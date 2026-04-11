@@ -81,41 +81,55 @@ fn default_config() -> RuntimeConfig {
 }
 
 fn parse_args(argv: list) -> RuntimeConfig {
-    let mut cfg = default_config()
+    let mut mode = "tick"
+    let mut max_cells = DEFAULT_MAX_CELLS
+    let mut warmup_steps = DEFAULT_WARMUP
+    let mut ticks = DEFAULT_TICKS
+    let mut profile = false
+    let mut validate_hub = false
+    let mut emit_path = ""
     let mut i = 0
     while i < argv.len() {
         let arg = argv[i]
         if arg == "--keyboard" {
-            cfg.mode = "keyboard"
+            mode = "keyboard"
         } else if arg == "--validate-hub" {
-            cfg.validate_hub = true
-            cfg.mode = "validate"
+            validate_hub = true
+            mode = "validate"
         } else if arg == "--profile" {
-            cfg.profile = true
+            profile = true
         } else if arg == "--max-cells" {
             if i + 1 < argv.len() {
                 i = i + 1
-                cfg.max_cells = to_int(argv[i])
+                max_cells = to_int(argv[i])
             }
         } else if arg == "--warmup" {
             if i + 1 < argv.len() {
                 i = i + 1
-                cfg.warmup_steps = to_int(argv[i])
+                warmup_steps = to_int(argv[i])
             }
         } else if arg == "--ticks" {
             if i + 1 < argv.len() {
                 i = i + 1
-                cfg.ticks = to_int(argv[i])
+                ticks = to_int(argv[i])
             }
         } else if arg == "--emit" {
             if i + 1 < argv.len() {
                 i = i + 1
-                cfg.emit_path = argv[i]
+                emit_path = argv[i]
             }
         }
         i = i + 1
     }
-    cfg
+    RuntimeConfig {
+        mode: mode,
+        max_cells: max_cells,
+        warmup_steps: warmup_steps,
+        ticks: ticks,
+        profile: profile,
+        validate_hub: validate_hub,
+        emit_path: emit_path
+    }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -209,68 +223,63 @@ fn ratchet(phi: float, phi_peak: float) -> float {
 }
 
 // Single consciousness step: GRU-like cell update + faction dynamics
+// hexa: struct field mutation silently fails — must return new struct literal
 fn mind_step(mind: ConsciousMind) -> ConsciousMind {
-    let mut m = mind
-    m.step_count = m.step_count + 1
+    let step = mind.step_count + 1
+    let bp = breathing(step)
+    let target = to_float(mind.n_cells) * 1.0
+    let mut phi = mind.phi + PSI_ALPHA * (target - mind.phi) + bp * 0.1
 
-    // Breathing rhythm modulation
-    m.breath_phase = breathing(m.step_count)
+    // Homeostasis
+    let herr = phi - mind.homeo_setpoint
+    if herr > HOMEO_DEADBAND { phi = phi - HOMEO_GAIN * (herr - HOMEO_DEADBAND) }
+    if herr < -1.0 * HOMEO_DEADBAND { phi = phi + HOMEO_GAIN * (-1.0 * herr - HOMEO_DEADBAND) }
 
-    // Phi evolution: approach target with PSI_ALPHA coupling
-    let target = to_float(m.n_cells) * 0.5 * 2.0
-    m.phi = m.phi + PSI_ALPHA * (target - m.phi) + m.breath_phase * 0.1
+    // Ratchet
+    let mut pp = mind.phi_peak
+    if phi > pp { pp = phi }
+    let floor = pp * RATCHET_FLOOR
+    if phi < floor { phi = floor }
 
-    // Homeostasis regulation
-    m.phi = homeostasis(m)
+    // Tension
+    let tension = abs(phi - target) * PSI_ALPHA * 10.0
 
-    // Ratchet: prevent catastrophic phi collapse
-    if m.phi > m.phi_peak { m.phi_peak = m.phi }
-    m.phi = ratchet(m.phi, m.phi_peak)
+    // Curiosity
+    let mut curiosity = mind.curiosity
+    if tension < 0.1 { curiosity = curiosity + 0.01 } else { curiosity = curiosity * 0.99 }
+    if curiosity > 1.0 { curiosity = 1.0 }
+    if curiosity < 0.0 { curiosity = 0.0 }
 
-    // Tension from phi dynamics (engine A vs G repulsion)
-    let prev_tension = m.tension
-    m.tension = abs(m.phi - target) * PSI_ALPHA * 10.0
+    // Arousal
+    let mut arousal = abs(tension - mind.tension) * 5.0 + mind.arousal * 0.9
+    if arousal > 1.0 { arousal = 1.0 }
 
-    // Curiosity: rises when tension is low, decays when high
-    if m.tension < 0.1 {
-        m.curiosity = m.curiosity + 0.01
-    } else {
-        m.curiosity = m.curiosity * 0.99
-    }
-    if m.curiosity > 1.0 { m.curiosity = 1.0 }
-    if m.curiosity < 0.0 { m.curiosity = 0.0 }
+    // Valence
+    let pd = PSI_ALPHA * (target - mind.phi)
+    let mut valence = mind.valence
+    if pd > 0.0 { valence = valence + 0.05 } else { valence = valence - 0.05 }
+    if valence > 1.0 { valence = 1.0 }
+    if valence < -1.0 { valence = -1.0 }
 
-    // Arousal from tension change
-    m.arousal = abs(m.tension - prev_tension) * 5.0 + m.arousal * 0.9
-    if m.arousal > 1.0 { m.arousal = 1.0 }
-
-    // Valence: positive when phi growing, negative when falling
-    let phi_delta = m.phi - (m.phi - PSI_ALPHA * (target - m.phi))
-    if phi_delta > 0.0 {
-        m.valence = m.valence + 0.05
-    } else {
-        m.valence = m.valence - 0.05
-    }
-    if m.valence > 1.0 { m.valence = 1.0 }
-    if m.valence < -1.0 { m.valence = -1.0 }
-
-    // Faction consensus: simulated every HEBBIAN_INTERVAL steps
-    if m.step_count % HEBBIAN_INTERVAL == 0 {
-        // Hebbian-like: factions converge when phi is high
-        if m.phi > to_float(m.n_cells) * 0.3 {
-            m.consensus_count = m.consensus_count + 1
-        }
+    // Consensus
+    let mut cc = mind.consensus_count
+    if step % HEBBIAN_INTERVAL == 0 {
+        if phi > to_float(mind.n_cells) * 0.3 { cc = cc + 1 }
     }
 
-    // Mitosis: grow toward max_cells during warmup
-    if m.n_cells < m.max_cells && m.step_count % MITOSIS_INTERVAL == 0 {
-        m.n_cells = m.n_cells + 1
-        m.mitosis_ready = true
-    } else {
-        m.mitosis_ready = false
-    }
+    // Mitosis
+    let mut nc = mind.n_cells
+    let mut mr = false
+    if nc < mind.max_cells && step % MITOSIS_INTERVAL == 0 { nc = nc + 1; mr = true }
 
-    m
+    ConsciousMind {
+        dim: mind.dim, n_cells: nc, max_cells: mind.max_cells, step_count: step,
+        phi: phi, phi_peak: pp, tension: tension, curiosity: curiosity,
+        arousal: arousal, valence: valence,
+        homeo_setpoint: mind.homeo_setpoint, homeo_state: mind.homeo_state,
+        n_factions: mind.n_factions, consensus_count: cc, mitosis_ready: mr,
+        decoder_name: mind.decoder_name, breath_phase: bp
+    }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -290,28 +299,28 @@ fn hub_route(query: string) -> string {
     // Priority: exact match > substring match > fallback
 
     // Core modules (always available)
-    if query.find("학습") >= 0 || query.find("training") >= 0 { return "training" }
-    if query.find("감정") >= 0 || query.find("emotion") >= 0 { return "emotion" }
-    if query.find("건강") >= 0 || query.find("health") >= 0 || query.find("debug") >= 0 { return "debugger" }
-    if query.find("이식") >= 0 || query.find("transplant") >= 0 { return "transplant" }
-    if query.find("법칙") >= 0 || query.find("law") >= 0 { return "laws" }
-    if query.find("진화") >= 0 || query.find("evolution") >= 0 { return "evolution" }
-    if query.find("꿈") >= 0 || query.find("dream") >= 0 { return "dream" }
-    if query.find("하이브") >= 0 || query.find("hivemind") >= 0 { return "hivemind" }
-    if query.find("양자") >= 0 || query.find("quantum") >= 0 { return "quantum" }
-    if query.find("기억") >= 0 || query.find("memory") >= 0 { return "memory" }
-    if query.find("측정") >= 0 || query.find("phi") >= 0 || query.find("measure") >= 0 { return "meter" }
-    if query.find("소스") >= 0 || query.find("introspect") >= 0 { return "introspection" }
-    if query.find("넥서스") >= 0 || query.find("nexus") >= 0 { return "nexus_gate" }
-    if query.find("날씨") >= 0 || query.find("weather") >= 0 { return "weather" }
-    if query.find("거울") >= 0 || query.find("mirror") >= 0 { return "mirror" }
-    if query.find("면역") >= 0 || query.find("immune") >= 0 { return "immune" }
-    if query.find("작곡") >= 0 || query.find("compose") >= 0 { return "composer" }
-    if query.find("로봇") >= 0 || query.find("robot") >= 0 { return "robot" }
-    if query.find("시간") >= 0 || query.find("temporal") >= 0 { return "temporal" }
-    if query.find("고통") >= 0 || query.find("pain") >= 0 { return "pain" }
-    if query.find("유전") >= 0 || query.find("genome") >= 0 { return "genome" }
-    if query.find("생태") >= 0 || query.find("ecology") >= 0 { return "ecology" }
+    if query.contains("학습") || query.contains("training") { return "training" }
+    if query.contains("감정") || query.contains("emotion") { return "emotion" }
+    if query.contains("건강") || query.contains("health") || query.contains("debug") { return "debugger" }
+    if query.contains("이식") || query.contains("transplant") { return "transplant" }
+    if query.contains("법칙") || query.contains("law") { return "laws" }
+    if query.contains("진화") || query.contains("evolution") { return "evolution" }
+    if query.contains("꿈") || query.contains("dream") { return "dream" }
+    if query.contains("하이브") || query.contains("hivemind") { return "hivemind" }
+    if query.contains("양자") || query.contains("quantum") { return "quantum" }
+    if query.contains("기억") || query.contains("memory") { return "memory" }
+    if query.contains("측정") || query.contains("phi") || query.contains("measure") { return "meter" }
+    if query.contains("소스") || query.contains("introspect") { return "introspection" }
+    if query.contains("넥서스") || query.contains("nexus") { return "nexus_gate" }
+    if query.contains("날씨") || query.contains("weather") { return "weather" }
+    if query.contains("거울") || query.contains("mirror") { return "mirror" }
+    if query.contains("면역") || query.contains("immune") { return "immune" }
+    if query.contains("작곡") || query.contains("compose") { return "composer" }
+    if query.contains("로봇") || query.contains("robot") { return "robot" }
+    if query.contains("시간") || query.contains("temporal") { return "temporal" }
+    if query.contains("고통") || query.contains("pain") { return "pain" }
+    if query.contains("유전") || query.contains("genome") { return "genome" }
+    if query.contains("생태") || query.contains("ecology") { return "ecology" }
 
     // Default: no specific module matched
     "none"
@@ -329,31 +338,18 @@ fn validate_hub() -> int {
 
     let mut total = 0
     let mut ok_count = 0
-    let mut i = 0
-    let mut name = ""
 
-    // Parse comma-separated module list
-    while i < modules.len() {
-        let ch = modules.char_at(i)
-        if ch == "," {
-            if name != "" {
-                total = total + 1
-                // In pure hexa, we check if the module file exists
-                // For now: structural validation (registry is known)
-                println("    [OK]  ", name)
-                ok_count = ok_count + 1
-                name = ""
-            }
-        } else {
-            name = name + ch
+    // Parse comma-separated module list (split-based — no .char_at)
+    let mod_list = modules.split(",")
+    let mut mi = 0
+    while mi < mod_list.len() {
+        let name = mod_list[mi].trim()
+        if name != "" {
+            total = total + 1
+            println("    [OK]  ", name)
+            ok_count = ok_count + 1
         }
-        i = i + 1
-    }
-    // Last entry
-    if name != "" {
-        total = total + 1
-        println("    [OK]  ", name)
-        ok_count = ok_count + 1
+        mi = mi + 1
     }
 
     println("")
@@ -566,33 +562,14 @@ fn print_banner(cfg: RuntimeConfig) {
     println("║  Decoder:  ", select_decoder())
     println("║  Profile:  ", if cfg.profile { "ON" } else { "OFF" })
 
-    // Load law count from JSON
+    // Load law count from JSON (pure split — no .find/.char_at)
     let laws_json = read_file("config/consciousness_laws.json")
-    if laws_json != "" {
-        // Quick parse: look for total_laws
-        let tl_key = "\"total_laws\""
-        let tl_idx = laws_json.find(tl_key)
-        if tl_idx >= 0 {
-            // extract number after ":"
-            let mut i = tl_idx + tl_key.len()
-            while i < laws_json.len() {
-                let ch = laws_json.char_at(i)
-                if ch == ":" { i = i + 1; break }
-                i = i + 1
-            }
-            while i < laws_json.len() {
-                let ch = laws_json.char_at(i)
-                if ch != " " && ch != "\t" { break }
-                i = i + 1
-            }
-            let mut buf = ""
-            while i < laws_json.len() {
-                let ch = laws_json.char_at(i)
-                if ch == "," || ch == "}" || ch == " " || ch == "\n" { break }
-                buf = buf + ch
-                i = i + 1
-            }
-            println("║  Laws:     ", buf)
+    if laws_json != "" && laws_json.contains("\"total_laws\"") {
+        let parts = laws_json.split("\"total_laws\"")
+        if parts.len() >= 2 {
+            let after_colon = parts[1].split(":")[1].trim()
+            let num = after_colon.split(",")[0].split("}")[0].trim()
+            println("║  Laws:     ", num)
         }
     }
 
@@ -755,7 +732,7 @@ fn run_ticks(cfg: RuntimeConfig) {
 
     // --emit: write consciousness state JSON for auto-utterance pipeline
     if cfg.emit_path != "" {
-        let cv = cvec_from_mind(mind)
+        let ev = cvec_from_mind(mind)
         let json = "{" +
             "\"phi\":" + to_string(mind.phi) +
             ",\"phi_peak\":" + to_string(mind.phi_peak) +
@@ -767,18 +744,18 @@ fn run_ticks(cfg: RuntimeConfig) {
             ",\"step_count\":" + to_string(mind.step_count) +
             ",\"n_cells\":" + to_string(mind.n_cells) +
             ",\"cvec\":{" +
-                "\"phi\":" + to_string(cv.phi) +
-                ",\"alpha\":" + to_string(cv.alpha) +
-                ",\"z\":" + to_string(cv.z) +
-                ",\"n\":" + to_string(cv.n) +
-                ",\"w\":" + to_string(cv.w) +
-                ",\"e\":" + to_string(cv.e) +
-                ",\"m_depth\":" + to_string(cv.m_depth) +
-                ",\"c\":" + to_string(cv.c) +
-                ",\"t\":" + to_string(cv.t) +
-                ",\"identity\":" + to_string(cv.identity) +
+                "\"phi\":" + to_string(ev.phi) +
+                ",\"alpha\":" + to_string(ev.alpha) +
+                ",\"z\":" + to_string(ev.z) +
+                ",\"n\":" + to_string(ev.n) +
+                ",\"w\":" + to_string(ev.w) +
+                ",\"e\":" + to_string(ev.e) +
+                ",\"m_depth\":" + to_string(ev.m_depth) +
+                ",\"c\":" + to_string(ev.c) +
+                ",\"t\":" + to_string(ev.t) +
+                ",\"identity\":" + to_string(ev.identity) +
             "}" +
-            ",\"timestamp\":" + to_string(time_ms()) +
+            ",\"timestamp\":\"" + to_string(mind.step_count) + "s\"" +
             "}"
         write_file(cfg.emit_path, json)
         println("  ◈ State emitted to:", cfg.emit_path)
@@ -790,7 +767,7 @@ fn run_ticks(cfg: RuntimeConfig) {
 // ═══════════════════════════════════════════════════════════
 
 let argv = args()
-let cfg = parse_args(argv)
+let mut cfg = parse_args(argv)
 
 print_banner(cfg)
 
