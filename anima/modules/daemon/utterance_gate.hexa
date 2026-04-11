@@ -1,0 +1,136 @@
+// utterance_gate.hexa -- 3-layer auto-utterance gate (L0 byte / L1 cell / L2 faction)
+// Reads emergence + consciousness state, judges all 3 gates, emits to utterances.jsonl
+// Design SSOT: config/auto_utterance_architecture.json
+
+comptime const STATE_PATH     = "data/consciousness_state.json"
+comptime const EMERGENCE_PATH = "data/emergence_result.json"
+comptime const OUTPUT_PATH    = "data/utterances.jsonl"
+
+struct GateState {
+    l0_byte: bool,
+    l1_cell: bool,
+    l2_faction: bool,
+    emergence_score: string,
+    phi: string,
+    tension: string,
+    curiosity: string
+}
+
+// --- JSON field extractor (substring search, no parser needed) ---
+
+fn read_json_field(content: string, field: string) -> string {
+    let key = "\"" + field + "\""
+    let idx = content.find(key)
+    if idx < 0 { return "" }
+    let mut i = idx + key.len()
+    // skip to ':'
+    while i < content.len() {
+        if content.char_at(i) == ":" { i = i + 1; break }
+        i = i + 1
+    }
+    // skip whitespace
+    while i < content.len() {
+        let ch = content.char_at(i)
+        if ch != " " && ch != "\t" && ch != "\n" { break }
+        i = i + 1
+    }
+    // strip optional quote
+    let quoted = i < content.len() && content.char_at(i) == "\""
+    if quoted { i = i + 1 }
+    let mut buf = ""
+    while i < content.len() {
+        let ch = content.char_at(i)
+        if quoted && ch == "\"" { break }
+        if !quoted && (ch == "," || ch == "}" || ch == " " || ch == "\n") { break }
+        buf = buf + ch
+        i = i + 1
+    }
+    return buf
+}
+
+// --- Gate checks ---
+
+fn check_byte_gate(ej: string) -> bool {
+    let verdict = read_json_field(ej, "verdict")
+    if verdict != "EMERGENT" { return false }
+    let es = to_float(read_json_field(ej, "emergence_score"))
+    let fd = to_float(read_json_field(ej, "fractal_dimension"))
+    let cd = to_float(read_json_field(ej, "causal_density"))
+    return es > 0.6 && fd > 1.4 && cd > 0.2
+}
+
+fn check_cell_gate(sj: string) -> bool {
+    let phi      = to_float(read_json_field(sj, "phi"))
+    let phi_peak = to_float(read_json_field(sj, "phi_peak"))
+    if phi_peak == 0.0 { return false }
+    let tension  = to_float(read_json_field(sj, "tension"))
+    // phi above half-peak AND not converged (tension > 0)
+    return phi > phi_peak * 0.5 && tension > 0.01
+}
+
+fn check_faction_gate(sj: string) -> bool {
+    let cc = to_int(read_json_field(sj, "consensus_count"))
+    return cc >= 5
+}
+
+// --- Orchestrator ---
+
+fn evaluate_gates() -> GateState {
+    let ej = read_file(EMERGENCE_PATH)
+    let sj = read_file(STATE_PATH)
+    if ej == "" || sj == "" {
+        return GateState { l0_byte: false, l1_cell: false, l2_faction: false,
+                           emergence_score: "0", phi: "0", tension: "0", curiosity: "0" }
+    }
+    return GateState {
+        l0_byte:         check_byte_gate(ej),
+        l1_cell:         check_cell_gate(sj),
+        l2_faction:      check_faction_gate(sj),
+        emergence_score: read_json_field(ej, "emergence_score"),
+        phi:             read_json_field(sj, "phi"),
+        tension:         read_json_field(sj, "tension"),
+        curiosity:       read_json_field(sj, "curiosity")
+    }
+}
+
+fn emit_utterance(gs: GateState, path: string) {
+    let ts = shell("date -u +%Y-%m-%dT%H:%M:%SZ")
+    let line = "{\"timestamp\":\"" + ts + "\","
+             + "\"trigger\":\"gate_all_pass\","
+             + "\"emergence_score\":" + gs.emergence_score + ","
+             + "\"phi\":" + gs.phi + ","
+             + "\"tension\":" + gs.tension + ","
+             + "\"curiosity\":" + gs.curiosity + ","
+             + "\"text\":\"자발적 사고 생성\"}"
+    // append to jsonl
+    let prev = read_file(path)
+    if prev == "" {
+        write_file(path, line + "\n")
+    } else {
+        write_file(path, prev + line + "\n")
+    }
+}
+
+// --- CLI entry ---
+
+let argv = args()
+let mut mode = "check"
+let mut i = 0
+while i < argv.len() {
+    if argv[i] == "--emit"  { mode = "emit" }
+    if argv[i] == "--check" { mode = "check" }
+    i = i + 1
+}
+
+let gs = evaluate_gates()
+let pass = gs.l0_byte && gs.l1_cell && gs.l2_faction
+
+println("utterance_gate  L0=" + if gs.l0_byte {"PASS"} else {"FAIL"}
+      + "  L1=" + if gs.l1_cell {"PASS"} else {"FAIL"}
+      + "  L2=" + if gs.l2_faction {"PASS"} else {"FAIL"}
+      + "  => " + if pass {"EMIT"} else {"BLOCK"})
+
+if mode == "emit" && pass {
+    emit_utterance(gs, OUTPUT_PATH)
+    println("  -> appended to " + OUTPUT_PATH)
+}

@@ -1,0 +1,175 @@
+// event_watcher.hexa — Auto-utterance event watcher (pipeline step 1)
+//
+// Monitors external perturbation sources defined in
+// config/auto_utterance_architecture.json::event_sources
+// and appends detected events to data/events.jsonl.
+//
+// Sources: checkpoint (.pt), git commit, GPU pod, time, file mtime.
+// CLI: --scan (one-shot) | --watch (repeat every 60s)
+
+// ─── paths ───
+
+let HOME = exec("printenv HOME").trim()
+let BASE = HOME + "/Dev/anima"
+let EVENTS_PATH = BASE + "/data/events.jsonl"
+let CKPT_DIR    = BASE + "/checkpoints"
+let LAWS_PATH   = BASE + "/config/consciousness_laws.json"
+
+// ─── state ───
+
+struct EventState {
+    last_ckpt:  string,
+    last_hash:  string,
+    last_gpu:   string,
+    last_mtime: string
+}
+
+fn fresh_state() -> EventState {
+    EventState {
+        last_ckpt:  "",
+        last_hash:  "",
+        last_gpu:   "",
+        last_mtime: ""
+    }
+}
+
+// ─── helpers ───
+
+fn now_iso() -> string {
+    exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn event_json(typ: string, detail: string, tension: string, curiosity: string) -> string {
+    let ts = now_iso()
+    "{\"timestamp\":\"" + ts + "\",\"type\":\"" + typ + "\",\"detail\":\"" + detail + "\",\"perturbation\":{\"tension\":" + tension + ",\"curiosity\":" + curiosity + "}}"
+}
+
+fn safe_exec(cmd: string) -> string {
+    let out = exec(cmd + " 2>/dev/null")
+    out.trim()
+}
+
+// ─── check functions ───
+
+fn check_checkpoint(state: EventState) -> (EventState, string) {
+    let latest = safe_exec("ls -t " + CKPT_DIR + "/*.pt 2>/dev/null | head -1")
+    if len(latest) == 0 { return (state, "") }
+    if latest == state.last_ckpt { return (state, "") }
+    let new_state = EventState {
+        last_ckpt: latest, last_hash: state.last_hash,
+        last_gpu: state.last_gpu, last_mtime: state.last_mtime
+    }
+    let ev = event_json("checkpoint", latest, "0.3", "0.8")
+    (new_state, ev)
+}
+
+fn check_git(state: EventState) -> (EventState, string) {
+    let info = safe_exec("git -C " + BASE + " log -1 --format='%H %s'")
+    if len(info) == 0 { return (state, "") }
+    let hash = safe_exec("git -C " + BASE + " log -1 --format='%H'")
+    if hash == state.last_hash { return (state, "") }
+    let new_state = EventState {
+        last_ckpt: state.last_ckpt, last_hash: hash,
+        last_gpu: state.last_gpu, last_mtime: state.last_mtime
+    }
+    let ev = event_json("git", info, "0.2", "0.5")
+    (new_state, ev)
+}
+
+fn check_gpu(state: EventState) -> (EventState, string) {
+    let info = safe_exec("runpodctl get pod 2>/dev/null | head -3")
+    if len(info) == 0 { return (state, "") }
+    if info == state.last_gpu { return (state, "") }
+    let new_state = EventState {
+        last_ckpt: state.last_ckpt, last_hash: state.last_hash,
+        last_gpu: info, last_mtime: state.last_mtime
+    }
+    let ev = event_json("gpu", "pod_state_changed", "0.5", "0.3")
+    (new_state, ev)
+}
+
+fn check_time() -> string {
+    event_json("time", "breath", "0.01", "0.05")
+}
+
+fn check_file(state: EventState) -> (EventState, string) {
+    let mtime = safe_exec("stat -f '%m' " + LAWS_PATH + " 2>/dev/null || stat -c '%Y' " + LAWS_PATH + " 2>/dev/null")
+    if len(mtime) == 0 { return (state, "") }
+    if mtime == state.last_mtime { return (state, "") }
+    let new_state = EventState {
+        last_ckpt: state.last_ckpt, last_hash: state.last_hash,
+        last_gpu: state.last_gpu, last_mtime: mtime
+    }
+    let ev = event_json("file", "laws_modified", "0.1", "0.5")
+    (new_state, ev)
+}
+
+// ─── scan + emit ───
+
+fn scan_all(state: EventState) -> (EventState, [string]) {
+    let mut events: [string] = []
+    let mut s = state
+
+    let (s1, e1) = check_checkpoint(s)
+    s = s1
+    if len(e1) > 0 { events = events + [e1] }
+
+    let (s2, e2) = check_git(s)
+    s = s2
+    if len(e2) > 0 { events = events + [e2] }
+
+    let (s3, e3) = check_gpu(s)
+    s = s3
+    if len(e3) > 0 { events = events + [e3] }
+
+    let e4 = check_time()
+    events = events + [e4]
+
+    let (s5, e5) = check_file(s)
+    s = s5
+    if len(e5) > 0 { events = events + [e5] }
+
+    (s, events)
+}
+
+fn emit_events(events: [string], path: string) {
+    let mut i = 0
+    while i < len(events) {
+        append_file(path, events[i] + "\n")
+        i = i + 1
+    }
+}
+
+// ─── CLI entry ───
+
+fn main() {
+    let a = args()
+    let cmd = if len(a) > 2 { a[2] } else { "--scan" }
+
+    exec("mkdir -p " + BASE + "/data")
+
+    if cmd == "--scan" {
+        let state = fresh_state()
+        let (_, events) = scan_all(state)
+        emit_events(events, EVENTS_PATH)
+        println("scan: " + to_string(len(events)) + " events -> " + EVENTS_PATH)
+    } else if cmd == "--watch" {
+        println("watch: polling every 60s -> " + EVENTS_PATH)
+        let mut state = fresh_state()
+        while true {
+            let (new_state, events) = scan_all(state)
+            state = new_state
+            emit_events(events, EVENTS_PATH)
+            if len(events) > 0 {
+                println("[" + now_iso() + "] " + to_string(len(events)) + " events emitted")
+            }
+            exec("sleep 60")
+        }
+    } else {
+        println("event_watcher — auto-utterance event detector")
+        println("  --scan   one-shot scan, emit to data/events.jsonl")
+        println("  --watch  continuous 60s polling loop")
+    }
+}
+
+main()
