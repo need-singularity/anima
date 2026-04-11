@@ -1,0 +1,337 @@
+// ═══════════════════════════════════════════════════════════════
+//  serving/eval_pipeline.hexa — full eval loop on a saved checkpoint
+//
+//  Wires together:
+//    training/checkpoint_hexa.hexa  → load saved tensors
+//    serving/eval_hexa.hexa         → 5-metric evaluation
+//
+//  Pipeline:
+//    1. Build a tiny "model" (single linear layer: vocab × vocab matrix)
+//    2. Save it via checkpoint_hexa text format
+//    3. Load it back
+//    4. Run eval_hexa metrics with the LOADED weights as model_logits
+//    5. Report PASS/FAIL
+//
+//  This proves the full training-side ↔ eval-side handoff works.
+//  Once a real trained model lands, the same pipeline runs unchanged.
+// ═══════════════════════════════════════════════════════════════
+
+let VOCAB = 32
+
+// ── Inline checkpoint format (copied from checkpoint_hexa.hexa) ──
+// We keep the helpers local so this file is standalone (no `use` needed,
+// since cross-module resolution in build_c.hexa is still TODO).
+
+let MAGIC = "HEXACKPT-v1"
+
+fn make_tensor(name, rows, cols, data) {
+    let mut t = []
+    t = t.push(name)
+    t = t.push(rows)
+    t = t.push(cols)
+    t = t.push(data)
+    return t
+}
+
+fn make_decode_result(tensors, total, n_t) {
+    let mut r = []
+    r = r.push(tensors)
+    r = r.push(total)
+    r = r.push(n_t)
+    return r
+}
+
+fn split_ws(s) {
+    let n = len(s)
+    let mut parts = []
+    let mut cur = ""
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if ch == " " || ch == "\t" {
+            if cur != "" {
+                parts = parts.push(cur)
+                cur = ""
+            }
+        } else {
+            cur = cur + ch
+        }
+        i = i + 1
+    }
+    if cur != "" { parts = parts.push(cur) }
+    return parts
+}
+
+fn encode_checkpoint(tensors) {
+    let mut s = MAGIC + "\n"
+    let n = len(tensors)
+    let mut total = 0
+    let mut i = 0
+    while i < n {
+        let t = tensors[i]
+        let name = t[0]
+        let rows = t[1]
+        let cols = t[2]
+        let data = t[3]
+        let numel = rows * cols
+        s = s + name + " " + str(rows) + " " + str(cols) + "\n"
+        let mut j = 0
+        while j < numel {
+            if j > 0 { s = s + " " }
+            s = s + str(data[j])
+            j = j + 1
+        }
+        s = s + "\n"
+        total = total + numel
+        i = i + 1
+    }
+    s = s + "__MANIFEST__ " + str(total) + " " + str(n) + "\n"
+    return s
+}
+
+fn decode_checkpoint(text) {
+    let n = len(text)
+    if n < 11 { return make_decode_result([], 0, 0) }
+    let magic = text.substring(0, 11)
+    if magic != MAGIC { return make_decode_result([], 0, 0) }
+
+    let mut lines = []
+    let mut cur = ""
+    let mut k = 12
+    while k < n {
+        let ch = text.substring(k, k + 1)
+        if ch == "\n" {
+            lines = lines.push(cur)
+            cur = ""
+        } else {
+            cur = cur + ch
+        }
+        k = k + 1
+    }
+    if cur != "" { lines = lines.push(cur) }
+
+    let mut tensors = []
+    let mut total = 0
+    let mut declared = 0
+    let nl = len(lines)
+    let mut li = 0
+    while li < nl {
+        let header = lines[li]
+        if header == "" {
+            li = li + 1
+        } else if header.substring(0, 12) == "__MANIFEST__" {
+            let parts = split_ws(header)
+            if len(parts) >= 3 {
+                total = to_int(parts[1])
+                declared = to_int(parts[2])
+            }
+            li = li + 1
+        } else {
+            let parts = split_ws(header)
+            if len(parts) < 3 {
+                li = li + 1
+            } else {
+                let name = parts[0]
+                let rows = to_int(parts[1])
+                let cols = to_int(parts[2])
+                let numel = rows * cols
+                li = li + 1
+                if li < nl {
+                    let data_line = lines[li]
+                    let data_parts = split_ws(data_line)
+                    let mut data = []
+                    let mut di = 0
+                    while di < numel && di < len(data_parts) {
+                        data = data.push(to_float(data_parts[di]))
+                        di = di + 1
+                    }
+                    let entry = make_tensor(name, rows, cols, data)
+                    tensors = tensors.push(entry)
+                }
+                li = li + 1
+            }
+        }
+    }
+    return make_decode_result(tensors, total, declared)
+}
+
+// ── Build a simple "trained" linear model: W[vocab × vocab] biased  ──
+// We construct a deliberately-non-uniform W so eval has signal:
+// W[i, j] = (i == (j+1) % vocab) ? 5.0 : -1.0
+// → model predicts the NEXT token deterministically when scored well.
+fn build_simple_model() {
+    let mut data = []
+    let mut i = 0
+    while i < VOCAB {
+        let mut j = 0
+        while j < VOCAB {
+            // Strong positive on the "shift by 1" diagonal, weak negative elsewhere
+            let target_j = (i + 1) % VOCAB
+            let v = if j == target_j { 5.0 } else { -0.5 }
+            data = data.push(v)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let mut model = []
+    model = model.push(make_tensor("W_lm", VOCAB, VOCAB, data))
+    return model
+}
+
+// ── Forward pass: logits = W[token, :] (single row of the lm head) ──
+// Uses the loaded checkpoint's W_lm tensor.
+let mut LOADED_W_DATA = []
+let mut LOADED_W_ROWS = 0
+let mut LOADED_W_COLS = 0
+
+fn install_loaded_model(tensors) {
+    let nt = len(tensors)
+    let mut i = 0
+    while i < nt {
+        let t = tensors[i]
+        if t[0] == "W_lm" {
+            LOADED_W_ROWS = t[1]
+            LOADED_W_COLS = t[2]
+            LOADED_W_DATA = t[3]
+        }
+        i = i + 1
+    }
+}
+
+fn model_logits(token, ctx) {
+    let mut logits = []
+    let row_start = token * LOADED_W_COLS
+    let mut j = 0
+    while j < LOADED_W_COLS {
+        logits = logits.push(LOADED_W_DATA[row_start + j])
+        j = j + 1
+    }
+    return logits
+}
+
+// ── eval helpers (mirror eval_hexa.hexa, scoped to LOADED model) ──
+fn log_softmax(logits) {
+    let n = len(logits)
+    let mut m = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > m { m = logits[i] }
+        i = i + 1
+    }
+    let mut s = 0.0
+    let mut j = 0
+    while j < n {
+        s = s + exp(logits[j] - m)
+        j = j + 1
+    }
+    let logZ = m + log(s)
+    let mut out = []
+    let mut k = 0
+    while k < n {
+        out = out.push(logits[k] - logZ)
+        k = k + 1
+    }
+    return out
+}
+
+fn argmax(logits) {
+    let n = len(logits)
+    let mut best_i = 0
+    let mut best_v = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > best_v { best_v = logits[i]; best_i = i }
+        i = i + 1
+    }
+    return best_i
+}
+
+// Validation set: shift-by-1 sequence so the trained model maximizes signal
+fn build_val_shift1(n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(i % VOCAB)
+        i = i + 1
+    }
+    return out
+}
+
+fn metric_ppl(val) {
+    let n = len(val)
+    let mut total_nll = 0.0
+    let mut count = 0
+    let mut i = 0
+    while i < n - 1 {
+        let logits = model_logits(val[i], i)
+        let lp = log_softmax(logits)
+        total_nll = total_nll - lp[val[i + 1]]
+        count = count + 1
+        i = i + 1
+    }
+    return exp(total_nll / (count * 1.0))
+}
+
+fn metric_top1(val) {
+    let n = len(val)
+    let mut hits = 0
+    let mut i = 0
+    while i < n - 1 {
+        let logits = model_logits(val[i], i)
+        if argmax(logits) == val[i + 1] { hits = hits + 1 }
+        i = i + 1
+    }
+    return (hits * 1.0) / ((n - 1) * 1.0)
+}
+
+fn main() {
+    println("═══ eval_pipeline: full save → load → eval loop ═══")
+    println("  vocab=", VOCAB)
+
+    // ── Step 1: build a "trained" model with shift-by-1 signal ──
+    let model = build_simple_model()
+    println("  built model: ", len(model), " tensors")
+
+    // ── Step 2: save to text checkpoint ──
+    let path = "/tmp/eval_pipeline_ckpt.hexackpt"
+    let text = encode_checkpoint(model)
+    write_file(path, text)
+    println("  saved ", len(text), " bytes to ", path)
+
+    // ── Step 3: load it back ──
+    let raw = read_file(path)
+    let result = decode_checkpoint(raw)
+    let loaded_tensors = result[0]
+    let loaded_total = result[1]
+    let loaded_n = result[2]
+    println("  loaded ", loaded_n, " tensors, ", loaded_total, " params")
+
+    // ── Step 4: install loaded model + run metrics ──
+    install_loaded_model(loaded_tensors)
+    println("  installed W_lm: ", LOADED_W_ROWS, "x", LOADED_W_COLS)
+
+    let val = build_val_shift1(64)
+    let ppl = metric_ppl(val)
+    let top1 = metric_top1(val)
+
+    println("")
+    println("  M1 PPL    = ", ppl, "  (threshold < 20)")
+    println("  M2 top-1  = ", top1, "  (threshold > 0.30)")
+
+    // For a shift-by-1 trained model on shift-by-1 validation,
+    // top-1 should be ~1.0 and PPL should be tiny.
+    let mut passed = 0
+    if ppl < 20.0 { passed = passed + 1 }
+    if top1 > 0.30 { passed = passed + 1 }
+
+    println("")
+    println("  → ", passed, " / 2 metrics passed")
+    if passed == 2 {
+        println("  → eval pipeline PASS — checkpoint round-trip + eval loop works")
+    } else {
+        println("  → eval pipeline FAIL — investigate")
+    }
+    println("═══ DONE ═══")
+}
+
+let _ = main()
