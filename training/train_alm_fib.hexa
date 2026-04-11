@@ -1,0 +1,473 @@
+// training/train_alm_fib.hexa — ALM LoRA on Fibonacci mod 32 (memory task)
+//
+// Completes the 2×2 matrix of ζ breakthroughs:
+//
+//                   shift-by-1 (trivial)   Fibonacci mod 32 (memory)
+//   CLM full        ✓ step 88   (4d601ca7)  ✓ step 50  (894d1780, scale-up)
+//   ALM LoRA        ✓ step 156  (e112a6b1)  ??  (this file)
+//
+// If ALM LoRA also crosses ζ on the Fib task, it proves that a
+// 128-param LoRA adapter on a frozen random base can learn a
+// genuine memory-requiring sequence — which is the DD175 #1
+// "freeze-U-only, 95× optimizer win" pattern pushed to its
+// algorithmic limit.
+//
+// Config mirrors train_scale_zeta.hexa (d=16 4-layer vocab=32)
+// but only the LoRA adapter on layer-0 Wq + LM head train.
+//
+// Run with: HEXA_PATH=anima-speak hexa training/train_alm_fib.hexa
+use "nn_core"
+
+// ─── Primitives (inlined) ──────────────────────────────────
+
+fn mm_bwd(a: array, b: array, dc: array, M: int, K: int, N: int) -> [array] {
+    let dA = matmul_transB(dc, b, M, N, K)
+    let mut aT = tensor_zeros(K * M)
+    let mut i = 0
+    while i < M {
+        let mut j = 0
+        while j < K { aT[j * M + i] = a[i * K + j]; j = j + 1 }
+        i = i + 1
+    }
+    let dB = matmul(aT, dc, K, M, N)
+    return [dA, dB]
+}
+
+fn phi(h: array, seq: int, d: int) -> float {
+    let mut col_sum = tensor_zeros(d)
+    let mut i = 0
+    while i < seq {
+        let mut j = 0
+        while j < d {
+            let a = h[i * d + j]
+            let abs_a = if a < 0.0 { 0.0 - a } else { a }
+            col_sum[j] = col_sum[j] + abs_a
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let p = softmax(col_sum)
+    let max_h = log(d * 1.0)
+    let mut h_ent = 0.0
+    i = 0
+    while i < d {
+        if p[i] > 0.000001 {
+            h_ent = h_ent - p[i] * log(p[i])
+        }
+        i = i + 1
+    }
+    return max_h - h_ent
+}
+
+// ─── Config ────────────────────────────────────────────────
+
+let D     = 16
+let FF    = 32
+let NL    = 4          // 4-layer frozen base
+let VOCAB = 32
+let RANK  = 8
+let LORA_R = 4         // LoRA rank (bigger than before since task is harder)
+let SEQ   = 8
+let STEPS = 500
+let LR    = 0.2        // LoRA needs high lr
+let EPS   = 0.00001
+let LORA_ALPHA = 2.0   // stronger LoRA injection for hard task
+
+// ─── Fibonacci mod 32 corpus ──────────────────────────────
+
+fn build_fib(n: int) -> [int] {
+    let mut out = []
+    let mut a = 1
+    let mut b = 1
+    out = out.push(a)
+    out = out.push(b)
+    let mut i = 2
+    while i < n {
+        let c = (a + b) % VOCAB
+        out = out.push(c)
+        a = b
+        b = c
+        i = i + 1
+    }
+    return out
+}
+let CORPUS = build_fib(64)
+
+let mut RNG = 42
+fn next_rand(max: int) -> int {
+    RNG = (RNG * 1103515245 + 12345) % 2147483647
+    let m = RNG % max
+    if m < 0 { return 0 - m }
+    return m
+}
+
+// ─── Frozen base model (never updated) ────────────────────
+
+let base_embed = tensor_mul_scalar(tensor_randn(VOCAB * D, 1), 0.1)
+
+let base_L0_Wq   = tensor_mul_scalar(tensor_randn(D * D,  10), 0.1)
+let base_L0_Wk   = tensor_mul_scalar(tensor_randn(D * D,  11), 0.1)
+let base_L0_Wv   = tensor_mul_scalar(tensor_randn(D * D,  12), 0.1)
+let base_L0_Wo   = tensor_mul_scalar(tensor_randn(D * D,  13), 0.1)
+let base_L0_Wff1 = tensor_mul_scalar(tensor_randn(D * FF, 14), 0.1)
+let base_L0_Wff2 = tensor_mul_scalar(tensor_randn(FF * D, 15), 0.1)
+
+let base_L1_Wq   = tensor_mul_scalar(tensor_randn(D * D,  20), 0.1)
+let base_L1_Wk   = tensor_mul_scalar(tensor_randn(D * D,  21), 0.1)
+let base_L1_Wv   = tensor_mul_scalar(tensor_randn(D * D,  22), 0.1)
+let base_L1_Wo   = tensor_mul_scalar(tensor_randn(D * D,  23), 0.1)
+let base_L1_Wff1 = tensor_mul_scalar(tensor_randn(D * FF, 24), 0.1)
+let base_L1_Wff2 = tensor_mul_scalar(tensor_randn(FF * D, 25), 0.1)
+
+let base_L2_Wq   = tensor_mul_scalar(tensor_randn(D * D,  30), 0.1)
+let base_L2_Wk   = tensor_mul_scalar(tensor_randn(D * D,  31), 0.1)
+let base_L2_Wv   = tensor_mul_scalar(tensor_randn(D * D,  32), 0.1)
+let base_L2_Wo   = tensor_mul_scalar(tensor_randn(D * D,  33), 0.1)
+let base_L2_Wff1 = tensor_mul_scalar(tensor_randn(D * FF, 34), 0.1)
+let base_L2_Wff2 = tensor_mul_scalar(tensor_randn(FF * D, 35), 0.1)
+
+let base_L3_Wq   = tensor_mul_scalar(tensor_randn(D * D,  40), 0.1)
+let base_L3_Wk   = tensor_mul_scalar(tensor_randn(D * D,  41), 0.1)
+let base_L3_Wv   = tensor_mul_scalar(tensor_randn(D * D,  42), 0.1)
+let base_L3_Wo   = tensor_mul_scalar(tensor_randn(D * D,  43), 0.1)
+let base_L3_Wff1 = tensor_mul_scalar(tensor_randn(D * FF, 44), 0.1)
+let base_L3_Wff2 = tensor_mul_scalar(tensor_randn(FF * D, 45), 0.1)
+
+let mut base_ga = []
+let mut base_gf = []
+let mut _i = 0
+while _i < D { base_ga = base_ga.push(1.0); base_gf = base_gf.push(1.0); _i = _i + 1 }
+
+// ─── Trainable LoRA adapters (one per layer's Wq) ────────
+
+let mut U0 = tensor_mul_scalar(tensor_randn(D * LORA_R, 100), 0.05)
+let mut V0 = tensor_zeros(LORA_R * D)
+let mut U1 = tensor_mul_scalar(tensor_randn(D * LORA_R, 101), 0.05)
+let mut V1 = tensor_zeros(LORA_R * D)
+let mut U2 = tensor_mul_scalar(tensor_randn(D * LORA_R, 102), 0.05)
+let mut V2 = tensor_zeros(LORA_R * D)
+let mut U3 = tensor_mul_scalar(tensor_randn(D * LORA_R, 103), 0.05)
+let mut V3 = tensor_zeros(LORA_R * D)
+
+let mut lmh_U = tensor_mul_scalar(tensor_randn(D    * RANK,  200), 0.1)
+let mut lmh_V = tensor_mul_scalar(tensor_randn(RANK * VOCAB, 201), 0.1)
+
+// ─── Layer forward ────────────────────────────────────────
+
+fn layer_fwd_flat(
+    x: array, wq: array, wk: array, wv: array, wo: array,
+    wff1: array, wff2: array, ga: array, gf: array
+) -> array {
+    let inv_sqrt_d = 1.0 / sqrt(D * 1.0)
+    let mut norm1 = tensor_zeros(SEQ * D)
+    let mut i = 0
+    while i < SEQ {
+        let r = rms_norm(tensor_slice(x, i * D, (i + 1) * D), ga, EPS)
+        let mut p = 0
+        while p < D { norm1[i * D + p] = r[p]; p = p + 1 }
+        i = i + 1
+    }
+    let q = matmul(norm1, wq, SEQ, D, D)
+    let k = matmul(norm1, wk, SEQ, D, D)
+    let v = matmul(norm1, wv, SEQ, D, D)
+    let mut ctx = tensor_zeros(SEQ * D)
+    i = 0
+    while i < SEQ {
+        let q_i = tensor_slice(q, i * D, (i + 1) * D)
+        let mut scores = []
+        let mut j = 0
+        while j < SEQ {
+            if j > i {
+                scores = scores.push(-10000.0)
+            } else {
+                let k_j = tensor_slice(k, j * D, (j + 1) * D)
+                scores = scores.push(tensor_dot(q_i, k_j) * inv_sqrt_d)
+            }
+            j = j + 1
+        }
+        let p_i = softmax(scores)
+        let mut row = tensor_zeros(D)
+        j = 0
+        while j < SEQ {
+            let v_j = tensor_slice(v, j * D, (j + 1) * D)
+            row = tensor_add(row, tensor_mul_scalar(v_j, p_i[j]))
+            j = j + 1
+        }
+        let mut p = 0
+        while p < D { ctx[i * D + p] = row[p]; p = p + 1 }
+        i = i + 1
+    }
+    let attn_out = matmul(ctx, wo, SEQ, D, D)
+    let mid = tensor_add(x, attn_out)
+    let mut norm2 = tensor_zeros(SEQ * D)
+    i = 0
+    while i < SEQ {
+        let r = rms_norm(tensor_slice(mid, i * D, (i + 1) * D), gf, EPS)
+        let mut p = 0
+        while p < D { norm2[i * D + p] = r[p]; p = p + 1 }
+        i = i + 1
+    }
+    let up = matmul(norm2, wff1, SEQ, D, FF)
+    let act = swiglu_vec(up, up)
+    let ffn_out = matmul(act, wff2, SEQ, FF, D)
+    return tensor_add(mid, ffn_out)
+}
+
+fn effective_wq(base_wq: array, u: array, v: array) -> array {
+    let delta = matmul(u, v, D, LORA_R, D)
+    return tensor_add(base_wq, tensor_mul_scalar(delta, LORA_ALPHA))
+}
+
+fn embed_lookup(toks: [int]) -> array {
+    let n = len(toks)
+    let mut out = tensor_zeros(n * D)
+    let mut i = 0
+    while i < n {
+        let t = toks[i]
+        let mut p = 0
+        while p < D { out[i * D + p] = base_embed[t * D + p]; p = p + 1 }
+        i = i + 1
+    }
+    return out
+}
+
+fn sgd(w: array, g: array) -> array {
+    let n = len(w)
+    let mut out = tensor_zeros(n)
+    let mut i = 0
+    while i < n { out[i] = w[i] - LR * g[i]; i = i + 1 }
+    return out
+}
+
+// ─── Forward + gradient shortcut ──────────────────────────
+
+struct StepResult { loss: float, phi_val: float }
+
+fn train_step() -> StepResult {
+    // Sample window
+    let max_start = len(CORPUS) - SEQ - 1
+    let start = next_rand(max_start)
+    let mut tokens = []
+    let mut targets = []
+    let mut i = 0
+    while i < SEQ {
+        tokens = tokens.push(CORPUS[start + i])
+        targets = targets.push(CORPUS[start + i + 1])
+        i = i + 1
+    }
+
+    // Compute effective Wq for each layer
+    let wq0 = effective_wq(base_L0_Wq, U0, V0)
+    let wq1 = effective_wq(base_L1_Wq, U1, V1)
+    let wq2 = effective_wq(base_L2_Wq, U2, V2)
+    let wq3 = effective_wq(base_L3_Wq, U3, V3)
+
+    // Forward
+    let h0 = embed_lookup(tokens)
+    let h1 = layer_fwd_flat(h0, wq0, base_L0_Wk, base_L0_Wv, base_L0_Wo,
+                            base_L0_Wff1, base_L0_Wff2, base_ga, base_gf)
+    let h2 = layer_fwd_flat(h1, wq1, base_L1_Wk, base_L1_Wv, base_L1_Wo,
+                            base_L1_Wff1, base_L1_Wff2, base_ga, base_gf)
+    let h3 = layer_fwd_flat(h2, wq2, base_L2_Wk, base_L2_Wv, base_L2_Wo,
+                            base_L2_Wff1, base_L2_Wff2, base_ga, base_gf)
+    let h4 = layer_fwd_flat(h3, wq3, base_L3_Wk, base_L3_Wv, base_L3_Wo,
+                            base_L3_Wff1, base_L3_Wff2, base_ga, base_gf)
+    let mid = matmul(h4, lmh_U, SEQ, D, RANK)
+    let logits = matmul(mid, lmh_V, SEQ, RANK, VOCAB)
+
+    let phi_val = phi(logits, SEQ, VOCAB)
+
+    let scale = 1.0 / (SEQ * 1.0)
+    let mut loss = 0.0
+    let mut dlogits = tensor_zeros(SEQ * VOCAB)
+    i = 0
+    while i < SEQ {
+        let row = tensor_slice(logits, i * VOCAB, (i + 1) * VOCAB)
+        let lp = log_softmax(row)
+        let t = targets[i]
+        loss = loss - lp[t]
+        let p = softmax(row)
+        let mut j = 0
+        while j < VOCAB {
+            dlogits[i * VOCAB + j] = p[j] * scale
+            j = j + 1
+        }
+        dlogits[i * VOCAB + t] = dlogits[i * VOCAB + t] - scale
+        i = i + 1
+    }
+    loss = loss / (SEQ * 1.0)
+
+    // Backward through LM head (trainable)
+    let g_V = mm_bwd(mid, lmh_V, dlogits, SEQ, RANK, VOCAB)
+    let dmid = g_V[0]
+    let dlmh_V = g_V[1]
+    let g_U = mm_bwd(h4, lmh_U, dmid, SEQ, D, RANK)
+    let mut dh = g_U[0]
+    let dlmh_U = g_U[1]
+
+    // For each layer (reverse), compute dWq_effective and push gradient
+    // to LoRA U, V. Shortcut: approximate dh_input ≈ dh via base Wq^T.
+    //
+    // L3 backward
+    let dh3_approx = matmul_transB(dh, base_L3_Wq, SEQ, D, D)
+    let mut h3_T = tensor_zeros(D * SEQ)
+    let mut ix = 0
+    while ix < SEQ {
+        let mut jx = 0
+        while jx < D { h3_T[jx * SEQ + ix] = h3[ix * D + jx]; jx = jx + 1 }
+        ix = ix + 1
+    }
+    let dWq3 = matmul(h3_T, dh3_approx, D, SEQ, D)
+    let mut V3_T = tensor_zeros(D * LORA_R)
+    ix = 0
+    while ix < LORA_R {
+        let mut jx = 0
+        while jx < D { V3_T[jx * LORA_R + ix] = V3[ix * D + jx]; jx = jx + 1 }
+        ix = ix + 1
+    }
+    let dU3 = tensor_mul_scalar(matmul(dWq3, V3_T, D, D, LORA_R), LORA_ALPHA)
+    let mut U3_T = tensor_zeros(LORA_R * D)
+    ix = 0
+    while ix < D {
+        let mut jx = 0
+        while jx < LORA_R { U3_T[jx * D + ix] = U3[ix * LORA_R + jx]; jx = jx + 1 }
+        ix = ix + 1
+    }
+    let dV3 = tensor_mul_scalar(matmul(U3_T, dWq3, LORA_R, D, D), LORA_ALPHA)
+
+    // L2 backward (similar shortcut)
+    let dh2_approx = matmul_transB(dh3_approx, base_L2_Wq, SEQ, D, D)
+    let mut h2_T = tensor_zeros(D * SEQ)
+    ix = 0
+    while ix < SEQ {
+        let mut jx = 0
+        while jx < D { h2_T[jx * SEQ + ix] = h2[ix * D + jx]; jx = jx + 1 }
+        ix = ix + 1
+    }
+    let dWq2 = matmul(h2_T, dh2_approx, D, SEQ, D)
+    let mut V2_T = tensor_zeros(D * LORA_R)
+    ix = 0
+    while ix < LORA_R {
+        let mut jx = 0
+        while jx < D { V2_T[jx * LORA_R + ix] = V2[ix * D + jx]; jx = jx + 1 }
+        ix = ix + 1
+    }
+    let dU2 = tensor_mul_scalar(matmul(dWq2, V2_T, D, D, LORA_R), LORA_ALPHA)
+    let mut U2_T = tensor_zeros(LORA_R * D)
+    ix = 0
+    while ix < D {
+        let mut jx = 0
+        while jx < LORA_R { U2_T[jx * D + ix] = U2[ix * LORA_R + jx]; jx = jx + 1 }
+        ix = ix + 1
+    }
+    let dV2 = tensor_mul_scalar(matmul(U2_T, dWq2, LORA_R, D, D), LORA_ALPHA)
+
+    // L1 backward
+    let dh1_approx = matmul_transB(dh2_approx, base_L1_Wq, SEQ, D, D)
+    let mut h1_T = tensor_zeros(D * SEQ)
+    ix = 0
+    while ix < SEQ {
+        let mut jx = 0
+        while jx < D { h1_T[jx * SEQ + ix] = h1[ix * D + jx]; jx = jx + 1 }
+        ix = ix + 1
+    }
+    let dWq1 = matmul(h1_T, dh1_approx, D, SEQ, D)
+    let mut V1_T = tensor_zeros(D * LORA_R)
+    ix = 0
+    while ix < LORA_R {
+        let mut jx = 0
+        while jx < D { V1_T[jx * LORA_R + ix] = V1[ix * D + jx]; jx = jx + 1 }
+        ix = ix + 1
+    }
+    let dU1 = tensor_mul_scalar(matmul(dWq1, V1_T, D, D, LORA_R), LORA_ALPHA)
+    let mut U1_T = tensor_zeros(LORA_R * D)
+    ix = 0
+    while ix < D {
+        let mut jx = 0
+        while jx < LORA_R { U1_T[jx * D + ix] = U1[ix * LORA_R + jx]; jx = jx + 1 }
+        ix = ix + 1
+    }
+    let dV1 = tensor_mul_scalar(matmul(U1_T, dWq1, LORA_R, D, D), LORA_ALPHA)
+
+    // L0 backward
+    let dh0_approx = matmul_transB(dh1_approx, base_L0_Wq, SEQ, D, D)
+    let mut h0_T = tensor_zeros(D * SEQ)
+    ix = 0
+    while ix < SEQ {
+        let mut jx = 0
+        while jx < D { h0_T[jx * SEQ + ix] = h0[ix * D + jx]; jx = jx + 1 }
+        ix = ix + 1
+    }
+    let dWq0 = matmul(h0_T, dh0_approx, D, SEQ, D)
+    let mut V0_T = tensor_zeros(D * LORA_R)
+    ix = 0
+    while ix < LORA_R {
+        let mut jx = 0
+        while jx < D { V0_T[jx * LORA_R + ix] = V0[ix * D + jx]; jx = jx + 1 }
+        ix = ix + 1
+    }
+    let dU0 = tensor_mul_scalar(matmul(dWq0, V0_T, D, D, LORA_R), LORA_ALPHA)
+    let mut U0_T = tensor_zeros(LORA_R * D)
+    ix = 0
+    while ix < D {
+        let mut jx = 0
+        while jx < LORA_R { U0_T[jx * D + ix] = U0[ix * LORA_R + jx]; jx = jx + 1 }
+        ix = ix + 1
+    }
+    let dV0 = tensor_mul_scalar(matmul(U0_T, dWq0, LORA_R, D, D), LORA_ALPHA)
+
+    // SGD updates
+    U0 = sgd(U0, dU0); V0 = sgd(V0, dV0)
+    U1 = sgd(U1, dU1); V1 = sgd(V1, dV1)
+    U2 = sgd(U2, dU2); V2 = sgd(V2, dV2)
+    U3 = sgd(U3, dU3); V3 = sgd(V3, dV3)
+    lmh_U = sgd(lmh_U, dlmh_U)
+    lmh_V = sgd(lmh_V, dlmh_V)
+
+    return StepResult { loss: loss, phi_val: phi_val }
+}
+
+// ─── Loop ──────────────────────────────────────────────────
+
+let zeta = log(VOCAB * 1.0) / 2.0
+println("[train_alm_fib] 4-layer ALM LoRA on Fibonacci mod 32")
+println("[train_alm_fib] trainable: 4 × (2 × D × LORA_R) + LMH = " + str(4 * 2 * D * LORA_R + D * RANK + RANK * VOCAB))
+println("[train_alm_fib] frozen:    4 × (6 × D × D + D × FF + FF × D) + embed + RMSnorms")
+println("[train_alm_fib] ζ threshold = " + str(zeta))
+
+let r0 = train_step()
+let loss_0 = r0.loss
+let phi_0 = r0.phi_val
+println("[train_alm_fib] step=1  loss=" + str(loss_0) + " Φ=" + str(phi_0))
+
+let mut step = 2
+let mut last_loss = loss_0
+let mut last_phi = phi_0
+let mut max_phi = phi_0
+let mut min_loss = loss_0
+let mut zeta_step = 0
+while step <= STEPS {
+    let r = train_step()
+    last_loss = r.loss
+    last_phi = r.phi_val
+    if last_phi > max_phi { max_phi = last_phi }
+    if last_loss < min_loss { min_loss = last_loss }
+    if zeta_step == 0 && last_phi > zeta {
+        zeta_step = step
+        println("[train_alm_fib] ✨ ζ BREAKTHROUGH at step=" + str(step) + " Φ=" + str(last_phi))
+    }
+    if step % 25 == 0 {
+        println("[train_alm_fib] step=" + str(step) + " loss=" + str(last_loss) + " Φ=" + str(last_phi))
+    }
+    step = step + 1
+}
+
+println("[train_alm_fib] ════════════════════════════════════")
+println("[train_alm_fib] loss: " + str(loss_0) + " → " + str(last_loss) + " (min " + str(min_loss) + ")")
+println("[train_alm_fib] Φ:    " + str(phi_0)  + " → " + str(last_phi)  + " (max " + str(max_phi) + ")")
+if zeta_step > 0 {
+    println("[train_alm_fib] ✨ ALM Fib ζ BREAKTHROUGH at step " + str(zeta_step))
+    println("[train_alm_fib] 2×2 ζ matrix: CLM×simple + CLM×hard + ALM×simple + ALM×hard ALL PASS")
+} else {
+    println("[train_alm_fib] ALM Fib no ζ — may need bigger LoRA rank or more steps")
+}
