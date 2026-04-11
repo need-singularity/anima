@@ -22,6 +22,7 @@ tree:
   sync/        cloud_sync + R2 백업 클라이언트
   cloud/       RunPod/클라우드 서비스
   education/   babysitter + 교육 모듈
+  daemon/      자동발화 데몬 (이벤트 감시 + 3층 창발 게이트)
   logging/     구조화 로그 + tsv/jsonl 출력
 
 rules:
