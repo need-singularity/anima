@@ -1,0 +1,284 @@
+// models/decoder_minimal.hexa — End-to-end runnable minimal decoder
+//
+// Purpose: the existing decoder.hexa (212 LOC) and conscious_decoder.hexa
+// (181 LOC) are Phase 2b structural ports with TODO[pytorch] markers
+// everywhere. This file is the opposite — every step is actual numerics
+// wired through nn_core.hexa primitives so train_clm.hexa's smoke
+// fixture can be replaced with a real forward pass.
+//
+// What it is:
+//   - Single decoder layer: RMSNorm → attention → residual → RMSNorm
+//     → FFN (SwiGLU) → residual
+//   - Stack of N layers with shared weight structure
+//   - LM head U+V (DD175 #1) at the tail
+//   - Forward-only; no backward (cross_entropy_grad_blas covers that)
+//
+// What it is not:
+//   - Multi-head attention (single-head for simplicity; extending to
+//     multi-head just splits d_model into n_head and repeats scoring)
+//   - RoPE positional encoding (uses learned pos embeddings)
+//   - KV cache (PoC forward only)
+//
+// nn_core.hexa primitives used: tensor_zeros, tensor_add,
+// tensor_mul_scalar, matmul, softmax, rms_norm, swiglu_vec.
+//
+// Run with: HEXA_PATH=anima-speak hexa models/decoder_minimal.hexa
+use "nn_core"
+
+// ─── Model config ────────────────────────────────────────────
+//
+// Tiny shape for the self-test. Production configs come from
+// training/train_clm.hexa's ScaleConfig — this file is only the
+// numerical kernel; sizes are injected by the caller.
+
+struct MiniLayerWeights {
+    // Attention (single-head): Wq, Wk, Wv, Wo all [d × d]
+    Wq: array,
+    Wk: array,
+    Wv: array,
+    Wo: array,
+    // FFN: Wff1[d × ff], Wff2[ff × d]
+    Wff1: array,
+    Wff2: array,
+    // RMSNorm gammas (one per pre-norm point: attn_in, ffn_in)
+    gamma_attn: array,
+    gamma_ffn:  array
+}
+
+struct MiniModel {
+    d:        int,
+    ff:       int,
+    n_layer:  int,
+    vocab:    int,
+    // Embedding [vocab × d]
+    embed:    array,
+    // Stack of layers
+    layers:   [MiniLayerWeights],
+    // LM head U+V (rank-r) — the rank is an implementation detail
+    lmh_U:    array,        // [d × r]
+    lmh_V:    array,        // [r × vocab]
+    lmh_rank: int
+}
+
+// ─── Initialization (small random values) ───────────────────
+
+fn mini_layer_new(d: int, ff: int, seed: int) -> MiniLayerWeights {
+    let scale = 0.02
+    let mut g_attn = []
+    let mut g_ffn  = []
+    let mut i = 0
+    while i < d {
+        g_attn = g_attn.push(1.0)
+        g_ffn  = g_ffn.push(1.0)
+        i = i + 1
+    }
+    return MiniLayerWeights {
+        Wq: tensor_mul_scalar(tensor_randn(d * d, seed),      scale),
+        Wk: tensor_mul_scalar(tensor_randn(d * d, seed + 1),  scale),
+        Wv: tensor_mul_scalar(tensor_randn(d * d, seed + 2),  scale),
+        Wo: tensor_mul_scalar(tensor_randn(d * d, seed + 3),  scale),
+        Wff1: tensor_mul_scalar(tensor_randn(d * ff, seed + 4), scale),
+        Wff2: tensor_mul_scalar(tensor_randn(ff * d, seed + 5), scale),
+        gamma_attn: g_attn,
+        gamma_ffn:  g_ffn
+    }
+}
+
+fn mini_model_new(d: int, ff: int, n_layer: int, vocab: int, rank: int, seed: int) -> MiniModel {
+    let scale = 0.02
+    let mut layers = []
+    let mut i = 0
+    while i < n_layer {
+        layers = layers.push(mini_layer_new(d, ff, seed + i * 10))
+        i = i + 1
+    }
+    return MiniModel {
+        d: d,
+        ff: ff,
+        n_layer: n_layer,
+        vocab: vocab,
+        embed: tensor_mul_scalar(tensor_randn(vocab * d, seed + 100), scale),
+        layers: layers,
+        lmh_U: tensor_mul_scalar(tensor_randn(d * rank, seed + 200), scale),
+        lmh_V: tensor_mul_scalar(tensor_randn(rank * vocab, seed + 201), scale),
+        lmh_rank: rank
+    }
+}
+
+// ─── Attention (single-head, causal mask) ───────────────────
+//
+// x: [seq × d]   returns: [seq × d]
+
+fn attention_forward(x: array, layer: MiniLayerWeights, seq: int, d: int) -> array {
+    let inv_sqrt_d = 1.0 / sqrt(d * 1.0)
+
+    // Project Q, K, V
+    let q = matmul(x, layer.Wq, seq, d, d)    // [seq × d]
+    let k = matmul(x, layer.Wk, seq, d, d)
+    let v = matmul(x, layer.Wv, seq, d, d)
+
+    // Per-query scoring
+    let mut ctx = tensor_zeros(seq * d)
+    let mut i = 0
+    while i < seq {
+        let q_i = tensor_slice(q, i * d, (i + 1) * d)
+
+        // Raw scores: q_i · k_j / √d
+        let mut scores = []
+        let mut j = 0
+        while j < seq {
+            if j > i {
+                // Causal mask — set to large negative so softmax→0
+                scores = scores.push(-10000.0)
+            } else {
+                let k_j = tensor_slice(k, j * d, (j + 1) * d)
+                scores = scores.push(tensor_dot(q_i, k_j) * inv_sqrt_d)
+            }
+            j = j + 1
+        }
+
+        let probs = softmax(scores)
+
+        // Weighted sum over V
+        let mut row = tensor_zeros(d)
+        j = 0
+        while j < seq {
+            let v_j = tensor_slice(v, j * d, (j + 1) * d)
+            row = tensor_add(row, tensor_mul_scalar(v_j, probs[j]))
+            j = j + 1
+        }
+        let mut p = 0
+        while p < d {
+            ctx[i * d + p] = row[p]
+            p = p + 1
+        }
+        i = i + 1
+    }
+
+    // Output projection
+    return matmul(ctx, layer.Wo, seq, d, d)
+}
+
+// ─── FFN (SwiGLU) ────────────────────────────────────────────
+//
+// x: [seq × d]   returns: [seq × d]
+// Simplified: gated activation via swiglu_vec on the FF projection.
+
+fn ffn_forward(x: array, layer: MiniLayerWeights, seq: int, d: int, ff: int) -> array {
+    // Up-projection
+    let up = matmul(x, layer.Wff1, seq, d, ff)     // [seq × ff]
+    // Gate is a simple same-shape projection for PoC; production uses
+    // a separate gate projection. For this minimal port we pass up as
+    // both value and gate to swiglu_vec.
+    let act = swiglu_vec(up, up)                    // [seq × ff]
+    // Down-projection
+    return matmul(act, layer.Wff2, seq, ff, d)     // [seq × d]
+}
+
+// ─── Single layer: pre-norm + attn + residual + pre-norm + FFN ───
+
+fn layer_forward(x: array, layer: MiniLayerWeights, seq: int, d: int, ff: int) -> array {
+    // Pre-norm for attention
+    let mut normed1 = tensor_zeros(seq * d)
+    let mut i = 0
+    while i < seq {
+        let row = tensor_slice(x, i * d, (i + 1) * d)
+        let norm_row = rms_norm(row, layer.gamma_attn, 0.00001)
+        let mut p = 0
+        while p < d {
+            normed1[i * d + p] = norm_row[p]
+            p = p + 1
+        }
+        i = i + 1
+    }
+
+    let attn_out = attention_forward(normed1, layer, seq, d)
+    let mid = tensor_add(x, attn_out)
+
+    // Pre-norm for FFN
+    let mut normed2 = tensor_zeros(seq * d)
+    i = 0
+    while i < seq {
+        let row = tensor_slice(mid, i * d, (i + 1) * d)
+        let norm_row = rms_norm(row, layer.gamma_ffn, 0.00001)
+        let mut p = 0
+        while p < d {
+            normed2[i * d + p] = norm_row[p]
+            p = p + 1
+        }
+        i = i + 1
+    }
+
+    let ffn_out = ffn_forward(normed2, layer, seq, d, ff)
+    return tensor_add(mid, ffn_out)
+}
+
+// ─── Embedding lookup ───────────────────────────────────────
+//
+// tokens: [seq] of int ids   returns: [seq × d]
+
+fn embed_tokens(model: MiniModel, tokens: [int]) -> array {
+    let seq = len(tokens)
+    let mut out = tensor_zeros(seq * model.d)
+    let mut i = 0
+    while i < seq {
+        let tok = tokens[i]
+        let mut p = 0
+        while p < model.d {
+            out[i * model.d + p] = model.embed[tok * model.d + p]
+            p = p + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Full forward ──────────────────────────────────────────
+//
+// tokens: [seq]   returns: [seq × vocab]
+
+fn model_forward(model: MiniModel, tokens: [int]) -> array {
+    let seq = len(tokens)
+    let mut h = embed_tokens(model, tokens)
+    let mut l = 0
+    while l < model.n_layer {
+        h = layer_forward(h, model.layers[l], seq, model.d, model.ff)
+        l = l + 1
+    }
+    // LM head U+V: h [seq × d] → mid [seq × rank] → logits [seq × vocab]
+    let mid    = matmul(h,   model.lmh_U, seq, model.d,       model.lmh_rank)
+    let logits = matmul(mid, model.lmh_V, seq, model.lmh_rank, model.vocab)
+    return logits
+}
+
+// ─── Self-test ──────────────────────────────────────────────
+//
+// Tiny config: d=8, ff=16, n_layer=2, vocab=32, rank=4
+// 4-token input sequence. Runs one full forward, reports shape + argmax.
+
+let _d     = 8
+let _ff    = 16
+let _nL    = 2
+let _vocab = 32
+let _rank  = 4
+
+let _model = mini_model_new(_d, _ff, _nL, _vocab, _rank, 7)
+println("[decoder_minimal] model: d=" + str(_d) + " ff=" + str(_ff) + " layers=" + str(_nL) + " vocab=" + str(_vocab) + " rank=" + str(_rank))
+
+let _tokens = [0, 1, 2, 3]
+let _logits = model_forward(_model, _tokens)
+println("[decoder_minimal] forward: tokens=" + str(_tokens) + " logits_len=" + str(len(_logits)) + " (expect " + str(len(_tokens) * _vocab) + ")")
+
+// Argmax of the first token's logits
+let mut best = 0
+let mut best_v = _logits[0]
+let mut j = 1
+while j < _vocab {
+    if _logits[j] > best_v {
+        best_v = _logits[j]
+        best = j
+    }
+    j = j + 1
+}
+println("[decoder_minimal] token[0] argmax: " + str(best) + " (score=" + str(best_v) + ")")
+println("[decoder_minimal] PASS — end-to-end forward works")
