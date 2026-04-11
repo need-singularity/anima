@@ -1,0 +1,151 @@
+// ═══════════════════════════════════════════════════════════════
+//  profile_step_ops.hexa — locate the 500× interpreter gap
+//
+//  R8: train_gpu 43.6M step=161s while raw SGEMM = 52 TFLOPS (0.30s theoretical)
+//      → ~533× gap
+//
+//  Diagnostic: measure per-op dispatch cost on CPU. Interpreter
+//  dispatch cost scales independently of GPU throughput, so if it
+//  dominates on CPU it also dominates on GPU.
+// ═══════════════════════════════════════════════════════════════
+
+let D = 64
+let SEQ = 16
+
+fn randf_array(n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(random() - 0.5)
+        i = i + 1
+    }
+    return out
+}
+
+// ── naive matmul: SEQ × D @ D × D → SEQ × D ──
+fn naive_matmul(a, b, M, N, K) {
+    let mut out = []
+    let mut i = 0
+    while i < M {
+        let mut j = 0
+        while j < N {
+            let mut sum = 0.0
+            let mut k = 0
+            while k < K {
+                sum = sum + a[i * K + k] * b[k * N + j]
+                k = k + 1
+            }
+            out = out.push(sum)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn main() {
+    println("═══ profile_step_ops ═══")
+    println("  D=" + str(D) + " SEQ=" + str(SEQ))
+    println("")
+
+    let a = randf_array(SEQ * D)
+    let b = randf_array(D * D)
+
+    // ── matmul ──
+    let t0 = clock()
+    let iters_mm = 10
+    let mut i = 0
+    while i < iters_mm {
+        let _ = naive_matmul(a, b, SEQ, D, D)
+        i = i + 1
+    }
+    let t1 = clock()
+    let matmul_ms = (t1 - t0) * 1000.0 / (iters_mm * 1.0)
+    println("  naive matmul (SEQ×D @ D×D): " + str(matmul_ms) + " ms/iter")
+
+    // Inner loop ops: M*N*K = 16*64*64 = 65536 multiply-adds
+    // Each mad ≈ 5 interpreter ops (2 index, 1 mul, 1 add, 1 var write)
+    // Total ~327680 ops
+    let est_inner_ops = 327680.0
+    let per_op_us = matmul_ms * 1000.0 / est_inner_ops
+    println("  per-op dispatch cost (rough): " + str(per_op_us) + " us")
+
+    // ── array indexing ──
+    let t2 = clock()
+    let iters_idx = 1000
+    let mut j = 0
+    let mut sum_chk = 0.0
+    while j < iters_idx {
+        let mut k = 0
+        while k < 1000 {
+            sum_chk = sum_chk + a[k]
+            k = k + 1
+        }
+        j = j + 1
+    }
+    let t3 = clock()
+    let idx_ms = (t3 - t2) * 1000.0
+    let idx_ns_per = idx_ms * 1000000.0 / (iters_idx * 1000.0)
+    println("  array index loop (1M total): " + str(idx_ms) + " ms total, " + str(idx_ns_per) + " ns/index")
+
+    // ── function call overhead ──
+    let t4 = clock()
+    let iters_fn = 100000
+    let mut f = 0
+    while f < iters_fn {
+        let _ = f + 1
+        f = f + 1
+    }
+    let t5 = clock()
+    let fn_ms = (t5 - t4) * 1000.0
+    let fn_ns_per = fn_ms * 1000000.0 / (iters_fn * 1.0)
+    println("  empty-body loop iter (" + str(iters_fn) + "): " + str(fn_ms) + " ms total, " + str(fn_ns_per) + " ns/iter")
+
+    // ── env lookup heavy ──
+    let x0 = 1.0
+    let x1 = 2.0
+    let x2 = 3.0
+    let x3 = 4.0
+    let x4 = 5.0
+    let t6 = clock()
+    let mut m = 0
+    let mut s = 0.0
+    while m < 100000 {
+        s = s + x0 + x1 + x2 + x3 + x4
+        m = m + 1
+    }
+    let t7 = clock()
+    let env_ms = (t7 - t6) * 1000.0
+    let env_ns_per_lookup = env_ms * 1000000.0 / (100000.0 * 5.0)
+    println("  env lookup (5 locals × 100k): " + str(env_ms) + " ms total, " + str(env_ns_per_lookup) + " ns/lookup")
+
+    // ── summary ──
+    println("")
+    println("═══ summary ═══")
+
+    // Extrapolation to 43.6M model:
+    // Forward: every param touched ~1×  → 43.6M "ops"
+    // Backward: every param touched ~2× → 87.2M "ops"
+    // Optimizer: ~4 ops per param       → 174.4M "ops"
+    // Plus per-tensor fixed dispatch   ≈ 20k tensors × ~5 ops  = 100k
+    // Effective interpreter ops ~305M
+    let est_total_ops = 305000000.0
+    let est_ms_on_cpu = est_total_ops * per_op_us / 1000.0
+    let est_s = est_ms_on_cpu / 1000.0
+    println("  rough extrapolation to 43.6M model step (CPU):")
+    println("    total interpreted ops (est): " + str(est_total_ops))
+    println("    per-op cost (est from matmul): " + str(per_op_us) + " us")
+    println("    total step time (est): " + str(est_s) + " s")
+    println("")
+    println("  R8 H100 actual: 161 s")
+    println("  R8 raw SGEMM ceiling: 0.302 s (52 TFLOPS)")
+    println("  gap (H100): 533×")
+    println("")
+    println("  conclusion: if CPU est >> 0.3 s by a similar multiple,")
+    println("              interpreter dispatch IS the bottleneck and a")
+    println("              single-call fused train_step FFI is the fix.")
+
+    println("═══ profile_step_ops DONE ═══")
+}
+
+let _ = main()
