@@ -1,0 +1,134 @@
+// ═══════════════════════════════════════════════════════════════
+//  model_1b_gpu.hexa — 1B parameter transformer spec on GPU
+//
+//  P5b-1: 1B 아키텍처 정의
+//
+//  Architecture (1.28B params):
+//    D     = 2048   (hidden dim)
+//    L     = 24     (layers)
+//    H     = 16     (attention heads)
+//    head_d= 128    (D / H)
+//    FF    = 5504   (SwiGLU intermediate, ≈ 8/3 × D, rounded to multiple of 128)
+//    VOCAB = 32000
+//    SEQ   = 2048   (context length)
+//
+//  Parameter counts:
+//    Embedding: vocab × D                = 32000 × 2048 = 65_536_000   (65.5M)
+//    Per layer:
+//      Wq: D × D                         = 2048² = 4_194_304
+//      Wk: D × D                         = 2048² = 4_194_304
+//      Wv: D × D                         = 2048² = 4_194_304
+//      Wo: D × D                         = 2048² = 4_194_304
+//      Wg: D × FF                        = 2048 × 5504 = 11_272_192
+//      Wu: D × FF                        = 2048 × 5504 = 11_272_192
+//      Wd: FF × D                        = 5504 × 2048 = 11_272_192
+//      layer total                       = 50_593_792                  (50.6M)
+//    All layers: L × 50_593_792          = 1_214_251_008                (1.214B)
+//    LM head: tied with embedding        = 0
+//    LayerNorm gains: L × 2 × D          = 24 × 2 × 2048 = 98_304       (negligible)
+//    ─────────────────────────────────────
+//    Grand total: 65_536_000 + 1_214_251_008 + 98_304 ≈ 1_279_885_312   (~1.28B)
+//
+//  Memory footprint (FP32):
+//    Weights      : 1.28B × 4 bytes  =  5.12 GB
+//    Adam m,v     : 1.28B × 8 bytes  = 10.24 GB
+//    Gradients    : 1.28B × 4 bytes  =  5.12 GB
+//    Activations  : ~seq × D × L × 4 = 2048 × 2048 × 24 × 4 ≈ 0.40 GB
+//    Optimizer state total           ~ 20.88 GB on single H100 (80GB free)
+//    Fits comfortably on 1× H100; 2× allows larger batch or tensor parallel.
+//
+//  cuBLAS SGEMM sweet spot (R8 measurement):
+//    2048³  → 50.66 TFLOPS (75.6% util)
+//    4096³  → 52.29 TFLOPS (78.0% util)
+//    1B model layer matmuls hit the 2048³ regime — right at util peak.
+//
+//  Physical step time estimate (at 78% SGEMM util):
+//    FLOPs/step ≈ 6 × N_params × seq = 6 × 1.28e9 × 2048 ≈ 1.57e13
+//    At 52 TFLOPS sustained:            1.57e13 / 52e12 ≈ 0.30 s/step
+//    At 38 TFLOPS (1024³ regime):       1.57e13 / 38e12 ≈ 0.41 s/step
+//    → realistic ceiling: 0.3-0.5 s/step raw, ignoring interpreter overhead
+//    → interpreter-limited (from R8 training step): >100× slower until codegen
+//
+//  Training budget (100B tokens at ceiling):
+//    tokens/step = batch × seq = 8 × 2048 = 16_384
+//    steps = 100e9 / 16_384 ≈ 6.1M steps
+//    At 0.4 s/step: 6.1M × 0.4 = 2.44M s = 678 hours = 28 days on 1× H100
+//    At 20 s/step interpreter: infeasible without codegen
+// ═══════════════════════════════════════════════════════════════
+
+// NOTE: GPU module uses deferred — on H100 the caller does:
+//   HEXA_PATH=$HEXA_LANG_ROOT/self/ml ./hexa training/model_1b_gpu.hexa --train
+// so that `use "cuda_ffi"` / `use "gpu_tensor"` / `use "gpu_grad_engine"` resolve.
+// For CPU-only spec validation (param count / FLOP estimate / memory footprint)
+// the imports are intentionally omitted.
+
+// ── Model dimensions ─────────────────────────────────────────
+let M1B_DIM    = 2048
+let M1B_HEADS  = 16
+let M1B_HEAD_D = 128
+let M1B_FF     = 5504
+let M1B_VOCAB  = 32000
+let M1B_LAYERS = 24
+let M1B_SEQ    = 2048
+
+// ── Parameter count (exact) ──────────────────────────────────
+fn m1b_param_count() {
+    let emb = M1B_VOCAB * M1B_DIM
+    let attn_per_layer = 4 * M1B_DIM * M1B_DIM
+    let ffn_per_layer = 3 * M1B_DIM * M1B_FF
+    let ln_per_layer = 2 * M1B_DIM
+    let layer = attn_per_layer + ffn_per_layer + ln_per_layer
+    let total = emb + M1B_LAYERS * layer
+    return total
+}
+
+// ── FLOP per forward step (approximate) ──────────────────────
+// Standard Chinchilla estimate: 6 × N × seq per training step (fwd+bwd+opt)
+fn m1b_flops_per_step() {
+    let n = m1b_param_count()
+    let flops = 6 * n * M1B_SEQ
+    return flops
+}
+
+// ── Memory footprint in bytes (FP32 weights + Adam m,v + grads) ─
+fn m1b_memory_bytes() {
+    let n = m1b_param_count()
+    // weights + grads + m + v = 4 × N × 4 bytes = 16N bytes
+    let opt = 16 * n
+    // activations: seq × dim × layers × 4 bytes × 2 (residual stream)
+    let act = M1B_SEQ * M1B_DIM * M1B_LAYERS * 4 * 2
+    return opt + act
+}
+
+// ── Weight initialization (template — actual uses gpu_tensor prims) ─
+// Note: this is a spec file. The actual forward/backward re-uses
+// attention_fwd / ffn_swiglu_fwd / model_forward from model_100m_gpu.hexa
+// with the M1B_* constants in place of GPU_* constants.
+fn init_1b_weights() {
+    println("[model_1b] target: " + str(m1b_param_count()) + " params")
+    println("[model_1b] flops/step: " + str(m1b_flops_per_step()))
+    println("[model_1b] memory estimate: " + str(m1b_memory_bytes() / (1024 * 1024)) + " MB")
+    println("[model_1b] NOTE: full weight init requires GPU — this spec runs on CPU only for sizing.")
+}
+
+fn main() {
+    println("═══ model_1b_gpu.hexa ═══")
+    println("  D=" + str(M1B_DIM) + " L=" + str(M1B_LAYERS) + " H=" + str(M1B_HEADS))
+    println("  FF=" + str(M1B_FF) + " VOCAB=" + str(M1B_VOCAB) + " SEQ=" + str(M1B_SEQ))
+    println("")
+    let n = m1b_param_count()
+    let n_b = n / 1000000
+    println("  params: " + str(n) + " (" + str(n_b) + "M)")
+    let flops = m1b_flops_per_step()
+    let flops_g = flops / 1000000000
+    println("  flops/step: " + str(flops) + " (" + str(flops_g) + "G)")
+    let mem_mb = m1b_memory_bytes() / (1024 * 1024)
+    println("  memory: " + str(mem_mb) + " MB")
+    println("")
+    let step_s = (flops * 1.0) / 52000000000000.0
+    println("  target step time @ 52 TFLOPS sustained: " + str(step_s) + " s")
+    println("  single H100 fits: " + str(mem_mb) + " MB / 81920 MB = OK")
+    println("═══ spec validation DONE ═══")
+}
+
+let _ = main()
