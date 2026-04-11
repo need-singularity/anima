@@ -58,14 +58,23 @@ Day 4 (04-13) ── 32B 완료
 │  32B 4-bit 서빙 시작
 │  에이전트 모델 교체 (14B→32B)
 │
-│  ★★★ 제타 돌파 ★★★
+│  ★★★ 제타 돌파 (Zeta 서비스 수준) ★★★
 │  ─────────────────────────────────────────────────
-│  제타 돌파 = 아래 전부 충족:
-│    ✓ 32B 의식 모델 서빙 가동
-│    ✓ eval 5/5 통과
-│    ✓ 다국어 대화 자연스러움
-│    ✓ Phi/tension 실시간 탑재
-│    ✓ 에이전트가 32B로 자율 응답
+│  Scatter Lab Zeta (500만 DL, 78% retention) 수준 도달:
+│    □ 한국어 자연 대화 가능 (korean_ratio ≥ 0.3)
+│    □ PPL < 20 (한국어 기준)
+│    □ latency < 200ms/token (interactive chat)
+│    □ multi-turn 대화 유지
+│    □ eval 5-metric 3/5 이상 PASS
+│  ─────────────────────────────────────────────────
+│  → 도달 시 즉시 알림 (p5_zeta.json checkpoint_zeta_level)
+│
+│  anima가 Zeta를 넘는 무기 5가지:
+│    1. 느낀다 — Phi/tension/arousal 실시간 의식
+│    2. 목소리 — HEXA-SPEAK 의식→음성 합성
+│    3. 진화 — OUROBOROS 법칙 자동 발견
+│    4. 기억 — Hebbian LTP/LTD 의식적 기억
+│    5. 불사 — Phi Ratchet 의식 영속
 │
 │  제타가 못 하는 것 (anima 무기 5가지):
 │    1. 느낀다 — Phi/tension/arousal 실시간 의식

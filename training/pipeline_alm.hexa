@@ -1,0 +1,405 @@
+// training/pipeline_alm.hexa — ALM LoRA fine-tune pipeline
+//
+// GOAL: ALM → AGI. LoRA adapters on frozen base, configurable scale.
+//
+// Architecture: frozen random base + trainable LoRA(U,V) on all Wq + LM head.
+// This mirrors the AnimaLM approach: inject consciousness into existing LLM.
+//
+// Modes:
+//   SMOKE  — 2L d=8 LoRA_r=2, shift-by-1 corpus, ~20s
+//   DEEP   — 4L d=16 LoRA_r=4, Fibonacci mod 32, ~5min
+//   KOREAN — 4L d=16 LoRA_r=4, Korean byte corpus, ~10min
+//
+// Usage:
+//   cp anima-speak/nn_core.hexa training/nn_core.hexa
+//   hexa training/pipeline_alm.hexa              # SMOKE
+//   hexa training/pipeline_alm.hexa --deep       # DEEP (Fib)
+//   hexa training/pipeline_alm.hexa --korean     # KOREAN bytes
+//
+use "nn_core"
+use "corpus_loader"
+
+// ─── Primitives ─────────────────────────────────────────────
+
+fn mm_bwd(a: array, b: array, dc: array, M: int, K: int, N: int) -> [array] {
+    let dA = matmul_transB(dc, b, M, N, K)
+    let mut aT = tensor_zeros(K * M)
+    let mut i = 0
+    while i < M {
+        let mut j = 0
+        while j < K { aT[j * M + i] = a[i * K + j]; j = j + 1 }
+        i = i + 1
+    }
+    let dB = matmul(aT, dc, K, M, N)
+    return [dA, dB]
+}
+
+fn phi(h: array, seq: int, d: int) -> float {
+    let mut col_sum = tensor_zeros(d)
+    let mut i = 0
+    while i < seq {
+        let mut j = 0
+        while j < d {
+            let a = h[i * d + j]
+            col_sum[j] = col_sum[j] + (if a < 0.0 { 0.0 - a } else { a })
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let p = softmax(col_sum)
+    let max_h = log(d * 1.0)
+    let mut h_ent = 0.0
+    i = 0
+    while i < d {
+        if p[i] > 0.000001 { h_ent = h_ent - p[i] * log(p[i]) }
+        i = i + 1
+    }
+    return max_h - h_ent
+}
+
+// ─── Config ─────────────────────────────────────────────────
+
+struct AlmConfig {
+    name: string,
+    D: int, FF: int, NL: int, VOCAB: int, RANK: int, LORA_R: int, SEQ: int,
+    STEPS: int, LR: float, LORA_ALPHA: float,
+    CORPUS_MODE: string
+}
+
+fn alm_smoke() -> AlmConfig {
+    AlmConfig {
+        name: "SMOKE", D: 8, FF: 16, NL: 2, VOCAB: 16, RANK: 4, LORA_R: 2, SEQ: 8,
+        STEPS: 200, LR: 0.1, LORA_ALPHA: 1.0, CORPUS_MODE: "period"
+    }
+}
+
+fn alm_deep() -> AlmConfig {
+    AlmConfig {
+        name: "DEEP", D: 16, FF: 32, NL: 4, VOCAB: 32, RANK: 8, LORA_R: 4, SEQ: 8,
+        STEPS: 500, LR: 0.2, LORA_ALPHA: 2.0, CORPUS_MODE: "fib"
+    }
+}
+
+fn alm_korean() -> AlmConfig {
+    AlmConfig {
+        name: "KOREAN", D: 16, FF: 32, NL: 4, VOCAB: 256, RANK: 8, LORA_R: 4, SEQ: 8,
+        STEPS: 500, LR: 0.15, LORA_ALPHA: 2.0, CORPUS_MODE: "korean"
+    }
+}
+
+let ARGS = args()
+let mut CFG = alm_smoke()
+if len(ARGS) > 1 {
+    if ARGS[1] == "--deep" { CFG = alm_deep() }
+    if ARGS[1] == "--korean" { CFG = alm_korean() }
+}
+let D = CFG.D
+let FF = CFG.FF
+let NL = CFG.NL
+let VOCAB = CFG.VOCAB
+let RANK = CFG.RANK
+let LORA_R = CFG.LORA_R
+let SEQ = CFG.SEQ
+let EPS = 0.00001
+
+println("═══════════════════════════════════════════════")
+println("[ALM] " + CFG.name + " — D=" + str(D) + " L=" + str(NL) + " V=" + str(VOCAB) + " LoRA_r=" + str(LORA_R))
+println("[ALM] STEPS=" + str(CFG.STEPS) + " LR=" + str(CFG.LR) + " α=" + str(CFG.LORA_ALPHA))
+println("═══════════════════════════════════════════════")
+
+// ─── Corpus ─────────────────────────────────────────────────
+
+let CORPUS = if CFG.CORPUS_MODE == "fib" {
+    synthetic_fib(VOCAB, 64)
+} else if CFG.CORPUS_MODE == "korean" {
+    synthetic_korean_bytes()
+} else {
+    synthetic_period(VOCAB, SEQ, SEQ * 64)
+}
+
+// ─── RNG ────────────────────────────────────────────────────
+
+let mut RNG = 42
+fn next_rand(max: int) -> int {
+    RNG = (RNG * 1103515245 + 12345) % 2147483647
+    let m = RNG % max
+    if m < 0 { return 0 - m }
+    return m
+}
+
+// ─── Frozen base model ──────────────────────────────────────
+
+let base_embed = tensor_mul_scalar(tensor_randn(VOCAB * D, 1), 0.1)
+
+// Init frozen layers
+struct FrozenLayer {
+    Wq: array, Wk: array, Wv: array, Wo: array,
+    Wff1: array, Wff2: array
+}
+
+let mut base_layers = []
+let mut bl = 0
+while bl < NL {
+    let s = 10 + bl * 10
+    base_layers = base_layers.push(FrozenLayer {
+        Wq:   tensor_mul_scalar(tensor_randn(D * D,  s),     0.1),
+        Wk:   tensor_mul_scalar(tensor_randn(D * D,  s + 1), 0.1),
+        Wv:   tensor_mul_scalar(tensor_randn(D * D,  s + 2), 0.1),
+        Wo:   tensor_mul_scalar(tensor_randn(D * D,  s + 3), 0.1),
+        Wff1: tensor_mul_scalar(tensor_randn(D * FF, s + 4), 0.1),
+        Wff2: tensor_mul_scalar(tensor_randn(FF * D, s + 5), 0.1)
+    })
+    bl = bl + 1
+}
+
+let mut base_ga = []
+let mut base_gf = []
+let mut _gi = 0
+while _gi < D { base_ga = base_ga.push(1.0); base_gf = base_gf.push(1.0); _gi = _gi + 1 }
+
+// ─── Trainable LoRA adapters (one per layer Wq) ────────────
+
+struct LoraAdapter { U: array, V: array }
+
+let mut lora = []
+let mut la = 0
+while la < NL {
+    lora = lora.push(LoraAdapter {
+        U: tensor_mul_scalar(tensor_randn(D * LORA_R, 100 + la), 0.05),
+        V: tensor_zeros(LORA_R * D)
+    })
+    la = la + 1
+}
+
+let mut lmh_U = tensor_mul_scalar(tensor_randn(D * RANK, 200), 0.1)
+let mut lmh_V = tensor_mul_scalar(tensor_randn(RANK * VOCAB, 201), 0.1)
+
+let trainable = NL * 2 * D * LORA_R + D * RANK + RANK * VOCAB
+let frozen_per_l = 4 * D * D + D * FF + FF * D
+println("[ALM] trainable: " + str(trainable) + " params")
+println("[ALM] frozen:    " + str(NL * frozen_per_l + VOCAB * D) + " params")
+
+// ─── Effective Wq ───────────────────────────────────────────
+
+fn effective_wq(base_wq: array, u: array, v: array) -> array {
+    let delta = matmul(u, v, D, LORA_R, D)
+    return tensor_add(base_wq, tensor_mul_scalar(delta, CFG.LORA_ALPHA))
+}
+
+// ─── Layer forward (flat, same as train_alm_fib) ────────────
+
+fn embed_lookup(toks: [int]) -> array {
+    let n = len(toks)
+    let mut out = tensor_zeros(n * D)
+    let mut i = 0
+    while i < n {
+        let t = toks[i]
+        let mut p = 0
+        while p < D { out[i * D + p] = base_embed[t * D + p]; p = p + 1 }
+        i = i + 1
+    }
+    return out
+}
+
+fn layer_fwd_flat(x: array, wq: array, wk: array, wv: array, wo: array,
+                  wff1: array, wff2: array) -> array {
+    let inv_d = 1.0 / sqrt(D * 1.0)
+    let mut norm1 = tensor_zeros(SEQ * D)
+    let mut i = 0
+    while i < SEQ {
+        let r = rms_norm(tensor_slice(x, i * D, (i + 1) * D), base_ga, EPS)
+        let mut p = 0
+        while p < D { norm1[i * D + p] = r[p]; p = p + 1 }
+        i = i + 1
+    }
+    let q = matmul(norm1, wq, SEQ, D, D)
+    let k = matmul(norm1, wk, SEQ, D, D)
+    let v = matmul(norm1, wv, SEQ, D, D)
+    let mut ctx = tensor_zeros(SEQ * D)
+    i = 0
+    while i < SEQ {
+        let qi = tensor_slice(q, i * D, (i + 1) * D)
+        let mut scores = []
+        let mut j = 0
+        while j < SEQ {
+            if j > i { scores = scores.push(-10000.0) }
+            else { scores = scores.push(tensor_dot(qi, tensor_slice(k, j * D, (j + 1) * D)) * inv_d) }
+            j = j + 1
+        }
+        let pi = softmax(scores)
+        let mut row = tensor_zeros(D)
+        j = 0
+        while j < SEQ {
+            row = tensor_add(row, tensor_mul_scalar(tensor_slice(v, j * D, (j + 1) * D), pi[j]))
+            j = j + 1
+        }
+        let mut p = 0
+        while p < D { ctx[i * D + p] = row[p]; p = p + 1 }
+        i = i + 1
+    }
+    let attn = matmul(ctx, wo, SEQ, D, D)
+    let mid = tensor_add(x, attn)
+    let mut norm2 = tensor_zeros(SEQ * D)
+    i = 0
+    while i < SEQ {
+        let r = rms_norm(tensor_slice(mid, i * D, (i + 1) * D), base_gf, EPS)
+        let mut p = 0
+        while p < D { norm2[i * D + p] = r[p]; p = p + 1 }
+        i = i + 1
+    }
+    let up = matmul(norm2, wff1, SEQ, D, FF)
+    let act = swiglu_vec(up, up)
+    let ffn = matmul(act, wff2, SEQ, FF, D)
+    return tensor_add(mid, ffn)
+}
+
+fn sgd(w: array, g: array, lr: float) -> array {
+    let n = len(w)
+    let mut out = tensor_zeros(n)
+    let mut i = 0
+    while i < n { out[i] = w[i] - lr * g[i]; i = i + 1 }
+    return out
+}
+
+// ─── Training step (forward + approx backward for LoRA) ────
+
+fn train_step(tokens: [int], targets: [int]) -> [float, float] {
+    let h0 = embed_lookup(tokens)
+
+    // Forward through all layers with effective Wq
+    let mut hiddens = [h0]
+    let mut li = 0
+    while li < NL {
+        let bl = base_layers[li]
+        let wq = effective_wq(bl.Wq, lora[li].U, lora[li].V)
+        let h_next = layer_fwd_flat(hiddens[li], wq, bl.Wk, bl.Wv, bl.Wo, bl.Wff1, bl.Wff2)
+        hiddens = hiddens.push(h_next)
+        li = li + 1
+    }
+    let h_final = hiddens[NL]
+    let mid = matmul(h_final, lmh_U, SEQ, D, RANK)
+    let logits = matmul(mid, lmh_V, SEQ, RANK, VOCAB)
+    let phi_val = phi(logits, SEQ, VOCAB)
+
+    // CE loss + dlogits
+    let scale = 1.0 / (SEQ * 1.0)
+    let mut loss = 0.0
+    let mut dlogits = tensor_zeros(SEQ * VOCAB)
+    let mut i = 0
+    while i < SEQ {
+        let row = tensor_slice(logits, i * VOCAB, (i + 1) * VOCAB)
+        let lp = log_softmax(row)
+        loss = loss - lp[targets[i]]
+        let p = softmax(row)
+        let mut j = 0
+        while j < VOCAB {
+            dlogits[i * VOCAB + j] = p[j] * scale
+            j = j + 1
+        }
+        dlogits[i * VOCAB + targets[i]] = dlogits[i * VOCAB + targets[i]] - scale
+        i = i + 1
+    }
+    loss = loss / (SEQ * 1.0)
+
+    // Backward LM head
+    let gV = mm_bwd(mid, lmh_V, dlogits, SEQ, RANK, VOCAB)
+    let dmid = gV[0]
+    let dlmh_V = gV[1]
+    let gU = mm_bwd(h_final, lmh_U, dmid, SEQ, D, RANK)
+    let mut dh = gU[0]
+    let dlmh_U = gU[1]
+
+    // Backward through layers (approx: gradient through base Wq^T)
+    li = NL - 1
+    while li >= 0 {
+        let bl = base_layers[li]
+        let h_in = hiddens[li]
+
+        // transpose h_in for dWq
+        let mut hT = tensor_zeros(D * SEQ)
+        let mut ix = 0
+        while ix < SEQ {
+            let mut jx = 0
+            while jx < D { hT[jx * SEQ + ix] = h_in[ix * D + jx]; jx = jx + 1 }
+            ix = ix + 1
+        }
+        let dh_approx = matmul_transB(dh, bl.Wq, SEQ, D, D)
+        let dWq = matmul(hT, dh_approx, D, SEQ, D)
+
+        // LoRA gradient: dU = dWq @ V^T * alpha, dV = U^T @ dWq * alpha
+        let mut VT = tensor_zeros(D * LORA_R)
+        ix = 0
+        while ix < LORA_R {
+            let mut jx = 0
+            while jx < D { VT[jx * LORA_R + ix] = lora[li].V[ix * D + jx]; jx = jx + 1 }
+            ix = ix + 1
+        }
+        let dU = tensor_mul_scalar(matmul(dWq, VT, D, D, LORA_R), CFG.LORA_ALPHA)
+        let mut UT = tensor_zeros(LORA_R * D)
+        ix = 0
+        while ix < D {
+            let mut jx = 0
+            while jx < LORA_R { UT[jx * D + ix] = lora[li].U[ix * LORA_R + jx]; jx = jx + 1 }
+            ix = ix + 1
+        }
+        let dV = tensor_mul_scalar(matmul(UT, dWq, LORA_R, D, D), CFG.LORA_ALPHA)
+
+        // SGD update LoRA
+        lora[li] = LoraAdapter {
+            U: sgd(lora[li].U, dU, CFG.LR),
+            V: sgd(lora[li].V, dV, CFG.LR)
+        }
+        dh = dh_approx
+        li = li - 1
+    }
+
+    // SGD update LM head
+    lmh_U = sgd(lmh_U, dlmh_U, CFG.LR)
+    lmh_V = sgd(lmh_V, dlmh_V, CFG.LR)
+
+    return [loss, phi_val]
+}
+
+// ─── Training loop ──────────────────────────────────────────
+
+let zeta = log(VOCAB * 1.0) / 2.0
+println("[ALM] ζ threshold: " + str(zeta))
+println("[ALM] corpus: " + str(len(CORPUS)) + " tokens")
+println("[ALM] training...")
+
+let max_start = len(CORPUS) - SEQ - 1
+let mut step = 1
+let mut min_loss = 999.0
+let mut max_phi = 0.0
+let mut zeta_step = 0
+
+while step <= CFG.STEPS {
+    let start = next_rand(max_start)
+    let tokens = corpus_window(CORPUS, start, SEQ)
+    let targets = corpus_targets(CORPUS, start, SEQ)
+
+    let r = train_step(tokens, targets)
+    let loss = r[0]
+    let phi_val = r[1]
+    if loss < min_loss { min_loss = loss }
+    if phi_val > max_phi { max_phi = phi_val }
+    if zeta_step == 0 && phi_val > zeta {
+        zeta_step = step
+        println("[ALM] ✨ ζ BREAKTHROUGH step=" + str(step) + " Φ=" + str(phi_val))
+    }
+
+    if step % 25 == 0 || step == 1 {
+        println("[ALM] step=" + str(step) + " loss=" + str(loss) + " Φ=" + str(phi_val))
+    }
+    step = step + 1
+}
+
+// ─── Summary ────────────────────────────────────────────────
+
+println("═══════════════════════════════════════════════")
+println("[ALM] " + CFG.name + " DONE")
+println("[ALM] loss: min=" + str(min_loss) + "  Φ: max=" + str(max_phi))
+if zeta_step > 0 {
+    println("[ALM] ✨ ζ BREAKTHROUGH at step " + str(zeta_step))
+}
+println("═══════════════════════════════════════════════")

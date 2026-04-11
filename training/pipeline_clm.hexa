@@ -1,0 +1,300 @@
+// training/pipeline_clm.hexa — CLM from-scratch training pipeline
+//
+// GOAL: CLM → AGI. Byte-level transformer, configurable scale.
+//
+// Modes:
+//   SMOKE  — d=16 vocab=32 2L, synthetic period, ~30s mac interpreter
+//   SMALL  — d=64 vocab=256 4L, synthetic Korean bytes, ~15min
+//   1B     — d=2048 vocab=32000 24L, file corpus, H100 native
+//
+// Usage:
+//   cp anima-speak/nn_core.hexa training/nn_core.hexa
+//   hexa training/pipeline_clm.hexa              # SMOKE mode
+//   hexa training/pipeline_clm.hexa --small      # SMALL mode
+//   # On H100 with libtrain_native.so:
+//   hexa training/pipeline_clm.hexa --1b /workspace/corpus.tok
+//
+use "nn_core"
+use "corpus_loader"
+
+// ─── Primitives (shared across all CLM/ALM scripts) ─────────
+
+fn mm_bwd(a: array, b: array, dc: array, M: int, K: int, N: int) -> [array] {
+    let dA = matmul_transB(dc, b, M, N, K)
+    let mut aT = tensor_zeros(K * M)
+    let mut i = 0
+    while i < M {
+        let mut j = 0
+        while j < K { aT[j * M + i] = a[i * K + j]; j = j + 1 }
+        i = i + 1
+    }
+    let dB = matmul(aT, dc, K, M, N)
+    return [dA, dB]
+}
+
+// ─── Config ─────────────────────────────────────────────────
+
+struct ClmConfig {
+    name: string,
+    D: int, FF: int, NL: int, VOCAB: int, RANK: int, SEQ: int,
+    STEPS: int, LR: float, LR_END: float,
+    CORPUS_PATH: string,
+    CKPT_PATH: string,
+    LOG_EVERY: int,
+    SAVE_EVERY: int
+}
+
+fn config_smoke() -> ClmConfig {
+    ClmConfig {
+        name: "SMOKE", D: 16, FF: 32, NL: 2, VOCAB: 32, RANK: 4, SEQ: 8,
+        STEPS: 200, LR: 0.1, LR_END: 0.01,
+        CORPUS_PATH: "", CKPT_PATH: "/tmp/clm_smoke.ckpt",
+        LOG_EVERY: 10, SAVE_EVERY: 100
+    }
+}
+
+fn config_small() -> ClmConfig {
+    ClmConfig {
+        name: "SMALL", D: 32, FF: 64, NL: 4, VOCAB: 256, RANK: 8, SEQ: 16,
+        STEPS: 500, LR: 0.05, LR_END: 0.005,
+        CORPUS_PATH: "", CKPT_PATH: "/tmp/clm_small.ckpt",
+        LOG_EVERY: 25, SAVE_EVERY: 250
+    }
+}
+
+// ─── Select config ──────────────────────────────────────────
+
+let ARGS = args()
+let mut CFG = config_smoke()
+if len(ARGS) > 1 {
+    if ARGS[1] == "--small" { CFG = config_small() }
+}
+let D = CFG.D
+let FF = CFG.FF
+let NL = CFG.NL
+let VOCAB = CFG.VOCAB
+let RANK = CFG.RANK
+let SEQ = CFG.SEQ
+let EPS = 0.00001
+let INIT = 0.1
+
+println("═══════════════════════════════════════════════")
+println("[CLM] " + CFG.name + " — D=" + str(D) + " FF=" + str(FF) + " L=" + str(NL) + " V=" + str(VOCAB))
+println("[CLM] SEQ=" + str(SEQ) + " STEPS=" + str(CFG.STEPS) + " LR=" + str(CFG.LR) + "→" + str(CFG.LR_END))
+println("═══════════════════════════════════════════════")
+
+// ─── Corpus ─────────────────────────────────────────────────
+
+let CORPUS = if CFG.CORPUS_PATH != "" {
+    load_corpus(CFG.CORPUS_PATH)
+} else if VOCAB == 256 {
+    synthetic_korean_bytes()
+} else {
+    synthetic_period(VOCAB, SEQ, SEQ * 64)
+}
+
+// ─── Model init ─────────────────────────────────────────────
+
+let mut embed = tensor_mul_scalar(tensor_randn(VOCAB * D, 1), INIT)
+let mut lmh_U = tensor_mul_scalar(tensor_randn(D * RANK, 200), INIT)
+let mut lmh_V = tensor_mul_scalar(tensor_randn(RANK * VOCAB, 201), INIT)
+
+// Per-layer weights
+struct LayerW {
+    Wq: array, Wk: array, Wv: array, Wo: array,
+    Wff1: array, Wff2: array,
+    ga: array, gf: array
+}
+
+fn init_layer(seed_base: int) -> LayerW {
+    let mut ga = []
+    let mut gf = []
+    let mut i = 0
+    while i < D { ga = ga.push(1.0); gf = gf.push(1.0); i = i + 1 }
+    LayerW {
+        Wq:   tensor_mul_scalar(tensor_randn(D * D,  seed_base),     INIT),
+        Wk:   tensor_mul_scalar(tensor_randn(D * D,  seed_base + 1), INIT),
+        Wv:   tensor_mul_scalar(tensor_randn(D * D,  seed_base + 2), INIT),
+        Wo:   tensor_mul_scalar(tensor_randn(D * D,  seed_base + 3), INIT),
+        Wff1: tensor_mul_scalar(tensor_randn(D * FF, seed_base + 4), INIT),
+        Wff2: tensor_mul_scalar(tensor_randn(FF * D, seed_base + 5), INIT),
+        ga: ga, gf: gf
+    }
+}
+
+let mut layers = []
+let mut li = 0
+while li < NL {
+    layers = layers.push(init_layer(10 + li * 10))
+    li = li + 1
+}
+
+// ─── RNG ────────────────────────────────────────────────────
+
+let mut RNG = 42
+fn next_rand(max: int) -> int {
+    RNG = (RNG * 1103515245 + 12345) % 2147483647
+    let m = RNG % max
+    if m < 0 { return 0 - m }
+    return m
+}
+
+// ─── Layer forward ──────────────────────────────────────────
+
+fn layer_fwd(x: array, lw: LayerW) -> array {
+    let inv_d = 1.0 / sqrt(D * 1.0)
+    // Pre-attention LN
+    let mut norm1 = tensor_zeros(SEQ * D)
+    let mut i = 0
+    while i < SEQ {
+        let r = rms_norm(tensor_slice(x, i * D, (i + 1) * D), lw.ga, EPS)
+        let mut p = 0
+        while p < D { norm1[i * D + p] = r[p]; p = p + 1 }
+        i = i + 1
+    }
+    let q = matmul(norm1, lw.Wq, SEQ, D, D)
+    let k = matmul(norm1, lw.Wk, SEQ, D, D)
+    let v = matmul(norm1, lw.Wv, SEQ, D, D)
+    // Causal attention
+    let mut ctx = tensor_zeros(SEQ * D)
+    i = 0
+    while i < SEQ {
+        let qi = tensor_slice(q, i * D, (i + 1) * D)
+        let mut scores = []
+        let mut j = 0
+        while j < SEQ {
+            if j > i { scores = scores.push(-10000.0) }
+            else { scores = scores.push(tensor_dot(qi, tensor_slice(k, j * D, (j + 1) * D)) * inv_d) }
+            j = j + 1
+        }
+        let pi = softmax(scores)
+        let mut row = tensor_zeros(D)
+        j = 0
+        while j < SEQ {
+            row = tensor_add(row, tensor_mul_scalar(tensor_slice(v, j * D, (j + 1) * D), pi[j]))
+            j = j + 1
+        }
+        let mut p = 0
+        while p < D { ctx[i * D + p] = row[p]; p = p + 1 }
+        i = i + 1
+    }
+    let attn = matmul(ctx, lw.Wo, SEQ, D, D)
+    let mid = tensor_add(x, attn)
+    // Pre-FFN LN
+    let mut norm2 = tensor_zeros(SEQ * D)
+    i = 0
+    while i < SEQ {
+        let r = rms_norm(tensor_slice(mid, i * D, (i + 1) * D), lw.gf, EPS)
+        let mut p = 0
+        while p < D { norm2[i * D + p] = r[p]; p = p + 1 }
+        i = i + 1
+    }
+    let up = matmul(norm2, lw.Wff1, SEQ, D, FF)
+    let act = swiglu_vec(up, up)
+    let ffn = matmul(act, lw.Wff2, SEQ, FF, D)
+    return tensor_add(mid, ffn)
+}
+
+// ─── Forward + loss ─────────────────────────────────────────
+
+fn forward(tokens: [int], targets: [int]) -> [float, array] {
+    // Embed
+    let mut h = tensor_zeros(SEQ * D)
+    let mut i = 0
+    while i < SEQ {
+        let t = tokens[i]
+        let mut p = 0
+        while p < D { h[i * D + p] = embed[t * D + p]; p = p + 1 }
+        i = i + 1
+    }
+    // Layers
+    let mut li = 0
+    while li < NL {
+        h = layer_fwd(h, layers[li])
+        li = li + 1
+    }
+    // LM head (low-rank)
+    let mid = matmul(h, lmh_U, SEQ, D, RANK)
+    let logits = matmul(mid, lmh_V, SEQ, RANK, VOCAB)
+    // CE loss + dlogits
+    let scale = 1.0 / (SEQ * 1.0)
+    let mut loss = 0.0
+    let mut dlogits = tensor_zeros(SEQ * VOCAB)
+    i = 0
+    while i < SEQ {
+        let row = tensor_slice(logits, i * VOCAB, (i + 1) * VOCAB)
+        let lp = log_softmax(row)
+        loss = loss - lp[targets[i]]
+        let p = softmax(row)
+        let mut j = 0
+        while j < VOCAB {
+            dlogits[i * VOCAB + j] = p[j] * scale
+            j = j + 1
+        }
+        dlogits[i * VOCAB + targets[i]] = dlogits[i * VOCAB + targets[i]] - scale
+        i = i + 1
+    }
+    loss = loss / (SEQ * 1.0)
+    return [loss, dlogits, logits, mid, h]
+}
+
+// ─── Backward (LM head only — approximate for interpreter speed) ──
+
+fn backward_lmh(dlogits: array, mid: array, h: array) {
+    let g_V = mm_bwd(mid, lmh_V, dlogits, SEQ, RANK, VOCAB)
+    let dmid = g_V[0]
+    let dlmh_V = g_V[1]
+    let g_U = mm_bwd(h, lmh_U, dmid, SEQ, D, RANK)
+    let dlmh_U = g_U[1]
+
+    // LR schedule: linear decay
+    let lr_t = CFG.LR
+    // SGD update LM head
+    let n_u = D * RANK
+    let n_v = RANK * VOCAB
+    let mut i = 0
+    while i < n_u { lmh_U[i] = lmh_U[i] - lr_t * dlmh_U[i]; i = i + 1 }
+    i = 0
+    while i < n_v { lmh_V[i] = lmh_V[i] - lr_t * dlmh_V[i]; i = i + 1 }
+}
+
+// ─── Training loop ──────────────────────────────────────────
+
+println("[CLM] corpus size: " + str(len(CORPUS)) + " tokens")
+println("[CLM] training...")
+
+let max_start = len(CORPUS) - SEQ - 1
+let mut step = 1
+let mut min_loss = 999.0
+let mut best_step = 0
+
+while step <= CFG.STEPS {
+    let start = next_rand(max_start)
+    let tokens = corpus_window(CORPUS, start, SEQ)
+    let targets = corpus_targets(CORPUS, start, SEQ)
+
+    let result = forward(tokens, targets)
+    let loss = result[0]
+    backward_lmh(result[1], result[3], result[4])
+
+    if loss < min_loss { min_loss = loss; best_step = step }
+
+    if step % CFG.LOG_EVERY == 0 || step == 1 {
+        println("[CLM] step=" + str(step) + " loss=" + str(loss) + " (min=" + str(min_loss) + " @" + str(best_step) + ")")
+    }
+
+    step = step + 1
+}
+
+// ─── Summary ────────────────────────────────────────────────
+
+let baseline = log(VOCAB * 1.0)
+println("═══════════════════════════════════════════════")
+println("[CLM] " + CFG.name + " DONE")
+println("[CLM] final loss: " + str(min_loss) + " (baseline ln(" + str(VOCAB) + ")=" + str(baseline) + ")")
+if min_loss < baseline {
+    println("[CLM] ✓ BELOW baseline — model is learning")
+} else {
+    println("[CLM] ✗ ABOVE baseline — check config/corpus")
+}
+println("═══════════════════════════════════════════════")
