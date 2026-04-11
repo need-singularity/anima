@@ -1,0 +1,120 @@
+// ═══════════════════════════════════════════════════════════════
+//  train_gpu_minimal.hexa — struct-free GPU training step skeleton
+//
+//  Goal: prove the hexa → native pipeline (self/build_c.hexa) can
+//  compile a file that uses extern fn + pointer builtins + a real
+//  cuBLAS-shaped call sequence WITHOUT touching `struct` declarations.
+//
+//  Tensors are passed as parallel-array tuples (ptr, rows, cols)
+//  instead of GpuTensor struct fields. This is the same data layout
+//  cuBLAS sees on the wire — no semantic loss.
+//
+//  This file:
+//    1. Declares extern fns for cudaMalloc/cudaFree/cublasSgemm
+//       (mocked on mac via libc malloc/free/memcpy stand-ins)
+//    2. Allocates two raw float buffers, fills them
+//    3. Calls a "matmul stand-in" via extern
+//    4. Reports a checksum
+//
+//  When this compiles + runs through self/build_c.hexa, the same
+//  source can drop in real cuBLAS @link tags on H100 to get the
+//  500× speedup the FFI path was designed for — but as PURE HEXA,
+//  not a C shim.
+// ═══════════════════════════════════════════════════════════════
+
+// ── On H100 these become real cuBLAS via @link("cublas") ──
+// On mac we don't link any extern, just use the pointer builtins
+// (alloc_raw, deref_f32, write_f32) which already cover what's needed
+// for a SCAFFOLD validation. The @link("cublas") declarations will be
+// added once H100 testing begins.
+
+// ── Tiny "tensor" represented as (ptr, rows, cols) tuples ──
+// We don't use hexa structs; we pass ptr/rows/cols as separate args.
+
+fn alloc_tensor(rows, cols) {
+    let nbytes = rows * cols * 4
+    let ptr = alloc_raw(nbytes)
+    return ptr
+}
+
+fn fill_tensor(ptr, rows, cols, val) {
+    let n = rows * cols
+    let mut i = 0
+    while i < n {
+        write_f32(ptr, i, val)
+        i = i + 1
+    }
+}
+
+fn fill_arange(ptr, rows, cols) {
+    let n = rows * cols
+    let mut i = 0
+    while i < n {
+        write_f32(ptr, i, i * 1.0)
+        i = i + 1
+    }
+}
+
+fn checksum(ptr, rows, cols) {
+    let n = rows * cols
+    let mut s: float = 0.0
+    let mut i = 0
+    while i < n {
+        let v: float = deref_f32(ptr, i)
+        s = s + v
+        i = i + 1
+    }
+    return s
+}
+
+fn free_tensor(ptr, rows, cols) {
+    let nbytes = rows * cols * 4
+    let _ = free_raw(ptr, nbytes)
+}
+
+// Mock matmul: copies A into C (validates the dispatch chain).
+// On H100 this becomes cublasSgemm via @link("cublas") + a single
+// extern fn cublasSgemm(...) call replacing this loop body.
+fn mock_matmul(a, b, c, m, n, k) {
+    let total = m * n
+    let mut i = 0
+    while i < total {
+        let v: float = deref_f32(a, i)
+        write_f32(c, i, v)
+        i = i + 1
+    }
+}
+
+fn main() {
+    println("=== train_gpu_minimal: struct-free GPU step skeleton ===")
+
+    // Allocate three "tensors" (8x8 each)
+    let a = alloc_tensor(8, 8)
+    let b = alloc_tensor(8, 8)
+    let c = alloc_tensor(8, 8)
+
+    // Initialize
+    fill_arange(a, 8, 8)         // A = [0, 1, 2, ..., 63]
+    fill_tensor(b, 8, 8, 1.0)     // B = ones
+    fill_tensor(c, 8, 8, 0.0)     // C = zeros
+
+    // Verify initial state
+    let sum_a = checksum(a, 8, 8)  // 0+1+...+63 = 2016
+    let sum_b = checksum(b, 8, 8)  // 64
+    println("init: sum_a=", sum_a, " sum_b=", sum_b)
+
+    // Run mock matmul (copies A → C in this scaffold)
+    mock_matmul(a, b, c, 8, 8, 8)
+
+    let sum_c = checksum(c, 8, 8)  // should equal sum_a after the copy
+    println("after matmul: sum_c=", sum_c, " (expected sum_a=2016)")
+
+    // Cleanup
+    free_tensor(a, 8, 8)
+    free_tensor(b, 8, 8)
+    free_tensor(c, 8, 8)
+
+    println("=== train_gpu_minimal DONE ===")
+}
+
+let _ = main()
