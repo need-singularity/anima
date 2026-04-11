@@ -163,6 +163,7 @@ def train(args):
     data_iter = iter(dataloader)
     step = 0
     accum_loss = 0.0
+    log_steps = 0
     best_loss = float("inf")
     t0 = time.time()
 
@@ -194,22 +195,28 @@ def train(args):
         optimizer.step()
         scheduler.step()
         step += 1
+        log_steps += 1
 
-        # Log
+        # Log (avg_loss = per-step CE, NOT accumulated over log interval)
         if step % 10 == 0 or step == 1:
+            avg_loss = accum_loss / max(log_steps, 1)
             elapsed = time.time() - t0
             steps_per_min = step * 60 / max(elapsed, 1)
             eta_min = (args.steps - step) / max(steps_per_min, 0.01)
             lr_now = scheduler.get_last_lr()[0]
+            # Sanity: CE should never exceed ln(vocab_size) ≈ 12 for random
+            if avg_loss > 15.0 and step > args.warmup:
+                print(f"[WARN] loss={avg_loss:.2f} > 15.0 — 학습 이상 감지", flush=True)
             print(
                 f"[train] step={step}/{args.steps} "
-                f"loss={accum_loss:.4f} lr={lr_now:.2e} "
+                f"loss={avg_loss:.4f} lr={lr_now:.2e} "
                 f"speed={steps_per_min:.1f}step/min ETA={eta_min:.0f}min",
                 flush=True,
             )
-            if accum_loss < best_loss:
-                best_loss = accum_loss
+            if avg_loss < best_loss:
+                best_loss = avg_loss
             accum_loss = 0.0
+            log_steps = 0
 
         # Eval
         if step % args.eval_every == 0:
