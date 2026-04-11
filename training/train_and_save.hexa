@@ -1,0 +1,268 @@
+// ═══════════════════════════════════════════════════════════════
+//  training/train_and_save.hexa — end-to-end CPU training proof
+//
+//  Goal: prove the full pipeline works on actually-converging data:
+//    1. Build a tiny period-16 corpus (deterministic shift task)
+//    2. Train a single linear LM head W[vocab × vocab] via SGD
+//       to minimize cross-entropy on the next-token task
+//    3. Save the converged W as a HEXACKPT-v1 text checkpoint
+//    4. Output info needed by eval_serve.hexa to load + serve it
+//
+//  Convergence target: loss < log(vocab) / 2 → information-theoretic
+//  proof that the model learned structure, not just averaged.
+//
+//  After this runs:
+//    - /tmp/train_and_save.ckpt is a real trained checkpoint
+//    - hexa serving/eval_serve.hexa /tmp/train_and_save.ckpt
+//      runs the same model and generates meaningful sequences
+//
+//  This is the first end-to-end (train → save → load → serve) demo
+//  of the AGI critical path running entirely in pure hexa.
+// ═══════════════════════════════════════════════════════════════
+
+let VOCAB = 8
+let CORPUS_LEN = 64
+let STEPS = 30
+let LR = 0.5
+
+let MAGIC = "HEXACKPT-v1"
+
+// ── Build deterministic period-16 corpus: tokens[i] = i % VOCAB ──
+fn build_corpus() {
+    let mut out = []
+    let mut i = 0
+    while i < CORPUS_LEN {
+        out = out.push(i % VOCAB)
+        i = i + 1
+    }
+    return out
+}
+
+// ── Initialize W[VOCAB × VOCAB] with small uniform values ──
+fn init_W() {
+    let mut data = []
+    let n = VOCAB * VOCAB
+    let mut i = 0
+    while i < n {
+        // small symmetric init
+        data = data.push(0.0)
+        i = i + 1
+    }
+    return data
+}
+
+// ── Get logit row W[token, :] ──
+fn get_row(W, token) {
+    let row_start = token * VOCAB
+    let mut row = []
+    let mut j = 0
+    while j < VOCAB {
+        row = row.push(W[row_start + j])
+        j = j + 1
+    }
+    return row
+}
+
+// ── Numerically stable log-softmax + softmax probs ──
+fn softmax_with_logsumexp(logits) {
+    let n = len(logits)
+    let mut m = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > m { m = logits[i] }
+        i = i + 1
+    }
+    let mut sum = 0.0
+    let mut probs = []
+    let mut j = 0
+    while j < n {
+        let e = exp(logits[j] - m)
+        sum = sum + e
+        probs = probs.push(e)
+        j = j + 1
+    }
+    let mut k = 0
+    while k < n {
+        probs[k] = probs[k] / sum
+        k = k + 1
+    }
+    return probs
+}
+
+// NOTE: training step is INLINED into main() below because hexa lists
+// are pass-by-value — a helper function that mutates its W parameter
+// would only touch a local copy and leave the caller's W untouched.
+// (See /tmp/mut_test.hexa for the verification of this semantics.)
+
+// ── Mean loss across full corpus (post-training validation) ──
+fn mean_loss(W, corpus) {
+    let n = len(corpus)
+    let mut total = 0.0
+    let mut count = 0
+    let mut i = 0
+    while i < n - 1 {
+        let token = corpus[i]
+        let target = corpus[i + 1]
+        let logits = get_row(W, token)
+        let probs = softmax_with_logsumexp(logits)
+        let p_t = probs[target]
+        total = total - log(p_t + 1.0e-10)
+        count = count + 1
+        i = i + 1
+    }
+    return total / (count * 1.0)
+}
+
+// ── Top-1 accuracy across corpus ──
+fn argmax_local(logits) {
+    let n = len(logits)
+    let mut bi = 0
+    let mut bv = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > bv { bv = logits[i]; bi = i }
+        i = i + 1
+    }
+    return bi
+}
+
+fn top1_acc(W, corpus) {
+    let n = len(corpus)
+    let mut hits = 0
+    let mut i = 0
+    while i < n - 1 {
+        let token = corpus[i]
+        let target = corpus[i + 1]
+        let logits = get_row(W, token)
+        let pred = argmax_local(logits)
+        if pred == target { hits = hits + 1 }
+        i = i + 1
+    }
+    return (hits * 1.0) / ((n - 1) * 1.0)
+}
+
+// ── Save W as HEXACKPT-v1 text checkpoint ──
+fn save_checkpoint(W, path) {
+    let mut s = MAGIC + "\n"
+    s = s + "W_lm " + str(VOCAB) + " " + str(VOCAB) + "\n"
+    let n = VOCAB * VOCAB
+    let mut i = 0
+    while i < n {
+        if i > 0 { s = s + " " }
+        s = s + str(W[i])
+        i = i + 1
+    }
+    s = s + "\n"
+    s = s + "__MANIFEST__ " + str(n) + " 1\n"
+    write_file(path, s)
+    return len(s)
+}
+
+fn main() {
+    println("═══ train_and_save: end-to-end CPU training proof ═══")
+    println("  vocab     = ", VOCAB)
+    println("  corpus    = period-", VOCAB, " sequence × ", CORPUS_LEN, " tokens")
+    println("  steps     = ", STEPS)
+    println("  lr        = ", LR)
+    println("")
+    let entropy_floor = log(VOCAB * 1.0)
+    println("  entropy floor (log(vocab)) = ", entropy_floor)
+    println("  target loss (< floor/2)    = ", entropy_floor / 2.0)
+    println("")
+
+    // Build corpus + initialize
+    let corpus = build_corpus()
+    let mut W = init_W()
+
+    // Initial metrics
+    let init_loss = mean_loss(W, corpus)
+    let init_acc = top1_acc(W, corpus)
+    println("  [step 0] loss=", init_loss, " top1=", init_acc)
+
+    // Training loop: SGD over the full corpus once per step.
+    // The per-pair update is INLINED here because W must be mutated
+    // in this scope (pass-by-value makes helper functions ineffective).
+    let mut step = 1
+    while step <= STEPS {
+        let n = len(corpus)
+        let mut total_loss = 0.0
+        let mut count = 0
+        let mut i = 0
+        while i < n - 1 {
+            let token = corpus[i]
+            let target = corpus[i + 1]
+            let row_start = token * VOCAB
+
+            // ── softmax(W[token,:]) with logsumexp stabilization ──
+            let mut m = W[row_start]
+            let mut kk = 1
+            while kk < VOCAB {
+                if W[row_start + kk] > m { m = W[row_start + kk] }
+                kk = kk + 1
+            }
+            let mut sum_e = 0.0
+            let mut probs = []
+            let mut jj = 0
+            while jj < VOCAB {
+                let e = exp(W[row_start + jj] - m)
+                sum_e = sum_e + e
+                probs = probs.push(e)
+                jj = jj + 1
+            }
+            let mut kk2 = 0
+            while kk2 < VOCAB {
+                probs[kk2] = probs[kk2] / sum_e
+                kk2 = kk2 + 1
+            }
+
+            // ── cross-entropy loss ──
+            let p_target = probs[target]
+            let l = 0.0 - log(p_target + 1.0e-10)
+            total_loss = total_loss + l
+            count = count + 1
+
+            // ── SGD update: W[token,j] -= lr * (probs[j] - onehot[j==target]) ──
+            let mut jg = 0
+            while jg < VOCAB {
+                let one = if jg == target { 1.0 } else { 0.0 }
+                let grad = probs[jg] - one
+                W[row_start + jg] = W[row_start + jg] - LR * grad
+                jg = jg + 1
+            }
+
+            i = i + 1
+        }
+        let avg = total_loss / (count * 1.0)
+        if step == 1 || step % 5 == 0 || step == STEPS {
+            let acc = top1_acc(W, corpus)
+            println("  [step ", step, "] loss=", avg, " top1=", acc)
+        }
+        step = step + 1
+    }
+
+    // Final metrics
+    let final_loss = mean_loss(W, corpus)
+    let final_acc = top1_acc(W, corpus)
+    println("")
+    println("  final loss = ", final_loss)
+    println("  final top1 = ", final_acc)
+
+    // Convergence verdict
+    let mut verdict = "FAIL"
+    if final_loss < entropy_floor / 2.0 { verdict = "PASS" }
+    if final_acc > 0.95 { verdict = "PASS" }
+    println("  verdict    = ", verdict)
+    println("")
+
+    // Save checkpoint
+    let ckpt_path = "/tmp/train_and_save.ckpt"
+    let nb = save_checkpoint(W, ckpt_path)
+    println("  saved ", nb, " bytes to ", ckpt_path)
+    println("")
+    println("  serve with:")
+    println("    hexa serving/eval_serve.hexa ", ckpt_path)
+    println("")
+    println("═══ DONE ═══")
+}
+
+let _ = main()
