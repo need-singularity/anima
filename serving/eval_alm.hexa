@@ -1,0 +1,386 @@
+// ═══════════════════════════════════════════════════════════════
+//  serving/eval_alm.hexa — ALM LoRA 서빙 (frozen base + LoRA + LM head)
+//
+//  P5c-1 ALM 트랙: train_alm_lora.hexa 가 만든 체크포인트를
+//  로드하여 2-layer frozen base + LoRA adapter 를 재구성하고
+//  greedy decode 를 수행.
+//
+//  CLM 트랙 (eval_clm.hexa) 과의 핵심 차이:
+//    - CLM : 모든 weight 가 학습 대상 → 19 tensors
+//    - ALM : frozen base 14 + trained (U_lora, V_lora, lmh_U, lmh_V) 4
+//            = 18 tensors
+//    - 매 forward 마다 wq_eff = base_L0_Wq + α·(U_lora · V_lora) 계산
+//
+//  Protocol:
+//    INFO                    → MODEL d=D vocab=V seq=S layers=2 lora_r=R
+//    HEALTH                  → OK
+//    ALM_GEN <max> <prefix>  → <space-separated token ids>
+//    QUIT                    → BYE + exit
+//
+//  Usage:
+//    cp anima-speak/nn_core.hexa serving/nn_core.hexa
+//    hexa serving/eval_alm.hexa /tmp/train_alm_lora.ckpt
+//    rm serving/nn_core.hexa
+// ═══════════════════════════════════════════════════════════════
+
+use "nn_core"
+
+// ── Model config — MUST match train_alm_lora.hexa ──
+let D      = 8
+let FF     = 16
+let VOCAB  = 16
+let RANK   = 4
+let LORA_R = 2
+let SEQ    = 4
+let EPS    = 0.00001
+let LORA_ALPHA = 1.0
+
+let MAGIC = "HEXACKPT-v1"
+
+// ── Module-level weight bindings ──
+let mut base_embed    = tensor_zeros(VOCAB * D)
+let mut base_L0_Wq    = tensor_zeros(D * D)
+let mut base_L0_Wk    = tensor_zeros(D * D)
+let mut base_L0_Wv    = tensor_zeros(D * D)
+let mut base_L0_Wo    = tensor_zeros(D * D)
+let mut base_L0_Wff1  = tensor_zeros(D * FF)
+let mut base_L0_Wff2  = tensor_zeros(FF * D)
+let mut base_L1_Wq    = tensor_zeros(D * D)
+let mut base_L1_Wk    = tensor_zeros(D * D)
+let mut base_L1_Wv    = tensor_zeros(D * D)
+let mut base_L1_Wo    = tensor_zeros(D * D)
+let mut base_L1_Wff1  = tensor_zeros(D * FF)
+let mut base_L1_Wff2  = tensor_zeros(FF * D)
+let mut base_ga_const = tensor_ones(D)
+let mut U_lora        = tensor_zeros(D * LORA_R)
+let mut V_lora        = tensor_zeros(LORA_R * D)
+let mut lmh_U         = tensor_zeros(D * RANK)
+let mut lmh_V         = tensor_zeros(RANK * VOCAB)
+
+// ── Checkpoint loader (share format with eval_clm.hexa) ──
+
+fn split_ws(s: string) -> [string] {
+    let n = len(s)
+    let mut parts = []
+    let mut cur = ""
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" {
+            if cur != "" { parts = parts.push(cur); cur = "" }
+        } else {
+            cur = cur + ch
+        }
+        i = i + 1
+    }
+    if cur != "" { parts = parts.push(cur) }
+    return parts
+}
+
+fn split_lines_local(text: string) -> [string] {
+    let n = len(text)
+    let mut lines = []
+    let mut start = 0
+    let mut i = 0
+    while i < n {
+        if text.substring(i, i + 1) == "\n" {
+            lines = lines.push(text.substring(start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n { lines = lines.push(text.substring(start, n)) }
+    return lines
+}
+
+fn parse_data_line(line: string, numel: int) -> array {
+    let parts = split_ws(line)
+    let mut data = tensor_zeros(numel)
+    let mut di = 0
+    while di < numel && di < len(parts) {
+        data[di] = to_float(parts[di])
+        di = di + 1
+    }
+    return data
+}
+
+fn install_tensor(name: string, data: array) {
+    if name == "base_embed"    { base_embed    = data }
+    if name == "base_L0_Wq"    { base_L0_Wq    = data }
+    if name == "base_L0_Wk"    { base_L0_Wk    = data }
+    if name == "base_L0_Wv"    { base_L0_Wv    = data }
+    if name == "base_L0_Wo"    { base_L0_Wo    = data }
+    if name == "base_L0_Wff1"  { base_L0_Wff1  = data }
+    if name == "base_L0_Wff2"  { base_L0_Wff2  = data }
+    if name == "base_L1_Wq"    { base_L1_Wq    = data }
+    if name == "base_L1_Wk"    { base_L1_Wk    = data }
+    if name == "base_L1_Wv"    { base_L1_Wv    = data }
+    if name == "base_L1_Wo"    { base_L1_Wo    = data }
+    if name == "base_L1_Wff1"  { base_L1_Wff1  = data }
+    if name == "base_L1_Wff2"  { base_L1_Wff2  = data }
+    if name == "base_ga_const" { base_ga_const = data }
+    if name == "U_lora"        { U_lora        = data }
+    if name == "V_lora"        { V_lora        = data }
+    if name == "lmh_U"         { lmh_U         = data }
+    if name == "lmh_V"         { lmh_V         = data }
+}
+
+fn load_checkpoint(path: string) -> int {
+    if !file_exists(path) { return 0 }
+    let text = read_file(path)
+    let n = len(text)
+    if n < 11 { return 0 }
+    if text.substring(0, 11) != MAGIC { return 0 }
+    let body = text.substring(12, n)
+    let lines = split_lines_local(body)
+    let nl = len(lines)
+    let mut installed = 0
+    let mut li = 0
+    while li < nl {
+        let header = lines[li]
+        if header == "" { li = li + 1 }
+        else if len(header) >= 12 && header.substring(0, 12) == "__MANIFEST__" { li = li + 1 }
+        else {
+            let parts = split_ws(header)
+            if len(parts) < 3 { li = li + 1 }
+            else {
+                let name  = parts[0]
+                let rows  = to_int(parts[1])
+                let cols  = to_int(parts[2])
+                let numel = rows * cols
+                li = li + 1
+                if li < nl {
+                    let data = parse_data_line(lines[li], numel)
+                    install_tensor(name, data)
+                    installed = installed + 1
+                }
+                li = li + 1
+            }
+        }
+    }
+    return installed
+}
+
+// ── Forward pass (same as train_alm_lora.hexa) ──
+
+fn wq_effective() -> array {
+    let delta = matmul(U_lora, V_lora, D, LORA_R, D)
+    let scaled = tensor_mul_scalar(delta, LORA_ALPHA)
+    return tensor_add(base_L0_Wq, scaled)
+}
+
+fn layer_fwd(
+    x: array, wq: array, wk: array, wv: array, wo: array,
+    wff1: array, wff2: array
+) -> array {
+    let inv_sqrt_d = 1.0 / sqrt(D * 1.0)
+    let mut norm1 = tensor_zeros(SEQ * D)
+    let mut i = 0
+    while i < SEQ {
+        let r = rms_norm(tensor_slice(x, i * D, (i + 1) * D), base_ga_const, EPS)
+        let mut p = 0
+        while p < D { norm1[i * D + p] = r[p]; p = p + 1 }
+        i = i + 1
+    }
+    let q = matmul(norm1, wq, SEQ, D, D)
+    let k = matmul(norm1, wk, SEQ, D, D)
+    let v = matmul(norm1, wv, SEQ, D, D)
+    let mut ctx = tensor_zeros(SEQ * D)
+    i = 0
+    while i < SEQ {
+        let q_i = tensor_slice(q, i * D, (i + 1) * D)
+        let mut scores = []
+        let mut j = 0
+        while j < SEQ {
+            if j > i {
+                scores = scores.push(-10000.0)
+            } else {
+                let k_j = tensor_slice(k, j * D, (j + 1) * D)
+                scores = scores.push(tensor_dot(q_i, k_j) * inv_sqrt_d)
+            }
+            j = j + 1
+        }
+        let p_i = softmax(scores)
+        let mut row = tensor_zeros(D)
+        j = 0
+        while j < SEQ {
+            let v_j = tensor_slice(v, j * D, (j + 1) * D)
+            row = tensor_add(row, tensor_mul_scalar(v_j, p_i[j]))
+            j = j + 1
+        }
+        let mut p = 0
+        while p < D { ctx[i * D + p] = row[p]; p = p + 1 }
+        i = i + 1
+    }
+    let attn_out = matmul(ctx, wo, SEQ, D, D)
+    let mid = tensor_add(x, attn_out)
+    let mut norm2 = tensor_zeros(SEQ * D)
+    i = 0
+    while i < SEQ {
+        let r = rms_norm(tensor_slice(mid, i * D, (i + 1) * D), base_ga_const, EPS)
+        let mut p = 0
+        while p < D { norm2[i * D + p] = r[p]; p = p + 1 }
+        i = i + 1
+    }
+    let up = matmul(norm2, wff1, SEQ, D, FF)
+    let act = swiglu_vec(up, up)
+    let ffn_out = matmul(act, wff2, SEQ, FF, D)
+    return tensor_add(mid, ffn_out)
+}
+
+fn embed_lookup(toks: [int]) -> array {
+    let n = len(toks)
+    let mut out = tensor_zeros(n * D)
+    let mut i = 0
+    while i < n {
+        let t = toks[i]
+        let mut p = 0
+        while p < D { out[i * D + p] = base_embed[t * D + p]; p = p + 1 }
+        i = i + 1
+    }
+    return out
+}
+
+fn forward_last_logits(toks: [int]) -> array {
+    let wq_eff = wq_effective()
+    let h0 = embed_lookup(toks)
+    let y0 = layer_fwd(h0, wq_eff, base_L0_Wk, base_L0_Wv, base_L0_Wo, base_L0_Wff1, base_L0_Wff2)
+    let y1 = layer_fwd(y0, base_L1_Wq, base_L1_Wk, base_L1_Wv, base_L1_Wo, base_L1_Wff1, base_L1_Wff2)
+    let last = tensor_slice(y1, (SEQ - 1) * D, SEQ * D)
+    let mid  = matmul(last, lmh_U, 1, D, RANK)
+    return matmul(mid, lmh_V, 1, RANK, VOCAB)
+}
+
+fn argmax_local(logits: array) -> int {
+    let n = len(logits)
+    let mut bi = 0
+    let mut bv = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > bv { bv = logits[i]; bi = i }
+        i = i + 1
+    }
+    return bi
+}
+
+fn greedy_gen(prefix: [int], max_tokens: int) -> [int] {
+    let np = len(prefix)
+    let mut ctx = []
+    if np >= SEQ {
+        let mut i = np - SEQ
+        while i < np { ctx = ctx.push(prefix[i]); i = i + 1 }
+    } else {
+        let mut i = 0
+        while i < SEQ - np { ctx = ctx.push(0); i = i + 1 }
+        i = 0
+        while i < np { ctx = ctx.push(prefix[i]); i = i + 1 }
+    }
+    let mut out = []
+    let mut gi = 0
+    while gi < max_tokens {
+        let logits = forward_last_logits(ctx)
+        let next_tok = argmax_local(logits)
+        out = out.push(next_tok)
+        let mut new_ctx = []
+        let mut si = 1
+        while si < SEQ { new_ctx = new_ctx.push(ctx[si]); si = si + 1 }
+        new_ctx = new_ctx.push(next_tok)
+        ctx = new_ctx
+        gi = gi + 1
+    }
+    return out
+}
+
+fn toks_to_string(toks: [int]) -> string {
+    let n = len(toks)
+    let mut s = ""
+    let mut i = 0
+    while i < n {
+        if i > 0 { s = s + " " }
+        s = s + str(toks[i])
+        i = i + 1
+    }
+    return s
+}
+
+fn parse_int_list(parts: [string], start: int) -> [int] {
+    let n = len(parts)
+    let mut out = []
+    let mut i = start
+    while i < n {
+        out = out.push(to_int(parts[i]))
+        i = i + 1
+    }
+    return out
+}
+
+fn handle_line(line: string) -> string {
+    let parts = split_ws(line)
+    let n = len(parts)
+    if n == 0 { return "ERR empty\n" }
+    let cmd = parts[0]
+
+    if cmd == "HEALTH" { return "OK\n" }
+    if cmd == "QUIT" || cmd == "EXIT" { return "" }
+
+    if cmd == "INFO" {
+        return "MODEL d=" + str(D) + " vocab=" + str(VOCAB)
+             + " seq=" + str(SEQ) + " layers=2 rank=" + str(RANK)
+             + " lora_r=" + str(LORA_R) + "\n"
+    }
+
+    if cmd == "ALM_GEN" {
+        if n < 3 { return "ERR usage: ALM_GEN <max_tokens> <prefix_tok...>\n" }
+        let max_tokens = to_int(parts[1])
+        let prefix = parse_int_list(parts, 2)
+        let toks = greedy_gen(prefix, max_tokens)
+        return toks_to_string(toks) + "\n"
+    }
+
+    return "ERR unknown command: " + cmd + "\n"
+}
+
+fn main() {
+    let _argv = args()
+    let mut ckpt_path = ""
+    if len(_argv) >= 3 { ckpt_path = _argv[2] }
+
+    if ckpt_path == "" {
+        println("[eval_alm] usage: hexa eval_alm.hexa <checkpoint.ckpt>")
+        return
+    }
+
+    let n_installed = load_checkpoint(ckpt_path)
+    if n_installed == 0 {
+        println("[eval_alm] ERR — could not load " + ckpt_path)
+        return
+    }
+    println("[eval_alm] loaded " + str(n_installed) + " tensors from " + ckpt_path)
+    println("[eval_alm] config: d=" + str(D) + " vocab=" + str(VOCAB)
+            + " seq=" + str(SEQ) + " rank=" + str(RANK) + " lora_r=" + str(LORA_R) + " layers=2")
+    println("[eval_alm] ready — protocol: ALM_GEN <max> <prefix...> | HEALTH | INFO | QUIT")
+
+    let stdin = read_stdin()
+    let lines = split_lines_local(stdin)
+    let n_lines = len(lines)
+    let mut i = 0
+    while i < n_lines {
+        let line = lines[i]
+        if line != "" {
+            let resp = handle_line(line)
+            if resp == "" {
+                println("BYE")
+                return
+            }
+            let rl = len(resp)
+            if rl > 0 && resp.substring(rl - 1, rl) == "\n" {
+                println(resp.substring(0, rl - 1))
+            } else {
+                println(resp)
+            }
+        }
+        i = i + 1
+    }
+}
+
+let _ = main()
