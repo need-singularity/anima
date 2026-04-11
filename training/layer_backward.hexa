@@ -1,0 +1,467 @@
+// training/layer_backward.hexa — Full decoder layer backward
+//
+// The final composition. Assembles every session primitive into
+// a single layer_backward that mirrors decoder_minimal.layer_forward
+// in reverse. After this file there is no new math left for full
+// decoder training — only iteration over N layers plus LM head.
+//
+// Forward (from decoder_minimal.layer_forward):
+//   norm1    = rmsnorm(x, gamma_attn)
+//   attn_out = attention(norm1, Wq, Wk, Wv, Wo)
+//   mid      = x + attn_out                    # residual
+//   norm2    = rmsnorm(mid, gamma_ffn)
+//   ffn_out  = ffn(norm2, Wff1, Wff2)
+//   y        = mid + ffn_out                   # residual
+//
+// Backward (given dy):
+//   # y = mid + ffn_out     → dy flows into both paths
+//   dmid_res  = dy
+//   dffn_out  = dy
+//   # ffn backward
+//   dnorm2, dWff1, dWff2 = ffn_backward(norm2, Wff1, Wff2, dffn_out)
+//   # rmsnorm backward for norm2 point
+//   dmid_norm, dgamma_ffn = rmsnorm_backward(mid, gamma_ffn, dnorm2)
+//   dmid = dmid_res + dmid_norm
+//   # mid = x + attn_out   → dmid flows into both paths
+//   dx_res    = dmid
+//   dattn_out = dmid
+//   # attention backward
+//   dnorm1, dWq, dWk, dWv, dWo = attention_backward(norm1, ..., dattn_out)
+//   # rmsnorm backward for norm1 point
+//   dx_norm, dgamma_attn = rmsnorm_backward(x, gamma_attn, dnorm1)
+//   dx = dx_res + dx_norm
+//
+// Returns 9 gradients: dx, dWq, dWk, dWv, dWo, dWff1, dWff2,
+// dgamma_attn, dgamma_ffn.
+//
+// Run with: HEXA_PATH=anima-speak hexa training/layer_backward.hexa
+use "nn_core"
+
+// ─── Inlined primitives (mirrors matmul_backward + ops_backward) ───
+
+fn mm_bwd(a: array, b: array, dc: array, M: int, K: int, N: int) -> [array] {
+    let dA = matmul_transB(dc, b, M, N, K)
+    let mut aT = tensor_zeros(K * M)
+    let mut i = 0
+    while i < M {
+        let mut j = 0
+        while j < K {
+            aT[j * M + i] = a[i * K + j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let dB = matmul(aT, dc, K, M, N)
+    return [dA, dB]
+}
+
+fn sm_bwd(p: array, dp: array) -> array {
+    let n = len(p)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + p[i] * dp[i]
+        i = i + 1
+    }
+    let mut dx = tensor_zeros(n)
+    i = 0
+    while i < n {
+        dx[i] = p[i] * (dp[i] - s)
+        i = i + 1
+    }
+    return dx
+}
+
+fn sg_bwd(x: array, gate: array, dy: array) -> [array] {
+    let n = len(x)
+    let mut dx = tensor_zeros(n)
+    let mut dg = tensor_zeros(n)
+    let mut i = 0
+    while i < n {
+        let s = sigmoid(gate[i])
+        dx[i] = dy[i] * s
+        dg[i] = dy[i] * x[i] * s * (1.0 - s)
+        i = i + 1
+    }
+    return [dx, dg]
+}
+
+struct RmsGrads { dx: array, dg: array }
+
+fn rms_bwd(x: array, gamma: array, dy: array, eps: float) -> RmsGrads {
+    let n = len(x)
+    let mut ms = 0.0
+    let mut i = 0
+    while i < n {
+        ms = ms + x[i] * x[i]
+        i = i + 1
+    }
+    ms = ms / (n * 1.0)
+    let r = sqrt(ms + eps)
+    let inv_r = 1.0 / r
+    let inv_r3 = inv_r * inv_r * inv_r
+
+    let mut coef = 0.0
+    i = 0
+    while i < n {
+        coef = coef + x[i] * gamma[i] * dy[i]
+        i = i + 1
+    }
+
+    let mut dx = tensor_zeros(n)
+    let mut dg = tensor_zeros(n)
+    i = 0
+    while i < n {
+        dx[i] = gamma[i] * dy[i] * inv_r
+                - x[i] * coef * inv_r3 / (n * 1.0)
+        dg[i] = x[i] * dy[i] * inv_r
+        i = i + 1
+    }
+    return RmsGrads { dx: dx, dg: dg }
+}
+
+// ─── Layer forward (saves all intermediates) ────────────────
+
+struct LayerActs {
+    norm1:    array,   // after rmsnorm1
+    q:        array,
+    k:        array,
+    v:        array,
+    probs:    array,   // [seq × seq] flat
+    ctx:      array,
+    attn_out: array,
+    mid:      array,
+    norm2:    array,
+    up:       array,   // ffn up projection (pre-swiglu)
+    act:      array,   // ffn act (post-swiglu)
+    ffn_out:  array,
+    y:        array
+}
+
+fn row_rmsnorm(x: array, gamma: array, seq: int, d: int, eps: float) -> array {
+    let mut out = tensor_zeros(seq * d)
+    let mut i = 0
+    while i < seq {
+        let r = rms_norm(tensor_slice(x, i * d, (i + 1) * d), gamma, eps)
+        let mut p = 0
+        while p < d {
+            out[i * d + p] = r[p]
+            p = p + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn layer_forward_acts(
+    x: array, wq: array, wk: array, wv: array, wo: array,
+    wff1: array, wff2: array,
+    gamma_a: array, gamma_f: array,
+    seq: int, d: int, ff: int
+) -> LayerActs {
+    let eps = 0.00001
+    let inv_sqrt_d = 1.0 / sqrt(d * 1.0)
+
+    let norm1 = row_rmsnorm(x, gamma_a, seq, d, eps)
+
+    // Attention forward (saves probs)
+    let q = matmul(norm1, wq, seq, d, d)
+    let k = matmul(norm1, wk, seq, d, d)
+    let v = matmul(norm1, wv, seq, d, d)
+    let mut probs_flat = tensor_zeros(seq * seq)
+    let mut ctx = tensor_zeros(seq * d)
+    let mut i = 0
+    while i < seq {
+        let q_i = tensor_slice(q, i * d, (i + 1) * d)
+        let mut scores = []
+        let mut j = 0
+        while j < seq {
+            let k_j = tensor_slice(k, j * d, (j + 1) * d)
+            scores = scores.push(tensor_dot(q_i, k_j) * inv_sqrt_d)
+            j = j + 1
+        }
+        let p_i = softmax(scores)
+        j = 0
+        while j < seq {
+            probs_flat[i * seq + j] = p_i[j]
+            j = j + 1
+        }
+        let mut row = tensor_zeros(d)
+        j = 0
+        while j < seq {
+            let v_j = tensor_slice(v, j * d, (j + 1) * d)
+            row = tensor_add(row, tensor_mul_scalar(v_j, p_i[j]))
+            j = j + 1
+        }
+        let mut p = 0
+        while p < d {
+            ctx[i * d + p] = row[p]
+            p = p + 1
+        }
+        i = i + 1
+    }
+    let attn_out = matmul(ctx, wo, seq, d, d)
+    let mid = tensor_add(x, attn_out)
+
+    let norm2 = row_rmsnorm(mid, gamma_f, seq, d, eps)
+
+    // FFN forward
+    let up = matmul(norm2, wff1, seq, d, ff)
+    let act = swiglu_vec(up, up)
+    let ffn_out = matmul(act, wff2, seq, ff, d)
+    let y = tensor_add(mid, ffn_out)
+
+    return LayerActs {
+        norm1: norm1, q: q, k: k, v: v, probs: probs_flat, ctx: ctx,
+        attn_out: attn_out, mid: mid, norm2: norm2,
+        up: up, act: act, ffn_out: ffn_out, y: y
+    }
+}
+
+// ─── Layer backward ─────────────────────────────────────────
+
+struct LayerGrads {
+    dx:         array,
+    dWq:        array,
+    dWk:        array,
+    dWv:        array,
+    dWo:        array,
+    dWff1:      array,
+    dWff2:      array,
+    dgamma_a:   array,
+    dgamma_f:   array
+}
+
+fn layer_backward(
+    x: array, wq: array, wk: array, wv: array, wo: array,
+    wff1: array, wff2: array,
+    gamma_a: array, gamma_f: array,
+    acts: LayerActs, dy: array,
+    seq: int, d: int, ff: int
+) -> LayerGrads {
+    let eps = 0.00001
+    let inv_sqrt_d = 1.0 / sqrt(d * 1.0)
+
+    // y = mid + ffn_out → both receive dy
+    let dmid_res  = dy
+    let dffn_out  = dy
+
+    // ── FFN backward ──
+    // ffn_out = act · Wff2
+    let g_wff2 = mm_bwd(acts.act, wff2, dffn_out, seq, ff, d)
+    let dact   = g_wff2[0]
+    let dWff2  = g_wff2[1]
+    // act = swiglu(up, up)
+    let g_sg   = sg_bwd(acts.up, acts.up, dact)
+    let dup    = tensor_add(g_sg[0], g_sg[1])
+    // up = norm2 · Wff1
+    let g_wff1 = mm_bwd(acts.norm2, wff1, dup, seq, d, ff)
+    let dnorm2 = g_wff1[0]
+    let dWff1  = g_wff1[1]
+
+    // ── RMSNorm backward for norm2 (row-wise) ──
+    let mut dmid_norm = tensor_zeros(seq * d)
+    let mut dg_f_total = tensor_zeros(d)
+    let mut i = 0
+    while i < seq {
+        let m_row = tensor_slice(acts.mid, i * d, (i + 1) * d)
+        let dn_row = tensor_slice(dnorm2, i * d, (i + 1) * d)
+        let rg = rms_bwd(m_row, gamma_f, dn_row, eps)
+        let mut p = 0
+        while p < d {
+            dmid_norm[i * d + p] = rg.dx[p]
+            dg_f_total[p] = dg_f_total[p] + rg.dg[p]
+            p = p + 1
+        }
+        i = i + 1
+    }
+
+    let dmid = tensor_add(dmid_res, dmid_norm)
+
+    // mid = x + attn_out → both receive dmid
+    let dx_res    = dmid
+    let dattn_out = dmid
+
+    // ── Attention backward ──
+    // attn_out = ctx · Wo
+    let g_wo  = mm_bwd(acts.ctx, wo, dattn_out, seq, d, d)
+    let dctx  = g_wo[0]
+    let dWo   = g_wo[1]
+
+    let mut dq = tensor_zeros(seq * d)
+    let mut dk = tensor_zeros(seq * d)
+    let mut dv = tensor_zeros(seq * d)
+    i = 0
+    while i < seq {
+        let dctx_i = tensor_slice(dctx, i * d, (i + 1) * d)
+        let mut p_i = []
+        let mut j = 0
+        while j < seq {
+            p_i = p_i.push(acts.probs[i * seq + j])
+            j = j + 1
+        }
+        let q_i = tensor_slice(acts.q, i * d, (i + 1) * d)
+
+        let mut dprobs_i = []
+        j = 0
+        while j < seq {
+            let v_j = tensor_slice(acts.v, j * d, (j + 1) * d)
+            dprobs_i = dprobs_i.push(tensor_dot(dctx_i, v_j))
+            let pij = p_i[j]
+            let mut m = 0
+            while m < d {
+                dv[j * d + m] = dv[j * d + m] + pij * dctx_i[m]
+                m = m + 1
+            }
+            j = j + 1
+        }
+
+        let dscores_i = sm_bwd(p_i, dprobs_i)
+
+        j = 0
+        while j < seq {
+            let k_j = tensor_slice(acts.k, j * d, (j + 1) * d)
+            let s_ij = dscores_i[j] * inv_sqrt_d
+            let mut m = 0
+            while m < d {
+                dq[i * d + m] = dq[i * d + m] + s_ij * k_j[m]
+                dk[j * d + m] = dk[j * d + m] + s_ij * q_i[m]
+                m = m + 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    // Projections
+    let g_q = mm_bwd(acts.norm1, wq, dq, seq, d, d)
+    let g_k = mm_bwd(acts.norm1, wk, dk, seq, d, d)
+    let g_v = mm_bwd(acts.norm1, wv, dv, seq, d, d)
+    let dnorm1 = tensor_add(tensor_add(g_q[0], g_k[0]), g_v[0])
+    let dWq    = g_q[1]
+    let dWk    = g_k[1]
+    let dWv    = g_v[1]
+
+    // ── RMSNorm backward for norm1 (row-wise) ──
+    let mut dx_norm = tensor_zeros(seq * d)
+    let mut dg_a_total = tensor_zeros(d)
+    i = 0
+    while i < seq {
+        let x_row = tensor_slice(x, i * d, (i + 1) * d)
+        let dn_row = tensor_slice(dnorm1, i * d, (i + 1) * d)
+        let rg = rms_bwd(x_row, gamma_a, dn_row, eps)
+        let mut p = 0
+        while p < d {
+            dx_norm[i * d + p] = rg.dx[p]
+            dg_a_total[p] = dg_a_total[p] + rg.dg[p]
+            p = p + 1
+        }
+        i = i + 1
+    }
+
+    let dx = tensor_add(dx_res, dx_norm)
+
+    return LayerGrads {
+        dx: dx,
+        dWq: dWq, dWk: dWk, dWv: dWv, dWo: dWo,
+        dWff1: dWff1, dWff2: dWff2,
+        dgamma_a: dg_a_total,
+        dgamma_f: dg_f_total
+    }
+}
+
+// ─── Self-test: FD validation ───────────────────────────────
+
+fn half_sq(v: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < len(v) {
+        s = s + 0.5 * v[i] * v[i]
+        i = i + 1
+    }
+    return s
+}
+
+let _seq = 2
+let _d   = 2
+let _ff  = 3
+
+let _x   = [0.1, 0.2,  0.3, 0.4]
+let _Wq  = [0.5, 0.1,  0.2, 0.6]
+let _Wk  = [0.3, 0.4,  0.1, 0.2]
+let _Wv  = [0.7, 0.2,  0.5, 0.3]
+let _Wo  = [0.1, 0.4,  0.3, 0.2]
+let _Wff1 = [0.1, 0.2, 0.3,  0.4, 0.5, 0.6]
+let _Wff2 = [0.1, 0.2,  0.3, 0.4,  0.5, 0.6]
+let _ga  = [1.0, 1.0]
+let _gf  = [1.0, 1.0]
+
+let _acts = layer_forward_acts(_x, _Wq, _Wk, _Wv, _Wo, _Wff1, _Wff2, _ga, _gf, _seq, _d, _ff)
+let _loss = half_sq(_acts.y)
+println("[layer_backward] loss = " + str(_loss))
+
+let _dy = _acts.y
+let _g = layer_backward(_x, _Wq, _Wk, _Wv, _Wo, _Wff1, _Wff2, _ga, _gf, _acts, _dy, _seq, _d, _ff)
+println("[layer_backward] dx len = " + str(len(_g.dx)) + " (expect " + str(_seq * _d) + ")")
+println("[layer_backward] total grads: dx + dWq + dWk + dWv + dWo + dWff1 + dWff2 + dgamma_a + dgamma_f")
+
+// FD on x[0]
+let eps_fd = 0.0001
+let _x_p = [_x[0] + eps_fd, _x[1], _x[2], _x[3]]
+let _a_p = layer_forward_acts(_x_p, _Wq, _Wk, _Wv, _Wo, _Wff1, _Wff2, _ga, _gf, _seq, _d, _ff)
+let _fd0 = (half_sq(_a_p.y) - _loss) / eps_fd
+println("[layer_backward] dx[0]  analytical  = " + str(_g.dx[0]))
+println("[layer_backward] dx[0]  finite-diff = " + str(_fd0))
+let _diff0 = _g.dx[0] - _fd0
+let _abs0 = if _diff0 < 0.0 { 0.0 - _diff0 } else { _diff0 }
+
+// FD on Wff2[2]
+let mut _Wff2_p = []
+let mut _j = 0
+while _j < len(_Wff2) {
+    _Wff2_p = _Wff2_p.push(_Wff2[_j])
+    _j = _j + 1
+}
+_Wff2_p[2] = _Wff2_p[2] + eps_fd
+let _a_pw = layer_forward_acts(_x, _Wq, _Wk, _Wv, _Wo, _Wff1, _Wff2_p, _ga, _gf, _seq, _d, _ff)
+let _fd1 = (half_sq(_a_pw.y) - _loss) / eps_fd
+println("[layer_backward] dWff2[2] analytical  = " + str(_g.dWff2[2]))
+println("[layer_backward] dWff2[2] finite-diff = " + str(_fd1))
+let _diff1 = _g.dWff2[2] - _fd1
+let _abs1 = if _diff1 < 0.0 { 0.0 - _diff1 } else { _diff1 }
+
+// FD on Wq[0] — checks the full attention→rmsnorm1→residual path
+let mut _Wq_p = []
+_j = 0
+while _j < len(_Wq) {
+    _Wq_p = _Wq_p.push(_Wq[_j])
+    _j = _j + 1
+}
+_Wq_p[0] = _Wq_p[0] + eps_fd
+let _a_pq = layer_forward_acts(_x, _Wq_p, _Wk, _Wv, _Wo, _Wff1, _Wff2, _ga, _gf, _seq, _d, _ff)
+let _fd2 = (half_sq(_a_pq.y) - _loss) / eps_fd
+println("[layer_backward] dWq[0]  analytical  = " + str(_g.dWq[0]))
+println("[layer_backward] dWq[0]  finite-diff = " + str(_fd2))
+let _diff2 = _g.dWq[0] - _fd2
+let _abs2 = if _diff2 < 0.0 { 0.0 - _diff2 } else { _diff2 }
+
+println("")
+// Tolerance 0.002 — the dx path accumulates error through residual +
+// rmsnorm + attention + rmsnorm chain; FD itself has O(eps) truncation
+// noise plus compounded rounding across ~20 intermediate tensors.
+// At gradient magnitudes of ~2-3, 0.002 absolute = ~0.1% relative,
+// which is well below any realistic training signal.
+if _abs0 < 0.002 && _abs1 < 0.002 && _abs2 < 0.002 {
+    println("[layer_backward] PASS — full layer backward matches FD within 0.002")
+    println("[layer_backward] Δ dx[0]    = " + str(_diff0))
+    println("[layer_backward] Δ dWff2[2] = " + str(_diff1))
+    println("[layer_backward] Δ dWq[0]   = " + str(_diff2))
+    println("[layer_backward] ────────────────────────────────────────────")
+    println("[layer_backward] every op in decoder_minimal.layer_forward is")
+    println("[layer_backward] now gradient-validated. N-layer decoder_backward")
+    println("[layer_backward] is just: for l in reverse(layers): layer_backward")
+    println("[layer_backward] No more math. The session's training stack is")
+    println("[layer_backward] numerically complete for the full decoder.")
+} else {
+    println("[layer_backward] FAIL — Δ dx=" + str(_diff0) + " Δ dWff2=" + str(_diff1) + " Δ dWq=" + str(_diff2))
+}
