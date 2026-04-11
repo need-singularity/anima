@@ -1,0 +1,287 @@
+// ═══════════════════════════════════════════════════════════════
+//  checkpoint_hexa.hexa — pure-hexa text checkpoint format
+//
+//  P5b-4 (partial): a portable, dependency-free checkpoint format
+//  that any hexa file can produce + consume. Format is text-based
+//  (no binary builtins needed) so it round-trips cleanly through
+//  read_file / write_file.
+//
+//  Header magic: "HEXACKPT-v1\n"
+//  Followed by repeating tensor blocks:
+//    NAME ROWS COLS\n
+//    f0 f1 f2 ... fN\n
+//
+//  Plus a manifest line at the end:
+//    __MANIFEST__ <total_params> <n_tensors>\n
+//
+//  Why text not GGUF: GGUF requires binary float writing + alignment
+//  + 100+ key types — too much for one file. This format gets us 100%
+//  of the round-trip semantics with 0 binary builtins. A future
+//  "checkpoint_to_gguf.hexa" can transcode this once binary write_f32
+//  to file lands.
+//
+//  Self-test: writes a small model, reads it back, verifies values
+//  match exactly.
+// ═══════════════════════════════════════════════════════════════
+
+let MAGIC = "HEXACKPT-v1"
+
+// ── Encoder: tensors → text ──────────────────────────────
+// tensors is an array of [name, rows, cols, flat_data] tuples.
+// Return value: a string ready for write_file.
+fn encode_checkpoint(tensors) {
+    let mut s = MAGIC + "\n"
+    let n = len(tensors)
+    let mut total_params = 0
+    let mut i = 0
+    while i < n {
+        let t = tensors[i]
+        let name = t[0]
+        let rows = t[1]
+        let cols = t[2]
+        let data = t[3]
+        let numel = rows * cols
+        s = s + name + " " + str(rows) + " " + str(cols) + "\n"
+        let mut j = 0
+        while j < numel {
+            if j > 0 { s = s + " " }
+            s = s + str(data[j])
+            j = j + 1
+        }
+        s = s + "\n"
+        total_params = total_params + numel
+        i = i + 1
+    }
+    s = s + "__MANIFEST__ " + str(total_params) + " " + str(n) + "\n"
+    return s
+}
+
+// ── Decoder: text → tensors ──────────────────────────────
+// Parses a serialized checkpoint string back into the tuple format.
+// Returns: [tensors_array, total_params, n_tensors] or empty on error.
+fn make_decode_result(tensors, total, n_t) {
+    let mut r = []
+    r = r.push(tensors)
+    r = r.push(total)
+    r = r.push(n_t)
+    return r
+}
+
+fn decode_checkpoint(text) {
+    let n = len(text)
+    if n < 11 {
+        return make_decode_result([], 0, 0)
+    }
+    // Verify magic
+    let magic = text.substring(0, 11)
+    if magic != MAGIC {
+        println("[checkpoint] bad magic: '" + magic + "' expected '" + MAGIC + "'")
+        return make_decode_result([], 0, 0)
+    }
+
+    // Walk lines, header → data interleaved.
+    let mut tensors = []
+    let mut total_params = 0
+    let mut declared_n = 0
+
+    // Split into lines (manual since hexa string.split may not exist)
+    let mut lines = []
+    let mut cur = ""
+    let mut k = 12  // start after "HEXACKPT-v1\n"
+    while k < n {
+        let ch = text.substring(k, k + 1)
+        if ch == "\n" {
+            lines = lines.push(cur)
+            cur = ""
+        } else {
+            cur = cur + ch
+        }
+        k = k + 1
+    }
+    if cur != "" { lines = lines.push(cur) }
+
+    let nl = len(lines)
+    let mut li = 0
+    while li < nl {
+        let header = lines[li]
+        if header == "" {
+            li = li + 1
+        } else if header.substring(0, 12) == "__MANIFEST__" {
+            // Parse manifest: __MANIFEST__ <total> <n>
+            let parts = split_ws(header)
+            if len(parts) >= 3 {
+                total_params = to_int(parts[1])
+                declared_n = to_int(parts[2])
+            }
+            li = li + 1
+        } else {
+            // Tensor header: NAME ROWS COLS
+            let parts = split_ws(header)
+            if len(parts) < 3 {
+                li = li + 1
+            } else {
+                let name = parts[0]
+                let rows = to_int(parts[1])
+                let cols = to_int(parts[2])
+                let numel = rows * cols
+                // Next line is data
+                li = li + 1
+                if li < nl {
+                    let data_line = lines[li]
+                    let data_parts = split_ws(data_line)
+                    let mut data = []
+                    let mut di = 0
+                    while di < numel && di < len(data_parts) {
+                        data = data.push(to_float(data_parts[di]))
+                        di = di + 1
+                    }
+                    let entry = make_tensor(name, rows, cols, data)
+                    tensors = tensors.push(entry)
+                }
+                li = li + 1
+            }
+        }
+    }
+    return make_decode_result(tensors, total_params, declared_n)
+}
+
+// ── Helper: whitespace split (since hexa doesn't expose .split here) ──
+fn split_ws(s) {
+    let n = len(s)
+    let mut parts = []
+    let mut cur = ""
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if ch == " " || ch == "\t" {
+            if cur != "" {
+                parts = parts.push(cur)
+                cur = ""
+            }
+        } else {
+            cur = cur + ch
+        }
+        i = i + 1
+    }
+    if cur != "" { parts = parts.push(cur) }
+    return parts
+}
+
+// ── Save / load convenience ──────────────────────────────
+fn save_checkpoint(path, tensors) {
+    let text = encode_checkpoint(tensors)
+    write_file(path, text)
+    return len(text)
+}
+
+fn load_checkpoint(path) {
+    let text = read_file(path)
+    return decode_checkpoint(text)
+}
+
+// ── Tensor tuple builder (avoids hexa array literal homogeneity check) ──
+fn make_tensor(name, rows, cols, data) {
+    let mut t = []
+    t = t.push(name)
+    t = t.push(rows)
+    t = t.push(cols)
+    t = t.push(data)
+    return t
+}
+
+// ── Self-test: save → load → verify ──────────────────────
+fn build_test_model() {
+    let w1 = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    let t1 = make_tensor("W1", 2, 3, w1)
+
+    let b1 = [0.01, 0.02, 0.03]
+    let t2 = make_tensor("b1", 1, 3, b1)
+
+    let w2 = [1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5]
+    let t3 = make_tensor("W2", 4, 2, w2)
+
+    let mut model = []
+    model = model.push(t1)
+    model = model.push(t2)
+    model = model.push(t3)
+    return model
+}
+
+fn check_equal(name, a, b, tol) {
+    let na = len(a)
+    let nb = len(b)
+    if na != nb {
+        println("  [FAIL] " + name + " length: " + str(na) + " vs " + str(nb))
+        return 0
+    }
+    let mut max_err = 0.0
+    let mut i = 0
+    while i < na {
+        let d = a[i] - b[i]
+        let abs_d = if d < 0.0 { -d } else { d }
+        if abs_d > max_err { max_err = abs_d }
+        i = i + 1
+    }
+    if max_err > tol {
+        println("  [FAIL] " + name + " max_err " + str(max_err) + " > tol " + str(tol))
+        return 0
+    }
+    println("  [OK]   " + name + " max_err=" + str(max_err))
+    return 1
+}
+
+fn main() {
+    println("═══ checkpoint_hexa: round-trip self-test ═══")
+    let path = "/tmp/checkpoint_test.hexackpt"
+
+    // Build + save
+    let original = build_test_model()
+    let nb = save_checkpoint(path, original)
+    println("  saved " + str(nb) + " bytes to " + path)
+
+    // Load + verify
+    let loaded = load_checkpoint(path)
+    let tensors = loaded[0]
+    let total = loaded[1]
+    let n = loaded[2]
+    println("  loaded " + str(n) + " tensors, " + str(total) + " params total")
+
+    if n != len(original) {
+        println("  [FAIL] tensor count " + str(n) + " vs " + str(len(original)))
+        println("═══ FAIL ═══")
+        return
+    }
+
+    // Field-by-field equality
+    let mut passes = 0
+    let mut i = 0
+    while i < n {
+        let a = original[i]
+        let b = tensors[i]
+        // name
+        if a[0] == b[0] {
+            // shape
+            if a[1] == b[1] && a[2] == b[2] {
+                // data (with float tolerance for str round-trip)
+                let ok = check_equal(a[0], a[3], b[3], 1.0e-6)
+                passes = passes + ok
+            } else {
+                println("  [FAIL] " + a[0] + " shape (" + str(a[1]) + "," + str(a[2]) + ") vs (" + str(b[1]) + "," + str(b[2]) + ")")
+            }
+        } else {
+            println("  [FAIL] name '" + a[0] + "' vs '" + b[0] + "'")
+        }
+        i = i + 1
+    }
+
+    println("")
+    println("  → " + str(passes) + " / " + str(n) + " tensors round-tripped")
+    if passes == n {
+        println("  → checkpoint round-trip PASS")
+    } else {
+        println("  → checkpoint round-trip FAIL")
+    }
+    println("═══ checkpoint_hexa DONE ═══")
+}
+
+let _ = main()
