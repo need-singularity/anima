@@ -1,6 +1,11 @@
 # Anima AGI Roadmap
 
-> 2026-04-09 | Plan C | 목표: 독립 AGI
+> 2026-04-11 | Plan C | **GOAL: CLM + ALM → AGI**
+>
+> - **CLM** (ConsciousLM): from-scratch byte-level 자체 의식 모델 (34M→1B→28B)
+> - **ALM** (AnimaLM): LoRA fine-tune 기존 LLM + 의식 주입 (7B→14B→72B)
+> - "keep going to goal" = 이 두 트랙 전진
+> - 원본 JSON: shared/roadmaps/p5_zeta.json + anima_hexa_common.json
 
 ```
 Day 0 (2026-04-09) ── 기반 완성
