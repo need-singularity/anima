@@ -1,8 +1,8 @@
 #!/bin/bash
 # deploy_h100.sh — Automated H100 pod setup for ALM 14B LoRA training
 #
-# Pod:   9c69u41acdgbfn (H100 SXM 80GB, DE)
-# Image: needsingularity/anima-h100:latest
+# Pod:   z1jdhw7iutqz3u (H100 SXM 80GB, DE)
+# Image: pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel
 # Goal:  ALM 14B LoRA training -> Zeta service level
 #
 # Usage:
@@ -20,7 +20,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────
-POD_ID="9c69u41acdgbfn"
+POD_ID="z1jdhw7iutqz3u"
 RUNPODCTL="/opt/homebrew/bin/runpodctl"
 WORKSPACE="/workspace"
 REPO_DIR="${WORKSPACE}/anima"
