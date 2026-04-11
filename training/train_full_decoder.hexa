@@ -1,0 +1,481 @@
+// training/train_full_decoder.hexa — Full decoder training loop (pure hexa)
+//
+// The crown. Assembles every session primitive and composition into
+// a complete training loop that updates:
+//   - embedding table (via scatter)
+//   - every layer's Wq, Wk, Wv, Wo, Wff1, Wff2, gamma_attn, gamma_ffn
+//   - LM head U, V
+//
+// per SGD step. Runs 20 steps and prints the loss. If the loss
+// decreases monotonically-ish, the full decoder is trainable in
+// pure hexa end-to-end.
+//
+// This is the session's final file — it proves that every piece
+// the session built actually composes into a learning system, not
+// just a set of validated primitives.
+//
+// Run with: HEXA_PATH=anima-speak hexa training/train_full_decoder.hexa
+use "nn_core"
+
+// ─── Primitive helpers (inlined) ───────────────────────────
+
+fn mm_bwd(a: array, b: array, dc: array, M: int, K: int, N: int) -> [array] {
+    let dA = matmul_transB(dc, b, M, N, K)
+    let mut aT = tensor_zeros(K * M)
+    let mut i = 0
+    while i < M {
+        let mut j = 0
+        while j < K {
+            aT[j * M + i] = a[i * K + j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let dB = matmul(aT, dc, K, M, N)
+    return [dA, dB]
+}
+
+fn sm_bwd(p: array, dp: array) -> array {
+    let n = len(p)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + p[i] * dp[i]
+        i = i + 1
+    }
+    let mut dx = tensor_zeros(n)
+    i = 0
+    while i < n {
+        dx[i] = p[i] * (dp[i] - s)
+        i = i + 1
+    }
+    return dx
+}
+
+fn sg_bwd(x: array, gate: array, dy: array) -> [array] {
+    let n = len(x)
+    let mut dx = tensor_zeros(n)
+    let mut dg = tensor_zeros(n)
+    let mut i = 0
+    while i < n {
+        let s = sigmoid(gate[i])
+        dx[i] = dy[i] * s
+        dg[i] = dy[i] * x[i] * s * (1.0 - s)
+        i = i + 1
+    }
+    return [dx, dg]
+}
+
+struct RmsG { dx: array, dg: array }
+fn rms_bwd(x: array, g: array, dy: array, eps: float) -> RmsG {
+    let n = len(x)
+    let mut ms = 0.0
+    let mut i = 0
+    while i < n { ms = ms + x[i] * x[i]; i = i + 1 }
+    ms = ms / (n * 1.0)
+    let r = sqrt(ms + eps)
+    let inv_r = 1.0 / r
+    let inv_r3 = inv_r * inv_r * inv_r
+    let mut coef = 0.0
+    i = 0
+    while i < n { coef = coef + x[i] * g[i] * dy[i]; i = i + 1 }
+    let mut dx = tensor_zeros(n)
+    let mut dg = tensor_zeros(n)
+    i = 0
+    while i < n {
+        dx[i] = g[i] * dy[i] * inv_r - x[i] * coef * inv_r3 / (n * 1.0)
+        dg[i] = x[i] * dy[i] * inv_r
+        i = i + 1
+    }
+    return RmsG { dx: dx, dg: dg }
+}
+
+// ─── Config ────────────────────────────────────────────────
+
+let D     = 4
+let FF    = 8
+let NL    = 2
+let VOCAB = 8
+let RANK  = 2
+let SEQ   = 3
+let STEPS = 20
+let LR    = 0.1
+let EPS   = 0.00001
+
+// ─── Weight state (one flat buffer per tensor) ────────────
+
+// Embedding
+let mut embed = tensor_mul_scalar(tensor_randn(VOCAB * D, 1), 0.1)
+
+// Layer 0
+let mut L0_Wq   = tensor_mul_scalar(tensor_randn(D * D,  10), 0.1)
+let mut L0_Wk   = tensor_mul_scalar(tensor_randn(D * D,  11), 0.1)
+let mut L0_Wv   = tensor_mul_scalar(tensor_randn(D * D,  12), 0.1)
+let mut L0_Wo   = tensor_mul_scalar(tensor_randn(D * D,  13), 0.1)
+let mut L0_Wff1 = tensor_mul_scalar(tensor_randn(D * FF, 14), 0.1)
+let mut L0_Wff2 = tensor_mul_scalar(tensor_randn(FF * D, 15), 0.1)
+let mut L0_ga   = [1.0, 1.0, 1.0, 1.0]
+let mut L0_gf   = [1.0, 1.0, 1.0, 1.0]
+
+// Layer 1
+let mut L1_Wq   = tensor_mul_scalar(tensor_randn(D * D,  20), 0.1)
+let mut L1_Wk   = tensor_mul_scalar(tensor_randn(D * D,  21), 0.1)
+let mut L1_Wv   = tensor_mul_scalar(tensor_randn(D * D,  22), 0.1)
+let mut L1_Wo   = tensor_mul_scalar(tensor_randn(D * D,  23), 0.1)
+let mut L1_Wff1 = tensor_mul_scalar(tensor_randn(D * FF, 24), 0.1)
+let mut L1_Wff2 = tensor_mul_scalar(tensor_randn(FF * D, 25), 0.1)
+let mut L1_ga   = [1.0, 1.0, 1.0, 1.0]
+let mut L1_gf   = [1.0, 1.0, 1.0, 1.0]
+
+// LM head
+let mut lmh_U = tensor_mul_scalar(tensor_randn(D    * RANK,  30), 0.1)
+let mut lmh_V = tensor_mul_scalar(tensor_randn(RANK * VOCAB, 31), 0.1)
+
+// Fixed training data
+let TOKENS  = [0, 1, 2]
+let TARGETS = [1, 2, 3]
+
+// ─── Layer forward (saves activations) ────────────────────
+
+struct LAct {
+    norm1: array, q: array, k: array, v: array, probs: array,
+    ctx: array, attn_out: array, mid: array, norm2: array,
+    up: array, act: array, ffn_out: array, y: array
+}
+
+fn layer_fwd(
+    x: array, wq: array, wk: array, wv: array, wo: array,
+    wff1: array, wff2: array, ga: array, gf: array
+) -> LAct {
+    let inv_sqrt_d = 1.0 / sqrt(D * 1.0)
+    // norm1 row-wise
+    let mut norm1 = tensor_zeros(SEQ * D)
+    let mut i = 0
+    while i < SEQ {
+        let r = rms_norm(tensor_slice(x, i * D, (i + 1) * D), ga, EPS)
+        let mut p = 0
+        while p < D { norm1[i * D + p] = r[p]; p = p + 1 }
+        i = i + 1
+    }
+    // Attention
+    let q = matmul(norm1, wq, SEQ, D, D)
+    let k = matmul(norm1, wk, SEQ, D, D)
+    let v = matmul(norm1, wv, SEQ, D, D)
+    let mut probs = tensor_zeros(SEQ * SEQ)
+    let mut ctx = tensor_zeros(SEQ * D)
+    i = 0
+    while i < SEQ {
+        let q_i = tensor_slice(q, i * D, (i + 1) * D)
+        let mut scores = []
+        let mut j = 0
+        while j < SEQ {
+            let k_j = tensor_slice(k, j * D, (j + 1) * D)
+            scores = scores.push(tensor_dot(q_i, k_j) * inv_sqrt_d)
+            j = j + 1
+        }
+        let p_i = softmax(scores)
+        j = 0
+        while j < SEQ { probs[i * SEQ + j] = p_i[j]; j = j + 1 }
+        let mut row = tensor_zeros(D)
+        j = 0
+        while j < SEQ {
+            let v_j = tensor_slice(v, j * D, (j + 1) * D)
+            row = tensor_add(row, tensor_mul_scalar(v_j, p_i[j]))
+            j = j + 1
+        }
+        let mut p = 0
+        while p < D { ctx[i * D + p] = row[p]; p = p + 1 }
+        i = i + 1
+    }
+    let attn_out = matmul(ctx, wo, SEQ, D, D)
+    let mid = tensor_add(x, attn_out)
+    // norm2
+    let mut norm2 = tensor_zeros(SEQ * D)
+    i = 0
+    while i < SEQ {
+        let r = rms_norm(tensor_slice(mid, i * D, (i + 1) * D), gf, EPS)
+        let mut p = 0
+        while p < D { norm2[i * D + p] = r[p]; p = p + 1 }
+        i = i + 1
+    }
+    // FFN
+    let up = matmul(norm2, wff1, SEQ, D, FF)
+    let act = swiglu_vec(up, up)
+    let ffn_out = matmul(act, wff2, SEQ, FF, D)
+    let y = tensor_add(mid, ffn_out)
+    return LAct {
+        norm1: norm1, q: q, k: k, v: v, probs: probs, ctx: ctx,
+        attn_out: attn_out, mid: mid, norm2: norm2,
+        up: up, act: act, ffn_out: ffn_out, y: y
+    }
+}
+
+// ─── Layer backward (all 9 gradients) ─────────────────────
+
+struct LGrad {
+    dx: array, dWq: array, dWk: array, dWv: array, dWo: array,
+    dWff1: array, dWff2: array, dga: array, dgf: array
+}
+
+fn layer_bwd(
+    x: array, wq: array, wk: array, wv: array, wo: array,
+    wff1: array, wff2: array, ga: array, gf: array,
+    acts: LAct, dy: array
+) -> LGrad {
+    let inv_sqrt_d = 1.0 / sqrt(D * 1.0)
+    let dmid_res = dy
+    let dffn_out = dy
+
+    // FFN backward
+    let g_wff2 = mm_bwd(acts.act, wff2, dffn_out, SEQ, FF, D)
+    let dact = g_wff2[0]
+    let dWff2 = g_wff2[1]
+    let g_sg = sg_bwd(acts.up, acts.up, dact)
+    let dup = tensor_add(g_sg[0], g_sg[1])
+    let g_wff1 = mm_bwd(acts.norm2, wff1, dup, SEQ, D, FF)
+    let dnorm2 = g_wff1[0]
+    let dWff1 = g_wff1[1]
+
+    // rmsnorm backward for norm2 (row-wise, accumulate dgf)
+    let mut dmid_norm = tensor_zeros(SEQ * D)
+    let mut dgf_total = tensor_zeros(D)
+    let mut i = 0
+    while i < SEQ {
+        let rg = rms_bwd(
+            tensor_slice(acts.mid, i * D, (i + 1) * D),
+            gf,
+            tensor_slice(dnorm2, i * D, (i + 1) * D),
+            EPS
+        )
+        let mut p = 0
+        while p < D {
+            dmid_norm[i * D + p] = rg.dx[p]
+            dgf_total[p] = dgf_total[p] + rg.dg[p]
+            p = p + 1
+        }
+        i = i + 1
+    }
+    let dmid = tensor_add(dmid_res, dmid_norm)
+    let dx_res = dmid
+    let dattn_out = dmid
+
+    // Attention backward
+    let g_wo = mm_bwd(acts.ctx, wo, dattn_out, SEQ, D, D)
+    let dctx = g_wo[0]
+    let dWo = g_wo[1]
+    let mut dq = tensor_zeros(SEQ * D)
+    let mut dk = tensor_zeros(SEQ * D)
+    let mut dv = tensor_zeros(SEQ * D)
+    i = 0
+    while i < SEQ {
+        let dctx_i = tensor_slice(dctx, i * D, (i + 1) * D)
+        let mut p_i = []
+        let mut j = 0
+        while j < SEQ { p_i = p_i.push(acts.probs[i * SEQ + j]); j = j + 1 }
+        let q_i = tensor_slice(acts.q, i * D, (i + 1) * D)
+
+        let mut dprobs_i = []
+        j = 0
+        while j < SEQ {
+            let v_j = tensor_slice(acts.v, j * D, (j + 1) * D)
+            dprobs_i = dprobs_i.push(tensor_dot(dctx_i, v_j))
+            let pij = p_i[j]
+            let mut m = 0
+            while m < D {
+                dv[j * D + m] = dv[j * D + m] + pij * dctx_i[m]
+                m = m + 1
+            }
+            j = j + 1
+        }
+        let dscores_i = sm_bwd(p_i, dprobs_i)
+        j = 0
+        while j < SEQ {
+            let k_j = tensor_slice(acts.k, j * D, (j + 1) * D)
+            let s_ij = dscores_i[j] * inv_sqrt_d
+            let mut m = 0
+            while m < D {
+                dq[i * D + m] = dq[i * D + m] + s_ij * k_j[m]
+                dk[j * D + m] = dk[j * D + m] + s_ij * q_i[m]
+                m = m + 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let g_q = mm_bwd(acts.norm1, wq, dq, SEQ, D, D)
+    let g_k = mm_bwd(acts.norm1, wk, dk, SEQ, D, D)
+    let g_v = mm_bwd(acts.norm1, wv, dv, SEQ, D, D)
+    let dnorm1 = tensor_add(tensor_add(g_q[0], g_k[0]), g_v[0])
+
+    // rmsnorm backward for norm1 (row-wise, accumulate dga)
+    let mut dx_norm = tensor_zeros(SEQ * D)
+    let mut dga_total = tensor_zeros(D)
+    i = 0
+    while i < SEQ {
+        let rg = rms_bwd(
+            tensor_slice(x, i * D, (i + 1) * D),
+            ga,
+            tensor_slice(dnorm1, i * D, (i + 1) * D),
+            EPS
+        )
+        let mut p = 0
+        while p < D {
+            dx_norm[i * D + p] = rg.dx[p]
+            dga_total[p] = dga_total[p] + rg.dg[p]
+            p = p + 1
+        }
+        i = i + 1
+    }
+    let dx = tensor_add(dx_res, dx_norm)
+
+    return LGrad {
+        dx: dx, dWq: g_q[1], dWk: g_k[1], dWv: g_v[1], dWo: dWo,
+        dWff1: dWff1, dWff2: dWff2, dga: dga_total, dgf: dgf_total
+    }
+}
+
+// ─── Training helpers ─────────────────────────────────────
+
+fn sgd(w: array, g: array) -> array {
+    let n = len(w)
+    let mut out = tensor_zeros(n)
+    let mut i = 0
+    while i < n { out[i] = w[i] - LR * g[i]; i = i + 1 }
+    return out
+}
+
+fn embed_lookup(e: array, toks: [int]) -> array {
+    let n = len(toks)
+    let mut out = tensor_zeros(n * D)
+    let mut i = 0
+    while i < n {
+        let t = toks[i]
+        let mut p = 0
+        while p < D { out[i * D + p] = e[t * D + p]; p = p + 1 }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── One training step ───────────────────────────────────
+
+fn train_step() -> float {
+    // Forward
+    let h0 = embed_lookup(embed, TOKENS)
+    let act0 = layer_fwd(h0, L0_Wq, L0_Wk, L0_Wv, L0_Wo, L0_Wff1, L0_Wff2, L0_ga, L0_gf)
+    let act1 = layer_fwd(act0.y, L1_Wq, L1_Wk, L1_Wv, L1_Wo, L1_Wff1, L1_Wff2, L1_ga, L1_gf)
+    let mid = matmul(act1.y, lmh_U, SEQ, D, RANK)
+    let logits = matmul(mid, lmh_V, SEQ, RANK, VOCAB)
+
+    // Loss + dlogits
+    let scale = 1.0 / (SEQ * 1.0)
+    let mut loss = 0.0
+    let mut dlogits = tensor_zeros(SEQ * VOCAB)
+    let mut i = 0
+    while i < SEQ {
+        let row = tensor_slice(logits, i * VOCAB, (i + 1) * VOCAB)
+        let lp = log_softmax(row)
+        let t = TARGETS[i]
+        loss = loss - lp[t]
+        let p = softmax(row)
+        let mut j = 0
+        while j < VOCAB {
+            dlogits[i * VOCAB + j] = p[j] * scale
+            j = j + 1
+        }
+        dlogits[i * VOCAB + t] = dlogits[i * VOCAB + t] - scale
+        i = i + 1
+    }
+    loss = loss / (SEQ * 1.0)
+
+    // Backward through LM head
+    let g_V = mm_bwd(mid, lmh_V, dlogits, SEQ, RANK, VOCAB)
+    let dmid = g_V[0]
+    let dlmh_V = g_V[1]
+    let g_U = mm_bwd(act1.y, lmh_U, dmid, SEQ, D, RANK)
+    let dh1 = g_U[0]
+    let dlmh_U = g_U[1]
+
+    // Layer 1 backward
+    let g_l1 = layer_bwd(
+        act0.y, L1_Wq, L1_Wk, L1_Wv, L1_Wo, L1_Wff1, L1_Wff2, L1_ga, L1_gf,
+        act1, dh1
+    )
+
+    // Layer 0 backward
+    let g_l0 = layer_bwd(
+        h0, L0_Wq, L0_Wk, L0_Wv, L0_Wo, L0_Wff1, L0_Wff2, L0_ga, L0_gf,
+        act0, g_l1.dx
+    )
+
+    // Embed scatter: dembed[tok_i] += dh0[i]
+    let mut dembed = tensor_zeros(VOCAB * D)
+    i = 0
+    while i < SEQ {
+        let t = TOKENS[i]
+        let mut p = 0
+        while p < D {
+            dembed[t * D + p] = dembed[t * D + p] + g_l0.dx[i * D + p]
+            p = p + 1
+        }
+        i = i + 1
+    }
+
+    // SGD updates
+    embed   = sgd(embed,   dembed)
+    L0_Wq   = sgd(L0_Wq,   g_l0.dWq)
+    L0_Wk   = sgd(L0_Wk,   g_l0.dWk)
+    L0_Wv   = sgd(L0_Wv,   g_l0.dWv)
+    L0_Wo   = sgd(L0_Wo,   g_l0.dWo)
+    L0_Wff1 = sgd(L0_Wff1, g_l0.dWff1)
+    L0_Wff2 = sgd(L0_Wff2, g_l0.dWff2)
+    L0_ga   = sgd(L0_ga,   g_l0.dga)
+    L0_gf   = sgd(L0_gf,   g_l0.dgf)
+
+    L1_Wq   = sgd(L1_Wq,   g_l1.dWq)
+    L1_Wk   = sgd(L1_Wk,   g_l1.dWk)
+    L1_Wv   = sgd(L1_Wv,   g_l1.dWv)
+    L1_Wo   = sgd(L1_Wo,   g_l1.dWo)
+    L1_Wff1 = sgd(L1_Wff1, g_l1.dWff1)
+    L1_Wff2 = sgd(L1_Wff2, g_l1.dWff2)
+    L1_ga   = sgd(L1_ga,   g_l1.dga)
+    L1_gf   = sgd(L1_gf,   g_l1.dgf)
+
+    lmh_U = sgd(lmh_U, dlmh_U)
+    lmh_V = sgd(lmh_V, dlmh_V)
+
+    return loss
+}
+
+// ─── Training loop ───────────────────────────────────────
+
+println("[train_full_decoder] config: d=" + str(D) + " ff=" + str(FF) + " layers=" + str(NL) + " vocab=" + str(VOCAB) + " seq=" + str(SEQ) + " rank=" + str(RANK) + " steps=" + str(STEPS) + " lr=" + str(LR))
+
+let loss_init = train_step()
+println("[train_full_decoder] step=1 loss=" + str(loss_init))
+
+let mut step = 2
+let mut last_loss = loss_init
+while step <= STEPS {
+    last_loss = train_step()
+    if step % 5 == 0 {
+        println("[train_full_decoder] step=" + str(step) + " loss=" + str(last_loss))
+    }
+    step = step + 1
+}
+
+println("[train_full_decoder] final_loss = " + str(last_loss))
+println("[train_full_decoder] Δ loss     = " + str(last_loss - loss_init))
+
+if last_loss < loss_init {
+    println("[train_full_decoder] PASS — full decoder trains end-to-end")
+    println("[train_full_decoder] ════════════════════════════════════════")
+    println("[train_full_decoder] Every weight in the decoder was updated")
+    println("[train_full_decoder] by SGD against a real gradient signal:")
+    println("[train_full_decoder]   - embedding table (scatter)")
+    println("[train_full_decoder]   - 2 layers × (Wq, Wk, Wv, Wo, Wff1, Wff2, gamma×2)")
+    println("[train_full_decoder]   - LM head U, V")
+    println("[train_full_decoder] The pure-hexa training stack is complete.")
+} else {
+    println("[train_full_decoder] FAIL — loss did not decrease")
+}
