@@ -323,7 +323,7 @@ struct MetricSnapshot {
 
 ### 4.3 ESP32 Hardware Law Evolution
 
-**Files:** `anima-physics/esp32-crate/src/law_measurement.hexa`, `law_evolution.hexa` | **Status: Code Ready** (needs hardware)
+**Files:** `anima-physics/esp32/src/law_measurement.hexa`, `law_evolution.hexa` | **Status: Code Ready** (needs hardware)
 
 `no_std` compatible law metrics for ESP32 boards ($4/board, 2 cells/board). `LawMetrics` struct is 34 bytes (8 x f32 + u16):
 
@@ -542,7 +542,7 @@ How a law is discovered, validated, registered, and applied:
 | 3 | - | Multi-Loop Arena | Complete | `anima/experiments/evolution/closed_loop.hexa` (arena/scale) | integrated |
 | 4 | 4.1 | ConsciousLM Discovery | Complete | `anima/experiments/evolution/law_discovery.hexa` | 1084 |
 | 4 | 4.2 | Hexa Backend | Code Ready | `anima/core/law_discovery/` (hexa-native) | 1738 |
-| 4 | 4.3 | ESP32 Hardware | Code Ready | `anima-physics/esp32-crate/src/law_*.hexa` | ~300 |
+| 4 | 4.3 | ESP32 Hardware | Code Ready | `anima-physics/esp32/src/law_*.hexa` | ~300 |
 | 4 | 4.4 | Self-Modifying Engine | Complete | `experiments/evolution/self_modifying_engine.hexa` | ~1200 |
 
 ### Completion

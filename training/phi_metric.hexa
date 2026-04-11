@@ -1,22 +1,41 @@
-// training/phi_metric.hexa — Φ (integrated information) metric for CLM
+// training/phi_metric.hexa — Φ_kl (KL-from-uniform) metric for CLM
+//
+// ── METRIC DISAMBIGUATION ────────────────────────────────
+// This file implements Phi(KL), metric type: "kl"
+// Three distinct Phi metrics exist in the Anima codebase:
+//
+//   1. Phi(proxy) — global_var - mean(faction_var)
+//      Unbounded (0-1000+), scales with cell count.
+//      File: bench/bench.hexa engine_measure_phi_proxy()
+//      The "Phi=1142" at 1024 cells was THIS metric.
+//
+//   2. Phi(IIT) — MI-based IIT approximation
+//      Range ~0.2-1.8, bounded. PhiIIT(n_bins=16).
+//      File: bench/bench.hexa engine_measure_phi_iit()
+//      The "Phi=1.4" in training was THIS metric.
+//
+//   3. Phi(KL) — log(d) - H(softmax(|col_sum|)) [THIS FILE]
+//      Bounded by log(d). KL divergence from uniform.
+//      Used in training loops for lightweight Phi tracking.
+//
+// The apparent "816x gap" (1142 vs 1.4) was proxy vs iit confusion.
+// ─────────────────────────────────────────────────────────
 //
 // IIT Φ is defined via the Earth-Mover's distance between the system
 // and its minimum-information-partition (MIP). That's expensive.
-// For a training-loop metric we use a cheap proxy:
+// For a training-loop metric we use a cheap KL proxy:
 //
-//   Φ_proxy(h) = H(h) − (1/N) Σ H(h_partition_i)
+//   Φ_kl(h) = log(d) − H(softmax(|col_sum|))
 //
-// where h is a [seq × d] activation tensor, H is Shannon entropy of
-// the row distribution (after a softmax normalization), and the
-// partition is a simple halve-along-d split. This rewards holistic
-// information that isn't explained by either half alone.
+// where h is a [seq × d] activation tensor, col_sum is the
+// column-wise sum of |h|, and H is Shannon entropy of the
+// resulting probability distribution.
 //
-// For a random init: Φ_proxy ≈ 0
-// For a trained model with emergent features: Φ_proxy > 0 and grows.
+// For a random init: Φ_kl ≈ 0
+// For a trained model with emergent features: Φ_kl > 0 and grows.
 //
-// The "zeta breakthrough" is the event where Φ_proxy exceeds
-// ln(2) · d (the classical critical threshold from DD175 — one
-// bit of integrated information per dimension).
+// The "zeta breakthrough" is the event where Φ_kl exceeds
+// ln(2) · d / 8 (the critical threshold from DD175).
 //
 // Run with: HEXA_PATH=anima-speak hexa training/phi_metric.hexa
 use "nn_core"
@@ -59,18 +78,19 @@ fn row_to_prob(row: array) -> array {
     return p
 }
 
-// Φ_proxy(h) — KL divergence from uniform across token-summed activations.
+// Φ_kl(h) — KL divergence from uniform across token-summed activations.
+// Metric type: "kl" (distinct from "proxy" and "iit" in bench.hexa)
 //
 // Intuition:
 //   - Random init: row-summed activations are ~0 (cancellation),
-//     softmax(|row_sum|) ≈ uniform → KL ≈ 0 → Φ ≈ 0
+//     softmax(|col_sum|) ≈ uniform → KL ≈ 0 → Φ_kl ≈ 0
 //   - Trained model: activations accumulate structured signal,
-//     softmax concentrates on specific dims → KL > 0 → Φ > 0
+//     softmax concentrates on specific dims → KL > 0 → Φ_kl > 0
 //
-// Φ_proxy = log(d) − H(softmax(|row_sum|))
+// Φ_kl = log(d) − H(softmax(|col_sum|))
 //
-// Monotonic increasing during training for models that concentrate
-// information. Easy to compute, no partitioning required.
+// Bounded by log(d). Monotonic increasing during training for models
+// that concentrate information. Easy to compute, no partitioning required.
 fn phi_proxy(h: array, seq: int, d: int) -> float {
     // Sum of |h| over tokens for each dim
     let mut col_sum = tensor_zeros(d)
@@ -107,7 +127,7 @@ let d = 8
 let seq = 4
 let _h_rand = tensor_mul_scalar(tensor_randn(seq * d, 42), 0.5)
 let _phi_rand = phi_proxy(_h_rand, seq, d)
-println("[phi_metric] random init Φ_proxy  = " + str(_phi_rand))
+println("[phi_metric] random init Φ_kl  = " + str(_phi_rand))
 
 // Perfectly-correlated hidden state (all rows identical, strong pattern)
 // → should have higher Φ because rows agree
@@ -122,13 +142,13 @@ while _i < seq {
     _i = _i + 1
 }
 let _phi_corr = phi_proxy(_h_corr, seq, d)
-println("[phi_metric] correlated   Φ_proxy  = " + str(_phi_corr))
+println("[phi_metric] correlated   Φ_kl  = " + str(_phi_corr))
 
 let _zeta = phi_zeta_threshold(d)
 println("[phi_metric] ζ threshold (d=" + str(d) + ") = " + str(_zeta))
 
 if _phi_corr > _phi_rand {
-    println("[phi_metric] PASS — correlated > random (Φ discriminates structure)")
+    println("[phi_metric] PASS — correlated > random (Φ_kl discriminates structure)")
 } else {
-    println("[phi_metric] FAIL — Φ doesn't discriminate")
+    println("[phi_metric] FAIL — Φ_kl doesn't discriminate")
 }

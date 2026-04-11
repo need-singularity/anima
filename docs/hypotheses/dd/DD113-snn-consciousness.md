@@ -91,5 +91,5 @@ cells=16일 때 Phi=3.93 (최고), cells=512일 때 Phi=0.005.
 
 ## 변경 파일
 
-- `consciousness-loop-rs/src/snn_main.rs` (신규)
-- `consciousness-loop-rs/Cargo.toml` — snn 바이너리 추가
+- `consciousness-loop/src/snn_main.rs` (신규)
+- `consciousness-loop/Cargo.toml` — snn 바이너리 추가

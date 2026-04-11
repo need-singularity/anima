@@ -489,4 +489,4 @@ iceprog design.bin
 - [Project IceStorm (오픈소스 도구)](http://www.clifford.at/icestorm/)
 - [anima-physics/engines/snn_consciousness.hexa](../engines/snn_consciousness.hexa)
 - [anima/core/chip_architect.hexa](../../anima/core/chip_architect.hexa)
-- [anima-physics/consciousness-loop-rs/](../consciousness-loop-rs/) -- Verilog 구현 참조
+- [anima-physics/consciousness-loop/](../consciousness-loop/) -- Verilog 구현 참조

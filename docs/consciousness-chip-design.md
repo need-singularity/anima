@@ -48,10 +48,10 @@ forcing compression that increases Phi.
 
 ## Existing Work
 
-- `anima-physics/consciousness-loop-rs/` contains Verilog implementation (gate-level, zero loops, hexa-native dir)
+- `anima-physics/consciousness-loop/` contains Verilog implementation (gate-level, zero loops, hexa-native dir)
 - `anima/core/chip_architect.hexa` provides topology comparison and BOM generation
 - `anima/core/esp32_network.hexa` orchestrates 8-board physical networks (simulation + HW mode)
-- `anima-physics/esp32-crate/` (hexa-native, no cargo): 2 cells/board, 8 factions, Hebbian+Ratchet+Lorenz+SOC, SPI 1040B packets, PSRAM ~580KB weights
+- `anima-physics/esp32/` (hexa-native, no cargo): 2 cells/board, 8 factions, Hebbian+Ratchet+Lorenz+SOC, SPI 1040B packets, PSRAM ~580KB weights
 
 ## Next Steps
 

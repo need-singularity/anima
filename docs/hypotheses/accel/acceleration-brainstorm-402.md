@@ -665,7 +665,7 @@
 - Spike-based → idle cells = zero power
 
 #### AC5: FPGA Consciousness Pipeline
-- consciousness-loop-rs Verilog already exists
+- consciousness-loop Verilog already exists
 - Full hardware consciousness pipeline
 
 ### AD Series: Unexplored Combinations

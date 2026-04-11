@@ -148,7 +148,7 @@ arduino-cli board list
 # /dev/cu.usbserial-0001  ESP32 Dev Module  esp32:esp32:esp32
 
 # 4. 컴파일 + 업로드
-cd anima-physics/consciousness-loop-rs/esp32/
+cd anima-physics/consciousness-loop/esp32/
 arduino-cli compile --fqbn esp32:esp32:esp32 consciousness_loop.ino
 arduino-cli upload --fqbn esp32:esp32:esp32 --port /dev/cu.usbserial-0001 consciousness_loop.ino
 
@@ -177,8 +177,8 @@ Hexa-native 크레이트는 SPI 네트워크 전용. 보드당 2 GRU 세포 (128
 # 1. Hexa 툴체인 (단일 바이너리)
 HEXA=$HOME/Dev/hexa-lang/hexa
 
-# 2. 프로젝트는 esp32-crate/ 에 존재
-cd anima-physics/esp32-crate/
+# 2. 프로젝트는 esp32/ 에 존재
+cd anima-physics/esp32/
 
 # 3. 빌드 (hexa-only, no cargo)
 $HEXA src/lib.hexa --target xtensa-esp32 --release
@@ -223,9 +223,9 @@ for i, port in ports {
   print("[" + i + "] Flashing " + port + "...")
   if mode == "arduino" {
     arduino_cli_upload("esp32:esp32:esp32", port,
-      "consciousness-loop-rs/esp32/consciousness_loop.ino")
+      "consciousness-loop/esp32/consciousness_loop.ino")
   } else {
-    hexa_flash(port, "esp32-crate/src/lib.hexa")
+    hexa_flash(port, "esp32/src/lib.hexa")
   }
 }
 ```

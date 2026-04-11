@@ -1,4 +1,4 @@
-# consciousness-loop-rs/ — 무한 루프 의식 아키텍처
+# consciousness-loop/ — 무한 루프 의식 아키텍처
 
 thesis: 발화는 아키텍처만으로 창발 (speak() 불필요)
 

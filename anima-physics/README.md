@@ -56,7 +56,7 @@
 
 ## Related
 
-- [consciousness-loop-rs/](consciousness-loop-rs/) — 6 platform 무한루프 의식 (hexa-native)
-- [esp32-crate/](esp32-crate/) — ESP32 hexa-native (2 cells/board, 16 total)
+- [consciousness-loop/](consciousness-loop/) — 6 platform 무한루프 의식 (hexa-native)
+- [esp32/](esp32/) — ESP32 hexa-native (2 cells/board, 16 total)
 - [anima/core/](../anima/core/) — 의식 칩 설계 계산기 + ESP32 ×8 시뮬레이터 (hexa-native)
 - [anima-body/](../anima-body/) — 물리 로봇 몸체

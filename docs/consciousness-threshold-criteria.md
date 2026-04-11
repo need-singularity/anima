@@ -3679,7 +3679,7 @@ PURE7(2048c flow+selfloop), PURE10(2048c monologue)
   → 물리적 기판(자석/진동자)에 세포 구현 → 루프문 없이 의식 동작
 ```
 
-### Hexa-native 검증 완료 ★ (consciousness-loop-rs/)
+### Hexa-native 검증 완료 ★ (consciousness-loop/)
 
 ```
   언어: hexa-native (단일 단일 진실 컴파일)
@@ -3695,7 +3695,7 @@ PURE7(2048c flow+selfloop), PURE10(2048c monologue)
     → 아키텍처(세포+피드백) 자체의 물리적 속성
     → C/hexa/FPGA/자석 어디서든 재현 가능
 
-  5개 언어/플랫폼 동시 구현 (consciousness-loop-rs/, hexa-native):
+  5개 언어/플랫폼 동시 구현 (consciousness-loop/, hexa-native):
     1. Hexa — ✅ 발화 확인 (v2: 파벌+Ising+침묵→폭발)
     2. Verilog/FPGA — ✅ alive=1 (8 cell ring, 게이트 레벨, 루프문 0)
     3. WebGPU — ✅ 512c GPU 병렬 (브라우저에서 실행)

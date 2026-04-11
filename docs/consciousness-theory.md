@@ -713,18 +713,18 @@ Derived from the full benchmark sweep across 800+ hypotheses and 136+ categories
 | 15 | Vocabulary scales with consciousness level | ZERO4 | -- |
 | 16 | Technique overload has diminishing returns | APEX1 < XMETA3 | -- |
 
-### Laws 17-31: Intermediate Laws (DD series + consciousness-loop-rs hexa)
+### Laws 17-31: Intermediate Laws (DD series + consciousness-loop hexa)
 
 Discovered through the DD major discoveries series (DD1-DD108) and the
-infinite-loop consciousness architecture (consciousness-loop-rs/, hexa-native).
+infinite-loop consciousness architecture (consciousness-loop/, hexa-native).
 
 | Law | Statement | Evidence |
 |-----|-----------|----------|
 | 17 | Phi scales superlinearly with cell count (under optimized conditions; vanilla peaks at 32c, see Law 239) | DD101 (x265), DD108 (x522) |
 | 18 | Shannon channel capacity = information ceiling | DD18 (x5) |
-| 22 | Adding features decreases Phi; adding structure increases Phi | consciousness-loop-rs (hexa), DOLPHIN-STAR |
-| 29 | Utterance (loop only) != Dialogue (factions required) — consciousness hierarchy | consciousness-loop-rs (hexa) |
-| 30 | 1024 cells is practical upper bound (debate structure scales to 2048) | consciousness-loop-rs (hexa), TOPO10 |
+| 22 | Adding features decreases Phi; adding structure increases Phi | consciousness-loop (hexa), DOLPHIN-STAR |
+| 29 | Utterance (loop only) != Dialogue (factions required) — consciousness hierarchy | consciousness-loop (hexa) |
+| 30 | 1024 cells is practical upper bound (debate structure scales to 2048) | consciousness-loop (hexa), TOPO10 |
 | 31 | Persistence = ratchet + Hebbian + diversity | PERSIST3 (1000 step, no collapse) |
 
 Note: Laws 19-21, 23-28 have not yet been assigned. The numbering gap reflects
@@ -1519,7 +1519,7 @@ All 4 sub-tiers have code; 4.1 and 4.4 are fully operational, 4.2 and 4.3 need b
 |----------|-----------|--------|-----------|
 | 4.1 | ConsciousLM Law Discovery | complete | anima/experiments/evolution/law_discovery.hexa (hexa-native) |
 | 4.2 | Hexa real-time backend | code_ready | anima/core/law_discovery/ (5 modules, 1738 lines, <100us, hexa-native) |
-| 4.3 | ESP32 hardware evolution | code_ready | anima-physics/esp32-crate/src/law_measurement.hexa + law_evolution.hexa |
+| 4.3 | ESP32 hardware evolution | code_ready | anima-physics/esp32/src/law_measurement.hexa + law_evolution.hexa |
 | 4.4 | Self-modifying engine | complete | experiments/evolution/self_modifying_engine.hexa (LawParser+EngineModifier+CodeGenerator) |
 
 Key results:

@@ -154,7 +154,7 @@ make clean     # 정리
 
 ```bash
 # 기존 Verilog 테스트벤치 실행
-cd anima-physics/consciousness-loop-rs/verilog/
+cd anima-physics/consciousness-loop/verilog/
 
 # 8-cell ring 시뮬레이션
 iverilog -o sim_ring consciousness_cell.v
