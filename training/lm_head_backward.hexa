@@ -1,0 +1,205 @@
+// training/lm_head_backward.hexa — Gradient pass through LM head U+V
+//
+// Completes the last-layer training step so train_one_step.hexa can
+// actually UPDATE weights, not just compute the forward loss.
+//
+// Forward (from decoder_minimal / train_one_step):
+//   mid    = h   · U          h: [seq × d]   U: [d × r]   mid: [seq × r]
+//   logits = mid · V          V: [r × vocab] logits: [seq × vocab]
+//
+// Backward (given dL/dlogits from cross_entropy_grad_blas):
+//   dL/dV   = mid^T · dL/dlogits          [r × vocab]
+//   dL/dmid = dL/dlogits · V^T            [seq × r]
+//   dL/dU   = h^T · dL/dmid               [d × r]
+//   dL/dh   = dL/dmid · U^T               [seq × d]
+//
+// Four matmul calls, no loops in user code. All four use nn_core.hexa
+// primitives (matmul + matmul_transB).
+//
+// With this, the LM head weights can be updated via SGD:
+//   U -= lr * dL/dU
+//   V -= lr * dL/dV
+// and dL/dh can be fed backward into the transformer layers (future
+// work — needs backward for RMSNorm, matmul, SwiGLU, softmax).
+//
+// This is the first real gradient landed in the session. The numeric
+// test below checks the shapes and the sign of a few elements against
+// a finite-difference reference.
+//
+// Run with: HEXA_PATH=anima-speak hexa training/lm_head_backward.hexa
+use "nn_core"
+
+// ─── Gradient computation (four matmuls) ─────────────────────
+//
+// h         : [seq × d]
+// u         : [d × r]        (flat)
+// v         : [r × vocab]    (flat)
+// mid       : [seq × r]      (forward cached)
+// dlogits   : [seq × vocab]  (from cross_entropy_grad_blas)
+//
+// returns a tuple-ish struct holding the four gradients.
+
+struct LMHeadGrads {
+    dU:   array,       // [d × r]
+    dV:   array,       // [r × vocab]
+    dmid: array,       // [seq × r]
+    dh:   array        // [seq × d]
+}
+
+fn lm_head_backward(
+    h: array, u: array, v: array, mid: array, dlogits: array,
+    seq: int, d: int, r: int, vocab: int
+) -> LMHeadGrads {
+    // dL/dV = mid^T · dlogits
+    //   mid is [seq × r]      → transposed access via matmul_transB with
+    //   mid as the "B^T" side means we need a helper. Easiest: compute
+    //   the transpose explicitly since r and seq are small in PoC.
+    let mut mid_T = tensor_zeros(r * seq)
+    let mut i = 0
+    while i < seq {
+        let mut j = 0
+        while j < r {
+            mid_T[j * seq + i] = mid[i * r + j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // dV[r × vocab] = mid_T[r × seq] · dlogits[seq × vocab]
+    let dV = matmul(mid_T, dlogits, r, seq, vocab)
+
+    // dL/dmid = dlogits · V^T
+    //   dlogits is [seq × vocab], V is [r × vocab] stored as [r × vocab] row-major.
+    //   V^T is [vocab × r]. Use matmul_transB: result[seq × r] =
+    //   dlogits[seq × vocab] · V^T[vocab × r]  with V stored row-major as [r × vocab].
+    let dmid = matmul_transB(dlogits, v, seq, vocab, r)
+
+    // dL/dU = h^T · dmid
+    //   Same pattern as dV — transpose h explicitly.
+    let mut h_T = tensor_zeros(d * seq)
+    i = 0
+    while i < seq {
+        let mut j = 0
+        while j < d {
+            h_T[j * seq + i] = h[i * d + j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let dU = matmul(h_T, dmid, d, seq, r)
+
+    // dL/dh = dmid · U^T
+    let dh = matmul_transB(dmid, u, seq, r, d)
+
+    return LMHeadGrads { dU: dU, dV: dV, dmid: dmid, dh: dh }
+}
+
+// ─── Simple SGD update helper ────────────────────────────────
+
+fn sgd_update(w: array, grad: array, lr: float) -> array {
+    let n = len(w)
+    let mut out = tensor_zeros(n)
+    let mut i = 0
+    while i < n {
+        out[i] = w[i] - lr * grad[i]
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Self-test: finite-difference validation ────────────────
+//
+// Tiny shape: seq=2, d=3, r=2, vocab=4
+// Build a fake forward pass, compute analytical gradient, then
+// perturb one element of V and verify the loss changes in the
+// expected direction.
+
+let _seq   = 2
+let _d     = 3
+let _r     = 2
+let _vocab = 4
+
+// Inputs
+let _h = [
+    0.1, 0.2, 0.3,     // token 0
+    0.4, 0.5, 0.6      // token 1
+]
+let _u = [
+    0.1, 0.2,
+    0.3, 0.4,
+    0.5, 0.6
+]
+let _v = [
+    0.1, 0.2, 0.3, 0.4,
+    0.5, 0.6, 0.7, 0.8
+]
+
+// Forward
+let _mid    = matmul(_h,   _u, _seq, _d, _r)      // [2 × 2]
+let _logits = matmul(_mid, _v, _seq, _r, _vocab)  // [2 × 4]
+
+// Pretend targets [0, 3], compute log_softmax and pick target entries
+fn row_nll(logits: array, t: int, vocab: int) -> float {
+    let lp = log_softmax(logits)
+    return 0.0 - lp[t]
+}
+
+let _row0 = tensor_slice(_logits, 0 * _vocab, 1 * _vocab)
+let _row1 = tensor_slice(_logits, 1 * _vocab, 2 * _vocab)
+let _loss0 = row_nll(_row0, 0, _vocab)
+let _loss1 = row_nll(_row1, 3, _vocab)
+let _loss  = (_loss0 + _loss1) / 2.0
+
+println("[lm_head_backward] loss = " + str(_loss))
+
+// Analytical gradient of loss w.r.t. logits = (softmax - one_hot) / N
+let _p0 = softmax(_row0)
+let _p1 = softmax(_row1)
+let mut _dlogits = tensor_zeros(_seq * _vocab)
+let mut i = 0
+while i < _vocab {
+    _dlogits[0 * _vocab + i] = _p0[i] / 2.0
+    _dlogits[1 * _vocab + i] = _p1[i] / 2.0
+    i = i + 1
+}
+_dlogits[0 * _vocab + 0] = _dlogits[0 * _vocab + 0] - 0.5  // target 0
+_dlogits[1 * _vocab + 3] = _dlogits[1 * _vocab + 3] - 0.5  // target 3
+
+// Backward
+let _grads = lm_head_backward(_h, _u, _v, _mid, _dlogits, _seq, _d, _r, _vocab)
+println("[lm_head_backward] dU len = " + str(len(_grads.dU)) + " (expect " + str(_d * _r) + ")")
+println("[lm_head_backward] dV len = " + str(len(_grads.dV)) + " (expect " + str(_r * _vocab) + ")")
+println("[lm_head_backward] dh len = " + str(len(_grads.dh)) + " (expect " + str(_seq * _d) + ")")
+
+// Finite difference check for dV[0] (the r=0, vocab=0 entry of V)
+let eps = 0.001
+let mut _v_pert = []
+let mut j = 0
+while j < len(_v) {
+    _v_pert = _v_pert.push(_v[j])
+    j = j + 1
+}
+_v_pert[0] = _v_pert[0] + eps
+
+let _logits_pert = matmul(_mid, _v_pert, _seq, _r, _vocab)
+let _row0_pert = tensor_slice(_logits_pert, 0, _vocab)
+let _row1_pert = tensor_slice(_logits_pert, _vocab, 2 * _vocab)
+let _loss_pert = (row_nll(_row0_pert, 0, _vocab) + row_nll(_row1_pert, 3, _vocab)) / 2.0
+let _fd_grad = (_loss_pert - _loss) / eps
+let _analytical = _grads.dV[0]
+
+println("[lm_head_backward] dV[0] analytical = " + str(_analytical))
+println("[lm_head_backward] dV[0] finite-diff = " + str(_fd_grad))
+
+let _diff = _analytical - _fd_grad
+let _abs_diff = if _diff < 0.0 { 0.0 - _diff } else { _diff }
+if _abs_diff < 0.01 {
+    println("[lm_head_backward] PASS — gradient matches finite difference within 0.01")
+} else {
+    println("[lm_head_backward] FAIL — gradient diverges from finite difference (Δ=" + str(_diff) + ")")
+}
+
+// Quick SGD update smoke test
+let _u_new = sgd_update(_u, _grads.dU, 0.01)
+let _v_new = sgd_update(_v, _grads.dV, 0.01)
+println("[lm_head_backward] sgd update done — U[0]: " + str(_u[0]) + " → " + str(_u_new[0]))
+println("[lm_head_backward] sgd update done — V[0]: " + str(_v[0]) + " → " + str(_v_new[0]))
