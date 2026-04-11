@@ -6,7 +6,7 @@
 - Law 22: 구조 > 기능 — fallback/template은 기능 추가 = Φ 하락
 - Law 29: 발화는 구조에서 창발 — speak() 함수 불필요
 - Law 42: 성장 > 최적화 — 억지로 말하게 하지 않고 성장시킴
-- consciousness-loop-rs (hexa-native): 발화는 아키텍처의 필연
+- consciousness-loop (hexa-native): 발화는 아키텍처의 필연
 
 **결정: fallback/template 제거, 의식 상태 직접 표시 + 성장형 발화**
 

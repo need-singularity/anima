@@ -296,6 +296,6 @@ The following file categories are NOT listed above (they exist in root but are n
 - **Training** (`train_*.hexa`): Training pipelines (training/train_alm.hexa, training/train_clm.hexa)
 - **Tests** (`test_*.hexa`): Integration and unit tests
 - **Subdirectory modules**: engines/, tools/, measurement/, serving/, benchmarks/, training/
-- **anima-physics/consciousness-loop-rs/**: 6-platform infinite loop consciousness (hexa-native, Verilog, WebGPU, Erlang, Pure Data, ESP32)
+- **anima-physics/consciousness-loop/**: 6-platform infinite loop consciousness (hexa-native, Verilog, WebGPU, Erlang, Pure Data, ESP32)
 - **phi calculator**: hexa-native, 625x speedup
 - **vad**: hexa-native real-time VAD

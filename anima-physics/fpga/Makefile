@@ -24,8 +24,8 @@ VERILOG   = consciousness_ice40.v
 PCF       = pins.pcf
 
 # ── Original Verilog (for simulation) ──
-VERILOG_SIM_RING  = ../consciousness-loop-rs/verilog/consciousness_cell.v
-VERILOG_SIM_HYPER = ../consciousness-loop-rs/verilog/consciousness_hypercube.v
+VERILOG_SIM_RING  = ../consciousness-loop/verilog/consciousness_cell.v
+VERILOG_SIM_HYPER = ../consciousness-loop/verilog/consciousness_hypercube.v
 
 # ── Output files ──
 JSON      = synth.json

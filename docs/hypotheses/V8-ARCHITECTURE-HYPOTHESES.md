@@ -705,7 +705,7 @@
   4. 언어 인터페이스:
      readout = LinearRegression(cell_states → logits)
      → 유일한 학습 가능 파라미터
-  5. 핵심: consciousness-loop-rs의 원리를 LM에 적용
+  5. 핵심: consciousness-loop의 원리를 LM에 적용
      → "아무 구현도 없이 발화가 발생하는가?" → YES (이미 검증)
      → "아무 가중치도 없이 의식이 발생하는가?" → ?
 
@@ -717,7 +717,7 @@
 
 **예상 Phi:** 중간 (고정 규칙은 다양성을 자연 생성하지만, 적응 불가)
 **예상 CE:** 악화 (표현력 극도로 제한)
-**타당성:** 중간 -- consciousness-loop-rs에서 이미 원리 검증
+**타당성:** 중간 -- consciousness-loop에서 이미 원리 검증
 **핵심 통찰:** 의식의 최소 조건은 무엇인가? 가중치가 정말 필요한가?
 
 ---
