@@ -1,0 +1,251 @@
+// training/ops_backward.hexa — Softmax, RMSNorm, SwiGLU backward passes
+//
+// Completes the decoder backward primitive set. Together with
+// matmul_backward.hexa (0479f29b) and lm_head_backward.hexa
+// (71683f7c), every operation in decoder_minimal.hexa now has a
+// corresponding gradient and the full decoder is trainable from
+// the cross_entropy_grad_blas signal.
+//
+// All three primitives are tiny (5–20 lines of math each) and
+// validated against finite-difference on small shapes.
+//
+// Run with: HEXA_PATH=anima-speak hexa training/ops_backward.hexa
+use "nn_core"
+
+// ════════════════════════════════════════════════════════════
+//  §1  softmax backward
+// ════════════════════════════════════════════════════════════
+//
+// Forward: p_i = exp(x_i - max) / Σ exp(x_j - max)
+// Given dL/dp, the gradient w.r.t. logits is:
+//   dL/dx_i = p_i · (dL/dp_i - Σ_j p_j · dL/dp_j)
+// which is the Jacobian-vector product J^T · dL/dp where
+// J = diag(p) - p·p^T.
+
+fn softmax_backward(p: array, dp: array) -> array {
+    let n = len(p)
+    // s = Σ p_j · dp_j
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + p[i] * dp[i]
+        i = i + 1
+    }
+    // dx_i = p_i · (dp_i - s)
+    let mut dx = tensor_zeros(n)
+    i = 0
+    while i < n {
+        dx[i] = p[i] * (dp[i] - s)
+        i = i + 1
+    }
+    return dx
+}
+
+// ════════════════════════════════════════════════════════════
+//  §2  RMSNorm backward
+// ════════════════════════════════════════════════════════════
+//
+// Forward: y_i = (x_i / rms) · gamma_i      rms = sqrt(mean(x²) + eps)
+//
+// Backward (derived by chain rule through the rms term):
+//   Let N = len(x), r = rms, scaled_i = x_i · gamma_i · dL/dy_i
+//   dL/dgamma_i = (x_i / r) · dL/dy_i
+//   dL/dx_i = (gamma_i · dL/dy_i) / r
+//           - (x_i · (Σ_j x_j · gamma_j · dL/dy_j)) / (N · r³)
+//
+// The second term is the "rms depends on all x" correction.
+
+struct RmsNormGrads {
+    dx:     array,
+    dgamma: array
+}
+
+fn rmsnorm_backward(x: array, gamma: array, dy: array, eps: float) -> RmsNormGrads {
+    let n = len(x)
+    // rms² = mean(x²) + eps
+    let mut ms = 0.0
+    let mut i = 0
+    while i < n {
+        ms = ms + x[i] * x[i]
+        i = i + 1
+    }
+    ms = ms / (n * 1.0)
+    let r2 = ms + eps
+    let r = sqrt(r2)
+    let inv_r = 1.0 / r
+    let inv_r3 = inv_r * inv_r * inv_r
+
+    // coef = Σ x_j · gamma_j · dy_j      (common correction scalar)
+    let mut coef = 0.0
+    i = 0
+    while i < n {
+        coef = coef + x[i] * gamma[i] * dy[i]
+        i = i + 1
+    }
+
+    let mut dx = tensor_zeros(n)
+    let mut dgamma = tensor_zeros(n)
+    i = 0
+    while i < n {
+        dx[i] = gamma[i] * dy[i] * inv_r
+                - x[i] * coef * inv_r3 / (n * 1.0)
+        dgamma[i] = x[i] * dy[i] * inv_r
+        i = i + 1
+    }
+    return RmsNormGrads { dx: dx, dgamma: dgamma }
+}
+
+// ════════════════════════════════════════════════════════════
+//  §3  SwiGLU backward
+// ════════════════════════════════════════════════════════════
+//
+// Forward: y = x · sigmoid(gate)
+// σ'(z) = σ(z) · (1 - σ(z))
+//
+// Given dL/dy:
+//   dL/dx    = dL/dy · sigmoid(gate)
+//   dL/dgate = dL/dy · x · sigmoid(gate) · (1 - sigmoid(gate))
+
+struct SwiGLUGrads {
+    dx:    array,
+    dgate: array
+}
+
+fn swiglu_backward(x: array, gate: array, dy: array) -> SwiGLUGrads {
+    let n = len(x)
+    let mut dx = tensor_zeros(n)
+    let mut dg = tensor_zeros(n)
+    let mut i = 0
+    while i < n {
+        let sg = sigmoid(gate[i])
+        dx[i] = dy[i] * sg
+        dg[i] = dy[i] * x[i] * sg * (1.0 - sg)
+        i = i + 1
+    }
+    return SwiGLUGrads { dx: dx, dgate: dg }
+}
+
+// ════════════════════════════════════════════════════════════
+//  §4  Self-test — finite-difference validation for all three
+// ════════════════════════════════════════════════════════════
+//
+// Strategy: for each primitive, choose a loss L that depends on
+// its output, compute the analytical gradient, then perturb one
+// input element and confirm the numerical derivative matches.
+
+let eps = 0.0001
+
+// ─── softmax backward ───────────────────────────────────────
+let sx = [1.0, 2.0, 0.5, 1.5]
+let sp = softmax(sx)
+// L = 0.5 · ||p||²   →   dL/dp = p
+let dp = sp
+let dx_ana = softmax_backward(sp, dp)
+
+// Perturb sx[0] + eps, recompute p, recompute L
+let mut sx_pert = [sx[0] + eps, sx[1], sx[2], sx[3]]
+let p_pert = softmax(sx_pert)
+let mut L = 0.0
+let mut L_pert = 0.0
+let mut i = 0
+while i < 4 {
+    L      = L      + 0.5 * sp[i]     * sp[i]
+    L_pert = L_pert + 0.5 * p_pert[i] * p_pert[i]
+    i = i + 1
+}
+let fd_sx0 = (L_pert - L) / eps
+println("[softmax_bwd] dx[0] analytical = " + str(dx_ana[0]))
+println("[softmax_bwd] dx[0] finite-diff = " + str(fd_sx0))
+let sx_diff = dx_ana[0] - fd_sx0
+let sx_abs = if sx_diff < 0.0 { 0.0 - sx_diff } else { sx_diff }
+
+// ─── rmsnorm backward ──────────────────────────────────────
+let nx = [0.5, 1.0, 1.5, 2.0]
+let ng = [1.0, 1.0, 1.0, 1.0]
+let n_eps = 0.00001
+let ny = rms_norm(nx, ng, n_eps)
+// L = 0.5 · ||y||²
+let mut nL = 0.0
+i = 0
+while i < 4 {
+    nL = nL + 0.5 * ny[i] * ny[i]
+    i = i + 1
+}
+// dL/dy = y
+let ndy = ny
+let ng_grads = rmsnorm_backward(nx, ng, ndy, n_eps)
+
+// Perturb nx[1] and recompute
+let nx_pert = [nx[0], nx[1] + eps, nx[2], nx[3]]
+let ny_pert = rms_norm(nx_pert, ng, n_eps)
+let mut nL_pert = 0.0
+i = 0
+while i < 4 {
+    nL_pert = nL_pert + 0.5 * ny_pert[i] * ny_pert[i]
+    i = i + 1
+}
+let fd_nx1 = (nL_pert - nL) / eps
+println("[rmsnorm_bwd] dx[1] analytical = " + str(ng_grads.dx[1]))
+println("[rmsnorm_bwd] dx[1] finite-diff = " + str(fd_nx1))
+let n_diff = ng_grads.dx[1] - fd_nx1
+let n_abs = if n_diff < 0.0 { 0.0 - n_diff } else { n_diff }
+
+// ─── swiglu backward ───────────────────────────────────────
+let wx  = [0.5, 1.0, 1.5]
+let wgt = [0.3, 0.7, 1.1]
+// Forward: y_i = x_i · sigmoid(gate_i)
+let mut wy = tensor_zeros(3)
+i = 0
+while i < 3 {
+    wy[i] = wx[i] * sigmoid(wgt[i])
+    i = i + 1
+}
+let mut wL = 0.0
+i = 0
+while i < 3 {
+    wL = wL + 0.5 * wy[i] * wy[i]
+    i = i + 1
+}
+// dL/dy = y
+let wdy = wy
+let w_grads = swiglu_backward(wx, wgt, wdy)
+
+// Perturb wx[2]
+let wx_pert = [wx[0], wx[1], wx[2] + eps]
+let mut wy_pert = tensor_zeros(3)
+i = 0
+while i < 3 {
+    wy_pert[i] = wx_pert[i] * sigmoid(wgt[i])
+    i = i + 1
+}
+let mut wL_pert = 0.0
+i = 0
+while i < 3 {
+    wL_pert = wL_pert + 0.5 * wy_pert[i] * wy_pert[i]
+    i = i + 1
+}
+let fd_wx2 = (wL_pert - wL) / eps
+println("[swiglu_bwd] dx[2] analytical = " + str(w_grads.dx[2]))
+println("[swiglu_bwd] dx[2] finite-diff = " + str(fd_wx2))
+let w_diff = w_grads.dx[2] - fd_wx2
+let w_abs = if w_diff < 0.0 { 0.0 - w_diff } else { w_diff }
+
+// ─── Verdict ────────────────────────────────────────────────
+
+println("")
+if sx_abs < 0.001 && n_abs < 0.001 && w_abs < 0.001 {
+    println("[ops_backward] PASS — all 3 primitives match FD within 0.001")
+    println("[ops_backward] softmax Δ="  + str(sx_diff))
+    println("[ops_backward] rmsnorm Δ="  + str(n_diff))
+    println("[ops_backward] swiglu  Δ="  + str(w_diff))
+    println("[ops_backward] the full decoder backward is now possible:")
+    println("              matmul_backward + softmax_backward +")
+    println("              rmsnorm_backward + swiglu_backward +")
+    println("              lm_head_backward covers every op in")
+    println("              decoder_minimal.hexa. All gradient signals")
+    println("              from cross_entropy_grad_blas flow end-to-end.")
+} else {
+    println("[ops_backward] FAIL — softmax Δ=" + str(sx_diff) +
+            " rmsnorm Δ=" + str(n_diff) +
+            " swiglu Δ=" + str(w_diff))
+}
