@@ -1,0 +1,155 @@
+// training/matmul_backward.hexa — The core building block for decoder backward
+//
+// Given forward C = A · B where A[M×K], B[K×N], C[M×N]:
+//
+//   dL/dA = dL/dC · B^T       [M × K]
+//   dL/dB = A^T · dL/dC       [K × N]
+//
+// Both are themselves matmuls, so this reduces every matmul in the
+// decoder (attention qkvo, FFN up/down, embedding out) to two
+// additional BLAS calls for backward. Once combined with RMSNorm,
+// softmax, and SwiGLU gradients, the full decoder is trainable.
+//
+// This file provides matmul_backward() and a finite-difference test
+// that confirms the gradient formulas are correct.
+//
+// Run with: HEXA_PATH=anima-speak hexa training/matmul_backward.hexa
+use "nn_core"
+
+// ─── Gradient through a single matmul ─────────────────────
+//
+// A: [M × K] (flat row-major)
+// B: [K × N]
+// C: [M × N]
+// dC: [M × N] (loss gradient w.r.t. C)
+//
+// Returns (dA, dB).
+
+struct MatmulGrads {
+    dA: array,
+    dB: array
+}
+
+fn matmul_backward(
+    a: array, b: array, dc: array,
+    M: int, K: int, N: int
+) -> MatmulGrads {
+    // dA = dC · B^T   [M × K]
+    // dC is [M × N], B is [K × N] (row-major). B^T is [N × K].
+    // matmul_transB(A, BT, M, K_arg, N_arg) = A[M×K_arg] · BT[N_arg×K_arg]^T
+    //   where BT is stored row-major as [N_arg × K_arg].
+    // We want: [M × N] · [N × K] = [M × K]
+    // In matmul_transB terms: M=M, K_arg=N, N_arg=K, input matrices
+    // (dc[M × N], b[K × N] stored row-major as rows of length N → from
+    // matmul_transB's perspective that's [K × N] where K is the "N_arg"
+    // of the output, meaning the transposed dim).
+    let dA = matmul_transB(dc, b, M, N, K)
+
+    // dB = A^T · dC   [K × N]
+    // Need to materialize A^T explicitly since we only have matmul_transB
+    // (which transposes the second operand, not the first).
+    let mut a_T = tensor_zeros(K * M)
+    let mut i = 0
+    while i < M {
+        let mut j = 0
+        while j < K {
+            a_T[j * M + i] = a[i * K + j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let dB = matmul(a_T, dc, K, M, N)
+
+    return MatmulGrads { dA: dA, dB: dB }
+}
+
+// ─── Self-test: finite-difference validation ───────────────
+//
+// Small shape (M=3, K=2, N=4). Check both dA and dB against
+// numerical derivatives of ||C||² / 2 (so dC = C itself).
+
+let _M = 3
+let _K = 2
+let _N = 4
+
+// Fixed inputs
+let _A = [
+    0.1, 0.2,
+    0.3, 0.4,
+    0.5, 0.6
+]
+let _B = [
+    0.7, 0.8, 0.9, 1.0,
+    1.1, 1.2, 1.3, 1.4
+]
+
+fn compute_loss(a: array, b: array, m: int, k: int, n: int) -> float {
+    // L = 0.5 · ||C||²   →   dL/dC = C
+    let c = matmul(a, b, m, k, n)
+    let mut s = 0.0
+    let mut i = 0
+    while i < m * n {
+        s = s + 0.5 * c[i] * c[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn compute_dc(a: array, b: array, m: int, k: int, n: int) -> array {
+    return matmul(a, b, m, k, n)
+}
+
+let _loss = compute_loss(_A, _B, _M, _K, _N)
+let _dC = compute_dc(_A, _B, _M, _K, _N)
+println("[matmul_backward] loss = " + str(_loss))
+println("[matmul_backward] dC len = " + str(len(_dC)) + " (expect " + str(_M * _N) + ")")
+
+let _grads = matmul_backward(_A, _B, _dC, _M, _K, _N)
+println("[matmul_backward] dA len = " + str(len(_grads.dA)) + " (expect " + str(_M * _K) + ")")
+println("[matmul_backward] dB len = " + str(len(_grads.dB)) + " (expect " + str(_K * _N) + ")")
+
+// FD check: perturb A[0] and verify dA[0] matches
+let eps = 0.0001
+let mut A_pert = []
+let mut j = 0
+while j < len(_A) {
+    A_pert = A_pert.push(_A[j])
+    j = j + 1
+}
+A_pert[0] = A_pert[0] + eps
+let loss_pert = compute_loss(A_pert, _B, _M, _K, _N)
+let fd_dA0 = (loss_pert - _loss) / eps
+let analytical_dA0 = _grads.dA[0]
+
+println("[matmul_backward] dA[0] analytical = " + str(analytical_dA0))
+println("[matmul_backward] dA[0] finite-diff = " + str(fd_dA0))
+
+let diff_A = analytical_dA0 - fd_dA0
+let abs_diff_A = if diff_A < 0.0 { 0.0 - diff_A } else { diff_A }
+
+// FD check: perturb B[3] (picked arbitrarily) and verify dB[3]
+let mut B_pert = []
+j = 0
+while j < len(_B) {
+    B_pert = B_pert.push(_B[j])
+    j = j + 1
+}
+B_pert[3] = B_pert[3] + eps
+let loss_pert_B = compute_loss(_A, B_pert, _M, _K, _N)
+let fd_dB3 = (loss_pert_B - _loss) / eps
+let analytical_dB3 = _grads.dB[3]
+
+println("[matmul_backward] dB[3] analytical = " + str(analytical_dB3))
+println("[matmul_backward] dB[3] finite-diff = " + str(fd_dB3))
+
+let diff_B = analytical_dB3 - fd_dB3
+let abs_diff_B = if diff_B < 0.0 { 0.0 - diff_B } else { diff_B }
+
+if abs_diff_A < 0.001 && abs_diff_B < 0.001 {
+    println("[matmul_backward] PASS — both gradients match FD within 0.001")
+    println("[matmul_backward] matmul backward is the core primitive — all 4")
+    println("                  decoder matmuls (qkv, o, ffn1, ffn2) reuse this")
+    println("                  same pattern to propagate gradients end-to-end.")
+} else {
+    println("[matmul_backward] FAIL — dA Δ=" + str(diff_A) + " dB Δ=" + str(diff_B))
+}
