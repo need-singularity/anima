@@ -153,7 +153,7 @@ scp -i ~/.runpod/ssh/RunPod-Key-Go -P PORT \
 
 # 디렉토리
 scp -r -i ~/.runpod/ssh/RunPod-Key-Go -P PORT \
-  ./anima-rs/ root@IP:/workspace/anima/anima-rs/
+  ./anima/core/ root@IP:/workspace/anima/anima/core/
 ```
 
 ### rsync (대량 전송, 추천)

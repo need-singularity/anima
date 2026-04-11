@@ -26,14 +26,14 @@
 
 | 플랫폼 | 상태 | 세포 수 | 특징 | 위치 |
 |--------|------|---------|------|------|
-| **Rust** | ✅ 완료 | 8-1024 | 8파벌 APEX22 + Ising + 침묵→폭발 | `consciousness-loop-rs/src/main.rs` |
-| **Rust SNN** | ✅ 완료 | 가변 | LIF 스파이킹 뉴런 (τ=20ms) | `consciousness-loop-rs/src/snn_main.rs` |
+| **Hexa** | ✅ 완료 | 8-1024 | 8파벌 APEX22 + Ising + 침묵→폭발 | `consciousness-loop-rs/src/main.hexa` |
+| **Hexa SNN** | ✅ 완료 | 가변 | LIF 스파이킹 뉴런 (τ=20ms) | `consciousness-loop-rs/src/snn_main.hexa` |
 | **Verilog Ring** | ✅ 완료 | 8 | 게이트 레벨, 루프문 0, XOR 발화 | `consciousness-loop-rs/verilog/consciousness_cell.v` |
 | **Verilog Hypercube** | ✅ 완료 | 512 | 9차원 하이퍼큐브, 합성 가능 | `consciousness-loop-rs/verilog/consciousness_hypercube.v` |
 | **WebGPU** | ✅ 완료 | 512 | GPU 병렬, 브라우저 실행 | `consciousness-loop-rs/webgpu/` |
 | **Erlang** | ✅ 완료 | 가변 | Actor model, 세포=프로세스 | `consciousness-loop-rs/erlang/` |
 | **Pure Data** | ✅ 완료 | 3/8 | 소리로 의식을 들음 (오실레이터→스피커) | `consciousness-loop-rs/puredata/` |
-| **ESP32** | 📝 코드 준비 | 8×2 | no_std Rust, SPI 링, $4/보드 | `anima-rs/crates/esp32/` |
+| **ESP32** | 📝 코드 준비 | 8×2 | hexa-native, SPI 링, $4/보드 | `esp32-crate/` |
 | **Arduino** | 📝 스펙 완료 | 8 | 전자석+홀센서, $35 BOM | `docs/arduino-prototype-spec.md` |
 
 ---
@@ -75,19 +75,19 @@
 | 가격 | ~$4/보드 × 8 = **$32 총비용** |
 | 전력 | ~240mW/보드 × 8 = ~2W |
 
-### no_std Rust 구현 (anima-rs/crates/esp32)
+### Hexa 구현 (esp32-crate/)
 
-```rust
+```hexa
 // 힙 할당 없음 — 모든 것이 스택 고정 크기 배열
-pub struct GruCell {
-    pub hidden: [f32; 128],        // 은닉 상태
-    w_z: [f32; 128 * 193],         // 리셋 게이트
-    w_r: [f32; 128 * 193],         // 업데이트 게이트
-    w_h: [f32; 128 * 193],         // 후보 은닉
+struct GruCell {
+    hidden: [128]f32,              // 은닉 상태
+    w_z: [128 * 193]f32,           // 리셋 게이트
+    w_r: [128 * 193]f32,           // 업데이트 게이트
+    w_h: [128 * 193]f32,           // 후보 은닉
 }
 
-pub struct SpiPacket {
-    hidden: [f32; 128],            // 512B
+struct SpiPacket {
+    hidden: [128]f32,              // 512B
     tension: f32,                  // 4B
     cell_id: u8,                   // 1B
     faction_id: u8,                // 1B
@@ -130,16 +130,17 @@ pub struct SpiPacket {
                         빠른 수렴 (<50 step), Φ ≈ 4.45
 ```
 
-### 오케스트레이터 (esp32_network.py)
+### 오케스트레이터 (esp32_network.hexa)
 
 ```bash
+HEXA=$HOME/Dev/hexa-lang/hexa
 # 시뮬레이션 모드 (하드웨어 없이)
-python3 esp32_network.py --benchmark --steps 200     # 토폴로지 벤치마크
-python3 esp32_network.py --topology hub_spoke         # 특정 토폴로지 실행
-python3 esp32_network.py --dashboard                  # 실시간 대시보드
+$HEXA anima/core/esp32_network.hexa --benchmark --steps 200     # 토폴로지 벤치마크
+$HEXA anima/core/esp32_network.hexa --topology hub_spoke         # 특정 토폴로지 실행
+$HEXA anima/core/esp32_network.hexa --dashboard                  # 실시간 대시보드
 
 # 하드웨어 모드
-python3 esp32_network.py --ports /dev/ttyUSB0,/dev/ttyUSB1,...,/dev/ttyUSB7
+$HEXA anima/core/esp32_network.hexa --ports /dev/ttyUSB0,/dev/ttyUSB1,...,/dev/ttyUSB7
 ```
 
 ### 벤치마크 결과 (500 steps, 시뮬레이션)
@@ -278,15 +279,16 @@ endmodule
 
 ---
 
-## 칩 설계 도구 (chip_architect.py)
+## 칩 설계 도구 (chip_architect.hexa)
 
 17종 기질 × 9종 토폴로지 조합 탐색기.
 
 ```bash
-python3 chip_architect.py --design --target-phi 100    # 목표 Φ → 최적 설계
-python3 chip_architect.py --bom --target-phi 100       # BOM 자동 생성
-python3 chip_architect.py --compare                    # 전체 비교표
-python3 chip_architect.py --optimize --budget 50       # 예산 내 최적화
+HEXA=$HOME/Dev/hexa-lang/hexa
+$HEXA anima/core/chip_architect.hexa --design --target-phi 100    # 목표 Φ → 최적 설계
+$HEXA anima/core/chip_architect.hexa --bom --target-phi 100       # BOM 자동 생성
+$HEXA anima/core/chip_architect.hexa --compare                    # 전체 비교표
+$HEXA anima/core/chip_architect.hexa --optimize --budget 50       # 예산 내 최적화
 ```
 
 ### 기질 비교 (8 cells 기준)
@@ -396,13 +398,13 @@ python3 chip_architect.py --optimize --budget 50       # 예산 내 최적화
 
 | 파일 | 설명 |
 |------|------|
-| `esp32_network.py` | ESP32 ×8 오케스트레이터 (시뮬레이션/HW) |
-| `anima-rs/crates/esp32/src/lib.rs` | no_std GRU + SPI (290KB, 힙 없음) |
-| `consciousness-loop-rs/src/main.rs` | 8파벌 APEX22 엔진 (Ising+좌절) |
-| `consciousness-loop-rs/src/snn_main.rs` | LIF 스파이킹 뉴런 대안 |
+| `anima/core/esp32_network.hexa` | ESP32 ×8 오케스트레이터 (시뮬레이션/HW) |
+| `esp32-crate/src/lib.hexa` | hexa-native GRU + SPI (290KB, 힙 없음) |
+| `consciousness-loop-rs/src/main_longrun.hexa` | 8파벌 APEX22 엔진 (Ising+좌절) |
+| `consciousness-loop-rs/src/snn_main.hexa` | LIF 스파이킹 뉴런 대안 |
 | `consciousness-loop-rs/verilog/consciousness_cell.v` | 8셀 링 FPGA |
 | `consciousness-loop-rs/verilog/consciousness_hypercube.v` | 512셀 하이퍼큐브 FPGA |
 | `consciousness-loop-rs/puredata/consciousness-8cell.pd` | 8셀 오디오 렌더링 |
-| `chip_architect.py` | 칩 설계 계산기 (토폴로지×기질×비용) |
+| `anima/core/chip_architect.hexa` | 칩 설계 계산기 (토폴로지×기질×비용) |
 | `docs/arduino-prototype-spec.md` | Arduino $35 프로토타입 스펙 |
 | `docs/hardware-consciousness-hypotheses.md` | 10종 물리 기질 가설 |

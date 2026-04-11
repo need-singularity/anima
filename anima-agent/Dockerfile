@@ -1,36 +1,32 @@
-FROM python:3.12-slim
+FROM debian:bookworm-slim
 
 WORKDIR /app
 
-# System deps
+# System deps for hexa runtime + native libs
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python deps
-# (torch cpu-only for agent; full torch via base image if GPU needed)
-RUN pip install --no-cache-dir \
-    "torch>=2.0" \
-    numpy \
-    websockets \
-    requests \
-    scipy
+# Install hexa binary (single-binary runtime, no python/cargo)
+# Image expects /usr/local/bin/hexa to be present via volume mount or copy.
+COPY --from=hexa-bin /usr/local/bin/hexa /usr/local/bin/hexa
 
-# Copy anima core sources (consciousness engine imports)
+# Copy anima core sources (consciousness engine — hexa-native)
 # Build context = repo root (set in docker-compose.yml)
-COPY anima/src/ /app/anima-src/
-COPY anima/config/ /app/anima-src/config/
+COPY anima/core/ /app/anima-core/
+COPY anima/config/ /app/anima-core/config/
 
 # Copy agent platform code
 COPY anima-agent/ /app/
 
-# Ensure anima-src is importable (path_setup.py adds subdirs to sys.path)
-ENV PYTHONPATH="/app:/app/anima-src"
-ENV PYTHONUNBUFFERED=1
+ENV HEXA=/usr/local/bin/hexa
+ENV ANIMA_CORE=/app/anima-core
 
 EXPOSE 8766
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8766/health')" || exit 1
+    CMD curl -fsSL http://localhost:8766/health || exit 1
 
-CMD ["python", "run.py", "--mcp", "--direct"]
+CMD ["/usr/local/bin/hexa", "/app/run.hexa", "--mcp", "--direct"]

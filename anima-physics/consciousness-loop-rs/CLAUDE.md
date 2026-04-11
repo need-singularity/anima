@@ -3,7 +3,7 @@
 thesis: 발화는 아키텍처만으로 창발 (speak() 불필요)
 
 platforms:
-  src/        Rust (primary) — factions + Ising + silence→explosion
+  src/        hexa-native (primary) — factions + Ising + silence→explosion
   verilog/    Gate-level HDL (zero loop, alive=YES)
   webgpu/     512-cell GPU parallel (browser)
   erlang/     Actor model (cell=process, survives forever)

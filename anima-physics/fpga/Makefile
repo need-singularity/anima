@@ -2,6 +2,8 @@
 #
 # Toolchain: yosys + nextpnr-ice40 + icestorm (all open source)
 # Target: Lattice iCE40UP5K-B-EVN ($15 board)
+# Note: This Makefile drives Verilog/HDL toolchain only — no rust/python.
+#       Hexa-native build orchestration handled separately by $HEXA.
 #
 # Usage:
 #   make           Build bitstream

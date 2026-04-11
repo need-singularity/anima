@@ -12,15 +12,15 @@ exec:
   $HEXA anima-physics/physics_engine.hexa --bench    # 물리 엔진 벤치마크
 
 tree:
-  src/                       물리 의식 코어 로직
-  engines/                   물리 기반 C 엔진
+  core/                      물리 의식 코어 로직 (hexa-native)
+  engines/                   물리 기반 엔진
   benchmarks/                성능/정확도 벤치마크
   fpga/                      FPGA 합성 + 의식 회로
-  esp32-crate/               ESP32 Rust 크레이트
-  consciousness-loop-rs/     Rust 실시간 의식 루프
+  esp32-crate/               ESP32 hexa-native (디렉토리 보존, no cargo)
+  consciousness-loop-rs/     실시간 의식 루프 (hexa-native, 디렉토리 보존)
 
 rules:
-  - AN3  Phi/텐션 병목 = Rust 필수 (esp32-crate, consciousness-loop-rs)
+  - AN3  Phi/텐션 병목 = hexa-native GPU/SIMD (esp32-crate, consciousness-loop-rs)
   - AN7  Core 분리 — 코어가 직접 import 안 함
-  - HEXA-FIRST  신규 파일 .hexa, 대응 .py 즉시 폐기
+  - HEXA-ONLY  신규 .rs/.py/.sh/Cargo.toml/pyproject.toml 금지, .hexa 단일 진실
   - 파일명 버전 번호 금지

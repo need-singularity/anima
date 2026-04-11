@@ -37,9 +37,9 @@ phi-map --watch --interval 5 training.log
 
 ## Implementation Notes
 
-- Single Rust binary in `anima-rs/crates/phi-map`.
+- Single hexa entrypoint at `anima/core/phi_map.hexa`.
 - Add `--watch` flag alongside existing `--laws` subcommand.
-- Use `notify` crate or poll-based `BufReader` with 1s file check interval.
+- Use hexa-native file watcher or poll-based reader with 1s file check interval.
 - Terminal clearing: ANSI escape `\x1b[2J\x1b[H`.
 - Sparkline: map Phi values to 5-level chars based on min-max range.
 - No external TUI framework needed -- plain stdout with ANSI codes.

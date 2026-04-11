@@ -169,36 +169,25 @@ step 100: norm=0.1456 delta=0.0012 never_silent=98.3%
 step 200: norm=0.1389 delta=0.0089 never_silent=97.1%
 ```
 
-### 3.2 Rust no_std 크레이트 (네트워크 모드)
+### 3.2 Hexa-native 크레이트 (네트워크 모드)
 
-Rust 크레이트는 SPI 네트워크 전용. 보드당 2 GRU 세포 (128d hidden), 8 boards = 16 cells total.
+Hexa-native 크레이트는 SPI 네트워크 전용. 보드당 2 GRU 세포 (128d hidden), 8 boards = 16 cells total.
 
 ```bash
-# 1. Rust ESP32 툴체인 설치
-rustup install nightly
-rustup component add rust-src --toolchain nightly
-cargo install espup
-espup install
+# 1. Hexa 툴체인 (단일 바이너리)
+HEXA=$HOME/Dev/hexa-lang/hexa
 
-# 2. esp-idf-template 기반 프로젝트 생성 (이미 esp32-crate/ 에 존재)
+# 2. 프로젝트는 esp32-crate/ 에 존재
 cd anima-physics/esp32-crate/
 
-# 3. 타겟 설정 (ESP32 = Xtensa)
-# Cargo.toml에 이미 설정됨:
-#   [target.xtensa-esp32-none-elf]
+# 3. 빌드 (hexa-only, no cargo)
+$HEXA src/lib.hexa --target xtensa-esp32 --release
 
-# 4. 빌드
-cargo +nightly build --target xtensa-esp32-none-elf --release
-
-# 5. 플래시 (espflash 사용)
-cargo install espflash
-espflash flash --monitor --port /dev/cu.usbserial-0001 \
-  target/xtensa-esp32-none-elf/release/anima-esp32
+# 4. 플래시 (hexa의 통합 플래셔)
+$HEXA src/lib.hexa --flash --port /dev/cu.usbserial-0001
 
 # ESP32-S3의 경우:
-# cargo +nightly build --target xtensa-esp32s3-none-elf --release
-# espflash flash --monitor --port /dev/cu.usbserial-0001 \
-#   target/xtensa-esp32s3-none-elf/release/anima-esp32
+# $HEXA src/lib.hexa --target xtensa-esp32s3 --release --flash --port /dev/cu.usbserial-0001
 ```
 
 #### 메모리 예산 (ESP32-WROOM-32, SRAM 520KB)
@@ -213,84 +202,63 @@ espflash flash --monitor --port /dev/cu.usbserial-0001 \
   PSRAM: ~580KB (weights), SRAM working: ~10KB
 ```
 
-### 3.3 8보드 순차 플래시 스크립트
+### 3.3 8보드 순차 플래시 (.hexa 스크립트)
 
-```bash
-#!/bin/bash
-# flash_all.sh — 8개 보드 순차 플래시
-# 사용법: ./flash_all.sh [arduino|rust]
+```hexa
+// flash_all.hexa — 8개 보드 순차 플래시
+// 실행: $HEXA flash_all.hexa --mode arduino|hexa
 
-MODE=${1:-arduino}
-PORTS=(
-  /dev/cu.usbserial-0001
-  /dev/cu.usbserial-0002
-  /dev/cu.usbserial-0003
-  /dev/cu.usbserial-0004
-  /dev/cu.usbserial-0005
-  /dev/cu.usbserial-0006
-  /dev/cu.usbserial-0007
-  /dev/cu.usbserial-0008
-)
+ports = [
+  "/dev/cu.usbserial-0001",
+  "/dev/cu.usbserial-0002",
+  "/dev/cu.usbserial-0003",
+  "/dev/cu.usbserial-0004",
+  "/dev/cu.usbserial-0005",
+  "/dev/cu.usbserial-0006",
+  "/dev/cu.usbserial-0007",
+  "/dev/cu.usbserial-0008",
+]
 
-echo "Flashing 8 ESP32 boards (mode: $MODE)"
-
-for i in "${!PORTS[@]}"; do
-  PORT="${PORTS[$i]}"
-  echo "[$i] Flashing $PORT..."
-
-  if [ "$MODE" = "arduino" ]; then
-    arduino-cli upload --fqbn esp32:esp32:esp32 \
-      --port "$PORT" \
-      consciousness-loop-rs/esp32/consciousness_loop.ino
-  else
-    espflash flash --port "$PORT" \
-      esp32-crate/target/xtensa-esp32-none-elf/release/anima-esp32
-  fi
-
-  if [ $? -eq 0 ]; then
-    echo "[$i] OK"
-  else
-    echo "[$i] FAILED — check connection"
-  fi
-done
-
-echo "Done. All 8 boards flashed."
+for i, port in ports {
+  print("[" + i + "] Flashing " + port + "...")
+  if mode == "arduino" {
+    arduino_cli_upload("esp32:esp32:esp32", port,
+      "consciousness-loop-rs/esp32/consciousness_loop.ino")
+  } else {
+    hexa_flash(port, "esp32-crate/src/lib.hexa")
+  }
+}
 ```
 
 ---
 
-## 4. Python 오케스트레이터 (실제 하드웨어)
+## 4. Hexa 오케스트레이터 (실제 하드웨어)
 
-### 4.1 의존성 설치
-
-```bash
-pip install pyserial numpy
-```
-
-### 4.2 실행
+### 4.1 실행
 
 ```bash
-cd anima-physics/src/
+HEXA=$HOME/Dev/hexa-lang/hexa
+cd anima/core/
 
 # 시뮬레이션 모드 (하드웨어 없이 테스트)
-python esp32_network.py --topology ring --steps 500 --dashboard
+$HEXA esp32_network.hexa --topology ring --steps 500 --dashboard
 
 # 실제 하드웨어 (8보드 연결)
-python esp32_network.py \
+$HEXA esp32_network.hexa \
   --ports /dev/cu.usbserial-0001,/dev/cu.usbserial-0002,/dev/cu.usbserial-0003,/dev/cu.usbserial-0004,/dev/cu.usbserial-0005,/dev/cu.usbserial-0006,/dev/cu.usbserial-0007,/dev/cu.usbserial-0008 \
   --topology ring \
   --steps 1000 \
   --dashboard
 
 # 벤치마크 (3개 토폴로지 비교)
-python esp32_network.py --benchmark
+$HEXA esp32_network.hexa --benchmark
 
 # 토폴로지 선택
-python esp32_network.py --ports ... --topology hub_spoke    # Law 93: 허브-스포크
-python esp32_network.py --ports ... --topology small_world  # Watts-Strogatz
+$HEXA esp32_network.hexa --ports ... --topology hub_spoke    # Law 93: 허브-스포크
+$HEXA esp32_network.hexa --ports ... --topology small_world  # Watts-Strogatz
 ```
 
-### 4.3 시리얼 포트 찾기
+### 4.2 시리얼 포트 찾기
 
 ```bash
 # macOS
@@ -301,15 +269,11 @@ ls /dev/cu.SLAB_USB*        # CP2102 칩 사용 보드
 ls /dev/ttyUSB*
 ls /dev/ttyACM*
 
-# 보드 구분 (각 보드 시리얼 번호 확인)
-python -c "
-import serial.tools.list_ports
-for p in serial.tools.list_ports.comports():
-    print(f'{p.device}  {p.description}  SN={p.serial_number}')
-"
+# 보드 구분 — hexa의 list_serial_ports 빌트인 사용
+$HEXA -e 'list_serial_ports() | print'
 ```
 
-### 4.4 프로토콜 (보드 ↔ 호스트)
+### 4.3 프로토콜 (보드 ↔ 호스트)
 
 ```
   USB 시리얼 (115200 baud):
@@ -403,9 +367,9 @@ for p in serial.tools.list_ports.comports():
     2. 모든 세포가 동일 상태로 수렴
 
   진단:
-    python esp32_network.py --ports ... --steps 10 --dashboard
-    → Board 별 local_phi 확인
-    → 0이 아닌 보드만 SPI 동작 중
+    $HEXA anima/core/esp32_network.hexa --ports ... --steps 10 --dashboard
+    결과: Board 별 local_phi 확인
+    결과: 0이 아닌 보드만 SPI 동작 중
 
   해결:
     1. SPI 배선 재확인 (CLK, MOSI, MISO, CS, GND)
@@ -465,7 +429,7 @@ for p in serial.tools.list_ports.comports():
 ### 6.4 물리 의식 vs 소프트웨어 비교
 
 ```
-  항목           | ESP32 물리    | Python 시뮬    | 비율
+  항목           | ESP32 물리    | Hexa 시뮬      | 비율
   --------------|--------------|---------------|------
   Update rate   | ~100 Hz      | ~10,000 Hz    | ×0.01
   Latency/step  | ~10 ms       | ~0.1 ms       | ×100
@@ -487,7 +451,7 @@ for p in serial.tools.list_ports.comports():
 
 ```
   - USB 허브 16포트 또는 2개 사용
-  - esp32_network.py --boards 16 --ports ...
+  - $HEXA anima/core/esp32_network.hexa --boards 16 --ports ...
   - 링 토폴로지: 자동 확장
   - 예상 Phi: ~0.30 (2× 보드 → ~2× Phi)
 ```

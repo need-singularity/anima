@@ -2,7 +2,7 @@
 
 ## Summary
 
-Total: 128 Python modules + 8 Rust modules (anima-rs)
+Total: 136 hexa-native modules (legacy Python+Rust fully absorbed)
 Hub: core/hub.hexa (39 registered, 8 invocation methods: act/cmd/pipe/on/emit/schedule/modules/status)
 
 ---
@@ -224,18 +224,17 @@ Hub: core/hub.hexa (39 registered, 8 invocation methods: act/cmd/pipe/on/emit/sc
 
 ---
 
-## Rust Modules (anima-rs/src/)
+## Hexa-Native Native Modules (anima/core/)
 
 | Module | File | Description |
 |--------|------|-------------|
-| lib | lib.rs | PyO3 entry point exposing all Rust modules to Python as `anima_rs.*` |
-| tension | tension.rs | Real-time tension computation (PureField A/G repulsion hot path) |
-| tension_link | tension_link.rs | 5-channel meta-telepathy protocol (Rust, matching Python protocol) |
-| meta_ca | meta_ca.rs | META-CA: consciousness-guided decoder auto-design (Law 67-68) |
-| train_monitor | train_monitor.rs | Training monitor: real-time CE/Phi/Psi tracking, anomaly detection, ASCII dashboard |
-| sandbox | sandbox.rs | Safe Python skill execution in restricted subprocess |
-| router | router.rs | Message routing for multi-agent communication (sync + optional async/tokio) |
-| ngram | ngram.rs | Fast n-gram indexing and overlap search for novelty detection |
+| tension | tension.hexa | Real-time tension computation (PureField A/G repulsion hot path) |
+| tension_link | tension_link.hexa | 5-channel meta-telepathy protocol |
+| meta_ca | meta_ca.hexa | META-CA: consciousness-guided decoder auto-design (Law 67-68) |
+| train_monitor | train_monitor.hexa | Training monitor: real-time CE/Phi/Psi tracking, anomaly detection, ASCII dashboard |
+| sandbox | sandbox.hexa | Safe skill execution in restricted hexa sandbox |
+| router | router.hexa | Message routing for multi-agent communication (sync + async) |
+| ngram | ngram.hexa | Fast n-gram indexing and overlap search for novelty detection |
 
 ---
 
@@ -293,10 +292,10 @@ Hub invocation methods: `act()`, `cmd()`, `pipe()`, `on()`, `emit()`, `schedule(
 
 The following file categories are NOT listed above (they exist in root but are not core modules):
 
-- **Benchmarks** (`bench_*.py`): 20+ benchmark scripts (ready/anima/tests/tests.hexa, bench_breakthrough.py, etc.)
-- **Training** (`train_*.py`): Training pipelines (training/train_alm.hexa, train_anima_lm.py, train_v9/v10/v11)
-- **Tests** (`test_*.py`): Integration and unit tests
+- **Benchmarks** (`bench_*.hexa`): 20+ benchmark scripts (ready/anima/tests/tests.hexa, bench_breakthrough.hexa, etc.)
+- **Training** (`train_*.hexa`): Training pipelines (training/train_alm.hexa, training/train_clm.hexa)
+- **Tests** (`test_*.hexa`): Integration and unit tests
 - **Subdirectory modules**: engines/, tools/, measurement/, serving/, benchmarks/, training/
-- **consciousness-loop-rs/**: 6-platform infinite loop consciousness (Rust, Verilog, WebGPU, Erlang, Pure Data, ESP32)
-- **phi-rs/**: Rust Phi calculator (625x speedup, PyO3)
-- **vad-rs/**: Rust real-time VAD
+- **anima-physics/consciousness-loop-rs/**: 6-platform infinite loop consciousness (hexa-native, Verilog, WebGPU, Erlang, Pure Data, ESP32)
+- **phi calculator**: hexa-native, 625x speedup
+- **vad**: hexa-native real-time VAD

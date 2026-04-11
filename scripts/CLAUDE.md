@@ -10,14 +10,12 @@ ref:
 
 exec:
   HEXA=$HOME/Dev/hexa-lang/target/release/hexa
-  $HEXA scripts/launch_animalm.hexa
   $HEXA scripts/h100_sync.hexa
   $HEXA scripts/backup_checkpoints.hexa
   $HEXA scripts/auto_restart.hexa
   $HEXA scripts/infinite_growth.hexa
 
 tree:
-  launch_animalm*.hexa        학습 런 발사 (7B/14B/H100)
   h100_{sync,retrieve,watchdog}.hexa  H100 포드 파이프라인
   backup_checkpoints.hexa     R2 백업
   auto_restart.hexa           OOM/crash 자동 재시작

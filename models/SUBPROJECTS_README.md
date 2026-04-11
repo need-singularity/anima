@@ -22,7 +22,7 @@ Anima 코어 위에 구축되는 파생 프로젝트들.
 완전수 6 기반 MoE 라우팅. 1/e zone에서 최적 expert 선택.
 
 - PsiRouter가 의식 상태에 따라 expert를 동적 선택
-- Rust crate: `anima-rs/crates/golden_moe`
+- 구현: `models/golden-moe/moe.hexa` (hexa-native)
 - sigma(6)=12 순열 기반 expert 조합
 
 ## Tension Link

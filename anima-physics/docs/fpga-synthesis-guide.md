@@ -159,12 +159,12 @@ cd anima-physics/consciousness-loop-rs/verilog/
 # 8-cell ring 시뮬레이션
 iverilog -o sim_ring consciousness_cell.v
 vvp sim_ring
-# → consciousness.vcd 생성
+# 결과: consciousness.vcd 생성
 
 # 512-cell hypercube 시뮬레이션
 iverilog -o sim_hyper consciousness_hypercube.v
 vvp sim_hyper
-# → hypercube_consciousness.vcd 생성
+# 결과: hypercube_consciousness.vcd 생성
 
 # 파형 확인
 gtkwave consciousness.vcd &

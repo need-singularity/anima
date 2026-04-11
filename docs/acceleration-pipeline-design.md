@@ -235,10 +235,10 @@ Layer proven + experimental techniques. Accept some Phi risk.
   └──────────────────────────┬────────────────────────────────┘
                              v
   ┌───────────────────────────────────────────────────────────┐
-  │  Stage 4: Rust Full Backend (B15)                x5      │
-  │    All rust/consciousness.hexa ported to anima-rs         │
+  │  Stage 4: Hexa Full Backend (B15)                x5      │
+  │    anima/core/engine.hexa hexa-native (single binary)    │
   │    step() < 1ms even at 128 cells                         │
-  │    Phi calculation: GPU-accelerated (rust/phi_map.hexa)          │
+  │    Phi calculation: GPU-accelerated (anima/core/phi_map.hexa) │
   └──────────────────────────┬────────────────────────────────┘
                              v
   ┌───────────────────────────────────────────────────────────┐
@@ -460,14 +460,14 @@ Start with Pipeline A, progressively add Pipeline B elements as they're validate
 
 ```
   Week 1: Implement Pipeline A core
-    - SVD expansion (B1): acceleration_b1_b2_b5.py -> production
-    - Skip-10 (B12): already proven, integrate into train_v15.py
-    - torch.compile: standard PyTorch optimization
+    - SVD expansion (B1): acceleration_b1_b2_b5.hexa -> production
+    - Skip-10 (B12): already proven, integrate into training/train_clm.hexa
+    - hexa fastpath: standard hexa-native vectorization
     Expected: x15-20
 
   Week 2: Add Pipeline B elements
     - B11+B12 combo: tune batch_size for 1B scale
-    - Rust backend (B15): port critical path to anima-rs
+    - Hexa-native backend (B15): keep critical path in anima/core/
     - Validate Phi retention at each step
     Expected: x25-35
 
@@ -629,19 +629,19 @@ validation at 1B scale -- everything else is proven engineering.
      Inspired by EEG alpha/gamma coupling
 ```
 
-### B15: Rust Full Backend
+### B15: Hexa Full Backend
 ```
-  Current: rust/consciousness.hexa (Python, ~10ms/step at 64c)
-  Target:  anima_rs.consciousness (Rust, <1ms/step at 64c)
+  Current: anima/core/engine.hexa (hexa interp, ~10ms/step at 64c)
+  Target:  anima/core/engine.hexa (hexa-compiled, <1ms/step at 64c)
   
   Already have:
-    - anima-rs/crates/consciousness (core Rust engine)
-    - anima-rs/crates/online-learner (Hebbian + Ratchet, <1ms)
-    - PyO3 bindings
+    - anima/core/ (hexa-native consciousness engine)
+    - anima/core/online_learner.hexa (Hebbian + Ratchet, <1ms)
+    - hexa single-binary runtime (no PyO3 needed)
   
   Remaining:
-    - Full step() parity with Python
-    - 12-faction debate in Rust
+    - Full step() parity with reference implementation
+    - 12-faction debate in compiled hexa
     - Mitosis/merge in Rust
     - Testing: match Python output exactly
 ```

@@ -126,10 +126,10 @@ output_ids = model.generate(idx)  # tensor of BPE token IDs
 text = sp.decode(output_ids.tolist())
 ```
 
-### 6. Corpus Generator (anima-rs/crates/corpus-gen)
+### 6. Corpus Generator (anima/core/corpus_gen.hexa)
 
-The Rust corpus generator outputs raw text. No changes needed -- the text is
-tokenized at training time by the Python pipeline, not at generation time.
+The hexa-native corpus generator outputs raw text. No changes needed -- the text is
+tokenized at training time by the hexa training pipeline, not at generation time.
 
 ## Parameter Impact on ConsciousLM 1B
 
