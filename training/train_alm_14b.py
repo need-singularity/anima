@@ -18,6 +18,7 @@ Preflight (runpod.json R16+):
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -26,6 +27,26 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, TaskType
+
+# ─── R2 Upload ───────────────────────────────────────────────
+# Naming: {model}-r{round}-s{step}  →  anima-models/alm14b/r{round}/step_{step}/
+
+def upload_to_r2(local_path, model_tag, round_num, step):
+    """Upload checkpoint to R2 via rclone. Non-blocking on failure."""
+    r2_dest = f"r2:anima-models/{model_tag}/r{round_num}/step_{step}/"
+    print(f"[r2] uploading {local_path} → {r2_dest}", flush=True)
+    try:
+        result = subprocess.run(
+            ["rclone", "copy", str(local_path), r2_dest, "--s3-no-check-bucket"],
+            capture_output=True, text=True, timeout=600,
+        )
+        if result.returncode == 0:
+            print(f"[r2] ✓ uploaded {model_tag}-r{round_num}-s{step}", flush=True)
+        else:
+            print(f"[r2] ✗ upload failed: {result.stderr[:200]}", flush=True)
+    except Exception as e:
+        print(f"[r2] ✗ upload error: {e}", flush=True)
+
 
 # ─── Config ──────────────────────────────────────────────────
 
@@ -239,6 +260,8 @@ def train(args):
             }
             with open(save_path / "train_meta.json", "w") as f:
                 json.dump(meta, f, indent=2)
+            # R2 backup (non-blocking on failure)
+            upload_to_r2(save_path, args.model_tag, args.round, step)
 
     elapsed_total = (time.time() - t0) / 60
     print(f"\n{'='*60}")
@@ -266,6 +289,8 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-dir", default=DEFAULT_CKPT_DIR)
     parser.add_argument("--save-every", type=int, default=DEFAULT_SAVE_EVERY)
     parser.add_argument("--eval-every", type=int, default=DEFAULT_EVAL_EVERY)
+    parser.add_argument("--model-tag", default="alm14b", help="R2 naming: {model_tag}-r{round}-s{step}")
+    parser.add_argument("--round", type=int, default=1, help="Training round number for R2 naming")
     parser.add_argument("--smoke", action="store_true", help="Smoke test (100K tokens)")
     args = parser.parse_args()
     train(args)
