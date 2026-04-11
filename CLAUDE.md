@@ -8,6 +8,7 @@
 | `go` / `가자` | 모든 TODO 병렬 발사 |
 | `smash` / `부셔` | 블로업 돌파 엔진 |
 | `free` / `dfs` | 자율 조립 + DFS 탐색 |
+| `lm` / `듀얼` | CLM(CPU)+ALM(GPU) 듀얼 트랙 동시 발사 (AN8) |
 | `list` / `목록` | 이 명령어 표 다시 출력 |
 
 > shared/ JSON 단일진실 (R14). 규칙: `shared/rules/common.json` (R0~R27)

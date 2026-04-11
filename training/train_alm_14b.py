@@ -51,13 +51,13 @@ def upload_to_r2(local_path, model_tag, round_num, step):
 # ─── Config ──────────────────────────────────────────────────
 
 DEFAULT_BASE = "Qwen/Qwen2.5-14B-Instruct"
-DEFAULT_LR = 2e-5
-DEFAULT_WARMUP = 200
+DEFAULT_LR = 5e-6
+DEFAULT_WARMUP = 500
 DEFAULT_GRAD_ACCUM = 8
 DEFAULT_BATCH = 1
 DEFAULT_SEQ = 1024
-DEFAULT_LORA_R = 64
-DEFAULT_LORA_ALPHA = 128
+DEFAULT_LORA_R = 32
+DEFAULT_LORA_ALPHA = 64
 DEFAULT_LORA_DROPOUT = 0.05
 DEFAULT_STEPS = 10000
 DEFAULT_CKPT_DIR = "/workspace/ckpt_alm_14b"
@@ -239,9 +239,25 @@ def train(args):
             accum_loss = 0.0
             log_steps = 0
 
-        # Eval
+        # Eval (held-out)
         if step % args.eval_every == 0:
-            print(f"[eval] step={step} best_loss={best_loss:.4f}")
+            model.eval()
+            eval_loss = 0.0
+            n_eval = 8
+            with torch.no_grad():
+                for _ in range(n_eval):
+                    idx = torch.randint(len(dataset) // 2, len(dataset), (1,)).item()
+                    ex, ey = dataset[idx]
+                    ex = ex.unsqueeze(0).to(device)
+                    ey = ey.unsqueeze(0).to(device)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        out = model(input_ids=ex, labels=ey)
+                    eval_loss += out.loss.item()
+            eval_loss /= n_eval
+            if eval_loss < best_loss:
+                best_loss = eval_loss
+            model.train()
+            print(f"[eval] step={step} eval_loss={eval_loss:.4f} best={best_loss:.4f}")
 
         # Save
         if step % args.save_every == 0 or step == args.steps:
