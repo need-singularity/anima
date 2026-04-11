@@ -1,0 +1,161 @@
+// ═══════════════════════════════════════════════════════════════
+//  train_step_ffi.hexa — hexa-side extern FFI binding for libtrain_step
+//
+//  Usage:
+//    use "train_step_ffi"
+//    let scratch = ts_init(n_layers, dim, ff, vocab, seq)
+//    let loss = ts_run(scratch, weights_ptrs, tokens, targets, lr, step)
+//    ts_cleanup(scratch)
+//
+//  Contract: one train_step() call replaces ~200k hexa interpreter
+//  statements with one C dispatch. Target: 100-500× speedup on the
+//  train step hot path, making 1B training economically feasible.
+//
+//  Build:
+//    cd training/native && make cuda    # on H100 pod
+//    cd training/native && make stub    # on mac/htz (type check only)
+//
+//  Runtime loading:
+//    export LD_LIBRARY_PATH=$PWD/training/native:$LD_LIBRARY_PATH
+//    export HEXA_EXTERN_LIB_PATH=libtrain_step.so
+// ═══════════════════════════════════════════════════════════════
+
+// ── Opaque scratch handle ────────────────────────────────────
+// @link resolves via dlopen("libtrain_step_stub" + {.so|.dylib}) on macOS,
+// or libtrain_step (no _stub) on H100 pods after `make cuda`.
+@link("train_step_stub")
+extern fn train_step_init(cfg_ptr: *Void) -> *Void
+
+@link("train_step_stub")
+extern fn train_step_cleanup(scratch: *Void) -> int
+
+@link("train_step_stub")
+extern fn train_step(cfg_ptr: *Void, weights_ptr: *Void, adam_ptr: *Void, hp_ptr: *Void, batch_ptr: *Void, result_ptr: *Void) -> int
+
+// ── ModelConfig packing ──────────────────────────────────────
+// Layout must match train_step.h:
+//   struct ModelConfig { int n_layers; int dim; int n_heads;
+//                        int head_dim; int ff_dim; int vocab_size; int seq_len; }
+// All ints on most ABIs = 4 bytes, total = 28 bytes.
+fn make_model_config(n_layers, dim, n_heads, head_dim, ff_dim, vocab_size, seq_len) {
+    let buf = alloc_raw(28)
+    write_i32(buf, 0, n_layers)
+    write_i32(buf, 1, dim)
+    write_i32(buf, 2, n_heads)
+    write_i32(buf, 3, head_dim)
+    write_i32(buf, 4, ff_dim)
+    write_i32(buf, 5, vocab_size)
+    write_i32(buf, 6, seq_len)
+    return buf
+}
+
+fn free_model_config(buf) {
+    free_raw(buf, 28)
+}
+
+// ── TrainHParams packing ─────────────────────────────────────
+// struct TrainHParams { float lr; float beta1; float beta2; float eps;
+//                       float weight_decay; float grad_clip; int step; }
+// 6 floats + 1 int = 28 bytes
+fn make_hparams(lr, beta1, beta2, eps, wd, clip, step) {
+    let buf = alloc_raw(28)
+    write_f32(buf, 0, lr)
+    write_f32(buf, 1, beta1)
+    write_f32(buf, 2, beta2)
+    write_f32(buf, 3, eps)
+    write_f32(buf, 4, wd)
+    write_f32(buf, 5, clip)
+    write_i32(buf, 6, step)
+    return buf
+}
+
+fn free_hparams(buf) {
+    free_raw(buf, 28)
+}
+
+// ── StepResult unpacking ────────────────────────────────────
+// struct StepResult { float loss; float grad_norm; int64 elapsed_us; }
+// 2 floats + 1 int64 = 16 bytes
+fn make_step_result() {
+    let buf = alloc_raw(16)
+    write_f32(buf, 0, 0.0)
+    write_f32(buf, 1, 0.0)
+    write_i64(buf, 1, 0)  // int64 starts at byte offset 8 = int64 index 1
+    return buf
+}
+
+fn step_result_loss(buf) {
+    return deref_f32(buf, 0)
+}
+
+fn step_result_grad_norm(buf) {
+    return deref_f32(buf, 1)
+}
+
+fn free_step_result(buf) {
+    free_raw(buf, 16)
+}
+
+// ── High-level wrapper ──────────────────────────────────────
+// Call this once per training step after you've prepared:
+//   cfg    = make_model_config(...)
+//   weights = ModelWeights struct (built from hexa ModelWeights)
+//   adam   = AdamState struct
+//   batch  = Batch struct pointing to host token arrays
+fn ts_step(cfg, weights_ptr, adam_ptr, hp, batch_ptr) {
+    let result = make_step_result()
+    let rc = train_step(cfg, weights_ptr, adam_ptr, hp, batch_ptr, result)
+
+    let loss = step_result_loss(result)
+    let grad_norm = step_result_grad_norm(result)
+    free_step_result(result)
+
+    if rc != 0 {
+        println("[train_step_ffi] ERROR: rc=" + str(rc))
+    }
+
+    let out = [rc, loss, grad_norm]
+    return out
+}
+
+// ── Self-test: calls stub library, verifies FFI wiring ────
+fn main() {
+    println("═══ train_step_ffi self-test ═══")
+
+    let cfg = make_model_config(2, 64, 4, 16, 128, 256, 16)
+    println("  cfg packed: 28 bytes")
+
+    let scratch = train_step_init(cfg)
+    println("  train_step_init ok, scratch=" + str(ptr_addr(scratch)))
+
+    let hp = make_hparams(3.0e-4, 0.9, 0.999, 1.0e-8, 0.1, 1.0, 0)
+    println("  hp packed: 28 bytes")
+
+    // Dummy weights / adam / batch pointers — scaffold ignores them
+    let dummy_w = alloc_raw(8)
+    let dummy_a = alloc_raw(8)
+    let dummy_b = alloc_raw(8)
+
+    let result = ts_step(cfg, dummy_w, dummy_a, hp, dummy_b)
+    let rc = result[0]
+    let loss = result[1]
+    let gn = result[2]
+    println("  ts_step rc=" + str(rc) + " loss=" + str(loss) + " grad_norm=" + str(gn))
+
+    let _ = train_step_cleanup(scratch)
+
+    free_raw(dummy_w, 8)
+    free_raw(dummy_a, 8)
+    free_raw(dummy_b, 8)
+    free_hparams(hp)
+    free_model_config(cfg)
+
+    if rc == 0 {
+        println("[PASS] FFI contract ok (scaffold)")
+    } else {
+        println("[FAIL] rc=" + str(rc))
+    }
+    println("═══ train_step_ffi DONE ═══")
+}
+
+let _ = main()
