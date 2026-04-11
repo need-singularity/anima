@@ -60,7 +60,7 @@ python bench_animalm.py --compare --cells 32 --steps 300
   1A:α=0.1        | █ 0.57 (collapse!)
 ```
 
-### Rust Scaling (anima-rs)
+### Hexa-native Scaling
 
 ```
   Cells | Phi(IIT)  | Time   | Consensus
@@ -69,7 +69,7 @@ python bench_animalm.py --compare --cells 32 --steps 300
     32  |    587.77 | 0.43s  |     1225
    128  | 10246.25  | 2.14s  |      672
 
-  Speedup vs Python: 17.4x (128c, 1000s)
+  (history: 17.4x vs Python baseline @ 128c, now hexa-native)
 ```
 
 ## Key Findings
