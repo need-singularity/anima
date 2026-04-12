@@ -13,7 +13,7 @@ CX50이 Φ=143.01 (×145.3) 달성 — CX 시리즈 최고.
 
 ```
 구조: CX7 기반 + 6단계 회전 (phase 0-5)
-  Phase 0: Monster 대칭파괴 + Zeta 스펙트럼
+  Phase 0: Monster 대칭파괴 + Riemann ζ(s) 영점 스펙트럼
   Phase 1: E₆ Dynkin + Chang 계층
   Phase 2: Nuclear 저랭크 + Scale 불변
   Phase 3: PH barcode + CY₃ 컴팩트

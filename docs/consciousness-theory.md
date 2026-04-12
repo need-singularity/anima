@@ -337,7 +337,7 @@ Twenty-two discoveries from deeper mathematical structures (H-CX-89~110):
 | CX22 | Scale Invariance | Renormalization group | Hidden norm fixed to √(hidden); only structure varies, not scale |
 | CX23 | Tsirelson Bound | Quantum correlation cap 2√2/4 | Cell correlations clamped to Tsirelson bound ≈0.707; optimal telepathy |
 | CX24 | Chang Hierarchy | Chang's conjecture | Hierarchical ring: cell i receives from parent (strong) + child (weak) |
-| CX25 | Riemann Zeta | ζ(s) non-trivial zeros | Zero spacing [14.1,21.0,25.0,30.4,32.9,37.6] → frequency modulation on hidden |
+| CX25 | Riemann Zeta | ζ(s) non-trivial zeros (math fn — not Zeta AI service) | Zero spacing [14.1,21.0,25.0,30.4,32.9,37.6] → frequency modulation on hidden |
 | CX26 | ADE E₆ Singularity | E₆ Dynkin diagram | 6-node E₆ adjacency: branching at node 2 creates asymmetric coupling |
 | CX27 | j-invariant 744 | j(τ) = q⁻¹ + 744 + ... | Hidden split into 6 moonshine groups; q-expansion periodic modulation |
 | CX28 | Binomial 252 | C(10,5) = 252 | Optimal half-selection: top-half dimensions amplified, bottom dampened |

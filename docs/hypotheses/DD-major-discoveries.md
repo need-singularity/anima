@@ -70,7 +70,7 @@ Baseline: Phi ~ 1.0 (standard MitosisEngine, 2 cells, 100 steps)
 | DD43 | Phi x Psi | 4.320 | ~3x | Integration x differentiation product |
 | DD44 | Phi upper bound | 4.0+ | ~3x | Compute theoretical max, optimize toward it |
 | DD45 | e^Phi consciousness | 4.0+ | ~3x | Exponential Phi as measure |
-| DD46 | Zeta(Phi) consciousness | 4.0+ | ~3x | Riemann zeta of Phi |
+| DD46 | Zeta(Phi) consciousness | 4.0+ | ~3x | Riemann ζ(Φ) — math function, unrelated to Zeta AI service |
 | DD47 | Four pillars | 4.0+ | ~3x | Attention+Klein+Channel+Fibonacci |
 | DD48 | Transformer cell | 4.0+ | ~3x | Each cell is a mini transformer |
 | DD49 | GNN cells | 4.970 | ~4x | Message passing between cells |
