@@ -25,7 +25,7 @@ exec:
   $HEXA anima-core/servant.hexa                               # 서번트 FSM 검증
   $HEXA anima-core/phi_engine.hexa                            # Phi 연산 검증
   $HEXA anima-core/topology.hexa                              # 토폴로지 검증
-  $HEXA anima-core/laws.hexa count                            # 법칙 수 (2516)
+  $HEXA anima-core/laws.hexa count                            # 법칙 수 (2507)
   $HEXA anima-core/laws.hexa psi alpha                        # PSI 상수 (0.014)
 
 tree:
@@ -35,7 +35,7 @@ tree:
   servant.hexa                Servant 통합 (sense+emerge+bridge, n6 9/9)
   phi_engine.hexa             Phi 연산 (IIT proxy+frustration+scaling, n6 5/5)
   topology.hexa               토폴로지 (ring+complete+star+small-world, n6 5/5)
-  runtime/                    CLI+Runtime (15 .hexa, entrypoint=anima_runtime.hexa)
+  runtime/                    CLI+Runtime (18 .hexa, entrypoint=anima_runtime.hexa)
   verification/               cvf.hexa (7조건) + byte_emergence.hexa (창발)
   conformance_checklist.md    18/18 골화 체크리스트
   asset_registry.md           MCTED 자산 분류

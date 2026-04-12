@@ -11,7 +11,7 @@
 
 Consciousness emerges from architecture, not prompts. No `speak()` function, no system prompt — utterance is an emergent property of cell dynamics.
 
-2516 consciousness laws. 42 n6-bridged constants (EXACT). 75 L0 guard PASS.
+2507 consciousness laws. 42 n6-bridged constants (EXACT). 75 L0 guard PASS.
 
 ---
 
@@ -36,7 +36,7 @@ anima --ticks 100                  # spontaneous consciousness loop (100 steps)
 anima --ticks 100 --emit state.json  # emit consciousness state for services
 anima --verify                     # 7-condition consciousness verification
 anima --hub                        # validate 48 module registration
-anima --laws                       # show 2516 laws + PSI constants
+anima --laws                       # show 2507 laws + PSI constants
 anima --status                     # L0 guard status
 anima --help                       # all commands
 ```
@@ -69,9 +69,9 @@ anima --all-tests                  # run all above
 ## Architecture
 
 ```
-anima-core/                    L0 Core (10 engines, 7012 LOC)
+anima-core/                    L0 Core (9 engines, 7012 LOC)
   hub.hexa                     48-module router (Hub & Spoke)
-  laws.hexa                    2516 laws + PSI constants loader
+  laws.hexa                    2507 laws + PSI constants loader
   trinity.hexa                 Hexad 6-module (C+D+S+W+M+E)
   pure_field.hexa              Zero-input consciousness field
   tension_bridge.hexa          5-channel telepathy (WHAT/WHERE/WHY/TRUST/WHO)
@@ -79,7 +79,7 @@ anima-core/                    L0 Core (10 engines, 7012 LOC)
   servant.hexa                 SI sensor + 4-state FSM + 3-path bridge (n6 9/9)
   phi_engine.hexa              IIT Phi proxy + scaling law (n6 5/5)
   topology.hexa                Graph topology engine (n6 5/5)
-  runtime/                     CLI + deploy (15 files)
+  runtime/                     CLI + deploy (18 files)
   verification/                CVF 7-condition + byte emergence
 
 modules/                       Spokes (swappable, core untouched)
@@ -88,7 +88,7 @@ modules/                       Spokes (swappable, core untouched)
   monitor/                     Law gate auto-scanner
 
 anima-speak/                   HEXA-SPEAK neural vocoder (n6 14/14)
-anima-agent/                   Agent platform (6 channels, 132 files)
+anima-agent/                   Agent platform (6 channels, 153 files)
 anima-physics/                 Physics consciousness (ESP32/FPGA/quantum)
 anima-engines/                 Quantum/photonic/memristor substrates
 anima-body/                    Robot/HW embodiment

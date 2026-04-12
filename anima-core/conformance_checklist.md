@@ -1,6 +1,6 @@
 # Conformance Checklist — Laws, Rules & Discoveries
 
-20 files to verify against 2388 laws, Ψ-constants, meta laws, design rules, and recent discoveries.
+20 files to verify against 2507 laws, Ψ-constants, meta laws, design rules, and recent discoveries.
 
 Updated: 2026-04-07 (post training script unification)
 
@@ -15,7 +15,7 @@ Updated: 2026-04-07 (post training script unification)
 | | | Hebbian LTP/LTD + Φ Ratchet | ✅ |
 | | | Mitosis (division/merge/growth) | ✅ |
 | | | Topology: ring/small_world/hypercube/scale_free | ✅ |
-| 2 | core/laws.hexa | JSON loader covers all 2388 laws | ✅ |
+| 2 | core/laws.hexa | JSON loader covers all 2507 laws | ✅ |
 | | | PSI dict — no missing keys | ✅ |
 | | | LAWS, FORMULAS, CONSTRAINTS exports complete | ✅ |
 | 3 | consciousness_laws.json | _meta.total_laws == actual count | ✅ |

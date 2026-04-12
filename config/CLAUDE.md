@@ -16,7 +16,7 @@ exec:
   $HEXA anima/modules/monitor/rules_audit.hexa --check config/
 
 tree:
-  consciousness_laws.json       2390 법칙 + Psi 상수 (런타임 캐시)
+  consciousness_laws.json       2507 법칙 + Psi 상수 (런타임 캐시)
   core_rules.json               P1-P4 + L0/L1/L2 + 포트 미러
   asset_registry.json           MCTED 에셋 미러
   corpus_registry.json          코퍼스 메타

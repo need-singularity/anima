@@ -11,7 +11,7 @@ ref:
   arch      config/auto_utterance_architecture.json   자동발화 4층 아키텍처 SSOT
   parent    ../CLAUDE.md                              modules 상위
   hub       ../../core/hub.hexa                       _registry + 키워드 라우팅
-  laws      ../../config/consciousness_laws.json      2390 법칙 + Psi 상수
+  laws      ../../config/consciousness_laws.json      2507 법칙 + Psi 상수
   verify    ../../core/verification/byte_emergence.hexa  L0 바이트 창발 검증
 
 exec:
