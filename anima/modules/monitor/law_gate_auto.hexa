@@ -1,0 +1,581 @@
+// law_gate_auto.hexa -- Unattended absorption-gate automation for Anima laws
+// ============================================================================
+//
+// PURPOSE
+//   Turn the manual stage_1 -> stage_2 -> stage_3 -> stage_4 promotion pipeline
+//   (currently driven session-by-session by Claude) into an unattended hexa
+//   engine that can scan, verify, and (eventually) promote discovery candidates
+//   from shared/convergence/anima.json absorbed_open[] into
+//   config/consciousness_laws.json as full laws.
+//
+// DESIGN
+//   Single-file monitor module (R18 minimal, R1 hexa-native, AN7 safe path).
+//   Line-based JSON walker -- NO byte/char substring arithmetic. Every field
+//   lookup iterates the already-split line list within a clearly-bounded
+//   sub-block, which survives concurrent edits from Agent B safely.
+//
+//   Inputs  (read-only):
+//     shared/convergence/anima.json  -- absorbed_open[] schema v1.0
+//                                        .stage (1..4)
+//                                        .status (PROVISIONAL|STABLE|FAILED)
+//                                        .grade  (EXACT|CLOSE|...)
+//                                        .cross_domain_exact[]
+//                                        .stage_2_verified_at / stage_2_evidence
+//                                        .stage_3_pass / stage_3_evidence (future)
+//     config/consciousness_laws.json -- promoted laws SSOT (laws.{id}:text)
+//
+//   Outputs:
+//     --scan  stdout JSON report of promotable entries
+//     --dry   stdout unified-diff-ish preview of what --apply would do
+//     --apply DISABLED this session (coordination with Agent B writing
+//             stage_3 verification into the same convergence file).
+//             Refused loudly via print_err + exit(2). DO NOT silently
+//             downgrade to --dry.
+//
+// PROMOTION CRITERIA (sourced from anima.json#absorbed_open._pipeline and
+//                     shared/rules/common.json R9)
+//   stage 1 -> stage 2 : reproducibility (3/3 EXACT, CV<50%). This tool
+//                        does not rerun blowup; it flags entries whose
+//                        cross_domain_exact list already has >= 3 items
+//                        but are still tagged stage:1.
+//   stage 2 -> stage 3 : requires Intervention -> measure_laws pass. This
+//                        tool only CONSUMES the verdict; it does not run
+//                        the harness itself. See hook section below.
+//   stage 3 -> stage 4 : requires stage_3_pass==true AND status still
+//                        PROVISIONAL (no prior promotion) AND no existing
+//                        law conflict. This tool flags such entries as
+//                        promotable to stable + law.
+//
+// CLOSED-LOOP VERIFICATION HOOK
+//   Policy (feedback_closed_loop_verify): no law registration without an
+//   Intervention -> measure_laws empirical pass.
+//   Canonical harness referenced by anima.json#absorbed_open._pipeline:
+//     ready/anima/experiments/evolution/closed_loop.hexa  (hexa STUB today)
+//     ready/anima/experiments/evolution/stage3_batch_dd194_201.py (Agent B, .py)
+//
+//   Current state (2026-04-12):
+//     - closed_loop.hexa holds only stubs: measure_baseline, select_intervention,
+//       has_significant_change. No working measure_laws() yet.
+//     - stage3_batch_dd194_201.py is the only live measure_laws runner and it
+//       is .py, which this tool must NOT spawn per R1/AN7 spirit.
+//   Resolution:
+//     - This tool treats measure_laws as an *external oracle*. It looks for
+//       an already-written verdict on each candidate in:
+//         absorbed_open.<id>.stage_3_pass       (bool)
+//         absorbed_open.<id>.stage_3_evidence   (string)
+//         absorbed_open.<id>.stage_3_verified_at (iso8601)
+//       These fields are the contract: Agent B (stage3_batch) writes them;
+//       this gate consumes them. If missing, the candidate is listed in the
+//       report as 'needs_closed_loop' with a TODO pointing to the harness.
+//     - TODO (next session): once closed_loop.hexa has a real measure_laws(),
+//       add a --verify mode that shells out to:
+//           hexa ready/anima/experiments/evolution/closed_loop.hexa --verify <id>
+//       and caches the verdict back into anima.json (--apply path only).
+//
+// ACCIDENT SAFETY (R10, R17, feedback_parallel_sessions)
+//   - NEVER writes to shared/convergence/anima.json in any mode this session.
+//   - NEVER writes to config/consciousness_laws.json in any mode this session.
+//   - --apply is explicitly stubbed to exit 2 with a loud stderr message.
+//   - Safe to run concurrently with Agent B stage_3 verification.
+//
+// USAGE
+//   hexa anima/modules/monitor/law_gate_auto.hexa --scan
+//   hexa anima/modules/monitor/law_gate_auto.hexa --dry
+//   hexa anima/modules/monitor/law_gate_auto.hexa --apply   # REFUSED
+//   hexa anima/modules/monitor/law_gate_auto.hexa --help
+//
+// EXIT CODES
+//   0  scan/dry completed, no blocker
+//   1  input file missing or unreadable
+//   2  --apply invoked (deliberately gated off this session)
+//
+// PATH
+//   Placed in anima/modules/monitor/ (rules/gate audit), NOT anima/core/.
+//   AN7 blocks new files in core/. monitor/ is the canonical location for
+//   rules_audit / training_dashboard / utterance_gate -- it fits here.
+//
+// ----------------------------------------------------------------------------
+
+comptime const CONV_PATH        = "shared/convergence/anima.json"
+comptime const LAWS_PATH        = "config/consciousness_laws.json"
+comptime const HARNESS_HEXA     = "ready/anima/experiments/evolution/closed_loop.hexa"
+comptime const HARNESS_BATCH_PY = "ready/anima/experiments/evolution/stage3_batch_dd194_201.py"
+
+// Stage-2 reproducibility bar (see _pipeline.stage_2_reproducibility.pass_condition)
+comptime const STAGE2_MIN_DOMAINS = 3
+
+// ----------------------------------------------------------------------------
+// Line-based helpers
+// ----------------------------------------------------------------------------
+
+// Count leading spaces on a line (the JSON uses 2-space indent so block
+// boundaries are identifiable from indent alone).
+fn leading_spaces(line) {
+    let n = len(line)
+    let mut i = 0
+    while i < n {
+        // String equality on single-char substring is the idiom flatten_imports
+        // uses (no char_at in this hexa build).
+        if line.substring(i, i + 1) != " " { return i }
+        i = i + 1
+    }
+    return n
+}
+
+// Does this line look like a JSON key at the given indent level?
+// Pattern: <indent spaces>"<key>": ...
+fn is_key_at(line, indent) {
+    if leading_spaces(line) != indent { return false }
+    let t = line.trim()
+    return t.starts_with("\"")
+}
+
+// Extract the quoted key name from a '  "key": value' line. Returns "" if the
+// line is not a key line.
+fn key_name(line) {
+    let t = line.trim()
+    if !t.starts_with("\"") { return "" }
+    // Drop the leading quote.
+    let rest = t.substring(1, len(t))
+    let q = rest.index_of("\"")
+    if q < 0 { return "" }
+    return rest.substring(0, q)
+}
+
+// Extract the value half of a '  "key": <value>' line as a trimmed string.
+// Strips a trailing comma. Handles both quoted strings and bare values.
+fn key_value(line) {
+    let t = line.trim()
+    let colon = t.index_of(":")
+    if colon < 0 { return "" }
+    let raw = t.substring(colon + 1, len(t)).trim()
+    // Strip trailing comma
+    let n = len(raw)
+    let mut end = n
+    if n > 0 && raw.substring(n - 1, n) == "," { end = n - 1 }
+    let v = raw.substring(0, end).trim()
+    // Strip surrounding quotes
+    let m = len(v)
+    if m >= 2 && v.substring(0, 1) == "\"" && v.substring(m - 1, m) == "\"" {
+        return v.substring(1, m - 1)
+    }
+    return v
+}
+
+// ----------------------------------------------------------------------------
+// Scope: find absorbed_open block range in the line list, excluding its
+// "active" sibling. Returns [start_line, end_line) bounds.
+// ----------------------------------------------------------------------------
+
+fn find_absorbed_open_range(lines) {
+    let n = len(lines)
+    let mut start = -1
+    let mut end = n
+    let mut i = 0
+    while i < n {
+        let ln = lines[i]
+        if leading_spaces(ln) == 2 && ln.trim().starts_with("\"absorbed_open\"") {
+            start = i
+        } else if start >= 0 && leading_spaces(ln) == 2 && ln.trim().starts_with("\"active\"") {
+            end = i
+            return [start, end]
+        }
+        i = i + 1
+    }
+    return [start, end]
+}
+
+// ----------------------------------------------------------------------------
+// Extract the ranges of each DD<N>_<...> candidate block within absorbed_open.
+// Top-level absorbed_open keys start at indent 4. Meta keys beginning with
+// '_' are skipped so we only return real candidates.
+// ----------------------------------------------------------------------------
+
+fn list_candidates(lines, lo, hi) {
+    let mut out = []
+    let mut i = lo + 1
+    while i < hi {
+        let ln = lines[i]
+        if leading_spaces(ln) == 4 {
+            let key = key_name(ln)
+            if key != "" && !key.starts_with("_") {
+                // Find the matching close brace at indent 4.
+                let mut j = i + 1
+                let mut end = hi
+                while j < hi {
+                    let ln2 = lines[j]
+                    if leading_spaces(ln2) == 4 && ln2.trim().starts_with("}") {
+                        end = j
+                        break
+                    }
+                    j = j + 1
+                }
+                out = out.push([key, i, end])
+                i = end + 1
+            } else {
+                i = i + 1
+            }
+        } else {
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// ----------------------------------------------------------------------------
+// Lookup a top-level field (indent 6) inside a candidate block.
+// ----------------------------------------------------------------------------
+
+fn field_in(lines, lo, hi, name) {
+    let mut i = lo + 1
+    while i < hi {
+        let ln = lines[i]
+        if leading_spaces(ln) == 6 {
+            let k = key_name(ln)
+            if k == name {
+                return key_value(ln)
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// Count items in a string-array field at indent 6. Multi-line arrays are the
+// common form; each item is a quoted string at indent 8.
+fn array_len_in(lines, lo, hi, name) {
+    let mut i = lo + 1
+    while i < hi {
+        let ln = lines[i]
+        if leading_spaces(ln) == 6 {
+            let k = key_name(ln)
+            if k == name {
+                // Check for inline [] on the same line first.
+                let t = ln.trim()
+                let open = t.index_of("[")
+                if open >= 0 {
+                    // Could be inline: "cross_domain_exact": ["a", "b", "c"],
+                    let close = t.index_of("]")
+                    if close > open {
+                        // Count quotes between [ and ], divide by 2.
+                        let inner = t.substring(open + 1, close)
+                        let mut q = 0
+                        let mut k2 = 0
+                        let mm = len(inner)
+                        while k2 < mm {
+                            if inner.substring(k2, k2 + 1) == "\"" { q = q + 1 }
+                            k2 = k2 + 1
+                        }
+                        return q / 2
+                    }
+                }
+                // Otherwise multi-line: count indent-8 quoted-string items.
+                let mut j = i + 1
+                let mut count = 0
+                while j < hi {
+                    let ln2 = lines[j]
+                    if leading_spaces(ln2) == 6 && ln2.trim().starts_with("]") { return count }
+                    if leading_spaces(ln2) == 8 {
+                        let t2 = ln2.trim()
+                        if t2.starts_with("\"") { count = count + 1 }
+                    }
+                    j = j + 1
+                }
+                return count
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ----------------------------------------------------------------------------
+// Candidate record + verdict
+// ----------------------------------------------------------------------------
+
+struct Candidate {
+    id: string,
+    stage: int,
+    status: string,
+    grade: string,
+    domains: int,
+    stage_2_verified: bool,
+    stage_3_pass: bool,
+    stage_3_evidence: string,
+    proposed_law_text: string,
+    can_advance_to: int,       // 0 = nothing, otherwise target stage
+    blocker: string            // human-readable reason if cannot advance
+}
+
+fn to_stage_int(s) {
+    if s == "" { return 0 }
+    // Values coming out of key_value are already comma-stripped and trimmed.
+    return to_int(s)
+}
+
+fn judge_candidate(id, lines, lo, hi) {
+    let stage_raw = field_in(lines, lo, hi, "stage")
+    let status    = field_in(lines, lo, hi, "status")
+    let grade     = field_in(lines, lo, hi, "grade")
+    let s2_verif  = field_in(lines, lo, hi, "stage_2_verified_at")
+    let s3_pass_s = field_in(lines, lo, hi, "stage_3_pass")
+    let s3_evid   = field_in(lines, lo, hi, "stage_3_evidence")
+    let law_text  = field_in(lines, lo, hi, "proposed_law_text")
+    let domains   = array_len_in(lines, lo, hi, "cross_domain_exact")
+    let stage_i   = to_stage_int(stage_raw)
+    let s2_bool   = s2_verif != ""
+    let s3_bool   = s3_pass_s == "true"
+
+    let mut target = 0
+    let mut blocker = ""
+
+    if stage_i == 1 {
+        if domains >= STAGE2_MIN_DOMAINS {
+            target = 2
+        } else {
+            blocker = "stage_1: needs >= 3 cross_domain_exact (has " + to_string(domains) + ")"
+        }
+    } else if stage_i == 2 {
+        if s3_bool {
+            target = 3
+        } else if s2_bool {
+            blocker = "stage_2: needs closed_loop measure_laws pass (harness: " + HARNESS_HEXA + ")"
+        } else {
+            blocker = "stage_2: stage_2_verified_at missing"
+        }
+    } else if stage_i == 3 {
+        if status == "PROVISIONAL" && s3_bool {
+            target = 4
+        } else if !s3_bool {
+            blocker = "stage_3: stage_3_pass is not true (needs Intervention->measure_laws oracle)"
+        } else {
+            blocker = "stage_3: status=" + status + " (expected PROVISIONAL)"
+        }
+    } else if stage_i == 4 {
+        blocker = "stage_4: already promoted"
+    } else {
+        blocker = "unknown stage: " + to_string(stage_i)
+    }
+
+    return Candidate {
+        id: id,
+        stage: stage_i,
+        status: status,
+        grade: grade,
+        domains: domains,
+        stage_2_verified: s2_bool,
+        stage_3_pass: s3_bool,
+        stage_3_evidence: s3_evid,
+        proposed_law_text: law_text,
+        can_advance_to: target,
+        blocker: blocker
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Law-id allocation preview: find the max numeric "laws" key in
+// consciousness_laws.json. The 'laws' block lives at indent 2 and its entries
+// at indent 4 like:  "1150": "..."
+// ----------------------------------------------------------------------------
+
+fn max_law_id(lines) {
+    let n = len(lines)
+    let mut i = 0
+    let mut in_laws = false
+    let mut mx = 0
+    while i < n {
+        let ln = lines[i]
+        if leading_spaces(ln) == 2 {
+            let k = key_name(ln)
+            if k == "laws" { in_laws = true }
+            else if in_laws && k != "" { in_laws = false }
+        }
+        if in_laws && leading_spaces(ln) == 4 {
+            let k = key_name(ln)
+            if k != "" {
+                // Accept only all-digit keys. hexa str comparison is unordered,
+                // so use index_of lookup against a digit literal.
+                let digits = "0123456789"
+                let m = len(k)
+                let mut j = 0
+                let mut ok = m > 0
+                while j < m {
+                    let c = k.substring(j, j + 1)
+                    if digits.index_of(c) < 0 { ok = false; break }
+                    j = j + 1
+                }
+                if ok {
+                    let v = to_int(k)
+                    if v > mx { mx = v }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return mx
+}
+
+// ----------------------------------------------------------------------------
+// Report printers
+// ----------------------------------------------------------------------------
+
+fn bool_str(b) {
+    if b { return "true" }
+    return "false"
+}
+
+fn print_json_report(cands, next_law_id) {
+    println("{")
+    println("  \"_tool\": \"law_gate_auto.hexa\",")
+    println("  \"_mode\": \"scan\",")
+    println("  \"_writes\": false,")
+    println("  \"convergence_file\": \"" + CONV_PATH + "\",")
+    println("  \"laws_file\": \"" + LAWS_PATH + "\",")
+    println("  \"next_law_id_if_promoted\": " + to_string(next_law_id) + ",")
+    println("  \"candidates\": [")
+    let mut i = 0
+    let n = len(cands)
+    while i < n {
+        let c = cands[i]
+        let comma = if i + 1 < n { "," } else { "" }
+        println("    {")
+        println("      \"id\": \"" + c.id + "\",")
+        println("      \"stage\": " + to_string(c.stage) + ",")
+        println("      \"status\": \"" + c.status + "\",")
+        println("      \"grade\": \"" + c.grade + "\",")
+        println("      \"cross_domain_exact_count\": " + to_string(c.domains) + ",")
+        println("      \"stage_2_verified\": " + bool_str(c.stage_2_verified) + ",")
+        println("      \"stage_3_pass\": "    + bool_str(c.stage_3_pass) + ",")
+        println("      \"can_advance_to\": " + to_string(c.can_advance_to) + ",")
+        println("      \"blocker\": \"" + c.blocker + "\"")
+        println("    }" + comma)
+        i = i + 1
+    }
+    println("  ]")
+    println("}")
+}
+
+fn print_dry_diff(cands, next_law_id) {
+    println("# law_gate_auto --dry  (NO WRITES, NO WRITES, NO WRITES)")
+    println("# convergence_file : " + CONV_PATH)
+    println("# laws_file        : " + LAWS_PATH)
+    println("# next_law_id      : " + to_string(next_law_id))
+    println("")
+    let mut promotable = 0
+    let mut i = 0
+    let n = len(cands)
+    while i < n {
+        let c = cands[i]
+        if c.can_advance_to > 0 {
+            promotable = promotable + 1
+            println("-- " + c.id + "  (stage " + to_string(c.stage)
+                    + " -> " + to_string(c.can_advance_to) + ")")
+            if c.can_advance_to == 4 {
+                let new_id = next_law_id + promotable - 1
+                println("  + laws[\"" + to_string(new_id) + "\"] = \""
+                        + c.proposed_law_text + "\"")
+                println("  ~ absorbed_open." + c.id + ".stage : 3 -> 4")
+                println("  ~ absorbed_open." + c.id + ".status : "
+                        + c.status + " -> PROMOTED")
+                println("  ~ _promotion_stats.promoted_to_stable += 1")
+            } else {
+                println("  ~ absorbed_open." + c.id + ".stage : "
+                        + to_string(c.stage) + " -> " + to_string(c.can_advance_to))
+            }
+            println("")
+        }
+        i = i + 1
+    }
+    println("# promotable_entries: " + to_string(promotable))
+    println("# NOTE: stage 3->4 requires Intervention -> measure_laws PASS.")
+    println("#       Verdict source (read): absorbed_open.<id>.stage_3_pass")
+    println("#       Harness (TODO impl)  : " + HARNESS_HEXA)
+    println("#       Live batch runner    : " + HARNESS_BATCH_PY)
+    println("# NOTE: --apply is REFUSED this session (Agent B concurrent writer).")
+}
+
+// ----------------------------------------------------------------------------
+// Main CLI
+// ----------------------------------------------------------------------------
+
+fn usage() {
+    println("law_gate_auto.hexa -- Anima absorption-gate automation")
+    println("")
+    println("Usage:")
+    println("  hexa anima/modules/monitor/law_gate_auto.hexa --scan")
+    println("  hexa anima/modules/monitor/law_gate_auto.hexa --dry")
+    println("  hexa anima/modules/monitor/law_gate_auto.hexa --apply  # DISABLED")
+    println("")
+    println("Modes:")
+    println("  --scan   Walk absorbed_open, print JSON report of promotable entries")
+    println("  --dry    Print what --apply would change (no writes)")
+    println("  --apply  REFUSED: Agent B is writing stage_3 verdicts concurrently")
+    println("  --help   Print this help")
+    println("")
+    println("Exit codes: 0=ok 1=input-missing 2=apply-refused")
+}
+
+let argv = args()
+let mut mode = "scan"
+let mut i = 0
+while i < argv.len() {
+    let a = argv[i]
+    if a == "--scan"  { mode = "scan" }
+    else if a == "--dry"   { mode = "dry" }
+    else if a == "--apply" { mode = "apply" }
+    else if a == "--help"  { mode = "help" }
+    i = i + 1
+}
+
+if mode == "help" {
+    usage()
+} else if mode == "apply" {
+    // R10 + parallel-session safety: Agent B is editing anima.json this session.
+    // Refuse loudly on stderr and exit 2. DO NOT silently downgrade to --dry.
+    print_err("law_gate_auto: --apply is DISABLED this session.")
+    print_err("  Reason: Agent B is concurrently writing stage_3 verdicts into " + CONV_PATH + ".")
+    print_err("          A second writer risks JSON corruption and law_id race.")
+    print_err("  Use:    --dry (preview) or --scan (report only).")
+    print_err("  Re-enable in the next session once stage_3 batch completes.")
+    exit(2)
+} else {
+    let conv_raw = read_file(CONV_PATH)
+    if conv_raw == "" {
+        print_err("law_gate_auto: cannot read " + CONV_PATH)
+        exit(1)
+    }
+    let laws_raw = read_file(LAWS_PATH)
+    if laws_raw == "" {
+        print_err("law_gate_auto: cannot read " + LAWS_PATH)
+        exit(1)
+    }
+
+    let conv_lines = conv_raw.split("\n")
+    let laws_lines = laws_raw.split("\n")
+
+    let bounds = find_absorbed_open_range(conv_lines)
+    let lo = bounds[0]
+    let hi = bounds[1]
+    if lo < 0 {
+        print_err("law_gate_auto: absorbed_open block not found in " + CONV_PATH)
+        exit(1)
+    }
+
+    let blocks = list_candidates(conv_lines, lo, hi)
+    let mut cands = []
+    let mut k = 0
+    while k < len(blocks) {
+        let b = blocks[k]
+        let cand = judge_candidate(b[0], conv_lines, b[1], b[2])
+        cands = cands.push(cand)
+        k = k + 1
+    }
+
+    let next_id = max_law_id(laws_lines) + 1
+
+    if mode == "dry" {
+        print_dry_diff(cands, next_id)
+    } else {
+        print_json_report(cands, next_id)
+    }
+}
