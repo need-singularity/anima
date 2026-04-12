@@ -161,12 +161,18 @@ anima status                 # decoder: pure/clm/alm
 ## 모듈 관리
 
 ```bash
-anima module               # 모듈 상태 표시
-anima module enable daemon  # 자동발화 데몬 활성화
-anima module disable speak  # 음성 출력 비활성화
+anima module                   # 전체 모듈 목록 + 상태 (12개)
+anima module get agent         # GitHub에서 모듈 다운로드
+anima module enable daemon     # 모듈 활성화
+anima module disable speak     # 모듈 비활성화
+anima module remove tools      # 모듈 삭제
 
-# 모듈: decoder(디코더) · daemon(자동발화) · monitor(법칙감시)
-# enable/disable = 모듈 디렉토리 활성/비활성 토글
+# local 모듈 (modules/)
+#   decoder · daemon · monitor
+
+# external 모듈 (anima-*/  — anima module get 으로 설치)
+#   agent · body · eeg · engines · hexad
+#   measurement · physics · speak · tools
 ```
 
 ## 자연발화 → 서비스 연결
