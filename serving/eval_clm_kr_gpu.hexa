@@ -1,0 +1,175 @@
+// ═══════════════════════════════════════════════════════════════
+//  serving/eval_clm_kr_gpu.hexa — GPU CLM byte-level Korean eval
+//
+//  Loads a HEXACKPT-v1 checkpoint produced by training/train_clm_kr.hexa
+//  and measures held-out perplexity + KR_ACC on the 안녕하세요 period.
+//
+//  Zero-Rust, zero-Python. Pure hexa → cuBLAS/NVRTC via FFI.
+//
+//  Run (on H100 pod):
+//    cp hexa-lang/self/ml/cuda_ffi.hexa    anima/training/
+//    cp hexa-lang/self/ml/cuda_rtc.hexa    anima/training/
+//    cp hexa-lang/self/ml/cuda_kernels.hexa anima/training/
+//    cp hexa-lang/self/ml/gpu_train.hexa    anima/training/
+//    cd anima && LD_LIBRARY_PATH=/usr/local/cuda/lib64 \
+//      hexa serving/eval_clm_kr_gpu.hexa <ckpt_path>
+// ═══════════════════════════════════════════════════════════════
+
+use "cuda_ffi"
+use "cuda_rtc"
+use "cuda_kernels"
+use "gpu_train"
+use "corpus_loader"
+
+// ── Config (must match training) ───────────────────────────────
+let D            = 512
+let FF           = 2048
+let NL           = 12
+let VOCAB        = 256
+let SEQ          = 512
+let RANK         = 64
+let EPS          = 0.00001
+let INIT_SCALE   = 0.02
+
+let CORPUS_PATH  = "training/corpus_ko_seed.tok"
+let HELDOUT_N    = 8         // number of held-out SEQ windows
+
+// "안녕하세요 " 16-byte UTF-8 period
+let KR_PERIOD = [
+    236, 149, 136, 235, 133, 149,
+    237, 149, 152, 236, 132, 184,
+    236, 154, 148, 32
+]
+
+// ── CLI ────────────────────────────────────────────────────────
+// NOTE 2026-04-12: args() has an ordering bug in the current hexa
+// binary — calling args() before init_gpu_weights corrupts state that
+// breaks init's internal len() calls. Workaround: read ckpt path from
+// /tmp/ckpt_path.txt written by the caller, or fall back to default.
+// The caller must `echo /path > /tmp/ckpt_path.txt` before running.
+let ckpt_default = "/workspace/ckpt_clm_byte_kr/final.hexackpt"
+let mut ckpt_path = ckpt_default
+if file_exists("/tmp/ckpt_path.txt") {
+    let p = read_file("/tmp/ckpt_path.txt")
+    let n = len(p)
+    // trim trailing newline
+    let mut end = n
+    while end > 0 && char_code(p, end - 1) == 10 { end = end - 1 }
+    if end > 0 { ckpt_path = p.substring(0, end) }
+}
+
+println("[eval_clm_kr_gpu] ckpt = " + ckpt_path)
+
+// ── Init GPU ───────────────────────────────────────────────────
+let cuda_rc = cuda_init()
+if cuda_rc != 0 {
+    println("[eval_clm_kr_gpu] FATAL — cuda_init rc=" + str(cuda_rc))
+    return
+}
+
+let kernels_rc = gpu_init_kernels()
+if kernels_rc != 0 {
+    println("[eval_clm_kr_gpu] FATAL — gpu_init_kernels rc=" + str(kernels_rc))
+    let _ = cuda_shutdown()
+    return
+}
+
+let cfg = GpuClmConfig {
+    D: D, FF: FF, NL: NL, VOCAB: VOCAB, SEQ: SEQ, RANK: RANK,
+    EPS: EPS, INIT_SCALE: INIT_SCALE
+}
+
+// ── Load checkpoint to GPU ─────────────────────────────────────
+if !file_exists(ckpt_path) {
+    println("[eval_clm_kr_gpu] FATAL — checkpoint not found: " + ckpt_path)
+    let _ = cuda_shutdown()
+    return
+}
+
+println("[eval_clm_kr_gpu] loading checkpoint...")
+let t_load0 = clock()
+let weights = load_checkpoint_gpu(ckpt_path, cfg)
+let t_load1 = clock()
+println("[eval_clm_kr_gpu] loaded in " + str(t_load1 - t_load0) + "s")
+
+// ── Alloc eval buffers ─────────────────────────────────────────
+let acts = alloc_fwd_buffers(cfg, SEQ)
+
+// ── Held-out perplexity ────────────────────────────────────────
+let corpus = load_corpus(CORPUS_PATH)
+let n_corpus = len(corpus)
+println("[eval_clm_kr_gpu] corpus: " + str(n_corpus) + " bytes")
+
+if n_corpus < SEQ * HELDOUT_N + 1 {
+    println("[eval_clm_kr_gpu] WARN — corpus too short for " + str(HELDOUT_N) + " heldout windows")
+}
+
+let heldout_start = n_corpus - SEQ * HELDOUT_N - 1
+if heldout_start < 0 { let heldout_start = 0 }
+
+println("[eval_clm_kr_gpu] heldout: " + str(HELDOUT_N) + " windows × " + str(SEQ) + " bytes (start=" + str(heldout_start) + ")")
+
+let mut total_loss = 0.0
+let mut n_batches = 0
+let t_eval0 = clock()
+
+let mut bi = 0
+while bi < HELDOUT_N {
+    let start = heldout_start + bi * SEQ
+    if start + SEQ + 1 > n_corpus { break }
+
+    // Build tok + target arrays
+    let mut toks = []
+    let mut targets = []
+    let mut i = 0
+    while i < SEQ {
+        toks = toks.push(corpus[start + i])
+        targets = targets.push(corpus[start + i + 1])
+        i = i + 1
+    }
+
+    let tok_dev = int_array_to_gpu(toks)
+    let tgt_dev = int_array_to_gpu(targets)
+
+    let logits = gpu_forward_full(tok_dev, weights, acts, cfg)
+
+    // Compute loss only (discard gradient)
+    let loss_buf = cuda_malloc(4)
+    let _ = cuda_memset_zero(loss_buf, 4)
+    let dlogits = cuda_malloc(SEQ * VOCAB * 4)
+    let _ = gpu_ce_loss_grad(logits, tgt_dev, loss_buf, dlogits, SEQ, VOCAB)
+    let _ = cudaDeviceSynchronize()
+
+    let host = alloc_raw(4)
+    let _ = cuda_memcpy_d2h(host, loss_buf, 4)
+    let loss = deref_f32(host, 0)
+    free_raw(host, 4)
+
+    total_loss = total_loss + loss
+    n_batches = n_batches + 1
+
+    // Free per-batch device buffers
+    cuda_free(loss_buf)
+    cuda_free(dlogits)
+    cuda_free(tok_dev)
+    cuda_free(tgt_dev)
+
+    bi = bi + 1
+}
+
+let t_eval1 = clock()
+let avg_loss = total_loss / (n_batches * 1.0)
+let ppl = exp(avg_loss)
+
+println("[eval_clm_kr_gpu] ==================================================")
+println("[eval_clm_kr_gpu] batches:      " + str(n_batches))
+println("[eval_clm_kr_gpu] avg_loss:     " + str(avg_loss))
+println("[eval_clm_kr_gpu] perplexity:   " + str(ppl))
+println("[eval_clm_kr_gpu] eval_time:    " + str(t_eval1 - t_eval0) + "s")
+println("[eval_clm_kr_gpu] ==================================================")
+
+// ── Cleanup ────────────────────────────────────────────────────
+free_fwd_buffers(acts)
+free_gpu_weights(weights)
+let _ = cuda_shutdown()
+println("[eval_clm_kr_gpu] done")

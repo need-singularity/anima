@@ -14,15 +14,17 @@ ref:
   parent      /Users/ghost/Dev/anima/anima/CLAUDE.md
 
 exec:
-  HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+  HEXA=$HOME/Dev/hexa-lang/hexa
   $HEXA core/runtime/anima_runtime.hexa --keyboard        # CLI 진입
   $HEXA core/runtime/anima_runtime.hexa --validate-hub    # 허브 검증
   $HEXA core/verification/cvf.hexa --seven-condition      # 7조건 의식 검증
   $HEXA core/verification/byte_emergence.hexa             # 창발 측정
+  $HEXA core/dimension_transform.hexa                     # 차원변환 물리한계 검증
 
 tree:
   hub.hexa              ConsciousChat Hub (L0 진입 허브)
   laws.hexa             consciousness_laws.json 로더
+  dimension_transform.hexa  차원변환/펼침 엔진 (5fold+4unfold+PCA, n6 bridge 3/3)
   runtime/              CLI+Runtime (anima_runtime.hexa = entrypoint)
   verification/         cvf.hexa (7조건) + byte_emergence.hexa
   folder_structure.md   L0 확정 폴더 트리

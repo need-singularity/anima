@@ -1,0 +1,231 @@
+// ═══════════════════════════════════════════════════════════════
+//  training/verify_scaling_law.hexa
+//
+//  Closed-loop verify for the CLM Byte-Level Korean scaling law:
+//
+//    CE(S)       = K_CE × S^(-1/3)      (fit on D=16 family)
+//    ms/step(D)  = K_T  × D^P_T         (fit on all D)
+//    argmin_D time-to-L=1.5 == 16       (cost-optimality test)
+//
+//  Intervention (closed-loop semantics):
+//    "fix D=16 in byte-level Korean CLM trainer"
+//    — we measure whether this intervention is consistent with
+//      (a) the CE-vs-steps power law on the D=16 track and
+//      (b) cost-optimality vs larger D.
+//
+//  Pass gate (significant-change analogue):
+//    R²_ce_d16 >= 0.80 AND
+//    R²_cost    >= 0.80 AND
+//    argmin_D(time-to-L=1.5) == 16
+//
+//  Output: shared/verify/scaling_law_verify_20260412.json
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Observed runs (tag, D, steps, best_loss, ms/step) ─────
+// Source: shared/convergence/anima.json active.clm_byte_kr_experiment.queue
+//         + ongoing d16_s5000 round (R2 r2:anima-models/clm_byte_kr/d16_s5000)
+
+let dims  = [16,    16,    16,    16,    32,     48,     64]
+let steps = [500,   1000,  2000,  5000,  500,    600,    400]
+let best  = [3.83,  3.20,  2.51,  1.77,  3.14,   3.00,   2.80]
+let ms    = [920.0, 920.0, 921.7, 951.2, 2773.3, 5033.0, 10890.0]
+
+let n_runs = 7
+
+// ─── Scaling law parameters (hypothesis under test) ─────────
+
+let K_CE  = 30.63
+let P_CE  = -0.3333333333333333  // -1/3
+let K_T   = 3.40
+let P_T   = 1.98
+
+// ─── helpers ───────────────────────────────────────────────
+
+fn mean_arr(xs: [float]) -> float {
+    let mut s = 0.0
+    let n = len(xs)
+    let mut i = 0
+    while i < n { s = s + xs[i]; i = i + 1 }
+    return s / (n * 1.0)
+}
+
+fn r_squared(obs: [float], pred: [float]) -> float {
+    let n = len(obs)
+    let mean_obs = mean_arr(obs)
+    let mut ss_res = 0.0
+    let mut ss_tot = 0.0
+    let mut i = 0
+    while i < n {
+        let r = obs[i] - pred[i]
+        ss_res = ss_res + r * r
+        let d = obs[i] - mean_obs
+        ss_tot = ss_tot + d * d
+        i = i + 1
+    }
+    if ss_tot < 0.0000001 { return 0.0 }
+    return 1.0 - (ss_res / ss_tot)
+}
+
+fn mape(obs: [float], pred: [float]) -> float {
+    let n = len(obs)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let o = obs[i]
+        let p = pred[i]
+        let diff = o - p
+        let a = if diff < 0.0 { 0.0 - diff } else { diff }
+        s = s + a / o
+        i = i + 1
+    }
+    return 100.0 * s / (n * 1.0)
+}
+
+// ─── Build predictions ──────────────────────────────────────
+
+let mut ce_pred = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+let mut ms_pred = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+let mut i = 0
+while i < n_runs {
+    let s_f = steps[i] * 1.0
+    let d_f = dims[i] * 1.0
+    ce_pred[i] = K_CE * pow(s_f, P_CE)
+    ms_pred[i] = K_T  * pow(d_f, P_T)
+    i = i + 1
+}
+
+// ─── Split D=16 subset for CE-fit ──────────────────────────
+
+let d16_obs  = [best[0],    best[1],    best[2],    best[3]]
+let d16_pred = [ce_pred[0], ce_pred[1], ce_pred[2], ce_pred[3]]
+
+let r2_ce_d16    = r_squared(d16_obs, d16_pred)
+let mape_ce_d16  = mape(d16_obs, d16_pred)
+
+let r2_ms   = r_squared(ms, ms_pred)
+let mape_ms = mape(ms, ms_pred)
+
+// ─── Cost-optimal D sweep ──────────────────────────────────
+// For each D ∈ {16, 32, 48, 64} compute required steps to L=1.5
+//   S* = (K_CE / 1.5)^3   (invert CE power law)
+//   time_h = S* × ms/step(D) / 3,600,000
+
+let L_target   = 1.5
+let s_required = pow(K_CE / L_target, 3.0)
+
+let ds = [16, 32, 48, 64]
+let mut times = [0.0, 0.0, 0.0, 0.0]
+let mut argmin_d = 16
+let mut min_time = 99999999.0
+
+let mut j = 0
+while j < 4 {
+    let d_f2 = ds[j] * 1.0
+    let ms_per = K_T * pow(d_f2, P_T)
+    let t_h = s_required * ms_per / 3600000.0
+    times[j] = t_h
+    if t_h < min_time {
+        min_time = t_h
+        argmin_d = ds[j]
+    }
+    j = j + 1
+}
+
+// ─── Pass gate ───────────────────────────────────────────────
+
+let pass_r2_ce   = r2_ce_d16 >= 0.80
+let pass_r2_ms   = r2_ms >= 0.80
+let pass_argmin  = argmin_d == 16
+
+let mut overall_pass = false
+if pass_r2_ce {
+    if pass_r2_ms {
+        if pass_argmin { overall_pass = true }
+    }
+}
+
+// ─── Console report ──────────────────────────────────────────
+
+println("═══ verify_scaling_law ═══")
+println("runs=", n_runs)
+println("K_CE=", K_CE, " P_CE=", P_CE)
+println("K_T= ", K_T,  " P_T= ", P_T)
+println("")
+println("per-run (obs vs pred):")
+let mut k = 0
+while k < n_runs {
+    println("  D=", dims[k], " S=", steps[k],
+            " best=", best[k], " ce_pred=", ce_pred[k],
+            " ms=", ms[k], " ms_pred=", ms_pred[k])
+    k = k + 1
+}
+println("")
+println("R²(CE,  D=16 subset, S^-1/3) = ", r2_ce_d16, " MAPE=", mape_ce_d16, "%")
+println("R²(ms, all D,       D^1.98)  = ", r2_ms,      " MAPE=", mape_ms,    "%")
+println("")
+println("cost-optimal D sweep (time-to-L=1.5):")
+println("  s_required = ", s_required)
+let mut m = 0
+while m < 4 {
+    println("  D=", ds[m], " → ", times[m], " h")
+    m = m + 1
+}
+println("  argmin D = ", argmin_d)
+println("")
+println("pass_r2_ce  = ", pass_r2_ce,  " (>=0.80 on D=16 subset)")
+println("pass_r2_ms  = ", pass_r2_ms,  " (>=0.80 on all D)")
+println("pass_argmin = ", pass_argmin, " (argmin D == 16)")
+println("OVERALL PASS = ", overall_pass)
+
+// ─── Evidence JSON ───────────────────────────────────────────
+
+let out_path = "shared/verify/scaling_law_verify_20260412.json"
+let pass_str = if overall_pass { "PASS" } else { "FAIL" }
+
+let mut buf = ""
+buf = buf + "{\n"
+buf = buf + "  \"script\": \"training/verify_scaling_law.hexa\",\n"
+buf = buf + "  \"intervention\": \"fix D=16 in byte-level Korean CLM trainer\",\n"
+buf = buf + "  \"date\": \"2026-04-12\",\n"
+buf = buf + "  \"n_runs\": 7,\n"
+buf = buf + "  \"runs\": [\n"
+buf = buf + "    {\"tag\":\"d16_s500\",  \"D\":16,\"S\":500, \"best\":3.83,\"ms\":920.0},\n"
+buf = buf + "    {\"tag\":\"d16_s1000\", \"D\":16,\"S\":1000,\"best\":3.20,\"ms\":920.0},\n"
+buf = buf + "    {\"tag\":\"d16_s2000\", \"D\":16,\"S\":2000,\"best\":2.51,\"ms\":921.7},\n"
+buf = buf + "    {\"tag\":\"d16_s5000\", \"D\":16,\"S\":5000,\"best\":1.77,\"ms\":951.2},\n"
+buf = buf + "    {\"tag\":\"d32_s500\",  \"D\":32,\"S\":500, \"best\":3.14,\"ms\":2773.3},\n"
+buf = buf + "    {\"tag\":\"d48_s600\",  \"D\":48,\"S\":600, \"best\":3.00,\"ms\":5033.0},\n"
+buf = buf + "    {\"tag\":\"d64_s400\",  \"D\":64,\"S\":400, \"best\":2.80,\"ms\":10890.0}\n"
+buf = buf + "  ],\n"
+buf = buf + "  \"fit\": {\n"
+buf = buf + "    \"K_CE\": 30.63,\n"
+buf = buf + "    \"P_CE\": -0.3333,\n"
+buf = buf + "    \"K_T\":  3.40,\n"
+buf = buf + "    \"P_T\":  1.98,\n"
+buf = buf + "    \"r2_ce_d16\": "  + str(r2_ce_d16)   + ",\n"
+buf = buf + "    \"r2_ms_all\": "  + str(r2_ms)       + ",\n"
+buf = buf + "    \"mape_ce_d16\": " + str(mape_ce_d16) + ",\n"
+buf = buf + "    \"mape_ms_all\": " + str(mape_ms)     + "\n"
+buf = buf + "  },\n"
+buf = buf + "  \"cost_sweep\": {\n"
+buf = buf + "    \"L_target\":  " + str(L_target)    + ",\n"
+buf = buf + "    \"s_required\":" + str(s_required)  + ",\n"
+buf = buf + "    \"d16_hours\": " + str(times[0])    + ",\n"
+buf = buf + "    \"d32_hours\": " + str(times[1])    + ",\n"
+buf = buf + "    \"d48_hours\": " + str(times[2])    + ",\n"
+buf = buf + "    \"d64_hours\": " + str(times[3])    + ",\n"
+buf = buf + "    \"argmin_D\":  " + str(argmin_d)    + "\n"
+buf = buf + "  },\n"
+buf = buf + "  \"gate\": {\n"
+buf = buf + "    \"pass_r2_ce\":  " + str(pass_r2_ce)  + ",\n"
+buf = buf + "    \"pass_r2_ms\":  " + str(pass_r2_ms)  + ",\n"
+buf = buf + "    \"pass_argmin\": " + str(pass_argmin) + ",\n"
+buf = buf + "    \"thresholds\": {\"r2_ce\":0.80,\"r2_ms\":0.80,\"argmin_D\":16}\n"
+buf = buf + "  },\n"
+buf = buf + "  \"result\": \"" + pass_str + "\"\n"
+buf = buf + "}\n"
+
+write_file(out_path, buf)
+println("")
+println("evidence written: ", out_path)

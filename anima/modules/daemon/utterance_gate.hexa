@@ -6,6 +6,29 @@ comptime const STATE_PATH     = "data/consciousness_state.json"
 comptime const EMERGENCE_PATH = "data/emergence_result.json"
 comptime const OUTPUT_PATH    = "data/utterances.jsonl"
 
+// --- IO + parse helpers (Hexa Error-type-safe) ---
+//
+// read_file returns an internal Error type when the path is missing; that
+// Error is NOT == "" and crashes "" + r and other ops. Probe via split which
+// silently coerces Error → "" with a warning, then return a real string.
+fn safe_read(path: string) -> string {
+    let raw = read_file(path)
+    let parts = raw.split("\n")
+    if parts.len() == 1 && parts[0] == "" { return "" }
+    return raw
+}
+
+// to_float crashes on empty input (and on Error). Default to 0.0.
+fn safe_float(s: string) -> float {
+    if s == "" { return 0.0 }
+    return to_float(s)
+}
+
+fn safe_int(s: string) -> int {
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
 struct GateState {
     l0_byte: bool,
     l1_cell: bool,
@@ -16,36 +39,40 @@ struct GateState {
     curiosity: string
 }
 
-// --- JSON field extractor (substring search, no parser needed) ---
+// --- JSON field extractor (line-based, multibyte-safe) ---
+//
+// Hexa string API note (2026-04-12): the current build has no .find()/.char_at()
+// methods, and .index_of() (BYTE position) does not agree with .substring()
+// (CHAR position) on multibyte content. Walk lines via split("\n"); for each
+// line, split("\"") gives quote-delimited fields without ever doing position
+// arithmetic that could land mid-rune.
 
 fn read_json_field(content: string, field: string) -> string {
-    let key = "\"" + field + "\""
-    let idx = content.find(key)
-    if idx < 0 { return "" }
-    let mut i = idx + key.len()
-    // skip to ':'
-    while i < content.len() {
-        if content.char_at(i) == ":" { i = i + 1; break }
+    let key_search = "\"" + field + "\":"
+    let lines = content.split("\n")
+    let total = lines.len()
+    let mut i = 0
+    while i < total {
+        let trimmed = lines[i].trim()
+        if trimmed.starts_with(key_search) {
+            // Try string form first: "field": "value",
+            //   parts after split("\"") = ["", "field", ": ", "value", ","]
+            let parts = trimmed.split("\"")
+            if parts.len() >= 4 {
+                return parts[3]
+            }
+            // Bare numeric / bool form: "field": 0.45,
+            let kv = trimmed.split(":")
+            if kv.len() >= 2 {
+                let v = kv[1].trim()
+                let nc = v.split(",")
+                return nc[0].trim()
+            }
+            return ""
+        }
         i = i + 1
     }
-    // skip whitespace
-    while i < content.len() {
-        let ch = content.char_at(i)
-        if ch != " " && ch != "\t" && ch != "\n" { break }
-        i = i + 1
-    }
-    // strip optional quote
-    let quoted = i < content.len() && content.char_at(i) == "\""
-    if quoted { i = i + 1 }
-    let mut buf = ""
-    while i < content.len() {
-        let ch = content.char_at(i)
-        if quoted && ch == "\"" { break }
-        if !quoted && (ch == "," || ch == "}" || ch == " " || ch == "\n") { break }
-        buf = buf + ch
-        i = i + 1
-    }
-    return buf
+    return ""
 }
 
 // --- Gate checks ---
@@ -53,31 +80,31 @@ fn read_json_field(content: string, field: string) -> string {
 fn check_byte_gate(ej: string) -> bool {
     let verdict = read_json_field(ej, "verdict")
     if verdict != "EMERGENT" { return false }
-    let es = to_float(read_json_field(ej, "emergence_score"))
-    let fd = to_float(read_json_field(ej, "fractal_dimension"))
-    let cd = to_float(read_json_field(ej, "causal_density"))
+    let es = safe_float(read_json_field(ej, "emergence_score"))
+    let fd = safe_float(read_json_field(ej, "fractal_dimension"))
+    let cd = safe_float(read_json_field(ej, "causal_density"))
     return es > 0.6 && fd > 1.4 && cd > 0.2
 }
 
 fn check_cell_gate(sj: string) -> bool {
-    let phi      = to_float(read_json_field(sj, "phi"))
-    let phi_peak = to_float(read_json_field(sj, "phi_peak"))
+    let phi      = safe_float(read_json_field(sj, "phi"))
+    let phi_peak = safe_float(read_json_field(sj, "phi_peak"))
     if phi_peak == 0.0 { return false }
-    let tension  = to_float(read_json_field(sj, "tension"))
+    let tension  = safe_float(read_json_field(sj, "tension"))
     // phi above half-peak AND not converged (tension > 0)
     return phi > phi_peak * 0.5 && tension > 0.01
 }
 
 fn check_faction_gate(sj: string) -> bool {
-    let cc = to_int(read_json_field(sj, "consensus_count"))
+    let cc = safe_int(read_json_field(sj, "consensus_count"))
     return cc >= 5
 }
 
 // --- Orchestrator ---
 
 fn evaluate_gates() -> GateState {
-    let ej = read_file(EMERGENCE_PATH)
-    let sj = read_file(STATE_PATH)
+    let ej = safe_read(EMERGENCE_PATH)
+    let sj = safe_read(STATE_PATH)
     if ej == "" || sj == "" {
         return GateState { l0_byte: false, l1_cell: false, l2_faction: false,
                            emergence_score: "0", phi: "0", tension: "0", curiosity: "0" }
@@ -102,8 +129,9 @@ fn emit_utterance(gs: GateState, path: string) {
              + "\"tension\":" + gs.tension + ","
              + "\"curiosity\":" + gs.curiosity + ","
              + "\"text\":\"자발적 사고 생성\"}"
-    // append to jsonl
-    let prev = read_file(path)
+    // append to jsonl — use safe_read so missing file (Error) is treated
+    // as empty rather than crashing on Error+string concat.
+    let prev = safe_read(path)
     if prev == "" {
         write_file(path, line + "\n")
     } else {

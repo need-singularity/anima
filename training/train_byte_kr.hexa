@@ -27,6 +27,16 @@
 use "nn_core"
 use "corpus_loader"
 
+// ─── env_or helper (self-host 2-arg env 미지원 — 빈 문자열 fallback) ──
+//  2026-04-12: CLM_D / CLM_FF / CLM_STEPS / CLM_LR / CLM_TAG 환경변수로
+//  파라미터화. sed 편집 race condition 제거 + scaling law 스윕 (d32→d64→d128).
+
+fn env_or(key: string, default_v: string) -> string {
+    let v = env(key)
+    if v == "" { return default_v }
+    return v
+}
+
 // ─── Primitive helpers (동일 — train_byte_clm) ────────────
 
 fn mm_bwd(a: array, b: array, dc: array, M: int, K: int, N: int) -> [array] {
@@ -91,16 +101,22 @@ fn rms_bwd(x: array, g: array, dy: array, eps: float) -> RmsG {
     return RmsG { dx: dx, dg: dg }
 }
 
-// ─── Config ────────────────────────────────────────────────
+// ─── Config (env-driven — fallback = 기존 기본값) ──────────
+//  CLM_D     : hidden dim         (default 16)
+//  CLM_FF    : ffn dim            (default 32)
+//  CLM_STEPS : train steps        (default 2000)
+//  CLM_LR    : learning rate      (default 0.05)
+//  CLM_TAG   : run tag (ckpt/log) (default "default")
 
-let D     = 16
-let FF    = 32
+let D     = to_int(env_or("CLM_D",     "16"))
+let FF    = to_int(env_or("CLM_FF",    "32"))
 let NL    = 2
 let VOCAB = 256      // real byte-level
 let RANK  = 4
 let SEQ   = 16       // native hexa: 16-byte context window
-let STEPS = 2000     // queue scales: D=16→32→48→64 via pod sed (clm_queue.sh)
-let LR    = 0.05     // initial; queue scales down to 0.02, 0.015, 0.01
+let STEPS = to_int(env_or("CLM_STEPS", "2000"))
+let LR    = to_float(env_or("CLM_LR",  "0.05"))
+let TAG   = env_or("CLM_TAG", "default")
 let EPS   = 0.00001
 let LOG_EVERY = 50
 let INIT_SCALE = 0.1
@@ -468,7 +484,7 @@ fn train_step() -> float {
 
 // ─── Train loop ────────────────────────────────────────────
 
-println("[train_byte_kr] config: d=" + str(D) + " ff=" + str(FF) + " layers=" + str(NL) + " vocab=" + str(VOCAB) + " seq=" + str(SEQ) + " rank=" + str(RANK) + " steps=" + str(STEPS) + " lr=" + str(LR))
+println("[train_byte_kr] config: d=" + str(D) + " ff=" + str(FF) + " layers=" + str(NL) + " vocab=" + str(VOCAB) + " seq=" + str(SEQ) + " rank=" + str(RANK) + " steps=" + str(STEPS) + " lr=" + str(LR) + " tag=" + TAG)
 
 let t0 = clock()
 let loss_0 = train_step()
@@ -538,7 +554,7 @@ ckpt = write_tensor(ckpt, "lmh_U",   D,     RANK,  lmh_U)
 ckpt = write_tensor(ckpt, "lmh_V",   RANK,  VOCAB, lmh_V)
 ckpt = ckpt + "__MANIFEST__ 19 1\n"
 
-let ckpt_path = "/tmp/train_byte_kr.ckpt"
+let ckpt_path = "/tmp/train_byte_kr_" + TAG + ".ckpt"
 write_file(ckpt_path, ckpt)
 println("[train_byte_kr] saved " + str(len(ckpt)) + " bytes → " + ckpt_path)
 println("[train_byte_kr] eval with: hexa serving/eval_clm_kr.hexa " + ckpt_path)

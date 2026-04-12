@@ -170,7 +170,7 @@ boundary, multiscale
 27. fibonacci         — 황금비/피보나치 수열 출현
 28. prime_gap         — 소수 간격 분포
 29. collatz           — 콜라츠 추측 궤적 패턴
-30. riemann_zeta      — 제타 함수 영점 분포
+30. riemann_zeta      — Riemann ζ(s) 함수 영점 분포 (수학, Zeta AI 서비스와 무관)
 31. catalan           — 카탈란 수 (재귀 구조 수)
 32. euler_product     — 오일러 곱 분해 (소수↔전체)
 33. ramanujan         — 라마누잔 타입 놀라운 일치

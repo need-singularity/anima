@@ -1,0 +1,372 @@
+// ═══════════════════════════════════════════════════════════════
+//  cuda_ffi.hexa — Pure hexa CUDA/cuBLAS FFI bindings
+//
+//  All GPU operations via extern fn + dlopen to:
+//    libcudart.so  (CUDA runtime)
+//    libcublas.so  (cuBLAS BLAS)
+//
+//  Pointers are hexa Pointer type (u64).
+//  Float scalars for cuBLAS passed as pointers to host f32 buffers.
+//
+//  NOTE (CR1): extern hexa-side names are snake_case with `_raw` suffix
+//  where needed to avoid colliding with C stdlib / hexa builtins /
+//  runtime.c symbols when codegen_c2 emits wrappers. Each extern has
+//  an `@symbol("original_c_name")` so dlsym resolves to libcudart/libcublas.
+//
+//  Usage:
+//    use "self/ml/cuda_ffi"
+//    let ok = cuda_init()
+//    let dev_ptr = cuda_malloc(1024 * 4)
+//    ...
+// ═══════════════════════════════════════════════════════════════
+
+// ── CUDA Runtime (libcudart) ─────────────────────────────────
+
+@link("cudart")
+extern fn cudaSetDevice(device: int) -> int
+
+@link("cudart")
+extern fn cudaMalloc(ptr_ptr: *Void, size: int) -> int
+
+@link("cudart")
+extern fn cudaFree(dev_ptr: *Void) -> int
+
+@link("cudart")
+extern fn cudaMemcpy(dst: *Void, src: *Void, count: int, kind: int) -> int
+
+@link("cudart")
+extern fn cudaMemset(dev_ptr: *Void, value: int, count: int) -> int
+
+@link("cudart")
+extern fn cudaDeviceSynchronize() -> int
+
+@link("cudart")
+extern fn cudaStreamCreate(stream_ptr: *Void) -> int
+
+@link("cudart")
+extern fn cudaStreamSynchronize(stream: *Void) -> int
+
+@link("cudart")
+extern fn cudaStreamDestroy(stream: *Void) -> int
+
+@link("cudart")
+extern fn cudaMemGetInfo(free_ptr: *Void, total_ptr: *Void) -> int
+
+@link("cudart")
+extern fn cudaGetLastError() -> int
+
+@link("cudart")
+extern fn cudaMemcpyAsync(dst: *Void, src: *Void, count: int, kind: int, stream: *Void) -> int
+
+// ── cuBLAS ───────────────────────────────────────────────────
+
+@link("cublas")
+extern fn cublasCreate_v2(handle_ptr: *Void) -> int
+
+@link("cublas")
+extern fn cublasDestroy_v2(hnd: *Void) -> int
+
+@link("cublas")
+extern fn cublasSetStream_v2(hnd: *Void, strm: *Void) -> int
+
+@link("cublas")
+extern fn cublasSetMathMode(hnd: *Void, mode: int) -> int
+
+// cublasSgemm_v2(hnd, transa, transb, m, n, k, alpha_ptr, A, lda, B, ldb, beta_ptr, C, ldc)
+@link("cublas")
+extern fn cublasSgemm_v2(hnd: *Void, transa: int, transb: int, m: int, n: int, k: int, alpha: *Void, A: *Void, lda: int, B: *Void, ldb: int, beta: *Void, C: *Void, ldc: int) -> int
+
+// cublasSaxpy_v2(hnd, n, alpha_ptr, x, incx, y, incy)
+@link("cublas")
+extern fn cublasSaxpy_v2(hnd: *Void, n: int, alpha: *Void, x: *Void, incx: int, y: *Void, incy: int) -> int
+
+// cublasSscal_v2(hnd, n, alpha_ptr, x, incx)
+@link("cublas")
+extern fn cublasSscal_v2(hnd: *Void, n: int, alpha: *Void, x: *Void, incx: int) -> int
+
+// cublasSdot_v2(hnd, n, x, incx, y, incy, result_ptr)
+@link("cublas")
+extern fn cublasSdot_v2(hnd: *Void, n: int, x: *Void, incx: int, y: *Void, incy: int, result: *Void) -> int
+
+// cublasSnrm2_v2(hnd, n, x, incx, result_ptr)
+@link("cublas")
+extern fn cublasSnrm2_v2(hnd: *Void, n: int, x: *Void, incx: int, result: *Void) -> int
+
+// ── cudaMemcpy direction constants ───────────────────────────
+let MEMCPY_H2H = 0
+let MEMCPY_H2D = 1
+let MEMCPY_D2H = 2
+let MEMCPY_D2D = 3
+
+// cuBLAS operation constants
+let CUBLAS_OP_N = 0
+let CUBLAS_OP_T = 1
+
+// cuBLAS math mode
+let CUBLAS_DEFAULT_MATH = 0
+let CUBLAS_TENSOR_OP_MATH = 1
+
+// ── Global state (handle + stream + scalar buffers) ──────────
+let mut G_CUBLAS_HANDLE = ptr_null()
+let mut G_CUDA_STREAM   = ptr_null()
+
+// Host-allocated f32 scalar buffers for cuBLAS alpha/beta
+let mut G_ALPHA_PTR = ptr_null()
+let mut G_BETA_ZERO_PTR = ptr_null()
+let mut G_BETA_ONE_PTR = ptr_null()
+
+// ── Initialization ───────────────────────────────────────────
+
+fn cuda_init() {
+    // Set device 0
+    let err = cudaSetDevice(0)
+    if err != 0 {
+        println("[cuda_ffi] cudaSetDevice failed: " + str(err))
+        return -1
+    }
+
+    // Create cuBLAS handle
+    let handle_buf = alloc_raw(8)
+    let st = cublasCreate_v2(handle_buf)
+    if st != 0 {
+        println("[cuda_ffi] cublasCreate_v2 failed: " + str(st))
+        free_raw(handle_buf, 8)
+        return -2
+    }
+    G_CUBLAS_HANDLE = ptr_from_int(deref(handle_buf))
+    free_raw(handle_buf, 8)
+
+    // Create stream
+    let stream_buf = alloc_raw(8)
+    let serr = cudaStreamCreate(stream_buf)
+    if serr != 0 {
+        println("[cuda_ffi] cudaStreamCreate failed: " + str(serr))
+        free_raw(stream_buf, 8)
+        return -3
+    }
+    G_CUDA_STREAM = ptr_from_int(deref(stream_buf))
+    free_raw(stream_buf, 8)
+
+    // Bind stream to cuBLAS
+    let _ = cublasSetStream_v2(G_CUBLAS_HANDLE, G_CUDA_STREAM)
+    // Enable tensor cores
+    let _ = cublasSetMathMode(G_CUBLAS_HANDLE, CUBLAS_DEFAULT_MATH)
+
+    // Allocate scalar buffers (persistent host memory)
+    G_ALPHA_PTR = alloc_raw(4)
+    write_f32(G_ALPHA_PTR, 0, 1.0)
+
+    G_BETA_ZERO_PTR = alloc_raw(4)
+    write_f32(G_BETA_ZERO_PTR, 0, 0.0)
+
+    G_BETA_ONE_PTR = alloc_raw(4)
+    write_f32(G_BETA_ONE_PTR, 0, 1.0)
+
+    println("[cuda_ffi] initialized — handle=" + str(ptr_addr(G_CUBLAS_HANDLE)))
+    0
+}
+
+fn cuda_shutdown() {
+    if ptr_addr(G_CUBLAS_HANDLE) != 0 {
+        let _ = cublasDestroy_v2(G_CUBLAS_HANDLE)
+    }
+    if ptr_addr(G_CUDA_STREAM) != 0 {
+        let _ = cudaStreamDestroy(G_CUDA_STREAM)
+    }
+    if ptr_addr(G_ALPHA_PTR) != 0 {
+        free_raw(G_ALPHA_PTR, 4)
+    }
+    if ptr_addr(G_BETA_ZERO_PTR) != 0 {
+        free_raw(G_BETA_ZERO_PTR, 4)
+    }
+    if ptr_addr(G_BETA_ONE_PTR) != 0 {
+        free_raw(G_BETA_ONE_PTR, 4)
+    }
+    G_CUBLAS_HANDLE = ptr_null()
+    G_CUDA_STREAM = ptr_null()
+    0
+}
+
+// ── Memory helpers ───────────────────────────────────────────
+
+// cuda_malloc(nbytes) -> device Pointer
+fn cuda_malloc(nbytes) {
+    let ptr_buf = alloc_raw(8)
+    write_i64(ptr_buf, 0, 0)
+    let err = cudaMalloc(ptr_buf, nbytes)
+    if err != 0 {
+        println("[cuda_ffi] cuda_malloc(" + str(nbytes) + ") failed: " + str(err))
+        free_raw(ptr_buf, 8)
+        return ptr_null()
+    }
+    let dev = ptr_from_int(deref(ptr_buf))
+    free_raw(ptr_buf, 8)
+    dev
+}
+
+// cuda_free(dev_ptr)
+fn cuda_free(dev_ptr) {
+    let _ = cudaFree(dev_ptr)
+    0
+}
+
+// cuda_memcpy_h2d(dev_dst, host_src, nbytes)
+fn cuda_memcpy_h2d(dev_dst, host_src, nbytes) {
+    cudaMemcpy(dev_dst, host_src, nbytes, MEMCPY_H2D)
+}
+
+// cuda_memcpy_d2h(host_dst, dev_src, nbytes)
+fn cuda_memcpy_d2h(host_dst, dev_src, nbytes) {
+    cudaMemcpy(host_dst, dev_src, nbytes, MEMCPY_D2H)
+}
+
+// cuda_memcpy_d2d(dev_dst, dev_src, nbytes)
+fn cuda_memcpy_d2d(dev_dst, dev_src, nbytes) {
+    cudaMemcpy(dev_dst, dev_src, nbytes, MEMCPY_D2D)
+}
+
+// cuda_memset_zero(dev_ptr, nbytes)
+fn cuda_memset_zero(dev_ptr, nbytes) {
+    cudaMemset(dev_ptr, 0, nbytes)
+}
+
+fn cuda_sync() {
+    cudaStreamSynchronize(G_CUDA_STREAM)
+}
+
+fn cuda_device_sync() {
+    cudaDeviceSynchronize()
+}
+
+// ── GPU memory info ──────────────────────────────────────────
+
+fn cuda_mem_info() {
+    let free_buf = alloc_raw(8)
+    let total_buf = alloc_raw(8)
+    let _ = cudaMemGetInfo(free_buf, total_buf)
+    let free_bytes = deref(free_buf)
+    let total_bytes = deref(total_buf)
+    free_raw(free_buf, 8)
+    free_raw(total_buf, 8)
+    let free_mb = free_bytes / (1024 * 1024)
+    let total_mb = total_bytes / (1024 * 1024)
+    println("[cuda_ffi] GPU memory: " + str(free_mb) + " MB free / " + str(total_mb) + " MB total")
+    free_bytes
+}
+
+// ── cuBLAS SGEMM wrappers (row-major) ────────────────────────
+// All matrices stored in ROW-MAJOR in hexa.
+// cuBLAS expects column-major. Trick: C = A*B row-major
+// is equivalent to C^T = B^T * A^T in column-major.
+// So we call cublasSgemm_v2(N, N, N_cols, M_rows, K, alpha, B, N_cols, A, K, beta, C, N_cols)
+
+// gpu_sgemm(A, B, C, M, N, K) — C[M×N] = A[M×K] * B[K×N]
+fn gpu_sgemm(A_dev, B_dev, C_dev, M, N, K) {
+    let st = cublasSgemm_v2(G_CUBLAS_HANDLE, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, G_ALPHA_PTR, B_dev, N, A_dev, K, G_BETA_ZERO_PTR, C_dev, N)
+    if st != 0 {
+        println("[cuda_ffi] sgemm failed: " + str(st))
+    }
+    st
+}
+
+// gpu_sgemm_acc(A, B, C, M, N, K) — C[M×N] += A[M×K] * B[K×N]
+fn gpu_sgemm_acc(A_dev, B_dev, C_dev, M, N, K) {
+    cublasSgemm_v2(G_CUBLAS_HANDLE, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, G_ALPHA_PTR, B_dev, N, A_dev, K, G_BETA_ONE_PTR, C_dev, N)
+}
+
+// gpu_sgemm_tn(A, B, C, M, N, K) — C[M×N] = A^T[M×K] * B[K×N]
+// A is stored as [K×M], transposed to [M×K]
+fn gpu_sgemm_tn(A_dev, B_dev, C_dev, M, N, K) {
+    cublasSgemm_v2(G_CUBLAS_HANDLE, CUBLAS_OP_N, CUBLAS_OP_T, N, M, K, G_ALPHA_PTR, B_dev, N, A_dev, M, G_BETA_ZERO_PTR, C_dev, N)
+}
+
+// gpu_sgemm_nt(A, B, C, M, N, K) — C[M×N] = A[M×K] * B^T[K×N]
+// B is stored as [N×K], transposed to [K×N]
+fn gpu_sgemm_nt(A_dev, B_dev, C_dev, M, N, K) {
+    cublasSgemm_v2(G_CUBLAS_HANDLE, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, G_ALPHA_PTR, B_dev, K, A_dev, K, G_BETA_ZERO_PTR, C_dev, N)
+}
+
+// ── cuBLAS vector operations ─────────────────────────────────
+
+// gpu_saxpy(x, y, n, alpha_f32) — y = alpha*x + y
+fn gpu_saxpy(x_dev, y_dev, n, alpha_val) {
+    let alpha_buf = alloc_raw(4)
+    write_f32(alpha_buf, 0, alpha_val)
+    let st = cublasSaxpy_v2(G_CUBLAS_HANDLE, n, alpha_buf, x_dev, 1, y_dev, 1)
+    free_raw(alpha_buf, 4)
+    st
+}
+
+// gpu_sscal(x, n, alpha_f32) — x = alpha*x
+fn gpu_sscal(x_dev, n, alpha_val) {
+    let alpha_buf = alloc_raw(4)
+    write_f32(alpha_buf, 0, alpha_val)
+    let st = cublasSscal_v2(G_CUBLAS_HANDLE, n, alpha_buf, x_dev, 1)
+    free_raw(alpha_buf, 4)
+    st
+}
+
+// gpu_sdot(x, y, n) -> f32 dot product
+fn gpu_sdot(x_dev, y_dev, n) {
+    let result_buf = alloc_raw(4)
+    write_f32(result_buf, 0, 0.0)
+    let _ = cublasSdot_v2(G_CUBLAS_HANDLE, n, x_dev, 1, y_dev, 1, result_buf)
+    let val = deref_f32(result_buf, 0)
+    free_raw(result_buf, 4)
+    val
+}
+
+// gpu_snrm2(x, n) -> f32 L2 norm
+fn gpu_snrm2(x_dev, n) {
+    let result_buf = alloc_raw(4)
+    write_f32(result_buf, 0, 0.0)
+    let _ = cublasSnrm2_v2(G_CUBLAS_HANDLE, n, x_dev, 1, result_buf)
+    let val = deref_f32(result_buf, 0)
+    free_raw(result_buf, 4)
+    val
+}
+
+// ── Tensor ↔ GPU transfer ────────────────────────────────────
+
+// Upload hexa tensor to GPU (f64 → f32 conversion on host, then H2D)
+fn tensor_to_gpu(t) {
+    let n = len(t)
+    let host_buf = tensor_data_f32_ptr(t)
+    let dev = cuda_malloc(n * 4)
+    let _ = cuda_memcpy_h2d(dev, host_buf, n * 4)
+    free_raw(host_buf, n * 4)
+    dev
+}
+
+// Download GPU tensor to hexa (D2H then f32 → f64)
+fn tensor_from_gpu(dev_ptr, n) {
+    let host_buf = alloc_raw(n * 4)
+    let _ = cuda_memcpy_d2h(host_buf, dev_ptr, n * 4)
+    let t = tensor_from_f32_ptr(host_buf, n)
+    free_raw(host_buf, n * 4)
+    t
+}
+
+// Allocate zeroed GPU tensor
+fn gpu_zeros(n) {
+    let dev = cuda_malloc(n * 4)
+    let _ = cuda_memset_zero(dev, n * 4)
+    dev
+}
+
+// Upload int array to GPU as i32
+fn int_array_to_gpu(arr) {
+    let n = len(arr)
+    let host_buf = alloc_raw(n * 4)
+    let mut i = 0
+    while i < n {
+        write_i32(host_buf, i, arr[i])
+        i = i + 1
+    }
+    let dev = cuda_malloc(n * 4)
+    let _ = cuda_memcpy_h2d(dev, host_buf, n * 4)
+    free_raw(host_buf, n * 4)
+    dev
+}
+
+println("[cuda_ffi] module loaded — CUDA/cuBLAS extern FFI bindings ready")
