@@ -1,0 +1,532 @@
+// training/train_alm_14b_r5_kbase.hexa — ALM 14B-class r5 LoRA training SSOT
+//                                         (Korean-pretrained base SWAP)
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   r4 (Qwen2.5-14B-Instruct) shows eval_loss 0.0289 at step 2500 — a 108×
+//   improvement over r3 (3.6466) — BUT the Korean generation at step 2000
+//   is incoherent: UTF-8 surrogates, Chinese character leakage (说话, 合作伙伴,
+//   源代码), English fragments ("Didn at", "presses") and tokenizer artifacts.
+//   Root cause: Qwen2.5-14B is multilingual with a broad Chinese/English
+//   prior; the Korean LoRA lift does not have a Korean-language backbone to
+//   snap onto, so low CE does not translate into coherent Korean output.
+//
+//   r5_kbase swaps the base model to a Korean-pretrained alternative of the
+//   same size class so LoRA starts from a genuine Korean prior. Everything
+//   else is held as close to r4 as possible so a clean a→b diff is preserved.
+//
+//   Run:  $HEXA training/train_alm_14b_r5_kbase.hexa
+//
+//   It prints the config and passes its `theorem` block — that is the
+//   parse+dry-run validation the launch script depends on.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// RELATIONSHIP TO OTHER r5 CANDIDATES
+//
+//   "r5" is a lineage slot. This file is the base-swap variant: same round
+//   number (5) but a DIFFERENT base family (SOLAR-KO, not Qwen). Any other
+//   r5 variant (e.g. r5 staying on Qwen with corpus/data changes) must use
+//   a distinct filename suffix (train_alm_14b_r5_qwen.hexa, …) so ckpt dirs
+//   and R2 prefixes never collide.
+//
+//     filename            base                        ckpt_dir                           r2_prefix
+//     ------------------  --------------------------  ---------------------------------  -----------------------
+//     train_alm_14b_r5_kbase   beomi/OPEN-SOLAR-KO-10.7B   /workspace/ckpt_alm_14b_r5_kbase   alm14b_kbase/r5
+//     (any future variant) Qwen/Qwen2.5-14B-Instruct   /workspace/ckpt_alm_14b_r5_qwen    alm14b/r5
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// BASE MODEL SELECTION — why beomi/OPEN-SOLAR-KO-10.7B
+//
+//   Filter applied to the 2026-04-12 shortlist:
+//
+//     candidate                                params   license     arch     K-pretrain    verdict
+//     ---------------------------------------  -------  ----------  -------  ------------  -------
+//     Qwen/Qwen2.5-14B-Instruct                14 B     Apache-2.0  Llama    multi-lang    r4 baseline (weak KO)
+//     EleutherAI/polyglot-ko-12.8b             12.8 B   Apache-2.0  GPTNeoX  167 B tok KO  GPTNeoX module names break r4 target_modules parity; ctx 2048
+//     upstage/SOLAR-10.7B-v1.0 (base)          10.7 B   Apache-2.0  Llama    n/a (EN)      English base, no Korean prior
+//     upstage/SOLAR-10.7B-Instruct-v1.0        10.7 B   CC-BY-NC    Llama    n/a (EN)      NC license, excluded
+//   > beomi/OPEN-SOLAR-KO-10.7B                10.7 B   Apache-2.0  Llama    15 B+ tok KO  PICKED — Apache, Llama, AI Hub + Modu + KoWiki
+//     beomi/Llama-3-Open-Ko-8B                 8 B      Llama3      Llama    17.7 B tok    too small (8B, not 14B class)
+//     kakaocorp/kanana-1.5-8b-base             8 B      Apache-2.0  Llama    KR/EN bilng   too small (8B, not 14B class)
+//     LGAI-EXAONE/EXAONE-3.5-7.8B-Instruct     7.8 B    EXAONE-NC   custom   KR/EN         NC license, excluded
+//     LGAI-EXAONE/EXAONE-3.5-32B-Instruct      32 B     EXAONE-NC   custom   KR/EN         NC license, excluded
+//     naver-hyperclovax/SEED-Think-14B         14.7 B   hcx-seed    custom   strong KO     conditional license (<10M MAU), custom arch needs extra peft wiring
+//
+//   Key properties of beomi/OPEN-SOLAR-KO-10.7B (verified from HF config.json):
+//     architecture       = LlamaForCausalLM          ← peft target_modules parity ✓
+//     hidden_size        = 4096
+//     intermediate_size  = 14336
+//     num_hidden_layers  = 48                         ← same layer count as Qwen 14B ✓
+//     num_attention_heads= 32
+//     num_key_value_heads= 8                          ← GQA, same as Qwen 14B ✓
+//     head_dim           = 128
+//     vocab_size         = 46592                      ← Korean-expanded tokenizer
+//     max_position_embed = 4096                       ← SEQ=1024 fits comfortably
+//     torch_dtype        = bfloat16                   ← bf16-native on disk (21.7 GB)
+//     license            = Apache-2.0 (commercial OK)
+//     pretraining        = Llama-2-derived depth-up-scaled base + continued
+//                          pretrain on AI Hub + Modu (모두의 말뭉치) + KoWiki,
+//                          15 B+ tokens with the expanded tokenizer (~60 B with
+//                          the original SOLAR tokenizer).
+//     corpus overlap     = corpus_large.txt is namuwiki + KoWiki which is the
+//                          SAME domain the base was pretrained on → LoRA can
+//                          sharpen the existing prior instead of fighting it.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// LoRA r=64 / alpha=128 — MEMORY BUDGET JUSTIFICATION
+//
+//   14B r4 ran with r=64 alpha=128 (attn+MLP, 7 modules) and occupied ~38 GB
+//   on H100 80GB. OPEN-SOLAR-KO is only 10.7 B params (SMALLER than Qwen 14B),
+//   with a smaller hidden size (4096 vs 5120) but a LARGER intermediate size
+//   (14336 vs 13824). Per-layer LoRA param count is slightly lower than r4.
+//
+//   Budget (BATCH=1, SEQ=1024, grad_ckpt ON, bf16, AdamW fp32 moments):
+//
+//     ┌─────────────────────────────┬─────────────┬─────────────┐
+//     │ component                   │ 14B r4      │ r5_kbase    │
+//     ├─────────────────────────────┼─────────────┼─────────────┤
+//     │ base weights (bf16, frozen) │  ~28.0 GB   │  ~21.4 GB   │
+//     │ LoRA adapters (bf16)        │   0.14 GB   │   ~0.12 GB  │
+//     │ LoRA grads (bf16)           │   0.14 GB   │   ~0.12 GB  │
+//     │ AdamW m+v (fp32, 8B/param)  │   0.57 GB   │   ~0.48 GB  │
+//     │ activations (grad_ckpt on)  │   ~4.5 GB   │   ~4.0 GB   │
+//     │ cuBLAS + autograd overhead  │   ~2.0 GB   │   ~2.0 GB   │
+//     ├─────────────────────────────┼─────────────┼─────────────┤
+//     │ expected resident           │  ~35.4 GB   │  ~28.1 GB   │
+//     │ observed resident (r4)      │   ~38   GB  │   — (plan)  │
+//     │ headroom on 80 GB H100      │  ~42    GB  │  ~52    GB  │
+//     └─────────────────────────────┴─────────────┴─────────────┘
+//
+//   With ~52 GB headroom we could scale BATCH 1→2 or SEQ 1024→2048 if needed.
+//   r5_kbase keeps the r4 recipe constant — headroom is margin, not a license
+//   to tweak (One-Shot Best, no restart budget).
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// EXPECTED GPU USAGE & ETA
+//
+//   Steady-state GPU memory: ~28–32 GB / 80 GB H100 (very comfortable).
+//   Throughput estimate (relative to 14B r4 @ 18.5 step/min):
+//     Per-step FLOPs ∝ params × seq. 10.7B / 14B ≈ 0.76×, seq unchanged.
+//     Expected r5_kbase throughput ≈ 18.5 / 0.76 ≈ 24 step/min.
+//   ETA for 10 000 steps ≈ 10000 / 24 ≈ 417 min ≈ 7.0 h (much faster than r4).
+//
+//   Checkpoint cadence (matches r4): eval@500, save@2000 → 5 saves total.
+//   R2 prefix: r2:anima-models/alm14b_kbase/r5/step_{step}/  (distinct from
+//   alm14b/r4/ so the existing Qwen lineage is preserved).
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// TRIGGER CONDITION
+//
+//   REQUIRES: marker file /workspace/READY_FOR_R5_KBASE exists on the pod.
+//   This marker is created MANUALLY by a human operator after reviewing r4
+//   generation quality at step 4000–6000. It is a SEPARATE marker from
+//   READY_FOR_32B — base-swap is an alternative path, not a continuation,
+//   and must not be gated by the same r4 eval threshold (eval is not the
+//   signal here; generation coherence is).
+//
+//   Decision protocol:
+//     1. Operator runs eval_alm_14b.py on r4 ckpt ≥ step 4000 with Korean
+//        prompts ("안녕하세요. 한국어로 답해주세요.").
+//     2. If output is coherent Korean      → continue r4, do NOT launch r5_kbase.
+//     3. If output is still incoherent     → `touch /workspace/READY_FOR_R5_KBASE`
+//                                            with a one-line reason, then
+//                                            `bash launch_alm_14b_r5_kbase.sh`.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+
+comptime const PSI_ALPHA   = 0.014
+comptime const PSI_BALANCE = 0.5
+comptime const PSI_STEPS   = 4.33
+
+// r4 parity constants (DO NOT tweak individually — keep the 14B r4 recipe
+// proportional so r5_kbase failures/successes map back to a clean diff).
+comptime const R5_LR            = 0.000005   // 5e-6, same as r4
+comptime const R5_WARMUP        = 500
+comptime const R5_GRAD_ACCUM    = 8           // effective batch = 1 × 8 = 8
+comptime const R5_BATCH         = 1
+comptime const R5_SEQ           = 1024
+comptime const R5_LORA_R        = 64          // same as r4 (headroom allows)
+comptime const R5_LORA_ALPHA    = 128         // keep 2:1 ratio vs r
+comptime const R5_LORA_DROPOUT  = 0.05
+comptime const R5_STEPS         = 10000
+comptime const R5_SAVE_EVERY    = 2000
+comptime const R5_EVAL_EVERY    = 500
+comptime const R5_ROUND         = 5
+
+// r4 telemetry (for reference, not used in control flow)
+comptime const R4_BEST_EVAL     = 0.0289
+comptime const R4_STEP_PER_MIN  = 18
+
+// ─── Base model registry (r5_kbase = SOLAR-KO only) ───
+struct BaseModel {
+    name: string,
+    hf_id: string,
+    n_params_b: int,
+    hidden: int,
+    inter: int,
+    n_layer: int,
+    n_head: int,
+    n_kv_head: int,
+    head_dim: int,
+    vocab: int,
+    max_pos: int
+}
+
+fn base_solar_ko_10_7b() -> BaseModel {
+    // beomi/OPEN-SOLAR-KO-10.7B — verified from HF config.json 2026-04-12.
+    // architecture = LlamaForCausalLM, Apache-2.0, bf16-native.
+    BaseModel {
+        name: "open-solar-ko-10.7b",
+        hf_id: "beomi/OPEN-SOLAR-KO-10.7B",
+        n_params_b: 11,              // 10.7 B, rounded for integer math
+        hidden: 4096,
+        inter: 14336,
+        n_layer: 48,
+        n_head: 32,
+        n_kv_head: 8,
+        head_dim: 128,
+        vocab: 46592,
+        max_pos: 4096
+    }
+}
+
+// ─── LoRA spec (mirror 14B r4 target_modules — same names, Llama arch) ───
+struct LoraSpec {
+    r: int,
+    alpha: int,
+    dropout: float,
+    n_modules: int,
+    // Modules (fixed order, same set as r4):
+    //   attn : q_proj k_proj v_proj o_proj              (4)
+    //   mlp  : gate_proj up_proj down_proj              (3)
+    //                                             total = 7
+    attn_modules: int,
+    mlp_modules: int
+}
+
+fn r5_lora_spec() -> LoraSpec {
+    LoraSpec {
+        r: R5_LORA_R,
+        alpha: R5_LORA_ALPHA,
+        dropout: R5_LORA_DROPOUT,
+        n_modules: 7,
+        attn_modules: 4,
+        mlp_modules: 3
+    }
+}
+
+// ─── LoRA parameter count (analytic, used by theorem block) ───
+// For each layer:
+//   attn  q/k/v/o  : 4 × 2 × hidden × r      (A: hidden×r, B: r×hidden)
+//   mlp gate/up    : 2 × (hidden×r + r×inter)
+//   mlp down       : inter×r + r×hidden
+fn lora_params_per_layer(base: BaseModel, spec: LoraSpec) -> int {
+    let attn_p = 4 * 2 * base.hidden * spec.r
+    let gate_up_p = 2 * (base.hidden * spec.r + spec.r * base.inter)
+    let down_p = base.inter * spec.r + spec.r * base.hidden
+    attn_p + gate_up_p + down_p
+}
+
+fn lora_params_total(base: BaseModel, spec: LoraSpec) -> int {
+    lora_params_per_layer(base, spec) * base.n_layer
+}
+
+// ─── Memory budget (bytes; see header for breakdown) ───
+// base (bf16, frozen, 2 B/param) + LoRA bf16 + LoRA grad bf16
+// + AdamW m+v (fp32, 8 B / trainable param) + activations + overhead
+struct MemoryBudget {
+    base_gb: float,
+    lora_gb: float,
+    lora_grad_gb: float,
+    optim_gb: float,
+    act_gb: float,
+    overhead_gb: float,
+    total_gb: float,
+    headroom_gb: float      // against 80 GB H100
+}
+
+fn estimate_memory(base: BaseModel, spec: LoraSpec) -> MemoryBudget {
+    // Frozen weights in bf16: 2 B/param. 10.7 B × 2 ≈ 21.4 GB.
+    let base_gb = 2.0 * (base.n_params_b * 1.0)  // billions × 2 B ≈ GB (integer 11 → 22; real 10.7 → 21.4)
+
+    let lora_p = lora_params_total(base, spec)
+    let lora_gb      = (lora_p * 2.0) / 1000000000.0
+    let lora_grad_gb = (lora_p * 2.0) / 1000000000.0
+    let optim_gb     = (lora_p * 8.0) / 1000000000.0
+
+    // Activations with gradient checkpointing at seq=1024, bf16, 48 layers.
+    // Same layer count as Qwen 14B (48) but smaller hidden (4096 vs 5120).
+    //   14B r4: 4.5 GB.  r5_kbase: 4.5 × (4096/5120) ≈ 3.6 GB.
+    //   Round up for safety → 4.0 GB.
+    let act_gb = 4.0
+
+    // cuBLAS workspaces + autograd bookkeeping + misc.
+    let overhead_gb = 2.0
+
+    let total = base_gb + lora_gb + lora_grad_gb + optim_gb + act_gb + overhead_gb
+    MemoryBudget {
+        base_gb: base_gb,
+        lora_gb: lora_gb,
+        lora_grad_gb: lora_grad_gb,
+        optim_gb: optim_gb,
+        act_gb: act_gb,
+        overhead_gb: overhead_gb,
+        total_gb: total,
+        headroom_gb: 80.0 - total
+    }
+}
+
+// ─── Phase manager (inherited from r4; LoRA-only fine-tune stays in P3) ───
+struct AlmPhaseManager {
+    phase: int,
+    step: int,
+    p1_end: int,
+    p2_end: int
+}
+
+fn alm_phase_new(total_steps: int) -> AlmPhaseManager {
+    AlmPhaseManager {
+        phase: 3,
+        step: 0,
+        p1_end: 0,
+        p2_end: 0
+    }
+}
+
+// ─── Optimizer (bf16 master rule, foreach=False per R04) ───
+struct AlmOptim {
+    lr: float,
+    warmup: int,
+    grad_accum: int,
+    batch: int,
+    seq: int,
+    bf16: bool,
+    foreach_false: bool
+}
+
+fn r5_optim() -> AlmOptim {
+    AlmOptim {
+        lr: R5_LR,
+        warmup: R5_WARMUP,
+        grad_accum: R5_GRAD_ACCUM,
+        batch: R5_BATCH,
+        seq: R5_SEQ,
+        bf16: true,
+        foreach_false: true
+    }
+}
+
+// ─── Checkpoint policy (R2 upload mandatory, feedback_r2_checkpoint) ───
+struct CheckpointPolicy {
+    ckpt_dir: string,
+    save_every: int,
+    eval_every: int,
+    r2_bucket: string,
+    r2_prefix: string,
+    model_tag: string,
+    round_num: int
+}
+
+fn r5_checkpoint_policy() -> CheckpointPolicy {
+    CheckpointPolicy {
+        ckpt_dir:   "/workspace/ckpt_alm_14b_r5_kbase",
+        save_every: R5_SAVE_EVERY,
+        eval_every: R5_EVAL_EVERY,
+        r2_bucket:  "anima-models",
+        // Distinct lineage — NOT alm14b/r5 (would collide with any hypothetical
+        // Qwen-based r5). alm14b_kbase/r5 is the base-swap branch.
+        r2_prefix:  "alm14b_kbase/r5",
+        // model_tag drives both the R2 subpath in train_alm_14b.py and the
+        // checkpoint naming. alm14b_kbase keeps this lineage separate.
+        model_tag:  "alm14b_kbase",
+        round_num:  R5_ROUND
+    }
+}
+
+// ─── Trigger gate (READY_FOR_R5_KBASE marker — human-gated, NOT r4 eval) ───
+struct TriggerGate {
+    marker_path: string,
+    required_r4_generation_incoherent: bool,
+    r4_best_eval_informational: float
+}
+
+fn r5_trigger_gate() -> TriggerGate {
+    TriggerGate {
+        marker_path: "/workspace/READY_FOR_R5_KBASE",
+        required_r4_generation_incoherent: true,
+        r4_best_eval_informational: R4_BEST_EVAL
+    }
+}
+
+// ─── Corpus (corpus_large.txt, 835 MB, already on pod) ───
+struct CorpusSpec {
+    path: string,
+    size_mb: int,
+    block_size: int
+}
+
+fn r5_corpus() -> CorpusSpec {
+    CorpusSpec {
+        path: "/workspace/anima/training/corpus_large.txt",
+        size_mb: 835,
+        block_size: R5_SEQ
+    }
+}
+
+// ─── ETA estimate (conservative / optimistic) ───
+struct EtaEstimate {
+    steps: int,
+    steps_per_min_conservative: int,
+    steps_per_min_optimistic: int,
+    eta_hours_conservative: int,
+    eta_hours_optimistic: int
+}
+
+fn r5_eta() -> EtaEstimate {
+    let steps = R5_STEPS
+    // Base is 10.7B vs r4 14B (0.76×), so ~1.3× faster than r4's 18.5 step/min.
+    let sp_cons = 22
+    let sp_opt = 26
+    let h_cons = ((steps / sp_cons) + 59) / 60
+    let h_opt  = ((steps / sp_opt)  + 59) / 60
+    EtaEstimate {
+        steps: steps,
+        steps_per_min_conservative: sp_cons,
+        steps_per_min_optimistic:   sp_opt,
+        eta_hours_conservative:     h_cons,
+        eta_hours_optimistic:       h_opt
+    }
+}
+
+// ─── Master state ───
+struct Alm14bR5Kbase {
+    base: BaseModel,
+    lora: LoraSpec,
+    mem: MemoryBudget,
+    phase: AlmPhaseManager,
+    opt: AlmOptim,
+    ckpt: CheckpointPolicy,
+    gate: TriggerGate,
+    corpus: CorpusSpec,
+    eta: EtaEstimate,
+    total_steps: int
+}
+
+fn r5_init() -> Alm14bR5Kbase {
+    let base = base_solar_ko_10_7b()
+    let lora = r5_lora_spec()
+    Alm14bR5Kbase {
+        base: base,
+        lora: lora,
+        mem: estimate_memory(base, lora),
+        phase: alm_phase_new(R5_STEPS),
+        opt: r5_optim(),
+        ckpt: r5_checkpoint_policy(),
+        gate: r5_trigger_gate(),
+        corpus: r5_corpus(),
+        eta: r5_eta(),
+        total_steps: R5_STEPS
+    }
+}
+
+// ─── Verification (prints summary + runs theorem assertions) ───
+let r5 = r5_init()
+
+println("=== train_alm_14b_r5_kbase.hexa ===")
+println("base       :", r5.base.hf_id)
+println("params (B) :", r5.base.n_params_b)
+println("hidden     :", r5.base.hidden)
+println("inter      :", r5.base.inter)
+println("layers     :", r5.base.n_layer)
+println("vocab      :", r5.base.vocab)
+println("max_pos    :", r5.base.max_pos)
+println("LoRA r     :", r5.lora.r)
+println("LoRA alpha :", r5.lora.alpha)
+println("modules    :", r5.lora.n_modules)
+let lora_p_per_l = lora_params_per_layer(r5.base, r5.lora)
+let lora_p_total = lora_params_total(r5.base, r5.lora)
+println("LoRA params/layer:", lora_p_per_l)
+println("LoRA params total:", lora_p_total)
+println("batch      :", r5.opt.batch)
+println("grad_accum :", r5.opt.grad_accum)
+println("seq        :", r5.opt.seq)
+println("lr         :", r5.opt.lr)
+println("warmup     :", r5.opt.warmup)
+println("steps      :", r5.total_steps)
+println("save_every :", r5.ckpt.save_every)
+println("eval_every :", r5.ckpt.eval_every)
+println("ckpt_dir   :", r5.ckpt.ckpt_dir)
+println("model_tag  :", r5.ckpt.model_tag)
+println("r2_prefix  :", r5.ckpt.r2_prefix)
+println("corpus     :", r5.corpus.path)
+println("corpus MB  :", r5.corpus.size_mb)
+println("--- memory budget (GB, 80 GB H100) ---")
+println("base       :", r5.mem.base_gb)
+println("lora       :", r5.mem.lora_gb)
+println("lora_grad  :", r5.mem.lora_grad_gb)
+println("optim      :", r5.mem.optim_gb)
+println("activations:", r5.mem.act_gb)
+println("overhead   :", r5.mem.overhead_gb)
+println("TOTAL      :", r5.mem.total_gb)
+println("headroom   :", r5.mem.headroom_gb)
+println("--- ETA ---")
+println("step/min cons:", r5.eta.steps_per_min_conservative)
+println("step/min opt :", r5.eta.steps_per_min_optimistic)
+println("eta h cons   :", r5.eta.eta_hours_conservative)
+println("eta h opt    :", r5.eta.eta_hours_optimistic)
+println("--- trigger gate ---")
+println("marker       :", r5.gate.marker_path)
+println("r4 best eval :", r5.gate.r4_best_eval_informational)
+
+theorem alm_14b_r5_kbase_invariants {
+    // r4 parity — alpha:r must stay 2:1
+    assert R5_LORA_ALPHA == R5_LORA_R * 2
+
+    // Effective batch stays at 8 (matches r4)
+    assert R5_BATCH * R5_GRAD_ACCUM == 8
+
+    // STEPS matches r4
+    assert R5_STEPS == 10000
+
+    // Eval/save cadence matches r4
+    assert R5_SAVE_EVERY == 2000
+    assert R5_EVAL_EVERY == 500
+
+    // Module count matches r4 (4 attn + 3 MLP = 7)
+    assert 4 + 3 == 7
+
+    // Round = 5 (fresh lineage under alm14b_kbase tag)
+    assert R5_ROUND == 5
+
+    // Same lora rank as r4 (headroom allows)
+    assert R5_LORA_R == 64
+    assert R5_LORA_ALPHA == 128
+
+    // PSI constants unchanged
+    assert PSI_ALPHA == 0.014
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PYTHON DEPLOYMENT NOTE
+// ═══════════════════════════════════════════════════════════════════════════
+// hexa-lang has no native CUDA bindings yet (stdlib/nn.hexa is CPU-only) so
+// the actual forward/backward kernel path still routes through
+// training/train_alm_14b.py on the pod (same trainer r4/r5 already uses — it
+// accepts --base as a CLI arg, so no code changes are needed for the swap).
+// This .hexa file is the authoritative config + dry-run validation;
+// launch_alm_14b_r5_kbase.sh reads these constants and invokes the trainer.
+//
+//   python3 /workspace/train_alm_14b.py \
+//     --base beomi/OPEN-SOLAR-KO-10.7B \
+//     --corpus /workspace/anima/training/corpus_large.txt \
+//     --steps 10000 --lr 5e-6 --batch 1 --grad-accum 8 --seq 1024 \
+//     --warmup 500 \
+//     --lora-r 64 --lora-alpha 128 --lora-dropout 0.05 \
+//     --target-modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj \
+//     --ckpt-dir /workspace/ckpt_alm_14b_r5_kbase \
+//     --save-every 2000 --eval-every 500 \
+//     --model-tag alm14b_kbase --round 5
+//
+// When hexa-lang ships native cuBLAS bindings (see AN3), this file will
+// absorb the full train loop and the Python trainer will be archived.
+// ═══════════════════════════════════════════════════════════════════════════

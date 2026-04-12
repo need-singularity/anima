@@ -1,0 +1,833 @@
+// ═══════════════════════════════════════════════════════════════
+//  serving/monitor_alm_r4.hexa — ALM 14B r4 training monitor daemon
+//
+//  HEXA-FIRST (AN7): pure hexa stdlib, no python/bash.
+//  Polls /workspace/train_r4.log every 60 s, parses [eval] / [save] /
+//  [r2 uploaded] lines, tracks best eval_loss, detects plateau
+//  (3 consecutive non-improving eval entries) and the 32B-ready
+//  threshold (best eval_loss < 0.02). Emits marker files + structured
+//  log entries. Tolerant of missing files, malformed lines, and
+//  races with the writing training process.
+//
+//  Outputs (pod-side):
+//    /workspace/monitor_alm.log              ─ daemon log (append)
+//    /workspace/r2_backups.log               ─ R2 upload audit trail
+//    /workspace/PLATEAU_ALERT                ─ marker (created on plateau)
+//    /workspace/READY_FOR_32B_EVAL_ONLY      ─ marker (best<0.02, KR unknown)
+//    /workspace/READY_FOR_32B                ─ marker (best<0.02 AND KR OK)
+//    /workspace/monitor_alm.state            ─ persistent state
+//
+//  KR gate (2026-04-12 extension):
+//    Reads /workspace/kr_quality.log (written by serving/kr_quality_gate.hexa
+//    sister daemon). Each line:
+//        [kr_quality] step=N composite=X verdict=V
+//    If composite >= --kr-gate AND best eval < --best-target, we fire the
+//    real READY_FOR_32B marker. Otherwise we fall back to the eval-only
+//    signal (READY_FOR_32B_EVAL_ONLY), which is now known to be unreliable
+//    by itself (r4 eval=0.0289 but Korean generation incoherent).
+//    --kr-gate 0.0 disables the KR requirement (legacy behaviour).
+//
+//  Launched via serving/launch_monitor_alm_r4.sh (idempotent).
+//
+//  Usage:
+//    hexa serving/monitor_alm_r4.hexa \
+//        [--log /workspace/train_r4.log] \
+//        [--interval 60] \
+//        [--out-log /workspace/monitor_alm.log] \
+//        [--ckpt-dir /workspace/ckpt_alm_14b_r4] \
+//        [--kr-gate 0.70]   # composite threshold (0.0 = disabled)
+//        [--kr-quality-log /workspace/kr_quality.log] \
+//        [--once]        # single poll pass then exit (for smoke test)
+//
+//  Constraints:
+//    - Never modifies train_*.hexa or any training file
+//    - Never kills the training process
+//    - Tolerant: missing log / malformed lines / races are all non-fatal
+//    - KR sample hook: disabled on this pod (no hexa ALM serving script
+//      exists — skip with explicit note written to monitor_alm.log)
+// ═══════════════════════════════════════════════════════════════
+
+// ── Defaults ────────────────────────────────────────────────────
+let DEFAULT_LOG          = "/workspace/train_r4.log"
+let DEFAULT_OUT_LOG      = "/workspace/monitor_alm.log"
+let DEFAULT_R2_LOG       = "/workspace/r2_backups.log"
+let DEFAULT_KR_LOG       = "/workspace/kr_samples.log"
+let DEFAULT_KR_QUAL_LOG  = "/workspace/kr_quality.log"
+let DEFAULT_STATE        = "/workspace/monitor_alm.state"
+let DEFAULT_CKPT_DIR     = "/workspace/ckpt_alm_14b_r4"
+let DEFAULT_INTERVAL     = 60
+let DEFAULT_PLATEAU_N    = 3
+let DEFAULT_BEST_TGT     = 0.02
+let DEFAULT_KR_GATE      = 0.70
+
+let DEFAULT_PLATEAU_MARKER    = "/workspace/PLATEAU_ALERT"
+let DEFAULT_READY_MARKER      = "/workspace/READY_FOR_32B"
+let DEFAULT_READY_EVAL_MARKER = "/workspace/READY_FOR_32B_EVAL_ONLY"
+
+// ── Config state (populated from args) ──────────────────────────
+let mut cfg_log           = DEFAULT_LOG
+let mut cfg_out           = DEFAULT_OUT_LOG
+let mut cfg_r2            = DEFAULT_R2_LOG
+let mut cfg_kr            = DEFAULT_KR_LOG
+let mut cfg_kr_qual_log   = DEFAULT_KR_QUAL_LOG
+let mut cfg_state_path    = DEFAULT_STATE
+let mut cfg_ckpt_dir      = DEFAULT_CKPT_DIR
+let mut cfg_interval      = DEFAULT_INTERVAL
+let mut cfg_plateau_n     = DEFAULT_PLATEAU_N
+let mut cfg_best_tgt      = DEFAULT_BEST_TGT
+let mut cfg_kr_gate       = DEFAULT_KR_GATE
+let mut cfg_once          = false
+let mut cfg_plateau_marker    = DEFAULT_PLATEAU_MARKER
+let mut cfg_ready_marker      = DEFAULT_READY_MARKER
+let mut cfg_ready_eval_marker = DEFAULT_READY_EVAL_MARKER
+
+// ── Runtime state (persisted across restarts via cfg_state_path) ─
+let mut st_offset              = 0     // bytes of train_r4.log consumed
+let mut st_last_mtime          = 0     // last observed mtime (seconds)
+let mut st_best_eval           = 1e18  // best eval_loss so far
+let mut st_best_step           = 0
+let mut st_last_step           = 0
+let mut st_nonimprove_count    = 0     // consecutive non-improving [eval] entries
+let mut st_last_evals          = []    // last N eval floats for plateau body
+let mut st_plateau_fired       = false
+let mut st_ready32b_fired      = false
+let mut st_ready32b_eval_fired = false
+let mut st_poll_count          = 0
+let mut st_last_train_loss     = 0.0
+let mut st_last_save_step      = 0
+
+// KR gate state (extension 2026-04-12)
+let mut st_latest_kr_composite  = -1.0  // -1.0 = never seen
+let mut st_latest_kr_step       = 0
+let mut st_latest_kr_verdict    = ""
+let mut st_kr_gate_satisfied    = false
+let mut st_kr_offset            = 0     // bytes of kr_quality.log consumed
+let mut st_kr_passthrough_logged = false
+
+// ──────────────────────────────────────────────────────────────
+//  Helpers
+// ──────────────────────────────────────────────────────────────
+
+fn parse_args() {
+    let argv = args()
+    let n = len(argv)
+    let mut i = 2   // skip "hexa" + script path
+    while i < n {
+        let a = argv[i]
+        if a == "--log" && i + 1 < n {
+            cfg_log = argv[i + 1]
+            i = i + 2
+        } else if a == "--out-log" && i + 1 < n {
+            cfg_out = argv[i + 1]
+            i = i + 2
+        } else if a == "--r2-log" && i + 1 < n {
+            cfg_r2 = argv[i + 1]
+            i = i + 2
+        } else if a == "--kr-log" && i + 1 < n {
+            cfg_kr = argv[i + 1]
+            i = i + 2
+        } else if a == "--kr-quality-log" && i + 1 < n {
+            cfg_kr_qual_log = argv[i + 1]
+            i = i + 2
+        } else if a == "--kr-gate" && i + 1 < n {
+            cfg_kr_gate = to_float(argv[i + 1])
+            i = i + 2
+        } else if a == "--state" && i + 1 < n {
+            cfg_state_path = argv[i + 1]
+            i = i + 2
+        } else if a == "--ckpt-dir" && i + 1 < n {
+            cfg_ckpt_dir = argv[i + 1]
+            i = i + 2
+        } else if a == "--interval" && i + 1 < n {
+            cfg_interval = to_int(argv[i + 1])
+            i = i + 2
+        } else if a == "--plateau-n" && i + 1 < n {
+            cfg_plateau_n = to_int(argv[i + 1])
+            i = i + 2
+        } else if a == "--best-target" && i + 1 < n {
+            cfg_best_tgt = to_float(argv[i + 1])
+            i = i + 2
+        } else if a == "--plateau-marker" && i + 1 < n {
+            cfg_plateau_marker = argv[i + 1]
+            i = i + 2
+        } else if a == "--ready-marker" && i + 1 < n {
+            cfg_ready_marker = argv[i + 1]
+            i = i + 2
+        } else if a == "--ready-eval-marker" && i + 1 < n {
+            cfg_ready_eval_marker = argv[i + 1]
+            i = i + 2
+        } else if a == "--once" {
+            cfg_once = true
+            i = i + 1
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+// Timestamp helper — uses hexa builtin `now()` which returns ISO 8601.
+fn ts() -> string {
+    return now()
+}
+
+// Tolerant file read — returns "" on any error/missing path.
+fn safe_read(path: string) -> string {
+    if !file_exists(path) { return "" }
+    return read_file(path)
+}
+
+// Tolerant append — silently best-effort (monitor must never crash).
+fn safe_append(path: string, s: string) {
+    append_file(path, s)
+}
+
+// Tolerant write — best-effort.
+fn safe_write(path: string, s: string) {
+    write_file(path, s)
+}
+
+// Monitor-log entry with timestamp.
+fn mlog(msg: string) {
+    let line = "[" + ts() + "] " + msg + "\n"
+    safe_append(cfg_out, line)
+}
+
+// Split a text blob on "\n" into a list of lines. Never panics.
+fn split_lines(text: string) -> [string] {
+    let n = len(text)
+    if n == 0 { return [] }
+    let mut out = []
+    let mut start = 0
+    let mut i = 0
+    while i < n {
+        if text.substring(i, i + 1) == "\n" {
+            out = out.push(text.substring(start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n { out = out.push(text.substring(start, n)) }
+    return out
+}
+
+// Whitespace split (space, tab, CR, LF).
+fn split_ws(s: string) -> [string] {
+    let n = len(s)
+    let mut parts = []
+    let mut cur = ""
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if ch == " " || ch == "\t" || ch == "\r" || ch == "\n" {
+            if cur != "" { parts = parts.push(cur); cur = "" }
+        } else {
+            cur = cur + ch
+        }
+        i = i + 1
+    }
+    if cur != "" { parts = parts.push(cur) }
+    return parts
+}
+
+// Find "key=" token and return the substring after "=".
+// Returns "" if not found. Tolerant of malformed entries.
+fn extract_kv(line: string, key: string) -> string {
+    let needle = key + "="
+    let idx = line.index_of(needle)
+    if idx < 0 { return "" }
+    let start = idx + len(needle)
+    let n = len(line)
+    let mut j = start
+    while j < n {
+        let ch = line.substring(j, j + 1)
+        if ch == " " || ch == "\t" || ch == "\r" || ch == "\n" {
+            return line.substring(start, j)
+        }
+        j = j + 1
+    }
+    return line.substring(start, n)
+}
+
+// Sentinel: -1.0e18 means "missing / malformed" (eval_loss is always >= 0).
+let FLOAT_MISSING = -1.0e18
+
+fn extract_float(line: string, key: string) -> float {
+    let v = extract_kv(line, key)
+    if v == "" { return FLOAT_MISSING }
+    return to_float(v)
+}
+
+fn extract_int(line: string, key: string) -> int {
+    let v = extract_kv(line, key)
+    if v == "" { return -1 }
+    // "2000/10000" → 2000
+    let slash = v.index_of("/")
+    if slash >= 0 { return to_int(v.substring(0, slash)) }
+    return to_int(v)
+}
+
+fn is_missing(x: float) -> bool {
+    return x <= -1.0e17
+}
+
+// ──────────────────────────────────────────────────────────────
+//  Line handlers
+// ──────────────────────────────────────────────────────────────
+
+// "[train] step=2290/10000 loss=0.0307 lr=4.58e-06 speed=18.6step/min ETA=416min"
+fn handle_train_line(line: string) {
+    let step = extract_int(line, "step")
+    if step >= 0 { st_last_step = step }
+    let loss = extract_float(line, "loss")
+    if !is_missing(loss) { st_last_train_loss = loss }
+}
+
+// "[eval] step=N eval_loss=X best=Y"  (or variants)
+fn handle_eval_line(line: string) {
+    let step = extract_int(line, "step")
+    let ev   = extract_float(line, "eval_loss")
+    if is_missing(ev) {
+        mlog("WARN  malformed eval line: " + line)
+        return
+    }
+    if step >= 0 { st_last_step = step }
+
+    // Keep rolling window of last (plateau_n) eval values for plateau body.
+    st_last_evals = st_last_evals.push(ev)
+    let nw = len(st_last_evals)
+    if nw > cfg_plateau_n {
+        // pop-front
+        let mut tmp = []
+        let mut k = nw - cfg_plateau_n
+        while k < nw { tmp = tmp.push(st_last_evals[k]); k = k + 1 }
+        st_last_evals = tmp
+    }
+
+    let improved = ev < st_best_eval
+    if improved {
+        let prev_best = st_best_eval
+        st_best_eval        = ev
+        st_best_step        = step
+        st_nonimprove_count = 0
+        if prev_best > 1.0e17 {
+            mlog("EVAL  step=" + str(step)
+                 + " eval_loss=" + str(ev)
+                 + " NEW BEST (first eval)")
+        } else {
+            mlog("EVAL  step=" + str(step)
+                 + " eval_loss=" + str(ev)
+                 + " NEW BEST (was " + str(prev_best) + ")")
+        }
+    } else {
+        st_nonimprove_count = st_nonimprove_count + 1
+        mlog("EVAL  step=" + str(step)
+             + " eval_loss=" + str(ev)
+             + " best=" + str(st_best_eval) + "@" + str(st_best_step)
+             + " nonimprove=" + str(st_nonimprove_count))
+    }
+
+    // ── Plateau alarm ───────────────────────────────────────────
+    if st_nonimprove_count >= cfg_plateau_n && !st_plateau_fired {
+        let mut evals_str = ""
+        let ne = len(st_last_evals)
+        let mut ei = 0
+        while ei < ne {
+            if ei > 0 { evals_str = evals_str + ", " }
+            evals_str = evals_str + str(st_last_evals[ei])
+            ei = ei + 1
+        }
+        let body = "PLATEAU ALERT\n"
+                 + "timestamp=" + ts() + "\n"
+                 + "step=" + str(st_last_step) + "\n"
+                 + "best_eval_loss=" + str(st_best_eval) + "\n"
+                 + "best_step=" + str(st_best_step) + "\n"
+                 + "nonimprove_count=" + str(st_nonimprove_count) + "\n"
+                 + "last_" + str(cfg_plateau_n) + "_evals=[" + evals_str + "]\n"
+                 + "threshold=" + str(cfg_plateau_n) + " consecutive non-improving\n"
+        safe_write(cfg_plateau_marker, body)
+        mlog("ALERT plateau detected — wrote " + cfg_plateau_marker)
+        st_plateau_fired = true
+    }
+
+    // ── 32B ready trigger (now split into eval-only + full-gate) ─
+    evaluate_ready_gate()
+}
+
+// Evaluate both the eval-only marker and the full (eval+KR) gate.
+// Called after every [eval] line AND after every kr_quality.log line,
+// so whichever arrives last completes the gate check.
+fn evaluate_ready_gate() {
+    // Eval-only signal: best < target, KR unknown/not-yet-gated.
+    // This marker exists as the legacy pre-KR-gate signal. It is known
+    // to be unreliable on its own (r4 eval=0.0289 but Korean gen
+    // incoherent) — only useful as a milestone, not a launch trigger.
+    if st_best_eval < cfg_best_tgt && !st_ready32b_eval_fired {
+        let body = "READY FOR 32B (EVAL ONLY — DO NOT LAUNCH)\n"
+                 + "timestamp=" + ts() + "\n"
+                 + "step=" + str(st_best_step) + "\n"
+                 + "best_eval_loss=" + str(st_best_eval) + "\n"
+                 + "last_train_loss=" + str(st_last_train_loss) + "\n"
+                 + "target=" + str(cfg_best_tgt) + "\n"
+                 + "note=Eval passed, KR quality NOT verified. Do NOT launch 32B\n"
+                 + "  until READY_FOR_32B (full gate) is created.\n"
+        safe_write(cfg_ready_eval_marker, body)
+        mlog("READY 32B eval-only trigger — wrote " + cfg_ready_eval_marker)
+        st_ready32b_eval_fired = true
+    }
+
+    // Full gate: best < target AND kr composite >= kr_gate.
+    // If --kr-gate is 0.0 we treat it as disabled → fall back to the
+    // eval-only threshold (legacy behaviour).
+    let kr_ok = cfg_kr_gate <= 0.0 || st_latest_kr_composite >= cfg_kr_gate
+    let eval_ok = st_best_eval < cfg_best_tgt
+    if eval_ok && kr_ok && !st_ready32b_fired {
+        st_kr_gate_satisfied = true
+        let kr_display = if st_latest_kr_composite < 0.0 { "disabled" } else { str(st_latest_kr_composite) }
+        let body = "READY FOR 32B (FULL GATE PASSED)\n"
+                 + "timestamp=" + ts() + "\n"
+                 + "step=" + str(st_best_step) + "\n"
+                 + "best_eval_loss=" + str(st_best_eval) + "\n"
+                 + "last_train_loss=" + str(st_last_train_loss) + "\n"
+                 + "target=" + str(cfg_best_tgt) + "\n"
+                 + "kr_composite=" + kr_display + "\n"
+                 + "kr_gate=" + str(cfg_kr_gate) + "\n"
+                 + "kr_step=" + str(st_latest_kr_step) + "\n"
+                 + "kr_verdict=" + st_latest_kr_verdict + "\n"
+                 + "note=14B eval AND Korean quality verified — prepare 32B\n"
+        safe_write(cfg_ready_marker, body)
+        mlog("READY 32B full-gate trigger — wrote " + cfg_ready_marker)
+        st_ready32b_fired = true
+    }
+}
+
+// "[save] /workspace/ckpt_alm_14b_r4/step_N"  (path-style, real format)
+// "[save] step=N path=..."                     (key=value variant)
+//
+// Strategy: prefer key=value (`step=N`), otherwise walk tokens and
+// look for one ending in "step_N" → extract N.
+fn extract_step_from_token(tok: string) -> int {
+    // Find last "step_" then parse digits after.
+    let marker = "step_"
+    let tlen = len(tok)
+    let mlen = len(marker)
+    if tlen < mlen { return -1 }
+    // Hand-rolled last-occurrence search (avoid index_of byte/char skew).
+    let mut i = tlen - mlen
+    let mut found = -1
+    while i >= 0 {
+        if tok.substring(i, i + mlen) == marker { found = i; i = -1 }
+        else { i = i - 1 }
+    }
+    if found < 0 { return -1 }
+    let start = found + mlen
+    // Read digits until non-digit or end.
+    let mut j = start
+    let mut digits = ""
+    while j < tlen {
+        let ch = tok.substring(j, j + 1)
+        if ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4" ||
+           ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9" {
+            digits = digits + ch
+            j = j + 1
+        } else {
+            j = tlen
+        }
+    }
+    if digits == "" { return -1 }
+    return to_int(digits)
+}
+
+fn handle_save_line(line: string) {
+    let mut step = extract_int(line, "step")
+    if step < 0 {
+        // Fall back to path-style: walk tokens looking for step_N
+        let parts = split_ws(line)
+        let np = len(parts)
+        let mut pi = 0
+        while pi < np {
+            let s = extract_step_from_token(parts[pi])
+            if s >= 0 { step = s; pi = np }
+            else { pi = pi + 1 }
+        }
+    }
+    if step < 0 {
+        mlog("SAVE  detected (unknown step): " + line)
+        return
+    }
+    // Deduplicate: if we've already logged this save step, skip silently.
+    if step == st_last_save_step { return }
+    st_last_save_step = step
+    mlog("SAVE  step=" + str(step) + " ckpt_dir=" + cfg_ckpt_dir)
+    // KR sample hook: disabled on this pod (no hexa ALM serving script).
+    // Log once per save that we skipped it.
+    safe_append(cfg_kr, "[" + ts() + "] SKIPPED step=" + str(step)
+                + " reason=no hexa-native ALM LoRA serving script on pod\n")
+}
+
+// "[r2] ✓ uploaded alm14b-r4-sNNNN"   — success (track it)
+// "[r2] uploading ..."                  — in-progress (ignore)
+//
+// We walk tokens looking for "uploaded" (exact token match) and take
+// the next non-empty token as the tag. Token-based matching avoids
+// UTF-8 byte vs. char index mismatches with the checkmark prefix.
+fn handle_r2_line(line: string) {
+    let parts = split_ws(line)
+    let np = len(parts)
+    let mut tag = ""
+    let mut found_uploaded = false
+    let mut pi = 0
+    while pi < np {
+        if parts[pi] == "uploaded" {
+            found_uploaded = true
+            if pi + 1 < np { tag = parts[pi + 1] }
+            pi = np
+        } else {
+            pi = pi + 1
+        }
+    }
+    if !found_uploaded { return }    // skip "uploading" / in-progress lines
+    safe_append(cfg_r2, "[" + ts() + "] " + tag + "  (raw: " + line + ")\n")
+    mlog("R2    upload " + tag)
+}
+
+// Dispatch a single log line to the appropriate handler.
+fn route_line(line: string) {
+    if line == "" { return }
+    if line.starts_with("[eval]") || line.contains("[eval]") {
+        handle_eval_line(line)
+    } else if line.starts_with("[save]") || line.contains("[save]") {
+        handle_save_line(line)
+    } else if line.starts_with("[r2]") || line.contains("[r2]") {
+        handle_r2_line(line)
+    } else if line.starts_with("[train]") || line.contains("[train]") {
+        handle_train_line(line)
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+//  KR quality log — written by serving/kr_quality_gate.hexa
+//  Each line: "[kr_quality] step=N composite=X verdict=V"
+// ──────────────────────────────────────────────────────────────
+
+fn handle_kr_quality_line(line: string) {
+    if line == "" { return }
+    // Tolerant marker: accept "[kr_quality]" anywhere in line.
+    if !line.contains("[kr_quality]") { return }
+    let step = extract_int(line, "step")
+    let comp = extract_float(line, "composite")
+    let verd = extract_kv(line, "verdict")
+    if step < 0 || is_missing(comp) {
+        mlog("WARN  malformed kr_quality line: " + line)
+        return
+    }
+    st_latest_kr_step      = step
+    st_latest_kr_composite = comp
+    st_latest_kr_verdict   = verd
+    let satisfied = comp >= cfg_kr_gate
+    let satisfied_str = if satisfied { "true" } else { "false" }
+    mlog("[kr_gate] step=" + str(step)
+         + " composite=" + str(comp)
+         + " verdict=" + verd
+         + " gate=" + str(cfg_kr_gate)
+         + " satisfied=" + satisfied_str)
+    // Re-evaluate gate — this is the second trigger point after [eval].
+    evaluate_ready_gate()
+}
+
+// Poll /workspace/kr_quality.log from byte offset st_kr_offset.
+// Same safe pattern as the train_r4.log poller:
+//   - tolerant of missing file (passthrough mode)
+//   - handles truncation by resetting offset
+//   - defers partial (no-newline) tails
+fn poll_kr_quality() {
+    if cfg_kr_gate <= 0.0 {
+        // KR gate disabled → skip polling entirely.
+        return
+    }
+    if !file_exists(cfg_kr_qual_log) {
+        if !st_kr_passthrough_logged {
+            mlog("[kr_gate] kr_quality.log not found (passthrough mode) path="
+                 + cfg_kr_qual_log)
+            st_kr_passthrough_logged = true
+        }
+        return
+    }
+    // File exists again — clear the passthrough flag so a subsequent
+    // delete would re-log the warning.
+    st_kr_passthrough_logged = false
+
+    let fsize = file_size(cfg_kr_qual_log)
+    if fsize < st_kr_offset {
+        mlog("[kr_gate] kr_quality.log truncated (size " + str(fsize)
+             + " < offset " + str(st_kr_offset) + ") — restarting from 0")
+        st_kr_offset = 0
+    }
+    if fsize == st_kr_offset { return }
+
+    let full = read_file(cfg_kr_qual_log)
+    let bytes = bytes_encode(full)
+    let total = len(bytes)
+    let mut start = st_kr_offset
+    if start < 0 { start = 0 }
+    if start > total { start = total }
+
+    let tail_bytes = bytes.slice(start, total)
+    let tail_n = len(tail_bytes)
+    let mut consume_end = total
+    if tail_n > 0 && tail_bytes[tail_n - 1] != 10 {
+        let last_nl = byte_last_index_of_newline(tail_bytes)
+        if last_nl < 0 { return }     // partial line, wait for more
+        consume_end = start + last_nl + 1
+    }
+
+    let mut line_start = start
+    while line_start < consume_end {
+        let nl_pos = byte_index_of_newline(bytes, line_start)
+        if nl_pos < 0 || nl_pos >= consume_end {
+            line_start = consume_end
+        } else {
+            if nl_pos > line_start {
+                let sub = bytes.slice(line_start, nl_pos)
+                let s = bytes_decode(sub)
+                handle_kr_quality_line(s)
+            }
+            line_start = nl_pos + 1
+        }
+    }
+    st_kr_offset = consume_end
+}
+
+// ──────────────────────────────────────────────────────────────
+//  State persistence — durable across daemon restarts
+// ──────────────────────────────────────────────────────────────
+
+fn save_state() {
+    let body = "offset="              + str(st_offset)              + "\n"
+             + "last_mtime="          + str(st_last_mtime)          + "\n"
+             + "best_eval="           + str(st_best_eval)           + "\n"
+             + "best_step="           + str(st_best_step)           + "\n"
+             + "last_step="           + str(st_last_step)           + "\n"
+             + "nonimprove_count="    + str(st_nonimprove_count)    + "\n"
+             + "plateau_fired="       + str(st_plateau_fired)       + "\n"
+             + "ready32b_fired="      + str(st_ready32b_fired)      + "\n"
+             + "ready32b_eval_fired=" + str(st_ready32b_eval_fired) + "\n"
+             + "poll_count="          + str(st_poll_count)          + "\n"
+             + "last_train_loss="     + str(st_last_train_loss)     + "\n"
+             + "last_save_step="      + str(st_last_save_step)      + "\n"
+             + "latest_kr_composite=" + str(st_latest_kr_composite) + "\n"
+             + "latest_kr_step="      + str(st_latest_kr_step)      + "\n"
+             + "latest_kr_verdict="   + st_latest_kr_verdict        + "\n"
+             + "kr_gate_satisfied="   + str(st_kr_gate_satisfied)   + "\n"
+             + "kr_offset="           + str(st_kr_offset)           + "\n"
+    safe_write(cfg_state_path, body)
+}
+
+fn load_state() {
+    if !file_exists(cfg_state_path) { return }
+    let text = read_file(cfg_state_path)
+    let lines = split_lines(text)
+    let n = len(lines)
+    let mut i = 0
+    while i < n {
+        let ln = lines[i]
+        let eq = ln.index_of("=")
+        if eq > 0 {
+            let k = ln.substring(0, eq)
+            let v = ln.substring(eq + 1, len(ln))
+            if k == "offset"              { st_offset              = to_int(v) }
+            if k == "last_mtime"          { st_last_mtime          = to_int(v) }
+            if k == "best_eval"           { st_best_eval           = to_float(v) }
+            if k == "best_step"           { st_best_step           = to_int(v) }
+            if k == "last_step"           { st_last_step           = to_int(v) }
+            if k == "nonimprove_count"    { st_nonimprove_count    = to_int(v) }
+            if k == "plateau_fired"       { st_plateau_fired       = (v == "true") }
+            if k == "ready32b_fired"      { st_ready32b_fired      = (v == "true") }
+            if k == "ready32b_eval_fired" { st_ready32b_eval_fired = (v == "true") }
+            if k == "poll_count"          { st_poll_count          = to_int(v) }
+            if k == "last_train_loss"     { st_last_train_loss     = to_float(v) }
+            if k == "last_save_step"      { st_last_save_step      = to_int(v) }
+            if k == "latest_kr_composite" { st_latest_kr_composite = to_float(v) }
+            if k == "latest_kr_step"      { st_latest_kr_step      = to_int(v) }
+            if k == "latest_kr_verdict"   { st_latest_kr_verdict   = v }
+            if k == "kr_gate_satisfied"   { st_kr_gate_satisfied   = (v == "true") }
+            if k == "kr_offset"           { st_kr_offset           = to_int(v) }
+        }
+        i = i + 1
+    }
+}
+
+// Query file mtime (epoch seconds) via `stat`. Returns 0 on error.
+// Using `stat -c` (GNU coreutils — standard on the H100 Ubuntu pod).
+fn file_mtime(path: string) -> int {
+    if !file_exists(path) { return 0 }
+    let out = exec("stat -c %Y '" + path + "' 2>/dev/null || echo 0")
+    let trimmed = out.trim()
+    if trimmed == "" { return 0 }
+    return to_int(trimmed)
+}
+
+// ──────────────────────────────────────────────────────────────
+//  Poll cycle — read new bytes from log, dispatch every line
+// ──────────────────────────────────────────────────────────────
+
+// Byte-array helpers — hexa strings mix char vs. byte indexing depending
+// on the method used, so we do all slicing in raw byte space and decode
+// back to string at the line level. This is robust against UTF-8 chars
+// (e.g. the ✓ and → that rclone prints in [r2] lines).
+
+fn byte_index_of_newline(bytes: array, start: int) -> int {
+    let n = len(bytes)
+    let mut i = start
+    while i < n {
+        if bytes[i] == 10 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn byte_last_index_of_newline(bytes: array) -> int {
+    let n = len(bytes)
+    let mut i = n - 1
+    while i >= 0 {
+        if bytes[i] == 10 { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+// Decode a byte sub-range into a string and feed it through route_line.
+fn dispatch_byte_slice(bytes: array, start: int, end: int) {
+    if end <= start { return }
+    let sub = bytes.slice(start, end)
+    let s = bytes_decode(sub)
+    route_line(s)
+}
+
+fn poll_once() {
+    st_poll_count = st_poll_count + 1
+
+    // Poll KR quality log FIRST so that any new composite is visible
+    // before we re-evaluate the ready gate via [eval] lines. It is also
+    // safe to run the KR poller even when the training log is missing.
+    poll_kr_quality()
+
+    if !file_exists(cfg_log) {
+        mlog("POLL  #" + str(st_poll_count) + " log missing: " + cfg_log)
+        return
+    }
+
+    let fsize  = file_size(cfg_log)
+    let fmtime = file_mtime(cfg_log)
+
+    // Rotation / truncation → restart from 0
+    if fsize < st_offset {
+        mlog("POLL  #" + str(st_poll_count)
+             + " log truncated/rotated (size " + str(fsize)
+             + " < offset " + str(st_offset) + ") — restarting from 0")
+        st_offset = 0
+    }
+
+    if fsize == st_offset {
+        st_last_mtime = fmtime
+        mlog("POLL  #" + str(st_poll_count)
+             + " idle size=" + str(fsize)
+             + " last_step=" + str(st_last_step)
+             + " best=" + str(st_best_eval) + "@" + str(st_best_step)
+             + " nonimprove=" + str(st_nonimprove_count))
+        return
+    }
+
+    // Read full file, convert to byte array, slice the new tail in bytes.
+    // train_r4.log is small (< 100 MB over a full run) and we poll every
+    // 60 s — simpler and more robust than seek-based reads, especially
+    // across rotation and partial-line flushes.
+    let full = read_file(cfg_log)
+    let bytes = bytes_encode(full)
+    let total = len(bytes)
+    let mut start = st_offset
+    if start < 0 { start = 0 }
+    if start > total { start = total }
+
+    // Guard against partial final line: scan the tail for the last "\n"
+    // (byte 0x0A). If none found, defer — wait for more data next poll.
+    let tail_bytes = bytes.slice(start, total)
+    let tail_n = len(tail_bytes)
+    let mut consume_end = total
+    if tail_n > 0 && tail_bytes[tail_n - 1] != 10 {
+        let last_nl = byte_last_index_of_newline(tail_bytes)
+        if last_nl < 0 {
+            mlog("POLL  #" + str(st_poll_count)
+                 + " partial line (no newline) — deferring "
+                 + str(tail_n) + " bytes")
+            st_last_mtime = fmtime
+            return
+        } else {
+            consume_end = start + last_nl + 1
+        }
+    }
+
+    // Walk the consumable byte range line-by-line.
+    let mut line_start = start
+    let mut nl_count = 0
+    while line_start < consume_end {
+        let nl_pos = byte_index_of_newline(bytes, line_start)
+        if nl_pos < 0 || nl_pos >= consume_end {
+            // shouldn't happen because consume_end ends at a newline,
+            // but defensively stop here.
+            line_start = consume_end
+        } else {
+            dispatch_byte_slice(bytes, line_start, nl_pos)
+            line_start = nl_pos + 1
+            nl_count = nl_count + 1
+        }
+    }
+
+    st_offset     = consume_end
+    st_last_mtime = fmtime
+
+    mlog("POLL  #" + str(st_poll_count)
+         + " consumed=" + str(nl_count) + " lines"
+         + " offset=" + str(st_offset) + "/" + str(total)
+         + " last_step=" + str(st_last_step)
+         + " best=" + str(st_best_eval) + "@" + str(st_best_step)
+         + " nonimprove=" + str(st_nonimprove_count))
+}
+
+// ──────────────────────────────────────────────────────────────
+//  Entry point
+// ──────────────────────────────────────────────────────────────
+
+fn main() {
+    parse_args()
+    load_state()
+
+    mlog("START monitor_alm_r4 daemon pid=$$ log=" + cfg_log
+         + " interval=" + str(cfg_interval) + "s"
+         + " plateau_n=" + str(cfg_plateau_n)
+         + " best_target=" + str(cfg_best_tgt)
+         + " kr_gate=" + str(cfg_kr_gate)
+         + " kr_qual_log=" + cfg_kr_qual_log
+         + " once=" + str(cfg_once))
+    let best_display = if st_best_eval > 1.0e17 { "none" } else { str(st_best_eval) + "@" + str(st_best_step) }
+    mlog("START restored state offset=" + str(st_offset)
+         + " best=" + best_display
+         + " nonimprove=" + str(st_nonimprove_count)
+         + " kr_offset=" + str(st_kr_offset)
+         + " latest_kr=" + str(st_latest_kr_composite) + "@" + str(st_latest_kr_step))
+    mlog("START kr_sample_hook=SKIPPED (no hexa-native ALM LoRA serving on pod)")
+
+    if cfg_once {
+        poll_once()
+        save_state()
+        mlog("EXIT  once mode — single pass complete")
+        return
+    }
+
+    while true {
+        poll_once()
+        save_state()
+        sleep(cfg_interval * 1000)
+    }
+}
+
+let _ = main()

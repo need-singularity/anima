@@ -1,0 +1,922 @@
+// ═══════════════════════════════════════════════════════════════
+//  serving/kr_quality_score.hexa — hexa-native Korean quality scorer
+//
+//  PURPOSE
+//    eval_loss alone is NOT a valid quality signal for ALM 14B r4:
+//    at step 2000 eval_loss looks excellent but generations are
+//    incoherent (broken UTF-8 surrogates, CJK leakage, English
+//    fragments).  This module scores generated text on five
+//    measurable dimensions and emits a composite verdict.
+//
+//  DIMENSIONS (each 0.0 .. 1.0, higher = better)
+//    1. utf8_valid_ratio  — bytes that decode as valid UTF-8
+//                           (U+FFFD counts as INVALID)
+//    2. korean_char_ratio — share of meaningful chars that are Hangul
+//    3. leakage_penalty   — 1 - (cjk + english runs) / meaningful
+//    4. no_replacement    — 1 - min(1, repl_rate_per_10_chars)
+//                           repl_rate = 10 * replacement_count / total_chars
+//                           i.e. the spec's "/10" is interpreted as a
+//                           density over 10 chars rather than an
+//                           absolute count of 10 — this is the only
+//                           deviation from the literal spec formula
+//                           and is required to flag the known-bad
+//                           step_2000 baseline as INCOHERENT.  The
+//                           absolute form lets a 48-token generation
+//                           with 8 replacement chars still pass,
+//                           which defeats the point of the scorer.
+//    5. composite_score   — weighted mean (0.25/0.35/0.25/0.15)
+//
+//  VERDICT
+//    composite >= 0.70 → COHERENT
+//    0.40 .. 0.70       → PARTIAL
+//    < 0.40             → INCOHERENT
+//
+//  CLI
+//    hexa serving/kr_quality_score.hexa --test
+//      Runs the 5 known-bad step_2000 samples from Agent E's report,
+//      prints a scoring table, and exits.  Used as a unit test of the
+//      scorer against a known-bad baseline.
+//
+//    hexa serving/kr_quality_score.hexa --gen "문자열"
+//      Scores a single generation string.
+//
+//    hexa serving/kr_quality_score.hexa --log /path/to/kr_samples.log
+//      Parses a kr_samples.log and prints the per-ckpt summary.
+//
+//  CONSTRAINTS (from feedback_hexa_string_api.md)
+//    * no .split / .contains / .find / .char_at / .substr
+//    * s.index_of returns BYTE position, s.substring uses CHAR positions
+//      → we stay in byte space (bytes_encode / bytes_decode) end-to-end
+//    * no hex literals (0xFF) — all byte constants in decimal
+//    * no struct literal construction — outputs live in named globals
+//      filled by score_generation() and read back after the call
+//    * no python / rust / bash inside the scorer
+//
+//  ENCODING FACTS
+//    Hangul syllables  U+AC00..U+D7AF  =  44032..55215
+//    Hangul Jamo       U+1100..U+11FF  =   4352.. 4607
+//    Hangul compat     U+3130..U+318F  =  12592..12687
+//    Hangul ext-A      U+A960..U+A97F  =  43360..43391
+//    CJK ideographs    U+4E00..U+9FFF  =  19968..40959
+//    Replacement char  U+FFFD          =  65533
+//    ASCII A..Z / a..z                 =  65..90 / 97..122
+// ═══════════════════════════════════════════════════════════════
+
+// ── Unicode block constants ────────────────────────────────────
+let HS_LO = 44032    // U+AC00 Hangul syllables low
+let HS_HI = 55215    // U+D7AF Hangul syllables high
+let HJ_LO = 4352     // U+1100 Hangul Jamo low
+let HJ_HI = 4607     // U+11FF Hangul Jamo high
+let HC_LO = 12592    // U+3130 Hangul compat jamo low
+let HC_HI = 12687    // U+318F Hangul compat jamo high
+let HE_LO = 43360    // U+A960 Hangul Jamo extended-A low
+let HE_HI = 43391    // U+A97F Hangul Jamo extended-A high
+let CJK_LO = 19968   // U+4E00 CJK Unified Ideographs low
+let CJK_HI = 40959   // U+9FFF CJK Unified Ideographs high
+let REPLACEMENT = 65533   // U+FFFD
+
+// Verdict thresholds
+let COHERENT_MIN  = 0.70
+let PARTIAL_MIN   = 0.40
+
+// Composite weights
+let W_UTF8    = 0.25
+let W_KOREAN  = 0.35
+let W_LEAKAGE = 0.25
+let W_NOREP   = 0.15
+
+// Target thresholds (for diagnostic "worst dimension" labelling)
+let TGT_UTF8    = 0.95
+let TGT_KOREAN  = 0.60
+let TGT_LEAKAGE = 0.85
+let TGT_NOREP   = 0.90
+
+// Critical floors — if ANY single dimension falls below its floor,
+// the verdict is forced to INCOHERENT regardless of composite score.
+// This is the "any red = red" gate required by the known-bad
+// step_2000 baseline (where composite hovers near 0.73-0.77 but
+// several individual dimensions are deeply broken — specifically
+// utf8 < 0.92 and no_replacement < 0.50 due to 5-9 U+FFFD chars in
+// 48-token generations).
+let CRIT_UTF8    = 0.92
+let CRIT_KOREAN  = 0.55
+let CRIT_LEAKAGE = 0.75
+let CRIT_NOREP   = 0.55
+
+// ── Output slots (filled by score_generation) ──────────────────
+// Using globals because the current hexa build does not parse
+// struct literals (`return {...}`) at either statement or
+// expression position.  Callers read these names immediately after
+// calling score_generation() on a single input.
+
+let mut sc_utf8          = 0.0
+let mut sc_korean        = 0.0
+let mut sc_leakage       = 0.0
+let mut sc_norep         = 0.0
+let mut sc_composite     = 0.0
+let mut sc_verdict       = "INCOHERENT"
+let mut sc_total_bytes   = 0
+let mut sc_total_chars   = 0
+let mut sc_hangul        = 0
+let mut sc_cjk           = 0
+let mut sc_latin_run     = 0
+let mut sc_repl          = 0
+let mut sc_worst         = "none"
+
+// ── Small helpers ──────────────────────────────────────────────
+
+fn is_hangul_cp(cp) {
+    if cp >= HS_LO && cp <= HS_HI { return true }
+    if cp >= HJ_LO && cp <= HJ_HI { return true }
+    if cp >= HC_LO && cp <= HC_HI { return true }
+    if cp >= HE_LO && cp <= HE_HI { return true }
+    return false
+}
+
+fn is_cjk_cp(cp) {
+    if cp >= CJK_LO && cp <= CJK_HI { return true }
+    return false
+}
+
+fn is_ascii_alpha_cp(cp) {
+    if cp >= 65 && cp <= 90  { return true }  // A..Z
+    if cp >= 97 && cp <= 122 { return true }  // a..z
+    return false
+}
+
+fn is_ascii_digit_cp(cp) {
+    if cp >= 48 && cp <= 57 { return true }
+    return false
+}
+
+fn is_ascii_space_or_punct(cp) {
+    if cp == 32 || cp == 9 || cp == 10 || cp == 13 { return true }
+    if cp >= 33 && cp <= 47  { return true }   // ! .. /
+    if cp >= 58 && cp <= 64  { return true }   // : .. @
+    if cp >= 91 && cp <= 96  { return true }   // [ .. `
+    if cp >= 123 && cp <= 126 { return true }  // { .. ~
+    return false
+}
+
+fn min_f(a, b) { if a < b { return a } else { return b } }
+fn max_f(a, b) { if a > b { return a } else { return b } }
+
+// Round to 3 decimals for display only.
+fn round3(x) {
+    let shifted = x * 1000.0
+    let r = to_int(shifted + 0.5)
+    return to_float(r) / 1000.0
+}
+
+// Pad a string with trailing spaces up to approx `width` display cells
+// (byte-count as a rough proxy; good enough for tabular output).
+fn pad_right(s, width) {
+    let blen = len(s)
+    let mut out = s
+    let mut i = blen
+    while i < width { out = out + " "; i = i + 1 }
+    return out
+}
+
+// ── Byte-level UTF-8 scanner ───────────────────────────────────
+//
+// decode_bytes walks the byte array and fills four parallel lists:
+//   scan_cps     : code points (int)
+//   scan_widths  : advance in bytes for each emitted code point
+//   scan_valids  : true iff the code point is valid UTF-8 AND not U+FFFD
+// plus two totals:
+//   scan_n_valid_bytes : sum of widths where valid = true
+//   scan_total_bytes   : len(bytes) (pass-through)
+//
+// Invalid sequences advance exactly 1 byte and emit REPLACEMENT.
+//
+// IMPORTANT: U+FFFD (REPLACEMENT CHAR) is treated as INVALID for the
+// utf8_valid_ratio dimension.  Technically U+FFFD is a valid UTF-8
+// encoding, but in our context it is ALWAYS a post-tokenizer decode
+// failure (the trainer/tokenizer emitted bytes that could not map to
+// a proper code point and got replaced).  Counting it as "valid"
+// would hide exactly the failure mode this scorer exists to detect.
+
+let mut scan_cps = []
+let mut scan_widths = []
+let mut scan_valids = []
+let mut scan_n_valid_bytes = 0
+let mut scan_total_bytes = 0
+
+fn decode_bytes(bytes) {
+    scan_cps = []
+    scan_widths = []
+    scan_valids = []
+    scan_n_valid_bytes = 0
+    scan_total_bytes = len(bytes)
+    let n = scan_total_bytes
+    let mut i = 0
+    while i < n {
+        let c = bytes[i]
+        let mut cp_bytes = 1
+        let mut ok = true
+        let mut cp = REPLACEMENT
+
+        if c < 128 {
+            cp_bytes = 1
+            cp = c
+            ok = true
+        } else if c >= 192 && c < 224 {
+            cp_bytes = 2
+            if i + 1 < n && bytes[i + 1] >= 128 && bytes[i + 1] < 192 {
+                cp = (c - 192) * 64 + (bytes[i + 1] - 128)
+                if cp < 128 { ok = false; cp = REPLACEMENT }
+                else { ok = true }
+            } else {
+                ok = false; cp = REPLACEMENT
+            }
+        } else if c >= 224 && c < 240 {
+            cp_bytes = 3
+            if i + 2 < n &&
+               bytes[i + 1] >= 128 && bytes[i + 1] < 192 &&
+               bytes[i + 2] >= 128 && bytes[i + 2] < 192 {
+                cp = (c - 224) * 4096 + (bytes[i + 1] - 128) * 64 + (bytes[i + 2] - 128)
+                if cp < 2048 { ok = false; cp = REPLACEMENT }
+                else if cp >= 55296 && cp <= 57343 { ok = false; cp = REPLACEMENT }
+                // U+FFFD (65533) is literal REPLACEMENT from the
+                // decoder upstream; treat as invalid for scoring.
+                else if cp == REPLACEMENT { ok = false }
+                else { ok = true }
+            } else {
+                ok = false; cp = REPLACEMENT
+            }
+        } else if c >= 240 && c < 248 {
+            cp_bytes = 4
+            if i + 3 < n &&
+               bytes[i + 1] >= 128 && bytes[i + 1] < 192 &&
+               bytes[i + 2] >= 128 && bytes[i + 2] < 192 &&
+               bytes[i + 3] >= 128 && bytes[i + 3] < 192 {
+                cp = (c - 240) * 262144 + (bytes[i + 1] - 128) * 4096
+                     + (bytes[i + 2] - 128) * 64 + (bytes[i + 3] - 128)
+                if cp < 65536 { ok = false; cp = REPLACEMENT }
+                else if cp > 1114111 { ok = false; cp = REPLACEMENT }
+                else { ok = true }
+            } else {
+                ok = false; cp = REPLACEMENT
+            }
+        } else {
+            cp_bytes = 1
+            ok = false
+            cp = REPLACEMENT
+        }
+
+        // Byte-advance policy:
+        //   valid code point → advance cp_bytes
+        //   U+FFFD from a well-formed 3-byte EF BF BD → advance 3
+        //     (we want "1 replacement char, 3 invalid bytes")
+        //   malformed sequence → advance 1 (so each stray byte
+        //     counts as its own invalid slot and we don't skip
+        //     legitimate data behind it)
+        let mut advance = cp_bytes
+        if !ok {
+            // Stay at cp_bytes only when the raw bytes were a
+            // structurally-valid 3-byte U+FFFD (the common decoder-
+            // fallback case).  Otherwise rewind to 1.
+            if cp == REPLACEMENT && cp_bytes == 3 &&
+               c == 239 && i + 2 < n &&
+               bytes[i + 1] == 191 && bytes[i + 2] == 189 {
+                advance = 3
+            } else {
+                advance = 1
+            }
+        }
+
+        scan_cps = scan_cps.push(cp)
+        scan_widths = scan_widths.push(advance)
+        scan_valids = scan_valids.push(ok)
+        if ok { scan_n_valid_bytes = scan_n_valid_bytes + advance }
+        i = i + advance
+    }
+}
+
+// ── Scoring core ───────────────────────────────────────────────
+//
+// Fills the sc_* globals from `gen_bytes` (an array of ints 0..255).
+// Use score_string(s) as the plain-string wrapper.
+
+fn score_generation(gen_bytes) {
+    let total_bytes = len(gen_bytes)
+    sc_total_bytes = total_bytes
+    if total_bytes == 0 {
+        sc_utf8 = 0.0
+        sc_korean = 0.0
+        sc_leakage = 0.0
+        sc_norep = 0.0
+        sc_composite = 0.0
+        sc_verdict = "INCOHERENT"
+        sc_total_chars = 0
+        sc_hangul = 0
+        sc_cjk = 0
+        sc_latin_run = 0
+        sc_repl = 0
+        sc_worst = "empty"
+        return
+    }
+
+    decode_bytes(gen_bytes)
+    let n = len(scan_cps)
+
+    // 1. utf8_valid_ratio
+    let mut utf8_ratio = 0.0
+    if total_bytes > 0 {
+        utf8_ratio = to_float(scan_n_valid_bytes) / to_float(total_bytes)
+    }
+
+    // 2/3/4. walk code points + latin run detection
+    let mut hangul = 0
+    let mut cjk = 0
+    let mut repl = 0
+    let mut meaningful = 0
+    let mut total_chars = 0
+    let mut latin_run_chars = 0
+
+    let mut latin_flags = []
+    let mut i = 0
+    while i < n {
+        let cp = scan_cps[i]
+        let ok = scan_valids[i]
+        total_chars = total_chars + 1
+        let mut is_latin = false
+        if !ok || cp == REPLACEMENT {
+            repl = repl + 1
+            meaningful = meaningful + 1
+        } else if is_hangul_cp(cp) {
+            hangul = hangul + 1
+            meaningful = meaningful + 1
+        } else if is_cjk_cp(cp) {
+            cjk = cjk + 1
+            meaningful = meaningful + 1
+        } else if is_ascii_alpha_cp(cp) {
+            is_latin = true
+        } else if is_ascii_digit_cp(cp) {
+            meaningful = meaningful + 1
+        } else if is_ascii_space_or_punct(cp) {
+            // skip — excluded from meaningful denom
+        } else {
+            meaningful = meaningful + 1
+        }
+        latin_flags = latin_flags.push(is_latin)
+        i = i + 1
+    }
+
+    // Scan for latin runs of length >= 3.
+    let mf = len(latin_flags)
+    let mut run = 0
+    let mut j = 0
+    while j < mf {
+        if latin_flags[j] {
+            run = run + 1
+        } else {
+            if run >= 3 { latin_run_chars = latin_run_chars + run }
+            run = 0
+        }
+        j = j + 1
+    }
+    if run >= 3 { latin_run_chars = latin_run_chars + run }
+
+    // Each qualifying latin-run char counts toward both meaningful
+    // and leakage numerator.
+    meaningful = meaningful + latin_run_chars
+
+    // 2. korean_char_ratio
+    let mut korean_ratio = 0.0
+    if meaningful > 0 {
+        korean_ratio = to_float(hangul) / to_float(meaningful)
+    }
+
+    // 3. leakage_penalty = 1 - (cjk + latin_run) / meaningful
+    let mut leakage = 1.0
+    if meaningful > 0 {
+        let leak = to_float(cjk + latin_run_chars) / to_float(meaningful)
+        leakage = 1.0 - leak
+    }
+    if leakage < 0.0 { leakage = 0.0 }
+
+    // 4. no_replacement = 1 - min(1, repl_rate_per_10_chars)
+    //    Interpret the spec's "/10" as a rate per 10 chars so that
+    //    short generations are not under-penalised.  A 48-token
+    //    gen with 8 replacements is now ~1.67 → clamp → full penalty,
+    //    which matches the intended behaviour on the step_2000
+    //    known-bad baseline.  Fallback to absolute form when the
+    //    generation has fewer than 10 chars (density undefined).
+    let mut rr = 0.0
+    if total_chars >= 10 {
+        rr = 10.0 * to_float(repl) / to_float(total_chars)
+    } else {
+        rr = to_float(repl) / 10.0
+    }
+    let clamp = min_f(1.0, rr)
+    let no_rep = 1.0 - clamp
+
+    // Clamp everything to [0,1]
+    if utf8_ratio   < 0.0 { utf8_ratio   = 0.0 }
+    if utf8_ratio   > 1.0 { utf8_ratio   = 1.0 }
+    if korean_ratio < 0.0 { korean_ratio = 0.0 }
+    if korean_ratio > 1.0 { korean_ratio = 1.0 }
+    if leakage      < 0.0 { leakage      = 0.0 }
+    if leakage      > 1.0 { leakage      = 1.0 }
+    let mut nr = no_rep
+    if nr < 0.0 { nr = 0.0 }
+    if nr > 1.0 { nr = 1.0 }
+
+    let composite = W_UTF8 * utf8_ratio
+                  + W_KOREAN * korean_ratio
+                  + W_LEAKAGE * leakage
+                  + W_NOREP * nr
+
+    // Threshold verdict — base assignment from composite score.
+    let mut verdict = "INCOHERENT"
+    if composite >= COHERENT_MIN { verdict = "COHERENT" }
+    else if composite >= PARTIAL_MIN { verdict = "PARTIAL" }
+
+    // Critical floor gate — any single dimension below its critical
+    // floor downgrades the verdict by one step (COHERENT→PARTIAL,
+    // PARTIAL→INCOHERENT).  This catches the case where a broken
+    // generation has 3 strong dimensions + 1 catastrophic dimension
+    // and would otherwise average to 0.73 (spuriously COHERENT).
+    let mut floor_fail = false
+    if utf8_ratio   < CRIT_UTF8    { floor_fail = true }
+    if korean_ratio < CRIT_KOREAN  { floor_fail = true }
+    if leakage      < CRIT_LEAKAGE { floor_fail = true }
+    if nr           < CRIT_NOREP   { floor_fail = true }
+    if floor_fail {
+        if verdict == "COHERENT" { verdict = "PARTIAL" }
+        else if verdict == "PARTIAL" { verdict = "INCOHERENT" }
+    }
+
+    // Double-floor: if TWO or more dimensions fail their critical
+    // floors, force INCOHERENT directly.  Step_2000 samples have
+    // both utf8 (< 0.90) and no_replacement (< 0.50) failing, which
+    // is the correct signature of catastrophic decode failure.
+    let mut floor_count = 0
+    if utf8_ratio   < CRIT_UTF8    { floor_count = floor_count + 1 }
+    if korean_ratio < CRIT_KOREAN  { floor_count = floor_count + 1 }
+    if leakage      < CRIT_LEAKAGE { floor_count = floor_count + 1 }
+    if nr           < CRIT_NOREP   { floor_count = floor_count + 1 }
+    if floor_count >= 2 { verdict = "INCOHERENT" }
+
+    // worst_dimension = dimension with largest gap below target
+    let gap_utf8    = TGT_UTF8    - utf8_ratio
+    let gap_korean  = TGT_KOREAN  - korean_ratio
+    let gap_leakage = TGT_LEAKAGE - leakage
+    let gap_norep   = TGT_NOREP   - nr
+    let mut worst = "utf8"
+    let mut worst_gap = gap_utf8
+    if gap_korean > worst_gap { worst = "korean"; worst_gap = gap_korean }
+    if gap_leakage > worst_gap { worst = "leakage"; worst_gap = gap_leakage }
+    if gap_norep > worst_gap { worst = "replacement"; worst_gap = gap_norep }
+    if worst_gap <= 0.0 { worst = "none" }
+
+    sc_utf8        = utf8_ratio
+    sc_korean      = korean_ratio
+    sc_leakage     = leakage
+    sc_norep       = nr
+    sc_composite   = composite
+    sc_verdict     = verdict
+    sc_total_chars = total_chars
+    sc_hangul      = hangul
+    sc_cjk         = cjk
+    sc_latin_run   = latin_run_chars
+    sc_repl        = repl
+    sc_worst       = worst
+}
+
+// Convenience wrapper — score a plain string.
+fn score_string(s) {
+    score_generation(bytes_encode(s))
+}
+
+// ── Per-ckpt sample store ──────────────────────────────────────
+//
+// Parallel lists keyed by sample index (also avoiding struct literals).
+//   smp_step[i]      int
+//   smp_prompt[i]    string
+//   smp_gen[i]       string
+//   smp_composite[i] float
+//   smp_verdict[i]   string
+//   smp_worst[i]     string
+//   smp_utf8[i]      float
+//   smp_korean[i]    float
+//   smp_leakage[i]   float
+//   smp_norep[i]     float
+
+let mut smp_step = []
+let mut smp_prompt = []
+let mut smp_gen = []
+let mut smp_composite = []
+let mut smp_verdict = []
+let mut smp_worst = []
+let mut smp_utf8 = []
+let mut smp_korean = []
+let mut smp_leakage = []
+let mut smp_norep = []
+
+fn samples_reset() {
+    smp_step = []
+    smp_prompt = []
+    smp_gen = []
+    smp_composite = []
+    smp_verdict = []
+    smp_worst = []
+    smp_utf8 = []
+    smp_korean = []
+    smp_leakage = []
+    smp_norep = []
+}
+
+fn samples_add(step, prompt, gen) {
+    score_string(gen)
+    smp_step = smp_step.push(step)
+    smp_prompt = smp_prompt.push(prompt)
+    smp_gen = smp_gen.push(gen)
+    smp_composite = smp_composite.push(sc_composite)
+    smp_verdict = smp_verdict.push(sc_verdict)
+    smp_worst = smp_worst.push(sc_worst)
+    smp_utf8 = smp_utf8.push(sc_utf8)
+    smp_korean = smp_korean.push(sc_korean)
+    smp_leakage = smp_leakage.push(sc_leakage)
+    smp_norep = smp_norep.push(sc_norep)
+}
+
+// ── Summary aggregator ─────────────────────────────────────────
+//
+// Fills sum_* globals with stats over the subset of samples whose
+// smp_step equals `target_step`.  Filter by target_step = -1 to
+// aggregate over all samples currently loaded.
+
+let mut sum_n = 0
+let mut sum_avg = 0.0
+let mut sum_min = 0.0
+let mut sum_max = 0.0
+let mut sum_verdict = "INCOHERENT"
+let mut sum_n_coh = 0
+let mut sum_n_par = 0
+let mut sum_n_inc = 0
+
+fn summarize_step(target_step) {
+    let n = len(smp_step)
+    sum_n = 0
+    sum_n_coh = 0
+    sum_n_par = 0
+    sum_n_inc = 0
+    sum_avg = 0.0
+    sum_min = 2.0
+    sum_max = -1.0
+    sum_verdict = "INCOHERENT"
+    let mut total = 0.0
+    let mut i = 0
+    while i < n {
+        if target_step < 0 || smp_step[i] == target_step {
+            let c = smp_composite[i]
+            total = total + c
+            if c < sum_min { sum_min = c }
+            if c > sum_max { sum_max = c }
+            sum_n = sum_n + 1
+            let v = smp_verdict[i]
+            if v == "COHERENT"   { sum_n_coh = sum_n_coh + 1 }
+            if v == "PARTIAL"    { sum_n_par = sum_n_par + 1 }
+            if v == "INCOHERENT" { sum_n_inc = sum_n_inc + 1 }
+        }
+        i = i + 1
+    }
+    if sum_n == 0 {
+        sum_min = 0.0
+        sum_max = 0.0
+        sum_avg = 0.0
+        return
+    }
+    sum_avg = total / to_float(sum_n)
+
+    // Ckpt-level verdict — majority rule with INCOHERENT precedence.
+    //   * any INCOHERENT sample in the majority → ckpt INCOHERENT
+    //   * otherwise majority COHERENT → ckpt COHERENT
+    //   * otherwise → PARTIAL
+    // Stricter form: if ANY sample is INCOHERENT, the ckpt is AT
+    // MOST PARTIAL (never COHERENT) — a single broken sample means
+    // the model is not reliably coherent.  To be promoted to
+    // COHERENT, the ckpt needs ZERO INCOHERENT and majority COHERENT.
+    if sum_n_inc >= sum_n_coh && sum_n_inc >= sum_n_par {
+        sum_verdict = "INCOHERENT"
+    } else if sum_n_inc == 0 && sum_n_coh >= sum_n_par && sum_n_coh > 0 {
+        sum_verdict = "COHERENT"
+    } else {
+        sum_verdict = "PARTIAL"
+    }
+}
+
+// ── kr_samples.log parser ──────────────────────────────────────
+//
+// Log format (from serving/kr_sample_at_ckpt.hexa):
+//   [STAMP] [kr_sample] BEGIN step=N ckpt=PATH
+//   [STAMP] [kr_sample] step=N prompt="..." gen="..."
+//   ...
+//   [STAMP] [kr_sample] END step=N
+//
+// We parse in byte space: find lines that contain both `prompt="`
+// and ` gen="` and carve out each value between its opening
+// `"=` marker and the next `"` terminator.
+
+fn byte_index_of(bytes, needle, start) {
+    let n = len(bytes)
+    let m = len(needle)
+    if m == 0 { return start }
+    if m > n - start { return -1 }
+    let mut i = start
+    while i + m <= n {
+        let mut k = 0
+        let mut eq = true
+        while k < m {
+            if bytes[i + k] != needle[k] { eq = false; k = m }
+            else { k = k + 1 }
+        }
+        if eq { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn bytes_slice_to_string(bytes, start, end) {
+    if end <= start { return "" }
+    let sub = bytes.slice(start, end)
+    return bytes_decode(sub)
+}
+
+// Split raw file bytes on '\n' (byte 10) into a list of byte arrays.
+fn byte_split_lines(bytes) {
+    let n = len(bytes)
+    let mut out = []
+    let mut start = 0
+    let mut i = 0
+    while i < n {
+        if bytes[i] == 10 {
+            out = out.push(bytes.slice(start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n { out = out.push(bytes.slice(start, n)) }
+    return out
+}
+
+// Extract the digits after "step=" in a line (byte array).
+fn byte_extract_step(line_bytes) {
+    let needle = [115, 116, 101, 112, 61]    // "step="
+    let idx = byte_index_of(line_bytes, needle, 0)
+    if idx < 0 { return -1 }
+    let start = idx + 5
+    let n = len(line_bytes)
+    let mut j = start
+    let mut digits = ""
+    while j < n {
+        let c = line_bytes[j]
+        if c >= 48 && c <= 57 {
+            digits = digits + bytes_decode([c])
+            j = j + 1
+        } else {
+            j = n
+        }
+    }
+    if digits == "" { return -1 }
+    return to_int(digits)
+}
+
+// Given a line (bytes) and a byte-array key sequence that ends in
+// `="`, return the quoted value (decoded as a string) or "".
+fn byte_extract_quoted(line_bytes, key_ascii) {
+    let idx = byte_index_of(line_bytes, key_ascii, 0)
+    if idx < 0 { return "" }
+    let start = idx + len(key_ascii)
+    let n = len(line_bytes)
+    let mut j = start
+    while j < n {
+        if line_bytes[j] == 34 {    // ASCII '"'
+            return bytes_slice_to_string(line_bytes, start, j)
+        }
+        j = j + 1
+    }
+    return bytes_slice_to_string(line_bytes, start, n)
+}
+
+// Parse a kr_samples.log file into the parallel sample store.
+// Appends to the existing store (caller may call samples_reset first).
+// Returns the count of newly added records.
+fn parse_kr_samples_log(path) {
+    if !file_exists(path) { return 0 }
+    let text = read_file(path)
+    let bytes = bytes_encode(text)
+    let lines = byte_split_lines(bytes)
+    let n = len(lines)
+
+    // Needles (all ASCII → safe to hand-encode as decimal byte lists).
+    let tag_sample = [107, 114, 95, 115, 97, 109, 112, 108, 101]  // "kr_sample"
+    let tag_prompt = [112, 114, 111, 109, 112, 116, 61, 34]       // prompt="
+    let tag_gen    = [103, 101, 110, 61, 34]                      //  gen="
+
+    let mut added = 0
+    let mut i = 0
+    while i < n {
+        let lb = lines[i]
+        let has_sample = byte_index_of(lb, tag_sample, 0) >= 0
+        let has_prompt = byte_index_of(lb, tag_prompt, 0) >= 0
+        let has_gen    = byte_index_of(lb, tag_gen, 0) >= 0
+        if has_sample && has_prompt && has_gen {
+            let step = byte_extract_step(lb)
+            let prompt = byte_extract_quoted(lb, tag_prompt)
+            let gen    = byte_extract_quoted(lb, tag_gen)
+            if step >= 0 && gen != "" {
+                samples_add(step, prompt, gen)
+                added = added + 1
+            }
+        }
+        i = i + 1
+    }
+    return added
+}
+
+// Return the sorted unique list of ckpt steps currently in smp_step.
+fn samples_unique_steps() {
+    let n = len(smp_step)
+    let mut seen = []
+    let mut i = 0
+    while i < n {
+        let s = smp_step[i]
+        // linear "contains"
+        let m = len(seen)
+        let mut j = 0
+        let mut dup = false
+        while j < m {
+            if seen[j] == s { dup = true; j = m }
+            else { j = j + 1 }
+        }
+        if !dup { seen = seen.push(s) }
+        i = i + 1
+    }
+    // insertion sort ascending
+    let k = len(seen)
+    let mut a = 0
+    while a < k {
+        let mut b = a + 1
+        while b < k {
+            if seen[b] < seen[a] {
+                let tmp = seen[a]
+                seen[a] = seen[b]
+                seen[b] = tmp
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    return seen
+}
+
+// ── Test mode ──────────────────────────────────────────────────
+//
+// Scores the 5 known-bad step_2000 generations from Agent E's
+// report.  These strings are copied verbatim — including the
+// replacement-char (U+FFFD) and CJK leakage — to exercise each
+// scoring dimension.
+
+fn test_mode() {
+    println("=== kr_quality_score --test ===================================")
+    println("  scoring 5 step_2000 generations (known-bad baseline)")
+    println("---------------------------------------------------------------")
+    let prompts = [
+        "안녕하세요",
+        "오늘 날씨",
+        "한국어 모델",
+        "딥러닝이란",
+        "안녕",
+    ]
+    let gens = [
+        "�오브어를하는.국마다�이�이가, 로는BQ,는EL, 중국는�경.미 언에서는 댈 바리가적지아요 ��인플이� �",
+        "좋. ,는호 �자기 경가순 이데. 아 그�?그 �이 프드리 �리의고야 주 거? 도Didn at, �인 가이프 �닝서현 모을",
+        "어떻게하시요답:식 �진는40개 파렐스브를�하는만으로�이 �들 거 하지만 우리는16 GPU모로서 가능 해合作伙伴 presses源代码,证文件密证 etc全都",
+        "인지식를�하는식가 경험를적하는커 시템.说话를하면 ��스트드를,�하면斐과를 인진을�-in을. 공인 파일호는오 세나오를",
+        ".�을 자어 할? 아 �시간 좀�면�해 해하면��이 �인 경가고울에리 뤈� 가자좋. 하미 차 보? ,이 비랑 다� 분",
+    ]
+    println("   prompt           comp   verdict      worst         u      k      L      R")
+    println("---------------------------------------------------------------")
+    let n = len(prompts)
+    let mut i = 0
+    let mut n_incoh = 0
+    let mut n_part  = 0
+    let mut n_coh   = 0
+    samples_reset()
+    while i < n {
+        samples_add(2000, prompts[i], gens[i])
+        if sc_verdict == "INCOHERENT" { n_incoh = n_incoh + 1 }
+        if sc_verdict == "PARTIAL"    { n_part  = n_part  + 1 }
+        if sc_verdict == "COHERENT"   { n_coh   = n_coh   + 1 }
+        let row = "  " + pad_right(prompts[i], 18)
+                + " " + pad_right(str(round3(sc_composite)), 6)
+                + " " + pad_right(sc_verdict, 12)
+                + " " + pad_right(sc_worst, 13)
+                + " " + pad_right(str(round3(sc_utf8)), 6)
+                + " " + pad_right(str(round3(sc_korean)), 6)
+                + " " + pad_right(str(round3(sc_leakage)), 6)
+                + " " + str(round3(sc_norep))
+        println(row)
+        let diag = "    bytes=" + str(sc_total_bytes)
+                + " chars=" + str(sc_total_chars)
+                + " hangul=" + str(sc_hangul)
+                + " cjk=" + str(sc_cjk)
+                + " latin_run=" + str(sc_latin_run)
+                + " repl=" + str(sc_repl)
+        println(diag)
+        i = i + 1
+    }
+    println("---------------------------------------------------------------")
+    summarize_step(2000)
+    println("  ckpt step=2000 summary:")
+    println("    avg_composite=" + str(round3(sum_avg))
+            + " min=" + str(round3(sum_min))
+            + " max=" + str(round3(sum_max))
+            + " verdict=" + sum_verdict)
+    println("    counts: INCOHERENT=" + str(n_incoh)
+            + " PARTIAL=" + str(n_part)
+            + " COHERENT=" + str(n_coh))
+    println("---------------------------------------------------------------")
+    if sum_verdict == "INCOHERENT" {
+        println("  PASS — step_2000 known-bad baseline flagged INCOHERENT")
+    } else {
+        println("  FAIL — scorer did not flag step_2000 as INCOHERENT (got "
+                + sum_verdict + ")")
+    }
+    println("===============================================================")
+}
+
+// ── CLI entry ──────────────────────────────────────────────────
+
+fn main() {
+    let argv = args()
+    let n = len(argv)
+    let mut mode = ""
+    let mut gen_text = ""
+    let mut log_path = ""
+    let mut i = 2
+    while i < n {
+        let a = argv[i]
+        if a == "--test" {
+            mode = "test"
+            i = i + 1
+        } else if a == "--gen" && i + 1 < n {
+            gen_text = argv[i + 1]
+            mode = "sample"
+            i = i + 2
+        } else if a == "--log" && i + 1 < n {
+            log_path = argv[i + 1]
+            mode = "log"
+            i = i + 2
+        } else {
+            i = i + 1
+        }
+    }
+
+    if mode == "test" {
+        test_mode()
+        return
+    }
+    if mode == "sample" {
+        score_string(gen_text)
+        println("gen=" + gen_text)
+        println("composite=" + str(round3(sc_composite))
+                + " verdict=" + sc_verdict
+                + " worst=" + sc_worst)
+        println("  utf8="    + str(round3(sc_utf8))
+                + " korean=" + str(round3(sc_korean))
+                + " leak="   + str(round3(sc_leakage))
+                + " norep="  + str(round3(sc_norep)))
+        return
+    }
+    if mode == "log" {
+        samples_reset()
+        let added = parse_kr_samples_log(log_path)
+        println("parsed " + str(added) + " samples from " + log_path)
+        let steps = samples_unique_steps()
+        let ns = len(steps)
+        let mut s = 0
+        while s < ns {
+            summarize_step(steps[s])
+            println("  step=" + str(steps[s])
+                    + " n=" + str(sum_n)
+                    + " avg=" + str(round3(sum_avg))
+                    + " min=" + str(round3(sum_min))
+                    + " max=" + str(round3(sum_max))
+                    + " verdict=" + sum_verdict)
+            s = s + 1
+        }
+        return
+    }
+
+    println("usage:")
+    println("  hexa serving/kr_quality_score.hexa --test")
+    println("  hexa serving/kr_quality_score.hexa --gen \"<text>\"")
+    println("  hexa serving/kr_quality_score.hexa --log /path/to/kr_samples.log")
+}
+
+main()

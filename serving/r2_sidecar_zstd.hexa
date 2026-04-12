@@ -1,0 +1,211 @@
+// ═══════════════════════════════════════════════════════════════
+//  serving/r2_sidecar_zstd.hexa — ALM 14B r4 R2 backup with zstd
+//
+//  Parallel new path to /workspace/r2_sidecar_r3.sh. Does NOT replace
+//  the existing uncompressed sidecar; runs alongside to upload a
+//  compressed .tar.zst per step_NNNN directory.
+//
+//  Watch loop:
+//    for each /workspace/ckpt_alm_14b_r4/step_*/ ignored in seen-file:
+//      tar+zstd -19 -T0 → /tmp/step_NNNN.tar.zst
+//      rclone copy     → r2:anima-models/alm14b/r4/step_NNNN.tar.zst
+//      log size/ratio/elapsed → /workspace/r2_zstd_sidecar.log
+//      mark seen
+//
+//  Idempotent: skips a step if /tmp/<name>.tar.zst already exists
+//  AND the name is already in the seen-file.
+//
+//  Zero-Rust, HEXA-FIRST. Shell-outs: tar, zstd, rclone, stat, date.
+//  Target: ratio >= 30% reduction (typical 20-40% for ML ckpts).
+//
+//  Run (one-shot test trigger via /tmp/r2_zstd_sidecar_once):
+//    touch /tmp/r2_zstd_sidecar_once
+//    hexa /workspace/anima/serving/r2_sidecar_zstd.hexa
+//
+//  Daemon mode (not launched by deploy):
+//    nohup hexa /workspace/anima/serving/r2_sidecar_zstd.hexa \
+//      > /workspace/r2_zstd_sidecar.out 2>&1 &
+//
+//  NOTE 2026-04-12: This file deliberately avoids string methods
+//  that aren't guaranteed in the current hexa binary (.split/.replace/
+//  .contains/.find/.rfind). It uses only substring + len + trim +
+//  starts_with, plus shell helpers for any text manipulation.
+// ═══════════════════════════════════════════════════════════════
+
+let CKPT_ROOT = "/workspace/ckpt_alm_14b_r4"
+let TMP_DIR   = "/workspace/tmp_zstd"
+let R2_DEST   = "r2:anima-models/alm14b/r4/"
+let SEEN_FILE = "/workspace/.r2_sidecar_zstd_r4_seen"
+let LOG_FILE  = "/workspace/r2_zstd_sidecar.log"
+let POLL_SEC  = 60
+let ZSTD_LVL  = 19
+let ONCE_FLAG = "/workspace/tmp_zstd/r2_zstd_sidecar_once"
+
+// ── Manual string helpers (safe subset) ─────────────────────────
+fn str_contains(hay, needle) {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return true }
+    if nn > hn { return false }
+    let mut i = 0
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn split_lines(text) {
+    let n = len(text)
+    let mut lines = []
+    let mut start = 0
+    let mut i = 0
+    while i < n {
+        if text.substring(i, i + 1) == "\n" {
+            lines = lines.push(text.substring(start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n { lines = lines.push(text.substring(start, n)) }
+    return lines
+}
+
+fn now_stamp() {
+    return exec("date +%Y-%m-%dT%H:%M:%S").trim()
+}
+
+fn append_log(line) {
+    let stamp = now_stamp()
+    let full = "[" + stamp + "] " + line
+    // Unique per-call scratch file to dodge any cat+rm race.
+    let nano = exec("date +%s%N").trim()
+    let tmp_line = TMP_DIR + "/.log_" + nano + ".txt"
+    write_file(tmp_line, full + "\n")
+    let _ = exec("cat " + tmp_line + " >> " + LOG_FILE + " && rm -f " + tmp_line)
+    println(full)
+}
+
+fn du_bytes(path) {
+    let out = exec("du -sb " + path + " 2>/dev/null | awk '{print $1}'")
+    let s = out.trim()
+    if len(s) == 0 { return "0" }
+    return s
+}
+
+fn already_seen(name) {
+    if !file_exists(SEEN_FILE) { return false }
+    let raw = read_file(SEEN_FILE)
+    let lines = split_lines(raw)
+    let mut i = 0
+    while i < len(lines) {
+        if lines[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn mark_seen(name) {
+    let nano = exec("date +%s%N").trim()
+    let tmp_line = TMP_DIR + "/.seen_" + nano + ".txt"
+    write_file(tmp_line, name + "\n")
+    let _ = exec("cat " + tmp_line + " >> " + SEEN_FILE + " && rm -f " + tmp_line)
+}
+
+fn list_steps() {
+    let out = exec("ls " + CKPT_ROOT + " 2>/dev/null | grep '^step_' | sort -V")
+    let lines = split_lines(out)
+    let mut result = []
+    let mut i = 0
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) > 0 { result = result.push(l) }
+        i = i + 1
+    }
+    return result
+}
+
+fn process_step(name) {
+    let src_dir = CKPT_ROOT + "/" + name
+    let tar_path = TMP_DIR + "/" + name + ".tar.zst"
+
+    if file_exists(tar_path) && already_seen(name) {
+        append_log(name + " skip (already compressed + seen)")
+        return
+    }
+
+    append_log(name + " start — source=" + src_dir)
+
+    let orig = du_bytes(src_dir)
+    append_log(name + " orig_bytes=" + orig)
+
+    let t0s = exec("date +%s").trim()
+
+    let compress_cmd = "cd " + CKPT_ROOT + " && tar -cf - " + name +
+        " | zstd -" + str(ZSTD_LVL) + " -T0 -q -o " + tar_path + ".tmp 2>&1 && mv " +
+        tar_path + ".tmp " + tar_path + "; echo RC=$?"
+    let crc = exec(compress_cmd)
+    if !file_exists(tar_path) {
+        append_log(name + " FAIL compression")
+        append_log(name + " fail_tail=" + crc.substring(0, 240))
+        return
+    }
+
+    let t1s = exec("date +%s").trim()
+    let comp = du_bytes(tar_path)
+    append_log(name + " comp_bytes=" + comp + " compress_window=" + t0s + "-" + t1s + "s")
+
+    // Ratio + savings via awk.
+    let ratio_cmd = "awk 'BEGIN{printf \"%.2f\", (" + comp + "/" + orig + ")*100.0}'"
+    let ratio = exec(ratio_cmd).trim()
+    let save_cmd = "awk 'BEGIN{printf \"%.2f\", (1.0-(" + comp + "/" + orig + "))*100.0}'"
+    let savings = exec(save_cmd).trim()
+    append_log(name + " ratio=" + ratio + "% savings=" + savings + "%")
+
+    // Upload via rclone.
+    let u0s = exec("date +%s").trim()
+    let upload_cmd = "rclone copy " + tar_path + " " + R2_DEST +
+        " --s3-no-check-bucket --transfers 2 2>&1; echo RC=$?"
+    let uout = exec(upload_cmd)
+    let u1s = exec("date +%s").trim()
+
+    if str_contains(uout, "RC=0") {
+        append_log(name + " upload OK window=" + u0s + "-" + u1s + "s")
+        mark_seen(name)
+    } else {
+        append_log(name + " upload FAIL tail=" + uout.substring(0, 240))
+    }
+}
+
+fn sweep() {
+    let steps = list_steps()
+    let mut i = 0
+    while i < len(steps) {
+        let name = steps[i]
+        if !already_seen(name) {
+            process_step(name)
+        }
+        i = i + 1
+    }
+}
+
+fn main() {
+    let _ = exec("mkdir -p " + TMP_DIR)
+    let once = file_exists(ONCE_FLAG)
+    append_log("sidecar_zstd START once=" + str(once))
+    let _ = exec("touch " + SEEN_FILE)
+
+    if once {
+        sweep()
+        append_log("sidecar_zstd ONCE DONE")
+        let _ = exec("rm -f " + ONCE_FLAG)
+        return
+    }
+
+    while true {
+        sweep()
+        let _ = exec("sleep " + str(POLL_SEC))
+    }
+}
+
+main()
