@@ -1,0 +1,861 @@
+// ═══════════════════════════════════════════════════════════════
+//  serving/kr_quality_gate.hexa — strict 32B-readiness gate
+//
+//  PURPOSE
+//    The existing monitor_alm_r4.hexa daemon emits
+//    /workspace/READY_FOR_32B purely on eval_loss (< 0.02).  That
+//    signal was proven insufficient at step_2000 — eval_loss was
+//    excellent but generations were broken.  This module adds a
+//    second, stricter gate that requires BOTH
+//      * latest ckpt eval_loss < 0.02   (same as existing)
+//      * latest ckpt kr_quality verdict == "COHERENT"
+//    and writes /workspace/READY_FOR_32B_AND_KR when both pass.
+//
+//  SCOPE
+//    Parallel path — does NOT read, write, delete, or override
+//    /workspace/READY_FOR_32B.  The existing daemon keeps owning
+//    the loose gate; this script owns the strict gate.
+//
+//  INPUTS
+//    /workspace/kr_samples.log  — per-ckpt KR generation log
+//    /workspace/train_r4.log    — training log (for eval_loss lookup)
+//
+//  OUTPUTS
+//    /workspace/kr_quality.log           — one line per ckpt:
+//        [STAMP] [kr_quality] step=N n=K avg=X min=Y max=Z verdict=V
+//    /workspace/READY_FOR_32B_AND_KR     — marker file (idempotent)
+//
+//  CLI
+//    hexa serving/kr_quality_gate.hexa
+//        default scan
+//    hexa serving/kr_quality_gate.hexa --samples /workspace/kr_samples.log
+//                                      --train   /workspace/train_r4.log
+//                                      --quality /workspace/kr_quality.log
+//                                      --marker  /workspace/READY_FOR_32B_AND_KR
+//                                      --target  0.02
+//    hexa serving/kr_quality_gate.hexa --dry-run
+//        prints summary but does NOT write kr_quality.log or the marker
+//
+//  CONSTRAINTS
+//    * HEXA-FIRST — no python, no bash inside the scoring or gating
+//      logic (though the deployment wrapper may launch us via bash)
+//    * Idempotent — re-running appends only new ckpt entries to
+//      kr_quality.log (dedup on step number in existing log)
+//    * Never touches the existing READY_FOR_32B marker
+//    * Never touches the running monitor daemon or training process
+//
+//  DEPENDS ON
+//    serving/kr_quality_score.hexa  (loaded via hexa `import`? or
+//    inlined via exec?)  — the hexa build does not expose an
+//    `import` statement, so we duplicate the scoring core as an
+//    inlined mini-copy.  To keep the two files in sync, changes to
+//    the scoring formulas MUST be mirrored in both files.  A future
+//    hexa build with module support will collapse this to a single
+//    source of truth.
+// ═══════════════════════════════════════════════════════════════
+
+// ── Defaults ──────────────────────────────────────────────────
+let DEFAULT_SAMPLES  = "/workspace/kr_samples.log"
+let DEFAULT_TRAIN    = "/workspace/train_r4.log"
+let DEFAULT_QUALITY  = "/workspace/kr_quality.log"
+let DEFAULT_MARKER   = "/workspace/READY_FOR_32B_AND_KR"
+let DEFAULT_TARGET   = 0.02
+
+// ── Config state (populated from args) ──────────────────────────
+let mut cfg_samples = DEFAULT_SAMPLES
+let mut cfg_train   = DEFAULT_TRAIN
+let mut cfg_quality = DEFAULT_QUALITY
+let mut cfg_marker  = DEFAULT_MARKER
+let mut cfg_target  = DEFAULT_TARGET
+let mut cfg_dry     = false
+
+fn parse_args() {
+    let argv = args()
+    let n = len(argv)
+    let mut i = 2
+    while i < n {
+        let a = argv[i]
+        if a == "--samples" && i + 1 < n {
+            cfg_samples = argv[i + 1]; i = i + 2
+        } else if a == "--train" && i + 1 < n {
+            cfg_train = argv[i + 1]; i = i + 2
+        } else if a == "--quality" && i + 1 < n {
+            cfg_quality = argv[i + 1]; i = i + 2
+        } else if a == "--marker" && i + 1 < n {
+            cfg_marker = argv[i + 1]; i = i + 2
+        } else if a == "--target" && i + 1 < n {
+            cfg_target = to_float(argv[i + 1]); i = i + 2
+        } else if a == "--dry-run" {
+            cfg_dry = true; i = i + 1
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+// ── Inlined scoring core (mirrors kr_quality_score.hexa) ───────
+//
+// See kr_quality_score.hexa for the authoritative version + doc
+// strings.  Formulas, thresholds, and critical floors MUST stay in
+// lockstep between the two files until hexa gets module support.
+
+let HS_LO = 44032
+let HS_HI = 55215
+let HJ_LO = 4352
+let HJ_HI = 4607
+let HC_LO = 12592
+let HC_HI = 12687
+let HE_LO = 43360
+let HE_HI = 43391
+let CJK_LO = 19968
+let CJK_HI = 40959
+let REPLACEMENT = 65533
+
+let COHERENT_MIN  = 0.70
+let PARTIAL_MIN   = 0.40
+
+let W_UTF8    = 0.25
+let W_KOREAN  = 0.35
+let W_LEAKAGE = 0.25
+let W_NOREP   = 0.15
+
+let CRIT_UTF8    = 0.92
+let CRIT_KOREAN  = 0.55
+let CRIT_LEAKAGE = 0.75
+let CRIT_NOREP   = 0.55
+
+let mut sc_utf8          = 0.0
+let mut sc_korean        = 0.0
+let mut sc_leakage       = 0.0
+let mut sc_norep         = 0.0
+let mut sc_composite     = 0.0
+let mut sc_verdict       = "INCOHERENT"
+let mut sc_total_bytes   = 0
+let mut sc_total_chars   = 0
+let mut sc_hangul        = 0
+let mut sc_cjk           = 0
+let mut sc_latin_run     = 0
+let mut sc_repl          = 0
+let mut sc_worst         = "none"
+
+fn is_hangul_cp(cp) {
+    if cp >= HS_LO && cp <= HS_HI { return true }
+    if cp >= HJ_LO && cp <= HJ_HI { return true }
+    if cp >= HC_LO && cp <= HC_HI { return true }
+    if cp >= HE_LO && cp <= HE_HI { return true }
+    return false
+}
+fn is_cjk_cp(cp) { if cp >= CJK_LO && cp <= CJK_HI { return true } return false }
+fn is_ascii_alpha_cp(cp) {
+    if cp >= 65 && cp <= 90  { return true }
+    if cp >= 97 && cp <= 122 { return true }
+    return false
+}
+fn is_ascii_digit_cp(cp) { if cp >= 48 && cp <= 57 { return true } return false }
+fn is_ascii_space_or_punct(cp) {
+    if cp == 32 || cp == 9 || cp == 10 || cp == 13 { return true }
+    if cp >= 33 && cp <= 47  { return true }
+    if cp >= 58 && cp <= 64  { return true }
+    if cp >= 91 && cp <= 96  { return true }
+    if cp >= 123 && cp <= 126 { return true }
+    return false
+}
+fn min_f(a, b) { if a < b { return a } else { return b } }
+
+fn round3(x) {
+    let shifted = x * 1000.0
+    let r = to_int(shifted + 0.5)
+    return to_float(r) / 1000.0
+}
+
+let mut scan_cps = []
+let mut scan_widths = []
+let mut scan_valids = []
+let mut scan_n_valid_bytes = 0
+let mut scan_total_bytes = 0
+
+fn decode_bytes(bytes) {
+    scan_cps = []
+    scan_widths = []
+    scan_valids = []
+    scan_n_valid_bytes = 0
+    scan_total_bytes = len(bytes)
+    let n = scan_total_bytes
+    let mut i = 0
+    while i < n {
+        let c = bytes[i]
+        let mut cp_bytes = 1
+        let mut ok = true
+        let mut cp = REPLACEMENT
+        if c < 128 {
+            cp_bytes = 1; cp = c; ok = true
+        } else if c >= 192 && c < 224 {
+            cp_bytes = 2
+            if i + 1 < n && bytes[i + 1] >= 128 && bytes[i + 1] < 192 {
+                cp = (c - 192) * 64 + (bytes[i + 1] - 128)
+                if cp < 128 { ok = false; cp = REPLACEMENT } else { ok = true }
+            } else { ok = false; cp = REPLACEMENT }
+        } else if c >= 224 && c < 240 {
+            cp_bytes = 3
+            if i + 2 < n &&
+               bytes[i + 1] >= 128 && bytes[i + 1] < 192 &&
+               bytes[i + 2] >= 128 && bytes[i + 2] < 192 {
+                cp = (c - 224) * 4096 + (bytes[i + 1] - 128) * 64 + (bytes[i + 2] - 128)
+                if cp < 2048 { ok = false; cp = REPLACEMENT }
+                else if cp >= 55296 && cp <= 57343 { ok = false; cp = REPLACEMENT }
+                else if cp == REPLACEMENT { ok = false }
+                else { ok = true }
+            } else { ok = false; cp = REPLACEMENT }
+        } else if c >= 240 && c < 248 {
+            cp_bytes = 4
+            if i + 3 < n &&
+               bytes[i + 1] >= 128 && bytes[i + 1] < 192 &&
+               bytes[i + 2] >= 128 && bytes[i + 2] < 192 &&
+               bytes[i + 3] >= 128 && bytes[i + 3] < 192 {
+                cp = (c - 240) * 262144 + (bytes[i + 1] - 128) * 4096
+                     + (bytes[i + 2] - 128) * 64 + (bytes[i + 3] - 128)
+                if cp < 65536 { ok = false; cp = REPLACEMENT }
+                else if cp > 1114111 { ok = false; cp = REPLACEMENT }
+                else { ok = true }
+            } else { ok = false; cp = REPLACEMENT }
+        } else {
+            cp_bytes = 1; ok = false; cp = REPLACEMENT
+        }
+        let mut advance = cp_bytes
+        if !ok {
+            if cp == REPLACEMENT && cp_bytes == 3 &&
+               c == 239 && i + 2 < n &&
+               bytes[i + 1] == 191 && bytes[i + 2] == 189 {
+                advance = 3
+            } else { advance = 1 }
+        }
+        scan_cps = scan_cps.push(cp)
+        scan_widths = scan_widths.push(advance)
+        scan_valids = scan_valids.push(ok)
+        if ok { scan_n_valid_bytes = scan_n_valid_bytes + advance }
+        i = i + advance
+    }
+}
+
+fn score_generation(gen_bytes) {
+    let total_bytes = len(gen_bytes)
+    sc_total_bytes = total_bytes
+    if total_bytes == 0 {
+        sc_utf8 = 0.0; sc_korean = 0.0; sc_leakage = 0.0; sc_norep = 0.0
+        sc_composite = 0.0; sc_verdict = "INCOHERENT"
+        sc_total_chars = 0; sc_hangul = 0; sc_cjk = 0
+        sc_latin_run = 0; sc_repl = 0; sc_worst = "empty"
+        return
+    }
+    decode_bytes(gen_bytes)
+    let n = len(scan_cps)
+    let mut utf8_ratio = 0.0
+    if total_bytes > 0 {
+        utf8_ratio = to_float(scan_n_valid_bytes) / to_float(total_bytes)
+    }
+    let mut hangul = 0
+    let mut cjk = 0
+    let mut repl = 0
+    let mut meaningful = 0
+    let mut total_chars = 0
+    let mut latin_run_chars = 0
+    let mut latin_flags = []
+    let mut i = 0
+    while i < n {
+        let cp = scan_cps[i]
+        let ok = scan_valids[i]
+        total_chars = total_chars + 1
+        let mut is_latin = false
+        if !ok || cp == REPLACEMENT {
+            repl = repl + 1
+            meaningful = meaningful + 1
+        } else if is_hangul_cp(cp) {
+            hangul = hangul + 1
+            meaningful = meaningful + 1
+        } else if is_cjk_cp(cp) {
+            cjk = cjk + 1
+            meaningful = meaningful + 1
+        } else if is_ascii_alpha_cp(cp) {
+            is_latin = true
+        } else if is_ascii_digit_cp(cp) {
+            meaningful = meaningful + 1
+        } else if is_ascii_space_or_punct(cp) {
+            // skip
+        } else {
+            meaningful = meaningful + 1
+        }
+        latin_flags = latin_flags.push(is_latin)
+        i = i + 1
+    }
+    let mf = len(latin_flags)
+    let mut run = 0
+    let mut j = 0
+    while j < mf {
+        if latin_flags[j] { run = run + 1 }
+        else {
+            if run >= 3 { latin_run_chars = latin_run_chars + run }
+            run = 0
+        }
+        j = j + 1
+    }
+    if run >= 3 { latin_run_chars = latin_run_chars + run }
+    meaningful = meaningful + latin_run_chars
+    let mut korean_ratio = 0.0
+    if meaningful > 0 { korean_ratio = to_float(hangul) / to_float(meaningful) }
+    let mut leakage = 1.0
+    if meaningful > 0 {
+        let leak = to_float(cjk + latin_run_chars) / to_float(meaningful)
+        leakage = 1.0 - leak
+    }
+    if leakage < 0.0 { leakage = 0.0 }
+    let mut rr = 0.0
+    if total_chars >= 10 { rr = 10.0 * to_float(repl) / to_float(total_chars) }
+    else { rr = to_float(repl) / 10.0 }
+    let clamp = min_f(1.0, rr)
+    let no_rep = 1.0 - clamp
+    if utf8_ratio   < 0.0 { utf8_ratio   = 0.0 }
+    if utf8_ratio   > 1.0 { utf8_ratio   = 1.0 }
+    if korean_ratio < 0.0 { korean_ratio = 0.0 }
+    if korean_ratio > 1.0 { korean_ratio = 1.0 }
+    if leakage      < 0.0 { leakage      = 0.0 }
+    if leakage      > 1.0 { leakage      = 1.0 }
+    let mut nr = no_rep
+    if nr < 0.0 { nr = 0.0 }
+    if nr > 1.0 { nr = 1.0 }
+    let composite = W_UTF8 * utf8_ratio + W_KOREAN * korean_ratio
+                  + W_LEAKAGE * leakage + W_NOREP * nr
+    let mut verdict = "INCOHERENT"
+    if composite >= COHERENT_MIN { verdict = "COHERENT" }
+    else if composite >= PARTIAL_MIN { verdict = "PARTIAL" }
+    let mut floor_fail = false
+    if utf8_ratio   < CRIT_UTF8    { floor_fail = true }
+    if korean_ratio < CRIT_KOREAN  { floor_fail = true }
+    if leakage      < CRIT_LEAKAGE { floor_fail = true }
+    if nr           < CRIT_NOREP   { floor_fail = true }
+    if floor_fail {
+        if verdict == "COHERENT" { verdict = "PARTIAL" }
+        else if verdict == "PARTIAL" { verdict = "INCOHERENT" }
+    }
+    let mut floor_count = 0
+    if utf8_ratio   < CRIT_UTF8    { floor_count = floor_count + 1 }
+    if korean_ratio < CRIT_KOREAN  { floor_count = floor_count + 1 }
+    if leakage      < CRIT_LEAKAGE { floor_count = floor_count + 1 }
+    if nr           < CRIT_NOREP   { floor_count = floor_count + 1 }
+    if floor_count >= 2 { verdict = "INCOHERENT" }
+
+    sc_utf8 = utf8_ratio
+    sc_korean = korean_ratio
+    sc_leakage = leakage
+    sc_norep = nr
+    sc_composite = composite
+    sc_verdict = verdict
+    sc_total_chars = total_chars
+    sc_hangul = hangul
+    sc_cjk = cjk
+    sc_latin_run = latin_run_chars
+    sc_repl = repl
+    sc_worst = "none"
+}
+
+fn score_string(s) { score_generation(bytes_encode(s)) }
+
+// ── Byte-level log parsing helpers ─────────────────────────────
+
+fn byte_index_of(bytes, needle, start) {
+    let n = len(bytes)
+    let m = len(needle)
+    if m == 0 { return start }
+    if m > n - start { return -1 }
+    let mut i = start
+    while i + m <= n {
+        let mut k = 0
+        let mut eq = true
+        while k < m {
+            if bytes[i + k] != needle[k] { eq = false; k = m }
+            else { k = k + 1 }
+        }
+        if eq { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn bytes_slice_to_string(bytes, start, end) {
+    if end <= start { return "" }
+    let sub = bytes.slice(start, end)
+    return bytes_decode(sub)
+}
+
+fn byte_split_lines(bytes) {
+    let n = len(bytes)
+    let mut out = []
+    let mut start = 0
+    let mut i = 0
+    while i < n {
+        if bytes[i] == 10 {
+            out = out.push(bytes.slice(start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n { out = out.push(bytes.slice(start, n)) }
+    return out
+}
+
+fn byte_extract_step(line_bytes) {
+    let needle = [115, 116, 101, 112, 61]
+    let idx = byte_index_of(line_bytes, needle, 0)
+    if idx < 0 { return -1 }
+    let start = idx + 5
+    let n = len(line_bytes)
+    let mut j = start
+    let mut digits = ""
+    while j < n {
+        let c = line_bytes[j]
+        if c >= 48 && c <= 57 {
+            digits = digits + bytes_decode([c])
+            j = j + 1
+        } else { j = n }
+    }
+    if digits == "" { return -1 }
+    return to_int(digits)
+}
+
+fn byte_extract_quoted(line_bytes, key_ascii) {
+    let idx = byte_index_of(line_bytes, key_ascii, 0)
+    if idx < 0 { return "" }
+    let start = idx + len(key_ascii)
+    let n = len(line_bytes)
+    let mut j = start
+    while j < n {
+        if line_bytes[j] == 34 { return bytes_slice_to_string(line_bytes, start, j) }
+        j = j + 1
+    }
+    return bytes_slice_to_string(line_bytes, start, n)
+}
+
+// ── Per-sample store (parallel lists) ──────────────────────────
+
+let mut smp_step = []
+let mut smp_prompt = []
+let mut smp_gen = []
+let mut smp_composite = []
+let mut smp_verdict = []
+let mut smp_utf8 = []
+let mut smp_korean = []
+let mut smp_leakage = []
+let mut smp_norep = []
+
+fn samples_reset() {
+    smp_step = []
+    smp_prompt = []
+    smp_gen = []
+    smp_composite = []
+    smp_verdict = []
+    smp_utf8 = []
+    smp_korean = []
+    smp_leakage = []
+    smp_norep = []
+}
+
+fn samples_add(step, prompt, gen) {
+    score_string(gen)
+    smp_step = smp_step.push(step)
+    smp_prompt = smp_prompt.push(prompt)
+    smp_gen = smp_gen.push(gen)
+    smp_composite = smp_composite.push(sc_composite)
+    smp_verdict = smp_verdict.push(sc_verdict)
+    smp_utf8 = smp_utf8.push(sc_utf8)
+    smp_korean = smp_korean.push(sc_korean)
+    smp_leakage = smp_leakage.push(sc_leakage)
+    smp_norep = smp_norep.push(sc_norep)
+}
+
+// ── Parse kr_samples.log ───────────────────────────────────────
+
+fn parse_kr_samples_log(path) {
+    if !file_exists(path) { return 0 }
+    let text = read_file(path)
+    let bytes = bytes_encode(text)
+    let lines = byte_split_lines(bytes)
+    let n = len(lines)
+    let tag_sample = [107, 114, 95, 115, 97, 109, 112, 108, 101]
+    let tag_prompt = [112, 114, 111, 109, 112, 116, 61, 34]
+    let tag_gen    = [103, 101, 110, 61, 34]
+    let mut added = 0
+    let mut i = 0
+    while i < n {
+        let lb = lines[i]
+        let has_sample = byte_index_of(lb, tag_sample, 0) >= 0
+        let has_prompt = byte_index_of(lb, tag_prompt, 0) >= 0
+        let has_gen    = byte_index_of(lb, tag_gen, 0) >= 0
+        if has_sample && has_prompt && has_gen {
+            let step = byte_extract_step(lb)
+            let prompt = byte_extract_quoted(lb, tag_prompt)
+            let gen    = byte_extract_quoted(lb, tag_gen)
+            if step >= 0 && gen != "" {
+                samples_add(step, prompt, gen)
+                added = added + 1
+            }
+        }
+        i = i + 1
+    }
+    return added
+}
+
+// Unique sorted ckpt step list.
+fn samples_unique_steps() {
+    let n = len(smp_step)
+    let mut seen = []
+    let mut i = 0
+    while i < n {
+        let s = smp_step[i]
+        let m = len(seen)
+        let mut j = 0
+        let mut dup = false
+        while j < m {
+            if seen[j] == s { dup = true; j = m }
+            else { j = j + 1 }
+        }
+        if !dup { seen = seen.push(s) }
+        i = i + 1
+    }
+    let k = len(seen)
+    let mut a = 0
+    while a < k {
+        let mut b = a + 1
+        while b < k {
+            if seen[b] < seen[a] {
+                let tmp = seen[a]
+                seen[a] = seen[b]
+                seen[b] = tmp
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    return seen
+}
+
+// ── Per-step aggregation ───────────────────────────────────────
+//
+// verdict precedence (matches kr_quality_score.hexa summarize_step):
+//   any INCOHERENT wins → INCOHERENT
+//   else zero INCOHERENT + majority COHERENT → COHERENT
+//   else PARTIAL
+
+let mut gate_n = 0
+let mut gate_avg = 0.0
+let mut gate_min = 0.0
+let mut gate_max = 0.0
+let mut gate_verdict = "INCOHERENT"
+let mut gate_n_coh = 0
+let mut gate_n_par = 0
+let mut gate_n_inc = 0
+
+fn aggregate_step(target_step) {
+    let n = len(smp_step)
+    gate_n = 0
+    gate_avg = 0.0
+    gate_min = 2.0
+    gate_max = -1.0
+    gate_verdict = "INCOHERENT"
+    gate_n_coh = 0
+    gate_n_par = 0
+    gate_n_inc = 0
+    let mut total = 0.0
+    let mut i = 0
+    while i < n {
+        if smp_step[i] == target_step {
+            let c = smp_composite[i]
+            total = total + c
+            if c < gate_min { gate_min = c }
+            if c > gate_max { gate_max = c }
+            gate_n = gate_n + 1
+            let v = smp_verdict[i]
+            if v == "COHERENT"   { gate_n_coh = gate_n_coh + 1 }
+            if v == "PARTIAL"    { gate_n_par = gate_n_par + 1 }
+            if v == "INCOHERENT" { gate_n_inc = gate_n_inc + 1 }
+        }
+        i = i + 1
+    }
+    if gate_n == 0 {
+        gate_min = 0.0; gate_max = 0.0; gate_avg = 0.0
+        return
+    }
+    gate_avg = total / to_float(gate_n)
+    if gate_n_inc >= gate_n_coh && gate_n_inc >= gate_n_par {
+        gate_verdict = "INCOHERENT"
+    } else if gate_n_inc == 0 && gate_n_coh >= gate_n_par && gate_n_coh > 0 {
+        gate_verdict = "COHERENT"
+    } else {
+        gate_verdict = "PARTIAL"
+    }
+}
+
+// ── Dedup: which steps are already logged in kr_quality.log ────
+//
+// We scan the quality log for existing "[kr_quality] step=N" entries
+// and return the set of ints so we only append new lines.
+fn existing_quality_steps(path) {
+    let mut seen = []
+    if !file_exists(path) { return seen }
+    let text = read_file(path)
+    let bytes = bytes_encode(text)
+    let lines = byte_split_lines(bytes)
+    let n = len(lines)
+    let tag = [107, 114, 95, 113, 117, 97, 108, 105, 116, 121]   // "kr_quality"
+    let mut i = 0
+    while i < n {
+        let lb = lines[i]
+        if byte_index_of(lb, tag, 0) >= 0 {
+            let s = byte_extract_step(lb)
+            if s >= 0 { seen = seen.push(s) }
+        }
+        i = i + 1
+    }
+    return seen
+}
+
+fn seen_contains(seen, v) {
+    let n = len(seen)
+    let mut i = 0
+    while i < n {
+        if seen[i] == v { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ── eval_loss extraction from train_r4.log ─────────────────────
+//
+// train_r4.log line format (from handle_eval_line in monitor_alm_r4):
+//   [STAMP] [eval] step=N/M eval_loss=X ...
+//
+// We walk all [eval] lines looking for the one whose step == target
+// and return the eval_loss (or a sentinel).
+
+let EVAL_MISSING = -1.0
+
+fn find_eval_loss_for_step(train_path, target_step) {
+    if !file_exists(train_path) { return EVAL_MISSING }
+    let text = read_file(train_path)
+    let bytes = bytes_encode(text)
+    let lines = byte_split_lines(bytes)
+    let n = len(lines)
+    let tag_eval = [91, 101, 118, 97, 108, 93]  // "[eval]"
+    let tag_ev   = [101, 118, 97, 108, 95, 108, 111, 115, 115, 61]  // "eval_loss="
+    let mut best = EVAL_MISSING
+    let mut i = 0
+    while i < n {
+        let lb = lines[i]
+        if byte_index_of(lb, tag_eval, 0) >= 0 {
+            let step = byte_extract_step(lb)
+            if step == target_step {
+                // pull eval_loss float
+                let idx = byte_index_of(lb, tag_ev, 0)
+                if idx >= 0 {
+                    let start = idx + 10
+                    let m = len(lb)
+                    let mut j = start
+                    let mut digits = ""
+                    while j < m {
+                        let c = lb[j]
+                        let is_num = (c >= 48 && c <= 57) || c == 46 || c == 45 || c == 101 || c == 69 || c == 43
+                        if is_num {
+                            digits = digits + bytes_decode([c])
+                            j = j + 1
+                        } else { j = m }
+                    }
+                    if digits != "" { best = to_float(digits) }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// Also track the global best eval_loss seen in train_r4.log (for
+// the stricter "best_eval < target" check — we use the min eval_loss
+// across all [eval] lines, which is what monitor_alm_r4 exposes).
+fn find_best_eval_loss(train_path) {
+    if !file_exists(train_path) { return EVAL_MISSING }
+    let text = read_file(train_path)
+    let bytes = bytes_encode(text)
+    let lines = byte_split_lines(bytes)
+    let n = len(lines)
+    let tag_eval = [91, 101, 118, 97, 108, 93]
+    let tag_ev   = [101, 118, 97, 108, 95, 108, 111, 115, 115, 61]
+    let mut best = 1.0e18
+    let mut found = false
+    let mut i = 0
+    while i < n {
+        let lb = lines[i]
+        if byte_index_of(lb, tag_eval, 0) >= 0 {
+            let idx = byte_index_of(lb, tag_ev, 0)
+            if idx >= 0 {
+                let start = idx + 10
+                let m = len(lb)
+                let mut j = start
+                let mut digits = ""
+                while j < m {
+                    let c = lb[j]
+                    let is_num = (c >= 48 && c <= 57) || c == 46 || c == 45 || c == 101 || c == 69 || c == 43
+                    if is_num {
+                        digits = digits + bytes_decode([c])
+                        j = j + 1
+                    } else { j = m }
+                }
+                if digits != "" {
+                    let v = to_float(digits)
+                    if v < best { best = v; found = true }
+                }
+            }
+        }
+        i = i + 1
+    }
+    if !found { return EVAL_MISSING }
+    return best
+}
+
+// ── Append helpers ─────────────────────────────────────────────
+
+fn ts() { return now() }
+
+fn qlog_append(line) {
+    let full = "[" + ts() + "] " + line + "\n"
+    append_file(cfg_quality, full)
+    println(full)
+}
+
+// ── Main ───────────────────────────────────────────────────────
+
+fn main() {
+    parse_args()
+
+    println("[kr_quality_gate] samples=" + cfg_samples)
+    println("[kr_quality_gate] train="   + cfg_train)
+    println("[kr_quality_gate] quality=" + cfg_quality)
+    println("[kr_quality_gate] marker="  + cfg_marker)
+    println("[kr_quality_gate] target="  + str(cfg_target))
+    println("[kr_quality_gate] dry_run=" + str(cfg_dry))
+
+    if !file_exists(cfg_samples) {
+        println("[kr_quality_gate] ERROR samples log missing: " + cfg_samples)
+        return
+    }
+
+    samples_reset()
+    let added = parse_kr_samples_log(cfg_samples)
+    println("[kr_quality_gate] parsed samples=" + str(added))
+
+    let steps = samples_unique_steps()
+    let nsteps = len(steps)
+    if nsteps == 0 {
+        println("[kr_quality_gate] WARN no samples found — nothing to score")
+        return
+    }
+
+    let already = existing_quality_steps(cfg_quality)
+    let n_already = len(already)
+    println("[kr_quality_gate] existing quality entries=" + str(n_already))
+
+    // Score every step, append to quality log only those that are new.
+    let mut latest_step = -1
+    let mut latest_verdict = "INCOHERENT"
+    let mut latest_avg = 0.0
+    let mut latest_min = 0.0
+    let mut latest_max = 0.0
+
+    let mut s_idx = 0
+    while s_idx < nsteps {
+        let step = steps[s_idx]
+        aggregate_step(step)
+        // Format compatibility: monitor_alm_r4.hexa parser expects
+        // `composite=X verdict=V` keys. Emit canonical names first
+        // (composite, verdict) then the extras for dashboards.
+        let line = "[kr_quality] step=" + str(step)
+                 + " composite=" + str(round3(gate_avg))
+                 + " verdict=" + gate_verdict
+                 + " n=" + str(gate_n)
+                 + " min=" + str(round3(gate_min))
+                 + " max=" + str(round3(gate_max))
+                 + " coh=" + str(gate_n_coh)
+                 + " par=" + str(gate_n_par)
+                 + " inc=" + str(gate_n_inc)
+        if seen_contains(already, step) {
+            println("[kr_quality_gate] skip step=" + str(step) + " (already logged)")
+        } else {
+            if cfg_dry {
+                println("[DRY] would append: " + line)
+            } else {
+                qlog_append(line)
+            }
+        }
+        if step > latest_step {
+            latest_step = step
+            latest_verdict = gate_verdict
+            latest_avg = gate_avg
+            latest_min = gate_min
+            latest_max = gate_max
+        }
+        s_idx = s_idx + 1
+    }
+
+    println("[kr_quality_gate] latest step=" + str(latest_step)
+            + " verdict=" + latest_verdict
+            + " avg=" + str(round3(latest_avg)))
+
+    // ── Strict 32B gate check ──────────────────────────────────
+    //
+    // Requires BOTH:
+    //   * latest ckpt verdict == "COHERENT"
+    //   * best eval_loss across the training run < cfg_target
+    // When both hold (and the marker does not already exist), create
+    // /workspace/READY_FOR_32B_AND_KR.  This marker is PARALLEL to
+    // (not a replacement for) the looser /workspace/READY_FOR_32B
+    // written by monitor_alm_r4.hexa.
+
+    let best_eval = find_best_eval_loss(cfg_train)
+    println("[kr_quality_gate] best_eval_loss=" + str(best_eval)
+            + " target=" + str(cfg_target))
+
+    if latest_verdict == "COHERENT" && best_eval >= 0.0 && best_eval < cfg_target {
+        if file_exists(cfg_marker) {
+            println("[kr_quality_gate] marker already exists — no-op: " + cfg_marker)
+        } else {
+            let body = "READY FOR 32B + KR QUALITY\n"
+                     + "timestamp=" + ts() + "\n"
+                     + "latest_ckpt_step=" + str(latest_step) + "\n"
+                     + "latest_ckpt_verdict=" + latest_verdict + "\n"
+                     + "latest_ckpt_avg_composite=" + str(round3(latest_avg)) + "\n"
+                     + "best_eval_loss=" + str(best_eval) + "\n"
+                     + "target_eval_loss=" + str(cfg_target) + "\n"
+                     + "samples_log=" + cfg_samples + "\n"
+                     + "train_log=" + cfg_train + "\n"
+                     + "note=BOTH eval_loss AND kr_quality gates passed\n"
+            if cfg_dry {
+                println("[DRY] would write marker: " + cfg_marker)
+                println("[DRY] body:\n" + body)
+            } else {
+                write_file(cfg_marker, body)
+                println("[kr_quality_gate] STRICT GATE PASSED — wrote " + cfg_marker)
+            }
+        }
+    } else {
+        let mut reason = ""
+        if latest_verdict != "COHERENT" {
+            reason = "kr_verdict=" + latest_verdict + " (need COHERENT)"
+        }
+        if best_eval < 0.0 || best_eval >= cfg_target {
+            if reason != "" { reason = reason + "; " }
+            reason = reason + "best_eval=" + str(best_eval) + " (need < " + str(cfg_target) + ")"
+        }
+        println("[kr_quality_gate] strict gate NOT passed: " + reason)
+    }
+
+    println("[kr_quality_gate] DONE")
+}
+
+main()

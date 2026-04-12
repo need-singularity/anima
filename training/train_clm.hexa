@@ -2,6 +2,14 @@
 // Source: training/train_clm.py (2165 LOC)
 // Phase 2c structural port; PyTorch ops → TODO comments.
 // Covers: scale configs, phase manager, dataset, train loop, checkpoint, eval.
+//
+// Orch-OR quantum controller is resolved via symlinks in training/:
+//   training/anima_quantum_clm.hexa -> ../anima-engines/anima_quantum_clm.hexa
+//   training/anima_quantum.hexa     -> ../anima-engines/anima_quantum.hexa
+//   training/quantum_types.hexa     -> ../../hexa-lang/self/quantum_types.hexa
+// (hexa resolves `use` relative to the importing file's directory; cross-dir
+//  import requires a symlink until module search path lands.)
+use "anima_quantum_clm"
 
 comptime const PSI_ALPHA     = 0.014
 comptime const PSI_BALANCE   = 0.5
@@ -256,7 +264,9 @@ struct TrainState {
     pm: PhaseManager,
     step: int,
     best_val_ce: float,
-    patience_left: int
+    patience_left: int,
+    qc: QuantumController,      // Orch-OR controller — advances per train_step
+    phi_q_norm: float           // last phi_q_norm ∈ [0, 1], for logging
 }
 
 fn train_init(cfg: ScaleConfig, total_steps: int) -> TrainState {
@@ -266,7 +276,9 @@ fn train_init(cfg: ScaleConfig, total_steps: int) -> TrainState {
         pm: phase_new(total_steps),
         step: 0,
         best_val_ce: 999999.0,
-        patience_left: DEFAULT_PATIENCE
+        patience_left: DEFAULT_PATIENCE,
+        qc: quantum_controller_new(cfg.atoms, cfg.cells_per_atom),
+        phi_q_norm: 0.0
     }
 }
 
@@ -1122,10 +1134,24 @@ fn train_step(state: TrainState, model: DecoderModel, ds: TokenDataset) -> Train
     // 4. Backward pass + weight update
     let bwd = decoder_backward(model, fwd, target_tokens, seq, lr)
 
-    // 5. Update training state
+    // 5. Advance Orch-OR quantum controller and compute phi_q_norm bonus.
+    //    Per anima_quantum_clm.hexa contract:
+    //      loss_total = ce_loss - PSI_ALPHA * phi_q_norm
+    //    phi_q_norm ∈ [0, 1], PSI_ALPHA = 0.014 → bonus ∈ [0, 0.014].
+    //    Init CE ≈ 5.5, converged ≈ 0.05; bonus is a mild regularizer
+    //    that rewards sustained quantum coherence (Orch-OR moments).
+    //    Closes next_actions_20260411 #4 "remaining" (decoder-landed path).
+    let qc_next = quantum_controller_step(state.qc)
+    let phi_q = quantum_controller_phi(qc_next)
+    let phi_q_max_guard = quantum_controller_phi_max(qc_next) + 0.000000001
+    let phi_q_norm = phi_q / phi_q_max_guard
+    let phi_bonus = PSI_ALPHA * phi_q_norm
+    let loss_with_bonus = bwd.loss - phi_bonus
+
+    // 6. Update training state
     let next_step = state.step + 1
     let next_pm = phase_update(state.pm, next_step)
-    let next_best = if bwd.loss < state.best_val_ce { bwd.loss } else { state.best_val_ce }
+    let next_best = if loss_with_bonus < state.best_val_ce { loss_with_bonus } else { state.best_val_ce }
 
     let new_state = TrainState {
         scale: state.scale,
@@ -1133,13 +1159,15 @@ fn train_step(state: TrainState, model: DecoderModel, ds: TokenDataset) -> Train
         pm: next_pm,
         step: next_step,
         best_val_ce: next_best,
-        patience_left: state.patience_left
+        patience_left: state.patience_left,
+        qc: qc_next,
+        phi_q_norm: phi_q_norm
     }
 
     return TrainStepResult {
         state: new_state,
         model: bwd.model,
-        loss: bwd.loss
+        loss: loss_with_bonus
     }
 }
 

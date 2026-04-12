@@ -1,0 +1,650 @@
+// training/train_alm_14b_r5.hexa — ALM 14B r5 LoRA training SSOT (same-base K-quality path)
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   r4 achieved eval_loss 3.6466 -> 0.0289 (108x) but Korean generation at
+//   step 2000 is INCOHERENT: broken UTF-8, Chinese character leakage, English
+//   fragments. The low loss is an artifact of memorizing byte-pair sequences
+//   in a tokenizer that fragments Korean 3-7x more than English — local CE
+//   drops without ever learning Korean discourse structure.
+//
+//   r5 stays on the SAME base (Qwen/Qwen2.5-14B-Instruct) and retargets the
+//   hyperparameters at Korean *quality* rather than loss. A parallel agent
+//   owns the base-swap path (train_alm_14b_r5_kbase.*) — that is a separate
+//   lineage.
+//
+//   This .hexa file is the declarative SSOT for the r5 launch (config +
+//   diagnosis + memory budget + invariants). Run:
+//
+//     $HEXA training/train_alm_14b_r5.hexa
+//
+//   It prints the config and passes the `theorem` block — this is the
+//   parse+dry-run validation the launch script depends on.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// DIAGNOSIS OF r4 FAILURE (same base, loss down, quality broken)
+//
+//   [D1] Tokenizer mismatch — Qwen2.5 BBPE is English/Chinese heavy.
+//        '안녕하세요' ~= 5-7 BPE tokens vs 'hello' = 1 token.
+//        A typical namuwiki sentence (~30 chars) = ~50-70 tokens.
+//        Korean syllables rarely map to single tokens, so CE is computed
+//        over fine-grained sub-syllable pieces whose local transitions are
+//        easy to memorize without learning word/sentence-level Korean.
+//
+//   [D2] LoRA capacity too shallow for a language transplant.
+//        r4: r=64, 7 modules, 48 layers = 300.4 M trainable (2.15% of 14B).
+//        This is ample for *style* transfer but tight for *language prior*
+//        injection: Korean needs to reshape attention routing AND re-weight
+//        the learned MLP feature bank, and 300 M with r=64 has limited low-
+//        rank subspace. r=128 doubles that to 600.8 M (4.29%), still LoRA
+//        but meaningfully more expressive.
+//
+//   [D3] Token embeddings + lm_head are FROZEN in r4.
+//        Qwen's Korean token embeddings were trained mostly on crawled Web
+//        Korean at small scale, and lm_head projects to the same 152 064
+//        vocab. LoRA on q/k/v/o/gate/up/down cannot move the embedding
+//        manifold at all, so Korean tokens stay wherever Qwen's pretrain
+//        put them — which for low-frequency Hangul pieces is "near random".
+//        Unfreezing embed_tokens + lm_head lets r5 drag Korean tokens into
+//        a coherent region of representation space.
+//
+//   [D4] Corpus coverage math — 0.18 epoch seen in r4.
+//        835 MB namuwiki UTF-8 ~= 278 M chars ~= 445 M Qwen tokens
+//        (tokens/char ~= 1.6 on Korean).  r4 sees 10 000 * 8 * 1024 = 82 M
+//        tokens across training = ~0.18 epoch. Randomly sampled block
+//        windows with no document-boundary respect means every draw cuts
+//        Korean mid-sentence, so the model effectively never sees clean
+//        SOS/EOS boundaries. r5 doubles steps (10k -> 20k) for ~0.37 epoch
+//        AND uses document-aware sampling inside the trainer (see D5).
+//
+//   [D5] No instruction template, no document separator.
+//        train_alm_14b.py concatenates the entire corpus as one token
+//        stream and samples fixed-size windows with stride 1 (see
+//        TextDataset). Zero chat_template formatting, zero <|im_start|>
+//        or BOS insertion, no doc boundary handling. The base model is
+//        `Qwen/Qwen2.5-14B-Instruct` which expects chat-formatted inputs;
+//        training on raw corpus overwrites the instruction-following prior
+//        with fragmentary Korean noise. r5 prepends a document separator
+//        (tokenizer.eos_token) between randomly sampled documents before
+//        tokenization — minimal change, big discourse signal.
+//
+//   [D6] LR is far too conservative for LoRA on a frozen base.
+//        Standard LoRA practice: LR 1e-4 .. 3e-4 for adapters on a frozen
+//        model. r4 used 5e-6 which is full-fine-tune territory — the
+//        adapters barely moved, then warmup=500 (5% of steps) eased into
+//        cosine decay that immediately tapered what little signal they had.
+//        r5 uses LR_max=1e-4 (20x higher) with warmup=2000 (10% of steps,
+//        4x longer) so the adapters can actually learn Korean structure
+//        without a cliff at the start.
+//
+//   [D7] LoRA dropout 0.05 is too low — the model memorized fast.
+//        With r=128 and LR=1e-4 we bump dropout to 0.10 to damp memorization
+//        pressure and force the adapters to generalize over the corpus.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// r5 CHANGES vs r4 (high-confidence, Korean-quality targeted)
+//
+//   C1  LoRA r           64   -> 128       [D2]  (2x capacity)
+//   C2  LoRA alpha       128  -> 256       [D2]  (keep 2:1 ratio)
+//   C3  target_modules   7    -> 9         [D3]  (+embed_tokens +lm_head)
+//   C4  lr               5e-6 -> 1e-4      [D6]  (20x, std LoRA range)
+//   C5  warmup           500  -> 2000      [D6]  (4x, 10% of steps)
+//   C6  steps            10k  -> 20k       [D4]  (0.37 epoch coverage)
+//   C7  lora_dropout     0.05 -> 0.10      [D7]  (damp memorization)
+//   C8  doc_separator    OFF  -> ON        [D5]  (EOS between docs)
+//   C9  eval cadence     500  -> 500       UNCHANGED (signal density)
+//   C10 save cadence     2000 -> 2000      UNCHANGED (R2 cadence)
+//
+//   UNCHANGED (intentional parity with r4, cleanest A/B):
+//     base, batch=1, grad_accum=8, seq=1024, AdamW/bf16/foreach=False,
+//     corpus=/workspace/anima/training/corpus_large.txt
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// MEMORY BUDGET (80 GB H100)
+//
+//   Qwen2.5-14B-Instruct reference config:
+//     hidden_size       = 5120
+//     intermediate_size = 13824
+//     num_hidden_layers = 48
+//     num_attention_heads = 40 (head_dim 128)
+//     num_key_value_heads = 8  (GQA)
+//     vocab_size        = 152064
+//
+//   LoRA param count (r=128, 7 proj modules, 48 layers):
+//     attn q/k/v/o : 4 * 2 * hidden * r * n_layer
+//                  = 4 * 2 * 5120 * 128 * 48            ~= 251.7 M
+//     mlp gate/up  : 2 * (hidden*r + r*inter) * n_layer
+//                  = 2 * (5120*128 + 128*13824) * 48    ~= 232.8 M
+//     mlp down     : (inter*r + r*hidden) * n_layer
+//                  = (13824*128 + 128*5120) * 48        ~= 116.4 M
+//                                             proj total ~= 600.8 M
+//
+//   Unfrozen full-rank (C3): embed_tokens and lm_head are not LoRA-wrapped
+//   in the standard PEFT recipe — they are promoted to trainable via
+//   `modules_to_save=["embed_tokens", "lm_head"]`. Each is vocab*hidden:
+//     embed_tokens : 152064 * 5120                    ~= 778.6 M
+//     lm_head      : 152064 * 5120                    ~= 778.6 M
+//   Note: Qwen2.5-14B does NOT tie embed_tokens <-> lm_head (tie_word_embeddings
+//     = False in the HF config), so they are separate tensors. Both must be
+//     promoted — hence 2 copies in the budget below.
+//
+//   Budget (BATCH=1, SEQ=1024, grad_ckpt ON, bf16 everywhere, AdamW fp32 moments):
+//
+//     +-----------------------------+-----------+-----------+
+//     | component                   | 14B r4    | 14B r5    |
+//     +-----------------------------+-----------+-----------+
+//     | base weights (bf16, frozen) |  28.0 GB  |  24.9 GB  |  (*)
+//     | LoRA proj (bf16)            |   0.60 GB |   1.20 GB |
+//     | LoRA proj grads (bf16)      |   0.60 GB |   1.20 GB |
+//     | AdamW m+v proj (fp32 2xr)   |   2.40 GB |   4.81 GB |
+//     | embed_tokens bf16 (unfroz)  |      0    |   1.56 GB |
+//     | lm_head bf16 (unfroz)       |      0    |   1.56 GB |
+//     | embed/lm_head grads (bf16)  |      0    |   3.11 GB |
+//     | embed/lm_head optim (fp32)  |      0    |  12.46 GB |
+//     | activations (grad_ckpt on)  |   4.5 GB  |   5.0 GB  |
+//     | cuBLAS + autograd overhead  |   2.0 GB  |   2.5 GB  |
+//     +-----------------------------+-----------+-----------+
+//     | expected resident           |  38.1 GB  |  58.3 GB  |
+//     | headroom on 80 GB H100      |  41.9 GB  |  21.7 GB  |
+//     +-----------------------------+-----------+-----------+
+//
+//   (*) 14B frozen weights: "14B" is rounded — Qwen2.5-14B is ~14.8 B params
+//       including embeddings. Net frozen portion in r5 excludes the ~1.56 B
+//       we promote to trainable, so the base_gb line drops by ~3.1 GB vs r4.
+//
+//   The 58 GB resident leaves 22 GB of headroom on the 80 GB H100. Biggest
+//   risk is the AdamW fp32 moments on the promoted embed/lm_head tensors
+//   (12.5 GB alone). If OOM at warmup, the fallback order is documented
+//   in the launcher preflight: drop seq 1024 -> 768 (-0.5 GB), then r
+//   128 -> 96 (-0.7 GB), then disable embed_tokens promotion (-7.1 GB,
+//   losing C3 — last resort only).
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// EXPECTED THROUGHPUT & ETA
+//
+//   r4 throughput: ~18.5 step/min (observed). r5 per-step cost grows because:
+//     - LoRA r doubled: adapter mm 2x (small absolute delta).
+//     - embed_tokens + lm_head are now trainable: backward pass writes
+//       777 M fp32 grads each step (two 3 GB gradient tensors) + AdamW
+//       applies two fp32 moments over them.
+//     - Net step time overhead ~= +15-25%.
+//
+//   Expected r5 throughput: ~14-15 step/min.
+//   ETA for 20 000 steps: 20000 / 14 ~= 1428 min ~= 23.8 h (conservative)
+//                         20000 / 15 ~= 1333 min ~= 22.2 h (optimistic)
+//   plan horizon: ~24 h.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// TRIGGER CONDITION
+//
+//   REQUIRES: marker file /workspace/READY_FOR_R5 exists on the pod. Marker
+//             is created manually by the ops owner after (a) r4 has either
+//             completed 10k steps or been killed for quality, and (b) the
+//             H100 is free. The sister base-swap agent uses a DIFFERENT
+//             marker /workspace/READY_FOR_R5_KBASE — they must never share.
+//
+//   Preflight also enforces: r4 ckpt dir is NOT being written to
+//   (no running Python process owning /workspace/ckpt_alm_14b_r4).
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// EARLY-ABORT SIGNALS (quality, not loss)
+//
+//   The whole point of r5 is that eval_loss alone is a liar. The launcher
+//   should watch for these *in addition* to loss:
+//
+//     step 500  : Manual sample 3 generations after a Korean prompt like
+//                 '안녕, 오늘 기분 어때?' — expect Korean-only output, no
+//                 Chinese character leakage, UTF-8 valid. If ANY generation
+//                 contains CJK non-Hangul or broken UTF-8 bytes, ABORT.
+//     step 1000 : Char-level Hangul ratio in 100-token sample must be >0.70.
+//                 If <0.50, ABORT (model still English/Chinese-majority).
+//     step 2000 : Run eval_alm_14b.py with --korean-quality flag (char
+//                 Hangul ratio, CJK-leak count, UTF-8 validity). Target:
+//                 Hangul ratio >0.80 AND zero UTF-8 errors in 10 samples.
+//
+//   Any early-abort must be recorded in shared/convergence/anima.json as an
+//   ossified troubleshoot record (feedback_troubleshoot_ossified.md).
+//
+// ═══════════════════════════════════════════════════════════════════════════
+
+comptime const PSI_ALPHA   = 0.014
+comptime const PSI_BALANCE = 0.5
+comptime const PSI_STEPS   = 4.33
+
+// r5 hyperparameters (see C1..C10 above)
+comptime const R5_LR            = 0.0001      // 1e-4, 20x r4 [C4]
+comptime const R5_WARMUP        = 2000        // 10% of steps [C5]
+comptime const R5_GRAD_ACCUM    = 8           // effective batch = 1 * 8 = 8
+comptime const R5_BATCH         = 1
+comptime const R5_SEQ           = 1024
+comptime const R5_LORA_R        = 128         // 2x r4 [C1]
+comptime const R5_LORA_ALPHA    = 256         // keep 2:1 ratio [C2]
+comptime const R5_LORA_DROPOUT  = 0.10        // 2x r4 [C7]
+comptime const R5_STEPS         = 20000       // 2x r4 [C6]
+comptime const R5_SAVE_EVERY    = 2000
+comptime const R5_EVAL_EVERY    = 500
+comptime const R5_ROUND         = 5
+
+// r4 telemetry (reference only, not used in control flow)
+comptime const R4_BEST_EVAL     = 0.0289
+comptime const R4_STEP_PER_MIN  = 18
+
+// ─── Base model registry (14B, same as r4) ───
+struct BaseModel {
+    name: string,
+    hf_id: string,
+    n_params_b: int,
+    hidden: int,
+    inter: int,
+    n_layer: int,
+    n_head: int,
+    n_kv_head: int,
+    head_dim: int,
+    vocab_size: int,
+    tie_embed: int      // 0 = separate embed/lm_head, 1 = tied
+}
+
+fn base_qwen_14b() -> BaseModel {
+    // Qwen/Qwen2.5-14B-Instruct reference config. Source: HF model card.
+    // tie_word_embeddings = False -> embed_tokens and lm_head are separate.
+    BaseModel {
+        name: "qwen2.5-14b-instruct",
+        hf_id: "Qwen/Qwen2.5-14B-Instruct",
+        n_params_b: 14,
+        hidden: 5120,
+        inter: 13824,
+        n_layer: 48,
+        n_head: 40,
+        n_kv_head: 8,
+        head_dim: 128,
+        vocab_size: 152064,
+        tie_embed: 0
+    }
+}
+
+// ─── LoRA spec (7 projection modules, same as r4) + unfrozen embed/lm_head ───
+struct LoraSpec {
+    r: int,
+    alpha: int,
+    dropout: float,
+    n_proj_modules: int,      // q/k/v/o + gate/up/down = 7
+    attn_modules: int,
+    mlp_modules: int,
+    unfreeze_embed: int,      // 1 = modules_to_save includes embed_tokens
+    unfreeze_lm_head: int     // 1 = modules_to_save includes lm_head
+}
+
+fn r5_lora_spec() -> LoraSpec {
+    LoraSpec {
+        r: R5_LORA_R,
+        alpha: R5_LORA_ALPHA,
+        dropout: R5_LORA_DROPOUT,
+        n_proj_modules: 7,
+        attn_modules: 4,
+        mlp_modules: 3,
+        unfreeze_embed: 1,
+        unfreeze_lm_head: 1
+    }
+}
+
+// ─── LoRA parameter count (analytic, used by theorem block) ───
+// For each layer:
+//   attn q/k/v/o : 4 * 2 * hidden * r
+//   mlp gate/up  : 2 * (hidden*r + r*inter)
+//   mlp down     : inter*r + r*hidden
+fn lora_proj_params_per_layer(base: BaseModel, spec: LoraSpec) -> int {
+    let attn_p = 4 * 2 * base.hidden * spec.r
+    let gate_up_p = 2 * (base.hidden * spec.r + spec.r * base.inter)
+    let down_p = base.inter * spec.r + spec.r * base.hidden
+    attn_p + gate_up_p + down_p
+}
+
+fn lora_proj_params_total(base: BaseModel, spec: LoraSpec) -> int {
+    lora_proj_params_per_layer(base, spec) * base.n_layer
+}
+
+fn unfrozen_embed_params(base: BaseModel, spec: LoraSpec) -> int {
+    let embed_p = base.vocab_size * base.hidden
+    let mut out = 0
+    if spec.unfreeze_embed == 1 { out = out + embed_p }
+    if spec.unfreeze_lm_head == 1 { out = out + embed_p }
+    out
+}
+
+fn trainable_params_total(base: BaseModel, spec: LoraSpec) -> int {
+    lora_proj_params_total(base, spec) + unfrozen_embed_params(base, spec)
+}
+
+// ─── Memory budget (bytes; see header breakdown) ───
+// base (bf16, frozen minus promoted) + LoRA bf16 + LoRA grad bf16
+// + embed/lm_head bf16 + embed/lm_head grads bf16
+// + AdamW m+v (fp32, 8 B / trainable param) + activations + overhead
+struct MemoryBudget {
+    base_gb: float,
+    lora_proj_gb: float,
+    lora_proj_grad_gb: float,
+    lora_proj_optim_gb: float,
+    unfroz_gb: float,
+    unfroz_grad_gb: float,
+    unfroz_optim_gb: float,
+    act_gb: float,
+    overhead_gb: float,
+    total_gb: float,
+    headroom_gb: float      // against 80 GB H100
+}
+
+fn estimate_memory(base: BaseModel, spec: LoraSpec) -> MemoryBudget {
+    // Frozen weights in bf16: 2 B/param. 14 B params * 2 ~= 28 GB.
+    // Subtract the portion we promoted to trainable so we don't double-count
+    // it in both base_gb AND unfroz_gb.
+    let raw_base_gb = 2.0 * (base.n_params_b * 1.0)
+    let unfroz_p = unfrozen_embed_params(base, spec)
+    let unfroz_gb_bf16 = (unfroz_p * 2.0) / 1000000000.0
+    let base_gb = raw_base_gb - unfroz_gb_bf16
+
+    // LoRA projection adapters
+    let lora_p = lora_proj_params_total(base, spec)
+    let lora_gb       = (lora_p * 2.0) / 1000000000.0
+    let lora_grad_gb  = (lora_p * 2.0) / 1000000000.0
+    let lora_optim_gb = (lora_p * 8.0) / 1000000000.0
+
+    // Unfrozen embed/lm_head: weights already counted above as unfroz_gb_bf16.
+    // Grads are bf16 (same size) and AdamW moments are fp32 (8 B/param).
+    let unfroz_grad_gb  = unfroz_gb_bf16
+    let unfroz_optim_gb = (unfroz_p * 8.0) / 1000000000.0
+
+    // Activations with gradient checkpointing at seq=1024, bf16, 48 layers.
+    // r4 anchor: ~4.5 GB. r5 slightly higher (+0.5 GB) because lm_head
+    // grads are full vocab so the final-layer activation is larger.
+    let act_gb = 5.0
+
+    // cuBLAS workspaces + autograd bookkeeping + misc.
+    let overhead_gb = 2.5
+
+    let total = base_gb
+              + lora_gb + lora_grad_gb + lora_optim_gb
+              + unfroz_gb_bf16 + unfroz_grad_gb + unfroz_optim_gb
+              + act_gb + overhead_gb
+    MemoryBudget {
+        base_gb: base_gb,
+        lora_proj_gb: lora_gb,
+        lora_proj_grad_gb: lora_grad_gb,
+        lora_proj_optim_gb: lora_optim_gb,
+        unfroz_gb: unfroz_gb_bf16,
+        unfroz_grad_gb: unfroz_grad_gb,
+        unfroz_optim_gb: unfroz_optim_gb,
+        act_gb: act_gb,
+        overhead_gb: overhead_gb,
+        total_gb: total,
+        headroom_gb: 80.0 - total
+    }
+}
+
+// ─── Optimizer (bf16 master rule, foreach=False per R04) ───
+struct AlmOptim {
+    lr: float,
+    warmup: int,
+    grad_accum: int,
+    batch: int,
+    seq: int,
+    bf16: bool,
+    foreach_false: bool
+}
+
+fn r5_optim() -> AlmOptim {
+    AlmOptim {
+        lr: R5_LR,
+        warmup: R5_WARMUP,
+        grad_accum: R5_GRAD_ACCUM,
+        batch: R5_BATCH,
+        seq: R5_SEQ,
+        bf16: true,
+        foreach_false: true
+    }
+}
+
+// ─── Checkpoint policy (R2 upload mandatory, feedback_r2_checkpoint) ───
+struct CheckpointPolicy {
+    ckpt_dir: string,
+    save_every: int,
+    eval_every: int,
+    r2_bucket: string,
+    r2_prefix: string,
+    model_tag: string,
+    round_num: int
+}
+
+fn r5_checkpoint_policy() -> CheckpointPolicy {
+    CheckpointPolicy {
+        ckpt_dir:   "/workspace/ckpt_alm_14b_r5",
+        save_every: R5_SAVE_EVERY,
+        eval_every: R5_EVAL_EVERY,
+        r2_bucket:  "anima-models",
+        r2_prefix:  "alm14b/r5",
+        model_tag:  "alm14b",
+        round_num:  R5_ROUND
+    }
+}
+
+// ─── Trigger gate (READY_FOR_R5 marker — MUST NOT share with READY_FOR_R5_KBASE) ───
+struct TriggerGate {
+    marker_path: string,
+    forbidden_markers: string,   // comma list, for preflight to reject sharing
+    purpose: string
+}
+
+fn r5_trigger_gate() -> TriggerGate {
+    TriggerGate {
+        marker_path: "/workspace/READY_FOR_R5",
+        forbidden_markers: "/workspace/READY_FOR_R5_KBASE,/workspace/READY_FOR_32B",
+        purpose: "same-base K-quality tune on Qwen2.5-14B-Instruct"
+    }
+}
+
+// ─── Corpus (corpus_large.txt, 835 MB, already on pod) ───
+struct CorpusSpec {
+    path: string,
+    size_mb: int,
+    block_size: int,
+    doc_separator: int,      // 1 = insert tokenizer.eos_token between docs
+    shuffle_docs: int,       // 1 = shuffle document order before tokenization
+    dedupe: int              // 1 = drop exact-duplicate lines
+}
+
+fn r5_corpus() -> CorpusSpec {
+    CorpusSpec {
+        path: "/workspace/anima/training/corpus_large.txt",
+        size_mb: 835,
+        block_size: R5_SEQ,
+        doc_separator: 1,
+        shuffle_docs: 1,
+        dedupe: 1
+    }
+}
+
+// ─── ETA estimate (conservative / optimistic) ───
+struct EtaEstimate {
+    steps: int,
+    steps_per_min_conservative: int,   // 14 -> ~24 h
+    steps_per_min_optimistic: int,     // 15 -> ~22 h
+    eta_hours_conservative: int,
+    eta_hours_optimistic: int
+}
+
+fn r5_eta() -> EtaEstimate {
+    let steps = R5_STEPS
+    let sp_cons = 14
+    let sp_opt = 15
+    // integer hours, round up
+    let h_cons = ((steps / sp_cons) + 59) / 60
+    let h_opt  = ((steps / sp_opt)  + 59) / 60
+    EtaEstimate {
+        steps: steps,
+        steps_per_min_conservative: sp_cons,
+        steps_per_min_optimistic:   sp_opt,
+        eta_hours_conservative:     h_cons,
+        eta_hours_optimistic:       h_opt
+    }
+}
+
+// ─── R5 master state (everything the launch script needs in one struct) ───
+struct Alm14bR5 {
+    base: BaseModel,
+    lora: LoraSpec,
+    mem: MemoryBudget,
+    opt: AlmOptim,
+    ckpt: CheckpointPolicy,
+    gate: TriggerGate,
+    corpus: CorpusSpec,
+    eta: EtaEstimate,
+    total_steps: int
+}
+
+fn r5_init() -> Alm14bR5 {
+    let base = base_qwen_14b()
+    let lora = r5_lora_spec()
+    Alm14bR5 {
+        base: base,
+        lora: lora,
+        mem: estimate_memory(base, lora),
+        opt: r5_optim(),
+        ckpt: r5_checkpoint_policy(),
+        gate: r5_trigger_gate(),
+        corpus: r5_corpus(),
+        eta: r5_eta(),
+        total_steps: R5_STEPS
+    }
+}
+
+// ─── Verification (prints summary + runs theorem assertions) ───
+let r5 = r5_init()
+
+println("=== train_alm_14b_r5.hexa (same-base K-quality) ===")
+println("base         :", r5.base.hf_id)
+println("params (B)   :", r5.base.n_params_b)
+println("hidden       :", r5.base.hidden)
+println("inter        :", r5.base.inter)
+println("layers       :", r5.base.n_layer)
+println("vocab        :", r5.base.vocab_size)
+println("tie_embed    :", r5.base.tie_embed)
+println("LoRA r       :", r5.lora.r)
+println("LoRA alpha   :", r5.lora.alpha)
+println("LoRA dropout :", r5.lora.dropout)
+println("proj modules :", r5.lora.n_proj_modules)
+println("unfreeze emb :", r5.lora.unfreeze_embed)
+println("unfreeze lmh :", r5.lora.unfreeze_lm_head)
+let proj_p_per_l = lora_proj_params_per_layer(r5.base, r5.lora)
+let proj_p_total = lora_proj_params_total(r5.base, r5.lora)
+let unfroz_p     = unfrozen_embed_params(r5.base, r5.lora)
+let train_p      = trainable_params_total(r5.base, r5.lora)
+println("LoRA proj/layer  :", proj_p_per_l)
+println("LoRA proj total  :", proj_p_total)
+println("unfrozen emb+lmh :", unfroz_p)
+println("trainable total  :", train_p)
+println("batch        :", r5.opt.batch)
+println("grad_accum   :", r5.opt.grad_accum)
+println("seq          :", r5.opt.seq)
+println("lr           :", r5.opt.lr)
+println("warmup       :", r5.opt.warmup)
+println("steps        :", r5.total_steps)
+println("save_every   :", r5.ckpt.save_every)
+println("eval_every   :", r5.ckpt.eval_every)
+println("ckpt_dir     :", r5.ckpt.ckpt_dir)
+println("r2_prefix    :", r5.ckpt.r2_prefix)
+println("corpus       :", r5.corpus.path)
+println("corpus MB    :", r5.corpus.size_mb)
+println("doc sep      :", r5.corpus.doc_separator)
+println("shuffle docs :", r5.corpus.shuffle_docs)
+println("dedupe       :", r5.corpus.dedupe)
+println("--- memory budget (GB, 80 GB H100) ---")
+println("base (frozen)    :", r5.mem.base_gb)
+println("lora proj        :", r5.mem.lora_proj_gb)
+println("lora proj grad   :", r5.mem.lora_proj_grad_gb)
+println("lora proj optim  :", r5.mem.lora_proj_optim_gb)
+println("unfroz emb/lmh   :", r5.mem.unfroz_gb)
+println("unfroz grads     :", r5.mem.unfroz_grad_gb)
+println("unfroz optim     :", r5.mem.unfroz_optim_gb)
+println("activations      :", r5.mem.act_gb)
+println("overhead         :", r5.mem.overhead_gb)
+println("TOTAL            :", r5.mem.total_gb)
+println("headroom (80GB)  :", r5.mem.headroom_gb)
+println("--- ETA ---")
+println("step/min cons:", r5.eta.steps_per_min_conservative)
+println("step/min opt :", r5.eta.steps_per_min_optimistic)
+println("eta h cons   :", r5.eta.eta_hours_conservative)
+println("eta h opt    :", r5.eta.eta_hours_optimistic)
+println("--- trigger gate ---")
+println("marker       :", r5.gate.marker_path)
+println("forbidden    :", r5.gate.forbidden_markers)
+println("purpose      :", r5.gate.purpose)
+
+theorem alm_14b_r5_invariants {
+    // alpha:r stays 2:1 (matches r4 family convention)
+    assert R5_LORA_ALPHA == R5_LORA_R * 2
+
+    // Effective batch stays at 8 (clean A/B vs r4)
+    assert R5_BATCH * R5_GRAD_ACCUM == 8
+
+    // STEPS is exactly double r4 (coverage doubling per [D4])
+    assert R5_STEPS == 20000
+
+    // Warmup is 10% of steps ([C5])
+    assert R5_WARMUP == R5_STEPS / 10
+
+    // LoRA r doubled vs r4 ([C1])
+    assert R5_LORA_R == 64 * 2
+
+    // Dropout doubled vs r4 ([C7])
+    assert R5_LORA_DROPOUT == 0.10
+
+    // LR is 20x r4 (std LoRA range, see [D6])
+    assert R5_LR == 0.0001
+
+    // Round = 5 (fresh lineage, no resume)
+    assert R5_ROUND == 5
+
+    // Save cadence matches r4 (R2 upload rhythm)
+    assert R5_SAVE_EVERY == 2000
+
+    // Eval cadence matches r4 (signal density)
+    assert R5_EVAL_EVERY == 500
+
+    // PSI constants unchanged
+    assert PSI_ALPHA == 0.014
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PYTHON DEPLOYMENT NOTE
+// ═══════════════════════════════════════════════════════════════════════════
+// hexa-lang has no native CUDA bindings yet (stdlib/nn.hexa is CPU-only) so
+// the actual fwd/bwd kernel path still routes through
+// training/train_alm_14b.py on the pod. This .hexa file is the authoritative
+// config + dry-run validation; launch_alm_14b_r5.sh reads these constants
+// (via the printed summary or by shelling out to `hexa ...` and grepping)
+// and then invokes the pod's Python trainer with r5 flags:
+//
+//   python3 /workspace/train_alm_14b.py \
+//     --base Qwen/Qwen2.5-14B-Instruct \
+//     --corpus /workspace/anima/training/corpus_large.txt \
+//     --steps 20000 --lr 1e-4 --batch 1 --grad-accum 8 --seq 1024 \
+//     --warmup 2000 \
+//     --lora-r 128 --lora-alpha 256 --lora-dropout 0.10 \
+//     --target-modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj \
+//     --unfreeze-embed --unfreeze-lm-head \
+//     --doc-separator --shuffle-docs --dedupe \
+//     --ckpt-dir /workspace/ckpt_alm_14b_r5 \
+//     --save-every 2000 --eval-every 500 \
+//     --model-tag alm14b --round 5
+//
+// IMPORTANT: the pod's train_alm_14b.py must already support --target-modules,
+// --unfreeze-embed, --unfreeze-lm-head, --doc-separator, --shuffle-docs,
+// --dedupe. These args are NOT in the repo copy at training/train_alm_14b.py
+// (which hardcodes target_modules and lacks data-prep flags). The r4 run
+// proved the pod has a patched version with --target-modules at minimum.
+// The r5 launcher (launch_alm_14b_r5.sh) runs a dry `--help` check in
+// preflight and aborts if any of the new flags are missing — the fix must
+// land on the pod first.
+//
+// When hexa-lang ships native cuBLAS bindings (see AN3), this file will
+// absorb the full train loop and the Python trainer will be archived (R7).
+// ═══════════════════════════════════════════════════════════════════════════
