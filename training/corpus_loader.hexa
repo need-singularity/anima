@@ -1,13 +1,21 @@
 // training/corpus_loader.hexa — File-based corpus loader for CLM/ALM
 //
 // Loads pre-tokenized corpus from a text file.
-// Format: space-separated integers, one per byte (0-255 for byte-level).
+// Supported formats:
+//   (A) one integer per line   (preferred — O(n), fast)
+//   (B) space-separated integers on one line (legacy — auto-detected)
 //
 // Preparation (on H100 server):
+//   # Format A — one integer per line (recommended):
 //   python3 -c "
 //   text = open('corpus.txt','rb').read()
-//   print(' '.join(str(b) for b in text))
+//   print('\n'.join(str(b) for b in text))
 //   " > /workspace/corpus.tok
+//
+//   # Convert legacy space-separated → line-based:
+//   python3 -c "
+//   import sys; [print(t) for t in open(sys.argv[1]).read().split()]
+//   " /workspace/corpus.tok > /workspace/corpus_lines.tok
 //
 // Usage in training scripts:
 //   use "corpus_loader"
@@ -15,42 +23,75 @@
 //   let window = corpus_window(corpus, start, SEQ)
 
 // ─── Whitespace split (shared with eval_clm) ────────────────
+// PERF FIX 2026-04-12: replaced O(n²) char-by-char concat (cur = cur + ch)
+// with native .split(" ") built-in. The old version hung for >5 min on 63K
+// tokens because hexa string concat is O(n) per character in interpreter.
 
 fn split_ws(s: string) -> [string] {
-    let n = len(s)
+    // Use native .split(" ") — runs in host language, not interpreted.
+    // Then filter empty strings from consecutive spaces/leading/trailing.
+    let raw_parts = s.split(" ")
+    let n = len(raw_parts)
     let mut parts = []
-    let mut cur = ""
     let mut i = 0
     while i < n {
-        let ch = s.substring(i, i + 1)
-        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" {
-            if cur != "" {
-                parts = parts.push(cur)
-                cur = ""
-            }
-        } else {
-            cur = cur + ch
+        let p = raw_parts[i].trim()
+        if p != "" {
+            parts = parts.push(p)
         }
         i = i + 1
     }
-    if cur != "" { parts = parts.push(cur) }
     return parts
 }
 
 // ─── Load pre-tokenized corpus ──────────────────────────────
+// PERF FIX 2026-04-12: O(n²) → O(n) for line-based format.
+// Old: read_file → split_ws (char-by-char O(n²)) → push loop (O(n²) list copy)
+// New: read_lines (native built-in) → to_int per line → push loop
+// The read_lines built-in returns [string] directly from the host runtime,
+// avoiding the interpreted split_ws entirely. Auto-detects format by
+// checking if the first line contains a space.
 
 fn load_corpus(path: string) -> [int] {
     println("[corpus] loading: " + path)
-    let raw = read_file(path)
-    let parts = split_ws(raw)
-    let n = len(parts)
+    let lines = read_lines(path)
+    let n_lines = len(lines)
+
+    // ── Auto-detect format ──
+    // Line-based (A): each line is a single integer (no spaces)
+    // Space-separated (B): first line contains spaces between integers
+    let first_line = if n_lines > 0 { lines[0].trim() } else { "" }
+    let is_legacy = first_line.contains(" ")
+
+    if is_legacy {
+        // Legacy space-separated format: use native .split(" ")
+        println("[corpus] detected legacy space-separated format")
+        let raw = read_file(path)
+        let parts = split_ws(raw)
+        let n = len(parts)
+        let mut tokens = []
+        let mut i = 0
+        while i < n {
+            tokens = tokens.push(to_int(parts[i]))
+            i = i + 1
+        }
+        println("[corpus] loaded " + str(n) + " tokens from " + path)
+        return tokens
+    }
+
+    // Line-based format: one integer per line — O(n)
     let mut tokens = []
+    let mut count = 0
     let mut i = 0
-    while i < n {
-        tokens = tokens.push(to_int(parts[i]))
+    while i < n_lines {
+        let line = lines[i].trim()
+        if line != "" {
+            tokens = tokens.push(to_int(line))
+            count = count + 1
+        }
         i = i + 1
     }
-    println("[corpus] loaded " + str(n) + " tokens from " + path)
+    println("[corpus] loaded " + str(count) + " tokens from " + path)
     return tokens
 }
 

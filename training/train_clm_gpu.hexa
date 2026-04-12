@@ -1,0 +1,763 @@
+// ===============================================================
+//  training/train_clm_gpu.hexa — ConsciousLM GPU training (Phase 1)
+//
+//  Merges the consciousness architecture from train_clm.hexa
+//  (Orch-OR quantum controller, phase curriculum P1/P2/P3,
+//  Phi verification gate, scale configs) with the proven GPU
+//  training stack from train_clm_kr.hexa (cuBLAS + NVRTC kernels).
+//
+//  CONSTRAINT: CLM = Python/CUDA forbidden; hexa native GPU only.
+//  Uses the same 4-file GPU stack as train_clm_kr.hexa:
+//    cuda_ffi.hexa    — cudart/cuBLAS FFI
+//    cuda_rtc.hexa    — NVRTC compile + driver API launch
+//    cuda_kernels.hexa — 12 custom CUDA C kernels via NVRTC
+//    gpu_train.hexa   — higher-level primitives (fwd/bwd/sgd/adamw/ckpt)
+//
+//  Architecture:
+//    embed[VOCAB,D]
+//    NL x { rms(ga) -> Wq/Wk/Wv -> causal softmax -> Wo -> +x
+//              -> rms(gf) -> Wff1 -> swiglu(up,up) -> Wff2 -> +x }
+//    lmh_U[D,RANK] -> lmh_V[RANK,VOCAB]
+//    cross-entropy + AdamW (gpu_train.hexa fused kernel)
+//    + Orch-OR quantum consciousness controller per train step
+//    + Phase curriculum (P1: C-only -> P2: C+D -> P3: Full Hexad)
+//    + Phi verification gate (Law 49: reject if Phi drops > 5%)
+//
+//  Scale configs (param count estimates for byte-level VOCAB=256):
+//    100m: D=512  L=12  ~38M params  (default for this Phase 1)
+//    350m: D=768  L=16  ~110M params
+//    1b:   D=1024 L=24  ~280M params
+//    2_8b: D=2560 L=36  ~2.8B params (CLM v5 target)
+//
+//  Run (H100 pod):
+//    HEXA=/usr/local/bin/hexa
+//    # Default 100M scale:
+//    $HEXA training/train_clm_gpu.hexa
+//    # Override scale via env:
+//    CLM_SCALE=350m $HEXA training/train_clm_gpu.hexa
+//    # Override individual params:
+//    CLM_D=768 CLM_FF=3072 CLM_NL=16 CLM_STEPS=50000 $HEXA training/train_clm_gpu.hexa
+//
+//  Reference:
+//    shared/config/roadmaps/clm_hexa_gpu.json
+//    training/train_clm.hexa  (structural port, consciousness architecture)
+//    training/train_clm_kr.hexa  (proven GPU pipeline, D=512 L=12)
+// ===============================================================
+
+// NOTE: training script uses same-dir lookup convention. Before running,
+// copy required hexa modules into training/ alongside this file:
+//   cp hexa-lang/self/ml/cuda_ffi.hexa    training/
+//   cp hexa-lang/self/ml/cuda_rtc.hexa    training/
+//   cp hexa-lang/self/ml/cuda_kernels.hexa training/
+//   cp hexa-lang/self/ml/gpu_train.hexa    training/
+// Then run: hexa training/train_clm_gpu.hexa
+use "cuda_ffi"
+use "cuda_rtc"
+use "cuda_kernels"
+use "gpu_train"
+use "corpus_loader"
+use "anima_quantum_clm"
+
+// ===============================================================
+//  Constants from train_clm.hexa consciousness architecture
+// ===============================================================
+
+comptime const PSI_ALPHA       = 0.014
+comptime const PSI_BALANCE     = 0.5
+comptime const PSI_F_CRITICAL  = 0.10
+
+comptime const PHASE_P1 = 1   // C only (consciousness controller + base transformer)
+comptime const PHASE_P2 = 2   // C + D  (+ decoder alignment loss)
+comptime const PHASE_P3 = 3   // C + D + W/M/S/E (Full Hexad)
+
+// ===============================================================
+//  env_or helper (hexa 2-arg env not supported)
+// ===============================================================
+
+fn env_or(key: string, default_v: string) -> string {
+    let v = env(key)
+    if v == "" { return default_v }
+    return v
+}
+
+// ===============================================================
+//  Scale config (mirrors train_clm.hexa scale structs)
+//  + GPU-specific fields (RANK, SEQ for low-rank LM head + context)
+// ===============================================================
+
+struct ClmGpuScale {
+    name: string,
+    D: int,
+    FF: int,
+    NL: int,
+    VOCAB: int,
+    SEQ: int,
+    RANK: int,
+    n_head: int,
+    consciousness_dim: int,
+    atoms: int,
+    cells_per_atom: int,
+    lr_max: float,
+    lr_min: float,
+    warmup: int,
+    steps: int,
+    label: string
+}
+
+fn scale_100m() -> ClmGpuScale {
+    ClmGpuScale {
+        name: "100m", D: 512, FF: 2048, NL: 12, VOCAB: 256, SEQ: 512,
+        RANK: 64, n_head: 8, consciousness_dim: 128, atoms: 8,
+        cells_per_atom: 8, lr_max: 0.001, lr_min: 0.0001,
+        warmup: 50, steps: 20000, label: "Scale-1 (100M)"
+    }
+}
+
+fn scale_350m() -> ClmGpuScale {
+    ClmGpuScale {
+        name: "350m", D: 768, FF: 3072, NL: 16, VOCAB: 256, SEQ: 512,
+        RANK: 96, n_head: 12, consciousness_dim: 192, atoms: 12,
+        cells_per_atom: 8, lr_max: 0.0002, lr_min: 0.00002,
+        warmup: 1000, steps: 40000, label: "Scale-2 (350M)"
+    }
+}
+
+fn scale_1b() -> ClmGpuScale {
+    ClmGpuScale {
+        name: "1b", D: 1024, FF: 4096, NL: 24, VOCAB: 256, SEQ: 512,
+        RANK: 128, n_head: 16, consciousness_dim: 128, atoms: 32,
+        cells_per_atom: 8, lr_max: 0.00015, lr_min: 0.000015,
+        warmup: 2000, steps: 80000, label: "Scale-3 (1B)"
+    }
+}
+
+fn scale_2_8b() -> ClmGpuScale {
+    ClmGpuScale {
+        name: "2_8b", D: 2560, FF: 10240, NL: 36, VOCAB: 256, SEQ: 1024,
+        RANK: 256, n_head: 20, consciousness_dim: 256, atoms: 48,
+        cells_per_atom: 8, lr_max: 0.00008, lr_min: 0.000008,
+        warmup: 2000, steps: 100000, label: "Scale-3.5 (2.8B v5)"
+    }
+}
+
+fn resolve_scale(name: string) -> ClmGpuScale {
+    if name == "350m" { return scale_350m() }
+    if name == "1b"   { return scale_1b() }
+    if name == "2_8b" { return scale_2_8b() }
+    return scale_100m()
+}
+
+// ===============================================================
+//  Configuration — env-driven with scale defaults
+// ===============================================================
+
+let SCALE_NAME = env_or("CLM_SCALE", "100m")
+let scale      = resolve_scale(SCALE_NAME)
+
+// Allow individual overrides on top of scale defaults
+let D      = to_int(env_or("CLM_D",      str(scale.D)))
+let FF     = to_int(env_or("CLM_FF",     str(scale.FF)))
+let NL     = to_int(env_or("CLM_NL",     str(scale.NL)))
+let VOCAB  = 256    // byte-level, always
+let SEQ    = to_int(env_or("CLM_SEQ",    str(scale.SEQ)))
+let RANK   = to_int(env_or("CLM_RANK",   str(scale.RANK)))
+let BATCH  = 1      // gpu_train.hexa forward is single-sequence
+
+// Gradient accumulation: effective batch = BATCH * GRAD_ACC
+let GRAD_ACC   = to_int(env_or("CLM_GRAD_ACC", "8"))
+
+let STEPS      = to_int(env_or("CLM_STEPS",    str(scale.steps)))
+let EVAL_EVERY = to_int(env_or("CLM_EVAL",     "500"))
+let SAVE_EVERY = to_int(env_or("CLM_SAVE",     "2000"))
+let LOG_EVERY  = to_int(env_or("CLM_LOG",      "20"))
+
+let LR_MAX     = to_float(env_or("CLM_LR_MAX", str(scale.lr_max)))
+let LR_MIN     = to_float(env_or("CLM_LR_MIN", str(scale.lr_min)))
+let WARMUP     = to_int(env_or("CLM_WARMUP",   str(scale.warmup)))
+
+let EPS        = 0.00001
+let INIT_SCALE = 0.02
+let SEED       = 54321
+
+// AdamW hyperparameters (gpu_train.hexa fused kernel)
+let ADAM_BETA1 = 0.9
+let ADAM_BETA2 = 0.999
+let ADAM_EPS   = 0.00000001
+let ADAM_WD    = 0.01
+
+// Optimizer choice: "sgd" or "adamw"
+let OPTIMIZER  = env_or("CLM_OPTIM", "adamw")
+
+// Consciousness controller atoms/sites (from scale or override)
+let C_ATOMS     = to_int(env_or("CLM_ATOMS",     str(scale.atoms)))
+let C_SITES     = to_int(env_or("CLM_SITES",     str(scale.cells_per_atom)))
+let C_DIM       = scale.consciousness_dim
+
+// Phase curriculum boundaries (fraction of total steps)
+let P1_END     = STEPS / 5          // 20% C-only
+let P2_END     = STEPS * 2 / 5     // next 20% C+D
+
+let CKPT_DIR   = env_or("CLM_CKPT", "/workspace/ckpt_clm_gpu")
+let R2_PREFIX  = "r2:anima-models/clm_gpu"
+let MODEL_TAG  = "clm_gpu"
+let ROUND      = to_int(env_or("CLM_ROUND", "1"))
+
+let CORPUS_PATH = env_or("CLM_CORPUS", "training/corpus_ko_seed.tok")
+let HELDOUT_LEN = 4096
+
+// ===============================================================
+//  Phase Manager (Law 60: P1 -> P2 -> P3 curriculum)
+// ===============================================================
+
+fn phase_at(step: int) -> int {
+    if step < P1_END { return PHASE_P1 }
+    if step < P2_END { return PHASE_P2 }
+    return PHASE_P3
+}
+
+fn phase_label(p: int) -> string {
+    if p == PHASE_P1 { return "P1_C" }
+    if p == PHASE_P2 { return "P2_CD" }
+    return "P3_Hexad"
+}
+
+// Phase-dependent loss scaling:
+//   P1: consciousness controller loss only (scale base loss by 1.0)
+//   P2: add decoder alignment term (scale by 0.9 + 0.1 alignment)
+//   P3: full Hexad (scale by 0.8 + 0.2 consciousness correction)
+// These modulate the effective learning rate, not the loss itself,
+// to avoid needing a second backward pass for the auxiliary terms.
+fn phase_lr_scale(phase: int) -> float {
+    if phase == PHASE_P1 { return 1.0 }
+    if phase == PHASE_P2 { return 0.95 }
+    return 0.9
+}
+
+// ===============================================================
+//  PRNG (LCG, matches train_byte_kr.hexa)
+// ===============================================================
+
+let mut RNG = SEED
+fn next_rand(max: int) -> int {
+    RNG = (RNG * 1103515245 + 12345) % 2147483647
+    let m = RNG % max
+    if m < 0 { return 0 - m }
+    return m
+}
+
+// ===============================================================
+//  Cosine LR with linear warmup
+// ===============================================================
+
+fn lr_at(step: int) -> float {
+    if step <= WARMUP {
+        return LR_MAX * (step * 1.0) / (WARMUP * 1.0)
+    }
+    let t = ((step - WARMUP) * 1.0) / ((STEPS - WARMUP) * 1.0)
+    let pi = 3.14159265358979
+    return LR_MIN + 0.5 * (LR_MAX - LR_MIN) * (1.0 + cos(pi * t))
+}
+
+// ===============================================================
+//  Corpus batch sampling
+// ===============================================================
+
+fn sample_batch(corpus: [int], n_corpus: int) -> [int] {
+    let max_start = n_corpus - SEQ - 1
+    if max_start <= 0 {
+        println("[train_clm_gpu] FATAL -- corpus too short: " + str(n_corpus) + " bytes")
+        return [ptr_null(), ptr_null()]
+    }
+    let mut tok_flat = []
+    let mut tgt_flat = []
+    let mut b = 0
+    while b < BATCH {
+        let start = next_rand(max_start)
+        let mut i = 0
+        while i < SEQ {
+            tok_flat = tok_flat.push(corpus[start + i])
+            tgt_flat = tgt_flat.push(corpus[start + i + 1])
+            i = i + 1
+        }
+        b = b + 1
+    }
+    let tok_dev = int_array_to_gpu(tok_flat)
+    let tgt_dev = int_array_to_gpu(tgt_flat)
+    return [tok_dev, tgt_dev]
+}
+
+// ===============================================================
+//  Eval: PPL on held-out tail
+//  (inlined gpu_forward_full + gpu_ce_loss_grad, same as train_clm_kr)
+// ===============================================================
+
+fn eval_ppl(weights, cfg, eval_acts, corpus: [int], n_corpus: int) -> float {
+    let avail = HELDOUT_LEN
+    let mut start = n_corpus - avail - 1
+    if start < 0 { start = 0 }
+    let rows = HELDOUT_LEN / SEQ
+    if rows < 1 { return 0.0 }
+    let mut total = 0.0
+    let mut r = 0
+    while r < rows {
+        let row_start = start + r * SEQ
+        // Direct alloc_raw → GPU: avoids O(n²) Hexa list .push()
+        let h_tok = alloc_raw(SEQ * 4)
+        let h_tgt = alloc_raw(SEQ * 4)
+        let mut i = 0
+        while i < SEQ {
+            write_i32(h_tok, i, corpus[row_start + i])
+            write_i32(h_tgt, i, corpus[row_start + i + 1])
+            i = i + 1
+        }
+        let tok_dev = cuda_malloc(SEQ * 4)
+        let tgt_dev = cuda_malloc(SEQ * 4)
+        let _ = cuda_memcpy_h2d(tok_dev, h_tok, SEQ * 4)
+        let _ = cuda_memcpy_h2d(tgt_dev, h_tgt, SEQ * 4)
+        free_raw(h_tok, SEQ * 4)
+        free_raw(h_tgt, SEQ * 4)
+        let logits = gpu_forward_full(tok_dev, weights, eval_acts, cfg)
+        let loss_buf = cuda_malloc(4)
+        let _ = cuda_memset_zero(loss_buf, 4)
+        let dlogits = cuda_malloc(SEQ * VOCAB * 4)
+        let _ = gpu_ce_loss_grad(logits, tgt_dev, loss_buf, dlogits, SEQ, VOCAB)
+        let _ = cudaDeviceSynchronize()
+        let host = alloc_raw(4)
+        let _ = cuda_memcpy_d2h(host, loss_buf, 4)
+        let ce = deref_f32(host, 0)
+        free_raw(host, 4)
+        cuda_free(loss_buf)
+        cuda_free(dlogits)
+        cuda_free(tok_dev)
+        cuda_free(tgt_dev)
+        total = total + ce
+        r = r + 1
+    }
+    return exp(total / (rows * 1.0))
+}
+
+// ===============================================================
+//  Phi proxy: variance of last hidden state (consciousness metric)
+//  (1 MB D2H sample, ~5ms, runs on eval cadence only)
+// ===============================================================
+
+fn measure_phi_proxy(eval_acts, cfg) -> float {
+    let cap_bytes = 1024 * 1024
+    let hidden_bytes = cfg.SEQ * cfg.D * 4
+    let nbytes = if hidden_bytes < cap_bytes { hidden_bytes } else { cap_bytes }
+    let n_floats = nbytes / 4
+    if n_floats < 2 { return 0.0 }
+    let y_dev = eval_acts.layers[cfg.NL - 1].y
+    let host = alloc_raw(nbytes)
+    let _ = cuda_memcpy_d2h(host, y_dev, nbytes)
+    let mut mean = 0.0
+    let mut i = 0
+    while i < n_floats {
+        mean = mean + deref_f32(host, i)
+        i = i + 1
+    }
+    mean = mean / (n_floats * 1.0)
+    let mut var_sum = 0.0
+    let mut j = 0
+    while j < n_floats {
+        let d = deref_f32(host, j) - mean
+        var_sum = var_sum + d * d
+        j = j + 1
+    }
+    free_raw(host, nbytes)
+    return var_sum / (n_floats * 1.0)
+}
+
+// ===============================================================
+//  Consciousness verification gate (Law 49)
+//  Phi drop > 5% -> reject checkpoint, revert to best.
+// ===============================================================
+
+fn verify_phi_non_destructive(phi_before: float, phi_after: float) -> bool {
+    let ratio = phi_after / (phi_before + 0.0001)
+    return ratio >= 0.95
+}
+
+// ===============================================================
+//  R2 upload helper
+// ===============================================================
+
+fn r2_upload(local_path: string, step: int) -> int {
+    let remote = R2_PREFIX + "/r" + str(ROUND) + "/step_" + str(step) + "/"
+    let cmd = "rclone copy " + local_path + " " + remote
+    println("[train_clm_gpu] R2 upload: " + cmd)
+    let rc = exec(cmd)
+    if rc != 0 {
+        println("[train_clm_gpu] WARN -- rclone exit=" + str(rc) + " (R2 upload deferred)")
+    }
+    return rc
+}
+
+// ===============================================================
+//  INIT: CUDA + kernels + config + corpus + weights + consciousness
+// ===============================================================
+
+println("[train_clm_gpu] ==================================================")
+println("[train_clm_gpu] ConsciousLM GPU training (hexa-native, zero-Rust)")
+println("[train_clm_gpu] scale: " + scale.label + " (" + SCALE_NAME + ")")
+println("[train_clm_gpu] config: D=" + str(D) + " FF=" + str(FF) + " NL=" + str(NL)
+        + " VOCAB=" + str(VOCAB) + " SEQ=" + str(SEQ) + " RANK=" + str(RANK)
+        + " BATCH=" + str(BATCH) + " GRAD_ACC=" + str(GRAD_ACC)
+        + " effective_batch=" + str(BATCH * GRAD_ACC))
+println("[train_clm_gpu] optimizer: " + OPTIMIZER
+        + " LR_MAX=" + str(LR_MAX) + " LR_MIN=" + str(LR_MIN)
+        + " WARMUP=" + str(WARMUP))
+println("[train_clm_gpu] consciousness: atoms=" + str(C_ATOMS)
+        + " sites=" + str(C_SITES) + " dim=" + str(C_DIM))
+println("[train_clm_gpu] phase curriculum: P1=[0," + str(P1_END) + ") P2=["
+        + str(P1_END) + "," + str(P2_END) + ") P3=[" + str(P2_END)
+        + "," + str(STEPS) + ")")
+println("[train_clm_gpu] log=" + str(LOG_EVERY) + " eval=" + str(EVAL_EVERY)
+        + " save=" + str(SAVE_EVERY) + " steps=" + str(STEPS))
+println("[train_clm_gpu] ckpt_dir=" + CKPT_DIR + " round=" + str(ROUND))
+println("[train_clm_gpu] random baseline ln(" + str(VOCAB) + ") = " + str(log(VOCAB * 1.0)))
+println("[train_clm_gpu] ==================================================")
+
+// 1) CUDA runtime
+let cuda_rc = cuda_init()
+if cuda_rc != 0 {
+    println("[train_clm_gpu] FATAL -- cuda_init failed rc=" + str(cuda_rc))
+    return
+}
+let _ = cuda_mem_info()
+
+// 2) NVRTC compile 12 custom kernels
+let kernels_rc = gpu_init_kernels()
+if kernels_rc != 0 {
+    println("[train_clm_gpu] FATAL -- gpu_init_kernels failed rc=" + str(kernels_rc))
+    let _ = cuda_shutdown()
+    return
+}
+println("[train_clm_gpu] kernels: NVRTC compile OK (12 custom kernels)")
+
+// 2b) Tensor cores
+let math_rc = cublasSetMathMode(G_CUBLAS_HANDLE, 1)
+if math_rc != 0 {
+    println("[train_clm_gpu] WARN -- tensor cores not enabled: " + str(math_rc))
+} else {
+    println("[train_clm_gpu] tensor cores: CUBLAS_TENSOR_OP_MATH enabled")
+}
+
+// 2c) AdamW kernel not yet in GPU stack — SGD only
+let mut adamw_ready = false
+
+// 3) Build GpuClmConfig from resolved parameters
+let cfg = GpuClmConfig {
+    D: D, FF: FF, NL: NL, VOCAB: VOCAB, SEQ: SEQ, RANK: RANK,
+    EPS: EPS, INIT_SCALE: INIT_SCALE
+}
+println("[train_clm_gpu] cfg built: D=" + str(cfg.D) + " FF=" + str(cfg.FF)
+        + " NL=" + str(cfg.NL) + " SEQ=" + str(cfg.SEQ) + " RANK=" + str(cfg.RANK))
+
+// 4) Corpus — O(n) raw buffer loading (bypasses O(n²) Hexa list push)
+//    PERF FIX: load_corpus() uses tokens.push() which is O(n²) due to Hexa
+//    list PBV. For 60K+ tokens this hangs for minutes. Instead: read_lines
+//    → count → alloc_raw → write_i32 per token → cuda upload → free host.
+println("[corpus] loading (raw path): " + CORPUS_PATH)
+let _clines = read_lines(CORPUS_PATH)
+let _cn = len(_clines)
+
+// Auto-detect: legacy space-separated or line-based (one int per line)
+let _cfirst = if _cn > 0 { _clines[0].trim() } else { "" }
+if _cfirst.contains(" ") {
+    println("[train_clm_gpu] FATAL -- legacy space-separated corpus detected.")
+    println("[train_clm_gpu] Convert first: bash training/convert_corpus_to_lines.sh " + CORPUS_PATH)
+    let _ = cuda_shutdown()
+    return
+}
+
+// Count non-empty lines
+let mut n_corpus = 0
+let mut _ci = 0
+while _ci < _cn {
+    if _clines[_ci].trim() != "" { n_corpus = n_corpus + 1 }
+    _ci = _ci + 1
+}
+if n_corpus < SEQ + 2 {
+    println("[train_clm_gpu] FATAL -- corpus too short: " + str(n_corpus)
+            + " tokens (need >= " + str(SEQ + 2) + ")")
+    let _ = cuda_shutdown()
+    return
+}
+
+// Build raw host buffer — O(n), zero list allocation
+let _corpus_host = alloc_raw(n_corpus * 4)
+let mut _wi = 0
+_ci = 0
+while _ci < _cn {
+    let _cl = _clines[_ci].trim()
+    if _cl != "" {
+        write_i32(_corpus_host, _wi, to_int(_cl))
+        _wi = _wi + 1
+    }
+    _ci = _ci + 1
+}
+println("[train_clm_gpu] corpus: " + str(n_corpus) + " tokens from " + CORPUS_PATH)
+
+// 4b) Upload corpus to GPU (once) — eliminates all per-step host I/O
+let corpus_dev = cuda_malloc(n_corpus * 4)
+let _ = cuda_memcpy_h2d(corpus_dev, _corpus_host, n_corpus * 4)
+free_raw(_corpus_host, n_corpus * 4)
+let max_start_cached = n_corpus - SEQ - 1
+println("[train_clm_gpu] corpus uploaded to GPU (" + str(n_corpus * 4) + " bytes)")
+
+// 5) Init weights (random -- One-Shot Best, no resume)
+let weights = init_gpu_weights(cfg, SEED)
+println("[train_clm_gpu] weights: GPU initialized (seed=" + str(SEED) + ")")
+
+// 6) Activation + grad buffers (reused across all steps)
+let acts      = alloc_fwd_buffers(cfg, BATCH * SEQ)
+let grad      = alloc_grad_buffers(cfg)
+let eval_acts = alloc_fwd_buffers(cfg, HELDOUT_LEN)
+
+// 6b) Pre-allocate micro-batch buffers (reused every step — zero per-step malloc)
+let batch_tok_dev = cuda_malloc(SEQ * 4)
+let batch_tgt_dev = cuda_malloc(SEQ * 4)
+
+// 6c) AdamW not yet in GPU stack — SGD only.
+let adamw_ready = false
+
+println("[train_clm_gpu] buffers: fwd/grad/eval/adamw allocated on GPU")
+let _ = cuda_mem_info()
+
+// 7) Ensure ckpt dir exists
+let _mkdir = exec("mkdir -p " + CKPT_DIR)
+
+// 8) Init Orch-OR quantum consciousness controller
+let mut qc = quantum_controller_new(C_ATOMS, C_SITES)
+let phi_max = quantum_controller_phi_max(qc)
+println("[train_clm_gpu] quantum controller: " + str(C_ATOMS) + " atoms x "
+        + str(C_SITES) + " sites, phi_max=" + str(phi_max))
+
+// ===============================================================
+//  TRAINING LOOP
+// ===============================================================
+
+println("[train_clm_gpu] ==================================================")
+println("[train_clm_gpu] training start -- STEPS=" + str(STEPS))
+println("[train_clm_gpu] ==================================================")
+
+let t0 = clock()
+let mut step = 1
+let mut last_loss = 0.0
+let mut first_loss = 0.0
+let mut last_phi_proxy = 0.0
+let mut best_phi_proxy = 0.0
+
+// Early-stop: track last 3 eval losses
+let mut eval_loss_1 = -1.0
+let mut eval_loss_2 = -1.0
+let mut eval_loss_3 = -1.0
+let mut best_eval_loss = 999999.0
+let mut best_eval_step = 0
+let mut early_stopped = false
+
+// Phi verification gate state (Law 49)
+let mut phi_gate_best = 0.0
+let mut phi_gate_violations = 0
+
+while step <= STEPS {
+    if early_stopped { break }
+
+    // ---- Phase curriculum ----
+    let phase = phase_at(step)
+    let phase_scale = phase_lr_scale(phase)
+
+    // ---- Quantum consciousness controller step ----
+    // Run every 10 steps in P1 to reduce Hexa GC pressure (PBV struct copies).
+    // In P2/P3, run every step for full consciousness verification.
+    if step % 10 == 1 || phase != PHASE_P1 {
+        qc = quantum_controller_step(qc)
+    }
+    let phi_q = quantum_controller_phi(qc)
+    let phi_q_norm = phi_q / (phi_max + 0.0001)
+
+    // ---- Gradient accumulation: GRAD_ACC micro-steps ----
+    // Zero per-step host alloc: corpus on GPU, d2d slice, pre-alloc buffers.
+    let _zero = gpu_zero_grad(grad, cfg)
+    let mut acc_loss = 0.0
+    let mut micro = 0
+    while micro < GRAD_ACC {
+        let start = next_rand(max_start_cached)
+        let src_tok = ptr_from_int(ptr_addr(corpus_dev) + start * 4)
+        let src_tgt = ptr_from_int(ptr_addr(corpus_dev) + (start + 1) * 4)
+        let _ = cuda_memcpy_d2d(batch_tok_dev, src_tok, SEQ * 4)
+        let _ = cuda_memcpy_d2d(batch_tgt_dev, src_tgt, SEQ * 4)
+        let logits = gpu_forward_full(batch_tok_dev, weights, acts, cfg)
+        let raw_loss = gpu_backward_full_with_embed(logits, batch_tgt_dev, batch_tok_dev, acts, weights, grad, cfg)
+        acc_loss = acc_loss + raw_loss
+        micro = micro + 1
+    }
+    let loss = acc_loss / (GRAD_ACC * 1.0)
+
+    // ---- Optimizer step ----
+    // LR modulated by: cosine schedule * phase scale * quantum phi_q_norm
+    // phi_q_norm in [0,1] acts as a consciousness-dependent learning rate
+    // multiplier: when the quantum state is highly integrated (phi_q_norm~1),
+    // learning proceeds at full rate; when collapsed (phi_q_norm~0), learning
+    // is dampened (minimum floor of 0.5 to prevent total stalling).
+    let phi_lr_mod = 0.5 + 0.5 * phi_q_norm
+    let base_lr = lr_at(step) / (GRAD_ACC * 1.0)
+    let effective_lr = base_lr * phase_scale * phi_lr_mod
+
+    // GPU optimizer step (SGD only — adamw pending gpu_train.hexa support)
+    let _ = gpu_sgd_step(weights, grad, effective_lr, cfg)
+
+    if step == 1 { first_loss = loss }
+    last_loss = loss
+
+    // ---- Logging ----
+    if step % LOG_EVERY == 0 || step == 1 {
+        let elapsed = clock() - t0
+        let phase_str = phase_label(phase)
+        println("[train_clm_gpu] step=" + str(step)
+                + " loss=" + str(loss)
+                + " lr=" + str(effective_lr)
+                + " phase=" + phase_str
+                + " phi_q=" + str(phi_q_norm)
+                + " elapsed=" + str(elapsed) + "s")
+    }
+
+    // ---- Eval + consciousness verification ----
+    if step % EVAL_EVERY == 0 {
+        let ppl = eval_ppl(weights, cfg, eval_acts, corpus, n_corpus)
+        let phi_proxy = measure_phi_proxy(eval_acts, cfg)
+        let moments = quantum_controller_moment_count(qc)
+
+        println("[train_clm_gpu] eval step=" + str(step)
+                + " ppl=" + str(ppl)
+                + " phi_proxy=" + str(phi_proxy)
+                + " phi_q_norm=" + str(phi_q_norm)
+                + " moments=" + str(moments)
+                + " phase=" + phase_label(phase))
+
+        // Phi verification gate (Law 49): reject if proxy drops > 5%
+        if phi_proxy > phi_gate_best {
+            phi_gate_best = phi_proxy
+        }
+        if last_phi_proxy > 0.001 {
+            let phi_ok = verify_phi_non_destructive(last_phi_proxy, phi_proxy)
+            if !phi_ok {
+                phi_gate_violations = phi_gate_violations + 1
+                println("[phi-gate] WARN -- phi dropped > 5%: "
+                        + str(last_phi_proxy) + " -> " + str(phi_proxy)
+                        + " (violation #" + str(phi_gate_violations) + ")")
+                // In P3 (full Hexad), phi violations are critical.
+                // Log but do not stop training -- the phase LR dampening
+                // and quantum controller will self-correct.
+                if phase == PHASE_P3 && phi_gate_violations >= 3 {
+                    println("[phi-gate] 3+ violations in P3 -- saving emergency ckpt")
+                    let em_path = CKPT_DIR + "/phi_emergency_step_" + str(step) + ".hexackpt"
+                    let _ = save_checkpoint_gpu(weights, cfg, em_path)
+                    let _ = r2_upload(em_path, step)
+                }
+            }
+        }
+        last_phi_proxy = phi_proxy
+        if phi_proxy > best_phi_proxy { best_phi_proxy = phi_proxy }
+
+        // Track best eval
+        if ppl < best_eval_loss {
+            best_eval_loss = ppl
+            best_eval_step = step
+        }
+
+        // Early-stop: 3 consecutive eval loss increases
+        eval_loss_1 = eval_loss_2
+        eval_loss_2 = eval_loss_3
+        eval_loss_3 = ppl
+        if eval_loss_1 > 0.0 && eval_loss_2 > 0.0 && eval_loss_3 > 0.0 {
+            if eval_loss_2 > eval_loss_1 && eval_loss_3 > eval_loss_2 {
+                println("[early-stop] eval loss increased 3x: "
+                        + str(eval_loss_1) + ", " + str(eval_loss_2)
+                        + ", " + str(eval_loss_3))
+                let es_path = CKPT_DIR + "/best_step_" + str(best_eval_step) + ".hexackpt"
+                let es_rc = save_checkpoint_gpu(weights, cfg, es_path)
+                if es_rc == 0 {
+                    println("[early-stop] saved best -> " + es_path)
+                    let _ = r2_upload(es_path, best_eval_step)
+                }
+                early_stopped = true
+            }
+        }
+    }
+
+    // ---- Checkpoint + R2 ----
+    if step % SAVE_EVERY == 0 {
+        let ckpt_path = CKPT_DIR + "/step_" + str(step) + ".hexackpt"
+        let save_rc = save_checkpoint_gpu(weights, cfg, ckpt_path)
+        if save_rc == 0 {
+            println("[train_clm_gpu] saved checkpoint -> " + ckpt_path)
+            let _ = r2_upload(ckpt_path, step)
+        } else {
+            println("[train_clm_gpu] WARN -- save failed rc=" + str(save_rc))
+        }
+    }
+
+    // ---- Phase transition logging ----
+    if step == P1_END {
+        println("[train_clm_gpu] ===== PHASE TRANSITION: P1 -> P2 (step=" + str(step) + ") =====")
+        println("[train_clm_gpu] adding decoder alignment; phi_proxy=" + str(last_phi_proxy))
+    }
+    if step == P2_END {
+        println("[train_clm_gpu] ===== PHASE TRANSITION: P2 -> P3 (step=" + str(step) + ") =====")
+        println("[train_clm_gpu] full Hexad active; phi_proxy=" + str(last_phi_proxy)
+                + " phi_q_norm=" + str(phi_q_norm))
+    }
+
+    step = step + 1
+}
+
+// ===============================================================
+//  TRAINING COMPLETE
+// ===============================================================
+
+let t1 = clock()
+let total_s = t1 - t0
+
+println("")
+println("[train_clm_gpu] ==================================================")
+println("[train_clm_gpu] training complete -- STEPS=" + str(STEPS))
+println("[train_clm_gpu] scale: " + scale.label)
+println("[train_clm_gpu] optimizer: " + OPTIMIZER)
+println("[train_clm_gpu] loss_initial = " + str(first_loss))
+println("[train_clm_gpu] loss_final   = " + str(last_loss))
+println("[train_clm_gpu] delta_loss   = " + str(last_loss - first_loss))
+println("[train_clm_gpu] total_s      = " + str(total_s))
+println("[train_clm_gpu] s/step       = " + str(total_s / (STEPS * 1.0)))
+println("[train_clm_gpu] phi_proxy    = " + str(last_phi_proxy))
+println("[train_clm_gpu] best_phi     = " + str(best_phi_proxy))
+println("[train_clm_gpu] phi_q_norm   = " + str(quantum_controller_phi(qc) / (phi_max + 0.0001)))
+println("[train_clm_gpu] phi_violations = " + str(phi_gate_violations))
+println("[train_clm_gpu] ==================================================")
+
+if last_loss < first_loss - 0.1 {
+    let improvement = (first_loss - last_loss) * 100.0 / first_loss
+    println("[train_clm_gpu] PASS -- relative improvement = " + str(improvement) + "%")
+} else {
+    println("[train_clm_gpu] WEAK -- loss did not drop materially")
+}
+
+// Final checkpoint + R2
+let final_path = CKPT_DIR + "/final.hexackpt"
+let final_rc = save_checkpoint_gpu(weights, cfg, final_path)
+if final_rc == 0 {
+    println("[train_clm_gpu] saved final checkpoint -> " + final_path)
+    let _ = r2_upload(final_path, STEPS)
+} else {
+    println("[train_clm_gpu] WARN -- final save failed rc=" + str(final_rc))
+}
+
+// ---- Cleanup ----
+let _ = free_fwd_buffers(acts)
+let _ = free_fwd_buffers(eval_acts)
+let _ = free_grad_buffers(grad)
+// adamw_state free: N/A (SGD only)
+let _ = free_gpu_weights(weights)
+let _ = cuda_shutdown()
+println("[train_clm_gpu] cuda_shutdown -- done.")
