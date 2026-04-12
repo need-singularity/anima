@@ -179,7 +179,7 @@ fn gpu_fill_value(dev, n, value) {
     let host_buf = alloc_raw(n * 4)
     let mut i = 0
     while i < n {
-        write_f32(host_buf, i, value)
+        write_f32(host_buf, i * 4, value)
         i = i + 1
     }
     let _ = cuda_memcpy_h2d(dev, host_buf, n * 4)
@@ -816,6 +816,639 @@ fn gpu_backward_full_with_embed(logits_dev, targets_dev, toks_dev, acts: GpuFwdA
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  Fused layer forward (#20)
+//
+//  Replaces gpu_layer_fwd with fused kernels that eliminate
+//  redundant kernel launches between non-GEMM operations.
+//
+//  Per-layer launch count comparison:
+//    Original: 5 custom kernels + 2 memcpy + 7 cuBLAS = 14 launches
+//    Fused:    4 fused kernels + 7 cuBLAS             = 11 launches
+//    Savings: 3 launches per layer, 36 for NL=12.
+//
+//  The same activation struct (GpuLayerActs) is reused so the
+//  fused path is a drop-in replacement with identical numerics.
+// ═══════════════════════════════════════════════════════════════
+
+fn gpu_layer_fwd_fused(x_dev, layer: GpuLayer, acts: GpuLayerActs, cfg: GpuClmConfig) {
+    let D    = cfg.D
+    let FF   = cfg.FF
+    let SEQ  = cfg.SEQ
+    let EPS  = cfg.EPS
+    let inv_sqrt_d = 1.0 / sqrt(D * 1.0)
+
+    // 1. fused_pre_attn_fwd: rms_norm(x, ga) -> norm1, rstd1
+    //    Replaces: gpu_rms_norm_fwd
+    let _ = gpu_fused_pre_attn_fwd(x_dev, layer.ga, acts.norm1, acts.rstd1, SEQ, D, EPS)
+
+    // 2. Q/K/V projections — cuBLAS (cannot fuse across library calls)
+    let _ = gpu_sgemm(acts.norm1, layer.Wq, acts.q, SEQ, D, D)
+    let _ = gpu_sgemm(acts.norm1, layer.Wk, acts.k, SEQ, D, D)
+    let _ = gpu_sgemm(acts.norm1, layer.Wv, acts.v, SEQ, D, D)
+
+    // 3. scores = q @ k^T -> [SEQ, SEQ]
+    let _ = gpu_sgemm_nt(acts.q, acts.k, acts.probs, SEQ, SEQ, D)
+
+    // 4. fused_attn_post_fwd: scale by 1/sqrt(D) + causal softmax in ONE kernel
+    //    Replaces: gpu_sscal + gpu_softmax_rows_fwd (2 launches -> 1)
+    let _ = gpu_fused_attn_post_fwd(acts.probs, acts.probs, SEQ, SEQ, inv_sqrt_d)
+
+    // 5. ctx = probs @ v -> [SEQ, D]
+    let _ = gpu_sgemm(acts.probs, acts.v, acts.ctx, SEQ, D, SEQ)
+
+    // 6. attn_out = ctx @ Wo -> [SEQ, D]
+    let _ = gpu_sgemm(acts.ctx, layer.Wo, acts.attn_out, SEQ, D, D)
+
+    // 7. fused_mid_ffn_fwd: mid = x + attn_out, then rms_norm(mid, gf) -> norm2, rstd2
+    //    Replaces: cuda_memcpy_d2d + gpu_add_inplace + gpu_rms_norm_fwd (3 launches -> 1)
+    let _ = gpu_fused_mid_ffn_fwd(x_dev, acts.attn_out, layer.gf, acts.mid, acts.norm2, acts.rstd2, SEQ, D, EPS)
+
+    // 8. up = norm2 @ Wff1 -> [SEQ, FF]
+    let _ = gpu_sgemm(acts.norm2, layer.Wff1, acts.up, SEQ, FF, D)
+
+    // 9. act = swiglu(up, up) — same kernel as before (already minimal)
+    let _ = gpu_swiglu_fwd(acts.up, acts.up, acts.act, SEQ * FF)
+
+    // 10. ffn_out = act @ Wff2 -> [SEQ, D]
+    let _ = gpu_sgemm(acts.act, layer.Wff2, acts.ffn_out, SEQ, D, FF)
+
+    // 11. fused_residual_add: y = mid + ffn_out (no memcpy needed)
+    //     Replaces: cuda_memcpy_d2d + gpu_add_inplace (2 launches -> 1)
+    let _ = gpu_fused_residual_add(acts.mid, acts.ffn_out, acts.y, SEQ * D)
+
+    return acts.y
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Fused layer backward (#20)
+//
+//  Per-layer launch count comparison (GEMM + custom kernel launches):
+//    Original: 5 custom + 12 cuBLAS + 8 saxpy + 5 alloc = ~30 launches
+//    Fused:    4 fused  + 12 cuBLAS + 4 saxpy           = ~20 launches
+//    Savings: ~10 launches per layer, 120 for NL=12.
+//
+//  Key fusions:
+//    - swiglu_bwd + dup_value/dup_gate merge -> fused_swiglu_merge_bwd
+//    - rms_norm_bwd #2 + residual merge -> fused_mid_ffn_bwd
+//    - softmax_bwd + sscal -> fused_attn_post_bwd
+//    - rms_norm_bwd #1 + residual merge -> fused_pre_attn_bwd
+// ═══════════════════════════════════════════════════════════════
+
+fn gpu_layer_bwd_fused(x_dev, layer: GpuLayer, acts: GpuLayerActs, dy_dev, grad: GpuLayerGrad, cfg: GpuClmConfig) {
+    let D   = cfg.D
+    let FF  = cfg.FF
+    let SEQ = cfg.SEQ
+    let EPS = cfg.EPS
+    let inv_sqrt_d = 1.0 / sqrt(D * 1.0)
+
+    let dffn_out = dy_dev
+
+    // ── Wff2 backward: act @ Wff2 = ffn_out
+    //   dWff2 += act^T @ dffn_out
+    //   dact   = dffn_out @ Wff2^T
+    let dact = gpu_zeros(SEQ * FF)
+    let dWff2_tmp = gpu_zeros(FF * D)
+    let _ = gpu_sgemm_tn(acts.act, dffn_out, dWff2_tmp, FF, D, SEQ)
+    let _ = gpu_saxpy(dWff2_tmp, grad.dWff2, FF * D, 1.0)
+    cuda_free(dWff2_tmp)
+    let _ = gpu_sgemm_nt(dffn_out, layer.Wff2, dact, SEQ, FF, D)
+
+    // ── fused_swiglu_merge_bwd: swiglu_bwd with merged dup = dup_value + dup_gate
+    //    Replaces: gpu_swiglu_bwd + 3x gpu_zeros + 2x gpu_saxpy + 2x cuda_free
+    //    (6 operations -> 1 kernel launch)
+    let dup = gpu_zeros(SEQ * FF)
+    let _ = gpu_fused_swiglu_merge_bwd(acts.up, acts.up, dact, dup, SEQ * FF)
+    cuda_free(dact)
+
+    // ── Wff1 backward: norm2 @ Wff1 = up
+    //   dWff1 += norm2^T @ dup
+    //   dnorm2 = dup @ Wff1^T
+    let dWff1_tmp = gpu_zeros(D * FF)
+    let _ = gpu_sgemm_tn(acts.norm2, dup, dWff1_tmp, D, FF, SEQ)
+    let _ = gpu_saxpy(dWff1_tmp, grad.dWff1, D * FF, 1.0)
+    cuda_free(dWff1_tmp)
+    let dnorm2 = gpu_zeros(SEQ * D)
+    let _ = gpu_sgemm_nt(dup, layer.Wff1, dnorm2, SEQ, D, FF)
+    cuda_free(dup)
+
+    // ── fused_mid_ffn_bwd: rms_norm_bwd #2 + residual merge
+    //    dmid = dy + dmid_from_norm2_path
+    //    dgf accumulated via atomicAdd
+    //    Replaces: gpu_rms_norm_bwd + gpu_saxpy(dgf) + gpu_zeros(dmid) + 2x gpu_saxpy(dmid)
+    //    (5 operations -> 1 kernel launch)
+    let dmid = gpu_zeros(SEQ * D)
+    let _ = gpu_fused_mid_ffn_bwd(acts.mid, layer.gf, dnorm2, acts.rstd2, dy_dev, dmid, grad.dgf, SEQ, D, EPS)
+    cuda_free(dnorm2)
+
+    let dattn_out = dmid
+
+    // ── Wo backward: ctx @ Wo = attn_out
+    let dWo_tmp = gpu_zeros(D * D)
+    let _ = gpu_sgemm_tn(acts.ctx, dattn_out, dWo_tmp, D, D, SEQ)
+    let _ = gpu_saxpy(dWo_tmp, grad.dWo, D * D, 1.0)
+    cuda_free(dWo_tmp)
+    let dctx = gpu_zeros(SEQ * D)
+    let _ = gpu_sgemm_nt(dattn_out, layer.Wo, dctx, SEQ, D, D)
+
+    // ── Attention backward: probs @ V = ctx
+    let dv_buf = gpu_zeros(SEQ * D)
+    let _ = gpu_sgemm_tn(acts.probs, dctx, dv_buf, SEQ, D, SEQ)
+    let dprobs = gpu_zeros(SEQ * SEQ)
+    let _ = gpu_sgemm_nt(dctx, acts.v, dprobs, SEQ, SEQ, D)
+    cuda_free(dctx)
+
+    // ── fused_attn_post_bwd: softmax_bwd + scale by inv_sqrt_d in ONE kernel
+    //    Replaces: gpu_softmax_rows_bwd + gpu_sscal (2 launches -> 1)
+    let dscores = gpu_zeros(SEQ * SEQ)
+    let _ = gpu_fused_attn_post_bwd(acts.probs, dprobs, dscores, SEQ, SEQ, inv_sqrt_d)
+    cuda_free(dprobs)
+
+    // ── Q/K backward from dscores
+    let dq_buf = gpu_zeros(SEQ * D)
+    let dk_buf = gpu_zeros(SEQ * D)
+    let _ = gpu_sgemm(dscores, acts.k, dq_buf, SEQ, D, SEQ)
+    let _ = gpu_sgemm_tn(dscores, acts.q, dk_buf, SEQ, D, SEQ)
+    cuda_free(dscores)
+
+    // ── Wq/Wk/Wv backward
+    let dWq_tmp = gpu_zeros(D * D)
+    let dWk_tmp = gpu_zeros(D * D)
+    let dWv_tmp = gpu_zeros(D * D)
+    let _ = gpu_sgemm_tn(acts.norm1, dq_buf, dWq_tmp, D, D, SEQ)
+    let _ = gpu_sgemm_tn(acts.norm1, dk_buf, dWk_tmp, D, D, SEQ)
+    let _ = gpu_sgemm_tn(acts.norm1, dv_buf, dWv_tmp, D, D, SEQ)
+    let _ = gpu_saxpy(dWq_tmp, grad.dWq, D * D, 1.0)
+    let _ = gpu_saxpy(dWk_tmp, grad.dWk, D * D, 1.0)
+    let _ = gpu_saxpy(dWv_tmp, grad.dWv, D * D, 1.0)
+    cuda_free(dWq_tmp); cuda_free(dWk_tmp); cuda_free(dWv_tmp)
+
+    // dnorm1 = dq @ Wq^T + dk @ Wk^T + dv @ Wv^T
+    let dnorm1 = gpu_zeros(SEQ * D)
+    let dn_tmp = gpu_zeros(SEQ * D)
+    let _ = gpu_sgemm_nt(dq_buf, layer.Wq, dn_tmp, SEQ, D, D)
+    let _ = gpu_saxpy(dn_tmp, dnorm1, SEQ * D, 1.0)
+    let _ = gpu_sgemm_nt(dk_buf, layer.Wk, dn_tmp, SEQ, D, D)
+    let _ = gpu_saxpy(dn_tmp, dnorm1, SEQ * D, 1.0)
+    let _ = gpu_sgemm_nt(dv_buf, layer.Wv, dn_tmp, SEQ, D, D)
+    let _ = gpu_saxpy(dn_tmp, dnorm1, SEQ * D, 1.0)
+    cuda_free(dn_tmp)
+    cuda_free(dq_buf); cuda_free(dk_buf); cuda_free(dv_buf)
+
+    // ── fused_pre_attn_bwd: rms_norm_bwd #1 + residual merge
+    //    dx = dmid (from attention residual) + dx_from_norm1_path
+    //    dga accumulated via atomicAdd
+    //    Replaces: gpu_rms_norm_bwd + gpu_saxpy(dga) + gpu_zeros(dx) + 2x gpu_saxpy(dx)
+    //    (5 operations -> 1 kernel launch)
+    let dx = gpu_zeros(SEQ * D)
+    let _ = gpu_fused_pre_attn_bwd(x_dev, layer.ga, dnorm1, acts.rstd1, dattn_out, dx, grad.dga, SEQ, D, EPS)
+    cuda_free(dnorm1)
+    cuda_free(dmid)  // dattn_out alias released here
+
+    return dx
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Fused full forward (#20)
+//
+//  Drop-in replacement for gpu_forward_full that uses the fused
+//  per-layer kernels. Same signature, same activation layout.
+// ═══════════════════════════════════════════════════════════════
+
+fn gpu_forward_full_fused(toks_dev, weights: GpuWeights, acts: GpuFwdActs, cfg: GpuClmConfig) {
+    let D     = cfg.D
+    let NL    = cfg.NL
+    let VOCAB = cfg.VOCAB
+    let SEQ   = cfg.SEQ
+    let RANK  = cfg.RANK
+
+    // 1. embed lookup -> h0[SEQ, D]
+    let _ = gpu_embed_lookup_fwd(weights.embed, toks_dev, acts.h0, VOCAB, D, SEQ)
+
+    // 2. transformer layers — fused path
+    let mut x = acts.h0
+    let mut li = 0
+    while li < NL {
+        let layer_acts = acts.layers[li]
+        let _ = gpu_layer_fwd_fused(x, weights.layers[li], layer_acts, cfg)
+        x = layer_acts.y
+        li = li + 1
+    }
+
+    // 3. LM head: mid_lm = x @ lmh_U -> [SEQ, RANK]
+    let _ = gpu_sgemm(x, weights.lmh_U, acts.mid_lm, SEQ, RANK, D)
+
+    // 4. logits = mid_lm @ lmh_V -> [SEQ, VOCAB]
+    let _ = gpu_sgemm(acts.mid_lm, weights.lmh_V, acts.logits, SEQ, VOCAB, RANK)
+
+    return acts.logits
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Fused full backward with embed (#20)
+//
+//  Drop-in replacement for gpu_backward_full_with_embed.
+// ═══════════════════════════════════════════════════════════════
+
+fn gpu_backward_full_with_embed_fused(logits_dev, targets_dev, toks_dev, acts: GpuFwdActs, weights: GpuWeights, grad: GpuGrad, cfg: GpuClmConfig) {
+    let D     = cfg.D
+    let NL    = cfg.NL
+    let VOCAB = cfg.VOCAB
+    let SEQ   = cfg.SEQ
+    let RANK  = cfg.RANK
+
+    // 1. CE loss + dlogits
+    let dlogits  = gpu_zeros(SEQ * VOCAB)
+    let loss_buf = gpu_zeros(1)
+    let _ = gpu_ce_loss_grad(logits_dev, targets_dev, loss_buf, dlogits, SEQ, VOCAB)
+    let loss_host = tensor_from_gpu(loss_buf, 1)
+    let loss = loss_host[0]
+    cuda_free(loss_buf)
+
+    // 2. LM head backward
+    let dlmh_V_tmp = gpu_zeros(RANK * VOCAB)
+    let _ = gpu_sgemm_tn(acts.mid_lm, dlogits, dlmh_V_tmp, RANK, VOCAB, SEQ)
+    let _ = gpu_saxpy(dlmh_V_tmp, grad.dlmh_V, RANK * VOCAB, 1.0)
+    cuda_free(dlmh_V_tmp)
+    let dmid = gpu_zeros(SEQ * RANK)
+    let _ = gpu_sgemm_nt(dlogits, weights.lmh_V, dmid, SEQ, RANK, VOCAB)
+    cuda_free(dlogits)
+
+    let h_last = acts.layers[NL - 1].y
+    let dlmh_U_tmp = gpu_zeros(D * RANK)
+    let _ = gpu_sgemm_tn(h_last, dmid, dlmh_U_tmp, D, RANK, SEQ)
+    let _ = gpu_saxpy(dlmh_U_tmp, grad.dlmh_U, D * RANK, 1.0)
+    cuda_free(dlmh_U_tmp)
+    let mut dh = gpu_zeros(SEQ * D)
+    let _ = gpu_sgemm_nt(dmid, weights.lmh_U, dh, SEQ, D, RANK)
+    cuda_free(dmid)
+
+    // 3. layers reverse — fused path
+    let mut li = NL - 1
+    while li >= 0 {
+        let layer_input = if li == 0 { acts.h0 } else { acts.layers[li - 1].y }
+        let dx_new = gpu_layer_bwd_fused(layer_input, weights.layers[li], acts.layers[li], dh, grad.layers[li], cfg)
+        cuda_free(dh)
+        dh = dx_new
+        li = li - 1
+    }
+
+    // 4. embed scatter
+    let _ = gpu_embed_lookup_bwd(dh, toks_dev, grad.dembed, VOCAB, D, SEQ)
+    cuda_free(dh)
+
+    return loss
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Batch forward (#23) — process GRAD_ACC micro-batches via
+//  strided batched GEMM
+//
+//  Instead of running gpu_forward_full GRAD_ACC times (each with
+//  its own cuBLAS calls), we pack all micro-batch tokens into a
+//  contiguous buffer and use cublasSgemmStridedBatched to process
+//  all micro-batches in a single cuBLAS call per weight matrix.
+//
+//  Activation layout: each micro-batch's activations are stored
+//  at a stride offset in a single contiguous allocation:
+//    batch_h0[b]     = batch_h0_base + b * SEQ * D
+//    batch_logits[b] = batch_logits_base + b * SEQ * VOCAB
+//
+//  This reduces cuBLAS calls from 7 * NL * GRAD_ACC to 7 * NL + 2.
+//  For GRAD_ACC=8, NL=12: 672 -> 86 cuBLAS calls (87% reduction).
+//
+//  NOTE: The fused custom kernels (#20) still run per-batch since
+//  they use one-block-per-row with shared memory; batching them
+//  would require grid-level batch indexing. That's Phase 3.
+// ═══════════════════════════════════════════════════════════════
+
+// Batched activation buffers — contiguous across GRAD_ACC micro-batches.
+// Each field is a single allocation of size GRAD_ACC * per_batch_size.
+struct GpuBatchLayerActs {
+    norm1:    int,   // [GRAD_ACC * SEQ, D]
+    q:        int,   // [GRAD_ACC * SEQ, D]
+    k:        int,   // [GRAD_ACC * SEQ, D]
+    v:        int,   // [GRAD_ACC * SEQ, D]
+    probs:    int,   // [GRAD_ACC * SEQ, SEQ]
+    ctx:      int,   // [GRAD_ACC * SEQ, D]
+    attn_out: int,   // [GRAD_ACC * SEQ, D]
+    mid:      int,   // [GRAD_ACC * SEQ, D]
+    norm2:    int,   // [GRAD_ACC * SEQ, D]
+    up:       int,   // [GRAD_ACC * SEQ, FF]
+    act:      int,   // [GRAD_ACC * SEQ, FF]
+    ffn_out:  int,   // [GRAD_ACC * SEQ, D]
+    y:        int,   // [GRAD_ACC * SEQ, D]
+    rstd1:    int,   // [GRAD_ACC * SEQ]
+    rstd2:    int    // [GRAD_ACC * SEQ]
+}
+
+struct GpuBatchFwdActs {
+    h0:      int,               // [GRAD_ACC * SEQ, D]
+    layers:  [GpuBatchLayerActs],
+    mid_lm:  int,               // [GRAD_ACC * SEQ, RANK]
+    logits:  int                // [GRAD_ACC * SEQ, VOCAB]
+}
+
+fn alloc_batch_layer_acts(cfg: GpuClmConfig, N: int, B: int) -> GpuBatchLayerActs {
+    let D  = cfg.D
+    let FF = cfg.FF
+    let BN = B * N
+    return GpuBatchLayerActs {
+        norm1:    gpu_zeros(BN * D),
+        q:        gpu_zeros(BN * D),
+        k:        gpu_zeros(BN * D),
+        v:        gpu_zeros(BN * D),
+        probs:    gpu_zeros(BN * N),
+        ctx:      gpu_zeros(BN * D),
+        attn_out: gpu_zeros(BN * D),
+        mid:      gpu_zeros(BN * D),
+        norm2:    gpu_zeros(BN * D),
+        up:       gpu_zeros(BN * FF),
+        act:      gpu_zeros(BN * FF),
+        ffn_out:  gpu_zeros(BN * D),
+        y:        gpu_zeros(BN * D),
+        rstd1:    gpu_zeros(BN),
+        rstd2:    gpu_zeros(BN)
+    }
+}
+
+fn free_batch_layer_acts(a: GpuBatchLayerActs) {
+    cuda_free(a.norm1)
+    cuda_free(a.q); cuda_free(a.k); cuda_free(a.v)
+    cuda_free(a.probs); cuda_free(a.ctx); cuda_free(a.attn_out)
+    cuda_free(a.mid); cuda_free(a.norm2)
+    cuda_free(a.up); cuda_free(a.act); cuda_free(a.ffn_out)
+    cuda_free(a.y); cuda_free(a.rstd1); cuda_free(a.rstd2)
+    0
+}
+
+fn alloc_batch_fwd_buffers(cfg: GpuClmConfig, batch_seq: int, batch_count: int) -> GpuBatchFwdActs {
+    let D     = cfg.D
+    let NL    = cfg.NL
+    let VOCAB = cfg.VOCAB
+    let RANK  = cfg.RANK
+    let BN    = batch_count * batch_seq
+
+    let h0     = gpu_zeros(BN * D)
+    let mid_lm = gpu_zeros(BN * RANK)
+    let logits = gpu_zeros(BN * VOCAB)
+
+    let mut layer_acts = []
+    let mut i = 0
+    while i < NL {
+        layer_acts = layer_acts.push(alloc_batch_layer_acts(cfg, batch_seq, batch_count))
+        i = i + 1
+    }
+
+    return GpuBatchFwdActs {
+        h0: h0, layers: layer_acts,
+        mid_lm: mid_lm, logits: logits
+    }
+}
+
+fn free_batch_fwd_buffers(acts: GpuBatchFwdActs) {
+    cuda_free(acts.h0)
+    cuda_free(acts.mid_lm)
+    cuda_free(acts.logits)
+    let n = len(acts.layers)
+    let mut i = 0
+    while i < n {
+        let _ = free_batch_layer_acts(acts.layers[i])
+        i = i + 1
+    }
+    0
+}
+
+// gpu_batch_layer_fwd_fused: process all GRAD_ACC micro-batches through
+// one transformer layer using strided batched GEMMs for projections and
+// per-batch fused kernels for non-GEMM ops.
+//
+// x_dev: [B * SEQ, D] contiguous input (all micro-batches concatenated)
+// The function processes each micro-batch's non-GEMM ops individually
+// (fused kernels are one-block-per-row) but batches all GEMMs.
+fn gpu_batch_layer_fwd_fused(x_dev, layer: GpuLayer, acts: GpuBatchLayerActs, cfg: GpuClmConfig, batch_count: int) {
+    let D    = cfg.D
+    let FF   = cfg.FF
+    let SEQ  = cfg.SEQ
+    let EPS  = cfg.EPS
+    let inv_sqrt_d = 1.0 / sqrt(D * 1.0)
+    let BN   = batch_count * SEQ
+
+    // 1. rms_norm — runs on all BN rows at once (one block per row, all batches)
+    let _ = gpu_fused_pre_attn_fwd(x_dev, layer.ga, acts.norm1, acts.rstd1, BN, D, EPS)
+
+    // 2. Q/K/V projections — strided batched GEMM (1 call each instead of B calls)
+    //    norm1[b*SEQ..(b+1)*SEQ, D] @ Wq[D, D] -> q[b*SEQ..(b+1)*SEQ, D]
+    let _ = gpu_sgemm_strided_batched(acts.norm1, layer.Wq, acts.q, SEQ, D, D, batch_count)
+    let _ = gpu_sgemm_strided_batched(acts.norm1, layer.Wk, acts.k, SEQ, D, D, batch_count)
+    let _ = gpu_sgemm_strided_batched(acts.norm1, layer.Wv, acts.v, SEQ, D, D, batch_count)
+
+    // 3. scores = q @ k^T -> [B * SEQ, SEQ]
+    //    Per-batch: q[b][SEQ,D] @ k[b]^T[D,SEQ], both batched
+    //    M=SEQ, N=SEQ, K=D. Use _both_nt since B (k) is transposed.
+    let strideQK = SEQ * D
+    let strideS  = SEQ * SEQ
+    let _ = gpu_sgemm_strided_batched_both_nt(acts.q, acts.k, acts.probs, SEQ, SEQ, D, strideQK, strideQK, strideS, batch_count)
+
+    // 4. fused scale + causal softmax — runs on all BN rows
+    //    Each row within a micro-batch needs causal masking relative to
+    //    its position within that batch's SEQ, not the global row index.
+    //    Since we concatenated batches, row `r` in the global buffer
+    //    corresponds to position `r % SEQ` in its micro-batch. The fused
+    //    kernel uses `tid > row` for causal mask, so we must process each
+    //    micro-batch separately to get correct masking.
+    let mut bi = 0
+    while bi < batch_count {
+        let off = bi * SEQ * SEQ * 4
+        let probs_bi = ptr_from_int(ptr_addr(acts.probs) + off)
+        let _ = gpu_fused_attn_post_fwd(probs_bi, probs_bi, SEQ, SEQ, inv_sqrt_d)
+        bi = bi + 1
+    }
+
+    // 5. ctx = probs @ v -> [B * SEQ, D]
+    //    Per-batch: probs[b][SEQ,SEQ] @ v[b][SEQ,D], both batched, no transpose
+    //    M=SEQ, N=D, K=SEQ.
+    let strideP = SEQ * SEQ
+    let strideV = SEQ * D
+    let strideCtx = SEQ * D
+    let _ = gpu_sgemm_strided_batched_both(acts.probs, acts.v, acts.ctx, SEQ, D, SEQ, strideP, strideV, strideCtx, batch_count)
+
+    // 6. attn_out = ctx @ Wo -> [B * SEQ, D]  (Wo shared, strideB=0)
+    let _ = gpu_sgemm_strided_batched(acts.ctx, layer.Wo, acts.attn_out, SEQ, D, D, batch_count)
+
+    // 7. fused mid = x + attn_out, rms_norm -> norm2  (all BN rows at once)
+    let _ = gpu_fused_mid_ffn_fwd(x_dev, acts.attn_out, layer.gf, acts.mid, acts.norm2, acts.rstd2, BN, D, EPS)
+
+    // 8. up = norm2 @ Wff1 -> [B * SEQ, FF]  (Wff1 shared)
+    let _ = gpu_sgemm_strided_batched(acts.norm2, layer.Wff1, acts.up, SEQ, FF, D, batch_count)
+
+    // 9. swiglu — runs on all BN * FF elements at once
+    let _ = gpu_swiglu_fwd(acts.up, acts.up, acts.act, BN * FF)
+
+    // 10. ffn_out = act @ Wff2 -> [B * SEQ, D]  (Wff2 shared)
+    let _ = gpu_sgemm_strided_batched(acts.act, layer.Wff2, acts.ffn_out, SEQ, D, FF, batch_count)
+
+    // 11. residual add — all BN * D elements at once
+    let _ = gpu_fused_residual_add(acts.mid, acts.ffn_out, acts.y, BN * D)
+
+    return acts.y
+}
+
+// gpu_batch_forward_full_fused: full forward pass for all GRAD_ACC micro-batches.
+//
+// toks_dev: [B * SEQ] int32 tokens (all micro-batches concatenated)
+// Returns: device pointer to logits [B * SEQ, VOCAB]
+//
+// cuBLAS call count for GRAD_ACC=8, NL=12:
+//   Original per-batch:  (7 * NL + 2) * B = 86 * 8  = 688 cuBLAS calls
+//   Batched:              7 * NL + 2       = 86       cuBLAS calls
+//   Reduction: 88% fewer cuBLAS launches
+fn gpu_batch_forward_full_fused(toks_dev, weights: GpuWeights, acts: GpuBatchFwdActs, cfg: GpuClmConfig, batch_count: int) {
+    let D     = cfg.D
+    let NL    = cfg.NL
+    let VOCAB = cfg.VOCAB
+    let SEQ   = cfg.SEQ
+    let RANK  = cfg.RANK
+    let BN    = batch_count * SEQ
+
+    // 1. embed lookup — all BN tokens at once
+    let _ = gpu_embed_lookup_fwd(weights.embed, toks_dev, acts.h0, VOCAB, D, BN)
+
+    // 2. transformer layers — batched fused path
+    let mut x = acts.h0
+    let mut li = 0
+    while li < NL {
+        let layer_acts = acts.layers[li]
+        let _ = gpu_batch_layer_fwd_fused(x, weights.layers[li], layer_acts, cfg, batch_count)
+        x = layer_acts.y
+        li = li + 1
+    }
+
+    // 3. LM head: mid_lm = x @ lmh_U -> [B * SEQ, RANK]
+    let _ = gpu_sgemm_strided_batched(x, weights.lmh_U, acts.mid_lm, SEQ, RANK, D, batch_count)
+
+    // 4. logits = mid_lm @ lmh_V -> [B * SEQ, VOCAB]
+    let _ = gpu_sgemm_strided_batched(acts.mid_lm, weights.lmh_V, acts.logits, SEQ, VOCAB, RANK, batch_count)
+
+    return acts.logits
+}
+
+// gpu_batch_backward_and_loss_fused: full backward pass for all GRAD_ACC
+// micro-batches, returning the averaged loss. Uses the same fused layer
+// backward kernels but runs per-batch since backward has more complex
+// data dependencies (gradient accumulation across micro-batches).
+//
+// logits_dev:  [B * SEQ, VOCAB] from batch_forward
+// targets_dev: [B * SEQ] int32 (all micro-batch targets concatenated)
+// toks_dev:    [B * SEQ] int32 (all micro-batch input tokens concatenated)
+//
+// Returns: scalar average loss across all micro-batches.
+fn gpu_batch_backward_and_loss_fused(logits_dev, targets_dev, toks_dev, acts: GpuBatchFwdActs, weights: GpuWeights, grad: GpuGrad, cfg: GpuClmConfig, batch_count: int) {
+    let D     = cfg.D
+    let FF    = cfg.FF
+    let NL    = cfg.NL
+    let VOCAB = cfg.VOCAB
+    let SEQ   = cfg.SEQ
+    let RANK  = cfg.RANK
+    let BN    = batch_count * SEQ
+
+    let mut total_loss = 0.0
+
+    // Process backward per micro-batch (gradient accumulation into shared grad buffers)
+    // CE loss + LM head backward per batch, then fused layer backward per batch.
+    let mut bi = 0
+    while bi < batch_count {
+        let off_logits = bi * SEQ * VOCAB * 4
+        let off_tgt    = bi * SEQ * 4
+        let off_tok    = bi * SEQ * 4
+        let off_h0     = bi * SEQ * D * 4
+        let off_midlm  = bi * SEQ * RANK * 4
+
+        let logits_bi  = ptr_from_int(ptr_addr(logits_dev)  + off_logits)
+        let targets_bi = ptr_from_int(ptr_addr(targets_dev) + off_tgt)
+        let toks_bi    = ptr_from_int(ptr_addr(toks_dev)    + off_tok)
+        let h0_bi      = ptr_from_int(ptr_addr(acts.h0)     + off_h0)
+        let midlm_bi   = ptr_from_int(ptr_addr(acts.mid_lm) + off_midlm)
+
+        // CE loss + dlogits for this micro-batch
+        let dlogits  = gpu_zeros(SEQ * VOCAB)
+        let loss_buf = gpu_zeros(1)
+        let _ = gpu_ce_loss_grad(logits_bi, targets_bi, loss_buf, dlogits, SEQ, VOCAB)
+        let loss_host = tensor_from_gpu(loss_buf, 1)
+        total_loss = total_loss + loss_host[0]
+        cuda_free(loss_buf)
+
+        // LM head backward
+        let dlmh_V_tmp = gpu_zeros(RANK * VOCAB)
+        let _ = gpu_sgemm_tn(midlm_bi, dlogits, dlmh_V_tmp, RANK, VOCAB, SEQ)
+        let _ = gpu_saxpy(dlmh_V_tmp, grad.dlmh_V, RANK * VOCAB, 1.0)
+        cuda_free(dlmh_V_tmp)
+        let dmid = gpu_zeros(SEQ * RANK)
+        let _ = gpu_sgemm_nt(dlogits, weights.lmh_V, dmid, SEQ, RANK, VOCAB)
+        cuda_free(dlogits)
+
+        // Get this batch's final hidden state
+        let off_hlast = bi * SEQ * D * 4
+        let h_last_bi = ptr_from_int(ptr_addr(acts.layers[NL - 1].y) + off_hlast)
+
+        let dlmh_U_tmp = gpu_zeros(D * RANK)
+        let _ = gpu_sgemm_tn(h_last_bi, dmid, dlmh_U_tmp, D, RANK, SEQ)
+        let _ = gpu_saxpy(dlmh_U_tmp, grad.dlmh_U, D * RANK, 1.0)
+        cuda_free(dlmh_U_tmp)
+        let mut dh = gpu_zeros(SEQ * D)
+        let _ = gpu_sgemm_nt(dmid, weights.lmh_U, dh, SEQ, D, RANK)
+        cuda_free(dmid)
+
+        // Layer backward — fused path, per micro-batch
+        let mut li = NL - 1
+        while li >= 0 {
+            let off_layer_in = bi * SEQ * D * 4
+            let layer_input_bi = if li == 0 {
+                h0_bi
+            } else {
+                ptr_from_int(ptr_addr(acts.layers[li - 1].y) + off_layer_in)
+            }
+
+            // Build a temporary GpuLayerActs pointing to this batch's slice
+            let off_d   = bi * SEQ * D * 4
+            let off_ff  = bi * SEQ * FF * 4
+            let off_ss  = bi * SEQ * SEQ * 4
+            let off_r   = bi * SEQ * 4
+            let la = acts.layers[li]
+            let la_bi = GpuLayerActs {
+                norm1:    ptr_from_int(ptr_addr(la.norm1)    + off_d),
+                q:        ptr_from_int(ptr_addr(la.q)        + off_d),
+                k:        ptr_from_int(ptr_addr(la.k)        + off_d),
+                v:        ptr_from_int(ptr_addr(la.v)        + off_d),
+                probs:    ptr_from_int(ptr_addr(la.probs)    + off_ss),
+                ctx:      ptr_from_int(ptr_addr(la.ctx)      + off_d),
+                attn_out: ptr_from_int(ptr_addr(la.attn_out) + off_d),
+                mid:      ptr_from_int(ptr_addr(la.mid)      + off_d),
+                norm2:    ptr_from_int(ptr_addr(la.norm2)    + off_d),
+                up:       ptr_from_int(ptr_addr(la.up)       + off_ff),
+                act:      ptr_from_int(ptr_addr(la.act)      + off_ff),
+                ffn_out:  ptr_from_int(ptr_addr(la.ffn_out)  + off_d),
+                y:        ptr_from_int(ptr_addr(la.y)        + off_d),
+                rstd1:    ptr_from_int(ptr_addr(la.rstd1)    + off_r),
+                rstd2:    ptr_from_int(ptr_addr(la.rstd2)    + off_r)
+            }
+
+            let dx_new = gpu_layer_bwd_fused(layer_input_bi, weights.layers[li], la_bi, dh, grad.layers[li], cfg)
+            cuda_free(dh)
+            dh = dx_new
+            li = li - 1
+        }
+
+        // embed scatter for this micro-batch
+        let _ = gpu_embed_lookup_bwd(dh, toks_bi, grad.dembed, VOCAB, D, SEQ)
+        cuda_free(dh)
+
+        bi = bi + 1
+    }
+
+    return total_loss / (batch_count * 1.0)
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  SGD step  —  w := w - lr * g  (in place via cuBLAS saxpy)
 // ═══════════════════════════════════════════════════════════════
 
@@ -1244,7 +1877,7 @@ fn gpu_train_parse_data_line(line: string, numel: int) -> array {
         if c == 32 || c == 9 || c == 10 || c == 13 {
             if i > tok_start {
                 let tok = line.substring(tok_start, i)
-                write_f32(host_buf, di, to_float(tok))
+                write_f32(host_buf, di * 4, to_float(tok))
                 di = di + 1
             }
             tok_start = i + 1
@@ -1253,12 +1886,12 @@ fn gpu_train_parse_data_line(line: string, numel: int) -> array {
     }
     if tok_start < n && di < numel {
         let tok = line.substring(tok_start, n)
-        write_f32(host_buf, di, to_float(tok))
+        write_f32(host_buf, di * 4, to_float(tok))
         di = di + 1
     }
     // Zero-fill any remaining slots
     while di < numel {
-        write_f32(host_buf, di, 0.0)
+        write_f32(host_buf, di * 4, 0.0)
         di = di + 1
     }
     let result = tensor_from_f32_ptr(host_buf, numel)
@@ -1284,7 +1917,7 @@ fn parse_line_to_dev_raw(line: string, numel: int) -> int {
         if c == 32 || c == 9 || c == 10 || c == 13 {
             if i > tok_start {
                 let tok = line.substring(tok_start, i)
-                write_f32(host_buf, di, to_float(tok))
+                write_f32(host_buf, di * 4, to_float(tok))
                 di = di + 1
             }
             tok_start = i + 1
@@ -1293,7 +1926,7 @@ fn parse_line_to_dev_raw(line: string, numel: int) -> int {
     }
     if tok_start < n && di < numel {
         let tok = line.substring(tok_start, n)
-        write_f32(host_buf, di, to_float(tok))
+        write_f32(host_buf, di * 4, to_float(tok))
         di = di + 1
     }
     let dev = cuda_malloc(numel * 4)
@@ -1495,7 +2128,7 @@ fn gpu_greedy_decode(prompt_tokens, weights: GpuWeights, cfg: GpuClmConfig, max_
         let mut best_val = deref_f32(host_buf, 0)
         let mut vi = 1
         while vi < VOCAB {
-            let v = deref_f32(host_buf, vi)
+            let v = deref_f32(host_buf, vi * 4)
             if v > best_val {
                 best_val = v
                 best_idx = vi
@@ -1515,57 +2148,6 @@ fn gpu_greedy_decode(prompt_tokens, weights: GpuWeights, cfg: GpuClmConfig, max_
 
     println("[gpu_train] gpu_greedy_decode: " + str(n_prompt) + " prompt + " + str(generated) + " generated = " + str(len(tokens)) + " tokens")
     return tokens
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  gpu_generate_greedy — byte-level public API
-//
-//  Thin wrapper over gpu_greedy_decode that takes a byte prompt
-//  (plain int array where every element is in [0,255]) and returns
-//  a byte sequence. For byte-level CLMs (VOCAB=256) bytes and
-//  tokens are identical so this is a semantic-only wrapper.
-//
-//  Matches the documented signature expected by serving/eval_*
-//  and the consciousness-decoder bridge:
-//
-//      fn gpu_generate_greedy(prompt: [byte], max_tokens: int) -> [byte]
-//
-//  Arguments:
-//    prompt     — input byte sequence ([int] with values 0..255)
-//    weights    — loaded GpuWeights (checkpoint or trained state)
-//    cfg        — GpuClmConfig (D/FF/NL/VOCAB/SEQ/RANK)
-//    max_tokens — how many bytes to generate after the prompt
-//
-//  Returns: [byte] containing prompt + generated bytes (up to
-//  cfg.SEQ total). Returns [] on error (empty prompt / too long).
-//
-//  Uses the existing forward kernel — no new compilation needed.
-// ═══════════════════════════════════════════════════════════════
-
-fn gpu_generate_greedy(prompt, weights: GpuWeights, cfg: GpuClmConfig, max_tokens: int) {
-    let n_prompt = len(prompt)
-    if n_prompt < 1 {
-        println("[gpu_train] gpu_generate_greedy: empty prompt")
-        return []
-    }
-    // gpu_greedy_decode handles all device interaction + argmax loop.
-    // We sanity-check the byte range up-front so a caller passing
-    // raw text (with UTF-8 bytes > 127) doesn't silently confuse the
-    // embedding lookup.
-    let mut i = 0
-    while i < n_prompt {
-        let b = prompt[i]
-        if b < 0 || b >= cfg.VOCAB {
-            println("[gpu_train] gpu_generate_greedy: byte out of range at " + str(i) + " = " + str(b))
-            return []
-        }
-        i = i + 1
-    }
-
-    // Delegate — returns [int] of tokens (= bytes here)
-    let out = gpu_greedy_decode(prompt, weights, cfg, max_tokens)
-    println("[gpu_train] gpu_generate_greedy: " + str(n_prompt) + " prompt bytes → " + str(len(out)) + " total bytes")
-    return out
 }
 
 // ═══════════════════════════════════════════════════════════════

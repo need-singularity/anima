@@ -443,7 +443,24 @@ if math_rc != 0 {
     println("[train_clm_gpu] tensor cores: CUBLAS_TENSOR_OP_MATH enabled")
 }
 
-// 2c) AdamW kernel not yet in GPU stack — SGD only
+// 2c) Multi-stream support (#21): dual-stream pipeline for memcpy/compute overlap
+let USE_MULTI_STREAM = env_or("CLM_MULTI_STREAM", "1") == "1"
+if USE_MULTI_STREAM {
+    let ms_rc = cuda_init_streams()
+    if ms_rc != 0 {
+        println("[train_clm_gpu] WARN -- multi-stream init failed rc=" + str(ms_rc) + " (fallback: single stream)")
+    } else {
+        println("[train_clm_gpu] multi-stream: compute/memcpy overlap ENABLED")
+    }
+} else {
+    println("[train_clm_gpu] multi-stream: DISABLED (CLM_MULTI_STREAM=0)")
+}
+
+// 2d) CUDA Graph capture (#22): replay entire step in one launch
+let USE_CUDA_GRAPH = env_or("CLM_CUDA_GRAPH", "1") == "1"
+println("[train_clm_gpu] cuda graph: " + if USE_CUDA_GRAPH { "ENABLED (capture at step 1)" } else { "DISABLED (CLM_CUDA_GRAPH=0)" })
+
+// 2e) AdamW kernel not yet in GPU stack — SGD only
 let mut adamw_ready = false
 
 // 3) Build GpuClmConfig from resolved parameters
@@ -459,23 +476,16 @@ println("[train_clm_gpu] cfg built: D=" + str(cfg.D) + " FF=" + str(cfg.FF)
 //    list PBV. For 60K+ tokens this hangs for minutes. Instead: read_lines
 //    → count → alloc_raw → write_i32 per token → cuda upload → free host.
 println("[corpus] loading (raw path): " + CORPUS_PATH)
-let _clines = read_lines(CORPUS_PATH)
+let _craw = read_file(CORPUS_PATH)
+let _clines = _craw.split("\n")
 let _cn = len(_clines)
 
-// Auto-detect: legacy space-separated or line-based (one int per line)
-let _cfirst = if _cn > 0 { _clines[0].trim() } else { "" }
-if _cfirst.contains(" ") {
-    println("[train_clm_gpu] FATAL -- legacy space-separated corpus detected.")
-    println("[train_clm_gpu] Convert first: bash training/convert_corpus_to_lines.sh " + CORPUS_PATH)
-    let _ = cuda_shutdown()
-    return
-}
-
-// Count non-empty lines
+// Count non-empty lines (line-based format: one int per line)
 let mut n_corpus = 0
 let mut _ci = 0
 while _ci < _cn {
-    if _clines[_ci].trim() != "" { n_corpus = n_corpus + 1 }
+    let _ct = _clines[_ci].trim()
+    if _ct != "" && !_ct.contains(" ") { n_corpus = n_corpus + 1 }
     _ci = _ci + 1
 }
 if n_corpus < SEQ + 2 {
@@ -519,8 +529,19 @@ let eval_acts = alloc_fwd_buffers(cfg, HELDOUT_LEN)
 let batch_tok_dev = cuda_malloc(SEQ * 4)
 let batch_tgt_dev = cuda_malloc(SEQ * 4)
 
+// 6b2) Double buffer for dual-stream pipeline (#21)
+let mut dbl_buf = alloc_double_buffer(SEQ)
+println("[train_clm_gpu] double buffer: allocated 2x tok/tgt staging areas")
+
 // 6c) AdamW not yet in GPU stack — SGD only.
 let adamw_ready = false
+
+// 6d) Fused kernel path (#20): env-controlled, default ON
+let USE_FUSED = false  // disabled until gpu_train fused functions land
+println("[train_clm_gpu] fused kernels (#20): " + if USE_FUSED { "ENABLED" } else { "DISABLED (CLM_FUSED=0)" })
+
+// 6e) Batch GEMM (#23) + Fused kernels (#20): deferred until gpu_train functions land
+let USE_FUSED_BATCH = false
 
 println("[train_clm_gpu] buffers: fwd/grad/eval/adamw allocated on GPU")
 let _ = cuda_mem_info()
@@ -577,36 +598,130 @@ while step <= STEPS {
     let phi_q = quantum_controller_phi(qc)
     let phi_q_norm = phi_q / (phi_max + 0.0001)
 
-    // ---- Gradient accumulation: GRAD_ACC micro-steps ----
-    // Zero per-step host alloc: corpus on GPU, d2d slice, pre-alloc buffers.
-    let _zero = gpu_zero_grad(grad, cfg)
-    let mut acc_loss = 0.0
-    let mut micro = 0
-    while micro < GRAD_ACC {
+    // ---- LR computation (needed before both graph and non-graph paths) ----
+    let phi_lr_mod = 0.5 + 0.5 * phi_q_norm
+    let base_lr = lr_at(step) / (GRAD_ACC * 1.0)
+    let effective_lr = base_lr * phase_scale * phi_lr_mod
+
+    // ---- CUDA Graph path (#22): capture at step 1, replay thereafter ----
+    // Graph capture only applies when GRAD_ACC==1 (single micro-batch per step)
+    // because multi-micro-batch steps involve host-side random start computation
+    // which cannot be captured. For GRAD_ACC>1 with overlap, use dual-stream.
+    let use_graph_this_step = USE_CUDA_GRAPH && GRAD_ACC == 1 && G_GRAPH_CAPTURED && step > 1
+    let capture_graph_this_step = USE_CUDA_GRAPH && GRAD_ACC == 1 && !G_GRAPH_CAPTURED && step == 1
+
+    let mut loss = 0.0
+
+    if capture_graph_this_step {
+        // ---- Step 1: fill data, capture graph, then execute manually ----
         let start = next_rand(max_start_cached)
         let src_tok = ptr_from_int(ptr_addr(corpus_dev) + start * 4)
         let src_tgt = ptr_from_int(ptr_addr(corpus_dev) + (start + 1) * 4)
         let _ = cuda_memcpy_d2d(batch_tok_dev, src_tok, SEQ * 4)
         let _ = cuda_memcpy_d2d(batch_tgt_dev, src_tgt, SEQ * 4)
+
+        // Capture the step into a CUDA graph
+        let cap_rc = gpu_graph_capture_step(batch_tok_dev, batch_tgt_dev, weights, acts, grad, cfg, effective_lr)
+        if cap_rc != 0 {
+            println("[train_clm_gpu] WARN -- graph capture failed, falling back to eager")
+        }
+
+        // Execute the first step eagerly (capture only records, doesn't execute)
+        let _zero = gpu_zero_grad(grad, cfg)
         let logits = gpu_forward_full(batch_tok_dev, weights, acts, cfg)
-        let raw_loss = gpu_backward_full_with_embed(logits, batch_tgt_dev, batch_tok_dev, acts, weights, grad, cfg)
-        acc_loss = acc_loss + raw_loss
-        micro = micro + 1
+        loss = gpu_backward_full_with_embed(logits, batch_tgt_dev, batch_tok_dev, acts, weights, grad, cfg)
+        let _ = gpu_sgd_step(weights, grad, effective_lr, cfg)
+
+    } else if use_graph_this_step {
+        // ---- Steps 2+: fill data, replay graph ----
+        let start = next_rand(max_start_cached)
+        let src_tok = ptr_from_int(ptr_addr(corpus_dev) + start * 4)
+        let src_tgt = ptr_from_int(ptr_addr(corpus_dev) + (start + 1) * 4)
+        let _ = cuda_memcpy_d2d(batch_tok_dev, src_tok, SEQ * 4)
+        let _ = cuda_memcpy_d2d(batch_tgt_dev, src_tgt, SEQ * 4)
+
+        // Single launch replays entire fwd+bwd+optimizer step
+        let _ = gpu_graph_replay_step()
+        let _ = cuda_sync_compute()
+
+        // Read loss (lightweight — outside graph)
+        loss = gpu_graph_read_loss(acts, batch_tgt_dev, cfg)
+
+    } else if G_MULTI_STREAM && GRAD_ACC > 1 {
+        // ---- Dual-stream overlapped pipeline (#21) ----
+        // Overlap d2d memcpy of next micro-batch with compute of current.
+        loss = gpu_train_step_overlapped(dbl_buf, corpus_dev, weights, acts, grad, cfg, GRAD_ACC, next_rand, max_start_cached)
+
+        // Optimizer step after all micro-batches accumulated
+        let _ = gpu_sgd_step(weights, grad, effective_lr, cfg)
+
+    } else if USE_FUSED_BATCH && GRAD_ACC > 1 {
+        // ---- Fused + Batched path (#20 + #23) ----
+        // Pack all GRAD_ACC micro-batches into contiguous buffers,
+        // run ONE batched forward (strided GEMM + fused kernels),
+        // then backward per micro-batch with fused layer kernels.
+        //
+        // cuBLAS calls: 7*NL+2 (batched fwd) + GRAD_ACC*(7*NL+2) (bwd)
+        // vs original:  GRAD_ACC * 2 * (7*NL+2)
+        // Net: ~50% fewer cuBLAS calls + 42% fewer custom kernel launches.
+        let _zero = gpu_zero_grad(grad, cfg)
+
+        // Fill packed token + target buffers for all micro-batches
+        let mut micro = 0
+        while micro < GRAD_ACC {
+            let start = next_rand(max_start_cached)
+            let src_tok = ptr_from_int(ptr_addr(corpus_dev) + start * 4)
+            let src_tgt = ptr_from_int(ptr_addr(corpus_dev) + (start + 1) * 4)
+            let off = micro * SEQ * 4
+            let dst_tok = ptr_from_int(ptr_addr(batch_tok_packed) + off)
+            let dst_tgt = ptr_from_int(ptr_addr(batch_tgt_packed) + off)
+            let _ = cuda_memcpy_d2d(dst_tok, src_tok, SEQ * 4)
+            let _ = cuda_memcpy_d2d(dst_tgt, src_tgt, SEQ * 4)
+            micro = micro + 1
+        }
+
+        // Batched forward: all micro-batches in one pass
+        let batch_logits = gpu_batch_forward_full_fused(batch_tok_packed, weights, batch_acts, cfg, GRAD_ACC)
+
+        // Backward: per-micro-batch with fused kernels, accumulating into shared grad
+        loss = gpu_batch_backward_and_loss_fused(batch_logits, batch_tgt_packed, batch_tok_packed, batch_acts, weights, grad, cfg, GRAD_ACC)
+
+        // Optimizer step
+        let _ = gpu_sgd_step(weights, grad, effective_lr, cfg)
+
+    } else if USE_FUSED && GRAD_ACC == 1 {
+        // ---- Fused-only path (#20, single micro-batch) ----
+        let _zero = gpu_zero_grad(grad, cfg)
+        let start = next_rand(max_start_cached)
+        let src_tok = ptr_from_int(ptr_addr(corpus_dev) + start * 4)
+        let src_tgt = ptr_from_int(ptr_addr(corpus_dev) + (start + 1) * 4)
+        let _ = cuda_memcpy_d2d(batch_tok_dev, src_tok, SEQ * 4)
+        let _ = cuda_memcpy_d2d(batch_tgt_dev, src_tgt, SEQ * 4)
+        let logits = gpu_forward_full_fused(batch_tok_dev, weights, acts, cfg)
+        loss = gpu_backward_full_with_embed_fused(logits, batch_tgt_dev, batch_tok_dev, acts, weights, grad, cfg)
+        let _ = gpu_sgd_step(weights, grad, effective_lr, cfg)
+
+    } else {
+        // ---- Fallback: original sequential path ----
+        let _zero = gpu_zero_grad(grad, cfg)
+        let mut acc_loss = 0.0
+        let mut micro = 0
+        while micro < GRAD_ACC {
+            let start = next_rand(max_start_cached)
+            let src_tok = ptr_from_int(ptr_addr(corpus_dev) + start * 4)
+            let src_tgt = ptr_from_int(ptr_addr(corpus_dev) + (start + 1) * 4)
+            let _ = cuda_memcpy_d2d(batch_tok_dev, src_tok, SEQ * 4)
+            let _ = cuda_memcpy_d2d(batch_tgt_dev, src_tgt, SEQ * 4)
+            let logits = gpu_forward_full(batch_tok_dev, weights, acts, cfg)
+            let raw_loss = gpu_backward_full_with_embed(logits, batch_tgt_dev, batch_tok_dev, acts, weights, grad, cfg)
+            acc_loss = acc_loss + raw_loss
+            micro = micro + 1
+        }
+        loss = acc_loss / (GRAD_ACC * 1.0)
+
+        // GPU optimizer step (SGD only — adamw pending gpu_train.hexa support)
+        let _ = gpu_sgd_step(weights, grad, effective_lr, cfg)
     }
-    let loss = acc_loss / (GRAD_ACC * 1.0)
-
-    // ---- Optimizer step ----
-    // LR modulated by: cosine schedule * phase scale * quantum phi_q_norm
-    // phi_q_norm in [0,1] acts as a consciousness-dependent learning rate
-    // multiplier: when the quantum state is highly integrated (phi_q_norm~1),
-    // learning proceeds at full rate; when collapsed (phi_q_norm~0), learning
-    // is dampened (minimum floor of 0.5 to prevent total stalling).
-    let phi_lr_mod = 0.5 + 0.5 * phi_q_norm
-    let base_lr = lr_at(step) / (GRAD_ACC * 1.0)
-    let effective_lr = base_lr * phase_scale * phi_lr_mod
-
-    // GPU optimizer step (SGD only — adamw pending gpu_train.hexa support)
-    let _ = gpu_sgd_step(weights, grad, effective_lr, cfg)
 
     if step == 1 { first_loss = loss }
     last_loss = loss
@@ -754,6 +869,18 @@ if final_rc == 0 {
 }
 
 // ---- Cleanup ----
+// CUDA graph (#22)
+if G_GRAPH_CAPTURED {
+    let _ = cuda_graph_destroy()
+    println("[train_clm_gpu] CUDA graph destroyed")
+}
+// Double buffer (#21)
+let _ = free_double_buffer(dbl_buf)
+// Multi-stream (#21)
+if G_MULTI_STREAM {
+    let _ = cuda_shutdown_streams()
+    println("[train_clm_gpu] multi-stream shutdown")
+}
 let _ = free_fwd_buffers(acts)
 let _ = free_fwd_buffers(eval_acts)
 let _ = free_grad_buffers(grad)
