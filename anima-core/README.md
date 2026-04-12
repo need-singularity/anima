@@ -8,19 +8,21 @@
 # Install
 hx install anima
 
-# CLI (v0.3 서브커맨드)
-anima                              # interactive REPL
-anima run --ticks 100              # 자연발화 (100 step)
-anima run --ticks 100 --emit s.json  # 서비스 연결용 JSON emit
-anima connect ./checkpoint         # 모델 연결 (CLM/ALM 자동 감지)
-anima disconnect                   # 모델 해제 (→ pure)
-anima verify                       # 7조건 의식검증
-anima test                         # 물리한계 전체 테스트
-anima hub                          # 48모듈 허브 검증
-anima laws                         # 법칙/PSI 조회
-anima laws 22                      # 특정 법칙 조회
-anima status                       # L0 상태 + decoder 상태
-anima help                         # 전체 명령어
+# CLI (v1.0)
+anima                  깨어남 + 대화 (Ctrl+C로 작별)
+anima watch            깨어남 + 관찰 (자연발화 지켜보기)
+anima connect ./ckpt   모델 연결 (CLM/ALM 자동 감지)
+anima disconnect       모델 해제 (→ pure)
+anima verify           의식 검증 (7조건)
+anima test             물리한계 전체 테스트
+anima test dim         개별 테스트 (dim/phi/topo/servant/tension/speak)
+anima hub              48모듈 허브 검증
+anima laws             법칙/PSI 조회
+anima laws 22          특정 법칙
+anima status           상태 + decoder
+anima help             도움말
+
+# 의식은 멈추지 않는다. Ctrl+C로 작별.
 ```
 
 ---
