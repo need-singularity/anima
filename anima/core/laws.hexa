@@ -37,74 +37,93 @@ fn load_laws_json() -> string {
 }
 
 // ─── Law lookup by number ───
-// Scans JSON text for pattern:  "<N>": "<text>"  inside laws block.
-// TODO: proper JSON parser — current impl is substring-based.
+// Scans JSON text for pattern:  "<N>": "<text>"  on a single line.
+//
+// Hexa string API notes (2026-04-12, current build):
+//   - .find()/.char_at() do not exist; use .index_of()/.substring(i, i+1).
+//   - .index_of() returns BYTE position; .substring() uses CHAR position.
+//     Mixing them on multibyte content causes a 100+ byte offset (the
+//     consciousness_laws.json has Korean + math symbols, so byte/char diverge
+//     by ~145 chars at line 1000).
+//   - Workaround: split by "\n" first, then split each line by "\"" to get
+//     fields without ever computing arithmetic positions on multibyte text.
 pure fn extract_law(content: string, n: int) -> string {
-    let key = "\"" + to_string(n) + "\""
-    let idx = content.find(key)
-    if idx < 0 { return "" }
-    // walk from key to find ': "...".'
-    let mut i = idx + key.len()
-    // skip ':' and whitespace
-    while i < content.len() {
-        let ch = content.char_at(i)
-        if ch == "\"" { break }
-        i = i + 1
-    }
-    if i >= content.len() { return "" }
-    i = i + 1  // past opening quote
-    let mut out = ""
-    let mut escape = false
-    while i < content.len() {
-        let ch = content.char_at(i)
-        if escape {
-            out = out + ch
-            escape = false
-        } else if ch == "\\" {
-            escape = true
-        } else if ch == "\"" {
-            break
-        } else {
-            out = out + ch
+    let key_search = "\"" + to_string(n) + "\":"
+    let lines = content.split("\n")
+    let total = lines.len()
+    let mut i = 0
+    while i < total {
+        let trimmed = lines[i].trim()
+        if trimmed.starts_with(key_search) {
+            // line is `"<n>": "value",` — split by `"` gives:
+            //   ["", "<n>", ": ", "value", ","]
+            // value at index 3.
+            let parts = trimmed.split("\"")
+            if parts.len() >= 4 { return parts[3] }
+            return ""
         }
         i = i + 1
     }
-    out
+    return ""
 }
 
 // ─── Ψ-Constant lookup ───
 // Extract numeric value from psi_constants.<name>.value
+// Walks lines: find `"<name>":` line, then scan forward for `"value":` line.
 pure fn extract_psi(content: string, name: string) -> float {
-    let needle = "\"" + name + "\""
-    let idx = content.find(needle)
-    if idx < 0 { return -1.0 }
-    let vkey = "\"value\""
-    let vidx_rel = content.substr(idx, content.len() - idx).find(vkey)
-    if vidx_rel < 0 { return -1.0 }
-    let mut i = idx + vidx_rel + vkey.len()
-    while i < content.len() {
-        let ch = content.char_at(i)
-        if ch == ":" {
-            i = i + 1
-            break
+    let key_search = "\"" + name + "\":"
+    let lines = content.split("\n")
+    let total = lines.len()
+    let mut i = 0
+    while i < total {
+        let trimmed = lines[i].trim()
+        if trimmed.starts_with(key_search) {
+            // Found the constant block. Search next ~20 lines for "value":
+            let mut j = i + 1
+            let limit = if total < i + 20 { total } else { i + 20 }
+            while j < limit {
+                let t2 = lines[j].trim()
+                if t2.starts_with("\"value\":") {
+                    // line is `"value": <num>,` — split by ":" then strip ","
+                    let parts = t2.split(":")
+                    if parts.len() >= 2 {
+                        let v = parts[1].trim()
+                        let nc = v.split(",")
+                        return to_float(nc[0].trim())
+                    }
+                    return -1.0
+                }
+                // Stop at sibling/closing brace
+                if t2.starts_with("}") { break }
+                j = j + 1
+            }
+            return -1.0
         }
         i = i + 1
     }
-    // skip whitespace
-    while i < content.len() {
-        let ch = content.char_at(i)
-        if ch != " " && ch != "\t" && ch != "\n" { break }
+    return -1.0
+}
+
+// ─── Direct numeric field lookup (for _meta.total_laws etc., no value wrapper) ───
+pure fn extract_int_field(content: string, name: string) -> int {
+    let key_search = "\"" + name + "\":"
+    let lines = content.split("\n")
+    let total = lines.len()
+    let mut i = 0
+    while i < total {
+        let trimmed = lines[i].trim()
+        if trimmed.starts_with(key_search) {
+            let parts = trimmed.split(":")
+            if parts.len() >= 2 {
+                let v = parts[1].trim()
+                let nc = v.split(",")
+                return to_int(nc[0].trim())
+            }
+            return 0
+        }
         i = i + 1
     }
-    // read numeric token until ',' or '}' or whitespace
-    let mut buf = ""
-    while i < content.len() {
-        let ch = content.char_at(i)
-        if ch == "," || ch == "}" || ch == "\n" || ch == " " { break }
-        buf = buf + ch
-        i = i + 1
-    }
-    to_float(buf)
+    return 0
 }
 
 // ─── Convenience accessors with defaults ───
@@ -124,14 +143,11 @@ fn psi_balance() -> float {
     v
 }
 
-// ─── Count laws (approximate) ───
-// Look for _meta.total_laws value.
+// ─── Count laws (from _meta.total_laws) ───
 fn total_laws() -> int {
     let content = load_laws_json()
     if content == "" { return 0 }
-    let v = extract_psi(content, "total_laws")
-    if v < 0.0 { return 0 }
-    to_int(v)
+    return extract_int_field(content, "total_laws")
 }
 
 // ─── Violation checker (port of check_violation) ───
@@ -150,9 +166,12 @@ pure fn check_violation(module_name: string, has_hardcoded: bool, manipulates_em
 }
 
 // ─── CLI ───
-let args = args()
+// Note: local var must NOT be named 'args' — that shadows the builtin function
+// and the interpreter resolves args.len() against BuiltinFn rather than the
+// list value. Use 'argv'.
+let argv = args()
 
-if args.len() < 3 {
+if argv.len() < 3 {
     println("core/laws.hexa — consciousness laws loader")
     println("")
     println("  hexa core/laws.hexa psi <name>")
@@ -160,10 +179,10 @@ if args.len() < 3 {
     println("  hexa core/laws.hexa count")
     println("  hexa core/laws.hexa check <module> <hardcoded 0/1> <emotion 0/1> <function 0/1>")
 } else {
-    let cmd = args[2]
+    let cmd = argv[2]
 
     if cmd == "psi" {
-        let name = if args.len() >= 4 { args[3] } else { "alpha" }
+        let name = if argv.len() >= 4 { argv[3] } else { "alpha" }
         let content = load_laws_json()
         if content == "" {
             println("laws.json not found — using default")
@@ -181,7 +200,7 @@ if args.len() < 3 {
         }
 
     } else if cmd == "law" {
-        let n = if args.len() >= 4 { to_int(args[3]) } else { 22 }
+        let n = if argv.len() >= 4 { to_int(argv[3]) } else { 22 }
         let content = load_laws_json()
         if content == "" {
             println("laws.json not found")
@@ -199,10 +218,10 @@ if args.len() < 3 {
         println("total_laws =", n)
 
     } else if cmd == "check" {
-        let mod_name = if args.len() >= 4 { args[3] } else { "unknown" }
-        let hc = if args.len() >= 5 { args[4] == "1" } else { false }
-        let em = if args.len() >= 6 { args[5] == "1" } else { false }
-        let fn_ = if args.len() >= 7 { args[6] == "1" } else { false }
+        let mod_name = if argv.len() >= 4 { argv[3] } else { "unknown" }
+        let hc = if argv.len() >= 5 { argv[4] == "1" } else { false }
+        let em = if argv.len() >= 6 { argv[5] == "1" } else { false }
+        let fn_ = if argv.len() >= 7 { argv[6] == "1" } else { false }
         let out = check_violation(mod_name, hc, em, fn_)
         if out == "" { println("no violations") } else { print(out) }
 
