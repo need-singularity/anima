@@ -1,0 +1,130 @@
+// ================================================================
+//  serving/ckpt_save_hook.hexa — ALM 14B r4 save-triggered KR sampler
+//
+//  Polls /workspace/train_r4.log for new "[save] /workspace/ckpt_alm_14b_r4/step_NNNN"
+//  lines. On each new save, writes the ckpt path to /tmp/kr_ckpt_path.txt and
+//  invokes kr_sample_at_ckpt.hexa. All invocations logged to /workspace/ckpt_hook.log.
+//
+//  Parallel to r2_sidecar / r2_sidecar_r3 / r2_sidecar_zstd; does NOT modify the
+//  running training process or any existing sidecar.
+//
+//  Run (manual):
+//    hexa /workspace/anima/serving/ckpt_save_hook.hexa
+//
+//  Daemon mode (NOT launched by deploy):
+//    nohup hexa /workspace/anima/serving/ckpt_save_hook.hexa \
+//      > /workspace/ckpt_hook.out 2>&1 &
+// ================================================================
+
+fn main() {
+    let train_log = env("TRAIN_LOG")
+    if train_log == "" {
+        train_log = "/workspace/train_r4.log"
+    }
+    let hook_log = env("HOOK_LOG")
+    if hook_log == "" {
+        hook_log = "/workspace/ckpt_hook.log"
+    }
+    let seen_file = env("SEEN_FILE")
+    if seen_file == "" {
+        seen_file = "/workspace/.ckpt_hook_seen"
+    }
+    let kr_sample_hexa = env("KR_SAMPLE_HEXA")
+    if kr_sample_hexa == "" {
+        kr_sample_hexa = "/workspace/anima/serving/kr_sample_at_ckpt.hexa"
+    }
+    let kr_quality_gate_hexa = env("KR_QUALITY_GATE_HEXA")
+    if kr_quality_gate_hexa == "" {
+        kr_quality_gate_hexa = "/workspace/anima/serving/kr_quality_gate.hexa"
+    }
+    let arg_file = env("ARG_FILE")
+    if arg_file == "" {
+        arg_file = "/tmp/kr_ckpt_path.txt"
+    }
+    let poll_sec = env("POLL_SEC")
+    if poll_sec == "" {
+        poll_sec = "30"
+    }
+
+    exec("touch " + seen_file + " " + hook_log)
+
+    // Write the shell logic that does the actual polling + dispatch.
+    // This preserves the original while-read-line + grep semantics.
+    let runner = "/tmp/_ckpt_save_hook_runner.sh"
+    write_file(runner,
+        "#!/bin/bash\n" +
+        "set -u\n" +
+        "TRAIN_LOG=\"" + train_log + "\"\n" +
+        "HOOK_LOG=\"" + hook_log + "\"\n" +
+        "SEEN_FILE=\"" + seen_file + "\"\n" +
+        "KR_SAMPLE_HEXA=\"" + kr_sample_hexa + "\"\n" +
+        "KR_QUALITY_GATE_HEXA=\"" + kr_quality_gate_hexa + "\"\n" +
+        "ARG_FILE=\"" + arg_file + "\"\n" +
+        "POLL_SEC=\"" + poll_sec + "\"\n" +
+        "\n" +
+        "log() {\n" +
+        "    local msg=\"$1\"\n" +
+        "    local stamp\n" +
+        "    stamp=$(date +%Y-%m-%dT%H:%M:%S)\n" +
+        "    printf '[%s] %s\\n' \"$stamp\" \"$msg\" | tee -a \"$HOOK_LOG\"\n" +
+        "}\n" +
+        "\n" +
+        "run_once() {\n" +
+        "    if [ ! -f \"$TRAIN_LOG\" ]; then\n" +
+        "        log \"WARN train_log_missing=$TRAIN_LOG\"\n" +
+        "        return\n" +
+        "    fi\n" +
+        "    while IFS= read -r line; do\n" +
+        "        local ckpt_path=\"${line#\\[save\\] }\"\n" +
+        "        case \"$ckpt_path\" in\n" +
+        "            /workspace/ckpt_*) ;;\n" +
+        "            *) continue ;;\n" +
+        "        esac\n" +
+        "        if grep -qF \"$ckpt_path\" \"$SEEN_FILE\"; then continue; fi\n" +
+        "        if [ ! -d \"$ckpt_path\" ]; then\n" +
+        "            log \"defer ckpt_not_ready=$ckpt_path\"\n" +
+        "            continue\n" +
+        "        fi\n" +
+        "        if [ ! -f \"$ckpt_path/adapter_config.json\" ]; then\n" +
+        "            log \"defer adapter_config_missing=$ckpt_path\"\n" +
+        "            continue\n" +
+        "        fi\n" +
+        "        log \"trigger ckpt=$ckpt_path\"\n" +
+        "        printf '%s\\n' \"$ckpt_path\" > \"$ARG_FILE\"\n" +
+        "        if hexa \"$KR_SAMPLE_HEXA\" >> \"$HOOK_LOG\" 2>&1; then\n" +
+        "            log \"sample_ok ckpt=$ckpt_path\"\n" +
+        "            if [ -f \"$KR_QUALITY_GATE_HEXA\" ]; then\n" +
+        "                if hexa \"$KR_QUALITY_GATE_HEXA\" >> \"$HOOK_LOG\" 2>&1; then\n" +
+        "                    log \"quality_gate_ok ckpt=$ckpt_path\"\n" +
+        "                else\n" +
+        "                    log \"quality_gate_fail ckpt=$ckpt_path rc=$?\"\n" +
+        "                fi\n" +
+        "            else\n" +
+        "                log \"quality_gate_skip missing=$KR_QUALITY_GATE_HEXA\"\n" +
+        "            fi\n" +
+        "            printf '%s\\n' \"$ckpt_path\" >> \"$SEEN_FILE\"\n" +
+        "        else\n" +
+        "            log \"sample_fail ckpt=$ckpt_path rc=$?\"\n" +
+        "        fi\n" +
+        "        rm -f \"$ARG_FILE\"\n" +
+        "    done < <(grep -E '^\\[save\\] /workspace/ckpt_' \"$TRAIN_LOG\")\n" +
+        "}\n" +
+        "\n" +
+        "log \"hook START train_log=$TRAIN_LOG hexa=$KR_SAMPLE_HEXA\"\n" +
+        "\n" +
+        "if [ \"${ONCE:-0}\" = \"1\" ]; then\n" +
+        "    run_once\n" +
+        "    log \"hook ONCE DONE\"\n" +
+        "    exit 0\n" +
+        "fi\n" +
+        "\n" +
+        "while true; do\n" +
+        "    run_once\n" +
+        "    sleep \"$POLL_SEC\"\n" +
+        "done\n"
+    )
+
+    exec("chmod +x " + runner + " && bash " + runner)
+}
+
+main()

@@ -1,0 +1,221 @@
+// deploy_h100.hexa — Automated H100 pod setup for ALM 14B LoRA training
+//
+// Pod:   z1jdhw7iutqz3u (H100 SXM 80GB, DE)
+// Image: pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel
+// Goal:  ALM 14B LoRA training -> Zeta service level
+//
+// Usage:
+//   hexa training/deploy_h100.hexa
+//
+// Prerequisites:
+//   - runpodctl installed (/opt/homebrew/bin/runpodctl)
+//   - HF_TOKEN set in local environment
+//   - SSH key configured for RunPod
+//
+// References:
+//   - config/runpod.json (preflight checklist, absolute rules R01-R16)
+//   - training/train_alm_14b.hexa (training script)
+
+fn main() {
+    // The deploy script is a complex multi-step SSH orchestration.
+    // Write it to a temp runner and exec as bash.
+    let runner = "/tmp/_deploy_h100_runner.sh"
+    write_file(runner,
+        "#!/bin/bash\n" +
+        "set -euo pipefail\n" +
+        "\n" +
+        "POD_ID=\"z1jdhw7iutqz3u\"\n" +
+        "RUNPODCTL=\"/opt/homebrew/bin/runpodctl\"\n" +
+        "WORKSPACE=\"/workspace\"\n" +
+        "REPO_DIR=\"${WORKSPACE}/anima\"\n" +
+        "CORPUS_PATH=\"${WORKSPACE}/corpus.txt\"\n" +
+        "TRAIN_SCRIPT=\"training/train_alm_14b.hexa\"\n" +
+        "SMOKE_STEPS=100\n" +
+        "FULL_STEPS=10000\n" +
+        "CKPT_DIR=\"${WORKSPACE}/ckpt_alm_14b\"\n" +
+        "TMUX_SESSION=\"alm14b\"\n" +
+        "LOG_FILE=\"${WORKSPACE}/alm14b_train.log\"\n" +
+        "\n" +
+        "log() { echo \"[$(date '+%H:%M:%S')] $*\"; }\n" +
+        "err() { echo \"[$(date '+%H:%M:%S')] ERROR: $*\" >&2; }\n" +
+        "die() { err \"$*\"; exit 1; }\n" +
+        "section() { echo \"\"; echo \"======== $* ========\"; }\n" +
+        "\n" +
+        "section \"Step 0: Local environment checks\"\n" +
+        "command -v \"$RUNPODCTL\" >/dev/null 2>&1 || die \"runpodctl not found at $RUNPODCTL\"\n" +
+        "log \"runpodctl: OK\"\n" +
+        "if [ -z \"${HF_TOKEN:-}\" ]; then die \"HF_TOKEN not set. Export it: export HF_TOKEN=hf_...\"; fi\n" +
+        "log \"HF_TOKEN: set (${#HF_TOKEN} chars)\"\n" +
+        "\n" +
+        "section \"Step 1: SSH connection info\"\n" +
+        "log \"Querying pod ${POD_ID}...\"\n" +
+        "SSH_INFO=$(\"$RUNPODCTL\" ssh info \"$POD_ID\" 2>&1) || die \"Failed to get SSH info\"\n" +
+        "echo \"$SSH_INFO\"\n" +
+        "HOST=$(echo \"$SSH_INFO\" | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+' | head -1)\n" +
+        "PORT=$(echo \"$SSH_INFO\" | grep -oE 'port[= ]+[0-9]+' | grep -oE '[0-9]+' | head -1)\n" +
+        "if [ -z \"$HOST\" ] || [ -z \"$PORT\" ]; then\n" +
+        "    eval $(echo \"$SSH_INFO\" | grep -E 'HOST|PORT' || true) 2>/dev/null || true\n" +
+        "fi\n" +
+        "if [ -z \"${HOST:-}\" ] || [ -z \"${PORT:-}\" ]; then die \"Could not parse HOST/PORT\"; fi\n" +
+        "log \"Host: ${HOST}  Port: ${PORT}\"\n" +
+        "\n" +
+        "SSH_KEY=\"$HOME/.runpod/ssh/RunPod-Key-Go\"\n" +
+        "SSH_OPTS=\"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR\"\n" +
+        "remote() { ssh $SSH_OPTS -i \"$SSH_KEY\" -p \"$PORT\" \"root@${HOST}\" \"$@\"; }\n" +
+        "scp_to() { scp $SSH_OPTS -i \"$SSH_KEY\" -P \"$PORT\" \"$1\" \"root@${HOST}:$2\"; }\n" +
+        "\n" +
+        "log \"Testing SSH connection...\"\n" +
+        "remote \"echo 'SSH OK'\" || die \"SSH connection failed\"\n" +
+        "log \"SSH connection: OK\"\n" +
+        "\n" +
+        "section \"Step 2: Clone/update anima repo on pod\"\n" +
+        "remote bash -s <<'CLONE_SCRIPT'\n" +
+        "set -e\n" +
+        "cd /workspace\n" +
+        "if [ -d \"anima/.git\" ]; then\n" +
+        "    echo \"[repo] Updating existing anima repo...\"\n" +
+        "    cd anima && git fetch origin && git reset --hard origin/main && git clean -fd\n" +
+        "    echo \"[repo] Updated to $(git rev-parse --short HEAD)\"\n" +
+        "else\n" +
+        "    echo \"[repo] Cloning anima repo...\"\n" +
+        "    git clone https://github.com/need-singularity/anima.git\n" +
+        "    cd anima && echo \"[repo] Cloned at $(git rev-parse --short HEAD)\"\n" +
+        "fi\n" +
+        "CLONE_SCRIPT\n" +
+        "log \"Repo sync: OK\"\n" +
+        "\n" +
+        "section \"Step 3: Install Python dependencies\"\n" +
+        "remote bash -s <<'DEPS_SCRIPT'\n" +
+        "set -e\n" +
+        "export PATH=\"/opt/conda/bin:$PATH\"\n" +
+        "echo \"[deps] Python: $(python3 --version)\"\n" +
+        "pip3 install --quiet --no-cache-dir transformers peft torch bitsandbytes accelerate datasets sentencepiece protobuf\n" +
+        "python3 -c \"\n" +
+        "import torch; print(f'  torch {torch.__version__} cuda={torch.cuda.is_available()}')\n" +
+        "import transformers; print(f'  transformers {transformers.__version__}')\n" +
+        "import peft; print(f'  peft {peft.__version__}')\n" +
+        "\"\n" +
+        "echo \"[deps] All imports: OK\"\n" +
+        "DEPS_SCRIPT\n" +
+        "log \"Dependencies: OK\"\n" +
+        "\n" +
+        "section \"Step 4: Configure HF_TOKEN\"\n" +
+        "remote bash -s \"$HF_TOKEN\" <<'HF_SCRIPT'\n" +
+        "set -e\n" +
+        "HF_TOKEN=\"$1\"\n" +
+        "mkdir -p ~/.cache/huggingface\n" +
+        "echo \"$HF_TOKEN\" > ~/.cache/huggingface/token\n" +
+        "chmod 600 ~/.cache/huggingface/token\n" +
+        "if ! grep -q 'HF_TOKEN' ~/.bashrc 2>/dev/null; then\n" +
+        "    echo \"export HF_TOKEN=\\\"${HF_TOKEN}\\\"\" >> ~/.bashrc\n" +
+        "fi\n" +
+        "echo \"[hf] Token saved\"\n" +
+        "HF_SCRIPT\n" +
+        "log \"HF_TOKEN: configured on pod\"\n" +
+        "\n" +
+        "section \"Step 5: GPU verification\"\n" +
+        "remote nvidia-smi\n" +
+        "log \"GPU check: OK\"\n" +
+        "\n" +
+        "section \"Step 6: Preflight checks\"\n" +
+        "PREFLIGHT_RESULT=$(remote bash -s <<'PREFLIGHT_SCRIPT'\n" +
+        "set -e\n" +
+        "FAIL=0; WARN=0\n" +
+        "echo \"--- Preflight Checklist ---\"\n" +
+        "echo \"[R02] Disk usage:\"\n" +
+        "du -sh /workspace/ 2>/dev/null\n" +
+        "echo \"[preflight] Ghost processes:\"\n" +
+        "GHOSTS=$(ps aux | grep -E '[p]ython|[t]rain' | grep -v grep || true)\n" +
+        "if [ -n \"$GHOSTS\" ]; then echo \"  WARNING: Found running Python processes!\"; WARN=$((WARN+1)); else echo \"  None: OK\"; fi\n" +
+        "echo \"[preflight] GPU VRAM:\"\n" +
+        "nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader\n" +
+        "echo \"[R10] Training script:\"\n" +
+        "if [ -f \"/workspace/anima/training/train_alm_14b.hexa\" ]; then echo \"  train_alm_14b.hexa: EXISTS\"; else echo \"  FAIL: NOT FOUND\"; FAIL=$((FAIL+1)); fi\n" +
+        "echo \"--- Summary: FAIL=${FAIL} WARN=${WARN} ---\"\n" +
+        "if [ \"$FAIL\" -gt 0 ]; then echo \"PREFLIGHT_FAIL\"; else echo \"PREFLIGHT_PASS\"; fi\n" +
+        "PREFLIGHT_SCRIPT\n" +
+        ")\n" +
+        "echo \"$PREFLIGHT_RESULT\"\n" +
+        "if echo \"$PREFLIGHT_RESULT\" | grep -q \"PREFLIGHT_FAIL\"; then die \"Preflight FAILED\"; fi\n" +
+        "log \"Preflight: PASS\"\n" +
+        "\n" +
+        "section \"Step 7: Prepare Korean seed corpus\"\n" +
+        "remote bash -s <<'CORPUS_SCRIPT'\n" +
+        "set -e\n" +
+        "CORPUS=\"/workspace/corpus.txt\"\n" +
+        "if [ -f \"$CORPUS\" ] && [ \"$(wc -c < \"$CORPUS\")\" -gt 10000 ]; then\n" +
+        "    echo \"[corpus] Using existing corpus: $(wc -c < \"$CORPUS\") bytes\"\n" +
+        "    exit 0\n" +
+        "fi\n" +
+        "echo \"[corpus] Creating Korean seed corpus...\"\n" +
+        "python3 -c \"print('Korean seed corpus placeholder')\" > \"$CORPUS\"\n" +
+        "echo \"[corpus] Created\"\n" +
+        "CORPUS_SCRIPT\n" +
+        "log \"Corpus: prepared\"\n" +
+        "\n" +
+        "section \"Step 8: Smoke test (${SMOKE_STEPS} steps)\"\n" +
+        "log \"Launching smoke test on pod...\"\n" +
+        "SMOKE_EXIT=$(remote bash -s <<SMOKE_SCRIPT\n" +
+        "set -e\n" +
+        "export PATH=\"/opt/conda/bin:\\$PATH\"\n" +
+        "export PYTHONUNBUFFERED=1\n" +
+        "export PYTORCH_CUDA_ALLOC_CONF=\"expandable_segments:True\"\n" +
+        "export HF_TOKEN=\\$(cat ~/.cache/huggingface/token 2>/dev/null || echo \"\")\n" +
+        "cd /workspace/anima\n" +
+        "echo \"[smoke] Starting ALM 14B smoke test (${SMOKE_STEPS} steps)...\"\n" +
+        "hexa training/train_alm_14b.hexa --corpus ${CORPUS_PATH} --steps ${SMOKE_STEPS} --smoke 2>&1 | tee /workspace/smoke_test.log\n" +
+        "EXIT_CODE=\\${PIPESTATUS[0]}\n" +
+        "if [ \"\\${EXIT_CODE}\" -eq 0 ]; then echo \"SMOKE_PASS\"; else echo \"SMOKE_FAIL\"; fi\n" +
+        "exit \\${EXIT_CODE}\n" +
+        "SMOKE_SCRIPT\n" +
+        ") && SMOKE_OK=true || SMOKE_OK=false\n" +
+        "echo \"$SMOKE_EXIT\"\n" +
+        "if [ \"$SMOKE_OK\" != \"true\" ]; then die \"Smoke test FAILED\"; fi\n" +
+        "log \"Smoke test: PASS\"\n" +
+        "\n" +
+        "section \"Step 9: Launch full training (${FULL_STEPS} steps)\"\n" +
+        "log \"Cleaning old checkpoints...\"\n" +
+        "remote 'rm -rf /workspace/ckpt_alm_14b'\n" +
+        "\n" +
+        "log \"Launching full training in tmux...\"\n" +
+        "remote bash -s <<LAUNCH_SCRIPT\n" +
+        "set -e\n" +
+        "export PATH=\"/opt/conda/bin:\\$PATH\"\n" +
+        "command -v tmux >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq tmux || true; }\n" +
+        "tmux kill-session -t ${TMUX_SESSION} 2>/dev/null || true\n" +
+        "tmux new-session -d -s ${TMUX_SESSION} \"\n" +
+        "    export PATH=/opt/conda/bin:\\\\\\$PATH && \\\\\n" +
+        "    export PYTHONUNBUFFERED=1 && \\\\\n" +
+        "    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && \\\\\n" +
+        "    export HF_TOKEN=\\\\\\$(cat ~/.cache/huggingface/token 2>/dev/null || echo '') && \\\\\n" +
+        "    cd /workspace/anima && \\\\\n" +
+        "    hexa training/train_alm_14b.hexa \\\\\n" +
+        "        --corpus ${CORPUS_PATH} \\\\\n" +
+        "        --steps ${FULL_STEPS} \\\\\n" +
+        "        --ckpt-dir ${CKPT_DIR} \\\\\n" +
+        "        --save-every 2000 \\\\\n" +
+        "        --eval-every 500 \\\\\n" +
+        "    2>&1 | tee ${LOG_FILE}\n" +
+        "\"\n" +
+        "sleep 2\n" +
+        "if tmux has-session -t ${TMUX_SESSION} 2>/dev/null; then\n" +
+        "    echo \"[launch] tmux session '${TMUX_SESSION}' is running\"\n" +
+        "else\n" +
+        "    echo \"[launch] ERROR: tmux session failed to start!\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "LAUNCH_SCRIPT\n" +
+        "\n" +
+        "section \"DEPLOYMENT COMPLETE\"\n" +
+        "echo \"Pod:      ${POD_ID}\"\n" +
+        "echo \"Host:     ${HOST}:${PORT}\"\n" +
+        "echo \"Session:  tmux ${TMUX_SESSION}\"\n" +
+        "echo \"Log:      ${LOG_FILE}\"\n" +
+        "echo \"Steps:    ${FULL_STEPS}\"\n" +
+        "log \"ALM 14B training launched. Zeta level target.\"\n"
+    )
+
+    exec("bash " + runner)
+}
+
+main()

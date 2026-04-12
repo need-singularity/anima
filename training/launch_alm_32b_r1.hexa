@@ -1,0 +1,104 @@
+// launch_alm_32b_r1.hexa — ALM 32B r1 LoRA training (RunPod H100 80GB)
+//
+// Scales 14B r4 -> 32B r1:
+//   - base:         Qwen/Qwen2.5-14B-Instruct -> Qwen/Qwen2.5-32B-Instruct
+//   - lora_r:       64 -> 32    (memory budget)
+//   - lora_alpha:   128 -> 64   (keep 2:1 ratio)
+//   - target_modules: UNCHANGED (attn q/k/v/o + MLP gate/up/down = 7 modules)
+//   - ckpt_dir:     /workspace/ckpt_alm_32b_r1  (fresh, never reused)
+//
+// Trigger condition:
+//   - /workspace/READY_FOR_32B marker MUST exist
+//
+// Run on RunPod H100 80GB:
+//   1. Wait for /workspace/READY_FOR_32B to appear.
+//   2. scp this script + train_alm_32b_r1.hexa to /workspace/
+//   3. hexa launch_alm_32b_r1.hexa
+
+fn main() {
+    let runner = "/tmp/_launch_alm_32b_r1_runner.sh"
+    write_file(runner,
+        "#!/usr/bin/env bash\n" +
+        "set -euo pipefail\n" +
+        "\n" +
+        "echo \"============================================\"\n" +
+        "echo \"  ALM 32B r1 -- LoRA r=32 alpha=64, attn+MLP\"\n" +
+        "echo \"============================================\"\n" +
+        "\n" +
+        "MARKER=\"/workspace/READY_FOR_32B\"\n" +
+        "if [[ ! -f \"$MARKER\" ]]; then\n" +
+        "    echo \"[preflight] $MARKER missing -- 14B r4 has not yet cleared eval<0.02\"\n" +
+        "    echo \"[preflight]   Refusing to launch.\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[preflight] trigger marker present: $MARKER\"\n" +
+        "cat \"$MARKER\" 2>/dev/null || true\n" +
+        "\n" +
+        "HEXA_BIN=\"${HEXA_BIN:-/usr/local/bin/hexa}\"\n" +
+        "HEXA_CFG=\"/workspace/train_alm_32b_r1.hexa\"\n" +
+        "if [[ -x \"$HEXA_BIN\" && -f \"$HEXA_CFG\" ]]; then\n" +
+        "    echo \"[preflight] parse-checking $HEXA_CFG ...\"\n" +
+        "    \"$HEXA_BIN\" \"$HEXA_CFG\" > /workspace/train_alm_32b_r1.plan.log 2>&1 || {\n" +
+        "        echo \"[preflight] parse failed\"\n" +
+        "        cat /workspace/train_alm_32b_r1.plan.log\n" +
+        "        exit 1\n" +
+        "    }\n" +
+        "    echo \"[preflight] hexa config OK\"\n" +
+        "else\n" +
+        "    echo \"[preflight] hexa binary or config missing -- continuing without dry-run\"\n" +
+        "fi\n" +
+        "\n" +
+        "echo \"[preflight] checking GPU...\"\n" +
+        "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader\n" +
+        "\n" +
+        "CORPUS=\"/workspace/anima/training/corpus_large.txt\"\n" +
+        "echo \"[preflight] checking corpus...\"\n" +
+        "if [[ ! -f \"$CORPUS\" ]]; then echo \"[preflight] corpus missing: $CORPUS\"; exit 1; fi\n" +
+        "ls -lh \"$CORPUS\"\n" +
+        "\n" +
+        "echo \"[preflight] checking disk...\"\n" +
+        "df -h /workspace\n" +
+        "echo \"[preflight] HF_TOKEN set: ${HF_TOKEN:+yes}\"\n" +
+        "\n" +
+        "export HF_HUB_CACHE=\"/workspace/hf_cache\"\n" +
+        "export HF_HOME=\"/workspace/hf_cache\"\n" +
+        "export TRANSFORMERS_CACHE=\"/workspace/hf_cache\"\n" +
+        "PRESTAGED=\"/workspace/hf_cache/models--Qwen--Qwen2.5-32B-Instruct\"\n" +
+        "if [[ -d \"$PRESTAGED\" ]]; then\n" +
+        "    echo \"[preflight] Qwen2.5-32B pre-staged: $(du -sh \"$PRESTAGED\" | awk '{print $1}')\"\n" +
+        "else\n" +
+        "    echo \"[preflight] Qwen2.5-32B NOT pre-staged -- first launch will download ~64GB\"\n" +
+        "fi\n" +
+        "\n" +
+        "CKPT_DIR=\"/workspace/ckpt_alm_32b_r1\"\n" +
+        "rm -rf \"$CKPT_DIR\"\n" +
+        "mkdir -p \"$CKPT_DIR\"\n" +
+        "\n" +
+        "python3 /workspace/anima/training/train_alm_14b.py \\\n" +
+        "    --base Qwen/Qwen2.5-32B-Instruct \\\n" +
+        "    --corpus \"$CORPUS\" \\\n" +
+        "    --steps 10000 \\\n" +
+        "    --lr 5e-6 \\\n" +
+        "    --batch 1 \\\n" +
+        "    --grad-accum 8 \\\n" +
+        "    --seq 1024 \\\n" +
+        "    --warmup 500 \\\n" +
+        "    --lora-r 32 \\\n" +
+        "    --lora-alpha 64 \\\n" +
+        "    --lora-dropout 0.05 \\\n" +
+        "    --target-modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj \\\n" +
+        "    --ckpt-dir \"$CKPT_DIR\" \\\n" +
+        "    --save-every 2000 \\\n" +
+        "    --eval-every 500 \\\n" +
+        "    --model-tag alm32b \\\n" +
+        "    --round 1 \\\n" +
+        "    2>&1 | tee \"$CKPT_DIR/train_r1.log\"\n" +
+        "\n" +
+        "echo \"[done] 32B r1 training complete -- check $CKPT_DIR\"\n" +
+        "echo \"[next] hexa eval_alm_14b.hexa --ckpt $CKPT_DIR/step_10000\"\n"
+    )
+
+    exec("bash " + runner)
+}
+
+main()

@@ -1,0 +1,136 @@
+// launch_monitor_alm_r4.hexa — idempotent launcher for ALM 14B r4 monitor
+//
+// Deploys monitor_alm_r4.hexa as a background daemon on the H100 pod.
+// Idempotent: kills any previously running instance before starting a
+// new one. Writes PID to /workspace/monitor_alm.pid.
+//
+// Runs on the pod (not local mac). Called via ssh or directly after
+// scp sync:
+//     ssh H100 hexa /workspace/anima/serving/launch_monitor_alm_r4.hexa
+//
+// Constraints:
+//   - never touches the training process (PID 26756 or otherwise)
+//   - never touches unrelated hexa processes (CLM d32, CLM GPU, etc.)
+//   - ONLY kills processes that match the exact script path
+
+fn main() {
+    let hexa_bin = env("HEXA_BIN")
+    if hexa_bin == "" {
+        hexa_bin = "/usr/local/bin/hexa"
+    }
+    let script = env("SCRIPT")
+    if script == "" {
+        script = "/workspace/anima/serving/monitor_alm_r4.hexa"
+    }
+    let log_path = env("LOG")
+    if log_path == "" {
+        log_path = "/workspace/monitor_alm.log"
+    }
+    let pidfile = env("PIDFILE")
+    if pidfile == "" {
+        pidfile = "/workspace/monitor_alm.pid"
+    }
+    let interval = env("INTERVAL")
+    if interval == "" {
+        interval = "60"
+    }
+
+    println("[launch] monitor_alm_r4 launcher starting")
+    println("[launch] hexa:     " + hexa_bin)
+    println("[launch] script:   " + script)
+    println("[launch] log:      " + log_path)
+    println("[launch] pidfile:  " + pidfile)
+    println("[launch] interval: " + interval + "s")
+
+    // Write the launcher shell script and exec it.
+    // The shell handles pidfile management, process killing, nohup, etc.
+    let runner = "/tmp/_launch_monitor_runner.sh"
+    write_file(runner,
+        "#!/usr/bin/env bash\n" +
+        "set -euo pipefail\n" +
+        "HEXA_BIN=\"" + hexa_bin + "\"\n" +
+        "SCRIPT=\"" + script + "\"\n" +
+        "LOG=\"" + log_path + "\"\n" +
+        "PIDFILE=\"" + pidfile + "\"\n" +
+        "INTERVAL=\"" + interval + "\"\n" +
+        "\n" +
+        "if [ ! -x \"$HEXA_BIN\" ]; then\n" +
+        "    echo \"[launch][fatal] hexa binary missing: $HEXA_BIN\" >&2\n" +
+        "    exit 2\n" +
+        "fi\n" +
+        "if [ ! -f \"$SCRIPT\" ]; then\n" +
+        "    echo \"[launch][fatal] script missing: $SCRIPT\" >&2\n" +
+        "    exit 2\n" +
+        "fi\n" +
+        "\n" +
+        "KILLED=0\n" +
+        "if [ -f \"$PIDFILE\" ]; then\n" +
+        "    OLD_PID=\"$(cat \"$PIDFILE\" 2>/dev/null || echo \"\")\"\n" +
+        "    if [ -n \"$OLD_PID\" ] && kill -0 \"$OLD_PID\" 2>/dev/null; then\n" +
+        "        CMD=\"$(ps -p \"$OLD_PID\" -o args= 2>/dev/null || echo \"\")\"\n" +
+        "        case \"$CMD\" in\n" +
+        "            *monitor_alm_r4.hexa*)\n" +
+        "                echo \"[launch] killing prior daemon pid=$OLD_PID\"\n" +
+        "                kill \"$OLD_PID\" 2>/dev/null || true\n" +
+        "                sleep 1\n" +
+        "                if kill -0 \"$OLD_PID\" 2>/dev/null; then\n" +
+        "                    echo \"[launch] sending SIGKILL to stubborn pid=$OLD_PID\"\n" +
+        "                    kill -9 \"$OLD_PID\" 2>/dev/null || true\n" +
+        "                fi\n" +
+        "                KILLED=1\n" +
+        "                ;;\n" +
+        "            *)\n" +
+        "                echo \"[launch] pidfile pid=$OLD_PID is not our daemon (cmd='$CMD'); skipping\"\n" +
+        "                ;;\n" +
+        "        esac\n" +
+        "    fi\n" +
+        "fi\n" +
+        "\n" +
+        "REMAINING=\"$(pgrep -af 'monitor_alm_r4\\.hexa' 2>/dev/null | grep -v 'launch_monitor_alm_r4' | awk '{print $1}' || true)\"\n" +
+        "if [ -n \"${REMAINING:-}\" ]; then\n" +
+        "    for p in $REMAINING; do\n" +
+        "        CMD=\"$(ps -p \"$p\" -o args= 2>/dev/null || echo \"\")\"\n" +
+        "        case \"$CMD\" in\n" +
+        "            *monitor_alm_r4.hexa*)\n" +
+        "                echo \"[launch] killing stray daemon pid=$p\"\n" +
+        "                kill \"$p\" 2>/dev/null || true\n" +
+        "                KILLED=1\n" +
+        "                ;;\n" +
+        "        esac\n" +
+        "    done\n" +
+        "    sleep 1\n" +
+        "fi\n" +
+        "\n" +
+        "if [ \"$KILLED\" -eq 1 ]; then\n" +
+        "    echo \"[launch] prior daemons cleared\"\n" +
+        "fi\n" +
+        "\n" +
+        "if kill -0 26756 2>/dev/null; then\n" +
+        "    echo \"[launch] training PID 26756 still alive -- OK\"\n" +
+        "else\n" +
+        "    echo \"[launch][warn] training PID 26756 not running -- monitor will still start\"\n" +
+        "fi\n" +
+        "\n" +
+        "echo \"[launch] starting new daemon\"\n" +
+        "cd /workspace\n" +
+        "nohup \"$HEXA_BIN\" \"$SCRIPT\" --interval \"$INTERVAL\" >> \"$LOG\" 2>&1 < /dev/null &\n" +
+        "NEW_PID=$!\n" +
+        "echo \"$NEW_PID\" > \"$PIDFILE\"\n" +
+        "echo \"[launch] daemon started pid=$NEW_PID\"\n" +
+        "\n" +
+        "sleep 2\n" +
+        "if kill -0 \"$NEW_PID\" 2>/dev/null; then\n" +
+        "    echo \"[launch] pid=$NEW_PID alive after 2s -- OK\"\n" +
+        "    ps -p \"$NEW_PID\" -o pid,stat,command\n" +
+        "else\n" +
+        "    echo \"[launch][fatal] pid=$NEW_PID died within 2s -- check $LOG\" >&2\n" +
+        "    tail -20 \"$LOG\" >&2 || true\n" +
+        "    exit 3\n" +
+        "fi\n" +
+        "echo \"[launch] done. tail -f $LOG\"\n"
+    )
+
+    exec("bash " + runner)
+}
+
+main()

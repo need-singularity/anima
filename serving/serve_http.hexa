@@ -1,0 +1,95 @@
+// serve_http.hexa — bridge eval_serve.hexa to HTTP via socat
+//
+// P5c-1: minimal HTTP serving endpoint for hexa model.
+// Each TCP connection forks a new eval_serve.hexa process that
+// reads its stdin (the request body) and writes plaintext to stdout
+// (the response body). socat handles the HTTP framing.
+//
+// Usage:
+//   hexa serve_http.hexa                       # default port 8080, no checkpoint
+//   hexa serve_http.hexa 9000                  # custom port
+//   hexa serve_http.hexa 8080 model.hexackpt   # custom port + checkpoint
+//
+// Test (in another shell):
+//   curl -s -d 'GEN 16 0' http://localhost:8080
+//   curl -s -d 'HEALTH'   http://localhost:8080
+//   curl -s -d 'INFO'     http://localhost:8080
+
+fn main() {
+    let argv = args()
+    let mut port = "8080"
+    let mut ckpt = ""
+
+    if len(argv) >= 1 {
+        port = argv[0]
+    }
+    if len(argv) >= 2 {
+        ckpt = argv[1]
+    }
+
+    let hexa = env("HEXA")
+    if hexa == "" {
+        hexa = env("HOME") + "/Dev/hexa-lang/hexa"
+    }
+
+    // Resolve eval_serve.hexa relative to this script's directory
+    let eval_serve = "$(dirname \"$(realpath \"$0\" 2>/dev/null || echo serving)\")/eval_serve.hexa"
+
+    // Preflight checks
+    let runner = "/tmp/_serve_http_runner.sh"
+    write_file(runner,
+        "#!/bin/bash\n" +
+        "set -e\n" +
+        "PORT=\"" + port + "\"\n" +
+        "CKPT=\"" + ckpt + "\"\n" +
+        "HEXA=\"" + hexa + "\"\n" +
+        "EVAL_SERVE=\"$(dirname \"$0\")/../serving/eval_serve.hexa\"\n" +
+        "# Try to resolve from the anima serving dir\n" +
+        "for candidate in \\\n" +
+        "    \"$(cd \"$(dirname \"$0\")\" && pwd)/eval_serve.hexa\" \\\n" +
+        "    \"$(cd \"$(dirname \"$0\")/../serving\" 2>/dev/null && pwd)/eval_serve.hexa\" \\\n" +
+        "    \"/workspace/anima/serving/eval_serve.hexa\" \\\n" +
+        "    \"$HOME/Dev/anima/serving/eval_serve.hexa\"; do\n" +
+        "    if [ -f \"$candidate\" ]; then\n" +
+        "        EVAL_SERVE=\"$candidate\"\n" +
+        "        break\n" +
+        "    fi\n" +
+        "done\n" +
+        "\n" +
+        "if [ ! -x \"$HEXA\" ]; then\n" +
+        "    echo \"ERR: hexa binary not found at $HEXA\" >&2\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "if [ ! -f \"$EVAL_SERVE\" ]; then\n" +
+        "    echo \"ERR: eval_serve.hexa not found at $EVAL_SERVE\" >&2\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "if ! command -v socat >/dev/null 2>&1; then\n" +
+        "    echo \"ERR: socat not installed (brew install socat / apt install socat)\" >&2\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "\n" +
+        "if [ -n \"$CKPT\" ]; then\n" +
+        "    CMD=\"$HEXA $EVAL_SERVE $CKPT\"\n" +
+        "else\n" +
+        "    CMD=\"$HEXA $EVAL_SERVE\"\n" +
+        "fi\n" +
+        "\n" +
+        "echo \"=== eval_serve HTTP bridge ===\"\n" +
+        "echo \"  port  : $PORT\"\n" +
+        "echo \"  hexa  : $HEXA\"\n" +
+        "echo \"  serve : $EVAL_SERVE\"\n" +
+        "echo \"  ckpt  : ${CKPT:-(default shift-by-1 model)}\"\n" +
+        "echo \"\"\n" +
+        "echo \"  Test:  curl -s -d 'GEN 16 0' http://localhost:$PORT\"\n" +
+        "echo \"         curl -s -d 'HEALTH'   http://localhost:$PORT\"\n" +
+        "echo \"\"\n" +
+        "echo \"  Listening...\"\n" +
+        "\n" +
+        "exec socat TCP-LISTEN:\"$PORT\",fork,reuseaddr SYSTEM:\"$CMD\"\n"
+    )
+
+    exec("bash " + runner)
+}
+
+main()
