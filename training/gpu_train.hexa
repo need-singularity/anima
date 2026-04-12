@@ -1,0 +1,1573 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/gpu_train.hexa — Higher-level CLM training primitives
+//
+//  Pure-hexa GPU training stack for byte-level CLM. Mirrors the
+//  CPU reference at anima/training/train_byte_kr.hexa exactly so
+//  that small-D smoke runs (D=16, FF=32, NL=2, SEQ=16, RANK=4)
+//  can be cross-verified bit-for-bit between CPU/GPU paths.
+//
+//  Architecture (per cfg, NOT hardcoded):
+//      embed[VOCAB,D]
+//      NL × { rms(ga) → Wq/Wk/Wv → softmax(causal) → Wo → +x
+//                → rms(gf) → Wff1 → swiglu(up,up) → Wff2 → +x }
+//      lmh_U[D,RANK] → lmh_V[RANK,VOCAB]  (low-rank LM head)
+//      cross-entropy + per-step SGD on every parameter
+//
+//  All weights/grads/activations live on the device as raw *Void
+//  pointers. We never round-trip through CPU during the training
+//  loop (apart from optional checkpoint I/O).
+//
+//  This file ships the primitives:
+//      cfg + structs (Weights / Grad / per-layer Acts / fwd Acts)
+//      init / free helpers
+//      gpu_layer_fwd / gpu_layer_bwd
+//      gpu_forward_full / gpu_backward_full
+//      gpu_sgd_step / gpu_zero_grad
+//      gpu_adamw_step / alloc_adamw_state / free_adamw_state
+//      gpu_greedy_decode (autoregressive generation)
+//      save_checkpoint_gpu / load_checkpoint_gpu (HEXACKPT-v1)
+//
+//  cuBLAS supplies all matmul (gpu_sgemm / gpu_sgemm_tn /
+//  gpu_sgemm_nt). All non-matmul kernels (rms_norm, softmax,
+//  swiglu, embed_lookup, ce_loss_grad, add_inplace, randn_fill)
+//  come from cuda_kernels.hexa via NVRTC. We assume those wrapper
+//  names exist:
+//      gpu_embed_lookup_fwd(W, toks, out, V, D, N)  // matches cuda_kernels signature
+//      gpu_embed_lookup_bwd(dy, toks, dW, V, D, N)  // matches cuda_kernels signature
+//      gpu_rms_norm_fwd(x, g, out, rstd, N, D, eps)
+//      gpu_rms_norm_bwd(x, g, dy, rstd, dx, dg, N, D, eps)
+//      gpu_softmax_rows_fwd(in, out, R, C, causal)
+//      gpu_softmax_rows_bwd(probs, dp, ds, R, C)
+//      gpu_swiglu_fwd(up, gate, out, N)
+//      gpu_swiglu_bwd(up, gate, dy, dup, dgate, N)
+//      gpu_add_inplace(a, b, N)            // a += b
+//      gpu_ce_loss_grad(logits, tgt, loss, dlogits, R, C)
+//      gpu_randn_fill(buf, n, seed, scale) // Box-Muller, fp32
+//      gpu_fill_value(buf, n, value)       // constant fill (1.0)
+// ═══════════════════════════════════════════════════════════════
+
+use "cuda_ffi"
+use "cuda_rtc"
+use "cuda_kernels"
+
+// ═══════════════════════════════════════════════════════════════
+//  Config
+// ═══════════════════════════════════════════════════════════════
+
+struct GpuClmConfig {
+    D:          int,
+    FF:         int,
+    NL:         int,
+    VOCAB:      int,
+    SEQ:        int,
+    RANK:       int,
+    EPS:        float,
+    INIT_SCALE: float
+}
+
+// Service-grade defaults (H100 target)
+fn gpu_clm_config_default() -> GpuClmConfig {
+    return GpuClmConfig {
+        D:          512,
+        FF:         2048,
+        NL:         12,
+        VOCAB:      256,
+        SEQ:        512,
+        RANK:       64,
+        EPS:        0.00001,
+        INIT_SCALE: 0.02
+    }
+}
+
+// Smoke defaults — must match anima/training/train_byte_kr.hexa
+// for bit-for-bit cross-verification on CPU vs GPU.
+fn gpu_clm_config_smoke() -> GpuClmConfig {
+    return GpuClmConfig {
+        D:          16,
+        FF:         32,
+        NL:         2,
+        VOCAB:      256,
+        SEQ:        16,
+        RANK:       4,
+        EPS:        0.00001,
+        INIT_SCALE: 0.1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Structs (device pointer carriers)
+// ═══════════════════════════════════════════════════════════════
+
+// Per-transformer-layer parameters (8 tensors).
+struct GpuLayer {
+    Wq:   int,   // [D, D]
+    Wk:   int,   // [D, D]
+    Wv:   int,   // [D, D]
+    Wo:   int,   // [D, D]
+    Wff1: int,   // [D, FF]
+    Wff2: int,   // [FF, D]
+    ga:   int,   // [D]    pre-attn rmsnorm scale
+    gf:   int    // [D]    pre-ffn rmsnorm scale
+}
+
+// Full model on device. cfg carried alongside so save/load is
+// self-describing.
+struct GpuWeights {
+    cfg:    GpuClmConfig,
+    embed:  int,        // [VOCAB, D]
+    layers: [GpuLayer],   // length NL
+    lmh_U:  int,        // [D, RANK]
+    lmh_V:  int         // [RANK, VOCAB]
+}
+
+// Activations saved during a single layer's forward, needed for
+// backward. Shapes assume token count N = SEQ.
+struct GpuLayerActs {
+    norm1:    int,   // [N, D]   rms_norm(x, ga)
+    q:        int,   // [N, D]
+    k:        int,   // [N, D]
+    v:        int,   // [N, D]
+    probs:    int,   // [N, N]   row-softmax (causal)
+    ctx:      int,   // [N, D]   probs @ V
+    attn_out: int,   // [N, D]   ctx @ Wo
+    mid:      int,   // [N, D]   x + attn_out
+    norm2:    int,   // [N, D]   rms_norm(mid, gf)
+    up:       int,   // [N, FF]  norm2 @ Wff1
+    act:      int,   // [N, FF]  swiglu(up, up)
+    ffn_out:  int,   // [N, D]   act @ Wff2
+    y:        int,   // [N, D]   mid + ffn_out
+    rstd1:    int,   // [N]      1/rms saved by rms_norm_fwd #1
+    rstd2:    int    // [N]      1/rms saved by rms_norm_fwd #2
+}
+
+// Activations across the whole forward chain for one micro-step.
+struct GpuFwdActs {
+    h0:      int,         // [N, D]      embed lookup
+    layers:  [GpuLayerActs],// per-layer
+    mid_lm:  int,         // [N, RANK]   y_last @ lmh_U
+    logits:  int          // [N, VOCAB]  mid_lm @ lmh_V
+}
+
+// Per-layer gradients (matches GpuLayer one-for-one).
+struct GpuLayerGrad {
+    dWq:   int,
+    dWk:   int,
+    dWv:   int,
+    dWo:   int,
+    dWff1: int,
+    dWff2: int,
+    dga:   int,
+    dgf:   int
+}
+
+// Full-model grad (mirrors GpuWeights).
+struct GpuGrad {
+    dembed:  int,
+    layers:  [GpuLayerGrad],
+    dlmh_U:  int,
+    dlmh_V:  int
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Allocation helpers
+// ═══════════════════════════════════════════════════════════════
+
+// gpu_fill_value(dev, n, value)
+//   Host-side fill of a GPU f32 buffer with a constant value.
+//   Small buffers (RMS norm scales of length D) so host alloc is fine.
+fn gpu_fill_value(dev, n, value) {
+    let host_buf = alloc_raw(n * 4)
+    let mut i = 0
+    while i < n {
+        write_f32(host_buf, i, value)
+        i = i + 1
+    }
+    let _ = cuda_memcpy_h2d(dev, host_buf, n * 4)
+    free_raw(host_buf, n * 4)
+    0
+}
+
+fn gpu_init_layer_random(cfg: GpuClmConfig, seed_base: int) -> GpuLayer {
+    let D  = cfg.D
+    let FF = cfg.FF
+    let s  = cfg.INIT_SCALE
+
+    let Wq   = gpu_zeros(D * D)
+    let Wk   = gpu_zeros(D * D)
+    let Wv   = gpu_zeros(D * D)
+    let Wo   = gpu_zeros(D * D)
+    let Wff1 = gpu_zeros(D * FF)
+    let Wff2 = gpu_zeros(FF * D)
+    let ga   = gpu_zeros(D)
+    let gf   = gpu_zeros(D)
+
+    let _ = gpu_randn_fill(Wq,   D * D,  seed_base + 10, s)
+    let _ = gpu_randn_fill(Wk,   D * D,  seed_base + 11, s)
+    let _ = gpu_randn_fill(Wv,   D * D,  seed_base + 12, s)
+    let _ = gpu_randn_fill(Wo,   D * D,  seed_base + 13, s)
+    let _ = gpu_randn_fill(Wff1, D * FF, seed_base + 14, s)
+    let _ = gpu_randn_fill(Wff2, FF * D, seed_base + 15, s)
+    // rms-norm scales start at 1.0 (mirrors train_byte_kr.hexa)
+    let _ = gpu_fill_value(ga, D, 1.0)
+    let _ = gpu_fill_value(gf, D, 1.0)
+
+    return GpuLayer {
+        Wq: Wq, Wk: Wk, Wv: Wv, Wo: Wo,
+        Wff1: Wff1, Wff2: Wff2, ga: ga, gf: gf
+    }
+}
+
+fn init_gpu_weights(cfg: GpuClmConfig, seed: int) -> GpuWeights {
+    let D     = cfg.D
+    let FF    = cfg.FF
+    let NL    = cfg.NL
+    let VOCAB = cfg.VOCAB
+    let RANK  = cfg.RANK
+
+    // Embedding — INIT_SCALE
+    let embed = gpu_zeros(VOCAB * D)
+    let _ = gpu_randn_fill(embed, VOCAB * D, seed + 1, cfg.INIT_SCALE)
+
+    // LM head low-rank factors — INIT_SCALE
+    let lmh_U = gpu_zeros(D * RANK)
+    let lmh_V = gpu_zeros(RANK * VOCAB)
+    let _ = gpu_randn_fill(lmh_U, D * RANK,    seed + 30, cfg.INIT_SCALE)
+    let _ = gpu_randn_fill(lmh_V, RANK * VOCAB, seed + 31, cfg.INIT_SCALE)
+
+    // Stack of layers
+    let mut layers = []
+    let mut li = 0
+    while li < NL {
+        // Each layer gets a distinct seed band so smoke runs are
+        // deterministic and reproducible across re-inits.
+        let layer = gpu_init_layer_random(cfg, seed + 100 + li * 100)
+        layers = layers.push(layer)
+        li = li + 1
+    }
+
+    println("[gpu_train] init_gpu_weights — D=" + str(D) + " FF=" + str(FF) + " NL=" + str(NL) + " VOCAB=" + str(VOCAB) + " SEQ=" + str(cfg.SEQ) + " RANK=" + str(RANK))
+    return GpuWeights {
+        cfg: cfg, embed: embed, layers: layers,
+        lmh_U: lmh_U, lmh_V: lmh_V
+    }
+}
+
+fn free_gpu_layer(layer: GpuLayer) {
+    cuda_free(layer.Wq)
+    cuda_free(layer.Wk)
+    cuda_free(layer.Wv)
+    cuda_free(layer.Wo)
+    cuda_free(layer.Wff1)
+    cuda_free(layer.Wff2)
+    cuda_free(layer.ga)
+    cuda_free(layer.gf)
+    0
+}
+
+fn free_gpu_weights(w: GpuWeights) {
+    cuda_free(w.embed)
+    cuda_free(w.lmh_U)
+    cuda_free(w.lmh_V)
+    let NL = w.cfg.NL
+    let mut i = 0
+    while i < NL {
+        let _ = free_gpu_layer(w.layers[i])
+        i = i + 1
+    }
+    println("[gpu_train] free_gpu_weights — released " + str(NL) + " layers")
+    0
+}
+
+// ─── Activation buffer helpers ──────────────────────────────────
+
+fn alloc_layer_acts(cfg: GpuClmConfig, N: int) -> GpuLayerActs {
+    let D  = cfg.D
+    let FF = cfg.FF
+    return GpuLayerActs {
+        norm1:    gpu_zeros(N * D),
+        q:        gpu_zeros(N * D),
+        k:        gpu_zeros(N * D),
+        v:        gpu_zeros(N * D),
+        probs:    gpu_zeros(N * N),
+        ctx:      gpu_zeros(N * D),
+        attn_out: gpu_zeros(N * D),
+        mid:      gpu_zeros(N * D),
+        norm2:    gpu_zeros(N * D),
+        up:       gpu_zeros(N * FF),
+        act:      gpu_zeros(N * FF),
+        ffn_out:  gpu_zeros(N * D),
+        y:        gpu_zeros(N * D),
+        rstd1:    gpu_zeros(N),
+        rstd2:    gpu_zeros(N)
+    }
+}
+
+fn free_layer_acts(a: GpuLayerActs) {
+    cuda_free(a.norm1)
+    cuda_free(a.q); cuda_free(a.k); cuda_free(a.v)
+    cuda_free(a.probs); cuda_free(a.ctx); cuda_free(a.attn_out)
+    cuda_free(a.mid); cuda_free(a.norm2)
+    cuda_free(a.up); cuda_free(a.act); cuda_free(a.ffn_out)
+    cuda_free(a.y); cuda_free(a.rstd1); cuda_free(a.rstd2)
+    0
+}
+
+fn alloc_fwd_buffers(cfg: GpuClmConfig, batch_seq: int) -> GpuFwdActs {
+    let D     = cfg.D
+    let NL    = cfg.NL
+    let VOCAB = cfg.VOCAB
+    let RANK  = cfg.RANK
+    let N     = batch_seq
+
+    let h0     = gpu_zeros(N * D)
+    let mid_lm = gpu_zeros(N * RANK)
+    let logits = gpu_zeros(N * VOCAB)
+
+    let mut layer_acts = []
+    let mut i = 0
+    while i < NL {
+        layer_acts = layer_acts.push(alloc_layer_acts(cfg, N))
+        i = i + 1
+    }
+
+    return GpuFwdActs {
+        h0: h0, layers: layer_acts,
+        mid_lm: mid_lm, logits: logits
+    }
+}
+
+fn free_fwd_buffers(acts: GpuFwdActs) {
+    cuda_free(acts.h0)
+    cuda_free(acts.mid_lm)
+    cuda_free(acts.logits)
+    let n = len(acts.layers)
+    let mut i = 0
+    while i < n {
+        let _ = free_layer_acts(acts.layers[i])
+        i = i + 1
+    }
+    0
+}
+
+// ─── Gradient buffer helpers ────────────────────────────────────
+
+fn alloc_layer_grad(cfg: GpuClmConfig) -> GpuLayerGrad {
+    let D  = cfg.D
+    let FF = cfg.FF
+    return GpuLayerGrad {
+        dWq:   gpu_zeros(D * D),
+        dWk:   gpu_zeros(D * D),
+        dWv:   gpu_zeros(D * D),
+        dWo:   gpu_zeros(D * D),
+        dWff1: gpu_zeros(D * FF),
+        dWff2: gpu_zeros(FF * D),
+        dga:   gpu_zeros(D),
+        dgf:   gpu_zeros(D)
+    }
+}
+
+fn free_layer_grad(g: GpuLayerGrad) {
+    cuda_free(g.dWq); cuda_free(g.dWk); cuda_free(g.dWv); cuda_free(g.dWo)
+    cuda_free(g.dWff1); cuda_free(g.dWff2)
+    cuda_free(g.dga);  cuda_free(g.dgf)
+    0
+}
+
+fn alloc_grad_buffers(cfg: GpuClmConfig) -> GpuGrad {
+    let D     = cfg.D
+    let VOCAB = cfg.VOCAB
+    let RANK  = cfg.RANK
+    let NL    = cfg.NL
+
+    let dembed = gpu_zeros(VOCAB * D)
+    let dlmh_U = gpu_zeros(D * RANK)
+    let dlmh_V = gpu_zeros(RANK * VOCAB)
+    let mut layers = []
+    let mut i = 0
+    while i < NL {
+        layers = layers.push(alloc_layer_grad(cfg))
+        i = i + 1
+    }
+    return GpuGrad {
+        dembed: dembed, layers: layers,
+        dlmh_U: dlmh_U, dlmh_V: dlmh_V
+    }
+}
+
+fn free_grad_buffers(g: GpuGrad) {
+    cuda_free(g.dembed)
+    cuda_free(g.dlmh_U)
+    cuda_free(g.dlmh_V)
+    let n = len(g.layers)
+    let mut i = 0
+    while i < n {
+        let _ = free_layer_grad(g.layers[i])
+        i = i + 1
+    }
+    0
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Layer forward
+//  Mirrors layer_fwd in train_byte_kr.hexa step-by-step:
+//    1. norm1 = rms_norm(x, ga)
+//    2. q,k,v = norm1 @ Wq,Wk,Wv
+//    3. scores = q @ k^T / sqrt(D), softmax(causal)  → probs
+//    4. ctx = probs @ v
+//    5. attn_out = ctx @ Wo
+//    6. mid = x + attn_out
+//    7. norm2 = rms_norm(mid, gf)
+//    8. up = norm2 @ Wff1
+//    9. act = swiglu(up, up)
+//   10. ffn_out = act @ Wff2
+//   11. y = mid + ffn_out
+// ═══════════════════════════════════════════════════════════════
+
+fn gpu_layer_fwd(x_dev, layer: GpuLayer, acts: GpuLayerActs, cfg: GpuClmConfig) {
+    let D    = cfg.D
+    let FF   = cfg.FF
+    let SEQ  = cfg.SEQ
+    let EPS  = cfg.EPS
+
+    // 1. norm1 = rms_norm(x, ga) — also fills rstd1[N]
+    let _ = gpu_rms_norm_fwd(x_dev, layer.ga, acts.norm1, acts.rstd1, SEQ, D, EPS)
+
+    // 2. Q/K/V projections — [SEQ, D] @ [D, D] → [SEQ, D]
+    let _ = gpu_sgemm(acts.norm1, layer.Wq, acts.q, SEQ, D, D)
+    let _ = gpu_sgemm(acts.norm1, layer.Wk, acts.k, SEQ, D, D)
+    let _ = gpu_sgemm(acts.norm1, layer.Wv, acts.v, SEQ, D, D)
+
+    // 3. scores = q @ k^T  → [SEQ, SEQ]
+    //    gpu_sgemm_nt(A,B,C,M,N,K) computes C = A @ B^T  with B[N,K]
+    //    so we pass M=SEQ, N=SEQ, K=D, A=q, B=k.
+    let _ = gpu_sgemm_nt(acts.q, acts.k, acts.probs, SEQ, SEQ, D)
+
+    //    scale by 1/sqrt(D) (in place) and softmax with causal mask
+    let inv_sqrt_d = 1.0 / sqrt(D * 1.0)
+    let _ = gpu_sscal(acts.probs, SEQ * SEQ, inv_sqrt_d)
+    let _ = gpu_softmax_rows_fwd(acts.probs, acts.probs, SEQ, SEQ, 1)
+
+    // 4. ctx = probs @ v  → [SEQ, D]
+    let _ = gpu_sgemm(acts.probs, acts.v, acts.ctx, SEQ, D, SEQ)
+
+    // 5. attn_out = ctx @ Wo  → [SEQ, D]
+    let _ = gpu_sgemm(acts.ctx, layer.Wo, acts.attn_out, SEQ, D, D)
+
+    // 6. mid = x + attn_out
+    //    cuBLAS has no copy-add → memcpy x → mid then add attn_out
+    let _ = cuda_memcpy_d2d(acts.mid, x_dev, SEQ * D * 4)
+    let _ = gpu_add_inplace(acts.mid, acts.attn_out, SEQ * D)
+
+    // 7. norm2 = rms_norm(mid, gf) — also fills rstd2[N]
+    let _ = gpu_rms_norm_fwd(acts.mid, layer.gf, acts.norm2, acts.rstd2, SEQ, D, EPS)
+
+    // 8. up = norm2 @ Wff1  → [SEQ, FF]
+    let _ = gpu_sgemm(acts.norm2, layer.Wff1, acts.up, SEQ, FF, D)
+
+    // 9. act = swiglu(up, up)  — both gate and value share the same tensor
+    let _ = gpu_swiglu_fwd(acts.up, acts.up, acts.act, SEQ * FF)
+
+    // 10. ffn_out = act @ Wff2  → [SEQ, D]
+    let _ = gpu_sgemm(acts.act, layer.Wff2, acts.ffn_out, SEQ, D, FF)
+
+    // 11. y = mid + ffn_out
+    let _ = cuda_memcpy_d2d(acts.y, acts.mid, SEQ * D * 4)
+    let _ = gpu_add_inplace(acts.y, acts.ffn_out, SEQ * D)
+
+    return acts.y
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Layer backward
+//  Receives dy (gradient of layer output y) and accumulates into
+//  the supplied GpuLayerGrad. Returns dx via the workspace ptr
+//  passed in (in fact we write into a freshly allocated buffer
+//  which the caller must free, mirroring layer_bwd's dx return).
+//
+//  Reverses train_byte_kr.hexa layer_bwd exactly:
+//    dy = dmid_res = dffn_out
+//    swiglu^-1 → Wff1^-1 → rms2^-1 → +dy → split for attn
+//    Wo^-1 → ctx → softmax^-1 → q,k,v^-1 → rms1^-1 → +dx_res
+// ═══════════════════════════════════════════════════════════════
+
+fn gpu_layer_bwd(x_dev, layer: GpuLayer, acts: GpuLayerActs, dy_dev, grad: GpuLayerGrad, cfg: GpuClmConfig) {
+    let D   = cfg.D
+    let FF  = cfg.FF
+    let SEQ = cfg.SEQ
+    let EPS = cfg.EPS
+    let inv_sqrt_d = 1.0 / sqrt(D * 1.0)
+
+    // dmid_res = dy, dffn_out = dy (residual fork)
+    let dffn_out = dy_dev
+
+    // ── Wff2 backward: act @ Wff2 = ffn_out
+    //   dWff2 += act^T @ dffn_out   → [FF, D]
+    //   dact   = dffn_out @ Wff2^T  → [SEQ, FF]
+    let dact = gpu_zeros(SEQ * FF)
+    // dWff2 accumulate via tn-gemm: act is [SEQ, FF] → A^T [FF, SEQ]
+    let dWff2_tmp = gpu_zeros(FF * D)
+    let _ = gpu_sgemm_tn(acts.act, dffn_out, dWff2_tmp, FF, D, SEQ)
+    let _ = gpu_saxpy(dWff2_tmp, grad.dWff2, FF * D, 1.0)
+    cuda_free(dWff2_tmp)
+    // dact = dffn_out @ Wff2^T  : Wff2 is [FF, D] so we need
+    //   dact[SEQ, FF] = dffn_out[SEQ, D] @ Wff2^T[D, FF]
+    // gpu_sgemm_nt(A,B,C,M,N,K) does C = A @ B^T  with B[N,K]
+    //   M=SEQ N=FF K=D  A=dffn_out  B=Wff2
+    let _ = gpu_sgemm_nt(dffn_out, layer.Wff2, dact, SEQ, FF, D)
+
+    // ── swiglu backward: act = swiglu(up, up)
+    //   dup_value, dup_gate ← acts.up, acts.up, dact
+    //   dup = dup_value + dup_gate (since up == gate)
+    let dup_value = gpu_zeros(SEQ * FF)
+    let dup_gate  = gpu_zeros(SEQ * FF)
+    let _ = gpu_swiglu_bwd(acts.up, acts.up, dact, dup_value, dup_gate, SEQ * FF)
+    let dup = gpu_zeros(SEQ * FF)
+    let _ = gpu_saxpy(dup_value, dup, SEQ * FF, 1.0)
+    let _ = gpu_saxpy(dup_gate,  dup, SEQ * FF, 1.0)
+    cuda_free(dact)
+    cuda_free(dup_value)
+    cuda_free(dup_gate)
+
+    // ── Wff1 backward: norm2 @ Wff1 = up
+    //   dWff1 += norm2^T @ dup    → [D, FF]
+    //   dnorm2 = dup @ Wff1^T     → [SEQ, D]
+    let dWff1_tmp = gpu_zeros(D * FF)
+    let _ = gpu_sgemm_tn(acts.norm2, dup, dWff1_tmp, D, FF, SEQ)
+    let _ = gpu_saxpy(dWff1_tmp, grad.dWff1, D * FF, 1.0)
+    cuda_free(dWff1_tmp)
+    let dnorm2 = gpu_zeros(SEQ * D)
+    let _ = gpu_sgemm_nt(dup, layer.Wff1, dnorm2, SEQ, D, FF)
+    cuda_free(dup)
+
+    // ── rms_norm #2 backward: rms_norm(mid, gf) = norm2
+    //   dmid_norm = ..., dgf accumulated, dmid = dy + dmid_norm
+    let dmid_norm = gpu_zeros(SEQ * D)
+    let dgf_tmp   = gpu_zeros(D)
+    let _ = gpu_rms_norm_bwd(acts.mid, layer.gf, dnorm2, acts.rstd2, dmid_norm, dgf_tmp, SEQ, D, EPS)
+    let _ = gpu_saxpy(dgf_tmp, grad.dgf, D, 1.0)
+    cuda_free(dgf_tmp)
+    cuda_free(dnorm2)
+
+    // dmid = dy (residual)  +  dmid_norm  (gradient through norm2 path)
+    let dmid_buf = gpu_zeros(SEQ * D)
+    let _ = gpu_saxpy(dy_dev,    dmid_buf, SEQ * D, 1.0)
+    let _ = gpu_saxpy(dmid_norm, dmid_buf, SEQ * D, 1.0)
+    cuda_free(dmid_norm)
+
+    // dx_res = dmid, dattn_out = dmid (residual fork at attn output)
+    let dattn_out = dmid_buf
+
+    // ── Wo backward: ctx @ Wo = attn_out
+    //   dWo  += ctx^T @ dattn_out  → [D, D]
+    //   dctx  = dattn_out @ Wo^T   → [SEQ, D]
+    let dWo_tmp = gpu_zeros(D * D)
+    let _ = gpu_sgemm_tn(acts.ctx, dattn_out, dWo_tmp, D, D, SEQ)
+    let _ = gpu_saxpy(dWo_tmp, grad.dWo, D * D, 1.0)
+    cuda_free(dWo_tmp)
+    let dctx = gpu_zeros(SEQ * D)
+    let _ = gpu_sgemm_nt(dattn_out, layer.Wo, dctx, SEQ, D, D)
+
+    // ── Attention backward: probs[SEQ,SEQ] @ V[SEQ,D] = ctx[SEQ,D]
+    //   dV     += probs^T @ dctx     → [SEQ, D]
+    //   dprobs  = dctx @ V^T          → [SEQ, SEQ]
+    let dv_buf = gpu_zeros(SEQ * D)
+    let _ = gpu_sgemm_tn(acts.probs, dctx, dv_buf, SEQ, D, SEQ)
+    let dprobs = gpu_zeros(SEQ * SEQ)
+    let _ = gpu_sgemm_nt(dctx, acts.v, dprobs, SEQ, SEQ, D)
+    cuda_free(dctx)
+
+    //   softmax backward (per row): dscores = sm_bwd(probs, dprobs)
+    let dscores = gpu_zeros(SEQ * SEQ)
+    let _ = gpu_softmax_rows_bwd(acts.probs, dprobs, dscores, SEQ, SEQ)
+    cuda_free(dprobs)
+    //   scale dscores by 1/sqrt(D) (the same scale applied in fwd)
+    let _ = gpu_sscal(dscores, SEQ * SEQ, inv_sqrt_d)
+
+    //   scores = q @ k^T   (computed via gpu_sgemm_nt in fwd)
+    //   dq += dscores @ k     → [SEQ, D]
+    //   dk += dscores^T @ q   → [SEQ, D]
+    let dq_buf = gpu_zeros(SEQ * D)
+    let dk_buf = gpu_zeros(SEQ * D)
+    let _ = gpu_sgemm(dscores, acts.k, dq_buf, SEQ, D, SEQ)
+    let _ = gpu_sgemm_tn(dscores, acts.q, dk_buf, SEQ, D, SEQ)
+    cuda_free(dscores)
+
+    // ── Wq/Wk/Wv backward: norm1 @ W{q,k,v} = {q,k,v}
+    //   dW{q,k,v} += norm1^T @ d{q,k,v}
+    //   dnorm1    += d{q,k,v} @ W{q,k,v}^T
+    let dWq_tmp = gpu_zeros(D * D)
+    let dWk_tmp = gpu_zeros(D * D)
+    let dWv_tmp = gpu_zeros(D * D)
+    let _ = gpu_sgemm_tn(acts.norm1, dq_buf, dWq_tmp, D, D, SEQ)
+    let _ = gpu_sgemm_tn(acts.norm1, dk_buf, dWk_tmp, D, D, SEQ)
+    let _ = gpu_sgemm_tn(acts.norm1, dv_buf, dWv_tmp, D, D, SEQ)
+    let _ = gpu_saxpy(dWq_tmp, grad.dWq, D * D, 1.0)
+    let _ = gpu_saxpy(dWk_tmp, grad.dWk, D * D, 1.0)
+    let _ = gpu_saxpy(dWv_tmp, grad.dWv, D * D, 1.0)
+    cuda_free(dWq_tmp); cuda_free(dWk_tmp); cuda_free(dWv_tmp)
+
+    let dnorm1 = gpu_zeros(SEQ * D)
+    let dn_tmp = gpu_zeros(SEQ * D)
+    let _ = gpu_sgemm_nt(dq_buf, layer.Wq, dn_tmp, SEQ, D, D)
+    let _ = gpu_saxpy(dn_tmp, dnorm1, SEQ * D, 1.0)
+    let _ = gpu_sgemm_nt(dk_buf, layer.Wk, dn_tmp, SEQ, D, D)
+    let _ = gpu_saxpy(dn_tmp, dnorm1, SEQ * D, 1.0)
+    let _ = gpu_sgemm_nt(dv_buf, layer.Wv, dn_tmp, SEQ, D, D)
+    let _ = gpu_saxpy(dn_tmp, dnorm1, SEQ * D, 1.0)
+    cuda_free(dn_tmp)
+    cuda_free(dq_buf); cuda_free(dk_buf); cuda_free(dv_buf)
+
+    // ── rms_norm #1 backward: rms_norm(x, ga) = norm1
+    //   dx_norm = ..., dga accumulated
+    let dx_norm = gpu_zeros(SEQ * D)
+    let dga_tmp = gpu_zeros(D)
+    let _ = gpu_rms_norm_bwd(x_dev, layer.ga, dnorm1, acts.rstd1, dx_norm, dga_tmp, SEQ, D, EPS)
+    let _ = gpu_saxpy(dga_tmp, grad.dga, D, 1.0)
+    cuda_free(dga_tmp)
+    cuda_free(dnorm1)
+
+    // dx = dx_res + dx_norm  (residual join at layer input)
+    //   We allocate a fresh dx, accumulate the residual + norm path.
+    let dx = gpu_zeros(SEQ * D)
+    let _ = gpu_saxpy(dattn_out, dx, SEQ * D, 1.0)  // dx_res = dmid
+    let _ = gpu_saxpy(dx_norm,   dx, SEQ * D, 1.0)
+    cuda_free(dx_norm)
+    cuda_free(dmid_buf)  // dattn_out alias released here
+
+    return dx
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Full forward
+//
+//  toks_dev:    device int32 [N]   token ids
+//  weights:     GpuWeights
+//  acts:        GpuFwdActs (preallocated, reused per step)
+//  cfg:         GpuClmConfig
+//
+//  Writes embed → per-layer → mid_lm → logits into acts and
+//  returns acts.logits (device pointer to [N, VOCAB] floats).
+// ═══════════════════════════════════════════════════════════════
+
+fn gpu_forward_full(toks_dev, weights: GpuWeights, acts: GpuFwdActs, cfg: GpuClmConfig) {
+    let D     = cfg.D
+    let NL    = cfg.NL
+    let VOCAB = cfg.VOCAB
+    let SEQ   = cfg.SEQ
+    let RANK  = cfg.RANK
+
+    // 1. embed lookup → h0[SEQ, D]
+    // FIX 2026-04-12: cuda_kernels signature is (W, toks, out, V, D, N) per
+    // cuda_kernels.hexa:198 — must pass VOCAB first, then SEQ last, or the
+    // kernel launches with grid=ceil(VOCAB/16) tokens (only 256 of 512) and
+    // writes h0 out of bounds.
+    let _ = gpu_embed_lookup_fwd(weights.embed, toks_dev, acts.h0, VOCAB, D, SEQ)
+
+    // 2. transformer layers — chain h0 → layers[0].y → ... → layers[NL-1].y
+    let mut x = acts.h0
+    let mut li = 0
+    while li < NL {
+        let layer_acts = acts.layers[li]
+        let _ = gpu_layer_fwd(x, weights.layers[li], layer_acts, cfg)
+        x = layer_acts.y
+        li = li + 1
+    }
+    // x is now layers[NL-1].y  (i.e. final hidden state [SEQ, D])
+
+    // 3. LM head: mid_lm = x @ lmh_U  → [SEQ, RANK]
+    let _ = gpu_sgemm(x, weights.lmh_U, acts.mid_lm, SEQ, RANK, D)
+
+    // 4. logits = mid_lm @ lmh_V  → [SEQ, VOCAB]
+    let _ = gpu_sgemm(acts.mid_lm, weights.lmh_V, acts.logits, SEQ, VOCAB, RANK)
+
+    return acts.logits
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Full backward
+//
+//  Returns the scalar CE loss (downloaded once from device).
+//  Side-effects: accumulates into `grad`.
+// ═══════════════════════════════════════════════════════════════
+
+fn gpu_backward_full(logits_dev, targets_dev, acts: GpuFwdActs, weights: GpuWeights, grad: GpuGrad, cfg: GpuClmConfig) {
+    let D     = cfg.D
+    let NL    = cfg.NL
+    let VOCAB = cfg.VOCAB
+    let SEQ   = cfg.SEQ
+    let RANK  = cfg.RANK
+
+    // 1. cross-entropy loss + dlogits  (1/SEQ averaged inside kernel)
+    let dlogits  = gpu_zeros(SEQ * VOCAB)
+    let loss_buf = gpu_zeros(1)
+    let _ = gpu_ce_loss_grad(logits_dev, targets_dev, loss_buf, dlogits, SEQ, VOCAB)
+
+    // pull scalar loss back to host
+    let loss_host = tensor_from_gpu(loss_buf, 1)
+    let loss = loss_host[0]
+    cuda_free(loss_buf)
+
+    // 2. LM head backward — logits = mid_lm @ lmh_V
+    //   dlmh_V += mid_lm^T @ dlogits        → [RANK, VOCAB]
+    //   dmid    = dlogits @ lmh_V^T          → [SEQ, RANK]
+    let dlmh_V_tmp = gpu_zeros(RANK * VOCAB)
+    let _ = gpu_sgemm_tn(acts.mid_lm, dlogits, dlmh_V_tmp, RANK, VOCAB, SEQ)
+    let _ = gpu_saxpy(dlmh_V_tmp, grad.dlmh_V, RANK * VOCAB, 1.0)
+    cuda_free(dlmh_V_tmp)
+    let dmid = gpu_zeros(SEQ * RANK)
+    let _ = gpu_sgemm_nt(dlogits, weights.lmh_V, dmid, SEQ, RANK, VOCAB)
+    cuda_free(dlogits)
+
+    // 3. mid_lm = h_last @ lmh_U
+    //   dlmh_U += h_last^T @ dmid    → [D, RANK]
+    //   dh_last = dmid @ lmh_U^T      → [SEQ, D]
+    let h_last = acts.layers[NL - 1].y
+    let dlmh_U_tmp = gpu_zeros(D * RANK)
+    let _ = gpu_sgemm_tn(h_last, dmid, dlmh_U_tmp, D, RANK, SEQ)
+    let _ = gpu_saxpy(dlmh_U_tmp, grad.dlmh_U, D * RANK, 1.0)
+    cuda_free(dlmh_U_tmp)
+    let mut dh = gpu_zeros(SEQ * D)
+    let _ = gpu_sgemm_nt(dmid, weights.lmh_U, dh, SEQ, D, RANK)
+    cuda_free(dmid)
+
+    // 4. layer-stack backward — feed dh through layers in reverse
+    //    Each gpu_layer_bwd returns the freshly-allocated dx for the
+    //    layer's input; we then free the previous dh.
+    let mut li = NL - 1
+    while li >= 0 {
+        let layer_input = if li == 0 { acts.h0 } else { acts.layers[li - 1].y }
+        let dx_new = gpu_layer_bwd(layer_input, weights.layers[li], acts.layers[li], dh, grad.layers[li], cfg)
+        cuda_free(dh)
+        dh = dx_new
+        li = li - 1
+    }
+
+    // 5. embed backward — scatter-add dh into dembed at toks rows
+    //    The kernel needs access to the original token ids; we keep
+    //    the device tok pointer in the caller and pass it in via the
+    //    ce_loss_grad path (targets are not the same as inputs!).
+    //    The caller is responsible for passing a separate `toks_dev`
+    //    when calling embed_bwd; here we expect the front-end loop
+    //    to call gpu_embed_lookup_bwd directly with the right ptr.
+    //    To keep this function self-contained, we surface dh via the
+    //    grad struct: store it temporarily in dembed (overwritten by
+    //    the caller's embed_bwd call). Simpler: caller invokes the
+    //    embed bwd. We free dh here.
+    cuda_free(dh)
+
+    return loss
+}
+
+// Convenience wrapper that takes the input tokens and runs the
+// embedding scatter for you. Use this for the typical training
+// step:
+//   gpu_forward_full(toks, ...)
+//   gpu_backward_full_with_embed(logits, targets, toks, ...)
+fn gpu_backward_full_with_embed(logits_dev, targets_dev, toks_dev, acts: GpuFwdActs, weights: GpuWeights, grad: GpuGrad, cfg: GpuClmConfig) {
+    let D     = cfg.D
+    let NL    = cfg.NL
+    let VOCAB = cfg.VOCAB
+    let SEQ   = cfg.SEQ
+    let RANK  = cfg.RANK
+
+    // 1. CE
+    let dlogits  = gpu_zeros(SEQ * VOCAB)
+    let loss_buf = gpu_zeros(1)
+    let _ = gpu_ce_loss_grad(logits_dev, targets_dev, loss_buf, dlogits, SEQ, VOCAB)
+    let loss_host = tensor_from_gpu(loss_buf, 1)
+    let loss = loss_host[0]
+    cuda_free(loss_buf)
+
+    // 2. LM head
+    let dlmh_V_tmp = gpu_zeros(RANK * VOCAB)
+    let _ = gpu_sgemm_tn(acts.mid_lm, dlogits, dlmh_V_tmp, RANK, VOCAB, SEQ)
+    let _ = gpu_saxpy(dlmh_V_tmp, grad.dlmh_V, RANK * VOCAB, 1.0)
+    cuda_free(dlmh_V_tmp)
+    let dmid = gpu_zeros(SEQ * RANK)
+    let _ = gpu_sgemm_nt(dlogits, weights.lmh_V, dmid, SEQ, RANK, VOCAB)
+    cuda_free(dlogits)
+
+    let h_last = acts.layers[NL - 1].y
+    let dlmh_U_tmp = gpu_zeros(D * RANK)
+    let _ = gpu_sgemm_tn(h_last, dmid, dlmh_U_tmp, D, RANK, SEQ)
+    let _ = gpu_saxpy(dlmh_U_tmp, grad.dlmh_U, D * RANK, 1.0)
+    cuda_free(dlmh_U_tmp)
+    let mut dh = gpu_zeros(SEQ * D)
+    let _ = gpu_sgemm_nt(dmid, weights.lmh_U, dh, SEQ, D, RANK)
+    cuda_free(dmid)
+
+    // 3. layers reverse
+    let mut li = NL - 1
+    while li >= 0 {
+        let layer_input = if li == 0 { acts.h0 } else { acts.layers[li - 1].y }
+        let dx_new = gpu_layer_bwd(layer_input, weights.layers[li], acts.layers[li], dh, grad.layers[li], cfg)
+        cuda_free(dh)
+        dh = dx_new
+        li = li - 1
+    }
+
+    // 4. embed scatter — accumulate dh rows into dembed[toks[i]]
+    // FIX 2026-04-12: positional arg order is (dy, toks, dW, V, D, N) per
+    // cuda_kernels.hexa:313 — must pass VOCAB then SEQ for correct atomicAdd scatter.
+    let _ = gpu_embed_lookup_bwd(dh, toks_dev, grad.dembed, VOCAB, D, SEQ)
+    cuda_free(dh)
+
+    return loss
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  SGD step  —  w := w - lr * g  (in place via cuBLAS saxpy)
+// ═══════════════════════════════════════════════════════════════
+
+fn gpu_sgd_step(weights: GpuWeights, grad: GpuGrad, lr: float, cfg: GpuClmConfig) {
+    let D     = cfg.D
+    let FF    = cfg.FF
+    let NL    = cfg.NL
+    let VOCAB = cfg.VOCAB
+    let RANK  = cfg.RANK
+    let neg_lr = 0.0 - lr
+
+    // embed
+    let _ = gpu_saxpy(grad.dembed, weights.embed, VOCAB * D, neg_lr)
+
+    // layers
+    let mut li = 0
+    while li < NL {
+        let layer = weights.layers[li]
+        let g     = grad.layers[li]
+        let _ = gpu_saxpy(g.dWq,   layer.Wq,   D * D,  neg_lr)
+        let _ = gpu_saxpy(g.dWk,   layer.Wk,   D * D,  neg_lr)
+        let _ = gpu_saxpy(g.dWv,   layer.Wv,   D * D,  neg_lr)
+        let _ = gpu_saxpy(g.dWo,   layer.Wo,   D * D,  neg_lr)
+        let _ = gpu_saxpy(g.dWff1, layer.Wff1, D * FF, neg_lr)
+        let _ = gpu_saxpy(g.dWff2, layer.Wff2, FF * D, neg_lr)
+        let _ = gpu_saxpy(g.dga,   layer.ga,   D,      neg_lr)
+        let _ = gpu_saxpy(g.dgf,   layer.gf,   D,      neg_lr)
+        li = li + 1
+    }
+
+    // LM head
+    let _ = gpu_saxpy(grad.dlmh_U, weights.lmh_U, D * RANK,    neg_lr)
+    let _ = gpu_saxpy(grad.dlmh_V, weights.lmh_V, RANK * VOCAB, neg_lr)
+    0
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  AdamW optimizer — per-parameter m/v buffers + fused CUDA kernel
+//
+//  AdamW update rule (decoupled weight decay):
+//    m = beta1 * m + (1 - beta1) * g
+//    v = beta2 * v + (1 - beta2) * g^2
+//    m_hat = m / (1 - beta1^t)
+//    v_hat = v / (1 - beta2^t)
+//    w = w - lr * (m_hat / (sqrt(v_hat) + eps) + wd * w)
+//
+//  Uses a single fused NVRTC kernel to avoid multiple passes.
+// ═══════════════════════════════════════════════════════════════
+
+// Per-layer AdamW state (m and v for each of the 8 weight tensors).
+struct GpuLayerAdamW {
+    mWq: int, vWq: int,
+    mWk: int, vWk: int,
+    mWv: int, vWv: int,
+    mWo: int, vWo: int,
+    mWff1: int, vWff1: int,
+    mWff2: int, vWff2: int,
+    mga: int, vga: int,
+    mgf: int, vgf: int
+}
+
+// Full-model AdamW state (mirrors GpuWeights).
+struct GpuAdamWState {
+    membed: int, vembed: int,
+    layers: [GpuLayerAdamW],
+    mlmh_U: int, vlmh_U: int,
+    mlmh_V: int, vlmh_V: int
+}
+
+fn alloc_layer_adamw(cfg: GpuClmConfig) -> GpuLayerAdamW {
+    let D  = cfg.D
+    let FF = cfg.FF
+    return GpuLayerAdamW {
+        mWq: gpu_zeros(D * D), vWq: gpu_zeros(D * D),
+        mWk: gpu_zeros(D * D), vWk: gpu_zeros(D * D),
+        mWv: gpu_zeros(D * D), vWv: gpu_zeros(D * D),
+        mWo: gpu_zeros(D * D), vWo: gpu_zeros(D * D),
+        mWff1: gpu_zeros(D * FF), vWff1: gpu_zeros(D * FF),
+        mWff2: gpu_zeros(FF * D), vWff2: gpu_zeros(FF * D),
+        mga: gpu_zeros(D), vga: gpu_zeros(D),
+        mgf: gpu_zeros(D), vgf: gpu_zeros(D)
+    }
+}
+
+fn free_layer_adamw(s: GpuLayerAdamW) {
+    cuda_free(s.mWq); cuda_free(s.vWq)
+    cuda_free(s.mWk); cuda_free(s.vWk)
+    cuda_free(s.mWv); cuda_free(s.vWv)
+    cuda_free(s.mWo); cuda_free(s.vWo)
+    cuda_free(s.mWff1); cuda_free(s.vWff1)
+    cuda_free(s.mWff2); cuda_free(s.vWff2)
+    cuda_free(s.mga); cuda_free(s.vga)
+    cuda_free(s.mgf); cuda_free(s.vgf)
+    0
+}
+
+fn alloc_adamw_state(cfg: GpuClmConfig) -> GpuAdamWState {
+    let D     = cfg.D
+    let VOCAB = cfg.VOCAB
+    let RANK  = cfg.RANK
+    let NL    = cfg.NL
+    let mut layers = []
+    let mut i = 0
+    while i < NL {
+        layers = layers.push(alloc_layer_adamw(cfg))
+        i = i + 1
+    }
+    return GpuAdamWState {
+        membed: gpu_zeros(VOCAB * D), vembed: gpu_zeros(VOCAB * D),
+        layers: layers,
+        mlmh_U: gpu_zeros(D * RANK), vlmh_U: gpu_zeros(D * RANK),
+        mlmh_V: gpu_zeros(RANK * VOCAB), vlmh_V: gpu_zeros(RANK * VOCAB)
+    }
+}
+
+fn free_adamw_state(s: GpuAdamWState) {
+    cuda_free(s.membed); cuda_free(s.vembed)
+    cuda_free(s.mlmh_U); cuda_free(s.vlmh_U)
+    cuda_free(s.mlmh_V); cuda_free(s.vlmh_V)
+    let n = len(s.layers)
+    let mut i = 0
+    while i < n {
+        let _ = free_layer_adamw(s.layers[i])
+        i = i + 1
+    }
+    0
+}
+
+// ── Fused AdamW CUDA kernel ────────────────────────────────────
+//
+// One kernel, one pass: updates w, m, v in place for N elements.
+// Avoids 6+ separate cuBLAS calls per parameter tensor.
+
+let K_ADAMW_FUSED = "extern \"C\" __global__ void adamw_fused(float* w, const float* g, float* m, float* v, int N, float lr, float beta1, float beta2, float eps, float wd, float bc1, float bc2) {\n    int i = blockIdx.x * blockDim.x + threadIdx.x;\n    if (i >= N) return;\n    float gi = g[i];\n    float mi = beta1 * m[i] + (1.0f - beta1) * gi;\n    float vi = beta2 * v[i] + (1.0f - beta2) * gi * gi;\n    m[i] = mi;\n    v[i] = vi;\n    float m_hat = mi / bc1;\n    float v_hat = vi / bc2;\n    w[i] = w[i] - lr * (m_hat / (sqrtf(v_hat) + eps) + wd * w[i]);\n}\n"
+
+let mut G_K_ADAMW_MODULE = ptr_null()
+let mut G_K_adamw_fused  = ptr_null()
+
+fn gpu_adamw_init_kernel() {
+    // Compile the fused AdamW kernel once. Must be called after
+    // cuda_init() + rtc_init() (gpu_init_kernels handles both).
+    let ptx = rtc_compile_ptx(K_ADAMW_FUSED, "adamw_kernel.cu")
+    if ptr_addr(ptx) == 0 {
+        println("[gpu_train] ERROR: adamw kernel compile failed")
+        return -1
+    }
+    G_K_ADAMW_MODULE = rtc_load_module(ptx)
+    if ptr_addr(G_K_ADAMW_MODULE) == 0 {
+        println("[gpu_train] ERROR: adamw module load failed")
+        return -2
+    }
+    G_K_adamw_fused = rtc_get_function(G_K_ADAMW_MODULE, "adamw_fused")
+    if ptr_addr(G_K_adamw_fused) == 0 {
+        println("[gpu_train] ERROR: adamw_fused function not found")
+        return -3
+    }
+    println("[gpu_train] adamw kernel compiled OK")
+    return 0
+}
+
+// Low-level: apply one fused AdamW update to a single (w, g, m, v) tensor.
+// bc1 = 1 - beta1^step, bc2 = 1 - beta2^step (precomputed by caller).
+fn gpu_adamw_update_tensor(w_dev, g_dev, m_dev, v_dev, n: int, lr: float, beta1: float, beta2: float, eps: float, wd: float, bc1: float, bc2: float) {
+    if ptr_addr(G_K_adamw_fused) == 0 {
+        println("[gpu_train] ERROR: adamw kernel not initialized — call gpu_adamw_init_kernel() first")
+        return -1
+    }
+    let args = [
+        _arg_ptr(w_dev),
+        _arg_ptr(g_dev),
+        _arg_ptr(m_dev),
+        _arg_ptr(v_dev),
+        _arg_i32(n),
+        _arg_f32(lr),
+        _arg_f32(beta1),
+        _arg_f32(beta2),
+        _arg_f32(eps),
+        _arg_f32(wd),
+        _arg_f32(bc1),
+        _arg_f32(bc2)
+    ]
+    let bx = 256
+    let gx = _ceil_div(n, bx)
+    let st = rtc_launch(G_K_adamw_fused, gx, 1, 1, bx, 1, 1, args)
+    let _ = _free_args(args)
+    st
+}
+
+// ── Full-model AdamW step ──────────────────────────────────────
+//
+// fn gpu_adamw_step(weights, grads, adamw_state, step, lr, beta1, beta2, eps, wd)
+//
+// step: 1-indexed training step (used for bias correction).
+// Default hyperparameters: lr=3e-4, beta1=0.9, beta2=0.999,
+//   eps=1e-8, wd=0.01.
+fn gpu_adamw_step(weights: GpuWeights, grad: GpuGrad, adamw: GpuAdamWState, step: int, lr: float, beta1: float, beta2: float, eps: float, wd: float) {
+    let D     = weights.cfg.D
+    let FF    = weights.cfg.FF
+    let NL    = weights.cfg.NL
+    let VOCAB = weights.cfg.VOCAB
+    let RANK  = weights.cfg.RANK
+
+    // Bias correction terms: bc1 = 1 - beta1^step, bc2 = 1 - beta2^step
+    let mut bc1 = 1.0
+    let mut bc2 = 1.0
+    let mut si = 0
+    while si < step {
+        bc1 = bc1 * beta1
+        bc2 = bc2 * beta2
+        si = si + 1
+    }
+    bc1 = 1.0 - bc1
+    bc2 = 1.0 - bc2
+
+    // Guard: bc1/bc2 must be positive for valid correction
+    if bc1 <= 0.0 || bc2 <= 0.0 {
+        println("[gpu_train] ERROR: adamw bias correction <= 0 at step " + str(step))
+        return -1
+    }
+
+    // embed
+    let _ = gpu_adamw_update_tensor(weights.embed, grad.dembed, adamw.membed, adamw.vembed, VOCAB * D, lr, beta1, beta2, eps, wd, bc1, bc2)
+
+    // layers
+    let mut li = 0
+    while li < NL {
+        let layer = weights.layers[li]
+        let g     = grad.layers[li]
+        let s     = adamw.layers[li]
+        let _ = gpu_adamw_update_tensor(layer.Wq,   g.dWq,   s.mWq,   s.vWq,   D * D,  lr, beta1, beta2, eps, wd, bc1, bc2)
+        let _ = gpu_adamw_update_tensor(layer.Wk,   g.dWk,   s.mWk,   s.vWk,   D * D,  lr, beta1, beta2, eps, wd, bc1, bc2)
+        let _ = gpu_adamw_update_tensor(layer.Wv,   g.dWv,   s.mWv,   s.vWv,   D * D,  lr, beta1, beta2, eps, wd, bc1, bc2)
+        let _ = gpu_adamw_update_tensor(layer.Wo,   g.dWo,   s.mWo,   s.vWo,   D * D,  lr, beta1, beta2, eps, wd, bc1, bc2)
+        let _ = gpu_adamw_update_tensor(layer.Wff1, g.dWff1, s.mWff1, s.vWff1, D * FF, lr, beta1, beta2, eps, wd, bc1, bc2)
+        let _ = gpu_adamw_update_tensor(layer.Wff2, g.dWff2, s.mWff2, s.vWff2, FF * D, lr, beta1, beta2, eps, wd, bc1, bc2)
+        let _ = gpu_adamw_update_tensor(layer.ga,   g.dga,   s.mga,   s.vga,   D,      lr, beta1, beta2, eps, wd, bc1, bc2)
+        let _ = gpu_adamw_update_tensor(layer.gf,   g.dgf,   s.mgf,   s.vgf,   D,      lr, beta1, beta2, eps, wd, bc1, bc2)
+        li = li + 1
+    }
+
+    // LM head
+    let _ = gpu_adamw_update_tensor(weights.lmh_U, grad.dlmh_U, adamw.mlmh_U, adamw.vlmh_U, D * RANK, lr, beta1, beta2, eps, wd, bc1, bc2)
+    let _ = gpu_adamw_update_tensor(weights.lmh_V, grad.dlmh_V, adamw.mlmh_V, adamw.vlmh_V, RANK * VOCAB, lr, beta1, beta2, eps, wd, bc1, bc2)
+    0
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Zero gradients  (called once per step before backward)
+// ═══════════════════════════════════════════════════════════════
+
+fn gpu_zero_grad(grad: GpuGrad, cfg: GpuClmConfig) {
+    let D     = cfg.D
+    let FF    = cfg.FF
+    let NL    = cfg.NL
+    let VOCAB = cfg.VOCAB
+    let RANK  = cfg.RANK
+
+    let _ = cuda_memset_zero(grad.dembed, VOCAB * D * 4)
+    let _ = cuda_memset_zero(grad.dlmh_U, D * RANK * 4)
+    let _ = cuda_memset_zero(grad.dlmh_V, RANK * VOCAB * 4)
+
+    let mut li = 0
+    while li < NL {
+        let g = grad.layers[li]
+        let _ = cuda_memset_zero(g.dWq,   D * D  * 4)
+        let _ = cuda_memset_zero(g.dWk,   D * D  * 4)
+        let _ = cuda_memset_zero(g.dWv,   D * D  * 4)
+        let _ = cuda_memset_zero(g.dWo,   D * D  * 4)
+        let _ = cuda_memset_zero(g.dWff1, D * FF * 4)
+        let _ = cuda_memset_zero(g.dWff2, FF * D * 4)
+        let _ = cuda_memset_zero(g.dga,   D * 4)
+        let _ = cuda_memset_zero(g.dgf,   D * 4)
+        li = li + 1
+    }
+    0
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Checkpoint I/O — HEXACKPT-v1 (matches train_byte_kr.hexa)
+//
+//  Format:
+//      HEXACKPT-v1\n
+//      <name> <rows> <cols>\n
+//      <flat space-separated f32 values>\n
+//      ...
+//      __MANIFEST__ <count> 1\n
+//
+//  Tensor naming (variable NL):
+//      embed   VOCAB D
+//      L{n}_Wq    D D
+//      L{n}_Wk    D D
+//      L{n}_Wv    D D
+//      L{n}_Wo    D D
+//      L{n}_Wff1  D FF
+//      L{n}_Wff2  FF D
+//      L{n}_ga    1 D
+//      L{n}_gf    1 D
+//      lmh_U   D RANK
+//      lmh_V   RANK VOCAB
+// ═══════════════════════════════════════════════════════════════
+
+// CRITICAL 2026-04-12: hexa string concat is O(n²) — 100K concat≈11s,
+// 38M concat at same rate is ~17 days. Fix: stream in small batches so
+// each concat loop has bounded size. Batch of 64 values means concats
+// stay under 64²=4K ops which is negligible. Each batch is appended
+// to disk, then the batch buffer is reset. File I/O overhead (~100µs
+// per append) bounds total to N/64 × 100µs = ~0.2 s per million floats.
+let _CKPT_BATCH = 64
+
+fn append_tensor_section(path: string, name: string, rows: int, cols: int, dev_ptr) {
+    let n = rows * cols
+    let host = tensor_from_gpu(dev_ptr, n)
+    // Header line first
+    let _ = append_file(path, name + " " + str(rows) + " " + str(cols) + "\n")
+    // Stream values in batches
+    let mut batch = ""
+    let mut count = 0
+    let mut i = 0
+    while i < n {
+        if count > 0 { batch = batch + " " }
+        batch = batch + str(host[i])
+        count = count + 1
+        if count >= _CKPT_BATCH {
+            let _ = append_file(path, batch)
+            batch = " "    // leading space separates from next batch
+            count = 0
+        }
+        i = i + 1
+    }
+    if count > 0 { let _ = append_file(path, batch) }
+    let _ = append_file(path, "\n")
+    0
+}
+
+fn save_checkpoint_gpu(weights: GpuWeights, cfg: GpuClmConfig, path: string) {
+    let D     = cfg.D
+    let FF    = cfg.FF
+    let NL    = cfg.NL
+    let VOCAB = cfg.VOCAB
+    let RANK  = cfg.RANK
+
+    // Truncate + write header
+    let _ = write_file(path, "HEXACKPT-v1\n")
+    let _ = append_tensor_section(path, "embed", VOCAB, D, weights.embed)
+
+    let mut li = 0
+    while li < NL {
+        let prefix = "L" + str(li) + "_"
+        let layer = weights.layers[li]
+        let _ = append_tensor_section(path, prefix + "Wq",   D,  D,  layer.Wq)
+        let _ = append_tensor_section(path, prefix + "Wk",   D,  D,  layer.Wk)
+        let _ = append_tensor_section(path, prefix + "Wv",   D,  D,  layer.Wv)
+        let _ = append_tensor_section(path, prefix + "Wo",   D,  D,  layer.Wo)
+        let _ = append_tensor_section(path, prefix + "Wff1", D,  FF, layer.Wff1)
+        let _ = append_tensor_section(path, prefix + "Wff2", FF, D,  layer.Wff2)
+        let _ = append_tensor_section(path, prefix + "ga",   1,  D,  layer.ga)
+        let _ = append_tensor_section(path, prefix + "gf",   1,  D,  layer.gf)
+        li = li + 1
+    }
+
+    let _ = append_tensor_section(path, "lmh_U", D,    RANK,  weights.lmh_U)
+    let _ = append_tensor_section(path, "lmh_V", RANK, VOCAB, weights.lmh_V)
+
+    let n_tensors = 8 * NL + 3
+    let _ = append_file(path, "__MANIFEST__ " + str(n_tensors) + " 1\n")
+
+    println("[gpu_train] saved checkpoint → " + path + " (NL=" + str(NL) + ", " + str(n_tensors) + " tensors)")
+    0
+}
+
+// ─── Loader helpers (whitespace tokeniser) ──────────────────────
+
+// OPTIMIZED 2026-04-12: use char_code + substring(start,end) per token
+// rather than per char. Same speedup rationale as split_lines.
+fn gpu_train_split_ws(s: string) -> [string] {
+    let n = len(s)
+    let mut parts = []
+    let mut tok_start = 0
+    let mut i = 0
+    while i < n {
+        let c = char_code(s, i)
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            if i > tok_start {
+                parts = parts.push(s.substring(tok_start, i))
+            }
+            tok_start = i + 1
+        }
+        i = i + 1
+    }
+    if tok_start < n { parts = parts.push(s.substring(tok_start, n)) }
+    return parts
+}
+
+// OPTIMIZED 2026-04-12: use char_code(text, i) for indexed byte reads.
+// Previously used text.substring(i, i+1) per char = O(n²) allocations
+// on an 810MB file (hours). char_code is O(1) per call. For huge text
+// files we ALSO batch alternate every 10K lines to avoid array push cost.
+fn gpu_train_split_lines(text: string) -> [string] {
+    let n = len(text)
+    let mut lines = []
+    let mut start = 0
+    let mut i = 0
+    while i < n {
+        if char_code(text, i) == 10 {  // '\n' = 10
+            lines = lines.push(text.substring(start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n { lines = lines.push(text.substring(start, n)) }
+    return lines
+}
+
+fn gpu_train_parse_data_line(line: string, numel: int) -> array {
+    // FIX 2026-04-12: tensor[idx]=val is not supported by the hexa
+    // interpreter. Build via alloc_raw + write_f32, then convert to
+    // tensor with tensor_from_f32_ptr. Hexa lists are pass-by-value
+    // so mutating helpers silently fail — must inline the write loop.
+    let host_buf = alloc_raw(numel * 4)
+    let n = len(line)
+    let mut di = 0
+    let mut tok_start = 0
+    let mut i = 0
+    while i < n && di < numel {
+        let c = char_code(line, i)
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            if i > tok_start {
+                let tok = line.substring(tok_start, i)
+                write_f32(host_buf, di, to_float(tok))
+                di = di + 1
+            }
+            tok_start = i + 1
+        }
+        i = i + 1
+    }
+    if tok_start < n && di < numel {
+        let tok = line.substring(tok_start, n)
+        write_f32(host_buf, di, to_float(tok))
+        di = di + 1
+    }
+    // Zero-fill any remaining slots
+    while di < numel {
+        write_f32(host_buf, di, 0.0)
+        di = di + 1
+    }
+    let result = tensor_from_f32_ptr(host_buf, numel)
+    free_raw(host_buf, numel * 4)
+    return result
+}
+
+// parse_line_to_dev_raw: scan the data line once using char_code(s, i)
+// indexed reads (much faster than per-char substring allocation), write
+// floats into an alloc_raw f32 host buffer, upload to GPU, return int
+// device pointer. Avoids tensor index assignment + O(n²) string concat.
+//
+// char_code(s, i) = byte at index i (0-255). Whitespace bytes:
+//   32=space, 9=tab, 10=LF, 13=CR.
+fn parse_line_to_dev_raw(line: string, numel: int) -> int {
+    let host_buf = alloc_raw(numel * 4)
+    let n = len(line)
+    let mut di = 0
+    let mut tok_start = 0
+    let mut i = 0
+    while i < n && di < numel {
+        let c = char_code(line, i)
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            if i > tok_start {
+                let tok = line.substring(tok_start, i)
+                write_f32(host_buf, di, to_float(tok))
+                di = di + 1
+            }
+            tok_start = i + 1
+        }
+        i = i + 1
+    }
+    if tok_start < n && di < numel {
+        let tok = line.substring(tok_start, n)
+        write_f32(host_buf, di, to_float(tok))
+        di = di + 1
+    }
+    let dev = cuda_malloc(numel * 4)
+    let _ = cuda_memcpy_h2d(dev, host_buf, numel * 4)
+    free_raw(host_buf, numel * 4)
+    return ptr_addr(dev)
+}
+
+// install_gpu_tensor_raw: takes a device pointer (int-addr) from
+// parse_line_to_dev_raw and copies it into the target weight slot,
+// then frees the source device buffer.
+fn install_gpu_tensor_raw(weights: GpuWeights, cfg: GpuClmConfig, name: string, src_dev_addr: int) {
+    let D     = cfg.D
+    let FF    = cfg.FF
+    let NL    = cfg.NL
+    let VOCAB = cfg.VOCAB
+    let RANK  = cfg.RANK
+    let src   = ptr_from_int(src_dev_addr)
+
+    if name == "embed" {
+        let _ = cuda_memcpy_d2d(weights.embed, src, VOCAB * D * 4)
+        cuda_free(src)
+        return 0
+    }
+    if name == "lmh_U" {
+        let _ = cuda_memcpy_d2d(weights.lmh_U, src, D * RANK * 4)
+        cuda_free(src)
+        return 0
+    }
+    if name == "lmh_V" {
+        let _ = cuda_memcpy_d2d(weights.lmh_V, src, RANK * VOCAB * 4)
+        cuda_free(src)
+        return 0
+    }
+
+    // Per-layer: name = "L{idx}_{field}"
+    if len(name) >= 4 && name.substring(0, 1) == "L" {
+        let nl_str = len(name)
+        let mut us = 1
+        while us < nl_str && name.substring(us, us + 1) != "_" { us = us + 1 }
+        if us < nl_str {
+            let idx_str = name.substring(1, us)
+            let field   = name.substring(us + 1, nl_str)
+            let idx     = to_int(idx_str)
+            if idx >= 0 && idx < NL {
+                let layer = weights.layers[idx]
+                if field == "Wq"   { let _ = cuda_memcpy_d2d(layer.Wq,   src, D * D  * 4) }
+                if field == "Wk"   { let _ = cuda_memcpy_d2d(layer.Wk,   src, D * D  * 4) }
+                if field == "Wv"   { let _ = cuda_memcpy_d2d(layer.Wv,   src, D * D  * 4) }
+                if field == "Wo"   { let _ = cuda_memcpy_d2d(layer.Wo,   src, D * D  * 4) }
+                if field == "Wff1" { let _ = cuda_memcpy_d2d(layer.Wff1, src, D * FF * 4) }
+                if field == "Wff2" { let _ = cuda_memcpy_d2d(layer.Wff2, src, FF * D * 4) }
+                if field == "ga"   { let _ = cuda_memcpy_d2d(layer.ga,   src, D * 4) }
+                if field == "gf"   { let _ = cuda_memcpy_d2d(layer.gf,   src, D * 4) }
+                cuda_free(src)
+            }
+        }
+    }
+    0
+}
+
+fn load_checkpoint_gpu(path: string, cfg: GpuClmConfig) -> GpuWeights {
+    println("[load_dbg] step 1: init_gpu_weights")
+    let weights = init_gpu_weights(cfg, 0)
+
+    println("[load_dbg] step 2: file_exists")
+    if !file_exists(path) {
+        println("[gpu_train] load_checkpoint_gpu: file not found — " + path)
+        return weights
+    }
+
+    println("[load_dbg] step 3: read_file")
+    let text = read_file(path)
+    println("[load_dbg] step 4: len(text)")
+    let n = len(text)
+    println("[load_dbg] step 5: n=" + str(n))
+    if n < 11 {
+        println("[gpu_train] load_checkpoint_gpu: file too small — " + path)
+        return weights
+    }
+    println("[load_dbg] step 6: substring magic check")
+    if text.substring(0, 11) != "HEXACKPT-v1" {
+        println("[gpu_train] load_checkpoint_gpu: bad magic — " + path)
+        return weights
+    }
+
+    println("[load_dbg] step 7: substring body")
+    let body = text.substring(12, n)
+    println("[load_dbg] step 8: split_lines")
+    let lines = gpu_train_split_lines(body)
+    println("[load_dbg] step 9: len(lines)")
+    let nl = len(lines)
+    println("[load_dbg] step 10: nl=" + str(nl))
+    let mut installed = 0
+    let mut li = 0
+    while li < nl {
+        let header = lines[li]
+        if header == "" {
+            li = li + 1
+        } else if len(header) >= 12 && header.substring(0, 12) == "__MANIFEST__" {
+            li = li + 1
+        } else {
+            let parts = gpu_train_split_ws(header)
+            if len(parts) < 3 {
+                li = li + 1
+            } else {
+                let name  = parts[0]
+                let rows  = to_int(parts[1])
+                let cols  = to_int(parts[2])
+                let numel = rows * cols
+                li = li + 1
+                if li < nl {
+                    let dev_addr = parse_line_to_dev_raw(lines[li], numel)
+                    let _ = install_gpu_tensor_raw(weights, cfg, name, dev_addr)
+                    installed = installed + 1
+                }
+                li = li + 1
+            }
+        }
+    }
+    println("[gpu_train] load_checkpoint_gpu: installed " + str(installed) + " tensors from " + path)
+    return weights
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Greedy decode — autoregressive generation using the training
+//  forward pass. No KV-cache; re-runs the full sequence each step
+//  (adequate for short sequences / smoke tests).
+//
+//  fn gpu_greedy_decode(prompt_tokens, weights, cfg, max_tokens)
+//    -> list of generated token ints (including prompt)
+//
+//  Uses gpu_forward_full to get logits, downloads the last
+//  position's row to host, takes argmax, appends the new token,
+//  and repeats until max_tokens or the sequence fills cfg.SEQ.
+// ═══════════════════════════════════════════════════════════════
+
+fn gpu_greedy_decode(prompt_tokens, weights: GpuWeights, cfg: GpuClmConfig, max_tokens: int) {
+    let VOCAB = cfg.VOCAB
+    let SEQ   = cfg.SEQ
+    let D     = cfg.D
+
+    let n_prompt = len(prompt_tokens)
+    if n_prompt < 1 {
+        println("[gpu_train] ERROR: gpu_greedy_decode — empty prompt")
+        return []
+    }
+    if n_prompt > SEQ {
+        println("[gpu_train] ERROR: gpu_greedy_decode — prompt length " + str(n_prompt) + " exceeds SEQ " + str(SEQ))
+        return []
+    }
+
+    // Build the token sequence (starts with prompt, grows each step)
+    let mut tokens = []
+    let mut pi = 0
+    while pi < n_prompt {
+        tokens = tokens.push(prompt_tokens[pi])
+        pi = pi + 1
+    }
+
+    // Host buffer for reading back one VOCAB-sized logit row
+    let logit_row_bytes = VOCAB * 4
+
+    let mut generated = 0
+    while generated < max_tokens && len(tokens) < SEQ {
+        let cur_len = len(tokens)
+
+        // Pad tokens to SEQ length for gpu_forward_full (it expects
+        // a fixed SEQ-length token array). Padding tokens = 0.
+        let mut padded = []
+        let mut ti = 0
+        while ti < cur_len {
+            padded = padded.push(tokens[ti])
+            ti = ti + 1
+        }
+        while ti < SEQ {
+            padded = padded.push(0)
+            ti = ti + 1
+        }
+
+        // Upload tokens to device
+        let toks_dev = int_array_to_gpu(padded)
+
+        // Allocate forward buffers, run forward pass
+        let acts = alloc_fwd_buffers(cfg, SEQ)
+        let logits_dev = gpu_forward_full(toks_dev, weights, acts, cfg)
+
+        // Download the logit row at position (cur_len - 1) — that's
+        // the prediction for the next token after the last real token.
+        let row_offset = (cur_len - 1) * VOCAB
+        let host_buf = alloc_raw(logit_row_bytes)
+        // cuda_memcpy_d2h(host_dst, dev_src, nbytes)
+        // logits_dev points to [SEQ, VOCAB] f32; offset by row_offset floats
+        let src_offset_ptr = ptr_offset(logits_dev, row_offset * 4)
+        let _ = cuda_memcpy_d2h(host_buf, src_offset_ptr, logit_row_bytes)
+
+        // Argmax over the VOCAB logits
+        let mut best_idx = 0
+        let mut best_val = deref_f32(host_buf, 0)
+        let mut vi = 1
+        while vi < VOCAB {
+            let v = deref_f32(host_buf, vi)
+            if v > best_val {
+                best_val = v
+                best_idx = vi
+            }
+            vi = vi + 1
+        }
+        free_raw(host_buf, logit_row_bytes)
+
+        // Append the argmax token
+        tokens = tokens.push(best_idx)
+        generated = generated + 1
+
+        // Clean up this step's device allocations
+        let _ = free_fwd_buffers(acts)
+        cuda_free(toks_dev)
+    }
+
+    println("[gpu_train] gpu_greedy_decode: " + str(n_prompt) + " prompt + " + str(generated) + " generated = " + str(len(tokens)) + " tokens")
+    return tokens
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  gpu_generate_greedy — byte-level public API
+//
+//  Thin wrapper over gpu_greedy_decode that takes a byte prompt
+//  (plain int array where every element is in [0,255]) and returns
+//  a byte sequence. For byte-level CLMs (VOCAB=256) bytes and
+//  tokens are identical so this is a semantic-only wrapper.
+//
+//  Matches the documented signature expected by serving/eval_*
+//  and the consciousness-decoder bridge:
+//
+//      fn gpu_generate_greedy(prompt: [byte], max_tokens: int) -> [byte]
+//
+//  Arguments:
+//    prompt     — input byte sequence ([int] with values 0..255)
+//    weights    — loaded GpuWeights (checkpoint or trained state)
+//    cfg        — GpuClmConfig (D/FF/NL/VOCAB/SEQ/RANK)
+//    max_tokens — how many bytes to generate after the prompt
+//
+//  Returns: [byte] containing prompt + generated bytes (up to
+//  cfg.SEQ total). Returns [] on error (empty prompt / too long).
+//
+//  Uses the existing forward kernel — no new compilation needed.
+// ═══════════════════════════════════════════════════════════════
+
+fn gpu_generate_greedy(prompt, weights: GpuWeights, cfg: GpuClmConfig, max_tokens: int) {
+    let n_prompt = len(prompt)
+    if n_prompt < 1 {
+        println("[gpu_train] gpu_generate_greedy: empty prompt")
+        return []
+    }
+    // gpu_greedy_decode handles all device interaction + argmax loop.
+    // We sanity-check the byte range up-front so a caller passing
+    // raw text (with UTF-8 bytes > 127) doesn't silently confuse the
+    // embedding lookup.
+    let mut i = 0
+    while i < n_prompt {
+        let b = prompt[i]
+        if b < 0 || b >= cfg.VOCAB {
+            println("[gpu_train] gpu_generate_greedy: byte out of range at " + str(i) + " = " + str(b))
+            return []
+        }
+        i = i + 1
+    }
+
+    // Delegate — returns [int] of tokens (= bytes here)
+    let out = gpu_greedy_decode(prompt, weights, cfg, max_tokens)
+    println("[gpu_train] gpu_generate_greedy: " + str(n_prompt) + " prompt bytes → " + str(len(out)) + " total bytes")
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+
+println("[gpu_train] module loaded — CLM training primitives ready")
