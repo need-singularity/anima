@@ -86,7 +86,8 @@ The service auto-restarts on failure with a 5-second delay. Memory is capped at 
 ```bash
 ssh 100.96.193.56
 cd ~/hexa-agi
-./hexa core/conscious_chat.hexa          # interactive
-./hexa core/bench.hexa                   # benchmark
-./hexa core/conscious_chat.hexa status   # status check
+./hexa run core/conscious_chat.hexa          # interactive (stage1 CLI)
+./hexa run core/bench.hexa                   # benchmark
+./hexa run core/conscious_chat.hexa status   # status check
+# 호환 모드: `./hexa <file.hexa>` 직접 호출도 run 자동 위임
 ```

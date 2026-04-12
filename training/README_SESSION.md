@@ -66,7 +66,7 @@ the running file's directory.
 ```sh
 cd /Users/ghost/Dev/anima
 cp anima-speak/nn_core.hexa training/nn_core.hexa
-hexa training/train_full_decoder.hexa
+hexa run training/train_full_decoder.hexa
 rm training/nn_core.hexa
 ```
 
@@ -109,7 +109,7 @@ RANK  = 2    →  16      (DD175 #3 sweet spot)
 SEQ   = 3    →  1024
 ```
 
-Then hit the H100 with `hexa training/train_full_decoder.hexa`.
+Then hit the H100 with `hexa run training/train_full_decoder.hexa`.
 
 ## Session stats
 

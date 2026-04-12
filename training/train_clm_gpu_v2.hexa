@@ -1,0 +1,138 @@
+// ═══════════════════════════════════════════════════════════════
+//  training/train_clm_gpu_v2.hexa — GPU CLM with checkpoint save
+//  env-configurable, checkpoint save, loss tracking
+// ═══════════════════════════════════════════════════════════════
+use "cuda_ffi"
+use "cuda_rtc"
+use "cuda_kernels"
+use "gpu_train"
+
+fn env_or(key: string, dv: string) -> string {
+    let v = env(key)
+    if v == "" { return dv }
+    return v
+}
+
+let D      = to_int(env_or("CLM_D",      "256"))
+let FF     = to_int(env_or("CLM_FF",     "1024"))
+let NL     = to_int(env_or("CLM_NL",     "8"))
+let SEQ    = to_int(env_or("CLM_SEQ",    "512"))
+let VOCAB  = to_int(env_or("CLM_VOCAB",  "256"))
+let RANK   = to_int(env_or("CLM_RANK",   "16"))
+let STEPS  = to_int(env_or("CLM_STEPS",  "5000"))
+let SAVE_EVERY = to_int(env_or("CLM_SAVE", "1000"))
+let LOG_EVERY  = to_int(env_or("CLM_LOG",  "5"))
+let EPS    = 0.00001
+let INIT_SCALE = 0.1
+let LR_MAX = to_float(env_or("CLM_LR", "0.0003"))
+let LR_MIN = LR_MAX * 0.1
+let WARMUP = to_int(env_or("CLM_WARMUP", "200"))
+let TAG    = env_or("CLM_TAG", "gpu")
+
+println("[clm_gpu] D=" + str(D) + " FF=" + str(FF) + " NL=" + str(NL) + " SEQ=" + str(SEQ))
+println("[clm_gpu] STEPS=" + str(STEPS) + " SAVE_EVERY=" + str(SAVE_EVERY) + " TAG=" + TAG)
+println("[clm_gpu] LR_MAX=" + str(LR_MAX) + " LR_MIN=" + str(LR_MIN) + " WARMUP=" + str(WARMUP))
+
+let _ = cuda_init()
+let _ = gpu_init_kernels()
+let _ = gpu_adamw_init_kernel()
+
+let cfg = GpuClmConfig {
+    D: D, FF: FF, NL: NL, VOCAB: VOCAB, SEQ: SEQ, RANK: RANK,
+    EPS: EPS, INIT_SCALE: INIT_SCALE
+}
+
+// ─── Corpus ───
+let CORPUS_PATH = env_or("CLM_CORPUS", "training/corpus_ko_wiki_lines.tok")
+println("[clm_gpu] corpus: " + CORPUS_PATH)
+let _craw = read_file(CORPUS_PATH)
+let _clines = _craw.split("\n")
+let _cn = len(_clines)
+let mut n_corpus = 0
+let mut _ci = 0
+while _ci < _cn {
+    let _ct = _clines[_ci].trim()
+    if _ct != "" { n_corpus = n_corpus + 1 }
+    _ci = _ci + 1
+}
+println("[clm_gpu] " + str(n_corpus) + " tokens loaded")
+
+let _corpus_host = alloc_raw(n_corpus * 4)
+let mut _wi = 0
+_ci = 0
+while _ci < _cn {
+    let _ct = _clines[_ci].trim()
+    if _ct != "" {
+        write_i32(_corpus_host, _wi, to_int(_ct))
+        _wi = _wi + 1
+    }
+    _ci = _ci + 1
+}
+
+let corpus_dev = cuda_malloc(n_corpus * 4)
+cuda_memcpy_h2d(corpus_dev, _corpus_host, n_corpus * 4)
+free_raw(_corpus_host, n_corpus * 4)
+let max_start = n_corpus - SEQ - 1
+println("[clm_gpu] corpus on GPU, max_start=" + str(max_start))
+
+// ─── Model ───
+let weights = init_gpu_weights(cfg, 42)
+let acts = alloc_fwd_buffers(cfg, SEQ)
+let grad = alloc_grad_buffers(cfg)
+let batch_tok = cuda_malloc(SEQ * 4)
+let batch_tgt = cuda_malloc(SEQ * 4)
+
+let CKPT_DIR = env_or("CLM_CKPT_DIR", "/workspace/ckpt_clm_" + TAG)
+let _ = exec("mkdir -p " + CKPT_DIR)
+
+let mut rng = 12345
+let mut best_loss = 999.0
+
+println("[clm_gpu] GO — ln(256)=5.545")
+let t0 = time()
+let mut step = 1
+while step <= STEPS {
+    // Random window
+    rng = (rng * 1103515245 + 12345) % 2147483647
+    if rng < 0 { rng = 0 - rng }
+    let s = rng % max_start
+    let st = ptr_from_int(ptr_addr(corpus_dev) + s * 4)
+    let sg = ptr_from_int(ptr_addr(corpus_dev) + (s + 1) * 4)
+    cuda_memcpy_d2d(batch_tok, st, SEQ * 4)
+    cuda_memcpy_d2d(batch_tgt, sg, SEQ * 4)
+
+    gpu_zero_grad(grad, cfg)
+    let logits = gpu_forward_full(batch_tok, weights, acts, cfg)
+    let loss = gpu_backward_full_with_embed(logits, batch_tgt, batch_tok, acts, weights, grad, cfg)
+
+    // Cosine LR with warmup
+    let lr = if step <= WARMUP {
+        LR_MIN + (LR_MAX - LR_MIN) * (step * 1.0 / (WARMUP * 1.0))
+    } else {
+        let progress = (step - WARMUP) * 1.0 / ((STEPS - WARMUP) * 1.0)
+        let pi = 3.14159265358979
+        LR_MIN + (LR_MAX - LR_MIN) * 0.5 * (1.0 + cos(pi * progress))
+    }
+    gpu_sgd_step(weights, grad, lr, cfg)
+
+    if loss < best_loss { best_loss = loss }
+
+    if step % LOG_EVERY == 0 || step == 1 {
+        let el = time() - t0
+        let spd = el / (step * 1.0)
+        let eta = spd * (STEPS - step)
+        println("[clm_gpu] step=" + str(step) + "/" + str(STEPS) + " loss=" + str(loss) + " best=" + str(best_loss) + " lr=" + str(lr) + " " + str(spd) + "s/step ETA=" + str(to_int(eta)) + "s")
+    }
+
+    // Save checkpoint
+    if step % SAVE_EVERY == 0 || step == STEPS {
+        let ckpt_path = CKPT_DIR + "/step_" + str(step) + ".hexackpt"
+        let _ = save_checkpoint_gpu(weights, cfg, ckpt_path)
+        println("[clm_gpu] checkpoint saved: " + ckpt_path)
+    }
+
+    step = step + 1
+}
+
+let total = time() - t0
+println("[clm_gpu] DONE " + str(STEPS) + " steps in " + str(total) + "s — best_loss=" + str(best_loss))
