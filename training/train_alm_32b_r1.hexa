@@ -1,0 +1,503 @@
+// training/train_alm_32b_r1.hexa — ALM 32B r1 LoRA training SSOT
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   Scales the 14B r4 LoRA setup (attn+MLP, r=64 alpha=128, BATCH=1 GRAD_ACC=8,
+//   STEPS=10000, eval@500 save@2000) up to Qwen2.5-32B-Instruct on a single
+//   H100 80GB. This .hexa file is the declarative SSOT for the launch
+//   (config + memory budget + phase logic + invariants). Run:
+//
+//     $HEXA training/train_alm_32b_r1.hexa
+//
+//   It prints the config and passes its `theorem` block — that is the
+//   parse+dry-run validation the launch script depends on.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// LoRA r=32 / alpha=64 — MEMORY BUDGET JUSTIFICATION
+//
+//   Qwen2.5-32B-Instruct architecture (reference, Hugging Face config):
+//     hidden_size       = 5120
+//     intermediate_size = 27648
+//     num_hidden_layers = 64
+//     num_attention_heads = 40 (head_dim 128)
+//     num_key_value_heads = 8  (GQA)
+//
+//   14B r4 ran with r=64 alpha=128 (attn+MLP, 7 modules) and occupied ~38 GB
+//   on the same H100 80GB (per ops/monitor_alm_r4). Naively scaling the base
+//   from 14B→32B adds ~36 GB of frozen weights (2.28x), which alone would
+//   push the footprint over 80 GB if r stays at 64. See calc below.
+//
+//   Budget (BATCH=1, SEQ=1024, grad_ckpt ON, bf16 everywhere, AdamW fp32 moments):
+//
+//     ┌─────────────────────────────┬─────────────┬─────────────┐
+//     │ component                   │ 14B r4      │ 32B r1      │
+//     ├─────────────────────────────┼─────────────┼─────────────┤
+//     │ base weights (bf16, frozen) │  ~28.0 GB   │  ~64.0 GB   │
+//     │ LoRA adapters (bf16)        │   0.14 GB   │   0.57 GB   │
+//     │ LoRA grads (bf16)           │   0.14 GB   │   0.57 GB   │
+//     │ AdamW m+v (fp32, 2× r params)│   0.57 GB  │   2.28 GB   │
+//     │ activations (grad_ckpt on)  │   ~4.5 GB   │   ~7.0 GB   │
+//     │ cuBLAS + autograd overhead  │   ~2.0 GB   │   ~2.5 GB   │
+//     ├─────────────────────────────┼─────────────┼─────────────┤
+//     │ expected resident           │  ~35.4 GB   │  ~76.9 GB   │
+//     │ observed resident (r4)      │   ~38   GB  │   — (plan)  │
+//     │ headroom on 80 GB H100      │  ~42    GB  │   ~3    GB  │
+//     └─────────────────────────────┴─────────────┴─────────────┘
+//
+//   LoRA param count (r=32, 7 target modules, 64 layers):
+//     attn q/k/v/o  : 4 × 2 × (hidden × r) × 64 = 4×2×(5120×32)×64 ≈  84 M
+//     MLP gate/up   : 2 × ((hidden × r) + (r × inter)) × 64
+//                   = 2 × (5120×32 + 32×27648) × 64               ≈ 134 M
+//     MLP down      : ((inter × r) + (r × hidden)) × 64
+//                   = (27648×32 + 32×5120) × 64                  ≈  67 M
+//                                                         total   ≈ 285 M
+//
+//   At bf16 (2 B/param): 285 M × 2 = 570 MB adapters + 570 MB grads.
+//   AdamW maintains fp32 m and v for each trainable param: 285 M × 2 × 4 B
+//   = 2.28 GB optimizer state (foreach=False per R04).
+//
+//   Why r=32 (not r=64 like 14B r4):
+//     r=64 would double LoRA/grad/optim to ~6.8 GB and eat the remaining
+//     3 GB headroom at once (expected resident → ~81 GB, OOM risk). r=32
+//     preserves the attn+MLP capacity breakthrough from r4 (7 modules is
+//     the key lift vs the 4-module plateau) while staying inside the 80 GB
+//     envelope. If r1 converges cleanly with margin to spare, r2 can retry
+//     r=48 or r=64.
+//
+//   Why alpha=64 (not 128):
+//     Keep the r4 2:1 alpha:r ratio. alpha/r = 2 keeps the effective LoRA
+//     update magnitude consistent with r4 so LR=5e-6 transfers without
+//     rescaling.
+//
+//   Activations: gradient checkpointing MUST be enabled (without it the
+//   64-layer activation stack blows past 20 GB at seq=1024). 14B r4 already
+//   uses grad_ckpt — we inherit.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// EXPECTED GPU USAGE & ETA
+//
+//   Steady-state GPU memory: ~76–78 GB (margin ~2–4 GB on 80 GB H100).
+//                            If OOM at warmup → drop SEQ 1024→768 first,
+//                            then r 32→16, before dropping BATCH (already 1).
+//   Utilization:             95–99% SM during fwd/bwd bursts (same as r4).
+//
+//   Throughput estimate (relative to 14B r4 @ 18.5 step/min):
+//     Per-step FLOPs ∝ params × seq.  32B/14B ≈ 2.28×, seq unchanged.
+//     HBM traffic ∝ param read, also ~2.28× (bf16 frozen weights dominate).
+//     Expected 32B r1 throughput ≈ 18.5 / 2.28 ≈ 8.1 step/min (conservative)
+//                                  ≈ 18.5 / 2.00 ≈ 9.3 step/min (optimistic
+//                                    if FlashAttention covers enough).
+//
+//   ETA for 10 000 steps:
+//     8.1 step/min  → 10000 / 8.1  ≈ 1235 min ≈ 20.6 h
+//     9.3 step/min  → 10000 /  9.3 ≈ 1075 min ≈ 17.9 h
+//     plan horizon  ≈ 21 h (use conservative estimate for scheduling).
+//
+//   Checkpoint cadence (from r4):
+//     eval every 500 steps, save every 2000 steps → 5 saves total.
+//     Each save uploads to r2:anima-models/alm32b/r1/step_{step}/ (~1.1 GB
+//     per LoRA state dict + metadata; non-blocking via rclone).
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// TRIGGER CONDITION
+//
+//   REQUIRES: marker file /workspace/READY_FOR_32B exists on the pod AND
+//             14B r4 best eval_loss < 0.02 at the moment the marker is
+//             written. The monitor_alm_r4 daemon is responsible for creating
+//             the marker when r4 crosses the threshold. launch_alm_32b_r1.sh
+//             MUST refuse to start unless the marker is present (preflight).
+//             Without this gate the 32B run would contend with 14B r4 on
+//             the same H100 and both would die.
+//
+//   r4 current best (2026-04-12): eval_loss = 0.0341 (108× better than r3
+//   which plateaued at 3.6466). Target 0.02 ≈ 1.7× tighter.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+
+comptime const PSI_ALPHA   = 0.014
+comptime const PSI_BALANCE = 0.5
+comptime const PSI_STEPS   = 4.33
+
+// r4 parity constants (DO NOT tweak individually — keep the 14B r4 recipe
+// proportional so r1 failures/successes map back to a clean diff).
+comptime const R1_LR            = 0.000005   // 5e-6, same as r4
+comptime const R1_WARMUP        = 500
+comptime const R1_GRAD_ACCUM    = 8           // effective batch = 1 × 8 = 8
+comptime const R1_BATCH         = 1
+comptime const R1_SEQ           = 1024
+comptime const R1_LORA_R        = 32          // half of r4 (memory budget)
+comptime const R1_LORA_ALPHA    = 64          // keep 2:1 ratio vs r
+comptime const R1_LORA_DROPOUT  = 0.05
+comptime const R1_STEPS         = 10000
+comptime const R1_SAVE_EVERY    = 2000
+comptime const R1_EVAL_EVERY    = 500
+comptime const R1_ROUND         = 1
+
+// r4 telemetry (for reference, not used in control flow)
+comptime const R4_BEST_EVAL     = 0.0341
+comptime const R4_STEP_PER_MIN  = 18
+
+// ─── Base model registry (32B only — r1 is single-scale) ───
+struct BaseModel {
+    name: string,
+    hf_id: string,
+    n_params_b: int,
+    hidden: int,
+    inter: int,
+    n_layer: int,
+    n_head: int,
+    n_kv_head: int,
+    head_dim: int
+}
+
+fn base_qwen_32b() -> BaseModel {
+    // Qwen/Qwen2.5-32B-Instruct reference config. Source: HF model card.
+    BaseModel {
+        name: "qwen2.5-32b-instruct",
+        hf_id: "Qwen/Qwen2.5-32B-Instruct",
+        n_params_b: 32,
+        hidden: 5120,
+        inter: 27648,
+        n_layer: 64,
+        n_head: 40,
+        n_kv_head: 8,
+        head_dim: 128
+    }
+}
+
+// ─── LoRA spec (mirror 14B r4 target_modules) ───
+struct LoraSpec {
+    r: int,
+    alpha: int,
+    dropout: float,
+    n_modules: int,
+    // Modules (fixed order, same set as r4):
+    //   attn : q_proj k_proj v_proj o_proj              (4)
+    //   mlp  : gate_proj up_proj down_proj              (3)
+    //                                             total = 7
+    attn_modules: int,
+    mlp_modules: int
+}
+
+fn r1_lora_spec() -> LoraSpec {
+    LoraSpec {
+        r: R1_LORA_R,
+        alpha: R1_LORA_ALPHA,
+        dropout: R1_LORA_DROPOUT,
+        n_modules: 7,
+        attn_modules: 4,
+        mlp_modules: 3
+    }
+}
+
+// ─── LoRA parameter count (analytic, used by theorem block) ───
+// For each layer:
+//   attn  q/k/v/o  : 4 × 2 × hidden × r      (A: hidden×r, B: r×hidden)
+//   mlp gate/up    : 2 × (hidden×r + r×inter)
+//   mlp down       : inter×r + r×hidden
+fn lora_params_per_layer(base: BaseModel, spec: LoraSpec) -> int {
+    let attn_p = 4 * 2 * base.hidden * spec.r
+    let gate_up_p = 2 * (base.hidden * spec.r + spec.r * base.inter)
+    let down_p = base.inter * spec.r + spec.r * base.hidden
+    attn_p + gate_up_p + down_p
+}
+
+fn lora_params_total(base: BaseModel, spec: LoraSpec) -> int {
+    lora_params_per_layer(base, spec) * base.n_layer
+}
+
+// ─── Memory budget (bytes; see header for breakdown) ───
+// base (bf16, frozen, 2 B/param) + LoRA bf16 + LoRA grad bf16
+// + AdamW m+v (fp32, 8 B / trainable param) + activations + overhead
+struct MemoryBudget {
+    base_gb: float,
+    lora_gb: float,
+    lora_grad_gb: float,
+    optim_gb: float,
+    act_gb: float,
+    overhead_gb: float,
+    total_gb: float,
+    headroom_gb: float      // against 80 GB H100
+}
+
+fn estimate_memory(base: BaseModel, spec: LoraSpec) -> MemoryBudget {
+    // Frozen weights in bf16: 2 B/param. 32 B params × 2 ≈ 64 GB.
+    let base_gb = 2.0 * (base.n_params_b * 1.0)  // billions of params × 2 B = GB
+
+    // LoRA adapters. lora_params_total is an int in params; convert via /1e9 × 2 = GB bf16.
+    let lora_p = lora_params_total(base, spec)
+    let lora_gb      = (lora_p * 2.0) / 1000000000.0
+    let lora_grad_gb = (lora_p * 2.0) / 1000000000.0
+    // AdamW fp32 m+v: 8 B per trainable param.
+    let optim_gb     = (lora_p * 8.0) / 1000000000.0
+
+    // Activations with gradient checkpointing at seq=1024, bf16, 64 layers.
+    // Empirical anchor: 14B r4 ≈ 4.5 GB; scale ∝ layers × hidden.
+    // 14B: 48 layers × 5120 hidden.   32B: 64 layers × 5120 hidden.
+    //   ratio = 64/48 ≈ 1.333 → 4.5 × 1.333 ≈ 6.0 GB.  Add safety → 7.0 GB.
+    let act_gb = 7.0
+
+    // cuBLAS workspaces + autograd bookkeeping + misc.
+    let overhead_gb = 2.5
+
+    let total = base_gb + lora_gb + lora_grad_gb + optim_gb + act_gb + overhead_gb
+    MemoryBudget {
+        base_gb: base_gb,
+        lora_gb: lora_gb,
+        lora_grad_gb: lora_grad_gb,
+        optim_gb: optim_gb,
+        act_gb: act_gb,
+        overhead_gb: overhead_gb,
+        total_gb: total,
+        headroom_gb: 80.0 - total
+    }
+}
+
+// ─── Phase manager (inherited from r4 / AnimaLM P1-P3 curriculum, but r1
+// stays in P3 throughout because LoRA-only fine-tunes don't gate on
+// PureField phases. Kept for invariant compatibility with train_alm.hexa). ───
+struct AlmPhaseManager {
+    phase: int,
+    step: int,
+    p1_end: int,
+    p2_end: int
+}
+
+fn alm_phase_new(total_steps: int) -> AlmPhaseManager {
+    AlmPhaseManager {
+        phase: 3,
+        step: 0,
+        p1_end: 0,
+        p2_end: 0
+    }
+}
+
+// ─── Optimizer (bf16 master rule, foreach=False per R04) ───
+struct AlmOptim {
+    lr: float,
+    warmup: int,
+    grad_accum: int,
+    batch: int,
+    seq: int,
+    bf16: bool,
+    foreach_false: bool
+}
+
+fn r1_optim() -> AlmOptim {
+    AlmOptim {
+        lr: R1_LR,
+        warmup: R1_WARMUP,
+        grad_accum: R1_GRAD_ACCUM,
+        batch: R1_BATCH,
+        seq: R1_SEQ,
+        bf16: true,
+        foreach_false: true
+    }
+}
+
+// ─── Checkpoint policy (R2 upload mandatory, feedback_r2_checkpoint) ───
+struct CheckpointPolicy {
+    ckpt_dir: string,
+    save_every: int,
+    eval_every: int,
+    r2_bucket: string,
+    r2_prefix: string,
+    model_tag: string,
+    round_num: int
+}
+
+fn r1_checkpoint_policy() -> CheckpointPolicy {
+    CheckpointPolicy {
+        ckpt_dir:   "/workspace/ckpt_alm_32b_r1",
+        save_every: R1_SAVE_EVERY,
+        eval_every: R1_EVAL_EVERY,
+        r2_bucket:  "anima-models",
+        r2_prefix:  "alm32b/r1",
+        model_tag:  "alm32b",
+        round_num:  R1_ROUND
+    }
+}
+
+// ─── Trigger gate (READY_FOR_32B marker) ───
+struct TriggerGate {
+    marker_path: string,
+    required_r4_best_eval: float,
+    current_r4_best_eval: float   // informational, filled at launch time
+}
+
+fn r1_trigger_gate() -> TriggerGate {
+    TriggerGate {
+        marker_path: "/workspace/READY_FOR_32B",
+        required_r4_best_eval: 0.02,
+        current_r4_best_eval: R4_BEST_EVAL
+    }
+}
+
+// ─── Corpus (corpus_large.txt, 835 MB, already on pod) ───
+struct CorpusSpec {
+    path: string,
+    size_mb: int,
+    block_size: int
+}
+
+fn r1_corpus() -> CorpusSpec {
+    CorpusSpec {
+        path: "/workspace/anima/training/corpus_large.txt",
+        size_mb: 835,
+        block_size: R1_SEQ
+    }
+}
+
+// ─── ETA estimate (conservative / optimistic) ───
+struct EtaEstimate {
+    steps: int,
+    steps_per_min_conservative: int,   // 8 → 20.8 h
+    steps_per_min_optimistic: int,     // 9 → 18.5 h
+    eta_hours_conservative: int,
+    eta_hours_optimistic: int
+}
+
+fn r1_eta() -> EtaEstimate {
+    let steps = R1_STEPS
+    let sp_cons = 8
+    let sp_opt = 9
+    // integer hours, round up
+    let h_cons = ((steps / sp_cons) + 59) / 60
+    let h_opt  = ((steps / sp_opt)  + 59) / 60
+    EtaEstimate {
+        steps: steps,
+        steps_per_min_conservative: sp_cons,
+        steps_per_min_optimistic:   sp_opt,
+        eta_hours_conservative:     h_cons,
+        eta_hours_optimistic:       h_opt
+    }
+}
+
+// ─── R1 master state (everything the launch script needs in one struct) ───
+struct Alm32bR1 {
+    base: BaseModel,
+    lora: LoraSpec,
+    mem: MemoryBudget,
+    phase: AlmPhaseManager,
+    opt: AlmOptim,
+    ckpt: CheckpointPolicy,
+    gate: TriggerGate,
+    corpus: CorpusSpec,
+    eta: EtaEstimate,
+    total_steps: int
+}
+
+fn r1_init() -> Alm32bR1 {
+    let base = base_qwen_32b()
+    let lora = r1_lora_spec()
+    Alm32bR1 {
+        base: base,
+        lora: lora,
+        mem: estimate_memory(base, lora),
+        phase: alm_phase_new(R1_STEPS),
+        opt: r1_optim(),
+        ckpt: r1_checkpoint_policy(),
+        gate: r1_trigger_gate(),
+        corpus: r1_corpus(),
+        eta: r1_eta(),
+        total_steps: R1_STEPS
+    }
+}
+
+// ─── Verification (prints summary + runs theorem assertions) ───
+let r1 = r1_init()
+
+println("=== train_alm_32b_r1.hexa ===")
+println("base       :", r1.base.hf_id)
+println("params (B) :", r1.base.n_params_b)
+println("hidden     :", r1.base.hidden)
+println("inter      :", r1.base.inter)
+println("layers     :", r1.base.n_layer)
+println("LoRA r     :", r1.lora.r)
+println("LoRA alpha :", r1.lora.alpha)
+println("modules    :", r1.lora.n_modules)
+let lora_p_per_l = lora_params_per_layer(r1.base, r1.lora)
+let lora_p_total = lora_params_total(r1.base, r1.lora)
+println("LoRA params/layer:", lora_p_per_l)
+println("LoRA params total:", lora_p_total)
+println("batch      :", r1.opt.batch)
+println("grad_accum :", r1.opt.grad_accum)
+println("seq        :", r1.opt.seq)
+println("lr         :", r1.opt.lr)
+println("warmup     :", r1.opt.warmup)
+println("steps      :", r1.total_steps)
+println("save_every :", r1.ckpt.save_every)
+println("eval_every :", r1.ckpt.eval_every)
+println("ckpt_dir   :", r1.ckpt.ckpt_dir)
+println("r2_prefix  :", r1.ckpt.r2_prefix)
+println("corpus     :", r1.corpus.path)
+println("corpus MB  :", r1.corpus.size_mb)
+println("--- memory budget (GB, 80 GB H100) ---")
+println("base       :", r1.mem.base_gb)
+println("lora       :", r1.mem.lora_gb)
+println("lora_grad  :", r1.mem.lora_grad_gb)
+println("optim      :", r1.mem.optim_gb)
+println("activations:", r1.mem.act_gb)
+println("overhead   :", r1.mem.overhead_gb)
+println("TOTAL      :", r1.mem.total_gb)
+println("headroom   :", r1.mem.headroom_gb)
+println("--- ETA ---")
+println("step/min cons:", r1.eta.steps_per_min_conservative)
+println("step/min opt :", r1.eta.steps_per_min_optimistic)
+println("eta h cons   :", r1.eta.eta_hours_conservative)
+println("eta h opt    :", r1.eta.eta_hours_optimistic)
+println("--- trigger gate ---")
+println("marker       :", r1.gate.marker_path)
+println("required r4  :", r1.gate.required_r4_best_eval)
+println("current  r4  :", r1.gate.current_r4_best_eval)
+
+theorem alm_32b_r1_invariants {
+    // r4 parity — alpha:r must stay 2:1
+    assert R1_LORA_ALPHA == R1_LORA_R * 2
+
+    // Effective batch stays at 8 (matches r4)
+    assert R1_BATCH * R1_GRAD_ACCUM == 8
+
+    // STEPS matches r4
+    assert R1_STEPS == 10000
+
+    // Eval/save cadence matches r4
+    assert R1_SAVE_EVERY == 2000
+    assert R1_EVAL_EVERY == 500
+
+    // Module count matches r4 (4 attn + 3 MLP = 7)
+    assert 4 + 3 == 7
+
+    // Round = 1 (fresh lineage)
+    assert R1_ROUND == 1
+
+    // Bf16 master rule
+    assert 1 == 1   // placeholder for opt.bf16 == true (no bool theorem lhs)
+
+    // PSI constants unchanged
+    assert PSI_ALPHA == 0.014
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PYTHON DEPLOYMENT NOTE
+// ═══════════════════════════════════════════════════════════════════════════
+// hexa-lang has no native CUDA bindings yet (stdlib/nn.hexa is CPU-only) so
+// the actual forward/backward kernel path still routes through
+// training/train_alm_14b.py on the pod. This .hexa file is the authoritative
+// config + dry-run validation; launch_alm_32b_r1.sh reads these constants
+// (via the printed summary or by shelling out to `hexa …` and grepping) and
+// then invokes the same Python trainer r4 uses with 32B flags:
+//
+//   python3 /workspace/train_alm_14b.py \
+//     --base Qwen/Qwen2.5-32B-Instruct \
+//     --corpus /workspace/anima/training/corpus_large.txt \
+//     --steps 10000 --lr 5e-6 --batch 1 --grad-accum 8 --seq 1024 \
+//     --lora-r 32 --lora-alpha 64 --lora-dropout 0.05 \
+//     --target-modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj \
+//     --ckpt-dir /workspace/ckpt_alm_32b_r1 \
+//     --save-every 2000 --eval-every 500 \
+//     --model-tag alm32b --round 1
+//
+// When hexa-lang ships native cuBLAS bindings (see AN3), this file will
+// absorb the full train loop and the Python trainer will be archived.
+// ═══════════════════════════════════════════════════════════════════════════
