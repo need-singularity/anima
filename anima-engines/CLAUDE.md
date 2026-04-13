@@ -5,7 +5,7 @@ R14: shared/ JSON 단일진실, 이 파일은 참조만.
 ref:
   rules   shared/rules/common.json       공통 규칙
   anima   shared/rules/anima.json        anima 규칙
-  parent  /Users/ghost/Dev/anima/CLAUDE.md
+  parent  $ANIMA/CLAUDE.md
 
 exec:
   HEXA=$HOME/Dev/hexa-lang/target/release/hexa

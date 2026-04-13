@@ -43,7 +43,7 @@ python3 -c "import numpy; print('numpy OK')"
 ### Check Anima EEG module
 
 ```bash
-cd ~/Dev/anima
+cd $ANIMA
 python3 -c "import sys; sys.path.insert(0,'anima-eeg'); import validate_consciousness; print('EEG module OK')"
 ```
 
@@ -52,7 +52,7 @@ python3 -c "import sys; sys.path.insert(0,'anima-eeg'); import validate_consciou
 Start Anima with synthetic EEG to verify everything works before connecting hardware.
 
 ```bash
-cd ~/Dev/anima
+cd $ANIMA
 python3 anima/run.py --web --eeg
 ```
 
@@ -70,7 +70,7 @@ This starts:
 ### Run consciousness validation (synthetic)
 
 ```bash
-cd ~/Dev/anima
+cd $ANIMA
 python3 anima-eeg/validate_consciousness.py --quick
 ```
 
@@ -88,7 +88,7 @@ Insert the OpenBCI USB dongle into your computer. It should appear as a serial d
 ### Step 2: Run calibration
 
 ```bash
-cd ~/Dev/anima
+cd $ANIMA
 python3 anima-eeg/calibrate.py
 ```
 

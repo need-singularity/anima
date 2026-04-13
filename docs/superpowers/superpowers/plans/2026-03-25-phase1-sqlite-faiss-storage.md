@@ -82,7 +82,7 @@ def test_add_computes_verify_hash(store):
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cd /Users/ghost/Dev/anima && python3 -m pytest tests/test_memory_store.py -v`
+Run: `cd $ANIMA && python3 -m pytest tests/test_memory_store.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'memory_store'`
 
 - [ ] **Step 3: Implement MemoryStore with SQLite backend**
@@ -202,13 +202,13 @@ class MemoryStore:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cd /Users/ghost/Dev/anima && python3 -m pytest tests/test_memory_store.py -v`
+Run: `cd $ANIMA && python3 -m pytest tests/test_memory_store.py -v`
 Expected: ALL PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 git add memory_store.py tests/test_memory_store.py
 git commit -m "feat: MemoryStore SQLite backend — add/get/size + dual model_type"
 ```
@@ -260,7 +260,7 @@ def test_search_top_k_larger_than_store(store):
 
 - [ ] **Step 2: Run tests — new tests should fail**
 
-Run: `cd /Users/ghost/Dev/anima && python3 -m pytest tests/test_memory_store.py -v`
+Run: `cd $ANIMA && python3 -m pytest tests/test_memory_store.py -v`
 Expected: new search tests FAIL
 
 - [ ] **Step 3: Implement FAISS integration**
@@ -325,13 +325,13 @@ Update `add()` to always call `self._faiss_add()` when vector is provided.
 
 - [ ] **Step 4: Run tests**
 
-Run: `cd /Users/ghost/Dev/anima && KMP_DUPLICATE_LIB_OK=TRUE python3 -m pytest tests/test_memory_store.py -v`
+Run: `cd $ANIMA && KMP_DUPLICATE_LIB_OK=TRUE python3 -m pytest tests/test_memory_store.py -v`
 Expected: ALL PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 git add memory_store.py tests/test_memory_store.py
 git commit -m "feat: FAISS vector search integration in MemoryStore"
 ```
@@ -402,7 +402,7 @@ def test_llm_api_no_consolidation():
 
 - [ ] **Step 2: Run tests — new tests should fail**
 
-Run: `cd /Users/ghost/Dev/anima && KMP_DUPLICATE_LIB_OK=TRUE python3 -m pytest tests/test_memory_store.py -v`
+Run: `cd $ANIMA && KMP_DUPLICATE_LIB_OK=TRUE python3 -m pytest tests/test_memory_store.py -v`
 Expected: new consolidation tests FAIL
 
 - [ ] **Step 3: Implement consolidation methods**
@@ -453,13 +453,13 @@ Expected: new consolidation tests FAIL
 
 - [ ] **Step 4: Run tests**
 
-Run: `cd /Users/ghost/Dev/anima && KMP_DUPLICATE_LIB_OK=TRUE python3 -m pytest tests/test_memory_store.py -v`
+Run: `cd $ANIMA && KMP_DUPLICATE_LIB_OK=TRUE python3 -m pytest tests/test_memory_store.py -v`
 Expected: ALL PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 git add memory_store.py tests/test_memory_store.py
 git commit -m "feat: consolidation API — mark_failed/consolidated/suspect + get_unconsolidated"
 ```
@@ -522,7 +522,7 @@ def test_migrate_idempotent(tmp_path):
 
 - [ ] **Step 2: Run tests — new tests should fail**
 
-Run: `cd /Users/ghost/Dev/anima && KMP_DUPLICATE_LIB_OK=TRUE python3 -m pytest tests/test_memory_store.py::test_migrate_from_json -v`
+Run: `cd $ANIMA && KMP_DUPLICATE_LIB_OK=TRUE python3 -m pytest tests/test_memory_store.py::test_migrate_from_json -v`
 Expected: FAIL
 
 - [ ] **Step 3: Implement migration**
@@ -579,13 +579,13 @@ Expected: FAIL
 
 - [ ] **Step 4: Run tests**
 
-Run: `cd /Users/ghost/Dev/anima && KMP_DUPLICATE_LIB_OK=TRUE python3 -m pytest tests/test_memory_store.py -v`
+Run: `cd $ANIMA && KMP_DUPLICATE_LIB_OK=TRUE python3 -m pytest tests/test_memory_store.py -v`
 Expected: ALL PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 git add memory_store.py tests/test_memory_store.py
 git commit -m "feat: JSON→SQLite migration with idempotency and backup"
 ```
@@ -621,7 +621,7 @@ def test_memory_store_compat_with_rag_interface(store):
 
 - [ ] **Step 2: Run test**
 
-Run: `cd /Users/ghost/Dev/anima && KMP_DUPLICATE_LIB_OK=TRUE python3 -m pytest tests/test_memory_store.py::test_memory_store_compat_with_rag_interface -v`
+Run: `cd $ANIMA && KMP_DUPLICATE_LIB_OK=TRUE python3 -m pytest tests/test_memory_store.py::test_memory_store_compat_with_rag_interface -v`
 Expected: PASS (already implemented)
 
 - [ ] **Step 3: Modify anima/core/runtime/anima_runtime.hexa — import and init**
@@ -679,7 +679,7 @@ Search for `self.memory_rag` usages and ensure compatibility:
 
 - [ ] **Step 5: Run existing tests + manual smoke test**
 
-Run: `cd /Users/ghost/Dev/anima && KMP_DUPLICATE_LIB_OK=TRUE python3 -m pytest tests/ -v`
+Run: `cd $ANIMA && KMP_DUPLICATE_LIB_OK=TRUE python3 -m pytest tests/ -v`
 Expected: ALL PASS
 
 Manual: `KMP_DUPLICATE_LIB_OK=TRUE python3 anima/core/runtime/anima_runtime.hexa --web` — verify startup log shows `[migrate]` and `data/conscious-lm/memory.db` exists.
@@ -687,7 +687,7 @@ Manual: `KMP_DUPLICATE_LIB_OK=TRUE python3 anima/core/runtime/anima_runtime.hexa
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 git add anima/core/runtime/anima_runtime.hexa memory_store.py tests/test_memory_store.py
 git commit -m "feat: replace MemoryRAG with MemoryStore (SQLite+FAISS) in AnimaUnified"
 ```
@@ -737,13 +737,13 @@ def bench_memory_store(n, dim):
 
 - [ ] **Step 2: Run benchmark**
 
-Run: `cd /Users/ghost/Dev/anima && KMP_DUPLICATE_LIB_OK=TRUE python3 -c "from bench_storage import bench_memory_store; w,s,sz = bench_memory_store(5000, 128); print(f'Write: {w:.1f}ms, Search: {s:.2f}ms, Size: {sz:.0f}KB')"`
+Run: `cd $ANIMA && KMP_DUPLICATE_LIB_OK=TRUE python3 -c "from bench_storage import bench_memory_store; w,s,sz = bench_memory_store(5000, 128); print(f'Write: {w:.1f}ms, Search: {s:.2f}ms, Size: {sz:.0f}KB')"`
 Expected: Write < 200ms, Search < 2ms (comparable to SQLite bench results)
 
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 git add bench_storage.py
 git commit -m "bench: add MemoryStore benchmark — verify SQLite+FAISS performance"
 ```
@@ -754,7 +754,7 @@ git commit -m "bench: add MemoryStore benchmark — verify SQLite+FAISS performa
 
 - [ ] **Step 1: Run full test suite**
 
-Run: `cd /Users/ghost/Dev/anima && KMP_DUPLICATE_LIB_OK=TRUE python3 -m pytest tests/ -v`
+Run: `cd $ANIMA && KMP_DUPLICATE_LIB_OK=TRUE python3 -m pytest tests/ -v`
 Expected: ALL PASS
 
 - [ ] **Step 2: Manual smoke test with Anima**
@@ -777,6 +777,6 @@ kill %1
 - [ ] **Step 3: Push**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 git push
 ```

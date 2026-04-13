@@ -5,9 +5,9 @@ R14: shared/ JSON 단일진실, 이 파일은 참조만.
 ref:
   laws      anima/config/consciousness_laws.json    2390 법칙 SSOT
   structure anima/core/folder_structure.md          L0 확정 구조
-  training  /Users/ghost/Dev/anima/training/        실제 학습 스크립트
-  engines   /Users/ghost/Dev/anima/anima/engines/   대체 기질 엔진
-  parent    /Users/ghost/Dev/anima/CLAUDE.md
+  training  $ANIMA/training/        실제 학습 스크립트
+  engines   $ANIMA/anima/engines/   대체 기질 엔진
+  parent    $ANIMA/CLAUDE.md
 
 exec:
   HEXA=$HOME/Dev/hexa-lang/target/release/hexa

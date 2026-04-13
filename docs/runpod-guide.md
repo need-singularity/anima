@@ -280,7 +280,7 @@ ls -lth /workspace/anima/checkpoints/clm_v3/ 2>/dev/null | head -5
 # scp
 scp -i ~/.runpod/ssh/RunPod-Key-Go -P PORT \
   root@IP:/workspace/anima/checkpoints/clm_v3/best.pt \
-  ~/Dev/anima/checkpoints/
+  $ANIMA/checkpoints/
 
 # cat (scp 실패 시)
 ssh ... "cat /workspace/anima/checkpoints/clm_v3/best.pt" > best.pt
@@ -290,7 +290,7 @@ ssh ... "cat /workspace/anima/checkpoints/clm_v3/best.pt" > best.pt
 ```bash
 scp -i ~/.runpod/ssh/RunPod-Key-Go -P PORT \
   root@IP:/workspace/anima/logs/clm_v3.log \
-  ~/Dev/anima/logs/
+  $ANIMA/logs/
 ```
 
 ---

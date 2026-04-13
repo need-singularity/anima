@@ -12,7 +12,7 @@ ref:
   assets       asset_registry.md                    M/C/T/E/D 자산 분류
   laws         laws.hexa                            PSI 상수 + 법칙 로더
   hub          hub.hexa                             _registry 라우팅
-  parent       /Users/ghost/Dev/anima/CLAUDE.md
+  parent       $ANIMA/CLAUDE.md
 
 exec:
   HEXA=$HOME/Dev/hexa-lang/hexa

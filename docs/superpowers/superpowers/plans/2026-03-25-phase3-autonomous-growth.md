@@ -127,7 +127,7 @@ class TestDiscoveryLogging:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cd /Users/ghost/Dev/anima && python3 -m pytest tests/test_growth_manager.py -v`
+Run: `cd $ANIMA && python3 -m pytest tests/test_growth_manager.py -v`
 Expected: FAIL — ModuleNotFoundError
 
 - [ ] **Step 3: Implement GrowthManager**
@@ -299,13 +299,13 @@ class GrowthManager:
 
 - [ ] **Step 4: Run tests**
 
-Run: `cd /Users/ghost/Dev/anima && python3 -m pytest tests/test_growth_manager.py -v`
+Run: `cd $ANIMA && python3 -m pytest tests/test_growth_manager.py -v`
 Expected: ALL PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 git add growth_manager.py tests/test_growth_manager.py
 git commit -m "feat: GrowthManager — dim expansion, versioning, rollback, discovery logging"
 ```
@@ -390,7 +390,7 @@ With:
 - [ ] **Step 4: Smoke test**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 PYTHONUNBUFFERED=1 KMP_DUPLICATE_LIB_OK=TRUE python3 anima/core/runtime/anima_runtime.hexa --web &
 sleep 6 && head -25 /tmp/anima_p3.txt
 # Should show [OK] growth_mgr
@@ -400,7 +400,7 @@ kill %1
 - [ ] **Step 5: Commit + Push**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 git add anima/core/runtime/anima_runtime.hexa
 git commit -m "feat: Phase 3 — autonomous growth execution + post_check + discovery logging"
 git push

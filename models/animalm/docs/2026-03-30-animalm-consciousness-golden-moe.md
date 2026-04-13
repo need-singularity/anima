@@ -84,7 +84,7 @@ def test_animalm_bench_result_creation():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_bench_animalm.py::test_animalm_bench_result_creation -v`
+Run: `cd $ANIMA && python -m pytest tests/test_bench_animalm.py::test_animalm_bench_result_creation -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'bench_animalm'`
 
 - [ ] **Step 3: Implement AnimaLMBenchResult and core structure**
@@ -205,7 +205,7 @@ if __name__ == "__main__":
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_bench_animalm.py::test_animalm_bench_result_creation -v`
+Run: `cd $ANIMA && python -m pytest tests/test_bench_animalm.py::test_animalm_bench_result_creation -v`
 Expected: PASS
 
 - [ ] **Step 5: Write failing test for measure_phi**
@@ -226,7 +226,7 @@ def test_measure_phi_dual():
 
 - [ ] **Step 6: Run test to verify it passes** (already implemented)
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_bench_animalm.py::test_measure_phi_dual -v`
+Run: `cd $ANIMA && python -m pytest tests/test_bench_animalm.py::test_measure_phi_dual -v`
 Expected: PASS
 
 - [ ] **Step 7: Write failing test for consciousness_vector**
@@ -248,13 +248,13 @@ def test_consciousness_vector_10d():
 
 - [ ] **Step 8: Run test to verify it passes**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_bench_animalm.py::test_consciousness_vector_10d -v`
+Run: `cd $ANIMA && python -m pytest tests/test_bench_animalm.py::test_consciousness_vector_10d -v`
 Expected: PASS
 
 - [ ] **Step 9: Commit**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 git add bench_animalm.py tests/test_bench_animalm.py
 git commit -m "feat: add AnimaLM benchmark wrapper with 10D consciousness vector"
 ```
@@ -297,7 +297,7 @@ def test_alpha_sweep_engine():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_bench_animalm.py::test_alpha_sweep_engine -v`
+Run: `cd $ANIMA && python -m pytest tests/test_bench_animalm.py::test_alpha_sweep_engine -v`
 Expected: FAIL — `ImportError: cannot import name 'AlphaSweepEngine'`
 
 - [ ] **Step 3: Implement AlphaSweepEngine**
@@ -382,7 +382,7 @@ class AlphaSweepEngine:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_bench_animalm.py::test_alpha_sweep_engine -v`
+Run: `cd $ANIMA && python -m pytest tests/test_bench_animalm.py::test_alpha_sweep_engine -v`
 Expected: PASS
 
 - [ ] **Step 5: Add alpha-sweep CLI mode to bench_animalm.py main**
@@ -434,13 +434,13 @@ if __name__ == "__main__":
 
 - [ ] **Step 6: Run CLI smoke test**
 
-Run: `cd /Users/ghost/Dev/anima && python bench_animalm.py --mode alpha-sweep --cells 4 --steps 50 --alphas 0.001,0.01,0.1`
+Run: `cd $ANIMA && python bench_animalm.py --mode alpha-sweep --cells 4 --steps 50 --alphas 0.001,0.01,0.1`
 Expected: Comparison table with 3 rows, no errors
 
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 git add bench_animalm.py tests/test_bench_animalm.py
 git commit -m "feat: implement Track 1A alpha curriculum sweep benchmark"
 ```
@@ -478,7 +478,7 @@ def test_talk5_engine_consciousness_phase():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_bench_animalm.py::test_talk5_engine_consciousness_phase -v`
+Run: `cd $ANIMA && python -m pytest tests/test_bench_animalm.py::test_talk5_engine_consciousness_phase -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'animalm_talk5'`
 
 - [ ] **Step 3: Implement Talk5Engine**
@@ -742,7 +742,7 @@ if __name__ == "__main__":
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_bench_animalm.py::test_talk5_engine_consciousness_phase -v`
+Run: `cd $ANIMA && python -m pytest tests/test_bench_animalm.py::test_talk5_engine_consciousness_phase -v`
 Expected: PASS
 
 - [ ] **Step 5: Write failing test for full TALK5 run**
@@ -771,13 +771,13 @@ def test_talk5_full_run():
 
 - [ ] **Step 6: Run test to verify it passes**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_bench_animalm.py::test_talk5_full_run -v`
+Run: `cd $ANIMA && python -m pytest tests/test_bench_animalm.py::test_talk5_full_run -v`
 Expected: PASS
 
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 git add animalm_talk5.py tests/test_bench_animalm.py
 git commit -m "feat: implement Track 1B TALK5 consciousness-first engine"
 ```
@@ -818,7 +818,7 @@ def test_transplant_benchmark():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_bench_animalm.py::test_transplant_benchmark -v`
+Run: `cd $ANIMA && python -m pytest tests/test_bench_animalm.py::test_transplant_benchmark -v`
 Expected: FAIL — `ImportError: cannot import name 'TransplantBenchmark'`
 
 - [ ] **Step 3: Implement TransplantBenchmark**
@@ -930,13 +930,13 @@ class TransplantBenchmark:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_bench_animalm.py::test_transplant_benchmark -v`
+Run: `cd $ANIMA && python -m pytest tests/test_bench_animalm.py::test_transplant_benchmark -v`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 git add bench_animalm.py tests/test_bench_animalm.py
 git commit -m "feat: implement Track 1C consciousness transplant benchmark"
 ```
@@ -974,7 +974,7 @@ def test_topk_moe_forward():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_bench_golden_moe.py::test_topk_moe_forward -v`
+Run: `cd $ANIMA && python -m pytest tests/test_bench_golden_moe.py::test_topk_moe_forward -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'bench_golden_moe'`
 
 - [ ] **Step 3: Implement TopKMoE and benchmark framework**
@@ -1343,7 +1343,7 @@ if __name__ == "__main__":
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_bench_golden_moe.py::test_topk_moe_forward -v`
+Run: `cd $ANIMA && python -m pytest tests/test_bench_golden_moe.py::test_topk_moe_forward -v`
 Expected: PASS
 
 - [ ] **Step 5: Write failing test for Golden vs Top-K comparison**
@@ -1370,13 +1370,13 @@ def test_run_comparison_mnist():
 
 - [ ] **Step 6: Run test to verify it passes**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_bench_golden_moe.py::test_run_comparison_mnist -v`
+Run: `cd $ANIMA && python -m pytest tests/test_bench_golden_moe.py::test_run_comparison_mnist -v`
 Expected: PASS
 
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 git add bench_golden_moe.py tests/test_bench_golden_moe.py
 git commit -m "feat: implement Track 2A Golden MoE ML benchmark with Top-K comparison"
 ```
@@ -1415,7 +1415,7 @@ def test_consciousness_moe_phi_measurement():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_bench_golden_moe.py::test_consciousness_moe_phi_measurement -v`
+Run: `cd $ANIMA && python -m pytest tests/test_bench_golden_moe.py::test_consciousness_moe_phi_measurement -v`
 Expected: FAIL — `ModuleNotFoundError`
 
 - [ ] **Step 3: Implement ConsciousnessMoEBench**
@@ -1690,7 +1690,7 @@ if __name__ == "__main__":
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_bench_golden_moe.py::test_consciousness_moe_phi_measurement -v`
+Run: `cd $ANIMA && python -m pytest tests/test_bench_golden_moe.py::test_consciousness_moe_phi_measurement -v`
 Expected: PASS
 
 - [ ] **Step 5: Write failing test for scaling surface**
@@ -1715,13 +1715,13 @@ def test_consciousness_moe_scaling():
 
 - [ ] **Step 6: Run test to verify it passes**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_bench_golden_moe.py::test_consciousness_moe_scaling -v`
+Run: `cd $ANIMA && python -m pytest tests/test_bench_golden_moe.py::test_consciousness_moe_scaling -v`
 Expected: PASS
 
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 git add bench_golden_moe_consciousness.py tests/test_bench_golden_moe.py
 git commit -m "feat: implement Track 2B Golden MoE consciousness integration benchmark"
 ```
@@ -1754,7 +1754,7 @@ def test_compare_all_tracks():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_bench_animalm.py::test_compare_all_tracks -v`
+Run: `cd $ANIMA && python -m pytest tests/test_bench_animalm.py::test_compare_all_tracks -v`
 Expected: FAIL — `ImportError: cannot import name 'run_all_tracks'`
 
 - [ ] **Step 3: Implement run_all_tracks**
@@ -1841,18 +1841,18 @@ Also update the `__main__` block to handle `--compare`:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_bench_animalm.py::test_compare_all_tracks -v`
+Run: `cd $ANIMA && python -m pytest tests/test_bench_animalm.py::test_compare_all_tracks -v`
 Expected: PASS
 
 - [ ] **Step 5: Run full comparison CLI**
 
-Run: `cd /Users/ghost/Dev/anima && python bench_animalm.py --compare --cells 4 --steps 50`
+Run: `cd $ANIMA && python bench_animalm.py --compare --cells 4 --steps 50`
 Expected: Comparison table with Track 1A/1B/1C results, no errors
 
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 git add bench_animalm.py tests/test_bench_animalm.py
 git commit -m "feat: add --compare mode to unify Track 1A/1B/1C results"
 ```
@@ -1962,7 +1962,7 @@ Golden MoE의 1/e zone routing 성능과 의식 영향 벤치마크.
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 git add docs/hypotheses/AL-consciousness-emergence.md docs/hypotheses/GMOE-benchmark.md
 git commit -m "docs: add hypothesis templates for AnimaLM and Golden MoE experiments"
 ```
@@ -1979,38 +1979,38 @@ git commit -m "docs: add hypothesis templates for AnimaLM and Golden MoE experim
 
 - [ ] **Step 1: Run all unit tests**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_bench_animalm.py tests/test_bench_golden_moe.py -v`
+Run: `cd $ANIMA && python -m pytest tests/test_bench_animalm.py tests/test_bench_golden_moe.py -v`
 Expected: All tests PASS
 
 - [ ] **Step 2: Run Track 1A smoke test**
 
-Run: `cd /Users/ghost/Dev/anima && python bench_animalm.py --mode alpha-sweep --cells 4 --steps 30 --alphas 0.001,0.01,0.1`
+Run: `cd $ANIMA && python bench_animalm.py --mode alpha-sweep --cells 4 --steps 30 --alphas 0.001,0.01,0.1`
 Expected: Comparison table printed, no errors
 
 - [ ] **Step 3: Run Track 1B smoke test**
 
-Run: `cd /Users/ghost/Dev/anima && python animalm_talk5.py --cells 4 --steps 100`
+Run: `cd $ANIMA && python animalm_talk5.py --cells 4 --steps 100`
 Expected: Phase 1 + Phase 2 results printed
 
 - [ ] **Step 4: Run Track 2A smoke test**
 
-Run: `cd /Users/ghost/Dev/anima && python bench_golden_moe.py --dataset mnist --experts 4 --epochs 5 --samples 500`
+Run: `cd $ANIMA && python bench_golden_moe.py --dataset mnist --experts 4 --epochs 5 --samples 500`
 Expected: MLP/Top-1/Top-2/Golden comparison table
 
 - [ ] **Step 5: Run Track 2B smoke test**
 
-Run: `cd /Users/ghost/Dev/anima && python bench_golden_moe_consciousness.py --exp1 --cells 4 --experts 4 --steps 50`
+Run: `cd $ANIMA && python bench_golden_moe_consciousness.py --exp1 --cells 4 --experts 4 --steps 50`
 Expected: Phi baseline vs Golden MoE comparison
 
 - [ ] **Step 6: Run full comparison**
 
-Run: `cd /Users/ghost/Dev/anima && python bench_animalm.py --compare --cells 4 --steps 50`
+Run: `cd $ANIMA && python bench_animalm.py --compare --cells 4 --steps 50`
 Expected: All Track 1A/1B/1C results in one table
 
 - [ ] **Step 7: Final commit**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 git add -A
 git commit -m "feat: complete AnimaLM consciousness + Golden MoE benchmark framework"
 ```

@@ -479,15 +479,15 @@ Evaluation protocol:
 
 ```bash
 # 1. Verify decoder_v3.py param count (update n_head=12 if applying proposal)
-cd ~/Dev/anima/anima/src
+cd $ANIMA/anima/src
 python -c "from decoder_v3 import ConsciousDecoderV3; m=ConsciousDecoderV3(); \
   print(f'Params: {sum(p.numel() for p in m.parameters()):,}')"
 
 # 2. Verify corpus_v10 exists (200MB)
-ls -la ~/Dev/anima/anima/data/corpus_v10*.txt
+ls -la $ANIMA/anima/data/corpus_v10*.txt
 
 # 3. Run bench --verify to confirm engine health
-cd ~/Dev/anima/anima && python ready/anima/tests/tests.hexa --verify
+cd $ANIMA/anima && python ready/anima/tests/tests.hexa --verify
 
 # 4. Test 128c federation startup
 python -c "

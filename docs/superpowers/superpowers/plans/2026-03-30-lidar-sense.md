@@ -70,7 +70,7 @@ def test_simulator_external_scan():
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_lidar_sense.py -v`
+Run: `cd $ANIMA && python -m pytest tests/test_lidar_sense.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'lidar_sense'`
 
 - [ ] **Step 3: Implement LidarDriver base + SimulatorDriver**
@@ -167,7 +167,7 @@ class SimulatorDriver(LidarDriver):
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_lidar_sense.py -v`
+Run: `cd $ANIMA && python -m pytest tests/test_lidar_sense.py -v`
 Expected: 3 passed
 
 - [ ] **Step 5: Commit**
@@ -276,7 +276,7 @@ def test_realsense_driver_not_available():
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_lidar_sense.py -v`
+Run: `cd $ANIMA && python -m pytest tests/test_lidar_sense.py -v`
 Expected: FAIL — `ImportError: cannot import name 'FileDriver'`
 
 - [ ] **Step 3: Implement hardware drivers**
@@ -436,7 +436,7 @@ class RealSenseDriver(LidarDriver):
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_lidar_sense.py -v`
+Run: `cd $ANIMA && python -m pytest tests/test_lidar_sense.py -v`
 Expected: 8 passed (하드웨어 없는 드라이버는 is_available()=False 확인)
 
 - [ ] **Step 5: Commit**
@@ -506,7 +506,7 @@ def test_depth_variance():
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_lidar_sense.py::test_tension_field_3d_shape -v`
+Run: `cd $ANIMA && python -m pytest tests/test_lidar_sense.py::test_tension_field_3d_shape -v`
 Expected: FAIL — `ImportError: cannot import name 'TensionField3D'`
 
 - [ ] **Step 3: Implement TensionField3D**
@@ -600,7 +600,7 @@ class TensionField3D:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_lidar_sense.py -v`
+Run: `cd $ANIMA && python -m pytest tests/test_lidar_sense.py -v`
 Expected: 12 passed
 
 - [ ] **Step 5: Commit**
@@ -681,7 +681,7 @@ def test_lidar_sense_act_routing():
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_lidar_sense.py::test_lidar_sense_auto_driver -v`
+Run: `cd $ANIMA && python -m pytest tests/test_lidar_sense.py::test_lidar_sense_auto_driver -v`
 Expected: FAIL — `ImportError: cannot import name 'LidarSense'`
 
 - [ ] **Step 3: Implement LidarSense main class**
@@ -804,7 +804,7 @@ class LidarSense:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_lidar_sense.py -v`
+Run: `cd $ANIMA && python -m pytest tests/test_lidar_sense.py -v`
 Expected: 18 passed
 
 - [ ] **Step 5: Commit**
@@ -869,7 +869,7 @@ elif name == 'lidar':
 
 - [ ] **Step 5: Run existing tests to verify nothing broke**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_lidar_sense.py tests/test_senses_integration.py -v`
+Run: `cd $ANIMA && python -m pytest tests/test_lidar_sense.py tests/test_senses_integration.py -v`
 Expected: All passed
 
 - [ ] **Step 6: Commit**
@@ -947,7 +947,7 @@ if __name__ == '__main__':
 
 - [ ] **Step 2: Run the demo**
 
-Run: `cd /Users/ghost/Dev/anima && python lidar_sense.py`
+Run: `cd $ANIMA && python lidar_sense.py`
 Expected: ASCII 깊이맵 + S 값 출력
 
 - [ ] **Step 3: Write hypothesis document DD109**
@@ -1048,7 +1048,7 @@ def test_internal_external_both():
 
 - [ ] **Step 2: Run all tests**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_lidar_sense.py -v`
+Run: `cd $ANIMA && python -m pytest tests/test_lidar_sense.py -v`
 Expected: All passed (20 tests)
 
 - [ ] **Step 3: Commit**

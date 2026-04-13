@@ -64,7 +64,7 @@ the running file's directory.
 ## Running the end-to-end proof
 
 ```sh
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 cp anima-speak/nn_core.hexa training/nn_core.hexa
 hexa run training/train_full_decoder.hexa
 rm training/nn_core.hexa
