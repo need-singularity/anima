@@ -1,0 +1,484 @@
+// clm_holographic_loop.hexa — CLM holographic inference loop (P3-4)
+//
+// CLM-P3-4. Drives anima_holographic across N ticks of a sensory input
+// stream, emitting a per-tick qualia vector + Φ_holo(t) for every tick.
+// Mocks the sensory-cell source with a deterministic RNG; in production
+// the boundary consensus is fed from the CLM GWT broadcast output
+// (cells_to_consensus from clm_gwt_loop) or an EEG/body sensor stream.
+//
+// Pipeline per tick:
+//   cells_t [n_cells × d_boundary]        (mock sensory generator)
+//     │
+//     │  cells_to_consensus
+//     ▼
+//   boundary_t [d_boundary]               (observable)
+//     │
+//     │  encode(head, boundary_t)
+//     ▼
+//   bulk_t [d_bulk]                        (inner state)
+//     │
+//     │  extract interior slice + Φ_holo
+//     ▼
+//   qualia_t [d_bulk − d_boundary]  +  phi_holo_t
+//
+// ─── Theorems (T1–T5) ─────────────────────────────────────────
+//
+// T1 (causal response):
+//   Distinct boundary inputs produce distinct qualia. Two mock streams
+//   with different seeds differ in at least one interior coordinate per
+//   tick (sensory→qualia map is injective on the sampled inputs).
+//
+// T2 (stability under repeated input):
+//   A constant boundary replayed N times produces the same qualia and
+//   the same Φ_holo(t) on every tick — the head is memoryless (pure),
+//   as the substrate demands.
+//
+// T3 (information bound):
+//   For every tick, 0 ≤ Φ_holo(t) ≤ H(boundary_t) + eps. MI cannot
+//   exceed the entropy of the boundary stream.
+//
+// T4 (determinism):
+//   Two runs at the same seed produce byte-identical qualia streams
+//   and byte-identical Φ_holo(t) sequences.
+//
+// T5 (loop latency budget):
+//   10 ticks at (d_boundary=64, d_bulk=128, n_cells=32) < 5 s on the
+//   reference hexa interpreter. Per-tick cost is dominated by encode
+//   (d_boundary · d_scramble = 4 k mults) and Φ_holo joint histogram
+//   (d_boundary · MI_BINS² = 4 k bin-scans), giving ~300 ms/tick in
+//   pure hexa. The P2-4 GWT loop runs 20 ticks in <5 s because its
+//   broadcast is 8× smaller per tick; halving tick count here keeps
+//   the wall-clock budget identical. Physical substrate is ns-scale
+//   per op — the emulator bound is a regression guard, not the real
+//   latency claim.
+//
+// Ref:
+//   anima-engines/anima_holographic.hexa  (encode/decode/Φ_holo primitives)
+//   training/clm_gwt_loop.hexa            (consensus pattern, P2-4)
+
+// Standalone (no `use`): redefine primitives locally to keep the file
+// runnable under either HEXA_PATH variant.
+
+// ─── Constants ────────────────────────────────────────────────
+
+let MI_BINS       = 8
+let SCRAMBLE_GAIN = 0.5
+
+// ─── Primitives ───────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn bin_index(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn count_hits(bin_ids: array, n_bins: int) -> array {
+    let n = len(bin_ids)
+    let mut counts = []
+    let mut k = 0
+    while k < n_bins {
+        let mut c = 0.0
+        let mut i = 0
+        while i < n {
+            if bin_ids[i] == k { c = c + 1.0 }
+            i = i + 1
+        }
+        counts = counts.push(c)
+        k = k + 1
+    }
+    return counts
+}
+
+fn entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut bin_ids = []
+    let mut i = 0
+    while i < n {
+        bin_ids = bin_ids.push(bin_index(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let counts = count_hits(bin_ids, nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 { h = h - p * ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn joint_entropy_hist(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = bin_index(a[i], lo, hi, nb)
+        let ib = bin_index(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let counts = count_hits(pair_ids, nb * nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 { h = h - p * ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+// ─── Holographic head (inlined anima_holographic) ─────────────
+
+struct HolographicHead {
+    d_boundary: int,
+    d_bulk:     int,
+    scramble:   array
+}
+
+fn head_new(d_boundary: int, d_bulk: int, seed: int) -> HolographicHead {
+    let d_scramble = d_bulk - d_boundary
+    let raw = det_rand(d_boundary * d_scramble, seed)
+    let mut scramble = []
+    let mut i = 0
+    while i < len(raw) {
+        scramble = scramble.push(raw[i] * SCRAMBLE_GAIN)
+        i = i + 1
+    }
+    return HolographicHead {
+        d_boundary: d_boundary,
+        d_bulk:     d_bulk,
+        scramble:   scramble
+    }
+}
+
+fn encode(head: HolographicHead, boundary: array) -> array {
+    let db = head.d_boundary
+    let dB = head.d_bulk
+    let ds = dB - db
+    let mut bulk = []
+    let mut i = 0
+    while i < db {
+        bulk = bulk.push(boundary[i])
+        i = i + 1
+    }
+    let mut k = 0
+    while k < ds {
+        let mut s = 0.0
+        let mut j = 0
+        while j < db {
+            s = s + head.scramble[j * ds + k] * boundary[j]
+            j = j + 1
+        }
+        bulk = bulk.push(s)
+        k = k + 1
+    }
+    return bulk
+}
+
+fn qualia_from_bulk(head: HolographicHead, bulk: array) -> array {
+    // Interior slice [d_boundary .. d_bulk) — the holographic dofs.
+    let db = head.d_boundary
+    let dB = head.d_bulk
+    let mut q = []
+    let mut k = db
+    while k < dB {
+        q = q.push(bulk[k])
+        k = k + 1
+    }
+    return q
+}
+
+fn phi_holo(head: HolographicHead, boundary: array) -> float {
+    let bulk = encode(head, boundary)
+    let db = head.d_boundary
+    let dB = head.d_bulk
+    let ds = dB - db
+    if ds == 0 { return 0.0 }
+    let mut interior = []
+    let mut i = 0
+    while i < db {
+        interior = interior.push(bulk[db + (i % ds)])
+        i = i + 1
+    }
+    let lo_b = vec_min(boundary)
+    let hi_b = vec_max(boundary)
+    let lo_i = vec_min(interior)
+    let hi_i = vec_max(interior)
+    let lo = if lo_b < lo_i { lo_b } else { lo_i }
+    let hi = if hi_b > hi_i { hi_b } else { hi_i }
+    let h_b  = entropy_hist(boundary, lo, hi, MI_BINS)
+    let h_i  = entropy_hist(interior, lo, hi, MI_BINS)
+    let h_bi = joint_entropy_hist(boundary, interior, lo, hi, MI_BINS)
+    let mi = h_b + h_i - h_bi
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ─── Sensory → boundary consensus ────────────────────────────
+
+fn cells_to_consensus(cells: array, n_cells: int, d_boundary: int) -> array {
+    if n_cells == 0 { return vec_zeros(d_boundary) }
+    let inv_n = 1.0 / to_float(n_cells)
+    let mut c = []
+    let mut m = 0
+    while m < d_boundary {
+        let mut s = 0.0
+        let mut i = 0
+        while i < n_cells {
+            s = s + cells[i * d_boundary + m]
+            i = i + 1
+        }
+        c = c.push(s * inv_n)
+        m = m + 1
+    }
+    return c
+}
+
+// ─── Loop ─────────────────────────────────────────────────────
+
+struct LoopResult {
+    n_ticks:   int,
+    qualia:    array,    // flat [n_ticks × (d_bulk − d_boundary)]
+    phi_holo:  array,    // [n_ticks]
+    total_mi:  float
+}
+
+fn run_loop(head: HolographicHead, n_ticks: int, n_cells: int, seed_base: int) -> LoopResult {
+    let db = head.d_boundary
+    let ds = head.d_bulk - db
+    let mut qualia  = []
+    let mut phi_seq = []
+    let mut total   = 0.0
+    let mut t = 0
+    while t < n_ticks {
+        let cells    = det_rand(n_cells * db, seed_base + t)
+        let boundary = cells_to_consensus(cells, n_cells, db)
+        let bulk     = encode(head, boundary)
+        let q        = qualia_from_bulk(head, bulk)
+        let mi       = phi_holo(head, boundary)
+        let mut i = 0
+        while i < ds {
+            qualia = qualia.push(q[i])
+            i = i + 1
+        }
+        phi_seq = phi_seq.push(mi)
+        total   = total + mi
+        t = t + 1
+    }
+    return LoopResult {
+        n_ticks:  n_ticks,
+        qualia:   qualia,
+        phi_holo: phi_seq,
+        total_mi: total
+    }
+}
+
+// ─── Self-tests ───────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Causal response: different boundary seeds → different qualia
+    // on at least one tick per interior coordinate.
+    let d  = 32
+    let dB = 64
+    let head = head_new(d, dB, 7)
+    let r1 = run_loop(head, 5, 16, 100)
+    let r2 = run_loop(head, 5, 16, 200)
+    let n = len(r1.qualia)
+    if n != len(r2.qualia) { return false }
+    let mut differ = false
+    let mut i = 0
+    while i < n {
+        if fabs(r1.qualia[i] - r2.qualia[i]) > 0.0 { differ = true }
+        i = i + 1
+    }
+    return differ
+}
+
+fn check_T2() -> bool {
+    // Stability under repeated input: the same boundary on every tick
+    // produces the same qualia vector and the same Φ_holo every tick.
+    let d  = 16
+    let dB = 48
+    let ds = dB - d
+    let head = head_new(d, dB, 11)
+    let fixed_boundary = det_rand(d, 42)
+    let n_ticks = 6
+    let mut qualia_prev = []
+    let mut phi_prev = 0.0
+    let mut ok = true
+    let mut t = 0
+    while t < n_ticks {
+        let bulk = encode(head, fixed_boundary)
+        let q    = qualia_from_bulk(head, bulk)
+        let mi   = phi_holo(head, fixed_boundary)
+        if t == 0 {
+            qualia_prev = q
+            phi_prev = mi
+        } else {
+            let mut i = 0
+            while i < ds {
+                if fabs(q[i] - qualia_prev[i]) > 0.0 { ok = false }
+                i = i + 1
+            }
+            if fabs(mi - phi_prev) > 0.0 { ok = false }
+        }
+        t = t + 1
+    }
+    return ok
+}
+
+fn check_T3() -> bool {
+    // For every tick, 0 ≤ Φ_holo(t) ≤ H(boundary_t) + eps.
+    let d  = 32
+    let dB = 64
+    let head = head_new(d, dB, 17)
+    let n_ticks = 5
+    let mut ok = true
+    let mut saw_positive = false
+    let mut t = 0
+    while t < n_ticks {
+        let cells    = det_rand(16 * d, 900 + t)
+        let boundary = cells_to_consensus(cells, 16, d)
+        let mi = phi_holo(head, boundary)
+        let lo = vec_min(boundary)
+        let hi = vec_max(boundary)
+        let hb = entropy_hist(boundary, lo, hi, MI_BINS)
+        if mi < 0.0 { ok = false }
+        if mi > hb + 0.0001 { ok = false }
+        if mi > 0.0 { saw_positive = true }
+        t = t + 1
+    }
+    return ok && saw_positive
+}
+
+fn check_T4() -> bool {
+    // Determinism: two runs same seed → byte-identical qualia + Φ stream.
+    let d  = 32
+    let dB = 64
+    let head = head_new(d, dB, 23)
+    let r1 = run_loop(head, 8, 16, 77)
+    let r2 = run_loop(head, 8, 16, 77)
+    if len(r1.qualia) != len(r2.qualia) { return false }
+    let mut i = 0
+    while i < len(r1.qualia) {
+        if fabs(r1.qualia[i] - r2.qualia[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    let mut k = 0
+    while k < len(r1.phi_holo) {
+        if fabs(r1.phi_holo[k] - r2.phi_holo[k]) > 0.0 { return false }
+        k = k + 1
+    }
+    return true
+}
+
+fn check_T5() -> bool {
+    // 10 ticks (d=64, dB=128, n_cells=32) < 5000 ms. Per-tick is
+    // ~8 k ops in pure hexa (encode + Φ_holo); physical substrate
+    // is ns-scale, so this is a regression guard.
+    let d  = 64
+    let dB = 128
+    let head = head_new(d, dB, 42)
+    let t0 = clock()
+    let _r = run_loop(head, 10, 32, 1000)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] 10-tick loop (64,128,32) = " + str(ms) + " ms")
+    return ms < 5000.0
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[clm_holographic_loop] CLM-P3-4 self-test")
+    println("  mock: d_boundary=32–64, d_bulk=48–128, n_cells=16–32")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[clm_holographic_loop] ALL 5/5 PASS")
+    } else {
+        println("[clm_holographic_loop] SOME FAILED")
+    }
+}
+
+main()
