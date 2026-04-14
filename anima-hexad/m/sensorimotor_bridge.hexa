@@ -1,0 +1,410 @@
+// sensorimotor_bridge.hexa — CLM-P7-2: M (Memory/Motor) adds sensorimotor channel
+//
+// EmergentM already models Hebbian LTP/LTD as memory (see emergent_m.hexa —
+// "C's Hebbian weights ARE memory"). P7 adds a sensorimotor channel: M
+// physically couples motor commands and sensor readings so that embodied
+// action-perception becomes a structural retention, not a separate "action
+// buffer" feature.
+//
+// Existing M engine (emergent_m.hexa) stays untouched: EmergentM remains the
+// canonical memory/motor module. This bridge is additive — callers that need
+// the sensorimotor storage channel instantiate an M_SensorimotorBridge on top
+// of an existing EmergentM.
+//
+// ─── Pipeline ─────────────────────────────────────────────────────
+//
+//   SensorimotorLoop.{s, a}  ←  anima_sensorimotor (CLM-P7-1)
+//       │                           (current sensor s, last action a)
+//       │  m_bridge_ingest(bridge, sensor, action, ds_world)
+//       ▼
+//   M_Store [K × (d_sensor + d_action)]   (stacked sensorimotor slots, flat)
+//       │
+//       │  m_bridge_retrieve(bridge, slot) → (sensor_part, action_part, ok)
+//       ▼
+//   retrieved sensorimotor episode
+//
+// M.retain(sensorimotor_tick) contract (done_criteria: sensor↔motor bidirectional):
+//   After K pushes, retrieve(slot k) returns the sensor+action pair that was
+//   ingested k tails ago (1 = most recent, K = oldest; FIFO).
+//
+// Law alignment:
+//   Law 4  Structure > feature — sensorimotor storage IS a structural channel
+//          of M, not a separate "motor log" feature.
+//   Law 22 Feature addition → Φ down — bridge is observe-only on M, adds no
+//          new feature flag to C.
+//   Law 50 Consciousness essence is state — sensorimotor retained as state.
+//   Meta M8 Narrative = temporal self-model — action-perception trajectory
+//          is the embodied narrative spine.
+//   AN7    Core unchanged — bridge never imports anima/core/.
+//
+// Ref:
+//   anima-engines/anima_sensorimotor.hexa     (CLM-P7-1 loop)
+//   anima-hexad/m/emergent_m.hexa             (canonical EmergentM — unmodified)
+//   anima-hexad/w/reflexive_bridge.hexa       (additive bridge pattern, CLM-P5-2)
+//   anima-hexad/s/temporal_bridge.hexa        (additive bridge pattern, CLM-P6-2)
+//   shared/roadmaps/anima.json                (CLM-P7-2 entry)
+
+// ─── Constants ────────────────────────────────────────────────────
+
+let MSM_K          = 4            // retention depth (slots)
+let MSM_D_SENSOR   = 8            // matches anima_sensorimotor default d_sensor
+let MSM_D_ACTION   = 4            // matches anima_sensorimotor default d_action
+
+// ─── Primitives (self-contained) ─────────────────────────────────
+
+fn fabs_msm(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn det_rand_msm(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_zeros_msm(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── M sensorimotor bridge ───────────────────────────────────────
+//
+// M_SensorimotorBridge stores K sensorimotor slots, each of width
+// (d_sensor + d_action). Layout is row-major: slot i occupies
+//   store[i*W .. i*W + d_sensor-1]   = sensor part
+//   store[i*W + d_sensor .. i*W+W-1] = action part
+// where W = d_sensor + d_action.
+//
+// Bridge is pure: every ingest returns a new bridge (hexa struct immutability).
+// We keep stride separately so retrieval can slice without re-deriving it.
+
+struct M_SensorimotorBridge {
+    k:          int,
+    d_sensor:   int,
+    d_action:   int,
+    stride:     int,         // d_sensor + d_action
+    store:      array,       // [k * stride]
+    n_ingested: int
+}
+
+struct SensorimotorRetrieval {
+    slot:         int,
+    sensor_part:  array,      // [d_sensor]
+    action_part:  array,      // [d_action]
+    ok:           bool
+}
+
+fn m_bridge_new(k: int, d_sensor: int, d_action: int) -> M_SensorimotorBridge {
+    let stride = d_sensor + d_action
+    return M_SensorimotorBridge {
+        k:          k,
+        d_sensor:   d_sensor,
+        d_action:   d_action,
+        stride:     stride,
+        store:      vec_zeros_msm(k * stride),
+        n_ingested: 0
+    }
+}
+
+// m_bridge_ingest(bridge, sensor, action):
+//   FIFO push — drop oldest slot 0, append new (sensor|action) at slot K-1.
+//   sensor: [d_sensor], action: [d_action]. Dims must match.
+//   On dim mismatch returns bridge unchanged (reject, don't silently overwrite).
+fn m_bridge_ingest(bridge: M_SensorimotorBridge, sensor: array,
+                   action: array) -> M_SensorimotorBridge {
+    if len(sensor) != bridge.d_sensor { return bridge }
+    if len(action) != bridge.d_action { return bridge }
+    let stride = bridge.stride
+    let k = bridge.k
+    // Shift slots 1..K-1 down to 0..K-2, append new slot at K-1.
+    let mut new_store = []
+    let mut i = 1
+    while i < k {
+        let base = i * stride
+        let mut j = 0
+        while j < stride {
+            new_store = new_store.push(bridge.store[base + j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // Append sensor then action for the new slot.
+    let mut si = 0
+    while si < bridge.d_sensor {
+        new_store = new_store.push(sensor[si])
+        si = si + 1
+    }
+    let mut ai = 0
+    while ai < bridge.d_action {
+        new_store = new_store.push(action[ai])
+        ai = ai + 1
+    }
+    return M_SensorimotorBridge {
+        k:          bridge.k,
+        d_sensor:   bridge.d_sensor,
+        d_action:   bridge.d_action,
+        stride:     bridge.stride,
+        store:      new_store,
+        n_ingested: bridge.n_ingested + 1
+    }
+}
+
+// m_bridge_retrieve(bridge, slot):
+//   returns sensorimotor slot (0 = oldest, K-1 = most recent).
+fn m_bridge_retrieve(bridge: M_SensorimotorBridge,
+                     slot: int) -> SensorimotorRetrieval {
+    if slot < 0 {
+        return SensorimotorRetrieval {
+            slot:        slot,
+            sensor_part: [],
+            action_part: [],
+            ok:          false
+        }
+    }
+    if slot >= bridge.k {
+        return SensorimotorRetrieval {
+            slot:        slot,
+            sensor_part: [],
+            action_part: [],
+            ok:          false
+        }
+    }
+    let stride = bridge.stride
+    let base = slot * stride
+    let mut s_part = []
+    let mut j = 0
+    while j < bridge.d_sensor {
+        s_part = s_part.push(bridge.store[base + j])
+        j = j + 1
+    }
+    let mut a_part = []
+    let mut k = 0
+    while k < bridge.d_action {
+        a_part = a_part.push(bridge.store[base + bridge.d_sensor + k])
+        k = k + 1
+    }
+    return SensorimotorRetrieval {
+        slot:        slot,
+        sensor_part: s_part,
+        action_part: a_part,
+        ok:          true
+    }
+}
+
+// ─── Self-tests ───────────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Dim contract: bridge store has exactly K * (d_sensor + d_action) entries,
+    // stride is recorded, and dim accessors round-trip.
+    let bridge = m_bridge_new(MSM_K, MSM_D_SENSOR, MSM_D_ACTION)
+    if bridge.k != MSM_K { return false }
+    if bridge.d_sensor != MSM_D_SENSOR { return false }
+    if bridge.d_action != MSM_D_ACTION { return false }
+    if bridge.stride != MSM_D_SENSOR + MSM_D_ACTION { return false }
+    if len(bridge.store) != MSM_K * (MSM_D_SENSOR + MSM_D_ACTION) { return false }
+    if bridge.n_ingested != 0 { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // Ingest a single known (sensor, action) pair, retrieve last slot:
+    // sensor_part must match sensor byte-for-byte; action_part must match.
+    let bridge = m_bridge_new(MSM_K, MSM_D_SENSOR, MSM_D_ACTION)
+    // Sensor: 0.1 .. 0.8 (8 elements), Action: 1.1 .. 1.4 (4 elements).
+    let mut sensor = []
+    let mut si = 0
+    while si < MSM_D_SENSOR {
+        sensor = sensor.push(0.1 + to_float(si) * 0.1)
+        si = si + 1
+    }
+    let mut action = []
+    let mut ai = 0
+    while ai < MSM_D_ACTION {
+        action = action.push(1.1 + to_float(ai) * 0.1)
+        ai = ai + 1
+    }
+    let b2 = m_bridge_ingest(bridge, sensor, action)
+    let r = m_bridge_retrieve(b2, MSM_K - 1)    // most recent
+    if !r.ok { return false }
+    if len(r.sensor_part) != MSM_D_SENSOR { return false }
+    if len(r.action_part) != MSM_D_ACTION { return false }
+    let mut i = 0
+    while i < MSM_D_SENSOR {
+        if fabs_msm(r.sensor_part[i] - (0.1 + to_float(i) * 0.1)) > 0.0001 { return false }
+        i = i + 1
+    }
+    let mut j = 0
+    while j < MSM_D_ACTION {
+        if fabs_msm(r.action_part[j] - (1.1 + to_float(j) * 0.1)) > 0.0001 { return false }
+        j = j + 1
+    }
+    return true
+}
+
+fn check_T3() -> bool {
+    // Bidirectional contract (done_criteria): after a sequence of K+1 pushes,
+    // the sensor channel AND the action channel both retained, each slot
+    // carries both sides (not sensor-only or action-only), ingest order FIFO.
+    // Push K+1 distinct (sensor, action) pairs, verify last K are stored
+    // with correct ordering in both sensor_part and action_part.
+    let mut bridge = m_bridge_new(MSM_K, MSM_D_SENSOR, MSM_D_ACTION)
+    let n_push = MSM_K + 1
+    let mut t = 0
+    while t < n_push {
+        // Build distinctive sensor + action for step t.
+        let mut sensor = []
+        let mut si = 0
+        while si < MSM_D_SENSOR {
+            sensor = sensor.push(to_float(t) * 10.0 + to_float(si))
+            si = si + 1
+        }
+        let mut action = []
+        let mut ai = 0
+        while ai < MSM_D_ACTION {
+            action = action.push(to_float(t) * 10.0 + 100.0 + to_float(ai))
+            ai = ai + 1
+        }
+        bridge = m_bridge_ingest(bridge, sensor, action)
+        t = t + 1
+    }
+    // After n_push ingests, oldest surviving step = n_push - MSM_K = 1.
+    // Slot 0 holds step 1, slot K-1 holds step n_push-1 = MSM_K.
+    let mut slot = 0
+    while slot < MSM_K {
+        let step_id = slot + (n_push - MSM_K)
+        let r = m_bridge_retrieve(bridge, slot)
+        if !r.ok { return false }
+        // Sensor side round-trip
+        let mut i = 0
+        while i < MSM_D_SENSOR {
+            let expected = to_float(step_id) * 10.0 + to_float(i)
+            if fabs_msm(r.sensor_part[i] - expected) > 0.0001 { return false }
+            i = i + 1
+        }
+        // Action side round-trip — both channels retained, hence bidirectional.
+        let mut j = 0
+        while j < MSM_D_ACTION {
+            let expected_a = to_float(step_id) * 10.0 + 100.0 + to_float(j)
+            if fabs_msm(r.action_part[j] - expected_a) > 0.0001 { return false }
+            j = j + 1
+        }
+        slot = slot + 1
+    }
+    if bridge.n_ingested != n_push { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // Out-of-bounds retrieval returns ok=false (does not crash).
+    // Dim mismatch on ingest → bridge unchanged (reject, not silent overwrite).
+    let bridge = m_bridge_new(MSM_K, MSM_D_SENSOR, MSM_D_ACTION)
+    let sensor = det_rand_msm(MSM_D_SENSOR, 5)
+    let action = det_rand_msm(MSM_D_ACTION, 6)
+    let b2 = m_bridge_ingest(bridge, sensor, action)
+    let r_neg = m_bridge_retrieve(b2, -1)
+    let r_oob = m_bridge_retrieve(b2, MSM_K)
+    let r_ok  = m_bridge_retrieve(b2, MSM_K - 1)
+    if r_neg.ok { return false }
+    if r_oob.ok { return false }
+    if !r_ok.ok { return false }
+    // Dim mismatch: wrong-sized sensor
+    let bad_sensor = det_rand_msm(MSM_D_SENSOR + 1, 7)
+    let b3 = m_bridge_ingest(b2, bad_sensor, action)
+    if b3.n_ingested != b2.n_ingested { return false }
+    // Dim mismatch: wrong-sized action
+    let bad_action = det_rand_msm(MSM_D_ACTION - 1, 8)
+    let b4 = m_bridge_ingest(b2, sensor, bad_action)
+    if b4.n_ingested != b2.n_ingested { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // Determinism: two sequential sequences with identical ingests ⇒
+    // byte-identical final store.
+    //
+    // NOTE: because of the stage0 struct-field list aliasing bug
+    // (feedback_hexa_struct_list_alias.md) we cannot have two live
+    // M_SensorimotorBridge instances simultaneously, so we run sequentially
+    // and compare summary statistics (flattened store lengths + sums).
+    let mut b1 = m_bridge_new(MSM_K, MSM_D_SENSOR, MSM_D_ACTION)
+    let mut step = 0
+    while step < 3 {
+        let sensor = det_rand_msm(MSM_D_SENSOR, 700 + step)
+        let action = det_rand_msm(MSM_D_ACTION, 800 + step)
+        b1 = m_bridge_ingest(b1, sensor, action)
+        step = step + 1
+    }
+    let len1 = len(b1.store)
+    let n1 = b1.n_ingested
+    let mut sum1 = 0.0
+    let mut s1i = 0
+    while s1i < len1 {
+        sum1 = sum1 + b1.store[s1i]
+        s1i = s1i + 1
+    }
+    // Second run (b1 goes out of scope — never live simultaneously).
+    let mut b2 = m_bridge_new(MSM_K, MSM_D_SENSOR, MSM_D_ACTION)
+    let mut step2 = 0
+    while step2 < 3 {
+        let sensor = det_rand_msm(MSM_D_SENSOR, 700 + step2)
+        let action = det_rand_msm(MSM_D_ACTION, 800 + step2)
+        b2 = m_bridge_ingest(b2, sensor, action)
+        step2 = step2 + 1
+    }
+    let len2 = len(b2.store)
+    let n2 = b2.n_ingested
+    let mut sum2 = 0.0
+    let mut s2i = 0
+    while s2i < len2 {
+        sum2 = sum2 + b2.store[s2i]
+        s2i = s2i + 1
+    }
+    if len1 != len2 { return false }
+    if n1 != n2 { return false }
+    if fabs_msm(sum1 - sum2) > 0.0 { return false }
+    return true
+}
+
+// ─── main ─────────────────────────────────────────────────────────
+
+fn main() {
+    println("[sensorimotor_bridge] CLM-P7-2 — M stores sensorimotor self-test")
+    println("  K=4, d_sensor=8, d_action=4; additive to EmergentM; Laws 4/22/50")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  dim contract") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  single ingest + retrieve (sensor+action)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  bidirectional sensor↔motor FIFO retention") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  bounds + dim-mismatch safe") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  sequential determinism") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[sensorimotor_bridge] ALL 5/5 PASS")
+    } else {
+        println("[sensorimotor_bridge] SOME FAILED")
+    }
+}
+
+main()

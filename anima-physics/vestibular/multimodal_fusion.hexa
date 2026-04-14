@@ -1,0 +1,241 @@
+// multimodal_fusion.hexa — PHYS-P7-3 vestibular/haptic multimodal fusion
+//
+// Roadmap: shared/roadmaps/anima.json P7 PHYSICS track, PHYS-P7-3
+//   "vestibular/haptic integration — multimodal sensor fusion"
+//
+// Purpose:
+//   An embodied agent maintains its sense of "where am I and what is
+//   touching me?" by continually integrating three physically distinct
+//   sensory streams:
+//     - vestibular (v)   — inner-ear head-orientation estimate
+//     - haptic (h)       — skin-level contact force estimate
+//     - visual (vis)     — optic-flow self-motion estimate
+//
+//   Each stream reports the *same* egocentric direction (e.g. "my
+//   body is tilted 0.3 rad to the right"), but each with its own
+//   reliability.  The optimal Bayesian fusion, assuming Gaussian
+//   noise with known precisions (π_v, π_h, π_vis), is the
+//   precision-weighted average (Ernst & Banks 2002; Kording 2004):
+//
+//       θ̂ = (π_v · v + π_h · h + π_vis · vis) / (π_v + π_h + π_vis)
+//
+//   This is the physical substrate of *Varela sensorimotor binding*
+//   across modalities — how a single coherent body schema emerges
+//   from heterogeneous receptor populations.  Without it the brain
+//   gets double-images and proprioceptive drift.
+//
+// Exposed API (roadmap spec):
+//   fuse(v: float, h: float, vis: float, precisions: [float]) -> float
+//     - v, h, vis  — modality estimates (any unit, but same per call)
+//     - precisions — length-3 list [π_v, π_h, π_vis], each ≥ 0
+//     - returns the precision-weighted posterior mean.
+//
+//   Degenerate handling:
+//     - If all precisions are 0 → return arithmetic mean of the 3
+//       modalities (uninformative prior).
+//     - Negative precisions are clamped to 0 (precision must be ≥ 0).
+//
+// Self-test (PASS/FAIL):
+//   T1 equal precision → plain mean.  π = [1,1,1] → (v+h+vis)/3.
+//   T2 dominant modality takes over — π = [1000, 1, 1] → θ̂ ≈ v.
+//   T3 ignored modality has zero influence — π = [1, 0, 1], vis=999
+//       still gives result in the range [min(v,h), max(v,h)].
+//   T4 API contract:
+//     - len(precisions) == 3 required (return NaN-guard → arithmetic
+//       mean of all given modalities when wrong length).
+//     - negative precisions silently clamped.
+//     - all-zero precisions → arithmetic mean.
+//   T5 determinism — two calls on the same args give bit-identical
+//     output.
+//
+// Hexa constraints honored:
+//   - HEXA-FIRST (pure .hexa)
+//   - flat [float] lists
+//   - no multi-float struct returns (hexa 0.1.0-stage1 field-read bug)
+//   - single-line `return A op B op C` (multi-line return only keeps
+//     the first term in this build — verified 2026-04-15)
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let N_MODALITIES = 3          // vestibular, haptic, visual
+let EPSILON      = 0.000000001
+
+// ═══════════════════════════════════════════════════════════════
+// Scalar helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// Clamp precision to ≥ 0 — precision is 1/σ², which is intrinsically
+// non-negative.
+fn clamp_nonneg(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    return x
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Exposed API — fuse(v, h, vis, precisions) → θ̂
+//
+//   θ̂ = (Σ π_i · x_i) / (Σ π_i)
+//
+// Edge cases:
+//   - Σπ == 0                        → arithmetic mean (π = 1/N each)
+//   - len(precisions) != 3           → arithmetic mean (defensive)
+//   - π_i < 0                        → clamp to 0
+// ═══════════════════════════════════════════════════════════════
+
+fn fuse(v: float, h: float, vis: float, precisions: [float]) -> float {
+    // Defensive length guard — wrong length falls back to uniform mean.
+    if len(precisions) != N_MODALITIES {
+        return (v + h + vis) / to_float(N_MODALITIES)
+    }
+    let pv  = clamp_nonneg(precisions[0])
+    let ph  = clamp_nonneg(precisions[1])
+    let pvs = clamp_nonneg(precisions[2])
+    let total = pv + ph + pvs
+    if total < EPSILON {
+        // All-zero precision ⇒ no information in the precisions;
+        // return uniform arithmetic mean.
+        return (v + h + vis) / to_float(N_MODALITIES)
+    }
+    return (pv * v + ph * h + pvs * vis) / total
+}
+
+// Convenience — build a precisions list.
+fn precisions_of(pv: float, ph: float, pvs: float) -> [float] {
+    let mut p: [float] = []
+    p = p.push(pv)
+    p = p.push(ph)
+    p = p.push(pvs)
+    return p
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1_equal_precisions() -> bool {
+    // π = [1, 1, 1] ⇒ θ̂ = (v + h + vis) / 3
+    let v = 0.3
+    let h = 0.5
+    let vis = 0.1
+    let pr = precisions_of(1.0, 1.0, 1.0)
+    let out = fuse(v, h, vis, pr)
+    let want = (v + h + vis) / 3.0
+    let err = fabs(out - want)
+    let ok = err < 0.0000001
+    println("  [T1] π=[1,1,1] fuse=" + str(out) + " want=" + str(want)
+        + " err=" + str(err))
+    return ok
+}
+
+fn check_T2_dominant_modality() -> bool {
+    // Vestibular is ~1000× more precise than the other two. Result
+    // should be pinned to the vestibular estimate.
+    let v = 0.7
+    let h = 0.0 - 0.5
+    let vis = 0.2
+    let pr = precisions_of(1000.0, 1.0, 1.0)
+    let out = fuse(v, h, vis, pr)
+    // Theoretical: (1000*0.7 + 1*(-0.5) + 1*0.2) / 1002 =
+    //              (700 + (-0.5) + 0.2) / 1002 = 699.7 / 1002 ≈ 0.6983
+    // Which should be within 0.005 of v=0.7
+    let err_from_v = fabs(out - v)
+    let ok = err_from_v < 0.005
+    println("  [T2] π=[1000,1,1] fuse=" + str(out) + " |fuse−v|=" + str(err_from_v))
+    return ok
+}
+
+fn check_T3_ignored_modality() -> bool {
+    // π_vis = 0 — visual stream has ZERO information. The fused
+    // estimate must lie within [min(v,h), max(v,h)], ignoring vis=999.
+    let v = 0.2
+    let h = 0.4
+    let vis = 999.0                   // huge but zero-precision → must be ignored
+    let pr = precisions_of(1.0, 1.0, 0.0)
+    let out = fuse(v, h, vis, pr)
+    let lo = if v < h { v } else { h }
+    let hi = if v > h { v } else { h }
+    let in_range = out >= lo && out <= hi
+    // More specifically: theoretical = (v + h) / 2 = 0.3
+    let want = (v + h) / 2.0
+    let err = fabs(out - want)
+    let ok = in_range && err < 0.0000001
+    println("  [T3] π=[1,1,0] fuse=" + str(out) + " (expect 0.3) in_range=" + str(in_range))
+    return ok
+}
+
+fn check_T4_api_contract() -> bool {
+    // Wrong length → arithmetic mean.
+    let mut short_p: [float] = []
+    short_p = short_p.push(1.0)
+    short_p = short_p.push(2.0)                   // length 2 (wrong)
+    let out_short = fuse(0.3, 0.5, 0.1, short_p)
+    let want_short = (0.3 + 0.5 + 0.1) / 3.0
+    let ok_short = fabs(out_short - want_short) < 0.0000001
+    // Empty precisions → arithmetic mean.
+    let empty: [float] = []
+    let out_empty = fuse(0.3, 0.5, 0.1, empty)
+    let ok_empty = fabs(out_empty - want_short) < 0.0000001
+    // Negative precision clamped → equivalent to 0.
+    let neg_p = precisions_of(0.0 - 1.0, 1.0, 1.0)
+    let out_neg = fuse(0.3, 0.5, 0.1, neg_p)
+    // With pv=0, ph=1, pvs=1: (0.5 + 0.1)/2 = 0.3
+    let want_neg = (0.5 + 0.1) / 2.0
+    let ok_neg = fabs(out_neg - want_neg) < 0.0000001
+    // All-zero precisions → arithmetic mean.
+    let zero_p = precisions_of(0.0, 0.0, 0.0)
+    let out_zero = fuse(0.3, 0.5, 0.1, zero_p)
+    let ok_zero = fabs(out_zero - want_short) < 0.0000001
+    let ok = ok_short && ok_empty && ok_neg && ok_zero
+    println("  [T4] short=" + str(out_short) + " empty=" + str(out_empty)
+        + " neg=" + str(out_neg) + " zero=" + str(out_zero))
+    return ok
+}
+
+fn check_T5_determinism() -> bool {
+    // Same inputs → same output, bit-identical.
+    let pr = precisions_of(2.7, 1.3, 0.9)
+    let a = fuse(0.111, 0.222, 0.0 - 0.333, pr)
+    let b = fuse(0.111, 0.222, 0.0 - 0.333, pr)
+    let d = fabs(a - b)
+    let ok = d == 0.0
+    println("  [T5] two calls: a=" + str(a) + " b=" + str(b) + " Δ=" + str(d))
+    return ok
+}
+
+fn test() {
+    println("[vestibular/multimodal_fusion] PHYS-P7-3 — vestibular/haptic/visual fusion")
+    println("  θ̂ = Σ π_i · x_i / Σ π_i   (precision-weighted Bayes)")
+    println("")
+
+    let t1 = check_T1_equal_precisions()
+    if t1 { println("T1 PASS — equal precisions → arithmetic mean") } else { println("T1 FAIL") }
+
+    let t2 = check_T2_dominant_modality()
+    if t2 { println("T2 PASS — dominant precision pins the estimate") } else { println("T2 FAIL") }
+
+    let t3 = check_T3_ignored_modality()
+    if t3 { println("T3 PASS — zero-precision modality is ignored") } else { println("T3 FAIL") }
+
+    let t4 = check_T4_api_contract()
+    if t4 { println("T4 PASS — API guards (length, empty, negative, zero)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5_determinism()
+    if t5 { println("T5 PASS — deterministic fuse()") } else { println("T5 FAIL") }
+
+    println("")
+    let all = t1 && t2 && t3 && t4 && t5
+    if all {
+        println("[vestibular/multimodal_fusion] 5/5 PASS — PHYS-P7-3 DONE")
+    } else {
+        println("[vestibular/multimodal_fusion] SOME FAILED")
+    }
+}
+
+test()

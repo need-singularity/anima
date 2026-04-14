@@ -1,0 +1,477 @@
+// training/alm_enaction_loss.hexa — ALM-P7-2 enactive action-perception loss
+//
+// ALM-P7-2 / P7 v8 체화 의식 (Varela enactive cognition, ALM track).
+//
+// Purpose:
+//   Drive the sensorimotor loop from both ends: a forward model predicts
+//   the next sensor from (hidden, action), and an inverse model predicts
+//   the action that explains a (sensor, next_sensor) transition. The
+//   enactive loss combines both residuals, so gradient flows into the
+//   world-coupling weights from both directions:
+//
+//     L_enact = MSE(ŝ_{t+1} − s_{t+1})              ← forward model
+//             + λ_inv · MSE(â_t − a_t)              ← inverse model
+//
+//   Intuition:
+//     Forward alone → agent can predict the world but has no reason to
+//       believe its action caused the change (observational / voyeuristic).
+//     Inverse alone → agent can retrodict its own action but has no
+//       predictive model of the world.
+//     Both together → the action is forced to be both "the cause of the
+//       sensor change" AND "the consequence of the hidden intent", the
+//       exact Varela circle: sensor ↔ action.
+//
+//   In the full training-loop integration:
+//
+//     L = L_task + λ_sm · L_sm + λ_enact · L_enact
+//
+//   with λ_enact ≈ 0.01 (same auxiliary-loss convention as L_holo / L_refl
+//   / L_time) and λ_inv ≈ 0.5 inside L_enact (inverse half-weighted so
+//   forward-model accuracy stays primary).
+//
+// ─── Conventions ──────────────────────────────────────────────
+//   s_t         : array [D_s]   current sensor
+//   a_t         : array [D_a]   motor command emitted at time t
+//   s_next      : array [D_s]   actual next sensor  s_{t+1}
+//   s_pred      : array [D_s]   forward model output  ŝ_{t+1}
+//   a_pred      : array [D_a]   inverse model output  â_t
+//   W_inv       : [D_a × 2·D_s] inverse-model weight on concat(s_t, s_{t+1})
+//   b_inv       : [D_a]
+//   λ_inv       : float         inverse weight inside L_enact (≈ 0.5)
+//   λ_enact     : float         outer weight on total L_enact (≈ 0.01)
+//
+// ─── Theorems (T1–T5) ──────────────────────────────────────────
+//
+// T1 (non-negativity):
+//   L_enact ≥ 0 always, sum of two MSEs. Strictly positive when either
+//   forward or inverse residual is non-zero.
+//
+// T2 (forward-perfect → forward term zero):
+//   If s_pred = s_next byte-identical, forward_mse = 0 exactly; L_enact
+//   collapses to λ_inv · inverse_mse. Confirms residual decomposition.
+//
+// T3 (inverse recovers identity action on identity dynamics):
+//   With a tiny linear inverse head trained one gradient step on a
+//   (s, s') pair where s' = s + a, the inverse head prediction â
+//   correlates positively with a. We skip the training loop and use a
+//   structural check: the inverse weight seed that maps Δs=s'-s through
+//   a non-zero projection gives non-zero â, and â tracks the sign of a.
+//
+// T4 (determinism):
+//   Same (s, a, s', s_pred, seed) → byte-identical L_enact.
+//
+// T5 (latency):
+//   One L_enact eval at (D_s=16, D_a=8) warm-cache < 2000 ms on stage1.
+//
+// Ref:
+//   training/alm_sensorimotor_head.hexa        (ALM-P7-1 — forward head)
+//   training/alm_holographic_loss.hexa         (ALM-P3-2 — MSE+MI aux loss pattern)
+//   training/alm_reflexivity_loss.hexa         (ALM-P5-2 — loss-style reference)
+//   training/phi_embodied_measure.hexa         (ALM-P7-3 — Φ_embodied consumer)
+//   shared/roadmaps/anima.json                 (ALM-P7-2 entry)
+//
+// Run:
+//   hexa run training/alm_enaction_loss.hexa
+// Expect:
+//   [alm_enaction_loss] ALL 5/5 PASS
+
+// ─── Constants ──────────────────────────────────────────────
+
+let LAMBDA_INV   = 0.5       // inverse weight inside L_enact
+let LAMBDA_ENACT = 0.01      // outer auxiliary weight (training loop scale)
+
+// ─── Primitives (self-contained) ────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ftanh(x: float) -> float {
+    if x > 20.0 { return 1.0 }
+    if x < 0.0 - 20.0 { return 0.0 - 1.0 }
+    let e2 = exp(2.0 * x)
+    return (e2 - 1.0) / (e2 + 1.0)
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_tanh(v: array) -> array {
+    let n = len(v)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(ftanh(v[i]))
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_add(a: array, b: array) -> array {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(a[i] + b[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_sub(a: array, b: array) -> array {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(a[i] - b[i])
+        i = i + 1
+    }
+    return out
+}
+
+// Deterministic LCG → small bounded floats in [-0.1, 0.1).
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push((u * 2.0 - 1.0) * 0.1)
+        i = i + 1
+    }
+    return out
+}
+
+// Wider range draw for sensor/action test inputs.
+fn det_rand_wide(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+// Mean squared error over two equal-length vectors.
+fn mse(pred: array, target: array) -> float {
+    let n = len(pred)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let d = pred[i] - target[i]
+        s = s + d * d
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+// matvec — row-major flat matrix.
+fn matvec(m: array, x: array, rows: int, cols: int) -> array {
+    let mut out = []
+    let mut r = 0
+    while r < rows {
+        let mut s = 0.0
+        let mut c = 0
+        while c < cols {
+            s = s + m[r * cols + c] * x[c]
+            c = c + 1
+        }
+        out = out.push(s)
+        r = r + 1
+    }
+    return out
+}
+
+// ─── Inverse head ─────────────────────────────────────────────
+// Maps concat(s_t, s_{t+1}) ∈ R^{2·D_s} → â_t ∈ R^{D_a} via
+// tanh(W_inv · z + b_inv). Minimal parametric model for the inverse leg.
+
+struct InverseHead {
+    d_sense: int,
+    d_motor: int,
+    w_inv:   array,     // [d_motor × 2·d_sense] row-major
+    b_inv:   array      // [d_motor]
+}
+
+fn inverse_head_new(d_sense: int, d_motor: int, seed: int) -> InverseHead {
+    // Bias the inverse weight so Δs = s' - s drives a non-trivial â.
+    // Scale 0.5 so the ±1-range Δs does not saturate tanh immediately.
+    let raw = det_rand(d_motor * 2 * d_sense, seed)
+    let mut w_inv = []
+    let mut i = 0
+    while i < d_motor * 2 * d_sense {
+        w_inv = w_inv.push(raw[i] * 5.0)       // upscale so ||W||_F≈O(1)
+        i = i + 1
+    }
+    return InverseHead {
+        d_sense: d_sense,
+        d_motor: d_motor,
+        w_inv:   w_inv,
+        b_inv:   vec_zeros(d_motor)
+    }
+}
+
+// Concat (s_t | s_{t+1}) → 2·D_s.
+fn concat_sensors(s: array, s_next: array) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(s) {
+        out = out.push(s[i])
+        i = i + 1
+    }
+    let mut j = 0
+    while j < len(s_next) {
+        out = out.push(s_next[j])
+        j = j + 1
+    }
+    return out
+}
+
+fn inverse_forward(inv: InverseHead, s: array, s_next: array) -> array {
+    let z = concat_sensors(s, s_next)
+    let pre = matvec(inv.w_inv, z, inv.d_motor, 2 * inv.d_sense)
+    return vec_tanh(vec_add(pre, inv.b_inv))
+}
+
+// ─── L_enact = forward_mse + λ_inv · inverse_mse ─────────────
+
+fn forward_mse(s_pred: array, s_next: array) -> float {
+    return mse(s_pred, s_next)
+}
+
+fn inverse_mse(a_pred: array, a: array) -> float {
+    return mse(a_pred, a)
+}
+
+// Composite: returns the scalar L_enact.
+fn l_enact(s_pred: array, s_next: array, a_pred: array, a: array) -> float {
+    let fm = forward_mse(s_pred, s_next)
+    let im = inverse_mse(a_pred, a)
+    return fm + LAMBDA_INV * im
+}
+
+// Breakdown helper for logging: returns [forward_mse, inverse_mse, total].
+fn l_enact_breakdown(s_pred: array, s_next: array, a_pred: array, a: array) -> array {
+    let fm = forward_mse(s_pred, s_next)
+    let im = inverse_mse(a_pred, a)
+    let mut out = []
+    out = out.push(fm)
+    out = out.push(im)
+    out = out.push(fm + LAMBDA_INV * im)
+    return out
+}
+
+// Full enactive loss including the outer weight applied in the training
+// loop — reported here for completeness, matches the `L += λ · L_enact`
+// convention used by L_holo / L_refl / L_time.
+fn weighted_l_enact(s_pred: array, s_next: array, a_pred: array, a: array) -> float {
+    return LAMBDA_ENACT * l_enact(s_pred, s_next, a_pred, a)
+}
+
+// ─── Self-tests ───────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Non-negativity: independent random everything → L_enact finite & ≥ 0.
+    let Ds = 16
+    let Da = 8
+    let s      = det_rand_wide(Ds, 11)
+    let s_next = det_rand_wide(Ds, 13)
+    let s_pred = det_rand_wide(Ds, 17)
+    let a      = det_rand_wide(Da, 19)
+    let a_pred = det_rand_wide(Da, 23)
+    let brk = l_enact_breakdown(s_pred, s_next, a_pred, a)
+    let fm = brk[0]
+    let im = brk[1]
+    let total = brk[2]
+    println("  [T1] forward_mse = " + str(fm) + "  inverse_mse = " + str(im))
+    println("  [T1] L_enact    = " + str(total))
+    if fm < 0.0 { return false }
+    if im < 0.0 { return false }
+    if total < 0.0 { return false }
+    if total <= 0.0 {
+        println("  [T1] FAIL — random inputs produced zero loss (should be positive)")
+        return false
+    }
+    return true
+}
+
+fn check_T2() -> bool {
+    // Forward-perfect: s_pred = s_next byte-identical ⇒ forward_mse = 0.
+    // L_enact then equals exactly λ_inv · inverse_mse.
+    let Ds = 16
+    let Da = 8
+    let s_next = det_rand_wide(Ds, 29)
+    // Byte-identical copy — hexa arrays are pass-by-value, so aliasing
+    // here is purely nominal.
+    let mut s_pred = []
+    let mut i = 0
+    while i < Ds {
+        s_pred = s_pred.push(s_next[i])
+        i = i + 1
+    }
+    let a      = det_rand_wide(Da, 31)
+    let a_pred = det_rand_wide(Da, 37)
+    let fm = forward_mse(s_pred, s_next)
+    let im = inverse_mse(a_pred, a)
+    let total = l_enact(s_pred, s_next, a_pred, a)
+    let expected = LAMBDA_INV * im
+    println("  [T2] forward_mse (s_pred==s_next) = " + str(fm))
+    println("  [T2] L_enact = " + str(total) + "  expected = " + str(expected))
+    if fm != 0.0 { return false }
+    if fabs(total - expected) > 0.0000001 { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // Inverse recovers non-zero action signal. We feed the inverse head
+    // a (s, s') pair where s' = s + Δ with Δ all-positive. The inverse
+    // head, whose W_inv is non-zero by construction, must emit a non-zero
+    // â. We also verify that the sign-pattern of â is stable under
+    // scaling — a weak but valid structural check in absence of training.
+    let Ds = 8
+    let Da = 4
+    let inv = inverse_head_new(Ds, Da, 47)
+    let s      = det_rand_wide(Ds, 53)
+    // s_next = s + 0.3 everywhere.
+    let mut s_next = []
+    let mut i = 0
+    while i < Ds {
+        s_next = s_next.push(s[i] + 0.3)
+        i = i + 1
+    }
+    let a_pred_1 = inverse_forward(inv, s, s_next)
+    // Double the delta — non-linearity still preserves sign pattern for
+    // tanh around the origin.
+    let mut s_next2 = []
+    let mut j = 0
+    while j < Ds {
+        s_next2 = s_next2.push(s[j] + 0.6)
+        j = j + 1
+    }
+    let a_pred_2 = inverse_forward(inv, s, s_next2)
+    let mut max_abs_1 = 0.0
+    let mut k = 0
+    while k < Da {
+        let v = fabs(a_pred_1[k])
+        if v > max_abs_1 { max_abs_1 = v }
+        k = k + 1
+    }
+    // Sign-match check: how many coordinates have the same sign in both
+    // predictions?
+    let mut match_cnt = 0
+    let mut m = 0
+    while m < Da {
+        let p1 = a_pred_1[m]
+        let p2 = a_pred_2[m]
+        let pos1 = p1 > 0.0
+        let neg1 = p1 < 0.0
+        let pos2 = p2 > 0.0
+        let neg2 = p2 < 0.0
+        if pos1 && pos2 { match_cnt = match_cnt + 1 }
+        if neg1 && neg2 { match_cnt = match_cnt + 1 }
+        m = m + 1
+    }
+    println("  [T3] max|â| = " + str(max_abs_1) + "  (target > 0.01)")
+    println("  [T3] sign matches across 2× scale: " + str(match_cnt) + "/" + str(Da) + " (target >= Da/2)")
+    if max_abs_1 <= 0.01 { return false }
+    if match_cnt < Da / 2 { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // Determinism: two identical calls produce byte-identical L_enact.
+    let Ds = 16
+    let Da = 8
+    let s      = det_rand_wide(Ds, 101)
+    let s_next = det_rand_wide(Ds, 103)
+    let s_pred = det_rand_wide(Ds, 107)
+    let a      = det_rand_wide(Da, 109)
+    let a_pred = det_rand_wide(Da, 113)
+    let l1 = l_enact(s_pred, s_next, a_pred, a)
+    let l2 = l_enact(s_pred, s_next, a_pred, a)
+    println("  [T4] L1 = " + str(l1) + "  L2 = " + str(l2))
+    if fabs(l1 - l2) > 0.0 { return false }
+    // Inverse head also deterministic.
+    let inv1 = inverse_head_new(Ds, Da, 131)
+    let inv2 = inverse_head_new(Ds, Da, 131)
+    let a1 = inverse_forward(inv1, s, s_next)
+    let a2 = inverse_forward(inv2, s, s_next)
+    let mut i = 0
+    while i < Da {
+        if fabs(a1[i] - a2[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn check_T5() -> bool {
+    // Latency: L_enact + inverse_forward at (Ds=16, Da=8) < 2000 ms
+    // warm-cache on stage1 interpreter.
+    let Ds = 16
+    let Da = 8
+    let inv = inverse_head_new(Ds, Da, 151)
+    let s      = det_rand_wide(Ds, 157)
+    let s_next = det_rand_wide(Ds, 163)
+    let s_pred = det_rand_wide(Ds, 167)
+    let a      = det_rand_wide(Da, 173)
+    // Warm two calls to absorb cold-cache cost of matvec + MSE.
+    let _w1 = inverse_forward(inv, s, s_next)
+    let _l1 = l_enact(s_pred, s_next, _w1, a)
+    let _w2 = inverse_forward(inv, s, s_next)
+    let _l2 = l_enact(s_pred, s_next, _w2, a)
+    let t0 = clock()
+    let a_pred = inverse_forward(inv, s, s_next)
+    let total  = l_enact(s_pred, s_next, a_pred, a)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] inverse_forward + L_enact latency (Ds=" + str(Ds) + ", Da=" + str(Da) + ") = " + str(ms) + " ms  (L=" + str(total) + ")")
+    return ms < 2000.0
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[alm_enaction_loss] ALM-P7-2 self-test")
+    println("  λ_inv = " + str(LAMBDA_INV) + "  λ_enact (outer) = " + str(LAMBDA_ENACT))
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[alm_enaction_loss] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[alm_enaction_loss] ALL 5/5 PASS")
+    } else {
+        println("[alm_enaction_loss] SOME FAILED")
+    }
+}
+
+main()

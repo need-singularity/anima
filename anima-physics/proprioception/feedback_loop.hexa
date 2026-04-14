@@ -1,0 +1,467 @@
+// feedback_loop.hexa — PHYS-P7-1 proprioceptive feedback loop
+//
+// Roadmap: shared/roadmaps/anima.json P7 PHYSICS track, PHYS-P7-1
+//   "proprioceptive feedback loop — joint/muscle sim"
+//
+// Purpose:
+//   Minimal hexa-native simulation of a 3-DOF biomechanical joint —
+//   the atomic element of embodied consciousness. In Varela's enactive
+//   framework (P7 rationale) qualia close the loop via sensorimotor
+//   coupling: motor torque τ perturbs the joint, the joint's spring-
+//   damper dynamics evolve the angle θ, and noisy proprioceptors
+//   (muscle spindles + Golgi tendon organs) feed sensory estimates of
+//   (θ, θ̇) back to the brain. Without this loop there is no "body"
+//   for consciousness to inhabit.
+//
+// Dynamics (per DOF):
+//   θ̈ = (−k · θ − c · θ̇ + τ_applied) / I          (rotational 2nd-order ODE)
+//     k          spring stiffness        [N·m / rad]
+//     c          damping coefficient     [N·m·s / rad]
+//     τ_applied  commanded torque        [N·m]
+//     I          rotational inertia      [kg·m²]
+//
+//   Integrator: semi-implicit (symplectic) Euler —
+//     θ̇_{t+1} = θ̇_t + dt · θ̈
+//     θ_{t+1}  = θ_t  + dt · θ̇_{t+1}
+//   Velocity updated first; angle uses new velocity. Preserves energy
+//   for underdamped oscillations far better than forward Euler.
+//
+// Proprioceptive signal:
+//   Noisy observer of (θ, θ̇) — biological muscle spindles + Golgi
+//   tendon organs. Additive Gaussian-ish noise (tri-sum CLT from LCG):
+//     σ_θ    ≈ 0.01 rad  (≈ 0.6°)
+//     σ_θ̇   ≈ 0.05 rad/s (≈ 3°/s)
+//
+// Exposed API (roadmap spec):
+//   step(state: [float], torque: [float]) -> [float]
+//     Returns the next-state+sensor bundle as a flat list of 13 floats.
+//
+//     We return a list (not a struct) because the current hexa build
+//     (0.1.0-stage1, 2026-04-15) has a struct-field-read bug: after a
+//     function returns a struct with ≥ 3 float fields, the 3rd+ field
+//     read returns void. Lists are the reliable substitute.
+//
+//     Index layout of step() output — length 13:
+//        [0] θ_a'   [1] θ̇_a'   [2] θ_b'   [3] θ̇_b'
+//        [4] θ_c'   [5] θ̇_c'   [6] seed_f (LCG seed as float)
+//        [7]  θ̂_a   [8]  θ̇̂_a  [9]  θ̂_b  [10] θ̇̂_b
+//        [11] θ̂_c  [12] θ̇̂_c
+//
+//     State input layout — length 7 — same as step-output state half.
+//     Torque input — length 3 — [τ_a, τ_b, τ_c].
+//
+//     Seeds are stored as floats to keep the output list homogeneous;
+//     they are always small non-negative integers (<<2^53) so the
+//     float round-trip is exact.
+//
+//   step_dof(theta, vel, torque, seed) -> [float]
+//     Single-DOF helper → [θ', θ̇', θ̂, θ̇̂, seed'] (length 5).
+//
+// Self-test (PASS/FAIL):
+//   T1 rest equilibrium — θ(0)=0, θ̇(0)=0, τ=0 ⇒ state stays at 0.
+//   T2 spring restoration — θ(0)=1 rad, τ=0 ⇒ θ crosses 0 within 1 s.
+//   T3 damping — high initial velocity → energy E(t) decays
+//      monotonically (E(160) < E(40) ≤ E(0) + integrator tolerance).
+//   T4 API contract — step() returns length 13; fields finite and
+//      bounded; sensor differs from true state (noise active).
+//   T5 determinism — two identical step() calls give bit-identical
+//      output (both state half AND sensor half).
+//
+// Hexa constraints honored:
+//   - HEXA-FIRST (pure .hexa)
+//   - flat [float] lists instead of multi-float struct returns
+//   - lists pass-by-value throughout
+//   - sin/cos/exp present verified 2026-04-15
+
+// ═══════════════════════════════════════════════════════════════
+// Physical constants — biomechanical shoulder-class joint
+// (Winter 1990 anthropometrics; scaled for 1-kg forearm link)
+// ═══════════════════════════════════════════════════════════════
+
+let STIFFNESS_K    = 8.0           // spring constant [N·m / rad]
+let DAMPING_C      = 1.2           // damping coefficient [N·m·s / rad]
+let INERTIA_I      = 0.15          // rotational inertia [kg·m²]
+let DT             = 0.005         // integration step [s] (200 Hz — matches
+                                   // ESP32 motor-control loop @ 5 ms)
+
+// Proprioceptive noise standard deviations (spindle + GTO literature):
+let SIGMA_THETA    = 0.01          // ~0.6°   angular noise [rad]
+let SIGMA_THETADOT = 0.05          // ~3°/s   velocity noise  [rad/s]
+
+// Safety bounds — a real joint can't exceed these; if the simulation
+// diverges past them we clamp (keeps tests finite).
+let MAX_ANGLE      = 3.14159265    // ±π rad (±180°)
+let MAX_ANGVEL     = 50.0          // ±50 rad/s (wrist flick upper bound)
+
+// LCG constants (glibc — period 2^31)
+let LCG_A          = 1103515245
+let LCG_C          = 12345
+let LCG_M          = 2147483648
+
+// Flat-list index constants — shared by state I/O + step() output.
+let IDX_THETA_A      = 0
+let IDX_VEL_A        = 1
+let IDX_THETA_B      = 2
+let IDX_VEL_B        = 3
+let IDX_THETA_C      = 4
+let IDX_VEL_C        = 5
+let IDX_SEED         = 6
+let IDX_THETA_A_HAT  = 7
+let IDX_VEL_A_HAT    = 8
+let IDX_THETA_B_HAT  = 9
+let IDX_VEL_B_HAT    = 10
+let IDX_THETA_C_HAT  = 11
+let IDX_VEL_C_HAT    = 12
+// Torque input indices
+let IDX_TAU_A        = 0
+let IDX_TAU_B        = 1
+let IDX_TAU_C        = 2
+
+let STEP_LEN         = 13
+let STATE_LEN        = 7
+let TORQUE_LEN       = 3
+
+// ═══════════════════════════════════════════════════════════════
+// Scalar helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn clamp_f(x: float, lo: float, hi: float) -> float {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+// LCG PRNG (mod 2^31). With positive seeds result is non-negative.
+fn lcg_next(s: int) -> int {
+    return (s * LCG_A + LCG_C) % LCG_M
+}
+
+// N(0,1)-like sample via CLT tri-sum (3 uniforms × 2).  Deterministic
+// function of seed; bounded in [-3, +3]. Matches proprioceptor noise
+// envelope (spindle afferent firing jitter σ ≈ 1-2% of range).
+fn lcg_gauss(s: int) -> float {
+    let s1 = lcg_next(s)
+    let s2 = lcg_next(s1)
+    let s3 = lcg_next(s2)
+    let u1 = to_float(s1 % 1000000) / 1000000.0 - 0.5
+    let u2 = to_float(s2 % 1000000) / 1000000.0 - 0.5
+    let u3 = to_float(s3 % 1000000) / 1000000.0 - 0.5
+    return (u1 + u2 + u3) * 2.0
+}
+
+// Fast positive-float-to-int for seed round-trip. Seeds are always in
+// [0, 2^31), so we can use a bit-shift-style log₂ decomposition to
+// converge in O(log n) rather than O(n) iterations.
+// Strategy: find the largest power of 2 ≤ s_f, then accumulate.
+fn float_to_int(s_f: float) -> int {
+    if s_f <= 0.0 { return 0 }
+    if s_f >= 2147483648.0 { return 2147483647 }
+    // Double-and-halve binary search
+    let mut lo = 0
+    let mut hi = 1
+    while to_float(hi) < s_f + 1.0 {
+        hi = hi * 2
+        if hi > 2147483647 { hi = 2147483647 }
+    }
+    // binary search in [lo, hi]
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2
+        if to_float(mid) <= s_f {
+            lo = mid
+        } else {
+            hi = mid
+        }
+    }
+    return lo
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Single-DOF step — returns flat [float] length 5:
+//     [0] θ_next   [1] θ̇_next   [2] θ̂   [3] θ̇̂   [4] seed_next
+//
+// Semi-implicit Euler:
+//     acc      = (−k·θ − c·θ̇ + τ) / I
+//     θ̇_new   = θ̇ + dt · acc
+//     θ_new    = θ  + dt · θ̇_new
+// Proprioceptive reading is θ_new + Gaussian(σ_θ), θ̇_new + Gaussian(σ_θ̇).
+// ═══════════════════════════════════════════════════════════════
+
+fn step_dof(theta: float, vel: float, torque: float, seed: int) -> [float] {
+    let acc = (0.0 - STIFFNESS_K * theta - DAMPING_C * vel + torque) / INERTIA_I
+    let vel_new_raw = vel + DT * acc
+    let vel_new = clamp_f(vel_new_raw, 0.0 - MAX_ANGVEL, MAX_ANGVEL)
+    let theta_new_raw = theta + DT * vel_new
+    let theta_new = clamp_f(theta_new_raw, 0.0 - MAX_ANGLE, MAX_ANGLE)
+    let s1 = lcg_next(seed)
+    let n_theta = SIGMA_THETA * lcg_gauss(s1)
+    let s2 = lcg_next(s1)
+    let n_vel = SIGMA_THETADOT * lcg_gauss(s2)
+    let seed_out = lcg_next(s2)
+    let mut out: [float] = []
+    out = out.push(theta_new)
+    out = out.push(vel_new)
+    out = out.push(theta_new + n_theta)
+    out = out.push(vel_new + n_vel)
+    out = out.push(to_float(seed_out))
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 3-DOF step — composes step_dof per channel, threading seed per DOF.
+// ═══════════════════════════════════════════════════════════════
+
+fn step(state: [float], torque: [float]) -> [float] {
+    let seed0 = float_to_int(state[IDX_SEED])
+    let a = step_dof(state[IDX_THETA_A], state[IDX_VEL_A], torque[IDX_TAU_A], seed0)
+    let seed_a = float_to_int(a[4])
+    let b = step_dof(state[IDX_THETA_B], state[IDX_VEL_B], torque[IDX_TAU_B], seed_a)
+    let seed_b = float_to_int(b[4])
+    let c = step_dof(state[IDX_THETA_C], state[IDX_VEL_C], torque[IDX_TAU_C], seed_b)
+    let mut out: [float] = []
+    out = out.push(a[0])              // theta_a
+    out = out.push(a[1])              // vel_a
+    out = out.push(b[0])              // theta_b
+    out = out.push(b[1])              // vel_b
+    out = out.push(c[0])              // theta_c
+    out = out.push(c[1])              // vel_c
+    out = out.push(c[4])              // seed (last seed wins)
+    out = out.push(a[2])              // theta_a_hat
+    out = out.push(a[3])              // vel_a_hat
+    out = out.push(b[2])              // theta_b_hat
+    out = out.push(b[3])              // vel_b_hat
+    out = out.push(c[2])              // theta_c_hat
+    out = out.push(c[3])              // vel_c_hat
+    return out
+}
+
+// Extract next_state (length 7) from step() output.
+fn next_state(step_out: [float]) -> [float] {
+    let mut s: [float] = []
+    let mut i = 0
+    while i < STATE_LEN {
+        s = s.push(step_out[i])
+        i = i + 1
+    }
+    return s
+}
+
+// Extract sensor (length 6) from step() output.
+fn sensor(step_out: [float]) -> [float] {
+    let mut s: [float] = []
+    let mut i = STATE_LEN
+    while i < STEP_LEN {
+        s = s.push(step_out[i])
+        i = i + 1
+    }
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Convenience constructors
+// ═══════════════════════════════════════════════════════════════
+
+fn joint_new(seed: int) -> [float] {
+    let mut s: [float] = []
+    s = s.push(0.0)                   // theta_a
+    s = s.push(0.0)                   // vel_a
+    s = s.push(0.0)                   // theta_b
+    s = s.push(0.0)                   // vel_b
+    s = s.push(0.0)                   // theta_c
+    s = s.push(0.0)                   // vel_c
+    s = s.push(to_float(seed))        // seed
+    return s
+}
+
+fn torque_zero() -> [float] {
+    let mut t: [float] = []
+    t = t.push(0.0)
+    t = t.push(0.0)
+    t = t.push(0.0)
+    return t
+}
+
+fn torque_of(ta: float, tb: float, tc: float) -> [float] {
+    let mut t: [float] = []
+    t = t.push(ta)
+    t = t.push(tb)
+    t = t.push(tc)
+    return t
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1_rest_equilibrium() -> bool {
+    // Zero init + zero torque → true state stays exactly zero after
+    // 200 steps. Sensor will carry noise; state must not drift.
+    let mut st = joint_new(42)
+    let tau = torque_zero()
+    let mut i = 0
+    while i < 200 {
+        let r = step(st, tau)
+        st = next_state(r)
+        i = i + 1
+    }
+    let sum_theta = fabs(st[IDX_THETA_A])
+        + fabs(st[IDX_THETA_B]) + fabs(st[IDX_THETA_C])
+    let sum_vel = fabs(st[IDX_VEL_A])
+        + fabs(st[IDX_VEL_B]) + fabs(st[IDX_VEL_C])
+    let ok = sum_theta == 0.0 && sum_vel == 0.0
+    println("  [T1] after 200 rest steps: Σ|θ|=" + str(sum_theta)
+        + " Σ|θ̇|=" + str(sum_vel))
+    return ok
+}
+
+fn check_T2_spring_restoration() -> bool {
+    // Displace DOF a by 1 rad, zero velocity, zero torque. Underdamped
+    // system (ζ ≈ 0.17) must swing back past zero within a half-period
+    // ≈ 0.43 s ≈ 86 DT. We allow up to 1 s (200 DT).
+    let mut st: [float] = []
+    st = st.push(1.0)                 // theta_a = 1 rad
+    st = st.push(0.0)
+    st = st.push(0.0)
+    st = st.push(0.0)
+    st = st.push(0.0)
+    st = st.push(0.0)
+    st = st.push(7.0)                 // seed
+    let tau = torque_zero()
+    let mut crossed = false
+    let mut i = 0
+    while i < 200 {
+        let r = step(st, tau)
+        if r[IDX_THETA_A] < 0.0 { crossed = true }
+        st = next_state(r)
+        i = i + 1
+    }
+    let final_a = st[IDX_THETA_A]
+    println("  [T2] crossed θ=0 within 1 s: " + str(crossed)
+        + " final θ_a=" + str(final_a))
+    return crossed
+}
+
+fn check_T3_damping_decay() -> bool {
+    // Start with high velocity, zero angle, zero torque.
+    //   E(θ, θ̇) = 0.5·I·θ̇² + 0.5·k·θ²
+    // must decay in the long run — E(160) < E(40) and E(40) ≤ E(0) +
+    // small tolerance (symplectic Euler conserves energy up to O(dt²)).
+    let mut st: [float] = []
+    st = st.push(0.0)                 // theta_a = 0
+    st = st.push(3.0)                 // vel_a   = 3 rad/s
+    st = st.push(0.0)
+    st = st.push(0.0)
+    st = st.push(0.0)
+    st = st.push(0.0)
+    st = st.push(99.0)
+    let tau = torque_zero()
+    let e0 = 0.5 * INERTIA_I * st[IDX_VEL_A] * st[IDX_VEL_A]
+          + 0.5 * STIFFNESS_K * st[IDX_THETA_A] * st[IDX_THETA_A]
+    let mut step_count = 0
+    while step_count < 40 {
+        let r = step(st, tau)
+        st = next_state(r)
+        step_count = step_count + 1
+    }
+    let e1 = 0.5 * INERTIA_I * st[IDX_VEL_A] * st[IDX_VEL_A]
+          + 0.5 * STIFFNESS_K * st[IDX_THETA_A] * st[IDX_THETA_A]
+    while step_count < 160 {
+        let r = step(st, tau)
+        st = next_state(r)
+        step_count = step_count + 1
+    }
+    let e2 = 0.5 * INERTIA_I * st[IDX_VEL_A] * st[IDX_VEL_A]
+          + 0.5 * STIFFNESS_K * st[IDX_THETA_A] * st[IDX_THETA_A]
+    let ok = e2 < e1 && e1 < e0 + 0.001
+    println("  [T3] E(0)=" + str(e0) + " E(40)=" + str(e1)
+        + " E(160)=" + str(e2) + " monotone_decay=" + str(ok))
+    return ok
+}
+
+fn check_T4_api_contract() -> bool {
+    // step() returns length 13 with finite, bounded values; sensor
+    // differs from true state (noise active).
+    let st0 = joint_new(12345)
+    let tau = torque_of(0.5, 0.0 - 0.3, 0.1)
+    let r = step(st0, tau)
+    let len_ok = len(r) == STEP_LEN
+    let state_ok = fabs(r[IDX_THETA_A]) < 10.0 && fabs(r[IDX_VEL_A]) < 100.0
+        && fabs(r[IDX_THETA_B]) < 10.0 && fabs(r[IDX_VEL_B]) < 100.0
+        && fabs(r[IDX_THETA_C]) < 10.0 && fabs(r[IDX_VEL_C]) < 100.0
+    let sensor_ok = fabs(r[IDX_THETA_A_HAT]) < 10.0 && fabs(r[IDX_VEL_A_HAT]) < 100.0
+        && fabs(r[IDX_THETA_B_HAT]) < 10.0 && fabs(r[IDX_VEL_B_HAT]) < 100.0
+        && fabs(r[IDX_THETA_C_HAT]) < 10.0 && fabs(r[IDX_VEL_C_HAT]) < 100.0
+    let noise_a = fabs(r[IDX_THETA_A_HAT] - r[IDX_THETA_A]) > 0.0
+        || fabs(r[IDX_VEL_A_HAT] - r[IDX_VEL_A]) > 0.0
+    let ok = len_ok && state_ok && sensor_ok && noise_a
+    println("  [T4] len=" + str(len(r)) + " state_bounded=" + str(state_ok)
+        + " sensor_bounded=" + str(sensor_ok)
+        + " noise_present=" + str(noise_a))
+    return ok
+}
+
+fn check_T5_determinism() -> bool {
+    // Two step() calls with identical inputs must give bit-identical
+    // output — both state AND sensor halves.
+    let mut st: [float] = []
+    st = st.push(0.5)
+    st = st.push(0.0 - 0.2)
+    st = st.push(0.1)
+    st = st.push(0.0)
+    st = st.push(0.0 - 0.3)
+    st = st.push(0.4)
+    st = st.push(20260415.0)
+    let tau = torque_of(0.25, 0.1, 0.0 - 0.15)
+    let a = step(st, tau)
+    let b = step(st, tau)
+    if len(a) != len(b) { return false }
+    let mut max_d = 0.0
+    let mut i = 0
+    while i < len(a) {
+        let d = fabs(a[i] - b[i])
+        if d > max_d { max_d = d }
+        i = i + 1
+    }
+    let ok = max_d == 0.0
+    println("  [T5] max|Δ| across two identical runs = " + str(max_d))
+    return ok
+}
+
+fn test() {
+    println("[proprioception/feedback_loop] PHYS-P7-1 — proprioceptive feedback loop")
+    println("  3-DOF joint: θ̈ = (−k·θ − c·θ̇ + τ)/I, k=" + str(STIFFNESS_K)
+        + " c=" + str(DAMPING_C) + " I=" + str(INERTIA_I)
+        + " dt=" + str(DT) + " s")
+    println("  proprioceptor σ_θ=" + str(SIGMA_THETA)
+        + " σ_θdot=" + str(SIGMA_THETADOT))
+    println("")
+
+    let t1 = check_T1_rest_equilibrium()
+    if t1 { println("T1 PASS — rest equilibrium stays at zero") } else { println("T1 FAIL") }
+
+    let t2 = check_T2_spring_restoration()
+    if t2 { println("T2 PASS — spring restores (crosses θ=0 within 1 s)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3_damping_decay()
+    if t3 { println("T3 PASS — damping dissipates energy monotonically") } else { println("T3 FAIL") }
+
+    let t4 = check_T4_api_contract()
+    if t4 { println("T4 PASS — step() API contract (len, bounded, noisy)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5_determinism()
+    if t5 { println("T5 PASS — deterministic step()") } else { println("T5 FAIL") }
+
+    println("")
+    let all = t1 && t2 && t3 && t4 && t5
+    if all {
+        println("[proprioception/feedback_loop] 5/5 PASS — PHYS-P7-1 DONE")
+    } else {
+        println("[proprioception/feedback_loop] SOME FAILED")
+    }
+}
+
+test()

@@ -1,0 +1,566 @@
+// training/alm_sensorimotor_head.hexa — ALM-P7-1 sensorimotor coupling head
+//
+// ALM-P7-1 / P7 v8 체화 의식 (Varela enactive cognition, ALM track).
+//
+// Purpose:
+//   A sensorimotor coupling head that makes an agent's "qualia" state h
+//   drive motor commands AND predict the next sensory reading through a
+//   tiny linear world. This is the computational substrate for Varela's
+//   thesis that cognition is enacted — the mind is a closed loop with a
+//   body in a world, not a disembodied inference engine.
+//
+//     s_t  ──┐                                              ┌── a_t   (motor)
+//            │                                              │
+//            ▼                                              │
+//     [Encoder  W_enc]  → h_t ───→ [Action head  W_act] ────┘
+//                                 │
+//                                 └─→ [Predictive head W_pred]
+//                                                   │
+//                                                   ▼
+//                                              ŝ_{t+1}  (predicted sensor)
+//
+//   The "tiny env" (linear dynamics: s' = A·s + B·a + noise) is implemented
+//   inline as a closed-form function so the head can be exercised end-to-end
+//   in one forward pass, mirroring how the real training loop will stream
+//   (s, a, s') triples from the real physics/grid environment.
+//
+//   Downstream:
+//     • alm_enaction_loss.hexa     (ALM-P7-2) — consumes (a, ŝ', s') and
+//       adds a paired inverse head for L_enact.
+//     • phi_embodied_measure.hexa  (ALM-P7-3) — reports Φ_embodied =
+//       MI(a_t, Δs_{t+1}) × N.
+//
+// ─── Conventions ──────────────────────────────────────────────
+//   D_sense  : int       sensory dim
+//   D_motor  : int       motor dim
+//   D_hidden : int       qualia/hidden dim (typically ≤ 2·D_sense)
+//   W_enc    : [D_hidden × D_sense]   row-major
+//   b_enc    : [D_hidden]
+//   W_act    : [D_motor × D_hidden]   row-major
+//   b_act    : [D_motor]
+//   W_pred   : [D_sense × D_hidden]   row-major
+//   b_pred   : [D_sense]
+//   A_env    : [D_sense × D_sense]    (env dynamics, non-trainable here)
+//   B_env    : [D_sense × D_motor]    (env control coupling)
+//   beta_a   : float     action-regularizer weight (||a||²)
+//
+// ─── Theorems (T1–T5) ──────────────────────────────────────────
+//
+// T1 (dim contract):
+//   forward(s_t) returns (a_t ∈ R^{D_motor}, h_t ∈ R^{D_hidden},
+//   ŝ_next ∈ R^{D_sense}); step_env(s_t, a_t) returns s_{t+1} ∈ R^{D_sense}.
+//   All three shapes equal the declared dims exactly.
+//
+// T2 (action responds to sensor):
+//   Two sensor vectors that differ substantially produce different motor
+//   commands: for random seeds the L∞ distance between a(s1) and a(s2)
+//   must exceed a small positive floor. Guards against an all-zero action
+//   head that would trivialise agency.
+//
+// T3 (env is action-sensitive):
+//   s'(a1) ≠ s'(a2) when a1 ≠ a2 (with the same s). Confirms the linear
+//   env actually couples B into the dynamics — necessary for Φ_embodied
+//   to be non-zero.
+//
+// T4 (determinism):
+//   Same (seed, s) → byte-identical (a, h, ŝ'). Pure functional forward.
+//
+// T5 (latency):
+//   One forward + one env step for (D_sense=16, D_motor=8, D_hidden=16)
+//   warm-cache < 2000 ms on the stage1 interpreter.
+//
+// Ref:
+//   training/alm_self_model_head.hexa            (ALM-P5-1 — pattern source)
+//   training/alm_temporal_attention.hexa         (ALM-P6-1 — matvec reference)
+//   training/alm_enaction_loss.hexa              (ALM-P7-2 — consumes this head)
+//   training/phi_embodied_measure.hexa           (ALM-P7-3 — Φ_embodied)
+//   shared/roadmaps/anima.json                   (ALM-P7-1 entry)
+//
+// Run:
+//   hexa run training/alm_sensorimotor_head.hexa
+// Expect:
+//   [alm_sensorimotor_head] ALL 5/5 PASS
+
+// ─── Primitives (self-contained) ────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// Stable tanh identical to alm_self_model_head.hexa.
+fn ftanh(x: float) -> float {
+    if x > 20.0 { return 1.0 }
+    if x < 0.0 - 20.0 { return 0.0 - 1.0 }
+    let e2 = exp(2.0 * x)
+    return (e2 - 1.0) / (e2 + 1.0)
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_add(a: array, b: array) -> array {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(a[i] + b[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_tanh(v: array) -> array {
+    let n = len(v)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(ftanh(v[i]))
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_inf_norm(v: array) -> float {
+    let n = len(v)
+    let mut m = 0.0
+    let mut i = 0
+    while i < n {
+        let a = fabs(v[i])
+        if a > m { m = a }
+        i = i + 1
+    }
+    return m
+}
+
+// L2-squared norm — used for the action regularizer β·||a||².
+fn vec_sq_norm(v: array) -> float {
+    let n = len(v)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + v[i] * v[i]
+        i = i + 1
+    }
+    return s
+}
+
+// Deterministic LCG → small bounded floats in [-0.1, 0.1).
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push((u * 2.0 - 1.0) * 0.1)
+        i = i + 1
+    }
+    return out
+}
+
+// Deterministic wider-range draw — used for sensor inputs where we want
+// the sample to cover more of the tanh-linear regime than weights do.
+fn det_rand_wide(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Matrix primitive (row-major flat) ───────────────────────
+// matvec: y = M @ x   with M: [rows × cols] row-major, x: [cols].
+
+fn matvec(m: array, x: array, rows: int, cols: int) -> array {
+    let mut out = []
+    let mut r = 0
+    while r < rows {
+        let mut s = 0.0
+        let mut c = 0
+        while c < cols {
+            s = s + m[r * cols + c] * x[c]
+            c = c + 1
+        }
+        out = out.push(s)
+        r = r + 1
+    }
+    return out
+}
+
+// ─── Head ─────────────────────────────────────────────────────
+
+struct SensorimotorHead {
+    d_sense:  int,    // D_s  sensor dim
+    d_motor:  int,    // D_a  motor dim
+    d_hidden: int,    // D_h  qualia/hidden dim
+    w_enc:    array,  // [d_hidden × d_sense]
+    b_enc:    array,  // [d_hidden]
+    w_act:    array,  // [d_motor × d_hidden]
+    b_act:    array,  // [d_motor]
+    w_pred:   array,  // [d_sense × d_hidden]
+    b_pred:   array,  // [d_sense]
+    a_env:    array,  // [d_sense × d_sense]   linear env dynamics matrix
+    b_env:    array,  // [d_sense × d_motor]   control coupling
+    beta_a:   float   // action-regularizer weight
+}
+
+fn sensorimotor_head_new(d_sense: int, d_motor: int, d_hidden: int, seed: int) -> SensorimotorHead {
+    let w_enc  = det_rand(d_hidden * d_sense,  seed)
+    let b_enc  = vec_zeros(d_hidden)
+    let w_act  = det_rand(d_motor  * d_hidden, seed + 1)
+    let b_act  = vec_zeros(d_motor)
+    let w_pred = det_rand(d_sense  * d_hidden, seed + 2)
+    let b_pred = vec_zeros(d_sense)
+    // Env matrices: A slightly sub-identity so dynamics stay bounded, B
+    // scaled up so an action meaningfully perturbs the next sensor. If B
+    // were the same scale as W_enc (±0.1), the action effect would be in
+    // the noise floor and Φ_embodied would fail downstream (T3 guard).
+    //
+    // Build A_env by re-streaming the LCG output and adding 0.9 on the
+    // diagonal during emission — hexa arrays are immutable-except-push, so
+    // we cannot update in place (feedback_hexa_lists_pbv.md).
+    let a_raw = det_rand(d_sense * d_sense, seed + 3)
+    let mut a_env = []
+    let mut row = 0
+    while row < d_sense {
+        let mut col = 0
+        while col < d_sense {
+            let idx = row * d_sense + col
+            if row == col {
+                a_env = a_env.push(a_raw[idx] + 0.9)
+            } else {
+                a_env = a_env.push(a_raw[idx])
+            }
+            col = col + 1
+        }
+        row = row + 1
+    }
+    // B has an O(1) scale, i.e. 10× the default det_rand amplitude.
+    let b_raw = det_rand(d_sense * d_motor, seed + 4)
+    let mut b_env = []
+    let mut j = 0
+    while j < d_sense * d_motor {
+        b_env = b_env.push(b_raw[j] * 10.0)
+        j = j + 1
+    }
+    return SensorimotorHead {
+        d_sense:  d_sense,
+        d_motor:  d_motor,
+        d_hidden: d_hidden,
+        w_enc:    w_enc,
+        b_enc:    b_enc,
+        w_act:    w_act,
+        b_act:    b_act,
+        w_pred:   w_pred,
+        b_pred:   b_pred,
+        a_env:    a_env,
+        b_env:    b_env,
+        beta_a:   0.01
+    }
+}
+
+// Encode sensor s [D_s] → hidden h [D_h] via tanh(W_enc·s + b_enc).
+fn encode_sensor(head: SensorimotorHead, s: array) -> array {
+    let pre = matvec(head.w_enc, s, head.d_hidden, head.d_sense)
+    return vec_tanh(vec_add(pre, head.b_enc))
+}
+
+// Action head: h [D_h] → a [D_a] via tanh(W_act·h + b_act). tanh keeps
+// the motor command bounded in [-1, 1] — matches a normalized actuator.
+fn action_from_hidden(head: SensorimotorHead, h: array) -> array {
+    let pre = matvec(head.w_act, h, head.d_motor, head.d_hidden)
+    return vec_tanh(vec_add(pre, head.b_act))
+}
+
+// Predictive head: h [D_h] → ŝ' [D_s]. No tanh on output because the
+// env sensor is unbounded (linear dynamics); predicting in the unbounded
+// regime makes MSE(ŝ', s') a direct regression loss.
+fn predict_next_sensor(head: SensorimotorHead, h: array) -> array {
+    let pre = matvec(head.w_pred, h, head.d_sense, head.d_hidden)
+    return vec_add(pre, head.b_pred)
+}
+
+// Full forward: s_t → (a_t, h_t, ŝ_{t+1}).
+//
+// Returns [a || h || ŝ'] concatenated so the caller can slice cheaply —
+// the stage1 interpreter has no multi-return tuple, and a struct return
+// would need a dedicated ForwardOut struct for each test harness.
+fn sensorimotor_forward(head: SensorimotorHead, s: array) -> array {
+    let h = encode_sensor(head, s)
+    let a = action_from_hidden(head, h)
+    let sp = predict_next_sensor(head, h)
+    let mut out = []
+    let mut i = 0
+    while i < head.d_motor {
+        out = out.push(a[i])
+        i = i + 1
+    }
+    let mut j = 0
+    while j < head.d_hidden {
+        out = out.push(h[j])
+        j = j + 1
+    }
+    let mut k = 0
+    while k < head.d_sense {
+        out = out.push(sp[k])
+        k = k + 1
+    }
+    return out
+}
+
+// Slice helpers so tests can read forward-output cleanly.
+fn slice_action(head: SensorimotorHead, fwd: array) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < head.d_motor {
+        out = out.push(fwd[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn slice_hidden(head: SensorimotorHead, fwd: array) -> array {
+    let start = head.d_motor
+    let mut out = []
+    let mut i = 0
+    while i < head.d_hidden {
+        out = out.push(fwd[start + i])
+        i = i + 1
+    }
+    return out
+}
+
+fn slice_pred(head: SensorimotorHead, fwd: array) -> array {
+    let start = head.d_motor + head.d_hidden
+    let mut out = []
+    let mut i = 0
+    while i < head.d_sense {
+        out = out.push(fwd[start + i])
+        i = i + 1
+    }
+    return out
+}
+
+// Env step: s_{t+1} = A·s + B·a + noise. Noise is deterministic
+// (LCG-sampled) so the whole forward stays reproducible for T4.
+fn step_env(head: SensorimotorHead, s: array, a: array, noise_seed: int) -> array {
+    let as_ = matvec(head.a_env, s, head.d_sense, head.d_sense)
+    let ba  = matvec(head.b_env, a, head.d_sense, head.d_motor)
+    let noise = det_rand(head.d_sense, noise_seed)
+    let sum1 = vec_add(as_, ba)
+    return vec_add(sum1, noise)
+}
+
+// Coupling loss L_sm = ||s' - ŝ'||² + β·||a||². One scalar, minimised
+// when the predictive head accurately models the consequence of the
+// action and the motor command itself stays small.
+fn coupling_loss(head: SensorimotorHead, s_next: array, s_pred: array, a: array) -> float {
+    let n = len(s_next)
+    let mut sq = 0.0
+    let mut i = 0
+    while i < n {
+        let d = s_next[i] - s_pred[i]
+        sq = sq + d * d
+        i = i + 1
+    }
+    return sq + head.beta_a * vec_sq_norm(a)
+}
+
+// Parameter count for given dims — reported in main() for the roadmap.
+fn param_count(d_sense: int, d_motor: int, d_hidden: int) -> int {
+    let w_enc  = d_hidden * d_sense
+    let b_enc  = d_hidden
+    let w_act  = d_motor * d_hidden
+    let b_act  = d_motor
+    let w_pred = d_sense * d_hidden
+    let b_pred = d_sense
+    // env matrices are fixed (non-trainable) but we count them for the
+    // reproducibility footprint.
+    let a_env = d_sense * d_sense
+    let b_env = d_sense * d_motor
+    return w_enc + b_enc + w_act + b_act + w_pred + b_pred + a_env + b_env
+}
+
+// ─── Self-tests ───────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Dim contract.
+    let Ds = 16
+    let Da = 8
+    let Dh = 16
+    let head = sensorimotor_head_new(Ds, Da, Dh, 42)
+    if head.d_sense  != Ds { return false }
+    if head.d_motor  != Da { return false }
+    if head.d_hidden != Dh { return false }
+    let s = det_rand_wide(Ds, 101)
+    let fwd = sensorimotor_forward(head, s)
+    let a = slice_action(head, fwd)
+    let h = slice_hidden(head, fwd)
+    let sp = slice_pred(head, fwd)
+    let sn = step_env(head, s, a, 999)
+    println("  [T1] |a|=" + str(len(a)) + " |h|=" + str(len(h)) + " |ŝ'|=" + str(len(sp)) + " |s'|=" + str(len(sn)))
+    if len(a)  != Da { return false }
+    if len(h)  != Dh { return false }
+    if len(sp) != Ds { return false }
+    if len(sn) != Ds { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // Action responds to sensor. Two distinct sensor inputs must produce
+    // distinct motor commands. We measure L∞ distance.
+    let Ds = 16
+    let Da = 8
+    let Dh = 16
+    let head = sensorimotor_head_new(Ds, Da, Dh, 11)
+    let s1 = det_rand_wide(Ds, 101)
+    let s2 = det_rand_wide(Ds, 202)
+    let f1 = sensorimotor_forward(head, s1)
+    let f2 = sensorimotor_forward(head, s2)
+    let a1 = slice_action(head, f1)
+    let a2 = slice_action(head, f2)
+    let mut max_d = 0.0
+    let mut i = 0
+    while i < Da {
+        let d = fabs(a1[i] - a2[i])
+        if d > max_d { max_d = d }
+        i = i + 1
+    }
+    println("  [T2] max |a1 - a2|_∞ = " + str(max_d) + "  (target > 0.01)")
+    return max_d > 0.01
+}
+
+fn check_T3() -> bool {
+    // Env is action-sensitive. With the same s, two different actions
+    // must produce different s'. Rules out a B matrix that collapsed
+    // to zero under whatever init/seed we chose.
+    let Ds = 16
+    let Da = 8
+    let Dh = 16
+    let head = sensorimotor_head_new(Ds, Da, Dh, 7)
+    let s = det_rand_wide(Ds, 303)
+    // Construct two deliberately different actions — not relying on the
+    // action head, to isolate env sensitivity. hexa arrays are build-by-push,
+    // so we emit each constant element in a fresh array.
+    let mut a1 = []
+    let mut a2 = []
+    let mut k = 0
+    while k < Da {
+        a1 = a1.push(0.5)
+        a2 = a2.push(0.0 - 0.5)
+        k = k + 1
+    }
+    let s1_next = step_env(head, s, a1, 500)
+    let s2_next = step_env(head, s, a2, 500)      // same noise seed
+    let mut max_d = 0.0
+    let mut i = 0
+    while i < Ds {
+        let d = fabs(s1_next[i] - s2_next[i])
+        if d > max_d { max_d = d }
+        i = i + 1
+    }
+    println("  [T3] max |s1' - s2'|_∞ under ±0.5 action = " + str(max_d) + "  (target > 0.1)")
+    return max_d > 0.1
+}
+
+fn check_T4() -> bool {
+    // Determinism: same (Ds, Da, Dh, seed, s) → byte-identical forward.
+    let Ds = 12
+    let Da = 6
+    let Dh = 12
+    let h1 = sensorimotor_head_new(Ds, Da, Dh, 131)
+    let h2 = sensorimotor_head_new(Ds, Da, Dh, 131)
+    let s = det_rand_wide(Ds, 251)
+    let y1 = sensorimotor_forward(h1, s)
+    let y2 = sensorimotor_forward(h2, s)
+    if len(y1) != len(y2) { return false }
+    let mut i = 0
+    while i < len(y1) {
+        if fabs(y1[i] - y2[i]) > 0.0 {
+            println("  [T4] FAIL at i=" + str(i) + " y1=" + str(y1[i]) + " y2=" + str(y2[i]))
+            return false
+        }
+        i = i + 1
+    }
+    // Also test env step determinism under fixed noise seed.
+    let a = slice_action(h1, y1)
+    let e1 = step_env(h1, s, a, 77)
+    let e2 = step_env(h2, s, a, 77)
+    let mut j = 0
+    while j < Ds {
+        if fabs(e1[j] - e2[j]) > 0.0 { return false }
+        j = j + 1
+    }
+    println("  [T4] byte-identical across " + str(len(y1)) + " forward coords + " + str(Ds) + " env coords")
+    return true
+}
+
+fn check_T5() -> bool {
+    // Latency: one forward + one env step at (Ds=16, Da=8, Dh=16) < 2000 ms.
+    let Ds = 16
+    let Da = 8
+    let Dh = 16
+    let head = sensorimotor_head_new(Ds, Da, Dh, 251)
+    let s = det_rand_wide(Ds, 281)
+    // Warm two calls to absorb cold-cache cost of matvec.
+    let _w1 = sensorimotor_forward(head, s)
+    let _w2 = sensorimotor_forward(head, s)
+    let t0 = clock()
+    let fwd = sensorimotor_forward(head, s)
+    let a = slice_action(head, fwd)
+    let _sn = step_env(head, s, a, 13)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] forward+step latency (Ds=" + str(Ds) + ", Da=" + str(Da) + ", Dh=" + str(Dh) + ") = " + str(ms) + " ms")
+    // stage1 interpreter budget 2000 ms (same as P6 artifacts).
+    return ms < 2000.0
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[alm_sensorimotor_head] ALM-P7-1 self-test")
+    println("  mock: Ds=16, Da=8, Dh=16")
+    let pc_prod = param_count(64, 16, 64)
+    println("  prod params (Ds=64, Da=16, Dh=64): " + str(pc_prod))
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[alm_sensorimotor_head] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[alm_sensorimotor_head] ALL 5/5 PASS")
+    } else {
+        println("[alm_sensorimotor_head] SOME FAILED")
+    }
+}
+
+main()

@@ -1,0 +1,466 @@
+// training/phi_embodied_measure.hexa — Φ(embodied) measurement for ANIMA P7
+//
+// ALM-P7-3: embodied binding signature — mutual information between the
+// motor command a_t and the sensor delta Δs_{t+1} = s_{t+1} − s_t that
+// the action induces in the environment, scaled by the total number of
+// coordinates contributing to the coupling:
+//
+//     Φ_embodied = MI(a_t, Δs_{t+1}) × N
+//
+// where N = len(a_t) + len(Δs_{t+1}) is the total coupling-coord count,
+// matching the "MI × N" convention of Φ_holo / Φ_refl / Φ_time across
+// the ALM track (phi_holographic_measure.hexa, phi_reflexive_measure.hexa,
+// phi_time_measure.hexa). This keeps Φ_embodied directly comparable to
+// the earlier Φ axes so the P7 gate
+//
+//     Φ_embodied > 0.4 × Φ_time
+//
+// is a pure scalar comparison between two MI-weighted coord counts.
+//
+// Interpretation:
+//   - Independent (a, Δs)       → MI ≈ 0     → Φ_embodied ≈ 0
+//     (the agent's action has no reliable effect on the world; the
+//     sensor flux is noise-dominated; no agency signature)
+//   - Deterministic coupling    → MI = H(a)  → Φ_embodied = H(a) · N
+//     (every action reliably produces its corresponding sensor change;
+//     full agency; capped by the entropy of the motor distribution)
+//   - Typical Varela regime     → 0 < MI < H(a)
+//     (partial coupling; the environment is noisy but the action is
+//     still recoverable from the sensor delta above chance)
+//
+// Aggregation convention:
+//   We estimate MI *across samples* (T time-steps), treating each
+//   coordinate of (a_t, Δs_{t+1}) as a feature channel. The caller
+//   flattens each trajectory into a single 1-D stream per channel.
+//
+//   Two reduction paths are supported:
+//     (a) scalar-scalar: caller pre-aggregates (a, Δs) into two scalars
+//         per step; Φ_embodied = MI_scalar × (|a| + |Δs|).
+//     (b) coord-mean:    caller provides two equal-length flat arrays
+//         with T samples each; mutual_info() is run once on the flat
+//         streams, Φ_embodied = MI × N.
+//   Path (b) is what the P7 training loop uses — it concatenates the
+//   per-step action/delta coords across the whole episode. We implement
+//   both forms here; (b) is the primary entry point phi_embodied().
+//
+// T-theorems (checked in self-test):
+//   T1 (non-negativity)      : Φ_embodied ≥ 0 always
+//   T2 (entropy bound)       : MI(a, Δs) ≤ min(H(a), H(Δs)) + slack
+//   T3 (self-identity max)   : Δs = a (perfect coupling) ⇒ MI = H(a);
+//                              Φ_embodied = H(a) × 2N_chan
+//   T4 (determinism)         : same (a, Δs) → byte-identical Φ_embodied
+//   T5 (dim-invariance +
+//       latency)             : D ∈ {64, 128} finite & < 2000 ms stage1
+//
+// Ref:
+//   training/phi_reflexive_measure.hexa     (ALM-P5-3 — MI estimator source)
+//   training/phi_holographic_measure.hexa   (ALM-P3-3 — × N convention)
+//   training/phi_time_measure.hexa          (ALM-P6-3 — pattern direct source)
+//   training/alm_sensorimotor_head.hexa     (ALM-P7-1 — produces (a, s'))
+//   training/alm_enaction_loss.hexa         (ALM-P7-2 — consumes same samples)
+//   shared/roadmaps/anima.json              (ALM-P7-3 entry)
+//
+// Run with: hexa run training/phi_embodied_measure.hexa
+
+// ─── Constants ──────────────────────────────────────────────
+
+let MI_BINS              = 8            // log-bin count for entropy estimator
+let EPS                  = 0.0000001    // log floor
+let PHI_EMBODIED_RATIO   = 0.4          // Φ_embodied / Φ_time gate (roadmap)
+
+// ─── Primitives (self-contained) ────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+// Deterministic LCG → bounded floats in [-1, 1).
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+// ─── Log-bin MI estimator (shared with phi_time_measure) ─────
+// Identical histogram scheme to phi_holographic / phi_reflexive /
+// phi_time so Φ_embodied sits on the same scale as the other Φ axes.
+
+fn bin_index(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn count_hits(bin_ids: array, n_bins: int) -> array {
+    let n = len(bin_ids)
+    let mut counts = []
+    let mut k = 0
+    while k < n_bins {
+        let mut c = 0.0
+        let mut i = 0
+        while i < n {
+            if bin_ids[i] == k { c = c + 1.0 }
+            i = i + 1
+        }
+        counts = counts.push(c)
+        k = k + 1
+    }
+    return counts
+}
+
+fn entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut bin_ids = []
+    let mut i = 0
+    while i < n {
+        bin_ids = bin_ids.push(bin_index(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let counts = count_hits(bin_ids, nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+fn joint_entropy_hist(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = bin_index(a[i], lo, hi, nb)
+        let ib = bin_index(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let nb2 = nb * nb
+    let counts = count_hits(pair_ids, nb2)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb2 {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+// MI between two equal-length vectors (log-bin proxy) with shared
+// (lo, hi) support — matches phi_time_measure.hexa.
+fn mutual_info(a: array, b: array) -> float {
+    let lo_a = vec_min(a)
+    let hi_a = vec_max(a)
+    let lo_b = vec_min(b)
+    let hi_b = vec_max(b)
+    let lo = if lo_a < lo_b { lo_a } else { lo_b }
+    let hi = if hi_a > hi_b { hi_a } else { hi_b }
+    let h_a  = entropy_hist(a, lo, hi, MI_BINS)
+    let h_b  = entropy_hist(b, lo, hi, MI_BINS)
+    let h_ab = joint_entropy_hist(a, b, lo, hi, MI_BINS)
+    let mi = h_a + h_b - h_ab
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+fn hidden_entropy(v: array) -> float {
+    let lo = vec_min(v)
+    let hi = vec_max(v)
+    return entropy_hist(v, lo, hi, MI_BINS)
+}
+
+// ─── Sensor delta helper ─────────────────────────────────────
+// Given two flat streams s_t and s_{t+1} of identical length, emit
+// Δs = s_{t+1} − s_t element-wise.
+
+fn sensor_delta(s_t: array, s_next: array) -> array {
+    let n = len(s_t)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(s_next[i] - s_t[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Φ_embodied = MI(a_t, Δs_{t+1}) × N ─────────────────────
+
+// Primary entry: flat streams of actions and sensor deltas. The training
+// loop concatenates per-step coord streams, so len(a_stream) and
+// len(delta_stream) may differ (|a| per step × T vs |Δs| per step × T).
+// N is taken as the sum of the two stream lengths — the total number
+// of embodied-coupling coordinates crossing the scalar MI estimator.
+fn phi_embodied(a_stream: array, delta_stream: array) -> float {
+    let n_total = len(a_stream) + len(delta_stream)
+    if n_total == 0 { return 0.0 }
+    // If the two streams have equal length, call MI directly; otherwise
+    // we truncate to the shorter length (sample count must match).
+    let n_a = len(a_stream)
+    let n_d = len(delta_stream)
+    let n = if n_a < n_d { n_a } else { n_d }
+    if n == 0 { return 0.0 }
+    let mut a_trunc = []
+    let mut d_trunc = []
+    let mut i = 0
+    while i < n {
+        a_trunc = a_trunc.push(a_stream[i])
+        d_trunc = d_trunc.push(delta_stream[i])
+        i = i + 1
+    }
+    let mi = mutual_info(a_trunc, d_trunc)
+    return mi * to_float(n_total)
+}
+
+// Convenience: take raw (a_t, s_t, s_next) tuples and compute Φ_embodied
+// end-to-end. Caller has already flattened per-step coord streams.
+fn phi_embodied_from_tuples(a_stream: array, s_stream: array, s_next_stream: array) -> float {
+    let delta = sensor_delta(s_stream, s_next_stream)
+    return phi_embodied(a_stream, delta)
+}
+
+// Ratio against an externally-measured Φ_time (from ALM-P6-3). Used to
+// report the roadmap gate Φ_embodied > 0.4 × Φ_time.
+fn phi_embodied_ratio(phi_emb: float, phi_time_val: float) -> float {
+    if phi_time_val <= EPS { return 0.0 }
+    return phi_emb / phi_time_val
+}
+
+// Breakdown: returns [MI, N_total, Φ_embodied] for log output.
+fn phi_embodied_breakdown(a_stream: array, delta_stream: array) -> array {
+    let n_a = len(a_stream)
+    let n_d = len(delta_stream)
+    let n = if n_a < n_d { n_a } else { n_d }
+    let mut a_trunc = []
+    let mut d_trunc = []
+    let mut i = 0
+    while i < n {
+        a_trunc = a_trunc.push(a_stream[i])
+        d_trunc = d_trunc.push(delta_stream[i])
+        i = i + 1
+    }
+    let mi = if n == 0 { 0.0 } else { mutual_info(a_trunc, d_trunc) }
+    let n_total = to_float(n_a + n_d)
+    let mut out = []
+    out = out.push(mi)
+    out = out.push(n_total)
+    out = out.push(mi * n_total)
+    return out
+}
+
+// ─── Self-tests ─────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Non-negativity: both the random decoupled case and the bound case
+    // must yield Φ ≥ 0, and the bound case must be strictly positive.
+    let D = 64
+    let a_indep = det_rand(D, 29)
+    let d_indep = det_rand(D, 31)
+    let phi_rnd = phi_embodied(a_indep, d_indep)
+
+    // Bound case: Δs = a + 5% noise — action almost perfectly explains Δs.
+    let a_bound = det_rand(D, 41)
+    let noise = det_rand(D, 43)
+    let mut d_bound = []
+    let mut i = 0
+    while i < D {
+        d_bound = d_bound.push(a_bound[i] + noise[i] * 0.05)
+        i = i + 1
+    }
+    let phi_bound = phi_embodied(a_bound, d_bound)
+
+    println("  [T1] Φ_embodied(indep) = " + str(phi_rnd))
+    println("  [T1] Φ_embodied(bound) = " + str(phi_bound))
+    if phi_rnd   < 0.0 { return false }
+    if phi_bound <= 0.0 {
+        println("  [T1] FAIL — coupled (a, Δs) gave Φ_embodied = 0")
+        return false
+    }
+    return true
+}
+
+fn check_T2() -> bool {
+    // Entropy bound: MI(a, Δs) ≤ min(H(a), H(Δs)) + slack (0.01 for
+    // histogram bias).
+    let D = 64
+    let a = det_rand(D, 41)
+    let noise = det_rand(D, 43)
+    let mut d = []
+    let mut i = 0
+    while i < D {
+        d = d.push(a[i] * 0.8 + noise[i] * 0.2)
+        i = i + 1
+    }
+    let mi = mutual_info(a, d)
+    let h_a = hidden_entropy(a)
+    let h_d = hidden_entropy(d)
+    let min_h = if h_a < h_d { h_a } else { h_d }
+    let ok = mi <= min_h + 0.01
+    println("  [T2] MI=" + str(mi) + "  H(a)=" + str(h_a) + "  H(Δs)=" + str(h_d))
+    if !ok {
+        println("  [T2] FAIL — violates MI upper bound (> min(H)+0.01)")
+    }
+    return ok
+}
+
+fn check_T3() -> bool {
+    // Self-identity: Δs = a byte-identical ⇒ MI = H(a) exactly and
+    // Φ_embodied = H(a) × 2D.
+    let D = 64
+    let a = det_rand(D, 53)
+    // Δs byte-identical to a.
+    let mut d = []
+    let mut i = 0
+    while i < D {
+        d = d.push(a[i])
+        i = i + 1
+    }
+    let mi = mutual_info(a, d)
+    let phi_e = phi_embodied(a, d)
+    let h_a = hidden_entropy(a)
+    let expected_phi = h_a * to_float(2 * D)
+    println("  [T3] MI(a, a) = " + str(mi) + "  H(a) = " + str(h_a))
+    println("  [T3] Φ_embodied = " + str(phi_e) + "  expected = " + str(expected_phi))
+    if fabs(mi - h_a) > 0.0001 { return false }
+    if fabs(phi_e - expected_phi) > 0.001 { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // Determinism: two identical calls produce byte-identical Φ_embodied.
+    let D = 32
+    let a = det_rand(D, 101)
+    let d = det_rand(D, 103)
+    let p1 = phi_embodied(a, d)
+    let p2 = phi_embodied(a, d)
+    println("  [T4] Φ1 = " + str(p1) + "  Φ2 = " + str(p2))
+    return fabs(p1 - p2) == 0.0
+}
+
+fn check_T5() -> bool {
+    // Dim-invariance + latency: D ∈ {64, 128} finite & < 2000 ms each on
+    // stage1. Single MI call per evaluation → slightly cheaper than
+    // Φ_time's triadic estimator.
+    let D_a = 64
+    let D_b = 128
+
+    let a_a = det_rand(D_a, 55)
+    let d_a = det_rand(D_a, 57)
+    let _wa1 = phi_embodied(a_a, d_a)
+    let _wa2 = phi_embodied(a_a, d_a)
+    let t0a = clock()
+    let phi_a = phi_embodied(a_a, d_a)
+    let t1a = clock()
+    let ms_a = (t1a - t0a) * 1000.0
+
+    let a_b = det_rand(D_b, 77)
+    let d_b = det_rand(D_b, 79)
+    let _wb1 = phi_embodied(a_b, d_b)
+    let _wb2 = phi_embodied(a_b, d_b)
+    let t0b = clock()
+    let phi_b = phi_embodied(a_b, d_b)
+    let t1b = clock()
+    let ms_b = (t1b - t0b) * 1000.0
+
+    let finite_a = phi_a >= 0.0
+    let finite_b = phi_b >= 0.0
+    let ok = finite_a && finite_b && ms_a < 2000.0 && ms_b < 2000.0
+
+    println("  [T5] D=64  Φ_embodied=" + str(phi_a) + " t=" + str(ms_a) + "ms")
+    println("  [T5] D=128 Φ_embodied=" + str(phi_b) + " t=" + str(ms_b) + "ms")
+    return ok
+}
+
+// ─── main ───────────────────────────────────────────────────
+
+fn main() {
+    println("[phi_embodied_measure] ALM-P7-3 Φ(embodied) self-test")
+    println("  mock: MI_BINS=" + str(MI_BINS) + " ratio_gate=" + str(PHI_EMBODIED_RATIO))
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[phi_embodied_measure] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[phi_embodied_measure] ALL 5/5 PASS")
+    } else {
+        println("[phi_embodied_measure] SOME FAILED")
+    }
+}
+
+main()

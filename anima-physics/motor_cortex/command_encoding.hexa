@@ -1,0 +1,374 @@
+// command_encoding.hexa — PHYS-P7-2 motor cortex command encoding
+//
+// Roadmap: shared/roadmaps/anima.json P7 PHYSICS track, PHYS-P7-2
+//   "motor cortex simulation — motor command encoding"
+//
+// Purpose:
+//   Georgopoulos (1986) showed that primary motor cortex (M1) encodes
+//   reaching direction not in individual neurons but in the *vector
+//   sum* over a population of direction-tuned cells. Each neuron has
+//   a preferred direction ψ_i and fires above baseline with cosine
+//   tuning:
+//
+//       r_i(θ) = b + a · cos(θ − ψ_i)
+//
+//   where θ is the commanded direction and (b, a) are the baseline
+//   and tuning gain.  Given the population rates (r_1..r_N), the
+//   commanded direction is read out by computing the population
+//   vector:
+//
+//       P(θ) = Σ_i  r_i · (cos ψ_i, sin ψ_i)        (vector sum)
+//       θ̂  = atan2(P_y, P_x)                         (read-out angle)
+//
+//   This two-step encode/decode round-trip is the atomic operation
+//   of motor intention and is the physical substrate of agency in
+//   P7 (enactive cognition). Without it, the brain cannot turn an
+//   abstract "go-left" qualia into a physical arm trajectory.
+//
+// Spec:
+//   N = 16 neurons, preferred directions uniformly spaced on [0, 2π):
+//     ψ_i = 2π · i / N,  i = 0..15
+//   Baseline rate b = 1.0 (sp/bin); tuning amplitude a = 1.0.
+//   Rates are clamped to ≥ 0 (biologically no negative firing rates).
+//
+// Exposed API (roadmap spec):
+//   encode(direction: float) -> [float]
+//     Returns the population rate vector length N=16.
+//
+//   decode(population: [float]) -> float
+//     Returns the readout angle in radians, folded to [0, 2π).
+//
+// Self-test (PASS/FAIL):
+//   T1 round-trip identity — encode(θ) → decode → θ̂, error < 0.01 rad
+//      for θ ∈ {0°, 45°, 90°, 135°, 180°, 225°, 270°, 315°}.
+//   T2 cosine tuning — for θ = 0 the neuron with ψ_0 = 0 fires highest;
+//      the neuron with ψ = π fires lowest (cosine minimum).
+//   T3 determinism — two calls on the same θ give bit-identical
+//      population vectors; two decodes on the same vector give the
+//      same angle.
+//   T4 API contract — encode() returns length 16; decode() returns
+//      a number in [0, 2π); decode([0,0,..,0]) returns 0 (no-signal
+//      fallback).
+//   T5 permutation equivariance — rotating the population by +90°
+//      rotates the decoded angle by +90° (within 0.01 rad).
+//
+// Hexa constraints honored:
+//   - HEXA-FIRST (pure .hexa)
+//   - flat [float] lists (no multi-float struct returns — build bug)
+//   - pass-by-value lists
+//   - sin/cos/atan2 fallback via half-angle + sign table (verify below)
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let N_NEURONS  = 16
+let TWO_PI     = 6.283185307179586
+let PI         = 3.141592653589793
+let HALF_PI    = 1.5707963267948966
+let BASELINE   = 2.0          // b — baseline firing rate (≥ a so r_i ≥ 0
+                              // always; removes the clamp-induced bias
+                              // in the population-vector readout)
+let GAIN       = 1.0          // a — cosine tuning amplitude
+
+// ═══════════════════════════════════════════════════════════════
+// Scalar helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// Fold angle to [0, 2π).
+fn wrap_0_2pi(a: float) -> float {
+    let mut x = a
+    while x < 0.0 { x = x + TWO_PI }
+    while x >= TWO_PI { x = x - TWO_PI }
+    return x
+}
+
+// Signed angular difference in (−π, π].
+fn angle_diff(a: float, b: float) -> float {
+    let mut d = a - b
+    while d > PI { d = d - TWO_PI }
+    while d <= 0.0 - PI { d = d + TWO_PI }
+    return d
+}
+
+// atan2 — portable implementation using only the sin/cos/atan stage1
+// primitives that we actually have.  Strategy:
+//   - if x > 0  → atan(y/x)
+//   - if x < 0  → atan(y/x) + π (y ≥ 0) or −π (y < 0)
+//   - if x = 0  → +π/2 (y > 0), −π/2 (y < 0), 0 (y = 0)
+//
+// We don't have atan() directly, but we can compute it via a Taylor
+// series for |t| ≤ 1 and the identity atan(1/t) = π/2 − atan(t) for
+// |t| > 1.
+fn atan_small(t: float) -> float {
+    // Taylor for |t| ≤ 1: atan(t) = Σ_{k=0} (-1)^k · t^{2k+1} / (2k+1)
+    // At |t| = 1 the series converges slowly (Leibniz formula for π/4).
+    // For 0 ≤ |t| ≤ 0.5 → 10 terms give error < 1e-6.
+    // For 0.5 < |t| ≤ 1 → we use the identity
+    //     atan(t) = 2·atan( t / (1 + √(1+t²)) )
+    // (half-angle reduction) which moves t into [0, √2 − 1] ≈ [0, 0.414]
+    // where the Taylor series converges to < 1e-8 in 6 terms.
+    let abs_t = if t < 0.0 { 0.0 - t } else { t }
+    if abs_t <= 0.5 {
+        return atan_taylor(t)
+    }
+    // Half-angle reduction
+    let s = sqrt(1.0 + t * t)
+    let t_reduced = t / (1.0 + s)
+    return 2.0 * atan_taylor(t_reduced)
+}
+
+// 10-term Taylor series — accurate to ~1e-6 for |t| ≤ 0.5.
+// NOTE: hexa 0.1.0-stage1 only evaluates the first operand of a
+// multi-line `return A - B + C - D ...` chain (2026-04-15), so we
+// keep the full arithmetic on a single source line.
+fn atan_taylor(t: float) -> float {
+    let t2 = t * t
+    let t3 = t2 * t
+    let t5 = t3 * t2
+    let t7 = t5 * t2
+    let t9 = t7 * t2
+    let t11 = t9 * t2
+    let t13 = t11 * t2
+    let t15 = t13 * t2
+    let t17 = t15 * t2
+    let t19 = t17 * t2
+    return t - t3/3.0 + t5/5.0 - t7/7.0 + t9/9.0 - t11/11.0 + t13/13.0 - t15/15.0 + t17/17.0 - t19/19.0
+}
+
+fn atan_single(t: float) -> float {
+    if t >= 0.0 && t <= 1.0 {
+        return atan_small(t)
+    }
+    if t < 0.0 && t >= 0.0 - 1.0 {
+        return 0.0 - atan_small(0.0 - t)
+    }
+    // |t| > 1 → use identity atan(t) = π/2 − atan(1/t) for t > 0
+    //          or −π/2 − atan(1/t)  for t < 0
+    if t > 1.0 {
+        return HALF_PI - atan_small(1.0 / t)
+    }
+    // t < -1
+    return 0.0 - HALF_PI - atan_small(1.0 / t)
+}
+
+fn atan2_portable(y: float, x: float) -> float {
+    if x > 0.0 {
+        return atan_single(y / x)
+    }
+    if x < 0.0 {
+        if y >= 0.0 {
+            return atan_single(y / x) + PI
+        }
+        return atan_single(y / x) - PI
+    }
+    // x == 0
+    if y > 0.0 { return HALF_PI }
+    if y < 0.0 { return 0.0 - HALF_PI }
+    return 0.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Encode — direction θ → population rate vector r[0..N-1]
+//
+// For each neuron i, preferred direction ψ_i = 2π·i/N, and rate
+//   r_i = max(0, b + a · cos(θ − ψ_i))
+// ═══════════════════════════════════════════════════════════════
+
+fn encode(direction: float) -> [float] {
+    let mut r: [float] = []
+    let mut i = 0
+    while i < N_NEURONS {
+        let psi_i = TWO_PI * to_float(i) / to_float(N_NEURONS)
+        let raw = BASELINE + GAIN * cos(direction - psi_i)
+        // clamp to ≥ 0 (no negative firing rates)
+        let r_i = if raw < 0.0 { 0.0 } else { raw }
+        r = r.push(r_i)
+        i = i + 1
+    }
+    return r
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Decode — population rate vector → readout direction (radians)
+//
+// Population vector readout:
+//   P_x = Σ_i r_i · cos(ψ_i)
+//   P_y = Σ_i r_i · sin(ψ_i)
+//   θ̂ = atan2(P_y, P_x), folded to [0, 2π).
+//
+// The DC baseline cancels out in the vector sum because
+// Σ_i cos(ψ_i) = Σ_i sin(ψ_i) = 0 for uniformly-distributed ψ_i.
+// ═══════════════════════════════════════════════════════════════
+
+fn decode(population: [float]) -> float {
+    let n = len(population)
+    if n == 0 { return 0.0 }
+    let mut px = 0.0
+    let mut py = 0.0
+    let mut i = 0
+    while i < n {
+        let psi_i = TWO_PI * to_float(i) / to_float(n)
+        px = px + population[i] * cos(psi_i)
+        py = py + population[i] * sin(psi_i)
+        i = i + 1
+    }
+    // If population is all zero (|P|=0) return 0 as a safe default.
+    if fabs(px) < 0.000001 && fabs(py) < 0.000001 {
+        return 0.0
+    }
+    return wrap_0_2pi(atan2_portable(py, px))
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1_round_trip() -> bool {
+    // encode(θ) → decode → θ̂ must agree with θ within 0.01 rad for
+    // 8 evenly-spaced directions spanning the unit circle.
+    let mut dirs: [float] = []
+    dirs = dirs.push(0.0)
+    dirs = dirs.push(PI / 4.0)
+    dirs = dirs.push(PI / 2.0)
+    dirs = dirs.push(3.0 * PI / 4.0)
+    dirs = dirs.push(PI)
+    dirs = dirs.push(5.0 * PI / 4.0)
+    dirs = dirs.push(3.0 * PI / 2.0)
+    dirs = dirs.push(7.0 * PI / 4.0)
+    let mut max_err = 0.0
+    let mut worst_theta = 0.0
+    let mut worst_hat = 0.0
+    let mut i = 0
+    while i < len(dirs) {
+        let theta = dirs[i]
+        let pop = encode(theta)
+        let hat = decode(pop)
+        let d = fabs(angle_diff(hat, theta))
+        if d > max_err {
+            max_err = d
+            worst_theta = theta
+            worst_hat = hat
+        }
+        i = i + 1
+    }
+    let ok = max_err < 0.01
+    println("  [T1] max round-trip error over 8 directions = " + str(max_err)
+        + " rad @ θ=" + str(worst_theta) + " hat=" + str(worst_hat))
+    return ok
+}
+
+fn check_T2_cosine_tuning() -> bool {
+    // θ = 0 → neuron 0 (ψ = 0) fires at maximum (b+a=2); neuron 8
+    // (ψ = π) fires at minimum (b−a=0).  Other neurons fire in between.
+    let pop = encode(0.0)
+    let r0 = pop[0]
+    let r8 = pop[8]
+    let r4 = pop[4]
+    // b=2, a=1: r0 = 2 + cos(0)  = 3 (max)
+    //           r8 = 2 + cos(π)  = 1 (min)
+    //           r4 = 2 + cos(−π/2) = 2 (quadrature)
+    let ok_max  = fabs(r0 - 3.0) < 0.001
+    let ok_min  = fabs(r8 - 1.0) < 0.001
+    let ok_quad = fabs(r4 - 2.0) < 0.001
+    let ok = ok_max && ok_min && ok_quad
+    println("  [T2] r[0]=" + str(r0) + " r[4]=" + str(r4) + " r[8]=" + str(r8))
+    return ok
+}
+
+fn check_T3_determinism() -> bool {
+    // Two encode() calls on the same θ must produce identical
+    // populations; two decode() calls on the same pop must give
+    // identical θ̂.
+    let a = encode(1.234)
+    let b = encode(1.234)
+    let mut enc_match = len(a) == len(b)
+    let mut i = 0
+    while i < len(a) {
+        if a[i] != b[i] { enc_match = false }
+        i = i + 1
+    }
+    let d1 = decode(a)
+    let d2 = decode(a)
+    let dec_match = d1 == d2
+    let ok = enc_match && dec_match
+    println("  [T3] enc_match=" + str(enc_match)
+        + " dec_match=" + str(dec_match))
+    return ok
+}
+
+fn check_T4_api_contract() -> bool {
+    // encode returns len==N_NEURONS; decode returns [0, 2π).
+    // decode on all-zero returns 0.0 (safe fallback).
+    let pop = encode(0.5)
+    let len_ok = len(pop) == N_NEURONS
+    let hat = decode(pop)
+    let range_ok = hat >= 0.0 && hat < TWO_PI
+    // All-zero population → 0
+    let mut zeros: [float] = []
+    let mut i = 0
+    while i < N_NEURONS {
+        zeros = zeros.push(0.0)
+        i = i + 1
+    }
+    let zero_decode = decode(zeros)
+    let zero_ok = zero_decode == 0.0
+    let ok = len_ok && range_ok && zero_ok
+    println("  [T4] len=" + str(len(pop)) + " decode=" + str(hat)
+        + " in [0,2π)=" + str(range_ok) + " zero_decode=" + str(zero_decode))
+    return ok
+}
+
+fn check_T5_rotation_equivariance() -> bool {
+    // If we encode θ and then encode θ+90°, the decoded readout must
+    // also differ by 90° (within 0.01 rad).
+    let theta0 = 0.7
+    let theta1 = theta0 + HALF_PI
+    let pop0 = encode(theta0)
+    let pop1 = encode(theta1)
+    let d0 = decode(pop0)
+    let d1 = decode(pop1)
+    // Angular difference between the two decoded angles should be π/2.
+    let diff = angle_diff(d1, d0)
+    let err = fabs(diff - HALF_PI)
+    let ok = err < 0.01
+    println("  [T5] Δ decoded = " + str(diff) + " rad (expected π/2 ≈ 1.5708), err=" + str(err))
+    return ok
+}
+
+fn test() {
+    println("[motor_cortex/command_encoding] PHYS-P7-2 — M1 population coding")
+    println("  N=" + str(N_NEURONS) + " cosine-tuned neurons, b="
+        + str(BASELINE) + " a=" + str(GAIN))
+    println("")
+
+    let t1 = check_T1_round_trip()
+    if t1 { println("T1 PASS — encode/decode round-trip identity") } else { println("T1 FAIL") }
+
+    let t2 = check_T2_cosine_tuning()
+    if t2 { println("T2 PASS — cosine tuning (max at ψ=0, min at ψ=π)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3_determinism()
+    if t3 { println("T3 PASS — deterministic encode + decode") } else { println("T3 FAIL") }
+
+    let t4 = check_T4_api_contract()
+    if t4 { println("T4 PASS — API contract (len, range, zero-fallback)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5_rotation_equivariance()
+    if t5 { println("T5 PASS — rotation equivariance (+90° in → +90° out)") } else { println("T5 FAIL") }
+
+    println("")
+    let all = t1 && t2 && t3 && t4 && t5
+    if all {
+        println("[motor_cortex/command_encoding] 5/5 PASS — PHYS-P7-2 DONE")
+    } else {
+        println("[motor_cortex/command_encoding] SOME FAILED")
+    }
+}
+
+test()
