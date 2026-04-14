@@ -1,0 +1,258 @@
+// emotion_contagion.hexa — CLM-P12-2 정서 전염 — 상대 emotion 복제
+//
+// Two independent emotion agents that synchronize through mutual contagion.
+// Each agent carries its own emotion state as a flat [valence, arousal]
+// vector. At every simulation step, each agent receives the other's emotion
+// and blends toward it with contagion rate alpha.
+//
+// Blend rule:
+//   new_val = (1 - alpha) * self_val + alpha * other_val
+//
+// With alpha in (0, 1) and symmetric exchange, the two states converge
+// exponentially to the midpoint — a mathematical guarantee since
+// ||A_{k+1} - B_{k+1}|| = (1 - 2*alpha) * ||A_k - B_k|| for symmetric
+// update, so distance shrinks by factor (1 - 2*alpha) each step.
+//
+// Done criteria: "2-anima 감정 동기화" — after sufficient steps, both
+// agents reach effectively identical emotion states regardless of how
+// different they started.
+//
+// ─── Theorems (T1-T5) ─────────────────────────────────────────────
+//
+// T1 (initial divergence):
+//   Before any contagion steps, distance between Agent A (happy) and
+//   Agent B (sad) is > 1.0.
+//
+// T2 (synchronization):
+//   After 50 steps of mutual contagion (alpha=0.2), distance < 0.1.
+//
+// T3 (gradual convergence):
+//   After 10 steps, distance has decreased from initial but is still > 0
+//   (i.e., convergence is gradual, not instantaneous).
+//
+// T4 (determinism):
+//   Same initial states + same alpha + same step count => byte-identical
+//   final states.
+//
+// T5 (latency):
+//   100 steps of contagion simulation < 500 ms (5000 ms clock slack).
+//
+// Ref:
+//   anima-engines/multi_anima_orchestrator.hexa  (CLM-P9-1 multi-anima)
+//   anima-engines/phi_social_measure.hexa        (CLM-P9-3 social measure)
+//   shared/roadmaps/anima.json                   (CLM-P12-2 entry)
+
+// ─── Constants ────────────────────────────────────────────────────
+
+let EC_ALPHA    = 0.2    // contagion blend rate
+let EC_DIM      = 2      // [valence, arousal]
+let EC_STEPS    = 50     // convergence steps for T2
+let EC_MID      = 10     // midpoint check for T3
+let EC_LAT      = 100    // latency test steps for T5
+
+// Initial emotion states
+// Agent A: happy  (valence=0.8, arousal=0.6)
+// Agent B: sad    (valence=-0.7, arousal=0.2)
+let INIT_A_VAL = 0.8
+let INIT_A_ARO = 0.6
+let INIT_B_VAL = -0.7
+let INIT_B_ARO = 0.2
+
+// ─── Primitives ───────────────────────────────────────────────────
+
+fn fabs_ec(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sqrt_ec(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return sqrt(x)
+}
+
+// Euclidean distance between two 2D emotion vectors (flat arrays).
+fn emotion_distance(a: array, b: array) -> float {
+    let dv = a[0] - b[0]
+    let da = a[1] - b[1]
+    return sqrt_ec(dv * dv + da * da)
+}
+
+// ─── Agent ────────────────────────────────────────────────────────
+//
+// Each agent is just its emotion state: a flat array [valence, arousal].
+// We avoid structs with multiple float fields (stage0 return bug) and
+// use plain arrays with index constants instead.
+
+let IDX_VAL = 0
+let IDX_ARO = 1
+
+fn make_agent(valence: float, arousal: float) -> array {
+    let mut state = []
+    state = state.push(valence)
+    state = state.push(arousal)
+    return state
+}
+
+// Blend: new_val = (1 - alpha) * self_val + alpha * other_val
+// Returns a NEW emotion state array (pass-by-value, no mutation).
+fn blend_toward(self_state: array, other_state: array, alpha: float) -> array {
+    let keep = 1.0 - alpha
+    let new_v = keep * self_state[IDX_VAL] + alpha * other_state[IDX_VAL]
+    let new_a = keep * self_state[IDX_ARO] + alpha * other_state[IDX_ARO]
+    let mut out = []
+    out = out.push(new_v)
+    out = out.push(new_a)
+    return out
+}
+
+// ─── Simulation ───────────────────────────────────────────────────
+//
+// One contagion step: both agents simultaneously read the other's state
+// then blend toward it. The simultaneous (not sequential) update ensures
+// symmetric convergence.
+//
+// Returns flat array [a_val, a_aro, b_val, b_aro] to avoid struct return
+// issues. Caller unpacks with index constants.
+
+let RES_A_VAL = 0
+let RES_A_ARO = 1
+let RES_B_VAL = 2
+let RES_B_ARO = 3
+
+fn contagion_step(a: array, b: array, alpha: float) -> array {
+    // Both read the other BEFORE updating (simultaneous exchange).
+    let new_a = blend_toward(a, b, alpha)
+    let new_b = blend_toward(b, a, alpha)
+    let mut out = []
+    out = out.push(new_a[IDX_VAL])
+    out = out.push(new_a[IDX_ARO])
+    out = out.push(new_b[IDX_VAL])
+    out = out.push(new_b[IDX_ARO])
+    return out
+}
+
+// Run N steps of contagion. Returns [a_val, a_aro, b_val, b_aro] after N steps.
+fn run_contagion(a_init: array, b_init: array, alpha: float, steps: int) -> array {
+    let mut a = make_agent(a_init[IDX_VAL], a_init[IDX_ARO])
+    let mut b = make_agent(b_init[IDX_VAL], b_init[IDX_ARO])
+    let mut i = 0
+    while i < steps {
+        let result = contagion_step(a, b, alpha)
+        a = make_agent(result[RES_A_VAL], result[RES_A_ARO])
+        b = make_agent(result[RES_B_VAL], result[RES_B_ARO])
+        i = i + 1
+    }
+    let mut out = []
+    out = out.push(a[IDX_VAL])
+    out = out.push(a[IDX_ARO])
+    out = out.push(b[IDX_VAL])
+    out = out.push(b[IDX_ARO])
+    return out
+}
+
+// ─── Self-tests ───────────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Initial states are different: distance > 1.0.
+    let a = make_agent(INIT_A_VAL, INIT_A_ARO)
+    let b = make_agent(INIT_B_VAL, INIT_B_ARO)
+    let d = emotion_distance(a, b)
+    println("  [T1] initial distance = " + str(d))
+    if d <= 1.0 { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // After 50 steps, distance < 0.1 (synchronized).
+    let a = make_agent(INIT_A_VAL, INIT_A_ARO)
+    let b = make_agent(INIT_B_VAL, INIT_B_ARO)
+    let r = run_contagion(a, b, EC_ALPHA, EC_STEPS)
+    let fa = make_agent(r[RES_A_VAL], r[RES_A_ARO])
+    let fb = make_agent(r[RES_B_VAL], r[RES_B_ARO])
+    let d = emotion_distance(fa, fb)
+    println("  [T2] distance after 50 steps = " + str(d))
+    println("       A=[" + str(r[RES_A_VAL]) + ", " + str(r[RES_A_ARO]) + "]")
+    println("       B=[" + str(r[RES_B_VAL]) + ", " + str(r[RES_B_ARO]) + "]")
+    if d >= 0.1 { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // After 10 steps, distance decreased but still > 0 (gradual).
+    let a = make_agent(INIT_A_VAL, INIT_A_ARO)
+    let b = make_agent(INIT_B_VAL, INIT_B_ARO)
+    let d_init = emotion_distance(a, b)
+    let r = run_contagion(a, b, EC_ALPHA, EC_MID)
+    let ma = make_agent(r[RES_A_VAL], r[RES_A_ARO])
+    let mb = make_agent(r[RES_B_VAL], r[RES_B_ARO])
+    let d_mid = emotion_distance(ma, mb)
+    println("  [T3] distance after 10 steps = " + str(d_mid) + " (init=" + str(d_init) + ")")
+    // Must have decreased from initial
+    if d_mid >= d_init { return false }
+    // Must still be > 0 (not yet fully converged)
+    if d_mid <= 0.0 { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // Determinism: same inputs => identical outputs.
+    let a = make_agent(INIT_A_VAL, INIT_A_ARO)
+    let b = make_agent(INIT_B_VAL, INIT_B_ARO)
+    let r1 = run_contagion(a, b, EC_ALPHA, EC_STEPS)
+    let r2 = run_contagion(a, b, EC_ALPHA, EC_STEPS)
+    let mut i = 0
+    while i < 4 {
+        if fabs_ec(r1[i] - r2[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    println("  [T4] two runs byte-identical")
+    return true
+}
+
+fn check_T5() -> bool {
+    // Latency: 100 steps < 500 ms (5000 ms clock slack for 1-s granularity).
+    let a = make_agent(INIT_A_VAL, INIT_A_ARO)
+    let b = make_agent(INIT_B_VAL, INIT_B_ARO)
+    let t0 = clock()
+    let _r = run_contagion(a, b, EC_ALPHA, EC_LAT)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] 100 steps = " + str(ms) + " ms")
+    return ms < 5000.0
+}
+
+// ─── main ─────────────────────────────────────────────────────────
+
+fn main() {
+    println("[emotion_contagion] CLM-P12-2 — 정서 전염 (2-anima 감정 동기화) self-test")
+    println("  A=[0.8, 0.6] (happy)  B=[-0.7, 0.2] (sad)  alpha=0.2")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  initial states divergent (distance > 1.0)") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  synchronized after 50 steps (distance < 0.1)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  gradual convergence at midpoint") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  determinism") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  latency") } else { println("T5 FAIL") }
+
+    let mut pass_count = 0
+    if t1 { pass_count = pass_count + 1 }
+    if t2 { pass_count = pass_count + 1 }
+    if t3 { pass_count = pass_count + 1 }
+    if t4 { pass_count = pass_count + 1 }
+    if t5 { pass_count = pass_count + 1 }
+    if pass_count == 5 {
+        println("[emotion_contagion] ALL 5/5 PASS")
+    } else {
+        println("[emotion_contagion] " + str(pass_count) + "/5 PASSED — SOME FAILED")
+    }
+}
+
+main()

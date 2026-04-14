@@ -1,0 +1,312 @@
+// training/phi_affect_measure.hexa — Phi(affect) measurement for ANIMA P12
+//
+// ALM-P12-3 / P12 감정 의식 (affective consciousness, ALM track).
+//
+// Phi_affect quantifies temporal autocorrelation of the emotion vector
+// across consecutive time steps. Sustained emotional states (not
+// flickering noise) indicate genuine affective consciousness.
+//
+//   Phi_affect = avg_t cosine_sim(e_t, e_{t+1}) * n_steps * d
+//
+// where e_t is the d-dimensional emotion vector at step t, and the
+// average runs over all consecutive pairs (t, t+1).
+//
+// Design:
+//   emotion_sequence: flat array of n_steps * d floats.
+//   Step t occupies indices [t*d .. (t+1)*d).
+//   Temporal autocorrelation = mean of cosine_sim between adjacent steps.
+//   Phi_affect = autocorr * N, where N = n_steps * d (same x N convention).
+//
+// Done criterion: "sustained duration > 0" — Phi_affect must be positive
+// for sustained emotional states.
+//
+// T-theorems (checked in self-test):
+//   T1 (non-negativity)    : Phi_affect >= 0 for sustained emotions
+//   T2 (sustained > flicker): sustained Phi > flickering Phi
+//   T3 (P12 gate_exit)     : sustained Phi_affect > 0 (criteria: sustained duration > 0)
+//   T4 (determinism)       : same data -> byte-identical Phi_affect
+//   T5 (latency)           : 50 steps x d=8 < 1000 ms
+//
+// Reference:
+//   training/phi_narrative_measure.hexa    (ALM-P11-3)
+//   training/phi_will_measure.hexa         (ALM-P10-3)
+//   training/alm_episodic_store.hexa       (cosine_sim source)
+//   shared/roadmaps/anima.json             (ALM-P12-3 entry)
+//
+// Run: hexa run training/phi_affect_measure.hexa
+
+// --- Constants -------------------------------------------------------
+
+let EPS = 0.000001    // zero-norm guard for cosine_sim
+
+// --- Primitives ------------------------------------------------------
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+// --- Vector helpers (from alm_episodic_store.hexa) -------------------
+
+fn vec_dot(a: array, b: array) -> float {
+    let n = len(a)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn vec_norm(a: array) -> float {
+    let d = vec_dot(a, a)
+    return sqrt(d)
+}
+
+// BUG FIX: zero-norm guard prevents NaN/Inf from division
+fn cosine_sim(a: array, b: array) -> float {
+    let dot_val = vec_dot(a, b)
+    let na = vec_norm(a)
+    let nb = vec_norm(b)
+    let denom = na * nb
+    if denom < EPS { return 0.0 }
+    return dot_val / denom
+}
+
+// --- Extract step t from flat emotion sequence -----------------------
+// emotion_sequence: flat array [n_steps * d], step t at [t*d .. (t+1)*d)
+
+fn extract_step(emotion_seq: array, t: int, d: int) -> array {
+    let base = t * d
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        out = out.push(emotion_seq[base + i])
+        i = i + 1
+    }
+    return out
+}
+
+// --- Phi_affect = avg cosine_sim(e_t, e_{t+1}) * n_steps * d --------
+//
+// Temporal autocorrelation: average cosine similarity between each
+// consecutive pair of emotion vectors. Sustained emotions have high
+// cosine similarity (vectors barely change), flickering emotions have
+// near-zero cosine similarity (random direction each step).
+
+fn phi_affect(emotion_seq: array, n_steps: int, d: int) -> float {
+    if n_steps < 2 { return 0.0 }
+    if d < 1 { return 0.0 }
+    let n_pairs = n_steps - 1
+    let mut sum_cos = 0.0
+    let mut t = 0
+    while t < n_pairs {
+        let e_t = extract_step(emotion_seq, t, d)
+        let e_t1 = extract_step(emotion_seq, t + 1, d)
+        let cs = cosine_sim(e_t, e_t1)
+        sum_cos = sum_cos + cs
+        t = t + 1
+    }
+    let autocorr = sum_cos / to_float(n_pairs)
+    let n_total = n_steps * d
+    return autocorr * to_float(n_total)
+}
+
+fn phi_affect_breakdown(emotion_seq: array, n_steps: int, d: int) -> array {
+    let n_pairs = n_steps - 1
+    let mut sum_cos = 0.0
+    let mut t = 0
+    while t < n_pairs {
+        let e_t = extract_step(emotion_seq, t, d)
+        let e_t1 = extract_step(emotion_seq, t + 1, d)
+        let cs = cosine_sim(e_t, e_t1)
+        sum_cos = sum_cos + cs
+        t = t + 1
+    }
+    let autocorr = sum_cos / to_float(n_pairs)
+    let n_total = n_steps * d
+    let phi_val = autocorr * to_float(n_total)
+    let mut out = []
+    out = out.push(autocorr)
+    out = out.push(to_float(n_total))
+    out = out.push(phi_val)
+    return out
+}
+
+// --- Synthetic data --------------------------------------------------
+//
+// Sustained: base emotion + small drift noise each step.
+//   e_0 = random vector, e_{t+1} = e_t + noise * 0.05
+//   Cosine similarity between consecutive steps is high (~0.99).
+//
+// Flickering: completely random emotion each step.
+//   e_t ~ random, independent of e_{t-1}.
+//   Cosine similarity between consecutive steps is near 0.
+
+fn make_sustained(n_steps: int, d: int, seed: int) -> array {
+    // Base emotion vector
+    let base = det_rand(d, seed)
+    // All drift noise in one batch: n_steps * d values
+    let all_noise = det_rand(n_steps * d, seed + 1)
+    let mut out = []
+    // Step 0: copy base
+    let mut j = 0
+    while j < d {
+        out = out.push(base[j])
+        j = j + 1
+    }
+    // Steps 1..n_steps-1: accumulate small drift from previous step
+    let mut t = 1
+    while t < n_steps {
+        let prev_base = (t - 1) * d
+        let noise_base = t * d
+        let mut k = 0
+        while k < d {
+            // BUG FIX: read from out[] at previous step's position
+            let prev_val = out[prev_base + k]
+            let drift = all_noise[noise_base + k] * 0.05
+            out = out.push(prev_val + drift)
+            k = k + 1
+        }
+        t = t + 1
+    }
+    return out
+}
+
+fn make_flickering(n_steps: int, d: int, seed: int) -> array {
+    // Each step is independently random -> low autocorrelation
+    let total = n_steps * d
+    let rand_data = det_rand(total, seed)
+    return rand_data
+}
+
+// --- Self-tests ------------------------------------------------------
+
+fn check_T1() -> bool {
+    // T1: Non-negativity -- Phi_affect >= 0 for sustained emotions
+    let n = 30
+    let d = 8
+    let sustained = make_sustained(n, d, 42)
+    let phi_s = phi_affect(sustained, n, d)
+    let flickering = make_flickering(n, d, 99)
+    let phi_f = phi_affect(flickering, n, d)
+    println("  [T1] Phi_affect(sustained)  = " + str(phi_s))
+    println("  [T1] Phi_affect(flickering) = " + str(phi_f))
+    // Sustained must be non-negative (high autocorr * positive N)
+    if phi_s < 0.0 { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: Sustained Phi > flickering Phi
+    let n = 50
+    let d = 8
+    let sustained = make_sustained(n, d, 51)
+    let phi_s = phi_affect(sustained, n, d)
+    let flickering = make_flickering(n, d, 53)
+    let phi_f = phi_affect(flickering, n, d)
+    println("  [T2] Phi_affect(sustained)  = " + str(phi_s) + "  (expect > flickering)")
+    println("  [T2] Phi_affect(flickering) = " + str(phi_f))
+    if phi_s <= phi_f {
+        println("  [T2] FAIL -- sustained not > flickering")
+        return false
+    }
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3: Gate exit -- sustained Phi_affect > 0 (criteria: sustained duration > 0)
+    let n = 50
+    let d = 8
+    let sustained = make_sustained(n, d, 67)
+    let brk = phi_affect_breakdown(sustained, n, d)
+    let autocorr = brk[0]
+    let n_total = brk[1]
+    let phi_val = brk[2]
+    println("  [T3] autocorr = " + str(autocorr) + "  N = " + str(n_total) + "  Phi_affect = " + str(phi_val))
+    if phi_val <= 0.0 {
+        println("  [T3] FAIL -- Phi_affect not > 0 (P12 gate_exit: sustained duration > 0)")
+        return false
+    }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: Determinism -- same data -> byte-identical Phi_affect
+    let n = 30
+    let d = 8
+    let data = make_sustained(n, d, 101)
+    let p1 = phi_affect(data, n, d)
+    let p2 = phi_affect(data, n, d)
+    println("  [T4] Phi1 = " + str(p1) + "  Phi2 = " + str(p2))
+    return fabs(p1 - p2) == 0.0
+}
+
+fn check_T5() -> bool {
+    // T5: Latency -- 50 steps x d=8 < 1000ms
+    let n = 50
+    let d = 8
+    let data = make_sustained(n, d, 55)
+    let t0 = clock()
+    let phi_val = phi_affect(data, n, d)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] N=50 d=8  Phi_affect=" + str(phi_val) + "  t=" + str(ms) + "ms  (limit 1000ms)")
+    if ms >= 1000.0 {
+        println("  [T5] FAIL -- latency exceeded 1000ms")
+        return false
+    }
+    if phi_val < 0.0 {
+        println("  [T5] FAIL -- negative Phi")
+        return false
+    }
+    return true
+}
+
+// --- main ------------------------------------------------------------
+
+fn main() {
+    println("[phi_affect_measure] ALM-P12-3 Phi(affect) self-test")
+    println("  Phi_affect = avg cosine_sim(e_t, e_{t+1}) * n_steps * d")
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[phi_affect_measure] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[phi_affect_measure] ALL 5/5 PASS -- gate ALM-P12-3 OK")
+    } else {
+        println("[phi_affect_measure] SOME FAILED")
+    }
+}
+
+main()

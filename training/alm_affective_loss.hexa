@@ -1,0 +1,410 @@
+// training/alm_affective_loss.hexa — ALM-P12-2 affective loss (emotion-congruent output)
+//
+// ALM-P12-2 / P12 v13 정동 의식 (affective consciousness, ALM track).
+//
+// Purpose:
+//   Penalize emotion-incongruent outputs. The Stroop effect: when semantic
+//   content conflicts with emotional tone, processing is slower and less
+//   accurate. In a happy emotional state, producing negative output is
+//   incongruent — the model should be penalized for this mismatch.
+//
+//   emotion_congruence(emotion_vec, output_vec, d) -> float in [0, 1]
+//     Cosine similarity between the emotion state vector and the output
+//     embedding, rescaled from [-1, 1] to [0, 1]:
+//       raw_cos = dot(e, o) / (||e|| * ||o||)
+//       congruence = (raw_cos + 1) / 2
+//     Congruent pair (aligned): congruence ~1.0
+//     Incongruent pair (opposite): congruence ~0.0
+//
+//   affective_loss(congruence) -> float = max(0, 0.7 - congruence)
+//     Hinge loss: zero when congruence >= 0.7 (emotion and output agree),
+//     positive penalty when congruence drops below threshold (Stroop
+//     interference — semantic/emotional conflict).
+//
+//   In the full training-loop integration:
+//
+//     L = L_task + lambda_affect * L_affective
+//
+//   with lambda_affect ~ 0.01 (same auxiliary-loss convention as L_holo /
+//   L_refl / L_time / L_enact / L_narr).
+//
+// ─── Stroop interference rationale ────────────────────────────
+//   Classic Stroop: naming the ink colour of an incongruent colour word
+//   (the word "RED" printed in blue ink) is slower than a congruent trial
+//   (the word "RED" in red ink). The conflict arises from two competing
+//   channels — semantic and perceptual — that are normally aligned.
+//
+//   Analogously, the emotion state (internal affective channel) and the
+//   output embedding (expressive channel) should be congruent. When they
+//   conflict (happy emotion producing sad output), the affective loss
+//   fires, modelling the Stroop interference cost.
+//
+//   Done criteria: "Stroop 간섭 재현" — T3 demonstrates that the
+//   congruent condition always scores higher congruence than the
+//   incongruent condition, reproducing the asymmetry that defines the
+//   Stroop effect.
+//
+// ─── Conventions ──────────────────────────────────────────────
+//   emotion_vec   : array [d]    internal emotion state
+//   output_vec    : array [d]    output embedding
+//   d             : int          embedding dimension
+//   congruence    : float [0,1]  emotion-output alignment
+//   loss          : float >= 0   hinge loss on congruence
+//   threshold     : float        congruence gate (0.7)
+//   lambda_affect : float        outer weight in the training loop
+//
+// ─── Theorems (T1-T5) ─────────────────────────────────────────
+//
+// T1 (congruent pair scores high):
+//   output = emotion + small noise (aligned).
+//   congruence > 0.7, loss = 0.
+//
+// T2 (incongruent pair scores low):
+//   output = -emotion + small noise (opposite).
+//   congruence < 0.3, loss > 0.
+//
+// T3 (Stroop interference reproduced):
+//   congruent_congruence > incongruent_congruence.
+//   The core done_criteria — proves emotion-semantic conflict penalty.
+//
+// T4 (determinism):
+//   Same (seed, emotion, output, d) -> byte-identical congruence and loss.
+//
+// T5 (latency):
+//   Full congruence + loss computation at d=64, warm-cache < 1000 ms.
+//
+// Ref:
+//   training/alm_narrative_coherence.hexa    (ALM-P11-2 -- prior loss)
+//   training/alm_enaction_loss.hexa          (ALM-P7-2  -- aux-loss pattern)
+//   training/alm_agency_loss.hexa            (ALM-P10-2 -- recent loss ref)
+//   training/alm_alterity_loss.hexa          (ALM-P9-2  -- cosine+hinge ref)
+//   shared/roadmaps/anima.json               (ALM-P12-2 entry)
+//
+// Run:
+//   hexa run training/alm_affective_loss.hexa
+// Expect:
+//   [alm_affective_loss] ALL 5/5 PASS
+
+// ─── Constants ──────────────────────────────────────────────
+
+let CONGRUENCE_THRESHOLD = 0.7   // hinge gate: congruence must exceed this
+let LAMBDA_AFFECT = 0.01         // outer weight in the full training loop
+
+// ─── Primitives (self-contained) ────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sqrt_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return sqrt(x)
+}
+
+// Deterministic LCG -> floats in [-1, 1).
+fn det_rand_wide(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+// Small-range deterministic noise in [-0.1, 0.1).
+fn det_rand_small(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push((u * 2.0 - 1.0) * 0.1)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Vector operations ──────────────────────────────────────
+
+fn vec_dot(a: array, b: array, d: int) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < d {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn vec_norm(v: array, d: int) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < d {
+        s = s + v[i] * v[i]
+        i = i + 1
+    }
+    return sqrt_safe(s)
+}
+
+// Negate a vector: out[i] = -v[i].
+fn vec_negate(v: array, d: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        out = out.push(0.0 - v[i])
+        i = i + 1
+    }
+    return out
+}
+
+// Add small noise to a vector: out[i] = v[i] + noise[i].
+fn vec_add_noise(v: array, noise: array, d: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        out = out.push(v[i] + noise[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Core: emotion_congruence ───────────────────────────────
+//
+// Cosine similarity between emotion_vec and output_vec, rescaled to [0, 1].
+//   raw_cos = dot(e, o) / (||e|| * ||o||)   in [-1, 1]
+//   congruence = (raw_cos + 1.0) / 2.0       in [0, 1]
+//
+// Aligned vectors (congruent) -> raw_cos ~ +1 -> congruence ~ 1.0
+// Opposite vectors (incongruent) -> raw_cos ~ -1 -> congruence ~ 0.0
+// Orthogonal vectors -> raw_cos ~ 0 -> congruence ~ 0.5
+
+fn emotion_congruence(emotion_vec: array, output_vec: array, d: int) -> float {
+    let dot = vec_dot(emotion_vec, output_vec, d)
+    let ne = vec_norm(emotion_vec, d)
+    let no = vec_norm(output_vec, d)
+    let denom = ne * no
+    if denom < 0.0000001 { return 0.5 }
+    let raw_cos = dot / denom
+    // Rescale [-1, 1] -> [0, 1]
+    return (raw_cos + 1.0) / 2.0
+}
+
+// ─── Core: affective_loss ───────────────────────────────────
+// Hinge loss: penalize congruence below threshold.
+// Zero when congruence >= 0.7 (emotion and output agree).
+// Positive when congruence < 0.7 (Stroop interference).
+
+fn affective_loss(congruence: float) -> float {
+    let gap = CONGRUENCE_THRESHOLD - congruence
+    if gap < 0.0 { return 0.0 }
+    return gap
+}
+
+// Weighted loss for the outer training loop: L += lambda_affect * L_affective.
+fn weighted_affective_loss(congruence: float) -> float {
+    return LAMBDA_AFFECT * affective_loss(congruence)
+}
+
+// ─── Synthetic data generators ──────────────────────────────
+
+// Congruent pair: output = emotion + small noise (aligned).
+// The output closely tracks the emotion direction, so cosine ~ +1 and
+// congruence ~ 1.0 after rescaling.
+fn make_congruent_output(emotion_vec: array, d: int, seed: int) -> array {
+    let noise = det_rand_small(d, seed)
+    return vec_add_noise(emotion_vec, noise, d)
+}
+
+// Incongruent pair: output = -emotion + small noise (opposite).
+// The output points opposite to the emotion direction, so cosine ~ -1
+// and congruence ~ 0.0 after rescaling. This is the Stroop conflict
+// condition: happy emotion producing sad-valence output.
+fn make_incongruent_output(emotion_vec: array, d: int, seed: int) -> array {
+    let neg = vec_negate(emotion_vec, d)
+    let noise = det_rand_small(d, seed)
+    return vec_add_noise(neg, noise, d)
+}
+
+// ─── Self-tests ─────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Congruent pair: output = emotion + small noise -> congruence > 0.7, loss = 0.
+    let d = 64
+    let emotion = det_rand_wide(d, 42)
+    let output = make_congruent_output(emotion, d, 1001)
+    let cong = emotion_congruence(emotion, output, d)
+    let loss = affective_loss(cong)
+    println("  [T1] congruent: d=" + str(d) + " congruence=" + str(cong) + " loss=" + str(loss))
+    println("  [T1] target: congruence > " + str(CONGRUENCE_THRESHOLD) + ", loss = 0")
+    if cong <= CONGRUENCE_THRESHOLD {
+        println("  [T1] FAIL -- congruence " + str(cong) + " <= " + str(CONGRUENCE_THRESHOLD))
+        return false
+    }
+    if loss != 0.0 {
+        println("  [T1] FAIL -- loss " + str(loss) + " != 0")
+        return false
+    }
+    return true
+}
+
+fn check_T2() -> bool {
+    // Incongruent pair: output = -emotion + small noise -> congruence < 0.3, loss > 0.
+    let d = 64
+    let emotion = det_rand_wide(d, 42)
+    let output = make_incongruent_output(emotion, d, 2002)
+    let cong = emotion_congruence(emotion, output, d)
+    let loss = affective_loss(cong)
+    println("  [T2] incongruent: d=" + str(d) + " congruence=" + str(cong) + " loss=" + str(loss))
+    println("  [T2] target: congruence < 0.3, loss > 0")
+    if cong >= 0.3 {
+        println("  [T2] FAIL -- congruence " + str(cong) + " >= 0.3")
+        return false
+    }
+    if loss <= 0.0 {
+        println("  [T2] FAIL -- loss " + str(loss) + " <= 0")
+        return false
+    }
+    return true
+}
+
+fn check_T3() -> bool {
+    // CORE done_criteria: Stroop interference reproduced.
+    // Congruent condition must score HIGHER congruence than incongruent.
+    // Test across multiple emotion vectors (batch of 16) to ensure the
+    // effect is robust, not a single-seed fluke.
+    let d = 64
+    let n_trials = 16
+    let mut cong_wins = 0
+    let mut total_cong_sum = 0.0
+    let mut total_incong_sum = 0.0
+    let mut i = 0
+    while i < n_trials {
+        let emotion = det_rand_wide(d, 100 + i * 31)
+        let out_cong = make_congruent_output(emotion, d, 3000 + i * 17)
+        let out_incong = make_incongruent_output(emotion, d, 4000 + i * 23)
+        let c_cong = emotion_congruence(emotion, out_cong, d)
+        let c_incong = emotion_congruence(emotion, out_incong, d)
+        total_cong_sum = total_cong_sum + c_cong
+        total_incong_sum = total_incong_sum + c_incong
+        // Congruent must beat incongruent for Stroop effect.
+        if c_cong > c_incong { cong_wins = cong_wins + 1 }
+        i = i + 1
+    }
+    let avg_cong = total_cong_sum / to_float(n_trials)
+    let avg_incong = total_incong_sum / to_float(n_trials)
+    println("  [T3] Stroop test: " + str(n_trials) + " trials")
+    println("  [T3] avg_congruent=" + str(avg_cong) + "  avg_incongruent=" + str(avg_incong))
+    println("  [T3] congruent wins: " + str(cong_wins) + "/" + str(n_trials))
+    println("  [T3] target: congruent_congruence > incongruent_congruence (all trials)")
+    if cong_wins < n_trials {
+        println("  [T3] FAIL -- congruent did not beat incongruent in all " + str(n_trials) + " trials")
+        return false
+    }
+    // Also verify the average gap is substantial (not just epsilon).
+    let gap = avg_cong - avg_incong
+    println("  [T3] Stroop gap (avg_cong - avg_incong) = " + str(gap))
+    if gap < 0.3 {
+        println("  [T3] FAIL -- Stroop gap " + str(gap) + " < 0.3 (too weak)")
+        return false
+    }
+    return true
+}
+
+fn check_T4() -> bool {
+    // Determinism: two identical calls produce byte-identical results.
+    let d = 64
+    let emotion = det_rand_wide(d, 42)
+    let output = make_congruent_output(emotion, d, 1001)
+    let cong_a = emotion_congruence(emotion, output, d)
+    let cong_b = emotion_congruence(emotion, output, d)
+    let loss_a = affective_loss(cong_a)
+    let loss_b = affective_loss(cong_b)
+    println("  [T4] cong_a=" + str(cong_a) + " cong_b=" + str(cong_b))
+    println("  [T4] loss_a=" + str(loss_a) + " loss_b=" + str(loss_b))
+    if fabs(cong_a - cong_b) > 0.0 {
+        println("  [T4] FAIL -- congruence values differ")
+        return false
+    }
+    if fabs(loss_a - loss_b) > 0.0 {
+        println("  [T4] FAIL -- loss values differ")
+        return false
+    }
+    // Also test incongruent path for determinism.
+    let out_inc = make_incongruent_output(emotion, d, 2002)
+    let ci_a = emotion_congruence(emotion, out_inc, d)
+    let ci_b = emotion_congruence(emotion, out_inc, d)
+    if fabs(ci_a - ci_b) > 0.0 {
+        println("  [T4] FAIL -- incongruent congruence values differ")
+        return false
+    }
+    println("  [T4] byte-identical on both congruent and incongruent paths")
+    return true
+}
+
+fn check_T5() -> bool {
+    // Latency: congruence + loss at d=64, warm-cache < 1000 ms.
+    let d = 64
+    let emotion = det_rand_wide(d, 42)
+    let out_cong = make_congruent_output(emotion, d, 1001)
+    let out_incong = make_incongruent_output(emotion, d, 2002)
+    // Warm calls.
+    let _w1 = emotion_congruence(emotion, out_cong, d)
+    let _w2 = affective_loss(_w1)
+    let _w3 = emotion_congruence(emotion, out_incong, d)
+    let _w4 = affective_loss(_w3)
+
+    let t0 = clock()
+    // Measure both congruent and incongruent paths.
+    let c1 = emotion_congruence(emotion, out_cong, d)
+    let l1 = affective_loss(c1)
+    let c2 = emotion_congruence(emotion, out_incong, d)
+    let l2 = affective_loss(c2)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] latency (d=" + str(d) + ", 2 evals): " + str(ms) + " ms")
+    println("  [T5] congruent: c=" + str(c1) + " L=" + str(l1) + "  incongruent: c=" + str(c2) + " L=" + str(l2))
+    println("  [T5] target: < 1000 ms")
+    if ms < 1000.0 { return true }
+    println("  [T5] FAIL -- " + str(ms) + " ms >= 1000 ms")
+    return false
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[alm_affective_loss] ALM-P12-2 self-test (Stroop interference)")
+    println("  threshold=" + str(CONGRUENCE_THRESHOLD) + "  lambda_affect=" + str(LAMBDA_AFFECT))
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[alm_affective_loss] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[alm_affective_loss] ALL 5/5 PASS")
+    } else {
+        println("[alm_affective_loss] SOME FAILED")
+    }
+}
+
+main()

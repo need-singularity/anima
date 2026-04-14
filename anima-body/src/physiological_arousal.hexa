@@ -1,0 +1,254 @@
+// physiological_arousal.hexa — PHYS-P12-1 physiological arousal: HR/GSR emulation
+//
+// Roadmap: shared/roadmaps/anima.json P12 PHYSICS track, PHYS-P12-1
+//   "physiological arousal — HR/GSR emulation"
+//   done_criteria: "arousal level 추적"
+//
+// Purpose:
+//   Emulate the sympathetic-nervous-system arousal axis that modulates
+//   consciousness via two peripheral biomarkers:
+//
+//     Heart Rate (HR) — beats per minute. Controlled by vagal tone and
+//       sympathetic outflow; tracks arousal with fast (~1-2 s) dynamics.
+//       Baseline resting HR = 70 bpm (healthy adult).
+//
+//     Galvanic Skin Response (GSR, aka EDA) — skin conductance in micro-
+//       Siemens. Driven by eccrine sweat gland innervation; tracks arousal
+//       with a sluggish (~3-5 s) rise and exponential decay.
+//       Baseline GSR = 2.0 uS.
+//
+//   The composite arousal_level (0..1) is a normalized blend of HR and
+//   GSR, feeding the affective dimension of the consciousness loop.
+//
+// State representation:
+//   Flat array [hr_bpm, gsr_micro_siemens, arousal_level]
+//   Index constants: IDX_HR=0, IDX_GSR=1, IDX_AROUSAL=2
+//
+// Dynamics (arousal_step):
+//   Given emotion_arousal in [0,1]:
+//     HR = BASELINE_HR + (emotion_arousal - BASELINE_AROUSAL) * 40
+//          clamped to [HR_MIN, HR_MAX] = [50, 120]
+//     GSR = 0.8 * prev_gsr + 0.2 * (BASELINE_GSR + emotion_arousal * 5)
+//          (exponential moving average — models sweat gland lag)
+//     arousal_level = (hr_norm + gsr_norm) / 2
+//       where hr_norm   = (HR  - HR_MIN)  / (HR_MAX  - HR_MIN)
+//             gsr_norm  = (GSR - GSR_MIN) / (GSR_MAX - GSR_MIN)
+//
+// Self-tests (T1-T5):
+//   T1 Baseline state correct (HR ~ 70, GSR ~ 2.0)
+//   T2 High arousal input  -> HR increases, GSR increases
+//   T3 Low arousal input   -> HR stays near baseline
+//   T4 Determinism         -> two identical runs produce same state
+//   T5 Latency             -> 200 steps < 500 ms
+//
+// Hexa stage0 constraints honored:
+//   - HEXA-FIRST (pure .hexa; no .py/.rs/.sh)
+//   - flat array (not typed [float]; index-based access)
+//   - lists pass-by-value — never mutate arguments
+//   - single-line return expressions (stage0 multi-line return bug)
+//   - no multi-float struct returns (stage0 corruption bug)
+
+// ================================================================
+// Constants
+// ================================================================
+
+let BASELINE_HR      = 70.0    // bpm — resting heart rate
+let BASELINE_GSR     = 2.0     // uS  — resting skin conductance
+let BASELINE_AROUSAL = 0.3     // dimensionless — neutral arousal
+
+let HR_MIN           = 50.0    // bpm — deep relaxation / sleep
+let HR_MAX           = 120.0   // bpm — high arousal (not max exercise)
+let GSR_MIN          = 0.5     // uS  — very dry / relaxed
+let GSR_MAX          = 12.0    // uS  — strong arousal / stress
+
+let HR_GAIN          = 40.0    // bpm per unit arousal deviation
+let GSR_DECAY        = 0.8     // EMA weight on previous GSR
+let GSR_INPUT        = 0.2     // EMA weight on new GSR input
+let GSR_SCALE        = 5.0     // uS per unit emotion_arousal
+
+// State array indices
+let IDX_HR           = 0
+let IDX_GSR          = 1
+let IDX_AROUSAL      = 2
+
+// ================================================================
+// Scalar helpers
+// ================================================================
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn clamp(x: float, lo: float, hi: float) -> float {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+// ================================================================
+// Core API
+// ================================================================
+
+// make_baseline() -> array [hr, gsr, arousal]
+// Returns the physiological resting state.
+fn make_baseline() -> array {
+    let mut state = []
+    state = state.push(BASELINE_HR)
+    state = state.push(BASELINE_GSR)
+    state = state.push(BASELINE_AROUSAL)
+    return state
+}
+
+// normalize_hr(hr) -> float in [0,1]
+fn normalize_hr(hr: float) -> float {
+    return (hr - HR_MIN) / (HR_MAX - HR_MIN)
+}
+
+// normalize_gsr(gsr) -> float in [0,1]
+fn normalize_gsr(gsr: float) -> float {
+    return (gsr - GSR_MIN) / (GSR_MAX - GSR_MIN)
+}
+
+// arousal_step(state, emotion_arousal) -> new state array
+//
+// Advances the physiological model by one tick.
+//   emotion_arousal: float in [0,1] — the affective arousal input.
+//
+// Returns a NEW state array (pass-by-value; original is untouched).
+fn arousal_step(state: array, emotion_arousal: float) -> array {
+    let ea = clamp(emotion_arousal, 0.0, 1.0)
+
+    // HR — fast tracking of arousal
+    let raw_hr = BASELINE_HR + (ea - BASELINE_AROUSAL) * HR_GAIN
+    let hr = clamp(raw_hr, HR_MIN, HR_MAX)
+
+    // GSR — exponential moving average (models sweat gland lag)
+    let prev_gsr = state[IDX_GSR]
+    let target_gsr = BASELINE_GSR + ea * GSR_SCALE
+    let raw_gsr = GSR_DECAY * prev_gsr + GSR_INPUT * target_gsr
+    let gsr = clamp(raw_gsr, GSR_MIN, GSR_MAX)
+
+    // Composite arousal level
+    let hr_norm = clamp(normalize_hr(hr), 0.0, 1.0)
+    let gsr_norm = clamp(normalize_gsr(gsr), 0.0, 1.0)
+    let arousal = (hr_norm + gsr_norm) / 2.0
+
+    let mut out = []
+    out = out.push(hr)
+    out = out.push(gsr)
+    out = out.push(arousal)
+    return out
+}
+
+// multi_step(state, emotion_arousal, n) -> final state after n steps
+// Useful for testing convergence / steady-state behavior.
+fn multi_step(state: array, emotion_arousal: float, n: int) -> array {
+    let mut s = state
+    let mut i = 0
+    while i < n {
+        s = arousal_step(s, emotion_arousal)
+        i = i + 1
+    }
+    return s
+}
+
+// ================================================================
+// Self-tests
+// ================================================================
+
+fn check_T1_baseline() -> bool {
+    // Baseline state: HR ~ 70 bpm, GSR ~ 2.0 uS, arousal ~ 0.3
+    let s = make_baseline()
+    let hr_ok = fabs(s[IDX_HR] - 70.0) < 0.01
+    let gsr_ok = fabs(s[IDX_GSR] - 2.0) < 0.01
+    let ok = hr_ok && gsr_ok
+    println("  [T1] HR=" + str(s[IDX_HR]) + " GSR=" + str(s[IDX_GSR])
+        + " arousal=" + str(s[IDX_AROUSAL]))
+    return ok
+}
+
+fn check_T2_high_arousal() -> bool {
+    // High emotion_arousal (0.9) -> HR increases well above baseline,
+    // GSR increases after several steps (EMA lag).
+    let s0 = make_baseline()
+    let s1 = multi_step(s0, 0.9, 20)
+    let hr_up = s1[IDX_HR] > BASELINE_HR + 10.0
+    let gsr_up = s1[IDX_GSR] > BASELINE_GSR + 0.5
+    let ok = hr_up && gsr_up
+    println("  [T2] after 20 steps @ ea=0.9: HR=" + str(s1[IDX_HR])
+        + " GSR=" + str(s1[IDX_GSR]) + " arousal=" + str(s1[IDX_AROUSAL]))
+    return ok
+}
+
+fn check_T3_low_arousal() -> bool {
+    // Low emotion_arousal (0.3, same as baseline) -> HR stays near 70.
+    let s0 = make_baseline()
+    let s1 = multi_step(s0, 0.3, 20)
+    let hr_near = fabs(s1[IDX_HR] - BASELINE_HR) < 1.0
+    let ok = hr_near
+    println("  [T3] after 20 steps @ ea=0.3: HR=" + str(s1[IDX_HR])
+        + " GSR=" + str(s1[IDX_GSR]) + " arousal=" + str(s1[IDX_AROUSAL]))
+    return ok
+}
+
+fn check_T4_determinism() -> bool {
+    // Two identical runs must produce byte-identical results.
+    let s0a = make_baseline()
+    let s1a = multi_step(s0a, 0.75, 50)
+    let s0b = make_baseline()
+    let s1b = multi_step(s0b, 0.75, 50)
+    let hr_eq = s1a[IDX_HR] == s1b[IDX_HR]
+    let gsr_eq = s1a[IDX_GSR] == s1b[IDX_GSR]
+    let ar_eq = s1a[IDX_AROUSAL] == s1b[IDX_AROUSAL]
+    let ok = hr_eq && gsr_eq && ar_eq
+    println("  [T4] run_a HR=" + str(s1a[IDX_HR]) + " run_b HR=" + str(s1b[IDX_HR])
+        + " match=" + str(ok))
+    return ok
+}
+
+fn check_T5_latency() -> bool {
+    // 200 arousal_step calls must complete in < 500 ms.
+    let t0 = clock()
+    let s0 = make_baseline()
+    let sf = multi_step(s0, 0.6, 200)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    let ok = ms < 500.0
+    println("  [T5] 200 steps in " + str(ms) + " ms (< 500 ms)")
+    return ok
+}
+
+fn test() {
+    println("[anima-body/physiological_arousal] PHYS-P12-1 — HR/GSR arousal emulation")
+    println("  baseline: HR=70bpm GSR=2.0uS arousal=0.3")
+    println("  model: HR tracks arousal (fast), GSR EMA (lagged), composite blend")
+    println("")
+
+    let t1 = check_T1_baseline()
+    if t1 { println("T1 PASS — baseline state correct") } else { println("T1 FAIL") }
+
+    let t2 = check_T2_high_arousal()
+    if t2 { println("T2 PASS — high arousal input increases HR and GSR") } else { println("T2 FAIL") }
+
+    let t3 = check_T3_low_arousal()
+    if t3 { println("T3 PASS — low arousal input keeps HR near baseline") } else { println("T3 FAIL") }
+
+    let t4 = check_T4_determinism()
+    if t4 { println("T4 PASS — deterministic (two runs identical)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5_latency()
+    if t5 { println("T5 PASS — 200 steps under 500 ms") } else { println("T5 FAIL") }
+
+    println("")
+    let a12 = t1 && t2
+    let a345 = t3 && t4 && t5
+    let all = a12 && a345
+    if all {
+        println("[anima-body/physiological_arousal] 5/5 PASS — PHYS-P12-1 DONE")
+    } else {
+        println("[anima-body/physiological_arousal] SOME FAILED")
+    }
+}
+
+test()
