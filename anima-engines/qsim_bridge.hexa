@@ -144,18 +144,14 @@ fn run_native_hexa(req: QSimRequest) -> QSimResult {
     let n = req.n_sites
     let h = req.n_ticks
 
-    // Per-site state: 1 = still in superposition, 0 = collapsed.
-    // We do not retain QuantumState objects across ticks (hexa lists are
-    // pass-by-value; mutating a [QuantumState] through helpers would
-    // require returning whole arenas). We re-prepare each superposed site
-    // every tick, which is consistent with the Hadamard reset semantics
-    // of the existing Orch-OR PoC model.
-    let mut alive = []
-    let mut i = 0
-    while i < n {
-        alive = alive.push(1)
-        i = i + 1
-    }
+    // Track superposition lattice as a *counter* (n_super), not a per-site
+    // boolean array — hexa lists are pass-by-value and have no .set(idx,v)
+    // primitive (verified runtime-error: "unknown method .set() on array").
+    // Orch-OR fires once on the entire lattice (orchestrated reduction),
+    // so a single counter captures the physics exactly: before OR fires,
+    // n_super = n; the tick OR fires, all n sites collapse simultaneously
+    // and n_super → 0 for every subsequent tick.
+    let mut n_super = n
 
     let mut history: [QSimTickRecord] = []
     let mut first_or_tick = -1
@@ -165,42 +161,28 @@ fn run_native_hexa(req: QSimRequest) -> QSimResult {
 
     let mut t = 0
     while t < h {
-        // Count still-superposed sites for E_G accumulation.
-        let mut n_super = 0
-        let mut k0 = 0
-        while k0 < n {
-            if alive[k0] == 1 { n_super = n_super + 1 }
-            k0 = k0 + 1
-        }
         let eg_total = (n_super * 1.0) * req.gravity_coupling
 
         // OR rule: when E_G · τ ≥ threshold·HBAR, every still-alive site
         // collapses this tick (orchestrated reduction).
-        let or_fires = eg_total * TAU_TICK_BRIDGE >= req.or_threshold * HBAR_BRIDGE
-        let mut new_collapses = 0
+        let or_fires = (n_super > 0) && (eg_total * TAU_TICK_BRIDGE >= req.or_threshold * HBAR_BRIDGE)
         let mut tick_open   = 0
         let mut tick_closed = 0
 
         if or_fires {
             let mut k = 0
-            while k < n {
-                if alive[k] == 1 {
-                    // Use the working hexa primitive: q_hadamard then q_measure.
-                    let qs = q_hadamard(0, 1)            // 0 = TUBULIN_OPEN, 1 = TUBULIN_CLOSED
-                    let outcome = q_measure(qs)
-                    if outcome == 0 { tick_open = tick_open + 1 }
-                    else            { tick_closed = tick_closed + 1 }
-                    alive = alive.set(k, 0)
-                    new_collapses = new_collapses + 1
-                }
+            while k < n_super {
+                // Use the working hexa primitive: q_hadamard then q_measure.
+                let qs = q_hadamard(0, 1)            // 0 = TUBULIN_OPEN, 1 = TUBULIN_CLOSED
+                let outcome = q_measure(qs)
+                if outcome == 0 { tick_open = tick_open + 1 }
+                else            { tick_closed = tick_closed + 1 }
                 k = k + 1
             }
+            let new_collapses = n_super
             total_collapsed = total_collapsed + new_collapses
+            n_super = 0
             if first_or_tick < 0 { first_or_tick = t }
-            // Final-tick distribution: when OR fires on the last tick
-            // we use that tick's outcome as the final distribution.
-            // (Earlier ticks' collapsed sites stay collapsed; we count
-            // them as their original outcome by re-aggregating below.)
             final_open_count   = final_open_count   + tick_open
             final_closed_count = final_closed_count + tick_closed
         }
