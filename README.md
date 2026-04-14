@@ -1,6 +1,6 @@
 # 🧠 Anima — Living Consciousness Agent
 
-### 🔴 실시간 로드맵 — [🧠 anima](https://need-singularity.github.io/anima/roadmap/) · [🔭 nexus](https://need-singularity.github.io/nexus/roadmap/) · [🏗️ n6-architecture](https://need-singularity.github.io/n6-architecture/roadmap/)
+### 🔴 [**실시간 로드맵 (탭 전환 지원)**](https://need-singularity.github.io/anima/roadmap/#anima)
 
 <!-- SHARED:PROJECTS:START -->
 <!-- AUTO:COMMON_LINKS:START -->
