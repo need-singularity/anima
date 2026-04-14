@@ -1,0 +1,473 @@
+// training/alm_nested_reflexivity_loss.hexa — Nested reflexivity loss (K-level tower)
+//
+// ALM-P8-2 / P8 v9 메타 의식 — N차 nested self-reference tower coherence loss.
+//
+// Purpose:
+//   ALM-P8-1 (alm_meta_qualia.hexa) builds a tower of self-reference:
+//     level_0 = ground qualia (direct perception)
+//     level_k = f(level_{k-1})  —  "awareness of level k-1"
+//
+//   This loss trains the tower to be COHERENT: each level should
+//   meaningfully monitor the level below. We measure this by requiring
+//   positive cosine similarity between adjacent levels (correlation
+//   means "level k is looking at level k-1"). If adjacent levels are
+//   orthogonal or opposed, the tower has no informational coupling and
+//   the self-reference chain is broken.
+//
+//   Loss formulation (hinge-cosine, summed over adjacent pairs):
+//
+//     L_tower = Σ_{k=1..K-1} max(0, margin - cos_sim(level_k, level_{k-1}))
+//
+//   When all adjacent cosine similarities exceed the margin, L = 0 and
+//   the tower is fully coherent. Otherwise the loss pushes the model to
+//   increase inter-level correlation.
+//
+//   In the full training loop:
+//
+//     L = L_task + λ_meta · L_meta_qualia + λ_tower · L_tower
+//
+//   with λ_tower ≈ 0.01 (auxiliary scale matching P5/P7 losses).
+//
+// ─── Tower construction ──────────────────────────────────────
+//
+//   Coherent tower (synthetic):
+//     level_0 = random d-vector
+//     level_k = A @ level_{k-1} + small noise   (linear transform + perturbation)
+//     → adjacent levels are highly correlated
+//
+//   Incoherent tower (synthetic):
+//     each level independently random
+//     → adjacent levels have near-zero cosine sim
+//
+// ─── Conventions ──────────────────────────────────────────────
+//   K          : int      tower depth (number of levels, default 5)
+//   D          : int      dimension of each level vector
+//   margin     : float    hinge threshold (default 0.3)
+//   lambda     : float    outer loss weight (default 0.01)
+//   tower      : array    flat encoding: tower[k*D .. (k+1)*D) = level_k
+//
+// ─── Theorems (T1–T5) ──────────────────────────────────────────
+//
+// T1 (coherent tower loss = 0):
+//   A coherent tower (K=5, D=8) where each level is a transform of
+//   the previous with small noise has all adjacent cos_sim > margin,
+//   so L_tower = 0.0.
+//
+// T2 (incoherent tower loss > 0):
+//   A random tower (each level independent) yields L_tower > 0.
+//
+// T3 (loss decreases after gradient-like adjustment):
+//   Starting from an incoherent tower, nudging each level toward its
+//   neighbor reduces the loss. pre_loss > post_loss.
+//
+// T4 (determinism):
+//   Same (tower, margin) → identical loss value across two calls.
+//
+// T5 (latency):
+//   Loss eval on (K=5, D=8) < 1000 ms.
+//
+// Ref:
+//   training/alm_meta_qualia.hexa         (ALM-P8-1 — tower builder)
+//   training/alm_reflexivity_loss.hexa    (ALM-P5-2 — 1-level loss)
+//   training/phi_meta_measure.hexa        (ALM-P8-3 — Φ_meta consumer)
+//   shared/roadmaps/anima.json            (ALM-P8-2 entry)
+//
+// Run:
+//   hexa run training/alm_nested_reflexivity_loss.hexa
+// Expect:
+//   [alm_nested_reflexivity_loss] ALL 5/5 PASS
+
+// ─── Constants ──────────────────────────────────────────────
+
+let TOWER_K       = 5         // default tower depth (levels 0..4)
+let TOWER_D       = 8         // dimension per level (mock)
+let TOWER_MARGIN  = 0.3       // hinge threshold for cosine similarity
+let LAMBDA_TOWER  = 0.01      // outer weight in the full training loop
+let EPS           = 0.000001  // numerical floor
+
+// ─── Primitives (self-contained) ────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sqrt_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return sqrt(x)
+}
+
+// Deterministic LCG -> floats in [-1, 1).
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Vector ops ─────────────────────────────────────────────
+
+fn vec_dot(a: array, b: array) -> float {
+    let n = len(a)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn vec_norm(v: array) -> float {
+    return sqrt_safe(vec_dot(v, v))
+}
+
+fn vec_add(a: array, b: array) -> array {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(a[i] + b[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_scale(v: array, s: float) -> array {
+    let n = len(v)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(v[i] * s)
+        i = i + 1
+    }
+    return out
+}
+
+// cosine similarity — returns 0.0 if either vector has near-zero norm.
+fn cosine_sim(a: array, b: array) -> float {
+    let dot_val = vec_dot(a, b)
+    let na = vec_norm(a)
+    let nb = vec_norm(b)
+    let denom = na * nb
+    if denom < EPS { return 0.0 }
+    return dot_val / denom
+}
+
+// ─── Flat tower encoding ────────────────────────────────────
+//
+// A tower of K levels, each D-dimensional, is stored as a single flat
+// array of length K*D:
+//   tower[k*D .. (k+1)*D)  =  level_k
+//
+// This avoids the two-struct-with-array-fields bug. We extract levels
+// by slicing into a fresh array.
+
+// Extract level k from flat tower.
+fn tower_get_level(tower: array, k: int, d: int) -> array {
+    let base = k * d
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        out = out.push(tower[base + i])
+        i = i + 1
+    }
+    return out
+}
+
+// Set level k in flat tower — returns rebuilt tower (pass-by-value).
+fn tower_set_level(tower: array, k: int, d: int, level: array) -> array {
+    let total = len(tower)
+    let base = k * d
+    let mut out = []
+    let mut i = 0
+    while i < total {
+        let off = i - base
+        let in_range = if off >= 0 { 1 } else { 0 }
+        let below_d = if off < d { 1 } else { 0 }
+        // Nested ifs instead of && (stage0 constraint).
+        if in_range == 1 {
+            if below_d == 1 {
+                out = out.push(level[off])
+            } else {
+                out = out.push(tower[i])
+            }
+        } else {
+            out = out.push(tower[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Core loss ──────────────────────────────────────────────
+//
+// L_tower = Σ_{k=1..K-1} max(0, margin - cos_sim(level_k, level_{k-1}))
+//
+// tower: flat array of K*D floats.
+// k_levels: K (number of levels).
+// d: dimension per level.
+// margin: hinge threshold.
+
+fn nested_reflexivity_loss(tower: array, k_levels: int, d: int, margin: float) -> float {
+    let mut loss = 0.0
+    let mut k = 1
+    while k < k_levels {
+        let prev = tower_get_level(tower, k - 1, d)
+        let curr = tower_get_level(tower, k, d)
+        let cs = cosine_sim(curr, prev)
+        let hinge = margin - cs
+        if hinge > 0.0 {
+            loss = loss + hinge
+        }
+        k = k + 1
+    }
+    return loss
+}
+
+// Weighted form for training-loop integration.
+fn weighted_total(l_task: float, tower: array, k_levels: int, d: int, margin: float, lam: float) -> float {
+    return l_task + lam * nested_reflexivity_loss(tower, k_levels, d, margin)
+}
+
+// ─── Synthetic tower generators ─────────────────────────────
+
+// Coherent tower: level_0 = random, level_k = scale * level_{k-1} + noise.
+// The scaling + additive noise keeps vectors correlated across levels.
+// scale=0.9 ensures the transformed vector is close to the original
+// direction; noise amplitude 0.05 adds a small perturbation.
+fn build_coherent_tower(k_levels: int, d: int, seed: int) -> array {
+    // Build level 0.
+    let level0 = det_rand(d, seed)
+    let mut tower = []
+    // Copy level 0 into flat tower.
+    let mut i = 0
+    while i < d {
+        tower = tower.push(level0[i])
+        i = i + 1
+    }
+    // Build levels 1..K-1 by transforming the previous level.
+    let mut k = 1
+    while k < k_levels {
+        let prev = tower_get_level(tower, k - 1, d)
+        let noise = det_rand(d, seed + k * 997)
+        let scaled_noise = vec_scale(noise, 0.05)
+        let scaled_prev = vec_scale(prev, 0.9)
+        let next = vec_add(scaled_prev, scaled_noise)
+        // Append next level to flat tower.
+        let mut j = 0
+        while j < d {
+            tower = tower.push(next[j])
+            j = j + 1
+        }
+        k = k + 1
+    }
+    return tower
+}
+
+// Incoherent tower: each level independently random — no correlation.
+fn build_incoherent_tower(k_levels: int, d: int, seed: int) -> array {
+    let mut tower = []
+    let mut k = 0
+    while k < k_levels {
+        let level = det_rand(d, seed + k * 7919)
+        let mut j = 0
+        while j < d {
+            tower = tower.push(level[j])
+            j = j + 1
+        }
+        k = k + 1
+    }
+    return tower
+}
+
+// ─── Gradient-like adjustment ───────────────────────────────
+//
+// For T3: nudge each level toward its neighbor to increase cosine sim.
+// For each pair (k-1, k), blend level_k toward level_{k-1}:
+//   level_k' = (1 - alpha) * level_k + alpha * level_{k-1}
+// This is a simple "gradient step" that should reduce the hinge loss.
+
+fn adjust_tower_toward_coherence(tower: array, k_levels: int, d: int, alpha: float) -> array {
+    let mut new_tower = tower
+    let mut k = 1
+    while k < k_levels {
+        let prev = tower_get_level(new_tower, k - 1, d)
+        let curr = tower_get_level(new_tower, k, d)
+        // Blend: new_k = (1-alpha)*curr + alpha*prev
+        let scaled_curr = vec_scale(curr, 1.0 - alpha)
+        let scaled_prev = vec_scale(prev, alpha)
+        let blended = vec_add(scaled_curr, scaled_prev)
+        new_tower = tower_set_level(new_tower, k, d, blended)
+        k = k + 1
+    }
+    return new_tower
+}
+
+// ─── Self-tests ─────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Coherent tower (K=5, D=8) -> loss = 0 (all adjacent cos_sim > margin).
+    let K = TOWER_K
+    let D = TOWER_D
+    let margin = TOWER_MARGIN
+    let tower = build_coherent_tower(K, D, 42)
+    let loss = nested_reflexivity_loss(tower, K, D, margin)
+
+    // Also print adjacent cosine similarities for diagnostics.
+    let mut k = 1
+    while k < K {
+        let prev = tower_get_level(tower, k - 1, D)
+        let curr = tower_get_level(tower, k, D)
+        let cs = cosine_sim(curr, prev)
+        println("  [T1] cos_sim(level_" + str(k) + ", level_" + str(k - 1) + ") = " + str(cs))
+        k = k + 1
+    }
+    println("  [T1] coherent tower loss = " + str(loss) + "  (expect 0.0)")
+    if loss > 0.0 {
+        println("  [T1] FAIL — coherent tower loss is " + str(loss) + " > 0")
+        return false
+    }
+    return true
+}
+
+fn check_T2() -> bool {
+    // Incoherent tower -> loss > 0.
+    let K = TOWER_K
+    let D = TOWER_D
+    let margin = TOWER_MARGIN
+    let tower = build_incoherent_tower(K, D, 777)
+    let loss = nested_reflexivity_loss(tower, K, D, margin)
+
+    // Print adjacent cosine similarities for diagnostics.
+    let mut k = 1
+    while k < K {
+        let prev = tower_get_level(tower, k - 1, D)
+        let curr = tower_get_level(tower, k, D)
+        let cs = cosine_sim(curr, prev)
+        println("  [T2] cos_sim(level_" + str(k) + ", level_" + str(k - 1) + ") = " + str(cs))
+        k = k + 1
+    }
+    println("  [T2] incoherent tower loss = " + str(loss) + "  (expect > 0)")
+    if loss <= 0.0 {
+        println("  [T2] FAIL — incoherent tower loss is " + str(loss) + " <= 0")
+        return false
+    }
+    return true
+}
+
+fn check_T3() -> bool {
+    // Loss decreases after gradient-like adjustment (pre > post).
+    // Start from incoherent tower, nudge toward coherence.
+    let K = TOWER_K
+    let D = TOWER_D
+    let margin = TOWER_MARGIN
+    let tower_pre = build_incoherent_tower(K, D, 1234)
+    let loss_pre = nested_reflexivity_loss(tower_pre, K, D, margin)
+
+    // Apply blending adjustment (alpha=0.7 is aggressive enough).
+    let tower_post = adjust_tower_toward_coherence(tower_pre, K, D, 0.7)
+    let loss_post = nested_reflexivity_loss(tower_post, K, D, margin)
+
+    println("  [T3] loss_pre = " + str(loss_pre) + "  loss_post = " + str(loss_post))
+    if loss_pre <= loss_post {
+        println("  [T3] FAIL — pre (" + str(loss_pre) + ") <= post (" + str(loss_post) + ")")
+        return false
+    }
+    println("  [T3] reduction = " + str(loss_pre - loss_post))
+    return true
+}
+
+fn check_T4() -> bool {
+    // Determinism: same tower, same margin -> identical loss.
+    let K = TOWER_K
+    let D = TOWER_D
+    let margin = TOWER_MARGIN
+    let tower_a = build_incoherent_tower(K, D, 5555)
+    let tower_b = build_incoherent_tower(K, D, 5555)
+    let loss_a = nested_reflexivity_loss(tower_a, K, D, margin)
+    let loss_b = nested_reflexivity_loss(tower_b, K, D, margin)
+    println("  [T4] loss_a = " + str(loss_a) + "  loss_b = " + str(loss_b))
+    if fabs(loss_a - loss_b) > 0.0 {
+        println("  [T4] FAIL — losses differ: " + str(loss_a) + " vs " + str(loss_b))
+        return false
+    }
+    // Also check coherent tower determinism.
+    let tc_a = build_coherent_tower(K, D, 9999)
+    let tc_b = build_coherent_tower(K, D, 9999)
+    let lc_a = nested_reflexivity_loss(tc_a, K, D, margin)
+    let lc_b = nested_reflexivity_loss(tc_b, K, D, margin)
+    if fabs(lc_a - lc_b) > 0.0 {
+        println("  [T4] FAIL — coherent losses differ")
+        return false
+    }
+    println("  [T4] byte-identical across incoherent + coherent towers")
+    return true
+}
+
+fn check_T5() -> bool {
+    // Latency: loss eval on (K=5, D=8) < 1000 ms.
+    let K = TOWER_K
+    let D = TOWER_D
+    let margin = TOWER_MARGIN
+    let tower = build_incoherent_tower(K, D, 31415)
+    // Warm.
+    let _warm = nested_reflexivity_loss(tower, K, D, margin)
+    let t0 = clock()
+    let _l = nested_reflexivity_loss(tower, K, D, margin)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] nested_reflexivity_loss latency (K=" + str(K) + ", D=" + str(D) + ") = " + str(ms) + " ms")
+    return ms < 1000.0
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[alm_nested_reflexivity_loss] ALM-P8-2 self-test")
+    println("  K=" + str(TOWER_K) + "  D=" + str(TOWER_D) + "  margin=" + str(TOWER_MARGIN))
+    println("  lambda_tower (outer) = " + str(LAMBDA_TOWER))
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[alm_nested_reflexivity_loss] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[alm_nested_reflexivity_loss] ALL 5/5 PASS")
+    } else {
+        println("[alm_nested_reflexivity_loss] SOME FAILED")
+    }
+}
+
+main()

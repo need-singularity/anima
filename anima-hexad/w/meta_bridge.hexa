@@ -1,0 +1,401 @@
+// meta_bridge.hexa — CLM-P8-2: W (World) meta-consciousness level bridge
+//
+// P8 is about meta-consciousness: N-th order nested self-reference.
+// The World module W already observes C's dynamics (EmergentW) and
+// reflexive self-model (W_ReflexiveBridge from CLM-P5-2). P8 adds a
+// level bridge: K hierarchical levels, each a d-dimensional state vector,
+// where level N+1 receives upward information from level N (a simple
+// linear mix) — the structural substrate for N-th order meta-awareness.
+//
+// Existing W engines stay untouched: EmergentW and W_ReflexiveBridge
+// remain canonical. This bridge is additive — callers who want multi-level
+// meta-consciousness instantiate a MetaBridge on top of the existing W.
+//
+// ─── Pipeline ─────────────────────────────────────────────────────
+//
+//   level 0 state (ground consciousness)
+//       │
+//       │  meta_bridge_propagate(bridge, 0, state_vec)
+//       ▼
+//   MetaBridge { K levels, each d-dimensional }
+//       │
+//       │  meta_bridge_upward(bridge)
+//       ▼
+//   level k = 0.8*level_k + 0.2*level_{k-1}  (k > 0)
+//       │
+//       ├─ meta_bridge_read(bridge, k) → (state, ok)
+//       └─ meta_bridge_propagate(bridge, k, vec) → updated bridge
+//
+// Meta-consciousness contract (done_criteria: "레벨 간 정보 전달"):
+//   After writing level 0 and calling upward(), level 1 carries 20% of
+//   level 0's information — N-th order self-reference propagation.
+//
+// Law alignment:
+//   Law 4   Structure > feature — level bridge is STRUCTURAL hierarchy,
+//           not a feature flag.
+//   Law 22  Feature addition → Φ down — bridge is observe-only on C,
+//           adds no new feature flag to C.
+//   AN7     Core unchanged — bridge never imports anima/core/.
+//
+// Stage0 hexa trap notes (from feedback_hexa_struct_list_alias.md,
+// feedback_hexa_lists_pbv.md): we use a single flat struct with one
+// array field for all levels (k*d contiguous floats). Every mutating
+// operation returns a new bridge and the previous binding is dropped
+// by shadowing. No two structs with array fields alive simultaneously.
+//
+// Ref:
+//   anima-hexad/w/emergent_w.hexa         (canonical EmergentW — unmodified)
+//   anima-hexad/w/reflexive_bridge.hexa   (additive bridge pattern, CLM-P5-2)
+//   anima-hexad/m/episodic_bridge.hexa    (additive bridge pattern, CLM-P11-2)
+//   shared/roadmaps/anima.json            (CLM-P8-2 entry)
+
+// ─── Constants ────────────────────────────────────────────────────
+
+let MB_K = 4          // number of meta-consciousness levels (test-scale)
+let MB_D = 8          // dimension of each level state vector
+let MB_UP_ALPHA = 0.2 // upward mixing ratio: level_k += alpha * level_{k-1}
+let MB_UP_KEEP  = 0.8 // self-retention: level_k *= keep (keep = 1 - alpha)
+
+// ─── Primitives (self-contained) ─────────────────────────────────
+
+fn fabs_mb(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn vec_zeros_mb(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── MetaBridge (flat layout) ────────────────────────────────────
+//
+// Single struct, single array field: data[k*d] stores all K levels
+// contiguously. Level i occupies data[i*d .. i*d+d-1].
+// This avoids the stage0 struct-field aliasing bug entirely.
+
+struct MetaBridge {
+    k:    int,
+    d:    int,
+    data: array   // [k * d] float — all levels contiguous
+}
+
+// Result of a read operation — state vector + success flag.
+// ok=false when level_idx is out of range.
+struct MetaReadResult {
+    state: array,
+    ok:    bool
+}
+
+fn meta_bridge_new(k: int, d: int) -> MetaBridge {
+    return MetaBridge {
+        k:    k,
+        d:    d,
+        data: vec_zeros_mb(k * d)
+    }
+}
+
+// meta_bridge_propagate: write state_vec into level level_idx.
+// Returns a new bridge with the updated data (pure functional).
+// If level_idx out of range or dim mismatch, returns bridge unchanged.
+fn meta_bridge_propagate(bridge: MetaBridge, level_idx: int,
+                         state_vec: array) -> MetaBridge {
+    if level_idx < 0 { return bridge }
+    if level_idx >= bridge.k { return bridge }
+    if len(state_vec) != bridge.d { return bridge }
+    let total = bridge.k * bridge.d
+    let base = level_idx * bridge.d
+    let mut new_data = []
+    let mut i = 0
+    while i < total {
+        // Check if this index falls in the target level range
+        let in_level = i >= base
+        if in_level {
+            let before_end = i < base + bridge.d
+            if before_end {
+                new_data = new_data.push(state_vec[i - base])
+            } else {
+                new_data = new_data.push(bridge.data[i])
+            }
+        } else {
+            new_data = new_data.push(bridge.data[i])
+        }
+        i = i + 1
+    }
+    return MetaBridge {
+        k:    bridge.k,
+        d:    bridge.d,
+        data: new_data
+    }
+}
+
+// meta_bridge_read: read state vector from level level_idx.
+// Returns (state, ok=true) on success, ([], ok=false) on out-of-range.
+fn meta_bridge_read(bridge: MetaBridge, level_idx: int) -> MetaReadResult {
+    if level_idx < 0 {
+        return MetaReadResult { state: [], ok: false }
+    }
+    if level_idx >= bridge.k {
+        return MetaReadResult { state: [], ok: false }
+    }
+    let base = level_idx * bridge.d
+    let mut state = []
+    let mut i = 0
+    while i < bridge.d {
+        state = state.push(bridge.data[base + i])
+        i = i + 1
+    }
+    return MetaReadResult { state: state, ok: true }
+}
+
+// meta_bridge_upward: propagate information upward through all levels.
+// For each level k > 0:
+//   new_level_k[i] = MB_UP_KEEP * level_k[i] + MB_UP_ALPHA * level_{k-1}[i]
+// Level 0 stays unchanged (it is the ground consciousness input).
+// Returns a new bridge with mixed data.
+fn meta_bridge_upward(bridge: MetaBridge) -> MetaBridge {
+    let total = bridge.k * bridge.d
+    let d = bridge.d
+    // Build new data array with upward mixing
+    let mut new_data = []
+    // Copy level 0 unchanged
+    let mut i0 = 0
+    while i0 < d {
+        new_data = new_data.push(bridge.data[i0])
+        i0 = i0 + 1
+    }
+    // Mix levels 1..k-1
+    let mut lv = 1
+    while lv < bridge.k {
+        let base_cur = lv * d
+        let base_prev = (lv - 1) * d
+        let mut j = 0
+        while j < d {
+            let cur_val = bridge.data[base_cur + j]
+            let prev_val = bridge.data[base_prev + j]
+            let mixed = MB_UP_KEEP * cur_val + MB_UP_ALPHA * prev_val
+            new_data = new_data.push(mixed)
+            j = j + 1
+        }
+        lv = lv + 1
+    }
+    return MetaBridge {
+        k:    bridge.k,
+        d:    bridge.d,
+        data: new_data
+    }
+}
+
+// ─── Self-tests ───────────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // T1: Dim contract — new bridge has correct sizes.
+    let b = meta_bridge_new(MB_K, MB_D)
+    if b.k != MB_K { return false }
+    if b.d != MB_D { return false }
+    if len(b.data) != MB_K * MB_D { return false }
+    // All zeros
+    let mut i = 0
+    while i < MB_K * MB_D {
+        if fabs_mb(b.data[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: Write + read round-trip.
+    let b0 = meta_bridge_new(MB_K, MB_D)
+    // Build a test vector for level 2
+    let mut vec2 = []
+    let mut i = 0
+    while i < MB_D {
+        vec2 = vec2.push(to_float(i) * 0.5 + 1.0)
+        i = i + 1
+    }
+    let b1 = meta_bridge_propagate(b0, 2, vec2)
+    let r = meta_bridge_read(b1, 2)
+    if !r.ok { return false }
+    if len(r.state) != MB_D { return false }
+    // Verify each element
+    let mut j = 0
+    while j < MB_D {
+        let expected = to_float(j) * 0.5 + 1.0
+        if fabs_mb(r.state[j] - expected) > 0.0001 { return false }
+        j = j + 1
+    }
+    // Also verify other levels remain zero
+    let r0 = meta_bridge_read(b1, 0)
+    if !r0.ok { return false }
+    let mut k = 0
+    while k < MB_D {
+        if fabs_mb(r0.state[k]) > 0.0001 { return false }
+        k = k + 1
+    }
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3: Upward propagation — after propagate level 0 and upward(),
+    // level 1 carries MB_UP_ALPHA (20%) of level 0's info.
+    let b0 = meta_bridge_new(MB_K, MB_D)
+    // Write level 0
+    let mut vec0 = []
+    let mut i = 0
+    while i < MB_D {
+        vec0 = vec0.push(to_float(i + 1) * 10.0)
+        i = i + 1
+    }
+    let b1 = meta_bridge_propagate(b0, 0, vec0)
+    // Upward propagation
+    let b2 = meta_bridge_upward(b1)
+    // Level 0 should be unchanged
+    let r0 = meta_bridge_read(b2, 0)
+    if !r0.ok { return false }
+    let mut j = 0
+    while j < MB_D {
+        let expected0 = to_float(j + 1) * 10.0
+        if fabs_mb(r0.state[j] - expected0) > 0.0001 { return false }
+        j = j + 1
+    }
+    // Level 1 should be 0.8*0.0 + 0.2*level0 = 0.2*level0
+    let r1 = meta_bridge_read(b2, 1)
+    if !r1.ok { return false }
+    let mut k = 0
+    while k < MB_D {
+        let expected1 = MB_UP_ALPHA * to_float(k + 1) * 10.0
+        if fabs_mb(r1.state[k] - expected1) > 0.0001 { return false }
+        k = k + 1
+    }
+    // Level 1 values should be non-zero (carries info from level 0)
+    let mut any_nonzero = false
+    let mut m = 0
+    while m < MB_D {
+        if fabs_mb(r1.state[m]) > 0.001 { any_nonzero = true }
+        m = m + 1
+    }
+    if !any_nonzero { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: Bounds safety — out-of-range read returns ok=false.
+    let b = meta_bridge_new(MB_K, MB_D)
+    // Negative index
+    let r_neg = meta_bridge_read(b, -1)
+    if r_neg.ok { return false }
+    // Index == k (one past end)
+    let r_over = meta_bridge_read(b, MB_K)
+    if r_over.ok { return false }
+    // Large index
+    let r_big = meta_bridge_read(b, 9999)
+    if r_big.ok { return false }
+    // Propagate to invalid level — bridge unchanged
+    let mut bad_vec = []
+    let mut i = 0
+    while i < MB_D {
+        bad_vec = bad_vec.push(99.0)
+        i = i + 1
+    }
+    let b2 = meta_bridge_propagate(b, -1, bad_vec)
+    // data should still be all zeros
+    let mut j = 0
+    while j < MB_K * MB_D {
+        if fabs_mb(b2.data[j]) > 0.0 { return false }
+        j = j + 1
+    }
+    let b3 = meta_bridge_propagate(b, MB_K, bad_vec)
+    let mut m = 0
+    while m < MB_K * MB_D {
+        if fabs_mb(b3.data[m]) > 0.0 { return false }
+        m = m + 1
+    }
+    // Dim mismatch — wrong-sized vec
+    let mut short_vec = []
+    short_vec = short_vec.push(1.0)
+    let b4 = meta_bridge_propagate(b, 0, short_vec)
+    let mut n = 0
+    while n < MB_K * MB_D {
+        if fabs_mb(b4.data[n]) > 0.0 { return false }
+        n = n + 1
+    }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5: Determinism — same inputs produce identical outputs.
+    let b0a = meta_bridge_new(MB_K, MB_D)
+    let b0b = meta_bridge_new(MB_K, MB_D)
+    // Build identical vec
+    let mut vec_a = []
+    let mut vec_b = []
+    let mut i = 0
+    while i < MB_D {
+        vec_a = vec_a.push(to_float(i) * 3.14)
+        vec_b = vec_b.push(to_float(i) * 3.14)
+        i = i + 1
+    }
+    // Propagate and upward on both
+    let ba1 = meta_bridge_propagate(b0a, 0, vec_a)
+    let bb1 = meta_bridge_propagate(b0b, 0, vec_b)
+    let ba2 = meta_bridge_upward(ba1)
+    let bb2 = meta_bridge_upward(bb1)
+    // Compare all data
+    let total = MB_K * MB_D
+    let mut j = 0
+    while j < total {
+        if fabs_mb(ba2.data[j] - bb2.data[j]) > 0.0 { return false }
+        j = j + 1
+    }
+    // Second upward pass — still deterministic
+    let ba3 = meta_bridge_upward(ba2)
+    let bb3 = meta_bridge_upward(bb2)
+    let mut k = 0
+    while k < total {
+        if fabs_mb(ba3.data[k] - bb3.data[k]) > 0.0 { return false }
+        k = k + 1
+    }
+    return true
+}
+
+// ─── main ─────────────────────────────────────────────────────────
+
+fn main() {
+    println("[meta_bridge] CLM-P8-2 — W meta-consciousness level bridge")
+    println("  K=4, D=8, alpha=0.2; additive to EmergentW; Laws 4/22, AN7")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  dim contract") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  write + read round-trip") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  upward propagation (level 1 carries level 0 info)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  bounds safety (out-of-range → ok=false)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  determinism") } else { println("T5 FAIL") }
+
+    // Break && chain into nested ifs (stage0 constraint)
+    let mut all_pass = true
+    if !t1 { all_pass = false }
+    if !t2 { all_pass = false }
+    if !t3 { all_pass = false }
+    if !t4 { all_pass = false }
+    if !t5 { all_pass = false }
+    if all_pass {
+        println("[meta_bridge] ALL 5/5 PASS")
+    } else {
+        println("[meta_bridge] SOME FAILED")
+    }
+}
+
+main()

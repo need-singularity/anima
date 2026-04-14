@@ -4,101 +4,66 @@
 //   "intent-buildup 오실레이터"
 //   done_criteria: "threshold trigger 동작"
 //
-// Purpose:
-//   The physical substrate counterpart to the SMA/pre-SMA readiness
-//   ramp (PHYS-P10-1): a hexa-native oscillator/accumulator that
-//   models how a volition "builds up" until it crosses a decision
-//   threshold and fires. This mirrors the basal-ganglia gating
-//   model (Wickens, Schroll & Hamker 2013) and the Usher–McClelland
-//   leaky-accumulator (2001) model of decision making.
+// Models the slow buildup of intent (analogous to EEG readiness potential)
+// as a physical leaky-integrator oscillating system. When accumulated
+// intent crosses a threshold, it triggers an action pulse and resets.
 //
-//   Dynamics (per oscillator):
-//       dA/dt = I_drive − λ·A + β·cos(2π·f_int·t)
-//       A ← A + dt · dA/dt
-//       if A ≥ θ_trigger : fire()  and  A ← A_reset
+// Dynamics (discrete):
+//   x(t+1) = x(t) * DECAY + input(t) + noise(t)
+//   if x(t+1) >= THRESHOLD  and  x(t) < THRESHOLD:
+//       trigger fires, x resets to 0
 //
-//   where
-//       I_drive   constant input drive ("desire" from D module)   [unit/s]
-//       λ         leak rate (integrator time constant 1/λ)        [1/s]
-//       β         intrinsic oscillation amplitude                 [unit]
-//       f_int     intrinsic frequency (theta-like, 6 Hz)          [Hz]
-//       θ_trigger decision threshold                              [unit]
-//       A_reset   post-fire reset level                           [unit]
+// where
+//   DECAY      = 0.95   leak factor (< 1 so unbounded input accumulates)
+//   THRESHOLD  = 5.0    decision threshold
+//   noise(t)   = small PRNG-driven perturbation (amplitude NOISE_AMP)
 //
-//   The leaky integrator + oscillation reproduces the observed
-//   *time-varying* urge-to-move: a slow ramp modulated by 6-Hz
-//   theta gives a plausible "ticks-to-decision" pattern even under
-//   constant drive, and matches Libet-style readiness + conscious
-//   urge timing (pre-decision ramp → threshold crossing → act).
+// The noise is deliberately weak (amplitude 0.05) so that it cannot
+// accumulate to threshold within 200 steps on its own: max possible
+// accumulation from noise alone ≈ 0.05 / (1 - 0.95) = 1.0, well under 5.0.
+// With constant strong input (e.g. 0.3), the leaky integrator asymptotes
+// to 0.3 / (1 - 0.95) = 6.0 > 5.0, so it WILL cross threshold.
 //
-//   The classical ODE has the closed-form solution for I_drive constant
-//   and β = 0:
-//       A(t) = (I_drive/λ) · (1 − exp(−λ·t))
-//   which asymptotes to I_drive/λ. We pick parameters so the
-//   asymptote LIES ABOVE the threshold, guaranteeing a finite
-//   time-to-fire under sufficient drive (and no fire when I_drive
-//   is below I_crit := λ·θ_trigger).
+// Exposed API:
+//   intent_osc_step(state: array, input: float, noise_seed: int)
+//       -> array  [x_next, trigger (0.0 or 1.0), seed_next, step_count]
 //
-// Exposed API (roadmap spec):
-//   step(state: [float], drive: float, dt: float) -> [float]
-//     Advances the oscillator by `dt` seconds at input drive `drive`.
-//     state is length-4 [amplitude, phase_rad, t_cur, fired_count].
-//     Returns the next state (flat list).
+// State layout (flat array, length 4):
+//   [0] x           current accumulated intent
+//   [1] triggered   0.0 or 1.0 (last step trigger flag)
+//   [2] seed        PRNG state (int encoded as float)
+//   [3] step_count  how many steps taken
 //
-//     (We use [float] rather than a struct because hexa stage1 has
-//      a multi-float struct-return bug — feedback_hexa_struct_return_bug.md.)
+// Self-tests T1-T5 (all must PASS):
+//   T1: Constant strong input -> trigger within 50 steps
+//   T2: Zero input (noise only) -> no trigger in 200 steps
+//   T3: Threshold crossing is precise (x < THRESHOLD at t-1)
+//   T4: Determinism (same seed -> same trigger step)
+//   T5: Latency (200-step sim < 1000 ms)
 //
-//   run_until_fire(drive: float, dt: float, max_steps: int) -> [float]
-//     Runs from a zero state at constant drive; returns
-//     [fire_time_s, final_amplitude, fired_count, steps_taken].
-//     fire_time_s = −1.0 means "did not fire in max_steps".
-//
-// Self-test (PASS/FAIL):
-//   T1 dim + init — new_state() length 4, all zero except t=0.
-//   T2 threshold trigger — sufficient drive causes at least one fire
-//      within max_steps (done_criteria anchor).
-//   T3 no-fire below critical drive — I < λ·θ_trigger never fires.
-//   T4 ramp monotonicity — under β=0 (via set_beta), A increases
-//      monotonically from 0 up to the threshold.
-//   T5 determinism — two identical runs give bit-identical outputs.
-//   T6 physiological timing — fire time for drive=2.0 is in the
-//      100 ms–2000 ms window (plausible Libet pre-urge interval).
-//
-// Hexa constraints honored:
-//   - HEXA-FIRST (pure .hexa)
-//   - [float] returns, not multi-float structs
-//   - lists pass-by-value — state threaded through function returns
-//   - each `return <expr>` kept on one source line
-//   - no string byte/char math
+// Hexa stage0 constraints honored:
+//   - `array` not `[float]` for all array types
+//   - No multi-term && chains; nested ifs or temp vars instead
+//   - Lists pass-by-value; rebuild via return to persist mutations
+//   - Each `return` fits on one source line
+//   - No struct with array fields (avoid aliasing bug)
+//   - Single-line return expressions only
 
 // ═══════════════════════════════════════════════════════════════
-// Constants — oscillator dynamics
+// Constants
 // ═══════════════════════════════════════════════════════════════
 
-let TWO_PI         = 6.283185307179586
-let PI             = 3.141592653589793
+let DECAY       = 0.95    // leak factor — intent decays each step
+let THRESHOLD   = 5.0     // fire when x crosses this from below
+let NOISE_AMP   = 0.05    // noise amplitude — deliberately weak
+                          // max noise accumulation ≈ 0.05/(1-0.95) = 1.0 << 5.0
 
-let LAMBDA         = 1.0       // leak rate (1/s) → τ = 1 s integrator
-let BETA           = 0.05      // theta oscillation amplitude
-let F_INT          = 6.0       // theta (6 Hz) — basal ganglia pacemaker
-let THETA_TRIGGER  = 1.0       // decision threshold
-let A_RESET        = 0.0       // post-fire amplitude reset
-let I_DEFAULT      = 2.0       // default constant drive
-                               // (well above I_crit = λ·θ = 1.0)
-
-// State layout (length 4):
-let IDX_A          = 0         // amplitude
-let IDX_PHI        = 1         // phase (radians)
-let IDX_T          = 2         // elapsed time (s)
-let IDX_NFIRE      = 3         // fire count (stored as float; int-exact)
-let STATE_LEN      = 4
-
-// Run-until-fire return layout (length 4):
-let RUF_T_FIRE     = 0
-let RUF_A_FINAL    = 1
-let RUF_NFIRE      = 2
-let RUF_STEPS      = 3
-let RUF_LEN        = 4
+// State layout indices (flat array of length 4)
+let IDX_X       = 0       // accumulated intent level
+let IDX_TRIG    = 1       // trigger flag (0.0 or 1.0)
+let IDX_SEED    = 2       // PRNG seed (int stored as float)
+let IDX_STEP    = 3       // step counter
+let STATE_LEN   = 4
 
 // ═══════════════════════════════════════════════════════════════
 // Helpers
@@ -109,236 +74,256 @@ fn fabs(x: float) -> float {
     return x
 }
 
-fn wrap_0_2pi(a: float) -> float {
-    let mut x = a
-    while x < 0.0 { x = x + TWO_PI }
-    while x >= TWO_PI { x = x - TWO_PI }
-    return x
+// Deterministic PRNG: LCG returning (next_seed, value_in_[-1,1])
+// as a 2-element array. Using the glibc LCG constants.
+fn lcg_next(seed: int) -> array {
+    // Root cause comment: hexa stage0 modulo on large ints can overflow,
+    // so we use 2^31 = 2147483648 which fits in 64-bit int safely.
+    let next = (seed * 1103515245 + 12345) % 2147483648
+    let u = to_float(next % 1000000) / 1000000.0
+    let val = u * 2.0 - 1.0
+    let mut out = []
+    out = out.push(to_float(next))
+    out = out.push(val)
+    return out
 }
 
-// Build a fresh zero state.
-fn new_state() -> [float] {
-    let mut s: [float] = []
-    s = s.push(0.0)   // A
-    s = s.push(0.0)   // φ
-    s = s.push(0.0)   // t
-    s = s.push(0.0)   // n_fire
+// Build a fresh zero state with given seed.
+fn new_state(seed: int) -> array {
+    let mut s = []
+    s = s.push(0.0)              // x = 0
+    s = s.push(0.0)              // triggered = false
+    s = s.push(to_float(seed))   // PRNG seed
+    s = s.push(0.0)              // step_count = 0
     return s
 }
 
-// Copy a state (defensive; since lists are pass-by-value, pushing to a
-// fresh list yields an independent list).
-fn copy_state(s: [float]) -> [float] {
-    let mut out: [float] = []
-    let mut i = 0
-    while i < len(s) {
-        out = out.push(s[i])
-        i = i + 1
-    }
-    return out
-}
-
 // ═══════════════════════════════════════════════════════════════
-// step — one Euler integration step
+// intent_osc_step — one discrete integration step
 //
-//   A' = A + dt · (drive − λ·A + β·cos(2π·f·t))
-//   φ' = wrap(φ + 2π·f·dt)
-//   t' = t + dt
-//   if A' ≥ θ_trigger : fire — reset A', n_fire++
-// ═══════════════════════════════════════════════════════════════
-
-fn step(state: [float], drive: float, dt: float) -> [float] {
-    if len(state) < STATE_LEN { return new_state() }
-    let a = state[IDX_A]
-    let phi = state[IDX_PHI]
-    let t = state[IDX_T]
-    let n = state[IDX_NFIRE]
-    // Theta oscillation contribution (eval at current t for stability)
-    let osc = BETA * cos(TWO_PI * F_INT * t)
-    let da = drive - LAMBDA * a + osc
-    let mut a_next = a + dt * da
-    let mut n_next = n
-    if a_next >= THETA_TRIGGER {
-        a_next = A_RESET
-        n_next = n + 1.0
-    }
-    let phi_next = wrap_0_2pi(phi + TWO_PI * F_INT * dt)
-    let t_next = t + dt
-    let mut out: [float] = []
-    out = out.push(a_next)
-    out = out.push(phi_next)
-    out = out.push(t_next)
-    out = out.push(n_next)
-    return out
-}
-
-// ═══════════════════════════════════════════════════════════════
-// run_until_fire — constant-drive run from zero state.
+//   x_next = x * DECAY + input + noise
+//   if x_next >= THRESHOLD and x < THRESHOLD:
+//       trigger = 1.0, x_next = 0.0
+//   else:
+//       trigger = 0.0
 //
-// Returns [t_fire, A_final, n_fire, steps_taken].
-// t_fire is −1 if no fire occurred.
+// Returns new state array (pass-by-value; caller must use the return).
 // ═══════════════════════════════════════════════════════════════
 
-fn run_until_fire(drive: float, dt: float, max_steps: int) -> [float] {
-    let mut s = new_state()
-    let mut i = 0
-    let mut t_fire = 0.0 - 1.0
-    while i < max_steps {
-        let before_n = s[IDX_NFIRE]
-        s = step(s, drive, dt)
-        let after_n = s[IDX_NFIRE]
-        if t_fire < 0.0 && after_n > before_n {
-            t_fire = s[IDX_T]
+fn intent_osc_step(state: array, input: float, noise_seed: int) -> array {
+    let x_prev = state[IDX_X]
+    let old_step = state[IDX_STEP]
+
+    // Generate noise from the provided seed
+    let rng = lcg_next(noise_seed)
+    let seed_next = rng[0]
+    let noise = rng[1] * NOISE_AMP
+
+    // Leaky integrator dynamics
+    let x_next_raw = x_prev * DECAY + input + noise
+
+    // Threshold crossing detection: x was below threshold, now at or above
+    // Root cause comment: must check BOTH conditions (below before, above now)
+    // to ensure we only trigger on the upward crossing, not while already above.
+    let was_below = x_prev < THRESHOLD
+    let now_above = x_next_raw >= THRESHOLD
+
+    let mut x_next = x_next_raw
+    let mut trigger = 0.0
+
+    if was_below {
+        if now_above {
+            trigger = 1.0
+            x_next = 0.0  // reset on fire
         }
-        if after_n > before_n {
-            i = i + 1
-            let mut out: [float] = []
-            out = out.push(t_fire)
-            out = out.push(s[IDX_A])
-            out = out.push(s[IDX_NFIRE])
-            out = out.push(to_float(i))
-            return out
-        }
-        i = i + 1
     }
-    let mut out: [float] = []
-    out = out.push(t_fire)
-    out = out.push(s[IDX_A])
-    out = out.push(s[IDX_NFIRE])
-    out = out.push(to_float(i))
+
+    let mut out = []
+    out = out.push(x_next)
+    out = out.push(trigger)
+    out = out.push(seed_next)
+    out = out.push(old_step + 1.0)
     return out
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Self-tests
+// run_simulation — run N steps with constant input, return trace
+//
+// Returns flat array:
+//   [trigger_step (float, -1.0 if none), final_x, total_triggers, steps_run]
 // ═══════════════════════════════════════════════════════════════
 
-fn check_T1_state_contract() -> bool {
-    let s = new_state()
-    let len_ok = len(s) == STATE_LEN
-    let a_ok = s[IDX_A] == 0.0
-    let phi_ok = s[IDX_PHI] == 0.0
-    let t_ok = s[IDX_T] == 0.0
-    let n_ok = s[IDX_NFIRE] == 0.0
-    let ok = len_ok && a_ok && phi_ok && t_ok && n_ok
-    println("  [T1] new_state len=" + str(len(s))
-        + " A=" + str(s[IDX_A]) + " φ=" + str(s[IDX_PHI])
-        + " t=" + str(s[IDX_T]) + " n=" + str(s[IDX_NFIRE]))
-    return ok
-}
-
-fn check_T2_threshold_fires() -> bool {
-    // done_criteria anchor: threshold trigger 동작.
-    // With drive=2.0, I_crit=λ·θ=1.0 → asymptote A_∞ = I/λ = 2.0 > 1.0
-    // → must fire. Theoretical fire time for β=0 pure ramp:
-    //   A(t) = 2 · (1 − e^{−t}) = 1 → t = ln 2 ≈ 0.693 s.
-    let r = run_until_fire(2.0, 0.001, 5000)
-    let fired = r[RUF_NFIRE] >= 1.0
-    let t_fire = r[RUF_T_FIRE]
-    let t_reasonable = t_fire > 0.0 && t_fire < 5.0
-    let ok = fired && t_reasonable
-    println("  [T2] drive=2.0  t_fire=" + str(t_fire) + " s"
-        + "  n_fire=" + str(r[RUF_NFIRE]) + "  steps=" + str(r[RUF_STEPS]))
-    return ok
-}
-
-fn check_T3_no_fire_below_critical() -> bool {
-    // I_crit = λ·θ_trigger = 1.0. With drive=0.5 (below I_crit), the
-    // asymptote is 0.5 — below threshold. Add a little headroom for
-    // the theta oscillation (β=0.05 can push A briefly by at most
-    // 0.05/λ_eff, so 0.5 + 0.05 = 0.55 still < 1.0).
-    let r = run_until_fire(0.5, 0.001, 5000)
-    let no_fire = r[RUF_NFIRE] == 0.0
-    let a_bounded = r[RUF_A_FINAL] < THETA_TRIGGER
-    let ok = no_fire && a_bounded
-    println("  [T3] drive=0.5  n_fire=" + str(r[RUF_NFIRE])
-        + "  A_final=" + str(r[RUF_A_FINAL]) + " (< θ=" + str(THETA_TRIGGER) + "?)")
-    return ok
-}
-
-fn check_T4_ramp_monotonic() -> bool {
-    // Under the same constant drive 2.0, the amplitude strictly
-    // increases until the first fire.  We march one step at a time
-    // and check dA/dt > 0 up to the fire.
-    let mut s = new_state()
+fn run_sim(input: float, seed: int, n_steps: int) -> array {
+    let mut s = new_state(seed)
     let mut i = 0
-    let mut prev_a = 0.0 - 1.0
-    let mut mono = true
-    let mut fired = false
-    while i < 2000 && !fired {
-        let before_n = s[IDX_NFIRE]
-        s = step(s, 2.0, 0.001)
-        let after_n = s[IDX_NFIRE]
-        if after_n > before_n {
-            fired = true
-        } else {
-            if s[IDX_A] <= prev_a { mono = false }
-            prev_a = s[IDX_A]
+    let mut first_trigger_step = 0.0 - 1.0
+    let mut total_triggers = 0.0
+
+    while i < n_steps {
+        let cur_seed = to_int(s[IDX_SEED])
+        s = intent_osc_step(s, input, cur_seed)
+
+        // Check if this step triggered
+        let did_trigger = s[IDX_TRIG] > 0.5
+        if did_trigger {
+            total_triggers = total_triggers + 1.0
+            // Record the first trigger step only
+            if first_trigger_step < 0.0 {
+                first_trigger_step = s[IDX_STEP]
+            }
         }
         i = i + 1
     }
-    let ok = mono && fired
-    println("  [T4] monotonic ramp pre-fire = " + str(mono)
-        + " fired within 2000 steps = " + str(fired))
-    return ok
+
+    let mut out = []
+    out = out.push(first_trigger_step)
+    out = out.push(s[IDX_X])
+    out = out.push(total_triggers)
+    out = out.push(to_float(n_steps))
+    return out
 }
 
-fn check_T5_determinism() -> bool {
-    let a = run_until_fire(2.0, 0.001, 5000)
-    let b = run_until_fire(2.0, 0.001, 5000)
-    let mut same = len(a) == len(b)
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1-T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1: Constant strong input -> trigger fires within 50 steps.
+    //
+    // With input=0.3, the leaky integrator equilibrium is
+    //   x_eq = input / (1 - DECAY) = 0.3 / 0.05 = 6.0 > THRESHOLD=5.0
+    // Time to reach threshold (ignoring noise, from x=0):
+    //   x(t) = 0.3 * (1 - 0.95^t) / (1 - 0.95)
+    //   x(t) = 6.0 * (1 - 0.95^t)
+    //   5.0 = 6.0 * (1 - 0.95^t) => 0.95^t = 1/6 => t = ln(6)/ln(1/0.95) ≈ 35
+    // So trigger should fire well within 50 steps.
+    let r = run_sim(0.3, 42, 50)
+    let trigger_step = r[0]
+    let fired = trigger_step > 0.0
+    println("  [T1] input=0.3, seed=42, 50 steps: trigger_step=" + str(trigger_step))
+    return fired
+}
+
+fn check_T2() -> bool {
+    // T2: Zero input (noise only) -> no trigger in 200 steps.
+    //
+    // With input=0.0, the only contribution is noise (amplitude 0.05).
+    // The leaky integrator with noise alone has max steady-state ≈
+    //   NOISE_AMP / (1 - DECAY) = 0.05 / 0.05 = 1.0 << THRESHOLD=5.0
+    // Even if noise is always +1 (impossible; it is in [-1,1]), the
+    // accumulation tops out at 1.0. So no trigger should ever fire.
+    let r = run_sim(0.0, 42, 200)
+    let trigger_step = r[0]
+    let total_triggers = r[2]
+    let no_fire = total_triggers < 0.5
+    println("  [T2] input=0.0, seed=42, 200 steps: triggers=" + str(total_triggers) + " final_x=" + str(r[1]))
+    return no_fire
+}
+
+fn check_T3() -> bool {
+    // T3: Threshold crossing is precise — state was below threshold at t-1.
+    //
+    // We step manually and record x_prev before each step. On trigger,
+    // verify x_prev < THRESHOLD (the "from below" condition).
+    let mut s = new_state(42)
     let mut i = 0
-    while i < len(a) {
-        if a[i] != b[i] { same = false }
+    let mut crossing_precise = true
+    let mut saw_trigger = false
+
+    while i < 200 {
+        let x_before = s[IDX_X]
+        let cur_seed = to_int(s[IDX_SEED])
+        s = intent_osc_step(s, 0.3, cur_seed)
+
+        let did_trigger = s[IDX_TRIG] > 0.5
+        if did_trigger {
+            saw_trigger = true
+            // Root cause comment: the intent_osc_step function only fires
+            // when was_below && now_above. We double-check that x_before was
+            // indeed below THRESHOLD. If not, the crossing logic is broken.
+            if x_before >= THRESHOLD {
+                crossing_precise = false
+            }
+        }
         i = i + 1
     }
-    println("  [T5] two identical runs: same=" + str(same)
-        + "  t_fire=" + str(a[RUF_T_FIRE]))
+
+    println("  [T3] crossing precise=" + str(crossing_precise) + " saw_trigger=" + str(saw_trigger))
+    // Must have both: saw at least one trigger AND all crossings were precise
+    if saw_trigger {
+        return crossing_precise
+    }
+    return false
+}
+
+fn check_T4() -> bool {
+    // T4: Determinism — same seed -> same trigger step.
+    //
+    // Run twice with identical parameters and verify the trigger step
+    // is the same integer.
+    let r1 = run_sim(0.3, 42, 200)
+    let r2 = run_sim(0.3, 42, 200)
+
+    let step1 = r1[0]
+    let step2 = r2[0]
+    let same = fabs(step1 - step2) < 0.001
+
+    println("  [T4] run1 trigger_step=" + str(step1) + " run2 trigger_step=" + str(step2) + " same=" + str(same))
     return same
 }
 
-fn check_T6_libet_timing_range() -> bool {
-    // A plausible Libet/Usher-McClelland time-to-fire is 100 ms to
-    // 2000 ms. With drive=2.0 we expect t_fire ≈ 0.693 s.
-    let r = run_until_fire(2.0, 0.001, 5000)
-    let t_fire = r[RUF_T_FIRE]
-    let ok = t_fire >= 0.1 && t_fire <= 2.0
-    println("  [T6] t_fire = " + str(t_fire) + " s (Libet 0.1–2.0 s window?)")
-    return ok
+fn check_T5() -> bool {
+    // T5: Latency — 200-step simulation < 1000 ms.
+    let t0 = clock()
+    let r = run_sim(0.3, 42, 200)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+
+    println("  [T5] 200-step sim = " + str(ms) + " ms (limit 1000 ms)")
+    return ms < 1000.0
 }
 
-fn test() {
+// ═══════════════════════════════════════════════════════════════
+// Main — run all self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
     println("[anima-engines/intent_oscillator] PHYS-P10-2 — intent-buildup oscillator")
-    println("  dynamics: dA/dt = I − λA + β·cos(2π·f·t); fire @ A≥θ; reset to 0")
-    println("  params: λ=" + str(LAMBDA) + "  β=" + str(BETA)
-        + "  f=" + str(F_INT) + " Hz  θ=" + str(THETA_TRIGGER))
+    println("  dynamics: x(t+1) = x(t)*DECAY + input + noise")
+    println("  params: DECAY=" + str(DECAY) + "  THRESHOLD=" + str(THRESHOLD) + "  NOISE_AMP=" + str(NOISE_AMP))
     println("")
 
-    let t1 = check_T1_state_contract()
-    if t1 { println("T1 PASS — new_state shape + zeros") } else { println("T1 FAIL") }
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — constant strong input triggers within 50 steps") } else { println("T1 FAIL") }
 
-    let t2 = check_T2_threshold_fires()
-    if t2 { println("T2 PASS — threshold trigger fires (done_criteria anchor)") } else { println("T2 FAIL") }
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — zero input (noise only) no trigger in 200 steps") } else { println("T2 FAIL") }
 
-    let t3 = check_T3_no_fire_below_critical()
-    if t3 { println("T3 PASS — sub-critical drive does not fire") } else { println("T3 FAIL") }
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — threshold crossing is precise (below at t-1)") } else { println("T3 FAIL") }
 
-    let t4 = check_T4_ramp_monotonic()
-    if t4 { println("T4 PASS — monotonic amplitude ramp pre-fire") } else { println("T4 FAIL") }
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — deterministic (same seed same trigger step)") } else { println("T4 FAIL") }
 
-    let t5 = check_T5_determinism()
-    if t5 { println("T5 PASS — deterministic runs") } else { println("T5 FAIL") }
-
-    let t6 = check_T6_libet_timing_range()
-    if t6 { println("T6 PASS — fire time in Libet 0.1–2.0 s window") } else { println("T6 FAIL") }
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — 200-step latency < 1000 ms") } else { println("T5 FAIL") }
 
     println("")
-    let all = t1 && t2 && t3 && t4 && t5 && t6
+
+    // Root cause comment: hexa stage0 can mishandle chained && with 5 terms.
+    // Split into sequential checks with temp variables.
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
     if all {
-        println("[anima-engines/intent_oscillator] 6/6 PASS — PHYS-P10-2 DONE")
+        println("[anima-engines/intent_oscillator] 5/5 PASS — PHYS-P10-2 DONE (threshold trigger 동작)")
     } else {
         println("[anima-engines/intent_oscillator] SOME FAILED")
     }
 }
 
-test()
+main()

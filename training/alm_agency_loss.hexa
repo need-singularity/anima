@@ -318,23 +318,42 @@ fn build_dataset(n_each: int, K: int, seed_offset: int) -> array {
 }
 
 // ─── Logistic classifier ────────────────────────────────────
+//
+// Representation: flat array of length D_FEAT + 1.
+//   params[0..D_FEAT)    : weights w
+//   params[D_FEAT]        : bias b
+//
+// We deliberately avoid a struct { w: array, b: float } here — hexa
+// struct field aliasing bugs (feedback_hexa_struct_list_alias.md) can
+// corrupt the second struct's array field when two structs coexist in
+// the same scope during a determinism test.
 
-struct AgencyClassifier {
-    w: array,    // [D_FEAT]
-    b: float     // scalar bias
+fn classifier_new(seed: int) -> array {
+    let w = det_rand(D_FEAT, seed)
+    let mut out = []
+    let mut i = 0
+    while i < D_FEAT {
+        out = out.push(w[i])
+        i = i + 1
+    }
+    out = out.push(0.0)    // bias
+    return out
 }
 
-fn classifier_new(seed: int) -> AgencyClassifier {
-    let w = det_rand(D_FEAT, seed)
-    return AgencyClassifier { w: w, b: 0.0 }
+fn cls_get_w(params: array, i: int) -> float {
+    return params[i]
+}
+
+fn cls_get_b(params: array) -> float {
+    return params[D_FEAT]
 }
 
 // Forward: single sample.
-fn cls_forward(cls: AgencyClassifier, x: array) -> float {
-    let mut z = cls.b
+fn cls_forward(params: array, x: array) -> float {
+    let mut z = cls_get_b(params)
     let mut i = 0
     while i < D_FEAT {
-        z = z + cls.w[i] * x[i]
+        z = z + cls_get_w(params, i) * x[i]
         i = i + 1
     }
     return sigmoid(z)
@@ -359,12 +378,13 @@ fn bce_sample(pred: float, label: float) -> float {
 //   dL/dw_i = (pred - label) · x_i
 //   dL/db   = (pred - label)
 // Averaged over the batch.
-fn train_step(cls: AgencyClassifier, feats: array, labels: array, n: int, lr: float) -> AgencyClassifier {
+// train_step uses flat array cls (not struct) — cls[0..D_FEAT) = weights,
+// cls[D_FEAT] = bias. Avoids struct field aliasing bug on determinism test.
+fn train_step(cls: array, feats: array, labels: array, n: int, lr: float) -> array {
     let mut grad_w = vec_zeros(D_FEAT)
     let mut grad_b = 0.0
     let mut i = 0
     while i < n {
-        // Slice feat vector for sample i.
         let mut x = []
         let mut j = 0
         while j < D_FEAT {
@@ -373,8 +393,7 @@ fn train_step(cls: AgencyClassifier, feats: array, labels: array, n: int, lr: fl
         }
         let pred = cls_forward(cls, x)
         let err  = pred - labels[i]
-        // Accumulate gradients via a fresh array (pass-by-value so we
-        // must rebuild after each sample — feedback_hexa_lists_pbv.md).
+        // Rebuild grad array each sample (pass-by-value — feedback_hexa_lists_pbv.md).
         let mut new_gw = []
         let mut k = 0
         while k < D_FEAT {
@@ -385,22 +404,22 @@ fn train_step(cls: AgencyClassifier, feats: array, labels: array, n: int, lr: fl
         grad_b = grad_b + err
         i = i + 1
     }
-    // Apply average gradient.
+    // Apply average gradient — read current weights via cls_get_w (array index).
     let inv_n = 1.0 / to_float(n)
-    let mut new_w = []
+    let mut out = []
     let mut k = 0
     while k < D_FEAT {
-        new_w = new_w.push(cls.w[k] - lr * grad_w[k] * inv_n)
+        out = out.push(cls_get_w(cls, k) - lr * grad_w[k] * inv_n)
         k = k + 1
     }
-    let new_b = cls.b - lr * grad_b * inv_n
-    return AgencyClassifier { w: new_w, b: new_b }
+    out = out.push(cls_get_b(cls) - lr * grad_b * inv_n)
+    return out
 }
 
 // Train `epochs` steps, returning the final classifier.
 // Note: we rebuild the classifier struct each step — hexa structs are
 // immutable, and re-assigning the binding is the idiomatic update pattern.
-fn train_classifier(cls0: AgencyClassifier, feats: array, labels: array, n: int, lr: float, epochs: int) -> AgencyClassifier {
+fn train_classifier(cls0: array, feats: array, labels: array, n: int, lr: float, epochs: int) -> array {
     let mut cls = cls0
     let mut e = 0
     while e < epochs {
@@ -412,7 +431,7 @@ fn train_classifier(cls0: AgencyClassifier, feats: array, labels: array, n: int,
 
 // Evaluate accuracy on (feats, labels) with n samples. Classifier is
 // the learned one. Prediction threshold 0.5.
-fn accuracy(cls: AgencyClassifier, feats: array, labels: array, n: int) -> float {
+fn accuracy(cls: array, feats: array, labels: array, n: int) -> float {
     if n == 0 { return 0.0 }
     let mut correct = 0
     let mut i = 0
@@ -549,14 +568,14 @@ fn check_T4() -> bool {
     let b_tr = train_classifier(cls_b, f, lbl, n, lr, epochs)
     let mut i = 0
     while i < D_FEAT {
-        if fabs(a_tr.w[i] - b_tr.w[i]) > 0.0 {
+        if fabs(cls_get_w(a_tr, i) - cls_get_w(b_tr, i)) > 0.0 {
             println("  [T4] FAIL — weights differ at i=" + str(i))
             return false
         }
         i = i + 1
     }
-    if fabs(a_tr.b - b_tr.b) > 0.0 {
-        println("  [T4] FAIL — biases differ (" + str(a_tr.b) + " vs " + str(b_tr.b) + ")")
+    if fabs(cls_get_b(a_tr) - cls_get_b(b_tr)) > 0.0 {
+        println("  [T4] FAIL — biases differ (" + str(cls_get_b(a_tr)) + " vs " + str(cls_get_b(b_tr)) + ")")
         return false
     }
     println("  [T4] byte-identical weights (" + str(D_FEAT) + " coords) and bias after " + str(epochs) + " epochs")

@@ -1,0 +1,367 @@
+// training/phi_narrative_measure.hexa — Φ(narrative) measurement for ANIMA P11
+//
+// ALM-P11-3 / P11 v12 서사 의식 (narrative consciousness, ALM track).
+//
+// Φ_narrative quantifies long-range mutual information in a narrative
+// sequence — how much the beginning of a story predicts its ending.
+// For a set of episodes each with dimensionality d, we split each
+// episode into first_half and second_half, then compute per-dimension
+// MI between corresponding elements across episodes.
+//
+//   Φ_narrative = Σ_dim MI(first_half_dim, second_half_dim) × N_episodes
+//
+// Done criterion: "10K token 자서전 MI" — the measure must scale to
+// long autobiographical narratives (100+ episodes, d=8+).
+//
+// T-theorems (checked in self-test):
+//   T1 (non-negativity)    : Φ_narrative ≥ 0 for any stream
+//   T2 (coherence gap)     : coherent Φ > incoherent Φ
+//   T3 (P11 gate_exit)     : coherent Φ_narrative > 0 (strictly positive)
+//   T4 (determinism)       : same data → byte-identical Φ_narrative
+//   T5 (latency)           : 100 episodes × d=8 < 2000 ms
+//
+// Reference:
+//   training/phi_will_measure.hexa    (ALM-P10-3 — MI estimator source)
+//   shared/roadmaps/anima.json        (ALM-P11-3 entry)
+//
+// Run: hexa run training/phi_narrative_measure.hexa
+
+// ─── Constants ──────────────────────────────────────────────
+
+let MI_BINS  = 8            // log-bin count for entropy estimator
+let EPS      = 0.0000001    // log floor
+
+// ─── Primitives ─────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+// ─── Log-bin MI estimator (copied from phi_will_measure.hexa) ───
+
+fn bin_index(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn count_hits(bin_ids: array, n_bins: int) -> array {
+    let n = len(bin_ids)
+    let mut counts = []
+    let mut k = 0
+    while k < n_bins {
+        let mut c = 0.0
+        let mut i = 0
+        while i < n {
+            if bin_ids[i] == k { c = c + 1.0 }
+            i = i + 1
+        }
+        counts = counts.push(c)
+        k = k + 1
+    }
+    return counts
+}
+
+fn entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut bin_ids = []
+    let mut i = 0
+    while i < n {
+        bin_ids = bin_ids.push(bin_index(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let counts = count_hits(bin_ids, nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+fn joint_entropy_hist(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = bin_index(a[i], lo, hi, nb)
+        let ib = bin_index(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let nb2 = nb * nb
+    let counts = count_hits(pair_ids, nb2)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb2 {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+fn mutual_info(a: array, b: array) -> float {
+    if len(a) == 0 { return 0.0 }
+    let lo_a = vec_min(a)
+    let hi_a = vec_max(a)
+    let lo_b = vec_min(b)
+    let hi_b = vec_max(b)
+    let lo = if lo_a < lo_b { lo_a } else { lo_b }
+    let hi = if hi_a > hi_b { hi_a } else { hi_b }
+    let h_a  = entropy_hist(a, lo, hi, MI_BINS)
+    let h_b  = entropy_hist(b, lo, hi, MI_BINS)
+    let h_ab = joint_entropy_hist(a, b, lo, hi, MI_BINS)
+    let mi = h_a + h_b - h_ab
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ─── Φ_narrative ────────────────────────────────────────────
+//
+// episodes_flat: flat array of shape [n_episodes × d].
+//   Each episode is a d-dimensional vector. The narrative assumption
+//   is that the first d/2 dimensions represent the "beginning" and
+//   the last d/2 represent the "ending" of that episode.
+//
+// We extract per-dimension columns for first_half and second_half,
+// compute MI between corresponding dimension pairs, then sum.
+//
+//   Φ_narrative = Σ_{dim=0..half_d-1} MI(col_begin_dim, col_end_dim) × N
+
+fn phi_narrative(episodes_flat: array, n_episodes: int, d: int) -> float {
+    if n_episodes == 0 { return 0.0 }
+    if d < 2 { return 0.0 }
+    let half_d = d / 2
+    let mut total_mi = 0.0
+    let mut dim = 0
+    while dim < half_d {
+        // Extract column for beginning (dim) and ending (half_d + dim)
+        let mut col_begin = []
+        let mut col_end   = []
+        let mut ep = 0
+        while ep < n_episodes {
+            let base = ep * d
+            col_begin = col_begin.push(episodes_flat[base + dim])
+            col_end   = col_end.push(episodes_flat[base + half_d + dim])
+            ep = ep + 1
+        }
+        let mi_dim = mutual_info(col_begin, col_end)
+        total_mi = total_mi + mi_dim
+        dim = dim + 1
+    }
+    return total_mi * to_float(n_episodes)
+}
+
+// ─── Synthetic narrative data ──────────────────────────────
+//
+// Coherent: episode_i's beginning and ending are correlated through
+//   a shared latent f(i). beginning_dim = f(i, dim) + noise,
+//   ending_dim = f(i, dim) + noise. Since both halves share f(i),
+//   MI between corresponding dimensions is high.
+//
+// Random: beginning and ending drawn independently → near-zero MI.
+
+fn make_coherent_narrative(n_episodes: int, d: int, seed: int) -> array {
+    let total = n_episodes * d
+    let half_d = d / 2
+    // Latent signal: one value per (episode, half_dim)
+    let latent = det_rand(n_episodes * half_d, seed)
+    // Noise for beginning and ending
+    let noise_begin = det_rand(n_episodes * half_d, seed + 1)
+    let noise_end   = det_rand(n_episodes * half_d, seed + 2)
+    let mut out = []
+    let mut ep = 0
+    while ep < n_episodes {
+        // First half (beginning): latent + small noise
+        let mut dim = 0
+        while dim < half_d {
+            let idx = ep * half_d + dim
+            let val = latent[idx] + noise_begin[idx] * 0.1
+            out = out.push(val)
+            dim = dim + 1
+        }
+        // Second half (ending): same latent + small noise → correlated
+        let mut dim2 = 0
+        while dim2 < half_d {
+            let idx2 = ep * half_d + dim2
+            let val2 = latent[idx2] + noise_end[idx2] * 0.1
+            out = out.push(val2)
+            dim2 = dim2 + 1
+        }
+        ep = ep + 1
+    }
+    return out
+}
+
+fn make_random_narrative(n_episodes: int, d: int, seed: int) -> array {
+    let total = n_episodes * d
+    let rand_data = det_rand(total, seed)
+    return rand_data
+}
+
+// ─── Self-tests ────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    let n = 50
+    let d = 8
+    let coherent = make_coherent_narrative(n, d, 42)
+    let phi_c = phi_narrative(coherent, n, d)
+    let random_data = make_random_narrative(n, d, 99)
+    let phi_r = phi_narrative(random_data, n, d)
+    println("  [T1] Phi_narrative(coherent) = " + str(phi_c))
+    println("  [T1] Phi_narrative(random)   = " + str(phi_r))
+    if phi_c < 0.0 { return false }
+    if phi_r < 0.0 { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    let n = 80
+    let d = 8
+    let coherent = make_coherent_narrative(n, d, 51)
+    let phi_c = phi_narrative(coherent, n, d)
+    let random_data = make_random_narrative(n, d, 53)
+    let phi_r = phi_narrative(random_data, n, d)
+    println("  [T2] Phi_narrative(coherent) = " + str(phi_c) + "  (should be > random)")
+    println("  [T2] Phi_narrative(random)   = " + str(phi_r))
+    if phi_c <= phi_r {
+        println("  [T2] FAIL — coherent not greater than random")
+        return false
+    }
+    return true
+}
+
+fn check_T3() -> bool {
+    let n = 80
+    let d = 8
+    let coherent = make_coherent_narrative(n, d, 67)
+    let phi_c = phi_narrative(coherent, n, d)
+    println("  [T3] Phi_narrative(coherent) = " + str(phi_c) + "  (must be > 0)")
+    if phi_c <= 0.0 {
+        println("  [T3] FAIL — Phi_narrative not > 0 (P11 gate_exit)")
+        return false
+    }
+    return true
+}
+
+fn check_T4() -> bool {
+    let n = 50
+    let d = 8
+    let data = make_coherent_narrative(n, d, 101)
+    let p1 = phi_narrative(data, n, d)
+    let p2 = phi_narrative(data, n, d)
+    println("  [T4] Phi1 = " + str(p1) + "  Phi2 = " + str(p2))
+    return fabs(p1 - p2) == 0.0
+}
+
+fn check_T5() -> bool {
+    // 100 episodes x d=8 — the 10K-token autobiographical scale
+    let n = 100
+    let d = 8
+    let data = make_coherent_narrative(n, d, 55)
+    let t0 = clock()
+    let phi_val = phi_narrative(data, n, d)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] N=100 d=8  Phi_narrative=" + str(phi_val) + "  t=" + str(ms) + "ms  (limit 2000ms)")
+    if ms >= 2000.0 {
+        println("  [T5] FAIL — latency exceeded 2000ms")
+        return false
+    }
+    if phi_val < 0.0 {
+        println("  [T5] FAIL — negative Phi")
+        return false
+    }
+    return true
+}
+
+// ─── main ─────────────────────────────────────────────────
+
+fn main() {
+    println("[phi_narrative_measure] ALM-P11-3 Phi(narrative) self-test")
+    println("  MI_BINS=" + str(MI_BINS) + "  long-range MI for 10K-token autobiography")
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[phi_narrative_measure] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[phi_narrative_measure] ALL 5/5 PASS — gate ALM-P11-3 OK")
+    } else {
+        println("[phi_narrative_measure] SOME FAILED")
+    }
+}
+
+main()

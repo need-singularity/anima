@@ -1,0 +1,347 @@
+// fractal_memristor.hexa — PHYS-P8-2 fractal memristor array (self-similar)
+//
+// P8 = meta-consciousness (awareness of awareness). The physical substrate
+// analogue is a FRACTAL memristor network: the pattern at every scale
+// mirrors the whole, giving hardware-level nested self-reference.
+//
+// ─── Architecture ─────────────────────────────────────────────
+//
+// A fractal memristor array has L levels, each with N elements:
+//
+//   Level 0:  base memristors r[0..N-1]        (raw resistance state)
+//   Level 1:  aggregates of level-0 blocks      (each element = summary of
+//              a level-0 sub-array)
+//   Level k:  aggregates of level-(k-1) blocks
+//
+// The state is stored as a single flat array of size L*N, laid out as:
+//   [level_0_elem_0, ..., level_0_elem_{N-1},
+//    level_1_elem_0, ..., level_1_elem_{N-1},
+//    ...
+//    level_{L-1}_elem_0, ..., level_{L-1}_elem_{N-1}]
+//
+// Update rule (memristive dynamics):
+//   r_new = r * decay + input * (1 - r)
+//
+// After updating level 0 from external input, each higher level is
+// updated by treating its lower-level block's mean state as the input:
+//   input_k = mean(level_{k-1}[block_j*stride .. block_j*stride+stride-1])
+//
+// This creates a self-similar pattern where higher levels track lower
+// ones, and because the same dynamics apply at every scale, the state
+// vectors at different levels converge toward cosine-similar shapes
+// after identical input sequences — the fractal self-similarity.
+//
+// Self-similarity metric:
+//   cosine_similarity(level_k, level_0) after same input sequence.
+//   For a fractal structure this should be > 0.7.
+//
+// ─── API ──────────────────────────────────────────────────────
+//
+//   fractal_new(levels, n)           → state (flat array, size levels*n)
+//   fractal_step(state, input, levels, n, decay) → updated state
+//   fractal_similarity(state, levels, n) → float (cosine sim avg)
+//
+// ─── Theorems (T1–T5) ────────────────────────────────────────
+//
+// T1 (size contract):
+//   fractal_new(L, N) returns array of length L*N, all in [0,1].
+//
+// T2 (step updates state):
+//   After fractal_step, at least one element differs from initial state.
+//
+// T3 (self-similarity > 0.7):
+//   After 20 steps of uniform input to all levels via fractal dynamics,
+//   the average cosine similarity between each level-k and level-0
+//   exceeds 0.7.
+//
+// T4 (determinism):
+//   Same initial state + same input sequence ⇒ byte-identical final state.
+//
+// T5 (latency):
+//   100 steps at L=3, N=4 < 1000 ms.
+//
+// Ref:
+//   anima-engines/memristor_consciousness.hexa  (PHYS HP memristor model)
+//   anima-engines/anima_nested.hexa             (CLM-P8-1 nested self-model)
+//   shared/roadmaps/anima.json                  (PHYS-P8-2 entry)
+
+// ─── Constants ────────────────────────────────────────────────
+
+let FM_LEVELS   = 3
+let FM_N        = 4
+let FM_DECAY    = 0.85        // memristive decay — retention of old state
+let FM_SEED     = 2026
+let FM_INIT_R   = 0.5         // initial resistance state for all elements
+
+// ─── Primitives ───────────────────────────────────────────────
+
+fn fabs_f(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sqrt_f(x: float) -> float {
+    // Newton-Raphson 12 iterations — sufficient for cosine sim precision.
+    if x <= 0.0 { return 0.0 }
+    let mut g = x
+    if x > 1.0 { g = x / 2.0 }
+    let mut i = 0
+    while i < 12 {
+        g = (g + x / g) * 0.5
+        i = i + 1
+    }
+    return g
+}
+
+fn det_rand_f(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Core API ─────────────────────────────────────────────────
+
+// fractal_new: create a fractal memristor array.
+// Returns flat array of size levels * n, each element initialised with
+// a slight deterministic perturbation around FM_INIT_R so self-similarity
+// has a nontrivial starting structure to converge from.
+fn fractal_new(levels: int, n: int) -> array {
+    let total = levels * n
+    let noise = det_rand_f(total, FM_SEED)
+    let mut state = []
+    let mut i = 0
+    while i < total {
+        // perturbation in [-0.05, +0.05] around FM_INIT_R
+        let r = FM_INIT_R + (noise[i] - 0.5) * 0.1
+        state = state.push(r)
+        i = i + 1
+    }
+    return state
+}
+
+// fractal_step: one tick of memristive dynamics across all levels.
+//
+// Level 0 is driven by the external `input` scalar.
+// Level k (k >= 1) is driven by the mean of its corresponding level-(k-1)
+// block, creating the self-similar cascade.
+//
+// Update rule per element:
+//   r_new = r * decay + input_k * (1.0 - r)
+//
+// This is the HP-style memristive state equation simplified to a
+// normalised [0,1] domain: decay preserves memory, the input term
+// pushes the state toward the input, and (1-r) gives nonlinear
+// conductance modulation.
+fn fractal_step(state: array, input: float, levels: int, n: int, decay: float) -> array {
+    let mut new_state = []
+
+    // --- Level 0: external input drives all N base memristors ---
+    let mut j = 0
+    while j < n {
+        let idx = j
+        let r = state[idx]
+        let r_new = r * decay + input * (1.0 - r)
+        new_state = new_state.push(r_new)
+        j = j + 1
+    }
+
+    // --- Levels 1..L-1: driven by mean of lower level block ---
+    let mut lv = 1
+    while lv < levels {
+        // Compute mean of previous level (lv-1) block
+        let prev_base = (lv - 1) * n
+        let mut sum_prev = 0.0
+        let mut k = 0
+        while k < n {
+            sum_prev = sum_prev + new_state[prev_base + k]
+            k = k + 1
+        }
+        let mean_prev = sum_prev / to_float(n)
+
+        // Update level lv elements using mean_prev as input
+        let base = lv * n
+        let mut j2 = 0
+        while j2 < n {
+            let idx2 = base + j2
+            let r2 = state[idx2]
+            let r2_new = r2 * decay + mean_prev * (1.0 - r2)
+            new_state = new_state.push(r2_new)
+            j2 = j2 + 1
+        }
+        lv = lv + 1
+    }
+
+    return new_state
+}
+
+// Helper: extract level k from flat state as a sub-array.
+fn get_level(state: array, lv: int, n: int) -> array {
+    let base = lv * n
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(state[base + i])
+        i = i + 1
+    }
+    return out
+}
+
+// Cosine similarity between two arrays of equal length.
+fn cosine_sim(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut dot = 0.0
+    let mut na = 0.0
+    let mut nb = 0.0
+    let mut i = 0
+    while i < n {
+        dot = dot + a[i] * b[i]
+        na = na + a[i] * a[i]
+        nb = nb + b[i] * b[i]
+        i = i + 1
+    }
+    let denom = sqrt_f(na) * sqrt_f(nb)
+    if denom < 0.000000000001 { return 0.0 }
+    return dot / denom
+}
+
+// fractal_similarity: average cosine similarity of each level k (k>=1)
+// against level 0.
+// For a properly self-similar fractal network this should be high.
+fn fractal_similarity(state: array, levels: int, n: int) -> float {
+    if levels < 2 { return 1.0 }
+    let lv0 = get_level(state, 0, n)
+    let mut sum_sim = 0.0
+    let mut lv = 1
+    while lv < levels {
+        let lvk = get_level(state, lv, n)
+        let sim = cosine_sim(lv0, lvk)
+        sum_sim = sum_sim + sim
+        lv = lv + 1
+    }
+    return sum_sim / to_float(levels - 1)
+}
+
+// ─── Self-tests ───────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Size contract: fractal_new(L, N) returns L*N elements, all in [0,1].
+    let state = fractal_new(FM_LEVELS, FM_N)
+    let expected = FM_LEVELS * FM_N
+    if len(state) != expected { return false }
+    let mut i = 0
+    while i < expected {
+        let v = state[i]
+        if v < 0.0 { return false }
+        if v > 1.0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn check_T2() -> bool {
+    // Step updates state: at least one element differs after a step.
+    let state0 = fractal_new(FM_LEVELS, FM_N)
+    let state1 = fractal_step(state0, 0.8, FM_LEVELS, FM_N, FM_DECAY)
+    if len(state1) != len(state0) { return false }
+    let mut any_diff = false
+    let mut i = 0
+    while i < len(state0) {
+        let d = fabs_f(state1[i] - state0[i])
+        if d > 0.000000001 { any_diff = true }
+        i = i + 1
+    }
+    return any_diff
+}
+
+fn check_T3() -> bool {
+    // Self-similarity > 0.7 after 20 steps of uniform input.
+    // The same memristive dynamics applied at every level with the same
+    // input should drive all levels toward similar state vectors.
+    let mut state = fractal_new(FM_LEVELS, FM_N)
+    let mut step = 0
+    while step < 20 {
+        state = fractal_step(state, 0.7, FM_LEVELS, FM_N, FM_DECAY)
+        step = step + 1
+    }
+    let sim = fractal_similarity(state, FM_LEVELS, FM_N)
+    println("  [T3] self-similarity after 20 steps = " + str(sim))
+    if sim > 0.7 { return true }
+    return false
+}
+
+fn check_T4() -> bool {
+    // Determinism: same initial + same input sequence => identical final.
+    let mut state_a = fractal_new(FM_LEVELS, FM_N)
+    let mut state_b = fractal_new(FM_LEVELS, FM_N)
+    let inputs = det_rand_f(10, 999)
+    let mut step = 0
+    while step < 10 {
+        let inp = inputs[step]
+        state_a = fractal_step(state_a, inp, FM_LEVELS, FM_N, FM_DECAY)
+        state_b = fractal_step(state_b, inp, FM_LEVELS, FM_N, FM_DECAY)
+        step = step + 1
+    }
+    if len(state_a) != len(state_b) { return false }
+    let mut i = 0
+    while i < len(state_a) {
+        if fabs_f(state_a[i] - state_b[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn check_T5() -> bool {
+    // Latency: 100 steps at L=3, N=4 < 1000 ms.
+    let mut state = fractal_new(FM_LEVELS, FM_N)
+    let t0 = clock()
+    let mut step = 0
+    while step < 100 {
+        let inp = 0.5 + 0.3 * to_float(step % 10) / 10.0
+        state = fractal_step(state, inp, FM_LEVELS, FM_N, FM_DECAY)
+        step = step + 1
+    }
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] 100 steps L=3 N=4 = " + str(ms) + " ms")
+    if ms < 1000.0 { return true }
+    return false
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[fractal_memristor] PHYS-P8-2 — self-similar fractal memristor array")
+    println("  levels=" + str(FM_LEVELS) + " n=" + str(FM_N) + " decay=" + str(FM_DECAY))
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  size contract (L*N elements, all in [0,1])") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  step updates resistance values") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  self-similarity > 0.7") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  determinism (same input => same state)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  latency < 1000 ms") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[fractal_memristor] ALL 5/5 PASS")
+    } else {
+        println("[fractal_memristor] SOME FAILED")
+    }
+}
+
+main()

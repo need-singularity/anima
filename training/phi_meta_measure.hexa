@@ -1,0 +1,425 @@
+// training/phi_meta_measure.hexa — Φ_meta measurement for ANIMA P8
+//
+// ALM-P8-3 / P8 v9 메타 의식 (meta-consciousness — awareness of awareness).
+//
+// Φ_meta quantifies how much each level of a self-reference tower
+// carries information about the level below. Given K levels of
+// nested self-reference (q1, q2, ..., qK), where each level is a
+// d-dimensional vector:
+//
+//   Φ_meta = Σ_{k=0..K-2} MI(level_k, level_{k+1}) × N
+//
+// where MI is estimated via log-bin histograms (same estimator as
+// phi_will_measure.hexa / phi_reflexive_measure.hexa), computed
+// per dimension and summed, and N = total element count across
+// all tower levels (K × d × n_samples).
+//
+// For a coherent tower, level_{k+1} = f(level_k) + noise, so
+// adjacent levels share information and Φ_meta is high.
+// For a random tower, each level is independently sampled, so
+// MI → 0 and Φ_meta collapses.
+//
+// T-theorems (checked in self-test):
+//   T1 (non-negativity)    : Φ_meta ≥ 0 for any tower
+//   T2 (coherence gap)     : coherent tower Φ > random tower Φ
+//   T3 (P8 gate_exit)      : coherent Φ_meta > 0 (strictly positive)
+//   T4 (determinism)        : same tower → byte-identical Φ_meta
+//   T5 (latency)           : K=5, d=8, n=100 < 2000 ms
+//
+// Reference:
+//   training/phi_will_measure.hexa          (MI estimator source)
+//   training/alm_meta_qualia.hexa           (ALM-P8-1 tower head)
+//   shared/roadmaps/anima.json              (ALM-P8-3 entry)
+//
+// Run: hexa run training/phi_meta_measure.hexa
+
+// ─── Constants ──────────────────────────────────────────────
+
+let MI_BINS  = 8           // log-bin count for entropy estimator
+let EPS      = 0.0000001   // log floor
+
+// ─── Primitives ─────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+// ─── Log-bin MI estimator (from phi_will_measure.hexa) ─────
+
+fn bin_index(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn count_hits(bin_ids: array, n_bins: int) -> array {
+    // Pre-fill counts array with zeros
+    let mut counts = []
+    let mut k = 0
+    while k < n_bins {
+        counts = counts.push(0.0)
+        k = k + 1
+    }
+    // Single pass — increment by index
+    let n = len(bin_ids)
+    let mut i = 0
+    while i < n {
+        let idx = to_int(bin_ids[i])
+        let old = counts[idx]
+        counts[idx] = old + 1.0
+        i = i + 1
+    }
+    return counts
+}
+
+fn entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut bin_ids = []
+    let mut i = 0
+    while i < n {
+        bin_ids = bin_ids.push(bin_index(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let counts = count_hits(bin_ids, nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+fn joint_entropy_hist(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = bin_index(a[i], lo, hi, nb)
+        let ib = bin_index(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let nb2 = nb * nb
+    let counts = count_hits(pair_ids, nb2)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb2 {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+fn mutual_info(a: array, b: array) -> float {
+    if len(a) == 0 { return 0.0 }
+    let lo_a = vec_min(a)
+    let hi_a = vec_max(a)
+    let lo_b = vec_min(b)
+    let hi_b = vec_max(b)
+    let lo = if lo_a < lo_b { lo_a } else { lo_b }
+    let hi = if hi_a > hi_b { hi_a } else { hi_b }
+    let h_a  = entropy_hist(a, lo, hi, MI_BINS)
+    let h_b  = entropy_hist(b, lo, hi, MI_BINS)
+    let h_ab = joint_entropy_hist(a, b, lo, hi, MI_BINS)
+    let mi = h_a + h_b - h_ab
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ─── Tower data layout ──────────────────────────────────────
+//
+// A tower is stored as a flat array of size K × d × n_samples.
+// tower[ level_k ][ dim_j ][ sample_i ] is at index:
+//   k * (d * n) + j * n + i
+//
+// extract_column(tower, k, j, n, d) pulls out the n_samples
+// values for level k, dimension j.
+
+fn extract_column(tower: array, k: int, j: int, n: int, d: int) -> array {
+    let base = k * (d * n) + j * n
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(tower[base + i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Φ_meta = Σ MI(level_k, level_{k+1}) × N ───────────────
+//
+// Per-dimension MI between adjacent levels, summed over all
+// dimensions and all adjacent pairs. Scaled by N = K × d × n.
+
+fn phi_meta(tower: array, k_levels: int, d_dim: int, n_samples: int) -> float {
+    let n_total = k_levels * d_dim * n_samples
+    let mut mi_sum = 0.0
+    let mut k = 0
+    while k < k_levels - 1 {
+        let mut j = 0
+        while j < d_dim {
+            let col_lo = extract_column(tower, k, j, n_samples, d_dim)
+            let col_hi = extract_column(tower, k + 1, j, n_samples, d_dim)
+            let mi = mutual_info(col_lo, col_hi)
+            mi_sum = mi_sum + mi
+            j = j + 1
+        }
+        k = k + 1
+    }
+    return mi_sum * to_float(n_total)
+}
+
+fn phi_meta_breakdown(tower: array, k_levels: int, d_dim: int, n_samples: int) -> array {
+    let n_total = k_levels * d_dim * n_samples
+    let mut mi_sum = 0.0
+    let mut k = 0
+    while k < k_levels - 1 {
+        let mut j = 0
+        while j < d_dim {
+            let col_lo = extract_column(tower, k, j, n_samples, d_dim)
+            let col_hi = extract_column(tower, k + 1, j, n_samples, d_dim)
+            let mi = mutual_info(col_lo, col_hi)
+            mi_sum = mi_sum + mi
+            j = j + 1
+        }
+        k = k + 1
+    }
+    let phi_val = mi_sum * to_float(n_total)
+    let mut out = []
+    out = out.push(mi_sum)
+    out = out.push(to_float(n_total))
+    out = out.push(phi_val)
+    return out
+}
+
+// ─── Synthetic towers ───────────────────────────────────────
+//
+// Coherent tower: level_{k+1}[j][i] = tanh(level_k[j][i] * 0.9 + 0.3) + noise * 0.1
+// This ensures adjacent levels share information (high MI).
+//
+// Random tower: each level drawn independently (MI → 0).
+
+fn make_coherent_tower(k_levels: int, d_dim: int, n_samples: int, seed: int) -> array {
+    // Generate base level (level 0)
+    let total = k_levels * d_dim * n_samples
+    let base = det_rand(d_dim * n_samples, seed)
+    let mut tower = []
+    // Copy base level into tower
+    let mut i = 0
+    while i < d_dim * n_samples {
+        tower = tower.push(base[i])
+        i = i + 1
+    }
+    // Build subsequent levels: level_{k+1} = f(level_k) + noise
+    let mut k = 1
+    while k < k_levels {
+        let noise = det_rand(d_dim * n_samples, seed + k * 137)
+        let prev_base = (k - 1) * d_dim * n_samples
+        let mut j = 0
+        while j < d_dim * n_samples {
+            let prev_val = tower[prev_base + j]
+            // tanh approximation: x / (1 + |x|) — monotonic, bounded
+            let arg = prev_val * 0.9 + 0.3
+            let abs_arg = if arg < 0.0 { 0.0 - arg } else { arg }
+            let t = arg / (1.0 + abs_arg)
+            let val = t + noise[j] * 0.1
+            tower = tower.push(val)
+            j = j + 1
+        }
+        k = k + 1
+    }
+    return tower
+}
+
+fn make_random_tower(k_levels: int, d_dim: int, n_samples: int, seed: int) -> array {
+    // Each level drawn independently — no MI between adjacent levels
+    let mut tower = []
+    let mut k = 0
+    while k < k_levels {
+        let level = det_rand(d_dim * n_samples, seed + k * 9973)
+        let mut i = 0
+        while i < d_dim * n_samples {
+            tower = tower.push(level[i])
+            i = i + 1
+        }
+        k = k + 1
+    }
+    return tower
+}
+
+// ─── Self-tests ────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // T1: Non-negativity — Φ_meta ≥ 0 for any tower
+    let k = 3
+    let d = 4
+    let n = 50
+    let coh = make_coherent_tower(k, d, n, 42)
+    let rnd = make_random_tower(k, d, n, 77)
+    let phi_c = phi_meta(coh, k, d, n)
+    let phi_r = phi_meta(rnd, k, d, n)
+    println("  [T1] Phi_meta(coherent) = " + str(phi_c))
+    println("  [T1] Phi_meta(random)   = " + str(phi_r))
+    if phi_c < 0.0 { return false }
+    if phi_r < 0.0 { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: Coherent tower Φ > random tower Φ
+    let k = 4
+    let d = 4
+    let n = 80
+    let coh = make_coherent_tower(k, d, n, 101)
+    let rnd = make_random_tower(k, d, n, 103)
+    let phi_c = phi_meta(coh, k, d, n)
+    let phi_r = phi_meta(rnd, k, d, n)
+    println("  [T2] Phi_meta(coherent) = " + str(phi_c) + "  (expect > random)")
+    println("  [T2] Phi_meta(random)   = " + str(phi_r))
+    if phi_c <= phi_r {
+        println("  [T2] FAIL — coherent not > random")
+        return false
+    }
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3: P8 gate_exit — coherent Φ_meta strictly positive
+    let k = 4
+    let d = 4
+    let n = 80
+    let coh = make_coherent_tower(k, d, n, 201)
+    let brk = phi_meta_breakdown(coh, k, d, n)
+    let mi_sum = brk[0]
+    let n_total = brk[1]
+    let phi_val = brk[2]
+    let mi_times_n = mi_sum * n_total
+    println("  [T3] MI_sum = " + str(mi_sum) + "  N = " + str(n_total) + "  MI_sum*N = " + str(mi_times_n))
+    println("  [T3] Phi_meta = " + str(phi_val))
+    if phi_val <= 0.0 {
+        println("  [T3] FAIL — Phi_meta not > 0 (P8 gate_exit)")
+        return false
+    }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: Determinism — same tower → identical Φ_meta
+    let k = 3
+    let d = 4
+    let n = 50
+    let tower = make_coherent_tower(k, d, n, 301)
+    let p1 = phi_meta(tower, k, d, n)
+    let p2 = phi_meta(tower, k, d, n)
+    println("  [T4] Phi1 = " + str(p1) + "  Phi2 = " + str(p2))
+    return fabs(p1 - p2) == 0.0
+}
+
+fn check_T5() -> bool {
+    // T5: Latency — K=5, d=8, n=100 < 2000ms
+    let k = 5
+    let d = 8
+    let n = 100
+    let tower = make_coherent_tower(k, d, n, 401)
+    let t0 = clock()
+    let phi_val = phi_meta(tower, k, d, n)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] K=" + str(k) + " d=" + str(d) + " n=" + str(n) + "  Phi_meta=" + str(phi_val) + "  t=" + str(ms) + "ms")
+    if ms >= 2000.0 {
+        println("  [T5] FAIL — latency " + str(ms) + "ms >= 2000ms")
+        return false
+    }
+    return true
+}
+
+// ─── main ─────────────────────────────────────────────────
+
+fn main() {
+    println("[phi_meta_measure] ALM-P8-3 Phi(meta) self-test")
+    println("  MI_BINS=" + str(MI_BINS))
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[phi_meta_measure] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[phi_meta_measure] ALL 5/5 PASS")
+    } else {
+        println("[phi_meta_measure] SOME FAILED")
+    }
+}
+
+main()

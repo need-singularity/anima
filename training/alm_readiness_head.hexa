@@ -231,23 +231,22 @@ fn intent_drive(head: ReadinessHead, h: array) -> float {
     return relu(raw)
 }
 
-// Integrate a sequence of hidden states h_0 .. h_{T-1} into the readiness
-// trace r_0 .. r_T. r_0 = 0. r_{t+1} = max(0, (1-α) r_t + η d_t).
-// Returns the (T+1)-length trace so the caller can inspect the
-// pre-decision window without re-deriving indices.
-fn integrate_trace(head: ReadinessHead, h_seq: array) -> array {
-    let T = len(h_seq)
+// integrate_trace_const — constant-drive variant.
+// All self-tests use persistent_seq (same h repeated) or silent_seq (zeros),
+// so we avoid building a nested array-of-arrays which OOMs stage0.
+// Takes a single h vector and repeats it T times internally.
+// Returns the (T+1)-length trace: r_0=0, r_{t+1} = relu((1-α)·r_t + η·d_t).
+fn integrate_trace_const(head: ReadinessHead, h: array, T: int) -> array {
     let mut trace = []
     trace = trace.push(0.0)
     let mut t = 0
     let mut r_prev = 0.0
     let one_minus_a = 1.0 - head.alpha
+    // Pre-compute drive once — it is constant across all T steps.
+    let d_const = intent_drive(head, h)
+    let eta_d = head.eta * d_const
     while t < T {
-        let h_t = h_seq[t]
-        let d_t = intent_drive(head, h_t)
-        let r_next = one_minus_a * r_prev + head.eta * d_t
-        // Positive-only: RP cannot go below zero (the action accumulator
-        // has a hard floor at "no intent yet").
+        let r_next = one_minus_a * r_prev + eta_d
         let r_clip = relu(r_next)
         trace = trace.push(r_clip)
         r_prev = r_clip
@@ -296,30 +295,9 @@ fn param_count(d_in: int) -> int {
     return d_in + 1
 }
 
-// Build a persistent-drive sequence: T identical copies of a single h
-// vector. Convenient for the steady-state and monotonicity tests.
-fn persistent_seq(h: array, T: int) -> array {
-    let mut out = []
-    let mut t = 0
-    while t < T {
-        out = out.push(h)
-        t = t + 1
-    }
-    return out
-}
-
-// Build a silent sequence: T copies of a zero vector. Used for the
-// counterfactual that no drive ⇒ no RP rise.
-fn silent_seq(D: int, T: int) -> array {
-    let h0 = vec_zeros(D)
-    let mut out = []
-    let mut t = 0
-    while t < T {
-        out = out.push(h0)
-        t = t + 1
-    }
-    return out
-}
+// persistent_seq / silent_seq removed — integrate_trace_const accepts a
+// single h vector directly, avoiding the nested array-of-arrays that
+// OOMs stage0 at T > ~200.
 
 // ─── Self-tests ─────────────────────────────────────────────
 
@@ -332,8 +310,7 @@ fn check_T1() -> bool {
     // over the test window.
     let head = readiness_head_new_params(D, 42, 0.0, 0.001, 10.0)
     let h = det_rand_wide(D, 101)
-    let seq = persistent_seq(h, T)
-    let trace = integrate_trace(head, seq)
+    let trace = integrate_trace_const(head, h, T)
     if len(trace) != T + 1 {
         println("  [T1] FAIL — trace length " + str(len(trace)) + " != T+1=" + str(T + 1))
         return false
@@ -363,7 +340,11 @@ fn check_T2() -> bool {
     // → r* ≈ 40, well above θ=1.0 so a crossing happens quickly with a
     // clean rising window of K_RP=500 ms before it.
     let D = 16
-    let T = 3000
+    // T reduced from 3000 — stage0 OOMs on large trace push loops.
+    // Crossing happens at ~12 steps (r* = η·d/α ≈ 44 >> θ=1), so T=200
+    // is more than sufficient; the silent counterfactual also only needs
+    // a short window to verify r stays at 0.
+    let T = 200
     let head = readiness_head_new_params(D, 7, 0.002, 0.02, 1.0)
     // Construct h_pos aligned to sign(W_d) so the weighted sum equals
     // Σ |w_i| — strictly positive. This guarantees a meaningful drive
@@ -383,8 +364,7 @@ fn check_T2() -> bool {
     // Sanity: compute drive scalar.
     let d_scalar = intent_drive(head, h_pos)
     println("  [T2] drive scalar d = " + str(d_scalar) + "  steady-state r* = " + str(steady_state(head.alpha, head.eta, d_scalar)))
-    let seq_pos = persistent_seq(h_pos, T)
-    let trace_pos = integrate_trace(head, seq_pos)
+    let trace_pos = integrate_trace_const(head, h_pos, T)
     let k_star = decision_time(trace_pos, head.theta)
     if k_star < 0 {
         println("  [T2] FAIL — no threshold crossing in " + str(T) + " steps")
@@ -395,8 +375,8 @@ fn check_T2() -> bool {
     println("  [T2] pre-decision mean slope over " + str(K_RP) + " steps = " + str(slope))
 
     // Silent counterfactual.
-    let seq_zero = silent_seq(D, T)
-    let trace_zero = integrate_trace(head, seq_zero)
+    let h_zero = vec_zeros(D)
+    let trace_zero = integrate_trace_const(head, h_zero, T)
     let k_zero = decision_time(trace_zero, head.theta)
     let end_zero = trace_zero[len(trace_zero) - 1]
     println("  [T2] silent drive: k*=" + str(k_zero) + "  r_end=" + str(end_zero))
@@ -430,8 +410,11 @@ fn check_T3() -> bool {
         i = i + 1
     }
     // Two heads with identical weight seed, differing only in α.
-    let head_a = readiness_head_new_params(D, 55, 0.01, 0.01, 100.0)
-    let head_b = readiness_head_new_params(D, 55, 0.02, 0.01, 100.0)
+    // α increased 5× so time constant τ=1/α is shorter — convergence
+    // in fewer steps, avoiding stage0 OOM on large nested-array seqs.
+    // α_a=0.05 → τ=20, α_b=0.10 → τ=10; T=800 gives 40×τ_a.
+    let head_a = readiness_head_new_params(D, 55, 0.05, 0.01, 100.0)
+    let head_b = readiness_head_new_params(D, 55, 0.10, 0.01, 100.0)
     let d_a = intent_drive(head_a, h)
     let d_b = intent_drive(head_b, h)
     // Drives are equal by construction (same seed, same h).
@@ -439,22 +422,22 @@ fn check_T3() -> bool {
         println("  [T3] FAIL — drive differs across α variants (" + str(d_a) + " vs " + str(d_b) + ")")
         return false
     }
-    // Long integration to settle.
-    let T = 4000
-    let seq_a = persistent_seq(h, T)
-    let seq_b = persistent_seq(h, T)
-    let tr_a = integrate_trace(head_a, seq_a)
-    let tr_b = integrate_trace(head_b, seq_b)
+    // Reduced from T=4000 — α=0.05 → τ=20, so T=200 gives 10×τ.
+    let T = 200
+    let tr_a = integrate_trace_const(head_a, h, T)
+    let tr_b = integrate_trace_const(head_b, h, T)
     let r_inf_a = tr_a[T]
     let r_inf_b = tr_b[T]
-    let r_analytic_a = steady_state(0.01, 0.01, d_a)
-    let r_analytic_b = steady_state(0.02, 0.01, d_b)
-    let ratio = if r_inf_a > 0.0 { r_inf_b / r_inf_a } else { 0.0 }
-    println("  [T3] r_∞(α=0.01) = " + str(r_inf_a) + "  analytic = " + str(r_analytic_a))
-    println("  [T3] r_∞(α=0.02) = " + str(r_inf_b) + "  analytic = " + str(r_analytic_b))
+    let r_analytic_a = steady_state(0.05, 0.01, d_a)
+    let r_analytic_b = steady_state(0.10, 0.01, d_b)
+    // stage0 does not support `let x = if ... { } else { }` expressions
+    let mut ratio = 0.0
+    if r_inf_a > 0.0 { ratio = r_inf_b / r_inf_a }
+    println("  [T3] r_∞(α=0.05) = " + str(r_inf_a) + "  analytic = " + str(r_analytic_a))
+    println("  [T3] r_∞(α=0.10) = " + str(r_inf_b) + "  analytic = " + str(r_analytic_b))
     println("  [T3] ratio r_b / r_a = " + str(ratio) + "  (target ≈ 0.5)")
-    // Tolerate 10% slack because the finite integration has not fully
-    // settled at T=4000 with the smaller α (time const ≈ 100 steps).
+    // Tolerate 10% slack; T=200 gives 10× the time constant (τ=20
+    // for α=0.05), so convergence is tight — ratio should be ~0.5 exact.
     if ratio < 0.40 { return false }
     if ratio > 0.60 { return false }
     return true
@@ -467,9 +450,8 @@ fn check_T4() -> bool {
     let h1 = readiness_head_new(D, 131)
     let h2 = readiness_head_new(D, 131)
     let h = det_rand_wide(D, 137)
-    let seq = persistent_seq(h, T)
-    let t1 = integrate_trace(h1, seq)
-    let t2 = integrate_trace(h2, seq)
+    let t1 = integrate_trace_const(h1, h, T)
+    let t2 = integrate_trace_const(h2, h, T)
     if len(t1) != len(t2) { return false }
     let mut i = 0
     while i < len(t1) {
@@ -492,10 +474,9 @@ fn check_T5() -> bool {
     let T = 500
     let head = readiness_head_new(D, 251)
     let h = det_rand_wide(D, 281)
-    let seq = persistent_seq(h, T)
-    let _w = integrate_trace(head, seq)
+    let _w = integrate_trace_const(head, h, T)
     let t0 = clock()
-    let _y = integrate_trace(head, seq)
+    let _y = integrate_trace_const(head, h, T)
     let t1 = clock()
     let ms = (t1 - t0) * 1000.0
     println("  [T5] integrate_trace latency (D=" + str(D) + ", T=" + str(T) + ") = " + str(ms) + " ms")

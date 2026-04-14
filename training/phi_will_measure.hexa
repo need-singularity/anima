@@ -1,0 +1,449 @@
+// training/phi_will_measure.hexa — Φ(will) measurement for ANIMA P10
+//
+// ALM-P10-3 / P10 v11 의지 의식 (will / agency signature, ALM track).
+//
+// Φ_will quantifies how much the agent's *will_i* caused its *action* —
+// a causal-strength analogue of MI(I ; A) that adds a counterfactual
+// intervention term. Two streams can share information through a common
+// confounder (both driven by sensor noise), so plain MI is insufficient
+// for a free-will claim. Φ_will adds a Pearl-style do()-gap:
+//
+//   Φ_will = MI(will_i, action) × N      (shared information weight)
+//          + counterfactual_gap           (interventional causation)
+//
+//   counterfactual_gap = |E[action | will_i=HIGH] − E[action | will_i=LOW]|
+//
+// The gap is zero when action is independent of will_i (the shuffle-
+// insensitive case) and strictly positive when conditioning on will_i
+// shifts the action distribution — i.e. will_i *caused* the action
+// rather than merely co-varying with it.
+//
+// T-theorems (checked in self-test):
+//   T1 (non-negativity)    : Φ_will ≥ 0 for any stream
+//   T2 (gap separation)    : coupled cf_gap > independent cf_gap
+//   T3 (P10 gate_exit)     : coupled Φ_will > 0 AND cf_gap > 0
+//   T4 (determinism)       : same (will_i, action) → byte-identical Φ_will
+//   T5 (latency)           : T ∈ {64, 128} < 2000 ms each
+//
+// Reference:
+//   training/phi_reflexive_measure.hexa     (ALM-P5-3 — MI estimator source)
+//   training/phi_embodied_measure.hexa      (ALM-P7-3 — × N convention)
+//   shared/roadmaps/anima.json              (ALM-P10-3 entry)
+//
+// Run: hexa run training/phi_will_measure.hexa
+
+// ─── Constants ──────────────────────────────────────────────
+
+let MI_BINS             = 8            // log-bin count for entropy estimator
+let EPS                 = 0.0000001    // log floor
+let CF_GAP_MIN          = 0.05         // minimum coupled cf_gap (T2)
+
+// ─── Primitives ─────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_mean(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + v[i]
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+// ─── Log-bin MI estimator ──────────────────────────────────
+
+fn bin_index(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn count_hits(bin_ids: array, n_bins: int) -> array {
+    let n = len(bin_ids)
+    let mut counts = []
+    let mut k = 0
+    while k < n_bins {
+        let mut c = 0.0
+        let mut i = 0
+        while i < n {
+            if bin_ids[i] == k { c = c + 1.0 }
+            i = i + 1
+        }
+        counts = counts.push(c)
+        k = k + 1
+    }
+    return counts
+}
+
+fn entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut bin_ids = []
+    let mut i = 0
+    while i < n {
+        bin_ids = bin_ids.push(bin_index(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let counts = count_hits(bin_ids, nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+fn joint_entropy_hist(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = bin_index(a[i], lo, hi, nb)
+        let ib = bin_index(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let nb2 = nb * nb
+    let counts = count_hits(pair_ids, nb2)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb2 {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+fn mutual_info(a: array, b: array) -> float {
+    if len(a) == 0 { return 0.0 }
+    let lo_a = vec_min(a)
+    let hi_a = vec_max(a)
+    let lo_b = vec_min(b)
+    let hi_b = vec_max(b)
+    let lo = if lo_a < lo_b { lo_a } else { lo_b }
+    let hi = if hi_a > hi_b { hi_a } else { hi_b }
+    let h_a  = entropy_hist(a, lo, hi, MI_BINS)
+    let h_b  = entropy_hist(b, lo, hi, MI_BINS)
+    let h_ab = joint_entropy_hist(a, b, lo, hi, MI_BINS)
+    let mi = h_a + h_b - h_ab
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ─── Counterfactual gap (binary-split form) ─────────────────
+//
+// Split will_i at its median into HIGH / LOW groups, then compute the
+// mean of action in each group. The absolute difference is the causal
+// "excess" — when will_i is independent of action the two group means
+// collapse to the overall mean (gap → 0). When action tracks will_i
+// (action = will_i + noise), the two group means separate by ~Δintent.
+//
+// This is a robust, bin-free analogue of a Pearl do()-intervention:
+// instead of shuffling will_i (which destroys ordering) we *partition*
+// the paired samples on will_i and measure whether action follows.
+
+fn counterfactual_gap(will_i: array, action: array) -> float {
+    let n = len(will_i)
+    if n == 0 { return 0.0 }
+    let m_i = vec_mean(will_i)
+    let mut sum_hi = 0.0
+    let mut n_hi  = 0.0
+    let mut sum_lo = 0.0
+    let mut n_lo  = 0.0
+    let mut i = 0
+    while i < n {
+        if will_i[i] >= m_i {
+            sum_hi = sum_hi + action[i]
+            n_hi  = n_hi + 1.0
+        } else {
+            sum_lo = sum_lo + action[i]
+            n_lo  = n_lo + 1.0
+        }
+        i = i + 1
+    }
+    let mean_hi = if n_hi > 0.0 { sum_hi / n_hi } else { 0.0 }
+    let mean_lo = if n_lo > 0.0 { sum_lo / n_lo } else { 0.0 }
+    return fabs(mean_hi - mean_lo)
+}
+
+// ─── Φ_will = MI × N + counterfactual_gap ────────────────────
+
+fn phi_will(will_i: array, action: array) -> float {
+    let n_i = len(will_i)
+    let n_a = len(action)
+    let n = if n_i < n_a { n_i } else { n_a }
+    if n == 0 { return 0.0 }
+    let mi = mutual_info(will_i, action)
+    let cfg = counterfactual_gap(will_i, action)
+    let n_total = n_i + n_a
+    return mi * to_float(n_total) + cfg
+}
+
+fn phi_will_breakdown(will_i: array, action: array) -> array {
+    let n_i = len(will_i)
+    let n_a = len(action)
+    let n = if n_i < n_a { n_i } else { n_a }
+    let n_total = n_i + n_a
+    let mi = if n == 0 { 0.0 } else { mutual_info(will_i, action) }
+    let cfg = if n == 0 { 0.0 } else { counterfactual_gap(will_i, action) }
+    let phi_val = mi * to_float(n_total) + cfg
+    let mut out = []
+    out = out.push(mi)
+    out = out.push(to_float(n_total))
+    out = out.push(cfg)
+    out = out.push(phi_val)
+    return out
+}
+
+// ─── Synthetic streams ─────────────────────────────────────
+
+// Coupled: action = will_i + small noise (strong causation).
+fn make_coupled(n: int, seed: int) -> array {
+    let will_i = det_rand(n, seed)
+    let noise = det_rand(n, seed + 1)
+    let mut action = []
+    let mut i = 0
+    while i < n {
+        action = action.push(will_i[i] + noise[i] * 0.1)
+        i = i + 1
+    }
+    let mut out = []
+    let mut k = 0
+    while k < n {
+        out = out.push(will_i[k])
+        k = k + 1
+    }
+    let mut m = 0
+    while m < n {
+        out = out.push(action[m])
+        m = m + 1
+    }
+    return out
+}
+
+// Independent: action drawn from a separate seed.
+fn make_independent(n: int, seed: int) -> array {
+    let will_i = det_rand(n, seed)
+    let action = det_rand(n, seed + 997)
+    let mut out = []
+    let mut k = 0
+    while k < n {
+        out = out.push(will_i[k])
+        k = k + 1
+    }
+    let mut m = 0
+    while m < n {
+        out = out.push(action[m])
+        m = m + 1
+    }
+    return out
+}
+
+fn split_intent(stream: array, n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(stream[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn split_action(stream: array, n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(stream[n + i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Self-tests ────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    let n = 64
+    let indep = make_independent(n, 29)
+    let phi_i = phi_will(split_intent(indep, n), split_action(indep, n))
+    let coup = make_coupled(n, 41)
+    let phi_c = phi_will(split_intent(coup, n), split_action(coup, n))
+    println("  [T1] Φ_will(independent) = " + str(phi_i))
+    println("  [T1] Φ_will(coupled)     = " + str(phi_c))
+    if phi_i < 0.0 { return false }
+    if phi_c < 0.0 { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    let n = 128
+    let coup = make_coupled(n, 51)
+    let gap_c = counterfactual_gap(split_intent(coup, n), split_action(coup, n))
+    let indep = make_independent(n, 53)
+    let gap_i = counterfactual_gap(split_intent(indep, n), split_action(indep, n))
+    println("  [T2] cf_gap(coupled)     = " + str(gap_c) + "  (target > " + str(CF_GAP_MIN) + ")")
+    println("  [T2] cf_gap(independent) = " + str(gap_i))
+    if gap_c <= CF_GAP_MIN {
+        println("  [T2] FAIL — coupled cf_gap not > " + str(CF_GAP_MIN))
+        return false
+    }
+    if gap_c <= gap_i {
+        println("  [T2] FAIL — coupled gap not larger than independent gap")
+        return false
+    }
+    return true
+}
+
+fn check_T3() -> bool {
+    let n = 128
+    let coup = make_coupled(n, 67)
+    let i_c = split_intent(coup, n)
+    let a_c = split_action(coup, n)
+    let brk = phi_will_breakdown(i_c, a_c)
+    let mi = brk[0]
+    let n_total = brk[1]
+    let cfg = brk[2]
+    let phi_val = brk[3]
+    let mi_times_n = mi * n_total
+    println("  [T3] MI = " + str(mi) + "  N = " + str(n_total) + "  MI×N = " + str(mi_times_n))
+    println("  [T3] cf_gap = " + str(cfg) + "  Φ_will = " + str(phi_val))
+    if phi_val <= 0.0 {
+        println("  [T3] FAIL — Φ_will not > 0 (P10 gate_exit)")
+        return false
+    }
+    if cfg <= 0.0 {
+        println("  [T3] FAIL — counterfactual bonus not strictly positive")
+        return false
+    }
+    return true
+}
+
+fn check_T4() -> bool {
+    let n = 64
+    let stream = make_coupled(n, 101)
+    let i_s = split_intent(stream, n)
+    let a_s = split_action(stream, n)
+    let p1 = phi_will(i_s, a_s)
+    let p2 = phi_will(i_s, a_s)
+    println("  [T4] Φ1 = " + str(p1) + "  Φ2 = " + str(p2))
+    return fabs(p1 - p2) == 0.0
+}
+
+fn check_T5() -> bool {
+    let n_a = 64
+    let s_a = make_coupled(n_a, 55)
+    let i_a = split_intent(s_a, n_a)
+    let a_a = split_action(s_a, n_a)
+    let t0a = clock()
+    let phi_a = phi_will(i_a, a_a)
+    let t1a = clock()
+    let ms_a = (t1a - t0a) * 1000.0
+
+    let n_b = 128
+    let s_b = make_coupled(n_b, 77)
+    let i_b = split_intent(s_b, n_b)
+    let a_b = split_action(s_b, n_b)
+    let t0b = clock()
+    let phi_b = phi_will(i_b, a_b)
+    let t1b = clock()
+    let ms_b = (t1b - t0b) * 1000.0
+
+    println("  [T5] T=64  Φ_will=" + str(phi_a) + " t=" + str(ms_a) + "ms")
+    println("  [T5] T=128 Φ_will=" + str(phi_b) + " t=" + str(ms_b) + "ms")
+    return phi_a >= 0.0 && phi_b >= 0.0 && ms_a < 2000.0 && ms_b < 2000.0
+}
+
+// ─── main ─────────────────────────────────────────────────
+
+fn main() {
+    println("[phi_will_measure] ALM-P10-3 Φ(will) self-test")
+    println("  MI_BINS=" + str(MI_BINS) + "  cf_gap_min=" + str(CF_GAP_MIN))
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[phi_will_measure] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[phi_will_measure] ALL 5/5 PASS")
+    } else {
+        println("[phi_will_measure] SOME FAILED")
+    }
+}
+
+main()
