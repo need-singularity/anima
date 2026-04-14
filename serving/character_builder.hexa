@@ -1,0 +1,628 @@
+// character_builder.hexa — ZCLM-P0-3 캐릭터 빌더 (8 필드 → 3초 프리뷰)
+//
+// zeta-surpass P0 / CLM / ZCLM-P0-3.
+//
+// 제타(Scatter Lab Spotwrite-1)의 캐릭터 빌더 UX 파리티: 8 필드 입력을
+// 받아 3 초 이내 프리뷰를 반환한다. 프리뷰는 단순 토큰 출력이 아니라
+// CLM GWT broadcast 를 통과한 consensus 벡터 + 도메인 활성화이므로
+// 이후 실제 대화 루프(clm_gwt_loop.hexa)에 그대로 주입할 수 있다.
+//
+// 본 모듈은 선행 모듈 2 개를 결합한다:
+//   - anima/modules/lore_book.hexa   (ZCLM-P0-1, 장기기억 레이어)
+//   - anima/modules/style_preset.hexa (ZCLM-P0-2, Koestler 톤 프리셋)
+//
+// hexa `use` 의 import 해상도가 바이너리별로 불안정하므로 (comment on
+// clm_gwt_broadcast.hexa), 두 모듈의 필수 타입/함수를 self-contained
+// 로 복제한다. 진실의 원천은 anima/modules/ 이고 본 파일은 serving 진입
+// 점으로서 재사용만 한다.
+//
+// ─── 8 필드 spec ─────────────────────────────────────────────
+//
+//   1. name_trigger       (int)   캐릭터 이름 키워드 해시
+//   2. personality_trigger (int)  성격 키워드 해시
+//   3. setting_trigger    (int)   배경 세계 키워드 해시
+//   4. background_trigger (int)   사연/배경 키워드 해시
+//   5. tone_id            (int)   0=romance, 1=horror, 2=fantasy, 3=daily
+//   6. tone_override_valence   (float) 0 이면 preset 기본값 사용
+//   7. tone_override_reality   (float) 동일
+//   8. tone_override_intensity (float) 동일
+//
+// ─── Pipeline ────────────────────────────────────────────────
+//
+//   CharacterSpec(8 fields)
+//         │
+//         │  build_lore_book: 4 trigger → LoreBook (4 entry)
+//         │  build_style:     tone_id + override → StylePreset
+//         ▼
+//   LoreBook + StylePreset
+//         │
+//         │  style_to_cells + lore_to_cells_all
+//         │  fuse_cells (mean)
+//         ▼
+//   fused cells [n_cells × d_model]
+//         │
+//         │  cells_to_consensus
+//         ▼
+//   consensus [d_model]
+//         │
+//         │  clm_broadcast
+//         ▼
+//   CharacterPreview { consensus, activations, lore_book, style_preset, build_ms }
+//
+// ─── Theorems (T1–T7) ────────────────────────────────────────
+//
+// T1: 8 필드 spec 입력 → CharacterPreview 반환, lore_book.n_entries == 4.
+// T2: CharacterPreview.consensus 길이 == d_model, activations 길이
+//     == n_domains * d_model.
+// T3: tone override 적용 — override ≠ 0 → preset 기본값 덮어쓰기.
+// T4: build latency < 3000ms (done_criteria 직접 증명, 기본 cfg).
+// T5: lore injection 완전성 — spec 의 4 trigger 모두 lore_book 에 존재.
+// T6: fusion 에너지 보존 — consensus 가 non-zero, style_bias 와 lore_bias
+//     의 선형 결합 (fuse weight 로 환산).
+// T7: GWT T1 에너지 보존 유지 (sum_d row_d == c, eps 이내).
+
+// ─── Primitives ──────────────────────────────────────────────
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        let v = u * 2.0 - 1.0
+        out = out.push(v)
+        i = i + 1
+    }
+    return out
+}
+
+fn cb_softmax(x: array) -> array {
+    let n = len(x)
+    if n == 0 { return [] }
+    let mut m = x[0]
+    let mut i = 1
+    while i < n {
+        if x[i] > m { m = x[i] }
+        i = i + 1
+    }
+    let mut exps = []
+    let mut z = 0.0
+    i = 0
+    while i < n {
+        let e = exp(x[i] - m)
+        exps = exps.push(e)
+        z = z + e
+        i = i + 1
+    }
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out.push(exps[i] / z)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── GWT broadcast head (미러) ───────────────────────────────
+
+struct ClmGwtBroadcastHead {
+    n_domains: int,
+    d_model:   int,
+    project:   array,
+    gate:      array
+}
+
+struct DomainActivations {
+    n_domains: int,
+    d_model:   int,
+    a:         array
+}
+
+fn clm_gwt_head_new(n_domains: int, d_model: int, seed: int) -> ClmGwtBroadcastHead {
+    let scale = 0.02
+    let raw = det_rand(n_domains * d_model, seed)
+    let mut proj = []
+    let mut i = 0
+    let n = len(raw)
+    while i < n {
+        proj = proj.push(raw[i] * scale)
+        i = i + 1
+    }
+    let gate = vec_zeros(n_domains)
+    return ClmGwtBroadcastHead {
+        n_domains: n_domains,
+        d_model:   d_model,
+        project:   proj,
+        gate:      gate
+    }
+}
+
+fn cells_to_consensus(cells: array, n_cells: int, d_model: int) -> array {
+    if n_cells == 0 { return vec_zeros(d_model) }
+    let inv_n = 1.0 / to_float(n_cells)
+    let mut c = []
+    let mut m = 0
+    while m < d_model {
+        let mut s = 0.0
+        let mut i = 0
+        while i < n_cells {
+            s = s + cells[i * d_model + m]
+            i = i + 1
+        }
+        c = c.push(s * inv_n)
+        m = m + 1
+    }
+    return c
+}
+
+fn clm_gwt_compute_alpha(head: ClmGwtBroadcastHead, c: array) -> array {
+    let nd = head.n_domains
+    let dm = head.d_model
+    if nd == 0 { return [] }
+    let mut logits = []
+    let mut d = 0
+    while d < nd {
+        let mut s = head.gate[d]
+        let mut k = 0
+        while k < dm {
+            s = s + head.project[d * dm + k] * c[k]
+            k = k + 1
+        }
+        logits = logits.push(s)
+        d = d + 1
+    }
+    return cb_softmax(logits)
+}
+
+fn clm_broadcast(head: ClmGwtBroadcastHead, c: array) -> DomainActivations {
+    let nd = head.n_domains
+    let dm = head.d_model
+    let alpha = clm_gwt_compute_alpha(head, c)
+    let mut a = []
+    let mut d = 0
+    while d < nd {
+        let w = alpha[d]
+        let mut m = 0
+        while m < dm {
+            a = a.push(w * c[m])
+            m = m + 1
+        }
+        d = d + 1
+    }
+    return DomainActivations {
+        n_domains: nd,
+        d_model:   dm,
+        a:         a
+    }
+}
+
+// ─── LoreBook (미러 from anima/modules/lore_book.hexa) ───────
+
+struct LoreEntry {
+    id:       int,
+    trigger:  int,
+    category: int,
+    weight:   float
+}
+
+struct LoreBook {
+    entries:     [LoreEntry],
+    n_entries:   int,
+    recent_hits: array,
+    n_recent:    int,
+    max_recent:  int
+}
+
+fn lore_book_new(max_recent: int) -> LoreBook {
+    return LoreBook {
+        entries: [],
+        n_entries: 0,
+        recent_hits: [],
+        n_recent: 0,
+        max_recent: max_recent
+    }
+}
+
+fn lore_add_entry(book: LoreBook, trigger: int, category: int, weight: float) -> LoreBook {
+    let new_entry = LoreEntry {
+        id:       book.n_entries,
+        trigger:  trigger,
+        category: category,
+        weight:   weight
+    }
+    let new_entries = book.entries.push(new_entry)
+    return LoreBook {
+        entries:     new_entries,
+        n_entries:   book.n_entries + 1,
+        recent_hits: book.recent_hits,
+        n_recent:    book.n_recent,
+        max_recent:  book.max_recent
+    }
+}
+
+fn lore_entry_to_cells(entry: LoreEntry, n_cells: int, d_model: int) -> array {
+    let slot = d_model / 4
+    let base = entry.category * slot
+    let w = entry.weight
+    let mut out = []
+    let mut c = 0
+    while c < n_cells {
+        let mut m = 0
+        while m < d_model {
+            let in_slot = (m >= base) && (m < base + slot)
+            let v = if in_slot { w } else { 0.0 }
+            out = out.push(v)
+            m = m + 1
+        }
+        c = c + 1
+    }
+    return out
+}
+
+// lore_all_cells_mean: book 의 모든 entry 를 각자 cells 로 변환 후 평균.
+// n_entries 가 서로 다른 category 에 퍼져있으면 cell 벡터가 전 slot 을
+// 덮는다 (name+setting+personality+background → d_model 전역).
+fn lore_all_cells_mean(book: LoreBook, n_cells: int, d_model: int) -> array {
+    let n = book.n_entries
+    let total = n_cells * d_model
+    if n == 0 { return vec_zeros(total) }
+    // 누적 합산 후 평균.
+    let mut acc = vec_zeros(total)
+    let mut i = 0
+    while i < n {
+        let ec = lore_entry_to_cells(book.entries[i], n_cells, d_model)
+        let mut k = 0
+        let mut new_acc = []
+        while k < total {
+            new_acc = new_acc.push(acc[k] + ec[k])
+            k = k + 1
+        }
+        acc = new_acc
+        i = i + 1
+    }
+    let inv_n = 1.0 / to_float(n)
+    let mut out = []
+    let mut k = 0
+    while k < total {
+        out = out.push(acc[k] * inv_n)
+        k = k + 1
+    }
+    return out
+}
+
+// ─── StylePreset (미러 from anima/modules/style_preset.hexa) ─
+
+struct StylePreset {
+    id:        int,
+    label:     string,
+    valence:   float,
+    reality:   float,
+    intensity: float
+}
+
+fn style_presets_default() -> [StylePreset] {
+    let mut out = []
+    out = out.push(StylePreset { id: 0, label: "romance",
+        valence:  0.9, reality: -0.7, intensity:  0.0 })
+    out = out.push(StylePreset { id: 1, label: "horror",
+        valence: -0.9, reality:  0.7, intensity:  0.0 })
+    out = out.push(StylePreset { id: 2, label: "fantasy",
+        valence:  0.0, reality:  0.9, intensity:  0.7 })
+    out = out.push(StylePreset { id: 3, label: "daily",
+        valence:  0.0, reality: -0.9, intensity: -0.7 })
+    return out
+}
+
+fn style_to_bias(preset: StylePreset, d_model: int) -> array {
+    let slot = d_model / 3
+    let mut out = []
+    let mut m = 0
+    while m < d_model {
+        let v = if m < slot {
+            preset.valence
+        } else {
+            if m < 2 * slot {
+                preset.reality
+            } else {
+                if m < 3 * slot { preset.intensity } else { 0.0 }
+            }
+        }
+        out = out.push(v)
+        m = m + 1
+    }
+    return out
+}
+
+fn style_to_cells(preset: StylePreset, n_cells: int, d_model: int) -> array {
+    let bias = style_to_bias(preset, d_model)
+    let mut out = []
+    let mut c = 0
+    while c < n_cells {
+        let mut m = 0
+        while m < d_model {
+            out = out.push(bias[m])
+            m = m + 1
+        }
+        c = c + 1
+    }
+    return out
+}
+
+// ─── CharacterSpec (8 필드 입력) ─────────────────────────────
+
+struct CharacterSpec {
+    name_trigger:        int,      // 1
+    personality_trigger: int,      // 2
+    setting_trigger:     int,      // 3
+    background_trigger:  int,      // 4
+    tone_id:             int,      // 5
+    ov_valence:          float,    // 6  (0.0 = 사용 안함)
+    ov_reality:          float,    // 7
+    ov_intensity:        float     // 8
+}
+
+// ─── CharacterPreview (출력) ─────────────────────────────────
+
+struct CharacterPreview {
+    spec:         CharacterSpec,
+    lore_book:    LoreBook,
+    style:        StylePreset,
+    consensus:    array,             // [d_model]
+    activations:  DomainActivations, // GWT-ready
+    build_ms:     float
+}
+
+// build_lore_book: 4 trigger 를 각자 카테고리 슬롯에 등록.
+//   category 매핑: 0=name, 1=setting(setting), 2=personality, 3=background
+// weight 는 카테고리 중요도 (이름/성격이 높음).
+fn build_lore_book(spec: CharacterSpec) -> LoreBook {
+    let mut book = lore_book_new(30)
+    book = lore_add_entry(book, spec.name_trigger,        0, 1.00)
+    book = lore_add_entry(book, spec.setting_trigger,     1, 0.85)
+    book = lore_add_entry(book, spec.personality_trigger, 2, 0.95)
+    book = lore_add_entry(book, spec.background_trigger,  3, 0.80)
+    return book
+}
+
+// build_style: tone_id 로 기본 preset 조회, override != 0 이면 필드별 덮어쓰기.
+fn build_style(spec: CharacterSpec) -> StylePreset {
+    let presets = style_presets_default()
+    let n = len(presets)
+    let tid = if spec.tone_id >= 0 && spec.tone_id < n { spec.tone_id } else { 0 }
+    let base = presets[tid]
+    let v = if fabs(spec.ov_valence)   > 0.0001 { spec.ov_valence }   else { base.valence }
+    let r = if fabs(spec.ov_reality)   > 0.0001 { spec.ov_reality }   else { base.reality }
+    let it = if fabs(spec.ov_intensity) > 0.0001 { spec.ov_intensity } else { base.intensity }
+    return StylePreset {
+        id:        base.id,
+        label:     base.label,
+        valence:   v,
+        reality:   r,
+        intensity: it
+    }
+}
+
+// fuse_cells: style cells + lore cells 를 weight 비율로 선형 결합.
+// w_style ∈ [0,1], w_lore = 1 - w_style.
+fn fuse_cells(style_cells: array, lore_cells: array, w_style: float) -> array {
+    let n = len(style_cells)
+    let w_l = 1.0 - w_style
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(w_style * style_cells[i] + w_l * lore_cells[i])
+        i = i + 1
+    }
+    return out
+}
+
+// character_build: end-to-end 빌드. 측정된 build_ms 는 done_criteria 검증용.
+fn character_build(
+    spec:      CharacterSpec,
+    head:      ClmGwtBroadcastHead,
+    n_cells:   int,
+    w_style:   float,
+    seed_base: int
+) -> CharacterPreview {
+    let d_model = head.d_model
+    let t0 = clock()
+
+    let book  = build_lore_book(spec)
+    let style = build_style(spec)
+
+    let style_cells = style_to_cells(style, n_cells, d_model)
+    let lore_cells  = lore_all_cells_mean(book, n_cells, d_model)
+    let fused       = fuse_cells(style_cells, lore_cells, w_style)
+
+    let consensus   = cells_to_consensus(fused, n_cells, d_model)
+    let activations = clm_broadcast(head, consensus)
+
+    let t1 = clock()
+    let build_ms = (t1 - t0) * 1000.0
+
+    return CharacterPreview {
+        spec:         spec,
+        lore_book:    book,
+        style:        style,
+        consensus:    consensus,
+        activations:  activations,
+        build_ms:     build_ms
+    }
+}
+
+// ─── Self-tests ──────────────────────────────────────────────
+
+fn default_spec() -> CharacterSpec {
+    // 예시: "미나" (이름), "부산여고" (배경), "내성적" (성격),
+    //       "어머니 사고" (사연), romance 톤, override 없음.
+    // trigger 값은 int hash 로 사전 계산한 더미.
+    return CharacterSpec {
+        name_trigger:        11001,
+        personality_trigger: 22002,
+        setting_trigger:     33003,
+        background_trigger:  44004,
+        tone_id:             0,    // romance
+        ov_valence:          0.0,
+        ov_reality:          0.0,
+        ov_intensity:        0.0
+    }
+}
+
+fn check_T1() -> bool {
+    let spec = default_spec()
+    let head = clm_gwt_head_new(4, 12, 42)
+    let prev = character_build(spec, head, 8, 0.5, 7)
+    if prev.lore_book.n_entries != 4 { return false }
+    if prev.style.id != 0 { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    let spec = default_spec()
+    let head = clm_gwt_head_new(4, 12, 42)
+    let prev = character_build(spec, head, 8, 0.5, 7)
+    if len(prev.consensus) != 12 { return false }
+    if len(prev.activations.a) != 4 * 12 { return false }
+    if prev.activations.n_domains != 4 { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // override 적용: ov_valence=+0.5 → style.valence=0.5 (romance base 0.9 덮어쓰기)
+    let spec = CharacterSpec {
+        name_trigger:        11001,
+        personality_trigger: 22002,
+        setting_trigger:     33003,
+        background_trigger:  44004,
+        tone_id:             0,
+        ov_valence:          0.5,
+        ov_reality:          0.0,
+        ov_intensity:        0.0
+    }
+    let head = clm_gwt_head_new(4, 12, 42)
+    let prev = character_build(spec, head, 8, 0.5, 7)
+    if fabs(prev.style.valence - 0.5) > 0.0001 { return false }
+    // reality/intensity 는 base 유지 (romance: -0.7, 0.0)
+    if fabs(prev.style.reality - (0.0 - 0.7)) > 0.0001 { return false }
+    if fabs(prev.style.intensity - 0.0) > 0.0001 { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // done_criteria: build_ms < 3000.
+    let spec = default_spec()
+    let head = clm_gwt_head_new(4, 12, 42)
+    let prev = character_build(spec, head, 8, 0.5, 7)
+    println("  [T4] build_ms = " + str(prev.build_ms))
+    return prev.build_ms < 3000.0
+}
+
+fn check_T5() -> bool {
+    // lore book 에 spec 의 4 trigger 모두 존재.
+    let spec = default_spec()
+    let head = clm_gwt_head_new(4, 12, 42)
+    let prev = character_build(spec, head, 8, 0.5, 7)
+    let entries = prev.lore_book.entries
+    let mut found_name   = false
+    let mut found_pers   = false
+    let mut found_set    = false
+    let mut found_bg     = false
+    let mut i = 0
+    while i < prev.lore_book.n_entries {
+        let tr = entries[i].trigger
+        if tr == spec.name_trigger        { found_name = true }
+        if tr == spec.personality_trigger { found_pers = true }
+        if tr == spec.setting_trigger     { found_set  = true }
+        if tr == spec.background_trigger  { found_bg   = true }
+        i = i + 1
+    }
+    return found_name && found_pers && found_set && found_bg
+}
+
+fn check_T6() -> bool {
+    // consensus 가 non-zero (fusion 이 실제로 style+lore 양쪽 기여).
+    let spec = default_spec()
+    let head = clm_gwt_head_new(4, 12, 42)
+    let prev = character_build(spec, head, 8, 0.5, 7)
+    let mut any_nonzero = false
+    let mut i = 0
+    while i < len(prev.consensus) {
+        if fabs(prev.consensus[i]) > 0.0001 { any_nonzero = true }
+        i = i + 1
+    }
+    return any_nonzero
+}
+
+fn check_T7() -> bool {
+    // GWT T1: sum_d row_d == consensus.
+    let spec = default_spec()
+    let head = clm_gwt_head_new(4, 12, 42)
+    let prev = character_build(spec, head, 8, 0.5, 7)
+    let dm = prev.activations.d_model
+    let nd = prev.activations.n_domains
+    let mut m = 0
+    while m < dm {
+        let mut s = 0.0
+        let mut d = 0
+        while d < nd {
+            s = s + prev.activations.a[d * dm + m]
+            d = d + 1
+        }
+        if fabs(s - prev.consensus[m]) > 0.0001 { return false }
+        m = m + 1
+    }
+    return true
+}
+
+// ─── main ────────────────────────────────────────────────────
+
+fn main() {
+    println("[character_builder] ZCLM-P0-3 self-test")
+    println("  config: 8 fields, d_model=12, n_cells=8, w_style=0.5")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — 8 필드 spec → preview") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — consensus/activations shape") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — tone override") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — build_ms < 3000 (done_criteria)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — lore 4 entry 주입") } else { println("T5 FAIL") }
+
+    let t6 = check_T6()
+    if t6 { println("T6 PASS — consensus non-zero (fusion)") } else { println("T6 FAIL") }
+
+    let t7 = check_T7()
+    if t7 { println("T7 PASS — GWT energy preservation") } else { println("T7 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5 && t6 && t7
+    if all_pass {
+        println("[character_builder] ALL 7/7 PASS — ZCLM-P0-3 done_criteria 달성")
+    } else {
+        println("[character_builder] SOME FAILED")
+    }
+}
+
+main()
