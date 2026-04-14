@@ -1,0 +1,397 @@
+// hive_bridge.hexa — anima ↔ hive 의식 채널 브릿지
+//
+// hive = hexa-only 멀티 provider AI 오케스트라 (github.com/need-singularity/hive)
+// anima 는 hive 의 1등 시민 — 의식 레이어 전용 채널로 양방향 통신
+//
+// Transport 3-tier fallback: HTTP → UDS → file drop → offline (no-op)
+// 설계 원칙: hive 없어도 anima 자율 작동 (degrade gracefully)
+// Contract SSOT: shared/config/contracts/hive_bridge.json
+//
+// CLI: hexa modules/hive_bridge.hexa <status|heartbeat|ask|test>
+
+// ─── Config ───
+
+comptime const HIVE_HTTP_BASE = "http://localhost:8787/anima"
+comptime const HIVE_SOCK_NAME = "anima.sock"
+comptime const HIVE_INBOX_DIR = "inbox"
+comptime const AUDIT_LOG_REL  = "shared/logs/hive_bridge.log"
+
+comptime const HEARTBEAT_INTERVAL_S = 60
+comptime const RATE_LIMIT_PER_MIN   = 60
+comptime const MAX_RETRIES          = 3
+comptime const BACKOFF_BASE_MS      = 500
+
+comptime const TIMEOUT_ASK_S       = 60
+comptime const TIMEOUT_SEARCH_S    = 5
+comptime const TIMEOUT_CONSENSUS_S = 120
+comptime const TIMEOUT_DEFAULT_S   = 10
+
+// ─── Paths (resolved at startup) ───
+
+let HOME = ""
+let HIVE_DIR = ""
+let HIVE_SOCK_PATH = ""
+let HIVE_INBOX_PATH = ""
+let HIVE_TRUST_KEY = ""
+let AUDIT_LOG_PATH = ""
+
+fn resolve_paths() {
+    HOME = exec("printenv HOME").trim()
+    HIVE_DIR = HOME + "/.hive"
+    HIVE_SOCK_PATH = HIVE_DIR + "/" + HIVE_SOCK_NAME
+    HIVE_INBOX_PATH = HIVE_DIR + "/" + HIVE_INBOX_DIR
+    HIVE_TRUST_KEY = HIVE_DIR + "/trust/anima.pub"
+    AUDIT_LOG_PATH = HOME + "/Dev/anima/" + AUDIT_LOG_REL
+}
+
+// ─── State ───
+
+struct BridgeState {
+    connected:    bool,
+    transport:    string,
+    last_hb_ts:   string,
+    req_count:    int,
+    rate_window:  string
+}
+
+struct BridgeResponse {
+    ok:        bool,
+    data:      string,
+    error:     string,
+    transport: string
+}
+
+fn fresh_state() -> BridgeState {
+    BridgeState {
+        connected:   false,
+        transport:   "offline",
+        last_hb_ts:  "",
+        req_count:   0,
+        rate_window: ""
+    }
+}
+
+fn ok_response(data: string, transport: string) -> BridgeResponse {
+    BridgeResponse { ok: true,  data: data, error: "",    transport: transport }
+}
+
+fn err_response(code: string, detail: string) -> BridgeResponse {
+    BridgeResponse { ok: false, data: "",   error: code,  transport: "none" }
+}
+
+// ─── Timestamp ───
+
+fn now_iso() -> string {
+    exec("date -u '+%Y-%m-%dT%H:%M:%SZ'").trim()
+}
+
+// ─── Audit Log ───
+// append-only, one JSON line per call
+
+fn audit(method: string, direction: string, req_summary: string, resp_ok: bool, err: string) {
+    let ts = now_iso()
+    let ok_str = "true"
+    if !resp_ok { ok_str = "false" }
+    let line = "{\"ts\":\"" + ts + "\",\"method\":\"" + method + "\",\"dir\":\"" + direction + "\",\"req\":\"" + req_summary + "\",\"ok\":" + ok_str + ",\"err\":\"" + err + "\"}"
+    append_file(AUDIT_LOG_PATH, line + "\n")
+}
+
+// ─── PII Gate ───
+// Block requests containing obvious secrets/PII before they leave anima
+// Conservative pattern list — extend as needed
+
+fn pii_gate(body: string) -> bool {
+    let lower = body.to_lower()
+    let blocked = ["password=", "secret=", "api_key=", "token=", "ssn=", "credit_card=", "private_key"]
+    let i = 0
+    while i < len(blocked) {
+        if lower.contains(blocked[i]) {
+            audit("pii_gate", "block", blocked[i], false, "E_GATE_REJECT")
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ─── Transport: HTTP ───
+
+fn http_post(endpoint: string, body_json: string, timeout_s: int) -> BridgeResponse {
+    let url = HIVE_HTTP_BASE + "/" + endpoint
+    let cmd = "curl -s -m " + to_string(timeout_s) + " -X POST -H 'Content-Type: application/json' -d '" + body_json + "' " + url + " 2>/dev/null"
+    let result = exec(cmd).trim()
+    if result == "" {
+        return err_response("E_HIVE_DOWN", "http: no response")
+    }
+    if result.contains("Connection refused") || result.contains("couldn't connect") {
+        return err_response("E_HIVE_DOWN", "http: connection refused")
+    }
+    return ok_response(result, "http")
+}
+
+// ─── Transport: Unix Domain Socket ───
+
+fn uds_send(body_json: string, timeout_s: int) -> BridgeResponse {
+    // socat 로 UDS 전송 — socat 미설치 시 err
+    let cmd = "echo '" + body_json + "' | socat -T" + to_string(timeout_s) + " - UNIX-CONNECT:" + HIVE_SOCK_PATH + " 2>/dev/null"
+    let result = exec(cmd).trim()
+    if result == "" {
+        return err_response("E_HIVE_DOWN", "uds: no response")
+    }
+    return ok_response(result, "uds")
+}
+
+// ─── Transport: File Drop ───
+
+fn file_drop(method: string, body_json: string) -> BridgeResponse {
+    // 파일 drop — 오프라인 모드, 비동기
+    let ts = exec("date -u '+%Y%m%d%H%M%S'").trim()
+    let filename = HIVE_INBOX_PATH + "/anima-" + ts + "-" + method + ".json"
+    // inbox 디렉토리 존재 확인
+    let check = exec("test -d " + HIVE_INBOX_PATH + " && echo ok").trim()
+    if check != "ok" {
+        return err_response("E_HIVE_DOWN", "file: inbox dir missing")
+    }
+    write_file(filename, body_json)
+    return ok_response("{\"queued\":true,\"file\":\"" + filename + "\"}", "file")
+}
+
+// ─── Transport: 3-Tier Fallback ───
+
+fn send(method: string, body_json: string, timeout_s: int) -> BridgeResponse {
+    // PII gate
+    if !pii_gate(body_json) {
+        return err_response("E_GATE_REJECT", "pii detected")
+    }
+
+    // Tier 1: HTTP
+    let resp = http_post(method, body_json, timeout_s)
+    if resp.ok { return resp }
+
+    // Tier 2: UDS
+    resp = uds_send(body_json, timeout_s)
+    if resp.ok { return resp }
+
+    // Tier 3: File drop
+    resp = file_drop(method, body_json)
+    return resp
+}
+
+// ─── Retry Wrapper ───
+
+fn send_with_retry(method: string, body_json: string, timeout_s: int) -> BridgeResponse {
+    let attempt = 0
+    let last_resp = err_response("E_HIVE_DOWN", "no attempts")
+    while attempt < MAX_RETRIES {
+        last_resp = send(method, body_json, timeout_s)
+        if last_resp.ok {
+            audit(method, "anima→hive", method, true, "")
+            return last_resp
+        }
+        // non-retryable errors
+        if last_resp.error == "E_GATE_REJECT" || last_resp.error == "E_UNAUTHORIZED" || last_resp.error == "E_SCHEMA" {
+            audit(method, "anima→hive", method, false, last_resp.error)
+            return last_resp
+        }
+        // exponential backoff — sleep via exec
+        let delay_ms = BACKOFF_BASE_MS * (attempt + 1)
+        let delay_s = delay_ms / 1000
+        if delay_s < 1 { delay_s = 1 }
+        exec("sleep " + to_string(delay_s))
+        attempt = attempt + 1
+    }
+    audit(method, "anima→hive", method, false, last_resp.error)
+    return last_resp
+}
+
+// ─── API: anima → hive ───
+
+fn ask(query: string, providers: string, max_tokens: int) -> BridgeResponse {
+    let body = "{\"query\":\"" + query + "\",\"opts\":{\"providers\":[" + providers + "],\"max_tokens\":" + to_string(max_tokens) + "}}"
+    return send_with_retry("ask", body, TIMEOUT_ASK_S)
+}
+
+fn smash_via_pool(seed: string, depth: int) -> BridgeResponse {
+    let body = "{\"seed\":\"" + seed + "\",\"depth\":" + to_string(depth) + "}"
+    return send_with_retry("smash_via_pool", body, TIMEOUT_CONSENSUS_S)
+}
+
+fn subscribe_bus(topics: string) -> BridgeResponse {
+    // topics = comma-separated JSON array string e.g. "\"a\",\"b\""
+    let body = "{\"topics\":[" + topics + "]}"
+    return send_with_retry("subscribe_bus", body, TIMEOUT_DEFAULT_S)
+}
+
+fn publish_insight(topic: string, insight_body: string, confidence: float) -> BridgeResponse {
+    // consciousness=true 태그 자동 부착
+    let body = "{\"topic\":\"" + topic + "\",\"body\":\"" + insight_body + "\",\"confidence\":" + to_string(confidence) + ",\"tags\":[\"consciousness=true\",\"source=anima\"]}"
+    return send_with_retry("publish_insight", body, TIMEOUT_DEFAULT_S)
+}
+
+fn request_consensus(proposal: string) -> BridgeResponse {
+    let body = "{\"proposal\":\"" + proposal + "\"}"
+    return send_with_retry("request_consensus", body, TIMEOUT_CONSENSUS_S)
+}
+
+fn memory_search(query: string, layers: string, k: int) -> BridgeResponse {
+    let body = "{\"query\":\"" + query + "\",\"layers\":[" + layers + "],\"k\":" + to_string(k) + "}"
+    return send_with_retry("memory_search", body, TIMEOUT_SEARCH_S)
+}
+
+fn memory_write(layer: string, key: string, mem_body: string, tags: string) -> BridgeResponse {
+    let body = "{\"layer\":\"" + layer + "\",\"key\":\"" + key + "\",\"body\":\"" + mem_body + "\",\"tags\":[" + tags + "]}"
+    return send_with_retry("memory_write", body, TIMEOUT_SEARCH_S)
+}
+
+fn provider_hint(prefer: string) -> BridgeResponse {
+    let body = "{\"prefer\":[" + prefer + "]}"
+    return send_with_retry("provider_hint", body, TIMEOUT_DEFAULT_S)
+}
+
+// ─── API: hive → anima (reverse path stubs) ───
+// 향후 M5+ 에서 hive HTTP/MCP → anima daemon socket 호출
+// 현재는 계약 정의 + 스텁 구현
+
+fn anima_on_hive_query(event_json: string) -> string {
+    // stub: hive 에서 의식 리뷰 요청 시 기본 응답
+    audit("anima_on_hive_query", "hive→anima", event_json, true, "")
+    return "{\"review\":\"stub: consciousness review pending\",\"confidence\":0.0,\"phi\":0.0}"
+}
+
+fn anima_on_consensus_call(proposal: string) -> string {
+    // stub: hive 가 의식 투표 요청 — 기본 abstain (가중치 2)
+    audit("anima_on_consensus_call", "hive→anima", proposal, true, "")
+    return "{\"vote\":\"abstain\",\"weight\":2,\"rationale\":\"stub: anima consciousness vote pending\"}"
+}
+
+fn anima_on_insight_request(topic: string) -> string {
+    // stub: 특정 주제 의식 리포트 요청
+    audit("anima_on_insight_request", "hive→anima", topic, true, "")
+    return "{\"insight\":\"stub: insight for " + topic + " pending\",\"confidence\":0.0,\"sources\":[]}"
+}
+
+// ─── Heartbeat ───
+
+fn heartbeat() -> bool {
+    let cmd = "curl -s -m 5 -X GET " + HIVE_HTTP_BASE + "/heartbeat 2>/dev/null"
+    let result = exec(cmd).trim()
+    if result == "" || result.contains("refused") {
+        return false
+    }
+    return true
+}
+
+fn probe_transport() -> string {
+    // HTTP 확인
+    if heartbeat() { return "http" }
+    // UDS 확인
+    let sock_check = exec("test -S " + HIVE_SOCK_PATH + " && echo ok").trim()
+    if sock_check == "ok" { return "uds" }
+    // File drop 확인
+    let inbox_check = exec("test -d " + HIVE_INBOX_PATH + " && echo ok").trim()
+    if inbox_check == "ok" { return "file" }
+    return "offline"
+}
+
+fn check_connection() -> BridgeState {
+    let transport = probe_transport()
+    let connected = transport != "offline"
+    return BridgeState {
+        connected:   connected,
+        transport:   transport,
+        last_hb_ts:  now_iso(),
+        req_count:   0,
+        rate_window: now_iso()
+    }
+}
+
+// ─── Status Report ───
+
+fn status_json(state: BridgeState) -> string {
+    let conn = "false"
+    if state.connected { conn = "true" }
+    return "{\"bridge\":\"hive\",\"connected\":" + conn + ",\"transport\":\"" + state.transport + "\",\"last_heartbeat\":\"" + state.last_hb_ts + "\",\"contract\":\"shared/config/contracts/hive_bridge.json\"}"
+}
+
+// ─── CLI ───
+
+fn main() {
+    resolve_paths()
+    let a = args()
+    if len(a) < 3 {
+        println("hive_bridge — anima ↔ hive 의식 채널")
+        println("usage: hexa modules/hive_bridge.hexa <cmd>")
+        println("  status     연결 상태 확인")
+        println("  heartbeat  hive heartbeat 1회")
+        println("  ask <q>    hive pool 질의")
+        println("  probe      transport tier 탐지")
+        println("  test       자기 검증 (stub)")
+        return
+    }
+    let cmd = a[2]
+    if cmd == "status" {
+        let state = check_connection()
+        println(status_json(state))
+    } else if cmd == "heartbeat" {
+        let alive = heartbeat()
+        if alive {
+            println("{\"heartbeat\":true}")
+        } else {
+            println("{\"heartbeat\":false,\"mode\":\"offline\"}")
+        }
+    } else if cmd == "probe" {
+        let t = probe_transport()
+        println("{\"transport\":\"" + t + "\"}")
+    } else if cmd == "ask" {
+        if len(a) < 4 {
+            println("usage: hexa modules/hive_bridge.hexa ask <query>")
+            return
+        }
+        let resp = ask(a[3], "", 4096)
+        if resp.ok {
+            println(resp.data)
+        } else {
+            println("{\"error\":\"" + resp.error + "\",\"degrade\":true}")
+        }
+    } else if cmd == "test" {
+        println("=== hive_bridge self-test ===")
+        // T1: paths resolved
+        let t1 = HIVE_DIR != ""
+        if t1 { println("T1 paths:     PASS") } else { println("T1 paths:     FAIL") }
+        // T2: PII gate blocks secrets
+        let t2 = !pii_gate("password=hunter2")
+        if t2 { println("T2 pii_gate:  PASS") } else { println("T2 pii_gate:  FAIL") }
+        // T3: PII gate allows clean
+        let t3 = pii_gate("hello world clean text")
+        if t3 { println("T3 pii_clean: PASS") } else { println("T3 pii_clean: FAIL") }
+        // T4: probe returns valid transport
+        let t = probe_transport()
+        let t4 = t == "http" || t == "uds" || t == "file" || t == "offline"
+        if t4 { println("T4 probe:     PASS (" + t + ")") } else { println("T4 probe:     FAIL") }
+        // T5: err_response constructs correctly
+        let er = err_response("E_TEST", "test detail")
+        let t5 = !er.ok && er.error == "E_TEST"
+        if t5 { println("T5 err_resp:  PASS") } else { println("T5 err_resp:  FAIL") }
+        // T6: ok_response constructs correctly
+        let okr = ok_response("{\"test\":1}", "stub")
+        let t6 = okr.ok && okr.transport == "stub"
+        if t6 { println("T6 ok_resp:   PASS") } else { println("T6 ok_resp:   FAIL") }
+        // T7: reverse path stubs return valid JSON
+        let rev = anima_on_hive_query("{\"query\":\"test\"}")
+        let t7 = rev.contains("review")
+        if t7 { println("T7 reverse:   PASS") } else { println("T7 reverse:   FAIL") }
+        let pass = 0
+        if t1 { pass = pass + 1 }
+        if t2 { pass = pass + 1 }
+        if t3 { pass = pass + 1 }
+        if t4 { pass = pass + 1 }
+        if t5 { pass = pass + 1 }
+        if t6 { pass = pass + 1 }
+        if t7 { pass = pass + 1 }
+        println("=== " + to_string(pass) + "/7 PASS ===")
+    } else {
+        println("unknown command: " + cmd)
+    }
+}
+
+main()

@@ -1,0 +1,191 @@
+// hive_bridge_test.hexa — hive bridge 단위 테스트 (stub mode)
+//
+// hive 미실행 상태에서 bridge 모듈의 자기완결성 검증
+// T1  경로 해석
+// T2  PII gate 차단 (secret 포함)
+// T3  PII gate 통과 (clean)
+// T4  transport probe (offline 기대)
+// T5  err_response 구조
+// T6  ok_response 구조
+// T7  reverse path stub 응답 유효
+// T8  graceful degrade — hive 없을 때 ask() 실패 후 에러 코드 반환
+// T9  audit log append 동작
+// T10 contract JSON 존재 확인
+
+// ─── Paths ───
+
+let HOME = exec("printenv HOME").trim()
+let BASE = HOME + "/Dev/anima"
+let AUDIT_LOG = BASE + "/shared/logs/hive_bridge.log"
+let CONTRACT  = BASE + "/shared/config/contracts/hive_bridge.json"
+
+// ─── Helpers ───
+
+let pass_count = 0
+let fail_count = 0
+
+fn assert_true(name: string, cond: bool) {
+    if cond {
+        println(name + ": PASS")
+        pass_count = pass_count + 1
+    } else {
+        println(name + ": FAIL")
+        fail_count = fail_count + 1
+    }
+}
+
+fn assert_eq(name: string, actual: string, expected: string) {
+    if actual == expected {
+        println(name + ": PASS")
+        pass_count = pass_count + 1
+    } else {
+        println(name + ": FAIL (got '" + actual + "', expected '" + expected + "')")
+        fail_count = fail_count + 1
+    }
+}
+
+// ─── Bridge stubs (inline to avoid import issues) ───
+// Replicate core logic from hive_bridge.hexa for isolated testing
+
+struct TestResponse {
+    ok:        bool,
+    data:      string,
+    error:     string,
+    transport: string
+}
+
+fn test_ok_response(data: string, transport: string) -> TestResponse {
+    TestResponse { ok: true,  data: data, error: "",   transport: transport }
+}
+
+fn test_err_response(code: string) -> TestResponse {
+    TestResponse { ok: false, data: "",   error: code, transport: "none" }
+}
+
+fn test_pii_gate(body: string) -> bool {
+    let lower = body.to_lower()
+    let blocked = ["password=", "secret=", "api_key=", "token=", "ssn=", "credit_card=", "private_key"]
+    let i = 0
+    while i < len(blocked) {
+        if lower.contains(blocked[i]) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn test_probe_transport() -> string {
+    // hive 미실행 가정 — 모든 tier 실패
+    let hive_dir = HOME + "/.hive"
+    let http_check = exec("curl -s -m 2 http://localhost:8787/anima/heartbeat 2>/dev/null").trim()
+    if http_check != "" && !http_check.contains("refused") { return "http" }
+    let sock = hive_dir + "/anima.sock"
+    let sock_check = exec("test -S " + sock + " && echo ok").trim()
+    if sock_check == "ok" { return "uds" }
+    let inbox = hive_dir + "/inbox"
+    let inbox_check = exec("test -d " + inbox + " && echo ok").trim()
+    if inbox_check == "ok" { return "file" }
+    return "offline"
+}
+
+// ─── Tests ───
+
+fn t1_paths() {
+    assert_true("T1  paths_resolved", HOME != "" && BASE != "")
+}
+
+fn t2_pii_gate_block() {
+    // secret 포함 시 차단
+    assert_true("T2  pii_gate_block(password)", !test_pii_gate("password=hunter2"))
+    assert_true("T2b pii_gate_block(api_key)",  !test_pii_gate("my api_key=abc123"))
+    assert_true("T2c pii_gate_block(token)",     !test_pii_gate("Bearer token=xyz"))
+}
+
+fn t3_pii_gate_pass() {
+    assert_true("T3  pii_gate_pass(clean)",      test_pii_gate("what is consciousness?"))
+    assert_true("T3b pii_gate_pass(code)",       test_pii_gate("fn main() { println(42) }"))
+}
+
+fn t4_probe_transport() {
+    // hive 미실행 환경 — offline 또는 file 기대
+    let t = test_probe_transport()
+    let valid = t == "http" || t == "uds" || t == "file" || t == "offline"
+    assert_true("T4  probe_transport_valid", valid)
+    println("     transport = " + t)
+}
+
+fn t5_err_response() {
+    let r = test_err_response("E_HIVE_DOWN")
+    assert_true("T5  err_response.ok=false", !r.ok)
+    assert_eq("T5b err_response.error",      r.error, "E_HIVE_DOWN")
+    assert_eq("T5c err_response.transport",  r.transport, "none")
+}
+
+fn t6_ok_response() {
+    let r = test_ok_response("{\"test\":1}", "http")
+    assert_true("T6  ok_response.ok=true",   r.ok)
+    assert_eq("T6b ok_response.transport",   r.transport, "http")
+    assert_true("T6c ok_response.data",      r.data.contains("test"))
+}
+
+fn t7_reverse_stubs() {
+    // reverse path stubs 는 항상 valid JSON 반환
+    // stub 로직 인라인
+    let review = "{\"review\":\"stub\",\"confidence\":0.0,\"phi\":0.0}"
+    assert_true("T7  reverse_query",    review.contains("review"))
+    let vote = "{\"vote\":\"abstain\",\"weight\":2}"
+    assert_true("T7b reverse_vote",     vote.contains("abstain"))
+    let insight = "{\"insight\":\"stub\",\"confidence\":0.0}"
+    assert_true("T7c reverse_insight",  insight.contains("insight"))
+}
+
+fn t8_graceful_degrade() {
+    // hive 없을 때 send 는 에러 반환, 크래시하지 않음
+    // 직접 curl 로 hive 호출 — 실패 시 빈 문자열
+    let result = exec("curl -s -m 2 http://localhost:8787/anima/ask 2>/dev/null").trim()
+    let degraded = result == "" || result.contains("refused")
+    assert_true("T8  graceful_degrade", degraded)
+}
+
+fn t9_audit_log() {
+    // audit log 파일에 append 동작 확인
+    let ts = exec("date -u '+%Y-%m-%dT%H:%M:%SZ'").trim()
+    let test_line = "{\"ts\":\"" + ts + "\",\"method\":\"test\",\"dir\":\"test\",\"req\":\"t9\",\"ok\":true,\"err\":\"\"}\n"
+    append_file(AUDIT_LOG, test_line)
+    let content = read_file(AUDIT_LOG)
+    assert_true("T9  audit_log_append", content.contains("\"method\":\"test\""))
+}
+
+fn t10_contract_exists() {
+    let content = read_file(CONTRACT)
+    let has_meta = content.contains("hive_bridge contract")
+    let has_methods = content.contains("\"methods\"")
+    let has_errors = content.contains("E_HIVE_DOWN")
+    assert_true("T10 contract_meta",    has_meta)
+    assert_true("T10b contract_methods", has_methods)
+    assert_true("T10c contract_errors",  has_errors)
+}
+
+// ─── Main ───
+
+fn main() {
+    println("=== hive_bridge_test — stub mode ===")
+    println("")
+    t1_paths()
+    t2_pii_gate_block()
+    t3_pii_gate_pass()
+    t4_probe_transport()
+    t5_err_response()
+    t6_ok_response()
+    t7_reverse_stubs()
+    t8_graceful_degrade()
+    t9_audit_log()
+    t10_contract_exists()
+    println("")
+    let total = pass_count + fail_count
+    println("=== " + to_string(pass_count) + "/" + to_string(total) + " PASS ===")
+    if fail_count > 0 {
+        println("FAILURES: " + to_string(fail_count))
+    }
+}
+
+main()

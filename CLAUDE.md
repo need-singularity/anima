@@ -44,3 +44,10 @@ ref:
   roadmap   shared/roadmaps/anima_hexa_common.json  P0~P5
   grammar   shared/config/hexa_grammar.jsonl
   api       shared/CLAUDE.md
+
+hive:
+  bridge    modules/hive_bridge.hexa                 anima↔hive 의식 채널 (3-tier: HTTP→UDS→file)
+  contract  shared/config/contracts/hive_bridge.json 계약 SSOT (메서드/에러/타임아웃/재시도)
+  test      modules/test/hive_bridge_test.hexa       스텁 테스트 (10항목)
+  log       shared/logs/hive_bridge.log              감사 로그 (append-only)
+  hive repo github.com/need-singularity/hive         hexa-only 멀티 provider 오케스트라
