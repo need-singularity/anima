@@ -15,8 +15,8 @@ REMOTE_USER="${DEPLOY_USER:-$(whoami)}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 REMOTE_DIR="hexa-agi"
 
-HEXA_LANG_DIR="$HOME/Dev/hexa-lang"
-ANIMA_DIR="$HOME/Dev/anima"
+HEXA_LANG_DIR="${HEXA_LANG:-$HOME/Dev/hexa-lang}"
+ANIMA_DIR="${ANIMA:-$HOME/Dev/anima}"
 LINUX_TARGET="x86_64-unknown-linux-gnu"
 LINUX_BINARY="$HEXA_LANG_DIR/target/$LINUX_TARGET/release/hexa"
 

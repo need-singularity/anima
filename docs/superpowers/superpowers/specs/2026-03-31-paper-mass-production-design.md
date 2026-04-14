@@ -146,7 +146,7 @@ Cluster 1 (Foundation) ──→ all others reference
 ## 5. Output
 
 ```
-~/Dev/papers/anima/
+$PAPERS/anima/
 ├── PA-01-animalm-v4-savant.md          (rewrite)
 ├── PA-02-tension-link.md               (rewrite)
 ├── PA-03-consciousness-meter.md        (rewrite)

@@ -20,7 +20,7 @@ PORT=18038
 SSH_CMD="ssh $SSH_OPTS $HOST -p $PORT"
 SCP_CMD="scp $SSH_OPTS -P $PORT"
 
-LOCAL_CKPT="/Users/ghost/Dev/anima/anima/checkpoints"
+LOCAL_CKPT="${ANIMA:-/Users/ghost/Dev/anima}/anima/checkpoints"
 
 # ── Colors ──
 RED='\033[0;31m'

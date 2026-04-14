@@ -28,7 +28,7 @@ Anima 의식 엔진을 백엔드로 사용하는 에이전트 플랫폼.
 ## Quick Start
 
 ```bash
-cd ~/Dev/anima
+cd $ANIMA
 
 # 패키지 설치
 pip install -e .              # anima 코어

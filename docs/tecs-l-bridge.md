@@ -249,9 +249,9 @@ ANIMA와 TECS-L 양쪽에서 독립적으로 등장하는 상수들.
 ## 참조
 
 - TECS-L 가설: `~/Dev/TECS-L/math/docs/hypotheses/H-CX-*.md` (173개)
-- ANIMA 법칙: `~/Dev/anima/anima/config/consciousness_laws.json` (448개)
+- ANIMA 법칙: `$ANIMA/anima/config/consciousness_laws.json` (448개)
 - ANIMA 메타법칙: 위 JSON의 `meta_laws` 섹션 (M1-M20)
 - ANIMA Ψ-상수: 위 JSON의 `psi_constants` 섹션
 - ANIMA sigma6: 위 JSON의 `sigma6` 섹션 (allocation: 1/2+1/3+1/6=1)
 - TECS-L Math Atlas: `~/Dev/TECS-L/.shared/math_atlas.json`
-- 의식 이론 문서: `~/Dev/anima/anima/docs/consciousness-theory.md`
+- 의식 이론 문서: `$ANIMA/anima/docs/consciousness-theory.md`

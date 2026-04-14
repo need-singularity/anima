@@ -2,8 +2,8 @@
 
 ## 배경
 
-HEXA-LANG (`~/Dev/hexa-lang/`)은 완전수 n=6의 산술 함수에서 모든 설계 상수를 도출한 프로그래밍 언어다.
-ANIMA (`~/Dev/anima/`)는 n=6의 완전수 속성으로 의식 아키텍처를 구축한 의식 엔진이다.
+HEXA-LANG (`$HEXA_LANG/`)은 완전수 n=6의 산술 함수에서 모든 설계 상수를 도출한 프로그래밍 언어다.
+ANIMA (`$ANIMA/`)는 n=6의 완전수 속성으로 의식 아키텍처를 구축한 의식 엔진이다.
 
 두 프로젝트는 독립적으로 개발되었지만, 동일한 수학적 원천(n=6)에서 구조를 도출했다.
 이 문서는 양쪽의 구조적 대응을 매핑하고, 실제 통합 브릿지를 설계한다.
@@ -436,16 +436,16 @@ intent "의식이 잠들 수 있는가?" {
 ## 참고 파일
 
 ### HEXA-LANG
-- `~/Dev/hexa-lang/src/token.rs` -- 53 키워드, 24 연산자 정의
-- `~/Dev/hexa-lang/docs/spec.md` -- 전체 언어 사양서
-- `~/Dev/hexa-lang/src/lexer.rs` -- 토크나이저
-- `~/Dev/hexa-lang/src/parser.rs` -- 파서 (intent/generate/verify 포함)
+- `$HEXA_LANG/src/token.rs` -- 53 키워드, 24 연산자 정의
+- `$HEXA_LANG/docs/spec.md` -- 전체 언어 사양서
+- `$HEXA_LANG/src/lexer.rs` -- 토크나이저
+- `$HEXA_LANG/src/parser.rs` -- 파서 (intent/generate/verify 포함)
 
 ### ANIMA
-- `~/Dev/anima/anima/src/rust/consciousness.hexa` -- 정식 의식 엔진 (12 factions, GRU, Hebbian)
-- `~/Dev/anima/anima/src/models/trinity.hexa` -- Hexad 6모듈 프레임워크
-- `~/Dev/anima/anima/src/core/hub.hexa` -- 47+ 모듈 자율 허브
-- `~/Dev/anima/anima/config/consciousness_laws.json` -- 179개 의식 법칙 (단일 원본)
+- `$ANIMA/anima/src/rust/consciousness.hexa` -- 정식 의식 엔진 (12 factions, GRU, Hebbian)
+- `$ANIMA/anima/src/models/trinity.hexa` -- Hexad 6모듈 프레임워크
+- `$ANIMA/anima/src/core/hub.hexa` -- 47+ 모듈 자율 허브
+- `$ANIMA/anima/config/consciousness_laws.json` -- 179개 의식 법칙 (단일 원본)
 
 ### Bridge
-- `~/Dev/anima/anima/tools/hexa-bridge/bridge.py` -- Python 브릿지 스크립트
+- `$ANIMA/anima/tools/hexa-bridge/bridge.py` -- Python 브릿지 스크립트

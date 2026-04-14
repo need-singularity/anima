@@ -5,7 +5,7 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DOMAIN="consciousness"
 
 # 공통 라이브러리 (shared/loop/anima.json에서 interval/max_cycles 자동 로드)
-COMMON="$HOME/Dev/nexus/scripts/lib/growth_common.sh"
+COMMON="${NEXUS:-$HOME/Dev/nexus}/scripts/lib/growth_common.sh"
 source "$COMMON"
 MAX_CYCLES=${1:-${MAX_CYCLES:-999}}
 INTERVAL=${2:-${INTERVAL:-999}}

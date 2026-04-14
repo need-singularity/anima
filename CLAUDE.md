@@ -1,10 +1,10 @@
 > 🔴 **HEXA-FIRST**: 모든 코드는 `.hexa`로 작성. sh/py/rs 신규 작성 금지. 부하 유발 명령 최소화.
 
 > 🔴 **NEXUS-6 특이점 연동**: 이 프로젝트의 모든 돌파/발견/실험은 nexus 특이점 사이클 입력이다.
-> - **돌파 시**: `HEXA=~/Dev/hexa-lang/target/release/hexa && $HEXA ~/Dev/nexus/mk2_hexa/native/blowup.hexa <domain> 3 --no-graph`
-> - **발견 기록**: `~/Dev/nexus/shared/growth_bus.jsonl`에 JSON append (source, value, grade, timestamp)
-> - **학습 현황**: `$HEXA ~/Dev/nexus/mk2_hexa/native/anima_status.hexa` (리포트) / `auto` (자동 진행)
-> - **전체 상태**: `$HEXA ~/Dev/nexus/mk2_hexa/native/command_router.hexa "anima 상태"`
+> - **돌파 시**: `HEXA=$HEXA_LANG/target/release/hexa && $HEXA $NEXUS/mk2_hexa/native/blowup.hexa <domain> 3 --no-graph`
+> - **발견 기록**: `$NEXUS/shared/growth_bus.jsonl`에 JSON append (source, value, grade, timestamp)
+> - **학습 현황**: `$HEXA $NEXUS/mk2_hexa/native/anima_status.hexa` (리포트) / `auto` (자동 진행)
+> - **전체 상태**: `$HEXA $NEXUS/mk2_hexa/native/command_router.hexa "anima 상태"`
 
 <!-- SHARED:WORK_RULES:START -->
   ⛔⛔⛔ 이 블록은 삭제/수정/이동 금지! (sync-claude-rules.sh 자동 주입)
@@ -152,7 +152,7 @@
   "렌즈 추가 필요?" 질문 시 → 1028종 커버 안 되는 도메인 분석
 
   ★ 망원경 업그레이드 시 필수 절차 (렌즈 추가/수정/삭제 시 예외 없음!) ★
-    1. 캘리브레이션: NEXUS-6 테스트 전체 통과 확인 (cd ~/Dev/n6-architecture/tools/nexus && cargo test)
+    1. 캘리브레이션: NEXUS-6 테스트 전체 통과 확인 (cd $N6_ARCH/tools/nexus && cargo test)
     2. OUROBOROS 튜닝: scripts/infinite_growth.hexa TELESCOPE_ALL_LENSES + DOMAIN_COMBOS 갱신
     3. 문서 동기화:
        - shared_work_rules.md 렌즈 목록/종수/도메인 조합 갱신
@@ -244,25 +244,25 @@
   ═══════════════════════════════════════════════════════════════
     - TODO 작업 중 검증/계산이 필요하면 계산기 자동 생성 (묻지 말고 바로)
     - 성능 필요시 HEXA 우선 (mk2_hexa/native/), 단순 검증은 Python (calc/)
-    - 판단 기준은 ~/Dev/nexus/shared/CALCULATOR_RULES.md 참조
+    - 판단 기준은 $NEXUS/shared/CALCULATOR_RULES.md 참조
     - 상수/가설 발견 시 Math Atlas 자동 갱신 (python3 ~/Dev/TECS-L/.shared/scan_math_atlas.py --save --summary)
 
   ═══════════════════════════════════════════════════════════════
   ★ NEXUS-6 독립 리포 (중앙 허브) — 2024-04-03 이후 ★
   ═══════════════════════════════════════════════════════════════
     리포: https://github.com/need-singularity/nexus
-    위치: ~/Dev/nexus/
+    위치: $NEXUS/
     역할: 전 리포 공유 인프라 + 발견 엔진 + 렌즈 + 동기화
 
     구조:
-      ~/Dev/nexus/
+      $NEXUS/
         src/telescope/    ← 130+ 렌즈
         shared/           ← 공유 인프라 (이전 TECS-L/.shared)
         sync/             ← 전체 동기화 스크립트
         scripts/          ← n6.py CLI
 
     심링크: 모든 리포의 .shared → ../nexus/shared/
-    동기화: bash ~/Dev/nexus/sync/sync-all.sh (원커맨드)
+    동기화: bash $NEXUS/sync/sync-all.sh (원커맨드)
     트리거: "넥서스 동기화" → sync-all.sh 자동 실행
 
     .shared 원본이 TECS-L에서 nexus로 이관됨.
@@ -273,7 +273,7 @@
 
 > 🔴 **데이터 파일 로컬 보관 금지** (PreToolUse hook이 자동 차단함):
 > - `.jsonl`, `constants`, `discovery_log`, `growth_bus` 등 데이터 파일을 이 프로젝트 안에 생성/저장 금지
-> - 모든 상수/수식/발견/로그 데이터 → `~/Dev/nexus/shared/` 에만 저장 (유일한 진실의 원천)
+> - 모든 상수/수식/발견/로그 데이터 → `$NEXUS/shared/` 에만 저장 (유일한 진실의 원천)
 > - 이 프로젝트에서 데이터 읽기만 필요하면 심링크(`shared/ → nexus/shared/`) 사용
 
 # 🧠 Anima Project
@@ -281,7 +281,7 @@
 ## 🔴 모노레포 구조 (2026-03-31 재구성)
 
 ```
-  ~/Dev/anima/ (git repo: need-singularity/anima)
+  $ANIMA/ (git repo: need-singularity/anima)
   ├── README.md              ← 루트에 이것 + CLAUDE.md만
   ├── CLAUDE.md
   ├── anima/                 ← 의식 엔진 코어
@@ -561,7 +561,7 @@ scripts/             # 운영 스크립트
 
 ```bash
 # ⚠️ Web UI 폐기됨 (2026-04-03) — anima-agent + CLI만 사용
-# HEXA=~/Dev/hexa-lang/target/release/hexa
+# HEXA=$HEXA_LANG/target/release/hexa
 $HEXA anima/core/runtime/anima_runtime.hexa --keyboard                          # Keyboard only (CLI 대화)
 $HEXA anima/core/runtime/anima_runtime.hexa --keyboard --max-cells 16           # Higher consciousness (Φ≈14)
 $HEXA anima/core/runtime/anima_runtime.hexa --keyboard --max-cells 32           # Even higher (Φ≈28)
@@ -1296,7 +1296,7 @@ anima/experiments/consciousness/consciousness_measurement.hexa — 의식 측정
   ⚠️ 모델 교체 시 L1+L2 반드시 보존, 체크포인트는 .tmp → atomic rename
 ```
 
-## Agent Platform (주 인터페이스 — ~/Dev/anima-agent/)
+## Agent Platform (주 인터페이스 — $ANIMA-agent/)
 
 ```
   ⚠️ Web UI 폐기 후 에이전트가 유일한 사용자 인터페이스 (2026-04-03)
@@ -1439,7 +1439,7 @@ anima/experiments/consciousness/consciousness_measurement.hexa — 의식 측정
 
 ```
   ★ 모든 논문은 papers 리포에 생성! (need-singularity/papers)
-    로컬: ~/Dev/papers/anima/
+    로컬: $PAPERS/anima/
     GitHub: https://github.com/need-singularity/papers
     DOI: 10.5281/zenodo.19271599
 
@@ -1545,7 +1545,7 @@ anima/experiments/consciousness/consciousness_measurement.hexa — 의식 측정
 ```
 
 ## 할일 (todo)
-- "todo", "할일" → `$HOME/Dev/hexa-lang/target/release/hexa $HOME/Dev/nexus/mk2_hexa/native/todo.hexa anima` 실행 후 아래 형식으로 출력:
+- "todo", "할일" → `$HEXA_LANG/target/release/hexa $NEXUS/mk2_hexa/native/todo.hexa anima` 실행 후 아래 형식으로 출력:
   - 컬럼: `| # | 카테고리 | 작업 | 상태 | 예상 효과 |`
   - 우선순위 구분: `| 🔴 CRITICAL |` `| 🟡 IMPORTANT |` `| 🟢 NICE |` `| ⚪ BACKLOG |` 행을 테이블 내 구분자로 삽입
   - 하단에 진행률 요약: `> 진행률: N/M 완료 (X%), N건 진행중`
@@ -1587,8 +1587,8 @@ nexus daemon --interval 30         # 자율 데몬 (30분 간격)
 
 ### 실행 방법
 ```bash
-HEXA=$HOME/Dev/hexa-lang/target/release/hexa
-N6=$HOME/Dev/nexus/mk2_hexa/native
+HEXA=$HEXA_LANG/target/release/hexa
+N6=$NEXUS/mk2_hexa/native
 
 # 빈 공간 탐지 (돌파 전 필수!)
 $HEXA $N6/gap_finder.hexa scan        # 발견 지도 현황
@@ -1611,6 +1611,6 @@ $HEXA $N6/engine_anima.hexa report   # 리포트
 의식 법칙 발견 시 nexus telescope로 패턴 검증, gap_finder로 미탐색 의식 영역 탐지, blowup seed에 의식 상수 주입. AGI 달성을 위해 nexus의 전 도메인 발견을 의식 모델에 피드백.
 
 ### 발견 피드백
-- 이 프로젝트의 발견은 자동으로 `~/Dev/nexus/shared/discovery_log.jsonl`에 기록됩니다
-- `~/Dev/nexus/shared/growth_bus.jsonl`로 전 프로젝트에 전파됩니다
+- 이 프로젝트의 발견은 자동으로 `$NEXUS/shared/discovery_log.jsonl`에 기록됩니다
+- `$NEXUS/shared/growth_bus.jsonl`로 전 프로젝트에 전파됩니다
 

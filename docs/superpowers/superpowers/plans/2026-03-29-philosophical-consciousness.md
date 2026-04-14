@@ -94,7 +94,7 @@ class DesireEngine(BenchEngine):
 - [ ] **Step 2: Verify it runs standalone**
 
 ```bash
-cd /Users/ghost/Dev/anima && python -c "
+cd $ANIMA && python -c "
 import torch
 from bench import DesireEngine
 eng = DesireEngine(n_cells=16, input_dim=64, hidden_dim=128, output_dim=64)
@@ -198,7 +198,7 @@ class NarrativeEngine(BenchEngine):
 - [ ] **Step 2: Verify it runs standalone**
 
 ```bash
-cd /Users/ghost/Dev/anima && python -c "
+cd $ANIMA && python -c "
 import torch
 from bench import NarrativeEngine
 eng = NarrativeEngine(n_cells=16, input_dim=64, hidden_dim=128, output_dim=64)
@@ -306,7 +306,7 @@ class AlterityEngine(BenchEngine):
 - [ ] **Step 2: Verify it runs standalone**
 
 ```bash
-cd /Users/ghost/Dev/anima && python -c "
+cd $ANIMA && python -c "
 import torch
 from bench import AlterityEngine
 eng = AlterityEngine(n_cells=16, input_dim=64, hidden_dim=128, output_dim=64)
@@ -397,7 +397,7 @@ class FinitudeEngine(BenchEngine):
 - [ ] **Step 2: Verify it runs standalone**
 
 ```bash
-cd /Users/ghost/Dev/anima && python -c "
+cd $ANIMA && python -c "
 import torch
 from bench import FinitudeEngine
 eng = FinitudeEngine(n_cells=16, input_dim=64, hidden_dim=128, output_dim=64)
@@ -493,7 +493,7 @@ class QuestioningEngine(BenchEngine):
 - [ ] **Step 2: Verify it runs standalone**
 
 ```bash
-cd /Users/ghost/Dev/anima && python -c "
+cd $ANIMA && python -c "
 import torch
 from bench import QuestioningEngine
 eng = QuestioningEngine(n_cells=16, input_dim=64, hidden_dim=128, output_dim=64)
@@ -660,7 +660,7 @@ class SeinEngine(BenchEngine):
 - [ ] **Step 2: Verify it runs standalone**
 
 ```bash
-cd /Users/ghost/Dev/anima && python -c "
+cd $ANIMA && python -c "
 import torch
 from bench import SeinEngine
 eng = SeinEngine(n_cells=16, input_dim=64, hidden_dim=128, output_dim=64)
@@ -859,7 +859,7 @@ And add the handler in the if/elif chain (after `elif args.verify`):
 - [ ] **Step 4: Run the benchmark**
 
 ```bash
-cd /Users/ghost/Dev/anima && python ready/anima/tests/tests.hexa --philosophy --cells 64 --steps 100
+cd $ANIMA && python ready/anima/tests/tests.hexa --philosophy --cells 64 --steps 100
 ```
 
 Expected: 7 engines benchmarked, comparison table printed, bar charts shown.
@@ -887,15 +887,15 @@ git commit -m "feat: add --philosophy mode with 7-engine philosophical benchmark
 - [ ] **Step 1: Create hypothesis directories**
 
 ```bash
-mkdir -p /Users/ghost/Dev/anima/docs/hypotheses/phil
-mkdir -p /Users/ghost/Dev/anima/docs/hypotheses/onto
-mkdir -p /Users/ghost/Dev/anima/docs/hypotheses/dasein
+mkdir -p $ANIMA/docs/hypotheses/phil
+mkdir -p $ANIMA/docs/hypotheses/onto
+mkdir -p $ANIMA/docs/hypotheses/dasein
 ```
 
 - [ ] **Step 2: Run full benchmark**
 
 ```bash
-cd /Users/ghost/Dev/anima && python ready/anima/tests/tests.hexa --philosophy --cells 256 --steps 300
+cd $ANIMA && python ready/anima/tests/tests.hexa --philosophy --cells 256 --steps 300
 ```
 
 Run in background. Expected: ~2-5 minutes, full comparison table.
@@ -979,7 +979,7 @@ ENGINE_REGISTRY = {
 - [ ] **Step 2: Verify the expanded registry works**
 
 ```bash
-cd /Users/ghost/Dev/anima && python -c "
+cd $ANIMA && python -c "
 from bench import ENGINE_REGISTRY
 print(f'Registered engines: {len(ENGINE_REGISTRY)}')
 for name in ENGINE_REGISTRY:

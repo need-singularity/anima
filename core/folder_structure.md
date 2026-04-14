@@ -3,7 +3,7 @@
 > ⛔ **L0 골화 (불변)** — 이 구조는 core_rules.json L0 등록. 변경 금지.
 
 ```
-~/Dev/anima/
+$ANIMA/
 ├── CLAUDE.md, README.md
 │
 ├── core/                    ← L0 골화 (엔진+법칙+Hub)

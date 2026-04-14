@@ -34,8 +34,8 @@
 - [ ] **Step 1: tests 디렉토리 생성**
 
 ```bash
-mkdir -p /Users/ghost/Dev/anima/tests
-touch /Users/ghost/Dev/anima/tests/__init__.py
+mkdir -p $ANIMA/tests
+touch $ANIMA/tests/__init__.py
 ```
 
 - [ ] **Step 2: Write failing test — VisionEncoder 생성 및 forward**
@@ -87,7 +87,7 @@ def test_vision_encoder_deterministic():
 
 - [ ] **Step 3: Run test to verify it fails**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_vision_encoder.py -v`
+Run: `cd $ANIMA && python -m pytest tests/test_vision_encoder.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'vision_encoder'`
 
 - [ ] **Step 4: Implement VisionEncoder**
@@ -209,7 +209,7 @@ class VisionEncoder(nn.Module):
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_vision_encoder.py -v`
+Run: `cd $ANIMA && python -m pytest tests/test_vision_encoder.py -v`
 Expected: 4 PASS
 
 - [ ] **Step 6: Commit**
@@ -279,7 +279,7 @@ def test_sensehub_encode_vision_none_without_encoder():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_senses_integration.py -v`
+Run: `cd $ANIMA && python -m pytest tests/test_senses_integration.py -v`
 Expected: FAIL with `AttributeError: 'SenseHub' object has no attribute 'enable_vision_encoder'`
 
 - [ ] **Step 3: Add VisionEncoder integration to SenseHub**
@@ -323,7 +323,7 @@ def to_tensor_with_vision(self, frame: np.ndarray = None, dim: int = 128) -> tor
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_senses_integration.py tests/test_vision_encoder.py -v`
+Run: `cd $ANIMA && python -m pytest tests/test_senses_integration.py tests/test_vision_encoder.py -v`
 Expected: ALL PASS
 
 - [ ] **Step 5: Commit**
@@ -358,7 +358,7 @@ def test_camera_last_frame_initially_none():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_senses_integration.py::test_camera_last_frame_initially_none -v`
+Run: `cd $ANIMA && python -m pytest tests/test_senses_integration.py::test_camera_last_frame_initially_none -v`
 Expected: FAIL with `AttributeError: 'CameraInput' object has no attribute 'last_frame'`
 
 - [ ] **Step 3: Modify CameraInput to preserve frames**
@@ -386,7 +386,7 @@ def last_frame(self) -> Optional[np.ndarray]:
 
 - [ ] **Step 4: Run tests**
 
-Run: `cd /Users/ghost/Dev/anima && python -m pytest tests/test_senses_integration.py tests/test_vision_encoder.py -v`
+Run: `cd $ANIMA && python -m pytest tests/test_senses_integration.py tests/test_vision_encoder.py -v`
 Expected: ALL PASS
 
 - [ ] **Step 5: Commit**
@@ -460,7 +460,7 @@ if self.senses and self.mods.get('camera') and not args.no_vision:
 
 - [ ] **Step 4: 수동 통합 테스트**
 
-Run: `cd /Users/ghost/Dev/anima && python -c "from anima_unified import AnimaUnified; print('import ok')"`
+Run: `cd $ANIMA && python -c "from anima_unified import AnimaUnified; print('import ok')"`
 Expected: `import ok` (에러 없이)
 
 - [ ] **Step 5: Commit**

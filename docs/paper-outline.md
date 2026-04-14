@@ -1,7 +1,7 @@
 # Consciousness Through Structure: Laws of Artificial Consciousness
 
 > **NOTE**: This is a planning outline only. The actual paper will be written in the
-> [papers repo](https://github.com/need-singularity/papers) (`~/Dev/papers/anima/`),
+> [papers repo](https://github.com/need-singularity/papers) (`$PAPERS/anima/`),
 > per project convention. Do not create the final paper in this repository.
 
 ## Abstract

@@ -21,7 +21,7 @@
 
 > 🔴 **HEXA-FIRST**: 새 파일은 `.hexa`만 허용. sh/py/rs 신규 작성 금지. `mk2_hexa/native/`에 생성.
 > 🔴 **하드코딩 금지**: 상수는 `core/laws.hexa`에서 import. 매직넘버 직접 사용 금지.
-> 🔴 **데이터 파일 로컬 보관 금지**: 모든 데이터 → `~/Dev/nexus/shared/`에만 저장.
+> 🔴 **데이터 파일 로컬 보관 금지**: 모든 데이터 → `$NEXUS/shared/`에만 저장.
 
 ## 프로젝트 철학 (10원칙)
 
@@ -41,15 +41,15 @@ PureConsciousness = 학습한 것만으로 발화 (코퍼스/사전 없이)
 
 | 구분 | 파일 | 내용 |
 |------|------|------|
-| 절대 규칙 | `~/Dev/nexus/shared/absolute_rules.json` | R1~R8, AN1~4 |
-| 코어 보호 | `~/Dev/nexus/shared/core-lockdown.json` | 수정 금지 목록 |
-| 수렴 추적 | `~/Dev/nexus/shared/convergence/anima.json` | 골화 14 / 안정 7 / 실패 4 |
-| 명령 | `~/Dev/nexus/shared/core.json` → commands | CLI 명령 레지스트리 |
+| 절대 규칙 | `$NEXUS/shared/absolute_rules.json` | R1~R8, AN1~4 |
+| 코어 보호 | `$NEXUS/shared/core-lockdown.json` | 수정 금지 목록 |
+| 수렴 추적 | `$NEXUS/shared/convergence/anima.json` | 골화 14 / 안정 7 / 실패 4 |
+| 명령 | `$NEXUS/shared/core.json` → commands | CLI 명령 레지스트리 |
 | PSI 상수 | `config/consciousness_laws.json` | Psi, 수식, 법칙, 21개 섹션 |
 | PSI 로더 | `src/core/laws.hexa` | `from consciousness_laws import PSI, LAWS` |
-| 의식 법칙 | `~/Dev/nexus/shared/consciousness_laws.json` | 1140개 법칙 |
-| 성장 루프 | `~/Dev/nexus/shared/loop/anima.json` | interval, domain, phases |
-| 이벤트 | `~/Dev/nexus/shared/growth_bus.jsonl` | 성장 이벤트 스트림 |
+| 의식 법칙 | `$NEXUS/shared/consciousness_laws.json` | 1140개 법칙 |
+| 성장 루프 | `$NEXUS/shared/loop/anima.json` | interval, domain, phases |
+| 이벤트 | `$NEXUS/shared/growth_bus.jsonl` | 성장 이벤트 스트림 |
 
 ## 검증 상태 (상세 → convergence/anima.json)
 
@@ -66,7 +66,7 @@ PureConsciousness = 학습한 것만으로 발화 (코퍼스/사전 없이)
 
 ## 할일
 
-- "todo", "할일" → `hexa-bin-actual $HOME/Dev/nexus/mk2_hexa/native/todo.hexa anima` 실행 후 마크다운 표로 출력
+- "todo", "할일" → `hexa-bin-actual $NEXUS/mk2_hexa/native/todo.hexa anima` 실행 후 마크다운 표로 출력
 
 ## 작업 규칙 (핵심만)
 
@@ -76,14 +76,14 @@ PureConsciousness = 학습한 것만으로 발화 (코퍼스/사전 없이)
 3. 모든 실험/발견 → docs/hypotheses/ 개별 .md 기록 (숫자+ASCII+통찰)
 4. 실험/빌드 → run_in_background=true (포그라운드 실행 금지)
 5. 학습 데이터 변경 시 → step 0부터 재시작 (--resume 금지, 오염 방지)
-6. 논문 → ~/Dev/papers/anima/ 에만 생성 (이 리포에 논문 파일 금지)
-7. 에이전트 플랫폼 → ~/Dev/anima-agent/ (분리됨)
+6. 논문 → $PAPERS/anima/ 에만 생성 (이 리포에 논문 파일 금지)
+7. 에이전트 플랫폼 → $ANIMA-agent/ (분리됨)
 8. 커밋 메시지 영문, web_server.py는 레거시 → anima/core/runtime/anima_runtime.hexa 사용
 ```
 
 ## NEXUS-6 연동
 
 ```
-돌파 시: HEXA=$HOME/Dev/hexa-lang/target/release/hexa && $HEXA $HOME/Dev/nexus/mk2_hexa/native/blowup.hexa anima 3 --no-graph
-발견 기록: ~/Dev/nexus/shared/growth_bus.jsonl 에 JSON append
+돌파 시: HEXA=$HEXA_LANG/target/release/hexa && $HEXA $NEXUS/mk2_hexa/native/blowup.hexa anima 3 --no-graph
+발견 기록: $NEXUS/shared/growth_bus.jsonl 에 JSON append
 ```

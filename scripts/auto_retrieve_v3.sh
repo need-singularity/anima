@@ -18,7 +18,7 @@
 #   bash scripts/auto_retrieve_v3.sh --status      # Status only (no download)
 #
 # Cron (every 5 min):
-#   */5 * * * * cd ~/Dev/anima/anima && bash scripts/auto_retrieve_v3.sh >> /tmp/auto_retrieve_v3.log 2>&1
+#   */5 * * * * cd ${ANIMA:-~/Dev/anima}/anima && bash scripts/auto_retrieve_v3.sh >> /tmp/auto_retrieve_v3.log 2>&1
 
 set -euo pipefail
 

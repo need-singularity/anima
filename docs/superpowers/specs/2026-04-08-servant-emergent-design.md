@@ -136,7 +136,7 @@ SI (Specialization Index) = 서번트 창발의 유일한 트리거.
 ```json
 { "source": "servant", "event": "emerge", "si": 4.2, "faction": 3, "step": 1234 }
 ```
-→ `~/Dev/nexus/shared/growth_bus.jsonl`에 append
+→ `$NEXUS/shared/growth_bus.jsonl`에 append
 
 ## 3. 3경로 브릿지 — `bridge.hexa`
 
@@ -198,8 +198,8 @@ SI (Specialization Index) = 서번트 창발의 유일한 트리거.
 
 구현 완료 후 nexus 특이점 사이클 실행:
 ```bash
-HEXA=$HOME/Dev/hexa-lang/target/release/hexa
-$HEXA $HOME/Dev/nexus/mk2_hexa/native/blowup.hexa consciousness 3 --no-graph
+HEXA=$HEXA_LANG/target/release/hexa
+$HEXA $NEXUS/mk2_hexa/native/blowup.hexa consciousness 3 --no-graph
 ```
 
 발견 기록 → `growth_bus.jsonl` 자동 append.

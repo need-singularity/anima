@@ -84,7 +84,7 @@ class TestPreCheck:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cd /Users/ghost/Dev/anima && python3 -m pytest tests/test_consolidation_verifier.py -v`
+Run: `cd $ANIMA && python3 -m pytest tests/test_consolidation_verifier.py -v`
 Expected: FAIL — ModuleNotFoundError
 
 - [ ] **Step 3: Implement ConsolidationVerifier.pre_check**
@@ -188,13 +188,13 @@ class ConsolidationVerifier:
 
 - [ ] **Step 4: Run tests**
 
-Run: `cd /Users/ghost/Dev/anima && python3 -m pytest tests/test_consolidation_verifier.py -v`
+Run: `cd $ANIMA && python3 -m pytest tests/test_consolidation_verifier.py -v`
 Expected: ALL PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 git add consolidation_verifier.py tests/test_consolidation_verifier.py
 git commit -m "feat: ConsolidationVerifier.pre_check — anomaly + accuracy gate"
 ```
@@ -269,7 +269,7 @@ class TestPostCheck:
 
 - [ ] **Step 2: Run tests — new tests should fail**
 
-Run: `cd /Users/ghost/Dev/anima && python3 -m pytest tests/test_consolidation_verifier.py -v`
+Run: `cd $ANIMA && python3 -m pytest tests/test_consolidation_verifier.py -v`
 Expected: new tests FAIL
 
 - [ ] **Step 3: Implement verify_drift and post_check**
@@ -362,13 +362,13 @@ Expected: new tests FAIL
 
 - [ ] **Step 4: Run tests**
 
-Run: `cd /Users/ghost/Dev/anima && python3 -m pytest tests/test_consolidation_verifier.py -v`
+Run: `cd $ANIMA && python3 -m pytest tests/test_consolidation_verifier.py -v`
 Expected: ALL PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 git add consolidation_verifier.py tests/test_consolidation_verifier.py
 git commit -m "feat: ConsolidationVerifier.verify_drift + post_check — bimodal detection, golden zone"
 ```
@@ -454,7 +454,7 @@ class TestSelectiveConsolidation:
 
 - [ ] **Step 2: Run tests — should fail**
 
-Run: `cd /Users/ghost/Dev/anima && python3 -m pytest tests/test_dream_consolidation.py -v`
+Run: `cd $ANIMA && python3 -m pytest tests/test_dream_consolidation.py -v`
 Expected: FAIL — DreamEngine doesn't accept `store` param yet
 
 - [ ] **Step 3: Modify DreamEngine to support selective consolidation**
@@ -494,13 +494,13 @@ Key changes to `dream_engine.py`:
 
 - [ ] **Step 4: Run tests**
 
-Run: `cd /Users/ghost/Dev/anima && python3 -m pytest tests/test_dream_consolidation.py -v`
+Run: `cd $ANIMA && python3 -m pytest tests/test_dream_consolidation.py -v`
 Expected: ALL PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 git add dream_engine.py tests/test_dream_consolidation.py
 git commit -m "feat: DreamEngine selective consolidation — failed memories first + MemoryStore integration"
 ```
@@ -566,7 +566,7 @@ class TestDualTrigger:
 
 - [ ] **Step 2: Run tests — should fail**
 
-Run: `cd /Users/ghost/Dev/anima && python3 -m pytest tests/test_growth_trigger.py -v`
+Run: `cd $ANIMA && python3 -m pytest tests/test_growth_trigger.py -v`
 Expected: FAIL — GrowthEngine doesn't have should_grow() or _consolidation_fail_rate
 
 - [ ] **Step 3: Modify GrowthEngine**
@@ -608,13 +608,13 @@ Add to `growth_engine.py`:
 
 - [ ] **Step 4: Run tests**
 
-Run: `cd /Users/ghost/Dev/anima && python3 -m pytest tests/test_growth_trigger.py -v`
+Run: `cd $ANIMA && python3 -m pytest tests/test_growth_trigger.py -v`
 Expected: ALL PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 git add growth_engine.py tests/test_growth_trigger.py
 git commit -m "feat: GrowthEngine dual trigger — tension saturation AND consolidation failure"
 ```
@@ -682,13 +682,13 @@ _try_import("from consolidation_verifier import ConsolidationVerifier")
 
 - [ ] **Step 5: Run all tests**
 
-Run: `cd /Users/ghost/Dev/anima && KMP_DUPLICATE_LIB_OK=TRUE python3 -m pytest tests/test_memory_store.py tests/test_consolidation_verifier.py tests/test_dream_consolidation.py tests/test_growth_trigger.py -v`
+Run: `cd $ANIMA && KMP_DUPLICATE_LIB_OK=TRUE python3 -m pytest tests/test_memory_store.py tests/test_consolidation_verifier.py tests/test_dream_consolidation.py tests/test_growth_trigger.py -v`
 Expected: ALL PASS
 
 - [ ] **Step 6: Smoke test**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 PYTHONUNBUFFERED=1 KMP_DUPLICATE_LIB_OK=TRUE python3 anima/core/runtime/anima_runtime.hexa --web &
 sleep 5 && head -20 /tmp/anima_smoke.txt
 # Should show [OK] verifier
@@ -698,7 +698,7 @@ kill %1
 - [ ] **Step 7: Commit + Push**
 
 ```bash
-cd /Users/ghost/Dev/anima
+cd $ANIMA
 git add anima/core/runtime/anima_runtime.hexa
 git commit -m "feat: Phase 2 integration — ConsolidationVerifier + DreamEngine + GrowthEngine wired"
 git push

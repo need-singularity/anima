@@ -89,7 +89,7 @@ RTX 5070에서 AnimaLM 7B를 4-bit로 서빙. 에이전트의 백엔드.
 
 - [ ] **Step 1: 서빙 테스트 실행**
 
-Run: `cd /Users/ghost/Dev/anima && python3 sub-projects/animalm/serving/serve.hexa --checkpoint anima/checkpoints/animalm_7b_final.pt --quantize 4bit --port 8400`
+Run: `cd $ANIMA && python3 sub-projects/animalm/serving/serve.hexa --checkpoint anima/checkpoints/animalm_7b_final.pt --quantize 4bit --port 8400`
 Expected: `Serving on http://0.0.0.0:8400` 출력, 모델 로드 완료
 
 - [ ] **Step 2: API 테스트**
@@ -113,7 +113,7 @@ AnimaLM 7B를 백엔드로 에이전트 시작. 외부 API 0.
 
 - [ ] **Step 1: CLI 에이전트 테스트**
 
-Run: `cd /Users/ghost/Dev/anima && python3 anima-agent/run.py --cli --provider animalm`
+Run: `cd $ANIMA && python3 anima-agent/run.py --cli --provider animalm`
 Expected: 대화 프롬프트 → 입력 → AnimaLM 7B 응답 (API 호출 0)
 
 - [ ] **Step 2: 대화 품질 확인**
