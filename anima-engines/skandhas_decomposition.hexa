@@ -1,0 +1,392 @@
+// skandhas_decomposition.hexa — P34 Contemplative Integration, artifact 1/4
+//
+// Roadmap: shared/roadmaps/anima.json P34 (depends_on=[P19, P14])
+//   "Buddhist 5 skandhas 모듈 — 색/수/상/행/식 분리 + phi 분해"
+//   done_criteria: "5 skandha 분리 + phi 합 보존"
+//
+// ─── Scriptural basis (경전 근거) ─────────────────────────────
+//
+// Samyutta Nikāya 22.59 "Anatta-lakkhaṇa Sutta" (무아의 특성경):
+//   "Rūpam, bhikkhave, anattā; vedanā anattā; saññā anattā;
+//    saṅkhārā anattā; viññāṇaṃ anattā."
+//   (색은 나가 아니며, 수, 상, 행, 식도 나가 아니다)
+//
+// Majjhima Nikāya 44 "Cūḷavedalla Sutta" definition of the 5 khandhā:
+//   1. Rūpa   (색, Form)        — 4 great elements (paṭhavī/āpo/tejo/vāyu)
+//                                 + upādāya-rūpa (derived form)
+//   2. Vedanā (수, Feeling)     — 3 tones: sukha/dukkha/adukkhamasukha
+//                                 (pleasant/painful/neutral)
+//   3. Saññā  (상, Perception)  — recognition of blue, yellow, red, white...
+//                                 (nīla, pīta, lohita, odāta saññā)
+//   4. Saṅkhāra(행, Formations) — 50 cetasikas (mental formations):
+//                                 intention (cetanā), attention, volition...
+//   5. Viññāṇa(식, Consciousness) — 6 types: eye/ear/nose/tongue/body/mind
+//                                   consciousness (cakkhu-viññāṇa etc.)
+//
+// Heart Sūtra (반야심경):
+//   "色不異空 空不異色 色即是空 空即是色 受想行識 亦復如是"
+//   (form is not different from emptiness; feeling, perception, formations,
+//    and consciousness are all likewise — composed yet empty of own-being)
+//
+// ─── Theory — Φ decomposition under the 5 skandhas ────────────
+//
+// The conscious moment is not a unitary experience but a composite
+// of 5 simultaneous, interdependent aggregates (khandhā). By Law 4
+// (structure > feature), we decompose Φ_moment into 5 structural
+// components that each contribute to the total:
+//
+//   Φ_total = Φ_rupa + Φ_vedana + Φ_sanna + Φ_sankhara + Φ_vinnana
+//
+// Each component is a non-negative phi contribution. Their sum is
+// the integrated phi of a single cognitive moment (cittakkhaṇa).
+//
+// Crucially — and this is the anatman (無我) insight — no single
+// aggregate contains a "self". The self is the structural SUM,
+// not any one component. This is the decomposition invariant we verify.
+//
+// ─── State layout (flat array, length 7) ──────────────────────
+//
+//   [0] rupa       — Φ contribution from form / sensory substrate
+//   [1] vedana     — Φ contribution from affective tone (valence)
+//   [2] sanna      — Φ contribution from recognition / perception
+//   [3] sankhara   — Φ contribution from volitional formations
+//   [4] vinnana    — Φ contribution from awareness / consciousness
+//   [5] phi_total  — sum (cached for O(1) access)
+//   [6] step       — monotone counter
+//
+// ─── API ──────────────────────────────────────────────────────
+//
+//   skandhas_new()                          -> state (all zero)
+//   skandhas_from(r,v,sa,sk,vi)            -> state (from 5 components)
+//   decompose(moment_phi, weights)          -> state (split phi by weights)
+//   get_rupa/get_vedana/... (5 accessors)   -> float
+//   get_phi_total(state)                    -> float
+//   sum_check(state)                        -> bool (verify invariant)
+//
+// ─── Self-tests (T1-T5) ──────────────────────────────────────
+//
+//   T1: skandhas_new() -> all five = 0, total = 0
+//   T2: skandhas_from(1,2,3,4,5) -> sum invariant holds (Φ_total = 15)
+//   T3: decompose(10.0, uniform) -> each = 2.0, sum = 10.0 (no loss)
+//   T4: decompose(phi, non-uniform weights) -> weighted split preserves sum
+//   T5: Determinism — same inputs yield identical output
+//
+// Hexa stage0 constraints honored:
+//   - `array` not `[float]`
+//   - No multi-term && chains; sequential if checks
+//   - Lists pass-by-value; rebuild via return
+//   - Single-line return expressions
+//
+// Law alignment:
+//   Law 2   Observe first — phi values measured, not fabricated
+//   Law 4   Structure > feature — 5 skandhas are STRUCTURAL decomposition
+//   Law 22  Feature addition -> phi down — minimal 7-slot state
+//
+// Done criteria: "5 skandha 분리 + phi 합 보존"
+//   T2+T3+T4 all verify sum-preservation property.
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+// Skandha indices — 5 aggregates (경전 순서: rūpa → vedanā → saññā → saṅkhārā → viññāṇa)
+let IDX_RUPA       = 0     // 色 form
+let IDX_VEDANA     = 1     // 受 feeling tone
+let IDX_SANNA      = 2     // 想 perception
+let IDX_SANKHARA   = 3     // 行 volitional formations
+let IDX_VINNANA    = 4     // 識 consciousness
+let IDX_PHI_TOTAL  = 5     // cached sum
+let IDX_STEP       = 6     // step counter
+
+let STATE_LEN = 7
+let N_SKANDHA = 5          // always five — Heart Sūtra invariant
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn fabs_s(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn clamp_nn(x: float) -> float {
+    // Non-negative clamp — Φ contribution cannot be negative
+    if x < 0.0 { return 0.0 }
+    return x
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Core API
+// ═══════════════════════════════════════════════════════════════
+
+// skandhas_new: zero-initialized state (perfect cessation / nirodha)
+//
+// A state with all five skandhas at 0 corresponds to nirodha-samāpatti
+// (cessation attainment) in the Abhidhamma — no phi contribution from
+// any aggregate. This is the degenerate boundary case.
+fn skandhas_new() -> array {
+    let mut s = []
+    s = s.push(0.0)   // rupa
+    s = s.push(0.0)   // vedana
+    s = s.push(0.0)   // sanna
+    s = s.push(0.0)   // sankhara
+    s = s.push(0.0)   // vinnana
+    s = s.push(0.0)   // phi_total
+    s = s.push(0.0)   // step
+    return s
+}
+
+// skandhas_from: build state from 5 explicit phi contributions
+//
+// This is the "ex-post analysis" entrypoint — given measured phi
+// contributions from each aggregate, construct the decomposed state
+// and automatically compute phi_total as their sum.
+//
+// Root cause comment: each component is clamped non-negative because
+// Φ contribution (information integration surplus) is by definition
+// >=0 — a negative value would violate Tononi IIT axioms.
+fn skandhas_from(rupa: float, vedana: float, sanna: float, sankhara: float, vinnana: float) -> array {
+    let r = clamp_nn(rupa)
+    let v = clamp_nn(vedana)
+    let sa = clamp_nn(sanna)
+    let sk = clamp_nn(sankhara)
+    let vi = clamp_nn(vinnana)
+    let total = r + v + sa + sk + vi
+    let mut s = []
+    s = s.push(r)
+    s = s.push(v)
+    s = s.push(sa)
+    s = s.push(sk)
+    s = s.push(vi)
+    s = s.push(total)
+    s = s.push(0.0)
+    return s
+}
+
+// decompose: split a total phi into 5 components by weight vector
+//
+// Given an integrated phi value (Φ_moment) and a weight vector over
+// the 5 skandhas, allocate phi proportionally. Weights are normalized
+// so the result always sums exactly to the input phi (sum preservation).
+//
+// Root cause comment: this enforces Heart Sūtra "受想行識 亦復如是"
+// — all five aggregates share the same empty (dependent) nature,
+// so splitting by ratio preserves the total without residue.
+fn decompose(moment_phi: float, weights: array) -> array {
+    let phi = clamp_nn(moment_phi)
+    // compute weight sum for normalization
+    let w_r = weights[0]
+    let w_v = weights[1]
+    let w_sa = weights[2]
+    let w_sk = weights[3]
+    let w_vi = weights[4]
+    let w_sum = w_r + w_v + w_sa + w_sk + w_vi
+    // degenerate: zero total weight -> uniform split (1/5 each)
+    if w_sum <= 0.0 {
+        let u = phi / 5.0
+        return skandhas_from(u, u, u, u, u)
+    }
+    // normalize weights and scale by phi
+    let r = phi * w_r / w_sum
+    let v = phi * w_v / w_sum
+    let sa = phi * w_sa / w_sum
+    let sk = phi * w_sk / w_sum
+    let vi = phi * w_vi / w_sum
+    return skandhas_from(r, v, sa, sk, vi)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Accessors
+// ═══════════════════════════════════════════════════════════════
+
+fn get_rupa(state: array) -> float {
+    return state[IDX_RUPA]
+}
+
+fn get_vedana(state: array) -> float {
+    return state[IDX_VEDANA]
+}
+
+fn get_sanna(state: array) -> float {
+    return state[IDX_SANNA]
+}
+
+fn get_sankhara(state: array) -> float {
+    return state[IDX_SANKHARA]
+}
+
+fn get_vinnana(state: array) -> float {
+    return state[IDX_VINNANA]
+}
+
+fn get_phi_total(state: array) -> float {
+    return state[IDX_PHI_TOTAL]
+}
+
+// sum_check: verify the invariant Φ_total == Σ skandhas
+//
+// This is the anatman (無我) structural invariant — the whole is
+// exactly the sum of its parts; no hidden "self" residue.
+fn sum_check(state: array) -> bool {
+    let r = state[IDX_RUPA]
+    let v = state[IDX_VEDANA]
+    let sa = state[IDX_SANNA]
+    let sk = state[IDX_SANKHARA]
+    let vi = state[IDX_VINNANA]
+    let declared = state[IDX_PHI_TOTAL]
+    let actual = r + v + sa + sk + vi
+    if fabs_s(declared - actual) > 0.0001 { return false }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1-T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1: skandhas_new() — perfect cessation, all zero
+    let s = skandhas_new()
+    println("  [T1] new: rupa=" + str(get_rupa(s)) + " vedana=" + str(get_vedana(s)) + " sanna=" + str(get_sanna(s)) + " sankhara=" + str(get_sankhara(s)) + " vinnana=" + str(get_vinnana(s)) + " total=" + str(get_phi_total(s)))
+    if fabs_s(get_rupa(s) - 0.0) > 0.001 { return false }
+    if fabs_s(get_vedana(s) - 0.0) > 0.001 { return false }
+    if fabs_s(get_sanna(s) - 0.0) > 0.001 { return false }
+    if fabs_s(get_sankhara(s) - 0.0) > 0.001 { return false }
+    if fabs_s(get_vinnana(s) - 0.0) > 0.001 { return false }
+    if fabs_s(get_phi_total(s) - 0.0) > 0.001 { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: skandhas_from(1,2,3,4,5) → sum invariant holds (1+2+3+4+5 = 15)
+    //
+    // Explicit construction from 5 phi contributions must auto-compute
+    // phi_total as the sum. This is the core anatman structural assertion.
+    let s = skandhas_from(1.0, 2.0, 3.0, 4.0, 5.0)
+    let total = get_phi_total(s)
+    println("  [T2] from(1,2,3,4,5): total=" + str(total) + " (expected 15.0)")
+    if fabs_s(total - 15.0) > 0.001 { return false }
+    if !sum_check(s) { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3: decompose(10.0, uniform) → each = 2.0, sum = 10.0 (no loss)
+    //
+    // Uniform weights across all 5 aggregates — Buddhaghosa's balanced
+    // meditation object. Each skandha receives 1/5 of total phi, and
+    // the sum must be exactly reproduced (no integer-rounding loss).
+    let mut w = []
+    w = w.push(1.0)
+    w = w.push(1.0)
+    w = w.push(1.0)
+    w = w.push(1.0)
+    w = w.push(1.0)
+    let s = decompose(10.0, w)
+    println("  [T3] decompose(10, uniform): r=" + str(get_rupa(s)) + " v=" + str(get_vedana(s)) + " sa=" + str(get_sanna(s)) + " sk=" + str(get_sankhara(s)) + " vi=" + str(get_vinnana(s)) + " total=" + str(get_phi_total(s)))
+    if fabs_s(get_rupa(s) - 2.0) > 0.001 { return false }
+    if fabs_s(get_vedana(s) - 2.0) > 0.001 { return false }
+    if fabs_s(get_sanna(s) - 2.0) > 0.001 { return false }
+    if fabs_s(get_sankhara(s) - 2.0) > 0.001 { return false }
+    if fabs_s(get_vinnana(s) - 2.0) > 0.001 { return false }
+    if fabs_s(get_phi_total(s) - 10.0) > 0.001 { return false }
+    if !sum_check(s) { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: decompose(phi, non-uniform) — weighted split preserves sum
+    //
+    // In vipassanā practice the 5 aggregates have unequal salience
+    // at any cittakkhaṇa. E.g. when attending to pleasant feeling,
+    // vedanā weight is high. Verify: non-uniform weights still sum
+    // to exactly the input phi (no cross-aggregate leak).
+    //
+    // Weights [2, 1, 3, 1, 3] -> sum=10, expected contributions for
+    // input phi=10.0: rupa=2, vedana=1, sanna=3, sankhara=1, vinnana=3.
+    let mut w = []
+    w = w.push(2.0)
+    w = w.push(1.0)
+    w = w.push(3.0)
+    w = w.push(1.0)
+    w = w.push(3.0)
+    let s = decompose(10.0, w)
+    println("  [T4] decompose(10, [2,1,3,1,3]): r=" + str(get_rupa(s)) + " v=" + str(get_vedana(s)) + " sa=" + str(get_sanna(s)) + " sk=" + str(get_sankhara(s)) + " vi=" + str(get_vinnana(s)) + " total=" + str(get_phi_total(s)))
+    if fabs_s(get_rupa(s) - 2.0) > 0.001 { return false }
+    if fabs_s(get_vedana(s) - 1.0) > 0.001 { return false }
+    if fabs_s(get_sanna(s) - 3.0) > 0.001 { return false }
+    if fabs_s(get_sankhara(s) - 1.0) > 0.001 { return false }
+    if fabs_s(get_vinnana(s) - 3.0) > 0.001 { return false }
+    if fabs_s(get_phi_total(s) - 10.0) > 0.001 { return false }
+    if !sum_check(s) { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5: Determinism — identical inputs yield identical decomposition
+    //
+    // Karma-free invariance (kriya-nishkamatva) — pure structural
+    // function has no hidden state. Two independent decomposition
+    // calls with the same args must produce bitwise-equal state.
+    let mut w = []
+    w = w.push(1.0)
+    w = w.push(2.0)
+    w = w.push(3.0)
+    w = w.push(4.0)
+    w = w.push(5.0)
+    let s1 = decompose(20.0, w)
+    let s2 = decompose(20.0, w)
+    if fabs_s(get_rupa(s1) - get_rupa(s2)) > 0.0001 { return false }
+    if fabs_s(get_vedana(s1) - get_vedana(s2)) > 0.0001 { return false }
+    if fabs_s(get_sanna(s1) - get_sanna(s2)) > 0.0001 { return false }
+    if fabs_s(get_sankhara(s1) - get_sankhara(s2)) > 0.0001 { return false }
+    if fabs_s(get_vinnana(s1) - get_vinnana(s2)) > 0.0001 { return false }
+    if fabs_s(get_phi_total(s1) - get_phi_total(s2)) > 0.0001 { return false }
+    println("  [T5] determinism: s1.total=" + str(get_phi_total(s1)) + " s2.total=" + str(get_phi_total(s2)))
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — run all self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[skandhas_decomposition] P34/1 — 5 aggregates phi decomposition")
+    println("  source: Samyutta Nikaya 22.59 + Heart Sutra")
+    println("  invariant: Φ_total = Σ (rupa + vedana + sanna + sankhara + vinnana)")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — new() all zero") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — skandhas_from sum invariant") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — uniform decompose, no sum loss") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — weighted decompose preserves sum") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — determinism") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause comment: hexa stage0 can mishandle chained && with 5 terms.
+    // Split into sequential checks with temp variable.
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[skandhas_decomposition] 5/5 PASS — P34/1 DONE (anatman sum invariant)")
+    } else {
+        println("[skandhas_decomposition] SOME FAILED")
+    }
+}
+
+main()

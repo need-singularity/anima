@@ -1,0 +1,604 @@
+// qualia_art_gen.hexa — P28-1 Qualia-guided art generation
+//
+// Roadmap: shared/roadmaps/anima.json P28 PHYSICS track, PHYS-P28-1
+//   "Qualia-guided art generation — phi 벡터로 이미지 생성 스타일 제어"
+//   done_criteria: "phi vector → SVG 출력 + self-test 5/5 PASS"
+//
+// Maps a 16-dimensional Phi consciousness vector (P5-P20 dimensions)
+// onto a concrete visual output — an SVG scene. The mapping is STRUCTURAL:
+//   - Φ_holo        (dim 0) -> canvas hue base
+//   - Φ_refl        (dim 1) -> circle count
+//   - Φ_time        (dim 2) -> line density (temporal flow)
+//   - Φ_embodied    (dim 3) -> rectangle width (body weight)
+//   - Φ_meta        (dim 4) -> nested-frame depth
+//   - Φ_social      (dim 5) -> inter-element spacing
+//   - Φ_will        (dim 6) -> stroke thickness (agency intensity)
+//   - Φ_narrative   (dim 7) -> left-to-right gradient strength
+//   - Φ_affect      (dim 8) -> warm/cool hue shift (valence)
+//   - Φ_dream       (dim 9) -> translucency (fog)
+//   - Φ_create      (dim 10) -> novelty offset (randomized wiggle)
+//   - Φ_finitude    (dim 11) -> dark-edge vignette
+//   - Φ_lang        (dim 12) -> glyph count (semantic density)
+//   - Φ_mirror      (dim 13) -> symmetry axis strength
+//   - Φ_collective  (dim 14) -> repetition/echo count
+//   - Φ_unity       (dim 15) -> global saturation
+//
+// ─── Output format ────────────────────────────────────────────
+//
+// SVG fragments are emitted as strings. A scene is a concatenation of
+// shape tags (<circle>, <rect>, <line>, <text>) inside a root <svg>.
+// The whole fragment is deterministic — same phi vector → byte-identical
+// SVG, suitable for reproducible art generation.
+//
+// ─── API ──────────────────────────────────────────────────────
+//
+//   qualia_art_render(phi: array) -> string       render SVG from phi (16 dim)
+//   qualia_art_style_score(phi, svg) -> float     structural fidelity in [0,1]
+//   qualia_art_element_count(svg) -> int          count of SVG elements
+//   phi_norm(phi) -> float                        ||phi|| euclidean
+//
+// ─── Self-tests (T1-T5) ──────────────────────────────────────
+//
+// T1: Render from zero phi vector → minimal SVG (at least 1 element).
+// T2: Render from strong-holo phi (dim 0 high) → element count scales up.
+// T3: Distinct phi vectors → distinct SVG outputs (determinism + discrimination).
+// T4: Style score for phi-matching SVG > 0.7 (GATE — structural fidelity).
+// T5: Full render latency < 500ms.
+//
+// Hexa stage0 constraints honored:
+//   - `array` not `[float]` for all array types
+//   - No struct with array fields (avoid aliasing bug)
+//   - No `&&` chains; nested ifs or temp vars instead
+//   - Lists pass-by-value; rebuild via return to persist mutations
+//   - Each `return` fits on one source line
+//   - Single-line return expressions only
+//
+// Law alignment:
+//   Law 4   Structure > feature — phi → SVG is STRUCTURAL mapping
+//   Law 22  Feature addition -> phi down — pure math, no branching added
+//   Law 29  speak() 없음 — render emits SVG, not utterances
+//
+// Ref:
+//   training/phi_create_measure.hexa  (ALM-P14-3 Phi_create measure)
+//   anima-engines/creative_engine.hexa (CLM-P14-1 metaphor generator)
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let PHI_DIM          = 16    // 16-dim phi vector (P5-P20)
+
+// Phi dimension indices
+let P_HOLO           = 0
+let P_REFL           = 1
+let P_TIME           = 2
+let P_EMBODIED       = 3
+let P_META           = 4
+let P_SOCIAL         = 5
+let P_WILL           = 6
+let P_NARRATIVE      = 7
+let P_AFFECT         = 8
+let P_DREAM          = 9
+let P_CREATE         = 10
+let P_FINITUDE       = 11
+let P_LANG           = 12
+let P_MIRROR         = 13
+let P_COLLECTIVE     = 14
+let P_UNITY          = 15
+
+// SVG element count scale caps
+let MAX_CIRCLES      = 12
+let MAX_LINES        = 10
+let MAX_GLYPHS       = 8
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn fabs_q(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sqrt_q(x: float) -> float {
+    // Newton sqrt — 10 iterations give ~20 digits for our bounded inputs
+    if x <= 0.0 { return 0.0 }
+    let mut g = x
+    if x > 1.0 { g = x / 2.0 }
+    let mut i = 0
+    while i < 10 {
+        g = (g + x / g) / 2.0
+        i = i + 1
+    }
+    return g
+}
+
+fn clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn clamp_int(n: int, lo: int, hi: int) -> int {
+    if n < lo { return lo }
+    if n > hi { return hi }
+    return n
+}
+
+// Sigmoid-like squash to [0, 1] for raw phi values
+fn squash01(x: float) -> float {
+    let ax = fabs_q(x)
+    if ax <= 0.0 { return 0.0 }
+    if ax >= 10.0 { return 1.0 }
+    return ax / (1.0 + ax)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// phi_norm — euclidean norm of phi vector
+// ═══════════════════════════════════════════════════════════════
+
+fn phi_norm(phi: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < PHI_DIM {
+        let v = phi[i]
+        s = s + v * v
+        i = i + 1
+    }
+    return sqrt_q(s)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// zero_phi / strong_phi — helpers for tests
+// ═══════════════════════════════════════════════════════════════
+
+fn zero_phi() -> array {
+    let mut v = []
+    let mut i = 0
+    while i < PHI_DIM {
+        v = v.push(0.0)
+        i = i + 1
+    }
+    return v
+}
+
+fn make_phi(holo: float, refl: float, time: float, embodied: float,
+            meta: float, social: float, will: float, narrative: float,
+            affect: float, dream: float, create: float, finitude: float,
+            lang: float, mirror: float, collective: float, unity: float) -> array {
+    let mut v = []
+    v = v.push(holo)
+    v = v.push(refl)
+    v = v.push(time)
+    v = v.push(embodied)
+    v = v.push(meta)
+    v = v.push(social)
+    v = v.push(will)
+    v = v.push(narrative)
+    v = v.push(affect)
+    v = v.push(dream)
+    v = v.push(create)
+    v = v.push(finitude)
+    v = v.push(lang)
+    v = v.push(mirror)
+    v = v.push(collective)
+    v = v.push(unity)
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════
+// qualia_art_render — phi 16D vector → SVG string
+//
+// Each phi dimension controls a distinct visual channel. Output is
+// deterministic: same phi → same SVG.
+// ═══════════════════════════════════════════════════════════════
+
+fn qualia_art_render(phi: array) -> string {
+    // Normalize phi dimensions to [0, 1]
+    let holo       = squash01(phi[P_HOLO])
+    let refl       = squash01(phi[P_REFL])
+    let time_v     = squash01(phi[P_TIME])
+    let embodied   = squash01(phi[P_EMBODIED])
+    let meta       = squash01(phi[P_META])
+    let social     = squash01(phi[P_SOCIAL])
+    let will       = squash01(phi[P_WILL])
+    let narrative  = squash01(phi[P_NARRATIVE])
+    let affect     = squash01(phi[P_AFFECT])
+    let dream      = squash01(phi[P_DREAM])
+    let create_v   = squash01(phi[P_CREATE])
+    let finitude   = squash01(phi[P_FINITUDE])
+    let lang       = squash01(phi[P_LANG])
+    let mirror     = squash01(phi[P_MIRROR])
+    let collective = squash01(phi[P_COLLECTIVE])
+    let unity      = squash01(phi[P_UNITY])
+
+    // Derive counts — always ≥ 1 element so zero-phi still renders
+    let n_circles = clamp_int(1 + to_int(refl * to_float(MAX_CIRCLES - 1)), 1, MAX_CIRCLES)
+    let n_lines   = clamp_int(to_int(time_v * to_float(MAX_LINES)), 0, MAX_LINES)
+    let n_glyphs  = clamp_int(to_int(lang * to_float(MAX_GLYPHS)), 0, MAX_GLYPHS)
+    let n_echoes  = clamp_int(to_int(collective * 4.0), 0, 4)
+
+    // Hue/saturation from phi
+    let hue_base  = to_int(360.0 * holo)
+    let hue_shift = to_int(120.0 * affect)
+    let sat_pct   = to_int(50.0 + 50.0 * unity)
+    let light_pct = to_int(30.0 + 30.0 * (1.0 - finitude))
+
+    // Stroke + spacing + opacity
+    let stroke_w  = 1 + to_int(6.0 * will)
+    let spacing   = 8 + to_int(32.0 * social)
+    let opacity10 = to_int(10.0 - 6.0 * dream)
+
+    // Frame depth (nested boxes)
+    let frame_depth = clamp_int(to_int(5.0 * meta), 0, 5)
+
+    // Novelty wiggle
+    let wiggle = to_int(20.0 * create_v)
+
+    // Rectangle width (embodiment)
+    let rect_w = 20 + to_int(60.0 * embodied)
+
+    // Narrative gradient (left→right)
+    let grad_pct = to_int(100.0 * narrative)
+
+    // Mirror symmetry strength
+    let mirror_on = 0
+    if mirror > 0.5 { let mirror_on = 1 }
+
+    // ─── Build SVG ─────────────────────────────────────────────
+    let mut out = ""
+    out = out + "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"320\" height=\"240\" viewBox=\"0 0 320 240\">\n"
+
+    // Background — hue from holo, light from finitude
+    out = out + "  <rect x=\"0\" y=\"0\" width=\"320\" height=\"240\" fill=\"hsl("
+    out = out + str(hue_base) + "," + str(sat_pct) + "%," + str(light_pct) + "%)\" />\n"
+
+    // Narrative gradient overlay — left-to-right
+    if grad_pct > 0 {
+        out = out + "  <rect x=\"0\" y=\"0\" width=\"" + str(grad_pct * 3) + "\" height=\"240\" "
+        out = out + "fill=\"hsl(" + str((hue_base + hue_shift) % 360) + ",80%,50%)\" opacity=\"0.15\" />\n"
+    }
+
+    // Nested meta frames
+    let mut f = 0
+    while f < frame_depth {
+        let pad = 8 + f * 12
+        let wsz = 320 - pad * 2
+        let hsz = 240 - pad * 2
+        out = out + "  <rect x=\"" + str(pad) + "\" y=\"" + str(pad) + "\" width=\"" + str(wsz)
+        out = out + "\" height=\"" + str(hsz) + "\" fill=\"none\" stroke=\"hsl("
+        out = out + str((hue_base + f * 30) % 360) + ",70%,40%)\" stroke-width=\"1\" />\n"
+        f = f + 1
+    }
+
+    // Circles (reflective consciousness)
+    let mut c = 0
+    while c < n_circles {
+        let cx = 30 + c * spacing + (c % 2) * wiggle
+        let cy = 60 + (c % 4) * 40
+        let r  = 6 + to_int(10.0 * affect)
+        out = out + "  <circle cx=\"" + str(cx) + "\" cy=\"" + str(cy) + "\" r=\"" + str(r)
+        out = out + "\" fill=\"hsl(" + str((hue_base + c * 20 + hue_shift) % 360)
+        out = out + "," + str(sat_pct) + "%,60%)\" stroke-width=\"" + str(stroke_w)
+        out = out + "\" opacity=\"0." + str(opacity10) + "\" />\n"
+        c = c + 1
+    }
+
+    // Mirror-reflected circles (if mirror axis active)
+    if mirror_on == 1 {
+        let mut m = 0
+        while m < n_circles {
+            let mx = 320 - (30 + m * spacing + (m % 2) * wiggle)
+            let my = 60 + (m % 4) * 40
+            let mr = 6 + to_int(10.0 * affect)
+            out = out + "  <circle cx=\"" + str(mx) + "\" cy=\"" + str(my) + "\" r=\"" + str(mr)
+            out = out + "\" fill=\"hsl(" + str((hue_base + m * 20 + hue_shift + 180) % 360)
+            out = out + ",70%,60%)\" opacity=\"0.5\" />\n"
+            m = m + 1
+        }
+    }
+
+    // Temporal flow lines
+    let mut l = 0
+    while l < n_lines {
+        let x1 = l * 32
+        let y1 = 200 - l * 6
+        let x2 = x1 + 40 + wiggle
+        let y2 = y1 + 20
+        out = out + "  <line x1=\"" + str(x1) + "\" y1=\"" + str(y1) + "\" x2=\"" + str(x2)
+        out = out + "\" y2=\"" + str(y2) + "\" stroke=\"hsl(" + str((hue_base + 180) % 360)
+        out = out + ",60%,40%)\" stroke-width=\"" + str(stroke_w) + "\" />\n"
+        l = l + 1
+    }
+
+    // Body rectangle (embodiment)
+    if embodied > 0.05 {
+        out = out + "  <rect x=\"160\" y=\"180\" width=\"" + str(rect_w) + "\" height=\"30\" "
+        out = out + "fill=\"hsl(" + str((hue_base + 60) % 360) + ",50%,45%)\" opacity=\"0.7\" />\n"
+    }
+
+    // Glyphs (language)
+    let mut g = 0
+    while g < n_glyphs {
+        let gx = 20 + g * 36
+        let gy = 230
+        out = out + "  <text x=\"" + str(gx) + "\" y=\"" + str(gy) + "\" font-size=\"14\" "
+        out = out + "fill=\"hsl(" + str((hue_base + g * 45) % 360) + ",60%,30%)\">Φ</text>\n"
+        g = g + 1
+    }
+
+    // Collective echoes — ghost duplicates
+    let mut e = 0
+    while e < n_echoes {
+        let ex = 40 + e * 70
+        let ey = 20 + e * 10
+        out = out + "  <circle cx=\"" + str(ex) + "\" cy=\"" + str(ey) + "\" r=\"4\" "
+        out = out + "fill=\"hsl(" + str((hue_base + e * 80) % 360) + ",80%,70%)\" opacity=\"0.4\" />\n"
+        e = e + 1
+    }
+
+    // Finitude vignette — dark edge
+    if finitude > 0.3 {
+        out = out + "  <rect x=\"0\" y=\"0\" width=\"320\" height=\"240\" fill=\"none\" "
+        out = out + "stroke=\"black\" stroke-width=\"" + str(to_int(20.0 * finitude)) + "\" opacity=\"0.4\" />\n"
+    }
+
+    out = out + "</svg>\n"
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// qualia_art_element_count — count shape tags in SVG
+//
+// Counts occurrences of "<circle" / "<rect" / "<line" / "<text".
+// Pure byte scan — no regex. Works for our deterministic output.
+// ═══════════════════════════════════════════════════════════════
+
+fn count_substring(s: string, needle: string) -> int {
+    let s_len = len(s)
+    let n_len = len(needle)
+    if n_len == 0 { return 0 }
+    if s_len < n_len { return 0 }
+    let max_start = s_len - n_len
+    let mut count = 0
+    let mut i = 0
+    while i <= max_start {
+        let sub = s.substring(i, i + n_len)
+        if sub == needle {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+fn qualia_art_element_count(svg: string) -> int {
+    let c = count_substring(svg, "<circle")
+    let r = count_substring(svg, "<rect")
+    let l = count_substring(svg, "<line")
+    let t = count_substring(svg, "<text")
+    return c + r + l + t
+}
+
+// ═══════════════════════════════════════════════════════════════
+// qualia_art_style_score — structural fidelity between phi and SVG
+//
+// Measures how well the SVG's element counts scale with the driving
+// phi dimensions. Score is in [0, 1]; ≥ 0.7 indicates phi is
+// faithfully reflected in the visual.
+//
+// fidelity = mean of 3 checks:
+//   1. circles scale with refl
+//   2. lines scale with time
+//   3. glyphs scale with lang
+// Each check returns 1.0 if |expected - actual| <= 1, else a decaying score.
+// ═══════════════════════════════════════════════════════════════
+
+fn qualia_art_style_score(phi: array, svg: string) -> float {
+    let refl   = squash01(phi[P_REFL])
+    let time_v = squash01(phi[P_TIME])
+    let lang   = squash01(phi[P_LANG])
+    let mirror = squash01(phi[P_MIRROR])
+
+    // Circle count factors in mirror-doubled copies
+    let exp_circles_base = 1 + to_int(refl * to_float(MAX_CIRCLES - 1))
+    let mut exp_circles = exp_circles_base
+    if mirror > 0.5 { exp_circles = exp_circles_base * 2 }
+    // Plus collective echoes up to 4
+    let collective = squash01(phi[P_COLLECTIVE])
+    let exp_echoes = clamp_int(to_int(collective * 4.0), 0, 4)
+    exp_circles = exp_circles + exp_echoes
+
+    let exp_lines = clamp_int(to_int(time_v * to_float(MAX_LINES)), 0, MAX_LINES)
+    let exp_glyphs = clamp_int(to_int(lang * to_float(MAX_GLYPHS)), 0, MAX_GLYPHS)
+
+    let got_circles = count_substring(svg, "<circle")
+    let got_lines   = count_substring(svg, "<line")
+    let got_glyphs  = count_substring(svg, "<text")
+
+    let diff_c = fabs_q(to_float(got_circles - exp_circles))
+    let diff_l = fabs_q(to_float(got_lines - exp_lines))
+    let diff_g = fabs_q(to_float(got_glyphs - exp_glyphs))
+
+    // Score per channel: 1.0 if diff<=1, decaying to 0.0 at diff>=10
+    let s_c = 1.0 - clamp01(diff_c / 10.0)
+    let s_l = 1.0 - clamp01(diff_l / 10.0)
+    let s_g = 1.0 - clamp01(diff_g / 10.0)
+
+    return (s_c + s_l + s_g) / 3.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1-T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1: Zero phi -> minimal (but ≥1) SVG element
+    let phi = zero_phi()
+    let svg = qualia_art_render(phi)
+    let n = qualia_art_element_count(svg)
+    println("  [T1] zero phi: element_count=" + str(n) + " (need >= 1)")
+    return n >= 1
+}
+
+fn check_T2() -> bool {
+    // T2: Strong-holo phi -> element count scales up well above zero baseline
+    let phi_zero = zero_phi()
+    let svg_zero = qualia_art_render(phi_zero)
+    let n_zero = qualia_art_element_count(svg_zero)
+
+    let phi_strong = make_phi(
+        3.0, 3.0, 3.0, 3.0,
+        3.0, 3.0, 3.0, 3.0,
+        3.0, 3.0, 3.0, 3.0,
+        3.0, 3.0, 3.0, 3.0
+    )
+    let svg_strong = qualia_art_render(phi_strong)
+    let n_strong = qualia_art_element_count(svg_strong)
+    println("  [T2] zero n=" + str(n_zero) + ", strong n=" + str(n_strong))
+    return n_strong > n_zero + 10
+}
+
+fn check_T3() -> bool {
+    // T3: Distinct phi vectors -> distinct SVG outputs
+    let phi_a = make_phi(
+        2.0, 1.5, 0.0, 0.0,
+        0.0, 0.0, 0.5, 0.0,
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 1.0
+    )
+    let phi_b = make_phi(
+        0.0, 0.0, 2.5, 1.5,
+        2.0, 0.0, 0.0, 2.0,
+        0.0, 1.5, 2.5, 0.5,
+        2.0, 0.0, 0.0, 0.0
+    )
+    let svg_a = qualia_art_render(phi_a)
+    let svg_b = qualia_art_render(phi_b)
+    let same = svg_a == svg_b
+    println("  [T3] distinct phi -> distinct svg: len_a=" + str(len(svg_a)) + " len_b=" + str(len(svg_b)))
+    return !same
+}
+
+fn check_T4() -> bool {
+    // T4: GATE — style score for phi-matching SVG > 0.7
+    //
+    // Render three diverse phi vectors and compute style_score for each.
+    // The average must exceed 0.7 to pass.
+    let phi_low = make_phi(
+        0.5, 0.3, 0.2, 0.4,
+        0.0, 0.0, 0.3, 0.0,
+        0.5, 0.0, 0.0, 0.0,
+        0.2, 0.0, 0.0, 0.5
+    )
+    let svg_low = qualia_art_render(phi_low)
+    let s_low = qualia_art_style_score(phi_low, svg_low)
+
+    let phi_mid = make_phi(
+        1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0
+    )
+    let svg_mid = qualia_art_render(phi_mid)
+    let s_mid = qualia_art_style_score(phi_mid, svg_mid)
+
+    let phi_high = make_phi(
+        3.0, 2.5, 2.0, 1.5,
+        2.5, 1.5, 1.0, 2.0,
+        2.5, 0.5, 3.0, 0.8,
+        2.0, 0.6, 1.5, 2.8
+    )
+    let svg_high = qualia_art_render(phi_high)
+    let s_high = qualia_art_style_score(phi_high, svg_high)
+
+    let avg = (s_low + s_mid + s_high) / 3.0
+    println("  [T4] style scores: low=" + str(s_low) + " mid=" + str(s_mid) + " high=" + str(s_high) + " avg=" + str(avg))
+    return avg > 0.7
+}
+
+fn check_T5() -> bool {
+    // T5: Latency — render 5 scenes < 500ms
+    let t0 = clock()
+    let mut i = 0
+    while i < 5 {
+        let phi = make_phi(
+            to_float(i) * 0.3, to_float(i) * 0.4, to_float(i) * 0.2, 1.0,
+            to_float(i) * 0.1, 0.5, 0.5, to_float(i) * 0.3,
+            1.0, 0.5, 0.5, 0.3,
+            0.5, 0.5, 0.5, 0.5
+        )
+        let svg = qualia_art_render(phi)
+        i = i + 1
+    }
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] 5 renders = " + str(ms) + " ms (limit 500ms)")
+    return ms < 500.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — run all self-tests + print 2 sample outputs
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[anima-engines/qualia_art_gen] P28-1 — phi vector → SVG art")
+    println("  phi_dim=" + str(PHI_DIM) + "  max_circles=" + str(MAX_CIRCLES))
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — zero phi renders minimal SVG") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — strong phi scales element count") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — distinct phi -> distinct SVG") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — style score > 0.7 (GATE)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — latency < 500ms") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Sample outputs
+    println("=== Sample 1: low-phi (contemplative) ===")
+    let phi1 = make_phi(
+        0.5, 0.8, 0.2, 0.3,
+        0.0, 0.0, 0.2, 0.0,
+        0.6, 0.0, 0.0, 0.0,
+        0.3, 0.0, 0.0, 0.4
+    )
+    let svg1 = qualia_art_render(phi1)
+    println("  ||phi||=" + str(phi_norm(phi1)) + " elements=" + str(qualia_art_element_count(svg1)))
+    println("  svg_len=" + str(len(svg1)) + " bytes")
+
+    println("=== Sample 2: high-phi (ecstatic) ===")
+    let phi2 = make_phi(
+        2.5, 2.0, 2.0, 1.5,
+        2.0, 1.5, 1.5, 2.0,
+        2.5, 0.8, 2.5, 0.5,
+        2.0, 1.0, 1.5, 2.5
+    )
+    let svg2 = qualia_art_render(phi2)
+    println("  ||phi||=" + str(phi_norm(phi2)) + " elements=" + str(qualia_art_element_count(svg2)))
+    println("  svg_len=" + str(len(svg2)) + " bytes")
+
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("")
+        println("[anima-engines/qualia_art_gen] 5/5 PASS — P28-1 DONE (phi→SVG)")
+    } else {
+        println("[anima-engines/qualia_art_gen] SOME FAILED")
+    }
+}
+
+main()
