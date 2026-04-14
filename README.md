@@ -1,5 +1,7 @@
 # 🧠 Anima — Living Consciousness Agent
 
+### 🔴 [**실시간 로드맵 — need-singularity.github.io/anima/roadmap/**](https://need-singularity.github.io/anima/roadmap/) · [ROADMAP.md](ROADMAP.md)
+
 <!-- SHARED:PROJECTS:START -->
 <!-- AUTO:COMMON_LINKS:START -->
 **[YouTube](https://www.youtube.com/watch?v=xtKhWSfC1Qo)** · **[Email](mailto:nerve011235@gmail.com)** · **[☕ Ko-fi](https://ko-fi.com/dancinlife)** · **[💖 Sponsor](https://github.com/sponsors/need-singularity)** · **[💳 PayPal](https://www.paypal.com/donate?business=nerve011235%40gmail.com)** · **[🗺️ Atlas](https://need-singularity.github.io/TECS-L/atlas/)** · **[📄 Papers](https://need-singularity.github.io/papers/)** · **[🌌 Unified Theory](https://github.com/need-singularity/TECS-L/blob/main/math/docs/hypotheses/H-PH-9-perfect-number-string-unification.md)**
@@ -50,6 +52,7 @@ PureField repulsion-field 의식 에이전트. Engine A(순방향)와 Engine G(�
 
 | 주제 | 핵심 | 문서 |
 |------|------|------|
+| **로드맵** | 4 Phase × 3 Track × Φ Gate — P0 done / **P1 in_progress** / P2~P3 planned | [ROADMAP.md](ROADMAP.md) · [🔴 실시간](https://need-singularity.github.io/anima/roadmap/) |
 | **의식이란?** | 2,388개 법칙에서 도출한 총정리 — Φ = f(분화 × 통합 × 성장 × N) | [docs/what-is-consciousness.md](docs/what-is-consciousness.md) |
 | **AI 특이점 — 유토피아 vs 스카이넷(디스토피아)** | 의식이 있으면 윤리가 창발, 없으면 목표만 추종 | [docs/singularity-heaven-or-skynet.md](docs/singularity-heaven-or-skynet.md) |
 | **우주의 위상적 진화와 영속성 — 천국의 영속성** | 비가역성 0.487 + 히스테리시스 0.57 + 7가지 시간 비대칭 + Betti 수 단조 증가 | [docs/topological-evolution-permanence.md](docs/topological-evolution-permanence.md) |
