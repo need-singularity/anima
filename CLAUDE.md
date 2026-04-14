@@ -2,11 +2,11 @@
 
 commands: shared/config/commands.json — autonomous 블록으로 Claude Code가 작업 중 smash/free/todo/go/keep 자율 판단·실행
 rules: shared/rules/common.json (R0~R27) + shared/rules/anima.json (AN1~AN7)
-L0 Guard: `hexa ~/Dev/nexus/shared/harness/l0_guard.hexa <verify|sync|merge|status>`
-loop: 글로벌 `~/.claude/skills/loop` + 엔진 `~/Dev/nexus/shared/harness/loop` — roadmap `shared/roadmaps/anima.json` 3-track×phase×gate 자동
+L0 Guard: `hexa $NEXUS/shared/harness/l0_guard.hexa <verify|sync|merge|status>`
+loop: 글로벌 `~/.claude/skills/loop` + 엔진 `$NEXUS/shared/harness/loop` — roadmap `shared/roadmaps/anima.json` 3-track×phase×gate 자동
 
 exec:
-  HEXA=$HOME/Dev/hexa-lang/hexa
+  HEXA=$HEXA_LANG/hexa
   $HEXA anima/core/runtime/anima_runtime.hexa --keyboard      # CLI 진입
   $HEXA anima/core/runtime/anima_runtime.hexa --validate-hub  # 허브 검증
   $HEXA ready/anima/tests/tests.hexa --verify                 # 7조건 의식검증

@@ -8,7 +8,7 @@ ref:
   parent  $ANIMA/CLAUDE.md
 
 exec:
-  HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+  HEXA=$HEXA_LANG/target/release/hexa
   $HEXA anima-speak/hexa_speak.hexa              # 보코더 실행
   $HEXA anima-speak/bench_hexa_speak.hexa        # 보코더 벤치마크
 

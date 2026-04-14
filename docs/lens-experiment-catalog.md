@@ -84,7 +84,7 @@
 ## 실험 실행 방법
 
 ```bash
-HEXA=$HOME/Dev/hexa-lang/hexa
+HEXA=$HEXA_LANG/hexa
 # 단일 렌즈 실험
 $HEXA anima/experiments/lens_L01_overlay.hexa --cells 64 --steps 300
 

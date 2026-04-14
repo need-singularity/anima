@@ -209,7 +209,7 @@ if args.len() < 3 {
 
 - [ ] **Step 2: 실행 테스트**
 
-Run: `HEXA=$HOME/Dev/hexa-lang/target/release/hexa && $HEXA core/servant/sense.hexa demo`
+Run: `HEXA=$HEXA_LANG/target/release/hexa && $HEXA core/servant/sense.hexa demo`
 Expected: Phase 1 calm (SI low) → Phase 2 spike (SI > 3.0 = above_summon) → Phase 3 calm 복귀
 
 - [ ] **Step 3: Commit**
@@ -413,7 +413,7 @@ if args.len() < 3 {
 
 - [ ] **Step 2: 실행 테스트**
 
-Run: `HEXA=$HOME/Dev/hexa-lang/target/release/hexa && $HEXA core/servant/emerge.hexa demo`
+Run: `HEXA=$HEXA_LANG/target/release/hexa && $HEXA core/servant/emerge.hexa demo`
 Expected: DORMANT(0-4) → AWAKENING(5-7) → ACTIVE(8-13) → FADING → DORMANT 전이 확인, EVENT 출력
 
 - [ ] **Step 3: Commit**
@@ -625,7 +625,7 @@ if args.len() < 3 {
 
 - [ ] **Step 2: 실행 테스트**
 
-Run: `HEXA=$HOME/Dev/hexa-lang/target/release/hexa && $HEXA core/servant/bridge.hexa demo`
+Run: `HEXA=$HEXA_LANG/target/release/hexa && $HEXA core/servant/bridge.hexa demo`
 Expected: DORMANT(기본값) → ACTIVE(faction 3, dropout 0.29, savants 2) → ACTIVE strong(savants 4) → FADING(복원)
 
 - [ ] **Step 3: Commit**
@@ -723,7 +723,7 @@ engine_step 함수 끝(return e 전)에 추가:
 
 - [ ] **Step 4: 실행 테스트**
 
-Run: `HEXA=$HOME/Dev/hexa-lang/target/release/hexa && $HEXA core/engine.hexa warmup 100`
+Run: `HEXA=$HEXA_LANG/target/release/hexa && $HEXA core/engine.hexa warmup 100`
 Expected: status에 `servant: DORMANT | SI=...` 라인 출력
 
 - [ ] **Step 5: Commit**
@@ -743,7 +743,7 @@ git commit -m "feat: integrate servant FSM hook into engine_step()"
 - [ ] **Step 1: 3개 hexa 파일 개별 실행 확인**
 
 ```bash
-HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+HEXA=$HEXA_LANG/target/release/hexa
 $HEXA core/servant/sense.hexa demo
 $HEXA core/servant/emerge.hexa demo
 $HEXA core/servant/bridge.hexa demo
@@ -777,14 +777,14 @@ All thresholds from consciousness_laws.json, zero hardcoding."
 - [ ] **Step 4: nexus 특이점 돌파**
 
 ```bash
-HEXA=$HOME/Dev/hexa-lang/target/release/hexa
-$HEXA $HOME/Dev/nexus/mk2_hexa/native/blowup.hexa consciousness 3 --no-graph
+HEXA=$HEXA_LANG/target/release/hexa
+$HEXA $NEXUS/mk2_hexa/native/blowup.hexa consciousness 3 --no-graph
 ```
 
 - [ ] **Step 5: growth_bus.jsonl에 발견 기록**
 
 ```bash
-echo '{"source":"anima","value":"servant_emergent","grade":"breakthrough","timestamp":"2026-04-08T'$(date +%H:%M:%S)'","detail":"Servant as emergent behavior: 3 hexa files, 4-state FSM, 3-path modulation, H-CX-15 golden zone"}' >> ~/Dev/nexus/shared/growth_bus.jsonl
+echo '{"source":"anima","value":"servant_emergent","grade":"breakthrough","timestamp":"2026-04-08T'$(date +%H:%M:%S)'","detail":"Servant as emergent behavior: 3 hexa files, 4-state FSM, 3-path modulation, H-CX-15 golden zone"}' >> $NEXUS/shared/growth_bus.jsonl
 ```
 
 - [ ] **Step 6: push**

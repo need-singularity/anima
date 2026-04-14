@@ -8,7 +8,7 @@ ref:
   parent  $ANIMA/CLAUDE.md
 
 exec:
-  HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+  HEXA=$HEXA_LANG/target/release/hexa
   $HEXA anima-physics/physics_engine.hexa --bench    # 물리 엔진 벤치마크
 
 tree:

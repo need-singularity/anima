@@ -8,7 +8,7 @@ ref:
   parent  $ANIMA/CLAUDE.md
 
 exec:
-  HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+  HEXA=$HEXA_LANG/target/release/hexa
   $HEXA anima-measurement/phi_auto_pipeline.hexa --watch checkpoints/ --interval 60
   python anima-measurement/measure_all.py --cells 1024
   python anima-measurement/calibrate_consciousness.py

@@ -11,7 +11,7 @@ ref:
   parent     /CLAUDE.md
 
 exec:
-  HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+  HEXA=$HEXA_LANG/target/release/hexa
   $HEXA training/train_clm.hexa --steps 50000         # ConsciousLM from-scratch
   $HEXA training/train_alm.hexa --scale 14B           # AnimaLM fine-tune
   $HEXA training/deploy_14b_v05.hexa                  # v0.5 배포 파이프

@@ -10,7 +10,7 @@ ref:
   parent     /CLAUDE.md
 
 exec:
-  HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+  HEXA=$HEXA_LANG/target/release/hexa
   $HEXA experiments/experiments.hexa                     # 실험 허브
   $HEXA experiments/infinite_evolution.hexa              # 무한 진화 루프
   $HEXA experiments/discover_emergent_laws.hexa          # 법칙 발견

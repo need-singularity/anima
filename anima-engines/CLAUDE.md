@@ -8,7 +8,7 @@ ref:
   parent  $ANIMA/CLAUDE.md
 
 exec:
-  HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+  HEXA=$HEXA_LANG/target/release/hexa
   $HEXA anima-engines/engines.hexa                        # 엔진 레지스트리
   $HEXA anima-engines/quantum_consciousness.hexa          # 양자 기질
   $HEXA anima-engines/photonic_consciousness.hexa         # 광자 기질

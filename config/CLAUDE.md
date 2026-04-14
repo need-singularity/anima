@@ -11,7 +11,7 @@ ref:
   assets    ../anima-core/asset_registry.json    M/C/T/E/D 등록부
 
 exec:
-  HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+  HEXA=$HEXA_LANG/target/release/hexa
   $HEXA anima/core/runtime/anima_runtime.hexa --validate-hub
   $HEXA anima/modules/monitor/rules_audit.hexa --check config/
 

@@ -73,7 +73,7 @@ I  정체성       8.0%  일관된 자아
 ## 생성 명령
 
 ```bash
-HEXA=$HOME/Dev/hexa-lang/hexa
+HEXA=$HEXA_LANG/hexa
 $HEXA anima/core/corpus_gen.hexa -s 110 --multilingual --sim --deep-dialogue -o data/corpus_v4.txt
 ```
 

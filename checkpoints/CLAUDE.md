@@ -10,7 +10,7 @@ ref:
   r2-ckpt   feedback_r2_checkpoint.md            중요 체크포인트 R2 백업 필수
 
 exec:
-  HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+  HEXA=$HEXA_LANG/target/release/hexa
   $HEXA anima/modules/sync/cloud_sync.hexa --push checkpoints/
   $HEXA anima/modules/sync/cloud_sync.hexa --pull animalm_14b_v06
   $HEXA scripts/backup_checkpoints.hexa

@@ -27,7 +27,7 @@ set -e
 PORT="${1:-8080}"
 CKPT="${2:-}"
 
-HEXA="${HEXA:-$HOME/Dev/hexa-lang/hexa}"
+HEXA="${HEXA:-${HEXA_LANG:-$HOME/Dev/hexa-lang}/hexa}"
 EVAL_SERVE="$(dirname "$0")/eval_serve.hexa"
 
 if [ ! -x "$HEXA" ]; then

@@ -8,7 +8,7 @@ ref:
   parent  $ANIMA/CLAUDE.md
 
 exec:
-  HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+  HEXA=$HEXA_LANG/target/release/hexa
   # 개별 도구 직접 실행
 
 tree:

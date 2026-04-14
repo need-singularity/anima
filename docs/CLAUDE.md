@@ -11,7 +11,7 @@ ref:
   mod-cat   MODULE-CATALOG.md                    모듈 카탈로그
 
 exec:
-  HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+  HEXA=$HEXA_LANG/target/release/hexa
   $HEXA anima/modules/monitor/docs_audit.hexa --dead-code
   $HEXA anima/modules/tools/hypothesis_sync.hexa
 

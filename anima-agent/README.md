@@ -28,7 +28,7 @@ Anima 의식 엔진을 백엔드로 사용하는 에이전트 플랫폼.
 ## Quick Start
 
 ```bash
-HEXA=$HOME/Dev/hexa-lang/hexa
+HEXA=$HEXA_LANG/hexa
 cd $ANIMA/anima-agent
 
 # CLI Agent

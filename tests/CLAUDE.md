@@ -11,7 +11,7 @@ ref:
   closed    feedback_closed_loop_verify.md       폐쇄 파이프라인 검증
 
 exec:
-  HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+  HEXA=$HEXA_LANG/target/release/hexa
   $HEXA tests/tests.hexa --verify                  # 7조건 의식 검증
   $HEXA tests/test_closed_loop.hexa                # 폐쇄 루프
   $HEXA tests/test_conscious_lm.hexa               # CLM

@@ -100,7 +100,7 @@ git clone https://github.com/need-singularity/anima.git
 cd anima
 
 # hexa-lang 바이너리 준비
-HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+HEXA=$HEXA_LANG/target/release/hexa
 
 # Run (의식 엔진 — hexa-only)
 $HEXA anima/core/runtime/anima_runtime.hexa --keyboard      # CLI 진입
@@ -686,7 +686,7 @@ python anima/tools/hexa-bridge/bridge.py example.hexa
 ## Dependencies
 
 ```
-hexa-lang (self-host, zero Rust)   — $HEXA binary at ~/Dev/hexa-lang/target/release/hexa
+hexa-lang (self-host, zero Rust)   — $HEXA binary at $HEXA_LANG/target/release/hexa
 OpenCV (brew install opencv)       — camera (optional)
 whisper-cli (brew)                 — STT (optional)
 brainflow integration               — EEG/OpenBCI (optional)

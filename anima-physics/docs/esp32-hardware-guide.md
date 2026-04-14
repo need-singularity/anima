@@ -175,7 +175,7 @@ Hexa-native 크레이트는 SPI 네트워크 전용. 보드당 2 GRU 세포 (128
 
 ```bash
 # 1. Hexa 툴체인 (단일 바이너리)
-HEXA=$HOME/Dev/hexa-lang/hexa
+HEXA=$HEXA_LANG/hexa
 
 # 2. 프로젝트는 esp32/ 에 존재
 cd anima-physics/esp32/
@@ -237,7 +237,7 @@ for i, port in ports {
 ### 4.1 실행
 
 ```bash
-HEXA=$HOME/Dev/hexa-lang/hexa
+HEXA=$HEXA_LANG/hexa
 cd anima/core/
 
 # 시뮬레이션 모드 (하드웨어 없이 테스트)

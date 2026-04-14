@@ -9,7 +9,7 @@ ref:
   hexa-py   feedback_hexa_replaces_py.md         hexa 완성 시 .py 즉시 폐기
 
 exec:
-  HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+  HEXA=$HEXA_LANG/target/release/hexa
   $HEXA scripts/h100_sync.hexa
   $HEXA scripts/backup_checkpoints.hexa
   $HEXA scripts/auto_restart.hexa

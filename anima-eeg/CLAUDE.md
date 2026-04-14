@@ -12,7 +12,7 @@ ref:
   api       shared/CLAUDE.md
 
 exec:
-  HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+  HEXA=$HEXA_LANG/target/release/hexa
   $HEXA anima/modules/eeg/eeg.hexa                        # 모듈 self-test
   $HEXA anima/modules/eeg/validate_consciousness.hexa     # 의식검증 (7조건)
   $HEXA anima/modules/eeg/realtime.hexa                   # OpenBCI → tension live

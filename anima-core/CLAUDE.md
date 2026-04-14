@@ -15,7 +15,7 @@ ref:
   parent       $ANIMA/CLAUDE.md
 
 exec:
-  HEXA=$HOME/Dev/hexa-lang/hexa
+  HEXA=$HEXA_LANG/hexa
   $HEXA anima-core/runtime/anima_runtime.hexa --keyboard      # CLI 대화
   $HEXA anima-core/runtime/anima_runtime.hexa --ticks 100     # 자연발화 (tick loop)
   $HEXA anima-core/runtime/anima_runtime.hexa --validate-hub  # 48모듈 허브 검증

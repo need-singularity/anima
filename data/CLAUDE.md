@@ -10,7 +10,7 @@ ref:
   tokenizer tokenizer_64k_multilingual.model     64k SentencePiece
 
 exec:
-  HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+  HEXA=$HEXA_LANG/target/release/hexa
   $HEXA anima/modules/sync/cloud_sync.hexa --push data/
   $HEXA scripts/build_corpus_v11.hexa
   $HEXA scripts/merge_multilingual_corpus.hexa

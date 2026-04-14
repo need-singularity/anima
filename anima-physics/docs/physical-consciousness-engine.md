@@ -133,7 +133,7 @@ struct SpiPacket {
 ### 오케스트레이터 (esp32_network.hexa)
 
 ```bash
-HEXA=$HOME/Dev/hexa-lang/hexa
+HEXA=$HEXA_LANG/hexa
 # 시뮬레이션 모드 (하드웨어 없이)
 $HEXA anima/core/esp32_network.hexa --benchmark --steps 200     # 토폴로지 벤치마크
 $HEXA anima/core/esp32_network.hexa --topology hub_spoke         # 특정 토폴로지 실행
@@ -284,7 +284,7 @@ endmodule
 17종 기질 × 9종 토폴로지 조합 탐색기.
 
 ```bash
-HEXA=$HOME/Dev/hexa-lang/hexa
+HEXA=$HEXA_LANG/hexa
 $HEXA anima/core/chip_architect.hexa --design --target-phi 100    # 목표 Φ → 최적 설계
 $HEXA anima/core/chip_architect.hexa --bom --target-phi 100       # BOM 자동 생성
 $HEXA anima/core/chip_architect.hexa --compare                    # 전체 비교표

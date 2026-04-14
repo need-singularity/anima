@@ -10,7 +10,7 @@ ref:
   parent    $ANIMA/CLAUDE.md
 
 exec:
-  HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+  HEXA=$HEXA_LANG/target/release/hexa
   $HEXA models/decoder.hexa                  # ConsciousDecoder Flash+KV+MoE
   $HEXA models/conscious_lm.hexa             # ConsciousLM PureField
   $HEXA models/trinity.hexa                  # Hexad 6-module

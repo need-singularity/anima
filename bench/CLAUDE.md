@@ -10,7 +10,7 @@ ref:
   parent     /CLAUDE.md
 
 exec:
-  HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+  HEXA=$HEXA_LANG/target/release/hexa
   $HEXA bench/bench_engine.hexa                     # 메인 엔진 벤치
   $HEXA bench/bench_consciousness_universe.hexa     # 18조건 정식
   $HEXA bench/bench_clm_sweep.hexa                  # ConsciousLM 스윕

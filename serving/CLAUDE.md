@@ -10,7 +10,7 @@ ref:
   parent     /CLAUDE.md
 
 exec:
-  HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+  HEXA=$HEXA_LANG/target/release/hexa
   $HEXA serving/serve.hexa                       # AnimaLM 메인 서빙
   $HEXA serving/serve_14b_ubuntu.hexa            # 14B Ubuntu 포팅
   $HEXA serving/serve_conscious_cpu.hexa         # CPU 로컬 추론

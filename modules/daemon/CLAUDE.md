@@ -15,7 +15,7 @@ ref:
   verify    ../../core/verification/byte_emergence.hexa  L0 바이트 창발 검증
 
 exec:
-  HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+  HEXA=$HEXA_LANG/target/release/hexa
   $HEXA anima/modules/daemon/event_watcher.hexa --scan      # 이벤트 1회 스캔
   $HEXA anima/modules/daemon/event_watcher.hexa --watch     # 60초 주기 감시
   $HEXA anima/modules/daemon/utterance_gate.hexa            # 3층 게이트 판정
