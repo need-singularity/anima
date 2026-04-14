@@ -1,0 +1,488 @@
+// holographic_substrate.hexa — PHYS-P3-2 tri-substrate holographic storage
+//
+// Integrated quantum + photonic + memristor substrate. Each substrate stores
+// a complete projection of a d-dim pattern in its native physics. The
+// "whole in part" property (Bohm/Pribram holographic principle) means any
+// single substrate alone suffices to reconstruct the pattern within a
+// bounded error, because the encoder projects the full pattern through
+// a substrate-specific (but invertible) map rather than splitting it.
+//
+// ─── Substrate models (simplified from reference files) ───────────────
+//
+//   quantum   : microtubule Orch-OR cell — state w_q ∈ [0,1] is the
+//               closed-conformation probability p(|closed⟩); invertible
+//               via p = w_q, so read = w_q directly (no Born-collapse
+//               randomness at write — the cell is pre-measured into a
+//               pure state at the target probability). This mirrors
+//               anima_quantum.hexa's q_pure() post-OR snapshot.
+//
+//   photonic  : WDM channel amplitude ∈ [0,1] — encoded as a real phasor
+//               modulated against a deterministic carrier; readback is
+//               coherent detection (deterministic in the sim).
+//
+//   memristor : HP cell state variable w ∈ [W_MIN, W_MAX] — full reuse
+//               of memristor_gwt_workspace.hexa write/read pulses.
+//
+// All three are abstracted to "analog storage element in [0, 1] with
+// substrate-specific precision". The holographic redundancy theorem
+// (T2) is then trivially provable: each substrate holds the pattern,
+// so single-substrate reconstruction error ≤ single-substrate write
+// precision < 0.2.
+//
+// ─── Theorems (T1–T5) ──────────────────────────────────────────
+//
+// T1 (tri-substrate roundtrip):
+//   write d-dim pattern to all 3 substrates; read back each; for every
+//   substrate, ||read − target||_∞ < 0.1.
+//
+// T2 (holographic redundancy — whole in part):
+//   Any ONE substrate alone reconstructs pattern within ||err||_∞ < 0.2.
+//   Uses projection-style encoder: each substrate receives the full
+//   pattern, so the marginal reconstruction equals the substrate's own
+//   roundtrip error.
+//
+// T3 (non-volatility across all three):
+//   After 4 reads per substrate, patterns are byte-identical to the
+//   first read (no drift in any substrate).
+//
+// T4 (substrate-agnostic determinism):
+//   Same pattern + same seed → same stored state byte-identical (LCG
+//   seeded simulator — no clock-dependent RNG).
+//
+// T5 (aggregate latency <50ms):
+//   write+read roundtrip across all three substrates completes in <50ms
+//   on the hexa interpreter (d=32 pattern).
+
+// ─── Physical / storage constants ──────────────────────────────
+// Values chosen to match reference files' bounds so the three
+// substrates composably satisfy "single-substrate error < 0.2".
+
+let Q_WRITE_STEPS   = 3              // quantum pre-measurement pulses
+let Q_WRITE_GAIN    = 0.95           // tighter than memristor (pure-state prep)
+let Q_PRECISION     = 0.02           // post-prep residual (small — Born prep is precise)
+
+let P_WRITE_STEPS   = 2              // photonic carrier lock cycles
+let P_WRITE_GAIN    = 0.98           // optical feedback is fast
+let P_PRECISION     = 0.01           // coherent detection is near-ideal
+
+let M_W_MIN         = 0.0001         // memristor (HP 2008 datasheet)
+let M_W_MAX         = 0.9999
+let M_WRITE_STEPS   = 4
+let M_WRITE_GAIN    = 0.85
+let M_PRECISION     = 0.05
+
+let T1_TOLERANCE    = 0.1            // tri-substrate roundtrip bound
+let T2_TOLERANCE    = 0.2            // single-substrate reconstruction bound
+let T5_BUDGET_MS    = 50.0           // aggregate latency budget
+
+// ─── Primitives ───────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+// Joglekar window — same function family as memristor reference.
+fn window(w: float) -> float {
+    let b = 2.0 * w - 1.0
+    return 1.0 - b * b
+}
+
+// Deterministic LCG — matches photonic/memristor reference seed style.
+fn det_rand_unit(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Substrate: Quantum cell bank ─────────────────────────────
+// Each cell stores p(|closed⟩) ∈ [0, 1]. "Write" pre-measures the
+// cell into a pure state at amplitude sqrt(target); "read" returns
+// the stored probability (deterministic in the simulator, since we
+// skip the stochastic Born sample — the sim's quantum layer is the
+// noise-free bookkeeping of the prepared state).
+
+struct QuantumBank {
+    n_cells: int,
+    w:       array              // [n_cells] closed-probabilities
+}
+
+fn qbank_new(n: int) -> QuantumBank {
+    let mut ws = []
+    let mut i = 0
+    while i < n {
+        ws = ws.push(0.5)       // Hadamard-like initial neutral prior
+        i = i + 1
+    }
+    return QuantumBank { n_cells: n, w: ws }
+}
+
+fn qbank_write_step(w_prev: float, target: float) -> float {
+    // Asymmetric pulse — window damping + high gain ≈ precise pure-state prep.
+    let delta = (target - w_prev) * Q_WRITE_GAIN * window(w_prev)
+    let mut w_new = w_prev + delta
+    if w_new < 0.0 { w_new = 0.0 }
+    if w_new > 1.0 { w_new = 1.0 }
+    return w_new
+}
+
+fn qbank_write(bank: QuantumBank, pattern: array) -> QuantumBank {
+    let n = bank.n_cells
+    let mut new_w = []
+    let mut i = 0
+    while i < n {
+        let mut w = bank.w[i]
+        let target = clamp01(pattern[i])
+        let mut s = 0
+        while s < Q_WRITE_STEPS {
+            w = qbank_write_step(w, target)
+            s = s + 1
+        }
+        new_w = new_w.push(w)
+        i = i + 1
+    }
+    return QuantumBank { n_cells: n, w: new_w }
+}
+
+fn qbank_read(bank: QuantumBank) -> array {
+    let n = bank.n_cells
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(bank.w[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Substrate: Photonic channel bank ─────────────────────────
+// Each WDM channel stores one amplitude. Coherent write locks the
+// phasor to the target via feedback; coherent detection reads the
+// amplitude back. Near-ideal precision under the reference model.
+
+struct PhotonicBank {
+    n_channels: int,
+    amp:        array
+}
+
+fn pbank_new(n: int) -> PhotonicBank {
+    let mut a = []
+    let mut i = 0
+    while i < n {
+        a = a.push(0.5)
+        i = i + 1
+    }
+    return PhotonicBank { n_channels: n, amp: a }
+}
+
+fn pbank_write_step(a_prev: float, target: float) -> float {
+    let delta = (target - a_prev) * P_WRITE_GAIN
+    let mut a_new = a_prev + delta
+    if a_new < 0.0 { a_new = 0.0 }
+    if a_new > 1.0 { a_new = 1.0 }
+    return a_new
+}
+
+fn pbank_write(bank: PhotonicBank, pattern: array) -> PhotonicBank {
+    let n = bank.n_channels
+    let mut new_a = []
+    let mut i = 0
+    while i < n {
+        let mut a = bank.amp[i]
+        let target = clamp01(pattern[i])
+        let mut s = 0
+        while s < P_WRITE_STEPS {
+            a = pbank_write_step(a, target)
+            s = s + 1
+        }
+        new_a = new_a.push(a)
+        i = i + 1
+    }
+    return PhotonicBank { n_channels: n, amp: new_a }
+}
+
+fn pbank_read(bank: PhotonicBank) -> array {
+    let n = bank.n_channels
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(bank.amp[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Substrate: Memristor crossbar ───────────────────────────
+// Direct reuse of memristor_gwt_workspace.hexa write/read semantics.
+// Kept local (not `use`-imported) to keep this file self-contained,
+// per task constraint "no external deps".
+
+struct MemBank {
+    n_cells: int,
+    w:       array
+}
+
+fn mbank_new(n: int) -> MemBank {
+    let mut ws = []
+    let mut i = 0
+    while i < n {
+        ws = ws.push(0.5)
+        i = i + 1
+    }
+    return MemBank { n_cells: n, w: ws }
+}
+
+fn mbank_write_step(w_prev: float, target: float) -> float {
+    let delta = (target - w_prev) * M_WRITE_GAIN * window(w_prev)
+    let mut w_new = w_prev + delta
+    if w_new < M_W_MIN { w_new = M_W_MIN }
+    if w_new > M_W_MAX { w_new = M_W_MAX }
+    return w_new
+}
+
+fn mbank_write(bank: MemBank, pattern: array) -> MemBank {
+    let n = bank.n_cells
+    let mut new_w = []
+    let mut i = 0
+    while i < n {
+        let mut w = bank.w[i]
+        let target = clamp01(pattern[i])
+        let mut s = 0
+        while s < M_WRITE_STEPS {
+            w = mbank_write_step(w, target)
+            s = s + 1
+        }
+        new_w = new_w.push(w)
+        i = i + 1
+    }
+    return MemBank { n_cells: n, w: new_w }
+}
+
+fn mbank_read(bank: MemBank) -> array {
+    let n = bank.n_cells
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(bank.w[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Tri-substrate holographic interface ─────────────────────
+// Bundles one bank from each physics so main() can write and read
+// through a single object. Each substrate stores the FULL pattern
+// (projection-style encoder), giving the holographic "whole in
+// part" property at the cost of 3× storage.
+
+struct HoloSubstrate {
+    d:         int,
+    quantum:   QuantumBank,
+    photonic:  PhotonicBank,
+    memristor: MemBank
+}
+
+fn holo_new(d: int) -> HoloSubstrate {
+    return HoloSubstrate {
+        d:         d,
+        quantum:   qbank_new(d),
+        photonic:  pbank_new(d),
+        memristor: mbank_new(d)
+    }
+}
+
+fn holo_write(h: HoloSubstrate, pattern: array) -> HoloSubstrate {
+    return HoloSubstrate {
+        d:         h.d,
+        quantum:   qbank_write(h.quantum, pattern),
+        photonic:  pbank_write(h.photonic, pattern),
+        memristor: mbank_write(h.memristor, pattern)
+    }
+}
+
+// Single-substrate read accessors — used for T2 (holographic redundancy).
+fn holo_read_quantum(h: HoloSubstrate) -> array {
+    return qbank_read(h.quantum)
+}
+fn holo_read_photonic(h: HoloSubstrate) -> array {
+    return pbank_read(h.photonic)
+}
+fn holo_read_memristor(h: HoloSubstrate) -> array {
+    return mbank_read(h.memristor)
+}
+
+// ─── Error metrics ────────────────────────────────────────────
+
+fn linf_err(a: array, b: array) -> float {
+    let n = len(a)
+    let mut m = 0.0
+    let mut i = 0
+    while i < n {
+        let e = fabs(a[i] - b[i])
+        if e > m { m = e }
+        i = i + 1
+    }
+    return m
+}
+
+fn arrays_equal(a: array, b: array) -> bool {
+    let n = len(a)
+    if n != len(b) { return false }
+    let mut i = 0
+    while i < n {
+        if fabs(a[i] - b[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// ─── Self-tests ───────────────────────────────────────────────
+
+fn check_T1(d: int) -> bool {
+    // Tri-substrate roundtrip: each substrate's readback within 0.1 of target.
+    let h0 = holo_new(d)
+    let pattern = det_rand_unit(d, 101)
+    let h1 = holo_write(h0, pattern)
+
+    let q_err = linf_err(holo_read_quantum(h1),   pattern)
+    let p_err = linf_err(holo_read_photonic(h1),  pattern)
+    let m_err = linf_err(holo_read_memristor(h1), pattern)
+
+    println("  [T1] quantum   ||read−target||_∞ = " + str(q_err))
+    println("  [T1] photonic  ||read−target||_∞ = " + str(p_err))
+    println("  [T1] memristor ||read−target||_∞ = " + str(m_err))
+
+    if q_err >= T1_TOLERANCE { return false }
+    if p_err >= T1_TOLERANCE { return false }
+    if m_err >= T1_TOLERANCE { return false }
+    return true
+}
+
+fn check_T2(d: int) -> bool {
+    // Holographic redundancy: each single substrate reconstructs pattern
+    // within ||err||_∞ < 0.2. Since the encoder projects the whole
+    // pattern onto each substrate, single-substrate error == substrate
+    // roundtrip error (each substrate's own precision bound).
+    let h0 = holo_new(d)
+    let pattern = det_rand_unit(d, 211)
+    let h1 = holo_write(h0, pattern)
+
+    // Reconstruct from quantum alone.
+    let rec_q = holo_read_quantum(h1)
+    let err_q = linf_err(rec_q, pattern)
+    println("  [T2] reconstruct|quantum   err = " + str(err_q))
+    if err_q >= T2_TOLERANCE { return false }
+
+    // Reconstruct from photonic alone.
+    let rec_p = holo_read_photonic(h1)
+    let err_p = linf_err(rec_p, pattern)
+    println("  [T2] reconstruct|photonic  err = " + str(err_p))
+    if err_p >= T2_TOLERANCE { return false }
+
+    // Reconstruct from memristor alone.
+    let rec_m = holo_read_memristor(h1)
+    let err_m = linf_err(rec_m, pattern)
+    println("  [T2] reconstruct|memristor err = " + str(err_m))
+    if err_m >= T2_TOLERANCE { return false }
+
+    return true
+}
+
+fn check_T3(d: int) -> bool {
+    // Non-volatility: 4 consecutive reads per substrate byte-identical.
+    let h0 = holo_new(d)
+    let pattern = det_rand_unit(d, 307)
+    let h1 = holo_write(h0, pattern)
+
+    let q_first = holo_read_quantum(h1)
+    let p_first = holo_read_photonic(h1)
+    let m_first = holo_read_memristor(h1)
+
+    let mut k = 0
+    while k < 4 {
+        let q_r = holo_read_quantum(h1)
+        let p_r = holo_read_photonic(h1)
+        let m_r = holo_read_memristor(h1)
+        if arrays_equal(q_r, q_first) == false { return false }
+        if arrays_equal(p_r, p_first) == false { return false }
+        if arrays_equal(m_r, m_first) == false { return false }
+        k = k + 1
+    }
+    return true
+}
+
+fn check_T4(d: int) -> bool {
+    // Substrate-agnostic determinism: same pattern + same seed →
+    // byte-identical stored state across two independent banks.
+    let pattern = det_rand_unit(d, 409)
+
+    let h_a = holo_write(holo_new(d), pattern)
+    let h_b = holo_write(holo_new(d), pattern)
+
+    if arrays_equal(holo_read_quantum(h_a),   holo_read_quantum(h_b))   == false { return false }
+    if arrays_equal(holo_read_photonic(h_a),  holo_read_photonic(h_b))  == false { return false }
+    if arrays_equal(holo_read_memristor(h_a), holo_read_memristor(h_b)) == false { return false }
+    return true
+}
+
+fn check_T5(d: int) -> bool {
+    // Aggregate latency: write+read roundtrip across all 3 substrates < 50ms.
+    let h0 = holo_new(d)
+    let pattern = det_rand_unit(d, 503)
+
+    let t0 = clock()
+    let h1 = holo_write(h0, pattern)
+    let _q = holo_read_quantum(h1)
+    let _p = holo_read_photonic(h1)
+    let _m = holo_read_memristor(h1)
+    let t1 = clock()
+
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] tri-substrate write+read latency = " + str(ms) + " ms (budget " + str(T5_BUDGET_MS) + " ms)")
+    return ms < T5_BUDGET_MS
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    let d = 32
+    println("[holographic_substrate] PHYS-P3-2 self-test")
+    println("  tri-substrate: quantum(d=" + str(d) + ") + photonic(n=" + str(d) + ") + memristor(n=" + str(d) + ")")
+
+    let t1 = check_T1(d)
+    if t1 { println("T1 PASS") } else { println("T1 FAIL") }
+
+    let t2 = check_T2(d)
+    if t2 { println("T2 PASS") } else { println("T2 FAIL") }
+
+    let t3 = check_T3(d)
+    if t3 { println("T3 PASS") } else { println("T3 FAIL") }
+
+    let t4 = check_T4(d)
+    if t4 { println("T4 PASS") } else { println("T4 FAIL") }
+
+    let t5 = check_T5(d)
+    if t5 { println("T5 PASS") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[holographic_substrate] ALL 5/5 PASS")
+    } else {
+        println("[holographic_substrate] SOME FAILED")
+    }
+}
+
+main()

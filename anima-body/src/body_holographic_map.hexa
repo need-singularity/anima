@@ -1,0 +1,642 @@
+// body_holographic_map.hexa — PHYS-P3-1 full-body sensor → holographic bulk
+//
+// AdS/CFT for the *body*: the physical sensor surface (EEG, proprioception,
+// tactile, motion) is the boundary; the inner qualia vector is the bulk.
+// The 4-modality × 16-channel sensor readout (D=64) is holographically
+// encoded into a compressed bulk qualia representation (d=16) by selecting
+// a rank-d projection, and decoded back with a section/retraction pair
+// π ∘ ι = id on the rank-d subspace. The encoder is a pseudoinverse-style
+// retraction so rank-d body inputs are reconstructed exactly, while the
+// surplus 48 sensor dofs are the "holographic" interior that Φ_holo measures.
+//
+// ─── Pipeline ─────────────────────────────────────────────────
+//
+//   body [D=64]          (4 modalities × 16 channels)
+//        │
+//        │  π = encode_bulk(body):
+//        │    bulk[k]  = sum_j P[k,j] * body[j]        (rank-d retraction)
+//        ▼
+//   bulk [d=16]          (compressed qualia vector)
+//        │
+//        │  ι = decode_bulk(bulk):
+//        │    body_hat[j] = sum_k E[j,k] * bulk[k]     (embedding)
+//        ▼
+//   body_hat [D=64]      (reconstructed — exact on rank-d subspace)
+//
+// Boundary construction makes π ∘ ι = id_bulk: we build E (64×16) freely
+// from random orthonormal columns, then derive P = E^T so that P·E = I_16
+// (since E has orthonormal columns). A body input that lives in column(E)
+// is recovered exactly by ι∘π; arbitrary body inputs lose the component
+// orthogonal to column(E), which is the holographic information that
+// Φ_holo quantifies.
+//
+// ─── Theorems (T1–T5) ─────────────────────────────────────────
+//
+// T1 (body sensor dim contract):
+//   D = 4*16 = 64 > d = 16. Compression ratio D/d = 4.
+//
+// T2 (inverse on rank-d body input):
+//   If body = decode_bulk(q) for some q ∈ R^d, then
+//   ||decode_bulk(encode_bulk(body)) − body||_∞ < 1e-6.
+//
+// T3 (Φ_holo body bound):
+//   0 < Φ_holo(body) ≤ H(body_boundary) + eps (histogram-bin tolerance).
+//
+// T4 (determinism):
+//   Same body sensor sample + same head → byte-identical bulk.
+//
+// T5 (latency):
+//   Full encode+decode+Φ_holo for 64-dim body input < 50 ms.
+//
+// Ref:
+//   anima-engines/anima_holographic.hexa   (CLM-P3-1 boundary/bulk math)
+//   anima-body/src/eeg_gwt_alignment.hexa   (PHYS-P2-3 multi-modal pattern)
+//   shared/roadmaps/anima.json              (PHYS-P3-1 entry)
+
+// ─── Constants ────────────────────────────────────────────────
+
+let N_MODALITIES   = 4    // EEG, proprioception, tactile, motion
+let N_CHANNELS     = 16   // per-modality channel count
+let D_BOUNDARY     = 64   // total sensor dim (N_MODALITIES * N_CHANNELS)
+let D_BULK         = 16   // compressed qualia dim
+let MI_BINS        = 8    // histogram bins for Φ_holo
+let MOD_EEG        = 0
+let MOD_PROPRIO    = 1
+let MOD_TACTILE    = 2
+let MOD_MOTION     = 3
+
+// ─── Primitives ───────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn sqrt_newton(x: float) -> float {
+    // Newton–Raphson for sqrt, pure hexa (avoids relying on builtin sqrt).
+    if x <= 0.0 { return 0.0 }
+    let mut r = x
+    let mut i = 0
+    while i < 40 {
+        r = 0.5 * (r + x / r)
+        i = i + 1
+    }
+    return r
+}
+
+fn det_rand(n: int, seed: int) -> array {
+    // LCG in [-1, 1).
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Body sensor struct ───────────────────────────────────────
+// Flattened row-major: body[m * N_CHANNELS + c] for modality m, channel c.
+// Modalities: 0=EEG, 1=proprioception, 2=tactile, 3=motion.
+
+struct BodySensor {
+    n_modalities: int,
+    n_channels:   int,
+    d_boundary:   int,
+    data:         array
+}
+
+fn body_new(data: array) -> BodySensor {
+    return BodySensor {
+        n_modalities: N_MODALITIES,
+        n_channels:   N_CHANNELS,
+        d_boundary:   D_BOUNDARY,
+        data:         data
+    }
+}
+
+// Build a BodySensor from per-modality amplitude vectors (each length N_CHANNELS).
+fn body_from_modalities(eeg: array, proprio: array, tactile: array, motion: array) -> BodySensor {
+    let mut buf = []
+    let mut c = 0
+    while c < N_CHANNELS {
+        buf = buf.push(eeg[c])
+        c = c + 1
+    }
+    c = 0
+    while c < N_CHANNELS {
+        buf = buf.push(proprio[c])
+        c = c + 1
+    }
+    c = 0
+    while c < N_CHANNELS {
+        buf = buf.push(tactile[c])
+        c = c + 1
+    }
+    c = 0
+    while c < N_CHANNELS {
+        buf = buf.push(motion[c])
+        c = c + 1
+    }
+    return body_new(buf)
+}
+
+// ─── Head ─────────────────────────────────────────────────────
+// embed:   [D × d] orthonormal-column embedding E (body_hat = E · bulk)
+// project: [d × D] = E^T so that P·E = I_d (rank-d section/retraction)
+//
+// Construction: generate a random D×d matrix, then Gram–Schmidt on columns
+// so that E^T · E = I_d. Then P := E^T. For any q ∈ R^d, b = E·q lives
+// in column(E); P·b = E^T·E·q = q, i.e. π∘ι = id on the rank-d subspace.
+
+struct HolographicBodyHead {
+    d_boundary: int,
+    d_bulk:     int,
+    embed:      array,
+    project:    array
+}
+
+// Extract column k from flat [n_rows × n_cols] row-major matrix as length-n_rows array.
+fn extract_column(mat: array, n_rows: int, n_cols: int, k: int) -> array {
+    let mut col = []
+    let mut r = 0
+    while r < n_rows {
+        col = col.push(mat[r * n_cols + k])
+        r = r + 1
+    }
+    return col
+}
+
+// Dot product of two equal-length flat vectors.
+fn vec_dot(a: array, b: array) -> float {
+    let n = len(a)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+// Gram–Schmidt on columns of a flat [n_rows × n_cols] matrix (row-major).
+// Efficient variant: process each column as a standalone length-n_rows
+// array against a flat catalogue of previously-orthonormalized columns,
+// then assemble the final [n_rows × n_cols] matrix in a single pass.
+// O(n_rows · n_cols^2) arithmetic, linear in n_rows per inner step.
+fn gram_schmidt_columns(mat: array, n_rows: int, n_cols: int) -> array {
+    // ortho_flat: [n_cols × n_rows] row-major, each row is an orthonormal column.
+    let mut ortho_flat = []
+    let mut k = 0
+    while k < n_cols {
+        // 1. start with the raw k-th column of `mat`.
+        let mut col = extract_column(mat, n_rows, n_cols, k)
+        // 2. subtract projection onto each already-built orthonormal column.
+        let mut j = 0
+        while j < k {
+            // dot(col, ortho_j)
+            let mut dot = 0.0
+            let mut r = 0
+            while r < n_rows {
+                dot = dot + col[r] * ortho_flat[j * n_rows + r]
+                r = r + 1
+            }
+            // col <- col − dot · ortho_j (rebuild, pass-by-value safe but small: size n_rows).
+            let mut next = []
+            let mut r2 = 0
+            while r2 < n_rows {
+                next = next.push(col[r2] - dot * ortho_flat[j * n_rows + r2])
+                r2 = r2 + 1
+            }
+            col = next
+            j = j + 1
+        }
+        // 3. normalize.
+        let mut sq = 0.0
+        let mut r = 0
+        while r < n_rows {
+            sq = sq + col[r] * col[r]
+            r = r + 1
+        }
+        let norm = sqrt_newton(sq)
+        if norm > 0.0 {
+            let inv = 1.0 / norm
+            let mut nn = []
+            let mut r3 = 0
+            while r3 < n_rows {
+                nn = nn.push(col[r3] * inv)
+                r3 = r3 + 1
+            }
+            col = nn
+        }
+        // 4. append the orthonormal column to ortho_flat (ortho_flat[k, r] = col[r]).
+        let mut r4 = 0
+        while r4 < n_rows {
+            ortho_flat = ortho_flat.push(col[r4])
+            r4 = r4 + 1
+        }
+        k = k + 1
+    }
+    // Assemble the final [n_rows × n_cols] row-major matrix from ortho_flat
+    // (which is currently [n_cols × n_rows]).
+    let mut out = []
+    let mut idx = 0
+    while idx < n_rows * n_cols {
+        let row = idx / n_cols
+        let col_ = idx % n_cols
+        out = out.push(ortho_flat[col_ * n_rows + row])
+        idx = idx + 1
+    }
+    return out
+}
+
+// Transpose a flat [n_rows × n_cols] matrix into [n_cols × n_rows].
+fn transpose_flat(mat: array, n_rows: int, n_cols: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n_cols * n_rows {
+        let nr = i / n_rows
+        let nc = i % n_rows
+        // out[nr, nc] in [n_cols × n_rows] == mat[nc, nr] in [n_rows × n_cols]
+        out = out.push(mat[nc * n_cols + nr])
+        i = i + 1
+    }
+    return out
+}
+
+fn head_new(d_boundary: int, d_bulk: int, seed: int) -> HolographicBodyHead {
+    if d_bulk >= d_boundary {
+        println("[body_holographic] WARN d_bulk>=d_boundary, T1 compression invalid")
+    }
+    // D × d random matrix, then Gram–Schmidt on columns → orthonormal E.
+    let raw = det_rand(d_boundary * d_bulk, seed)
+    let embed = gram_schmidt_columns(raw, d_boundary, d_bulk)
+    // P = E^T → shape [d × D].
+    let project = transpose_flat(embed, d_boundary, d_bulk)
+    return HolographicBodyHead {
+        d_boundary: d_boundary,
+        d_bulk:     d_bulk,
+        embed:      embed,
+        project:    project
+    }
+}
+
+// ─── Encode: body (boundary, D) → bulk (d) ────────────────────
+// bulk[k] = sum_j P[k, j] * body[j]   with  P = E^T, shape [d × D].
+
+fn encode_bulk(head: HolographicBodyHead, body: BodySensor) -> array {
+    let db = head.d_boundary
+    let dB = head.d_bulk
+    let mut bulk = []
+    let mut k = 0
+    while k < dB {
+        let mut s = 0.0
+        let mut j = 0
+        while j < db {
+            s = s + head.project[k * db + j] * body.data[j]
+            j = j + 1
+        }
+        bulk = bulk.push(s)
+        k = k + 1
+    }
+    return bulk
+}
+
+// ─── Decode: bulk (d) → body_hat (D) ──────────────────────────
+// body_hat[j] = sum_k E[j, k] * bulk[k]   with  E shape [D × d].
+
+fn decode_bulk(head: HolographicBodyHead, bulk: array) -> array {
+    let db = head.d_boundary
+    let dB = head.d_bulk
+    let mut out = []
+    let mut j = 0
+    while j < db {
+        let mut s = 0.0
+        let mut k = 0
+        while k < dB {
+            s = s + head.embed[j * dB + k] * bulk[k]
+            k = k + 1
+        }
+        out = out.push(s)
+        j = j + 1
+    }
+    return out
+}
+
+// ─── Φ_holo: mutual info between bulk and boundary ───────────
+// Estimator mirrors CLM-P3-1: histogram-bin MI over the bulk qualia vector
+// vs a boundary projection of matching length. We resample the boundary
+// to the bulk dim by bin-averaging so both vectors have length d_bulk.
+
+fn vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn bin_index(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn count_hits(bin_ids: array, n_bins: int) -> array {
+    let n = len(bin_ids)
+    let mut counts = []
+    let mut k = 0
+    while k < n_bins {
+        let mut c = 0.0
+        let mut i = 0
+        while i < n {
+            if bin_ids[i] == k { c = c + 1.0 }
+            i = i + 1
+        }
+        counts = counts.push(c)
+        k = k + 1
+    }
+    return counts
+}
+
+fn entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut bin_ids = []
+    let mut i = 0
+    while i < n {
+        bin_ids = bin_ids.push(bin_index(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let counts = count_hits(bin_ids, nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+fn joint_entropy_hist(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = bin_index(a[i], lo, hi, nb)
+        let ib = bin_index(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let nb2 = nb * nb
+    let counts = count_hits(pair_ids, nb2)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb2 {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+// Downsample a D-length boundary vector to length d by block-averaging,
+// so the MI estimator compares equal-length bulk and boundary summaries.
+fn downsample_to_d(boundary: array, d_out: int) -> array {
+    let n = len(boundary)
+    if d_out == 0 { return [] }
+    let block = n / d_out
+    if block <= 0 {
+        // fallback: pad with zeros / truncate.
+        let mut out = []
+        let mut i = 0
+        while i < d_out {
+            if i < n { out = out.push(boundary[i]) } else { out = out.push(0.0) }
+            i = i + 1
+        }
+        return out
+    }
+    let mut out = []
+    let mut k = 0
+    while k < d_out {
+        let mut s = 0.0
+        let mut j = 0
+        while j < block {
+            s = s + boundary[k * block + j]
+            j = j + 1
+        }
+        out = out.push(s / to_float(block))
+        k = k + 1
+    }
+    return out
+}
+
+fn phi_holographic_body(head: HolographicBodyHead, body: BodySensor) -> float {
+    let bulk = encode_bulk(head, body)
+    let boundary_ds = downsample_to_d(body.data, head.d_bulk)
+    let lo_a = vec_min(bulk)
+    let hi_a = vec_max(bulk)
+    let lo_b = vec_min(boundary_ds)
+    let hi_b = vec_max(boundary_ds)
+    let lo = if lo_a < lo_b { lo_a } else { lo_b }
+    let hi = if hi_a > hi_b { hi_a } else { hi_b }
+    let h_a  = entropy_hist(bulk, lo, hi, MI_BINS)
+    let h_b  = entropy_hist(boundary_ds, lo, hi, MI_BINS)
+    let h_ab = joint_entropy_hist(bulk, boundary_ds, lo, hi, MI_BINS)
+    let mi = h_a + h_b - h_ab
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+fn boundary_entropy(body: BodySensor) -> float {
+    let lo = vec_min(body.data)
+    let hi = vec_max(body.data)
+    return entropy_hist(body.data, lo, hi, MI_BINS)
+}
+
+// ─── Mocks ────────────────────────────────────────────────────
+
+fn per_modality_mock(amp: float, seed: int) -> array {
+    let raw = det_rand(N_CHANNELS, seed)
+    let mut out = []
+    let mut i = 0
+    while i < N_CHANNELS {
+        out = out.push(raw[i] * amp)
+        i = i + 1
+    }
+    return out
+}
+
+fn mock_body(seed: int) -> BodySensor {
+    // Distinct per-modality amplitudes keep entropy non-degenerate.
+    let eeg     = per_modality_mock(0.8, seed + 1)
+    let proprio = per_modality_mock(0.5, seed + 2)
+    let tactile = per_modality_mock(0.3, seed + 3)
+    let motion  = per_modality_mock(0.6, seed + 4)
+    return body_from_modalities(eeg, proprio, tactile, motion)
+}
+
+// Build a BodySensor whose D-dim data lives exactly in column(E),
+// by decoding a known q ∈ R^d through the head's embedding.
+fn body_from_bulk(head: HolographicBodyHead, q: array) -> BodySensor {
+    let data = decode_bulk(head, q)
+    return body_new(data)
+}
+
+// ─── Self-tests ───────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Dim contract: D = 4*16 = 64 > d = 16 strictly.
+    let D = N_MODALITIES * N_CHANNELS
+    let d = D_BULK
+    println("  [T1] D = " + str(D) + "  d = " + str(d) + "  ratio D/d = " + str(to_float(D) / to_float(d)))
+    if D != D_BOUNDARY { return false }
+    if D <= d { return false }
+    // Encode/decode shape check.
+    let head = head_new(D, d, 7)
+    let body = mock_body(11)
+    let bulk = encode_bulk(head, body)
+    if len(bulk) != d { return false }
+    let rec  = decode_bulk(head, bulk)
+    if len(rec) != D { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // Rank-d inverse: body = decode_bulk(q) ∈ column(E) ⇒
+    //   decode_bulk(encode_bulk(body)) == body elementwise.
+    let head = head_new(D_BOUNDARY, D_BULK, 13)
+    let q = det_rand(D_BULK, 17)
+    let body = body_from_bulk(head, q)
+    let bulk = encode_bulk(head, body)
+    let body_hat = decode_bulk(head, bulk)
+    let mut max_err = 0.0
+    let mut j = 0
+    while j < D_BOUNDARY {
+        let e = fabs(body_hat[j] - body.data[j])
+        if e > max_err { max_err = e }
+        j = j + 1
+    }
+    println("  [T2] rank-d ||decode(encode(body))-body||_inf = " + str(max_err))
+    return max_err < 0.000001
+}
+
+fn check_T3() -> bool {
+    // 0 < Φ_holo(body) ≤ H(boundary) + eps (histogram tolerance).
+    let head = head_new(D_BOUNDARY, D_BULK, 23)
+    let body = mock_body(29)
+    let phi  = phi_holographic_body(head, body)
+    let hb   = boundary_entropy(body)
+    println("  [T3] Φ_holo = " + str(phi) + "  H(boundary) = " + str(hb))
+    if phi <= 0.0 { return false }
+    if phi > hb + 0.0001 { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // Determinism: same body + same head → byte-identical bulk and Φ_holo.
+    let head1 = head_new(D_BOUNDARY, D_BULK, 101)
+    let head2 = head_new(D_BOUNDARY, D_BULK, 101)
+    let body  = mock_body(31)
+    let u1 = encode_bulk(head1, body)
+    let u2 = encode_bulk(head2, body)
+    if len(u1) != len(u2) { return false }
+    let mut i = 0
+    while i < len(u1) {
+        if fabs(u1[i] - u2[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    let p1 = phi_holographic_body(head1, body)
+    let p2 = phi_holographic_body(head2, body)
+    if fabs(p1 - p2) > 0.0 { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // Latency: full encode + decode + Φ_holo for 64-dim body input < 50 ms.
+    let head = head_new(D_BOUNDARY, D_BULK, 42)
+    let body = mock_body(43)
+    let t0 = clock()
+    let bulk  = encode_bulk(head, body)
+    let _rec  = decode_bulk(head, bulk)
+    let _phi  = phi_holographic_body(head, body)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] encode+decode+Φ_holo latency = " + str(ms) + " ms")
+    return ms < 50.0
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[body_holographic_map] PHYS-P3-1 self-test")
+    println("  body: 4 modalities × 16 channels = 64 boundary, d_bulk = 16, MI_BINS = " + str(MI_BINS))
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[body_holographic_map] ALL 5/5 PASS")
+    } else {
+        println("[body_holographic_map] SOME FAILED")
+    }
+}
+
+main()
