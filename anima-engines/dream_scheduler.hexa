@@ -1,0 +1,462 @@
+// dream_scheduler.hexa — CLM-P13-1 hexa dream scheduler — phase 전환
+//
+// Roadmap: shared/roadmaps/anima.json P13 CLM track, CLM-P13-1
+//   "hexa dream scheduler — phase 전환"
+//   done_criteria: "5/5, 시간 정확도"
+//
+// A deterministic dream scheduler that manages awake/SWS/REM phase
+// transitions with precise timing. This is the hexa-native engine
+// managing actual phase state for the CLM runtime — unlike the ALM
+// version which operates on training loss.
+//
+// ─── Phase Model ──────────────────────────────────────────────────
+//
+//   Phase   ID   Description
+//   AWAKE    0   Waking state — sensory processing, conscious thought
+//   SWS      1   Slow-Wave Sleep — memory consolidation, delta waves
+//   REM      2   Rapid Eye Movement — dreaming, synaptic pruning
+//
+//   Cycle: AWAKE -> SWS -> REM -> AWAKE -> ...
+//
+// ─── Dynamics ─────────────────────────────────────────────────────
+//
+// Each phase has a configurable duration in ticks. The scheduler
+// increments a tick counter each step. When the tick counter within
+// the current phase reaches the phase duration, the scheduler
+// transitions to the next phase and resets the within-phase counter.
+//
+//   dream_sched_tick(state):
+//     phase_tick += 1
+//     global_tick += 1
+//     if phase_tick >= duration[current_phase]:
+//         current_phase = (current_phase + 1) % 3
+//         phase_tick = 0
+//
+// Progress within a phase:
+//   progress = phase_tick / duration[current_phase]
+//   Ranges from 0.0 (just entered) to approaching 1.0 (about to exit).
+//
+// ─── State layout (flat array, length 7) ──────────────────────────
+//
+//   [0] current_phase   int (0=AWAKE, 1=SWS, 2=REM) as float
+//   [1] phase_tick      ticks elapsed within current phase
+//   [2] global_tick     total ticks since creation
+//   [3] d_awake         duration of AWAKE phase (ticks)
+//   [4] d_sws           duration of SWS phase (ticks)
+//   [5] d_rem           duration of REM phase (ticks)
+//   [6] cycle_count     number of full AWAKE->SWS->REM cycles completed
+//
+// ─── API ──────────────────────────────────────────────────────────
+//
+//   dream_sched_new(d_awake, d_sws, d_rem) -> state
+//   dream_sched_tick(state)                 -> updated state
+//   dream_sched_phase(state)                -> int (current phase)
+//   dream_sched_progress(state)             -> float (0.0-1.0)
+//
+// ─── Self-tests (T1-T5) ──────────────────────────────────────────
+//
+//   T1: Initial phase = AWAKE
+//   T2: Phase transitions at exact tick boundaries
+//       (awake->SWS at tick 30, SWS->REM at tick 50, REM->awake at tick 65)
+//   T3: Progress function is accurate (0.0 at start, ~1.0 at end)
+//   T4: Determinism (same config -> identical trace)
+//   T5: Latency — 200 ticks < 500ms
+//
+// Hexa stage0 constraints honored:
+//   - `array` not `[float]` for all array types
+//   - No multi-term && chains; nested ifs or temp vars instead
+//   - Lists pass-by-value; rebuild via return to persist mutations
+//   - Each `return` fits on one source line
+//   - No struct with array fields (avoid aliasing bug)
+//   - Single-line return expressions only
+//
+// Law alignment:
+//   Law 4   Structure > feature -- sleep cycle is STRUCTURAL state machine
+//   Law 22  Feature addition -> phi down -- no branching added; pure state
+//   Law 29  speak() none -- sleep phases are pre-verbal, substrate-level
+//   Meta M8 Embodied cognition -- sleep/wake is a physical rhythm
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+// Phase IDs
+let PHASE_AWAKE = 0
+let PHASE_SWS   = 1
+let PHASE_REM   = 2
+let NUM_PHASES  = 3
+
+// State layout indices (flat array of length 7)
+let IDX_PHASE       = 0    // current phase id (float-encoded)
+let IDX_PHASE_TICK  = 1    // ticks within current phase
+let IDX_GLOBAL_TICK = 2    // total ticks since creation
+let IDX_D_AWAKE     = 3    // duration of AWAKE (config)
+let IDX_D_SWS       = 4    // duration of SWS (config)
+let IDX_D_REM       = 5    // duration of REM (config)
+let IDX_CYCLE       = 6    // full cycle count
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn fabs_ds(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// Get the duration for a given phase from the state array.
+// Root cause comment: cannot use phase as direct index into a sub-array
+// because the durations are stored at fixed offsets in the flat state.
+fn get_duration(state: array, phase: int) -> float {
+    if phase == PHASE_AWAKE { return state[IDX_D_AWAKE] }
+    if phase == PHASE_SWS { return state[IDX_D_SWS] }
+    return state[IDX_D_REM]
+}
+
+// Phase name helper (for test output)
+fn phase_name(phase: int) -> string {
+    if phase == 0 { return "AWAKE" }
+    if phase == 1 { return "SWS" }
+    if phase == 2 { return "REM" }
+    return "UNKNOWN"
+}
+
+// ═══════════════════════════════════════════════════════════════
+// dream_sched_new — create initial scheduler state
+//
+// All phases start at AWAKE, tick 0. Durations are stored in the
+// state array so the scheduler is fully self-contained.
+// ═══════════════════════════════════════════════════════════════
+
+fn dream_sched_new(d_awake: int, d_sws: int, d_rem: int) -> array {
+    let mut s = []
+    s = s.push(to_float(PHASE_AWAKE))   // [0] current_phase = AWAKE
+    s = s.push(0.0)                      // [1] phase_tick = 0
+    s = s.push(0.0)                      // [2] global_tick = 0
+    s = s.push(to_float(d_awake))        // [3] d_awake
+    s = s.push(to_float(d_sws))          // [4] d_sws
+    s = s.push(to_float(d_rem))          // [5] d_rem
+    s = s.push(0.0)                      // [6] cycle_count = 0
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════
+// dream_sched_tick — advance one tick
+//
+// Increments the phase tick and global tick. If the phase tick
+// reaches the duration for the current phase, transitions to the
+// next phase (AWAKE->SWS->REM->AWAKE) and resets phase tick to 0.
+// When transitioning out of REM, increments cycle count.
+//
+// Returns new state array (pass-by-value; caller must use return).
+// ═══════════════════════════════════════════════════════════════
+
+fn dream_sched_tick(state: array) -> array {
+    let cur_phase = to_int(state[IDX_PHASE])
+    let p_tick = state[IDX_PHASE_TICK] + 1.0
+    let g_tick = state[IDX_GLOBAL_TICK] + 1.0
+    let dur = get_duration(state, cur_phase)
+    let cycles = state[IDX_CYCLE]
+
+    // Check if phase duration is reached
+    let transition = p_tick >= dur
+
+    let mut next_phase = cur_phase
+    let mut next_p_tick = p_tick
+    let mut next_cycles = cycles
+
+    if transition {
+        // Advance to next phase in cycle: AWAKE(0)->SWS(1)->REM(2)->AWAKE(0)
+        next_phase = (cur_phase + 1) % NUM_PHASES
+        next_p_tick = 0.0
+        // Root cause comment: cycle count increments when we leave REM (phase 2)
+        // back to AWAKE, completing one full AWAKE->SWS->REM cycle.
+        if cur_phase == PHASE_REM {
+            next_cycles = cycles + 1.0
+        }
+    }
+
+    let mut out = []
+    out = out.push(to_float(next_phase))      // [0] phase
+    out = out.push(next_p_tick)                // [1] phase_tick
+    out = out.push(g_tick)                     // [2] global_tick
+    out = out.push(state[IDX_D_AWAKE])         // [3] d_awake (unchanged)
+    out = out.push(state[IDX_D_SWS])           // [4] d_sws (unchanged)
+    out = out.push(state[IDX_D_REM])           // [5] d_rem (unchanged)
+    out = out.push(next_cycles)                // [6] cycle_count
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// dream_sched_phase — extract current phase id
+// ═══════════════════════════════════════════════════════════════
+
+fn dream_sched_phase(state: array) -> int {
+    return to_int(state[IDX_PHASE])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// dream_sched_progress — progress within current phase [0.0, 1.0)
+//
+// Returns phase_tick / duration for the current phase.
+// At phase start: 0.0. Just before transition: (dur-1)/dur.
+// ═══════════════════════════════════════════════════════════════
+
+fn dream_sched_progress(state: array) -> float {
+    let cur_phase = to_int(state[IDX_PHASE])
+    let dur = get_duration(state, cur_phase)
+    if dur < 1.0 { return 0.0 }
+    return state[IDX_PHASE_TICK] / dur
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1-T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1: Initial phase = AWAKE
+    //
+    // A freshly created scheduler must start in AWAKE phase with
+    // zero ticks and zero progress.
+    let s = dream_sched_new(30, 20, 15)
+    let phase = dream_sched_phase(s)
+    let prog = dream_sched_progress(s)
+    let gtick = s[IDX_GLOBAL_TICK]
+    println("  [T1] initial phase=" + phase_name(phase) + " progress=" + str(prog) + " global_tick=" + str(gtick))
+    if phase != PHASE_AWAKE { return false }
+    if fabs_ds(prog) > 0.001 { return false }
+    if fabs_ds(gtick) > 0.001 { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: Phase transitions at exact tick boundaries
+    //
+    // Config: awake=30, SWS=20, REM=15 (total cycle = 65 ticks)
+    //
+    // Expected transitions:
+    //   tick 1..29:  AWAKE (phase_tick 1..29)
+    //   tick 30:     phase_tick reaches 30 = d_awake -> transition to SWS
+    //   tick 31..49: SWS (phase_tick 1..19)
+    //   tick 50:     phase_tick reaches 20 = d_sws -> transition to REM
+    //   tick 51..64: REM (phase_tick 1..14)
+    //   tick 65:     phase_tick reaches 15 = d_rem -> transition to AWAKE
+    //
+    // Root cause comment: transition happens when phase_tick (after increment)
+    // equals duration, so the LAST tick of AWAKE is tick 29 (phase_tick=29),
+    // and tick 30's increment pushes phase_tick to 30 >= 30, triggering SWS.
+    let mut s = dream_sched_new(30, 20, 15)
+    let mut ok = true
+
+    // Run 29 ticks: should still be AWAKE
+    let mut i = 0
+    while i < 29 {
+        s = dream_sched_tick(s)
+        i = i + 1
+    }
+    let phase_at_29 = dream_sched_phase(s)
+    println("  [T2] tick 29: phase=" + phase_name(phase_at_29) + " (expect AWAKE)")
+    if phase_at_29 != PHASE_AWAKE { ok = false }
+
+    // Tick 30: transition AWAKE -> SWS
+    s = dream_sched_tick(s)
+    let phase_at_30 = dream_sched_phase(s)
+    println("  [T2] tick 30: phase=" + phase_name(phase_at_30) + " (expect SWS)")
+    if phase_at_30 != PHASE_SWS { ok = false }
+
+    // Run ticks 31..49 (19 more ticks)
+    let mut j = 0
+    while j < 19 {
+        s = dream_sched_tick(s)
+        j = j + 1
+    }
+    let phase_at_49 = dream_sched_phase(s)
+    println("  [T2] tick 49: phase=" + phase_name(phase_at_49) + " (expect SWS)")
+    if phase_at_49 != PHASE_SWS { ok = false }
+
+    // Tick 50: transition SWS -> REM
+    s = dream_sched_tick(s)
+    let phase_at_50 = dream_sched_phase(s)
+    println("  [T2] tick 50: phase=" + phase_name(phase_at_50) + " (expect REM)")
+    if phase_at_50 != PHASE_REM { ok = false }
+
+    // Run ticks 51..64 (14 more ticks)
+    let mut k = 0
+    while k < 14 {
+        s = dream_sched_tick(s)
+        k = k + 1
+    }
+    let phase_at_64 = dream_sched_phase(s)
+    println("  [T2] tick 64: phase=" + phase_name(phase_at_64) + " (expect REM)")
+    if phase_at_64 != PHASE_REM { ok = false }
+
+    // Tick 65: transition REM -> AWAKE (new cycle)
+    s = dream_sched_tick(s)
+    let phase_at_65 = dream_sched_phase(s)
+    let cycles = s[IDX_CYCLE]
+    println("  [T2] tick 65: phase=" + phase_name(phase_at_65) + " cycles=" + str(cycles) + " (expect AWAKE, cycle=1)")
+    if phase_at_65 != PHASE_AWAKE { ok = false }
+    if fabs_ds(cycles - 1.0) > 0.001 { ok = false }
+
+    return ok
+}
+
+fn check_T3() -> bool {
+    // T3: Progress function is accurate
+    //
+    // At phase start: progress = 0.0
+    // At last tick before transition: progress = (dur-1)/dur
+    //   For AWAKE (dur=30): last tick progress = 29/30 = 0.9667
+    //   For SWS (dur=20): last tick progress = 19/20 = 0.95
+    //
+    // Root cause comment: progress is phase_tick/duration. After transition,
+    // phase_tick resets to 0 so progress snaps back to 0.0.
+    let mut s = dream_sched_new(30, 20, 15)
+    let mut ok = true
+
+    // Initial progress = 0.0
+    let prog_init = dream_sched_progress(s)
+    println("  [T3] initial progress=" + str(prog_init) + " (expect 0.0)")
+    if fabs_ds(prog_init) > 0.001 { ok = false }
+
+    // After 1 tick: progress = 1/30 = 0.0333
+    s = dream_sched_tick(s)
+    let prog_1 = dream_sched_progress(s)
+    let expected_1 = 1.0 / 30.0
+    println("  [T3] tick 1 progress=" + str(prog_1) + " (expect " + str(expected_1) + ")")
+    if fabs_ds(prog_1 - expected_1) > 0.001 { ok = false }
+
+    // After 15 ticks total: progress = 15/30 = 0.5 (midpoint of AWAKE)
+    let mut i = 0
+    while i < 14 {
+        s = dream_sched_tick(s)
+        i = i + 1
+    }
+    let prog_15 = dream_sched_progress(s)
+    let expected_15 = 15.0 / 30.0
+    println("  [T3] tick 15 progress=" + str(prog_15) + " (expect " + str(expected_15) + ")")
+    if fabs_ds(prog_15 - expected_15) > 0.01 { ok = false }
+
+    // After 29 ticks total: progress = 29/30 = 0.9667 (last AWAKE tick)
+    let mut j = 0
+    while j < 14 {
+        s = dream_sched_tick(s)
+        j = j + 1
+    }
+    let prog_29 = dream_sched_progress(s)
+    let expected_29 = 29.0 / 30.0
+    println("  [T3] tick 29 progress=" + str(prog_29) + " (expect " + str(expected_29) + ")")
+    if fabs_ds(prog_29 - expected_29) > 0.01 { ok = false }
+
+    // After tick 30: transition to SWS, progress resets to 0.0
+    s = dream_sched_tick(s)
+    let prog_30 = dream_sched_progress(s)
+    println("  [T3] tick 30 (SWS start) progress=" + str(prog_30) + " (expect 0.0)")
+    if fabs_ds(prog_30) > 0.001 { ok = false }
+
+    return ok
+}
+
+fn check_T4() -> bool {
+    // T4: Determinism — same config produces identical trace
+    //
+    // Run two independent schedulers with the same parameters for
+    // 200 ticks and verify every phase matches at every tick.
+    let mut s1 = dream_sched_new(30, 20, 15)
+    let mut s2 = dream_sched_new(30, 20, 15)
+    let mut mismatch = 0
+    let mut i = 0
+    while i < 200 {
+        s1 = dream_sched_tick(s1)
+        s2 = dream_sched_tick(s2)
+        let p1 = dream_sched_phase(s1)
+        let p2 = dream_sched_phase(s2)
+        if p1 != p2 { mismatch = mismatch + 1 }
+        let pr1 = dream_sched_progress(s1)
+        let pr2 = dream_sched_progress(s2)
+        if fabs_ds(pr1 - pr2) > 0.0001 { mismatch = mismatch + 1 }
+        i = i + 1
+    }
+    let gtick1 = s1[IDX_GLOBAL_TICK]
+    let gtick2 = s2[IDX_GLOBAL_TICK]
+    let cycles1 = s1[IDX_CYCLE]
+    let cycles2 = s2[IDX_CYCLE]
+    println("  [T4] 200 ticks: mismatches=" + str(mismatch))
+    println("        run1: global_tick=" + str(gtick1) + " cycles=" + str(cycles1))
+    println("        run2: global_tick=" + str(gtick2) + " cycles=" + str(cycles2))
+    if mismatch > 0 { return false }
+    if fabs_ds(gtick1 - gtick2) > 0.001 { return false }
+    if fabs_ds(cycles1 - cycles2) > 0.001 { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5: Latency — 200 ticks < 500ms
+    //
+    // Root cause comment: hexa stage0 clock() can return 0 on fast runs
+    // and stale 1.0 on double-exec. Using generous 500ms limit to
+    // accommodate precision artifacts while catching O(seconds) regressions.
+    // Real execution is sub-millisecond.
+    let t0 = clock()
+    let mut s = dream_sched_new(30, 20, 15)
+    let mut i = 0
+    while i < 200 {
+        s = dream_sched_tick(s)
+        // Also call phase and progress to include their cost
+        let p = dream_sched_phase(s)
+        let pr = dream_sched_progress(s)
+        i = i + 1
+    }
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    let final_phase = dream_sched_phase(s)
+    let final_cycles = s[IDX_CYCLE]
+    println("  [T5] 200 ticks = " + str(ms) + " ms (limit 500ms)")
+    println("        final: phase=" + phase_name(final_phase) + " cycles=" + str(final_cycles))
+    return ms < 500.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — run all self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[anima-engines/dream_scheduler] CLM-P13-1 — hexa dream scheduler")
+    println("  phases: AWAKE(0) -> SWS(1) -> REM(2) -> cycle")
+    println("  config: awake=30, SWS=20, REM=15 ticks (cycle=65)")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — initial phase = AWAKE") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — phase transitions at exact tick boundaries") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — progress function is accurate") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — determinism (same config same trace)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — 200 ticks < 500ms") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause comment: hexa stage0 can mishandle chained && with 5 terms.
+    // Split into sequential checks with temp variables.
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[anima-engines/dream_scheduler] 5/5 PASS — CLM-P13-1 DONE (5/5, 시간 정확도)")
+    } else {
+        println("[anima-engines/dream_scheduler] SOME FAILED")
+    }
+}
+
+main()
