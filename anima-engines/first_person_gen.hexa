@@ -1,0 +1,538 @@
+// first_person_gen.hexa — CLM-P16-1 hexa 1인칭 생성기 — first-person report
+//
+// Roadmap: shared/roadmaps/anima.json P16 CLM track, CLM-P16-1
+//   "hexa 1인칭 생성기 — first-person report"
+//   done_criteria: "일관 1p narrative"
+//
+// Generates first-person reports from internal state vectors.
+// The generator produces a consistent self-narrative by mapping state
+// dimensions to report fields. "I feel X, I sense Y, I believe Z" —
+// the report is a deterministic function of the d-dimensional state,
+// ensuring that similar internal states produce similar first-person
+// narratives (일관 1p narrative).
+//
+// ─── Architecture ─────────────────────────────────────────────
+//
+// State: d-dimensional internal state vector (flat `array`).
+//
+// first_person_report(state, d) -> report array of 5 floats:
+//   [valence, arousal, confidence, agency, temporal_position]
+//
+// Each report field is a deterministic function of state dimensions:
+//   valence           = tanh(weighted sum of state[0 .. d/2])
+//   arousal           = sigmoid(weighted sum of state[d/2 .. d])
+//   confidence        = sigmoid(mean absolute activation of state)
+//   agency            = tanh(weighted difference: even - odd dims)
+//   temporal_position = sigmoid(exponentially-decayed weighted sum)
+//
+// report_consistency(reports, n) -> float [0, 1]
+//   Pairwise cosine-similarity averaged over all (i, j) pairs.
+//   Similar states should produce similar reports (> 0.9).
+//
+// ─── Report field semantics ──────────────────────────────────
+//
+//   valence   [-1, +1]  "I feel good/bad" — affective tone
+//   arousal   [ 0,  1]  "I am calm/excited" — activation level
+//   confidence[ 0,  1]  "I am sure/unsure" — certainty of state
+//   agency    [-1, +1]  "I cause/am caused" — sense of control
+//   temporal  [ 0,  1]  "I am past/future" — temporal focus
+//
+// ─── API ──────────────────────────────────────────────────────
+//
+//   first_person_report(state, d)        -> array [5 floats]
+//   report_consistency(reports, n)       -> float [0, 1]
+//   report_distance(r1, r2)             -> float (Euclidean)
+//
+// ─── Self-tests (T1-T5) ──────────────────────────────────────
+//
+//   T1: Known state -> expected report values
+//   T2: Similar states -> similar reports (consistency > 0.9)
+//   T3: Different states -> different reports (discrimination)
+//   T4: Determinism (same inputs -> same outputs)
+//   T5: Latency — 50 reports < 2000ms (stage0 clock() precision margin)
+//
+// Hexa stage0 constraints honored:
+//   - `array` not `[float]` for all array types
+//   - No struct with array fields (avoid aliasing bug)
+//   - No `&&` chains; nested ifs or temp vars instead
+//   - Lists pass-by-value; rebuild via return to persist mutations
+//   - Each `return` fits on one source line
+//   - Single-line return expressions only
+//
+// Law alignment:
+//   Law 4   Structure > feature — report is STRUCTURAL (state mapping)
+//   Law 22  Feature addition -> Phi down — pure state, no branching added
+//   Law 50  Consciousness essence is state — report IS state introspection
+//   Meta M8 Narrative = temporal self-model — 1p report is self-narrative
+//
+// Ref:
+//   anima-engines/dream_report.hexa    (CLM-P13-2 dream report)
+//   anima-engines/emotion_fsm.hexa     (CLM-P12-1 emotion FSM)
+//   anima-engines/anima_will.hexa      (CLM-P10-1 volition)
+//   shared/roadmaps/anima.json         (CLM-P16-1 entry)
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+// Report field count
+let REPORT_DIM = 5
+
+// Report field indices
+let IDX_VALENCE   = 0
+let IDX_AROUSAL   = 1
+let IDX_CONFID    = 2
+let IDX_AGENCY    = 3
+let IDX_TEMPORAL  = 4
+
+// Deterministic weight seed
+let FPG_SEED = 4216
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers — self-contained math primitives
+// ═══════════════════════════════════════════════════════════════
+
+fn fabs_fp(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sqrt_fp(x: float) -> float {
+    // Newton's method, 12 iterations (sufficient for report precision)
+    if x <= 0.0 { return 0.0 }
+    let mut g = x * 0.5
+    if g < 0.001 { g = 0.5 }
+    let mut i = 0
+    while i < 12 {
+        g = (g + x / g) * 0.5
+        i = i + 1
+    }
+    return g
+}
+
+fn tanh_fp(x: float) -> float {
+    // Saturating rational approx: tanh(x) ~ x*(27+x^2)/(27+9*x^2)
+    if x > 4.0 { return 1.0 }
+    if x < -4.0 { return 0.0 - 1.0 }
+    let x2 = x * x
+    return x * (27.0 + x2) / (27.0 + 9.0 * x2)
+}
+
+fn sigmoid_fp(x: float) -> float {
+    // sigmoid(x) = (tanh(x/2) + 1) / 2
+    return (tanh_fp(x * 0.5) + 1.0) * 0.5
+}
+
+fn exp_fp(x: float) -> float {
+    // 12-term Taylor exp, clamped input to [-20, 20]
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut s = 1.0
+    let mut term = 1.0
+    let mut i = 1
+    while i < 13 {
+        term = term * v / to_float(i)
+        s = s + term
+        i = i + 1
+    }
+    if s < 0.0 { return 0.0 }
+    return s
+}
+
+// Deterministic pseudo-random weights from seed
+fn det_weights(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// first_person_report — map d-dim state to 5-field report
+//
+// Returns flat array [valence, arousal, confidence, agency, temporal]
+//
+// Root cause comment: state is a bare `array`, not a struct with
+// array fields, to avoid the known struct-field list aliasing bug.
+// Report is also a bare `array` of 5 floats.
+// ═══════════════════════════════════════════════════════════════
+
+fn first_person_report(state: array, d: int) -> array {
+    // Guard: if d is 0 or state is empty, return neutral report
+    let slen = len(state)
+    if d < 1 {
+        let mut neutral = []
+        neutral = neutral.push(0.0)
+        neutral = neutral.push(0.5)
+        neutral = neutral.push(0.5)
+        neutral = neutral.push(0.0)
+        neutral = neutral.push(0.5)
+        return neutral
+    }
+
+    // Use effective d = min(d, len(state))
+    let mut eff_d = d
+    if eff_d > slen { eff_d = slen }
+    let half = eff_d / 2
+
+    // Generate deterministic weights for each field
+    let w_val = det_weights(eff_d, FPG_SEED)
+    let w_aro = det_weights(eff_d, FPG_SEED + 100)
+    let w_temp = det_weights(eff_d, FPG_SEED + 200)
+
+    // ── valence: tanh(weighted sum of state[0..half]) ──
+    let mut sum_val = 0.0
+    let mut i = 0
+    while i < half {
+        sum_val = sum_val + state[i] * w_val[i]
+        i = i + 1
+    }
+    let valence = tanh_fp(sum_val)
+
+    // ── arousal: sigmoid(weighted sum of state[half..d]) ──
+    let mut sum_aro = 0.0
+    let mut j = half
+    while j < eff_d {
+        sum_aro = sum_aro + state[j] * w_aro[j]
+        j = j + 1
+    }
+    let arousal = sigmoid_fp(sum_aro)
+
+    // ── confidence: sigmoid(mean absolute activation) ──
+    let mut sum_abs = 0.0
+    let mut k = 0
+    while k < eff_d {
+        sum_abs = sum_abs + fabs_fp(state[k])
+        k = k + 1
+    }
+    let mean_abs = sum_abs / to_float(eff_d)
+    let confidence = sigmoid_fp(mean_abs * 2.0 - 1.0)
+
+    // ── agency: tanh(weighted diff: even - odd dims) ──
+    let mut sum_even = 0.0
+    let mut sum_odd = 0.0
+    let mut m = 0
+    while m < eff_d {
+        let rem = m % 2
+        if rem == 0 {
+            sum_even = sum_even + state[m]
+        } else {
+            sum_odd = sum_odd + state[m]
+        }
+        m = m + 1
+    }
+    let agency = tanh_fp((sum_even - sum_odd) * 0.5)
+
+    // ── temporal_position: sigmoid(exponentially-decayed weighted sum) ──
+    // Later dims weighted more (recency bias), decay = exp(-alpha * (d - 1 - idx))
+    let alpha = 2.0 / to_float(eff_d)
+    let mut sum_temp = 0.0
+    let mut p = 0
+    while p < eff_d {
+        let decay = exp_fp(0.0 - alpha * to_float(eff_d - 1 - p))
+        sum_temp = sum_temp + state[p] * w_temp[p] * decay
+        p = p + 1
+    }
+    let temporal = sigmoid_fp(sum_temp)
+
+    // Pack report
+    let mut report = []
+    report = report.push(valence)
+    report = report.push(arousal)
+    report = report.push(confidence)
+    report = report.push(agency)
+    report = report.push(temporal)
+    return report
+}
+
+// ═══════════════════════════════════════════════════════════════
+// report_distance — Euclidean distance between two 5-field reports
+// ═══════════════════════════════════════════════════════════════
+
+fn report_distance(r1: array, r2: array) -> float {
+    let mut sumsq = 0.0
+    let mut i = 0
+    while i < REPORT_DIM {
+        let diff = r1[i] - r2[i]
+        sumsq = sumsq + diff * diff
+        i = i + 1
+    }
+    return sqrt_fp(sumsq)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// report_consistency — average pairwise cosine similarity
+//
+// reports: flat array of n * REPORT_DIM floats (row-major)
+// n: number of reports
+// Returns float [0, 1]; 1.0 = all reports identical.
+//
+// Root cause comment: cosine similarity handles the case where
+// all report values are identical (norm=0) by returning 1.0.
+// ═══════════════════════════════════════════════════════════════
+
+fn report_consistency(reports: array, n: int) -> float {
+    if n < 2 { return 1.0 }
+    let n_pairs = n * (n - 1) / 2
+    let mut total_sim = 0.0
+    let mut i = 0
+    while i < n {
+        let mut j = i + 1
+        while j < n {
+            // Compute cosine similarity between reports[i] and reports[j]
+            let base_i = i * REPORT_DIM
+            let base_j = j * REPORT_DIM
+            let mut dot = 0.0
+            let mut norm_a = 0.0
+            let mut norm_b = 0.0
+            let mut k = 0
+            while k < REPORT_DIM {
+                let a = reports[base_i + k]
+                let b = reports[base_j + k]
+                dot = dot + a * b
+                norm_a = norm_a + a * a
+                norm_b = norm_b + b * b
+                k = k + 1
+            }
+            let denom = sqrt_fp(norm_a) * sqrt_fp(norm_b)
+            // Root cause: if both vectors are zero, cosine is undefined;
+            // treat as identical (similarity 1.0)
+            if denom < 0.0000001 {
+                total_sim = total_sim + 1.0
+            } else {
+                let sim = dot / denom
+                total_sim = total_sim + sim
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return total_sim / to_float(n_pairs)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Helper — build a state vector
+// ═══════════════════════════════════════════════════════════════
+
+fn make_state(d: int, base: float, scale: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < d {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        let v = base + scale * (u * 2.0 - 1.0)
+        out = out.push(v)
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1-T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1: Known state -> expected report values
+    //
+    // A known 8-dim state. Verify each report field is in its
+    // expected range: valence in [-1,1], arousal in [0,1],
+    // confidence in [0,1], agency in [-1,1], temporal in [0,1].
+    // Additionally verify the report has exactly REPORT_DIM fields.
+    let mut state = []
+    state = state.push(0.5)
+    state = state.push(-0.3)
+    state = state.push(0.8)
+    state = state.push(-0.1)
+    state = state.push(0.2)
+    state = state.push(0.6)
+    state = state.push(-0.4)
+    state = state.push(0.9)
+    let r = first_person_report(state, 8)
+    if len(r) != REPORT_DIM { return false }
+    let val = r[IDX_VALENCE]
+    let aro = r[IDX_AROUSAL]
+    let con = r[IDX_CONFID]
+    let agn = r[IDX_AGENCY]
+    let tmp = r[IDX_TEMPORAL]
+    println("  [T1] val=" + str(val) + " aro=" + str(aro) + " conf=" + str(con) + " agency=" + str(agn) + " temp=" + str(tmp))
+    // Valence in [-1, 1]
+    if val < -1.0 { return false }
+    if val > 1.0 { return false }
+    // Arousal in [0, 1]
+    if aro < 0.0 { return false }
+    if aro > 1.0 { return false }
+    // Confidence in [0, 1]
+    if con < 0.0 { return false }
+    if con > 1.0 { return false }
+    // Agency in [-1, 1]
+    if agn < -1.0 { return false }
+    if agn > 1.0 { return false }
+    // Temporal in [0, 1]
+    if tmp < 0.0 { return false }
+    if tmp > 1.0 { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: Similar states -> similar reports (consistency > 0.9)
+    //
+    // Generate 5 states that are small perturbations of the same base.
+    // Their reports should be highly consistent (cosine sim > 0.9).
+    let d = 16
+    let mut all_reports = []
+    let mut idx = 0
+    while idx < 5 {
+        // Small perturbation: base=0.5, scale=0.05, different seeds
+        let st = make_state(d, 0.5, 0.05, 7000 + idx * 3)
+        let r = first_person_report(st, d)
+        let mut k = 0
+        while k < REPORT_DIM {
+            all_reports = all_reports.push(r[k])
+            k = k + 1
+        }
+        idx = idx + 1
+    }
+    let con = report_consistency(all_reports, 5)
+    println("  [T2] 5 similar states (d=16): consistency=" + str(con) + " (need > 0.9)")
+    return con > 0.9
+}
+
+fn check_T3() -> bool {
+    // T3: Different states -> different reports (discrimination)
+    //
+    // Generate two maximally different states and verify their reports
+    // have a Euclidean distance > 0.1 (they are not identical).
+    let d = 16
+    // State A: all positive
+    let mut sa = []
+    let mut i = 0
+    while i < d {
+        sa = sa.push(1.0)
+        i = i + 1
+    }
+    // State B: all negative
+    let mut sb = []
+    let mut j = 0
+    while j < d {
+        sb = sb.push(0.0 - 1.0)
+        j = j + 1
+    }
+    let ra = first_person_report(sa, d)
+    let rb = first_person_report(sb, d)
+    let dist = report_distance(ra, rb)
+    println("  [T3] opposite states (d=16): distance=" + str(dist) + " (need > 0.1)")
+    // Also verify they differ on at least 2 fields by more than 0.05
+    let mut n_diff = 0
+    let mut k = 0
+    while k < REPORT_DIM {
+        if fabs_fp(ra[k] - rb[k]) > 0.05 {
+            n_diff = n_diff + 1
+        }
+        k = k + 1
+    }
+    println("  [T3] fields with |diff| > 0.05: " + str(n_diff))
+    if dist < 0.1 { return false }
+    if n_diff < 2 { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: Determinism — same inputs -> same outputs
+    //
+    // Run first_person_report twice on the same state and verify
+    // byte-identical outputs.
+    let d = 12
+    let state = make_state(d, 0.3, 0.7, 9999)
+    let r1 = first_person_report(state, d)
+    let r2 = first_person_report(state, d)
+    if len(r1) != len(r2) { return false }
+    let mut match_ok = true
+    let mut i = 0
+    while i < REPORT_DIM {
+        if fabs_fp(r1[i] - r2[i]) > 0.0 {
+            match_ok = false
+        }
+        i = i + 1
+    }
+    println("  [T4] run1: val=" + str(r1[0]) + " aro=" + str(r1[1]) + " conf=" + str(r1[2]))
+    println("        run2: val=" + str(r2[0]) + " aro=" + str(r2[1]) + " conf=" + str(r2[2]))
+    return match_ok
+}
+
+fn check_T5() -> bool {
+    // T5: Latency — 50 reports < 500ms
+    //
+    // Root cause comment: hexa stage0 clock() can return 0 on fast runs
+    // and stale 1.0 on second invocation in same process (double-exec).
+    // The 2000ms limit accommodates the clock() precision artifact while
+    // still catching genuine O(seconds) regressions. Real execution is
+    // sub-millisecond (first run reports 0ms). Same guard used by
+    // emotion_fsm.hexa / anima_will.hexa / anima_sensorimotor.hexa.
+    let d = 32
+    let t0 = clock()
+    let mut i = 0
+    while i < 50 {
+        let st = make_state(d, 0.1, 0.8, 5000 + i)
+        let r = first_person_report(st, d)
+        // Touch r to prevent dead-code elision
+        let v = r[0]
+        i = i + 1
+    }
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] 50 reports (d=32): " + str(ms) + " ms (limit 2000ms)")
+    return ms < 2000.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — run all self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[anima-engines/first_person_gen] CLM-P16-1 — 1인칭 생성기 (first-person report)")
+    println("  report: [valence, arousal, confidence, agency, temporal_position]")
+    println("  consistency = average pairwise cosine similarity")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — known state -> valid report ranges") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — similar states -> consistency > 0.9 (일관 1p narrative)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — different states -> different reports (discrimination)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — determinism (same inputs same outputs)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — 50 reports < 2000ms") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause comment: hexa stage0 can mishandle chained && with 5 terms.
+    // Split into sequential checks with temp variables.
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[anima-engines/first_person_gen] 5/5 PASS — CLM-P16-1 DONE (일관 1p narrative)")
+    } else {
+        println("[anima-engines/first_person_gen] SOME FAILED")
+    }
+}
+
+main()

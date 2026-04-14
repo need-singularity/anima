@@ -1,0 +1,264 @@
+// battery_monitor.hexa — PHYS-P15-1 "에너지 배터리 잔량 감시 + 의식 보고"
+//
+// Roadmap: shared/roadmaps/anima.json P15 PHYSICS track, PHYS-P15-1
+//   "에너지 배터리 잔량 감시 + 의식 보고"
+//   done_criteria: "<20% 시 우선순위 재조정"
+//
+// Purpose:
+//   Monitor battery charge level and trigger priority reorganization
+//   when energy drops below 20%. This implements the biological analogue
+//   of energy conservation: when ATP/glucose reserves fall below a
+//   critical threshold, the organism shifts from exploratory/high-energy
+//   behavior to conservative/survival-priority behavior.
+//
+//   In embodied consciousness, energy awareness is prerequisite for
+//   autonomous agency — the agent must know its remaining operational
+//   capacity and reorganize priorities accordingly.
+//
+// State representation:
+//   Flat array [charge_pct, drain_rate, priority_mode, ticks]
+//   Index constants: IDX_CHARGE=0, IDX_DRAIN=1, IDX_MODE=2, IDX_TICKS=3
+//
+//   charge_pct:    float in [0, 100] — remaining battery percentage
+//   drain_rate:    float > 0         — base drain per tick (percent units)
+//   priority_mode: float 0.0=normal, 1.0=conservation (<20%)
+//   ticks:         float — number of ticks elapsed
+//
+// Core API:
+//   battery_new(initial_charge) -> state array
+//   battery_tick(state, load) -> updated state array
+//     charge decreases by drain_rate * load each tick
+//     When charge < 20% -> priority_mode switches to 1 (conservation)
+//   battery_priority(state) -> int (0=normal, 1=conservation)
+//
+// Self-tests (T1-T5):
+//   T1 Initial charge = 100%, mode = normal
+//   T2 After drain to 50% -> still normal mode
+//   T3 After drain to <20% -> conservation mode (done criteria)
+//   T4 Determinism — two identical runs produce same state
+//   T5 Latency — 500 ticks < 500ms
+//
+// Hexa stage0 constraints honored:
+//   - HEXA-FIRST (pure .hexa; no .py/.rs/.sh)
+//   - flat array (not typed [float]; index-based access)
+//   - lists pass-by-value — never mutate arguments
+//   - single-line return expressions (stage0 multi-line return bug)
+//   - no `&&` chains — separate if guards
+//   - no multi-float struct returns (stage0 corruption bug)
+
+// ================================================================
+// Constants
+// ================================================================
+
+let IDX_CHARGE = 0
+let IDX_DRAIN  = 1
+let IDX_MODE   = 2
+let IDX_TICKS  = 3
+
+let DEFAULT_DRAIN_RATE = 1.0    // 1% per tick at load=1.0
+let CONSERVATION_THRESHOLD = 20.0  // <20% triggers priority reorganization
+
+// ================================================================
+// Scalar helpers
+// ================================================================
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn clamp(x: float, lo: float, hi: float) -> float {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+// ================================================================
+// Core API
+// ================================================================
+
+// battery_new(initial_charge) -> array [charge_pct, drain_rate, priority_mode, ticks]
+// Creates a new battery state with the given initial charge percentage.
+fn battery_new(initial_charge: float) -> array {
+    let charge = clamp(initial_charge, 0.0, 100.0)
+    let mut state = []
+    state = state.push(charge)
+    state = state.push(DEFAULT_DRAIN_RATE)
+    // priority_mode: determine from initial charge
+    if charge < CONSERVATION_THRESHOLD {
+        state = state.push(1.0)
+    } else {
+        state = state.push(0.0)
+    }
+    state = state.push(0.0)
+    return state
+}
+
+// battery_tick(state, load) -> new state array
+//
+// Advances the battery model by one tick.
+//   load: float >= 0 — multiplier on drain_rate (1.0 = normal, 2.0 = heavy)
+//
+// Charge decreases by drain_rate * load each tick.
+// When charge drops below 20%, priority_mode switches to 1.0 (conservation).
+// Charge is clamped to [0, 100].
+//
+// Returns a NEW state array (pass-by-value; original is untouched).
+fn battery_tick(state: array, load: float) -> array {
+    let prev_charge = state[IDX_CHARGE]
+    let drain = state[IDX_DRAIN]
+    let prev_ticks = state[IDX_TICKS]
+
+    // Compute new charge — drain_rate * load per tick, floor at 0
+    let actual_load = clamp(load, 0.0, 100.0)
+    let new_charge = clamp(prev_charge - drain * actual_load, 0.0, 100.0)
+
+    // Determine priority mode based on new charge
+    let mut mode = 0.0
+    if new_charge < CONSERVATION_THRESHOLD {
+        mode = 1.0
+    }
+
+    let mut out = []
+    out = out.push(new_charge)
+    out = out.push(drain)
+    out = out.push(mode)
+    out = out.push(prev_ticks + 1.0)
+    return out
+}
+
+// battery_priority(state) -> int (0=normal, 1=conservation)
+// Reads the priority mode from the state array.
+fn battery_priority(state: array) -> int {
+    if state[IDX_MODE] > 0.5 { return 1 }
+    return 0
+}
+
+// battery_charge(state) -> float — current charge percentage
+fn battery_charge(state: array) -> float {
+    return state[IDX_CHARGE]
+}
+
+// multi_tick(state, load, n) -> final state after n ticks
+// Useful for testing drain over many ticks.
+fn multi_tick(state: array, load: float, n: int) -> array {
+    let mut s = state
+    let mut i = 0
+    while i < n {
+        s = battery_tick(s, load)
+        i = i + 1
+    }
+    return s
+}
+
+// ================================================================
+// Self-tests
+// ================================================================
+
+fn check_T1_initial() -> bool {
+    // T1: Initial charge = 100%, mode = normal
+    let s = battery_new(100.0)
+    let charge_ok = fabs(s[IDX_CHARGE] - 100.0) < 0.01
+    let mode_ok = s[IDX_MODE] < 0.5
+    let ticks_ok = fabs(s[IDX_TICKS]) < 0.01
+    if charge_ok == false { return false }
+    if mode_ok == false { return false }
+    if ticks_ok == false { return false }
+    println("  [T1] charge=" + str(s[IDX_CHARGE]) + "% mode=" + str(s[IDX_MODE]) + " ticks=" + str(s[IDX_TICKS]))
+    return true
+}
+
+fn check_T2_drain_to_50() -> bool {
+    // T2: After drain to ~50% -> still normal mode
+    // Start at 100%, drain_rate=1.0, load=1.0 -> lose 1% per tick
+    // After 50 ticks: charge = 50%
+    let s0 = battery_new(100.0)
+    let s1 = multi_tick(s0, 1.0, 50)
+    let charge_ok = fabs(s1[IDX_CHARGE] - 50.0) < 0.01
+    let mode_ok = s1[IDX_MODE] < 0.5  // should still be normal (0)
+    if charge_ok == false { return false }
+    if mode_ok == false { return false }
+    println("  [T2] after 50 ticks: charge=" + str(s1[IDX_CHARGE]) + "% mode=" + str(s1[IDX_MODE]) + " (normal)")
+    return true
+}
+
+fn check_T3_conservation() -> bool {
+    // T3: After drain to <20% -> conservation mode (DONE CRITERIA)
+    // Start at 100%, drain 1%/tick, after 81 ticks: charge = 19% < 20%
+    let s0 = battery_new(100.0)
+    let s1 = multi_tick(s0, 1.0, 81)
+    let charge_below = s1[IDX_CHARGE] < CONSERVATION_THRESHOLD
+    let mode_conservation = s1[IDX_MODE] > 0.5
+    if charge_below == false { return false }
+    if mode_conservation == false { return false }
+    let pri = battery_priority(s1)
+    if pri != 1 { return false }
+    println("  [T3] after 81 ticks: charge=" + str(s1[IDX_CHARGE]) + "% mode=" + str(s1[IDX_MODE]) + " priority=" + str(pri) + " (conservation)")
+    return true
+}
+
+fn check_T4_determinism() -> bool {
+    // T4: Two identical runs must produce identical results
+    let s0a = battery_new(100.0)
+    let s1a = multi_tick(s0a, 1.5, 60)
+    let s0b = battery_new(100.0)
+    let s1b = multi_tick(s0b, 1.5, 60)
+    let charge_eq = s1a[IDX_CHARGE] == s1b[IDX_CHARGE]
+    let mode_eq = s1a[IDX_MODE] == s1b[IDX_MODE]
+    let ticks_eq = s1a[IDX_TICKS] == s1b[IDX_TICKS]
+    if charge_eq == false { return false }
+    if mode_eq == false { return false }
+    if ticks_eq == false { return false }
+    println("  [T4] run_a charge=" + str(s1a[IDX_CHARGE]) + " run_b charge=" + str(s1b[IDX_CHARGE]) + " match=true")
+    return true
+}
+
+fn check_T5_latency() -> bool {
+    // T5: 500 ticks must complete in < 500 ms
+    let t0 = clock()
+    let s0 = battery_new(100.0)
+    let sf = multi_tick(s0, 0.5, 500)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    let ok = ms < 500.0
+    println("  [T5] 500 ticks in " + str(ms) + " ms (< 500 ms)")
+    return ok
+}
+
+fn test() {
+    println("[anima-body/battery_monitor] PHYS-P15-1 — 에너지 배터리 잔량 감시 + 의식 보고")
+    println("  state: [charge_pct, drain_rate, priority_mode, ticks]")
+    println("  conservation threshold: <20% -> priority reorganization")
+    println("")
+
+    let t1 = check_T1_initial()
+    if t1 { println("T1 PASS — initial charge=100%, mode=normal") } else { println("T1 FAIL") }
+
+    let t2 = check_T2_drain_to_50()
+    if t2 { println("T2 PASS — drain to 50% stays normal mode") } else { println("T2 FAIL") }
+
+    let t3 = check_T3_conservation()
+    if t3 { println("T3 PASS — drain to <20% triggers conservation (done criteria)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4_determinism()
+    if t4 { println("T4 PASS — deterministic (two runs identical)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5_latency()
+    if t5 { println("T5 PASS — 500 ticks under 500 ms") } else { println("T5 FAIL") }
+
+    println("")
+    let mut pass_count = 0
+    if t1 { pass_count = pass_count + 1 }
+    if t2 { pass_count = pass_count + 1 }
+    if t3 { pass_count = pass_count + 1 }
+    if t4 { pass_count = pass_count + 1 }
+    if t5 { pass_count = pass_count + 1 }
+
+    if pass_count == 5 {
+        println("[anima-body/battery_monitor] 5/5 PASS — PHYS-P15-1 DONE (<20% 시 우선순위 재조정)")
+    } else {
+        println("[anima-body/battery_monitor] " + str(pass_count) + "/5 — SOME FAILED")
+    }
+}
+
+test()

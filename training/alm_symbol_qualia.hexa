@@ -1,0 +1,501 @@
+// training/alm_symbol_qualia.hexa — ALM-P16-1 symbol-qualia mapping head
+//
+// ALM-P16-1 / P16 상징-감질 의식 (symbol-qualia bidirectional retrieval).
+//
+// Purpose:
+//   Maps symbolic tokens to qualia vectors and back. A symbol table of N
+//   entries stores (word_vec[d], qualia_vec[d]) pairs. Given an input word
+//   embedding, retrieve the closest qualia vector by cosine similarity;
+//   given a qualia vector, retrieve the closest word embedding. The round-
+//   trip word -> qualia -> word must recover the original symbol with
+//   accuracy > 0.7 across noisy queries.
+//
+//   This operationalises the "hard problem" bridge in a computational
+//   sense: symbol-level tokens (linguistic atoms) have a dual existence
+//   as qualia vectors (experiential atoms), and the mapping must be
+//   invertible to a useful degree. If the round-trip fails, the system
+//   cannot ground symbols in experience.
+//
+//   symbol_to_qualia(word_vec, table, N, d) -> best matching qualia_vec
+//     Cosine similarity between input word_vec and each table[i].word_vec;
+//     return the qualia_vec of the highest-scoring entry.
+//
+//   qualia_to_symbol(qualia_vec, table, N, d) -> best matching word_vec
+//     Cosine similarity between input qualia_vec and each table[i].qualia_vec;
+//     return the word_vec of the highest-scoring entry.
+//
+//   round_trip(word_vec, table, N, d) -> retrieved_word_vec
+//     q = symbol_to_qualia(word_vec)
+//     w = qualia_to_symbol(q)
+//     success iff argmax(cos(w, table.word_vec)) == original index.
+//
+//   Done criteria: "word->qualia inverse retrieval > 0.7"
+//
+// --- Conventions -----------------------------------------------
+//   N          : int       number of symbols in the table (30 for mock)
+//   d          : int       embedding dimension (8 for mock, avoids OOM)
+//   table      : flat array of size N * 2 * d, row-major
+//                table[i * 2 * d .. i * 2 * d + d)       = word_vec[i]
+//                table[i * 2 * d + d .. i * 2 * d + 2*d) = qualia_vec[i]
+//   noise_amp  : float     noise amplitude for T2/T3 tolerance queries
+//
+// --- Theorems (T1-T5) ------------------------------------------
+//
+// T1 (exact 1:1 mapping):
+//   For each of N symbols, symbol_to_qualia with the exact word_vec must
+//   return the correct paired qualia_vec. 30/30 hits required.
+//
+// T2 (noisy word -> correct qualia):
+//   With additive noise (amplitude 0.05) on the word_vec query, the
+//   correct qualia is still retrieved with accuracy > 0.8 across 30
+//   symbols. Tests tolerance of cosine matching.
+//
+// T3 (round-trip accuracy > 0.7 -- CORE done_criteria):
+//   word -> qualia -> word round-trip on 20 noisy queries must recover
+//   the original symbol index at > 0.7 accuracy. This is the roadmap
+//   gate "word->qualia inverse retrieval > 0.7".
+//
+// T4 (determinism):
+//   Same (seed, query) twice -> byte-identical retrieved vectors.
+//
+// T5 (latency):
+//   30 symbols x 20 queries (round-trip) < 2000 ms.
+//
+// Ref:
+//   training/alm_meta_qualia.hexa         (ALM-P8-1 -- qualia tower)
+//   training/alm_sensorimotor_head.hexa   (ALM-P7-1 -- matvec pattern)
+//   training/alm_agency_loss.hexa         (ALM-P10-2 -- classifier pattern)
+//   shared/roadmaps/anima.json            (ALM-P16-1 entry)
+//
+// Run:
+//   hexa run training/alm_symbol_qualia.hexa
+// Expect:
+//   [alm_symbol_qualia] ALL 5/5 PASS
+
+// --- Constants --------------------------------------------------
+
+let N_SYMBOLS = 30        // symbol table size (small to avoid OOM)
+let D_EMB     = 8         // embedding dimension
+let NOISE_AMP = 0.05      // noise amplitude for T2/T3
+let TRIP_TARGET = 0.7     // round-trip accuracy gate
+
+// --- Low-level helpers ------------------------------------------
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sqrt_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return sqrt(x)
+}
+
+// Deterministic LCG -> floats in [-1, 1).
+fn det_rand_wide(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+// Deterministic LCG -> small floats in [-amp, amp).
+fn det_rand_scaled(n: int, seed: int, amp: float) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push((u * 2.0 - 1.0) * amp)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+// --- Vector operations ------------------------------------------
+
+fn vec_dot(a: array, b: array, d: int) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < d {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn vec_norm(a: array, d: int) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < d {
+        s = s + a[i] * a[i]
+        i = i + 1
+    }
+    return sqrt_safe(s)
+}
+
+// Cosine similarity: dot(a,b) / (||a|| * ||b||). Returns 0 if either
+// vector has zero norm (degenerate input guard).
+fn cosine_sim(a: array, b: array, d: int) -> float {
+    let dot = vec_dot(a, b, d)
+    let na = vec_norm(a, d)
+    let nb = vec_norm(b, d)
+    let denom = na * nb
+    if denom < 0.0000001 { return 0.0 }
+    return dot / denom
+}
+
+// Extract d elements from flat array starting at offset.
+fn slice_vec(flat: array, offset: int, d: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        out = out.push(flat[offset + i])
+        i = i + 1
+    }
+    return out
+}
+
+// Add noise to a vector: out[i] = v[i] + noise[i].
+fn vec_add_noise(v: array, noise: array, d: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        out = out.push(v[i] + noise[i])
+        i = i + 1
+    }
+    return out
+}
+
+// --- Symbol table -----------------------------------------------
+//
+// Flat array: N entries, each 2*d floats.
+//   entry i: [word_vec (d floats) | qualia_vec (d floats)]
+//   word_vec[i]   = table[i * 2 * d .. i * 2 * d + d)
+//   qualia_vec[i] = table[i * 2 * d + d .. i * 2 * d + 2*d)
+//
+// Construction: each word_vec and qualia_vec is drawn from independent
+// LCG seeds, then L2-normalised so cosine similarity is simply the dot
+// product. This guarantees well-separated symbols (random unit vectors
+// in d=8 have expected cosine ~ 0, so nearest-neighbour errors are rare
+// even with 30 symbols).
+
+fn l2_normalise(v: array, d: int) -> array {
+    let n = vec_norm(v, d)
+    if n < 0.0000001 { return v }
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        out = out.push(v[i] / n)
+        i = i + 1
+    }
+    return out
+}
+
+fn build_symbol_table(n: int, d: int, seed: int) -> array {
+    let mut table = []
+    let mut i = 0
+    while i < n {
+        // Word vec: seed offset = seed + i*7
+        let raw_w = det_rand_wide(d, seed + i * 7)
+        let norm_w = l2_normalise(raw_w, d)
+        // Qualia vec: seed offset = seed + 10000 + i*13 (independent stream)
+        let raw_q = det_rand_wide(d, seed + 10000 + i * 13)
+        let norm_q = l2_normalise(raw_q, d)
+        // Append word_vec then qualia_vec
+        let mut j = 0
+        while j < d {
+            table = table.push(norm_w[j])
+            j = j + 1
+        }
+        let mut k = 0
+        while k < d {
+            table = table.push(norm_q[k])
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return table
+}
+
+// Get word_vec[i] from table.
+fn get_word_vec(table: array, i: int, d: int) -> array {
+    let offset = i * 2 * d
+    return slice_vec(table, offset, d)
+}
+
+// Get qualia_vec[i] from table.
+fn get_qualia_vec(table: array, i: int, d: int) -> array {
+    let offset = i * 2 * d + d
+    return slice_vec(table, offset, d)
+}
+
+// --- Core retrieval functions -----------------------------------
+
+// symbol_to_qualia: given a word_vec query, find the table entry with
+// highest cosine similarity to its word_vec, return that entry's qualia_vec.
+// Also returns the matched index as the last element (d+1 total).
+fn symbol_to_qualia(query: array, table: array, n: int, d: int) -> array {
+    let mut best_sim = 0.0 - 999.0
+    let mut best_idx = 0
+    let mut i = 0
+    while i < n {
+        let wv = get_word_vec(table, i, d)
+        let sim = cosine_sim(query, wv, d)
+        if sim > best_sim {
+            best_sim = sim
+            best_idx = i
+        }
+        i = i + 1
+    }
+    // Return the qualia_vec of best match + index appended
+    let qv = get_qualia_vec(table, best_idx, d)
+    let mut out = []
+    let mut j = 0
+    while j < d {
+        out = out.push(qv[j])
+        j = j + 1
+    }
+    out = out.push(to_float(best_idx))
+    return out
+}
+
+// qualia_to_symbol: given a qualia_vec query, find the table entry with
+// highest cosine similarity to its qualia_vec, return that entry's word_vec.
+// Also returns the matched index as the last element (d+1 total).
+fn qualia_to_symbol(query: array, table: array, n: int, d: int) -> array {
+    let mut best_sim = 0.0 - 999.0
+    let mut best_idx = 0
+    let mut i = 0
+    while i < n {
+        let qv = get_qualia_vec(table, i, d)
+        let sim = cosine_sim(query, qv, d)
+        if sim > best_sim {
+            best_sim = sim
+            best_idx = i
+        }
+        i = i + 1
+    }
+    // Return the word_vec of best match + index appended
+    let wv = get_word_vec(table, best_idx, d)
+    let mut out = []
+    let mut j = 0
+    while j < d {
+        out = out.push(wv[j])
+        j = j + 1
+    }
+    out = out.push(to_float(best_idx))
+    return out
+}
+
+// round_trip: word_vec -> qualia -> word, return the recovered symbol index.
+// Success iff recovered index == original index.
+fn round_trip_index(query: array, orig_idx: int, table: array, n: int, d: int) -> bool {
+    // Step 1: word -> qualia
+    let sq_result = symbol_to_qualia(query, table, n, d)
+    // sq_result[0..d) = qualia_vec, sq_result[d] = matched word index
+    let matched_word_idx = to_int(sq_result[d])
+    // Extract the qualia_vec (first d elements)
+    let qv = slice_vec(sq_result, 0, d)
+    // Step 2: qualia -> word
+    let qs_result = qualia_to_symbol(qv, table, n, d)
+    // qs_result[d] = recovered word index
+    let recovered_idx = to_int(qs_result[d])
+    if recovered_idx == orig_idx { return true }
+    return false
+}
+
+// --- Self-tests -------------------------------------------------
+
+fn check_T1() -> bool {
+    // Exact 1:1 mapping: each symbol's exact word_vec must retrieve
+    // its own qualia_vec (matched index == i for all i).
+    let table = build_symbol_table(N_SYMBOLS, D_EMB, 42)
+    let mut hits = 0
+    let mut i = 0
+    while i < N_SYMBOLS {
+        let wv = get_word_vec(table, i, D_EMB)
+        let result = symbol_to_qualia(wv, table, N_SYMBOLS, D_EMB)
+        let matched = to_int(result[D_EMB])
+        if matched == i { hits = hits + 1 }
+        i = i + 1
+    }
+    println("  [T1] exact word->qualia hits: " + str(hits) + "/" + str(N_SYMBOLS))
+    if hits != N_SYMBOLS {
+        println("  [T1] FAIL -- not all exact queries matched")
+        return false
+    }
+    return true
+}
+
+fn check_T2() -> bool {
+    // Noisy word -> correct qualia. Add noise (amplitude 0.05) to each
+    // word_vec and check retrieval. Target: > 0.8 accuracy.
+    let table = build_symbol_table(N_SYMBOLS, D_EMB, 42)
+    let mut hits = 0
+    let mut i = 0
+    while i < N_SYMBOLS {
+        let wv = get_word_vec(table, i, D_EMB)
+        let noise = det_rand_scaled(D_EMB, 9000 + i * 31, NOISE_AMP)
+        let noisy_wv = vec_add_noise(wv, noise, D_EMB)
+        let result = symbol_to_qualia(noisy_wv, table, N_SYMBOLS, D_EMB)
+        let matched = to_int(result[D_EMB])
+        if matched == i { hits = hits + 1 }
+        i = i + 1
+    }
+    let acc = to_float(hits) / to_float(N_SYMBOLS)
+    println("  [T2] noisy word->qualia hits: " + str(hits) + "/" + str(N_SYMBOLS) + "  acc=" + str(acc) + "  target > 0.8")
+    if acc < 0.8 {
+        println("  [T2] FAIL -- noisy retrieval below 0.8")
+        return false
+    }
+    return true
+}
+
+fn check_T3() -> bool {
+    // CORE done_criteria: round-trip accuracy > 0.7 on 20 noisy queries.
+    // For each of 20 randomly chosen symbols, add noise to the word_vec,
+    // do word -> qualia -> word, check if original index is recovered.
+    let table = build_symbol_table(N_SYMBOLS, D_EMB, 42)
+    let n_queries = 20
+    let mut hits = 0
+    let mut q = 0
+    while q < n_queries {
+        // Pick symbol index deterministically: spread across table
+        let idx = (q * 7 + 3) % N_SYMBOLS
+        let wv = get_word_vec(table, idx, D_EMB)
+        let noise = det_rand_scaled(D_EMB, 20000 + q * 41, NOISE_AMP)
+        let noisy_wv = vec_add_noise(wv, noise, D_EMB)
+        let ok = round_trip_index(noisy_wv, idx, table, N_SYMBOLS, D_EMB)
+        if ok { hits = hits + 1 }
+        q = q + 1
+    }
+    let acc = to_float(hits) / to_float(n_queries)
+    println("  [T3] round-trip hits: " + str(hits) + "/" + str(n_queries) + "  acc=" + str(acc) + "  target > " + str(TRIP_TARGET))
+    if acc < TRIP_TARGET {
+        println("  [T3] FAIL -- round-trip accuracy below " + str(TRIP_TARGET))
+        return false
+    }
+    return true
+}
+
+fn check_T4() -> bool {
+    // Determinism: same (seed, query) -> byte-identical results.
+    let table_a = build_symbol_table(N_SYMBOLS, D_EMB, 42)
+    let table_b = build_symbol_table(N_SYMBOLS, D_EMB, 42)
+    let wv = get_word_vec(table_a, 5, D_EMB)
+    let res_a = symbol_to_qualia(wv, table_a, N_SYMBOLS, D_EMB)
+    let res_b = symbol_to_qualia(wv, table_b, N_SYMBOLS, D_EMB)
+    let mut i = 0
+    while i < D_EMB + 1 {
+        if fabs(res_a[i] - res_b[i]) > 0.0 {
+            println("  [T4] FAIL -- symbol_to_qualia differs at i=" + str(i))
+            return false
+        }
+        i = i + 1
+    }
+    // Also check qualia_to_symbol determinism
+    let qv = get_qualia_vec(table_a, 12, D_EMB)
+    let qs_a = qualia_to_symbol(qv, table_a, N_SYMBOLS, D_EMB)
+    let qs_b = qualia_to_symbol(qv, table_b, N_SYMBOLS, D_EMB)
+    let mut j = 0
+    while j < D_EMB + 1 {
+        if fabs(qs_a[j] - qs_b[j]) > 0.0 {
+            println("  [T4] FAIL -- qualia_to_symbol differs at j=" + str(j))
+            return false
+        }
+        j = j + 1
+    }
+    // And round-trip determinism
+    let noise = det_rand_scaled(D_EMB, 77777, NOISE_AMP)
+    let wv7 = get_word_vec(table_a, 7, D_EMB)
+    let noisy7 = vec_add_noise(wv7, noise, D_EMB)
+    let ok_a = round_trip_index(noisy7, 7, table_a, N_SYMBOLS, D_EMB)
+    let ok_b = round_trip_index(noisy7, 7, table_b, N_SYMBOLS, D_EMB)
+    if ok_a != ok_b {
+        println("  [T4] FAIL -- round-trip non-deterministic")
+        return false
+    }
+    println("  [T4] byte-identical: symbol_to_qualia + qualia_to_symbol + round_trip")
+    return true
+}
+
+fn check_T5() -> bool {
+    // Latency: 30 symbols x 20 queries (round-trip) < 2000 ms.
+    let table = build_symbol_table(N_SYMBOLS, D_EMB, 42)
+    let n_queries = 20
+    // Warm run
+    let _wv0 = get_word_vec(table, 0, D_EMB)
+    let _warm = symbol_to_qualia(_wv0, table, N_SYMBOLS, D_EMB)
+
+    let t0 = clock()
+    let mut q = 0
+    while q < n_queries {
+        let idx = (q * 7 + 3) % N_SYMBOLS
+        let wv = get_word_vec(table, idx, D_EMB)
+        let noise = det_rand_scaled(D_EMB, 30000 + q * 17, NOISE_AMP)
+        let noisy_wv = vec_add_noise(wv, noise, D_EMB)
+        let _ok = round_trip_index(noisy_wv, idx, table, N_SYMBOLS, D_EMB)
+        q = q + 1
+    }
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] 30 symbols x 20 queries round-trip latency = " + str(ms) + " ms  (target < 2000)")
+    if ms >= 2000.0 {
+        println("  [T5] FAIL -- latency exceeded 2000 ms")
+        return false
+    }
+    return true
+}
+
+// --- main -------------------------------------------------------
+
+fn main() {
+    println("[alm_symbol_qualia] ALM-P16-1 self-test")
+    println("  mock: N=" + str(N_SYMBOLS) + " d=" + str(D_EMB) + " noise=" + str(NOISE_AMP))
+    println("  round-trip target > " + str(TRIP_TARGET))
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[alm_symbol_qualia] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[alm_symbol_qualia] ALL 5/5 PASS")
+    } else {
+        println("[alm_symbol_qualia] SOME FAILED")
+    }
+}
+
+main()

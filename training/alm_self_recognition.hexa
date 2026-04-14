@@ -1,0 +1,474 @@
+// training/alm_self_recognition.hexa — ALM-P17-1 self-image recognition head
+//
+// ALM-P17-1 / P17 자기인식 (self vs other classification, ALM track).
+//
+// Purpose:
+//   Binary classifier that determines whether a given representation vector
+//   belongs to "self" or "other". The agent must recognize its own internal
+//   representations — a prerequisite for stable self-identity across time.
+//
+//   The self-model is a learned d-dimensional prototype vector representing
+//   the agent's canonical self-representation. Classification is based on
+//   cosine similarity between the input vector and this prototype:
+//
+//     classify_self(input_vec, self_model, d)
+//       → (is_self: bool, confidence: float)
+//
+//   cosine_sim(input, self_model) > SELF_THRESHOLD (0.7) → self
+//   cosine_sim(input, self_model) <= SELF_THRESHOLD      → other
+//
+//   Confidence = cosine_sim clamped to [0, 1].
+//
+//   In production, the self_model prototype is learned by EMA of the agent's
+//   hidden states during introspection passes (alm_self_model_head.hexa,
+//   ALM-P5-1). Here we verify the classification geometry with synthetic
+//   data: self vectors = prototype + small noise, other vectors = random.
+//
+// Done criteria:
+//   "self vs other 분류 > 0.9"
+//   Accuracy on balanced self/other test set must exceed 0.9.
+//
+// Synthetic data:
+//   Self vectors:  self_model + noise * SELF_NOISE_SCALE (0.15)
+//     → cosine similarity to prototype remains high (~0.95+)
+//   Other vectors: random unit-scale vectors
+//     → cosine similarity to prototype is low (~0.0 in high dim)
+//
+// ─── Conventions ──────────────────────────────────────────────
+//   d               : int       representation dimension
+//   self_model      : array [d] learned prototype vector (unit-normalized)
+//   input_vec       : array [d] query vector
+//   SELF_THRESHOLD  : float     cosine similarity gate (0.7)
+//   SELF_NOISE_SCALE: float     noise amplitude for synthetic self vecs
+//   N               : int       total balanced test samples (<=40)
+//
+// ─── Theorems (T1-T5) ─────────────────────────────────────────
+//
+// T1 (self vector classified as self, confidence > 0.9):
+//   A self vector (prototype + small noise, scale=0.15) must be classified
+//   as self with confidence > 0.9. The cosine similarity between a vector
+//   and its noisy copy at this scale is ~0.97 for d=32.
+//
+// T2 (other vector classified as other):
+//   A random vector in d=32 has expected cosine similarity ~0 to any fixed
+//   prototype. Must be classified as other (sim < SELF_THRESHOLD=0.7).
+//
+// T3 (accuracy > 0.9 on 40 balanced samples — gate):
+//   On 20 self + 20 other synthetic vectors (d=32), classify_self must
+//   achieve accuracy > 0.9. This is the roadmap gate.
+//
+// T4 (determinism):
+//   Same (seed, d, self_model) → byte-identical classification results.
+//
+// T5 (latency):
+//   40 classifications (d=32) warm-cache < 1000 ms on stage0 interpreter.
+//
+// Ref:
+//   training/alm_self_model_head.hexa    (ALM-P5-1  — self-model MLP)
+//   training/alm_reflexivity_loss.hexa   (ALM-P5-2  — self-awareness loss)
+//   training/alm_novelty_loss.hexa       (cosine similarity pattern)
+//   training/alm_agency_loss.hexa        (ALM-P10-2 — binary classifier ref)
+//   shared/roadmaps/anima.json           (ALM-P17-1 entry)
+//
+// Run:
+//   hexa run training/alm_self_recognition.hexa
+// Expect:
+//   [alm_self_recognition] ALL 5/5 PASS
+
+// ─── Constants ──────────────────────────────────────────────
+
+let SELF_THRESHOLD   = 0.7     // cosine similarity gate
+let SELF_NOISE_SCALE = 0.15    // noise amplitude for synthetic self vectors
+let TARGET_ACC       = 0.9     // roadmap gate
+
+// ─── Primitives (self-contained, no external deps) ──────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sqrt_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return sqrt(x)
+}
+
+// Deterministic LCG -> floats in [-1, 1).
+fn det_rand_wide(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+// Small-amplitude variant for noise.
+fn det_rand_small(n: int, seed: int, scale: float) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push((u * 2.0 - 1.0) * scale)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Vector ops ─────────────────────────────────────────────
+
+fn vec_dot(a: array, b: array, d: int) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < d {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn vec_norm(v: array, d: int) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < d {
+        s = s + v[i] * v[i]
+        i = i + 1
+    }
+    return sqrt_safe(s)
+}
+
+fn vec_add(a: array, b: array, d: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        out = out.push(a[i] + b[i])
+        i = i + 1
+    }
+    return out
+}
+
+// Normalize vector to unit length. Returns zero vector if norm < eps.
+fn vec_normalize(v: array, d: int) -> array {
+    let n = vec_norm(v, d)
+    let mut out = []
+    if n < 0.0000001 {
+        let mut i = 0
+        while i < d {
+            out = out.push(0.0)
+            i = i + 1
+        }
+        return out
+    }
+    let inv = 1.0 / n
+    let mut i = 0
+    while i < d {
+        out = out.push(v[i] * inv)
+        i = i + 1
+    }
+    return out
+}
+
+// Cosine similarity in [-1, 1]. Returns 0 for zero-norm vectors.
+fn cosine_sim(a: array, b: array, d: int) -> float {
+    let dot = vec_dot(a, b, d)
+    let na = vec_norm(a, d)
+    let nb = vec_norm(b, d)
+    let denom = na * nb
+    if denom < 0.0000001 { return 0.0 }
+    return dot / denom
+}
+
+// ─── Self-model ─────────────────────────────────────────────
+// The self-model is a unit-normalized prototype vector of dimension d.
+// In production this is learned via EMA of introspection hidden states.
+// Here we build it deterministically from a seed.
+
+fn build_self_model(d: int, seed: int) -> array {
+    let raw = det_rand_wide(d, seed)
+    return vec_normalize(raw, d)
+}
+
+// ─── Core classifier ────────────────────────────────────────
+//
+// classify_self: given input_vec and self_model, compute cosine
+// similarity. If sim > SELF_THRESHOLD -> self (true), else other (false).
+// Returns result as array [is_self_float, confidence] to sidestep
+// hexa multi-return struct bugs.
+//   result[0] = 1.0 if self, 0.0 if other
+//   result[1] = confidence (clamped cosine sim in [0, 1])
+
+fn classify_self(input_vec: array, self_model: array, d: int) -> array {
+    let sim = cosine_sim(input_vec, self_model, d)
+    // Confidence: clamp sim to [0, 1].
+    let mut conf = sim
+    if conf < 0.0 { conf = 0.0 }
+    if conf > 1.0 { conf = 1.0 }
+    let mut result = []
+    if sim > SELF_THRESHOLD {
+        result = result.push(1.0)
+    } else {
+        result = result.push(0.0)
+    }
+    result = result.push(conf)
+    return result
+}
+
+// ─── Synthetic data ─────────────────────────────────────────
+//
+// Self vectors: self_model + small noise, then normalize.
+//   → high cosine similarity to prototype.
+// Other vectors: random vectors (uncorrelated with prototype).
+//   → cosine sim ~ 0 in moderate dim (d >= 16).
+
+fn make_self_vec(self_model: array, d: int, seed: int) -> array {
+    let noise = det_rand_small(d, seed, SELF_NOISE_SCALE)
+    let noisy = vec_add(self_model, noise, d)
+    return vec_normalize(noisy, d)
+}
+
+fn make_other_vec(d: int, seed: int) -> array {
+    let raw = det_rand_wide(d, seed)
+    return vec_normalize(raw, d)
+}
+
+// Build balanced dataset: n_each self + n_each other.
+// Returns flat array: [n_each self vecs || n_each other vecs || labels]
+//   Total length = 2 * n_each * d + 2 * n_each
+//   Labels: 1.0 for self, 0.0 for other.
+fn build_dataset(self_model: array, d: int, n_each: int, seed_offset: int) -> array {
+    let mut vecs = []
+    let mut labels = []
+    // Self vectors.
+    let mut i = 0
+    while i < n_each {
+        let sv = make_self_vec(self_model, d, seed_offset + i * 13 + 1)
+        let mut j = 0
+        while j < d {
+            vecs = vecs.push(sv[j])
+            j = j + 1
+        }
+        labels = labels.push(1.0)
+        i = i + 1
+    }
+    // Other vectors.
+    let mut i2 = 0
+    while i2 < n_each {
+        let ov = make_other_vec(d, seed_offset + i2 * 17 + 5000)
+        let mut j = 0
+        while j < d {
+            vecs = vecs.push(ov[j])
+            j = j + 1
+        }
+        labels = labels.push(0.0)
+        i2 = i2 + 1
+    }
+    // Concat: [vecs || labels].
+    let mut out = []
+    let mut p = 0
+    while p < len(vecs) {
+        out = out.push(vecs[p])
+        p = p + 1
+    }
+    let mut q = 0
+    while q < len(labels) {
+        out = out.push(labels[q])
+        q = q + 1
+    }
+    return out
+}
+
+// Extract i-th vector from flat dataset.
+fn ds_get_vec(ds: array, i: int, d: int) -> array {
+    let base = i * d
+    let mut out = []
+    let mut j = 0
+    while j < d {
+        out = out.push(ds[base + j])
+        j = j + 1
+    }
+    return out
+}
+
+// Extract labels from dataset. Labels start at offset 2 * n_each * d.
+fn ds_get_labels(ds: array, n_each: int, d: int) -> array {
+    let offset = 2 * n_each * d
+    let n_total = 2 * n_each
+    let mut out = []
+    let mut i = 0
+    while i < n_total {
+        out = out.push(ds[offset + i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Accuracy evaluation ────────────────────────────────────
+// Classify all samples and compare to labels.
+
+fn eval_accuracy(ds: array, self_model: array, d: int, n_each: int) -> float {
+    let n_total = 2 * n_each
+    let labels = ds_get_labels(ds, n_each, d)
+    let mut correct = 0
+    let mut i = 0
+    while i < n_total {
+        let v = ds_get_vec(ds, i, d)
+        let result = classify_self(v, self_model, d)
+        let pred = result[0]
+        if fabs(pred - labels[i]) < 0.001 { correct = correct + 1 }
+        i = i + 1
+    }
+    return to_float(correct) / to_float(n_total)
+}
+
+// ─── Self-tests ─────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Self vector must be classified as self with confidence > 0.9.
+    let d = 32
+    let self_model = build_self_model(d, 42)
+    let sv = make_self_vec(self_model, d, 100)
+    let result = classify_self(sv, self_model, d)
+    let is_self = result[0]
+    let conf = result[1]
+    println("  [T1] self vec: is_self=" + str(is_self) + " confidence=" + str(conf))
+    if is_self < 0.5 {
+        println("  [T1] FAIL — self vector classified as other")
+        return false
+    }
+    if conf <= 0.9 {
+        println("  [T1] FAIL — confidence " + str(conf) + " <= 0.9")
+        return false
+    }
+    return true
+}
+
+fn check_T2() -> bool {
+    // Other vector must be classified as other.
+    let d = 32
+    let self_model = build_self_model(d, 42)
+    let ov = make_other_vec(d, 7777)
+    let result = classify_self(ov, self_model, d)
+    let is_self = result[0]
+    let conf = result[1]
+    let sim = cosine_sim(ov, self_model, d)
+    println("  [T2] other vec: is_self=" + str(is_self) + " confidence=" + str(conf) + " raw_sim=" + str(sim))
+    if is_self > 0.5 {
+        println("  [T2] FAIL — other vector classified as self (sim=" + str(sim) + ")")
+        return false
+    }
+    return true
+}
+
+fn check_T3() -> bool {
+    // Accuracy > 0.9 on 40 balanced samples (20 self + 20 other). Gate.
+    let d = 32
+    let n_each = 20
+    let n_total = 2 * n_each
+    let self_model = build_self_model(d, 42)
+    let ds = build_dataset(self_model, d, n_each, 3000)
+    let acc = eval_accuracy(ds, self_model, d, n_each)
+    println("  [T3] accuracy on " + str(n_total) + " balanced samples = " + str(acc) + " (target > " + str(TARGET_ACC) + ")")
+    if acc < TARGET_ACC {
+        println("  [T3] FAIL — accuracy " + str(acc) + " < " + str(TARGET_ACC))
+        return false
+    }
+    return true
+}
+
+fn check_T4() -> bool {
+    // Determinism: same inputs produce byte-identical results.
+    let d = 32
+    let self_model = build_self_model(d, 42)
+    let sv = make_self_vec(self_model, d, 200)
+    let ov = make_other_vec(d, 201)
+    // First run.
+    let r1_self = classify_self(sv, self_model, d)
+    let r1_other = classify_self(ov, self_model, d)
+    // Second run — same inputs.
+    let r2_self = classify_self(sv, self_model, d)
+    let r2_other = classify_self(ov, self_model, d)
+    // Compare.
+    if fabs(r1_self[0] - r2_self[0]) > 0.0 {
+        println("  [T4] FAIL — self classification differs")
+        return false
+    }
+    if fabs(r1_self[1] - r2_self[1]) > 0.0 {
+        println("  [T4] FAIL — self confidence differs")
+        return false
+    }
+    if fabs(r1_other[0] - r2_other[0]) > 0.0 {
+        println("  [T4] FAIL — other classification differs")
+        return false
+    }
+    if fabs(r1_other[1] - r2_other[1]) > 0.0 {
+        println("  [T4] FAIL — other confidence differs")
+        return false
+    }
+    println("  [T4] byte-identical across 2 runs (self + other)")
+    return true
+}
+
+fn check_T5() -> bool {
+    // Latency: 40 classifications (d=32) warm-cache < 1000 ms.
+    let d = 32
+    let n_each = 20
+    let n_total = 2 * n_each
+    let self_model = build_self_model(d, 42)
+    let ds = build_dataset(self_model, d, n_each, 9000)
+    // Warm run.
+    let warm_v = ds_get_vec(ds, 0, d)
+    let _warm = classify_self(warm_v, self_model, d)
+    // Timed run.
+    let t0 = clock()
+    let mut i = 0
+    while i < n_total {
+        let v = ds_get_vec(ds, i, d)
+        let _r = classify_self(v, self_model, d)
+        i = i + 1
+    }
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] " + str(n_total) + " classifications (d=" + str(d) + ") latency = " + str(ms) + " ms (target < 1000)")
+    return ms < 1000.0
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[alm_self_recognition] ALM-P17-1 self-test")
+    println("  self-image recognition head (self vs other classifier)")
+    println("  d=32, SELF_THRESHOLD=" + str(SELF_THRESHOLD) + ", TARGET_ACC=" + str(TARGET_ACC))
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[alm_self_recognition] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[alm_self_recognition] ALL 5/5 PASS")
+    } else {
+        println("[alm_self_recognition] SOME FAILED")
+    }
+}
+
+main()

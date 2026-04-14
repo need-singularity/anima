@@ -1,0 +1,361 @@
+// gossip_protocol.hexa — CLM-P18-2 "hexa gossip protocol — N=8 수렴"
+//
+// Eight nodes each hold a scalar value. Every round, a randomly chosen
+// pair exchanges their values by averaging. After enough rounds all
+// eight values converge to the global mean — a fundamental property of
+// gossip-based averaging protocols (Boyd et al. 2006, Dimakis et al. 2010).
+//
+// The protocol uses a deterministic Linear Congruential Generator (LCG)
+// for pair selection so that every run is reproducible.
+//
+// Convergence measure: "spread" = max(values) - min(values).
+// When spread -> 0, all nodes agree.
+//
+// ─── Math ────────────────────────────────────────────────────────
+//
+// At each round, two nodes i,j replace their values with:
+//   v_i' = v_j' = (v_i + v_j) / 2
+//
+// Global mean is invariant under pairwise averaging:
+//   sum(v') = sum(v)  for all rounds.
+//
+// The spread contracts because the maximum can only decrease and the
+// minimum can only increase after any averaging step.
+//
+// ─── LCG ─────────────────────────────────────────────────────────
+//
+// Deterministic pseudo-random pair selection:
+//   state_{n+1} = (a * state_n + c) mod m
+//   a = 1103515245,  c = 12345,  m = 2^31 = 2147483648
+//   (Numerical Recipes LCG constants)
+//
+// ─── Self-tests (T1-T5) ─────────────────────────────────────────
+//
+// T1 (initial spread):   spread of 8 initial values > 5.0
+// T2 (convergence):      after 50 rounds, spread < 0.1
+// T3 (conservation):     mean preserved across all rounds (|mean_before - mean_after| < 1e-6)
+// T4 (determinism):      two runs with same seed produce identical final values
+// T5 (latency):          50 rounds < 500 ms
+//
+// Ref:
+//   anima-engines/emotion_contagion.hexa   (CLM-P12-2 pairwise sync)
+//   shared/roadmaps/anima.json             (CLM-P18-2 entry)
+
+// ─── Constants ───────────────────────────────────────────────────
+
+let GP_N       = 8         // number of gossip nodes
+let GP_ROUNDS  = 50        // rounds for convergence test
+let GP_SEED    = 42        // LCG initial seed
+let GP_LCG_A   = 1103515245
+let GP_LCG_C   = 12345
+let GP_LCG_M   = 2147483648  // 2^31
+
+// Initial node values — spread deliberately > 5.0
+// nodes: [1.0, 8.0, 3.0, 7.0, 2.0, 9.0, 4.0, 6.0]
+// min=1.0, max=9.0, spread=8.0, mean=5.0
+let INIT_V0 = 1.0
+let INIT_V1 = 8.0
+let INIT_V2 = 3.0
+let INIT_V3 = 7.0
+let INIT_V4 = 2.0
+let INIT_V5 = 9.0
+let INIT_V6 = 4.0
+let INIT_V7 = 6.0
+
+// ─── Primitives ──────────────────────────────────────────────────
+
+fn fabs_gp(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// ─── LCG ─────────────────────────────────────────────────────────
+// Returns next LCG state. Caller must store it.
+// state_{n+1} = (a * state_n + c) mod m
+
+fn lcg_next(state: int) -> int {
+    let raw = GP_LCG_A * state + GP_LCG_C
+    // mod for positive result: raw mod m
+    let result = raw % GP_LCG_M
+    if result < 0 { return result + GP_LCG_M }
+    return result
+}
+
+// Map an LCG state to an index in [0, bound).
+fn lcg_index(state: int, bound: int) -> int {
+    // Use absolute value of state to avoid negative mod
+    let mut s = state
+    if s < 0 { s = 0 - s }
+    return s % bound
+}
+
+// ─── Node array helpers ──────────────────────────────────────────
+// 8 values stored as a flat array. stage0: `array` type, pass-by-value.
+
+fn make_nodes() -> array {
+    let mut v = []
+    v = v.push(INIT_V0)
+    v = v.push(INIT_V1)
+    v = v.push(INIT_V2)
+    v = v.push(INIT_V3)
+    v = v.push(INIT_V4)
+    v = v.push(INIT_V5)
+    v = v.push(INIT_V6)
+    v = v.push(INIT_V7)
+    return v
+}
+
+fn arr_min(a: array, n: int) -> float {
+    let mut m = a[0]
+    let mut i = 1
+    while i < n {
+        if a[i] < m { m = a[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn arr_max(a: array, n: int) -> float {
+    let mut m = a[0]
+    let mut i = 1
+    while i < n {
+        if a[i] > m { m = a[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn arr_sum(a: array, n: int) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + a[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn spread(a: array, n: int) -> float {
+    return arr_max(a, n) - arr_min(a, n)
+}
+
+fn mean(a: array, n: int) -> float {
+    return arr_sum(a, n) / to_float(n)
+}
+
+// Copy array (pass-by-value ensures this, but explicit for clarity).
+fn copy_nodes(src: array, n: int) -> array {
+    let mut dst = []
+    let mut i = 0
+    while i < n {
+        dst = dst.push(src[i])
+        i = i + 1
+    }
+    return dst
+}
+
+// Set value at index — returns new array (pass-by-value, no mutation).
+fn arr_set(a: array, idx: int, val: float) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < GP_N {
+        if i == idx {
+            out = out.push(val)
+        } else {
+            out = out.push(a[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Gossip round ────────────────────────────────────────────────
+//
+// One round: pick a random pair (i, j) where i != j using LCG,
+// replace both values with their average.
+// Returns flat array: [node0..node7, lcg_state] (9 elements).
+// The caller unpacks the LCG state from index 8.
+
+fn gossip_round(nodes: array, lcg_state: int) -> array {
+    // Pick first node index
+    let s1 = lcg_next(lcg_state)
+    let i = lcg_index(s1, GP_N)
+
+    // Pick second node index, ensuring j != i
+    let mut s2 = lcg_next(s1)
+    let mut j = lcg_index(s2, GP_N)
+    // If j == i, advance LCG until j != i
+    while j == i {
+        s2 = lcg_next(s2)
+        j = lcg_index(s2, GP_N)
+    }
+
+    // Average the pair
+    let avg = (nodes[i] + nodes[j]) / 2.0
+
+    // Build new nodes array with averaged values
+    let mut updated = arr_set(nodes, i, avg)
+    updated = arr_set(updated, j, avg)
+
+    // Pack result: 8 node values + lcg_state
+    let mut out = []
+    let mut k = 0
+    while k < GP_N {
+        out = out.push(updated[k])
+        k = k + 1
+    }
+    out = out.push(to_float(s2))
+    return out
+}
+
+// Extract nodes from packed result (first 8 elements).
+fn unpack_nodes(packed: array) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < GP_N {
+        out = out.push(packed[i])
+        i = i + 1
+    }
+    return out
+}
+
+// Extract LCG state from packed result (element at index 8).
+fn unpack_lcg(packed: array) -> int {
+    return to_int(packed[GP_N])
+}
+
+// ─── Run N rounds ────────────────────────────────────────────────
+
+fn run_gossip(init_nodes: array, seed: int, rounds: int) -> array {
+    let mut nodes = copy_nodes(init_nodes, GP_N)
+    let mut lcg = seed
+    let mut r = 0
+    while r < rounds {
+        let packed = gossip_round(nodes, lcg)
+        nodes = unpack_nodes(packed)
+        lcg = unpack_lcg(packed)
+        r = r + 1
+    }
+    // Return final nodes (just the 8 values)
+    return nodes
+}
+
+// ─── Print helpers ───────────────────────────────────────────────
+
+fn print_nodes(label: string, a: array) {
+    let mut s = "  " + label + " ["
+    let mut i = 0
+    while i < GP_N {
+        if i > 0 { s = s + ", " }
+        s = s + str(a[i])
+        i = i + 1
+    }
+    s = s + "]"
+    println(s)
+}
+
+// ─── Self-tests ──────────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // T1: initial spread > 5.0
+    let nodes = make_nodes()
+    let sp = spread(nodes, GP_N)
+    println("  [T1] initial spread = " + str(sp))
+    if sp > 5.0 { return true }
+    return false
+}
+
+fn check_T2() -> bool {
+    // T2: after 50 rounds, spread < 0.1 (converged)
+    let nodes = make_nodes()
+    let final_nodes = run_gossip(nodes, GP_SEED, GP_ROUNDS)
+    let sp = spread(final_nodes, GP_N)
+    println("  [T2] spread after " + str(GP_ROUNDS) + " rounds = " + str(sp))
+    print_nodes("final", final_nodes)
+    if sp < 0.1 { return true }
+    return false
+}
+
+fn check_T3() -> bool {
+    // T3: mean preserved (conservation law)
+    let nodes = make_nodes()
+    let mean_before = mean(nodes, GP_N)
+    let final_nodes = run_gossip(nodes, GP_SEED, GP_ROUNDS)
+    let mean_after = mean(final_nodes, GP_N)
+    let diff = fabs_gp(mean_before - mean_after)
+    println("  [T3] mean before=" + str(mean_before) + "  after=" + str(mean_after) + "  diff=" + str(diff))
+    if diff < 0.000001 { return true }
+    return false
+}
+
+fn check_T4() -> bool {
+    // T4: determinism — same seed => identical results
+    let nodes = make_nodes()
+    let r1 = run_gossip(nodes, GP_SEED, GP_ROUNDS)
+    let r2 = run_gossip(nodes, GP_SEED, GP_ROUNDS)
+    let mut i = 0
+    let mut ok = true
+    while i < GP_N {
+        if fabs_gp(r1[i] - r2[i]) > 0.0 { ok = false }
+        i = i + 1
+    }
+    if ok { println("  [T4] two runs byte-identical") }
+    if ok { return true }
+    println("  [T4] MISMATCH")
+    return false
+}
+
+fn check_T5() -> bool {
+    // T5: latency — 50 rounds < 500 ms
+    let nodes = make_nodes()
+    let t0 = clock()
+    let _r = run_gossip(nodes, GP_SEED, GP_ROUNDS)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] " + str(GP_ROUNDS) + " rounds = " + str(ms) + " ms")
+    if ms < 500.0 { return true }
+    return false
+}
+
+// ─── main ────────────────────────────────────────────────────────
+
+fn main() {
+    println("[gossip_protocol] CLM-P18-2 — hexa gossip protocol (N=8 수렴) self-test")
+    println("  nodes=" + str(GP_N) + "  rounds=" + str(GP_ROUNDS) + "  seed=" + str(GP_SEED))
+
+    let nodes = make_nodes()
+    print_nodes("init", nodes)
+    println("  mean=" + str(mean(nodes, GP_N)) + "  spread=" + str(spread(nodes, GP_N)))
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  initial spread > 5.0") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  converged after " + str(GP_ROUNDS) + " rounds (spread < 0.1)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  mean preserved (conservation)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  determinism") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  latency < 500 ms") } else { println("T5 FAIL") }
+
+    let mut pass_count = 0
+    if t1 { pass_count = pass_count + 1 }
+    if t2 { pass_count = pass_count + 1 }
+    if t3 { pass_count = pass_count + 1 }
+    if t4 { pass_count = pass_count + 1 }
+    if t5 { pass_count = pass_count + 1 }
+
+    println("")
+    if pass_count == 5 {
+        println("[gossip_protocol] ALL 5/5 PASS  -- N=8 gossip 수렴 verified")
+    } else {
+        println("[gossip_protocol] " + str(pass_count) + "/5 PASS")
+    }
+}
+
+main()

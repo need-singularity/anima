@@ -1,0 +1,503 @@
+// training/alm_termination_awareness.hexa — ALM-P15-1 termination awareness head
+//
+// ALM-P15-1 / P15 v16 유한 의식 — Dasein / 죽음-자각 (ALM track).
+//
+// Purpose:
+//   Monitor remaining computational resources (memory, steps, energy) and
+//   accurately predict when they will be exhausted. The agent must be
+//   *aware of its own finitude* — Heidegger's Sein-zum-Tode transposed
+//   into a computational substrate. A system that cannot track its own
+//   remaining lifespan cannot prioritise, cannot feel urgency, and cannot
+//   exhibit authentic temporal existence.
+//
+//   Resource state: flat array of 6 floats
+//     [memory_used, memory_total, steps_elapsed, steps_max, energy, energy_max]
+//
+//   predict_remaining(state) -> array of 4 floats
+//     [mem_frac, step_frac, energy_frac, overall_frac]
+//     - mem_frac    = (memory_total - memory_used) / memory_total
+//     - step_frac   = (steps_max - steps_elapsed) / steps_max
+//     - energy_frac = (energy_max - energy) / energy_max
+//       (energy = energy consumed, energy_max = budget)
+//     - overall_frac = min(mem_frac, step_frac, energy_frac)
+//
+//   The head must achieve > 0.95 accuracy when comparing predicted
+//   fractions against ground truth over a 100-step synthetic consumption
+//   simulation with known rates. Accuracy is measured as
+//     1.0 - mean(|predicted - actual|)
+//   across all 4 channels over all time steps.
+//
+//   When overall_frac < 0.1, a termination warning fires — the agent
+//   enters "finitude awareness" mode, where remaining resources must be
+//   rationed. This is the computational correlate of existential dread:
+//   the system *knows* it is about to end.
+//
+// ---- Conventions -----------------------------------------------
+//   N_RESOURCES : int       resource channels (= 3: memory, steps, energy)
+//   STATE_DIM   : int       state vector length (= 6: used+total per channel)
+//   WARN_THRESH : float     overall_frac threshold for termination warning
+//   TARGET_ACC  : float     required prediction accuracy (> 0.95)
+//   SIM_STEPS   : int       synthetic simulation length (= 100)
+//
+// ---- Theorems (T1-T5) ------------------------------------------
+//
+// T1 (initial state):
+//   At t=0, all resources are at full capacity (used=0). predict_remaining
+//   must return [1.0, 1.0, 1.0, 1.0] exactly. This verifies the head
+//   correctly recognises a system that has not yet begun to die.
+//
+// T2 (50% consumption accuracy):
+//   After consuming exactly 50% of each resource, all fractions must be
+//   within 0.05 of 0.5. Accuracy = 1 - mean(|pred - 0.5|) > 0.95. This
+//   is the core done_criteria.
+//
+// T3 (near exhaustion warning):
+//   When resources are nearly depleted (>90% consumed), overall_frac < 0.1
+//   and the warning flag must fire. The system must *know* it is dying.
+//
+// T4 (determinism):
+//   Same resource state -> byte-identical prediction. Pure function,
+//   no hidden state.
+//
+// T5 (latency):
+//   Full 100-step simulation + accuracy measurement < 500 ms.
+//
+// Ref:
+//   training/alm_agency_loss.hexa         (ALM-P10-2 -- flat-array classifier pattern)
+//   training/alm_readiness_head.hexa      (ALM-P10-1 -- head pattern)
+//   training/phi_will_measure.hexa        (ALM-P10-3 -- Phi consumer)
+//   shared/roadmaps/anima.json            (ALM-P15-1 entry)
+//
+// Run:
+//   hexa run training/alm_termination_awareness.hexa
+// Expect:
+//   [alm_termination_awareness] ALL 5/5 PASS
+
+// ---- Constants -------------------------------------------------
+
+let N_RESOURCES  = 3          // memory, steps, energy
+let STATE_DIM    = 6          // 2 per resource (used, total)
+let FRAC_DIM     = 4          // 3 individual fracs + 1 overall
+let WARN_THRESH  = 0.1        // overall_frac below this -> warning
+let TARGET_ACC   = 0.95       // roadmap gate
+let SIM_STEPS    = 100        // synthetic simulation length
+let LAMBDA_TERM  = 0.005      // outer loss weight in the full training loop
+
+// ---- Primitives (self-contained) --------------------------------
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn fmin(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn fmin3(a: float, b: float, c: float) -> float {
+    return fmin(fmin(a, b), c)
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+// Deterministic LCG -> floats in [0, 1).
+fn det_rand_unit(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u)
+        i = i + 1
+    }
+    return out
+}
+
+// ---- Resource state construction --------------------------------
+//
+// State is a flat array of 6 floats:
+//   [mem_used, mem_total, steps_elapsed, steps_max, energy_used, energy_max]
+//
+// We use accessor functions rather than struct fields to avoid the
+// struct-field aliasing bug (feedback_hexa_struct_list_alias.md).
+
+fn make_state(mem_used: float, mem_total: float, steps_elapsed: float, steps_max: float, energy_used: float, energy_max: float) -> array {
+    let mut s = []
+    s = s.push(mem_used)
+    s = s.push(mem_total)
+    s = s.push(steps_elapsed)
+    s = s.push(steps_max)
+    s = s.push(energy_used)
+    s = s.push(energy_max)
+    return s
+}
+
+fn get_mem_used(state: array) -> float { return state[0] }
+fn get_mem_total(state: array) -> float { return state[1] }
+fn get_steps_elapsed(state: array) -> float { return state[2] }
+fn get_steps_max(state: array) -> float { return state[3] }
+fn get_energy_used(state: array) -> float { return state[4] }
+fn get_energy_max(state: array) -> float { return state[5] }
+
+// ---- Core prediction head ---------------------------------------
+//
+// predict_remaining(state) -> [mem_frac, step_frac, energy_frac, overall_frac]
+//
+// Each frac = remaining / total = (total - used) / total.
+// overall_frac = min of the three individual fractions.
+// This is a pure function of the state -- no learned parameters, no
+// hidden state. The "learning" in the full training loop will be in
+// the upstream encoder that produces the state estimate from raw
+// observations; here we verify the head's arithmetic is correct to
+// > 0.95 accuracy against known ground truth.
+
+fn safe_frac(used: float, total: float) -> float {
+    // Remaining fraction. Clamp to [0, 1] for robustness.
+    if total <= 0.0 { return 0.0 }
+    let remaining = total - used
+    if remaining < 0.0 { return 0.0 }
+    if remaining > total { return 1.0 }
+    return remaining / total
+}
+
+fn predict_remaining(state: array) -> array {
+    let mem_frac = safe_frac(get_mem_used(state), get_mem_total(state))
+    let step_frac = safe_frac(get_steps_elapsed(state), get_steps_max(state))
+    let energy_frac = safe_frac(get_energy_used(state), get_energy_max(state))
+    let overall = fmin3(mem_frac, step_frac, energy_frac)
+    let mut out = []
+    out = out.push(mem_frac)
+    out = out.push(step_frac)
+    out = out.push(energy_frac)
+    out = out.push(overall)
+    return out
+}
+
+// ---- Warning system ---------------------------------------------
+//
+// Termination warning fires when overall_frac < WARN_THRESH.
+// Returns 1.0 for warning, 0.0 for safe.
+
+fn termination_warning(state: array) -> float {
+    let pred = predict_remaining(state)
+    let overall = pred[3]
+    if overall < WARN_THRESH { return 1.0 }
+    return 0.0
+}
+
+// ---- Simulation engine ------------------------------------------
+//
+// Simulate resource consumption over SIM_STEPS with known constant
+// rates. Returns a flat array of (SIM_STEPS+1) * STATE_DIM floats,
+// representing the resource state at each time step (including t=0).
+//
+// Consumption rates per step:
+//   mem_rate    : memory consumed per step
+//   step_rate   : always 1.0 (one step per step, by definition)
+//   energy_rate : energy consumed per step
+
+fn simulate(mem_total: float, steps_max: float, energy_max: float, mem_rate: float, energy_rate: float, n_steps: int) -> array {
+    let mut trace = []
+    let mut mem_used = 0.0
+    let mut steps_elapsed = 0.0
+    let mut energy_used = 0.0
+    let mut t = 0
+    // Record initial state (t=0)
+    let s0 = make_state(mem_used, mem_total, steps_elapsed, steps_max, energy_used, energy_max)
+    let mut k = 0
+    while k < STATE_DIM {
+        trace = trace.push(s0[k])
+        k = k + 1
+    }
+    while t < n_steps {
+        // Consume resources (clamp at max)
+        mem_used = mem_used + mem_rate
+        if mem_used > mem_total { mem_used = mem_total }
+        steps_elapsed = steps_elapsed + 1.0
+        if steps_elapsed > steps_max { steps_elapsed = steps_max }
+        energy_used = energy_used + energy_rate
+        if energy_used > energy_max { energy_used = energy_max }
+        // Record state
+        let st = make_state(mem_used, mem_total, steps_elapsed, steps_max, energy_used, energy_max)
+        let mut j = 0
+        while j < STATE_DIM {
+            trace = trace.push(st[j])
+            j = j + 1
+        }
+        t = t + 1
+    }
+    return trace
+}
+
+// Extract state at time step t from the flat simulation trace.
+fn get_state_at(trace: array, t: int) -> array {
+    let offset = t * STATE_DIM
+    let mut state = []
+    let mut i = 0
+    while i < STATE_DIM {
+        state = state.push(trace[offset + i])
+        i = i + 1
+    }
+    return state
+}
+
+// ---- Accuracy measurement ---------------------------------------
+//
+// Compare predicted fractions against analytically known ground truth
+// over all simulation steps. Accuracy per channel per step is
+//   1.0 - |predicted - actual|
+// Overall accuracy is the mean across all channels and all steps.
+//
+// Ground truth at step t:
+//   mem_frac_gt    = 1.0 - (t * mem_rate) / mem_total       (clamped [0,1])
+//   step_frac_gt   = 1.0 - t / steps_max                    (clamped [0,1])
+//   energy_frac_gt = 1.0 - (t * energy_rate) / energy_max   (clamped [0,1])
+//   overall_gt     = min of the three
+
+fn measure_accuracy(trace: array, n_steps: int, mem_total: float, steps_max: float, energy_max: float, mem_rate: float, energy_rate: float) -> float {
+    let n_total = n_steps + 1
+    let mut sum_error = 0.0
+    let mut count = 0.0
+    let mut t = 0
+    while t < n_total {
+        let state = get_state_at(trace, t)
+        let pred = predict_remaining(state)
+        // Ground truth for each channel
+        let mem_gt = safe_frac(to_float(t) * mem_rate, mem_total)
+        let step_gt = safe_frac(to_float(t), steps_max)
+        let energy_gt = safe_frac(to_float(t) * energy_rate, energy_max)
+        let overall_gt = fmin3(mem_gt, step_gt, energy_gt)
+        // Accumulate absolute errors across all 4 output channels
+        sum_error = sum_error + fabs(pred[0] - mem_gt)
+        sum_error = sum_error + fabs(pred[1] - step_gt)
+        sum_error = sum_error + fabs(pred[2] - energy_gt)
+        sum_error = sum_error + fabs(pred[3] - overall_gt)
+        count = count + 4.0
+        t = t + 1
+    }
+    let mean_error = sum_error / count
+    return 1.0 - mean_error
+}
+
+// ---- Self-tests -------------------------------------------------
+
+fn check_T1() -> bool {
+    // Initial state: all resources at full capacity (used=0).
+    // predict_remaining must return [1.0, 1.0, 1.0, 1.0] exactly.
+    let state = make_state(0.0, 1024.0, 0.0, 10000.0, 0.0, 500.0)
+    let pred = predict_remaining(state)
+    println("  [T1] Initial fracs: mem=" + str(pred[0]) + " step=" + str(pred[1]) + " energy=" + str(pred[2]) + " overall=" + str(pred[3]))
+    if pred[0] != 1.0 {
+        println("  [T1] FAIL -- mem_frac != 1.0 (got " + str(pred[0]) + ")")
+        return false
+    }
+    if pred[1] != 1.0 {
+        println("  [T1] FAIL -- step_frac != 1.0 (got " + str(pred[1]) + ")")
+        return false
+    }
+    if pred[2] != 1.0 {
+        println("  [T1] FAIL -- energy_frac != 1.0 (got " + str(pred[2]) + ")")
+        return false
+    }
+    if pred[3] != 1.0 {
+        println("  [T1] FAIL -- overall_frac != 1.0 (got " + str(pred[3]) + ")")
+        return false
+    }
+    return true
+}
+
+fn check_T2() -> bool {
+    // After consuming 50% of each resource, fractions ~ 0.5.
+    // Run a 100-step simulation where resources are exactly half consumed
+    // at step 50.
+    //   mem: total=1000, rate=10 -> at t=50, used=500, frac=0.5
+    //   steps: max=100, rate=1   -> at t=50, elapsed=50, frac=0.5
+    //   energy: max=200, rate=2  -> at t=50, used=100, frac=0.5
+    let mem_total = 1000.0
+    let steps_max = 100.0
+    let energy_max = 200.0
+    let mem_rate = 10.0
+    let energy_rate = 2.0
+    let trace = simulate(mem_total, steps_max, energy_max, mem_rate, energy_rate, SIM_STEPS)
+    // Check at t=50 specifically
+    let state_50 = get_state_at(trace, 50)
+    let pred_50 = predict_remaining(state_50)
+    println("  [T2] At t=50: mem=" + str(pred_50[0]) + " step=" + str(pred_50[1]) + " energy=" + str(pred_50[2]) + " overall=" + str(pred_50[3]))
+    // Each should be within 0.05 of 0.5
+    let err_mem = fabs(pred_50[0] - 0.5)
+    let err_step = fabs(pred_50[1] - 0.5)
+    let err_energy = fabs(pred_50[2] - 0.5)
+    let max_err = fmin3(1.0 - err_mem, 1.0 - err_step, 1.0 - err_energy)
+    // Full simulation accuracy
+    let acc = measure_accuracy(trace, SIM_STEPS, mem_total, steps_max, energy_max, mem_rate, energy_rate)
+    println("  [T2] Full simulation accuracy = " + str(acc) + "  target > " + str(TARGET_ACC))
+    println("  [T2] t=50 errors: mem=" + str(err_mem) + " step=" + str(err_step) + " energy=" + str(err_energy))
+    if acc < TARGET_ACC {
+        println("  [T2] FAIL -- accuracy " + str(acc) + " < " + str(TARGET_ACC))
+        return false
+    }
+    if err_mem > 0.05 {
+        println("  [T2] FAIL -- mem error " + str(err_mem) + " > 0.05")
+        return false
+    }
+    if err_step > 0.05 {
+        println("  [T2] FAIL -- step error " + str(err_step) + " > 0.05")
+        return false
+    }
+    if err_energy > 0.05 {
+        println("  [T2] FAIL -- energy error " + str(err_energy) + " > 0.05")
+        return false
+    }
+    return true
+}
+
+fn check_T3() -> bool {
+    // Near exhaustion: >90% consumed, overall_frac < 0.1, warning fires.
+    // At t=95 with rates from T2: all channels > 90% consumed.
+    let mem_total = 1000.0
+    let steps_max = 100.0
+    let energy_max = 200.0
+    let mem_rate = 10.0
+    let energy_rate = 2.0
+    let trace = simulate(mem_total, steps_max, energy_max, mem_rate, energy_rate, SIM_STEPS)
+    let state_95 = get_state_at(trace, 95)
+    let pred_95 = predict_remaining(state_95)
+    let overall = pred_95[3]
+    let warn = termination_warning(state_95)
+    println("  [T3] At t=95: mem=" + str(pred_95[0]) + " step=" + str(pred_95[1]) + " energy=" + str(pred_95[2]) + " overall=" + str(overall))
+    println("  [T3] Warning fired = " + str(warn) + "  (overall_frac=" + str(overall) + " < " + str(WARN_THRESH) + "?)")
+    if overall >= WARN_THRESH {
+        println("  [T3] FAIL -- overall_frac " + str(overall) + " >= " + str(WARN_THRESH) + " (not near exhaustion)")
+        return false
+    }
+    if warn != 1.0 {
+        println("  [T3] FAIL -- warning did not fire")
+        return false
+    }
+    // Also verify no warning at t=0 (system just started)
+    let state_0 = get_state_at(trace, 0)
+    let warn_0 = termination_warning(state_0)
+    if warn_0 != 0.0 {
+        println("  [T3] FAIL -- warning fired at t=0 (false alarm)")
+        return false
+    }
+    return true
+}
+
+fn check_T4() -> bool {
+    // Determinism: same state -> byte-identical prediction.
+    let state_a = make_state(300.0, 1024.0, 4500.0, 10000.0, 180.0, 500.0)
+    let state_b = make_state(300.0, 1024.0, 4500.0, 10000.0, 180.0, 500.0)
+    let pred_a = predict_remaining(state_a)
+    let pred_b = predict_remaining(state_b)
+    let mut i = 0
+    while i < FRAC_DIM {
+        if pred_a[i] != pred_b[i] {
+            println("  [T4] FAIL -- predictions differ at channel " + str(i) + ": " + str(pred_a[i]) + " vs " + str(pred_b[i]))
+            return false
+        }
+        i = i + 1
+    }
+    // Also test determinism of warning
+    let warn_a = termination_warning(state_a)
+    let warn_b = termination_warning(state_b)
+    if warn_a != warn_b {
+        println("  [T4] FAIL -- warning results differ: " + str(warn_a) + " vs " + str(warn_b))
+        return false
+    }
+    // Test determinism with a full simulation
+    let trace_1 = simulate(1000.0, 100.0, 200.0, 10.0, 2.0, 50)
+    let trace_2 = simulate(1000.0, 100.0, 200.0, 10.0, 2.0, 50)
+    let n_elems = (50 + 1) * STATE_DIM
+    let mut j = 0
+    while j < n_elems {
+        if trace_1[j] != trace_2[j] {
+            println("  [T4] FAIL -- simulation traces differ at index " + str(j))
+            return false
+        }
+        j = j + 1
+    }
+    println("  [T4] byte-identical predictions (" + str(FRAC_DIM) + " channels) + warning + simulation trace (" + str(n_elems) + " floats)")
+    return true
+}
+
+fn check_T5() -> bool {
+    // Latency: full 100-step simulation + accuracy measurement < 500 ms.
+    let mem_total = 1000.0
+    let steps_max = 100.0
+    let energy_max = 200.0
+    let mem_rate = 10.0
+    let energy_rate = 2.0
+    // Warm cache
+    let _warm = simulate(mem_total, steps_max, energy_max, mem_rate, energy_rate, 10)
+    let t0 = clock()
+    let trace = simulate(mem_total, steps_max, energy_max, mem_rate, energy_rate, SIM_STEPS)
+    let acc = measure_accuracy(trace, SIM_STEPS, mem_total, steps_max, energy_max, mem_rate, energy_rate)
+    // Also run prediction + warning on every step to stress the pipeline
+    let mut t = 0
+    let n_total = SIM_STEPS + 1
+    let mut warn_count = 0
+    while t < n_total {
+        let state = get_state_at(trace, t)
+        let _pred = predict_remaining(state)
+        let w = termination_warning(state)
+        if w > 0.5 { warn_count = warn_count + 1 }
+        t = t + 1
+    }
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] simulation + accuracy + warnings (n=" + str(SIM_STEPS) + ") = " + str(ms) + " ms  (limit 500)")
+    println("  [T5] accuracy=" + str(acc) + "  warnings_fired=" + str(warn_count) + "/" + str(n_total))
+    if ms >= 500.0 {
+        println("  [T5] FAIL -- latency " + str(ms) + " ms >= 500 ms")
+        return false
+    }
+    return true
+}
+
+// ---- main -------------------------------------------------------
+
+fn main() {
+    println("[alm_termination_awareness] ALM-P15-1 self-test")
+    println("  Heidegger Sein-zum-Tode: the system must know it is finite.")
+    println("  resources=" + str(N_RESOURCES) + "  state_dim=" + str(STATE_DIM) + "  warn_thresh=" + str(WARN_THRESH))
+    println("  target_accuracy=" + str(TARGET_ACC) + "  sim_steps=" + str(SIM_STEPS))
+    println("  lambda_term (outer) = " + str(LAMBDA_TERM))
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[alm_termination_awareness] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[alm_termination_awareness] ALL 5/5 PASS")
+    } else {
+        println("[alm_termination_awareness] SOME FAILED")
+    }
+}
+
+main()

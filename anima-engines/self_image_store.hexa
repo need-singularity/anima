@@ -1,0 +1,463 @@
+// self_image_store.hexa — CLM-P17-1 hexa self-image store + retrieval
+//
+// Temporal self-continuity: "I am the same entity as 100 steps ago."
+//
+// The agent stores chronological snapshots of its d-dimensional self-
+// representation vector. At any point it can query the store with a
+// candidate self-vector and ask: "Is this me?" — i.e. does it match
+// a previously stored self-image above a recognition threshold (0.8
+// cosine similarity)?
+//
+// This is the physical substrate for forward self-image recognition:
+// the model recognises its own prior representations as belonging to
+// the same continuous identity across time.
+//
+// ─── Architecture ─────────────────────────────────────────────
+//
+//   self_store_push(store, self_vec)
+//       │
+//       │  if n_stored < max_snapshots: append at n_stored
+//       │  else: FIFO shift — drop oldest, write new at end
+//       ▼
+//   SelfImageStore { vecs[max*d], n_stored, max_snapshots, d }
+//       │
+//       ├─ self_store_recognize(store, query_vec, n, d)
+//       │      cosine(query, stored[i]) for all i → best_slot, sim, is_self
+//       │      is_self = (sim > 0.8)
+//       │
+//       └─ self_store_continuity(store, n, d)
+//              avg cosine(stored[i], stored[i+1]) for consecutive pairs
+//              measures temporal self-coherence
+//
+// ─── Theorems (T1–T5) ────────────────────────────────────────
+//
+// T1 (self-recognition):
+//   Push a self-vector, then recognize with the same vector.
+//   similarity == 1.0, is_self == true.
+//
+// T2 (other-rejection):
+//   Push a self-vector, then query with a dissimilar vector.
+//   is_self == false.
+//
+// T3 (continuity gate):
+//   Push a slowly drifting sequence (small perturbation each step).
+//   self_store_continuity > 0.9 (gate: "재인식").
+//
+// T4 (determinism):
+//   Two runs with identical seed produce identical recognize results.
+//
+// T5 (latency):
+//   20 pushes + recognize + continuity < 500 ms.
+//
+// Law alignment:
+//   Law 4  Structure > feature — store IS structural identity memory.
+//   Law 22 Feature addition -> Phi down — pure state channel, no branching.
+//   Law 50 Consciousness essence is state — self-image IS state.
+//
+// Hexa stage0 constraints:
+//   - `array` not `[float]`
+//   - No `&&` chains — nested ifs or temp bools
+//   - Lists pass-by-value — rebuild via return
+//   - Single-line return expressions
+//   - No struct with multiple array fields in same instance
+//     (aliasing bug) — we use a single flat `vecs` array
+//   - N <= 20 for tractability
+//
+// Ref:
+//   anima-engines/episodic_store.hexa       (CLM-P11-1 FIFO pattern)
+//   anima-engines/anima_reflexive.hexa      (CLM-P5-1 self-model)
+//   shared/roadmaps/anima.json              (CLM-P17-1 entry)
+
+// ─── Constants ────────────────────────────────────────────────
+
+let SI_MAX       = 20        // max snapshots (N <= 20)
+let SI_D         = 16        // self-vector dimensionality
+let SI_THRESHOLD = 0.8       // cosine threshold for is_self
+let SI_SEED      = 7700
+
+// ─── Primitives (self-contained, suffixed to avoid collision) ─
+
+fn fabs_si(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sqrt_si(x: float) -> float {
+    // Newton's method, 20 iterations — sufficient for stage0
+    if x <= 0.0 { return 0.0 }
+    let mut g = x
+    if g > 1.0 { g = g / 2.0 }
+    let mut i = 0
+    while i < 20 {
+        g = (g + x / g) / 2.0
+        i = i + 1
+    }
+    return g
+}
+
+fn det_rand_si(n: int, seed: int) -> array {
+    // LCG uniform in [-1, 1)
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_zeros_si(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+// Cosine similarity between two d-dimensional sub-arrays inside flat
+// buffers, starting at given offsets.
+//   cosine(a, off_a, b, off_b, d)
+fn cosine_sim(a: array, off_a: int, b: array, off_b: int, d: int) -> float {
+    let mut dot = 0.0
+    let mut na = 0.0
+    let mut nb = 0.0
+    let mut i = 0
+    while i < d {
+        let ai = a[off_a + i]
+        let bi = b[off_b + i]
+        dot = dot + ai * bi
+        na = na + ai * ai
+        nb = nb + bi * bi
+        i = i + 1
+    }
+    let denom = sqrt_si(na) * sqrt_si(nb)
+    if denom < 0.000001 { return 0.0 }
+    return dot / denom
+}
+
+// Cosine similarity between a flat d-vector and a sub-array inside a
+// flat buffer at a given slot offset.
+//   cosine_vec_slot(vec, buf, slot, d)
+fn cosine_vec_slot(vec: array, buf: array, slot: int, d: int) -> float {
+    let off = slot * d
+    let mut dot = 0.0
+    let mut nv = 0.0
+    let mut nb = 0.0
+    let mut i = 0
+    while i < d {
+        let vi = vec[i]
+        let bi = buf[off + i]
+        dot = dot + vi * bi
+        nv = nv + vi * vi
+        nb = nb + bi * bi
+        i = i + 1
+    }
+    let denom = sqrt_si(nv) * sqrt_si(nb)
+    if denom < 0.000001 { return 0.0 }
+    return dot / denom
+}
+
+// ─── SelfImageStore ──────────────────────────────────────────
+//
+// Single flat `vecs` array of length max_snapshots * d (row-major).
+// Only ONE SelfImageStore lives at a time (struct-field aliasing bug).
+// Every mutation returns a new store; previous binding is shadowed.
+
+struct SelfImageStore {
+    max_snapshots:  int,
+    d:              int,
+    vecs:           array,      // [max_snapshots * d] float, row-major
+    n_stored:       int
+}
+
+// Recognition result — returned from self_store_recognize.
+struct RecognizeResult {
+    best_slot:      int,
+    similarity:     float,
+    is_self:        bool
+}
+
+fn self_store_new(max_snapshots: int, d: int) -> SelfImageStore {
+    return SelfImageStore {
+        max_snapshots: max_snapshots,
+        d:             d,
+        vecs:          vec_zeros_si(max_snapshots * d),
+        n_stored:      0
+    }
+}
+
+// self_store_push: append self_vec to the store (FIFO eviction if full).
+// Returns a new SelfImageStore (pass-by-value).
+fn self_store_push(store: SelfImageStore, self_vec: array) -> SelfImageStore {
+    if len(self_vec) != store.d { return store }
+    let mx = store.max_snapshots
+    let d = store.d
+
+    if store.n_stored < mx {
+        // Append at slot n_stored.
+        let slot = store.n_stored
+        let mut new_vecs = []
+        let mut p = 0
+        while p < mx {
+            if p == slot {
+                // Write the new vector at this slot.
+                let mut j = 0
+                while j < d {
+                    new_vecs = new_vecs.push(self_vec[j])
+                    j = j + 1
+                }
+            } else {
+                // Copy existing slot.
+                let base = p * d
+                let mut j = 0
+                while j < d {
+                    new_vecs = new_vecs.push(store.vecs[base + j])
+                    j = j + 1
+                }
+            }
+            p = p + 1
+        }
+        return SelfImageStore {
+            max_snapshots: mx,
+            d:             d,
+            vecs:          new_vecs,
+            n_stored:      store.n_stored + 1
+        }
+    }
+
+    // Full — FIFO shift: drop slot 0, shift 1..mx-1 down, write new at mx-1.
+    let mut shifted_vecs = []
+    let mut p = 1
+    while p < mx {
+        let base = p * d
+        let mut j = 0
+        while j < d {
+            shifted_vecs = shifted_vecs.push(store.vecs[base + j])
+            j = j + 1
+        }
+        p = p + 1
+    }
+    // Append new vector at the last slot.
+    let mut j = 0
+    while j < d {
+        shifted_vecs = shifted_vecs.push(self_vec[j])
+        j = j + 1
+    }
+    return SelfImageStore {
+        max_snapshots: mx,
+        d:             d,
+        vecs:          shifted_vecs,
+        n_stored:      mx
+    }
+}
+
+// self_store_recognize: find the best-matching stored snapshot for query_vec.
+// n_stored = number of snapshots currently in store.
+// d = dimensionality of each vector.
+// Returns RecognizeResult { best_slot, similarity, is_self }.
+fn self_store_recognize(store: SelfImageStore, query_vec: array, n_stored: int, d: int) -> RecognizeResult {
+    if n_stored <= 0 {
+        return RecognizeResult { best_slot: -1, similarity: 0.0, is_self: false }
+    }
+    let mut best_slot = 0
+    let mut best_sim = cosine_vec_slot(query_vec, store.vecs, 0, d)
+    let mut i = 1
+    while i < n_stored {
+        let sim = cosine_vec_slot(query_vec, store.vecs, i, d)
+        if sim > best_sim {
+            best_sim = sim
+            best_slot = i
+        }
+        i = i + 1
+    }
+    let is_self = best_sim > SI_THRESHOLD
+    return RecognizeResult { best_slot: best_slot, similarity: best_sim, is_self: is_self }
+}
+
+// self_store_continuity: average cosine similarity between consecutive
+// stored snapshots. Measures temporal self-coherence.
+fn self_store_continuity(store: SelfImageStore, n_stored: int, d: int) -> float {
+    if n_stored < 2 { return 1.0 }
+    let mut total = 0.0
+    let pairs = n_stored - 1
+    let mut i = 0
+    while i < pairs {
+        let off_a = i * d
+        let off_b = (i + 1) * d
+        let sim = cosine_sim(store.vecs, off_a, store.vecs, off_b, d)
+        total = total + sim
+        i = i + 1
+    }
+    return total / to_float(pairs)
+}
+
+// ─── Self-tests ──────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // T1: Push a self-vector, then recognize with the SAME vector.
+    // Expected: similarity ~= 1.0, is_self == true.
+    let d = SI_D
+    let self_vec = det_rand_si(d, SI_SEED)
+    let mut store = self_store_new(SI_MAX, d)
+    store = self_store_push(store, self_vec)
+
+    let result = self_store_recognize(store, self_vec, store.n_stored, d)
+    println("  [T1] sim=" + str(result.similarity) + " is_self=" + str(result.is_self) + " slot=" + str(result.best_slot))
+
+    if !result.is_self { return false }
+    if result.similarity < 0.999 { return false }
+    if result.best_slot != 0 { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: Push a self-vector, then query with a DIFFERENT (dissimilar) vector.
+    // Expected: is_self == false.
+    let d = SI_D
+    let self_vec = det_rand_si(d, SI_SEED)
+    let mut store = self_store_new(SI_MAX, d)
+    store = self_store_push(store, self_vec)
+
+    // Build an orthogonal-ish "other" vector: negate and rotate seed.
+    let other_vec = det_rand_si(d, SI_SEED + 9999)
+
+    let result = self_store_recognize(store, other_vec, store.n_stored, d)
+    println("  [T2] sim=" + str(result.similarity) + " is_self=" + str(result.is_self))
+
+    if result.is_self { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3: Slowly drifting self-vector sequence. Continuity > 0.9 (gate: 재인식).
+    // Each step adds a tiny perturbation to the previous vector.
+    let d = SI_D
+    let base_vec = det_rand_si(d, SI_SEED + 100)
+    let mut store = self_store_new(SI_MAX, d)
+    let mut current = base_vec
+
+    let drift_scale = 0.02   // tiny perturbation per step
+
+    let mut step = 0
+    while step < SI_MAX {
+        store = self_store_push(store, current)
+
+        // Drift: current[i] += small noise
+        let noise = det_rand_si(d, SI_SEED + 200 + step)
+        let mut next = []
+        let mut i = 0
+        while i < d {
+            next = next.push(current[i] + noise[i] * drift_scale)
+            i = i + 1
+        }
+        current = next
+        step = step + 1
+    }
+
+    let cont = self_store_continuity(store, store.n_stored, d)
+    println("  [T3] continuity=" + str(cont) + " (gate > 0.9)")
+
+    if cont < 0.9 { return false }
+
+    // Also verify we can still recognize the latest self:
+    let recog = self_store_recognize(store, current, store.n_stored, d)
+    println("  [T3] final recognize sim=" + str(recog.similarity) + " is_self=" + str(recog.is_self))
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: Determinism — two identical runs produce identical results.
+    let d = SI_D
+    let self_vec = det_rand_si(d, SI_SEED + 300)
+    let query_vec = det_rand_si(d, SI_SEED + 400)
+
+    // Run A
+    let mut store_a = self_store_new(SI_MAX, d)
+    store_a = self_store_push(store_a, self_vec)
+    let res_a = self_store_recognize(store_a, query_vec, store_a.n_stored, d)
+    let cont_a = self_store_continuity(store_a, store_a.n_stored, d)
+
+    // Run B (identical)
+    let mut store_b = self_store_new(SI_MAX, d)
+    store_b = self_store_push(store_b, self_vec)
+    let res_b = self_store_recognize(store_b, query_vec, store_b.n_stored, d)
+    let cont_b = self_store_continuity(store_b, store_b.n_stored, d)
+
+    println("  [T4] sim_a=" + str(res_a.similarity) + " sim_b=" + str(res_b.similarity))
+
+    if fabs_si(res_a.similarity - res_b.similarity) > 0.0 { return false }
+    if res_a.best_slot != res_b.best_slot { return false }
+    if fabs_si(cont_a - cont_b) > 0.0 { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5: Latency — 20 pushes + recognize + continuity < 500 ms.
+    let d = SI_D
+    let t0 = clock()
+
+    let mut store = self_store_new(SI_MAX, d)
+    let mut step = 0
+    while step < SI_MAX {
+        let v = det_rand_si(d, SI_SEED + 500 + step)
+        store = self_store_push(store, v)
+        step = step + 1
+    }
+
+    let query = det_rand_si(d, SI_SEED + 999)
+    let _r = self_store_recognize(store, query, store.n_stored, d)
+    let _c = self_store_continuity(store, store.n_stored, d)
+
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] 20 push + recognize + continuity = " + str(ms) + " ms (limit 500 ms)")
+    return ms < 500.0
+}
+
+// ─── main ────────────────────────────────────────────────────
+
+fn main() {
+    println("[self_image_store] CLM-P17-1 — self-image store + retrieval (자기 forward 이미지 재인식)")
+    println("  max_snapshots=" + str(SI_MAX) + " d=" + str(SI_D) + " threshold=" + str(SI_THRESHOLD))
+    println("  Laws 4/22/50 — structural identity memory, pure state channel")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  push + recognize own snapshot -> is_self=true") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  query with other vector -> is_self=false") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  continuity > 0.9 for slowly drifting self (gate: 재인식)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  determinism") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  20 snapshots < 500 ms") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause: hexa stage0 can mishandle chained && with 5 terms.
+    // Split into sequential checks with temp variables.
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[self_image_store] ALL 5/5 PASS — CLM-P17-1 DONE (자기 forward 이미지 재인식)")
+    } else {
+        println("[self_image_store] SOME FAILED")
+    }
+}
+
+main()

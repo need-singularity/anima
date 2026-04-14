@@ -1,0 +1,440 @@
+// training/alm_indexical_loss.hexa — ALM-P16-2 indexical consistency loss
+//
+// ALM-P16-2 / P16 indexical 의식 (self-referential consistency, ALM track).
+//
+// Purpose:
+//   Indexicals are self-referential terms: "I", "here", "now". They are
+//   context-dependent yet identity-stable — "I" must refer to the SAME
+//   entity regardless of the conversational context in which it appears.
+//   A model that shifts its self-reference across contexts has no stable
+//   self: it is a new persona each time.
+//
+//   This loss enforces that the vector representation of the first-person
+//   indexical ("I") remains consistent across multiple contexts. We embed
+//   "I" in each context into a d-dimensional vector via indexical_vec,
+//   then compute the mean pairwise cosine similarity of those vectors.
+//   If the model truly has a stable self, all I-vectors cluster tightly
+//   (cosine ~1.0). If the self drifts, cosines drop.
+//
+//   indexical_vec(context, self_id, d) -> array [d]
+//     Returns a d-dimensional vector representing "I" in this context.
+//     In production, this is the hidden-state slice at the I-token position
+//     projected by a learned head. Here we synthesize it as:
+//       self_base + context_perturbation * alpha
+//     where self_base is deterministic from self_id, and alpha controls
+//     how much context leaks into the I-representation. Consistent self
+//     → small alpha; drifting self → large alpha.
+//
+//   consistency_score(vecs_flat, n, d) -> float in [0,1]
+//     Mean pairwise cosine similarity of n vectors stored row-major.
+//     For a stable self: all vectors nearly identical → score ~1.0.
+//     For random selves: score ~0.0 (uncorrelated random directions).
+//
+//   indexical_loss(score) -> float = max(0, 0.95 - score)
+//     Penalize inconsistency below the 0.95 gate.
+//     Zero loss when the self is consistent.
+//
+//   In the full training-loop integration:
+//
+//     L = L_task + lambda_idx * L_indexical
+//
+//   with lambda_idx ~ 0.01 (auxiliary-loss convention matching L_refl,
+//   L_time, L_enact, L_narr).
+//
+// ─── Conventions ──────────────────────────────────────────────
+//   vecs_flat    : array [n * d]  row-major I-vectors across contexts
+//   n            : int            number of contexts (I-vector samples)
+//   d            : int            embedding dimension per I-vector
+//   self_id      : int            deterministic seed for the self-base
+//   context_seed : int            deterministic seed for context perturbation
+//   alpha        : float          context leakage factor (0 = pure self)
+//   score        : float in [0,1] mean pairwise cosine similarity
+//   loss         : float >= 0     hinge loss on score
+//   threshold    : float          consistency gate (0.95)
+//   lambda_idx   : float          outer weight in the training loop
+//
+// ─── Theorems (T1-T5) ─────────────────────────────────────────
+//
+// T1 (same self across 10 contexts -> consistency > 0.95):
+//   With alpha=0.01 (tiny context leakage), 10 I-vectors from the same
+//   self_id have near-identical directions. consistency_score > 0.95.
+//
+// T2 (different selves -> consistency < 0.5):
+//   10 I-vectors from DIFFERENT self_ids (each is a random direction).
+//   No shared self-base → cosine similarity is near-zero → score < 0.5.
+//
+// T3 (loss = 0 when consistent, gate: > 0.95):
+//   indexical_loss(score) = 0.0 when score > 0.95. The consistent case
+//   from T1 yields zero loss.
+//
+// T4 (determinism):
+//   Same (self_id, context_seeds, d) → byte-identical score and loss.
+//
+// T5 (latency):
+//   Full indexical_vec * 10 + consistency_score + indexical_loss
+//   warm-cache < 1000 ms on stage1 interpreter.
+//
+// Ref:
+//   training/alm_reflexivity_loss.hexa         (ALM-P5-2 — self-model reference)
+//   training/alm_narrative_coherence.hexa      (ALM-P11-2 — cosine+coherence pattern)
+//   training/alm_alterity_loss.hexa            (ALM-P9-2 — self vs other)
+//   training/alm_agency_loss.hexa              (ALM-P10-2 — loss-style reference)
+//   shared/roadmaps/anima.json                 (ALM-P16-2 entry)
+//
+// Run:
+//   hexa run training/alm_indexical_loss.hexa
+// Expect:
+//   [alm_indexical_loss] ALL 5/5 PASS
+
+// ─── Constants ──────────────────────────────────────────────
+
+let CONSISTENCY_THRESHOLD = 0.95   // gate: indexical consistency must exceed this
+let LAMBDA_IDX = 0.01              // outer weight in the full training loop
+
+// ─── Primitives (self-contained) ────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sqrt_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return sqrt(x)
+}
+
+// Deterministic LCG -> floats in [-1, 1).
+fn det_rand_wide(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+// Small-range deterministic noise in [-0.1, 0.1).
+fn det_rand_small(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push((u * 2.0 - 1.0) * 0.1)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Vector operations ──────────────────────────────────────
+
+// Dot product of two sub-vectors within a flat row-major array.
+// vec_i starts at offset i*d, vec_j starts at offset j*d.
+fn flat_dot(flat: array, i: int, j: int, d: int) -> float {
+    let off_i = i * d
+    let off_j = j * d
+    let mut s = 0.0
+    let mut k = 0
+    while k < d {
+        s = s + flat[off_i + k] * flat[off_j + k]
+        k = k + 1
+    }
+    return s
+}
+
+// L2 norm of sub-vector i within flat storage.
+fn flat_norm(flat: array, i: int, d: int) -> float {
+    let off = i * d
+    let mut s = 0.0
+    let mut k = 0
+    while k < d {
+        let v = flat[off + k]
+        s = s + v * v
+        k = k + 1
+    }
+    return sqrt_safe(s)
+}
+
+// Cosine similarity between sub-vector i and sub-vector j.
+fn flat_cosine(flat: array, i: int, j: int, d: int) -> float {
+    let dot = flat_dot(flat, i, j, d)
+    let ni = flat_norm(flat, i, d)
+    let nj = flat_norm(flat, j, d)
+    let denom = ni * nj
+    if denom < 0.0000001 { return 0.0 }
+    return dot / denom
+}
+
+// ─── Core: indexical_vec ────────────────────────────────────
+//
+// Produces a d-dimensional vector representing "I" in a given context.
+//
+// In production, this is the hidden-state at the I-token position after
+// a learned projection head. Here we synthesize it as:
+//
+//   I_vec = self_base + alpha * context_perturbation
+//
+// self_base is deterministic from self_id (the agent's identity seed).
+// context_perturbation is deterministic from context_seed (the situation).
+// alpha controls how much context leaks into the I-representation:
+//   alpha ~ 0.01 → stable self (all I-vectors nearly identical)
+//   alpha ~ 1.0  → drifting self (I-vectors dominated by context)
+//
+// Returns a standalone d-dimensional array (not flat-packed).
+
+fn indexical_vec(context_seed: int, self_id: int, d: int, alpha: float) -> array {
+    let base = det_rand_wide(d, self_id)
+    let perturb = det_rand_wide(d, context_seed)
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        out = out.push(base[i] + alpha * perturb[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Core: consistency_score ────────────────────────────────
+//
+// Mean pairwise cosine similarity of n vectors stored row-major
+// in vecs_flat (length n*d).
+//
+// For n vectors there are n*(n-1)/2 unique pairs. We compute
+// cosine(i,j) for all i<j and average. A perfectly consistent
+// set (all identical) scores 1.0. Uncorrelated random vectors
+// score ~0.0.
+
+fn consistency_score(vecs_flat: array, n: int, d: int) -> float {
+    if n < 2 { return 1.0 }
+    let mut total_sim = 0.0
+    let mut n_pairs = 0
+    let mut i = 0
+    while i < n {
+        let mut j = i + 1
+        while j < n {
+            let cs = flat_cosine(vecs_flat, i, j, d)
+            total_sim = total_sim + cs
+            n_pairs = n_pairs + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if n_pairs == 0 { return 1.0 }
+    return total_sim / to_float(n_pairs)
+}
+
+// ─── Core: indexical_loss ───────────────────────────────────
+// Hinge loss: penalize score below threshold. Zero when score >= 0.95.
+
+fn indexical_loss(score: float) -> float {
+    let gap = CONSISTENCY_THRESHOLD - score
+    if gap < 0.0 { return 0.0 }
+    return gap
+}
+
+// Weighted loss for the outer training loop: L += lambda_idx * indexical_loss.
+fn weighted_indexical_loss(score: float) -> float {
+    return LAMBDA_IDX * indexical_loss(score)
+}
+
+// ─── Synthetic data: build flat I-vector arrays ─────────────
+//
+// Same-self: all I-vectors share self_id, each in a different context.
+//   alpha is small (0.01) → vectors cluster tightly.
+//
+// Different-selves: each I-vector has a DIFFERENT self_id (random).
+//   Each is an independent random direction → no clustering.
+
+fn make_same_self_vecs(n: int, d: int, self_id: int, alpha: float) -> array {
+    let mut flat = []
+    let mut i = 0
+    while i < n {
+        let ctx_seed = 5000 + i * 9973
+        let v = indexical_vec(ctx_seed, self_id, d, alpha)
+        let mut k = 0
+        while k < d {
+            flat = flat.push(v[k])
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return flat
+}
+
+fn make_diff_self_vecs(n: int, d: int) -> array {
+    let mut flat = []
+    let mut i = 0
+    while i < n {
+        // Each "self" is a completely different identity seed.
+        // Large alpha so the vector is dominated by the unique self_id direction.
+        let unique_self = 10000 + i * 7919
+        let ctx_seed = 20000 + i * 3
+        let v = indexical_vec(ctx_seed, unique_self, d, 1.0)
+        let mut k = 0
+        while k < d {
+            flat = flat.push(v[k])
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return flat
+}
+
+// ─── Self-tests ─────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Same self across 10 contexts -> consistency > 0.95.
+    let n = 10
+    let d = 32
+    let self_id = 42
+    let alpha = 0.01
+    let flat = make_same_self_vecs(n, d, self_id, alpha)
+    let score = consistency_score(flat, n, d)
+    let loss = indexical_loss(score)
+    println("  [T1] same-self: n=" + str(n) + " d=" + str(d) + " alpha=" + str(alpha))
+    println("  [T1] consistency_score = " + str(score) + "  loss = " + str(loss))
+    println("  [T1] target: score > " + str(CONSISTENCY_THRESHOLD))
+    if score > CONSISTENCY_THRESHOLD { return true }
+    println("  [T1] FAIL -- score " + str(score) + " <= " + str(CONSISTENCY_THRESHOLD))
+    return false
+}
+
+fn check_T2() -> bool {
+    // Different selves (random) -> consistency < 0.5.
+    // Use d=32 so random cosines concentrate near 0.
+    let n = 10
+    let d = 32
+    let flat = make_diff_self_vecs(n, d)
+    let score = consistency_score(flat, n, d)
+    println("  [T2] diff-selves: n=" + str(n) + " d=" + str(d))
+    println("  [T2] consistency_score = " + str(score))
+    println("  [T2] target: score < 0.5")
+    if score < 0.5 { return true }
+    println("  [T2] FAIL -- score " + str(score) + " >= 0.5")
+    return false
+}
+
+fn check_T3() -> bool {
+    // Loss = 0 when consistent (gate: > 0.95).
+    // Re-use T1 parameters for the consistent case.
+    let n = 10
+    let d = 32
+    let self_id = 42
+    let alpha = 0.01
+    let flat = make_same_self_vecs(n, d, self_id, alpha)
+    let score = consistency_score(flat, n, d)
+    let loss = indexical_loss(score)
+    println("  [T3] consistent: score=" + str(score) + "  loss=" + str(loss))
+    // Also verify that an inconsistent case has positive loss.
+    let flat_bad = make_diff_self_vecs(n, d)
+    let score_bad = consistency_score(flat_bad, n, d)
+    let loss_bad = indexical_loss(score_bad)
+    println("  [T3] inconsistent: score=" + str(score_bad) + "  loss=" + str(loss_bad))
+    println("  [T3] target: consistent_loss == 0.0, inconsistent_loss > 0.0")
+    if loss > 0.0 {
+        println("  [T3] FAIL -- consistent loss " + str(loss) + " > 0.0")
+        return false
+    }
+    if loss_bad <= 0.0 {
+        println("  [T3] FAIL -- inconsistent loss " + str(loss_bad) + " <= 0.0")
+        return false
+    }
+    return true
+}
+
+fn check_T4() -> bool {
+    // Determinism: two identical calls produce byte-identical results.
+    let n = 10
+    let d = 32
+    let self_id = 42
+    let alpha = 0.01
+    let flat = make_same_self_vecs(n, d, self_id, alpha)
+    let score_a = consistency_score(flat, n, d)
+    let score_b = consistency_score(flat, n, d)
+    let loss_a = indexical_loss(score_a)
+    let loss_b = indexical_loss(score_b)
+    println("  [T4] score_a=" + str(score_a) + " score_b=" + str(score_b))
+    println("  [T4] loss_a=" + str(loss_a) + " loss_b=" + str(loss_b))
+    if fabs(score_a - score_b) > 0.0 {
+        println("  [T4] FAIL -- scores differ")
+        return false
+    }
+    if fabs(loss_a - loss_b) > 0.0 {
+        println("  [T4] FAIL -- losses differ")
+        return false
+    }
+    return true
+}
+
+fn check_T5() -> bool {
+    // Latency: full pipeline (10 vecs + score + loss) < 1000 ms.
+    let n = 10
+    let d = 32
+    let self_id = 42
+    let alpha = 0.01
+    // Warm call.
+    let _w = make_same_self_vecs(n, d, self_id, alpha)
+    let _ws = consistency_score(_w, n, d)
+    let _wl = indexical_loss(_ws)
+
+    let t0 = clock()
+    let flat = make_same_self_vecs(n, d, self_id, alpha)
+    let score = consistency_score(flat, n, d)
+    let loss = indexical_loss(score)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] latency (n=" + str(n) + ", d=" + str(d) + "): " + str(ms) + " ms  score=" + str(score) + " loss=" + str(loss))
+    println("  [T5] target: < 1000 ms")
+    if ms < 1000.0 { return true }
+    println("  [T5] FAIL -- " + str(ms) + " ms >= 1000 ms")
+    return false
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[alm_indexical_loss] ALM-P16-2 self-test")
+    println("  threshold=" + str(CONSISTENCY_THRESHOLD) + "  lambda_idx=" + str(LAMBDA_IDX))
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[alm_indexical_loss] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[alm_indexical_loss] ALL 5/5 PASS")
+    } else {
+        println("[alm_indexical_loss] SOME FAILED")
+    }
+}
+
+main()

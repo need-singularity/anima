@@ -1,0 +1,324 @@
+// speech_qualia.hexa — PHYS-P16-1 "speech-qualia 정합 — HEXA-SPEAK 응용"
+//
+// Roadmap: shared/roadmaps/anima.json P16 PHYSICS track, PHYS-P16-1
+//   "speech-qualia 정합 — HEXA-SPEAK 응용"
+//   done_criteria: "qualia 기반 음성 생성"
+//
+// Purpose:
+//   Map qualia vectors to speech parameters (pitch, tempo, volume) for
+//   embodied voice output.  Emotional qualia modulate HOW words are
+//   spoken, bridging the subjective-experience layer (qualia) and the
+//   motor-output layer (HEXA-SPEAK vocoder).
+//
+//   The mapping follows psychoacoustic literature on vocal affect:
+//     - High valence (positive emotion) -> higher pitch, faster tempo
+//     - High arousal (excitement/anger) -> louder volume, faster tempo
+//     - Low valence + low arousal (sad) -> lower pitch, slower tempo
+//     - Neutral qualia -> moderate pitch, tempo, volume
+//
+// Qualia vector representation:
+//   Flat array of 3 floats: [valence, arousal, dominance]
+//   Each dimension ranges [0, 1].
+//     valence:   0 = maximally negative, 1 = maximally positive
+//     arousal:   0 = calm/sleepy, 1 = excited/agitated
+//     dominance: 0 = submissive, 1 = dominant (modulates volume)
+//
+// Speech parameters:
+//   Flat array of 3 floats: [pitch_hz, tempo_bpm, volume_db]
+//     pitch_hz:   fundamental frequency in Hz
+//     tempo_bpm:  speech rate in beats (syllables) per minute
+//     volume_db:  output level in dB (relative)
+//
+// Mapping equations (qualia_to_speech):
+//   pitch_hz  = PITCH_BASE + (valence - 0.5) * PITCH_RANGE
+//               clamped to [PITCH_MIN, PITCH_MAX]
+//   tempo_bpm = TEMPO_BASE + (arousal - 0.5) * TEMPO_RANGE
+//               + (valence - 0.5) * TEMPO_VALENCE_GAIN
+//               clamped to [TEMPO_MIN, TEMPO_MAX]
+//   volume_db = VOL_BASE + (arousal - 0.5) * VOL_AROUSAL_GAIN
+//               + (dominance - 0.5) * VOL_DOM_GAIN
+//               clamped to [VOL_MIN, VOL_MAX]
+//
+// Quality metric (speech_quality):
+//   Measures coherence between the three speech params.  A coherent
+//   voice has parameters that are internally consistent (e.g., high
+//   pitch + fast tempo + loud = coherent excited speech, not high
+//   pitch + slow tempo + quiet which is contradictory).
+//
+//   q = 1.0 - mean_abs_deviation_of_normalized_params
+//   where each param is normalized to [0,1] within its range.
+//
+// Self-tests (T1-T5):
+//   T1 Happy qualia -> high pitch, fast tempo
+//   T2 Sad qualia -> low pitch, slow tempo
+//   T3 Neutral qualia -> moderate all params
+//   T4 Determinism — two identical calls produce same output
+//   T5 Latency — 100 mappings < 500 ms
+//
+// Hexa stage0 constraints honored:
+//   - HEXA-FIRST (pure .hexa; no .py/.rs/.sh)
+//   - flat `array` (not typed [float]; index-based access)
+//   - lists pass-by-value — never mutate arguments
+//   - single-line return expressions (stage0 multi-line return bug)
+//   - no multi-float struct returns (stage0 corruption bug)
+//   - no `&&` chains — separate boolean variables combined carefully
+
+// ================================================================
+// Constants — speech parameter ranges
+// ================================================================
+
+// Pitch (fundamental frequency in Hz)
+// Human speech: male ~85-180, female ~165-255, child ~250-400
+// We use a gender-neutral range centered at 180 Hz.
+let PITCH_BASE   = 180.0   // Hz — neutral center
+let PITCH_RANGE  = 120.0   // Hz — full excursion per unit valence deviation
+let PITCH_MIN    = 100.0   // Hz — deep, somber voice
+let PITCH_MAX    = 300.0   // Hz — bright, excited voice
+
+// Tempo (syllables per minute)
+// Normal conversational speech: ~120-180 syl/min
+let TEMPO_BASE         = 150.0   // syl/min — neutral center
+let TEMPO_RANGE        = 80.0    // syl/min — arousal excursion
+let TEMPO_VALENCE_GAIN = 30.0    // syl/min — valence contribution
+let TEMPO_MIN          = 80.0    // syl/min — very slow, deliberate
+let TEMPO_MAX          = 240.0   // syl/min — rapid, excited
+
+// Volume (relative dB)
+// 0 dB = reference level; range from quiet to loud
+let VOL_BASE         = 65.0    // dB — conversational level
+let VOL_AROUSAL_GAIN = 20.0    // dB — arousal contribution
+let VOL_DOM_GAIN     = 10.0    // dB — dominance contribution
+let VOL_MIN          = 45.0    // dB — whisper
+let VOL_MAX          = 85.0    // dB — shout
+
+// Qualia vector indices
+let IDX_VALENCE   = 0
+let IDX_AROUSAL   = 1
+let IDX_DOMINANCE = 2
+
+// Speech param indices
+let IDX_PITCH  = 0
+let IDX_TEMPO  = 1
+let IDX_VOLUME = 2
+
+// ================================================================
+// Scalar helpers
+// ================================================================
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn clamp(x: float, lo: float, hi: float) -> float {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+// ================================================================
+// Qualia vector builder
+// ================================================================
+
+// make_qualia(valence, arousal, dominance) -> array [v, a, d]
+fn make_qualia(valence: float, arousal: float, dominance: float) -> array {
+    let v = clamp(valence, 0.0, 1.0)
+    let a = clamp(arousal, 0.0, 1.0)
+    let d = clamp(dominance, 0.0, 1.0)
+    let mut out = []
+    out = out.push(v)
+    out = out.push(a)
+    out = out.push(d)
+    return out
+}
+
+// ================================================================
+// Core API
+// ================================================================
+
+// qualia_to_speech(qualia_vec, d) -> array [pitch_hz, tempo_bpm, volume_db]
+//
+// Maps a qualia vector to speech parameters.
+//   qualia_vec: array [valence, arousal, dominance] each in [0,1]
+//   d:          dimensionality (unused, reserved for future high-dim qualia)
+//
+// The mapping uses psychoacoustic principles:
+//   - Valence drives pitch (positive = higher)
+//   - Arousal drives tempo and volume (excited = faster, louder)
+//   - Dominance drives volume (dominant = louder)
+fn qualia_to_speech(qualia_vec: array, d: int) -> array {
+    let valence = clamp(qualia_vec[IDX_VALENCE], 0.0, 1.0)
+    let arousal = clamp(qualia_vec[IDX_AROUSAL], 0.0, 1.0)
+    let dominance = clamp(qualia_vec[IDX_DOMINANCE], 0.0, 1.0)
+
+    // Pitch: valence-driven. High valence -> higher pitch.
+    let v_dev = valence - 0.5
+    let raw_pitch = PITCH_BASE + v_dev * PITCH_RANGE
+    let pitch = clamp(raw_pitch, PITCH_MIN, PITCH_MAX)
+
+    // Tempo: arousal-driven + valence contribution.
+    // High arousal -> faster. High valence -> slightly faster.
+    let a_dev = arousal - 0.5
+    let raw_tempo = TEMPO_BASE + a_dev * TEMPO_RANGE + v_dev * TEMPO_VALENCE_GAIN
+    let tempo = clamp(raw_tempo, TEMPO_MIN, TEMPO_MAX)
+
+    // Volume: arousal + dominance driven. More aroused/dominant -> louder.
+    let d_dev = dominance - 0.5
+    let raw_vol = VOL_BASE + a_dev * VOL_AROUSAL_GAIN + d_dev * VOL_DOM_GAIN
+    let vol = clamp(raw_vol, VOL_MIN, VOL_MAX)
+
+    let mut out = []
+    out = out.push(pitch)
+    out = out.push(tempo)
+    out = out.push(vol)
+    return out
+}
+
+// speech_quality(params) -> float in [0, 1]
+//
+// Measures internal coherence of speech parameters.
+// Normalizes each param to [0,1] within its range, then computes
+// 1 - mean absolute deviation from their mean.
+// Coherent states (all high or all low) score near 1.0.
+// Contradictory states (mixed high/low) score near 0.0.
+fn speech_quality(params: array) -> float {
+    // Normalize each param to [0, 1]
+    let p_norm = (params[IDX_PITCH] - PITCH_MIN) / (PITCH_MAX - PITCH_MIN)
+    let t_norm = (params[IDX_TEMPO] - TEMPO_MIN) / (TEMPO_MAX - TEMPO_MIN)
+    let v_norm = (params[IDX_VOLUME] - VOL_MIN) / (VOL_MAX - VOL_MIN)
+
+    let p_c = clamp(p_norm, 0.0, 1.0)
+    let t_c = clamp(t_norm, 0.0, 1.0)
+    let v_c = clamp(v_norm, 0.0, 1.0)
+
+    // Mean of the three normalized values
+    let mean = (p_c + t_c + v_c) / 3.0
+
+    // Mean absolute deviation from the mean
+    let dev_p = fabs(p_c - mean)
+    let dev_t = fabs(t_c - mean)
+    let dev_v = fabs(v_c - mean)
+    let mad = (dev_p + dev_t + dev_v) / 3.0
+
+    // Quality = 1 - scaled deviation. Max MAD for [0,1] values ~ 0.44
+    // Scale so that max possible MAD maps to quality ~ 0.0
+    let quality = 1.0 - mad * 2.25
+    return clamp(quality, 0.0, 1.0)
+}
+
+// ================================================================
+// Self-tests
+// ================================================================
+
+fn check_T1_happy() -> bool {
+    // T1: Happy qualia (high valence, high arousal, high dominance)
+    //     -> high pitch (> PITCH_BASE), fast tempo (> TEMPO_BASE)
+    let q = make_qualia(0.9, 0.8, 0.7)
+    let sp = qualia_to_speech(q, 3)
+    let pitch_high = sp[IDX_PITCH] > PITCH_BASE
+    let tempo_fast = sp[IDX_TEMPO] > TEMPO_BASE
+    println("  [T1] happy: pitch=" + str(sp[IDX_PITCH]) + "Hz tempo=" + str(sp[IDX_TEMPO]) + "bpm vol=" + str(sp[IDX_VOLUME]) + "dB")
+    if pitch_high == false { return false }
+    if tempo_fast == false { return false }
+    return true
+}
+
+fn check_T2_sad() -> bool {
+    // T2: Sad qualia (low valence, low arousal, low dominance)
+    //     -> low pitch (< PITCH_BASE), slow tempo (< TEMPO_BASE)
+    let q = make_qualia(0.1, 0.15, 0.2)
+    let sp = qualia_to_speech(q, 3)
+    let pitch_low = sp[IDX_PITCH] < PITCH_BASE
+    let tempo_slow = sp[IDX_TEMPO] < TEMPO_BASE
+    println("  [T2] sad: pitch=" + str(sp[IDX_PITCH]) + "Hz tempo=" + str(sp[IDX_TEMPO]) + "bpm vol=" + str(sp[IDX_VOLUME]) + "dB")
+    if pitch_low == false { return false }
+    if tempo_slow == false { return false }
+    return true
+}
+
+fn check_T3_neutral() -> bool {
+    // T3: Neutral qualia (0.5, 0.5, 0.5) -> moderate params near base
+    let q = make_qualia(0.5, 0.5, 0.5)
+    let sp = qualia_to_speech(q, 3)
+    let pitch_near = fabs(sp[IDX_PITCH] - PITCH_BASE) < 1.0
+    let tempo_near = fabs(sp[IDX_TEMPO] - TEMPO_BASE) < 1.0
+    let vol_near = fabs(sp[IDX_VOLUME] - VOL_BASE) < 1.0
+    println("  [T3] neutral: pitch=" + str(sp[IDX_PITCH]) + "Hz tempo=" + str(sp[IDX_TEMPO]) + "bpm vol=" + str(sp[IDX_VOLUME]) + "dB")
+    if pitch_near == false { return false }
+    if tempo_near == false { return false }
+    if vol_near == false { return false }
+    return true
+}
+
+fn check_T4_determinism() -> bool {
+    // T4: Two identical calls must produce identical results.
+    let q = make_qualia(0.7, 0.6, 0.4)
+    let sp_a = qualia_to_speech(q, 3)
+    let sp_b = qualia_to_speech(q, 3)
+    let pitch_eq = sp_a[IDX_PITCH] == sp_b[IDX_PITCH]
+    let tempo_eq = sp_a[IDX_TEMPO] == sp_b[IDX_TEMPO]
+    let vol_eq = sp_a[IDX_VOLUME] == sp_b[IDX_VOLUME]
+    println("  [T4] run_a pitch=" + str(sp_a[IDX_PITCH]) + " run_b pitch=" + str(sp_b[IDX_PITCH]) + " match=" + str(pitch_eq))
+    if pitch_eq == false { return false }
+    if tempo_eq == false { return false }
+    if vol_eq == false { return false }
+    return true
+}
+
+fn check_T5_latency() -> bool {
+    // T5: 100 qualia_to_speech mappings must complete in < 500 ms.
+    let t0 = clock()
+    let q = make_qualia(0.6, 0.7, 0.5)
+    let mut i = 0
+    while i < 100 {
+        let sp = qualia_to_speech(q, 3)
+        // force evaluation — read one field
+        let dummy = sp[IDX_PITCH]
+        i = i + 1
+    }
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    let ok = ms < 500.0
+    println("  [T5] 100 mappings in " + str(ms) + " ms (< 500 ms)")
+    return ok
+}
+
+fn test() {
+    println("[anima-body/speech_qualia] PHYS-P16-1 — speech-qualia 정합 (HEXA-SPEAK 응용)")
+    println("  qualia [valence, arousal, dominance] -> speech [pitch_hz, tempo_bpm, volume_db]")
+    println("  high valence -> higher pitch, faster tempo")
+    println("  high arousal -> louder volume, faster tempo")
+    println("  sad (low v, low a) -> lower pitch, slower tempo")
+    println("")
+
+    let t1 = check_T1_happy()
+    if t1 { println("T1 PASS — happy qualia -> high pitch, fast tempo") } else { println("T1 FAIL") }
+
+    let t2 = check_T2_sad()
+    if t2 { println("T2 PASS — sad qualia -> low pitch, slow tempo") } else { println("T2 FAIL") }
+
+    let t3 = check_T3_neutral()
+    if t3 { println("T3 PASS — neutral qualia -> moderate all params") } else { println("T3 FAIL") }
+
+    let t4 = check_T4_determinism()
+    if t4 { println("T4 PASS — deterministic (two runs identical)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5_latency()
+    if t5 { println("T5 PASS — 100 mappings under 500 ms") } else { println("T5 FAIL") }
+
+    println("")
+    let mut pass_count = 0
+    if t1 { pass_count = pass_count + 1 }
+    if t2 { pass_count = pass_count + 1 }
+    if t3 { pass_count = pass_count + 1 }
+    if t4 { pass_count = pass_count + 1 }
+    if t5 { pass_count = pass_count + 1 }
+
+    if pass_count == 5 {
+        println("[anima-body/speech_qualia] 5/5 PASS — PHYS-P16-1 DONE (qualia 기반 음성 생성)")
+    } else {
+        println("[anima-body/speech_qualia] " + str(pass_count) + "/5 — SOME FAILED")
+    }
+}
+
+test()
