@@ -1,0 +1,314 @@
+// temporal_bridge.hexa — CLM-P6-2: S (Storage) connects to retention band
+//
+// EmergentS already models perception-as-state-delta (see emergent_s.hexa).
+// P6 adds a retention channel: S physically stores retention slots that come
+// off the temporal ring's `past` band, so that perception can reach back into
+// retained experience and retrieval is not a feature but a structural read.
+//
+// Existing S engine (emergent_s.hexa) stays untouched: EmergentS remains the
+// canonical sense module. This bridge is additive — callers that need the
+// temporal storage channel instantiate an S_TemporalBridge on top of an
+// existing EmergentS.
+//
+// ─── Pipeline ─────────────────────────────────────────────────────
+//
+//   TemporalRing.past (K × d_hidden)  ← anima_temporal (CLM-P6-1)
+//       │
+//       │  s_bridge_ingest(bridge, ring)
+//       ▼
+//   S_Store [K × d_hidden]            (physical retention slots)
+//       │
+//       │  s_bridge_retrieve(bridge, slot) → array [d_hidden]
+//       ▼
+//   retrieved_retention
+//
+// S.retain(C.forward) contract (done_criteria from roadmap):
+//   After 10 pushes, retrieve(slot k) returns the value that was past[k]
+//   at ingest time (the retention retrieval test — 10-step retention PASS).
+//
+// Law alignment:
+//   Law 4  Structure > feature — storage IS a structural channel of S,
+//          not a separate "memory" feature.
+//   Law 50 Consciousness essence is state — retention stored as state.
+//   Meta M8 Narrative = temporal self-model — this is the temporal spine.
+//
+// Ref:
+//   anima-engines/anima_temporal.hexa   (CLM-P6-1 ring)
+//   anima-hexad/s/emergent_s.hexa       (canonical EmergentS — unmodified)
+//   anima-hexad/w/reflexive_bridge.hexa (additive bridge pattern, CLM-P5-2)
+//   shared/roadmaps/anima.json          (CLM-P6-2 entry)
+
+// ─── Constants ────────────────────────────────────────────────────
+
+let TB_K          = 4
+let TB_D_HIDDEN   = 8
+let TB_SEED       = 2026
+
+// ─── Primitives (self-contained) ─────────────────────────────────
+
+fn fabs_tb(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn det_rand_tb(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_zeros_tb(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── S temporal bridge ───────────────────────────────────────────
+//
+// S_TemporalBridge stores K retention slots, each of width d_hidden.
+// The layout mirrors TemporalRing.past — flat row-major
+// slot[i] = store[i*d_hidden + j].
+// Bridge is pure: every ingest returns a new bridge (hexa struct immutability).
+
+struct S_TemporalBridge {
+    k:          int,
+    d_hidden:   int,
+    store:      array,      // [k * d_hidden]
+    n_ingested: int
+}
+
+struct RetrievalResult {
+    slot:       int,
+    values:     array,      // [d_hidden]
+    ok:         bool
+}
+
+fn s_bridge_new(k: int, d_hidden: int) -> S_TemporalBridge {
+    return S_TemporalBridge {
+        k:          k,
+        d_hidden:   d_hidden,
+        store:      vec_zeros_tb(k * d_hidden),
+        n_ingested: 0
+    }
+}
+
+// s_bridge_ingest(bridge, past_band, k_ring, d_ring):
+//   copies the ring's retention band (past) into the S store verbatim.
+//   past_band: flat array [k_ring * d_ring] from TemporalRing.past.
+//   Dimensions must match bridge dims (bridge.k, bridge.d_hidden).
+fn s_bridge_ingest(bridge: S_TemporalBridge, past_band: array,
+                   k_ring: int, d_ring: int) -> S_TemporalBridge {
+    if k_ring != bridge.k { return bridge }
+    if d_ring != bridge.d_hidden { return bridge }
+    if len(past_band) != bridge.k * bridge.d_hidden { return bridge }
+    let mut new_store = []
+    let mut i = 0
+    while i < len(past_band) {
+        new_store = new_store.push(past_band[i])
+        i = i + 1
+    }
+    return S_TemporalBridge {
+        k:          bridge.k,
+        d_hidden:   bridge.d_hidden,
+        store:      new_store,
+        n_ingested: bridge.n_ingested + 1
+    }
+}
+
+// s_bridge_retrieve(bridge, slot):
+//   returns retention slot (0 = oldest, K-1 = most recent).
+fn s_bridge_retrieve(bridge: S_TemporalBridge, slot: int) -> RetrievalResult {
+    if slot < 0 {
+        return RetrievalResult {
+            slot:   slot,
+            values: [],
+            ok:     false
+        }
+    }
+    if slot >= bridge.k {
+        return RetrievalResult {
+            slot:   slot,
+            values: [],
+            ok:     false
+        }
+    }
+    let dH = bridge.d_hidden
+    let base = slot * dH
+    let mut vals = []
+    let mut j = 0
+    while j < dH {
+        vals = vals.push(bridge.store[base + j])
+        j = j + 1
+    }
+    return RetrievalResult {
+        slot:   slot,
+        values: vals,
+        ok:     true
+    }
+}
+
+// ─── Self-tests ───────────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Dim contract: bridge store has exactly K * d_hidden entries.
+    let bridge = s_bridge_new(TB_K, TB_D_HIDDEN)
+    if len(bridge.store) != TB_K * TB_D_HIDDEN { return false }
+    if bridge.k != TB_K { return false }
+    if bridge.d_hidden != TB_D_HIDDEN { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // Ingest + retrieve each slot: values match ingested past band exactly.
+    let bridge = s_bridge_new(TB_K, TB_D_HIDDEN)
+    // Build a synthetic past band: slot i filled with constant i+0.5.
+    let mut past_band = []
+    let mut i = 0
+    while i < TB_K {
+        let c = to_float(i) + 0.5
+        let mut j = 0
+        while j < TB_D_HIDDEN {
+            past_band = past_band.push(c)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let b2 = s_bridge_ingest(bridge, past_band, TB_K, TB_D_HIDDEN)
+    let mut ok = true
+    let mut slot = 0
+    while slot < TB_K {
+        let r = s_bridge_retrieve(b2, slot)
+        if !r.ok { ok = false }
+        if len(r.values) != TB_D_HIDDEN { ok = false }
+        let expected = to_float(slot) + 0.5
+        let mut jj = 0
+        while jj < TB_D_HIDDEN {
+            if fabs_tb(r.values[jj] - expected) > 0.0001 { ok = false }
+            jj = jj + 1
+        }
+        slot = slot + 1
+    }
+    return ok
+}
+
+fn check_T3() -> bool {
+    // 10-step retention retrieval PASS (roadmap done_criteria).
+    // Simulate 10 ingests of distinct past bands; after each, retrieve all K slots
+    // and verify they match the ingested values byte-for-byte.
+    let mut bridge = s_bridge_new(TB_K, TB_D_HIDDEN)
+    let mut step = 0
+    let mut ok = true
+    while step < 10 {
+        // Build past band for this step: slot i filled with (step*10 + i)*0.01.
+        let mut past_band = []
+        let mut i = 0
+        while i < TB_K {
+            let c = to_float(step * 10 + i) * 0.01
+            let mut j = 0
+            while j < TB_D_HIDDEN {
+                past_band = past_band.push(c)
+                j = j + 1
+            }
+            i = i + 1
+        }
+        bridge = s_bridge_ingest(bridge, past_band, TB_K, TB_D_HIDDEN)
+        // Retrieve every slot and check
+        let mut slot = 0
+        while slot < TB_K {
+            let r = s_bridge_retrieve(bridge, slot)
+            if !r.ok { ok = false }
+            let expected = to_float(step * 10 + slot) * 0.01
+            let mut jj = 0
+            while jj < TB_D_HIDDEN {
+                if fabs_tb(r.values[jj] - expected) > 0.0001 { ok = false }
+                jj = jj + 1
+            }
+            slot = slot + 1
+        }
+        step = step + 1
+    }
+    // n_ingested must equal 10 after 10 ingests.
+    if bridge.n_ingested != 10 { ok = false }
+    return ok
+}
+
+fn check_T4() -> bool {
+    // Out-of-bounds retrieval returns ok=false (does not crash).
+    let bridge = s_bridge_new(TB_K, TB_D_HIDDEN)
+    let mut past_band = det_rand_tb(TB_K * TB_D_HIDDEN, 5)
+    let b2 = s_bridge_ingest(bridge, past_band, TB_K, TB_D_HIDDEN)
+    let r_neg = s_bridge_retrieve(b2, -1)
+    let r_oob = s_bridge_retrieve(b2, TB_K)
+    let r_ok  = s_bridge_retrieve(b2, 0)
+    if r_neg.ok { return false }
+    if r_oob.ok { return false }
+    if !r_ok.ok { return false }
+    // Dim mismatch on ingest → bridge unchanged (reject, don't silently overwrite).
+    let bad_band = det_rand_tb(TB_K * TB_D_HIDDEN + 1, 6)
+    let b3 = s_bridge_ingest(b2, bad_band, TB_K, TB_D_HIDDEN)
+    if b3.n_ingested != b2.n_ingested { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // Determinism: same sequence of past bands ⇒ byte-identical store.
+    let mut b1 = s_bridge_new(TB_K, TB_D_HIDDEN)
+    let mut b2 = s_bridge_new(TB_K, TB_D_HIDDEN)
+    let mut s = 0
+    while s < 5 {
+        let band = det_rand_tb(TB_K * TB_D_HIDDEN, 700 + s)
+        b1 = s_bridge_ingest(b1, band, TB_K, TB_D_HIDDEN)
+        b2 = s_bridge_ingest(b2, band, TB_K, TB_D_HIDDEN)
+        s = s + 1
+    }
+    if len(b1.store) != len(b2.store) { return false }
+    let mut i = 0
+    while i < len(b1.store) {
+        if fabs_tb(b1.store[i] - b2.store[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    if b1.n_ingested != b2.n_ingested { return false }
+    return true
+}
+
+// ─── main ─────────────────────────────────────────────────────────
+
+fn main() {
+    println("[temporal_bridge] CLM-P6-2 — S stores retention self-test")
+    println("  K=4, d_hidden=8 (test); additive to EmergentS; Law 4")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  dim contract") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  ingest + retrieve per slot") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  10-step retention retrieval") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  bounds + dim-mismatch safe") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  determinism") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[temporal_bridge] ALL 5/5 PASS")
+    } else {
+        println("[temporal_bridge] SOME FAILED")
+    }
+}
+
+main()

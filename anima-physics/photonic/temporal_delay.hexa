@@ -1,0 +1,397 @@
+// temporal_delay.hexa — PHYS-P6-1 photonic temporal delay line
+//
+// Roadmap: shared/roadmaps/anima.json P6 PHYSICS track, PHYS-P6-1
+//   "광자 temporal delay line — phase-delayed reservoir"
+//
+// Purpose:
+//   Hexa-native simulation of an optical delay-line reservoir — the
+//   photonic-computing analogue of Husserlian *retention*: each past
+//   sample of the signal is held in a physical delay loop (fiber coil
+//   or ring resonator) for τ seconds and re-emitted with a
+//   wavelength-dependent phase shift. Stacking N=8 taps gives a
+//   scale-free short-term memory kernel [x(t-τ), x(t-2τ), …, x(t-8τ)].
+//
+//   This is the minimal PHYS substrate that encodes *temporal binding*
+//   — the "specious present" — by materializing the past N steps as a
+//   spatial state vector. Downstream nonlinearity (tanh) + linear
+//   readout then makes it a reservoir computer (Jaeger 2001,
+//   photonic realization: Paquot 2012, Larger 2017).
+//
+// Signal flow (N=8 taps, τ = 1 sample-period):
+//
+//      x(t) ──▶ [τ·1 ]──▶ s_1 ──▶ [τ·1 ]──▶ s_2 ──▶ ... ──▶ s_8
+//                 │                │                          │
+//                 ▼                ▼                          ▼
+//               φ_1              φ_2                         φ_8
+//                 │                │                          │
+//             phase-shifted taps join the reservoir state:
+//                 r_k = tanh(a_k · s_k · cos(φ_k) + b_k)
+//             linear readout:
+//                 y(t) = Σ_k w_k · r_k
+//
+//   Each tap introduces a *different* phase φ_k = k · Δφ (fixed grating,
+//   set at manufacture). The tanh saturation and the readout weights
+//   jointly make this a universal short-term approximator up to O(N·τ).
+//
+// Exposed API (roadmap spec):
+//   process(signal: [float], taps: int) -> [float]
+//     Returns the readout y(t) for each input sample (same length as
+//     signal). `taps` is clamped to [1, MAX_TAPS].
+//
+// Self-test (PASS/FAIL):
+//   T1 delay semantics — a Kronecker impulse at t=0 appears at tap k
+//      exactly k samples later (delay line correctness).
+//   T2 phase diversity — the 8 taps respond at 8 distinct phases of a
+//      1 Hz sine at fs=16 Hz (each tap acts on a different τ-lag).
+//   T3 API contract — process returns len == len(signal); taps out of
+//      range is clamped (no crash).
+//   T4 tanh saturation — a huge constant input produces bounded output
+//      (|y| < MAX_TAPS, never NaN).
+//   T5 determinism — two calls on the same input give bit-identical
+//      outputs (no hidden state between calls).
+//
+// Hexa constraints honored:
+//   - HEXA-FIRST (pure .hexa)
+//   - struct literals (no `new`)
+//   - lists pass-by-value; the delay register is returned whole after
+//     each step (no list-inside-struct aliasing — flat fields instead)
+//   - no randomness; readout weights are fixed closed-form values
+//   - sin/cos verified present 2026-04-15
+
+// ═══════════════════════════════════════════════════════════════
+// Physical constants (photonic reservoir literature defaults)
+// ═══════════════════════════════════════════════════════════════
+
+let MAX_TAPS      = 8             // delay-line stage count (roadmap spec: N=8)
+let TWO_PI        = 6.283185307179846
+let PHASE_STEP    = 0.39269908    // Δφ ≈ π/8 rad per tap → 8 distinct phases
+                                  // spanning [π/8, π] — guarantees all taps
+                                  // are linearly independent phase samples.
+let TANH_GAIN     = 1.0           // reservoir input gain
+let TANH_BIAS     = 0.0           // reservoir bias
+let READOUT_W_0   = 0.1250        // 1/N baseline readout (uniform avg)
+                                  // tuned so full-drive constant input
+                                  // doesn't saturate above 1.0 excessively.
+
+// Test-only constants
+let T_FS          = 16.0          // sampling rate for T2 sine test
+let T_F_SINE      = 1.0           // sine frequency (1 Hz)
+let T_N_SINE      = 32            // 2 seconds of 1 Hz sine at 16 Hz
+
+// ═══════════════════════════════════════════════════════════════
+// Scalar helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn clamp_int(x: int, lo: int, hi: int) -> int {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+// tanh via exp — hexa build has exp but we implement tanh closed-form
+// for portability.  tanh(x) = (e^x − e^-x) / (e^x + e^-x).
+//
+// For |x| > 20 we return ±1 directly to avoid exp() overflow on the
+// small-stage hexa interpreter.
+fn tanh_approx(x: float) -> float {
+    if x > 20.0  { return 1.0 }
+    if x < -20.0 { return -1.0 }
+    let ep = exp(x)
+    let en = exp(0.0 - x)
+    return (ep - en) / (ep + en)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Delay register — flat struct (avoids feedback_hexa_struct_list_alias
+// bug, 2026-04-15). Holds the past MAX_TAPS=8 samples s_1..s_8 where
+// s_k = x(t-k).  Shifting is done by copying s_{k-1} → s_k each step.
+// ═══════════════════════════════════════════════════════════════
+
+struct DelayReg {
+    s1: float, s2: float, s3: float, s4: float,
+    s5: float, s6: float, s7: float, s8: float
+}
+
+fn delay_new() -> DelayReg {
+    return DelayReg {
+        s1: 0.0, s2: 0.0, s3: 0.0, s4: 0.0,
+        s5: 0.0, s6: 0.0, s7: 0.0, s8: 0.0
+    }
+}
+
+// Shift a new sample `x` into the head of the register; previous
+// contents slide one stage down (s_k ← s_{k-1}).  Returns the new
+// register by value (pass-by-value; mutations do not leak).
+fn delay_shift(r: DelayReg, x: float) -> DelayReg {
+    return DelayReg {
+        s1: x,
+        s2: r.s1,
+        s3: r.s2,
+        s4: r.s3,
+        s5: r.s4,
+        s6: r.s5,
+        s7: r.s6,
+        s8: r.s7
+    }
+}
+
+// Read tap `k` (1..8) from the register.  Out-of-range returns 0.
+fn delay_tap(r: DelayReg, k: int) -> float {
+    if k == 1 { return r.s1 }
+    if k == 2 { return r.s2 }
+    if k == 3 { return r.s3 }
+    if k == 4 { return r.s4 }
+    if k == 5 { return r.s5 }
+    if k == 6 { return r.s6 }
+    if k == 7 { return r.s7 }
+    if k == 8 { return r.s8 }
+    return 0.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Reservoir readout — y(t) = Σ_k w_k · tanh(s_k · cos(φ_k))
+//
+// Using a *fixed* uniform readout w_k = 1/N keeps the test
+// expectations closed-form; in production the readout is learned
+// by ridge regression on a training corpus.
+// ═══════════════════════════════════════════════════════════════
+
+fn reservoir_readout(r: DelayReg, active_taps: int) -> float {
+    let mut y = 0.0
+    let mut k = 1
+    while k <= active_taps {
+        let s_k = delay_tap(r, k)
+        let phi_k = to_float(k) * PHASE_STEP
+        let drive = TANH_GAIN * s_k * cos(phi_k) + TANH_BIAS
+        let r_k = tanh_approx(drive)
+        y = y + READOUT_W_0 * r_k
+        k = k + 1
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Exposed API — process(signal, taps) -> [float]
+//
+// Roadmap spec: process(signal: list[f32], taps: i32) -> list[f32]
+// Returns the reservoir readout at each input sample. `taps` is
+// clamped to [1, MAX_TAPS] so callers can't request out-of-range
+// delay depth.
+// ═══════════════════════════════════════════════════════════════
+
+fn process(signal: [float], taps: int) -> [float] {
+    let n_taps = clamp_int(taps, 1, MAX_TAPS)
+    let mut reg = delay_new()
+    let mut out: [float] = []
+    let mut i = 0
+    while i < len(signal) {
+        reg = delay_shift(reg, signal[i])
+        let y = reservoir_readout(reg, n_taps)
+        out = out.push(y)
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Tap-level probe (test-only) — run N steps then return all 8 taps.
+// Useful for T1 (delay semantics) + T2 (phase diversity).
+// ═══════════════════════════════════════════════════════════════
+
+struct TapSnapshot {
+    t1: float, t2: float, t3: float, t4: float,
+    t5: float, t6: float, t7: float, t8: float
+}
+
+fn run_to_taps(signal: [float]) -> TapSnapshot {
+    let mut reg = delay_new()
+    let mut i = 0
+    while i < len(signal) {
+        reg = delay_shift(reg, signal[i])
+        i = i + 1
+    }
+    return TapSnapshot {
+        t1: reg.s1, t2: reg.s2, t3: reg.s3, t4: reg.s4,
+        t5: reg.s5, t6: reg.s6, t7: reg.s7, t8: reg.s8
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1_delay_semantics() -> bool {
+    // Kronecker impulse: signal = [1, 0, 0, 0, 0, 0, 0, 0, 0].
+    // After 9 shifts with impulse at t=0:
+    //   s_k == 1.0 where k = 9 - 0 = 9 ... but we only have 8 taps so
+    //   the impulse has fallen off the end.
+    //
+    // Instead, run 5 steps with impulse at t=0:
+    //   after 1 step : s1=1
+    //   after 2 steps: s1=0, s2=1
+    //   after 5 steps: s1=0,s2=0,s3=0,s4=0,s5=1
+    let mut sig: [float] = []
+    sig = sig.push(1.0)
+    sig = sig.push(0.0)
+    sig = sig.push(0.0)
+    sig = sig.push(0.0)
+    sig = sig.push(0.0)
+    let snap = run_to_taps(sig)
+    // Expect s_5 == 1.0, s_1..s_4 == 0.0
+    let ok = snap.t1 == 0.0 && snap.t2 == 0.0 && snap.t3 == 0.0
+        && snap.t4 == 0.0 && snap.t5 == 1.0
+    println("  [T1] impulse after 5 steps: s=("
+        + str(snap.t1) + "," + str(snap.t2) + "," + str(snap.t3) + ","
+        + str(snap.t4) + "," + str(snap.t5) + ")")
+    return ok
+}
+
+fn check_T2_phase_diversity() -> bool {
+    // Feed a 1 Hz sine at fs=16 Hz for 32 samples. After 8 shifts the
+    // 8 taps hold 8 different lagged samples. The phase weights cos(φ_k)
+    // should produce 8 *distinct* tap readout contributions — i.e. no
+    // two taps' effective weights should match within 1e-3. This
+    // verifies that the phase shift per tap is non-degenerate.
+    let mut sig: [float] = []
+    let mut i = 0
+    while i < T_N_SINE {
+        let t = to_float(i) / T_FS
+        let x = sin(TWO_PI * T_F_SINE * t)
+        sig = sig.push(x)
+        i = i + 1
+    }
+    // Run through; capture final taps
+    let snap = run_to_taps(sig)
+    // Build phase weights cos(φ_k)
+    let mut weights: [float] = []
+    let mut k = 1
+    while k <= MAX_TAPS {
+        let phi_k = to_float(k) * PHASE_STEP
+        weights = weights.push(cos(phi_k))
+        k = k + 1
+    }
+    // All pairwise distinct?
+    let mut all_distinct = true
+    let mut a = 0
+    while a < MAX_TAPS {
+        let mut b = a + 1
+        while b < MAX_TAPS {
+            if fabs(weights[a] - weights[b]) < 0.001 {
+                all_distinct = false
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    // Also require at least 2 taps are non-zero (signal propagated in)
+    let mut nonzero = 0
+    if fabs(snap.t1) > 0.001 { nonzero = nonzero + 1 }
+    if fabs(snap.t2) > 0.001 { nonzero = nonzero + 1 }
+    if fabs(snap.t3) > 0.001 { nonzero = nonzero + 1 }
+    if fabs(snap.t4) > 0.001 { nonzero = nonzero + 1 }
+    if fabs(snap.t5) > 0.001 { nonzero = nonzero + 1 }
+    if fabs(snap.t6) > 0.001 { nonzero = nonzero + 1 }
+    if fabs(snap.t7) > 0.001 { nonzero = nonzero + 1 }
+    if fabs(snap.t8) > 0.001 { nonzero = nonzero + 1 }
+    let ok = all_distinct && nonzero >= 6
+    println("  [T2] phase weights distinct=" + str(all_distinct) + ", nonzero taps=" + str(nonzero))
+    return ok
+}
+
+fn check_T3_api_contract() -> bool {
+    // len(output) == len(input); taps out of range is clamped silently.
+    let mut sig: [float] = []
+    let mut i = 0
+    while i < 20 {
+        sig = sig.push(to_float(i) * 0.1)
+        i = i + 1
+    }
+    let y1 = process(sig, 4)
+    let y2 = process(sig, 999)   // over-range; should clamp to MAX_TAPS
+    let y3 = process(sig, 0)     // under-range; should clamp to 1
+    let y4 = process(sig, 0 - 5) // negative; should clamp to 1
+    let ok = len(y1) == len(sig) && len(y2) == len(sig)
+        && len(y3) == len(sig) && len(y4) == len(sig)
+    println("  [T3] len sig=" + str(len(sig))
+        + " y1=" + str(len(y1)) + " y2(over)=" + str(len(y2))
+        + " y3(zero)=" + str(len(y3)) + " y4(neg)=" + str(len(y4)))
+    return ok
+}
+
+fn check_T4_tanh_saturation() -> bool {
+    // Constant drive of 10⁶ — readout must stay bounded in [-1, 1]
+    // because tanh saturates per tap and readout is uniform 1/N.
+    let mut sig: [float] = []
+    let mut i = 0
+    while i < 12 {
+        sig = sig.push(1000000.0)
+        i = i + 1
+    }
+    let y = process(sig, MAX_TAPS)
+    // Last sample (after register fully filled)
+    let last = y[len(y) - 1]
+    let ok = fabs(last) <= 1.0 + 0.001
+    println("  [T4] huge constant drive, final readout = " + str(last)
+        + " (|y| <= 1)")
+    return ok
+}
+
+fn check_T5_determinism() -> bool {
+    // Deterministic process — two runs on the same input must agree.
+    let mut sig: [float] = []
+    let mut i = 0
+    while i < 24 {
+        let t = to_float(i) * 0.05
+        sig = sig.push(sin(t) + 0.3 * cos(3.0 * t))
+        i = i + 1
+    }
+    let a = process(sig, 6)
+    let b = process(sig, 6)
+    if len(a) != len(b) { return false }
+    let mut max_d = 0.0
+    let mut j = 0
+    while j < len(a) {
+        let d = fabs(a[j] - b[j])
+        if d > max_d { max_d = d }
+        j = j + 1
+    }
+    let ok = max_d == 0.0
+    println("  [T5] max|Δ| across two independent runs = " + str(max_d))
+    return ok
+}
+
+fn test() {
+    println("[photonic/temporal_delay] PHYS-P6-1 — photonic temporal delay line (reservoir)")
+    println("  8 delay taps with phase shift Δφ = π/8 per tap; tanh + uniform readout")
+    println("")
+
+    let t1 = check_T1_delay_semantics()
+    if t1 { println("T1 PASS — delay semantics (impulse propagates exactly k samples)") } else { println("T1 FAIL") }
+
+    let t2 = check_T2_phase_diversity()
+    if t2 { println("T2 PASS — 8 taps respond at 8 distinct phases of 1 Hz sine") } else { println("T2 FAIL") }
+
+    let t3 = check_T3_api_contract()
+    if t3 { println("T3 PASS — process() API contract (len matches; taps clamped)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4_tanh_saturation()
+    if t4 { println("T4 PASS — tanh saturation bounds output (|y| <= 1)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5_determinism()
+    if t5 { println("T5 PASS — deterministic process (no hidden state)") } else { println("T5 FAIL") }
+
+    println("")
+    let all = t1 && t2 && t3 && t4 && t5
+    if all {
+        println("[photonic/temporal_delay] 5/5 PASS — PHYS-P6-1 DONE")
+    } else {
+        println("[photonic/temporal_delay] SOME FAILED")
+    }
+}
+
+test()

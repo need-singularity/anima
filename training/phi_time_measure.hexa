@@ -1,0 +1,417 @@
+// training/phi_time_measure.hexa — Φ(time) measurement for ANIMA P6
+//
+// ALM-P6-3: temporal binding signature — mean triadic mutual information
+// between retention-pooled past, now, and protention-pooled future, scaled
+// by the total number of hidden coordinates integrated:
+//
+//   triadic_MI = [ MI(h_past, h_now)
+//                + MI(h_now,  h_future)
+//                + MI(h_past, h_future) ] / 3
+//
+//   Φ_time = triadic_MI × N_total
+//
+// where N_total = len(h_past) + len(h_now) + len(h_future) is the count
+// of hidden-state coordinates contributing to the binding — following the
+// `Φ_holo = MI × N` convention in phi_holographic_measure / phi_reflexive.
+//
+//   h_past    ∈ R^D  — retention pooled hidden state
+//   h_now     ∈ R^D  — now-frame hidden state
+//   h_future  ∈ R^D  — protention pooled hidden state
+//
+// Interpretation:
+//   - Fully decorrelated frames (untrained model) → triadic_MI ≈ 0
+//     → Φ_time ≈ 0 (no temporal binding)
+//   - Perfectly bound triad (ĥ_past ≈ ĥ_now ≈ ĥ_future) → triadic_MI = H(h)
+//     → Φ_time = H(h) × 3D (full temporal binding, capped by boundary H)
+//   - Training monotonically grows Φ_time toward the binding ceiling
+//
+// T-theorems (checked in self-test):
+//   T1 (positivity): Φ_time ≥ 0 always; > 0 when frames share information
+//   T2 (entropy bound): triadic_MI ≤ min(H(past), H(now), H(future))
+//   T3 (self-identity maximum): past=now=future (byte-identical) ⇒
+//       triadic_MI = H(h) exactly; Φ_time = H(h) × 3D
+//   T4 (determinism): same (past, now, future) → byte-identical Φ_time
+//   T5 (latency): D ∈ {64, 128} finite & < 2000 ms each (stage1 budget)
+//
+// Self-contained — follows the sibling phi_reflexive_measure.hexa pattern
+// and re-uses the log-bin MI estimator shared across the ALM track. The
+// "MI × N" scaling mirrors phi_holographic_measure.hexa conventions so
+// Φ_time and Φ_holo are directly comparable (enables the P6 gate
+// Φ_time > 0.5 × Φ_holo).
+//
+// Run with: hexa run training/phi_time_measure.hexa
+
+// ─── Constants ──────────────────────────────────────────────
+
+let MI_BINS         = 8            // log-bin count for entropy estimator
+let EPS             = 0.0000001    // log floor
+let PHI_TIME_RATIO  = 0.5          // Φ_time / Φ_holo target (roadmap gate)
+
+// ─── Primitives (self-contained) ────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+// Deterministic LCG → bounded floats in [-1, 1).
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+// ─── Log-bin MI estimator ───────────────────────────────────
+// Matches phi_holographic_measure.hexa + phi_reflexive_measure.hexa so
+// the three Φ measurements share a common histogram scheme — necessary
+// for inter-Φ ratio gates (Φ_time / Φ_holo > 0.5, etc.).
+
+fn bin_index(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn count_hits(bin_ids: array, n_bins: int) -> array {
+    let n = len(bin_ids)
+    let mut counts = []
+    let mut k = 0
+    while k < n_bins {
+        let mut c = 0.0
+        let mut i = 0
+        while i < n {
+            if bin_ids[i] == k { c = c + 1.0 }
+            i = i + 1
+        }
+        counts = counts.push(c)
+        k = k + 1
+    }
+    return counts
+}
+
+fn entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut bin_ids = []
+    let mut i = 0
+    while i < n {
+        bin_ids = bin_ids.push(bin_index(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let counts = count_hits(bin_ids, nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+fn joint_entropy_hist(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = bin_index(a[i], lo, hi, nb)
+        let ib = bin_index(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let nb2 = nb * nb
+    let counts = count_hits(pair_ids, nb2)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb2 {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+// Mutual information between two equal-length vectors (log-bin proxy).
+// Shared (lo, hi) support across the pair — necessary so H(a), H(b),
+// H(a,b) sit on the same histogram scale.
+fn mutual_info(a: array, b: array) -> float {
+    let lo_a = vec_min(a)
+    let hi_a = vec_max(a)
+    let lo_b = vec_min(b)
+    let hi_b = vec_max(b)
+    let lo = if lo_a < lo_b { lo_a } else { lo_b }
+    let hi = if hi_a > hi_b { hi_a } else { hi_b }
+    let h_a  = entropy_hist(a, lo, hi, MI_BINS)
+    let h_b  = entropy_hist(b, lo, hi, MI_BINS)
+    let h_ab = joint_entropy_hist(a, b, lo, hi, MI_BINS)
+    let mi = h_a + h_b - h_ab
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// Single-vector entropy — used for T2/T3 witnesses.
+fn hidden_entropy(h: array) -> float {
+    let lo = vec_min(h)
+    let hi = vec_max(h)
+    return entropy_hist(h, lo, hi, MI_BINS)
+}
+
+// ─── Φ_time = triadic_MI × N_total ─────────────────────────
+//
+// The three pairwise MIs share the shared-support protocol inside
+// mutual_info; the triadic mean is then scaled by the total coord count.
+// For equal-dim frames, N_total = 3D.
+
+fn triadic_mi(h_past: array, h_now: array, h_future: array) -> float {
+    let n = len(h_past)
+    if n == 0 { return 0.0 }
+    if len(h_now) != n { return 0.0 }
+    if len(h_future) != n { return 0.0 }
+    let mi_pn = mutual_info(h_past,  h_now)
+    let mi_nf = mutual_info(h_now,   h_future)
+    let mi_pf = mutual_info(h_past,  h_future)
+    return (mi_pn + mi_nf + mi_pf) / 3.0
+}
+
+fn phi_time(h_past: array, h_now: array, h_future: array) -> float {
+    let n_total = len(h_past) + len(h_now) + len(h_future)
+    if n_total == 0 { return 0.0 }
+    let mi = triadic_mi(h_past, h_now, h_future)
+    return mi * to_float(n_total)
+}
+
+// Ratio against an externally-measured Φ_holo (from ALM-P4/P3-3).
+// Used to report the roadmap gate Φ_time > 0.5 · Φ_holo.
+fn phi_time_ratio(phi_time_val: float, phi_holo: float) -> float {
+    if phi_holo <= EPS { return 0.0 }
+    return phi_time_val / phi_holo
+}
+
+// Convenience: return (MI_pn, MI_nf, MI_pf) so callers can log components.
+fn phi_time_breakdown(h_past: array, h_now: array, h_future: array) -> array {
+    let mi_pn = mutual_info(h_past,  h_now)
+    let mi_nf = mutual_info(h_now,   h_future)
+    let mi_pf = mutual_info(h_past,  h_future)
+    let mut out = []
+    out = out.push(mi_pn)
+    out = out.push(mi_nf)
+    out = out.push(mi_pf)
+    return out
+}
+
+// ─── Self-tests ─────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Positivity: Φ_time ≥ 0 always.
+    // (a) Independent random triad → Φ finite, ≥ 0, possibly small.
+    // (b) Correlated: future = now, past = now + 1% noise → Φ > 0 strictly.
+    let D = 64
+    let a = det_rand(D, 29)
+    let b = det_rand(D, 31)
+    let c = det_rand(D, 37)
+    let phi_rnd = phi_time(a, b, c)
+
+    let now = det_rand(D, 41)
+    let fut = now                             // byte-identical clone
+    let noise = det_rand(D, 43)
+    let mut past = []
+    let mut i = 0
+    while i < D {
+        past = past.push(now[i] + noise[i] * 0.01)
+        i = i + 1
+    }
+    let phi_bound = phi_time(past, now, fut)
+
+    println("  [T1] Φ_time(indep) = " + str(phi_rnd))
+    println("  [T1] Φ_time(bound) = " + str(phi_bound))
+    if phi_rnd < 0.0 { return false }
+    if phi_bound < 0.0 { return false }
+    if phi_bound <= 0.0 {
+        println("  [T1] FAIL — bound triad gives Φ_time = 0")
+        return false
+    }
+    return true
+}
+
+fn check_T2() -> bool {
+    // Entropy bound: triadic_MI ≤ min(H(past), H(now), H(future)) + slack.
+    let D = 64
+    let h = det_rand(D, 41)
+    let noise = det_rand(D, 43)
+    let mut now = []
+    let mut past = []
+    let mut fut = []
+    let mut i = 0
+    while i < D {
+        now  = now.push(h[i])
+        past = past.push(h[i] * 0.9 + noise[i] * 0.1)
+        fut  = fut.push(h[i] * 0.8 + noise[i] * 0.2)
+        i = i + 1
+    }
+    let mi = triadic_mi(past, now, fut)
+    let h_p = hidden_entropy(past)
+    let h_n = hidden_entropy(now)
+    let h_f = hidden_entropy(fut)
+    let mut min_h = h_p
+    if h_n < min_h { min_h = h_n }
+    if h_f < min_h { min_h = h_f }
+    let ok = mi <= min_h + 0.01     // tiny slack for histogram bias
+    println("  [T2] triadic_MI = " + str(mi) + "  H(past)=" + str(h_p) + " H(now)=" + str(h_n) + " H(fut)=" + str(h_f))
+    if !ok {
+        println("  [T2] FAIL — violates MI upper bound (> min(H)+0.01)")
+    }
+    return ok
+}
+
+fn check_T3() -> bool {
+    // Self-identity maximum: past = now = future byte-identical ⇒
+    // triadic_MI = H(h) exactly; Φ_time = H(h) × 3D.
+    let D = 64
+    let h = det_rand(D, 53)
+    let mi = triadic_mi(h, h, h)
+    let phi_t = phi_time(h, h, h)
+    let hh = hidden_entropy(h)
+    let expected_phi = hh * to_float(3 * D)
+    println("  [T3] triadic_MI(h,h,h) = " + str(mi) + "  H(h) = " + str(hh))
+    println("  [T3] Φ_time = " + str(phi_t) + "  expected = " + str(expected_phi))
+    if fabs(mi - hh) > 0.0001 { return false }
+    if fabs(phi_t - expected_phi) > 0.001 { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // Determinism: two identical calls produce byte-identical Φ_time.
+    let D = 32
+    let a = det_rand(D, 101)
+    let b = det_rand(D, 103)
+    let c = det_rand(D, 107)
+    let p1 = phi_time(a, b, c)
+    let p2 = phi_time(a, b, c)
+    println("  [T4] Φ1 = " + str(p1) + "  Φ2 = " + str(p2))
+    return fabs(p1 - p2) == 0.0
+}
+
+fn check_T5() -> bool {
+    // Dim-invariance + latency: D ∈ {64, 128} finite & < 2000 ms each
+    // on the stage1 interpreter. Three pairwise MIs per call → roughly
+    // 3× the phi_reflexive cost at the same D.
+    let D_a = 64
+    let D_b = 128
+
+    let a_p = det_rand(D_a, 55)
+    let a_n = det_rand(D_a, 57)
+    let a_f = det_rand(D_a, 59)
+    let _wa1 = phi_time(a_p, a_n, a_f)
+    let _wa2 = phi_time(a_p, a_n, a_f)
+    let t0a = clock()
+    let phi_a = phi_time(a_p, a_n, a_f)
+    let t1a = clock()
+    let ms_a = (t1a - t0a) * 1000.0
+
+    let b_p = det_rand(D_b, 77)
+    let b_n = det_rand(D_b, 79)
+    let b_f = det_rand(D_b, 81)
+    let _wb1 = phi_time(b_p, b_n, b_f)
+    let _wb2 = phi_time(b_p, b_n, b_f)
+    let t0b = clock()
+    let phi_b = phi_time(b_p, b_n, b_f)
+    let t1b = clock()
+    let ms_b = (t1b - t0b) * 1000.0
+
+    let finite_a = phi_a >= 0.0
+    let finite_b = phi_b >= 0.0
+    let ok = finite_a && finite_b && ms_a < 2000.0 && ms_b < 2000.0
+
+    println("  [T5] D=64  Φ_time=" + str(phi_a) + " t=" + str(ms_a) + "ms")
+    println("  [T5] D=128 Φ_time=" + str(phi_b) + " t=" + str(ms_b) + "ms")
+    return ok
+}
+
+// ─── main ───────────────────────────────────────────────────
+
+fn main() {
+    println("[phi_time_measure] ALM-P6-3 Φ(time) self-test")
+    println("  mock: MI_BINS=" + str(MI_BINS) + " ratio_gate=" + str(PHI_TIME_RATIO))
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[phi_time_measure] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[phi_time_measure] ALL 5/5 PASS")
+    } else {
+        println("[phi_time_measure] SOME FAILED")
+    }
+}
+
+main()
