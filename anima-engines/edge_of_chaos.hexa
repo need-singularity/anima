@@ -1,0 +1,208 @@
+// edge_of_chaos.hexa — PHYS-P14-1 "edge-of-chaos memristor — 창조성 대역"
+//
+// A memristor network operating at the "edge of chaos" — the critical
+// regime between order and chaos where creativity is maximised.
+//
+// ─── Theory ──────────────────────────────────────────────────
+//
+// The logistic map x_{n+1} = r * x_n * (1 - x_n) is the simplest
+// dynamical system exhibiting the full route to chaos:
+//
+//   r < 3.57   stable (fixed points / periodic orbits)
+//   r ~ 3.57   edge of chaos (onset of chaos, period-doubling cascade)
+//   r > 3.57   chaotic (positive Lyapunov exponent)
+//
+// A memristor whose internal resistance state is governed by the
+// logistic map inherits these regimes.  The edge of chaos is the
+// narrow band r in [3.55, 3.60] where the Lyapunov exponent is
+// approximately zero — the system is neither predictable nor random.
+// This is the creativity band: maximal information processing capacity
+// (Langton 1990, Packard 1988).
+//
+// Lyapunov exponent estimation:
+//   lambda = (1/N) * sum_{n=0}^{N-1} ln|f'(x_n)|
+//          = (1/N) * sum_{n=0}^{N-1} ln|r - 2*r*x_n|
+//
+// At edge of chaos, lambda -> 0.
+//
+// ─── API ─────────────────────────────────────────────────────
+//
+//   eoc_step(x, r)                     -> float  (next state)
+//   estimate_lyapunov(x0, r, n_steps)  -> float  (Lyapunov exponent)
+//
+// ─── Self-tests (T1-T5) ─────────────────────────────────────
+//
+// T1: Stable regime     (r=2.5) -> lambda < -0.1
+// T2: Edge-of-chaos     (r=3.57) -> |lambda| < 0.15
+// T3: Chaotic regime    (r=3.9) -> lambda > 0.1
+// T4: Determinism       (same input -> same output)
+// T5: Latency           (1000 steps < 500 ms)
+//
+// Ref:
+//   anima-engines/fractal_memristor.hexa     (PHYS-P8-2 fractal memristor)
+//   anima-engines/memristor_consciousness.hexa (HP memristor model)
+//   shared/roadmaps/anima.json               (PHYS-P14-1 entry)
+
+// ─── Constants ───────────────────────────────────────────────
+
+let EOC_R_STABLE  = 2.5     // stable regime
+let EOC_R_EDGE    = 3.57    // edge-of-chaos regime
+let EOC_R_CHAOTIC = 3.9     // chaotic regime
+let EOC_X0        = 0.4     // initial state (must be in (0,1))
+let EOC_WARMUP    = 200     // transient steps discarded before measuring
+let EOC_MEASURE   = 800     // steps used for Lyapunov estimation
+
+// ─── Primitives ──────────────────────────────────────────────
+
+fn fabs_eoc(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// ─── Core API ────────────────────────────────────────────────
+
+// eoc_step: one iteration of the logistic map memristor.
+//   x_{n+1} = r * x_n * (1 - x_n)
+//
+// The logistic map is the canonical route-to-chaos system.
+// Interpreting x as normalised memristor conductance state (0..1),
+// the parameter r controls the nonlinear feedback strength:
+// low r = restoring (ordered), high r = amplifying (chaotic).
+fn eoc_step(x: float, r: float) -> float {
+    return r * x * (1.0 - x)
+}
+
+// estimate_lyapunov: compute the maximal Lyapunov exponent for the
+// logistic map at parameter r, starting from x0.
+//
+// Method:
+//   1. Run EOC_WARMUP steps to wash out transients.
+//   2. Accumulate sum of ln|f'(x_n)| over EOC_MEASURE steps.
+//      f'(x) = r - 2*r*x = r*(1 - 2*x), so |f'(x)| = |r*(1-2*x)|.
+//   3. lambda = sum / EOC_MEASURE.
+//
+// Result interpretation:
+//   lambda < 0  -> stable (exponential convergence to attractor)
+//   lambda ~ 0  -> edge of chaos (critical regime)
+//   lambda > 0  -> chaotic (exponential divergence of nearby orbits)
+fn estimate_lyapunov(x0: float, r: float, n_steps: int) -> float {
+    // Phase 1: warm-up — discard transient
+    let mut x = x0
+    let mut w = 0
+    while w < EOC_WARMUP {
+        x = eoc_step(x, r)
+        w = w + 1
+    }
+
+    // Phase 2: accumulate Lyapunov sum
+    let mut lyap_sum = 0.0
+    let mut n = 0
+    while n < n_steps {
+        // derivative of logistic map: f'(x) = r*(1 - 2*x)
+        let deriv = r * (1.0 - 2.0 * x)
+        let abs_deriv = fabs_eoc(deriv)
+        // guard against ln(0) — clamp to tiny positive value
+        if abs_deriv > 0.0000000001 {
+            lyap_sum = lyap_sum + ln(abs_deriv)
+        } else {
+            lyap_sum = lyap_sum + ln(0.0000000001)
+        }
+        x = eoc_step(x, r)
+        n = n + 1
+    }
+
+    return lyap_sum / to_float(n_steps)
+}
+
+// ─── Self-tests ──────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // T1: Stable regime (r=2.5) -> lambda < -0.1 (negative = convergent)
+    let lam = estimate_lyapunov(EOC_X0, EOC_R_STABLE, EOC_MEASURE)
+    println("  [T1] r=" + str(EOC_R_STABLE) + "  lambda=" + str(lam))
+    if lam < 0.0 - 0.1 { return true }
+    return false
+}
+
+fn check_T2() -> bool {
+    // T2: Edge-of-chaos (r=3.57) -> |lambda| < 0.15 (near zero)
+    let lam = estimate_lyapunov(EOC_X0, EOC_R_EDGE, EOC_MEASURE)
+    let abs_lam = fabs_eoc(lam)
+    println("  [T2] r=" + str(EOC_R_EDGE) + "  lambda=" + str(lam) + "  |lambda|=" + str(abs_lam))
+    if abs_lam < 0.15 { return true }
+    return false
+}
+
+fn check_T3() -> bool {
+    // T3: Chaotic regime (r=3.9) -> lambda > 0.1 (positive = divergent)
+    let lam = estimate_lyapunov(EOC_X0, EOC_R_CHAOTIC, EOC_MEASURE)
+    println("  [T3] r=" + str(EOC_R_CHAOTIC) + "  lambda=" + str(lam))
+    if lam > 0.1 { return true }
+    return false
+}
+
+fn check_T4() -> bool {
+    // T4: Determinism — same initial state + same r -> identical trajectory
+    let lam_a = estimate_lyapunov(EOC_X0, EOC_R_EDGE, EOC_MEASURE)
+    let lam_b = estimate_lyapunov(EOC_X0, EOC_R_EDGE, EOC_MEASURE)
+    let diff = fabs_eoc(lam_a - lam_b)
+    println("  [T4] run_a=" + str(lam_a) + "  run_b=" + str(lam_b) + "  diff=" + str(diff))
+    if diff < 0.0000001 { return true }
+    return false
+}
+
+fn check_T5() -> bool {
+    // T5: Latency — 1000 steps < 500 ms
+    let t0 = clock()
+    let mut x = EOC_X0
+    let mut i = 0
+    while i < 1000 {
+        x = eoc_step(x, EOC_R_EDGE)
+        i = i + 1
+    }
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] 1000 steps = " + str(ms) + " ms  (final x=" + str(x) + ")")
+    if ms < 500.0 { return true }
+    return false
+}
+
+// ─── main ────────────────────────────────────────────────────
+
+fn main() {
+    println("[edge_of_chaos] PHYS-P14-1 — edge-of-chaos memristor, creativity band")
+    println("  r_stable=" + str(EOC_R_STABLE) + " r_edge=" + str(EOC_R_EDGE) + " r_chaotic=" + str(EOC_R_CHAOTIC))
+    println("  warmup=" + str(EOC_WARMUP) + " measure=" + str(EOC_MEASURE))
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  stable regime lambda < -0.1") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  edge-of-chaos |lambda| < 0.15") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  chaotic regime lambda > 0.1") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  determinism") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  latency < 500 ms") } else { println("T5 FAIL") }
+
+    let mut pass_count = 0
+    if t1 { pass_count = pass_count + 1 }
+    if t2 { pass_count = pass_count + 1 }
+    if t3 { pass_count = pass_count + 1 }
+    if t4 { pass_count = pass_count + 1 }
+    if t5 { pass_count = pass_count + 1 }
+
+    println("")
+    if pass_count == 5 {
+        println("[edge_of_chaos] ALL 5/5 PASS  -- Lyapunov ~ 0 maintained at edge")
+    } else {
+        println("[edge_of_chaos] " + str(pass_count) + "/5 PASS")
+    }
+}
+
+main()

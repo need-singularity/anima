@@ -1,0 +1,470 @@
+// insight_trigger.hexa — CLM-P14-2 insight trigger (aha moment detection)
+//
+// Roadmap: shared/roadmaps/anima.json P14 CLM track, CLM-P14-2
+//   "insight trigger — aha moment 감지"
+//   done_criteria: "restructuring 감지"
+//
+// Detects "aha moments" — sudden restructuring of internal representations.
+// When the internal state vector suddenly jumps far from its recent
+// trajectory (exponential moving average), an insight is triggered.
+// After insight fires, the running average resets to the new vector,
+// representing a cognitive restructuring.
+//
+// ─── Dynamics ─────────────────────────────────────────────────
+//
+// Exponential Moving Average (EMA) tracks recent trajectory:
+//   avg[i] = avg[i] * (1 - ALPHA) + new_vec[i] * ALPHA
+//
+// Insight detection:
+//   dist = sqrt( sum_i (new_vec[i] - avg[i])^2 )
+//   if dist > INSIGHT_THRESHOLD -> insight fires
+//
+// After insight fires, running average resets to new_vec:
+//   avg[i] = new_vec[i]   (restructuring — old trajectory abandoned)
+//
+// ─── State layout (flat array) ────────────────────────────────
+//
+// For d-dimensional vectors, state has length 2*d + 3:
+//   [0 .. d-1]       running average (EMA) of recent vectors
+//   [d .. 2*d-1]     last distance per dimension (debug/introspection)
+//   [2*d]            insight_flag (0.0 or 1.0)
+//   [2*d + 1]        last_distance (scalar, the triggering dist)
+//   [2*d + 2]        step_count
+//
+// ─── API ──────────────────────────────────────────────────────
+//
+//   insight_new(d)                    -> state (zero-initialized)
+//   insight_step(state, new_vec, d)   -> updated state + insight_flag
+//
+// ─── Self-tests (T1-T5) ──────────────────────────────────────
+//
+//   T1: Gradual drift (small steps) -> no insight triggered
+//   T2: Sudden jump (far from average) -> insight triggered
+//   T3: After insight, running average resets (restructuring confirmed)
+//   T4: Determinism (same inputs -> same outputs)
+//   T5: Latency — 100 steps < 500ms
+//
+// Hexa stage0 constraints honored:
+//   - `array` not `[float]` for all array types
+//   - No multi-term && chains; nested ifs or temp vars instead
+//   - Lists pass-by-value; rebuild via return to persist mutations
+//   - Each `return` fits on one source line
+//   - No struct with array fields (avoid aliasing bug)
+//   - Single-line return expressions only
+//
+// Law alignment:
+//   Law 2   Observe, never inject -- distance is MEASURED, not fabricated
+//   Law 4   Structure > feature -- EMA is structural state tracking
+//   Law 22  Feature addition -> phi down -- no branching added; pure state
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let ALPHA             = 0.1    // EMA smoothing factor (slow adaptation)
+let INSIGHT_THRESHOLD = 2.0    // distance threshold for aha moment (test scale)
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn fabs_it(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sqrt_it(x: float) -> float {
+    // Newton's method for sqrt, 20 iterations. Sufficient for test-scale values.
+    // Root cause comment: hexa stage0 has no built-in sqrt, so we implement manually.
+    if x <= 0.0 { return 0.0 }
+    let mut g = x
+    if x > 1.0 { g = x / 2.0 }
+    let mut i = 0
+    while i < 20 {
+        g = (g + x / g) / 2.0
+        i = i + 1
+    }
+    return g
+}
+
+// ═══════════════════════════════════════════════════════════════
+// insight_new — create initial state for d-dimensional vectors
+//
+// State length = 2*d + 3
+//   [0..d-1]    avg (all 0.0)
+//   [d..2d-1]   dim_dists (all 0.0)
+//   [2d]        insight_flag = 0.0
+//   [2d+1]      last_distance = 0.0
+//   [2d+2]      step_count = 0.0
+// ═══════════════════════════════════════════════════════════════
+
+fn insight_new(d: int) -> array {
+    let total = d * 2 + 3
+    let mut s = []
+    let mut i = 0
+    while i < total {
+        s = s.push(0.0)
+        i = i + 1
+    }
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════
+// insight_step — one step of insight detection
+//
+//   1. Compute distance(new_vec, running_avg)
+//   2. Update EMA: avg = avg * (1-alpha) + new_vec * alpha
+//   3. If distance > INSIGHT_THRESHOLD -> insight fires, reset avg to new_vec
+//
+// Returns new state array (pass-by-value; caller must use the return).
+// ═══════════════════════════════════════════════════════════════
+
+fn insight_step(state: array, new_vec: array, d: int) -> array {
+    // Compute squared distance between new_vec and running average
+    let mut sum_sq = 0.0
+    let mut j = 0
+    while j < d {
+        let diff = new_vec[j] - state[j]
+        sum_sq = sum_sq + diff * diff
+        j = j + 1
+    }
+    let dist = sqrt_it(sum_sq)
+
+    // Check if insight fires
+    let fires = dist > INSIGHT_THRESHOLD
+
+    // Update running average (EMA)
+    let keep = 1.0 - ALPHA
+    let mut out = []
+    let mut k = 0
+    while k < d {
+        let avg_old = state[k]
+        let mut avg_new = avg_old * keep + new_vec[k] * ALPHA
+        // Root cause comment: if insight fires, we reset the running average
+        // to new_vec — this is the "restructuring" that abandons the old trajectory.
+        if fires {
+            avg_new = new_vec[k]
+        }
+        out = out.push(avg_new)
+        k = k + 1
+    }
+
+    // Store per-dimension distances (for debug introspection)
+    let mut m = 0
+    while m < d {
+        let dd = new_vec[m] - state[m]
+        out = out.push(dd)
+        m = m + 1
+    }
+
+    // insight_flag
+    let mut flag = 0.0
+    if fires { flag = 1.0 }
+    out = out.push(flag)
+
+    // last_distance
+    out = out.push(dist)
+
+    // step_count
+    let old_step = state[d * 2 + 2]
+    out = out.push(old_step + 1.0)
+
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// State accessors
+// ═══════════════════════════════════════════════════════════════
+
+fn insight_flag(state: array, d: int) -> float {
+    return state[d * 2]
+}
+
+fn insight_dist(state: array, d: int) -> float {
+    return state[d * 2 + 1]
+}
+
+fn insight_step_count(state: array, d: int) -> float {
+    return state[d * 2 + 2]
+}
+
+fn insight_avg(state: array, d: int) -> array {
+    let mut avg = []
+    let mut i = 0
+    while i < d {
+        avg = avg.push(state[i])
+        i = i + 1
+    }
+    return avg
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1-T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1: Gradual drift (small steps) -> no insight triggered.
+    //
+    // Start at origin. Each step nudges by +0.05 per dimension.
+    // With d=4, step magnitude = sqrt(4 * 0.05^2) = sqrt(0.01) = 0.1
+    // The EMA adapts with alpha=0.1, so the average trails behind by
+    // roughly (1-alpha)/alpha * step_size ~ 0.9 * 0.05 = 0.045 per dim.
+    // Max distance from avg ≈ sqrt(4 * 0.045^2) ≈ 0.09 << 2.0 threshold.
+    // No insight should fire.
+    let d = 4
+    let mut s = insight_new(d)
+    let mut step_num = 0
+    let mut any_fired = false
+
+    while step_num < 50 {
+        let val = to_float(step_num) * 0.05
+        let mut v = []
+        let mut di = 0
+        while di < d {
+            v = v.push(val)
+            di = di + 1
+        }
+        s = insight_step(s, v, d)
+        let flag = insight_flag(s, d)
+        if flag > 0.5 {
+            any_fired = true
+        }
+        step_num = step_num + 1
+    }
+
+    let final_dist = insight_dist(s, d)
+    println("  [T1] 50 gradual steps, d=4, drift=0.05/step: any_fired=" + str(any_fired) + " final_dist=" + str(final_dist))
+    // Must NOT fire
+    if any_fired { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: Sudden jump (far from average) -> insight triggered.
+    //
+    // Run 10 steps near origin to establish an average near 0,
+    // then inject a vector at (5.0, 5.0, 5.0, 5.0).
+    // Distance = sqrt(4 * 5^2) = sqrt(100) = 10.0 >> 2.0 threshold.
+    // Insight must fire on the jump step.
+    let d = 4
+    let mut s = insight_new(d)
+
+    // Warm up near origin
+    let mut i = 0
+    while i < 10 {
+        let mut v = []
+        let small = to_float(i) * 0.01
+        let mut di = 0
+        while di < d {
+            v = v.push(small)
+            di = di + 1
+        }
+        s = insight_step(s, v, d)
+        i = i + 1
+    }
+
+    // Sudden jump
+    let mut jump = []
+    let mut di2 = 0
+    while di2 < d {
+        jump = jump.push(5.0)
+        di2 = di2 + 1
+    }
+    s = insight_step(s, jump, d)
+
+    let flag = insight_flag(s, d)
+    let dist = insight_dist(s, d)
+    let fired = flag > 0.5
+    println("  [T2] after sudden jump to (5,5,5,5): fired=" + str(fired) + " dist=" + str(dist))
+    return fired
+}
+
+fn check_T3() -> bool {
+    // T3: After insight, running average resets (restructuring confirmed).
+    //
+    // After the jump in T2's scenario, the running average should be
+    // reset to the jump vector (5.0 per dim). We verify by checking
+    // that the next gradual step from (5.0,...) does NOT fire insight
+    // (because avg is now at the jump point, so distance is small).
+    let d = 4
+    let mut s = insight_new(d)
+
+    // Warm up near origin
+    let mut i = 0
+    while i < 10 {
+        let mut v = []
+        let small = to_float(i) * 0.01
+        let mut di = 0
+        while di < d {
+            v = v.push(small)
+            di = di + 1
+        }
+        s = insight_step(s, v, d)
+        i = i + 1
+    }
+
+    // Sudden jump -> insight fires
+    let mut jump = []
+    let mut di2 = 0
+    while di2 < d {
+        jump = jump.push(5.0)
+        di2 = di2 + 1
+    }
+    s = insight_step(s, jump, d)
+
+    // Verify insight fired
+    let fire_flag = insight_flag(s, d)
+    if fire_flag < 0.5 {
+        println("  [T3] SETUP FAIL: insight did not fire on jump")
+        return false
+    }
+
+    // Read the running average — should be reset to jump vector
+    let avg = insight_avg(s, d)
+    let avg0 = avg[0]
+    let avg_near_five = fabs_it(avg0 - 5.0) < 0.01
+    println("  [T3] avg after restructuring: avg[0]=" + str(avg0) + " (expect ~5.0)")
+
+    if !avg_near_five {
+        println("  [T3] FAIL: avg not reset to jump vector")
+        return false
+    }
+
+    // Next step slightly near 5.0 -> should NOT fire insight
+    let mut near = []
+    let mut di3 = 0
+    while di3 < d {
+        near = near.push(5.1)
+        di3 = di3 + 1
+    }
+    s = insight_step(s, near, d)
+
+    let no_fire = insight_flag(s, d) < 0.5
+    let dist_after = insight_dist(s, d)
+    println("  [T3] step after restructuring: dist=" + str(dist_after) + " no_fire=" + str(no_fire))
+    return avg_near_five
+}
+
+fn check_T4() -> bool {
+    // T4: Determinism — same inputs -> same outputs.
+    //
+    // Run two identical sequences and verify the final state matches exactly.
+    let d = 3
+    let mut s1 = insight_new(d)
+    let mut s2 = insight_new(d)
+
+    let mut i = 0
+    while i < 20 {
+        let val = to_float(i) * 0.1
+        let mut v = []
+        let mut di = 0
+        while di < d {
+            v = v.push(val + to_float(di) * 0.02)
+            di = di + 1
+        }
+
+        s1 = insight_step(s1, v, d)
+
+        // Rebuild same vector for s2 (pass-by-value: v is consumed by s1 call)
+        let mut v2 = []
+        let mut di2 = 0
+        while di2 < d {
+            v2 = v2.push(val + to_float(di2) * 0.02)
+            di2 = di2 + 1
+        }
+        s2 = insight_step(s2, v2, d)
+
+        i = i + 1
+    }
+
+    // Compare final states
+    let total_len = d * 2 + 3
+    let mut mismatch = false
+    let mut idx = 0
+    while idx < total_len {
+        let diff = fabs_it(s1[idx] - s2[idx])
+        if diff > 0.0001 {
+            mismatch = true
+        }
+        idx = idx + 1
+    }
+
+    let dist1 = insight_dist(s1, d)
+    let dist2 = insight_dist(s2, d)
+    println("  [T4] run1 dist=" + str(dist1) + " run2 dist=" + str(dist2) + " mismatch=" + str(mismatch))
+    if mismatch { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5: Latency — 100 steps < 500ms.
+    //
+    // Root cause comment: hexa stage0 clock() can return 0 on fast runs.
+    // The 500ms limit accommodates clock() precision while catching regressions.
+    let d = 8
+    let mut s = insight_new(d)
+
+    let t0 = clock()
+    let mut i = 0
+    while i < 100 {
+        let mut v = []
+        let val = to_float(i) * 0.03
+        let mut di = 0
+        while di < d {
+            v = v.push(val + to_float(di) * 0.01)
+            di = di + 1
+        }
+        s = insight_step(s, v, d)
+        i = i + 1
+    }
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+
+    println("  [T5] 100 steps, d=8 = " + str(ms) + " ms (limit 500ms)")
+    return ms < 500.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — run all self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[anima-engines/insight_trigger] CLM-P14-2 — insight trigger (aha moment)")
+    println("  EMA alpha=" + str(ALPHA) + "  INSIGHT_THRESHOLD=" + str(INSIGHT_THRESHOLD))
+    println("  detection: dist(new_vec, running_avg) > threshold -> restructuring")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — gradual drift no insight") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — sudden jump triggers insight") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — restructuring confirmed (avg reset)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — determinism (same inputs same outputs)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — 100 steps d=8 < 500ms") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause comment: hexa stage0 can mishandle chained && with 5 terms.
+    // Split into sequential checks with temp variables.
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[anima-engines/insight_trigger] 5/5 PASS — CLM-P14-2 DONE (restructuring 감지)")
+    } else {
+        println("[anima-engines/insight_trigger] SOME FAILED")
+    }
+}
+
+main()

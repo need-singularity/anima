@@ -1,0 +1,300 @@
+// stochastic_resonance.hexa — PHYS-P14-2 stochastic resonance — noise-enhanced signal detection
+//
+// Roadmap: shared/roadmaps/anima.json P14 PHYSICS track, PHYS-P14-2
+//   "stochastic resonance — 노이즈로 신호 증폭"
+//   done_criteria: "SNR 상승"
+//
+// Stochastic resonance: adding an optimal amount of noise to a weak
+// subthreshold signal can paradoxically INCREASE the signal-to-noise
+// ratio. This is the physical basis for noise-enhanced creativity.
+//
+// Model:
+//   signal(t)  = signal_amp * sin(2*pi * f_signal * t)
+//   input(t)   = signal(t) + noise_amp * xi(t)       [xi ~ uniform(-1,1)]
+//   output(t)  = 1 if input(t) > threshold, else 0
+//
+// Without noise: signal_amp < threshold, so the signal NEVER crosses
+// the threshold. Detection rate = 0, SNR = 0.
+//
+// With optimal noise: the combined input occasionally crosses the
+// threshold, and crossings correlate with signal peaks. The result
+// is detection correlated with the signal, yielding positive SNR.
+//
+// API:
+//   sr_detect(signal_amp, noise_amp, threshold, f_signal, n_steps, dt, seed)
+//       -> array [detection_rate, snr_estimate]
+//
+//   detection_rate = (threshold crossings) / (expected signal peaks)
+//   snr_estimate   = peak_detection_rate / off_peak_detection_rate
+//                    (ratio of detections near signal peaks vs away)
+//
+// Self-tests T1-T5 (all must PASS):
+//   T1: No noise -> detection rate = 0 (subthreshold signal)
+//   T2: Optimal noise -> detection rate > 0.3 (resonance)
+//   T3: SNR with optimal noise > SNR with no noise (gate: SNR 상승)
+//   T4: Determinism (same seed -> same results)
+//   T5: Latency (500 steps < 1000 ms)
+//
+// Hexa stage0 constraints honored:
+//   - `array` not `[float]` for all array types
+//   - No multi-term && chains; nested ifs or temp vars instead
+//   - Lists pass-by-value; rebuild via return to persist mutations
+//   - Each `return` fits on one source line
+//   - No struct with array fields (avoid aliasing bug)
+//   - Single-line return expressions only
+
+// ===================================================================
+// Constants
+// ===================================================================
+
+let PI = 3.14159265358979
+let TWO_PI = 6.28318530717959
+
+// ===================================================================
+// Helpers
+// ===================================================================
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// Deterministic PRNG: LCG returning (next_seed, value_in_[-1,1])
+// as a 2-element array. Using the glibc LCG constants.
+fn lcg_next(seed: int) -> array {
+    // Root cause: hexa stage0 modulo on large ints can overflow,
+    // so we use 2^31 = 2147483648 which fits in 64-bit int safely.
+    let next = (seed * 1103515245 + 12345) % 2147483648
+    let u = to_float(next % 1000000) / 1000000.0
+    let val = u * 2.0 - 1.0
+    let mut out = []
+    out = out.push(to_float(next))
+    out = out.push(val)
+    return out
+}
+
+// ===================================================================
+// sr_detect — stochastic resonance detector
+//
+// Simulates a weak periodic signal + noise passing through a
+// threshold detector, and measures how well the output correlates
+// with the signal peaks.
+//
+// Returns array: [detection_rate, snr_estimate]
+//
+// Algorithm:
+//   1. Generate signal(t) = signal_amp * sin(2*pi*f_signal*t*dt)
+//   2. Generate noise(t) = noise_amp * xi(t)
+//   3. Apply threshold: output(t) = 1 if signal+noise > threshold
+//   4. Count detections near signal peaks (on-peak) and away (off-peak)
+//   5. detection_rate = on_peak_detections / expected_peaks
+//   6. snr_estimate = on_peak_rate / off_peak_rate (inf -> capped at 100)
+// ===================================================================
+
+fn sr_detect(signal_amp: float, noise_amp: float, threshold: float, f_signal: float, n_steps: int, dt: float, seed: int) -> array {
+    let mut cur_seed = seed
+    let mut on_peak_hits = 0.0
+    let mut off_peak_hits = 0.0
+    let mut on_peak_count = 0.0
+    let mut off_peak_count = 0.0
+    let mut i = 0
+
+    while i < n_steps {
+        let t = to_float(i) * dt
+        let phase = TWO_PI * f_signal * t
+        let signal_val = signal_amp * sin(phase)
+
+        // Generate noise
+        let rng = lcg_next(cur_seed)
+        cur_seed = to_int(rng[0])
+        let noise_val = noise_amp * rng[1]
+
+        // Combined input
+        let input_val = signal_val + noise_val
+
+        // Threshold detection
+        let detected = input_val > threshold
+
+        // Classify this timestep as on-peak or off-peak.
+        // On-peak: signal is in its upper region (sin > 0.0, i.e. positive half).
+        // Root cause: using 0.0 as the split captures the full positive half-cycle.
+        // Noise-assisted crossings happen predominantly in this half-cycle,
+        // while the negative half-cycle almost never crosses threshold.
+        // This gives a clean on-peak/off-peak separation for SNR measurement.
+        let is_on_peak = signal_val > 0.0
+
+        if is_on_peak {
+            on_peak_count = on_peak_count + 1.0
+            if detected {
+                on_peak_hits = on_peak_hits + 1.0
+            }
+        } else {
+            off_peak_count = off_peak_count + 1.0
+            if detected {
+                off_peak_hits = off_peak_hits + 1.0
+            }
+        }
+
+        i = i + 1
+    }
+
+    // Compute detection rate (fraction of on-peak times that crossed threshold)
+    let mut detection_rate = 0.0
+    if on_peak_count > 0.0 {
+        detection_rate = on_peak_hits / on_peak_count
+    }
+
+    // Compute SNR estimate = on-peak detection rate / off-peak detection rate
+    // If off-peak rate is zero, SNR is either 0 (no detections at all) or
+    // very high (detections only at peaks). Cap at 100.0.
+    let mut on_rate = 0.0
+    if on_peak_count > 0.0 {
+        on_rate = on_peak_hits / on_peak_count
+    }
+    let mut off_rate = 0.0
+    if off_peak_count > 0.0 {
+        off_rate = off_peak_hits / off_peak_count
+    }
+
+    let mut snr = 0.0
+    if on_rate > 0.0 {
+        if off_rate > 0.0 {
+            snr = on_rate / off_rate
+        } else {
+            // Detections only at peaks, no false alarms -> excellent SNR
+            snr = 100.0
+        }
+    }
+
+    let mut out = []
+    out = out.push(detection_rate)
+    out = out.push(snr)
+    return out
+}
+
+// ===================================================================
+// Self-tests T1-T5
+// ===================================================================
+
+fn check_T1() -> bool {
+    // T1: No noise -> detection rate = 0 (subthreshold signal)
+    //
+    // signal_amp=0.8, threshold=1.0, noise_amp=0.0
+    // Since 0.8 < 1.0, the signal never crosses the threshold.
+    // All detections should be zero.
+    let r = sr_detect(0.8, 0.0, 1.0, 1.0, 500, 0.01, 42)
+    let det = r[0]
+    let snr = r[1]
+    println("  [T1] no noise: detection_rate=" + str(det) + " snr=" + str(snr))
+    let pass = det < 0.001
+    return pass
+}
+
+fn check_T2() -> bool {
+    // T2: Optimal noise -> detection rate > 0.3 (resonance)
+    //
+    // signal_amp=0.8, threshold=1.0, noise_amp=1.5
+    // The noise can push the signal above threshold when signal is near peak.
+    // sin peak = 0.8, noise up to 1.5, so 0.8+1.5=2.3 > 1.0.
+    // At signal peak, noise needs > 0.2 out of [-1.5,1.5] = 43% of range.
+    // Averaged over the positive half-cycle, detection rate is well above 0.3
+    // because even mid-cycle (signal~0.4) noise can bridge the 0.6 gap
+    // with probability ~30%. The off-peak half (signal<0) has a bigger gap
+    // so fewer false alarms -> good SNR.
+    let r = sr_detect(0.8, 1.5, 1.0, 1.0, 500, 0.01, 42)
+    let det = r[0]
+    let snr = r[1]
+    println("  [T2] optimal noise: detection_rate=" + str(det) + " snr=" + str(snr))
+    let pass = det > 0.3
+    return pass
+}
+
+fn check_T3() -> bool {
+    // T3: SNR with optimal noise > SNR with no noise (gate: SNR 상승)
+    //
+    // This is the core stochastic resonance result: noise IMPROVES SNR.
+    // Without noise: SNR = 0 (no detections at all)
+    // With optimal noise: SNR > 0 (detections correlated with signal)
+    let r_no = sr_detect(0.8, 0.0, 1.0, 1.0, 500, 0.01, 42)
+    let snr_no = r_no[1]
+
+    let r_opt = sr_detect(0.8, 1.5, 1.0, 1.0, 500, 0.01, 42)
+    let snr_opt = r_opt[1]
+
+    println("  [T3] SNR no_noise=" + str(snr_no) + " optimal_noise=" + str(snr_opt))
+    // Root cause: stochastic resonance means adding noise paradoxically
+    // increases SNR. snr_opt must be strictly greater than snr_no.
+    let pass = snr_opt > snr_no
+    return pass
+}
+
+fn check_T4() -> bool {
+    // T4: Determinism — same seed -> identical results.
+    let r1 = sr_detect(0.8, 1.5, 1.0, 1.0, 500, 0.01, 42)
+    let r2 = sr_detect(0.8, 1.5, 1.0, 1.0, 500, 0.01, 42)
+
+    let det_diff = fabs(r1[0] - r2[0])
+    let snr_diff = fabs(r1[1] - r2[1])
+    println("  [T4] det_diff=" + str(det_diff) + " snr_diff=" + str(snr_diff))
+    let det_ok = det_diff < 0.0001
+    let snr_ok = snr_diff < 0.0001
+    if det_ok {
+        return snr_ok
+    }
+    return false
+}
+
+fn check_T5() -> bool {
+    // T5: Latency — 500-step simulation < 1000 ms.
+    let t0 = clock()
+    let r = sr_detect(0.8, 1.5, 1.0, 1.0, 500, 0.01, 42)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] 500-step sim = " + str(ms) + " ms (limit 1000 ms)")
+    return ms < 1000.0
+}
+
+// ===================================================================
+// Main — run all self-tests
+// ===================================================================
+
+fn main() {
+    println("[anima-engines/stochastic_resonance] PHYS-P14-2 — stochastic resonance")
+    println("  model: signal(t) + noise(t) -> threshold detector")
+    println("  key insight: subthreshold signal + optimal noise = SNR improvement")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — no noise, detection rate = 0 (subthreshold)") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — optimal noise, detection rate > 0.3 (resonance)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — SNR with noise > SNR without (SNR 상승)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — deterministic (same seed same results)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — 500-step latency < 1000 ms") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause: hexa stage0 can mishandle chained && with 5 terms.
+    // Split into sequential checks with temp variables.
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[anima-engines/stochastic_resonance] 5/5 PASS — PHYS-P14-2 DONE (SNR 상승)")
+    } else {
+        println("[anima-engines/stochastic_resonance] SOME FAILED")
+    }
+}
+
+main()

@@ -1,0 +1,435 @@
+// training/phi_create_measure.hexa — Φ(create) measurement for ANIMA P14
+//
+// ALM-P14-3 / P14 창조 의식 (creative consciousness — bisociation strength, ALM track).
+//
+// Φ_create quantifies the strength of creative bisociation — how much
+// information the blended concept shares with BOTH parent conceptual
+// matrices, weighted by the novelty of the resulting blend.
+//
+// Arthur Koestler's bisociation: creativity = intersection of two
+// habitually incompatible frames of reference. The blend must carry
+// information from both parents (MI term) yet be genuinely novel
+// (distance term), not just a trivial average.
+//
+//   Φ_create = [ MI(blend, concept_a) + MI(blend, concept_b) ]
+//              × novelty_factor
+//              × N
+//
+//   novelty_factor = mean_dist(blend, a) + mean_dist(blend, b)
+//                    normalized by dimensionality
+//
+// High Φ_create = strong bisociation (carries info from both + novel).
+// Low  Φ_create = trivial blend (just an average, no novelty).
+//
+// Done criterion: "bisociation 강도" — creative Φ_create > trivial Φ_create.
+//
+// T-theorems (checked in self-test):
+//   T1 (non-negativity)    : Φ_create >= 0 for any stream
+//   T2 (creative > trivial): creative blend Φ > trivial blend (average) Φ
+//   T3 (P14 gate_exit)     : creative Φ_create > 0
+//   T4 (determinism)       : same data -> byte-identical Φ_create
+//   T5 (latency)           : d=16, T=64 < 2000 ms
+//
+// Reference:
+//   training/phi_dream_measure.hexa       (ALM-P13-3)
+//   training/phi_will_measure.hexa        (ALM-P10-3 — MI estimator source)
+//   shared/roadmaps/anima.json            (ALM-P14-3 entry)
+//
+// Run: hexa run training/phi_create_measure.hexa
+
+// --- Constants -------------------------------------------------------
+
+let MI_BINS  = 8           // log-bin count for MI histogram estimator
+let EPS      = 0.0000001   // log floor
+
+// --- Primitives ------------------------------------------------------
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn sqrt_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return sqrt(x)
+}
+
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+// --- Log-bin MI estimator (from phi_will_measure) --------------------
+
+fn bin_index(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn count_hits(bin_ids: array, n_bins: int) -> array {
+    let n = len(bin_ids)
+    let mut counts = []
+    let mut k = 0
+    while k < n_bins {
+        let mut c = 0.0
+        let mut i = 0
+        while i < n {
+            if bin_ids[i] == k { c = c + 1.0 }
+            i = i + 1
+        }
+        counts = counts.push(c)
+        k = k + 1
+    }
+    return counts
+}
+
+fn entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut bin_ids = []
+    let mut i = 0
+    while i < n {
+        bin_ids = bin_ids.push(bin_index(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let counts = count_hits(bin_ids, nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+fn joint_entropy_hist(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = bin_index(a[i], lo, hi, nb)
+        let ib = bin_index(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let nb2 = nb * nb
+    let counts = count_hits(pair_ids, nb2)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb2 {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+fn mutual_info(a: array, b: array) -> float {
+    if len(a) == 0 { return 0.0 }
+    let lo_a = vec_min(a)
+    let hi_a = vec_max(a)
+    let lo_b = vec_min(b)
+    let hi_b = vec_max(b)
+    let lo = if lo_a < lo_b { lo_a } else { lo_b }
+    let hi = if hi_a > hi_b { hi_a } else { hi_b }
+    let h_a  = entropy_hist(a, lo, hi, MI_BINS)
+    let h_b  = entropy_hist(b, lo, hi, MI_BINS)
+    let h_ab = joint_entropy_hist(a, b, lo, hi, MI_BINS)
+    let mi = h_a + h_b - h_ab
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// --- Euclidean distance (element-wise, flat arrays) ------------------
+//
+// Both vectors are flat arrays of length d. Computes ||a - b||.
+
+fn euclidean_dist(a: array, b: array, d: int) -> float {
+    let mut sum = 0.0
+    let mut i = 0
+    while i < d {
+        let diff = a[i] - b[i]
+        sum = sum + diff * diff
+        i = i + 1
+    }
+    return sqrt_safe(sum)
+}
+
+// --- Novelty factor --------------------------------------------------
+//
+// novelty = mean element-wise distance of blend from each parent,
+// averaged across all d dimensions, then summed for a and b.
+// A trivial average blend (blend = (a+b)/2) has small distance.
+// A creative blend with injected noise has larger distance.
+
+fn mean_distance(blend: array, parent: array, d: int) -> float {
+    let n = len(blend)
+    if n == 0 { return 0.0 }
+    let mut sum = 0.0
+    let mut i = 0
+    while i < d {
+        let diff = blend[i] - parent[i]
+        sum = sum + diff * diff
+        i = i + 1
+    }
+    return sqrt_safe(sum / to_float(d))
+}
+
+// --- Φ_create --------------------------------------------------------
+//
+// phi_create(blend, concept_a, concept_b, d)
+//   = [ MI(blend, a) + MI(blend, b) ] * novelty_factor * N
+//
+// where:
+//   MI terms   = blend carries info from BOTH parents
+//   novelty    = mean_distance(blend, a) + mean_distance(blend, b)
+//   N          = d (scaling convention, dimension count)
+//
+// All inputs are flat arrays of length d.
+
+fn phi_create(blend: array, concept_a: array, concept_b: array, d: int) -> float {
+    if d == 0 { return 0.0 }
+    let mi_a = mutual_info(blend, concept_a)
+    let mi_b = mutual_info(blend, concept_b)
+    let mi_total = mi_a + mi_b
+    let dist_a = mean_distance(blend, concept_a, d)
+    let dist_b = mean_distance(blend, concept_b, d)
+    let novelty = dist_a + dist_b
+    let n_scale = to_float(d)
+    return mi_total * novelty * n_scale
+}
+
+fn phi_create_breakdown(blend: array, concept_a: array, concept_b: array, d: int) -> array {
+    let mi_a = if d == 0 { 0.0 } else { mutual_info(blend, concept_a) }
+    let mi_b = if d == 0 { 0.0 } else { mutual_info(blend, concept_b) }
+    let mi_total = mi_a + mi_b
+    let dist_a = if d == 0 { 0.0 } else { mean_distance(blend, concept_a, d) }
+    let dist_b = if d == 0 { 0.0 } else { mean_distance(blend, concept_b, d) }
+    let novelty = dist_a + dist_b
+    let n_scale = to_float(d)
+    let phi_val = mi_total * novelty * n_scale
+    let mut out = []
+    out = out.push(mi_a)
+    out = out.push(mi_b)
+    out = out.push(mi_total)
+    out = out.push(novelty)
+    out = out.push(n_scale)
+    out = out.push(phi_val)
+    return out
+}
+
+// --- Synthetic data generators ---------------------------------------
+
+// make_concept: generate a d-dimensional concept vector from det_rand.
+fn make_concept(d: int, seed: int) -> array {
+    return det_rand(d, seed)
+}
+
+// make_creative_blend: blend = f(a, b) + noise.
+// Takes elements from both parents with non-trivial transformation
+// (not just average) and adds novelty noise.
+fn make_creative_blend(concept_a: array, concept_b: array, d: int, seed: int) -> array {
+    let noise = det_rand(d, seed)
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        // Creative bisociation: non-linear mix + noise injection
+        // blend[i] = a[i]*0.6 + b[i]*0.4 + noise[i]*0.5
+        // The noise term makes it genuinely novel (not a pure interpolation).
+        let v = concept_a[i] * 0.6 + concept_b[i] * 0.4 + noise[i] * 0.5
+        out = out.push(v)
+        i = i + 1
+    }
+    return out
+}
+
+// make_trivial_blend: blend = (a + b) / 2 (pure average, no novelty).
+fn make_trivial_blend(concept_a: array, concept_b: array, d: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        let v = (concept_a[i] + concept_b[i]) / 2.0
+        out = out.push(v)
+        i = i + 1
+    }
+    return out
+}
+
+// --- Self-tests ------------------------------------------------------
+
+fn check_T1() -> bool {
+    // T1: Non-negativity -- Phi_create >= 0 for any stream
+    let d = 16
+    let a = make_concept(d, 42)
+    let b = make_concept(d, 77)
+    let creative = make_creative_blend(a, b, d, 101)
+    let trivial = make_trivial_blend(a, b, d)
+    let phi_c = phi_create(creative, a, b, d)
+    let phi_t = phi_create(trivial, a, b, d)
+    println("  [T1] Phi_create(creative) = " + str(phi_c))
+    println("  [T1] Phi_create(trivial)  = " + str(phi_t))
+    if phi_c < 0.0 { return false }
+    if phi_t < 0.0 { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: Creative blend Phi > trivial blend (average) Phi
+    // The creative blend has noise injection => higher novelty factor =>
+    // higher Phi_create than the trivial midpoint average.
+    let d = 16
+    let a = make_concept(d, 51)
+    let b = make_concept(d, 88)
+    let creative = make_creative_blend(a, b, d, 123)
+    let trivial = make_trivial_blend(a, b, d)
+    let phi_c = phi_create(creative, a, b, d)
+    let phi_t = phi_create(trivial, a, b, d)
+    println("  [T2] Phi_create(creative) = " + str(phi_c) + "  (expect > trivial)")
+    println("  [T2] Phi_create(trivial)  = " + str(phi_t))
+    if phi_c <= phi_t {
+        println("  [T2] FAIL -- creative blend not > trivial blend (bisociation weak)")
+        return false
+    }
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3: Gate exit -- creative Phi_create > 0
+    let d = 16
+    let a = make_concept(d, 67)
+    let b = make_concept(d, 99)
+    let creative = make_creative_blend(a, b, d, 200)
+    let brk = phi_create_breakdown(creative, a, b, d)
+    let mi_a = brk[0]
+    let mi_b = brk[1]
+    let mi_total = brk[2]
+    let novelty = brk[3]
+    let n_scale = brk[4]
+    let phi_val = brk[5]
+    println("  [T3] MI(blend,a) = " + str(mi_a) + "  MI(blend,b) = " + str(mi_b))
+    println("  [T3] MI_total = " + str(mi_total) + "  novelty = " + str(novelty) + "  N = " + str(n_scale))
+    println("  [T3] Phi_create = " + str(phi_val))
+    if phi_val <= 0.0 {
+        println("  [T3] FAIL -- Phi_create not > 0 (P14 gate_exit: bisociation strength > 0)")
+        return false
+    }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: Determinism -- same data -> byte-identical Phi_create
+    let d = 16
+    let a = make_concept(d, 101)
+    let b = make_concept(d, 55)
+    let creative = make_creative_blend(a, b, d, 77)
+    let p1 = phi_create(creative, a, b, d)
+    let p2 = phi_create(creative, a, b, d)
+    println("  [T4] Phi1 = " + str(p1) + "  Phi2 = " + str(p2))
+    return fabs(p1 - p2) == 0.0
+}
+
+fn check_T5() -> bool {
+    // T5: Latency -- d=16, single call < 2000ms
+    let d = 16
+    let a = make_concept(d, 55)
+    let b = make_concept(d, 77)
+    let creative = make_creative_blend(a, b, d, 150)
+    let t0 = clock()
+    let phi_val = phi_create(creative, a, b, d)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] d=16  Phi_create=" + str(phi_val) + "  t=" + str(ms) + "ms  (limit 2000ms)")
+    if ms >= 2000.0 {
+        println("  [T5] FAIL -- latency exceeded 2000ms")
+        return false
+    }
+    if phi_val < 0.0 {
+        println("  [T5] FAIL -- negative Phi")
+        return false
+    }
+    return true
+}
+
+// --- main ------------------------------------------------------------
+
+fn main() {
+    println("[phi_create_measure] ALM-P14-3 Phi(create) self-test")
+    println("  Phi_create = [MI(blend,a) + MI(blend,b)] * novelty * N")
+    println("  Done criterion: bisociation strength (creative > trivial)")
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[phi_create_measure] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[phi_create_measure] ALL 5/5 PASS -- gate ALM-P14-3 OK")
+    } else {
+        println("[phi_create_measure] SOME FAILED")
+    }
+}
+
+main()
