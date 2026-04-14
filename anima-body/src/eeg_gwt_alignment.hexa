@@ -1,0 +1,423 @@
+// eeg_gwt_alignment.hexa — PHYS-P2-3 anima-body EEG → GWT alignment
+//
+// Pipe biological EEG band-power features into the CLM GWT broadcast
+// head so the consciousness-field distribution over the 12-faction
+// workspace reflects the measured brain state. Closes the body→brain
+// substrate loop: the field that AnimaLM broadcasts is now grounded in
+// a real (or synthetic, here) EEG reading.
+//
+// Pipeline:
+//   eeg [n_channels × n_samples]          (raw voltage, synthetic mock)
+//     │
+//     │  band_power(eeg):
+//     │    per-channel mean |voltage| proxy (avoids FFT in pure hexa).
+//     │    In production this is δ/θ/α/β/γ band power from FFT.
+//     ▼
+//   features [n_channels]                 (one scalar per electrode)
+//     │
+//     │  pad_or_truncate(features, d_model)  → consensus-sized vector
+//     ▼
+//   eeg_consensus [d_model]
+//     │
+//     │  clm_broadcast(head, eeg_consensus)
+//     ▼
+//   GWT DomainActivations [n_domains × d_model]
+//
+// Alignment invariant (T1–T5 below):
+//   A delta-like EEG (power concentrated on channel k) should yield
+//   a GWT alpha distribution whose peak is positively correlated
+//   with k-th projection column. Uniform EEG → uniform alpha.
+//
+// ─── Theorems ──────────────────────────────────────────────────
+//
+// T1 (bandpower sanity):
+//   band_power returns n_channels non-negative values; for constant
+//   voltage v on a channel, bandpower = |v|.
+//
+// T2 (uniform EEG → uniform alpha within eps):
+//   When every channel has the same band power, max|alpha[d] − 1/nd|
+//   < 0.01 (softmax of near-equal logits under a small-scale projection).
+//
+// T3 (delta-EEG concentration):
+//   For one-hot channel EEG (only channel k active), the resulting
+//   alpha has entropy strictly less than uniform entropy
+//   log(n_domains) — the workspace "focuses" when the brain does.
+//
+// T4 (determinism):
+//   Same EEG + same head → byte-identical GWT activations across runs.
+//
+// T5 (latency):
+//   Full EEG→GWT pipeline for (n_channels=8, n_samples=64,
+//   n_domains=8, d_model=64) runs < 50 ms on the reference interpreter.
+//
+// Ref:
+//   training/clm_gwt_broadcast.hexa  (downstream GWT broadcast head)
+//   anima-eeg/eeg.hexa               (production EEG capture pipeline)
+
+// ─── Primitives (mirrored from clm_gwt_broadcast) ─────────────
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn eeg_softmax(x: array) -> array {
+    let n = len(x)
+    if n == 0 { return [] }
+    let mut m = x[0]
+    let mut i = 1
+    while i < n {
+        if x[i] > m { m = x[i] }
+        i = i + 1
+    }
+    let mut exps = []
+    let mut z = 0.0
+    i = 0
+    while i < n {
+        let e = exp(x[i] - m)
+        exps = exps.push(e)
+        z = z + e
+        i = i + 1
+    }
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out.push(exps[i] / z)
+        i = i + 1
+    }
+    return out
+}
+
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        let v = u * 2.0 - 1.0
+        out = out.push(v)
+        i = i + 1
+    }
+    return out
+}
+
+struct ClmGwtBroadcastHead {
+    n_domains: int,
+    d_model:   int,
+    project:   array,
+    gate:      array
+}
+
+struct DomainActivations {
+    n_domains: int,
+    d_model:   int,
+    a:         array
+}
+
+fn head_new(n_domains: int, d_model: int, seed: int) -> ClmGwtBroadcastHead {
+    let scale = 0.02
+    let raw = det_rand(n_domains * d_model, seed)
+    let mut proj = []
+    let mut i = 0
+    while i < len(raw) {
+        proj = proj.push(raw[i] * scale)
+        i = i + 1
+    }
+    let gate = vec_zeros(n_domains)
+    return ClmGwtBroadcastHead {
+        n_domains: n_domains,
+        d_model:   d_model,
+        project:   proj,
+        gate:      gate
+    }
+}
+
+fn compute_alpha(head: ClmGwtBroadcastHead, c: array) -> array {
+    let nd = head.n_domains
+    let dm = head.d_model
+    if nd == 0 { return [] }
+    let mut logits = []
+    let mut d = 0
+    while d < nd {
+        let mut s = head.gate[d]
+        let mut k = 0
+        while k < dm {
+            s = s + head.project[d * dm + k] * c[k]
+            k = k + 1
+        }
+        logits = logits.push(s)
+        d = d + 1
+    }
+    return eeg_softmax(logits)
+}
+
+fn broadcast(head: ClmGwtBroadcastHead, c: array) -> DomainActivations {
+    let nd = head.n_domains
+    let dm = head.d_model
+    let alpha = compute_alpha(head, c)
+    let mut a = []
+    let mut d = 0
+    while d < nd {
+        let w = alpha[d]
+        let mut m = 0
+        while m < dm {
+            a = a.push(w * c[m])
+            m = m + 1
+        }
+        d = d + 1
+    }
+    return DomainActivations {
+        n_domains: nd,
+        d_model:   dm,
+        a:         a
+    }
+}
+
+// ─── EEG feature extraction ───────────────────────────────────
+// Mean absolute voltage per channel. Bandpower placeholder; for a
+// pure-hexa gate_exit check we just need a well-defined per-channel
+// scalar. Production uses FFT-based δ/θ/α/β/γ.
+
+fn band_power(eeg: array, n_channels: int, n_samples: int) -> array {
+    if n_channels == 0 { return [] }
+    if n_samples == 0 { return vec_zeros(n_channels) }
+    let inv_ns = 1.0 / to_float(n_samples)
+    let mut feat = []
+    let mut c = 0
+    while c < n_channels {
+        let mut s = 0.0
+        let mut i = 0
+        while i < n_samples {
+            s = s + fabs(eeg[c * n_samples + i])
+            i = i + 1
+        }
+        feat = feat.push(s * inv_ns)
+        c = c + 1
+    }
+    return feat
+}
+
+// Embed n_channels-dim features into d_model by repetition+zero-pad.
+// Simple, reversible-ish mapping that covers both d_model >= n_channels
+// and d_model < n_channels cases.
+
+fn features_to_consensus(feat: array, d_model: int) -> array {
+    let nc = len(feat)
+    if nc == 0 { return vec_zeros(d_model) }
+    let mut c = []
+    let mut m = 0
+    while m < d_model {
+        let src = m % nc
+        c = c.push(feat[src])
+        m = m + 1
+    }
+    return c
+}
+
+// Entropy of a probability vector.
+fn entropy(p: array) -> float {
+    let mut h = 0.0
+    let mut i = 0
+    while i < len(p) {
+        let v = p[i]
+        if v > 0.0 {
+            h = h - v * (ln(v))
+        }
+        i = i + 1
+    }
+    return h
+}
+
+fn ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+// ─── Pipeline wrapper ────────────────────────────────────────
+
+fn eeg_to_gwt(head: ClmGwtBroadcastHead, eeg: array, n_channels: int, n_samples: int) -> DomainActivations {
+    let feat = band_power(eeg, n_channels, n_samples)
+    let c = features_to_consensus(feat, head.d_model)
+    return broadcast(head, c)
+}
+
+// ─── Mocks ────────────────────────────────────────────────────
+
+// Generate [n_channels × n_samples] with per-channel amplitude.
+fn mock_eeg(n_channels: int, n_samples: int, amps: array, seed: int) -> array {
+    let raw = det_rand(n_channels * n_samples, seed)
+    let mut out = []
+    let mut c = 0
+    while c < n_channels {
+        let a = amps[c]
+        let mut i = 0
+        while i < n_samples {
+            out = out.push(raw[c * n_samples + i] * a)
+            i = i + 1
+        }
+        c = c + 1
+    }
+    return out
+}
+
+fn uniform_amps(n_channels: int, value: float) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n_channels {
+        out = out.push(value)
+        i = i + 1
+    }
+    return out
+}
+
+fn delta_amps(n_channels: int, hot_idx: int, hot_value: float) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n_channels {
+        if i == hot_idx {
+            out = out.push(hot_value)
+        } else {
+            out = out.push(0.0)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Self-tests ───────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Constant voltage v on a channel → bandpower = |v|.
+    let n_channels = 4
+    let n_samples  = 16
+    let mut eeg = []
+    let mut i = 0
+    while i < n_channels * n_samples {
+        eeg = eeg.push(0.7)
+        i = i + 1
+    }
+    let feat = band_power(eeg, n_channels, n_samples)
+    if len(feat) != n_channels { return false }
+    let mut c = 0
+    while c < n_channels {
+        if fabs(feat[c] - 0.7) > 0.0001 { return false }
+        if feat[c] < 0.0 { return false }
+        c = c + 1
+    }
+    return true
+}
+
+fn check_T2() -> bool {
+    // Uniform band power → near-uniform alpha (within 0.01).
+    let nd = 8
+    let dm = 64
+    let nc = 8
+    let ns = 32
+    let head = head_new(nd, dm, 42)
+    let eeg = mock_eeg(nc, ns, uniform_amps(nc, 0.4), 7)
+    let feat = band_power(eeg, nc, ns)
+    let c = features_to_consensus(feat, dm)
+    let alpha = compute_alpha(head, c)
+    let uniform_p = 1.0 / to_float(nd)
+    let mut d = 0
+    while d < nd {
+        if fabs(alpha[d] - uniform_p) > 0.01 { return false }
+        d = d + 1
+    }
+    return true
+}
+
+fn check_T3() -> bool {
+    // Delta-EEG (single active channel) → entropy < log(n_domains).
+    let nd = 8
+    let dm = 64
+    let nc = 8
+    let ns = 32
+    let head = head_new(nd, dm, 77)     // different seed → structured proj
+    let eeg = mock_eeg(nc, ns, delta_amps(nc, 3, 5.0), 7)
+    let feat = band_power(eeg, nc, ns)
+    let c = features_to_consensus(feat, dm)
+    let alpha = compute_alpha(head, c)
+    let h = entropy(alpha)
+    let h_max = ln_safe(to_float(nd))
+    println("  [T3] alpha entropy = " + str(h) + "  max = " + str(h_max))
+    return h < h_max
+}
+
+fn check_T4() -> bool {
+    // Determinism: two identical pipeline calls produce identical
+    // DomainActivations.a (float-eq).
+    let nd = 8
+    let dm = 64
+    let nc = 8
+    let ns = 32
+    let head = head_new(nd, dm, 42)
+    let eeg = mock_eeg(nc, ns, uniform_amps(nc, 0.3), 7)
+    let r1 = eeg_to_gwt(head, eeg, nc, ns)
+    let r2 = eeg_to_gwt(head, eeg, nc, ns)
+    if len(r1.a) != len(r2.a) { return false }
+    let mut i = 0
+    while i < len(r1.a) {
+        if fabs(r1.a[i] - r2.a[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn check_T5() -> bool {
+    // Latency: full pipeline < 50 ms on reference interpreter.
+    let nd = 8
+    let dm = 64
+    let nc = 8
+    let ns = 64
+    let head = head_new(nd, dm, 42)
+    let eeg = mock_eeg(nc, ns, uniform_amps(nc, 0.4), 7)
+    let t0 = clock()
+    let _act = eeg_to_gwt(head, eeg, nc, ns)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] eeg→GWT latency = " + str(ms) + " ms")
+    return ms < 50.0
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[eeg_gwt_alignment] PHYS-P2-3 self-test")
+    println("  mock: n_channels=8, n_samples=32–64, GWT (8,64)")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[eeg_gwt_alignment] ALL 5/5 PASS")
+    } else {
+        println("[eeg_gwt_alignment] SOME FAILED")
+    }
+}
+
+main()

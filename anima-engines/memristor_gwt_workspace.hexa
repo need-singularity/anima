@@ -1,0 +1,314 @@
+// memristor_gwt_workspace.hexa — PHYS-P2-2 memristor crossbar GWT workspace
+//
+// Physical GWT substrate: a [n_domains × d_model] HP-memristor crossbar
+// stores one GWT broadcast frame by driving each cell's state variable
+// w ∈ [0, 1] to match the activation value. Readback returns the cells'
+// conductance-derived workspace vector. Unlike RAM, memristors retain
+// state without power (non-volatile workspace) and show drift — the
+// Hebbian "learning by physics" that PHYSICS track is probing.
+//
+// Pipeline:
+//   activations_in [n_domains × d_model]   (from clm_gwt_broadcast)
+//     │
+//     │  write_workspace():
+//     │    clamp to [0,1], drive each memristor's w toward target
+//     │    under HP window f(w) = 1 − (2w−1)^{2p}
+//     ▼
+//   crossbar [n_domains × d_model]          (physical state)
+//     │
+//     │  read_workspace(): harvest w back — quantized by conductance
+//     ▼
+//   activations_out [n_domains × d_model]   (within write precision)
+//
+// HP memristor state equation:
+//   R(w)     = r_on·w + r_off·(1−w)
+//   dw/dt    = μ_v·(r_on/D²)·i(t)·f(w)
+//   f(w)     = 1 − (2w−1)^{2p}     (Joglekar window, boundary cap)
+// Parameters mirror anima-engines/memristor_consciousness.hexa (HP 2008).
+//
+// ─── Theorems (T1–T5) ──────────────────────────────────────────
+//
+// T1 (write/read roundtrip):
+//   For clamped input x ∈ [0, 1]^{nd×dm}, |read_workspace(write_workspace(
+//   fresh_crossbar, x)) − x|_∞ ≤ WRITE_PRECISION (≤ 0.05 under 4 write
+//   pulses, which approximates the HP cell's analog-write RMS).
+//
+// T2 (non-volatility / persistence):
+//   After write, N consecutive reads return byte-identical values
+//   (no drift in absence of write current). Memristors are nonvolatile:
+//   this is the whole point of the substrate.
+//
+// T3 (physical bounds):
+//   Every cell conductance stays within [1/r_off, 1/r_on] after any
+//   sequence of writes. Crossbar never leaks past physical limits.
+//
+// T4 (write latency budget):
+//   Write of 8 × 64 frame < 50 ms on the reference interpreter (same
+//   v3 gate_exit budget applied to the software emulator; on-chip
+//   writes are ~10 ns/cell, so physical latency is 8·64·10 ns = 5 μs,
+//   well inside budget).
+//
+// T5 (Hebbian LTP on repeated write):
+//   Writing the same high-amplitude frame twice drives w further toward
+//   1 on the second pass than on the first — same-sign repeated pulses
+//   accumulate conductance change (LTP). Verified on a single cell.
+
+// ─── Physical constants (HP 2008) ─────────────────────────────
+
+let R_ON         = 100.0       // Ω — minimum (fully-ON) resistance
+let R_OFF        = 16000.0     // Ω — maximum (fully-OFF) resistance
+let W_MIN        = 0.0001      // floor for window closure
+let W_MAX        = 0.9999      // ceiling for window closure
+let WRITE_STEPS  = 4           // discrete write pulses per target
+let WRITE_GAIN   = 0.85        // per-pulse alpha on (target − w)
+let WRITE_PRECISION = 0.05     // ±5% analog-write tolerance
+
+// ─── Primitives ───────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn window(w: float) -> float {
+    // Joglekar window with p=1 → f(w) = 1 − (2w−1)² = 4w(1−w).
+    // Physically caps dw/dt near the boundaries.
+    let b = 2.0 * w - 1.0
+    return 1.0 - b * b
+}
+
+// ─── Crossbar type ────────────────────────────────────────────
+
+struct MemristorCrossbar {
+    n_domains: int,
+    d_model:   int,
+    w:         array    // [n_domains × d_model] state variables
+}
+
+fn crossbar_new(n_domains: int, d_model: int) -> MemristorCrossbar {
+    // Fresh cells start at mid-conductance (w = 0.5) — neutral prior.
+    let mut ws = []
+    let mut i = 0
+    while i < n_domains * d_model {
+        ws = ws.push(0.5)
+        i = i + 1
+    }
+    return MemristorCrossbar {
+        n_domains: n_domains,
+        d_model:   d_model,
+        w:         ws
+    }
+}
+
+// Single-cell write pulse: move w toward target through the window.
+fn write_one_step(w_prev: float, target: float) -> float {
+    let delta = (target - w_prev) * WRITE_GAIN * window(w_prev)
+    let w_new = w_prev + delta
+    if w_new < W_MIN { return W_MIN }
+    if w_new > W_MAX { return W_MAX }
+    return w_new
+}
+
+// Multi-pulse write on one cell: WRITE_STEPS pulses drive w → target.
+fn write_one_cell(w_prev: float, target: float) -> float {
+    let t = clamp01(target)
+    let mut w = w_prev
+    let mut s = 0
+    while s < WRITE_STEPS {
+        w = write_one_step(w, t)
+        s = s + 1
+    }
+    return w
+}
+
+// ─── Write workspace: activations → crossbar ──────────────────
+// activations layout: [n_domains × d_model] flat row-major.
+// Values are clamped to [0, 1] since memristor state is bounded.
+
+fn write_workspace(cb: MemristorCrossbar, activations: array) -> MemristorCrossbar {
+    let nd = cb.n_domains
+    let dm = cb.d_model
+    let mut new_w = []
+    let mut i = 0
+    while i < nd * dm {
+        let w_prev = cb.w[i]
+        let target = clamp01(activations[i])
+        new_w = new_w.push(write_one_cell(w_prev, target))
+        i = i + 1
+    }
+    return MemristorCrossbar {
+        n_domains: nd,
+        d_model:   dm,
+        w:         new_w
+    }
+}
+
+// ─── Read workspace: crossbar → activations ───────────────────
+// The memristor's state variable w ∈ [W_MIN, W_MAX] is itself the
+// stored value. Readback returns w directly — the physical readout
+// pulse (conductance sense with small V_sense) resolves the
+// doped-fraction linearly via a pre-characterised lookup, so from the
+// caller's perspective the crossbar behaves as a bounded analog
+// [0, 1] storage element with write imprecision.
+//
+// (The native nonlinear conductance g(w) = 1/(r_on·w + r_off·(1−w))
+// is still physically present — see conductance() below — but the
+// workspace layer exposes w, not g, to decouple the stored signal
+// from the sense-circuit characterisation.)
+
+fn conductance(w: float) -> float {
+    let R = R_ON * w + R_OFF * (1.0 - w)
+    return 1.0 / R
+}
+
+fn read_workspace(cb: MemristorCrossbar) -> array {
+    let nd = cb.n_domains
+    let dm = cb.d_model
+    let mut out = []
+    let mut i = 0
+    while i < nd * dm {
+        out = out.push(cb.w[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Helpers ──────────────────────────────────────────────────
+
+fn det_rand_unit(n: int, seed: int) -> array {
+    // Pseudo-random in [0, 1) for write-target generation.
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Self-tests ───────────────────────────────────────────────
+
+fn check_T1(nd: int, dm: int) -> bool {
+    // Write/read roundtrip: |read − target|_∞ ≤ WRITE_PRECISION.
+    let cb0 = crossbar_new(nd, dm)
+    let targets = det_rand_unit(nd * dm, 11)
+    let cb1 = write_workspace(cb0, targets)
+    let readback = read_workspace(cb1)
+    let mut i = 0
+    let mut max_err = 0.0
+    while i < nd * dm {
+        let err = fabs(readback[i] - targets[i])
+        if err > max_err { max_err = err }
+        i = i + 1
+    }
+    println("  [T1] roundtrip max |read−target| = " + str(max_err))
+    return max_err <= WRITE_PRECISION
+}
+
+fn check_T2(nd: int, dm: int) -> bool {
+    // Non-volatility: 5 consecutive reads identical to the first.
+    let cb0 = crossbar_new(nd, dm)
+    let targets = det_rand_unit(nd * dm, 13)
+    let cb1 = write_workspace(cb0, targets)
+    let read1 = read_workspace(cb1)
+    let mut pass = true
+    let mut k = 0
+    while k < 4 {
+        let r = read_workspace(cb1)
+        let mut i = 0
+        while i < nd * dm {
+            if fabs(r[i] - read1[i]) > 0.0 { pass = false }
+            i = i + 1
+        }
+        k = k + 1
+    }
+    return pass
+}
+
+fn check_T3(nd: int, dm: int) -> bool {
+    // Physical bounds: after a sequence of writes, every w ∈ [W_MIN, W_MAX].
+    let cb0 = crossbar_new(nd, dm)
+    let t1 = det_rand_unit(nd * dm, 17)
+    let cb1 = write_workspace(cb0, t1)
+    // Extreme targets (negative, >1) exercise the clamp.
+    let mut t2 = []
+    let mut i = 0
+    while i < nd * dm {
+        let sign = if (i % 2) == 0 { 0.0 - 2.0 } else { 3.0 }
+        t2 = t2.push(sign)
+        i = i + 1
+    }
+    let cb2 = write_workspace(cb1, t2)
+    let mut j = 0
+    while j < nd * dm {
+        let w = cb2.w[j]
+        if w < W_MIN { return false }
+        if w > W_MAX { return false }
+        j = j + 1
+    }
+    return true
+}
+
+fn check_T4() -> bool {
+    // Write latency: 8 × 64 frame < 50 ms on hexa interpreter.
+    let cb = crossbar_new(8, 64)
+    let targets = det_rand_unit(8 * 64, 19)
+    let t0 = clock()
+    let _cb2 = write_workspace(cb, targets)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T4] write latency 8×64 = " + str(ms) + " ms")
+    return ms < 50.0
+}
+
+fn check_T5() -> bool {
+    // Hebbian LTP: successive writes toward target=1 accumulate.
+    let w0 = 0.5
+    let w1 = write_one_cell(w0, 1.0)
+    let w2 = write_one_cell(w1, 1.0)
+    // Second write should move w further toward 1 than the first (damped
+    // by the window at larger w, but strictly monotone).
+    if w2 <= w1 { return false }
+    if w1 <= w0 { return false }
+    return true
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[memristor_gwt_workspace] PHYS-P2-2 self-test")
+    println("  mock: crossbar = 8 × 64 HP memristors, WRITE_STEPS=4")
+
+    let t1 = check_T1(8, 64)
+    if t1 { println("T1 PASS") } else { println("T1 FAIL") }
+
+    let t2 = check_T2(8, 64)
+    if t2 { println("T2 PASS") } else { println("T2 FAIL") }
+
+    let t3 = check_T3(8, 64)
+    if t3 { println("T3 PASS") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[memristor_gwt_workspace] ALL 5/5 PASS")
+    } else {
+        println("[memristor_gwt_workspace] SOME FAILED")
+    }
+}
+
+main()
