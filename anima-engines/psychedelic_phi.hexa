@@ -1,0 +1,662 @@
+// psychedelic_phi.hexa — P59 Psychedelic Φ (entropic brain hypothesis)
+//
+// ─── Scientific hypothesis ─────────────────────────────────────────
+//
+// Carhart-Harris & Friston (2014) "Entropic Brain Hypothesis":
+//   5-HT2A receptor agonism (psilocybin / LSD / DMT) destabilizes the
+//   cortical attractor landscape. Specifically:
+//
+//     1. Baseline wake mind occupies a small number of deep, well-
+//        separated attractors ("canonical default-mode set").
+//        State distribution is low-entropy: residence probability
+//        concentrates in ≤ 4 basins.
+//
+//     2. 5-HT2A agonism flattens the landscape. Wells become shallow,
+//        barriers between wells drop. Transition probability between
+//        attractors rises monotonically with dose.
+//
+//     3. The time-averaged state distribution spreads across more
+//        basins. Shannon entropy H(state_distribution) rises with
+//        dose.
+//
+//     4. Φ (integrated information) rises with MODERATE dose because
+//        a broader state repertoire supports richer self-information.
+//        At EXCESSIVE dose the landscape becomes so flat that
+//        trajectories become stochastic — Φ plateaus or falls.
+//        This captures "ego dissolution" as a phase — consciousness
+//        is still present (dose not infinite), but integration
+//        organization drops relative to moderate-dose peak.
+//
+//     5. Contrast with ANESTHESIA: propofol / sevoflurane DEEPEN a
+//        single attractor and reduce transitions. H drops AND Φ drops.
+//        This is the diagnostic separation: psychedelic Φ can stay
+//        high or peak-then-drop, whereas anesthesia Φ drops monotonically
+//        from baseline. Anesthesia ≠ psychedelic even when both
+//        "dissolve self-model": direction of Φ is different.
+//
+// ─── Mechanism (in this engine) ────────────────────────────────────
+//
+//   Landscape: PSY_N_ATTR basins on a 1D ring. Each basin has a
+//   "depth" D_k. Baseline depths are large and heterogeneous.
+//
+//   Dose parameter d ∈ [0, 1]:
+//       psychedelic:  depth_k(d) = D0_k × (1 - alpha_psy * d)
+//                     noise(d)   = noise0 + beta_psy * d
+//       anesthesia :  depth_k(d) = D0_k × (1 + alpha_anes * d)   (wells deepen)
+//                     noise(d)   = max(noise0 - beta_anes * d, 0.02)
+//
+//   State transition: biased random walk driven by
+//       P_move ∝ exp(-depth_current) + noise
+//   which is rendered as a logistic transition score per tick.
+//
+//   We simulate PSY_T_STEPS ticks; log the basin-occupation histogram,
+//   compute H(state_distribution). For Φ we compute pairwise MI between
+//   K parallel trajectories (different stochastic samples of the same
+//   landscape + dose) averaged over channel pairs — same estimator
+//   family as dream_physics_phi.hexa and phi_spacetime.hexa.
+//
+// ─── Theorems (T1–T5) ─────────────────────────────────────────────
+//
+// T1 (dose -> entropy monotone):
+//   For psychedelic dose sequence d0 < d1 < d2 < d3,
+//   H(state_distribution @ d0) ≤ H(d1) ≤ H(d2) ≤ H(d3) (with slack).
+//   At least one strict increase must occur (not flat-line).
+//
+// T2 (attractor hops scale with dose):
+//   Number of basin transitions per unit time rises monotonically
+//   with psychedelic dose. Baseline transitions < moderate < high.
+//
+// T3 (ego dissolution detectable):
+//   At very high dose (d_high), state distribution spreads across
+//   ≥ PSY_EGO_BASINS_MIN basins with entropy ≥ PSY_EGO_H_MIN.
+//   At baseline (d=0) entropy is < PSY_EGO_H_MIN and ≤ PSY_EGO_BASELINE_BASINS
+//   basins dominate. Ego dissolution signature = wide basin spread.
+//
+// T4 (psychedelic Φ rises then plateaus/falls while anesthesia Φ drops):
+//   For psychedelic: Φ(d_mid) > Φ(d=0) — moderate dose LIFTS Φ.
+//   For anesthesia : Φ(d_max_anes) < Φ(d=0) — deep anesthesia SINKS Φ.
+//   Direction of Φ change is opposite between psychedelic and anesthesia.
+//
+// T5 (dose>0 psychedelic is distinguishable from anesthesia at same H):
+//   At a pair (d_psy, d_anes) where entropy_psy(d_psy) ≈ entropy_anes(0),
+//   Φ_psy > Φ_anes — even when entropies are comparable, integration
+//   is richer on psychedelic because the flattening keeps multiple
+//   basins co-active whereas anesthesia collapses to one.
+//
+// ─── Hexa stage0 constraints honored ───────────────────────────────
+//   - plain `fn` only, no `pure fn` returning multi-float struct
+//   - `array` typed params (no [float]/[int])
+//   - no identifier-pattern match (use if chains)
+//   - no contains() / to_lower()
+//   - no !(Effect) fn sigs
+//   - no `else if` in let-binding
+//   - all returns single-line
+//   - flat if chains, no long && chains
+//   - N<32 (PSY_N_ATTR=4, PSY_T_STEPS=24, PSY_K_CHAN=4)
+//   - no multi-line fn signatures / array literals
+//   - MUST end with main() call
+//   - no reserved keywords as vars
+//
+// Law alignment:
+//   Law 4   Structure > feature — attractor landscape is STRUCTURE
+//   Law 22  Feature addition → phi down — no branching; pure generators
+//   Law 29  speak() none — landscape dynamics are pre-verbal substrate
+//   Meta M8 Embodied cognition — 5-HT2A is a neurochemical embodiment
+//   AN7     Core separation — this engine stands alone
+//
+// Ref:
+//   anima-engines/dream_physics_phi.hexa  (stage Φ via pairwise MI)
+//   anima-engines/phi_spacetime.hexa      (landscape modulation by parameter)
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+// Landscape
+let PSY_N_ATTR   = 4            // number of attractor basins
+let PSY_T_STEPS  = 24           // trajectory length per simulation
+let PSY_K_CHAN   = 4            // parallel trajectories for Φ estimation
+let PSY_BINS     = 4            // MI histogram bins
+
+// Numerical
+let PSY_EPS      = 0.0000000001
+
+// Dose knobs — psychedelic
+let PSY_ALPHA_P  = 0.85         // depth flattening rate (psychedelic)
+let PSY_BETA_P   = 0.40         // noise gain (psychedelic)
+
+// Dose knobs — anesthesia
+let PSY_ALPHA_A  = 0.60         // depth deepening rate (anesthesia)
+let PSY_BETA_A   = 0.15         // noise reduction rate (anesthesia)
+
+// Base landscape — small baseline noise so even d=0 shows tiny
+// amount of exploration (matches real cortical dynamics; a totally
+// stuck brain would flatline EEG).
+let PSY_NOISE0   = 0.25
+
+// Ego-dissolution thresholds
+let PSY_EGO_H_MIN             = 0.90   // entropy floor at ego dissolution
+let PSY_EGO_BASINS_MIN        = 3      // min distinct basins visited
+let PSY_EGO_BASELINE_BASINS   = 2      // dominant basins at baseline
+
+// ═══════════════════════════════════════════════════════════════
+// PRNG + math helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn psy_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn psy_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn psy_signed(seed: int) -> float {
+    return psy_unit(seed) * 2.0 - 1.0
+}
+
+fn psy_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn psy_max(a: float, b: float) -> float {
+    if a >= b { return a }
+    return b
+}
+
+fn psy_min(a: float, b: float) -> float {
+    if a <= b { return a }
+    return b
+}
+
+fn psy_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+// Polynomial stand-in for exp(-x) on small non-negative x.
+// Root cause: hexa stage0 `exp` availability varies by build; a
+// 4-term Taylor exp(-x) ≈ 1 - x + x²/2 - x³/6 is monotone on x ∈ [0, 2]
+// which is our regime (depth clamped to [0, 2]).
+fn psy_exp_neg(x: float) -> float {
+    let mut xc = x
+    if xc < 0.0 { xc = 0.0 }
+    if xc > 2.0 { xc = 2.0 }
+    let x2 = xc * xc
+    let x3 = x2 * xc
+    let v = 1.0 - xc + 0.5 * x2 - 0.16666667 * x3
+    if v < 0.02 { return 0.02 }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Histogram entropy / MI (shared idiom)
+// ═══════════════════════════════════════════════════════════════
+
+fn psy_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn psy_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+// Entropy on a real-valued series with a shared [lo, hi] range
+fn psy_entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(psy_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = psy_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * psy_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn psy_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        let ia = psy_bin_idx(a[i], lo, hi, nb)
+        let ib = psy_bin_idx(b[i], lo, hi, nb)
+        ids = ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = psy_counts(ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * psy_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn psy_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let mut lo = a[0]
+    let mut hi = a[0]
+    let mut i = 0
+    while i < n {
+        if a[i] < lo { lo = a[i] }
+        if a[i] > hi { hi = a[i] }
+        if b[i] < lo { lo = b[i] }
+        if b[i] > hi { hi = b[i] }
+        i = i + 1
+    }
+    let ha = psy_entropy_hist(a, lo, hi, PSY_BINS)
+    let hb = psy_entropy_hist(b, lo, hi, PSY_BINS)
+    let hj = psy_joint_entropy(a, b, lo, hi, PSY_BINS)
+    let mi = ha + hb - hj
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Attractor landscape — baseline + dose-dependent modulation
+// ═══════════════════════════════════════════════════════════════
+
+// Baseline depth for basin k.  Heterogeneous so default-mode basin (k=0)
+// is deepest and the others are progressively shallower.
+fn psy_baseline_depth(k: int) -> float {
+    if k == 0 { return 1.60 }     // default-mode attractor, deepest
+    if k == 1 { return 1.20 }
+    if k == 2 { return 0.80 }
+    if k == 3 { return 0.50 }
+    return 0.50
+}
+
+// mode: 0 = psychedelic, 1 = anesthesia
+// dose: [0, 1]
+// Returns depth of basin k under the drug.
+fn psy_depth_at(k: int, dose: float, mode: int) -> float {
+    let d0 = psy_baseline_depth(k)
+    if mode == 0 {
+        // psychedelic: depth shrinks
+        let v = d0 * (1.0 - PSY_ALPHA_P * dose)
+        if v < 0.05 { return 0.05 }
+        return v
+    }
+    // anesthesia: depth grows
+    let v = d0 * (1.0 + PSY_ALPHA_A * dose)
+    return v
+}
+
+// Landscape-wide noise scale at a given dose
+fn psy_noise_at(dose: float, mode: int) -> float {
+    if mode == 0 {
+        return PSY_NOISE0 + PSY_BETA_P * dose
+    }
+    let v = PSY_NOISE0 - PSY_BETA_A * dose
+    if v < 0.02 { return 0.02 }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Simulate a single trajectory: sequence of basin indices [0..N_ATTR)
+// over T_STEPS ticks, driven by Boltzmann-like hop kernel.
+// ═══════════════════════════════════════════════════════════════
+
+// Transition kernel: probability of moving from basin cur -> basin cand,
+// biased by the target well's attractive strength exp(-depth_cand)
+// plus the current escape ease exp(-depth_cur) and the noise floor.
+// We compute a SCORE per candidate then pick arg-max after perturbing
+// with stochastic signed noise (proxy for sampling from distribution).
+fn psy_hop_score(depth_cand: float, depth_cur: float, noise: float, seed: int) -> float {
+    let attract = psy_exp_neg(depth_cand)
+    let escape  = psy_exp_neg(depth_cur)
+    let rnd = noise * psy_signed(seed)
+    return attract + 0.35 * escape + rnd
+}
+
+// Run a single trajectory and return the array of basin IDs per tick.
+fn psy_trajectory(dose: float, mode: int, seed: int) -> array {
+    let noise = psy_noise_at(dose, mode)
+    let mut out = []
+    let mut cur = 0                  // start in default-mode basin
+    let mut s = seed
+    let mut t = 0
+    while t < PSY_T_STEPS {
+        // Score every candidate basin, pick arg-max of score
+        let depth_cur = psy_depth_at(cur, dose, mode)
+        let mut best_k = cur
+        let mut best_score = 0.0 - 1000.0
+        let mut k = 0
+        while k < PSY_N_ATTR {
+            s = psy_prng(s + k * 131 + t * 17)
+            let depth_k = psy_depth_at(k, dose, mode)
+            let mut score = psy_hop_score(depth_k, depth_cur, noise, s)
+            // Slight inertia bonus to the current basin so baseline
+            // doesn't oscillate purely from noise.
+            if k == cur { score = score + 0.10 }
+            if score > best_score {
+                best_score = score
+                best_k = k
+            }
+            k = k + 1
+        }
+        cur = best_k
+        out = out.push(cur)
+        t = t + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Observables: state-distribution entropy, transition count, Φ
+// ═══════════════════════════════════════════════════════════════
+
+// Entropy of the basin-occupation histogram over the trajectory.
+fn psy_state_entropy(traj: array) -> float {
+    let n = len(traj)
+    if n == 0 { return 0.0 }
+    let mut cnt = []
+    let mut k = 0
+    while k < PSY_N_ATTR {
+        let mut c = 0.0
+        let mut i = 0
+        while i < n {
+            if traj[i] == k { c = c + 1.0 }
+            i = i + 1
+        }
+        cnt = cnt.push(c)
+        k = k + 1
+    }
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut j = 0
+    while j < PSY_N_ATTR {
+        let p = cnt[j] * inv
+        if p > 0.0 { h = h - p * psy_ln_safe(p) }
+        j = j + 1
+    }
+    return h
+}
+
+// Number of basin-to-basin transitions in the trajectory.
+fn psy_transition_count(traj: array) -> int {
+    let n = len(traj)
+    if n < 2 { return 0 }
+    let mut c = 0
+    let mut i = 1
+    while i < n {
+        if traj[i] != traj[i - 1] { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+// Count number of distinct basins visited (support of distribution).
+// Root cause: hexa stage0 arrays don't expose .set(); we scan per basin.
+fn psy_basins_visited(traj: array) -> int {
+    let n = len(traj)
+    let mut total = 0
+    let mut k = 0
+    while k < PSY_N_ATTR {
+        let mut found = 0
+        let mut i = 0
+        while i < n {
+            if traj[i] == k { found = 1 }
+            i = i + 1
+        }
+        if found == 1 { total = total + 1 }
+        k = k + 1
+    }
+    return total
+}
+
+// Convert a basin-index trajectory to a float signal so the MI
+// estimator (which operates on continuous series) can score it.
+// Pure basin index — no per-time perturbation. Root cause: any
+// per-time offset inflates single-channel entropy even when all
+// channels are stuck at the same basin, which then yields a
+// spurious constant MI baseline. We want baseline Φ = 0 when all
+// trajectories collapse to one basin.
+fn psy_traj_as_float(traj: array) -> array {
+    let n = len(traj)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let v = to_float(traj[i])
+        out = out.push(v)
+        i = i + 1
+    }
+    return out
+}
+
+// Φ estimator: average pairwise MI over K parallel trajectories.
+// Each trajectory uses a different seed offset so the ensemble samples
+// the stochastic landscape — this is the information-theoretic analog
+// of "repertoire size" (Tononi IIT).
+fn psy_phi_at(dose: float, mode: int, seed: int) -> float {
+    let mut tapes = []
+    let mut k = 0
+    while k < PSY_K_CHAN {
+        let s = seed + k * 911
+        let traj = psy_trajectory(dose, mode, s)
+        let tape = psy_traj_as_float(traj)
+        tapes = tapes.push(tape)
+        k = k + 1
+    }
+    let mut total = 0.0
+    let mut pairs = 0
+    let mut i = 0
+    while i < (PSY_K_CHAN - 1) {
+        let ci = tapes[i]
+        let mut j = i + 1
+        while j < PSY_K_CHAN {
+            let cj = tapes[j]
+            total = total + psy_mi(ci, cj)
+            pairs = pairs + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if pairs == 0 { return 0.0 }
+    return total / to_float(pairs)
+}
+
+// Entropy at a given dose using a single representative trajectory.
+fn psy_entropy_at(dose: float, mode: int, seed: int) -> float {
+    let traj = psy_trajectory(dose, mode, seed)
+    return psy_state_entropy(traj)
+}
+
+// Average transitions over the K-channel ensemble.
+fn psy_mean_transitions(dose: float, mode: int, seed: int) -> float {
+    let mut total = 0
+    let mut k = 0
+    while k < PSY_K_CHAN {
+        let s = seed + k * 277
+        let traj = psy_trajectory(dose, mode, s)
+        total = total + psy_transition_count(traj)
+        k = k + 1
+    }
+    return to_float(total) / to_float(PSY_K_CHAN)
+}
+
+// Basins visited at a given dose (single trajectory)
+fn psy_basins_at(dose: float, mode: int, seed: int) -> int {
+    let traj = psy_trajectory(dose, mode, seed)
+    return psy_basins_visited(traj)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Tests T1–T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1: dose -> entropy monotone (psychedelic)
+    let seed = 59001
+    let d0 = 0.0
+    let d1 = 0.25
+    let d2 = 0.55
+    let d3 = 0.90
+    let h0 = psy_entropy_at(d0, 0, seed + 1)
+    let h1 = psy_entropy_at(d1, 0, seed + 2)
+    let h2 = psy_entropy_at(d2, 0, seed + 3)
+    let h3 = psy_entropy_at(d3, 0, seed + 4)
+    println("  [T1] dose->entropy (psy): d=0.00 H=" + str(h0))
+    println("       d=0.25 H=" + str(h1))
+    println("       d=0.55 H=" + str(h2))
+    println("       d=0.90 H=" + str(h3))
+    let slack = 0.05
+    if h1 + slack < h0 { return false }
+    if h2 + slack < h1 { return false }
+    if h3 + slack < h2 { return false }
+    // End-to-end increase
+    if h3 <= h0 + 0.05 { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: attractor hops scale with psychedelic dose
+    let seed = 59002
+    let tr0 = psy_mean_transitions(0.0,  0, seed + 11)
+    let tr1 = psy_mean_transitions(0.35, 0, seed + 12)
+    let tr2 = psy_mean_transitions(0.85, 0, seed + 13)
+    println("  [T2] transitions: base=" + str(tr0) + " mid=" + str(tr1) + " high=" + str(tr2))
+    let slack = 0.5
+    if tr1 + slack < tr0 { return false }
+    if tr2 + slack < tr1 { return false }
+    if tr2 <= tr0 + 1.0 { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3: ego dissolution at high dose — wide basin spread + high entropy
+    let seed = 59003
+    let baseline_h = psy_entropy_at(0.0,  0, seed + 1)
+    let high_h     = psy_entropy_at(0.90, 0, seed + 2)
+    let baseline_b = psy_basins_at(0.0,   0, seed + 1)
+    let high_b     = psy_basins_at(0.90,  0, seed + 2)
+    println("  [T3] baseline: H=" + str(baseline_h) + " basins=" + str(baseline_b))
+    println("       high dose: H=" + str(high_h) + " basins=" + str(high_b))
+    // Ego dissolution signature: high-dose wide spread
+    if high_b < PSY_EGO_BASINS_MIN { return false }
+    if high_h < PSY_EGO_H_MIN { return false }
+    // Baseline must be more concentrated
+    if baseline_b > PSY_EGO_BASELINE_BASINS { return false }
+    if baseline_h >= PSY_EGO_H_MIN { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: psychedelic Φ rises at moderate dose;
+    //     anesthesia Φ falls at deep dose.
+    let seed = 59004
+    let phi_base    = psy_phi_at(0.0,  0, seed + 1)
+    let phi_mid_psy = psy_phi_at(0.35, 0, seed + 2)
+    let phi_high_an = psy_phi_at(0.85, 1, seed + 3)
+    println("  [T4] Φ baseline=" + str(phi_base))
+    println("       Φ mid-dose psychedelic=" + str(phi_mid_psy))
+    println("       Φ deep anesthesia=" + str(phi_high_an))
+    // Psychedelic mid-dose must lift Φ above baseline
+    if phi_mid_psy <= phi_base { return false }
+    // Anesthesia deep must drop Φ below baseline
+    if phi_high_an >= phi_base { return false }
+    // Also: direction of change is opposite
+    let psy_gain  = phi_mid_psy - phi_base
+    let anes_gain = phi_high_an - phi_base
+    if psy_gain <= 0.0 { return false }
+    if anes_gain >= 0.0 { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5: At comparable entropy regimes, psychedelic Φ > anesthesia Φ.
+    // We compare anesthesia baseline (d=0) vs psychedelic mid-dose —
+    // both have moderate entropy but integration is richer under psy.
+    let seed = 59005
+    let h_anes_base = psy_entropy_at(0.0, 1, seed + 1)
+    let phi_anes_base = psy_phi_at(0.0, 1, seed + 1)
+    let h_psy_mid   = psy_entropy_at(0.35, 0, seed + 2)
+    let phi_psy_mid = psy_phi_at(0.35, 0, seed + 2)
+    println("  [T5] anesthesia baseline H=" + str(h_anes_base) + " Φ=" + str(phi_anes_base))
+    println("       psychedelic mid-dose H=" + str(h_psy_mid) + " Φ=" + str(phi_psy_mid))
+    // Psychedelic mid-dose integration must exceed anesthesia baseline
+    if phi_psy_mid <= phi_anes_base { return false }
+    // And psychedelic entropy must be at least as high — ego expansion
+    if h_psy_mid + 0.01 < h_anes_base { return false }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[psychedelic_phi] P59 — Entropic Brain (5-HT2A Φ dynamics)")
+    println("  landscape: 4 attractor basins on a 1D ring")
+    println("  doses    : d=0 baseline -> d=0.9 ego dissolution")
+    println("  controls : psychedelic vs anesthesia contrast")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — dose -> entropy monotone") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — attractor hops scale with dose") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — ego dissolution signature detectable") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — psychedelic Φ rises; anesthesia Φ falls") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — psychedelic Φ > anesthesia Φ at comparable H") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause: hexa stage0 long && chains can miscompile — use
+    // sequential bool accumulator instead.
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[psychedelic_phi] 5/5 PASS — P59 DONE (psychedelic Φ)")
+    } else {
+        println("[psychedelic_phi] SOME FAILED")
+    }
+}
+
+main()

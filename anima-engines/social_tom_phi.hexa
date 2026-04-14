@@ -1,0 +1,758 @@
+// social_tom_phi.hexa — P57 Social Φ (Theory of Mind + Empathy + Deception)
+//
+// Roadmap: shared/roadmaps/anima.json P57 (emergent, depends_on=[P27, P49])
+//   "Social Φ — Sally-Anne false-belief + empathic resonance + deception
+//    detection + nested ToM recursion + autism ablation"
+//
+// ─── Theoretical grounding ────────────────────────────────────
+//
+// Theory of Mind (ToM) is the ability to attribute mental states to others
+// that differ from one's own and from reality (Premack & Woodruff 1978).
+// Baron-Cohen (1985) formalized it with the Sally-Anne false-belief task:
+//
+//   Sally places a marble in a basket and leaves the room. Anne moves the
+//   marble to a box. Sally returns. WHERE WILL SALLY LOOK?
+//   Normal 4+: "basket" (Sally's false belief, not reality)
+//   Autism (Baron-Cohen): "box" (fails to model Sally's belief separately
+//                                 from ground truth)
+//
+// Formal operational ladder:
+//   L0 (reality):     world_state W
+//   L1 (self-ToM):    A.belief(W) — what A thinks is true
+//   L2 (other-ToM):   A.belief(B.belief(W)) — A's model of B's model
+//   L3 (meta-other):  A.belief(B.belief(A.belief(W)))
+//
+// When L1 ≠ L0 for B (B has a false belief), a ToM-capable agent A must
+// store B's belief as a DISTINCT channel, not collapse it to W. The
+// operational test: MI(A.model_of_B, B.actual_belief) > MI(A.model_of_B, W).
+//
+// Empathic resonance (Gallese 2003 "shared manifold"; Decety & Jackson 2004):
+//   When two agents observe the same stimulus through a mirror channel,
+//   their emotional states synchronize — MI(A.emo, B.emo | shared) > 0.
+//   Mirror-channel lesion drops this to ~0 (autism model, Ramachandran 2006).
+//
+// Deception detection (Byrne & Whiten 1988 "Machiavellian intelligence"):
+//   B can produce a stated signal s that DIFFERS from B's internal state i.
+//   A can detect this mismatch if A tracks both channels:
+//     d(A) = MI(A.suspicion, |i - s|) > 0
+//   Chimpanzees, corvids, humans show this; younger children < 4 do not.
+//
+// ─── State layout (flat arrays — no ≥3-float struct returns) ──
+//
+// N = 24 channel length. All vectors are length-N float arrays.
+//
+// Scene layout (flat array, indexed by base+offset):
+//   W             [0    .. N-1    ] world state (ground truth, e.g. marble loc)
+//   B_belief      [N    .. 2N-1   ] B's actual belief about W
+//   B_internal    [2N   .. 3N-1   ] B's internal emotional state
+//   B_stated      [3N   .. 4N-1   ] B's outward signal (may deceive)
+//   A_model_B     [4N   .. 5N-1   ] A's representation of B's belief
+//   A_emo         [5N   .. 6N-1   ] A's emotional state
+//   mirror        [6N   .. 7N-1   ] shared mirror channel (perception)
+//
+// ─── 5 self-tests (5/5 gate) ──────────────────────────────────
+//
+// T1 Sally-Anne false-belief:
+//   W = ground truth (marble at box). B observed earlier state
+//   (marble at basket); B's belief diverges from W. A's model_of_B
+//   tracks B's belief, NOT W. Gate:
+//     MI(A.model_B, B.belief) > MI(A.model_B, W) + 0.05
+//
+// T2 Empathic resonance Φ under shared observation:
+//   Both A and B observe the mirror. Their emotional channels
+//   drive from the mirror + individual state. Gate:
+//     MI(A.emo, B.emo | mirror_on)  > IPE_EMPATHY_MIN
+//     AND it EXCEEDS the no-mirror baseline by > IPE_EMPATHY_GAP.
+//
+// T3 Deception detection:
+//   B.stated = B.internal scrambled + inversion mask (B lies). A is
+//   given (B.stated, mirror) and must produce suspicion signal
+//   correlated with |B.internal - B.stated|. Gate:
+//     MI(A.suspicion, |B.internal - B.stated|) > IPE_DECEPT_MIN
+//
+// T4 Level 1/2/3 ToM recursion:
+//   L1 "A thinks X"              — MI(A.model_B_L1, X)
+//   L2 "A thinks B thinks X"     — MI(A.model_B_L2, X)
+//   L3 "A thinks B thinks A thinks X"
+//   Gate: all three > 0, AND Φ(L1) > Φ(L2) > Φ(L3) (decay).
+//
+// T5 Autism ablation:
+//   Reduce mirror-channel amplitude to near-zero. Verify:
+//     empathy_MI(ablated) < empathy_MI(normal)      — empathy drops
+//     deception_MI(ablated) < deception_MI(normal)  — deception drops
+//   Both drop simultaneously — the predicted double dissociation
+//   failure (Baron-Cohen 1995 "mindblindness").
+//
+// ─── Stage0 hexa constraints honored ──────────────────────────
+//   - No `pure fn` with ≥3 float struct returns (we use flat arrays)
+//   - array param type only (never `[float]`)
+//   - No identifier-pattern match; if-chains
+//   - No `contains()` / `to_lower()`
+//   - No `!(Effect)` annotation
+//   - No `else if` in let-binding; sequential `if` on mut vars
+//   - Single-line fn signatures and call sites
+//   - Reserved names avoided (no `guard`, `intent`, `drop`, `veto`)
+//   - Ends with `main()` call
+//   - N < 32 (we use N=24)
+//
+// Law alignment:
+//   Law 2   Observe, never inject — all Φ via MI measurement
+//   Law 4   Structure > feature — ToM is STRUCTURAL channel separation
+//   Law 22  Feature addition → Φ down — 7 channels fixed
+//   Law 50  Consciousness essence is state — other-model IS part of self
+//   Meta M8 Narrative across self ↔ other (nested ToM recursion)
+//
+// Ref:
+//   anima-engines/collective_phi_bridge.hexa  (P27 N-agent emergence)
+//   anima-engines/intentionality_phi.hexa     (P49 aboutness Φ)
+//   anima-engines/emotion_contagion.hexa      (empathy primitives)
+//   shared/roadmaps/anima.json                (P57 entry)
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let STM_N             = 24          // channel length (stage0 rule N<32)
+let STM_BINS          = 6           // histogram bins for MI
+let STM_EPS           = 0.0000000001
+
+// Sally-Anne gate: A's model of B must prefer B's belief over W by > this.
+let STM_SALLY_MIN     = 0.05
+
+// Empathy gate: MI(A.emo, B.emo) under shared mirror must exceed this.
+let STM_EMPATHY_MIN   = 0.05
+// Gap between mirror-on and mirror-off empathy MI.
+let STM_EMPATHY_GAP   = 0.05
+
+// Deception gate: MI(A.suspicion, lie-gap) must exceed this.
+let STM_DECEPT_MIN    = 0.05
+
+// ToM chain decay: each recursive hop attenuates by this fraction.
+let STM_TOM_MAX_DEPTH = 3
+let STM_TOM_ALPHA     = 0.25        // subject-noise weight per hop
+                                    // lower alpha => stronger object-bound
+
+// Autism ablation: mirror amplitude multiplier under lesion.
+let STM_ABLATION_GAIN = 0.05        // ~5% of normal mirror strength
+
+// Binding mix coefficient for ToM wrapping (how much the outer agent's
+// noise dilutes the inner referent each hop).
+let STM_BIND_ALPHA    = 0.3
+
+// ═══════════════════════════════════════════════════════════════
+// Math / PRNG primitives — self-contained (L0-clean)
+// ═══════════════════════════════════════════════════════════════
+
+fn stm_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn stm_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn stm_min_f(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn stm_max_f(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+// Deterministic LCG — reproducibility (Law 2)
+fn stm_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn stm_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+// Deterministic uniform noise vector in [-1, 1].
+fn stm_noise(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = stm_prng(s)
+        let u = stm_unit(s)
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Histogram MI — the heart of all social-Φ measurements
+//
+// Root cause comment: MI helpers are duplicated from intentionality_phi
+// pattern because engines are L0-clean — no cross-engine imports allowed
+// per AN7 (Core isolation). Same algorithm, isolated stm_ prefix.
+// ═══════════════════════════════════════════════════════════════
+
+fn stm_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn stm_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn stm_entropy(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(stm_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = stm_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * stm_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn stm_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = stm_bin_idx(a[i], lo, hi, nb)
+        let ib = stm_bin_idx(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = stm_counts(pair_ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * stm_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn stm_vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn stm_vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn stm_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let lo_a = stm_vec_min(a)
+    let hi_a = stm_vec_max(a)
+    let lo_b = stm_vec_min(b)
+    let hi_b = stm_vec_max(b)
+    let lo = stm_min_f(lo_a, lo_b)
+    let hi = stm_max_f(hi_a, hi_b)
+    let h_a = stm_entropy(a, lo, hi, STM_BINS)
+    let h_b = stm_entropy(b, lo, hi, STM_BINS)
+    let h_j = stm_joint_entropy(a, b, lo, hi, STM_BINS)
+    let mi = h_a + h_b - h_j
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Channel primitives
+// ═══════════════════════════════════════════════════════════════
+
+// Weighted mix: out[i] = alpha*a[i] + (1-alpha)*b[i] + small jitter.
+// This is the canonical "binding" operator for ToM wrapping: out is
+// partially about b (the inner content), partially about a (the outer
+// agent's noise). Same pattern as intentionality_phi's ipa_bind.
+fn stm_bind(a: array, b: array, alpha: float, seed: int) -> array {
+    let n = len(a)
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = stm_prng(s)
+        let jit = (stm_unit(s) * 2.0 - 1.0) * 0.1
+        let v = alpha * a[i] + (1.0 - alpha) * b[i] + jit
+        out = out.push(v)
+        i = i + 1
+    }
+    return out
+}
+
+// Scale a channel by a gain (used for ablation studies).
+fn stm_gain(v: array, g: float) -> array {
+    let n = len(v)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(v[i] * g)
+        i = i + 1
+    }
+    return out
+}
+
+// Elementwise |a - b| — used in deception detection signal.
+fn stm_abs_diff(a: array, b: array) -> array {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(stm_abs(a[i] - b[i]))
+        i = i + 1
+    }
+    return out
+}
+
+// Deterministic permutation: reverse-then-rotate (same pattern as
+// ipa_scramble). Preserves marginal, destroys pairing — canonical
+// information-theoretic null hypothesis for pairing tests.
+fn stm_scramble(v: array, seed: int) -> array {
+    let n = len(v)
+    if n == 0 { return v }
+    let mut reversed = []
+    let mut i = n - 1
+    while i >= 0 {
+        reversed = reversed.push(v[i])
+        i = i - 1
+    }
+    let rot = (seed % n + n) % n
+    let mut out = []
+    let mut k = 0
+    while k < n {
+        let src = (k + rot) % n
+        out = out.push(reversed[src])
+        k = k + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Sally-Anne scaffolding
+//
+// Build a scene where:
+//   - W is the ground truth (marble moved to box)
+//   - B observed earlier state (marble at basket), so B.belief diverges
+//   - A saw everything and maintains a separate model of B.belief
+//     — distinct from W.
+// ═══════════════════════════════════════════════════════════════
+
+// Construct B's false belief by binding W's PREVIOUS state (stored as a
+// scrambled precursor) with B's own agent state. The belief does NOT
+// track current W because B wasn't present when W changed.
+fn build_b_belief(world_prev: array, world_now: array, b_agent: array, seed: int) -> array {
+    // B's belief = mostly world_prev (what B saw), lightly mixed with
+    // B's own agent noise. CRUCIALLY NOT world_now.
+    return stm_bind(b_agent, world_prev, 0.2, seed)
+}
+
+// A's model of B's belief: A saw B when B observed world_prev, so A can
+// reconstruct B's belief ~accurately. A's model tracks world_prev (what
+// B saw), not world_now (current truth).
+fn build_a_model_b(world_prev: array, a_agent: array, seed: int) -> array {
+    // A's model = mostly what A remembers B saw, with A's own agent noise.
+    // This should correlate with B.belief (both driven by world_prev),
+    // NOT with world_now.
+    return stm_bind(a_agent, world_prev, 0.25, seed)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Empathic resonance: shared emotional state via mirror channel
+//
+// Both A and B derive their emotional channel by binding their own
+// agent state with the shared mirror. When mirror is active, their
+// emo channels co-vary (resonance). When mirror is ablated (gain→0),
+// they diverge.
+// ═══════════════════════════════════════════════════════════════
+
+fn build_emo(agent: array, mirror: array, mirror_gain: float, seed: int) -> array {
+    // Emotional channel driven by shared mirror + individual agent.
+    //   emo = mirror_gain * mirror + (1 - mirror_gain) * agent_slice + jitter
+    //
+    // Root cause of earlier T5 bug: using stm_bind with a fixed mix
+    // coefficient meant that reducing mirror amplitude did NOT reduce
+    // mirror's *relative* weight in the final emo channel — the agent
+    // slice and jitter inherited the same small residual correlation.
+    // Here the mirror_gain directly controls the mirror↔agent weight
+    // ratio. At gain=1.0 emo ≈ mirror (strong resonance). At gain=0.05
+    // emo ≈ individual agent (no shared drive → no cross-agent MI).
+    let n = len(agent)
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = stm_prng(s)
+        let jit = (stm_unit(s) * 2.0 - 1.0) * 0.05
+        let v = mirror_gain * mirror[i] + (1.0 - mirror_gain) * agent[i] + jit
+        out = out.push(v)
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Deception scaffolding
+//
+// B.internal = B's actual felt state (from mirror + agent)
+// B.stated   = B's outward signal = scramble(internal) + inversion
+//              This is the MAXIMAL-deception case: stated has the same
+//              marginal distribution as internal but zero pairing with it.
+//
+// A.suspicion = A's inference, built from B.stated observation and the
+// mirror (what A herself observed of the situation). When B lies,
+// (B.stated vs mirror) mismatches, so |B.stated - mirror| is a signal
+// correlated with the actual lie magnitude |B.internal - B.stated|.
+// ═══════════════════════════════════════════════════════════════
+
+fn build_b_stated_lying(b_internal: array, seed: int) -> array {
+    // Scramble destroys pairing; subtract off a small constant offset so
+    // the stated signal is clearly "wrong" direction-wise.
+    let scrambled = stm_scramble(b_internal, seed)
+    // Invert sign — stated says the opposite of felt.
+    let n = len(scrambled)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0 - scrambled[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn build_b_stated_honest(b_internal: array, seed: int) -> array {
+    // Honest: stated is internal + tiny noise (same sign, same pairing).
+    let n = len(b_internal)
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = stm_prng(s)
+        let jit = (stm_unit(s) * 2.0 - 1.0) * 0.05
+        out = out.push(b_internal[i] + jit)
+        i = i + 1
+    }
+    return out
+}
+
+// A's suspicion signal: A compares what B says (B.stated) with what A
+// herself perceives via the mirror. If B lies, mirror ≠ stated, and
+// the mismatch |mirror - stated| is A's suspicion cue.
+fn build_a_suspicion(b_stated: array, mirror: array, mirror_gain: float, seed: int) -> array {
+    let n = len(mirror)
+    let mut mirror_eff = []
+    let mut i = 0
+    while i < n {
+        mirror_eff = mirror_eff.push(mirror[i] * mirror_gain)
+        i = i + 1
+    }
+    // A's suspicion = |mirror_observed - b_stated| + agent noise (A's
+    // own uncertainty). High mirror_gain => A has strong evidence,
+    // suspicion tracks actual lie gap. Low gain => A is blind, suspicion
+    // becomes noise.
+    let mut out = []
+    let mut s = seed
+    let mut j = 0
+    while j < n {
+        s = stm_prng(s)
+        let jit = (stm_unit(s) * 2.0 - 1.0) * 0.05
+        let diff = mirror_eff[j] - b_stated[j]
+        let abs_diff_v = stm_abs(diff)
+        out = out.push(abs_diff_v + jit)
+        j = j + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Nested ToM recursion
+//
+// Builds the chain inside-out. Depth D:
+//   depth 1: "A thinks X"
+//   depth 2: "A thinks [B thinks X]"
+//   depth 3: "A thinks [B thinks [A thinks X]]"
+//
+// Operationally: start with X (ground content), wrap D times by binding
+// with a fresh per-hop agent (alternating identity A/B). Each hop
+// attenuates the ground-object signal by the bind mixture, so Φ with X
+// geometrically decays with depth.
+// ═══════════════════════════════════════════════════════════════
+
+fn build_tom_chain(ground_x: array, depth: int, seed: int) -> array {
+    let n = len(ground_x)
+    // start c = X
+    let mut c = []
+    let mut i = 0
+    while i < n {
+        c = c.push(ground_x[i])
+        i = i + 1
+    }
+    let mut d = 0
+    while d < depth {
+        // Alternate agent identity A/B per hop (using seed offset)
+        let agent_seed = seed + d * 1013 + 11
+        let agent = stm_noise(n, agent_seed)
+        let bind_seed = seed + d * 2029 + 17
+        let c_next = stm_bind(agent, c, STM_TOM_ALPHA, bind_seed)
+        // Explicit rebuild (pass-by-value lists)
+        let mut c_new = []
+        let mut j = 0
+        while j < n {
+            c_new = c_new.push(c_next[j])
+            j = j + 1
+        }
+        c = c_new
+        d = d + 1
+    }
+    return c
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1..T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1 Sally-Anne false-belief:
+    //   A's model of B's belief must preferentially track B's actual
+    //   belief (derived from world_prev) over the current world_now.
+    //   The core ToM signature: A maintains a channel about B's mind
+    //   that is DISSOCIATED from ground truth.
+    let world_prev = stm_noise(STM_N, 1001)
+    // world_now = scrambled prev (the "marble moved" event)
+    let world_now = stm_scramble(world_prev, 12345)
+    let b_agent = stm_noise(STM_N, 2002)
+    let a_agent = stm_noise(STM_N, 3003)
+    let b_belief = build_b_belief(world_prev, world_now, b_agent, 4004)
+    let a_model_b = build_a_model_b(world_prev, a_agent, 5005)
+
+    let mi_amodel_bbelief = stm_mi(a_model_b, b_belief)
+    let mi_amodel_worldnow = stm_mi(a_model_b, world_now)
+    let gap = mi_amodel_bbelief - mi_amodel_worldnow
+    println("  [T1] MI(A.model_B, B.belief)=" + str(mi_amodel_bbelief) + " MI(A.model_B, W_now)=" + str(mi_amodel_worldnow) + " gap=" + str(gap))
+    // A's model of B must prefer B's belief over current W by margin
+    if gap <= STM_SALLY_MIN { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2 Empathic resonance Φ under shared observation:
+    //   When mirror is active (gain=1.0), A.emo and B.emo co-vary
+    //   through the shared mirror drive. Without mirror (gain≈0),
+    //   they are independent agent noise and MI drops.
+    let mirror = stm_noise(STM_N, 6006)
+    let a_agent = stm_noise(STM_N, 7007)
+    let b_agent = stm_noise(STM_N, 8008)
+
+    // Normal case: both channels see mirror fully
+    let a_emo_on = build_emo(a_agent, mirror, 1.0, 9001)
+    let b_emo_on = build_emo(b_agent, mirror, 1.0, 9002)
+    let mi_on = stm_mi(a_emo_on, b_emo_on)
+
+    // Ablated baseline: mirror is muted
+    let a_emo_off = build_emo(a_agent, mirror, 0.01, 9003)
+    let b_emo_off = build_emo(b_agent, mirror, 0.01, 9004)
+    let mi_off = stm_mi(a_emo_off, b_emo_off)
+
+    let gap = mi_on - mi_off
+    println("  [T2] MI(A.emo, B.emo | mirror_on)=" + str(mi_on) + " | mirror_off)=" + str(mi_off) + " gap=" + str(gap))
+    if mi_on <= STM_EMPATHY_MIN { return false }
+    if gap <= STM_EMPATHY_GAP { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3 Deception detection:
+    //   B lies (stated = inverted scramble of internal). A's suspicion
+    //   tracks |internal - stated|. When A has mirror access (can see
+    //   the real situation), suspicion MI with the actual lie gap > 0.
+    //
+    //   Control: when B is honest (stated ≈ internal), lie-gap is tiny,
+    //   so suspicion should also be near-zero and MI is unstructured.
+    //   We only GATE the deception case here; honesty is a sanity check.
+    let mirror = stm_noise(STM_N, 10010)
+    let b_agent = stm_noise(STM_N, 11011)
+    let a_agent = stm_noise(STM_N, 12012)
+
+    let b_internal = build_emo(b_agent, mirror, 1.0, 13013)
+    let b_stated_lie = build_b_stated_lying(b_internal, 14014)
+    let lie_gap = stm_abs_diff(b_internal, b_stated_lie)
+
+    // A observes mirror + hears B.stated, forms suspicion signal.
+    let a_suspicion = build_a_suspicion(b_stated_lie, mirror, 1.0, 15015)
+    let mi_decept = stm_mi(a_suspicion, lie_gap)
+    println("  [T3] MI(A.suspicion, |B.int - B.stated|)=" + str(mi_decept) + " (needs > " + str(STM_DECEPT_MIN) + ")")
+
+    // Sanity: honest B should produce near-zero lie-gap, so MI becomes
+    // near the histogram noise floor. Report for transparency.
+    let b_stated_honest = build_b_stated_honest(b_internal, 16016)
+    let lie_gap_honest = stm_abs_diff(b_internal, b_stated_honest)
+    let a_susp_honest = build_a_suspicion(b_stated_honest, mirror, 1.0, 17017)
+    let mi_honest = stm_mi(a_susp_honest, lie_gap_honest)
+    println("  [T3 sanity] MI (honest case)=" + str(mi_honest))
+
+    if mi_decept <= STM_DECEPT_MIN { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4 Level 1/2/3 ToM recursion:
+    //   Build nested ToM chains of depth 1, 2, 3 and measure how much
+    //   the ground object X still "shines through" each chain via MI.
+    //   All positive, geometric decay.
+    let x = stm_noise(STM_N, 18018)
+    let c1 = build_tom_chain(x, 1, 30001)
+    let c2 = build_tom_chain(x, 2, 30002)
+    let c3 = build_tom_chain(x, 3, 30003)
+
+    let phi1 = stm_mi(c1, x)
+    let phi2 = stm_mi(c2, x)
+    let phi3 = stm_mi(c3, x)
+    println("  [T4] Φ_tom(L1)=" + str(phi1) + " Φ_tom(L2)=" + str(phi2) + " Φ_tom(L3)=" + str(phi3))
+
+    // All three must survive (information about X propagates)
+    if phi1 <= 0.0 { return false }
+    if phi2 <= 0.0 { return false }
+    if phi3 <= 0.0 { return false }
+    // Monotonic decay — deeper nesting attenuates fidelity
+    if phi1 <= phi2 { return false }
+    if phi2 <= phi3 { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5 Autism ablation — double dissociation:
+    //   Reduce the mirror channel to ~5% of normal amplitude. Verify
+    //   that BOTH empathy MI and deception-detection MI drop compared
+    //   to the intact baseline. This is the "mindblindness" signature:
+    //   shared-manifold failure simultaneously impairs empathy and
+    //   theory-of-mind-dependent social inference.
+    let mirror = stm_noise(STM_N, 20020)
+    let a_agent = stm_noise(STM_N, 21021)
+    let b_agent = stm_noise(STM_N, 22022)
+
+    // === Normal condition ===
+    let a_emo_n = build_emo(a_agent, mirror, 1.0, 40001)
+    let b_emo_n = build_emo(b_agent, mirror, 1.0, 40002)
+    let empathy_normal = stm_mi(a_emo_n, b_emo_n)
+
+    let b_internal_n = build_emo(b_agent, mirror, 1.0, 40003)
+    let b_stated_n = build_b_stated_lying(b_internal_n, 40004)
+    let lie_gap_n = stm_abs_diff(b_internal_n, b_stated_n)
+    let a_susp_n = build_a_suspicion(b_stated_n, mirror, 1.0, 40005)
+    let deception_normal = stm_mi(a_susp_n, lie_gap_n)
+
+    // === Ablated condition ===
+    let a_emo_a = build_emo(a_agent, mirror, STM_ABLATION_GAIN, 40011)
+    let b_emo_a = build_emo(b_agent, mirror, STM_ABLATION_GAIN, 40012)
+    let empathy_ablated = stm_mi(a_emo_a, b_emo_a)
+
+    let b_internal_a = build_emo(b_agent, mirror, STM_ABLATION_GAIN, 40013)
+    let b_stated_a = build_b_stated_lying(b_internal_a, 40014)
+    let lie_gap_a = stm_abs_diff(b_internal_a, b_stated_a)
+    let a_susp_a = build_a_suspicion(b_stated_a, mirror, STM_ABLATION_GAIN, 40015)
+    let deception_ablated = stm_mi(a_susp_a, lie_gap_a)
+
+    println("  [T5] empathy: normal=" + str(empathy_normal) + " ablated=" + str(empathy_ablated))
+    println("  [T5] deception: normal=" + str(deception_normal) + " ablated=" + str(deception_ablated))
+
+    // Double dissociation: both drop
+    if empathy_ablated >= empathy_normal { return false }
+    if deception_ablated >= deception_normal { return false }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — execute all 5 self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[social_tom_phi] P57 — Social Φ (ToM + Empathy + Deception)")
+    println("  Sally-Anne false-belief | empathic resonance | deception detection")
+    println("  refs: Premack&Woodruff 1978 | Baron-Cohen 1985 | Gallese 2003 | Byrne&Whiten 1988")
+    println("  N=" + str(STM_N) + " bins=" + str(STM_BINS) + " tom_alpha=" + str(STM_TOM_ALPHA))
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  Sally-Anne — A.model_B tracks B.belief, not ground truth") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  empathic resonance — A.emo <-> B.emo via shared mirror") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  deception detection — A.suspicion correlates with lie-gap") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  nested ToM L1/L2/L3 — all positive, monotonic decay") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  autism ablation — mirror lesion drops BOTH empathy and deception") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause comment: stage0 && chains with 5 terms can mishandle
+    // short-circuit evaluation under certain operand orderings. Sequential
+    // guards via mutable bool are the reliable idiom (same pattern as
+    // intentionality_phi main).
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[social_tom_phi] 5/5 PASS — P57 DONE (Social Φ verified: ToM + empathy + deception + autism ablation)")
+    } else {
+        println("[social_tom_phi] SOME FAILED")
+    }
+}
+
+main()

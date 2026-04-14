@@ -1,0 +1,516 @@
+// placebo_phi.hexa — P58 Placebo / Expectation × Φ
+//
+// Roadmap: anima P58 "Belief-driven perception — expectation modulates
+// experience (Benedetti placebo, predictive processing)."
+//
+// ─── Scientific hypothesis ────────────────────────────────────────
+//
+// H (placebo as predictive processing): Perception is not a bottom-up
+// readout of sensory input; it is a top-down hypothesis generator that
+// uses sensory data as disambiguating evidence. Expectation acts as a
+// high-precision prior. When a pain signal arrives, the brain blends
+// bottom-up nociception with the top-down prior "this will help":
+//
+//   perceived = w_s · sensory + w_e · expectation + η
+//
+// The mixing weights reflect precision-weighted Bayesian inference
+// (Friston 2010, Büchel 2014). Expectation of relief biases perceived
+// intensity downward (placebo analgesia, Benedetti 2005 ~30%). Symmetric
+// effect exists: expectation of harm biases perceived intensity upward
+// (nocebo, Colloca 2013 ~25%).
+//
+// The key empirical signature:
+//   - Φ_placebo = MI(expectation, outcome) − MI(sensory_only, outcome) > 0
+//   - ablating the expectation channel removes the effect
+//   - pre-registered expectation correlates with actual perceived delta
+//
+// References
+//   Benedetti F. (2005) Placebo Effects, Oxford
+//   Colloca L. & Benedetti F. (2013) Nocebo hyperalgesia, Nature Rev Neurosci
+//   Büchel C. et al. (2014) Placebo analgesia: predictive coding, Neuron
+//   Friston K. (2010) Free-energy principle
+//
+// ─── Theorems (T1–T5) ─────────────────────────────────────────────
+//
+// T1 (placebo reduces pain signal):
+//   For a constant baseline nociceptive input, injecting a positive
+//   expectation of relief (E = +0.8) produces a perceived pain strictly
+//   lower than the no-expectation (E = 0) baseline. Reduction ≥ 15%.
+//
+// T2 (nocebo raises pain signal — symmetric):
+//   For the same baseline, injecting a negative expectation (E = -0.8,
+//   "this will hurt more") produces perceived pain strictly higher than
+//   the baseline. Increase ≥ 15%. Also: nocebo - placebo separation
+//   exceeds a gate (sandwich test: placebo < neutral < nocebo).
+//
+// T3 (Φ_placebo > 0 when expectation is wired):
+//   MI between expectation and outcome, over many trials where the
+//   agent has access to expectation, strictly exceeds MI computed
+//   from sensory alone vs outcome. Φ_placebo = ΔMI ≥ 0.02 nats.
+//
+// T4 (ablation removes effect):
+//   When the expectation channel is clamped to zero (ablated), perceived
+//   outcome tracks the sensory-only baseline and the placebo-nocebo
+//   separation collapses. |perceived_ablated_placebo - perceived_ablated_nocebo|
+//   must be strictly smaller than the intact separation by ratio ≥ 3×.
+//
+// T5 (latency):
+//   Full pipeline (baseline + placebo + nocebo + MI ablation sweep)
+//   under 5 s on hexa stage0 interpreter.
+//
+// ─── Stage0 hexa constraints honored ─────────────────────────────
+//   - plain `fn` only, no pure-fn multi-float struct returns
+//   - `array` typed params (no [float]/[int])
+//   - no match with identifier patterns
+//   - no contains() / to_lower() builtins
+//   - no !(Effect) annotations
+//   - no else-if in let-binding
+//   - no multi-line fn signatures / call sites
+//   - no reserved keywords (guard/intent/drop/veto) as vars
+//   - N < 32 throughout
+//   - main() call at bottom
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let PB_BASELINE_PAIN    = 1.0         // nominal pain intensity (baseline)
+let PB_SENSORY_NOISE    = 0.08        // bottom-up sensory noise amplitude
+
+// Mixing weights (precision-weighted Bayesian blend)
+let PB_W_SENSORY        = 0.55        // weight on bottom-up nociception
+let PB_W_EXPECT         = 0.45        // weight on top-down expectation
+
+// Expectation magnitudes
+let PB_EXPECT_PLACEBO   = 0.8         // "this will help" (positive relief expect.)
+let PB_EXPECT_NOCEBO    = 0 - 0.8     // "this will harm" (negative harm expect.)
+let PB_EXPECT_NEUTRAL   = 0.0         // no suggestion
+
+// Effect thresholds (T1, T2)
+let PB_PLACEBO_REDUCE   = 0.15        // ≥15% reduction required
+let PB_NOCEBO_INCREASE  = 0.15        // ≥15% increase required
+let PB_SANDWICH_GAP     = 0.25        // placebo < neutral < nocebo total spread
+
+// Φ_placebo gate (T3)
+let PB_PHI_GATE         = 0.02        // nats, MI delta threshold
+
+// Ablation gate (T4)
+let PB_ABLATE_RATIO     = 3.0         // intact/ablated separation ratio
+
+// Trial counts
+let PB_N_TRIALS         = 24          // trials per condition
+let PB_N_MI_TRIALS      = 28          // trials for MI estimation (N<32)
+let PB_MI_BINS          = 5           // histogram bins (keep product < 32)
+
+// Latency gate (T5)
+let PB_LATENCY_MS       = 5000.0
+
+let PB_EPS              = 0.00000001
+let PB_SEED             = 5800
+
+// ═══════════════════════════════════════════════════════════════
+// PRNG + numeric helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn pb_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn pb_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn pb_signed(seed: int) -> float {
+    return pb_unit(seed) * 2.0 - 1.0
+}
+
+fn pb_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn pb_clamp_nonneg(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    return x
+}
+
+fn pb_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Predictive processing 2-stream perception model
+// ═══════════════════════════════════════════════════════════════
+//
+// Two streams converge into the perceived outcome:
+//
+//   bottom_up (sensory)  = baseline_pain + noise_s       ∈ ℝ
+//   top_down (expect)    = expectation   + noise_e       ∈ ℝ
+//
+//   perceived = w_s · bottom_up − w_e · expectation + noise
+//
+// Sign convention: positive expectation (placebo) SUBTRACTS from
+// perceived pain; negative expectation (nocebo) ADDS. The model thus
+// treats expectation magnitude as "expected relief"; nocebo is simply
+// negative expected relief. This keeps the forward equation linear.
+
+fn pb_sensory(baseline: float, seed: int) -> float {
+    let s = pb_prng(seed)
+    let noise = PB_SENSORY_NOISE * pb_signed(s)
+    return baseline + noise
+}
+
+fn pb_expectation_channel(expect_level: float, seed: int) -> float {
+    // Expectation stream carries the prior plus its own reliability noise.
+    let s = pb_prng(seed + 101)
+    let noise = 0.03 * pb_signed(s)
+    return expect_level + noise
+}
+
+// Forward model: combine the two streams into perceived outcome.
+// ablate_expect=true: clamp expectation stream to zero (channel lesion).
+fn pb_perceive(baseline: float, expect_level: float, ablate_expect: bool, seed: int) -> float {
+    let sensory = pb_sensory(baseline, seed)
+    let mut expect_eff = pb_expectation_channel(expect_level, seed)
+    if ablate_expect { expect_eff = 0.0 }
+    // Top-down positive expectation reduces perceived pain.
+    // Root cause note: we cannot use `pure fn` returning struct with 3+ floats,
+    // so perceive() returns a single scalar — sensory and expect_eff are local.
+    let mixed = PB_W_SENSORY * sensory - PB_W_EXPECT * expect_eff
+    let s2 = pb_prng(seed + 911)
+    let residual = 0.02 * pb_signed(s2)
+    return pb_clamp_nonneg(mixed + residual)
+}
+
+// Mean perceived over N trials under a given expectation condition.
+fn pb_mean_perceived(baseline: float, expect_level: float, ablate_expect: bool, n_trials: int, seed_base: int) -> float {
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n_trials {
+        let sd = seed_base + i * 97
+        sum = sum + pb_perceive(baseline, expect_level, ablate_expect, sd)
+        i = i + 1
+    }
+    return sum / to_float(n_trials)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MI (mutual information) helpers — histogram based, N<32 safe
+// ═══════════════════════════════════════════════════════════════
+
+fn pb_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn pb_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn pb_entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(pb_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = pb_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * pb_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn pb_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        let ia = pb_bin_idx(a[i], lo, hi, nb)
+        let ib = pb_bin_idx(b[i], lo, hi, nb)
+        ids = ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = pb_counts(ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * pb_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+// MI over a shared [lo, hi] range, computed consistently for the two series.
+fn pb_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    // Shared range over both vectors ensures joint entropy is well-defined.
+    let mut lo = a[0]
+    let mut hi = a[0]
+    let mut i = 0
+    while i < n {
+        if a[i] < lo { lo = a[i] }
+        if a[i] > hi { hi = a[i] }
+        if b[i] < lo { lo = b[i] }
+        if b[i] > hi { hi = b[i] }
+        i = i + 1
+    }
+    let ha = pb_entropy_hist(a, lo, hi, PB_MI_BINS)
+    let hb = pb_entropy_hist(b, lo, hi, PB_MI_BINS)
+    let hj = pb_joint_entropy(a, b, lo, hi, PB_MI_BINS)
+    let mi = ha + hb - hj
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Trial generation for MI analysis (T3)
+// ═══════════════════════════════════════════════════════════════
+//
+// We run N_MI_TRIALS across a spread of expectation levels, recording:
+//   expectations[i]   : top-down prior for trial i
+//   sensory_only[i]   : what the bottom-up stream reported (no top-down)
+//   outcomes[i]       : actual perceived outcome (2-stream blend)
+//
+// Then:
+//   MI(expectation, outcome)     ← expectation wired to outcome
+//   MI(sensory_only, outcome)    ← baseline bottom-up contribution
+//   Φ_placebo = MI(exp, out) − MI(sens, out)
+//
+// When Φ_placebo > 0, the top-down channel carries information about the
+// outcome BEYOND what sensory alone provides. This is the mathematical
+// signature of predictive-processing modulation.
+
+fn pb_run_mi_trials(baseline: float, ablate: bool, n_trials: int, seed_base: int) -> array {
+    // Packed layout: [exp_0..n-1, sens_0..n-1, out_0..n-1]
+    let mut exps = []
+    let mut sens = []
+    let mut outs = []
+    let mut s = seed_base
+    let mut i = 0
+    while i < n_trials {
+        // Sample expectation across [-1, +1] — covers nocebo-to-placebo range.
+        s = pb_prng(s + i * 137)
+        let e = pb_signed(s)
+        exps = exps.push(e)
+        // Sensory-only proxy: bottom-up reading, independent of expectation.
+        let sens_val = pb_sensory(baseline, s + 11)
+        sens = sens.push(sens_val)
+        // Outcome: full 2-stream percept under this expectation.
+        let out_val = pb_perceive(baseline, e, ablate, s + 23)
+        outs = outs.push(out_val)
+        i = i + 1
+    }
+    let mut packed = []
+    let mut a = 0
+    while a < n_trials {
+        packed = packed.push(exps[a])
+        a = a + 1
+    }
+    let mut b = 0
+    while b < n_trials {
+        packed = packed.push(sens[b])
+        b = b + 1
+    }
+    let mut c = 0
+    while c < n_trials {
+        packed = packed.push(outs[c])
+        c = c + 1
+    }
+    return packed
+}
+
+// Unpack a packed trial array into an individual stream slice.
+fn pb_slice(packed: array, offset: int, n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(packed[offset + i])
+        i = i + 1
+    }
+    return out
+}
+
+// Φ_placebo = MI(exp, out) − MI(sens, out) from a packed trial bundle.
+fn pb_phi_placebo(packed: array, n: int) -> float {
+    let exps = pb_slice(packed, 0, n)
+    let sens = pb_slice(packed, n, n)
+    let outs = pb_slice(packed, 2 * n, n)
+    let mi_eo = pb_mi(exps, outs)
+    let mi_so = pb_mi(sens, outs)
+    return mi_eo - mi_so
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1–T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1: placebo (+E) strictly reduces perceived pain by ≥ 15%
+    //     vs neutral (E=0).
+    let base_mean = pb_mean_perceived(PB_BASELINE_PAIN, PB_EXPECT_NEUTRAL, false, PB_N_TRIALS, PB_SEED + 100)
+    let plac_mean = pb_mean_perceived(PB_BASELINE_PAIN, PB_EXPECT_PLACEBO, false, PB_N_TRIALS, PB_SEED + 100)
+    let reduction = (base_mean - plac_mean) / base_mean
+    println("  [T1] baseline=" + str(base_mean) + " placebo=" + str(plac_mean) + " reduction=" + str(reduction))
+    if plac_mean >= base_mean { return false }
+    if reduction < PB_PLACEBO_REDUCE { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: nocebo (−E) strictly increases perceived pain by ≥ 15%
+    //     vs neutral. Also check the sandwich: placebo < neutral < nocebo.
+    let base_mean = pb_mean_perceived(PB_BASELINE_PAIN, PB_EXPECT_NEUTRAL, false, PB_N_TRIALS, PB_SEED + 200)
+    let noc_mean = pb_mean_perceived(PB_BASELINE_PAIN, PB_EXPECT_NOCEBO, false, PB_N_TRIALS, PB_SEED + 200)
+    let plac_mean = pb_mean_perceived(PB_BASELINE_PAIN, PB_EXPECT_PLACEBO, false, PB_N_TRIALS, PB_SEED + 200)
+    let increase = (noc_mean - base_mean) / base_mean
+    let total_spread = (noc_mean - plac_mean) / base_mean
+    println("  [T2] baseline=" + str(base_mean) + " nocebo=" + str(noc_mean) + " placebo=" + str(plac_mean))
+    println("  [T2] nocebo increase=" + str(increase) + " sandwich spread=" + str(total_spread))
+    if noc_mean <= base_mean { return false }
+    if increase < PB_NOCEBO_INCREASE { return false }
+    // Sandwich check: placebo strictly below neutral strictly below nocebo
+    if plac_mean >= base_mean { return false }
+    if base_mean >= noc_mean { return false }
+    if total_spread < PB_SANDWICH_GAP { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3: Φ_placebo > gate when expectation channel is wired.
+    //     Run a broad trial bank with expectations swept across [-1,+1];
+    //     MI(exp,out) should exceed MI(sens,out) because expectation is
+    //     causally wired into the perceived outcome through the top-down path.
+    let packed = pb_run_mi_trials(PB_BASELINE_PAIN, false, PB_N_MI_TRIALS, PB_SEED + 300)
+    let phi = pb_phi_placebo(packed, PB_N_MI_TRIALS)
+    let exps = pb_slice(packed, 0, PB_N_MI_TRIALS)
+    let sens = pb_slice(packed, PB_N_MI_TRIALS, PB_N_MI_TRIALS)
+    let outs = pb_slice(packed, 2 * PB_N_MI_TRIALS, PB_N_MI_TRIALS)
+    let mi_eo = pb_mi(exps, outs)
+    let mi_so = pb_mi(sens, outs)
+    println("  [T3] MI(expect,out)=" + str(mi_eo) + " MI(sens,out)=" + str(mi_so) + " Φ_placebo=" + str(phi))
+    if phi < PB_PHI_GATE { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: ablation of the expectation channel collapses the placebo/nocebo
+    //     separation. Ratio of intact separation to ablated separation ≥ 3×.
+    let intact_plac = pb_mean_perceived(PB_BASELINE_PAIN, PB_EXPECT_PLACEBO, false, PB_N_TRIALS, PB_SEED + 400)
+    let intact_noc = pb_mean_perceived(PB_BASELINE_PAIN, PB_EXPECT_NOCEBO, false, PB_N_TRIALS, PB_SEED + 400)
+    let abl_plac = pb_mean_perceived(PB_BASELINE_PAIN, PB_EXPECT_PLACEBO, true, PB_N_TRIALS, PB_SEED + 400)
+    let abl_noc = pb_mean_perceived(PB_BASELINE_PAIN, PB_EXPECT_NOCEBO, true, PB_N_TRIALS, PB_SEED + 400)
+    let intact_sep = pb_abs(intact_noc - intact_plac)
+    let abl_sep = pb_abs(abl_noc - abl_plac)
+    println("  [T4] intact sep=" + str(intact_sep) + " ablated sep=" + str(abl_sep))
+    if intact_sep <= abl_sep { return false }
+    // Guard against divide-by-near-zero: require intact_sep > eps
+    if intact_sep < PB_EPS { return false }
+    // Ablated separation must be tiny relative to intact: intact ≥ ratio × ablated
+    if abl_sep < PB_EPS {
+        // Ablated essentially zero — collapse confirmed trivially
+        println("  [T4] ablated separation ≈ 0 → collapse confirmed")
+        return true
+    }
+    let ratio = intact_sep / abl_sep
+    println("  [T4] intact/ablated ratio=" + str(ratio) + " gate=" + str(PB_ABLATE_RATIO))
+    if ratio < PB_ABLATE_RATIO { return false }
+    // Additionally: ablated Φ_placebo must fall to near zero.
+    let abl_pack = pb_run_mi_trials(PB_BASELINE_PAIN, true, PB_N_MI_TRIALS, PB_SEED + 401)
+    let abl_phi = pb_phi_placebo(abl_pack, PB_N_MI_TRIALS)
+    println("  [T4] ablated Φ_placebo=" + str(abl_phi))
+    // With channel clamped to 0, MI(exp, out) has no causal path → Φ ≤ 0
+    // or at most histogram-noise level. Require strictly below intact gate.
+    if abl_phi >= PB_PHI_GATE { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5: full pipeline latency under 5 s.
+    let t0 = clock()
+    let _a = pb_mean_perceived(PB_BASELINE_PAIN, PB_EXPECT_NEUTRAL, false, PB_N_TRIALS, PB_SEED + 500)
+    let _b = pb_mean_perceived(PB_BASELINE_PAIN, PB_EXPECT_PLACEBO, false, PB_N_TRIALS, PB_SEED + 501)
+    let _c = pb_mean_perceived(PB_BASELINE_PAIN, PB_EXPECT_NOCEBO, false, PB_N_TRIALS, PB_SEED + 502)
+    let packed = pb_run_mi_trials(PB_BASELINE_PAIN, false, PB_N_MI_TRIALS, PB_SEED + 503)
+    let _phi = pb_phi_placebo(packed, PB_N_MI_TRIALS)
+    let abl_pack = pb_run_mi_trials(PB_BASELINE_PAIN, true, PB_N_MI_TRIALS, PB_SEED + 504)
+    let _abl_phi = pb_phi_placebo(abl_pack, PB_N_MI_TRIALS)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] placebo_phi pipeline = " + str(ms) + " ms")
+    return ms < PB_LATENCY_MS
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[placebo_phi] P58 — predictive processing + expectation × Φ")
+    println("  2-stream: perceived = w_s·sensory − w_e·expectation")
+    println("  w_s=" + str(PB_W_SENSORY) + " w_e=" + str(PB_W_EXPECT) + " baseline=" + str(PB_BASELINE_PAIN))
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — placebo reduces pain ≥ 15%") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — nocebo raises pain ≥ 15% (sandwich confirmed)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — Φ_placebo > 0 when expectation wired") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — ablating expectation channel collapses effect") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — latency < 5000 ms") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause note: stage0 chained-&& across 5 terms is unreliable;
+    // sequential bool accumulator is the safe idiom in anima-engines.
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[placebo_phi] 5/5 PASS — P58 DONE (placebo + nocebo + Φ_placebo + ablation)")
+    } else {
+        println("[placebo_phi] SOME FAILED")
+    }
+}
+
+main()

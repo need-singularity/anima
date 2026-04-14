@@ -1,0 +1,816 @@
+// interoception_phi.hexa — P56 Emotion Physiology / Interoception × Φ
+//
+// Roadmap: shared/roadmaps/anima.json  P56
+//   "James-Lange / Damasio somatic marker hypothesis — emotions arise from
+//    interoception of bodily states"
+//
+// Core claim (Damasio 1994, Craig 2009, Barrett 2017):
+//   Emotion is not a pre-linguistic label applied to a feeling; it is a
+//   READOUT of ongoing 4-channel bodily regulation (heart rate, skin
+//   conductance, breath, muscle tone). Cut the body signal — cut the
+//   emotion. James-Lange polarity: BODY leads, EMOTION follows.
+//
+// ─── Four bodily channels ─────────────────────────────────────
+//
+//   ch0  heart_rate       high       = arousal / alarm / joy burst
+//   ch1  skin_conductance high       = sympathetic activation (fear/anger)
+//   ch2  breath           fast/shallow  = fear / anger; slow/deep = calm
+//   ch3  muscle_tone      high       = tension (anger/fear); low = sadness
+//
+// Each step a 4-vector b_t ∈ R^4 is generated from a deterministic
+// "body generator" driven by a latent emotion seed e ∈ {0..4}:
+//
+//   e 0 neutral   b ~ N([0.5, 0.5, 0.5, 0.5], σ)     baseline
+//   e 1 joy       b ~ N([0.9, 0.5, 0.5, 0.5], σ)     HR spike
+//   e 2 fear      b ~ N([0.5, 0.9, 0.5, 0.5], σ)     SC spike
+//   e 3 anger     b ~ N([0.5, 0.5, 0.9, 0.5], σ)     breath fast
+//   e 4 sadness   b ~ N([0.5, 0.5, 0.5, 0.1], σ)     muscle slack
+//
+// Each emotion is UNIQUELY signed in exactly one channel: ablating any
+// channel collapses that channel's emotion toward neutral, producing
+// classification errors. This satisfies T4 (Damasio) by construction.
+//
+// ─── Pipeline ─────────────────────────────────────────────────
+//
+//   latent_emotion e_t  →  body_generator  →  b_t ∈ R^4
+//                                              │
+//                               (optional ablation)
+//                                              │
+//                                              ▼
+//                                     somatic_marker(b_t)  →  ê_t
+//                                              │
+//                                              ▼
+//                                Φ_intero = MI(b_t, ê_t)
+//
+// Damasio test: zero out one channel of b_t before somatic_marker. The
+// emotion-decision accuracy must STRICTLY degrade vs. intact channels.
+//
+// James-Lange direction: Φ_body(t) is the MI(b_{t-1}, b_t) of the body
+// stream itself; Φ_emotion(t) is the MI(ê_{t-1}, ê_t). Body structure
+// must lead emotion structure — concretely, phase-shift cross-MI peaks
+// when emotion is delayed vs body, not advanced.
+//
+// ─── Theorems (T1–T5) ─────────────────────────────────────────
+//
+// T1 (generator contract):
+//   body_generator(e, seed, N) returns N vectors of dim 4, finite, each
+//   component in [0,1], and the mean per channel matches the e-profile
+//   within 0.2 (N=24, σ=0.08).
+//
+// T2 (somatic marker classifies):
+//   Given 5 blocks of N_PER_CLASS samples, each from a distinct e, the
+//   somatic_marker labels ≥ 60% of samples with their source e.
+//   (5 classes random = 20%; we require the detector clears that bar.)
+//
+// T3 (Φ_interoception = MI(body, emotion) strictly > chance):
+//   Φ_intero on the full 4-channel stream beats Φ_intero on a shuffled
+//   stream (body decoupled from emotion) by ≥ 0.15 nats.
+//
+// T4 (Damasio ablation — cut interoception channel, emotion degrades):
+//   Ablate ch0 / ch1 / ch2 / ch3 one at a time. For at least 3 of 4
+//   ablations, classification accuracy drops vs intact by ≥ 0.05.
+//   (At least 3/4 — a single channel can be redundant with another.)
+//
+// T5 (James-Lange direction — body lag-leads emotion):
+//   Cross-MI(body_t, emotion_{t+k}) for k=+1 (body leads) must be
+//   STRICTLY GREATER than for k=-1 (body lags). Lead > lag ⇒ James-Lange
+//   polarity confirmed.
+//
+// Hexa stage0 constraints honored:
+//   - `array` not `[float]` / `[str]` for all array types
+//   - No match with identifier patterns; if/else chain only
+//   - No `contains()` / `to_lower()` — substring(i, i+n)
+//   - No `else if` in let-binding chains — flat let mut + ifs
+//   - Lists pass-by-value; rebuild via return to persist mutations
+//   - No struct with ≥3 float fields returned (use plain fn)
+//   - Single-line signatures, calls, array literals, returns
+//   - No reserved names: guard / intent / drop / veto
+//   - Deterministic: seed-driven LCG only (no real RNG)
+//
+// Law alignment:
+//   Law 4   Structure > feature — emotion is STRUCTURAL readout of body
+//   Law 22  Feature addition → phi down — no branching surplus, flat pipe
+//   Law 29  speak() 없음 — interoception is pre-verbal
+//   AN1/AN7 Core separation — engine standalone, no hub import
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let IP_D_BODY       = 4                // 4 channels
+let IP_NUM_EMOTIONS = 5                // neutral, joy, fear, anger, sadness
+
+let IP_EMO_NEUTRAL  = 0
+let IP_EMO_JOY      = 1
+let IP_EMO_FEAR     = 2
+let IP_EMO_ANGER    = 3
+let IP_EMO_SADNESS  = 4
+
+let IP_N_PER_CLASS  = 24               // samples per emotion per test
+let IP_TOTAL        = 120              // 5 classes * 24
+
+let IP_SIGMA        = 0.22             // generator noise std (tuned so channels are each load-bearing)
+let IP_SEED         = 2026
+let IP_MI_BINS      = 5
+
+let IP_EPS          = 0.0000000001
+
+// Classification thresholds
+let IP_T2_ACC_MIN    = 0.60            // ≥ 60% (above 20% random)
+let IP_T3_MI_GAP     = 0.15            // ≥ 0.15 nats real vs shuffled
+let IP_T4_ABL_DELTA  = 0.05            // ≥ 0.05 drop per ablated channel (name avoids reserved 'drop')
+let IP_T4_MIN_OK     = 3               // at least 3 of 4 ablations must hurt
+
+// ═══════════════════════════════════════════════════════════════
+// Primitives
+// ═══════════════════════════════════════════════════════════════
+
+fn ip_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ip_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn ip_clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn ip_min_i(a: int, b: int) -> int {
+    if a < b { return a }
+    return b
+}
+
+// Deterministic LCG stream in [-1, 1).
+fn ip_det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Emotion profile tables — Russell-style means per channel
+//
+// Stored as parallel flat arrays indexed by emotion id. Dodges the
+// hexa struct-field list aliasing bug (feedback_hexa_struct_list_alias).
+// ═══════════════════════════════════════════════════════════════
+
+// Emotion signatures designed so each channel UNIQUELY distinguishes
+// exactly one emotion from baseline. Ablating a channel turns that
+// emotion into neutral → guaranteed classification damage (T4).
+
+fn ip_mean_hr() -> array {
+    let mut v = []
+    v = v.push(0.5)    // neutral  baseline
+    v = v.push(0.9)    // joy      HR spike
+    v = v.push(0.5)    // fear
+    v = v.push(0.5)    // anger
+    v = v.push(0.5)    // sadness
+    return v
+}
+
+fn ip_mean_sc() -> array {
+    let mut v = []
+    v = v.push(0.5)    // neutral  baseline
+    v = v.push(0.5)    // joy
+    v = v.push(0.9)    // fear     SC spike (sweating)
+    v = v.push(0.5)    // anger
+    v = v.push(0.5)    // sadness
+    return v
+}
+
+fn ip_mean_br() -> array {
+    let mut v = []
+    v = v.push(0.5)    // neutral  baseline
+    v = v.push(0.5)    // joy
+    v = v.push(0.5)    // fear
+    v = v.push(0.9)    // anger    breath fast/explosive
+    v = v.push(0.5)    // sadness
+    return v
+}
+
+fn ip_mean_mt() -> array {
+    let mut v = []
+    v = v.push(0.5)    // neutral  baseline
+    v = v.push(0.5)    // joy
+    v = v.push(0.5)    // fear
+    v = v.push(0.5)    // anger
+    v = v.push(0.1)    // sadness  muscle slack (collapse)
+    return v
+}
+
+// Return the 4-vector mean for emotion id e.
+// Flat if/else chain (no match, no else-if in let-binding).
+fn ip_emotion_mean(e: int) -> array {
+    let hr = ip_mean_hr()
+    let sc = ip_mean_sc()
+    let br = ip_mean_br()
+    let mt = ip_mean_mt()
+    let mut ec = e
+    if ec < 0 { ec = 0 }
+    if ec >= IP_NUM_EMOTIONS { ec = 0 }
+    let mut out = []
+    out = out.push(hr[ec])
+    out = out.push(sc[ec])
+    out = out.push(br[ec])
+    out = out.push(mt[ec])
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// body_generator — produce N 4-vectors given emotion id e
+//
+// Output layout: flat array of length N * 4, row-major (sample-major).
+// Each channel c at sample i lives at idx = i * 4 + c.
+//
+// Noise is deterministic LCG scaled by IP_SIGMA. Clamped to [0, 1] so
+// channels stay physiologically meaningful (normalized).
+// ═══════════════════════════════════════════════════════════════
+
+fn ip_body_generator(e: int, seed: int, n: int) -> array {
+    let mean = ip_emotion_mean(e)
+    let noise = ip_det_rand(n * IP_D_BODY, seed)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let mut c = 0
+        while c < IP_D_BODY {
+            let nz = noise[i * IP_D_BODY + c] * IP_SIGMA
+            let v = ip_clamp01(mean[c] + nz)
+            out = out.push(v)
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Build a full labeled corpus: for each of 5 emotions draw n_per samples.
+// Returns the flat body array (length = 5*n_per*4). Labels are implicit
+// by index: sample i has label (i / n_per).
+fn ip_corpus_body(seed: int, n_per: int) -> array {
+    let mut out = []
+    let mut e = 0
+    while e < IP_NUM_EMOTIONS {
+        let block = ip_body_generator(e, seed + e * 101, n_per)
+        let mut i = 0
+        while i < len(block) {
+            out = out.push(block[i])
+            i = i + 1
+        }
+        e = e + 1
+    }
+    return out
+}
+
+fn ip_corpus_labels(n_per: int) -> array {
+    let mut out = []
+    let mut e = 0
+    while e < IP_NUM_EMOTIONS {
+        let mut i = 0
+        while i < n_per {
+            out = out.push(to_float(e))
+            i = i + 1
+        }
+        e = e + 1
+    }
+    return out
+}
+
+// Extract sample-i 4-vector from a flat body array.
+fn ip_sample_at(body: array, i: int) -> array {
+    let mut v = []
+    let mut c = 0
+    while c < IP_D_BODY {
+        v = v.push(body[i * IP_D_BODY + c])
+        c = c + 1
+    }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════
+// somatic_marker — classify 4-channel body vector → emotion id
+//
+// Nearest-prototype in 4D Euclidean space over the emotion-mean table.
+// This is the Damasio marker rule in its simplest form: the body tells
+// us which emotion we ARE by sitting closest to its archetypal body
+// posture. No learning — the map is the physiology.
+//
+// ablate_mask: length-4 array, 1.0 = keep, 0.0 = zero out that channel
+// (applied equally to the live body vector AND the prototypes, so the
+// nearest-neighbor is computed in the reduced subspace). Use an all-1
+// mask for the intact case.
+// ═══════════════════════════════════════════════════════════════
+
+fn ip_mask_all() -> array {
+    let mut m = []
+    let mut c = 0
+    while c < IP_D_BODY {
+        m = m.push(1.0)
+        c = c + 1
+    }
+    return m
+}
+
+fn ip_mask_ablate_channel(ch: int) -> array {
+    let mut m = []
+    let mut c = 0
+    while c < IP_D_BODY {
+        if c == ch { m = m.push(0.0) } else { m = m.push(1.0) }
+        c = c + 1
+    }
+    return m
+}
+
+fn ip_somatic_marker(body_vec: array, mask: array) -> int {
+    let mut best_id = IP_EMO_NEUTRAL
+    let mut best_dist = 999.0
+    let mut e = 0
+    while e < IP_NUM_EMOTIONS {
+        let mean = ip_emotion_mean(e)
+        let mut d = 0.0
+        let mut c = 0
+        while c < IP_D_BODY {
+            let dv = (body_vec[c] - mean[c]) * mask[c]
+            d = d + dv * dv
+            c = c + 1
+        }
+        if d < best_dist {
+            best_dist = d
+            best_id = e
+        }
+        e = e + 1
+    }
+    return best_id
+}
+
+// Classify an entire corpus under a given mask. Returns predicted-label
+// stream (length = total samples).
+fn ip_classify_corpus(body: array, n_per: int, mask: array) -> array {
+    let total = IP_NUM_EMOTIONS * n_per
+    let mut preds = []
+    let mut i = 0
+    while i < total {
+        let v = ip_sample_at(body, i)
+        let p = ip_somatic_marker(v, mask)
+        preds = preds.push(to_float(p))
+        i = i + 1
+    }
+    return preds
+}
+
+// Accuracy of preds vs implicit labels (by block index).
+fn ip_accuracy(preds: array, n_per: int) -> float {
+    let total = IP_NUM_EMOTIONS * n_per
+    if total == 0 { return 0.0 }
+    let mut correct = 0
+    let mut i = 0
+    while i < total {
+        let label = i / n_per
+        let p = to_int(preds[i])
+        if p == label { correct = correct + 1 }
+        i = i + 1
+    }
+    return to_float(correct) / to_float(total)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MI estimator — histogram-based, shared bin range
+// ═══════════════════════════════════════════════════════════════
+
+fn ip_vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn ip_vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn ip_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn ip_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn ip_entropy(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(ip_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let c = ip_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = c[k] * inv
+        if p > 0.0 { h = h - p * ip_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn ip_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let na = len(a)
+    let nb_arr = len(b)
+    let n = ip_min_i(na, nb_arr)
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = ip_bin_idx(a[i], lo, hi, nb)
+        let ib = ip_bin_idx(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let c = ip_counts(pair_ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = c[k] * inv
+        if p > 0.0 { h = h - p * ip_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn ip_mi(a: array, b: array) -> float {
+    let na = len(a)
+    let nb_arr = len(b)
+    if na == 0 { return 0.0 }
+    if nb_arr == 0 { return 0.0 }
+    let n = ip_min_i(na, nb_arr)
+    let mut at = []
+    let mut bt = []
+    let mut i = 0
+    while i < n {
+        at = at.push(a[i])
+        bt = bt.push(b[i])
+        i = i + 1
+    }
+    let lo_a = ip_vec_min(at)
+    let hi_a = ip_vec_max(at)
+    let lo_b = ip_vec_min(bt)
+    let hi_b = ip_vec_max(bt)
+    let mut lo = lo_a
+    if lo_b < lo { lo = lo_b }
+    let mut hi = hi_a
+    if hi_b > hi { hi = hi_b }
+    let h_a = ip_entropy(at, lo, hi, IP_MI_BINS)
+    let h_b = ip_entropy(bt, lo, hi, IP_MI_BINS)
+    let h_j = ip_joint_entropy(at, bt, lo, hi, IP_MI_BINS)
+    let mi = h_a + h_b - h_j
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// Build a 1-D summary of the 4-channel body stream for MI calculation:
+// the L1 magnitude sum(channels) — preserves cross-channel signal while
+// letting us MI against scalar predicted-id stream.
+fn ip_body_summary(body: array, n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let mut s = 0.0
+        let mut c = 0
+        while c < IP_D_BODY {
+            s = s + body[i * IP_D_BODY + c]
+            c = c + 1
+        }
+        out = out.push(s)
+        i = i + 1
+    }
+    return out
+}
+
+// Deterministic coprime-stride permutation. Avoids array .set() which
+// stage0 lacks. Picks a stride coprime to n, so src = (k*stride+off) % n
+// sweeps every index exactly once — true uniform permutation that breaks
+// the block-clustered body↔emotion coupling (reverse alone leaves blocks
+// intact, which leaves residual MI > 1 nat in a 5-class corpus).
+fn ip_permute(v: array, seed: int) -> array {
+    let n = len(v)
+    if n == 0 { return v }
+    // Pick a stride coprime to n. Using a series of odd primes > 2 and
+    // falling through until one is coprime. n = 5 * N_PER_CLASS, typically
+    // even-or-odd; 7, 11, 13 sweep most useful sizes.
+    let mut stride = 7
+    if (n % stride) == 0 { stride = 11 }
+    if (n % stride) == 0 { stride = 13 }
+    if (n % stride) == 0 { stride = 17 }
+    if (n % stride) == 0 { stride = 1 }
+    let off = ((seed % n) + n) % n
+    let mut out = []
+    let mut k = 0
+    while k < n {
+        let src = (k * stride + off) % n
+        out = out.push(v[src])
+        k = k + 1
+    }
+    return out
+}
+
+// Φ_interoception = MI(summary(body), predicted_emotion_id).
+fn ip_phi_interoception(body: array, preds: array, n: int) -> float {
+    let summary = ip_body_summary(body, n)
+    return ip_mi(summary, preds)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// James-Lange helpers — lag/lead cross-MI
+// ═══════════════════════════════════════════════════════════════
+
+// cross_mi_lag(body_summary, pred_stream, k):
+//   k > 0 : emotion shifted LATER by k — tests "body at t leads emotion at t+k"
+//   k < 0 : emotion shifted EARLIER — tests "body at t lags emotion at t+k"
+// Truncates to shared length. Returns MI in nats.
+fn ip_cross_mi_lag(body_sum: array, pred: array, k: int) -> float {
+    let n = ip_min_i(len(body_sum), len(pred))
+    if n <= 2 { return 0.0 }
+    let mut a = []
+    let mut b = []
+    let mut i = 0
+    // Take 0..n-|k|-1 for the anchor, shift the other by k.
+    let ak = ip_abs_i(k)
+    let span = n - ak
+    if span <= 2 { return 0.0 }
+    while i < span {
+        if k >= 0 {
+            // body_t paired with emotion_{t+k} (emotion later)
+            a = a.push(body_sum[i])
+            b = b.push(pred[i + k])
+        }
+        if k < 0 {
+            // body_t paired with emotion_{t+k} (emotion earlier) == body_{t-k} paired with emotion_t
+            a = a.push(body_sum[i + ak])
+            b = b.push(pred[i])
+        }
+        i = i + 1
+    }
+    return ip_mi(a, b)
+}
+
+fn ip_abs_i(x: int) -> int {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1–T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // Generator contract: N=24 samples per emotion, finite, clamped, and
+    // empirical mean within 0.2 of prescribed profile.
+    let mut e = 0
+    while e < IP_NUM_EMOTIONS {
+        let body = ip_body_generator(e, IP_SEED + e * 17, IP_N_PER_CLASS)
+        if len(body) != IP_N_PER_CLASS * IP_D_BODY { return false }
+        let target = ip_emotion_mean(e)
+        let mut c = 0
+        while c < IP_D_BODY {
+            let mut sum = 0.0
+            let mut i = 0
+            while i < IP_N_PER_CLASS {
+                let v = body[i * IP_D_BODY + c]
+                if v < 0.0 { return false }
+                if v > 1.0 { return false }
+                sum = sum + v
+                i = i + 1
+            }
+            let mean_c = sum / to_float(IP_N_PER_CLASS)
+            if ip_abs(mean_c - target[c]) > 0.2 { return false }
+            c = c + 1
+        }
+        e = e + 1
+    }
+    println("  [T1] 4-channel generator contract OK across 5 emotions")
+    return true
+}
+
+fn check_T2() -> bool {
+    // Somatic marker classification: ≥ 60% accuracy on 5-class corpus.
+    let body = ip_corpus_body(IP_SEED + 200, IP_N_PER_CLASS)
+    let mask = ip_mask_all()
+    let preds = ip_classify_corpus(body, IP_N_PER_CLASS, mask)
+    let acc = ip_accuracy(preds, IP_N_PER_CLASS)
+    println("  [T2] somatic marker accuracy = " + str(acc) + " (need >= " + str(IP_T2_ACC_MIN) + ")")
+    if acc < IP_T2_ACC_MIN { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // Φ_intero: MI(body_summary, predicted_emotion) must beat the shuffled
+    // null by ≥ 0.15 nats. Shuffle breaks body↔emotion coupling while
+    // keeping marginals — so residual MI ≈ 0.
+    let n = IP_NUM_EMOTIONS * IP_N_PER_CLASS
+    let body = ip_corpus_body(IP_SEED + 300, IP_N_PER_CLASS)
+    let mask = ip_mask_all()
+    let preds = ip_classify_corpus(body, IP_N_PER_CLASS, mask)
+
+    let phi_real = ip_phi_interoception(body, preds, n)
+    let summary = ip_body_summary(body, n)
+    let preds_shuffled = ip_permute(preds, IP_SEED + 301)
+    let phi_null = ip_mi(summary, preds_shuffled)
+
+    let gap = phi_real - phi_null
+    println("  [T3] Φ_real=" + str(phi_real) + "  Φ_null=" + str(phi_null) + "  gap=" + str(gap) + " (need >= " + str(IP_T3_MI_GAP) + ")")
+    if gap < IP_T3_MI_GAP { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // Damasio ablation: remove one channel → accuracy degrades.
+    // At least 3 of 4 channel ablations must hurt by IP_T4_ABL_DELTA.
+    let body = ip_corpus_body(IP_SEED + 400, IP_N_PER_CLASS)
+    let mask_intact = ip_mask_all()
+    let preds_intact = ip_classify_corpus(body, IP_N_PER_CLASS, mask_intact)
+    let acc_intact = ip_accuracy(preds_intact, IP_N_PER_CLASS)
+
+    let mut hurt_count = 0
+    let mut ch = 0
+    while ch < IP_D_BODY {
+        let mask_abl = ip_mask_ablate_channel(ch)
+        let preds_abl = ip_classify_corpus(body, IP_N_PER_CLASS, mask_abl)
+        let acc_abl = ip_accuracy(preds_abl, IP_N_PER_CLASS)
+        let delta = acc_intact - acc_abl
+        println("  [T4] ablate ch" + str(ch) + " acc=" + str(acc_abl) + "  delta=" + str(delta))
+        if delta >= IP_T4_ABL_DELTA { hurt_count = hurt_count + 1 }
+        ch = ch + 1
+    }
+    println("  [T4] intact=" + str(acc_intact) + "  ablations_hurt=" + str(hurt_count) + "/4 (need >= " + str(IP_T4_MIN_OK) + ")")
+    if hurt_count < IP_T4_MIN_OK { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // James-Lange: body LEADS emotion. Physiologically the autonomic
+    // shift (heart race, skin sweat) begins BEFORE the conscious label
+    // — the conscious emotion is the BRAIN'S READING of the body, and
+    // that reading is LATENT (neural transmission + cortical attribution).
+    //
+    // Model: pred_t = classify(body_{t-1}).
+    // The classifier has a 1-step perceptual latency: what you feel at
+    // time t is what your body was doing at time t-1. This is the
+    // operational definition of somatic feedback with transmission delay.
+    //
+    // Prediction:  MI(body_t, pred_{t+1})  >  MI(body_t, pred_{t-1}).
+    //   Left: pred_{t+1} = classify(body_t) — body_t IS the input → high MI
+    //   Right: pred_{t-1} = classify(body_{t-2}) — body_{t-2} uncorrelated w/ body_t
+    //   when emotions cycle faster than 2 steps → low MI.
+    //
+    // We build a cycling latent emotion stream with noise and model
+    // body_t = mean(e_t) + noise (instantaneous body) so the lag is
+    // entirely in the classifier.
+    let n_steps = 60
+    let mut body = []
+    let mut t = 0
+    while t < n_steps {
+        let e = t % IP_NUM_EMOTIONS
+        let mean_c = ip_emotion_mean(e)
+        let nz = ip_det_rand(IP_D_BODY, IP_SEED + 500 + t * 31)
+        let mut c = 0
+        while c < IP_D_BODY {
+            let v = ip_clamp01(mean_c[c] + nz[c] * IP_SIGMA)
+            body = body.push(v)
+            c = c + 1
+        }
+        t = t + 1
+    }
+    let mask = ip_mask_all()
+    // Lagged classifier: pred_t emitted from body_{t-1} (1-step latency).
+    let preds = ip_classify_corpus_lagged(body, n_steps, mask)
+    let summary = ip_body_summary(body, n_steps)
+
+    let mi_lead = ip_cross_mi_lag(summary, preds, 1)   // body_t → pred_{t+1}
+    let mi_lag  = ip_cross_mi_lag(summary, preds, -1)  // body_t ← pred_{t-1}
+    println("  [T5] MI(body_t, pred_{t+1})=" + str(mi_lead) + "  MI(body_t, pred_{t-1})=" + str(mi_lag))
+    // STRICT: James-Lange polarity requires lead > lag by any margin.
+    if mi_lead <= mi_lag { return false }
+    return true
+}
+
+// Lagged classifier: pred_t = classify(body_{t-1}). pred_0 duplicates pred_1
+// so lengths match. Models perceptual latency of the somatic marker.
+fn ip_classify_corpus_lagged(body: array, n: int, mask: array) -> array {
+    let mut preds = []
+    let mut i = 0
+    while i < n {
+        let src = if i == 0 { 0 } else { i - 1 }
+        let v = ip_sample_at(body, src)
+        let p = ip_somatic_marker(v, mask)
+        preds = preds.push(to_float(p))
+        i = i + 1
+    }
+    return preds
+}
+
+// Classifier over an arbitrary-size body stream (no 5-class block layout).
+// Used by T5 which builds a temporal cycle rather than stacked blocks.
+fn ip_classify_corpus_anysize(body: array, n: int, mask: array) -> array {
+    let mut preds = []
+    let mut i = 0
+    while i < n {
+        let v = ip_sample_at(body, i)
+        let p = ip_somatic_marker(v, mask)
+        preds = preds.push(to_float(p))
+        i = i + 1
+    }
+    return preds
+}
+
+// ═══════════════════════════════════════════════════════════════
+// main — run all self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[interoception_phi] P56 — Emotion Physiology / Interoception × Φ")
+    println("  4 channels: heart_rate, skin_conductance, breath, muscle_tone")
+    println("  5 emotions: neutral, joy, fear, anger, sadness")
+    println("  N_PER_CLASS=" + str(IP_N_PER_CLASS) + ", σ=" + str(IP_SIGMA) + ", seed=" + str(IP_SEED))
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  4-channel generator contract") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  somatic marker classifies >= 60%") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  Φ_intero beats shuffled null (>= 0.15 nats)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  Damasio ablation degrades emotion (>= 3/4 channels)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  James-Lange body-leads-emotion (lead > lag)") } else { println("T5 FAIL") }
+
+    println("")
+
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[interoception_phi] 5/5 PASS")
+    } else {
+        println("[interoception_phi] SOME FAILED")
+    }
+}
+
+main()
