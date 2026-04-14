@@ -1,0 +1,343 @@
+// training/alm_gwt_loss.hexa — Global Workspace Theory broadcast consistency loss
+//
+// ALM-P2-2 — GWT 학습 loss for ANIMA P2 phase.
+//
+// Purpose:
+//   ANIMA의 Global Workspace Theory 구현에서 여러 도메인 (예: vision,
+//   language, motor, memory, …) 이 동일한 입력에 대해 브로드캐스트할 때
+//   각 도메인이 "일관된" 신호를 공유하도록 학습 신호(gradient)를 제공한다.
+//
+// Concept (3 components):
+//   1. Consistency loss — pairwise KL(p_i || p_j) 평균. 모든 도메인의
+//      activation이 같은 분포를 공유하도록 penalize. 이것이 GWT의
+//      "global broadcast" 일관성을 강제한다.
+//   2. Coverage loss — 각 도메인의 최소 활성치가 threshold 이상인지.
+//      특정 도메인이 죽어서 (all zeros) 방송에 참여하지 않는 경우를
+//      막는다. ReLU(threshold - activity)^2.
+//   3. Total loss = task_loss + α·consistency + β·coverage
+//
+// Theorems (self-test verifies numerically):
+//   T1: consistency_loss(D) >= 0 for all D  (KL non-negative)
+//   T2: D = [p, p, …, p] (identical) → consistency_loss = 0
+//   T3: coverage_loss == 0 iff every domain activity > threshold
+//   T4: α=0, β=0 → total_loss == task_loss
+//   T5: total_loss is differentiable — finite-difference gradient exists
+//       and is non-trivial.
+//
+// Reference: training/rank_r_attention.hexa for the hexa style used here.
+//
+// Run:
+//   $HOME/Dev/hexa-lang/hexa training/alm_gwt_loss.hexa
+// Expect:
+//   [alm_gwt_loss] T1 PASS
+//   [alm_gwt_loss] T2 PASS
+//   [alm_gwt_loss] T3 PASS
+//   [alm_gwt_loss] T4 PASS
+//   [alm_gwt_loss] T5 PASS
+//   [alm_gwt_loss] ALL THEOREMS PASS (5/5)
+
+// ─── Constants ──────────────────────────────────────────────
+
+let GWT_EPS            = 0.0000001      // numerical floor (avoid log(0))
+let GWT_ACTIVITY_THR   = 0.01           // minimum per-domain activity
+let GWT_ALPHA_DEFAULT  = 0.3            // weight for consistency term
+let GWT_BETA_DEFAULT   = 0.1            // weight for coverage term
+
+// ─── Low-level helpers ──────────────────────────────────────
+
+// Absolute value on f64.
+fn f_abs(x: float) -> float {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+// Max on f64.
+fn f_max(a: float, b: float) -> float {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+// Sum of a vector.
+fn vec_sum(v: array) -> float {
+    let n = len(v)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + v[i]
+        i = i + 1
+    }
+    return s
+}
+
+// Normalize a non-negative vector into a probability distribution.
+// Falls back to uniform if the sum is ~0.
+fn vec_to_prob(v: array) -> array {
+    let n = len(v)
+    let mut abs_v = []
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let a = f_abs(v[i]) + GWT_EPS
+        abs_v = abs_v.push(a)
+        s = s + a
+        i = i + 1
+    }
+    let mut p = []
+    i = 0
+    while i < n {
+        p = p.push(abs_v[i] / s)
+        i = i + 1
+    }
+    return p
+}
+
+// KL(p || q) = sum_i p_i * log(p_i / q_i)
+// Both p and q are assumed to be probability vectors of equal length.
+// GWT_EPS added in the denominator for numerical safety.
+fn kl_divergence(p: array, q: array) -> float {
+    let n = len(p)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let pi = p[i]
+        let qi = q[i] + GWT_EPS
+        if pi > GWT_EPS {
+            s = s + pi * log(pi / qi)
+        }
+        i = i + 1
+    }
+    // Clamp tiny negative numerical noise.
+    if s < 0.0 {
+        return 0.0
+    }
+    return s
+}
+
+// Mean activity of a domain activation vector: mean(|a|).
+fn domain_activity(v: array) -> float {
+    let n = len(v)
+    if n == 0 {
+        return 0.0
+    }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + f_abs(v[i])
+        i = i + 1
+    }
+    return s / (n * 1.0)
+}
+
+// ─── Core losses ────────────────────────────────────────────
+
+// T1, T2 reference.
+//
+// consistency_loss(D) = mean over i<j of KL(p_i || p_j)
+// where p_i = normalize(|D[i]|).
+//
+// Returns 0 when all domains produce the same distribution (T2) and
+// is always >= 0 by KL non-negativity (T1).
+//
+// If |D| < 2, returns 0 (no pairs).
+fn consistency_loss(domain_acts: array) -> float {
+    let d = len(domain_acts)
+    if d < 2 {
+        return 0.0
+    }
+
+    // Pre-normalize each domain once.
+    let mut probs = []
+    let mut i = 0
+    while i < d {
+        probs = probs.push(vec_to_prob(domain_acts[i]))
+        i = i + 1
+    }
+
+    // Pairwise KL (symmetric-ish average: KL(p||q) only; averaged).
+    let mut total = 0.0
+    let mut pair_count = 0
+    i = 0
+    while i < d {
+        let mut j = i + 1
+        while j < d {
+            let kl_ij = kl_divergence(probs[i], probs[j])
+            let kl_ji = kl_divergence(probs[j], probs[i])
+            total = total + 0.5 * (kl_ij + kl_ji)
+            pair_count = pair_count + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if pair_count == 0 {
+        return 0.0
+    }
+    return total / (pair_count * 1.0)
+}
+
+// T3 reference.
+//
+// coverage_loss(D) = mean over i of max(0, thr - activity_i)^2
+//
+// Returns 0 iff every domain's activity strictly exceeds thr (T3).
+fn coverage_loss(domain_acts: array) -> float {
+    let d = len(domain_acts)
+    if d == 0 {
+        return 0.0
+    }
+    let thr = GWT_ACTIVITY_THR
+    let mut s = 0.0
+    let mut i = 0
+    while i < d {
+        let a = domain_activity(domain_acts[i])
+        let deficit = f_max(0.0, thr - a)
+        s = s + deficit * deficit
+        i = i + 1
+    }
+    return s / (d * 1.0)
+}
+
+// T4 reference.
+//
+// gwt_total_loss = task_loss + α · consistency + β · coverage
+//
+// With α=0 and β=0 it reduces to task_loss (T4).
+fn gwt_total_loss(
+    domain_acts: array,
+    task_loss: float,
+    alpha: float,
+    beta: float
+) -> float {
+    let c = consistency_loss(domain_acts)
+    let g = coverage_loss(domain_acts)
+    return task_loss + alpha * c + beta * g
+}
+
+// ─── Self-test ──────────────────────────────────────────────
+
+// Helper: make n copies of the same domain vector.
+fn replicate(vec: array, n: int) -> array {
+    let mut r = []
+    let mut i = 0
+    while i < n {
+        r = r.push(vec)
+        i = i + 1
+    }
+    return r
+}
+
+// Helper: approximate equality for floats.
+fn approx_eq(a: float, b: float, tol: float) -> bool {
+    return f_abs(a - b) < tol
+}
+
+println("[alm_gwt_loss] self-test — ALM-P2-2")
+
+// Canonical 3-domain example with differing activations.
+let d1 = [1.0, 2.0, 3.0, 4.0]
+let d2 = [2.0, 1.0, 4.0, 3.0]
+let d3 = [0.5, 0.5, 0.5, 0.5]
+let domains_varied = [d1, d2, d3]
+
+// Identical-domain example.
+let same = [0.2, 0.4, 0.6, 0.8]
+let domains_same = replicate(same, 4)
+
+// Dead-domain example (all zeros in one slot).
+let dead = [0.0, 0.0, 0.0, 0.0]
+let domains_dead = [d1, d2, dead]
+
+// Healthy (above threshold) domains — activity will be >> GWT_ACTIVITY_THR.
+let domains_healthy = [d1, d2, d3]
+
+// ── T1: consistency_loss >= 0 on arbitrary inputs ────────────
+let cl_varied = consistency_loss(domains_varied)
+let cl_same   = consistency_loss(domains_same)
+let cl_dead   = consistency_loss(domains_dead)
+let t1_pass = cl_varied >= 0.0 && cl_same >= 0.0 && cl_dead >= 0.0
+if t1_pass {
+    println("[alm_gwt_loss] T1 PASS  consistency_loss >= 0 "
+        + "(varied=" + str(cl_varied)
+        + ", same=" + str(cl_same)
+        + ", dead=" + str(cl_dead) + ")")
+} else {
+    println("[alm_gwt_loss] T1 FAIL")
+}
+
+// ── T2: identical domains → consistency_loss == 0 ────────────
+let t2_pass = approx_eq(cl_same, 0.0, 0.000001)
+if t2_pass {
+    println("[alm_gwt_loss] T2 PASS  identical → 0 (got " + str(cl_same) + ")")
+} else {
+    println("[alm_gwt_loss] T2 FAIL  identical → " + str(cl_same))
+}
+
+// ── T3: coverage_loss == 0 iff all activity > threshold ──────
+let cov_healthy = coverage_loss(domains_healthy)
+let cov_dead    = coverage_loss(domains_dead)
+let t3_pass = approx_eq(cov_healthy, 0.0, 0.0000001) && cov_dead > 0.0
+if t3_pass {
+    println("[alm_gwt_loss] T3 PASS  coverage healthy=" + str(cov_healthy)
+        + ", dead=" + str(cov_dead))
+} else {
+    println("[alm_gwt_loss] T3 FAIL  healthy=" + str(cov_healthy)
+        + ", dead=" + str(cov_dead))
+}
+
+// ── T4: α=β=0 → total == task_loss ───────────────────────────
+let task = 1.234
+let total_zero = gwt_total_loss(domains_varied, task, 0.0, 0.0)
+let t4_pass = approx_eq(total_zero, task, 0.0000001)
+if t4_pass {
+    println("[alm_gwt_loss] T4 PASS  α=β=0 total=" + str(total_zero)
+        + " == task=" + str(task))
+} else {
+    println("[alm_gwt_loss] T4 FAIL  total=" + str(total_zero)
+        + " task=" + str(task))
+}
+
+// ── T5: finite-difference gradient exists ────────────────────
+//
+// Perturb domain_acts[0][0] by h and check that the finite-difference
+// derivative of total_loss w.r.t. that input is finite and non-zero.
+let h = 0.001
+let base_total = gwt_total_loss(domains_varied, task,
+    GWT_ALPHA_DEFAULT, GWT_BETA_DEFAULT)
+
+// Build perturbed copy (+h).
+let d1_plus = [d1[0] + h, d1[1], d1[2], d1[3]]
+let domains_plus = [d1_plus, d2, d3]
+let total_plus = gwt_total_loss(domains_plus, task,
+    GWT_ALPHA_DEFAULT, GWT_BETA_DEFAULT)
+
+// Build perturbed copy (−h).
+let d1_minus = [d1[0] - h, d1[1], d1[2], d1[3]]
+let domains_minus = [d1_minus, d2, d3]
+let total_minus = gwt_total_loss(domains_minus, task,
+    GWT_ALPHA_DEFAULT, GWT_BETA_DEFAULT)
+
+let grad_fd = (total_plus - total_minus) / (2.0 * h)
+let t5_pass = f_abs(grad_fd) > 0.000001 && f_abs(grad_fd) < 1000000.0
+if t5_pass {
+    println("[alm_gwt_loss] T5 PASS  d(total)/d(x)|FD = " + str(grad_fd)
+        + " (base=" + str(base_total) + ")")
+} else {
+    println("[alm_gwt_loss] T5 FAIL  grad_fd=" + str(grad_fd))
+}
+
+// ── Summary ──────────────────────────────────────────────────
+let mut pass_count = 0
+if t1_pass { pass_count = pass_count + 1 }
+if t2_pass { pass_count = pass_count + 1 }
+if t3_pass { pass_count = pass_count + 1 }
+if t4_pass { pass_count = pass_count + 1 }
+if t5_pass { pass_count = pass_count + 1 }
+
+if pass_count == 5 {
+    println("[alm_gwt_loss] ALL THEOREMS PASS (5/5)")
+} else {
+    println("[alm_gwt_loss] FAIL — " + str(pass_count) + "/5 passed")
+}

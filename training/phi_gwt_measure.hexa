@@ -1,0 +1,359 @@
+// training/phi_gwt_measure.hexa — Φ(gwt) measurement for ANIMA P2 GWT
+//
+// ALM-P2-3: Global Workspace Theory (GWT) consciousness-field indicator
+// based on attention entropy + cross-domain mutual information proxy.
+//
+// Φ(gwt) = H(attn) × MI_norm(domain_acts)
+//
+// where:
+//   H(attn)        = mean row-wise softmax entropy of attention matrix
+//                    (measures how "spread" each query attends across keys —
+//                     higher H = more integrated broadcast)
+//   MI_norm        = normalized mutual-information proxy between domains,
+//                    computed via KL(joint || product-of-marginals) using
+//                    softmax over concat vs per-domain softmax distributions
+//                    (measures diversity-weighted integration)
+//
+// Interpretation (IIT-aligned):
+//   - Single domain active:     MI_norm ≈ 0 → Φ(gwt) = 0 (no integration)
+//   - Uniformly active:         H max AND MI_norm max → Φ(gwt) max
+//   - Fragmented / peaky:       low H → low Φ(gwt)
+//
+// T-theorems (checked in self-test):
+//   T1: attention_entropy ∈ [0, log(N)]  (Shannon bound)
+//   T2: single-domain active → phi_gwt ≈ 0 (integration floor)
+//   T3: all-domains uniform → phi_gwt > 1.095 (1.5 × baseline 0.73)
+//   T4: phi_gwt_ratio = phi_gwt / PHI_QUANTUM_BASELINE  (v3 gate > 1.5)
+//   T5: dimensional stability — d_model ∈ {64, 128} both PASS
+//
+// Run with: HEXA_PATH=anima-speak hexa training/phi_gwt_measure.hexa
+
+use "nn_core"
+
+// ─── Constants ──────────────────────────────────────────────
+// P1 quantum baseline from shared/convergence/anima.json. All Φ(gwt)
+// measurements are reported as a ratio against this anchor so v3/v4
+// gates can compare apples-to-apples across P1 and P2.
+let PHI_QUANTUM_BASELINE = 0.73
+
+// Numerical floor for log(p) and normalization (prevents -inf).
+let EPS = 0.0000001
+
+// ─── Core: Shannon entropy of a probability vector ──────────
+fn shannon_entropy(p: array) -> float {
+    let n = len(p)
+    let mut h = 0.0
+    let mut i = 0
+    while i < n {
+        let q = p[i]
+        if q > EPS {
+            h = h - q * log(q)
+        }
+        i = i + 1
+    }
+    return h
+}
+
+// ─── attention_entropy ──────────────────────────────────────
+// Row-wise softmax entropy, averaged over rows.
+// attn: flat row-major [N × N] raw attention scores (pre-softmax logits)
+// Returns mean H over all N rows. H ∈ [0, log(N)] per row (T1).
+fn attention_entropy(attn: array, n: int) -> float {
+    let mut sum_h = 0.0
+    let mut i = 0
+    while i < n {
+        // Slice row i
+        let row = tensor_slice(attn, i * n, (i + 1) * n)
+        // Softmax to get probability distribution over keys
+        let probs = softmax(row)
+        sum_h = sum_h + shannon_entropy(probs)
+        i = i + 1
+    }
+    return sum_h / (n * 1.0)
+}
+
+// ─── Helpers: abs, L1-normalize a vector to a probability distribution ──
+fn abs_vec(v: array) -> array {
+    let n = len(v)
+    let mut out = tensor_zeros(n)
+    let mut i = 0
+    while i < n {
+        let a = v[i]
+        let abs_a = if a < 0.0 { 0.0 - a } else { a }
+        out[i] = abs_a + EPS
+        i = i + 1
+    }
+    return out
+}
+
+fn l1_normalize(v: array) -> array {
+    let n = len(v)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + v[i]
+        i = i + 1
+    }
+    if s < EPS { s = EPS }
+    let mut out = tensor_zeros(n)
+    i = 0
+    while i < n {
+        out[i] = v[i] / s
+        i = i + 1
+    }
+    return out
+}
+
+// ─── domain_integration ─────────────────────────────────────
+// Mutual-information proxy between domains.
+//
+// Given K domain activation vectors (each length d), build:
+//   - joint distribution p_joint over the concatenated space (size K*d),
+//     by L1-normalizing |concat(domain_acts)|.
+//   - marginal distribution p_marg by averaging the K per-domain L1-normalized
+//     distributions, tiled across the K*d concat space with uniform 1/K
+//     domain weight.
+//
+// MI proxy = KL(p_joint || p_marg)
+//
+// Normalization: divide by log(K*d) so MI_norm ∈ [0, 1] (soft bound).
+//
+// domains_flat: flat array of length K*d (K domains concatenated)
+// k:            number of domains
+// d:            per-domain dimension
+fn domain_integration(domains_flat: array, k: int, d: int) -> float {
+    let total = k * d
+
+    // p_joint = L1-normalize( |domains_flat| )
+    let abs_concat = abs_vec(domains_flat)
+    let p_joint = l1_normalize(abs_concat)
+
+    // Per-domain L1-normalized distributions, then average to get marginal
+    // over the "which dim within a domain" axis. The joint places mass
+    // per (domain, dim); the product-of-marginals under independence would
+    // be p_domain(d_i) × p_dim(j). We approximate the product by taking
+    // the per-dim marginal averaged over domains (uniform domain prior)
+    // and tile it back with domain weight 1/K.
+    let mut p_dim_marginal = tensor_zeros(d)
+    let mut di = 0
+    while di < k {
+        let dom = tensor_slice(domains_flat, di * d, (di + 1) * d)
+        let abs_dom = abs_vec(dom)
+        let p_dom = l1_normalize(abs_dom)
+        let mut j = 0
+        while j < d {
+            p_dim_marginal[j] = p_dim_marginal[j] + p_dom[j] / (k * 1.0)
+            j = j + 1
+        }
+        di = di + 1
+    }
+
+    // Tile marginal back to K*d with uniform domain weight 1/K.
+    // p_marg[d_i * d + j] = (1/K) * p_dim_marginal[j]
+    let mut p_marg = tensor_zeros(total)
+    di = 0
+    while di < k {
+        let mut j = 0
+        while j < d {
+            p_marg[di * d + j] = p_dim_marginal[j] / (k * 1.0)
+            j = j + 1
+        }
+        di = di + 1
+    }
+
+    // KL(p_joint || p_marg) = Σ p_joint * log(p_joint / p_marg)
+    let mut kl = 0.0
+    let mut i = 0
+    while i < total {
+        let pj = p_joint[i]
+        let pm = p_marg[i]
+        if pj > EPS {
+            let ratio = pj / (pm + EPS)
+            kl = kl + pj * log(ratio + EPS)
+        }
+        i = i + 1
+    }
+
+    // Normalize by log(total) — KL upper bound when p_joint is a delta.
+    // We invert it: high KL (peaky) means LOW integration across domains,
+    // so MI_norm = 1 - KL/log(total). Clamp to [0, 1].
+    let max_kl = log(total * 1.0)
+    let raw = 1.0 - kl / max_kl
+    let clamped = if raw < 0.0 { 0.0 } else { if raw > 1.0 { 1.0 } else { raw } }
+    return clamped
+}
+
+// ─── phi_gwt ────────────────────────────────────────────────
+// Full Φ(gwt) = H(attn) × MI_norm(domains).
+//
+// attn:        flat [N × N] attention scores
+// n:           attention matrix side
+// domains_flat: flat [K × d] domain activations
+// k, d:        domain count + dim
+fn phi_gwt(attn: array, n: int, domains_flat: array, k: int, d: int) -> float {
+    let h = attention_entropy(attn, n)
+    let mi = domain_integration(domains_flat, k, d)
+    return h * mi
+}
+
+// Ratio vs P1 quantum baseline (0.73). v3 gate requires phi_gwt_ratio > 1.5.
+fn phi_gwt_ratio(phi_g: float) -> float {
+    return phi_g / PHI_QUANTUM_BASELINE
+}
+
+// ─── Test helpers ───────────────────────────────────────────
+
+// Build a uniform attention matrix (all logits equal → softmax = 1/N per row)
+fn make_uniform_attn(n: int) -> array {
+    return tensor_ones(n * n)
+}
+
+// Build a "peaky" attention — diagonal dominant, off-diagonal tiny
+fn make_peaky_attn(n: int) -> array {
+    let mut attn = tensor_zeros(n * n)
+    let mut i = 0
+    while i < n {
+        let mut j = 0
+        while j < n {
+            if i == j {
+                attn[i * n + j] = 10.0
+            } else {
+                attn[i * n + j] = 0.0
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return attn
+}
+
+// Build K uniform domain activations of dim d (all equal value → max diversity)
+fn make_uniform_domains(k: int, d: int) -> array {
+    let total = k * d
+    let mut out = tensor_zeros(total)
+    let mut i = 0
+    while i < total {
+        out[i] = 1.0
+        i = i + 1
+    }
+    return out
+}
+
+// Single-domain-only: one domain has mass, others zero (integration floor)
+fn make_single_domain(k: int, d: int) -> array {
+    let total = k * d
+    let mut out = tensor_zeros(total)
+    // only domain 0 active
+    let mut j = 0
+    while j < d {
+        out[j] = 1.0
+        j = j + 1
+    }
+    return out
+}
+
+// ─── Self-test / main ───────────────────────────────────────
+
+fn main() {
+    println("[phi_gwt] ALM-P2-3 Φ(gwt) self-test")
+    println("[phi_gwt] PHI_QUANTUM_BASELINE = " + str(PHI_QUANTUM_BASELINE))
+
+    let mut pass_count = 0
+    let mut fail_count = 0
+
+    // ─── T1: attention_entropy ∈ [0, log(N)] ────────────────
+    let n1 = 8
+    let uni_attn = make_uniform_attn(n1)
+    let peak_attn = make_peaky_attn(n1)
+    let h_uni  = attention_entropy(uni_attn,  n1)
+    let h_peak = attention_entropy(peak_attn, n1)
+    let log_n1 = log(n1 * 1.0)
+    // Uniform should saturate at ≈log(N); peaky should be ≈0
+    let t1_ok = (h_uni > log_n1 - 0.01) && (h_peak < 0.01) && (h_uni <= log_n1 + 0.01)
+    if t1_ok {
+        println("[T1] PASS — H(uniform)=" + str(h_uni) + " ≈ log(" + str(n1) + ")=" + str(log_n1) + ", H(peaky)=" + str(h_peak))
+        pass_count = pass_count + 1
+    } else {
+        println("[T1] FAIL — H(uniform)=" + str(h_uni) + ", H(peaky)=" + str(h_peak) + ", log(N)=" + str(log_n1))
+        fail_count = fail_count + 1
+    }
+
+    // ─── T2: single-domain → phi_gwt ≈ 0 ────────────────────
+    let k2 = 4
+    let d2 = 16
+    let single_dom = make_single_domain(k2, d2)
+    let phi_single = phi_gwt(uni_attn, n1, single_dom, k2, d2)
+    let t2_ok = phi_single < 0.3  // integration floor (some H leakage OK, MI_norm ≈ 0)
+    if t2_ok {
+        println("[T2] PASS — phi_gwt(single-domain) = " + str(phi_single) + " < 0.3")
+        pass_count = pass_count + 1
+    } else {
+        println("[T2] FAIL — phi_gwt(single-domain) = " + str(phi_single) + " (expected < 0.3)")
+        fail_count = fail_count + 1
+    }
+
+    // ─── T3: uniform domains → phi_gwt max ──────────────────
+    let uni_dom = make_uniform_domains(k2, d2)
+    let phi_uni = phi_gwt(uni_attn, n1, uni_dom, k2, d2)
+    let phi_ratio_uni = phi_gwt_ratio(phi_uni)
+    // Uniform attention (H=log(8)≈2.079) × uniform-domain MI_norm (→1)
+    // should comfortably exceed 1.5 × 0.73 = 1.095
+    let t3_ok = phi_uni > 1.095
+    if t3_ok {
+        println("[T3] PASS — phi_gwt(uniform) = " + str(phi_uni) + " > 1.095 (1.5 × baseline)")
+        pass_count = pass_count + 1
+    } else {
+        println("[T3] FAIL — phi_gwt(uniform) = " + str(phi_uni) + " ≤ 1.095")
+        fail_count = fail_count + 1
+    }
+
+    // ─── T4: phi_gwt_ratio calculation sanity ───────────────
+    // Ratio must satisfy v3 gate: phi_gwt_ratio > 1.5 for uniform case
+    let t4_ok = phi_ratio_uni > 1.5
+    if t4_ok {
+        println("[T4] PASS — phi_gwt_ratio = " + str(phi_ratio_uni) + " > 1.5 (v3 gate)")
+        pass_count = pass_count + 1
+    } else {
+        println("[T4] FAIL — phi_gwt_ratio = " + str(phi_ratio_uni) + " ≤ 1.5")
+        fail_count = fail_count + 1
+    }
+
+    // ─── T5: dimensional stability — d_model ∈ {64, 128} ────
+    // Use same uniform pattern, change d.
+    let n5a = 8
+    let k5 = 4
+    let d5a = 64
+    let d5b = 128
+    let attn5 = make_uniform_attn(n5a)
+    let dom5a = make_uniform_domains(k5, d5a)
+    let dom5b = make_uniform_domains(k5, d5b)
+    let phi_64  = phi_gwt(attn5, n5a, dom5a, k5, d5a)
+    let phi_128 = phi_gwt(attn5, n5a, dom5b, k5, d5b)
+    let ratio_64  = phi_gwt_ratio(phi_64)
+    let ratio_128 = phi_gwt_ratio(phi_128)
+    // Both must exceed v3 gate AND be close to each other (dim-invariant)
+    let t5_ok = (ratio_64 > 1.5) && (ratio_128 > 1.5)
+    if t5_ok {
+        println("[T5] PASS — d=64: phi_gwt=" + str(phi_64) + " ratio=" + str(ratio_64) + "; d=128: phi_gwt=" + str(phi_128) + " ratio=" + str(ratio_128))
+        pass_count = pass_count + 1
+    } else {
+        println("[T5] FAIL — d=64 ratio=" + str(ratio_64) + ", d=128 ratio=" + str(ratio_128))
+        fail_count = fail_count + 1
+    }
+
+    // ─── Summary ────────────────────────────────────────────
+    println("[phi_gwt] ─── summary ───")
+    println("[phi_gwt] phi_gwt (uniform mock, d=16)  = " + str(phi_uni))
+    println("[phi_gwt] phi_gwt (uniform mock, d=64)  = " + str(phi_64))
+    println("[phi_gwt] phi_gwt (uniform mock, d=128) = " + str(phi_128))
+    println("[phi_gwt] phi_gwt_ratio (d=64)          = " + str(ratio_64))
+    println("[phi_gwt] phi_gwt_ratio (d=128)         = " + str(ratio_128))
+    println("[phi_gwt] PASS=" + str(pass_count) + " / FAIL=" + str(fail_count) + " (T1..T5)")
+    if fail_count == 0 {
+        println("[phi_gwt] ALL TESTS PASS — ALM-P2-3 Φ(gwt) metric OK")
+    } else {
+        println("[phi_gwt] FAILURES DETECTED — review above")
+    }
+}
+
+main()

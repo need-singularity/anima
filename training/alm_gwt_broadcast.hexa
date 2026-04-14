@@ -1,0 +1,384 @@
+// alm_gwt_broadcast.hexa — ALM GWT (Global Workspace Theory) Broadcast Head
+//
+// ALM-P2-1 / P2 GWT 구현.
+//
+// Purpose:
+//   Rank-r attention 출력을 multi-domain 글로벌 워크스페이스에 방송.
+//   각 도메인(modality/subsystem)이 공통 context로부터 자신의 activation을
+//   얻고, 이후 reduce_consensus 단계에서 도메인간 평균을 통해 합의 신호를
+//   생성함. Baars(1988)의 Global Workspace Theory를 NN head로 구현.
+//
+// Pipeline:
+//   attn_out [d_model]            (ALM attention output, single vector)
+//     │
+//     │  project:    proj[d] = sum_k project[d, k] * attn_out[k]
+//     │              project: [n_domains × d_model]  row-major
+//     │
+//     │  gate:       alpha[d] = exp(gate[d] + proj[d]) / Z   ← softmax
+//     │              gate:    [n_domains]  learned scalar per domain
+//     │
+//     │  broadcast:  dom[d][m] = alpha[d] * attn_out[m]
+//     ▼
+//   DomainActivations { a: [n_domains × d_model] }
+//     │
+//     │  reduce:     consensus[m] = mean_d dom[d][m]
+//     ▼
+//   Vector [d_model]
+//
+// ─── Theorems (T1–T5) ──────────────────────────────────────────
+//
+// T1 (normalization):
+//   sum_d alpha[d] = 1   (softmax over domains).
+//   Equivalently, for any m,
+//     sum_d dom[d][m] = attn_out[m] * sum_d alpha[d]  =  attn_out[m].
+//   Therefore the broadcast preserves the per-feature "energy" of the
+//   incoming attention signal — no magnification, no leakage.
+//   Checked as "broadcast_sum_eq_attn_out(m) for all m" within eps.
+//
+// T2 (proportional reduce):
+//   consensus[m] = (1/n_domains) * sum_d alpha[d] * attn_out[m]
+//                = (1/n_domains) * attn_out[m]      (by T1)
+//   So reduce_consensus outputs attn_out / n_domains — each domain
+//   contributes proportionally and symmetrically to the consensus.
+//
+// T3 (empty activations):
+//   If n_domains == 0 (or dom matrix is length 0), reduce_consensus
+//   returns a zero vector of length d_model. No division by zero.
+//
+// T4 (gradient propagation / gate learnability):
+//   The gate vector enters broadcast through a softmax; a small
+//   perturbation gate[k] += eps changes alpha[k] by
+//     d alpha[k] / d gate[k] = alpha[k] * (1 - alpha[k]) > 0
+//   as long as 0 < alpha[k] < 1. We approximate this numerically with
+//   a finite difference around the baseline and check it is > 1e-6,
+//   confirming gradients would flow if plugged into autograd.
+//
+// T5 (latency):
+//   A single broadcast call for (n_domains=8, d_model=64) must run in
+//   < 50 ms on the reference interpreter (v3 gate_exit baseline).
+//   Measured with clock() around a warm call.
+//
+// ─── Conventions ──────────────────────────────────────────────
+//   DomainActivations.a is flat row-major, length n_domains * d_model.
+//   Vector / Matrix are type aliases for `array` (flat list-of-float).
+//
+// Ref:
+//   training/rank_r_attention.hexa  (upstream attention producer)
+
+// ─── Primitives (self-contained, no external deps) ────────────
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_sum(v: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    let n = len(v)
+    while i < n {
+        s = s + v[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// Deterministic LCG → small bounded floats in [-1, 1).
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0   // [0, 1)
+        let v = u * 2.0 - 1.0                       // [-1, 1)
+        out = out.push(v)
+        i = i + 1
+    }
+    return out
+}
+
+// softmax on a flat array (numerically stable with max-subtraction).
+fn gwt_softmax(x: array) -> array {
+    let n = len(x)
+    if n == 0 { return [] }
+    let mut m = x[0]
+    let mut i = 1
+    while i < n {
+        if x[i] > m { m = x[i] }
+        i = i + 1
+    }
+    let mut exps = []
+    let mut z = 0.0
+    i = 0
+    while i < n {
+        let e = exp(x[i] - m)
+        exps = exps.push(e)
+        z = z + e
+        i = i + 1
+    }
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out.push(exps[i] / z)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Types ───────────────────────────────────────────────────
+// Matrix / Vector are flat arrays; we track shape alongside.
+
+struct GwtBroadcastHead {
+    n_domains: int,
+    d_model:   int,
+    project:   array,   // [n_domains × d_model]  row-major
+    gate:      array    // [n_domains]            learnable bias per domain
+}
+
+struct DomainActivations {
+    n_domains: int,
+    d_model:   int,
+    a:         array    // [n_domains × d_model]  row-major
+}
+
+// ─── Constructor ─────────────────────────────────────────────
+
+fn gwt_head_new(n_domains: int, d_model: int, seed: int) -> GwtBroadcastHead {
+    let scale = 0.02
+    let raw = det_rand(n_domains * d_model, seed)
+    let mut proj = []
+    let mut i = 0
+    let n = len(raw)
+    while i < n {
+        proj = proj.push(raw[i] * scale)
+        i = i + 1
+    }
+    let gate = vec_zeros(n_domains)   // zero-init → uniform alpha at start
+    return GwtBroadcastHead {
+        n_domains: n_domains,
+        d_model:   d_model,
+        project:   proj,
+        gate:      gate
+    }
+}
+
+// ─── Internal: compute domain gating coefficients alpha[d] ─────
+// alpha[d] = softmax_d ( gate[d] + sum_k project[d, k] * attn_out[k] )
+
+fn gwt_compute_alpha(head: GwtBroadcastHead, attn_out: array) -> array {
+    let nd = head.n_domains
+    let dm = head.d_model
+    if nd == 0 { return [] }
+    let mut logits = []
+    let mut d = 0
+    while d < nd {
+        let mut s = head.gate[d]
+        let mut k = 0
+        while k < dm {
+            s = s + head.project[d * dm + k] * attn_out[k]
+            k = k + 1
+        }
+        logits = logits.push(s)
+        d = d + 1
+    }
+    return gwt_softmax(logits)
+}
+
+// ─── broadcast: attn_out → per-domain activations ─────────────
+// Returns DomainActivations whose row d equals alpha[d] * attn_out.
+// By construction, sum over d of activations[d, m] = attn_out[m].  (T1)
+
+fn broadcast(head: GwtBroadcastHead, attn_out: array) -> DomainActivations {
+    let nd = head.n_domains
+    let dm = head.d_model
+    let alpha = gwt_compute_alpha(head, attn_out)
+    // Row-by-row construction (HEXA arrays are immutable-by-index; append-only).
+    let mut a = []
+    let mut d = 0
+    while d < nd {
+        let w = alpha[d]
+        let mut m = 0
+        while m < dm {
+            a = a.push(w * attn_out[m])
+            m = m + 1
+        }
+        d = d + 1
+    }
+    return DomainActivations {
+        n_domains: nd,
+        d_model:   dm,
+        a:         a
+    }
+}
+
+// ─── reduce_consensus: mean across domains → [d_model] ────────
+// Empty activations → zero vector of length d_model.  (T3)
+
+fn reduce_consensus(act: DomainActivations) -> array {
+    let nd = act.n_domains
+    let dm = act.d_model
+    if nd == 0 { return vec_zeros(dm) }
+    if len(act.a) == 0 { return vec_zeros(dm) }
+    let inv_nd = 1.0 / to_float(nd)
+    let mut cons = []
+    let mut m = 0
+    while m < dm {
+        let mut s = 0.0
+        let mut d = 0
+        while d < nd {
+            s = s + act.a[d * dm + m]
+            d = d + 1
+        }
+        cons = cons.push(s * inv_nd)
+        m = m + 1
+    }
+    return cons
+}
+
+// ─── Self-tests ───────────────────────────────────────────────
+
+fn check_T1(head: GwtBroadcastHead, attn_out: array) -> bool {
+    // sum_d alpha[d] = 1  AND  sum_d dom[d, m] = attn_out[m]  for all m
+    let alpha = gwt_compute_alpha(head, attn_out)
+    let s_alpha = vec_sum(alpha)
+    if fabs(s_alpha - 1.0) > 0.0001 { return false }
+    let act = broadcast(head, attn_out)
+    let dm = act.d_model
+    let nd = act.n_domains
+    let mut m = 0
+    while m < dm {
+        let mut s = 0.0
+        let mut d = 0
+        while d < nd {
+            s = s + act.a[d * dm + m]
+            d = d + 1
+        }
+        if fabs(s - attn_out[m]) > 0.0001 { return false }
+        m = m + 1
+    }
+    return true
+}
+
+fn check_T2(head: GwtBroadcastHead, attn_out: array) -> bool {
+    // consensus[m] should equal attn_out[m] / n_domains within eps.
+    let act = broadcast(head, attn_out)
+    let cons = reduce_consensus(act)
+    let dm = act.d_model
+    let inv_n = 1.0 / to_float(act.n_domains)
+    let mut m = 0
+    while m < dm {
+        let expected = attn_out[m] * inv_n
+        if fabs(cons[m] - expected) > 0.0001 { return false }
+        m = m + 1
+    }
+    return true
+}
+
+fn check_T3(head: GwtBroadcastHead) -> bool {
+    // Empty activations → zero vector of length d_model.
+    let empty = DomainActivations { n_domains: 0, d_model: head.d_model, a: [] }
+    let cons = reduce_consensus(empty)
+    if len(cons) != head.d_model { return false }
+    let mut i = 0
+    while i < len(cons) {
+        if fabs(cons[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// Helper for T4: build a head with gate perturbed at index k by eps.
+fn gwt_head_perturb_gate(head: GwtBroadcastHead, k: int, eps: float) -> GwtBroadcastHead {
+    let nd = head.n_domains
+    let mut g2 = []
+    let mut j = 0
+    while j < nd {
+        let v = if j == k { head.gate[j] + eps } else { head.gate[j] }
+        g2 = g2.push(v)
+        j = j + 1
+    }
+    return GwtBroadcastHead {
+        n_domains: head.n_domains,
+        d_model:   head.d_model,
+        project:   head.project,
+        gate:      g2
+    }
+}
+
+fn check_T4(head: GwtBroadcastHead, attn_out: array) -> bool {
+    // Finite-difference surrogate of d alpha[k] / d gate[k].
+    // Expected: ≈ alpha[k] * (1 - alpha[k]) > 0 for every k.
+    let alpha0 = gwt_compute_alpha(head, attn_out)
+    let nd = head.n_domains
+    let eps = 0.001
+    let mut k = 0
+    while k < nd {
+        let h2 = gwt_head_perturb_gate(head, k, eps)
+        let alpha1 = gwt_compute_alpha(h2, attn_out)
+        let slope = (alpha1[k] - alpha0[k]) / eps
+        // With alpha[k] in (0,1), slope ≈ alpha(1-alpha) ∈ (0, 0.25].
+        if slope < 0.000001 { return false }
+        k = k + 1
+    }
+    return true
+}
+
+fn check_T5(head: GwtBroadcastHead, attn_out: array) -> bool {
+    // Wall-time: a single broadcast call must finish in < 50 ms.
+    // clock() returns seconds (float) on HEXA.
+    let t0 = clock()
+    let _act = broadcast(head, attn_out)
+    let t1 = clock()
+    let elapsed_ms = (t1 - t0) * 1000.0
+    println("  [T5] broadcast latency = " + str(elapsed_ms) + " ms")
+    return elapsed_ms < 50.0
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[alm_gwt_broadcast] ALM-P2-1 self-test")
+    println("  mock: n_domains=8, d_model=64")
+
+    let n_domains = 8
+    let d_model   = 64
+    let head = gwt_head_new(n_domains, d_model, 42)
+
+    // Mock attn_out: deterministic pseudo-random vector.
+    let attn_out = det_rand(d_model, 7)
+
+    let t1 = check_T1(head, attn_out)
+    if t1 { println("T1 PASS") } else { println("T1 FAIL") }
+
+    let t2 = check_T2(head, attn_out)
+    if t2 { println("T2 PASS") } else { println("T2 FAIL") }
+
+    let t3 = check_T3(head)
+    if t3 { println("T3 PASS") } else { println("T3 FAIL") }
+
+    let t4 = check_T4(head, attn_out)
+    if t4 { println("T4 PASS") } else { println("T4 FAIL") }
+
+    let t5 = check_T5(head, attn_out)
+    if t5 { println("T5 PASS") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[alm_gwt_broadcast] ALL 5/5 PASS")
+    } else {
+        println("[alm_gwt_broadcast] SOME FAILED")
+    }
+}
+
+main()

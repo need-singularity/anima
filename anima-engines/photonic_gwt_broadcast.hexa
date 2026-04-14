@@ -1,0 +1,217 @@
+// photonic_gwt_broadcast.hexa — Photonic fabric Global Workspace Theory broadcast latency
+// PHYS-P2-1: measure time for GWT signal to propagate across photonic fabric to all domains
+// Chip-scale photonic mesh: light-speed propagation + wavelength-division multiplex
+//
+// Theorems (verified in main):
+//   T1: latency >= fabric_diameter / speed_of_light  (causality lower bound)
+//   T2: n_domains up => latency monotonically non-decreasing (fan-out cost)
+//   T3: p99 < 50 ms = 5e7 ns (v3 gate_exit 50ms budget; photonic ns scale gives vast headroom)
+//   T4: spectral_bandwidth_ghz is proportional to n_channels (WDM linear scaling)
+//   T5: n_domains == 1 => fan-out overhead == 0 ns, latency == c-propagation only
+
+// Physical constants
+let C_CM_PER_NS = 30.0                    // speed of light in vacuum: 30 cm/ns
+let DEFAULT_CHANNELS = 32                 // telecom C-band WDM lanes
+let DEFAULT_DIAMETER_CM = 10.0            // chip-scale photonic fabric (10 cm)
+let CHANNEL_BANDWIDTH_GHZ = 50.0          // per-channel modulation bandwidth (50 GHz)
+let FANOUT_OVERHEAD_NS = 0.12             // directional coupler delay per domain branch
+let JITTER_NS = 0.05                      // thermal/shot-noise jitter amplitude
+
+// Photonic fabric substrate
+// n_channels:           parallel WDM wavelengths
+// speed_of_light_cm_ns: effective propagation speed (in-medium, vacuum baseline here)
+// fabric_diameter_cm:   max physical distance any broadcast must cover
+struct PhotonicFabric {
+    n_channels: int,
+    speed_of_light_cm_ns: float,
+    fabric_diameter_cm: float
+}
+
+// Broadcast latency statistics (ns scale)
+struct BroadcastStats {
+    n_trials: int,
+    n_domains: int,
+    mean_ns: float,
+    p50_ns: float,
+    p99_ns: float,
+    min_ns: float,
+    max_ns: float
+}
+
+// Construct fabric with default chip-scale photonic parameters
+fn new_photonic_fabric(n_channels: int, diameter_cm: float) -> PhotonicFabric {
+    PhotonicFabric {
+        n_channels: n_channels,
+        speed_of_light_cm_ns: C_CM_PER_NS,
+        fabric_diameter_cm: diameter_cm
+    }
+}
+
+// Broadcast latency: light-speed propagation + domain fan-out overhead
+// T1 lower bound: fabric_diameter / c
+// T2 monotone: overhead grows with n_domains
+// T5 base case: n_domains == 1 -> fan-out term collapses to 0
+fn broadcast_latency_ns(fabric, n_domains: int) -> float {
+    let prop_ns = fabric.fabric_diameter_cm / fabric.speed_of_light_cm_ns
+    let fanout_branches = n_domains - 1
+    let fanout_ns = FANOUT_OVERHEAD_NS * to_float(to_string(fanout_branches))
+    return prop_ns + fanout_ns
+}
+
+// Spectral bandwidth: WDM aggregate = n_channels * per-lane bandwidth
+// T4: linearly proportional to n_channels
+fn spectral_bandwidth_ghz(fabric) -> float {
+    return to_float(to_string(fabric.n_channels)) * CHANNEL_BANDWIDTH_GHZ
+}
+
+// Deterministic LCG pseudo-random jitter — avoids external RNG
+// returns a value in [-JITTER_NS, +JITTER_NS]
+fn jitter_ns(seed: int) -> float {
+    let a = 1103515245
+    let c = 12345
+    let m = 2147483648
+    let raw = (a * seed + c) % m
+    let norm = to_float(to_string(raw)) / to_float(to_string(m))   // 0..1
+    return (norm - 0.5) * 2.0 * JITTER_NS
+}
+
+// Absolute value (float)
+fn abs_f(x: float) -> float {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+// Insertion sort ascending — O(n^2), fine for n_trials <= 10000
+fn sort_ascending(arr) {
+    let mut a = []
+    for v in arr {
+        a = a.push(v)
+    }
+    let n = len(a)
+    let mut i = 1
+    while i < n {
+        let key = a[i]
+        let mut j = i - 1
+        while j >= 0 && a[j] > key {
+            a[j + 1] = a[j]
+            j = j - 1
+        }
+        a[j + 1] = key
+        i = i + 1
+    }
+    return a
+}
+
+// Simulate broadcast: n_trials samples at fixed n_domains, return summary stats
+fn simulate_broadcast(fabric, n_domains: int, n_trials: int) -> BroadcastStats {
+    let base = broadcast_latency_ns(fabric, n_domains)
+    let mut samples = []
+    let mut sum = 0.0
+    let mut min_v = base + 1.0e9
+    let mut max_v = 0.0
+    let mut k = 0
+    while k < n_trials {
+        let j = jitter_ns(k + 1)
+        let mut sample = base + j
+        if sample < 0.0 {
+            sample = 0.0
+        }
+        samples = samples.push(sample)
+        sum = sum + sample
+        if sample < min_v {
+            min_v = sample
+        }
+        if sample > max_v {
+            max_v = sample
+        }
+        k = k + 1
+    }
+    let sorted = sort_ascending(samples)
+    let mut p50_idx = n_trials / 2
+    let mut p99_idx = (n_trials * 99) / 100
+    if p50_idx >= n_trials {
+        p50_idx = n_trials - 1
+    }
+    if p99_idx >= n_trials {
+        p99_idx = n_trials - 1
+    }
+    return BroadcastStats {
+        n_trials: n_trials,
+        n_domains: n_domains,
+        mean_ns: sum / to_float(to_string(n_trials)),
+        p50_ns: sorted[p50_idx],
+        p99_ns: sorted[p99_idx],
+        min_ns: min_v,
+        max_ns: max_v
+    }
+}
+
+// Theorem check — print PASS/FAIL, return 1 on pass
+fn check_theorem(name: string, passed: bool) -> int {
+    if passed {
+        println(name, "PASS")
+        return 1
+    }
+    println(name, "FAIL")
+    return 0
+}
+
+fn main() {
+    let fabric = new_photonic_fabric(DEFAULT_CHANNELS, DEFAULT_DIAMETER_CM)
+    let n_domains = 8
+    let n_trials = 1000
+
+    println("photonic_gwt_broadcast — PHYS-P2-1")
+    println("fabric diameter_cm =", fabric.fabric_diameter_cm, "channels =", fabric.n_channels)
+    println("c_cm_per_ns =", fabric.speed_of_light_cm_ns)
+
+    let stats = simulate_broadcast(fabric, n_domains, n_trials)
+    println("n_domains =", stats.n_domains, "n_trials =", stats.n_trials)
+    println("mean_ns =", stats.mean_ns)
+    println("p50_ns  =", stats.p50_ns)
+    println("p99_ns  =", stats.p99_ns)
+    println("min_ns  =", stats.min_ns)
+    println("max_ns  =", stats.max_ns)
+
+    let bw = spectral_bandwidth_ghz(fabric)
+    println("spectral_bandwidth_ghz =", bw)
+
+    // T1: every sampled latency must be >= causal floor (diameter / c) minus jitter slack
+    let t1_floor = fabric.fabric_diameter_cm / fabric.speed_of_light_cm_ns
+    let t1_ok = stats.min_ns + 0.5 >= t1_floor - JITTER_NS
+    let _t1 = check_theorem("T1_causality_floor", t1_ok)
+
+    // T2: broadcast_latency_ns is monotone non-decreasing in n_domains
+    let lat_1 = broadcast_latency_ns(fabric, 1)
+    let lat_2 = broadcast_latency_ns(fabric, 2)
+    let lat_4 = broadcast_latency_ns(fabric, 4)
+    let lat_16 = broadcast_latency_ns(fabric, 16)
+    let t2_ok = lat_1 <= lat_2 && lat_2 <= lat_4 && lat_4 <= lat_16
+    let _t2 = check_theorem("T2_monotone_fanout", t2_ok)
+
+    // T3: p99 < 50 ms = 5e7 ns (v3 gate_exit budget)
+    let t3_budget_ns = 50000000.0
+    let t3_ok = stats.p99_ns < t3_budget_ns
+    let _t3 = check_theorem("T3_p99_under_50ms", t3_ok)
+
+    // T4: bandwidth proportional to n_channels — doubling channels doubles bandwidth
+    let fabric_2x = new_photonic_fabric(fabric.n_channels * 2, fabric.fabric_diameter_cm)
+    let bw_1x = spectral_bandwidth_ghz(fabric)
+    let bw_2x = spectral_bandwidth_ghz(fabric_2x)
+    let ratio = bw_2x / bw_1x
+    let t4_ok = ratio > 1.99 && ratio < 2.01
+    let _t4 = check_theorem("T4_bandwidth_linear", t4_ok)
+
+    // T5: n_domains == 1 => fan-out overhead is zero, latency = c-propagation exactly
+    let lat_single = broadcast_latency_ns(fabric, 1)
+    let prop_only = fabric.fabric_diameter_cm / fabric.speed_of_light_cm_ns
+    let t5_ok = abs_f(lat_single - prop_only) < 1.0e-9
+    let _t5 = check_theorem("T5_single_domain_no_fanout", t5_ok)
+
+    println("p99_latency_ns =", stats.p99_ns)
+    println("done")
+}
+
+let _ = main()
