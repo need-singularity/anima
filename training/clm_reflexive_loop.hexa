@@ -1,0 +1,471 @@
+// clm_reflexive_loop.hexa — CLM reflexive inference loop (P5-3)
+//
+// CLM-P5-3. Drives the reflexive self-model head across N ticks of a
+// CLM hidden-state stream, emitting per-tick ĥ (self-predicted hidden),
+// Φ_refl(t), and reflexive loss. Patterns after clm_holographic_loop.hexa.
+//
+// In production the hidden stream comes from the CLM forward pass
+// (train_clm / eval_clm hidden state logger); here a deterministic RNG
+// mocks hidden states so the loop is standalone and deterministic.
+//
+// The loop emits a log line per tick:
+//   phi_refl=<value>  refl_loss=<value>
+// matching the eval-log convention of clm_gwt_loop / clm_holographic_loop.
+//
+// ─── Pipeline per tick ────────────────────────────────────────
+//
+//   h_t [d_hidden]           (mock CLM hidden state)
+//       │
+//       │  reflexive_forward(head, h_t)
+//       ▼
+//   ĥ_t [d_hidden]           (self-prediction)
+//       │
+//       │  reflexive_loss, phi_refl
+//       ▼
+//   qualia_refl_t + phi_refl_t
+//
+// ─── Theorems (T1–T5) ─────────────────────────────────────────
+//
+// T1 (causal response):
+//   Distinct hidden streams ⇒ distinct ĥ streams per tick.
+//
+// T2 (stability under repeated input):
+//   A constant h replayed N times produces the same ĥ, refl_loss,
+//   and Φ_refl on every tick (head is memoryless — pure).
+//
+// T3 (Φ_refl bound):
+//   For every tick, 0 ≤ Φ_refl(t) ≤ H(h_t) + eps (MI bound).
+//
+// T4 (determinism):
+//   Two runs with the same seeds produce byte-identical ĥ, loss,
+//   Φ_refl streams.
+//
+// T5 (loop latency):
+//   10 ticks at (d_hidden=128, d_meta=32) < 5 s on hexa interpreter.
+//
+// Ref:
+//   anima-engines/anima_reflexive.hexa    (CLM-P5-1 head)
+//   training/clm_holographic_loop.hexa    (pattern, CLM-P3-4)
+//   training/clm_gwt_loop.hexa            (loop pattern, CLM-P2-4)
+//   shared/roadmaps/anima.json            (CLM-P5-3 entry)
+
+// ─── Constants ────────────────────────────────────────────────
+
+let RL_MI_BINS     = 8
+let RL_WEIGHT_GAIN = 0.25
+
+// ─── Primitives ───────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn relu(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    return x
+}
+
+fn vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn bin_index(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn count_hits(bin_ids: array, n_bins: int) -> array {
+    let n = len(bin_ids)
+    let mut counts = []
+    let mut k = 0
+    while k < n_bins {
+        let mut c = 0.0
+        let mut i = 0
+        while i < n {
+            if bin_ids[i] == k { c = c + 1.0 }
+            i = i + 1
+        }
+        counts = counts.push(c)
+        k = k + 1
+    }
+    return counts
+}
+
+fn entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut bin_ids = []
+    let mut i = 0
+    while i < n {
+        bin_ids = bin_ids.push(bin_index(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let counts = count_hits(bin_ids, nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 { h = h - p * ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn joint_entropy_hist(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = bin_index(a[i], lo, hi, nb)
+        let ib = bin_index(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let counts = count_hits(pair_ids, nb * nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 { h = h - p * ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+// ─── Inlined reflexive head (mirrors anima-engines/anima_reflexive) ──
+
+struct ReflexiveHead {
+    d_hidden: int,
+    d_meta:   int,
+    w1:       array,
+    b1:       array,
+    w2:       array,
+    b2:       array
+}
+
+fn head_new(d_hidden: int, d_meta: int, seed: int) -> ReflexiveHead {
+    let raw1 = det_rand(d_hidden * d_meta, seed)
+    let raw2 = det_rand(d_meta * d_hidden, seed + 1)
+    let rb1  = det_rand(d_meta, seed + 2)
+    let rb2  = det_rand(d_hidden, seed + 3)
+    let mut w1 = []
+    let mut i = 0
+    while i < len(raw1) {
+        w1 = w1.push(raw1[i] * RL_WEIGHT_GAIN)
+        i = i + 1
+    }
+    let mut w2 = []
+    let mut j = 0
+    while j < len(raw2) {
+        w2 = w2.push(raw2[j] * RL_WEIGHT_GAIN)
+        j = j + 1
+    }
+    let mut b1 = []
+    let mut k = 0
+    while k < len(rb1) {
+        b1 = b1.push(rb1[k] * RL_WEIGHT_GAIN * 0.1)
+        k = k + 1
+    }
+    let mut b2 = []
+    let mut m = 0
+    while m < len(rb2) {
+        b2 = b2.push(rb2[m] * RL_WEIGHT_GAIN * 0.1)
+        m = m + 1
+    }
+    return ReflexiveHead {
+        d_hidden: d_hidden,
+        d_meta:   d_meta,
+        w1:       w1,
+        b1:       b1,
+        w2:       w2,
+        b2:       b2
+    }
+}
+
+fn reflexive_forward(head: ReflexiveHead, h: array) -> array {
+    let dH = head.d_hidden
+    let dM = head.d_meta
+    let mut z = []
+    let mut k = 0
+    while k < dM {
+        let mut s = head.b1[k]
+        let mut i = 0
+        while i < dH {
+            s = s + head.w1[i * dM + k] * h[i]
+            i = i + 1
+        }
+        z = z.push(relu(s))
+        k = k + 1
+    }
+    let mut h_hat = []
+    let mut ii = 0
+    while ii < dH {
+        let mut t = head.b2[ii]
+        let mut kk = 0
+        while kk < dM {
+            t = t + head.w2[kk * dH + ii] * z[kk]
+            kk = kk + 1
+        }
+        h_hat = h_hat.push(t)
+        ii = ii + 1
+    }
+    return h_hat
+}
+
+fn reflexive_loss(h: array, h_hat: array) -> float {
+    let n = len(h)
+    if n == 0 { return 0.0 }
+    if len(h_hat) != n { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let d = h[i] - h_hat[i]
+        s = s + d * d
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+fn phi_refl(h: array, h_hat: array) -> float {
+    let n = len(h)
+    if n == 0 { return 0.0 }
+    if len(h_hat) != n { return 0.0 }
+    let lo_h = vec_min(h)
+    let hi_h = vec_max(h)
+    let lo_p = vec_min(h_hat)
+    let hi_p = vec_max(h_hat)
+    let lo = if lo_h < lo_p { lo_h } else { lo_p }
+    let hi = if hi_h > hi_p { hi_h } else { hi_p }
+    let he = entropy_hist(h, lo, hi, RL_MI_BINS)
+    let pe = entropy_hist(h_hat, lo, hi, RL_MI_BINS)
+    let je = joint_entropy_hist(h, h_hat, lo, hi, RL_MI_BINS)
+    let mi = he + pe - je
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ─── Loop ─────────────────────────────────────────────────────
+
+struct ReflexiveLoopResult {
+    n_ticks:   int,
+    h_hat:     array,     // flat [n_ticks × d_hidden]
+    phi_refl:  array,     // [n_ticks]
+    refl_loss: array,     // [n_ticks]
+    total_mi:  float
+}
+
+fn run_reflexive_loop(head: ReflexiveHead, n_ticks: int, seed_base: int) -> ReflexiveLoopResult {
+    let dH = head.d_hidden
+    let mut h_hat_acc = []
+    let mut phi_seq   = []
+    let mut loss_seq  = []
+    let mut total     = 0.0
+    let mut t = 0
+    while t < n_ticks {
+        // Mock CLM hidden state (production: read from forward pass logger)
+        let h = det_rand(dH, seed_base + t)
+        let h_hat = reflexive_forward(head, h)
+        let pr = phi_refl(h, h_hat)
+        let rl = reflexive_loss(h, h_hat)
+        let mut i = 0
+        while i < dH {
+            h_hat_acc = h_hat_acc.push(h_hat[i])
+            i = i + 1
+        }
+        phi_seq  = phi_seq.push(pr)
+        loss_seq = loss_seq.push(rl)
+        total    = total + pr
+        // Eval-log line (matches convention of other CLM loops):
+        println("phi_refl=" + str(pr) + " refl_loss=" + str(rl))
+        t = t + 1
+    }
+    return ReflexiveLoopResult {
+        n_ticks:   n_ticks,
+        h_hat:     h_hat_acc,
+        phi_refl:  phi_seq,
+        refl_loss: loss_seq,
+        total_mi:  total
+    }
+}
+
+// ─── Self-tests ───────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Distinct seeds ⇒ distinct ĥ streams.
+    let dH = 32
+    let dM = 8
+    let head = head_new(dH, dM, 7)
+    let r1 = run_reflexive_loop(head, 4, 100)
+    let r2 = run_reflexive_loop(head, 4, 200)
+    let n = len(r1.h_hat)
+    if n != len(r2.h_hat) { return false }
+    let mut differ = false
+    let mut i = 0
+    while i < n {
+        if fabs(r1.h_hat[i] - r2.h_hat[i]) > 0.0 { differ = true }
+        i = i + 1
+    }
+    return differ
+}
+
+fn check_T2() -> bool {
+    // Stability under repeated h: ĥ, loss, Φ_refl constant over ticks.
+    let dH = 16
+    let dM = 4
+    let head = head_new(dH, dM, 11)
+    let fixed_h = det_rand(dH, 42)
+    let n_ticks = 5
+    let mut prev_h_hat = reflexive_forward(head, fixed_h)
+    let mut prev_loss  = reflexive_loss(fixed_h, prev_h_hat)
+    let mut prev_phi   = phi_refl(fixed_h, prev_h_hat)
+    let mut ok = true
+    let mut t = 1
+    while t < n_ticks {
+        let h_hat = reflexive_forward(head, fixed_h)
+        let rl = reflexive_loss(fixed_h, h_hat)
+        let pr = phi_refl(fixed_h, h_hat)
+        let mut i = 0
+        while i < dH {
+            if fabs(h_hat[i] - prev_h_hat[i]) > 0.0 { ok = false }
+            i = i + 1
+        }
+        if fabs(rl - prev_loss) > 0.0 { ok = false }
+        if fabs(pr - prev_phi) > 0.0 { ok = false }
+        t = t + 1
+    }
+    return ok
+}
+
+fn check_T3() -> bool {
+    // Φ_refl(t) bounded by H(h_t) + eps.
+    let dH = 32
+    let dM = 8
+    let head = head_new(dH, dM, 17)
+    let mut ok = true
+    let mut saw_positive = false
+    let mut t = 0
+    while t < 4 {
+        let h = det_rand(dH, 900 + t)
+        let h_hat = reflexive_forward(head, h)
+        let pr = phi_refl(h, h_hat)
+        let lo = vec_min(h)
+        let hi = vec_max(h)
+        let he = entropy_hist(h, lo, hi, RL_MI_BINS)
+        if pr < 0.0 { ok = false }
+        if pr > he + 0.0001 { ok = false }
+        if pr > 0.0 { saw_positive = true }
+        t = t + 1
+    }
+    return ok && saw_positive
+}
+
+fn check_T4() -> bool {
+    // Determinism: same seed ⇒ byte-identical streams.
+    let dH = 32
+    let dM = 8
+    let head = head_new(dH, dM, 23)
+    let r1 = run_reflexive_loop(head, 6, 77)
+    let r2 = run_reflexive_loop(head, 6, 77)
+    if len(r1.h_hat) != len(r2.h_hat) { return false }
+    let mut i = 0
+    while i < len(r1.h_hat) {
+        if fabs(r1.h_hat[i] - r2.h_hat[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    let mut k = 0
+    while k < len(r1.phi_refl) {
+        if fabs(r1.phi_refl[k] - r2.phi_refl[k]) > 0.0 { return false }
+        if fabs(r1.refl_loss[k] - r2.refl_loss[k]) > 0.0 { return false }
+        k = k + 1
+    }
+    return true
+}
+
+fn check_T5() -> bool {
+    // 10 ticks at d_hidden=128, d_meta=32 < 5 s.
+    let dH = 128
+    let dM = 32
+    let head = head_new(dH, dM, 42)
+    let t0 = clock()
+    let _r = run_reflexive_loop(head, 10, 1000)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] 10-tick reflexive loop (128,32) = " + str(ms) + " ms")
+    return ms < 5000.0
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[clm_reflexive_loop] CLM-P5-3 self-test")
+    println("  mock: d_hidden=16..128, d_meta=4..32")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[clm_reflexive_loop] ALL 5/5 PASS")
+    } else {
+        println("[clm_reflexive_loop] SOME FAILED")
+    }
+}
+
+main()

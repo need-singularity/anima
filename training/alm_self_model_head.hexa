@@ -1,0 +1,450 @@
+// training/alm_self_model_head.hexa — ALM-P5-1 self-model head
+//
+// ALM-P5-1 / P5 v6 자의식 (reflexivity, ALM track).
+//
+// Purpose:
+//   Model observes its own forward pass. A small MLP head sitting on top
+//   of the hidden state h produces ĥ, a *meta-prediction* of the next-layer
+//   hidden representation. This is the computational core of Hofstadter's
+//   strange loop: the model carries an internal model of its own state.
+//
+//   Downstream, alm_reflexivity_loss.hexa (ALM-P5-2) drives ĥ toward
+//   stop_grad(h) with a small auxiliary weight, and phi_reflexive_measure
+//   (ALM-P5-3) reports Φ_refl = MI(h, ĥ) as the self-awareness signature.
+//
+// Pipeline:
+//
+//   hidden h [D]              (model's current-layer activations)
+//        │
+//        │  fc1:  z[k] = tanh(sum_j W1[k, j] * h[j] + b1[k])
+//        │        W1: [d_hidden × D]     row-major
+//        │        b1: [d_hidden]
+//        ▼
+//   meta latent z [d_hidden]  (self-model internal bottleneck)
+//        │
+//        │  fc2:  ĥ[m] = sum_k W2[m, k] * z[k] + b2[m]
+//        │        W2: [D × d_hidden]     row-major
+//        │        b2: [D]
+//        ▼
+//   meta prediction ĥ [D]     (model's belief about its own next-layer h)
+//
+// Parameter count (target ~2 M):
+//   W1: d_hidden × D
+//   b1: d_hidden
+//   W2: D × d_hidden
+//   b2: D
+//   total = 2·D·d_hidden + D + d_hidden
+//   For (D=1024, d_hidden=1024): 2·1024·1024 + 1024 + 1024 ≈ 2.10 M params
+//   (self-test uses smaller D=64, d_hidden=32 for stage0 interpreter speed)
+//
+// ─── Theorems (T1–T5) ──────────────────────────────────────────
+//
+// T1 (dim contract):
+//   forward: R^D → R^D with an internal bottleneck d_hidden ∈ (0, 2·D].
+//   Checked by len() of output on a fresh head (D=64, d_hidden=32).
+//
+// T2 (convergence proxy — ||ĥ − h|| can be driven below 0.1):
+//   A full 14B train loop is out-of-scope for a self-test. Instead we
+//   verify the *structural* claim: when W2·W1 ≈ I (identity) and biases
+//   are zero, ĥ ≈ tanh-smoothed h and the gap ||ĥ − h||_∞ is below 0.1
+//   on a moderate-amplitude input (|h_i| ≤ 0.1, where tanh(x) ≈ x).
+//   This is the ideal-fixpoint witness; the real training loop (P5-2)
+//   moves the head toward this fixpoint via SGD on L_refl.
+//
+// T3 (Φ_refl > 0 — non-trivial meta info):
+//   When h has non-zero variance, ĥ must carry information about h:
+//   Var(ĥ) > 0 AND ĥ is not constant-shifted h (i.e. the head is not
+//   a trivial identity wire). A variance-positivity proxy guards this
+//   lightweight at head-build time; proper MI estimator lives in
+//   phi_reflexive_measure.hexa (ALM-P5-3).
+//
+// T4 (determinism):
+//   Two heads built with the same (d_in, d_hidden, seed) produce
+//   byte-identical ĥ on the same h.
+//
+// T5 (latency):
+//   One forward call for (D=64, d_hidden=32) must finish in < 50 ms
+//   on the reference interpreter.
+//
+// ─── Conventions ──────────────────────────────────────────────
+//   All matrices flat row-major.
+//   W1: [d_hidden × D]
+//   W2: [D × d_hidden]
+//
+// Ref:
+//   training/alm_holographic_mapping.hexa       (ALM-P3-1 — pattern source)
+//   training/alm_gwt_broadcast.hexa             (T1–T5 self-test style)
+//   training/alm_reflexivity_loss.hexa          (ALM-P5-2 — consumes this head)
+//   training/phi_reflexive_measure.hexa         (ALM-P5-3 — Φ_refl = MI(h, ĥ))
+//   shared/roadmaps/anima.json                  (ALM-P5-1 entry)
+
+// ─── Primitives (self-contained, no external deps) ────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// Stable tanh. For |x| > 20, saturate to ±1 to avoid overflow in exp.
+// Implemented as (e^{2x} - 1) / (e^{2x} + 1) for x <= 0 and the
+// symmetric form for x > 0 to keep the numerator/denominator bounded.
+fn ftanh(x: float) -> float {
+    if x > 20.0 { return 1.0 }
+    if x < 0.0 - 20.0 { return 0.0 - 1.0 }
+    let e2 = exp(2.0 * x)
+    return (e2 - 1.0) / (e2 + 1.0)
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_sub(a: array, b: array) -> array {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(a[i] - b[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_inf_norm(v: array) -> float {
+    let n = len(v)
+    let mut m = 0.0
+    let mut i = 0
+    while i < n {
+        let a = fabs(v[i])
+        if a > m { m = a }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_variance(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        sum = sum + v[i]
+        i = i + 1
+    }
+    let mean = sum / to_float(n)
+    let mut s2 = 0.0
+    i = 0
+    while i < n {
+        let d = v[i] - mean
+        s2 = s2 + d * d
+        i = i + 1
+    }
+    return s2 / to_float(n)
+}
+
+// Deterministic LCG → small bounded floats in [-1, 1).
+// Scaled down by 0.1 so the initial linear layers don't saturate tanh.
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0   // [0, 1)
+        out = out.push((u * 2.0 - 1.0) * 0.1)       // [-0.1, 0.1)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Matrix primitive (row-major flat) ───────────────────────
+// matvec: y = M @ x   with M: [rows × cols] row-major, x: [cols].
+
+fn matvec(m: array, x: array, rows: int, cols: int) -> array {
+    let mut out = []
+    let mut r = 0
+    while r < rows {
+        let mut s = 0.0
+        let mut c = 0
+        while c < cols {
+            s = s + m[r * cols + c] * x[c]
+            c = c + 1
+        }
+        out = out.push(s)
+        r = r + 1
+    }
+    return out
+}
+
+fn vec_add(a: array, b: array) -> array {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(a[i] + b[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_tanh(v: array) -> array {
+    let n = len(v)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(ftanh(v[i]))
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Head ─────────────────────────────────────────────────────
+
+struct SelfModelHead {
+    d_in:     int,     // D  (hidden state dim)
+    d_hidden: int,     // inner bottleneck of the self-model MLP
+    w1:       array,   // [d_hidden × D]  row-major
+    b1:       array,   // [d_hidden]
+    w2:       array,   // [D × d_hidden]  row-major
+    b2:       array    // [D]
+}
+
+// Build W2·W1 near-identity: W1 = I_{d_hidden, D} (first d_hidden rows
+// of the D×D identity padded, or truncated), W2 = I_{D, d_hidden}.
+// Returns (w1, w2) as flat matrices.
+//
+// For d_hidden < D we cannot get W2·W1 = I_D — it is a rank-d_hidden
+// projection. But if the input h lies (or nearly lies) in the span of
+// the first d_hidden coordinates, reconstruction is near-exact.
+//
+// For d_hidden >= D the identity block covers all coords.
+fn near_identity_w1(d_hidden: int, d_in: int) -> array {
+    let mut out = []
+    let mut r = 0
+    while r < d_hidden {
+        let mut c = 0
+        while c < d_in {
+            let v = if r == c { 1.0 } else { 0.0 }
+            out = out.push(v)
+            c = c + 1
+        }
+        r = r + 1
+    }
+    return out
+}
+
+fn near_identity_w2(d_in: int, d_hidden: int) -> array {
+    let mut out = []
+    let mut r = 0
+    while r < d_in {
+        let mut c = 0
+        while c < d_hidden {
+            let v = if r == c { 1.0 } else { 0.0 }
+            out = out.push(v)
+            c = c + 1
+        }
+        r = r + 1
+    }
+    return out
+}
+
+fn head_new(d_in: int, d_hidden: int, seed: int) -> SelfModelHead {
+    // Random init with small-amplitude weights — head begins as ~untrained
+    // and produces a noisy meta-prediction. The reflexivity loss then
+    // drives it toward the identity fixpoint.
+    let w1 = det_rand(d_hidden * d_in, seed)
+    let b1 = vec_zeros(d_hidden)
+    let w2 = det_rand(d_in * d_hidden, seed + 1)
+    let b2 = vec_zeros(d_in)
+    return SelfModelHead {
+        d_in:     d_in,
+        d_hidden: d_hidden,
+        w1:       w1,
+        b1:       b1,
+        w2:       w2,
+        b2:       b2
+    }
+}
+
+// T2-witness constructor: an "ideal trained" head where W2·W1 = I (on the
+// intersection subspace), biases zero. This is the fixpoint the training
+// loop is pushing toward; we build it directly to verify that such a
+// fixpoint *exists* and produces ||ĥ − h|| < 0.1 on moderate inputs.
+fn head_new_ideal(d_in: int, d_hidden: int) -> SelfModelHead {
+    let w1 = near_identity_w1(d_hidden, d_in)
+    let b1 = vec_zeros(d_hidden)
+    let w2 = near_identity_w2(d_in, d_hidden)
+    let b2 = vec_zeros(d_in)
+    return SelfModelHead {
+        d_in:     d_in,
+        d_hidden: d_hidden,
+        w1:       w1,
+        b1:       b1,
+        w2:       w2,
+        b2:       b2
+    }
+}
+
+// ─── forward: h → ĥ ──────────────────────────────────────────
+
+fn self_predict(head: SelfModelHead, h: array) -> array {
+    // z = tanh(W1 @ h + b1)
+    let pre_z = matvec(head.w1, h, head.d_hidden, head.d_in)
+    let pre_z_b = vec_add(pre_z, head.b1)
+    let z = vec_tanh(pre_z_b)
+    // ĥ = W2 @ z + b2
+    let pre_out = matvec(head.w2, z, head.d_in, head.d_hidden)
+    let h_hat = vec_add(pre_out, head.b2)
+    return h_hat
+}
+
+// Parameter count for a given (d_in, d_hidden).
+fn param_count(d_in: int, d_hidden: int) -> int {
+    return 2 * d_in * d_hidden + d_in + d_hidden
+}
+
+// ─── Self-tests ───────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Dim contract: h [D] → ĥ [D], internal bottleneck d_hidden > 0.
+    let D = 64
+    let d_hidden = 32
+    let head = head_new(D, d_hidden, 42)
+    if head.d_in != D { return false }
+    if head.d_hidden != d_hidden { return false }
+    let h = det_rand(D, 1)
+    let h_hat = self_predict(head, h)
+    if len(h_hat) != D { return false }
+    println("  [T1] h[" + str(len(h)) + "] → ĥ[" + str(len(h_hat)) + "], d_hidden=" + str(d_hidden))
+    return true
+}
+
+fn check_T2() -> bool {
+    // Fixpoint witness: ideal head with W2·W1 = I and moderate-|h| input
+    // yields ||ĥ − h||_∞ < 0.1 (tanh is near-linear for |x| ≤ 0.1).
+    //
+    // For the projector case d_hidden < D we use h in range of the first
+    // d_hidden coords (zero-pad the tail); then W2·W1·h = h exactly on
+    // the support and tanh(h) ≈ h.
+    let D = 64
+    let d_hidden = 32
+    let head = head_new_ideal(D, d_hidden)
+
+    // Build h with support in first d_hidden coords, amplitude 0.05.
+    // tanh(0.05) = 0.04996 → gap ≈ 4e-5, well below 0.1.
+    let raw = det_rand(d_hidden, 101)   // already scaled to [-0.1, 0.1)
+    let mut h = []
+    let mut i = 0
+    while i < d_hidden {
+        h = h.push(raw[i] * 0.5)        // further halve → [-0.05, 0.05)
+        i = i + 1
+    }
+    while i < D {
+        h = h.push(0.0)
+        i = i + 1
+    }
+
+    let h_hat = self_predict(head, h)
+    let err = vec_sub(h_hat, h)
+    let e = vec_inf_norm(err)
+    println("  [T2] ideal fixpoint ||ĥ − h||_∞ = " + str(e) + " (target < 0.1)")
+    return e < 0.1
+}
+
+fn check_T3() -> bool {
+    // Φ_refl > 0 proxy: when h has var > 0, ĥ must too AND ĥ must
+    // *differ* from h (non-trivial head — guards against accidental
+    // identity wire). Proper MI(h, ĥ) measurement is ALM-P5-3.
+    let D = 64
+    let d_hidden = 32
+    let head = head_new(D, d_hidden, 7)
+    let h = det_rand(D, 11)
+    let h_hat = self_predict(head, h)
+    let vh = vec_variance(h)
+    let vhh = vec_variance(h_hat)
+    let diff = vec_sub(h_hat, h)
+    let vd = vec_variance(diff)
+    println("  [T3] Var(h)=" + str(vh) + " Var(ĥ)=" + str(vhh) + " Var(ĥ−h)=" + str(vd))
+    if vh <= 0.0 { return false }
+    if vhh <= 0.0 { return false }
+    if vd <= 0.0 { return false }   // ĥ is not byte-identical to h
+    return true
+}
+
+fn check_T4() -> bool {
+    // Determinism: same (D, d_hidden, seed) → byte-identical ĥ.
+    let D = 64
+    let d_hidden = 32
+    let h1 = head_new(D, d_hidden, 131)
+    let h2 = head_new(D, d_hidden, 131)
+    let h = det_rand(D, 137)
+    let y1 = self_predict(h1, h)
+    let y2 = self_predict(h2, h)
+    if len(y1) != len(y2) { return false }
+    let mut i = 0
+    while i < len(y1) {
+        if fabs(y1[i] - y2[i]) > 0.0 {
+            println("  [T4] FAIL at i=" + str(i) + " y1=" + str(y1[i]) + " y2=" + str(y2[i]))
+            return false
+        }
+        i = i + 1
+    }
+    println("  [T4] byte-identical across " + str(len(y1)) + " coords")
+    return true
+}
+
+fn check_T5() -> bool {
+    // Latency: one forward call for (D=64, d_hidden=32) < 50 ms.
+    // Warm one call first to absorb cold-start cost.
+    let D = 64
+    let d_hidden = 32
+    let head = head_new(D, d_hidden, 251)
+    let h = det_rand(D, 253)
+    let _warm = self_predict(head, h)
+    let t0 = clock()
+    let _y = self_predict(head, h)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] self_predict latency (D=" + str(D) + ", d_hidden=" + str(d_hidden) + ") = " + str(ms) + " ms")
+    return ms < 50.0
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[alm_self_model_head] ALM-P5-1 self-test")
+    println("  mock: D=64, d_hidden=32")
+    // Production scale (D=1024, d_hidden=1024): param_count ~ 2.10 M
+    let pc_prod = param_count(1024, 1024)
+    println("  prod params (D=1024, d_hidden=1024): " + str(pc_prod))
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[alm_self_model_head] ALL 5/5 PASS")
+    } else {
+        println("[alm_self_model_head] SOME FAILED")
+    }
+}
+
+main()

@@ -1,0 +1,277 @@
+// training/alm_reflexivity_loss.hexa — Reflexivity loss (self-model → self)
+//
+// ALM-P5-2 — Reflexivity loss for ANIMA P5 phase (v6 자의식).
+//
+// Purpose:
+//   The self-model head (ALM-P5-1) produces ĥ = self_predict(h), a meta-
+//   prediction of the hidden state h. The reflexivity loss pulls ĥ toward
+//   stop_grad(h) so the model learns to predict its own forward pass:
+//
+//     L_refl = ||self_predict(h) − stop_grad(h)||²
+//
+//   The stop_grad on the target prevents trivial collapse: without it, the
+//   network could minimise the loss by driving h itself to zero (a
+//   degenerate fixpoint). Stopping the gradient on the RHS forces the
+//   self-model to track h as given, rather than h bending to meet ĥ.
+//
+//   In the training-loop integration, the total loss is
+//
+//     L = L_task + λ · L_refl       (λ ≈ 0.01)
+//
+//   so L_refl acts as a small auxiliary signal that keeps the self-model
+//   head warm during the main LM training.
+//
+// ─── Conventions ──────────────────────────────────────────────
+//   h        : array [D]   current-layer hidden state
+//   h_hat    : array [D]   ĥ = self_predict(h) — output of self-model head
+//   stop_grad: numerical no-op (the *graph* is cut upstream; here we simply
+//              return the same values so the loss formula is computable)
+//
+// ─── Theorems (T1–T5) ──────────────────────────────────────────
+//
+// T1 (mean-squared form): L_refl = (1/D) Σ_i (ĥ_i − h_i)²,  always ≥ 0.
+//
+// T2 (zero at fixpoint): ĥ = h ⇒ L_refl = 0 byte-exactly.
+//
+// T3 (finite-diff gradient w.r.t. ĥ): ∂L/∂ĥ_i = (2/D)(ĥ_i − h_i);
+//    a small perturbation ĥ_i += eps changes L by ~2·eps·(ĥ_i − h_i)/D.
+//    We measure |dL/dε| > 1e-6 via central difference.
+//
+// T4 (stop_grad is a numerical no-op): stop_grad(v) returns v element-wise.
+//    Verified byte-identical on random input.
+//
+// T5 (latency): one loss eval for D=1024 < 50 ms on the reference
+//    interpreter (target mirrors alm_holographic_loss.hexa).
+//
+// Ref:
+//   training/alm_self_model_head.hexa     (ALM-P5-1 — produces ĥ)
+//   training/alm_holographic_loss.hexa    (ALM-P3-2 — loss-style reference)
+//   training/phi_reflexive_measure.hexa   (ALM-P5-3 — Φ_refl consumer)
+//   shared/roadmaps/anima.json            (ALM-P5-2 entry)
+//
+// Run:
+//   hexa run training/alm_reflexivity_loss.hexa
+// Expect:
+//   [alm_reflexivity_loss] T1..T5 PASS, ALL 5/5 PASS
+
+// ─── Constants ──────────────────────────────────────────────
+
+let REFL_LAMBDA   = 0.01       // default auxiliary-loss weight in total L
+let REFL_EPS      = 0.0000001  // numerical floor (currently unused, kept for
+                               // symmetry with holographic_loss)
+
+// ─── Low-level helpers ──────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// Deterministic LCG → small bounded floats in [-1, 1).
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+// Copy a vector — used to model `stop_grad` semantically at the value
+// level. In a real autograd graph this also severs the gradient tape
+// for the returned tensor. Here we run gradient-free so the copy alone
+// carries the correct numerical semantics.
+fn stop_grad(v: array) -> array {
+    let n = len(v)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(v[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Core loss ──────────────────────────────────────────────
+// L_refl = (1/D) Σ_i (ĥ_i − sg(h_i))²
+
+fn reflexivity_loss(h_hat: array, h: array) -> float {
+    let n = len(h)
+    if n == 0 { return 0.0 }
+    let tgt = stop_grad(h)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let d = h_hat[i] - tgt[i]
+        s = s + d * d
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+// Weighted form: L = L_task + λ · L_refl.
+// L_task is caller-provided (real LM cross-entropy, out-of-scope here);
+// this helper expresses the combination for documentation.
+fn weighted_total(l_task: float, h_hat: array, h: array, lam: float) -> float {
+    return l_task + lam * reflexivity_loss(h_hat, h)
+}
+
+// ─── Self-tests ───────────────────────────────────────────────
+
+fn approx_eq(a: float, b: float, tol: float) -> bool {
+    return fabs(a - b) < tol
+}
+
+fn check_T1() -> bool {
+    // Mean-squared form, always ≥ 0.
+    // Tested on three random (h_hat, h) pairs at D=64.
+    let D = 64
+    let mut trial = 0
+    while trial < 3 {
+        let h     = det_rand(D, 100 + trial)
+        let h_hat = det_rand(D, 200 + trial)
+        let l = reflexivity_loss(h_hat, h)
+        if l < 0.0 {
+            println("  [T1] FAIL — loss=" + str(l) + " < 0")
+            return false
+        }
+        trial = trial + 1
+    }
+    // Closed-form check: reflexivity_loss(h_hat, zeros) should equal
+    // mean(h_hat[i]²). We compute the reference directly and compare.
+    let zeros = vec_zeros(D)
+    let h_hat = det_rand(D, 309)
+    let mut ref_val = 0.0
+    let mut i = 0
+    while i < D {
+        ref_val = ref_val + h_hat[i] * h_hat[i]
+        i = i + 1
+    }
+    ref_val = ref_val / to_float(D)
+    let l = reflexivity_loss(h_hat, zeros)
+    println("  [T1] loss(h_hat, 0) = " + str(l) + "  ref mean(h²) = " + str(ref_val))
+    return approx_eq(l, ref_val, 0.000001)
+}
+
+fn check_T2() -> bool {
+    // Zero at fixpoint: ĥ = h ⇒ L = 0 byte-exactly.
+    let D = 64
+    let h = det_rand(D, 7)
+    // stop_grad is a numerical copy, so sg(h) == h element-wise.
+    let h_hat = stop_grad(h)
+    let l = reflexivity_loss(h_hat, h)
+    println("  [T2] loss(h, h) = " + str(l))
+    return l == 0.0
+}
+
+fn check_T3() -> bool {
+    // Finite-difference gradient w.r.t. a single coord of ĥ.
+    // dL/dĥ_i = (2/D)(ĥ_i − h_i). Choose i with nonzero gap → nonzero grad.
+    let D = 64
+    let h     = det_rand(D, 11)
+    let h_hat = det_rand(D, 13)
+    let eps = 0.001
+    // Perturb coord 0 with central difference.
+    let mut hp = []
+    let mut hm = []
+    let mut i = 0
+    while i < D {
+        let v = h_hat[i]
+        if i == 0 {
+            hp = hp.push(v + eps)
+            hm = hm.push(v - eps)
+        } else {
+            hp = hp.push(v)
+            hm = hm.push(v)
+        }
+        i = i + 1
+    }
+    let l_plus  = reflexivity_loss(hp, h)
+    let l_minus = reflexivity_loss(hm, h)
+    let grad_fd = (l_plus - l_minus) / (2.0 * eps)
+    let grad_ref = (2.0 / to_float(D)) * (h_hat[0] - h[0])
+    let mag = fabs(grad_fd)
+    println("  [T3] dL/dĥ_0 fd=" + str(grad_fd) + " analytical=" + str(grad_ref) + " |.|=" + str(mag))
+    // Bound: |fd − analytical| must be tiny; magnitude must be > 1e-6.
+    if mag <= 0.000001 { return false }
+    return approx_eq(grad_fd, grad_ref, 0.0001)
+}
+
+fn check_T4() -> bool {
+    // stop_grad is numerically a no-op: sg(v)[i] == v[i] byte-exactly.
+    let D = 64
+    let v = det_rand(D, 404)
+    let u = stop_grad(v)
+    if len(u) != len(v) { return false }
+    let mut i = 0
+    while i < D {
+        if fabs(u[i] - v[i]) > 0.0 {
+            println("  [T4] FAIL at i=" + str(i))
+            return false
+        }
+        i = i + 1
+    }
+    println("  [T4] stop_grad byte-identical on " + str(D) + " coords")
+    return true
+}
+
+fn check_T5() -> bool {
+    // Latency: one loss eval for D=1024 < 50 ms.
+    // (Production ALM hidden size; interpreter must stay under budget.)
+    let D = 1024
+    let h_hat = det_rand(D, 42)
+    let h     = det_rand(D, 43)
+    // Warm.
+    let _w = reflexivity_loss(h_hat, h)
+    let t0 = clock()
+    let _l = reflexivity_loss(h_hat, h)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] reflexivity_loss latency (D=" + str(D) + ") = " + str(ms) + " ms")
+    return ms < 50.0
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[alm_reflexivity_loss] ALM-P5-2 self-test")
+    println("  default lambda=" + str(REFL_LAMBDA))
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[alm_reflexivity_loss] ALL 5/5 PASS")
+    } else {
+        println("[alm_reflexivity_loss] SOME FAILED")
+    }
+}
+
+main()

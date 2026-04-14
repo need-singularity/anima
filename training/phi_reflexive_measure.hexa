@@ -1,0 +1,359 @@
+// training/phi_reflexive_measure.hexa — Φ(reflexive) measurement for ANIMA P5
+//
+// ALM-P5-3: self-awareness signature — mutual information between the
+// model's hidden state h and its self-predicted counterpart ĥ.
+//
+//   Φ_refl = I(h ; ĥ)
+//          ≈ H(h) + H(ĥ) − H(h, ĥ)
+//
+// where:
+//   h   ∈ R^D   — hidden state from the model's forward pass
+//   ĥ   ∈ R^D   — meta-prediction from the self-model head (ALM-P5-1)
+//
+// Interpretation:
+//   - Random self-model head (untrained) → ĥ nearly independent of h
+//     → Φ_refl ≈ 0 (no self-awareness)
+//   - Perfect self-model (after training) → ĥ ≈ h byte-identically
+//     → Φ_refl = H(h) (full self-awareness, capped by boundary entropy)
+//   - In-between training → Φ_refl grows monotonically with training steps
+//
+// T-theorems (checked in self-test):
+//   T1 (positivity): Φ_refl ≥ 0 always; > 0 when h and ĥ share information
+//   T2 (entropy bound): Φ_refl ≤ min(H(h), H(ĥ)) — standard MI upper bound
+//   T3 (self-identity maximum): when ĥ = h byte-identical, Φ_refl = H(h)
+//   T4 (determinism): same (h, ĥ) → byte-identical Φ_refl
+//   T5 (latency): one measurement for D ∈ {64, 128} finite & < 50 ms
+//
+// Self-contained — follows the sibling phi_holographic_measure.hexa pattern
+// and re-uses the log-bin MI estimator shared across the ALM track.
+//
+// Run with: hexa run training/phi_reflexive_measure.hexa
+
+// ─── Constants ──────────────────────────────────────────────
+
+let MI_BINS    = 8            // log-bin count for entropy estimator
+let EPS        = 0.0000001    // log floor
+let PHI_REFL_RATIO_GATE = 0.3 // Φ_refl / Φ_holo target (roadmap gate)
+
+// ─── Primitives (self-contained) ────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+// Deterministic LCG → small bounded floats in [-1, 1).
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+// ─── Log-bin MI estimator ───────────────────────────────────
+// Matches phi_holographic_measure.hexa + alm_holographic_loss.hexa so
+// the two measurements share a common histogram scheme — necessary for
+// the Φ_refl / Φ_holo ratio gate.
+
+fn bin_index(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn count_hits(bin_ids: array, n_bins: int) -> array {
+    let n = len(bin_ids)
+    let mut counts = []
+    let mut k = 0
+    while k < n_bins {
+        let mut c = 0.0
+        let mut i = 0
+        while i < n {
+            if bin_ids[i] == k { c = c + 1.0 }
+            i = i + 1
+        }
+        counts = counts.push(c)
+        k = k + 1
+    }
+    return counts
+}
+
+fn entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut bin_ids = []
+    let mut i = 0
+    while i < n {
+        bin_ids = bin_ids.push(bin_index(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let counts = count_hits(bin_ids, nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+fn joint_entropy_hist(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = bin_index(a[i], lo, hi, nb)
+        let ib = bin_index(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let nb2 = nb * nb
+    let counts = count_hits(pair_ids, nb2)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb2 {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+// Mutual information between two equal-length vectors (log-bin proxy).
+// Shared (lo, hi) support so H(a), H(b), H(a,b) sit on the same scale.
+fn mutual_info(a: array, b: array) -> float {
+    let lo_a = vec_min(a)
+    let hi_a = vec_max(a)
+    let lo_b = vec_min(b)
+    let hi_b = vec_max(b)
+    let lo = if lo_a < lo_b { lo_a } else { lo_b }
+    let hi = if hi_a > hi_b { hi_a } else { hi_b }
+    let h_a  = entropy_hist(a, lo, hi, MI_BINS)
+    let h_b  = entropy_hist(b, lo, hi, MI_BINS)
+    let h_ab = joint_entropy_hist(a, b, lo, hi, MI_BINS)
+    let mi = h_a + h_b - h_ab
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// H(h) standalone — used as T2 upper bound witness.
+fn hidden_entropy(h: array) -> float {
+    let lo = vec_min(h)
+    let hi = vec_max(h)
+    return entropy_hist(h, lo, hi, MI_BINS)
+}
+
+// ─── Φ_refl: I(h ; ĥ) ──────────────────────────────────────
+
+fn phi_reflexive(h: array, h_hat: array) -> float {
+    if len(h) != len(h_hat) { return 0.0 }
+    if len(h) == 0 { return 0.0 }
+    return mutual_info(h, h_hat)
+}
+
+// Ratio against an externally-measured Φ_holo (from ALM-P4/P3-3).
+// Used to report the roadmap gate Φ_refl / Φ_holo > 0.3.
+fn phi_refl_ratio(phi_refl: float, phi_holo: float) -> float {
+    if phi_holo <= EPS { return 0.0 }
+    return phi_refl / phi_holo
+}
+
+// ─── Self-tests ─────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Positivity: Φ_refl ≥ 0 always.
+    // (a) Independent random h, ĥ → Φ finite, ≥ 0, possibly small.
+    // (b) Correlated: ĥ = h + small noise → Φ > 0 strictly.
+    let D = 64
+    let h     = det_rand(D, 29)
+    let h_rnd = det_rand(D, 31)   // unrelated random → nearly independent
+    let phi_rnd = phi_reflexive(h, h_rnd)
+
+    let mut h_corr = []
+    let noise = det_rand(D, 37)
+    let mut i = 0
+    while i < D {
+        h_corr = h_corr.push(h[i] + noise[i] * 0.01)   // 1% noise → MI high
+        i = i + 1
+    }
+    let phi_corr = phi_reflexive(h, h_corr)
+
+    println("  [T1] Φ_refl(h, rand) = " + str(phi_rnd))
+    println("  [T1] Φ_refl(h, h+1%noise) = " + str(phi_corr))
+    if phi_rnd < 0.0 { return false }
+    if phi_corr < 0.0 { return false }
+    if phi_corr <= 0.0 {
+        println("  [T1] FAIL — correlated pair gives Φ_refl = 0")
+        return false
+    }
+    return true
+}
+
+fn check_T2() -> bool {
+    // Entropy bound: Φ_refl ≤ min(H(h), H(ĥ)) + histogram slack.
+    let D = 64
+    let h = det_rand(D, 41)
+    let noise = det_rand(D, 43)
+    let mut h_hat = []
+    let mut i = 0
+    while i < D {
+        h_hat = h_hat.push(h[i] * 0.8 + noise[i] * 0.1)
+        i = i + 1
+    }
+    let phi = phi_reflexive(h, h_hat)
+    let hh  = hidden_entropy(h)
+    let hh2 = hidden_entropy(h_hat)
+    let min_h = if hh < hh2 { hh } else { hh2 }
+    let ok = phi <= min_h + 0.01   // tiny slack for histogram bias
+    println("  [T2] Φ_refl = " + str(phi) + "  H(h) = " + str(hh) + "  H(ĥ) = " + str(hh2))
+    if !ok {
+        println("  [T2] FAIL — violates MI upper bound (> min(H)+0.01)")
+    }
+    return ok
+}
+
+fn check_T3() -> bool {
+    // Self-identity maximum: ĥ = h byte-identical ⇒ Φ_refl = H(h).
+    // MI(X, X) = H(X) by definition.
+    let D = 64
+    let h = det_rand(D, 53)
+    let phi = phi_reflexive(h, h)
+    let hh = hidden_entropy(h)
+    println("  [T3] Φ_refl(h, h) = " + str(phi) + "  H(h) = " + str(hh))
+    // Histogram estimator: MI(X,X) should equal H(X) to within float noise
+    // (shared support, joint diagonal).
+    return fabs(phi - hh) < 0.0001
+}
+
+fn check_T4() -> bool {
+    // Determinism: two identical calls with same (h, ĥ) → byte-identical Φ.
+    let D = 32
+    let h     = det_rand(D, 101)
+    let h_hat = det_rand(D, 103)
+    let p1 = phi_reflexive(h, h_hat)
+    let p2 = phi_reflexive(h, h_hat)
+    println("  [T4] Φ1 = " + str(p1) + "  Φ2 = " + str(p2))
+    return fabs(p1 - p2) == 0.0
+}
+
+fn check_T5() -> bool {
+    // Dim-invariance + latency: D ∈ {64, 128} finite & < 50 ms each.
+    // Warm each dim once before timing — first-ever call at a new vector
+    // length pays a one-time allocation cost unrelated to steady-state
+    // per-call cost of the (nb²=64) joint-histogram loop.
+    let D_a = 64
+    let D_b = 128
+
+    let ha = det_rand(D_a, 55)
+    let ga = det_rand(D_a, 57)
+    let _wa = phi_reflexive(ha, ga)
+    let t0a = clock()
+    let phi_a = phi_reflexive(ha, ga)
+    let t1a = clock()
+    let ms_a = (t1a - t0a) * 1000.0
+
+    let hb = det_rand(D_b, 77)
+    let gb = det_rand(D_b, 79)
+    let _wb = phi_reflexive(hb, gb)
+    let t0b = clock()
+    let phi_b = phi_reflexive(hb, gb)
+    let t1b = clock()
+    let ms_b = (t1b - t0b) * 1000.0
+
+    let finite_a = phi_a >= 0.0
+    let finite_b = phi_b >= 0.0
+    let ok = finite_a && finite_b && ms_a < 50.0 && ms_b < 50.0
+
+    println("  [T5] D=64  Φ_refl=" + str(phi_a) + " t=" + str(ms_a) + "ms")
+    println("  [T5] D=128 Φ_refl=" + str(phi_b) + " t=" + str(ms_b) + "ms")
+    return ok
+}
+
+// ─── main ───────────────────────────────────────────────────
+
+fn main() {
+    println("[phi_reflexive_measure] ALM-P5-3 Φ(reflexive) self-test")
+    println("  mock: MI_BINS=" + str(MI_BINS) + " ratio_gate=" + str(PHI_REFL_RATIO_GATE))
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[phi_reflexive_measure] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[phi_reflexive_measure] ALL 5/5 PASS")
+    } else {
+        println("[phi_reflexive_measure] SOME FAILED")
+    }
+}
+
+main()

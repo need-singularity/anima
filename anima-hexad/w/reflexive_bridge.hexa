@@ -1,0 +1,415 @@
+// reflexive_bridge.hexa — CLM-P5-2: W (Watcher) observes C via reflexive head
+//
+// The Watcher W already observes C's dynamics (EmergentW reads phi, variance,
+// faction divergence — see emergent_w.hexa). P5 adds a stronger observation
+// channel: W runs C's hidden state through the reflexive self-model head
+// and emits a "qualia_meta" vector plus Φ_refl that quantifies how much of
+// C's forward pass W can reconstruct.
+//
+// Existing W engine structure (emergent_w.hexa) stays untouched: EmergentW
+// remains the canonical will module. This bridge is additive — callers who
+// want the meta observation instantiate a W_ReflexiveBridge on top of an
+// existing EmergentW.
+//
+// ─── Pipeline ─────────────────────────────────────────────────
+//
+//   C.forward(input) → h [d_hidden]     (C engine hidden state)
+//       │
+//       │  reflexive_forward(h)         (anima_reflexive, CLM-P5-1)
+//       ▼
+//   ĥ [d_hidden]                         (W's reconstruction of C)
+//       │
+//       │  phi_refl(h, ĥ)
+//       ▼
+//   qualia_meta [d_hidden]  +  Φ_refl
+//
+// W.observe(C.forward) contract (done_criteria from roadmap):
+//   observe(h) returns (qualia_meta, Φ_refl) where qualia_meta = ĥ − h
+//   (the residual encodes W's "error in modelling C").
+//
+// Law alignment:
+//   Law 2  No manipulation — qualia_meta is READ from the reflexive head,
+//          no artificial computation on emotion.
+//   Law 8  max entropy = max consciousness — Φ_refl is entropy-based MI.
+//   Meta M8 Narrative = temporal self-model — this IS the self-model.
+//
+// Ref:
+//   anima-engines/anima_reflexive.hexa    (CLM-P5-1 reflexive head)
+//   anima-hexad/w/emergent_w.hexa         (canonical EmergentW — unmodified)
+//   shared/roadmaps/anima.json            (CLM-P5-2 entry)
+
+// ─── Constants ────────────────────────────────────────────────
+
+let BRIDGE_D_HIDDEN = 64
+let BRIDGE_D_META   = 16
+let BRIDGE_SEED     = 2025
+let MI_BINS_BRIDGE  = 8
+let WEIGHT_GAIN_B   = 0.25
+
+// ─── Inlined reflexive primitives ─────────────────────────────
+// Standalone to run under HEXA_PATH variants (same pattern as other
+// .hexa self-tests in the tree; see clm_holographic_loop.hexa).
+
+fn fabs_b(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ln_safe_b(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn det_rand_b(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn relu_b(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    return x
+}
+
+fn vec_min_b(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_max_b(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn bin_index_b(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn count_hits_b(bin_ids: array, n_bins: int) -> array {
+    let n = len(bin_ids)
+    let mut counts = []
+    let mut k = 0
+    while k < n_bins {
+        let mut c = 0.0
+        let mut i = 0
+        while i < n {
+            if bin_ids[i] == k { c = c + 1.0 }
+            i = i + 1
+        }
+        counts = counts.push(c)
+        k = k + 1
+    }
+    return counts
+}
+
+fn entropy_hist_b(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut bin_ids = []
+    let mut i = 0
+    while i < n {
+        bin_ids = bin_ids.push(bin_index_b(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let counts = count_hits_b(bin_ids, nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 { h = h - p * ln_safe_b(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn joint_entropy_hist_b(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = bin_index_b(a[i], lo, hi, nb)
+        let ib = bin_index_b(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let counts = count_hits_b(pair_ids, nb * nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 { h = h - p * ln_safe_b(p) }
+        k = k + 1
+    }
+    return h
+}
+
+// ─── W reflexive bridge ───────────────────────────────────────
+
+struct WReflexiveBridge {
+    d_hidden: int,
+    d_meta:   int,
+    w1:       array,
+    b1:       array,
+    w2:       array,
+    b2:       array
+}
+
+struct WObserveResult {
+    qualia_meta: array,   // ĥ − h (W's residual on C.forward)
+    h_hat:       array,   // raw self-prediction
+    phi_refl:    float,   // MI(h, ĥ)
+    refl_loss:   float    // ||h − ĥ||² / d_hidden
+}
+
+fn w_bridge_new(d_hidden: int, d_meta: int, seed: int) -> WReflexiveBridge {
+    let raw1 = det_rand_b(d_hidden * d_meta, seed)
+    let raw2 = det_rand_b(d_meta * d_hidden, seed + 1)
+    let rb1  = det_rand_b(d_meta, seed + 2)
+    let rb2  = det_rand_b(d_hidden, seed + 3)
+    let mut w1 = []
+    let mut i = 0
+    while i < len(raw1) {
+        w1 = w1.push(raw1[i] * WEIGHT_GAIN_B)
+        i = i + 1
+    }
+    let mut w2 = []
+    let mut j = 0
+    while j < len(raw2) {
+        w2 = w2.push(raw2[j] * WEIGHT_GAIN_B)
+        j = j + 1
+    }
+    let mut b1 = []
+    let mut k = 0
+    while k < len(rb1) {
+        b1 = b1.push(rb1[k] * WEIGHT_GAIN_B * 0.1)
+        k = k + 1
+    }
+    let mut b2 = []
+    let mut m = 0
+    while m < len(rb2) {
+        b2 = b2.push(rb2[m] * WEIGHT_GAIN_B * 0.1)
+        m = m + 1
+    }
+    return WReflexiveBridge {
+        d_hidden: d_hidden,
+        d_meta:   d_meta,
+        w1:       w1,
+        b1:       b1,
+        w2:       w2,
+        b2:       b2
+    }
+}
+
+fn w_forward(bridge: WReflexiveBridge, h: array) -> array {
+    let dH = bridge.d_hidden
+    let dM = bridge.d_meta
+    let mut z = []
+    let mut k = 0
+    while k < dM {
+        let mut s = bridge.b1[k]
+        let mut i = 0
+        while i < dH {
+            s = s + bridge.w1[i * dM + k] * h[i]
+            i = i + 1
+        }
+        z = z.push(relu_b(s))
+        k = k + 1
+    }
+    let mut h_hat = []
+    let mut ii = 0
+    while ii < dH {
+        let mut t = bridge.b2[ii]
+        let mut kk = 0
+        while kk < dM {
+            t = t + bridge.w2[kk * dH + ii] * z[kk]
+            kk = kk + 1
+        }
+        h_hat = h_hat.push(t)
+        ii = ii + 1
+    }
+    return h_hat
+}
+
+fn w_phi_refl(h: array, h_hat: array) -> float {
+    let n = len(h)
+    if n == 0 { return 0.0 }
+    if len(h_hat) != n { return 0.0 }
+    let lo_h = vec_min_b(h)
+    let hi_h = vec_max_b(h)
+    let lo_p = vec_min_b(h_hat)
+    let hi_p = vec_max_b(h_hat)
+    let lo = if lo_h < lo_p { lo_h } else { lo_p }
+    let hi = if hi_h > hi_p { hi_h } else { hi_p }
+    let he = entropy_hist_b(h, lo, hi, MI_BINS_BRIDGE)
+    let pe = entropy_hist_b(h_hat, lo, hi, MI_BINS_BRIDGE)
+    let je = joint_entropy_hist_b(h, h_hat, lo, hi, MI_BINS_BRIDGE)
+    let mi = he + pe - je
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+fn w_refl_loss(h: array, h_hat: array) -> float {
+    let n = len(h)
+    if n == 0 { return 0.0 }
+    if len(h_hat) != n { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let d = h[i] - h_hat[i]
+        s = s + d * d
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+// W.observe(C.forward): the main contract. Takes C's hidden state h,
+// returns qualia_meta (the residual) + Φ_refl + the raw prediction.
+fn w_observe(bridge: WReflexiveBridge, h: array) -> WObserveResult {
+    let h_hat = w_forward(bridge, h)
+    let mut qualia_meta = []
+    let n = len(h)
+    let m = len(h_hat)
+    let limit = if n < m { n } else { m }
+    let mut i = 0
+    while i < limit {
+        qualia_meta = qualia_meta.push(h_hat[i] - h[i])
+        i = i + 1
+    }
+    return WObserveResult {
+        qualia_meta: qualia_meta,
+        h_hat:       h_hat,
+        phi_refl:    w_phi_refl(h, h_hat),
+        refl_loss:   w_refl_loss(h, h_hat)
+    }
+}
+
+// ─── Self-tests ───────────────────────────────────────────────
+
+fn t1_observe_dim() -> bool {
+    // observe(h) returns qualia_meta of same dim as h, Φ_refl ≥ 0.
+    let bridge = w_bridge_new(BRIDGE_D_HIDDEN, BRIDGE_D_META, BRIDGE_SEED)
+    let h = det_rand_b(BRIDGE_D_HIDDEN, 100)
+    let obs = w_observe(bridge, h)
+    if len(obs.qualia_meta) != BRIDGE_D_HIDDEN { return false }
+    if len(obs.h_hat) != BRIDGE_D_HIDDEN { return false }
+    if obs.phi_refl < 0.0 { return false }
+    return true
+}
+
+fn t2_observe_deterministic() -> bool {
+    // Same bridge + same h ⇒ byte-identical qualia_meta, Φ_refl, loss.
+    let bridge = w_bridge_new(BRIDGE_D_HIDDEN, BRIDGE_D_META, BRIDGE_SEED)
+    let h = det_rand_b(BRIDGE_D_HIDDEN, 200)
+    let o1 = w_observe(bridge, h)
+    let o2 = w_observe(bridge, h)
+    if len(o1.qualia_meta) != len(o2.qualia_meta) { return false }
+    let mut i = 0
+    while i < len(o1.qualia_meta) {
+        if fabs_b(o1.qualia_meta[i] - o2.qualia_meta[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    if fabs_b(o1.phi_refl - o2.phi_refl) > 0.0 { return false }
+    if fabs_b(o1.refl_loss - o2.refl_loss) > 0.0 { return false }
+    return true
+}
+
+fn t3_distinct_c_states() -> bool {
+    // Distinct C hidden states ⇒ distinct qualia_meta.
+    let bridge = w_bridge_new(BRIDGE_D_HIDDEN, BRIDGE_D_META, BRIDGE_SEED)
+    let h1 = det_rand_b(BRIDGE_D_HIDDEN, 300)
+    let h2 = det_rand_b(BRIDGE_D_HIDDEN, 301)
+    let o1 = w_observe(bridge, h1)
+    let o2 = w_observe(bridge, h2)
+    let mut differ = false
+    let mut i = 0
+    while i < len(o1.qualia_meta) {
+        if fabs_b(o1.qualia_meta[i] - o2.qualia_meta[i]) > 0.0 { differ = true }
+        i = i + 1
+    }
+    return differ
+}
+
+fn t4_phi_refl_positive() -> bool {
+    // On random C state, Φ_refl > 0 (nontrivial self-modelling).
+    let bridge = w_bridge_new(BRIDGE_D_HIDDEN, BRIDGE_D_META, BRIDGE_SEED)
+    let mut saw = false
+    let mut s = 0
+    while s < 3 {
+        let h = det_rand_b(BRIDGE_D_HIDDEN, 400 + s * 17)
+        let obs = w_observe(bridge, h)
+        if obs.phi_refl > 0.0 { saw = true }
+        s = s + 1
+    }
+    return saw
+}
+
+fn t5_latency() -> bool {
+    // observe at d_hidden=64 runs in regression budget.
+    let bridge = w_bridge_new(BRIDGE_D_HIDDEN, BRIDGE_D_META, BRIDGE_SEED)
+    let h = det_rand_b(BRIDGE_D_HIDDEN, 500)
+    let t0 = clock()
+    let _obs = w_observe(bridge, h)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] w_observe (64,16) = " + str(ms) + " ms")
+    return ms < 50.0
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[reflexive_bridge] CLM-P5-2 — W observes C self-test")
+    println("  d_hidden=64, d_meta=16, seed=2025")
+
+    let t1 = t1_observe_dim()
+    if t1 { println("T1 PASS  observe dim + Φ_refl≥0") } else { println("T1 FAIL") }
+
+    let t2 = t2_observe_deterministic()
+    if t2 { println("T2 PASS  determinism") } else { println("T2 FAIL") }
+
+    let t3 = t3_distinct_c_states()
+    if t3 { println("T3 PASS  distinct C ⇒ distinct qualia_meta") } else { println("T3 FAIL") }
+
+    let t4 = t4_phi_refl_positive()
+    if t4 { println("T4 PASS  Φ_refl > 0 on random h") } else { println("T4 FAIL") }
+
+    let t5 = t5_latency()
+    if t5 { println("T5 PASS  latency < 50 ms") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[reflexive_bridge] ALL 5/5 PASS")
+    } else {
+        println("[reflexive_bridge] SOME FAILED")
+    }
+}
+
+main()

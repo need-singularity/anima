@@ -1,0 +1,447 @@
+// anima_reflexive.hexa — CLM-P5-1 CPU native self-model engine (v6 reflexivity)
+//
+// Hofstadter "strange loop": the model observes its own forward pass.
+// A 2-layer MLP head predicts hidden state ĥ from the same hidden h
+// (teacher-forced stop-grad target). The reflexivity loss
+//   L_refl = ||h − ĥ||² / d_hidden
+// measures how well the model self-models its own activations; the
+// mutual-information proxy Φ_refl measures how much of h is encoded
+// in ĥ (analogue of Φ_holo but on the self-reference channel).
+//
+// ─── Architecture ─────────────────────────────────────────────
+//
+//   h [d_hidden]                  (observed hidden state)
+//       │
+//       │  W1 [d_hidden × d_meta]  bias b1 [d_meta]
+//       ▼
+//   z = relu(W1·h + b1)           (bottleneck meta code, d_meta < d_hidden)
+//       │
+//       │  W2 [d_meta × d_hidden]  bias b2 [d_hidden]
+//       ▼
+//   ĥ = W2·z + b2                 (reconstructed hidden)
+//
+// Weights are deterministic-seeded; this engine is a measurement head,
+// not a trained model. Training-time feedback (gradient on the ALM
+// track) is in training/alm_reflexivity_loss.hexa (P5-2 ALM).
+//
+// ─── Theorems (T1–T5) ─────────────────────────────────────────
+//
+// T1 (dim contract):
+//   reflexive_forward(h: d_hidden) returns ĥ of dim d_hidden;
+//   internal bottleneck d_meta strictly smaller (d_meta < d_hidden)
+//   so the map is lossy (non-trivial compression).
+//
+// T2 (bounded residual):
+//   For unit-scaled h (||h||∞ ≤ 1), reflexive_loss(h, ĥ) is finite
+//   and non-negative across a sweep of seeds.
+//
+// T3 (Φ_refl positive, bounded):
+//   0 < Φ_refl(h, ĥ) ≤ H(h) + eps on random h with nontrivial
+//   entropy (MI cannot exceed source entropy).
+//
+// T4 (determinism):
+//   Same engine + same h ⇒ byte-identical ĥ and byte-identical
+//   reflexive_loss / Φ_refl.
+//
+// T5 (latency):
+//   reflexive_forward for d_hidden=128, d_meta=32 < 50 ms on hexa
+//   interpreter. Physical self-reference is ns-scale; this is a
+//   regression guard, not the real latency claim.
+//
+// Ref:
+//   anima-engines/anima_holographic.hexa   (head/encode pattern)
+//   training/alm_holographic_loss.hexa     (MI estimator pattern)
+//   shared/roadmaps/anima.json             (CLM-P5-1 entry)
+
+// ─── Constants ────────────────────────────────────────────────
+
+let DEFAULT_D_HIDDEN = 128
+let DEFAULT_D_META   = 32
+let MI_BINS          = 8
+let WEIGHT_GAIN      = 0.25
+
+// ─── Primitives ───────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn det_rand(n: int, seed: int) -> array {
+    // LCG uniform in [-1, 1)
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn relu(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    return x
+}
+
+fn vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn bin_index(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn count_hits(bin_ids: array, n_bins: int) -> array {
+    let n = len(bin_ids)
+    let mut counts = []
+    let mut k = 0
+    while k < n_bins {
+        let mut c = 0.0
+        let mut i = 0
+        while i < n {
+            if bin_ids[i] == k { c = c + 1.0 }
+            i = i + 1
+        }
+        counts = counts.push(c)
+        k = k + 1
+    }
+    return counts
+}
+
+fn entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut bin_ids = []
+    let mut i = 0
+    while i < n {
+        bin_ids = bin_ids.push(bin_index(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let counts = count_hits(bin_ids, nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 { h = h - p * ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn joint_entropy_hist(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = bin_index(a[i], lo, hi, nb)
+        let ib = bin_index(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let counts = count_hits(pair_ids, nb * nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 { h = h - p * ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+// ─── Reflexive self-model head ────────────────────────────────
+// Two-layer MLP: h [d_hidden] -> z [d_meta] -> ĥ [d_hidden].
+// W1: row-major [d_hidden × d_meta] flat (row i slot k = W1[i*d_meta+k])
+// W2: row-major [d_meta × d_hidden] flat (row k slot i = W2[k*d_hidden+i])
+
+struct ReflexiveHead {
+    d_hidden: int,
+    d_meta:   int,
+    w1:       array,   // [d_hidden * d_meta]
+    b1:       array,   // [d_meta]
+    w2:       array,   // [d_meta * d_hidden]
+    b2:       array    // [d_hidden]
+}
+
+fn reflexive_new(d_hidden: int, d_meta: int, seed: int) -> ReflexiveHead {
+    if d_meta >= d_hidden {
+        println("[reflexive] WARN d_meta>=d_hidden, bottleneck trivial")
+    }
+    let raw1 = det_rand(d_hidden * d_meta, seed)
+    let raw2 = det_rand(d_meta * d_hidden, seed + 1)
+    let rb1  = det_rand(d_meta, seed + 2)
+    let rb2  = det_rand(d_hidden, seed + 3)
+    let mut w1 = []
+    let mut i = 0
+    while i < len(raw1) {
+        w1 = w1.push(raw1[i] * WEIGHT_GAIN)
+        i = i + 1
+    }
+    let mut w2 = []
+    let mut j = 0
+    while j < len(raw2) {
+        w2 = w2.push(raw2[j] * WEIGHT_GAIN)
+        j = j + 1
+    }
+    // Scale biases smaller so ĥ ≈ W2·relu(W1·h) when h nontrivial.
+    let mut b1 = []
+    let mut k = 0
+    while k < len(rb1) {
+        b1 = b1.push(rb1[k] * WEIGHT_GAIN * 0.1)
+        k = k + 1
+    }
+    let mut b2 = []
+    let mut m = 0
+    while m < len(rb2) {
+        b2 = b2.push(rb2[m] * WEIGHT_GAIN * 0.1)
+        m = m + 1
+    }
+    return ReflexiveHead {
+        d_hidden: d_hidden,
+        d_meta:   d_meta,
+        w1:       w1,
+        b1:       b1,
+        w2:       w2,
+        b2:       b2
+    }
+}
+
+// reflexive_forward: h [d_hidden] → ĥ [d_hidden] (same dim).
+// The meta bottleneck z [d_meta] is internal; the caller only sees ĥ.
+fn reflexive_forward(head: ReflexiveHead, h: array) -> array {
+    let dH = head.d_hidden
+    let dM = head.d_meta
+    // Layer 1: z = relu(W1·h + b1)
+    let mut z = []
+    let mut k = 0
+    while k < dM {
+        let mut s = head.b1[k]
+        let mut i = 0
+        while i < dH {
+            s = s + head.w1[i * dM + k] * h[i]
+            i = i + 1
+        }
+        z = z.push(relu(s))
+        k = k + 1
+    }
+    // Layer 2: ĥ = W2·z + b2
+    let mut h_hat = []
+    let mut ii = 0
+    while ii < dH {
+        let mut t = head.b2[ii]
+        let mut kk = 0
+        while kk < dM {
+            t = t + head.w2[kk * dH + ii] * z[kk]
+            kk = kk + 1
+        }
+        h_hat = h_hat.push(t)
+        ii = ii + 1
+    }
+    return h_hat
+}
+
+// reflexive_loss: mean squared error per dim between h and ĥ.
+// stop_grad target convention — caller must pass the detached h.
+fn reflexive_loss(h: array, h_hat: array) -> float {
+    let n = len(h)
+    if n == 0 { return 0.0 }
+    if len(h_hat) != n { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let d = h[i] - h_hat[i]
+        s = s + d * d
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+// Φ_refl: MI proxy between h and ĥ over shared binning.
+// 0 ≤ Φ_refl ≤ H(h) + eps (information bound).
+fn phi_refl(h: array, h_hat: array) -> float {
+    let n = len(h)
+    if n == 0 { return 0.0 }
+    if len(h_hat) != n { return 0.0 }
+    let lo_h = vec_min(h)
+    let hi_h = vec_max(h)
+    let lo_p = vec_min(h_hat)
+    let hi_p = vec_max(h_hat)
+    let lo = if lo_h < lo_p { lo_h } else { lo_p }
+    let hi = if hi_h > hi_p { hi_h } else { hi_p }
+    let h_ent = entropy_hist(h, lo, hi, MI_BINS)
+    let p_ent = entropy_hist(h_hat, lo, hi, MI_BINS)
+    let j_ent = joint_entropy_hist(h, h_hat, lo, hi, MI_BINS)
+    let mi = h_ent + p_ent - j_ent
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ─── Self-tests ───────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Dim contract: forward preserves d_hidden; bottleneck < d_hidden.
+    let d_h = 64
+    let d_m = 16
+    let head = reflexive_new(d_h, d_m, 1)
+    let h = det_rand(d_h, 100)
+    let h_hat = reflexive_forward(head, h)
+    if len(h_hat) != d_h { return false }
+    if head.d_meta >= head.d_hidden { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // Bounded residual: reflexive_loss finite & non-negative across seeds.
+    let d_h = 64
+    let d_m = 16
+    let mut ok = true
+    let mut s = 0
+    while s < 4 {
+        let head = reflexive_new(d_h, d_m, 10 + s * 7)
+        let h = det_rand(d_h, 200 + s)
+        let h_hat = reflexive_forward(head, h)
+        let l = reflexive_loss(h, h_hat)
+        if l < 0.0 { ok = false }
+        // finite: in hexa, NaN would propagate; check sane upper bound
+        if l > 1000.0 { ok = false }
+        s = s + 1
+    }
+    return ok
+}
+
+fn check_T3() -> bool {
+    // Φ_refl > 0 on nontrivial h, bounded by H(h) + eps.
+    let d_h = 64
+    let d_m = 16
+    let head = reflexive_new(d_h, d_m, 21)
+    let mut saw_positive = false
+    let mut bounded = true
+    let mut s = 0
+    while s < 3 {
+        let h = det_rand(d_h, 400 + s * 13)
+        let h_hat = reflexive_forward(head, h)
+        let pr = phi_refl(h, h_hat)
+        let lo = vec_min(h)
+        let hi = vec_max(h)
+        let hh = entropy_hist(h, lo, hi, MI_BINS)
+        if pr > 0.0 { saw_positive = true }
+        if pr > hh + 0.0001 { bounded = false }
+        s = s + 1
+    }
+    return saw_positive && bounded
+}
+
+fn check_T4() -> bool {
+    // Determinism: same head + same h ⇒ byte-identical ĥ and loss and Φ_refl.
+    let d_h = 64
+    let d_m = 16
+    let head = reflexive_new(d_h, d_m, 31)
+    let h = det_rand(d_h, 600)
+    let r1 = reflexive_forward(head, h)
+    let r2 = reflexive_forward(head, h)
+    if len(r1) != len(r2) { return false }
+    let mut i = 0
+    while i < len(r1) {
+        if fabs(r1[i] - r2[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    let l1 = reflexive_loss(h, r1)
+    let l2 = reflexive_loss(h, r2)
+    if fabs(l1 - l2) > 0.0 { return false }
+    let p1 = phi_refl(h, r1)
+    let p2 = phi_refl(h, r2)
+    if fabs(p1 - p2) > 0.0 { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // Latency guard: d_hidden=128, d_meta=32 forward < 50 ms.
+    let d_h = 128
+    let d_m = 32
+    let head = reflexive_new(d_h, d_m, 42)
+    let h = det_rand(d_h, 777)
+    let t0 = clock()
+    let h_hat = reflexive_forward(head, h)
+    let _l = reflexive_loss(h, h_hat)
+    let _p = phi_refl(h, h_hat)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] reflexive_forward (128,32) = " + str(ms) + " ms")
+    return ms < 50.0
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[anima_reflexive] CLM-P5-1 self-test")
+    println("  d_hidden=64, d_meta=16 (T1-T4); d_hidden=128, d_meta=32 (T5)")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[anima_reflexive] ALL 5/5 PASS")
+    } else {
+        println("[anima_reflexive] SOME FAILED")
+    }
+}
+
+main()

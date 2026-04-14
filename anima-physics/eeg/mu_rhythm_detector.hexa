@@ -1,0 +1,317 @@
+// mu_rhythm_detector.hexa — PHYS-P5-3 EEG mu-rhythm self-referential detection
+//
+// Roadmap: shared/roadmaps/anima.json P5 PHYSICS track, PHYS-P5-3
+//   "EEG mu-rhythm — self-referential 뇌파 감지"
+//
+// Purpose:
+//   Detect the 8–12 Hz mu rhythm in a synthetic EEG window — and
+//   specifically quantify its *suppression* (event-related
+//   desynchronization, ERD). The mu rhythm is the canonical EEG
+//   self-referential signature: when a subject observes, imagines,
+//   or performs a self-directed action, sensorimotor-cortex mu
+//   power *drops* (mirror-neuron activation). This self-awareness
+//   signature is the EEG analogue of PHYS-P5's reflexivity goal.
+//
+// Pipeline:
+//   1. Synthetic EEG generator —
+//        x(t) = A_mu · cos(2π·f_mu·t + φ) · gate(t)
+//             + A_noise · pseudo_random(t)
+//             + A_beta · cos(2π·f_beta·t)      [distractor, 18 Hz]
+//      where gate(t) = 1 during baseline, suppressed during "action"
+//      window. All synthesis is deterministic (LCG noise).
+//
+//   2. Bandpass filter (Goertzel algorithm at mu center frequency):
+//        Computes spectral power at f_mu = 10 Hz precisely over the
+//        input window. Goertzel is O(N) and matches what you'd run
+//        on an ESP32 / STM32 DSP — no FFT needed.
+//
+//   3. Suppression score:
+//        score = 1 − P_action_window / P_baseline_window
+//        clamped to [0, 1]. High score (→1) means strong mu
+//        suppression → self-referential activity detected.
+//
+// Exposed API (roadmap spec):
+//   detect_mu_suppression(eeg_window: [float]) -> float
+//     Returns a score in [0, 1]. The input window is split into
+//     first-half (baseline) and second-half (action) internally.
+//
+// Self-test (PASS/FAIL):
+//   T1 generated baseline (pure mu) has large detectable power
+//   T2 action-only window has smaller mu power than baseline-only
+//   T3 detect_mu_suppression gives HIGH score on a suppressed window
+//   T4 detect_mu_suppression gives LOW score on a non-suppressed window
+//   T5 API contract — accepts any list, never crashes, clamps output
+//   T6 determinism — two calls with same input give identical output
+//
+// Hexa constraints honored:
+//   - HEXA-FIRST (pure .hexa)
+//   - lists pass-by-value; helper fns that consume [float] return a
+//     scalar summary instead of mutating
+//   - no string subscripting on multibyte content
+//   - Goertzel uses only sin/cos/arithmetic (all verified available)
+
+// ═══════════════════════════════════════════════════════════════
+// Constants — physiological + DSP parameters
+// ═══════════════════════════════════════════════════════════════
+
+let FS_HZ        = 256.0         // sampling rate (typical consumer EEG)
+let F_MU         = 10.0          // mu rhythm center (8–12 Hz band; pick 10)
+let F_BETA_DIST  = 18.0          // distractor band (beta — should NOT trigger)
+let PI           = 3.141592653589793
+let TWO_PI       = 6.283185307179586
+
+// Synthesis amplitudes
+let A_MU         = 1.0           // mu amplitude when active
+let A_MU_SUPP    = 0.15          // suppressed mu amplitude (≈85% ERD)
+let A_NOISE      = 0.10          // broadband noise
+let A_BETA       = 0.30          // distractor amplitude
+
+// Test window length
+let WIN_N        = 512           // 2 seconds at 256 Hz
+
+// Noise LCG seed (deterministic)
+let NOISE_SEED   = 20260415
+
+// Suppression score clamp
+let SCORE_LO     = 0.0
+let SCORE_HI     = 1.0
+
+// ═══════════════════════════════════════════════════════════════
+// Scalar helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn clamp(x: float, lo: float, hi: float) -> float {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+// LCG PRNG — identical to anima-physics/verify_7cond_hw.hexa
+fn lcg_next(s: int) -> int {
+    return (s * 1103515245 + 12345) % 2147483648
+}
+
+// LCG float in [-0.5, 0.5)
+fn lcg_unit_signed(s: int) -> float {
+    let x = lcg_next(s)
+    let u = to_float(x % 1000000) / 1000000.0
+    return u - 0.5
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Goertzel power at `f_target` over samples [i_lo, i_hi)
+//
+// Standard Goertzel:
+//   ω  = 2π · f / fs
+//   k  = cos(ω) ,   coeff = 2·k
+//   s0, s1 initialized 0
+//   for each x in window:
+//       s = x + coeff·s0 − s1
+//       s1 = s0 ;  s0 = s
+//   power = s0² + s1² − coeff·s0·s1
+//
+// Returns power in arbitrary units (proportional to |FFT(f_target)|²).
+// ═══════════════════════════════════════════════════════════════
+
+fn goertzel_power(signal: [float], i_lo: int, i_hi: int, f_target: float, fs: float) -> float {
+    if i_lo < 0 { return 0.0 }
+    if i_hi > len(signal) { return 0.0 }
+    if i_hi <= i_lo { return 0.0 }
+    let omega = TWO_PI * f_target / fs
+    let coeff = 2.0 * cos(omega)
+    let mut s0 = 0.0
+    let mut s1 = 0.0
+    let mut i = i_lo
+    while i < i_hi {
+        let x = signal[i]
+        let s = x + coeff * s0 - s1
+        s1 = s0
+        s0 = s
+        i = i + 1
+    }
+    let power = s0 * s0 + s1 * s1 - coeff * s0 * s1
+    if power < 0.0 { return 0.0 }
+    return power
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Synthetic EEG generator
+//
+//   gate_supp(t) — 1 when t < N/2 (baseline), A_MU_SUPP/A_MU ratio
+//                  when t >= N/2 (action window has suppressed mu)
+//   signal(t) = A_i · cos(2π·f_mu·t/fs + φ)
+//             + A_BETA · cos(2π·f_beta·t/fs)
+//             + A_NOISE · noise(t)
+//
+// `suppressed` flag toggles whether the second half shows ERD.
+// ═══════════════════════════════════════════════════════════════
+
+fn synth_eeg(n: int, suppressed: bool, seed: int) -> [float] {
+    let mut out: [float] = []
+    let mut s = seed
+    let mut i = 0
+    let half = n / 2
+    let phase = 0.0
+    while i < n {
+        let t = to_float(i) / FS_HZ
+        let amp_mu = if suppressed && i >= half { A_MU_SUPP } else { A_MU }
+        let mu_comp = amp_mu * cos(TWO_PI * F_MU * t + phase)
+        let beta_comp = A_BETA * cos(TWO_PI * F_BETA_DIST * t)
+        s = lcg_next(s)
+        let noise_comp = A_NOISE * lcg_unit_signed(s)
+        out = out.push(mu_comp + beta_comp + noise_comp)
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Exposed API — detect_mu_suppression(eeg_window) -> float
+//
+// Roadmap spec: "detect_mu_suppression(eeg_window: list[f32]) -> f32
+//                (suppression score 0..1)"
+// Interpretation: input is assumed to contain a baseline period
+// (first half) and an action period (second half). We compute
+// mu-band power ratio and return a score in [0, 1].
+// ═══════════════════════════════════════════════════════════════
+
+fn detect_mu_suppression(eeg_window: [float]) -> float {
+    let n = len(eeg_window)
+    if n < 8 { return 0.0 }           // degenerate window
+    let half = n / 2
+    let p_baseline = goertzel_power(eeg_window, 0, half, F_MU, FS_HZ)
+    let p_action   = goertzel_power(eeg_window, half, n,   F_MU, FS_HZ)
+    // Guard against divide-by-zero baseline (flat input)
+    if p_baseline <= 0.0 { return 0.0 }
+    let ratio = p_action / p_baseline
+    // Score = 1 − ratio  → more suppression, higher score
+    let score = 1.0 - ratio
+    return clamp(score, SCORE_LO, SCORE_HI)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests — with TARGET thresholds tuned to the synth generator
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1_baseline_detectable() -> bool {
+    // Pure-mu window (no suppression) — baseline half should have
+    // clearly non-zero mu-band power.
+    let w = synth_eeg(WIN_N, false, NOISE_SEED)
+    let p = goertzel_power(w, 0, WIN_N / 2, F_MU, FS_HZ)
+    // For A_MU=1, N=256 samples, a cleanly resonating Goertzel
+    // has power on the order of N²·(A/2)² = 256² · 0.25 ≈ 16000.
+    // We set a loose floor of 100 to survive noise variation.
+    let ok = p > 100.0
+    println("  [T1] baseline mu-power = " + str(p))
+    return ok
+}
+
+fn check_T2_action_smaller() -> bool {
+    // Suppressed window — action half's mu-power must be smaller
+    // than baseline half's.
+    let w = synth_eeg(WIN_N, true, NOISE_SEED)
+    let p_base = goertzel_power(w, 0, WIN_N / 2, F_MU, FS_HZ)
+    let p_act  = goertzel_power(w, WIN_N / 2, WIN_N, F_MU, FS_HZ)
+    let ok = p_act < p_base
+    println("  [T2] suppressed window: baseline=" + str(p_base) + " action=" + str(p_act))
+    return ok
+}
+
+fn check_T3_high_score_suppressed() -> bool {
+    // A suppressed window must produce a HIGH suppression score.
+    // Theoretical: A_MU_SUPP² / A_MU² = 0.15² = 0.0225
+    // so the ratio ≈ 0.02 → score ≈ 0.98 (noise lowers it slightly).
+    let w = synth_eeg(WIN_N, true, NOISE_SEED)
+    let s = detect_mu_suppression(w)
+    let ok = s > 0.7
+    println("  [T3] score on suppressed window = " + str(s) + " (threshold > 0.7)")
+    return ok
+}
+
+fn check_T4_low_score_unsuppressed() -> bool {
+    // A non-suppressed window should produce LOW score (both halves
+    // have the same mu amplitude → ratio ≈ 1 → score ≈ 0, modulo noise).
+    let w = synth_eeg(WIN_N, false, NOISE_SEED)
+    let s = detect_mu_suppression(w)
+    let ok = s < 0.3
+    println("  [T4] score on non-suppressed window = " + str(s) + " (threshold < 0.3)")
+    return ok
+}
+
+fn check_T5_api_robust() -> bool {
+    // Degenerate inputs should not crash:
+    //   - empty window → 0.0
+    //   - single sample → 0.0 (min-length guard)
+    //   - flat signal (zero baseline) → 0.0 (divide-by-zero guard)
+    let empty: [float] = []
+    let s_empty = detect_mu_suppression(empty)
+    let ok_empty = s_empty == 0.0
+
+    let mut single: [float] = []
+    single = single.push(1.0)
+    let s_single = detect_mu_suppression(single)
+    let ok_single = s_single == 0.0
+
+    // Flat signal — both halves zero → baseline=0 → guard returns 0.0
+    let mut flat: [float] = []
+    let mut i = 0
+    while i < 64 {
+        flat = flat.push(0.0)
+        i = i + 1
+    }
+    let s_flat = detect_mu_suppression(flat)
+    let ok_flat = s_flat >= 0.0 && s_flat <= 1.0  // clamped no matter what
+
+    let ok = ok_empty && ok_single && ok_flat
+    println("  [T5] empty=" + str(s_empty) + " single=" + str(s_single) + " flat=" + str(s_flat))
+    return ok
+}
+
+fn check_T6_deterministic() -> bool {
+    let w = synth_eeg(WIN_N, true, NOISE_SEED)
+    let s1 = detect_mu_suppression(w)
+    let s2 = detect_mu_suppression(w)
+    let ok = fabs(s1 - s2) == 0.0
+    println("  [T6] two calls: s1=" + str(s1) + " s2=" + str(s2))
+    return ok
+}
+
+fn test() {
+    println("[eeg/mu_rhythm_detector] PHYS-P5-3 — EEG mu-rhythm self-referential detection")
+    println("  synth: 256 Hz sampling, 10 Hz mu + 18 Hz beta + LCG noise")
+    println("  detector: Goertzel @ 10 Hz, score = 1 − P_action / P_baseline ∈ [0,1]")
+    println("")
+
+    let t1 = check_T1_baseline_detectable()
+    if t1 { println("T1 PASS — baseline mu-power detectable") } else { println("T1 FAIL") }
+
+    let t2 = check_T2_action_smaller()
+    if t2 { println("T2 PASS — action half has lower mu power than baseline") } else { println("T2 FAIL") }
+
+    let t3 = check_T3_high_score_suppressed()
+    if t3 { println("T3 PASS — high score on suppressed window (self-reference detected)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4_low_score_unsuppressed()
+    if t4 { println("T4 PASS — low score on non-suppressed window") } else { println("T4 FAIL") }
+
+    let t5 = check_T5_api_robust()
+    if t5 { println("T5 PASS — API robust on degenerate inputs") } else { println("T5 FAIL") }
+
+    let t6 = check_T6_deterministic()
+    if t6 { println("T6 PASS — deterministic output") } else { println("T6 FAIL") }
+
+    println("")
+    let all = t1 && t2 && t3 && t4 && t5 && t6
+    if all {
+        println("[eeg/mu_rhythm_detector] 6/6 PASS — PHYS-P5-3 DONE")
+    } else {
+        println("[eeg/mu_rhythm_detector] SOME FAILED")
+    }
+}
+
+test()
