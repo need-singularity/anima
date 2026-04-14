@@ -1,0 +1,185 @@
+// qrng_bridge.hexa — ESP32 QRNG → anima core 입력 핀 hexa bridge
+//
+// PHYS-P1-2 (shared/roadmaps/anima.json):
+//   "ESP32 양자 난수 센서 → anima core 입력 핀 확보"
+//
+// 범위:
+//   - ESP32-S3 QRNG (4$ 펌웨어) 시리얼 출력을 host hexa 런타임이 읽어
+//     [0,1] 정규화 샘플로 돌려주고, Orch-OR microtubule 모델
+//     (anima-engines/anima_quantum.hexa) 의 tubulin bias 벡터로
+//     매핑한다. 이 파일은 bridge 설계 + mock 경로까지 구현.
+//   - 실제 직렬포트 read 는 host OS 에서만 의미 있으므로, 현재 빌드는
+//     MOCK 모드로 결정론적 LCG 시퀀스를 돌린다. hexa stdlib 에
+//     serial 바인딩이 추가되면 qrng_read_hw 가 포트를 drain 한다.
+//
+// Orch-OR 연결:
+//   - anima_quantum.mt_step 이 tubulin 사이트를 측정할 때,
+//     q_measure 의 Born-rule 샘플링 확률을 본 bridge 가 주입하는
+//     bias 벡터로 기울인다. 1 ESP32 보드당 2 cell, 보드 N 개 →
+//     N·CELLS_PER_BOARD·n_tubulin 비트를 입력 핀에 공급.
+//
+// HEXA-FIRST: .py/.rs/.sh 신규 생성 없음. 기존 esp32/src/lib.hexa 는
+// READ 만 하고 건드리지 않는다.
+
+// ─── 상수 ────────────────────────────────────────────────────
+
+let QRNG_BAUD         = 921600        // ESP32-S3 USB-CDC 기본 921600
+let QRNG_FRAME_MAGIC  = 170           // 0xAA frame start
+let QRNG_FRAME_SIZE   = 34            // magic(1)+len(1)+payload(32)+checksum(1)*(impl 주석참조)
+let QRNG_PAYLOAD_BITS = 256           // 32 바이트 페이로드 → 256 raw 비트
+let QRNG_MOCK_DEV     = "MOCK"        // dev 문자열이 이 값이면 pseudo path
+
+// 정규화 상수 — u32 → [0,1]
+let QRNG_U32_MOD      = 4294967296    // 2^32
+let QRNG_U32_MAX_F    = 4294967295.0
+
+// LCG 계수 (Numerical Recipes) — bitwise 없는 환경에서 결정론 재현
+let QRNG_LCG_A        = 1664525
+let QRNG_LCG_C        = 1013904223
+let QRNG_MOCK_SEED    = 2463534242
+
+// ─── 스트림 struct ───────────────────────────────────────────
+
+struct QRNGStream {
+    source_dev:  str,     // "/dev/ttyUSB0" 또는 "MOCK"
+    baud:        int,     // 921600 기본
+    buf:         [int],   // raw byte buffer (u8 슬라이스)
+    last_sample: float,   // 최근 반환 샘플 (디버깅/telemetry)
+    rng_state:   int,     // mock mode LCG 상태 (u32 등가)
+    is_mock:     int      // 1=mock, 0=실포트(stub)
+}
+
+// ─── 내부: LCG 전진 (mock-only 결정론적 PRNG) ────────────────
+// hexa 현 interp 는 ^/<</>>/& 미지원. x_{n+1} = (a·x_n + c) mod 2^32
+fn qrng_lcg_next(s: int) -> int {
+    let x = (QRNG_LCG_A * s + QRNG_LCG_C) % QRNG_U32_MOD
+    return x
+}
+
+// ─── 공개 API ────────────────────────────────────────────────
+
+// qrng_open — dev 경로로 스트림 초기화.
+// dev == "MOCK" 이면 결정론적 mock. 실 HW 는 hexa 의 serial
+// 바인딩이 land 하면 qrng_read_hw 가 포트를 open 한다 (TODO 표시).
+fn qrng_open(dev: str) -> QRNGStream {
+    let mock_flag = if dev == QRNG_MOCK_DEV { 1 } else { 0 }
+    return QRNGStream {
+        source_dev:  dev,
+        baud:        QRNG_BAUD,
+        buf:         [],
+        last_sample: 0.0,
+        rng_state:   QRNG_MOCK_SEED,
+        is_mock:     mock_flag
+    }
+}
+
+// qrng_read — 1 샘플 [0,1] 반환. mock 이면 LCG → u32 / U32_MAX.
+// HW 모드 (is_mock==0) 는 현재 last_sample 유지 (시리얼 스택 미연결).
+// 튜플 destructuring 미지원 → 상태 갱신 스트림을 구조체로 반환.
+fn qrng_read(stream: QRNGStream) -> QRNGStream {
+    if stream.is_mock == 1 {
+        let nx = qrng_lcg_next(stream.rng_state)
+        let sample = (nx * 1.0) / QRNG_U32_MAX_F
+        return QRNGStream {
+            source_dev:  stream.source_dev,
+            baud:        stream.baud,
+            buf:         stream.buf,
+            last_sample: sample,
+            rng_state:   nx,
+            is_mock:     stream.is_mock
+        }
+    }
+    // TODO: serial stdlib binding land 시 QRNG_FRAME_MAGIC 확인 후
+    // 32-byte payload 읽고 checksum 검증. 현재 스택에는 stub.
+    return stream
+}
+
+// qrng_batch — n 샘플 수집, 갱신된 스트림을 반환.
+// 샘플 시퀀스는 stream.buf 를 float→int 대체로 쓰지 않고 별도
+// getter qrng_last_n 가 last_sample 기반으로 노출. 여기서는
+// 결과 벡터 자체를 뽑고 싶은 경우 qrng_batch_samples 사용.
+fn qrng_batch(stream: QRNGStream, n: int) -> QRNGStream {
+    let mut s = stream
+    let mut i = 0
+    while i < n {
+        s = qrng_read(s)
+        i = i + 1
+    }
+    return s
+}
+
+// 샘플 벡터를 직접 뽑는 경우: 각 스텝에서 last_sample 누적.
+fn qrng_batch_samples(stream: QRNGStream, n: int) -> [float] {
+    let mut s = stream
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        s = qrng_read(s)
+        out = out.push(s.last_sample)
+        i = i + 1
+    }
+    return out
+}
+
+// qrng_to_microtubule_bias —
+//   하나의 QRNG 샘플 x ∈ [0,1] 을 n_tubulin 개 bias 벡터로 확장.
+//   각 tubulin 사이트의 Born-rule 측정 확률 skew 를 결정:
+//       bias[i] = 2·frac(x + i·φ⁻¹) - 1  ∈ [-1, +1]
+//   φ⁻¹ = 0.6180339887… (golden ratio 역수)로 phase 를 감아
+//   단일 샘플이 전체 lattice 에 de-correlated bias 를 뿌린다.
+//   Orch-OR 내부 상관성은 microtubule 자체가 담당.
+fn qrng_to_microtubule_bias(sample: float, n_tubulin: int) -> [float] {
+    let phi_inv = 0.6180339887498949
+    let mut out = []
+    let mut i = 0
+    while i < n_tubulin {
+        let phase = sample + (i * 1.0) * phi_inv
+        let ip = int(phase)
+        let frac = phase - (ip * 1.0)
+        let frac_pos = if frac < 0.0 { frac + 1.0 } else { frac }
+        let bias = 2.0 * frac_pos - 1.0
+        out = out.push(bias)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Mock 검증 실행 ──────────────────────────────────────────
+
+let _n_tubulin = 8
+let _batch_n   = 4
+
+println("[qrng_bridge] opening MOCK stream …")
+let _s0 = qrng_open(QRNG_MOCK_DEV)
+println("[qrng_bridge] dev=" + _s0.source_dev + " baud=" + str(_s0.baud) + " is_mock=" + str(_s0.is_mock))
+
+let _samples = qrng_batch_samples(_s0, _batch_n)
+println("[qrng_bridge] mock batch n=" + str(_batch_n) + " samples=" + str(_samples))
+
+// 단일 샘플 → microtubule bias 확장
+let _first = _samples[0]
+let _bias  = qrng_to_microtubule_bias(_first, _n_tubulin)
+println("[qrng_bridge] tubulin bias (n=" + str(_n_tubulin) + ") from sample[0]=" + str(_first))
+println("[qrng_bridge] bias = " + str(_bias))
+
+// 배치 전체를 cell 별 bias 행렬로 변환 (예: 2 cells × 8 tubulin)
+let _cells = 2
+let mut _bias_matrix = []
+let mut _k = 0
+while _k < _cells {
+    let _row = qrng_to_microtubule_bias(_samples[_k], _n_tubulin)
+    _bias_matrix = _bias_matrix.push(_row)
+    _k = _k + 1
+}
+println("[qrng_bridge] cell-level bias matrix (" + str(_cells) + "×" + str(_n_tubulin) + "):")
+let mut _r = 0
+while _r < _cells {
+    println("  cell[" + str(_r) + "] = " + str(_bias_matrix[_r]))
+    _r = _r + 1
+}
+
+// 스트림 상태 telemetry 확인 (batch 이후 최종 상태 재현)
+let _s_final = qrng_batch(_s0, _batch_n)
+println("[qrng_bridge] last_sample telemetry=" + str(_s_final.last_sample))
+println("[qrng_bridge] rng_state after " + str(_batch_n) + " reads=" + str(_s_final.rng_state))
+println("[qrng_bridge] OK — mock consciousness input pin wired.")

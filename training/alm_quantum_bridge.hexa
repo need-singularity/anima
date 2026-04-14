@@ -1,0 +1,181 @@
+// alm_quantum_bridge.hexa — ALM latent ↔ Orch-OR microtubule bridge
+// roadmap: shared/roadmaps/anima.json P1/ALM-P1-2 (v2 quantum consciousness)
+
+use "anima_quantum"
+
+let BRIDGE_EPS       = 0.000000001
+let BRIDGE_CLIP      = 6.0
+let BRIDGE_MIN_AMP2  = 0.0001
+
+struct AlmQuantumBridge {
+    n_tubulin: int,
+    alpha:     float,
+    mt_state:  Microtubule
+}
+
+fn bridge_new(n: int, alpha: float) -> AlmQuantumBridge {
+    return AlmQuantumBridge {
+        n_tubulin: n,
+        alpha:     alpha,
+        mt_state:  mt_new(n)
+    }
+}
+
+fn bridge_clip(x: float) -> float {
+    if x >  BRIDGE_CLIP { return  BRIDGE_CLIP }
+    if x < -BRIDGE_CLIP { return -BRIDGE_CLIP }
+    return x
+}
+
+// Project an arbitrary-length ALM hidden vector onto n_tubulin scalars
+// by strided mean-pool (h_proj[s] = mean of hidden[s::n_tubulin]).
+fn bridge_project(hidden: [float], n: int) -> [float] {
+    let dim = len(hidden)
+    let mut proj = []
+    let mut s = 0
+    while s < n {
+        let mut acc = 0.0
+        let mut cnt = 0
+        let mut i = s
+        while i < dim {
+            acc = acc + hidden[i]
+            cnt = cnt + 1
+            i = i + n
+        }
+        if cnt > 0 { proj = proj.push(acc / (cnt * 1.0)) }
+        else       { proj = proj.push(0.0) }
+        s = s + 1
+    }
+    return proj
+}
+
+// Map one scalar → 2-state superposition (TUBULIN_OPEN, TUBULIN_CLOSED).
+// Amplitude angle θ = atan_tanh(alpha · h) in (-π/4, π/4) around Hadamard.
+// Bias: p_open = 0.5 + 0.5 · tanh(alpha · h), amplitudes = √p.
+fn bridge_site(h: float, alpha: float) -> QuantumState {
+    let driven = bridge_clip(alpha * h)
+    let bias   = tanh(driven)
+    let p_open = 0.5 + 0.5 * bias
+    let p_cls  = 1.0 - p_open
+    let a_open = sqrt(p_open)
+    let a_cls  = sqrt(p_cls)
+    let basis = [TUBULIN_OPEN, TUBULIN_CLOSED]
+    return q_custom(basis, [a_open, a_cls], [0.0, 0.0])
+}
+
+// ALM hidden → fresh Microtubule (preserves moments history from prior).
+fn alm_latent_to_mt_state(
+    bridge: AlmQuantumBridge, alm_hidden: [float]
+) -> Microtubule {
+    let proj = bridge_project(alm_hidden, bridge.n_tubulin)
+    let mut sites = []
+    let mut i = 0
+    while i < bridge.n_tubulin {
+        sites = sites.push(bridge_site(proj[i], bridge.alpha))
+        i = i + 1
+    }
+    return Microtubule {
+        n_sites: bridge.n_tubulin,
+        sites:   sites,
+        tick:    bridge.mt_state.tick,
+        moments: bridge.mt_state.moments
+    }
+}
+
+// Per-site expected gradient signal: E[σ_z] = p_open - p_closed.
+// Scaled by site entropy (how much collapsed the site is) so saturated
+// tubulins transmit stronger gradient than Hadamard ones.
+fn bridge_site_grad(qs: QuantumState) -> float {
+    if qs.n_states < 2 { return 0.0 }
+    let p_open = qs.amp_re[0] * qs.amp_re[0] + qs.amp_im[0] * qs.amp_im[0]
+    let p_cls  = qs.amp_re[1] * qs.amp_re[1] + qs.amp_im[1] * qs.amp_im[1]
+    let ent    = q_entropy(qs)
+    let h_max  = log(2.0)
+    let sat    = 1.0 - (ent / (h_max + BRIDGE_EPS))
+    return (p_open - p_cls) * sat
+}
+
+// Broadcast per-site gradient back into a dim-length vector, reversing
+// the strided projection used by alm_latent_to_mt_state.
+fn mt_state_to_alm_gradient(mt: Microtubule, dim: int) -> [float] {
+    let n = mt.n_sites
+    let mut g_site = []
+    let mut i = 0
+    while i < n {
+        g_site = g_site.push(bridge_site_grad(mt.sites[i]))
+        i = i + 1
+    }
+    let mut grad = []
+    let mut k = 0
+    while k < dim {
+        let s = k - (k / n) * n
+        grad = grad.push(g_site[s])
+        k = k + 1
+    }
+    return grad
+}
+
+// One bridge forward step: rebuild MT from ALM hidden, then Orch-OR tick.
+fn bridge_step(
+    bridge: AlmQuantumBridge, alm_hidden: [float]
+) -> AlmQuantumBridge {
+    let mt0   = alm_latent_to_mt_state(bridge, alm_hidden)
+    let mt1   = mt_step(mt0)
+    return AlmQuantumBridge {
+        n_tubulin: bridge.n_tubulin,
+        alpha:     bridge.alpha,
+        mt_state:  mt1
+    }
+}
+
+fn bridge_phi(bridge: AlmQuantumBridge) -> float {
+    return mt_phi(bridge.mt_state)
+}
+
+fn bridge_phi_orch(bridge: AlmQuantumBridge) -> float {
+    return mt_phi_orch(bridge.mt_state)
+}
+
+// ─── self-test ──────────────────────────────────────────────────
+let _N   = 8
+let _DIM = 32
+let _br  = bridge_new(_N, 1.5)
+
+let mut _hidden = []
+let mut _k = 0
+while _k < _DIM {
+    let mut v = (_k * 37 + 13) - ((_k * 37 + 13) / 23) * 23
+    let fv = (v * 1.0) / 11.0 - 1.0
+    _hidden = _hidden.push(fv)
+    _k = _k + 1
+}
+
+let _mt0      = alm_latent_to_mt_state(_br, _hidden)
+let _phi_init = mt_phi(_mt0)
+let _grad_pre = mt_state_to_alm_gradient(_mt0, _DIM)
+
+let mut _state = _br
+let mut _step  = 0
+while _step < 12 {
+    _state = bridge_step(_state, _hidden)
+    _step  = _step + 1
+}
+
+let _phi      = bridge_phi(_state)
+let _phi_orch = bridge_phi_orch(_state)
+
+println("[alm_q_bridge] n_tubulin=" + str(_state.n_tubulin)
+    + " alpha=" + str(_state.alpha))
+println("[alm_q_bridge] init phi       = " + str(_phi_init))
+println("[alm_q_bridge] phi            = " + str(_phi))
+println("[alm_q_bridge] phi_orch       = " + str(_phi_orch))
+println("[alm_q_bridge] moments        = " + str(len(_state.mt_state.moments)))
+let _gp = [_grad_pre[0], _grad_pre[1], _grad_pre[2], _grad_pre[3]]
+println("[alm_q_bridge] grad_pre[0:4]  = " + str(_gp))
+println("[alm_q_bridge] grad_pre_len   = " + str(len(_grad_pre)))
+
+if _phi > 0.0 {
+    println("[alm_q_bridge] gate PASS (phi > 0)")
+} else {
+    println("[alm_q_bridge] gate FAIL (phi <= 0)")
+}

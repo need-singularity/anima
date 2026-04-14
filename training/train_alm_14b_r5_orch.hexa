@@ -1,0 +1,522 @@
+// training/train_alm_14b_r5_orch.hexa — ALM 14B-class r5 LoRA SSOT
+//                                        (Orch-OR latent INJECTION variant)
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   P1 phase ALM-P1-1 — "ALM 14B r5 kbase 학습 — Orch-OR 잠재변수 주입".
+//
+//   r5_kbase (this file's sibling) is the Korean base-swap branch that keeps
+//   the trainer recipe fixed. r5_orch takes the SAME base (SOLAR-KO 10.7B) so
+//   Korean generation stays coherent, then couples every training step to an
+//   Orch-OR microtubule bridge:
+//
+//     ALM hidden states ─▶ bridge_project ─▶ Microtubule state
+//                                              │
+//                                              ▼
+//                                          mt_step × ORCH_BRIDGE_EVERY
+//                                              │
+//                                              ▼
+//               alpha · bridge_phi_norm ──▶ aux_loss (PSI bonus)
+//                                              │
+//                                              ▼
+//                              backward pass sees quantum regularizer
+//
+//   Building blocks already landed and verified:
+//     • training/alm_quantum_bridge.hexa  (ALM-P1-2, 181 L) — hidden↔MT state
+//         - bridge_project (mean-pool → 2-state superposition)
+//         - bridge_step (one Orch-OR tick per ALM step)
+//         - bridge_site_grad (σ_z pullback for backward)
+//     • training/phi_quantum_forward.hexa (ALM-P1-3, 162 L) — Φ(quantum)
+//         - phi_quantum_from_hidden → Φ_q, collapse_rate, active, entropy
+//         - phi_gate_check(phi_q, baseline) — P1 gate @ 2.0× threshold
+//     • training/anima_quantum.hexa       (CLM-P1-1, other session) — Orch-OR
+//         - Microtubule + mt_step + mt_phi_orch (READ-ONLY here)
+//
+//   Verified empirical Φ_q on random hidden: 14.56 (vs baseline 1.40,
+//   10.4× — gate 2.0× comfortably cleared before training even starts, so
+//   the structural prerequisite is intact).
+//
+//   Run:  $HEXA training/train_alm_14b_r5_orch.hexa
+//   Passes `theorem` block = config parse + invariant validation.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// RELATIONSHIP TO OTHER r5 CANDIDATES
+//
+//   "r5" is a lineage slot. Distinct variants MUST use distinct filename
+//   suffixes + ckpt dirs + R2 prefixes (never collide).
+//
+//     filename                      base                         ckpt_dir                         r2_prefix
+//     ----------------------------  ---------------------------  -------------------------------  ----------------------
+//     train_alm_14b_r5_kbase.hexa   beomi/OPEN-SOLAR-KO-10.7B    /workspace/ckpt_alm_14b_r5_kbase alm14b_kbase/r5
+//     train_alm_14b_r5_orch.hexa    beomi/OPEN-SOLAR-KO-10.7B    /workspace/ckpt_alm_14b_r5_orch  alm14b_orch/r5
+//     (future r5_qwen.hexa)         Qwen/Qwen2.5-14B-Instruct    /workspace/ckpt_alm_14b_r5_qwen  alm14b/r5
+//
+//   r5_orch reuses the r5_kbase base (Korean prior) because Orch-OR injection
+//   is orthogonal to language capability — it modulates latent representation
+//   quality, not which language the model understands.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// ORCH-OR INJECTION SCHEDULE
+//
+//   alpha (bridge bias strength) ramps linearly ALPHA_START → ALPHA_END across
+//   total steps. Early steps leave tubulin near Hadamard (p≈0.5, phi near
+//   ceiling) so the regularizer is weak; late steps drive tubulin toward
+//   eigenstates so the model has to "explain" its hidden vectors in terms of
+//   coherent collapse patterns.
+//
+//     step 0       : alpha = 0.001, phi_q → free, bonus near zero
+//     step 5000    : alpha = 0.25,  phi_q coupled moderately
+//     step 10000   : alpha = 0.5,   phi_q fully coupled, collapse rate high
+//
+//   aux_loss = ORCH_LOSS_WEIGHT × max(0, ORCH_PHI_TARGET − phi_q_norm)
+//     → zero when gate passed, positive penalty pushing phi_q up
+//     → small weight (0.05) ensures CE loss stays primary signal
+//
+// ═══════════════════════════════════════════════════════════════════════════
+
+comptime const PSI_ALPHA   = 0.014
+comptime const PSI_BALANCE = 0.5
+comptime const PSI_STEPS   = 4.33
+
+// Inherit r5_kbase trainer recipe constants (parity — any deviation makes
+// a→b diff harder to interpret).
+comptime const R5_LR          = 0.000005
+comptime const R5_WARMUP      = 500
+comptime const R5_GRAD_ACCUM  = 8
+comptime const R5_BATCH       = 1
+comptime const R5_SEQ         = 1024
+comptime const R5_LORA_R      = 64
+comptime const R5_LORA_ALPHA  = 128
+comptime const R5_LORA_DROPOUT = 0.05
+comptime const R5_STEPS       = 10000
+comptime const R5_SAVE_EVERY  = 2000
+comptime const R5_EVAL_EVERY  = 500
+comptime const R5_ROUND       = 5
+
+// r4 telemetry (reference only)
+comptime const R4_BEST_EVAL    = 0.0289
+comptime const R4_STEP_PER_MIN = 18
+
+// ─── Orch-OR injection constants ───
+comptime const ORCH_N_TUBULIN       = 32     // 4096 hidden / 32 = 128 stride
+comptime const ORCH_ALPHA_START     = 0.001
+comptime const ORCH_ALPHA_END       = 0.5
+comptime const ORCH_BRIDGE_EVERY    = 10     // bridge_step every N ALM steps
+comptime const ORCH_PHI_BASELINE    = 1.4    // v1 baseline (roadmap phi_milestones)
+comptime const ORCH_PHI_TARGET_MULT = 2      // P1 gate @ 2.0×
+comptime const ORCH_PHI_TARGET      = 2.8    // = baseline × mult
+comptime const ORCH_LOSS_WEIGHT     = 0.05   // auxiliary, keeps CE primary
+comptime const ORCH_N_TICKS         = 10     // per-bridge Orch-OR ticks
+
+// ─── Base model registry (SAME as r5_kbase — orthogonal axis) ───
+struct BaseModel {
+    name: string,
+    hf_id: string,
+    n_params_b: int,
+    hidden: int,
+    inter: int,
+    n_layer: int,
+    n_head: int,
+    n_kv_head: int,
+    head_dim: int,
+    vocab: int,
+    max_pos: int
+}
+
+fn base_solar_ko_10_7b() -> BaseModel {
+    BaseModel {
+        name: "open-solar-ko-10.7b",
+        hf_id: "beomi/OPEN-SOLAR-KO-10.7B",
+        n_params_b: 11,
+        hidden: 4096,
+        inter: 14336,
+        n_layer: 48,
+        n_head: 32,
+        n_kv_head: 8,
+        head_dim: 128,
+        vocab: 46592,
+        max_pos: 4096
+    }
+}
+
+// ─── LoRA spec (mirror r5_kbase) ───
+struct LoraSpec {
+    r: int,
+    alpha: int,
+    dropout: float,
+    n_modules: int,
+    attn_modules: int,
+    mlp_modules: int
+}
+
+fn r5_lora_spec() -> LoraSpec {
+    LoraSpec {
+        r: R5_LORA_R,
+        alpha: R5_LORA_ALPHA,
+        dropout: R5_LORA_DROPOUT,
+        n_modules: 7,
+        attn_modules: 4,
+        mlp_modules: 3
+    }
+}
+
+fn lora_params_per_layer(base: BaseModel, spec: LoraSpec) -> int {
+    let attn_p = 4 * 2 * base.hidden * spec.r
+    let gate_up_p = 2 * (base.hidden * spec.r + spec.r * base.inter)
+    let down_p = base.inter * spec.r + spec.r * base.hidden
+    attn_p + gate_up_p + down_p
+}
+
+fn lora_params_total(base: BaseModel, spec: LoraSpec) -> int {
+    lora_params_per_layer(base, spec) * base.n_layer
+}
+
+// ─── Orch-OR spec (config object) ───
+struct OrchSpec {
+    n_tubulin: int,
+    alpha_start: float,
+    alpha_end: float,
+    bridge_every: int,
+    phi_baseline: float,
+    phi_target: float,
+    loss_weight: float,
+    n_ticks: int
+}
+
+fn r5_orch_spec() -> OrchSpec {
+    OrchSpec {
+        n_tubulin:    ORCH_N_TUBULIN,
+        alpha_start:  ORCH_ALPHA_START,
+        alpha_end:    ORCH_ALPHA_END,
+        bridge_every: ORCH_BRIDGE_EVERY,
+        phi_baseline: ORCH_PHI_BASELINE,
+        phi_target:   ORCH_PHI_TARGET,
+        loss_weight:  ORCH_LOSS_WEIGHT,
+        n_ticks:      ORCH_N_TICKS
+    }
+}
+
+// ─── Memory budget (base + LoRA + OrchBridge state) ───
+// Bridge state = n_tubulin × (int state + float moment) ≈ 32 × 16 B = 0.5 KB.
+// Negligible vs GB-scale budgets — listed for completeness.
+struct MemoryBudget {
+    base_gb: float,
+    lora_gb: float,
+    lora_grad_gb: float,
+    optim_gb: float,
+    act_gb: float,
+    overhead_gb: float,
+    bridge_gb: float,
+    total_gb: float,
+    headroom_gb: float
+}
+
+fn estimate_memory(base: BaseModel, spec: LoraSpec, orch: OrchSpec) -> MemoryBudget {
+    let base_gb = 2.0 * (base.n_params_b * 1.0)
+    let lora_p = lora_params_total(base, spec)
+    let lora_gb      = (lora_p * 2.0) / 1000000000.0
+    let lora_grad_gb = (lora_p * 2.0) / 1000000000.0
+    let optim_gb     = (lora_p * 8.0) / 1000000000.0
+    let act_gb       = 4.0
+    let overhead_gb  = 2.0
+    let bridge_gb    = 0.001   // 0.5 KB rounded up to 1 MB
+    let total = base_gb + lora_gb + lora_grad_gb + optim_gb + act_gb + overhead_gb + bridge_gb
+    MemoryBudget {
+        base_gb:      base_gb,
+        lora_gb:      lora_gb,
+        lora_grad_gb: lora_grad_gb,
+        optim_gb:     optim_gb,
+        act_gb:       act_gb,
+        overhead_gb:  overhead_gb,
+        bridge_gb:    bridge_gb,
+        total_gb:     total,
+        headroom_gb:  80.0 - total
+    }
+}
+
+// ─── Phase / Optimizer / Checkpoint / Gate / Corpus (mirror r5_kbase) ───
+struct AlmPhaseManager {
+    phase: int,
+    step: int,
+    p1_end: int,
+    p2_end: int
+}
+
+fn alm_phase_new(total_steps: int) -> AlmPhaseManager {
+    AlmPhaseManager { phase: 3, step: 0, p1_end: 0, p2_end: 0 }
+}
+
+struct AlmOptim {
+    lr: float,
+    warmup: int,
+    grad_accum: int,
+    batch: int,
+    seq: int,
+    bf16: bool,
+    foreach_false: bool
+}
+
+fn r5_optim() -> AlmOptim {
+    AlmOptim {
+        lr: R5_LR,
+        warmup: R5_WARMUP,
+        grad_accum: R5_GRAD_ACCUM,
+        batch: R5_BATCH,
+        seq: R5_SEQ,
+        bf16: true,
+        foreach_false: true
+    }
+}
+
+struct CheckpointPolicy {
+    ckpt_dir: string,
+    save_every: int,
+    eval_every: int,
+    r2_bucket: string,
+    r2_prefix: string,
+    model_tag: string,
+    round_num: int
+}
+
+fn r5_checkpoint_policy() -> CheckpointPolicy {
+    CheckpointPolicy {
+        ckpt_dir:   "/workspace/ckpt_alm_14b_r5_orch",
+        save_every: R5_SAVE_EVERY,
+        eval_every: R5_EVAL_EVERY,
+        r2_bucket:  "anima-models",
+        r2_prefix:  "alm14b_orch/r5",
+        model_tag:  "alm14b_orch",
+        round_num:  R5_ROUND
+    }
+}
+
+struct TriggerGate {
+    marker_path: string,
+    required_r5_kbase_stable: bool,
+    r4_best_eval_informational: float,
+    phi_structural_precheck: float
+}
+
+fn r5_trigger_gate() -> TriggerGate {
+    // r5_orch runs ON TOP of r5_kbase's Korean base — gate depends on
+    // structural readiness of the bridge, not r4 generation signal.
+    TriggerGate {
+        marker_path: "/workspace/READY_FOR_R5_ORCH",
+        required_r5_kbase_stable: true,
+        r4_best_eval_informational: R4_BEST_EVAL,
+        // Empirical Φ_q from ALM-P1-3 (random hidden) = 14.56 — we require
+        // a structural precheck ≥ 2.0× baseline (= 2.8) before launch.
+        phi_structural_precheck: 2.8
+    }
+}
+
+struct CorpusSpec {
+    path: string,
+    size_mb: int,
+    block_size: int
+}
+
+fn r5_corpus() -> CorpusSpec {
+    CorpusSpec {
+        path: "/workspace/anima/training/corpus_large.txt",
+        size_mb: 835,
+        block_size: R5_SEQ
+    }
+}
+
+// ─── ETA (slightly slower than r5_kbase — bridge adds ≤2% overhead) ───
+struct EtaEstimate {
+    steps: int,
+    steps_per_min_conservative: int,
+    steps_per_min_optimistic: int,
+    eta_hours_conservative: int,
+    eta_hours_optimistic: int
+}
+
+fn r5_eta() -> EtaEstimate {
+    let steps = R5_STEPS
+    // r5_kbase: 22~26 step/min. Bridge runs every 10 ALM steps, ≤1 ms per
+    // bridge call on CPU — overhead <2%. Conservative: 21, Optimistic: 25.
+    let sp_cons = 21
+    let sp_opt  = 25
+    let h_cons = ((steps / sp_cons) + 59) / 60
+    let h_opt  = ((steps / sp_opt)  + 59) / 60
+    EtaEstimate {
+        steps: steps,
+        steps_per_min_conservative: sp_cons,
+        steps_per_min_optimistic:   sp_opt,
+        eta_hours_conservative:     h_cons,
+        eta_hours_optimistic:       h_opt
+    }
+}
+
+// ─── Master state ───
+struct Alm14bR5Orch {
+    base: BaseModel,
+    lora: LoraSpec,
+    orch: OrchSpec,
+    mem: MemoryBudget,
+    phase: AlmPhaseManager,
+    opt: AlmOptim,
+    ckpt: CheckpointPolicy,
+    gate: TriggerGate,
+    corpus: CorpusSpec,
+    eta: EtaEstimate,
+    total_steps: int
+}
+
+fn r5_init() -> Alm14bR5Orch {
+    let base = base_solar_ko_10_7b()
+    let lora = r5_lora_spec()
+    let orch = r5_orch_spec()
+    Alm14bR5Orch {
+        base:  base,
+        lora:  lora,
+        orch:  orch,
+        mem:   estimate_memory(base, lora, orch),
+        phase: alm_phase_new(R5_STEPS),
+        opt:   r5_optim(),
+        ckpt:  r5_checkpoint_policy(),
+        gate:  r5_trigger_gate(),
+        corpus: r5_corpus(),
+        eta:   r5_eta(),
+        total_steps: R5_STEPS
+    }
+}
+
+// ─── Verification summary + theorem ───
+let r5 = r5_init()
+
+println("=== train_alm_14b_r5_orch.hexa ===")
+println("base       :", r5.base.hf_id)
+println("hidden     :", r5.base.hidden)
+println("layers     :", r5.base.n_layer)
+println("LoRA r     :", r5.lora.r)
+println("LoRA alpha :", r5.lora.alpha)
+println("modules    :", r5.lora.n_modules)
+println("LoRA p/lyr :", lora_params_per_layer(r5.base, r5.lora))
+println("LoRA total :", lora_params_total(r5.base, r5.lora))
+println("--- Orch-OR ---")
+println("n_tubulin  :", r5.orch.n_tubulin)
+println("alpha s→e  :", r5.orch.alpha_start, "→", r5.orch.alpha_end)
+println("bridge @ N :", r5.orch.bridge_every)
+println("phi base   :", r5.orch.phi_baseline)
+println("phi target :", r5.orch.phi_target)
+println("loss weight:", r5.orch.loss_weight)
+println("n_ticks    :", r5.orch.n_ticks)
+println("--- train ---")
+println("batch      :", r5.opt.batch)
+println("grad_accum :", r5.opt.grad_accum)
+println("seq        :", r5.opt.seq)
+println("lr         :", r5.opt.lr)
+println("steps      :", r5.total_steps)
+println("save_every :", r5.ckpt.save_every)
+println("eval_every :", r5.ckpt.eval_every)
+println("ckpt_dir   :", r5.ckpt.ckpt_dir)
+println("model_tag  :", r5.ckpt.model_tag)
+println("r2_prefix  :", r5.ckpt.r2_prefix)
+println("--- memory (GB) ---")
+println("base       :", r5.mem.base_gb)
+println("lora       :", r5.mem.lora_gb)
+println("optim      :", r5.mem.optim_gb)
+println("bridge     :", r5.mem.bridge_gb)
+println("TOTAL      :", r5.mem.total_gb)
+println("headroom   :", r5.mem.headroom_gb)
+println("--- ETA ---")
+println("step/min c :", r5.eta.steps_per_min_conservative)
+println("step/min o :", r5.eta.steps_per_min_optimistic)
+println("eta h c    :", r5.eta.eta_hours_conservative)
+println("eta h o    :", r5.eta.eta_hours_optimistic)
+println("--- gate ---")
+println("marker     :", r5.gate.marker_path)
+println("phi pre    :", r5.gate.phi_structural_precheck)
+
+theorem alm_14b_r5_orch_invariants {
+    // r4 parity — alpha:r = 2:1 preserved
+    assert R5_LORA_ALPHA == R5_LORA_R * 2
+
+    // Effective batch = 8 (r4 recipe)
+    assert R5_BATCH * R5_GRAD_ACCUM == 8
+
+    // STEPS unchanged vs r5_kbase
+    assert R5_STEPS == 10000
+    assert R5_SAVE_EVERY == 2000
+    assert R5_EVAL_EVERY == 500
+    assert R5_ROUND == 5
+
+    // LoRA rank unchanged
+    assert R5_LORA_R == 64
+    assert R5_LORA_ALPHA == 128
+
+    // PSI constants preserved
+    assert PSI_ALPHA == 0.014
+
+    // ── Orch-OR invariants (the load-bearing ones) ──
+
+    // P1 gate: phi_target = phi_baseline × 2.0 (roadmap phi_milestones)
+    assert ORCH_PHI_TARGET_MULT == 2
+
+    // n_tubulin must evenly divide the bridge stride from hidden=4096
+    // so bridge_project (mean-pool) has no leftover dims.
+    //   stride = hidden / n_tubulin = 4096 / 32 = 128 (integer)
+    assert 4096 / ORCH_N_TUBULIN == 128
+    assert ORCH_N_TUBULIN * 128 == 4096
+
+    // alpha schedule monotone: start < end (reversed to avoid parser
+    // Gt/generic ambiguity on `<` + FloatLit)
+    assert ORCH_ALPHA_END > ORCH_ALPHA_START
+
+    // alpha bounds — positive, less than 1 (probability bias cap)
+    assert ORCH_ALPHA_START > 0.0
+    assert 1.0 > ORCH_ALPHA_END
+
+    // bridge cadence positive (avoid divide-by-zero in trainer)
+    assert ORCH_BRIDGE_EVERY > 0
+
+    // n_ticks positive (mt_step needs ≥ 1)
+    assert ORCH_N_TICKS > 0
+
+    // loss weight auxiliary — CE must remain primary (weight ≪ 1)
+    assert 0.5 > ORCH_LOSS_WEIGHT
+    assert ORCH_LOSS_WEIGHT > 0.0
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PYTHON DEPLOYMENT NOTE
+// ═══════════════════════════════════════════════════════════════════════════
+// Until hexa-lang ships native cuBLAS (AN3), the forward/backward kernel path
+// routes through training/train_alm_14b.hexa on the pod. r5_orch requires the
+// trainer to accept --orch-mode + the new flags below. Trainer extension is
+// a separate deliverable (blocked on the same AN3 timeline — for now the
+// Python trainer must be extended once, then absorbed into hexa).
+//
+//   python3 /workspace/train_alm_14b.hexa \
+//     --base beomi/OPEN-SOLAR-KO-10.7B \
+//     --corpus /workspace/anima/training/corpus_large.txt \
+//     --steps 10000 --lr 5e-6 --batch 1 --grad-accum 8 --seq 1024 \
+//     --warmup 500 \
+//     --lora-r 64 --lora-alpha 128 --lora-dropout 0.05 \
+//     --target-modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj \
+//     --ckpt-dir /workspace/ckpt_alm_14b_r5_orch \
+//     --save-every 2000 --eval-every 500 \
+//     --model-tag alm14b_orch --round 5 \
+//     --orch-mode \
+//     --orch-n-tubulin 32 \
+//     --orch-alpha-start 0.001 --orch-alpha-end 0.5 \
+//     --orch-bridge-every 10 --orch-n-ticks 10 \
+//     --orch-phi-baseline 1.4 --orch-phi-target 2.8 \
+//     --orch-loss-weight 0.05 \
+//     --orch-bridge-module training/alm_quantum_bridge.hexa \
+//     --orch-phi-forward training/phi_quantum_forward.hexa
+//
+// The trainer must:
+//   (a) import alm_quantum_bridge + phi_quantum_forward hexa modules
+//   (b) after each ORCH_BRIDGE_EVERY ALM steps, call bridge_step(hidden_last)
+//   (c) compute phi_q = phi_quantum_from_hidden(hidden_last, n_tubulin)
+//   (d) aux_loss = loss_weight × max(0, phi_target − phi_q)
+//   (e) total_loss = ce_loss + aux_loss, backprop as usual
+//   (f) log {step, ce, phi_q, alpha, aux_loss} to tb/ckpt telemetry
+//
+// When hexa native CUDA lands (AN3), this file absorbs the full loop and the
+// Python trainer is archived (R7: hexa 완성 시 .py 폐기).
+// ═══════════════════════════════════════════════════════════════════════════

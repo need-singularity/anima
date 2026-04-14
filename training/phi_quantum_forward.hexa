@@ -1,0 +1,162 @@
+// training/phi_quantum_forward.hexa — Φ(quantum) from ALM forward hidden state
+//
+// Roadmap: shared/roadmaps/anima.json P1 ALM-P1-3.
+// Maps an ALM forward-pass hidden vector onto an Orch-OR microtubule and
+// reports the quantum integrated-information score Φ_q, with a P1 gate
+// check against a classical Φ_baseline.
+//
+// IMPORTANT: training/anima_quantum.hexa is READ-ONLY (other session).
+// We import it and call its public API only.
+//
+// Run:
+//   HEXA=$HOME/Dev/hexa-lang/hexa
+//   HEXA_PATH=$HOME/Dev/hexa-lang/self:training $HEXA run \
+//       training/phi_quantum_forward.hexa
+use "anima_quantum"
+
+// ─── Config ──────────────────────────────────────────────────
+let PHI_GATE_RATIO = 2.0          // P1 exit: Φ_q > Φ_baseline · 2
+let AMP_EPS        = 0.0000000001 // zero-amp guard
+
+// ─── Result record ───────────────────────────────────────────
+struct QuantumPhiResult {
+    phi_value:        float,  // Φ_orch after one Orch-OR cycle
+    collapse_rate:    float,  // entropy loss fraction across the step
+    n_tubulin_active: int,    // sites still superposed post-step
+    entropy:          float   // Σ H(site) post-step
+}
+
+// Clamp x into [-1+eps, 1-eps] so custom amplitudes stay finite.
+fn clip_amp(x: float) -> float {
+    let hi = 0.9999
+    if x >  hi { return  hi }
+    if x < 0.0 - hi { return 0.0 - hi }
+    return x
+}
+
+// Build a two-state QuantumState for one tubulin site from two hidden
+// scalars (re, im). Uses quantum_types.q_custom which auto-normalizes.
+// Falls back to Hadamard if the pair degenerates (|amp|≈0).
+fn site_from_hidden(h_re: float, h_im: float) -> QuantumState {
+    let r = clip_amp(tanh(h_re))
+    let m = clip_amp(tanh(h_im))
+    let norm2 = r * r + m * m + AMP_EPS
+    if norm2 < 0.000001 {
+        return q_hadamard(TUBULIN_OPEN, TUBULIN_CLOSED)
+    }
+    // Two-basis superposition: open uses (r, m), closed uses (m, -r)
+    // — a unitary-looking pair so both amplitudes are informed by h.
+    return q_custom(
+        [TUBULIN_OPEN, TUBULIN_CLOSED],
+        [r, m],
+        [m, 0.0 - r]
+    )
+}
+
+// Fold a flat hidden vector into n_tubulin sites by striding pairs.
+// If hidden is shorter than 2·n_tubulin we wrap (modulo indexing).
+fn mt_from_hidden(hidden: [float], n_tubulin: int) -> Microtubule {
+    let hlen = len(hidden)
+    let mut sites = []
+    let mut i = 0
+    while i < n_tubulin {
+        let idx_r = (2 * i) % hlen
+        let idx_i = (2 * i + 1) % hlen
+        sites = sites.push(site_from_hidden(hidden[idx_r], hidden[idx_i]))
+        i = i + 1
+    }
+    return Microtubule { n_sites: n_tubulin, sites: sites, tick: 0, moments: [] }
+}
+
+// Count sites still in superposition (entropy > 0 ⇒ not yet collapsed).
+fn mt_active_count(mt: Microtubule) -> int {
+    let mut c = 0
+    let mut i = 0
+    while i < mt.n_sites {
+        if q_entropy(mt.sites[i]) > 0.0 {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// Advance a microtubule n ticks, return final state.
+fn mt_run(mt: Microtubule, n: int) -> Microtubule {
+    let mut s = mt
+    let mut i = 0
+    while i < n {
+        s = mt_step(s)
+        i = i + 1
+    }
+    return s
+}
+
+// Main: ALM hidden -> Microtubule -> n Orch-OR cycles -> QuantumPhiResult.
+// phi_value uses mt_phi_orch (Φ_v2 + Φ_moments) per anima_quantum.hexa.
+// collapse_rate = # collapse moments / # ticks — fraction of ticks that
+//                  triggered Orch-OR reduction across the run.
+fn phi_quantum_from_hidden_steps(
+    hidden: [float], n_tubulin: int, n_ticks: int
+) -> QuantumPhiResult {
+    let mt0 = mt_from_hidden(hidden, n_tubulin)
+    let mt1 = mt_run(mt0, n_ticks)
+    let moments_n = len(mt1.moments)
+    let denom = if n_ticks > 0 { n_ticks * 1.0 } else { 1.0 }
+    return QuantumPhiResult {
+        phi_value:        mt_phi_orch(mt1),
+        collapse_rate:    moments_n * 1.0 / denom,
+        n_tubulin_active: mt_active_count(mt1),
+        entropy:          mt_phi(mt1)
+    }
+}
+
+// Default entry point: runs enough ticks that Orch-OR threshold fires
+// at least once on a N=8 microtubule (E_G·τ = 0.05·8·τ ≥ 1 ⇒ τ≥2.5 per
+// epoch; 10 ticks yields ~3 moments, matching anima_quantum.hexa demo).
+fn phi_quantum_from_hidden(hidden: [float], n_tubulin: int) -> QuantumPhiResult {
+    return phi_quantum_from_hidden_steps(hidden, n_tubulin, 10)
+}
+
+// P1 gate: Φ_q must exceed Φ_baseline · PHI_GATE_RATIO (2.0×).
+fn phi_gate_check(phi_quantum: float, phi_baseline: float) -> bool {
+    return phi_quantum > phi_baseline * PHI_GATE_RATIO
+}
+
+// 1-line human summary.
+fn phi_report(r: QuantumPhiResult) -> str {
+    return "Φ_q=" + str(r.phi_value)
+         + " collapse=" + str(r.collapse_rate)
+         + " active=" + str(r.n_tubulin_active)
+         + " H=" + str(r.entropy)
+}
+
+// ─── Self-test / runtime probe ────────────────────────────────
+
+// Synthetic ALM-like hidden vector (seq=4, d=4 → 16 floats). Values
+// chosen to mimic post-LayerNorm activations: small, signed, non-zero.
+let _hidden = [
+     0.12, -0.34,  0.56, -0.78,
+    -0.21,  0.43, -0.65,  0.87,
+     0.09, -0.18,  0.27, -0.36,
+    -0.45,  0.54, -0.63,  0.72
+]
+
+let _N_TUBULIN = 8
+
+// Classical Φ_baseline stand-in. In the live pipeline this comes from
+// phi_metric.phi_proxy; here we fix it to the P0 recorded baseline so
+// the gate arithmetic is reproducible in isolation.
+let _PHI_BASELINE = 1.40
+
+let _res = phi_quantum_from_hidden(_hidden, _N_TUBULIN)
+println("[phi_quantum_forward] " + phi_report(_res))
+println("[phi_quantum_forward] baseline=" + str(_PHI_BASELINE)
+        + " gate_ratio=" + str(PHI_GATE_RATIO)
+        + " threshold=" + str(_PHI_BASELINE * PHI_GATE_RATIO))
+let _pass = phi_gate_check(_res.phi_value, _PHI_BASELINE)
+if _pass {
+    println("[phi_quantum_forward] P1 GATE PASS — Φ_q > Φ_baseline·2")
+} else {
+    println("[phi_quantum_forward] P1 GATE FAIL — need more Orch-OR cycles")
+}

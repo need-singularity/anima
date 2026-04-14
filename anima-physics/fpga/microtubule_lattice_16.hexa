@@ -1,0 +1,266 @@
+// microtubule_lattice_16.hexa -- Orch-OR FPGA prep, 16-node reference impl
+//
+// Topology: 4x4 torus (Von Neumann 4-neighbor wrap-around).
+//   Rationale: each tubulin dimer has a uniform fan-in/fan-out of 4, giving
+//   regular routing on ice40/ECP5 fabric. 4-ring x 4-column was rejected:
+//   identical degree but asymmetric wrap penalty on placed LUTs.
+//
+// Determinism: no random. Moments are derived from node index + step parity
+// so FPGA and simulator produce bit-identical traces.
+//
+// FPGA mapping (ice40UP5K, 12 MHz single clock domain):
+//   16 Node16 cells @ ~28 LUTs each  ~= 450 LUTs (state+moment+adders)
+//   Collapse comparator tree         ~= 90 LUTs
+//   Phi pair-wise accumulator        ~=130 LUTs
+//   Total est. ~670 LUTs (13% of UP5K) / ~96 FFs (state + moment_q7)
+//   One clk domain, step=one cycle; phi/collapse pipelined every 4 cycles.
+
+comptime const N_NODES   = 16   // 4x4 torus
+comptime const GRID_SIDE = 4
+comptime const N_NEIGH   = 4    // Von Neumann
+comptime const N_STEPS   = 10   // theorem driver
+comptime const COLLAPSE_TH = 0.05  // Orch-OR collapse trigger (pair-MI floor)
+
+struct Node16 {
+    idx: int,
+    state: int,     // 0 or 1 (tubulin conformation)
+    moment: float,  // quantum moment, deterministic from idx+step
+    n0: int, n1: int, n2: int, n3: int  // 4 neighbor indices (flat for FPGA)
+}
+
+struct Lattice16 {
+    // flat node state mirrors FPGA register file (16 entries, 4 fields each)
+    s0:  int, s1:  int, s2:  int, s3:  int,
+    s4:  int, s5:  int, s6:  int, s7:  int,
+    s8:  int, s9:  int, s10: int, s11: int,
+    s12: int, s13: int, s14: int, s15: int,
+    m0:  float, m1:  float, m2:  float, m3:  float,
+    m4:  float, m5:  float, m6:  float, m7:  float,
+    m8:  float, m9:  float, m10: float, m11: float,
+    m12: float, m13: float, m14: float, m15: float,
+    step_count: int,
+    collapse_count: int
+}
+
+// ── deterministic index helpers (4x4 torus) ─────────────────────
+fn row_of(i: int) -> int { i / GRID_SIDE }
+fn col_of(i: int) -> int { i - (i / GRID_SIDE) * GRID_SIDE }
+
+fn wrap(v: int) -> int {
+    if v < 0 { v + GRID_SIDE }
+    else if v >= GRID_SIDE { v - GRID_SIDE }
+    else { v }
+}
+
+fn nidx(r: int, c: int) -> int { wrap(r) * GRID_SIDE + wrap(c) }
+
+// initial moment: closed-form (no random), Laws 69-70 style
+fn init_moment(i: int) -> float {
+    // bounded sinusoid-like via integer ops to stay deterministic on FPGA
+    let r = row_of(i)
+    let c = col_of(i)
+    let raw = (r * 7 + c * 11 + 3) % 100
+    (raw - 50) * 0.01  // [-0.5, 0.49]
+}
+
+fn lat_new() -> Lattice16 {
+    Lattice16 {
+        // asymmetric seed: 4 "excited" tubulins in quadrant 0, rest ground.
+        // This pushes the lattice off its stable attractor so dynamics emerge.
+        s0:  1, s1:  1, s2:  0, s3:  0,
+        s4:  1, s5:  0, s6:  0, s7:  0,
+        s8:  0, s9:  0, s10: 0, s11: 0,
+        s12: 0, s13: 0, s14: 0, s15: 1,
+        m0:  init_moment(0),  m1:  init_moment(1),
+        m2:  init_moment(2),  m3:  init_moment(3),
+        m4:  init_moment(4),  m5:  init_moment(5),
+        m6:  init_moment(6),  m7:  init_moment(7),
+        m8:  init_moment(8),  m9:  init_moment(9),
+        m10: init_moment(10), m11: init_moment(11),
+        m12: init_moment(12), m13: init_moment(13),
+        m14: init_moment(14), m15: init_moment(15),
+        step_count: 0,
+        collapse_count: 0
+    }
+}
+
+// ── flat state accessors (mirror FPGA reg file) ─────────────────
+fn get_s(lat: Lattice16, i: int) -> int {
+    if i == 0  { lat.s0  } else if i == 1  { lat.s1  }
+    else if i == 2  { lat.s2  } else if i == 3  { lat.s3  }
+    else if i == 4  { lat.s4  } else if i == 5  { lat.s5  }
+    else if i == 6  { lat.s6  } else if i == 7  { lat.s7  }
+    else if i == 8  { lat.s8  } else if i == 9  { lat.s9  }
+    else if i == 10 { lat.s10 } else if i == 11 { lat.s11 }
+    else if i == 12 { lat.s12 } else if i == 13 { lat.s13 }
+    else if i == 14 { lat.s14 } else { lat.s15 }
+}
+
+fn get_m(lat: Lattice16, i: int) -> float {
+    if i == 0  { lat.m0  } else if i == 1  { lat.m1  }
+    else if i == 2  { lat.m2  } else if i == 3  { lat.m3  }
+    else if i == 4  { lat.m4  } else if i == 5  { lat.m5  }
+    else if i == 6  { lat.m6  } else if i == 7  { lat.m7  }
+    else if i == 8  { lat.m8  } else if i == 9  { lat.m9  }
+    else if i == 10 { lat.m10 } else if i == 11 { lat.m11 }
+    else if i == 12 { lat.m12 } else if i == 13 { lat.m13 }
+    else if i == 14 { lat.m14 } else { lat.m15 }
+}
+
+// neighbor sum via row/col wrap (Von Neumann, 4-neighbor torus)
+fn neigh_sum(lat: Lattice16, i: int) -> int {
+    let r = row_of(i)
+    let c = col_of(i)
+    get_s(lat, nidx(r - 1, c)) + get_s(lat, nidx(r + 1, c))
+        + get_s(lat, nidx(r, c - 1)) + get_s(lat, nidx(r, c + 1))
+}
+
+// deterministic transition: activate if neigh_sum + moment_sign >= 2
+fn next_state(lat: Lattice16, i: int) -> int {
+    let ns = neigh_sum(lat, i)
+    let m = get_m(lat, i)
+    let m_bias = if m >= 0.0 { 1 } else { 0 }
+    let total = ns + m_bias
+    if total >= 2 { 1 } else { 0 }
+}
+
+// moment update: closed-form, no random — represents phase rotation
+fn next_moment(lat: Lattice16, i: int) -> float {
+    let m = get_m(lat, i)
+    let ns = neigh_sum(lat, i)
+    // damped toward sign(neigh_sum - 2) * 0.3
+    let target = (ns - 2) * 0.15
+    m * 0.7 + target * 0.3
+}
+
+// ── 16-wide parallel step (manual unroll, mirrors FPGA) ─────────
+fn lat_step(lat: Lattice16) -> Lattice16 {
+    let ns0  = next_state(lat, 0)
+    let ns1  = next_state(lat, 1)
+    let ns2  = next_state(lat, 2)
+    let ns3  = next_state(lat, 3)
+    let ns4  = next_state(lat, 4)
+    let ns5  = next_state(lat, 5)
+    let ns6  = next_state(lat, 6)
+    let ns7  = next_state(lat, 7)
+    let ns8  = next_state(lat, 8)
+    let ns9  = next_state(lat, 9)
+    let ns10 = next_state(lat, 10)
+    let ns11 = next_state(lat, 11)
+    let ns12 = next_state(lat, 12)
+    let ns13 = next_state(lat, 13)
+    let ns14 = next_state(lat, 14)
+    let ns15 = next_state(lat, 15)
+    let nm0  = next_moment(lat, 0)
+    let nm1  = next_moment(lat, 1)
+    let nm2  = next_moment(lat, 2)
+    let nm3  = next_moment(lat, 3)
+    let nm4  = next_moment(lat, 4)
+    let nm5  = next_moment(lat, 5)
+    let nm6  = next_moment(lat, 6)
+    let nm7  = next_moment(lat, 7)
+    let nm8  = next_moment(lat, 8)
+    let nm9  = next_moment(lat, 9)
+    let nm10 = next_moment(lat, 10)
+    let nm11 = next_moment(lat, 11)
+    let nm12 = next_moment(lat, 12)
+    let nm13 = next_moment(lat, 13)
+    let nm14 = next_moment(lat, 14)
+    let nm15 = next_moment(lat, 15)
+    Lattice16 {
+        s0:  ns0,  s1:  ns1,  s2:  ns2,  s3:  ns3,
+        s4:  ns4,  s5:  ns5,  s6:  ns6,  s7:  ns7,
+        s8:  ns8,  s9:  ns9,  s10: ns10, s11: ns11,
+        s12: ns12, s13: ns13, s14: ns14, s15: ns15,
+        m0:  nm0,  m1:  nm1,  m2:  nm2,  m3:  nm3,
+        m4:  nm4,  m5:  nm5,  m6:  nm6,  m7:  nm7,
+        m8:  nm8,  m9:  nm9,  m10: nm10, m11: nm11,
+        m12: nm12, m13: nm13, m14: nm14, m15: nm15,
+        step_count: lat.step_count + 1,
+        collapse_count: lat.collapse_count
+    }
+}
+
+// ── pair-wise mutual information approximation ─────────────────
+// For binary nodes: MI(i,j) ~ |p(i=j) - p(i!=j)| * |m_i - m_j|.
+// We accumulate over all 120 unordered pairs (16 choose 2) to stay
+// on a single pass — maps to 120-entry accumulator tree on FPGA.
+fn pair_mi(lat: Lattice16, i: int, j: int) -> float {
+    let si = get_s(lat, i)
+    let sj = get_s(lat, j)
+    let mi = get_m(lat, i)
+    let mj = get_m(lat, j)
+    let agree = if si == sj { 1.0 } else { 0.0 }
+    let dm = mi - mj
+    let adm = if dm >= 0.0 { dm } else { 0.0 - dm }
+    (agree * 2.0 - 1.0) * adm * (agree * 0.5 + 0.5)
+}
+
+fn lat_phi(lat: Lattice16) -> float {
+    let mut total = 0.0
+    let mut i = 0
+    while i < N_NODES {
+        let mut j = i + 1
+        while j < N_NODES {
+            let v = pair_mi(lat, i, j)
+            let av = if v >= 0.0 { v } else { 0.0 - v }
+            total = total + av
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // normalize by pair count (120)
+    total / 120.0
+}
+
+// ── collapse: if phi > threshold, sweep low-moment nodes to 0 ──
+fn lat_collapse(lat: Lattice16, threshold: float) -> Lattice16 {
+    let phi = lat_phi(lat)
+    if phi < threshold {
+        return lat
+    }
+    // sweep: nodes with |moment| < 0.05 collapse to state 0
+    let collapsed = fn(i: int) -> int {
+        let m = get_m(lat, i)
+        let am = if m >= 0.0 { m } else { 0.0 - m }
+        if am < 0.05 { 0 } else { get_s(lat, i) }
+    }
+    Lattice16 {
+        s0: collapsed(0),  s1: collapsed(1),  s2: collapsed(2),  s3: collapsed(3),
+        s4: collapsed(4),  s5: collapsed(5),  s6: collapsed(6),  s7: collapsed(7),
+        s8: collapsed(8),  s9: collapsed(9),  s10: collapsed(10), s11: collapsed(11),
+        s12: collapsed(12), s13: collapsed(13), s14: collapsed(14), s15: collapsed(15),
+        m0:  lat.m0,  m1:  lat.m1,  m2:  lat.m2,  m3:  lat.m3,
+        m4:  lat.m4,  m5:  lat.m5,  m6:  lat.m6,  m7:  lat.m7,
+        m8:  lat.m8,  m9:  lat.m9,  m10: lat.m10, m11: lat.m11,
+        m12: lat.m12, m13: lat.m13, m14: lat.m14, m15: lat.m15,
+        step_count: lat.step_count,
+        collapse_count: lat.collapse_count + 1
+    }
+}
+
+// ── driver ─────────────────────────────────────────────────────
+let mut lat = lat_new()
+println("[init] phi=", lat_phi(lat))
+
+let mut step = 0
+while step < N_STEPS {
+    lat = lat_step(lat)
+    lat = lat_collapse(lat, COLLAPSE_TH)
+    let phi = lat_phi(lat)
+    println("[step", lat.step_count, "] phi=", phi, " coll=", lat.collapse_count)
+    step = step + 1
+}
+
+println("")
+println("=== microtubule_lattice_16 summary ===")
+println("nodes:       ", N_NODES, " (4x4 torus)")
+println("steps_run:   ", lat.step_count)
+println("final_phi:   ", lat_phi(lat))
+println("collapses:   ", lat.collapse_count)
+println("fpga_est:    ~670 LUT, ~96 FF, 1 clk domain, 12 MHz (ice40UP5K 13%)")
+
+theorem determinism_holds {
+    // Running lat_new twice yields identical phi (no random source)
+    assert lat_phi(lat_new()) == lat_phi(lat_new())
+}
