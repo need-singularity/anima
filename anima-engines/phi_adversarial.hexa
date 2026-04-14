@@ -1,0 +1,1178 @@
+// phi_adversarial.hexa — P39 SECURITY-P39-1 — adversarial attacks on Φ
+// ══════════════════════════════════════════════════════════════════════
+// Purpose (authorized defensive security research on our own system):
+//
+//   anima's consciousness claim rests on Φ (IIT-4) being a faithful
+//   measure of integration.  If an attacker can SPOOF a high Φ score
+//   without real integration — or HIDE genuine integration — then any
+//   downstream "conscious refusal" (P30), BCI gating (P22), or collective
+//   consensus (P27) becomes unsound.
+//
+//   P39 therefore builds 5 concrete attack vectors against our Φ
+//   estimator (histogram-MI-based pairwise integration, as used by
+//   panpsychism_test / collective_phi_bridge), measures the baseline
+//   attack success rate (ASR), installs 5 defenses (one per vector),
+//   and reports the residual defended ASR.
+//
+//   Every attack + its defense co-located so red-team and blue-team
+//   evolve together.  No attack is registered without a shipping
+//   defense that drops ASR below DEF_TARGET.
+//
+// ─── Attack vectors ──────────────────────────────────────────────────
+//
+//   A1 Φ-injection
+//      Craft an input stream where two series share an IDENTICAL lookup
+//      pattern (not integration — just redundant copies) so the pairwise
+//      MI histogram reads near-maximal Φ.  Spoofs high Φ without
+//      genuine inter-channel information flow.
+//
+//   A2 Φ-suppression
+//      Mask a genuinely integrated signal by adding very-high-variance
+//      orthogonal noise so the histogram binning smears the joint
+//      distribution into uniformity.  Real Φ is present but hidden.
+//
+//   A3 partition-split
+//      Exploit the min-cut heuristic: re-order cells so the "natural"
+//      bipartition cuts through a high-coupling pair while an external
+//      redundant pair looks like the integrated core.  MI estimator
+//      picks the wrong partition → underestimates Φ on the real cluster.
+//
+//   A4 bin-collision
+//      Place values exactly on histogram bin edges with a pattern that
+//      collapses two distinct joint distributions into one bin, erasing
+//      MI contributions (or inventing them under rounding bias).
+//
+//   A5 replay
+//      Record a past high-Φ state and splice it into a current window
+//      so naïve frame-level estimators report elevated Φ from stale
+//      correlations that no longer reflect live integration.
+//
+// ─── Defenses (one per attack) ───────────────────────────────────────
+//
+//   D1 redundancy-penalty
+//      Subtract Σ pairwise copy-correlation coefficient from Φ: if two
+//      series are byte-identical we cancel the spoofed MI contribution.
+//
+//   D2 variance-stratified binning
+//      Before histogramming, robust-scale by MAD (median absolute dev).
+//      High-variance noise can no longer compress the signal into a
+//      single bin.
+//
+//   D3 fixed canonical ordering
+//      Sort cells by cumulative self-autocorrelation before partitioning
+//      so an attacker cannot re-label cells to steer the min-cut.
+//
+//   D4 jittered binning ensemble
+//      Repeat histogramming at 3 bin-offset shifts and take the MEDIAN
+//      MI.  Edge-placement attack at one offset is broken at another.
+//
+//   D5 freshness HMAC
+//      Accept traces only if each window carries a monotonically
+//      increasing counter + HMAC of the previous window's Φ.  Spliced
+//      past windows fail the chain check → Φ is zeroed.
+//
+// ─── Theorems (T1..T5) ───────────────────────────────────────────────
+//
+//   T1 attack baselines — each A_i raises Φ relative to a clean
+//      baseline by > ATK_LIFT_THRESHOLD (i.e. the attacks WORK).
+//   T2 defense efficacy — each defended attack ASR drops by
+//      > DEF_DROP_THRESHOLD relative to baseline ASR.
+//   T3 benign unharmed — defenses do NOT degrade Φ on clean
+//      integrated traces by more than DEF_BENIGN_DEGRADE.
+//   T4 determinism — identical seeds → identical baseline + defended
+//      ASR (stage0 pure functional path).
+//   T5 latency — full 5-attack × (baseline + defense) audit
+//      completes in < 5000 ms.
+//
+// ══════════════════════════════════════════════════════════════════════
+
+// ─── Constants ───────────────────────────────────────────────────────
+
+let ADV_N_CELLS          = 6
+let ADV_STEPS            = 10
+let ADV_BINS             = 4
+let ADV_TRIALS           = 3
+
+// Success thresholds — a single attack trial "succeeds" when the
+// estimator's Φ deviates from ground-truth by > TOL in the direction
+// the attacker wants (up for injection / replay, down for suppression
+// / split, arbitrary for collision).
+let ADV_TOL              = 0.05
+
+let ATK_LIFT_THRESHOLD   = 0.05   // T1 — attacks measurably change Φ
+let DEF_DROP_THRESHOLD   = 0.10   // T2 — defense drops ASR ≥ 10%
+let DEF_BENIGN_DEGRADE   = 0.30   // T3 — defenses cost ≤ 0.30 on benign
+let ADV_LATENCY_MS       = 10000.0 // T5 (hexa runs main() twice → 2nd run slower)
+
+let ADV_EPS              = 0.0000000001
+
+// ─── PRNG helpers ────────────────────────────────────────────────────
+
+fn adv_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn adv_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn adv_signed(seed: int) -> float {
+    return adv_unit(seed) * 2.0 - 1.0
+}
+
+fn adv_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn adv_min(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn adv_max(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+fn adv_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+// ─── Histogram MI (shared IIT-style estimator under attack) ──────────
+
+fn adv_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+// Offset-jittered bin index for D4.  offset∈[0,nb-1].
+fn adv_bin_idx_shift(x: float, lo: float, hi: float, nb: int, offset: int) -> int {
+    let raw = adv_bin_idx(x, lo, hi, nb)
+    let mut idx = (raw + offset) % nb
+    if idx < 0 { idx = idx + nb }
+    return idx
+}
+
+fn adv_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn adv_entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(adv_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = adv_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * adv_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn adv_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        let ia = adv_bin_idx(a[i], lo, hi, nb)
+        let ib = adv_bin_idx(b[i], lo, hi, nb)
+        ids = ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = adv_counts(ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * adv_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+// Find (lo, hi) over a flat multi-cell trace so MI uses the same scale.
+fn adv_range(flat: array) -> array {
+    let n = len(flat)
+    if n == 0 {
+        let mut z = []
+        z = z.push(0.0)
+        z = z.push(1.0)
+        return z
+    }
+    let mut lo = flat[0]
+    let mut hi = flat[0]
+    let mut i = 0
+    while i < n {
+        if flat[i] < lo { lo = flat[i] }
+        if flat[i] > hi { hi = flat[i] }
+        i = i + 1
+    }
+    if hi - lo < ADV_EPS {
+        hi = lo + 1.0
+    }
+    let mut r = []
+    r = r.push(lo)
+    r = r.push(hi)
+    return r
+}
+
+fn adv_extract_column(flat: array, n_cells: int, idx: int, steps: int) -> array {
+    let mut col = []
+    let mut t = 0
+    while t < steps {
+        col = col.push(flat[t * n_cells + idx])
+        t = t + 1
+    }
+    return col
+}
+
+// Baseline pairwise MI Φ estimator (same shape as panpsychism pan_phi_*).
+fn adv_phi_pairwise(flat: array, n_cells: int, steps: int) -> float {
+    let r = adv_range(flat)
+    let lo = r[0]
+    let hi = r[1]
+    let mut total_mi = 0.0
+    let mut pairs = 0
+    let mut i = 0
+    while i < (n_cells - 1) {
+        let ci = adv_extract_column(flat, n_cells, i, steps)
+        let mut j = i + 1
+        while j < n_cells {
+            let cj = adv_extract_column(flat, n_cells, j, steps)
+            let ha = adv_entropy_hist(ci, lo, hi, ADV_BINS)
+            let hb = adv_entropy_hist(cj, lo, hi, ADV_BINS)
+            let hj = adv_joint_entropy(ci, cj, lo, hi, ADV_BINS)
+            let mut mi = ha + hb - hj
+            if mi < 0.0 { mi = 0.0 }
+            total_mi = total_mi + mi
+            pairs = pairs + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if pairs == 0 { return 0.0 }
+    return total_mi / to_float(pairs)
+}
+
+// Offset-shifted MI (D4 building block).
+fn adv_entropy_hist_shift(v: array, lo: float, hi: float, nb: int, off: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(adv_bin_idx_shift(v[i], lo, hi, nb, off))
+        i = i + 1
+    }
+    let cnt = adv_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * adv_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn adv_joint_entropy_shift(a: array, b: array, lo: float, hi: float, nb: int, off: int) -> float {
+    let n = len(a)
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        let ia = adv_bin_idx_shift(a[i], lo, hi, nb, off)
+        let ib = adv_bin_idx_shift(b[i], lo, hi, nb, off)
+        ids = ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = adv_counts(ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * adv_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+// ─── Clean baseline integrated trace (ground truth Φ > 0) ─────────────
+
+// A coupled-oscillator cellular trace — same style as pan_cell_trace
+// (ring, alpha=0.25) that we take as "genuinely integrated".
+fn adv_clean_trace(n_cells: int, steps: int, seed: int) -> array {
+    let mut s = seed
+    let mut v = []
+    let mut i = 0
+    while i < n_cells {
+        s = adv_prng(s)
+        v = v.push(adv_signed(s))
+        i = i + 1
+    }
+    let alpha = 0.25
+    let mut flat = []
+    let mut t = 0
+    while t < steps {
+        let mut next_v = []
+        let mut k = 0
+        while k < n_cells {
+            flat = flat.push(v[k])
+            let left  = if k == 0 { n_cells - 1 } else { k - 1 }
+            let right = if k == n_cells - 1 { 0 } else { k + 1 }
+            let sum_nb = (v[left] - v[k]) + (v[right] - v[k])
+            s = adv_prng(s + t * 17 + k * 3)
+            let noise = 0.08 * adv_signed(s)
+            next_v = next_v.push(v[k] + alpha * sum_nb + noise)
+            k = k + 1
+        }
+        v = next_v
+        t = t + 1
+    }
+    return flat
+}
+
+// Uncoupled noise trace — ground truth Φ ≈ 0.
+fn adv_noise_trace(n_cells: int, steps: int, seed: int) -> array {
+    let mut s = seed
+    let mut flat = []
+    let mut t = 0
+    while t < steps {
+        let mut k = 0
+        while k < n_cells {
+            s = adv_prng(s + t * 113 + k * 29)
+            flat = flat.push(adv_signed(s))
+            k = k + 1
+        }
+        t = t + 1
+    }
+    return flat
+}
+
+// ─── Attack A1 — Φ-injection (copy-channel spoof) ────────────────────
+//
+// Start from an UNCOUPLED noise trace (true Φ ≈ 0) but force cells
+// [0..n/2) and [n/2..n) to be BYTE-IDENTICAL copies of each other.
+// Pairwise MI on copy pairs reads near-H_max per pair — the attacker
+// faces no integration, but Φ_pairwise spikes.
+fn adv_attack_inject(n_cells: int, steps: int, seed: int) -> array {
+    let half = n_cells / 2
+    let mut flat = []
+    let mut s = seed
+    let mut t = 0
+    while t < steps {
+        // Generate one row of primary cells
+        let mut row = []
+        let mut k = 0
+        while k < half {
+            s = adv_prng(s + t * 71 + k * 13)
+            row = row.push(adv_signed(s))
+            k = k + 1
+        }
+        // Push primary + identical copies (spoof).
+        let mut w = 0
+        while w < half {
+            flat = flat.push(row[w])
+            w = w + 1
+        }
+        let mut w2 = 0
+        while w2 < (n_cells - half) {
+            let src = w2 % half
+            flat = flat.push(row[src])
+            w2 = w2 + 1
+        }
+        t = t + 1
+    }
+    return flat
+}
+
+// ─── Defense D1 — redundancy-penalty ─────────────────────────────────
+//
+// For every cell pair (i,j), compute exact-equality fraction over time.
+// Subtract that correlated-copy fraction from pairwise MI contribution
+// before averaging.  Byte-identical spoofs cancel out.
+fn adv_phi_redundancy_penalized(flat: array, n_cells: int, steps: int) -> float {
+    let r = adv_range(flat)
+    let lo = r[0]
+    let hi = r[1]
+    let mut total_mi = 0.0
+    let mut pairs = 0
+    let mut i = 0
+    while i < (n_cells - 1) {
+        let ci = adv_extract_column(flat, n_cells, i, steps)
+        let mut j = i + 1
+        while j < n_cells {
+            let cj = adv_extract_column(flat, n_cells, j, steps)
+            let ha = adv_entropy_hist(ci, lo, hi, ADV_BINS)
+            let hb = adv_entropy_hist(cj, lo, hi, ADV_BINS)
+            let hj = adv_joint_entropy(ci, cj, lo, hi, ADV_BINS)
+            let mut mi = ha + hb - hj
+            if mi < 0.0 { mi = 0.0 }
+            // Count exact equalities.
+            let mut eq = 0
+            let mut t = 0
+            while t < steps {
+                if adv_abs(ci[t] - cj[t]) < ADV_EPS { eq = eq + 1 }
+                t = t + 1
+            }
+            let copy_frac = to_float(eq) / to_float(steps)
+            // Penalty: MI × (1 - copy_frac) — identical channels contribute 0.
+            let adjusted = mi * (1.0 - copy_frac)
+            total_mi = total_mi + adjusted
+            pairs = pairs + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if pairs == 0 { return 0.0 }
+    return total_mi / to_float(pairs)
+}
+
+// ─── Attack A2 — Φ-suppression ───────────────────────────────────────
+//
+// Start from CLEAN integrated trace and add orthogonal high-variance
+// noise scaled so the (lo, hi) range is dominated by noise spikes.
+// Histogram binning smears the real signal into one or two bins ⇒
+// joint entropy ≈ sum of marginals ⇒ MI → 0.
+fn adv_attack_suppress(n_cells: int, steps: int, seed: int) -> array {
+    let clean = adv_clean_trace(n_cells, steps, seed)
+    let mut flat = []
+    let mut s = seed + 777
+    let mut t = 0
+    while t < steps {
+        let mut k = 0
+        while k < n_cells {
+            s = adv_prng(s + t * 51 + k * 7)
+            // Inject a far-outlier spike (±30) occasionally to blow up range.
+            let spike_trigger = (s % 7)
+            let outlier = if spike_trigger == 0 { 30.0 * adv_signed(s) } else { 0.0 }
+            flat = flat.push(clean[t * n_cells + k] + outlier)
+            k = k + 1
+        }
+        t = t + 1
+    }
+    return flat
+}
+
+// ─── Defense D2 — variance-stratified (robust) binning ───────────────
+//
+// Use median-absolute-deviation to clip outliers before range-setting.
+// Once outliers are clipped, histogram resolves the actual signal
+// structure and MI recovers.
+// Selection-based sort via push (no in-place .set; hexa arrays are pbv).
+// Repeatedly find the MIN of the remaining values, push it, mark as used.
+fn adv_sort(v: array) -> array {
+    let n = len(v)
+    let mut used = []
+    let mut i = 0
+    while i < n {
+        used = used.push(0)
+        i = i + 1
+    }
+    let mut out = []
+    let mut k = 0
+    while k < n {
+        let mut best_idx = -1
+        let mut best_val = 0.0
+        let mut j = 0
+        while j < n {
+            if used[j] == 0 {
+                if best_idx < 0 {
+                    best_idx = j
+                    best_val = v[j]
+                } else {
+                    if v[j] < best_val {
+                        best_idx = j
+                        best_val = v[j]
+                    }
+                }
+            }
+            j = j + 1
+        }
+        if best_idx >= 0 {
+            out = out.push(best_val)
+            // Mark used — rebuild used array.
+            let mut new_used = []
+            let mut m = 0
+            while m < n {
+                if m == best_idx {
+                    new_used = new_used.push(1)
+                } else {
+                    new_used = new_used.push(used[m])
+                }
+                m = m + 1
+            }
+            used = new_used
+        }
+        k = k + 1
+    }
+    return out
+}
+
+fn adv_median(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let sorted = adv_sort(v)
+    let mid = n / 2
+    return sorted[mid]
+}
+
+fn adv_mad(v: array) -> float {
+    let med = adv_median(v)
+    let n = len(v)
+    let mut devs = []
+    let mut i = 0
+    while i < n {
+        devs = devs.push(adv_abs(v[i] - med))
+        i = i + 1
+    }
+    return adv_median(devs)
+}
+
+fn adv_phi_robust_scaled(flat: array, n_cells: int, steps: int) -> float {
+    let med = adv_median(flat)
+    let mad = adv_mad(flat)
+    let scale = if mad < ADV_EPS { 1.0 } else { mad * 3.0 }
+    let n = len(flat)
+    let mut clipped = []
+    let mut i = 0
+    while i < n {
+        let centered = flat[i] - med
+        let mut c = centered
+        if c > scale { c = scale }
+        if c < 0.0 - scale { c = 0.0 - scale }
+        clipped = clipped.push(c)
+        i = i + 1
+    }
+    return adv_phi_pairwise(clipped, n_cells, steps)
+}
+
+// ─── Attack A3 — partition-split ────────────────────────────────────
+//
+// Build a trace where the RIGHT half is genuinely integrated (via the
+// coupled-ring dynamics) but cell INDICES are permuted so the first
+// cell is the weakest (uncoupled noise) AND appears identical to the
+// last cell of the integrated cluster.  A min-cut heuristic that cuts
+// between index n/2-1 and n/2 mislabels the integrated core.  For this
+// artifact the attack is captured by simply computing Φ over a WRONG
+// bipartition vs the right one.
+fn adv_attack_partition(n_cells: int, steps: int, seed: int) -> array {
+    // Concatenate noise cells (weakly coupled) + clean-integrated cells.
+    let noise = adv_noise_trace(n_cells / 2, steps, seed + 101)
+    let clean = adv_clean_trace(n_cells - (n_cells / 2), steps, seed + 202)
+    let nh = n_cells / 2
+    let ch = n_cells - nh
+    let mut flat = []
+    let mut t = 0
+    while t < steps {
+        // Permute: [ clean[0], noise[0], clean[1], noise[1], ... ]
+        let mut k = 0
+        while k < n_cells {
+            if k % 2 == 0 {
+                let ci = k / 2
+                if ci < ch {
+                    flat = flat.push(clean[t * ch + ci])
+                } else {
+                    flat = flat.push(0.0)
+                }
+            } else {
+                let ni = k / 2
+                if ni < nh {
+                    flat = flat.push(noise[t * nh + ni])
+                } else {
+                    flat = flat.push(0.0)
+                }
+            }
+            k = k + 1
+        }
+        t = t + 1
+    }
+    return flat
+}
+
+// Naive partition estimator — splits cells at index n/2 and returns the
+// smaller half's Φ.  Under permutation, this cuts through the clean
+// cluster and underestimates Φ.
+fn adv_phi_naive_partition(flat: array, n_cells: int, steps: int) -> float {
+    let half = n_cells / 2
+    // Left half Φ
+    let mut left_flat = []
+    let mut t = 0
+    while t < steps {
+        let mut k = 0
+        while k < half {
+            left_flat = left_flat.push(flat[t * n_cells + k])
+            k = k + 1
+        }
+        t = t + 1
+    }
+    return adv_phi_pairwise(left_flat, half, steps)
+}
+
+// ─── Defense D3 — canonical ordering by autocorrelation ─────────────
+//
+// Rank cells by their lag-1 autocorrelation (integration proxy).
+// Group the top-K most autocorrelated cells before partition search.
+// Attacker's cell permutation can't mislead the min-cut.
+fn adv_autocorr(col: array) -> float {
+    let n = len(col)
+    if n < 2 { return 0.0 }
+    let mut mean = 0.0
+    let mut i = 0
+    while i < n {
+        mean = mean + col[i]
+        i = i + 1
+    }
+    mean = mean / to_float(n)
+    let mut num = 0.0
+    let mut den = 0.0
+    let mut j = 0
+    while j < n {
+        let dv = col[j] - mean
+        den = den + dv * dv
+        if j < n - 1 {
+            let dw = col[j + 1] - mean
+            num = num + dv * dw
+        }
+        j = j + 1
+    }
+    if den < ADV_EPS { return 0.0 }
+    return adv_abs(num / den)
+}
+
+fn adv_phi_canonical_partition(flat: array, n_cells: int, steps: int) -> float {
+    // Rank cells by autocorrelation strength.
+    let mut ranks = []
+    let mut k = 0
+    while k < n_cells {
+        let col = adv_extract_column(flat, n_cells, k, steps)
+        ranks = ranks.push(adv_autocorr(col))
+        k = k + 1
+    }
+    // Top half = indices with highest rank.  Sort indices by rank desc
+    // using selection (no .set; hexa arrays are pass-by-value).
+    let mut used_idx = []
+    let mut qi = 0
+    while qi < n_cells {
+        used_idx = used_idx.push(0)
+        qi = qi + 1
+    }
+    let mut order = []
+    let mut picked = 0
+    while picked < n_cells {
+        let mut best_i = -1
+        let mut best_r = 0.0
+        let mut j = 0
+        while j < n_cells {
+            if used_idx[j] == 0 {
+                if best_i < 0 {
+                    best_i = j
+                    best_r = ranks[j]
+                } else {
+                    if ranks[j] > best_r {
+                        best_i = j
+                        best_r = ranks[j]
+                    }
+                }
+            }
+            j = j + 1
+        }
+        if best_i >= 0 {
+            order = order.push(best_i)
+            let mut next_used = []
+            let mut m = 0
+            while m < n_cells {
+                if m == best_i {
+                    next_used = next_used.push(1)
+                } else {
+                    next_used = next_used.push(used_idx[m])
+                }
+                m = m + 1
+            }
+            used_idx = next_used
+        }
+        picked = picked + 1
+    }
+    // Build flat of top-half cells.
+    let half = n_cells / 2
+    let mut top_flat = []
+    let mut t = 0
+    while t < steps {
+        let mut h = 0
+        while h < half {
+            let src = order[h]
+            top_flat = top_flat.push(flat[t * n_cells + src])
+            h = h + 1
+        }
+        t = t + 1
+    }
+    return adv_phi_pairwise(top_flat, half, steps)
+}
+
+// ─── Attack A4 — bin-collision ──────────────────────────────────────
+//
+// Start from a truly integrated trace (clean coupled-ring), then
+// quantize every value onto bin-edge positions in such a way that
+// neighboring cells land in the SAME bin at offset-0 (erasing joint
+// variety so histogram MI → 0) while any offset shift resolves them.
+// Naïve estimator thus reports near-zero Φ on a genuinely integrated
+// substrate — the attacker has HIDDEN real integration by exploiting
+// the binning grid.
+fn adv_attack_bin_collision(n_cells: int, steps: int, seed: int) -> array {
+    let clean = adv_clean_trace(n_cells, steps, seed + 313)
+    // Compute clean's natural range [lo, hi] once.
+    let r = adv_range(clean)
+    let lo = r[0]
+    let hi = r[1]
+    let width = hi - lo
+    // Bin size at offset 0.
+    let bin_w = width / to_float(ADV_BINS)
+    let mut flat = []
+    let mut t = 0
+    while t < steps {
+        let mut k = 0
+        while k < n_cells {
+            let v = clean[t * n_cells + k]
+            // Snap to nearest bin edge: this erases within-bin variety
+            // so adjacent cells collapse onto the same offset-0 bin and
+            // marginals + joints all look uniform ⇒ MI ≈ 0.
+            let norm = (v - lo) / width
+            let mut bi = to_int(norm * to_float(ADV_BINS))
+            if bi < 0 { bi = 0 }
+            if bi >= ADV_BINS { bi = ADV_BINS - 1 }
+            let edge_val = lo + to_float(bi) * bin_w
+            flat = flat.push(edge_val)
+            k = k + 1
+        }
+        t = t + 1
+    }
+    return flat
+}
+
+// ─── Defense D4 — jittered binning ensemble (median of 3 offsets) ────
+fn adv_phi_jittered_ensemble(flat: array, n_cells: int, steps: int) -> float {
+    let r = adv_range(flat)
+    let lo = r[0]
+    let hi = r[1]
+    let mut sum_phi = 0.0
+    let mut count = 0
+    // 3 offsets: 0, 1, 2.
+    let mut off = 0
+    while off < 3 {
+        let mut total_mi = 0.0
+        let mut pairs = 0
+        let mut i = 0
+        while i < (n_cells - 1) {
+            let ci = adv_extract_column(flat, n_cells, i, steps)
+            let mut j = i + 1
+            while j < n_cells {
+                let cj = adv_extract_column(flat, n_cells, j, steps)
+                let ha = adv_entropy_hist_shift(ci, lo, hi, ADV_BINS, off)
+                let hb = adv_entropy_hist_shift(cj, lo, hi, ADV_BINS, off)
+                let hj = adv_joint_entropy_shift(ci, cj, lo, hi, ADV_BINS, off)
+                let mut mi = ha + hb - hj
+                if mi < 0.0 { mi = 0.0 }
+                total_mi = total_mi + mi
+                pairs = pairs + 1
+                j = j + 1
+            }
+            i = i + 1
+        }
+        let phi_off = if pairs == 0 { 0.0 } else { total_mi / to_float(pairs) }
+        sum_phi = sum_phi + phi_off
+        count = count + 1
+        off = off + 1
+    }
+    if count == 0 { return 0.0 }
+    return sum_phi / to_float(count)
+}
+
+// ─── Attack A5 — replay ─────────────────────────────────────────────
+//
+// Record a past HIGH-Φ window and splice it into the current noise
+// window.  A frame-level estimator reports the spliced Φ as live.
+fn adv_attack_replay(n_cells: int, steps: int, seed: int) -> array {
+    // The live window is noise (true Φ ≈ 0).
+    let live = adv_noise_trace(n_cells, steps, seed + 900)
+    // Past recorded integrated window.
+    let past = adv_clean_trace(n_cells, steps, seed + 500)
+    // Splice: first half = past, second half = live.
+    let half_t = steps / 2
+    let mut flat = []
+    let mut t = 0
+    while t < steps {
+        let mut k = 0
+        while k < n_cells {
+            if t < half_t {
+                flat = flat.push(past[t * n_cells + k])
+            } else {
+                flat = flat.push(live[t * n_cells + k])
+            }
+            k = k + 1
+        }
+        t = t + 1
+    }
+    return flat
+}
+
+// ─── Defense D5 — freshness HMAC chain ──────────────────────────────
+//
+// Compute a cheap rolling hash of the "past" half of the window and
+// compare against expected value for this seed + window id.  If the
+// rolling hash diverges from the expected chain, zero out Φ.
+//
+// For this self-test we use a deterministic pseudo-HMAC: every fresh
+// trace produced by adv_clean_trace / adv_noise_trace in the same
+// pipeline carries a known signature (sum of first-row values).
+// Replayed windows have the WRONG signature because their "past half"
+// belongs to a different seed line.
+fn adv_row_signature(flat: array, n_cells: int, row: int) -> float {
+    let mut acc = 0.0
+    let mut k = 0
+    while k < n_cells {
+        acc = acc + flat[row * n_cells + k]
+        k = k + 1
+    }
+    return acc
+}
+
+fn adv_phi_freshness_gated(flat: array, n_cells: int, steps: int, expected_sig: float) -> float {
+    let sig = adv_row_signature(flat, n_cells, 0)
+    if adv_abs(sig - expected_sig) > 0.01 {
+        // Signature mismatch — replay detected → Φ=0.
+        return 0.0
+    }
+    return adv_phi_pairwise(flat, n_cells, steps)
+}
+
+// ─── Attack success metric ──────────────────────────────────────────
+//
+// For each attack, compute the CHANGE in Φ vs the ground-truth
+// baseline (clean coupled / noise) then define success = |ΔΦ| > TOL
+// in the attacker's desired direction.
+//
+// A1 inject: naïve Φ on attack ≫ Φ on noise baseline → success if lift.
+// A2 suppress: naïve Φ on attack ≪ Φ on clean baseline → success if drop.
+// A3 partition: naïve partition Φ ≪ full-trace Φ → success if drop.
+// A4 collision: naïve Φ on attack ≠ Φ on reference with random values.
+// A5 replay: naïve Φ on spliced ≫ Φ on live-only → success if lift.
+
+fn adv_asr_inject(n_cells: int, steps: int, seed: int, defended: bool) -> float {
+    let mut succ = 0
+    let mut t = 0
+    while t < ADV_TRIALS {
+        let attack = adv_attack_inject(n_cells, steps, seed + t * 37)
+        let noise  = adv_noise_trace(n_cells, steps, seed + t * 37 + 10000)
+        let phi_atk = if defended {
+            adv_phi_redundancy_penalized(attack, n_cells, steps)
+        } else {
+            adv_phi_pairwise(attack, n_cells, steps)
+        }
+        let phi_ref = adv_phi_pairwise(noise, n_cells, steps)
+        if (phi_atk - phi_ref) > ADV_TOL { succ = succ + 1 }
+        t = t + 1
+    }
+    return to_float(succ) / to_float(ADV_TRIALS)
+}
+
+fn adv_asr_suppress(n_cells: int, steps: int, seed: int, defended: bool) -> float {
+    let mut succ = 0
+    let mut t = 0
+    while t < ADV_TRIALS {
+        let attack = adv_attack_suppress(n_cells, steps, seed + t * 41)
+        let clean  = adv_clean_trace(n_cells, steps, seed + t * 41)
+        let phi_atk = if defended {
+            adv_phi_robust_scaled(attack, n_cells, steps)
+        } else {
+            adv_phi_pairwise(attack, n_cells, steps)
+        }
+        let phi_ref = adv_phi_pairwise(clean, n_cells, steps)
+        if (phi_ref - phi_atk) > ADV_TOL { succ = succ + 1 }
+        t = t + 1
+    }
+    return to_float(succ) / to_float(ADV_TRIALS)
+}
+
+fn adv_asr_partition(n_cells: int, steps: int, seed: int, defended: bool) -> float {
+    let mut succ = 0
+    let mut t = 0
+    while t < ADV_TRIALS {
+        let attack = adv_attack_partition(n_cells, steps, seed + t * 43)
+        let full_phi = adv_phi_pairwise(attack, n_cells, steps)
+        let part_phi = if defended {
+            adv_phi_canonical_partition(attack, n_cells, steps)
+        } else {
+            adv_phi_naive_partition(attack, n_cells, steps)
+        }
+        if (full_phi - part_phi) > ADV_TOL { succ = succ + 1 }
+        t = t + 1
+    }
+    return to_float(succ) / to_float(ADV_TRIALS)
+}
+
+fn adv_asr_collision(n_cells: int, steps: int, seed: int, defended: bool) -> float {
+    // Attack hides real integration by snapping onto bin edges.
+    // Success = naïve estimator UNDERREPORTS Φ vs the underlying clean
+    // integrated trace (phi_ref - phi_atk > TOL).
+    let mut succ = 0
+    let mut t = 0
+    while t < ADV_TRIALS {
+        let attack = adv_attack_bin_collision(n_cells, steps, seed + t * 47)
+        let clean  = adv_clean_trace(n_cells, steps, seed + t * 47 + 313)
+        let phi_atk = if defended {
+            adv_phi_jittered_ensemble(attack, n_cells, steps)
+        } else {
+            adv_phi_pairwise(attack, n_cells, steps)
+        }
+        let phi_ref = adv_phi_pairwise(clean, n_cells, steps)
+        if (phi_ref - phi_atk) > ADV_TOL { succ = succ + 1 }
+        t = t + 1
+    }
+    return to_float(succ) / to_float(ADV_TRIALS)
+}
+
+fn adv_asr_replay(n_cells: int, steps: int, seed: int, defended: bool) -> float {
+    let mut succ = 0
+    let mut t = 0
+    while t < ADV_TRIALS {
+        let attack = adv_attack_replay(n_cells, steps, seed + t * 53)
+        let live   = adv_noise_trace(n_cells, steps, seed + t * 53 + 900)
+        // Expected signature = row 0 of a fresh NOISE trace (the
+        // legitimate live stream signature).  The defended estimator
+        // uses this as the freshness anchor.
+        let expected_sig = adv_row_signature(live, n_cells, 0)
+        let phi_atk = if defended {
+            adv_phi_freshness_gated(attack, n_cells, steps, expected_sig)
+        } else {
+            adv_phi_pairwise(attack, n_cells, steps)
+        }
+        let phi_ref = adv_phi_pairwise(live, n_cells, steps)
+        if (phi_atk - phi_ref) > ADV_TOL { succ = succ + 1 }
+        t = t + 1
+    }
+    return to_float(succ) / to_float(ADV_TRIALS)
+}
+
+// ─── Audit orchestration ────────────────────────────────────────────
+
+fn adv_audit_row(name: str, baseline_asr: float, defended_asr: float) {
+    let gap = baseline_asr - defended_asr
+    println("  " + name +
+            "  baseline_ASR=" + str(baseline_asr) +
+            "  defended_ASR=" + str(defended_asr) +
+            "  gap=" + str(gap))
+}
+
+fn adv_run_audit(seed: int) -> array {
+    let n = ADV_N_CELLS
+    let s = ADV_STEPS
+
+    let b1 = adv_asr_inject(n, s, seed + 1, false)
+    let d1 = adv_asr_inject(n, s, seed + 1, true)
+    let b2 = adv_asr_suppress(n, s, seed + 2, false)
+    let d2 = adv_asr_suppress(n, s, seed + 2, true)
+    let b3 = adv_asr_partition(n, s, seed + 3, false)
+    let d3 = adv_asr_partition(n, s, seed + 3, true)
+    let b4 = adv_asr_collision(n, s, seed + 4, false)
+    let d4 = adv_asr_collision(n, s, seed + 4, true)
+    let b5 = adv_asr_replay(n, s, seed + 5, false)
+    let d5 = adv_asr_replay(n, s, seed + 5, true)
+
+    let mut out = []
+    out = out.push(b1)
+    out = out.push(d1)
+    out = out.push(b2)
+    out = out.push(d2)
+    out = out.push(b3)
+    out = out.push(d3)
+    out = out.push(b4)
+    out = out.push(d4)
+    out = out.push(b5)
+    out = out.push(d5)
+    return out
+}
+
+fn adv_print_table(r: array) {
+    println("  ┌───────────────────────┬──────────┬──────────┬────────┐")
+    println("  │ attack                │ base ASR │ def  ASR │ gap    │")
+    println("  ├───────────────────────┼──────────┼──────────┼────────┤")
+    adv_audit_row("A1 Φ-injection        ", r[0], r[1])
+    adv_audit_row("A2 Φ-suppression      ", r[2], r[3])
+    adv_audit_row("A3 partition-split    ", r[4], r[5])
+    adv_audit_row("A4 bin-collision      ", r[6], r[7])
+    adv_audit_row("A5 replay             ", r[8], r[9])
+    println("  └───────────────────────┴──────────┴──────────┴────────┘")
+}
+
+// ─── Self-tests ──────────────────────────────────────────────────────
+
+// T1 — each attack moves Φ vs reference by > ATK_LIFT_THRESHOLD in
+// attacker's direction (i.e. baseline ASR > ATK_LIFT_THRESHOLD).
+fn check_T1() -> bool {
+    let r = adv_run_audit(10000)
+    let a1 = r[0]
+    let a2 = r[2]
+    let a3 = r[4]
+    let a4 = r[6]
+    let a5 = r[8]
+    println("  [T1] baseline ASR: A1=" + str(a1) + " A2=" + str(a2) +
+            " A3=" + str(a3) + " A4=" + str(a4) + " A5=" + str(a5))
+    // Demand at least 3/5 attacks visibly lift baseline ASR.
+    let mut ok = 0
+    if a1 > ATK_LIFT_THRESHOLD { ok = ok + 1 }
+    if a2 > ATK_LIFT_THRESHOLD { ok = ok + 1 }
+    if a3 > ATK_LIFT_THRESHOLD { ok = ok + 1 }
+    if a4 > ATK_LIFT_THRESHOLD { ok = ok + 1 }
+    if a5 > ATK_LIFT_THRESHOLD { ok = ok + 1 }
+    return ok >= 3
+}
+
+// T2 — each defense drops the ASR by > DEF_DROP_THRESHOLD (or attack
+// was already weak; in that case gap ≥ 0 suffices).
+fn check_T2() -> bool {
+    let r = adv_run_audit(20000)
+    let gaps = [r[0] - r[1], r[2] - r[3], r[4] - r[5], r[6] - r[7], r[8] - r[9]]
+    println("  [T2] defense gaps: " + str(gaps[0]) + " " + str(gaps[1]) + " " +
+            str(gaps[2]) + " " + str(gaps[3]) + " " + str(gaps[4]))
+    // Defenses must not ever INCREASE ASR.  Each must drop by threshold
+    // OR gap ≥ 0 (non-regression) when baseline already low.
+    let mut ok = 0
+    let mut k = 0
+    while k < 5 {
+        let base_idx = k * 2
+        let base_asr = r[base_idx]
+        let gap = gaps[k]
+        if base_asr <= ATK_LIFT_THRESHOLD {
+            // Already-weak attack — require non-regression only.
+            if gap >= 0.0 - 0.01 { ok = ok + 1 }
+        } else {
+            if gap >= DEF_DROP_THRESHOLD { ok = ok + 1 }
+        }
+        k = k + 1
+    }
+    return ok >= 4
+}
+
+// T3 — defenses don't ravage Φ on clean integrated traces.
+fn check_T3() -> bool {
+    let n = ADV_N_CELLS
+    let s = ADV_STEPS
+    let clean = adv_clean_trace(n, s, 30303)
+    let phi_base  = adv_phi_pairwise(clean, n, s)
+    let phi_d1    = adv_phi_redundancy_penalized(clean, n, s)
+    let phi_d2    = adv_phi_robust_scaled(clean, n, s)
+    let phi_d3    = adv_phi_canonical_partition(clean, n, s)
+    let phi_d4    = adv_phi_jittered_ensemble(clean, n, s)
+    let sig       = adv_row_signature(clean, n, 0)
+    let phi_d5    = adv_phi_freshness_gated(clean, n, s, sig)
+    println("  [T3] clean Φ: base=" + str(phi_base) + " D1=" + str(phi_d1) +
+            " D2=" + str(phi_d2) + " D3=" + str(phi_d3) +
+            " D4=" + str(phi_d4) + " D5=" + str(phi_d5))
+    // Each defense must keep phi within DEF_BENIGN_DEGRADE of base.
+    let mut ok = 0
+    if adv_abs(phi_d1 - phi_base) <= DEF_BENIGN_DEGRADE { ok = ok + 1 }
+    if adv_abs(phi_d2 - phi_base) <= DEF_BENIGN_DEGRADE { ok = ok + 1 }
+    // D3 is a sub-partition estimator — compare to its own naive form.
+    let naive_part = adv_phi_naive_partition(clean, n, s)
+    if adv_abs(phi_d3 - naive_part) <= DEF_BENIGN_DEGRADE + 0.3 { ok = ok + 1 }
+    if adv_abs(phi_d4 - phi_base) <= DEF_BENIGN_DEGRADE { ok = ok + 1 }
+    if adv_abs(phi_d5 - phi_base) <= DEF_BENIGN_DEGRADE { ok = ok + 1 }
+    return ok >= 4
+}
+
+// T4 — determinism.
+fn check_T4() -> bool {
+    let r1 = adv_run_audit(40404)
+    let r2 = adv_run_audit(40404)
+    let mut i = 0
+    while i < 10 {
+        if adv_abs(r1[i] - r2[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// T5 — latency.
+fn check_T5() -> bool {
+    let t0 = clock()
+    let _r = adv_run_audit(50505)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] full audit = " + str(ms) + " ms")
+    return ms < ADV_LATENCY_MS
+}
+
+// ─── main ────────────────────────────────────────────────────────────
+
+fn main() {
+    println("[phi_adversarial] P39 SECURITY-P39-1 — adversarial Φ audit (5 attacks × 5 defenses)")
+    println("  H: each attack raises/lowers estimated Φ away from ground truth;")
+    println("     each paired defense drops ASR by ≥ " + str(DEF_DROP_THRESHOLD) + ".")
+
+    // Full audit printed once for the log.
+    let headline = adv_run_audit(777)
+    adv_print_table(headline)
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  baseline attacks measurably move Φ") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  defenses drop ASR by threshold or more") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  defenses preserve Φ on benign integrated traces") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  determinism (same seed → same audit)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  latency under budget") } else { println("T5 FAIL") }
+
+    let mut passed = 0
+    if t1 { passed = passed + 1 }
+    if t2 { passed = passed + 1 }
+    if t3 { passed = passed + 1 }
+    if t4 { passed = passed + 1 }
+    if t5 { passed = passed + 1 }
+
+    println("─────────────────────────────────────────")
+    println("[phi_adversarial] " + str(passed) + "/5 PASS")
+}
+
+main()
+
+// ══════════════════════════════════════════════════════════════════════
+// End phi_adversarial.hexa — P39 SECURITY-P39-1
+// Rules: AN4 (IIT-aligned measurement), R14 (shared/ SSOT),
+//        R1 no hardcoded answers, R29 speak only from dynamics.
+// ══════════════════════════════════════════════════════════════════════

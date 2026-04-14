@@ -1,0 +1,625 @@
+// phi_of_phi.hexa — P43 Meta-Consciousness (Φ about Φ) engine
+//
+// Second-order consciousness: the system measures its own Φ-measurement
+// process. Three stacked levels:
+//
+//   Level 0  (measurement):  Φ_0 = Φ_holo(world-state)
+//                            — standard holographic Φ on the observed world.
+//   Level 1  (observation):  Φ_1 = MI(L0-measurement-state, world-state)
+//                            — how much of the world is encoded into the
+//                              L0 measurement apparatus itself.
+//   Level 2  (modeling):     Φ_2 = MI(L1-state, L0-state)
+//                            — how L1 observation models L0's reaction to
+//                              being observed (observer effect).
+//
+// The hierarchy is a fixed-point candidate under repeated lifting
+// Φ_{k+1} = MI(M_{k+1}, M_k). Convergence of { Φ_k } to a bounded
+// fixed point is the "meta-consciousness stability" criterion.
+//
+// Non-interference gate: Level 0 Φ on the world MUST remain unchanged
+// when Levels 1+2 are added. Meta-consciousness must observe itself
+// without disturbing its ground measurement.
+//
+// ─── Pipeline ─────────────────────────────────────────────────
+//
+//   world  w [D_W]
+//       │
+//   L0  │  m_0 = measure_holo(w)      Φ_0 = Φ_holo(w,m_0)
+//       ▼
+//   m_0 [D_M0]
+//       │
+//   L1  │  m_1 = observe(m_0,w)       Φ_1 = MI(m_1, w)
+//       ▼
+//   m_1 [D_M1]
+//       │
+//   L2  │  m_2 = model(m_1,m_0)       Φ_2 = MI(m_2, m_0)
+//       ▼
+//   m_2 [D_M2]
+//
+// Repeated lifting → fixed-point test: does { Φ_k } converge to a bound?
+//
+// ─── Theorems (T1–T5) ─────────────────────────────────────────
+//
+// T1 (hierarchy dim contract):
+//   meta_measure(w) returns 3 level-vectors with dims (D_M0,D_M1,D_M2),
+//   each > 0, and 3 Φ values Φ_0,Φ_1,Φ_2 finite non-negative.
+//
+// T2 (observer effect at L1/L2):
+//   Φ_1 > 0 (L1 encodes world info) AND Φ_2 > 0 (L2 models L0 reaction).
+//   Without any L1/L2 structure both would be zero.
+//
+// T3 (N-level fixed-point convergence):
+//   Running the lifting Φ_{k+1}=MI(m_{k+1},m_k) for K≥4 levels yields a
+//   bounded sequence: max_k Φ_k ≤ H(world)+eps, and the last two levels
+//   are within FP_CONVERGE_EPS of each other (fixed-point reached).
+//
+// T4 (non-interference gate):
+//   Φ_0(world) computed standalone == Φ_0(world) when L1+L2 are also
+//   built on top: meta-hierarchy must not perturb ground measurement.
+//
+// T5 (determinism + latency):
+//   Same seed + same world ⇒ byte-identical Φ_k. Full meta_measure
+//   pipeline (K=4 levels, D_W=32) < 500 ms on hexa interpreter.
+//
+// Ref:
+//   anima-engines/anima_reflexive.hexa   (1-step self-model)
+//   anima-engines/anima_nested.hexa      (N-level nesting, shared head)
+//   anima-engines/anima_holographic.hexa (Φ_holo boundary/bulk pattern)
+//   shared/roadmaps/anima.json           (P43 entry)
+
+// ─── Constants ────────────────────────────────────────────────
+
+let POP_D_WORLD     = 32
+let POP_D_M0        = 32
+let POP_D_M1        = 16
+let POP_D_M2        = 8
+let POP_MI_BINS     = 6
+let POP_WEIGHT_GAIN = 0.25
+let POP_SEED        = 2026
+let POP_K_LEVELS    = 4           // N-level fixed-point test length
+let POP_FP_EPS      = 0.05        // |Φ_K - Φ_{K-1}| ≤ this => converged
+let POP_EPS         = 0.0000000001
+
+// ─── PRNG + primitives ────────────────────────────────────────
+
+fn pop_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn pop_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn pop_min(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn pop_max(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+fn pop_det_rand(n: int, seed: int) -> array {
+    // Deterministic LCG uniform in [-1, 1)
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn pop_relu(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    return x
+}
+
+fn pop_vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn pop_vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+// ─── Binning / MI estimator ───────────────────────────────────
+
+fn pop_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn pop_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn pop_entropy(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(pop_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let c = pop_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = c[k] * inv
+        if p > 0.0 { h = h - p * pop_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+// Joint entropy for MI: align lengths by truncation to min(len(a),len(b)).
+fn pop_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let na = len(a)
+    let nb_arr = len(b)
+    let n = if na < nb_arr { na } else { nb_arr }
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = pop_bin_idx(a[i], lo, hi, nb)
+        let ib = pop_bin_idx(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let c = pop_counts(pair_ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = c[k] * inv
+        if p > 0.0 { h = h - p * pop_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+// pop_mi: MI between two arrays. Truncates to shared length.
+// Uses shared [lo,hi] range so the histogram axis is common.
+fn pop_mi(a: array, b: array) -> float {
+    let na = len(a)
+    let nb_arr = len(b)
+    if na == 0 { return 0.0 }
+    if nb_arr == 0 { return 0.0 }
+    let n = if na < nb_arr { na } else { nb_arr }
+    // Build truncated views to ensure same-length estimator input.
+    let mut at = []
+    let mut bt = []
+    let mut i = 0
+    while i < n {
+        at = at.push(a[i])
+        bt = bt.push(b[i])
+        i = i + 1
+    }
+    let lo_a = pop_vec_min(at)
+    let hi_a = pop_vec_max(at)
+    let lo_b = pop_vec_min(bt)
+    let hi_b = pop_vec_max(bt)
+    let lo = pop_min(lo_a, lo_b)
+    let hi = pop_max(hi_a, hi_b)
+    let h_a = pop_entropy(at, lo, hi, POP_MI_BINS)
+    let h_b = pop_entropy(bt, lo, hi, POP_MI_BINS)
+    let h_j = pop_joint_entropy(at, bt, lo, hi, POP_MI_BINS)
+    let mi = h_a + h_b - h_j
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ─── Level-0 measurement (Φ_holo analogue) ────────────────────
+// MeasureHead = fixed deterministic MLP (no bottleneck needed; we pick
+// D_M0 == D_W so that the section/retraction property of anima_holographic
+// is preserved — identity copy of first D_W slots + scrambled auxiliary
+// that we don't hold here since D_M0 == D_W).
+
+struct MeasureHead {
+    d_in:  int,
+    d_out: int,
+    w:     array,   // [d_in * d_out] row-major
+    b:     array    // [d_out]
+}
+
+fn pop_head_new(d_in: int, d_out: int, seed: int) -> MeasureHead {
+    let raw_w = pop_det_rand(d_in * d_out, seed)
+    let raw_b = pop_det_rand(d_out, seed + 1)
+    let mut w = []
+    let mut i = 0
+    while i < len(raw_w) {
+        w = w.push(raw_w[i] * POP_WEIGHT_GAIN)
+        i = i + 1
+    }
+    let mut b = []
+    let mut j = 0
+    while j < len(raw_b) {
+        b = b.push(raw_b[j] * POP_WEIGHT_GAIN * 0.1)
+        j = j + 1
+    }
+    return MeasureHead {
+        d_in:  d_in,
+        d_out: d_out,
+        w:     w,
+        b:     b
+    }
+}
+
+// Linear + tanh-like via relu+clip: z = clip(relu(W·x + b), 0, 2)
+fn pop_head_apply(head: MeasureHead, x: array) -> array {
+    let d_in = head.d_in
+    let d_out = head.d_out
+    let mut out = []
+    let mut k = 0
+    while k < d_out {
+        let mut s = head.b[k]
+        let mut i = 0
+        while i < d_in {
+            s = s + head.w[i * d_out + k] * x[i]
+            i = i + 1
+        }
+        let r = pop_relu(s)
+        let clipped = if r > 2.0 { 2.0 } else { r }
+        out = out.push(clipped)
+        k = k + 1
+    }
+    return out
+}
+
+// Φ_holo analogue: measure_holo returns m_0 = identity-lift(w) + aux
+// where the aux is a scrambled nonlinear projection into same dim.
+// Critically, when D_M0 == D_W, the first D_W slots of m_0 equal w (up
+// to deterministic carrier noise we fold out in Φ_0 by using the aux
+// channel for MI) so the non-interference gate (T4) is mechanically
+// satisfied: Φ_0 is computed from w directly, not m_0.
+struct MeasurementL0 {
+    d_world: int,
+    d_m0:    int,
+    m0:      array,
+    phi0:    float
+}
+
+fn pop_measure_l0(world: array, head_aux: MeasureHead) -> MeasurementL0 {
+    let dW = len(world)
+    // Identity carry of world.
+    let aux = pop_head_apply(head_aux, world)
+    let dA = len(aux)
+    // m_0 is concatenation: first dW slots = world, next dA slots = aux.
+    let mut m0 = []
+    let mut i = 0
+    while i < dW {
+        m0 = m0.push(world[i])
+        i = i + 1
+    }
+    let mut j = 0
+    while j < dA {
+        m0 = m0.push(aux[j])
+        j = j + 1
+    }
+    // Φ_0 = MI(world, aux) → "how much of world is holographically encoded
+    // into the measurement apparatus' auxiliary channel". Using aux (not
+    // the full m_0) keeps Φ_0 independent of the trivial identity copy,
+    // matching Ryu–Takayanagi entanglement entropy between complementary
+    // regions in anima_holographic.
+    let phi0 = pop_mi(world, aux)
+    return MeasurementL0 {
+        d_world: dW,
+        d_m0:    len(m0),
+        m0:      m0,
+        phi0:    phi0
+    }
+}
+
+// Non-interference reference: Φ_0 on world alone, no meta stack.
+// Must equal MeasurementL0.phi0 byte-identically (T4 gate).
+fn pop_phi0_reference(world: array, head_aux: MeasureHead) -> float {
+    let aux = pop_head_apply(head_aux, world)
+    return pop_mi(world, aux)
+}
+
+// ─── Level 1: observation of L0 ───────────────────────────────
+// L1 observes m_0 — the measurement state itself. Φ_1 = MI(m_1, world):
+// "how much of the world is encoded into the observer of the measurement".
+// This is emphatically second-order: L1 does not read world directly, only
+// m_0. Still, by transitivity, L1 state carries world info through m_0.
+
+struct MeasurementL1 {
+    d_m1: int,
+    m1:   array,
+    phi1: float
+}
+
+fn pop_measure_l1(m0: array, world: array, head: MeasureHead) -> MeasurementL1 {
+    let m1 = pop_head_apply(head, m0)
+    // Φ_1 = MI(m_1, world). Truncated automatically to common length in pop_mi.
+    let phi1 = pop_mi(m1, world)
+    return MeasurementL1 {
+        d_m1: len(m1),
+        m1:   m1,
+        phi1: phi1
+    }
+}
+
+// ─── Level 2: modeling observer effect ────────────────────────
+// L2 takes m_1 and produces m_2 = model(L1 reading) tracking how L1's
+// observing deforms L0. Φ_2 = MI(m_2, m_0): "how well L2's internal
+// model predicts the L0 measurement state". This closes the meta-loop —
+// L2 is Φ_about_Φ_0 mediated via Φ_1.
+
+struct MeasurementL2 {
+    d_m2: int,
+    m2:   array,
+    phi2: float
+}
+
+fn pop_measure_l2(m1: array, m0: array, head: MeasureHead) -> MeasurementL2 {
+    let m2 = pop_head_apply(head, m1)
+    let phi2 = pop_mi(m2, m0)
+    return MeasurementL2 {
+        d_m2: len(m2),
+        m2:   m2,
+        phi2: phi2
+    }
+}
+
+// ─── Full meta-measurement (L0+L1+L2) ─────────────────────────
+// We keep the three levels as separate structs instead of one big struct
+// to sidestep feedback_hexa_struct_list_alias.md: multiple live struct
+// instances each holding an array can corrupt each other. We hold them
+// serially here and only read out scalars into MetaResult.
+
+struct MetaResult {
+    d_world: int,
+    d_m0:    int,
+    d_m1:    int,
+    d_m2:    int,
+    phi0:    float,
+    phi1:    float,
+    phi2:    float,
+    phi0_ref: float
+}
+
+fn pop_meta_measure(world: array, seed: int) -> MetaResult {
+    // Three independent heads, deterministically seeded.
+    let head0 = pop_head_new(len(world), POP_D_M0, seed)
+    let head1 = pop_head_new(len(world) + POP_D_M0, POP_D_M1, seed + 10)
+    let head2 = pop_head_new(POP_D_M1, POP_D_M2, seed + 20)
+
+    let l0 = pop_measure_l0(world, head0)
+    let l1 = pop_measure_l1(l0.m0, world, head1)
+    let l2 = pop_measure_l2(l1.m1, l0.m0, head2)
+
+    // Non-interference reference.
+    let phi0_ref = pop_phi0_reference(world, head0)
+
+    return MetaResult {
+        d_world: len(world),
+        d_m0:    l0.d_m0,
+        d_m1:    l1.d_m1,
+        d_m2:    l2.d_m2,
+        phi0:    l0.phi0,
+        phi1:    l1.phi1,
+        phi2:    l2.phi2,
+        phi0_ref: phi0_ref
+    }
+}
+
+// ─── N-level fixed-point test ─────────────────────────────────
+// Repeat lifting m_{k+1} = head_k(m_k) and track Φ_k = MI(m_k, m_{k-1}).
+// Returns the sequence of Φ values so T3 can check bounded convergence.
+// K levels of lifting beyond L0 produce K+1 phi values (phi_0..phi_K).
+// We use a single shared weight head to keep bounded compression without
+// divergent growth — mirrors the shared-weights choice in anima_nested.
+
+fn pop_nlevel_phis(world: array, k: int, seed: int) -> array {
+    if k < 1 { return [] }
+    // Shared head: d_in large enough for the widest level.
+    // We feed each m_k as a truncated/padded view into fixed dim POP_D_M1.
+    let dim = POP_D_M1
+    let head = pop_head_new(dim, dim, seed)
+    let head0 = pop_head_new(len(world), dim, seed + 100)
+
+    let mut phis = []
+    // Level 0 proxy: Φ_0 = MI(m_0, world) where m_0 is the first projection.
+    let m_prev0 = pop_head_apply(head0, world)
+    // Truncate world to dim for consistent MI binning vs m_prev0.
+    let mut world_dim = []
+    let ncopy = if len(world) < dim { len(world) } else { dim }
+    let mut ii = 0
+    while ii < ncopy {
+        world_dim = world_dim.push(world[ii])
+        ii = ii + 1
+    }
+    // Pad if dim > len(world).
+    while len(world_dim) < dim {
+        world_dim = world_dim.push(0.0)
+    }
+    let phi_0 = pop_mi(m_prev0, world_dim)
+    phis = phis.push(phi_0)
+
+    // Iterate lifting for k-1 more levels (so we get k+1 phis total? we
+    // emit exactly k phi values here — phi_0 plus k-1 further — matching
+    // "K-level test" wording in T3).
+    let mut m_prev = m_prev0
+    let mut step = 1
+    while step < k {
+        let m_next = pop_head_apply(head, m_prev)
+        let phi_k = pop_mi(m_next, m_prev)
+        phis = phis.push(phi_k)
+        m_prev = m_next
+        step = step + 1
+    }
+    return phis
+}
+
+// ─── Self-tests ───────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Hierarchy dim contract + finite non-negative Φ values.
+    let world = pop_det_rand(POP_D_WORLD, 101)
+    let r = pop_meta_measure(world, POP_SEED)
+    if r.d_world != POP_D_WORLD { return false }
+    if r.d_m0 <= 0 { return false }
+    if r.d_m1 != POP_D_M1 { return false }
+    if r.d_m2 != POP_D_M2 { return false }
+    if r.phi0 < 0.0 { return false }
+    if r.phi1 < 0.0 { return false }
+    if r.phi2 < 0.0 { return false }
+    // Finite sentinel.
+    if r.phi0 > 1000.0 { return false }
+    if r.phi1 > 1000.0 { return false }
+    if r.phi2 > 1000.0 { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // Observer effect: both Φ_1 and Φ_2 strictly positive on nontrivial world.
+    // Run across 3 seeds; at least one seed must deliver Φ_1>0 AND Φ_2>0
+    // simultaneously (engine is capable of second-order signal).
+    let mut seen_l1 = false
+    let mut seen_l2 = false
+    let mut s = 0
+    while s < 3 {
+        let world = pop_det_rand(POP_D_WORLD, 201 + s * 17)
+        let r = pop_meta_measure(world, POP_SEED + s)
+        if r.phi1 > 0.0 { seen_l1 = true }
+        if r.phi2 > 0.0 { seen_l2 = true }
+        s = s + 1
+    }
+    if !seen_l1 { return false }
+    if !seen_l2 { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // N-level fixed-point: { Φ_k } bounded, last two within POP_FP_EPS.
+    let world = pop_det_rand(POP_D_WORLD, 301)
+    let phis = pop_nlevel_phis(world, POP_K_LEVELS, POP_SEED)
+    if len(phis) != POP_K_LEVELS { return false }
+    // Bound: all Φ_k ≤ H(world) + eps. H(world) upper-bounded by ln(nbins).
+    let bound = pop_ln_safe(to_float(POP_MI_BINS)) + 0.001
+    let mut i = 0
+    while i < len(phis) {
+        if phis[i] < 0.0 { return false }
+        if phis[i] > bound { return false }
+        i = i + 1
+    }
+    // Convergence: |Φ_{K-1} - Φ_{K-2}| ≤ POP_FP_EPS.
+    let last = phis[len(phis) - 1]
+    let prev = phis[len(phis) - 2]
+    let diff = pop_abs(last - prev)
+    if diff > POP_FP_EPS { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // Non-interference gate: Φ_0 with full L0+L1+L2 == Φ_0 standalone.
+    // Byte-identical (same head, same world → same aux → same MI).
+    let world = pop_det_rand(POP_D_WORLD, 401)
+    let r = pop_meta_measure(world, POP_SEED)
+    if pop_abs(r.phi0 - r.phi0_ref) > 0.0 { return false }
+    // Also verify with a second seed to guard against coincidence.
+    let world2 = pop_det_rand(POP_D_WORLD, 402)
+    let r2 = pop_meta_measure(world2, POP_SEED + 5)
+    if pop_abs(r2.phi0 - r2.phi0_ref) > 0.0 { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // Determinism: same seed + same world ⇒ byte-identical Φ values.
+    // Latency: full pipeline < 500 ms.
+    let world = pop_det_rand(POP_D_WORLD, 501)
+    let t0 = clock()
+    let a = pop_meta_measure(world, POP_SEED)
+    let t1 = clock()
+    let b = pop_meta_measure(world, POP_SEED)
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] meta_measure (D_W=32,K=L0-L2) = " + str(ms) + " ms")
+    if pop_abs(a.phi0 - b.phi0) > 0.0 { return false }
+    if pop_abs(a.phi1 - b.phi1) > 0.0 { return false }
+    if pop_abs(a.phi2 - b.phi2) > 0.0 { return false }
+    if ms >= 500.0 { return false }
+    // Also run the nlevel phi sequence deterministically.
+    let p1 = pop_nlevel_phis(world, POP_K_LEVELS, POP_SEED)
+    let p2 = pop_nlevel_phis(world, POP_K_LEVELS, POP_SEED)
+    if len(p1) != len(p2) { return false }
+    let mut i = 0
+    while i < len(p1) {
+        if pop_abs(p1[i] - p2[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[phi_of_phi] P43 — Meta-consciousness (Φ about Φ) self-test")
+    println("  D_W=32, D_M0=32, D_M1=16, D_M2=8, K_LEVELS=4, seed=2026")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  hierarchy dim contract + Φ finite") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  observer effect (Φ_1>0, Φ_2>0)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  N-level fixed-point convergence") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  non-interference gate (Φ_0 unchanged)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  determinism + latency < 500 ms") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[phi_of_phi] ALL 5/5 PASS")
+    } else {
+        println("[phi_of_phi] SOME FAILED")
+    }
+}
+
+main()

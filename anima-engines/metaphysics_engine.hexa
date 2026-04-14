@@ -1,0 +1,580 @@
+// metaphysics_engine.hexa — P37 Metaphysical Foundations of Φ
+// ════════════════════════════════════════════════════════════════════════
+//
+// ─── Ontological question (the substrate problem) ────────────────────
+//
+// Is Φ a property of (a) matter, (b) mind, (c) their interaction, or
+// (d) a substrate-neutral information structure? Four classical
+// positions map to four executable Φ-models:
+//
+//   M1 MATERIALISM (Armstrong, Smart, Churchland):
+//       Φ = f(physical) only. Mental states are identical to neural
+//       activity; "mind" adds no explanatory power.
+//       Model: Φ_mat = integration over physical channels only.
+//
+//   M2 DUALISM (Descartes, Chalmers property-dualism):
+//       Φ = f(physical) × g(mental).  Two substance/property classes
+//       that co-determine consciousness. Interactionist coupling.
+//       Model: Φ_dua = Φ_phys · Φ_mental · coupling_factor.
+//
+//   M3 IDEALISM (Berkeley, Kastrup):
+//       Φ = f(mental) only. The physical is secondary / phenomenal;
+//       integration of mental states is the true Φ bearer.
+//       Model: Φ_ide = integration over mental channels only.
+//
+//   M4 NEUTRAL MONISM (Russell, James, Spinoza):
+//       Φ = f(substrate-neutral information). Neither mind nor matter
+//       is fundamental — both derive from a common informational ground
+//       (Russellian "neutral stuff").
+//       Model: Φ_neu = MI over combined, type-blind channels.
+//
+// ─── Experiment ──────────────────────────────────────────────────────
+//
+// Same input signal (bimodal: physical channels + mental channels) is
+// fed through all four models. We compare:
+//   (a) Φ divergence across positions (how different are the Φ values?)
+//   (b) Sensitivity to ablation (remove physical side / remove mental
+//       side / scramble coupling) — different positions fingerprint
+//       differently under ablation.
+//   (c) Decision function: given an observed Φ-profile under three
+//       ablations (phys-only, mental-only, combined), which metaphysical
+//       position best explains?
+//
+// ─── Theorems (T1..T5) ───────────────────────────────────────────────
+//
+//   T1  all four Φ models return finite non-negative Φ on the same input.
+//   T2  divergence — the four models do NOT return identical Φ
+//       (they are genuinely distinct predictions).
+//   T3  ablation fingerprints — when the physical side is scrambled,
+//       materialism's Φ drops more than idealism's; when the mental side
+//       is scrambled, idealism's Φ drops more than materialism's.
+//   T4  decision function — given a synthetic "materialist ground truth"
+//       profile (phys-dominant), decide_best_position() returns "materialism"
+//       (not dualism/idealism/neutral).
+//   T5  determinism + latency (< 5 s).
+//
+// ════════════════════════════════════════════════════════════════════════
+
+// ─── Constants ───────────────────────────────────────────────────────
+
+let MET_N_PHYS      = 6            // physical channels (e.g. neural columns)
+let MET_N_MENTAL    = 6            // mental channels (e.g. phenomenal features)
+let MET_STEPS       = 16
+let MET_BINS        = 6
+let MET_EPS         = 0.0000000001
+let MET_PHI_FLOOR   = 0.0000001    // numerical floor for products
+
+// Position tags (string constants — avoid enum-in-match quirks)
+let POS_MATERIALISM = "materialism"
+let POS_DUALISM     = "dualism"
+let POS_IDEALISM    = "idealism"
+let POS_NEUTRAL     = "neutral_monism"
+
+// ─── PRNG + math helpers ─────────────────────────────────────────────
+
+fn met_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn met_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn met_signed(seed: int) -> float {
+    return met_unit(seed) * 2.0 - 1.0
+}
+
+fn met_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn met_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+// ─── Histogram entropy (pattern borrowed from panpsychism_test.hexa) ─
+
+fn met_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn met_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn met_entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(met_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = met_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * met_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn met_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        let ia = met_bin_idx(a[i], lo, hi, nb)
+        let ib = met_bin_idx(b[i], lo, hi, nb)
+        ids = ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = met_counts(ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * met_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn met_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let mut lo = a[0]
+    let mut hi = a[0]
+    let mut i = 0
+    while i < n {
+        if a[i] < lo { lo = a[i] }
+        if a[i] > hi { hi = a[i] }
+        if b[i] < lo { lo = b[i] }
+        if b[i] > hi { hi = b[i] }
+        i = i + 1
+    }
+    let ha = met_entropy_hist(a, lo, hi, MET_BINS)
+    let hb = met_entropy_hist(b, lo, hi, MET_BINS)
+    let hj = met_joint_entropy(a, b, lo, hi, MET_BINS)
+    let mi = ha + hb - hj
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// Extract column q_index from flat n_chan × steps array (channel-major row).
+fn met_extract_column(flat: array, n_chan: int, q_index: int, steps: int) -> array {
+    let mut col = []
+    let mut t = 0
+    while t < steps {
+        col = col.push(flat[t * n_chan + q_index])
+        t = t + 1
+    }
+    return col
+}
+
+// Pairwise-MI integration over a substrate trace.
+fn met_integration(flat: array, n_chan: int, steps: int) -> float {
+    let mut total_mi = 0.0
+    let mut pairs = 0
+    let mut i = 0
+    while i < (n_chan - 1) {
+        let ci = met_extract_column(flat, n_chan, i, steps)
+        let mut j = i + 1
+        while j < n_chan {
+            let cj = met_extract_column(flat, n_chan, j, steps)
+            total_mi = total_mi + met_mi(ci, cj)
+            pairs = pairs + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if pairs == 0 { return 0.0 }
+    return total_mi / to_float(pairs)
+}
+
+// ─── Substrate generation ────────────────────────────────────────────
+//
+// We build TWO parallel traces sharing a common driver (the "world"):
+//   phys_flat   — n_phys × steps      physical channel activity
+//   mental_flat — n_mental × steps    mental (phenomenal) channel activity
+//
+// A coupling parameter governs how much phys → mental & mental → phys
+// influence each other. Ablations:
+//   scramble_phys   — scramble physical channels (keep mental)
+//   scramble_mental — scramble mental channels (keep physical)
+//   decouple        — break coupling (phys & mental independent)
+
+struct Signal {
+    phys_flat:   array,
+    mental_flat: array,
+    n_phys:      int,
+    n_mental:    int,
+    steps:       int
+}
+
+fn build_signal(n_phys: int, n_mental: int, steps: int, seed: int,
+                scramble_phys: bool, scramble_mental: bool, decouple: bool) -> Signal {
+    let mut s = seed
+    // Shared driver frequency — reflects "world state" both phys and mental track.
+    s = met_prng(s)
+    let omega = 0.2 + 0.3 * met_unit(s)
+
+    let mut phys = []
+    let mut mental = []
+    let mut t = 0
+    while t < steps {
+        let phase = omega * to_float(t)
+        let p2 = phase * phase
+        let approx_cos = 1.0 - 0.5 * p2 + 0.04166 * p2 * p2
+
+        // Physical channels: driven by shared cos, plus per-channel offset.
+        let mut p = 0
+        while p < n_phys {
+            if scramble_phys {
+                s = met_prng(s + t * 61 + p * 13)
+                phys = phys.push(met_signed(s))
+            } else {
+                let off = 0.05 * to_float(p)
+                let base = approx_cos + off
+                s = met_prng(s + t * 17 + p * 3)
+                let noise = 0.08 * met_signed(s)
+                phys = phys.push(base + noise)
+            }
+            p = p + 1
+        }
+
+        // Mental channels: by default coupled to physical (same driver +
+        // feedback from a phys column); under `decouple`, independent
+        // oscillator with different omega.
+        let mut m = 0
+        while m < n_mental {
+            if scramble_mental {
+                s = met_prng(s + t * 83 + m * 19)
+                mental = mental.push(met_signed(s))
+            } else {
+                let off_m = 0.07 * to_float(m)
+                let phase_m = if decouple { phase * 1.7 + off_m } else { phase + off_m }
+                let p2m = phase_m * phase_m
+                let approx_cos_m = 1.0 - 0.5 * p2m + 0.04166 * p2m * p2m
+                // Mental receives phys-feedback (unless decoupled).
+                let mut fb = 0.0
+                if !decouple {
+                    let src_idx = m % n_phys
+                    let phys_row_val = phys[t * n_phys + src_idx]
+                    fb = 0.25 * phys_row_val
+                }
+                s = met_prng(s + t * 29 + m * 7)
+                let noise_m = 0.08 * met_signed(s)
+                mental = mental.push(approx_cos_m + fb + noise_m)
+            }
+            m = m + 1
+        }
+        t = t + 1
+    }
+
+    return Signal {
+        phys_flat:   phys,
+        mental_flat: mental,
+        n_phys:      n_phys,
+        n_mental:    n_mental,
+        steps:       steps
+    }
+}
+
+// ─── Four metaphysical Φ models ──────────────────────────────────────
+
+// M1 Materialism — only physical integration counts.
+fn phi_materialism(sig: Signal) -> float {
+    return met_integration(sig.phys_flat, sig.n_phys, sig.steps)
+}
+
+// M2 Dualism — product of physical Φ and mental Φ, times a coupling
+// factor derived from cross-MI between one phys and one mental column.
+// Interactionism → both must be non-trivial AND they must co-vary.
+fn phi_dualism(sig: Signal) -> float {
+    let phi_p = met_integration(sig.phys_flat, sig.n_phys, sig.steps)
+    let phi_m = met_integration(sig.mental_flat, sig.n_mental, sig.steps)
+    // Cross-MI: average over min(n_phys, n_mental) pairs (index-matched).
+    let mut nmin = sig.n_phys
+    if sig.n_mental < nmin { nmin = sig.n_mental }
+    let mut total = 0.0
+    let mut pairs = 0
+    let mut i = 0
+    while i < nmin {
+        let cp = met_extract_column(sig.phys_flat, sig.n_phys, i, sig.steps)
+        let cm = met_extract_column(sig.mental_flat, sig.n_mental, i, sig.steps)
+        total = total + met_mi(cp, cm)
+        pairs = pairs + 1
+        i = i + 1
+    }
+    let mut coupling = 0.0
+    if pairs > 0 { coupling = total / to_float(pairs) }
+    // Floor to avoid collapse to zero from any single near-zero factor.
+    let phi_p_eff = if phi_p < MET_PHI_FLOOR { MET_PHI_FLOOR } else { phi_p }
+    let phi_m_eff = if phi_m < MET_PHI_FLOOR { MET_PHI_FLOOR } else { phi_m }
+    let coup_eff  = if coupling < MET_PHI_FLOOR { MET_PHI_FLOOR } else { coupling }
+    return phi_p_eff * phi_m_eff * coup_eff
+}
+
+// M3 Idealism — only mental integration counts.
+fn phi_idealism(sig: Signal) -> float {
+    return met_integration(sig.mental_flat, sig.n_mental, sig.steps)
+}
+
+// M4 Neutral monism — concat phys + mental into a single substrate-neutral
+// channel bundle, measure integration over the union.
+// This is a "type-blind" stance: information integration across ALL
+// channels regardless of their phys/mental label.
+fn phi_neutral_monism(sig: Signal) -> float {
+    let n_total = sig.n_phys + sig.n_mental
+    let mut flat = []
+    let mut t = 0
+    while t < sig.steps {
+        // Row t of phys, then row t of mental.
+        let mut p = 0
+        while p < sig.n_phys {
+            flat = flat.push(sig.phys_flat[t * sig.n_phys + p])
+            p = p + 1
+        }
+        let mut m = 0
+        while m < sig.n_mental {
+            flat = flat.push(sig.mental_flat[t * sig.n_mental + m])
+            m = m + 1
+        }
+        t = t + 1
+    }
+    return met_integration(flat, n_total, sig.steps)
+}
+
+// ─── Decision function ───────────────────────────────────────────────
+//
+// Given a 3-point ablation fingerprint:
+//   phi_baseline          (no ablation)
+//   phi_scramble_phys     (physical side destroyed)
+//   phi_scramble_mental   (mental side destroyed)
+// pick the position that best explains. Heuristics:
+//   drop_phys   = phi_baseline - phi_scramble_phys    (how much phys matters)
+//   drop_mental = phi_baseline - phi_scramble_mental  (how much mental matters)
+//
+//   MATERIALISM    — drop_phys >> drop_mental
+//   IDEALISM       — drop_mental >> drop_phys
+//   DUALISM        — both drops large, balanced
+//   NEUTRAL MONISM — neither drop is catastrophic (invariant to type-label)
+
+fn decide_best_position(phi_base: float, phi_scr_phys: float, phi_scr_mental: float) -> string {
+    let drop_p = phi_base - phi_scr_phys
+    let drop_m = phi_base - phi_scr_mental
+    let abs_dp = met_abs(drop_p)
+    let abs_dm = met_abs(drop_m)
+    let ratio_pm = if abs_dm > MET_EPS { abs_dp / abs_dm } else { 1000.0 }
+    let ratio_mp = if abs_dp > MET_EPS { abs_dm / abs_dp } else { 1000.0 }
+    let balanced = (ratio_pm > 0.5 && ratio_pm < 2.0)
+    let both_large = (abs_dp > 0.05 && abs_dm > 0.05)
+    let neither_large = (abs_dp < 0.05 && abs_dm < 0.05)
+
+    // Default to neutral monism — invariant stance.
+    let mut best = POS_NEUTRAL
+    if neither_large { best = POS_NEUTRAL }
+    if both_large && balanced { best = POS_DUALISM }
+    if ratio_pm >= 2.0 { best = POS_MATERIALISM }
+    if ratio_mp >= 2.0 { best = POS_IDEALISM }
+    return best
+}
+
+// ─── Self-tests ──────────────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    let sig = build_signal(MET_N_PHYS, MET_N_MENTAL, MET_STEPS, 1001, false, false, false)
+    let phi_mat = phi_materialism(sig)
+    let phi_dua = phi_dualism(sig)
+    let phi_ide = phi_idealism(sig)
+    let phi_neu = phi_neutral_monism(sig)
+    // All finite + non-negative.
+    if phi_mat != phi_mat { return false }
+    if phi_dua != phi_dua { return false }
+    if phi_ide != phi_ide { return false }
+    if phi_neu != phi_neu { return false }
+    if phi_mat < 0.0 { return false }
+    if phi_dua < 0.0 { return false }
+    if phi_ide < 0.0 { return false }
+    if phi_neu < 0.0 { return false }
+    println("  [T1] Φ_mat=" + str(phi_mat) + " Φ_dua=" + str(phi_dua) +
+            " Φ_ide=" + str(phi_ide) + " Φ_neu=" + str(phi_neu))
+    return true
+}
+
+fn check_T2() -> bool {
+    // Divergence: the four models must NOT be identical — they are
+    // genuinely distinct metaphysical predictions over the same input.
+    let sig = build_signal(MET_N_PHYS, MET_N_MENTAL, MET_STEPS, 2002, false, false, false)
+    let phi_mat = phi_materialism(sig)
+    let phi_dua = phi_dualism(sig)
+    let phi_ide = phi_idealism(sig)
+    let phi_neu = phi_neutral_monism(sig)
+
+    // Pairwise differences — at least one pair must differ by > 0.01.
+    let d1 = met_abs(phi_mat - phi_ide)
+    let d2 = met_abs(phi_mat - phi_neu)
+    let d3 = met_abs(phi_ide - phi_neu)
+    let d4 = met_abs(phi_mat - phi_dua)
+    // Dualism should be dramatically different (product of small numbers).
+    println("  [T2] Δ(mat-ide)=" + str(d1) + " Δ(mat-neu)=" + str(d2) +
+            " Δ(ide-neu)=" + str(d3) + " Δ(mat-dua)=" + str(d4))
+    // Sufficient condition: mat-dua gap is large (product collapses or amplifies).
+    let divergent = (d1 > 0.005 || d2 > 0.005 || d3 > 0.005 || d4 > 0.005)
+    return divergent
+}
+
+fn check_T3() -> bool {
+    // Ablation fingerprints:
+    //   scramble physical  → materialism Φ collapses; idealism Φ stable.
+    //   scramble mental    → idealism Φ collapses; materialism Φ stable.
+    let sig_base    = build_signal(MET_N_PHYS, MET_N_MENTAL, MET_STEPS, 3003, false, false, false)
+    let sig_no_phys = build_signal(MET_N_PHYS, MET_N_MENTAL, MET_STEPS, 3003, true,  false, false)
+    let sig_no_men  = build_signal(MET_N_PHYS, MET_N_MENTAL, MET_STEPS, 3003, false, true,  false)
+
+    let mat_base  = phi_materialism(sig_base)
+    let mat_noP   = phi_materialism(sig_no_phys)
+    let mat_noM   = phi_materialism(sig_no_men)
+
+    let ide_base  = phi_idealism(sig_base)
+    let ide_noP   = phi_idealism(sig_no_phys)
+    let ide_noM   = phi_idealism(sig_no_men)
+
+    println("  [T3] mat(base,¬P,¬M)=(" + str(mat_base) + "," + str(mat_noP) + "," + str(mat_noM) + ")")
+    println("  [T3] ide(base,¬P,¬M)=(" + str(ide_base) + "," + str(ide_noP) + "," + str(ide_noM) + ")")
+
+    // Claim A: scramble-phys hurts materialism more than it hurts idealism.
+    let mat_drop_P = mat_base - mat_noP
+    let ide_drop_P = ide_base - ide_noP
+    // Claim B: scramble-mental hurts idealism more than it hurts materialism.
+    let ide_drop_M = ide_base - ide_noM
+    let mat_drop_M = mat_base - mat_noM
+
+    let claim_a = mat_drop_P > ide_drop_P
+    let claim_b = ide_drop_M > mat_drop_M
+    println("  [T3] mat_drop_P=" + str(mat_drop_P) + " ide_drop_P=" + str(ide_drop_P) +
+            " | ide_drop_M=" + str(ide_drop_M) + " mat_drop_M=" + str(mat_drop_M))
+    return claim_a && claim_b
+}
+
+fn check_T4() -> bool {
+    // Decision function — synthesize a materialism-dominant fingerprint:
+    //   baseline Φ = 0.30
+    //   scramble_phys   Φ = 0.02  (big drop → matter matters)
+    //   scramble_mental Φ = 0.28  (tiny drop → mental irrelevant)
+    let pick_mat = decide_best_position(0.30, 0.02, 0.28)
+    println("  [T4a] materialism fingerprint → " + pick_mat)
+
+    // Idealism fingerprint:
+    //   baseline 0.30, scr_phys 0.28, scr_mental 0.02
+    let pick_ide = decide_best_position(0.30, 0.28, 0.02)
+    println("  [T4b] idealism fingerprint → " + pick_ide)
+
+    // Dualism fingerprint — both drops large & balanced:
+    //   baseline 0.30, scr_phys 0.15, scr_mental 0.15
+    let pick_dua = decide_best_position(0.30, 0.15, 0.15)
+    println("  [T4c] dualism fingerprint → " + pick_dua)
+
+    // Neutral monism fingerprint — neither drop large:
+    //   baseline 0.30, scr_phys 0.29, scr_mental 0.29
+    let pick_neu = decide_best_position(0.30, 0.29, 0.29)
+    println("  [T4d] neutral monism fingerprint → " + pick_neu)
+
+    let ok_mat = pick_mat == POS_MATERIALISM
+    let ok_ide = pick_ide == POS_IDEALISM
+    let ok_dua = pick_dua == POS_DUALISM
+    let ok_neu = pick_neu == POS_NEUTRAL
+    return ok_mat && ok_ide && ok_dua && ok_neu
+}
+
+fn check_T5() -> bool {
+    // Determinism + latency.
+    let sig1 = build_signal(MET_N_PHYS, MET_N_MENTAL, MET_STEPS, 5005, false, false, false)
+    let sig2 = build_signal(MET_N_PHYS, MET_N_MENTAL, MET_STEPS, 5005, false, false, false)
+    let a1 = phi_materialism(sig1)
+    let a2 = phi_materialism(sig2)
+    if met_abs(a1 - a2) > 0.0 { return false }
+    let b1 = phi_dualism(sig1)
+    let b2 = phi_dualism(sig2)
+    if met_abs(b1 - b2) > 0.0 { return false }
+    let c1 = phi_idealism(sig1)
+    let c2 = phi_idealism(sig2)
+    if met_abs(c1 - c2) > 0.0 { return false }
+    let d1 = phi_neutral_monism(sig1)
+    let d2 = phi_neutral_monism(sig2)
+    if met_abs(d1 - d2) > 0.0 { return false }
+
+    let t0 = clock()
+    let sig = build_signal(MET_N_PHYS, MET_N_MENTAL, MET_STEPS, 7777, false, false, false)
+    let _m = phi_materialism(sig)
+    let _d = phi_dualism(sig)
+    let _i = phi_idealism(sig)
+    let _n = phi_neutral_monism(sig)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] determinism PASS ; 4-model latency = " + str(ms) + " ms")
+    return ms < 5000.0
+}
+
+// ─── main ────────────────────────────────────────────────────────────
+
+fn main() {
+    println("[metaphysics_engine] P37 — Metaphysical Foundations of Φ")
+    println("  4 positions: materialism | dualism | idealism | neutral_monism")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  4 Φ-models finite + non-negative on shared input") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  4 positions yield divergent Φ (distinct predictions)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  ablation fingerprints — scramble-phys hurts materialism, scramble-mental hurts idealism") } else { println("T3 FAIL  (fingerprint asymmetry not detected)") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  decision function recovers true position on 4 synthetic fingerprints") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  determinism + latency < 5 s") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[metaphysics_engine] ALL 5/5 PASS")
+    } else {
+        println("[metaphysics_engine] SOME FAILED")
+    }
+}
+
+main()
+
+// ────────────────────────────────────────────────────────────────────
+// End metaphysics_engine.hexa — P37 Metaphysical Foundations of Φ
+// Rules: AN4 (IIT-aligned), AN7 (philosophical plurality), R14 (SSOT)
+// ────────────────────────────────────────────────────────────────────

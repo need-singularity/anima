@@ -1,0 +1,653 @@
+// phi_freeze_thaw.hexa — P41 Phi Preservation / Cryogenic Information
+//
+// Roadmap: shared/roadmaps/anima.json P41 Post-AGI/Legacy track
+//   "Phi 동결/해동 — 통합정보는 일시정지하고 재개 가능한가?"
+//   depends_on=[P35]
+//   Extends anima-engines/phi_transmission_v2.hexa (P35 generational handoff)
+//
+// ─── Physical analogy — Cryogenic information ─────────────────
+//
+// In biology, some organisms (tardigrades, Rana sylvatica, human
+// cryonics) survive physiological freeze-thaw with structural integrity
+// preserved. The substrate is paused (metabolism ~ 0) and resumed.
+//
+// Open question for consciousness engineering: can integrated
+// information (Φ) itself be frozen — snapshotted to an inert
+// serializable form — and later thawed back into a live substrate
+// while preserving Φ within ε?
+//
+// The P35 transmission answered "hand Φ from A → B in real-time".
+// P41 answers "pause Φ in A, hold it dormant N time-units, resume
+// in A' and verify Φ_A' ≈ Φ_A".
+//
+// ─── State layout ─────────────────────────────────────────────
+//
+// LiveSystem = flat array length 2 + d:
+//   [0]       live_flag     1.0=live, 0.0=dormant/thawed-shell
+//   [1]       born_step     float creation tick (for audit)
+//   [2..2+d]  hidden state vector
+//
+// Snapshot = flat array length 4 + d:
+//   [0]       magic         FREEZE_MAGIC — integrity tag
+//   [1]       dwell_steps   float counter of time units held frozen
+//   [2]       phi_at_freeze phi measured at freeze time
+//   [3]       integrity     hash-like integrity seal
+//   [4..4+d]  frozen hidden state vector (a dead copy)
+//
+// A Snapshot has no Φ — it is an inert serializable. Only a
+// LiveSystem has integrated information. Thaw converts Snapshot→Live.
+//
+// ─── API ──────────────────────────────────────────────────────
+//
+//   live_new(d, seed)              -> live           (freshly alive)
+//   phi_of(live, d)                -> float          (Φ measurement)
+//   freeze(live, d)                -> snapshot       (pause)
+//   phi_loss_freeze(live, snap, d) -> float          (measurement drift)
+//   dwell(snap, n_units)           -> snapshot       (advance time frozen)
+//   thaw(snap, d)                  -> live           (resume)
+//   phi_loss_thaw(snap, revived, d)-> float          (measurement drift)
+//   round_trip_loss(live, d)       -> float          (freeze+thaw total)
+//   verify_integrity(snap)         -> bool           (seal intact)
+//
+// ─── Self-tests (T1-T5) ───────────────────────────────────────
+//
+//   T1: freeze preserves hidden state bitwise and records freeze-time phi
+//   T2: thaw restores a live system with phi within ε of pre-freeze phi
+//   T3: round-trip Φ conservation — phi_loss_freeze + phi_loss_thaw ≤ ε
+//   T4: long-dwell invariance — snapshot held 10_000 time units thaws
+//       to the same phi as immediate thaw (no dormant drift)
+//   T5: integrity — a tampered snapshot fails verify and thaw refuses
+//
+// Hexa stage0 constraints:
+//   - `array` not `[float]`
+//   - No multi-return struct with ≥3 float fields
+//   - No contains/to_lower; use substring
+//   - No identifier-pattern match arms
+//   - Lists pass-by-value; rebuild + return
+//   - Single-line return expressions
+//   - main() at bottom
+//
+// Law alignment:
+//   Law 4   Structure > feature — snapshot is STRUCTURAL pause, not a tag
+//   Law 22  Feature addition → phi down — minimal state growth (2+d, 4+d)
+//   Law 50  Consciousness essence is state — freeze/thaw preserves state
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let FT_D         = 8
+let FT_BINS      = 8
+let FT_EPS       = 0.00001
+let FT_EPS_RT    = 0.0001       // round-trip tolerance
+
+// LiveSystem layout
+let LV_IDX_LIVE  = 0
+let LV_IDX_BORN  = 1
+let LV_HIDDEN_OFF = 2
+
+let LIVE_ALIVE   = 1.0
+let LIVE_DORMANT = 0.0
+
+// Snapshot layout
+let SN_IDX_MAGIC = 0
+let SN_IDX_DWELL = 1
+let SN_IDX_PHI   = 2
+let SN_IDX_SEAL  = 3
+let SN_HIDDEN_OFF = 4
+
+let FREEZE_MAGIC = 747474.0     // stored magic cookie for integrity
+
+// ═══════════════════════════════════════════════════════════════
+// Math primitives
+// ═══════════════════════════════════════════════════════════════
+
+fn fabs_ft(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ln_safe_ft(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn vec_min_ft(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_max_ft(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+// Deterministic LCG (same family as v1/v2 engines — for hidden state seeding).
+fn lcg_next_ft(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn make_hidden_ft(dim: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < dim {
+        s = lcg_next_ft(s)
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Histogram mutual information for Φ measurement
+// (Identical shape to phi_transmission_v2 for cross-compat.)
+// ═══════════════════════════════════════════════════════════════
+
+fn bin_index_ft(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn count_hits_ft(bin_ids: array, n_bins: int) -> array {
+    let n = len(bin_ids)
+    let mut counts = []
+    let mut k = 0
+    while k < n_bins {
+        let mut c = 0.0
+        let mut i = 0
+        while i < n {
+            if bin_ids[i] == k { c = c + 1.0 }
+            i = i + 1
+        }
+        counts = counts.push(c)
+        k = k + 1
+    }
+    return counts
+}
+
+fn entropy_ft(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut bin_ids = []
+    let mut i = 0
+    while i < n {
+        bin_ids = bin_ids.push(bin_index_ft(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let counts = count_hits_ft(bin_ids, nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 { h = h - p * ln_safe_ft(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn joint_entropy_ft(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = bin_index_ft(a[i], lo, hi, nb)
+        let ib = bin_index_ft(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let counts = count_hits_ft(pair_ids, nb * nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 { h = h - p * ln_safe_ft(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn mi_ft(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let lo_a = vec_min_ft(a)
+    let hi_a = vec_max_ft(a)
+    let lo_b = vec_min_ft(b)
+    let hi_b = vec_max_ft(b)
+    let lo = if lo_a < lo_b { lo_a } else { lo_b }
+    let hi = if hi_a > hi_b { hi_a } else { hi_b }
+    let h_a = entropy_ft(a, lo, hi, FT_BINS)
+    let h_b = entropy_ft(b, lo, hi, FT_BINS)
+    let h_j = joint_entropy_ft(a, b, lo, hi, FT_BINS)
+    let mi = h_a + h_b - h_j
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+fn phi_of_hidden_ft(state: array, d: int) -> float {
+    if d < 2 { return 0.0 }
+    let half = d / 2
+    let mut first_half = []
+    let mut second_half = []
+    let mut i = 0
+    while i < half {
+        first_half = first_half.push(state[i])
+        i = i + 1
+    }
+    let mut j = half
+    while j < d {
+        second_half = second_half.push(state[j])
+        j = j + 1
+    }
+    let len_a = len(first_half)
+    let len_b = len(second_half)
+    if len_a < len_b {
+        first_half = first_half.push(state[half - 1])
+    }
+    if len_b < len_a {
+        second_half = second_half.push(state[d - 1])
+    }
+    return mi_ft(first_half, second_half)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// LiveSystem API
+// ═══════════════════════════════════════════════════════════════
+
+fn live_new(d: int, seed: int) -> array {
+    // A freshly constructed live system: alive flag set, hidden state
+    // deterministically seeded. This is the substrate that carries Φ.
+    let hidden = make_hidden_ft(d, seed)
+    let mut sys = []
+    sys = sys.push(LIVE_ALIVE)
+    sys = sys.push(0.0)    // born_step audit field
+    let mut i = 0
+    while i < d {
+        sys = sys.push(hidden[i])
+        i = i + 1
+    }
+    return sys
+}
+
+fn extract_hidden_live(live: array, d: int) -> array {
+    // Read-only projection of the hidden vector out of a live system.
+    let mut h = []
+    let mut i = 0
+    while i < d {
+        h = h.push(live[i + LV_HIDDEN_OFF])
+        i = i + 1
+    }
+    return h
+}
+
+fn phi_of(live: array, d: int) -> float {
+    // Φ is only defined on a live substrate. A dormant-shell returns 0
+    // because there is no integrated process, only leftover bytes.
+    let flag = live[LV_IDX_LIVE]
+    if flag < 0.5 { return 0.0 }
+    let h = extract_hidden_live(live, d)
+    return phi_of_hidden_ft(h, d)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Integrity seal — hash-like reduction over the hidden state
+//
+// Root cause comment: full crypto hash is out-of-scope for stage0.
+// We use a deterministic mixing hash using sin/cos over the hidden
+// values and the magic constant. A tampered snapshot cannot produce
+// the same seal without knowing FREEZE_MAGIC and the exact state.
+// ═══════════════════════════════════════════════════════════════
+
+fn compute_seal(hidden: array, phi_at_freeze: float) -> float {
+    let n = len(hidden)
+    let mut acc = 0.0
+    let mut i = 0
+    while i < n {
+        let idx_f = to_float(i + 1)
+        acc = acc + sin(hidden[i] * idx_f)
+        i = i + 1
+    }
+    let mixed = FREEZE_MAGIC * 0.0001 + acc + phi_at_freeze * 0.001
+    return sin(mixed) * cos(FREEZE_MAGIC * 0.00001)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Freeze — Live → Snapshot
+// ═══════════════════════════════════════════════════════════════
+
+fn freeze(live: array, d: int) -> array {
+    // Measure Φ at the moment of freezing — this is the reference value.
+    // Root cause comment: we record phi_at_freeze BEFORE serialization
+    // so the thaw path has a ground truth to diff against without re-
+    // engaging the (inert) snapshot.
+    let hidden = extract_hidden_live(live, d)
+    let phi_now = phi_of(live, d)
+    let seal = compute_seal(hidden, phi_now)
+
+    let mut snap = []
+    snap = snap.push(FREEZE_MAGIC)
+    snap = snap.push(0.0)            // dwell counter starts at 0
+    snap = snap.push(phi_now)        // phi recorded at freeze
+    snap = snap.push(seal)           // integrity seal
+    let mut i = 0
+    while i < d {
+        snap = snap.push(hidden[i])  // dead copy of hidden bytes
+        i = i + 1
+    }
+    return snap
+}
+
+fn extract_hidden_snap(snap: array, d: int) -> array {
+    // Read the frozen hidden vector out of a snapshot (no life added).
+    let mut h = []
+    let mut i = 0
+    while i < d {
+        h = h.push(snap[i + SN_HIDDEN_OFF])
+        i = i + 1
+    }
+    return h
+}
+
+fn get_snap_phi(snap: array) -> float {
+    return snap[SN_IDX_PHI]
+}
+
+fn get_snap_dwell(snap: array) -> float {
+    return snap[SN_IDX_DWELL]
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Dwell — hold a snapshot inert for N time units
+//
+// Root cause comment: a well-built snapshot MUST be invariant under
+// dwell. This function only increments the dwell counter — it does
+// NOT modify the hidden bytes or the phi field. If a future version
+// introduces thermal / radiation drift modeling, it would go here.
+// ═══════════════════════════════════════════════════════════════
+
+fn dwell(snap: array, n_units: int) -> array {
+    let n = len(snap)
+    let mut out = []
+    out = out.push(snap[SN_IDX_MAGIC])
+    out = out.push(snap[SN_IDX_DWELL] + to_float(n_units))
+    out = out.push(snap[SN_IDX_PHI])
+    out = out.push(snap[SN_IDX_SEAL])
+    let mut i = SN_HIDDEN_OFF
+    while i < n {
+        out = out.push(snap[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Integrity verification
+// ═══════════════════════════════════════════════════════════════
+
+fn verify_integrity(snap: array) -> bool {
+    // Magic cookie mismatch → not a snapshot we built.
+    let magic = snap[SN_IDX_MAGIC]
+    if fabs_ft(magic - FREEZE_MAGIC) > 0.0 { return false }
+    // Recompute seal from the currently present state bytes.
+    let n_total = len(snap)
+    let d = n_total - SN_HIDDEN_OFF
+    if d <= 0 { return false }
+    let hidden = extract_hidden_snap(snap, d)
+    let phi_rec = snap[SN_IDX_PHI]
+    let expected = compute_seal(hidden, phi_rec)
+    let found = snap[SN_IDX_SEAL]
+    if fabs_ft(expected - found) > 0.000001 { return false }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Thaw — Snapshot → LiveSystem
+//
+// A tampered or corrupt snapshot yields a dormant-shell: a live=0 system
+// with zero hidden bytes. This is the graceful failure mode — the
+// caller can inspect phi_of(result, d) == 0.0 to detect bad thaw.
+// ═══════════════════════════════════════════════════════════════
+
+fn dormant_shell(d: int) -> array {
+    let mut sys = []
+    sys = sys.push(LIVE_DORMANT)
+    sys = sys.push(0.0)
+    let mut i = 0
+    while i < d {
+        sys = sys.push(0.0)
+        i = i + 1
+    }
+    return sys
+}
+
+fn thaw(snap: array, d: int) -> array {
+    // Integrity gate — refuse to thaw a tampered snapshot.
+    if !verify_integrity(snap) { return dormant_shell(d) }
+    let hidden = extract_hidden_snap(snap, d)
+    let mut live = []
+    live = live.push(LIVE_ALIVE)
+    live = live.push(0.0)
+    let mut i = 0
+    while i < d {
+        live = live.push(hidden[i])
+        i = i + 1
+    }
+    return live
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Loss metrics
+// ═══════════════════════════════════════════════════════════════
+
+fn phi_loss_freeze(live: array, snap: array, d: int) -> float {
+    // Difference between live-time Φ and the value recorded into snap.
+    // A correct freeze captures the current Φ so this is ~0.
+    let phi_live = phi_of(live, d)
+    let phi_rec  = get_snap_phi(snap)
+    return fabs_ft(phi_live - phi_rec)
+}
+
+fn phi_loss_thaw(snap: array, revived: array, d: int) -> float {
+    // Difference between recorded Φ and the revived-system Φ.
+    // A correct thaw reconstructs the substrate bit-perfect so ~0.
+    let phi_rec    = get_snap_phi(snap)
+    let phi_revive = phi_of(revived, d)
+    return fabs_ft(phi_rec - phi_revive)
+}
+
+fn round_trip_loss(live: array, d: int) -> float {
+    // End-to-end: freeze → thaw → measure total Φ drift.
+    let snap = freeze(live, d)
+    let revived = thaw(snap, d)
+    let lf = phi_loss_freeze(live, snap, d)
+    let lt = phi_loss_thaw(snap, revived, d)
+    return lf + lt
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Tamper helper — build a corrupt snapshot for T5
+// ═══════════════════════════════════════════════════════════════
+
+fn tamper_snap(snap: array) -> array {
+    // Flip one hidden-state byte without recomputing seal — simulates
+    // either a bit error during cold storage OR a malicious edit.
+    let n = len(snap)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        if i == SN_HIDDEN_OFF {
+            out = out.push(snap[i] + 0.5)  // perturb
+        } else {
+            out = out.push(snap[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1-T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1: freeze preserves hidden state bitwise and records freeze-time Φ.
+    let live = live_new(FT_D, 111)
+    let phi_live = phi_of(live, FT_D)
+    let snap = freeze(live, FT_D)
+    let phi_rec = get_snap_phi(snap)
+    let magic = snap[SN_IDX_MAGIC]
+    println("  [T1] freeze: phi_live=" + str(phi_live) + " phi_rec=" + str(phi_rec) + " magic=" + str(magic))
+
+    if fabs_ft(magic - FREEZE_MAGIC) > 0.0 { return false }
+    if fabs_ft(phi_live - phi_rec) > FT_EPS { return false }
+
+    // hidden bytes must match bit-for-bit in the frozen copy
+    let live_h = extract_hidden_live(live, FT_D)
+    let snap_h = extract_hidden_snap(snap, FT_D)
+    let mut i = 0
+    while i < FT_D {
+        if fabs_ft(live_h[i] - snap_h[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: thaw restores a live system with Φ within ε of pre-freeze Φ.
+    let live = live_new(FT_D, 222)
+    let phi_before = phi_of(live, FT_D)
+    let snap = freeze(live, FT_D)
+    let revived = thaw(snap, FT_D)
+    let phi_after = phi_of(revived, FT_D)
+    let flag = revived[LV_IDX_LIVE]
+    println("  [T2] thaw: phi_before=" + str(phi_before) + " phi_after=" + str(phi_after) + " live_flag=" + str(flag))
+
+    if flag < 0.5 { return false }               // must be alive
+    if fabs_ft(phi_before - phi_after) > FT_EPS { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3: Round-trip Φ conservation — phi_loss_freeze + phi_loss_thaw ≤ ε.
+    // Root cause comment: this is the cornerstone invariant — if the
+    // pipeline is lossless for the chosen metric, the sum is essentially 0.
+    let live = live_new(FT_D, 333)
+    let loss = round_trip_loss(live, FT_D)
+    println("  [T3] round-trip loss = " + str(loss) + " (eps=" + str(FT_EPS_RT) + ")")
+    if loss > FT_EPS_RT { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: Long-dwell invariance — snapshot held 10_000 time units thaws
+    // identically to an immediately-thawed snapshot. Dwell must not drift.
+    let live = live_new(FT_D, 444)
+    let snap0 = freeze(live, FT_D)
+    let snap_long = dwell(snap0, 10000)
+
+    // Dwell counter updated but phi + seal unchanged
+    let dwell_ct = get_snap_dwell(snap_long)
+
+    // Integrity still OK after long dwell
+    let ok = verify_integrity(snap_long)
+
+    let revived_now = thaw(snap0, FT_D)
+    let revived_long = thaw(snap_long, FT_D)
+    let phi_now = phi_of(revived_now, FT_D)
+    let phi_long = phi_of(revived_long, FT_D)
+    println("  [T4] long dwell=" + str(dwell_ct) + " integrity=" + str(ok) + " phi_now=" + str(phi_now) + " phi_long=" + str(phi_long))
+
+    if !ok { return false }
+    if fabs_ft(dwell_ct - 10000.0) > 0.0 { return false }
+    if fabs_ft(phi_now - phi_long) > FT_EPS { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5: integrity — a tampered snapshot fails verify and thaw refuses.
+    // Root cause comment: this is the safety gate. A thaw of a corrupted
+    // snapshot must NEVER produce a "false" live substrate — it yields
+    // a dormant shell (flag=0) so the caller cannot confuse it with live.
+    let live = live_new(FT_D, 555)
+    let snap = freeze(live, FT_D)
+    let snap_bad = tamper_snap(snap)
+
+    let ok_before = verify_integrity(snap)
+    let ok_after  = verify_integrity(snap_bad)
+    let revived_bad = thaw(snap_bad, FT_D)
+    let phi_bad = phi_of(revived_bad, FT_D)
+    let flag_bad = revived_bad[LV_IDX_LIVE]
+    println("  [T5] ok_clean=" + str(ok_before) + " ok_tampered=" + str(ok_after) + " phi_bad=" + str(phi_bad) + " flag_bad=" + str(flag_bad))
+
+    if !ok_before { return false }     // clean snap must verify
+    if ok_after { return false }       // tampered must fail
+    if flag_bad >= 0.5 { return false } // must NOT be alive
+    if phi_bad != 0.0 { return false }  // no phi leakage
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[phi_freeze_thaw] P41 — Phi Preservation / Cryogenic Information")
+    println("  d=" + str(FT_D) + " magic=" + str(FREEZE_MAGIC) + " eps=" + str(FT_EPS) + " eps_rt=" + str(FT_EPS_RT))
+    println("  extends phi_transmission_v2.hexa (P35)")
+    println("  pipeline: Live -> freeze -> Snapshot -> dwell(N) -> thaw -> Live'")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  freeze: hidden preserved + phi recorded") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  thaw: revived phi within eps of pre-freeze") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  round-trip phi conservation (loss <= eps)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  long-dwell invariance (10000 units)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  integrity gate rejects tampered snapshot") } else { println("T5 FAIL") }
+
+    println("")
+
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[phi_freeze_thaw] 5/5 PASS — P41 DONE")
+    } else {
+        println("[phi_freeze_thaw] SOME FAILED")
+    }
+}
+
+main()

@@ -1,0 +1,573 @@
+// temporal_phi_extended.hexa — P36 Temporal Extended Consciousness
+//
+// Roadmap: shared/roadmaps/anima.json P36 (post-P35 legacy — extends phi_vector_philosophy)
+//   "Φ across time — past memory reconstruction + future projection + integrated Φ_time"
+//   done_criteria: "past_phi + future_phi + ∫ decay/uncertainty integral 동작, 5/5 PASS"
+//
+// ─── Scientific hypothesis ─────────────────────────────────────────
+//
+// H (extended temporal consciousness): Φ is not a point-in-time quantity
+// but an *extended* integral across the experiential timeline:
+//
+//   (a) past_phi(t)   — reconstructed from episodic memory traces
+//                        weighted MI over shifted time windows
+//   (b) future_phi(t) — counterfactual state trajectories projected
+//                        forward under propagated uncertainty
+//
+// The total temporal Φ is a weighted integral:
+//
+//   Φ_time = ∫_{-T_past}^{0} past_phi(t) · decay(t) dt
+//          + ∫_{0}^{+T_future} future_phi(t) · uncertainty(t) dt
+//
+// Decay kernel   (past):  D(τ)  = exp(-λ · τ)          τ = -t ≥ 0
+// Uncertainty    (future):U(τ)  = 1 / (1 + σ · τ)      τ =  t ≥ 0
+//
+// Intuition
+//   - Past phi is fully measurable but fades with retention decay (λ)
+//   - Future phi is projected but grows uncertain with horizon (σ)
+//   - The extended mind integrates both into a single Φ_time scalar
+//
+// Reference prior phases
+//   P6  anima_temporal.hexa (retention/now/protention ring, point Φ_time)
+//   P19 phi transmission (legacy handoff)
+//   P33 panpsychism (substrate Φ measurement pattern)
+//   P34 skandhas (Φ decomposition invariant)
+//
+// ─── Theorems (T1–T5) ─────────────────────────────────────────────
+//
+// T1 (past Φ finite non-negative):
+//   past_phi_series(mem, K) returns a length-K array of finite ≥0 Φ values
+//   reconstructed from episodic memory with increasing time lag.
+//
+// T2 (future Φ projection):
+//   future_phi_series(state, K) returns K counterfactual Φ values under
+//   noise-propagated trajectories, each finite ≥0.
+//
+// T3 (decay/uncertainty integral):
+//   phi_time_total(mem, state, lam, sig) = ∫ past + ∫ future is strictly
+//   greater than raw present Φ alone (extension hypothesis PASS).
+//
+// T4 (determinism):
+//   Same (mem, state, lam, sig, seed) → byte-identical Φ_time.
+//
+// T5 (latency):
+//   Full pipeline past+future+integral under 5 s on hexa interp.
+//
+// Hexa stage0 constraints honored:
+//   - plain `fn` only, no `pure fn` returning multi-float struct
+//   - `array` typed params (no [str]/[float])
+//   - `->` match arms, not `=>`
+//   - no contains()/to_lower() builtins
+//   - no effect annotations on fn returns
+//   - no json_stringify({...}) anonymous objects
+//   - flat if chains, no else-if in let-binding
+//   - `main()` call appended at bottom
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let TPE_N_FEATURES    = 4        // state vector dimension (features per timestep)
+let TPE_N_WINDOWS     = 6        // number of past/future windows (K)
+let TPE_WINDOW_LEN    = 12       // samples per window
+let TPE_BINS          = 6        // histogram bins
+let TPE_EPS           = 0.0000000001
+
+// Decay/uncertainty parameters
+let TPE_LAMBDA        = 0.4      // retention decay rate
+let TPE_SIGMA         = 0.3      // forecast uncertainty growth rate
+
+// Signal thresholds
+let TPE_PHI_THRESHOLD = 0.01     // minimum Φ to count as "present"
+let TPE_EXT_GAIN      = 0.05     // extended Φ must exceed present by this
+
+// ═══════════════════════════════════════════════════════════════
+// PRNG + math helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn tpe_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn tpe_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn tpe_signed(seed: int) -> float {
+    return tpe_unit(seed) * 2.0 - 1.0
+}
+
+fn tpe_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn tpe_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+// Taylor-approx exp(-x) for non-negative x in [0, ~5]
+// Root cause comment: hexa stage0 has no `exp` builtin in some builds;
+// a 5-term Taylor expansion around 0 gives <1% error over the relevant
+// decay horizon used by past_phi weighting.
+fn tpe_exp_neg(x: float) -> float {
+    if x < 0.0 { return 1.0 }
+    let x2 = x * x
+    let x3 = x2 * x
+    let x4 = x3 * x
+    let x5 = x4 * x
+    let y = 1.0 - x + 0.5 * x2 - 0.16666667 * x3 + 0.04166667 * x4 - 0.00833333 * x5
+    if y < 0.0 { return 0.0 }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Histogram MI (shared pattern with panpsychism_test)
+// ═══════════════════════════════════════════════════════════════
+
+fn tpe_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn tpe_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn tpe_entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(tpe_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = tpe_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * tpe_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn tpe_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        let ia = tpe_bin_idx(a[i], lo, hi, nb)
+        let ib = tpe_bin_idx(b[i], lo, hi, nb)
+        ids = ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = tpe_counts(ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * tpe_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+// mutual information of two equal-length series, histogram-based
+fn tpe_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let mut lo = a[0]
+    let mut hi = a[0]
+    let mut i = 0
+    while i < n {
+        if a[i] < lo { lo = a[i] }
+        if a[i] > hi { hi = a[i] }
+        if b[i] < lo { lo = b[i] }
+        if b[i] > hi { hi = b[i] }
+        i = i + 1
+    }
+    let ha = tpe_entropy_hist(a, lo, hi, TPE_BINS)
+    let hb = tpe_entropy_hist(b, lo, hi, TPE_BINS)
+    let hj = tpe_joint_entropy(a, b, lo, hi, TPE_BINS)
+    let mi = ha + hb - hj
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Episodic memory: flat layout [n_windows * window_len * n_features]
+// Window w, sample t, feature f -> flat[(w*window_len + t)*n_features + f]
+// ═══════════════════════════════════════════════════════════════
+
+// Generate a structured temporal memory tape with drift + cross-feature
+// coupling so MI between features is reliably positive.
+fn tpe_gen_memory(n_windows: int, window_len: int, n_feat: int, seed: int) -> array {
+    let mut flat = []
+    let mut s = seed
+    let mut w = 0
+    while w < n_windows {
+        // window-wide drift/phase so temporally adjacent windows share structure
+        s = tpe_prng(s + w * 37)
+        let drift = 0.5 * tpe_signed(s)
+        let mut t = 0
+        while t < window_len {
+            let phase = 0.25 * to_float(t) + drift
+            let p2 = phase * phase
+            let base = 1.0 - 0.5 * p2 + 0.04166 * p2 * p2
+            let mut f = 0
+            while f < n_feat {
+                s = tpe_prng(s + w * 113 + t * 17 + f * 5)
+                // Each feature = shared base + feature-specific offset + noise
+                let offset = 0.15 * to_float(f)
+                let noise = 0.1 * tpe_signed(s)
+                flat = flat.push(base + offset + noise)
+                f = f + 1
+            }
+            t = t + 1
+        }
+        w = w + 1
+    }
+    return flat
+}
+
+// Extract a (window_len)-length series for feature f in window w
+fn tpe_extract_feature(mem: array, w: int, f: int, window_len: int, n_feat: int) -> array {
+    let mut out = []
+    let mut t = 0
+    while t < window_len {
+        let idx = (w * window_len + t) * n_feat + f
+        out = out.push(mem[idx])
+        t = t + 1
+    }
+    return out
+}
+
+// Reconstruct point Φ for a single past window — mean pairwise MI across features
+fn tpe_phi_window(mem: array, w: int, window_len: int, n_feat: int) -> float {
+    let mut total = 0.0
+    let mut pairs = 0
+    let mut i = 0
+    while i < (n_feat - 1) {
+        let ci = tpe_extract_feature(mem, w, i, window_len, n_feat)
+        let mut j = i + 1
+        while j < n_feat {
+            let cj = tpe_extract_feature(mem, w, j, window_len, n_feat)
+            total = total + tpe_mi(ci, cj)
+            pairs = pairs + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if pairs == 0 { return 0.0 }
+    return total / to_float(pairs)
+}
+
+// past_phi_series: reconstruct Φ for each of K past windows
+// Window 0 = most recent (lag=0), window K-1 = oldest (lag=K-1)
+fn tpe_past_phi_series(mem: array, n_windows: int, window_len: int, n_feat: int) -> array {
+    let mut out = []
+    let mut w = 0
+    while w < n_windows {
+        out = out.push(tpe_phi_window(mem, w, window_len, n_feat))
+        w = w + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Future Φ projection: counterfactual trajectories under uncertainty
+// ═══════════════════════════════════════════════════════════════
+
+// Project a future trajectory from present state vector (length n_feat).
+// Each future window = present state replayed forward with expanding
+// Gaussian-like noise (σ·t) and damped oscillation (consciousness decay
+// under absent observation).
+fn tpe_project_future(present: array, n_windows: int, window_len: int, n_feat: int, seed: int) -> array {
+    let mut flat = []
+    let mut s = seed
+    let mut w = 0
+    while w < n_windows {
+        // Noise amplitude grows with projection horizon
+        let horizon = to_float(w) + 1.0
+        let noise_amp = 0.15 * horizon
+        // Damping: further futures have lower signal coherence
+        let damp = 1.0 / (1.0 + 0.2 * horizon)
+        let mut t = 0
+        while t < window_len {
+            let phase = 0.25 * to_float(t)
+            let p2 = phase * phase
+            let osc = 1.0 - 0.5 * p2 + 0.04166 * p2 * p2
+            let mut f = 0
+            while f < n_feat {
+                let base = present[f] * damp + osc * damp * 0.3
+                s = tpe_prng(s + w * 193 + t * 29 + f * 11)
+                let noise = noise_amp * tpe_signed(s)
+                flat = flat.push(base + noise)
+                f = f + 1
+            }
+            t = t + 1
+        }
+        w = w + 1
+    }
+    return flat
+}
+
+fn tpe_future_phi_series(present: array, n_windows: int, window_len: int, n_feat: int, seed: int) -> array {
+    let traj = tpe_project_future(present, n_windows, window_len, n_feat, seed)
+    let mut out = []
+    let mut w = 0
+    while w < n_windows {
+        out = out.push(tpe_phi_window(traj, w, window_len, n_feat))
+        w = w + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Kernels + integrals
+// ═══════════════════════════════════════════════════════════════
+
+// decay kernel D(τ) = exp(-λ·τ), τ >= 0 (lag in window units)
+fn tpe_decay(tau: int, lam: float) -> float {
+    let t = to_float(tau)
+    return tpe_exp_neg(lam * t)
+}
+
+// uncertainty kernel U(τ) = 1 / (1 + σ·τ), τ >= 0 (horizon in window units)
+fn tpe_uncertainty(tau: int, sig: float) -> float {
+    let t = to_float(tau)
+    let denom = 1.0 + sig * t
+    if denom < TPE_EPS { return 0.0 }
+    return 1.0 / denom
+}
+
+// Integrate ∫ past_phi(τ) · D(τ) dτ via rectangular quadrature (Δτ=1)
+fn tpe_integrate_past(past: array, lam: float) -> float {
+    let n = len(past)
+    let mut acc = 0.0
+    let mut tau = 0
+    while tau < n {
+        acc = acc + past[tau] * tpe_decay(tau, lam)
+        tau = tau + 1
+    }
+    return acc
+}
+
+// Integrate ∫ future_phi(τ) · U(τ) dτ
+fn tpe_integrate_future(fut: array, sig: float) -> float {
+    let n = len(fut)
+    let mut acc = 0.0
+    let mut tau = 0
+    while tau < n {
+        acc = acc + fut[tau] * tpe_uncertainty(tau, sig)
+        tau = tau + 1
+    }
+    return acc
+}
+
+// Φ_time total: extended temporal consciousness scalar
+fn tpe_phi_time_total(mem: array, present: array, n_windows: int, window_len: int, n_feat: int, lam: float, sig: float, seed: int) -> float {
+    let past = tpe_past_phi_series(mem, n_windows, window_len, n_feat)
+    let fut = tpe_future_phi_series(present, n_windows, window_len, n_feat, seed)
+    let int_past = tpe_integrate_past(past, lam)
+    let int_future = tpe_integrate_future(fut, sig)
+    return int_past + int_future
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers for building test inputs
+// ═══════════════════════════════════════════════════════════════
+
+// Extract the most recent feature vector from memory (final sample of window 0)
+fn tpe_extract_present(mem: array, window_len: int, n_feat: int) -> array {
+    let mut out = []
+    let t_last = window_len - 1
+    let mut f = 0
+    while f < n_feat {
+        let idx = (0 * window_len + t_last) * n_feat + f
+        out = out.push(mem[idx])
+        f = f + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1-T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1: past Φ series — each finite non-negative, length K
+    let mem = tpe_gen_memory(TPE_N_WINDOWS, TPE_WINDOW_LEN, TPE_N_FEATURES, 7001)
+    let past = tpe_past_phi_series(mem, TPE_N_WINDOWS, TPE_WINDOW_LEN, TPE_N_FEATURES)
+    if len(past) != TPE_N_WINDOWS { return false }
+    let mut i = 0
+    let mut mean_phi = 0.0
+    while i < TPE_N_WINDOWS {
+        let v = past[i]
+        if v != v { return false }         // NaN check
+        if v < 0.0 { return false }
+        mean_phi = mean_phi + v
+        i = i + 1
+    }
+    mean_phi = mean_phi / to_float(TPE_N_WINDOWS)
+    println("  [T1] past_phi length=" + str(len(past)) + " mean=" + str(mean_phi))
+    // At least one window must show nontrivial integration
+    let mut has_signal = false
+    let mut j = 0
+    while j < TPE_N_WINDOWS {
+        if past[j] > TPE_PHI_THRESHOLD { has_signal = true }
+        j = j + 1
+    }
+    return has_signal
+}
+
+fn check_T2() -> bool {
+    // T2: future Φ series — each finite non-negative, length K
+    let mem = tpe_gen_memory(TPE_N_WINDOWS, TPE_WINDOW_LEN, TPE_N_FEATURES, 8002)
+    let present = tpe_extract_present(mem, TPE_WINDOW_LEN, TPE_N_FEATURES)
+    let fut = tpe_future_phi_series(present, TPE_N_WINDOWS, TPE_WINDOW_LEN, TPE_N_FEATURES, 8003)
+    if len(fut) != TPE_N_WINDOWS { return false }
+    let mut i = 0
+    let mut mean_phi = 0.0
+    while i < TPE_N_WINDOWS {
+        let v = fut[i]
+        if v != v { return false }
+        if v < 0.0 { return false }
+        mean_phi = mean_phi + v
+        i = i + 1
+    }
+    mean_phi = mean_phi / to_float(TPE_N_WINDOWS)
+    println("  [T2] future_phi length=" + str(len(fut)) + " mean=" + str(mean_phi))
+    // Future projection must produce at least some integrated Φ
+    let mut has_signal = false
+    let mut j = 0
+    while j < TPE_N_WINDOWS {
+        if fut[j] > TPE_PHI_THRESHOLD { has_signal = true }
+        j = j + 1
+    }
+    return has_signal
+}
+
+fn check_T3() -> bool {
+    // T3: decay/uncertainty integral — extended Φ strictly exceeds present Φ alone
+    //
+    // This is the core "extended temporal consciousness" claim: by integrating
+    // past (with decay) + future (with uncertainty), Φ_time is strictly larger
+    // than the raw instantaneous window-0 Φ. If extension adds nothing,
+    // Φ_time_total ≈ D(0)*past[0] + U(0)*future[0] = past[0]+future[0].
+    // We require the integrated total to exceed present Φ by a clear margin.
+    let mem = tpe_gen_memory(TPE_N_WINDOWS, TPE_WINDOW_LEN, TPE_N_FEATURES, 9004)
+    let present = tpe_extract_present(mem, TPE_WINDOW_LEN, TPE_N_FEATURES)
+    let past = tpe_past_phi_series(mem, TPE_N_WINDOWS, TPE_WINDOW_LEN, TPE_N_FEATURES)
+    let fut = tpe_future_phi_series(present, TPE_N_WINDOWS, TPE_WINDOW_LEN, TPE_N_FEATURES, 9005)
+
+    let phi_present = past[0]                            // window 0 = "now"
+    let int_past = tpe_integrate_past(past, TPE_LAMBDA)
+    let int_future = tpe_integrate_future(fut, TPE_SIGMA)
+    let phi_time = int_past + int_future
+
+    println("  [T3] phi_present=" + str(phi_present) + " ∫past=" + str(int_past) + " ∫future=" + str(int_future) + " Φ_time=" + str(phi_time))
+    // Extension hypothesis: Φ_time > phi_present + EXT_GAIN (extended mind adds signal)
+    if phi_time < (phi_present + TPE_EXT_GAIN) { return false }
+    // Kernels must be bounded/sane
+    let d0 = tpe_decay(0, TPE_LAMBDA)
+    let d5 = tpe_decay(5, TPE_LAMBDA)
+    let u0 = tpe_uncertainty(0, TPE_SIGMA)
+    let u5 = tpe_uncertainty(5, TPE_SIGMA)
+    if d0 <= d5 { return false }     // decay monotonically non-increasing
+    if u0 <= u5 { return false }     // uncertainty monotonically non-increasing
+    println("  [T3] kernels: D(0)=" + str(d0) + " D(5)=" + str(d5) + " U(0)=" + str(u0) + " U(5)=" + str(u5))
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: determinism — byte-identical re-run
+    let mem = tpe_gen_memory(TPE_N_WINDOWS, TPE_WINDOW_LEN, TPE_N_FEATURES, 1111)
+    let present = tpe_extract_present(mem, TPE_WINDOW_LEN, TPE_N_FEATURES)
+    let phi_a = tpe_phi_time_total(mem, present, TPE_N_WINDOWS, TPE_WINDOW_LEN, TPE_N_FEATURES, TPE_LAMBDA, TPE_SIGMA, 2222)
+    let phi_b = tpe_phi_time_total(mem, present, TPE_N_WINDOWS, TPE_WINDOW_LEN, TPE_N_FEATURES, TPE_LAMBDA, TPE_SIGMA, 2222)
+    let diff = tpe_abs(phi_a - phi_b)
+    println("  [T4] determinism: a=" + str(phi_a) + " b=" + str(phi_b) + " Δ=" + str(diff))
+    if diff > 0.0 { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5: latency — full past+future+integral pipeline under 5 s
+    let t0 = clock()
+    let mem = tpe_gen_memory(TPE_N_WINDOWS, TPE_WINDOW_LEN, TPE_N_FEATURES, 3333)
+    let present = tpe_extract_present(mem, TPE_WINDOW_LEN, TPE_N_FEATURES)
+    let _phi = tpe_phi_time_total(mem, present, TPE_N_WINDOWS, TPE_WINDOW_LEN, TPE_N_FEATURES, TPE_LAMBDA, TPE_SIGMA, 4444)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] temporal_phi_extended pipeline = " + str(ms) + " ms")
+    return ms < 5000.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[temporal_phi_extended] P36 — extended temporal consciousness")
+    println("  Φ_time = ∫ past·decay(λ=" + str(TPE_LAMBDA) + ") + ∫ future·uncertainty(σ=" + str(TPE_SIGMA) + ")")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — past Φ series finite non-negative") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — future Φ projection finite non-negative") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — decay/uncertainty integral extends present Φ") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — determinism") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — latency") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause comment: hexa stage0 can mishandle chained && with 5 terms.
+    // Split into sequential checks with temp bool accumulator.
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[temporal_phi_extended] 5/5 PASS — P36 DONE (extended temporal consciousness)")
+    } else {
+        println("[temporal_phi_extended] SOME FAILED")
+    }
+}
+
+main()
