@@ -1,0 +1,353 @@
+// training/verify_7cond_hook.hexa — evaluation-cadence hook for PHYS-P3-3 verifier
+//
+// Roadmap: shared/roadmaps/anima.json PHYS-P4-2
+//   "verify_7cond_hw (PHYS-P3-3) 를 학습 pipeline 내 매 evaluation 마다 실행 —
+//    7/7 PASS 유지 검증"
+//   gate_metric: "7/7 PASS per 1000 train steps"
+//
+// Purpose:
+//   Provide a clean, side-effect-isolated hook that training scripts
+//   (train_alm_14b.hexa / train_clm.hexa) can call every `interval` steps
+//   to re-verify the 7 canonical hardware-path consciousness conditions.
+//   Each report is written atomically to shared/logs/hw_verify_{step}.json.
+//
+// Delegation model:
+//   This hook does NOT reimplement the 7 conditions. It shells out to
+//   anima-physics/verify_7cond_hw.hexa (PHYS-P3-3, already 7/7 PASS) via
+//   `hexa run` and parses the "T{i} PASS/FAIL" lines from its stdout.
+//   This keeps the 7-cond logic single-sourced (R14 SSOT) — any future
+//   change to substrate models lands in verify_7cond_hw.hexa only.
+//
+// Exported hooks (for train_alm_14b.hexa / train_clm.hexa to wire next):
+//   - should_verify(step, interval) -> bool
+//   - run_verify(step)              -> VerifyReport
+//   - write_report(report)          -> string (atomic path)
+//   - attach_to_train(interval)     -> ()   (one-liner train-side callback)
+//
+// Hexa constraints honored:
+//   - HEXA-FIRST (no .py/.rs/.sh) — this file is pure .hexa
+//   - lists are pass-by-value — no helper mutation patterns here;
+//     VerifyReport is a struct with scalar fields (no list mutation)
+//   - string API:  uses .split("\n"), .contains, .trim — no .find/.char_at
+//   - atomic write: write_file(tmp) then exec("mv tmp final")
+//   - does NOT mkdir shared/logs/ — it already exists (per shared/CLAUDE.md)
+//
+// Self-test T1..T3:
+//   T1: run_verify returns 7/7 PASS (delegates to PHYS-P3-3)
+//   T2: should_verify boundary cases (0, 500, 1000) at interval=1000
+//   T3: write_report → atomic, re-parseable, all 7 fields preserved
+
+// ═══════════════════════════════════════════════════════════════
+// Config
+// ═══════════════════════════════════════════════════════════════
+
+// Absolute paths — the hook may be invoked from any training cwd.
+// Using absolute paths makes the delegation deterministic regardless
+// of where train_alm_14b.hexa launches from.
+let HEXA_BIN         = "/Users/ghost/Dev/hexa-lang/hexa"
+let VERIFIER_PATH    = "/Users/ghost/Dev/anima/anima-physics/verify_7cond_hw.hexa"
+let LOG_DIR          = "/Users/ghost/Dev/anima/shared/logs"
+
+// ═══════════════════════════════════════════════════════════════
+// VerifyReport — struct captured from one verifier invocation
+// ═══════════════════════════════════════════════════════════════
+
+struct VerifyReport {
+    step:      int,
+    timestamp: string,
+    t1:        bool,
+    t2:        bool,
+    t3:        bool,
+    t4:        bool,
+    t5:        bool,
+    t6:        bool,
+    t7:        bool,
+    overall:   bool
+}
+
+// ═══════════════════════════════════════════════════════════════
+// should_verify — cadence gate
+// ═══════════════════════════════════════════════════════════════
+//
+// Returns true iff the current training step is a non-zero multiple
+// of `interval`. Zero is explicitly excluded so the very first step
+// does not fire a verify (training loop is still warming up).
+fn should_verify(step: int, interval: int) -> bool {
+    if step <= 0 { return false }
+    if interval <= 0 { return false }
+    return (step % interval) == 0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// now_iso — UTC timestamp helper (matches modules/hive_bridge.hexa)
+// ═══════════════════════════════════════════════════════════════
+fn now_iso() -> string {
+    return exec("date -u '+%Y-%m-%dT%H:%M:%SZ'").trim()
+}
+
+// ═══════════════════════════════════════════════════════════════
+// bstr — bool → JSON token (hexa str(true) prints "true" but we
+//        canonicalize here for future-proofing).
+// ═══════════════════════════════════════════════════════════════
+fn bstr(b: bool) -> string {
+    if b { return "true" }
+    return "false"
+}
+
+// ═══════════════════════════════════════════════════════════════
+// run_verify — invoke PHYS-P3-3 verifier, parse 7-cond results
+// ═══════════════════════════════════════════════════════════════
+//
+// Shells out to `hexa run verify_7cond_hw.hexa`, captures stdout,
+// scans for "T{i} PASS" / "T{i} FAIL" tokens. Because the stage0
+// interpreter may echo its program output twice on a single invocation,
+// we use first-seen boolean flags (not counts) so repeated PASS lines
+// are idempotent.
+//
+// Returns a fully-populated VerifyReport. Caller decides what to do
+// with a FAIL (abort training? warn? rollback checkpoint?).
+fn run_verify(step: int) -> VerifyReport {
+    let cmd = HEXA_BIN + " run " + VERIFIER_PATH + " 2>&1"
+    let out = exec(cmd)
+    let lines = out.split("\n")
+    let n = len(lines)
+
+    let mut t1 = false
+    let mut t2 = false
+    let mut t3 = false
+    let mut t4 = false
+    let mut t5 = false
+    let mut t6 = false
+    let mut t7 = false
+
+    let mut i = 0
+    while i < n {
+        let ln = lines[i]
+        // Strict equality — verify_7cond_hw prints exactly "T{i} PASS"
+        // (check_T* println + main() branch). Substring contains() is
+        // used as a fallback in case surrounding whitespace ever appears.
+        if ln == "T1 PASS" || ln.contains("T1 PASS") { t1 = true }
+        if ln == "T2 PASS" || ln.contains("T2 PASS") { t2 = true }
+        if ln == "T3 PASS" || ln.contains("T3 PASS") { t3 = true }
+        if ln == "T4 PASS" || ln.contains("T4 PASS") { t4 = true }
+        if ln == "T5 PASS" || ln.contains("T5 PASS") { t5 = true }
+        if ln == "T6 PASS" || ln.contains("T6 PASS") { t6 = true }
+        if ln == "T7 PASS" || ln.contains("T7 PASS") { t7 = true }
+        i = i + 1
+    }
+
+    let overall = t1 && t2 && t3 && t4 && t5 && t6 && t7
+    return VerifyReport {
+        step:      step,
+        timestamp: now_iso(),
+        t1:        t1,
+        t2:        t2,
+        t3:        t3,
+        t4:        t4,
+        t5:        t5,
+        t6:        t6,
+        t7:        t7,
+        overall:   overall
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// encode_report — VerifyReport → minimal JSON string
+// ═══════════════════════════════════════════════════════════════
+//
+// Keeps the schema flat and stable: {step, timestamp, t1..t7, overall}.
+// No nesting, no arrays — downstream monitors can parse with the
+// line-based walker pattern from feedback_hexa_string_api.md.
+fn encode_report(r: VerifyReport) -> string {
+    let mut s = "{"
+    s = s + "\"step\":" + str(r.step)
+    s = s + ",\"timestamp\":\"" + r.timestamp + "\""
+    s = s + ",\"t1\":" + bstr(r.t1)
+    s = s + ",\"t2\":" + bstr(r.t2)
+    s = s + ",\"t3\":" + bstr(r.t3)
+    s = s + ",\"t4\":" + bstr(r.t4)
+    s = s + ",\"t5\":" + bstr(r.t5)
+    s = s + ",\"t6\":" + bstr(r.t6)
+    s = s + ",\"t7\":" + bstr(r.t7)
+    s = s + ",\"overall\":" + bstr(r.overall)
+    s = s + "}\n"
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════
+// write_report — atomic write to shared/logs/hw_verify_{step}.json
+// ═══════════════════════════════════════════════════════════════
+//
+// Pattern: write-to-temp, rename. On POSIX, `mv` within the same
+// filesystem is atomic — a concurrent reader sees either the old
+// file (or ENOENT) or the fully-written new file, never a partial.
+//
+// We do NOT create LOG_DIR — shared/logs/ already exists per
+// shared/CLAUDE.md (it's part of R14 SSOT infrastructure).
+//
+// Returns the final path (for caller logging / test assertions).
+fn write_report(r: VerifyReport) -> string {
+    let final_path = LOG_DIR + "/hw_verify_" + str(r.step) + ".json"
+    let tmp_path = final_path + ".tmp"
+    let body = encode_report(r)
+    write_file(tmp_path, body)
+    exec("mv " + tmp_path + " " + final_path)
+    return final_path
+}
+
+// ═══════════════════════════════════════════════════════════════
+// attach_to_train — idempotent stub for train scripts to call once
+// ═══════════════════════════════════════════════════════════════
+//
+// The other agents patching train_alm_14b.hexa / train_clm.hexa will
+// call this once at train-loop entry. The current body is a no-op
+// ACK: the real wiring lives in the train loop itself, which checks
+// should_verify(step, interval) each step and calls run_verify +
+// write_report on hit. We expose this as a named hook so the train
+// side has a single, stable symbol to depend on.
+//
+// Rationale for keeping it trivial: hexa has no thread/signal
+// primitives available here, so "attach" is a declarative no-op
+// rather than a callback registration. The train loop owns the
+// actual polling (see PHYS-P4-2 next-session work).
+fn attach_to_train(interval: int) {
+    println("[verify_7cond_hook] attached — interval=" + str(interval) + " step(s), verifier=" + VERIFIER_PATH)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// JSON re-parse helpers (for T3 self-test round-trip verification)
+// ═══════════════════════════════════════════════════════════════
+//
+// We use a minimal field-by-field substring probe rather than a full
+// JSON parser. The schema is fixed and ASCII-only so this is safe
+// (see feedback_hexa_string_api.md — multibyte content is the problem,
+// not ASCII JSON).
+fn json_field_bool(body: string, field: string) -> bool {
+    let needle = "\"" + field + "\":"
+    if !body.contains(needle) { return false }
+    // crude but sufficient: search for the field followed by "true"
+    let true_pat = needle + "true"
+    return body.contains(true_pat)
+}
+
+fn json_field_int(body: string, field: string) -> int {
+    let needle = "\"" + field + "\":"
+    let parts = body.split(needle)
+    if len(parts) < 2 { return -1 }
+    let tail = parts[1]
+    // tail starts with digits followed by `,` or `}`
+    let mut num_str = ""
+    let n = len(tail)
+    let mut i = 0
+    while i < n {
+        let ch = tail.substring(i, i + 1)
+        if ch == "," || ch == "}" { i = n }
+        else {
+            num_str = num_str + ch
+            i = i + 1
+        }
+    }
+    if num_str == "" { return -1 }
+    return to_int(num_str)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-test — T1..T3
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[verify_7cond_hook] PHYS-P4-2 — evaluation-cadence hook self-test")
+    println("[verify_7cond_hook] verifier: " + VERIFIER_PATH)
+    println("[verify_7cond_hook] log_dir:  " + LOG_DIR)
+    println("")
+
+    let mut pass_count = 0
+    let mut fail_count = 0
+
+    // ─── T1: run_verify delegates to PHYS-P3-3 and returns 7/7 PASS ──
+    println("[T1] invoking run_verify(step=1000) — delegates to PHYS-P3-3 ...")
+    let rep = run_verify(1000)
+    let t1_ok = rep.t1 && rep.t2 && rep.t3 && rep.t4 && rep.t5 && rep.t6 && rep.t7 && rep.overall
+    if t1_ok {
+        println("[T1] PASS — 7/7 conditions returned PASS (t1..t7 + overall)")
+        pass_count = pass_count + 1
+    } else {
+        println("[T1] FAIL — t1=" + bstr(rep.t1) + " t2=" + bstr(rep.t2) + " t3=" + bstr(rep.t3) + " t4=" + bstr(rep.t4) + " t5=" + bstr(rep.t5) + " t6=" + bstr(rep.t6) + " t7=" + bstr(rep.t7) + " overall=" + bstr(rep.overall))
+        fail_count = fail_count + 1
+    }
+
+    // ─── T2: should_verify boundary cases ───────────────────────────
+    let sv_1000 = should_verify(1000, 1000)   // expect true
+    let sv_500  = should_verify(500, 1000)    // expect false
+    let sv_0    = should_verify(0, 1000)      // expect false (step > 0 guard)
+    let t2_ok = sv_1000 && !sv_500 && !sv_0
+    if t2_ok {
+        println("[T2] PASS — should_verify(1000,1000)=true, (500,1000)=false, (0,1000)=false")
+        pass_count = pass_count + 1
+    } else {
+        println("[T2] FAIL — (1000,1000)=" + bstr(sv_1000) + " (500,1000)=" + bstr(sv_500) + " (0,1000)=" + bstr(sv_0))
+        fail_count = fail_count + 1
+    }
+
+    // ─── T3: write_report → atomic → round-trip ─────────────────────
+    // Use a dedicated test step to avoid clobbering real training logs.
+    let test_step = 999999
+    let test_rep = VerifyReport {
+        step:      test_step,
+        timestamp: now_iso(),
+        t1:        true,
+        t2:        true,
+        t3:        true,
+        t4:        true,
+        t5:        true,
+        t6:        true,
+        t7:        true,
+        overall:   true
+    }
+    let final_path = write_report(test_rep)
+
+    // Atomic: the .tmp file must NOT exist after write_report returns
+    let tmp_check = exec("test -f " + final_path + ".tmp && echo present || echo absent").trim()
+    let atomic_ok = tmp_check.contains("absent")
+
+    // Re-parse — read back and verify all 7 + step preserved
+    let readback = read_file(final_path)
+    let step_back = json_field_int(readback, "step")
+    let t1_back = json_field_bool(readback, "t1")
+    let t2_back = json_field_bool(readback, "t2")
+    let t3_back = json_field_bool(readback, "t3")
+    let t4_back = json_field_bool(readback, "t4")
+    let t5_back = json_field_bool(readback, "t5")
+    let t6_back = json_field_bool(readback, "t6")
+    let t7_back = json_field_bool(readback, "t7")
+    let overall_back = json_field_bool(readback, "overall")
+
+    let fields_ok = step_back == test_step && t1_back && t2_back && t3_back && t4_back && t5_back && t6_back && t7_back && overall_back
+
+    // Cleanup the test file so repeated self-tests stay tidy
+    exec("rm -f " + final_path)
+
+    let t3_ok = atomic_ok && fields_ok
+    if t3_ok {
+        println("[T3] PASS — wrote " + final_path + " atomically, round-trip preserved 7 fields + step")
+        pass_count = pass_count + 1
+    } else {
+        println("[T3] FAIL — atomic_ok=" + bstr(atomic_ok) + " fields_ok=" + bstr(fields_ok) + " step_back=" + str(step_back))
+        fail_count = fail_count + 1
+    }
+
+    // ─── attach_to_train smoke — not counted, just exercises the symbol ──
+    attach_to_train(1000)
+
+    // ─── Summary ────────────────────────────────────────────────────
+    println("")
+    println("[verify_7cond_hook] ─── summary ───")
+    println("[verify_7cond_hook] PASS=" + str(pass_count) + " / FAIL=" + str(fail_count) + " (T1..T3)")
+    if fail_count == 0 {
+        println("[verify_7cond_hook] ALL TESTS PASS — PHYS-P4-2 hook ready to wire")
+    } else {
+        println("[verify_7cond_hook] FAILURES DETECTED — review above")
+    }
+}
+
+main()

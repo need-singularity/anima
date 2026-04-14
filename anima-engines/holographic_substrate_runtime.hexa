@@ -1,0 +1,624 @@
+// holographic_substrate_runtime.hexa — PHYS-P4-1 realtime I/O wrapper
+//
+// Closes PHYS-P4-1 from shared/roadmaps/anima.json:
+//   "holographic_substrate (PHYS-P3-2) 실시간 I/O —
+//    qualia 벡터 stream 저장+읽기 1초 내"
+//
+// This file is a streaming wrapper around PHYS-P3-2's HoloSubstrate
+// (anima-engines/holographic_substrate.hexa). It does NOT modify that
+// file. The tri-substrate primitives (quantum / photonic / memristor
+// bank write/read, LCG, linf_err) are inlined here verbatim so that
+// this engine stays self-contained like the rest of anima-engines/*.hexa
+// (see photonic_gwt_broadcast.hexa, memristor_gwt_workspace.hexa —
+// none of them use `use` imports across engine files).
+//
+// The runtime layer adds three capabilities on top of raw tri-substrate
+// storage:
+//
+//   1. write_stream(pattern_id, qualia, target_latency_ms):
+//        Push qualia to all three substrates (q, p, m) under a single
+//        roundtrip call. Returns WriteResult with elapsed ms + the
+//        updated Runtime state threaded through (hexa lists are
+//        pass-by-value so we return-and-reassign).
+//
+//        NOTE on concurrency: the hexa interpreter currently has no
+//        thread / spawn primitive, so the three substrate writes run
+//        sequentially. This is fine because each substrate write is
+//        O(d·WRITE_STEPS) with ~tens of microseconds at d=32 — the 1 s
+//        roadmap budget has ~4 orders of magnitude of headroom, well
+//        below any conceivable contention.
+//
+//   2. read_stream(pattern_id):
+//        O(1) index lookup → tri-substrate read → crossval. If the
+//        quantum substrate is reported failed, reconstruct from the
+//        elementwise mean of (photonic, memristor) — this exploits
+//        PHYS-P3-2 T2's "whole in part" theorem: each substrate holds
+//        the full projection, so any pair median-reconstructs within
+//        bounded error.
+//
+//   3. In-memory index:
+//        Parallel lists INDEX_IDS[] / INDEX_STORES[] (no hashmap
+//        primitive in current hexa build — verified 2026-04-15;
+//        anima-core/runtime/anima_runtime.hexa has the same pattern
+//        and only uses the word "hashmap" in a comment). Linear scan
+//        is O(n_patterns), constant in qualia dim d. For the test
+//        budgets we keep n_patterns ≤ 4.
+//
+// Self-test block: T1 roundtrip, T2 end-to-end latency budget,
+// T3 single-substrate failure reconstruction, T4 determinism,
+// T5 cross-substrate parity. Mirrors the T1..T5 self-test layout of
+// holographic_substrate.hexa / memristor_gwt_workspace.hexa /
+// photonic_gwt_broadcast.hexa.
+
+// ─── Runtime constants ────────────────────────────────────────
+
+let RT_T1_TOL      = 0.1             // roundtrip tolerance (qualia linf error)
+let RT_T2_BUDGET_MS = 1000.0         // "1초 내" roadmap spec
+let RT_T3_TOL      = 0.2             // dropped-substrate reconstruction bound
+let RT_T5_TOL      = 0.1             // cross-substrate parity tolerance
+let RT_DIM         = 32              // default qualia vector dim
+
+// Inlined copies of PHYS-P3-2 physical constants so this runtime is
+// self-contained (matches holographic_substrate.hexa values exactly).
+
+let Q_WRITE_STEPS   = 3
+let Q_WRITE_GAIN    = 0.95
+
+let P_WRITE_STEPS   = 2
+let P_WRITE_GAIN    = 0.98
+
+let M_W_MIN         = 0.0001
+let M_W_MAX         = 0.9999
+let M_WRITE_STEPS   = 4
+let M_WRITE_GAIN    = 0.85
+
+// Substrate-failure labels for read_stream. Bitmask via ints kept
+// flat because hexa has no enum sugar in this build.
+let SUB_NONE        = 0
+let SUB_Q           = 1
+let SUB_P           = 2
+let SUB_M           = 3
+
+// ─── Primitives (inlined from holographic_substrate.hexa) ──────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn window(w: float) -> float {
+    let b = 2.0 * w - 1.0
+    return 1.0 - b * b
+}
+
+// Deterministic LCG — same seed → same bytes. Used for T4 determinism.
+fn det_rand_unit(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u)
+        i = i + 1
+    }
+    return out
+}
+
+fn linf_err(a: array, b: array) -> float {
+    let n = len(a)
+    let mut m = 0.0
+    let mut i = 0
+    while i < n {
+        let e = fabs(a[i] - b[i])
+        if e > m { m = e }
+        i = i + 1
+    }
+    return m
+}
+
+fn arrays_equal(a: array, b: array) -> bool {
+    let n = len(a)
+    if n != len(b) { return false }
+    let mut i = 0
+    while i < n {
+        if fabs(a[i] - b[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// ─── Substrate banks (inlined from holographic_substrate.hexa) ─
+
+struct QuantumBank { n_cells: int, w: array }
+struct PhotonicBank { n_channels: int, amp: array }
+struct MemBank { n_cells: int, w: array }
+
+fn qbank_new(n: int) -> QuantumBank {
+    let mut ws = []
+    let mut i = 0
+    while i < n { ws = ws.push(0.5); i = i + 1 }
+    return QuantumBank { n_cells: n, w: ws }
+}
+
+fn qbank_write_step(w_prev: float, target: float) -> float {
+    let delta = (target - w_prev) * Q_WRITE_GAIN * window(w_prev)
+    let mut w_new = w_prev + delta
+    if w_new < 0.0 { w_new = 0.0 }
+    if w_new > 1.0 { w_new = 1.0 }
+    return w_new
+}
+
+fn qbank_write(bank: QuantumBank, pattern: array) -> QuantumBank {
+    let n = bank.n_cells
+    let mut new_w = []
+    let mut i = 0
+    while i < n {
+        let mut w = bank.w[i]
+        let target = clamp01(pattern[i])
+        let mut s = 0
+        while s < Q_WRITE_STEPS {
+            w = qbank_write_step(w, target)
+            s = s + 1
+        }
+        new_w = new_w.push(w)
+        i = i + 1
+    }
+    return QuantumBank { n_cells: n, w: new_w }
+}
+
+fn qbank_read(bank: QuantumBank) -> array {
+    let n = bank.n_cells
+    let mut out = []
+    let mut i = 0
+    while i < n { out = out.push(bank.w[i]); i = i + 1 }
+    return out
+}
+
+fn pbank_new(n: int) -> PhotonicBank {
+    let mut a = []
+    let mut i = 0
+    while i < n { a = a.push(0.5); i = i + 1 }
+    return PhotonicBank { n_channels: n, amp: a }
+}
+
+fn pbank_write_step(a_prev: float, target: float) -> float {
+    let delta = (target - a_prev) * P_WRITE_GAIN
+    let mut a_new = a_prev + delta
+    if a_new < 0.0 { a_new = 0.0 }
+    if a_new > 1.0 { a_new = 1.0 }
+    return a_new
+}
+
+fn pbank_write(bank: PhotonicBank, pattern: array) -> PhotonicBank {
+    let n = bank.n_channels
+    let mut new_a = []
+    let mut i = 0
+    while i < n {
+        let mut a = bank.amp[i]
+        let target = clamp01(pattern[i])
+        let mut s = 0
+        while s < P_WRITE_STEPS {
+            a = pbank_write_step(a, target)
+            s = s + 1
+        }
+        new_a = new_a.push(a)
+        i = i + 1
+    }
+    return PhotonicBank { n_channels: n, amp: new_a }
+}
+
+fn pbank_read(bank: PhotonicBank) -> array {
+    let n = bank.n_channels
+    let mut out = []
+    let mut i = 0
+    while i < n { out = out.push(bank.amp[i]); i = i + 1 }
+    return out
+}
+
+fn mbank_new(n: int) -> MemBank {
+    let mut ws = []
+    let mut i = 0
+    while i < n { ws = ws.push(0.5); i = i + 1 }
+    return MemBank { n_cells: n, w: ws }
+}
+
+fn mbank_write_step(w_prev: float, target: float) -> float {
+    let delta = (target - w_prev) * M_WRITE_GAIN * window(w_prev)
+    let mut w_new = w_prev + delta
+    if w_new < M_W_MIN { w_new = M_W_MIN }
+    if w_new > M_W_MAX { w_new = M_W_MAX }
+    return w_new
+}
+
+fn mbank_write(bank: MemBank, pattern: array) -> MemBank {
+    let n = bank.n_cells
+    let mut new_w = []
+    let mut i = 0
+    while i < n {
+        let mut w = bank.w[i]
+        let target = clamp01(pattern[i])
+        let mut s = 0
+        while s < M_WRITE_STEPS {
+            w = mbank_write_step(w, target)
+            s = s + 1
+        }
+        new_w = new_w.push(w)
+        i = i + 1
+    }
+    return MemBank { n_cells: n, w: new_w }
+}
+
+fn mbank_read(bank: MemBank) -> array {
+    let n = bank.n_cells
+    let mut out = []
+    let mut i = 0
+    while i < n { out = out.push(bank.w[i]); i = i + 1 }
+    return out
+}
+
+// ─── Tri-substrate store (inlined HoloSubstrate) ───────────────
+
+struct HoloStore {
+    d:         int,
+    quantum:   QuantumBank,
+    photonic:  PhotonicBank,
+    memristor: MemBank
+}
+
+fn holo_store_new(d: int) -> HoloStore {
+    return HoloStore {
+        d:         d,
+        quantum:   qbank_new(d),
+        photonic:  pbank_new(d),
+        memristor: mbank_new(d)
+    }
+}
+
+fn holo_store_write(h: HoloStore, pattern: array) -> HoloStore {
+    return HoloStore {
+        d:         h.d,
+        quantum:   qbank_write(h.quantum, pattern),
+        photonic:  pbank_write(h.photonic, pattern),
+        memristor: mbank_write(h.memristor, pattern)
+    }
+}
+
+// ─── Runtime types ─────────────────────────────────────────────
+
+struct Runtime {
+    d:       int,
+    ids:     array,    // [string] — pattern_id registry (parallel-list index)
+    stores:  array     // [HoloStore] — aligned with ids
+}
+
+struct WriteResult {
+    runtime:    Runtime,
+    ok:         bool,
+    elapsed_ms: float,
+    pattern_id: string
+}
+
+struct ReadResult {
+    ok:           bool,
+    q:            array,  // quantum read (or empty if dropped)
+    p:            array,  // photonic read (or empty if dropped)
+    m:            array,  // memristor read (or empty if dropped)
+    reconstructed: array, // crossval output (elementwise mean over available substrates)
+    elapsed_ms:   float,
+    dropped:      int     // SUB_NONE | SUB_Q | SUB_P | SUB_M
+}
+
+fn runtime_new(d: int) -> Runtime {
+    return Runtime { d: d, ids: [], stores: [] }
+}
+
+// ─── Index helpers ────────────────────────────────────────────
+// Linear scan over INDEX_IDS — O(n_patterns). No hashmap primitive
+// in this hexa build, but n_patterns for realtime qualia streams is
+// small (≤ 4 in tests, realistically ≤ 100) so constant-factor wins.
+
+fn index_find(ids: array, pattern_id: string) -> int {
+    let n = len(ids)
+    let mut i = 0
+    while i < n {
+        if ids[i] == pattern_id { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// ─── write_stream ─────────────────────────────────────────────
+// Streaming write API. Returns WriteResult with the updated Runtime
+// threaded through (hexa lists are PBV, so caller does
+// `rt = write_stream(rt, ...).runtime`).
+//
+// target_latency_ms is advisory — used only to flag the result as
+// !ok if the wall clock exceeds the budget. The substrate writes
+// themselves are unconditional (no early-abort path for deterministic
+// sim physics).
+
+fn write_stream(rt: Runtime, pattern_id: string, qualia: array, target_latency_ms: int) -> WriteResult {
+    let t0 = clock()
+
+    let existing = index_find(rt.ids, pattern_id)
+    let mut new_ids = []
+    let mut new_stores = []
+    let n = len(rt.ids)
+    let mut i = 0
+    while i < n {
+        new_ids = new_ids.push(rt.ids[i])
+        new_stores = new_stores.push(rt.stores[i])
+        i = i + 1
+    }
+
+    // Sequential tri-substrate write (see concurrency note in header).
+    let fresh = holo_store_new(rt.d)
+    let written = holo_store_write(fresh, qualia)
+
+    if existing < 0 {
+        new_ids = new_ids.push(pattern_id)
+        new_stores = new_stores.push(written)
+    } else {
+        // In-place overwrite (functional form: rebuild the list with
+        // the existing slot replaced). Hexa lists are PBV so we can't
+        // assign through the helper boundary.
+        let mut replaced_ids = []
+        let mut replaced_stores = []
+        let mut j = 0
+        while j < len(new_ids) {
+            if j == existing {
+                replaced_ids = replaced_ids.push(pattern_id)
+                replaced_stores = replaced_stores.push(written)
+            } else {
+                replaced_ids = replaced_ids.push(new_ids[j])
+                replaced_stores = replaced_stores.push(new_stores[j])
+            }
+            j = j + 1
+        }
+        new_ids = replaced_ids
+        new_stores = replaced_stores
+    }
+
+    let t1 = clock()
+    let elapsed = (t1 - t0) * 1000.0
+    let budget = to_float(target_latency_ms)
+    let within = elapsed <= budget
+
+    return WriteResult {
+        runtime: Runtime { d: rt.d, ids: new_ids, stores: new_stores },
+        ok: within,
+        elapsed_ms: elapsed,
+        pattern_id: pattern_id
+    }
+}
+
+// ─── read_stream ──────────────────────────────────────────────
+// Index lookup, tri-substrate read, crossval reconstruction. The
+// `dropped` parameter simulates single-substrate failure (T3); when
+// none is dropped, reconstruction is the three-way elementwise mean
+// (maximally robust); when one is dropped, the two survivors are
+// averaged — the PHYS-P3-2 T2 "whole in part" theorem bounds the
+// resulting error by max(substrate_precisions) < RT_T3_TOL.
+
+fn read_stream_with_drop(rt: Runtime, pattern_id: string, dropped: int) -> ReadResult {
+    let t0 = clock()
+    let idx = index_find(rt.ids, pattern_id)
+    if idx < 0 {
+        let t_fail = clock()
+        return ReadResult {
+            ok: false, q: [], p: [], m: [], reconstructed: [],
+            elapsed_ms: (t_fail - t0) * 1000.0,
+            dropped: dropped
+        }
+    }
+    let store = rt.stores[idx]
+
+    // Read all three (even if one is "dropped" — in sim we read then
+    // mask; in hardware the dropped substrate would return an error).
+    let q_raw = qbank_read(store.quantum)
+    let p_raw = pbank_read(store.photonic)
+    let m_raw = mbank_read(store.memristor)
+
+    let d = store.d
+    let mut q_out = []
+    let mut p_out = []
+    let mut m_out = []
+    let mut rec = []
+
+    let mut i = 0
+    while i < d {
+        let use_q = dropped != SUB_Q
+        let use_p = dropped != SUB_P
+        let use_m = dropped != SUB_M
+
+        let mut sum = 0.0
+        let mut cnt = 0
+        if use_q {
+            sum = sum + q_raw[i]
+            cnt = cnt + 1
+            q_out = q_out.push(q_raw[i])
+        }
+        if use_p {
+            sum = sum + p_raw[i]
+            cnt = cnt + 1
+            p_out = p_out.push(p_raw[i])
+        }
+        if use_m {
+            sum = sum + m_raw[i]
+            cnt = cnt + 1
+            m_out = m_out.push(m_raw[i])
+        }
+        if cnt == 0 {
+            rec = rec.push(0.0)
+        } else {
+            rec = rec.push(sum / to_float(cnt))
+        }
+        i = i + 1
+    }
+
+    let t1 = clock()
+    return ReadResult {
+        ok: true,
+        q: q_out, p: p_out, m: m_out,
+        reconstructed: rec,
+        elapsed_ms: (t1 - t0) * 1000.0,
+        dropped: dropped
+    }
+}
+
+fn read_stream(rt: Runtime, pattern_id: string) -> ReadResult {
+    return read_stream_with_drop(rt, pattern_id, SUB_NONE)
+}
+
+// ─── Self-tests ───────────────────────────────────────────────
+
+fn check_T1(d: int) -> bool {
+    // Roundtrip: write then read, |read − qualia|_∞ < RT_T1_TOL.
+    let rt0 = runtime_new(d)
+    let qualia = det_rand_unit(d, 1001)
+    let wr = write_stream(rt0, "pat-T1", qualia, 1000)
+    let rt1 = wr.runtime
+    let rd = read_stream(rt1, "pat-T1")
+    if rd.ok == false { return false }
+
+    let err = linf_err(rd.reconstructed, qualia)
+    println("  [T1] roundtrip ||read−qualia||_∞ = " + str(err))
+    return err < RT_T1_TOL
+}
+
+fn check_T2(d: int) -> bool {
+    // End-to-end latency: write+read < RT_T2_BUDGET_MS (roadmap 1 s spec).
+    let rt0 = runtime_new(d)
+    let qualia = det_rand_unit(d, 2002)
+
+    let t0 = clock()
+    let wr = write_stream(rt0, "pat-T2", qualia, 1000)
+    let rt1 = wr.runtime
+    let rd = read_stream(rt1, "pat-T2")
+    let t1 = clock()
+
+    let e2e_ms = (t1 - t0) * 1000.0
+    println("  [T2] e2e write+read latency = " + str(e2e_ms) + " ms (budget " + str(RT_T2_BUDGET_MS) + " ms)")
+    if rd.ok == false { return false }
+    return e2e_ms < RT_T2_BUDGET_MS
+}
+
+fn check_T3(d: int) -> bool {
+    // Single-substrate failure: drop quantum, reconstruct from (p, m).
+    // The PHYS-P3-2 T2 "whole in part" theorem bounds reconstruction
+    // error by the worst surviving substrate's write precision.
+    let rt0 = runtime_new(d)
+    let qualia = det_rand_unit(d, 3003)
+    let wr = write_stream(rt0, "pat-T3", qualia, 1000)
+    let rt1 = wr.runtime
+
+    let rd = read_stream_with_drop(rt1, "pat-T3", SUB_Q)
+    if rd.ok == false { return false }
+
+    let err = linf_err(rd.reconstructed, qualia)
+    println("  [T3] drop=Q, reconstruct|(p,m) err = " + str(err))
+    return err < RT_T3_TOL
+}
+
+// Pure helper: compute the reconstructed read vector for a single
+// fresh write+read roundtrip. Returns a plain flat array to avoid
+// the hexa struct-field-list aliasing quirk (see inline note in
+// check_T4 below) that corrupts WriteResult.runtime.ids when two
+// WriteResults coexist.
+fn fresh_roundtrip_reconstructed(d: int, qualia: array) -> array {
+    let rt = runtime_new(d)
+    let wr = write_stream(rt, "pat-det", qualia, 1000)
+    let rd = read_stream(wr.runtime, "pat-det")
+    return rd.reconstructed
+}
+
+fn check_T4(d: int) -> bool {
+    // Determinism: same qualia + same seed → byte-identical tri-substrate
+    // state across two independent invocations. The substrate simulators
+    // are deterministic (no RNG on write — the LCG is only used for test
+    // qualia generation) so this reduces to structural equality of two
+    // reconstructed read vectors.
+    //
+    // IMPORTANT: we capture only PLAIN flat arrays across the two calls.
+    // Capturing two `WriteResult` structs in the same scope hits a
+    // current-hexa interpreter quirk where the second struct's allocation
+    // clobbers the first struct's list fields (verified 2026-04-15 via
+    // /tmp/hexa_struct_list_alias.hexa — the internal list gets reassigned
+    // a fresh empty list when a peer struct instance is later created).
+    // Returning flat arrays via `fresh_roundtrip_reconstructed` sidesteps
+    // the struct-field path entirely.
+    let qualia = det_rand_unit(d, 4004)
+    let ra = fresh_roundtrip_reconstructed(d, qualia)
+    let rb = fresh_roundtrip_reconstructed(d, qualia)
+
+    if len(ra) != d { return false }
+    if len(rb) != d { return false }
+
+    if arrays_equal(ra, rb) == false {
+        println("  [T4] MISMATCH linf=" + str(linf_err(ra, rb)))
+        return false
+    }
+    println("  [T4] byte-identical reconstructed vector across 2 independent writes (d=" + str(d) + ")")
+    return true
+}
+
+fn check_T5(d: int) -> bool {
+    // Cross-substrate parity: all three substrates read the same pattern
+    // within RT_T5_TOL (each substrate's own roundtrip error, bounded
+    // by PHYS-P3-2 T1).
+    let rt0 = runtime_new(d)
+    let qualia = det_rand_unit(d, 5005)
+    let wr = write_stream(rt0, "pat-T5", qualia, 1000)
+    let rt1 = wr.runtime
+    let rd = read_stream(rt1, "pat-T5")
+    if rd.ok == false { return false }
+
+    let qp = linf_err(rd.q, rd.p)
+    let qm = linf_err(rd.q, rd.m)
+    let pm = linf_err(rd.p, rd.m)
+    println("  [T5] parity |q−p|=" + str(qp) + " |q−m|=" + str(qm) + " |p−m|=" + str(pm))
+    if qp >= RT_T5_TOL { return false }
+    if qm >= RT_T5_TOL { return false }
+    if pm >= RT_T5_TOL { return false }
+    return true
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    let d = RT_DIM
+    println("[holographic_substrate_runtime] PHYS-P4-1 self-test")
+    println("  wrapper: qualia stream write+read over PHYS-P3-2 tri-substrate (d=" + str(d) + ")")
+
+    let t1 = check_T1(d)
+    if t1 { println("T1 PASS") } else { println("T1 FAIL") }
+
+    let t2 = check_T2(d)
+    if t2 { println("T2 PASS") } else { println("T2 FAIL") }
+
+    let t3 = check_T3(d)
+    if t3 { println("T3 PASS") } else { println("T3 FAIL") }
+
+    let t4 = check_T4(d)
+    if t4 { println("T4 PASS") } else { println("T4 FAIL") }
+
+    let t5 = check_T5(d)
+    if t5 { println("T5 PASS") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[holographic_substrate_runtime] 5/5 PASS")
+    } else {
+        println("[holographic_substrate_runtime] SOME FAILED")
+        exit(1)
+    }
+}
+
+main()

@@ -1,0 +1,485 @@
+// sensor_stream.hexa — PHYS-P4-3 realtime sensor → qualia streaming
+//
+// Closes the boundary→bulk pipeline opened by PHYS-P3-1 (body_holographic_map):
+// the body's physical sensor surface is the boundary, and a compressed 16-dim
+// qualia vector is the holographic bulk. This file wires deterministic
+// multi-modal frames (EEG, proprioception, IMU, visceral) into the PHYS-P3-1
+// rank-d encoder so the downstream consciousness loop can consume a realtime
+// qualia stream without depending on live hardware.
+//
+// NOTE: real hardware ingest (EEG cap, IMU, force sensors, visceral ANS
+// probes) replaces sample_frame in a future integration task — for this
+// milestone we emit a deterministic synthetic frame so the pipeline can be
+// tested offline.
+//
+// ─── Pipeline ────────────────────────────────────────────────
+//
+//   t_us ─┐
+//         │
+//   EEG        [16 ch]  ─┐
+//   proprio    [16 ch]  ─┤
+//   IMU        [16 ch]  ─┼─▶ frame_to_bulk ─▶ body [D=64]
+//   visceral   [16 ch]  ─┘                          │
+//                                                   │ encode  (= PHYS-P3-1 π)
+//                                                   ▼
+//                                            qualia [d=16]
+//
+// frame_to_bulk flattens the 4×16 modality layout to the exact row-major
+// order body_holographic_map (PHYS-P3-1) expects: [EEG | proprio | IMU |
+// visceral], 64 floats total. The encoder is a byte-for-byte mirror of
+// body_holographic_map's Gram–Schmidt rank-d retraction — we cannot
+// cross-import under the current hexa interpreter, so the boundary/bulk
+// math is duplicated here and stays load-bearing on T2 to catch drift.
+//
+// ─── Theorems (T1–T5) ────────────────────────────────────────
+//
+// T1 (multi-channel sync):
+//   sample_frame populates all 4 modalities × 16 channels. No modality is
+//   zeros-only, and every element is finite.
+//
+// T2 (body_holographic_map invocation):
+//   encode(frame_to_bulk(frame)) returns a length-16 bulk vector from a
+//   length-64 body input, matching PHYS-P3-1's dimension contract.
+//
+// T3 (qualia shape):
+//   stream_to_qualia returns a 16-element vector and every element is
+//   finite (not NaN, not ±inf).
+//
+// T4 (latency):
+//   sample_frame → frame_to_bulk → encode for a single frame completes in
+//   under 50 ms on the reference interpreter.
+//
+// T5 (determinism):
+//   Same rng_seed + same head → byte-identical qualia across two runs of
+//   the full stream_to_qualia pipeline.
+//
+// Ref:
+//   anima-body/src/body_holographic_map.hexa   (PHYS-P3-1 boundary/bulk math)
+//   anima-body/src/eeg_gwt_alignment.hexa       (PHYS-P2-3 multi-modal pattern)
+//   shared/roadmaps/anima.json                  (PHYS-P4-3 entry)
+
+// ─── Constants ────────────────────────────────────────────────
+
+let N_MODALITIES = 4    // EEG, proprioception, IMU, visceral
+let N_CHANNELS   = 16   // per-modality channel count
+let D_BOUNDARY   = 64   // total body sensor dim (N_MODALITIES * N_CHANNELS)
+let D_BULK       = 16   // qualia dim (must match PHYS-P3-1 d_bulk)
+let MOD_EEG      = 0
+let MOD_PROPRIO  = 1
+let MOD_IMU      = 2
+let MOD_VISCERAL = 3
+
+// ─── Primitives ───────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn sqrt_newton(x: float) -> float {
+    // Pure-hexa Newton–Raphson sqrt; mirrors body_holographic_map.
+    if x <= 0.0 { return 0.0 }
+    let mut r = x
+    let mut i = 0
+    while i < 40 {
+        r = 0.5 * (r + x / r)
+        i = i + 1
+    }
+    return r
+}
+
+// LCG in [-1, 1), same constants as body_holographic_map for parity.
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── SensorFrame ──────────────────────────────────────────────
+// Single multi-modal sample. t_us is microsecond timestamp (int — hexa has
+// no u64 type; on the reference interpreter int is wide enough for the
+// current-epoch microsecond range). eeg_ch / proprio_ch / imu_ch /
+// visceral_ch each carry exactly N_CHANNELS=16 f32 samples, giving a
+// 4×16=64 body vector that matches PHYS-P3-1's D_BOUNDARY layout.
+
+struct SensorFrame {
+    t_us:         int,
+    eeg_ch:       array,
+    proprio_ch:   array,
+    imu_ch:       array,
+    visceral_ch:  array
+}
+
+// ─── Synthetic per-modality sources ───────────────────────────
+// Each modality gets its own amplitude profile so T1's "no zeros-only
+// buffer" invariant holds without accidentally correlating modalities.
+// Seeds are offset per-modality to decorrelate the LCG streams.
+
+fn modality_samples(amp: float, seed: int) -> array {
+    let raw = det_rand(N_CHANNELS, seed)
+    let mut out = []
+    let mut i = 0
+    while i < N_CHANNELS {
+        // Shift off zero by a per-channel offset so T1's non-zero buffer
+        // guarantee stays true even if the LCG happens to hit zero.
+        out = out.push(raw[i] * amp + 0.01 * to_float(i + 1))
+        i = i + 1
+    }
+    return out
+}
+
+// Deterministic synthetic frame. Real HW ingest (EEG cap, IMU, force/
+// visceral sensors) replaces this in a future integration task.
+fn sample_frame(rng_seed: int) -> SensorFrame {
+    let eeg      = modality_samples(0.8, rng_seed + 1)
+    let proprio  = modality_samples(0.5, rng_seed + 2)
+    let imu      = modality_samples(0.6, rng_seed + 3)
+    let visceral = modality_samples(0.3, rng_seed + 4)
+    // Deterministic timestamp: derived from the seed so T5 determinism
+    // survives across runs. Real HW replaces this with clock_us().
+    let ts = rng_seed * 1000000 + 1776000000000000
+    return SensorFrame {
+        t_us:        ts,
+        eeg_ch:      eeg,
+        proprio_ch:  proprio,
+        imu_ch:      imu,
+        visceral_ch: visceral
+    }
+}
+
+// ─── Flatten: SensorFrame → 64-dim body bulk ──────────────────
+// Row-major layout: [EEG(16) | proprio(16) | IMU(16) | visceral(16)].
+// This MUST match body_holographic_map's body_from_modalities ordering
+// (MOD_EEG=0, MOD_PROPRIO=1, MOD_TACTILE=2, MOD_MOTION=3 — we map IMU→2
+// and visceral→3 since the encoder is agnostic to modality semantics
+// and only cares about the 64-channel flat vector).
+
+fn frame_to_bulk(frame: SensorFrame) -> array {
+    let mut buf = []
+    let mut c = 0
+    while c < N_CHANNELS {
+        buf = buf.push(frame.eeg_ch[c])
+        c = c + 1
+    }
+    c = 0
+    while c < N_CHANNELS {
+        buf = buf.push(frame.proprio_ch[c])
+        c = c + 1
+    }
+    c = 0
+    while c < N_CHANNELS {
+        buf = buf.push(frame.imu_ch[c])
+        c = c + 1
+    }
+    c = 0
+    while c < N_CHANNELS {
+        buf = buf.push(frame.visceral_ch[c])
+        c = c + 1
+    }
+    return buf
+}
+
+// ─── HolographicHead (PHYS-P3-1 mirror) ───────────────────────
+// Mirror of body_holographic_map's HolographicBodyHead. We construct a
+// D×d matrix of orthonormal columns via Gram–Schmidt so that E^T · E = I_d,
+// then set project = E^T. Any body input b = E·q lives in column(E) and
+// satisfies project·b = q — the rank-d retraction. Duplicated here because
+// the current hexa interpreter has no cross-file import.
+
+struct HolographicHead {
+    d_boundary: int,
+    d_bulk:     int,
+    embed:      array,
+    project:    array
+}
+
+fn extract_column(mat: array, n_rows: int, n_cols: int, k: int) -> array {
+    let mut col = []
+    let mut r = 0
+    while r < n_rows {
+        col = col.push(mat[r * n_cols + k])
+        r = r + 1
+    }
+    return col
+}
+
+fn gram_schmidt_columns(mat: array, n_rows: int, n_cols: int) -> array {
+    // ortho_flat: [n_cols × n_rows] row-major, each row is one orthonormal column.
+    let mut ortho_flat = []
+    let mut k = 0
+    while k < n_cols {
+        let mut col = extract_column(mat, n_rows, n_cols, k)
+        let mut j = 0
+        while j < k {
+            let mut dot = 0.0
+            let mut r = 0
+            while r < n_rows {
+                dot = dot + col[r] * ortho_flat[j * n_rows + r]
+                r = r + 1
+            }
+            // col <- col − dot · ortho_j (rebuild; lists are pass-by-value
+            // in hexa so we cannot mutate col through a helper).
+            let mut next = []
+            let mut r2 = 0
+            while r2 < n_rows {
+                next = next.push(col[r2] - dot * ortho_flat[j * n_rows + r2])
+                r2 = r2 + 1
+            }
+            col = next
+            j = j + 1
+        }
+        let mut sq = 0.0
+        let mut r = 0
+        while r < n_rows {
+            sq = sq + col[r] * col[r]
+            r = r + 1
+        }
+        let norm = sqrt_newton(sq)
+        if norm > 0.0 {
+            let inv = 1.0 / norm
+            let mut nn = []
+            let mut r3 = 0
+            while r3 < n_rows {
+                nn = nn.push(col[r3] * inv)
+                r3 = r3 + 1
+            }
+            col = nn
+        }
+        let mut r4 = 0
+        while r4 < n_rows {
+            ortho_flat = ortho_flat.push(col[r4])
+            r4 = r4 + 1
+        }
+        k = k + 1
+    }
+    // Re-assemble [n_rows × n_cols] row-major.
+    let mut out = []
+    let mut idx = 0
+    while idx < n_rows * n_cols {
+        let row = idx / n_cols
+        let col_ = idx % n_cols
+        out = out.push(ortho_flat[col_ * n_rows + row])
+        idx = idx + 1
+    }
+    return out
+}
+
+fn transpose_flat(mat: array, n_rows: int, n_cols: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n_cols * n_rows {
+        let nr = i / n_rows
+        let nc = i % n_rows
+        out = out.push(mat[nc * n_cols + nr])
+        i = i + 1
+    }
+    return out
+}
+
+fn head_new(seed: int) -> HolographicHead {
+    let raw = det_rand(D_BOUNDARY * D_BULK, seed)
+    let embed = gram_schmidt_columns(raw, D_BOUNDARY, D_BULK)
+    let project = transpose_flat(embed, D_BOUNDARY, D_BULK)
+    return HolographicHead {
+        d_boundary: D_BOUNDARY,
+        d_bulk:     D_BULK,
+        embed:      embed,
+        project:    project
+    }
+}
+
+// ─── Encode: body (D=64) → qualia (d=16) ──────────────────────
+// bulk[k] = sum_j project[k,j] * body[j]  — the PHYS-P3-1 rank-d retraction.
+
+fn encode(head: HolographicHead, body: array) -> array {
+    let db = head.d_boundary
+    let dB = head.d_bulk
+    let mut bulk = []
+    let mut k = 0
+    while k < dB {
+        let mut s = 0.0
+        let mut j = 0
+        while j < db {
+            s = s + head.project[k * db + j] * body[j]
+            j = j + 1
+        }
+        bulk = bulk.push(s)
+        k = k + 1
+    }
+    return bulk
+}
+
+// ─── Top-level: SensorFrame → qualia vector ──────────────────
+
+fn stream_to_qualia(frame: SensorFrame, head: HolographicHead) -> array {
+    let body = frame_to_bulk(frame)
+    return encode(head, body)
+}
+
+// ─── Helpers for self-tests ──────────────────────────────────
+
+fn all_zero(v: array) -> bool {
+    let mut i = 0
+    while i < len(v) {
+        if fabs(v[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// NaN detection: NaN is the only IEEE-754 value that is not equal to itself.
+fn any_nan(v: array) -> bool {
+    let mut i = 0
+    while i < len(v) {
+        let x = v[i]
+        if x != x { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// Finite check: reject NaN and ±inf. Uses a large but finite threshold
+// since pure hexa has no isinf builtin and the parser does not accept
+// scientific notation (1.0e300). 1e18 comfortably bounds encoder output
+// for this D=64 / d=16 rank-d retraction.
+fn all_finite(v: array) -> bool {
+    let big = 1000000000000000000.0
+    let neg_big = 0.0 - big
+    let mut i = 0
+    while i < len(v) {
+        let x = v[i]
+        if x != x { return false }
+        if x > big { return false }
+        if x < neg_big { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// ─── Self-tests ──────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Multi-channel sync: all 4 modalities × 16 channels populated, no
+    // zeros-only buffer, no NaN.
+    let frame = sample_frame(101)
+    if len(frame.eeg_ch)      != N_CHANNELS { return false }
+    if len(frame.proprio_ch)  != N_CHANNELS { return false }
+    if len(frame.imu_ch)      != N_CHANNELS { return false }
+    if len(frame.visceral_ch) != N_CHANNELS { return false }
+    if all_zero(frame.eeg_ch)      { return false }
+    if all_zero(frame.proprio_ch)  { return false }
+    if all_zero(frame.imu_ch)      { return false }
+    if all_zero(frame.visceral_ch) { return false }
+    if any_nan(frame.eeg_ch)      { return false }
+    if any_nan(frame.proprio_ch)  { return false }
+    if any_nan(frame.imu_ch)      { return false }
+    if any_nan(frame.visceral_ch) { return false }
+    println("  [T1] 4 modalities × 16 ch populated, non-zero, finite")
+    return true
+}
+
+fn check_T2() -> bool {
+    // body_holographic_map invocation: encode produces 16-dim output from
+    // 64-dim input. The body comes from frame_to_bulk so we also verify
+    // the 4×16 → 64 flatten contract end-to-end.
+    let head = head_new(7)
+    let frame = sample_frame(103)
+    let body = frame_to_bulk(frame)
+    if len(body) != D_BOUNDARY { return false }
+    let qualia = encode(head, body)
+    if len(qualia) != D_BULK { return false }
+    println("  [T2] encode(body[" + str(len(body)) + "]) → qualia[" + str(len(qualia)) + "]")
+    return true
+}
+
+fn check_T3() -> bool {
+    // Qualia shape: stream_to_qualia returns 16 elements, all finite.
+    let head = head_new(11)
+    let frame = sample_frame(107)
+    let qualia = stream_to_qualia(frame, head)
+    if len(qualia) != D_BULK { return false }
+    if !all_finite(qualia) { return false }
+    println("  [T3] stream_to_qualia → len=" + str(len(qualia)) + " all finite")
+    return true
+}
+
+fn check_T4() -> bool {
+    // Latency: sample_frame + frame_to_bulk + encode per frame < 50 ms.
+    // Head construction is amortized across many frames in production,
+    // so we time only the per-frame hot path (sample + flatten + encode).
+    let head = head_new(13)
+    let t0 = clock()
+    let frame = sample_frame(109)
+    let _body = frame_to_bulk(frame)
+    let _qualia = encode(head, _body)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T4] sample+flatten+encode latency = " + str(ms) + " ms")
+    return ms < 50.0
+}
+
+fn check_T5() -> bool {
+    // Determinism: same seed + same head → byte-identical qualia output
+    // across two runs of the full pipeline.
+    let head1 = head_new(17)
+    let head2 = head_new(17)
+    let q1 = stream_to_qualia(sample_frame(113), head1)
+    let q2 = stream_to_qualia(sample_frame(113), head2)
+    if len(q1) != len(q2) { return false }
+    let mut i = 0
+    while i < len(q1) {
+        // Strict zero-tolerance equality — same seed must reproduce bits.
+        if fabs(q1[i] - q2[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    println("  [T5] 2 runs × " + str(len(q1)) + " elements byte-identical")
+    return true
+}
+
+// ─── main ────────────────────────────────────────────────────
+
+fn main() {
+    println("[sensor_stream] PHYS-P4-3 self-test")
+    println("  frame: 4 modalities × 16 channels = 64 boundary, qualia d = 16")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[sensor_stream] ALL 5/5 PASS")
+    } else {
+        println("[sensor_stream] SOME FAILED")
+    }
+}
+
+main()
