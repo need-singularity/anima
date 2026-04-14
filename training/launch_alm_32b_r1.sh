@@ -200,6 +200,7 @@ $LAUNCH_WRAPPER /workspace/train_alm_14b.py \
     --lora-r 32 \
     --lora-alpha 64 \
     --lora-dropout 0.05 \
+    --target-modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj \
     --ckpt-dir "$CKPT_DIR" \
     --save-every "$SAVE_EVERY" \
     --eval-every "$EVAL_EVERY" \
