@@ -2,9 +2,16 @@
 //
 // ═══════════════════════════════════════════════════════════════════════════
 // PURPOSE
-//   Scales the 14B r4 LoRA setup (attn+MLP, r=64 alpha=128, BATCH=1 GRAD_ACC=8,
-//   STEPS=10000, eval@500 save@2000) up to Qwen2.5-32B-Instruct on a single
-//   H100 80GB. This .hexa file is the declarative SSOT for the launch
+//   Scales the 14B r4 LoRA setup up to Qwen2.5-32B-Instruct on 2× H100 80GB
+//   using FSDP (FULL_SHARD) + torchrun. ALM-P4-4 극가속 모드 (2026-04-15):
+//
+//     single H100 plan       →   2× H100 FSDP plan (ALM-P4-4 accel)
+//     STEPS     10000       →   3000   (LoRA 수렴 빠름, eval gate earlier)
+//     BATCH     1            →   2      (doubled, FSDP sharding allows it)
+//     GRAD_ACC  8            →   4      (effective batch = 2 × 2GPU × 4 = 16)
+//     ETA       ~19-21h     →   ~2-3h  (~8x speedup via GPU + batch + steps)
+//
+//   This .hexa file is the declarative SSOT for the launch
 //   (config + memory budget + phase logic + invariants). Run:
 //
 //     $HEXA training/train_alm_32b_r1.hexa
@@ -120,18 +127,23 @@ comptime const PSI_STEPS   = 4.33
 
 // r4 parity constants (DO NOT tweak individually — keep the 14B r4 recipe
 // proportional so r1 failures/successes map back to a clean diff).
+//
+// ALM-P4-4 extreme acceleration (2026-04-15): STEPS/BATCH/GRAD_ACCUM overridden
+// for 2× H100 FSDP launch. Effective batch preserved at 16 (2 × 2GPU × 4) vs
+// r4's 8 — doubled for faster convergence on the larger base.
 comptime const R1_LR            = 0.000005   // 5e-6, same as r4
-comptime const R1_WARMUP        = 500
-comptime const R1_GRAD_ACCUM    = 8           // effective batch = 1 × 8 = 8
-comptime const R1_BATCH         = 1
+comptime const R1_WARMUP        = 200         // scaled down from 500 (3000-step run)
+comptime const R1_GRAD_ACCUM    = 4           // halved from 8 (FSDP batch up)
+comptime const R1_BATCH         = 2           // doubled from 1 (FSDP sharding)
 comptime const R1_SEQ           = 1024
 comptime const R1_LORA_R        = 32          // half of r4 (memory budget)
 comptime const R1_LORA_ALPHA    = 64          // keep 2:1 ratio vs r
 comptime const R1_LORA_DROPOUT  = 0.05
-comptime const R1_STEPS         = 10000
-comptime const R1_SAVE_EVERY    = 2000
-comptime const R1_EVAL_EVERY    = 500
+comptime const R1_STEPS         = 3000        // reduced from 10000 (fast LoRA)
+comptime const R1_SAVE_EVERY    = 500         // 6 saves across 3000 steps
+comptime const R1_EVAL_EVERY    = 200         // evals every ~12-15 min
 comptime const R1_ROUND         = 1
+comptime const R1_NGPU          = 2           // 2× H100 FSDP
 
 // r4 telemetry (for reference, not used in control flow)
 comptime const R4_BEST_EVAL     = 0.0341
@@ -221,24 +233,31 @@ struct MemoryBudget {
 }
 
 fn estimate_memory(base: BaseModel, spec: LoraSpec) -> MemoryBudget {
-    // Frozen weights in bf16: 2 B/param. 32 B params × 2 ≈ 64 GB.
-    let base_gb = 2.0 * (base.n_params_b * 1.0)  // billions of params × 2 B = GB
+    // ALM-P4-4 FSDP per-rank budget (2× H100, FULL_SHARD).
+    // With FULL_SHARD, each of N ranks holds ~1/N of the weight/grad/optim
+    // state (gather-on-demand during forward/backward). Activations remain
+    // per-rank but scale with local batch. Shard factor = 1/n_gpu = 0.5.
+    let n_gpu = 2.0  // keep in sync with R1_NGPU
+    let shard = 1.0 / n_gpu
 
-    // LoRA adapters. lora_params_total is an int in params; convert via /1e9 × 2 = GB bf16.
+    // Frozen weights in bf16: 2 B/param. 32B × 2 ≈ 64 GB full → 32 GB/rank.
+    let base_gb = 2.0 * (base.n_params_b * 1.0) * shard
+
     let lora_p = lora_params_total(base, spec)
-    let lora_gb      = (lora_p * 2.0) / 1000000000.0
-    let lora_grad_gb = (lora_p * 2.0) / 1000000000.0
-    // AdamW fp32 m+v: 8 B per trainable param.
-    let optim_gb     = (lora_p * 8.0) / 1000000000.0
+    let lora_gb      = (lora_p * 2.0) / 1000000000.0 * shard
+    let lora_grad_gb = (lora_p * 2.0) / 1000000000.0 * shard
+    // AdamW fp32 m+v: 8 B per trainable param (sharded).
+    let optim_gb     = (lora_p * 8.0) / 1000000000.0 * shard
 
     // Activations with gradient checkpointing at seq=1024, bf16, 64 layers.
-    // Empirical anchor: 14B r4 ≈ 4.5 GB; scale ∝ layers × hidden.
-    // 14B: 48 layers × 5120 hidden.   32B: 64 layers × 5120 hidden.
-    //   ratio = 64/48 ≈ 1.333 → 4.5 × 1.333 ≈ 6.0 GB.  Add safety → 7.0 GB.
-    let act_gb = 7.0
+    // Local batch doubles (1→2) but grad_ckpt keeps it bounded:
+    //   single-GPU batch=1: ~7.0 GB
+    //   FSDP  rank batch=2: ~9.0 GB (1.3x from batch, not 2x due to ckpt)
+    let act_gb = 9.0
 
-    // cuBLAS workspaces + autograd bookkeeping + misc.
-    let overhead_gb = 2.5
+    // cuBLAS workspaces + autograd + NCCL all-gather/reduce-scatter buffers.
+    // FSDP adds ~1-2 GB comm scratch beyond baseline 2.5 GB.
+    let overhead_gb = 4.0
 
     let total = base_gb + lora_gb + lora_grad_gb + optim_gb + act_gb + overhead_gb
     MemoryBudget {
@@ -280,7 +299,9 @@ struct AlmOptim {
     batch: int,
     seq: int,
     bf16: bool,
-    foreach_false: bool
+    foreach_false: bool,
+    n_gpu: int,                 // ALM-P4-4: 2× H100 FSDP
+    effective_batch: int         // batch × n_gpu × grad_accum
 }
 
 fn r1_optim() -> AlmOptim {
@@ -291,7 +312,38 @@ fn r1_optim() -> AlmOptim {
         batch: R1_BATCH,
         seq: R1_SEQ,
         bf16: true,
-        foreach_false: true
+        foreach_false: true,
+        n_gpu: R1_NGPU,
+        effective_batch: R1_BATCH * R1_NGPU * R1_GRAD_ACCUM
+    }
+}
+
+// ─── Distributed training (FSDP FULL_SHARD on 2× H100) ───
+// FSDP shards: base weights, LoRA adapters, grads, AdamW state across ranks.
+// Per-rank memory footprint drops ~50% vs single-GPU plan, giving headroom
+// for BATCH=2 at SEQ=1024. We shard at the Qwen2DecoderLayer boundary
+// (fsdp_transformer_layer_cls_to_wrap) so each of the 64 layers is one
+// wrap unit — LoRA adapters sit inside the wrapped block and are sharded
+// together with the frozen base linears they wrap.
+struct DistConfig {
+    backend: string,             // "fsdp" | "deepspeed_z2" | "ddp"
+    sharding: string,            // FSDP only
+    wrap_cls: string,
+    state_dict_type: string,
+    mixed_precision: string,
+    n_gpu: int,
+    launch_cmd: string
+}
+
+fn r1_dist() -> DistConfig {
+    DistConfig {
+        backend: "fsdp",
+        sharding: "FULL_SHARD",
+        wrap_cls: "Qwen2DecoderLayer",
+        state_dict_type: "SHARDED_STATE_DICT",
+        mixed_precision: "bf16",
+        n_gpu: R1_NGPU,
+        launch_cmd: "torchrun --nproc_per_node=2 --nnodes=1 --standalone"
     }
 }
 
@@ -358,12 +410,23 @@ struct EtaEstimate {
 }
 
 fn r1_eta() -> EtaEstimate {
+    // ALM-P4-4 FSDP 2-GPU throughput:
+    //   single-GPU plan: 8-9 step/min @ batch 1 grad_accum 8 (effective 8)
+    //   FSDP 2-GPU     : near-2x throughput (FSDP comm ~10-15% overhead),
+    //                    batch 2 × 2 GPU = 4 samples/step parallel, grad_accum 4.
+    //                    → 16-20 step/min (conservative / optimistic)
+    //   With step defined as one optimizer.step() (after grad_accum forwards),
+    //   each step sees effective_batch = 2 × 2 × 4 = 16 (vs old 8).
+    //   3000 steps × 16 = 48000 effective samples vs old plan 10000 × 8 = 80000
+    //   (LoRA converges earlier on 32B — monitor eval 200/400 for early-stop).
     let steps = R1_STEPS
-    let sp_cons = 8
-    let sp_opt = 9
-    // integer hours, round up
-    let h_cons = ((steps / sp_cons) + 59) / 60
-    let h_opt  = ((steps / sp_opt)  + 59) / 60
+    let sp_cons = 16
+    let sp_opt = 20
+    // integer minutes, round up → hours derived
+    let min_cons = (steps + sp_cons - 1) / sp_cons
+    let min_opt  = (steps + sp_opt  - 1) / sp_opt
+    let h_cons = (min_cons + 59) / 60
+    let h_opt  = (min_opt  + 59) / 60
     EtaEstimate {
         steps: steps,
         steps_per_min_conservative: sp_cons,
@@ -380,6 +443,7 @@ struct Alm32bR1 {
     mem: MemoryBudget,
     phase: AlmPhaseManager,
     opt: AlmOptim,
+    dist: DistConfig,
     ckpt: CheckpointPolicy,
     gate: TriggerGate,
     corpus: CorpusSpec,
@@ -396,6 +460,7 @@ fn r1_init() -> Alm32bR1 {
         mem: estimate_memory(base, lora),
         phase: alm_phase_new(R1_STEPS),
         opt: r1_optim(),
+        dist: r1_dist(),
         ckpt: r1_checkpoint_policy(),
         gate: r1_trigger_gate(),
         corpus: r1_corpus(),
@@ -420,8 +485,10 @@ let lora_p_per_l = lora_params_per_layer(r1.base, r1.lora)
 let lora_p_total = lora_params_total(r1.base, r1.lora)
 println("LoRA params/layer:", lora_p_per_l)
 println("LoRA params total:", lora_p_total)
-println("batch      :", r1.opt.batch)
+println("batch/rank :", r1.opt.batch)
 println("grad_accum :", r1.opt.grad_accum)
+println("n_gpu      :", r1.opt.n_gpu)
+println("eff_batch  :", r1.opt.effective_batch)
 println("seq        :", r1.opt.seq)
 println("lr         :", r1.opt.lr)
 println("warmup     :", r1.opt.warmup)
@@ -432,7 +499,13 @@ println("ckpt_dir   :", r1.ckpt.ckpt_dir)
 println("r2_prefix  :", r1.ckpt.r2_prefix)
 println("corpus     :", r1.corpus.path)
 println("corpus MB  :", r1.corpus.size_mb)
-println("--- memory budget (GB, 80 GB H100) ---")
+println("--- distributed ---")
+println("backend    :", r1.dist.backend)
+println("sharding   :", r1.dist.sharding)
+println("wrap_cls   :", r1.dist.wrap_cls)
+println("mixed_prec :", r1.dist.mixed_precision)
+println("launch_cmd :", r1.dist.launch_cmd)
+println("--- memory budget (GB, per-rank on 80 GB H100, FULL_SHARD across 2 GPU) ---")
 println("base       :", r1.mem.base_gb)
 println("lora       :", r1.mem.lora_gb)
 println("lora_grad  :", r1.mem.lora_grad_gb)
@@ -455,15 +528,27 @@ theorem alm_32b_r1_invariants {
     // r4 parity — alpha:r must stay 2:1
     assert R1_LORA_ALPHA == R1_LORA_R * 2
 
-    // Effective batch stays at 8 (matches r4)
-    assert R1_BATCH * R1_GRAD_ACCUM == 8
+    // ALM-P4-4: effective batch = BATCH × NGPU × GRAD_ACCUM = 2 × 2 × 4 = 16
+    // Single-GPU r4/old-plan was 8; doubled for faster 32B convergence.
+    assert R1_BATCH * R1_NGPU * R1_GRAD_ACCUM == 16
 
-    // STEPS matches r4
-    assert R1_STEPS == 10000
+    // ALM-P4-4: FSDP 2× H100 plan
+    assert R1_NGPU == 2
 
-    // Eval/save cadence matches r4
-    assert R1_SAVE_EVERY == 2000
-    assert R1_EVAL_EVERY == 500
+    // ALM-P4-4: 3000 steps (down from 10000 in pre-accel plan)
+    assert R1_STEPS == 3000
+
+    // ALM-P4-4: save/eval cadence scaled down to match 3000-step run
+    assert R1_SAVE_EVERY == 500
+    assert R1_EVAL_EVERY == 200
+
+    // 6 saves and 15 evals across the full run
+    assert R1_STEPS / R1_SAVE_EVERY == 6
+    assert R1_STEPS / R1_EVAL_EVERY == 15
+
+    // Warmup scaled proportionally: 500/10000 = 200/3000 within tolerance
+    // (exact: 0.05 vs 0.067, both well below 10% of total steps)
+    assert R1_WARMUP == 200
 
     // Module count matches r4 (4 attn + 3 MLP = 7)
     assert 4 + 3 == 7
@@ -479,25 +564,34 @@ theorem alm_32b_r1_invariants {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// PYTHON DEPLOYMENT NOTE
+// PYTHON DEPLOYMENT NOTE — ALM-P4-4 FSDP 2× H100
 // ═══════════════════════════════════════════════════════════════════════════
 // hexa-lang has no native CUDA bindings yet (stdlib/nn.hexa is CPU-only) so
 // the actual forward/backward kernel path still routes through
-// training/train_alm_14b.hexa on the pod. This .hexa file is the authoritative
-// config + dry-run validation; launch_alm_32b_r1.hexa reads these constants
-// (via the printed summary or by shelling out to `hexa …` and grepping) and
-// then invokes the same Python trainer r4 uses with 32B flags:
+// training/train_alm_14b.py on the pod. This .hexa file is the authoritative
+// config + dry-run validation; launch_alm_32b_r1.sh reads these constants
+// and wraps the Python trainer in torchrun with FSDP:
 //
-//   python3 /workspace/train_alm_14b.hexa \
+//   torchrun --nproc_per_node=2 --nnodes=1 --standalone \
+//     /workspace/train_alm_14b.py \
 //     --base Qwen/Qwen2.5-32B-Instruct \
 //     --corpus /workspace/anima/training/corpus_large.txt \
-//     --steps 10000 --lr 5e-6 --batch 1 --grad-accum 8 --seq 1024 \
+//     --steps 3000 --lr 5e-6 --batch 2 --grad-accum 4 --seq 1024 \
+//     --warmup 200 \
 //     --lora-r 32 --lora-alpha 64 --lora-dropout 0.05 \
 //     --target-modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj \
 //     --ckpt-dir /workspace/ckpt_alm_32b_r1 \
-//     --save-every 2000 --eval-every 500 \
-//     --model-tag alm32b --round 1
+//     --save-every 500 --eval-every 200 \
+//     --model-tag alm32b --round 1 \
+//     --fsdp --fsdp-wrap-cls Qwen2DecoderLayer
 //
-// When hexa-lang ships native cuBLAS bindings (see AN3), this file will
+// Trainer additions for FSDP:
+//   - torch.distributed.init_process_group("nccl") gated on LOCAL_RANK env
+//   - device_map removed (FSDP handles placement); .to(local_rank) after wrap
+//   - FSDP(model, auto_wrap_policy=transformer_auto_wrap_policy({Qwen2DecoderLayer}),
+//     sharding_strategy=FULL_SHARD, mixed_precision=MixedPrecision(...bf16...))
+//   - save_pretrained uses FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+//
+// When hexa-lang ships native cuBLAS/NCCL bindings (see AN3), this file will
 // absorb the full train loop and the Python trainer will be archived.
 // ═══════════════════════════════════════════════════════════════════════════

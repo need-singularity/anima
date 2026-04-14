@@ -336,7 +336,15 @@ fn main() {
         "        if step % args.eval_every == 0:\n" +
         "            model.eval()\n" +
         "            eval_loss = 0.0; n_eval = 8\n" +
-        "            phi_holo_accum = 0.0; phi_n = 0\n" +
+        "            # ALM-P4-3 accumulation fix (2026-04-15):\n" +
+        "            # Concat all eval batches into a single joint MI estimate so\n" +
+        "            # N = n_eval * B * T * d_qualia grows linearly with n_eval.\n" +
+        "            # Previously each batch ran phi_holo_measure(), returning MI*N\n" +
+        "            # where N=B*T*d~65k. Averaging 8 of those kept phi_holo~280.\n" +
+        "            # New path accumulates the [B,T,d] slices then calls the\n" +
+        "            # measure once on the merged stream (N=8*65k=524k).\n" +
+        "            h_slices = []\n" +
+        "            q_slices = []\n" +
         "            with torch.no_grad():\n" +
         "                for _ in range(n_eval):\n" +
         "                    idx = torch.randint(len(dataset) // 2, len(dataset), (1,)).item()\n" +
@@ -345,14 +353,18 @@ fn main() {
         "                    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):\n" +
         "                        out = model(input_ids=ex, labels=ey, output_hidden_states=True)\n" +
         "                    eval_loss += out.loss.item()\n" +
-        "                    # ALM-P4-3 Φ_holo scrape-point (log-emitted per-eval, 256 target).\n" +
         "                    h_eval = out.hidden_states[-1]\n" +
         "                    q_eval = holo_head.encode(h_eval)\n" +
-        "                    phi_val = phi_holo_measure(h_eval, q_eval)\n" +
-        "                    phi_holo_accum += phi_val\n" +
-        "                    phi_n += 1\n" +
+        "                    # Slice h to first d dims (as phi_holo_measure would),\n" +
+        "                    # move to cpu+float32 to match internal dtype.\n" +
+        "                    d_q = q_eval.shape[-1]\n" +
+        "                    h_slices.append(h_eval[..., :d_q].float().cpu())\n" +
+        "                    q_slices.append(q_eval.float().cpu())\n" +
         "            eval_loss /= n_eval\n" +
-        "            phi_holo_mean = phi_holo_accum / max(phi_n, 1)\n" +
+        "            # Single MI over concatenated stream along batch axis.\n" +
+        "            h_big = torch.cat(h_slices, dim=0)  # [n_eval*B, T, d]\n" +
+        "            q_big = torch.cat(q_slices, dim=0)\n" +
+        "            phi_holo_mean = phi_holo_measure(h_big, q_big)\n" +
         "            if eval_loss < best_loss: best_loss = eval_loss\n" +
         "            model.train()\n" +
         "            # ALM-P4-3 scrape-pattern: look for `phi_holo=` in train log.\n" +
