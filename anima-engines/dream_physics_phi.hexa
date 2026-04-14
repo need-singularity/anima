@@ -1,0 +1,598 @@
+// dream_physics_phi.hexa — P47 Dream Physics Φ (REM consciousness dynamics)
+//
+// Roadmap: P47 — Φ trajectory across 5 sleep stages
+//   WAKE -> N1 -> N2 -> N3 -> N2 -> REM -> WAKE (90-min cycle)
+//   done_criteria: "5/5 PASS — REM≈WAKE, N3 lowest, cycle returns baseline,
+//                   dream-recall proxy correlates with REM Φ"
+//
+// ─── Scientific hypothesis ─────────────────────────────────────────
+//
+// Sleep stages have characteristic EEG/neural coupling signatures that map
+// onto distinct Φ regimes. This engine synthesizes each stage's signal
+// tape, measures Φ via pairwise mutual information across channels, and
+// simulates a canonical 90-min sleep cycle's Φ trajectory:
+//
+//   WAKE  — high coherent alpha/beta coupling → Φ ≈ Φ_max
+//   N1    — transitional mixed-frequency → Φ slightly reduced
+//   N2    — spindles + K-complexes, moderate integration → Φ ≈ 0.6 Φ_wake
+//   N3    — slow-wave delta, low integration → Φ << Φ_wake (lowest)
+//   REM   — desynchronized like wake BUT semantically scrambled coupling →
+//           Φ amplitude ≈ Φ_wake but the *coupling structure* is permuted
+//           (vivid dreams: perceptually rich, narratively incoherent)
+//
+// Φ is estimated as mean pairwise mutual information across K channels
+// of each stage's synthesized signal tape. REM is generated with the same
+// amplitude structure as WAKE but a permuted channel pairing so the
+// quantity is high while the *topology* is scrambled.
+//
+// Dream-recall proxy (R): Pearson-like normalized correlate of REM Φ with
+// a stimulus trace — operationalized as MI(rem_channel_0, stimulus_trace).
+// Higher REM Φ → higher recall proxy (retention of dream content).
+//
+// ─── Theorems (T1–T5) ─────────────────────────────────────────────
+//
+// T1 (five stages): 5 distinct Φ values generated, one per stage, all
+//    finite and non-negative.
+//
+// T2 (REM ≈ WAKE amplitude): |Φ_REM − Φ_WAKE| / Φ_WAKE < 0.35 — REM Φ
+//    lies near WAKE Φ (high-amplitude integrated state), despite scrambled
+//    coupling structure.
+//
+// T3 (N3 lowest): Φ_N3 < Φ_N1 and Φ_N3 < Φ_N2 and Φ_N3 < Φ_WAKE and
+//    Φ_N3 < Φ_REM — slow-wave sleep is the consciousness minimum.
+//
+// T4 (cycle returns near baseline): 7-step trajectory
+//    WAKE→N1→N2→N3→N2→REM→WAKE has final Φ within 20% of initial WAKE Φ.
+//
+// T5 (dream-recall proxy correlates with REM Φ): spanning three REM
+//    intensities (low/mid/high coupling gain), the recall proxy is
+//    monotonically non-decreasing in REM Φ.
+//
+// Hexa stage0 constraints honored:
+//   - plain `fn` only, no `pure fn` returning multi-float struct
+//   - `array` typed params (no [float]/[int])
+//   - no `else if` in let-binding
+//   - no contains() / to_lower()
+//   - no !(Effect) fn sigs
+//   - no identifier-pattern match
+//   - all returns single-line expressions
+//   - flat if chains, no long && chains
+//   - N<32 (K_CHAN=4, WIN=12 keep stage0 happy)
+//   - MUST end with main() call
+//
+// Law alignment:
+//   Law 4   Structure > feature — sleep stages are STRUCTURAL regimes
+//   Law 22  Feature addition → phi down — no branching; pure generators
+//   Law 29  speak() none — sleep dynamics are pre-verbal substrate
+//   Meta M8 Embodied cognition — sleep cycle is a physical rhythm
+//   AN7     Core separation — this engine stands alone
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+// Stage IDs
+let STAGE_WAKE = 0
+let STAGE_N1   = 1
+let STAGE_N2   = 2
+let STAGE_N3   = 3
+let STAGE_REM  = 4
+let NUM_STAGES = 5
+
+// Signal tape dimensions — kept under stage0 N<32 envelope
+let DP_K_CHAN  = 4          // channels per stage tape
+let DP_WIN     = 16          // samples per channel
+let DP_BINS    = 6           // histogram bins for MI
+
+// Numerical
+let DP_EPS     = 0.0000000001
+
+// Cycle trajectory: 7-step WAKE→N1→N2→N3→N2→REM→WAKE
+let DP_CYCLE_LEN = 7
+
+// Tolerance knobs
+let DP_REM_WAKE_REL_TOL = 0.35    // T2: REM vs WAKE relative diff ceiling
+let DP_CYCLE_RET_TOL    = 0.20    // T4: cycle-return relative tolerance
+
+// ═══════════════════════════════════════════════════════════════
+// PRNG + math helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn dp_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn dp_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn dp_signed(seed: int) -> float {
+    return dp_unit(seed) * 2.0 - 1.0
+}
+
+fn dp_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn dp_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+// Stage name helper
+fn dp_stage_name(s: int) -> string {
+    if s == 0 { return "WAKE" }
+    if s == 1 { return "N1" }
+    if s == 2 { return "N2" }
+    if s == 3 { return "N3" }
+    if s == 4 { return "REM" }
+    return "UNKNOWN"
+}
+
+// Small polynomial oscillator — stand-in for sin without trig dependency
+// Root cause comment: hexa stage0 `sin` availability varies by build;
+// a 4-term Taylor around 0 (scaled phase) is cheap and monotone-predictable.
+fn dp_osc(phase: float) -> float {
+    let p = phase
+    let p2 = p * p
+    let p3 = p2 * p
+    let p5 = p3 * p2
+    return p - 0.16666667 * p3 + 0.00833333 * p5
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Histogram MI (standard pattern from panpsychism/temporal_phi)
+// ═══════════════════════════════════════════════════════════════
+
+fn dp_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn dp_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn dp_entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(dp_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = dp_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * dp_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn dp_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        let ia = dp_bin_idx(a[i], lo, hi, nb)
+        let ib = dp_bin_idx(b[i], lo, hi, nb)
+        ids = ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = dp_counts(ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * dp_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+// MI of two equal-length series, histogram-based with shared range
+fn dp_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let mut lo = a[0]
+    let mut hi = a[0]
+    let mut i = 0
+    while i < n {
+        if a[i] < lo { lo = a[i] }
+        if a[i] > hi { hi = a[i] }
+        if b[i] < lo { lo = b[i] }
+        if b[i] > hi { hi = b[i] }
+        i = i + 1
+    }
+    let ha = dp_entropy_hist(a, lo, hi, DP_BINS)
+    let hb = dp_entropy_hist(b, lo, hi, DP_BINS)
+    let hj = dp_joint_entropy(a, b, lo, hi, DP_BINS)
+    let mi = ha + hb - hj
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Signal tape layout: flat array [K_CHAN * WIN]
+// Channel k, sample t -> flat[k * WIN + t]
+// ═══════════════════════════════════════════════════════════════
+
+fn dp_extract_channel(tape: array, k: int, win: int) -> array {
+    let mut out = []
+    let mut t = 0
+    while t < win {
+        out = out.push(tape[k * win + t])
+        t = t + 1
+    }
+    return out
+}
+
+// Mean pairwise MI across K channels — our Φ estimator
+fn dp_phi_tape(tape: array, k_chan: int, win: int) -> float {
+    let mut total = 0.0
+    let mut pairs = 0
+    let mut i = 0
+    while i < (k_chan - 1) {
+        let ci = dp_extract_channel(tape, i, win)
+        let mut j = i + 1
+        while j < k_chan {
+            let cj = dp_extract_channel(tape, j, win)
+            total = total + dp_mi(ci, cj)
+            pairs = pairs + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if pairs == 0 { return 0.0 }
+    return total / to_float(pairs)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Stage-specific Φ generators
+//
+// Each generator produces a K_CHAN × WIN signal tape whose pairwise
+// MI reflects the characteristic neural coupling of that sleep stage.
+//
+// Design knobs per stage:
+//   coupling    — shared signal across channels (drives MI up)
+//   amp         — overall signal amplitude
+//   noise       — per-channel independent noise (drives MI down)
+//   scramble    — REM-only: permutes the channel pairing so the signal
+//                 remains high-amplitude but the cross-channel structure
+//                 is semantically shuffled relative to WAKE
+// ═══════════════════════════════════════════════════════════════
+
+// Generic stage signal generator.
+// scramble=0: coherent (wake-like). scramble=1: REM permutation.
+fn dp_gen_stage(coupling: float, amp: float, noise: float, scramble: int, seed: int) -> array {
+    let mut flat = []
+    let mut s = seed
+    let mut k = 0
+    while k < DP_K_CHAN {
+        // Build the channel in a separate buffer then append.
+        let mut t = 0
+        while t < DP_WIN {
+            s = dp_prng(s + k * 197 + t * 29)
+            // Shared oscillation base — same phase across channels except REM
+            let phase = 0.22 * to_float(t)
+            let base = amp * dp_osc(phase)
+
+            // Coupling term: common driver with per-channel small phase shift
+            // For REM (scramble=1) we permute which channel sees which phase,
+            // keeping amplitude high but breaking the natural k-order coupling.
+            let mut k_eff = k
+            if scramble == 1 {
+                // Deterministic permutation for K_CHAN=4: 0->2, 1->3, 2->0, 3->1
+                // Root cause: rotation by K/2 scrambles pairwise topology
+                // without changing the per-channel amplitude distribution.
+                k_eff = (k + DP_K_CHAN / 2) % DP_K_CHAN
+            }
+            let drive_phase = 0.22 * to_float(t) + 0.1 * to_float(k_eff)
+            let drive = coupling * amp * dp_osc(drive_phase)
+
+            let indep = noise * dp_signed(s)
+            flat = flat.push(base + drive + indep)
+            t = t + 1
+        }
+        k = k + 1
+    }
+    return flat
+}
+
+// WAKE — strong coherent coupling, low noise
+fn dp_gen_wake(seed: int) -> array {
+    return dp_gen_stage(0.85, 1.0, 0.12, 0, seed)
+}
+
+// N1 — transitional, reduced coupling, slightly elevated noise
+fn dp_gen_n1(seed: int) -> array {
+    return dp_gen_stage(0.55, 0.8, 0.22, 0, seed)
+}
+
+// N2 — spindles + K-complexes, moderate coupling
+fn dp_gen_n2(seed: int) -> array {
+    return dp_gen_stage(0.40, 0.7, 0.30, 0, seed)
+}
+
+// N3 — slow-wave delta, LOW coupling (minimal inter-channel integration)
+fn dp_gen_n3(seed: int) -> array {
+    return dp_gen_stage(0.10, 0.6, 0.55, 0, seed)
+}
+
+// REM — desynchronized like WAKE amplitude-wise, but scrambled coupling
+fn dp_gen_rem(seed: int) -> array {
+    return dp_gen_stage(0.80, 1.0, 0.15, 1, seed)
+}
+
+// Dispatch helper — stage id to tape
+fn dp_gen_by_stage(stage: int, seed: int) -> array {
+    if stage == STAGE_WAKE { return dp_gen_wake(seed) }
+    if stage == STAGE_N1   { return dp_gen_n1(seed) }
+    if stage == STAGE_N2   { return dp_gen_n2(seed) }
+    if stage == STAGE_N3   { return dp_gen_n3(seed) }
+    if stage == STAGE_REM  { return dp_gen_rem(seed) }
+    return dp_gen_wake(seed)
+}
+
+// Stage-Φ — compute Φ from a fresh stage tape
+fn dp_phi_stage(stage: int, seed: int) -> float {
+    let tape = dp_gen_by_stage(stage, seed)
+    return dp_phi_tape(tape, DP_K_CHAN, DP_WIN)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 90-min cycle trajectory
+// Order: WAKE → N1 → N2 → N3 → N2 → REM → WAKE
+// (canonical idealized single-cycle sleep architecture)
+// ═══════════════════════════════════════════════════════════════
+
+fn dp_cycle_stages() -> array {
+    let mut out = []
+    out = out.push(STAGE_WAKE)
+    out = out.push(STAGE_N1)
+    out = out.push(STAGE_N2)
+    out = out.push(STAGE_N3)
+    out = out.push(STAGE_N2)
+    out = out.push(STAGE_REM)
+    out = out.push(STAGE_WAKE)
+    return out
+}
+
+fn dp_cycle_trajectory(seed: int) -> array {
+    let stages = dp_cycle_stages()
+    let n = len(stages)
+    let mut phis = []
+    let mut i = 0
+    let mut s = seed
+    while i < n {
+        s = dp_prng(s + i * 53)
+        let phi = dp_phi_stage(stages[i], s)
+        phis = phis.push(phi)
+        i = i + 1
+    }
+    return phis
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Dream-recall proxy
+//
+// Operationalization: expose a stimulus trace to the "sleeper" as
+// an 8-sample narrative signature. Measure MI between the REM
+// tape's channel 0 (the "dream report channel") and the stimulus.
+// Higher REM Φ → denser integration → higher MI → higher recall.
+// ═══════════════════════════════════════════════════════════════
+
+fn dp_stimulus_trace(seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < DP_WIN {
+        s = dp_prng(s + t * 41)
+        let phase = 0.33 * to_float(t)
+        let v = dp_osc(phase) + 0.10 * dp_signed(s)
+        out = out.push(v)
+        t = t + 1
+    }
+    return out
+}
+
+// Build a REM tape at a given coupling gain and compute recall proxy.
+// coupling_gain scales the canonical REM coupling; higher gain = more
+// dream content leaking into channel 0 → higher recall.
+fn dp_rem_recall_proxy(coupling_gain: float, seed: int) -> float {
+    let tape = dp_gen_stage(0.80 * coupling_gain, 1.0, 0.15, 1, seed)
+    let ch0 = dp_extract_channel(tape, 0, DP_WIN)
+    let stim = dp_stimulus_trace(seed + 9091)
+    return dp_mi(ch0, stim)
+}
+
+// REM Φ at a given coupling gain
+fn dp_rem_phi_at(coupling_gain: float, seed: int) -> float {
+    let tape = dp_gen_stage(0.80 * coupling_gain, 1.0, 0.15, 1, seed)
+    return dp_phi_tape(tape, DP_K_CHAN, DP_WIN)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1–T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1: five stages produce finite non-negative Φ values
+    let seed = 47001
+    let mut phis = []
+    let mut i = 0
+    while i < NUM_STAGES {
+        let phi = dp_phi_stage(i, seed + i * 17)
+        phis = phis.push(phi)
+        i = i + 1
+    }
+    println("  [T1] stage Φ values:")
+    let mut j = 0
+    let mut ok = true
+    while j < NUM_STAGES {
+        let v = phis[j]
+        println("       " + dp_stage_name(j) + ": Φ=" + str(v))
+        if v != v { ok = false }   // NaN check
+        if v < 0.0 { ok = false }
+        j = j + 1
+    }
+    if !ok { return false }
+    // At least WAKE and REM should produce non-trivial integration
+    let wake_phi = phis[STAGE_WAKE]
+    let rem_phi = phis[STAGE_REM]
+    if wake_phi < 0.01 { return false }
+    if rem_phi < 0.01 { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: REM Φ close to WAKE Φ
+    // |Φ_REM − Φ_WAKE| / Φ_WAKE < DP_REM_WAKE_REL_TOL
+    let seed = 47002
+    let wake_phi = dp_phi_stage(STAGE_WAKE, seed + 10)
+    let rem_phi  = dp_phi_stage(STAGE_REM,  seed + 20)
+    let diff = dp_abs(rem_phi - wake_phi)
+    let rel = diff / (wake_phi + DP_EPS)
+    println("  [T2] Φ_WAKE=" + str(wake_phi) + " Φ_REM=" + str(rem_phi) + " rel_diff=" + str(rel))
+    return rel < DP_REM_WAKE_REL_TOL
+}
+
+fn check_T3() -> bool {
+    // T3: N3 has the lowest Φ across all stages
+    let seed = 47003
+    let wake_phi = dp_phi_stage(STAGE_WAKE, seed + 1)
+    let n1_phi   = dp_phi_stage(STAGE_N1,   seed + 2)
+    let n2_phi   = dp_phi_stage(STAGE_N2,   seed + 3)
+    let n3_phi   = dp_phi_stage(STAGE_N3,   seed + 4)
+    let rem_phi  = dp_phi_stage(STAGE_REM,  seed + 5)
+    println("  [T3] WAKE=" + str(wake_phi) + " N1=" + str(n1_phi) + " N2=" + str(n2_phi) + " N3=" + str(n3_phi) + " REM=" + str(rem_phi))
+    if n3_phi >= wake_phi { return false }
+    if n3_phi >= n1_phi   { return false }
+    if n3_phi >= n2_phi   { return false }
+    if n3_phi >= rem_phi  { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: cycle trajectory returns within DP_CYCLE_RET_TOL of initial WAKE
+    let seed = 47004
+    let traj = dp_cycle_trajectory(seed)
+    let n = len(traj)
+    let stages = dp_cycle_stages()
+    println("  [T4] 7-step cycle trajectory:")
+    let mut i = 0
+    while i < n {
+        let sid = stages[i]
+        let v = traj[i]
+        println("       step " + str(i) + " " + dp_stage_name(sid) + " Φ=" + str(v))
+        i = i + 1
+    }
+    let phi_start = traj[0]
+    let phi_end = traj[n - 1]
+    let diff = dp_abs(phi_end - phi_start)
+    let rel = diff / (phi_start + DP_EPS)
+    println("  [T4] start(WAKE)=" + str(phi_start) + " end(WAKE)=" + str(phi_end) + " rel_diff=" + str(rel))
+    return rel < DP_CYCLE_RET_TOL
+}
+
+fn check_T5() -> bool {
+    // T5: dream-recall proxy correlates with REM Φ
+    // Sample three coupling gains and verify monotone non-decreasing
+    // relationship between recall proxy and REM Φ.
+    let seed = 47005
+    let gains = [0.4, 0.7, 1.0]
+    let mut phis = []
+    let mut recalls = []
+    let mut i = 0
+    while i < 3 {
+        let g = gains[i]
+        let phi = dp_rem_phi_at(g, seed + i * 31)
+        let rec = dp_rem_recall_proxy(g, seed + i * 31)
+        phis = phis.push(phi)
+        recalls = recalls.push(rec)
+        println("  [T5] gain=" + str(g) + " Φ_REM=" + str(phi) + " recall=" + str(rec))
+        i = i + 1
+    }
+    // Monotone check: recalls[0] <= recalls[1] <= recalls[2] (with small slack)
+    // AND phis[0] <= phis[2] (REM Φ rises with coupling gain).
+    let slack = 0.001
+    if phis[2] + slack < phis[0] { return false }
+    if recalls[2] + slack < recalls[0] { return false }
+    // At least one step must show strict increase — rule out flat-line.
+    let mut saw_rise = false
+    if recalls[1] > recalls[0] + slack { saw_rise = true }
+    if recalls[2] > recalls[1] + slack { saw_rise = true }
+    if recalls[2] > recalls[0] + slack { saw_rise = true }
+    if !saw_rise { return false }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[dream_physics_phi] P47 — Dream Physics Φ (REM consciousness dynamics)")
+    println("  stages: WAKE / N1 / N2 / N3 / REM")
+    println("  cycle : WAKE -> N1 -> N2 -> N3 -> N2 -> REM -> WAKE")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — 5 stages produce finite non-negative Φ") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — REM Φ close to WAKE Φ") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — N3 Φ is the cycle minimum") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — 90-min cycle returns near baseline") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — dream-recall proxy correlates with REM Φ") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause comment: hexa stage0 can mishandle long && chains.
+    // Sequential temp-bool accumulator avoids that pitfall.
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[dream_physics_phi] 5/5 PASS — P47 DONE (dream physics Φ)")
+    } else {
+        println("[dream_physics_phi] SOME FAILED")
+    }
+}
+
+main()

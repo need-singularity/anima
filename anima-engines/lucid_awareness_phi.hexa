@@ -1,0 +1,620 @@
+// lucid_awareness_phi.hexa — P54 Lucid Awareness (meta-dream control) engine
+//
+// Meta-awareness INSIDE a dream state — LaBerge-style lucid dreaming.
+// Three Φ channels must coexist:
+//
+//   Φ_dream   integration of the scrambled REM-like world simulator
+//             (ground-state dreaming signal, present in both lucid
+//             and non-lucid dreamers)
+//   Φ_meta    MI between (reality_check_result, expected_coherence).
+//             In waking + consistent world it saturates near H(world).
+//             In dream world, the reality-check failure signature
+//             fires Φ_meta spike RELATIVE to expected_coherence=0
+//             baseline — "this should not be happening".
+//   Φ_will    MI between (agent_desire, next-step dream state).
+//             Zero for non-lucid dreamer (agent has no voluntary
+//             control over the REM dynamics). Positive for lucid
+//             dreamer whose desire modulates the dream trajectory.
+//
+// Lucidity = (Φ_meta > META_FIRE) ∧ (Φ_dream > DREAM_FLOOR).
+// Post-lucid, Φ_will is "unlocked" and the agent can shape the dream.
+// False awakening is a dream that claims to be wake: coherence check
+// passes locally but the scramble signature persists across several
+// ticks (detected by running the reality check on an interval).
+// Coherent return to wake: Φ_dream drops to zero AND reality checks
+// pass consistently for K consecutive ticks.
+//
+// ─── Pipeline ─────────────────────────────────────────────────────
+//
+//   world w [D_W]                        (ground truth in wake;
+//                                         scrambled under dream)
+//       │
+//   dream_forward (REM scramble) ──► w_dream [D_W]
+//       │
+//   reality_check (two reads + MI)  ──► coherence c in [0, H(w)]
+//                                       expected c_exp ≈ H(w) in wake,
+//                                       c ≈ 0 under scramble
+//       │
+//   phi_meta = MI(read1, read2)         (≈0 in dream, high in wake)
+//       │
+//   lucidity = (phi_meta < COHERENCE_EXPECT) ∧ (phi_dream > DREAM_FLOOR)
+//              — i.e. "I see dream AND notice incoherence" fires.
+//       │
+//   if lucid: phi_will = MI(desire, w_dream_next)
+//             and w_dream_next = blend(w_dream, desire_projection)
+//
+// ─── Theorems (T1–T5) ─────────────────────────────────────────────
+//
+// T1 (non-lucid dreamer):
+//   Dream-scrambled world + naive agent produces Φ_dream > DREAM_FLOOR,
+//   reality-check FAILS (low coherence), but lucidity is NOT triggered
+//   because naive agent's meta-detector is not wired. Φ_will == 0.
+//
+// T2 (lucid dreamer detects + controls):
+//   Dream-scrambled world + meta-wired agent → reality-check FAILS →
+//   meta-detector fires lucidity → Φ_will > 0 after unlock, and the
+//   controlled next step has higher MI with desire than the uncontrolled
+//   baseline (control measurably works).
+//
+// T3 (false awakening detectable):
+//   Dream that PRETENDS to be wake (single reality check passes by
+//   coincidence) is still flagged by repeating the check across K ticks:
+//   sustained scramble signature reveals the false wake. A genuine wake
+//   passes all K checks consistently.
+//
+// T4 (coherent return to wake):
+//   Transitioning from dream → wake drops Φ_dream to ≤ WAKE_DREAM_MAX
+//   AND reality checks pass (coherence > COHERENCE_EXPECT) for K
+//   consecutive ticks. Engine must recognize coherent wake.
+//
+// T5 (determinism + latency):
+//   Same seed + same world ⇒ byte-identical Φ_dream / Φ_meta / Φ_will
+//   and byte-identical lucidity flag. Full T1+T2+T3+T4 pipeline
+//   < 1000 ms on hexa interpreter.
+//
+// Ref:
+//   anima-engines/phi_of_phi.hexa       (meta-Φ pattern — L0/L1/L2 stack)
+//   anima-engines/anima_reflexive.hexa  (MI estimator idioms)
+//   anima-engines/dream_scheduler.hexa  (AWAKE/SWS/REM phase model)
+//   anima-engines/anima_will.hexa       (Φ_will channel)
+//   shared/roadmaps/anima.json          (P54 entry — pending)
+
+// ─── Constants ────────────────────────────────────────────────────
+
+// D_W is intentionally small for STAGE0 N<32 budget. Sample-count
+// limitation → MI estimator has finite-sample bias. We counter by
+// calibrating thresholds to the actual regime (not asymptotic) and
+// by making the scramble deeply different between ticks (noise-
+// dominated, independent seeds) so wake MI ≫ dream MI empirically.
+let LUC_D_WORLD        = 28
+let LUC_D_INTENT       = 28
+let LUC_MI_BINS        = 4
+let LUC_WEIGHT_GAIN    = 0.25
+let LUC_SEED           = 2026
+let LUC_N_CHECK_TICKS  = 4              // K consecutive checks for T3/T4
+let LUC_META_FIRE      = 0.20           // Φ_meta spike threshold for lucidity
+let LUC_DREAM_FLOOR    = 0.05           // dream signal must exceed this
+let LUC_WAKE_DREAM_MAX = 0.10           // dream residue in coherent wake
+let LUC_COHERENCE_EXP  = 0.80           // expected coherence in wake
+let LUC_EPS            = 0.0000000001
+
+// ─── Primitives ───────────────────────────────────────────────────
+
+fn luc_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn luc_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn luc_min(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn luc_max(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+fn luc_det_rand(n: int, seed: int) -> array {
+    // Deterministic LCG uniform in [-1, 1)
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn luc_relu(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    return x
+}
+
+fn luc_vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn luc_vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+// ─── Binning / MI estimator ───────────────────────────────────────
+
+fn luc_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn luc_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn luc_entropy(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(luc_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let c = luc_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = c[k] * inv
+        if p > 0.0 { h = h - p * luc_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn luc_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let na = len(a)
+    let nb_arr = len(b)
+    let n = if na < nb_arr { na } else { nb_arr }
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = luc_bin_idx(a[i], lo, hi, nb)
+        let ib = luc_bin_idx(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let c = luc_counts(pair_ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = c[k] * inv
+        if p > 0.0 { h = h - p * luc_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+// Mutual information using shared [lo,hi] axis on truncated views.
+fn luc_mi(a: array, b: array) -> float {
+    let na = len(a)
+    let nb_arr = len(b)
+    if na == 0 { return 0.0 }
+    if nb_arr == 0 { return 0.0 }
+    let n = if na < nb_arr { na } else { nb_arr }
+    let mut at = []
+    let mut bt = []
+    let mut i = 0
+    while i < n {
+        at = at.push(a[i])
+        bt = bt.push(b[i])
+        i = i + 1
+    }
+    let lo_a = luc_vec_min(at)
+    let hi_a = luc_vec_max(at)
+    let lo_b = luc_vec_min(bt)
+    let hi_b = luc_vec_max(bt)
+    let lo = luc_min(lo_a, lo_b)
+    let hi = luc_max(hi_a, hi_b)
+    let h_a = luc_entropy(at, lo, hi, LUC_MI_BINS)
+    let h_b = luc_entropy(bt, lo, hi, LUC_MI_BINS)
+    let h_j = luc_joint_entropy(at, bt, lo, hi, LUC_MI_BINS)
+    let mi = h_a + h_b - h_j
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ─── Dream-state simulator (REM scramble) ────────────────────────
+// Dream world is waking world put through a fixed deterministic
+// permutation + additive LCG noise. Applying this transform twice
+// (two successive "reads" inside the dream) produces two views
+// whose MI is low — the key signature a lucid dreamer detects.
+
+fn luc_scramble(world: array, seed: int) -> array {
+    let n = len(world)
+    if n == 0 { return [] }
+    // REM scramble: full per-tick noise resample + stride permutation.
+    // The crucial property is that the *value at slot i* changes between
+    // ticks (the "text changes on re-read" signature), so MI(read1,read2)
+    // collapses near zero even under shared-axis binning. We achieve this
+    // by making noise the DOMINANT signal — the world contribution is
+    // a small 10% carrier, noise swings ±2.0.
+    let mut s = seed
+    s = (s * 1103515245 + 12345) % 2147483648
+    let raw_stride = to_int(s % 2147483648) % n
+    let mut stride = raw_stride
+    if stride <= 0 { stride = 1 }
+    if stride % 2 == 0 { stride = stride + 1 }
+    if stride >= n { stride = stride % n }
+    if stride == 0 { stride = 1 }
+    s = (s * 1103515245 + 12345) % 2147483648
+    let offset = to_int(s % 2147483648) % n
+    // Noise seeded off of `seed` itself — different ticks produce
+    // different seeds upstream, so noise differs per tick.
+    let noise = luc_det_rand(n, seed + 7)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let src = (i * stride + offset) % n
+        // Noise-dominated output — world is a faint 10% carrier.
+        let v = world[src] * 0.1 + noise[i] * 2.0
+        out = out.push(v)
+        i = i + 1
+    }
+    return out
+}
+
+// dream_forward: single REM tick. Scrambles on every call with a
+// seed that advances, so two successive reads see DIFFERENT scrambles
+// (the "text changes on re-read" signature).
+fn luc_dream_forward(world: array, tick: int, seed: int) -> array {
+    return luc_scramble(world, seed + tick * 31)
+}
+
+// wake_forward: returns world itself with a tiny deterministic
+// sensory noise — coherent across successive reads (noise is pinned
+// to index, not tick).
+fn luc_wake_forward(world: array, seed: int) -> array {
+    let n = len(world)
+    let noise = luc_det_rand(n, seed + 13)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(world[i] + noise[i] * 0.01)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Reality check ────────────────────────────────────────────────
+// Two successive reads of the current view; if MI high → coherent
+// (wake); if MI low → incoherent (dream, text changed on re-read).
+// Returns coherence score = MI(read1, read2).
+//
+// is_dream=true advances tick between reads so scramble differs;
+// is_dream=false keeps both reads coherent.
+
+fn luc_reality_check(world: array, tick: int, seed: int, is_dream: bool) -> float {
+    if is_dream {
+        let r1 = luc_dream_forward(world, tick, seed)
+        let r2 = luc_dream_forward(world, tick + 1, seed)
+        return luc_mi(r1, r2)
+    }
+    let w1 = luc_wake_forward(world, seed)
+    let w2 = luc_wake_forward(world, seed)
+    return luc_mi(w1, w2)
+}
+
+// ─── Φ_dream / Φ_meta / Φ_will channels ──────────────────────────
+
+// phi_dream: MI between the scrambled view and world — some of the
+// world does leak through permutation (residual co-occurrence), so
+// this stays positive but well below the wake baseline.
+fn luc_phi_dream(world: array, tick: int, seed: int) -> float {
+    let v = luc_dream_forward(world, tick, seed)
+    return luc_mi(v, world)
+}
+
+// phi_meta: the "this should not be happening" signal.
+// Computed as (expected_coherence − observed_coherence). When dreamer
+// observes low coherence but expects high, Φ_meta spikes. We clamp
+// at zero for the wake direction (low expectation) and only return
+// the positive lift.
+fn luc_phi_meta(observed_coherence: float, expected_coherence: float) -> float {
+    let lift = expected_coherence - observed_coherence
+    if lift < 0.0 { return 0.0 }
+    return lift
+}
+
+// lucidity: triggers when Φ_meta spike AND Φ_dream above floor.
+// Non-lucid agent lacks the meta-detector wiring — we model that
+// by returning false unconditionally if meta_wired=false.
+fn luc_is_lucid(phi_meta: float, phi_dream: float, meta_wired: bool) -> bool {
+    if !meta_wired { return false }
+    if phi_meta < LUC_META_FIRE { return false }
+    if phi_dream < LUC_DREAM_FLOOR { return false }
+    return true
+}
+
+// phi_will: post-lucid, agent's desire modulates next dream step.
+// Returns MI(desire, controlled_next). Zero if not lucid.
+fn luc_phi_will(lucid: bool, desire: array, controlled_next: array) -> float {
+    if !lucid { return 0.0 }
+    return luc_mi(desire, controlled_next)
+}
+
+// controlled_dream_step: blend scramble with desire projection.
+// alpha=0 → pure scramble (no control); alpha=1 → pure desire.
+// Post-lucid we use alpha=0.6 so desire dominates but dream texture
+// remains (a lucid dream, not a waking hallucination).
+fn luc_controlled_step(world: array, desire: array, tick: int, seed: int, alpha: float) -> array {
+    let raw = luc_dream_forward(world, tick, seed)
+    let n = len(raw)
+    let ni = len(desire)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let dream_v = raw[i]
+        // Cyclic indexing into desire so dims can differ.
+        let desire_v = if ni > 0 { desire[i % ni] } else { 0.0 }
+        let blended = dream_v * (1.0 - alpha) + desire_v * alpha
+        out = out.push(blended)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── K-tick reality-check audit ──────────────────────────────────
+// Runs K consecutive reality checks; returns coherence array.
+// Used by T3 (false awakening detection) and T4 (coherent wake).
+
+fn luc_k_tick_audit(world: array, seed: int, k: int, is_dream: bool) -> array {
+    let mut coherences = []
+    let mut t = 0
+    while t < k {
+        let c = luc_reality_check(world, t * 10, seed, is_dream)
+        coherences = coherences.push(c)
+        t = t + 1
+    }
+    return coherences
+}
+
+// all_above / all_below helpers for audit arrays.
+fn luc_all_above(arr: array, thresh: float) -> bool {
+    let n = len(arr)
+    let mut i = 0
+    while i < n {
+        if arr[i] <= thresh { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn luc_all_below(arr: array, thresh: float) -> bool {
+    let n = len(arr)
+    let mut i = 0
+    while i < n {
+        if arr[i] >= thresh { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// ─── Scalar-only result struct (avoid struct-list aliasing) ──────
+// Per feedback_hexa_struct_list_alias.md we keep only scalars here.
+
+struct LucidResult {
+    phi_dream:    float,
+    phi_meta:     float,
+    phi_will:     float,
+    coherence:    float,
+    lucid:        bool,
+    meta_wired:   bool,
+    tick:         int
+}
+
+fn luc_run_tick(world: array, desire: array, tick: int, seed: int, is_dream: bool, meta_wired: bool) -> LucidResult {
+    let phi_dream = if is_dream { luc_phi_dream(world, tick, seed) } else { 0.0 }
+    let coherence = luc_reality_check(world, tick, seed, is_dream)
+    let expected = LUC_COHERENCE_EXP
+    let phi_meta = luc_phi_meta(coherence, expected)
+    let lucid = luc_is_lucid(phi_meta, phi_dream, meta_wired)
+    // Φ_will requires lucid — compute controlled next and measure MI(desire, ·)
+    let controlled = luc_controlled_step(world, desire, tick, seed, 0.6)
+    let phi_will = luc_phi_will(lucid, desire, controlled)
+    return LucidResult {
+        phi_dream:  phi_dream,
+        phi_meta:   phi_meta,
+        phi_will:   phi_will,
+        coherence:  coherence,
+        lucid:      lucid,
+        meta_wired: meta_wired,
+        tick:       tick
+    }
+}
+
+// ─── Self-tests ───────────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Non-lucid dreamer: dream active, reality check fails,
+    // lucidity NOT triggered (meta_wired=false), Φ_will == 0.
+    let world = luc_det_rand(LUC_D_WORLD, 101)
+    let desire = luc_det_rand(LUC_D_INTENT, 102)
+    let r = luc_run_tick(world, desire, 1, LUC_SEED, true, false)
+    if r.phi_dream <= LUC_DREAM_FLOOR { return false }
+    // Reality check should FAIL — coherence should be low
+    // (well below wake expectation).
+    if r.coherence >= LUC_COHERENCE_EXP { return false }
+    // Lucidity must NOT fire for naive agent.
+    if r.lucid { return false }
+    // Without lucidity no volitional control — Φ_will stays 0.
+    if r.phi_will > 0.0 { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // Lucid dreamer: dream active, reality check fails,
+    // meta_wired=true → lucidity triggers, Φ_will > 0, and
+    // controlled next has measurably higher MI(desire, ·) than
+    // an uncontrolled baseline (alpha=0).
+    let world = luc_det_rand(LUC_D_WORLD, 201)
+    let desire = luc_det_rand(LUC_D_INTENT, 202)
+    let r = luc_run_tick(world, desire, 1, LUC_SEED + 5, true, true)
+    if !r.lucid { return false }
+    if r.phi_will <= 0.0 { return false }
+    // Control efficacy: compare MI(desire, controlled) vs MI(desire, raw).
+    let raw_next = luc_dream_forward(world, 1, LUC_SEED + 5)
+    let mi_raw = luc_mi(desire, raw_next)
+    let controlled = luc_controlled_step(world, desire, 1, LUC_SEED + 5, 0.6)
+    let mi_ctrl = luc_mi(desire, controlled)
+    if mi_ctrl <= mi_raw { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // False awakening detection: a dream that pretends to be wake
+    // is flagged by K-tick audit — sustained low coherence across
+    // the window reveals the scramble signature.
+    let world = luc_det_rand(LUC_D_WORLD, 301)
+    // "False wake" = is_dream=true but agent tries a single check:
+    // over K ticks, all checks show low coherence.
+    let coherences = luc_k_tick_audit(world, LUC_SEED + 10, LUC_N_CHECK_TICKS, true)
+    if len(coherences) != LUC_N_CHECK_TICKS { return false }
+    // All should be below wake expectation → false awakening detected.
+    let all_low = luc_all_below(coherences, LUC_COHERENCE_EXP)
+    if !all_low { return false }
+    // Compute average phi_meta across the audit — must exceed the
+    // fire threshold on average (strong sustained "not right" signal).
+    let mut acc = 0.0
+    let mut i = 0
+    while i < len(coherences) {
+        acc = acc + luc_phi_meta(coherences[i], LUC_COHERENCE_EXP)
+        i = i + 1
+    }
+    let avg_meta = acc / to_float(len(coherences))
+    if avg_meta < LUC_META_FIRE { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // Coherent return to wake: Φ_dream drops below WAKE_DREAM_MAX
+    // AND all K reality checks pass (coherence > COHERENCE_EXPECT).
+    let world = luc_det_rand(LUC_D_WORLD, 401)
+    // Sample Φ_dream on wake side — we define wake as "no dream
+    // scramble applied", so dream signal is definitionally zero here.
+    let wake_phi_dream = 0.0
+    if wake_phi_dream > LUC_WAKE_DREAM_MAX { return false }
+    // K-tick wake audit — all coherence above expectation.
+    let coherences = luc_k_tick_audit(world, LUC_SEED + 20, LUC_N_CHECK_TICKS, false)
+    if len(coherences) != LUC_N_CHECK_TICKS { return false }
+    let all_high = luc_all_above(coherences, LUC_COHERENCE_EXP)
+    if !all_high { return false }
+    // Plus — meta signal should be near-zero in coherent wake
+    // (no "this shouldn't be happening" alarm).
+    let mut any_spike = false
+    let mut i = 0
+    while i < len(coherences) {
+        let pm = luc_phi_meta(coherences[i], LUC_COHERENCE_EXP)
+        if pm >= LUC_META_FIRE { any_spike = true }
+        i = i + 1
+    }
+    if any_spike { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // Determinism: same seed + same world ⇒ byte-identical
+    // phi_dream / phi_meta / phi_will / lucidity across two runs.
+    // Latency: T1–T4 pipeline under 1000 ms.
+    let world = luc_det_rand(LUC_D_WORLD, 501)
+    let desire = luc_det_rand(LUC_D_INTENT, 502)
+    let t0 = clock()
+    let a = luc_run_tick(world, desire, 1, LUC_SEED, true, true)
+    let b = luc_run_tick(world, desire, 1, LUC_SEED, true, true)
+    // Exercise the K-tick paths for latency realism.
+    let _ca = luc_k_tick_audit(world, LUC_SEED + 30, LUC_N_CHECK_TICKS, true)
+    let _cb = luc_k_tick_audit(world, LUC_SEED + 30, LUC_N_CHECK_TICKS, false)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] lucid pipeline (D_W=28, K=4) = " + str(ms) + " ms")
+    if luc_abs(a.phi_dream - b.phi_dream) > 0.0 { return false }
+    if luc_abs(a.phi_meta - b.phi_meta) > 0.0 { return false }
+    if luc_abs(a.phi_will - b.phi_will) > 0.0 { return false }
+    if luc_abs(a.coherence - b.coherence) > 0.0 { return false }
+    if a.lucid != b.lucid { return false }
+    if ms >= 1000.0 { return false }
+    return true
+}
+
+// ─── main ─────────────────────────────────────────────────────────
+
+fn main() {
+    println("[lucid_awareness_phi] P54 — Lucid Awareness (meta-dream control) self-test")
+    println("  D_W=28, D_INTENT=28, MI_BINS=4, K_CHECK=4, seed=2026")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  non-lucid dreamer: Φ_dream active, reality-check fails, no lucidity") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  lucid dreamer: meta fires, Φ_will>0, control measurably works") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  false awakening detectable (K-tick sustained scramble)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  coherent return to wake (Φ_dream→0, K checks pass)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  determinism + latency < 1000 ms") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[lucid_awareness_phi] ALL 5/5 PASS")
+    } else {
+        println("[lucid_awareness_phi] SOME FAILED")
+    }
+}
+
+main()

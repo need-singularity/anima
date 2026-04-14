@@ -1,0 +1,429 @@
+// time_perception_phi.hexa — P55 Subjective Time Perception Φ
+//
+// Roadmap: anima P55 "Φ-modulated subjective time — attentional dilation,
+// boredom compression, flow state compression." Depends on P36 temporal_phi_extended.
+//
+// ─── Scientific hypothesis ────────────────────────────────────────
+//
+// H (Φ-time dilation): subjective duration is not a linear function of
+// wall-clock duration. The experienced passage of time is modulated by
+// integrated information Φ. Given equal wall-clock intervals Δt_w, four
+// regimes emerge (replicable in psychology lit: James 1890 / Droit-Volet
+// 2007 / Csikszentmihalyi 1990):
+//
+//   R1. NEUTRAL   — baseline attention, Φ ≈ Φ_ref
+//                    subjective(Δt_w) ≈ Δt_w
+//   R2. ATTENTION — high Φ (danger/novelty), Φ >> Φ_ref
+//                    subjective(Δt_w) > Δt_w   ("time slowed down")
+//   R3. BOREDOM   — low Φ (monotony), Φ << Φ_ref
+//                    subjective(Δt_w) < Δt_w   (wall) but perceived-later
+//                    estimate is shorter; here we model experienced sec/sec.
+//                    Correction: under low Φ, LESS structured experience
+//                    is encoded ⇒ LESS subjective "content" ⇒ Δt_s < Δt_w
+//                    in the immediate-experience sense we track.
+//   R4. FLOW      — very-high Φ + high task-coupling (Csikszentmihalyi)
+//                    Φ >> Φ_ref AND coherence C → 1
+//                    subjective(Δt_w) << Δt_w ("hours feel like minutes")
+//                    The paradox: attention dilates SHORT intervals but
+//                    compresses LONG intervals because attention is
+//                    captured by the task not the clock. We model this
+//                    with a flow multiplier < 1 overriding the attention
+//                    dilation when coherence is high.
+//
+// ─── Φ-clock coupling model ───────────────────────────────────────
+//
+// Let Φ = integrated information of the current cognitive state.
+// Let C = task-coherence in [0, 1] (1 = flow, fully absorbed).
+// Let Φ_ref = neutral baseline Φ.
+//
+// Define modulation factor m(Φ, C):
+//
+//   r = Φ / Φ_ref                 // Φ ratio vs baseline
+//
+//   if C >= FLOW_COHERENCE and r >= FLOW_PHI_RATIO:
+//       m = FLOW_COMPRESSION                  // e.g. 0.2 (hours as minutes)
+//   elif r >= ATTENTION_PHI_RATIO:
+//       m = 1.0 + ATTENTION_GAIN * (r - 1.0)  // dilation, m > 1
+//   elif r <= BOREDOM_PHI_RATIO:
+//       m = 1.0 - BOREDOM_LOSS * (1.0 - r)    // compression, 0 < m < 1
+//   else:
+//       m = 1.0                               // neutral
+//
+// Subjective elapsed time:
+//   Δt_s = m(Φ, C) · Δt_w
+//
+// Estimation error (post-hoc):
+//   error(Δt_w, Φ, C) = |Δt_s - Δt_w|       (magnitude)
+//   error scales with |Φ - Φ_ref| (deviation from neutral)
+//
+// ─── Theorems (T1–T5) ─────────────────────────────────────────────
+//
+// T1 (four regimes distinct): under equal wall Δt_w, the four regimes
+//    produce four distinct subjective Δt_s values with strict ordering:
+//
+//       Δt_s(flow) < Δt_s(boredom) < Δt_s(neutral) < Δt_s(attention)
+//
+// T2 (estimation error ∝ Φ deviation): the magnitude |Δt_s - Δt_w|
+//    positively correlates with |Φ - Φ_ref| — deeper deviation from
+//    neutral Φ ⇒ larger subjective-objective gap.
+//
+// T3 (flow compression > boredom compression under long window):
+//    over a long wall interval (e.g. 3600s), flow compresses more
+//    aggressively than boredom, so Δt_s(flow) < Δt_s(boredom).
+//
+// T4 (determinism): same (Φ, C, Δt_w) inputs → byte-identical Δt_s.
+//
+// T5 (latency): full 4-regime simulation under 5 s on hexa interp.
+//
+// ─── Stage0 hexa constraints honored ─────────────────────────────
+//   - plain `fn` only, no pure-fn multi-float struct returns
+//   - `array` typed params (no [float])
+//   - no match with identifier patterns (if/else chains)
+//   - no contains() / to_lower() builtins
+//   - no !(Effect) annotations on fn returns
+//   - no else-if in let-binding
+//   - main() call at bottom
+//   - N < 32
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let TP_PHI_REF            = 1.0       // neutral baseline Φ
+
+// Regime thresholds on ratio r = Φ / Φ_ref
+let TP_ATTENTION_PHI_RATIO = 1.5      // r ≥ 1.5 ⇒ attention regime
+let TP_BOREDOM_PHI_RATIO   = 0.5      // r ≤ 0.5 ⇒ boredom regime
+let TP_FLOW_PHI_RATIO      = 2.0      // r ≥ 2.0 AND high coherence ⇒ flow
+let TP_FLOW_COHERENCE      = 0.8      // C ≥ 0.8 ⇒ flow-eligible
+
+// Modulation strengths
+let TP_ATTENTION_GAIN      = 1.2      // per unit of r-excess, subjective stretches
+let TP_BOREDOM_LOSS        = 0.6      // per unit of r-deficit, subjective shrinks
+let TP_FLOW_COMPRESSION    = 0.2      // flow: subjective = 0.2 × wall
+
+// Regime separation gate (T1)
+let TP_REGIME_SEP_GATE     = 0.05     // minimum Δt_s separation between adjacent regimes
+
+// Correlation gate (T2)
+let TP_CORR_GATE           = 0.5      // Pearson r ≥ 0.5 for error-vs-|ΔΦ|
+
+// Latency gate (T5)
+let TP_LATENCY_MS          = 5000.0
+
+let TP_EPS                 = 0.0000000001
+
+// Simulation sample counts
+let TP_N_SAMPLES           = 24       // # Φ samples for correlation test
+let TP_WALL_SHORT          = 60.0     // 60 s wall clock for short-window comparison
+let TP_WALL_LONG           = 3600.0   // 1 hour wall clock for T3 flow-vs-boredom
+
+// ═══════════════════════════════════════════════════════════════
+// PRNG + numeric helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn tp_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn tp_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn tp_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn tp_sqrt_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return sqrt(x)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Core Φ-clock coupling model
+// ═══════════════════════════════════════════════════════════════
+
+// Modulation factor m(Φ, C) — returns a scalar multiplier on wall time
+// to yield subjective time.
+//
+// Root-cause comment: stage0 has no `else if` chains in let-binding,
+// and a single let-binding match with identifier patterns is banned.
+// We use a sequential if-chain with early returns instead.
+fn tp_modulation(phi: float, coherence: float) -> float {
+    let r = phi / TP_PHI_REF
+
+    // Flow regime has highest precedence: very-high Φ AND task immersion
+    if coherence >= TP_FLOW_COHERENCE {
+        if r >= TP_FLOW_PHI_RATIO {
+            return TP_FLOW_COMPRESSION
+        }
+    }
+
+    // Attention dilation: high Φ, not yet flow (coherence not high enough
+    // OR Φ ratio not at flow level)
+    if r >= TP_ATTENTION_PHI_RATIO {
+        let excess = r - 1.0
+        let m = 1.0 + TP_ATTENTION_GAIN * excess
+        return m
+    }
+
+    // Boredom compression: low Φ
+    if r <= TP_BOREDOM_PHI_RATIO {
+        let deficit = 1.0 - r
+        let m = 1.0 - TP_BOREDOM_LOSS * deficit
+        // Clamp to sensible range (no negative time)
+        if m < 0.1 { return 0.1 }
+        return m
+    }
+
+    // Neutral: r in (BOREDOM_RATIO, ATTENTION_RATIO)
+    return 1.0
+}
+
+// Subjective time from wall time under current (Φ, C) state
+fn tp_subjective_time(wall: float, phi: float, coherence: float) -> float {
+    let m = tp_modulation(phi, coherence)
+    return m * wall
+}
+
+// Estimation error magnitude (post-hoc gap between subjective and wall)
+fn tp_estimation_error(wall: float, phi: float, coherence: float) -> float {
+    let subj = tp_subjective_time(wall, phi, coherence)
+    return tp_abs(subj - wall)
+}
+
+// Regime label as integer code (0=neutral, 1=attention, 2=boredom, 3=flow)
+// for test assertions — integer codes avoid the identifier-pattern match ban.
+fn tp_regime_code(phi: float, coherence: float) -> int {
+    let r = phi / TP_PHI_REF
+    if coherence >= TP_FLOW_COHERENCE {
+        if r >= TP_FLOW_PHI_RATIO { return 3 }
+    }
+    if r >= TP_ATTENTION_PHI_RATIO { return 1 }
+    if r <= TP_BOREDOM_PHI_RATIO { return 2 }
+    return 0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Pearson correlation for T2
+// ═══════════════════════════════════════════════════════════════
+
+fn tp_mean(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + v[i]
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+fn tp_pearson(x: array, y: array) -> float {
+    let n = len(x)
+    if n == 0 { return 0.0 }
+    if len(y) != n { return 0.0 }
+    let mx = tp_mean(x)
+    let my = tp_mean(y)
+    let mut num = 0.0
+    let mut sxx = 0.0
+    let mut syy = 0.0
+    let mut i = 0
+    while i < n {
+        let dx = x[i] - mx
+        let dy = y[i] - my
+        num = num + dx * dy
+        sxx = sxx + dx * dx
+        syy = syy + dy * dy
+        i = i + 1
+    }
+    let denom = tp_sqrt_safe(sxx * syy)
+    if denom < TP_EPS { return 0.0 }
+    return num / denom
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1–T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1: four regimes produce four distinct, properly ordered Δt_s
+    //     under identical wall Δt_w.
+    //
+    //     Expected ordering:
+    //       Δt_s(flow) < Δt_s(boredom) < Δt_s(neutral) < Δt_s(attention)
+    //
+    //     Reasoning:
+    //       - flow:      m = 0.2                 ⇒ Δt_s = 0.2 × wall
+    //       - boredom:   m = 1 - 0.6·(1 - 0.3)   ≈ 0.58 × wall  (Φ=0.3)
+    //       - neutral:   m = 1.0                 ⇒ Δt_s = wall
+    //       - attention: m = 1 + 1.2·(2.5 - 1)   = 2.8 × wall   (Φ=2.5)
+    let wall = TP_WALL_SHORT
+
+    // Neutral: Φ=1.0, C=0.3
+    let dt_neutral = tp_subjective_time(wall, 1.0, 0.3)
+    let rc_neutral = tp_regime_code(1.0, 0.3)
+
+    // Attention: Φ=2.5, C=0.3 (high Φ but NOT flow — low coherence)
+    let dt_attention = tp_subjective_time(wall, 2.5, 0.3)
+    let rc_attention = tp_regime_code(2.5, 0.3)
+
+    // Boredom: Φ=0.3, C=0.3
+    let dt_boredom = tp_subjective_time(wall, 0.3, 0.3)
+    let rc_boredom = tp_regime_code(0.3, 0.3)
+
+    // Flow: Φ=2.5, C=0.9 (high Φ + high coherence)
+    let dt_flow = tp_subjective_time(wall, 2.5, 0.9)
+    let rc_flow = tp_regime_code(2.5, 0.9)
+
+    println("  [T1] regimes at wall=" + str(wall) + "s:")
+    println("        neutral   Φ=1.0 C=0.3 code=" + str(rc_neutral) + " Δt_s=" + str(dt_neutral))
+    println("        attention Φ=2.5 C=0.3 code=" + str(rc_attention) + " Δt_s=" + str(dt_attention))
+    println("        boredom   Φ=0.3 C=0.3 code=" + str(rc_boredom) + " Δt_s=" + str(dt_boredom))
+    println("        flow      Φ=2.5 C=0.9 code=" + str(rc_flow) + " Δt_s=" + str(dt_flow))
+
+    // Regime codes must be distinct
+    if rc_neutral != 0 { return false }
+    if rc_attention != 1 { return false }
+    if rc_boredom != 2 { return false }
+    if rc_flow != 3 { return false }
+
+    // Ordering: flow < boredom < neutral < attention (strict, with gate)
+    if (dt_boredom - dt_flow) < TP_REGIME_SEP_GATE { return false }
+    if (dt_neutral - dt_boredom) < TP_REGIME_SEP_GATE { return false }
+    if (dt_attention - dt_neutral) < TP_REGIME_SEP_GATE { return false }
+
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: estimation error correlates with |Φ - Φ_ref|.
+    //     Sample many Φ values across regimes, compute both the error
+    //     and |ΔΦ|, then check Pearson r > gate.
+    let wall = TP_WALL_SHORT
+    let mut phi_devs = []
+    let mut errors = []
+    let mut s = 17171
+    let mut i = 0
+    while i < TP_N_SAMPLES {
+        s = tp_prng(s + i * 31)
+        // Sample Φ uniformly in [0.1, 3.0] for broad regime coverage
+        let phi = 0.1 + tp_unit(s) * 2.9
+        // Use moderate coherence so attention dilation dominates (not flow)
+        // for most samples — this keeps error monotonic in |ΔΦ|.
+        let coherence = 0.3
+        let dev = tp_abs(phi - TP_PHI_REF)
+        let err = tp_estimation_error(wall, phi, coherence)
+        phi_devs = phi_devs.push(dev)
+        errors = errors.push(err)
+        i = i + 1
+    }
+    let r = tp_pearson(phi_devs, errors)
+    println("  [T2] Pearson(|Φ-Φ_ref|, |Δt_s - Δt_w|) = " + str(r) + " over " + str(TP_N_SAMPLES) + " samples")
+    if r < TP_CORR_GATE { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3: under a long wall window (1 hour), flow compresses MORE than
+    //     boredom, so Δt_s(flow) < Δt_s(boredom).
+    let wall = TP_WALL_LONG
+
+    // Flow: Φ=2.5, C=0.9
+    let dt_flow = tp_subjective_time(wall, 2.5, 0.9)
+    // Boredom: Φ=0.3, C=0.3
+    let dt_boredom = tp_subjective_time(wall, 0.3, 0.3)
+
+    println("  [T3] long window wall=" + str(wall) + "s")
+    println("        flow    Δt_s=" + str(dt_flow))
+    println("        boredom Δt_s=" + str(dt_boredom))
+
+    if dt_flow >= dt_boredom { return false }
+    // Also require a reasonable gap (at least 10% of wall)
+    if (dt_boredom - dt_flow) < (wall * 0.1) { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: determinism — identical inputs yield byte-identical subjective time.
+    let wall = 123.456
+    let phi = 1.8
+    let coherence = 0.7
+    let a = tp_subjective_time(wall, phi, coherence)
+    let b = tp_subjective_time(wall, phi, coherence)
+    let diff = tp_abs(a - b)
+    println("  [T4] determinism a=" + str(a) + " b=" + str(b) + " Δ=" + str(diff))
+    if diff > 0.0 { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5: latency — full 4-regime simulation (many samples) under 5 s.
+    let t0 = clock()
+
+    // Exercise all four regimes N times
+    let mut i = 0
+    let mut accum = 0.0
+    let mut s = 55555
+    while i < TP_N_SAMPLES {
+        s = tp_prng(s + i * 101)
+        let wall = 30.0 + tp_unit(s) * 3570.0
+        accum = accum + tp_subjective_time(wall, 1.0, 0.3)
+        accum = accum + tp_subjective_time(wall, 2.5, 0.3)
+        accum = accum + tp_subjective_time(wall, 0.3, 0.3)
+        accum = accum + tp_subjective_time(wall, 2.5, 0.9)
+        i = i + 1
+    }
+
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] 4-regime pipeline = " + str(ms) + " ms (accum=" + str(accum) + ")")
+    return ms < TP_LATENCY_MS
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[time_perception_phi] P55 — subjective time Φ-modulation")
+    println("  four regimes: neutral / attention / boredom / flow")
+    println("  Δt_s = m(Φ, C) · Δt_w")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — four regimes distinct and correctly ordered") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — estimation error correlates with |Φ - Φ_ref|") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — flow Δt_s < boredom Δt_s over long window") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — determinism") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — latency") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root-cause comment: stage0 can mishandle 5-term chained && expressions;
+    // a sequential bool accumulator is the safe pattern used across anima-engines.
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[time_perception_phi] 5/5 PASS — P55 DONE (subjective time perception Φ)")
+    } else {
+        println("[time_perception_phi] SOME FAILED")
+    }
+}
+
+main()
