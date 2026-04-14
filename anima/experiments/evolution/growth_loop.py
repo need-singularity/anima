@@ -123,52 +123,90 @@ class LoopReport:
 class GrowthLoop:
     """모든 발견 소스 → 코드 자동 반영 통합 루프."""
 
+    # ROI #11: hot/cold split. Hot keys rewritten every cycle (~8KB);
+    # cold keys are append-only archives (~150KB) written only on change.
+    # Total I/O per idempotent cycle: 8KB hot + 0 cold (vs 164KB prior).
+    _COLD_KEYS = frozenset({
+        "seen_fingerprints", "applied_items", "self_loop_discoveries",
+        "generated_code", "breakthroughs", "cycle_history", "connected_external",
+    })
+
     def __init__(self, anima_root: Optional[str] = None, dry_run: bool = False):
         self.anima_root = Path(anima_root or _HERE.parent)
         self.config_dir = self.anima_root / "config"
         self.laws_path = self.config_dir / "consciousness_laws.json"
         self.growth_state_path = self.config_dir / "growth_state.json"
         self.loop_state_path = self.config_dir / "growth_loop_state.json"
+        self.loop_archive_path = self.config_dir / "growth_loop_archive.json"
         self.nexus_root = Path.home() / "Dev" / "nexus"
         self.bridge_state_path = self.nexus_root / "shared" / "bridge_state.json"
         self.absorbed_dir = self.anima_root.parent / ".growth" / "absorbed"
         self.dry_run = dry_run
 
         self._state = self._load_state()
+        self._cold_snapshot = self._serialize_cold(self._state)
         self._laws = self._load_laws()
         self._parser = LawParser() if LawParser else None
         self._codegen = CodeGenerator() if CodeGenerator else None
 
     # ── state management ──
 
+    def _serialize_cold(self, state: dict) -> str:
+        cold = {k: state.get(k, []) for k in self._COLD_KEYS if k in state}
+        return json.dumps(cold, ensure_ascii=False, sort_keys=True)
+
     def _load_state(self) -> dict:
+        # Load hot (small) first.
         if self.loop_state_path.exists():
             with open(self.loop_state_path) as f:
-                return json.load(f)
-        return {
-            "_meta": {
-                "description": "통합 성장 루프 상태",
-                "version": "1.0",
-                "created": datetime.now().isoformat()
-            },
-            "cycle": 0,
-            "total_harvested": 0,
-            "total_applied": 0,
-            "total_self_discoveries": 0,
-            "seen_fingerprints": [],
-            "applied_items": [],
-            "self_loop_discoveries": [],
-            "phi_history": [],
-            "last_run": None
-        }
+                state = json.load(f)
+        else:
+            state = {
+                "_meta": {
+                    "description": "통합 성장 루프 상태",
+                    "version": "1.0",
+                    "created": datetime.now().isoformat()
+                },
+                "cycle": 0,
+                "total_harvested": 0,
+                "total_applied": 0,
+                "total_self_discoveries": 0,
+                "seen_fingerprints": [],
+                "applied_items": [],
+                "self_loop_discoveries": [],
+                "phi_history": [],
+                "last_run": None
+            }
+
+        # Merge in archive (cold) if present. First run after migration:
+        # existing monolithic file still has cold keys inline, so we leave
+        # them in place until first _save_state splits them out.
+        if self.loop_archive_path.exists():
+            with open(self.loop_archive_path) as f:
+                archive = json.load(f)
+            for k, v in archive.items():
+                state[k] = v
+        for k in self._COLD_KEYS:
+            state.setdefault(k, [])
+        return state
 
     def _save_state(self):
         self._state["last_run"] = datetime.now().isoformat()
         # seen_fingerprints 최대 1000개 유지
         if len(self._state["seen_fingerprints"]) > 1000:
             self._state["seen_fingerprints"] = self._state["seen_fingerprints"][-500:]
+
+        hot = {k: v for k, v in self._state.items() if k not in self._COLD_KEYS}
         with open(self.loop_state_path, "w") as f:
-            json.dump(self._state, f, indent=2, ensure_ascii=False)
+            json.dump(hot, f, indent=2, ensure_ascii=False)
+
+        # Write archive only when cold payload changed (delta-only).
+        cold_serialized = self._serialize_cold(self._state)
+        if cold_serialized != self._cold_snapshot:
+            cold = {k: self._state.get(k, []) for k in self._COLD_KEYS if k in self._state}
+            with open(self.loop_archive_path, "w") as f:
+                json.dump(cold, f, indent=2, ensure_ascii=False)
+            self._cold_snapshot = cold_serialized
 
     def _load_laws(self) -> dict:
         if self.laws_path.exists():
