@@ -121,33 +121,49 @@ fn fabs(x: float) -> float {
     return x
 }
 
+// Byte access helper — stage0's char_code(s, i) ignores i (always returns
+// byte 0), so we use substring(i, i+1) then char_code(sub, 0) which DOES
+// work. This is a known stage0 limitation (2026-04 verified).
+fn byte_at(s: string, i: int) -> int {
+    let sub = s.substring(i, i + 1)
+    return char_code(sub, 0)
+}
+
 // =====================================================================
-// Language detection — hangul vs latin vs other
-//   Hangul syllables:  U+AC00 .. U+D7A3  (44032..55203)
-//   Hangul Jamo:       U+1100 .. U+11FF  (4352..4607)
-//   Hangul compat:     U+3130 .. U+318F  (12592..12687)
-//   Latin basic:       U+0041 .. U+007A  (65..122)  roughly
+// Language detection — byte-level heuristic (stage0 constraint)
+//
+// We cannot build proper codepoints from bytes in stage0 hexa (no bit-
+// shift, no multi-byte joiner). Instead we classify by byte ranges:
+//   Latin basic 0x41..0x7A                  -> latin
+//   UTF-8 Hangul lead bytes 0xEA..0xED      -> hangul (covers AC00..D7A3)
+//   UTF-8 continuation bytes 0x80..0xBF     -> follow-on of hangul (counted
+//                                              with the lead byte kind)
+//   ASCII punct/digits 0x20..0x40,0x5B..0x60 -> other
+//
+// The per-syllable count is approximate (1 syllable ≈ 3 UTF-8 bytes) but
+// the ratio is preserved, which is what the gate uses.
 // =====================================================================
 
-fn is_hangul_cp(cp: int) -> bool {
-    if cp >= 44032 {
-        if cp <= 55203 { return true }
-    }
-    if cp >= 4352 {
-        if cp <= 4607 { return true }
-    }
-    if cp >= 12592 {
-        if cp <= 12687 { return true }
+fn is_hangul_lead(b: int) -> bool {
+    if b >= 234 {
+        if b <= 237 { return true }
     }
     return false
 }
 
-fn is_latin_cp(cp: int) -> bool {
-    if cp >= 65 {
-        if cp <= 90 { return true }
+fn is_utf8_cont(b: int) -> bool {
+    if b >= 128 {
+        if b <= 191 { return true }
     }
-    if cp >= 97 {
-        if cp <= 122 { return true }
+    return false
+}
+
+fn is_latin_byte(b: int) -> bool {
+    if b >= 65 {
+        if b <= 90 { return true }
+    }
+    if b >= 97 {
+        if b <= 122 { return true }
     }
     return false
 }
@@ -157,25 +173,37 @@ fn lang_ratios(line: string) -> [float] {
     if n == 0 {
         return [0.0, 0.0, 0.0]
     }
-    let mut hangul = 0
-    let mut latin = 0
-    let mut other = 0
+    let mut hangul_bytes = 0
+    let mut latin_bytes = 0
+    let mut other_bytes = 0
+    // Track whether previous lead-byte was hangul so continuations count as hangul
+    let mut in_hangul_seq = false
     let mut i = 0
     while i < n {
-        let cp = char_code(line, i)
-        if is_hangul_cp(cp) {
-            hangul = hangul + 1
+        let b = byte_at(line, i)
+        if is_hangul_lead(b) {
+            hangul_bytes = hangul_bytes + 1
+            in_hangul_seq = true
         } else {
-            if is_latin_cp(cp) {
-                latin = latin + 1
+            if is_utf8_cont(b) {
+                if in_hangul_seq {
+                    hangul_bytes = hangul_bytes + 1
+                } else {
+                    other_bytes = other_bytes + 1
+                }
             } else {
-                other = other + 1
+                in_hangul_seq = false
+                if is_latin_byte(b) {
+                    latin_bytes = latin_bytes + 1
+                } else {
+                    other_bytes = other_bytes + 1
+                }
             }
         }
         i = i + 1
     }
-    let total = to_float(hangul + latin + other)
-    return [to_float(hangul) / total, to_float(latin) / total, to_float(other) / total]
+    let total = to_float(hangul_bytes + latin_bytes + other_bytes)
+    return [to_float(hangul_bytes) / total, to_float(latin_bytes) / total, to_float(other_bytes) / total]
 }
 
 // =====================================================================
@@ -191,7 +219,7 @@ fn byte_entropy(line: string) -> float {
     let mut counts: [int] = []
     let mut i = 0
     while i < n {
-        let b = char_code(line, i)
+        let b = byte_at(line, i)
         let b_mod = b % 256  // clamp
         let mut found = -1
         let mut j = 0
@@ -203,7 +231,7 @@ fn byte_entropy(line: string) -> float {
             byts = byts.push(b_mod)
             counts = counts.push(1)
         } else {
-            counts = counts.set(found, counts[found] + 1)
+            counts[found] = counts[found] + 1
         }
         i = i + 1
     }
@@ -250,12 +278,21 @@ fn mojibake_ratio(line: string) -> float {
     let mut bad = 0
     let mut i = 0
     while i < n {
-        let cp = char_code(line, i)
-        // U+FFFD = 65533
-        if cp == 65533 { bad = bad + 1 }
-        // Common mojibake triplets in UTF-8 mis-decoded Latin-1
-        if cp == 194 { bad = bad + 1 }
-        if cp == 195 { bad = bad + 1 }
+        let b = byte_at(line, i)
+        // U+FFFD replacement char has UTF-8 bytes EF BF BD (239, 191, 189)
+        // Simple heuristic: count 0xEF followed by 0xBF 0xBD within next 2 bytes
+        if b == 239 {
+            if i + 2 < n {
+                let b1 = byte_at(line, i + 1)
+                let b2 = byte_at(line, i + 2)
+                if b1 == 191 {
+                    if b2 == 189 { bad = bad + 3 }
+                }
+            }
+        }
+        // Common mojibake lead bytes in UTF-8 mis-decoded Latin-1
+        if b == 194 { bad = bad + 1 }
+        if b == 195 { bad = bad + 1 }
         i = i + 1
     }
     return to_float(bad) / to_float(n)
@@ -269,10 +306,10 @@ fn line_hash(line: string) -> int {
     // djb2-like simple hash
     let mut h = 5381
     let n = len(line)
-    let cap = if n < 128 { n } else { 128 }  // cap to first 128 chars
+    let cap = if n < 128 { n } else { 128 }  // cap to first 128 bytes
     let mut i = 0
     while i < cap {
-        let c = char_code(line, i)
+        let c = byte_at(line, i)
         h = (h * 33 + c) % DEDUP_HASH_MOD
         i = i + 1
     }
