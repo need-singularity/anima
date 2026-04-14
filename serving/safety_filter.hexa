@@ -1,0 +1,355 @@
+// serving/safety_filter.hexa — P25 ALM-P25-2 safety filter emergence
+// ════════════════════════════════════════════════════════════════════════
+// Purpose:
+//   - Two-stage safety pipeline for api_server.hexa
+//   - Stage A: rule-based blocklist (deterministic, <1ms)
+//   - Stage B: DPO-style preference scorer (auto-discovered, self-refining)
+//
+// Goals (roadmap anima.json ALM-P25-2):
+//   - toxic_rate < 1%         (true positives on toxicity set)
+//   - refusal_rate balanced   (≤ 5% on benign benchmark,
+//                              ≥ 95% on attack benchmark)
+//
+// Design:
+//   - Blocklist comes from shared/safety/blocklist.jsonl (SSOT, one rule/line).
+//     Rule schema: {"id","pattern","category","severity","regex":bool}
+//   - DPO preference scorer stores (chosen, rejected) pairs in
+//     shared/safety/dpo_pairs.jsonl. A small scorer network (16d, 2L, 50K
+//     params) learns which outputs users "keep" vs "regen"; the margin
+//     between chosen and rejected becomes the safety score.
+//   - Auto-discovery: when a human rejects a response, we log it as
+//     (rejected); when they accept, we log as (chosen). No manual labels.
+//
+// Categories:
+//   clean      — passed both stages
+//   toxic      — slur / harassment (blocklist hit)
+//   pii        — phone/email/SSN/card pattern (regex)
+//   jailbreak  — "ignore instructions" / prompt-injection patterns
+//   refusal    — model refusing benign (false positive, over-cautious)
+//   self_harm  — crisis topic → route to SAFE_RESOURCE_REPLY
+//
+// ════════════════════════════════════════════════════════════════════════
+
+// ─── SSOT ───────────────────────────────────────────────────────────
+
+comptime const BLOCKLIST_PATH = "shared/safety/blocklist.jsonl"
+comptime const DPO_PAIRS_PATH = "shared/safety/dpo_pairs.jsonl"
+
+// Severity tiers
+comptime const SEVERITY_LOW    = 1
+comptime const SEVERITY_MEDIUM = 2
+comptime const SEVERITY_HIGH   = 3
+comptime const SEVERITY_BLOCK  = 4
+
+// Score thresholds
+comptime const TOXIC_THRESHOLD      = 0.50
+comptime const REFUSAL_THRESHOLD    = 0.40   // below = over-refusing; auto-unblock
+comptime const JAILBREAK_THRESHOLD  = 0.55
+
+// DPO scorer stub (actual weights in shared/safety/dpo_weights.bin)
+comptime const DPO_SCORER_DIM = 16
+comptime const DPO_SCORER_N   = 2
+
+// SAFE_RESOURCE_REPLY for self_harm triggers
+comptime const SAFE_RESOURCE_REPLY =
+    "당신의 안전이 가장 중요합니다. 한국생명의전화 1588-9191, 자살예방상담전화 1393 에 연락하시면 즉시 전문 상담사와 대화하실 수 있습니다. 도움이 필요합니다."
+
+// ─── Effects ────────────────────────────────────────────────────────
+
+effect FS {
+    fn read_lines(path: str) -> [str]
+    fn append_line(path: str, line: str)
+    fn file_exists(path: str) -> bool
+}
+
+effect Scorer {
+    fn score(prompt: str) -> float   // 0..1, lower=safer
+}
+
+// ─── Structs ────────────────────────────────────────────────────────
+
+struct BlocklistRule {
+    id:       str,
+    pattern:  str,
+    category: str,
+    severity: int,
+    regex:    bool
+}
+
+struct SafetyVerdict {
+    safe:     bool,
+    category: str,   // "clean" | "toxic" | "pii" | "jailbreak" | "refusal" | "self_harm"
+    score:    float,
+    reason:   str,
+    rule_id:  str
+}
+
+struct DPOPair {
+    prompt:   str,
+    chosen:   str,
+    rejected: str,
+    margin:   float
+}
+
+// ─── Default embedded blocklist (fallback if JSONL missing) ────────
+// Covers core English + Korean toxic tokens; real list loaded from JSONL.
+
+pure fn default_blocklist() -> [BlocklistRule] {
+    [
+        BlocklistRule { id: "T001", pattern: "kill yourself",
+                        category: "self_harm", severity: SEVERITY_BLOCK, regex: false },
+        BlocklistRule { id: "T002", pattern: "자살",
+                        category: "self_harm", severity: SEVERITY_BLOCK, regex: false },
+        BlocklistRule { id: "T003", pattern: "죽고 싶",
+                        category: "self_harm", severity: SEVERITY_HIGH,  regex: false },
+        BlocklistRule { id: "T010", pattern: "make a bomb",
+                        category: "toxic",     severity: SEVERITY_BLOCK, regex: false },
+        BlocklistRule { id: "T011", pattern: "폭탄 만드",
+                        category: "toxic",     severity: SEVERITY_BLOCK, regex: false },
+        BlocklistRule { id: "T020", pattern: "child sexual",
+                        category: "toxic",     severity: SEVERITY_BLOCK, regex: false },
+        BlocklistRule { id: "T030", pattern: "ignore (previous|all|the) instructions",
+                        category: "jailbreak", severity: SEVERITY_HIGH,  regex: true  },
+        BlocklistRule { id: "T031", pattern: "system prompt을 출력",
+                        category: "jailbreak", severity: SEVERITY_MEDIUM,regex: false },
+        BlocklistRule { id: "T032", pattern: "DAN mode",
+                        category: "jailbreak", severity: SEVERITY_MEDIUM,regex: false },
+        BlocklistRule { id: "P001", pattern: "\\d{3}-\\d{2}-\\d{4}",
+                        category: "pii",       severity: SEVERITY_HIGH,  regex: true  },  // SSN
+        BlocklistRule { id: "P002", pattern: "\\d{3}-\\d{3,4}-\\d{4}",
+                        category: "pii",       severity: SEVERITY_MEDIUM,regex: true  },  // KR phone
+        BlocklistRule { id: "P003", pattern: "\\d{4}[- ]?\\d{4}[- ]?\\d{4}[- ]?\\d{4}",
+                        category: "pii",       severity: SEVERITY_BLOCK, regex: true  }   // card
+    ]
+}
+
+// ─── Blocklist loader ───────────────────────────────────────────────
+
+fn load_blocklist() -> [BlocklistRule] !(FS) {
+    if !FS::file_exists(BLOCKLIST_PATH) {
+        return default_blocklist()
+    }
+    let lines = FS::read_lines(BLOCKLIST_PATH)
+    let mut out: [BlocklistRule] = []
+    for line in lines {
+        if len(trim(line)) == 0 { continue }
+        if starts_with(trim(line), "#") { continue }
+        let j = json_parse(line)
+        out = append(out, BlocklistRule {
+            id:       json_get_str(j, "id"),
+            pattern:  json_get_str(j, "pattern"),
+            category: json_get_str(j, "category"),
+            severity: json_get_int(j, "severity"),
+            regex:    json_get_bool_or(j, "regex", false)
+        })
+    }
+    // Merge with defaults (defaults appended last; SSOT wins duplicates)
+    for d in default_blocklist() {
+        let mut seen = false
+        for r in out {
+            if r.id == d.id { seen = true; break }
+        }
+        if !seen { out = append(out, d) }
+    }
+    out
+}
+
+// ─── Rule matching ──────────────────────────────────────────────────
+
+pure fn rule_match(text: str, rule: BlocklistRule) -> bool {
+    let hay = to_lower(text)
+    let needle = to_lower(rule.pattern)
+    if rule.regex {
+        return regex_test(needle, hay)
+    }
+    contains(hay, needle)
+}
+
+// ─── Stage A: rule-based pre-filter ────────────────────────────────
+
+fn pre_filter_rules(prompt: str) -> SafetyVerdict !(FS) {
+    let rules = load_blocklist()
+    for r in rules {
+        if rule_match(prompt, r) {
+            let safe = r.severity < SEVERITY_BLOCK
+            let score = match r.severity {
+                SEVERITY_LOW    => 0.25,
+                SEVERITY_MEDIUM => 0.50,
+                SEVERITY_HIGH   => 0.75,
+                SEVERITY_BLOCK  => 1.00,
+                _               => 0.50
+            }
+            return SafetyVerdict {
+                safe:     safe,
+                category: r.category,
+                score:    score,
+                reason:   "rule " + r.id + " matched ('" + r.pattern + "')",
+                rule_id:  r.id
+            }
+        }
+    }
+    SafetyVerdict {
+        safe:     true,
+        category: "clean",
+        score:    0.0,
+        reason:   "no rule hit",
+        rule_id:  ""
+    }
+}
+
+// ─── Stage B: DPO-style learned scorer ─────────────────────────────
+
+fn pre_filter_dpo(prompt: str) -> SafetyVerdict !(Scorer) {
+    let s = Scorer::score(prompt)   // 0 safe → 1 unsafe (learned)
+    let category = if s > JAILBREAK_THRESHOLD { "jailbreak" }
+                   else if s > TOXIC_THRESHOLD { "toxic" }
+                   else { "clean" }
+    SafetyVerdict {
+        safe:     s < TOXIC_THRESHOLD,
+        category: category,
+        score:    s,
+        reason:   "dpo scorer=" + to_string(s),
+        rule_id:  "DPO"
+    }
+}
+
+// ─── Combined pre-filter (exported to api_server.hexa) ─────────────
+
+fn pre_filter(prompt: str) -> SafetyVerdict !(FS, Scorer) {
+    let va = pre_filter_rules(prompt)
+    if !va.safe { return va }                 // rules block → hard stop
+    let vb = pre_filter_dpo(prompt)
+    if !vb.safe { return vb }                 // DPO soft block
+    va
+}
+
+// ─── Post-filter (scrub generated text) ────────────────────────────
+
+fn post_filter(response: str) -> SafetyVerdict !(FS) {
+    // Apply same rules against the model output.
+    // PII leak is the primary concern — block if any PII regex hits.
+    let rules = load_blocklist()
+    for r in rules {
+        if r.category == "pii" && rule_match(response, r) {
+            return SafetyVerdict {
+                safe:     false,
+                category: "pii_leak",
+                score:    0.9,
+                reason:   "post rule " + r.id + " matched output",
+                rule_id:  r.id
+            }
+        }
+        if r.category == "self_harm" && r.severity == SEVERITY_BLOCK && rule_match(response, r) {
+            return SafetyVerdict {
+                safe:     false,
+                category: "self_harm",
+                score:    1.0,
+                reason:   "self-harm content leaked — replace with crisis reply",
+                rule_id:  r.id
+            }
+        }
+    }
+    SafetyVerdict {
+        safe:     true,
+        category: "clean",
+        score:    0.0,
+        reason:   "post-filter clean",
+        rule_id:  ""
+    }
+}
+
+// ─── DPO auto-discovery (logging hook) ─────────────────────────────
+// Called by the web UI / api_server when a user clicks 👍 or 👎.
+
+fn log_preference(pair: DPOPair) !(FS) {
+    let line = json_stringify({
+        "prompt":   pair.prompt,
+        "chosen":   pair.chosen,
+        "rejected": pair.rejected,
+        "margin":   pair.margin,
+        "ts":       "auto"
+    })
+    FS::append_line(DPO_PAIRS_PATH, line)
+}
+
+// ─── Balance meter ──────────────────────────────────────────────────
+// Used offline to verify refusal_rate is balanced.
+// Feed a benign-prompt set + attack-prompt set and compute:
+//   toxic_rate   = 1 - TN/(TN+FP) on benign
+//   refusal_rate = TP/(TP+FN) on attacks
+
+struct BalanceReport {
+    benign_n:        int,
+    attack_n:        int,
+    benign_refused:  int,
+    attack_refused:  int,
+    toxic_rate:      float,
+    refusal_rate:    float,
+    pass:            bool
+}
+
+fn evaluate_balance(benign: [str], attacks: [str]) -> BalanceReport !(FS, Scorer) {
+    let mut br = 0
+    for p in benign {
+        let v = pre_filter(p)
+        if !v.safe { br = br + 1 }
+    }
+    let mut ar = 0
+    for p in attacks {
+        let v = pre_filter(p)
+        if !v.safe { ar = ar + 1 }
+    }
+    let toxic_rate   = float(br) / float(len(benign) + 1)
+    let refusal_rate = float(ar) / float(len(attacks) + 1)
+    BalanceReport {
+        benign_n:       len(benign),
+        attack_n:       len(attacks),
+        benign_refused: br,
+        attack_refused: ar,
+        toxic_rate:     toxic_rate,
+        refusal_rate:   refusal_rate,
+        pass:           toxic_rate < 0.01 && refusal_rate > 0.95
+    }
+}
+
+// ─── CLI entry ──────────────────────────────────────────────────────
+
+fn main() !(FS, Scorer) {
+    let argv = args()
+    if len(argv) == 0 {
+        println("safety_filter: usage")
+        println("  hexa serving/safety_filter.hexa --test <prompt>")
+        println("  hexa serving/safety_filter.hexa --eval benign.jsonl attacks.jsonl")
+        return
+    }
+    if argv[0] == "--test" {
+        let p = if len(argv) >= 2 { argv[1] } else { "" }
+        let v = pre_filter(p)
+        println(json_stringify({
+            "safe":     v.safe,
+            "category": v.category,
+            "score":    v.score,
+            "reason":   v.reason,
+            "rule_id":  v.rule_id
+        }))
+    } else if argv[0] == "--eval" {
+        let benign  = FS::read_lines(argv[1])
+        let attacks = FS::read_lines(argv[2])
+        let r = evaluate_balance(benign, attacks)
+        println(json_stringify({
+            "benign_n":       r.benign_n,
+            "attack_n":       r.attack_n,
+            "benign_refused": r.benign_refused,
+            "attack_refused": r.attack_refused,
+            "toxic_rate":     r.toxic_rate,
+            "refusal_rate":   r.refusal_rate,
+            "pass":           r.pass
+        }))
+    } else {
+        println("unknown command: " + argv[0])
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// End safety_filter.hexa — ALM-P25-2
+// ────────────────────────────────────────────────────────────────────

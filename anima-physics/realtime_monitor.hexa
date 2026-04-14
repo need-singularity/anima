@@ -1,0 +1,393 @@
+// ═══════════════════════════════════════════════════════════════
+//  anima-physics/realtime_monitor.hexa — PHYS-P24-1
+//
+//  Real-time inference latency + consciousness metric live monitor.
+//
+//  What it does:
+//    - Issues N forward passes through a mock 2-layer CLM forward
+//      (same shape budget as eval_clm.hexa: d=16, vocab=32, seq=8 — the
+//       numbers we actually ship in pure-hexa serving; P5c-4 target).
+//    - For each pass, records:
+//        latency_ms — wall-clock via clock()
+//        phi_live   — instantaneous Φ_holo on the last hidden state,
+//                     using MI_BINS=8 histogram estimator
+//                     (same primitives as phi_holographic_measure.hexa).
+//    - Emits a rolling report:
+//        p50 / p95 / p99 latency in ms
+//        phi_live mean / min / max
+//    - Gate: p95 < 200 ms AND phi_live mean > 0.0 AND finite.
+//
+//  Why "mock forward"?  We are monitoring the *monitor* path — the
+//  target latency number is the end-to-end observability envelope,
+//  not the GPU-assisted forward. This file runs everywhere (no GPU),
+//  so it can be invoked from an HTTP/UDS health endpoint and give
+//  a trustable latency+phi_live number even in CPU-only deployments.
+//  When a real model checkpoint is supplied via arg[2], we switch to
+//  calling eval_clm-style forward (TODO once cross-module `use` is
+//  stable in build_c; for now we stick to the mock).
+//
+//  Run:
+//    hexa run anima-physics/realtime_monitor.hexa            # 64 iters
+//    hexa run anima-physics/realtime_monitor.hexa --iters 32
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Knobs ──────────────────────────────────────────────────────
+
+let D           = 16
+let FF          = 32
+let VOCAB       = 32
+let SEQ         = 8
+let MI_BINS     = 8
+let GATE_LAT_MS = 200.0
+let EPS         = 0.0000001
+
+// ─── Primitives ─────────────────────────────────────────────────
+
+fn fabs(x: float) -> float { if x < 0.0 { return 0.0 - x } return x }
+
+fn ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+// ─── Histogram MI (copied from phi_holographic_measure.hexa) ────
+
+fn bin_index(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn count_hits(bin_ids: array, n_bins: int) -> array {
+    let n = len(bin_ids)
+    let mut counts = []
+    let mut k = 0
+    while k < n_bins {
+        let mut c = 0.0
+        let mut i = 0
+        while i < n {
+            if bin_ids[i] == k { c = c + 1.0 }
+            i = i + 1
+        }
+        counts = counts.push(c)
+        k = k + 1
+    }
+    return counts
+}
+
+fn entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut bin_ids = []
+    let mut i = 0
+    while i < n {
+        bin_ids = bin_ids.push(bin_index(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let counts = count_hits(bin_ids, nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+fn joint_entropy_hist(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = bin_index(a[i], lo, hi, nb)
+        let ib = bin_index(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let nb2 = nb * nb
+    let counts = count_hits(pair_ids, nb2)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb2 {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+fn mi_holo(boundary: array, interior: array) -> float {
+    let lo_b = vec_min(boundary)
+    let hi_b = vec_max(boundary)
+    let lo_i = vec_min(interior)
+    let hi_i = vec_max(interior)
+    let lo = if lo_b < lo_i { lo_b } else { lo_i }
+    let hi = if hi_b > hi_i { hi_b } else { hi_i }
+    let h_b  = entropy_hist(boundary, lo, hi, MI_BINS)
+    let h_i  = entropy_hist(interior, lo, hi, MI_BINS)
+    let h_bi = joint_entropy_hist(boundary, interior, lo, hi, MI_BINS)
+    let mi = h_b + h_i - h_bi
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ─── Mock 2-layer forward ───────────────────────────────────────
+// Shape matches eval_clm.hexa. We intentionally keep this branch
+// simple: one matmul per layer (Wq equivalent), one nonlinear mix,
+// one LM head. This is enough to generate both a realistic hidden
+// vector (for phi_live) and a realistic latency number on the
+// interpreter.
+
+fn tanh_approx(x: float) -> float {
+    // rational approx of tanh(x), accurate to a few percent in [-3, 3]
+    let x2 = x * x
+    return x * (27.0 + x2) / (27.0 + 9.0 * x2)
+}
+
+fn matvec(w: array, x: array, rows: int, cols: int) -> array {
+    let mut out = []
+    let mut r = 0
+    while r < rows {
+        let mut s = 0.0
+        let mut c = 0
+        while c < cols {
+            s = s + w[r * cols + c] * x[c]
+            c = c + 1
+        }
+        out = out.push(s)
+        r = r + 1
+    }
+    return out
+}
+
+fn forward_once(seed: int) -> array {
+    // emits final hidden state h ∈ R^D (length D=16)
+    let W1 = det_rand(D * D, seed)
+    let W2 = det_rand(D * D, seed + 1)
+    let x0 = det_rand(D, seed + 2)
+
+    let h1 = matvec(W1, x0, D, D)
+    let mut h1n = []
+    let mut i = 0
+    while i < D {
+        h1n = h1n.push(tanh_approx(h1[i]))
+        i = i + 1
+    }
+    let h2 = matvec(W2, h1n, D, D)
+    let mut h2n = []
+    i = 0
+    while i < D {
+        h2n = h2n.push(tanh_approx(h2[i]))
+        i = i + 1
+    }
+    return h2n
+}
+
+fn interior_from_boundary(boundary: array) -> array {
+    // split boundary into two halves — second half acts as "bulk"
+    let n = len(boundary)
+    let half = n / 2
+    let mut interior = []
+    let mut i = 0
+    while i < half {
+        interior = interior.push(boundary[half + (i % half)])
+        i = i + 1
+    }
+    // pad to match boundary length
+    while len(interior) < n {
+        interior = interior.push(boundary[len(interior) % half + half])
+    }
+    return interior
+}
+
+// ─── Rolling stats ──────────────────────────────────────────────
+
+fn sorted_copy(v: array) -> array {
+    // selection sort by index scan — avoids .set() (not in hexa stdlib).
+    // n is small: ≤128, so O(n^2) is fine.
+    let n = len(v)
+    let mut remaining = []
+    let mut i = 0
+    while i < n {
+        remaining = remaining.push(v[i])
+        i = i + 1
+    }
+    let mut out = []
+    let mut k = 0
+    while k < n {
+        let m = len(remaining)
+        // find index of min
+        let mut min_idx = 0
+        let mut min_val = remaining[0]
+        let mut j = 1
+        while j < m {
+            if remaining[j] < min_val {
+                min_val = remaining[j]
+                min_idx = j
+            }
+            j = j + 1
+        }
+        out = out.push(min_val)
+        // rebuild remaining without element at min_idx
+        let mut new_rem = []
+        let mut q = 0
+        while q < m {
+            if q != min_idx {
+                new_rem = new_rem.push(remaining[q])
+            }
+            q = q + 1
+        }
+        remaining = new_rem
+        k = k + 1
+    }
+    return out
+}
+
+fn percentile(v: array, pct: float) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let s = sorted_copy(v)
+    let mut idx = to_int(pct * to_float(n))
+    if idx < 0 { idx = 0 }
+    if idx >= n { idx = n - 1 }
+    return s[idx]
+}
+
+fn mean_f(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + v[i]
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+// ─── Arg parse ──────────────────────────────────────────────────
+
+fn parse_iters(argv: array) -> int {
+    let n = len(argv)
+    let mut i = 0
+    while i < n {
+        if argv[i] == "--iters" {
+            if i + 1 < n {
+                return to_int(argv[i + 1])
+            }
+        }
+        i = i + 1
+    }
+    return 64
+}
+
+fn main() {
+    let argv = args()
+    let iters = parse_iters(argv)
+
+    println("[realtime_monitor] PHYS-P24-1 live latency + phi monitor")
+    println("  d=" + str(D) + " seq=" + str(SEQ) + " vocab=" + str(VOCAB)
+          + " iters=" + str(iters) + " gate=" + str(GATE_LAT_MS) + "ms")
+    println("")
+
+    // Warmup pass — first iteration frequently carries a one-off
+    // interpreter/VM warm cost that is unrelated to steady-state latency.
+    let warm_h = forward_once(0)
+    let warm_i = interior_from_boundary(warm_h)
+    let _warm_phi = mi_holo(warm_h, warm_i)
+
+    let mut lats = []
+    let mut phis = []
+    let mut n_bad = 0
+
+    let mut i = 0
+    while i < iters {
+        let t0 = clock()
+        let h = forward_once(100 + i * 7)
+        let interior = interior_from_boundary(h)
+        let phi = mi_holo(h, interior)
+        let t1 = clock()
+        let ms = (t1 - t0) * 1000.0
+
+        lats = lats.push(ms)
+        phis = phis.push(phi)
+        if ms > GATE_LAT_MS { n_bad = n_bad + 1 }
+
+        i = i + 1
+    }
+
+    let p50 = percentile(lats, 0.50)
+    let p95 = percentile(lats, 0.95)
+    let p99 = percentile(lats, 0.99)
+    let phi_mean = mean_f(phis)
+    let phi_min  = vec_min(phis)
+    let phi_max  = vec_max(phis)
+
+    println("  latency p50 = " + str(p50) + " ms")
+    println("  latency p95 = " + str(p95) + " ms")
+    println("  latency p99 = " + str(p99) + " ms")
+    println("  phi_live    mean=" + str(phi_mean) + "  min=" + str(phi_min) + "  max=" + str(phi_max))
+    println("  samples over gate (" + str(GATE_LAT_MS) + "ms) = " + str(n_bad) + "/" + str(iters))
+
+    let ok_lat = p95 < GATE_LAT_MS
+    let ok_phi = phi_mean > 0.0 && phi_max > phi_min
+    let ok = ok_lat && ok_phi
+
+    println("")
+    if ok {
+        println("[realtime_monitor] GATE PASS — p95 < 200ms AND phi_live is live + finite")
+    } else {
+        println("[realtime_monitor] GATE FAIL — lat_ok=" + (if ok_lat { "1" } else { "0" })
+              + " phi_ok=" + (if ok_phi { "1" } else { "0" }))
+    }
+    println("pass=" + (if ok { "1" } else { "0" }))
+}
+
+main()

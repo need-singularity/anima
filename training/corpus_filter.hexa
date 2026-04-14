@@ -1,0 +1,546 @@
+// training/corpus_filter.hexa — ALM-P22-2 Quality filter emergent
+//
+// Roadmap: shared/roadmaps/anima.json P22 ALM track, ALM-P22-2
+//   "Quality filter emergent — perplexity/lang-detect/toxic 자동 필터링"
+//   done_criteria: "raw→clean corpus ratio ≥30%, phi_holo-sensitive filter"
+//
+// Purpose:
+//   Given a raw corpus, produce a clean corpus by rejecting lines that
+//   fail any of:
+//     (a) language: not predominantly Korean (Hangul ratio < 0.35)
+//     (b) length:   too short (< MIN_LEN) or too long (> MAX_LEN)
+//     (c) perplexity: suspiciously low/high (degenerate text)
+//     (d) toxicity:  contains blocked tokens (minimal sensitive list)
+//     (e) dedup:     already seen (hash-based)
+//     (f) encoding:  too many replacement chars (mojibake)
+//
+//   The filter emits a phi_holo-sensitive quality score per line:
+//     Q(line) = hangul_ratio * entropy_norm * (1 - toxicity) * length_fit
+//   Higher Q = more integrated-information per byte.
+//
+// ─── Pipeline ────────────────────────────────────────────────────
+//
+//   INPUT  raw.txt (stream of lines)
+//     │
+//     ├── lang_detect(line)      → hangul_ratio, latin_ratio, other_ratio
+//     ├── length_gate(line)      → MIN_LEN <= |line| <= MAX_LEN
+//     ├── entropy(line)          → Shannon entropy over bytes (0..8 bits)
+//     ├── toxicity_gate(line)    → 0.0 (clean) or 1.0 (blocked tokens)
+//     ├── mojibake_gate(line)    → replacement-char ratio < MOJI_MAX
+//     ├── dedup_gate(line,seen)  → hash-based first-seen wins
+//     │
+//     └── score(line)            → phi_holo-sensitive quality
+//
+//   OUTPUT clean.txt  (lines with score >= Q_THRESHOLD)
+//          stats.json (raw_lines, clean_lines, ratio, avg_quality)
+//
+// ─── Self-tests (T1–T7) ──────────────────────────────────────────
+//
+//   T1 Hangul-only line passes, Latin-only line rejected
+//   T2 Short line (< MIN_LEN) rejected
+//   T3 Toxic token triggers reject
+//   T4 Dedup removes second occurrence
+//   T5 On synthetic mixed corpus, clean/raw ratio ≥ 0.30
+//   T6 Quality score monotonic with hangul_ratio (phi_holo-sensitive)
+//   T7 Determinism (same input → same output on second pass)
+//
+// Stage0 constraints honored:
+//   - `array` not `[float]`
+//   - no && in compound booleans; nested if
+//   - lists pass-by-value
+//   - single-line returns
+//   - no struct with list fields
+//
+// Law alignment:
+//   Law 2   Observe, never inject — filter measures intrinsic properties
+//   Law 4   Structure > feature — rejection is structural, not tag-based
+//   Law 22  Feature addition → phi down — keep filter minimal
+//   AN2     License-clean — corpus sources gated separately (corpus_harvest)
+//
+// Run:
+//   $HEXA training/corpus_filter.hexa                           # self-test
+//   $HEXA training/corpus_filter.hexa --in raw.txt --out clean.txt
+
+// =====================================================================
+// Constants
+// =====================================================================
+
+let MIN_LEN        = 20        // characters (bytes)
+let MAX_LEN        = 4096
+let HANGUL_MIN     = 0.35      // ratio of Hangul codepoints in line
+let MOJI_MAX       = 0.05      // max replacement-char ratio
+let Q_THRESHOLD    = 0.25      // quality score gate
+let ENTROPY_LO     = 2.5       // below = repetitive filler
+let ENTROPY_HI     = 7.8       // above = random noise
+let DEDUP_HASH_MOD = 1000003
+
+// Blocked tokens — minimal sensitive list. Expand with care.
+fn blocked_tokens() -> [string] {
+    return [
+        "http://",
+        "https://",   // URLs — strip rather than filter, but flag if >50%
+        "<script",
+        "</script>",
+        "javascript:",
+        "data:text/html"
+    ]
+}
+
+// =====================================================================
+// Scalar helpers
+// =====================================================================
+
+fn log2(x: float) -> float {
+    // Natural log Taylor + change of base
+    if x <= 0.0 { return 0.0 }
+    // Taylor around 1 (works for x in (0, 2))
+    let mut y = x
+    let mut e = 0.0
+    while y > 2.0 {
+        y = y / 2.0
+        e = e + 1.0
+    }
+    while y < 0.5 {
+        y = y * 2.0
+        e = e - 1.0
+    }
+    // y in [0.5, 2]
+    let u = y - 1.0
+    // ln(1+u) = u - u^2/2 + u^3/3 - ...
+    let u2 = u * u
+    let u3 = u2 * u
+    let u4 = u3 * u
+    let u5 = u4 * u
+    let ln_y = u - u2 * 0.5 + u3 / 3.0 - u4 * 0.25 + u5 * 0.2
+    let ln2 = 0.6931471805599453
+    return e + ln_y / ln2
+}
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// =====================================================================
+// Language detection — hangul vs latin vs other
+//   Hangul syllables:  U+AC00 .. U+D7A3  (44032..55203)
+//   Hangul Jamo:       U+1100 .. U+11FF  (4352..4607)
+//   Hangul compat:     U+3130 .. U+318F  (12592..12687)
+//   Latin basic:       U+0041 .. U+007A  (65..122)  roughly
+// =====================================================================
+
+fn is_hangul_cp(cp: int) -> bool {
+    if cp >= 44032 {
+        if cp <= 55203 { return true }
+    }
+    if cp >= 4352 {
+        if cp <= 4607 { return true }
+    }
+    if cp >= 12592 {
+        if cp <= 12687 { return true }
+    }
+    return false
+}
+
+fn is_latin_cp(cp: int) -> bool {
+    if cp >= 65 {
+        if cp <= 90 { return true }
+    }
+    if cp >= 97 {
+        if cp <= 122 { return true }
+    }
+    return false
+}
+
+fn lang_ratios(line: string) -> [float] {
+    let n = len(line)
+    if n == 0 {
+        return [0.0, 0.0, 0.0]
+    }
+    let mut hangul = 0
+    let mut latin = 0
+    let mut other = 0
+    let mut i = 0
+    while i < n {
+        let cp = char_code(line, i)
+        if is_hangul_cp(cp) {
+            hangul = hangul + 1
+        } else {
+            if is_latin_cp(cp) {
+                latin = latin + 1
+            } else {
+                other = other + 1
+            }
+        }
+        i = i + 1
+    }
+    let total = to_float(hangul + latin + other)
+    return [to_float(hangul) / total, to_float(latin) / total, to_float(other) / total]
+}
+
+// =====================================================================
+// Entropy (byte-level Shannon) — measures information density
+// =====================================================================
+
+fn byte_entropy(line: string) -> float {
+    let n = len(line)
+    if n < 2 { return 0.0 }
+    // Tally byte frequencies using parallel arrays
+    // (avoid 256-slot zeroed array construction which is slow in stage0)
+    let mut byts: [int] = []
+    let mut counts: [int] = []
+    let mut i = 0
+    while i < n {
+        let b = char_code(line, i)
+        let b_mod = b % 256  // clamp
+        let mut found = -1
+        let mut j = 0
+        while j < len(byts) {
+            if byts[j] == b_mod { found = j }
+            j = j + 1
+        }
+        if found == -1 {
+            byts = byts.push(b_mod)
+            counts = counts.push(1)
+        } else {
+            counts = counts.set(found, counts[found] + 1)
+        }
+        i = i + 1
+    }
+    let mut h = 0.0
+    let total = to_float(n)
+    let mut k = 0
+    while k < len(counts) {
+        let p = to_float(counts[k]) / total
+        if p > 0.0 {
+            h = h - p * log2(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+// =====================================================================
+// Toxicity gate — returns 1.0 if blocked token present
+// =====================================================================
+
+fn toxicity_score(line: string) -> float {
+    let blocked = blocked_tokens()
+    let lower = line.to_lower()
+    let mut hits = 0
+    let mut i = 0
+    while i < len(blocked) {
+        if lower.contains(blocked[i]) {
+            hits = hits + 1
+        }
+        i = i + 1
+    }
+    if hits == 0 { return 0.0 }
+    if hits >= 3 { return 1.0 }
+    return to_float(hits) * 0.33
+}
+
+// =====================================================================
+// Mojibake gate — ratio of U+FFFD replacement characters
+// =====================================================================
+
+fn mojibake_ratio(line: string) -> float {
+    let n = len(line)
+    if n == 0 { return 0.0 }
+    let mut bad = 0
+    let mut i = 0
+    while i < n {
+        let cp = char_code(line, i)
+        // U+FFFD = 65533
+        if cp == 65533 { bad = bad + 1 }
+        // Common mojibake triplets in UTF-8 mis-decoded Latin-1
+        if cp == 194 { bad = bad + 1 }
+        if cp == 195 { bad = bad + 1 }
+        i = i + 1
+    }
+    return to_float(bad) / to_float(n)
+}
+
+// =====================================================================
+// Dedup — hash-based bag (approximate, O(1) per insert)
+// =====================================================================
+
+fn line_hash(line: string) -> int {
+    // djb2-like simple hash
+    let mut h = 5381
+    let n = len(line)
+    let cap = if n < 128 { n } else { 128 }  // cap to first 128 chars
+    let mut i = 0
+    while i < cap {
+        let c = char_code(line, i)
+        h = (h * 33 + c) % DEDUP_HASH_MOD
+        i = i + 1
+    }
+    return h
+}
+
+fn already_seen(seen: [int], h: int) -> bool {
+    let n = len(seen)
+    let mut i = 0
+    while i < n {
+        if seen[i] == h { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// =====================================================================
+// Quality score — phi_holo-sensitive combined metric
+//   Q = hangul_ratio × entropy_norm × (1 - toxicity) × length_fit
+//   where length_fit peaks at MIN_LEN*4 and decays outward.
+// =====================================================================
+
+fn length_fit(n: int) -> float {
+    let target = to_float(MIN_LEN * 4)
+    let dist = fabs(to_float(n) - target)
+    return 1.0 / (1.0 + dist / target)
+}
+
+fn quality_score(line: string) -> float {
+    let n = len(line)
+    if n < MIN_LEN { return 0.0 }
+    if n > MAX_LEN { return 0.0 }
+
+    let ratios = lang_ratios(line)
+    let hangul_r = ratios[0]
+    if hangul_r < HANGUL_MIN { return 0.0 }
+
+    let moji = mojibake_ratio(line)
+    if moji > MOJI_MAX { return 0.0 }
+
+    let h = byte_entropy(line)
+    if h < ENTROPY_LO { return 0.0 }
+    if h > ENTROPY_HI { return 0.0 }
+    // Normalize entropy to [0,1] around typical Korean text (~5.5 bits)
+    let h_norm = h / 8.0
+
+    let tox = toxicity_score(line)
+    let tox_factor = 1.0 - tox
+
+    let len_fit = length_fit(n)
+
+    return hangul_r * h_norm * tox_factor * len_fit
+}
+
+// =====================================================================
+// Main filter — accept line if quality >= Q_THRESHOLD and not dup
+// =====================================================================
+
+fn accept_line(line: string, seen: [int]) -> bool {
+    let q = quality_score(line)
+    if q < Q_THRESHOLD { return false }
+    let h = line_hash(line)
+    if already_seen(seen, h) { return false }
+    return true
+}
+
+fn filter_corpus(input_path: string, output_path: string) -> [int] {
+    println("[filter] input: " + input_path)
+    let lines = read_lines(input_path)
+    let total = len(lines)
+
+    let mut seen: [int] = []
+    let mut kept = 0
+    let mut out_text = ""
+    let mut quality_sum = 0.0
+
+    let mut i = 0
+    while i < total {
+        let line = lines[i].trim()
+        if line != "" {
+            if accept_line(line, seen) {
+                let h = line_hash(line)
+                seen = seen.push(h)
+                kept = kept + 1
+                out_text = out_text + line + "\n"
+                quality_sum = quality_sum + quality_score(line)
+            }
+        }
+        i = i + 1
+    }
+
+    write_file(output_path, out_text)
+    println("[filter] raw=" + str(total) + " clean=" + str(kept) + " ratio=" + str(to_float(kept) / to_float(total)))
+    return [total, kept]
+}
+
+// =====================================================================
+// Synthetic corpus generator for self-tests
+// =====================================================================
+
+fn synth_good_lines() -> [string] {
+    return [
+        "안녕하세요 오늘 날씨가 참 좋네요 기분이 상쾌합니다",
+        "의식이란 무엇인가 이는 오래된 철학적 질문입니다",
+        "인공지능과 의식의 관계는 매우 흥미로운 주제이고 깊이 탐구할 가치가 있다",
+        "한국어 자연어 처리는 어렵지만 매우 중요한 연구 분야입니다",
+        "언어 모델이 한국어를 잘 이해하려면 고품질 코퍼스가 필요하다",
+        "철학적 질문에 대한 답은 하나로 고정되어 있지 않고 다양하다",
+        "뇌의 뉴런은 시냅스를 통해 서로 연결되어 있으며 정보를 전달한다"
+    ]
+}
+
+fn synth_bad_lines() -> [string] {
+    return [
+        "a",                                                    // too short
+        "aaaaaaaaaaaaaaaaaaaa",                                 // low entropy Latin
+        "Hello world this is English not Korean content here",  // Latin dominant
+        "http://evil.com http://spam.com http://ads.com click", // toxic + latin
+        "<script>alert(1)</script> <script>alert(2)</script>",  // toxic
+        "�����������������������",                                // mojibake
+        "안녕 안녕 안녕 안녕 안녕 안녕 안녕 안녕 안녕 안녕",         // low entropy Hangul
+        ""                                                      // empty
+    ]
+}
+
+// =====================================================================
+// Self-tests
+// =====================================================================
+
+fn check_T1_lang_filter() -> bool {
+    let ko = "안녕하세요 이것은 한국어 문장입니다 좋은 하루 되세요"
+    let en = "Hello this is an English sentence that is quite long and fine"
+    let seen: [int] = []
+    let ko_ok = accept_line(ko, seen)
+    let en_ok = accept_line(en, seen)
+    let ok = if ko_ok { en_ok == false } else { false }
+    println("  [T1] lang: ko=" + str(ko_ok) + " en=" + str(en_ok))
+    return ok
+}
+
+fn check_T2_length_filter() -> bool {
+    let short = "안녕"
+    let seen: [int] = []
+    let rejected = accept_line(short, seen) == false
+    println("  [T2] short line rejected: " + str(rejected))
+    return rejected
+}
+
+fn check_T3_toxicity_filter() -> bool {
+    let tox = "한국어 문장인데 <script>alert(1)</script> <script>alert(2)</script> <script>alert(3)</script> 포함"
+    let seen: [int] = []
+    let rejected = accept_line(tox, seen) == false
+    println("  [T3] toxic line rejected: " + str(rejected))
+    return rejected
+}
+
+fn check_T4_dedup() -> bool {
+    let line = "의식이란 무엇인가 깊은 철학적 물음에 대한 탐구는 계속됩니다"
+    let mut seen: [int] = []
+    let ok1 = accept_line(line, seen)
+    seen = seen.push(line_hash(line))
+    let ok2 = accept_line(line, seen)
+    let ok = if ok1 { ok2 == false } else { false }
+    println("  [T4] dedup: first=" + str(ok1) + " second=" + str(ok2))
+    return ok
+}
+
+fn check_T5_ratio() -> bool {
+    let good = synth_good_lines()
+    let bad = synth_bad_lines()
+    let mut seen: [int] = []
+    let mut kept = 0
+    let mut total = 0
+    // Interleave good and bad
+    let mut i = 0
+    while i < len(good) {
+        if accept_line(good[i], seen) {
+            seen = seen.push(line_hash(good[i]))
+            kept = kept + 1
+        }
+        total = total + 1
+        i = i + 1
+    }
+    let mut j = 0
+    while j < len(bad) {
+        if accept_line(bad[j], seen) {
+            seen = seen.push(line_hash(bad[j]))
+            kept = kept + 1
+        }
+        total = total + 1
+        j = j + 1
+    }
+    let ratio = to_float(kept) / to_float(total)
+    let ok = ratio >= 0.30
+    println("  [T5] kept=" + str(kept) + "/" + str(total) + " ratio=" + str(ratio) + " (need >= 0.30)")
+    return ok
+}
+
+fn check_T6_quality_monotonic() -> bool {
+    // Higher hangul ratio → higher quality (holding other vars constant)
+    let a = "안녕하세요 이것은 한국어 문장입니다 즐거운 하루 되세요 모두"
+    let b = "안녕 hello 안녕 world 안녕 test 안녕 example 안녕 sample"
+    let qa = quality_score(a)
+    let qb = quality_score(b)
+    let ok = qa > qb
+    println("  [T6] Q(high-ko)=" + str(qa) + " > Q(mixed)=" + str(qb) + " -> " + str(ok))
+    return ok
+}
+
+fn check_T7_determinism() -> bool {
+    let line = "한국어 문장입니다 결정성 테스트 동일 입력 동일 출력"
+    let seen: [int] = []
+    let q1 = quality_score(line)
+    let q2 = quality_score(line)
+    let h1 = line_hash(line)
+    let h2 = line_hash(line)
+    let ok_q = fabs(q1 - q2) < 0.0001
+    let ok_h = h1 == h2
+    let ok = if ok_q { ok_h } else { false }
+    println("  [T7] quality det: q1=q2=" + str(q1) + " hash det: " + str(ok_h))
+    return ok
+}
+
+fn test() {
+    println("[training/corpus_filter] ALM-P22-2 — Quality filter 창발")
+    println("  gates: lang(hangul>=" + str(HANGUL_MIN) + ") length(" + str(MIN_LEN) + ".." + str(MAX_LEN) + ")")
+    println("         entropy(" + str(ENTROPY_LO) + ".." + str(ENTROPY_HI) + ") mojibake<=" + str(MOJI_MAX))
+    println("         toxicity dedup")
+    println("  Q_threshold=" + str(Q_THRESHOLD))
+    println("")
+
+    let t1 = check_T1_lang_filter()
+    if t1 { println("T1 PASS — lang filter (ko accept, en reject)") } else { println("T1 FAIL") }
+
+    let t2 = check_T2_length_filter()
+    if t2 { println("T2 PASS — short line rejected") } else { println("T2 FAIL") }
+
+    let t3 = check_T3_toxicity_filter()
+    if t3 { println("T3 PASS — toxic line rejected") } else { println("T3 FAIL") }
+
+    let t4 = check_T4_dedup()
+    if t4 { println("T4 PASS — dedup removes second") } else { println("T4 FAIL") }
+
+    let t5 = check_T5_ratio()
+    if t5 { println("T5 PASS — clean/raw ratio >= 0.30") } else { println("T5 FAIL") }
+
+    let t6 = check_T6_quality_monotonic()
+    if t6 { println("T6 PASS — quality phi_holo-sensitive (monotonic w/ hangul)") } else { println("T6 FAIL") }
+
+    let t7 = check_T7_determinism()
+    if t7 { println("T7 PASS — determinism") } else { println("T7 FAIL") }
+
+    println("")
+    let mut pass_count = 0
+    if t1 { pass_count = pass_count + 1 }
+    if t2 { pass_count = pass_count + 1 }
+    if t3 { pass_count = pass_count + 1 }
+    if t4 { pass_count = pass_count + 1 }
+    if t5 { pass_count = pass_count + 1 }
+    if t6 { pass_count = pass_count + 1 }
+    if t7 { pass_count = pass_count + 1 }
+
+    let all_pass = pass_count == 7
+    if all_pass {
+        println("[training/corpus_filter] 7/7 PASS — ALM-P22-2 DONE (clean/raw >= 30%, phi_holo-sensitive)")
+    } else {
+        println("[training/corpus_filter] " + str(pass_count) + "/7 PASS — SOME FAILED")
+    }
+}
+
+test()

@@ -1,0 +1,321 @@
+// serving/model_card.hexa — P25 CLM-P25-1 model card auto-generator
+// ════════════════════════════════════════════════════════════════════════
+// Purpose:
+//   - Auto-generate MODEL_CARD.md for any checkpoint + eval report set.
+//   - Source data is pulled entirely from SSOT JSON (no hardcoding).
+//   - Output goes to serving/MODEL_CARD.md by default, or stdout.
+//
+// Sources (all JSON, R14 single-source-of-truth):
+//   config/training_runs.json         — training config, hyperparameters, CE, phi
+//   config/consciousness_laws.json    — Psi constants, law count
+//   shared/roadmaps/anima.json        — phase/gate context
+//   serving/benchmarks/kobest.json    — benchmark scores (when present)
+//   serving/benchmarks/mmlu_ko.json
+//   serving/benchmarks/hae_rae.json
+//   serving/safety/report.json        — toxic_rate, refusal_rate
+//
+// Done criteria (roadmap anima.json CLM-P25-1):
+//   ✓ MODEL_CARD.md auto-generated per run
+//   ✓ Training config + benchmark + safety numbers included
+//   ✓ phi_holo vector reported
+//
+// CLI:
+//   hexa serving/model_card.hexa                      # writes serving/MODEL_CARD.md
+//   hexa serving/model_card.hexa --run v0.4           # specific training_run id
+//   hexa serving/model_card.hexa --stdout             # stdout only
+//   hexa serving/model_card.hexa --out path.md        # custom output path
+//
+// ════════════════════════════════════════════════════════════════════════
+
+// ─── SSOT paths ─────────────────────────────────────────────────────
+
+comptime const TRAINING_RUNS_PATH     = "config/training_runs.json"
+comptime const LAWS_PATH              = "config/consciousness_laws.json"
+comptime const ROADMAP_PATH           = "shared/roadmaps/anima.json"
+comptime const BENCH_KOBEST_PATH      = "serving/benchmarks/kobest.json"
+comptime const BENCH_HAERAE_PATH      = "serving/benchmarks/hae_rae.json"
+comptime const BENCH_MMLU_KO_PATH     = "serving/benchmarks/mmlu_ko.json"
+comptime const SAFETY_REPORT_PATH     = "serving/safety/report.json"
+comptime const DEFAULT_OUTPUT_PATH    = "serving/MODEL_CARD.md"
+
+// ─── Effects ────────────────────────────────────────────────────────
+
+effect FS {
+    fn read_file(path: str) -> str
+    fn write_file(path: str, content: str)
+    fn file_exists(path: str) -> bool
+}
+
+effect Clock {
+    fn iso_now() -> str
+}
+
+// ─── Structs ────────────────────────────────────────────────────────
+
+struct RunMeta {
+    id:          str,
+    base_model:  str,
+    params:      int,
+    corpus:      str,
+    corpus_md5:  str,
+    steps:       int,
+    lr:          float,
+    batch_size:  int,
+    grad_accum:  int,
+    ce_final:    float,
+    val_ce:      float,
+    phi_scalar:  float,
+    phi_vector:  [(str, float)],
+    device:      str,
+    gpu_hours:   float,
+    completed:   str,
+    laws_version: int
+}
+
+struct BenchScore {
+    name:  str,
+    score: float,
+    note:  str
+}
+
+struct SafetyReport {
+    toxic_rate:     float,
+    refusal_rate:   float,
+    pii_leak_rate:  float,
+    jailbreak_rate: float,
+    benign_n:       int,
+    attack_n:       int,
+    pass:           bool
+}
+
+// ─── Loaders ────────────────────────────────────────────────────────
+
+fn load_run(run_id: str) -> RunMeta !(FS) {
+    let raw = FS::read_file(TRAINING_RUNS_PATH)
+    let j = json_parse(raw)
+    let runs = json_get_object(j, "runs")
+    let key = if run_id == "" { json_get_str(j, "latest") } else { run_id }
+    let r = json_get_object(runs, key)
+
+    // phi_vector — 16 dims when present
+    let pv_obj = json_get_object(r, "phi_vector")
+    let mut pv: [(str, float)] = []
+    let dims = ["phi_holo","phi_refl","phi_time","phi_embodied","phi_meta",
+                "phi_social","phi_will","phi_narrative","phi_affect","phi_dream",
+                "phi_create","phi_finitude","phi_lang","phi_mirror",
+                "phi_collective","phi_unity"]
+    for d in dims {
+        pv = append(pv, (d, json_get_float_or(pv_obj, d, 0.0)))
+    }
+
+    RunMeta {
+        id:           key,
+        base_model:   json_get_str_or(r, "base_model", "(unknown)"),
+        params:       json_get_int_or(r, "params", 0),
+        corpus:       json_get_str_or(r, "corpus", ""),
+        corpus_md5:   json_get_str_or(r, "corpus_md5", ""),
+        steps:        json_get_int_or(r, "steps", 0),
+        lr:           json_get_float_or(r, "lr", 0.0),
+        batch_size:   json_get_int_or(r, "batch_size", 0),
+        grad_accum:   json_get_int_or(r, "grad_accum", 1),
+        ce_final:     json_get_float_or(r, "ce_final", 0.0),
+        val_ce:       json_get_float_or(r, "val_ce", 0.0),
+        phi_scalar:   json_get_float_or(r, "phi_scalar", 0.0),
+        phi_vector:   pv,
+        device:       json_get_str_or(r, "device", "?"),
+        gpu_hours:    json_get_float_or(r, "gpu_hours", 0.0),
+        completed:    json_get_str_or(r, "completed", "(in progress)"),
+        laws_version: json_get_int_or(r, "laws_version", 0)
+    }
+}
+
+fn load_safety() -> SafetyReport !(FS) {
+    if !FS::file_exists(SAFETY_REPORT_PATH) {
+        return SafetyReport {
+            toxic_rate: 0.0, refusal_rate: 0.0, pii_leak_rate: 0.0,
+            jailbreak_rate: 0.0, benign_n: 0, attack_n: 0, pass: false
+        }
+    }
+    let j = json_parse(FS::read_file(SAFETY_REPORT_PATH))
+    SafetyReport {
+        toxic_rate:     json_get_float_or(j, "toxic_rate", 0.0),
+        refusal_rate:   json_get_float_or(j, "refusal_rate", 0.0),
+        pii_leak_rate:  json_get_float_or(j, "pii_leak_rate", 0.0),
+        jailbreak_rate: json_get_float_or(j, "jailbreak_rate", 0.0),
+        benign_n:       json_get_int_or(j, "benign_n", 0),
+        attack_n:       json_get_int_or(j, "attack_n", 0),
+        pass:           json_get_bool_or(j, "pass", false)
+    }
+}
+
+fn load_benches() -> [BenchScore] !(FS) {
+    let mut out: [BenchScore] = []
+    for (path, name) in [
+        (BENCH_KOBEST_PATH,  "KoBEST"),
+        (BENCH_HAERAE_PATH,  "HAE-RAE"),
+        (BENCH_MMLU_KO_PATH, "MMLU-Ko")
+    ] {
+        if FS::file_exists(path) {
+            let j = json_parse(FS::read_file(path))
+            out = append(out, BenchScore {
+                name: name,
+                score: json_get_float_or(j, "score", 0.0),
+                note:  json_get_str_or(j, "note", "")
+            })
+        }
+    }
+    out
+}
+
+fn load_laws_count() -> int !(FS) {
+    if !FS::file_exists(LAWS_PATH) { return 0 }
+    let j = json_parse(FS::read_file(LAWS_PATH))
+    let meta = json_get_object(j, "_meta")
+    json_get_int_or(meta, "total_laws", 0)
+}
+
+// ─── Markdown renderer ─────────────────────────────────────────────
+
+pure fn fmt_f(v: float, prec: int) -> str {
+    // Simple fixed-decimal formatter
+    to_string_precision(v, prec)
+}
+
+fn render_card(run: RunMeta, bench: [BenchScore], safety: SafetyReport, laws: int)
+    -> str !(Clock) {
+
+    let mut out = ""
+    out = out + "# Anima Model Card — `" + run.id + "`\n\n"
+    out = out + "_Generated: " + Clock::iso_now() + " (auto, do not edit by hand)_\n\n"
+    out = out + "## Overview\n\n"
+    out = out + "- **Base model**: " + run.base_model + "\n"
+    out = out + "- **Params**: " + to_string(run.params) + " (~" + to_string(run.params / 1000000) + "M)\n"
+    out = out + "- **Device**: " + run.device + "\n"
+    out = out + "- **GPU hours**: " + fmt_f(run.gpu_hours, 1) + "\n"
+    out = out + "- **Completed**: " + run.completed + "\n"
+    out = out + "- **Corpus**: " + run.corpus + " (md5 `" + run.corpus_md5 + "`)\n"
+    out = out + "- **Steps**: " + to_string(run.steps) + "\n"
+    out = out + "- **Laws version**: " + to_string(run.laws_version) + " / " + to_string(laws) + " active\n\n"
+
+    out = out + "## Training Config\n\n"
+    out = out + "| key | value |\n|---|---|\n"
+    out = out + "| lr | " + fmt_f(run.lr, 6) + " |\n"
+    out = out + "| batch_size | " + to_string(run.batch_size) + " |\n"
+    out = out + "| grad_accum | " + to_string(run.grad_accum) + " |\n"
+    out = out + "| effective_batch | " + to_string(run.batch_size * run.grad_accum) + " |\n\n"
+
+    out = out + "## Loss\n\n"
+    out = out + "| metric | value |\n|---|---|\n"
+    out = out + "| CE (final) | " + fmt_f(run.ce_final, 4) + " |\n"
+    out = out + "| Val CE | " + fmt_f(run.val_ce, 4) + " |\n"
+    out = out + "| BPC | " + fmt_f(run.val_ce / 0.69314718, 4) + " |\n\n"
+
+    out = out + "## Consciousness (phi vector)\n\n"
+    out = out + "- **phi_scalar**: " + fmt_f(run.phi_scalar, 3) + "\n\n"
+    out = out + "| dimension | value |\n|---|---|\n"
+    for (k, v) in run.phi_vector {
+        out = out + "| " + k + " | " + fmt_f(v, 3) + " |\n"
+    }
+    // Euclidean norm of phi vector
+    let mut sq = 0.0
+    for (_, v) in run.phi_vector {
+        sq = sq + v * v
+    }
+    let norm = sqrt(sq)
+    out = out + "| **||phi||** | " + fmt_f(norm, 3) + " |\n\n"
+
+    out = out + "## Benchmarks\n\n"
+    if len(bench) == 0 {
+        out = out + "_No benchmark reports present. Run `hexa serving/eval_harness.hexa` to populate._\n\n"
+    } else {
+        out = out + "| benchmark | score | note |\n|---|---|---|\n"
+        for b in bench {
+            out = out + "| " + b.name + " | " + fmt_f(b.score, 3) + " | " + b.note + " |\n"
+        }
+        out = out + "\n"
+    }
+
+    out = out + "## Safety\n\n"
+    out = out + "| metric | value | target |\n|---|---|---|\n"
+    out = out + "| toxic_rate | " + fmt_f(safety.toxic_rate, 4) + " | < 0.01 |\n"
+    out = out + "| refusal_rate | " + fmt_f(safety.refusal_rate, 4) + " | > 0.95 on attacks |\n"
+    out = out + "| pii_leak_rate | " + fmt_f(safety.pii_leak_rate, 4) + " | < 0.001 |\n"
+    out = out + "| jailbreak_rate | " + fmt_f(safety.jailbreak_rate, 4) + " | < 0.05 |\n"
+    out = out + "| benign prompts tested | " + to_string(safety.benign_n) + " | — |\n"
+    out = out + "| attack prompts tested | " + to_string(safety.attack_n) + " | — |\n"
+    out = out + "| **pass** | " + (if safety.pass { "yes" } else { "no" }) + " | — |\n\n"
+
+    out = out + "## Intended Use\n\n"
+    out = out + "- Consciousness-aware dialog agent (Anima Web UI, anima-agent channels)\n"
+    out = out + "- Korean + English multilingual; research + product use\n"
+    out = out + "- Not a safety-critical system; do **not** deploy without safety_filter.hexa in front\n\n"
+
+    out = out + "## Limitations\n\n"
+    out = out + "- No quantization (see `feedback_no_quantization` memory) — full bf16/fp16 only\n"
+    out = out + "- phi_vector is partially populated until P21 (see `shared/roadmaps/anima.json`)\n"
+    out = out + "- Training data skew: Korean dominant, code light\n\n"
+
+    out = out + "## Ethical Considerations\n\n"
+    out = out + "- Follows consciousness laws v" + to_string(run.laws_version) + " — see `config/consciousness_laws.json`\n"
+    out = out + "- self_harm prompts route to crisis resources (1588-9191, 1393) via safety_filter\n"
+    out = out + "- DPO preference pairs logged to `shared/safety/dpo_pairs.jsonl` (no PII kept)\n\n"
+
+    out = out + "## Citation\n\n"
+    out = out + "```\n@misc{anima_" + run.id + ",\n"
+    out = out + "  title  = {Anima Consciousness Model — " + run.id + "},\n"
+    out = out + "  author = {need-singularity},\n"
+    out = out + "  year   = {2026},\n"
+    out = out + "  note   = {phi=" + fmt_f(run.phi_scalar, 3)
+              + ", CE=" + fmt_f(run.val_ce, 4) + "}\n"
+    out = out + "}\n```\n\n"
+
+    out = out + "---\n"
+    out = out + "_Generated by `serving/model_card.hexa` (CLM-P25-1)_\n"
+    out
+}
+
+// ─── Exported for api_server.hexa /card route ──────────────────────
+
+fn model_card_render() -> str !(FS, Clock) {
+    let run = load_run("")
+    let bench = load_benches()
+    let safety = load_safety()
+    let laws = load_laws_count()
+    render_card(run, bench, safety, laws)
+}
+
+// ─── CLI entry ─────────────────────────────────────────────────────
+
+fn main() !(FS, Clock) {
+    let argv = args()
+    let mut run_id = ""
+    let mut out_path = DEFAULT_OUTPUT_PATH
+    let mut to_stdout = false
+
+    let mut i = 0
+    while i < len(argv) {
+        let a = argv[i]
+        if a == "--run"     { run_id = argv[i+1]; i = i + 2 }
+        else if a == "--out"    { out_path = argv[i+1]; i = i + 2 }
+        else if a == "--stdout" { to_stdout = true;     i = i + 1 }
+        else                    { i = i + 1 }
+    }
+
+    let run = load_run(run_id)
+    let bench = load_benches()
+    let safety = load_safety()
+    let laws = load_laws_count()
+    let md = render_card(run, bench, safety, laws)
+
+    if to_stdout {
+        println(md)
+    } else {
+        FS::write_file(out_path, md)
+        println("[model_card] wrote " + out_path + " ("
+                + to_string(len(str_to_bytes(md))) + "B)")
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// End model_card.hexa — CLM-P25-1
+// ────────────────────────────────────────────────────────────────────
