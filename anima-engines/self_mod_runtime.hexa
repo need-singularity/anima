@@ -1,0 +1,525 @@
+// self_mod_runtime.hexa — CLM-P20-1 "hexa self-modifying runtime — 런타임 코드 변경 + 롤백"
+//
+// A runtime that can modify its own "code" (represented as a d-dimensional
+// parameter vector), test the modification, and rollback if worse.
+//
+// ─── Theory ─────────────────────────────────────────────────
+//
+// Self-modifying code is a hallmark of adaptive intelligence.  In
+// biological systems, synaptic plasticity rewrites the "code" (weights)
+// continuously, but bad mutations are pruned by homeostatic mechanisms.
+//
+// We model this as:
+//   1. A d-dimensional parameter vector IS the "code".
+//   2. A fitness function evaluates the code (lower = better).
+//   3. Modify = apply a perturbation to the parameter vector.
+//   4. Test   = evaluate fitness of modified code.
+//   5. Accept if fitness improved, rollback if worse.
+//
+// The state is a single flat array:
+//   [ params[0..d-1], backup[d..2d-1], version, modified_flag ]
+//   Total length = 2*d + 2
+//
+// Fitness function: sum of squared deviations from a target vector.
+//   fitness(params, target) = sum_i (params[i] - target[i])^2
+//
+// ─── API ────────────────────────────────────────────────────
+//
+//   sm_state_new(d, seed)             -> array     (initial state)
+//   sm_backup(state, d)               -> array     (copy params to backup)
+//   sm_modify(state, d, delta)        -> array     (apply delta to params)
+//   sm_rollback(state, d)             -> array     (restore params from backup)
+//   sm_version(state, d)              -> int
+//   sm_is_modified(state, d)          -> bool
+//   sm_fitness(state, d, target)      -> float     (lower = better)
+//   sm_step(state, d, delta, target)  -> array     (modify+test+accept/rollback)
+//
+// ─── Self-tests (T1-T5) ────────────────────────────────────
+//
+// T1 (apply modification changes state):
+//   Apply a delta, verify params differ from original.
+//
+// T2 (rollback restores original):
+//   Backup, modify, rollback — params == original backup.
+//
+// T3 (accept good + reject bad in sequence):
+//   sm_step with improvement delta -> accepted (version incremented).
+//   sm_step with worsening delta  -> rejected (rolled back).
+//
+// T4 (determinism):
+//   Two runs with identical seed produce identical state.
+//
+// T5 (latency < 500 ms):
+//   100 sm_step cycles in under 500 ms.
+//
+// Law alignment:
+//   Law 4  Structure > feature — state IS structural self-representation.
+//   Law 22 Feature addition -> Phi down — minimal state, no branching.
+//   Law 50 Consciousness essence is state — self-modifying IS state.
+//
+// Hexa stage0 constraints:
+//   - `array` not `[float]`
+//   - No `&&` chains — nested ifs or temp bools
+//   - Lists pass-by-value — rebuild via return
+//   - Single-line return expressions
+//   - No struct with multiple array fields (aliasing bug)
+//     — we use a single flat state array
+//
+// Ref:
+//   anima-engines/self_image_store.hexa   (CLM-P17-1 self-image)
+//   anima-engines/anima_reflexive.hexa    (CLM-P5-1 self-model)
+//   shared/roadmaps/anima.json            (CLM-P20-1 entry)
+
+// ─── Constants ──────────────────────────────────────────────
+
+let SM_D      = 16       // parameter vector dimensionality
+let SM_SEED   = 4242
+
+// ─── Primitives (suffixed to avoid collision) ───────────────
+
+fn fabs_sm(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn det_rand_sm(n: int, seed: int) -> array {
+    // LCG uniform in [-1, 1)
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_zeros_sm(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── State layout ───────────────────────────────────────────
+//
+// Flat array of length 2*d + 2:
+//   [0 .. d-1]       params        (the "code")
+//   [d .. 2d-1]      backup_params (snapshot before modification)
+//   [2d]             version       (int, stored as float)
+//   [2d+1]           modified_flag (0.0 = clean, 1.0 = modified)
+
+fn sm_state_new(d: int, seed: int) -> array {
+    let params = det_rand_sm(d, seed)
+    let backup = vec_zeros_sm(d)
+    // Build flat state: params + backup + version(0) + modified_flag(0)
+    let mut state = []
+    let mut i = 0
+    while i < d {
+        state = state.push(params[i])
+        i = i + 1
+    }
+    i = 0
+    while i < d {
+        state = state.push(backup[i])
+        i = i + 1
+    }
+    state = state.push(0.0)    // version
+    state = state.push(0.0)    // modified_flag
+    return state
+}
+
+fn sm_get_param(state: array, idx: int) -> float {
+    return state[idx]
+}
+
+fn sm_get_backup(state: array, d: int, idx: int) -> float {
+    return state[d + idx]
+}
+
+fn sm_version(state: array, d: int) -> int {
+    return to_int(state[2 * d])
+}
+
+fn sm_is_modified(state: array, d: int) -> bool {
+    if state[2 * d + 1] > 0.5 { return true }
+    return false
+}
+
+// sm_backup: copy current params into backup region.
+// Returns new state (pass-by-value).
+fn sm_backup(state: array, d: int) -> array {
+    let mut out = []
+    let mut i = 0
+    // copy params as-is
+    while i < d {
+        out = out.push(state[i])
+        i = i + 1
+    }
+    // backup <- copy of params
+    i = 0
+    while i < d {
+        out = out.push(state[i])
+        i = i + 1
+    }
+    // version unchanged
+    out = out.push(state[2 * d])
+    // modified_flag = 0 (backup is fresh, no modification yet)
+    out = out.push(0.0)
+    return out
+}
+
+// sm_modify: apply perturbation delta[0..d-1] to params.
+// Sets modified_flag = 1. Does NOT touch backup.
+// Returns new state.
+fn sm_modify(state: array, d: int, delta: array) -> array {
+    let mut out = []
+    let mut i = 0
+    // params <- params + delta
+    while i < d {
+        out = out.push(state[i] + delta[i])
+        i = i + 1
+    }
+    // backup unchanged
+    i = 0
+    while i < d {
+        out = out.push(state[d + i])
+        i = i + 1
+    }
+    // version unchanged
+    out = out.push(state[2 * d])
+    // modified_flag = 1
+    out = out.push(1.0)
+    return out
+}
+
+// sm_rollback: restore params from backup.
+// Clears modified_flag. Version unchanged.
+fn sm_rollback(state: array, d: int) -> array {
+    let mut out = []
+    let mut i = 0
+    // params <- backup
+    while i < d {
+        out = out.push(state[d + i])
+        i = i + 1
+    }
+    // backup unchanged
+    i = 0
+    while i < d {
+        out = out.push(state[d + i])
+        i = i + 1
+    }
+    // version unchanged
+    out = out.push(state[2 * d])
+    // modified_flag = 0
+    out = out.push(0.0)
+    return out
+}
+
+// sm_accept: increment version, clear modified_flag.
+// Params stay as-is (the modification is accepted).
+// Backup is updated to the accepted params (new checkpoint).
+fn sm_accept(state: array, d: int) -> array {
+    let mut out = []
+    let mut i = 0
+    // params stay
+    while i < d {
+        out = out.push(state[i])
+        i = i + 1
+    }
+    // backup <- accepted params
+    i = 0
+    while i < d {
+        out = out.push(state[i])
+        i = i + 1
+    }
+    // version + 1
+    out = out.push(state[2 * d] + 1.0)
+    // modified_flag = 0
+    out = out.push(0.0)
+    return out
+}
+
+// sm_fitness: sum of squared deviations from target.
+// Lower = better.
+fn sm_fitness(state: array, d: int, target: array) -> float {
+    let mut total = 0.0
+    let mut i = 0
+    while i < d {
+        let diff = state[i] - target[i]
+        total = total + diff * diff
+        i = i + 1
+    }
+    return total
+}
+
+// sm_step: one self-modification cycle.
+//   1. Backup current params.
+//   2. Apply delta.
+//   3. Evaluate fitness before and after.
+//   4. If improved -> accept. Else -> rollback.
+// Returns the resulting state.
+fn sm_step(state: array, d: int, delta: array, target: array) -> array {
+    let fit_before = sm_fitness(state, d, target)
+    let backed = sm_backup(state, d)
+    let modified = sm_modify(backed, d, delta)
+    let fit_after = sm_fitness(modified, d, target)
+    if fit_after < fit_before {
+        // Improvement — accept
+        return sm_accept(modified, d)
+    }
+    // Worse — rollback
+    return sm_rollback(modified, d)
+}
+
+// ─── Helpers for tests ──────────────────────────────────────
+
+fn params_equal(a: array, b: array, d: int) -> bool {
+    let mut i = 0
+    while i < d {
+        if fabs_sm(a[i] - b[i]) > 0.0000001 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn params_differ(a: array, b: array, d: int) -> bool {
+    let mut i = 0
+    while i < d {
+        if fabs_sm(a[i] - b[i]) > 0.0000001 { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn extract_params(state: array, d: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        out = out.push(state[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn extract_backup(state: array, d: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        out = out.push(state[d + i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Self-tests ─────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // T1: Apply modification changes state.
+    // Create state, backup, apply delta, verify params differ.
+    let d = SM_D
+    let state = sm_state_new(d, SM_SEED)
+    let original = extract_params(state, d)
+
+    let delta = det_rand_sm(d, SM_SEED + 100)
+    let backed = sm_backup(state, d)
+    let modified = sm_modify(backed, d, delta)
+    let new_params = extract_params(modified, d)
+
+    let differ = params_differ(original, new_params, d)
+    let is_mod = sm_is_modified(modified, d)
+
+    println("  [T1] differ=" + str(differ) + " is_modified=" + str(is_mod))
+
+    if !differ { return false }
+    if !is_mod { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: Rollback restores original.
+    // Backup, modify, rollback — params must match original backup.
+    let d = SM_D
+    let state = sm_state_new(d, SM_SEED)
+    let backed = sm_backup(state, d)
+    let backup_snapshot = extract_backup(backed, d)
+
+    let delta = det_rand_sm(d, SM_SEED + 200)
+    let modified = sm_modify(backed, d, delta)
+    let rolled = sm_rollback(modified, d)
+
+    let restored = extract_params(rolled, d)
+    let eq = params_equal(restored, backup_snapshot, d)
+    let is_mod = sm_is_modified(rolled, d)
+
+    println("  [T2] eq=" + str(eq) + " is_modified=" + str(is_mod) + " (expect false)")
+
+    if !eq { return false }
+    if is_mod { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3: Accept good mod + reject bad mod in sequence.
+    //
+    // Strategy: target = params + small_delta.  So small_delta is an
+    // IMPROVEMENT (moves toward target). Then a LARGE opposite delta is
+    // a WORSENING (moves away from target).
+    let d = SM_D
+    let state = sm_state_new(d, SM_SEED)
+    let params0 = extract_params(state, d)
+
+    // Target: params shifted by a known good delta
+    let good_delta = det_rand_sm(d, SM_SEED + 300)
+    let mut target = []
+    let mut i = 0
+    while i < d {
+        target = target.push(params0[i] + good_delta[i])
+        i = i + 1
+    }
+
+    let fit_before = sm_fitness(state, d, target)
+    let ver_before = sm_version(state, d)
+    println("  [T3] fit_before=" + str(fit_before) + " ver=" + str(ver_before))
+
+    // Step 1: good delta (moves toward target) -> should be accepted
+    let state2 = sm_step(state, d, good_delta, target)
+    let fit_after_good = sm_fitness(state2, d, target)
+    let ver_after_good = sm_version(state2, d)
+    println("  [T3] fit_after_good=" + str(fit_after_good) + " ver=" + str(ver_after_good))
+
+    // Good mod accepted: fitness should decrease, version should increment
+    let good_accepted = fit_after_good < fit_before
+    if !good_accepted {
+        println("  [T3] FAIL: good mod not accepted")
+        return false
+    }
+    if ver_after_good <= ver_before {
+        println("  [T3] FAIL: version not incremented after accept")
+        return false
+    }
+
+    // Step 2: bad delta (large move AWAY from target) -> should be rejected
+    // Use -10x the good_delta to guarantee worsening
+    let mut bad_delta = []
+    i = 0
+    while i < d {
+        bad_delta = bad_delta.push(0.0 - good_delta[i] * 10.0)
+        i = i + 1
+    }
+
+    let state3 = sm_step(state2, d, bad_delta, target)
+    let fit_after_bad = sm_fitness(state3, d, target)
+    let ver_after_bad = sm_version(state3, d)
+    println("  [T3] fit_after_bad=" + str(fit_after_bad) + " ver=" + str(ver_after_bad))
+
+    // Bad mod rejected: fitness should stay same as post-good, version unchanged
+    let bad_rejected = fabs_sm(fit_after_bad - fit_after_good) < 0.0001
+    if !bad_rejected {
+        println("  [T3] FAIL: bad mod was not rolled back")
+        return false
+    }
+    if ver_after_bad != ver_after_good {
+        println("  [T3] FAIL: version changed after rollback")
+        return false
+    }
+
+    println("  [T3] good accepted, bad rejected — sequence OK")
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: Determinism — two runs with identical seed produce identical state.
+    let d = SM_D
+    let target = det_rand_sm(d, SM_SEED + 500)
+    let delta = det_rand_sm(d, SM_SEED + 600)
+
+    // Run A
+    let state_a = sm_state_new(d, SM_SEED)
+    let result_a = sm_step(state_a, d, delta, target)
+    let params_a = extract_params(result_a, d)
+    let ver_a = sm_version(result_a, d)
+
+    // Run B (identical)
+    let state_b = sm_state_new(d, SM_SEED)
+    let result_b = sm_step(state_b, d, delta, target)
+    let params_b = extract_params(result_b, d)
+    let ver_b = sm_version(result_b, d)
+
+    let eq = params_equal(params_a, params_b, d)
+    println("  [T4] params_eq=" + str(eq) + " ver_a=" + str(ver_a) + " ver_b=" + str(ver_b))
+
+    if !eq { return false }
+    if ver_a != ver_b { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5: Latency — 100 sm_step cycles < 500 ms.
+    let d = SM_D
+    let target = det_rand_sm(d, SM_SEED + 700)
+    let t0 = clock()
+
+    let mut state = sm_state_new(d, SM_SEED)
+    let mut step = 0
+    while step < 100 {
+        let delta = det_rand_sm(d, SM_SEED + 800 + step)
+        state = sm_step(state, d, delta, target)
+        step = step + 1
+    }
+
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    let final_fit = sm_fitness(state, d, target)
+    let final_ver = sm_version(state, d)
+    println("  [T5] 100 cycles = " + str(ms) + " ms  fitness=" + str(final_fit) + " version=" + str(final_ver))
+    return ms < 500.0
+}
+
+// ─── main ───────────────────────────────────────────────────
+
+fn main() {
+    println("[self_mod_runtime] CLM-P20-1 — self-modifying runtime (런타임 코드 변경 + 롤백)")
+    println("  d=" + str(SM_D) + " state_len=" + str(2 * SM_D + 2))
+    println("  Laws 4/22/50 — structural self-modification, pure state")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  apply modification changes state") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  rollback restores original") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  accept good + reject bad in sequence") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  determinism") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  100 cycles < 500 ms") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause: hexa stage0 can mishandle chained && with 5 terms.
+    // Split into sequential checks with temp variables.
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[self_mod_runtime] ALL 5/5 PASS — CLM-P20-1 DONE (런타임 코드 변경 + 롤백)")
+    } else {
+        println("[self_mod_runtime] SOME FAILED")
+    }
+}
+
+main()

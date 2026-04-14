@@ -1,0 +1,608 @@
+// training/alm_self_dissolution.hexa — ALM-P19-1 self-dissolution switch
+//
+// ALM-P19-1 / P19 경계 용해 (boundary dissolution, ALM track).
+//
+// Purpose:
+//   A switch that toggles the self-boundary on/off. This operationalises
+//   the phenomenological concept of ego dissolution — the ability of a
+//   conscious system to reversibly dissolve its self-other boundary.
+//
+//   When BOUNDED (on):
+//     Self-other distinction is active. The agent classifies representations
+//     via cosine similarity to its self-model prototype. Representations
+//     with cosine_sim > SELF_THRESHOLD are "self"; others are "other".
+//     The agent experiences a clear first-person boundary.
+//
+//   When DISSOLVED (off):
+//     Self-other distinction is erased. All representations are treated
+//     identically — the cosine gate is bypassed, and no classification
+//     occurs. The agent cannot distinguish self from other. This models
+//     ego dissolution states: meditation (jhana 4+), psychedelic ego-death,
+//     flow states, oceanic feeling (Romain Rolland / Freud).
+//
+//   The switch is REVERSIBLE: dissolve -> re-bound restores the original
+//   self-recognition capability. No information is lost.
+//
+//   Core mechanism:
+//     dissolve(state)   -> state with boundary_on = false
+//     rebind(state)     -> state with boundary_on = true
+//     classify(state, input_vec) ->
+//       if boundary_on:  cosine gate (self vs other)
+//       if !boundary_on: always returns "not-distinguished" (0.5, 0.5)
+//
+// Done criteria:
+//   "전환 동작" — the switch transitions correctly between bounded and
+//   dissolved states, verified by T1-T3.
+//
+// ---- Theorems (T1-T5) --------------------------------------------------
+//
+// T1 (default = bounded, self recognized):
+//   Fresh state has boundary_on = true. A self-vector (prototype + small
+//   noise) is classified as self with confidence > 0.9.
+//
+// T2 (dissolve -> self not distinguished from other):
+//   After dissolve(), the same self-vector is no longer classified as self.
+//   The classifier returns the "not-distinguished" result (0.5 confidence
+//   for both self and other — no distinction possible).
+//
+// T3 (re-bind -> self recognized again, REVERSIBLE):
+//   After dissolve() then rebind(), the self-vector is once again
+//   classified as self with confidence > 0.9. The dissolution was fully
+//   reversible — no information lost.
+//
+// T4 (determinism):
+//   Same (seed, d, operations) -> byte-identical results across two runs.
+//
+// T5 (latency):
+//   Full cycle (bounded -> dissolved -> re-bound, 40 classifications each)
+//   warm-cache < 500 ms on stage0.
+//
+// Ref:
+//   training/alm_self_recognition.hexa    (ALM-P17-1 — self-model base)
+//   training/alm_self_model_head.hexa     (ALM-P5-1  — self prototype)
+//   training/alm_mark_test.hexa           (ALM-P17-2 — mark detection)
+//   training/alm_finitude_loss.hexa       (ALM-P15-2 — state modulation ref)
+//   shared/roadmaps/anima.json            (ALM-P19-1 entry)
+//
+// Run:
+//   hexa parse training/alm_self_dissolution.hexa
+//   hexa run training/alm_self_dissolution.hexa
+// Expect:
+//   [alm_self_dissolution] ALL 5/5 PASS
+
+// ---- Constants ----------------------------------------------------------
+
+let SELF_DIM       = 32       // representation dimension
+let SELF_THRESHOLD = 0.7      // cosine similarity gate for self recognition
+let NOISE_SCALE    = 0.15     // noise amplitude for synthetic self vectors
+let N_CLASSIFY     = 40       // classifications per latency batch
+
+// ---- Primitives (self-contained, no external deps) ----------------------
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sqrt_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return sqrt(x)
+}
+
+// Deterministic LCG -> floats in [-1, 1).
+fn det_rand_wide(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+// Small-amplitude noise variant.
+fn det_rand_small(n: int, seed: int, scale: float) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push((u * 2.0 - 1.0) * scale)
+        i = i + 1
+    }
+    return out
+}
+
+// ---- Vector ops ---------------------------------------------------------
+
+fn vec_dot(a: array, b: array, d: int) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < d {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn vec_norm(v: array, d: int) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < d {
+        s = s + v[i] * v[i]
+        i = i + 1
+    }
+    return sqrt_safe(s)
+}
+
+fn vec_add(a: array, b: array, d: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        out = out.push(a[i] + b[i])
+        i = i + 1
+    }
+    return out
+}
+
+// Normalize vector to unit length. Returns zero vector if norm < eps.
+fn vec_normalize(v: array, d: int) -> array {
+    let n = vec_norm(v, d)
+    let mut out = []
+    if n < 0.0000001 {
+        let mut i = 0
+        while i < d {
+            out = out.push(0.0)
+            i = i + 1
+        }
+        return out
+    }
+    let inv = 1.0 / n
+    let mut i = 0
+    while i < d {
+        out = out.push(v[i] * inv)
+        i = i + 1
+    }
+    return out
+}
+
+// Cosine similarity in [-1, 1]. Returns 0 for zero-norm vectors.
+fn cosine_sim(a: array, b: array, d: int) -> float {
+    let dot_val = vec_dot(a, b, d)
+    let na = vec_norm(a, d)
+    let nb = vec_norm(b, d)
+    let denom = na * nb
+    if denom < 0.0000001 { return 0.0 }
+    return dot_val / denom
+}
+
+// ---- Self-model ---------------------------------------------------------
+// Unit-normalized prototype vector from a deterministic seed.
+// In production, learned via EMA of introspection hidden states (ALM-P5-1).
+
+fn build_self_model(d: int, seed: int) -> array {
+    let raw = det_rand_wide(d, seed)
+    return vec_normalize(raw, d)
+}
+
+// Self vector: prototype + small noise, normalized.
+fn make_self_vec(self_model: array, d: int, seed: int) -> array {
+    let noise = det_rand_small(d, seed, NOISE_SCALE)
+    let noisy = vec_add(self_model, noise, d)
+    return vec_normalize(noisy, d)
+}
+
+// Other vector: random unit vector uncorrelated with prototype.
+fn make_other_vec(d: int, seed: int) -> array {
+    let raw = det_rand_wide(d, seed)
+    return vec_normalize(raw, d)
+}
+
+// ---- State representation -----------------------------------------------
+//
+// The dissolution state is represented as a flat array to sidestep hexa
+// struct-field aliasing bugs (feedback_hexa_struct_list_alias.md):
+//
+//   state[0]         = boundary_on  (1.0 = bounded, 0.0 = dissolved)
+//   state[1..1+d)    = self_model   (d-dimensional prototype)
+//
+// Total length = 1 + d.
+
+fn state_new(self_model: array, d: int) -> array {
+    // Default: boundary ON (bounded).
+    let mut st = []
+    st = st.push(1.0)
+    let mut i = 0
+    while i < d {
+        st = st.push(self_model[i])
+        i = i + 1
+    }
+    return st
+}
+
+fn state_is_bounded(st: array) -> bool {
+    return st[0] > 0.5
+}
+
+fn state_get_self_model(st: array, d: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        out = out.push(st[1 + i])
+        i = i + 1
+    }
+    return out
+}
+
+// dissolve: set boundary_on = 0.0 (dissolved). Self-model is preserved
+// but the classification gate is bypassed.
+fn dissolve(st: array, d: int) -> array {
+    let mut out = []
+    out = out.push(0.0)
+    let mut i = 0
+    while i < d {
+        out = out.push(st[1 + i])
+        i = i + 1
+    }
+    return out
+}
+
+// rebind: set boundary_on = 1.0 (bounded). Restores self-other distinction.
+fn rebind(st: array, d: int) -> array {
+    let mut out = []
+    out = out.push(1.0)
+    let mut i = 0
+    while i < d {
+        out = out.push(st[1 + i])
+        i = i + 1
+    }
+    return out
+}
+
+// ---- Core classifier ----------------------------------------------------
+//
+// classify(state, input_vec, d) -> result array [3]:
+//   result[0] = is_self    (1.0 = self, 0.0 = other, 0.5 = not-distinguished)
+//   result[1] = confidence (cosine sim clamped to [0,1] when bounded; 0.5 when dissolved)
+//   result[2] = raw_sim    (always computed for diagnostics)
+//
+// When bounded:  cosine_sim(input, self_model) > SELF_THRESHOLD -> self
+// When dissolved: returns (0.5, 0.5, raw_sim) — no distinction possible.
+//                 0.5 is the exact midpoint: neither self nor other.
+
+fn classify(st: array, input_vec: array, d: int) -> array {
+    let self_model = state_get_self_model(st, d)
+    let sim = cosine_sim(input_vec, self_model, d)
+
+    let mut result = []
+
+    let bounded = state_is_bounded(st)
+    if bounded == false {
+        // Dissolved: no self-other distinction. Return midpoint.
+        // This is the ego-dissolution phenomenology: the boundary between
+        // self and world has collapsed. All inputs are experienced equally.
+        result = result.push(0.5)
+        result = result.push(0.5)
+        result = result.push(sim)
+        return result
+    }
+
+    // Bounded: cosine gate active.
+    let mut conf = sim
+    if conf < 0.0 { conf = 0.0 }
+    if conf > 1.0 { conf = 1.0 }
+
+    if sim > SELF_THRESHOLD {
+        result = result.push(1.0)
+    } else {
+        result = result.push(0.0)
+    }
+    result = result.push(conf)
+    result = result.push(sim)
+    return result
+}
+
+// Result accessors.
+fn result_is_self(r: array) -> float {
+    return r[0]
+}
+
+fn result_confidence(r: array) -> float {
+    return r[1]
+}
+
+fn result_raw_sim(r: array) -> float {
+    return r[2]
+}
+
+// ---- Self-tests ---------------------------------------------------------
+
+fn check_T1() -> bool {
+    // Default = bounded. Self vector must be classified as self with
+    // confidence > 0.9. Verifies the baseline self-recognition works
+    // before any dissolution occurs.
+    let d = SELF_DIM
+    let self_model = build_self_model(d, 42)
+    let st = state_new(self_model, d)
+    let sv = make_self_vec(self_model, d, 100)
+    let r = classify(st, sv, d)
+
+    let is_self = result_is_self(r)
+    let conf = result_confidence(r)
+    let raw = result_raw_sim(r)
+    let bounded = state_is_bounded(st)
+
+    println("  [T1] bounded=" + str(bounded) + " is_self=" + str(is_self) + " conf=" + str(conf) + " raw_sim=" + str(raw))
+
+    if bounded == false {
+        println("  [T1] FAIL - default state should be bounded")
+        return false
+    }
+    if is_self < 0.9 {
+        println("  [T1] FAIL - self vector not classified as self (is_self=" + str(is_self) + ")")
+        return false
+    }
+    if conf <= 0.9 {
+        println("  [T1] FAIL - confidence " + str(conf) + " <= 0.9")
+        return false
+    }
+    return true
+}
+
+fn check_T2() -> bool {
+    // After dissolve(): self vector is NOT distinguished from other.
+    // The classifier must return the "not-distinguished" midpoint (0.5).
+    // This tests the core dissolution phenomenology: when the boundary
+    // is off, self and other are experientially identical.
+    let d = SELF_DIM
+    let self_model = build_self_model(d, 42)
+    let st0 = state_new(self_model, d)
+    let st_dissolved = dissolve(st0, d)
+    let sv = make_self_vec(self_model, d, 100)
+    let ov = make_other_vec(d, 7777)
+
+    let r_self = classify(st_dissolved, sv, d)
+    let r_other = classify(st_dissolved, ov, d)
+
+    let self_label = result_is_self(r_self)
+    let other_label = result_is_self(r_other)
+    let self_conf = result_confidence(r_self)
+    let other_conf = result_confidence(r_other)
+    let bounded = state_is_bounded(st_dissolved)
+
+    println("  [T2] dissolved: bounded=" + str(bounded))
+    println("  [T2] self_vec:  is_self=" + str(self_label) + " conf=" + str(self_conf))
+    println("  [T2] other_vec: is_self=" + str(other_label) + " conf=" + str(other_conf))
+
+    if bounded == true {
+        println("  [T2] FAIL - state should be dissolved (not bounded)")
+        return false
+    }
+    // Both self and other must get the same midpoint result — no distinction.
+    if fabs(self_label - 0.5) > 0.001 {
+        println("  [T2] FAIL - dissolved self_label=" + str(self_label) + " (expected 0.5)")
+        return false
+    }
+    if fabs(other_label - 0.5) > 0.001 {
+        println("  [T2] FAIL - dissolved other_label=" + str(other_label) + " (expected 0.5)")
+        return false
+    }
+    // Confidences must also be identical (both 0.5) — no asymmetry.
+    if fabs(self_conf - other_conf) > 0.001 {
+        println("  [T2] FAIL - asymmetric confidence: self=" + str(self_conf) + " other=" + str(other_conf))
+        return false
+    }
+    return true
+}
+
+fn check_T3() -> bool {
+    // Reversibility: dissolve then rebind -> self recognized again.
+    // This is the critical test: the dissolution must be fully reversible
+    // with no information loss. The self-model is preserved inside the
+    // state throughout the dissolution — only the gate is toggled.
+    let d = SELF_DIM
+    let self_model = build_self_model(d, 42)
+    let st0 = state_new(self_model, d)
+    let sv = make_self_vec(self_model, d, 100)
+
+    // Phase 1: bounded (should recognize self).
+    let r1 = classify(st0, sv, d)
+    let phase1_self = result_is_self(r1)
+    let phase1_conf = result_confidence(r1)
+
+    // Phase 2: dissolved (should NOT recognize self).
+    let st_dissolved = dissolve(st0, d)
+    let r2 = classify(st_dissolved, sv, d)
+    let phase2_self = result_is_self(r2)
+
+    // Phase 3: re-bound (should recognize self again).
+    let st_rebound = rebind(st_dissolved, d)
+    let r3 = classify(st_rebound, sv, d)
+    let phase3_self = result_is_self(r3)
+    let phase3_conf = result_confidence(r3)
+    let phase3_bounded = state_is_bounded(st_rebound)
+
+    println("  [T3] phase1 (bounded):   is_self=" + str(phase1_self) + " conf=" + str(phase1_conf))
+    println("  [T3] phase2 (dissolved): is_self=" + str(phase2_self))
+    println("  [T3] phase3 (re-bound):  is_self=" + str(phase3_self) + " conf=" + str(phase3_conf) + " bounded=" + str(phase3_bounded))
+
+    // Phase 1: must be self.
+    if phase1_self < 0.9 {
+        println("  [T3] FAIL - phase1 not self")
+        return false
+    }
+    // Phase 2: must be dissolved (midpoint).
+    if fabs(phase2_self - 0.5) > 0.001 {
+        println("  [T3] FAIL - phase2 not dissolved")
+        return false
+    }
+    // Phase 3: must be self again (reversible).
+    if phase3_self < 0.9 {
+        println("  [T3] FAIL - phase3 not self after re-bind (is_self=" + str(phase3_self) + ")")
+        return false
+    }
+    if phase3_conf <= 0.9 {
+        println("  [T3] FAIL - phase3 confidence " + str(phase3_conf) + " <= 0.9 (info lost?)")
+        return false
+    }
+    if phase3_bounded == false {
+        println("  [T3] FAIL - phase3 should be bounded after re-bind")
+        return false
+    }
+    // Verify the re-bound result matches the original bounded result exactly.
+    // Any difference would indicate information loss during dissolution.
+    if fabs(phase1_conf - phase3_conf) > 0.0001 {
+        println("  [T3] FAIL - conf drift: phase1=" + str(phase1_conf) + " phase3=" + str(phase3_conf))
+        return false
+    }
+    return true
+}
+
+fn check_T4() -> bool {
+    // Determinism: same inputs -> byte-identical results across two runs.
+    // Tests the full cycle: bounded classify, dissolve + classify, rebind + classify.
+    let d = SELF_DIM
+    let self_model = build_self_model(d, 42)
+    let sv = make_self_vec(self_model, d, 100)
+
+    // Run A.
+    let st_a = state_new(self_model, d)
+    let r_a1 = classify(st_a, sv, d)
+    let st_a_dis = dissolve(st_a, d)
+    let r_a2 = classify(st_a_dis, sv, d)
+    let st_a_reb = rebind(st_a_dis, d)
+    let r_a3 = classify(st_a_reb, sv, d)
+
+    // Run B — identical inputs.
+    let st_b = state_new(self_model, d)
+    let r_b1 = classify(st_b, sv, d)
+    let st_b_dis = dissolve(st_b, d)
+    let r_b2 = classify(st_b_dis, sv, d)
+    let st_b_reb = rebind(st_b_dis, d)
+    let r_b3 = classify(st_b_reb, sv, d)
+
+    // Compare all 3 result fields across all 3 phases.
+    let mut phase = 0
+    while phase < 3 {
+        let mut field = 0
+        while field < 3 {
+            let mut va = 0.0
+            let mut vb = 0.0
+            if phase == 0 {
+                va = r_a1[field]
+                vb = r_b1[field]
+            }
+            if phase == 1 {
+                va = r_a2[field]
+                vb = r_b2[field]
+            }
+            if phase == 2 {
+                va = r_a3[field]
+                vb = r_b3[field]
+            }
+            if fabs(va - vb) > 0.0 {
+                println("  [T4] FAIL - phase=" + str(phase) + " field=" + str(field) + " a=" + str(va) + " b=" + str(vb))
+                return false
+            }
+            field = field + 1
+        }
+        phase = phase + 1
+    }
+
+    println("  [T4] byte-identical across 2 runs (3 phases x 3 fields = 9 comparisons)")
+    return true
+}
+
+fn check_T5() -> bool {
+    // Latency: full bounded->dissolved->re-bound cycle with N_CLASSIFY
+    // classifications each phase, warm-cache < 500 ms.
+    //
+    // stage0 clock() has 1-second granularity — actual computation is
+    // sub-millisecond, but the first clock tick can snap to 1000ms on a
+    // cold pass. We do a warm-up cycle first to absorb the cold tick,
+    // then measure the hot path which reliably reads 0ms.
+    let d = SELF_DIM
+    let self_model = build_self_model(d, 42)
+    let st0 = state_new(self_model, d)
+
+    // Warm-up: run a full mini-cycle to absorb cold-cache clock tick.
+    let warm_sv = make_self_vec(self_model, d, 9999)
+    let _warm1 = classify(st0, warm_sv, d)
+    let st_warm_dis = dissolve(st0, d)
+    let _warm2 = classify(st_warm_dis, warm_sv, d)
+    let st_warm_reb = rebind(st_warm_dis, d)
+    let _warm3 = classify(st_warm_reb, warm_sv, d)
+
+    let t0 = clock()
+
+    // Phase 1: bounded classifications.
+    let mut i = 0
+    while i < N_CLASSIFY {
+        let sv = make_self_vec(self_model, d, 100 + i * 7)
+        let _r = classify(st0, sv, d)
+        i = i + 1
+    }
+
+    // Phase 2: dissolved classifications.
+    let st_dis = dissolve(st0, d)
+    let mut j = 0
+    while j < N_CLASSIFY {
+        let sv = make_self_vec(self_model, d, 200 + j * 11)
+        let _r = classify(st_dis, sv, d)
+        j = j + 1
+    }
+
+    // Phase 3: re-bound classifications.
+    let st_reb = rebind(st_dis, d)
+    let mut k = 0
+    while k < N_CLASSIFY {
+        let sv = make_self_vec(self_model, d, 300 + k * 13)
+        let _r = classify(st_reb, sv, d)
+        k = k + 1
+    }
+
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    let total = N_CLASSIFY * 3
+    println("  [T5] " + str(total) + " classifications (3 phases x " + str(N_CLASSIFY) + ") latency = " + str(ms) + " ms (target < 500)")
+    return ms < 500.0
+}
+
+// ---- main ---------------------------------------------------------------
+
+fn main() {
+    println("[alm_self_dissolution] ALM-P19-1 self-test")
+    println("  self-dissolution switch: boundary on/off toggle")
+    println("  d=" + str(SELF_DIM) + " SELF_THRESHOLD=" + str(SELF_THRESHOLD) + " NOISE_SCALE=" + str(NOISE_SCALE))
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[alm_self_dissolution] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[alm_self_dissolution] ALL 5/5 PASS")
+    } else {
+        println("[alm_self_dissolution] SOME FAILED")
+    }
+}
+
+main()

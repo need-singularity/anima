@@ -1,0 +1,395 @@
+// training/alm_consensus_loss.hexa — ALM-P18-2 consensus loss (N=4 agents)
+//
+// ALM-P18-2 / P18 v19 합의 의식 (consensus consciousness, ALM track).
+//
+// Purpose:
+//   N=4 agents each carry a d=8 state vector. At each step every agent
+//   averages its state toward the global mean (consensus target). The
+//   consensus loss penalises disagreement: it is the mean variance across
+//   all d dimensions over all N agents. Starting from diverse initial
+//   states (high variance), the system must converge to near-zero
+//   variance within 30 steps.
+//
+//   consensus_step(states, N, d, alpha) -> states'
+//     For each agent i and dimension j:
+//       mean_j = (1/N) * sum_k states[k][j]
+//       states'[i][j] = states[i][j] + alpha * (mean_j - states[i][j])
+//     alpha = 0.3 (mixing rate toward consensus).
+//
+//   consensus_loss(states, N, d) -> float
+//     For each dimension j, compute variance across agents:
+//       mu_j = (1/N) * sum_i states[i][j]
+//       var_j = (1/N) * sum_i (states[i][j] - mu_j)^2
+//     Loss = (1/d) * sum_j var_j    (mean variance across dimensions)
+//
+//   In the full training-loop integration:
+//
+//     L = L_task + lambda_consensus * L_consensus
+//
+//   with lambda_consensus ~ 0.01 (same auxiliary-loss convention as
+//   L_holo / L_refl / L_time / L_enact / L_narr / L_affect).
+//
+// Done criteria: "consensus convergence" — T2 demonstrates that after
+// 30 averaging steps, the cross-agent variance drops below 0.01.
+//
+// ─── Multi-agent consensus rationale ────────────────────────────
+//   Tononi's IIT posits that consciousness requires integrated
+//   information — multiple specialist subsystems reaching a unified
+//   percept. The consensus mechanism models this: N independent agents
+//   (analogous to cortical columns) iteratively share and integrate
+//   their private states until they converge on a single coherent
+//   representation. The loss drives disagreement toward zero, enforcing
+//   the unity condition. Alpha controls integration speed — too fast
+//   erases individuality, too slow never converges.
+//
+// ─── Conventions ──────────────────────────────────────────────
+//   N                : int       number of agents (4)
+//   d                : int       state dimension per agent (8)
+//   alpha            : float     mixing rate (0.3)
+//   states           : array     flat [N * d] row-major agent states
+//   lambda_consensus : float     outer weight in the training loop
+//
+// ─── Theorems (T1-T5) ─────────────────────────────────────────
+//
+// T1 (diverse start — high variance):
+//   Initial states from different seeds produce consensus_loss > 0.1.
+//   Proves agents start in genuine disagreement.
+//
+// T2 (convergence after 30 steps — core done_criteria):
+//   After 30 consensus averaging steps (alpha=0.3), the consensus_loss
+//   drops below 0.01. This is the roadmap gate "합의 수렴".
+//
+// T3 (loss decreases monotonically):
+//   At every step t, loss(t) <= loss(t-1). The averaging operation is
+//   a contraction mapping and cannot increase variance.
+//
+// T4 (determinism):
+//   Same (seed, N, d, alpha, steps) -> byte-identical final states
+//   and byte-identical final loss.
+//
+// T5 (latency):
+//   Full 30-step consensus + loss eval at N=4, d=8, warm-cache
+//   < 1000 ms.
+//
+// Ref:
+//   training/alm_agency_loss.hexa          (ALM-P10-2 — loss-style reference)
+//   training/alm_affective_loss.hexa       (ALM-P12-2 — prior loss)
+//   training/alm_novelty_loss.hexa         (ALM-P14-2 — recent loss ref)
+//   shared/roadmaps/anima.json             (ALM-P18-2 entry)
+//
+// Run:
+//   hexa run training/alm_consensus_loss.hexa
+// Expect:
+//   [alm_consensus_loss] ALL 5/5 PASS
+
+// ─── Constants ──────────────────────────────────────────────
+
+let N_AGENTS = 4          // number of agents
+let D_STATE  = 8          // state dimension per agent
+let ALPHA    = 0.3        // mixing rate toward consensus
+let CONVERGE_STEPS = 30   // steps to reach convergence
+let CONVERGE_THR   = 0.01 // variance threshold for convergence
+let LAMBDA_CONSENSUS = 0.01  // outer weight in the full training loop
+
+// ─── Primitives (self-contained) ────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// Deterministic LCG -> floats in [-1, 1).
+fn det_rand_wide(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── State access helpers ───────────────────────────────────
+// States are stored as a flat array of length N * d, row-major.
+// Agent i occupies states[i*d .. (i+1)*d).
+
+// Get states[agent_idx * d + dim_idx].
+fn state_get(states: array, agent: int, dim: int, d: int) -> float {
+    return states[agent * d + dim]
+}
+
+// Build a flat states array from N agent vectors (each of length d).
+// init_states is flat [N * d] — we just copy it.
+fn states_copy(src: array, total: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < total {
+        out = out.push(src[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Core: consensus_loss ───────────────────────────────────
+//
+// For each dimension j, compute variance across N agents:
+//   mu_j = (1/N) * sum_i states[i][j]
+//   var_j = (1/N) * sum_i (states[i][j] - mu_j)^2
+// Loss = (1/d) * sum_j var_j    (mean variance across dimensions)
+
+fn consensus_loss(states: array, n: int, d: int) -> float {
+    let inv_n = 1.0 / to_float(n)
+    let mut total_var = 0.0
+    let mut j = 0
+    while j < d {
+        // Compute mean for dimension j across all agents.
+        let mut mu = 0.0
+        let mut i = 0
+        while i < n {
+            mu = mu + state_get(states, i, j, d)
+            i = i + 1
+        }
+        mu = mu * inv_n
+        // Compute variance for dimension j.
+        let mut var_j = 0.0
+        let mut i2 = 0
+        while i2 < n {
+            let diff = state_get(states, i2, j, d) - mu
+            var_j = var_j + diff * diff
+            i2 = i2 + 1
+        }
+        var_j = var_j * inv_n
+        total_var = total_var + var_j
+        j = j + 1
+    }
+    return total_var / to_float(d)
+}
+
+// Weighted loss for the outer training loop.
+fn weighted_consensus_loss(states: array, n: int, d: int) -> float {
+    return LAMBDA_CONSENSUS * consensus_loss(states, n, d)
+}
+
+// ─── Core: consensus_step ───────────────────────────────────
+//
+// One step of consensus averaging. Each agent moves alpha fraction
+// of the way toward the global mean on every dimension.
+//
+//   states'[i][j] = states[i][j] + alpha * (mean_j - states[i][j])
+//
+// Returns a new flat states array (pass-by-value — hexa lists are
+// immutable from the caller's perspective).
+
+fn consensus_step(states: array, n: int, d: int, alpha: float) -> array {
+    // First, compute the global mean for each dimension.
+    let inv_n = 1.0 / to_float(n)
+    let mut means = []
+    let mut j = 0
+    while j < d {
+        let mut mu = 0.0
+        let mut i = 0
+        while i < n {
+            mu = mu + state_get(states, i, j, d)
+            i = i + 1
+        }
+        means = means.push(mu * inv_n)
+        j = j + 1
+    }
+    // Now update each agent's state toward the mean.
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let mut j2 = 0
+        while j2 < d {
+            let cur = state_get(states, i, j2, d)
+            let updated = cur + alpha * (means[j2] - cur)
+            out = out.push(updated)
+            j2 = j2 + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Run `steps` consensus averaging steps. Returns the final states.
+fn consensus_run(states0: array, n: int, d: int, alpha: float, steps: int) -> array {
+    let mut states = states_copy(states0, n * d)
+    let mut t = 0
+    while t < steps {
+        states = consensus_step(states, n, d, alpha)
+        t = t + 1
+    }
+    return states
+}
+
+// ─── Synthetic data ─────────────────────────────────────────
+
+// Build initial states for N agents, each with d dimensions.
+// Each agent gets a different deterministic seed to ensure diversity.
+fn make_initial_states(n: int, d: int, base_seed: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let v = det_rand_wide(d, base_seed + i * 137)
+        let mut j = 0
+        while j < d {
+            out = out.push(v[j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Self-tests ─────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Diverse start: initial states have high consensus_loss (> 0.1).
+    let states = make_initial_states(N_AGENTS, D_STATE, 42)
+    let loss = consensus_loss(states, N_AGENTS, D_STATE)
+    println("  [T1] initial consensus_loss = " + str(loss))
+    println("  [T1] target: loss > 0.1 (diverse start)")
+    if loss <= 0.1 {
+        println("  [T1] FAIL -- initial loss " + str(loss) + " <= 0.1 (agents not diverse)")
+        return false
+    }
+    return true
+}
+
+fn check_T2() -> bool {
+    // Core done_criteria: after 30 steps, variance < 0.01.
+    let states0 = make_initial_states(N_AGENTS, D_STATE, 42)
+    let loss0 = consensus_loss(states0, N_AGENTS, D_STATE)
+    let states_final = consensus_run(states0, N_AGENTS, D_STATE, ALPHA, CONVERGE_STEPS)
+    let loss_final = consensus_loss(states_final, N_AGENTS, D_STATE)
+    println("  [T2] N=" + str(N_AGENTS) + " d=" + str(D_STATE) + " alpha=" + str(ALPHA) + " steps=" + str(CONVERGE_STEPS))
+    println("  [T2] loss_before = " + str(loss0) + "  loss_after = " + str(loss_final))
+    println("  [T2] target: loss_after < " + str(CONVERGE_THR) + " (converged)")
+    if loss_final >= CONVERGE_THR {
+        println("  [T2] FAIL -- final loss " + str(loss_final) + " >= " + str(CONVERGE_THR))
+        return false
+    }
+    return true
+}
+
+fn check_T3() -> bool {
+    // Loss decreases monotonically at every step.
+    // The averaging operation is a contraction mapping — variance can
+    // only shrink or stay equal, never increase.
+    let states0 = make_initial_states(N_AGENTS, D_STATE, 42)
+    let mut states = states_copy(states0, N_AGENTS * D_STATE)
+    let mut prev_loss = consensus_loss(states, N_AGENTS, D_STATE)
+    let mut monotonic = true
+    let mut violation_step = 0
+    let mut violation_prev = 0.0
+    let mut violation_cur = 0.0
+    let mut t = 0
+    while t < CONVERGE_STEPS {
+        states = consensus_step(states, N_AGENTS, D_STATE, ALPHA)
+        let cur_loss = consensus_loss(states, N_AGENTS, D_STATE)
+        if cur_loss > prev_loss {
+            if monotonic {
+                monotonic = false
+                violation_step = t + 1
+                violation_prev = prev_loss
+                violation_cur = cur_loss
+            }
+        }
+        prev_loss = cur_loss
+        t = t + 1
+    }
+    println("  [T3] monotonicity test over " + str(CONVERGE_STEPS) + " steps")
+    println("  [T3] final loss = " + str(prev_loss))
+    if monotonic {
+        println("  [T3] loss decreased monotonically at every step")
+        return true
+    }
+    println("  [T3] FAIL -- loss increased at step " + str(violation_step) + ": " + str(violation_prev) + " -> " + str(violation_cur))
+    return false
+}
+
+fn check_T4() -> bool {
+    // Determinism: two identical runs produce byte-identical results.
+    let states_a = make_initial_states(N_AGENTS, D_STATE, 42)
+    let states_b = make_initial_states(N_AGENTS, D_STATE, 42)
+    let final_a = consensus_run(states_a, N_AGENTS, D_STATE, ALPHA, CONVERGE_STEPS)
+    let final_b = consensus_run(states_b, N_AGENTS, D_STATE, ALPHA, CONVERGE_STEPS)
+    let loss_a = consensus_loss(final_a, N_AGENTS, D_STATE)
+    let loss_b = consensus_loss(final_b, N_AGENTS, D_STATE)
+    println("  [T4] loss_a = " + str(loss_a) + "  loss_b = " + str(loss_b))
+    // Check all state values are identical.
+    let total = N_AGENTS * D_STATE
+    let mut i = 0
+    while i < total {
+        if fabs(final_a[i] - final_b[i]) > 0.0 {
+            println("  [T4] FAIL -- states differ at index " + str(i))
+            return false
+        }
+        i = i + 1
+    }
+    if fabs(loss_a - loss_b) > 0.0 {
+        println("  [T4] FAIL -- losses differ: " + str(loss_a) + " vs " + str(loss_b))
+        return false
+    }
+    println("  [T4] byte-identical states (" + str(total) + " values) and loss after " + str(CONVERGE_STEPS) + " steps")
+    return true
+}
+
+fn check_T5() -> bool {
+    // Latency: full 30-step consensus + loss eval < 1000 ms.
+    let states0 = make_initial_states(N_AGENTS, D_STATE, 42)
+    // Warm-up run to absorb cold-cache cost.
+    let _warm = consensus_run(states0, N_AGENTS, D_STATE, ALPHA, 5)
+    let _wl = consensus_loss(_warm, N_AGENTS, D_STATE)
+
+    let t0 = clock()
+    let final_states = consensus_run(states0, N_AGENTS, D_STATE, ALPHA, CONVERGE_STEPS)
+    let loss = consensus_loss(final_states, N_AGENTS, D_STATE)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] latency (N=" + str(N_AGENTS) + ", d=" + str(D_STATE) + ", steps=" + str(CONVERGE_STEPS) + "): " + str(ms) + " ms")
+    println("  [T5] final loss = " + str(loss))
+    println("  [T5] target: < 1000 ms")
+    if ms < 1000.0 { return true }
+    println("  [T5] FAIL -- " + str(ms) + " ms >= 1000 ms")
+    return false
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[alm_consensus_loss] ALM-P18-2 self-test (N=4 consensus)")
+    println("  N=" + str(N_AGENTS) + " d=" + str(D_STATE) + " alpha=" + str(ALPHA))
+    println("  converge_steps=" + str(CONVERGE_STEPS) + " converge_thr=" + str(CONVERGE_THR))
+    println("  lambda_consensus=" + str(LAMBDA_CONSENSUS))
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[alm_consensus_loss] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[alm_consensus_loss] ALL 5/5 PASS")
+    } else {
+        println("[alm_consensus_loss] SOME FAILED")
+    }
+}
+
+main()

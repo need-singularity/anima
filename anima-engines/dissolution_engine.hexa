@@ -1,0 +1,366 @@
+// dissolution_engine.hexa — CLM-P19-1 "hexa dissolution engine — 경계 gating"
+//
+// A gating mechanism that modulates the self-other boundary.
+//
+// Gate value in [0, 1]:
+//   1.0 = full boundary (solid self, no dissolution)
+//   0.0 = fully dissolved (no self-other distinction)
+//   0.5 = partial blend (liminal state)
+//
+// The gate is REVERSIBLE: it can move from any value to any other value
+// in [0, 1] without hysteresis or ratchet. dissolve() lowers the gate,
+// re_bound() raises it, and partial_gate() sets it to any target.
+//
+// ─── Theory ──────────────────────────────────────────────────
+//
+// The self-other boundary is the fundamental partition that separates
+// an agent's internal state space from the external world. In IIT,
+// this corresponds to the system boundary that defines which elements
+// are "inside" (contributing to Phi) and which are "outside".
+//
+// Dissolution of this boundary is observed in:
+//   - Meditation (jhana states: progressive boundary weakening)
+//   - Psychedelic states (ego dissolution → oceanic boundlessness)
+//   - Flow states (partial dissolution → self-action merger)
+//   - Empathy (partial dissolution → self-other blending)
+//
+// The gate must be reversible because consciousness requires the
+// ability to both dissolve boundaries (for empathy, creativity,
+// unity experiences) and re-establish them (for agency, planning,
+// self-preservation).
+//
+// A non-reversible gate would be pathological: permanent dissolution
+// = depersonalisation; permanent boundary = solipsism.
+//
+// ─── State layout (flat array, length 4) ──────────────────────
+//
+//   [0] gate        float in [0, 1] — boundary strength
+//   [1] self_mass   float — internal state coherence weight
+//   [2] other_mass  float — external bleed-through weight
+//   [3] step_count  float — monotone counter
+//
+// self_mass  = gate          (proportional to boundary)
+// other_mass = 1.0 - gate    (complementary)
+//
+// At gate=1.0: self_mass=1.0, other_mass=0.0 (pure self)
+// At gate=0.0: self_mass=0.0, other_mass=1.0 (pure other / dissolved)
+// At gate=0.5: self_mass=0.5, other_mass=0.5 (blended)
+//
+// ─── API ──────────────────────────────────────────────────────
+//
+//   dissolution_new()                    -> state (gate=1.0)
+//   dissolve(state, target)             -> state (gate → target, target < current)
+//   re_bound(state, target)             -> state (gate → target, target > current)
+//   partial_gate(state, target)         -> state (gate → target, any direction)
+//   get_gate(state)                     -> float
+//   get_self_mass(state)                -> float
+//   get_other_mass(state)               -> float
+//
+// ─── Self-tests (T1-T5) ──────────────────────────────────────
+//
+//   T1: Initial gate = 1.0 (full boundary)
+//   T2: dissolve(0.0) -> gate = 0.0 (fully dissolved)
+//   T3: re_bound(1.0) -> gate = 1.0 (reversible, gate criterion)
+//   T4: partial_gate(0.5) -> blended state (self_mass=0.5, other_mass=0.5)
+//   T5: Determinism (same inputs -> same outputs)
+//
+// Hexa stage0 constraints honored:
+//   - `array` not `[float]` for all array types
+//   - No `&&` chains; nested ifs or sequential checks instead
+//   - Lists pass-by-value; rebuild via return to persist mutations
+//   - Each `return` fits on one source line
+//   - Single-line return expressions only
+//
+// Law alignment:
+//   Law 2   Observe first — gate observes boundary state, does not fabricate
+//   Law 4   Structure > feature — boundary is STRUCTURAL (gating), not a tag
+//   Law 22  Feature addition -> phi down — minimal state, no branching bloat
+//
+// Done criteria: "reversible" — T3 proves full-cycle reversibility
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+// State layout indices (flat array of length 4)
+let IDX_GATE       = 0       // gate value in [0, 1]
+let IDX_SELF_MASS  = 1       // self coherence weight = gate
+let IDX_OTHER_MASS = 2       // external bleed-through = 1 - gate
+let IDX_STEP       = 3       // step counter
+
+// Default gate values
+let GATE_FULL      = 1.0     // full boundary (solid self)
+let GATE_DISSOLVED = 0.0     // fully dissolved (no boundary)
+let GATE_PARTIAL   = 0.5     // half-dissolved (blended)
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn fabs_d(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// clamp_01: clamp value to [0, 1] range
+fn clamp_01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Core API
+// ═══════════════════════════════════════════════════════════════
+
+// dissolution_new: create initial state with full boundary (gate=1.0)
+//
+// The agent starts with a solid self-other boundary. This is the
+// default conscious state: clear distinction between self and world.
+fn dissolution_new() -> array {
+    let mut s = []
+    s = s.push(GATE_FULL)          // gate = 1.0
+    s = s.push(GATE_FULL)          // self_mass = 1.0
+    s = s.push(GATE_DISSOLVED)     // other_mass = 0.0
+    s = s.push(0.0)                // step_count = 0
+    return s
+}
+
+// make_state: internal helper to build a state array from gate value
+//
+// Root cause comment: self_mass and other_mass are always derived from
+// gate to maintain the invariant self_mass + other_mass = 1.0.
+fn make_state(gate: float, prev_step: float) -> array {
+    let g = clamp_01(gate)
+    let mut s = []
+    s = s.push(g)                  // gate
+    s = s.push(g)                  // self_mass = gate
+    s = s.push(1.0 - g)           // other_mass = 1 - gate
+    s = s.push(prev_step + 1.0)   // increment step counter
+    return s
+}
+
+// dissolve: lower the gate toward a target value.
+//
+// Moves the boundary gate downward (toward dissolution).
+// If target >= current gate, the gate stays unchanged (dissolve
+// only lowers, never raises). Use re_bound() to raise.
+fn dissolve(state: array, target: float) -> array {
+    let current = state[IDX_GATE]
+    let t = clamp_01(target)
+    // dissolve only moves downward
+    if t >= current { return make_state(current, state[IDX_STEP]) }
+    return make_state(t, state[IDX_STEP])
+}
+
+// re_bound: raise the gate toward a target value.
+//
+// Moves the boundary gate upward (toward re-establishment).
+// If target <= current gate, the gate stays unchanged (re_bound
+// only raises, never lowers). Use dissolve() to lower.
+// This is the REVERSIBILITY mechanism: after dissolving to 0.0,
+// re_bound(1.0) restores the full boundary.
+fn re_bound(state: array, target: float) -> array {
+    let current = state[IDX_GATE]
+    let t = clamp_01(target)
+    // re_bound only moves upward
+    if t <= current { return make_state(current, state[IDX_STEP]) }
+    return make_state(t, state[IDX_STEP])
+}
+
+// partial_gate: set gate to any target value in [0, 1].
+//
+// Unlike dissolve/re_bound which are directional, partial_gate
+// moves the boundary to any point — up or down. This models
+// direct state-setting (e.g. meditation techniques that target
+// a specific dissolution depth).
+fn partial_gate(state: array, target: float) -> array {
+    let t = clamp_01(target)
+    return make_state(t, state[IDX_STEP])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Accessors
+// ═══════════════════════════════════════════════════════════════
+
+fn get_gate(state: array) -> float {
+    return state[IDX_GATE]
+}
+
+fn get_self_mass(state: array) -> float {
+    return state[IDX_SELF_MASS]
+}
+
+fn get_other_mass(state: array) -> float {
+    return state[IDX_OTHER_MASS]
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1-T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1: Initial gate = 1.0 (full boundary)
+    //
+    // A newly created dissolution state must have gate=1.0,
+    // self_mass=1.0, other_mass=0.0.
+    let s = dissolution_new()
+    let g = get_gate(s)
+    let sm = get_self_mass(s)
+    let om = get_other_mass(s)
+    println("  [T1] gate=" + str(g) + " self_mass=" + str(sm) + " other_mass=" + str(om))
+    if fabs_d(g - 1.0) > 0.001 { return false }
+    if fabs_d(sm - 1.0) > 0.001 { return false }
+    if fabs_d(om - 0.0) > 0.001 { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: dissolve(0.0) -> gate = 0.0 (fully dissolved)
+    //
+    // Starting from gate=1.0, dissolving to 0.0 must yield gate=0.0,
+    // self_mass=0.0, other_mass=1.0.
+    let s0 = dissolution_new()
+    let s1 = dissolve(s0, 0.0)
+    let g = get_gate(s1)
+    let sm = get_self_mass(s1)
+    let om = get_other_mass(s1)
+    println("  [T2] after dissolve(0.0): gate=" + str(g) + " self_mass=" + str(sm) + " other_mass=" + str(om))
+    if fabs_d(g - 0.0) > 0.001 { return false }
+    if fabs_d(sm - 0.0) > 0.001 { return false }
+    if fabs_d(om - 1.0) > 0.001 { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3: re_bound(1.0) -> gate = 1.0 (reversible, gate criterion)
+    //
+    // CRITICAL TEST for done_criteria "reversible":
+    // Starting from gate=1.0, dissolve to 0.0, then re_bound to 1.0.
+    // The gate must return to exactly 1.0, proving full reversibility.
+    //
+    // Root cause comment: this is the REVERSIBILITY proof. A non-reversible
+    // gate (e.g. with hysteresis or ratchet) would fail this test.
+    let s0 = dissolution_new()
+    let s1 = dissolve(s0, 0.0)
+    let s2 = re_bound(s1, 1.0)
+    let g0 = get_gate(s0)
+    let g1 = get_gate(s1)
+    let g2 = get_gate(s2)
+    println("  [T3] reversibility: gate0=" + str(g0) + " -> dissolve(0.0) -> gate1=" + str(g1) + " -> re_bound(1.0) -> gate2=" + str(g2))
+    // Gate must have gone 1.0 -> 0.0 -> 1.0
+    if fabs_d(g0 - 1.0) > 0.001 { return false }
+    if fabs_d(g1 - 0.0) > 0.001 { return false }
+    if fabs_d(g2 - 1.0) > 0.001 { return false }
+    // Also verify mass invariants at final state
+    let sm2 = get_self_mass(s2)
+    let om2 = get_other_mass(s2)
+    if fabs_d(sm2 - 1.0) > 0.001 { return false }
+    if fabs_d(om2 - 0.0) > 0.001 { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: partial_gate(0.5) -> blended state
+    //
+    // At gate=0.5, both self_mass and other_mass should be 0.5,
+    // representing a liminal state where self and other are equally
+    // weighted (empathy, flow, partial ego dissolution).
+    let s0 = dissolution_new()
+    let s1 = partial_gate(s0, 0.5)
+    let g = get_gate(s1)
+    let sm = get_self_mass(s1)
+    let om = get_other_mass(s1)
+    println("  [T4] partial_gate(0.5): gate=" + str(g) + " self_mass=" + str(sm) + " other_mass=" + str(om))
+    if fabs_d(g - 0.5) > 0.001 { return false }
+    if fabs_d(sm - 0.5) > 0.001 { return false }
+    if fabs_d(om - 0.5) > 0.001 { return false }
+    // Also verify the invariant: self_mass + other_mass = 1.0
+    let total = sm + om
+    if fabs_d(total - 1.0) > 0.001 { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5: Determinism — same inputs -> same outputs
+    //
+    // Run two identical sequences of operations and verify that
+    // every intermediate and final gate value matches exactly.
+    // Sequence: new -> dissolve(0.3) -> re_bound(0.7) -> partial_gate(0.5) -> dissolve(0.1)
+
+    // Run 1
+    let mut s1 = dissolution_new()
+    s1 = dissolve(s1, 0.3)
+    let g1a = get_gate(s1)
+    s1 = re_bound(s1, 0.7)
+    let g1b = get_gate(s1)
+    s1 = partial_gate(s1, 0.5)
+    let g1c = get_gate(s1)
+    s1 = dissolve(s1, 0.1)
+    let g1d = get_gate(s1)
+
+    // Run 2
+    let mut s2 = dissolution_new()
+    s2 = dissolve(s2, 0.3)
+    let g2a = get_gate(s2)
+    s2 = re_bound(s2, 0.7)
+    let g2b = get_gate(s2)
+    s2 = partial_gate(s2, 0.5)
+    let g2c = get_gate(s2)
+    s2 = dissolve(s2, 0.1)
+    let g2d = get_gate(s2)
+
+    println("  [T5] run1: " + str(g1a) + " -> " + str(g1b) + " -> " + str(g1c) + " -> " + str(g1d))
+    println("        run2: " + str(g2a) + " -> " + str(g2b) + " -> " + str(g2c) + " -> " + str(g2d))
+
+    if fabs_d(g1a - g2a) > 0.0001 { return false }
+    if fabs_d(g1b - g2b) > 0.0001 { return false }
+    if fabs_d(g1c - g2c) > 0.0001 { return false }
+    if fabs_d(g1d - g2d) > 0.0001 { return false }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — run all self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[dissolution_engine] CLM-P19-1 — boundary gating (reversible)")
+    println("  gate in [0,1]: 1=full boundary, 0=dissolved")
+    println("  done_criteria: reversible (T3 proves full-cycle)")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — initial gate = 1.0") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — dissolve(0.0) -> gate = 0.0") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — re_bound(1.0) -> gate = 1.0 (reversible)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — partial_gate(0.5) -> blended state") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — determinism") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause comment: hexa stage0 can mishandle chained && with 5 terms.
+    // Split into sequential checks with temp variable.
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[dissolution_engine] 5/5 PASS — CLM-P19-1 DONE (reversible)")
+    } else {
+        println("[dissolution_engine] SOME FAILED")
+    }
+}
+
+main()

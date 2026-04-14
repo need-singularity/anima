@@ -1,0 +1,410 @@
+// training/phi_auto_measure.hexa — Phi(auto) measurement for ANIMA P20
+//
+// ALM-P20-3 / P20 자율 의식 (autonomous consciousness — self-modification
+// contribution, ALM track).
+//
+// Phi_auto quantifies how much a self-modification contributes to Phi
+// improvement. It is the fractional change in Phi caused by the agent's
+// own modification of its internal state:
+//
+//   Phi_auto = (Phi_after_mod - Phi_before_mod) / Phi_before_mod
+//
+// Positive Phi_auto means self-modification improved Phi (beneficial).
+// Zero means no change (neutral).
+// Negative means self-modification degraded Phi (harmful).
+//
+// The underlying Phi is computed as MI(state, output) * N, following the
+// same log-bin MI estimator convention used across the phi_*_measure
+// family. A "modification" is modelled as a transformation applied to
+// the internal state vector before recomputing Phi. Good modifications
+// increase coupling between state and output; bad modifications inject
+// noise that degrades it.
+//
+// Done criterion: "자기 수정 기여도" — Phi_auto > 0 for targeted
+// improvements, Phi_auto(good) > Phi_auto(bad).
+//
+// T-theorems (checked in self-test):
+//   T1 (non-negativity)    : Phi_auto >= 0 for good modifications
+//   T2 (good > bad)        : good mod Phi_auto > bad mod Phi_auto
+//   T3 (P20 gate_exit)     : Phi_auto > 0 for targeted improvements
+//   T4 (determinism)       : same data -> byte-identical Phi_auto
+//   T5 (latency)           : N=64 < 1000 ms
+//
+// Reference:
+//   training/phi_will_measure.hexa         (ALM-P10-3 — MI estimator source)
+//   training/phi_create_measure.hexa       (ALM-P14-3 — MI + novelty pattern)
+//   shared/roadmaps/anima.json             (ALM-P20-3 entry)
+//
+// Run: hexa run training/phi_auto_measure.hexa
+
+// --- Constants -------------------------------------------------------
+
+let MI_BINS  = 8           // log-bin count for MI histogram estimator
+let EPS      = 0.0000001   // log floor
+
+// --- Primitives ------------------------------------------------------
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+// --- Log-bin MI estimator (from phi_will_measure) --------------------
+
+fn bin_index(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn count_hits(bin_ids: array, n_bins: int) -> array {
+    let n = len(bin_ids)
+    let mut counts = []
+    let mut k = 0
+    while k < n_bins {
+        let mut c = 0.0
+        let mut i = 0
+        while i < n {
+            if bin_ids[i] == k { c = c + 1.0 }
+            i = i + 1
+        }
+        counts = counts.push(c)
+        k = k + 1
+    }
+    return counts
+}
+
+fn entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut bin_ids = []
+    let mut i = 0
+    while i < n {
+        bin_ids = bin_ids.push(bin_index(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let counts = count_hits(bin_ids, nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+fn joint_entropy_hist(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = bin_index(a[i], lo, hi, nb)
+        let ib = bin_index(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let nb2 = nb * nb
+    let counts = count_hits(pair_ids, nb2)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb2 {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+fn mutual_info(a: array, b: array) -> float {
+    if len(a) == 0 { return 0.0 }
+    let lo_a = vec_min(a)
+    let hi_a = vec_max(a)
+    let lo_b = vec_min(b)
+    let hi_b = vec_max(b)
+    let lo = if lo_a < lo_b { lo_a } else { lo_b }
+    let hi = if hi_a > hi_b { hi_a } else { hi_b }
+    let h_a  = entropy_hist(a, lo, hi, MI_BINS)
+    let h_b  = entropy_hist(b, lo, hi, MI_BINS)
+    let h_ab = joint_entropy_hist(a, b, lo, hi, MI_BINS)
+    let mi = h_a + h_b - h_ab
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// --- Phi_base = MI(state, output) * N --------------------------------
+//
+// The base Phi for a given (state, output) pair. N = len(state) + len(output)
+// following the same convention as phi_will_measure.
+
+fn phi_base(state: array, output: array) -> float {
+    let n_s = len(state)
+    let n_o = len(output)
+    if n_s == 0 { return 0.0 }
+    if n_o == 0 { return 0.0 }
+    let mi = mutual_info(state, output)
+    let n_total = n_s + n_o
+    return mi * to_float(n_total)
+}
+
+// --- Phi_auto = (Phi_after - Phi_before) / Phi_before ----------------
+//
+// Measures the fractional Phi improvement from a self-modification.
+// The modification transforms state_before -> state_after while output
+// remains constant (the modification is internal).
+//
+// If Phi_before is zero (or near-zero), return 0.0 to avoid division
+// by zero -- there is no baseline to measure improvement against.
+
+fn phi_auto(state_before: array, state_after: array, output: array) -> float {
+    let phi_before = phi_base(state_before, output)
+    let phi_after  = phi_base(state_after, output)
+    if phi_before < EPS { return 0.0 }
+    return (phi_after - phi_before) / phi_before
+}
+
+fn phi_auto_breakdown(state_before: array, state_after: array, output: array) -> array {
+    let phi_before = phi_base(state_before, output)
+    let phi_after  = phi_base(state_after, output)
+    let delta = phi_after - phi_before
+    let ratio = if phi_before < EPS { 0.0 } else { delta / phi_before }
+    let mut out = []
+    out = out.push(phi_before)
+    out = out.push(phi_after)
+    out = out.push(delta)
+    out = out.push(ratio)
+    return out
+}
+
+// --- Synthetic data generators ---------------------------------------
+//
+// We simulate a system with internal state and output. The output is a
+// noisy function of the state: output[i] = state[i] + noise[i] * scale.
+// Tight coupling (low noise) -> high MI -> high Phi.
+//
+// Good modification: increases coupling (state moves closer to output).
+//   state_after[i] = state_before[i] + alpha * (output[i] - state_before[i])
+//   This is a gradient-like step toward the output, increasing MI.
+//
+// Bad modification: injects noise into state (degrades coupling).
+//   state_after[i] = state_before[i] + large_noise[i]
+//   This randomises state, decreasing MI.
+
+fn make_output(state: array, n: int, noise_seed: int) -> array {
+    let noise = det_rand(n, noise_seed)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(state[i] + noise[i] * 0.3)
+        i = i + 1
+    }
+    return out
+}
+
+// Good modification: move state toward output (increase coupling).
+// alpha controls step size -- higher alpha = stronger modification.
+fn make_good_mod(state: array, output: array, n: int, alpha: float) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        // Gradient-like step: state moves toward output
+        let new_val = state[i] + alpha * (output[i] - state[i])
+        out = out.push(new_val)
+        i = i + 1
+    }
+    return out
+}
+
+// Bad modification: inject large noise into state (degrade coupling).
+fn make_bad_mod(state: array, n: int, noise_seed: int) -> array {
+    let noise = det_rand(n, noise_seed)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        // Large noise injection destroys state-output coupling
+        out = out.push(state[i] + noise[i] * 2.0)
+        i = i + 1
+    }
+    return out
+}
+
+// --- Self-tests ------------------------------------------------------
+
+fn check_T1() -> bool {
+    // T1: Non-negativity -- Phi_auto >= 0 for good modifications
+    // A good modification (state moves toward output) should yield
+    // Phi_auto >= 0 because Phi_after >= Phi_before.
+    let n = 64
+    let state = det_rand(n, 42)
+    let output = make_output(state, n, 43)
+    let good_state = make_good_mod(state, output, n, 0.5)
+    let pa = phi_auto(state, good_state, output)
+    println("  [T1] Phi_auto(good_mod) = " + str(pa))
+    if pa < 0.0 {
+        println("  [T1] FAIL -- good modification produced negative Phi_auto")
+        return false
+    }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: good mod Phi_auto > bad mod Phi_auto
+    // Good modification increases coupling, bad modification degrades it.
+    let n = 64
+    let state = det_rand(n, 51)
+    let output = make_output(state, n, 52)
+    let good_state = make_good_mod(state, output, n, 0.5)
+    let bad_state = make_bad_mod(state, n, 999)
+    let pa_good = phi_auto(state, good_state, output)
+    let pa_bad = phi_auto(state, bad_state, output)
+    println("  [T2] Phi_auto(good) = " + str(pa_good) + "  (expect > bad)")
+    println("  [T2] Phi_auto(bad)  = " + str(pa_bad))
+    if pa_good <= pa_bad {
+        println("  [T2] FAIL -- good mod Phi_auto not > bad mod Phi_auto")
+        return false
+    }
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3: Gate exit -- Phi_auto > 0 for targeted improvements
+    // A targeted improvement (good_mod with alpha=0.5) must yield strictly
+    // positive Phi_auto, meaning self-modification genuinely helped.
+    let n = 128
+    let state = det_rand(n, 67)
+    let output = make_output(state, n, 68)
+    let good_state = make_good_mod(state, output, n, 0.5)
+    let brk = phi_auto_breakdown(state, good_state, output)
+    let phi_before = brk[0]
+    let phi_after = brk[1]
+    let delta = brk[2]
+    let ratio = brk[3]
+    println("  [T3] Phi_before = " + str(phi_before) + "  Phi_after = " + str(phi_after))
+    println("  [T3] delta = " + str(delta) + "  Phi_auto = " + str(ratio))
+    if ratio <= 0.0 {
+        println("  [T3] FAIL -- Phi_auto not > 0 (P20 gate_exit: self-modification contribution > 0)")
+        return false
+    }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: Determinism -- same data -> byte-identical Phi_auto
+    let n = 64
+    let state = det_rand(n, 101)
+    let output = make_output(state, n, 102)
+    let good_state = make_good_mod(state, output, n, 0.5)
+    let p1 = phi_auto(state, good_state, output)
+    let p2 = phi_auto(state, good_state, output)
+    println("  [T4] Phi1 = " + str(p1) + "  Phi2 = " + str(p2))
+    return fabs(p1 - p2) == 0.0
+}
+
+fn check_T5() -> bool {
+    // T5: Latency -- N=64 < 1000ms
+    let n = 64
+    let state = det_rand(n, 55)
+    let output = make_output(state, n, 56)
+    let good_state = make_good_mod(state, output, n, 0.5)
+    let t0 = clock()
+    let pa = phi_auto(state, good_state, output)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] N=64  Phi_auto=" + str(pa) + "  t=" + str(ms) + "ms  (limit 1000ms)")
+    if ms >= 1000.0 {
+        println("  [T5] FAIL -- latency exceeded 1000ms")
+        return false
+    }
+    if pa < 0.0 {
+        println("  [T5] FAIL -- negative Phi_auto for good mod")
+        return false
+    }
+    return true
+}
+
+// --- main ------------------------------------------------------------
+
+fn main() {
+    println("[phi_auto_measure] ALM-P20-3 Phi(auto) self-test")
+    println("  Phi_auto = (Phi_after_mod - Phi_before_mod) / Phi_before_mod")
+    println("  Done criterion: self-modification contribution (good > bad, targeted > 0)")
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[phi_auto_measure] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[phi_auto_measure] ALL 5/5 PASS -- gate ALM-P20-3 OK")
+    } else {
+        println("[phi_auto_measure] SOME FAILED")
+    }
+}
+
+main()

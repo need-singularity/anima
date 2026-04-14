@@ -1,0 +1,356 @@
+// entropy_dissolution.hexa — PHYS-P19-1 entropy-driven dissolution (thermal noise)
+//
+// Roadmap: shared/roadmaps/anima.json P19 PHYSICS track, PHYS-P19-1
+//   "entropy-driven dissolution — 열잡음 증가"
+//   done_criteria: "엔트로피 제어"
+//
+// Purpose:
+//   A thermodynamic system where increasing thermal noise drives the
+//   state distribution toward maximum entropy (dissolution).  The key
+//   property is CONTROLLABILITY: the noise amplitude can be raised or
+//   lowered, and the system responds by moving toward disorder or
+//   returning to order, respectively.
+//
+//   Physical analogy: a lattice of N_CELLS cells, each holding a
+//   continuous value in [0, N_BINS).  At each step, deterministic
+//   pseudo-random noise perturbs every cell.  Low noise keeps cells
+//   clustered near their initial position (ordered, low Shannon entropy).
+//   High noise spreads cells across all bins (disordered, max entropy).
+//
+//   Entropy is measured via Shannon entropy on the binned histogram:
+//     H = -sum_i p_i * ln(p_i)       (nat units)
+//   Maximum entropy = ln(N_BINS) when all bins are equally populated.
+//
+//   On noise reduction, a mean-reversion term pulls cells back toward
+//   the bin center, restoring order — this is the controllability gate.
+//
+// State: flat array of N_CELLS floats.
+//   No .set() — histogram built by scan-and-count.
+//   No && — boolean accumulator via integer counting.
+//   Pass-by-value, single-line returns.
+
+// ================================================================
+// Constants
+// ================================================================
+
+let N_CELLS      = 16       // lattice size (small for interpreter speed)
+let N_BINS       = 8        // histogram bins for Shannon entropy
+let INITIAL_VAL  = 0.0      // all cells start at bin 0 (ordered)
+let LOW_NOISE    = 0.05     // ordered regime
+let HIGH_NOISE   = 4.0      // dissolution regime
+let LN_N_BINS    = 2.0794415416798357  // ln(8) — theoretical max H
+let REVERT_RATE  = 0.3      // mean-reversion toward origin per step
+
+// ================================================================
+// Deterministic PRNG
+//
+// LCG: seed_{n+1} = (seed_n * 1103515245 + 12345) mod 2^31
+// Returns int seed; convert to float in [-1,1) for noise.
+// ================================================================
+
+fn lcg_next(seed: int) -> int {
+    let raw = seed * 1103515245 + 12345
+    let masked = raw % 2147483647
+    if masked < 0 { return 0 - masked }
+    return masked
+}
+
+fn seed_to_uniform(seed: int) -> float {
+    // Maps seed to [-1, +1)
+    let pos = seed % 2147483647
+    if pos < 0 { return to_float(0 - pos) / 1073741823.0 - 1.0 }
+    return to_float(pos) / 1073741823.0 - 1.0
+}
+
+// ================================================================
+// Approximate natural log (only used in entropy, not per-step)
+//
+// Range-reduce x into [0.5, 2.0] via powers of 2, then series.
+// ================================================================
+
+fn approx_ln(x: float) -> float {
+    if x <= 0.0 { return 0.0 - 100.0 }
+    let ln2 = 0.6931471805599453
+    let mut m = x
+    let mut e = 0
+    while m > 2.0 {
+        m = m / 2.0
+        e = e + 1
+    }
+    while m < 0.5 {
+        m = m * 2.0
+        e = e - 1
+    }
+    let t = (m - 1.0) / (m + 1.0)
+    let t2 = t * t
+    let mut sum = t
+    let mut term = t
+    let mut k = 1
+    while k < 15 {
+        term = term * t2
+        sum = sum + term / to_float(2 * k + 1)
+        k = k + 1
+    }
+    return 2.0 * sum + to_float(e) * ln2
+}
+
+// ================================================================
+// Core API
+// ================================================================
+
+fn dissolution_new() -> array {
+    let mut state = []
+    let mut i = 0
+    while i < N_CELLS {
+        state = state.push(INITIAL_VAL)
+        i = i + 1
+    }
+    return state
+}
+
+// One step: perturb each cell by noise, apply mean-reversion, clamp.
+// Returns array of N_CELLS+1 elements: [cells..., seed_as_float].
+fn dissolution_step(state: array, noise_amp: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let bins_f = to_float(N_BINS)
+    let mut i = 0
+    while i < N_CELLS {
+        let val = state[i]
+        // Generate uniform noise in [-1, +1)
+        s = lcg_next(s)
+        let noise = seed_to_uniform(s) * noise_amp
+        // Mean-reversion: pull toward INITIAL_VAL (origin).
+        // When noise is low, this consolidates cells back to order.
+        // When noise is high, noise overwhelms reversion.
+        let revert = (INITIAL_VAL - val) * REVERT_RATE
+        let perturbed = val + noise + revert
+        // Clamp to [0, N_BINS - 0.001)
+        let mut clamped = perturbed
+        if clamped < 0.0 { clamped = 0.0 }
+        if clamped >= bins_f { clamped = bins_f - 0.001 }
+        out = out.push(clamped)
+        i = i + 1
+    }
+    out = out.push(to_float(s))
+    return out
+}
+
+fn extract_state(step_out: array) -> array {
+    let mut state = []
+    let mut i = 0
+    while i < N_CELLS {
+        state = state.push(step_out[i])
+        i = i + 1
+    }
+    return state
+}
+
+fn extract_seed(step_out: array) -> int {
+    return to_int(step_out[N_CELLS])
+}
+
+// Run n steps inline — avoids per-step extract_state overhead.
+// Each step rebuilds the cell array from scratch (pass-by-value).
+fn dissolution_run(state: array, noise_amp: float, seed: int, n: int) -> array {
+    let mut s = state
+    let mut sd = seed
+    let bins_f = to_float(N_BINS)
+    let mut step = 0
+    while step < n {
+        let mut out = []
+        let mut i = 0
+        while i < N_CELLS {
+            let val = s[i]
+            sd = lcg_next(sd)
+            let noise = seed_to_uniform(sd) * noise_amp
+            let revert = (INITIAL_VAL - val) * REVERT_RATE
+            let perturbed = val + noise + revert
+            let mut clamped = perturbed
+            if clamped < 0.0 { clamped = 0.0 }
+            if clamped >= bins_f { clamped = bins_f - 0.001 }
+            out = out.push(clamped)
+            i = i + 1
+        }
+        s = out
+        step = step + 1
+    }
+    // Pack final seed
+    let mut result = []
+    let mut j = 0
+    while j < N_CELLS {
+        result = result.push(s[j])
+        j = j + 1
+    }
+    result = result.push(to_float(sd))
+    return result
+}
+
+// ================================================================
+// Shannon entropy via scan-and-count histogram
+//
+// For each bin b in [0, N_BINS), count how many cells fall in [b, b+1).
+// No .set() needed — just iterate cells per bin.
+// H = -sum p_i * ln(p_i)
+// ================================================================
+
+fn count_bin(state: array, bin: int) -> int {
+    let lo = to_float(bin)
+    let hi = to_float(bin + 1)
+    let mut count = 0
+    let mut i = 0
+    while i < N_CELLS {
+        let v = state[i]
+        if v >= lo {
+            if v < hi {
+                count = count + 1
+            }
+        }
+        i = i + 1
+    }
+    return count
+}
+
+fn shannon_entropy(state: array) -> float {
+    let n = to_float(N_CELLS)
+    let mut h = 0.0
+    let mut b = 0
+    while b < N_BINS {
+        let c = count_bin(state, b)
+        if c > 0 {
+            let p = to_float(c) / n
+            h = h - p * approx_ln(p)
+        }
+        b = b + 1
+    }
+    return h
+}
+
+fn normalized_entropy(state: array) -> float {
+    return shannon_entropy(state) / LN_N_BINS
+}
+
+// ================================================================
+// Self-tests  T1-T5
+// ================================================================
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn check_T1_low_noise_ordered() -> bool {
+    // Low noise -> state stays clustered (low entropy).
+    let s0 = dissolution_new()
+    let result = dissolution_run(s0, LOW_NOISE, 42, 50)
+    let state = extract_state(result)
+    let h = normalized_entropy(state)
+    let ok = h < 0.5
+    println("  [T1] low noise (amp=" + str(LOW_NOISE) + ") 50 steps: H_norm=" + str(h) + " (< 0.5)")
+    return ok
+}
+
+fn check_T2_high_noise_disordered() -> bool {
+    // High noise -> approaches max entropy (dissolution).
+    let s0 = dissolution_new()
+    let result = dissolution_run(s0, HIGH_NOISE, 42, 200)
+    let state = extract_state(result)
+    let h = normalized_entropy(state)
+    let ok = h > 0.5
+    println("  [T2] high noise (amp=" + str(HIGH_NOISE) + ") 200 steps: H_norm=" + str(h) + " (> 0.5)")
+    return ok
+}
+
+fn check_T3_reduce_noise_order_returns() -> bool {
+    // GATE CRITERION: controllability — dissolve, then reduce noise.
+    // Phase 1: dissolve with HIGH_NOISE (100 steps)
+    let s0 = dissolution_new()
+    let r1 = dissolution_run(s0, HIGH_NOISE, 42, 100)
+    let disordered = extract_state(r1)
+    let sd1 = extract_seed(r1)
+    let h_high = normalized_entropy(disordered)
+    // Phase 2: recover with LOW_NOISE (300 steps, longer for mean-reversion)
+    let r2 = dissolution_run(disordered, LOW_NOISE, sd1, 300)
+    let recovered = extract_state(r2)
+    let h_low = normalized_entropy(recovered)
+    // Entropy must decrease — order returns when noise is reduced
+    let ok = h_low < h_high
+    println("  [T3] controllability: H_disordered=" + str(h_high) + " -> H_recovered=" + str(h_low))
+    if ok { println("       entropy decreased — order restored (gate pass)") }
+    return ok
+}
+
+fn check_T4_determinism() -> bool {
+    // Two identical runs must produce identical entropy.
+    let s0a = dissolution_new()
+    let r_a = dissolution_run(s0a, 1.5, 999, 80)
+    let state_a = extract_state(r_a)
+    let h_a = shannon_entropy(state_a)
+    let s0b = dissolution_new()
+    let r_b = dissolution_run(s0b, 1.5, 999, 80)
+    let state_b = extract_state(r_b)
+    let h_b = shannon_entropy(state_b)
+    let ok = fabs(h_a - h_b) == 0.0
+    println("  [T4] determinism: H_a=" + str(h_a) + " H_b=" + str(h_b) + " match=" + str(ok))
+    return ok
+}
+
+fn check_T5_latency() -> bool {
+    // 500 steps must complete in < 500 ms.
+    let t0 = clock()
+    let s0 = dissolution_new()
+    let result = dissolution_run(s0, 1.0, 12345, 500)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    let ok = ms < 500.0
+    println("  [T5] 500 steps in " + str(ms) + " ms (< 500 ms)")
+    return ok
+}
+
+// ================================================================
+// Test runner
+// ================================================================
+
+fn test() {
+    println("[thermodynamic/entropy_dissolution] PHYS-P19-1 — entropy-driven dissolution")
+    println("  N_CELLS=" + str(N_CELLS) + " N_BINS=" + str(N_BINS))
+    println("  done_criteria: entropy control (controllable noise amplitude)")
+    println("")
+
+    let t1 = check_T1_low_noise_ordered()
+    if t1 { println("T1 PASS — low noise keeps ordered state (low entropy)") }
+    if !t1 { println("T1 FAIL") }
+
+    let t2 = check_T2_high_noise_disordered()
+    if t2 { println("T2 PASS — high noise drives dissolution (high entropy)") }
+    if !t2 { println("T2 FAIL") }
+
+    let t3 = check_T3_reduce_noise_order_returns()
+    if t3 { println("T3 PASS — reduce noise restores order (gate: controllable)") }
+    if !t3 { println("T3 FAIL") }
+
+    let t4 = check_T4_determinism()
+    if t4 { println("T4 PASS — deterministic (identical runs match)") }
+    if !t4 { println("T4 FAIL") }
+
+    let t5 = check_T5_latency()
+    if t5 { println("T5 PASS — 500 steps under 500 ms") }
+    if !t5 { println("T5 FAIL") }
+
+    println("")
+    let mut pass_count = 0
+    if t1 { pass_count = pass_count + 1 }
+    if t2 { pass_count = pass_count + 1 }
+    if t3 { pass_count = pass_count + 1 }
+    if t4 { pass_count = pass_count + 1 }
+    if t5 { pass_count = pass_count + 1 }
+
+    if pass_count == 5 {
+        println("[thermodynamic/entropy_dissolution] 5/5 PASS — PHYS-P19-1 DONE")
+    }
+    if pass_count < 5 {
+        println("[thermodynamic/entropy_dissolution] " + str(pass_count) + "/5 PASS — SOME FAILED")
+    }
+}
+
+test()
