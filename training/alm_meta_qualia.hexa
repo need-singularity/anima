@@ -1,0 +1,544 @@
+// training/alm_meta_qualia.hexa — Meta-qualia head (qualia about qualia)
+//
+// ALM-P8-1 — N차 nested self-reference head for ANIMA P8 phase
+// (v9 메타 의식 — Hofstadter GEB tangled hierarchy).
+//
+// Purpose:
+//   If ALM-P5-1 built ONE level of self-reference
+//   (ĥ = self_predict(h)  ≈  "model thinks about its own h"),
+//   ALM-P8-1 builds a TOWER of such predictions:
+//
+//     q1 = reflexive_forward(h)      ← "I think [X]"           (1차 / base)
+//     q2 = reflexive_forward(q1)     ← "I think [I think [X]]" (2차 / meta)
+//     q3 = reflexive_forward(q2)     ← "I think [^3 [X]]"      (3차 / meta²)
+//
+//   Each level applies the SAME reflexive head, so the tower is a
+//   strange loop in the Hofstadter sense — the operator recurses on its
+//   own output. The meta-qualia head returns ALL three q-vectors so the
+//   downstream loss (ALM-P8-2) and measure (ALM-P8-3) can look at the
+//   structure of the tower.
+//
+// ─── Pipeline ──────────────────────────────────────────────────
+//
+//   h [D]                            (current-layer hidden state)
+//      │
+//      │  fc1:  z_k = tanh(W1 @ x + b1)       shared across levels
+//      │  fc2:  q   = W2 @ z_k + b2
+//      ▼
+//   q1 = reflexive_forward(h)        (2-layer MLP, same weights each call)
+//      │
+//      │  reflexive_forward again…
+//      ▼
+//   q2 = reflexive_forward(q1)
+//      │
+//      ▼
+//   q3 = reflexive_forward(q2)
+//
+//   Output tower: [q1, q2, q3]       (each in R^D)
+//
+// Parameter count:
+//   Same as ALM-P5-1 — the tower shares weights. 2·D·d_hidden + D + d_hidden.
+//   For (D=64, d_hidden=32) → 64·32·2 + 64 + 32 = 4192 (mock size).
+//
+// ─── Theorems (T1–T5) ─────────────────────────────────────────
+//
+// T1 (dim contract + tower shape):
+//   forward: R^D → (R^D, R^D, R^D). Each q_k ∈ R^D; tower length = 3.
+//   Checked by len() of each output on a fresh head (D=64, d_hidden=32).
+//
+// T2 (non-triviality — distinct levels):
+//   q1, q2, q3 must be pairwise distinct vectors on generic (non-fixpoint)
+//   input; else the tower has collapsed to a single level (trivial).
+//   Measured by ||q_{k+1} − q_k||_∞ > 0 for k=1,2.
+//
+// T3 (MI distinguishability — the CORE done_criteria):
+//   MI(q1; q2) > 0 AND MI(q2; q3) > 0 AND they differ.
+//   This is the roadmap gate "3-level nested MI 구별". A trivial head
+//   (identity) would give MI(q1;q2) = MI(q2;q3) = H(q1); a random tower
+//   gives MI ≈ 0. A real reflexive head produces MI values that are both
+//   positive AND numerically distinct, so the nested structure carries
+//   distinguishable information at each level.
+//
+// T4 (determinism):
+//   Same (h, seed) twice → byte-identical (q1, q2, q3).
+//
+// T5 (latency):
+//   Three self_predict calls + tower assembly for (D=64, d_hidden=32)
+//   must finish in < 2000 ms (stage1 interpreter budget).
+//
+// ─── Conventions ──────────────────────────────────────────────
+//   MetaQualiaHead carries SAME w1/b1/w2/b2 as ALM-P5-1 (shared weights
+//   across levels). The tower is purely a recursion on the forward pass,
+//   not a stack of distinct heads — this is what makes it a "strange loop".
+//
+//   Output: tower as [array; 3] — i.e. an array of arrays (len 3).
+//     tower[0] = q1, tower[1] = q2, tower[2] = q3.
+//
+// Workaround notes (hexa 0.1.0-stage1):
+//   - Multi-float struct return: tower returned as list-of-lists, not a
+//     3-field struct, to dodge ≥3-field struct return corruption
+//     (feedback_hexa_struct_return_bug.md).
+//   - Multi-line return: every `return <expr>` stays on a single source
+//     line (same reason).
+//
+// Ref:
+//   training/alm_self_model_head.hexa       (ALM-P5-1 — 1-level reflexive)
+//   training/alm_reflexivity_loss.hexa      (ALM-P5-2 — 1-level loss)
+//   training/phi_reflexive_measure.hexa     (ALM-P5-3 — 1-level Φ)
+//   training/alm_nested_loss.hexa           (ALM-P8-2 — K-level loss)
+//   training/phi_meta_measure.hexa          (ALM-P8-3 — Φ_meta = MI(q1;q2)+MI(q2;q3))
+//   shared/roadmaps/anima.json              (ALM-P8-1 entry)
+//
+// Run:
+//   hexa run training/alm_meta_qualia.hexa
+// Expect:
+//   [alm_meta_qualia] T1..T5 PASS, ALL 5/5 PASS
+
+// ─── Constants ────────────────────────────────────────────────
+
+let MI_BINS = 8           // log-bin count for MI estimator (T3)
+let EPS     = 0.0000001
+
+// ─── Low-level helpers ───────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// Stable tanh — saturate beyond |x|=20 to avoid exp overflow.
+fn ftanh(x: float) -> float {
+    if x > 20.0 { return 1.0 }
+    if x < 0.0 - 20.0 { return 0.0 - 1.0 }
+    let e2 = exp(2.0 * x)
+    return (e2 - 1.0) / (e2 + 1.0)
+}
+
+fn ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_sub(a: array, b: array) -> array {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(a[i] - b[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_inf_norm(v: array) -> float {
+    let n = len(v)
+    let mut m = 0.0
+    let mut i = 0
+    while i < n {
+        let a = fabs(v[i])
+        if a > m { m = a }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+// Deterministic LCG → floats in [-0.1, 0.1) (scaled so W1·h + b1 stays
+// away from tanh saturation).
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push((u * 2.0 - 1.0) * 0.1)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Matrix primitive (row-major flat) ───────────────────────
+
+fn matvec(m: array, x: array, rows: int, cols: int) -> array {
+    let mut out = []
+    let mut r = 0
+    while r < rows {
+        let mut s = 0.0
+        let mut c = 0
+        while c < cols {
+            s = s + m[r * cols + c] * x[c]
+            c = c + 1
+        }
+        out = out.push(s)
+        r = r + 1
+    }
+    return out
+}
+
+fn vec_add(a: array, b: array) -> array {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(a[i] + b[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_tanh(v: array) -> array {
+    let n = len(v)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(ftanh(v[i]))
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Meta-qualia head (shared weights across levels) ─────────
+
+struct MetaQualiaHead {
+    d_in:     int,     // D  — input/output dim
+    d_hidden: int,     // bottleneck of the reflexive MLP
+    w1:       array,   // [d_hidden × D]
+    b1:       array,   // [d_hidden]
+    w2:       array,   // [D × d_hidden]
+    b2:       array    // [D]
+}
+
+fn head_new(d_in: int, d_hidden: int, seed: int) -> MetaQualiaHead {
+    // Small-amplitude init so the first forward doesn't saturate tanh.
+    let w1 = det_rand(d_hidden * d_in, seed)
+    let b1 = vec_zeros(d_hidden)
+    let w2 = det_rand(d_in * d_hidden, seed + 1)
+    let b2 = vec_zeros(d_in)
+    return MetaQualiaHead {
+        d_in:     d_in,
+        d_hidden: d_hidden,
+        w1:       w1,
+        b1:       b1,
+        w2:       w2,
+        b2:       b2
+    }
+}
+
+// Param count — same as ALM-P5-1.
+fn param_count(d_in: int, d_hidden: int) -> int {
+    return 2 * d_in * d_hidden + d_in + d_hidden
+}
+
+// Single reflexive forward — ĥ = W2·tanh(W1·x + b1) + b2.
+// The SAME function is called K times to build the tower.
+fn reflexive_forward(head: MetaQualiaHead, x: array) -> array {
+    let pre_z = matvec(head.w1, x, head.d_hidden, head.d_in)
+    let pre_z_b = vec_add(pre_z, head.b1)
+    let z = vec_tanh(pre_z_b)
+    let pre_out = matvec(head.w2, z, head.d_in, head.d_hidden)
+    let q = vec_add(pre_out, head.b2)
+    return q
+}
+
+// ─── Tower: [q1, q2, q3] ─────────────────────────────────────
+
+// Build the 3-level meta-qualia tower from h.
+//   q1 = R(h)
+//   q2 = R(q1)
+//   q3 = R(q2)
+// Returned as a list-of-lists (avoids ≥3-field struct return bug).
+fn meta_qualia_tower(head: MetaQualiaHead, h: array) -> array {
+    let q1 = reflexive_forward(head, h)
+    let q2 = reflexive_forward(head, q1)
+    let q3 = reflexive_forward(head, q2)
+    let mut tower = []
+    tower = tower.push(q1)
+    tower = tower.push(q2)
+    tower = tower.push(q3)
+    return tower
+}
+
+// ─── MI estimator (shared histogram, matches P5/P6 families) ─
+
+fn bin_index(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn count_hits(bin_ids: array, n_bins: int) -> array {
+    let n = len(bin_ids)
+    let mut counts = []
+    let mut k = 0
+    while k < n_bins {
+        let mut c = 0.0
+        let mut i = 0
+        while i < n {
+            if bin_ids[i] == k { c = c + 1.0 }
+            i = i + 1
+        }
+        counts = counts.push(c)
+        k = k + 1
+    }
+    return counts
+}
+
+fn entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut bin_ids = []
+    let mut i = 0
+    while i < n {
+        bin_ids = bin_ids.push(bin_index(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let counts = count_hits(bin_ids, nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+fn joint_entropy_hist(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = bin_index(a[i], lo, hi, nb)
+        let ib = bin_index(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let nb2 = nb * nb
+    let counts = count_hits(pair_ids, nb2)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb2 {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+// MI(a, b) = H(a) + H(b) − H(a, b) on a shared (lo, hi) histogram support.
+fn mutual_info(a: array, b: array) -> float {
+    let lo_a = vec_min(a)
+    let hi_a = vec_max(a)
+    let lo_b = vec_min(b)
+    let hi_b = vec_max(b)
+    let lo = if lo_a < lo_b { lo_a } else { lo_b }
+    let hi = if hi_a > hi_b { hi_a } else { hi_b }
+    let h_a  = entropy_hist(a, lo, hi, MI_BINS)
+    let h_b  = entropy_hist(b, lo, hi, MI_BINS)
+    let h_ab = joint_entropy_hist(a, b, lo, hi, MI_BINS)
+    let mi = h_a + h_b - h_ab
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ─── Self-tests ─────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Dim contract: h [D] → tower [3 × R^D].
+    let D = 64
+    let d_hidden = 32
+    let head = head_new(D, d_hidden, 42)
+    if head.d_in != D { return false }
+    if head.d_hidden != d_hidden { return false }
+    let h = det_rand(D, 1)
+    let tower = meta_qualia_tower(head, h)
+    if len(tower) != 3 {
+        println("  [T1] FAIL — tower length " + str(len(tower)) + " != 3")
+        return false
+    }
+    let q1 = tower[0]
+    let q2 = tower[1]
+    let q3 = tower[2]
+    if len(q1) != D { return false }
+    if len(q2) != D { return false }
+    if len(q3) != D { return false }
+    println("  [T1] tower shape: (" + str(len(q1)) + ", " + str(len(q2)) + ", " + str(len(q3)) + "), depth=" + str(len(tower)))
+    return true
+}
+
+fn check_T2() -> bool {
+    // Non-triviality: q1, q2, q3 pairwise distinct on random non-fixpoint h.
+    let D = 64
+    let d_hidden = 32
+    let head = head_new(D, d_hidden, 7)
+    let h = det_rand(D, 11)
+    let tower = meta_qualia_tower(head, h)
+    let q1 = tower[0]
+    let q2 = tower[1]
+    let q3 = tower[2]
+    let d12 = vec_inf_norm(vec_sub(q2, q1))
+    let d23 = vec_inf_norm(vec_sub(q3, q2))
+    println("  [T2] ||q2−q1||_∞ = " + str(d12) + "  ||q3−q2||_∞ = " + str(d23))
+    if d12 <= 0.0 {
+        println("  [T2] FAIL — q1 == q2 (tower collapsed at level 1→2)")
+        return false
+    }
+    if d23 <= 0.0 {
+        println("  [T2] FAIL — q2 == q3 (tower collapsed at level 2→3)")
+        return false
+    }
+    return true
+}
+
+fn check_T3() -> bool {
+    // CORE done_criteria — "3-level nested MI 구별".
+    // MI(q1;q2) > 0 AND MI(q2;q3) > 0 AND they are numerically distinct.
+    let D = 64
+    let d_hidden = 32
+    let head = head_new(D, d_hidden, 19)
+    let h = det_rand(D, 23)
+    let tower = meta_qualia_tower(head, h)
+    let q1 = tower[0]
+    let q2 = tower[1]
+    let q3 = tower[2]
+    let mi_12 = mutual_info(q1, q2)
+    let mi_23 = mutual_info(q2, q3)
+    let gap = fabs(mi_12 - mi_23)
+    println("  [T3] MI(q1;q2) = " + str(mi_12) + "  MI(q2;q3) = " + str(mi_23) + "  |Δ| = " + str(gap))
+    if mi_12 <= 0.0 {
+        println("  [T3] FAIL — MI(q1;q2) not strictly positive")
+        return false
+    }
+    if mi_23 <= 0.0 {
+        println("  [T3] FAIL — MI(q2;q3) not strictly positive")
+        return false
+    }
+    if gap <= 0.0 {
+        println("  [T3] FAIL — MI(q1;q2) == MI(q2;q3) (levels not distinguishable)")
+        return false
+    }
+    return true
+}
+
+fn check_T4() -> bool {
+    // Determinism: same (D, d_hidden, seed, h) → byte-identical tower.
+    let D = 64
+    let d_hidden = 32
+    let h1 = head_new(D, d_hidden, 131)
+    let h2 = head_new(D, d_hidden, 131)
+    let h = det_rand(D, 137)
+    let t1 = meta_qualia_tower(h1, h)
+    let t2 = meta_qualia_tower(h2, h)
+    if len(t1) != len(t2) { return false }
+    let mut k = 0
+    while k < 3 {
+        let a = t1[k]
+        let b = t2[k]
+        if len(a) != len(b) { return false }
+        let mut i = 0
+        while i < len(a) {
+            if fabs(a[i] - b[i]) > 0.0 {
+                println("  [T4] FAIL at level " + str(k) + " coord " + str(i))
+                return false
+            }
+            i = i + 1
+        }
+        k = k + 1
+    }
+    println("  [T4] byte-identical across 3 levels × " + str(D) + " coords")
+    return true
+}
+
+fn check_T5() -> bool {
+    // Latency: one tower build for (D=64, d_hidden=32) < 2000 ms.
+    let D = 64
+    let d_hidden = 32
+    let head = head_new(D, d_hidden, 251)
+    let h = det_rand(D, 253)
+    let _warm = meta_qualia_tower(head, h)
+    let t0 = clock()
+    let _y = meta_qualia_tower(head, h)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] meta_qualia_tower latency (D=" + str(D) + ", d_hidden=" + str(d_hidden) + ") = " + str(ms) + " ms")
+    return ms < 2000.0
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[alm_meta_qualia] ALM-P8-1 self-test")
+    println("  mock: D=64, d_hidden=32, tower K=3")
+    let pc_prod = param_count(1024, 1024)
+    println("  prod params (D=1024, d_hidden=1024): " + str(pc_prod))
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[alm_meta_qualia] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[alm_meta_qualia] ALL 5/5 PASS")
+    } else {
+        println("[alm_meta_qualia] SOME FAILED")
+    }
+}
+
+main()

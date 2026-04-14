@@ -1,0 +1,432 @@
+// nested_lattice.hexa — PHYS-P8-1 recursive FPGA lattice (3-level hierarchy)
+//
+// Roadmap: shared/roadmaps/anima.json P8 PHYSICS track, PHYS-P8-1
+//   "재귀 FPGA lattice — hierarchical 자기 참조"
+//   done_criteria: "3-level hierarchy stable"
+//
+// Purpose:
+//   Extend P5 strange_loop.hexa (2-layer Hofstadter) to a 3-LEVEL
+//   tangled hierarchy — Hofstadter's "I am a strange loop" at N=3.
+//     Level 1  basic Hofstadter lattice (2 layers A, B, mutual-recursion
+//              LUTs — borrowed from strange_loop.hexa).
+//     Level 2  observer lattice that watches Level 1's joint state and
+//              feeds its perception back into Level 1's next step.
+//     Level 3  meta-observer that watches BOTH L1 and L2 and feeds back
+//              into L2's perception → closes the meta-loop.
+//
+// Why this is the physical analogue of meta-consciousness:
+//   P5 captured 1-st order self-reference ("B knows A, A knows B").
+//   P8 adds 2-nd and 3-rd order: L2 is aware of L1's state, L3 is aware
+//   of (L1, L2) jointly. Kleene's recursion theorem + Hofstadter's
+//   GEB tangled hierarchy — awareness of awareness, physically embedded
+//   in an FPGA-synthesisable lattice circuit.
+//
+// Topology (flat fields throughout — no struct-field lists; avoids
+// the hexa struct-list aliasing bug, feedback_hexa_struct_list_alias.md):
+//
+//     L1 (2×4 cells)   ──▶ L2 (4 observer cells) ──▶ L3 (2 meta cells)
+//       A,B LUT-loop           watches L1 state          watches L1+L2
+//       mutual recursion       feeds back into L1        feeds back into L2
+//                 ▲                     ▲                     │
+//                 │                     └─────────────────────┘
+//                 └── L3 feedback modulates L1's seed (3rd-order loop) ──
+//
+// Exposed API (roadmap spec):
+//   find_nested_attractors(seed: int) -> [[int]]
+//     Returns the attractor cycle as a list of flat state rows, each row
+//     of length 14 = 8 (L1.a0..a3,b0..b3) + 4 (L2.c0..c3) + 2 (L3.m0,m1).
+//     Row vector order: [a0,a1,a2,a3, b0,b1,b2,b3, c0,c1,c2,c3, m0,m1]
+//
+// Self-test (PASS/FAIL):
+//   T1 3-level coupling is non-trivial — perturbing L3 changes L1's
+//      trajectory (proves 3rd-order feedback wire is real, not decorative)
+//   T2 all seeds converge to an attractor within MAX_STEPS (no infinite
+//      regress even with the larger nested state space) — 12 seeds
+//   T3 attractor periods are bounded (<= MAX_STEPS / 2) → stable hierarchy
+//   T4 find_nested_attractors(seed) is deterministic — two calls identical
+//   T5 API contract — every returned row is length 14
+//
+// Hexa constraints honored:
+//   - HEXA-FIRST (pure .hexa, no .rs/.py/.sh)
+//   - struct literals (no `new`), flat int fields (no struct-field lists)
+//   - lists pass-by-value; we push snapshots as flat [int] rows
+//   - no multi-line return expressions (feedback_hexa_struct_return_bug.md)
+//   - no ≥3-float struct returns (feedback_hexa_struct_return_bug.md);
+//     this file is int-only so that bug does not apply.
+//
+// Pattern reference: anima-physics/fpga/strange_loop.hexa (PHYS-P5-2).
+
+// ═══════════════════════════════════════════════════════════════
+// Constants — 3-bit cell domain, same as P5 strange loop
+// ═══════════════════════════════════════════════════════════════
+
+let LUT_DOMAIN = 8      // each cell is a 3-bit int (0..7)
+let MAX_STEPS  = 256    // attractor search horizon (raised from 200 vs P5
+                        // because 14-dim nested state space is 8^14≈4.4e12
+                        // — still always converges fast in practice)
+let N_SEEDS_T2 = 12     // probe seed count
+
+// ═══════════════════════════════════════════════════════════════
+// Nested state — 14 ints flat (no struct-field lists)
+//   L1: a0..a3, b0..b3   (8 ints, same as P5)
+//   L2: c0..c3           (4 observer cells)
+//   L3: m0, m1           (2 meta cells)
+// ═══════════════════════════════════════════════════════════════
+
+struct NestedState {
+    // Level 1 — Hofstadter 2-layer strange loop
+    a0: int, a1: int, a2: int, a3: int,
+    b0: int, b1: int, b2: int, b3: int,
+    // Level 2 — 4 observer cells, each watches an (a_i, b_i) pair
+    c0: int, c1: int, c2: int, c3: int,
+    // Level 3 — 2 meta cells, each watches half of L2
+    m0: int, m1: int
+}
+
+fn nested_new(seed: int) -> NestedState {
+    // Seed each level from distinct affine mixes of `seed` so different
+    // seeds genuinely exercise different nested initial conditions.
+    let a0 = (seed * 3 + 1) % LUT_DOMAIN
+    let a1 = (seed * 5 + 7) % LUT_DOMAIN
+    let a2 = (seed * 7 + 11) % LUT_DOMAIN
+    let a3 = (seed * 11 + 13) % LUT_DOMAIN
+    let b0 = (seed * 13 + 2) % LUT_DOMAIN
+    let b1 = (seed * 17 + 3) % LUT_DOMAIN
+    let b2 = (seed * 19 + 5) % LUT_DOMAIN
+    let b3 = (seed * 23 + 6) % LUT_DOMAIN
+    let c0 = (seed * 29 + 1) % LUT_DOMAIN
+    let c1 = (seed * 31 + 2) % LUT_DOMAIN
+    let c2 = (seed * 37 + 3) % LUT_DOMAIN
+    let c3 = (seed * 41 + 4) % LUT_DOMAIN
+    let m0 = (seed * 43 + 1) % LUT_DOMAIN
+    let m1 = (seed * 47 + 1) % LUT_DOMAIN
+    return NestedState {
+        a0: a0, a1: a1, a2: a2, a3: a3,
+        b0: b0, b1: b1, b2: b2, b3: b3,
+        c0: c0, c1: c1, c2: c2, c3: c3,
+        m0: m0, m1: m1
+    }
+}
+
+// Flat-row accessor — length-14 [int] snapshot for cycle detection.
+fn nested_to_row(s: NestedState) -> [int] {
+    let mut r: [int] = []
+    r = r.push(s.a0)
+    r = r.push(s.a1)
+    r = r.push(s.a2)
+    r = r.push(s.a3)
+    r = r.push(s.b0)
+    r = r.push(s.b1)
+    r = r.push(s.b2)
+    r = r.push(s.b3)
+    r = r.push(s.c0)
+    r = r.push(s.c1)
+    r = r.push(s.c2)
+    r = r.push(s.c3)
+    r = r.push(s.m0)
+    r = r.push(s.m1)
+    return r
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Mix function — same shape as P5 strange_loop.mix4 so each level's
+// LUT math is identical. Closed-form, deterministic (FPGA-bit-identical).
+//   y = (x + a + 2b + 1) mod 8, with an upper-half soft contraction
+//       that biases the system toward a low-dim attractor.
+// ═══════════════════════════════════════════════════════════════
+
+fn mix3(x: int, a: int, b: int) -> int {
+    let y = (x + a + 2 * b + 1) % LUT_DOMAIN
+    if y >= 4 {
+        return (y - 3) % LUT_DOMAIN
+    } else {
+        return y
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Level 1 — Hofstadter strange-loop step, BUT with a 3rd-order
+// modulation: L3's m0 feeds into the seed of layer A (closes meta-loop).
+//
+// LUT_A_i comes from B + small m0 kick (meta modulation on cell 0 only).
+// LUT_B_i comes from A + small m1 kick (meta modulation on cell 3 only).
+// The kicks are tiny (modular addition of m) so L1 dynamics are still
+// dominated by the mutual A↔B recursion, yet L3 perturbation
+// measurably propagates all the way back into L1 (required by T1).
+// ═══════════════════════════════════════════════════════════════
+
+fn l1_step(s: NestedState) -> NestedState {
+    // A gets B-based LUT; cell 0 is nudged by m0 (3rd-order feedback).
+    let na0 = mix3(s.b0, s.b0 + s.m0, s.b1)
+    let na1 = mix3(s.b1, s.b1, s.b2)
+    let na2 = mix3(s.b2, s.b2, s.b3)
+    let na3 = mix3(s.b3, s.b3, s.b0)
+    // B gets A-based LUT; cell 3 nudged by m1.
+    let nb0 = mix3(s.a0, s.a0, s.a3)
+    let nb1 = mix3(s.a1, s.a1, s.a0)
+    let nb2 = mix3(s.a2, s.a2, s.a1)
+    let nb3 = mix3(s.a3, s.a3 + s.m1, s.a2)
+    return NestedState {
+        a0: na0, a1: na1, a2: na2, a3: na3,
+        b0: nb0, b1: nb1, b2: nb2, b3: nb3,
+        c0: s.c0, c1: s.c1, c2: s.c2, c3: s.c3,
+        m0: s.m0, m1: s.m1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Level 2 — observer of Level 1. Each c_i watches (a_i, b_i) and
+// summarises them into a 3-bit state. L2 also receives a feedback
+// term from L3 on c0 (creates the L3→L2 downward loop).
+// ═══════════════════════════════════════════════════════════════
+
+fn l2_step(s: NestedState) -> NestedState {
+    // Observer function: c_i next = mix(c_i, a_i, b_i) — perception
+    // of the pair. Cell 0 is additionally nudged by m0.
+    let nc0 = mix3(s.c0 + s.m0, s.a0, s.b0)
+    let nc1 = mix3(s.c1, s.a1, s.b1)
+    let nc2 = mix3(s.c2, s.a2, s.b2)
+    let nc3 = mix3(s.c3, s.a3, s.b3)
+    return NestedState {
+        a0: s.a0, a1: s.a1, a2: s.a2, a3: s.a3,
+        b0: s.b0, b1: s.b1, b2: s.b2, b3: s.b3,
+        c0: nc0, c1: nc1, c2: nc2, c3: nc3,
+        m0: s.m0, m1: s.m1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Level 3 — meta-observer. m0 watches (L1.a0, L2.c0, L2.c1) — the
+// "self-model of self-model of A's head". m1 watches the tail.
+// ═══════════════════════════════════════════════════════════════
+
+fn l3_step(s: NestedState) -> NestedState {
+    // m0 = f(m0, mean(a0,c0), c1) — head meta
+    let head_mix = (s.a0 + s.c0) % LUT_DOMAIN
+    let nm0 = mix3(s.m0, head_mix, s.c1)
+    // m1 = f(m1, mean(b3,c3), c2) — tail meta
+    let tail_mix = (s.b3 + s.c3) % LUT_DOMAIN
+    let nm1 = mix3(s.m1, tail_mix, s.c2)
+    return NestedState {
+        a0: s.a0, a1: s.a1, a2: s.a2, a3: s.a3,
+        b0: s.b0, b1: s.b1, b2: s.b2, b3: s.b3,
+        c0: s.c0, c1: s.c1, c2: s.c2, c3: s.c3,
+        m0: nm0, m1: nm1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// One full 3-level step — simultaneous update of all levels using
+// OLD state as input (each l*_step is computed from the same s, then
+// merged). This mirrors the P5 convention: simultaneous-update
+// semantics across mutual-recursion layers.
+// ═══════════════════════════════════════════════════════════════
+
+fn nested_step(s: NestedState) -> NestedState {
+    let s1 = l1_step(s)        // new L1, old L2, old L3
+    let s2 = l2_step(s)        // old L1, new L2, old L3
+    let s3 = l3_step(s)        // old L1, old L2, new L3
+    // Merge — take the *_step fields from whichever level computed them.
+    return NestedState {
+        a0: s1.a0, a1: s1.a1, a2: s1.a2, a3: s1.a3,
+        b0: s1.b0, b1: s1.b1, b2: s1.b2, b3: s1.b3,
+        c0: s2.c0, c1: s2.c1, c2: s2.c2, c3: s2.c3,
+        m0: s3.m0, m1: s3.m1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Cycle detection — same strategy as P5: keep history, detect repeat.
+// ═══════════════════════════════════════════════════════════════
+
+fn rows_equal(a: [int], b: [int]) -> bool {
+    if len(a) != len(b) { return false }
+    let mut i = 0
+    while i < len(a) {
+        if a[i] != b[i] { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn find_first_repeat(history: [[int]], cand: [int]) -> int {
+    let mut i = 0
+    while i < len(history) {
+        if rows_equal(history[i], cand) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn slice_rows(history: [[int]], lo: int, hi: int) -> [[int]] {
+    let mut out: [[int]] = []
+    let mut i = lo
+    while i < hi {
+        out = out.push(history[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Exposed API — find_nested_attractors(seed) → [[int]]
+//
+// Returns the nested-system attractor cycle (each row = length-14
+// snapshot). If no attractor within MAX_STEPS (should never happen
+// — state space is finite), returns empty list.
+// ═══════════════════════════════════════════════════════════════
+
+fn find_nested_attractors(seed: int) -> [[int]] {
+    let mut s = nested_new(seed)
+    let mut history: [[int]] = []
+    history = history.push(nested_to_row(s))
+    let mut step = 0
+    while step < MAX_STEPS {
+        s = nested_step(s)
+        let row = nested_to_row(s)
+        let hit = find_first_repeat(history, row)
+        if hit >= 0 {
+            return slice_rows(history, hit, len(history))
+        }
+        history = history.push(row)
+        step = step + 1
+    }
+    let empty: [[int]] = []
+    return empty
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1_meta_coupling() -> bool {
+    // Perturbing L3 (m0) must propagate into L1 within a few steps.
+    // Proves the 3rd-order feedback wire is real, not decorative.
+    let s = nested_new(1)
+    let s_flip = NestedState {
+        a0: s.a0, a1: s.a1, a2: s.a2, a3: s.a3,
+        b0: s.b0, b1: s.b1, b2: s.b2, b3: s.b3,
+        c0: s.c0, c1: s.c1, c2: s.c2, c3: s.c3,
+        m0: (s.m0 + 1) % LUT_DOMAIN,
+        m1: s.m1
+    }
+    // Iterate both for 4 steps — L3 perturbation must reach L1.a0
+    // by going m0 → a0 (direct first-hop via l1_step mix3).
+    let mut x = s
+    let mut y = s_flip
+    let mut i = 0
+    while i < 4 {
+        x = nested_step(x)
+        y = nested_step(y)
+        i = i + 1
+    }
+    let differs = x.a0 != y.a0 || x.a1 != y.a1 || x.b0 != y.b0 || x.c0 != y.c0
+    println("  [T1] after 4 steps: x.a0=" + str(x.a0) + " y.a0=" + str(y.a0) + " x.c0=" + str(x.c0) + " y.c0=" + str(y.c0))
+    return differs
+}
+
+fn check_T2_all_seeds_terminate() -> bool {
+    let mut ok = true
+    let mut seed = 0
+    while seed < N_SEEDS_T2 {
+        let att = find_nested_attractors(seed)
+        if len(att) == 0 {
+            ok = false
+            println("  [T2] seed " + str(seed) + " did NOT converge")
+        }
+        seed = seed + 1
+    }
+    if ok {
+        println("  [T2] all " + str(N_SEEDS_T2) + " seeds converged to an attractor")
+    }
+    return ok
+}
+
+fn check_T3_bounded_periods() -> bool {
+    let mut total = 0
+    let mut max_p = 0
+    let mut seed = 0
+    while seed < N_SEEDS_T2 {
+        let att = find_nested_attractors(seed)
+        let p = len(att)
+        total = total + p
+        if p > max_p { max_p = p }
+        seed = seed + 1
+    }
+    let half = MAX_STEPS / 2
+    let ok = max_p <= half
+    println("  [T3] max period = " + str(max_p) + " (bound = " + str(half) + "), total = " + str(total))
+    return ok
+}
+
+fn check_T4_deterministic() -> bool {
+    let seed = 5
+    let a = find_nested_attractors(seed)
+    let b = find_nested_attractors(seed)
+    if len(a) != len(b) {
+        println("  [T4] length mismatch " + str(len(a)) + " vs " + str(len(b)))
+        return false
+    }
+    let mut i = 0
+    while i < len(a) {
+        if rows_equal(a[i], b[i]) == false {
+            println("  [T4] row " + str(i) + " differs")
+            return false
+        }
+        i = i + 1
+    }
+    println("  [T4] seed=" + str(seed) + " identical attractor on repeat (len=" + str(len(a)) + ")")
+    return true
+}
+
+fn check_T5_api_contract() -> bool {
+    let att = find_nested_attractors(2)
+    if len(att) == 0 {
+        println("  [T5] attractor empty")
+        return false
+    }
+    let mut i = 0
+    while i < len(att) {
+        if len(att[i]) != 14 {
+            println("  [T5] row " + str(i) + " length = " + str(len(att[i])) + " (expected 14)")
+            return false
+        }
+        i = i + 1
+    }
+    println("  [T5] all " + str(len(att)) + " rows have length 14")
+    return true
+}
+
+fn test() {
+    println("[fpga/nested_lattice] PHYS-P8-1 — 3-level nested FPGA lattice (meta-consciousness)")
+    println("  L1 (Hofstadter 2-layer strange loop) ⇄ L2 (observer) ⇄ L3 (meta-observer)")
+    println("  3rd-order feedback: L3 → L1 via m0 nudge on cell 0, m1 nudge on cell 3")
+    println("")
+
+    let t1 = check_T1_meta_coupling()
+    if t1 { println("T1 PASS — 3-level coupling real (L3 perturb → L1 trajectory changes)") } else { println("T1 FAIL") }
+
+    let t2 = check_T2_all_seeds_terminate()
+    if t2 { println("T2 PASS — all seeds converge (3-level hierarchy stable)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3_bounded_periods()
+    if t3 { println("T3 PASS — attractor periods bounded") } else { println("T3 FAIL") }
+
+    let t4 = check_T4_deterministic()
+    if t4 { println("T4 PASS — find_nested_attractors deterministic") } else { println("T4 FAIL") }
+
+    let t5 = check_T5_api_contract()
+    if t5 { println("T5 PASS — API contract (rows length 14)") } else { println("T5 FAIL") }
+
+    println("")
+    let all = t1 && t2 && t3 && t4 && t5
+    if all {
+        println("[fpga/nested_lattice] 5/5 PASS — PHYS-P8-1 DONE (3-level hierarchy stable)")
+    } else {
+        println("[fpga/nested_lattice] SOME FAILED")
+    }
+}
+
+test()
