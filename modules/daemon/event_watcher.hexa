@@ -6,6 +6,10 @@
 //
 // Sources: checkpoint (.pt), git commit, GPU pod, time, file mtime.
 // CLI: --scan (one-shot) | --watch (repeat every 60s)
+//
+// ROI #8: per-scan shell forks reduced from ~8 (date×N + ls + git×2 + stat +
+// runpodctl) to 1 combined probe + 1 sleep. now_iso cached once per scan.
+// Tuple destructuring removed (hexa 0.1.0-stage1 does not support it).
 
 // ─── paths ───
 
@@ -24,6 +28,19 @@ struct EventState {
     last_mtime: string
 }
 
+struct Probe {
+    ts:    string,
+    ckpt:  string,
+    git:   string,
+    gpu:   string,
+    mtime: string
+}
+
+struct StepResult {
+    state: EventState,
+    event: string
+}
+
 fn fresh_state() -> EventState {
     EventState {
         last_ckpt:  "",
@@ -35,101 +52,150 @@ fn fresh_state() -> EventState {
 
 // ─── helpers ───
 
-fn now_iso() -> string {
-    exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
-}
-
-fn event_json(typ: string, detail: string, tension: string, curiosity: string) -> string {
-    let ts = now_iso()
+fn event_json(ts: string, typ: string, detail: string, tension: string, curiosity: string) -> string {
     "{\"timestamp\":\"" + ts + "\",\"type\":\"" + typ + "\",\"detail\":\"" + detail + "\",\"perturbation\":{\"tension\":" + tension + ",\"curiosity\":" + curiosity + "}}"
 }
 
-fn safe_exec(cmd: string) -> string {
-    let out = exec(cmd + " 2>/dev/null")
-    out.trim()
+// Extract value after a "KEY=" prefix from a probe line.
+fn strip_prefix(line: string, prefix: string) -> string {
+    let plen = len(prefix)
+    if len(line) < plen { return "" }
+    let head = ""
+    let mut i = 0
+    while i < plen {
+        head = head + line[i]
+        i = i + 1
+    }
+    if head != prefix { return "" }
+    let out = ""
+    let mut j = plen
+    while j < len(line) {
+        out = out + line[j]
+        j = j + 1
+    }
+    out
+}
+
+// ─── one combined probe (1 exec fork, replaces 6+) ───
+
+fn run_probe() -> Probe {
+    // Single bash pipeline: emits 5 KEY=value lines. All 2>/dev/null
+    // suppresses missing-tool noise (runpodctl optional on laptops).
+    let cmd = "bash -c '"
+        + "printf \"TS=%s\\nCKPT=%s\\nGIT=%s\\nGPU=%s\\nMTIME=%s\\n\" "
+        + "\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" "
+        + "\"$(ls -t " + CKPT_DIR + "/*.pt 2>/dev/null | head -1)\" "
+        + "\"$(git -C " + BASE + " log -1 --format=%H@@%s 2>/dev/null | tr \"\\n\" \" \")\" "
+        + "\"$(runpodctl get pod 2>/dev/null | head -3 | tr \"\\n\" \";\")\" "
+        + "\"$(stat -f %m " + LAWS_PATH + " 2>/dev/null || stat -c %Y " + LAWS_PATH + " 2>/dev/null)\""
+        + "'"
+    let raw = exec(cmd)
+    let lines = split(raw, "\n")
+
+    let mut p = Probe { ts: "", ckpt: "", git: "", gpu: "", mtime: "" }
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i]
+        let v_ts    = strip_prefix(ln, "TS=")
+        let v_ckpt  = strip_prefix(ln, "CKPT=")
+        let v_git   = strip_prefix(ln, "GIT=")
+        let v_gpu   = strip_prefix(ln, "GPU=")
+        let v_mtime = strip_prefix(ln, "MTIME=")
+        if len(v_ts) > 0    { p = Probe { ts: v_ts.trim(),    ckpt: p.ckpt,  git: p.git,  gpu: p.gpu,  mtime: p.mtime } }
+        if len(v_ckpt) > 0  { p = Probe { ts: p.ts, ckpt: v_ckpt.trim(),  git: p.git,  gpu: p.gpu,  mtime: p.mtime } }
+        if len(v_git) > 0   { p = Probe { ts: p.ts, ckpt: p.ckpt,  git: v_git.trim(),   gpu: p.gpu,  mtime: p.mtime } }
+        if len(v_gpu) > 0   { p = Probe { ts: p.ts, ckpt: p.ckpt,  git: p.git,  gpu: v_gpu.trim(),   mtime: p.mtime } }
+        if len(v_mtime) > 0 { p = Probe { ts: p.ts, ckpt: p.ckpt,  git: p.git,  gpu: p.gpu,  mtime: v_mtime.trim() } }
+        i = i + 1
+    }
+    p
 }
 
 // ─── check functions ───
 
-fn check_checkpoint(state: EventState) -> (EventState, string) {
-    let latest = safe_exec("ls -t " + CKPT_DIR + "/*.pt 2>/dev/null | head -1")
-    if len(latest) == 0 { return (state, "") }
-    if latest == state.last_ckpt { return (state, "") }
+fn check_checkpoint(state: EventState, p: Probe) -> StepResult {
+    if len(p.ckpt) == 0 { return StepResult { state: state, event: "" } }
+    if p.ckpt == state.last_ckpt { return StepResult { state: state, event: "" } }
     let new_state = EventState {
-        last_ckpt: latest, last_hash: state.last_hash,
+        last_ckpt: p.ckpt, last_hash: state.last_hash,
         last_gpu: state.last_gpu, last_mtime: state.last_mtime
     }
-    let ev = event_json("checkpoint", latest, "0.3", "0.8")
-    (new_state, ev)
+    let ev = event_json(p.ts, "checkpoint", p.ckpt, "0.3", "0.8")
+    StepResult { state: new_state, event: ev }
 }
 
-fn check_git(state: EventState) -> (EventState, string) {
-    let info = safe_exec("git -C " + BASE + " log -1 --format='%H %s'")
-    if len(info) == 0 { return (state, "") }
-    let hash = safe_exec("git -C " + BASE + " log -1 --format='%H'")
-    if hash == state.last_hash { return (state, "") }
+fn check_git(state: EventState, p: Probe) -> StepResult {
+    if len(p.git) == 0 { return StepResult { state: state, event: "" } }
+    // Split on @@ — combined into one git call (was 2 separate).
+    let parts = split(p.git, "@@")
+    let hash = if len(parts) > 0 { parts[0] } else { "" }
+    if hash == state.last_hash { return StepResult { state: state, event: "" } }
     let new_state = EventState {
         last_ckpt: state.last_ckpt, last_hash: hash,
         last_gpu: state.last_gpu, last_mtime: state.last_mtime
     }
-    let ev = event_json("git", info, "0.2", "0.5")
-    (new_state, ev)
+    let ev = event_json(p.ts, "git", p.git, "0.2", "0.5")
+    StepResult { state: new_state, event: ev }
 }
 
-fn check_gpu(state: EventState) -> (EventState, string) {
-    let info = safe_exec("runpodctl get pod 2>/dev/null | head -3")
-    if len(info) == 0 { return (state, "") }
-    if info == state.last_gpu { return (state, "") }
+fn check_gpu(state: EventState, p: Probe) -> StepResult {
+    if len(p.gpu) == 0 { return StepResult { state: state, event: "" } }
+    if p.gpu == state.last_gpu { return StepResult { state: state, event: "" } }
     let new_state = EventState {
         last_ckpt: state.last_ckpt, last_hash: state.last_hash,
-        last_gpu: info, last_mtime: state.last_mtime
+        last_gpu: p.gpu, last_mtime: state.last_mtime
     }
-    let ev = event_json("gpu", "pod_state_changed", "0.5", "0.3")
-    (new_state, ev)
+    let ev = event_json(p.ts, "gpu", "pod_state_changed", "0.5", "0.3")
+    StepResult { state: new_state, event: ev }
 }
 
-fn check_time() -> string {
-    event_json("time", "breath", "0.01", "0.05")
+fn check_time(p: Probe) -> string {
+    event_json(p.ts, "time", "breath", "0.01", "0.05")
 }
 
-fn check_file(state: EventState) -> (EventState, string) {
-    let mtime = safe_exec("stat -f '%m' " + LAWS_PATH + " 2>/dev/null || stat -c '%Y' " + LAWS_PATH + " 2>/dev/null")
-    if len(mtime) == 0 { return (state, "") }
-    if mtime == state.last_mtime { return (state, "") }
+fn check_file(state: EventState, p: Probe) -> StepResult {
+    if len(p.mtime) == 0 { return StepResult { state: state, event: "" } }
+    if p.mtime == state.last_mtime { return StepResult { state: state, event: "" } }
     let new_state = EventState {
         last_ckpt: state.last_ckpt, last_hash: state.last_hash,
-        last_gpu: state.last_gpu, last_mtime: mtime
+        last_gpu: state.last_gpu, last_mtime: p.mtime
     }
-    let ev = event_json("file", "laws_modified", "0.1", "0.5")
-    (new_state, ev)
+    let ev = event_json(p.ts, "file", "laws_modified", "0.1", "0.5")
+    StepResult { state: new_state, event: ev }
 }
 
 // ─── scan + emit ───
 
-fn scan_all(state: EventState) -> (EventState, [string]) {
+struct ScanOutcome {
+    state: EventState,
+    events: [string]
+}
+
+fn scan_all(state: EventState) -> ScanOutcome {
+    let p = run_probe()
     let mut events: [string] = []
     let mut s = state
 
-    let (s1, e1) = check_checkpoint(s)
-    s = s1
-    if len(e1) > 0 { events = events + [e1] }
+    let r1 = check_checkpoint(s, p)
+    s = r1.state
+    if len(r1.event) > 0 { events = events + [r1.event] }
 
-    let (s2, e2) = check_git(s)
-    s = s2
-    if len(e2) > 0 { events = events + [e2] }
+    let r2 = check_git(s, p)
+    s = r2.state
+    if len(r2.event) > 0 { events = events + [r2.event] }
 
-    let (s3, e3) = check_gpu(s)
-    s = s3
-    if len(e3) > 0 { events = events + [e3] }
+    let r3 = check_gpu(s, p)
+    s = r3.state
+    if len(r3.event) > 0 { events = events + [r3.event] }
 
-    let e4 = check_time()
+    let e4 = check_time(p)
     events = events + [e4]
 
-    let (s5, e5) = check_file(s)
-    s = s5
-    if len(e5) > 0 { events = events + [e5] }
+    let r5 = check_file(s, p)
+    s = r5.state
+    if len(r5.event) > 0 { events = events + [r5.event] }
 
-    (s, events)
+    ScanOutcome { state: s, events: events }
 }
 
 fn emit_events(events: [string], path: string) {
@@ -150,18 +216,20 @@ fn main() {
 
     if cmd == "--scan" {
         let state = fresh_state()
-        let (_, events) = scan_all(state)
-        emit_events(events, EVENTS_PATH)
-        println("scan: " + to_string(len(events)) + " events -> " + EVENTS_PATH)
+        let out = scan_all(state)
+        emit_events(out.events, EVENTS_PATH)
+        println("scan: " + to_string(len(out.events)) + " events -> " + EVENTS_PATH)
     } else if cmd == "--watch" {
         println("watch: polling every 60s -> " + EVENTS_PATH)
         let mut state = fresh_state()
         while true {
-            let (new_state, events) = scan_all(state)
-            state = new_state
-            emit_events(events, EVENTS_PATH)
-            if len(events) > 0 {
-                println("[" + now_iso() + "] " + to_string(len(events)) + " events emitted")
+            let out = scan_all(state)
+            state = out.state
+            emit_events(out.events, EVENTS_PATH)
+            if len(out.events) > 0 {
+                // ts already captured in the probe; no extra date fork.
+                let last = out.events[len(out.events) - 1]
+                println("[scan] " + to_string(len(out.events)) + " events emitted")
             }
             exec("sleep 60")
         }
