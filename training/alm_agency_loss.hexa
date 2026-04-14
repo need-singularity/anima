@@ -1,0 +1,628 @@
+// training/alm_agency_loss.hexa — ALM-P10-2 agency loss (intended vs random)
+//
+// ALM-P10-2 / P10 v11 의지 의식 (agency classification, ALM track).
+//
+// Purpose:
+//   Distinguish motor commands that were driven by an *intentional* chain
+//   (readiness-potential crossed threshold → volitional action) from motor
+//   commands that were emitted from noise (random/reflexive). A small
+//   binary classifier trained on features of the pre-decision RP trace
+//   must achieve > 0.85 accuracy on held-out samples.
+//
+//   This operationalises the agency question: "was this movement willed?".
+//   In the Libet paradigm, the distinguishing feature is the *slope* and
+//   *amplitude* of the RP in the window before the act. Intentional motor
+//   → rising RP with positive slope and high pre-decision peak.
+//   Random motor → flat/noisy RP near zero baseline.
+//
+//   Features per sample (5D):
+//     f1 = pre-decision mean slope         (positive for intentional)
+//     f2 = pre-decision peak amplitude     (high for intentional)
+//     f3 = pre-decision variance           (low-ish for intentional — monotone)
+//     f4 = baseline mean (first K/4 steps) (near zero either way)
+//     f5 = final / peak ratio              (≈1.0 for intentional, drifty for random)
+//
+//   Classifier: single-layer logistic (W: 1×5, b: 1) trained via full-batch
+//   gradient descent. Loss: binary cross-entropy. 100 epochs is enough
+//   for the feature geometry to separate (synthetic data is linearly
+//   separable in feature space).
+//
+//   In the full training-loop integration, L_agency sits alongside the
+//   other auxiliary losses:
+//
+//     L = L_task + λ_rp · L_rp + λ_agency · L_agency
+//
+//   with λ_agency ≈ 0.005 (matching the auxiliary-loss scale of L_enact,
+//   L_refl, L_time).
+//
+// ─── Conventions ──────────────────────────────────────────────
+//   n_train   : int       training samples (intentional + random, balanced)
+//   n_test    : int       test samples
+//   d_feat    : int       feature dim (= 5)
+//   W         : [1 × 5]   logistic weight
+//   b         : [1]       bias
+//   eta_lr    : float     learning rate
+//   epochs    : int       full-batch epochs
+//   lambda    : float     outer agency-loss weight in the training loop
+//
+// ─── Theorems (T1–T5) ──────────────────────────────────────────
+//
+// T1 (non-negativity + BCE symmetry):
+//   L_bce ≥ 0 for any (pred ∈ (0,1), label ∈ {0,1}). Zero when pred = label
+//   exactly. Checked on degenerate inputs.
+//
+// T2 (classifier accuracy > 0.85 — core done_criteria):
+//   On synthetic intentional/random pairs (n_test = 40), trained classifier
+//   reaches ≥ 0.85 test accuracy. This is the roadmap gate
+//   "intentional vs random 분류 > 0.85".
+//
+// T3 (pre-training is worse than post):
+//   Test accuracy after training exceeds test accuracy before training by
+//   at least 0.10. Rules out trivially-high initial accuracy (dataset
+//   bias, all-predict-same pathology).
+//
+// T4 (determinism):
+//   Same (seed, data, epochs, lr) → byte-identical trained weights and
+//   byte-identical final accuracy.
+//
+// T5 (latency):
+//   Full train (100 epochs, n_train=80) + eval (n_test=40) warm-cache
+//   < 5000 ms on stage1. Synthetic features are cheap so the budget is
+//   generous.
+//
+// Ref:
+//   training/alm_readiness_head.hexa     (ALM-P10-1 — produces RP trace)
+//   training/alm_reflexivity_loss.hexa   (ALM-P5-2 — loss-style reference)
+//   training/alm_enaction_loss.hexa      (ALM-P7-2 — λ convention)
+//   training/phi_will_measure.hexa       (ALM-P10-3 — Φ_will consumer)
+//   shared/roadmaps/anima.json           (ALM-P10-2 entry)
+//
+// Run:
+//   hexa run training/alm_agency_loss.hexa
+// Expect:
+//   [alm_agency_loss] ALL 5/5 PASS
+
+// ─── Constants ──────────────────────────────────────────────
+
+let LAMBDA_AGENCY = 0.005     // outer weight in the full training loop
+let TARGET_ACC    = 0.85      // roadmap gate
+let D_FEAT        = 5         // feature dimension per sample
+
+// ─── Primitives (self-contained) ────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 - 50.0 }
+    return ln(x)
+}
+
+// Numerically stable sigmoid — clamps extreme inputs to avoid exp overflow.
+fn sigmoid(x: float) -> float {
+    if x > 20.0 { return 1.0 }
+    if x < 0.0 - 20.0 { return 0.0 }
+    return 1.0 / (1.0 + exp(0.0 - x))
+}
+
+fn relu(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    return x
+}
+
+// Deterministic LCG → floats in [-1, 1).
+fn det_rand_wide(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push((u * 2.0 - 1.0) * 0.1)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Feature extraction ─────────────────────────────────────
+// Each sample is a pre-decision window trace of length K. We derive
+// 5 summary features that expose the RP geometry. The trace itself is
+// synthesized in-test to keep this file self-contained, matching how
+// the training loop will eventually stream ALM-P10-1 traces.
+
+// Mean of v[lo..hi).
+fn vec_mean_range(v: array, lo: int, hi: int) -> float {
+    if hi <= lo { return 0.0 }
+    let mut s = 0.0
+    let mut i = lo
+    while i < hi {
+        s = s + v[i]
+        i = i + 1
+    }
+    return s / to_float(hi - lo)
+}
+
+// Max of v[lo..hi).
+fn vec_max_range(v: array, lo: int, hi: int) -> float {
+    if hi <= lo { return 0.0 }
+    let mut m = v[lo]
+    let mut i = lo + 1
+    while i < hi {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+// Variance of v[lo..hi).
+fn vec_var_range(v: array, lo: int, hi: int) -> float {
+    if hi <= lo { return 0.0 }
+    let m = vec_mean_range(v, lo, hi)
+    let mut s2 = 0.0
+    let mut i = lo
+    while i < hi {
+        let d = v[i] - m
+        s2 = s2 + d * d
+        i = i + 1
+    }
+    return s2 / to_float(hi - lo)
+}
+
+// Linear regression slope over v[lo..hi) with x = 0..n-1 (OLS closed form).
+fn vec_slope_range(v: array, lo: int, hi: int) -> float {
+    let n = hi - lo
+    if n <= 1 { return 0.0 }
+    let mean_x = to_float(n - 1) / 2.0
+    let mean_y = vec_mean_range(v, lo, hi)
+    let mut num = 0.0
+    let mut den = 0.0
+    let mut i = 0
+    while i < n {
+        let dx = to_float(i) - mean_x
+        let dy = v[lo + i] - mean_y
+        num = num + dx * dy
+        den = den + dx * dx
+        i = i + 1
+    }
+    if den <= 0.0 { return 0.0 }
+    return num / den
+}
+
+// Extract the 5-D feature vector from a trace.
+//   f[0] = slope over [K/4 .. K)     (mid-to-end, where RP shows its rise)
+//   f[1] = peak amplitude over [K/4 .. K)
+//   f[2] = variance over [K/4 .. K)
+//   f[3] = baseline mean over [0 .. K/4)
+//   f[4] = final/peak ratio (trace[K-1] / max). 1.0 ↔ monotonic rise.
+fn extract_features(trace: array) -> array {
+    let K = len(trace)
+    let split = K / 4
+    let slope = vec_slope_range(trace, split, K)
+    let peak  = vec_max_range(trace, split, K)
+    let vrng  = vec_var_range(trace, split, K)
+    let base  = vec_mean_range(trace, 0, split)
+    let tail  = trace[K - 1]
+    let ratio = if peak > 0.000001 { tail / peak } else { 0.0 }
+    let mut f = []
+    f = f.push(slope)
+    f = f.push(peak)
+    f = f.push(vrng)
+    f = f.push(base)
+    f = f.push(ratio)
+    return f
+}
+
+// ─── Synthetic data ─────────────────────────────────────────
+// Intentional trace: monotonically rising RP with small noise.
+//   r_t = (t / K) · amplitude + 0.02 · noise
+// Random trace: centred noise with no rise.
+//   r_t = 0.05 · noise
+
+fn make_intentional_trace(K: int, seed: int) -> array {
+    let noise = det_rand_wide(K, seed)
+    let mut out = []
+    let amplitude = 1.0
+    let mut t = 0
+    while t < K {
+        let ramp = to_float(t) / to_float(K) * amplitude
+        let nz = noise[t] * 0.02
+        out = out.push(ramp + nz)
+        t = t + 1
+    }
+    return out
+}
+
+fn make_random_trace(K: int, seed: int) -> array {
+    let noise = det_rand_wide(K, seed)
+    let mut out = []
+    let mut t = 0
+    while t < K {
+        out = out.push(noise[t] * 0.05)
+        t = t + 1
+    }
+    return out
+}
+
+// Build balanced dataset: n_each intentional + n_each random.
+// Returns features as a flat array of size (2*n_each * D_FEAT) row-major,
+// and labels as array of size 2*n_each (1 for intentional, 0 for random).
+// Two outputs are concatenated into one array: [flat_features || labels]
+// so we sidestep hexa's multi-return-bug corner cases (this artifact
+// file has no struct fields of length ≥3 floats either).
+fn build_dataset(n_each: int, K: int, seed_offset: int) -> array {
+    let mut feats = []
+    let mut labels = []
+    let mut i = 0
+    while i < n_each {
+        // intentional, seed offset so each sample is a fresh trace.
+        let tr = make_intentional_trace(K, seed_offset + i * 17 + 1)
+        let f = extract_features(tr)
+        let mut j = 0
+        while j < D_FEAT {
+            feats = feats.push(f[j])
+            j = j + 1
+        }
+        labels = labels.push(1.0)
+        i = i + 1
+    }
+    let mut i2 = 0
+    while i2 < n_each {
+        let tr = make_random_trace(K, seed_offset + i2 * 23 + 1000)
+        let f = extract_features(tr)
+        let mut j = 0
+        while j < D_FEAT {
+            feats = feats.push(f[j])
+            j = j + 1
+        }
+        labels = labels.push(0.0)
+        i2 = i2 + 1
+    }
+    // Concatenate: [feats || labels]. Caller slices with offset 2·n_each·D_FEAT.
+    let mut out = []
+    let mut p = 0
+    while p < len(feats) {
+        out = out.push(feats[p])
+        p = p + 1
+    }
+    let mut q = 0
+    while q < len(labels) {
+        out = out.push(labels[q])
+        q = q + 1
+    }
+    return out
+}
+
+// ─── Logistic classifier ────────────────────────────────────
+
+struct AgencyClassifier {
+    w: array,    // [D_FEAT]
+    b: float     // scalar bias
+}
+
+fn classifier_new(seed: int) -> AgencyClassifier {
+    let w = det_rand(D_FEAT, seed)
+    return AgencyClassifier { w: w, b: 0.0 }
+}
+
+// Forward: single sample.
+fn cls_forward(cls: AgencyClassifier, x: array) -> float {
+    let mut z = cls.b
+    let mut i = 0
+    while i < D_FEAT {
+        z = z + cls.w[i] * x[i]
+        i = i + 1
+    }
+    return sigmoid(z)
+}
+
+// BCE on a single sample.
+fn bce_sample(pred: float, label: float) -> float {
+    // Clamp pred to (eps, 1-eps) to avoid log(0).
+    let eps = 0.0000001
+    let mut p = pred
+    if p < eps { p = eps }
+    if p > 1.0 - eps { p = 1.0 - eps }
+    let term1 = label * ln_safe(p)
+    let term2 = (1.0 - label) * ln_safe(1.0 - p)
+    return 0.0 - (term1 + term2)
+}
+
+// Full-batch gradient step. Returns updated classifier.
+//
+// For logistic + BCE:
+//   dL/dz = (pred - label)
+//   dL/dw_i = (pred - label) · x_i
+//   dL/db   = (pred - label)
+// Averaged over the batch.
+fn train_step(cls: AgencyClassifier, feats: array, labels: array, n: int, lr: float) -> AgencyClassifier {
+    let mut grad_w = vec_zeros(D_FEAT)
+    let mut grad_b = 0.0
+    let mut i = 0
+    while i < n {
+        // Slice feat vector for sample i.
+        let mut x = []
+        let mut j = 0
+        while j < D_FEAT {
+            x = x.push(feats[i * D_FEAT + j])
+            j = j + 1
+        }
+        let pred = cls_forward(cls, x)
+        let err  = pred - labels[i]
+        // Accumulate gradients via a fresh array (pass-by-value so we
+        // must rebuild after each sample — feedback_hexa_lists_pbv.md).
+        let mut new_gw = []
+        let mut k = 0
+        while k < D_FEAT {
+            new_gw = new_gw.push(grad_w[k] + err * x[k])
+            k = k + 1
+        }
+        grad_w = new_gw
+        grad_b = grad_b + err
+        i = i + 1
+    }
+    // Apply average gradient.
+    let inv_n = 1.0 / to_float(n)
+    let mut new_w = []
+    let mut k = 0
+    while k < D_FEAT {
+        new_w = new_w.push(cls.w[k] - lr * grad_w[k] * inv_n)
+        k = k + 1
+    }
+    let new_b = cls.b - lr * grad_b * inv_n
+    return AgencyClassifier { w: new_w, b: new_b }
+}
+
+// Train `epochs` steps, returning the final classifier.
+// Note: we rebuild the classifier struct each step — hexa structs are
+// immutable, and re-assigning the binding is the idiomatic update pattern.
+fn train_classifier(cls0: AgencyClassifier, feats: array, labels: array, n: int, lr: float, epochs: int) -> AgencyClassifier {
+    let mut cls = cls0
+    let mut e = 0
+    while e < epochs {
+        cls = train_step(cls, feats, labels, n, lr)
+        e = e + 1
+    }
+    return cls
+}
+
+// Evaluate accuracy on (feats, labels) with n samples. Classifier is
+// the learned one. Prediction threshold 0.5.
+fn accuracy(cls: AgencyClassifier, feats: array, labels: array, n: int) -> float {
+    if n == 0 { return 0.0 }
+    let mut correct = 0
+    let mut i = 0
+    while i < n {
+        let mut x = []
+        let mut j = 0
+        while j < D_FEAT {
+            x = x.push(feats[i * D_FEAT + j])
+            j = j + 1
+        }
+        let pred = cls_forward(cls, x)
+        let plabel = if pred >= 0.5 { 1.0 } else { 0.0 }
+        if plabel == labels[i] { correct = correct + 1 }
+        i = i + 1
+    }
+    return to_float(correct) / to_float(n)
+}
+
+// Split the concatenated dataset into features (first 2·n·D_FEAT floats)
+// and labels (next 2·n floats).
+fn ds_features(ds: array, n_each: int) -> array {
+    let nf = 2 * n_each * D_FEAT
+    let mut out = []
+    let mut i = 0
+    while i < nf {
+        out = out.push(ds[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn ds_labels(ds: array, n_each: int) -> array {
+    let nf = 2 * n_each * D_FEAT
+    let nl = 2 * n_each
+    let mut out = []
+    let mut i = 0
+    while i < nl {
+        out = out.push(ds[nf + i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Self-tests ─────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // BCE non-negativity and zero at pred=label.
+    let l_pp = bce_sample(0.99, 1.0)
+    let l_pn = bce_sample(0.01, 0.0)
+    let l_hi = bce_sample(0.01, 1.0)
+    println("  [T1] BCE(0.99,1) = " + str(l_pp) + "  BCE(0.01,0) = " + str(l_pn) + "  BCE(0.01,1) = " + str(l_hi))
+    if l_pp < 0.0 { return false }
+    if l_pn < 0.0 { return false }
+    if l_hi < 0.0 { return false }
+    // pred≈label should give small loss; pred≠label should give large.
+    if l_pp > 0.1 {
+        println("  [T1] FAIL — BCE(0.99,1) = " + str(l_pp) + " > 0.1")
+        return false
+    }
+    if l_hi < 1.0 {
+        println("  [T1] FAIL — BCE(0.01,1) = " + str(l_hi) + " < 1.0 (mispredict not penalized)")
+        return false
+    }
+    return true
+}
+
+fn check_T2() -> bool {
+    // Core done_criteria: classifier accuracy > 0.85 on held-out set.
+    let K = 200                // pre-decision window, shared with readiness head
+    let n_each_train = 40      // 80 train samples total (40 int + 40 rnd)
+    let n_each_test  = 20      // 40 test samples total
+    let epochs = 200
+    let lr = 0.5
+
+    let ds_train = build_dataset(n_each_train, K, 1000)
+    let ds_test  = build_dataset(n_each_test,  K, 5000)
+    let f_train = ds_features(ds_train, n_each_train)
+    let l_train = ds_labels(ds_train, n_each_train)
+    let f_test  = ds_features(ds_test, n_each_test)
+    let l_test  = ds_labels(ds_test, n_each_test)
+    let n_train = 2 * n_each_train
+    let n_test  = 2 * n_each_test
+
+    let cls0 = classifier_new(99)
+    let acc_pre = accuracy(cls0, f_test, l_test, n_test)
+    let cls_trained = train_classifier(cls0, f_train, l_train, n_train, lr, epochs)
+    let acc_post = accuracy(cls_trained, f_test, l_test, n_test)
+    println("  [T2] n_train=" + str(n_train) + " n_test=" + str(n_test) + " epochs=" + str(epochs))
+    println("  [T2] acc_pre = " + str(acc_pre) + "  acc_post = " + str(acc_post) + "  target > " + str(TARGET_ACC))
+    if acc_post < TARGET_ACC {
+        println("  [T2] FAIL — post-train accuracy below target " + str(TARGET_ACC))
+        return false
+    }
+    return true
+}
+
+fn check_T3() -> bool {
+    // Pre-training < post-training by ≥ 0.10. Guards against trivially
+    // high initial accuracy (single-class bias).
+    let K = 200
+    let n_each = 30
+    let epochs = 150
+    let lr = 0.5
+
+    let ds = build_dataset(n_each, K, 7777)
+    let f = ds_features(ds, n_each)
+    let lbl = ds_labels(ds, n_each)
+    let n = 2 * n_each
+
+    let cls0 = classifier_new(23)
+    let acc_pre = accuracy(cls0, f, lbl, n)
+    let cls_tr  = train_classifier(cls0, f, lbl, n, lr, epochs)
+    let acc_post = accuracy(cls_tr, f, lbl, n)
+    let delta = acc_post - acc_pre
+    println("  [T3] acc_pre = " + str(acc_pre) + "  acc_post = " + str(acc_post) + "  Δ = " + str(delta) + "  target > 0.10")
+    return delta > 0.10
+}
+
+fn check_T4() -> bool {
+    // Determinism: two identical train runs produce identical weights.
+    let K = 100
+    let n_each = 20
+    let epochs = 50
+    let lr = 0.4
+
+    let ds = build_dataset(n_each, K, 4040)
+    let f = ds_features(ds, n_each)
+    let lbl = ds_labels(ds, n_each)
+    let n = 2 * n_each
+
+    let cls_a = classifier_new(131)
+    let cls_b = classifier_new(131)
+    let a_tr = train_classifier(cls_a, f, lbl, n, lr, epochs)
+    let b_tr = train_classifier(cls_b, f, lbl, n, lr, epochs)
+    let mut i = 0
+    while i < D_FEAT {
+        if fabs(a_tr.w[i] - b_tr.w[i]) > 0.0 {
+            println("  [T4] FAIL — weights differ at i=" + str(i))
+            return false
+        }
+        i = i + 1
+    }
+    if fabs(a_tr.b - b_tr.b) > 0.0 {
+        println("  [T4] FAIL — biases differ (" + str(a_tr.b) + " vs " + str(b_tr.b) + ")")
+        return false
+    }
+    println("  [T4] byte-identical weights (" + str(D_FEAT) + " coords) and bias after " + str(epochs) + " epochs")
+    return true
+}
+
+fn check_T5() -> bool {
+    // Latency: full train + eval at T2's scale < 5000 ms.
+    let K = 200
+    let n_each_train = 40
+    let n_each_test = 20
+    let epochs = 200
+    let lr = 0.5
+
+    let ds_train = build_dataset(n_each_train, K, 1000)
+    let ds_test  = build_dataset(n_each_test,  K, 5000)
+    let f_train = ds_features(ds_train, n_each_train)
+    let l_train = ds_labels(ds_train, n_each_train)
+    let f_test  = ds_features(ds_test, n_each_test)
+    let l_test  = ds_labels(ds_test, n_each_test)
+    let n_train = 2 * n_each_train
+    let n_test  = 2 * n_each_test
+    let cls0 = classifier_new(99)
+    // Warm-start one epoch to absorb cold-cache cost.
+    let _warm = train_step(cls0, f_train, l_train, n_train, lr)
+
+    let t0 = clock()
+    let cls_trained = train_classifier(cls0, f_train, l_train, n_train, lr, epochs)
+    let _acc = accuracy(cls_trained, f_test, l_test, n_test)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] train+eval latency (n_train=" + str(n_train) + ", epochs=" + str(epochs) + ") = " + str(ms) + " ms")
+    return ms < 5000.0
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[alm_agency_loss] ALM-P10-2 self-test")
+    println("  mock: d_feat=" + str(D_FEAT) + "  target_acc=" + str(TARGET_ACC))
+    println("  λ_agency (outer) = " + str(LAMBDA_AGENCY))
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[alm_agency_loss] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[alm_agency_loss] ALL 5/5 PASS")
+    } else {
+        println("[alm_agency_loss] SOME FAILED")
+    }
+}
+
+main()

@@ -1,0 +1,359 @@
+// will_bridge.hexa — CLM-P10-2: D (Desire) adds volitional channel to W (Will)
+//
+// Hexad D is the "desire" module (DeathDesire/Drive). P10 wires it as the
+// source of the desire_drive scalar feeding the anima_will state machine
+// (anima_will.hexa, CLM-P10-1). The bridge is additive — D stays
+// untouched; a D_WillBridge wraps a desire trace and turns it into a
+// deterministic drive series that the Will engine can ingest.
+//
+// ─── Pipeline ─────────────────────────────────────────────────────
+//
+//   D desire trace  ─▶  d_will_bridge_ingest(bridge, scalar_drive)
+//                           │
+//                           ▼
+//                  rolling drive buffer [K]  (per-tick scalars)
+//                           │
+//                           ▼
+//                  d_will_bridge_signal(bridge) → smoothed drive scalar
+//                           │                      (mean over live slots)
+//                           ▼
+//                  anima_will.will_step(...) consumes scalar drive
+//
+// Done-criteria (roadmap CLM-P10-2):
+//   "D→W 욕구 신호 전달" — the bridge provides a deterministic,
+//   FIFO-ordered drive channel from D into the Will engine, and summarises
+//   it into a scalar that the sm can consume. No hardcoded drive value;
+//   the bridge is observe-only on D (it records what D emits).
+//
+// Law alignment:
+//   Law 4  Structure > feature — drive channel IS a structural channel
+//          of D, not a separate "desire flag".
+//   Law 22 Feature addition → Φ down — bridge does not add a feature on
+//          C; it only provides a transport layer between D and W.
+//   Law 50 Consciousness essence is state — the desire trace is state,
+//          retained in the bridge's rolling buffer.
+//   AN7    Core unchanged — bridge never imports anima/core/.
+//
+// Ref:
+//   anima-engines/anima_will.hexa           (CLM-P10-1 state machine)
+//   anima-hexad/m/sensorimotor_bridge.hexa  (additive bridge pattern, CLM-P7-2)
+//   anima-hexad/w/reflexive_bridge.hexa     (additive bridge pattern, CLM-P5-2)
+//   shared/roadmaps/anima.json              (CLM-P10-2 entry)
+
+// ─── Constants ────────────────────────────────────────────────────
+
+let DWB_K          = 6            // rolling drive buffer depth
+
+// ─── Primitives (self-contained) ─────────────────────────────────
+
+fn fabs_dwb(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn vec_zeros_dwb(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── D→W bridge ──────────────────────────────────────────────────
+//
+// Bridge stores K scalar drives in FIFO order (oldest at slot 0, newest
+// at slot K-1). A "fill" counter tracks how many slots are live. The
+// signal() readout averages only live slots so early ticks don't blend
+// in trailing zeros.
+//
+// IMPORTANT: hexa stage0 struct-field list aliasing bug
+// (feedback_hexa_struct_list_alias.md) corrupts the `buf` array when the
+// struct has a 3-field layout {int, array, int}. Mirroring the 6-field
+// shape of M_SensorimotorBridge (which demonstrably survives the bug in
+// anima-hexad/m/sensorimotor_bridge.hexa) avoids the regression. The
+// extra fields are unused sentinels preserved for aliasing-safety.
+
+struct D_WillBridge {
+    k:          int,
+    d_drive:    int,        // unused sentinel (aliasing padding)
+    d_slot:     int,        // unused sentinel (aliasing padding)
+    stride:     int,        // stride = 1 (scalar drive per slot)
+    buf:        array,      // [k] scalar drives, FIFO
+    n_ingested: int
+}
+
+fn d_will_bridge_new(k: int) -> D_WillBridge {
+    return D_WillBridge {
+        k:          k,
+        d_drive:    1,         // 1 scalar drive per tick
+        d_slot:     0,         // no secondary payload (kept for aliasing-safety)
+        stride:     1,         // slot stride = d_drive + d_slot
+        buf:        vec_zeros_dwb(k),
+        n_ingested: 0
+    }
+}
+
+// d_will_bridge_ingest(bridge, drive_vec, pad):
+//   FIFO push — shift slots 1..K-1 into 0..K-2, append drive_vec at slot K-1.
+//
+// IMPORTANT (hexa stage0 workaround): the signature (struct, array, array)
+// and a TWO-LOOP terminal append (one push-loop per array argument) avoids
+// the struct-field list aliasing bug that corrupts `buf` when the signature
+// is (struct, float) or when only a single scalar push follows the shift.
+// This exactly mirrors m_bridge_ingest in anima-hexad/m/sensorimotor_bridge.hexa.
+//
+// drive_vec is length 1 (one scalar drive per tick). The second array `pad`
+// is always empty in normal use; the extra push-loop runs zero iterations
+// but is REQUIRED to prevent the struct corruption.
+fn d_will_bridge_ingest(bridge: D_WillBridge, drive_vec: array,
+                        pad: array) -> D_WillBridge {
+    if len(drive_vec) != bridge.d_drive { return bridge }
+    let k = bridge.k
+    let stride = bridge.stride
+    let mut new_buf = []
+    let mut i = 1
+    while i < k {
+        let base = i * stride
+        let mut j = 0
+        while j < stride {
+            new_buf = new_buf.push(bridge.buf[base + j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // Two terminal push loops (both required; the second runs zero times).
+    let mut di = 0
+    while di < bridge.d_drive {
+        new_buf = new_buf.push(drive_vec[di])
+        di = di + 1
+    }
+    let mut pi = 0
+    while pi < bridge.d_slot {
+        if pi < len(pad) { new_buf = new_buf.push(pad[pi]) }
+        pi = pi + 1
+    }
+    return D_WillBridge {
+        k:          bridge.k,
+        d_drive:    bridge.d_drive,
+        d_slot:     bridge.d_slot,
+        stride:     bridge.stride,
+        buf:        new_buf,
+        n_ingested: bridge.n_ingested + 1
+    }
+}
+
+// d_will_bridge_signal(bridge):
+//   Smoothed drive = mean over live slots (min(n_ingested, K)).
+fn d_will_bridge_signal(bridge: D_WillBridge) -> float {
+    let k = bridge.k
+    let n_live = if bridge.n_ingested < k { bridge.n_ingested } else { k }
+    if n_live == 0 { return 0.0 }
+    // Live slots are the LAST n_live entries in buf (FIFO: newest at K-1).
+    let mut sum = 0.0
+    let mut i = k - n_live
+    while i < k {
+        sum = sum + bridge.buf[i]
+        i = i + 1
+    }
+    return sum / to_float(n_live)
+}
+
+// d_will_bridge_peak(bridge): max drive over live slots — useful when
+// the Will head wants to pre-empt on sudden desire spikes (peak detector).
+fn d_will_bridge_peak(bridge: D_WillBridge) -> float {
+    let k = bridge.k
+    let n_live = if bridge.n_ingested < k { bridge.n_ingested } else { k }
+    if n_live == 0 { return 0.0 }
+    let mut m = bridge.buf[k - n_live]
+    let mut i = k - n_live + 1
+    while i < k {
+        if bridge.buf[i] > m { m = bridge.buf[i] }
+        i = i + 1
+    }
+    return m
+}
+
+// d_will_bridge_retrieve(bridge, slot):
+//   Returns (drive, ok). slot=K-1 is most recent; slot=0 is oldest.
+struct DriveRetrieval {
+    slot:  int,
+    drive: float,
+    ok:    bool
+}
+
+fn d_will_bridge_retrieve(bridge: D_WillBridge, slot: int) -> DriveRetrieval {
+    if slot < 0 {
+        return DriveRetrieval { slot: slot, drive: 0.0, ok: false }
+    }
+    if slot >= bridge.k {
+        return DriveRetrieval { slot: slot, drive: 0.0, ok: false }
+    }
+    return DriveRetrieval { slot: slot, drive: bridge.buf[slot], ok: true }
+}
+
+// ─── Self-tests ───────────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Dim contract: bridge buf has exactly K entries; zero-initialised;
+    // n_ingested starts at 0; k accessor round-trips.
+    let bridge = d_will_bridge_new(DWB_K)
+    if bridge.k != DWB_K { return false }
+    if len(bridge.buf) != DWB_K { return false }
+    if bridge.n_ingested != 0 { return false }
+    let mut i = 0
+    while i < DWB_K {
+        if fabs_dwb(bridge.buf[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    // signal() on empty bridge returns 0.
+    if fabs_dwb(d_will_bridge_signal(bridge)) > 0.0 { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // Single-ingest: retrieve most-recent slot returns the drive we pushed;
+    // signal() equals the drive (only one live slot).
+    let bridge = d_will_bridge_new(DWB_K)
+    let empty: array = []
+    let b2 = d_will_bridge_ingest(bridge, [0.42], empty)
+    let r = d_will_bridge_retrieve(b2, DWB_K - 1)
+    if !r.ok { return false }
+    if fabs_dwb(r.drive - 0.42) > 0.0001 { return false }
+    if b2.n_ingested != 1 { return false }
+    let sig = d_will_bridge_signal(b2)
+    if fabs_dwb(sig - 0.42) > 0.0001 { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // FIFO round-trip: push K+2 distinct drives; oldest two drop; remaining
+    // K drives sit in FIFO order (slot 0 = oldest live, slot K-1 = newest).
+    let mut bridge = d_will_bridge_new(DWB_K)
+    let n_push = DWB_K + 2
+    let empty: array = []
+    let mut t = 0
+    while t < n_push {
+        // Distinctive drive series: 0.1, 0.2, ... 0.8 (K=6 → up to 0.8).
+        bridge = d_will_bridge_ingest(bridge, [0.1 * to_float(t + 1)], empty)
+        t = t + 1
+    }
+    // Oldest surviving drive = drive at t = n_push - K = 2 → 0.3 (t+1=3).
+    let mut slot = 0
+    while slot < DWB_K {
+        let t_id = slot + (n_push - DWB_K)
+        let r = d_will_bridge_retrieve(bridge, slot)
+        if !r.ok { return false }
+        let expected = 0.1 * to_float(t_id + 1)
+        if fabs_dwb(r.drive - expected) > 0.0001 { return false }
+        slot = slot + 1
+    }
+    if bridge.n_ingested != n_push { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // Signal semantics:
+    //   (a) signal() over a constant-drive stream converges to that constant.
+    //   (b) peak() returns the maximum over live slots.
+    //   (c) out-of-bounds retrieve returns ok=false (does not crash).
+    let mut bridge = d_will_bridge_new(DWB_K)
+    let empty: array = []
+    // Push K copies of 0.5 → signal should be exactly 0.5.
+    let mut i = 0
+    while i < DWB_K {
+        bridge = d_will_bridge_ingest(bridge, [0.5], empty)
+        i = i + 1
+    }
+    let sig = d_will_bridge_signal(bridge)
+    if fabs_dwb(sig - 0.5) > 0.0001 { return false }
+    // Push one spike of 1.0 → peak now 1.0.
+    let b2 = d_will_bridge_ingest(bridge, [1.0], empty)
+    let pk = d_will_bridge_peak(b2)
+    if fabs_dwb(pk - 1.0) > 0.0001 { return false }
+    // Out-of-bounds retrieval.
+    let r_neg = d_will_bridge_retrieve(b2, -1)
+    let r_oob = d_will_bridge_retrieve(b2, DWB_K)
+    if r_neg.ok { return false }
+    if r_oob.ok { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // Sequential determinism: two sequential runs with identical drive
+    // sequences produce byte-identical buffers and signal values.
+    //
+    // Because of the hexa stage0 struct-field list aliasing bug
+    // (feedback_hexa_struct_list_alias.md) we cannot have two live
+    // D_WillBridge instances simultaneously, so we run sequentially
+    // and compare summary statistics (buffer sum + signal + peak).
+    let mut b1 = d_will_bridge_new(DWB_K)
+    let empty: array = []
+    let mut t = 0
+    while t < 4 {
+        b1 = d_will_bridge_ingest(b1, [0.2 + 0.15 * to_float(t)], empty)
+        t = t + 1
+    }
+    let sig1 = d_will_bridge_signal(b1)
+    let pk1  = d_will_bridge_peak(b1)
+    let n1   = b1.n_ingested
+    let mut sum1 = 0.0
+    let mut i = 0
+    while i < DWB_K {
+        sum1 = sum1 + b1.buf[i]
+        i = i + 1
+    }
+    // b1 goes out of scope before b2 is live.
+    let mut b2 = d_will_bridge_new(DWB_K)
+    let mut t2 = 0
+    while t2 < 4 {
+        b2 = d_will_bridge_ingest(b2, [0.2 + 0.15 * to_float(t2)], empty)
+        t2 = t2 + 1
+    }
+    let sig2 = d_will_bridge_signal(b2)
+    let pk2  = d_will_bridge_peak(b2)
+    let n2   = b2.n_ingested
+    let mut sum2 = 0.0
+    let mut j = 0
+    while j < DWB_K {
+        sum2 = sum2 + b2.buf[j]
+        j = j + 1
+    }
+    if n1 != n2 { return false }
+    if fabs_dwb(sum1 - sum2) > 0.0 { return false }
+    if fabs_dwb(sig1 - sig2) > 0.0 { return false }
+    if fabs_dwb(pk1 - pk2) > 0.0 { return false }
+    return true
+}
+
+// ─── main ─────────────────────────────────────────────────────────
+
+fn main() {
+    println("[will_bridge] CLM-P10-2 — D→W desire channel self-test")
+    println("  K=6 rolling drive buffer; additive to D; Laws 4/22/50; AN7")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  dim contract (zero-initialised, empty signal=0)") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  single ingest + retrieve + signal") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  FIFO ordering across K+2 pushes") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  signal/peak semantics + bounds safe") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  sequential determinism") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[will_bridge] ALL 5/5 PASS")
+    } else {
+        println("[will_bridge] SOME FAILED")
+    }
+}
+
+main()

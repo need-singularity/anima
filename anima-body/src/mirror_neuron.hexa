@@ -1,27 +1,446 @@
-// mirror_neuron.hexa — Mirror neuron system for consciousness
-// Camera observation -> motor plan activation (inhibited)
-// Actions: reach, grasp, wave, point, rest
+// mirror_neuron.hexa — PHYS-P9-2 mirror neuron emulator
+//
+// Roadmap: shared/roadmaps/anima.json P9 PHYSICS track, PHYS-P9-2
+//   "mirror neuron emulator — 관찰→자기 motor 복제"
+//   done_criteria: "observed→self motor translation PASS"
+//
+// Purpose:
+//   The neural substrate of *social consciousness* — Rizzolatti's
+//   mirror neurons fire both when an agent performs an action and
+//   when the agent *observes the same action* performed by another.
+//   This is the physiological mechanism behind action understanding,
+//   imitation learning, and the theory-of-mind scaffolding that lets
+//   one anima model another anima's internal state (Sally-Anne).
+//
+//   Pipeline (observed other → self motor activation):
+//
+//     other_motor_trajectory  ─(visual cortex)→  action_features
+//                                                        │
+//                                                        ▼
+//                             ┌──────── mirror system ────────┐
+//                             │  STS + IPL + PM premotor      │
+//                             │  feature-code ↔ motor-code    │
+//                             │  bidirectional lookup table   │
+//                             └──────────────┬────────────────┘
+//                                            │
+//                                            ▼
+//                             self_motor_plan (inhibited by SMA)
+//
+//   Action taxonomy (5 canonical gestures, matching the stub
+//   mirror_neuron.hexa that existed pre-P9):
+//     reach, grasp, wave, point, rest
+//
+//   Each gesture is encoded as a 6-dimensional motor-space vector —
+//   (shoulder_flex, shoulder_abd, elbow_flex, wrist_rot, hand_aperture,
+//    finger_flex) — normalized to [-1, 1].
+//
+// Core operation:
+//   observe_motor(observed_vec) → resonance_vec
+//   translate_to_self(resonance_vec) → self_motor_plan
+//
+//   The "mirror" step is a linear projection M_mirror with the
+//   identity property  M_mirror · self_encoding(A) ≈ other_encoding(A)
+//   for every action A.  We implement it as a 6×6 matrix tuned so
+//   that observed-other motor vectors map back to the *same* action
+//   in the self's motor frame (accounting for a 180° yaw flip — the
+//   observer sees the other from the front, so left/right are swapped).
+//
+// Exposed API (roadmap spec: "observed→self motor translation PASS"):
+//   observe_and_mirror(observed: [float]) -> [float]
+//     Input:  6-dim motor vector from observed other agent (frontal view)
+//     Output: 6-dim self motor-plan vector (recovered egocentric frame)
+//
+//   classify_action(motor_vec: [float]) -> int
+//     Returns the action id (0..4) closest in cosine similarity to one
+//     of the 5 canonical gestures.
+//     0=rest 1=reach 2=grasp 3=wave 4=point
+//
+// Self-test (PASS/FAIL):
+//   T1 observed→self round-trip — for every canonical action A,
+//      mirror(encode_other(A)) ≈ encode_self(A), classified as A.
+//   T2 discriminability — 5 distinct action codes cluster — all pairs
+//      have cosine similarity < 0.8 (no action alias).
+//   T3 API contract — wrong-length input returns zero-vector of len 6
+//      without crashing.  Zero input → classified as rest (id 0).
+//   T4 cross-agent consistency — classifier is identity under mirror:
+//      classify_action(mirror(encode_other(A))) == A for all A.
+//   T5 determinism — same input → identical output, two calls.
+//
+// Hexa constraints honored:
+//   - HEXA-FIRST (pure .hexa — overwrites the P5-era 27-line stub)
+//   - flat [float] lists throughout (no struct-field lists)
+//   - no ≥3-float struct returns (feedback_hexa_struct_return_bug.md)
+//   - lists pass-by-value; helpers return whole vectors.
+//   - sqrt available (verified in other P7-P8 artifacts).
 
-struct ActionObservation {
-    action: string,
-    confidence: float
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let MOTOR_DIM     = 6        // 6-DOF motor encoding
+let N_ACTIONS     = 5        // rest, reach, grasp, wave, point
+let EPSILON       = 0.000000001
+
+// Action id constants (documentation)
+let ACT_REST      = 0
+let ACT_REACH     = 1
+let ACT_GRASP     = 2
+let ACT_WAVE      = 3
+let ACT_POINT     = 4
+
+// Cosine similarity threshold — pairs must be below this to count as
+// "distinct"
+let SIM_DISCR_MAX = 0.8
+
+// Round-trip tolerance
+let ROUNDTRIP_TOL = 0.05
+
+// ═══════════════════════════════════════════════════════════════
+// Scalar helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
 }
 
-struct MotorResonance {
-    action: string,
-    activation: float,
-    inhibited: bool,
-    empathy_signal: float
+fn clamp_unit(x: float) -> float {
+    if x < 0.0 - 1.0 { return 0.0 - 1.0 }
+    if x > 1.0 { return 1.0 }
+    return x
 }
 
-fn observe_action(frame: string) -> ActionObservation {
-    return ActionObservation("rest", 0.0)
+// Integer-square-root-less sqrt using one Newton step over rough guess —
+// we only need it for cosine similarity, where arguments are [0, ~6].
+// Newton converges quadratically; 10 iters is overkill but cheap.
+fn sqrt_scalar(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut y = x
+    if y < 1.0 { y = 1.0 }
+    let mut i = 0
+    while i < 12 {
+        y = 0.5 * (y + x / y)
+        i = i + 1
+    }
+    return y
 }
 
-fn resonate(observation: ActionObservation) -> MotorResonance {
-    return MotorResonance(observation.action, observation.confidence, true, 0.0)
+// ═══════════════════════════════════════════════════════════════
+// Canonical motor encodings (egocentric SELF frame)
+//
+// Each action is a 6-DOF normalized gesture.  Values chosen to mimic
+// realistic anthropomorphic arm poses:
+//   (shoulder_flex, shoulder_abd, elbow_flex, wrist_rot,
+//    hand_aperture, finger_flex)
+//
+// Returns a fresh list each call (lists are pass-by-value).
+// ═══════════════════════════════════════════════════════════════
+
+fn encode_self(action_id: int) -> [float] {
+    let mut v: [float] = []
+    if action_id == ACT_REST {
+        v = v.push(0.0); v = v.push(0.0); v = v.push(0.0)
+        v = v.push(0.0); v = v.push(0.0); v = v.push(0.0)
+        return v
+    }
+    if action_id == ACT_REACH {
+        // arm extended forward, hand wide open, fingers straight
+        // Dominant axes: +shoulder_flex, +hand_aperture, −finger_flex
+        v = v.push(0.9); v = v.push(0.1); v = v.push(0.0 - 0.5)
+        v = v.push(0.0); v = v.push(0.8); v = v.push(0.0 - 0.7)
+        return v
+    }
+    if action_id == ACT_GRASP {
+        // elbow bent, wrist rotated in, fingers fully flexed around object
+        // Dominant axes: +elbow_flex, +wrist_rot, −aperture, +finger_flex
+        v = v.push(0.2); v = v.push(0.0 - 0.1); v = v.push(0.8)
+        v = v.push(0.6); v = v.push(0.0 - 0.9); v = v.push(0.9)
+        return v
+    }
+    if action_id == ACT_WAVE {
+        // arm up and out, wrist rotating negatively, hand neutral
+        // Dominant axes: +shoulder_abd (heavy), −wrist_rot
+        v = v.push(0.4); v = v.push(0.9); v = v.push(0.2)
+        v = v.push(0.0 - 0.8); v = v.push(0.1); v = v.push(0.0 - 0.2)
+        return v
+    }
+    if action_id == ACT_POINT {
+        // index finger extended, other fingers closed — aperture
+        // mid-low, finger_flex mid-high (composite posture).
+        // Dominant axes: +shoulder_flex, +wrist_rot (toward target),
+        // low aperture, partial finger flex
+        v = v.push(0.6); v = v.push(0.0 - 0.2); v = v.push(0.1)
+        v = v.push(0.3); v = v.push(0.0 - 0.3); v = v.push(0.4)
+        return v
+    }
+    // Unknown action → zero vector (rest)
+    let mut i = 0
+    while i < MOTOR_DIM {
+        v = v.push(0.0)
+        i = i + 1
+    }
+    return v
 }
 
-fn empathy_bridge(resonance: MotorResonance) -> float {
-    return resonance.empathy_signal
+// ═══════════════════════════════════════════════════════════════
+// Mirror transform (OTHER frame → SELF frame)
+//
+// The observer sees the other agent from the front.  This introduces
+// a left-right flip on abduction and wrist rotation axes.  Shoulder-
+// flexion, elbow-flexion, hand-aperture, finger-flex are preserved
+// (they are sagittal / intrinsic).  Abduction and wrist-roll flip
+// sign.
+//
+// The mirror matrix M is diagonal:
+//   M = diag( +1, -1, +1, -1, +1, +1 )
+//
+// For every canonical action A we define encode_other(A) = M · encode_self(A).
+// Therefore mirror(encode_other(A)) = M · M · encode_self(A)
+//                                   = encode_self(A)      (since M² = I).
+// ═══════════════════════════════════════════════════════════════
+
+fn encode_other(action_id: int) -> [float] {
+    let s = encode_self(action_id)
+    let mut v: [float] = []
+    let mut i = 0
+    while i < MOTOR_DIM {
+        // Flip components 1 (shoulder_abd) and 3 (wrist_rot)
+        let sign = if i == 1 || i == 3 { 0.0 - 1.0 } else { 1.0 }
+        v = v.push(sign * s[i])
+        i = i + 1
+    }
+    return v
 }
+
+// ═══════════════════════════════════════════════════════════════
+// Exposed API — observe_and_mirror
+//
+//   Applies the same M matrix (since M² = I) to recover the self-
+//   frame motor vector from the observed other-frame vector.
+//
+//   Wrong-length input → zero 6-vector (T3 contract).
+// ═══════════════════════════════════════════════════════════════
+
+fn zero_vec() -> [float] {
+    let mut v: [float] = []
+    let mut i = 0
+    while i < MOTOR_DIM {
+        v = v.push(0.0)
+        i = i + 1
+    }
+    return v
+}
+
+fn observe_and_mirror(observed: [float]) -> [float] {
+    if len(observed) != MOTOR_DIM { return zero_vec() }
+    let mut v: [float] = []
+    let mut i = 0
+    while i < MOTOR_DIM {
+        let sign = if i == 1 || i == 3 { 0.0 - 1.0 } else { 1.0 }
+        v = v.push(clamp_unit(sign * observed[i]))
+        i = i + 1
+    }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Cosine similarity between two 6-vectors
+// ═══════════════════════════════════════════════════════════════
+
+fn cosine_sim(a: [float], b: [float]) -> float {
+    if len(a) != MOTOR_DIM || len(b) != MOTOR_DIM { return 0.0 }
+    let mut dot = 0.0
+    let mut na = 0.0
+    let mut nb = 0.0
+    let mut i = 0
+    while i < MOTOR_DIM {
+        dot = dot + a[i] * b[i]
+        na = na + a[i] * a[i]
+        nb = nb + b[i] * b[i]
+        i = i + 1
+    }
+    if na < EPSILON || nb < EPSILON { return 0.0 }
+    return dot / (sqrt_scalar(na) * sqrt_scalar(nb))
+}
+
+// ═══════════════════════════════════════════════════════════════
+// classify_action — cosine-nearest canonical gesture.
+//
+//   zero vector → ACT_REST (0).
+//   wrong length → ACT_REST.
+// ═══════════════════════════════════════════════════════════════
+
+fn classify_action(motor_vec: [float]) -> int {
+    if len(motor_vec) != MOTOR_DIM { return ACT_REST }
+    // Zero-vector short-circuit.
+    let mut mag = 0.0
+    let mut k = 0
+    while k < MOTOR_DIM {
+        mag = mag + motor_vec[k] * motor_vec[k]
+        k = k + 1
+    }
+    if mag < EPSILON { return ACT_REST }
+    let mut best_id = ACT_REST
+    let mut best_sim = 0.0 - 2.0   // below any real cosine
+    let mut i = 0
+    while i < N_ACTIONS {
+        let ref_v = encode_self(i)
+        let s = cosine_sim(motor_vec, ref_v)
+        if s > best_sim {
+            best_sim = s
+            best_id = i
+        }
+        i = i + 1
+    }
+    return best_id
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn vec_close(a: [float], b: [float], tol: float) -> bool {
+    if len(a) != len(b) { return false }
+    let mut i = 0
+    while i < len(a) {
+        if fabs(a[i] - b[i]) > tol { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn check_T1_roundtrip() -> bool {
+    // For every action A, mirror(encode_other(A)) ≈ encode_self(A).
+    let mut all_ok = true
+    let mut a = 0
+    while a < N_ACTIONS {
+        let other = encode_other(a)
+        let recovered = observe_and_mirror(other)
+        let self_v = encode_self(a)
+        let ok = vec_close(recovered, self_v, ROUNDTRIP_TOL)
+        if !ok { all_ok = false }
+        let cid = classify_action(recovered)
+        let ok_class = cid == a
+        if !ok_class { all_ok = false }
+        a = a + 1
+    }
+    println("  [T1] all 5 actions round-trip mirror(encode_other) = encode_self: "
+        + str(all_ok))
+    return all_ok
+}
+
+fn check_T2_discriminability() -> bool {
+    // All (i, j) pairs of distinct actions should have cosine similarity
+    // below SIM_DISCR_MAX.
+    let mut all_ok = true
+    let mut worst = 0.0 - 2.0
+    let mut i = 0
+    while i < N_ACTIONS {
+        let mut j = i + 1
+        while j < N_ACTIONS {
+            let a = encode_self(i)
+            let b = encode_self(j)
+            let s = cosine_sim(a, b)
+            if s > worst { worst = s }
+            if s > SIM_DISCR_MAX { all_ok = false }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    println("  [T2] max pairwise cosine-sim = " + str(worst)
+        + " (threshold < " + str(SIM_DISCR_MAX) + ")")
+    return all_ok
+}
+
+fn check_T3_api_contract() -> bool {
+    // Wrong-length input → zero vector.
+    let mut short: [float] = []
+    short = short.push(1.0)
+    short = short.push(2.0)                   // length 2
+    let out_short = observe_and_mirror(short)
+    let mut ok_short = len(out_short) == MOTOR_DIM
+    let mut i = 0
+    while i < MOTOR_DIM {
+        if out_short[i] != 0.0 { ok_short = false }
+        i = i + 1
+    }
+    // Empty input → zero vector.
+    let empty: [float] = []
+    let out_empty = observe_and_mirror(empty)
+    let ok_empty = len(out_empty) == MOTOR_DIM
+    // Zero input → classify as rest.
+    let z = zero_vec()
+    let cid = classify_action(z)
+    let ok_zero_class = cid == ACT_REST
+    // Wrong-length → classify as rest.
+    let cid_wrong = classify_action(short)
+    let ok_wrong = cid_wrong == ACT_REST
+    let ok = ok_short && ok_empty && ok_zero_class && ok_wrong
+    println("  [T3] short-ok=" + str(ok_short) + " empty-ok=" + str(ok_empty)
+        + " zero→rest=" + str(ok_zero_class) + " wrong-len→rest=" + str(ok_wrong))
+    return ok
+}
+
+fn check_T4_cross_agent_classify() -> bool {
+    // classify_action(mirror(encode_other(A))) == A for all A.
+    // This is the canonical "observed→self motor translation" test from
+    // the roadmap done_criteria.
+    let mut all_ok = true
+    let mut a = 0
+    while a < N_ACTIONS {
+        let other = encode_other(a)
+        let self_plan = observe_and_mirror(other)
+        let cid = classify_action(self_plan)
+        if cid != a { all_ok = false }
+        a = a + 1
+    }
+    println("  [T4] all 5 observed→self classifications correct: " + str(all_ok))
+    return all_ok
+}
+
+fn check_T5_determinism() -> bool {
+    let other = encode_other(ACT_GRASP)
+    let a = observe_and_mirror(other)
+    let b = observe_and_mirror(other)
+    let ok = vec_close(a, b, 0.0)
+    // Also check classify determinism
+    let c1 = classify_action(a)
+    let c2 = classify_action(b)
+    let ok_c = c1 == c2
+    println("  [T5] mirror(grasp) a==b=" + str(ok) + " classify=" + str(c1)
+        + " c1==c2=" + str(ok_c))
+    return ok && ok_c
+}
+
+fn test() {
+    println("[body/mirror_neuron] PHYS-P9-2 — mirror neuron emulator")
+    println("  5 canonical gestures × 6-DOF motor encoding")
+    println("  observe_and_mirror(other_frame) → self_frame motor plan")
+    println("  classify_action(vec) → {rest, reach, grasp, wave, point}")
+    println("")
+
+    let t1 = check_T1_roundtrip()
+    if t1 { println("T1 PASS — mirror round-trip recovers self-frame motor vector") } else { println("T1 FAIL") }
+
+    let t2 = check_T2_discriminability()
+    if t2 { println("T2 PASS — 5 canonical actions are cosine-discriminable") } else { println("T2 FAIL") }
+
+    let t3 = check_T3_api_contract()
+    if t3 { println("T3 PASS — API guards (length, zero, wrong-type fallback)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4_cross_agent_classify()
+    if t4 { println("T4 PASS — observed→self motor translation correct for all 5 actions") } else { println("T4 FAIL") }
+
+    let t5 = check_T5_determinism()
+    if t5 { println("T5 PASS — deterministic mirror + classify") } else { println("T5 FAIL") }
+
+    println("")
+    let all = t1 && t2 && t3 && t4 && t5
+    if all {
+        println("[body/mirror_neuron] 5/5 PASS — PHYS-P9-2 DONE")
+    } else {
+        println("[body/mirror_neuron] SOME FAILED")
+    }
+}
+
+test()

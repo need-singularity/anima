@@ -1,0 +1,540 @@
+// training/alm_readiness_head.hexa — ALM-P10-1 readiness potential head
+//
+// ALM-P10-1 / P10 v11 의지 의식 (Libet readiness potential, ALM track).
+//
+// Purpose:
+//   Emit a Libet-style readiness potential (RP) — a monotonically rising
+//   pre-decision accumulator that starts ~500 ms before a motor decision
+//   crosses threshold. This is the computational substrate for the Libet
+//   experiment finding: scalp EEG over supplementary motor area (SMA)
+//   begins rising ~500 ms before a subject reports the conscious intent
+//   to act, and ~1000 ms before the actual motor output.
+//
+//     intent drive d_t (scalar, ≥ 0)        [e.g. tanh(W_d · h_t)]
+//            │
+//            │  leaky accumulator with positive-only integration:
+//            │    r_{t+1} = max(0, (1 − α) · r_t + η · d_t)
+//            │
+//            ▼
+//     readiness trace r_0, r_1, ..., r_T     (bounded accumulator)
+//            │
+//            │  threshold crossing:
+//            │    k* = argmin_k { k : r_k ≥ θ }  → decision time
+//            │
+//            ▼
+//     decision time k*, pre-decision window [k*−K_RP, k*)
+//
+//   The "rise" the Libet paradigm claims to find is the slope of r in
+//   the K_RP = 500 ms window before k*; we verify this slope is strictly
+//   positive on a persistent non-zero drive (d_t > 0) and zero on a
+//   silent drive (d_t = 0). The rise signature is the core done_criteria.
+//
+//   Downstream:
+//     - alm_agency_loss.hexa       (ALM-P10-2) — binary classifier on
+//       the (r, d) trace distinguishing intentional from random motor.
+//     - phi_will_measure.hexa      (ALM-P10-3) — Φ_will = MI(intent_label,
+//       action) × N × counterfactual_gap.
+//
+// ─── Conventions ──────────────────────────────────────────────
+//   D         : int       hidden-state dim feeding the intent head
+//   T         : int       time steps in a trace
+//   K_RP      : int       pre-decision window (500 ms at dt=1 ms → K_RP=500)
+//   alpha     : float     leak rate per step (0 < α < 1)
+//   eta       : float     drive gain (0 < η)
+//   theta     : float     decision threshold for r
+//   W_d       : [1 × D]   intent-drive weight  (single scalar head)
+//   b_d       : [1]       intent-drive bias
+//
+// ─── Theorems (T1–T5) ──────────────────────────────────────────
+//
+// T1 (dim + monotonicity on zero leak):
+//   integrate_trace(..., α=0, constant d > 0) produces a trace of length
+//   T whose values are strictly non-decreasing (pure accumulation).
+//
+// T2 (RP rise — core done_criteria):
+//   With a persistent positive drive, the K_RP-step window immediately
+//   before the first threshold crossing has a strictly positive mean
+//   slope. The slope signature — "pre-decision signal rise observable" —
+//   is the roadmap gate. We also check the silent-drive counterfactual:
+//   zero drive yields zero rise and no threshold crossing, which rules
+//   out a head that always signals "ready".
+//
+// T3 (leak controls RP shape):
+//   Doubling α should strictly reduce the steady-state readiness level.
+//   For a persistent drive d, the fixed point is r* = η·d/α; so r*(α=2β)
+//   is half of r*(α=β). We check that the steady-state value scales
+//   correctly — guards against a leak that silently zeroes out.
+//
+// T4 (determinism):
+//   Same (D, seed, h, α, η, θ, T) → byte-identical trace and decision
+//   time k*. Hexa arrays are pass-by-value so this is pure.
+//
+// T5 (latency):
+//   integrate_trace(T=500) at D=16 warm-cache < 2000 ms on stage1.
+//
+// Ref:
+//   training/alm_sensorimotor_head.hexa    (ALM-P7-1 — matvec pattern)
+//   training/alm_temporal_attention.hexa   (ALM-P6-1 — time window pattern)
+//   training/alm_agency_loss.hexa          (ALM-P10-2 — consumes this head)
+//   training/phi_will_measure.hexa         (ALM-P10-3 — Φ_will)
+//   shared/roadmaps/anima.json             (ALM-P10-1 entry)
+//
+// Run:
+//   hexa run training/alm_readiness_head.hexa
+// Expect:
+//   [alm_readiness_head] ALL 5/5 PASS
+
+// ─── Constants ──────────────────────────────────────────────
+
+let K_RP      = 500            // pre-decision window (500 ms ≈ Libet onset)
+let ALPHA_DEF = 0.002          // default leak rate  (steady-state r* = η·d/α)
+let ETA_DEF   = 0.01           // default drive gain
+let THETA_DEF = 1.0            // default decision threshold
+
+// ─── Primitives (self-contained) ────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ftanh(x: float) -> float {
+    if x > 20.0 { return 1.0 }
+    if x < 0.0 - 20.0 { return 0.0 - 1.0 }
+    let e2 = exp(2.0 * x)
+    return (e2 - 1.0) / (e2 + 1.0)
+}
+
+// ReLU — intent drive is one-sided (no "un-intent" signal in the Libet
+// paradigm; the RP only accumulates positive motivational pressure).
+fn relu(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    return x
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+// Deterministic LCG → bounded floats in [-0.1, 0.1). Same convention as
+// alm_self_model_head.hexa so weights compose cleanly across ALM heads.
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push((u * 2.0 - 1.0) * 0.1)
+        i = i + 1
+    }
+    return out
+}
+
+// Wider-range draw for test inputs (sensor/hidden scale ≈ 1).
+fn det_rand_wide(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+// matvec — row-major flat.
+fn matvec(m: array, x: array, rows: int, cols: int) -> array {
+    let mut out = []
+    let mut r = 0
+    while r < rows {
+        let mut s = 0.0
+        let mut c = 0
+        while c < cols {
+            s = s + m[r * cols + c] * x[c]
+            c = c + 1
+        }
+        out = out.push(s)
+        r = r + 1
+    }
+    return out
+}
+
+// ─── Readiness head ─────────────────────────────────────────
+
+struct ReadinessHead {
+    d_in:  int,     // D — hidden-state dim
+    w_d:   array,   // [1 × D] intent-drive weight (scalar head)
+    b_d:   array,   // [1] bias
+    alpha: float,   // leak rate
+    eta:   float,   // drive gain
+    theta: float    // decision threshold
+}
+
+fn readiness_head_new(d_in: int, seed: int) -> ReadinessHead {
+    // Intent-drive weight row: amplified ×5 so a typical h (amplitude ≈ 1)
+    // produces a drive of O(0.5), well above the leak floor. Without the
+    // upscale the steady-state r* would be too small to cross θ=1.0 in
+    // the T5 budget.
+    let raw = det_rand(d_in, seed)
+    let mut w_d = []
+    let mut i = 0
+    while i < d_in {
+        w_d = w_d.push(raw[i] * 5.0)
+        i = i + 1
+    }
+    return ReadinessHead {
+        d_in:  d_in,
+        w_d:   w_d,
+        b_d:   vec_zeros(1),
+        alpha: ALPHA_DEF,
+        eta:   ETA_DEF,
+        theta: THETA_DEF
+    }
+}
+
+// Variant constructor — arbitrary (alpha, eta, theta). Used by T3 to
+// probe leak-rate sensitivity.
+fn readiness_head_new_params(d_in: int, seed: int, alpha: float, eta: float, theta: float) -> ReadinessHead {
+    let raw = det_rand(d_in, seed)
+    let mut w_d = []
+    let mut i = 0
+    while i < d_in {
+        w_d = w_d.push(raw[i] * 5.0)
+        i = i + 1
+    }
+    return ReadinessHead {
+        d_in:  d_in,
+        w_d:   w_d,
+        b_d:   vec_zeros(1),
+        alpha: alpha,
+        eta:   eta,
+        theta: theta
+    }
+}
+
+// Compute the per-step intent drive d_t = relu(W_d · h_t + b_d).
+// One scalar per time step — returned as a length-1 array to match
+// matvec's row-major output convention (avoids the ≥3-field struct
+// return bug referenced in feedback_hexa_struct_return_bug.md).
+fn intent_drive(head: ReadinessHead, h: array) -> float {
+    let pre = matvec(head.w_d, h, 1, head.d_in)
+    let raw = pre[0] + head.b_d[0]
+    return relu(raw)
+}
+
+// Integrate a sequence of hidden states h_0 .. h_{T-1} into the readiness
+// trace r_0 .. r_T. r_0 = 0. r_{t+1} = max(0, (1-α) r_t + η d_t).
+// Returns the (T+1)-length trace so the caller can inspect the
+// pre-decision window without re-deriving indices.
+fn integrate_trace(head: ReadinessHead, h_seq: array) -> array {
+    let T = len(h_seq)
+    let mut trace = []
+    trace = trace.push(0.0)
+    let mut t = 0
+    let mut r_prev = 0.0
+    let one_minus_a = 1.0 - head.alpha
+    while t < T {
+        let h_t = h_seq[t]
+        let d_t = intent_drive(head, h_t)
+        let r_next = one_minus_a * r_prev + head.eta * d_t
+        // Positive-only: RP cannot go below zero (the action accumulator
+        // has a hard floor at "no intent yet").
+        let r_clip = relu(r_next)
+        trace = trace.push(r_clip)
+        r_prev = r_clip
+        t = t + 1
+    }
+    return trace
+}
+
+// Find the first index k ∈ [0, T] such that trace[k] ≥ θ; −1 if none.
+fn decision_time(trace: array, theta: float) -> int {
+    let n = len(trace)
+    let mut k = 0
+    while k < n {
+        if trace[k] >= theta {
+            return k
+        }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+// Mean slope across the pre-decision window (k* − K_RP .. k*).
+// If k* − K_RP < 0 we start from 0; slope = (r[k*] − r[start]) / (k* − start).
+// Returns 0.0 when k* < 0 or the window has width 0.
+fn pre_decision_slope(trace: array, k_star: int, k_rp: int) -> float {
+    if k_star <= 0 { return 0.0 }
+    let mut start = k_star - k_rp
+    if start < 0 { start = 0 }
+    let width = k_star - start
+    if width == 0 { return 0.0 }
+    let lo = trace[start]
+    let hi = trace[k_star]
+    return (hi - lo) / to_float(width)
+}
+
+// Steady-state readiness for a constant drive d: r* = η·d / α.
+// Returned in closed form so T3 can compare numerical trace tail against
+// the analytic fixed point.
+fn steady_state(alpha: float, eta: float, d: float) -> float {
+    if alpha <= 0.0 { return 0.0 }
+    return eta * d / alpha
+}
+
+// Parameter count — tiny (D + 1), the head is a scalar projection.
+fn param_count(d_in: int) -> int {
+    return d_in + 1
+}
+
+// Build a persistent-drive sequence: T identical copies of a single h
+// vector. Convenient for the steady-state and monotonicity tests.
+fn persistent_seq(h: array, T: int) -> array {
+    let mut out = []
+    let mut t = 0
+    while t < T {
+        out = out.push(h)
+        t = t + 1
+    }
+    return out
+}
+
+// Build a silent sequence: T copies of a zero vector. Used for the
+// counterfactual that no drive ⇒ no RP rise.
+fn silent_seq(D: int, T: int) -> array {
+    let h0 = vec_zeros(D)
+    let mut out = []
+    let mut t = 0
+    while t < T {
+        out = out.push(h0)
+        t = t + 1
+    }
+    return out
+}
+
+// ─── Self-tests ─────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Dim + monotonicity on α=0 (pure accumulation). With zero leak and
+    // a constant positive drive, the trace must be non-decreasing.
+    let D = 16
+    let T = 100
+    // α=0 so r grows without leak. eta small enough to stay bounded
+    // over the test window.
+    let head = readiness_head_new_params(D, 42, 0.0, 0.001, 10.0)
+    let h = det_rand_wide(D, 101)
+    let seq = persistent_seq(h, T)
+    let trace = integrate_trace(head, seq)
+    if len(trace) != T + 1 {
+        println("  [T1] FAIL — trace length " + str(len(trace)) + " != T+1=" + str(T + 1))
+        return false
+    }
+    let mut mono = true
+    let mut i = 1
+    while i < len(trace) {
+        if trace[i] < trace[i - 1] {
+            println("  [T1] monotonicity violated at i=" + str(i))
+            mono = false
+        }
+        i = i + 1
+    }
+    println("  [T1] trace length=" + str(len(trace)) + "  r_0=" + str(trace[0]) + "  r_T=" + str(trace[T]) + "  monotonic=" + str(mono))
+    return mono
+}
+
+fn check_T2() -> bool {
+    // Core done_criteria — "pre-decision signal 상승 관찰".
+    // With a persistent positive drive, the K_RP-step window immediately
+    // before the first threshold crossing must have a strictly positive
+    // mean slope. Silent drive → no crossing AND zero slope end-to-end.
+    //
+    // Parameter tuning: the steady-state r* = η·d/α is the asymptotic RP
+    // level. For d ≈ Σ|w_i| ≈ D·0.25 = 4 (typical drive from sign-aligned
+    // h through scaled weights in [-0.5, 0.5)) we set η=0.02 and α=0.002
+    // → r* ≈ 40, well above θ=1.0 so a crossing happens quickly with a
+    // clean rising window of K_RP=500 ms before it.
+    let D = 16
+    let T = 3000
+    let head = readiness_head_new_params(D, 7, 0.002, 0.02, 1.0)
+    // Construct h_pos aligned to sign(W_d) so the weighted sum equals
+    // Σ |w_i| — strictly positive. This guarantees a meaningful drive
+    // regardless of the seed. Note: we align to the row-0 weights only
+    // since w_d is a 1×D row-major matrix (single row).
+    let mut h_pos = []
+    let mut i = 0
+    while i < D {
+        let w_i = head.w_d[i]
+        if w_i >= 0.0 {
+            h_pos = h_pos.push(1.0)
+        } else {
+            h_pos = h_pos.push(0.0 - 1.0)
+        }
+        i = i + 1
+    }
+    // Sanity: compute drive scalar.
+    let d_scalar = intent_drive(head, h_pos)
+    println("  [T2] drive scalar d = " + str(d_scalar) + "  steady-state r* = " + str(steady_state(head.alpha, head.eta, d_scalar)))
+    let seq_pos = persistent_seq(h_pos, T)
+    let trace_pos = integrate_trace(head, seq_pos)
+    let k_star = decision_time(trace_pos, head.theta)
+    if k_star < 0 {
+        println("  [T2] FAIL — no threshold crossing in " + str(T) + " steps")
+        return false
+    }
+    let slope = pre_decision_slope(trace_pos, k_star, K_RP)
+    println("  [T2] k* = " + str(k_star) + "  (Libet RP onset ≈ k* − " + str(K_RP) + ")")
+    println("  [T2] pre-decision mean slope over " + str(K_RP) + " steps = " + str(slope))
+
+    // Silent counterfactual.
+    let seq_zero = silent_seq(D, T)
+    let trace_zero = integrate_trace(head, seq_zero)
+    let k_zero = decision_time(trace_zero, head.theta)
+    let end_zero = trace_zero[len(trace_zero) - 1]
+    println("  [T2] silent drive: k*=" + str(k_zero) + "  r_end=" + str(end_zero))
+
+    if slope <= 0.0 {
+        println("  [T2] FAIL — RP slope not strictly positive")
+        return false
+    }
+    if k_zero >= 0 {
+        println("  [T2] FAIL — silent drive still crossed threshold")
+        return false
+    }
+    if end_zero > 0.0 {
+        println("  [T2] FAIL — silent drive produced positive RP")
+        return false
+    }
+    return true
+}
+
+fn check_T3() -> bool {
+    // Leak controls RP shape. Analytic fixed point r* = η·d/α. We use
+    // a constant scalar drive d by fixing h to produce a known d_t and
+    // then verify that doubling α halves the steady-state value (up to
+    // numerical slack).
+    let D = 16
+    // h chosen so drive is a known positive scalar.
+    let mut h = []
+    let mut i = 0
+    while i < D {
+        h = h.push(1.0)
+        i = i + 1
+    }
+    // Two heads with identical weight seed, differing only in α.
+    let head_a = readiness_head_new_params(D, 55, 0.01, 0.01, 100.0)
+    let head_b = readiness_head_new_params(D, 55, 0.02, 0.01, 100.0)
+    let d_a = intent_drive(head_a, h)
+    let d_b = intent_drive(head_b, h)
+    // Drives are equal by construction (same seed, same h).
+    if fabs(d_a - d_b) > 0.0 {
+        println("  [T3] FAIL — drive differs across α variants (" + str(d_a) + " vs " + str(d_b) + ")")
+        return false
+    }
+    // Long integration to settle.
+    let T = 4000
+    let seq_a = persistent_seq(h, T)
+    let seq_b = persistent_seq(h, T)
+    let tr_a = integrate_trace(head_a, seq_a)
+    let tr_b = integrate_trace(head_b, seq_b)
+    let r_inf_a = tr_a[T]
+    let r_inf_b = tr_b[T]
+    let r_analytic_a = steady_state(0.01, 0.01, d_a)
+    let r_analytic_b = steady_state(0.02, 0.01, d_b)
+    let ratio = if r_inf_a > 0.0 { r_inf_b / r_inf_a } else { 0.0 }
+    println("  [T3] r_∞(α=0.01) = " + str(r_inf_a) + "  analytic = " + str(r_analytic_a))
+    println("  [T3] r_∞(α=0.02) = " + str(r_inf_b) + "  analytic = " + str(r_analytic_b))
+    println("  [T3] ratio r_b / r_a = " + str(ratio) + "  (target ≈ 0.5)")
+    // Tolerate 10% slack because the finite integration has not fully
+    // settled at T=4000 with the smaller α (time const ≈ 100 steps).
+    if ratio < 0.40 { return false }
+    if ratio > 0.60 { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // Determinism: same (D, seed, h, α, η, θ, T) → byte-identical trace.
+    let D = 12
+    let T = 300
+    let h1 = readiness_head_new(D, 131)
+    let h2 = readiness_head_new(D, 131)
+    let h = det_rand_wide(D, 137)
+    let seq = persistent_seq(h, T)
+    let t1 = integrate_trace(h1, seq)
+    let t2 = integrate_trace(h2, seq)
+    if len(t1) != len(t2) { return false }
+    let mut i = 0
+    while i < len(t1) {
+        if fabs(t1[i] - t2[i]) > 0.0 {
+            println("  [T4] FAIL at i=" + str(i) + " t1=" + str(t1[i]) + " t2=" + str(t2[i]))
+            return false
+        }
+        i = i + 1
+    }
+    // Decision-time determinism too.
+    let k1 = decision_time(t1, h1.theta)
+    let k2 = decision_time(t2, h2.theta)
+    println("  [T4] byte-identical across " + str(len(t1)) + " trace coords, k*=" + str(k1))
+    return k1 == k2
+}
+
+fn check_T5() -> bool {
+    // Latency: integrate_trace(T=500) at D=16 warm-cache < 2000 ms.
+    let D = 16
+    let T = 500
+    let head = readiness_head_new(D, 251)
+    let h = det_rand_wide(D, 281)
+    let seq = persistent_seq(h, T)
+    let _w = integrate_trace(head, seq)
+    let t0 = clock()
+    let _y = integrate_trace(head, seq)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] integrate_trace latency (D=" + str(D) + ", T=" + str(T) + ") = " + str(ms) + " ms")
+    return ms < 2000.0
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[alm_readiness_head] ALM-P10-1 self-test")
+    println("  mock: D=16, K_RP=" + str(K_RP) + " (≈500 ms Libet window)")
+    println("  α=" + str(ALPHA_DEF) + "  η=" + str(ETA_DEF) + "  θ=" + str(THETA_DEF))
+    let pc_prod = param_count(1024)
+    println("  prod params (D=1024): " + str(pc_prod))
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[alm_readiness_head] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[alm_readiness_head] ALL 5/5 PASS")
+    } else {
+        println("[alm_readiness_head] SOME FAILED")
+    }
+}
+
+main()

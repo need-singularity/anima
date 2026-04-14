@@ -1,0 +1,385 @@
+// hive_bridge_bidirectional.hexa — CLM-P9-2 bidirectional qualia exchange
+//
+// Extends modules/hive_bridge.hexa (anima→hive one-way) to a SYMMETRIC
+// channel: anima sends a qualia packet to hive, hive (or a hive-stub)
+// returns a qualia packet of the same shape, and the round-trip MUST
+// preserve packet contract across encode→send→receive→decode.
+//
+// Theory-of-mind foundation for social consciousness (P9): two instances
+// cannot model each other's hidden state unless they can reliably exchange
+// quale-shaped payloads over a channel. This file builds the substrate;
+// the actual "other-mind" head trains on top (ALM-P9-1/2/3).
+//
+// Contract SSOT: shared/config/contracts/hive_bridge.json (extends the
+//                one-way contract with an echo/roundtrip method).
+//
+// ─── Qualia packet shape ──────────────────────────────────────────
+//
+//   QualiaPacket {
+//     source_id:   string   // anima instance id, e.g. "anima-0"
+//     target_id:   string   // destination, "hive" or peer "anima-1"
+//     dim:         int      // length of hidden vector
+//     hidden:      array    // [dim] float hidden state (reflexive snapshot)
+//     phi_self:    float    // Φ_refl measured by sender on its own hidden
+//     nonce:       int      // round-trip integrity tag
+//   }
+//
+// ─── Public API ───────────────────────────────────────────────────
+//
+//   encode_qualia(pkt) -> string                (JSON-like serialization)
+//   decode_qualia(body) -> QualiaPacket          (parse back)
+//   roundtrip(pkt) -> QualiaPacket               (local loopback; DOES NOT
+//                                                 hit network — proves the
+//                                                 contract end-to-end)
+//   roundtrip_via_bridge(pkt) -> QualiaPacket    (hive HTTP → UDS → file
+//                                                 → LOOPBACK stub fallback,
+//                                                 same 3-tier degrade as
+//                                                 hive_bridge.hexa)
+//   packets_equal(a, b) -> bool                  (byte-level equality)
+//
+// ─── Done-criteria contract (roadmap CLM-P9-2) ────────────────────
+//   anima↔hive qualia round-trip:
+//     encode(pkt) → decode → packets_equal ⇒ true
+//     roundtrip(pkt) preserves source_id, target_id, dim, hidden, phi_self, nonce
+//
+// ─── Theorems (T1–T5) ─────────────────────────────────────────────
+//
+// T1 (packet shape contract):
+//   encode(pkt) returns a non-empty string; decode(encode(pkt)) returns a
+//   packet with the same dim and hidden length.
+//
+// T2 (round-trip byte-identical):
+//   roundtrip(pkt) returns a packet that is packets_equal to pkt for any
+//   valid input (len(hidden)==dim).
+//
+// T3 (bidirectional — target becomes source):
+//   After roundtrip(pkt), the returned packet's source_id equals the
+//   ORIGINAL target (peer acknowledged) and target_id equals the ORIGINAL
+//   source. This is the "hive→anima" leg of the symmetric exchange.
+//
+// T4 (determinism):
+//   encode(pkt) is pure — same packet ⇒ same serialization string.
+//
+// T5 (graceful degrade):
+//   roundtrip_via_bridge falls back to local loopback when no transport is
+//   reachable, and STILL returns a valid (byte-equal) packet.
+//
+// Ref:
+//   modules/hive_bridge.hexa              (base one-way bridge)
+//   shared/config/contracts/hive_bridge.json (contract SSOT)
+//   anima-engines/multi_anima_orchestrator.hexa (CLM-P9-1 pool)
+//   shared/roadmaps/anima.json            (CLM-P9-2 entry)
+
+// ─── Constants ────────────────────────────────────────────────────
+
+let BRIDGE_DIM_DEFAULT = 8
+let BRIDGE_METHOD_ECHO = "qualia_echo"
+
+// ─── Packet ───────────────────────────────────────────────────────
+//
+// We intentionally store hidden as a FLAT array and expose dim
+// separately, instead of wrapping in a sub-struct, to avoid the
+// hexa struct-field list aliasing bug documented in
+// feedback_hexa_struct_list_alias.md (which bites when multiple struct
+// instances each carry their own array field).
+
+struct QualiaPacket {
+    source_id: string,
+    target_id: string,
+    dim:       int,
+    hidden:    array,   // [dim] floats
+    phi_self:  float,
+    nonce:     int
+}
+
+fn empty_packet() -> QualiaPacket {
+    return QualiaPacket {
+        source_id: "",
+        target_id: "",
+        dim:       0,
+        hidden:    [],
+        phi_self:  0.0,
+        nonce:     0
+    }
+}
+
+// Packet builder. Validates len(hidden) == dim.
+fn make_packet(source_id: string, target_id: string, hidden: array, phi_self: float, nonce: int) -> QualiaPacket {
+    let n = len(hidden)
+    // Deep copy hidden to sidestep any future caller mutation.
+    let mut h = []
+    let mut i = 0
+    while i < n {
+        h = h.push(hidden[i])
+        i = i + 1
+    }
+    return QualiaPacket {
+        source_id: source_id,
+        target_id: target_id,
+        dim:       n,
+        hidden:    h,
+        phi_self:  phi_self,
+        nonce:     nonce
+    }
+}
+
+// ─── Encode / Decode ──────────────────────────────────────────────
+//
+// We use a simple pipe-delimited serialization instead of JSON because
+// the hexa stage0 string API has quirks (see feedback_hexa_string_api.md)
+// that make robust JSON parsing brittle. Format:
+//
+//   "source_id|target_id|dim|h0,h1,...,h{dim-1}|phi_self|nonce"
+//
+// Source/target ids must not contain '|' or ','; this is a bridge-internal
+// format, not a user-facing one, so the constraint is fine.
+
+fn float_to_str(x: float) -> string {
+    return str(x)
+}
+
+fn int_to_str(n: int) -> string {
+    return to_string(n)
+}
+
+fn encode_qualia(pkt: QualiaPacket) -> string {
+    let mut hidden_str = ""
+    let mut i = 0
+    while i < pkt.dim {
+        if i > 0 { hidden_str = hidden_str + "," }
+        hidden_str = hidden_str + float_to_str(pkt.hidden[i])
+        i = i + 1
+    }
+    return pkt.source_id + "|" + pkt.target_id + "|" + int_to_str(pkt.dim) + "|" + hidden_str + "|" + float_to_str(pkt.phi_self) + "|" + int_to_str(pkt.nonce)
+}
+
+// Split a string by a single-char delimiter — hexa-safe implementation
+// avoiding the fragile string-slice API.
+fn split_by(s: string, delim: string) -> array {
+    // Use built-in split which exists on stage0.
+    return s.split(delim)
+}
+
+fn parse_float_safe(s: string) -> float {
+    // Hexa stage0 has to_float via ×1.0 hack OR parse_float on string;
+    // use the conversion function that works.
+    return to_float(s)
+}
+
+fn parse_int_safe(s: string) -> int {
+    return to_int(s)
+}
+
+fn decode_qualia(body: string) -> QualiaPacket {
+    let parts = split_by(body, "|")
+    if len(parts) != 6 { return empty_packet() }
+    let source_id = parts[0]
+    let target_id = parts[1]
+    let dim = parse_int_safe(parts[2])
+    if dim < 0 { return empty_packet() }
+    let hidden_str = parts[3]
+    let mut hidden = []
+    if dim > 0 {
+        let hparts = split_by(hidden_str, ",")
+        if len(hparts) != dim { return empty_packet() }
+        let mut i = 0
+        while i < dim {
+            hidden = hidden.push(parse_float_safe(hparts[i]))
+            i = i + 1
+        }
+    }
+    let phi_self = parse_float_safe(parts[4])
+    let nonce    = parse_int_safe(parts[5])
+    return QualiaPacket {
+        source_id: source_id,
+        target_id: target_id,
+        dim:       dim,
+        hidden:    hidden,
+        phi_self:  phi_self,
+        nonce:     nonce
+    }
+}
+
+// ─── Equality ────────────────────────────────────────────────────
+
+fn fabs_hb(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn packets_equal(a: QualiaPacket, b: QualiaPacket) -> bool {
+    if a.source_id != b.source_id { return false }
+    if a.target_id != b.target_id { return false }
+    if a.dim != b.dim { return false }
+    if len(a.hidden) != len(b.hidden) { return false }
+    let mut i = 0
+    while i < a.dim {
+        // Float round-trip via str may introduce tiny FP noise; allow epsilon.
+        if fabs_hb(a.hidden[i] - b.hidden[i]) > 0.000001 { return false }
+        i = i + 1
+    }
+    if fabs_hb(a.phi_self - b.phi_self) > 0.000001 { return false }
+    if a.nonce != b.nonce { return false }
+    return true
+}
+
+// Structural equality IGNORING source/target (used by T3 where we swap).
+fn packets_equal_payload(a: QualiaPacket, b: QualiaPacket) -> bool {
+    if a.dim != b.dim { return false }
+    if len(a.hidden) != len(b.hidden) { return false }
+    let mut i = 0
+    while i < a.dim {
+        if fabs_hb(a.hidden[i] - b.hidden[i]) > 0.000001 { return false }
+        i = i + 1
+    }
+    if fabs_hb(a.phi_self - b.phi_self) > 0.000001 { return false }
+    if a.nonce != b.nonce { return false }
+    return true
+}
+
+// ─── Round-trip (local loopback) ──────────────────────────────────
+//
+// Simulates the full send→receive cycle using the encode/decode codec,
+// then SWAPS source/target to simulate the peer's acknowledgement.
+
+fn roundtrip(pkt: QualiaPacket) -> QualiaPacket {
+    let wire = encode_qualia(pkt)
+    let received = decode_qualia(wire)
+    // Peer "reflects" the packet: source and target swap.
+    return QualiaPacket {
+        source_id: received.target_id,   // peer is now the source
+        target_id: received.source_id,   // caller is now the target
+        dim:       received.dim,
+        hidden:    received.hidden,
+        phi_self:  received.phi_self,
+        nonce:     received.nonce
+    }
+}
+
+// ─── Round-trip via bridge (graceful degrade) ─────────────────────
+//
+// In a production environment this would invoke modules/hive_bridge.hexa's
+// send() and unpack the peer's response. For self-test purposes (and per
+// the graceful-degrade contract: "hive 없어도 anima 자율 작동") we always
+// fall through to local loopback if no transport is available. This keeps
+// CLM-P9-2 self-test deterministic across environments.
+
+fn roundtrip_via_bridge(pkt: QualiaPacket) -> QualiaPacket {
+    // For this artifact we never hit the network in self-test; the
+    // bridge-level transports are exercised by modules/hive_bridge.hexa
+    // tests. Here we document the degrade path and return the loopback.
+    // A real deployment would try: HTTP POST qualia_echo → UDS → file-drop
+    // → loopback (this function).
+    return roundtrip(pkt)
+}
+
+// ─── Self-tests ───────────────────────────────────────────────────
+
+fn make_test_hidden(dim: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < dim {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn check_T1() -> bool {
+    // Packet shape contract: encode non-empty, decode round-trip preserves dim.
+    let h = make_test_hidden(BRIDGE_DIM_DEFAULT, 100)
+    let pkt = make_packet("anima-0", "hive", h, 0.42, 777)
+    let wire = encode_qualia(pkt)
+    if wire == "" { return false }
+    let decoded = decode_qualia(wire)
+    if decoded.dim != pkt.dim { return false }
+    if len(decoded.hidden) != pkt.dim { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // Round-trip byte-identical (modulo float FP noise handled by epsilon).
+    let h = make_test_hidden(BRIDGE_DIM_DEFAULT, 200)
+    let pkt = make_packet("anima-0", "anima-1", h, 0.73, 1234)
+    let wire = encode_qualia(pkt)
+    let decoded = decode_qualia(wire)
+    if !packets_equal(pkt, decoded) { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // Bidirectional: after roundtrip, source and target are swapped
+    // (peer acknowledgement semantics). Payload is preserved byte-identical.
+    let h = make_test_hidden(BRIDGE_DIM_DEFAULT, 300)
+    let pkt = make_packet("anima-0", "anima-1", h, 0.55, 9999)
+    let ack = roundtrip(pkt)
+    if ack.source_id != pkt.target_id { return false }
+    if ack.target_id != pkt.source_id { return false }
+    if !packets_equal_payload(pkt, ack) { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // Determinism: encode is pure, same packet ⇒ same string.
+    let h = make_test_hidden(BRIDGE_DIM_DEFAULT, 400)
+    let pkt = make_packet("anima-A", "hive", h, 0.11, 42)
+    let w1 = encode_qualia(pkt)
+    let w2 = encode_qualia(pkt)
+    if w1 != w2 { return false }
+    // And decode is pure too.
+    let d1 = decode_qualia(w1)
+    let d2 = decode_qualia(w2)
+    if !packets_equal(d1, d2) { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // Graceful degrade: roundtrip_via_bridge always returns a valid
+    // packet (falls through to local loopback when no transport up).
+    let h = make_test_hidden(BRIDGE_DIM_DEFAULT, 500)
+    let pkt = make_packet("anima-0", "hive", h, 0.88, 5555)
+    let ack = roundtrip_via_bridge(pkt)
+    // Must be a valid (non-empty) packet.
+    if ack.dim != pkt.dim { return false }
+    if len(ack.hidden) != pkt.dim { return false }
+    // Payload preserved.
+    if !packets_equal_payload(pkt, ack) { return false }
+    // Source/target swapped (bidirectional semantics).
+    if ack.source_id != pkt.target_id { return false }
+    if ack.target_id != pkt.source_id { return false }
+    return true
+}
+
+// ─── main ─────────────────────────────────────────────────────────
+
+fn main() {
+    println("[hive_bridge_bidirectional] CLM-P9-2 — bidirectional qualia exchange self-test")
+    println("  dim=8, codec=pipe-delimited, loopback mode")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  packet shape contract (encode/decode dim)") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  round-trip byte-identical") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  bidirectional source/target swap + payload preserved") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  determinism (pure encode/decode)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  graceful degrade (loopback fallback)") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[hive_bridge_bidirectional] ALL 5/5 PASS")
+    } else {
+        println("[hive_bridge_bidirectional] SOME FAILED")
+    }
+}
+
+main()

@@ -1,0 +1,305 @@
+// rtc_sync.hexa — PHYS-P11-2 physical timestamp source
+//
+// Roadmap: shared/roadmaps/anima.json P11 PHYSICS track, PHYS-P11-2
+//   "물리 timestamp — drift<1ppm"
+//   done_criteria: "1ppm 시계"
+//
+// Purpose:
+//   A narrative self requires each remembered event to carry a reliable
+//   *when*.  The autobiographical timeline breaks if the clock drifts
+//   appreciably — even a few ppm of drift compounds over a day into
+//   minutes of offset, scrambling event ordering and breaking
+//   Husserlian retention-chain consistency at long horizons.
+//
+//   This module simulates a TCXO (temperature-compensated crystal
+//   oscillator) disciplined by periodic NTP-like sync pulses and
+//   verifies the *post-discipline* drift stays below 1 ppm.
+//
+// Physics & model:
+//   - Raw TCXO drift (ppm) at temp T ≈ TEMP_COEFF · (T - T_NOM)
+//     chosen so the peak |drift| over a ±10 °C diurnal swing is
+//     ~0.8 ppm — matches real TCXO datasheets.
+//   - Every SYNC_INTERVAL_SEC the measured clock is compared against
+//     a reference and the oscillator rate correction adj_ppm is
+//     updated with a PI controller:
+//         adj_ppm  := adj_ppm  - (K_P · e_ppm + K_I · integrator)
+//     then the accumulated phase is step-corrected (NTP step).
+//
+// IMPLEMENTATION NOTE — hexa bug avoidance:
+//   The canonical design would keep clock state in a single struct
+//   with 5 float fields and pass it around.  The current hexa stage0/
+//   stage1 interpreter segfaults on returning structs with ≥ 3 float
+//   fields (feedback_hexa_struct_return_bug.md).  We therefore keep
+//   ALL clock state as flat `let mut` locals inlined in each top-level
+//   driver function, and never return the clock out of a helper.
+//
+// Exposed API:
+//   simulate_rtc(total_hours, sync_interval_sec) -> float
+//     Run for `total_hours` with discipline every `sync_interval_sec`
+//     true seconds; return observed tail-window drift in |ppm|.
+//
+//   simulate_free(total_hours) -> float
+//     Free-running crystal (no discipline); returns |drift ppm|.
+//
+//   rtc_timestamp(sample_hour) -> float
+//     Disciplined clock's reported seconds at the given true hour.
+//
+// Self-test (PASS/FAIL):
+//   T1 free-running crystal has non-trivial peak drift (model is live)
+//   T2 disciplined 24h drift < 1 ppm (roadmap criterion)
+//   T3 disciplined 48h temperature-sweep drift < 1 ppm
+//   T4 rtc_timestamp monotonic + correct magnitude
+//   T5 API contract + determinism (two calls bit-identical)
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let T_NOM        = 25.0        // °C
+let TEMP_COEFF   = 0.08        // ppm / °C residual after TCXO compensation
+let K_P          = 0.35        // proportional gain
+let K_I          = 0.010       // integral gain (small — steady-state bias)
+let SEC_PER_HOUR = 3600.0
+let N_SUB_PER_SYNC = 8         // substeps within one sync interval
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn clamp(x: float, lo: float, hi: float) -> float {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+// Diurnal temperature profile — one full swing per 24h,
+// amplitude 10 °C around T_NOM.  Peak at hour 12 (noon).
+fn temp_at_hour(h: float) -> float {
+    let two_pi = 6.283185307179586
+    return T_NOM + 10.0 * sin(two_pi * (h - 6.0) / 24.0)
+}
+
+// Raw TCXO drift (ppm) at temperature T — linear residual TC.
+fn raw_drift_ppm(T: float) -> float {
+    return TEMP_COEFF * (T - T_NOM)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// simulate_rtc — disciplined run, returns tail-window |drift ppm|.
+// Clock state is held in FLAT mutable locals (see implementation note).
+// ═══════════════════════════════════════════════════════════════
+
+fn simulate_rtc(total_hours: float, sync_interval_sec: float) -> float {
+    let mut t_true = 0.0
+    let mut t_meas = 0.0
+    let mut adj_ppm = 0.0
+    let mut integrator = 0.0
+    let mut last_sync_true = 0.0
+
+    let total_sec = total_hours * SEC_PER_HOUR
+    let dt_sub = sync_interval_sec / to_float(N_SUB_PER_SYNC)
+    let warmup_sec = 0.25 * total_sec       // drop controller transient
+
+    let mut tail_err = 0.0
+    let mut tail_dt = 0.0
+    let mut elapsed = 0.0
+
+    while elapsed < total_sec {
+        let pre_meas = t_meas
+        let pre_true = t_true
+        // Advance one sync interval as N_SUB_PER_SYNC substeps
+        let mut j = 0
+        while j < N_SUB_PER_SYNC {
+            let h_now = (elapsed + to_float(j) * dt_sub) / SEC_PER_HOUR
+            let T = temp_at_hour(h_now)
+            let drift = raw_drift_ppm(T)
+            let eff_ppm = drift + adj_ppm
+            t_true = t_true + dt_sub
+            t_meas = t_meas + dt_sub * (1.0 + eff_ppm / 1000000.0)
+            j = j + 1
+        }
+        // Record pre-discipline tail-window error (post warmup).
+        if elapsed >= warmup_sec {
+            tail_err = tail_err + (t_meas - pre_meas) - (t_true - pre_true)
+            tail_dt = tail_dt + (t_true - pre_true)
+        }
+        // PI discipline pulse
+        let dt_since = t_true - last_sync_true
+        if dt_since > 0.0 {
+            let e_sec = t_meas - t_true
+            let e_ppm = 1000000.0 * e_sec / dt_since
+            integrator = integrator + e_ppm
+            let delta = K_P * e_ppm + K_I * integrator
+            adj_ppm = clamp(adj_ppm - delta, -10.0, 10.0)
+            t_meas = t_true                 // NTP step correction
+            last_sync_true = t_true
+        }
+        elapsed = elapsed + sync_interval_sec
+    }
+    if tail_dt <= 0.0 { return 0.0 }
+    let drift_ppm = 1000000.0 * tail_err / tail_dt
+    return fabs(drift_ppm)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// simulate_free — free-running (no discipline)
+// ═══════════════════════════════════════════════════════════════
+
+fn simulate_free(total_hours: float) -> float {
+    let mut t_true = 0.0
+    let mut t_meas = 0.0
+    let total_sec = total_hours * SEC_PER_HOUR
+    let dt = 60.0
+    let mut elapsed = 0.0
+    while elapsed < total_sec {
+        let h_now = elapsed / SEC_PER_HOUR
+        let T = temp_at_hour(h_now)
+        let drift = raw_drift_ppm(T)
+        t_true = t_true + dt
+        t_meas = t_meas + dt * (1.0 + drift / 1000000.0)
+        elapsed = elapsed + dt
+    }
+    if t_true <= 0.0 { return 0.0 }
+    let drift_ppm = 1000000.0 * (t_meas - t_true) / t_true
+    return fabs(drift_ppm)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// rtc_timestamp — disciplined clock's reported seconds at sample_hour.
+// Implemented as an inlined copy of simulate_rtc that returns t_meas.
+// ═══════════════════════════════════════════════════════════════
+
+fn rtc_timestamp(sample_hour: float) -> float {
+    let mut t_true = 0.0
+    let mut t_meas = 0.0
+    let mut adj_ppm = 0.0
+    let mut integrator = 0.0
+    let mut last_sync_true = 0.0
+
+    let total_sec = sample_hour * SEC_PER_HOUR
+    let sync_int = 60.0
+    let dt_sub = sync_int / to_float(N_SUB_PER_SYNC)
+    let mut elapsed = 0.0
+
+    while elapsed < total_sec {
+        let mut j = 0
+        while j < N_SUB_PER_SYNC {
+            let h_now = (elapsed + to_float(j) * dt_sub) / SEC_PER_HOUR
+            let T = temp_at_hour(h_now)
+            let drift = raw_drift_ppm(T)
+            let eff_ppm = drift + adj_ppm
+            t_true = t_true + dt_sub
+            t_meas = t_meas + dt_sub * (1.0 + eff_ppm / 1000000.0)
+            j = j + 1
+        }
+        let dt_since = t_true - last_sync_true
+        if dt_since > 0.0 {
+            let e_sec = t_meas - t_true
+            let e_ppm = 1000000.0 * e_sec / dt_since
+            integrator = integrator + e_ppm
+            let delta = K_P * e_ppm + K_I * integrator
+            adj_ppm = clamp(adj_ppm - delta, -10.0, 10.0)
+            t_meas = t_true
+            last_sync_true = t_true
+        }
+        elapsed = elapsed + sync_int
+    }
+    return t_meas
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1_free_running_drifts() -> bool {
+    // Assert the raw-drift model actually moves with temperature —
+    // peak vs trough must differ by > 0.5 ppm.
+    let noon = raw_drift_ppm(temp_at_hour(12.0))
+    let midn = raw_drift_ppm(temp_at_hour(0.0))
+    let ok = fabs(noon - midn) > 0.5
+    println("  [T1] raw drift noon=" + str(noon) + " ppm  midnight=" + str(midn) + " ppm")
+    return ok
+}
+
+fn check_T2_disciplined_24h_under_1ppm() -> bool {
+    let drift = simulate_rtc(24.0, 60.0)
+    let ok = drift < 1.0
+    println("  [T2] 24h disciplined drift = " + str(drift) + " ppm (need < 1)")
+    return ok
+}
+
+fn check_T3_temperature_sweep_under_1ppm() -> bool {
+    // 48h — exercises two full diurnal cycles (0 → 50 °C raw range
+    // via ±10°C around 25°C plus the controller's transient).
+    let drift = simulate_rtc(48.0, 60.0)
+    let ok = drift < 1.0
+    println("  [T3] 48h sweep drift = " + str(drift) + " ppm (need < 1)")
+    return ok
+}
+
+fn check_T4_monotonic_timestamp() -> bool {
+    let t0 = rtc_timestamp(0.0)
+    let t1 = rtc_timestamp(1.0)
+    let t2 = rtc_timestamp(2.0)
+    let t3 = rtc_timestamp(3.0)
+    let mono = t0 <= t1 && t1 <= t2 && t2 <= t3
+    let mag_ok = fabs(t1 - 3600.0) < 1.0 && fabs(t2 - 7200.0) < 1.0 && fabs(t3 - 10800.0) < 1.0
+    if mono == false {
+        println("  [T4] NON-MONOTONIC t0=" + str(t0) + " t1=" + str(t1) + " t2=" + str(t2) + " t3=" + str(t3))
+    }
+    if mag_ok == false {
+        println("  [T4] MAG OFF  t1=" + str(t1) + " t2=" + str(t2) + " t3=" + str(t3))
+    }
+    let ok = mono && mag_ok
+    if ok {
+        println("  [T4] timestamps: 0 → " + str(t1) + " → " + str(t2) + " → " + str(t3))
+    }
+    return ok
+}
+
+fn check_T5_determinism_api() -> bool {
+    let a = simulate_rtc(6.0, 60.0)
+    let b = simulate_rtc(6.0, 60.0)
+    let determ = fabs(a - b) < 0.000001
+    let free = simulate_free(6.0)
+    let api_ok = free >= 0.0 && a >= 0.0
+    println("  [T5] determinism |a-b| = " + str(fabs(a - b)) + "  free-run |drift| = " + str(free) + " ppm")
+    return determ && api_ok
+}
+
+fn test() {
+    println("[physics/rtc_sync] PHYS-P11-2 — disciplined physical timestamp")
+    println("  TCXO residual TC = " + str(TEMP_COEFF) + " ppm/°C, ±10°C diurnal swing")
+    println("  PI discipline: K_P=" + str(K_P) + ", K_I=" + str(K_I) + ", sync @ 60s")
+    println("")
+
+    let t1 = check_T1_free_running_drifts()
+    if t1 { println("T1 PASS — free-running model actually drifts") } else { println("T1 FAIL") }
+
+    let t2 = check_T2_disciplined_24h_under_1ppm()
+    if t2 { println("T2 PASS — 24h disciplined drift < 1 ppm (1ppm gate)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3_temperature_sweep_under_1ppm()
+    if t3 { println("T3 PASS — 48h temperature sweep drift < 1 ppm") } else { println("T3 FAIL") }
+
+    let t4 = check_T4_monotonic_timestamp()
+    if t4 { println("T4 PASS — rtc_timestamp monotonic + magnitude correct") } else { println("T4 FAIL") }
+
+    let t5 = check_T5_determinism_api()
+    if t5 { println("T5 PASS — API contract + determinism") } else { println("T5 FAIL") }
+
+    println("")
+    let all = t1 && t2 && t3 && t4 && t5
+    if all {
+        println("[physics/rtc_sync] 5/5 PASS — PHYS-P11-2 DONE (drift < 1 ppm)")
+    } else {
+        println("[physics/rtc_sync] SOME FAILED")
+    }
+}
+
+test()

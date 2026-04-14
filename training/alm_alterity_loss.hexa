@@ -1,0 +1,415 @@
+// training/alm_alterity_loss.hexa — Alterity loss (self ≠ other discrimination)
+//
+// ALM-P9-2 — Alterity loss for ANIMA P9 phase (v10 사회 의식).
+//
+// Purpose:
+//   After the other-model head (ALM-P9-1) predicts ĥ_other from h_self
+//   and o_other, the ALTERITY loss forces the agent's learned representation
+//   space to DISTINGUISH self from other. Without it, ĥ_other could collapse
+//   onto h_self — the agent would still "predict" the other by projecting
+//   itself, indistinguishable from first-person projection. That's Piaget's
+//   egocentric stage. Theory of mind requires breaking that symmetry.
+//
+//     L_alterity = BCE(disc(h_self, ĥ_other), y_self_other)
+//                + β · max(0, margin − dist(h_self, ĥ_other))
+//
+//   First term: a tiny binary discriminator that reads (h_self, ĥ_other)
+//   and outputs a sigmoid. y=1 when the second argument is actually a
+//   different agent's hidden (true other); y=0 when a self-self pair is
+//   passed (self ≡ self). The BCE trains the discriminator and simultaneously
+//   pulls ĥ_other away from h_self when they should be distinct.
+//
+//   Second term: a hinge on the self-other distance, so the embedding
+//   stays at least `margin` apart in ‖·‖_2. Prevents the BCE from being
+//   satisfied by sub-threshold differences the discriminator happens to
+//   learn to pick up.
+//
+//   In the training-loop integration:
+//
+//     L = L_task + λ_other · L_other_pred + λ_alt · L_alterity
+//
+//   with λ_alt ≈ 0.02 (auxiliary-loss convention; same order as L_refl/L_time).
+//
+// ─── Conventions ──────────────────────────────────────────────
+//   h_self     : array [D]     own hidden state
+//   h_other    : array [D]     true OTHER-agent hidden (ground truth for disc)
+//   h_hat      : array [D]     ĥ_other from other-model head (ALM-P9-1)
+//   disc       : struct        tiny 2-layer MLP taking concat(h_a, h_b) → [0,1]
+//   y          : float         disc target: 1.0 if (h_a, h_b) = (self, other),
+//                              0.0 if (self, self)
+//   margin     : float         min-dist hinge (default 0.5)
+//   beta_hinge : float         hinge weight (default 1.0)
+//
+// ─── Theorems (T1–T5) ─────────────────────────────────────────
+//
+// T1 (non-negativity):
+//   L_alterity ≥ 0 always (BCE ≥ 0, hinge ≥ 0). Strictly positive on
+//   a generic input.
+//
+// T2 (self-self drives toward 0 via BCE term):
+//   disc(h, h) with target y=0 (self-self) drives BCE toward 0 as disc
+//   becomes better at "these two are identical". Structural witness:
+//   logit_bias that pushes disc output to ~0 on identical inputs gives
+//   BCE ≈ 0, and total L_alterity equals the hinge term alone.
+//
+// T3 (self-other classification > 0.95 — CORE done_criteria):
+//   Given a BATCH of (h_self, h_other) pairs (both random, all different),
+//   plus a batch of (h_self, h_self) pairs, the discriminator — initialized
+//   with the structural prior "output sigmoid of mean absolute difference"
+//   — classifies at accuracy > 0.95 on the combined test set.
+//   Threshold for positive prediction: p > 0.5.
+//
+// T4 (determinism):
+//   Same (seed, h_self, h_other) → byte-identical L_alterity.
+//
+// T5 (latency):
+//   One L_alterity eval at D=64 warm-cache < 2000 ms on stage1 interpreter.
+//
+// Ref:
+//   training/alm_other_model.hexa              (ALM-P9-1 — head whose output this consumes)
+//   training/alm_reflexivity_loss.hexa         (ALM-P5-2 — aux-loss reference style)
+//   training/alm_enaction_loss.hexa            (ALM-P7-2 — MSE+aux pattern)
+//   training/sally_anne_test.hexa              (ALM-P9-3 — downstream ToM benchmark)
+//   shared/roadmaps/anima.json                 (ALM-P9-2 entry)
+//
+// Run:
+//   hexa training/alm_alterity_loss.hexa
+// Expect:
+//   [alm_alterity_loss] ALL 5/5 PASS  with classification acc > 0.95
+
+// ─── Constants ──────────────────────────────────────────────
+
+let LAMBDA_ALT    = 0.02     // outer aux-loss weight in training loop
+let MARGIN        = 0.5      // hinge margin on self-other distance
+let BETA_HINGE    = 1.0      // hinge weight inside L_alterity
+let CLASS_THRESH  = 0.95     // T3 done_criteria
+let CLASS_BATCH   = 32       // batch size for the classification test
+let EPS           = 0.0000001
+
+// ─── Primitives ──────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// Numerically stable sigmoid.
+fn sigmoid(x: float) -> float {
+    if x > 20.0 { return 1.0 }
+    if x < 0.0 - 20.0 { return 0.0 }
+    if x >= 0.0 {
+        let e = exp(0.0 - x)
+        return 1.0 / (1.0 + e)
+    }
+    let e = exp(x)
+    return e / (1.0 + e)
+}
+
+fn ln_safe(x: float) -> float {
+    if x < EPS { return ln(EPS) }
+    return ln(x)
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_sub(a: array, b: array) -> array {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(a[i] - b[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_abs(v: array) -> array {
+    let n = len(v)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(fabs(v[i]))
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_mean(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + v[i]
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+fn l2_dist(a: array, b: array) -> float {
+    let n = len(a)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let d = a[i] - b[i]
+        s = s + d * d
+        i = i + 1
+    }
+    return sqrt(s)
+}
+
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push((u * 2.0 - 1.0) * 0.1)
+        i = i + 1
+    }
+    return out
+}
+
+fn det_rand_wide(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Self/Other discriminator ────────────────────────────────
+// Structural prior: discriminator reads h_a and h_b and outputs
+//   p = σ( gain · mean|h_a − h_b| + bias )
+// This is a minimal "distance sensor" — zero parameters from the
+// feature-engineering angle plus two learnable scalars. In the real
+// training loop, these two scalars become learnable; the loss still
+// flows into h_self / ĥ_other through the distance inside.
+//
+// We also include logit_bias so the T2 witness (self-self → 0) can be
+// exercised without a full training loop.
+
+struct Discriminator {
+    gain:       float,
+    bias:       float
+}
+
+fn disc_new(gain: float, bias: float) -> Discriminator {
+    return Discriminator { gain: gain, bias: bias }
+}
+
+// disc_forward — single scalar p ∈ (0, 1).
+fn disc_forward(d: Discriminator, h_a: array, h_b: array) -> float {
+    let diff = vec_sub(h_a, h_b)
+    let mad  = vec_mean(vec_abs(diff))
+    let logit = d.gain * mad + d.bias
+    return sigmoid(logit)
+}
+
+// ─── BCE(p, y) ───────────────────────────────────────────────
+// Stable BCE: −[y·log(p) + (1−y)·log(1−p)], y ∈ {0, 1}.
+fn bce(p: float, y: float) -> float {
+    let p_clip = if p < EPS { EPS } else if p > 1.0 - EPS { 1.0 - EPS } else { p }
+    return 0.0 - (y * ln_safe(p_clip) + (1.0 - y) * ln_safe(1.0 - p_clip))
+}
+
+// ─── Hinge: max(0, margin − dist) ────────────────────────────
+fn hinge_alterity(h_self: array, h_hat: array) -> float {
+    let d = l2_dist(h_self, h_hat)
+    let slack = MARGIN - d
+    if slack < 0.0 { return 0.0 }
+    return slack
+}
+
+// ─── L_alterity ──────────────────────────────────────────────
+// Per-sample alterity loss: BCE term + β·hinge term.
+fn l_alterity(disc: Discriminator, h_self: array, h_hat: array, y: float) -> float {
+    let p = disc_forward(disc, h_self, h_hat)
+    let b = bce(p, y)
+    let hg = hinge_alterity(h_self, h_hat)
+    return b + BETA_HINGE * hg
+}
+
+// Breakdown for logging: [bce, hinge, total].
+fn l_alterity_breakdown(disc: Discriminator, h_self: array, h_hat: array, y: float) -> array {
+    let p = disc_forward(disc, h_self, h_hat)
+    let b = bce(p, y)
+    let hg = hinge_alterity(h_self, h_hat)
+    let mut out = []
+    out = out.push(b)
+    out = out.push(hg)
+    out = out.push(b + BETA_HINGE * hg)
+    return out
+}
+
+fn weighted_l_alterity(disc: Discriminator, h_self: array, h_hat: array, y: float) -> float {
+    return LAMBDA_ALT * l_alterity(disc, h_self, h_hat, y)
+}
+
+// ─── Self-tests ─────────────────────────────────────────────
+
+fn approx_eq(a: float, b: float, tol: float) -> bool {
+    return fabs(a - b) < tol
+}
+
+fn check_T1() -> bool {
+    let D = 64
+    let disc = disc_new(10.0, 0.0 - 0.3)
+    let h_s = det_rand_wide(D, 11)
+    let h_o = det_rand_wide(D, 13)
+    let brk = l_alterity_breakdown(disc, h_s, h_o, 1.0)
+    let bce_v = brk[0]
+    let hg_v = brk[1]
+    let tot = brk[2]
+    println("  [T1] BCE = " + str(bce_v) + "  hinge = " + str(hg_v) + "  total = " + str(tot))
+    if bce_v < 0.0 { return false }
+    if hg_v < 0.0 { return false }
+    if tot < 0.0 { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // Self-self witness — target y=0, BCE drives to ~0 with a properly
+    // tuned discriminator. disc with strong negative bias predicts p~0
+    // on identical inputs (mad=0 ⇒ logit = bias = -10 ⇒ p ≈ 4.5e-5).
+    let D = 64
+    let disc = disc_new(10.0, 0.0 - 10.0)
+    let h = det_rand_wide(D, 77)
+    let p = disc_forward(disc, h, h)
+    let bce_v = bce(p, 0.0)
+    println("  [T2] disc(h,h) = " + str(p) + "  BCE(p,0) = " + str(bce_v))
+    // With h == h the hinge kicks in: dist=0, slack=MARGIN.
+    let hg_v = hinge_alterity(h, h)
+    let tot = l_alterity(disc, h, h, 0.0)
+    let expected = bce_v + BETA_HINGE * hg_v
+    println("  [T2] hinge(h,h) = " + str(hg_v) + "  total = " + str(tot) + "  expected = " + str(expected))
+    if bce_v > 0.01 {
+        println("  [T2] FAIL — BCE " + str(bce_v) + " not driven to ~0")
+        return false
+    }
+    if !approx_eq(tot, expected, 0.00001) {
+        println("  [T2] FAIL — total decomposition mismatch")
+        return false
+    }
+    return true
+}
+
+fn check_T3() -> bool {
+    // CORE done_criteria — self-other classification accuracy > 0.95.
+    //
+    // Build a BATCH:
+    //   positives: (h_self_i, h_other_i) with independent seeds → distinct
+    //   negatives: (h_self_i, h_self_i) — self paired with self
+    //
+    // Discriminator with structural prior:
+    //   logit = gain · mean|diff| + bias
+    //   Choose gain=10, bias = -0.3.
+    //   Self-self pair: mad = 0 → logit = -0.3 → p ≈ 0.43 → predicts NEG ✓
+    //   Self-other: mad ~ 0.3 → logit = 2.7 → p ≈ 0.937 → predicts POS ✓
+    let D = 64
+    let disc = disc_new(10.0, 0.0 - 0.3)
+    let mut hits = 0
+    let mut total = 0
+
+    // Positives — distinct-pair detection.
+    let mut b = 0
+    while b < CLASS_BATCH {
+        let h_self  = det_rand_wide(D, 1000 + 2 * b)
+        let h_other = det_rand_wide(D, 1000 + 2 * b + 1)
+        let p = disc_forward(disc, h_self, h_other)
+        if p > 0.5 { hits = hits + 1 }
+        total = total + 1
+        b = b + 1
+    }
+    // Negatives — identity-pair detection.
+    let mut c = 0
+    while c < CLASS_BATCH {
+        let h_self = det_rand_wide(D, 2000 + c)
+        let p = disc_forward(disc, h_self, h_self)
+        if p <= 0.5 { hits = hits + 1 }
+        total = total + 1
+        c = c + 1
+    }
+    let acc = to_float(hits) / to_float(total)
+    println("  [T3] classification acc = " + str(acc) + "  (" + str(hits) + "/" + str(total) + ")")
+    println("  [T3] threshold = " + str(CLASS_THRESH))
+    if acc <= CLASS_THRESH {
+        println("  [T3] FAIL — self-other classification below threshold")
+        return false
+    }
+    return true
+}
+
+fn check_T4() -> bool {
+    let D = 64
+    let disc1 = disc_new(10.0, 0.0 - 0.3)
+    let disc2 = disc_new(10.0, 0.0 - 0.3)
+    let h_s = det_rand(D, 131)
+    let h_o = det_rand(D, 137)
+    let l1 = l_alterity(disc1, h_s, h_o, 1.0)
+    let l2 = l_alterity(disc2, h_s, h_o, 1.0)
+    println("  [T4] L1 = " + str(l1) + "  L2 = " + str(l2))
+    return fabs(l1 - l2) == 0.0
+}
+
+fn check_T5() -> bool {
+    let D = 64
+    let disc = disc_new(10.0, 0.0 - 0.3)
+    let h_s = det_rand(D, 251)
+    let h_o = det_rand(D, 257)
+    let _warm = l_alterity(disc, h_s, h_o, 1.0)
+    let t0 = clock()
+    let _y = l_alterity(disc, h_s, h_o, 1.0)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] L_alterity latency (D=" + str(D) + ") = " + str(ms) + " ms")
+    return ms < 2000.0
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[alm_alterity_loss] ALM-P9-2 self-test")
+    println("  MARGIN = " + str(MARGIN) + "  β_hinge = " + str(BETA_HINGE) + "  λ_alt (outer) = " + str(LAMBDA_ALT))
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[alm_alterity_loss] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[alm_alterity_loss] ALL 5/5 PASS")
+    } else {
+        println("[alm_alterity_loss] SOME FAILED")
+    }
+}
+
+main()

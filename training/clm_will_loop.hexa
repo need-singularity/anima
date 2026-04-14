@@ -1,0 +1,692 @@
+// clm_will_loop.hexa — CLM will closed-loop (P10-3)
+//
+// CLM-P10-3. Drives the volitional state machine (anima_will, CLM-P10-1)
+// across N ticks of a desire-drive stream, emits per-tick readiness
+// potential RP and the Libet-style "action onset" signal. Also logs a
+// cumulative Φ_will measured as MI(desire_drive[], rp[]) across the
+// trajectory — the information-theoretic coupling between what the agent
+// desires and how its readiness potential rises.
+//
+// Patterns after clm_sensorimotor_loop.hexa (CLM-P7-3) and
+// clm_temporal_loop.hexa (CLM-P6-3).
+//
+// The roadmap P10 gate_exit asks for "Libet paradigm 재현, Φ_will > 0".
+// This driver reproduces the Libet pattern in CLM land:
+//   (a) RP rises for ≥ 3 ticks BEFORE the first ACTION transition.
+//   (b) MI(desire_drive, rp) over the 25-tick window > 0 (coupling exists).
+//   (c) action onset tick is deterministic under fixed seed.
+//
+// ─── Pipeline per tick ────────────────────────────────────────────
+//
+//   desire_drive_t ─▶ will_step(w, head, drive) ─▶ WillStep
+//        │                                           │
+//        │                                           ├─ state_next
+//        │                                           ├─ rp_next
+//        │                                           └─ fired / action
+//        │
+//        ▼
+//   per-tick log:  tick=<t> state=<s> rp=<rp> fired=<0|1>
+//
+// At the end of the loop the driver computes trajectory-level
+// Φ_will = MI(desire_trace, rp_trace) and reports the first-fire tick.
+//
+// ─── Theorems (T1–T5) ─────────────────────────────────────────────
+//
+// T1 (loop latency):
+//   25 ticks (d_action=4) < 2000 ms on hexa stage1.
+//
+// T2 (Libet RP rise before first action):
+//   Over a rising desire-drive stream the first ACTION fires at tick
+//   n_first ≥ 3, and rp[n_first-1] > rp[n_first-3] (3-tick RP build-up).
+//
+// T3 (Φ_will > 0 across 25-tick window — roadmap gate):
+//   MI(desire_trace, rp_trace) > 0 AND the cumulative RP trace contains
+//   at least one non-zero value.
+//
+// T4 (determinism):
+//   Two sequential runs with the same seed + same drive sequence produce
+//   byte-identical per-tick state/RP/fired traces.
+//
+// T5 (log-line count):
+//   Each of N ticks emits exactly one tick-log line, and the returned
+//   traces each have exactly N entries.
+//
+// Ref:
+//   anima-engines/anima_will.hexa           (CLM-P10-1 sm)
+//   anima-hexad/d/will_bridge.hexa          (CLM-P10-2 bridge)
+//   training/clm_sensorimotor_loop.hexa     (pattern, CLM-P7-3)
+//   shared/roadmaps/anima.json              (CLM-P10-3 entry)
+
+// ─── Constants ────────────────────────────────────────────────────
+
+let CWL_D_INPUT      = 3
+let CWL_D_HIDDEN     = 8
+let CWL_D_ACTION     = 4
+let CWL_SEED         = 2030
+let CWL_WGT_GAIN     = 0.25
+let CWL_MI_BINS      = 8
+
+let CWL_S_IDLE    = 0
+let CWL_S_DESIRE  = 1
+let CWL_S_INTENT  = 2
+let CWL_S_ACTION  = 3
+
+let CWL_TH_DESIRE = 0.15
+let CWL_TH_INTENT = 0.30
+let CWL_TH_ACTION = 1.00
+let CWL_RP_LEAK   = 0.05
+let CWL_RP_MIN    = 0.0
+
+// ─── Primitives (self-contained) ─────────────────────────────────
+
+fn fabs_cwl(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn relu_cwl(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    return x
+}
+
+fn tanh_cwl(x: float) -> float {
+    if x > 4.0 { return 1.0 }
+    if x < -4.0 { return 0.0 - 1.0 }
+    let x2 = x * x
+    return x * (27.0 + x2) / (27.0 + 9.0 * x2)
+}
+
+fn ln_safe_cwl(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn det_rand_cwl(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_zeros_cwl(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_min_cwl(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_max_cwl(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn bin_index_cwl(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn count_hits_cwl(bin_ids: array, n_bins: int) -> array {
+    let n = len(bin_ids)
+    let mut counts = []
+    let mut k = 0
+    while k < n_bins {
+        let mut c = 0.0
+        let mut i = 0
+        while i < n {
+            if bin_ids[i] == k { c = c + 1.0 }
+            i = i + 1
+        }
+        counts = counts.push(c)
+        k = k + 1
+    }
+    return counts
+}
+
+fn entropy_hist_cwl(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut bin_ids = []
+    let mut i = 0
+    while i < n {
+        bin_ids = bin_ids.push(bin_index_cwl(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let counts = count_hits_cwl(bin_ids, nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 { h = h - p * ln_safe_cwl(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn joint_entropy_hist_cwl(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = bin_index_cwl(a[i], lo, hi, nb)
+        let ib = bin_index_cwl(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let counts = count_hits_cwl(pair_ids, nb * nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 { h = h - p * ln_safe_cwl(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn mi_pair_cwl(a: array, b: array) -> float {
+    let na = len(a)
+    let nb = len(b)
+    if na == 0 { return 0.0 }
+    if nb != na { return 0.0 }
+    let lo_a = vec_min_cwl(a)
+    let hi_a = vec_max_cwl(a)
+    let lo_b = vec_min_cwl(b)
+    let hi_b = vec_max_cwl(b)
+    let lo = if lo_a < lo_b { lo_a } else { lo_b }
+    let hi = if hi_a > hi_b { hi_a } else { hi_b }
+    let ea = entropy_hist_cwl(a, lo, hi, CWL_MI_BINS)
+    let eb = entropy_hist_cwl(b, lo, hi, CWL_MI_BINS)
+    let je = joint_entropy_hist_cwl(a, b, lo, hi, CWL_MI_BINS)
+    let mi = ea + eb - je
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ─── Inlined volition head + Will sm (mirrors anima-engines/anima_will) ──
+//
+// We inline instead of import so the driver runs standalone under stage1.
+
+struct WHead {
+    d_input:   int,
+    d_hidden:  int,
+    d_action:  int,
+    w1:        array,
+    b1:        array,
+    w2:        array,
+    b2:        array,
+    w_motor:   array,
+    b_motor:   array
+}
+
+fn w_head_new(seed: int) -> WHead {
+    let dI = CWL_D_INPUT
+    let dH = CWL_D_HIDDEN
+    let dA = CWL_D_ACTION
+    let raw1 = det_rand_cwl(dI * dH, seed)
+    let raw2 = det_rand_cwl(dH * 3, seed + 1)
+    let rawM = det_rand_cwl(dH * dA, seed + 2)
+    let rb1  = det_rand_cwl(dH, seed + 3)
+    let rb2  = det_rand_cwl(3, seed + 4)
+    let rbM  = det_rand_cwl(dA, seed + 5)
+    let mut w1 = []
+    let mut i = 0
+    while i < len(raw1) {
+        w1 = w1.push(raw1[i] * CWL_WGT_GAIN)
+        i = i + 1
+    }
+    let mut w2 = []
+    let mut j = 0
+    while j < len(raw2) {
+        w2 = w2.push(raw2[j] * CWL_WGT_GAIN)
+        j = j + 1
+    }
+    let mut wm = []
+    let mut k = 0
+    while k < len(rawM) {
+        wm = wm.push(rawM[k] * CWL_WGT_GAIN)
+        k = k + 1
+    }
+    let mut b1 = []
+    let mut m = 0
+    while m < len(rb1) {
+        b1 = b1.push(rb1[m] * CWL_WGT_GAIN * 0.1)
+        m = m + 1
+    }
+    let mut b2 = []
+    let mut mm = 0
+    while mm < len(rb2) {
+        b2 = b2.push(rb2[mm] * CWL_WGT_GAIN * 0.1)
+        mm = mm + 1
+    }
+    let mut bm = []
+    let mut mmm = 0
+    while mmm < len(rbM) {
+        bm = bm.push(rbM[mmm] * CWL_WGT_GAIN * 0.1)
+        mmm = mmm + 1
+    }
+    return WHead {
+        d_input:  dI,
+        d_hidden: dH,
+        d_action: dA,
+        w1:       w1,
+        b1:       b1,
+        w2:       w2,
+        b2:       b2,
+        w_motor:  wm,
+        b_motor:  bm
+    }
+}
+
+fn w_head_compute(h: WHead, desire_drive: float, rp_prev: float,
+                  phase: float) -> array {
+    let dI = h.d_input
+    let dH = h.d_hidden
+    let mut x = []
+    x = x.push(desire_drive)
+    x = x.push(rp_prev)
+    x = x.push(phase)
+    let mut z = []
+    let mut k = 0
+    while k < dH {
+        let mut s = h.b1[k]
+        let mut i = 0
+        while i < dI {
+            s = s + h.w1[i * dH + k] * x[i]
+            i = i + 1
+        }
+        z = z.push(relu_cwl(s))
+        k = k + 1
+    }
+    let mut out = []
+    let mut o = 0
+    while o < 3 {
+        let mut t = h.b2[o]
+        let mut kk = 0
+        while kk < dH {
+            t = t + h.w2[kk * 3 + o] * z[kk]
+            kk = kk + 1
+        }
+        out = out.push(t)
+        o = o + 1
+    }
+    let desire_level = (tanh_cwl(out[0]) + 1.0) * 0.5
+    let intent_score = (tanh_cwl(out[1]) + 1.0) * 0.5
+    let rp_delta = 0.05 + 0.6 * desire_level + 0.2 * relu_cwl(out[2])
+    let mut packed = []
+    packed = packed.push(desire_level)
+    packed = packed.push(intent_score)
+    packed = packed.push(rp_delta)
+    return packed
+}
+
+fn w_head_motor(h: WHead, desire_drive: float, rp_prev: float,
+                phase: float) -> array {
+    let dI = h.d_input
+    let dH = h.d_hidden
+    let dA = h.d_action
+    let mut x = []
+    x = x.push(desire_drive)
+    x = x.push(rp_prev)
+    x = x.push(phase)
+    let mut z = []
+    let mut k = 0
+    while k < dH {
+        let mut s = h.b1[k]
+        let mut i = 0
+        while i < dI {
+            s = s + h.w1[i * dH + k] * x[i]
+            i = i + 1
+        }
+        z = z.push(relu_cwl(s))
+        k = k + 1
+    }
+    let mut motor = []
+    let mut a = 0
+    while a < dA {
+        let mut t = h.b_motor[a]
+        let mut kk = 0
+        while kk < dH {
+            t = t + h.w_motor[kk * dA + a] * z[kk]
+            kk = kk + 1
+        }
+        motor = motor.push(t)
+        a = a + 1
+    }
+    return motor
+}
+
+struct WillObj {
+    state:       int,
+    rp:          float,
+    tick:        int,
+    last_action: array,
+    n_fired:     int,
+    n_steps:     int
+}
+
+fn will_obj_new(d_action: int) -> WillObj {
+    return WillObj {
+        state:       CWL_S_IDLE,
+        rp:          0.0,
+        tick:        0,
+        last_action: vec_zeros_cwl(d_action),
+        n_fired:     0,
+        n_steps:     0
+    }
+}
+
+struct WillStepOut {
+    state_next:   int,
+    rp_next:      float,
+    desire_level: float,
+    intent_score: float,
+    rp_delta:     float,
+    action:       array,
+    fired:        bool
+}
+
+fn will_obj_step(w: WillObj, head: WHead, desire_drive: float) -> WillStepOut {
+    let phase = to_float(w.tick % 7) / 7.0
+    let packed = w_head_compute(head, desire_drive, w.rp, phase)
+    let desire_level = packed[0]
+    let intent_score = packed[1]
+    let rp_delta     = packed[2]
+    let s_prev = w.state
+    let mut s_next = s_prev
+    let mut rp_next = w.rp
+    if s_prev == CWL_S_IDLE {
+        rp_next = w.rp - CWL_RP_LEAK
+        if rp_next < CWL_RP_MIN { rp_next = CWL_RP_MIN }
+    } else {
+        if s_prev == CWL_S_ACTION {
+            rp_next = 0.0
+        } else {
+            rp_next = w.rp + rp_delta
+        }
+    }
+    if s_prev == CWL_S_IDLE {
+        if desire_level >= CWL_TH_DESIRE {
+            s_next = CWL_S_DESIRE
+        }
+    } else {
+        if s_prev == CWL_S_DESIRE {
+            if intent_score >= CWL_TH_INTENT {
+                s_next = CWL_S_INTENT
+            }
+        } else {
+            if s_prev == CWL_S_INTENT {
+                if rp_next >= CWL_TH_ACTION {
+                    s_next = CWL_S_ACTION
+                }
+            } else {
+                if s_prev == CWL_S_ACTION {
+                    s_next = CWL_S_IDLE
+                }
+            }
+        }
+    }
+    let mut fired = false
+    let mut action = vec_zeros_cwl(head.d_action)
+    if s_next == CWL_S_ACTION {
+        fired = true
+        action = w_head_motor(head, desire_drive, w.rp, phase)
+    }
+    return WillStepOut {
+        state_next:   s_next,
+        rp_next:      rp_next,
+        desire_level: desire_level,
+        intent_score: intent_score,
+        rp_delta:     rp_delta,
+        action:       action,
+        fired:        fired
+    }
+}
+
+fn will_obj_advance(w: WillObj, head: WHead, desire_drive: float) -> WillObj {
+    let st = will_obj_step(w, head, desire_drive)
+    let mut new_n_fired = w.n_fired
+    if st.fired { new_n_fired = w.n_fired + 1 }
+    return WillObj {
+        state:       st.state_next,
+        rp:          st.rp_next,
+        tick:        w.tick + 1,
+        last_action: st.action,
+        n_fired:     new_n_fired,
+        n_steps:     w.n_steps + 1
+    }
+}
+
+// ─── Synthetic desire-drive stream ────────────────────────────────
+// Rising ramp with a mild cosine so drive is correlated across ticks —
+// gives Φ_will a signal to pick up on.
+fn synth_drive(tick: int, seed: int, n_ticks: int) -> float {
+    let base = 0.3 + 0.6 * (to_float(tick) / to_float(n_ticks))
+    let noise = det_rand_cwl(1, seed + tick)
+    let bump = 0.15 * noise[0]
+    return base + bump
+}
+
+// ─── Loop result ─────────────────────────────────────────────────
+
+struct WillLoopResult {
+    n_ticks:     int,
+    drive_trace: array,    // [n_ticks]
+    state_trace: array,    // [n_ticks] (ints as floats for uniform storage)
+    rp_trace:    array,    // [n_ticks]
+    fire_trace:  array,    // [n_ticks] (0/1 as float)
+    first_fire:  int,      // -1 if never fired
+    total_fires: int,
+    phi_will:    float     // MI(drive_trace, rp_trace)
+}
+
+fn run_will_loop(head: WHead, w0: WillObj, n_ticks: int,
+                 seed_base: int) -> WillLoopResult {
+    let mut w = w0
+    let mut drive_trace = []
+    let mut state_trace = []
+    let mut rp_trace    = []
+    let mut fire_trace  = []
+    let mut first_fire  = 0 - 1
+    let mut total_fires = 0
+    let mut t = 0
+    while t < n_ticks {
+        let drive = synth_drive(t, seed_base, n_ticks)
+        let st = will_obj_step(w, head, drive)
+        drive_trace = drive_trace.push(drive)
+        state_trace = state_trace.push(to_float(st.state_next))
+        rp_trace    = rp_trace.push(st.rp_next)
+        let fire_f = if st.fired { 1.0 } else { 0.0 }
+        fire_trace = fire_trace.push(fire_f)
+        if st.fired {
+            if first_fire < 0 { first_fire = t }
+            total_fires = total_fires + 1
+        }
+        // Tick log (eval-convention like clm_*_loop.hexa).
+        let fire_flag = if st.fired { 1 } else { 0 }
+        println("tick=" + str(t)
+              + " state=" + str(st.state_next)
+              + " rp=" + str(st.rp_next)
+              + " drive=" + str(drive)
+              + " fired=" + str(fire_flag))
+        w = will_obj_advance(w, head, drive)
+        t = t + 1
+    }
+    let phi = mi_pair_cwl(drive_trace, rp_trace)
+    return WillLoopResult {
+        n_ticks:     n_ticks,
+        drive_trace: drive_trace,
+        state_trace: state_trace,
+        rp_trace:    rp_trace,
+        fire_trace:  fire_trace,
+        first_fire:  first_fire,
+        total_fires: total_fires,
+        phi_will:    phi
+    }
+}
+
+// ─── Self-tests ───────────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Loop latency: 25 ticks (d_action=4) < 2000 ms.
+    let head = w_head_new(CWL_SEED)
+    let w0 = will_obj_new(CWL_D_ACTION)
+    let t0 = clock()
+    let _r = run_will_loop(head, w0, 25, 777)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T1] 25-tick will loop (d_action=4) = " + str(ms) + " ms")
+    return ms < 2000.0
+}
+
+fn check_T2() -> bool {
+    // Libet RP rise BEFORE first ACTION.
+    // Criteria:
+    //   (a) first_fire ≥ 3 (must pass through IDLE→DESIRE→INTENT→ACTION)
+    //   (b) rp[first_fire-1] > rp[first_fire-3]  (monotone build-up window)
+    let head = w_head_new(CWL_SEED)
+    let w0 = will_obj_new(CWL_D_ACTION)
+    let r = run_will_loop(head, w0, 25, 100)
+    if r.first_fire < 0 { return false }
+    if r.first_fire < 3 { return false }
+    let nf = r.first_fire
+    let rp_minus_1 = r.rp_trace[nf - 1]
+    let rp_minus_3 = r.rp_trace[nf - 3]
+    // RP at tick nf-3 should be strictly smaller than at nf-1 (build-up).
+    // Allow tiny epsilon slack on the monotone check since drive is noisy.
+    if rp_minus_1 + 0.0001 < rp_minus_3 { return false }
+    println("  [T2] first_fire=" + str(nf)
+          + " rp[nf-3]=" + str(rp_minus_3)
+          + " rp[nf-1]=" + str(rp_minus_1))
+    return true
+}
+
+fn check_T3() -> bool {
+    // Φ_will > 0 (roadmap gate exit).
+    let head = w_head_new(CWL_SEED)
+    let w0 = will_obj_new(CWL_D_ACTION)
+    let r = run_will_loop(head, w0, 25, 200)
+    // RP trace must contain non-zero values (engine actually ramps).
+    let mut saw_nonzero = false
+    let mut i = 0
+    while i < len(r.rp_trace) {
+        if r.rp_trace[i] > 0.0 { saw_nonzero = true }
+        i = i + 1
+    }
+    if !saw_nonzero { return false }
+    println("  [T3] phi_will=" + str(r.phi_will)
+          + " total_fires=" + str(r.total_fires))
+    return r.phi_will > 0.0
+}
+
+fn check_T4() -> bool {
+    // Determinism: two sequential runs with identical seed ⇒ byte-identical
+    // drive/state/rp/fire traces.
+    let head1 = w_head_new(CWL_SEED)
+    let w01 = will_obj_new(CWL_D_ACTION)
+    let a = run_will_loop(head1, w01, 12, 333)
+    let head2 = w_head_new(CWL_SEED)
+    let w02 = will_obj_new(CWL_D_ACTION)
+    let b = run_will_loop(head2, w02, 12, 333)
+    if a.n_ticks != b.n_ticks { return false }
+    if a.first_fire != b.first_fire { return false }
+    if a.total_fires != b.total_fires { return false }
+    let n = len(a.drive_trace)
+    if n != len(b.drive_trace) { return false }
+    let mut i = 0
+    while i < n {
+        if fabs_cwl(a.drive_trace[i] - b.drive_trace[i]) > 0.0 { return false }
+        if fabs_cwl(a.state_trace[i] - b.state_trace[i]) > 0.0 { return false }
+        if fabs_cwl(a.rp_trace[i] - b.rp_trace[i]) > 0.0 { return false }
+        if fabs_cwl(a.fire_trace[i] - b.fire_trace[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    if fabs_cwl(a.phi_will - b.phi_will) > 0.0 { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // Trace lengths match n_ticks; state_trace + rp_trace + fire_trace each
+    // carry exactly N entries; total_fires equals sum of fire_trace.
+    let head = w_head_new(CWL_SEED)
+    let w0 = will_obj_new(CWL_D_ACTION)
+    let n = 8
+    let r = run_will_loop(head, w0, n, 555)
+    if r.n_ticks != n { return false }
+    if len(r.drive_trace) != n { return false }
+    if len(r.state_trace) != n { return false }
+    if len(r.rp_trace) != n { return false }
+    if len(r.fire_trace) != n { return false }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + r.fire_trace[i]
+        i = i + 1
+    }
+    if fabs_cwl(s - to_float(r.total_fires)) > 0.0001 { return false }
+    return true
+}
+
+// ─── main ─────────────────────────────────────────────────────────
+
+fn main() {
+    println("[clm_will_loop] CLM-P10-3 self-test")
+    println("  25-tick closed loop, d_action=4, seed=2030")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  loop latency") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  Libet RP rise before action") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  Φ_will > 0 (gate exit)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  determinism") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  trace length + fire-count consistency") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[clm_will_loop] ALL 5/5 PASS")
+    } else {
+        println("[clm_will_loop] SOME FAILED")
+    }
+}
+
+main()

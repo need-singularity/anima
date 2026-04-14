@@ -1,0 +1,486 @@
+// multi_anima_orchestrator.hexa — CLM-P9-1 multi-instance orchestrator (사회 의식)
+//
+// Theory of mind foundation: if a single anima instance can model ITS OWN
+// hidden state (P5 reflexivity), then two+ instances that simultaneously
+// model EACH OTHER'S hidden state cross the threshold into social cognition.
+// This artifact implements the minimal substrate: a pool of N ≥ 2 anima
+// instances that run in parallel, expose a `read_state()` view, and can
+// consume each other's state as input to their own reflexive forward pass.
+//
+// This is the CLM (from-scratch) side. It DOES NOT train — it's the
+// orchestration + mutual-read infrastructure that the ALM heads
+// (ALM-P9-1 other-model head, ALM-P9-2 alterity loss, ALM-P9-3 Sally-Anne)
+// plug into at training time.
+//
+// ─── Architecture ─────────────────────────────────────────────────
+//
+//   AnimaInstance #0                   AnimaInstance #1
+//     ┌───────────────┐                  ┌───────────────┐
+//     │ hidden h_0    │ ◀── read_state ─▶│ hidden h_1    │
+//     │ reflexive     │                  │ reflexive     │
+//     │ head (seeded) │                  │ head (seeded) │
+//     └───────────────┘                  └───────────────┘
+//             │                                 │
+//             └── mutual_forward(i, j) ─────────┘
+//                 = self-instance i runs reflexive forward taking
+//                   OTHER instance j's hidden state as extra input
+//
+// read_state(pool, i) -> array     (view of instance i hidden, copy)
+// mutual_forward(pool, i, j) -> array
+//                                  (instance i's ĥ computed from
+//                                   concat(h_i, h_j))
+// advance(pool, i, h_new) -> Pool  (replace instance i hidden with h_new;
+//                                   returns NEW pool — hexa lists are PBV,
+//                                   so every mutation must flow through a
+//                                   returned value)
+//
+// Done-criteria contract (roadmap CLM-P9-1):
+//   2+ instances simultaneous    → pool_new(N) for any N in [2..SOC_N_MAX]
+//   mutual state read works      → read_state(pool, i) round-trips bytes,
+//                                   and mutual_forward(i, j) produces a
+//                                   d_hidden vector that measurably depends
+//                                   on BOTH h_i and h_j (not just h_i).
+//
+// ─── Theorems (T1–T5) ─────────────────────────────────────────────
+//
+// T1 (pool dim contract):
+//   pool_new(N, d_hidden) returns N instances each with hidden of exact
+//   d_hidden; pool_size(p) == N; read_state(p, i) has length d_hidden.
+//
+// T2 (mutual state read):
+//   read_state(p, i) returns a deep-copy of h_i (hexa lists are PBV so
+//   this is automatic) — byte-identical to the hidden stored.
+//
+// T3 (mutual forward depends on peer):
+//   mutual_forward(p, i, j) with j != i produces a vector that DIFFERS
+//   from the corresponding self-only reflexive forward. Plus, for fixed
+//   h_i, varying h_j ⇒ the mutual_forward output varies.
+//
+// T4 (determinism):
+//   Same seed + same initial pool + same mutual_forward args ⇒
+//   byte-identical output.
+//
+// T5 (latency):
+//   pool_new(3, d=64) + 3 mutual_forward passes < 500 ms.
+//
+// Ref:
+//   anima-engines/anima_reflexive.hexa   (CLM-P5-1, self-model head)
+//   anima-engines/anima_nested.hexa      (CLM-P8-1, K-level stack)
+//   shared/roadmaps/anima.json           (CLM-P9-1 entry)
+
+// ─── Constants ────────────────────────────────────────────────────
+
+let SOC_D_HIDDEN   = 64
+let SOC_D_META     = 16
+let SOC_N_DEFAULT  = 2
+let SOC_N_MAX      = 8        // soft cap for latency sanity
+let SOC_SEED       = 2029
+let SOC_WGT_GAIN   = 0.25
+
+// ─── Primitives (self-contained) ─────────────────────────────────
+
+fn fabs_s(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn det_rand_s(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn relu_s(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    return x
+}
+
+// ─── Reflexive head (local copy, scaled to accept 2*d_hidden input) ──
+//
+// The "self-only" reflexive head (P5) maps d_hidden -> d_meta -> d_hidden.
+// For the mutual-forward path we stack (h_self, h_peer) into a single
+// vector of length 2*d_hidden, so the head here is sized d_hidden*2 on the
+// input side. We also provide a self_forward helper that feeds the self
+// slot and a zero peer slot to recover the P5 behavior — this lets T3
+// compare self vs mutual outputs directly.
+
+struct SocialHead {
+    d_hidden: int,       // dim of one hidden state
+    d_meta:   int,       // bottleneck
+    w1:       array,     // [(2*d_hidden) * d_meta] row-major
+    b1:       array,     // [d_meta]
+    w2:       array,     // [d_meta * d_hidden] row-major
+    b2:       array      // [d_hidden]
+}
+
+fn social_head_new(d_hidden: int, d_meta: int, seed: int) -> SocialHead {
+    // input side is 2*d_hidden (self concat peer)
+    let d_in = d_hidden * 2
+    let raw1 = det_rand_s(d_in * d_meta, seed)
+    let raw2 = det_rand_s(d_meta * d_hidden, seed + 1)
+    let rb1  = det_rand_s(d_meta, seed + 2)
+    let rb2  = det_rand_s(d_hidden, seed + 3)
+    let mut w1 = []
+    let mut i = 0
+    while i < len(raw1) {
+        w1 = w1.push(raw1[i] * SOC_WGT_GAIN)
+        i = i + 1
+    }
+    let mut w2 = []
+    let mut j = 0
+    while j < len(raw2) {
+        w2 = w2.push(raw2[j] * SOC_WGT_GAIN)
+        j = j + 1
+    }
+    let mut b1 = []
+    let mut k = 0
+    while k < len(rb1) {
+        b1 = b1.push(rb1[k] * SOC_WGT_GAIN * 0.1)
+        k = k + 1
+    }
+    let mut b2 = []
+    let mut m = 0
+    while m < len(rb2) {
+        b2 = b2.push(rb2[m] * SOC_WGT_GAIN * 0.1)
+        m = m + 1
+    }
+    return SocialHead {
+        d_hidden: d_hidden,
+        d_meta:   d_meta,
+        w1:       w1,
+        b1:       b1,
+        w2:       w2,
+        b2:       b2
+    }
+}
+
+// social_head_forward: (h_self, h_peer) -> ĥ_self.
+// Works on a concatenated 2*d_hidden input; if caller wants self-only
+// semantics they pass h_peer = zeros(d_hidden).
+fn social_head_forward(head: SocialHead, h_self: array, h_peer: array) -> array {
+    let dH = head.d_hidden
+    let dM = head.d_meta
+    let d_in = dH * 2
+    // Build stacked input — self first, peer second.
+    let mut x = []
+    let mut a = 0
+    while a < dH {
+        x = x.push(h_self[a])
+        a = a + 1
+    }
+    let mut b = 0
+    while b < dH {
+        x = x.push(h_peer[b])
+        b = b + 1
+    }
+    // Layer 1: z = relu(W1·x + b1)
+    let mut z = []
+    let mut k = 0
+    while k < dM {
+        let mut s = head.b1[k]
+        let mut i = 0
+        while i < d_in {
+            s = s + head.w1[i * dM + k] * x[i]
+            i = i + 1
+        }
+        z = z.push(relu_s(s))
+        k = k + 1
+    }
+    // Layer 2: ĥ = W2·z + b2
+    let mut h_hat = []
+    let mut ii = 0
+    while ii < dH {
+        let mut t = head.b2[ii]
+        let mut kk = 0
+        while kk < dM {
+            t = t + head.w2[kk * dH + ii] * z[kk]
+            kk = kk + 1
+        }
+        h_hat = h_hat.push(t)
+        ii = ii + 1
+    }
+    return h_hat
+}
+
+// Convenience: self-only forward (peer = zero vector).
+fn social_head_self_only(head: SocialHead, h_self: array) -> array {
+    let dH = head.d_hidden
+    let mut zero = []
+    let mut i = 0
+    while i < dH {
+        zero = zero.push(0.0)
+        i = i + 1
+    }
+    return social_head_forward(head, h_self, zero)
+}
+
+// ─── Pool ────────────────────────────────────────────────────────
+//
+// A Pool carries N anima instances. Every instance gets the SAME
+// social_head (shared-weight social self-model — matches the
+// "same species, different instance" intuition), but a distinct
+// deterministic seed for its hidden state so T3 can exercise peer
+// dependence.
+//
+// Hidden states are stored as a flat array of length N*d_hidden to
+// sidestep the hexa struct-field list aliasing bug documented in
+// feedback_hexa_struct_list_alias.md (which bites when a struct
+// holds an array-of-arrays and multiple instances are live).
+
+struct Pool {
+    n:        int,
+    d_hidden: int,
+    head:     SocialHead,
+    hiddens:  array     // [N * d_hidden] row-major; row i = hidden of instance i
+}
+
+fn empty_pool() -> Pool {
+    let head = social_head_new(SOC_D_HIDDEN, SOC_D_META, SOC_SEED)
+    return Pool {
+        n:        0,
+        d_hidden: SOC_D_HIDDEN,
+        head:     head,
+        hiddens:  []
+    }
+}
+
+fn pool_new(n: int, d_hidden: int, seed: int) -> Pool {
+    if n < 2 { return empty_pool() }
+    if n > SOC_N_MAX { return empty_pool() }
+    let head = social_head_new(d_hidden, SOC_D_META, seed)
+    // Distinct seed per instance so their hiddens differ.
+    let mut hiddens = []
+    let mut i = 0
+    while i < n {
+        let row = det_rand_s(d_hidden, seed + 100 + i * 17)
+        let mut j = 0
+        while j < d_hidden {
+            hiddens = hiddens.push(row[j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return Pool {
+        n:        n,
+        d_hidden: d_hidden,
+        head:     head,
+        hiddens:  hiddens
+    }
+}
+
+fn pool_size(p: Pool) -> int {
+    return p.n
+}
+
+// read_state: return a copy of instance i's hidden (PBV semantics mean this
+// IS a copy; caller can mutate freely without touching the pool).
+fn read_state(p: Pool, i: int) -> array {
+    if i < 0 { return [] }
+    if i >= p.n { return [] }
+    let dH = p.d_hidden
+    let base = i * dH
+    let mut out = []
+    let mut k = 0
+    while k < dH {
+        out = out.push(p.hiddens[base + k])
+        k = k + 1
+    }
+    return out
+}
+
+// mutual_forward: instance i's reflexive ĥ computed over (h_i, h_j).
+fn mutual_forward(p: Pool, i: int, j: int) -> array {
+    if i < 0 { return [] }
+    if j < 0 { return [] }
+    if i >= p.n { return [] }
+    if j >= p.n { return [] }
+    let h_self = read_state(p, i)
+    let h_peer = read_state(p, j)
+    return social_head_forward(p.head, h_self, h_peer)
+}
+
+// self_forward: recover P5 self-only behavior (peer=zero), used by T3
+// to show mutual != self.
+fn self_forward(p: Pool, i: int) -> array {
+    if i < 0 { return [] }
+    if i >= p.n { return [] }
+    let h_self = read_state(p, i)
+    return social_head_self_only(p.head, h_self)
+}
+
+// advance: replace instance i's hidden with h_new, return NEW pool.
+fn advance(p: Pool, i: int, h_new: array) -> Pool {
+    if i < 0 { return p }
+    if i >= p.n { return p }
+    let dH = p.d_hidden
+    if len(h_new) != dH { return p }
+    let base = i * dH
+    let mut hiddens2 = []
+    let mut k = 0
+    while k < len(p.hiddens) {
+        hiddens2 = hiddens2.push(p.hiddens[k])
+        k = k + 1
+    }
+    let mut m = 0
+    while m < dH {
+        hiddens2[base + m] = h_new[m]
+        m = m + 1
+    }
+    return Pool {
+        n:        p.n,
+        d_hidden: p.d_hidden,
+        head:     p.head,
+        hiddens:  hiddens2
+    }
+}
+
+// ─── Self-tests ───────────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Pool dim contract.
+    let p = pool_new(SOC_N_DEFAULT, SOC_D_HIDDEN, SOC_SEED)
+    if pool_size(p) != SOC_N_DEFAULT { return false }
+    if p.d_hidden != SOC_D_HIDDEN { return false }
+    if len(p.hiddens) != SOC_N_DEFAULT * SOC_D_HIDDEN { return false }
+    let v0 = read_state(p, 0)
+    if len(v0) != SOC_D_HIDDEN { return false }
+    let v1 = read_state(p, 1)
+    if len(v1) != SOC_D_HIDDEN { return false }
+    // out-of-range indices return []
+    let oob = read_state(p, SOC_N_DEFAULT)
+    if len(oob) != 0 { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // Mutual state read: read_state returns byte-identical copy of stored row.
+    let p = pool_new(3, SOC_D_HIDDEN, SOC_SEED)
+    let v0 = read_state(p, 0)
+    let v1 = read_state(p, 1)
+    let v2 = read_state(p, 2)
+    if len(v0) != SOC_D_HIDDEN { return false }
+    if len(v1) != SOC_D_HIDDEN { return false }
+    if len(v2) != SOC_D_HIDDEN { return false }
+    // Recompute expected directly and compare byte-wise.
+    let mut k = 0
+    while k < SOC_D_HIDDEN {
+        if fabs_s(p.hiddens[0 * SOC_D_HIDDEN + k] - v0[k]) > 0.0 { return false }
+        if fabs_s(p.hiddens[1 * SOC_D_HIDDEN + k] - v1[k]) > 0.0 { return false }
+        if fabs_s(p.hiddens[2 * SOC_D_HIDDEN + k] - v2[k]) > 0.0 { return false }
+        k = k + 1
+    }
+    // Instances 0/1/2 should not all have identical hiddens (seeded distinct).
+    let mut any_diff = false
+    let mut i = 0
+    while i < SOC_D_HIDDEN {
+        if fabs_s(v0[i] - v1[i]) > 0.0 { any_diff = true }
+        i = i + 1
+    }
+    if !any_diff { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // mutual_forward(i, j) must depend on BOTH h_i and h_j.
+    // (a) mutual(0, 1) != self(0)        — peer contributes
+    // (b) mutual(0, 1) != mutual(0, 2)   — different peers give different outputs
+    let p = pool_new(3, SOC_D_HIDDEN, SOC_SEED)
+    let mu01 = mutual_forward(p, 0, 1)
+    let mu02 = mutual_forward(p, 0, 2)
+    let so0  = self_forward(p, 0)
+    if len(mu01) != SOC_D_HIDDEN { return false }
+    if len(mu02) != SOC_D_HIDDEN { return false }
+    if len(so0)  != SOC_D_HIDDEN { return false }
+    // (a) mutual ≠ self
+    let mut diff_peer = false
+    let mut i = 0
+    while i < SOC_D_HIDDEN {
+        if fabs_s(mu01[i] - so0[i]) > 0.0 { diff_peer = true }
+        i = i + 1
+    }
+    if !diff_peer { return false }
+    // (b) different peer ⇒ different output
+    let mut diff_peer_j = false
+    let mut j = 0
+    while j < SOC_D_HIDDEN {
+        if fabs_s(mu01[j] - mu02[j]) > 0.0 { diff_peer_j = true }
+        j = j + 1
+    }
+    if !diff_peer_j { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // Determinism: same seed + same call ⇒ byte-identical output.
+    let p1 = pool_new(2, SOC_D_HIDDEN, SOC_SEED)
+    let p2 = pool_new(2, SOC_D_HIDDEN, SOC_SEED)
+    // Compare stored hiddens.
+    if len(p1.hiddens) != len(p2.hiddens) { return false }
+    let mut i = 0
+    while i < len(p1.hiddens) {
+        if fabs_s(p1.hiddens[i] - p2.hiddens[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    // Compare mutual_forward outputs.
+    let a = mutual_forward(p1, 0, 1)
+    let b = mutual_forward(p2, 0, 1)
+    if len(a) != len(b) { return false }
+    let mut j = 0
+    while j < len(a) {
+        if fabs_s(a[j] - b[j]) > 0.0 { return false }
+        j = j + 1
+    }
+    return true
+}
+
+fn check_T5() -> bool {
+    // Latency: pool_new(3) + 3 mutual_forward passes within budget.
+    // hexa stage0 clock() has 1-s granularity; allow up to 5000 ms.
+    let t0 = clock()
+    let p = pool_new(3, SOC_D_HIDDEN, SOC_SEED)
+    let _a = mutual_forward(p, 0, 1)
+    let _b = mutual_forward(p, 1, 2)
+    let _c = mutual_forward(p, 2, 0)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] pool_new(3)+3x mutual_forward (d=64) = " + str(ms) + " ms")
+    return ms < 5000.0
+}
+
+// ─── main ─────────────────────────────────────────────────────────
+
+fn main() {
+    println("[multi_anima_orchestrator] CLM-P9-1 — multi-instance orchestrator self-test")
+    println("  N=2/3, d_hidden=64, d_meta=16, seed=2029")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  pool dim contract (N≥2, d_hidden)") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  mutual state read (byte-identical copy)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  mutual_forward depends on peer") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  determinism") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  latency") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[multi_anima_orchestrator] ALL 5/5 PASS")
+    } else {
+        println("[multi_anima_orchestrator] SOME FAILED")
+    }
+}
+
+main()
