@@ -1,0 +1,426 @@
+// clm_gwt_loop.hexa — CLM GWT broadcast loop (P2-4)
+//
+// CLM-P2-4. Drives the clm_gwt_broadcast head across N ticks, emitting
+// per-tick DomainActivations to every registered module. Mock modules
+// stand in for the downstream consumers (cell faction subsystems,
+// memory, emotion, W/E branches of the Hexad); each exposes a
+// `receive(tick, domain_idx, payload)` entry point satisfied here by
+// accumulating into a per-module receive counter.
+//
+// Pipeline per tick:
+//   cells_t [n_cells × d_model]  (mock generator)
+//     │
+//     │  cells_to_consensus
+//     ▼
+//   c_t [d_model]
+//     │
+//     │  clm_broadcast(head, c_t)
+//     ▼
+//   DomainActivations_t [n_domains × d_model]
+//     │
+//     │  fan-out to modules[d] for d in 0..n_domains
+//     ▼
+//   per-module trail (tick counter + last-seen energy)
+//
+// ─── Theorems (T1–T5) ──────────────────────────────────────────
+//
+// T1 (fan-out completeness):
+//   After N ticks, every module has received exactly N payloads, one per
+//   tick. Verified by inspecting ModuleState.received_ticks for each
+//   module in the registry.
+//
+// T2 (energy conservation across loop):
+//   For every tick t, sum_d (sum over features of activations[d]) equals
+//   sum over features of c_t (T1 of clm_gwt_broadcast lifted to the
+//   loop; cumulative sums stay within eps over all ticks).
+//
+// T3 (fan-out bandwidth linear in n_domains):
+//   Total receive calls over N ticks = N * n_domains. Checked via the
+//   global counter on ModuleRegistry.
+//
+// T4 (determinism):
+//   Two runs with the same seed produce byte-identical cumulative
+//   per-module energies (within float eps).
+//
+// T5 (loop latency budget):
+//   A 20-tick loop at (n_domains=8, d_model=64, n_cells=32) must run
+//   in < 5 seconds on the reference interpreter. Each tick pays for
+//   one cells_to_consensus (n_cells × d_model ≈ 2 k ops) and one
+//   broadcast (n_domains × d_model allocations), so wall time scales
+//   linearly with ticks. Interpreter budget ≈ 120 ms/tick observed.
+
+// clm_gwt_broadcast.hexa already defines the primitives we need; since
+// HEXA_PATH import semantics vary by binary, redefine locally (flat,
+// self-contained) to keep this file runnable standalone.
+
+// ─── Primitives (mirror of clm_gwt_broadcast) ─────────────────
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_sum(v: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    let n = len(v)
+    while i < n {
+        s = s + v[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        let v = u * 2.0 - 1.0
+        out = out.push(v)
+        i = i + 1
+    }
+    return out
+}
+
+fn loop_softmax(x: array) -> array {
+    let n = len(x)
+    if n == 0 { return [] }
+    let mut m = x[0]
+    let mut i = 1
+    while i < n {
+        if x[i] > m { m = x[i] }
+        i = i + 1
+    }
+    let mut exps = []
+    let mut z = 0.0
+    i = 0
+    while i < n {
+        let e = exp(x[i] - m)
+        exps = exps.push(e)
+        z = z + e
+        i = i + 1
+    }
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out.push(exps[i] / z)
+        i = i + 1
+    }
+    return out
+}
+
+struct ClmGwtBroadcastHead {
+    n_domains: int,
+    d_model:   int,
+    project:   array,
+    gate:      array
+}
+
+struct DomainActivations {
+    n_domains: int,
+    d_model:   int,
+    a:         array
+}
+
+fn clm_gwt_head_new(n_domains: int, d_model: int, seed: int) -> ClmGwtBroadcastHead {
+    let scale = 0.02
+    let raw = det_rand(n_domains * d_model, seed)
+    let mut proj = []
+    let mut i = 0
+    let n = len(raw)
+    while i < n {
+        proj = proj.push(raw[i] * scale)
+        i = i + 1
+    }
+    let gate = vec_zeros(n_domains)
+    return ClmGwtBroadcastHead {
+        n_domains: n_domains,
+        d_model:   d_model,
+        project:   proj,
+        gate:      gate
+    }
+}
+
+fn cells_to_consensus(cells: array, n_cells: int, d_model: int) -> array {
+    if n_cells == 0 { return vec_zeros(d_model) }
+    let inv_n = 1.0 / to_float(n_cells)
+    let mut c = []
+    let mut m = 0
+    while m < d_model {
+        let mut s = 0.0
+        let mut i = 0
+        while i < n_cells {
+            s = s + cells[i * d_model + m]
+            i = i + 1
+        }
+        c = c.push(s * inv_n)
+        m = m + 1
+    }
+    return c
+}
+
+fn clm_gwt_compute_alpha(head: ClmGwtBroadcastHead, c: array) -> array {
+    let nd = head.n_domains
+    let dm = head.d_model
+    if nd == 0 { return [] }
+    let mut logits = []
+    let mut d = 0
+    while d < nd {
+        let mut s = head.gate[d]
+        let mut k = 0
+        while k < dm {
+            s = s + head.project[d * dm + k] * c[k]
+            k = k + 1
+        }
+        logits = logits.push(s)
+        d = d + 1
+    }
+    return loop_softmax(logits)
+}
+
+fn clm_broadcast(head: ClmGwtBroadcastHead, c: array) -> DomainActivations {
+    let nd = head.n_domains
+    let dm = head.d_model
+    let alpha = clm_gwt_compute_alpha(head, c)
+    let mut a = []
+    let mut d = 0
+    while d < nd {
+        let w = alpha[d]
+        let mut m = 0
+        while m < dm {
+            a = a.push(w * c[m])
+            m = m + 1
+        }
+        d = d + 1
+    }
+    return DomainActivations {
+        n_domains: nd,
+        d_model:   dm,
+        a:         a
+    }
+}
+
+// ─── Module registry (mock downstream consumers) ──────────────
+
+struct ModuleState {
+    name:            string,
+    received_ticks:  int,
+    cumulative_energy: float
+}
+
+struct ModuleRegistry {
+    modules:        [ModuleState],
+    total_receives: int
+}
+
+fn registry_new(n_domains: int) -> ModuleRegistry {
+    let mut ms = []
+    let mut i = 0
+    while i < n_domains {
+        ms = ms.push(ModuleState {
+            name: "module_" + str(i),
+            received_ticks: 0,
+            cumulative_energy: 0.0
+        })
+        i = i + 1
+    }
+    return ModuleRegistry { modules: ms, total_receives: 0 }
+}
+
+// Fan-out activations to modules. activations layout: [n_domains × d_model].
+// Each module d "receives" the slice a[d*dm .. (d+1)*dm]; we record its
+// absolute energy sum (sum |a[d][m]|) so T2/T4 can assert invariants.
+fn registry_receive(reg: ModuleRegistry, act: DomainActivations) -> ModuleRegistry {
+    let nd = act.n_domains
+    let dm = act.d_model
+    let mut new_mods = []
+    let mut d = 0
+    while d < nd {
+        let prev = reg.modules[d]
+        let mut energy = 0.0
+        let mut m = 0
+        while m < dm {
+            energy = energy + fabs(act.a[d * dm + m])
+            m = m + 1
+        }
+        new_mods = new_mods.push(ModuleState {
+            name: prev.name,
+            received_ticks: prev.received_ticks + 1,
+            cumulative_energy: prev.cumulative_energy + energy
+        })
+        d = d + 1
+    }
+    return ModuleRegistry {
+        modules:        new_mods,
+        total_receives: reg.total_receives + nd
+    }
+}
+
+// ─── Main loop ───────────────────────────────────────────────
+
+struct LoopResult {
+    registry:          ModuleRegistry,
+    sum_input_energy:  float,   // ∑_t sum |c_t|
+    sum_output_energy: float    // ∑_t ∑_d sum |activations[d]|
+}
+
+fn run_loop(
+    head: ClmGwtBroadcastHead,
+    reg:  ModuleRegistry,
+    n_ticks: int,
+    n_cells: int,
+    cell_seed_base: int
+) -> LoopResult {
+    let dm = head.d_model
+    let mut r = reg
+    let mut sum_in = 0.0
+    let mut sum_out = 0.0
+    let mut t = 0
+    while t < n_ticks {
+        // Deterministic per-tick mock cells: different seed each tick.
+        let cells = det_rand(n_cells * dm, cell_seed_base + t)
+        let c = cells_to_consensus(cells, n_cells, dm)
+
+        // sum |c_t|
+        let mut in_e = 0.0
+        let mut m = 0
+        while m < dm {
+            in_e = in_e + fabs(c[m])
+            m = m + 1
+        }
+        sum_in = sum_in + in_e
+
+        let act = clm_broadcast(head, c)
+        // sum |a|
+        let mut out_e = 0.0
+        let mut i = 0
+        while i < len(act.a) {
+            out_e = out_e + fabs(act.a[i])
+            i = i + 1
+        }
+        sum_out = sum_out + out_e
+
+        r = registry_receive(r, act)
+        t = t + 1
+    }
+    return LoopResult {
+        registry:          r,
+        sum_input_energy:  sum_in,
+        sum_output_energy: sum_out
+    }
+}
+
+// ─── Self-tests ───────────────────────────────────────────────
+
+fn check_T1(result: LoopResult, n_ticks: int) -> bool {
+    // Every module received exactly n_ticks payloads.
+    let mods = result.registry.modules
+    let mut d = 0
+    while d < len(mods) {
+        if mods[d].received_ticks != n_ticks { return false }
+        d = d + 1
+    }
+    return true
+}
+
+fn check_T2(result: LoopResult) -> bool {
+    // Energy conservation: sum_out ≈ sum_in (per-tick T1 of broadcast
+    // states sum_d rows = c, so |sum| over d and m == |c| sum; floating
+    // point drift of O(n_ticks * n_domains * d_model * eps) is accepted).
+    let diff = fabs(result.sum_output_energy - result.sum_input_energy)
+    let tol = result.sum_input_energy * 0.001 + 0.01
+    return diff < tol
+}
+
+fn check_T3(result: LoopResult, n_ticks: int, n_domains: int) -> bool {
+    // total_receives = n_ticks * n_domains.
+    return result.registry.total_receives == n_ticks * n_domains
+}
+
+fn check_T4(head: ClmGwtBroadcastHead, n_ticks: int, n_cells: int) -> bool {
+    // Determinism: two runs with same seed produce identical cumulative
+    // energy on every module.
+    let reg1 = registry_new(head.n_domains)
+    let r1 = run_loop(head, reg1, n_ticks, n_cells, 7)
+    let reg2 = registry_new(head.n_domains)
+    let r2 = run_loop(head, reg2, n_ticks, n_cells, 7)
+    let m1 = r1.registry.modules
+    let m2 = r2.registry.modules
+    if len(m1) != len(m2) { return false }
+    let mut d = 0
+    while d < len(m1) {
+        if fabs(m1[d].cumulative_energy - m2[d].cumulative_energy) > 0.00001 { return false }
+        d = d + 1
+    }
+    return true
+}
+
+fn check_T5() -> bool {
+    // 20-tick loop (8, 64, 32) must run < 5 s on the hexa interpreter.
+    // Native code will compress this by 50–100x; the purpose here is a
+    // regression guard, not a performance goal.
+    let head = clm_gwt_head_new(8, 64, 42)
+    let reg = registry_new(8)
+    let t0 = clock()
+    let _r = run_loop(head, reg, 20, 32, 11)
+    let t1 = clock()
+    let elapsed_ms = (t1 - t0) * 1000.0
+    println("  [T5] 20-tick loop (8,64,32) = " + str(elapsed_ms) + " ms")
+    return elapsed_ms < 5000.0
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[clm_gwt_loop] CLM-P2-4 self-test")
+    println("  mock: n_domains=8, d_model=64, n_cells=32, n_ticks=20")
+
+    let n_domains = 8
+    let d_model   = 64
+    let n_cells   = 32
+    let n_ticks   = 20
+    let head = clm_gwt_head_new(n_domains, d_model, 42)
+    let reg = registry_new(n_domains)
+    let result = run_loop(head, reg, n_ticks, n_cells, 7)
+
+    println("  sum_input_energy  = " + str(result.sum_input_energy))
+    println("  sum_output_energy = " + str(result.sum_output_energy))
+    println("  total_receives    = " + str(result.registry.total_receives))
+
+    let t1 = check_T1(result, n_ticks)
+    if t1 { println("T1 PASS") } else { println("T1 FAIL") }
+
+    let t2 = check_T2(result)
+    if t2 { println("T2 PASS") } else { println("T2 FAIL") }
+
+    let t3 = check_T3(result, n_ticks, n_domains)
+    if t3 { println("T3 PASS") } else { println("T3 FAIL") }
+
+    let t4 = check_T4(head, 5, n_cells)
+    if t4 { println("T4 PASS") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[clm_gwt_loop] ALL 5/5 PASS")
+    } else {
+        println("[clm_gwt_loop] SOME FAILED")
+    }
+}
+
+main()
