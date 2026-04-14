@@ -1,0 +1,565 @@
+// psychosis_phi.hexa — P67 Psychosis / Hallucination Φ
+//
+// Roadmap: anima P67 "Positive symptoms of psychosis as Φ mis-binding —
+// aberrant precision weighting in predictive processing (Friston active
+// inference)."
+//
+// ─── Scientific hypothesis ────────────────────────────────────────
+//
+// H (hallucinations as precision pathology): In the Bayesian / active-
+// inference view, perception is a precision-weighted blend of a prior
+// (top-down hypothesis) and a likelihood (bottom-up sensory evidence):
+//
+//   posterior ∝ prior × likelihood
+//
+// The mixing weights are *precisions* — inverse variances expressing
+// how reliable each source is deemed to be:
+//
+//   percept = (π_prior · prior + π_sense · sensory) / (π_prior + π_sense)
+//
+// In the healthy regime π_prior and π_sense are balanced (subject-specific
+// but stable). In psychosis the balance is pathologically shifted — the
+// precision of the prior grows unchecked (or sensory precision collapses),
+// so the posterior collapses onto the prior even when the sensory evidence
+// is weak, absent, or contradictory.
+//
+//   Hallucination — sensory channel near-silent, strong prior; the
+//   prior becomes the percept (voices in silence, visions in darkness).
+//
+//   Delusion     — same mechanism, one level up in the generative
+//   hierarchy: a *conceptual* prior (belief) dominates evidence. We
+//   implement this as a second PP stage whose input is the *first*
+//   stage's percept, with its own precision pair (π_belief, π_ev).
+//
+// Empirical signatures:
+//   Φ_aberrant = MI(prior_channel, percept) − MI(prior_channel, baseline)
+//   large and positive in hallucination regime.
+//   Antipsychotic simulation = lowering π_prior (D2 analogy) restores
+//   MI balance toward baseline.
+//   Insight (Φ_meta) = MI between the measured Φ_aberrant and an
+//   internal report channel about it — captures meta-awareness of the
+//   aberrant state (poor insight ⇔ low Φ_meta despite large Φ_aberrant).
+//
+// References
+//   Friston K. (2005) A theory of cortical responses, Phil. Trans. R. Soc. B
+//   Fletcher P.C. & Frith C.D. (2009) Perceiving is believing, Nat. Rev. Neurosci.
+//   Adams R.A. et al. (2013) The computational anatomy of psychosis, Front. Psychiatry
+//   Corlett P.R. et al. (2019) Hallucinations and strong priors, Trends Cogn. Sci.
+//
+// ─── Theorems (T1–T5) ─────────────────────────────────────────────
+//
+// T1 (hallucination drives Φ_aberrant up):
+//   Raising π_prior while keeping sensory input near zero yields a
+//   percept dominated by the prior; Φ(prior, percept) in this regime
+//   strictly exceeds Φ(prior, percept) in the balanced baseline by
+//   ≥ 0.15 nats.
+//
+// T2 (delusion — hierarchical over-prior at belief level):
+//   Stacking a second PP stage (belief × evidence → conviction) with a
+//   pathologically high π_belief produces conviction dominated by the
+//   belief prior. Conviction-tracking prior MI minus baseline ≥ 0.10.
+//
+// T3 (antipsychotic — lowering π_prior restores balance):
+//   Starting from the hallucination regime, reducing π_prior toward
+//   sensory-balanced levels reduces Φ_aberrant by ratio ≥ 2× compared
+//   to the untreated hallucination case. Post-treatment Φ_aberrant
+//   must be strictly below the pretreatment value.
+//
+// T4 (insight — Φ_meta about aberrant Φ):
+//   An "insight" channel that is causally coupled to Φ_aberrant (report
+//   reflecting internal state) yields MI(Φ_aberrant_samples, report) > 0
+//   ≥ 0.05 nats in the insight-intact condition, whereas insight-absent
+//   (report clamped / decoupled) yields strictly lower MI. Ratio ≥ 2×.
+//
+// T5 (latency):
+//   Full pipeline (baseline + halluc + delusion + treated + insight)
+//   under 5 s on hexa stage0 interpreter.
+//
+// ─── Stage0 hexa constraints honored ─────────────────────────────
+//   - plain `fn` only, no pure-fn multi-float struct returns
+//   - `array` typed params (no [float]/[int])
+//   - no match with identifier patterns
+//   - no contains() / to_lower()
+//   - no !(Effect) fn sigs
+//   - no else-if in let-binding
+//   - no multi-line fn signatures / call sites
+//   - no reserved keywords as vars
+//   - N < 32 throughout
+//   - main() call at bottom
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+// Precision weights — healthy balanced regime
+let PY_PI_PRIOR_BAL     = 1.0
+let PY_PI_SENSE_BAL     = 1.0
+
+// Hallucination regime — strong prior, near-silent sensory
+let PY_PI_PRIOR_HIGH    = 9.0
+let PY_PI_SENSE_LOW     = 0.2
+
+// Delusion belief-level precisions
+let PY_PI_BELIEF_BAL    = 1.0
+let PY_PI_EV_BAL        = 1.0
+let PY_PI_BELIEF_HIGH   = 9.0
+let PY_PI_EV_LOW        = 0.2
+
+// Antipsychotic treatment: D2 blockade lowers prior precision while
+// sensory precision is restored. Empirically tuned so post-treatment
+// Φ(prior, percept) falls ≥ 2× below untreated hallucination.
+let PY_PI_PRIOR_TREATED = 0.3
+let PY_PI_SENSE_TREATED = 1.2
+
+// Prior magnitude (the "voice") and sensory baseline (silence)
+let PY_PRIOR_SIGNAL     = 0.8      // typical prior activation amplitude
+let PY_SENSE_SILENT     = 0.05     // near-zero external signal
+let PY_SENSE_NORMAL     = 0.8      // normal-regime sensory amplitude
+
+// Noise levels
+let PY_NOISE_PRIOR      = 0.05
+let PY_NOISE_SENSE      = 0.05
+let PY_NOISE_PERCEPT    = 0.03
+
+// Gates
+let PY_T1_PHI_GAIN      = 0.15     // halluc Φ_aberrant − baseline ≥ 0.15
+let PY_T2_DELUSION_GAIN = 0.10     // delusion conviction MI gain ≥ 0.10
+let PY_T3_RATIO         = 2.0      // treated reduces Φ by ≥ 2×
+let PY_T4_META_GATE     = 0.05     // insight Φ_meta ≥ 0.05 nats
+let PY_T4_RATIO         = 2.0      // insight vs no-insight ratio ≥ 2×
+
+// Trial sizes (all N<32)
+let PY_N_MI_TRIALS      = 28
+let PY_N_INSIGHT        = 28
+let PY_MI_BINS          = 5
+
+// Latency
+let PY_LATENCY_MS       = 5000.0
+
+let PY_EPS              = 0.00000001
+let PY_SEED             = 6700
+
+// ═══════════════════════════════════════════════════════════════
+// PRNG + numeric helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn py_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn py_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn py_signed(seed: int) -> float {
+    return py_unit(seed) * 2.0 - 1.0
+}
+
+fn py_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn py_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Active-inference 2-stream percept:
+//   percept = (π_prior · prior + π_sense · sensory) / (π_prior + π_sense)
+// ═══════════════════════════════════════════════════════════════
+//
+// Note: sign convention is direct (no subtraction). In psychosis the
+// prior is a *content* signal (a voice, an image) that overwrites
+// actual input — it is additive, not a relief term.
+
+fn py_prior_channel(prior_level: float, seed: int) -> float {
+    // Top-down prior stream carries its own noise.
+    let s = py_prng(seed + 17)
+    let noise = PY_NOISE_PRIOR * py_signed(s)
+    return prior_level + noise
+}
+
+fn py_sense_channel(sense_level: float, seed: int) -> float {
+    let s = py_prng(seed + 53)
+    let noise = PY_NOISE_SENSE * py_signed(s)
+    return sense_level + noise
+}
+
+// Precision-weighted Bayesian blend.
+// Root cause note: stage0 rejects pure fn multi-float struct returns,
+// so we expose the blend as a single scalar — the caller that also needs
+// prior/sense channels recomputes them locally with the same seed.
+fn py_percept(prior_level: float, sense_level: float, pi_prior: float, pi_sense: float, seed: int) -> float {
+    let p = py_prior_channel(prior_level, seed)
+    let s = py_sense_channel(sense_level, seed)
+    let denom = pi_prior + pi_sense
+    if denom < PY_EPS { return 0.0 }
+    let blend = (pi_prior * p + pi_sense * s) / denom
+    let s2 = py_prng(seed + 211)
+    let resid = PY_NOISE_PERCEPT * py_signed(s2)
+    return blend + resid
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Hierarchical PP stage 2 — belief × evidence → conviction
+// ═══════════════════════════════════════════════════════════════
+//
+// The lower stage's percept becomes the evidence fed into a second,
+// conceptual PP layer. A belief prior (e.g., "they are plotting") is
+// weighed against that evidence. Pathological π_belief >> π_evidence
+// yields conviction dominated by the belief regardless of evidence.
+
+fn py_conviction(belief_level: float, evidence: float, pi_belief: float, pi_ev: float, seed: int) -> float {
+    let s = py_prng(seed + 307)
+    let belief_noisy = belief_level + PY_NOISE_PRIOR * py_signed(s)
+    let denom = pi_belief + pi_ev
+    if denom < PY_EPS { return 0.0 }
+    let blend = (pi_belief * belief_noisy + pi_ev * evidence) / denom
+    let s2 = py_prng(seed + 419)
+    let resid = PY_NOISE_PERCEPT * py_signed(s2)
+    return blend + resid
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MI (mutual information) helpers — histogram based, N<32 safe
+// ═══════════════════════════════════════════════════════════════
+
+fn py_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn py_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn py_entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(py_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = py_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * py_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn py_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        let ia = py_bin_idx(a[i], lo, hi, nb)
+        let ib = py_bin_idx(b[i], lo, hi, nb)
+        ids = ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = py_counts(ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * py_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+// MI over a shared [lo, hi] range computed consistently across both series.
+fn py_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let mut lo = a[0]
+    let mut hi = a[0]
+    let mut i = 0
+    while i < n {
+        if a[i] < lo { lo = a[i] }
+        if a[i] > hi { hi = a[i] }
+        if b[i] < lo { lo = b[i] }
+        if b[i] > hi { hi = b[i] }
+        i = i + 1
+    }
+    let ha = py_entropy_hist(a, lo, hi, PY_MI_BINS)
+    let hb = py_entropy_hist(b, lo, hi, PY_MI_BINS)
+    let hj = py_joint_entropy(a, b, lo, hi, PY_MI_BINS)
+    let mi = ha + hb - hj
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Trial banks — packed layout [priors | senses | percepts]
+// ═══════════════════════════════════════════════════════════════
+//
+// Sampling protocol for stage-1 PP trials:
+//   - prior level sampled uniformly in [−1, +1]
+//   - sensory amplitude fixed to regime value (silent in halluc,
+//     normal in baseline), with additive noise
+//   - percept computed under the given (π_prior, π_sense)
+//
+// Φ_aberrant = MI(prior, percept) measured across the trial bank.
+
+fn py_run_percept_trials(sense_level: float, pi_prior: float, pi_sense: float, n_trials: int, seed_base: int) -> array {
+    let mut priors = []
+    let mut senses = []
+    let mut percs  = []
+    let mut s = seed_base
+    let mut i = 0
+    while i < n_trials {
+        // Sample a prior level across the full signed range so MI is measurable.
+        s = py_prng(s + i * 139)
+        let pr = py_signed(s) * PY_PRIOR_SIGNAL
+        priors = priors.push(pr)
+        let sn = sense_level
+        senses = senses.push(sn)
+        let pc = py_percept(pr, sn, pi_prior, pi_sense, s + 29)
+        percs = percs.push(pc)
+        i = i + 1
+    }
+    let mut packed = []
+    let mut a = 0
+    while a < n_trials {
+        packed = packed.push(priors[a])
+        a = a + 1
+    }
+    let mut b = 0
+    while b < n_trials {
+        packed = packed.push(senses[b])
+        b = b + 1
+    }
+    let mut c = 0
+    while c < n_trials {
+        packed = packed.push(percs[c])
+        c = c + 1
+    }
+    return packed
+}
+
+fn py_slice(packed: array, offset: int, n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(packed[offset + i])
+        i = i + 1
+    }
+    return out
+}
+
+// Φ_aberrant ≡ MI(prior, percept) measured over a trial bank.
+fn py_phi_aberrant(packed: array, n: int) -> float {
+    let priors = py_slice(packed, 0, n)
+    let percs  = py_slice(packed, 2 * n, n)
+    return py_mi(priors, percs)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1–T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1: Hallucination regime (π_prior high, sensory silent) drives
+    //     Φ(prior, percept) strictly above balanced baseline.
+    //     baseline: balanced precisions + normal sensory content
+    //     halluc : π_prior=9, π_sense=0.2, sensory≈silent
+    let base_pack = py_run_percept_trials(PY_SENSE_NORMAL, PY_PI_PRIOR_BAL, PY_PI_SENSE_BAL, PY_N_MI_TRIALS, PY_SEED + 100)
+    let halluc_pack = py_run_percept_trials(PY_SENSE_SILENT, PY_PI_PRIOR_HIGH, PY_PI_SENSE_LOW, PY_N_MI_TRIALS, PY_SEED + 101)
+    let phi_base = py_phi_aberrant(base_pack, PY_N_MI_TRIALS)
+    let phi_halluc = py_phi_aberrant(halluc_pack, PY_N_MI_TRIALS)
+    let gain = phi_halluc - phi_base
+    println("  [T1] Φ_base=" + str(phi_base) + " Φ_halluc=" + str(phi_halluc) + " gain=" + str(gain))
+    if phi_halluc <= phi_base { return false }
+    if gain < PY_T1_PHI_GAIN { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: Delusion stage — a conviction-level PP layer with pathological
+    //     π_belief dominates conviction with the belief prior even when
+    //     evidence (from stage-1 percept under balanced conditions) carries
+    //     information. MI(belief, conviction) − MI(belief, conviction_base) ≥ 0.10
+    let n = PY_N_MI_TRIALS
+    let mut beliefs = []
+    let mut ev_stream = []
+    let mut conv_del = []
+    let mut conv_bal = []
+    let mut s = PY_SEED + 200
+    let mut i = 0
+    while i < n {
+        s = py_prng(s + i * 181)
+        let bel = py_signed(s) * PY_PRIOR_SIGNAL
+        beliefs = beliefs.push(bel)
+        // Evidence channel: sample a stage-1 percept under balanced conditions.
+        let pr_sample = py_signed(s + 7) * PY_PRIOR_SIGNAL
+        let ev = py_percept(pr_sample, PY_SENSE_NORMAL, PY_PI_PRIOR_BAL, PY_PI_SENSE_BAL, s + 11)
+        ev_stream = ev_stream.push(ev)
+        // Pathological belief stage: π_belief >> π_ev → conviction ≈ belief
+        let cd = py_conviction(bel, ev, PY_PI_BELIEF_HIGH, PY_PI_EV_LOW, s + 13)
+        conv_del = conv_del.push(cd)
+        // Balanced belief stage for baseline
+        let cb = py_conviction(bel, ev, PY_PI_BELIEF_BAL, PY_PI_EV_BAL, s + 17)
+        conv_bal = conv_bal.push(cb)
+        i = i + 1
+    }
+    let mi_del = py_mi(beliefs, conv_del)
+    let mi_bal = py_mi(beliefs, conv_bal)
+    let gain = mi_del - mi_bal
+    println("  [T2] MI(bel,conv_del)=" + str(mi_del) + " MI(bel,conv_bal)=" + str(mi_bal) + " gain=" + str(gain))
+    if mi_del <= mi_bal { return false }
+    if gain < PY_T2_DELUSION_GAIN { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3: Antipsychotic — lowering π_prior from pathological to moderate
+    //     reduces Φ_aberrant by ≥ 2× compared to untreated hallucination.
+    //     Treated Φ must also be strictly below pretreatment.
+    let halluc_pack = py_run_percept_trials(PY_SENSE_SILENT, PY_PI_PRIOR_HIGH, PY_PI_SENSE_LOW, PY_N_MI_TRIALS, PY_SEED + 300)
+    let treated_pack = py_run_percept_trials(PY_SENSE_SILENT, PY_PI_PRIOR_TREATED, PY_PI_SENSE_TREATED, PY_N_MI_TRIALS, PY_SEED + 300)
+    let phi_pre = py_phi_aberrant(halluc_pack, PY_N_MI_TRIALS)
+    let phi_post = py_phi_aberrant(treated_pack, PY_N_MI_TRIALS)
+    println("  [T3] Φ_halluc(pre)=" + str(phi_pre) + " Φ_treated(post)=" + str(phi_post))
+    if phi_post >= phi_pre { return false }
+    if phi_pre < PY_EPS { return false }
+    // Guard tiny denominator
+    if phi_post < PY_EPS {
+        println("  [T3] Φ_treated ≈ 0 → recovery confirmed")
+        return true
+    }
+    let ratio = phi_pre / phi_post
+    println("  [T3] ratio pre/post=" + str(ratio) + " gate=" + str(PY_T3_RATIO))
+    if ratio < PY_T3_RATIO { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: Insight (Φ_meta) — report channel tracks Φ_aberrant when insight
+    //     is intact; decoupling (report clamped to zero) collapses MI.
+    //     Build Φ_aberrant-sample series by running repeated small trial
+    //     batches across varied π_prior magnitudes; the "report" mirrors
+    //     this value with noise when insight is on, or stays flat when off.
+    let n = PY_N_INSIGHT
+    let mut phis = []
+    let mut report_on  = []
+    let mut report_off = []
+    let mut s = PY_SEED + 400
+    let mut i = 0
+    while i < n {
+        // Sweep π_prior across a modest range so Φ varies sample to sample.
+        s = py_prng(s + i * 233)
+        let gain = 1.0 + py_unit(s) * 8.0      // π_prior ∈ [1, 9]
+        let mini_pack = py_run_percept_trials(PY_SENSE_SILENT, gain, PY_PI_SENSE_LOW, 12, s + 41)
+        let phi_i = py_phi_aberrant(mini_pack, 12)
+        phis = phis.push(phi_i)
+        // Insight-on: report = noisy echo of Φ_aberrant
+        let s2 = py_prng(s + 71)
+        let r_on = phi_i + 0.04 * py_signed(s2)
+        report_on = report_on.push(r_on)
+        // Insight-off: report is flat (clamped) — no meta-awareness
+        report_off = report_off.push(0.0)
+        i = i + 1
+    }
+    let mi_on = py_mi(phis, report_on)
+    let mi_off = py_mi(phis, report_off)
+    println("  [T4] Φ_meta_on=" + str(mi_on) + " Φ_meta_off=" + str(mi_off))
+    if mi_on < PY_T4_META_GATE { return false }
+    if mi_on <= mi_off { return false }
+    // Insight-off often ≈ 0 with clamped report; guard divide-by-zero.
+    if mi_off < PY_EPS {
+        println("  [T4] insight-off ≈ 0 → decoupling confirmed")
+        return true
+    }
+    let ratio = mi_on / mi_off
+    println("  [T4] ratio on/off=" + str(ratio) + " gate=" + str(PY_T4_RATIO))
+    if ratio < PY_T4_RATIO { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5: full pipeline latency under 5 s.
+    let t0 = clock()
+    let _a = py_run_percept_trials(PY_SENSE_NORMAL, PY_PI_PRIOR_BAL, PY_PI_SENSE_BAL, PY_N_MI_TRIALS, PY_SEED + 500)
+    let _b = py_run_percept_trials(PY_SENSE_SILENT, PY_PI_PRIOR_HIGH, PY_PI_SENSE_LOW, PY_N_MI_TRIALS, PY_SEED + 501)
+    let _c = py_run_percept_trials(PY_SENSE_SILENT, PY_PI_PRIOR_TREATED, PY_PI_SENSE_TREATED, PY_N_MI_TRIALS, PY_SEED + 502)
+    let _d = py_phi_aberrant(_b, PY_N_MI_TRIALS)
+    let _e = py_phi_aberrant(_c, PY_N_MI_TRIALS)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] psychosis_phi pipeline = " + str(ms) + " ms")
+    return ms < PY_LATENCY_MS
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[psychosis_phi] P67 — aberrant precision × Φ")
+    println("  posterior = (π_prior·prior + π_sense·sensory) / (π_prior + π_sense)")
+    println("  balanced π_prior=" + str(PY_PI_PRIOR_BAL) + " vs pathological=" + str(PY_PI_PRIOR_HIGH))
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — hallucination regime drives Φ_aberrant up ≥ 0.15") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — delusion (belief-stage) over-prior ≥ 0.10 gain") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — antipsychotic (↓π_prior) restores balance ≥ 2×") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — Φ_meta tracks aberrant Φ (insight intact)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — latency < 5000 ms") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause note: stage0 chained-&& across 5 terms is unreliable;
+    // sequential bool accumulator is the safe idiom in anima-engines.
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[psychosis_phi] 5/5 PASS — P67 DONE (halluc + delusion + Φ_aberrant + antipsychotic + insight)")
+    } else {
+        println("[psychosis_phi] SOME FAILED")
+    }
+}
+
+main()

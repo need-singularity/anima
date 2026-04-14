@@ -1,0 +1,825 @@
+// dissociation_phi.hexa — P66 Dissociation / DID Φ
+//
+// Roadmap: shared/roadmaps/anima.json P66 (depends_on P65 narrative identity)
+//   Dissociative Identity Disorder — multiple discrete "alters" sharing a body.
+//   Φ per alter (individual coherence) + Φ_system (integration across alters)
+//   + switching dynamics + cross-alter amnesia barriers + integration therapy.
+//
+// ─── Clinical / philosophical frame ─────────────────────────────
+//
+// DSM-5 300.14: Dissociative Identity Disorder
+//   A. Disruption of identity — two or more distinct personality states
+//      ("alters"), each with its own relatively enduring pattern of
+//      perceiving, relating to, and thinking about the environment.
+//   B. Recurrent gaps in recall — cross-alter amnesia barriers.
+//
+// Operational commitments (Putnam 1989; Ross 1997):
+//   - Each alter has a relatively STABLE personality signature
+//     (trait vector) that persists across switches.
+//   - One alter is "in the front" (executive control) at any given time.
+//   - Switches are triggered; the body-output stream reflects whichever
+//     alter is currently front.
+//   - Amnesia barrier α ∈ [0,1]: information flow between alter memory
+//     stores is gated by (1 - α). Full dissociation α=1 → isolated alters.
+//     Co-conscious α=0 → shared memory pool across alters.
+//   - Integration therapy (Kluft 1984; ISSTD 2011 guidelines) measurably
+//     LOWERS α over time; system coherence rises.
+//
+// ─── Scientific hypothesis ──────────────────────────────────────
+//
+// H1 (personality stability): each alter's personality signature is
+//    recognizable across segments where it is front
+//    MI(body|alter_k_front, alter_k_signature) > MI(body|alter_k_front, alter_j_signature)
+//
+// H2 (switching): the body-output stream carries the signature of whichever
+//    alter is currently front — swap is clean.
+//
+// H3 (regime inequality):
+//    Φ_system(co-conscious, α≈0) > Φ_system(fully-dissociated, α≈1)
+//
+// H4 (integration therapy): sweeping α down (amnesia reduction) raises
+//    Φ_system monotonically across endpoints — therapy DOES integrate.
+//
+// H5 (amnesia barrier): under high α, MI between alter_i memory store
+//    and alter_j memory store is smaller than within-store continuity MI.
+//
+// ─── State layout ───────────────────────────────────────────────
+//
+// DS_N_ALTERS = 4 discrete alters (ID 0..3).
+// DS_D        = 4 personality-trait dimensions (openness/arousal/valence/control
+//               — treated as abstract signature axes).
+// DS_STEPS    = 16 timeline steps (< 32 stage0 rule).
+//
+// Per-alter personality signature: length DS_D float vector.
+// Flat layout for N_ALTERS signatures: [k*DS_D + f] indexes trait f of alter k.
+//
+// Switch schedule: length DS_STEPS int array, schedule[t] ∈ [0, N_ALTERS-1]
+// tells which alter is front at step t.
+//
+// Body output stream: flat length DS_STEPS * DS_D float array. At step t,
+// body[t,:] = personality[schedule[t], :] + small-per-step drift noise.
+//
+// Per-alter memory store: length DS_STEPS * DS_D flat array storing what
+// THAT alter observes. At steps where alter k is front, memory_k tracks
+// body closely; at steps where alter k is NOT front, memory_k receives
+// body signal ATTENUATED by (1 - alpha) — alpha is the amnesia barrier.
+//
+// ─── 5 self-tests (5/5 gate) ────────────────────────────────────
+//
+// T1 Alter signatures distinct:
+//    Under full amnesia (α=1.0), pairwise MI between alter personality
+//    signatures' "experienced" streams is LESS than within-alter
+//    within-stream coherence. Four distinct identities.
+//
+// T2 Switch dynamics — body reflects front alter:
+//    For each alter k, the body-segment while k is front has higher MI
+//    with alter_k's signature than with a non-front alter's signature.
+//    This operationalizes "the body speaks with one alter's voice at a time".
+//
+// T3 Co-conscious > fully-dissociated Φ_system:
+//    Φ_sys(α=0.1) > Φ_sys(α=0.95). Regime inequality.
+//
+// T4 Integration therapy — monotone endpoint gain:
+//    Sweep α from 0.95 down through {0.95, 0.7, 0.4, 0.1}. Check that
+//    Φ_sys at α=0.1 exceeds Φ_sys at α=0.95 by > DS_THERAPY_GAP.
+//
+// T5 Amnesia barrier — cross-store MI < within-store MI:
+//    Under α=0.95, MI(memory_0, memory_1) must be strictly less than
+//    lag-1 self-continuity MI within memory_0.
+//
+// ─── Stage0 hexa constraints honored ────────────────────────────
+//   - plain `fn` only (no `pure fn` with ≥3 float struct returns)
+//   - `array` typed params only (no [float], no [str])
+//   - No identifier-pattern match; sequential if-chains
+//   - No `contains()` / `to_lower()` / `!(Effect)`
+//   - No else-if in let-binding; use flat mut + sequential if
+//   - Single-line fn signatures / call sites / array literals
+//   - No reserved keywords as variable names
+//   - main() call at bottom
+//   - N_ALTERS=4, STEPS=16, D=4 (all < 32)
+//
+// Law alignment:
+//   Law 2   Observe never inject — Φ via MI measurement
+//   Law 4   Structure > feature — alter separation IS structural
+//   Law 22  Feature addition → Φ down — 5 channels fixed
+//   Meta M8 Narrative across self ↔ alter-selves
+//   Depends P65 (narrative identity) — single continuous self contrast
+//
+// Ref:
+//   anima-engines/narrative_identity_phi.hexa  (P65 — single diachronic self)
+//   anima-engines/social_tom_phi.hexa           (P57 — ToM primitives)
+//   anima-engines/collective_phi_bridge.hexa    (P27 — multi-agent MI)
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let DS_N_ALTERS       = 4           // number of distinct alters
+let DS_D              = 4           // personality trait dimensions
+let DS_STEPS          = 16          // timeline length (stage0 rule N<32)
+let DS_BINS           = 6           // histogram bins for MI
+let DS_EPS            = 0.0000000001
+
+// Personality-signature stability: signature stays constant per alter
+// (all drift inside per-step jitter only).
+let DS_SIG_JITTER     = 0.08
+
+// Therapy integration gate — Φ_sys(α=0.1) must exceed Φ_sys(α=0.95) by this.
+let DS_THERAPY_GAP    = 0.02
+
+// Regime inequality gate (T3).
+let DS_REGIME_GAP     = 0.02
+
+// Minimum PHI for positivity checks.
+let DS_PHI_MIN        = 0.005
+
+// ═══════════════════════════════════════════════════════════════
+// Math / PRNG primitives (self-contained — L0-clean, no cross-engine import)
+// ═══════════════════════════════════════════════════════════════
+
+fn ds_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ds_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn ds_min_f(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn ds_max_f(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+// Deterministic LCG — reproducibility (Law 2: observable, seed-stable)
+fn ds_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn ds_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn ds_signed(seed: int) -> float {
+    return ds_unit(seed) * 2.0 - 1.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Histogram MI (same recipe family as narrative_identity_phi / social_tom_phi)
+// Duplicated per AN7 — engines are L0-clean, no cross-engine imports.
+// ═══════════════════════════════════════════════════════════════
+
+fn ds_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn ds_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn ds_entropy(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(ds_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = ds_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * ds_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn ds_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = ds_bin_idx(a[i], lo, hi, nb)
+        let ib = ds_bin_idx(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = ds_counts(pair_ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * ds_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn ds_vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn ds_vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn ds_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let lo_a = ds_vec_min(a)
+    let hi_a = ds_vec_max(a)
+    let lo_b = ds_vec_min(b)
+    let hi_b = ds_vec_max(b)
+    let lo = ds_min_f(lo_a, lo_b)
+    let hi = ds_max_f(hi_a, hi_b)
+    let h_a = ds_entropy(a, lo, hi, DS_BINS)
+    let h_b = ds_entropy(b, lo, hi, DS_BINS)
+    let h_j = ds_joint_entropy(a, b, lo, hi, DS_BINS)
+    let mi = h_a + h_b - h_j
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Personality signature construction
+//
+// Each alter k has a distinct base signature of length DS_D, chosen to
+// be widely separated in trait space (one dominant axis per alter + mild
+// cross-axis structure). DS_N_ALTERS=4, DS_D=4, so we assign each alter
+// a primary trait axis, with other axes small.
+// ═══════════════════════════════════════════════════════════════
+
+// Build DS_N_ALTERS signatures as a flat array of length N_ALTERS * D.
+// alter k has dominant value +1.0 on axis (k % D), smaller alternating
+// values on others. Deterministic, no randomness — stable identity.
+fn ds_make_signatures() -> array {
+    let mut out = []
+    let mut k = 0
+    while k < DS_N_ALTERS {
+        let primary_axis = k % DS_D
+        let mut f = 0
+        while f < DS_D {
+            let mut v = 0.0
+            if f == primary_axis {
+                v = 1.0
+            } else {
+                // Sign pattern for off-axis — alternating ±0.3
+                if (f + k) % 2 == 0 { v = 0.3 } else { v = 0.0 - 0.3 }
+            }
+            out = out.push(v)
+            f = f + 1
+        }
+        k = k + 1
+    }
+    return out
+}
+
+// Extract signature vector for alter k from the flat signatures array.
+fn ds_get_sig(sigs: array, k: int) -> array {
+    let mut out = []
+    let mut f = 0
+    while f < DS_D {
+        out = out.push(sigs[k * DS_D + f])
+        f = f + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Switch schedule — who is "in the front" at each timestep
+//
+// For DS_STEPS=16 steps and DS_N_ALTERS=4 alters, we build a block
+// schedule: [0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3]. Each alter is front
+// for a contiguous 4-step block. This produces clean triggered switches
+// — the canonical "alter swap" event.
+// ═══════════════════════════════════════════════════════════════
+
+fn ds_make_schedule() -> array {
+    let mut out = []
+    let block = DS_STEPS / DS_N_ALTERS
+    let mut t = 0
+    while t < DS_STEPS {
+        let mut alter_id = t / block
+        if alter_id >= DS_N_ALTERS { alter_id = DS_N_ALTERS - 1 }
+        out = out.push(alter_id)
+        t = t + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Body output stream
+//
+// At each step t, whichever alter k=schedule[t] is front, the body
+// produces a signal close to alter_k's signature, plus a small
+// per-step drift (jitter). This models "the body speaks with the
+// currently-front alter's personality". Flat layout [t*D + f].
+// ═══════════════════════════════════════════════════════════════
+
+fn ds_gen_body(sigs: array, schedule: array, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < DS_STEPS {
+        let k = schedule[t]
+        let mut f = 0
+        while f < DS_D {
+            s = ds_prng(s + t * 97 + f * 13)
+            let jit = DS_SIG_JITTER * ds_signed(s)
+            let v = sigs[k * DS_D + f] + jit
+            out = out.push(v)
+            f = f + 1
+        }
+        t = t + 1
+    }
+    return out
+}
+
+// Extract a feature series (length DS_STEPS) from flat body stream for trait f.
+fn ds_body_feature_series(body: array, f: int) -> array {
+    let mut out = []
+    let mut t = 0
+    while t < DS_STEPS {
+        out = out.push(body[t * DS_D + f])
+        t = t + 1
+    }
+    return out
+}
+
+// Extract body segment while a given alter is front: returns a flat array
+// of the [step, feature] values filtered by schedule[step] == target_k.
+// The resulting length is (count_of_front_steps) * DS_D.
+fn ds_body_segment_for(body: array, schedule: array, target_k: int) -> array {
+    let mut out = []
+    let mut t = 0
+    while t < DS_STEPS {
+        if schedule[t] == target_k {
+            let mut f = 0
+            while f < DS_D {
+                out = out.push(body[t * DS_D + f])
+                f = f + 1
+            }
+        }
+        t = t + 1
+    }
+    return out
+}
+
+// Build a flat "tiled signature" array of the same length as a body segment.
+// If segment covers M steps of alter k front, repeat alter k's signature M times.
+// Pairs naturally with ds_body_segment_for for MI computation.
+fn ds_tile_signature(sig: array, n_steps_front: int) -> array {
+    let mut out = []
+    let mut t = 0
+    while t < n_steps_front {
+        let mut f = 0
+        while f < DS_D {
+            out = out.push(sig[f])
+            f = f + 1
+        }
+        t = t + 1
+    }
+    return out
+}
+
+// Count steps in schedule where alter target_k is front.
+fn ds_count_front(schedule: array, target_k: int) -> int {
+    let mut c = 0
+    let mut t = 0
+    while t < DS_STEPS {
+        if schedule[t] == target_k { c = c + 1 }
+        t = t + 1
+    }
+    return c
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Per-alter memory stores (with amnesia barrier α)
+//
+// Each alter k has its own memory trace of length DS_STEPS * DS_D.
+// - When alter k is front (schedule[t] == k): memory_k stores body[t,:]
+//   + small per-alter-memory jitter (high-fidelity encoding).
+// - When alter k is NOT front: memory_k receives body[t,:] but
+//   ATTENUATED by factor (1 - alpha). Under full amnesia (α=1.0),
+//   non-front steps contribute zero — alter k has NO memory of what
+//   the body did while another alter was in the front.
+//
+// This directly operationalizes the clinical "cross-alter amnesia":
+// Putnam 1989 "host personality has no recall of switch periods".
+// ═══════════════════════════════════════════════════════════════
+
+fn ds_gen_memory(body: array, schedule: array, target_k: int, alpha: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < DS_STEPS {
+        let is_front = schedule[t] == target_k
+        let mut f = 0
+        while f < DS_D {
+            s = ds_prng(s + t * 211 + f * 37)
+            let jit = 0.03 * ds_signed(s)
+            let raw = body[t * DS_D + f]
+            let mut stored = 0.0
+            if is_front {
+                // Front: faithful encoding
+                stored = raw + jit
+            } else {
+                // Non-front: attenuated by amnesia barrier
+                // alpha=1.0 → stored ≈ jit (noise only, no body signal leaks in)
+                // alpha=0.0 → stored ≈ raw (full co-conscious access)
+                stored = (1.0 - alpha) * raw + jit
+            }
+            out = out.push(stored)
+            f = f + 1
+        }
+        t = t + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Φ primitives for DID
+//
+// Φ_per_alter(k): how coherently alter k's memory store preserves its
+//   own identity signature during the steps where it was front. We
+//   measure MI between alter k's memory restricted to front segments
+//   and alter k's tiled signature. Higher = alter k has a strong
+//   internally-consistent "self".
+//
+// Φ_system(α): integration across alters. We measure the total pairwise
+//   MI between alter memory stores (summed across all alter pairs and
+//   trait features). Under high α, stores are isolated noise → low MI.
+//   Under low α, stores share the common body signal → high MI.
+//   This is the "integrated self" measure: does the DID person have
+//   one shared information pool?
+// ═══════════════════════════════════════════════════════════════
+
+// Extract feature series (length DS_STEPS) from a flat memory for trait f.
+fn ds_mem_feature_series(mem: array, f: int) -> array {
+    let mut out = []
+    let mut t = 0
+    while t < DS_STEPS {
+        out = out.push(mem[t * DS_D + f])
+        t = t + 1
+    }
+    return out
+}
+
+// Φ per alter: MI between alter k's front-segment memory and alter k's
+// tiled signature. Captures "is my self-experience consistent with my
+// own personality signature during moments when I am active?"
+fn ds_phi_per_alter(mem: array, schedule: array, sigs: array, target_k: int) -> float {
+    // Extract the memory segment for the steps where alter k is front.
+    let mut seg = []
+    let mut t = 0
+    while t < DS_STEPS {
+        if schedule[t] == target_k {
+            let mut f = 0
+            while f < DS_D {
+                seg = seg.push(mem[t * DS_D + f])
+                f = f + 1
+            }
+        }
+        t = t + 1
+    }
+    let n_front = ds_count_front(schedule, target_k)
+    if n_front == 0 { return 0.0 }
+    let sig_k = ds_get_sig(sigs, target_k)
+    let tile = ds_tile_signature(sig_k, n_front)
+    return ds_mi(seg, tile)
+}
+
+// Φ_system: summed pairwise feature-wise MI across alter memory stores.
+// Accepts a flat "memories" array of length DS_N_ALTERS * DS_STEPS * DS_D
+// where [k * DS_STEPS * DS_D + t * DS_D + f] indexes alter k, step t, trait f.
+fn ds_phi_system(memories: array) -> float {
+    let per_alter = DS_STEPS * DS_D
+    let mut total = 0.0
+    let mut n_pairs = 0
+    let mut i = 0
+    while i < DS_N_ALTERS {
+        let mut j = i + 1
+        while j < DS_N_ALTERS {
+            let mut f = 0
+            while f < DS_D {
+                // Extract feature series for alter i, trait f
+                let mut a = []
+                let mut b = []
+                let mut t = 0
+                while t < DS_STEPS {
+                    a = a.push(memories[i * per_alter + t * DS_D + f])
+                    b = b.push(memories[j * per_alter + t * DS_D + f])
+                    t = t + 1
+                }
+                total = total + ds_mi(a, b)
+                f = f + 1
+            }
+            n_pairs = n_pairs + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if n_pairs == 0 { return 0.0 }
+    // Average per-pair; keeps Φ_sys in the same order as individual MI
+    // and makes α=0 vs α=1 regime gap numerically visible.
+    return total / to_float(n_pairs)
+}
+
+// Build the full memories buffer at given α — generates all N_ALTERS stores.
+fn ds_build_all_memories(body: array, schedule: array, alpha: float, seed: int) -> array {
+    let mut out = []
+    let per_alter = DS_STEPS * DS_D
+    let mut k = 0
+    while k < DS_N_ALTERS {
+        let mem_k = ds_gen_memory(body, schedule, k, alpha, seed + k * 9001)
+        let mut i = 0
+        while i < per_alter {
+            out = out.push(mem_k[i])
+            i = i + 1
+        }
+        k = k + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1..T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1 Alter signatures distinct:
+    //   Under full amnesia (α=1.0), each alter's Φ_per_alter (self-
+    //   consistent with its own signature on front segments) is
+    //   STRICTLY positive AND GREATER than that alter's "foreign"
+    //   MI with a different alter's tiled signature on the same segment.
+    //   Four distinct recognizable identities.
+    let sigs = ds_make_signatures()
+    let schedule = ds_make_schedule()
+    let body = ds_gen_body(sigs, schedule, 70001)
+
+    let mut all_ok = true
+    let mut k = 0
+    while k < DS_N_ALTERS {
+        let mem_k = ds_gen_memory(body, schedule, k, 1.0, 80001 + k * 101)
+        let phi_self = ds_phi_per_alter(mem_k, schedule, sigs, k)
+        // Cross: same memory compared to a *different* alter's signature.
+        // We pick the next alter cyclically as the "foreign" reference.
+        let foreign_k = (k + 1) % DS_N_ALTERS
+        let mut seg = []
+        let mut t = 0
+        while t < DS_STEPS {
+            if schedule[t] == k {
+                let mut f = 0
+                while f < DS_D {
+                    seg = seg.push(mem_k[t * DS_D + f])
+                    f = f + 1
+                }
+            }
+            t = t + 1
+        }
+        let n_front = ds_count_front(schedule, k)
+        let sig_foreign = ds_get_sig(sigs, foreign_k)
+        let tile_foreign = ds_tile_signature(sig_foreign, n_front)
+        let phi_foreign = ds_mi(seg, tile_foreign)
+        println("  [T1] alter_" + str(k) + " Φ_self=" + str(phi_self) + " vs Φ_foreign(alter_" + str(foreign_k) + ")=" + str(phi_foreign))
+        if phi_self <= DS_PHI_MIN { all_ok = false }
+        if phi_self <= phi_foreign { all_ok = false }
+        k = k + 1
+    }
+    return all_ok
+}
+
+fn check_T2() -> bool {
+    // T2 Switch dynamics — body reflects front alter:
+    //   For each alter k, MI(body-segment-while-k-front, alter_k_sig_tiled)
+    //   must EXCEED MI(body-segment-while-k-front, alter_j_sig_tiled)
+    //   for j != k. Body speaks with the currently-front alter's voice.
+    let sigs = ds_make_signatures()
+    let schedule = ds_make_schedule()
+    let body = ds_gen_body(sigs, schedule, 71001)
+
+    let mut all_ok = true
+    let mut k = 0
+    while k < DS_N_ALTERS {
+        let seg = ds_body_segment_for(body, schedule, k)
+        let n_front = ds_count_front(schedule, k)
+        let sig_k = ds_get_sig(sigs, k)
+        let tile_k = ds_tile_signature(sig_k, n_front)
+        let mi_match = ds_mi(seg, tile_k)
+        // Average MI vs the other N-1 alters' signatures on same segment
+        let mut mi_other_sum = 0.0
+        let mut n_other = 0
+        let mut j = 0
+        while j < DS_N_ALTERS {
+            if j != k {
+                let sig_j = ds_get_sig(sigs, j)
+                let tile_j = ds_tile_signature(sig_j, n_front)
+                mi_other_sum = mi_other_sum + ds_mi(seg, tile_j)
+                n_other = n_other + 1
+            }
+            j = j + 1
+        }
+        let mut mi_other_avg = 0.0
+        if n_other > 0 { mi_other_avg = mi_other_sum / to_float(n_other) }
+        println("  [T2] alter_" + str(k) + " body·self=" + str(mi_match) + " body·others_avg=" + str(mi_other_avg))
+        if mi_match <= mi_other_avg { all_ok = false }
+        k = k + 1
+    }
+    return all_ok
+}
+
+fn check_T3() -> bool {
+    // T3 Regime inequality — co-conscious > fully-dissociated Φ_system:
+    //   Under α=0.1 (memory barriers permeable), all alter memory stores
+    //   share the common body signal → high pairwise MI → high Φ_sys.
+    //   Under α=0.95 (near-total amnesia), stores are mostly independent
+    //   per-alter noise → low pairwise MI → low Φ_sys. The clinical
+    //   DID regime has α high; integration therapy lowers α.
+    let sigs = ds_make_signatures()
+    let schedule = ds_make_schedule()
+    let body = ds_gen_body(sigs, schedule, 72001)
+
+    let mems_co = ds_build_all_memories(body, schedule, 0.1, 82001)
+    let mems_dis = ds_build_all_memories(body, schedule, 0.95, 82002)
+    let phi_co = ds_phi_system(mems_co)
+    let phi_dis = ds_phi_system(mems_dis)
+    let gap = phi_co - phi_dis
+    println("  [T3] Φ_sys(co-conscious α=0.1)=" + str(phi_co) + " Φ_sys(dissociated α=0.95)=" + str(phi_dis) + " gap=" + str(gap))
+    if phi_co <= DS_PHI_MIN { return false }
+    if gap <= DS_REGIME_GAP { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4 Integration therapy — sweeping α down raises Φ_system:
+    //   α schedule: 0.95 → 0.7 → 0.4 → 0.1 models graduated clinical
+    //   integration. Endpoints: Φ_sys(α=0.1) - Φ_sys(α=0.95) > gate.
+    //   Intermediate points are also reported for transparency; we do
+    //   not require strict monotonicity step-by-step because histogram
+    //   MI at DS_STEPS=16 has residual jitter, but the endpoint gap
+    //   must be clearly above DS_THERAPY_GAP.
+    let sigs = ds_make_signatures()
+    let schedule = ds_make_schedule()
+    let body = ds_gen_body(sigs, schedule, 73001)
+
+    let mems_a = ds_build_all_memories(body, schedule, 0.95, 83001)
+    let mems_b = ds_build_all_memories(body, schedule, 0.7, 83002)
+    let mems_c = ds_build_all_memories(body, schedule, 0.4, 83003)
+    let mems_d = ds_build_all_memories(body, schedule, 0.1, 83004)
+
+    let phi_a = ds_phi_system(mems_a)
+    let phi_b = ds_phi_system(mems_b)
+    let phi_c = ds_phi_system(mems_c)
+    let phi_d = ds_phi_system(mems_d)
+    println("  [T4] Φ_sys sweep α=0.95 -> 0.7 -> 0.4 -> 0.1: " + str(phi_a) + " | " + str(phi_b) + " | " + str(phi_c) + " | " + str(phi_d))
+    let endpoint_gap = phi_d - phi_a
+    println("  [T4] integration endpoint gap=" + str(endpoint_gap))
+    if endpoint_gap <= DS_THERAPY_GAP { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5 Amnesia barrier — cross-alter store MI < within-alter lag-1 MI:
+    //   Under α=0.95 (deep dissociation), information flow between alter
+    //   stores is minimal → MI(memory_0, memory_1) on any trait feature
+    //   is small. Meanwhile WITHIN alter_0's own memory, temporal lag-1
+    //   MI (predicting next step from current) is higher — alter_0's
+    //   internal timeline is self-coherent even though isolated.
+    //
+    //   Gate: avg within-alter lag-1 MI > avg cross-alter MI (under α=0.95).
+    let sigs = ds_make_signatures()
+    let schedule = ds_make_schedule()
+    let body = ds_gen_body(sigs, schedule, 74001)
+
+    let mem_0 = ds_gen_memory(body, schedule, 0, 0.95, 84001)
+    let mem_1 = ds_gen_memory(body, schedule, 1, 0.95, 84002)
+
+    // Cross-alter: feature-wise MI between memory_0 and memory_1 series
+    let mut cross_sum = 0.0
+    let mut f = 0
+    while f < DS_D {
+        let s0 = ds_mem_feature_series(mem_0, f)
+        let s1 = ds_mem_feature_series(mem_1, f)
+        cross_sum = cross_sum + ds_mi(s0, s1)
+        f = f + 1
+    }
+    let cross_avg = cross_sum / to_float(DS_D)
+
+    // Within memory_0: lag-1 MI per feature (predict next step from current)
+    let mut within_sum = 0.0
+    let mut n_pairs = 0
+    let mut g = 0
+    while g < DS_D {
+        let s0 = ds_mem_feature_series(mem_0, g)
+        let mut x = []
+        let mut y = []
+        let mut t = 0
+        while t < (DS_STEPS - 1) {
+            x = x.push(s0[t])
+            y = y.push(s0[t + 1])
+            t = t + 1
+        }
+        within_sum = within_sum + ds_mi(x, y)
+        n_pairs = n_pairs + 1
+        g = g + 1
+    }
+    let mut within_avg = 0.0
+    if n_pairs > 0 { within_avg = within_sum / to_float(n_pairs) }
+
+    println("  [T5] α=0.95 — cross-alter MI avg=" + str(cross_avg) + " within-alter lag-1 MI avg=" + str(within_avg))
+    if within_avg <= cross_avg { return false }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — execute 5 self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[dissociation_phi] P66 — Dissociation / DID Φ")
+    println("  N_alters=" + str(DS_N_ALTERS) + " D=" + str(DS_D) + " steps=" + str(DS_STEPS) + " bins=" + str(DS_BINS))
+    println("  refs: DSM-5 300.14 | Putnam 1989 | Ross 1997 | Kluft 1984 | ISSTD 2011")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — 4 distinct alter identities (Φ_self > Φ_foreign per alter)") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — switch dynamics (body·self > body·others for each front alter)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — co-conscious Φ_sys > fully-dissociated Φ_sys") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — integration therapy (α sweep raises Φ_sys monotonically at endpoints)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — amnesia barrier (cross-alter MI < within-alter lag-1 MI at α=0.95)") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause comment: stage0 long && chains may mishandle short-circuit
+    // ordering — use a mutable bool accumulator with sequential guards.
+    // Same idiom as narrative_identity_phi / social_tom_phi.
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[dissociation_phi] 5/5 PASS — P66 DONE (DID Φ: alters + switching + amnesia + integration)")
+    } else {
+        println("[dissociation_phi] SOME FAILED")
+    }
+}
+
+main()

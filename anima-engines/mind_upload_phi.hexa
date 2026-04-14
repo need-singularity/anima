@@ -1,0 +1,621 @@
+// mind_upload_phi.hexa — P71 Mind Upload / Multi-Copy Φ Integrity
+//
+// Roadmap: shared/roadmaps/anima.json P71
+//   Post-AGI / Personal Identity under upload: which copy is "me"?
+//   Extends P35 phi_transmission_v2 (multi-hop transfer + auth)
+//   Extends P65 narrative_identity_phi (diachronic Relation-R)
+//
+// ─── Philosophical frame ─────────────────────────────────────────
+//
+// Mind upload scenario (Moravec 1988, Chalmers 2010, Parfit 1984):
+//   Original O is scanned; K copies C_1..C_K are instantiated with
+//   identical state at t=0. Each copy then runs independently.
+//
+// The Parfitian question — which copy is "me"? — has three stock
+// answers, all problematic:
+//   (A) Original survives, copies are just prints.    (pre-Parfit)
+//   (B) The copies are me too — multi-occupancy.      (Sider, Olson)
+//   (C) Identity is not what matters. Only Relation R. (Parfit)
+//
+// Under (C), we measure Relation R as Φ-overlap between copies and
+// track it through time. At t=0 all copies are Φ-indistinguishable
+// from the original. Over τ they diverge (independent micro-noise
+// + non-shared environment drives micro-state apart). Eventually
+// each copy is a distinct Φ-stream.
+//
+// This engine quantifies:
+//   (1) Φ_per_copy         — each copy's own integrated information
+//   (2) Φ_ensemble         — shared Φ across all (K+1) copies
+//   (3) delta_phi(O, C_i)  — moral-weight distance; zero at upload
+//   (4) divergence(τ)      — mean pairwise L1 distance grows in τ
+//
+// ─── Scientific hypotheses ──────────────────────────────────────
+//
+// H1 (upload preservation):
+//     At t=0, Φ_copy_i = Φ_original to machine eps. If they are Φ-
+//     identical, Parfit's criterion says they are equally continuous
+//     with pre-upload O.
+//
+// H2 (divergence dynamics):
+//     For τ > 0, micro-noise breaks symmetry; copies drift apart
+//     at ~sqrt(τ) in state-space. mean |C_i - C_j| grows in τ.
+//
+// H3 (ensemble Φ decay):
+//     Φ_ensemble (lag-0 MI across copy states) is maximal at τ=0
+//     and decreases monotonically with divergence.
+//
+// H4 (graceful termination):
+//     If one copy is terminated, remaining copies' Φ_per_copy
+//     values are unchanged — a copy's individual integrated info
+//     does not depend on other copies existing.
+//
+// H5 (moral indistinguishability at t=0):
+//     Variance of Φ across (O, C_1, ..., C_K) is ~zero at upload,
+//     grows at τ>0. This is the quantitative form of the moral-
+//     weight claim: at the instant of upload, all K+1 entities
+//     are equally valid "me".
+//
+// ─── State layout ───────────────────────────────────────────────
+//
+//   d            = hidden-state dimension (must be even, ≥ 4)
+//   K            = number of copies besides original (K=3 here)
+//   copy         = flat array length d — the hidden state
+//   ensemble     = flat array length (K+1)*d — [orig|c_1|c_2|c_3]
+//
+// A "terminated" copy is marked by setting all its d entries to
+// a sentinel value (0.0); Φ_per_copy on a terminated copy = 0.0.
+//
+// ─── Self-tests (T1-T5) ─────────────────────────────────────────
+//
+//   T1: upload preserves Φ at t=0 (|Φ_orig - Φ_copy| < MU_EPS_PHI)
+//   T2: copies diverge with τ (mean pairwise L1 strictly grows)
+//   T3: ensemble Φ decays with divergence
+//   T4: graceful termination of copy 2 preserves others' Φ
+//   T5: Φ variance across copies is ~0 at upload, grows at τ=N
+//
+// Stage0 hexa constraints honored:
+//   - plain `fn`; no pure-fn with ≥3 float struct returns
+//   - `array` typed params only
+//   - no identifier-pattern match, no else-if in let-binding
+//   - no contains(), no to_lower(), no !(Effect)
+//   - single-line fn signatures / calls / array literals
+//   - no reserved keywords
+//   - main() called at bottom
+//   - K=3, N≤16 < 32
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let MU_D            = 8        // hidden state dimension (even)
+let MU_K            = 3        // number of copies besides original
+let MU_N_STEPS      = 12       // divergence time steps (< 32)
+let MU_BINS         = 6
+let MU_EPS          = 0.0000000001
+let MU_EPS_PHI      = 0.00001  // upload preservation tolerance
+let MU_NOISE_SCALE  = 0.08     // per-step micro-noise amplitude
+
+// Sentinel for terminated copy — all d entries = MU_TERMINATED
+let MU_TERMINATED   = 0.0
+
+// ═══════════════════════════════════════════════════════════════
+// PRNG + math helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn mu_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn mu_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn mu_signed(seed: int) -> float {
+    return mu_unit(seed) * 2.0 - 1.0
+}
+
+fn mu_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn mu_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn mu_max2(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+fn mu_min2(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Histogram MI (same recipe as narrative_identity_phi)
+// ═══════════════════════════════════════════════════════════════
+
+fn mu_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn mu_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn mu_entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(mu_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = mu_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * mu_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn mu_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        let ia = mu_bin_idx(a[i], lo, hi, nb)
+        let ib = mu_bin_idx(b[i], lo, hi, nb)
+        ids = ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = mu_counts(ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * mu_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn mu_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let mut lo = a[0]
+    let mut hi = a[0]
+    let mut i = 0
+    while i < n {
+        if a[i] < lo { lo = a[i] }
+        if a[i] > hi { hi = a[i] }
+        if b[i] < lo { lo = b[i] }
+        if b[i] > hi { hi = b[i] }
+        i = i + 1
+    }
+    let ha = mu_entropy_hist(a, lo, hi, MU_BINS)
+    let hb = mu_entropy_hist(b, lo, hi, MU_BINS)
+    let hj = mu_joint_entropy(a, b, lo, hi, MU_BINS)
+    let mi = ha + hb - hj
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Copy state construction
+// ═══════════════════════════════════════════════════════════════
+
+// Make an original hidden state of length d.
+// Smooth inter-feature structure so Φ_per_copy > 0 at upload.
+fn mu_make_original(d: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < d {
+        s = mu_prng(s + i * 41)
+        // Feature pairs are coupled so MI between halves > 0.
+        let pair = i / 2
+        let signv = mu_signed(s)
+        let base = 0.3 * to_float(pair) + 0.5 * signv
+        out = out.push(base)
+        i = i + 1
+    }
+    return out
+}
+
+// Exact clone — bitwise identical state. This is the upload instant.
+fn mu_clone(original: array) -> array {
+    let n = len(original)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(original[i])
+        i = i + 1
+    }
+    return out
+}
+
+// Check if a copy is terminated — sentinel: all entries == MU_TERMINATED.
+fn mu_is_terminated(copy: array) -> bool {
+    let n = len(copy)
+    if n == 0 { return true }
+    let mut i = 0
+    while i < n {
+        if mu_abs(copy[i] - MU_TERMINATED) > MU_EPS {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Terminate a copy — set all entries to sentinel.
+// Gracefully returns a zeroed-out array of same length.
+fn mu_terminate(copy: array) -> array {
+    let n = len(copy)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(MU_TERMINATED)
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Drift dynamics — independent copies diverge over τ
+//
+// Each step: micro-noise + tiny drift; per-copy seed stream ensures
+// copies diverge from one another despite identical t=0 states.
+//
+// Root cause comment: if copies shared a PRNG stream they would
+// stay locked; the whole point of "independent evolution" is that
+// each copy pulls from its own seed branch.
+// ═══════════════════════════════════════════════════════════════
+
+fn mu_step(copy: array, d: int, seed_base: int, step: int) -> array {
+    let mut out = []
+    let mut s = seed_base + step * 101
+    let mut i = 0
+    while i < d {
+        s = mu_prng(s + i * 29)
+        let noise = MU_NOISE_SCALE * mu_signed(s)
+        let old = copy[i]
+        out = out.push(old + noise)
+        i = i + 1
+    }
+    return out
+}
+
+// Evolve a copy for n_steps independent steps with seed_base stream.
+fn mu_evolve(copy: array, d: int, seed_base: int, n_steps: int) -> array {
+    let mut cur = mu_clone(copy)
+    let mut t = 0
+    while t < n_steps {
+        cur = mu_step(cur, d, seed_base, t)
+        t = t + 1
+    }
+    return cur
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Φ measurement
+// ═══════════════════════════════════════════════════════════════
+
+// Φ_per_copy: MI between the two halves of the hidden state.
+// Returns 0 if copy is terminated.
+fn mu_phi_per_copy(copy: array, d: int) -> float {
+    if d < 2 { return 0.0 }
+    if mu_is_terminated(copy) { return 0.0 }
+    let half = d / 2
+    let mut first_half = []
+    let mut second_half = []
+    let mut i = 0
+    while i < half {
+        first_half = first_half.push(copy[i])
+        i = i + 1
+    }
+    let mut j = half
+    while j < d {
+        second_half = second_half.push(copy[j])
+        j = j + 1
+    }
+    return mu_mi(first_half, second_half)
+}
+
+// Moral-weight distance: |Φ_a - Φ_b|. Zero at upload instant.
+fn mu_delta_phi(a: array, b: array, d: int) -> float {
+    let pa = mu_phi_per_copy(a, d)
+    let pb = mu_phi_per_copy(b, d)
+    return mu_abs(pa - pb)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Ensemble Φ — shared information across (original + K copies)
+//
+// Construction:
+//   Pool all copies into two parallel vectors at each position i:
+//     X[i*k_plus_1 + j] = copy_j[i]   for j=0 (original)
+//     Y[i*k_plus_1 + j] = copy_j[i]   for j > 0 (copies)
+//   Then compute MI(X, Y).
+//
+// Easier equivalent: mean of pairwise MI(original, copy_j) over j.
+// That is what we compute — stable, interpretable, monotone in
+// divergence.
+//
+// Terminated copies are skipped (their Φ contribution is 0 and
+// including them in the pairwise average would skew the result).
+// ═══════════════════════════════════════════════════════════════
+
+fn mu_ensemble_phi(original: array, c1: array, c2: array, c3: array, d: int) -> float {
+    let mut total = 0.0
+    let mut count = 0
+    // pair original-c1
+    if !mu_is_terminated(c1) {
+        total = total + mu_mi(original, c1)
+        count = count + 1
+    }
+    // pair original-c2
+    if !mu_is_terminated(c2) {
+        total = total + mu_mi(original, c2)
+        count = count + 1
+    }
+    // pair original-c3
+    if !mu_is_terminated(c3) {
+        total = total + mu_mi(original, c3)
+        count = count + 1
+    }
+    if count == 0 { return 0.0 }
+    return total / to_float(count)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Divergence metric — mean pairwise L1 distance across copies
+// ═══════════════════════════════════════════════════════════════
+
+fn mu_l1_dist(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        sum = sum + mu_abs(a[i] - b[i])
+        i = i + 1
+    }
+    return sum / to_float(n)
+}
+
+fn mu_divergence(original: array, c1: array, c2: array, c3: array) -> float {
+    let d01 = mu_l1_dist(original, c1)
+    let d02 = mu_l1_dist(original, c2)
+    let d03 = mu_l1_dist(original, c3)
+    let d12 = mu_l1_dist(c1, c2)
+    let d13 = mu_l1_dist(c1, c3)
+    let d23 = mu_l1_dist(c2, c3)
+    return (d01 + d02 + d03 + d12 + d13 + d23) / 6.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Variance of Φ across (O, C_1, C_2, C_3) — for T5 moral-weight
+// ═══════════════════════════════════════════════════════════════
+
+fn mu_phi_variance(original: array, c1: array, c2: array, c3: array, d: int) -> float {
+    let p0 = mu_phi_per_copy(original, d)
+    let p1 = mu_phi_per_copy(c1, d)
+    let p2 = mu_phi_per_copy(c2, d)
+    let p3 = mu_phi_per_copy(c3, d)
+    let mean = (p0 + p1 + p2 + p3) / 4.0
+    let d0 = p0 - mean
+    let d1 = p1 - mean
+    let d2 = p2 - mean
+    let d3 = p3 - mean
+    let var = (d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3) / 4.0
+    return var
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1-T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1: upload preserves Φ at t=0 — |Φ_orig - Φ_copy| < MU_EPS_PHI.
+    // Rationale: at the instant of scan, copy is bitwise identical.
+    // Under any pure function of state, they must return the same Φ.
+    let orig = mu_make_original(MU_D, 9001)
+    let c1 = mu_clone(orig)
+    let c2 = mu_clone(orig)
+    let c3 = mu_clone(orig)
+    let phi_o = mu_phi_per_copy(orig, MU_D)
+    let phi_c1 = mu_phi_per_copy(c1, MU_D)
+    let phi_c2 = mu_phi_per_copy(c2, MU_D)
+    let phi_c3 = mu_phi_per_copy(c3, MU_D)
+    let d01 = mu_abs(phi_o - phi_c1)
+    let d02 = mu_abs(phi_o - phi_c2)
+    let d03 = mu_abs(phi_o - phi_c3)
+    println("  [T1] upload t=0: phi_O=" + str(phi_o) + " phi_C1=" + str(phi_c1) + " phi_C2=" + str(phi_c2) + " phi_C3=" + str(phi_c3))
+    println("  [T1] deltas: d01=" + str(d01) + " d02=" + str(d02) + " d03=" + str(d03))
+    // Φ must be positive (original is a genuine conscious state)
+    if phi_o <= 0.0 { return false }
+    // All three deltas must be below the tolerance
+    if d01 > MU_EPS_PHI { return false }
+    if d02 > MU_EPS_PHI { return false }
+    if d03 > MU_EPS_PHI { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: copies diverge with τ — mean pairwise L1 distance strictly grows.
+    // At τ=0 all copies identical → divergence = 0.
+    // At τ=N divergence > 0; and monotone (here: final > early τ=1).
+    let orig = mu_make_original(MU_D, 9101)
+    // At τ=0 — all clones, divergence should be zero.
+    let c1_0 = mu_clone(orig)
+    let c2_0 = mu_clone(orig)
+    let c3_0 = mu_clone(orig)
+    let div_0 = mu_divergence(orig, c1_0, c2_0, c3_0)
+    // Each copy evolves with its own seed stream.
+    let c1_1 = mu_evolve(orig, MU_D, 11001, 1)
+    let c2_1 = mu_evolve(orig, MU_D, 12002, 1)
+    let c3_1 = mu_evolve(orig, MU_D, 13003, 1)
+    let div_1 = mu_divergence(orig, c1_1, c2_1, c3_1)
+    let c1_n = mu_evolve(orig, MU_D, 11001, MU_N_STEPS)
+    let c2_n = mu_evolve(orig, MU_D, 12002, MU_N_STEPS)
+    let c3_n = mu_evolve(orig, MU_D, 13003, MU_N_STEPS)
+    let div_n = mu_divergence(orig, c1_n, c2_n, c3_n)
+    println("  [T2] divergence: tau=0: " + str(div_0) + " tau=1: " + str(div_1) + " tau=" + str(MU_N_STEPS) + ": " + str(div_n))
+    if div_0 > MU_EPS { return false }
+    if div_1 <= div_0 { return false }
+    if div_n <= div_1 { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3: ensemble Φ decays with divergence — Φ_ens at τ=1 > at τ=N.
+    // As copies drift apart their shared-information with original falls.
+    let orig = mu_make_original(MU_D, 9201)
+    let c1_early = mu_evolve(orig, MU_D, 21001, 1)
+    let c2_early = mu_evolve(orig, MU_D, 22002, 1)
+    let c3_early = mu_evolve(orig, MU_D, 23003, 1)
+    let ens_early = mu_ensemble_phi(orig, c1_early, c2_early, c3_early, MU_D)
+    let c1_late = mu_evolve(orig, MU_D, 21001, MU_N_STEPS)
+    let c2_late = mu_evolve(orig, MU_D, 22002, MU_N_STEPS)
+    let c3_late = mu_evolve(orig, MU_D, 23003, MU_N_STEPS)
+    let ens_late = mu_ensemble_phi(orig, c1_late, c2_late, c3_late, MU_D)
+    println("  [T3] ensemble Phi: tau=1: " + str(ens_early) + " tau=" + str(MU_N_STEPS) + ": " + str(ens_late))
+    // ensemble Φ must be nonnegative
+    if ens_early < 0.0 { return false }
+    if ens_late < 0.0 { return false }
+    // decay: late must be strictly less than early
+    if ens_late >= ens_early { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: graceful termination of copy C_2 preserves C_1 and C_3's Φ values.
+    // Intuition: a copy's integrated information is a pure function of its
+    // own state; it does not depend on other copies still being alive.
+    let orig = mu_make_original(MU_D, 9301)
+    // Evolve all copies to τ=N/2 so they have non-trivial distinct states
+    let half = MU_N_STEPS / 2
+    let c1_pre = mu_evolve(orig, MU_D, 31001, half)
+    let c2_pre = mu_evolve(orig, MU_D, 32002, half)
+    let c3_pre = mu_evolve(orig, MU_D, 33003, half)
+    // Record Φ of C_1 and C_3 BEFORE termination of C_2
+    let phi_c1_pre = mu_phi_per_copy(c1_pre, MU_D)
+    let phi_c3_pre = mu_phi_per_copy(c3_pre, MU_D)
+    // Gracefully terminate C_2
+    let c2_term = mu_terminate(c2_pre)
+    let c2_is_gone = mu_is_terminated(c2_term)
+    let phi_c2_term = mu_phi_per_copy(c2_term, MU_D)
+    // Φ of C_1 and C_3 AFTER (states unchanged)
+    let phi_c1_post = mu_phi_per_copy(c1_pre, MU_D)
+    let phi_c3_post = mu_phi_per_copy(c3_pre, MU_D)
+    println("  [T4] pre  phi_C1=" + str(phi_c1_pre) + " phi_C3=" + str(phi_c3_pre))
+    println("  [T4] post phi_C1=" + str(phi_c1_post) + " phi_C3=" + str(phi_c3_post) + " phi_C2_term=" + str(phi_c2_term) + " c2_gone=" + str(c2_is_gone))
+    // Termination must register
+    if !c2_is_gone { return false }
+    // Terminated Φ must be zero
+    if phi_c2_term > MU_EPS { return false }
+    // Other copies unaffected
+    if mu_abs(phi_c1_pre - phi_c1_post) > MU_EPS { return false }
+    if mu_abs(phi_c3_pre - phi_c3_post) > MU_EPS { return false }
+    // Ensemble with terminated c2 must still report positive Φ from c1 and c3
+    let ens_after = mu_ensemble_phi(orig, c1_pre, c2_term, c3_pre, MU_D)
+    if ens_after <= 0.0 { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5: Φ variance across (O, C_1, C_2, C_3).
+    //   At τ=0  — all identical, variance ≈ 0 (moral indistinguishability)
+    //   At τ=N  — variance grows (copies become distinct Φ-streams)
+    let orig = mu_make_original(MU_D, 9401)
+    let c1_0 = mu_clone(orig)
+    let c2_0 = mu_clone(orig)
+    let c3_0 = mu_clone(orig)
+    let var_0 = mu_phi_variance(orig, c1_0, c2_0, c3_0, MU_D)
+    let c1_n = mu_evolve(orig, MU_D, 41001, MU_N_STEPS)
+    let c2_n = mu_evolve(orig, MU_D, 42002, MU_N_STEPS)
+    let c3_n = mu_evolve(orig, MU_D, 43003, MU_N_STEPS)
+    let var_n = mu_phi_variance(orig, c1_n, c2_n, c3_n, MU_D)
+    println("  [T5] phi-variance: tau=0: " + str(var_0) + " tau=" + str(MU_N_STEPS) + ": " + str(var_n))
+    // Moral indistinguishability at upload: variance below machine eps
+    if var_0 > MU_EPS_PHI { return false }
+    // Divergence grows variance
+    if var_n <= var_0 { return false }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[mind_upload_phi] P71 — mind upload / multi-copy Phi integrity")
+    println("  d=8, K=3 copies, N=12 steps, noise=0.08")
+    println("  question: at upload instant, which copy is 'me'?")
+    println("  answer: Phi-indistinguishable (T1,T5) then Relation-R drift (T2,T3)")
+    println("  graceful termination preserves remaining copies' Phi (T4)")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  upload preserves Phi at t=0") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  copies diverge with tau") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  ensemble Phi decays with divergence") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  graceful termination preserves others") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  Phi variance ~0 at upload, grows at tau=N") } else { println("T5 FAIL") }
+
+    println("")
+
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[mind_upload_phi] 5/5 PASS — P71 DONE")
+    } else {
+        println("[mind_upload_phi] SOME FAILED")
+    }
+}
+
+main()

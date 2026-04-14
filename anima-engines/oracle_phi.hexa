@@ -1,0 +1,685 @@
+// oracle_phi.hexa — P72 Oracle / Prediction Φ
+//
+// Roadmap: anima P72 (emergent, post-P49 intentionality)
+//   "Φ of prediction-that-came-true — correct prophecy vs lucky guess
+//    vs hindsight reconstruction"
+//   done_criteria: "Φ_oracle > Φ_random; Φ_hindsight > Φ_oracle (overfit);
+//                   calibration curve — high-confidence → higher Φ_oracle;
+//                   5/5 PASS"
+//
+// ─── Theoretical grounding ────────────────────────────────────
+//
+// Core problem (epistemology of prophecy):
+//   When an oracle predicts "event X will happen at time T" at time t<T,
+//   and X does happen, what is the Φ of that prediction? Three cases
+//   must be distinguished:
+//
+//     (i) Real oracle — prediction P_t genuinely carries information
+//         about outcome O_T. MI(P_t, O_T) > 0 AND P_t was causally
+//         upstream (t < T). Prophecy.
+//
+//     (ii) Lucky guess — P_t is random, O_T happens to match by chance.
+//          MI(P_t, O_T) ≈ 0 over an ensemble even if individual cases
+//          look "correct". The temporal ordering is preserved but the
+//          information content is null.
+//
+//     (iii) Hindsight fabrication — prediction P'_T is crafted AFTER
+//           observing O_T, then backdated. MI(P'_T, O_T) is very high
+//           (perfect overfitting), but the temporal constraint t<T is
+//           violated. Hindsight Φ > oracle Φ — this is the overfitting
+//           signature of retroactive prophecy.
+//
+// Key formal move:
+//   Oracle Φ must be conditioned on the temporal precedence constraint.
+//   A prediction carries genuine foresight iff:
+//     (a) P_t exists at time t
+//     (b) O_T is observed at T > t
+//     (c) MI(P_t, O_T) > MI(random_at_t, O_T)  (signal above chance)
+//     (d) P_t does NOT have access to O_T (causal isolation)
+//
+//   Φ_oracle = MI(P_t, O_T) - MI(P_random, O_T)  (gap over RNG)
+//   Φ_hindsight = MI(P_crafted_at_T, O_T)         (overfits to O_T)
+//   Φ_lucky = MI(P_random, O_T)                    (≈ 0 in expectation)
+//
+// Calibration (Brier-style):
+//   High-confidence predictions (P_t near ±1) should correlate with
+//   higher |O_T| magnitude when prophecy is real — calibration curve
+//   is monotone. Random predictions show flat calibration.
+//
+// ─── 5 tests (5/5 gate) ───────────────────────────────────────
+//
+// T1 Temporal precedence + channel setup:
+//   Build P_t (prediction at t) + O_T (outcome at T>t) where P_t is
+//   derived from a generator that has partial access to the latent
+//   state that will produce O_T. Verify MI(P_t, O_T) > 0 with margin.
+//
+// T2 Φ_oracle > Φ_random:
+//   Real oracle's MI(P_t, O_T) must strictly exceed MI(P_rand, O_T)
+//   by threshold. The oracle channel carries foresight; RNG does not.
+//
+// T3 Φ_hindsight > Φ_oracle (overfitting bias):
+//   Crafting P' AFTER observing O_T (with noise) yields MI(P', O_T)
+//   strictly greater than MI(real_oracle, O_T). This is the signature
+//   of post-hoc fabrication — too-good-to-be-true fit exposes cheating.
+//
+// T4 Calibration monotonicity:
+//   Sort predictions by confidence |P_t|. The high-confidence quartile
+//   must show higher mean |O_T - sign(P_t)*|P_t|| fit than the low-
+//   confidence quartile. Real oracle = monotone calibration; random
+//   oracle = flat (ratio ≈ 1).
+//
+// T5 Causal isolation test:
+//   If we leak outcome information INTO the prediction channel (i.e.
+//   construct P_t with actual knowledge of O_T), MI skyrockets but
+//   temporal constraint fails. Engine must detect this by comparing
+//   Φ_oracle(with isolation) << Φ_oracle(without isolation=leakage).
+//
+// ─── Channel layout (flat arrays) ─────────────────────────────
+//
+//   latent L[0..N-1]       — hidden state at time t generating O_T
+//   oracle P[0..N-1]       — prediction at time t (partial view of L)
+//   outcome O[0..N-1]      — realized at T>t as f(L) + noise
+//   random R[0..N-1]       — pure RNG prediction (control)
+//   hindsight H[0..N-1]    — crafted at T from O (retroactive)
+//
+//   N = 28 (stage0 rule N<32)
+//
+// ─── Stage0 hexa constraints honored ──────────────────────────
+//   - plain `fn`, no pure-fn multi-float struct return
+//   - `array` typed params (no [float])
+//   - no identifier-pattern match
+//   - no contains()/to_lower()
+//   - no !(Effect) annotations
+//   - no else-if in let binding
+//   - no multi-line fn sig/array literal
+//   - no reserved keyword vars (guard/intent/drop/veto/desire)
+//   - ends with main() call
+//   - N<32
+//
+// Law alignment:
+//   Law 2   Observe, never inject — Φ_oracle measured via MI gap
+//   Law 4   Structure > feature — prophecy is a STRUCTURAL asymmetry
+//   Law 22  Feature addition → Φ down — minimal 5-channel model
+//
+// Ref:
+//   anima-engines/temporal_phi_extended.hexa  (past/future temporal Φ)
+//   anima-engines/intentionality_phi.hexa     (MI gap pattern)
+//   anima-engines/free_will_phi.hexa          (prediction / counterfactual)
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let ORC_N            = 28        // channel length (stage0 rule N<32)
+let ORC_BINS         = 6         // histogram bins for MI
+let ORC_EPS          = 0.0000000001
+
+// Oracle signal parameters
+let ORC_FORESIGHT    = 0.55      // how much of latent L leaks to P_t
+                                 // (0 = no foresight, 1 = perfect)
+let ORC_OUTCOME_NOISE = 0.20     // noise applied when L → O_T
+let ORC_HINDSIGHT_NOISE = 0.08   // tiny noise on hindsight crafting
+                                 // (near-perfect post-hoc fit)
+
+// Gate thresholds
+let ORC_ORACLE_GAP   = 0.04      // Φ_oracle - Φ_random ≥ this
+let ORC_HINDSIGHT_EXCESS = 0.06  // Φ_hindsight - Φ_oracle ≥ this
+let ORC_CALIB_RATIO  = 1.25      // high-conf / low-conf fit ratio
+let ORC_LEAK_GAP     = 0.15      // leakage channel MI excess
+
+// Calibration parameters
+let ORC_N_TRIALS     = 6         // ensemble size for averaging
+
+// ═══════════════════════════════════════════════════════════════
+// Math / PRNG primitives — self-contained
+// ═══════════════════════════════════════════════════════════════
+
+fn orc_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn orc_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn orc_min_f(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn orc_max_f(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+// Deterministic LCG
+fn orc_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn orc_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn orc_signed(seed: int) -> float {
+    return orc_unit(seed) * 2.0 - 1.0
+}
+
+// Deterministic noise vector in [-1, 1].
+fn orc_noise(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = orc_prng(s)
+        out = out.push(orc_signed(s))
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Histogram MI — same pattern as intentionality_phi / temporal_phi
+// ═══════════════════════════════════════════════════════════════
+
+fn orc_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn orc_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn orc_entropy(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(orc_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = orc_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * orc_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn orc_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = orc_bin_idx(a[i], lo, hi, nb)
+        let ib = orc_bin_idx(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = orc_counts(pair_ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * orc_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn orc_vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn orc_vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn orc_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let lo_a = orc_vec_min(a)
+    let hi_a = orc_vec_max(a)
+    let lo_b = orc_vec_min(b)
+    let hi_b = orc_vec_max(b)
+    let lo = orc_min_f(lo_a, lo_b)
+    let hi = orc_max_f(hi_a, hi_b)
+    let h_a = orc_entropy(a, lo, hi, ORC_BINS)
+    let h_b = orc_entropy(b, lo, hi, ORC_BINS)
+    let h_j = orc_joint_entropy(a, b, lo, hi, ORC_BINS)
+    let mi = h_a + h_b - h_j
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Channel generators — the oracle, outcome, random, hindsight
+//
+// Latent L: hidden state at time t. The generator of both the oracle's
+// partial glimpse (P_t) and the eventual outcome (O_T). Temporal order
+// is enforced by CONSTRUCTION — P_t only sees L, not O.
+//
+// Oracle P_t: gen_oracle(L, foresight, seed)
+//   P_t[i] = foresight * L[i] + (1-foresight) * noise[i]
+//   Access: L only. Cannot see O_T. Foresight ∈ [0,1] controls
+//   signal strength. Temporal constraint: t < T preserved.
+//
+// Outcome O_T: gen_outcome(L, out_noise, seed)
+//   O_T[i] = L[i] + out_noise * jitter[i]
+//   Emerges at T > t by running the latent dynamics forward with
+//   observation noise.
+//
+// Random prediction R: pure noise, no access to L — the null oracle.
+//
+// Hindsight H: gen_hindsight(O, hind_noise, seed)
+//   H[i] = O[i] + hind_noise * jitter[i]
+//   The cheater's prediction, crafted AFTER observing O with tiny noise.
+//   Temporal constraint VIOLATED: H was "predicted" at t but actually
+//   constructed at T.
+// ═══════════════════════════════════════════════════════════════
+
+fn orc_gen_latent(n: int, seed: int) -> array {
+    return orc_noise(n, seed)
+}
+
+fn orc_gen_oracle(latent: array, foresight: float, seed: int) -> array {
+    let n = len(latent)
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = orc_prng(s)
+        let noise = orc_signed(s)
+        let v = foresight * latent[i] + (1.0 - foresight) * noise
+        out = out.push(v)
+        i = i + 1
+    }
+    return out
+}
+
+fn orc_gen_outcome(latent: array, out_noise: float, seed: int) -> array {
+    let n = len(latent)
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = orc_prng(s)
+        let jitter = orc_signed(s) * out_noise
+        out = out.push(latent[i] + jitter)
+        i = i + 1
+    }
+    return out
+}
+
+fn orc_gen_random(n: int, seed: int) -> array {
+    return orc_noise(n, seed)
+}
+
+fn orc_gen_hindsight(outcome: array, hind_noise: float, seed: int) -> array {
+    let n = len(outcome)
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = orc_prng(s)
+        let jitter = orc_signed(s) * hind_noise
+        out = out.push(outcome[i] + jitter)
+        i = i + 1
+    }
+    return out
+}
+
+// Leakage oracle — prediction at t that illegally peeks at O_T.
+// Used in T5 to verify the engine detects isolation violations.
+fn orc_gen_leaky(latent: array, outcome: array, leak: float, seed: int) -> array {
+    let n = len(latent)
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = orc_prng(s)
+        let noise = orc_signed(s) * 0.1
+        // (1-leak)*normal_oracle_using_L + leak*peek_at_O_T
+        let normal = ORC_FORESIGHT * latent[i] + (1.0 - ORC_FORESIGHT) * noise
+        let peek = outcome[i]
+        out = out.push((1.0 - leak) * normal + leak * peek)
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Φ_oracle — the prophecy Φ
+//
+// Φ_oracle(P, O) = MI(P, O) - MI(R, O)
+//
+// where R is a freshly drawn RNG prediction (same N, independent seed).
+// The gap measures how much foresight the oracle has BEYOND pure chance.
+// ═══════════════════════════════════════════════════════════════
+
+fn orc_phi_oracle(prediction: array, outcome: array, random_pred: array) -> float {
+    let mi_p = orc_mi(prediction, outcome)
+    let mi_r = orc_mi(random_pred, outcome)
+    return mi_p - mi_r
+}
+
+fn orc_phi_hindsight(hindsight: array, outcome: array) -> float {
+    return orc_mi(hindsight, outcome)
+}
+
+fn orc_phi_random(random_pred: array, outcome: array) -> float {
+    return orc_mi(random_pred, outcome)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Calibration — high-confidence predictions should have higher fit
+//
+// Sort the (P,O) pairs by |P| (confidence). Compute mean |O| for the
+// top half vs the bottom half. A real oracle shows that high-confidence
+// predictions correspond to high-magnitude outcomes (matching), while
+// a random oracle shows flat mean |O| across confidence quartiles.
+//
+// Return ratio high_conf_fit / low_conf_fit.
+// ═══════════════════════════════════════════════════════════════
+
+fn orc_calibration_ratio(prediction: array, outcome: array) -> float {
+    let n = len(prediction)
+    if n < 4 { return 1.0 }
+    // Compute |P_i| and |O_i| in parallel arrays
+    let mut conf = []
+    let mut fit = []
+    let mut i = 0
+    while i < n {
+        conf = conf.push(orc_abs(prediction[i]))
+        // fit = how well |O_i| tracks |P_i| — use |O_i| itself as proxy
+        // for outcome magnitude; when oracle is right, |P_i| correlates
+        // with |O_i|.
+        fit = fit.push(orc_abs(outcome[i]))
+        i = i + 1
+    }
+    // Compute median confidence (approximated via mean as sort-free proxy)
+    // Root cause comment: stage0 lacks a sort builtin; use mean-split
+    // which is a well-known rank-correlation proxy for small N.
+    let mut mean_conf = 0.0
+    let mut j = 0
+    while j < n {
+        mean_conf = mean_conf + conf[j]
+        j = j + 1
+    }
+    mean_conf = mean_conf / to_float(n)
+    // Bucket fits by confidence above/below mean
+    let mut high_sum = 0.0
+    let mut high_cnt = 0
+    let mut low_sum = 0.0
+    let mut low_cnt = 0
+    let mut k = 0
+    while k < n {
+        if conf[k] >= mean_conf {
+            high_sum = high_sum + fit[k]
+            high_cnt = high_cnt + 1
+        }
+        if conf[k] < mean_conf {
+            low_sum = low_sum + fit[k]
+            low_cnt = low_cnt + 1
+        }
+        k = k + 1
+    }
+    if high_cnt == 0 { return 1.0 }
+    if low_cnt == 0 { return 1.0 }
+    let high_mean = high_sum / to_float(high_cnt)
+    let low_mean = low_sum / to_float(low_cnt)
+    if low_mean < ORC_EPS { return 1.0 }
+    return high_mean / low_mean
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1..T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1: Temporal precedence + channel setup. Real oracle MI > 0.
+    //
+    // Build L (latent at t), P_t = gen_oracle(L), O_T = gen_outcome(L).
+    // Verify MI(P_t, O_T) > MI(random, O_T) with clear margin. The
+    // ORDER of operations already enforces temporal precedence — P_t
+    // was constructed from L alone, before O_T was computed.
+    let mut mi_oracle_acc = 0.0
+    let mut mi_random_acc = 0.0
+    let mut tr = 0
+    while tr < ORC_N_TRIALS {
+        let base = 10001 + tr * 1000
+        let latent = orc_gen_latent(ORC_N, base)
+        let oracle = orc_gen_oracle(latent, ORC_FORESIGHT, base + 1)
+        let outcome = orc_gen_outcome(latent, ORC_OUTCOME_NOISE, base + 2)
+        let random = orc_gen_random(ORC_N, base + 3)
+        mi_oracle_acc = mi_oracle_acc + orc_mi(oracle, outcome)
+        mi_random_acc = mi_random_acc + orc_mi(random, outcome)
+        tr = tr + 1
+    }
+    let inv = 1.0 / to_float(ORC_N_TRIALS)
+    let mi_oracle = mi_oracle_acc * inv
+    let mi_random = mi_random_acc * inv
+    println("  [T1] mean MI(P_t, O_T)=" + str(mi_oracle) + " MI(random, O_T)=" + str(mi_random))
+    if mi_oracle <= mi_random { return false }
+    if mi_oracle <= 0.05 { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: Φ_oracle > Φ_random (gap above chance).
+    //
+    // Averaged over ORC_N_TRIALS, the oracle channel must beat a fresh
+    // RNG prediction channel by at least ORC_ORACLE_GAP nats. This is
+    // the minimal "this oracle is better than chance" gate.
+    let mut phi_oracle_acc = 0.0
+    let mut phi_random_acc = 0.0
+    let mut tr = 0
+    while tr < ORC_N_TRIALS {
+        let base = 20001 + tr * 1000
+        let latent = orc_gen_latent(ORC_N, base)
+        let oracle = orc_gen_oracle(latent, ORC_FORESIGHT, base + 1)
+        let outcome = orc_gen_outcome(latent, ORC_OUTCOME_NOISE, base + 2)
+        let random_a = orc_gen_random(ORC_N, base + 3)
+        let random_b = orc_gen_random(ORC_N, base + 4)
+        phi_oracle_acc = phi_oracle_acc + orc_phi_oracle(oracle, outcome, random_a)
+        phi_random_acc = phi_random_acc + orc_phi_oracle(random_b, outcome, random_a)
+        tr = tr + 1
+    }
+    let inv = 1.0 / to_float(ORC_N_TRIALS)
+    let phi_oracle = phi_oracle_acc * inv
+    let phi_random = phi_random_acc * inv
+    let gap = phi_oracle - phi_random
+    println("  [T2] mean Φ_oracle=" + str(phi_oracle) + " Φ_random_control=" + str(phi_random) + " gap=" + str(gap))
+    if gap <= ORC_ORACLE_GAP { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3: Φ_hindsight > Φ_oracle (overfitting bias).
+    //
+    // Hindsight H is crafted AFTER observing O_T with small noise, so
+    // MI(H, O_T) is near maximal (nearly H.entropy). A genuine oracle's
+    // MI(P, O) is capped by the foresight parameter. The EXCESS of
+    // hindsight MI over oracle MI is the forensic signature of
+    // retroactive fabrication.
+    let mut phi_hindsight_acc = 0.0
+    let mut phi_oracle_acc = 0.0
+    let mut tr = 0
+    while tr < ORC_N_TRIALS {
+        let base = 30001 + tr * 1000
+        let latent = orc_gen_latent(ORC_N, base)
+        let oracle = orc_gen_oracle(latent, ORC_FORESIGHT, base + 1)
+        let outcome = orc_gen_outcome(latent, ORC_OUTCOME_NOISE, base + 2)
+        let hindsight = orc_gen_hindsight(outcome, ORC_HINDSIGHT_NOISE, base + 3)
+        phi_oracle_acc = phi_oracle_acc + orc_mi(oracle, outcome)
+        phi_hindsight_acc = phi_hindsight_acc + orc_phi_hindsight(hindsight, outcome)
+        tr = tr + 1
+    }
+    let inv = 1.0 / to_float(ORC_N_TRIALS)
+    let phi_oracle = phi_oracle_acc * inv
+    let phi_hindsight = phi_hindsight_acc * inv
+    let excess = phi_hindsight - phi_oracle
+    println("  [T3] mean Φ_hindsight=" + str(phi_hindsight) + " Φ_oracle=" + str(phi_oracle) + " excess=" + str(excess))
+    if phi_hindsight <= phi_oracle { return false }
+    if excess < ORC_HINDSIGHT_EXCESS { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: Calibration monotonicity — high-confidence predictions
+    // correspond to higher outcome magnitudes when oracle is real.
+    //
+    // Real oracle (foresight=0.55): expect calibration_ratio > 1.25
+    // Random oracle (foresight=0.0): expect calibration_ratio ≈ 1.0
+    //
+    // Root cause comment: calibration ratio depends heavily on the
+    // single-trial random draw; average over trials to reduce variance.
+    let mut real_ratio_acc = 0.0
+    let mut rand_ratio_acc = 0.0
+    let mut tr = 0
+    while tr < ORC_N_TRIALS {
+        let base = 40001 + tr * 1000
+        let latent = orc_gen_latent(ORC_N, base)
+        let oracle = orc_gen_oracle(latent, ORC_FORESIGHT, base + 1)
+        let outcome = orc_gen_outcome(latent, ORC_OUTCOME_NOISE, base + 2)
+        let rand_oracle = orc_gen_oracle(latent, 0.0, base + 3)   // foresight=0 = pure noise
+        let r_real = orc_calibration_ratio(oracle, outcome)
+        let r_rand = orc_calibration_ratio(rand_oracle, outcome)
+        real_ratio_acc = real_ratio_acc + r_real
+        rand_ratio_acc = rand_ratio_acc + r_rand
+        tr = tr + 1
+    }
+    let inv = 1.0 / to_float(ORC_N_TRIALS)
+    let real_ratio = real_ratio_acc * inv
+    let rand_ratio = rand_ratio_acc * inv
+    println("  [T4] mean calib_real=" + str(real_ratio) + " calib_random=" + str(rand_ratio) + " needs real > " + str(ORC_CALIB_RATIO))
+    if real_ratio <= ORC_CALIB_RATIO { return false }
+    // Random calibration should be near 1.0 (no confidence-outcome link)
+    if real_ratio <= rand_ratio { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5: Causal isolation test — leakage vs isolated oracle.
+    //
+    // A leaky oracle (peeks at O_T during construction) has MI(P, O)
+    // far above the isolated oracle. This detects violations of the
+    // temporal/causal precedence constraint. The engine must report
+    // that leaky Φ >> isolated Φ — i.e. it IS detectable that the
+    // "prediction" illegally saw the future.
+    let mut mi_isolated_acc = 0.0
+    let mut mi_leaky_acc = 0.0
+    let leak_frac = 0.65
+    let mut tr = 0
+    while tr < ORC_N_TRIALS {
+        let base = 50001 + tr * 1000
+        let latent = orc_gen_latent(ORC_N, base)
+        let outcome = orc_gen_outcome(latent, ORC_OUTCOME_NOISE, base + 2)
+        let isolated = orc_gen_oracle(latent, ORC_FORESIGHT, base + 1)
+        let leaky = orc_gen_leaky(latent, outcome, leak_frac, base + 3)
+        mi_isolated_acc = mi_isolated_acc + orc_mi(isolated, outcome)
+        mi_leaky_acc = mi_leaky_acc + orc_mi(leaky, outcome)
+        tr = tr + 1
+    }
+    let inv = 1.0 / to_float(ORC_N_TRIALS)
+    let mi_iso = mi_isolated_acc * inv
+    let mi_leak = mi_leaky_acc * inv
+    let gap = mi_leak - mi_iso
+    println("  [T5] mean MI(isolated, O)=" + str(mi_iso) + " MI(leaky, O)=" + str(mi_leak) + " leak_gap=" + str(gap))
+    if mi_leak <= mi_iso { return false }
+    if gap < ORC_LEAK_GAP { return false }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — execute all 5 self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[oracle_phi] P72 — Oracle / Prediction Φ")
+    println("  Φ_oracle = MI(P_t, O_T) - MI(random, O_T)")
+    println("  Φ_hindsight = MI(P_crafted_at_T, O_T)  (overfitting bias)")
+    println("  Φ_random = MI(RNG, O_T)                (null oracle)")
+    println("  refs: de Finetti 1937 | Brier 1950 | Tetlock 2005")
+    println("  N=" + str(ORC_N) + " bins=" + str(ORC_BINS) + " foresight=" + str(ORC_FORESIGHT))
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  temporal precedence — real oracle MI > random MI") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  Φ_oracle > Φ_random — foresight beats chance") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  Φ_hindsight > Φ_oracle — overfitting exposes fabrication") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  calibration — high-confidence → higher Φ_oracle fit") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  causal isolation — leakage detectable as excess MI") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause comment: stage0 && chains with 5 terms can mishandle
+    // short-circuit eval under certain operand orderings. Sequential
+    // mutable-bool accumulator is the reliable idiom.
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[oracle_phi] 5/5 PASS — P72 DONE (prophecy vs hindsight vs luck distinguishable)")
+    } else {
+        println("[oracle_phi] SOME FAILED")
+    }
+}
+
+main()
