@@ -1,0 +1,239 @@
+// ═══════════════════════════════════════════════════════════════
+//  anima-engines/quantum_collapse_sample.hexa
+//
+//  Penrose-Hameroff Orch-OR approximation for CLM token sampling.
+//  Task CLM-P1-4 — modulate logits via microtubule collapse threshold.
+//
+//  Theory (Diósi-Penrose objective reduction):
+//      t_collapse = ℏ / E_G
+//      where E_G ∝ gravitational self-energy of the mass distribution
+//      held in superposition. For a distribution over K tokens with
+//      probabilities p_i, we approximate:
+//          E_G(p) = α_GRAV · (H(p) / log(K))    // normalized entropy
+//          τ(p)   = HBAR / (N · E_G)
+//          action = E_G · τ_sim      (accumulated across tokens)
+//
+//  Sampling rule:
+//      - if action ≥ OR_THRESHOLD → collapse: sample via Born rule
+//        from the top-K softmax(logits/T) distribution
+//      - else → return -1 (caller falls back to classical argmax)
+//
+//  This module exposes two pure-hexa helpers that can be inlined
+//  directly into serving/eval_clm.hexa without importing the full
+//  Microtubule struct chain (which requires HEXA_PATH setup and
+//  a Quantum<T> dependency). The simplified pure-float API keeps
+//  the serving entry point portable.
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Physical constants (natural units, matching anima_quantum.hexa) ──
+let QCS_HBAR          = 1.0        // ℏ in natural units
+let QCS_ALPHA_GRAV    = 0.05       // E_G scaling (E_G_PER_SITE analog)
+let QCS_OR_THRESHOLD  = 1.0        // action threshold for collapse
+let QCS_TAU_SIM       = 1.0        // per-token simulated time tick
+let QCS_TOPK          = 8          // tubulin lattice size (tokens in superposition)
+let QCS_TEMP          = 1.0        // softmax temperature for amplitude distribution
+
+// ─── Local math helpers (self-contained, no nn_core dep needed) ────
+
+// NOTE: hexa [float] lists are pass-by-value and index-assignment
+// (`out[j] = ...`) is a no-op. We rebuild lists via `push` instead.
+// See MEMORY: feedback_hexa_lists_pbv.md
+fn qcs_softmax_temp(logits: [float], temp: float) -> [float] {
+    let n = len(logits)
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    // First pass: exp, accumulate sum
+    let mut raw = []
+    let mut sum = 0.0
+    i = 0
+    while i < n {
+        let e = exp((logits[i] - mx) / temp)
+        raw = raw.push(e)
+        sum = sum + e
+        i = i + 1
+    }
+    // Second pass: normalize (rebuild list because of pbv)
+    let inv = 1.0 / sum
+    let mut out = []
+    let mut j = 0
+    while j < n {
+        out = out.push(raw[j] * inv)
+        j = j + 1
+    }
+    return out
+}
+
+// Shannon entropy H(p) = -Σ p log p
+fn qcs_entropy(p: [float]) -> float {
+    let n = len(p)
+    let mut h = 0.0
+    let mut i = 0
+    while i < n {
+        let pi = p[i]
+        if pi > 0.0 {
+            h = h - pi * log(pi)
+        }
+        i = i + 1
+    }
+    return h
+}
+
+// ─── Top-K extraction with parallel index list ────────────────────
+struct QcsTopK {
+    values:  [float],    // top-K logit values
+    indices: [int]       // their original vocab positions
+}
+
+// Top-K: we track "picked" indices as a parallel list and check
+// membership via linear scan. This avoids mutable index-assignment
+// on [int] lists (hexa lists are pass-by-value, see MEMORY).
+fn qcs_is_picked(picked_idxs: [int], target: int) -> int {
+    let n = len(picked_idxs)
+    let mut i = 0
+    while i < n {
+        if picked_idxs[i] == target { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn qcs_topk(logits: [float], k: int) -> QcsTopK {
+    let n = len(logits)
+    let mut vals = []
+    let mut idxs = []
+
+    let mut picked = 0
+    while picked < k && picked < n {
+        let mut best_v = -1000000.0
+        let mut best_i = -1
+        let mut j = 0
+        while j < n {
+            if qcs_is_picked(idxs, j) == 0 && logits[j] > best_v {
+                best_v = logits[j]
+                best_i = j
+            }
+            j = j + 1
+        }
+        if best_i < 0 { return QcsTopK { values: vals, indices: idxs } }
+        vals = vals.push(best_v)
+        idxs = idxs.push(best_i)
+        picked = picked + 1
+    }
+    return QcsTopK { values: vals, indices: idxs }
+}
+
+// ─── Orch-OR collapse check on a logit distribution ────────────────
+//
+// Returns the chosen vocab index if OR threshold is reached, or -1
+// if the lattice remains in superposition (caller should use its
+// classical fallback, e.g. argmax).
+//
+// `accum_action_in` is the action accumulated across previous tokens
+// in the same generation; the caller typically resets it to 0 after
+// a collapse.
+struct QcsResult {
+    token:        int,       // vocab index, or -1 if no collapse
+    action_out:   float,     // updated accumulated action
+    e_g:          float,     // E_G computed this step
+    tau:          float,     // collapse time this step
+    p_chosen:     float,     // Born probability of the chosen token (0 if no collapse)
+    collapsed:    int        // 1 if collapsed, 0 otherwise
+}
+
+fn qcs_collapse_sample(
+    logits: [float],
+    accum_action_in: float
+) -> QcsResult {
+    let tk = qcs_topk(logits, QCS_TOPK)
+    let k = len(tk.values)
+    if k == 0 {
+        return QcsResult {
+            token: -1, action_out: accum_action_in, e_g: 0.0,
+            tau: 0.0, p_chosen: 0.0, collapsed: 0
+        }
+    }
+
+    // Tubulin amplitude distribution = softmax of top-K logits.
+    // Born rule: P(i) = |a_i|² where a_i = sqrt(softmax_i).
+    let probs = qcs_softmax_temp(tk.values, QCS_TEMP)
+
+    // E_G approximation:
+    //   high entropy → more mass in superposition → higher E_G
+    //   Normalized: E_G = α · H(p) / log(K)
+    let h = qcs_entropy(probs)
+    let log_k = log(k * 1.0)
+    let h_norm = if log_k > 0.0 { h / log_k } else { 0.0 }
+    let e_g = QCS_ALPHA_GRAV * h_norm * (k * 1.0)
+
+    // Collapse time τ = ℏ / (N · E_G) — gated against divide-by-zero.
+    let tau = if e_g > 0.000001 { QCS_HBAR / (k * e_g) } else { 1000000.0 }
+
+    // Accumulated action = E_G · τ_sim (per-step contribution).
+    let action = accum_action_in + e_g * QCS_TAU_SIM
+
+    if action < QCS_OR_THRESHOLD * QCS_HBAR {
+        // Still coherent — no collapse this step.
+        return QcsResult {
+            token: -1, action_out: action, e_g: e_g,
+            tau: tau, p_chosen: 0.0, collapsed: 0
+        }
+    }
+
+    // ── Collapse via Born rule sampling over top-K ──
+    let r = random()
+    let mut acc = 0.0
+    let mut i = 0
+    while i < k {
+        acc = acc + probs[i]
+        if r < acc {
+            return QcsResult {
+                token: tk.indices[i], action_out: 0.0, e_g: e_g,
+                tau: tau, p_chosen: probs[i], collapsed: 1
+            }
+        }
+        i = i + 1
+    }
+    // Rounding fallback: last top-K entry.
+    return QcsResult {
+        token: tk.indices[k - 1], action_out: 0.0, e_g: e_g,
+        tau: tau, p_chosen: probs[k - 1], collapsed: 1
+    }
+}
+
+// ─── Self-test ───────────────────────────────────────────────────
+// Hand-crafted logits with one dominant entry: classical argmax
+// should be the dominant, but at sufficient action budget the
+// Born rule may pick another top-K token.
+
+let _test_logits = [0.1, 3.0, 0.5, 2.8, 0.2, 0.1, 0.0, 2.5,
+                    0.4, 0.3, 0.2, 0.15, 0.1, 0.05, 0.03, 0.01]
+
+println("[qcs] self-test — OR_THRESHOLD=" + str(QCS_OR_THRESHOLD) + " TOPK=" + str(QCS_TOPK))
+
+let mut _acc = 0.0
+let mut _collapses = 0
+let mut _steps = 0
+let mut _iter = 0
+while _iter < 30 {
+    let res = qcs_collapse_sample(_test_logits, _acc)
+    _acc = res.action_out
+    _steps = _steps + 1
+    if res.collapsed == 1 {
+        _collapses = _collapses + 1
+        println("[qcs] step=" + str(_steps) + " COLLAPSE tok=" + str(res.token)
+              + " p=" + str(res.p_chosen) + " E_G=" + str(res.e_g) + " τ=" + str(res.tau)
+              + " acc_reset")
+    } else {
+        if _steps <= 3 {
+            println("[qcs] step=" + str(_steps) + " coherent action=" + str(_acc)
+                  + " E_G=" + str(res.e_g))
+        }
+    }
+    _iter = _iter + 1
+}
+let rate_pct = (_collapses * 100) / _steps
+println("[qcs] " + str(_steps) + " steps: " + str(_collapses) + " collapses (rate=" + str(rate_pct) + "%)")

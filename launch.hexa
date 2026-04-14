@@ -13,7 +13,8 @@
 // anima help         도움말
 
 let VERSION = "1.0.0"
-let HOME = exec("printenv HOME")
+// Trim trailing newline from exec output to avoid embedded \n in paths
+let HOME = exec("printenv HOME").trim()
 let hexa = HOME + "/Dev/hexa-lang/hexa"
 let base = HOME + "/Dev/anima"
 let pkg = HOME + "/.hx/packages/anima"
@@ -106,14 +107,39 @@ if cmd == "help" || cmd == "-h" || cmd == "--help" {
             println("  " + name + "    [" + status + "]  modules/" + name)
             i = i + 1
         }
-        // external modules (anima-*)
+        // external modules (anima-*) — ROI #7: mtime-invalidated count cache
+        // Before: 9x exec(find ... | wc -l) ≈ 70–2000ms fork overhead
+        // After:  1x exec(stat) + cache hit zero-fork; cache miss 1x batched exec
+        let cache_path = base + "/.module_count.cache"
+        let base_mtime = exec("stat -f '%m' " + base + " 2>/dev/null || stat -c '%Y' " + base + " 2>/dev/null").trim()
+        let cache_raw = read_file(cache_path)
+        let cache_lines = cache_raw.split("\n")
+        let cache_valid = cache_lines.len() > 1 && cache_lines[0] == base_mtime
+        if !cache_valid {
+            // Cache miss — batched single exec fills counts for all 9 modules
+            let script = "for d in " + base + "/anima-agent " + base + "/anima-body " + base + "/anima-eeg " + base + "/anima-engines " + base + "/anima-hexad " + base + "/anima-measurement " + base + "/anima-physics " + base + "/anima-speak " + base + "/anima-tools; do n=0; if [ -d \"$d\" ]; then n=$(find \"$d\" -name '*.hexa' 2>/dev/null | wc -l | tr -d ' '); fi; b=$(basename \"$d\"); echo \"${b#anima-}:$n\"; done"
+            let batch_out = exec(script)
+            write_file(cache_path, base_mtime + "\n" + batch_out)
+            cache_lines = (base_mtime + "\n" + batch_out).split("\n")
+        }
+        // Build name -> count lookup from cache_lines[1..]
         i = 0
         while i < ext_mods.len() {
             let name = ext_mods[i]
             let dir = base + "/anima-" + name
             let installed = file_exists(dir)
             let status = if installed { "installed" } else { "not installed" }
-            let count = if installed { exec("find " + dir + " -name '*.hexa' 2>/dev/null | wc -l") } else { "0" }
+            // scan cache_lines for "name:count" (starts at index 1, skip header)
+            let count = "0"
+            let j = 1
+            while j < cache_lines.len() {
+                let kv = cache_lines[j].split(":")
+                if kv.len() == 2 && kv[0] == name {
+                    count = kv[1]
+                    j = cache_lines.len()
+                }
+                j = j + 1
+            }
             println("  " + name + "    [" + status + "]  anima-" + name + "/ (" + count + " .hexa)")
             i = i + 1
         }
