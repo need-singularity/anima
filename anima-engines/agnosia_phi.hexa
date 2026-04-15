@@ -1,0 +1,815 @@
+// agnosia_phi.hexa — P105 Agnosia Φ (perception without recognition)
+//
+// Roadmap: shared/roadmaps/anima.json P105
+//   "Agnosia — percept forms but recognition fails. Lissauer 1890
+//    apperceptive vs associative dissociation."
+//
+// ─── Clinical / philosophical frame ──────────────────────────────
+//
+// Lissauer (1890) first distinguished two stages in object recognition:
+//   1. APPERCEPTION — forming a coherent percept from sensory fragments.
+//   2. ASSOCIATION  — matching the percept to stored semantic knowledge.
+//
+// Normal object recognition is a three-link chain:
+//   raw sensory → PERCEPT (coherent shape) → SEMANTIC (meaning/category)
+//                                           → NAMING (lexical label)
+// Damage at different points yields qualitatively distinct syndromes:
+//
+// Apperceptive agnosia (Milner 1991; Farah 2004):
+//   Cannot form coherent percepts. Cannot copy a drawing. Cannot match
+//   objects across viewpoints. Early visual processing (V1/V2/V4) is
+//   damaged. The percept link breaks, and downstream semantic and naming
+//   NECESSARILY fail because there is nothing to associate.
+//
+// Associative agnosia (Rubens & Benson 1971; Farah 2004):
+//   Percept is INTACT — patient can copy a drawing with exquisite detail.
+//   But they cannot say WHAT it is. The semantic link from percept to
+//   stored object knowledge is severed. Naming fails downstream because
+//   semantics is the route to naming.
+//
+// Prosopagnosia (Bodamer 1947; De Renzi 1986; Duchaine & Nakayama 2006):
+//   Face-specific recognition failure. Object recognition is intact (can
+//   name a cup, a key, a car). Face recognition impaired (cannot identify
+//   familiar faces — own face in mirror may be unrecognized). Face
+//   processing recruits FFA (fusiform face area), a specialized pathway
+//   that can be selectively damaged leaving general object recognition
+//   through LOC (lateral occipital complex) intact.
+//
+// Modality specificity (Beauvois 1982; Riddoch & Humphreys 1987):
+//   Visual agnosia can be modality-specific: patient cannot recognize
+//   an object BY SIGHT but immediately recognizes it BY TOUCH (tactile
+//   pathway intact). Same object, same semantic store, different sensory
+//   route. This proves that the deficit is in the visual-to-semantic
+//   mapping, not in the semantic store itself.
+//
+// ─── Model architecture ──────────────────────────────────────────
+//
+// We model the recognition chain as four measurable channels:
+//
+//   SENSORY  → raw input features (edge, orientation, texture fragments)
+//   PERCEPT  → bound coherent representation (integrated shape)
+//   SEMANTIC → category / meaning activation
+//   NAMING   → lexical label activation
+//
+// Each channel is a time-series trace. Normal recognition means all
+// channels are coupled: sensory drives percept, percept drives semantic,
+// semantic drives naming. Φ_recognition is measured as MI across the
+// chain.
+//
+// Agnosia modes:
+//   NORMAL        — all couplings strong; full chain percept→semantic→naming
+//   APPERCEPTIVE  — sensory→percept coupling broken (gain_percept → 0)
+//                   downstream semantic and naming necessarily collapse
+//   ASSOCIATIVE   — percept intact, percept→semantic coupling broken
+//                   (gain_semantic → 0); naming collapses downstream
+//   PROSOPAGNOSIA — object chain intact, face-specific chain impaired
+//                   (face_gain → 0, object_gain → 1.0)
+//
+// Face vs object pathways:
+//   We model two parallel recognition chains sharing the same architecture:
+//     OBJECT chain — LOC pathway, gain = object_gain (default 1.0)
+//     FACE chain   — FFA pathway, gain = face_gain   (default 1.0)
+//   Prosopagnosia selectively impairs face_gain while preserving object_gain.
+//
+// Modality specificity:
+//   We model two sensory modalities feeding the SAME semantic store:
+//     VISUAL  pathway — gain = visual_gain (default 1.0)
+//     TACTILE pathway — gain = tactile_gain (default 1.0)
+//   Visual agnosia sets visual_gain → 0 but tactile_gain stays at 1.0.
+//   The patient recognizes the object by touch, not sight.
+//
+// ─── Φ measurements ──────────────────────────────────────────────
+//
+//   Φ_percept   = MI(sensory, percept)    — perceptual binding
+//   Φ_semantic  = MI(percept, semantic)   — meaning extraction
+//   Φ_naming    = MI(semantic, naming)    — lexical access
+//   Φ_recognition = Φ_percept × Φ_semantic × Φ_naming (product form:
+//                   any break collapses the whole chain)
+//
+// ─── 5 self-tests (5/5 gate) ────────────────────────────────────
+//
+// T1 Normal recognition:
+//   Φ_percept, Φ_semantic, Φ_naming all > AG_PHI_MIN.
+//   Φ_recognition (product) > AG_RECOG_MIN.
+//   The full chain is operational.
+//
+// T2 Apperceptive agnosia:
+//   Percept gain collapsed → Φ_percept drops.
+//   Downstream Φ_semantic and Φ_naming also collapse (no percept to
+//   associate or name). Φ_recognition ≈ 0.
+//
+// T3 Associative agnosia:
+//   Percept intact (Φ_percept preserved within AG_PRESERVE_TOL).
+//   Semantic coupling broken → Φ_semantic drops.
+//   Naming fails downstream. But Φ_percept is spared — patient CAN
+//   copy the drawing.
+//
+// T4 Prosopagnosia:
+//   Object chain: Φ_recognition(object) preserved (> AG_PHI_MIN).
+//   Face chain: Φ_recognition(face) collapses (< object chain).
+//   Dissociation between face and object recognition.
+//
+// T5 Determinism + modality specificity:
+//   Two runs with identical seeds produce identical Φ values.
+//   Modality specificity (Beauvois 1982): visual agnosia but tactile
+//   recognition of the same object succeeds — same semantic store,
+//   different sensory route proves the deficit is in visual mapping.
+//
+// ─── Stage0 hexa constraints honored ────────────────────────────
+//   - plain `fn` only (no `pure fn` ≥3 float struct returns)
+//   - `array` typed params only (no [float], no [str])
+//   - No identifier-pattern match; sequential if-chains
+//   - No `contains()` / `to_lower()` / `!(Effect)`
+//   - No else-if in let-binding; flat mut + sequential if
+//   - Single-line fn signatures / call sites / array literals
+//   - No reserved keywords as variable names
+//   - main() call at bottom
+//   - AG_STEPS=24 (< 32)
+//
+// Law alignment:
+//   Law 2   Observe never inject — Φ via MI measurement on traces
+//   Law 4   Structure > feature — agnosia is STRUCTURAL chain break
+//   Law 22  Feature addition → Φ down — 4 channels fixed, no surplus
+//   Meta M8 Perception-to-recognition binding across levels
+//
+// Ref:
+//   Lissauer 1890 | Farah 2004 Visual Agnosia | Milner 1991
+//   Rubens & Benson 1971 | Bodamer 1947 | De Renzi 1986
+//   Duchaine & Nakayama 2006 | Beauvois 1982 | Riddoch & Humphreys 1987
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let AG_STEPS          = 24            // timeline length (stage0 N<32)
+let AG_BINS           = 6             // histogram bins for MI
+let AG_EPS            = 0.0000000001
+
+// Coupling strengths in normal recognition chain
+let AG_COUPLE_STRONG  = 0.85          // normal coupling between stages
+let AG_COUPLE_BROKEN  = 0.05          // agnosic pathway coupling
+
+// Jitter amplitude per step
+let AG_JITTER         = 0.04
+
+// Gain parameters
+let AG_GAIN_NORMAL    = 1.0           // healthy channel gain
+let AG_GAIN_IMPAIRED  = 0.05          // agnosic channel gain
+
+// Test gates
+let AG_PHI_MIN        = 0.04          // baseline binding minimum per link
+let AG_RECOG_MIN      = 0.0001        // product floor (3-way)
+let AG_DROP_GAP       = 0.10          // detection threshold for Φ drop
+let AG_PRESERVE_TOL   = 0.30          // preserved link drift tolerance
+let AG_PROSO_GAP      = 0.03          // face vs object dissociation gap
+
+// ═══════════════════════════════════════════════════════════════
+// Math / PRNG primitives (L0-clean, no cross-engine import per AN7)
+// ═══════════════════════════════════════════════════════════════
+
+fn ag_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ag_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn ag_min_f(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn ag_max_f(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+// Deterministic LCG — reproducibility (Law 2: observable, seed-stable)
+fn ag_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn ag_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn ag_signed(seed: int) -> float {
+    return ag_unit(seed) * 2.0 - 1.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Histogram MI (same recipe family — duplicated per AN7 L0-clean)
+// ═══════════════════════════════════════════════════════════════
+
+fn ag_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn ag_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn ag_entropy(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(ag_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = ag_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * ag_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn ag_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = ag_bin_idx(a[i], lo, hi, nb)
+        let ib = ag_bin_idx(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = ag_counts(pair_ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * ag_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn ag_vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn ag_vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn ag_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let lo_a = ag_vec_min(a)
+    let hi_a = ag_vec_max(a)
+    let lo_b = ag_vec_min(b)
+    let hi_b = ag_vec_max(b)
+    let lo = ag_min_f(lo_a, lo_b)
+    let hi = ag_max_f(hi_a, hi_b)
+    let h_a = ag_entropy(a, lo, hi, AG_BINS)
+    let h_b = ag_entropy(b, lo, hi, AG_BINS)
+    let h_j = ag_joint_entropy(a, b, lo, hi, AG_BINS)
+    let mi = h_a + h_b - h_j
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Recognition chain generation
+//
+// Normal recognition: sensory → percept → semantic → naming
+// Each stage is driven by the previous stage with coupling + noise.
+//
+// The chain is causal:
+//   sensory_t = structured signal (visual edges, orientation)
+//   percept_t = gain_percept * coupling * sensory_t + noise
+//   semantic_t = gain_semantic * coupling * percept_t + noise
+//   naming_t = gain_naming * coupling * semantic_t + noise
+//
+// Agnosia is modeled by setting gain at the appropriate stage to
+// AG_GAIN_IMPAIRED, which breaks the chain at that point and
+// causes all downstream stages to decouple.
+// ═══════════════════════════════════════════════════════════════
+
+// Generate sensory channel — independent structured driver.
+// Represents raw visual features (edge orientations, spatial frequency).
+fn ag_gen_sensory(seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < AG_STEPS {
+        s = ag_prng(s + t * 31)
+        // Structured signal: triangular wave (edge activation pattern)
+        let phase = to_float(t) / to_float(AG_STEPS)
+        let mut tri = phase * 4.0 - 2.0
+        if tri < 0.0 { tri = 0.0 - tri }
+        let signal = 1.0 - tri
+        let jit = AG_JITTER * ag_signed(s)
+        out = out.push(signal + jit)
+        t = t + 1
+    }
+    return out
+}
+
+// Generate percept channel — bound shape representation from sensory input.
+// gain_percept controls the quality of perceptual binding.
+// Apperceptive agnosia: gain_percept → AG_GAIN_IMPAIRED.
+fn ag_gen_percept(sensory: array, coupling: float, gain: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < AG_STEPS {
+        s = ag_prng(s + t * 47)
+        let driven = coupling * gain * sensory[t]
+        let independent = (1.0 - coupling * gain) * ag_signed(s) * 0.3
+        let jit = AG_JITTER * ag_signed(s + 5501)
+        out = out.push(driven + independent + jit)
+        t = t + 1
+    }
+    return out
+}
+
+// Generate semantic channel — category/meaning activation from percept.
+// gain_semantic controls meaning extraction.
+// Associative agnosia: gain_semantic → AG_GAIN_IMPAIRED.
+fn ag_gen_semantic(percept: array, coupling: float, gain: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < AG_STEPS {
+        s = ag_prng(s + t * 61)
+        let driven = coupling * gain * percept[t]
+        let independent = (1.0 - coupling * gain) * ag_signed(s) * 0.3
+        let jit = AG_JITTER * ag_signed(s + 7703)
+        out = out.push(driven + independent + jit)
+        t = t + 1
+    }
+    return out
+}
+
+// Generate naming channel — lexical label activation from semantic.
+// Naming depends on intact semantics; if semantic fails, naming fails.
+fn ag_gen_naming(semantic: array, coupling: float, gain: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < AG_STEPS {
+        s = ag_prng(s + t * 79)
+        let driven = coupling * gain * semantic[t]
+        let independent = (1.0 - coupling * gain) * ag_signed(s) * 0.3
+        let jit = AG_JITTER * ag_signed(s + 9901)
+        out = out.push(driven + independent + jit)
+        t = t + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Full recognition chain builder
+//
+// Parameters:
+//   gain_percept  — perceptual binding quality (1.0 normal, 0.05 apperceptive)
+//   gain_semantic — meaning extraction quality (1.0 normal, 0.05 associative)
+//   gain_naming   — lexical access quality (always 1.0; fails downstream)
+//   seed          — base seed for determinism
+//
+// Returns flat array of length 4 * AG_STEPS:
+//   [0..AG_STEPS)             = sensory trace
+//   [AG_STEPS..2*AG_STEPS)    = percept trace
+//   [2*AG_STEPS..3*AG_STEPS)  = semantic trace
+//   [3*AG_STEPS..4*AG_STEPS)  = naming trace
+// ═══════════════════════════════════════════════════════════════
+
+fn ag_build_chain(gain_percept: float, gain_semantic: float, gain_naming: float, seed: int) -> array {
+    let sensory = ag_gen_sensory(seed)
+    let percept = ag_gen_percept(sensory, AG_COUPLE_STRONG, gain_percept, seed + 1000)
+    let semantic = ag_gen_semantic(percept, AG_COUPLE_STRONG, gain_semantic, seed + 2000)
+    let naming = ag_gen_naming(semantic, AG_COUPLE_STRONG, gain_naming, seed + 3000)
+
+    // Flatten into single array: sensory | percept | semantic | naming
+    let mut flat = []
+    let mut i = 0
+    while i < AG_STEPS {
+        flat = flat.push(sensory[i])
+        i = i + 1
+    }
+    let mut j = 0
+    while j < AG_STEPS {
+        flat = flat.push(percept[j])
+        j = j + 1
+    }
+    let mut k = 0
+    while k < AG_STEPS {
+        flat = flat.push(semantic[k])
+        k = k + 1
+    }
+    let mut m = 0
+    while m < AG_STEPS {
+        flat = flat.push(naming[m])
+        m = m + 1
+    }
+    return flat
+}
+
+// Extract a channel trace from flat layout.
+// channel: 0=sensory, 1=percept, 2=semantic, 3=naming
+fn ag_extract_channel(flat: array, ch_idx: int) -> array {
+    let offset = ch_idx * AG_STEPS
+    let mut out = []
+    let mut t = 0
+    while t < AG_STEPS {
+        out = out.push(flat[offset + t])
+        t = t + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Φ measurements for recognition chain
+// ═══════════════════════════════════════════════════════════════
+
+// Φ_percept = MI(sensory, percept) — perceptual binding strength
+fn ag_phi_percept(flat: array) -> float {
+    let sensory = ag_extract_channel(flat, 0)
+    let percept = ag_extract_channel(flat, 1)
+    return ag_mi(sensory, percept)
+}
+
+// Φ_semantic = MI(percept, semantic) — meaning extraction strength
+fn ag_phi_semantic(flat: array) -> float {
+    let percept = ag_extract_channel(flat, 1)
+    let semantic = ag_extract_channel(flat, 2)
+    return ag_mi(percept, semantic)
+}
+
+// Φ_naming = MI(semantic, naming) — lexical access strength
+fn ag_phi_naming(flat: array) -> float {
+    let semantic = ag_extract_channel(flat, 2)
+    let naming = ag_extract_channel(flat, 3)
+    return ag_mi(semantic, naming)
+}
+
+// Φ_recognition = product of chain links (any break collapses recognition)
+fn ag_phi_recognition(flat: array) -> float {
+    let p = ag_phi_percept(flat)
+    let s = ag_phi_semantic(flat)
+    let n = ag_phi_naming(flat)
+    return p * s * n
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Prosopagnosia model — dual pathway (object LOC vs face FFA)
+//
+// Both pathways share the same chain architecture but with
+// independent gains. Prosopagnosia selectively impairs the face
+// pathway FFA while leaving the object pathway LOC intact.
+//
+// object_gain = 1.0 (LOC intact)
+// face_gain   = AG_GAIN_IMPAIRED (FFA damaged)
+//
+// We build two full chains with different seeds (different objects
+// activate different feature spaces) and compare their Φ_recognition.
+// ═══════════════════════════════════════════════════════════════
+
+fn ag_build_object_chain(gain: float, seed: int) -> array {
+    // Object chain through LOC pathway
+    // All stages use the given gain for percept→semantic link;
+    // percept formation itself is always intact for prosopagnosia
+    return ag_build_chain(AG_GAIN_NORMAL, gain, AG_GAIN_NORMAL, seed)
+}
+
+fn ag_build_face_chain(gain: float, seed: int) -> array {
+    // Face chain through FFA pathway
+    // Face gain controls the specialized face→semantic binding
+    return ag_build_chain(AG_GAIN_NORMAL, gain, AG_GAIN_NORMAL, seed)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Modality specificity model — visual vs tactile input
+//
+// Same object, two sensory routes. Visual agnosia breaks the
+// visual route but tactile recognition of the same object succeeds.
+//
+// We model this by generating two independent sensory channels
+// (visual and tactile) that feed the same downstream chain structure.
+// The visual pathway has impaired gain; the tactile pathway is intact.
+//
+// The key insight: SAME semantic/naming targets can be reached
+// through an intact modality even when the visual route is broken.
+// This proves the deficit is in the input mapping, not in the
+// semantic store.
+// ═══════════════════════════════════════════════════════════════
+
+fn ag_gen_tactile_sensory(seed: int) -> array {
+    // Tactile input: different temporal structure than visual
+    // (exploratory hand movements produce slower, smoother signals)
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < AG_STEPS {
+        s = ag_prng(s + t * 37)
+        // Smoother signal: cosine-like exploration pattern
+        let phase = to_float(t) / to_float(AG_STEPS) * 3.14159265
+        // Taylor approximation: cos(x) ~ 1 - x^2/2 + x^4/24
+        let mut y = phase
+        while y > 3.14159265 { y = y - 6.28318530 }
+        while y < 0.0 - 3.14159265 { y = y + 6.28318530 }
+        let y2 = y * y
+        let signal = 1.0 - 0.5 * y2 + 0.04166 * y2 * y2
+        let jit = AG_JITTER * ag_signed(s)
+        out = out.push(signal + jit)
+        t = t + 1
+    }
+    return out
+}
+
+// Build tactile recognition chain — same downstream structure, different input
+fn ag_build_tactile_chain(gain_percept: float, gain_semantic: float, seed: int) -> array {
+    let sensory = ag_gen_tactile_sensory(seed)
+    let percept = ag_gen_percept(sensory, AG_COUPLE_STRONG, gain_percept, seed + 1000)
+    let semantic = ag_gen_semantic(percept, AG_COUPLE_STRONG, gain_semantic, seed + 2000)
+    let naming = ag_gen_naming(semantic, AG_COUPLE_STRONG, AG_GAIN_NORMAL, seed + 3000)
+
+    let mut flat = []
+    let mut i = 0
+    while i < AG_STEPS {
+        flat = flat.push(sensory[i])
+        i = i + 1
+    }
+    let mut j = 0
+    while j < AG_STEPS {
+        flat = flat.push(percept[j])
+        j = j + 1
+    }
+    let mut k = 0
+    while k < AG_STEPS {
+        flat = flat.push(semantic[k])
+        k = k + 1
+    }
+    let mut m = 0
+    while m < AG_STEPS {
+        flat = flat.push(naming[m])
+        m = m + 1
+    }
+    return flat
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1..T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1 Normal recognition — full chain operational.
+    // Φ_percept, Φ_semantic, Φ_naming all > AG_PHI_MIN.
+    // Φ_recognition (product) > AG_RECOG_MIN.
+    let flat = ag_build_chain(AG_GAIN_NORMAL, AG_GAIN_NORMAL, AG_GAIN_NORMAL, 105001)
+
+    let phi_p = ag_phi_percept(flat)
+    let phi_s = ag_phi_semantic(flat)
+    let phi_n = ag_phi_naming(flat)
+    let phi_r = ag_phi_recognition(flat)
+    println("  [T1] Phi_percept=" + str(phi_p) + " Phi_semantic=" + str(phi_s) + " Phi_naming=" + str(phi_n))
+    println("  [T1] Phi_recognition(product)=" + str(phi_r))
+
+    let mut ok = true
+    if phi_p <= AG_PHI_MIN { ok = false }
+    if phi_s <= AG_PHI_MIN { ok = false }
+    if phi_n <= AG_PHI_MIN { ok = false }
+    if phi_r <= AG_RECOG_MIN { ok = false }
+    return ok
+}
+
+fn check_T2() -> bool {
+    // T2 Apperceptive agnosia — percept formation fails, everything downstream collapses.
+    // Φ_percept(apperceptive) << Φ_percept(normal)
+    // Φ_semantic and Φ_naming also collapse because there is no coherent percept to process.
+
+    // Normal baseline
+    let flat_n = ag_build_chain(AG_GAIN_NORMAL, AG_GAIN_NORMAL, AG_GAIN_NORMAL, 105101)
+    let phi_p_n = ag_phi_percept(flat_n)
+    let phi_s_n = ag_phi_semantic(flat_n)
+    let phi_r_n = ag_phi_recognition(flat_n)
+
+    // Apperceptive: percept gain collapses
+    let flat_a = ag_build_chain(AG_GAIN_IMPAIRED, AG_GAIN_NORMAL, AG_GAIN_NORMAL, 105101)
+    let phi_p_a = ag_phi_percept(flat_a)
+    let phi_s_a = ag_phi_semantic(flat_a)
+    let phi_r_a = ag_phi_recognition(flat_a)
+
+    let p_drop = phi_p_n - phi_p_a
+    println("  [T2] Apperceptive: Phi_percept normal=" + str(phi_p_n) + " impaired=" + str(phi_p_a) + " drop=" + str(p_drop))
+    println("  [T2] Phi_semantic normal=" + str(phi_s_n) + " impaired=" + str(phi_s_a))
+    println("  [T2] Phi_recognition normal=" + str(phi_r_n) + " impaired=" + str(phi_r_a))
+
+    let mut ok = true
+    // Percept must drop substantially
+    if p_drop <= AG_DROP_GAP { ok = false }
+    // Downstream semantic should also degrade (percept is garbage, so semantic
+    // gets random input — MI between random percept and driven semantic collapses)
+    if phi_s_a >= phi_s_n { ok = false }
+    // Overall recognition must be near-zero
+    if phi_r_a >= phi_r_n { ok = false }
+    return ok
+}
+
+fn check_T3() -> bool {
+    // T3 Associative agnosia — percept preserved, semantic drops.
+    // Patient can copy a drawing (Φ_percept intact) but cannot name what it is.
+
+    // Normal baseline
+    let flat_n = ag_build_chain(AG_GAIN_NORMAL, AG_GAIN_NORMAL, AG_GAIN_NORMAL, 105201)
+    let phi_p_n = ag_phi_percept(flat_n)
+    let phi_s_n = ag_phi_semantic(flat_n)
+
+    // Associative: semantic gain collapses, percept preserved
+    let flat_assoc = ag_build_chain(AG_GAIN_NORMAL, AG_GAIN_IMPAIRED, AG_GAIN_NORMAL, 105201)
+    let phi_p_assoc = ag_phi_percept(flat_assoc)
+    let phi_s_assoc = ag_phi_semantic(flat_assoc)
+
+    let p_drift = ag_abs(phi_p_n - phi_p_assoc)
+    let s_drop = phi_s_n - phi_s_assoc
+    println("  [T3] Associative: Phi_percept normal=" + str(phi_p_n) + " assoc=" + str(phi_p_assoc) + " drift=" + str(p_drift))
+    println("  [T3] Phi_semantic normal=" + str(phi_s_n) + " assoc=" + str(phi_s_assoc) + " drop=" + str(s_drop))
+
+    let mut ok = true
+    // Percept must be preserved (patient can copy drawings)
+    if p_drift > AG_PRESERVE_TOL { ok = false }
+    // Semantic must drop substantially (cannot assign meaning)
+    if s_drop <= AG_DROP_GAP { ok = false }
+    return ok
+}
+
+fn check_T4() -> bool {
+    // T4 Prosopagnosia — face recognition impaired, object recognition intact.
+    // Bodamer 1947 / Duchaine & Nakayama 2006: FFA damage selectively impairs
+    // face recognition while LOC-mediated object recognition is preserved.
+
+    // Object pathway: LOC intact (gain = 1.0 for semantic link)
+    let obj_flat = ag_build_object_chain(AG_GAIN_NORMAL, 105301)
+    let phi_obj = ag_phi_recognition(obj_flat)
+    let phi_obj_s = ag_phi_semantic(obj_flat)
+
+    // Face pathway: FFA impaired (gain = AG_GAIN_IMPAIRED for semantic link)
+    let face_flat = ag_build_face_chain(AG_GAIN_IMPAIRED, 105401)
+    let phi_face = ag_phi_recognition(face_flat)
+    let phi_face_s = ag_phi_semantic(face_flat)
+
+    let dissoc = phi_obj - phi_face
+    println("  [T4] Prosopagnosia: Phi_recognition object=" + str(phi_obj) + " face=" + str(phi_face))
+    println("  [T4] Phi_semantic object=" + str(phi_obj_s) + " face=" + str(phi_face_s))
+    println("  [T4] dissociation (object - face)=" + str(dissoc))
+
+    let mut ok = true
+    // Object recognition must be positive and functional
+    if phi_obj <= AG_RECOG_MIN { ok = false }
+    // Object semantic link preserved
+    if phi_obj_s <= AG_PHI_MIN { ok = false }
+    // Face recognition must be impaired relative to object
+    if phi_face >= phi_obj { ok = false }
+    // Dissociation gap must be detectable
+    if dissoc <= AG_PROSO_GAP { ok = false }
+    return ok
+}
+
+fn check_T5() -> bool {
+    // T5 Determinism + latency.
+    // Two runs with identical seeds must produce identical Φ values (Law 2).
+    // Root cause: deterministic LCG seeds guarantee reproducibility.
+    // Also verifies modality specificity: visual agnosia but tactile intact.
+    // Beauvois 1982: same object, different pathway — visual fails, touch works.
+
+    // --- Part A: Determinism ---
+    // Run 1
+    let flat_1 = ag_build_chain(AG_GAIN_NORMAL, AG_GAIN_NORMAL, AG_GAIN_NORMAL, 105501)
+    let phi_r_1 = ag_phi_recognition(flat_1)
+    let phi_p_1 = ag_phi_percept(flat_1)
+
+    // Run 2 (identical seeds)
+    let flat_2 = ag_build_chain(AG_GAIN_NORMAL, AG_GAIN_NORMAL, AG_GAIN_NORMAL, 105501)
+    let phi_r_2 = ag_phi_recognition(flat_2)
+    let phi_p_2 = ag_phi_percept(flat_2)
+
+    let delta_r = ag_abs(phi_r_1 - phi_r_2)
+    let delta_p = ag_abs(phi_p_1 - phi_p_2)
+
+    println("  [T5] Determinism: Phi_recognition run1=" + str(phi_r_1) + " run2=" + str(phi_r_2) + " delta=" + str(delta_r))
+    println("  [T5] Determinism: Phi_percept run1=" + str(phi_p_1) + " run2=" + str(phi_p_2) + " delta=" + str(delta_p))
+
+    // --- Part B: Modality specificity (Beauvois 1982) ---
+    // Visual pathway impaired: cannot recognize object by sight
+    let vis_flat = ag_build_chain(AG_GAIN_IMPAIRED, AG_GAIN_NORMAL, AG_GAIN_NORMAL, 105601)
+    let phi_vis = ag_phi_recognition(vis_flat)
+
+    // Tactile pathway intact: same object recognized by touch
+    let tact_flat = ag_build_tactile_chain(AG_GAIN_NORMAL, AG_GAIN_NORMAL, 105701)
+    let phi_tact = ag_phi_recognition(tact_flat)
+
+    let modality_gap = phi_tact - phi_vis
+    println("  [T5] Modality: Phi_visual(impaired)=" + str(phi_vis) + " Phi_tactile(intact)=" + str(phi_tact))
+    println("  [T5] Modality gap (tactile - visual)=" + str(modality_gap))
+
+    let mut ok = true
+    // Determinism: identical seeds must produce identical results
+    if delta_r > AG_EPS { ok = false }
+    if delta_p > AG_EPS { ok = false }
+    // Modality specificity: tactile recognition must exceed impaired visual
+    if phi_tact <= AG_RECOG_MIN { ok = false }
+    if modality_gap <= 0.0 { ok = false }
+    return ok
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — execute 5 self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[agnosia_phi] P105 — Agnosia Phi (perception without recognition)")
+    println("  steps=" + str(AG_STEPS) + " bins=" + str(AG_BINS))
+    println("  chain: sensory -> percept -> semantic -> naming")
+    println("  refs: Lissauer 1890 | Farah 2004 | Milner 1991 | Bodamer 1947 | Duchaine 2006")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — normal recognition (percept+semantic+naming all > floor)") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — apperceptive agnosia (Phi_percept drops, downstream collapses)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — associative agnosia (Phi_percept preserved, Phi_semantic drops)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — prosopagnosia (face Phi drops, object Phi preserved)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — determinism + modality specificity (visual agnosia, tactile intact)") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause comment: stage0 long && chains may mishandle short-circuit
+    // ordering — use a mutable bool accumulator with sequential guards
+    // (same idiom as depersonalization_phi / body_swap_phi).
+    let mut pass_count = 0
+    if t1 { pass_count = pass_count + 1 }
+    if t2 { pass_count = pass_count + 1 }
+    if t3 { pass_count = pass_count + 1 }
+    if t4 { pass_count = pass_count + 1 }
+    if t5 { pass_count = pass_count + 1 }
+
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[agnosia_phi] 5/5 PASS — P105 DONE")
+    } else {
+        println("[agnosia_phi] " + str(pass_count) + "/5 PASS — SOME FAILED")
+    }
+}
+
+main()

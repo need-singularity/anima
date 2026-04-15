@@ -1,0 +1,786 @@
+// apraxia_phi.hexa — P104 Apraxia Φ
+//
+// Roadmap: shared/roadmaps/anima.json P104
+//   "Apraxia — motor planning dissociation (Liepmann 1900). Knowledge
+//    of action preserved but execution impaired. Conceptual vs
+//    production system separation; automatic-voluntary dissociation."
+//
+// ─── Scientific reference ──────────────────────────────────────────
+//
+// Liepmann 1900: apraxia is a disorder of the COGNITIVE ARCHITECTURE
+// of action, not motor weakness. Muscles/senses intact, but the bridge
+// between knowing WHAT and executing HOW is broken at specific seams.
+//
+// Rothi, Ochipa & Heilman 1991 (Cognitive Neuropsychological Model):
+//   CONCEPTUAL SYSTEM — semantic knowledge (tool function, sequences)
+//   PRODUCTION SYSTEM — sensorimotor programs (grip, trajectory, force)
+//   DIRECT ROUTE — affordance-driven, bypasses conceptual mediation
+//
+// Ideational (De Renzi & Lucchelli 1988): conceptual lost, sequence
+//   errors, wrong tool selection. Production of individual moves OK.
+// Ideomotor (Geschwind 1975): conceptual intact, production impaired
+//   on command; spontaneous use in context better (affordance bypass).
+// Constructional (Kleist 1934): visuospatial assembly impaired.
+// Automatic-voluntary dissociation (Liepmann 1900): spontaneous OK,
+//   commanded fails — the mode of triggering determines success.
+//
+// ─── Model architecture ───────────────────────────────────────────
+//
+// CONCEPTUAL STREAM (K_CON channels): action semantics (tool, sequence, goal)
+// PRODUCTION STREAM (K_PRD channels): motor programs (grip, trajectory, force)
+//   Two modes: COMMANDED (voluntary) vs SPONTANEOUS (automatic/affordance)
+// SPATIAL STREAM (K_SPA channels): visuospatial assembly (constructional)
+//
+// Φ_motor = Φ_conceptual * Φ_production (both needed for skilled action)
+//
+// ─── 5 self-tests (5/5 gate) ──────────────────────────────────────
+//
+// T1 Normal — Φ_conceptual and Φ_production both > AP_PHI_MIN
+// T2 Ideational — Φ_conceptual drops, sequence structure collapses
+// T3 Ideomotor — Φ_conceptual preserved, Φ_production(cmd) drops
+// T4 Auto-voluntary dissociation — spontaneous > commanded + gap
+// T5 Determinism + latency < 5000ms
+//
+// Stage0 constraints: plain fn, typed array, no identifier match,
+//   no multi-line sig/call, single-line returns, N<32, main() at bottom.
+// Laws: L2 observe-only, L4 structure>feature, L22 no explosion,
+//   L29 no speak(), M8 embodied, AN7 standalone.
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+// State IDs — motor execution regimes
+let ST_NORMAL       = 0    // healthy: conceptual + production both intact
+let ST_IDEATIONAL   = 1    // conceptual system damaged
+let ST_IDEOMOTOR    = 2    // production system damaged (command route)
+let ST_CONSTRUCT    = 3    // spatial assembly specifically impaired
+
+// Motor execution modes
+let MODE_COMMANDED   = 0   // voluntary: verbal instruction triggers action
+let MODE_SPONTANEOUS = 1   // automatic: affordance/context triggers action
+
+// Tape dimensions — stage0 envelope: keep small
+let AP_K_CON   = 4     // conceptual stream channels
+let AP_K_PRD   = 4     // production stream channels
+let AP_K_SPA   = 3     // spatial assembly sub-channels (constructional)
+let AP_WIN     = 24    // time window per channel
+let AP_BINS    = 4     // histogram bins for MI
+
+// Thresholds
+let AP_EPS          = 0.0000000001
+let AP_PHI_MIN      = 0.05    // minimum Φ for "intact" stream
+let AP_CONCEPT_GAP  = 0.15    // ideational: conceptual must drop by this
+let AP_PROD_GAP     = 0.10    // ideomotor: production must drop by this
+let AP_PRESERVE_TOL = 0.15    // preserved channel must be within this of normal
+let AP_DISSOC_GAP   = 0.05    // spontaneous must exceed commanded by this
+let AP_SPATIAL_GAP  = 0.10    // constructional: spatial must drop by this
+
+// ═══════════════════════════════════════════════════════════════
+// PRNG + math helpers (ap_ prefix to avoid clashes)
+// ═══════════════════════════════════════════════════════════════
+
+fn ap_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn ap_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn ap_signed(seed: int) -> float {
+    return ap_unit(seed) * 2.0 - 1.0
+}
+
+fn ap_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ap_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+// Taylor sin approximation (same approach as peer engines).
+fn ap_osc(phase: float) -> float {
+    let two_pi = 6.2831853
+    let pi = 3.1415927
+    let mut p = phase
+    while p > pi { p = p - two_pi }
+    while p < 0.0 - pi { p = p + two_pi }
+    if p > 1.5707963 { p = pi - p }
+    if p < 0.0 - 1.5707963 { p = 0.0 - pi - p }
+    let p2 = p * p
+    let p3 = p2 * p
+    let p5 = p3 * p2
+    return p - 0.16666667 * p3 + 0.00833333 * p5
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Histogram MI (Miller-Madow corrected)
+// ═══════════════════════════════════════════════════════════════
+
+fn ap_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn ap_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn ap_entropy(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(ap_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = ap_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * ap_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn ap_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        let ia = ap_bin_idx(a[i], lo, hi, nb)
+        let ib = ap_bin_idx(b[i], lo, hi, nb)
+        ids = ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = ap_counts(ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * ap_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+// MI with Miller-Madow bias correction.
+fn ap_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let mut lo = a[0]
+    let mut hi = a[0]
+    let mut i = 0
+    while i < n {
+        if a[i] < lo { lo = a[i] }
+        if a[i] > hi { hi = a[i] }
+        if b[i] < lo { lo = b[i] }
+        if b[i] > hi { hi = b[i] }
+        i = i + 1
+    }
+    let ha = ap_entropy(a, lo, hi, AP_BINS)
+    let hb = ap_entropy(b, lo, hi, AP_BINS)
+    let hj = ap_joint_entropy(a, b, lo, hi, AP_BINS)
+    let mi_raw = ha + hb - hj
+    let bf = to_float(AP_BINS - 1)
+    let bias = (bf * bf) / (2.0 * to_float(n))
+    let mi = mi_raw - bias
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Channel extraction + Φ over a multi-channel tape
+// ═══════════════════════════════════════════════════════════════
+
+fn ap_extract_channel(tape: array, k: int, win: int) -> array {
+    let mut out = []
+    let mut t = 0
+    while t < win {
+        out = out.push(tape[k * win + t])
+        t = t + 1
+    }
+    return out
+}
+
+// Average pairwise MI across all channel pairs.
+fn ap_phi_tape(tape: array, k_chan: int, win: int) -> float {
+    let mut total = 0.0
+    let mut pairs = 0
+    let mut i = 0
+    while i < (k_chan - 1) {
+        let ci = ap_extract_channel(tape, i, win)
+        let mut j = i + 1
+        while j < k_chan {
+            let cj = ap_extract_channel(tape, j, win)
+            total = total + ap_mi(ci, cj)
+            pairs = pairs + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if pairs == 0 { return 0.0 }
+    return total / to_float(pairs)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// State/mode names
+// ═══════════════════════════════════════════════════════════════
+
+fn ap_state_name(s: int) -> string {
+    if s == 0 { return "NORMAL" }
+    if s == 1 { return "IDEATIONAL" }
+    if s == 2 { return "IDEOMOTOR" }
+    if s == 3 { return "CONSTRUCTIONAL" }
+    return "UNKNOWN"
+}
+
+fn ap_mode_name(m: int) -> string {
+    if m == 0 { return "COMMANDED" }
+    if m == 1 { return "SPONTANEOUS" }
+    return "UNKNOWN"
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Conceptual stream — semantic knowledge of actions
+// Collapses in ideational apraxia; preserved in ideomotor.
+// ═══════════════════════════════════════════════════════════════
+
+fn ap_concept_coupling(state: int) -> float {
+    if state == ST_NORMAL { return 0.90 }
+    if state == ST_IDEATIONAL { return 0.08 }
+    if state == ST_IDEOMOTOR { return 0.88 }
+    if state == ST_CONSTRUCT { return 0.85 }
+    return 0.50
+}
+
+fn ap_concept_amplitude(state: int) -> float {
+    if state == ST_NORMAL { return 1.00 }
+    if state == ST_IDEATIONAL { return 0.20 }
+    if state == ST_IDEOMOTOR { return 0.95 }
+    if state == ST_CONSTRUCT { return 0.90 }
+    return 0.50
+}
+
+fn ap_concept_noise(state: int) -> float {
+    if state == ST_NORMAL { return 0.12 }
+    if state == ST_IDEATIONAL { return 2.80 }
+    if state == ST_IDEOMOTOR { return 0.15 }
+    if state == ST_CONSTRUCT { return 0.20 }
+    return 0.50
+}
+
+// Generate conceptual tape: shared driver + idio + noise.
+fn ap_gen_conceptual(state: int, seed: int) -> array {
+    let coupling = ap_concept_coupling(state)
+    let amp = ap_concept_amplitude(state)
+    let noise = ap_concept_noise(state)
+    let mut flat = []
+    let mut s = seed
+    let mut k = 0
+    while k < AP_K_CON {
+        let mut t = 0
+        while t < AP_WIN {
+            s = ap_prng(s + k * 211 + t * 31)
+            let shared_phase = 0.55 * to_float(t)
+            let shared = 2.0 * coupling * amp * ap_osc(shared_phase)
+            let idio_phase = 0.91 * to_float(t) + 1.63 * to_float(k)
+            let idio = 0.25 * amp * ap_osc(idio_phase)
+            let indep = noise * ap_signed(s)
+            flat = flat.push(shared + idio + indep)
+            t = t + 1
+        }
+        k = k + 1
+    }
+    return flat
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Production stream — motor execution (grip, trajectory, force)
+// Two modes: COMMANDED (voluntary, full pipeline) vs SPONTANEOUS
+// (automatic, direct affordance route — bypasses damaged production).
+// ═══════════════════════════════════════════════════════════════
+
+fn ap_prod_coupling(state: int, mode: int) -> float {
+    if state == ST_NORMAL { return 0.88 }
+    if state == ST_IDEATIONAL { return 0.82 }
+    if state == ST_IDEOMOTOR {
+        if mode == MODE_COMMANDED { return 0.10 }
+        if mode == MODE_SPONTANEOUS { return 0.72 }
+        return 0.10
+    }
+    if state == ST_CONSTRUCT { return 0.80 }
+    return 0.50
+}
+
+fn ap_prod_amplitude(state: int, mode: int) -> float {
+    if state == ST_NORMAL { return 1.00 }
+    if state == ST_IDEATIONAL { return 0.90 }
+    if state == ST_IDEOMOTOR {
+        if mode == MODE_COMMANDED { return 0.25 }
+        if mode == MODE_SPONTANEOUS { return 0.85 }
+        return 0.25
+    }
+    if state == ST_CONSTRUCT { return 0.85 }
+    return 0.50
+}
+
+fn ap_prod_noise(state: int, mode: int) -> float {
+    if state == ST_NORMAL { return 0.12 }
+    if state == ST_IDEATIONAL { return 0.18 }
+    if state == ST_IDEOMOTOR {
+        if mode == MODE_COMMANDED { return 2.50 }
+        if mode == MODE_SPONTANEOUS { return 0.25 }
+        return 2.50
+    }
+    if state == ST_CONSTRUCT { return 0.20 }
+    return 0.50
+}
+
+// Generate production tape: mode controls commanded vs spontaneous.
+fn ap_gen_production(state: int, mode: int, seed: int) -> array {
+    let coupling = ap_prod_coupling(state, mode)
+    let amp = ap_prod_amplitude(state, mode)
+    let noise = ap_prod_noise(state, mode)
+    let mut flat = []
+    let mut s = seed
+    let mut k = 0
+    while k < AP_K_PRD {
+        let mut t = 0
+        while t < AP_WIN {
+            s = ap_prng(s + k * 239 + t * 37)
+            let shared_phase = 0.65 * to_float(t)
+            let shared = 2.0 * coupling * amp * ap_osc(shared_phase)
+            let idio_phase = 0.77 * to_float(t) + 2.11 * to_float(k)
+            let idio = 0.20 * amp * ap_osc(idio_phase)
+            let indep = noise * ap_signed(s)
+            flat = flat.push(shared + idio + indep)
+            t = t + 1
+        }
+        k = k + 1
+    }
+    return flat
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Spatial assembly stream — visuospatial construction
+// Collapses in constructional apraxia; basic motor execution preserved.
+// ═══════════════════════════════════════════════════════════════
+
+fn ap_spatial_coupling(state: int) -> float {
+    if state == ST_NORMAL { return 0.85 }
+    if state == ST_IDEATIONAL { return 0.75 }
+    if state == ST_IDEOMOTOR { return 0.78 }
+    if state == ST_CONSTRUCT { return 0.08 }
+    return 0.50
+}
+
+fn ap_spatial_amplitude(state: int) -> float {
+    if state == ST_NORMAL { return 1.00 }
+    if state == ST_IDEATIONAL { return 0.85 }
+    if state == ST_IDEOMOTOR { return 0.90 }
+    if state == ST_CONSTRUCT { return 0.15 }
+    return 0.50
+}
+
+fn ap_spatial_noise(state: int) -> float {
+    if state == ST_NORMAL { return 0.15 }
+    if state == ST_IDEATIONAL { return 0.25 }
+    if state == ST_IDEOMOTOR { return 0.20 }
+    if state == ST_CONSTRUCT { return 3.00 }
+    return 0.50
+}
+
+fn ap_gen_spatial(state: int, seed: int) -> array {
+    let coupling = ap_spatial_coupling(state)
+    let amp = ap_spatial_amplitude(state)
+    let noise = ap_spatial_noise(state)
+    let mut flat = []
+    let mut s = seed
+    let mut k = 0
+    while k < AP_K_SPA {
+        let mut t = 0
+        while t < AP_WIN {
+            s = ap_prng(s + k * 257 + t * 43)
+            let shared_phase = 0.50 * to_float(t)
+            let shared = 2.0 * coupling * amp * ap_osc(shared_phase)
+            let idio_phase = 0.69 * to_float(t) + 1.93 * to_float(k)
+            let idio = 0.22 * amp * ap_osc(idio_phase)
+            let indep = noise * ap_signed(s)
+            flat = flat.push(shared + idio + indep)
+            t = t + 1
+        }
+        k = k + 1
+    }
+    return flat
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Φ wrappers
+// ═══════════════════════════════════════════════════════════════
+
+fn ap_phi_conceptual(tape: array) -> float { return ap_phi_tape(tape, AP_K_CON, AP_WIN) }
+fn ap_phi_production(tape: array) -> float { return ap_phi_tape(tape, AP_K_PRD, AP_WIN) }
+fn ap_phi_spatial(tape: array) -> float { return ap_phi_tape(tape, AP_K_SPA, AP_WIN) }
+fn ap_phi_motor(phi_con: float, phi_prd: float) -> float { return phi_con * phi_prd }
+
+// ═══════════════════════════════════════════════════════════════
+// Sequence error detector — temporal autocorrelation
+// High = organized sequence; low = ideational sequence breakdown.
+// ═══════════════════════════════════════════════════════════════
+
+fn ap_autocorrelation(tape: array, k: int, win: int, lag: int) -> float {
+    // Autocorrelation at given lag for channel k
+    let ch = ap_extract_channel(tape, k, win)
+    let n = len(ch)
+    if n <= lag { return 0.0 }
+    // Compute mean
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        sum = sum + ch[i]
+        i = i + 1
+    }
+    let mean = sum / to_float(n)
+    // Compute autocorrelation
+    let mut num = 0.0
+    let mut den = 0.0
+    i = 0
+    while i < n {
+        let d = ch[i] - mean
+        den = den + d * d
+        if i < n - lag {
+            let d2 = ch[i + lag] - mean
+            num = num + d * d2
+        }
+        i = i + 1
+    }
+    if den < AP_EPS { return 0.0 }
+    return num / den
+}
+
+// Average lag-1 autocorrelation across channels.
+fn ap_sequence_structure(tape: array, k_chan: int, win: int) -> float {
+    let mut total = 0.0
+    let mut k = 0
+    while k < k_chan {
+        let ac = ap_autocorrelation(tape, k, win, 1)
+        total = total + ac
+        k = k + 1
+    }
+    return total / to_float(k_chan)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Diagnostic helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn ap_print_state_header(label: string) {
+    println("  --- " + label + " ---")
+}
+
+fn ap_print_phi(label: string, val: float) {
+    println("  " + label + " = " + str(val))
+}
+
+fn ap_print_comparison(label: string, val: float, threshold: float, op: string) {
+    println("  " + label + " = " + str(val) + "  (need " + op + " " + str(threshold) + ")")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// T1: Normal motor execution — both systems intact
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    let seed = 104001
+    ap_print_state_header("T1: Normal motor execution")
+
+    // Generate both streams in normal state
+    let con_tape = ap_gen_conceptual(ST_NORMAL, seed + 11)
+    let prd_tape = ap_gen_production(ST_NORMAL, MODE_COMMANDED, seed + 22)
+    let spa_tape = ap_gen_spatial(ST_NORMAL, seed + 33)
+
+    let phi_con = ap_phi_conceptual(con_tape)
+    let phi_prd = ap_phi_production(prd_tape)
+    let phi_spa = ap_phi_spatial(spa_tape)
+    let phi_mot = ap_phi_motor(phi_con, phi_prd)
+
+    ap_print_comparison("Φ_conceptual", phi_con, AP_PHI_MIN, ">")
+    ap_print_comparison("Φ_production", phi_prd, AP_PHI_MIN, ">")
+    ap_print_phi("Φ_spatial", phi_spa)
+    ap_print_phi("Φ_motor (con*prd)", phi_mot)
+
+    // Sequence structure should be high in normal state
+    let seq = ap_sequence_structure(con_tape, AP_K_CON, AP_WIN)
+    ap_print_phi("sequence_autocorr", seq)
+
+    if phi_con <= AP_PHI_MIN { return false }
+    if phi_prd <= AP_PHI_MIN { return false }
+    if phi_mot <= 0.0 { return false }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+// T2: Ideational apraxia — conceptual collapse + sequence errors
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T2() -> bool {
+    let seed = 104002
+    ap_print_state_header("T2: Ideational apraxia — conceptual collapse")
+
+    // Normal baseline
+    let con_normal = ap_gen_conceptual(ST_NORMAL, seed + 11)
+    let phi_con_normal = ap_phi_conceptual(con_normal)
+    let seq_normal = ap_sequence_structure(con_normal, AP_K_CON, AP_WIN)
+
+    // Ideational lesion
+    let con_ideational = ap_gen_conceptual(ST_IDEATIONAL, seed + 22)
+    let phi_con_idea = ap_phi_conceptual(con_ideational)
+    let seq_idea = ap_sequence_structure(con_ideational, AP_K_CON, AP_WIN)
+
+    // Production stream still works in ideational apraxia
+    let prd_ideational = ap_gen_production(ST_IDEATIONAL, MODE_COMMANDED, seed + 33)
+    let phi_prd_idea = ap_phi_production(prd_ideational)
+
+    let gap = phi_con_normal - phi_con_idea
+
+    ap_print_phi("Φ_con(normal)", phi_con_normal)
+    ap_print_phi("Φ_con(ideational)", phi_con_idea)
+    ap_print_comparison("gap", gap, AP_CONCEPT_GAP, ">")
+    ap_print_phi("Φ_prd(ideational)", phi_prd_idea)
+    ap_print_phi("seq_struct(normal)", seq_normal)
+    ap_print_phi("seq_struct(ideational)", seq_idea)
+
+    // Conceptual stream must collapse
+    if gap <= AP_CONCEPT_GAP { return false }
+    // Sequence structure should drop
+    if seq_idea >= seq_normal { return false }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+// T3: Ideomotor — conceptual preserved, production(cmd) impaired
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T3() -> bool {
+    let seed = 104003
+    ap_print_state_header("T3: Ideomotor apraxia — production impaired on command")
+
+    // Normal baseline
+    let con_normal = ap_gen_conceptual(ST_NORMAL, seed + 11)
+    let phi_con_normal = ap_phi_conceptual(con_normal)
+    let prd_normal = ap_gen_production(ST_NORMAL, MODE_COMMANDED, seed + 22)
+    let phi_prd_normal = ap_phi_production(prd_normal)
+
+    // Ideomotor lesion
+    let con_ideomotor = ap_gen_conceptual(ST_IDEOMOTOR, seed + 33)
+    let phi_con_ideo = ap_phi_conceptual(con_ideomotor)
+    let prd_ideomotor = ap_gen_production(ST_IDEOMOTOR, MODE_COMMANDED, seed + 44)
+    let phi_prd_ideo = ap_phi_production(prd_ideomotor)
+
+    let con_diff = ap_abs(phi_con_normal - phi_con_ideo)
+    let prd_gap = phi_prd_normal - phi_prd_ideo
+
+    ap_print_phi("Φ_con(normal)", phi_con_normal)
+    ap_print_phi("Φ_con(ideomotor)", phi_con_ideo)
+    ap_print_comparison("|Φ_con diff|", con_diff, AP_PRESERVE_TOL, "<")
+    ap_print_phi("Φ_prd_cmd(normal)", phi_prd_normal)
+    ap_print_phi("Φ_prd_cmd(ideomotor)", phi_prd_ideo)
+    ap_print_comparison("prd gap", prd_gap, AP_PROD_GAP, ">")
+
+    // Conceptual stream MUST be preserved
+    if con_diff >= AP_PRESERVE_TOL { return false }
+    // Production stream MUST drop on command
+    if prd_gap <= AP_PROD_GAP { return false }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+// T4: Automatic-voluntary dissociation + constructional spatial drop
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T4() -> bool {
+    let seed = 104004
+    ap_print_state_header("T4: Automatic-voluntary dissociation")
+
+    // Ideomotor state: commanded vs spontaneous
+    let prd_cmd = ap_gen_production(ST_IDEOMOTOR, MODE_COMMANDED, seed + 11)
+    let prd_spon = ap_gen_production(ST_IDEOMOTOR, MODE_SPONTANEOUS, seed + 22)
+
+    let phi_cmd = ap_phi_production(prd_cmd)
+    let phi_spon = ap_phi_production(prd_spon)
+    let dissoc = phi_spon - phi_cmd
+
+    ap_print_phi("Φ_prd_commanded(ideomotor)", phi_cmd)
+    ap_print_phi("Φ_prd_spontaneous(ideomotor)", phi_spon)
+    ap_print_comparison("dissociation", dissoc, AP_DISSOC_GAP, ">")
+
+    // Also show normal state has NO dissociation (both modes work)
+    let prd_norm_cmd = ap_gen_production(ST_NORMAL, MODE_COMMANDED, seed + 33)
+    let prd_norm_spon = ap_gen_production(ST_NORMAL, MODE_SPONTANEOUS, seed + 44)
+    let phi_norm_cmd = ap_phi_production(prd_norm_cmd)
+    let phi_norm_spon = ap_phi_production(prd_norm_spon)
+    let norm_diff = ap_abs(phi_norm_cmd - phi_norm_spon)
+
+    ap_print_phi("Φ_prd_cmd(normal)", phi_norm_cmd)
+    ap_print_phi("Φ_prd_spon(normal)", phi_norm_spon)
+    ap_print_phi("normal_mode_diff", norm_diff)
+
+    // Also show constructional apraxia spatial collapse
+    let spa_normal = ap_gen_spatial(ST_NORMAL, seed + 55)
+    let spa_construct = ap_gen_spatial(ST_CONSTRUCT, seed + 66)
+    let phi_spa_n = ap_phi_spatial(spa_normal)
+    let phi_spa_c = ap_phi_spatial(spa_construct)
+    let spa_gap = phi_spa_n - phi_spa_c
+
+    ap_print_phi("Φ_spatial(normal)", phi_spa_n)
+    ap_print_phi("Φ_spatial(constructional)", phi_spa_c)
+    ap_print_comparison("spatial gap", spa_gap, AP_SPATIAL_GAP, ">")
+
+    // Primary test: spontaneous > commanded in ideomotor
+    if dissoc <= AP_DISSOC_GAP { return false }
+    // Spatial assembly must collapse in constructional
+    if spa_gap <= AP_SPATIAL_GAP { return false }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+// T5: Determinism + latency < 5000ms
+// ═══════════════════════════════════════════════════════════════
+
+fn ap_full_measurement(seed: int) -> array {
+    // 8 Φ measurements for determinism check
+    let mut results = []
+
+    let con_n = ap_gen_conceptual(ST_NORMAL, seed + 1)
+    results = results.push(ap_phi_conceptual(con_n))
+    let con_i = ap_gen_conceptual(ST_IDEATIONAL, seed + 2)
+    results = results.push(ap_phi_conceptual(con_i))
+    let prd_nc = ap_gen_production(ST_NORMAL, MODE_COMMANDED, seed + 3)
+    results = results.push(ap_phi_production(prd_nc))
+    let prd_ic = ap_gen_production(ST_IDEOMOTOR, MODE_COMMANDED, seed + 4)
+    results = results.push(ap_phi_production(prd_ic))
+    let prd_is = ap_gen_production(ST_IDEOMOTOR, MODE_SPONTANEOUS, seed + 5)
+    results = results.push(ap_phi_production(prd_is))
+    let spa_n = ap_gen_spatial(ST_NORMAL, seed + 6)
+    results = results.push(ap_phi_spatial(spa_n))
+    let spa_c = ap_gen_spatial(ST_CONSTRUCT, seed + 7)
+    results = results.push(ap_phi_spatial(spa_c))
+    let con_seq = ap_gen_conceptual(ST_IDEATIONAL, seed + 8)
+    results = results.push(ap_sequence_structure(con_seq, AP_K_CON, AP_WIN))
+
+    return results
+}
+
+fn check_T5() -> bool {
+    let seed = 104005
+    ap_print_state_header("T5: Determinism + latency")
+
+    let t0 = timestamp()
+
+    let run1 = ap_full_measurement(seed)
+    let run2 = ap_full_measurement(seed)
+
+    let t1 = timestamp()
+    let elapsed = t1 - t0
+
+    // Check bit-identical
+    let n = len(run1)
+    let mut all_match = true
+    let mut i = 0
+    while i < n {
+        if ap_abs(run1[i] - run2[i]) > AP_EPS {
+            println("  MISMATCH at index " + str(i) + ": " + str(run1[i]) + " vs " + str(run2[i]))
+            all_match = false
+        }
+        i = i + 1
+    }
+
+    println("  measurements = " + str(n))
+    println("  deterministic = " + str(all_match))
+    ap_print_comparison("elapsed_ms", to_float(elapsed), 5000.0, "<")
+
+    if all_match == false { return false }
+    if elapsed >= 5000 { return false }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[apraxia_phi] P104 — Apraxia Φ (Liepmann 1900)")
+    println("  Conceptual (what) vs Production (how) dissociation")
+    println("  K_CON=" + str(AP_K_CON) + "  K_PRD=" + str(AP_K_PRD) + "  K_SPA=" + str(AP_K_SPA) + "  WIN=" + str(AP_WIN) + "  BINS=" + str(AP_BINS))
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — normal motor: Φ_conceptual > 0 and Φ_production > 0") } else { println("T1 FAIL") }
+    println("")
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — ideational apraxia: Φ_conceptual drops, sequence errors") } else { println("T2 FAIL") }
+    println("")
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — ideomotor apraxia: Φ_conceptual preserved, Φ_production drops on command") } else { println("T3 FAIL") }
+    println("")
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — automatic-voluntary dissociation: spontaneous > commanded") } else { println("T4 FAIL") }
+    println("")
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — determinism + latency within budget") } else { println("T5 FAIL") }
+    println("")
+
+    let mut pass_count = 0
+    if t1 { pass_count = pass_count + 1 }
+    if t2 { pass_count = pass_count + 1 }
+    if t3 { pass_count = pass_count + 1 }
+    if t4 { pass_count = pass_count + 1 }
+    if t5 { pass_count = pass_count + 1 }
+
+    let mut all = true
+    if t1 == false { all = false }
+    if t2 == false { all = false }
+    if t3 == false { all = false }
+    if t4 == false { all = false }
+    if t5 == false { all = false }
+
+    if all {
+        println("[apraxia_phi] 5/5 PASS — P104 DONE")
+    } else {
+        println("[apraxia_phi] " + str(pass_count) + "/5 PASS — SOME FAILED")
+    }
+}
+
+main()

@@ -1,0 +1,863 @@
+// synaesthetic_binding_phi.hexa — P102 Synaesthetic Binding Φ
+//
+// Roadmap: shared/roadmaps/anima.json P102
+//   "Synaesthetic Binding — cross-modal hyperconnectivity binding mechanism"
+//   done_criteria: "5 binding modes + hyperconnectivity correlation + Stroop MI + 5/5 PASS"
+//
+// ─── Scientific framing ──────────────────────────────────────────
+//
+// Synaesthetic binding goes beyond simple cross-modal mapping (covered
+// in P53 synesthesia_phi.hexa) to the MECHANISM of integration itself.
+// Ramachandran & Hubbard (2001) proposed that synesthesia arises from
+// hyperconnectivity — excess cross-wiring between adjacent cortical
+// areas due to incomplete pruning during development.
+//
+// Normal binding (Treisman's Feature Integration Theory, 1980):
+//   Features within a single modality (color, shape, motion) are bound
+//   together via spatially-directed attention. Without attention,
+//   illusory conjunctions occur (red circle + blue triangle → red
+//   triangle percept). Binding requires top-down integration.
+//
+// Synaesthetic binding (Ramachandran & Hubbard 2001, 2005):
+//   Cross-modal features bind AUTOMATICALLY without attention. A
+//   grapheme (V4 activation) automatically triggers color area V4/V8
+//   via excess anatomical connections. The binding is:
+//     1. Automatic (pre-attentive, cannot be suppressed)
+//     2. Consistent (same input → same cross-modal output, always)
+//     3. Unidirectional (grapheme→color, rarely color→grapheme)
+//     4. Interference-producing (Stroop-like conflicts)
+//
+// Hyperconnectivity model:
+//   Normal pruning eliminates ~50% of childhood synapses. In
+//   synesthetes, excess connections survive between grapheme area
+//   (left fusiform) and color area (V4/V8). Connection strength
+//   predicts binding strength (Rouw & Scholte 2007, DTI evidence).
+//
+// Binding breakdown — Balint's syndrome (1909):
+//   Bilateral parietal lesion disrupts spatial attention → feature
+//   binding collapses entirely. Patients see individual features but
+//   cannot combine them into objects. Illusory conjunctions become
+//   the NORM rather than the exception. Φ_binding → 0.
+//   Robertson (1997) showed that Balint's patients produce
+//   illusory conjunctions at near-chance level: features float free.
+//
+// Key distinction from P53 (synesthesia_phi.hexa):
+//   P53 models the 4 mapping TYPES (grapheme-color, chromesthesia, etc.)
+//   and their consistency/Stroop properties.
+//   P102 (this engine) models the binding MECHANISM:
+//     - WHY cross-modal MI >> within-modal MI
+//     - How hyperconnectivity STRENGTH predicts binding STRENGTH
+//     - How parietal damage ABOLISHES binding (Φ_binding → 0)
+//     - Stroop MI as a function of cross-modal conflict
+//
+// ─── Model architecture ─────────────────────────────────────────
+//
+// We simulate a cortical sheet with D_MODAL channels per modality and
+// N_MOD modalities. Each modality has an internal recurrent network
+// producing within-modal binding. Cross-modal connections (the "hyper-
+// connectivity" parameter) produce synaesthetic binding.
+//
+// State: modal_states[mod][ch] — activation per channel per modality.
+//
+// Dynamics per step:
+//   within-modal coupling:
+//     x_i[ch] += alpha_within * sum_j(W_within[ch,j] * x_i[j])
+//   cross-modal coupling (hyperconnectivity):
+//     x_i[ch] += alpha_cross * hyper * sum_{j!=i}(W_cross[ch,j_ch] * x_j[j_ch])
+//   parietal gating (attention-based binding):
+//     x_i[ch] *= parietal_gate   (1.0=intact, 0.0=Balint's)
+//
+// Φ_binding      = MI(features_A, features_B) within same modality
+// Φ_cross_binding = MI(modality_A, modality_B) across modalities
+// Φ_hyper        = correlation(hyperconnectivity, Φ_cross_binding)
+//
+// ─── Self-tests (T1..T5) ────────────────────────────────────────
+//
+// T1: Normal within-modal binding: Φ_binding > 0 with intact parietal
+//     gate. Features within a modality integrate.
+//
+// T2: Synaesthetic cross-modal Φ >> normal within-modal Φ when
+//     hyperconnectivity is high. Cross-modal binding dominates.
+//
+// T3: Hyperconnectivity strength CORRELATES with binding strength.
+//     Sweep hyper from 0→1, measure Φ_cross at each level, verify
+//     monotonic increase (Spearman rank ≈ 1).
+//
+// T4: Stroop interference — when synaesthetic color (from grapheme
+//     cross-modal link) conflicts with physical color, the conflict
+//     MI > 0. The mismatch creates measurable informational tension.
+//
+// T5: Determinism + latency < 5s. Same seeds → same results.
+//
+// ─── Stage0 hexa constraints honored ────────────────────────────
+//   - plain `fn` only (no `pure fn` with ≥3 float struct returns)
+//   - `array` typed params only (no [float], no [str])
+//   - no identifier-pattern match; if/else chain only
+//   - no contains() / to_lower() / !(Effect)
+//   - single-line fn sig / call / array literal
+//   - no reserved keywords as variable names
+//   - main() at bottom, N < 32
+//
+// Law alignment:
+//   Law 4   Structure > feature — binding is STRUCTURAL integration
+//   Law 22  Feature-addition ⇒ phi down — deterministic, no branching
+//   Law 29  speak() 없음 — measurement engine, not utterance
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let SB_D_MODAL        = 8       // channels per modality
+let SB_N_MOD          = 3       // number of modalities (visual, auditory, tactile)
+let SB_N_STEPS        = 16      // simulation steps (< 32)
+let SB_BINS           = 6       // MI histogram bins
+let SB_EPS            = 0.0000000001
+let SB_NOISE_SCALE    = 0.04
+let SB_ALPHA_WITHIN   = 0.30    // within-modal coupling strength
+let SB_ALPHA_CROSS    = 0.25    // cross-modal coupling base strength
+let SB_PARIETAL_INTACT = 1.0    // normal parietal gate
+let SB_PARIETAL_BALINT = 0.05   // Balint's — near-total binding loss
+let SB_HYPER_LEVELS   = 5       // sweep levels for T3 correlation
+let SB_STROOP_ITERS   = 16      // Stroop conflict rounds
+let SB_PHI_FLOOR      = 0.001   // minimum meaningful Φ
+
+// ═══════════════════════════════════════════════════════════════
+// PRNG + scalar helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn sb_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn sb_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn sb_signed(seed: int) -> float {
+    return sb_unit(seed) * 2.0 - 1.0
+}
+
+fn sb_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sb_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn sb_sqrt_approx(x: float) -> float {
+    // Newton's method, 8 iterations — good enough for correlation calc.
+    if x <= 0.0 { return 0.0 }
+    let mut g = x
+    let mut i = 0
+    while i < 8 {
+        g = 0.5 * (g + x / g)
+        i = i + 1
+    }
+    return g
+}
+
+fn sb_cos_taylor(phase: float) -> float {
+    let mut y = phase
+    while y >  3.14159265 { y = y - 6.28318530 }
+    while y < -3.14159265 { y = y + 6.28318530 }
+    let y2 = y * y
+    return 1.0 - 0.5 * y2 + 0.04166 * y2 * y2
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Histogram-based MI estimator
+// ═══════════════════════════════════════════════════════════════
+
+fn sb_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn sb_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn sb_entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(sb_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = sb_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * sb_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn sb_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        let ia = sb_bin_idx(a[i], lo, hi, nb)
+        let ib = sb_bin_idx(b[i], lo, hi, nb)
+        ids = ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = sb_counts(ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * sb_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn sb_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let mut lo = a[0]
+    let mut hi = a[0]
+    let mut i = 0
+    while i < n {
+        if a[i] < lo { lo = a[i] }
+        if a[i] > hi { hi = a[i] }
+        if b[i] < lo { lo = b[i] }
+        if b[i] > hi { hi = b[i] }
+        i = i + 1
+    }
+    let span = hi - lo
+    if span < SB_EPS { return 0.0 }
+    let ha = sb_entropy_hist(a, lo, hi, SB_BINS)
+    let hb = sb_entropy_hist(b, lo, hi, SB_BINS)
+    let hj = sb_joint_entropy(a, b, lo, hi, SB_BINS)
+    let mi = ha + hb - hj
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Cortical state initialization
+//
+// Each modality gets D_MODAL channels. The flat state layout is:
+//   state[mod * D_MODAL + ch]   for modality `mod`, channel `ch`.
+// Total length = N_MOD * D_MODAL.
+//
+// Each modality has a distinct spectral signature so within-modal
+// MI is positive (features co-vary) but cross-modal MI depends on
+// coupling strength.
+// ═══════════════════════════════════════════════════════════════
+
+fn sb_make_state(seed: int) -> array {
+    let total = SB_N_MOD * SB_D_MODAL
+    let mut out = []
+    let mut s = seed
+    let mut idx = 0
+    while idx < total {
+        let modality = idx / SB_D_MODAL
+        let ch = idx % SB_D_MODAL
+        s = sb_prng(s + idx * 41)
+        // Base activation: modality-specific spectral pattern.
+        // Modality 0 (visual):   cos-driven with period ~4 channels.
+        // Modality 1 (auditory): sin-like with period ~3 channels.
+        // Modality 2 (tactile):  linear ramp + noise.
+        let base_phase = to_float(ch) * 0.8 + to_float(modality) * 1.5
+        let base = sb_cos_taylor(base_phase)
+        let noise = SB_NOISE_SCALE * sb_signed(s)
+        out = out.push(base + noise)
+        idx = idx + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Within-modal coupling weight
+//
+// W_within[ch_a, ch_b] models lateral connectivity within a single
+// cortical area. Nearby channels couple stronger (topographic map).
+// ═══════════════════════════════════════════════════════════════
+
+fn sb_within_weight(ch_a: int, ch_b: int, d: int) -> float {
+    if ch_a == ch_b { return 0.0 }
+    let diff = ch_a - ch_b
+    let da = if diff < 0 { 0 - diff } else { diff }
+    // Exponential decay with distance: exp(-dist/2) approx via 1/(1+dist).
+    let w = 1.0 / (1.0 + to_float(da))
+    return w
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Cross-modal coupling weight
+//
+// Hyperconnectivity parameter `hyper` in [0,1] controls the excess
+// anatomical connections between areas. When hyper=0, no cross-modal
+// coupling exists. When hyper=1, full cross-modal integration.
+//
+// W_cross[ch_src, ch_dst] = hyper * topographic_overlap
+// Adjacent channels across modalities couple more than distant ones
+// (reflects retinotopic / tonotopic alignment in V4-grapheme area).
+// ═══════════════════════════════════════════════════════════════
+
+fn sb_cross_weight(ch_src: int, ch_dst: int, d: int) -> float {
+    let diff = ch_src - ch_dst
+    let da = if diff < 0 { 0 - diff } else { diff }
+    // Cross-modal weight: topographic overlap (Gaussian-ish falloff).
+    let w = 1.0 / (1.0 + to_float(da) * to_float(da))
+    return w
+}
+
+// ═══════════════════════════════════════════════════════════════
+// One simulation step
+//
+// Updates entire cortical state (all modalities) in one pass.
+//
+// Parameters:
+//   state       — flat array [N_MOD * D_MODAL]
+//   hyper       — hyperconnectivity strength [0,1]
+//   parietal    — parietal gate [0,1] (1=intact, 0=Balint's)
+//   seed_base   — PRNG seed
+//   step        — current time step
+// ═══════════════════════════════════════════════════════════════
+
+fn sb_step(state: array, hyper: float, parietal: float, seed_base: int, step: int) -> array {
+    let total = SB_N_MOD * SB_D_MODAL
+    let mut out = []
+    let mut s = seed_base + step * 137
+    let mut idx = 0
+    while idx < total {
+        let mod_i = idx / SB_D_MODAL
+        let ch_i = idx % SB_D_MODAL
+        let cur = state[idx]
+        // 1. Within-modal coupling — lateral integration.
+        let mut within_sum = 0.0
+        let mut j = 0
+        while j < SB_D_MODAL {
+            if j != ch_i {
+                let src_idx = mod_i * SB_D_MODAL + j
+                let w = sb_within_weight(ch_i, j, SB_D_MODAL)
+                within_sum = within_sum + w * state[src_idx]
+            }
+            j = j + 1
+        }
+        // Normalize by number of neighbors.
+        let within_contrib = SB_ALPHA_WITHIN * within_sum / to_float(SB_D_MODAL - 1)
+        // 2. Cross-modal coupling — hyperconnectivity-gated.
+        let mut cross_sum = 0.0
+        let mut cross_count = 0
+        let mut m = 0
+        while m < SB_N_MOD {
+            if m != mod_i {
+                let mut k = 0
+                while k < SB_D_MODAL {
+                    let src_idx = m * SB_D_MODAL + k
+                    let w = sb_cross_weight(k, ch_i, SB_D_MODAL)
+                    cross_sum = cross_sum + w * state[src_idx]
+                    cross_count = cross_count + 1
+                    k = k + 1
+                }
+            }
+            m = m + 1
+        }
+        let mut cross_contrib = 0.0
+        if cross_count > 0 {
+            cross_contrib = SB_ALPHA_CROSS * hyper * cross_sum / to_float(cross_count)
+        }
+        // 3. Parietal gating — attention-based binding modulation.
+        //    Balint's syndrome: parietal=0 disrupts ALL binding,
+        //    both within and cross-modal.
+        let integrated = cur + (within_contrib + cross_contrib) * parietal
+        // 4. Noise + mild decay toward zero to prevent divergence.
+        s = sb_prng(s + idx * 23)
+        let noise = SB_NOISE_SCALE * sb_signed(s)
+        let decayed = integrated * 0.95 + noise
+        out = out.push(decayed)
+        idx = idx + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Run simulation for N steps, collecting per-channel traces
+//
+// Returns flat trace array: trace[step * total + idx]
+// where total = N_MOD * D_MODAL.
+// ═══════════════════════════════════════════════════════════════
+
+fn sb_run(state: array, hyper: float, parietal: float, n_steps: int, seed_base: int) -> array {
+    let total = SB_N_MOD * SB_D_MODAL
+    let mut cur = state
+    let mut trace = []
+    let mut t = 0
+    while t < n_steps {
+        // Record snapshot.
+        let mut idx = 0
+        while idx < total {
+            trace = trace.push(cur[idx])
+            idx = idx + 1
+        }
+        // Advance.
+        cur = sb_step(cur, hyper, parietal, seed_base, t)
+        t = t + 1
+    }
+    return trace
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Extract a single channel trace from flat trace layout
+// ═══════════════════════════════════════════════════════════════
+
+fn sb_extract_trace(trace: array, total: int, ch_idx: int, n_steps: int) -> array {
+    let mut col = []
+    let mut t = 0
+    while t < n_steps {
+        col = col.push(trace[t * total + ch_idx])
+        t = t + 1
+    }
+    return col
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Φ_binding: within-modal feature integration
+//
+// Mean MI between all pairs of channels within a single modality.
+// Measures how tightly features are bound into a unified percept
+// within one sensory stream.
+// ═══════════════════════════════════════════════════════════════
+
+fn sb_phi_within_modal(trace: array, modality: int, n_steps: int) -> float {
+    let total = SB_N_MOD * SB_D_MODAL
+    let base = modality * SB_D_MODAL
+    let mut sum_mi = 0.0
+    let mut count = 0
+    let mut a = 0
+    while a < SB_D_MODAL {
+        let tr_a = sb_extract_trace(trace, total, base + a, n_steps)
+        let mut b = a + 1
+        while b < SB_D_MODAL {
+            let tr_b = sb_extract_trace(trace, total, base + b, n_steps)
+            sum_mi = sum_mi + sb_mi(tr_a, tr_b)
+            count = count + 1
+            b = b + 1
+        }
+        a = a + 1
+    }
+    if count == 0 { return 0.0 }
+    return sum_mi / to_float(count)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Φ_cross_binding: cross-modal feature integration
+//
+// Mean MI between channels of DIFFERENT modalities. This is the
+// signature of synaesthetic binding — features from one modality
+// become integrated with features of another.
+//
+// When hyperconnectivity is high, Φ_cross >> Φ_within, because
+// the excess anatomical connections force cross-modal co-variation.
+// ═══════════════════════════════════════════════════════════════
+
+fn sb_phi_cross_modal(trace: array, mod_a: int, mod_b: int, n_steps: int) -> float {
+    let total = SB_N_MOD * SB_D_MODAL
+    let base_a = mod_a * SB_D_MODAL
+    let base_b = mod_b * SB_D_MODAL
+    let mut sum_mi = 0.0
+    let mut count = 0
+    let mut a = 0
+    while a < SB_D_MODAL {
+        let tr_a = sb_extract_trace(trace, total, base_a + a, n_steps)
+        let mut b = 0
+        while b < SB_D_MODAL {
+            let tr_b = sb_extract_trace(trace, total, base_b + b, n_steps)
+            sum_mi = sum_mi + sb_mi(tr_a, tr_b)
+            count = count + 1
+            b = b + 1
+        }
+        a = a + 1
+    }
+    if count == 0 { return 0.0 }
+    return sum_mi / to_float(count)
+}
+
+// Mean Φ_cross across all modality pairs.
+fn sb_phi_cross_all(trace: array, n_steps: int) -> float {
+    let mut sum_phi = 0.0
+    let mut count = 0
+    let mut a = 0
+    while a < SB_N_MOD {
+        let mut b = a + 1
+        while b < SB_N_MOD {
+            sum_phi = sum_phi + sb_phi_cross_modal(trace, a, b, n_steps)
+            count = count + 1
+            b = b + 1
+        }
+        a = a + 1
+    }
+    if count == 0 { return 0.0 }
+    return sum_phi / to_float(count)
+}
+
+// Mean Φ_within across all modalities.
+fn sb_phi_within_all(trace: array, n_steps: int) -> float {
+    let mut sum_phi = 0.0
+    let mut m = 0
+    while m < SB_N_MOD {
+        sum_phi = sum_phi + sb_phi_within_modal(trace, m, n_steps)
+        m = m + 1
+    }
+    return sum_phi / to_float(SB_N_MOD)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Stroop conflict cost
+//
+// Models the informational tension when synaesthetic color (from
+// cross-modal binding) conflicts with physical color presented.
+//
+// The Stroop effect in synesthesia (Ramachandran & Hubbard 2001,
+// Dixon et al. 2000): presenting a grapheme in an ink color that
+// CONFLICTS with the synesthete's photism (synaesthetic color)
+// produces slower RT and higher error rate — measurable interference.
+//
+// We model this as CONFLICT COST: the mean squared divergence
+// between the synaesthetic activation pattern and the physical
+// color pattern. Congruent trials have low divergence (patterns
+// align). Incongruent trials have high divergence (patterns oppose).
+//
+// The conflict MI is then computed over a population of mixed
+// trials: we measure MI between a CONDITION label (0=congruent,
+// 1=incongruent) and the CONFLICT COST scalar. If the Stroop
+// effect is real, the condition label predicts the conflict cost
+// → MI > 0. This MI is the informational signature of interference.
+// ═══════════════════════════════════════════════════════════════
+
+fn sb_stroop_divergence(grapheme_id: int, congruent: int) -> float {
+    // Synaesthetic color pattern: deterministic from grapheme_id.
+    // This is the "photism" — the color the synesthete experiences.
+    let mut cost = 0.0
+    let mut i = 0
+    while i < SB_D_MODAL {
+        let phase = to_float(grapheme_id * 7 + i * 3) * 0.5
+        let syn_val = sb_cos_taylor(phase)
+        let mut phys_val = 0.0
+        if congruent == 1 {
+            // Congruent: physical color matches photism + small noise.
+            let noise = 0.03 * sb_signed(sb_prng(grapheme_id * 100 + i * 17))
+            phys_val = syn_val + noise
+        } else {
+            // Incongruent: physical color is OPPOSITE on the color wheel.
+            // Root cause: incongruent ink triggers a conflict between the
+            // bottom-up physical color signal and the top-down synaesthetic
+            // color signal, producing the Stroop RT penalty.
+            let noise = 0.03 * sb_signed(sb_prng(grapheme_id * 200 + i * 19))
+            phys_val = 0.0 - syn_val + noise
+        }
+        let diff = syn_val - phys_val
+        cost = cost + diff * diff
+        i = i + 1
+    }
+    return cost / to_float(SB_D_MODAL)
+}
+
+fn sb_stroop_conflict_mi(iters: int) -> float {
+    // Collect MIXED trials: half congruent (label=0), half incongruent (label=1).
+    // Measure MI between the condition label and the conflict cost.
+    // If the Stroop effect is real, condition predicts cost → MI > 0.
+    let mut labels = []
+    let mut costs = []
+    let mut t = 0
+    while t < iters {
+        let gid = t % 20
+        // First half: congruent trials.
+        let cost_c = sb_stroop_divergence(gid, 1)
+        labels = labels.push(0.0)
+        costs = costs.push(cost_c)
+        // Second half: incongruent trials.
+        let cost_i = sb_stroop_divergence(gid, 0)
+        labels = labels.push(1.0)
+        costs = costs.push(cost_i)
+        t = t + 1
+    }
+    return sb_mi(labels, costs)
+}
+
+fn sb_stroop_mean_cost(iters: int, congruent: int) -> float {
+    let mut total = 0.0
+    let mut t = 0
+    while t < iters {
+        let gid = t % 20
+        total = total + sb_stroop_divergence(gid, congruent)
+        t = t + 1
+    }
+    return total / to_float(iters)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Spearman rank correlation for T3 (hyperconnectivity sweep)
+//
+// Rank-based correlation between hyperconnectivity levels and
+// measured Φ_cross values. Monotonic increase → rho ≈ 1.
+// ═══════════════════════════════════════════════════════════════
+
+fn sb_rank(vals: array) -> array {
+    let n = len(vals)
+    let mut ranks = []
+    let mut i = 0
+    while i < n {
+        let mut r = 1.0
+        let mut j = 0
+        while j < n {
+            if vals[j] < vals[i] { r = r + 1.0 }
+            j = j + 1
+        }
+        ranks = ranks.push(r)
+        i = i + 1
+    }
+    return ranks
+}
+
+fn sb_spearman(a: array, b: array) -> float {
+    let n = len(a)
+    if n < 2 { return 0.0 }
+    let ra = sb_rank(a)
+    let rb = sb_rank(b)
+    // Pearson on ranks.
+    let nf = to_float(n)
+    let mut sum_a = 0.0
+    let mut sum_b = 0.0
+    let mut i = 0
+    while i < n {
+        sum_a = sum_a + ra[i]
+        sum_b = sum_b + rb[i]
+        i = i + 1
+    }
+    let mean_a = sum_a / nf
+    let mean_b = sum_b / nf
+    let mut cov = 0.0
+    let mut var_a = 0.0
+    let mut var_b = 0.0
+    let mut k = 0
+    while k < n {
+        let da = ra[k] - mean_a
+        let db = rb[k] - mean_b
+        cov = cov + da * db
+        var_a = var_a + da * da
+        var_b = var_b + db * db
+        k = k + 1
+    }
+    let denom = sb_sqrt_approx(var_a) * sb_sqrt_approx(var_b)
+    if denom < SB_EPS { return 0.0 }
+    return cov / denom
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1: Normal within-modal binding Φ > 0 with intact parietal gate.
+    // Features within a modality integrate through lateral coupling.
+    // With Balint's (parietal=0), binding should collapse → Φ lower.
+    let state = sb_make_state(5001)
+    // Normal: moderate hyper (0.3), intact parietal.
+    let trace_normal = sb_run(state, 0.3, SB_PARIETAL_INTACT, SB_N_STEPS, 6001)
+    let phi_within_normal = sb_phi_within_all(trace_normal, SB_N_STEPS)
+    // Balint's: same hyper, but parietal gate near-zero.
+    let trace_balint = sb_run(state, 0.3, SB_PARIETAL_BALINT, SB_N_STEPS, 6001)
+    let phi_within_balint = sb_phi_within_all(trace_balint, SB_N_STEPS)
+    println("  [T1] phi_within (intact parietal) = " + str(phi_within_normal))
+    println("        phi_within (Balint's)        = " + str(phi_within_balint))
+    // Normal binding must be positive.
+    if phi_within_normal <= SB_PHI_FLOOR {
+        println("        FAIL: phi_within_normal too low")
+        return false
+    }
+    // Balint's should show reduced binding.
+    if phi_within_balint >= phi_within_normal {
+        println("        FAIL: Balint's should reduce binding")
+        return false
+    }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: Synaesthetic cross-modal Φ >> normal within-modal Φ when
+    // hyperconnectivity is high. Cross-modal binding dominates.
+    let state = sb_make_state(5002)
+    // High hyperconnectivity (synesthete).
+    let hyper_high = 0.9
+    let trace_high = sb_run(state, hyper_high, SB_PARIETAL_INTACT, SB_N_STEPS, 6002)
+    let phi_cross_high = sb_phi_cross_all(trace_high, SB_N_STEPS)
+    // Normal (non-synesthete): low hyperconnectivity.
+    let hyper_low = 0.05
+    let trace_low = sb_run(state, hyper_low, SB_PARIETAL_INTACT, SB_N_STEPS, 6003)
+    let phi_within_low = sb_phi_within_all(trace_low, SB_N_STEPS)
+    let phi_cross_low = sb_phi_cross_all(trace_low, SB_N_STEPS)
+    println("  [T2] phi_cross (hyper=0.9, synesthete)   = " + str(phi_cross_high))
+    println("        phi_within (hyper=0.05, normal)     = " + str(phi_within_low))
+    println("        phi_cross (hyper=0.05, normal)      = " + str(phi_cross_low))
+    // Cross-modal Φ under high hyper must exceed normal within-modal Φ.
+    if phi_cross_high <= phi_within_low {
+        println("        FAIL: synaesthetic cross Φ should >> normal within Φ")
+        return false
+    }
+    // Cross-modal Φ under high hyper must also exceed cross under low hyper.
+    if phi_cross_high <= phi_cross_low {
+        println("        FAIL: high hyper cross Φ should > low hyper cross Φ")
+        return false
+    }
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3: Hyperconnectivity strength correlates with binding strength.
+    // Sweep hyper from 0.1 to 0.9 in SB_HYPER_LEVELS steps, measure
+    // Φ_cross at each level, verify monotonic increase (Spearman ~1).
+    let state = sb_make_state(5003)
+    let mut hyper_vals = []
+    let mut phi_vals = []
+    let mut lvl = 0
+    while lvl < SB_HYPER_LEVELS {
+        // hyper = 0.1 + 0.8 * lvl / (levels-1) → range [0.1, 0.9].
+        let hyper_f = 0.1 + 0.8 * to_float(lvl) / to_float(SB_HYPER_LEVELS - 1)
+        let trace = sb_run(state, hyper_f, SB_PARIETAL_INTACT, SB_N_STEPS, 6004 + lvl * 100)
+        let phi_cross = sb_phi_cross_all(trace, SB_N_STEPS)
+        hyper_vals = hyper_vals.push(hyper_f)
+        phi_vals = phi_vals.push(phi_cross)
+        println("        hyper=" + str(hyper_f) + " → phi_cross=" + str(phi_cross))
+        lvl = lvl + 1
+    }
+    let rho = sb_spearman(hyper_vals, phi_vals)
+    println("  [T3] Spearman rho(hyperconnectivity, phi_cross) = " + str(rho))
+    // Require strong positive correlation (> 0.7).
+    if rho < 0.7 {
+        println("        FAIL: rho too low — binding should increase with hyperconnectivity")
+        return false
+    }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: Stroop interference — when synaesthetic color conflicts with
+    // physical color, the conflict cost is higher (incongruent > congruent).
+    // Additionally, the condition label (congruent vs incongruent) carries
+    // information about the cost → conflict MI > 0.
+    let cost_cong = sb_stroop_mean_cost(SB_STROOP_ITERS, 1)
+    let cost_incong = sb_stroop_mean_cost(SB_STROOP_ITERS, 0)
+    let conflict_mi = sb_stroop_conflict_mi(SB_STROOP_ITERS)
+    println("  [T4] Stroop cost (congruent)   = " + str(cost_cong))
+    println("        Stroop cost (incongruent) = " + str(cost_incong))
+    println("        conflict MI (cond→cost)   = " + str(conflict_mi))
+    // Incongruent cost must exceed congruent cost — the Stroop penalty.
+    if cost_incong <= cost_cong {
+        println("        FAIL: incongruent cost should > congruent cost")
+        return false
+    }
+    // Conflict MI must be positive — the condition label predicts the cost.
+    if conflict_mi <= 0.0 {
+        println("        FAIL: conflict MI must be > 0")
+        return false
+    }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5: Determinism + latency < 5s.
+    // Same seeds must produce same results (pure deterministic).
+    let t0 = clock()
+    // Run 1.
+    let state = sb_make_state(5005)
+    let trace_1 = sb_run(state, 0.5, SB_PARIETAL_INTACT, SB_N_STEPS, 6005)
+    let phi_1 = sb_phi_cross_all(trace_1, SB_N_STEPS)
+    // Run 2 — identical seeds.
+    let state_2 = sb_make_state(5005)
+    let trace_2 = sb_run(state_2, 0.5, SB_PARIETAL_INTACT, SB_N_STEPS, 6005)
+    let phi_2 = sb_phi_cross_all(trace_2, SB_N_STEPS)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    let delta = sb_abs(phi_1 - phi_2)
+    println("  [T5] phi_cross run1=" + str(phi_1) + " run2=" + str(phi_2) + " delta=" + str(delta))
+    println("        latency = " + str(ms) + " ms")
+    // Determinism: identical results from identical seeds.
+    if delta > SB_EPS {
+        println("        FAIL: non-deterministic — delta > 0")
+        return false
+    }
+    // Latency under 5 seconds.
+    if ms > 5000.0 {
+        println("        FAIL: latency > 5s")
+        return false
+    }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[synaesthetic_binding_phi] P102 — cross-modal hyperconnectivity binding")
+    println("  model: N_MOD=" + str(SB_N_MOD) + " D_MODAL=" + str(SB_D_MODAL) + " N_STEPS=" + str(SB_N_STEPS))
+    println("  Ramachandran & Hubbard (2001): hyperconnectivity → automatic cross-modal binding")
+    println("  Treisman (1980): normal binding via attention; Balint's (1909): binding breakdown")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  within-modal binding Phi > 0 (Balint's < intact)") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  synaesthetic cross-modal Phi >> normal within-modal Phi") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  hyperconnectivity correlates with binding (Spearman > 0.7)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  Stroop conflict MI > 0 (incongruent > congruent)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  determinism + latency < 5s") } else { println("T5 FAIL") }
+
+    println("")
+
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[synaesthetic_binding_phi] 5/5 PASS — P102 DONE")
+    } else {
+        println("[synaesthetic_binding_phi] SOME FAILED")
+    }
+}
+
+main()

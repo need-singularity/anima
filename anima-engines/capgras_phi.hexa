@@ -1,0 +1,823 @@
+// capgras_phi.hexa — P99 Capgras Delusion Φ
+//
+// Roadmap: shared/roadmaps/anima.json P99
+//   Capgras delusion: face recognition intact but emotional familiarity
+//   (autonomic response) absent → belief that a familiar person has been
+//   replaced by an identical impostor.
+//
+// ─── Neuropsychological frame (Ellis & Young 1990) ─────────────────
+//
+// Dual-route face recognition (Bruce & Young 1986):
+//   ROUTE 1 — Visual identity (FFA → FRUs). Intact in Capgras, impaired in prosopagnosia.
+//   ROUTE 2 — Emotional familiarity (amygdala → SCR). Independent of conscious recognition.
+//   Normal: BOTH routes fire → identified AND familiar. No prediction error.
+//
+// Capgras (Ellis & Young 1990; Ellis et al. 1997):
+//   Route 1 fires ("looks like my wife"), Route 2 silent (no SCR, no warmth).
+//   → massive prediction error → "She must be an impostor."
+//   SCR evidence: Capgras patients show FLAT SCR to all faces (Hirstein & Ramachandran 1997).
+//
+// Prosopagnosia — mirror dissociation (Bauer 1984; Tranel & Damasio 1985):
+//   Route 1 impaired (cannot identify), Route 2 intact (elevated SCR to familiar faces).
+//   Double dissociation proves neurological independence of the two routes.
+//
+// Bayesian prediction error (Coltheart 2010; Corlett 2019):
+//   PE = |predicted_emotional - actual_emotional|. Chronically high in Capgras.
+//   Delusion = brain's attempt to explain away persistent PE with new causal model.
+//
+// Autonomic disconnect: SCR modeled as MI(visual, emotional).
+//   Normal: high MI (routes covary). Capgras: zero MI (disconnect).
+//
+// ─── 5 self-tests (5/5 gate) ────────────────────────────────────────
+//
+// T1 Normal: both Φ_visual and Φ_emotional > 0, integrated Φ > floor.
+// T2 Capgras: Φ_visual intact, Φ_emotional ≈ 0, dissociation gap > threshold.
+// T3 Prosopagnosia: opposite — Φ_visual ≈ 0, Φ_emotional intact. Double dissociation.
+// T4 Prediction error Φ higher in Capgras than normal (mismatch → delusion).
+// T5 Determinism: identical seeds → identical Φ values.
+//
+// ─── Stage0 hexa constraints honored ────────────────────────────────
+//   - plain `fn` only (no `pure fn` >=3 float struct returns)
+//   - `array` typed params only (no [float], no [str])
+//   - No identifier-pattern match; sequential if-chains
+//   - No `contains()` / `to_lower()` / `!(Effect)`
+//   - No else-if in let-binding; flat mut + sequential if
+//   - Single-line fn signatures / call sites / array literals
+//   - No reserved keywords as variable names
+//   - main() call at bottom
+//   - CG_STEPS=24 (< 32)
+//
+// Law alignment:
+//   Law 2   Observe never inject — Φ via MI measurement on streams
+//   Law 4   Structure > feature — dual-route architecture is structural
+//   Law 22  Feature addition → Φ down — channels fixed (visual + emotional)
+//   Meta M8 Self-other boundary — face = other, SCR = self-response to other
+//
+// Ref:
+//   Ellis & Young 1990 — dual-route model, Capgras disconnect
+//   Ellis, Young & Quayle 1997 — SCR evidence
+//   Hirstein & Ramachandran 1997 — SCR absent in Capgras
+//   Bauer 1984 — covert recognition in prosopagnosia (SCR intact)
+//   Tranel & Damasio 1985 — double dissociation
+//   Coltheart 2010 — Bayesian prediction error account
+//   Corlett et al. 2019 — precision-weighted PE in delusions
+//   Bruce & Young 1986 — face recognition model
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let CG_STEPS          = 24            // timeline length (stage0 N<32)
+let CG_N_FACES        = 8             // faces per timeline (4 familiar + 4 unfamiliar)
+let CG_BINS           = 6             // histogram bins for MI
+let CG_EPS            = 0.0000000001
+
+// Route coupling strengths (how strongly emotional route tracks visual)
+let CG_COUPLE_NORMAL  = 0.85          // healthy: strong visual→emotional coupling
+let CG_COUPLE_BROKEN  = 0.05          // Capgras: emotional route disconnected
+let CG_COUPLE_PROSOP  = 0.10          // prosopagnosia: visual route impaired
+
+// Familiarity signal amplitude (SCR magnitude for known faces)
+let CG_FAM_AMP        = 0.80          // emotional response to familiar face
+let CG_UNFAM_AMP      = 0.15          // baseline emotional response to stranger
+
+// Visual recognition strength
+let CG_VIS_STRONG     = 0.90          // intact FFA-based identity signal
+let CG_VIS_IMPAIRED   = 0.10          // prosopagnosia: FFA cannot resolve
+
+// Per-step noise (independent per channel)
+let CG_JITTER         = 0.04
+
+// Prediction error parameters
+// The brain predicts emotional response given visual identity.
+// PE = |predicted_emo - actual_emo|.
+let CG_PRED_WEIGHT    = 0.85          // prediction tracks historical coupling
+
+// Test gate thresholds
+let CG_PHI_MIN        = 0.05          // minimum per-route Φ for "active"
+let CG_PHI_FLOOR      = 0.001         // product floor for integrated state
+let CG_EMO_CEIL       = 0.02          // Capgras emotional Φ must be below this
+let CG_VIS_CEIL       = 0.02          // prosopagnosia visual Φ must be below this
+let CG_DISSOC_GAP     = 0.10          // dissociation detection threshold
+let CG_PE_GAP         = 0.005         // prediction error gap (Capgras > normal)
+let CG_DETERM_TOL     = 0.0000001     // determinism tolerance
+
+// ═══════════════════════════════════════════════════════════════
+// Math / PRNG primitives (L0-clean, no cross-engine import per AN7)
+// ═══════════════════════════════════════════════════════════════
+
+fn cg_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn cg_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn cg_min_f(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn cg_max_f(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+// Deterministic LCG — reproducibility (Law 2: observable, seed-stable)
+fn cg_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn cg_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn cg_signed(seed: int) -> float {
+    return cg_unit(seed) * 2.0 - 1.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Histogram MI (duplicated per AN7 L0-clean, no cross-engine import)
+// ═══════════════════════════════════════════════════════════════
+
+fn cg_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn cg_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn cg_entropy(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(cg_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = cg_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * cg_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn cg_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = cg_bin_idx(a[i], lo, hi, nb)
+        let ib = cg_bin_idx(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = cg_counts(pair_ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * cg_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn cg_vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn cg_vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn cg_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let lo_a = cg_vec_min(a)
+    let hi_a = cg_vec_max(a)
+    let lo_b = cg_vec_min(b)
+    let hi_b = cg_vec_max(b)
+    let lo = cg_min_f(lo_a, lo_b)
+    let hi = cg_max_f(hi_a, hi_b)
+    let h_a = cg_entropy(a, lo, hi, CG_BINS)
+    let h_b = cg_entropy(b, lo, hi, CG_BINS)
+    let h_j = cg_joint_entropy(a, b, lo, hi, CG_BINS)
+    let mi = h_a + h_b - h_j
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// Variance helper for prediction error analysis
+fn cg_variance(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        sum = sum + v[i]
+        i = i + 1
+    }
+    let mean = sum / to_float(n)
+    let mut acc = 0.0
+    let mut j = 0
+    while j < n {
+        let d = v[j] - mean
+        acc = acc + d * d
+        j = j + 1
+    }
+    return acc / to_float(n)
+}
+
+// Mean helper
+fn cg_mean(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        sum = sum + v[i]
+        i = i + 1
+    }
+    return sum / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Face stimulus generation
+//
+// Timeline presents CG_N_FACES faces cyclically. First half are
+// familiar (FRU match), second half are unfamiliar (strangers).
+// For each face: visual_id (FFA) + emotional (SCR/amygdala).
+// Coupling: c_emo = visual→emotional, vis_strength = FFA integrity.
+// ═══════════════════════════════════════════════════════════════
+
+// Returns 1 if face index is "familiar", 0 if "unfamiliar".
+// First half of face indices are familiar, second half are unfamiliar.
+fn cg_is_familiar(face_idx: int) -> int {
+    let half = CG_N_FACES / 2
+    if face_idx < half { return 1 }
+    return 0
+}
+
+// Visual identity stream. vis_strength controls FFA integrity:
+//   Normal/Capgras: CG_VIS_STRONG (FFA intact).
+//   Prosopagnosia:  CG_VIS_IMPAIRED (FFA damaged).
+// Familiar faces produce richer FRU match signal; unfamiliar = weak noise.
+fn cg_gen_visual(vis_strength: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < CG_STEPS {
+        // Determine which face is presented at this timestep
+        let face_idx = t % CG_N_FACES
+        let fam = cg_is_familiar(face_idx)
+
+        s = cg_prng(s + t * 37)
+
+        // Visual signal: base structured component + noise.
+        // Familiar faces produce a richer FRU match (sinusoidal
+        // structure from the stored template), while unfamiliar
+        // faces produce only noise-level activation.
+        let phase = to_float(t) / to_float(CG_STEPS)
+        let mut tri = phase * 4.0 - 2.0
+        if tri < 0.0 { tri = 0.0 - tri }
+        let template_signal = 1.0 - tri
+
+        let jit = CG_JITTER * cg_signed(s)
+
+        let mut v = 0.0
+        if fam == 1 {
+            // Familiar face: strong FRU match with structured template
+            v = vis_strength * (0.6 * template_signal + 0.4) + jit
+        }
+        if fam == 0 {
+            // Unfamiliar face: weak, noise-dominated signal
+            v = vis_strength * 0.2 + jit
+        }
+
+        out = out.push(v)
+        t = t + 1
+    }
+    return out
+}
+
+// Emotional familiarity stream (amygdala → SCR pathway).
+// c_emo: coupling from visual route. covert_fam: prosopagnosia non-FFA SCR.
+//   Normal: c_emo high → emotional tracks visual. Capgras: c_emo ≈ 0 → flat.
+fn cg_gen_emotional(visual: array, c_emo: float, covert_fam: bool, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < CG_STEPS {
+        let face_idx = t % CG_N_FACES
+        let fam = cg_is_familiar(face_idx)
+
+        s = cg_prng(s + t * 59)
+
+        // Base emotional signal: autonomic familiarity response.
+        // For familiar faces, this would normally be CG_FAM_AMP;
+        // for unfamiliar faces, CG_UNFAM_AMP.
+        let mut base_emo = CG_UNFAM_AMP
+        if fam == 1 { base_emo = CG_FAM_AMP }
+
+        // The emotional output is a blend:
+        //   emo = c_emo * visual_driven + (1 - c_emo) * independent
+        // When c_emo is high (normal): emotional tracks visual closely.
+        // When c_emo is low (Capgras): emotional is noise + base only.
+        let visual_driven = c_emo * visual[t]
+
+        // Independent component: in Capgras, this is the only signal.
+        // It is flat and undifferentiated (no familiar/unfamiliar distinction).
+        let indep_noise = (1.0 - c_emo) * CG_UNFAM_AMP * cg_signed(s)
+
+        let jit = CG_JITTER * cg_signed(s + 6151)
+
+        let mut emo = visual_driven + indep_noise + jit
+
+        // Covert familiarity pathway (prosopagnosia special case):
+        // Even without visual recognition, the non-FFA pathway
+        // (possibly superior temporal sulcus → amygdala) generates
+        // an SCR signal to genuinely familiar faces.
+        if covert_fam {
+            if fam == 1 {
+                // Inject the covert SCR that prosopagnosia patients show
+                // (Tranel & Damasio 1985) — emotional familiarity WITHOUT
+                // conscious visual recognition.
+                let covert_amp = CG_FAM_AMP * 0.7
+                emo = emo + covert_amp
+            }
+        }
+
+        out = out.push(emo)
+        t = t + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Prediction error stream
+// PE(t) = |E_predicted(t) - E_actual(t)|
+// Normal: PE ≈ 0 (prediction matches). Capgras: PE high (emotional
+// response absent despite visual match). Drives delusion formation.
+// ═══════════════════════════════════════════════════════════════
+
+fn cg_gen_prediction(visual: array, seed: int) -> array {
+    let mut out = []
+    let mut t = 0
+    while t < CG_STEPS {
+        let face_idx = t % CG_N_FACES
+        let fam = cg_is_familiar(face_idx)
+
+        // Predicted emotional response given visual input.
+        // For familiar faces: brain expects strong emotional response
+        // proportional to the visual signal.
+        // For unfamiliar faces: brain expects low emotional response.
+        let mut pred = CG_UNFAM_AMP * 0.5
+        if fam == 1 {
+            pred = CG_PRED_WEIGHT * visual[t]
+        }
+
+        out = out.push(pred)
+        t = t + 1
+    }
+    return out
+}
+
+// Compute prediction error stream: |predicted - actual| at each step
+fn cg_pred_error_stream(predicted: array, actual: array) -> array {
+    let n = len(predicted)
+    let mut out = []
+    let mut t = 0
+    while t < n {
+        let pe = cg_abs(predicted[t] - actual[t])
+        out = out.push(pe)
+        t = t + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SCR differential — autonomic disconnect metric (Ellis et al. 1997)
+// SCR_diff = mean(emo[familiar]) - mean(emo[unfamiliar])
+// Normal: >> 0.  Capgras: ≈ 0 (flat).  Prosopagnosia: >> 0 (covert).
+// ═══════════════════════════════════════════════════════════════
+
+fn cg_scr_familiar_mean(emo: array) -> float {
+    let mut sum = 0.0
+    let mut cnt = 0
+    let mut t = 0
+    while t < CG_STEPS {
+        let face_idx = t % CG_N_FACES
+        let fam = cg_is_familiar(face_idx)
+        if fam == 1 {
+            sum = sum + emo[t]
+            cnt = cnt + 1
+        }
+        t = t + 1
+    }
+    if cnt == 0 { return 0.0 }
+    return sum / to_float(cnt)
+}
+
+fn cg_scr_unfamiliar_mean(emo: array) -> float {
+    let mut sum = 0.0
+    let mut cnt = 0
+    let mut t = 0
+    while t < CG_STEPS {
+        let face_idx = t % CG_N_FACES
+        let fam = cg_is_familiar(face_idx)
+        if fam == 0 {
+            sum = sum + emo[t]
+            cnt = cnt + 1
+        }
+        t = t + 1
+    }
+    if cnt == 0 { return 0.0 }
+    return sum / to_float(cnt)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Φ helpers — route-specific and integrated measures
+// ═══════════════════════════════════════════════════════════════
+
+// Generate the face-type label stream: 1.0 for familiar, 0.0 for
+// unfamiliar. This is the "ground truth" that a functional route
+// should be able to discriminate.
+fn cg_face_label_stream() -> array {
+    let mut out = []
+    let mut t = 0
+    while t < CG_STEPS {
+        let face_idx = t % CG_N_FACES
+        let fam = cg_is_familiar(face_idx)
+        let mut val = 0.0
+        if fam == 1 { val = 1.0 }
+        out = out.push(val)
+        t = t + 1
+    }
+    return out
+}
+
+// Φ for a single route: discriminative information content.
+// Measures MI between the route signal and the face-type labels.
+// A functional visual route discriminates familiar vs unfamiliar
+// faces (high MI with labels). A broken route (Capgras emotional,
+// prosopagnosia visual) produces undifferentiated noise (low MI
+// with labels).
+//
+// This is the scientifically correct metric:
+//   - Capgras visual: high discriminative MI (FFA sees who it is)
+//   - Capgras emotional: near-zero discriminative MI (SCR flat)
+//   - Prosopagnosia visual: near-zero (FFA cannot resolve)
+//   - Prosopagnosia emotional: high (covert SCR differentiates)
+fn cg_phi_route(stream: array) -> float {
+    let labels = cg_face_label_stream()
+    return cg_mi(stream, labels)
+}
+
+// Φ_cross: MI between visual and emotional routes (cross-route
+// integration). High in normal, low in Capgras.
+fn cg_phi_cross(visual: array, emotional: array) -> float {
+    return cg_mi(visual, emotional)
+}
+
+// Integrated Φ: product of route Φ and cross-route Φ.
+// Product form ensures that ANY route failure collapses overall.
+fn cg_phi_integrated(visual: array, emotional: array) -> float {
+    let phi_v = cg_phi_route(visual)
+    let phi_e = cg_phi_route(emotional)
+    let phi_c = cg_phi_cross(visual, emotional)
+    return phi_v * phi_e * phi_c
+}
+
+// Prediction error Φ = MI(PE_stream, visual). High in Capgras (structured
+// mismatch on familiar faces), low in normal (flat PE).
+
+fn cg_phi_pred_error(pe_stream: array, visual: array) -> float {
+    return cg_mi(pe_stream, visual)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1..T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1 Normal recognition — both Φ_visual and Φ_emotional > 0
+    //   Two routes fire together for familiar faces.
+    //   MI(visual, emotional) is high because coupling is intact.
+    //   Integrated Φ (product) exceeds floor.
+    let vis = cg_gen_visual(CG_VIS_STRONG, 99001)
+    let emo = cg_gen_emotional(vis, CG_COUPLE_NORMAL, false, 99101)
+
+    let phi_v = cg_phi_route(vis)
+    let phi_e = cg_phi_route(emo)
+    let phi_cross = cg_phi_cross(vis, emo)
+    let phi_int = cg_phi_integrated(vis, emo)
+
+    // SCR differential: familiar should be higher than unfamiliar
+    let scr_fam = cg_scr_familiar_mean(emo)
+    let scr_unf = cg_scr_unfamiliar_mean(emo)
+    let scr_diff = scr_fam - scr_unf
+
+    println("  [T1] Phi_visual_route=" + str(phi_v) + " Phi_emotional_route=" + str(phi_e))
+    println("  [T1] Phi_cross(vis,emo)=" + str(phi_cross) + " Phi_integrated=" + str(phi_int))
+    println("  [T1] SCR fam=" + str(scr_fam) + " unfam=" + str(scr_unf) + " diff=" + str(scr_diff))
+
+    let mut ok = true
+    if phi_v <= CG_PHI_MIN { ok = false }
+    if phi_e <= CG_PHI_MIN { ok = false }
+    if phi_cross <= CG_PHI_MIN { ok = false }
+    if phi_int <= CG_PHI_FLOOR { ok = false }
+    // SCR differential must be positive (familiar > unfamiliar)
+    if scr_diff <= 0.0 { ok = false }
+    return ok
+}
+
+fn check_T2() -> bool {
+    // T2 Capgras — visual identity intact, emotional familiarity absent.
+    //   Φ_visual remains high (FFA intact).
+    //   Φ_emotional collapses (autonomic disconnect).
+    //   The dissociation gap is large.
+    //   SCR differential collapses (flat across face types).
+
+    // Normal baseline for comparison
+    let vis_n = cg_gen_visual(CG_VIS_STRONG, 99201)
+    let emo_n = cg_gen_emotional(vis_n, CG_COUPLE_NORMAL, false, 99301)
+    let phi_v_n = cg_phi_route(vis_n)
+    let phi_e_n = cg_phi_route(emo_n)
+
+    // Capgras condition: visual intact, emotional coupling broken
+    // Root cause: the amygdala→SCR pathway is disconnected from FFA.
+    // Visual route is identical (same FFA activation), but emotional
+    // route receives no coupled input — only noise.
+    let vis_c = cg_gen_visual(CG_VIS_STRONG, 99201)
+    let emo_c = cg_gen_emotional(vis_c, CG_COUPLE_BROKEN, false, 99301)
+    let phi_v_c = cg_phi_route(vis_c)
+    let phi_e_c = cg_phi_route(emo_c)
+    let phi_cross_c = cg_phi_cross(vis_c, emo_c)
+
+    // SCR differential under Capgras
+    let scr_fam_c = cg_scr_familiar_mean(emo_c)
+    let scr_unf_c = cg_scr_unfamiliar_mean(emo_c)
+    let scr_diff_c = cg_abs(scr_fam_c - scr_unf_c)
+
+    // SCR differential under normal
+    let scr_fam_n = cg_scr_familiar_mean(emo_n)
+    let scr_unf_n = cg_scr_unfamiliar_mean(emo_n)
+    let scr_diff_n = scr_fam_n - scr_unf_n
+
+    let dissoc_gap = cg_abs(phi_v_c - phi_e_c)
+
+    println("  [T2] Normal: Phi_vis=" + str(phi_v_n) + " Phi_emo=" + str(phi_e_n))
+    println("  [T2] Capgras: Phi_vis=" + str(phi_v_c) + " Phi_emo=" + str(phi_e_c) + " Phi_cross=" + str(phi_cross_c))
+    println("  [T2] dissociation gap=" + str(dissoc_gap))
+    println("  [T2] SCR diff normal=" + str(scr_diff_n) + " Capgras=" + str(scr_diff_c))
+
+    let mut ok = true
+    // Visual route must remain active (FFA intact)
+    if phi_v_c <= CG_PHI_MIN { ok = false }
+    // Emotional route must collapse (autonomic disconnect)
+    if phi_e_c > CG_EMO_CEIL { ok = false }
+    // Dissociation gap must be detectable
+    if dissoc_gap <= CG_DISSOC_GAP { ok = false }
+    // SCR differential must collapse in Capgras relative to normal
+    if scr_diff_c >= scr_diff_n { ok = false }
+    return ok
+}
+
+fn check_T3() -> bool {
+    // T3 Prosopagnosia — opposite double dissociation.
+    //   Φ_visual collapses (FFA damaged — cannot consciously identify).
+    //   Φ_emotional remains active (covert familiarity intact).
+    //   Mirror of Capgras proves route independence (Bauer 1984).
+
+    // Prosopagnosia: visual route impaired, emotional route gets
+    // covert familiarity signal through non-FFA pathway.
+    let vis_p = cg_gen_visual(CG_VIS_IMPAIRED, 99401)
+    let emo_p = cg_gen_emotional(vis_p, CG_COUPLE_PROSOP, true, 99501)
+    let phi_v_p = cg_phi_route(vis_p)
+    let phi_e_p = cg_phi_route(emo_p)
+
+    // Capgras for comparison (opposite signature)
+    let vis_c = cg_gen_visual(CG_VIS_STRONG, 99601)
+    let emo_c = cg_gen_emotional(vis_c, CG_COUPLE_BROKEN, false, 99701)
+    let phi_v_c = cg_phi_route(vis_c)
+    let phi_e_c = cg_phi_route(emo_c)
+
+    // SCR differential in prosopagnosia (should still be positive —
+    // covert recognition produces differential SCR to known faces)
+    let scr_fam_p = cg_scr_familiar_mean(emo_p)
+    let scr_unf_p = cg_scr_unfamiliar_mean(emo_p)
+    let scr_diff_p = scr_fam_p - scr_unf_p
+
+    println("  [T3] Prosopagnosia: Phi_vis=" + str(phi_v_p) + " Phi_emo=" + str(phi_e_p))
+    println("  [T3] Capgras ref:   Phi_vis=" + str(phi_v_c) + " Phi_emo=" + str(phi_e_c))
+    println("  [T3] Prosop SCR diff=" + str(scr_diff_p) + " (covert familiarity)")
+    println("  [T3] Double dissociation: Capgras(vis+,emo-) vs Prosop(vis-,emo+)")
+
+    let mut ok = true
+    // Prosopagnosia: visual route must collapse
+    if phi_v_p > CG_VIS_CEIL { ok = false }
+    // Prosopagnosia: emotional route must remain active
+    if phi_e_p <= CG_PHI_MIN { ok = false }
+    // Mirror dissociation: Capgras visual > prosop visual
+    if phi_v_c <= phi_v_p { ok = false }
+    // Mirror dissociation: prosop emotional > Capgras emotional
+    if phi_e_p <= phi_e_c { ok = false }
+    // Covert SCR differential must be positive
+    if scr_diff_p <= 0.0 { ok = false }
+    return ok
+}
+
+fn check_T4() -> bool {
+    // T4 Prediction error Φ > 0 in Capgras (mismatch drives delusion).
+    //   The brain expects emotional response given visual input.
+    //   In Capgras, the prediction is violated → PE is large and structured.
+    //   Φ_pred_error (Capgras) > Φ_pred_error (normal) + CG_PE_GAP.
+    //   This mismatch information drives the "impostor" belief formation
+    //   (Coltheart 2010; Corlett 2019).
+
+    // Normal: prediction matches reality (PE low)
+    let vis_n = cg_gen_visual(CG_VIS_STRONG, 99801)
+    let emo_n = cg_gen_emotional(vis_n, CG_COUPLE_NORMAL, false, 99901)
+    let pred_n = cg_gen_prediction(vis_n, 99801)
+    let pe_n = cg_pred_error_stream(pred_n, emo_n)
+    let pe_mean_n = cg_mean(pe_n)
+    let phi_pe_n = cg_phi_pred_error(pe_n, vis_n)
+
+    // Capgras: prediction violated (PE high)
+    // Root cause: visual route predicts emotional warmth for familiar
+    // faces, but the autonomic route delivers nothing. The persistent
+    // mismatch is what drives the patient to form a delusional
+    // explanation ("impostor") to account for the discrepancy.
+    let vis_c = cg_gen_visual(CG_VIS_STRONG, 99801)
+    let emo_c = cg_gen_emotional(vis_c, CG_COUPLE_BROKEN, false, 99901)
+    let pred_c = cg_gen_prediction(vis_c, 99801)
+    let pe_c = cg_pred_error_stream(pred_c, emo_c)
+    let pe_mean_c = cg_mean(pe_c)
+    let phi_pe_c = cg_phi_pred_error(pe_c, vis_c)
+
+    let pe_gap = phi_pe_c - phi_pe_n
+
+    println("  [T4] Normal PE: mean=" + str(pe_mean_n) + " Phi_PE=" + str(phi_pe_n))
+    println("  [T4] Capgras PE: mean=" + str(pe_mean_c) + " Phi_PE=" + str(phi_pe_c))
+    println("  [T4] PE gap (Capgras - normal)=" + str(pe_gap))
+
+    let mut ok = true
+    // Capgras PE mean must be higher than normal
+    if pe_mean_c <= pe_mean_n { ok = false }
+    // Capgras PE Φ must be higher (structured mismatch, not random)
+    if pe_gap <= CG_PE_GAP { ok = false }
+    // Capgras PE must be non-trivial
+    if phi_pe_c <= 0.0 { ok = false }
+    return ok
+}
+
+fn check_T5() -> bool {
+    // T5 Determinism + latency.
+    //   Two runs with identical seeds must produce identical Φ values.
+    //   This verifies the LCG PRNG and all computation paths are
+    //   fully deterministic (no hidden state, no floating-point
+    //   nondeterminism from reordering).
+
+    // Run A
+    let vis_a = cg_gen_visual(CG_VIS_STRONG, 55001)
+    let emo_a = cg_gen_emotional(vis_a, CG_COUPLE_NORMAL, false, 55101)
+    let phi_v_a = cg_phi_route(vis_a)
+    let phi_e_a = cg_phi_route(emo_a)
+    let phi_c_a = cg_phi_cross(vis_a, emo_a)
+    let phi_int_a = cg_phi_integrated(vis_a, emo_a)
+
+    // Run B — identical seeds
+    let vis_b = cg_gen_visual(CG_VIS_STRONG, 55001)
+    let emo_b = cg_gen_emotional(vis_b, CG_COUPLE_NORMAL, false, 55101)
+    let phi_v_b = cg_phi_route(vis_b)
+    let phi_e_b = cg_phi_route(emo_b)
+    let phi_c_b = cg_phi_cross(vis_b, emo_b)
+    let phi_int_b = cg_phi_integrated(vis_b, emo_b)
+
+    let d_v = cg_abs(phi_v_a - phi_v_b)
+    let d_e = cg_abs(phi_e_a - phi_e_b)
+    let d_c = cg_abs(phi_c_a - phi_c_b)
+    let d_i = cg_abs(phi_int_a - phi_int_b)
+
+    println("  [T5] Run A: Phi_vis=" + str(phi_v_a) + " Phi_emo=" + str(phi_e_a) + " Phi_cross=" + str(phi_c_a))
+    println("  [T5] Run B: Phi_vis=" + str(phi_v_b) + " Phi_emo=" + str(phi_e_b) + " Phi_cross=" + str(phi_c_b))
+    println("  [T5] delta_vis=" + str(d_v) + " delta_emo=" + str(d_e) + " delta_cross=" + str(d_c) + " delta_int=" + str(d_i))
+
+    // Also run a Capgras condition determinism check
+    let vis_ca = cg_gen_visual(CG_VIS_STRONG, 55201)
+    let emo_ca = cg_gen_emotional(vis_ca, CG_COUPLE_BROKEN, false, 55301)
+    let pred_ca = cg_gen_prediction(vis_ca, 55201)
+    let pe_ca = cg_pred_error_stream(pred_ca, emo_ca)
+    let phi_pe_a2 = cg_phi_pred_error(pe_ca, vis_ca)
+
+    let vis_cb = cg_gen_visual(CG_VIS_STRONG, 55201)
+    let emo_cb = cg_gen_emotional(vis_cb, CG_COUPLE_BROKEN, false, 55301)
+    let pred_cb = cg_gen_prediction(vis_cb, 55201)
+    let pe_cb = cg_pred_error_stream(pred_cb, emo_cb)
+    let phi_pe_b2 = cg_phi_pred_error(pe_cb, vis_cb)
+
+    let d_pe = cg_abs(phi_pe_a2 - phi_pe_b2)
+    println("  [T5] Capgras PE determinism: delta=" + str(d_pe))
+
+    let mut ok = true
+    if d_v > CG_DETERM_TOL { ok = false }
+    if d_e > CG_DETERM_TOL { ok = false }
+    if d_c > CG_DETERM_TOL { ok = false }
+    if d_i > CG_DETERM_TOL { ok = false }
+    if d_pe > CG_DETERM_TOL { ok = false }
+    return ok
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — execute 5 self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[capgras_phi] P99 — Capgras Delusion Phi (Ellis & Young 1990)")
+    println("  steps=" + str(CG_STEPS) + " faces=" + str(CG_N_FACES) + " bins=" + str(CG_BINS))
+    println("  refs: Ellis & Young 1990 | Ellis et al. 1997 | Hirstein & Ramachandran 1997")
+    println("        Bauer 1984 | Tranel & Damasio 1985 | Coltheart 2010 | Corlett 2019")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — normal recognition (both routes active, SCR differential)") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — Capgras (visual intact, emotional absent, SCR flat)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — prosopagnosia (opposite double dissociation, covert SCR)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — prediction error Phi > 0 in Capgras (mismatch drives delusion)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — determinism (identical seeds, identical Phi values)") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause: stage0 long && chains may mishandle short-circuit
+    // ordering — use a mutable bool accumulator with sequential guards
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[capgras_phi] 5/5 PASS — P99 DONE")
+    } else {
+        println("[capgras_phi] SOME FAILED")
+    }
+}
+
+main()

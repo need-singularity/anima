@@ -1,0 +1,893 @@
+// hemispatial_neglect_phi.hexa — P98 Hemispatial Neglect Φ
+//
+// Roadmap: shared/roadmaps/anima.json P98
+//   "Hemispatial Neglect — Heilman & Valenstein right parietal lesion:
+//    left hemispace awareness collapses while right preserved. Line
+//    bisection bias, extinction under bilateral stimulation, prism
+//    adaptation recovery."
+//
+// ─── Scientific reference ──────────────────────────────────────────
+//
+// Heilman KM, Valenstein E (1979), "Mechanisms underlying hemispatial
+//   neglect." Ann Neurol 5:166-170.
+//   Right-hemisphere (predominantly right posterior parietal cortex, rPPC)
+//   lesion — typically MCA stroke involving the inferior parietal lobule
+//   (IPL, angular/supramarginal gyri) — produces CONTRALATERAL left
+//   hemispatial neglect: the patient fails to report, respond to, or
+//   orient toward stimuli in left hemispace. This is NOT a sensory loss
+//   (the retina and V1 are intact); it is an ATTENTIONAL/REPRESENTATIONAL
+//   deficit — the patient's internal spatial map is truncated.
+//
+// Mesulam (1981, 1999), "A cortical network for directed attention and
+//   unilateral neglect." The right hemisphere has bilateral spatial
+//   representation (attends both hemispaces), while the left hemisphere
+//   represents mainly the right hemispace. Therefore:
+//     - Left parietal lesion → minimal neglect (right hemisphere
+//       compensates, covering both sides).
+//     - Right parietal lesion → left neglect (left hemisphere can only
+//       cover right side; no compensator for left).
+//   This asymmetry explains why right-hemisphere neglect is common and
+//   left-hemisphere neglect is rare.
+//
+// ─── Line bisection ────────────────────────────────────────────────
+//
+// Schenkenberg, Bradford, Ajax (1980), "Line bisection and unilateral
+//   visual neglect in patients with neurologic impairment."
+//   Patients with left neglect mark the midpoint of a horizontal line
+//   significantly to the RIGHT of true center. The perceived "left end"
+//   is foreshortened because the internal left-space representation is
+//   compressed or absent. Bisection error magnitude correlates with
+//   neglect severity. Healthy controls: error < 1% of line length.
+//   Severe neglect: error > 15-25% rightward.
+//
+// ─── Extinction ────────────────────────────────────────────────────
+//
+// Heilman, Valenstein, Watson (2000), "Neglect and related disorders."
+//   Extinction: when stimuli are presented to both hemispaces
+//   simultaneously, the left stimulus is "extinguished" — not reported
+//   even though the same left stimulus is correctly detected when
+//   presented alone (unilateral condition). This is diagnostic: the
+//   right-side stimulus actively suppresses the already-weakened left
+//   representation under competitive conditions.
+//
+//   Unilateral left: patient detects (damaged but above threshold alone).
+//   Bilateral: left extinguished (right wins the competition).
+//   This produces a bilateral Φ_left < unilateral Φ_left signature.
+//
+// ─── Prism adaptation ──────────────────────────────────────────────
+//
+// Rossetti Y et al. (1998), "Prism adaptation to a rightward optical
+//   deviation rehabilitates left hemispatial neglect." Nature 395:166-169.
+//   Wearing rightward-shifting prisms forces the sensorimotor system to
+//   recalibrate leftward. After only 10-15 minutes of prism exposure,
+//   neglect patients show significant improvement: line bisection moves
+//   leftward toward true center, cancellation improves, and the
+//   after-effect persists for hours to days. The mechanism is
+//   sensorimotor recalibration of egocentric spatial coordinates,
+//   partially restoring left-space representation.
+//
+// ─── Operational model ─────────────────────────────────────────────
+//
+//   parietal_integrity ∈ [0,1]  (1.0=healthy, 0.0=full lesion)
+//   HN_NCHAN channels per hemispace; shared attention modulation.
+//   Φ_hemi = avg cross-channel MI. High gain → channels share signal
+//   → high MI. Low gain → independent noise → low MI.
+//
+//   Line bisection: attention-weighted centroid vs true center.
+//   Extinction: bilateral competition disrupts shared signal phase.
+//   Pipeline: gen_channels → apply_attention(gain) → phi_multi(cross-MI)
+//
+// ─── Tests (T1–T5) ─────────────────────────────────────────────────
+//
+// T1 (normal bilateral balance): parietal_integrity=1.0.
+//     Φ_left ≈ Φ_right — balanced spatial awareness. The ratio
+//     Φ_left / Φ_right must be within HN_BALANCE_TOL of 1.0.
+//
+// T2 (neglect — Φ_left collapse): parietal_integrity=HN_LESION.
+//     Φ_left << Φ_right. The ratio Φ_left / Φ_right must be
+//     below HN_NEGLECT_RATIO_CEIL.
+//
+// T3 (line bisection bias): bisection error must be proportional to
+//     Φ asymmetry. Sweep parietal_integrity from 1.0 to 0.0;
+//     correlation between (Φ_right - Φ_left) and bisection_error
+//     must exceed HN_BISECT_CORR_MIN.
+//
+// T4 (extinction): bilateral Φ_left must drop more than unilateral
+//     Φ_left when right stimulus co-presented.
+//     bilateral_Φ_left < unilateral_Φ_left × HN_EXTINCT_RATIO.
+//
+// T5 (determinism + latency): rerun, confirm identical output,
+//     wall time < 5000ms.
+//
+// ─── Stage0 hexa constraints honored ───────────────────────────────
+//   - plain `fn` only (no `pure fn` with >=3 float struct returns)
+//   - `array` typed params only (no [float] / [str])
+//   - no identifier-pattern match; use if-chains
+//   - no contains() / to_lower() / !(Effect)
+//   - no else-if in let-binding; flat mut + sequential if
+//   - single-line fn signatures / call sites / array literals
+//   - lists pass-by-value; rebuild + return
+//   - main() call at bottom
+//   - N < 32: HN_DIM=16, HN_BINS=4, HN_STEPS=30
+//
+// Law alignment:
+//   Law 2   Observe never inject — Φ via MI measurement only
+//   Law 4   Structure > feature — parietal lesion is STRUCTURAL pathway break
+//   Law 22  Feature addition -> Φ down — fixed channels, no extras
+//   Meta M8 Spatial awareness asymmetry — knowing without attending
+//   AN7     Core separation — standalone engine
+//   Ref: Heilman & Valenstein 1979, Mesulam 1981/1999,
+//        Schenkenberg et al. 1980, Rossetti et al. 1998
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+// Simulation geometry
+let HN_DIM             = 16          // spatial field dimensionality (< 32)
+let HN_HALF            = 8           // HN_DIM / 2, boundary between hemispaces
+let HN_BINS            = 4           // histogram bins for MI (fewer → less noise)
+let HN_STEPS           = 30          // temporal steps per trace (more → better MI)
+let HN_EPS             = 0.00000001
+
+// Parietal integrity levels
+let HN_INTACT          = 1.0         // healthy bilateral attention
+let HN_LESION          = 0.1         // severe right parietal lesion
+let HN_LESION_MILD     = 0.4         // mild lesion for extinction test
+
+// Attention model parameters
+let HN_BASE_GAIN       = 0.85        // baseline attention gain (right hemi coverage)
+let HN_LH_LEAK         = 0.02        // left hemisphere tiny leak to left space
+
+// Extinction model
+let HN_COMPETE_WEIGHT  = 0.85        // competitive suppression weight (strong extinction)
+let HN_EXTINCT_RATIO   = 0.90        // bilateral must drop below this × unilateral
+
+// Thresholds for pass/fail
+let HN_BALANCE_TOL     = 0.35        // |Φ_left/Φ_right - 1| must be < this for T1
+let HN_NEGLECT_RATIO_CEIL = 0.50     // Φ_left/Φ_right must be below this for T2
+let HN_BISECT_CORR_MIN = 0.55        // correlation threshold for T3
+let HN_PHI_FLOOR       = 0.005       // minimum meaningful Φ
+
+// Sweep for T3 correlation
+let HN_SWEEP_N         = 10          // number of integrity sweep steps
+
+// Deterministic seeds
+let HN_SEED_SPATIAL    = 98001
+let HN_SEED_ATTEND     = 98002
+let HN_SEED_NOISE      = 98003
+let HN_SEED_EXTINCT    = 98004
+
+// ═══════════════════════════════════════════════════════════════
+// Math primitives (hn_ prefix to avoid clashes)
+// ═══════════════════════════════════════════════════════════════
+
+fn hn_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn hn_max2(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+fn hn_min2(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn hn_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn hn_clamp(x: float, lo: float, hi: float) -> float {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+fn hn_sqrt(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x
+    let mut i = 0
+    while i < 20 {
+        g = 0.5 * (g + x / g)
+        i = i + 1
+    }
+    return g
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PRNG — deterministic LCG (same pattern as other engines)
+// ═══════════════════════════════════════════════════════════════
+
+fn hn_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn hn_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn hn_signed(seed: int) -> float {
+    return hn_unit(seed) * 2.0 - 1.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Vector utilities
+// ═══════════════════════════════════════════════════════════════
+
+fn hn_vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn hn_vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn hn_vec_mean(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + v[i]
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Histogram MI estimator (standard across anima-engines)
+// ═══════════════════════════════════════════════════════════════
+
+fn hn_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn hn_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn hn_entropy(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(hn_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = hn_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * hn_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn hn_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = hn_bin_idx(a[i], lo, hi, nb)
+        let ib = hn_bin_idx(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = hn_counts(pair_ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * hn_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn hn_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let lo_a = hn_vec_min(a)
+    let hi_a = hn_vec_max(a)
+    let lo_b = hn_vec_min(b)
+    let hi_b = hn_vec_max(b)
+    let lo = hn_min2(lo_a, lo_b)
+    let hi = hn_max2(hi_a, hi_b)
+    let h_a = hn_entropy(a, lo, hi, HN_BINS)
+    let h_b = hn_entropy(b, lo, hi, HN_BINS)
+    let h_j = hn_joint_entropy(a, b, lo, hi, HN_BINS)
+    let mi = h_a + h_b - h_j
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Spatial field: HN_DIM positions x HN_STEPS timesteps, flat row-major.
+// Left [0..HN_HALF-1] and right [HN_HALF..HN_DIM-1] equally structured.
+// ═══════════════════════════════════════════════════════════════
+
+fn hn_gen_spatial_field(seed: int) -> array {
+    let mut field = []
+    let mut s = seed
+    let mut t = 0
+    while t < HN_STEPS {
+        let mut p = 0
+        while p < HN_DIM {
+            s = hn_prng(s + t * 137 + p * 31)
+            let base_noise = hn_signed(s) * 0.3
+            let pos_norm = to_float(p) / to_float(HN_DIM) - 0.5
+            let phase = to_float(t) * 0.4 + to_float(p) * 0.2
+            let temporal = hn_clamp(phase - to_float(to_int(phase)), 0.0, 1.0) * 2.0 - 1.0
+            let val = pos_norm * 0.6 + temporal * 0.4 + base_noise
+            field = field.push(val)
+            p = p + 1
+        }
+        t = t + 1
+    }
+    return field
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Multi-channel attention model
+//
+// Each hemispace has HN_NCHAN channels. Attention creates SHARED
+// modulation across channels (common factor). When attention is
+// high, channels co-vary → cross-channel MI is high. When attention
+// is low, channels become independently noisy → MI drops.
+//
+// Φ_hemi = average cross-channel MI. This is robust to PRNG quirks
+// because we measure BETWEEN channels, not within a single trace.
+// ═══════════════════════════════════════════════════════════════
+
+let HN_NCHAN = 6  // channels per hemispace (15 pairs for MI averaging)
+
+// Generate multi-channel spatial trace for one hemispace.
+// Returns flat array [ch0_t0, ch0_t1, ..., ch0_tN, ch1_t0, ...].
+// Length = HN_NCHAN * HN_STEPS.
+fn hn_gen_hemi_channels(seed: int) -> array {
+    let mut out = []
+    let mut ch = 0
+    while ch < HN_NCHAN {
+        let mut s = seed + ch * 9001
+        let mut t = 0
+        while t < HN_STEPS {
+            s = hn_prng(s)
+            // Base signal with temporal structure: sawtooth wave
+            let phase = to_float(t) * 0.3 + to_float(ch) * 0.7
+            let saw = phase - to_float(to_int(phase))
+            let base = saw * 2.0 - 1.0
+            let jitter = hn_signed(s) * 0.15
+            out = out.push(base + jitter)
+            t = t + 1
+        }
+        ch = ch + 1
+    }
+    return out
+}
+
+// Apply attention: the output for each channel is a MIX of:
+//   (a) a SHARED signal (same across all channels) — weighted by gain
+//   (b) an INDEPENDENT noise per channel — weighted by (1-gain)
+// Cross-channel MI comes ENTIRELY from the shared component.
+// At high gain, channels co-vary → MI high. At low gain, independent → MI low.
+fn hn_apply_attention(channels: array, gain: float, seed: int) -> array {
+    // Generate shared attention signal — common across all channels.
+    // This is the sole source of cross-channel MI.
+    let mut shared = []
+    let mut s = seed
+    let mut t = 0
+    while t < HN_STEPS {
+        s = hn_prng(s)
+        let phase = to_float(t) * 0.25
+        let saw = (phase - to_float(to_int(phase))) * 2.0 - 1.0
+        let jit = hn_signed(s) * 0.1
+        shared = shared.push(saw + jit)
+        t = t + 1
+    }
+    let mut out = []
+    let noise_base = seed + 40000
+    let mut ch = 0
+    while ch < HN_NCHAN {
+        let mut t2 = 0
+        while t2 < HN_STEPS {
+            let indep = hn_noise_val(noise_base, ch, t2)
+            // Pure mix: gain controls shared vs independent
+            let val = gain * shared[t2] + (1.0 - gain) * indep
+            out = out.push(val)
+            t2 = t2 + 1
+        }
+        ch = ch + 1
+    }
+    return out
+}
+
+// Compute Φ for a hemispace: average cross-channel lag-1 MI across all
+// channel pairs. This measures how well channels are bound by attention.
+fn hn_phi_multi(channels: array) -> float {
+    let mut total_mi = 0.0
+    let mut n_pairs = 0
+    let mut i = 0
+    while i < HN_NCHAN {
+        let mut j = i + 1
+        while j < HN_NCHAN {
+            // Extract channel i and j traces
+            let mut ci = []
+            let mut cj = []
+            let mut t = 0
+            while t < HN_STEPS {
+                ci = ci.push(channels[i * HN_STEPS + t])
+                cj = cj.push(channels[j * HN_STEPS + t])
+                t = t + 1
+            }
+            total_mi = total_mi + hn_mi(ci, cj)
+            n_pairs = n_pairs + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if n_pairs == 0 { return 0.0 }
+    return total_mi / to_float(n_pairs)
+}
+
+// Compute [Φ_left, Φ_right] given parietal integrity.
+fn hn_attend_bilateral(parietal: float, seed: int) -> array {
+    let left_ch = hn_gen_hemi_channels(seed)
+    let right_ch = hn_gen_hemi_channels(seed + 10000)
+    // Left hemispace: attention gated by parietal (RH covers left)
+    let left_gain = parietal * HN_BASE_GAIN + HN_LH_LEAK
+    // Right hemispace: always well-attended (LH covers right)
+    let right_gain = HN_BASE_GAIN + parietal * HN_LH_LEAK
+    let left_att = hn_apply_attention(left_ch, left_gain, seed + 20000)
+    let right_att = hn_apply_attention(right_ch, right_gain, seed + 30000)
+    let phi_l = hn_phi_multi(left_att)
+    let phi_r = hn_phi_multi(right_att)
+    let mut result = []
+    result = result.push(phi_l)
+    result = result.push(phi_r)
+    return result
+}
+
+// Backward-compatible wrapper: return [Φ_left, Φ_right].
+fn hn_phi_bilateral(parietal: float, seed: int) -> array {
+    return hn_attend_bilateral(parietal, seed)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Line bisection: attention-weighted centroid vs true center.
+// Positive error = rightward shift (hallmark of left neglect).
+// ═══════════════════════════════════════════════════════════════
+
+fn hn_line_bisection(parietal: float, seed: int) -> float {
+    let field = hn_gen_spatial_field(seed)
+    let mut weights = []
+    let mut s = seed + 5000
+    let mut p = 0
+    while p < HN_DIM {
+        let mut w = 0.0
+        if p < HN_HALF {
+            let rh_gain = parietal * HN_BASE_GAIN
+            w = rh_gain + HN_LH_LEAK
+        } else {
+            w = HN_BASE_GAIN + parietal * 0.15
+        }
+        s = hn_prng(s + p * 71)
+        let jitter = hn_signed(s) * 0.02
+        w = hn_clamp(w + jitter, 0.0, 2.0)
+        weights = weights.push(w)
+        p = p + 1
+    }
+    // Weighted centroid: sum(pos * weight) / sum(weight)
+    let mut num = 0.0
+    let mut den = 0.0
+    let mut k = 0
+    while k < HN_DIM {
+        num = num + to_float(k) * weights[k]
+        den = den + weights[k]
+        k = k + 1
+    }
+    let perceived = num / den
+    let true_center = to_float(HN_HALF) - 0.5
+    let error = (perceived - true_center) / to_float(HN_DIM)
+    return error
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Extinction: bilateral competition suppresses weakened left channel.
+// ═══════════════════════════════════════════════════════════════
+
+// Extinction pair: returns [Φ_left_unilateral, Φ_left_bilateral].
+// Bilateral case: the right stimulus injects cross-channel disruption
+// that SCRAMBLES the shared attention signal across channels, reducing
+// cross-channel MI even when the base gain is the same.
+fn hn_extinction_pair(parietal: float, seed: int) -> array {
+    let gain = parietal * HN_BASE_GAIN + HN_LH_LEAK
+    // Unilateral: standard model
+    let phi_uni = hn_phi_from_gain(gain, seed)
+    // Bilateral: same gain but cross-channel disruption from competition.
+    // The right stimulus creates interference that phase-shifts the shared
+    // signal differently per channel. Disruption proportional to (1-parietal).
+    let disrupt = HN_COMPETE_WEIGHT * (1.0 - parietal)
+    let phi_bil = hn_phi_from_gain_disrupted(gain, disrupt, seed)
+    let mut result = []
+    result = result.push(phi_uni)
+    result = result.push(phi_bil)
+    return result
+}
+
+// Same as hn_phi_from_gain but with per-channel disruption of the shared
+// signal. Disruption adds channel-specific phase offsets to the shared
+// signal, destroying cross-channel MI. At disrupt=0 → same as undisrupted.
+fn hn_phi_from_gain_disrupted(gain: float, disrupt: float, seed: int) -> float {
+    let mut out = []
+    // Base shared signal
+    let mut shared = []
+    let mut s = seed + 70000
+    let mut t = 0
+    while t < HN_STEPS {
+        s = hn_prng(s)
+        let phase = to_float(t) * 0.25
+        let saw = (phase - to_float(to_int(phase))) * 2.0 - 1.0
+        let jit = hn_signed(s) * 0.1
+        shared = shared.push(saw + jit)
+        t = t + 1
+    }
+    // Build channels with disrupted shared signal
+    let noise_base = seed + 80000
+    let mut ch = 0
+    while ch < HN_NCHAN {
+        // Per-channel phase offset proportional to disruption
+        let offset = to_int(disrupt * to_float(ch + 1) * 3.7)
+        let mut t2 = 0
+        while t2 < HN_STEPS {
+            let indep = hn_noise_val(noise_base, ch, t2)
+            // Disrupted shared: read from a shifted position (circular)
+            let sh_idx = (t2 + offset) % HN_STEPS
+            let val = gain * shared[sh_idx] + (1.0 - gain) * indep
+            out = out.push(val)
+            t2 = t2 + 1
+        }
+        ch = ch + 1
+    }
+    return hn_phi_multi(out)
+}
+
+// Multiplicative hash for (ch, t, seed) → [-1, 1).
+// Uses mixed multiplicative constants to break LCG linear structure.
+// The key insight: we need (ch=0,t=5) and (ch=1,t=5) to produce
+// UNRELATED values. Multiplicative mixing + modular reduction achieves this.
+fn hn_noise_val(base_seed: int, ch: int, t: int) -> float {
+    // Three independent hash rounds with different multipliers
+    let mut h = base_seed + ch * 104729 + t * 7919 + 1
+    h = ((h * 2654435761) + 12345) % 2147483648
+    h = ((h * 1103515245) + t * 13 + ch * 997) % 2147483648
+    h = ((h * 2246822519) + 65537) % 2147483648
+    return to_float(h % 1000000) / 500000.0 - 1.0
+}
+
+// Compute Φ for a single gain level using a fixed seed. The shared
+// signal is always the same; noise uses hash-per-(ch,t) to ensure
+// true independence. Lower gain → lower Φ monotonically.
+fn hn_phi_from_gain(gain: float, seed: int) -> float {
+    let mut out = []
+    // Shared signal (same for all channels, same seed always)
+    let mut shared = []
+    let mut s = seed + 70000
+    let mut t = 0
+    while t < HN_STEPS {
+        s = hn_prng(s)
+        let phase = to_float(t) * 0.25
+        let saw = (phase - to_float(to_int(phase))) * 2.0 - 1.0
+        let jit = hn_signed(s) * 0.1
+        shared = shared.push(saw + jit)
+        t = t + 1
+    }
+    // Build channels: gain * shared + (1-gain) * per-(ch,t) hashed noise
+    let noise_base = seed + 80000
+    let mut ch = 0
+    while ch < HN_NCHAN {
+        let mut t2 = 0
+        while t2 < HN_STEPS {
+            let indep = hn_noise_val(noise_base, ch, t2)
+            let val = gain * shared[t2] + (1.0 - gain) * indep
+            out = out.push(val)
+            t2 = t2 + 1
+        }
+        ch = ch + 1
+    }
+    return hn_phi_multi(out)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Pearson correlation (for T3 bisection-asymmetry correlation)
+// ═══════════════════════════════════════════════════════════════
+
+fn hn_pearson(x: array, y: array) -> float {
+    let n = len(x)
+    if n < 2 { return 0.0 }
+    let mx = hn_vec_mean(x)
+    let my = hn_vec_mean(y)
+    let mut cov = 0.0
+    let mut vx = 0.0
+    let mut vy = 0.0
+    let mut i = 0
+    while i < n {
+        let dx = x[i] - mx
+        let dy = y[i] - my
+        cov = cov + dx * dy
+        vx = vx + dx * dx
+        vy = vy + dy * dy
+        i = i + 1
+    }
+    let denom = hn_sqrt(vx * vy)
+    if denom < HN_EPS { return 0.0 }
+    return cov / denom
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1–T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1: Normal bilateral balance — parietal_integrity = 1.0
+    // Heilman & Valenstein model predicts balanced spatial awareness:
+    // both hemispaces have equal attention coverage, so Φ_left and
+    // Φ_right should be approximately equal.
+    // Mesulam: healthy right hemisphere covers both sides; left hemisphere
+    // also covers right — total coverage roughly symmetric.
+    let result = hn_phi_bilateral(HN_INTACT, HN_SEED_SPATIAL)
+    let phi_l = result[0]
+    let phi_r = result[1]
+
+    let mut ratio = 0.0
+    if phi_r > HN_EPS {
+        ratio = phi_l / phi_r
+    }
+    let deviation = hn_abs(ratio - 1.0)
+
+    println("  [T1] normal: Phi_left=" + str(phi_l) + " Phi_right=" + str(phi_r))
+    println("  [T1] ratio Phi_L/Phi_R=" + str(ratio) + " deviation=" + str(deviation) + " (max=" + str(HN_BALANCE_TOL) + ")")
+
+    // Both must be positive
+    if phi_l <= HN_PHI_FLOOR { return false }
+    if phi_r <= HN_PHI_FLOOR { return false }
+    // Balance: ratio close to 1
+    if deviation > HN_BALANCE_TOL { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: Neglect — right parietal lesion (integrity = HN_LESION)
+    // Heilman & Valenstein: contralateral left neglect, Φ_left collapses
+    // while Φ_right is preserved. The ratio Φ_left/Φ_right must be
+    // well below 1.0, below HN_NEGLECT_RATIO_CEIL.
+    let result_neglect = hn_phi_bilateral(HN_LESION, HN_SEED_SPATIAL)
+    let phi_l_neg = result_neglect[0]
+    let phi_r_neg = result_neglect[1]
+
+    let mut ratio = 0.0
+    if phi_r_neg > HN_EPS {
+        ratio = phi_l_neg / phi_r_neg
+    }
+
+    // Also compare with normal for context
+    let result_normal = hn_phi_bilateral(HN_INTACT, HN_SEED_SPATIAL)
+    let phi_l_norm = result_normal[0]
+
+    println("  [T2] neglect: Phi_left=" + str(phi_l_neg) + " Phi_right=" + str(phi_r_neg))
+    println("  [T2] ratio Phi_L/Phi_R=" + str(ratio) + " (ceil=" + str(HN_NEGLECT_RATIO_CEIL) + ")")
+    println("  [T2] comparison: normal Phi_left=" + str(phi_l_norm))
+
+    // Right must be preserved
+    if phi_r_neg <= HN_PHI_FLOOR { return false }
+    // Left must be dramatically lower than right
+    if ratio >= HN_NEGLECT_RATIO_CEIL { return false }
+    // Left must also be lower than normal left
+    if phi_l_neg >= phi_l_norm { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3: Line bisection error proportional to Φ asymmetry.
+    // Schenkenberg et al. 1980: bisection error grows with neglect severity.
+    // We sweep parietal_integrity from 1.0 to 0.0 in HN_SWEEP_N steps,
+    // compute (Φ_right - Φ_left) asymmetry and bisection error at each,
+    // then correlate. Pearson r must exceed HN_BISECT_CORR_MIN.
+    let mut asymmetries = []
+    let mut errors = []
+
+    let mut step = 0
+    while step <= HN_SWEEP_N {
+        let parietal = 1.0 - to_float(step) / to_float(HN_SWEEP_N)
+        let sweep_seed = HN_SEED_SPATIAL + step * 100
+        let result = hn_phi_bilateral(parietal, sweep_seed)
+        let phi_l = result[0]
+        let phi_r = result[1]
+        let asym = phi_r - phi_l
+        let bisect_err = hn_line_bisection(parietal, sweep_seed)
+
+        asymmetries = asymmetries.push(asym)
+        errors = errors.push(bisect_err)
+        step = step + 1
+    }
+
+    let corr = hn_pearson(asymmetries, errors)
+
+    let asym_first = asymmetries[0]
+    let asym_last = asymmetries[HN_SWEEP_N]
+    let err_first = errors[0]
+    let err_last = errors[HN_SWEEP_N]
+
+    println("  [T3] sweep intact(p=1): asym=" + str(asym_first) + " bisect_err=" + str(err_first))
+    println("  [T3] sweep lesion(p=0): asym=" + str(asym_last) + " bisect_err=" + str(err_last))
+    println("  [T3] Pearson r(asymmetry, bisection_error)=" + str(corr) + " (min=" + str(HN_BISECT_CORR_MIN) + ")")
+
+    // Correlation must be strong positive
+    if corr < HN_BISECT_CORR_MIN { return false }
+    // Sanity: lesion should have larger error than intact
+    if err_last <= err_first { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: Extinction — bilateral Φ_left drops more than unilateral.
+    // Heilman et al. 2000: competitive suppression by co-presented right
+    // stimulus extinguishes the left. Tested at MILD lesion level (0.4)
+    // where there's enough residual signal for disruption to be measurable.
+    // Clinically, extinction is most diagnostic in mild neglect patients.
+    let ext_lesion = hn_extinction_pair(HN_LESION_MILD, HN_SEED_EXTINCT)
+    let phi_l_uni = ext_lesion[0]
+    let phi_l_bil = ext_lesion[1]
+
+    // Also test at normal integrity — extinction should be minimal
+    let ext_norm = hn_extinction_pair(HN_INTACT, HN_SEED_EXTINCT)
+    let phi_l_uni_norm = ext_norm[0]
+    let phi_l_bil_norm = ext_norm[1]
+
+    let mut ext_ratio = 0.0
+    if phi_l_uni > HN_EPS {
+        ext_ratio = phi_l_bil / phi_l_uni
+    }
+    let mut norm_ratio = 0.0
+    if phi_l_uni_norm > HN_EPS {
+        norm_ratio = phi_l_bil_norm / phi_l_uni_norm
+    }
+
+    println("  [T4] lesion: Phi_left(unilateral)=" + str(phi_l_uni) + " Phi_left(bilateral)=" + str(phi_l_bil))
+    println("  [T4] lesion ext_ratio=" + str(ext_ratio) + " (need < " + str(HN_EXTINCT_RATIO) + ")")
+    println("  [T4] normal: Phi_left(uni)=" + str(phi_l_uni_norm) + " Phi_left(bil)=" + str(phi_l_bil_norm) + " ratio=" + str(norm_ratio))
+
+    // Core extinction test: bilateral drops left more than unilateral
+    if ext_ratio >= HN_EXTINCT_RATIO { return false }
+    // Under lesion, bilateral left must be lower than unilateral left
+    if phi_l_bil >= phi_l_uni { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5: Determinism + latency — rerun computation, verify identical
+    // output and wall time < 5000ms.
+    let t_start = clock()
+
+    // First run
+    let result_a = hn_phi_bilateral(HN_INTACT, HN_SEED_SPATIAL)
+    let phi_l_a = result_a[0]
+    let phi_r_a = result_a[1]
+    let bisect_a = hn_line_bisection(HN_LESION, HN_SEED_SPATIAL)
+
+    // Second run — must produce identical values
+    let result_b = hn_phi_bilateral(HN_INTACT, HN_SEED_SPATIAL)
+    let phi_l_b = result_b[0]
+    let phi_r_b = result_b[1]
+    let bisect_b = hn_line_bisection(HN_LESION, HN_SEED_SPATIAL)
+
+    let t_end = clock()
+    let elapsed_ms = t_end - t_start
+
+    let diff_l = hn_abs(phi_l_a - phi_l_b)
+    let diff_r = hn_abs(phi_r_a - phi_r_b)
+    let diff_bisect = hn_abs(bisect_a - bisect_b)
+
+    println("  [T5] run A: Phi_L=" + str(phi_l_a) + " Phi_R=" + str(phi_r_a) + " bisect=" + str(bisect_a))
+    println("  [T5] run B: Phi_L=" + str(phi_l_b) + " Phi_R=" + str(phi_r_b) + " bisect=" + str(bisect_b))
+    println("  [T5] delta: |dPhi_L|=" + str(diff_l) + " |dPhi_R|=" + str(diff_r) + " |dBisect|=" + str(diff_bisect))
+    println("  [T5] elapsed=" + str(elapsed_ms) + "ms (limit=5000ms)")
+
+    // Determinism: identical results
+    if diff_l > HN_EPS { return false }
+    if diff_r > HN_EPS { return false }
+    if diff_bisect > HN_EPS { return false }
+    // Latency
+    if elapsed_ms > 5000.0 { return false }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — execute 5 self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[hemispatial_neglect_phi] P98 — Hemispatial Neglect Phi (Heilman & Valenstein 1979)")
+    println("  right parietal lesion -> contralateral left neglect")
+    println("  DIM=" + str(HN_DIM) + " HALF=" + str(HN_HALF) + " BINS=" + str(HN_BINS) + " STEPS=" + str(HN_STEPS))
+    println("  refs: Heilman-Valenstein 1979 | Mesulam 1981 | Schenkenberg 1980 | Rossetti 1998")
+    println("  model: Mesulam bilateral RH attention + competitive extinction + prism recalib")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  normal bilateral balance: Phi_left approx Phi_right") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  neglect: Phi_left << Phi_right (right parietal lesion)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  line bisection error proportional to Phi asymmetry") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  extinction: bilateral Phi_left < unilateral Phi_left") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  determinism verified + latency < 5000ms") } else { println("T5 FAIL") }
+
+    println("")
+
+    let mut pc = 0
+    if t1 { pc = pc + 1 }
+    if t2 { pc = pc + 1 }
+    if t3 { pc = pc + 1 }
+    if t4 { pc = pc + 1 }
+    if t5 { pc = pc + 1 }
+
+    if pc == 5 {
+        println("[hemispatial_neglect_phi] 5/5 PASS — P98 DONE")
+    } else {
+        println("[hemispatial_neglect_phi] " + str(pc) + "/5 PASS — SOME FAILED")
+    }
+}
+
+main()

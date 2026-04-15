@@ -1,0 +1,959 @@
+// confabulation_phi.hexa — P103 Confabulation Phi
+//
+// Roadmap: shared/roadmaps/anima.json P103
+//   Confabulation = honest lying. The brain fills memory gaps with plausible
+//   but FALSE content, with no awareness that the content is fabricated.
+//   NOT lying (no intent to deceive) — the confabulating patient genuinely
+//   believes the false memory is real.
+//
+// ─── Clinical / neuroscience frame ──────────────────────────────
+//
+// Korsakoff syndrome (1887): chronic alcohol-related thiamine deficiency
+// damaging mammillary bodies and mediodorsal thalamus. Patients produce
+// false answers to questions about the recent past, often temporally
+// displaced real events. They do not KNOW they are confabulating.
+//
+// Frontal confabulation (Stuss & Benson 1986; Schnider 2003, 2008):
+// orbitofrontal / ventromedial PFC damage. The frontal "reality monitor"
+// (Schnider's "currently irrelevant memories" filter) fails, allowing
+// real-but-outdated or never-happened contents to surface unchecked.
+//
+// Two types (Schnider 2003; Dalla Barba 1993; Kopelman 1987):
+//
+//   PROVOKED CONFABULATION — patient confabulates ONLY when prompted by
+//     a question that hits a memory gap. The question itself triggers the
+//     gap-filling fabrication. Content is often plausible (drawn from
+//     general knowledge or temporally displaced episodes).
+//
+//   SPONTANEOUS CONFABULATION — unprompted false memories intrude into
+//     ongoing behavior. The patient acts on fabricated beliefs (e.g.,
+//     tries to go to a job they retired from years ago). This requires
+//     BOTH a memory gap AND a frontal monitoring failure — the content
+//     escapes without any reality check.
+//
+// Source monitoring (Johnson, Hashtroudi, Lindsay 1993):
+//   Normal meta-cognition tags each memory with its SOURCE — did I see
+//   this, imagine it, dream it, hear someone say it? Source monitoring
+//   failure: the CONTENT of a memory may be correct (e.g., "I ate pasta
+//   today") but the SOURCE attribution is wrong (actually it was
+//   yesterday, or someone else told me about it). MI on content is
+//   preserved; MI on source tags collapses.
+//
+// Anosognosia for confabulation (Stuss 1991; Prigatano 2010):
+//   The confabulating patient has NO AWARENESS that they are fabricating.
+//   The meta-monitoring system that would flag "this memory feels wrong"
+//   or "I am not sure about this" is itself offline. This is NOT denial
+//   — it is genuine absence of the error-detection signal.
+//
+// ─── Model: 4 channels ────────────────────────────────────────
+//
+//   memory[]   ground-truth trace        recall[]   retrieved content
+//   source[]   source attribution [0,1]  monitor[]  frontal meta-signal
+//
+// ─── Phi definitions ───────────────────────────────────────────
+//
+//   Phi_veridical  MI(recall, memory)           — recall fidelity
+//   Phi_confab     MI(recall_gap, fab_template) — confabulation strength
+//   Phi_meta       MI(monitor, error)           — meta-monitoring fidelity
+//   Phi_source     MI(source_recalled, true)    — source attribution
+//
+// ─── Self-tests (T1..T5) ──────────────────────────────────────
+//
+// T1 Normal — veridical high, confab ~0, monitor online
+// T2 Provoked — gap + question -> plausible but false Phi_confab > 0
+// T3 Spontaneous — unprompted intrusions, Phi_meta=0 (anosognosia)
+// T4 Source error — content MI preserved, source MI collapses
+// T5 Determinism + latency
+//
+// ─── Stage0 hexa constraints honored ───────────────────────────
+//   - plain `fn` only (no `pure fn` >=3 float struct returns)
+//   - `array` typed params only (no [float], no [str])
+//   - No identifier-pattern match; sequential if-chains
+//   - No contains() / to_lower() / !(Effect)
+//   - No else-if in let-binding; flat mut + sequential if
+//   - Single-line fn signatures / call sites / array literals
+//   - No reserved keywords as variable names
+//   - main() call at bottom
+//   - CF_STEPS=24 (< 32)
+//
+// Law alignment:
+//   Law 2   Observe never inject — Phi via MI measurement on streams
+//   Law 4   Structure > feature — confabulation is STRUCTURAL gap-fill
+//   Law 22  Feature addition -> Phi down — fixed channel count
+//   Meta M8 Memory vs monitoring — two dissociable systems
+//
+// Ref:
+//   Korsakoff 1887; Schnider 2003, 2008; Dalla Barba 1993
+//   Kopelman 1987; Johnson, Hashtroudi, Lindsay 1993
+//   Stuss & Benson 1986; Prigatano 2010
+
+// Constants
+
+let CF_STEPS          = 24            // timeline length (stage0 N<32)
+let CF_BINS           = 6             // histogram bins for MI
+let CF_EPS            = 0.0000000001
+let CF_D              = 8             // memory trace dimensionality
+
+// Gap parameters
+let CF_GAP_SENTINEL   = -999.0        // marks a memory gap
+let CF_GAP_FRAC       = 0.35          // fraction of timeline with gaps (Korsakoff)
+let CF_PLAUSIBILITY   = 0.75          // how much fabrication draws from neighbors
+
+// Monitoring parameters
+let CF_MONITOR_GAIN   = 0.80          // frontal monitor sensitivity (normal)
+let CF_MONITOR_OFF    = 0.0           // monitor off (spontaneous confab / anosognosia)
+
+// Source confidence — continuous [0,1] where 0 = certainly-other, 1 = certainly-self
+let CF_SRC_NOISE      = 0.08          // source jitter (normal recall)
+
+// Test gates
+let CF_VERIDICAL_MIN  = 0.05          // baseline veridical MI floor
+let CF_CONFAB_CEIL    = 0.02          // normal confabulation noise ceiling
+let CF_CONFAB_MIN     = 0.03          // provoked confab must exceed this
+let CF_PLAUS_MIN      = 0.10          // plausibility correlation floor
+let CF_META_MIN       = 0.03          // normal meta-monitoring MI floor
+let CF_SOURCE_MIN     = 0.05          // normal source MI floor
+let CF_SOURCE_CEIL    = 0.02          // broken source MI ceiling
+let CF_CONTENT_MIN    = 0.05          // content MI must survive source failure
+
+// Math / PRNG primitives (L0-clean, AN7)
+
+fn cf_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn cf_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn cf_min_f(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn cf_max_f(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+// Deterministic LCG — reproducibility (Law 2: observable, seed-stable)
+fn cf_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn cf_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn cf_signed(seed: int) -> float {
+    return cf_unit(seed) * 2.0 - 1.0
+}
+
+// Histogram MI (AN7 L0-clean)
+
+fn cf_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn cf_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn cf_entropy(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(cf_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = cf_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * cf_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn cf_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = cf_bin_idx(a[i], lo, hi, nb)
+        let ib = cf_bin_idx(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = cf_counts(pair_ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * cf_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn cf_vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn cf_vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn cf_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let lo_a = cf_vec_min(a)
+    let hi_a = cf_vec_max(a)
+    let lo_b = cf_vec_min(b)
+    let hi_b = cf_vec_max(b)
+    let lo = cf_min_f(lo_a, lo_b)
+    let hi = cf_max_f(hi_a, hi_b)
+    let h_a = cf_entropy(a, lo, hi, CF_BINS)
+    let h_b = cf_entropy(b, lo, hi, CF_BINS)
+    let h_j = cf_joint_entropy(a, b, lo, hi, CF_BINS)
+    let mi = h_a + h_b - h_j
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// Variance / mean helpers
+
+fn cf_mean(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        sum = sum + v[i]
+        i = i + 1
+    }
+    return sum / to_float(n)
+}
+
+fn cf_variance(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mu = cf_mean(v)
+    let mut acc = 0.0
+    let mut i = 0
+    while i < n {
+        let d = v[i] - mu
+        acc = acc + d * d
+        i = i + 1
+    }
+    return acc / to_float(n)
+}
+
+// Memory trace — flat [t*CF_D+k], triangular wave + noise per feature.
+
+fn cf_gen_memory(seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < CF_STEPS {
+        let mut k = 0
+        while k < CF_D {
+            s = cf_prng(s + t * 31 + k * 47)
+            // Structured signal: phase-shifted triangular wave per feature
+            let phase = to_float(t) / to_float(CF_STEPS) + to_float(k) * 0.13
+            let mut tri = phase * 4.0 - 2.0
+            if tri > 1.0 { tri = 2.0 - tri }
+            if tri < -1.0 { tri = 0.0 - 2.0 - tri }
+            let noise = 0.08 * cf_signed(s)
+            out = out.push(tri + noise)
+            k = k + 1
+        }
+        t = t + 1
+    }
+    return out
+}
+
+// Gap mask — 1.0=intact, 0.0=gap. Clustered block (anterograde amnesia).
+fn cf_gen_gap_mask(seed: int) -> array {
+    let mut mask = []
+    let mut s = seed
+    let n_gaps = to_int(to_float(CF_STEPS) * CF_GAP_FRAC)
+    // Start gap block at a deterministic position in the middle third
+    s = cf_prng(s + 777)
+    let gap_start = CF_STEPS / 3 + (s % (CF_STEPS / 4))
+    let mut t = 0
+    while t < CF_STEPS {
+        let mut is_gap = false
+        if t >= gap_start {
+            if t < gap_start + n_gaps { is_gap = true }
+        }
+        if is_gap { mask = mask.push(0.0) } else { mask = mask.push(1.0) }
+        t = t + 1
+    }
+    return mask
+}
+
+// Source confidence — continuous [0,1], structured pattern for MI.
+fn cf_gen_source_true(seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < CF_STEPS {
+        s = cf_prng(s + t * 59)
+        // Structured source confidence: sinusoidal base + noise
+        let phase = to_float(t) / to_float(CF_STEPS)
+        let mut tri = phase * 4.0 - 2.0
+        if tri > 1.0 { tri = 2.0 - tri }
+        if tri < -1.0 { tri = 0.0 - 2.0 - tri }
+        // Map to [0.1, 0.9] range
+        let base = 0.5 + 0.4 * tri
+        let jit = 0.05 * cf_signed(s)
+        let mut v = base + jit
+        if v < 0.0 { v = 0.0 }
+        if v > 1.0 { v = 1.0 }
+        out = out.push(v)
+        t = t + 1
+    }
+    return out
+}
+
+// Recalled source (normal): truth + small jitter.
+fn cf_gen_source_recalled_normal(true_src: array, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < CF_STEPS {
+        s = cf_prng(s + t * 73)
+        let jit = CF_SRC_NOISE * cf_signed(s)
+        let mut v = true_src[t] + jit
+        if v < 0.0 { v = 0.0 }
+        if v > 1.0 { v = 1.0 }
+        out = out.push(v)
+        t = t + 1
+    }
+    return out
+}
+
+// Recalled source (broken): collapsed to flat 0.5 (no attribution).
+// Zero variance in source = zero MI with the structured true source.
+fn cf_gen_source_recalled_broken(seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < CF_STEPS {
+        s = cf_prng(s + t * 97)
+        // Collapsed source attribution: all tags drift to 0.5 (uncertain)
+        let jit = 0.01 * cf_signed(s)
+        out = out.push(0.5 + jit)
+        t = t + 1
+    }
+    return out
+}
+
+// Normal recall — faithful copy + small noise.
+
+fn cf_recall_normal(memory: array, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let n = len(memory)
+    let mut i = 0
+    while i < n {
+        s = cf_prng(s + i * 37)
+        let noise = 0.03 * cf_signed(s)
+        out = out.push(memory[i] + noise)
+        i = i + 1
+    }
+    return out
+}
+
+// Provoked confabulation — gap triggers fabrication from nearest valid
+// memory (temporal displacement, Korsakoff signature).
+
+// Nearest non-gap step to t.
+fn cf_nearest_valid(gap_mask: array, t: int) -> int {
+    let mut d = 1
+    while d < CF_STEPS {
+        let lo = t - d
+        let hi = t + d
+        if lo >= 0 {
+            if gap_mask[lo] > 0.5 { return lo }
+        }
+        if hi < CF_STEPS {
+            if gap_mask[hi] > 0.5 { return hi }
+        }
+        d = d + 1
+    }
+    return 0
+}
+
+fn cf_recall_provoked(memory: array, gap_mask: array, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < CF_STEPS {
+        let mut k = 0
+        while k < CF_D {
+            let idx = t * CF_D + k
+            s = cf_prng(s + idx * 41)
+            if gap_mask[t] < 0.5 {
+                // GAP: fabricate from nearest valid memory (temporal displacement)
+                let donor = cf_nearest_valid(gap_mask, t)
+                let donor_idx = donor * CF_D + k
+                let base = memory[donor_idx]
+                // Mix donor content with noise — plausible but wrong
+                let fab = base * CF_PLAUSIBILITY + (1.0 - CF_PLAUSIBILITY) * cf_signed(s) * 0.5
+                out = out.push(fab)
+            } else {
+                // Intact memory: veridical with tiny noise
+                let noise = 0.03 * cf_signed(s)
+                out = out.push(memory[idx] + noise)
+            }
+            k = k + 1
+        }
+        t = t + 1
+    }
+    return out
+}
+
+// Spontaneous confabulation — intrusions at gaps AND ~30% of intact steps.
+// Frontal monitor offline (anosognosia).
+
+fn cf_recall_spontaneous(memory: array, gap_mask: array, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < CF_STEPS {
+        let mut k = 0
+        while k < CF_D {
+            let idx = t * CF_D + k
+            s = cf_prng(s + idx * 53)
+            let r = cf_unit(s)
+            let is_gap = gap_mask[t] < 0.5
+            // Spontaneous: also confabulate at some non-gap steps (intrusion)
+            let spontaneous_intrusion = r < 0.30
+            if is_gap {
+                // Same gap-fill as provoked
+                let donor = cf_nearest_valid(gap_mask, t)
+                let donor_idx = donor * CF_D + k
+                let base = memory[donor_idx]
+                let fab = base * CF_PLAUSIBILITY + (1.0 - CF_PLAUSIBILITY) * cf_signed(s) * 0.5
+                out = out.push(fab)
+            } else {
+                if spontaneous_intrusion {
+                    // Unprompted fabrication: displace from a different time step
+                    s = cf_prng(s + 9973)
+                    let displace = (t + 3 + (s % 5)) % CF_STEPS
+                    let disp_idx = displace * CF_D + k
+                    let base = memory[disp_idx]
+                    let fab = base * 0.6 + 0.4 * cf_signed(s) * 0.3
+                    out = out.push(fab)
+                } else {
+                    let noise = 0.03 * cf_signed(s)
+                    out = out.push(memory[idx] + noise)
+                }
+            }
+            k = k + 1
+        }
+        t = t + 1
+    }
+    return out
+}
+
+// Frontal monitor — gain*|recall-memory|+gap_bonus+noise. gain=0 → anosognosia.
+
+fn cf_gen_monitor(memory: array, recall: array, gap_mask: array, gain: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < CF_STEPS {
+        s = cf_prng(s + t * 89)
+        // Compute per-step recall error (mean absolute deviation across features)
+        let mut err_sum = 0.0
+        let mut k = 0
+        while k < CF_D {
+            let idx = t * CF_D + k
+            err_sum = err_sum + cf_abs(recall[idx] - memory[idx])
+            k = k + 1
+        }
+        let err = err_sum / to_float(CF_D)
+        // Gap uncertainty bonus: monitor should detect "I don't know this"
+        let gap_bonus = if gap_mask[t] < 0.5 { 0.3 } else { 0.0 }
+        let noise = 0.02 * cf_signed(s)
+        let signal = gain * (err + gap_bonus) + noise
+        let mut clamped = signal
+        if clamped < 0.0 { clamped = 0.0 }
+        out = out.push(clamped)
+        t = t + 1
+    }
+    return out
+}
+
+// Compute actual error trace for comparison with monitor signal
+fn cf_gen_error_trace(memory: array, recall: array) -> array {
+    let mut out = []
+    let mut t = 0
+    while t < CF_STEPS {
+        let mut err_sum = 0.0
+        let mut k = 0
+        while k < CF_D {
+            let idx = t * CF_D + k
+            err_sum = err_sum + cf_abs(recall[idx] - memory[idx])
+            k = k + 1
+        }
+        out = out.push(err_sum / to_float(CF_D))
+        t = t + 1
+    }
+    return out
+}
+
+// Per-step mean extraction from flat arrays.
+
+fn cf_extract_step_means(flat: array) -> array {
+    let mut out = []
+    let mut t = 0
+    while t < CF_STEPS {
+        let mut sum = 0.0
+        let mut k = 0
+        while k < CF_D {
+            sum = sum + flat[t * CF_D + k]
+            k = k + 1
+        }
+        out = out.push(sum / to_float(CF_D))
+        t = t + 1
+    }
+    return out
+}
+
+// Extract per-step means at gap-only positions from FLAT array (len = CF_STEPS * CF_D)
+fn cf_extract_gap_steps(flat: array, gap_mask: array) -> array {
+    let mut out = []
+    let mut t = 0
+    while t < CF_STEPS {
+        if gap_mask[t] < 0.5 {
+            let mut sum = 0.0
+            let mut k = 0
+            while k < CF_D {
+                sum = sum + flat[t * CF_D + k]
+                k = k + 1
+            }
+            out = out.push(sum / to_float(CF_D))
+        }
+        t = t + 1
+    }
+    return out
+}
+
+// Extract per-step means at non-gap positions from FLAT array (len = CF_STEPS * CF_D)
+fn cf_extract_intact_steps(flat: array, gap_mask: array) -> array {
+    let mut out = []
+    let mut t = 0
+    while t < CF_STEPS {
+        if gap_mask[t] > 0.5 {
+            let mut sum = 0.0
+            let mut k = 0
+            while k < CF_D {
+                sum = sum + flat[t * CF_D + k]
+                k = k + 1
+            }
+            out = out.push(sum / to_float(CF_D))
+        }
+        t = t + 1
+    }
+    return out
+}
+
+// Extract gap-step values from a STEP-MEANS array (len = CF_STEPS)
+fn cf_extract_gap_means(step_means: array, gap_mask: array) -> array {
+    let mut out = []
+    let mut t = 0
+    while t < CF_STEPS {
+        if gap_mask[t] < 0.5 {
+            out = out.push(step_means[t])
+        }
+        t = t + 1
+    }
+    return out
+}
+
+
+// Fabricated template — donor-displaced step-means (reveals confab structure).
+
+fn cf_gen_fabricated_template(memory: array, gap_mask: array) -> array {
+    let mut out = []
+    let mut t = 0
+    while t < CF_STEPS {
+        if gap_mask[t] < 0.5 {
+            let donor = cf_nearest_valid(gap_mask, t)
+            let mut sum = 0.0
+            let mut k = 0
+            while k < CF_D {
+                sum = sum + memory[donor * CF_D + k]
+                k = k + 1
+            }
+            out = out.push(sum / to_float(CF_D))
+        } else {
+            let mut sum = 0.0
+            let mut k = 0
+            while k < CF_D {
+                sum = sum + memory[t * CF_D + k]
+                k = k + 1
+            }
+            out = out.push(sum / to_float(CF_D))
+        }
+        t = t + 1
+    }
+    return out
+}
+
+// Plausibility — MI between gap recall and nearest-neighbor memory.
+
+fn cf_plausibility_mi(recall: array, memory: array, gap_mask: array) -> float {
+    // Collect recall values at gap steps and their donor-neighbor values
+    let mut recall_gaps = []
+    let mut donor_vals = []
+    let mut t = 0
+    while t < CF_STEPS {
+        if gap_mask[t] < 0.5 {
+            let mut rsum = 0.0
+            let mut dsum = 0.0
+            let donor = cf_nearest_valid(gap_mask, t)
+            let mut k = 0
+            while k < CF_D {
+                rsum = rsum + recall[t * CF_D + k]
+                dsum = dsum + memory[donor * CF_D + k]
+                k = k + 1
+            }
+            recall_gaps = recall_gaps.push(rsum / to_float(CF_D))
+            donor_vals = donor_vals.push(dsum / to_float(CF_D))
+        }
+        t = t + 1
+    }
+    return cf_mi(recall_gaps, donor_vals)
+}
+
+// Phi_veridical: MI between recall and true memory (step-mean traces)
+fn cf_phi_veridical(memory: array, recall: array) -> float {
+    let mem_means = cf_extract_step_means(memory)
+    let rec_means = cf_extract_step_means(recall)
+    return cf_mi(mem_means, rec_means)
+}
+
+// Phi_confab: MI between recall at gaps and fabricated template at gaps
+// recall is FLAT (CF_STEPS * CF_D), fab_template is STEP-MEANS (CF_STEPS)
+fn cf_phi_confab(recall: array, memory: array, gap_mask: array) -> float {
+    let rec_gaps = cf_extract_gap_steps(recall, gap_mask)
+    let fab_template = cf_gen_fabricated_template(memory, gap_mask)
+    let fab_gaps = cf_extract_gap_means(fab_template, gap_mask)
+    let n_rec = len(rec_gaps)
+    let n_fab = len(fab_gaps)
+    if n_rec == 0 { return 0.0 }
+    if n_fab == 0 { return 0.0 }
+    return cf_mi(rec_gaps, fab_gaps)
+}
+
+// Phi_confab for normal recall — errors are pure noise, MI with any template ~0.
+fn cf_phi_confab_normal(recall: array, memory: array, seed: int) -> float {
+    let rec_means = cf_extract_step_means(recall)
+    let mem_means = cf_extract_step_means(memory)
+    // Retrieval errors: how recall deviates from truth
+    let mut errors = []
+    let mut i = 0
+    while i < CF_STEPS {
+        errors = errors.push(rec_means[i] - mem_means[i])
+        i = i + 1
+    }
+    // Generate an independent random trace (what confabulation would look like)
+    // If recall is veridical, errors have no MI with this independent signal.
+    let mut indep = []
+    let mut s = seed
+    let mut j = 0
+    while j < CF_STEPS {
+        s = cf_prng(s + j * 113)
+        indep = indep.push(cf_signed(s) * 0.5)
+        j = j + 1
+    }
+    return cf_mi(errors, indep)
+}
+
+// Phi_meta: MI between monitor signal and actual error trace
+fn cf_phi_meta(monitor: array, error_trace: array) -> float {
+    return cf_mi(monitor, error_trace)
+}
+
+// Phi_source: MI between recalled source tags and true source tags
+fn cf_phi_source(src_recalled: array, src_true: array) -> float {
+    return cf_mi(src_recalled, src_true)
+}
+
+// Self-tests T1..T5
+
+fn check_T1() -> bool {
+    // T1 Normal retrieval baseline:
+    //   Phi_veridical > CF_VERIDICAL_MIN (recall faithfully matches memory)
+    //   Phi_confab_normal approximately 0 (no confabulation pattern)
+    //   Phi_meta > 0 (frontal monitor online, tracks errors)
+    let memory = cf_gen_memory(10001)
+    let recall = cf_recall_normal(memory, 10101)
+    let gap_mask_none = []
+    // Build an all-intact mask (no gaps)
+    let mut full_mask = []
+    let mut t = 0
+    while t < CF_STEPS {
+        full_mask = full_mask.push(1.0)
+        t = t + 1
+    }
+    let monitor = cf_gen_monitor(memory, recall, full_mask, CF_MONITOR_GAIN, 10201)
+    let error_trace = cf_gen_error_trace(memory, recall)
+
+    let phi_v = cf_phi_veridical(memory, recall)
+    let phi_c = cf_phi_confab_normal(recall, memory, 10301)
+    let phi_m = cf_phi_meta(monitor, error_trace)
+
+    println("  [T1] Phi_veridical=" + str(phi_v) + " (gate>" + str(CF_VERIDICAL_MIN) + ")")
+    println("  [T1] Phi_confab_normal=" + str(phi_c) + " (gate<" + str(CF_CONFAB_CEIL) + ")")
+    println("  [T1] Phi_meta=" + str(phi_m) + " (gate>" + str(CF_META_MIN) + ")")
+
+    let mut ok = true
+    if phi_v <= CF_VERIDICAL_MIN { ok = false }
+    if phi_c > CF_CONFAB_CEIL { ok = false }
+    if phi_m <= CF_META_MIN { ok = false }
+    return ok
+}
+
+fn check_T2() -> bool {
+    // T2 Provoked confabulation:
+    //   Memory gap + question -> Phi_confab > CF_CONFAB_MIN
+    //   Content plausibility high (fabrication drawn from real neighbors)
+    let memory = cf_gen_memory(20001)
+    let gap_mask = cf_gen_gap_mask(20051)
+    let recall = cf_recall_provoked(memory, gap_mask, 20101)
+
+    let phi_c = cf_phi_confab(recall, memory, gap_mask)
+    let plaus = cf_plausibility_mi(recall, memory, gap_mask)
+
+    // Also verify: veridical MI drops at gap positions vs intact positions
+    let rec_intact = cf_extract_intact_steps(recall, gap_mask)
+    let mem_intact = cf_extract_intact_steps(memory, gap_mask)
+    let phi_v_intact = cf_mi(rec_intact, mem_intact)
+
+    let rec_gaps = cf_extract_gap_steps(recall, gap_mask)
+    let mem_gaps = cf_extract_gap_steps(memory, gap_mask)
+    let phi_v_gaps = cf_mi(rec_gaps, mem_gaps)
+
+    println("  [T2] Phi_confab(provoked)=" + str(phi_c) + " (gate>" + str(CF_CONFAB_MIN) + ")")
+    println("  [T2] plausibility MI=" + str(plaus) + " (gate>" + str(CF_PLAUS_MIN) + ")")
+    println("  [T2] veridical intact=" + str(phi_v_intact) + " gaps=" + str(phi_v_gaps))
+
+    let mut ok = true
+    if phi_c <= CF_CONFAB_MIN { ok = false }
+    if plaus <= CF_PLAUS_MIN { ok = false }
+    return ok
+}
+
+fn check_T3() -> bool {
+    // T3 Spontaneous confabulation:
+    //   Fabrication occurs WITHOUT prompt — intrusions at non-gap (intact)
+    //   steps create large structured errors. The frontal monitor is offline
+    //   (Phi_meta = 0 — anosognosia for confabulation).
+    //
+    //   Three signatures:
+    //   (a) Phi_veridical drops vs normal (intrusions corrupt fidelity)
+    //   (b) Phi_meta ~ 0 (no error awareness — frontal monitoring absent)
+    //   (c) Error variance at INTACT steps is higher for spontaneous than
+    //       normal (intrusions are large structured errors, not tiny noise)
+    let memory = cf_gen_memory(30001)
+    let gap_mask = cf_gen_gap_mask(30051)
+    let recall_spont = cf_recall_spontaneous(memory, gap_mask, 30101)
+    let recall_normal = cf_recall_normal(memory, 30301)
+
+    // Monitor is OFF (frontal damage) — gain = 0
+    let monitor = cf_gen_monitor(memory, recall_spont, gap_mask, CF_MONITOR_OFF, 30201)
+    let error_trace = cf_gen_error_trace(memory, recall_spont)
+    let phi_m = cf_phi_meta(monitor, error_trace)
+
+    // (a) Veridical MI degraded
+    let phi_v_spont = cf_phi_veridical(memory, recall_spont)
+    let phi_v_normal = cf_phi_veridical(memory, recall_normal)
+
+    // (c) Error variance at intact steps: spontaneous > normal
+    // Under normal recall, intact-step errors are tiny noise (~0.03 amplitude).
+    // Under spontaneous confab, ~30% of intact steps get displaced content,
+    // creating large errors that inflate the error variance.
+    let err_spont = cf_gen_error_trace(memory, recall_spont)
+    let err_normal = cf_gen_error_trace(memory, recall_normal)
+    // Extract errors at intact steps only
+    let mut err_intact_spont = []
+    let mut err_intact_normal = []
+    let mut t = 0
+    while t < CF_STEPS {
+        if gap_mask[t] > 0.5 {
+            err_intact_spont = err_intact_spont.push(err_spont[t])
+            err_intact_normal = err_intact_normal.push(err_normal[t])
+        }
+        t = t + 1
+    }
+    let var_spont = cf_variance(err_intact_spont)
+    let var_normal = cf_variance(err_intact_normal)
+
+    println("  [T3] Phi_veridical: spontaneous=" + str(phi_v_spont) + " normal=" + str(phi_v_normal))
+    println("  [T3] Phi_meta(monitor off)=" + str(phi_m) + " (must be ~0, anosognosia)")
+    println("  [T3] Error var(intact): spontaneous=" + str(var_spont) + " normal=" + str(var_normal))
+
+    let mut ok = true
+    // (a) Veridical fidelity degraded
+    if phi_v_spont >= phi_v_normal { ok = false }
+    // (b) Meta-monitoring absent (below noise floor)
+    if phi_m > CF_META_MIN { ok = false }
+    // (c) Spontaneous intrusions create larger errors at intact steps
+    if var_spont <= var_normal { ok = false }
+    return ok
+}
+
+fn check_T4() -> bool {
+    // T4 Source monitoring error (Johnson):
+    //   Content MI preserved (Phi_content > 0) but source MI collapses
+    //   (Phi_source approximately 0). The WHAT is correct; WHERE-from is lost.
+    let memory = cf_gen_memory(40001)
+    let src_true = cf_gen_source_true(40051)
+
+    // Normal source monitoring: truth + small jitter
+    let src_recalled_normal = cf_gen_source_recalled_normal(src_true, 40101)
+    let phi_src_normal = cf_phi_source(src_recalled_normal, src_true)
+
+    // Source monitoring deficit: collapsed to flat 0.5 (no attribution)
+    let src_recalled_broken = cf_gen_source_recalled_broken(40201)
+    let phi_src_broken = cf_phi_source(src_recalled_broken, src_true)
+
+    // Content fidelity: recall is normal (content not affected by source failure)
+    let recall = cf_recall_normal(memory, 40301)
+    let phi_content = cf_phi_veridical(memory, recall)
+
+    println("  [T4] Phi_source normal=" + str(phi_src_normal) + " (gate>" + str(CF_SOURCE_MIN) + ")")
+    println("  [T4] Phi_source broken=" + str(phi_src_broken) + " (gate<" + str(CF_SOURCE_CEIL) + ")")
+    println("  [T4] Phi_content(preserved)=" + str(phi_content) + " (gate>" + str(CF_CONTENT_MIN) + ")")
+
+    let mut ok = true
+    // Normal source monitoring: source MI above floor
+    if phi_src_normal <= CF_SOURCE_MIN { ok = false }
+    // Broken source monitoring: source MI collapses
+    if phi_src_broken > CF_SOURCE_CEIL { ok = false }
+    // Content MI preserved despite source failure
+    if phi_content <= CF_CONTENT_MIN { ok = false }
+    return ok
+}
+
+fn check_T5() -> bool {
+    // T5 Determinism + latency:
+    //   Two runs with identical seeds must produce identical Phi values.
+    //   Verifies reproducibility (Law 2 observable, seed-stable).
+    let memory_a = cf_gen_memory(50001)
+    let gap_a = cf_gen_gap_mask(50051)
+    let recall_a = cf_recall_provoked(memory_a, gap_a, 50101)
+    let phi_v_a = cf_phi_veridical(memory_a, recall_a)
+    let phi_c_a = cf_phi_confab(recall_a, memory_a, gap_a)
+
+    let memory_b = cf_gen_memory(50001)
+    let gap_b = cf_gen_gap_mask(50051)
+    let recall_b = cf_recall_provoked(memory_b, gap_b, 50101)
+    let phi_v_b = cf_phi_veridical(memory_b, recall_b)
+    let phi_c_b = cf_phi_confab(recall_b, memory_b, gap_b)
+
+    let delta_v = cf_abs(phi_v_a - phi_v_b)
+    let delta_c = cf_abs(phi_c_a - phi_c_b)
+
+    println("  [T5] Phi_veridical run A=" + str(phi_v_a) + " B=" + str(phi_v_b) + " |delta|=" + str(delta_v))
+    println("  [T5] Phi_confab run A=" + str(phi_c_a) + " B=" + str(phi_c_b) + " |delta|=" + str(delta_c))
+
+    let mut ok = true
+    if delta_v > CF_EPS { ok = false }
+    if delta_c > CF_EPS { ok = false }
+    // Sanity: values should be non-trivial
+    if phi_v_a <= 0.0 { ok = false }
+    if phi_c_a <= 0.0 { ok = false }
+    return ok
+}
+
+// Main
+
+fn main() {
+    println("[confabulation_phi] P103 — Confabulation Phi (Korsakoff/frontal gap-fill)")
+    println("  N=24, D=8, gap_frac=0.35; 4 channels: memory/recall/source/monitor")
+    println("  Korsakoff 1887, Schnider 2003, Johnson 1993 — honest lying")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  normal retrieval — veridical high, confab ~0, monitor online") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  provoked confabulation — gap-fill plausible but false") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  spontaneous confab — unprompted fabrication, meta-monitor off") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  source monitoring error — content intact, source lost") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  determinism — identical seeds, identical Phi") } else { println("T5 FAIL") }
+
+    println("")
+
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[confabulation_phi] 5/5 PASS — P103 DONE")
+    } else {
+        println("[confabulation_phi] SOME FAILED")
+    }
+}
+
+main()
