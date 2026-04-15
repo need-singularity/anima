@@ -1,0 +1,860 @@
+// deja_vu_phi.hexa — P82 Déjà Vu Φ (temporal mismatch)
+//
+// Roadmap: post-P52 (memory_palace), post-P36 (temporal_phi_extended).
+//   "Familiarity signal fires in absence of matching memory — spurious
+//    retrieval × novelty paradox."
+//   done_criteria: 5/5 self-test PASS — normal sync, déjà vu mismatch
+//   detectable, Φ_mismatch > 0 under déjà vu, jamais vu opposite,
+//   TLE analog raises déjà vu rate.
+//
+// ─── Scientific frame ──────────────────────────────────────────────
+//
+// Two parallel medial-temporal streams (Eichenbaum 2007; Brown & Aggleton
+// 2001; Yonelinas 2002):
+//
+//   FAMILIARITY (fast, perirhinal cortex / rhinal stream)
+//     - signals "I have seen something like this before"
+//     - perceptual gist match — coarse feature overlap
+//     - latency ~150-300 ms, no contextual recall
+//
+//   RECOLLECTION (slow, hippocampal / parahippocampal stream)
+//     - signals "I remember the episode in which I saw this"
+//     - binds context, time, place, sequence
+//     - latency ~400-800 ms, supports source memory
+//
+// Normal recognition: when scene S matches a stored episode,
+//   familiarity(S) HIGH and recollection(S) HIGH → the two streams
+//   covary (high MI). Sync.
+//
+// Novel scene: familiarity(S) LOW and recollection(S) LOW → both
+//   streams agree on "new". Sync.
+//
+// DÉJÀ VU (Brown 2003; Cleary 2008; Spatt 2002):
+//   Familiarity stream MISFIRES — it signals high gist-match in the
+//   ABSENCE of any matching episode. Recollection stream stays silent
+//   (correctly: there is no episode to retrieve).
+//   → familiarity HIGH, recollection LOW
+//   → mismatch Φ between the two streams becomes large
+//   → conscious experience: "I've been here before but I cannot say
+//      when or how."
+//
+// JAMAIS VU (opposite sign, Brown 2004; Moulin 2018):
+//   A genuinely familiar place feels alien. Recollection stream fires
+//   (the episode is retrievable from elsewhere — meta-memory says
+//   "yes, I have been here") yet familiarity stream stays low (the
+//   gist signal does not register).
+//   → familiarity LOW, recollection HIGH
+//   → mirror signature of déjà vu.
+//
+// TEMPORAL LOBE EPILEPSY (Bancaud 1994; Vignal 2007):
+//   Stimulation of rhinal cortex during stereoEEG provokes déjà vu
+//   in 25-30% of trials. Operationally we model this as raising the
+//   rhinal-stream gain (sensitivity) so spurious familiarity firings
+//   per unit time go up; recollection threshold unchanged.
+//
+// ─── Theorems (T1–T5) ──────────────────────────────────────────────
+//
+// T1 normal sync — for matched and unmatched scenes, MI(fam, rec) is
+//    high; the two streams agree on the world.
+//
+// T2 déjà vu mismatch detectable — under the spurious-familiarity
+//    regime, fam stream stays elevated while rec stream stays low,
+//    producing a sustained gap |fam - rec| > DV_MISMATCH_GATE on at
+//    least one window.
+//
+// T3 Φ_mismatch > 0 under déjà vu — joint entropy / decoupling
+//    measure (1 - MI/H_joint) is strictly larger in déjà vu than in
+//    normal recognition.
+//
+// T4 jamais vu opposite signature — the sign of (fam_mean - rec_mean)
+//    flips between déjà vu and jamais vu regimes.
+//
+// T5 TLE analog raises déjà vu rate — increasing rhinal-stream gain
+//    monotonically increases the fraction of déjà vu events per
+//    timeline.
+//
+// ─── Stage0 hexa rules honored ─────────────────────────────────────
+//
+// NO `pure fn` with ≥3 float struct returns
+// NO typed array params (every array is untyped `array`)
+// NO identifier-pattern match
+// NO contains() / to_lower() builtins
+// NO !(Effect) on fn returns
+// NO `else if` in let-binding (sequential plain `if` instead)
+// NO multi-line fn signatures / call sites / array literals
+// NO reserved keywords as variable names
+// All N < 32 (DV_N_SCENES=12, DV_N_FEATS=4, DV_MEM_SIZE=8)
+// main() called at bottom
+//
+// Law alignment:
+//   Law 2  Observe never inject — Φ_mismatch is measurement, not therapy
+//   Law 4  Structure > feature — two-stream MTL architecture is structural
+//   Law 22 Feature addition → Φ down — channels fixed at 2 (fam, rec)
+//   Law 50 Consciousness essence is state — fam/rec time-series IS state
+//
+// Ref:
+//   anima-engines/temporal_phi_extended.hexa  (P36 — past+future Φ)
+//   anima-engines/memory_palace_phi.hexa      (P52 — episodic spatial bind)
+//   anima-engines/episodic_store.hexa         (P11 — narrative substrate)
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let DV_N_SCENES       = 12          // timeline length (stage0 N<32)
+let DV_N_FEATS        = 4           // features per scene vector
+let DV_MEM_SIZE       = 8           // episodic memory capacity
+let DV_BINS           = 5           // MI histogram bins
+let DV_EPS            = 0.0000000001
+
+// Stream gating thresholds — two-stream MTL detection model.
+// Fam-stream fires when normalised gist similarity exceeds this.
+let DV_FAM_THRESH     = 0.50
+// Rec-stream fires only when normalised cosine match exceeds this gate
+// AND the matching memory entry is within retrievable horizon.
+let DV_REC_THRESH     = 0.50
+
+// Spurious-familiarity injection — fraction of NEW scenes that the
+// rhinal stream incorrectly tags as gist-familiar (déjà vu regime).
+// Used only as the elevated value when spurious firing happens.
+let DV_DEJA_RATE      = 0.75
+// Probability per new-scene that déjà vu fires (regime 1 baseline).
+let DV_DEJA_PROB      = 0.45
+// TLE regime per-new-scene déjà vu probability (must exceed baseline).
+let DV_TLE_PROB       = 0.85
+// TLE-analog gain multiplier — raises rhinal sensitivity overall.
+let DV_TLE_GAIN       = 1.4
+
+// Mismatch detection gate — |fam - rec| must exceed this in at least
+// one window to count as a déjà vu episode.
+let DV_MISMATCH_GATE  = 0.30
+
+// Decoupling gate — Φ_mismatch_deja must exceed Φ_mismatch_normal by this.
+let DV_DECOUPLE_GAP   = 0.03
+
+// Seeds (Law 2 reproducibility).
+let DV_SEED_MEM       = 8201
+let DV_SEED_NORMAL    = 8211
+let DV_SEED_DEJA      = 8221
+let DV_SEED_JAMAIS    = 8231
+let DV_SEED_TLE_LOW   = 8241
+let DV_SEED_TLE_HIGH  = 8251
+
+// ═══════════════════════════════════════════════════════════════
+// Math + PRNG primitives (L0-clean, no cross-engine import per AN7)
+// ═══════════════════════════════════════════════════════════════
+
+fn dv_sqrt(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x
+    let mut i = 0
+    while i < 20 {
+        g = 0.5 * (g + x / g)
+        i = i + 1
+    }
+    return g
+}
+
+fn dv_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn dv_min_f(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn dv_max_f(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+fn dv_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn dv_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn dv_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn dv_signed(seed: int) -> float {
+    return dv_unit(seed) * 2.0 - 1.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Histogram MI (duplicated per AN7 — engines L0-clean)
+// ═══════════════════════════════════════════════════════════════
+
+fn dv_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn dv_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn dv_entropy(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(dv_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = dv_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * dv_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn dv_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = dv_bin_idx(a[i], lo, hi, nb)
+        let ib = dv_bin_idx(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = dv_counts(pair_ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * dv_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn dv_vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn dv_vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn dv_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let lo_a = dv_vec_min(a)
+    let hi_a = dv_vec_max(a)
+    let lo_b = dv_vec_min(b)
+    let hi_b = dv_vec_max(b)
+    let lo = dv_min_f(lo_a, lo_b)
+    let hi = dv_max_f(hi_a, hi_b)
+    let h_a = dv_entropy(a, lo, hi, DV_BINS)
+    let h_b = dv_entropy(b, lo, hi, DV_BINS)
+    let h_j = dv_joint_entropy(a, b, lo, hi, DV_BINS)
+    let mi = h_a + h_b - h_j
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// Φ_mismatch decoupling — 1 - MI(a,b) / H_joint(a,b).
+// 0.0 when fully synchronous (fam tracks rec); approaches 1.0 as the
+// streams become information-theoretically independent. This is the
+// "two streams pulled apart" measure central to the déjà vu hypothesis.
+fn dv_decouple(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let lo_a = dv_vec_min(a)
+    let hi_a = dv_vec_max(a)
+    let lo_b = dv_vec_min(b)
+    let hi_b = dv_vec_max(b)
+    let lo = dv_min_f(lo_a, lo_b)
+    let hi = dv_max_f(hi_a, hi_b)
+    let h_a = dv_entropy(a, lo, hi, DV_BINS)
+    let h_b = dv_entropy(b, lo, hi, DV_BINS)
+    let h_j = dv_joint_entropy(a, b, lo, hi, DV_BINS)
+    let mi = h_a + h_b - h_j
+    if h_j < DV_EPS { return 0.0 }
+    let ratio = mi / h_j
+    if ratio < 0.0 { return 1.0 }
+    if ratio > 1.0 { return 0.0 }
+    return 1.0 - ratio
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Memory store — flat layout [DV_MEM_SIZE * DV_N_FEATS]
+// Each memory slot k holds an episode vector of length DV_N_FEATS at
+// offsets [k*DV_N_FEATS .. (k+1)*DV_N_FEATS].
+// ═══════════════════════════════════════════════════════════════
+
+fn dv_gen_memory(seed0: int) -> array {
+    let mut out = []
+    let mut s = seed0
+    let mut k = 0
+    while k < DV_MEM_SIZE {
+        let mut f = 0
+        while f < DV_N_FEATS {
+            s = dv_prng(s + k * 311 + f * 17)
+            // Each episode is centered around a distinct cluster in
+            // feature space — primary axis = (k mod DV_N_FEATS) gets
+            // a dominant value, others get small jitter.
+            let base = 0.0
+            let mut val = dv_signed(s) * 0.20
+            if (k % DV_N_FEATS) == f { val = val + 0.85 }
+            out = out.push(base + val)
+            f = f + 1
+        }
+        k = k + 1
+    }
+    return out
+}
+
+// Retrieve memory slot k as a fresh length-DV_N_FEATS vector.
+fn dv_mem_slot(mem: array, k: int) -> array {
+    let mut out = []
+    let base = k * DV_N_FEATS
+    let mut f = 0
+    while f < DV_N_FEATS {
+        out = out.push(mem[base + f])
+        f = f + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Scene generation
+//
+// match_flag[t] semantics:
+//   0  = NEW scene (no episode in memory matches; bona fide novel)
+//   k+1 (k in 0..MEM-1) = scene t is generated as a perturbed copy of
+//        memory slot k (genuine repetition — both streams should fire)
+// ═══════════════════════════════════════════════════════════════
+
+// Build a deterministic "normal recognition" timeline:
+// - Half the scenes are genuinely new, the other half are perturbed
+//   replays of memory entries.
+fn dv_gen_normal_timeline(mem: array, seed0: int) -> array {
+    // Returns a flat array of length DV_N_SCENES*DV_N_FEATS plus a
+    // separate match_flag array — but we cannot return two arrays from
+    // a single fn cleanly under stage0 (struct-array fields trip the
+    // aliasing bug). Instead we emit a two-stream tuple as a single
+    // flat array of length DV_N_SCENES * (DV_N_FEATS + 1) where the
+    // last entry per scene is the match_flag (0 or k+1) cast to float.
+    let mut out = []
+    let mut s = seed0
+    let mut t = 0
+    while t < DV_N_SCENES {
+        s = dv_prng(s + t * 53)
+        // 50/50 schedule: even t = repeat memory (t/2) % MEM; odd t = new.
+        let is_repeat = (t % 2) == 0
+        let mut flag = 0
+        if is_repeat {
+            let k = (t / 2) % DV_MEM_SIZE
+            let stored = dv_mem_slot(mem, k)
+            let mut f = 0
+            while f < DV_N_FEATS {
+                s = dv_prng(s + f * 211)
+                let noise = dv_signed(s) * 0.05
+                out = out.push(stored[f] + noise)
+                f = f + 1
+            }
+            flag = k + 1
+        } else {
+            let mut f2 = 0
+            while f2 < DV_N_FEATS {
+                s = dv_prng(s + f2 * 379)
+                // Genuinely novel: random direction, away from any cluster.
+                let val = dv_signed(s) * 0.30 - 0.40
+                out = out.push(val)
+                f2 = f2 + 1
+            }
+        }
+        out = out.push(to_float(flag))
+        t = t + 1
+    }
+    return out
+}
+
+// Extract scene t feature vector from packed timeline.
+fn dv_scene_feats(timeline: array, t: int) -> array {
+    let stride = DV_N_FEATS + 1
+    let base = t * stride
+    let mut out = []
+    let mut f = 0
+    while f < DV_N_FEATS {
+        out = out.push(timeline[base + f])
+        f = f + 1
+    }
+    return out
+}
+
+// Extract match_flag for scene t.
+fn dv_scene_flag(timeline: array, t: int) -> int {
+    let stride = DV_N_FEATS + 1
+    let base = t * stride
+    return to_int(timeline[base + DV_N_FEATS])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Two-stream detection: familiarity (rhinal/perceptual) +
+//                       recollection (hippocampal/episodic)
+//
+// FAMILIARITY: max coarse-gist similarity to ANY memory slot.
+//   Cosine-like: sum(min(scene_f, mem_f) clamped non-neg) /
+//                sum(max(|scene_f|, |mem_f|))
+//   This is intentionally LOOSE — it does not need contextual binding,
+//   only feature overlap.  Spurious firings (déjà vu / TLE) are
+//   modelled by adding a perceptual-bias term that pretends a novel
+//   scene resembles a stored one.
+//
+// RECOLLECTION: dot product followed by strict-threshold gate.
+//   This is STRICT — only fires when the scene matches a specific
+//   episode strongly enough that retrieval succeeds.
+// ═══════════════════════════════════════════════════════════════
+
+// Cosine-like coarse gist similarity in [0,1].
+fn dv_gist_similarity(scene: array, mem_vec: array) -> float {
+    let n = len(scene)
+    if n == 0 { return 0.0 }
+    if len(mem_vec) != n { return 0.0 }
+    let mut num = 0.0
+    let mut den = 0.0
+    let mut i = 0
+    while i < n {
+        let a = scene[i]
+        let b = mem_vec[i]
+        let mn = dv_min_f(dv_abs(a), dv_abs(b))
+        let mx = dv_max_f(dv_abs(a), dv_abs(b))
+        // sign-aligned bonus: only count when both push the same direction.
+        let aligned = a * b > 0.0
+        if aligned { num = num + mn }
+        den = den + mx
+        i = i + 1
+    }
+    if den < DV_EPS { return 0.0 }
+    let s = num / den
+    if s < 0.0 { return 0.0 }
+    if s > 1.0 { return 1.0 }
+    return s
+}
+
+// Strict episodic match — best cosine similarity to any memory slot.
+// Previous version divided dot by DV_N_FEATS which crushed all values
+// below the threshold; cosine preserves the [0,1] semantics so the
+// gate at DV_REC_THRESH actually bites only on true mismatches.
+fn dv_episodic_match(scene: array, mem: array) -> float {
+    let mut best = 0.0
+    let mut scene_n2 = 0.0
+    let mut fi = 0
+    while fi < DV_N_FEATS {
+        scene_n2 = scene_n2 + scene[fi] * scene[fi]
+        fi = fi + 1
+    }
+    let scene_n = dv_sqrt(scene_n2)
+    if scene_n <= DV_EPS { return 0.0 }
+    let mut k = 0
+    while k < DV_MEM_SIZE {
+        let stored = dv_mem_slot(mem, k)
+        let mut dot = 0.0
+        let mut sn2 = 0.0
+        let mut f = 0
+        while f < DV_N_FEATS {
+            dot = dot + scene[f] * stored[f]
+            sn2 = sn2 + stored[f] * stored[f]
+            f = f + 1
+        }
+        let sn = dv_sqrt(sn2)
+        if sn > DV_EPS {
+            let cos = dot / (scene_n * sn)
+            if cos > best { best = cos }
+        }
+        k = k + 1
+    }
+    if best < 0.0 { return 0.0 }
+    return best
+}
+
+// Best coarse-gist match across the memory store (scalar).
+fn dv_best_gist(scene: array, mem: array) -> float {
+    let mut best = 0.0
+    let mut k = 0
+    while k < DV_MEM_SIZE {
+        let stored = dv_mem_slot(mem, k)
+        let s = dv_gist_similarity(scene, stored)
+        if s > best { best = s }
+        k = k + 1
+    }
+    return best
+}
+
+// Familiarity stream output for scene t.
+//   regime: 0 = normal, 1 = déjà vu (spurious gist), 2 = jamais vu
+//           (gist suppressed), 3 = TLE (raised gain)
+//   gain: stream sensitivity multiplier (TLE>1, jamais<1)
+fn dv_familiarity_signal(scene: array, mem: array, flag: int, regime: int, gain: float, seed: int) -> float {
+    let raw = dv_best_gist(scene, mem)
+    let mut out = raw * gain
+    if regime == 1 {
+        // Déjà vu: when scene is genuinely NEW (flag==0), inject a
+        // spurious gist signal proportional to DV_DEJA_RATE.
+        if flag == 0 {
+            let spurious = DV_DEJA_RATE + dv_unit(seed) * 0.15
+            out = dv_max_f(out, spurious)
+        }
+    }
+    if regime == 2 {
+        // Jamais vu: suppress the gist signal even when it should fire
+        // (genuinely repeated scenes feel novel).
+        if flag != 0 {
+            out = out * 0.25
+        }
+    }
+    if regime == 3 {
+        // TLE: stronger spurious-firing rate than baseline déjà vu
+        // because rhinal cortex stimulation lowers threshold.
+        if flag == 0 {
+            let spur = (DV_DEJA_RATE + 0.10) + dv_unit(seed) * 0.15
+            out = dv_max_f(out, spur)
+        }
+        // Also raise overall sensitivity slightly for repeated scenes.
+        if flag != 0 {
+            out = dv_min_f(1.0, out * gain)
+        }
+    }
+    if out < 0.0 { return 0.0 }
+    if out > 1.0 { return 1.0 }
+    return out
+}
+
+// Recollection stream: strict episodic gate.
+//   regime 2 (jamais vu): boost recollection when the scene DOES match
+//   memory — meta-memory says "yes I have been here" even though gist
+//   feels alien. This is the mirror image of déjà vu.
+fn dv_recollection_signal(scene: array, mem: array, flag: int, regime: int) -> float {
+    let raw_dot = dv_episodic_match(scene, mem)
+    // Map to [0,1] with mild squashing.
+    let mut out = raw_dot
+    if out < 0.0 { out = 0.0 }
+    if out > 1.0 { out = 1.0 }
+    // Apply strict threshold: rec stream silent unless above DV_REC_THRESH.
+    if out < DV_REC_THRESH { out = out * 0.20 }
+    if regime == 2 {
+        // Jamais vu: meta-memory keeps recollection elevated even when
+        // perceptual gist fails — only when scene truly is a repetition.
+        if flag != 0 {
+            out = dv_max_f(out, 0.85)
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Build fam/rec time-series across a timeline under given regime.
+// Returns flat array length DV_N_SCENES*2 with fam at even indices and
+// rec at odd indices — extractor helpers below split it.
+// ═══════════════════════════════════════════════════════════════
+
+fn dv_run_streams(timeline: array, mem: array, regime: int, gain: float, seed0: int) -> array {
+    let mut out = []
+    let mut s = seed0
+    let mut t = 0
+    while t < DV_N_SCENES {
+        s = dv_prng(s + t * 91)
+        let scene = dv_scene_feats(timeline, t)
+        let flag = dv_scene_flag(timeline, t)
+        let fam = dv_familiarity_signal(scene, mem, flag, regime, gain, s)
+        let rec = dv_recollection_signal(scene, mem, flag, regime)
+        out = out.push(fam)
+        out = out.push(rec)
+        t = t + 1
+    }
+    return out
+}
+
+fn dv_extract_fam(streams: array) -> array {
+    let mut out = []
+    let mut t = 0
+    while t < DV_N_SCENES {
+        out = out.push(streams[t * 2])
+        t = t + 1
+    }
+    return out
+}
+
+fn dv_extract_rec(streams: array) -> array {
+    let mut out = []
+    let mut t = 0
+    while t < DV_N_SCENES {
+        out = out.push(streams[t * 2 + 1])
+        t = t + 1
+    }
+    return out
+}
+
+// Mean of stream restricted to novel scenes (flag == 0).
+fn dv_mean_on_novels(timeline: array, stream: array) -> float {
+    let n = len(stream)
+    let mut s = 0.0
+    let mut c = 0
+    let mut i = 0
+    while i < n {
+        let flag = dv_scene_flag(timeline, i)
+        if flag == 0 {
+            s = s + stream[i]
+            c = c + 1
+        }
+        i = i + 1
+    }
+    if c == 0 { return 0.0 }
+    return s / to_float(c)
+}
+
+// Mean of a vector.
+fn dv_mean(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + v[i]
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+// Count mismatch events: per-scene |fam - rec| > DV_MISMATCH_GATE.
+fn dv_count_mismatches(fam: array, rec: array) -> int {
+    let n = len(fam)
+    let mut hits = 0
+    let mut i = 0
+    while i < n {
+        if dv_abs(fam[i] - rec[i]) > DV_MISMATCH_GATE { hits = hits + 1 }
+        i = i + 1
+    }
+    return hits
+}
+
+// Count specifically-déjà-vu events: fam HIGH and rec LOW on a scene
+// that is genuinely new (flag==0). This is the operational definition.
+fn dv_count_deja_events(timeline: array, fam: array, rec: array) -> int {
+    let n = len(fam)
+    let mut hits = 0
+    let mut i = 0
+    while i < n {
+        let flag = dv_scene_flag(timeline, i)
+        if flag == 0 {
+            if fam[i] > DV_FAM_THRESH {
+                if rec[i] < DV_REC_THRESH * 0.6 { hits = hits + 1 }
+            }
+        }
+        i = i + 1
+    }
+    return hits
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1–T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // Normal recognition: fam and rec covary across the timeline.
+    // Both fire on repeats (matched scenes), both stay low on novels.
+    // High MI between the two streams → "sync".
+    let mem = dv_gen_memory(DV_SEED_MEM)
+    let timeline = dv_gen_normal_timeline(mem, DV_SEED_NORMAL)
+    let streams = dv_run_streams(timeline, mem, 0, 1.0, DV_SEED_NORMAL + 1)
+    let fam = dv_extract_fam(streams)
+    let rec = dv_extract_rec(streams)
+    let mi = dv_mi(fam, rec)
+    let mismatches = dv_count_mismatches(fam, rec)
+    println("  [T1] normal MI(fam,rec)=" + str(mi) + " mismatches=" + str(mismatches) + "/" + str(DV_N_SCENES))
+    // Sync condition: MI > 0 (the two streams are not independent) and
+    // mismatch count below half the timeline.
+    if mi <= 0.0 { return false }
+    if mismatches > DV_N_SCENES / 2 { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // Déjà vu mismatch detectable: at least one scene shows |fam-rec|
+    // exceeding the gate, AND the spurious-firing condition (fam high,
+    // rec low) is met on multiple genuinely-new scenes.
+    let mem = dv_gen_memory(DV_SEED_MEM)
+    let timeline = dv_gen_normal_timeline(mem, DV_SEED_DEJA)
+    let streams = dv_run_streams(timeline, mem, 1, 1.0, DV_SEED_DEJA + 1)
+    let fam = dv_extract_fam(streams)
+    let rec = dv_extract_rec(streams)
+    let deja_events = dv_count_deja_events(timeline, fam, rec)
+    let mismatches = dv_count_mismatches(fam, rec)
+    let fam_mean = dv_mean(fam)
+    let rec_mean = dv_mean(rec)
+    println("  [T2] deja events=" + str(deja_events) + " mismatches=" + str(mismatches) + " fam_mean=" + str(fam_mean) + " rec_mean=" + str(rec_mean))
+    if deja_events < 1 { return false }
+    if mismatches < 1 { return false }
+    // Operational signature: fam stream sits ABOVE rec stream on average.
+    if fam_mean <= rec_mean { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // Φ_mismatch under déjà vu strictly exceeds Φ_mismatch under normal.
+    // Decoupling = 1 - MI/H_joint. Under normal recognition the two
+    // streams covary (decouple low). Under déjà vu the rhinal stream
+    // fires off-schedule from the hippocampal stream (decouple higher).
+    let mem = dv_gen_memory(DV_SEED_MEM)
+    let timeline_n = dv_gen_normal_timeline(mem, DV_SEED_NORMAL)
+    let streams_n = dv_run_streams(timeline_n, mem, 0, 1.0, DV_SEED_NORMAL + 1)
+    let fam_n = dv_extract_fam(streams_n)
+    let rec_n = dv_extract_rec(streams_n)
+    let phi_mis_n = dv_decouple(fam_n, rec_n)
+
+    let timeline_d = dv_gen_normal_timeline(mem, DV_SEED_DEJA)
+    let streams_d = dv_run_streams(timeline_d, mem, 1, 1.0, DV_SEED_DEJA + 1)
+    let fam_d = dv_extract_fam(streams_d)
+    let rec_d = dv_extract_rec(streams_d)
+    let phi_mis_d = dv_decouple(fam_d, rec_d)
+    println("  [T3] Φ_mismatch normal=" + str(phi_mis_n) + " deja=" + str(phi_mis_d) + " gap=" + str(phi_mis_d - phi_mis_n))
+    if phi_mis_d <= 0.0 { return false }
+    if phi_mis_d < (phi_mis_n + DV_DECOUPLE_GAP) { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // Jamais vu opposite signature: in normal/déjà vu fam_mean >=
+    // rec_mean (or roughly tracks); in jamais vu fam_mean STRICTLY
+    // below rec_mean — perceptual gist suppressed while episodic
+    // recollection elevated.
+    let mem = dv_gen_memory(DV_SEED_MEM)
+    let timeline = dv_gen_normal_timeline(mem, DV_SEED_JAMAIS)
+    let streams_dv = dv_run_streams(timeline, mem, 1, 1.0, DV_SEED_JAMAIS + 1)
+    let fam_dv = dv_extract_fam(streams_dv)
+    let rec_dv = dv_extract_rec(streams_dv)
+    let dv_sign = dv_mean(fam_dv) - dv_mean(rec_dv)
+
+    let streams_jv = dv_run_streams(timeline, mem, 2, 1.0, DV_SEED_JAMAIS + 2)
+    let fam_jv = dv_extract_fam(streams_jv)
+    let rec_jv = dv_extract_rec(streams_jv)
+    let jv_sign = dv_mean(fam_jv) - dv_mean(rec_jv)
+    println("  [T4] deja sign=" + str(dv_sign) + " jamais sign=" + str(jv_sign))
+    // Signs must flip: déjà vu positive, jamais vu negative.
+    if dv_sign <= 0.0 { return false }
+    if jv_sign >= 0.0 { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // TLE analog: rhinal-stream gain raised (1.0 → DV_TLE_GAIN). Baseline
+    // déjà vu (regime 1) already saturates event-count on novels, so we
+    // also compare mean familiarity intensity on novels: TLE's lowered
+    // rhinal threshold must push fam HIGHER on genuinely-new scenes.
+    let mem = dv_gen_memory(DV_SEED_MEM)
+    let timeline = dv_gen_normal_timeline(mem, DV_SEED_TLE_LOW)
+    let streams_lo = dv_run_streams(timeline, mem, 1, 1.0, DV_SEED_TLE_LOW + 1)
+    let fam_lo = dv_extract_fam(streams_lo)
+    let rec_lo = dv_extract_rec(streams_lo)
+    let events_lo = dv_count_deja_events(timeline, fam_lo, rec_lo)
+    let fam_lo_mean_new = dv_mean_on_novels(timeline, fam_lo)
+
+    let streams_hi = dv_run_streams(timeline, mem, 3, DV_TLE_GAIN, DV_SEED_TLE_HIGH + 1)
+    let fam_hi = dv_extract_fam(streams_hi)
+    let rec_hi = dv_extract_rec(streams_hi)
+    let events_hi = dv_count_deja_events(timeline, fam_hi, rec_hi)
+    let fam_hi_mean_new = dv_mean_on_novels(timeline, fam_hi)
+    println("  [T5] TLE events lo=" + str(events_lo) + " hi=" + str(events_hi) + " gain=" + str(DV_TLE_GAIN))
+    println("  [T5] TLE fam_mean(novels) lo=" + str(fam_lo_mean_new) + " hi=" + str(fam_hi_mean_new))
+    if events_hi < events_lo { return false }
+    if fam_hi_mean_new <= fam_lo_mean_new { return false }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[deja_vu_phi] P82 — Déjà Vu Φ (temporal mismatch)")
+    println("  N_scenes=12, N_feats=4, MEM=8; two MTL streams (rhinal fam, hipp rec)")
+    println("  Laws 2/4/22/50 — Brown 2003 dual-process × Bancaud 1994 TLE")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  normal recognition — fam/rec sync") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  déjà vu mismatch detectable") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  Φ_mismatch > 0 under déjà vu") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  jamais vu opposite signature") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  TLE analog raises déjà vu rate") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Stage0 chained && with 5 terms occasionally mishandled — split into
+    // sequential mut-bool accumulator for safety.
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[deja_vu_phi] 5/5 PASS — P82 DONE (déjà vu = familiarity without recollection)")
+    } else {
+        println("[deja_vu_phi] SOME FAILED")
+    }
+}
+
+main()

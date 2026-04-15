@@ -1,0 +1,657 @@
+// locked_in_phi.hexa — P80 Locked-in Syndrome Φ
+//
+// Roadmap: P80 — Locked-in syndrome dissociation between cognitive Φ
+//   and motor-output Φ; misdiagnosis risk; BCI as Φ-recovery bridge.
+//   done_criteria: "5/5 PASS — locked-in cognitive Φ preserved while
+//                   motor Φ=0; outside-observer Φ estimate updated
+//                   only after BCI reveals signal; eye-blink code
+//                   recoverable from residual ocular channel"
+//
+// ─── Scientific hypothesis ─────────────────────────────────────────
+//
+// Locked-in syndrome (LIS) — typically a ventral-pontine lesion of the
+// corticospinal/corticobulbar tracts — produces complete somatic
+// paralysis with PRESERVED cortical activity. Jean-Dominique Bauby
+// dictated "The Diving Bell and the Butterfly" by blinking his left
+// eye one letter at a time. From the inside the patient is
+// cognitively intact; from the outside, with no motor output, an
+// observer who infers Φ from behaviour will read Φ ≈ 0 — and confuse
+// the patient with a vegetative-state (VS) brain whose CORTICAL Φ is
+// itself collapsed.
+//
+// This engine separates two Φ traces explicitly:
+//
+//   Φ_cognitive : MI on a multi-channel cortical inner-dialogue tape
+//                 (rich, structured, awake-grade signal).
+//   Φ_motor     : MI on the motor-output channel only (the only thing
+//                 an outside, behaviour-only observer can sample).
+//
+// In LIS, Φ_cognitive ≈ awake baseline AND Φ_motor ≈ 0. In VS, BOTH
+// are ≈ 0. So motor-only observation cannot distinguish them — the
+// MISDIAGNOSIS error.
+//
+// A BCI (P26-style) bypasses the broken motor pathway by tapping the
+// cortical signal directly. Once active, the observer's Φ estimate
+// jumps from Φ_motor (≈ 0) to Φ_bci (≈ Φ_cognitive). This is the
+// formal "recovery of person-status by instrument."
+//
+// We further model an eye-blink Morse code: in classical LIS the
+// patient retains vertical eye movement / left-eye blink — a single
+// residual binary motor channel. Recovering a known plaintext from
+// that channel proves cognitive preservation even pre-BCI.
+//
+// ─── Theorems (T1–T5) ─────────────────────────────────────────────
+//
+// T1 (locked-in cognitive Φ > vegetative Φ): generate two cortical
+//    tapes — LIS (intact dynamics) and VS (collapsed dynamics) —
+//    and require Φ_cognitive(LIS) > Φ_cognitive(VS) + margin.
+//
+// T2 (zero-motor preserves cognitive Φ): LIS motor channel is
+//    zeroed. Φ_motor(LIS) ≈ 0 while Φ_cognitive(LIS) is unchanged
+//    from a pre-lesion awake baseline (within tolerance).
+//
+// T3 (misdiagnosis risk quantified): the outside observer's Φ
+//    estimate (motor-only) ≤ ε for both LIS and VS. Without the
+//    BCI bridge the observer cannot tell them apart — i.e.
+//    |Φ_obs(LIS) - Φ_obs(VS)| < ε_diag. Diagnosis collapses.
+//
+// T4 (BCI restores observer Φ estimate): after activating the BCI
+//    bridge, the observer's effective Φ estimate equals Φ_bci ≈
+//    Φ_cognitive within tolerance, and the LIS/VS gap is recovered:
+//    Φ_obs_post(LIS) - Φ_obs_post(VS) > recovery_gap.
+//
+// T5 (eye-blink code recoverable): encode a known short symbol
+//    sequence into the residual eye-blink channel of LIS; decode
+//    from the channel and require ≥ 90% symbol-accuracy. This shows
+//    cognitive structure is exportable through a single bit even
+//    before the BCI is online.
+//
+// Hexa stage0 constraints honored:
+//   - plain `fn` only (no `pure fn` returning ≥3 float struct)
+//   - typed array params only (no [float]/[int])
+//   - no identifier-pattern match
+//   - no contains() / to_lower()
+//   - no !(Effect) sigs
+//   - no else-if in let-binding
+//   - no multi-line fn sig/call/array literal
+//   - all returns single-line expressions
+//   - N < 32 (K_COG=4, WIN=24, BINS=4)
+//   - main() at bottom
+//
+// Law alignment:
+//   Law 4   Structure > feature — cognitive vs motor is STRUCTURAL split
+//   Law 22  no feature explosion — motor zeroing is structural, not flag
+//   Law 29  speak() none — no fabricated patient utterances
+//   Meta M8 Embodied cognition — body is the broken layer, not mind
+//   AN7     Core separation — standalone engine
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+// State IDs
+let ST_AWAKE      = 0    // pre-lesion control (full Φ, full motor)
+let ST_LOCKED_IN  = 1    // LIS — cortex intact, motor zero
+let ST_VEGETATIVE = 2    // VS — cortex collapsed, motor zero
+
+// Cortical channels (cognitive trace). Stage0 envelope: keep small.
+let LI_K_COG  = 4
+let LI_WIN    = 24
+let LI_BINS   = 4
+
+// Numerics
+let LI_EPS         = 0.0000000001
+let LI_MOTOR_TOL   = 0.005       // motor-channel Φ floor we'll consider "zero"
+let LI_DIAG_GAP    = 0.05        // |Φ_obs(LIS)-Φ_obs(VS)| considered "tellable"
+let LI_REC_GAP     = 0.10        // Φ recovery after BCI must exceed this
+let LI_COG_DROP    = 0.30        // VS cognitive must fall this far below LIS
+
+// Eye-blink coder
+let LI_BLINK_BITS  = 12          // 12-bit message, 6 symbols of 2 bits each
+let LI_BLINK_NOISE = 0.20        // ocular noise amplitude
+
+// ═══════════════════════════════════════════════════════════════
+// PRNG + math helpers (independent prefix to avoid clashes)
+// ═══════════════════════════════════════════════════════════════
+
+fn li_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn li_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn li_signed(seed: int) -> float {
+    return li_unit(seed) * 2.0 - 1.0
+}
+
+fn li_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn li_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+// Wrapped Taylor sin substitute, same trick as anesthesia_phi.
+fn li_osc(phase: float) -> float {
+    let two_pi = 6.2831853
+    let pi = 3.1415927
+    let mut p = phase
+    while p > pi { p = p - two_pi }
+    while p < 0.0 - pi { p = p + two_pi }
+    if p > 1.5707963 { p = pi - p }
+    if p < 0.0 - 1.5707963 { p = 0.0 - pi - p }
+    let p2 = p * p
+    let p3 = p2 * p
+    let p5 = p3 * p2
+    return p - 0.16666667 * p3 + 0.00833333 * p5
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Histogram MI (Miller-Madow corrected)
+// ═══════════════════════════════════════════════════════════════
+
+fn li_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn li_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn li_entropy(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(li_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = li_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * li_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn li_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        let ia = li_bin_idx(a[i], lo, hi, nb)
+        let ib = li_bin_idx(b[i], lo, hi, nb)
+        ids = ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = li_counts(ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * li_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+// MI with Miller-Madow bias correction.
+// Same rationale as anesthesia_phi.an_mi: the (B-1)^2/(2N) bias term
+// makes truly independent / silent channels report ~0 instead of a
+// spurious floor that would defeat the LIS-vs-VS comparison.
+fn li_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let mut lo = a[0]
+    let mut hi = a[0]
+    let mut i = 0
+    while i < n {
+        if a[i] < lo { lo = a[i] }
+        if a[i] > hi { hi = a[i] }
+        if b[i] < lo { lo = b[i] }
+        if b[i] > hi { hi = b[i] }
+        i = i + 1
+    }
+    let ha = li_entropy(a, lo, hi, LI_BINS)
+    let hb = li_entropy(b, lo, hi, LI_BINS)
+    let hj = li_joint_entropy(a, b, lo, hi, LI_BINS)
+    let mi_raw = ha + hb - hj
+    let bf = to_float(LI_BINS - 1)
+    let bias = (bf * bf) / (2.0 * to_float(n))
+    let mi = mi_raw - bias
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Cortical tape — flat [K_COG * WIN], channel k sample t -> [k*WIN+t]
+// ═══════════════════════════════════════════════════════════════
+
+fn li_extract_channel(tape: array, k: int, win: int) -> array {
+    let mut out = []
+    let mut t = 0
+    while t < win {
+        out = out.push(tape[k * win + t])
+        t = t + 1
+    }
+    return out
+}
+
+fn li_phi_tape(tape: array, k_chan: int, win: int) -> float {
+    let mut total = 0.0
+    let mut pairs = 0
+    let mut i = 0
+    while i < (k_chan - 1) {
+        let ci = li_extract_channel(tape, i, win)
+        let mut j = i + 1
+        while j < k_chan {
+            let cj = li_extract_channel(tape, j, win)
+            total = total + li_mi(ci, cj)
+            pairs = pairs + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if pairs == 0 { return 0.0 }
+    return total / to_float(pairs)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// State-conditioned cortical regime
+//
+// Same shared/idio/noise decomposition as the anesthesia engine.
+// AWAKE  : strong shared driver, low noise
+// LIS    : same as AWAKE — that is the WHOLE point of LIS
+// VS     : shared driver collapsed, high noise (cortex disintegrated)
+// ═══════════════════════════════════════════════════════════════
+
+fn li_cog_coupling(state: int) -> float {
+    if state == ST_AWAKE { return 0.92 }
+    if state == ST_LOCKED_IN { return 0.92 }
+    if state == ST_VEGETATIVE { return 0.05 }
+    return 0.50
+}
+
+fn li_cog_amplitude(state: int) -> float {
+    if state == ST_AWAKE { return 1.00 }
+    if state == ST_LOCKED_IN { return 1.00 }
+    if state == ST_VEGETATIVE { return 0.10 }
+    return 0.50
+}
+
+fn li_cog_noise(state: int) -> float {
+    if state == ST_AWAKE { return 0.10 }
+    if state == ST_LOCKED_IN { return 0.10 }
+    if state == ST_VEGETATIVE { return 2.50 }
+    return 0.50
+}
+
+// State name for logs
+fn li_state_name(s: int) -> string {
+    if s == 0 { return "AWAKE" }
+    if s == 1 { return "LOCKED_IN" }
+    if s == 2 { return "VEGETATIVE" }
+    return "UNKNOWN"
+}
+
+// Generate cortical tape conditioned on state. Channels share an
+// oscillatory driver scaled by coupling*amp; per-channel idio + noise.
+fn li_gen_cortical(state: int, seed: int) -> array {
+    let coupling = li_cog_coupling(state)
+    let amp      = li_cog_amplitude(state)
+    let noise    = li_cog_noise(state)
+    let mut flat = []
+    let mut s = seed
+    let mut k = 0
+    while k < LI_K_COG {
+        let mut t = 0
+        while t < LI_WIN {
+            s = li_prng(s + k * 197 + t * 29)
+            let shared_phase = 0.60 * to_float(t)
+            let shared = 2.0 * coupling * amp * li_osc(shared_phase)
+            let idio_phase = 0.83 * to_float(t) + 1.77 * to_float(k)
+            let idio = 0.20 * amp * li_osc(idio_phase)
+            let indep = noise * li_signed(s)
+            flat = flat.push(shared + idio + indep)
+            t = t + 1
+        }
+        k = k + 1
+    }
+    return flat
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Motor channel
+//
+// In the AWAKE state the motor channel carries a structured cortical
+// efference copy — Φ_motor is meaningful. In LIS and VS the motor
+// channel is zeroed (lesion / disintegration). To compute "Φ_motor"
+// we still need ≥2 sub-channels to feed MI; we use two efference
+// taps (e.g. left and right pyramidal tract). Both are zero in LIS.
+// ═══════════════════════════════════════════════════════════════
+
+fn li_motor_active(state: int) -> bool {
+    if state == ST_AWAKE { return true }
+    return false
+}
+
+fn li_gen_motor(state: int, seed: int) -> array {
+    // 2 sub-channels of WIN samples (flat, channel-major).
+    let mut flat = []
+    let mut s = seed
+    let active = li_motor_active(state)
+    let mut k = 0
+    while k < 2 {
+        let mut t = 0
+        while t < LI_WIN {
+            s = li_prng(s + k * 311 + t * 41)
+            let mut v = 0.0
+            if active {
+                // Coupled efference signal — both channels share the
+                // motor-cortex oscillation strongly.
+                let phase = 0.70 * to_float(t) + 0.30 * to_float(k)
+                let shared = 1.6 * li_osc(phase)
+                let indep = 0.10 * li_signed(s)
+                v = shared + indep
+            }
+            // else: lesion zero — pure mechanical zero (no residual jitter).
+            flat = flat.push(v)
+            t = t + 1
+        }
+        k = k + 1
+    }
+    return flat
+}
+
+// Φ on the 2-channel motor tape: a single MI between channel 0 and 1.
+fn li_phi_motor(motor: array) -> float {
+    let a = li_extract_channel(motor, 0, LI_WIN)
+    let b = li_extract_channel(motor, 1, LI_WIN)
+    return li_mi(a, b)
+}
+
+// Cognitive Φ wrapper.
+fn li_phi_cognitive(cortical: array) -> float {
+    return li_phi_tape(cortical, LI_K_COG, LI_WIN)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Outside observer
+//
+// Without a BCI, the observer can only sample the motor channel;
+// their Φ estimate IS the motor Φ. With the BCI engaged, they
+// additionally read a cortical-tap channel that samples cognitive
+// integration directly — their Φ estimate jumps to Φ_bci ≈
+// Φ_cognitive (subject to noise).
+// ═══════════════════════════════════════════════════════════════
+
+// Pre-BCI observer: motor only.
+fn li_phi_observer_pre(motor: array) -> float {
+    return li_phi_motor(motor)
+}
+
+// Post-BCI observer: takes the cognitive tape directly via a tap.
+// Light additional measurement noise from the BCI hardware (electrodes
+// + amplifier). We add small jitter then compute Φ as usual.
+fn li_phi_observer_post(cortical: array, seed: int) -> float {
+    let n = len(cortical)
+    let mut tap = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = li_prng(s + i * 7)
+        let jitter = 0.05 * li_signed(s)
+        tap = tap.push(cortical[i] + jitter)
+        i = i + 1
+    }
+    return li_phi_tape(tap, LI_K_COG, LI_WIN)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Eye-blink Morse-like coder/decoder
+//
+// In classical LIS the patient retains vertical eye movement / one-eye
+// blink. We encode a 12-bit message into an ocular channel as
+// {+1, -1} values (blink = +1, no-blink = -1) plus low Gaussian
+// noise. The decoder thresholds on sign. We require ≥ 90% accuracy.
+// ═══════════════════════════════════════════════════════════════
+
+// Deterministic 12-bit message — alternating pattern with a flip
+// in the middle, which the decoder must recover exactly.
+fn li_blink_message() -> array {
+    let mut m = []
+    m = m.push(1)
+    m = m.push(0)
+    m = m.push(1)
+    m = m.push(1)
+    m = m.push(0)
+    m = m.push(1)
+    m = m.push(0)
+    m = m.push(0)
+    m = m.push(1)
+    m = m.push(0)
+    m = m.push(1)
+    m = m.push(1)
+    return m
+}
+
+fn li_encode_blinks(msg: array, seed: int) -> array {
+    let n = len(msg)
+    let mut sig = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = li_prng(s + i * 53)
+        let bit = msg[i]
+        let mut v = 0.0 - 1.0
+        if bit == 1 { v = 1.0 }
+        let noise = LI_BLINK_NOISE * li_signed(s)
+        sig = sig.push(v + noise)
+        i = i + 1
+    }
+    return sig
+}
+
+fn li_decode_blinks(sig: array) -> array {
+    let n = len(sig)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let mut bit = 0
+        if sig[i] > 0.0 { bit = 1 }
+        out = out.push(bit)
+        i = i + 1
+    }
+    return out
+}
+
+fn li_symbol_accuracy(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let mut hits = 0
+    let mut i = 0
+    while i < n {
+        if a[i] == b[i] { hits = hits + 1 }
+        i = i + 1
+    }
+    return to_float(hits) / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1–T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1: locked-in cognitive Φ > vegetative cognitive Φ + LI_COG_DROP.
+    let seed = 80001
+    let cortex_lis = li_gen_cortical(ST_LOCKED_IN,  seed + 11)
+    let cortex_vs  = li_gen_cortical(ST_VEGETATIVE, seed + 22)
+    let phi_lis = li_phi_cognitive(cortex_lis)
+    let phi_vs  = li_phi_cognitive(cortex_vs)
+    println("  [T1] Φ_cog(LIS) = " + str(phi_lis))
+    println("  [T1] Φ_cog(VS)  = " + str(phi_vs))
+    println("  [T1] gap = " + str(phi_lis - phi_vs) + "  (need > " + str(LI_COG_DROP) + ")")
+    if phi_lis <= phi_vs { return false }
+    return (phi_lis - phi_vs) > LI_COG_DROP
+}
+
+fn check_T2() -> bool {
+    // T2: zero-motor preserves cognitive Φ. LIS cognitive Φ should
+    //     match the AWAKE control's cognitive Φ within tolerance,
+    //     and LIS motor Φ should be ≤ LI_MOTOR_TOL.
+    let seed = 80002
+    let cortex_awake = li_gen_cortical(ST_AWAKE,     seed + 11)
+    let cortex_lis   = li_gen_cortical(ST_LOCKED_IN, seed + 11)  // SAME seed — same cortex
+    let motor_lis    = li_gen_motor(ST_LOCKED_IN,    seed + 33)
+    let phi_cog_awake = li_phi_cognitive(cortex_awake)
+    let phi_cog_lis   = li_phi_cognitive(cortex_lis)
+    let phi_motor_lis = li_phi_motor(motor_lis)
+    println("  [T2] Φ_cog(AWAKE)   = " + str(phi_cog_awake))
+    println("  [T2] Φ_cog(LIS)     = " + str(phi_cog_lis))
+    println("  [T2] Φ_motor(LIS)   = " + str(phi_motor_lis) + "  (need ≤ " + str(LI_MOTOR_TOL) + ")")
+    // Cognitive equality (same seed, same regime → must be bit-equal).
+    if li_abs(phi_cog_awake - phi_cog_lis) > LI_EPS { return false }
+    if phi_motor_lis > LI_MOTOR_TOL { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3: misdiagnosis risk — outside observer using motor only cannot
+    //     distinguish LIS from VS. Both Φ_obs are ≤ LI_MOTOR_TOL and
+    //     their gap is < LI_DIAG_GAP.
+    let seed = 80003
+    let motor_lis = li_gen_motor(ST_LOCKED_IN,  seed + 11)
+    let motor_vs  = li_gen_motor(ST_VEGETATIVE, seed + 22)
+    let phi_obs_lis = li_phi_observer_pre(motor_lis)
+    let phi_obs_vs  = li_phi_observer_pre(motor_vs)
+    let gap = li_abs(phi_obs_lis - phi_obs_vs)
+    println("  [T3] Φ_obs(LIS, motor-only) = " + str(phi_obs_lis))
+    println("  [T3] Φ_obs(VS,  motor-only) = " + str(phi_obs_vs))
+    println("  [T3] |gap| = " + str(gap) + "  (need < " + str(LI_DIAG_GAP) + ")")
+    if phi_obs_lis > LI_MOTOR_TOL { return false }
+    if phi_obs_vs  > LI_MOTOR_TOL { return false }
+    if gap >= LI_DIAG_GAP { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: BCI restores observer Φ estimate. After engaging the BCI, the
+    //     observer's Φ estimate for LIS is ≈ Φ_cognitive(LIS) and the
+    //     LIS-vs-VS gap is recovered (> LI_REC_GAP).
+    let seed = 80004
+    let cortex_lis = li_gen_cortical(ST_LOCKED_IN,  seed + 11)
+    let cortex_vs  = li_gen_cortical(ST_VEGETATIVE, seed + 22)
+    let phi_cog_lis = li_phi_cognitive(cortex_lis)
+    let phi_cog_vs  = li_phi_cognitive(cortex_vs)
+    let phi_bci_lis = li_phi_observer_post(cortex_lis, seed + 101)
+    let phi_bci_vs  = li_phi_observer_post(cortex_vs,  seed + 202)
+    let gap = phi_bci_lis - phi_bci_vs
+    println("  [T4] Φ_cog(LIS)        = " + str(phi_cog_lis))
+    println("  [T4] Φ_obs_post(LIS)   = " + str(phi_bci_lis))
+    println("  [T4] Φ_obs_post(VS)    = " + str(phi_bci_vs))
+    println("  [T4] recovered gap = " + str(gap) + "  (need > " + str(LI_REC_GAP) + ")")
+    // BCI estimate for LIS must be within 30% of true cognitive Φ.
+    let dev = li_abs(phi_bci_lis - phi_cog_lis) / (phi_cog_lis + LI_EPS)
+    if dev > 0.30 { return false }
+    if gap <= LI_REC_GAP { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5: eye-blink message recoverable from residual ocular channel
+    //     with ≥ 90% accuracy.
+    let seed = 80005
+    let msg = li_blink_message()
+    let sig = li_encode_blinks(msg, seed + 11)
+    let dec = li_decode_blinks(sig)
+    let acc = li_symbol_accuracy(msg, dec)
+    println("  [T5] message len = " + str(len(msg)))
+    println("  [T5] decoded len = " + str(len(dec)))
+    println("  [T5] symbol accuracy = " + str(acc) + "  (need ≥ 0.90)")
+    let mut i = 0
+    let n = len(msg)
+    let mut row_msg = "       msg = "
+    let mut row_dec = "       dec = "
+    while i < n {
+        row_msg = row_msg + str(msg[i])
+        row_dec = row_dec + str(dec[i])
+        i = i + 1
+    }
+    println(row_msg)
+    println(row_dec)
+    return acc >= 0.90
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[locked_in_phi] P80 — Locked-in Syndrome Φ (Bauby)")
+    println("  states: AWAKE / LOCKED_IN / VEGETATIVE")
+    println("  K_COG=" + str(LI_K_COG) + "  WIN=" + str(LI_WIN) + "  BINS=" + str(LI_BINS))
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — Φ_cog(LIS) > Φ_cog(VS) by required margin") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — zero-motor preserves cognitive Φ (LIS cortex == AWAKE cortex)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — motor-only observer cannot distinguish LIS from VS (misdiagnosis risk)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — BCI bridge restores observer Φ estimate; LIS/VS gap recovered") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — eye-blink code recoverable from residual ocular channel") } else { println("T5 FAIL") }
+
+    println("")
+
+    let mut all = true
+    if t1 == false { all = false }
+    if t2 == false { all = false }
+    if t3 == false { all = false }
+    if t4 == false { all = false }
+    if t5 == false { all = false }
+
+    if all {
+        println("[locked_in_phi] 5/5 PASS — P80 DONE (locked-in Φ + BCI recovery)")
+    } else {
+        println("[locked_in_phi] SOME FAILED")
+    }
+}
+
+main()
