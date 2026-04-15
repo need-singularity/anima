@@ -1,0 +1,1087 @@
+// nostalgia_phi.hexa — P135 Nostalgia Φ (Self-Continuity Bittersweet Engine)
+//
+// Roadmap: shared/roadmaps/anima.json P135
+//   Siblings:
+//     narrative_identity_phi (P65) — diachronic self / Parfit Relation R
+//     memory_consolidation_phi (P93) — hippo↔cortex replay Φ
+//     memory_palace_phi (P52) — episodic spatial bind
+//     emotion_regulation_phi (P88) — Gross process model
+//     autobiographical_memory_phi — retrieval / personal past
+//
+// ─── Scientific / psychological frame ──────────────────────────────
+//
+// Sedikides, Wildschut & Baden (2004); Sedikides & Wildschut (2008,
+// 2018); Wildschut, Sedikides, Arndt & Routledge (2006):
+//
+//   Nostalgia is a sentimental longing for one's personal past, most
+//   often involving momentous events (birthdays, weddings, graduations)
+//   populated by close others (family, romantic partners, close friends),
+//   reminisced about with a bittersweet tone — the memory itself is
+//   positively valenced, yet its PASTNESS (absence in the present)
+//   introduces a concurrent negative valence. Unlike pure sadness or
+//   pure joy, nostalgia is AMBIVALENT — both positive and negative
+//   affect channels co-activate.
+//
+//   Four canonical psychological functions of nostalgia:
+//
+//   (1) SELF-CONTINUITY (Sedikides+ 2008; Routledge+ 2012):
+//       Nostalgic reverie binds past-self to present-self, resisting
+//       discontinuity threats. MI(past_self_state, present_self_state)
+//       increases following a nostalgic episode relative to neutral
+//       memory recall. Operationally: the subspace correlation |r|
+//       between past-self and present-self trace rises.
+//
+//   (2) SOCIAL CONNECTEDNESS (Zhou+ 2008; Wildschut+ 2010):
+//       Nostalgic memories are typically populated by close others.
+//       Post-nostalgia, the social-bond channel (felt closeness to
+//       imagined others) rises. This effect is SPECIFIC to nostalgia
+//       — it does not arise under neutral autobiographical recall.
+//
+//   (3) MEANING-IN-LIFE (Routledge+ 2011; Hepper+ 2012):
+//       Nostalgia boosts perceived purpose and significance. We model
+//       this implicitly via Φ_nostalgia integration (not a separate T).
+//
+//   (4) EXISTENTIAL BUFFER (Routledge+ 2008):
+//       Nostalgia buffers against mortality salience / meaninglessness.
+//       Not tested directly here — see bardo_phi (P108) for that axis.
+//
+//   Bittersweet ambivalence (Larsen+ 2001; Leunissen+ 2021):
+//       Nostalgia produces CONCURRENT positive affect (remembered joy)
+//       and negative affect (the memory's pastness, irretrievability).
+//       Both valence channels have non-trivial activation; gap from
+//       pure-positive reminiscence is measurable.
+//
+//   Proust effect / sensory triggering (Chu & Downes 2000; Hepper+ 2012):
+//       Odor and music are privileged nostalgia triggers. A sensory
+//       cue with autobiographical loading evokes nostalgia above the
+//       baseline of a neutral, novel sensory cue. The trigger pathway
+//       is: sensory_cue → autobiographical retrieval → valence
+//       ambivalence → self-continuity & social-bond elevation.
+//
+// ─── Model channels (6, packed flat across T timesteps) ───────────
+//
+//   ch 0  sensory_cue   — Proust anchor (odor/music envelope) vs. neutral
+//   ch 1  past_self     — retrieved past-self state trace
+//   ch 2  present_self  — current self-state trace
+//   ch 3  pos_valence   — positive affective component (remembered joy)
+//   ch 4  neg_valence   — negative affective component (present absence)
+//   ch 5  social_bond   — felt closeness to close others / belongingness
+//
+// Packed layout: packed[ch * T + t]. Prefix nos_ used throughout
+// (L0-clean).
+//
+// Forward model (per state):
+//
+//   sensory_cue[t]  = cue_profile(state, t)
+//   past_self[t]    = retrieval_gain(state) * autobio_base(t) + jitter
+//   present_self[t] = continuity_gain(state) * autobio_base(t) + shift + jitter
+//   pos_valence[t]  = joy_gain(state) * positive_template(t) + jitter
+//   neg_valence[t]  = loss_gain(state) * absence_template(t) + jitter
+//   social_bond[t]  = social_gain(state) * social_template(t) + jitter
+//
+// States:
+//
+//   NOS_REST        — neutral rest, no cue, no recall
+//   NOS_NEUTRAL_CUE — novel sensory cue, no autobiographical loading
+//   NOS_NOSTALGIA   — Proust-loaded cue + autobiographical recall +
+//                     bittersweet + social imagery
+//   NOS_PURE_POS    — purely positive reminiscence baseline (no loss)
+//   NOS_NEUT_RECALL — neutral autobiographical recall (no nostalgia)
+//
+// ─── Φ definitions ─────────────────────────────────────────────────
+//
+//   Φ_trigger        — |r|(sensory_cue, past_self) — Proust pathway
+//   Φ_bittersweet    — min(mean|pos_val|, mean|neg_val|) — ambivalence floor
+//   Φ_self_continuity — |r|(past_self, present_self) via sub-window Pearson
+//   Φ_social          — mean|social_bond| post-state
+//   Φ_nostalgia       — mean pairwise MI across 4 binding channels
+//                        (past_self, pos_valence, neg_valence, social_bond)
+//
+// ─── 5 self-tests (T1..T5) ─────────────────────────────────────────
+//
+//   T1 Proust trigger response:
+//     Φ_trigger(nostalgia_state) > Φ_trigger(neutral_cue_state) + gate
+//     Sensory anchor with autobiographical loading couples cue→past_self,
+//     unlike a novel neutral cue which has no memory retrieval.
+//
+//   T2 Bittersweet ambivalence:
+//     Φ_bittersweet(nostalgia) > 0 with BOTH mean|pos_val| > floor
+//     AND mean|neg_val| > floor. Gap from pure-positive baseline:
+//     mean|neg_val|(nostalgia) - mean|neg_val|(pure_pos) > gap_gate.
+//     Operationalizes Larsen 2001 mixed-emotion model.
+//
+//   T3 Self-continuity boost:
+//     Φ_self_continuity(nostalgia) > Φ_self_continuity(rest)
+//     by a measurable gap. The past-self ↔ present-self coupling
+//     rises under nostalgic reverie (Sedikides+ 2008).
+//
+//   T4 Social connectedness rise (specificity):
+//     Φ_social(nostalgia) > Φ_social(rest) AND
+//     Φ_social(nostalgia) > Φ_social(neutral_recall)
+//     The effect is specific — neutral autobiographical recall does
+//     not produce the same social-bond elevation (Wildschut+ 2010).
+//
+//   T5 Integrated Φ_nostalgia:
+//     Φ_nostalgia(nostalgia_state) > Φ_nostalgia(rest_state) + gate.
+//     The integrated binding of memory + valence + self + social rises
+//     above the non-nostalgic rest baseline.
+//
+// ─── Stage0 hexa constraints honored ───────────────────────────────
+//   - plain `fn` only; no `pure fn` with ≥3 float struct returns
+//   - `array` typed params only; no [float]/[int]/[str]
+//   - no identifier-pattern match; sequential if chains
+//   - no contains() / to_lower() builtins
+//   - no !(Effect) annotations
+//   - no else-if in let-binding; flat mut + sequential if
+//   - single-line fn signatures / call sites / array literals
+//   - no reserved keywords as variable names
+//   - main() call at bottom
+//   - NOS_T = 24 (< 32)
+//   - packed channel layout (single flat array, index math)
+//   - sqrt-safe via nos_sqrt_safe; ln-safe via nos_ln_safe
+//   - sub-window Pearson |r| (sleep_stage_phi.hexa:845 recipe)
+//
+// Law alignment:
+//   Law 2  Observe never inject — Φ via MI / |r| measurement on streams
+//   Law 4  Structure > feature — 6-channel architecture is structural
+//   Law 22 Feature addition → Φ down — channels fixed; no tags
+//   Law 50 Consciousness essence is state — packed flat time-series
+//   Meta M8 Self-model — past_self vs present_self coupling as a self
+//                         about self channel
+//
+// Ref:
+//   anima-engines/narrative_identity_phi.hexa  (P65)
+//   anima-engines/memory_consolidation_phi.hexa (P93)
+//   anima-engines/emotion_regulation_phi.hexa   (P88)
+//   anima-engines/sleep_stage_phi.hexa          (P115 — packed layout recipe)
+//   Sedikides C., Wildschut T., Baden D. (2004). Nostalgia: Conceptual issues
+//     and existential functions. In Handbook of Experimental Existential Psych.
+//   Sedikides C. & Wildschut T. (2018). Finding meaning in nostalgia. Rev. GP.
+//   Wildschut T., Sedikides C., Arndt J., Routledge C. (2006). Nostalgia:
+//     Content, triggers, functions. J Pers Soc Psychol, 91, 975-993.
+//   Zhou X., Sedikides C., Wildschut T., Gao D.G. (2008). Counteracting
+//     loneliness: On the restorative function of nostalgia. Psych Sci.
+//   Routledge C., Arndt J., Sedikides C., Wildschut T. (2008). A blast from
+//     the past: The terror management function of nostalgia. J Exp Soc Psych.
+//   Chu S. & Downes J.J. (2000). Odour-evoked autobiographical memories:
+//     Psychological investigations of Proustian phenomena. Chem Senses.
+//   Larsen J.T., McGraw A.P., Cacioppo J.T. (2001). Can people feel happy
+//     and sad at the same time? J Pers Soc Psychol, 81, 684-696.
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let NOS_T              = 24           // timeline length (< 32)
+let NOS_CHAN           = 6            // channels (packed)
+let NOS_BINS           = 6            // MI histogram bins
+let NOS_PI             = 3.141592653589793
+let NOS_EPS            = 0.0000000001
+
+// ── State indices ──
+let NOS_REST           = 0
+let NOS_NEUTRAL_CUE    = 1
+let NOS_NOSTALGIA      = 2
+let NOS_PURE_POS       = 3
+let NOS_NEUT_RECALL    = 4
+
+// ── Channel indices (packed layout: packed[ch*T + t]) ──
+let NOS_CH_CUE         = 0
+let NOS_CH_PAST        = 1
+let NOS_CH_PRESENT     = 2
+let NOS_CH_POS         = 3
+let NOS_CH_NEG         = 4
+let NOS_CH_SOCIAL      = 5
+
+// ── Seeds ──
+let NOS_SEED           = 135000
+let NOS_SEED_REST      = 135100
+let NOS_SEED_NEUTCUE   = 135200
+let NOS_SEED_NOST      = 135300
+let NOS_SEED_POS       = 135400
+let NOS_SEED_NEUTREC   = 135500
+let NOS_SEED_DET_A     = 135600
+let NOS_SEED_DET_B     = 135700
+
+// ── Noise amplitude ──
+let NOS_NOISE          = 0.045
+
+// ── Sub-window size for Pearson self-continuity estimator ──
+// 24 = 4 windows × 6 samples each (matches sleep_stage_phi recipe)
+let NOS_SUBWIN         = 6
+
+// ── Test gates ──
+// T1 Proust trigger
+let NOS_TRIGGER_GAP    = 0.10        // |r|(cue,past) nostalgia - neutral
+// T2 Bittersweet — both valence channels active
+let NOS_VAL_FLOOR      = 0.08        // minimum mean|val| for "active"
+let NOS_NEG_GAP        = 0.05        // neg_val(nost) - neg_val(pure_pos)
+// T3 Self-continuity
+let NOS_CONT_GAP       = 0.06        // |r|(past,present) nost - rest
+// T4 Social connectedness
+let NOS_SOCIAL_GAP     = 0.10        // social(nost) - social(rest)
+let NOS_SOCIAL_SPEC    = 0.05        // social(nost) - social(neutral_recall)
+// T5 Integrated Φ
+let NOS_PHI_GAP        = 0.03        // Φ_nostalgia(nost) - Φ_nostalgia(rest)
+
+// ═══════════════════════════════════════════════════════════════
+// Numeric helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn nos_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn nos_sqrt_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return sqrt(x)
+}
+
+fn nos_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn nos_min_f(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn nos_max_f(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+// Taylor-series sin, range-reduced to [-PI, PI]
+fn nos_sin(x: float) -> float {
+    let mut y = x
+    while y > NOS_PI { y = y - 2.0 * NOS_PI }
+    while y < 0.0 - NOS_PI { y = y + 2.0 * NOS_PI }
+    let y2 = y * y
+    return y * (1.0 - y2 / 6.0 + y2 * y2 / 120.0 - y2 * y2 * y2 / 5040.0)
+}
+
+fn nos_cos(x: float) -> float {
+    return nos_sin(x + NOS_PI / 2.0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PRNG — deterministic LCG (Law 2 observable, seed-stable)
+// ═══════════════════════════════════════════════════════════════
+
+fn nos_prng(seed: int) -> int {
+    let mut s = (seed * 1103515245 + 12345) % 2147483648
+    if s < 0 { s = s + 2147483648 }
+    return s
+}
+
+fn nos_unit(seed: int) -> float {
+    let mut s = seed
+    if s < 0 { s = 0 - s }
+    return to_float(s % 1000000) / 1000000.0
+}
+
+fn nos_signed(seed: int) -> float {
+    return nos_unit(seed) * 2.0 - 1.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Histogram mutual information (same recipe family as siblings)
+// ═══════════════════════════════════════════════════════════════
+
+fn nos_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn nos_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn nos_entropy(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(nos_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = nos_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * nos_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn nos_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = nos_bin_idx(a[i], lo, hi, nb)
+        let ib = nos_bin_idx(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = nos_counts(pair_ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * nos_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn nos_vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn nos_vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn nos_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let lo_a = nos_vec_min(a)
+    let hi_a = nos_vec_max(a)
+    let lo_b = nos_vec_min(b)
+    let hi_b = nos_vec_max(b)
+    let lo = nos_min_f(lo_a, lo_b)
+    let hi = nos_max_f(hi_a, hi_b)
+    let h_a = nos_entropy(a, lo, hi, NOS_BINS)
+    let h_b = nos_entropy(b, lo, hi, NOS_BINS)
+    let h_j = nos_joint_entropy(a, b, lo, hi, NOS_BINS)
+    let mi = h_a + h_b - h_j
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Sub-window Pearson |r| — recipe from sleep_stage_phi.hexa:845
+//
+// Divides a pair of traces into n_wins windows of `win` samples,
+// computes |Pearson r| per window, then averages. This is more
+// robust to global level shifts than a single full-trace Pearson.
+// ═══════════════════════════════════════════════════════════════
+
+fn nos_pearson_subwin(a: array, b: array, t_len: int, win: int) -> float {
+    if len(a) != t_len { return 0.0 }
+    if len(b) != t_len { return 0.0 }
+    if win <= 1 { return 0.0 }
+    let n_wins = t_len / win
+    if n_wins <= 0 { return 0.0 }
+    let mut rs = []
+    let mut w = 0
+    while w < n_wins {
+        let base = w * win
+        // means
+        let mut sx = 0.0
+        let mut sy = 0.0
+        let mut j = 0
+        while j < win {
+            sx = sx + a[base + j]
+            sy = sy + b[base + j]
+            j = j + 1
+        }
+        let mx = sx / to_float(win)
+        let my = sy / to_float(win)
+        // r components
+        let mut sxy = 0.0
+        let mut sxx = 0.0
+        let mut syy = 0.0
+        j = 0
+        while j < win {
+            let dx = a[base + j] - mx
+            let dy = b[base + j] - my
+            sxy = sxy + dx * dy
+            sxx = sxx + dx * dx
+            syy = syy + dy * dy
+            j = j + 1
+        }
+        let denom = nos_sqrt_safe(sxx) * nos_sqrt_safe(syy)
+        let mut r = 0.0
+        if denom > 0.0001 {
+            r = sxy / denom
+            if r < 0.0 { r = 0.0 - r }
+        }
+        rs = rs.push(r)
+        w = w + 1
+    }
+    let mut acc = 0.0
+    let mut i = 0
+    while i < n_wins {
+        acc = acc + rs[i]
+        i = i + 1
+    }
+    return acc / to_float(n_wins)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Channel extraction helper (packed layout: packed[ch*T + t])
+// ═══════════════════════════════════════════════════════════════
+
+fn nos_extract(packed: array, ch: int, t_len: int) -> array {
+    let off = ch * t_len
+    let mut out = []
+    let mut i = 0
+    while i < t_len {
+        out = out.push(packed[off + i])
+        i = i + 1
+    }
+    return out
+}
+
+fn nos_mean_abs(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut acc = 0.0
+    let mut i = 0
+    while i < n {
+        acc = acc + nos_abs(v[i])
+        i = i + 1
+    }
+    return acc / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Per-state gain profiles
+//
+// Root cause comment: to avoid stage0 multi-float struct returns,
+// gains are exposed via singleton-getter fns keyed on state idx.
+// Each fn walks a flat if-chain (no else-if in let-binding).
+// ═══════════════════════════════════════════════════════════════
+
+// Proust loading on the sensory cue — how strongly the cue is
+// tied to autobiographical material (0 = novel/neutral, 1 = fully
+// loaded odor/music anchor).
+fn nos_proust_load(state: int) -> float {
+    if state == NOS_REST { return 0.0 }
+    if state == NOS_NEUTRAL_CUE { return 0.0 }
+    if state == NOS_NOSTALGIA { return 0.9 }
+    if state == NOS_PURE_POS { return 0.4 }
+    if state == NOS_NEUT_RECALL { return 0.15 }
+    return 0.0
+}
+
+// Cue amplitude — intensity of the sensory envelope regardless of
+// its autobiographical loading. Neutral cue has non-zero amplitude
+// but zero Proust load — a cue without the memory hook.
+fn nos_cue_amp(state: int) -> float {
+    if state == NOS_REST { return 0.05 }
+    if state == NOS_NEUTRAL_CUE { return 0.75 }
+    if state == NOS_NOSTALGIA { return 0.8 }
+    if state == NOS_PURE_POS { return 0.5 }
+    if state == NOS_NEUT_RECALL { return 0.3 }
+    return 0.0
+}
+
+// Past-self retrieval gain — how strongly the past-self trace is
+// evoked. Nostalgia retrieves strongly; neutral-cue does not.
+fn nos_past_gain(state: int) -> float {
+    if state == NOS_REST { return 0.08 }
+    if state == NOS_NEUTRAL_CUE { return 0.10 }
+    if state == NOS_NOSTALGIA { return 0.85 }
+    if state == NOS_PURE_POS { return 0.65 }
+    if state == NOS_NEUT_RECALL { return 0.55 }
+    return 0.0
+}
+
+// Present-self continuity gain — how strongly the current self-trace
+// shares structural material with the past-self retrieval. Nostalgia
+// boosts this coupling (Sedikides+ 2008).
+fn nos_present_gain(state: int) -> float {
+    if state == NOS_REST { return 0.30 }
+    if state == NOS_NEUTRAL_CUE { return 0.30 }
+    if state == NOS_NOSTALGIA { return 0.80 }
+    if state == NOS_PURE_POS { return 0.55 }
+    if state == NOS_NEUT_RECALL { return 0.40 }
+    return 0.0
+}
+
+// Positive valence gain — remembered joy channel.
+fn nos_joy_gain(state: int) -> float {
+    if state == NOS_REST { return 0.08 }
+    if state == NOS_NEUTRAL_CUE { return 0.10 }
+    if state == NOS_NOSTALGIA { return 0.75 }
+    if state == NOS_PURE_POS { return 0.85 }
+    if state == NOS_NEUT_RECALL { return 0.25 }
+    return 0.0
+}
+
+// Negative valence gain — sense of loss / irretrievable pastness.
+// Nostalgia has moderate-high; pure-positive baseline has near zero.
+fn nos_loss_gain(state: int) -> float {
+    if state == NOS_REST { return 0.06 }
+    if state == NOS_NEUTRAL_CUE { return 0.08 }
+    if state == NOS_NOSTALGIA { return 0.55 }
+    if state == NOS_PURE_POS { return 0.03 }
+    if state == NOS_NEUT_RECALL { return 0.15 }
+    return 0.0
+}
+
+// Social bond gain — close-other imagery / felt belongingness.
+// Nostalgic memories are typically populated by close others
+// (Wildschut+ 2006). Neutral recall does NOT share this feature.
+fn nos_social_gain(state: int) -> float {
+    if state == NOS_REST { return 0.07 }
+    if state == NOS_NEUTRAL_CUE { return 0.09 }
+    if state == NOS_NOSTALGIA { return 0.75 }
+    if state == NOS_PURE_POS { return 0.35 }
+    if state == NOS_NEUT_RECALL { return 0.20 }
+    return 0.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Channel generators
+//
+// Root cause comment: all generators receive a state index + seed
+// and return a flat T-length array. Cross-channel coupling (e.g.
+// cue→past_self in nostalgia) is implemented by sharing a latent
+// autobiographical template that modulates both channels with
+// state-specific gains. In neutral-cue, the templates are
+// uncorrelated, so cue and past-self do not couple.
+// ═══════════════════════════════════════════════════════════════
+
+// Latent autobiographical base trace — a smooth drift plus low-freq
+// oscillation representing the structured content of a personal
+// episodic memory. All states derive channel signals from this
+// shared template, but only states with Proust load > 0 will have
+// the cue channel modulated by the SAME template (producing
+// cue↔past coupling). Neutral-cue uses an INDEPENDENT template
+// for the cue, breaking coupling.
+fn nos_autobio_base(t_len: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < t_len {
+        // Low-freq drift (episode arc)
+        let phase = 2.0 * NOS_PI * to_float(i) / to_float(t_len)
+        let arc = 0.6 * nos_sin(phase) + 0.25 * nos_sin(2.0 * phase + 0.7)
+        s = nos_prng(s + i * 13 + 17)
+        let noise = NOS_NOISE * nos_signed(s)
+        out = out.push(arc + noise)
+        i = i + 1
+    }
+    return out
+}
+
+// Independent sensory envelope (for neutral-cue state — a novel
+// sensory stimulus unrelated to autobiographical memory).
+fn nos_cue_independent(t_len: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < t_len {
+        // Fast envelope, different phase structure from autobio base
+        let phase = 2.0 * NOS_PI * to_float(i) / to_float(t_len)
+        let env = 0.55 * nos_sin(3.5 * phase + 1.3) + 0.25 * nos_cos(5.0 * phase)
+        s = nos_prng(s + i * 19 + 41)
+        let noise = NOS_NOISE * nos_signed(s)
+        out = out.push(env + noise)
+        i = i + 1
+    }
+    return out
+}
+
+// Social-other template (close-other proximity arc — a warm rise
+// and gentle decay pattern).
+fn nos_social_template(t_len: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < t_len {
+        let tf = to_float(i) / to_float(t_len)
+        // Warm approach + soft sustain: rises quickly, holds, fades
+        let mut arc = 0.0
+        if tf < 0.3 { arc = tf / 0.3 }
+        if tf >= 0.3 {
+            if tf < 0.75 { arc = 1.0 - 0.25 * (tf - 0.3) }
+        }
+        if tf >= 0.75 { arc = 0.8 - 0.8 * (tf - 0.75) / 0.25 }
+        s = nos_prng(s + i * 23 + 101)
+        let noise = NOS_NOISE * 0.7 * nos_signed(s)
+        out = out.push(arc + noise)
+        i = i + 1
+    }
+    return out
+}
+
+// Positive valence template — remembered joy arc (steady warm
+// oscillation with positive mean).
+fn nos_pos_template(t_len: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < t_len {
+        let phase = 2.0 * NOS_PI * to_float(i) / to_float(t_len)
+        let arc = 0.55 + 0.35 * nos_sin(phase + 0.4) + 0.15 * nos_sin(2.0 * phase)
+        s = nos_prng(s + i * 29 + 211)
+        let noise = NOS_NOISE * 0.6 * nos_signed(s)
+        out = out.push(arc + noise)
+        i = i + 1
+    }
+    return out
+}
+
+// Negative valence template — irretrievable-pastness arc (rising
+// awareness of absence, late-episode ache).
+fn nos_neg_template(t_len: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < t_len {
+        let tf = to_float(i) / to_float(t_len)
+        // Slow build of "loss" realization, peaks late
+        let build = tf * tf
+        let phase = 2.0 * NOS_PI * to_float(i) / to_float(t_len)
+        let ache = 0.3 * nos_sin(1.5 * phase + 0.9)
+        s = nos_prng(s + i * 31 + 307)
+        let noise = NOS_NOISE * 0.6 * nos_signed(s)
+        out = out.push(build * 0.85 + ache + noise)
+        i = i + 1
+    }
+    return out
+}
+
+// Build all 6 channels for a given state, returned as packed flat array.
+// Packed layout: packed[ch * T + t].
+//
+// Root cause comment: we build each channel separately and concatenate
+// at the end via explicit push loop. This avoids any struct-of-arrays
+// return pattern that would trigger multi-float struct aliasing bugs.
+fn nos_build_state(state: int, t_len: int, seed: int) -> array {
+    // Templates (shared autobio base + social + valence arcs)
+    let autobio = nos_autobio_base(t_len, seed + 1)
+    let indep_cue = nos_cue_independent(t_len, seed + 2)
+    let social_t = nos_social_template(t_len, seed + 3)
+    let pos_t = nos_pos_template(t_len, seed + 4)
+    let neg_t = nos_neg_template(t_len, seed + 5)
+
+    // State-specific gains (singletons)
+    let proust = nos_proust_load(state)
+    let cue_amp = nos_cue_amp(state)
+    let past_g = nos_past_gain(state)
+    let present_g = nos_present_gain(state)
+    let joy_g = nos_joy_gain(state)
+    let loss_g = nos_loss_gain(state)
+    let soc_g = nos_social_gain(state)
+
+    // Build each channel in turn, append to packed flat array.
+    let mut packed = []
+    let mut s = seed
+
+    // Channel 0: sensory_cue — blend of Proust-loaded autobio and
+    // independent novel stimulus. In neutral-cue state (proust=0),
+    // the cue is pure independent envelope → zero cue↔past coupling.
+    // In nostalgia state (proust high), cue tracks the autobio base
+    // → strong cue↔past coupling via shared template.
+    let mut i = 0
+    while i < t_len {
+        s = nos_prng(s + i * 7 + 51)
+        let noise = NOS_NOISE * nos_signed(s)
+        let val = cue_amp * (proust * autobio[i] + (1.0 - proust) * indep_cue[i]) + noise
+        packed = packed.push(val)
+        i = i + 1
+    }
+
+    // Channel 1: past_self — retrieved autobiographical trace.
+    i = 0
+    while i < t_len {
+        s = nos_prng(s + i * 11 + 113)
+        let noise = NOS_NOISE * nos_signed(s)
+        let val = past_g * autobio[i] + noise
+        packed = packed.push(val)
+        i = i + 1
+    }
+
+    // Channel 2: present_self — current self-trace. In nostalgia,
+    // present_self is strongly coupled to past_self via shared
+    // autobio base (self-continuity). Rest/neutral-cue have much
+    // lower present-gain → weaker coupling.
+    //
+    // Root cause comment: to make the T3 sub-window Pearson coupling
+    // clearly positive (not just MI positive), we reuse the autobio
+    // base directly, scaled by present_gain. A small phase shift
+    // per sub-window is applied so the pattern is not a trivial
+    // constant — the Pearson estimator still sees a genuine rise
+    // in coupling compared to REST where present_gain is low and
+    // a stronger "current context" drift dominates.
+    i = 0
+    while i < t_len {
+        s = nos_prng(s + i * 17 + 223)
+        let noise = NOS_NOISE * nos_signed(s)
+        // "Current-context" drift — pulls present_self away from past_self
+        // when present_gain is low (rest). This low-freq contextual
+        // shift gives rest a different present trajectory so its
+        // sub-window Pearson with past_self stays lower.
+        let phase = 2.0 * NOS_PI * to_float(i) / to_float(t_len)
+        let context_drift = 0.55 * nos_cos(1.7 * phase + 0.2)
+        let val = present_g * autobio[i] + (1.0 - present_g) * context_drift + noise
+        packed = packed.push(val)
+        i = i + 1
+    }
+
+    // Channel 3: pos_valence — remembered joy component.
+    i = 0
+    while i < t_len {
+        s = nos_prng(s + i * 19 + 347)
+        let noise = NOS_NOISE * nos_signed(s)
+        let val = joy_g * pos_t[i] + noise
+        packed = packed.push(val)
+        i = i + 1
+    }
+
+    // Channel 4: neg_valence — pastness/absence component.
+    i = 0
+    while i < t_len {
+        s = nos_prng(s + i * 23 + 419)
+        let noise = NOS_NOISE * nos_signed(s)
+        let val = loss_g * neg_t[i] + noise
+        packed = packed.push(val)
+        i = i + 1
+    }
+
+    // Channel 5: social_bond — felt closeness to close others.
+    i = 0
+    while i < t_len {
+        s = nos_prng(s + i * 29 + 509)
+        let noise = NOS_NOISE * nos_signed(s)
+        let val = soc_g * social_t[i] + noise
+        packed = packed.push(val)
+        i = i + 1
+    }
+
+    return packed
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Φ metrics
+// ═══════════════════════════════════════════════════════════════
+
+// Φ_trigger = |r|(sensory_cue, past_self) via sub-window Pearson.
+// Captures Proust pathway strength — how tightly the sensory anchor
+// retrieves autobiographical material.
+fn nos_phi_trigger(packed: array, t_len: int) -> float {
+    let cue = nos_extract(packed, NOS_CH_CUE, t_len)
+    let past = nos_extract(packed, NOS_CH_PAST, t_len)
+    return nos_pearson_subwin(cue, past, t_len, NOS_SUBWIN)
+}
+
+// Φ_self_continuity = |r|(past_self, present_self) via sub-window Pearson.
+// Captures Sedikides+ 2008 self-continuity elevation.
+fn nos_phi_self_continuity(packed: array, t_len: int) -> float {
+    let past = nos_extract(packed, NOS_CH_PAST, t_len)
+    let present = nos_extract(packed, NOS_CH_PRESENT, t_len)
+    return nos_pearson_subwin(past, present, t_len, NOS_SUBWIN)
+}
+
+// Φ_social = mean|social_bond|. Raw strength of close-other imagery.
+fn nos_phi_social(packed: array, t_len: int) -> float {
+    let social = nos_extract(packed, NOS_CH_SOCIAL, t_len)
+    return nos_mean_abs(social)
+}
+
+// Mean|pos_val| and mean|neg_val| singleton getters.
+fn nos_mean_pos(packed: array, t_len: int) -> float {
+    let pos = nos_extract(packed, NOS_CH_POS, t_len)
+    return nos_mean_abs(pos)
+}
+
+fn nos_mean_neg(packed: array, t_len: int) -> float {
+    let neg = nos_extract(packed, NOS_CH_NEG, t_len)
+    return nos_mean_abs(neg)
+}
+
+// Φ_bittersweet = min(mean|pos|, mean|neg|). Captures the "floor"
+// of ambivalence — high only when BOTH channels are meaningfully
+// active (Larsen+ 2001 mixed emotion).
+fn nos_phi_bittersweet(packed: array, t_len: int) -> float {
+    let mp = nos_mean_pos(packed, t_len)
+    let mn = nos_mean_neg(packed, t_len)
+    return nos_min_f(mp, mn)
+}
+
+// Φ_nostalgia — integrated binding of the 4 nostalgia-relevant
+// channels: past_self, pos_val, neg_val, social_bond. Measured
+// as mean pairwise MI across all 6 pairs (C(4,2) = 6).
+//
+// Root cause comment: we deliberately omit sensory_cue and
+// present_self from the integrated Φ — they are causal ancestors
+// (cue) and a downstream coupling target (present), not themselves
+// bound content. The classical phenomenology of nostalgia binds
+// memory + bittersweet + social others into a single conscious
+// gestalt; that is the integration measured here.
+fn nos_phi_nostalgia(packed: array, t_len: int) -> float {
+    let past = nos_extract(packed, NOS_CH_PAST, t_len)
+    let pos = nos_extract(packed, NOS_CH_POS, t_len)
+    let neg = nos_extract(packed, NOS_CH_NEG, t_len)
+    let soc = nos_extract(packed, NOS_CH_SOCIAL, t_len)
+
+    let mi_pp = nos_mi(past, pos)
+    let mi_pn = nos_mi(past, neg)
+    let mi_ps = nos_mi(past, soc)
+    let mi_on = nos_mi(pos, neg)
+    let mi_os = nos_mi(pos, soc)
+    let mi_ns = nos_mi(neg, soc)
+
+    let sum = mi_pp + mi_pn + mi_ps + mi_on + mi_os + mi_ns
+    return sum / 6.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests (T1..T5)
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    println("  [T1] Proust trigger response (cue -> past_self coupling)")
+
+    // Nostalgia state — Proust-loaded cue, autobiographical retrieval.
+    let packed_nost = nos_build_state(NOS_NOSTALGIA, NOS_T, NOS_SEED_NOST)
+    let trig_nost = nos_phi_trigger(packed_nost, NOS_T)
+
+    // Neutral-cue state — novel sensory stimulus, no autobiographical hook.
+    let packed_neut = nos_build_state(NOS_NEUTRAL_CUE, NOS_T, NOS_SEED_NEUTCUE)
+    let trig_neut = nos_phi_trigger(packed_neut, NOS_T)
+
+    println("    Phi_trigger(nostalgia) = " + str(trig_nost))
+    println("    Phi_trigger(neutral_cue) = " + str(trig_neut))
+
+    let gap = trig_nost - trig_neut
+    println("    gap = " + str(gap) + " (gate: " + str(NOS_TRIGGER_GAP) + ")")
+
+    if gap < NOS_TRIGGER_GAP {
+        println("    FAIL: Proust trigger pathway insufficient")
+        return false
+    }
+    return true
+}
+
+fn check_T2() -> bool {
+    println("  [T2] Bittersweet ambivalence (pos AND neg valence co-active)")
+
+    // Nostalgia state.
+    let packed_nost = nos_build_state(NOS_NOSTALGIA, NOS_T, NOS_SEED_NOST + 10)
+    let mp = nos_mean_pos(packed_nost, NOS_T)
+    let mn = nos_mean_neg(packed_nost, NOS_T)
+    let bittersweet = nos_phi_bittersweet(packed_nost, NOS_T)
+
+    println("    mean|pos|(nostalgia) = " + str(mp))
+    println("    mean|neg|(nostalgia) = " + str(mn))
+    println("    Phi_bittersweet = min(pos,neg) = " + str(bittersweet))
+
+    // Floor check — both valence channels must be meaningfully active.
+    if mp < NOS_VAL_FLOOR {
+        println("    FAIL: positive valence below floor " + str(NOS_VAL_FLOOR))
+        return false
+    }
+    if mn < NOS_VAL_FLOOR {
+        println("    FAIL: negative valence below floor " + str(NOS_VAL_FLOOR))
+        return false
+    }
+
+    // Pure-positive reminiscence baseline — positive channel active,
+    // negative near zero. Nostalgia's negative channel should exceed
+    // this by NOS_NEG_GAP.
+    let packed_pos = nos_build_state(NOS_PURE_POS, NOS_T, NOS_SEED_POS)
+    let mn_pos = nos_mean_neg(packed_pos, NOS_T)
+    println("    mean|neg|(pure_pos_baseline) = " + str(mn_pos))
+
+    let neg_gap = mn - mn_pos
+    println("    neg_gap = mean|neg|(nost) - mean|neg|(pos) = " + str(neg_gap) + " (gate: " + str(NOS_NEG_GAP) + ")")
+
+    if neg_gap < NOS_NEG_GAP {
+        println("    FAIL: negative valence not distinguishable from pure-positive baseline")
+        return false
+    }
+    return true
+}
+
+fn check_T3() -> bool {
+    println("  [T3] Self-continuity boost (past_self <-> present_self)")
+
+    // Rest baseline.
+    let packed_rest = nos_build_state(NOS_REST, NOS_T, NOS_SEED_REST)
+    let cont_rest = nos_phi_self_continuity(packed_rest, NOS_T)
+
+    // Nostalgia — elevated past-self/present-self coupling.
+    let packed_nost = nos_build_state(NOS_NOSTALGIA, NOS_T, NOS_SEED_NOST + 20)
+    let cont_nost = nos_phi_self_continuity(packed_nost, NOS_T)
+
+    println("    Phi_self_continuity(rest) = " + str(cont_rest))
+    println("    Phi_self_continuity(nostalgia) = " + str(cont_nost))
+
+    let gap = cont_nost - cont_rest
+    println("    gap = " + str(gap) + " (gate: " + str(NOS_CONT_GAP) + ")")
+
+    if gap < NOS_CONT_GAP {
+        println("    FAIL: self-continuity coupling not elevated by nostalgia")
+        return false
+    }
+    return true
+}
+
+fn check_T4() -> bool {
+    println("  [T4] Social connectedness rise (specificity vs neutral recall)")
+
+    // Rest baseline — no social imagery.
+    let packed_rest = nos_build_state(NOS_REST, NOS_T, NOS_SEED_REST + 5)
+    let soc_rest = nos_phi_social(packed_rest, NOS_T)
+
+    // Nostalgia — close-other imagery strong.
+    let packed_nost = nos_build_state(NOS_NOSTALGIA, NOS_T, NOS_SEED_NOST + 30)
+    let soc_nost = nos_phi_social(packed_nost, NOS_T)
+
+    // Neutral autobiographical recall — memory without nostalgic
+    // framing. Should NOT show the same social elevation.
+    let packed_neutrec = nos_build_state(NOS_NEUT_RECALL, NOS_T, NOS_SEED_NEUTREC)
+    let soc_neutrec = nos_phi_social(packed_neutrec, NOS_T)
+
+    println("    Phi_social(rest) = " + str(soc_rest))
+    println("    Phi_social(nostalgia) = " + str(soc_nost))
+    println("    Phi_social(neutral_recall) = " + str(soc_neutrec))
+
+    let rest_gap = soc_nost - soc_rest
+    let spec_gap = soc_nost - soc_neutrec
+    println("    rest_gap = " + str(rest_gap) + " (gate: " + str(NOS_SOCIAL_GAP) + ")")
+    println("    spec_gap (nost - neut_recall) = " + str(spec_gap) + " (gate: " + str(NOS_SOCIAL_SPEC) + ")")
+
+    if rest_gap < NOS_SOCIAL_GAP {
+        println("    FAIL: social-bond channel did not rise above rest")
+        return false
+    }
+    if spec_gap < NOS_SOCIAL_SPEC {
+        println("    FAIL: social rise not specific (neutral recall also elevated)")
+        return false
+    }
+    return true
+}
+
+fn check_T5() -> bool {
+    println("  [T5] Integrated Phi_nostalgia (memory + valence + self + social)")
+
+    // Rest baseline.
+    let packed_rest = nos_build_state(NOS_REST, NOS_T, NOS_SEED_REST + 9)
+    let phi_rest = nos_phi_nostalgia(packed_rest, NOS_T)
+
+    // Nostalgia state.
+    let packed_nost = nos_build_state(NOS_NOSTALGIA, NOS_T, NOS_SEED_NOST + 40)
+    let phi_nost = nos_phi_nostalgia(packed_nost, NOS_T)
+
+    println("    Phi_nostalgia(rest) = " + str(phi_rest))
+    println("    Phi_nostalgia(nostalgia) = " + str(phi_nost))
+
+    let gap = phi_nost - phi_rest
+    println("    gap = " + str(gap) + " (gate: " + str(NOS_PHI_GAP) + ")")
+
+    if gap < NOS_PHI_GAP {
+        println("    FAIL: integrated Phi did not rise above rest baseline")
+        return false
+    }
+
+    // Determinism check — same seed must yield identical Φ.
+    let packed_det_a = nos_build_state(NOS_NOSTALGIA, NOS_T, NOS_SEED_DET_A)
+    let phi_det_a = nos_phi_nostalgia(packed_det_a, NOS_T)
+    let packed_det_b = nos_build_state(NOS_NOSTALGIA, NOS_T, NOS_SEED_DET_A)
+    let phi_det_b = nos_phi_nostalgia(packed_det_b, NOS_T)
+    let drift = nos_abs(phi_det_a - phi_det_b)
+    println("    determinism drift = " + str(drift))
+    if drift > NOS_EPS {
+        println("    FAIL: determinism violated")
+        return false
+    }
+
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — execute 5 self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[nostalgia_phi] P135 — Nostalgia Phi (self-continuity bittersweet engine)")
+    println("  channels=" + str(NOS_CHAN) + " T=" + str(NOS_T) + " bins=" + str(NOS_BINS))
+    println("  refs: Sedikides & Wildschut 2008/2018 | Wildschut+ 2006 | Zhou+ 2008")
+    println("        Routledge+ 2008 | Chu & Downes 2000 | Larsen+ 2001")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — Proust trigger: cue->past coupling above neutral cue") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — bittersweet ambivalence (pos AND neg co-active, neg > pure_pos)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — self-continuity (past<->present coupling elevated post-nostalgia)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — social connectedness rise (specific vs neutral recall)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — integrated Phi_nostalgia (memory+valence+self+social) > rest") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause comment: stage0 long && chains may mishandle short-circuit
+    // ordering — use a mutable bool accumulator with sequential guards
+    // (same idiom as narrative_identity_phi / memory_consolidation_phi).
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[nostalgia_phi] 5/5 PASS — P135 DONE (nostalgia operationalized)")
+    } else {
+        println("[nostalgia_phi] SOME FAILED")
+    }
+}
+
+main()
