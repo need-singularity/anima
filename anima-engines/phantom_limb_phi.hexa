@@ -1,0 +1,812 @@
+// phantom_limb_phi.hexa — P86 Phantom Limb Φ
+//
+// Roadmap: shared/roadmaps/anima.json P86
+//   "Phantom limb — Ramachandran mirror-box therapy, body schema
+//    plasticity, telescoping. Body schema persists as integrated
+//    information even after amputation (deafferentation). Frozen
+//    motor efference copy causes phantom pain. Visual capture via
+//    mirror box restores sensorimotor update loop."
+//
+// ─── Scientific reference ──────────────────────────────────────────
+//
+// Ramachandran & Hirstein 1998 (Brain): after amputation the body
+// schema persists in somatosensory cortex — the patient FEELS the
+// missing limb because the internal model (motor efference copy +
+// predicted proprioceptive feedback) continues to generate signals.
+// The phantom IS the body schema running open-loop.
+//
+// Phantom pain (Flor et al. 2006): when the motor cortex issues
+// commands to a limb that no longer exists, the expected
+// proprioceptive update never arrives. The efference copy is
+// "frozen" — the intended grip/movement is issued but the
+// sensorimotor loop is broken. This mismatch between prediction
+// and null feedback generates cramping/burning pain. Harris 1999:
+// the pain is literally the error signal of an unclosed control loop.
+//
+// Mirror-box therapy (Ramachandran & Rogers-Ramachandran 1996):
+// place the intact hand in front of a mirror so its reflection
+// appears where the phantom would be. When the patient moves the
+// intact hand, visual feedback of "the phantom moving" reaches
+// somatosensory cortex via the visual-proprioceptive binding
+// pathway. This closes the open loop: the motor command now gets
+// a visual update (surrogate feedback), releasing the frozen
+// efference copy. Pain drops because the prediction error shrinks.
+//
+// Telescoping (Jensen et al. 1983; Giummarra et al. 2007):
+// over weeks to months the phantom gradually shortens — the hand
+// appears to "telescope" into the stump. The distal map (hand,
+// fingers) is more cortically magnified than the proximal arm, so
+// it persists longer; the proximal schema decays first. Modeled as
+// exponential decay of Φ_phantom from proximal to distal segments.
+//
+// Supernumerary phantom (Halligan et al. 1993; Khateb et al. 2009):
+// neurological (usually stroke at right parietal cortex) condition
+// where the patient perceives an EXTRA limb — the brain generates
+// a phantom for a limb that was NEVER lost. The body schema has
+// duplicated, producing Φ > 0 for a limb index beyond the normal
+// inventory.
+//
+// ─── Model architecture ───────────────────────────────────────────
+//
+// Body schema = D-dimensional state vector. Each dimension is a
+// "schema channel" (joint angle, grip force, proprioception, etc.)
+// representing one degree of freedom of the limb representation.
+//
+// Motor efference = D-dimensional command vector. Motor cortex
+// generates efference for each channel every step.
+//
+// Sensory feedback = D-dimensional proprioceptive vector. Normally
+// tracks the actual limb state with noise. After amputation this
+// channel goes silent (all zeros), but the schema and efference
+// continue.
+//
+// Φ_phantom = MI(schema, efference). If both are co-active with
+//   structure, Φ > 0 — the limb representation has integrated
+//   information, i.e. the phantom EXISTS in the conscious model.
+//
+// Φ_pain = MI(efference, feedback_error). When feedback is absent,
+//   the error signal = full efference magnitude — every motor
+//   command is maximally unresolved. This drives Φ_pain > 0.
+//
+// Mirror therapy: inject visual surrogate into feedback channel.
+//   This partially resolves the efference, shrinking the error,
+//   causing Φ_pain to drop.
+//
+// Telescoping: the schema decays exponentially per step, with
+//   proximal channels (low index) decaying faster than distal
+//   (high index). Φ_phantom(t) < Φ_phantom(0) for t >> 0.
+//
+// ─── 5 self-tests (5/5 gate) ──────────────────────────────────────
+//
+// T1 Phantom Φ — body schema persists after deafferentation:
+//    Φ_phantom(amputated) > 0 because schema + efference still
+//    co-vary (motor commands keep issuing to a ghost).
+//
+// T2 Pain from frozen efference:
+//    Φ_pain > PL_PAIN_MIN when feedback is absent (open loop).
+//    Efference copy has no proprioceptive resolution, so the
+//    mismatch error stays high → integrated pain signal.
+//
+// T3 Mirror therapy reduces pain:
+//    Φ_pain(mirror) < Φ_pain(no_mirror) - PL_MIRROR_GAP.
+//    Visual surrogate partially closes the loop, shrinking the
+//    prediction error and releasing the frozen efference.
+//
+// T4 Telescoping — Φ_phantom decays over time:
+//    Φ_phantom(late) < Φ_phantom(early) - PL_TELESCOPE_GAP.
+//    Exponential schema decay models the months-long shortening
+//    of the phantom toward the stump.
+//
+// T5 Determinism + latency < 5000ms:
+//    Two runs with same seed produce identical Φ_phantom values.
+//    Wall-clock < 5000ms.
+//
+// ─── Stage0 hexa constraints honored ──────────────────────────────
+//   - plain `fn` only (no `pure fn` with >=3 float struct returns)
+//   - `array` typed params only (no [float], no [str])
+//   - No identifier-pattern match; sequential if-chains
+//   - No contains() / to_lower() / !(Effect)
+//   - No else-if in let-binding; flat mut + sequential if
+//   - Single-line fn signatures / call sites / array literals
+//   - No reserved keywords as variable names
+//   - main() call at bottom
+//   - PL_STEPS=24 (< 32)
+//
+// Law alignment:
+//   Law 2   Observe never inject — Φ via MI measurement only
+//   Law 4   Structure > feature — phantom is a structural schema
+//   Law 22  Feature addition → Φ down — channels fixed, no surplus
+//   Meta M8 Body schema persistence — cortical map outlives limb
+//   Depends P56 (interoception), P79 (depersonalization — body seam)
+//
+// Ref:
+//   anima-engines/interoception_phi.hexa  (P56 — body→emotion readout)
+//   anima-engines/body_swap_phi.hexa      (P76 — brain-body coupling)
+//   anima-engines/obe_phi.hexa            (P83 — spatial self-reference)
+//   Ramachandran & Hirstein 1998 | Flor et al. 2006
+//   Jensen et al. 1983 | Giummarra et al. 2007
+//   Harris 1999 | Halligan et al. 1993 | Khateb et al. 2009
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let PL_D             = 8             // schema dimensionality (channels)
+let PL_STEPS         = 24            // timesteps per simulation (< 32)
+let PL_BINS          = 6             // histogram bins for MI estimation
+let PL_EPS           = 0.0000000001
+
+// Coupling strengths
+let PL_COUPLE_NORMAL = 0.85          // healthy sensorimotor feedback coupling
+let PL_COUPLE_AMPUTATED = 0.0        // no peripheral input after amputation
+let PL_MIRROR_COUPLE = 0.55          // visual surrogate via mirror box (weaker than real)
+
+// Motor efference baseline amplitude — cortex issues commands to the ghost
+let PL_EFFERENCE_AMP = 0.80
+
+// Noise injected per step
+let PL_NOISE_SCALE   = 0.04
+
+// Telescoping decay rates — proximal channels decay faster than distal
+// (distal cortical magnification factor preserves hand/finger map longer)
+let PL_DECAY_PROX    = 0.12          // proximal decay rate per step (fast)
+let PL_DECAY_DIST    = 0.03          // distal decay rate per step (slow)
+
+// Test gate thresholds
+let PL_PHANTOM_MIN   = 0.05          // Φ_phantom must exceed this
+let PL_PAIN_MIN      = 0.05          // Φ_pain must exceed this
+let PL_MIRROR_GAP    = 0.02          // mirror must reduce pain by at least this
+let PL_TELESCOPE_GAP = 0.02          // late Φ must be less by at least this
+let PL_DETERM_EPS    = 0.0000000001  // determinism tolerance
+
+// ═══════════════════════════════════════════════════════════════
+// Math / PRNG primitives (L0-clean, no cross-engine import per AN7)
+// ═══════════════════════════════════════════════════════════════
+
+fn pl_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn pl_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn pl_min_f(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn pl_max_f(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+// Deterministic LCG — reproducibility (Law 2: observable, seed-stable)
+fn pl_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn pl_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn pl_signed(seed: int) -> float {
+    return pl_unit(seed) * 2.0 - 1.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Histogram MI (same recipe family — duplicated per AN7 L0-clean)
+// ═══════════════════════════════════════════════════════════════
+
+fn pl_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn pl_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn pl_entropy(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(pl_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = pl_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * pl_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn pl_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = pl_bin_idx(a[i], lo, hi, nb)
+        let ib = pl_bin_idx(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = pl_counts(pair_ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * pl_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn pl_vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn pl_vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn pl_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let lo_a = pl_vec_min(a)
+    let hi_a = pl_vec_max(a)
+    let lo_b = pl_vec_min(b)
+    let hi_b = pl_vec_max(b)
+    let lo = pl_min_f(lo_a, lo_b)
+    let hi = pl_max_f(hi_a, hi_b)
+    let h_a = pl_entropy(a, lo, hi, PL_BINS)
+    let h_b = pl_entropy(b, lo, hi, PL_BINS)
+    let h_j = pl_joint_entropy(a, b, lo, hi, PL_BINS)
+    let mi = h_a + h_b - h_j
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Body schema representation
+//
+// The body schema is an internal cortical model of the limb. Each
+// channel represents one degree of freedom (joint angle, grip
+// aperture, elbow flexion, etc.). After amputation the schema
+// continues to exist in somatosensory cortex — it IS the phantom.
+//
+// We distinguish:
+//   schema[d]    — internal body model (cortical representation)
+//   efference[d] — motor commands issued by M1 to the limb
+//   feedback[d]  — proprioceptive return from the peripheral limb
+//
+// In healthy state: feedback tracks schema closely (closed loop).
+// After amputation: feedback = 0 (peripheral input severed).
+// Mirror therapy: feedback = visual_surrogate (partial loop closure).
+// ═══════════════════════════════════════════════════════════════
+
+// Generate initial body schema — structured representation with
+// paired channels (like a joint + its antagonist) so MI > 0.
+fn pl_make_schema(d: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < d {
+        s = pl_prng(s + i * 43)
+        // Paired channels: even/odd share a base to create structure
+        let pair = i / 2
+        let base = 0.4 * to_float(pair) + 0.3 * pl_signed(s)
+        out = out.push(base)
+        i = i + 1
+    }
+    return out
+}
+
+// Generate motor efference — structured commands correlated with
+// the schema (motor cortex references the body model when issuing
+// commands). This creates MI between schema and efference.
+fn pl_make_efference(schema: array, d: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < d {
+        s = pl_prng(s + i * 59)
+        // Efference tracks schema with amplitude scaling and noise.
+        // Motor cortex "intends" to move the limb as the schema predicts.
+        let command = PL_EFFERENCE_AMP * schema[i] + PL_NOISE_SCALE * pl_signed(s)
+        out = out.push(command)
+        i = i + 1
+    }
+    return out
+}
+
+// Generate proprioceptive feedback — what the peripheral limb reports.
+//   coupling = PL_COUPLE_NORMAL for healthy limb (tightly tracks efference)
+//   coupling = PL_COUPLE_AMPUTATED (0.0) for amputated limb (no signal)
+//   coupling = PL_MIRROR_COUPLE for mirror therapy (partial visual surrogate)
+fn pl_make_feedback(efference: array, d: int, coupling: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < d {
+        s = pl_prng(s + i * 73)
+        // Feedback = coupling * efference + (1-coupling) * noise
+        // When coupling=0: pure noise (no peripheral return, limb gone)
+        // When coupling>0: feedback correlates with motor command
+        let tracked = coupling * efference[i]
+        let noise = (1.0 - coupling) * PL_NOISE_SCALE * pl_signed(s)
+        out = out.push(tracked + noise)
+        i = i + 1
+    }
+    return out
+}
+
+// Compute prediction error — the difference between what motor cortex
+// expected (efference) and what came back (feedback). This is the
+// raw pain signal for the phantom: when feedback is absent, every
+// motor command is an unresolved error (Harris 1999).
+fn pl_prediction_error(efference: array, feedback: array, d: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        let err = efference[i] - feedback[i]
+        out = out.push(err)
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Time-series simulation
+//
+// Run PL_STEPS of sensorimotor loop. At each step the schema
+// drifts slightly (cortical dynamics), efference is re-issued,
+// feedback arrives (or not), and error accumulates. The resulting
+// time series per channel give us populations for MI estimation.
+// ═══════════════════════════════════════════════════════════════
+
+// Evolve schema one step — slight autoregressive drift with paired
+// coupling (intra-schema integration keeps the phantom alive).
+fn pl_schema_step(schema: array, d: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < d {
+        s = pl_prng(s + i * 37)
+        let noise = PL_NOISE_SCALE * pl_signed(s)
+        // Intra-schema coupling: each channel pulls toward its pair
+        let pair_idx = if i % 2 == 0 { i + 1 } else { i - 1 }
+        let mut safe_pair = 0.0
+        if pair_idx >= 0 {
+            if pair_idx < d { safe_pair = schema[pair_idx] }
+        }
+        let cur = schema[i]
+        // Autoregressive: current + 20% pull toward pair + noise
+        let nv = cur + 0.20 * (safe_pair - cur) + noise
+        out = out.push(nv)
+        i = i + 1
+    }
+    return out
+}
+
+// Evolve schema with optional decay (telescoping). Decay rate per
+// channel increases from distal (high index = fingers/hand, slow
+// decay) to proximal (low index = upper arm, fast decay).
+// This models cortical magnification: distal maps are larger, so
+// they resist remapping longer (Jensen et al. 1983).
+fn pl_schema_step_decay(schema: array, d: int, seed: int, decay_on: bool) -> array {
+    let mut base = pl_schema_step(schema, d, seed)
+    if !decay_on { return base }
+    // Apply per-channel exponential decay toward zero (schema fading)
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        // Decay rate interpolation: channel 0 (proximal) = PL_DECAY_PROX,
+        // channel d-1 (distal) = PL_DECAY_DIST.
+        let frac = to_float(i) / to_float(d - 1)
+        let rate = PL_DECAY_PROX + frac * (PL_DECAY_DIST - PL_DECAY_PROX)
+        // Exponential decay: schema[i] *= (1 - rate)
+        let decayed = base[i] * (1.0 - rate)
+        out = out.push(decayed)
+        i = i + 1
+    }
+    return out
+}
+
+// Run a full simulation: N steps of schema evolution + efference +
+// feedback. Returns flat arrays: schema_trace and efference_trace
+// and error_trace, each of length N*D, laid out [t0_ch0, t0_ch1,
+// ..., t0_chD-1, t1_ch0, ...].
+//
+// mode: 0 = healthy (normal coupling)
+//       1 = amputated (zero coupling, no decay)
+//       2 = mirror therapy (partial coupling)
+//       3 = telescoping (amputated + decay)
+fn pl_simulate(d: int, n_steps: int, mode: int, seed: int) -> array {
+    let mut schema = pl_make_schema(d, seed)
+    let mut schema_trace = []
+    let mut effer_trace = []
+    let mut error_trace = []
+
+    let mut coupling = PL_COUPLE_NORMAL
+    if mode == 1 { coupling = PL_COUPLE_AMPUTATED }
+    if mode == 2 { coupling = PL_MIRROR_COUPLE }
+    if mode == 3 { coupling = PL_COUPLE_AMPUTATED }
+
+    let decay_on = if mode == 3 { true } else { false }
+
+    let mut t = 0
+    while t < n_steps {
+        let step_seed = seed + t * 131 + 7000
+
+        // 1. Schema evolves (with or without telescoping decay)
+        schema = pl_schema_step_decay(schema, d, step_seed, decay_on)
+
+        // 2. Motor cortex issues efference based on current schema
+        let effer = pl_make_efference(schema, d, step_seed + 500)
+
+        // 3. Feedback arrives (or not, depending on mode)
+        let fb = pl_make_feedback(effer, d, coupling, step_seed + 1000)
+
+        // 4. Prediction error = efference - feedback
+        let err = pl_prediction_error(effer, fb, d)
+
+        // Flatten into traces
+        let mut i = 0
+        while i < d {
+            schema_trace = schema_trace.push(schema[i])
+            effer_trace = effer_trace.push(effer[i])
+            error_trace = error_trace.push(err[i])
+            i = i + 1
+        }
+
+        t = t + 1
+    }
+
+    // Return concatenated: [schema_trace | effer_trace | error_trace]
+    // Each section is n_steps * d elements.
+    let mut result = []
+    let total = n_steps * d
+    let mut j = 0
+    while j < total {
+        result = result.push(schema_trace[j])
+        j = j + 1
+    }
+    let mut k = 0
+    while k < total {
+        result = result.push(effer_trace[k])
+        k = k + 1
+    }
+    let mut m = 0
+    while m < total {
+        result = result.push(error_trace[m])
+        m = m + 1
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Φ extraction from flat simulation output
+//
+// Flat layout: [schema(N*D) | efference(N*D) | error(N*D)]
+// Extract column traces (one channel across all timesteps) for MI.
+// ═══════════════════════════════════════════════════════════════
+
+// Extract time series for channel ch from a section starting at
+// section_offset in the flat array. Returns array of length n_steps.
+fn pl_extract_channel(flat: array, d: int, ch: int, n_steps: int, section_offset: int) -> array {
+    let mut col = []
+    let mut t = 0
+    while t < n_steps {
+        col = col.push(flat[section_offset + t * d + ch])
+        t = t + 1
+    }
+    return col
+}
+
+// Φ_phantom = mean MI(schema_ch, efference_ch) across all channels.
+// Measures whether the body schema and motor efference are co-active
+// with structured information. If Φ_phantom > 0, the phantom EXISTS
+// as an integrated representation — the cortex is maintaining a
+// coherent limb model even without peripheral confirmation.
+fn pl_phi_phantom(flat: array, d: int, n_steps: int) -> float {
+    let schema_offset = 0
+    let effer_offset = n_steps * d
+    let mut total = 0.0
+    let mut ch = 0
+    while ch < d {
+        let s_trace = pl_extract_channel(flat, d, ch, n_steps, schema_offset)
+        let e_trace = pl_extract_channel(flat, d, ch, n_steps, effer_offset)
+        total = total + pl_mi(s_trace, e_trace)
+        ch = ch + 1
+    }
+    if d == 0 { return 0.0 }
+    return total / to_float(d)
+}
+
+// Φ_pain = mean MI(efference_ch, error_ch) across all channels.
+// When feedback is absent (amputated), error ≈ efference, so MI is
+// high — every unresolved motor command is a pain signal (Harris 1999).
+// When feedback partially closes the loop (mirror), error shrinks,
+// so MI between efference and error drops (pain relief).
+fn pl_phi_pain(flat: array, d: int, n_steps: int) -> float {
+    let effer_offset = n_steps * d
+    let error_offset = 2 * n_steps * d
+    let mut total = 0.0
+    let mut ch = 0
+    while ch < d {
+        let e_trace = pl_extract_channel(flat, d, ch, n_steps, effer_offset)
+        let r_trace = pl_extract_channel(flat, d, ch, n_steps, error_offset)
+        total = total + pl_mi(e_trace, r_trace)
+        ch = ch + 1
+    }
+    if d == 0 { return 0.0 }
+    return total / to_float(d)
+}
+
+// Φ_phantom for a time window [t_start, t_end) — used for telescoping
+// comparison between early and late epochs.
+fn pl_phi_phantom_window(flat: array, d: int, n_steps: int, t_start: int, t_end: int) -> float {
+    let schema_offset = 0
+    let effer_offset = n_steps * d
+    let window_len = t_end - t_start
+    if window_len <= 0 { return 0.0 }
+    let mut total = 0.0
+    let mut ch = 0
+    while ch < d {
+        // Extract sub-window from full traces
+        let mut s_win = []
+        let mut e_win = []
+        let mut t = t_start
+        while t < t_end {
+            s_win = s_win.push(flat[schema_offset + t * d + ch])
+            e_win = e_win.push(flat[effer_offset + t * d + ch])
+            t = t + 1
+        }
+        total = total + pl_mi(s_win, e_win)
+        ch = ch + 1
+    }
+    if d == 0 { return 0.0 }
+    return total / to_float(d)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1..T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1 Phantom Φ — body schema persists after deafferentation.
+    //
+    // After amputation (mode=1, zero peripheral feedback), the body
+    // schema and motor efference continue to co-vary because cortex
+    // maintains the limb model open-loop. Φ_phantom > PL_PHANTOM_MIN.
+    //
+    // This IS the phantom — an integrated representation with no
+    // peripheral ground truth. Ramachandran & Hirstein 1998: "the
+    // phantom is the body image itself, persisting after the body
+    // part has been removed."
+
+    let flat = pl_simulate(PL_D, PL_STEPS, 1, 50001)
+    let phi = pl_phi_phantom(flat, PL_D, PL_STEPS)
+
+    println("  [T1] Phi_phantom (amputated, open-loop) = " + str(phi))
+    println("       threshold = " + str(PL_PHANTOM_MIN))
+
+    // Schema + efference still co-active → phantom exists
+    if phi <= PL_PHANTOM_MIN { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2 Pain from frozen efference — Φ_pain > PL_PAIN_MIN.
+    //
+    // Motor cortex sends commands to the missing limb. No
+    // proprioceptive return arrives, so error = efference — every
+    // command is maximally unresolved. The mutual information between
+    // efference and error is high because they are nearly identical
+    // (the error IS the efference when feedback is zero).
+    //
+    // Harris 1999: phantom pain is the prediction error of an
+    // unclosed sensorimotor control loop.
+
+    let flat = pl_simulate(PL_D, PL_STEPS, 1, 51001)
+    let phi_pain = pl_phi_pain(flat, PL_D, PL_STEPS)
+
+    println("  [T2] Phi_pain (amputated, frozen efference) = " + str(phi_pain))
+    println("       threshold = " + str(PL_PAIN_MIN))
+
+    // Open-loop → high efference-error MI → pain signal integrated
+    if phi_pain <= PL_PAIN_MIN { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3 Mirror therapy reduces pain.
+    //
+    // Ramachandran & Rogers-Ramachandran 1996: the mirror box places
+    // a mirror so that the reflection of the intact hand appears
+    // where the phantom would be. When the patient moves the intact
+    // hand, the visual feedback of "the phantom moving" reaches
+    // cortex. This partially resolves the efference copy — the motor
+    // command now has a (visual) update, shrinking prediction error.
+    //
+    // We compare Φ_pain in two conditions:
+    //   (a) amputated, no mirror (mode=1): pain from open loop
+    //   (b) mirror therapy (mode=2): visual surrogate partially closes loop
+    //
+    // Φ_pain(mirror) < Φ_pain(no_mirror) - PL_MIRROR_GAP
+
+    let flat_nomi = pl_simulate(PL_D, PL_STEPS, 1, 52001)
+    let pain_nomi = pl_phi_pain(flat_nomi, PL_D, PL_STEPS)
+
+    let flat_mirr = pl_simulate(PL_D, PL_STEPS, 2, 52001)
+    let pain_mirr = pl_phi_pain(flat_mirr, PL_D, PL_STEPS)
+
+    let reduction = pain_nomi - pain_mirr
+
+    println("  [T3] Phi_pain (no mirror) = " + str(pain_nomi))
+    println("       Phi_pain (mirror)    = " + str(pain_mirr))
+    println("       reduction            = " + str(reduction))
+    println("       threshold            = " + str(PL_MIRROR_GAP))
+
+    // Mirror must reduce pain by shrinking prediction error
+    if reduction <= PL_MIRROR_GAP { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4 Telescoping — Φ_phantom decays over time.
+    //
+    // Jensen et al. 1983; Giummarra et al. 2007: over weeks to months
+    // the phantom gradually shortens — the hand "telescopes" into the
+    // stump. Proximal segments (upper arm) lose their schema first;
+    // distal segments (fingers, hand) persist longest due to larger
+    // cortical magnification factor.
+    //
+    // We simulate with telescoping decay (mode=3) and compare
+    // Φ_phantom in the early window [0, half) vs late window [half, N).
+    //
+    // Φ_phantom(late) < Φ_phantom(early) - PL_TELESCOPE_GAP
+
+    let flat = pl_simulate(PL_D, PL_STEPS, 3, 53001)
+    let half = PL_STEPS / 2
+
+    let phi_early = pl_phi_phantom_window(flat, PL_D, PL_STEPS, 0, half)
+    let phi_late = pl_phi_phantom_window(flat, PL_D, PL_STEPS, half, PL_STEPS)
+    let decay = phi_early - phi_late
+
+    println("  [T4] Phi_phantom early [0," + str(half) + ") = " + str(phi_early))
+    println("       Phi_phantom late  [" + str(half) + "," + str(PL_STEPS) + ") = " + str(phi_late))
+    println("       decay = " + str(decay))
+    println("       threshold = " + str(PL_TELESCOPE_GAP))
+
+    // Schema must decay: late epoch has less integrated phantom
+    if decay <= PL_TELESCOPE_GAP { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5 Determinism + latency < 5000ms.
+    //
+    // Same seed must produce identical Φ_phantom values (deterministic
+    // simulation). Wall-clock must be under 5000ms for the full suite.
+
+    let t0 = clock()
+
+    // Run 1
+    let flat_a = pl_simulate(PL_D, PL_STEPS, 1, 54001)
+    let phi_a = pl_phi_phantom(flat_a, PL_D, PL_STEPS)
+
+    // Run 2 (same seed)
+    let flat_b = pl_simulate(PL_D, PL_STEPS, 1, 54001)
+    let phi_b = pl_phi_phantom(flat_b, PL_D, PL_STEPS)
+
+    let delta = pl_abs(phi_a - phi_b)
+
+    let t1 = clock()
+    let elapsed = t1 - t0
+
+    println("  [T5] Phi_phantom run1 = " + str(phi_a))
+    println("       Phi_phantom run2 = " + str(phi_b))
+    println("       |delta| = " + str(delta) + " (must be 0)")
+    println("       elapsed = " + str(elapsed) + "ms (must be < 5000)")
+
+    // Determinism: identical seeds → identical results
+    if delta > PL_DETERM_EPS { return false }
+    // Latency: must complete within 5 seconds
+    if elapsed > 5000.0 { return false }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — execute 5 self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[phantom_limb_phi] P86 — Phantom Limb Phi (Ramachandran)")
+    println("  d=" + str(PL_D) + " steps=" + str(PL_STEPS) + " bins=" + str(PL_BINS))
+    println("  refs: Ramachandran & Hirstein 1998 | Flor 2006 | Harris 1999")
+    println("  phenomena: phantom persistence, frozen efference pain,")
+    println("             mirror-box therapy, telescoping decay")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — phantom Phi > 0 (body schema persists after deafferentation)") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — pain from frozen efference (open-loop prediction error)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — mirror therapy reduces pain (visual capture closes loop)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — telescoping (Phi_phantom decays over time)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — determinism + latency < 5000ms") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause comment: stage0 long && chains may mishandle short-circuit
+    // ordering — use a mutable bool accumulator with sequential guards
+    // (same idiom as body_swap_phi / depersonalization_phi).
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[phantom_limb_phi] 5/5 PASS — P86 DONE")
+    } else {
+        println("[phantom_limb_phi] SOME FAILED")
+    }
+}
+
+main()

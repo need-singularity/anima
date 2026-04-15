@@ -1,0 +1,939 @@
+// unconscious_processing_phi.hexa — P95 Unconscious Processing Φ
+//
+// Roadmap: shared/roadmaps/anima.json P95
+//   Unconscious processing — subliminal perception, priming, implicit
+//   learning, and mere exposure. The boundary between conscious and
+//   unconscious information processing as a sigmoid Φ transition at
+//   perceptual threshold.
+//
+// ─── Scientific frame ─────────────────────────────────────────────
+//
+//   1. SUBLIMINAL PERCEPTION (Marcel 1983): stimulus below detection
+//      threshold → Φ_conscious ≈ 0 but Φ_processing > 0.
+//   2. SEMANTIC PRIMING (Meyer & Schvaneveldt 1971; Dehaene 1998):
+//      subliminal prime → spreading activation in semantic network.
+//   3. IMPLICIT LEARNING (Reber 1967): learn grammar rules without
+//      being able to articulate them.
+//   4. MERE EXPOSURE (Zajonc 1968): subliminal familiarity → preference.
+//   5. THRESHOLD: Φ_conscious = sigmoid(intensity) — Dehaene 2006 ignition.
+//
+// ─── Theorems (T1–T5) ─────────────────────────────────────────────
+//
+// T1 (subliminal processing):
+//    A subliminal stimulus (intensity < threshold) produces:
+//      Φ_processing > UP_PROC_GATE (behavioural effect exists)
+//      AND Φ_conscious < UP_AWARE_CEIL (no awareness).
+//    Operationalizes Marcel 1983.
+//
+// T2 (semantic priming Φ_spread):
+//    A subliminal prime activates semantically related nodes:
+//      MI(prime_activation, related_target) > MI(prime_activation, unrelated_target)
+//    by at least UP_PRIME_GAP. Spreading activation without awareness.
+//    Operationalizes Meyer & Schvaneveldt 1971; Dehaene et al. 1998.
+//
+// T3 (implicit learning — Reber grammar):
+//    After exposure to grammar-generated strings, classification
+//    accuracy exceeds chance by UP_GRAMMAR_GAP:
+//      accuracy > 0.5 + UP_GRAMMAR_GAP
+//    AND Φ_explicit (ability to state the rule) < UP_EXPLICIT_CEIL.
+//    Knowledge without awareness. Operationalizes Reber 1967.
+//
+// T4 (threshold transition sigmoid):
+//    Sweeping intensity from 0 to 1, Φ_conscious follows a sigmoid.
+//      Φ_conscious(sub_threshold) < UP_AWARE_CEIL (low, near 0)
+//      Φ_conscious(supra_threshold) > UP_SUPRA_FLOOR (high, near 1)
+//    AND the transition is steep: max slope > UP_SLOPE_GATE.
+//    Operationalizes Dehaene's ignition model.
+//
+// T5 (determinism + latency):
+//    Same seed + same params → byte-identical Φ values.
+//    Full pipeline latency < UP_LATENCY_MS.
+//
+// ─── Stage0 hexa constraints honored ─────────────────────────────
+//   - plain `fn` only, no pure-fn multi-float struct returns
+//   - `array` typed params (no [float]/[int])
+//   - no identifier-pattern match; sequential if chains
+//   - no contains() / to_lower()
+//   - no !(Effect) annotations
+//   - no else-if in let-binding (flat mut + sequential if)
+//   - no multi-line fn signatures / call sites / array literals
+//   - N < 32 throughout
+//   - main() call at bottom
+//
+// Refs: Marcel 1983, Dehaene 1998/2006, Reber 1967/1993, Zajonc 1968/1980,
+//       Meyer & Schvaneveldt 1971, Greenwald 1996
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+// Perceptual threshold — intensity at which stimuli cross into awareness.
+// Stimuli below this are "subliminal"; above are "supraliminal".
+let UP_THRESHOLD        = 0.5
+
+// Sigmoid steepness for the conscious/unconscious transition.
+// k=14 gives a sharp but not vertical boundary — matches psychophysical
+// data where the transition spans ~10-15% of the intensity range.
+let UP_SIGMOID_K        = 14.0
+
+// Signal generation parameters
+let UP_N                = 28           // trial / signal length (< 32)
+let UP_MI_BINS          = 5            // MI histogram bins
+let UP_SEED             = 9500         // base seed for determinism
+
+let UP_SUBLIM_INTENSITY = 0.18         // well below threshold
+let UP_SUPRA_INTENSITY  = 0.85         // well above threshold
+let UP_SWEEP_LO         = 0.05
+let UP_SWEEP_HI         = 0.95
+let UP_SWEEP_STEPS      = 20          // < 32
+
+let UP_PROC_STRENGTH    = 0.7          // processing fidelity (ungated by awareness)
+let UP_BEHAV_NOISE      = 0.15        // behavioural measurement noise
+
+let UP_SEM_NODES        = 24          // semantic network nodes (< 32)
+let UP_SEM_SPREAD       = 0.35        // spreading activation coefficient
+let UP_SEM_DECAY        = 0.92        // per-hop decay
+let UP_SEM_HOPS         = 3           // propagation depth
+
+let UP_GRAM_STATES      = 5            // Reber FSA states
+let UP_GRAM_SYMBOLS     = 3           // a=0, b=1, c=2
+let UP_GRAM_TRAIN_N     = 24          // training strings (< 32)
+let UP_GRAM_TEST_N      = 20          // test strings (< 32)
+let UP_GRAM_MAX_LEN     = 8           // max string length
+
+let UP_EXPO_REPS        = 16          // mere exposure repetitions
+let UP_EXPO_ITEMS       = 12          // distinct items (< 32)
+let UP_PREF_BASE        = 0.5         // baseline preference (no exposure)
+let UP_PREF_SHIFT       = 0.06        // per-exposure preference increment
+let UP_PREF_CAP         = 0.85        // maximum preference ceiling
+
+// Test gates
+let UP_PROC_GATE        = 0.05        // T1: min behavioural effect
+let UP_AWARE_CEIL       = 0.15        // T1/T3: max awareness for "unconscious"
+let UP_PRIME_GAP        = 0.03        // T2: min MI gap related vs unrelated
+let UP_GRAMMAR_GAP      = 0.08        // T3: accuracy above chance (50%)
+let UP_EXPLICIT_CEIL    = 0.15        // T3: max explicit rule knowledge
+let UP_SUPRA_FLOOR      = 0.70        // T4: min Φ_conscious above threshold
+let UP_SLOPE_GATE       = 2.0         // T4: min max-slope of sigmoid
+let UP_LATENCY_MS       = 5000.0      // T5: latency gate
+
+let UP_EPS              = 0.00000001
+
+// ═══════════════════════════════════════════════════════════════
+// PRNG + scalar helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn up_prng(seed: int) -> int {
+    let mut s = (seed * 1103515245 + 12345) % 2147483648
+    if s < 0 { s = s + 2147483648 }
+    return s
+}
+
+fn up_unit(seed: int) -> float {
+    let mut v = seed % 1000000
+    if v < 0 { v = v + 1000000 }
+    return to_float(v) / 1000000.0
+}
+
+fn up_signed(seed: int) -> float {
+    return up_unit(seed) * 2.0 - 1.0
+}
+
+fn up_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn up_clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn up_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn up_min_f(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn up_max_f(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+fn up_exp_pos(x: float) -> float {
+    // 20-term Taylor for x >= 0 (enough for x up to ~12).
+    let mut sum = 1.0
+    let mut term = 1.0
+    let mut i = 1
+    while i <= 20 {
+        term = term * x / to_float(i)
+        sum = sum + term
+        i = i + 1
+    }
+    return sum
+}
+
+fn up_exp_approx(x: float) -> float {
+    // exp(x) via identity: exp(-|x|) = 1/exp(|x|) for negative args.
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    if v >= 0.0 { return up_exp_pos(v) }
+    let pos_result = up_exp_pos(0.0 - v)
+    if pos_result < UP_EPS { return UP_EPS }
+    return 1.0 / pos_result
+}
+
+// Sigmoid: σ(x) = 1 / (1 + exp(-k * (x - threshold)))
+fn up_sigmoid(intensity: float, k: float, threshold: float) -> float {
+    let z = 0.0 - k * (intensity - threshold)
+    let e = up_exp_approx(z)
+    return 1.0 / (1.0 + e)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MI estimator (histogram-based, N<32 safe)
+// ═══════════════════════════════════════════════════════════════
+
+fn up_vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn up_vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn up_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn up_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn up_entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(up_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = up_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * up_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn up_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        let ia = up_bin_idx(a[i], lo, hi, nb)
+        let ib = up_bin_idx(b[i], lo, hi, nb)
+        ids = ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = up_counts(ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * up_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn up_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let lo_a = up_vec_min(a)
+    let hi_a = up_vec_max(a)
+    let lo_b = up_vec_min(b)
+    let hi_b = up_vec_max(b)
+    let lo = up_min_f(lo_a, lo_b) - UP_EPS
+    let hi = up_max_f(hi_a, hi_b) + UP_EPS
+    let ha = up_entropy_hist(a, lo, hi, UP_MI_BINS)
+    let hb = up_entropy_hist(b, lo, hi, UP_MI_BINS)
+    let hab = up_joint_entropy(a, b, lo, hi, UP_MI_BINS)
+    let mi = ha + hb - hab
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════
+// T1 — Subliminal perception model
+// Two parallel paths: processing (always active) + awareness (sigmoid-gated).
+// ═══════════════════════════════════════════════════════════════
+fn up_gen_stimuli(intensity: float, n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = up_prng(s)
+        let noise = up_signed(s) * 0.05
+        out = out.push(up_clamp01(intensity + noise))
+        i = i + 1
+    }
+    return out
+}
+
+// Processing pathway: output = stimulus * strength + noise (awareness-independent).
+fn up_processing_path(stimuli: array, strength: float, seed: int) -> array {
+    let n = len(stimuli)
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = up_prng(s)
+        let noise = up_signed(s) * UP_BEHAV_NOISE
+        let val = stimuli[i] * strength + noise
+        out = out.push(up_clamp01(val))
+        i = i + 1
+    }
+    return out
+}
+
+// Awareness pathway: sigmoid-gated Φ_conscious per-stimulus.
+fn up_awareness_path(stimuli: array) -> array {
+    let n = len(stimuli)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let phi_c = up_sigmoid(stimuli[i], UP_SIGMOID_K, UP_THRESHOLD)
+        out = out.push(phi_c)
+        i = i + 1
+    }
+    return out
+}
+
+// Behavioural effect: 1 - mean_error (high = processing intact).
+fn up_behavioural_effect(stimuli: array, proc_out: array) -> float {
+    let n = len(stimuli)
+    if n == 0 { return 0.0 }
+    // Mean of |stimulus - proc_out| as inverse proxy: low error = high effect.
+    // We return 1 - mean_error so that high processing = high value.
+    let mut sum_err = 0.0
+    let mut i = 0
+    while i < n {
+        sum_err = sum_err + up_abs(stimuli[i] * UP_PROC_STRENGTH - proc_out[i])
+        i = i + 1
+    }
+    let mean_err = sum_err / to_float(n)
+    let eff_val = 1.0 - mean_err
+    if eff_val < 0.0 { return 0.0 }
+    return eff_val
+}
+
+// Mean awareness (Φ_conscious) across trials.
+fn up_mean_awareness(awareness: array) -> float {
+    let n = len(awareness)
+    if n == 0 { return 0.0 }
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        sum = sum + awareness[i]
+        i = i + 1
+    }
+    return sum / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// T2 — Semantic priming (ring network, spreading activation)
+// Related = ring distance <= 2; unrelated = distance >= N/2.
+// ═══════════════════════════════════════════════════════════════
+fn up_is_adjacent(i: int, j: int, n: int) -> bool {
+    if i == j { return false }
+    let d1 = (j - i + n) % n
+    let d2 = (i - j + n) % n
+    let mut dist = d1
+    if d2 < d1 { dist = d2 }
+    if dist <= 2 { return true }
+    return false
+}
+
+// Spread activation from source through network for UP_SEM_HOPS steps.
+fn up_spread_activation(source: int, n_nodes: int, hops: int, seed: int) -> array {
+    let mut act = []
+    let mut i = 0
+    while i < n_nodes {
+        if i == source { act = act.push(1.0) } else { act = act.push(0.0) }
+        i = i + 1
+    }
+    let mut h = 0
+    while h < hops {
+        let mut next_act = []
+        let mut j = 0
+        while j < n_nodes {
+            let mut incoming = act[j] * UP_SEM_DECAY
+            let mut k = 0
+            while k < n_nodes {
+                if up_is_adjacent(k, j, n_nodes) {
+                    incoming = incoming + act[k] * UP_SEM_SPREAD * UP_SEM_DECAY
+                }
+                k = k + 1
+            }
+            next_act = next_act.push(up_clamp01(incoming))
+            j = j + 1
+        }
+        act = next_act
+        h = h + 1
+    }
+    let mut noisy = []
+    let mut s = seed
+    let mut m = 0
+    while m < n_nodes {
+        s = up_prng(s)
+        let noise = up_signed(s) * 0.01
+        noisy = noisy.push(up_clamp01(act[m] + noise))
+        m = m + 1
+    }
+    return noisy
+}
+
+// Collect activation at related/unrelated targets across many prime sources.
+// Returns [related_activations, unrelated_activations] interleaved flat array:
+//   [rel_0, unrel_0, rel_1, unrel_1, ...]
+fn up_collect_priming_data(n_trials: int, n_nodes: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < n_trials {
+        s = up_prng(s)
+        let source = s % n_nodes
+        let act = up_spread_activation(source, n_nodes, UP_SEM_HOPS, s + 71)
+        let related = (source + 1) % n_nodes
+        let unrelated = (source + n_nodes / 2) % n_nodes
+        out = out.push(act[related])
+        out = out.push(act[unrelated])
+        t = t + 1
+    }
+    return out
+}
+
+// Mean activation for related targets (even indices).
+fn up_mean_related(data: array, n: int) -> float {
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        sum = sum + data[i * 2]
+        i = i + 1
+    }
+    return sum / to_float(n)
+}
+
+// Mean activation for unrelated targets (odd indices).
+fn up_mean_unrelated(data: array, n: int) -> float {
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        sum = sum + data[i * 2 + 1]
+        i = i + 1
+    }
+    return sum / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// T3 — Implicit learning (Reber grammar: S0-a->S1-b->S2-a->S3-b->S4
+//       with loops S1-a->S1, S2-b->S2, S3-a->S3)
+// ═══════════════════════════════════════════════════════════════
+
+// Generate a grammatical string (symbol indices, length <= UP_GRAM_MAX_LEN).
+fn up_gen_grammatical(seed: int) -> array {
+    let mut out = []
+    let mut state = 0
+    let mut s = seed
+    let mut step = 0
+    while step < UP_GRAM_MAX_LEN {
+        if state == 0 {
+            out = out.push(0)
+            state = 1
+        } else { if state == 1 {
+            s = up_prng(s)
+            let r = s % 3
+            if r == 0 {
+                out = out.push(0)
+                state = 1
+            } else {
+                out = out.push(1)
+                state = 2
+            }
+        } else { if state == 2 {
+            s = up_prng(s)
+            let r = s % 3
+            if r == 0 {
+                out = out.push(1)
+                state = 2
+            } else {
+                out = out.push(0)
+                state = 3
+            }
+        } else { if state == 3 {
+            s = up_prng(s)
+            let r = s % 3
+            if r == 0 {
+                out = out.push(0)
+                state = 3
+            } else {
+                out = out.push(1)
+                state = 4
+            }
+        } else {
+            step = UP_GRAM_MAX_LEN
+        } } } }
+        step = step + 1
+    }
+    return out
+}
+
+// Generate an ungrammatical string (starts with b/c, violating grammar).
+fn up_gen_ungrammatical(seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    s = up_prng(s)
+    let first = 1 + (s % 2)
+    out = out.push(first)
+    let mut step = 1
+    while step < UP_GRAM_MAX_LEN {
+        s = up_prng(s)
+        out = out.push(s % UP_GRAM_SYMBOLS)
+        step = step + 1
+    }
+    return out
+}
+
+// Learn bigram transition matrix from grammatical training strings.
+fn up_learn_bigrams(n_train: int, seed: int) -> array {
+    let cells = UP_GRAM_SYMBOLS * UP_GRAM_SYMBOLS
+    let mut counts = []
+    let mut c = 0
+    while c < cells {
+        counts = counts.push(0.1)
+        c = c + 1
+    }
+    let mut s = seed
+    let mut t = 0
+    while t < n_train {
+        s = up_prng(s)
+        let gram = up_gen_grammatical(s)
+        let gn = len(gram)
+        let mut i = 0
+        while i < gn - 1 {
+            let a_sym = to_int(gram[i])
+            let b_sym = to_int(gram[i + 1])
+            let idx = a_sym * UP_GRAM_SYMBOLS + b_sym
+            counts[idx] = counts[idx] + 1.0
+            i = i + 1
+        }
+        t = t + 1
+    }
+    let mut probs = []
+    let mut row = 0
+    while row < UP_GRAM_SYMBOLS {
+        let mut row_sum = 0.0
+        let mut col = 0
+        while col < UP_GRAM_SYMBOLS {
+            row_sum = row_sum + counts[row * UP_GRAM_SYMBOLS + col]
+            col = col + 1
+        }
+        col = 0
+        while col < UP_GRAM_SYMBOLS {
+            let p = counts[row * UP_GRAM_SYMBOLS + col] / (row_sum + UP_EPS)
+            probs = probs.push(p)
+            col = col + 1
+        }
+        row = row + 1
+    }
+    return probs
+}
+
+// Score a string: sum of log transition probs (higher = more grammatical).
+fn up_score_string(strs: array, probs: array) -> float {
+    let n = len(strs)
+    if n < 2 { return 0.0 }
+    let mut score = 0.0
+    let mut i = 0
+    while i < n - 1 {
+        let a_sym = to_int(strs[i])
+        let b_sym = to_int(strs[i + 1])
+        let idx = a_sym * UP_GRAM_SYMBOLS + b_sym
+        score = score + up_ln_safe(probs[idx])
+        i = i + 1
+    }
+    return score
+}
+
+// Pairwise classification accuracy: grammatical vs ungrammatical.
+fn up_classify_accuracy(probs: array, n_test: int, seed: int) -> float {
+    let mut correct = 0.0
+    let mut total = 0.0
+    let mut s = seed
+    let mut i = 0
+    while i < n_test {
+        s = up_prng(s)
+        let gram = up_gen_grammatical(s + 3000)
+        let score_g = up_score_string(gram, probs)
+        let ungram = up_gen_ungrammatical(s + 5000)
+        let score_u = up_score_string(ungram, probs)
+        if score_g > score_u { correct = correct + 1.0 }
+        total = total + 1.0
+        i = i + 1
+    }
+    if total < 1.0 { return 0.5 }
+    return correct / total
+}
+
+// Φ_explicit = 1 - normalized_entropy(transition_matrix).
+// Low = cannot articulate rule (implicit only).
+fn up_explicit_knowledge(probs: array) -> float {
+    let cells = UP_GRAM_SYMBOLS * UP_GRAM_SYMBOLS
+    let max_ent = up_ln_safe(to_float(UP_GRAM_SYMBOLS))
+    if max_ent < UP_EPS { return 0.0 }
+    let mut total_ent = 0.0
+    let mut row = 0
+    while row < UP_GRAM_SYMBOLS {
+        let mut row_ent = 0.0
+        let mut col = 0
+        while col < UP_GRAM_SYMBOLS {
+            let p = probs[row * UP_GRAM_SYMBOLS + col]
+            if p > UP_EPS { row_ent = row_ent - p * up_ln_safe(p) }
+            col = col + 1
+        }
+        total_ent = total_ent + row_ent
+        row = row + 1
+    }
+    let mean_ent = total_ent / to_float(UP_GRAM_SYMBOLS)
+    let ratio = mean_ent / max_ent
+    return 1.0 - ratio
+}
+
+// ═══════════════════════════════════════════════════════════════
+// T4 — Threshold sigmoid sweep (Dehaene 2006 ignition model)
+// ═══════════════════════════════════════════════════════════════
+
+fn up_sigmoid_sweep() -> array {
+    let mut vals = []
+    let step_size = (UP_SWEEP_HI - UP_SWEEP_LO) / to_float(UP_SWEEP_STEPS - 1)
+    let mut i = 0
+    while i < UP_SWEEP_STEPS {
+        let intensity = UP_SWEEP_LO + to_float(i) * step_size
+        let phi_c = up_sigmoid(intensity, UP_SIGMOID_K, UP_THRESHOLD)
+        vals = vals.push(phi_c)
+        i = i + 1
+    }
+    return vals
+}
+
+fn up_max_slope(vals: array) -> float {
+    let n = len(vals)
+    if n < 2 { return 0.0 }
+    let step_size = (UP_SWEEP_HI - UP_SWEEP_LO) / to_float(n - 1)
+    let mut mx = 0.0
+    let mut i = 0
+    while i < n - 1 {
+        let slope = (vals[i + 1] - vals[i]) / step_size
+        if slope > mx { mx = slope }
+        i = i + 1
+    }
+    return mx
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Mere exposure effect (Zajonc) — subliminal familiarity → preference
+// ═══════════════════════════════════════════════════════════════
+
+fn up_mere_exposure_preference(n_items: int, n_reps: int, seed: int) -> array {
+    let mut prefs = []
+    let mut i = 0
+    while i < n_items {
+        // Each item exposed n_reps times subliminally.
+        // Preference = base + shift * reps, capped.
+        let raw = UP_PREF_BASE + UP_PREF_SHIFT * to_float(n_reps)
+        let pref = up_min_f(raw, UP_PREF_CAP)
+        prefs = prefs.push(pref)
+        i = i + 1
+    }
+    return prefs
+}
+
+fn up_unexposed_preference(n_items: int, seed: int) -> array {
+    let mut prefs = []
+    let mut s = seed
+    let mut i = 0
+    while i < n_items {
+        // Unexposed items: baseline preference with small random variation.
+        s = up_prng(s)
+        let noise = up_signed(s) * 0.03
+        prefs = prefs.push(up_clamp01(UP_PREF_BASE + noise))
+        i = i + 1
+    }
+    return prefs
+}
+
+fn up_mean_arr(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        sum = sum + v[i]
+        i = i + 1
+    }
+    return sum / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Check functions
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1: Subliminal processing (Marcel 1983) — behavioural effect > 0, Φ_conscious ≈ 0.
+    let stim = up_gen_stimuli(UP_SUBLIM_INTENSITY, UP_N, UP_SEED + 100)
+    let proc = up_processing_path(stim, UP_PROC_STRENGTH, UP_SEED + 101)
+    let aware = up_awareness_path(stim)
+    let behav_effect = up_behavioural_effect(stim, proc)
+    let phi_conscious = up_mean_awareness(aware)
+
+    // Φ_processing (MI) must be positive — information transmitted unconsciously.
+    let phi_proc = up_mi(stim, proc)
+
+    println("  [T1] subliminal intensity=" + str(UP_SUBLIM_INTENSITY))
+    println("  [T1] behavioural_effect=" + str(behav_effect) + " gate=" + str(UP_PROC_GATE))
+    println("  [T1] Φ_processing (MI)=" + str(phi_proc))
+    println("  [T1] Φ_conscious=" + str(phi_conscious) + " ceil=" + str(UP_AWARE_CEIL))
+
+    let mut ok = true
+    if behav_effect < UP_PROC_GATE { ok = false }
+    if phi_conscious > UP_AWARE_CEIL { ok = false }
+
+    // Supraliminal contrast: above threshold both processing and awareness high.
+    let stim_s = up_gen_stimuli(UP_SUPRA_INTENSITY, UP_N, UP_SEED + 110)
+    let proc_s = up_processing_path(stim_s, UP_PROC_STRENGTH, UP_SEED + 111)
+    let aware_s = up_awareness_path(stim_s)
+    let phi_c_supra = up_mean_awareness(aware_s)
+    println("  [T1] contrast: supra Φ_conscious=" + str(phi_c_supra) + " (should be high)")
+    if phi_c_supra < UP_SUPRA_FLOOR { ok = false }
+
+    return ok
+}
+
+fn check_T2() -> bool {
+    // T2: Semantic priming + mere exposure.
+    // Related targets receive more activation than unrelated targets
+    // (spreading activation facilitation effect).
+    let data = up_collect_priming_data(UP_N, UP_SEM_NODES, UP_SEED + 200)
+    let mean_rel = up_mean_related(data, UP_N)
+    let mean_unrel = up_mean_unrelated(data, UP_N)
+    let gap = mean_rel - mean_unrel
+
+    println("  [T2] mean activation: related=" + str(mean_rel) + " unrelated=" + str(mean_unrel))
+    println("  [T2] priming gap=" + str(gap) + " gate=" + str(UP_PRIME_GAP))
+
+    // Mere exposure (Zajonc): subliminal familiarity → preference shift.
+    let pref_exposed = up_mere_exposure_preference(UP_EXPO_ITEMS, UP_EXPO_REPS, UP_SEED + 210)
+    let pref_unexposed = up_unexposed_preference(UP_EXPO_ITEMS, UP_SEED + 211)
+    let mean_exp = up_mean_arr(pref_exposed)
+    let mean_unexp = up_mean_arr(pref_unexposed)
+    let pref_lift = mean_exp - mean_unexp
+
+    println("  [T2] mere exposure: pref(exposed)=" + str(mean_exp) + " pref(unexposed)=" + str(mean_unexp) + " lift=" + str(pref_lift))
+
+    let mut ok = true
+    if gap < UP_PRIME_GAP { ok = false }
+    if mean_rel <= mean_unrel { ok = false }
+    if pref_lift <= 0.0 { ok = false }
+    return ok
+}
+
+fn check_T3() -> bool {
+    // T3: Implicit learning (Reber 1967) — accuracy > chance, Φ_explicit low.
+    let probs = up_learn_bigrams(UP_GRAM_TRAIN_N, UP_SEED + 300)
+    let accuracy = up_classify_accuracy(probs, UP_GRAM_TEST_N, UP_SEED + 310)
+    let phi_explicit = up_explicit_knowledge(probs)
+
+    println("  [T3] Reber grammar classification accuracy=" + str(accuracy))
+    println("  [T3] accuracy above chance=" + str(accuracy - 0.5) + " gate=" + str(UP_GRAMMAR_GAP))
+    println("  [T3] Φ_explicit (rule articulability)=" + str(phi_explicit) + " ceil=" + str(UP_EXPLICIT_CEIL))
+
+    let mut ok = true
+    if accuracy < 0.5 + UP_GRAMMAR_GAP { ok = false }
+    if phi_explicit > UP_EXPLICIT_CEIL { ok = false }
+    return ok
+}
+
+fn check_T4() -> bool {
+    // T4: Threshold sigmoid (Dehaene 2006 ignition) — sub→0, supra→1, steep transition.
+    let vals = up_sigmoid_sweep()
+    let n = len(vals)
+
+    let phi_sub = vals[0]
+    let phi_supra = vals[n - 1]
+    let slope = up_max_slope(vals)
+
+    println("  [T4] sigmoid sweep: Φ_conscious(lo)=" + str(phi_sub) + " Φ_conscious(hi)=" + str(phi_supra))
+    println("  [T4] max slope=" + str(slope) + " gate=" + str(UP_SLOPE_GATE))
+
+    let mut ok = true
+    if phi_sub > UP_AWARE_CEIL { ok = false }
+    if phi_supra < UP_SUPRA_FLOOR { ok = false }
+    if slope < UP_SLOPE_GATE { ok = false }
+    // Monotonicity check.
+    let mut j = 0
+    while j < n - 1 {
+        if vals[j + 1] < vals[j] - UP_EPS { ok = false }
+        j = j + 1
+    }
+
+    return ok
+}
+
+fn check_T5() -> bool {
+    // T5: Determinism (two identical runs) + latency < UP_LATENCY_MS.
+    let t0 = clock()
+
+    let stim1 = up_gen_stimuli(UP_SUBLIM_INTENSITY, UP_N, UP_SEED + 500)
+    let proc1 = up_processing_path(stim1, UP_PROC_STRENGTH, UP_SEED + 501)
+    let aware1 = up_awareness_path(stim1)
+    let eff1 = up_behavioural_effect(stim1, proc1)
+    let phi_c1 = up_mean_awareness(aware1)
+    let pd1 = up_collect_priming_data(UP_N, UP_SEM_NODES, UP_SEED + 510)
+    let mr1 = up_mean_related(pd1, UP_N)
+    let mu1 = up_mean_unrelated(pd1, UP_N)
+    let probs1 = up_learn_bigrams(UP_GRAM_TRAIN_N, UP_SEED + 520)
+    let acc1 = up_classify_accuracy(probs1, UP_GRAM_TEST_N, UP_SEED + 521)
+    let sig1 = up_sigmoid_sweep()
+    // Run 2: identical seeds
+    let stim2 = up_gen_stimuli(UP_SUBLIM_INTENSITY, UP_N, UP_SEED + 500)
+    let proc2 = up_processing_path(stim2, UP_PROC_STRENGTH, UP_SEED + 501)
+    let aware2 = up_awareness_path(stim2)
+    let eff2 = up_behavioural_effect(stim2, proc2)
+    let phi_c2 = up_mean_awareness(aware2)
+    let pd2 = up_collect_priming_data(UP_N, UP_SEM_NODES, UP_SEED + 510)
+    let mr2 = up_mean_related(pd2, UP_N)
+    let mu2 = up_mean_unrelated(pd2, UP_N)
+    let probs2 = up_learn_bigrams(UP_GRAM_TRAIN_N, UP_SEED + 520)
+    let acc2 = up_classify_accuracy(probs2, UP_GRAM_TEST_N, UP_SEED + 521)
+    let sig2 = up_sigmoid_sweep()
+
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+
+    println("  [T5] pipeline ms=" + str(ms) + " gate=" + str(UP_LATENCY_MS))
+
+    let mut ok = true
+    if up_abs(eff1 - eff2) > UP_EPS { ok = false }
+    if up_abs(phi_c1 - phi_c2) > UP_EPS { ok = false }
+    if up_abs(mr1 - mr2) > UP_EPS { ok = false }
+    if up_abs(mu1 - mu2) > UP_EPS { ok = false }
+    if up_abs(acc1 - acc2) > UP_EPS { ok = false }
+
+    let sn = len(sig1)
+    let mut si = 0
+    while si < sn {
+        if up_abs(sig1[si] - sig2[si]) > UP_EPS { ok = false }
+        si = si + 1
+    }
+
+    if !ok { println("  [T5] DETERMINISM VIOLATION — runs differ") }
+    if ms > UP_LATENCY_MS {
+        println("  [T5] LATENCY EXCEEDED")
+        ok = false
+    }
+    return ok
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — execute 5 self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[unconscious_processing_phi] P95 — unconscious processing × Φ")
+    println("  domains: subliminal perception | semantic priming | implicit learning | mere exposure")
+    println("  threshold=" + str(UP_THRESHOLD) + " sigmoid_k=" + str(UP_SIGMOID_K))
+    println("  refs: Marcel 1983 | Dehaene 1998/2006 | Reber 1967 | Zajonc 1968")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — subliminal processing (Φ_processing > 0, Φ_conscious ≈ 0)") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — semantic priming + mere exposure (Φ_spread related > unrelated)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — implicit learning (accuracy > chance, Φ_explicit ≈ 0)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — threshold sigmoid (Φ_conscious 0→1, steep ignition)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — determinism + latency < " + str(UP_LATENCY_MS) + " ms") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause: stage0 long && chains may mishandle short-circuit
+    // ordering — use mutable bool accumulator with sequential guards.
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[unconscious_processing_phi] 5/5 PASS — P95 DONE")
+    } else {
+        println("[unconscious_processing_phi] SOME FAILED")
+    }
+}
+
+main()

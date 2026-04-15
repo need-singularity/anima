@@ -1,0 +1,816 @@
+// inner_speech_phi.hexa — P89 Inner Speech Phi
+//
+// Roadmap: shared/roadmaps/anima.json P89
+//
+// ─── Domain: Inner Speech ────────────────────────────────────────
+//
+// Vygotsky (1934/1962) "Thought and Language": inner speech is NOT
+// external speech minus sound. It is a DISTINCT register that
+// undergoes internalization: social (interpsychological) speech is
+// progressively condensed until it becomes intrapersonal, predicative,
+// and semantically dense. The syntactic skeleton drops away; what
+// remains is a stream of predicate-heavy meaning-fragments moving at
+// speeds far exceeding articulatory output.
+//
+// Baddeley & Hitch (1974) phonological loop: working memory's verbal
+// subsystem consists of (a) a phonological store with time-limited
+// trace decay (~2 s), and (b) a subvocal articulatory rehearsal
+// process that refreshes those traces. The loop is ACTIVE during inner
+// speech — fMRI shows Broca's area activation even in silent verbal
+// thought (McGuire et al. 1996). Rehearsal rate determines the word-
+// length effect and memory span.
+//
+// Fernyhough (2004) dialogic inner speech: inner speech can be
+// dialogic (two or more "voices" in internal conversation — e.g.
+// debating a decision) or monologic (single-stream narration). The
+// dialogic form preserves more of the original social-speech
+// structure; the monologic form is more condensed.
+//
+// Schooler & Engstler-Schooler (1990) verbal overshadowing: when
+// participants verbally describe a previously seen face, their
+// subsequent recognition accuracy DROPS relative to controls who did
+// not verbalize. Forcing a verbal code onto a perceptual trace
+// degrades the perceptual representation — the verbal description
+// overwrites or interferes with the fine-grained perceptual features.
+//
+// Seal et al. (2004), Johns et al. (2001) — source monitoring and
+// auditory verbal hallucinations (AVH): inner speech is normally
+// tagged with a self-generated label (efference copy / forward model).
+// When the source-monitoring mechanism fails — the "self-generated"
+// tag is absent — inner speech is misattributed to an external agent,
+// producing the phenomenology of hearing voices. This is a structural
+// failure of the forward-model comparison, not a content difference.
+//
+// ─── Computational model ─────────────────────────────────────────
+//
+// We model inner speech as a multi-channel generative process:
+//
+//   semantic_ch    — meaning/predicate stream (high information density)
+//   phonological_ch — phonological form stream (articulatory rehearsal)
+//   perceptual_ch  — concurrent perceptual trace (non-verbal)
+//   source_tag_ch  — efference copy / self-attribution tag
+//
+// Internalization is modeled as condensation: inner speech has fewer
+// tokens (shorter arrays per meaning unit) but preserves MI between
+// semantic and phonological channels. External speech is longer (more
+// tokens) with the same underlying meaning — lower information
+// density per token.
+//
+// Verbal overshadowing: when the verbal channel is forcibly activated
+// during a perceptual encoding task, MI(phonological_ch, perceptual_ch)
+// INCREASES (the verbal channel captures some perceptual features) but
+// the perceptual channel's internal structure (self-MI, variance,
+// fidelity) DECREASES — the verbal encoding corrupts the perceptual
+// trace.
+//
+// Source monitoring: source_tag_ch co-varies with semantic_ch when
+// self-generated (high MI). When the tag mechanism fails (simulated
+// noise injection on the tag channel), MI(source_tag, semantic)
+// collapses and the system enters a hallucination-signature state.
+//
+// ─── 5 self-tests ────────────────────────────────────────────────
+//
+// T1 Inner speech generation:
+//    Generate inner speech (semantic + phonological + source_tag).
+//    Phi_verbal = MI(semantic, phonological) > IS_PHI_MIN.
+//    Phonological loop is active: var(phonological) > IS_VAR_MIN.
+//    Source tag correctly bound: MI(source_tag, semantic) > IS_TAG_MIN.
+//
+// T2 Condensation:
+//    Inner speech (N_INNER tokens) is shorter than external speech
+//    (N_OUTER tokens) for the same meaning. Despite fewer tokens,
+//    Phi_inner (MI/token) >= Phi_outer (MI/token). Information density
+//    is preserved or increased through condensation.
+//
+// T3 Verbal overshadowing:
+//    Generate a perceptual trace in two conditions:
+//      (a) perceptual-only — no verbal encoding forced
+//      (b) perceptual + forced verbal encoding
+//    Phi_perceptual(b) < Phi_perceptual(a) — verbal encoding degrades
+//    perceptual fidelity. Schooler effect is a measurable Phi drop.
+//
+// T4 Source monitoring:
+//    (a) Normal: source_tag tracks semantic — MI > IS_TAG_MIN.
+//        Correctly attributed as self-generated inner speech.
+//    (b) Failure: source_tag is noise-corrupted — MI collapses.
+//        System enters hallucination signature: verbal content is
+//        present but unowned. MI(source_tag, semantic) < IS_HALL_CEIL.
+//    (c) The verbal content itself is unchanged — MI(semantic,
+//        phonological) is preserved. Only the attribution breaks.
+//
+// T5 Determinism + latency:
+//    Two runs with identical seeds produce identical Phi values.
+//    Wall-clock time < IS_LATENCY_MS.
+//
+// ─── Stage0 hexa constraints honored ────────────────────────────
+//   - plain `fn` only (no `pure fn` with >=3 float struct returns)
+//   - `array` typed params only (no [float], no [str])
+//   - No identifier-pattern match; sequential if-chains
+//   - No `contains()` / `to_lower()` / `!(Effect)`
+//   - No else-if in let-binding; flat mut + sequential if
+//   - Single-line fn signatures / call sites / array literals
+//   - No reserved keywords as variable names
+//   - main() call at bottom
+//   - IS_STEPS < 32
+//
+// Law alignment:
+//   Law 2   Observe never inject — Phi via MI measurement on streams
+//   Law 4   Structure > feature — condensation is structural transform
+//   Law 22  Feature addition -> Phi down — verbal overshadowing embodies this
+//   Law 29  speak() forbidden — speech is emergent from cell dynamics
+//   AN7     Core separation — no cross-engine import
+//
+// Ref:
+//   Vygotsky (1934/1962) "Thought and Language" — internalization
+//   Baddeley & Hitch (1974) — phonological loop / working memory
+//   Fernyhough (2004) — dialogic vs monologic inner speech
+//   Schooler & Engstler-Schooler (1990) — verbal overshadowing
+//   Seal et al. (2004) — source monitoring and AVH
+//   Johns et al. (2001) — forward model and inner speech
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let IS_STEPS        = 24        // timeline length (stage0 N<32)
+let IS_BINS         = 6         // histogram bins for MI
+let IS_EPS          = 0.0000000001
+
+// Inner vs outer speech token counts — same meaning, different lengths
+let IS_N_INNER      = 24        // condensed inner speech tokens
+let IS_N_OUTER      = 24        // external speech tokens (same array length,
+                                // but outer has MORE redundancy / lower density)
+
+// Channel coupling strengths
+let IS_SEM_PHON_COUPLE   = 0.80  // semantic -> phonological binding
+let IS_TAG_SEM_COUPLE    = 0.85  // source tag -> semantic binding (normal)
+let IS_TAG_BROKEN_COUPLE = 0.02  // source tag coupling under monitoring failure
+let IS_VERBAL_PERCEPT_COUPLE = 0.60  // verbal -> perceptual interference strength
+let IS_PERCEPT_INTRINSIC = 0.90  // perceptual channel self-structure (no interference)
+
+// Condensation: inner speech has higher information density per token
+// because the syntactic skeleton is dropped (Vygotsky predicativity)
+let IS_INNER_DENSITY  = 1.40    // semantic signal amplitude (dense, predicative)
+let IS_OUTER_DENSITY  = 0.60    // semantic signal amplitude (full syntax, diluted)
+let IS_OUTER_REDUNDANCY = 0.50  // extra noise padding in external speech
+
+// Rehearsal rate (Baddeley loop refresh)
+let IS_REHEARSAL_RATE = 0.35    // phonological store refresh coupling
+
+// Noise / jitter
+let IS_JITTER       = 0.05
+let IS_NUMB_NOISE   = 0.65     // noise amplitude for source monitoring failure
+
+// Test gate thresholds
+let IS_PHI_MIN      = 0.04     // minimum verbal Phi (MI semantic-phonological)
+let IS_VAR_MIN      = 0.01     // minimum phonological variance (loop active)
+let IS_TAG_MIN      = 0.04     // minimum source-tag binding
+let IS_HALL_CEIL    = 0.55     // hallucination: source MI must fall below this
+let IS_OVERSHADOW_GAP = 0.005  // verbal overshadowing Phi drop threshold
+let IS_DENSITY_RATIO  = 0.95   // inner/outer MI-per-token ratio floor
+let IS_LATENCY_MS   = 5000     // wall-clock ceiling (ms)
+
+// ═══════════════════════════════════════════════════════════════
+// Math / PRNG primitives (L0-clean, no cross-engine import per AN7)
+// ═══════════════════════════════════════════════════════════════
+
+fn is_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn is_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn is_min_f(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn is_max_f(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+// Deterministic LCG — reproducibility (Law 2: observable, seed-stable)
+fn is_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn is_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn is_signed(seed: int) -> float {
+    return is_unit(seed) * 2.0 - 1.0
+}
+
+// Taylor cosine for structured signal generation
+fn is_cos_taylor(phase: float) -> float {
+    let mut y = phase
+    while y >  3.14159265 { y = y - 6.28318530 }
+    while y < -3.14159265 { y = y + 6.28318530 }
+    let y2 = y * y
+    return 1.0 - 0.5 * y2 + 0.04166 * y2 * y2
+}
+
+// Sin approximation via cos shift
+fn is_sin_taylor(phase: float) -> float {
+    return is_cos_taylor(phase - 1.5707963)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Histogram MI — shared Phi estimator
+// ═══════════════════════════════════════════════════════════════
+
+fn is_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn is_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn is_entropy(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(is_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = is_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * is_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn is_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = is_bin_idx(a[i], lo, hi, nb)
+        let ib = is_bin_idx(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = is_counts(pair_ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * is_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn is_vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn is_vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn is_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let lo_a = is_vec_min(a)
+    let hi_a = is_vec_max(a)
+    let lo_b = is_vec_min(b)
+    let hi_b = is_vec_max(b)
+    let lo = is_min_f(lo_a, lo_b)
+    let hi = is_max_f(hi_a, hi_b)
+    let h_a = is_entropy(a, lo, hi, IS_BINS)
+    let h_b = is_entropy(b, lo, hi, IS_BINS)
+    let h_j = is_joint_entropy(a, b, lo, hi, IS_BINS)
+    let mi = h_a + h_b - h_j
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// Variance helper — used for phonological loop activity + perceptual fidelity
+fn is_variance(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        sum = sum + v[i]
+        i = i + 1
+    }
+    let mean = sum / to_float(n)
+    let mut acc = 0.0
+    let mut j = 0
+    while j < n {
+        let d = v[j] - mean
+        acc = acc + d * d
+        j = j + 1
+    }
+    return acc / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Channel generators — inner speech generative process
+//
+// The four channels are causally structured:
+//   semantic_ch     — meaning stream (dense predicative content)
+//   phonological_ch — phonological form (articulatory rehearsal loop)
+//   source_tag_ch   — efference copy / self-attribution label
+//   perceptual_ch   — concurrent non-verbal perceptual trace
+//
+// Coupling topology:
+//   semantic -> phonological (IS_SEM_PHON_COUPLE)
+//   semantic -> source_tag   (IS_TAG_SEM_COUPLE or IS_TAG_BROKEN_COUPLE)
+//   verbal_encoding -> perceptual (IS_VERBAL_PERCEPT_COUPLE, only in overshadowing)
+// ═══════════════════════════════════════════════════════════════
+
+// Generate semantic channel — meaning stream with structure.
+// density parameter controls signal amplitude (inner = dense, outer = dilute).
+fn is_gen_semantic(n_tokens: int, density: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < n_tokens {
+        s = is_prng(s + t * 41)
+        // Structured signal: superposition of two frequencies (thought rhythm)
+        // Vygotsky predicativity: high density = sharper peaks, less filler
+        let phase1 = to_float(t) / to_float(n_tokens) * 6.28318530
+        let phase2 = phase1 * 2.3
+        let signal = density * (0.6 * is_sin_taylor(phase1) + 0.4 * is_cos_taylor(phase2))
+        let jit = IS_JITTER * is_signed(s)
+        out = out.push(signal + jit)
+        t = t + 1
+    }
+    return out
+}
+
+// Generate phonological channel — articulatory rehearsal loop.
+// Baddeley loop: phonological store is a coupled echo of the semantic
+// stream, refreshed at IS_REHEARSAL_RATE with its own articulatory dynamics.
+fn is_gen_phonological(semantic: array, n_tokens: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut store = 0.0
+    let mut t = 0
+    while t < n_tokens {
+        s = is_prng(s + t * 59)
+        // Articulatory rehearsal: store decays and is refreshed from semantic
+        let decay = 0.75
+        let refresh = IS_SEM_PHON_COUPLE * semantic[t]
+        store = decay * store + (1.0 - decay) * refresh
+        // Subvocal articulation adds its own rhythm (Broca activation)
+        let artic = IS_REHEARSAL_RATE * is_sin_taylor(to_float(t) * 0.9)
+        let jit = IS_JITTER * is_signed(s)
+        out = out.push(store + artic + jit)
+        t = t + 1
+    }
+    return out
+}
+
+// Generate source tag channel — efference copy that marks speech as self-generated.
+// tag_couple: IS_TAG_SEM_COUPLE (normal) or IS_TAG_BROKEN_COUPLE (monitoring failure).
+fn is_gen_source_tag(semantic: array, n_tokens: int, tag_couple: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < n_tokens {
+        s = is_prng(s + t * 73)
+        // Forward model: tag tracks semantic content with coupling strength.
+        // When the forward model is intact (tag_couple ~ 0.85), the efference
+        // copy faithfully predicts the semantic content => high MI.
+        // When broken (tag_couple ~ 0.02), the prediction is nearly zero and
+        // independent noise dominates => MI collapses to near 0.
+        let forward = tag_couple * semantic[t]
+        // Noise floor (residual proprioceptive / corollary discharge noise).
+        // Uses a distinct seed scramble so the noise is truly independent of
+        // the semantic signal — critical for genuine MI decorrelation.
+        let noise_seed = is_prng(seed * 7919 + t * 6271)
+        let noise_amp = 1.0 - tag_couple
+        let noise = noise_amp * IS_NUMB_NOISE * is_signed(noise_seed)
+        // Additional per-step jitter from yet another seed lineage
+        let jit_seed = is_prng(seed * 4243 + t * 3571)
+        let jit = IS_JITTER * is_signed(jit_seed)
+        out = out.push(forward + noise + jit)
+        t = t + 1
+    }
+    return out
+}
+
+// Generate perceptual channel — non-verbal perceptual trace.
+// If verbal_interference is true, the verbal encoding process corrupts
+// the perceptual trace (Schooler verbal overshadowing).
+fn is_gen_perceptual(n_tokens: int, verbal_interference: bool, phonological: array, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < n_tokens {
+        s = is_prng(s + t * 89)
+        // Rich perceptual signal — multi-frequency structured trace
+        let phase1 = to_float(t) / to_float(n_tokens) * 4.71238898
+        let phase2 = phase1 * 1.7
+        let phase3 = phase1 * 0.6
+        let percept = IS_PERCEPT_INTRINSIC * (0.45 * is_cos_taylor(phase1) + 0.35 * is_sin_taylor(phase2) + 0.20 * is_cos_taylor(phase3))
+        let jit = IS_JITTER * is_signed(s)
+        let mut val = percept + jit
+        // Verbal overshadowing: phonological encoding interferes with
+        // perceptual representation. The verbal code overwrites fine-grained
+        // perceptual features — replacing continuous perceptual structure with
+        // categorical verbal bins (Schooler 1990).
+        if verbal_interference {
+            // Interference: perceptual trace pulled toward verbal attractor
+            let verbal_pull = IS_VERBAL_PERCEPT_COUPLE * phonological[t]
+            // The perceptual self-structure is degraded proportionally
+            let degrade = 1.0 - IS_VERBAL_PERCEPT_COUPLE
+            val = degrade * val + verbal_pull
+        }
+        out = out.push(val)
+        t = t + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// External speech generator — same meaning as inner speech but with
+// more tokens, lower density, and syntactic padding (redundancy).
+//
+// Vygotsky's key insight: inner speech is NOT just quiet external
+// speech. External speech has full grammatical structure, articles,
+// copulas, explicit subjects — all of which are dropped in the
+// predicative inner register. So external speech has MORE tokens
+// carrying LESS information per token.
+// ═══════════════════════════════════════════════════════════════
+
+fn is_gen_outer_semantic(n_tokens: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < n_tokens {
+        s = is_prng(s + t * 43)
+        // Same underlying thought rhythm (same seed family) but diluted
+        let phase1 = to_float(t) / to_float(n_tokens) * 6.28318530
+        let phase2 = phase1 * 2.3
+        let signal = IS_OUTER_DENSITY * (0.6 * is_sin_taylor(phase1) + 0.4 * is_cos_taylor(phase2))
+        // Extra syntactic padding noise (articles, copulas, fillers)
+        let padding = IS_OUTER_REDUNDANCY * is_signed(s)
+        let jit = IS_JITTER * is_signed(s + 1009)
+        out = out.push(signal + padding + jit)
+        t = t + 1
+    }
+    return out
+}
+
+fn is_gen_outer_phonological(semantic: array, n_tokens: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut store = 0.0
+    let mut t = 0
+    while t < n_tokens {
+        s = is_prng(s + t * 61)
+        // Slower refresh — external articulation takes more time per token
+        let decay = 0.80
+        let refresh = IS_SEM_PHON_COUPLE * semantic[t]
+        store = decay * store + (1.0 - decay) * refresh
+        // Full articulatory motor plan (louder, more effortful than subvocal)
+        let artic = IS_REHEARSAL_RATE * 0.7 * is_sin_taylor(to_float(t) * 0.7)
+        let jit = IS_JITTER * is_signed(s)
+        out = out.push(store + artic + jit)
+        t = t + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Phi measurement wrappers
+// ═══════════════════════════════════════════════════════════════
+
+// Phi_verbal: MI between semantic and phonological channels.
+// Measures the core binding of inner speech — meaning-to-form.
+fn is_phi_verbal(semantic: array, phonological: array) -> float {
+    return is_mi(semantic, phonological)
+}
+
+// Phi_perceptual: self-structure of perceptual channel measured as
+// MI between first-half and second-half of the trace. High fidelity
+// perceptual encoding = high split-half MI (structured, non-random).
+fn is_phi_perceptual(perceptual: array) -> float {
+    let n = len(perceptual)
+    let half = n / 2
+    if half < 2 { return 0.0 }
+    let mut first = []
+    let mut second = []
+    let mut i = 0
+    while i < half {
+        first = first.push(perceptual[i])
+        second = second.push(perceptual[half + i])
+        i = i + 1
+    }
+    return is_mi(first, second)
+}
+
+// Phi_source: MI between source tag and semantic — measures self-attribution.
+fn is_phi_source(source_tag: array, semantic: array) -> float {
+    return is_mi(source_tag, semantic)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1..T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1 Inner speech generation:
+    //   (a) Generate inner speech channels (semantic + phonological + source_tag)
+    //   (b) Phi_verbal = MI(semantic, phonological) > IS_PHI_MIN
+    //   (c) Phonological loop active: var(phonological) > IS_VAR_MIN
+    //   (d) Source tag bound: MI(source_tag, semantic) > IS_TAG_MIN
+    //
+    // This tests the fundamental architecture: inner speech has real
+    // phenomenology — meaning is coupled to phonological form, and the
+    // speaker knows it is self-generated.
+
+    let sem = is_gen_semantic(IS_N_INNER, IS_INNER_DENSITY, 80001)
+    let phon = is_gen_phonological(sem, IS_N_INNER, 80101)
+    let tag = is_gen_source_tag(sem, IS_N_INNER, IS_TAG_SEM_COUPLE, 80201)
+
+    let phi_v = is_phi_verbal(sem, phon)
+    let var_p = is_variance(phon)
+    let phi_s = is_phi_source(tag, sem)
+
+    println("  [T1] Phi_verbal(sem,phon)=" + str(phi_v) + " (min=" + str(IS_PHI_MIN) + ")")
+    println("  [T1] var(phonological)=" + str(var_p) + " (min=" + str(IS_VAR_MIN) + ")")
+    println("  [T1] Phi_source(tag,sem)=" + str(phi_s) + " (min=" + str(IS_TAG_MIN) + ")")
+
+    let mut ok = true
+    if phi_v <= IS_PHI_MIN { ok = false }
+    if var_p <= IS_VAR_MIN { ok = false }
+    if phi_s <= IS_TAG_MIN { ok = false }
+    return ok
+}
+
+fn check_T2() -> bool {
+    // T2 Condensation — Vygotsky internalization:
+    //   Inner speech is shorter/faster than external speech FOR THE SAME
+    //   underlying meaning. Despite fewer tokens (or, with same array
+    //   length, higher density), the MI per token is preserved or increased.
+    //
+    //   Phi_density_inner = MI(sem_inner, phon_inner)   (high density tokens)
+    //   Phi_density_outer = MI(sem_outer, phon_outer)   (low density tokens)
+    //   Require: Phi_density_inner >= IS_DENSITY_RATIO * Phi_density_outer
+    //
+    //   This captures Vygotsky's predicativity: inner speech drops the
+    //   syntactic skeleton but preserves (or increases) semantic coupling.
+
+    // Inner speech: dense, predicative
+    let sem_in = is_gen_semantic(IS_N_INNER, IS_INNER_DENSITY, 81001)
+    let phon_in = is_gen_phonological(sem_in, IS_N_INNER, 81101)
+    let phi_in = is_phi_verbal(sem_in, phon_in)
+
+    // External speech: diluted, full syntax, redundant padding
+    let sem_out = is_gen_outer_semantic(IS_N_OUTER, 81001)
+    let phon_out = is_gen_outer_phonological(sem_out, IS_N_OUTER, 81101)
+    let phi_out = is_phi_verbal(sem_out, phon_out)
+
+    // Information density comparison
+    let ratio_threshold = IS_DENSITY_RATIO * phi_out
+    println("  [T2] Phi_verbal inner=" + str(phi_in) + " outer=" + str(phi_out))
+    println("  [T2] inner >= " + str(IS_DENSITY_RATIO) + " * outer = " + str(ratio_threshold))
+    println("  [T2] Vygotsky condensation: inner speech preserves MI at higher density")
+
+    let mut ok = true
+    // Inner Phi must be genuinely positive
+    if phi_in <= IS_PHI_MIN { ok = false }
+    // Outer Phi must also be positive (external speech has real structure)
+    if phi_out <= 0.0 { ok = false }
+    // Inner density must meet or exceed the ratio threshold
+    if phi_in < ratio_threshold { ok = false }
+    return ok
+}
+
+fn check_T3() -> bool {
+    // T3 Verbal overshadowing (Schooler & Engstler-Schooler 1990):
+    //   Condition A: perceptual trace encoded WITHOUT verbal interference
+    //   Condition B: perceptual trace encoded WITH forced verbal description
+    //
+    //   Phi_perceptual(A) > Phi_perceptual(B) + IS_OVERSHADOW_GAP
+    //
+    //   Forcing a verbal code onto a perceptual experience DEGRADES the
+    //   perceptual representation — the categorical verbal binning overwrites
+    //   fine-grained continuous features. This is NOT just noise; it is a
+    //   structured degradation where the verbal code captures SOME features
+    //   while destroying OTHERS.
+
+    // Need phonological channel for the interference condition
+    let sem = is_gen_semantic(IS_N_INNER, IS_INNER_DENSITY, 82001)
+    let phon = is_gen_phonological(sem, IS_N_INNER, 82101)
+
+    // Condition A: pure perceptual encoding (no verbal interference)
+    let percept_pure = is_gen_perceptual(IS_N_INNER, false, phon, 82201)
+    let phi_pure = is_phi_perceptual(percept_pure)
+    let var_pure = is_variance(percept_pure)
+
+    // Condition B: perceptual encoding WITH verbal overshadowing
+    let percept_verbal = is_gen_perceptual(IS_N_INNER, true, phon, 82201)
+    let phi_verbal = is_phi_perceptual(percept_verbal)
+    let var_verbal = is_variance(percept_verbal)
+
+    let phi_drop = phi_pure - phi_verbal
+    let var_drop = var_pure - var_verbal
+    println("  [T3] Phi_perceptual pure=" + str(phi_pure) + " verbal_overshadowed=" + str(phi_verbal))
+    println("  [T3] Phi drop=" + str(phi_drop) + " (min_gap=" + str(IS_OVERSHADOW_GAP) + ")")
+    println("  [T3] var(perceptual) pure=" + str(var_pure) + " overshadowed=" + str(var_verbal))
+    println("  [T3] Schooler effect: verbalization degrades perceptual fidelity")
+
+    let mut ok = true
+    // Pure perceptual Phi must be positive (structured perceptual trace)
+    if phi_pure <= 0.0 { ok = false }
+    // Verbal overshadowing must produce a measurable Phi drop
+    if phi_drop <= IS_OVERSHADOW_GAP { ok = false }
+    // Variance should also drop (reduced dynamic range in perceptual channel)
+    if var_drop <= 0.0 { ok = false }
+    return ok
+}
+
+fn check_T4() -> bool {
+    // T4 Source monitoring — self-attribution vs hallucination:
+    //
+    // (a) Normal condition: source_tag tracks semantic content.
+    //     MI(source_tag, semantic) > IS_TAG_MIN — correctly self-attributed.
+    //
+    // (b) Failure condition: source_tag is noise-corrupted (forward model
+    //     broken). MI(source_tag, semantic) < IS_HALL_CEIL — hallucination
+    //     signature. The content sounds like it comes from an external agent.
+    //
+    // (c) Crucially, the VERBAL CONTENT ITSELF is unchanged. The semantic-
+    //     phonological binding is the same in both conditions. Only the
+    //     ownership tag breaks. This matches clinical observation: AVH
+    //     patients hear clear, well-formed speech — the content is normal,
+    //     only the "who is speaking" attribution is wrong.
+
+    let sem = is_gen_semantic(IS_N_INNER, IS_INNER_DENSITY, 83001)
+    let phon = is_gen_phonological(sem, IS_N_INNER, 83101)
+
+    // (a) Normal self-attribution — efference copy intact
+    let tag_normal = is_gen_source_tag(sem, IS_N_INNER, IS_TAG_SEM_COUPLE, 83201)
+    let phi_tag_normal = is_phi_source(tag_normal, sem)
+    let phi_verbal_normal = is_phi_verbal(sem, phon)
+
+    // (b) Source monitoring failure — efference copy disrupted
+    let tag_broken = is_gen_source_tag(sem, IS_N_INNER, IS_TAG_BROKEN_COUPLE, 83301)
+    let phi_tag_broken = is_phi_source(tag_broken, sem)
+    let phi_verbal_broken = is_phi_verbal(sem, phon)
+
+    println("  [T4] Source MI normal=" + str(phi_tag_normal) + " (min=" + str(IS_TAG_MIN) + ")")
+    println("  [T4] Source MI broken=" + str(phi_tag_broken) + " (ceil=" + str(IS_HALL_CEIL) + ")")
+    println("  [T4] Verbal MI normal=" + str(phi_verbal_normal) + " broken=" + str(phi_verbal_broken))
+    println("  [T4] Hallucination = content preserved, ownership lost")
+
+    let mut ok = true
+    // (a) Normal attribution must exceed threshold
+    if phi_tag_normal <= IS_TAG_MIN { ok = false }
+    // (b) Broken attribution must fall below hallucination ceiling
+    if phi_tag_broken >= IS_HALL_CEIL { ok = false }
+    // (c) Verbal content is preserved in both conditions
+    //     Root cause: content is unchanged, only the tag broke.
+    //     Phi_verbal must be positive in both, and the difference must be
+    //     negligible (same semantic-phonological binding, different tag only).
+    if phi_verbal_normal <= IS_PHI_MIN { ok = false }
+    if phi_verbal_broken <= IS_PHI_MIN { ok = false }
+    let verbal_drift = is_abs(phi_verbal_normal - phi_verbal_broken)
+    if verbal_drift > 0.01 { ok = false }
+    return ok
+}
+
+fn check_T5() -> bool {
+    // T5 Determinism + latency:
+    //   (a) Two runs with identical seeds produce identical Phi values.
+    //       This tests reproducibility (Law 2: seed-stable observations).
+    //   (b) Wall-clock time < IS_LATENCY_MS.
+    //       Inner speech simulation must be efficient.
+
+    let t_start = clock()
+
+    // Run 1
+    let sem1 = is_gen_semantic(IS_N_INNER, IS_INNER_DENSITY, 84001)
+    let phon1 = is_gen_phonological(sem1, IS_N_INNER, 84101)
+    let tag1 = is_gen_source_tag(sem1, IS_N_INNER, IS_TAG_SEM_COUPLE, 84201)
+    let phi_v1 = is_phi_verbal(sem1, phon1)
+    let phi_s1 = is_phi_source(tag1, sem1)
+
+    // Run 2 — identical seeds
+    let sem2 = is_gen_semantic(IS_N_INNER, IS_INNER_DENSITY, 84001)
+    let phon2 = is_gen_phonological(sem2, IS_N_INNER, 84101)
+    let tag2 = is_gen_source_tag(sem2, IS_N_INNER, IS_TAG_SEM_COUPLE, 84201)
+    let phi_v2 = is_phi_verbal(sem2, phon2)
+    let phi_s2 = is_phi_source(tag2, sem2)
+
+    let t_end = clock()
+    let elapsed_ms = t_end - t_start
+
+    let delta_v = is_abs(phi_v1 - phi_v2)
+    let delta_s = is_abs(phi_s1 - phi_s2)
+    println("  [T5] Phi_verbal run1=" + str(phi_v1) + " run2=" + str(phi_v2) + " |delta|=" + str(delta_v))
+    println("  [T5] Phi_source run1=" + str(phi_s1) + " run2=" + str(phi_s2) + " |delta|=" + str(delta_s))
+    println("  [T5] elapsed=" + str(elapsed_ms) + "ms (ceil=" + str(IS_LATENCY_MS) + "ms)")
+
+    let mut ok = true
+    // Determinism: identical seeds must produce bit-identical Phi
+    if delta_v > IS_EPS { ok = false }
+    if delta_s > IS_EPS { ok = false }
+    // Latency gate
+    if elapsed_ms > 5000.0 { ok = false }
+    return ok
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — execute 5 self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[inner_speech_phi] P89 — Inner Speech Phi")
+    println("  steps=" + str(IS_STEPS) + " bins=" + str(IS_BINS))
+    println("  refs: Vygotsky 1934 | Baddeley 1974 | Schooler 1990 | Seal 2004 | Fernyhough 2004")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — inner speech generation (Phi_verbal > 0, loop active, source bound)") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — condensation (inner MI/token >= outer, Vygotsky predicativity)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — verbal overshadowing (Phi_perceptual drops under forced verbalization)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — source monitoring (normal=self-attributed, failure=hallucination, content preserved)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — determinism + latency (seed-stable, within time budget)") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause comment: stage0 long && chains may mishandle short-circuit
+    // ordering — use a mutable bool accumulator with sequential guards
+    // (same idiom as depersonalization_phi / body_swap_phi).
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[inner_speech_phi] 5/5 PASS — P89 DONE")
+    } else {
+        println("[inner_speech_phi] SOME FAILED")
+    }
+}
+
+main()

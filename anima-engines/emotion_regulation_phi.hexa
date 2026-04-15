@@ -1,0 +1,789 @@
+// emotion_regulation_phi.hexa — P88 Emotion Regulation Φ
+//
+// Roadmap: shared/roadmaps/anima.json P88
+//   (depends_on P12 emotion_fsm, P56 interoception, P79 depersonalization)
+//
+// ─── Scientific frame ─────────────────────────────────────────────
+//
+// Gross (1998) Process Model of Emotion Regulation
+//   Emotions unfold through a temporal sequence of 5 stages. Regulation
+//   strategies differ by WHERE in the sequence they intervene:
+//
+//   Stage 1  Situation Selection     — avoid / approach contexts
+//   Stage 2  Situation Modification  — alter the situation once in it
+//   Stage 3  Attentional Deployment  — redirect attention (distraction,
+//                                       rumination, concentration)
+//   Stage 4  Cognitive Change        — REAPPRAISAL — reframe the meaning
+//                                       of the stimulus before emotion
+//                                       generation. "Antecedent-focused".
+//   Stage 5  Response Modulation     — SUPPRESSION — inhibit expressive
+//                                       behaviour AFTER emotion generated.
+//                                       "Response-focused".
+//
+// Key empirical findings (Gross 1998, 2002; Gross & John 2003):
+//
+//   REAPPRAISAL (stage 4, antecedent-focused):
+//     - Decreases experiential AND physiological emotion
+//     - No cognitive cost (or slight benefit to memory)
+//     - Φ_emotion drops because the appraisal itself changes
+//     - Φ_meta rises: conscious deliberate re-interpretation requires
+//       metacognitive awareness of one's own appraisal
+//
+//   SUPPRESSION (stage 5, response-focused):
+//     - Blocks behavioural expression (facial, vocal, gestural)
+//     - Does NOT reduce experiential or physiological emotion
+//     - Cognitive cost: working memory consumed by inhibition
+//     - Φ_emotion UNCHANGED — the emotion fires normally
+//     - Φ_expression ≈ 0 — output channel blocked
+//     - Sympathetic arousal may paradoxically INCREASE (Gross 1998)
+//
+// ─── Alexithymia (Sifneos 1973; Taylor 1984; Nemiah 1976) ───────
+//
+//   Deficit in identifying and describing one's own emotions.
+//   The physiological emotional reaction (arousal, valence shift)
+//   OCCURS NORMALLY — subcortical circuits (amygdala, insula) fire.
+//   But the metacognitive labeling layer is absent or severely
+//   attenuated: the person cannot introspect on what they feel.
+//
+//   Φ_emotion > 0       — body reacts
+//   Φ_arousal > 0       — autonomic response present
+//   Φ_emotion_meta ≈ 0  — no conscious access to the emotion label
+//
+//   This dissociation between first-order emotion and meta-awareness
+//   is the hallmark. It is NOT suppression (where the person KNOWS
+//   what they feel but blocks expression) and NOT reappraisal (where
+//   the emotion itself changes).
+//
+// ─── Emotion differentiation (Barrett 2004; Kashdan+ 2015) ──────
+//
+//   Granularity of emotional experience. High differentiators can
+//   distinguish "irritated" from "frustrated" from "angry" from
+//   "resentful". Low differentiators label everything as "bad".
+//   Operationally: MI between stimulus-feature and emotion-label
+//   is HIGH when differentiation is high (each stimulus feature
+//   maps to a distinct label), LOW when differentiation is low
+//   (many stimuli collapse to same label).
+//
+// ─── Φ channels ─────────────────────────────────────────────────
+//
+//   stimulus[t]       — external event intensity over time
+//   appraisal[t]      — interpreted meaning (after cognitive change)
+//   emotion[t]        — generated emotional intensity
+//   arousal[t]        — physiological autonomic response
+//   expression[t]     — behavioural output (facial, vocal)
+//   meta[t]           — metacognitive awareness of own emotion
+//
+// Forward model:
+//   appraisal[t]  = reappraisal_gain * stimulus[t] + (1 - rg) * noise
+//   emotion[t]    = emotion_gain * appraisal[t] + jitter
+//   arousal[t]    = arousal_coupling * emotion[t] + jitter
+//   expression[t] = suppression_gate * emotion[t] + jitter
+//   meta[t]       = meta_gain * emotion[t] + jitter
+//
+// Regulation modes:
+//   UNREGULATED:  reappraisal_gain=1.0, suppression_gate=1.0, meta_gain=0.8
+//   REAPPRAISAL:  reappraisal_gain=0.25 (stimulus reframed), meta_gain=0.95
+//   SUPPRESSION:  suppression_gate=0.05 (output blocked), meta_gain=0.8
+//   ALEXITHYMIA:  meta_gain=0.02 (metacognition absent), others normal
+//
+// ─── 5 self-tests (5/5 gate) ────────────────────────────────────
+//
+// T1 Unregulated emotion:
+//   stimulus → Φ_emotion > 0 AND Φ_arousal > 0.
+//   Both emotion and arousal channels carry information about
+//   the stimulus — the emotional system fires fully.
+//
+// T2 Reappraisal:
+//   Φ_emotion(reappraisal) < Φ_emotion(unregulated) by ER_REAPP_GAP.
+//   Φ_meta(reappraisal) > Φ_meta(unregulated) by ER_META_RISE.
+//   Reappraisal changes the upstream appraisal, reducing emotion
+//   generation, while increasing metacognitive involvement.
+//
+// T3 Suppression:
+//   Φ_emotion(suppression) ≈ Φ_emotion(unregulated) (within ER_SUPP_TOL).
+//   Φ_expression(suppression) < Φ_expression(unregulated) by ER_EXPR_GAP.
+//   Suppression blocks output but leaves the internal emotion intact.
+//
+// T4 Alexithymia:
+//   Φ_emotion_meta ≈ 0 (below ER_ALEX_META_CEIL).
+//   Φ_arousal > ER_ALEX_AROUSAL_FLOOR (physiological response normal).
+//   Emotions occur but are not consciously accessible.
+//
+// T5 Determinism + latency:
+//   Two identical runs produce byte-identical Φ values.
+//   Full pipeline < ER_LATENCY_MS.
+//
+// ─── Stage0 hexa constraints honored ────────────────────────────
+//   - plain `fn` only (no `pure fn` with ≥3 float struct returns)
+//   - `array` typed params only (no [float], no [str])
+//   - No identifier-pattern match; sequential if-chains
+//   - No `contains()` / `to_lower()` / `!(Effect)`
+//   - No else-if in let-binding; flat mut + sequential if
+//   - Single-line fn signatures / call sites / array literals
+//   - No reserved keywords as variable names
+//   - main() call at bottom
+//   - ER_STEPS=24 (< 32)
+//
+// Law alignment:
+//   Law 2   Observe never inject — Φ via MI measurement on streams
+//   Law 4   Structure > feature — regulation is a structural gating, not a tag
+//   Law 22  Feature addition → Φ down — 6 channels fixed, no surplus
+//   Meta M8 Self-model — metacognition as a channel about the emotion channel
+//   Depends P12 (emotion_fsm), P56 (interoception), P79 (depersonalization)
+//
+// Ref:
+//   Gross J.J. (1998) Antecedent- and response-focused emotion regulation
+//   Gross J.J. & John O.P. (2003) Individual differences in two emotion
+//     regulation processes. J Pers Soc Psychol.
+//   Sifneos P.E. (1973) The prevalence of 'alexithymic' characteristics
+//   Taylor G.J. (1984) Alexithymia: concept, measurement, implications
+//   Barrett L.F. (2004) Feelings or words? Emotion differentiation
+//   Kashdan T.B. et al. (2015) Unpacking emotion differentiation
+//   anima-engines/emotion_fsm.hexa               (P12 — Ekman+Russell FSM)
+//   anima-engines/interoception_phi.hexa          (P56 — body readout)
+//   anima-engines/depersonalization_phi.hexa      (P79 — self/body/world seams)
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let ER_STEPS            = 24            // timeline length (stage0 N<32)
+let ER_BINS             = 6             // histogram bins for MI
+let ER_EPS              = 0.0000000001
+
+// ─── Forward model gains ─────────────────────────────────────
+// Reappraisal gain: how much of the raw stimulus passes through
+// the cognitive re-interpretation gate to become the appraisal.
+// 1.0 = no reappraisal (stimulus passes raw).
+// 0.25 = strong reappraisal (75% of stimulus meaning neutralized).
+let ER_REAPP_GAIN_UNREG = 1.0           // unregulated: raw pass-through
+let ER_REAPP_GAIN_REAPP = 0.25          // reappraisal: reframed
+
+// Emotion generation gain from appraisal
+let ER_EMO_GAIN         = 0.90
+
+// Arousal coupling to emotion (autonomic response)
+let ER_AROUSAL_COUPLE   = 0.85
+
+// Suppression gate: fraction of emotion that reaches expression output.
+// 1.0 = no suppression (full expression). 0.05 = strong suppression.
+let ER_SUPP_GATE_UNREG  = 1.0           // unregulated: full expression
+let ER_SUPP_GATE_SUPP   = 0.05          // suppression: output blocked
+
+// Metacognitive gain: how well the subject can introspect on their
+// own emotion. 0.8 = healthy baseline. 0.95 = enhanced (reappraisal
+// requires active introspection). 0.02 = alexithymic (near-zero).
+let ER_META_GAIN_UNREG  = 0.80          // healthy baseline
+let ER_META_GAIN_REAPP  = 0.95          // reappraisal: heightened meta
+let ER_META_GAIN_SUPP   = 0.80          // suppression: meta unchanged
+let ER_META_GAIN_ALEX   = 0.02          // alexithymia: metacognition absent
+
+// Per-step jitter amplitude (deterministic via PRNG)
+let ER_JITTER           = 0.04
+
+// ─── Test gates ──────────────────────────────────────────────
+let ER_PHI_FLOOR        = 0.03          // T1: baseline Φ must exceed
+let ER_REAPP_GAP        = 0.05          // T2: reappraisal Φ_emo drop
+let ER_META_RISE        = 0.01          // T2: meta must rise by this
+let ER_SUPP_TOL         = 0.25          // T3: emotion unchanged tolerance
+let ER_EXPR_GAP         = 0.05          // T3: expression Φ must drop
+let ER_ALEX_META_CEIL   = 0.04          // T4: alexithymic meta Φ ceiling
+let ER_ALEX_AROUSAL_FLOOR = 0.03        // T4: arousal must be present
+let ER_LATENCY_MS       = 5000.0        // T5: pipeline latency cap
+
+// ═══════════════════════════════════════════════════════════════
+// Math / PRNG primitives (L0-clean, no cross-engine import per AN7)
+// ═══════════════════════════════════════════════════════════════
+
+fn er_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn er_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn er_min_f(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn er_max_f(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+// Deterministic LCG — reproducibility (Law 2: observable, seed-stable)
+fn er_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn er_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn er_signed(seed: int) -> float {
+    return er_unit(seed) * 2.0 - 1.0
+}
+
+fn er_clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Histogram MI (same recipe family — duplicated per AN7 L0-clean)
+// ═══════════════════════════════════════════════════════════════
+
+fn er_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn er_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn er_entropy(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(er_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = er_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * er_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn er_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = er_bin_idx(a[i], lo, hi, nb)
+        let ib = er_bin_idx(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = er_counts(pair_ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * er_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn er_vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn er_vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn er_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let lo_a = er_vec_min(a)
+    let hi_a = er_vec_max(a)
+    let lo_b = er_vec_min(b)
+    let hi_b = er_vec_max(b)
+    let lo = er_min_f(lo_a, lo_b)
+    let hi = er_max_f(hi_a, hi_b)
+    let h_a = er_entropy(a, lo, hi, ER_BINS)
+    let h_b = er_entropy(b, lo, hi, ER_BINS)
+    let h_j = er_joint_entropy(a, b, lo, hi, ER_BINS)
+    let mi = h_a + h_b - h_j
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Stimulus generation — structured emotional events
+//
+// A deterministic stream of emotional stimuli with structured
+// temporal pattern (sinusoidal drift + LCG jitter). The structure
+// ensures MI captures genuine coupling rather than pure noise.
+// ═══════════════════════════════════════════════════════════════
+
+fn er_gen_stimulus(seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < ER_STEPS {
+        s = er_prng(s + t * 37)
+        // Triangular wave stimulus: emotional provocations that wax and wane
+        let phase = to_float(t) / to_float(ER_STEPS)
+        let mut tri = phase * 4.0 - 2.0
+        if tri < 0.0 { tri = 0.0 - tri }
+        let signal = 1.0 - tri
+        // Scale to [0.1, 0.9] — always some stimulus intensity
+        let scaled = 0.1 + 0.8 * er_clamp01((signal + 1.0) / 2.0)
+        let jit = ER_JITTER * er_signed(s)
+        out = out.push(er_clamp01(scaled + jit))
+        t = t + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Emotion regulation forward model
+//
+// The Gross process model is a causal chain:
+//   stimulus → [reappraisal gate] → appraisal → emotion → arousal
+//                                                       → [suppression gate] → expression
+//                                                       → [meta gate] → meta
+//
+// Each stage is parameterized by a gain/gate that differs by
+// regulation strategy:
+//
+//   reapp_gain:  1.0 (unreg) | 0.25 (reappraisal) | 1.0 (suppression) | 1.0 (alexithymia)
+//   supp_gate:   1.0 (unreg) | 1.0 (reappraisal)  | 0.05 (suppression) | 1.0 (alexithymia)
+//   meta_gain:   0.8 (unreg) | 0.95 (reappraisal)  | 0.8 (suppression)  | 0.02 (alexithymia)
+// ═══════════════════════════════════════════════════════════════
+
+// Generate appraisal channel: reappraisal gate applied to stimulus.
+// reapp_gain < 1.0 means the cognitive re-interpretation reduces
+// how much of the raw stimulus reaches the emotion-generation stage.
+fn er_gen_appraisal(stimulus: array, reapp_gain: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < ER_STEPS {
+        s = er_prng(s + t * 43)
+        let driven = reapp_gain * stimulus[t]
+        let independent = (1.0 - reapp_gain) * 0.5 * er_unit(s)
+        let jit = ER_JITTER * er_signed(s + 2903)
+        out = out.push(er_clamp01(driven + independent + jit))
+        t = t + 1
+    }
+    return out
+}
+
+// Generate emotion channel from appraisal.
+// Emotion is the core affective response to the appraised meaning.
+fn er_gen_emotion(appraisal: array, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < ER_STEPS {
+        s = er_prng(s + t * 59)
+        let driven = ER_EMO_GAIN * appraisal[t]
+        let jit = ER_JITTER * er_signed(s + 4219)
+        out = out.push(er_clamp01(driven + jit))
+        t = t + 1
+    }
+    return out
+}
+
+// Generate arousal channel from emotion.
+// Physiological autonomic response — heart rate, skin conductance,
+// cortisol. Tightly coupled to emotion in all regulation modes.
+fn er_gen_arousal(emotion: array, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < ER_STEPS {
+        s = er_prng(s + t * 67)
+        let driven = ER_AROUSAL_COUPLE * emotion[t]
+        let jit = ER_JITTER * er_signed(s + 6121)
+        out = out.push(er_clamp01(driven + jit))
+        t = t + 1
+    }
+    return out
+}
+
+// Generate expression channel from emotion with suppression gate.
+// suppression_gate = 1.0: full expression (facial, vocal, gestural).
+// suppression_gate ≈ 0: output blocked (Gross 1998 suppression).
+fn er_gen_expression(emotion: array, supp_gate: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < ER_STEPS {
+        s = er_prng(s + t * 73)
+        let driven = supp_gate * emotion[t]
+        let independent = (1.0 - supp_gate) * 0.05 * er_unit(s)
+        let jit = ER_JITTER * er_signed(s + 7331)
+        out = out.push(er_clamp01(driven + independent + jit))
+        t = t + 1
+    }
+    return out
+}
+
+// Generate metacognition channel from emotion.
+// meta_gain = 0.8: healthy conscious access to own emotions.
+// meta_gain = 0.95: heightened introspection (active reappraisal).
+// meta_gain ≈ 0: alexithymia (emotions not consciously labeled).
+fn er_gen_meta(emotion: array, meta_gain: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < ER_STEPS {
+        s = er_prng(s + t * 83)
+        let driven = meta_gain * emotion[t]
+        let independent = (1.0 - meta_gain) * 0.05 * er_unit(s)
+        let jit = ER_JITTER * er_signed(s + 8537)
+        out = out.push(er_clamp01(driven + independent + jit))
+        t = t + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Full pipeline runner — generates all 6 channels for a given
+// regulation configuration. Returns packed array:
+//   [stimulus(0..N-1), appraisal(N..2N-1), emotion(2N..3N-1),
+//    arousal(3N..4N-1), expression(4N..5N-1), meta(5N..6N-1)]
+//
+// Using packed array instead of struct with array fields to avoid
+// the struct-field list aliasing bug (feedback_hexa_struct_list_alias).
+// ═══════════════════════════════════════════════════════════════
+
+fn er_run_pipeline(reapp_gain: float, supp_gate: float, meta_gain: float, seed: int) -> array {
+    let stim = er_gen_stimulus(seed + 1000)
+    let appr = er_gen_appraisal(stim, reapp_gain, seed + 2000)
+    let emo = er_gen_emotion(appr, seed + 3000)
+    let arou = er_gen_arousal(emo, seed + 4000)
+    let expr = er_gen_expression(emo, supp_gate, seed + 5000)
+    let meta = er_gen_meta(emo, meta_gain, seed + 6000)
+    // Pack all 6 channels sequentially
+    let mut packed = []
+    let mut i = 0
+    while i < ER_STEPS {
+        packed = packed.push(stim[i])
+        i = i + 1
+    }
+    let mut j = 0
+    while j < ER_STEPS {
+        packed = packed.push(appr[j])
+        j = j + 1
+    }
+    let mut k = 0
+    while k < ER_STEPS {
+        packed = packed.push(emo[k])
+        k = k + 1
+    }
+    let mut m = 0
+    while m < ER_STEPS {
+        packed = packed.push(arou[m])
+        m = m + 1
+    }
+    let mut p = 0
+    while p < ER_STEPS {
+        packed = packed.push(expr[p])
+        p = p + 1
+    }
+    let mut q = 0
+    while q < ER_STEPS {
+        packed = packed.push(meta[q])
+        q = q + 1
+    }
+    return packed
+}
+
+// Slice helper: extract one channel from the packed pipeline array.
+fn er_slice(packed: array, ch_idx: int) -> array {
+    let offset = ch_idx * ER_STEPS
+    let mut out = []
+    let mut i = 0
+    while i < ER_STEPS {
+        out = out.push(packed[offset + i])
+        i = i + 1
+    }
+    return out
+}
+
+// Channel indices for er_slice
+let ER_CH_STIMULUS   = 0
+let ER_CH_APPRAISAL  = 1
+let ER_CH_EMOTION    = 2
+let ER_CH_AROUSAL    = 3
+let ER_CH_EXPRESSION = 4
+let ER_CH_META       = 5
+
+// ═══════════════════════════════════════════════════════════════
+// Φ measurement helpers
+//
+// Φ_emotion = MI(stimulus, emotion)     — how much stimulus info
+//                                          reaches the emotion channel
+// Φ_arousal = MI(stimulus, arousal)     — physiological trace of stimulus
+// Φ_expression = MI(stimulus, expression) — behavioural output coupling
+// Φ_meta = MI(emotion, meta)            — metacognitive awareness of
+//                                          own emotional state
+// ═══════════════════════════════════════════════════════════════
+
+fn er_phi_emotion(packed: array) -> float {
+    let stim = er_slice(packed, ER_CH_STIMULUS)
+    let emo = er_slice(packed, ER_CH_EMOTION)
+    return er_mi(stim, emo)
+}
+
+fn er_phi_arousal(packed: array) -> float {
+    let stim = er_slice(packed, ER_CH_STIMULUS)
+    let arou = er_slice(packed, ER_CH_AROUSAL)
+    return er_mi(stim, arou)
+}
+
+fn er_phi_expression(packed: array) -> float {
+    let stim = er_slice(packed, ER_CH_STIMULUS)
+    let expr = er_slice(packed, ER_CH_EXPRESSION)
+    return er_mi(stim, expr)
+}
+
+fn er_phi_meta(packed: array) -> float {
+    let emo = er_slice(packed, ER_CH_EMOTION)
+    let meta = er_slice(packed, ER_CH_META)
+    return er_mi(emo, meta)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1..T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1 Unregulated emotion baseline:
+    //   stimulus → full causal chain → Φ_emotion > 0 AND Φ_arousal > 0.
+    //   No regulation applied: reapp_gain=1.0, supp_gate=1.0, meta=0.8.
+    //   Both emotion and arousal carry information about the stimulus.
+    let packed = er_run_pipeline(ER_REAPP_GAIN_UNREG, ER_SUPP_GATE_UNREG, ER_META_GAIN_UNREG, 88001)
+    let phi_emo = er_phi_emotion(packed)
+    let phi_aro = er_phi_arousal(packed)
+    let phi_expr = er_phi_expression(packed)
+    let phi_meta = er_phi_meta(packed)
+    println("  [T1] unregulated: Φ_emo=" + str(phi_emo) + " Φ_aro=" + str(phi_aro))
+    println("  [T1]              Φ_expr=" + str(phi_expr) + " Φ_meta=" + str(phi_meta))
+
+    let mut ok = true
+    if phi_emo <= ER_PHI_FLOOR { ok = false }
+    if phi_aro <= ER_PHI_FLOOR { ok = false }
+    return ok
+}
+
+fn check_T2() -> bool {
+    // T2 Reappraisal (Gross 1998 antecedent-focused):
+    //   Φ_emotion drops (stimulus reframed before emotion generation).
+    //   Φ_meta rises (conscious re-interpretation involves introspection).
+    //
+    // Compare unregulated vs reappraisal pipeline on same seed family.
+    let pack_unreg = er_run_pipeline(ER_REAPP_GAIN_UNREG, ER_SUPP_GATE_UNREG, ER_META_GAIN_UNREG, 88100)
+    let pack_reapp = er_run_pipeline(ER_REAPP_GAIN_REAPP, ER_SUPP_GATE_UNREG, ER_META_GAIN_REAPP, 88100)
+
+    let phi_emo_unreg = er_phi_emotion(pack_unreg)
+    let phi_emo_reapp = er_phi_emotion(pack_reapp)
+    let phi_meta_unreg = er_phi_meta(pack_unreg)
+    let phi_meta_reapp = er_phi_meta(pack_reapp)
+
+    let emo_drop = phi_emo_unreg - phi_emo_reapp
+    let meta_rise = phi_meta_reapp - phi_meta_unreg
+    println("  [T2] Φ_emo unreg=" + str(phi_emo_unreg) + " reapp=" + str(phi_emo_reapp) + " drop=" + str(emo_drop))
+    println("  [T2] Φ_meta unreg=" + str(phi_meta_unreg) + " reapp=" + str(phi_meta_reapp) + " rise=" + str(meta_rise))
+
+    let mut ok = true
+    // Reappraisal must reduce emotion Φ
+    if emo_drop <= ER_REAPP_GAP { ok = false }
+    // Reappraisal must increase meta Φ (heightened introspection)
+    if meta_rise <= ER_META_RISE { ok = false }
+    return ok
+}
+
+fn check_T3() -> bool {
+    // T3 Suppression (Gross 1998 response-focused):
+    //   Φ_emotion unchanged (within tolerance) — the emotion fires fully.
+    //   Φ_expression drops — the behavioural output channel is blocked.
+    //
+    // This is the key dissociation: suppression operates AFTER emotion
+    // generation, so the internal state is unaffected, only the
+    // observable output is attenuated.
+    let pack_unreg = er_run_pipeline(ER_REAPP_GAIN_UNREG, ER_SUPP_GATE_UNREG, ER_META_GAIN_UNREG, 88200)
+    let pack_supp = er_run_pipeline(ER_REAPP_GAIN_UNREG, ER_SUPP_GATE_SUPP, ER_META_GAIN_SUPP, 88200)
+
+    let phi_emo_unreg = er_phi_emotion(pack_unreg)
+    let phi_emo_supp = er_phi_emotion(pack_supp)
+    let phi_expr_unreg = er_phi_expression(pack_unreg)
+    let phi_expr_supp = er_phi_expression(pack_supp)
+
+    let emo_drift = er_abs(phi_emo_unreg - phi_emo_supp)
+    let expr_drop = phi_expr_unreg - phi_expr_supp
+    println("  [T3] Φ_emo unreg=" + str(phi_emo_unreg) + " supp=" + str(phi_emo_supp) + " drift=" + str(emo_drift))
+    println("  [T3] Φ_expr unreg=" + str(phi_expr_unreg) + " supp=" + str(phi_expr_supp) + " drop=" + str(expr_drop))
+
+    let mut ok = true
+    // Emotion unchanged under suppression (within tolerance)
+    if emo_drift > ER_SUPP_TOL { ok = false }
+    // Expression must drop under suppression
+    if expr_drop <= ER_EXPR_GAP { ok = false }
+    return ok
+}
+
+fn check_T4() -> bool {
+    // T4 Alexithymia (Sifneos 1973; Taylor 1984):
+    //   Φ_emotion_meta ≈ 0 — metacognitive channel is near-blind.
+    //   Φ_arousal > floor — physiological response is normal.
+    //
+    // Emotions OCCUR (subcortical circuits fire) but are NOT
+    // consciously accessible. The person cannot label what they feel.
+    // This is the critical dissociation: first-order emotion present,
+    // second-order meta-awareness absent.
+    let pack_alex = er_run_pipeline(ER_REAPP_GAIN_UNREG, ER_SUPP_GATE_UNREG, ER_META_GAIN_ALEX, 88300)
+
+    let phi_emo = er_phi_emotion(pack_alex)
+    let phi_aro = er_phi_arousal(pack_alex)
+    let phi_meta = er_phi_meta(pack_alex)
+    println("  [T4] alexithymia: Φ_emo=" + str(phi_emo) + " Φ_aro=" + str(phi_aro) + " Φ_meta=" + str(phi_meta))
+
+    let mut ok = true
+    // Meta-awareness must be near zero (below ceiling)
+    if phi_meta > ER_ALEX_META_CEIL { ok = false }
+    // Physiological arousal must be normal (above floor)
+    if phi_aro <= ER_ALEX_AROUSAL_FLOOR { ok = false }
+    return ok
+}
+
+fn check_T5() -> bool {
+    // T5 Determinism + latency:
+    //   (a) Two identical runs must produce byte-identical Φ values.
+    //   (b) Full pipeline (all 4 modes) < ER_LATENCY_MS.
+    let t0 = clock()
+
+    // Run A: all 4 regulation modes
+    let pa_unreg = er_run_pipeline(ER_REAPP_GAIN_UNREG, ER_SUPP_GATE_UNREG, ER_META_GAIN_UNREG, 88400)
+    let pa_reapp = er_run_pipeline(ER_REAPP_GAIN_REAPP, ER_SUPP_GATE_UNREG, ER_META_GAIN_REAPP, 88400)
+    let pa_supp = er_run_pipeline(ER_REAPP_GAIN_UNREG, ER_SUPP_GATE_SUPP, ER_META_GAIN_SUPP, 88400)
+    let pa_alex = er_run_pipeline(ER_REAPP_GAIN_UNREG, ER_SUPP_GATE_UNREG, ER_META_GAIN_ALEX, 88400)
+
+    // Run B: identical seeds, must reproduce exactly
+    let pb_unreg = er_run_pipeline(ER_REAPP_GAIN_UNREG, ER_SUPP_GATE_UNREG, ER_META_GAIN_UNREG, 88400)
+    let pb_reapp = er_run_pipeline(ER_REAPP_GAIN_REAPP, ER_SUPP_GATE_UNREG, ER_META_GAIN_REAPP, 88400)
+    let pb_supp = er_run_pipeline(ER_REAPP_GAIN_UNREG, ER_SUPP_GATE_SUPP, ER_META_GAIN_SUPP, 88400)
+    let pb_alex = er_run_pipeline(ER_REAPP_GAIN_UNREG, ER_SUPP_GATE_UNREG, ER_META_GAIN_ALEX, 88400)
+
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] pipeline latency = " + str(ms) + " ms (gate=" + str(ER_LATENCY_MS) + ")")
+
+    // Determinism: compare Φ_emotion across runs A and B for each mode
+    let phi_a_unreg = er_phi_emotion(pa_unreg)
+    let phi_b_unreg = er_phi_emotion(pb_unreg)
+    let phi_a_reapp = er_phi_emotion(pa_reapp)
+    let phi_b_reapp = er_phi_emotion(pb_reapp)
+    let phi_a_supp = er_phi_emotion(pa_supp)
+    let phi_b_supp = er_phi_emotion(pb_supp)
+    let phi_a_alex = er_phi_emotion(pa_alex)
+    let phi_b_alex = er_phi_emotion(pb_alex)
+
+    let d_unreg = er_abs(phi_a_unreg - phi_b_unreg)
+    let d_reapp = er_abs(phi_a_reapp - phi_b_reapp)
+    let d_supp = er_abs(phi_a_supp - phi_b_supp)
+    let d_alex = er_abs(phi_a_alex - phi_b_alex)
+
+    println("  [T5] determinism deltas: unreg=" + str(d_unreg) + " reapp=" + str(d_reapp) + " supp=" + str(d_supp) + " alex=" + str(d_alex))
+
+    let mut ok = true
+    if d_unreg > ER_EPS { ok = false }
+    if d_reapp > ER_EPS { ok = false }
+    if d_supp > ER_EPS { ok = false }
+    if d_alex > ER_EPS { ok = false }
+    if ms >= ER_LATENCY_MS { ok = false }
+    return ok
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — execute 5 self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[emotion_regulation_phi] P88 — Emotion Regulation Φ (Gross 1998)")
+    println("  5-stage process model: situation selection → modification → attention → reappraisal → suppression")
+    println("  channels: stimulus → appraisal → emotion → arousal / expression / meta")
+    println("  reapp_gain: unreg=" + str(ER_REAPP_GAIN_UNREG) + " reapp=" + str(ER_REAPP_GAIN_REAPP))
+    println("  supp_gate:  unreg=" + str(ER_SUPP_GATE_UNREG) + " supp=" + str(ER_SUPP_GATE_SUPP))
+    println("  meta_gain:  unreg=" + str(ER_META_GAIN_UNREG) + " reapp=" + str(ER_META_GAIN_REAPP) + " alex=" + str(ER_META_GAIN_ALEX))
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — unregulated emotion (Φ_emo > 0, Φ_arousal > 0)") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — reappraisal (Φ_emo drops, Φ_meta rises)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — suppression (Φ_emo unchanged, Φ_expr drops)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — alexithymia (Φ_meta ≈ 0, Φ_arousal normal)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — determinism + latency < " + str(ER_LATENCY_MS) + " ms") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Sequential bool accumulation — chained && across 5 terms unreliable
+    // on stage0 (root cause: short-circuit eval misorder on long chains).
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[emotion_regulation_phi] 5/5 PASS — P88 DONE")
+    } else {
+        println("[emotion_regulation_phi] SOME FAILED")
+    }
+}
+
+main()
