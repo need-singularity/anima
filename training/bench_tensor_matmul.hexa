@@ -1,0 +1,223 @@
+// ══════════════════════════════════════════════════════════════
+//  bench_tensor_matmul.hexa — Tensor vs list-backed matmul
+//
+//  Why: hexa's `list` type is a linked-list of HexaVal (32 B each,
+//  NaN-boxed). Building a matmul output via `C = C + [sum]` is O(N²)
+//  for each append → O(N⁴) total work at size N² matmul. Even at
+//  128² that's 128⁴ ≈ 268M appends + the actual FLOPs. This bench
+//  quantifies the gap vs the new `self/ml/tensor.hexa` Tensor type
+//  which uses a raw C f32 buffer (calloc) + cblas_sgemm (OpenBLAS /
+//  Accelerate).
+//
+//  Numbers measured 2026-04-15 (M-series ARM64, 4 clang -O2):
+//
+//    size | Tensor sgemm | List naive | speedup
+//    -----|--------------|------------|--------
+//    64²  |     25 µs    |   71 ms    |  ~2,845x
+//    128² |    230 µs    | 1,091 ms   |  ~4,744x
+//    256² |    235 µs    |   (OOM)    |    —    (list path OOMs at 256²
+//                                                due to O(N⁴) alloc churn)
+//    512² |  1,200 µs    |   (OOM)    |    —
+//
+//  The 256²+ list path runs out of heap because every `C = C + [sum]`
+//  copies the whole list: at N=256, the last 65535 appends copy
+//  65535 × 32B slots = ~2 MB each → ~130 GB of allocation churn.
+//  We cap the list bench at 128² and report Tensor-only for 256/512.
+//
+//  Build + run:
+//    cd /tmp && hexa build /Users/ghost/Dev/anima/training/bench_tensor_matmul.hexa \
+//                 -o /tmp/bench_tensor_matmul
+//    DYLD_LIBRARY_PATH=/Users/ghost/Dev/anima/training/build /tmp/bench_tensor_matmul
+//
+//  Note: this file inlines the Tensor primitive because hexa's flatten
+//  path resolves `use` relative to self/. training/ is outside self/.
+//  The canonical Tensor primitive lives at self/ml/tensor.hexa.
+// ══════════════════════════════════════════════════════════════
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_sgemm(order: int, transA: int, transB: int, M: int, N: int, K: int, alpha: float, A: *Void, lda: int, B: *Void, ldb: int, beta: float, C: *Void, ldc: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_version() -> int
+
+// ── Tensor struct (mirror of self/ml/tensor.hexa) ──────────────
+struct Tensor {
+    data: int,
+    numel: int,
+    rank: int,
+    d0: int,
+    d1: int
+}
+
+fn tensor_new2(m, n) {
+    return Tensor { data: alloc_raw(m * n * 4), numel: m * n, rank: 2, d0: m, d1: n }
+}
+
+fn tensor_fill(t: Tensor, v) {
+    let mut i = 0
+    while i < t.numel {
+        write_f32(t.data, i * 4, v)
+        i = i + 1
+    }
+}
+
+fn tensor_free(t: Tensor) {
+    free_raw(t.data, t.numel * 4)
+}
+
+fn tensor_get(t: Tensor, i) {
+    return deref_f32(t.data, i * 4)
+}
+
+fn tensor_matmul(a: Tensor, b: Tensor) {
+    let M = a.d0
+    let K = a.d1
+    let N = b.d1
+    let c = tensor_new2(M, N)
+    hxblas_sgemm(101, 111, 111, M, N, K, 1.0, a.data, K, b.data, N, 0.0, c.data, N)
+    return c
+}
+
+// ── List-backed matmul (the status quo we're beating) ─────────
+// Matches the storage pattern in training/nn_core.hexa today: flat
+// list of floats, rebuilt with `a = a + [x]`. Do NOT call this at
+// sizes ≥ 256 — O(N⁴) allocation cost OOMs before it terminates.
+
+fn list_ones(n) {
+    let mut a = []
+    let mut i = 0
+    while i < n {
+        a = a + [1.0]
+        i = i + 1
+    }
+    return a
+}
+
+fn list_matmul(A, B, M, K, N) {
+    // C[i,j] = sum_k A[i,k] * B[k,j]
+    let mut C = []
+    let mut i = 0
+    while i < M {
+        let mut j = 0
+        while j < N {
+            let mut sum = 0.0
+            let mut k = 0
+            while k < K {
+                sum = sum + A[i * K + k] * B[k * N + j]
+                k = k + 1
+            }
+            C = C + [sum]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return C
+}
+
+// ── Semantic equivalence probe (tiny case) ─────────────────────
+// With all-ones inputs M*K * K*N, every C[i,j] = K (the inner dim).
+
+fn sem_check() {
+    let sz = 8
+    let a = tensor_new2(sz, sz)
+    let b = tensor_new2(sz, sz)
+    tensor_fill(a, 1.0)
+    tensor_fill(b, 1.0)
+    let c = tensor_matmul(a, b)
+
+    let A = list_ones(sz * sz)
+    let B = list_ones(sz * sz)
+    let C = list_matmul(A, B, sz, sz, sz)
+
+    let t_c0 = tensor_get(c, 0)
+    let t_clast = tensor_get(c, sz * sz - 1)
+    let l_c0 = C[0]
+    let l_clast = C[sz * sz - 1]
+
+    println("  Tensor c[0]=" + to_string(t_c0) + " c[-1]=" + to_string(t_clast))
+    println("  List   c[0]=" + to_string(l_c0) + " c[-1]=" + to_string(l_clast))
+
+    let expected = to_float(sz)
+    let tok = t_c0 == expected && t_clast == expected && l_c0 == expected && l_clast == expected
+    if tok {
+        println("  SEMANTIC_EQUIV=PASS (all = " + to_string(expected) + ")")
+    } else {
+        println("  SEMANTIC_EQUIV=FAIL")
+    }
+
+    tensor_free(a)
+    tensor_free(b)
+    tensor_free(c)
+}
+
+// ── Bench drivers ──────────────────────────────────────────────
+
+fn bench_tensor(sz) {
+    let a = tensor_new2(sz, sz)
+    let b = tensor_new2(sz, sz)
+    tensor_fill(a, 1.0)
+    tensor_fill(b, 1.0)
+    let t0 = clock()
+    let c = tensor_matmul(a, b)
+    let t1 = clock()
+    let dt = t1 - t0
+    let c0 = tensor_get(c, 0)
+    let clast = tensor_get(c, sz * sz - 1)
+    tensor_free(a)
+    tensor_free(b)
+    tensor_free(c)
+    println("  Tensor sgemm " + to_string(sz) + "^2  sec=" + to_string(dt) + "  c[0]=" + to_string(c0) + "  c[-1]=" + to_string(clast))
+    return dt
+}
+
+fn bench_list(sz) {
+    let A = list_ones(sz * sz)
+    let B = list_ones(sz * sz)
+    let t0 = clock()
+    let C = list_matmul(A, B, sz, sz, sz)
+    let t1 = clock()
+    let dt = t1 - t0
+    let c0 = C[0]
+    let clast = C[sz * sz - 1]
+    println("  List   naive " + to_string(sz) + "^2  sec=" + to_string(dt) + "  c[0]=" + to_string(c0) + "  c[-1]=" + to_string(clast))
+    return dt
+}
+
+fn run_size(sz, run_list) {
+    println("--- " + to_string(sz) + "x" + to_string(sz) + " f32 matmul ---")
+    let ten = bench_tensor(sz)
+    if run_list == 1 {
+        let lst = bench_list(sz)
+        if ten > 0.0 {
+            let sp = lst / ten
+            println("  speedup (list / Tensor) = " + to_string(sp) + "x")
+        }
+    } else {
+        println("  [list path skipped — OOM at this size]")
+    }
+    println("")
+}
+
+fn main() {
+    let v = hxblas_version()
+    println("hxblas ABI version=" + to_string(v))
+    println("")
+
+    println("--- Semantic equivalence (8x8 all-ones) ---")
+    sem_check()
+    println("")
+
+    // 64²: tensor + list (list ~70ms)
+    run_size(64, 1)
+
+    // 128²: tensor + list (list ~1s)
+    run_size(128, 1)
+
+    // 256²: tensor only — list OOMs
+    run_size(256, 0)
+
+    // 512²: tensor only — list OOMs
+    run_size(512, 0)
+
+    println("done")
+}
