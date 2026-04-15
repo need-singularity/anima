@@ -1,0 +1,236 @@
+// ═══════════════════════════════════════════════════════════════
+//  serving/consciousness_pipeline.hexa
+//
+//  D1+D3+D6 unified consciousness pipeline for inference.
+//
+//  Composes three Track D artifacts into a single callable:
+//    D1: phi_realtime_hook    — Φ_holo computation (<=100ms)
+//    D3: sampler_wrap         — Orch-OR quantum collapse sampling
+//    D6: phi_cache            — LRU precompute cache for phi scores
+//
+//  Public entry:
+//    conscious_sample(logits, hidden, prompt, style, state) -> ConsciousSampleResult
+//
+//  This is the drop-in replacement for the classical sampling path.
+//  When wired into http_server.hexa / api_server.hexa, it replaces:
+//    1. Bare softmax sampling → Orch-OR with phi-modulated perturbation
+//    2. Zero phi telemetry   → realtime phi_holo per response
+//    3. Recompute every call → LRU cache for repeated prompts
+//
+//  Pipeline flow:
+//    1. Check phi cache for (prompt, style) key
+//    2. If miss: compute phi_holo from hidden state
+//    3. Store phi in cache
+//    4. Sample next token via Orch-OR (with phi_holo_context = phi)
+//    5. Return (token, phi, cache_hit, sampling_metadata)
+//
+//  L0: NEW file. Does not modify any existing code.
+//  Cross-file use: imports sampler_wrap, phi_realtime_hook, phi_cache.
+//  Per feedback_hexa_runtime this may be fragile in stage0 — the
+//  test_consciousness_pipeline.hexa harness validates it works.
+// ═══════════════════════════════════════════════════════════════
+
+use "sampler_wrap"
+use "phi_realtime_hook"
+use "phi_cache"
+
+// ─── Pipeline state (carried across requests) ──────────────────
+struct ConsciousPipelineState {
+    phi_cache:    PhiCache,
+    last_phi:     float,
+    total_tokens: int,
+    orch_or_used: int,       // count of Orch-OR collapse events
+    cache_hits:   int,
+    cache_misses: int
+}
+
+fn pipeline_new() -> ConsciousPipelineState {
+    return ConsciousPipelineState {
+        phi_cache:    cache_new(PHI_CACHE_DEFAULT_MAX),
+        last_phi:     0.0,
+        total_tokens: 0,
+        orch_or_used: 0,
+        cache_hits:   0,
+        cache_misses: 0
+    }
+}
+
+// ─── Pipeline output (per-token) ───────────────────────────────
+struct ConsciousSampleResult {
+    token_id:         int,
+    phi_holo:         float,
+    phi_cache_hit:    int,      // 1 if phi served from cache
+    orch_or_used:     int,      // 1 if Orch-OR collapse took token
+    quantum_variance: float,
+    phi_latency_ms:   int,
+    state:            ConsciousPipelineState
+}
+
+// ─── Main entry: conscious_sample ──────────────────────────────
+// Call this once per generated token.
+//
+// Arguments:
+//   logits      — raw decoder output logits over vocab
+//   hidden      — hidden state vector (for phi computation)
+//   prompt      — request prompt (for cache key)
+//   style       — style/persona tag (for cache key)
+//   temperature — sampling temperature
+//   tension     — GWT tension signal
+//   seed        — deterministic seed (0 = non-deterministic)
+//   state       — pipeline state from previous call
+//
+// Returns ConsciousSampleResult with updated state.
+fn conscious_sample(
+    logits:      [float],
+    hidden:      [float],
+    prompt:      string,
+    style:       string,
+    temperature: float,
+    tension:     float,
+    seed:        int,
+    state:       ConsciousPipelineState
+) -> ConsciousSampleResult {
+    // ── Step 1+2: phi cache lookup / computation ──
+    let key = cache_key(prompt, style)
+    let lookup_result = cache_get_touch(state.phi_cache, key)
+    let mut current_cache = lookup_result.cache
+
+    let mut phi_val = 0.0
+    let mut phi_hit = 0
+    let mut phi_lat = 0
+
+    if lookup_result.lookup.found == 1 {
+        // Cache hit — use cached phi value
+        phi_val = lookup_result.lookup.phi
+        phi_hit = 1
+        phi_lat = 0
+    } else {
+        // Cache miss — compute phi from hidden state
+        let phi_result = measure_phi_from_hidden(hidden, seed)
+        phi_val = phi_result.phi
+        phi_lat = phi_result.latency_ms
+        // Store in cache
+        current_cache = cache_put(current_cache, key, phi_val)
+    }
+
+    // ── Step 3: Orch-OR sampling with phi context ──
+    let cfg = SamplerConfig {
+        mode:             "orch_or",
+        temperature:      temperature,
+        tension:          tension,
+        phi_holo_context: phi_val * 1000.0,  // scale to OR_PHI_REF range (1000.0)
+        seed:             seed
+    }
+    let sample_out = sample_next_token(logits, cfg)
+
+    // ── Step 4: update pipeline state ──
+    let new_state = ConsciousPipelineState {
+        phi_cache:    current_cache,
+        last_phi:     phi_val,
+        total_tokens: state.total_tokens + 1,
+        orch_or_used: state.orch_or_used + sample_out.orch_or_used,
+        cache_hits:   state.cache_hits + phi_hit,
+        cache_misses: state.cache_misses + (1 - phi_hit)
+    }
+
+    return ConsciousSampleResult {
+        token_id:         sample_out.token_id,
+        phi_holo:         phi_val,
+        phi_cache_hit:    phi_hit,
+        orch_or_used:     sample_out.orch_or_used,
+        quantum_variance: sample_out.quantum_variance,
+        phi_latency_ms:   phi_lat,
+        state:            new_state
+    }
+}
+
+// ─── Pipeline telemetry JSON ───────────────────────────────────
+// Serialize the last sample result as JSON for the /generate
+// response consciousness block.
+fn pipeline_telemetry_json(r: ConsciousSampleResult) -> string {
+    return "{\"phi_holo\":" + str(r.phi_holo)
+         + ",\"phi_cache_hit\":" + str(r.phi_cache_hit)
+         + ",\"orch_or_used\":" + str(r.orch_or_used)
+         + ",\"quantum_variance\":" + str(r.quantum_variance)
+         + ",\"phi_latency_ms\":" + str(r.phi_latency_ms)
+         + "}"
+}
+
+fn pipeline_stats_json(state: ConsciousPipelineState) -> string {
+    return "{\"total_tokens\":" + str(state.total_tokens)
+         + ",\"orch_or_used\":" + str(state.orch_or_used)
+         + ",\"cache_hits\":" + str(state.cache_hits)
+         + ",\"cache_misses\":" + str(state.cache_misses)
+         + ",\"cache_stats\":" + cache_stats_json(state.phi_cache)
+         + ",\"last_phi\":" + str(state.last_phi)
+         + "}"
+}
+
+// ─── Self-test (gated) ─────────────────────────────────────────
+let _cp_selftest = env("CONSCIOUSNESS_PIPELINE_SELFTEST")
+if _cp_selftest == "1" {
+    println("[cpipe] consciousness_pipeline self-test")
+
+    // Build test data
+    let mut _lg = []
+    let mut _i = 0
+    while _i < 32 {
+        _lg = _lg.push(0.1 * (_i * 1.0))
+        _i = _i + 1
+    }
+
+    let mut _hd = []
+    let mut _j = 0
+    while _j < 64 {
+        _hd = _hd.push(0.05 * (_j * 1.0) - 1.0)
+        _j = _j + 1
+    }
+
+    // T1: first call — cache miss, valid token
+    let mut _state = pipeline_new()
+    let _r1 = conscious_sample(_lg, _hd, "test prompt", "default", 1.0, 0.1, 42, _state)
+    _state = _r1.state
+    if _r1.token_id >= 0 && _r1.phi_cache_hit == 0 && _r1.phi_holo >= 0.0 {
+        println("[cpipe] T1 PASS — miss, tok=" + str(_r1.token_id) + " phi=" + str(_r1.phi_holo))
+    } else {
+        println("[cpipe] T1 FAIL")
+    }
+
+    // T2: second call same prompt — cache hit
+    let _r2 = conscious_sample(_lg, _hd, "test prompt", "default", 1.0, 0.1, 42, _state)
+    _state = _r2.state
+    if _r2.phi_cache_hit == 1 && _r2.phi_holo == _r1.phi_holo {
+        println("[cpipe] T2 PASS — hit, phi matches")
+    } else {
+        println("[cpipe] T2 FAIL — hit=" + str(_r2.phi_cache_hit))
+    }
+
+    // T3: different prompt — cache miss
+    let _r3 = conscious_sample(_lg, _hd, "different prompt", "default", 1.0, 0.1, 42, _state)
+    _state = _r3.state
+    if _r3.phi_cache_hit == 0 {
+        println("[cpipe] T3 PASS — different prompt → miss")
+    } else {
+        println("[cpipe] T3 FAIL")
+    }
+
+    // T4: stats correct
+    if _state.total_tokens == 3 && _state.cache_hits == 1 && _state.cache_misses == 2 {
+        println("[cpipe] T4 PASS — stats: tokens=3 hits=1 misses=2")
+    } else {
+        println("[cpipe] T4 FAIL — tokens=" + str(_state.total_tokens)
+              + " hits=" + str(_state.cache_hits)
+              + " misses=" + str(_state.cache_misses))
+    }
+
+    // T5: telemetry JSON non-empty
+    let _tj = pipeline_telemetry_json(_r1)
+    let _sj = pipeline_stats_json(_state)
+    if len(_tj) > 20 && len(_sj) > 20 {
+        println("[cpipe] T5 PASS — telemetry + stats json ok")
+    } else {
+        println("[cpipe] T5 FAIL")
+    }
+
+    println("[cpipe] self-test complete")
+}

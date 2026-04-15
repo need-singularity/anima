@@ -1,0 +1,365 @@
+// ═══════════════════════════════════════════════════════════════
+//  serving/phi_cache.hexa
+//
+//  D6 — LRU inference-time phi_holo precompute cache.
+//
+//  Caches phi_holo values by (prompt_prefix_hash, style) key so
+//  repeated/similar prompts get instant phi scores without
+//  recomputing the holographic MI.
+//
+//  Design:
+//    - Fixed-capacity LRU with max_entries=1024
+//    - Key: FNV1a-32 hash of hidden prefix + style string
+//    - Eviction: on put when at capacity, evict entry with lowest
+//      last_used counter (LRU policy)
+//    - All mutators return new struct (hexa lists pass-by-value)
+//    - No closures, no XOR builtin (stage0 hexa constraints)
+//
+//  Contract (consumed from test_phi_realtime.hexa / future http_server mount):
+//    cache_new(max_entries)          -> PhiCache
+//    cache_key(prompt, style)        -> int
+//    cache_get(cache, key)           -> CacheLookup
+//    cache_get_touch(cache, key)     -> CacheGetResult
+//    cache_put(cache, key, phi)      -> PhiCache
+//    cache_hit_rate(cache)           -> float
+//    cache_size(cache)               -> int
+//    cache_stats_json(cache)         -> string
+//
+//  L0: NEW file. Does not modify any existing files.
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Constants ─────────────────────────────────────────────────
+let PHI_CACHE_DEFAULT_MAX = 1024
+let PHI_CACHE_FNV_OFFSET  = 2166136261
+let PHI_CACHE_FNV_PRIME   = 16777619
+let PHI_CACHE_FNV_MOD     = 2147483647
+
+// ─── Structs ───────────────────────────────────────────────────
+
+struct CacheEntry {
+    key:       int,
+    phi:       float,
+    last_used: int      // monotonic counter for LRU
+}
+
+struct PhiCache {
+    entries:     [CacheEntry],
+    max_entries: int,
+    counter:     int,     // monotonic, incremented on every access
+    hits:        int,
+    misses:      int
+}
+
+struct CacheLookup {
+    found: int,    // 1 = hit, 0 = miss
+    phi:   float   // valid only if found==1
+}
+
+// cache_get_touch returns both the lookup result AND the updated
+// cache (with last_used bumped on hit). Per hexa pass-by-value
+// semantics, the caller must use the returned cache for subsequent
+// operations to preserve the LRU ordering.
+struct CacheGetResult {
+    lookup: CacheLookup,
+    cache:  PhiCache
+}
+
+// ─── Constructor ───────────────────────────────────────────────
+
+fn cache_new(max_entries: int) -> PhiCache {
+    return PhiCache {
+        entries:     [],
+        max_entries: max_entries,
+        counter:     0,
+        hits:        0,
+        misses:      0
+    }
+}
+
+// ─── Key computation ───────────────────────────────────────────
+// FNV1a-32 over prompt prefix bytes + "|" + style bytes.
+// Uses ADD instead of XOR (stage0 hexa has no XOR builtin).
+
+fn _cache_fnv_byte(h: int, b: int) -> int {
+    return ((h + b) * PHI_CACHE_FNV_PRIME) % PHI_CACHE_FNV_MOD
+}
+
+fn cache_key(prompt: string, style: string) -> int {
+    let mut h = PHI_CACHE_FNV_OFFSET
+    // Hash up to 128 bytes of prompt
+    let plen = len(prompt)
+    let cap = if plen > 128 { 128 } else { plen }
+    let mut i = 0
+    while i < cap {
+        // Use character code as byte proxy
+        let ch = char_at(prompt, i)
+        h = _cache_fnv_byte(h, ch)
+        i = i + 1
+    }
+    // Separator
+    h = _cache_fnv_byte(h, 124)   // '|' = 124
+    // Hash style
+    let slen = len(style)
+    let mut j = 0
+    while j < slen {
+        let ch = char_at(style, j)
+        h = _cache_fnv_byte(h, ch)
+        j = j + 1
+    }
+    return h
+}
+
+// ─── Lookup (immutable — does not update LRU counter) ──────────
+
+fn cache_get(cache: PhiCache, key: int) -> CacheLookup {
+    let n = len(cache.entries)
+    let mut i = 0
+    while i < n {
+        if cache.entries[i].key == key {
+            return CacheLookup { found: 1, phi: cache.entries[i].phi }
+        }
+        i = i + 1
+    }
+    return CacheLookup { found: 0, phi: 0.0 }
+}
+
+// ─── Lookup + touch (updates LRU counter and hit/miss stats) ───
+// Returns new cache with updated counter/stats. Caller MUST use
+// the returned cache, not the original.
+
+fn cache_get_touch(cache: PhiCache, key: int) -> CacheGetResult {
+    let n = len(cache.entries)
+    let new_counter = cache.counter + 1
+    let mut i = 0
+    while i < n {
+        if cache.entries[i].key == key {
+            // Hit: rebuild entries with updated last_used for this entry
+            let mut new_entries = []
+            let mut j = 0
+            while j < n {
+                if j == i {
+                    new_entries = new_entries.push(CacheEntry {
+                        key:       cache.entries[j].key,
+                        phi:       cache.entries[j].phi,
+                        last_used: new_counter
+                    })
+                } else {
+                    new_entries = new_entries.push(cache.entries[j])
+                }
+                j = j + 1
+            }
+            let updated = PhiCache {
+                entries:     new_entries,
+                max_entries: cache.max_entries,
+                counter:     new_counter,
+                hits:        cache.hits + 1,
+                misses:      cache.misses
+            }
+            return CacheGetResult {
+                lookup: CacheLookup { found: 1, phi: cache.entries[i].phi },
+                cache:  updated
+            }
+        }
+        i = i + 1
+    }
+    // Miss
+    let missed = PhiCache {
+        entries:     cache.entries,
+        max_entries: cache.max_entries,
+        counter:     new_counter,
+        hits:        cache.hits,
+        misses:      cache.misses + 1
+    }
+    return CacheGetResult {
+        lookup: CacheLookup { found: 0, phi: 0.0 },
+        cache:  missed
+    }
+}
+
+// ─── Put (insert or update, with LRU eviction at capacity) ─────
+// Returns new cache with the entry added/updated.
+
+fn cache_put(cache: PhiCache, key: int, phi: float) -> PhiCache {
+    let n = len(cache.entries)
+    let new_counter = cache.counter + 1
+
+    // Check if key already exists — update in place
+    let mut i = 0
+    while i < n {
+        if cache.entries[i].key == key {
+            let mut new_entries = []
+            let mut j = 0
+            while j < n {
+                if j == i {
+                    new_entries = new_entries.push(CacheEntry {
+                        key:       key,
+                        phi:       phi,
+                        last_used: new_counter
+                    })
+                } else {
+                    new_entries = new_entries.push(cache.entries[j])
+                }
+                j = j + 1
+            }
+            return PhiCache {
+                entries:     new_entries,
+                max_entries: cache.max_entries,
+                counter:     new_counter,
+                hits:        cache.hits,
+                misses:      cache.misses
+            }
+        }
+        i = i + 1
+    }
+
+    // New entry — check capacity
+    if n < cache.max_entries {
+        // Under capacity: just append
+        let mut new_entries = []
+        let mut j = 0
+        while j < n {
+            new_entries = new_entries.push(cache.entries[j])
+            j = j + 1
+        }
+        new_entries = new_entries.push(CacheEntry {
+            key:       key,
+            phi:       phi,
+            last_used: new_counter
+        })
+        return PhiCache {
+            entries:     new_entries,
+            max_entries: cache.max_entries,
+            counter:     new_counter,
+            hits:        cache.hits,
+            misses:      cache.misses
+        }
+    }
+
+    // At capacity: find LRU entry (lowest last_used) and replace it
+    let mut lru_idx = 0
+    let mut lru_val = cache.entries[0].last_used
+    let mut k = 1
+    while k < n {
+        if cache.entries[k].last_used < lru_val {
+            lru_val = cache.entries[k].last_used
+            lru_idx = k
+        }
+        k = k + 1
+    }
+
+    // Replace LRU entry
+    let mut new_entries = []
+    let mut m = 0
+    while m < n {
+        if m == lru_idx {
+            new_entries = new_entries.push(CacheEntry {
+                key:       key,
+                phi:       phi,
+                last_used: new_counter
+            })
+        } else {
+            new_entries = new_entries.push(cache.entries[m])
+        }
+        m = m + 1
+    }
+    return PhiCache {
+        entries:     new_entries,
+        max_entries: cache.max_entries,
+        counter:     new_counter,
+        hits:        cache.hits,
+        misses:      cache.misses
+    }
+}
+
+// ─── Stats ─────────────────────────────────────────────────────
+
+fn cache_size(cache: PhiCache) -> int {
+    return len(cache.entries)
+}
+
+fn cache_hit_rate(cache: PhiCache) -> float {
+    let total = cache.hits + cache.misses
+    if total == 0 { return 0.0 }
+    return (cache.hits * 1.0) / (total * 1.0)
+}
+
+fn cache_stats_json(cache: PhiCache) -> string {
+    return "{\"size\":" + str(cache_size(cache))
+         + ",\"max\":" + str(cache.max_entries)
+         + ",\"hits\":" + str(cache.hits)
+         + ",\"misses\":" + str(cache.misses)
+         + ",\"hit_rate\":" + str(cache_hit_rate(cache))
+         + ",\"counter\":" + str(cache.counter)
+         + "}"
+}
+
+// ─── Self-test (gated behind env var) ──────────────────────────
+let _pcache_selftest = env("PHI_CACHE_SELFTEST")
+if _pcache_selftest == "1" {
+    println("[pcache] phi_cache self-test")
+
+    // T1: key determinism — same input -> same key
+    let _k1a = cache_key("hello world", "default")
+    let _k1b = cache_key("hello world", "default")
+    let _k1c = cache_key("hello world", "formal")
+    if _k1a == _k1b && _k1a != _k1c {
+        println("[pcache] T1 PASS — key deterministic, style-sensitive")
+    } else {
+        println("[pcache] T1 FAIL — k1a=" + str(_k1a) + " k1b=" + str(_k1b) + " k1c=" + str(_k1c))
+    }
+
+    // T2: put/get roundtrip
+    let mut _c2 = cache_new(4)
+    _c2 = cache_put(_c2, _k1a, 1.42)
+    let _l2 = cache_get(_c2, _k1a)
+    if _l2.found == 1 && _l2.phi == 1.42 {
+        println("[pcache] T2 PASS — roundtrip phi=1.42")
+    } else {
+        println("[pcache] T2 FAIL — found=" + str(_l2.found) + " phi=" + str(_l2.phi))
+    }
+
+    // T3: LRU eviction — fill cache to max, add one more, oldest evicted
+    let mut _c3 = cache_new(3)
+    _c3 = cache_put(_c3, 100, 0.1)   // counter=1
+    _c3 = cache_put(_c3, 200, 0.2)   // counter=2
+    _c3 = cache_put(_c3, 300, 0.3)   // counter=3
+    // Touch key 100 so it's recently used
+    let _g3 = cache_get_touch(_c3, 100)
+    _c3 = _g3.cache                    // counter=4, key 100 last_used=4
+    // Add key 400 — should evict key 200 (last_used=2, oldest)
+    _c3 = cache_put(_c3, 400, 0.4)
+    let _l3a = cache_get(_c3, 200)     // should be evicted
+    let _l3b = cache_get(_c3, 100)     // should survive (touched)
+    let _l3c = cache_get(_c3, 400)     // just added
+    if _l3a.found == 0 && _l3b.found == 1 && _l3c.found == 1 {
+        println("[pcache] T3 PASS — LRU eviction correct")
+    } else {
+        println("[pcache] T3 FAIL — 200.found=" + str(_l3a.found)
+              + " 100.found=" + str(_l3b.found)
+              + " 400.found=" + str(_l3c.found))
+    }
+
+    // T4: stats counters
+    let mut _c4 = cache_new(8)
+    _c4 = cache_put(_c4, 10, 1.0)
+    let _g4a = cache_get_touch(_c4, 10)    // hit
+    _c4 = _g4a.cache
+    let _g4b = cache_get_touch(_c4, 99)    // miss
+    _c4 = _g4b.cache
+    if _c4.hits == 1 && _c4.misses == 1 {
+        println("[pcache] T4 PASS — hits=1 misses=1")
+    } else {
+        println("[pcache] T4 FAIL — hits=" + str(_c4.hits) + " misses=" + str(_c4.misses))
+    }
+
+    // T5: empty cache miss
+    let _c5 = cache_new(4)
+    let _l5 = cache_get(_c5, 12345)
+    if _l5.found == 0 {
+        println("[pcache] T5 PASS — empty cache miss")
+    } else {
+        println("[pcache] T5 FAIL — found on empty cache")
+    }
+
+    println("[pcache] self-test complete")
+}

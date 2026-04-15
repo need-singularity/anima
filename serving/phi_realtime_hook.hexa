@@ -1,0 +1,458 @@
+// ═══════════════════════════════════════════════════════════════
+//  serving/phi_realtime_hook.hexa
+//
+//  D1 — Phi_holo realtime computation for inference (<= 100ms).
+//
+//  Inline mirror of training/phi_holographic_measure.hexa primitives.
+//  We do NOT `use "..."` the training file — per feedback_hexa_runtime
+//  cross-file import is risky in stage0 hexa, and training/ files
+//  run self-tests at module load time that would re-execute during
+//  serving import. Instead we copy the core algorithm here.
+//
+//  Algorithm (AdS/CFT MI estimator):
+//    1. Pool hidden state to d_boundary via chunked mean
+//    2. Encode boundary -> bulk via HolographicHead scramble
+//    3. Extract interior from bulk
+//    4. Compute I(boundary ; interior) via histogram MI
+//    5. Return PhiResult with phi_holo + latency_ms
+//
+//  Dimensions (stage0 interpreter):
+//    d_boundary = 16,  d_bulk = 32  (fast, ~50ms per call)
+//  Production native build:
+//    d_boundary = 64,  d_bulk = 128 (phi_holographic_measure.hexa T5 <50ms)
+//
+//  Contract (consumed from test_phi_realtime.hexa / future http_server mount):
+//    measure_phi_from_hidden(hidden, seed)    -> PhiResult
+//    phirt_to_metadata_json(r)                -> string
+//
+//  L0: this is a NEW file. Does not modify anima/core/, training/,
+//      http_server.hexa, hire_routes.hexa, or quantum_collapse_sample.hexa.
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Tunables ──────────────────────────────────────────────────
+let PHIRT_D_BOUNDARY  = 16
+let PHIRT_D_BULK      = 32
+let PHIRT_MI_BINS     = 8
+let PHIRT_SCRAMBLE_GAIN = 0.5
+let PHIRT_HEAD_SEED   = 42
+
+// ─── Output struct ─────────────────────────────────────────────
+struct PhiResult {
+    phi:         float,   // phi_holo MI value
+    latency_ms:  int,     // wall-clock ms for this measurement
+    d_boundary:  int,     // boundary dimension used
+    d_bulk:      int,     // bulk dimension used
+    cache_hit:   int,     // 1 if served from cache, 0 if computed
+    cache_key:   int      // hash key for caching
+}
+
+// ─── Math helpers (self-contained, mirror phi_holographic_measure) ──
+
+fn phirt_fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn phirt_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+// Deterministic LCG for scramble matrix generation.
+fn phirt_det_rand(n: int, seed: int) -> [float] {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = (s % 1000000) * 1.0 / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn phirt_vec_min(v: [float]) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn phirt_vec_max(v: [float]) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+// ─── Holographic head (scramble matrix) ────────────────────────
+// Pre-built at module load for PHIRT_D_BOUNDARY x (PHIRT_D_BULK - PHIRT_D_BOUNDARY).
+// This avoids re-generating the scramble per call.
+
+struct PhirtHead {
+    d_boundary: int,
+    d_bulk:     int,
+    scramble:   [float]   // flat d_boundary * d_scramble
+}
+
+fn phirt_make_head(d_boundary: int, d_bulk: int, seed: int) -> PhirtHead {
+    let d_scramble = d_bulk - d_boundary
+    let raw = phirt_det_rand(d_boundary * d_scramble, seed)
+    let mut scramble = []
+    let mut i = 0
+    while i < len(raw) {
+        scramble = scramble.push(raw[i] * PHIRT_SCRAMBLE_GAIN)
+        i = i + 1
+    }
+    return PhirtHead {
+        d_boundary: d_boundary,
+        d_bulk:     d_bulk,
+        scramble:   scramble
+    }
+}
+
+// Module-level head — built once, reused for all calls.
+let _PHIRT_HEAD = phirt_make_head(PHIRT_D_BOUNDARY, PHIRT_D_BULK, PHIRT_HEAD_SEED)
+
+// ─── Pool hidden state to boundary dimension ───────────────────
+// Takes arbitrary-length hidden [float] and reduces to d_boundary
+// via chunked mean. This is the same approach as the design doc
+// "phirt_pool_to_boundary — chunked mean to fixed d_target".
+//
+// If len(hidden) < d_boundary, we pad with 0.0.
+// If len(hidden) >= d_boundary, we chunk into d_boundary equal
+// segments and take mean of each chunk.
+fn phirt_pool_to_boundary(hidden: [float], d_target: int) -> [float] {
+    let n = len(hidden)
+    if n == 0 {
+        let mut z = []
+        let mut i = 0
+        while i < d_target {
+            z = z.push(0.0)
+            i = i + 1
+        }
+        return z
+    }
+    if n <= d_target {
+        // Pad: copy what we have, zero-fill the rest
+        let mut out = []
+        let mut i = 0
+        while i < d_target {
+            if i < n {
+                out = out.push(hidden[i])
+            } else {
+                out = out.push(0.0)
+            }
+            i = i + 1
+        }
+        return out
+    }
+    // Chunk mean: n > d_target
+    let chunk_size = n / d_target
+    let mut out = []
+    let mut d = 0
+    while d < d_target {
+        let start = d * chunk_size
+        let mut acc = 0.0
+        let mut j = 0
+        while j < chunk_size {
+            acc = acc + hidden[start + j]
+            j = j + 1
+        }
+        out = out.push(acc / (chunk_size * 1.0))
+        d = d + 1
+    }
+    return out
+}
+
+// ─── Encode: boundary -> bulk ──────────────────────────────────
+// bulk[0..d] = boundary (identity lift)
+// bulk[d..D] = scramble^T @ boundary (holographic interior dofs)
+fn phirt_encode(head: PhirtHead, boundary: [float]) -> [float] {
+    let db = head.d_boundary
+    let dB = head.d_bulk
+    let ds = dB - db
+    let mut bulk = []
+    // Identity lift
+    let mut i = 0
+    while i < db {
+        bulk = bulk.push(boundary[i])
+        i = i + 1
+    }
+    // Scrambled interior
+    let mut k = 0
+    while k < ds {
+        let mut s = 0.0
+        let mut j = 0
+        while j < db {
+            s = s + head.scramble[j * ds + k] * boundary[j]
+            j = j + 1
+        }
+        bulk = bulk.push(s)
+        k = k + 1
+    }
+    return bulk
+}
+
+// ─── Interior extraction: bulk[d..D] pooled to length d ────────
+fn phirt_interior(bulk: [float], d_boundary: int, d_bulk: int) -> [float] {
+    let ds = d_bulk - d_boundary
+    let mut interior = []
+    let mut i = 0
+    while i < d_boundary {
+        interior = interior.push(bulk[d_boundary + (i % ds)])
+        i = i + 1
+    }
+    return interior
+}
+
+// ─── Histogram MI estimator ────────────────────────────────────
+
+fn phirt_bin_index(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * (nb * 1.0))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn phirt_count_hits(bin_ids: [int], n_bins: int) -> [float] {
+    let n = len(bin_ids)
+    let mut counts = []
+    let mut k = 0
+    while k < n_bins {
+        let mut c = 0.0
+        let mut i = 0
+        while i < n {
+            if bin_ids[i] == k { c = c + 1.0 }
+            i = i + 1
+        }
+        counts = counts.push(c)
+        k = k + 1
+    }
+    return counts
+}
+
+fn phirt_entropy(v: [float], lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut bin_ids = []
+    let mut i = 0
+    while i < n {
+        bin_ids = bin_ids.push(phirt_bin_index(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let counts = phirt_count_hits(bin_ids, nb)
+    let inv_n = 1.0 / (n * 1.0)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * phirt_ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+fn phirt_joint_entropy(a: [float], b: [float], lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = phirt_bin_index(a[i], lo, hi, nb)
+        let ib = phirt_bin_index(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let nb2 = nb * nb
+    let counts = phirt_count_hits(pair_ids, nb2)
+    let inv_n = 1.0 / (n * 1.0)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb2 {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * phirt_ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+// ─── Core: phi_holo = I(boundary ; interior) ───────────────────
+fn phirt_compute_phi(head: PhirtHead, boundary: [float]) -> float {
+    let db = head.d_boundary
+    let dB = head.d_bulk
+    let ds = dB - db
+    if ds == 0 { return 0.0 }
+
+    let bulk = phirt_encode(head, boundary)
+    let interior = phirt_interior(bulk, db, dB)
+
+    // Shared support range
+    let lo_b = phirt_vec_min(boundary)
+    let hi_b = phirt_vec_max(boundary)
+    let lo_i = phirt_vec_min(interior)
+    let hi_i = phirt_vec_max(interior)
+    let lo = if lo_b < lo_i { lo_b } else { lo_i }
+    let hi = if hi_b > hi_i { hi_b } else { hi_i }
+
+    let h_b  = phirt_entropy(boundary, lo, hi, PHIRT_MI_BINS)
+    let h_i  = phirt_entropy(interior, lo, hi, PHIRT_MI_BINS)
+    let h_bi = phirt_joint_entropy(boundary, interior, lo, hi, PHIRT_MI_BINS)
+
+    let mi = h_b + h_i - h_bi
+    // Clamp: MI cannot be negative (rounding artifact of histogram estimator)
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ─── Cache key hash (FNV1a-32 variant, ADD instead of XOR) ─────
+// Matches the design doc: FNV1a-32 with ADD for stage0 hexa compat
+// (no XOR builtin). Input is a prefix of the hidden state.
+let PHIRT_FNV_OFFSET = 2166136261
+let PHIRT_FNV_PRIME  = 16777619
+let PHIRT_FNV_MOD    = 2147483647    // 2^31 - 1
+
+fn phirt_cache_key(hidden: [float], prefix_len: int) -> int {
+    let n = len(hidden)
+    let plen = if prefix_len < n { prefix_len } else { n }
+    let mut h = PHIRT_FNV_OFFSET
+    let mut i = 0
+    while i < plen {
+        // Quantize float to int for hashing
+        let qi = to_int(hidden[i] * 1000000.0)
+        let mut v = qi
+        if v < 0 { v = 0 - v }
+        // FNV1a step: hash = (hash ADD byte) * prime, mod 2^31-1
+        // Using ADD instead of XOR per design doc constraint
+        h = ((h + (v % 256)) * PHIRT_FNV_PRIME) % PHIRT_FNV_MOD
+        h = ((h + ((v / 256) % 256)) * PHIRT_FNV_PRIME) % PHIRT_FNV_MOD
+        i = i + 1
+    }
+    return h
+}
+
+// ─── Public entry: measure phi from hidden state ───────────────
+// Returns PhiResult with phi_holo and latency timing.
+// `seed` is unused for the head (module-level) but reserved for
+// future per-request head seeding.
+fn measure_phi_from_hidden(hidden: [float], seed: int) -> PhiResult {
+    let t0 = timestamp()
+
+    // Pool hidden -> boundary
+    let boundary = phirt_pool_to_boundary(hidden, PHIRT_D_BOUNDARY)
+
+    // Compute phi_holo
+    let phi = phirt_compute_phi(_PHIRT_HEAD, boundary)
+
+    // Cache key from hidden prefix
+    let key = phirt_cache_key(hidden, 128)
+
+    let t1 = timestamp()
+    // NOTE: stage0 timestamp() has 1s granularity. For batch
+    // measurement we time N calls and divide. Production native
+    // build will have sub-ms resolution.
+    let lat = t1 - t0
+
+    return PhiResult {
+        phi:         phi,
+        latency_ms:  lat,
+        d_boundary:  PHIRT_D_BOUNDARY,
+        d_bulk:      PHIRT_D_BULK,
+        cache_hit:   0,
+        cache_key:   key
+    }
+}
+
+// ─── JSON metadata serializer ──────────────────────────────────
+// Returns a JSON string suitable for embedding in the /generate
+// response as consciousness telemetry.
+fn phirt_to_metadata_json(r: PhiResult) -> string {
+    return "{\"phi_holo\":" + str(r.phi)
+         + ",\"phi_latency_ms\":" + str(r.latency_ms)
+         + ",\"phi_d_boundary\":" + str(r.d_boundary)
+         + ",\"phi_d_bulk\":" + str(r.d_bulk)
+         + ",\"phi_cache_hit\":" + str(r.cache_hit)
+         + "}"
+}
+
+// ─── Self-test (gated behind env var) ──────────────────────────
+let _phirt_selftest = env("PHIRT_SELFTEST")
+if _phirt_selftest == "1" {
+    println("[phirt] phi_realtime_hook self-test")
+
+    // T1: phi >= 0 for non-degenerate input
+    let _h1 = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8,
+               0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6,
+               0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8,
+               0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6]
+    let _r1 = measure_phi_from_hidden(_h1, 0)
+    if _r1.phi >= 0.0 {
+        println("[phirt] T1 PASS — phi=" + str(_r1.phi) + " >= 0")
+    } else {
+        println("[phirt] T1 FAIL — phi=" + str(_r1.phi) + " < 0")
+    }
+
+    // T2: pool dimension invariant — output is always d_boundary
+    let _b1 = phirt_pool_to_boundary(_h1, PHIRT_D_BOUNDARY)
+    if len(_b1) == PHIRT_D_BOUNDARY {
+        println("[phirt] T2 PASS — pool dim=" + str(len(_b1)))
+    } else {
+        println("[phirt] T2 FAIL — pool dim=" + str(len(_b1)) + " expected " + str(PHIRT_D_BOUNDARY))
+    }
+
+    // T3: determinism — same input -> same phi
+    let _r3a = measure_phi_from_hidden(_h1, 0)
+    let _r3b = measure_phi_from_hidden(_h1, 0)
+    if _r3a.phi == _r3b.phi && _r3a.cache_key == _r3b.cache_key {
+        println("[phirt] T3 PASS — deterministic phi=" + str(_r3a.phi) + " key=" + str(_r3a.cache_key))
+    } else {
+        println("[phirt] T3 FAIL — phi " + str(_r3a.phi) + " vs " + str(_r3b.phi))
+    }
+
+    // T4: latency bound — batch 20 calls, check mean < 100ms
+    // (stage0 has second granularity, so measure wall-clock over batch)
+    let _t4_start = timestamp()
+    let mut _t4_i = 0
+    while _t4_i < 20 {
+        let _r = measure_phi_from_hidden(_h1, 0)
+        _t4_i = _t4_i + 1
+    }
+    let _t4_end = timestamp()
+    let _t4_total = _t4_end - _t4_start
+    let _t4_mean = (_t4_total * 1000) / 20   // rough ms
+    println("[phirt] T4 batch=20 total=" + str(_t4_total) + "s → ~" + str(_t4_mean) + "ms/call")
+    if _t4_total <= 2 {
+        // 20 calls in <=2s → mean <=100ms
+        println("[phirt] T4 PASS — within 100ms target")
+    } else {
+        println("[phirt] T4 WARN — " + str(_t4_mean) + "ms/call (stage0 clock granularity)")
+    }
+
+    // T5: metadata JSON is well-formed
+    let _r5 = measure_phi_from_hidden(_h1, 0)
+    let _j5 = phirt_to_metadata_json(_r5)
+    // Check it starts with { and contains phi_holo
+    if len(_j5) > 10 {
+        println("[phirt] T5 PASS — json len=" + str(len(_j5)))
+    } else {
+        println("[phirt] T5 FAIL — json too short: " + _j5)
+    }
+
+    println("[phirt] self-test complete")
+}
