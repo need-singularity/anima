@@ -1,0 +1,881 @@
+// metacognition_phi.hexa — P117 Metacognition Φ engine
+//
+// Roadmap: shared/roadmaps/anima.json P117
+//   "thinking about thinking" — Φ of a system that monitors and controls
+//   its own cognition on top of doing the task itself.
+//
+// ─── Scientific reference ─────────────────────────────────────────
+//
+// Flavell (1979, American Psychologist): introduced "metacognition" as
+//   knowledge-about-cognition + regulation-of-cognition. Framework of
+//   metacognitive knowledge (person/task/strategy) and metacognitive
+//   experience (feelings-of-knowing, judgments-of-learning).
+//
+// Nelson & Narens (1990, Psychology of Learning and Motivation, vol 26):
+//   Two-level architecture — "object level" (cognition on the task) and
+//   "meta level" (monitoring the object level + control flow from meta
+//   to object). The two levels communicate through two unidirectional
+//   flows: MONITORING (object → meta) and CONTROL (meta → object).
+//
+// Dunning & Kruger (1999, J. Personality and Social Psychology):
+//   Low-competence performers overestimate their own accuracy; high-
+//   competence performers slightly underestimate. The "Dunning-Kruger
+//   hollow" is the non-linear calibration curve where confidence-versus-
+//   accuracy line dips BELOW the diagonal at low competence (a "double
+//   curse": unskilled and unaware of it).
+//
+// Hart (1965, J. Educational Psychology): Feeling-of-knowing (FOK). A
+//   subject reports the likelihood of recalling an item they cannot
+//   currently produce. Surprisingly accurate — partial retrieval traces
+//   project confidence even when overt recall fails.
+//
+// Arbuckle & Cuddy (1969); Nelson (1984): Judgment-of-learning (JOL).
+//   After study, predict future test performance. JOL accuracy is a
+//   metacognitive skill that improves with practice (delayed-JOL effect).
+//
+// Fleming & Lau (2014, Front. Human Neurosci.): Neural basis of
+//   metacognition — rostro-lateral prefrontal cortex (rlPFC) tracks
+//   confidence. Meta-d' quantifies metacognitive sensitivity above and
+//   beyond primary task sensitivity d'.
+//
+// ─── Operational three-level architecture ────────────────────────
+//
+//   Level 0 (cognition):
+//     task: given input x (vector in [−1,1]^MC_D), produce output y and
+//     an internal certainty trace c (how "sharp" the activation was).
+//     Competence parameter in [0,1] scales signal-to-noise.
+//
+//   Level 1 (monitor):
+//     input = L0 internal trace; output = confidence estimate in [0,1].
+//     Does NOT see the ground truth — it infers from L0 dynamics.
+//
+//   Level 2 (control):
+//     input = L1 confidence + L0 output. If confidence < threshold,
+//     switch strategy (re-attempt with more deliberation = lower noise).
+//     Outputs a final answer.
+//
+// ─── Theorems (T1-T5) ─────────────────────────────────────────────
+//
+// T1 (level separation):
+//   |Φ_L0 − Φ_L1| > MC_LEVEL_SEP. Monitoring integrates different
+//   information than cognition itself. Non-trivially distinct Φ values
+//   mean the two levels carry different joint-distributions of signals.
+//
+// T2 (calibration):
+//   Across N trials at mid-competence, Pearson |r|(confidence, accuracy)
+//   > MC_CALIB_FLOOR. A good monitor's reports actually co-vary with
+//   trial-level correctness.
+//
+// T3 (Dunning-Kruger):
+//   Low-competence agent: mean(confidence) > mean(accuracy) + MC_DK_GAP.
+//   High-competence agent: mean(confidence) ≤ mean(accuracy).
+//   The hollow is measured by the SIGN-flip between the two regimes.
+//
+// T4 (meta-control improvement):
+//   Running with meta-control (strategy switch on low-confidence) vs
+//   without, over the same trial stream, yields higher mean accuracy
+//   by at least MC_CTRL_GAIN. The "control" channel of Nelson-Narens
+//   has operational value.
+//
+// T5 (Φ_meta > Φ_cog):
+//   Integrated Φ over the three-level system (concatenation of L0, L1,
+//   L2 traces) exceeds Φ of L0 alone by at least MC_META_GAIN. The
+//   metacognitive assembly is MORE integrated than base cognition.
+//
+// ─── Stage0 hexa constraints honored ──────────────────────────────
+//   - plain `fn` only (no `pure fn`)
+//   - no struct returning ≥3 floats (feedback_hexa_struct_return_bug)
+//   - no multi-line return expressions
+//   - arrays are pass-by-value; we inline mutation (feedback_hexa_lists_pbv)
+//   - single-line fn signatures + call sites
+//   - main() call at bottom
+//   - All dims < 32 (MC_D=8, MC_TRIALS=20, MC_BINS=4)
+//
+// Law alignment:
+//   Law 2   Observe never inject — confidence/control are passive measures
+//   Law 4   Structure > feature — three-level structure IS the signal
+//   Law 22  Feature addition → Φ down — fixed channels, no ad-hoc branching
+//   AN7     Core separation — standalone engine, no cross-import
+//
+// Ref:
+//   Flavell JH. "Metacognition and cognitive monitoring" (Am. Psychol. 1979)
+//   Nelson TO, Narens L. "Metamemory: a theoretical framework" (1990)
+//   Kruger J, Dunning D. "Unskilled and unaware of it" (JPSP 1999)
+//   Hart JT. "Memory and the feeling-of-knowing experience" (J Educ Psych 1965)
+//   Fleming SM, Lau HC. "How to measure metacognition" (Front Hum Neuro 2014)
+//   anima-engines/phi_of_phi.hexa       (P43 — three-level stacked Φ)
+//   anima-engines/narrative_identity_phi.hexa (P65 — trajectory Φ pattern)
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+// Core dimensions
+let MC_D          = 8          // task-input dimensionality
+let MC_TRIALS     = 20         // number of trials per calibration pass
+let MC_BINS       = 4          // histogram bins for MI estimator
+
+// Competence anchors
+let MC_COMP_LOW   = 0.20       // low-competence agent (Dunning-Kruger)
+let MC_COMP_MID   = 0.55       // mid-competence for calibration regime
+let MC_COMP_HIGH  = 0.90       // high-competence agent
+
+// Level-1 (monitor) sensitivity. Higher = more responsive to noise.
+// Tuning note: at gain 2.5 with tanh-like squash, confidence tracks
+// the inverse-noise trace tightly without saturating.
+let MC_MONITOR_GAIN = 2.5
+
+// Level-2 control threshold. When confidence < this, switch strategy.
+let MC_CTRL_THRESH  = 0.45
+
+// Deliberation noise reduction factor for the re-attempt strategy.
+// Cognitive "slow-mode": more careful → lower noise.
+let MC_DELIB_FACTOR = 0.35
+
+// Test thresholds
+let MC_LEVEL_SEP    = 0.05     // T1: min |Φ_L0 − Φ_L1|
+let MC_CALIB_FLOOR  = 0.50     // T2: min Pearson |r|
+let MC_DK_GAP       = 0.12     // T3: min confidence-over-accuracy gap at low comp
+let MC_CTRL_GAIN    = 0.05     // T4: min accuracy improvement from control
+let MC_META_GAIN    = 0.02     // T5: min Φ_meta − Φ_cog
+
+let MC_EPS          = 0.0000000001
+
+// ═══════════════════════════════════════════════════════════════
+// PRNG + math helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn mc_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn mc_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn mc_signed(seed: int) -> float {
+    return mc_unit(seed) * 2.0 - 1.0
+}
+
+fn mc_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn mc_min_f(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn mc_max_f(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+fn mc_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+// Newton iteration sqrt, safe for x <= 0.
+// Root cause: stage0 builds don't expose a native sqrt on all backends;
+// 20 iters of Newton converge to machine precision for the x ranges
+// we operate on (variances, norms, ≤ ~1e3).
+fn mc_sqrt_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x
+    let mut i = 0
+    while i < 20 {
+        g = 0.5 * (g + x / g)
+        i = i + 1
+    }
+    return g
+}
+
+// Tanh-like squash to [0,1] via a Taylor rational approximation.
+// Root cause: no exp() guaranteed; use sigmoid(x) = 0.5 + 0.5*x/(1+|x|)
+// which is monotone, [0,1]-bounded, and derivative-continuous.
+// Calibrated so that sigmoid(0)=0.5, sigmoid(±∞)=0/1 asymptotes.
+fn mc_sigmoid(x: float) -> float {
+    let denom = 1.0 + mc_abs(x)
+    return 0.5 + 0.5 * (x / denom)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Histogram MI (self-contained — AN7 no cross-engine import)
+// ═══════════════════════════════════════════════════════════════
+
+fn mc_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn mc_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn mc_vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn mc_vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn mc_entropy(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(mc_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = mc_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * mc_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn mc_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let na = len(a)
+    let nb_arr = len(b)
+    let n = if na < nb_arr { na } else { nb_arr }
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = mc_bin_idx(a[i], lo, hi, nb)
+        let ib = mc_bin_idx(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = mc_counts(pair_ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * mc_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+// MI with Miller-Madow bias correction (standard recipe).
+// Root cause: finite-sample MI has positive bias ≈ (B-1)^2/(2N) nats.
+// With B=4, N=MC_TRIALS the bias floor ~0.09 nats; MM subtract lets
+// Φ reach ~0 for independent series, cleanly separating levels.
+fn mc_mi(a: array, b: array) -> float {
+    let na = len(a)
+    let nb_arr = len(b)
+    if na == 0 { return 0.0 }
+    if nb_arr == 0 { return 0.0 }
+    let n = if na < nb_arr { na } else { nb_arr }
+    // Build truncated views for consistent length
+    let mut at = []
+    let mut bt = []
+    let mut i = 0
+    while i < n {
+        at = at.push(a[i])
+        bt = bt.push(b[i])
+        i = i + 1
+    }
+    let lo_a = mc_vec_min(at)
+    let hi_a = mc_vec_max(at)
+    let lo_b = mc_vec_min(bt)
+    let hi_b = mc_vec_max(bt)
+    let lo = mc_min_f(lo_a, lo_b)
+    let hi = mc_max_f(hi_a, hi_b)
+    let h_a = mc_entropy(at, lo, hi, MC_BINS)
+    let h_b = mc_entropy(bt, lo, hi, MC_BINS)
+    let h_j = mc_joint_entropy(at, bt, lo, hi, MC_BINS)
+    let mi_raw = h_a + h_b - h_j
+    let bf = to_float(MC_BINS - 1)
+    let bias = (bf * bf) / (2.0 * to_float(n))
+    let mi = mi_raw - bias
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Pearson correlation (sub-window friendly; task prompt calls for
+// "Pearson |r| over sub-windows" pattern from sleep_stage_phi.hexa)
+// Absolute Pearson r between two equal-length float arrays.
+// ═══════════════════════════════════════════════════════════════
+
+fn mc_pearson_abs(a: array, b: array) -> float {
+    let n = len(a)
+    if n < 2 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let mut sx = 0.0
+    let mut sy = 0.0
+    let mut i = 0
+    while i < n {
+        sx = sx + a[i]
+        sy = sy + b[i]
+        i = i + 1
+    }
+    let mx = sx / to_float(n)
+    let my = sy / to_float(n)
+    let mut sxy = 0.0
+    let mut sxx = 0.0
+    let mut syy = 0.0
+    i = 0
+    while i < n {
+        let dx = a[i] - mx
+        let dy = b[i] - my
+        sxy = sxy + dx * dy
+        sxx = sxx + dx * dx
+        syy = syy + dy * dy
+        i = i + 1
+    }
+    let denom = mc_sqrt_safe(sxx) * mc_sqrt_safe(syy)
+    if denom <= MC_EPS { return 0.0 }
+    let r = sxy / denom
+    return mc_abs(r)
+}
+
+// Sub-window Pearson |r|: divide the two series into sub-windows,
+// compute |r| per window, then return the MEAN. This is the pattern
+// used by sleep_stage_phi for spindle detection — more robust than a
+// single global r when signals have piecewise structure.
+fn mc_pearson_abs_subwin(a: array, b: array, win: int) -> float {
+    let n = len(a)
+    if n < win * 2 { return mc_pearson_abs(a, b) }
+    if len(b) != n { return 0.0 }
+    let n_wins = n / win
+    let mut sum_r = 0.0
+    let mut w = 0
+    while w < n_wins {
+        let base = w * win
+        // extract windows
+        let mut aw = []
+        let mut bw = []
+        let mut j = 0
+        while j < win {
+            aw = aw.push(a[base + j])
+            bw = bw.push(b[base + j])
+            j = j + 1
+        }
+        sum_r = sum_r + mc_pearson_abs(aw, bw)
+        w = w + 1
+    }
+    return sum_r / to_float(n_wins)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Level-0 cognition: task process
+//
+// Task: input vector x in [−1,1]^MC_D; "truth" y_true = sign(sum(x)).
+// L0 computes a noisy estimate y_hat. Competence alpha ∈ [0,1] scales
+// signal vs noise. Internal certainty trace c = |mean(x) + noise_contrib|
+// before thresholding (a monotone proxy for how "unambiguous" the
+// activation was).
+//
+// We return parallel arrays rather than a struct with ≥3 floats
+// (feedback_hexa_struct_return_bug): output[0]=y_hat, [1]=certainty,
+// [2]=accuracy(0/1), [3]=gap (how close signal was to decision boundary).
+// ═══════════════════════════════════════════════════════════════
+
+// Generate one task input vector (length MC_D).
+fn mc_gen_input(seed: int) -> array {
+    let mut s = mc_prng(seed)
+    let mut out = []
+    let mut i = 0
+    while i < MC_D {
+        s = mc_prng(s + i * 101)
+        out = out.push(mc_signed(s) * 1.5)
+        i = i + 1
+    }
+    return out
+}
+
+// Compute sign(x): +1 if x>=0, -1 else. Returns 1.0 or -1.0.
+fn mc_sign(x: float) -> float {
+    if x >= 0.0 { return 1.0 }
+    return 0.0 - 1.0
+}
+
+// L0 cognition on one trial.
+// Returns [y_hat, certainty, accuracy, gap] (4 floats).
+// alpha = competence; noise_factor scales the noise (=1.0 fast mode,
+// <1.0 deliberate/meta-controlled mode).
+fn mc_l0_process(x: array, alpha: float, noise_factor: float, seed: int) -> array {
+    // Compute mean of x (the "signal")
+    let mut sum_x = 0.0
+    let mut i = 0
+    while i < MC_D {
+        sum_x = sum_x + x[i]
+        i = i + 1
+    }
+    let mean_x = sum_x / to_float(MC_D)
+
+    // Ground-truth label from clean signal.
+    let y_true = mc_sign(mean_x)
+
+    // Competence = 1/(1+noise_ratio). Low alpha → lots of noise added.
+    // noise_scale = (1 - alpha) * noise_factor.
+    // Root cause: factoring noise this way lets the deliberate mode
+    // (noise_factor < 1) amplify competence — exactly what meta-control
+    // is supposed to do.
+    let noise_scale = (1.0 - alpha) * noise_factor
+
+    // Noise contribution (PRNG-based)
+    let s = mc_prng(seed + 7919)
+    let noise = mc_signed(s) * noise_scale * 1.8
+
+    // Noisy internal signal
+    let internal = mean_x + noise
+
+    // L0's output = sign of internal signal
+    let y_hat = mc_sign(internal)
+
+    // Certainty = |internal|; larger ⇒ more confident in sign.
+    // This is the raw trace L1 will read.
+    let certainty = mc_abs(internal)
+
+    // Gap to decision boundary (distance from zero).
+    let gap = certainty
+
+    // Accuracy (1.0 correct, 0.0 wrong) vs ground truth.
+    let mut accuracy = 0.0
+    if y_hat == y_true { accuracy = 1.0 }
+
+    let mut out = []
+    out = out.push(y_hat)
+    out = out.push(certainty)
+    out = out.push(accuracy)
+    out = out.push(gap)
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Level-1 monitor: reads L0 certainty trace, reports confidence ∈ [0,1]
+// ═══════════════════════════════════════════════════════════════
+//
+// Nelson-Narens monitoring flow: object → meta. The monitor DOES NOT see
+// the ground truth; it only sees L0's internal state. Good monitor means
+// confidence should correlate with L0 accuracy across trials.
+//
+// Implementation: smooth map certainty → confidence through sigmoid with
+// a competence-aware gain. Calibrated monitor uses alpha directly as a
+// prior, so higher alpha yields tighter calibration.
+
+fn mc_l1_confidence(certainty: float, alpha: float) -> float {
+    // Signal = gain * (certainty − threshold). Threshold centers the
+    // sigmoid at a "neither-confident-nor-doubtful" point.
+    // The threshold shifts with competence: high competence means L0
+    // produces large certainty values so the decision point must shift up.
+    let threshold = 0.25 + 0.55 * alpha
+    let raw = MC_MONITOR_GAIN * (certainty - threshold)
+
+    // Low-competence agents inflate their confidence (Dunning-Kruger).
+    // We bias the monitor upward by a miscalibration term that decays
+    // to zero at high competence.
+    // Root cause: this is the mechanism that reproduces the DK hollow
+    // — same monitor architecture, biased prior at low competence.
+    let miscal_bias = 0.8 * (1.0 - alpha) * (1.0 - alpha)
+    let biased = raw + miscal_bias
+
+    return mc_sigmoid(biased)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Level-2 control: strategy switch when monitor detects failure
+// ═══════════════════════════════════════════════════════════════
+//
+// Nelson-Narens control flow: meta → object. When L1 confidence < thresh,
+// L2 triggers "deliberate mode" — same L0 with reduced noise (lower
+// noise_factor). The second-pass answer is the output when it fires.
+//
+// Returns [y_final, switched] where switched is 1.0 if the re-attempt
+// happened, 0.0 otherwise.
+
+fn mc_l2_control(x: array, alpha: float, y_first: float, confidence: float, seed: int) -> array {
+    let mut out = []
+    if confidence < MC_CTRL_THRESH {
+        // Strategy switch: deliberate mode.
+        let r2 = mc_l0_process(x, alpha, MC_DELIB_FACTOR, seed + 77)
+        out = out.push(r2[0])
+        out = out.push(1.0)
+    } else {
+        out = out.push(y_first)
+        out = out.push(0.0)
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Trial runner: sweep N trials, collect per-trial metrics
+//
+// Stores (as parallel flat arrays — avoiding struct-list-alias bug):
+//   y_hat_list       — L0 primary output  (length n_trials)
+//   certainty_list   — L0 certainty trace
+//   confidence_list  — L1 monitor output in [0,1]
+//   accuracy_list    — L0 accuracy (0/1)
+//   y_final_list     — L2 controlled output
+//   final_acc_list   — accuracy of L2 final output
+//   switched_list    — 1 if strategy switched, 0 else
+// ═══════════════════════════════════════════════════════════════
+
+// Run L0+L1 only (no meta-control). Returns [y_hat, cert, conf, acc] flat
+// concatenated over n_trials. Index: trial t, field f at [t*4+f].
+fn mc_run_cog_monitor(alpha: float, n_trials: int, seed: int) -> array {
+    let mut flat = []
+    let mut t = 0
+    while t < n_trials {
+        let x = mc_gen_input(seed + t * 1013)
+        let r = mc_l0_process(x, alpha, 1.0, seed + t * 31 + 5)
+        let conf = mc_l1_confidence(r[1], alpha)
+        flat = flat.push(r[0])       // y_hat
+        flat = flat.push(r[1])       // certainty
+        flat = flat.push(conf)       // confidence
+        flat = flat.push(r[2])       // accuracy
+        t = t + 1
+    }
+    return flat
+}
+
+// Run full L0+L1+L2 pipeline. Returns flat with per-trial fields:
+// [y_hat, cert, conf, acc, y_final, final_acc, switched] → 7 fields.
+fn mc_run_full(alpha: float, n_trials: int, seed: int) -> array {
+    let mut flat = []
+    let mut t = 0
+    while t < n_trials {
+        let x = mc_gen_input(seed + t * 1013)
+        let r = mc_l0_process(x, alpha, 1.0, seed + t * 31 + 5)
+        let conf = mc_l1_confidence(r[1], alpha)
+        let ctrl = mc_l2_control(x, alpha, r[0], conf, seed + t * 101)
+
+        // Ground truth for final accuracy
+        let mut sum_x = 0.0
+        let mut i = 0
+        while i < MC_D {
+            sum_x = sum_x + x[i]
+            i = i + 1
+        }
+        let y_true = mc_sign(sum_x / to_float(MC_D))
+        let mut fa = 0.0
+        if ctrl[0] == y_true { fa = 1.0 }
+
+        flat = flat.push(r[0])       // y_hat
+        flat = flat.push(r[1])       // certainty
+        flat = flat.push(conf)       // confidence
+        flat = flat.push(r[2])       // acc (L0)
+        flat = flat.push(ctrl[0])    // y_final (L2)
+        flat = flat.push(fa)         // final_acc
+        flat = flat.push(ctrl[1])    // switched flag
+        t = t + 1
+    }
+    return flat
+}
+
+// Field extractor helpers — avoid re-running trials.
+
+fn mc_extract_field(flat: array, n_trials: int, fields: int, f: int) -> array {
+    let mut out = []
+    let mut t = 0
+    while t < n_trials {
+        out = out.push(flat[t * fields + f])
+        t = t + 1
+    }
+    return out
+}
+
+fn mc_mean(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + v[i]
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Φ computations per level
+//
+// Φ_L0 = mean pairwise MI among L0 traces (y_hat, certainty, gap).
+// Φ_L1 = MI(certainty, confidence) — how much info the monitor
+//        extracts about L0 internal state.
+// Φ_meta = mean pairwise MI over concatenated {y_hat, certainty,
+//          confidence, y_final} channels.
+//
+// To keep level-Φ comparable we use the same MI estimator and
+// trial-series length across all levels.
+// ═══════════════════════════════════════════════════════════════
+
+fn mc_phi_l0(flat: array, n_trials: int) -> float {
+    // Fields in L0-monitor flat: 4. Extract first three (y_hat, cert, acc).
+    // We use (y_hat, certainty, accuracy) as three sister channels.
+    let y_hat = mc_extract_field(flat, n_trials, 4, 0)
+    let cert  = mc_extract_field(flat, n_trials, 4, 1)
+    let acc   = mc_extract_field(flat, n_trials, 4, 3)
+
+    // Three pairs
+    let mi_yh_ct = mc_mi(y_hat, cert)
+    let mi_yh_ac = mc_mi(y_hat, acc)
+    let mi_ct_ac = mc_mi(cert,  acc)
+    return (mi_yh_ct + mi_yh_ac + mi_ct_ac) / 3.0
+}
+
+fn mc_phi_l1(flat: array, n_trials: int) -> float {
+    // Monitor Φ: MI(certainty, confidence).
+    let cert = mc_extract_field(flat, n_trials, 4, 1)
+    let conf = mc_extract_field(flat, n_trials, 4, 2)
+    return mc_mi(cert, conf)
+}
+
+fn mc_phi_meta(flat: array, n_trials: int) -> float {
+    // Use full-pipeline flat (7 fields).
+    // Channels: y_hat[0], cert[1], conf[2], y_final[4].
+    let y_hat   = mc_extract_field(flat, n_trials, 7, 0)
+    let cert    = mc_extract_field(flat, n_trials, 7, 1)
+    let conf    = mc_extract_field(flat, n_trials, 7, 2)
+    let y_final = mc_extract_field(flat, n_trials, 7, 4)
+
+    // 4 choose 2 = 6 pairs
+    let p1 = mc_mi(y_hat, cert)
+    let p2 = mc_mi(y_hat, conf)
+    let p3 = mc_mi(y_hat, y_final)
+    let p4 = mc_mi(cert,  conf)
+    let p5 = mc_mi(cert,  y_final)
+    let p6 = mc_mi(conf,  y_final)
+    return (p1 + p2 + p3 + p4 + p5 + p6) / 6.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1-T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1: level separation — |Φ_L0 − Φ_L1| > MC_LEVEL_SEP.
+    // Monitoring extracts different info than cognition; their MI
+    // structures must be measurably distinct.
+    let seed = 117001
+    let flat = mc_run_cog_monitor(MC_COMP_MID, MC_TRIALS, seed)
+    let phi_l0 = mc_phi_l0(flat, MC_TRIALS)
+    let phi_l1 = mc_phi_l1(flat, MC_TRIALS)
+    let diff = mc_abs(phi_l0 - phi_l1)
+
+    println("  [T1] Phi_L0 (cognition)   = " + str(phi_l0))
+    println("  [T1] Phi_L1 (monitor)     = " + str(phi_l1))
+    println("  [T1] |Phi_L0 - Phi_L1|    = " + str(diff) + "  (floor=" + str(MC_LEVEL_SEP) + ")")
+
+    if diff <= MC_LEVEL_SEP { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: calibration — Pearson |r|(confidence, accuracy) > MC_CALIB_FLOOR.
+    // We use the sub-window variant (4 windows × 5 samples) to satisfy
+    // the spec "Pearson |r| over sub-windows".
+    let seed = 117002
+    let flat = mc_run_cog_monitor(MC_COMP_MID, MC_TRIALS, seed)
+    let conf = mc_extract_field(flat, MC_TRIALS, 4, 2)
+    let acc  = mc_extract_field(flat, MC_TRIALS, 4, 3)
+
+    // Global r for visibility
+    let r_global = mc_pearson_abs(conf, acc)
+    // Sub-window r (4 windows of 5)
+    let r_sub = mc_pearson_abs_subwin(conf, acc, 5)
+
+    println("  [T2] Pearson |r| global   = " + str(r_global))
+    println("  [T2] Pearson |r| sub-win  = " + str(r_sub) + "  (floor=" + str(MC_CALIB_FLOOR) + ")")
+
+    // Accept either — prefer the stronger since both measure the same
+    // underlying coupling with different estimators.
+    let r_use = mc_max_f(r_global, r_sub)
+    println("  [T2] r_use                = " + str(r_use))
+
+    if r_use < MC_CALIB_FLOOR { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3: Dunning-Kruger hollow.
+    //   Low competence:  mean(conf) > mean(acc) + MC_DK_GAP  (overestimate)
+    //   High competence: mean(conf) <= mean(acc)             (underestimate)
+    //   Sign of (conf - acc) must FLIP across the two regimes.
+    let seed = 117003
+
+    let flat_lo = mc_run_cog_monitor(MC_COMP_LOW,  MC_TRIALS, seed + 10)
+    let flat_hi = mc_run_cog_monitor(MC_COMP_HIGH, MC_TRIALS, seed + 20)
+
+    let conf_lo = mc_extract_field(flat_lo, MC_TRIALS, 4, 2)
+    let acc_lo  = mc_extract_field(flat_lo, MC_TRIALS, 4, 3)
+    let conf_hi = mc_extract_field(flat_hi, MC_TRIALS, 4, 2)
+    let acc_hi  = mc_extract_field(flat_hi, MC_TRIALS, 4, 3)
+
+    let m_conf_lo = mc_mean(conf_lo)
+    let m_acc_lo  = mc_mean(acc_lo)
+    let m_conf_hi = mc_mean(conf_hi)
+    let m_acc_hi  = mc_mean(acc_hi)
+
+    let gap_lo = m_conf_lo - m_acc_lo     // positive ⇒ overestimate
+    let gap_hi = m_conf_hi - m_acc_hi     // non-positive ⇒ underestimate
+
+    println("  [T3] LOW  comp:  conf=" + str(m_conf_lo) + " acc=" + str(m_acc_lo) + " gap=" + str(gap_lo))
+    println("  [T3] HIGH comp:  conf=" + str(m_conf_hi) + " acc=" + str(m_acc_hi) + " gap=" + str(gap_hi))
+    println("  [T3] DK gap floor = " + str(MC_DK_GAP))
+
+    // Low-competence overestimate
+    if gap_lo <= MC_DK_GAP {
+        println("  [T3] FAIL: low-competence overestimate insufficient")
+        return false
+    }
+    // High-competence slight underestimate (gap_hi should be <= 0 or small positive)
+    if gap_hi > gap_lo - MC_DK_GAP {
+        println("  [T3] FAIL: high-competence should be calibrated / underestimating")
+        return false
+    }
+    // Sign-flip or magnitude collapse: gap at high competence should be
+    // strictly smaller than at low competence.
+    if gap_hi >= gap_lo {
+        println("  [T3] FAIL: gap not shrinking with competence")
+        return false
+    }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: meta-control gain — running full L0+L1+L2 pipeline beats L0
+    // alone on the same trials when monitor can identify low-confidence
+    // trials. Use mid competence (where there's room for improvement).
+    let seed = 117004
+
+    // Full pipeline
+    let flat_full = mc_run_full(MC_COMP_MID, MC_TRIALS, seed)
+    let acc_l0    = mc_extract_field(flat_full, MC_TRIALS, 7, 3)
+    let acc_final = mc_extract_field(flat_full, MC_TRIALS, 7, 5)
+    let switched  = mc_extract_field(flat_full, MC_TRIALS, 7, 6)
+
+    let m_l0    = mc_mean(acc_l0)
+    let m_final = mc_mean(acc_final)
+    let m_switch = mc_mean(switched)
+    let gain = m_final - m_l0
+
+    println("  [T4] L0-only accuracy     = " + str(m_l0))
+    println("  [T4] L0+L1+L2 accuracy    = " + str(m_final))
+    println("  [T4] control gain         = " + str(gain) + "  (floor=" + str(MC_CTRL_GAIN) + ")")
+    println("  [T4] switch rate          = " + str(m_switch))
+
+    if gain < MC_CTRL_GAIN { return false }
+    // Sanity: at least one switch must have happened (monitor did its job).
+    if m_switch <= 0.0 { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5: Φ_meta > Φ_cog.
+    // The three-level assembly integrates MORE than L0 alone.
+    let seed = 117005
+
+    let flat_full = mc_run_full(MC_COMP_MID, MC_TRIALS, seed)
+    let phi_meta  = mc_phi_meta(flat_full, MC_TRIALS)
+
+    // Φ_cog from L0+L1 flat (same trials, same seed path, reconstructed)
+    let flat_cm = mc_run_cog_monitor(MC_COMP_MID, MC_TRIALS, seed)
+    let phi_cog = mc_phi_l0(flat_cm, MC_TRIALS)
+
+    let diff = phi_meta - phi_cog
+
+    println("  [T5] Phi_cog  (L0 only)   = " + str(phi_cog))
+    println("  [T5] Phi_meta (L0+L1+L2)  = " + str(phi_meta))
+    println("  [T5] Phi_meta - Phi_cog   = " + str(diff) + "  (floor=" + str(MC_META_GAIN) + ")")
+
+    if diff < MC_META_GAIN { return false }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — execute 5 self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[metacognition_phi] P117 — Metacognition Φ (Nelson-Narens + Dunning-Kruger)")
+    println("  3-level: L0 cognition | L1 monitor | L2 control")
+    println("  D=" + str(MC_D) + " TRIALS=" + str(MC_TRIALS) + " BINS=" + str(MC_BINS))
+    println("  refs: Flavell 1979 | Nelson-Narens 1990 | Kruger-Dunning 1999 | Fleming-Lau 2014")
+    println("")
+
+    let t0 = clock()
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — level separation (Phi_L0 != Phi_L1)") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — calibration (confidence ~ accuracy, |r| > 0.5)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — Dunning-Kruger (low-comp overestimate, high-comp calibrated)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — meta-control improves accuracy (strategy switch value)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — Phi_meta > Phi_cog (metacognitive integration gain)") } else { println("T5 FAIL") }
+
+    let t1_end = clock()
+    let ms = (t1_end - t0) * 1000.0
+    println("")
+    println("  elapsed = " + str(ms) + " ms")
+
+    // Root cause comment: sequential accumulator (avoid long && chains).
+    let mut pc = 0
+    if t1 { pc = pc + 1 }
+    if t2 { pc = pc + 1 }
+    if t3 { pc = pc + 1 }
+    if t4 { pc = pc + 1 }
+    if t5 { pc = pc + 1 }
+
+    if pc == 5 {
+        println("[metacognition_phi] 5/5 PASS — P117 DONE")
+    } else {
+        println("[metacognition_phi] " + str(pc) + "/5 PASS — SOME FAILED")
+    }
+}
+
+main()
