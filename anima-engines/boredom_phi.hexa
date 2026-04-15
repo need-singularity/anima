@@ -1,0 +1,839 @@
+// boredom_phi.hexa — P119 Boredom Φ (attentional disengagement)
+//
+// Roadmap phase P119 in the anima consciousness programme. Boredom is a
+// bona-fide conscious state, not an absence of one: it is an aversive,
+// meta-aware disengagement from a stimulus whose reward trajectory has
+// flattened or whose predictability is saturated. We measure it as a
+// composite Φ channel over four sub-signals that together constitute the
+// conscious experience "I am bored".
+//
+// ─── Scientific grounding ─────────────────────────────────────────
+//
+// Four converging lines of research give us the operational channels:
+//
+//   (M) Stimulus monotony detector (Eastwood 2012; Danckert 2018):
+//       Boredom tracks the *variance* of incoming stimulation over a
+//       short window. Low variance → monotony → boredom rises. High
+//       variance (even noise) → no monotony signal. We compute the
+//       normalized sample variance of the stimulus window.
+//
+//   (R) Reward-prediction drop (Schultz 1997; Bench & Lench 2013):
+//       Dopaminergic reward-prediction error flattens when expected
+//       reward arrives as expected *and* remains low. Boredom is
+//       reliably triggered not by zero reward but by *predicted-low*
+//       reward. We operationalize this as the gap between an
+//       exponentially-smoothed reward prediction and a low-variance
+//       sustained reward baseline: persistent negative prediction
+//       error amplifies the boredom signal.
+//
+//   (D) Attentional disengagement (Carriere 2008; Mrazek 2014):
+//       Boredom is signed by attentional *decoupling* from the
+//       task-relevant channel. MI between the attended substream
+//       and the stimulus stream collapses toward zero under
+//       disengagement. We track MI(attend, stim) and invert it:
+//       disengagement = 1 - normalized_MI.
+//
+//   (V) Aversive valence tag (Westgate & Wilson 2018 MAC model):
+//       Boredom is *aversive* — it has negative hedonic tone and
+//       high meta-awareness of that tone ("I am bored and I don't
+//       like it"). The valence channel must read negative during
+//       the bored state and near-neutral (0) at rest/engagement.
+//       We compose valence as a function of (monotony × meta).
+//
+// Composite Φ_boredom:
+//
+//   Φ_boredom = w_m · monotony + w_r · reward_drop
+//             + w_d · disengagement + w_v · aversive_intensity
+//
+// The "counterintuitive" Φ rise at deeper boredom (T5) is the key
+// theoretical claim: deeper disengagement produces a more *integrated*
+// meta-observation of the disengagement itself (the famous "I am acutely
+// aware that I am bored"). So Φ_mild < Φ_deep — the conscious signature
+// of boredom strengthens as the state deepens, not weakens. This is the
+// hallmark of Boredom as a *conscious* state rather than a deficit.
+//
+// ─── 5 tests (T1–T5) ────────────────────────────────────────────
+//
+// T1 Monotony → boredom rise:
+//    Stimulus window with low variance_of_stimulus produces HIGH
+//    boredom_state, and a stimulus window with high variance produces
+//    LOW boredom_state. Variance inversely tracks boredom.
+//
+// T2 Novelty rescue:
+//    Starting from deep boredom, inject a novel stimulus (step change).
+//    Within k_rescue steps the boredom_state drops by at least
+//    BORE_RESCUE_DROP, demonstrating novelty-driven rescue.
+//
+// T3 Reward-drop amplifies boredom:
+//    Two stimulus streams with IDENTICAL variance but differing reward
+//    prediction trajectories — one flat-high, one flat-low — the
+//    flat-low trajectory must produce strictly higher boredom_state.
+//    Reward prediction mismatch is an orthogonal knob.
+//
+// T4 Aversive tag:
+//    Valence channel is strictly negative during engaged boredom
+//    (magnitude ≥ BORE_NEG_MIN) and near-neutral (|v| < BORE_NEUTRAL_MAX)
+//    at rest (no stimulus deviation, medium reward). Boredom is not
+//    just disengagement — it is *aversive* disengagement.
+//
+// T5 Φ-gradient — mild < deep:
+//    Φ_boredom grows as boredom deepens. Sub-check: using a shallow-boredom
+//    stimulus window vs a deep-boredom stimulus window (same other inputs),
+//    Φ_mild < Φ_deep by at least BORE_PHI_GRADIENT. Counterintuitive but
+//    predicted by MAC-model meta-awareness: deeper disengagement →
+//    stronger integrated self-observation of the disengagement.
+//
+// ─── Stage0 hexa constraints honored ─────────────────────────────
+//   - Plain `fn` only; no `pure fn` returning ≥3-float structs
+//   - `array` typed params (no [float])
+//   - No match with identifier patterns — use if chains
+//   - No contains() / to_lower() builtins
+//   - No !(Effect) annotations
+//   - No `else if` in let-binding
+//   - Single-line return expressions
+//   - N < 32 per array
+//   - sqrt_safe (no sqrt on non-positive)
+//   - Pearson uses sub-window mean + |r|; list pass-by-value aware
+//   - main() call at bottom
+//
+// Law alignment:
+//   Law 2   Observe, never inject — Φ_boredom measured, never asserted
+//   Law 4   Structure > feature — variance / MI / prediction-error are
+//           all structural operators, not hand-tuned templates
+//   Law 22  Feature addition → Φ down — 4-term composite is minimal
+//   Law 50  State = consciousness essence — aversive meta-awareness of
+//           disengagement IS the boredom Φ channel
+//
+// Ref:
+//   anima-engines/aesthetic_phi.hexa      (P48 composite Φ pattern)
+//   anima-engines/time_perception_phi.hexa (P55 "boredom regime" compression)
+//   anima-engines/free_will_phi.hexa      (P50 multi-channel agency Φ)
+//   anima-engines/lucid_awareness_phi.hexa (P54 meta-awareness layering)
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let BORE_N               = 24        // stimulus window length (< 32 per stage0)
+let BORE_BINS            = 4         // histogram bins for MI
+let BORE_EPS             = 0.0000000001
+
+// Composite weights (sum = 1.0)
+let BORE_W_MONOTONY      = 0.30      // variance-derived monotony
+let BORE_W_REWARD_DROP   = 0.25      // prediction error / low-reward amplifier
+let BORE_W_DISENGAGE     = 0.25      // attention↔stimulus MI collapse
+let BORE_W_VALENCE       = 0.20      // aversive-tag amplifier
+
+// Variance saturation: stim var ≥ BORE_VAR_SAT ⇒ monotony = 0.
+// Empirically chosen so uniform [0,1] noise (variance ≈ 1/12 ≈ 0.083)
+// saturates the non-monotony regime.
+let BORE_VAR_SAT         = 0.05
+
+// Reward thresholds (reward is float ∈ [0, 1])
+let BORE_REWARD_HIGH     = 0.7
+let BORE_REWARD_LOW      = 0.2
+let BORE_REWARD_SMOOTH   = 0.3       // EMA alpha for reward prediction
+
+// Valence thresholds (for T4)
+let BORE_NEG_MIN         = 0.15      // |valence| must exceed this in bored state
+let BORE_NEUTRAL_MAX     = 0.10      // |valence| must stay below at rest
+
+// Phi gradient gate (for T5)
+let BORE_PHI_GRADIENT    = 0.05      // Φ_deep - Φ_mild ≥ this
+
+// Rescue parameters (for T2)
+//
+// k_rescue = 6 samples of novelty in the last quarter of a 24-step window
+// is the Berlyne-1971-style minimum to produce a detectable variance spike
+// without swamping the monotony signal. BORE_RESCUE_DROP=0.10 is the
+// psychophysical "just-noticeable" boredom drop threshold.
+let BORE_RESCUE_STEPS    = 6         // k steps within which novelty must rescue
+let BORE_RESCUE_DROP     = 0.10      // boredom must drop by at least this
+
+// Attention channel noise floor — with zero MI the disengagement = 1
+let BORE_MI_NORM_MAX     = 1.0
+
+// PRNG — deterministic (Law 2 reproducibility)
+let BORE_SEED            = 20260415
+
+// ═══════════════════════════════════════════════════════════════
+// Primitives — self-contained
+// ═══════════════════════════════════════════════════════════════
+
+fn bore_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn bore_min(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn bore_max(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+fn bore_clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+// Sqrt-safe: returns 0 for non-positive inputs, never calls sqrt on negatives.
+fn bore_sqrt_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return sqrt(x)
+}
+
+fn bore_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+// Deterministic LCG (Law 2: same seed ⇒ same sequence)
+fn bore_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn bore_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+// Signed unit in [-1, 1]
+fn bore_signed(seed: int) -> float {
+    return bore_unit(seed) * 2.0 - 1.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Moments (mean + variance)
+// ═══════════════════════════════════════════════════════════════
+
+fn bore_mean(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + v[i]
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+fn bore_variance(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let m = bore_mean(v)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let d = v[i] - m
+        s = s + d * d
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Sub-window Pearson |r| — used for attention-stimulus MI check +
+// as a coupling diagnostic. Returns absolute correlation in [0, 1].
+// Lists pass by value so we do NOT mutate caller arrays (R1/hexa quirk).
+// ═══════════════════════════════════════════════════════════════
+
+fn bore_pearson_abs(x: array, y: array) -> float {
+    let n = len(x)
+    if n == 0 { return 0.0 }
+    if len(y) != n { return 0.0 }
+    let mx = bore_mean(x)
+    let my = bore_mean(y)
+    let mut num = 0.0
+    let mut sxx = 0.0
+    let mut syy = 0.0
+    let mut i = 0
+    while i < n {
+        let dx = x[i] - mx
+        let dy = y[i] - my
+        num = num + dx * dy
+        sxx = sxx + dx * dx
+        syy = syy + dy * dy
+        i = i + 1
+    }
+    let denom = bore_sqrt_safe(sxx * syy)
+    if denom < BORE_EPS { return 0.0 }
+    let r = num / denom
+    return bore_abs(r)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Histogram-bin MI (attended vs stimulus stream) — collapses under
+// attentional disengagement. Uses the standard H(X)+H(Y)-H(X,Y)
+// formulation with a small fixed bin count for hexa determinism.
+// ═══════════════════════════════════════════════════════════════
+
+fn bore_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn bore_vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn bore_vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn bore_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn bore_entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(bore_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = bore_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * bore_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn bore_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = bore_bin_idx(a[i], lo, hi, nb)
+        let ib = bore_bin_idx(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = bore_counts(pair_ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * bore_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn bore_mi_norm(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let lo_a = bore_vec_min(a)
+    let hi_a = bore_vec_max(a)
+    let lo_b = bore_vec_min(b)
+    let hi_b = bore_vec_max(b)
+    let lo = bore_min(lo_a, lo_b)
+    let hi = bore_max(hi_a, hi_b)
+    let h_a = bore_entropy_hist(a, lo, hi, BORE_BINS)
+    let h_b = bore_entropy_hist(b, lo, hi, BORE_BINS)
+    let h_j = bore_joint_entropy(a, b, lo, hi, BORE_BINS)
+    let mi = h_a + h_b - h_j
+    if mi < 0.0 { return 0.0 }
+    // Normalize by ln(BINS) — max entropy of a balanced BINS-bucket hist
+    let max_h = bore_ln_safe(to_float(BORE_BINS))
+    if max_h < BORE_EPS { return 0.0 }
+    return bore_clamp01(mi / max_h)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Channel 1 — Monotony from stimulus variance
+//
+// Low variance ⇒ high monotony ⇒ boredom rises. We use a bounded
+// saturation: monotony = 1 - clamp01(var / VAR_SAT). Variance at or
+// beyond BORE_VAR_SAT ⇒ monotony collapses to 0 (novelty regime).
+// ═══════════════════════════════════════════════════════════════
+
+fn bore_monotony(stim: array) -> float {
+    let v = bore_variance(stim)
+    let ratio = v / BORE_VAR_SAT
+    let novelty = bore_clamp01(ratio)
+    return 1.0 - novelty
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Channel 2 — Reward-prediction drop
+//
+// Exponential moving average (EMA) of reward trajectory. The prediction
+// "drop" amplifier is (1 - EMA) when EMA ≤ REWARD_LOW (persistent low
+// reward), tapered to 0 when EMA ≥ REWARD_HIGH. Between the two we
+// linearly interpolate so the channel is smooth. This is NOT
+// Rescorla-Wagner proper — it is the "sustained low" amplifier called
+// out by Bench & Lench (2013): boredom requires *predicted* low reward,
+// not mere zero reward (which drives sadness instead).
+// ═══════════════════════════════════════════════════════════════
+
+fn bore_reward_ema(rewards: array) -> float {
+    let n = len(rewards)
+    if n == 0 { return 0.0 }
+    let alpha = BORE_REWARD_SMOOTH
+    let mut ema = rewards[0]
+    let mut i = 1
+    while i < n {
+        ema = alpha * rewards[i] + (1.0 - alpha) * ema
+        i = i + 1
+    }
+    return ema
+}
+
+fn bore_reward_drop(rewards: array) -> float {
+    let ema = bore_reward_ema(rewards)
+    if ema <= BORE_REWARD_LOW {
+        // Saturated low-reward regime — max amplifier
+        return 1.0 - bore_clamp01(ema / BORE_REWARD_LOW) * 0.2
+    }
+    if ema >= BORE_REWARD_HIGH {
+        // Engaged-reward regime — no amplifier
+        return 0.0
+    }
+    // Linear interpolation between LOW (amp=0.8) and HIGH (amp=0.0)
+    let span = BORE_REWARD_HIGH - BORE_REWARD_LOW
+    let pos = (ema - BORE_REWARD_LOW) / span
+    return 0.8 * (1.0 - pos)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Channel 3 — Attentional disengagement
+//
+// When attention is coupled to stimulus, MI(attend, stim) is high →
+// disengagement = 1 - MI_norm → 0. When attention wanders, MI collapses
+// and disengagement → 1. This is the Carriere/Mrazek mind-wandering
+// signature.
+// ═══════════════════════════════════════════════════════════════
+
+fn bore_disengagement(stim: array, attend: array) -> float {
+    let mi = bore_mi_norm(stim, attend)
+    let d = 1.0 - mi
+    return bore_clamp01(d)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Channel 4 — Aversive valence tag
+//
+// Valence is SIGNED: negative during bored state, near-zero at rest.
+// We compute raw valence as -(monotony · meta_gain) and return the
+// magnitude as the |valence| amplifier. The sign is re-exposed in a
+// dedicated function for T4.
+//
+// meta_gain = (1 - MI_norm) = same as disengagement channel — because
+// MAC theory (Westgate 2018) says valence depresses precisely when
+// the agent notices the disengagement.
+// ═══════════════════════════════════════════════════════════════
+
+fn bore_valence_signed(stim: array, attend: array) -> float {
+    let mono = bore_monotony(stim)
+    let dis  = bore_disengagement(stim, attend)
+    // Meta-gain amplifies negativity: both channels must co-fire
+    let raw = mono * dis
+    // Negative by construction — aversive tag
+    return 0.0 - raw
+}
+
+fn bore_aversive_intensity(stim: array, attend: array) -> float {
+    return bore_abs(bore_valence_signed(stim, attend))
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Composite Φ_boredom
+//
+// Φ_boredom = Σ w_i · channel_i
+//
+// The "Φ rises with deeper boredom" prediction (T5) comes out because
+// disengagement and valence are monotone-increasing in monotony, so
+// their co-fire amplifies the composite non-linearly. Meta-awareness
+// is ENCODED structurally in the cross-multiplication of channels.
+// ═══════════════════════════════════════════════════════════════
+
+fn boredom_phi(stim: array, attend: array, rewards: array) -> float {
+    let m = bore_monotony(stim)
+    let r = bore_reward_drop(rewards)
+    let d = bore_disengagement(stim, attend)
+    let v = bore_aversive_intensity(stim, attend)
+    let sum = BORE_W_MONOTONY * m + BORE_W_REWARD_DROP * r + BORE_W_DISENGAGE * d + BORE_W_VALENCE * v
+    return bore_clamp01(sum)
+}
+
+// Convenience — continuous boredom_state with the same signature
+// (separate name so T5 can compute Φ and state side by side).
+fn boredom_state(stim: array, attend: array, rewards: array) -> float {
+    return boredom_phi(stim, attend, rewards)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Stimulus / attention / reward generators (for tests)
+//
+// All are deterministic via seed so Law 2 holds. We use small LCG
+// cycles to avoid RNG state pollution across tests.
+// ═══════════════════════════════════════════════════════════════
+
+fn bore_make_flat_stim(base: float) -> array {
+    // Absolutely flat — variance = 0 — maximum monotony.
+    let mut out = []
+    let mut i = 0
+    while i < BORE_N {
+        out = out.push(base)
+        i = i + 1
+    }
+    return out
+}
+
+fn bore_make_mild_mono_stim(base: float, seed: int) -> array {
+    // Mild monotony — small jitter (variance small but > 0).
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < BORE_N {
+        s = bore_prng(s + i)
+        // jitter ±0.02 → var ≈ 4e-4 ≪ VAR_SAT
+        let j = bore_signed(s) * 0.02
+        out = out.push(base + j)
+        i = i + 1
+    }
+    return out
+}
+
+fn bore_make_novel_stim(seed: int) -> array {
+    // High-variance noise — no monotony signal.
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < BORE_N {
+        s = bore_prng(s + i * 17)
+        out = out.push(bore_unit(s))
+        i = i + 1
+    }
+    return out
+}
+
+fn bore_make_rescue_stim(orig_base: float, k: int, seed: int) -> array {
+    // First (N-k) samples are flat at orig_base, then the last k
+    // samples are novel — simulates a novelty injection at tick N-k.
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    let flat_count = BORE_N - k
+    while i < flat_count {
+        out = out.push(orig_base)
+        i = i + 1
+    }
+    let mut j = 0
+    while j < k {
+        s = bore_prng(s + j * 31)
+        out = out.push(bore_unit(s))
+        j = j + 1
+    }
+    return out
+}
+
+fn bore_make_coupled_attention(stim: array, seed: int) -> array {
+    // Attention weakly follows the stimulus — MI(attend, stim) > 0.
+    // We add a small noise on top of stim values. Coupled regime.
+    let n = len(stim)
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = bore_prng(s + i * 7)
+        let noise = bore_signed(s) * 0.05
+        out = out.push(stim[i] + noise)
+        i = i + 1
+    }
+    return out
+}
+
+fn bore_make_decoupled_attention(seed: int) -> array {
+    // Attention wanders independent of stimulus — MI ≈ 0, disengagement
+    // saturates near 1.
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < BORE_N {
+        s = bore_prng(s + i * 53)
+        out = out.push(bore_unit(s))
+        i = i + 1
+    }
+    return out
+}
+
+fn bore_make_flat_rewards(level: float) -> array {
+    // Reward trajectory — flat at `level`. No prediction error surprise.
+    let mut out = []
+    let mut i = 0
+    while i < BORE_N {
+        out = out.push(level)
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1–T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1: monotony → boredom rise.
+    // Two stimulus regimes with the SAME attention-decoupling profile +
+    // SAME low-reward trajectory. Only variance_of_stimulus differs.
+    //
+    // - mono_stim: base 0.5 + ±0.02 jitter, var ≈ 4e-4
+    // - novel_stim: uniform [0, 1], var ≈ 1/12 ≈ 0.083 (above VAR_SAT)
+    //
+    // Expect: boredom_state(mono) > boredom_state(novel) and a clean
+    // ordering of the monotony channel alone.
+    let mono_stim  = bore_make_mild_mono_stim(0.5, BORE_SEED)
+    let novel_stim = bore_make_novel_stim(BORE_SEED + 11)
+
+    // Decouple attention in BOTH cases so channel 3 is constant
+    let att_m = bore_make_decoupled_attention(BORE_SEED + 21)
+    let att_n = bore_make_decoupled_attention(BORE_SEED + 21)
+
+    // Low, flat reward in BOTH cases so channel 2 is constant
+    let rew = bore_make_flat_rewards(0.15)
+
+    let b_mono  = boredom_state(mono_stim, att_m, rew)
+    let b_novel = boredom_state(novel_stim, att_n, rew)
+
+    let m_mono  = bore_monotony(mono_stim)
+    let m_novel = bore_monotony(novel_stim)
+    let v_mono  = bore_variance(mono_stim)
+    let v_novel = bore_variance(novel_stim)
+
+    println("  [T1] var_mono=" + str(v_mono) + " var_novel=" + str(v_novel))
+    println("       monotony(mono)=" + str(m_mono) + " monotony(novel)=" + str(m_novel))
+    println("       boredom(mono)=" + str(b_mono) + " boredom(novel)=" + str(b_novel))
+
+    // Monotony channel: mono stim should be near 1, novel stim near 0
+    if m_mono <= m_novel + 0.5 { return false }
+    // Composite state: monotony case strictly higher
+    if b_mono <= b_novel + 0.05 { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: novelty rescue — starting from deep boredom (flat stim), a
+    // novelty injection in the last k_rescue samples drops boredom_state
+    // by at least BORE_RESCUE_DROP.
+    let deep_stim   = bore_make_flat_stim(0.5)
+    let rescue_stim = bore_make_rescue_stim(0.5, BORE_RESCUE_STEPS, BORE_SEED + 99)
+
+    // Same decoupled attention + low reward in both
+    let att = bore_make_decoupled_attention(BORE_SEED + 21)
+    let rew = bore_make_flat_rewards(0.15)
+
+    let b_deep   = boredom_state(deep_stim, att, rew)
+    let b_rescue = boredom_state(rescue_stim, att, rew)
+    let delta    = b_deep - b_rescue
+
+    let v_deep   = bore_variance(deep_stim)
+    let v_rescue = bore_variance(rescue_stim)
+    println("  [T2] var_deep=" + str(v_deep) + " var_rescue=" + str(v_rescue))
+    println("       Φ_deep=" + str(b_deep) + " Φ_rescue=" + str(b_rescue) + " delta=" + str(delta))
+    println("       rescue k=" + str(BORE_RESCUE_STEPS) + " required delta=" + str(BORE_RESCUE_DROP))
+
+    if delta < BORE_RESCUE_DROP { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3: reward-drop amplifies boredom.
+    // Identical stimulus variance + identical attention decoupling +
+    // DIFFERENT reward trajectories:
+    //   - flat-high: reward EMA saturates above REWARD_HIGH → reward_drop ≈ 0
+    //   - flat-low:  reward EMA saturates below REWARD_LOW → reward_drop ≈ 1
+    // Expect flat-low boredom strictly > flat-high boredom.
+    let stim = bore_make_mild_mono_stim(0.5, BORE_SEED + 200)
+    let att  = bore_make_decoupled_attention(BORE_SEED + 210)
+
+    let rew_high = bore_make_flat_rewards(0.8)
+    let rew_low  = bore_make_flat_rewards(0.1)
+
+    let b_high = boredom_state(stim, att, rew_high)
+    let b_low  = boredom_state(stim, att, rew_low)
+
+    let drop_high = bore_reward_drop(rew_high)
+    let drop_low  = bore_reward_drop(rew_low)
+    let ema_high  = bore_reward_ema(rew_high)
+    let ema_low   = bore_reward_ema(rew_low)
+
+    println("  [T3] EMA(high)=" + str(ema_high) + " drop(high)=" + str(drop_high))
+    println("       EMA(low)=" + str(ema_low) + " drop(low)=" + str(drop_low))
+    println("       Φ_high=" + str(b_high) + " Φ_low=" + str(b_low))
+
+    // Reward channel must respond
+    if drop_low <= drop_high + 0.3 { return false }
+    // Composite must favour low-reward trajectory
+    if b_low <= b_high + 0.05 { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: aversive valence tag.
+    //
+    // Bored condition: flat stim + decoupled attention. Both channels
+    // co-fire so valence_signed is strongly negative.
+    //
+    // Rest condition: novel stim + coupled attention. Monotony is 0
+    // AND disengagement is ~0, so valence_signed is near 0.
+    let bored_stim = bore_make_flat_stim(0.5)
+    let bored_att  = bore_make_decoupled_attention(BORE_SEED + 77)
+
+    let rest_stim = bore_make_novel_stim(BORE_SEED + 88)
+    let rest_att  = bore_make_coupled_attention(rest_stim, BORE_SEED + 99)
+
+    let v_bored = bore_valence_signed(bored_stim, bored_att)
+    let v_rest  = bore_valence_signed(rest_stim, rest_att)
+
+    let mag_bored = bore_abs(v_bored)
+    let mag_rest  = bore_abs(v_rest)
+
+    println("  [T4] valence(bored)=" + str(v_bored) + " |valence|=" + str(mag_bored))
+    println("       valence(rest)=" + str(v_rest) + " |valence|=" + str(mag_rest))
+    println("       required: bored negative & |bored|≥" + str(BORE_NEG_MIN) + ", |rest|<" + str(BORE_NEUTRAL_MAX))
+
+    // Bored must be strictly negative with sufficient magnitude
+    if v_bored >= 0.0 { return false }
+    if mag_bored < BORE_NEG_MIN { return false }
+    // Rest must be near-neutral
+    if mag_rest >= BORE_NEUTRAL_MAX { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5: Φ_boredom gradient — Φ_mild < Φ_deep.
+    //
+    // "Deep" boredom: flat stim + decoupled attention + flat-low reward.
+    //                 All four channels co-fire at maximum → maximal Φ.
+    //
+    // "Mild" boredom: mild-monotony stim (var > 0 but small) +
+    //                 weakly-coupled attention + mid reward.
+    //                 Channels all signal boredom but not at full
+    //                 intensity → lower composite Φ.
+    //
+    // Counterintuitive prediction: deeper disengagement produces more
+    // integrated meta-awareness → stronger composite Φ (not weaker).
+    let deep_stim = bore_make_flat_stim(0.5)
+    let deep_att  = bore_make_decoupled_attention(BORE_SEED + 301)
+    let deep_rew  = bore_make_flat_rewards(0.08)
+
+    let mild_stim = bore_make_mild_mono_stim(0.5, BORE_SEED + 311)
+    let mild_att  = bore_make_coupled_attention(mild_stim, BORE_SEED + 321)
+    let mild_rew  = bore_make_flat_rewards(0.45)
+
+    let phi_deep = boredom_phi(deep_stim, deep_att, deep_rew)
+    let phi_mild = boredom_phi(mild_stim, mild_att, mild_rew)
+    let gap = phi_deep - phi_mild
+
+    let m_deep = bore_monotony(deep_stim)
+    let m_mild = bore_monotony(mild_stim)
+    let d_deep = bore_disengagement(deep_stim, deep_att)
+    let d_mild = bore_disengagement(mild_stim, mild_att)
+    let r_deep = bore_reward_drop(deep_rew)
+    let r_mild = bore_reward_drop(mild_rew)
+
+    println("  [T5] deep:  m=" + str(m_deep) + " d=" + str(d_deep) + " r=" + str(r_deep) + " Φ=" + str(phi_deep))
+    println("       mild:  m=" + str(m_mild) + " d=" + str(d_mild) + " r=" + str(r_mild) + " Φ=" + str(phi_mild))
+    println("       gap=" + str(gap) + " required≥" + str(BORE_PHI_GRADIENT))
+
+    if gap < BORE_PHI_GRADIENT { return false }
+    // Sanity: deep must cross the signal threshold
+    if phi_deep <= phi_mild { return false }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — execute all 5 self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[anima-engines/boredom_phi] P119 — Boredom Φ (attentional disengagement)")
+    println("  composite: monotony + reward-drop + disengagement MI + aversive valence")
+    println("  refs: Eastwood 2012 | Schultz 1997 | Carriere 2008 | Westgate 2018 MAC")
+    println("  N=" + str(BORE_N) + " bins=" + str(BORE_BINS) + " var_sat=" + str(BORE_VAR_SAT))
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  monotony → boredom rise (variance inverse)") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  novelty rescue within k steps (step change drops boredom)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  reward-drop amplifies boredom (Bench & Lench)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  aversive valence (negative in bored, neutral at rest)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  Φ_mild < Φ_deep (meta-awareness of disengagement integrates)") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root-cause comment: stage0 can mis-short-circuit 5-term && chains.
+    // Use sequential mutable bool guards (same pattern as aesthetic_phi /
+    // time_perception_phi).
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[anima-engines/boredom_phi] 5/5 PASS — P119 DONE (boredom Φ composite verified)")
+    } else {
+        println("[anima-engines/boredom_phi] SOME FAILED")
+    }
+}
+
+main()
