@@ -1,0 +1,190 @@
+// tests/test_expand_instruct_ko.hexa — URGENT-STUB P2 smoke harness
+//
+// 검증 대상: scripts/expand_instruct_ko.hexa 의 3 P2 함수
+//   1) quality_filter(SampleStd) -> QualityResult
+//   2) dedup_hash([SampleStd])   -> [SampleStd]
+//   3) convert_sample(SampleStd, fmt) -> ConvertResult
+//
+// 각 함수당 최소 3 케이스 (총 10 케이스). 모두 PASS 해야 ALL GREEN.
+//
+// 실행:
+//   HEXA_LOCAL=1 hexa run tests/test_expand_instruct_ko.hexa
+// (HEXA_LOCAL=1 = remote dispatch 끄고 로컬 stage0 사용)
+//
+// Hexa quirk 회피:
+//   - println 이 stage0 환경에서 라인을 2회 출력할 수 있음
+//     → 카운트는 한 번만 증가하도록 main() 안에서 직접 합산 (passed/total)
+//   - sibling use 는 안정적 (동일 폴더). cross-dir 은 불안정해
+//     test 파일은 scripts/expand_instruct_ko.hexa 를 cross-dir 로 import.
+//     실패 시 stage0 가 use error 를 던지면 즉시 ABORT 하므로 fail-loud.
+
+use "../scripts/expand_instruct_ko"
+
+fn _ek_assert(label: string, cond: bool, total_ref: int, passed_ref: int) -> int {
+    let flag = if cond { "PASS" } else { "FAIL" }
+    println(flag + "  " + label)
+    if cond { return 1 }
+    return 0
+}
+
+fn _ek_make(inst: string, inp: string, out: string) -> SampleStd {
+    return SampleStd { instruction: inst, input: inp, output: out }
+}
+
+fn main() {
+    println("=== test_expand_instruct_ko ===")
+
+    let mut total  = 0
+    let mut passed = 0
+
+    // ─────────────────────────────────────────────────────────────────
+    // (A) quality_filter — 3 cases
+    // ─────────────────────────────────────────────────────────────────
+
+    // A1: 정상 한국어 SFT pair (instruction + output 둘 다 한국어)
+    let s_a1 = _ek_make(
+        "다음 한국어 문장을 영어로 번역하시오: 안녕하세요.",
+        "",
+        "안녕하세요는 영어로 Hello 라는 뜻입니다."
+    )
+    let r_a1 = quality_filter(s_a1)
+    total = total + 1
+    passed = passed + _ek_assert("A1 quality_filter ok_pass", r_a1.pass && r_a1.reason == "ok", total, passed)
+
+    // A2: 너무 짧은 instruction (8 byte) → reject
+    let s_a2 = _ek_make("짧다", "", "이것은 충분히 긴 한국어 응답입니다.")
+    let r_a2 = quality_filter(s_a2)
+    total = total + 1
+    passed = passed + _ek_assert(
+        "A2 quality_filter reject_short_instruction",
+        r_a2.pass == false && r_a2.reason == "instruction_too_short",
+        total, passed
+    )
+
+    // A3: 영어 only (한글 ratio = 0) → reject
+    let s_a3 = _ek_make(
+        "Translate the following English sentence to Korean: hello world.",
+        "",
+        "The Korean translation is something I would normally provide here."
+    )
+    let r_a3 = quality_filter(s_a3)
+    total = total + 1
+    passed = passed + _ek_assert(
+        "A3 quality_filter reject_english_only",
+        r_a3.pass == false && r_a3.reason == "korean_ratio_too_low",
+        total, passed
+    )
+
+    // ─────────────────────────────────────────────────────────────────
+    // (B) dedup_hash — 3 cases
+    // ─────────────────────────────────────────────────────────────────
+
+    // B1: 4 sample 중 1 exact dup → 3 unique 반환
+    let b_in1 = _ek_make("질문 가나다 라마바", "", "응답 사거리 진리표")
+    let b_in2 = _ek_make("다른 질문 가야금", "", "다른 응답 한라산")
+    let b_in3 = _ek_make("질문 가나다 라마바", "", "응답 사거리 진리표")  // exact dup of b_in1
+    let b_in4 = _ek_make("세 번째 질문 거문도", "", "세 번째 응답 백두산")
+    let mut b_arr: [SampleStd] = []
+    b_arr = b_arr.push(b_in1)
+    b_arr = b_arr.push(b_in2)
+    b_arr = b_arr.push(b_in3)
+    b_arr = b_arr.push(b_in4)
+    let b_out = dedup_hash(b_arr)
+    total = total + 1
+    passed = passed + _ek_assert(
+        "B1 dedup_hash exact_dup_removed",
+        len(b_out) == 3,
+        total, passed
+    )
+
+    // B2: 모두 unique → 입력 그대로 통과
+    let c_in1 = _ek_make("질문 일", "", "응답 일")
+    let c_in2 = _ek_make("질문 이", "", "응답 이")
+    let c_in3 = _ek_make("질문 삼", "", "응답 삼")
+    let mut c_arr: [SampleStd] = []
+    c_arr = c_arr.push(c_in1)
+    c_arr = c_arr.push(c_in2)
+    c_arr = c_arr.push(c_in3)
+    let c_out = dedup_hash(c_arr)
+    total = total + 1
+    passed = passed + _ek_assert(
+        "B2 dedup_hash all_unique_passthrough",
+        len(c_out) == 3,
+        total, passed
+    )
+
+    // B3: empty input → empty output (edge case)
+    let mut d_arr: [SampleStd] = []
+    let d_out = dedup_hash(d_arr)
+    total = total + 1
+    passed = passed + _ek_assert(
+        "B3 dedup_hash empty_in_empty_out",
+        len(d_out) == 0,
+        total, passed
+    )
+
+    // ─────────────────────────────────────────────────────────────────
+    // (C) convert_sample — 3 cases
+    // ─────────────────────────────────────────────────────────────────
+
+    // C1: alpaca 형식 변환 — payload 에 "instruction" 키 + 한국어 escape 보존
+    let s_c1 = _ek_make("질문이 있어요", "맥락 정보", "응답입니다")
+    let r_c1 = convert_sample(s_c1, "alpaca")
+    let c1_ok = r_c1.ok
+                && r_c1.format == "alpaca"
+                && r_c1.payload.index_of("\"instruction\"") >= 0
+                && r_c1.payload.index_of("질문이 있어요") >= 0
+                && r_c1.payload.index_of("\"lang\":\"ko\"") >= 0
+    total = total + 1
+    passed = passed + _ek_assert("C1 convert_sample alpaca_ok", c1_ok, total, passed)
+
+    // C2: chatml 형식 변환 — messages 배열 + role/content 키 + 한국어 보존
+    let s_c2 = _ek_make("두 번째 질문", "추가 입력", "두 번째 답변")
+    let r_c2 = convert_sample(s_c2, "chatml")
+    let c2_ok = r_c2.ok
+                && r_c2.format == "chatml"
+                && r_c2.payload.index_of("\"messages\"") >= 0
+                && r_c2.payload.index_of("\"role\":\"user\"") >= 0
+                && r_c2.payload.index_of("\"role\":\"assistant\"") >= 0
+                && r_c2.payload.index_of("두 번째 답변") >= 0
+    total = total + 1
+    passed = passed + _ek_assert("C2 convert_sample chatml_ok", c2_ok, total, passed)
+
+    // C3: unknown 형식 → ok=false
+    let s_c3 = _ek_make("아무 질문", "", "아무 응답")
+    let r_c3 = convert_sample(s_c3, "fooml")
+    total = total + 1
+    passed = passed + _ek_assert(
+        "C3 convert_sample unknown_format_rejected",
+        r_c3.ok == false && r_c3.format == "unknown",
+        total, passed
+    )
+
+    // ─────────────────────────────────────────────────────────────────
+    // (D) bonus — quality_filter n-gram repetitive output (10번째 case)
+    // ─────────────────────────────────────────────────────────────────
+
+    // D1: 같은 4-byte 윈도우가 5번 등장하는 output → reject
+    let s_d1 = _ek_make(
+        "한국어 문장을 분석해 주세요.",
+        "",
+        "abcdabcdabcdabcdabcd 더미 한국어 문장 추가."
+    )
+    let r_d1 = quality_filter(s_d1)
+    total = total + 1
+    passed = passed + _ek_assert(
+        "D1 quality_filter reject_repetitive_ngram",
+        r_d1.pass == false && r_d1.reason == "ngram_repetitive_output",
+        total, passed
+    )
+
+    // ─────────────────────────────────────────────────────────────────
+    // Summary
+    // ─────────────────────────────────────────────────────────────────
+    println("")
+    println("=== summary: " + to_string(passed) + "/" + to_string(total) + " ===")
+    let verdict = if passed == total { "ALL GREEN" } else { "REGRESSION" }
+    println(verdict)
+}
+
+main()

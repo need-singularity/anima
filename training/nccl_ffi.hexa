@@ -1,0 +1,183 @@
+// ===============================================================
+//  training/nccl_ffi.hexa — minimal NCCL FFI stub for FSDP (C9)
+//
+//  This file is the boundary between hexa-native FSDP (fsdp_shard.hexa)
+//  and the NVIDIA NCCL collective comm library. It defines the small
+//  surface that fsdp_shard requires:
+//
+//      nccl_init(world_size, rank)               -> int
+//      nccl_broadcast_layer(owner, layer, D, FF) -> int
+//      nccl_reduce_scatter_layer(owner, layer, _) -> int
+//      nccl_barrier()                             -> int
+//      nccl_shutdown()                            -> int
+//      NCCL_TODO_RC                               (comptime const)
+//
+//  Single-rank guarantee: all calls below are NO-OPs that return 0
+//  when the global world size is 1. fsdp_shard.hexa's hot-path
+//  collectives short-circuit on `state.world_size <= 1` BEFORE
+//  reaching this layer, but we keep the explicit NO-OP here so a
+//  caller that bypasses the helper still gets the same behavior.
+//
+//  Multi-rank TODO:
+//
+//    To actually wire NCCL, this file should expose @extern bindings
+//    to the libnccl.so symbols below (see NVIDIA NCCL docs for the
+//    full prototype). The wiring is intentionally NOT done in the
+//    4-hour C9 budget — the design + API + single-rank correctness
+//    are the deliverable, and the multi-rank flip is a one-day
+//    follow-up once the H100×2 pod is allocated:
+//
+//        // libnccl.so prototypes (NVIDIA NCCL 2.x)
+//        ncclResult_t ncclCommInitRank(ncclComm_t* comm, int nranks,
+//                                      ncclUniqueId commId, int rank)
+//        ncclResult_t ncclBroadcast(const void* sendbuff, void* recvbuff,
+//                                   size_t count, ncclDataType_t datatype,
+//                                   int root, ncclComm_t comm,
+//                                   cudaStream_t stream)
+//        ncclResult_t ncclReduceScatter(const void* sendbuff, void* recvbuff,
+//                                       size_t recvcount, ncclDataType_t datatype,
+//                                       ncclRedOp_t op, ncclComm_t comm,
+//                                       cudaStream_t stream)
+//        ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff,
+//                                   size_t count, ncclDataType_t datatype,
+//                                   ncclRedOp_t op, ncclComm_t comm,
+//                                   cudaStream_t stream)
+//        ncclResult_t ncclCommDestroy(ncclComm_t comm)
+//
+//    The bindings would live in a hexa-lang sibling library
+//    `$HEXA_LANG/lib/hxnccl/` that compiles to libhxnccl.so with a
+//    handful of @extern fn declarations alongside cuda_ffi.hexa.
+//    Until that library is in place, fsdp_shard.hexa returns
+//    NCCL_TODO_RC (= 99) for any world_size > 1 collective so the
+//    caller fails loudly instead of silently desynchronizing.
+//
+//  References:
+//    - feedback_ai_native_clm.md (no PyTorch FSDP / DeepSpeed; we
+//      may FFI to CUDA/NCCL shared libraries from .hexa)
+//    - hexa-lang self/ml/collective_comm.hexa (CPU prototype of the
+//      ring AllReduce / AllGather we will emulate via NCCL)
+//    - hexa-lang self/ml/fsdp.hexa            (math correctness)
+//    - $HEXA_LANG/lib/yoga (existing C-FFI siblings to model after)
+// ===============================================================
+
+// ───────────────────────────────────────────────────────────────
+//  Module load marker.
+// ───────────────────────────────────────────────────────────────
+println("[nccl_ffi] loaded — single-rank no-op stub (multi-rank TODO behind libhxnccl.so)")
+
+// ───────────────────────────────────────────────────────────────
+//  Comptime constants.
+//
+//  NCCL_OK / NCCL_TODO_RC — return codes for the stub. The TODO
+//  code (99) is unique enough to flag in dashboards but not so
+//  large that it overflows hexa int parsing on log lines.
+// ───────────────────────────────────────────────────────────────
+
+comptime const NCCL_OK       = 0
+comptime const NCCL_TODO_RC  = 99
+
+// Module-level global so callers can read the current world size
+// without having to thread it through every helper. This is set
+// once by nccl_init() at process start.
+let mut NCCL_WORLD_SIZE = 1
+let mut NCCL_RANK       = 0
+let mut NCCL_INITED     = false
+
+// ───────────────────────────────────────────────────────────────
+//  nccl_init — set process-global world_size + rank. World size 1
+//  is a valid no-op init: every later collective short-circuits.
+//
+//  For multi-rank wiring this is where we would call
+//  ncclCommInitRank and store the resulting ncclComm_t in a
+//  module-level pointer. The hexa-side state below would still
+//  be needed because hexa calls cannot read a C struct opaque
+//  handle directly.
+// ───────────────────────────────────────────────────────────────
+
+fn nccl_init(world_size: int, rank: int) -> int {
+    NCCL_WORLD_SIZE = world_size
+    NCCL_RANK       = rank
+    NCCL_INITED     = true
+    if world_size <= 1 {
+        println("[nccl_ffi] nccl_init — single-rank, world_size=1 (no comm needed)")
+        return NCCL_OK
+    }
+    println("[nccl_ffi] nccl_init — TODO: world_size=" + str(world_size)
+            + " rank=" + str(rank) + " — multi-rank requires libhxnccl.so")
+    return NCCL_TODO_RC
+}
+
+fn nccl_shutdown() -> int {
+    if !NCCL_INITED { return NCCL_OK }
+    NCCL_INITED = false
+    if NCCL_WORLD_SIZE <= 1 { return NCCL_OK }
+    println("[nccl_ffi] nccl_shutdown — TODO: would call ncclCommDestroy")
+    return NCCL_TODO_RC
+}
+
+// nccl_world_size / nccl_rank — accessor helpers so callers do
+// not touch the module globals directly (cleaner test mocking).
+fn nccl_world_size() -> int { return NCCL_WORLD_SIZE }
+fn nccl_rank() -> int       { return NCCL_RANK }
+
+// ───────────────────────────────────────────────────────────────
+//  nccl_barrier — process-wide synchronization point. Used by
+//  fsdp_save_ckpt to ensure all ranks have finished writing
+//  their shard files before the launcher is allowed to upload
+//  to R2.
+//
+//  Single-rank: trivially OK. Multi-rank: would issue an
+//  ncclAllReduce on a 1-byte buffer (the canonical lightweight
+//  barrier impl in NCCL).
+// ───────────────────────────────────────────────────────────────
+
+fn nccl_barrier() -> int {
+    if NCCL_WORLD_SIZE <= 1 { return NCCL_OK }
+    println("[nccl_ffi] nccl_barrier — TODO: would issue ncclAllReduce(1B)")
+    return NCCL_TODO_RC
+}
+
+// ───────────────────────────────────────────────────────────────
+//  nccl_broadcast_layer — broadcast all 8 tensors of a transformer
+//  layer from `owner` rank to every other rank. Used by FSDP
+//  all-gather before each layer's forward.
+//
+//  Stub returns OK for world_size==1 (nothing to do) and TODO
+//  otherwise. The real call would be 8 ncclBroadcast invocations,
+//  one per (Wq, Wk, Wv, Wo, Wff1, Wff2, ga, gf) tensor.
+// ───────────────────────────────────────────────────────────────
+
+fn nccl_broadcast_layer(owner: int, layer_id: int, D: int, FF: int) -> int {
+    if NCCL_WORLD_SIZE <= 1 { return NCCL_OK }
+    println("[nccl_ffi] nccl_broadcast_layer — TODO: owner=" + str(owner)
+            + " layer=" + str(layer_id) + " D=" + str(D) + " FF=" + str(FF))
+    return NCCL_TODO_RC
+}
+
+// ───────────────────────────────────────────────────────────────
+//  nccl_reduce_scatter_layer — sum all 8 grad tensors of a
+//  transformer layer across ranks, leaving the result only on
+//  the `owner` rank. Used by FSDP after each layer's backward.
+//
+//  Stub returns OK for world_size==1. Real call would be 8
+//  ncclReduceScatter calls (one per tensor) with op=ncclSum.
+// ───────────────────────────────────────────────────────────────
+
+fn nccl_reduce_scatter_layer(owner: int, layer_id: int, _unused: int) -> int {
+    if NCCL_WORLD_SIZE <= 1 { return NCCL_OK }
+    println("[nccl_ffi] nccl_reduce_scatter_layer — TODO: owner=" + str(owner)
+            + " layer=" + str(layer_id))
+    return NCCL_TODO_RC
+}
+
+// ───────────────────────────────────────────────────────────────
+//  nccl_all_reduce_loss — sum the scalar loss across ranks for
+//  step-level logging consistency. Single-rank no-op; multi-rank
+//  would be a 1-element ncclAllReduce with op=ncclSum.
+// ───────────────────────────────────────────────────────────────
+
+fn nccl_all_reduce_loss(local_loss: float) -> float {
+    if NCCL_WORLD_SIZE <= 1 { return local_loss }
+    println("[nccl_ffi] nccl_all_reduce_loss — TODO: returning local")
+    return local_loss
+}

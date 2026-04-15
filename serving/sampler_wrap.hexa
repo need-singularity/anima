@@ -1,0 +1,139 @@
+// ═══════════════════════════════════════════════════════════════
+//  serving/sampler_wrap.hexa
+//
+//  D3 — thin inference-time sampler dispatch.
+//
+//  Not yet wired into http_server.hexa / hire_routes.hexa / style_switch.hexa
+//  (those are currently git-modified by the user). This wrapper is the
+//  drop-in entry point the caller will use once the user lands their
+//  serving changes:
+//
+//      let cfg = SamplerConfig {
+//          mode:             "orch_or",   // or "standard"
+//          temperature:      0.8,
+//          tension:          0.2,
+//          phi_holo_context: 1200.0,
+//          seed:             0            // 0 → non-deterministic
+//      }
+//      let out = sample_next_token(logits, cfg)
+//
+//  out.token_id is the vocab index to append to the generated sequence.
+//
+//  Modes:
+//    "standard" → classical softmax(logits/T) + LCG multinomial draw.
+//                 orch_or_used=0 always. Matches pre-D3 behavior.
+//    "orch_or"  → delegates to orch_or_sample() (Penrose-Hameroff).
+//                 orch_or_used=1 when the quantum-collapse path is taken.
+//
+//  Unknown mode → falls back to "standard" with a single stderr warning.
+// ═══════════════════════════════════════════════════════════════
+
+use "orch_or_sampler"
+
+struct SamplerConfig {
+    mode:             string,   // "standard" | "orch_or"
+    temperature:      float,
+    tension:          float,
+    phi_holo_context: float,
+    seed:             int
+}
+
+// ── Standard softmax + multinomial using the orch_or_sampler's own
+//    LCG helpers. We deliberately reuse oos_draw / oos_scale_logits
+//    rather than pull a second PRNG so determinism is uniform across
+//    modes given the same seed.
+fn sample_standard(
+    logits:      [float],
+    temperature: float,
+    seed:        int
+) -> OrchOrOut {
+    let n = len(logits)
+    if n == 0 {
+        return OrchOrOut { token_id: -1, orch_or_used: 0, quantum_variance: 0.0 }
+    }
+    if temperature <= 0.0 {
+        // greedy argmax (reuse orch_or path with T=0 — equivalent)
+        return orch_or_sample(logits, 0.0, 0.0, 0.0, 0)
+    }
+
+    // temperature-scaled softmax distribution
+    let scaled = oos_scale_logits(logits, temperature)
+    let probs = qcs_softmax_temp(scaled, 1.0)
+    let qvar = oos_variance_of(probs)
+
+    // LCG-based multinomial draw
+    let st0 = lcg_seed(seed)
+    let d = oos_draw(probs, st0)
+    return OrchOrOut {
+        token_id:         d.token,
+        orch_or_used:     0,
+        quantum_variance: qvar
+    }
+}
+
+// ── Public dispatch ──
+fn sample_next_token(logits: [float], cfg: SamplerConfig) -> OrchOrOut {
+    if cfg.mode == "orch_or" {
+        return orch_or_sample(
+            logits,
+            cfg.temperature,
+            cfg.tension,
+            cfg.phi_holo_context,
+            cfg.seed
+        )
+    }
+    if cfg.mode == "standard" {
+        return sample_standard(logits, cfg.temperature, cfg.seed)
+    }
+    // Unknown mode → standard fallback (single warn — printed every call
+    // intentionally, so that integration bugs surface loudly).
+    println("[sampler_wrap] WARN unknown mode='" + cfg.mode + "', falling back to standard")
+    return sample_standard(logits, cfg.temperature, cfg.seed)
+}
+
+// ── Module-level smoke (gated, avoids double-emission on `use`) ──
+let _sw_mode = env("SAMPLER_WRAP_SELFTEST")
+if _sw_mode == "1" {
+    println("[sw] sampler_wrap module self-smoke")
+    let mut _lg = []
+    let mut _i = 0
+    while _i < 16 {
+        _lg = _lg.push(0.1 * (_i * 1.0))
+        _i = _i + 1
+    }
+
+    let _cfg_std = SamplerConfig {
+        mode: "standard",
+        temperature: 1.0,
+        tension: 0.0,
+        phi_holo_context: 0.0,
+        seed: 123
+    }
+    let _r_std = sample_next_token(_lg, _cfg_std)
+    println("[sw] standard mode → tok=" + str(_r_std.token_id)
+          + " used=" + str(_r_std.orch_or_used))
+
+    let _cfg_or = SamplerConfig {
+        mode: "orch_or",
+        temperature: 1.0,
+        tension: 0.1,
+        phi_holo_context: 1000.0,
+        seed: 123
+    }
+    let _r_or = sample_next_token(_lg, _cfg_or)
+    println("[sw] orch_or  mode → tok=" + str(_r_or.token_id)
+          + " used=" + str(_r_or.orch_or_used))
+
+    let _cfg_gr = SamplerConfig {
+        mode: "orch_or",
+        temperature: 0.0,
+        tension: 0.0,
+        phi_holo_context: 0.0,
+        seed: 0
+    }
+    let _r_gr = sample_next_token(_lg, _cfg_gr)
+    println("[sw] T=0 greedy   → tok=" + str(_r_gr.token_id)
+          + " used=" + str(_r_gr.orch_or_used))
+
+    println("[sw] smoke done")
+}

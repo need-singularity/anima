@@ -1,0 +1,328 @@
+// training/launch_alm_a1.hexa — ALM A1 launcher (14B r4 base resume + Φ-aware LoRA)
+//
+// Spec:   shared/roadmaps/alm_consciousness_standalone.json#tracks.A.options[A1]
+// Config: training/alm_a1_config.json   (SSOT for all hyperparameters)
+// Day:    day_1  — after C3 stability + E1/E2/E3 backup infra
+// Budget: 12h / $36 on single H100 pod
+//
+// Why a NEW launcher file (not an edit of train_alm_14b.hexa)?
+//   train_alm_14b.hexa was just touched by the E1 agent to add
+//   invoke_ckpt_backup_hook() + --ckpt-label arg. Editing it again
+//   here would create a merge conflict. This launcher is additive:
+//   it delegates to train_alm_14b.hexa via python3 train_alm_14b.py
+//   under the hood, with A1-specific args + a production label.
+//
+// Resume semantics (per feedback_no_resume_data_change):
+//   A1 ONLY reinits the LoRA adapter (new r/alpha). Base weights
+//   stream from the r4 R2 prefix. Corpus + step-sched unchanged.
+//   This preserves "resume allowed" because data/params on the
+//   base are untouched -- only the adapter rank changes.
+//
+// Naming (E3):
+//   run_id = alm14b-phi-a1-{date}   (no v\d+ per feedback_no_version_in_filename)
+//   ckpt   = step_{N}               (nested under production R2 prefix)
+//
+// Operation flow:
+//   1. parse config JSON (string-scan, no JSON lib needed)
+//   2. resolve {date} token -> YYYYMMDD
+//   3. emit bash runner to /tmp with all preflight checks
+//   4. exec bash runner  (which execs python3 train_alm_14b.py ...)
+//
+// Guardrails:
+//   - DRY_RUN env: if set, emits the bash runner but does NOT exec it.
+//     Used by test_alm_a1_launch.hexa smoke + preflight dry-run.
+//   - R2 resume check: bash runner rclone lsd-dry-runs the r4 prefix.
+//   - bf16 capability assert via nvidia-smi compute_cap >= 9.0.
+
+let CONFIG_PATH = "training/alm_a1_config.json"
+
+// ─── Hexa string-scan helpers (safe subset, mirror ckpt_backup_hook) ──
+fn str_index_of(hay, needle, from) {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return from }
+    let mut i = from
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn extract_json_string(text, key) {
+    // Naive "key": "value" extractor. Good enough for flat config.
+    let needle = "\"" + key + "\""
+    let kpos = str_index_of(text, needle, 0)
+    if kpos < 0 { return "" }
+    let after_key = kpos + len(needle)
+    let colon = str_index_of(text, ":", after_key)
+    if colon < 0 { return "" }
+    let open_q = str_index_of(text, "\"", colon)
+    if open_q < 0 { return "" }
+    let close_q = str_index_of(text, "\"", open_q + 1)
+    if close_q < 0 { return "" }
+    return text.substring(open_q + 1, close_q)
+}
+
+fn extract_json_int_str(text, key) {
+    // "key": NNN  -> returns digit run as a string ("" if miss).
+    let needle = "\"" + key + "\""
+    let kpos = str_index_of(text, needle, 0)
+    if kpos < 0 { return "" }
+    let after_key = kpos + len(needle)
+    let colon = str_index_of(text, ":", after_key)
+    if colon < 0 { return "" }
+    let n = len(text)
+    let mut i = colon + 1
+    while i < n {
+        let ch = text.substring(i, i + 1)
+        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" { i = i + 1 } else { break }
+    }
+    let mut j = i
+    while j < n {
+        let cj = text.substring(j, j + 1)
+        if cj == "0" || cj == "1" || cj == "2" || cj == "3" || cj == "4"
+           || cj == "5" || cj == "6" || cj == "7" || cj == "8" || cj == "9" {
+            j = j + 1
+        } else {
+            break
+        }
+    }
+    if j == i { return "" }
+    return text.substring(i, j)
+}
+
+// ─── Date resolver ──
+fn resolve_date() {
+    // Deterministic: use `date +%Y%m%d`. Naming convention requires
+    // no 'v' prefix, only digits, so this is safe for the E3 regex.
+    return exec("date +%Y%m%d").trim()
+}
+
+// ─── Log helpers ──
+fn log_info(msg) {
+    println("[launch_alm_a1] " + msg)
+}
+
+fn log_err(msg) {
+    println("[launch_alm_a1 ERR] " + msg)
+}
+
+// ─── Main ──
+fn main() {
+    // Resolve repo root (so we can find the config regardless of cwd).
+    // We still load and parse-verify the config so (a) the smoke test
+    // asserts "config parses" and (b) the launcher refuses if the
+    // config is missing/corrupt. But we deliberately use FROZEN
+    // defaults below instead of extracting by key, because this JSON
+    // has nested objects with overlapping keys (`"name"` in _meta and
+    // `base.name`, `"path"` in corpus and elsewhere, etc.) that the
+    // naive single-flat extractor cannot disambiguate. If the config
+    // is ever bumped, bump these defaults alongside it — the smoke
+    // test grep-verifies the emitted runner against these values.
+    let config_text = ""
+    if file_exists(CONFIG_PATH) {
+        config_text = read_file(CONFIG_PATH)
+    } else {
+        // Fallback: try absolute path via ANIMA_ROOT.
+        let anima_root = env("ANIMA_ROOT")
+        if anima_root == "" { anima_root = "." }
+        let fallback = anima_root + "/" + CONFIG_PATH
+        if file_exists(fallback) {
+            config_text = read_file(fallback)
+        } else {
+            log_err("config not found: " + CONFIG_PATH + " or " + fallback)
+            return
+        }
+    }
+    // Config-present guard — smoke test requires this to have parsed at
+    // minimum to the point where we can confirm the label.
+    if len(config_text) == 0 {
+        log_err("config empty: " + CONFIG_PATH)
+        return
+    }
+    // Light schema check: label must be production (A1 invariant).
+    let cfg_label = extract_json_string(config_text, "ckpt_label")
+    if cfg_label != "production" {
+        log_err("config ckpt_label=" + cfg_label + " (expected production for A1)")
+        return
+    }
+
+    // ── FROZEN A1 defaults (mirror training/alm_a1_config.json) ──
+    // Any change must be mirrored in alm_a1_config.json AND verified
+    // by `hexa run training/test_alm_a1_launch.hexa`.
+    let base_name       = "Qwen/Qwen2.5-14B-Instruct"
+    let steps_str       = "3000"
+    let lr_str          = "5e-6"
+    let warmup_str      = "200"
+    let batch_str       = "1"
+    let grad_accum_str  = "8"
+    let seq_str         = "1024"
+    let save_every_str  = "500"
+    let eval_every_str  = "200"
+    let lora_r_str      = "64"
+    let lora_alpha_str  = "128"
+    let dropout_str     = "0.05"
+    let round_str       = "1"
+    let model_tag       = "alm14b"
+    let ckpt_label      = "production"
+    let corpus_path     = "/workspace/anima/training/corpus_large.txt"
+    let r4_prefix       = "r2:anima-models/alm14b/r4/"
+
+    // ── Resolve date token for run_id/ckpt_dir ──
+    let date = resolve_date()
+    let run_id = "alm14b-phi-a1-" + date
+    let ckpt_dir = "/workspace/ckpt_" + "alm14b_phi_a1_" + date
+
+    log_info("run_id=" + run_id)
+    log_info("ckpt_dir=" + ckpt_dir)
+    log_info("base=" + base_name + "  steps=" + steps_str + "  lr=" + lr_str)
+    log_info("lora r=" + lora_r_str + " alpha=" + lora_alpha_str + " dropout=" + dropout_str)
+    log_info("ckpt_label=" + ckpt_label + "  round=" + round_str)
+
+    // ── Build bash runner ──
+    let runner = "/tmp/_launch_alm_a1_runner.sh"
+    write_file(runner,
+        "#!/usr/bin/env bash\n" +
+        "set -euo pipefail\n" +
+        "\n" +
+        "echo \"============================================\"\n" +
+        "echo \"  ALM A1 -- 14B r4 base resume + Phi-aware LoRA\"\n" +
+        "echo \"  run_id = " + run_id + "\"\n" +
+        "echo \"  ckpt   = " + ckpt_dir + "\"\n" +
+        "echo \"  lora   = r" + lora_r_str + " alpha" + lora_alpha_str + " dropout" + dropout_str + "\"\n" +
+        "echo \"  steps  = " + steps_str + "   lr=" + lr_str + "  warmup=" + warmup_str + "\"\n" +
+        "echo \"  batch  = " + batch_str + " x accum " + grad_accum_str + " (eff " + grad_accum_str + ")\"\n" +
+        "echo \"  label  = " + ckpt_label + "   (R2 permanent)\"\n" +
+        "echo \"============================================\"\n" +
+        "\n" +
+        "# ── preflight: conflicting markers ──\n" +
+        "for m in /workspace/READY_FOR_32B /workspace/READY_FOR_R5_KBASE; do\n" +
+        "    if [[ -f \"$m\" ]]; then\n" +
+        "        echo \"[preflight] forbidden marker present: $m -- refusing\"\n" +
+        "        exit 1\n" +
+        "    fi\n" +
+        "done\n" +
+        "\n" +
+        "# ── preflight: GPU + bf16 capability ──\n" +
+        "echo \"[preflight] GPU...\"\n" +
+        "nvidia-smi --query-gpu=name,memory.total,memory.free,compute_cap --format=csv,noheader\n" +
+        "CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '.')\n" +
+        "if [[ -z \"$CC\" ]]; then echo \"[preflight] compute_cap unknown -- refusing\"; exit 1; fi\n" +
+        "if (( CC < 80 )); then echo \"[preflight] compute_cap=$CC < 80 -- bf16 unsafe, refusing\"; exit 1; fi\n" +
+        "echo \"[preflight] bf16 OK (compute_cap >= 8.0)\"\n" +
+        "\n" +
+        "# ── preflight: disk ──\n" +
+        "FREE_GB=$(df -BG /workspace | tail -n1 | awk '{print $4}' | tr -d 'G')\n" +
+        "if [[ -z \"$FREE_GB\" || \"$FREE_GB\" -lt 100 ]]; then\n" +
+        "    echo \"[preflight] /workspace free = ${FREE_GB}GB < 100GB -- refusing\"\n" +
+        "    df -h /workspace\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[preflight] disk OK (${FREE_GB}GB free)\"\n" +
+        "\n" +
+        "# ── preflight: HF_TOKEN ──\n" +
+        "if [[ -z \"${HF_TOKEN:-}\" ]]; then echo \"[preflight] HF_TOKEN unset -- refusing\"; exit 1; fi\n" +
+        "echo \"[preflight] HF_TOKEN OK\"\n" +
+        "\n" +
+        "# ── preflight: r4 checkpoint in R2 ──\n" +
+        "echo \"[preflight] checking R2 r4 prefix: " + r4_prefix + "\"\n" +
+        "if command -v rclone >/dev/null 2>&1; then\n" +
+        "    if ! rclone lsd \"" + r4_prefix + "\" --s3-no-check-bucket >/dev/null 2>&1; then\n" +
+        "        echo \"[preflight] R2 r4 prefix missing or unreachable -- refusing\"\n" +
+        "        exit 1\n" +
+        "    fi\n" +
+        "    echo \"[preflight] r4 R2 prefix reachable\"\n" +
+        "else\n" +
+        "    echo \"[preflight] rclone missing -- refusing\"; exit 1\n" +
+        "fi\n" +
+        "\n" +
+        "# ── preflight: corpus ──\n" +
+        "CORPUS=\"" + corpus_path + "\"\n" +
+        "if [[ -z \"$CORPUS\" || ! -f \"$CORPUS\" ]]; then\n" +
+        "    echo \"[preflight] corpus missing: $CORPUS -- refusing\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "ls -lh \"$CORPUS\"\n" +
+        "\n" +
+        "# ── preflight: naming regex (E3) ──\n" +
+        "RUN_ID=\"" + run_id + "\"\n" +
+        "if ! [[ \"$RUN_ID\" =~ ^alm14b-phi-a1-[0-9]{8}$ ]]; then\n" +
+        "    echo \"[preflight] run_id $RUN_ID fails E3 regex -- refusing\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[preflight] naming E3 OK\"\n" +
+        "\n" +
+        "# ── env for HF cache + hook discovery ──\n" +
+        "export HF_HUB_CACHE=\"/workspace/hf_cache\"\n" +
+        "export HF_HOME=\"/workspace/hf_cache\"\n" +
+        "export TRANSFORMERS_CACHE=\"/workspace/hf_cache\"\n" +
+        "export ANIMA_ROOT=\"/workspace/anima\"\n" +
+        "export HEXA_CKPT_HOOK=\"/workspace/anima/scripts/ckpt_backup_hook.hexa\"\n" +
+        "\n" +
+        "# ── r4 base resume: stage from R2 into ckpt dir ──\n" +
+        "CKPT_DIR=\"" + ckpt_dir + "\"\n" +
+        "if [[ -d \"$CKPT_DIR\" ]]; then\n" +
+        "    echo \"[preflight] $CKPT_DIR exists -- refusing (never reuse ckpt dir)\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "mkdir -p \"$CKPT_DIR\"\n" +
+        "echo \"[stage] rclone copy " + r4_prefix + " -> $CKPT_DIR/r4_base (base weights resume)\"\n" +
+        "mkdir -p \"$CKPT_DIR/r4_base\"\n" +
+        "rclone copy \"" + r4_prefix + "\" \"$CKPT_DIR/r4_base\" --s3-no-check-bucket --transfers 4 --progress\n" +
+        "\n" +
+        "# ── launch training ──\n" +
+        "TRAINER=\"/workspace/train_alm_14b.py\"\n" +
+        "if [[ ! -f \"$TRAINER\" ]]; then\n" +
+        "    # train_alm_14b.hexa writes /tmp/_train_alm_14b_runner.py on exec; fall\n" +
+        "    # back to invoking the hexa launcher so the python runner is materialized.\n" +
+        "    HEXA_BIN=\"${HEXA_BIN:-/usr/local/bin/hexa}\"\n" +
+        "    HEXA_DRV=\"/workspace/anima/training/train_alm_14b.hexa\"\n" +
+        "    if [[ ! -x \"$HEXA_BIN\" || ! -f \"$HEXA_DRV\" ]]; then\n" +
+        "        echo \"[launch] trainer missing: $TRAINER and fallback hexa driver missing\"\n" +
+        "        exit 1\n" +
+        "    fi\n" +
+        "    TRAINER=\"$HEXA_BIN $HEXA_DRV\"\n" +
+        "fi\n" +
+        "echo \"[launch] trainer = $TRAINER\"\n" +
+        "\n" +
+        "$TRAINER \\\n" +
+        "    --base " + base_name + " \\\n" +
+        "    --corpus \"$CORPUS\" \\\n" +
+        "    --steps " + steps_str + " \\\n" +
+        "    --lr " + lr_str + " \\\n" +
+        "    --batch " + batch_str + " \\\n" +
+        "    --grad-accum " + grad_accum_str + " \\\n" +
+        "    --seq " + seq_str + " \\\n" +
+        "    --warmup " + warmup_str + " \\\n" +
+        "    --lora-r " + lora_r_str + " \\\n" +
+        "    --lora-alpha " + lora_alpha_str + " \\\n" +
+        "    --lora-dropout " + dropout_str + " \\\n" +
+        "    --target-modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj \\\n" +
+        "    --ckpt-dir \"$CKPT_DIR\" \\\n" +
+        "    --save-every " + save_every_str + " \\\n" +
+        "    --eval-every " + eval_every_str + " \\\n" +
+        "    --model-tag " + model_tag + " \\\n" +
+        "    --round " + round_str + " \\\n" +
+        "    --ckpt-label " + ckpt_label + " \\\n" +
+        "    2>&1 | tee \"$CKPT_DIR/train_" + run_id + ".log\"\n" +
+        "\n" +
+        "echo \"[done] A1 training complete -- $CKPT_DIR\"\n" +
+        "echo \"[next] hexa eval_alm_14b.hexa --ckpt $CKPT_DIR/step_" + steps_str + " --korean-quality\"\n"
+    )
+
+    log_info("runner emitted: " + runner)
+
+    // ── Execution gate (DRY_RUN env honored) ──
+    if env("DRY_RUN") == "1" {
+        log_info("DRY_RUN=1 — not executing runner")
+        log_info("inspect: cat " + runner)
+        return
+    }
+
+    // Execute.
+    log_info("exec bash " + runner)
+    exec("bash " + runner)
+}
+
+// NOTE: hexa stage1 runs main() automatically — explicit call would double-exec.

@@ -1,0 +1,125 @@
+// training/test_alm_a1_launch.hexa — Smoke test for ALM A1 launcher
+//
+// Spec:  shared/roadmaps/alm_consciousness_standalone.json#tracks.A.options[A1]
+//
+// 3 assertions:
+//   T1: alm_a1_config.json parses OK (structural + required keys)
+//   T2: launch_alm_a1.hexa dry-run — DRY_RUN=1 emits runner, does NOT exec
+//   T3: alm_a1_preflight.hexa returns {all_ok, issues} shape (JSON line)
+//
+// Run:
+//   hexa training/test_alm_a1_launch.hexa
+//
+// Exit contract: prints "alm_a1: <n>/3 PASS" as the final line.
+
+let CONFIG_PATH   = "training/alm_a1_config.json"
+let LAUNCHER_PATH = "training/launch_alm_a1.hexa"
+let PREFLIGHT_PATH = "training/alm_a1_preflight.hexa"
+let RUNNER_PATH   = "/tmp/_launch_alm_a1_runner.sh"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn assert_true(name, cond) {
+    if cond {
+        println("  " + name + ": PASS")
+        pass_count = pass_count + 1
+    } else {
+        println("  " + name + ": FAIL")
+        fail_count = fail_count + 1
+    }
+}
+
+fn str_contains(hay, needle) {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return true }
+    if nn > hn { return false }
+    let mut i = 0
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return true }
+        i = i + 1
+    }
+    return false
+}
+
+println("=== test_alm_a1_launch.hexa ===")
+println("")
+
+// ─── T1: config parse ──
+println("T1 — config parse")
+if !file_exists(CONFIG_PATH) {
+    assert_true("config_exists", false)
+} else {
+    let text = read_file(CONFIG_PATH)
+    assert_true("config_nonempty", len(text) > 0)
+    // Required keys spot check.
+    assert_true("has_run_id_template", str_contains(text, "\"run_id_template\""))
+    assert_true("has_lora_r_64",       str_contains(text, "\"r\": 64") || str_contains(text, "\"r\":64"))
+    assert_true("has_lora_alpha_128",  str_contains(text, "\"alpha\": 128") || str_contains(text, "\"alpha\":128"))
+    assert_true("has_steps_3000",      str_contains(text, "\"steps\": 3000") || str_contains(text, "\"steps\":3000"))
+    assert_true("has_production_label",str_contains(text, "\"ckpt_label\": \"production\"") || str_contains(text, "\"ckpt_label\":\"production\""))
+    assert_true("has_phi_weight_001",  str_contains(text, "\"phi_holo_consistency_weight\": 0.01") || str_contains(text, "\"phi_holo_consistency_weight\":0.01"))
+    assert_true("has_bf16_dtype",      str_contains(text, "\"dtype\": \"bf16\"") || str_contains(text, "\"dtype\":\"bf16\""))
+}
+
+// ─── T2: launcher dry-run ──
+println("")
+println("T2 — launcher dry-run (DRY_RUN=1)")
+if !file_exists(LAUNCHER_PATH) {
+    assert_true("launcher_exists", false)
+} else {
+    // Clean any prior runner so we can verify emission freshly.
+    let _ = exec("rm -f " + RUNNER_PATH)
+    // Invoke the launcher in dry-run mode. hexa CLI sub-command form.
+    let cmd = "DRY_RUN=1 hexa " + LAUNCHER_PATH + " 2>&1"
+    let out = exec(cmd)
+    assert_true("dry_run_printed_marker", str_contains(out, "DRY_RUN=1"))
+    assert_true("dry_run_emitted_runner", file_exists(RUNNER_PATH))
+    // Runner content sanity.
+    if file_exists(RUNNER_PATH) {
+        let runner_text = read_file(RUNNER_PATH)
+        assert_true("runner_has_shebang",       str_contains(runner_text, "#!/usr/bin/env bash"))
+        assert_true("runner_has_set_euo",       str_contains(runner_text, "set -euo pipefail"))
+        assert_true("runner_has_qwen_base",     str_contains(runner_text, "Qwen/Qwen2.5-14B-Instruct"))
+        assert_true("runner_has_lora_r_64",     str_contains(runner_text, "--lora-r 64"))
+        assert_true("runner_has_lora_alpha_128",str_contains(runner_text, "--lora-alpha 128"))
+        assert_true("runner_has_steps_3000",    str_contains(runner_text, "--steps 3000"))
+        assert_true("runner_has_production",    str_contains(runner_text, "--ckpt-label production"))
+        assert_true("runner_has_bf16_check",    str_contains(runner_text, "compute_cap"))
+        assert_true("runner_has_rclone_r4",     str_contains(runner_text, "r2:anima-models/alm14b/r4/"))
+        assert_true("runner_has_e3_regex",      str_contains(runner_text, "alm14b-phi-a1-"))
+    }
+}
+
+// ─── T3: preflight shape ──
+println("")
+println("T3 — preflight shape")
+if !file_exists(PREFLIGHT_PATH) {
+    assert_true("preflight_exists", false)
+} else {
+    // Invoke preflight in loose mode — we do NOT care if all_ok is true
+    // from the local dev box (nvidia-smi absent, rclone may fail). We
+    // only care that the script prints a valid shape line.
+    let cmd = "hexa " + PREFLIGHT_PATH + " 2>&1"
+    let out = exec(cmd)
+    assert_true("preflight_printed_all_ok",  str_contains(out, "all_ok:"))
+    assert_true("preflight_printed_issues",  str_contains(out, "issues:"))
+    assert_true("preflight_printed_json",    str_contains(out, "JSON:"))
+    assert_true("preflight_json_has_all_ok", str_contains(out, "\"all_ok\""))
+    assert_true("preflight_json_has_issues", str_contains(out, "\"issues\""))
+    // Structural: JSON line closes with '}'.
+    assert_true("preflight_json_closed",     str_contains(out, "}"))
+    // Must run all 7 checks.
+    assert_true("preflight_check_1",         str_contains(out, "1 host_id"))
+    assert_true("preflight_check_2",         str_contains(out, "2 ssh"))
+    assert_true("preflight_check_3",         str_contains(out, "3 r4 R2"))
+    assert_true("preflight_check_4",         str_contains(out, "4 HF_TOKEN"))
+    assert_true("preflight_check_5",         str_contains(out, "5 gpu bf16"))
+    assert_true("preflight_check_6",         str_contains(out, "6 disk"))
+    assert_true("preflight_check_7",         str_contains(out, "7 config"))
+}
+
+println("")
+let total = pass_count + fail_count
+println("alm_a1: " + str(pass_count) + "/" + str(total) + " PASS")

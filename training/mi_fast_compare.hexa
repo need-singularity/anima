@@ -1,0 +1,298 @@
+// training/mi_fast_compare.hexa — numerical A/B between add_mi (engine path)
+// and mi_fast (LUT path), using synthetic traces shaped like addiction_phi
+// inputs (N=24, values in [-1, 1]).
+//
+// Pass criterion: |mi_old - mi_new| ≤ 0.01 on all test pairs.
+
+// ═══════════════════════════════════════════════════════════════
+// Old engine path — copied verbatim from addiction_phi.hexa (add_mi family)
+// ═══════════════════════════════════════════════════════════════
+
+let OLD_BINS = 6
+
+fn old_min_f(a: float, b: float) -> float { if a < b { return a }; return b }
+fn old_max_f(a: float, b: float) -> float { if a > b { return a }; return b }
+fn old_ln_safe(x: float) -> float { if x <= 0.0 { return 0.0 }; return ln(x) }
+
+fn old_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn old_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn old_entropy(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(old_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = old_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * old_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn old_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = old_bin_idx(a[i], lo, hi, nb)
+        let ib = old_bin_idx(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = old_counts(pair_ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * old_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn old_vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn old_vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn old_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let lo_a = old_vec_min(a)
+    let hi_a = old_vec_max(a)
+    let lo_b = old_vec_min(b)
+    let hi_b = old_vec_max(b)
+    let lo = old_min_f(lo_a, lo_b)
+    let hi = old_max_f(hi_a, hi_b)
+    let h_a = old_entropy(a, lo, hi, OLD_BINS)
+    let h_b = old_entropy(b, lo, hi, OLD_BINS)
+    let h_j = old_joint_entropy(a, b, lo, hi, OLD_BINS)
+    let mi = h_a + h_b - h_j
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════
+// New fast path — mi_fast copied inline (no cross-file import in stage0)
+// ═══════════════════════════════════════════════════════════════
+
+let MF_BINS       = 6
+let MF_INV_RANGE  = 0.5
+let MF_LO         = -1.0
+let MF_MAXN       = 32
+
+fn mf_ln_lut() -> array {
+    let mut out = []
+    out = out.push(0.0)
+    let mut c = 1
+    while c <= MF_MAXN {
+        out = out.push(ln(to_float(c)))
+        c = c + 1
+    }
+    return out
+}
+
+fn mf_bin(x: float) -> int {
+    let t = (x - MF_LO) * MF_INV_RANGE
+    let mut idx = to_int(t * to_float(MF_BINS))
+    if idx < 0 { idx = 0 }
+    if idx >= MF_BINS { idx = MF_BINS - 1 }
+    return idx
+}
+
+fn mf_zeros(nb: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < nb {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn mf_entropy_from_counts(cnt: array, n_total: int, ln_lut: array) -> float {
+    if n_total <= 0 { return 0.0 }
+    let nb = len(cnt)
+    let ln_n = ln_lut[n_total]
+    let inv_n = 1.0 / to_float(n_total)
+    let mut acc = 0.0
+    let mut k = 0
+    while k < nb {
+        let c_f = cnt[k]
+        let c_i = to_int(c_f)
+        if c_i > 0 {
+            acc = acc + c_f * ln_lut[c_i]
+        }
+        k = k + 1
+    }
+    return ln_n - acc * inv_n
+}
+
+fn mi_fast(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    if n > MF_MAXN { return 0.0 }
+    let nb = MF_BINS
+    let ln_lut = mf_ln_lut()
+    let mut marg_a = mf_zeros(nb)
+    let mut marg_b = mf_zeros(nb)
+    let mut joint  = mf_zeros(nb * nb)
+    let mut i = 0
+    while i < n {
+        let ia = mf_bin(a[i])
+        let ib = mf_bin(b[i])
+        marg_a[ia] = marg_a[ia] + 1.0
+        marg_b[ib] = marg_b[ib] + 1.0
+        joint[ia * nb + ib] = joint[ia * nb + ib] + 1.0
+        i = i + 1
+    }
+    let h_a = mf_entropy_from_counts(marg_a, n, ln_lut)
+    let h_b = mf_entropy_from_counts(marg_b, n, ln_lut)
+    let h_j = mf_entropy_from_counts(joint,  n, ln_lut)
+    let mi = h_a + h_b - h_j
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Compare harness: 4 synthetic trace pairs mimicking addiction_phi shapes
+// ═══════════════════════════════════════════════════════════════
+
+fn abs_f(x: float) -> float { if x < 0.0 { return 0.0 - x }; return x }
+
+fn gen_tri(n: int, freq: float, amp: float, phase: float) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let t = to_float(i) * freq + phase
+        let mut p = t
+        while p >= 1.0 { p = p - 1.0 }
+        while p < 0.0 { p = p + 1.0 }
+        let mut v = 0.0
+        if p < 0.5 { v = 4.0 * p - 1.0 } else { v = 3.0 - 4.0 * p }
+        out = out.push(v * amp)
+        i = i + 1
+    }
+    return out
+}
+
+fn gen_noise(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn pair_check(name: string, a: array, b: array) -> bool {
+    let mi_o = old_mi(a, b)
+    let mi_n = mi_fast(a, b)
+    let diff = abs_f(mi_o - mi_n)
+    let ok = diff <= 0.01
+    let status = if ok { "PASS" } else { "FAIL" }
+    println("  [" + name + "] old=" + str(mi_o) + " new=" + str(mi_n) + " |Δ|=" + str(diff) + " " + status)
+    return ok
+}
+
+fn main() {
+    println("[mi_fast_compare] head-to-head: add_mi vs mi_fast (N=24, nb=6)")
+
+    // P1: identical coupled traces
+    let a1 = gen_tri(24, 0.2, 0.8, 0.0)
+    let p1 = pair_check("identical", a1, a1)
+
+    // P2: coupled with slight lag/amp shift (wanting/liking style)
+    let a2 = gen_tri(24, 0.2, 0.9, 0.0)
+    let b2 = gen_tri(24, 0.2, 0.7, 0.1)
+    let p2 = pair_check("coupled", a2, b2)
+
+    // P3: uncorrelated cycles
+    let a3 = gen_tri(24, 0.18, 0.8, 0.0)
+    let b3 = gen_tri(24, 0.31, 0.8, 0.25)
+    let p3 = pair_check("weak-coupled", a3, b3)
+
+    // P4: pure noise vs triangle (near-zero MI)
+    let a4 = gen_tri(24, 0.2, 0.8, 0.0)
+    let b4 = gen_noise(24, 42)
+    let p4 = pair_check("tri-vs-noise", a4, b4)
+
+    // P5: noise vs noise different seed
+    let a5 = gen_noise(24, 11)
+    let b5 = gen_noise(24, 77)
+    let p5 = pair_check("noise-vs-noise", a5, b5)
+
+    let mut all = true
+    if !p1 { all = false }
+    if !p2 { all = false }
+    if !p3 { all = false }
+    if !p4 { all = false }
+    if !p5 { all = false }
+
+    if all {
+        println("[mi_fast_compare] 5/5 numeric equivalence (|Δ| ≤ 0.01)")
+    } else {
+        println("[mi_fast_compare] MISMATCH — check tolerance / fixed-bin assumption")
+    }
+}
+
+main()

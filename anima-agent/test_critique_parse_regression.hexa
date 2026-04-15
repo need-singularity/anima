@@ -1,0 +1,160 @@
+// test_critique_parse_regression.hexa — unit-level smoke for parse_score_reply
+// fallback ladder. Runs entirely offline (no Claude calls). Exercises:
+//
+//   Primary  : well-formed "SCORE=0.92;reason"
+//   Primary  : with whitespace / newline noise
+//   Primary  : out-of-range score clamp
+//   Fallback1: no SCORE marker, bare float in response
+//   Fallback1: verbose preamble then "0.75" mid-sentence
+//   Fallback2: keyword sentiment positive
+//   Fallback2: keyword sentiment negative
+//   Fallback2: neutral (no keywords)
+//   Empty    : empty string → 0.0
+//
+// Purpose: ensure future edits to parse_score_reply / heuristic_reply /
+// first_number_token do not regress the fallback ladder that unblocks
+// hire_sim_100 completion_rate.
+//
+// Build:  hexa build test_critique_parse_regression.hexa -o /tmp/test_critique_parse_regression
+// Run:    /tmp/test_critique_parse_regression
+
+use "llm_claude_adapter"
+
+fn assert_primary(label: string, resp: string, expected_score: float, expect_reason_sub: string) -> int {
+    let r = parse_score_reply(resp)
+    let score_ok = abs_diff(r.score, expected_score) < 0.001
+    let reason_ok = if len(expect_reason_sub) > 0 { r.reason.contains(expect_reason_sub) } else { true }
+    let not_fallback = !r.reason.contains("[fallback=")
+    let pass = score_ok && reason_ok && not_fallback
+    print_case(label, pass, r.score, r.reason)
+    if pass { return 1 } else { return 0 }
+}
+
+fn assert_fallback1(label: string, resp: string, expected_score: float) -> int {
+    let r = parse_score_reply(resp)
+    let score_ok = abs_diff(r.score, expected_score) < 0.001
+    let fb1 = r.reason.contains("[fallback=1]")
+    let pass = score_ok && fb1
+    print_case(label, pass, r.score, r.reason)
+    if pass { return 1 } else { return 0 }
+}
+
+fn assert_fallback0(label: string, resp: string) -> int {
+    // No SCORE, no float → empty reply marker "[fallback=0]"
+    let r = parse_score_reply(resp)
+    let pass = r.score == 0.0 && r.reason.contains("[fallback=0]")
+    print_case(label, pass, r.score, r.reason)
+    if pass { return 1 } else { return 0 }
+}
+
+fn assert_heuristic(label: string, resp: string, expected_score: float) -> int {
+    // Exercise heuristic_reply directly (fallback 2 / post-retry path).
+    let r = heuristic_reply(resp, 2)
+    let pass = abs_diff(r.score, expected_score) < 0.001 && r.reason.contains("[fallback=2]")
+    print_case(label, pass, r.score, r.reason)
+    if pass { return 1 } else { return 0 }
+}
+
+fn abs_diff(a: float, b: float) -> float {
+    let d = a - b
+    if d < 0.0 { return 0.0 - d }
+    return d
+}
+
+fn print_case(label: string, pass: bool, score: float, reason: string) {
+    let flag = if pass { "PASS" } else { "FAIL" }
+    let reason_s = if len(reason) > 80 { reason.substring(0, 80) + "..." } else { reason }
+    println(flag + "  " + label + "  score=" + to_string(score) + "  reason=" + reason_s)
+}
+
+fn main() {
+    println("=== critique parse regression ===")
+    let mut passed = 0
+    let mut total = 0
+
+    // Primary: well-formed
+    total = total + 1
+    passed = passed + assert_primary(
+        "primary_wellformed",
+        "SCORE=0.92;covers all three bullet points and uses precise figures",
+        0.92,
+        "covers all three"
+    )
+
+    // Primary: multi-line preamble + marker on its own line
+    total = total + 1
+    passed = passed + assert_primary(
+        "primary_leading_whitespace",
+        "  SCORE=0.75;solid but misses one action item  ",
+        0.75,
+        "solid but"
+    )
+
+    // Primary: score > 1 clamped
+    total = total + 1
+    passed = passed + assert_primary(
+        "primary_clamp_over_1",
+        "SCORE=1.50;too enthusiastic grader",
+        1.0,
+        "too enthusiastic"
+    )
+
+    // Fallback 1: bare float
+    total = total + 1
+    passed = passed + assert_fallback1(
+        "fallback1_bare_float",
+        "I would rate this around 0.85 — it captures the key points clearly.",
+        0.85
+    )
+
+    // Fallback 1: no SCORE marker, float mid-sentence
+    total = total + 1
+    passed = passed + assert_fallback1(
+        "fallback1_midsentence",
+        "Overall quality is good. My grade would be 0.7 given the minor gaps.",
+        0.7
+    )
+
+    // Fallback 0: no score signal → empty
+    total = total + 1
+    passed = passed + assert_fallback0(
+        "fallback0_no_signal",
+        "Hello — I cannot evaluate this without more context."
+    )
+
+    // Heuristic: positive sentiment
+    total = total + 1
+    passed = passed + assert_heuristic(
+        "heuristic_positive",
+        "The answer is excellent and comprehensive, covering all the requested angles.",
+        0.85
+    )
+
+    // Heuristic: negative sentiment
+    total = total + 1
+    passed = passed + assert_heuristic(
+        "heuristic_negative",
+        "The response is incomplete — it is missing the summary section and is unclear about timing.",
+        0.40
+    )
+
+    // Heuristic: neutral
+    total = total + 1
+    passed = passed + assert_heuristic(
+        "heuristic_neutral",
+        "The response exists.",
+        0.60
+    )
+
+    // Empty string
+    total = total + 1
+    let er = parse_score_reply("")
+    let empty_ok = er.score == 0.0 && er.reason == "empty response"
+    print_case("empty_response", empty_ok, er.score, er.reason)
+    if empty_ok { passed = passed + 1 }
+
+    println("")
+    println("=== summary: " + to_string(passed) + "/" + to_string(total) + " ===")
+    let verdict = if passed == total { "ALL GREEN" } else { "REGRESSION" }
+    println(verdict)
+}

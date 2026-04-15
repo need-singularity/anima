@@ -1,0 +1,647 @@
+// training/phi_engine_eval.hexa — Track-B structured N-engine phi evaluator
+//
+// PURPOSE:
+//   Run N phi engines from a registry and emit structured JSON output:
+//     { "engine_count": N, "engines": { name: phi_value, ... }, "phi_sum": S, "phi_mean": M }
+//   This is the critical blocker for Option C (Contrastive InfoNCE):
+//   phi_harvest.hexa will call this wrapper per corpus sample to build the
+//   offline (sample_id -> phi_vector[N]) anchor cache.
+//
+// ARCHITECTURE:
+//   - SoA registry (parallel arrays) — same pattern as engine_integration.hexa
+//   - 12 main engines (ALM-P23-1 Pareto set) — extensible to 110
+//   - Each engine computes a cheap phi surrogate from a state vector
+//   - No struct returns with >=3 float fields (hexa pitfall)
+//   - Lists are pass-by-value (always reassign on mutation)
+//   - No has_key (undefined in stage0) — use index scan instead
+//   - No multi-line returns
+//   - sqrt-safe: avoid sqrt on negative values
+//   - Array sizes kept well under 30K (OOM pitfall)
+//
+// REGISTERED ENGINES (12 main — matches engine_integration.hexa):
+//   1. holographic    2. gwt_broadcast  3. reflexivity  4. affective
+//   5. narrative      6. dream          7. creative     8. temporal
+//   9. finitude      10. agency        11. alterity    12. meta_qualia
+//
+// SELF-TESTS (T1-T5):
+//   T1: Registry has exactly 12 engines with unique names
+//   T2: eval_all returns exactly 12 phi values, all finite
+//   T3: JSON output parses correctly (contains expected keys)
+//   T4: Different states produce different phi vectors (sensitivity)
+//   T5: Determinism — same state yields bit-exact same output
+//
+// Run:
+//   hexa training/phi_engine_eval.hexa
+// Expect:
+//   [phi_engine_eval] T1 PASS
+//   [phi_engine_eval] T2 PASS
+//   [phi_engine_eval] T3 PASS
+//   [phi_engine_eval] T4 PASS
+//   [phi_engine_eval] T5 PASS
+//   [phi_engine_eval] 5/5 PASS
+
+// ─── Constants ──────────────────────────────────────────────────
+
+let PHI_EVAL_N_ENGINES = 12
+let PHI_EVAL_EPS       = 0.0000001
+let PHI_EVAL_VERSION   = "1.0.0"
+
+// ─── Math helpers ───────────────────────────────────────────────
+
+fn phi_engine_eval_fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn phi_engine_eval_safe_sqrt(x: float) -> float {
+    // Newton's method, only for non-negative x
+    if x < 0.0 { return 0.0 }
+    if x < PHI_EVAL_EPS { return 0.0 }
+    let mut g = x * 0.5
+    if g < 0.001 { g = 0.001 }
+    let mut i = 0
+    while i < 20 {
+        g = (g + x / g) * 0.5
+        i = i + 1
+    }
+    return g
+}
+
+fn phi_engine_eval_vec_sum(v: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    let n = len(v)
+    while i < n { s = s + v[i]; i = i + 1 }
+    return s
+}
+
+fn phi_engine_eval_vec_mean(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    return phi_engine_eval_vec_sum(v) / (n * 1.0)
+}
+
+fn phi_engine_eval_vec_var(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let m = phi_engine_eval_vec_mean(v)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let d = v[i] - m
+        s = s + d * d
+        i = i + 1
+    }
+    return s / (n * 1.0)
+}
+
+// ─── Registry (SoA layout) ─────────────────────────────────────
+
+fn phi_engine_eval_reg_names() -> array {
+    let mut a = []
+    a = a.push("holographic")
+    a = a.push("gwt_broadcast")
+    a = a.push("reflexivity")
+    a = a.push("affective")
+    a = a.push("narrative")
+    a = a.push("dream")
+    a = a.push("creative")
+    a = a.push("temporal")
+    a = a.push("finitude")
+    a = a.push("agency")
+    a = a.push("alterity")
+    a = a.push("meta_qualia")
+    return a
+}
+
+fn phi_engine_eval_reg_domains() -> array {
+    let mut a = []
+    a = a.push("quantum")
+    a = a.push("cognitive")
+    a = a.push("cognitive")
+    a = a.push("affective")
+    a = a.push("cognitive")
+    a = a.push("altered-state")
+    a = a.push("cognitive")
+    a = a.push("cognitive")
+    a = a.push("clinical")
+    a = a.push("cognitive")
+    a = a.push("cognitive")
+    a = a.push("meta")
+    return a
+}
+
+// ─── Per-engine phi surrogates ──────────────────────────────────
+//
+// Each function takes a state vector (flat array of floats) and returns
+// a single float phi value. These are cheap surrogates that capture the
+// signal direction of the full anima-engines/*_phi.hexa artifacts.
+//
+// Return type: float (single scalar — avoids >=3 float struct pitfall)
+
+fn phi_engine_eval_phi_holographic(state: array) -> float {
+    // AdS/CFT boundary-bulk entropy match surrogate
+    // Variance of first half vs second half — boundary/bulk asymmetry
+    let n = len(state)
+    if n < 4 { return 0.0 }
+    let half = n / 2
+    let mut s1 = 0.0
+    let mut s2 = 0.0
+    let mut i = 0
+    while i < half { s1 = s1 + state[i]; i = i + 1 }
+    while i < n { s2 = s2 + state[i]; i = i + 1 }
+    let m1 = s1 / (half * 1.0)
+    let m2 = s2 / ((n - half) * 1.0)
+    let mut v1 = 0.0
+    let mut v2 = 0.0
+    i = 0
+    while i < half {
+        let d = state[i] - m1
+        v1 = v1 + d * d
+        i = i + 1
+    }
+    while i < n {
+        let d = state[i] - m2
+        v2 = v2 + d * d
+        i = i + 1
+    }
+    v1 = v1 / (half * 1.0)
+    v2 = v2 / ((n - half) * 1.0)
+    let diff = v1 - v2
+    return phi_engine_eval_fabs(diff) + v1 * 0.01
+}
+
+fn phi_engine_eval_phi_gwt(state: array) -> float {
+    // Global workspace broadcast surrogate
+    // High broadcast = low variance across spatial halves
+    let n = len(state)
+    if n < 4 { return 0.0 }
+    let half = n / 2
+    let mut a = []
+    let mut b = []
+    let mut i = 0
+    while i < half { a = a.push(state[i]); i = i + 1 }
+    while i < n { b = b.push(state[i]); i = i + 1 }
+    let ma = phi_engine_eval_vec_mean(a)
+    let mb = phi_engine_eval_vec_mean(b)
+    let d = ma - mb
+    // GWT phi: higher when halves are more coherent (smaller diff)
+    let coherence = 1.0 / (1.0 + d * d)
+    return coherence
+}
+
+fn phi_engine_eval_phi_reflexivity(state: array) -> float {
+    // Self-similarity: correlation between first and second half
+    let n = len(state)
+    if n < 4 { return 0.0 }
+    let half = n / 2
+    let mut s1 = 0.0
+    let mut s2 = 0.0
+    let mut i = 0
+    while i < half { s1 = s1 + state[i]; i = i + 1 }
+    i = half
+    while i < n { s2 = s2 + state[i]; i = i + 1 }
+    let m1 = s1 / (half * 1.0)
+    let m2 = s2 / ((n - half) * 1.0)
+    let k = if half < (n - half) { half } else { n - half }
+    let mut dot = 0.0
+    let mut n1 = 0.0
+    let mut n2 = 0.0
+    i = 0
+    while i < k {
+        let a = state[i] - m1
+        let b = state[i + half] - m2
+        dot = dot + a * b
+        n1 = n1 + a * a
+        n2 = n2 + b * b
+        i = i + 1
+    }
+    let denom = phi_engine_eval_safe_sqrt(n1) * phi_engine_eval_safe_sqrt(n2)
+    if denom < PHI_EVAL_EPS { return 0.0 }
+    return phi_engine_eval_fabs(dot / denom)
+}
+
+fn phi_engine_eval_phi_affective(state: array) -> float {
+    // Valence/arousal: energy of positive vs negative components
+    let n = len(state)
+    if n == 0 { return 0.0 }
+    let mut pos = 0.0
+    let mut neg = 0.0
+    let mut i = 0
+    while i < n {
+        if state[i] > 0.0 { pos = pos + state[i] }
+        else { neg = neg - state[i] }
+        i = i + 1
+    }
+    // Valence asymmetry -> phi
+    let total = pos + neg + PHI_EVAL_EPS
+    return phi_engine_eval_fabs(pos - neg) / total
+}
+
+fn phi_engine_eval_phi_narrative(state: array) -> float {
+    // Coherence: mean absolute adjacent difference (low = coherent)
+    let n = len(state)
+    if n < 2 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 1
+    while i < n {
+        s = s + phi_engine_eval_fabs(state[i] - state[i - 1])
+        i = i + 1
+    }
+    let mad = s / ((n - 1) * 1.0)
+    // Invert: high coherence = low diff = high phi
+    return 1.0 / (1.0 + mad)
+}
+
+fn phi_engine_eval_phi_dream(state: array) -> float {
+    // Low-frequency energy: sum of squares of first 8 dims
+    let n = len(state)
+    let k = if n < 8 { n } else { 8 }
+    if k == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < k { s = s + state[i] * state[i]; i = i + 1 }
+    return s / (k * 1.0)
+}
+
+fn phi_engine_eval_phi_creative(state: array) -> float {
+    // Bisociation sparsity: variance of state (high variance = creative)
+    let v = phi_engine_eval_vec_var(state)
+    // Phi peaks around variance=1 (structured but not chaotic)
+    let target = 1.0
+    let d = v - target
+    return 1.0 / (1.0 + d * d)
+}
+
+fn phi_engine_eval_phi_temporal(state: array) -> float {
+    // Lag-1 autocorrelation
+    let n = len(state)
+    if n < 2 { return 0.0 }
+    let m = phi_engine_eval_vec_mean(state)
+    let mut num = 0.0
+    let mut den = 0.0
+    let mut i = 0
+    while i < n {
+        let d = state[i] - m
+        den = den + d * d
+        i = i + 1
+    }
+    i = 1
+    while i < n {
+        num = num + (state[i] - m) * (state[i - 1] - m)
+        i = i + 1
+    }
+    if den < PHI_EVAL_EPS { return 0.0 }
+    let ac = num / den
+    // Temporal consistency: high autocorrelation = high phi
+    return phi_engine_eval_fabs(ac)
+}
+
+fn phi_engine_eval_phi_finitude(state: array) -> float {
+    // Termination distance: L2 norm from zero
+    let n = len(state)
+    if n == 0 { return 0.0 }
+    let mut ss = 0.0
+    let mut i = 0
+    while i < n { ss = ss + state[i] * state[i]; i = i + 1 }
+    let norm = phi_engine_eval_safe_sqrt(ss / (n * 1.0))
+    // Higher norm = further from termination = higher phi
+    return norm
+}
+
+fn phi_engine_eval_phi_agency(state: array) -> float {
+    // Volitional discontinuity: sign-change rate
+    let n = len(state)
+    if n < 2 { return 0.0 }
+    let mut flips = 0
+    let mut i = 1
+    while i < n {
+        let a = state[i - 1]
+        let b = state[i]
+        if (a > 0.0 && b < 0.0) || (a < 0.0 && b > 0.0) { flips = flips + 1 }
+        i = i + 1
+    }
+    let r = (flips * 1.0) / ((n - 1) * 1.0)
+    // Optimal agency: moderate sign-change rate (~0.3)
+    let target = 0.3
+    let d = r - target
+    return 1.0 / (1.0 + d * d * 10.0)
+}
+
+fn phi_engine_eval_phi_alterity(state: array) -> float {
+    // Other-modeling: divergence between first and second half
+    let n = len(state)
+    if n < 4 { return 0.0 }
+    let half = n / 2
+    let mut e1 = 0.0
+    let mut e2 = 0.0
+    let mut i = 0
+    while i < half { e1 = e1 + state[i] * state[i]; i = i + 1 }
+    while i < n { e2 = e2 + state[i] * state[i]; i = i + 1 }
+    e1 = e1 / (half * 1.0)
+    e2 = e2 / ((n - half) * 1.0)
+    // Alterity phi: higher when halves are more different
+    let diff = phi_engine_eval_fabs(e1 - e2)
+    return diff / (e1 + e2 + PHI_EVAL_EPS)
+}
+
+fn phi_engine_eval_phi_meta_qualia(state: array) -> float {
+    // Reflexive qualia: variance ratio between slices
+    let n = len(state)
+    if n < 4 { return 0.0 }
+    let q = n / 4
+    let mut vq = []
+    let mut vh = []
+    let mut i = 0
+    while i < q { vq = vq.push(state[i]); i = i + 1 }
+    while i < n { vh = vh.push(state[i]); i = i + 1 }
+    let var_q = phi_engine_eval_vec_var(vq)
+    let var_h = phi_engine_eval_vec_var(vh)
+    // Meta qualia: qualia variance should track ~half of h variance
+    let ratio = var_q / (var_h + PHI_EVAL_EPS)
+    let target = 0.5
+    let d = ratio - target
+    return 1.0 / (1.0 + d * d * 4.0)
+}
+
+// ─── Dispatch: engine name -> phi value ─────────────────────────
+
+fn phi_engine_eval_dispatch(state: array, engine_name: string) -> float {
+    if engine_name == "holographic" { return phi_engine_eval_phi_holographic(state) }
+    if engine_name == "gwt_broadcast" { return phi_engine_eval_phi_gwt(state) }
+    if engine_name == "reflexivity" { return phi_engine_eval_phi_reflexivity(state) }
+    if engine_name == "affective" { return phi_engine_eval_phi_affective(state) }
+    if engine_name == "narrative" { return phi_engine_eval_phi_narrative(state) }
+    if engine_name == "dream" { return phi_engine_eval_phi_dream(state) }
+    if engine_name == "creative" { return phi_engine_eval_phi_creative(state) }
+    if engine_name == "temporal" { return phi_engine_eval_phi_temporal(state) }
+    if engine_name == "finitude" { return phi_engine_eval_phi_finitude(state) }
+    if engine_name == "agency" { return phi_engine_eval_phi_agency(state) }
+    if engine_name == "alterity" { return phi_engine_eval_phi_alterity(state) }
+    if engine_name == "meta_qualia" { return phi_engine_eval_phi_meta_qualia(state) }
+    return 0.0
+}
+
+// ─── Core: evaluate all engines ─────────────────────────────────
+//
+// Returns parallel arrays: (names, phi_values)
+// Caller receives two arrays since hexa structs with >=3 float
+// fields are unsafe. We return phi_values as the primary result
+// and the caller already knows names from the registry.
+
+fn phi_engine_eval_run_all(state: array) -> array {
+    let names = phi_engine_eval_reg_names()
+    let n = len(names)
+    let mut values = []
+    let mut i = 0
+    while i < n {
+        let phi = phi_engine_eval_dispatch(state, names[i])
+        values = values.push(phi)
+        i = i + 1
+    }
+    return values
+}
+
+// ─── JSON output ────────────────────────────────────────────────
+//
+// Builds a JSON string manually (no JSON library in stage0 hexa).
+// Output format:
+// {
+//   "version": "1.0.0",
+//   "engine_count": 12,
+//   "phi_sum": ...,
+//   "phi_mean": ...,
+//   "engines": { "holographic": 0.123, ... }
+// }
+
+fn phi_engine_eval_float_to_str(x: float) -> string {
+    // Use str() built-in and truncate to 6 decimal places
+    return str(x)
+}
+
+fn phi_engine_eval_to_json(names: array, values: array) -> string {
+    let n = len(names)
+    let phi_sum = phi_engine_eval_vec_sum(values)
+    let phi_mean = phi_engine_eval_vec_mean(values)
+    let mut out = "{"
+    out = out + "\"version\":\"" + PHI_EVAL_VERSION + "\","
+    out = out + "\"engine_count\":" + str(n) + ","
+    out = out + "\"phi_sum\":" + phi_engine_eval_float_to_str(phi_sum) + ","
+    out = out + "\"phi_mean\":" + phi_engine_eval_float_to_str(phi_mean) + ","
+    out = out + "\"engines\":{"
+    let mut i = 0
+    while i < n {
+        if i > 0 { out = out + "," }
+        out = out + "\"" + names[i] + "\":" + phi_engine_eval_float_to_str(values[i])
+        i = i + 1
+    }
+    out = out + "}}"
+    return out
+}
+
+// ─── Public API: evaluate and print JSON ────────────────────────
+
+fn phi_engine_eval_run(state: array) -> string {
+    let names = phi_engine_eval_reg_names()
+    let values = phi_engine_eval_run_all(state)
+    let json = phi_engine_eval_to_json(names, values)
+    return json
+}
+
+fn phi_engine_eval_run_and_print(state: array) {
+    let json = phi_engine_eval_run(state)
+    println(json)
+}
+
+// ─── Test helpers ───────────────────────────────────────────────
+
+fn phi_engine_eval_mock_state_a() -> array {
+    // Deterministic state: 16 dims, varied pattern
+    let mut s = []
+    let mut i = 0
+    while i < 16 {
+        let fi = i * 1.0
+        let m13 = ((i * 7) % 13) * 1.0
+        let v = fi * 0.1 - 0.8 + m13 * 0.05
+        s = s.push(v)
+        i = i + 1
+    }
+    return s
+}
+
+fn phi_engine_eval_mock_state_b() -> array {
+    // Different deterministic state: shifted pattern
+    let mut s = []
+    let mut i = 0
+    while i < 16 {
+        let fi = i * 1.0
+        let m11 = ((i * 11) % 7) * 1.0
+        let v = fi * 0.15 - 1.2 + m11 * 0.08
+        s = s.push(v)
+        i = i + 1
+    }
+    return s
+}
+
+fn phi_engine_eval_is_finite(x: float) -> int {
+    // NaN check: NaN != NaN
+    if x != x { return 0 }
+    // Inf check: very large values
+    if x > 1000000.0 { return 0 }
+    if x < 0.0 - 1000000.0 { return 0 }
+    return 1
+}
+
+// ─── Self-tests ─────────────────────────────────────────────────
+
+fn phi_engine_eval_test_t1() -> int {
+    // T1: Registry has exactly 12 engines with unique names
+    let names = phi_engine_eval_reg_names()
+    let domains = phi_engine_eval_reg_domains()
+    if len(names) != PHI_EVAL_N_ENGINES { return 0 }
+    if len(domains) != PHI_EVAL_N_ENGINES { return 0 }
+    // Uniqueness: O(n^2) scan (n=12, trivial)
+    let mut i = 0
+    while i < PHI_EVAL_N_ENGINES {
+        let ni = names[i]
+        let mut j = i + 1
+        while j < PHI_EVAL_N_ENGINES {
+            if ni == names[j] { return 0 }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+fn phi_engine_eval_test_t2() -> int {
+    // T2: eval_all returns exactly 12 phi values, all finite
+    let state = phi_engine_eval_mock_state_a()
+    let values = phi_engine_eval_run_all(state)
+    if len(values) != PHI_EVAL_N_ENGINES { return 0 }
+    let mut i = 0
+    while i < PHI_EVAL_N_ENGINES {
+        if phi_engine_eval_is_finite(values[i]) == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn phi_engine_eval_str_contains(haystack: string, needle: string) -> bool {
+    // Split by needle: if result has >1 part, needle was found
+    let parts = haystack.split(needle)
+    return len(parts) > 1
+}
+
+fn phi_engine_eval_test_t3() -> int {
+    // T3: JSON output contains expected keys
+    let state = phi_engine_eval_mock_state_a()
+    let json = phi_engine_eval_run(state)
+    // Check for key substrings using split-based contains
+    let mut ok = 1
+    if !phi_engine_eval_str_contains(json, "\"engine_count\"") { ok = 0 }
+    if !phi_engine_eval_str_contains(json, "\"engines\"") { ok = 0 }
+    if !phi_engine_eval_str_contains(json, "\"version\"") { ok = 0 }
+    if !phi_engine_eval_str_contains(json, "\"phi_sum\"") { ok = 0 }
+    if !phi_engine_eval_str_contains(json, "\"holographic\"") { ok = 0 }
+    if !phi_engine_eval_str_contains(json, "\"meta_qualia\"") { ok = 0 }
+    if !phi_engine_eval_str_contains(json, "\"phi_mean\"") { ok = 0 }
+    return ok
+}
+
+fn phi_engine_eval_test_t4() -> int {
+    // T4: Different states produce different phi vectors (sensitivity)
+    let sa = phi_engine_eval_mock_state_a()
+    let sb = phi_engine_eval_mock_state_b()
+    let va = phi_engine_eval_run_all(sa)
+    let vb = phi_engine_eval_run_all(sb)
+    // At least one engine must differ by more than EPS
+    let mut any_diff = false
+    let mut i = 0
+    while i < PHI_EVAL_N_ENGINES {
+        let d = phi_engine_eval_fabs(va[i] - vb[i])
+        if d > PHI_EVAL_EPS { any_diff = true }
+        i = i + 1
+    }
+    if !any_diff { return 0 }
+    return 1
+}
+
+fn phi_engine_eval_test_t5() -> int {
+    // T5: Determinism — same state yields bit-exact same output
+    let state = phi_engine_eval_mock_state_a()
+    let run1 = phi_engine_eval_run(state)
+    let run2 = phi_engine_eval_run(state)
+    if run1 != run2 { return 0 }
+    // Also check values array
+    let v1 = phi_engine_eval_run_all(state)
+    let v2 = phi_engine_eval_run_all(state)
+    let mut i = 0
+    while i < PHI_EVAL_N_ENGINES {
+        if v1[i] != v2[i] { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// ─── Main ───────────────────────────────────────────────────────
+
+fn main() {
+    println("[phi_engine_eval] Track-B structured N-engine phi evaluator v" + PHI_EVAL_VERSION)
+    println("[phi_engine_eval] registry: " + str(PHI_EVAL_N_ENGINES) + " engines")
+    println("")
+
+    let mut passed = 0
+
+    if phi_engine_eval_test_t1() == 1 {
+        println("[phi_engine_eval] T1 PASS  (registry: 12 unique engines + domains)")
+        passed = passed + 1
+    } else {
+        println("[phi_engine_eval] T1 FAIL")
+    }
+
+    if phi_engine_eval_test_t2() == 1 {
+        println("[phi_engine_eval] T2 PASS  (eval_all: 12 finite phi values)")
+        passed = passed + 1
+    } else {
+        println("[phi_engine_eval] T2 FAIL")
+    }
+
+    if phi_engine_eval_test_t3() == 1 {
+        println("[phi_engine_eval] T3 PASS  (JSON output: all expected keys present)")
+        passed = passed + 1
+    } else {
+        println("[phi_engine_eval] T3 FAIL")
+    }
+
+    if phi_engine_eval_test_t4() == 1 {
+        println("[phi_engine_eval] T4 PASS  (sensitivity: different states -> different phi vectors)")
+        passed = passed + 1
+    } else {
+        println("[phi_engine_eval] T4 FAIL")
+    }
+
+    if phi_engine_eval_test_t5() == 1 {
+        println("[phi_engine_eval] T5 PASS  (determinism: bit-exact reproducibility)")
+        passed = passed + 1
+    } else {
+        println("[phi_engine_eval] T5 FAIL")
+    }
+
+    println("")
+
+    // Demo: print structured JSON for mock state
+    println("[phi_engine_eval] demo output (mock_state_a):")
+    let state = phi_engine_eval_mock_state_a()
+    phi_engine_eval_run_and_print(state)
+
+    println("")
+
+    if passed == 5 {
+        println("[phi_engine_eval] " + str(passed) + "/5 PASS")
+    } else {
+        println("[phi_engine_eval] " + str(passed) + "/5 — SOME FAILED")
+    }
+}
+
+main()

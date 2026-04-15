@@ -1,0 +1,963 @@
+// serving/hire_routes.hexa — TSRV-P4-1 직원(employee) HTTP wire (autonomy + style + lore)
+//
+// Roadmap: shared/roadmaps/anima-train.json#TSRV-P4-1
+//   "anima-agent 플랫폼 배포 — 6채널 × 5제공자 × 플러그인 SDK"
+// 본 파일은 TSRV-P4-1 의 HTTP-endpoint 단계 (직원 사용 진입점).
+//
+// ─── 아키텍처 (additive overlay) ───────────────────────────────
+//
+//   POST /hire/task         — 자율 task 실행
+//     body: {"task": "...", "tone": "senpai|stoic_mentor|...", "persona": "default|sorceress|...", "budget": 10}
+//     flow:
+//       (1) clm_lore_serve.load_persona(persona)          → persona state
+//       (2) style_switch.apply_tone_switch(body, default)  → SwitchResult
+//       (3) autonomy_loop.run(task, llm="claude", budget)  → trace
+//       (4) tone post-filter on autonomy 최종 출력
+//       (5) response: {answer, steps[], score, tone, trace}
+//
+//   GET  /hire/status        — 마지막 n 건 hire_sim 측정값 요약
+//   GET  /hire/capabilities  — 사용 가능 persona / tone 목록
+//
+// 본 파일은 http_server.hexa 의 진입 dispatch 와 분리되어 standalone 실행 가능.
+// 실제 mounting 은 http_server.hexa 의 route_request match 에 add 한다.
+//
+// ─── Hexa quirk 회피 ────────────────────────────────────────────
+//
+// - use "..." 금지 (memory: feedback_hexa_runtime). style_switch 와 동일하게
+//   StylePreset / autonomy 함수 등을 inline mirror.
+// - a[i] = v no-op 회피 → push 재구축.
+// - struct 안 list aliasing 회피 → 모든 mutator 가 새 struct return.
+// - `let match = ...` 금지 → use m / found / hit 등 non-reserved 이름.
+// - JSON body parse 는 byte-only ASCII marker scan (multibyte safe).
+// - 한국어 prompt body 도 marker 는 ASCII 라 OK.
+//
+// ─── Test plan (T1–T5) ──────────────────────────────────────────
+//
+// T1 /hire/capabilities      — 200 + persona/tone 목록 정상 (count, label sanity)
+// T2 /hire/task simple       — mock autonomy 결정론적 mock, 결정론적 응답 + tone 태그
+// T3 /hire/task tone switch  — tone=senpai 요청 시 응답에 [tone=senpai] 포함
+// T4 /hire/task bad persona  → fallback to "default" (response.persona=="default")
+// T5 /hire/status entries    — 로그 엔트리 형식 (count + 마지막 verdict 정상)
+//
+// 5/5 PASS 목표.
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 1. Primitives (inline mirrors)
+// ═══════════════════════════════════════════════════════════════
+
+fn hr_fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// punctuation strip for keyword scan (autonomy mock critique heuristic)
+fn hr_punct_to_space(s: string) -> string {
+    let mut r = s
+    r = r.replace(".", " ")
+    r = r.replace(",", " ")
+    r = r.replace(";", " ")
+    r = r.replace(":", " ")
+    r = r.replace("!", " ")
+    r = r.replace("?", " ")
+    return r
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 2. StylePreset mirror (4 톤 default + extension presets)
+// ═══════════════════════════════════════════════════════════════
+//
+// 본 파일은 4 base tone + 5 personality tone (senpai/stoic_mentor/playful/
+// professional/concise) 를 지원해야 함. base 4 톤 외에는 daily 와 동일한
+// bias 로 fallback (label 만 다름). 실 톤 유사도 학습은 P4 LoRA 후.
+
+struct StylePreset {
+    id:        int,
+    label:     string,
+    valence:   float,
+    reality:   float,
+    intensity: float
+}
+
+fn hr_presets_extended() -> [StylePreset] {
+    let romance = StylePreset {
+        id: 0, label: "romance",
+        valence:  0.9, reality: -0.7, intensity:  0.0
+    }
+    let horror = StylePreset {
+        id: 1, label: "horror",
+        valence: -0.9, reality:  0.7, intensity:  0.0
+    }
+    let fantasy = StylePreset {
+        id: 2, label: "fantasy",
+        valence:  0.0, reality:  0.9, intensity:  0.7
+    }
+    let daily = StylePreset {
+        id: 3, label: "daily",
+        valence:  0.0, reality: -0.9, intensity: -0.7
+    }
+    // Persona-specific tones (TSRV-P4-1 직원 용). Bias 는 daily 에서
+    // valence/intensity 미세 조정. 4 base 와 distinct 한 id 사용.
+    let senpai = StylePreset {
+        id: 4, label: "senpai",
+        valence:  0.5, reality: -0.3, intensity:  0.3
+    }
+    let stoic = StylePreset {
+        id: 5, label: "stoic_mentor",
+        valence: -0.2, reality:  0.5, intensity: -0.2
+    }
+    let playful = StylePreset {
+        id: 6, label: "playful",
+        valence:  0.7, reality: -0.5, intensity:  0.5
+    }
+    let prof = StylePreset {
+        id: 7, label: "professional",
+        valence:  0.0, reality:  0.6, intensity: -0.3
+    }
+    let concise = StylePreset {
+        id: 8, label: "concise",
+        valence:  0.0, reality:  0.3, intensity: -0.6
+    }
+    let mut out = []
+    out = out.push(romance)
+    out = out.push(horror)
+    out = out.push(fantasy)
+    out = out.push(daily)
+    out = out.push(senpai)
+    out = out.push(stoic)
+    out = out.push(playful)
+    out = out.push(prof)
+    out = out.push(concise)
+    return out
+}
+
+fn hr_preset_by_label(presets: [StylePreset], label: string) -> StylePreset {
+    let n = len(presets)
+    let mut i = 0
+    while i < n {
+        if presets[i].label == label { return presets[i] }
+        i = i + 1
+    }
+    // default fallback — daily
+    return StylePreset {
+        id: 3, label: "daily",
+        valence: 0.0, reality: 0.0 - 0.9, intensity: 0.0 - 0.7
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 3. Persona registry mirror (clm_lore_serve persona surface)
+// ═══════════════════════════════════════════════════════════════
+//
+// 직원(employee) personas — default / sorceress / scholar / engineer / friend.
+// 각 persona 는 (label, default_tone, lore_seed) 만 가짐. 실 lore_book
+// blend 는 clm_lore_serve.serve() 가 한다. 본 파일은 persona → default_tone
+// + persona 검증만 책임.
+
+struct PersonaSpec {
+    id:           int,
+    label:        string,
+    default_tone: string,
+    lore_seed:    int
+}
+
+fn hr_personas() -> [PersonaSpec] {
+    let p_default = PersonaSpec {
+        id: 0, label: "default", default_tone: "daily", lore_seed: 100
+    }
+    let p_sorceress = PersonaSpec {
+        id: 1, label: "sorceress", default_tone: "fantasy", lore_seed: 200
+    }
+    let p_scholar = PersonaSpec {
+        id: 2, label: "scholar", default_tone: "professional", lore_seed: 300
+    }
+    let p_engineer = PersonaSpec {
+        id: 3, label: "engineer", default_tone: "concise", lore_seed: 400
+    }
+    let p_friend = PersonaSpec {
+        id: 4, label: "friend", default_tone: "playful", lore_seed: 500
+    }
+    let mut out = []
+    out = out.push(p_default)
+    out = out.push(p_sorceress)
+    out = out.push(p_scholar)
+    out = out.push(p_engineer)
+    out = out.push(p_friend)
+    return out
+}
+
+// resolve_persona: label → spec; unknown → default fallback (track flag).
+struct PersonaResolved {
+    spec:           PersonaSpec,
+    fallback_used:  bool,
+    fallback_reason: string
+}
+
+fn hr_resolve_persona(personas: [PersonaSpec], label: string) -> PersonaResolved {
+    if len(label) == 0 {
+        return PersonaResolved {
+            spec: personas[0],
+            fallback_used: true,
+            fallback_reason: "missing"
+        }
+    }
+    let n = len(personas)
+    let mut i = 0
+    while i < n {
+        if personas[i].label == label {
+            return PersonaResolved {
+                spec: personas[i],
+                fallback_used: false,
+                fallback_reason: ""
+            }
+        }
+        i = i + 1
+    }
+    return PersonaResolved {
+        spec: personas[0],
+        fallback_used: true,
+        fallback_reason: "unknown_persona"
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 4. JSON body parsing — fixed-marker ASCII scan
+// ═══════════════════════════════════════════════════════════════
+
+struct HireTaskRequest {
+    task:    string,
+    tone:    string,
+    persona: string,
+    budget:  int
+}
+
+// hr_byte_at: stage0 byte access (matches llm_claude_adapter byte_at_parse pattern).
+fn hr_byte_at(s: string, i: int) -> int {
+    let sub = s.substring(i, i + 1)
+    return char_code(sub, 0)
+}
+
+// Extract a string value for "<key>": "<value>". Returns "" if not found.
+fn hr_extract_string(body: string, key: string) -> string {
+    let marker = "\"" + key + "\""
+    let pos = body.index_of(marker)
+    if pos < 0 { return "" }
+    let after = body.substring(pos + len(marker), len(body))
+    let colon = after.index_of(":")
+    if colon < 0 { return "" }
+    let tail = after.substring(colon + 1, len(after))
+    let n = len(tail)
+    let mut k = 0
+    // skip whitespace
+    while k < n {
+        let cc = hr_byte_at(tail, k)
+        if cc == 32 || cc == 9 { k = k + 1 } else { break }
+    }
+    if k >= n { return "" }
+    // expect opening "
+    if hr_byte_at(tail, k) != 34 { return "" }
+    k = k + 1
+    let start = k
+    while k < n {
+        let cc2 = hr_byte_at(tail, k)
+        if cc2 == 34 { break }   // closing "
+        k = k + 1
+    }
+    if k <= start { return "" }
+    return tail.substring(start, k)
+}
+
+// Extract an integer value for "<key>": <int>. Returns -1 if not found.
+fn hr_extract_int(body: string, key: string) -> int {
+    let marker = "\"" + key + "\""
+    let pos = body.index_of(marker)
+    if pos < 0 { return -1 }
+    let after = body.substring(pos + len(marker), len(body))
+    let colon = after.index_of(":")
+    if colon < 0 { return -1 }
+    let tail = after.substring(colon + 1, len(after))
+    let n = len(tail)
+    let mut k = 0
+    while k < n {
+        let cc = hr_byte_at(tail, k)
+        if cc == 32 || cc == 9 { k = k + 1 } else { break }
+    }
+    let start = k
+    while k < n {
+        let cc2 = hr_byte_at(tail, k)
+        if cc2 >= 48 && cc2 <= 57 { k = k + 1 } else { break }
+    }
+    if k <= start { return -1 }
+    let s = tail.substring(start, k)
+    return s.parse_int()
+}
+
+// parse_hire_task_request: decode POST /hire/task body.
+fn hr_parse_task_request(body: string) -> HireTaskRequest {
+    let task = hr_extract_string(body, "task")
+    let tone = hr_extract_string(body, "tone")
+    let persona = hr_extract_string(body, "persona")
+    let budget_raw = hr_extract_int(body, "budget")
+    let budget = if budget_raw <= 0 { 10 } else { budget_raw }
+    return HireTaskRequest {
+        task: task, tone: tone, persona: persona, budget: budget
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 5. Mock autonomy_loop adapter (deterministic)
+// ═══════════════════════════════════════════════════════════════
+//
+// 실 autonomy_loop 는 anima-agent/autonomy_loop.hexa 의 run_autonomy 를 호출.
+// 본 파일은 standalone test 가능해야 하므로 deterministic mock 으로 분리.
+// 실 mounting 시 hr_run_autonomy_mock → 실 run_autonomy(LLMAdapter{name:"claude"})
+// 로 swap. 시그니처는 동일 (root_text, max_depth, budget) → AutonomyTrace-like.
+
+struct AutonomyStep {
+    subgoal:  string,
+    exec:     string,
+    critique: string,
+    score:    float
+}
+
+struct AutonomyResult {
+    steps:           [AutonomyStep],
+    terminal_score:  float,
+    verdict:         string,
+    truncated:       bool
+}
+
+// hr_run_autonomy_mock: deterministic 3-step decomposition with 0.85 critique.
+// 실 Claude path 는 wire-up 시 swap (signature 보존).
+fn hr_run_autonomy_mock(task: string, budget: int) -> AutonomyResult {
+    // Decompose: 3 fixed sub-goals
+    let sg1 = "gather_context(" + task + ")"
+    let sg2 = "analyze(" + task + ")"
+    let sg3 = "synthesize(" + task + ")"
+    let mut steps = []
+    let mut score_sum = 0.0
+    let mut budget_used = 0
+    let max_steps = if budget < 3 { budget } else { 3 }
+
+    if max_steps >= 1 {
+        let s = AutonomyStep {
+            subgoal: sg1,
+            exec: "done: " + sg1,
+            critique: "non-empty result",
+            score: 0.85
+        }
+        steps = steps.push(s)
+        score_sum = score_sum + 0.85
+        budget_used = budget_used + 1
+    }
+    if max_steps >= 2 {
+        let s = AutonomyStep {
+            subgoal: sg2,
+            exec: "done: " + sg2,
+            critique: "non-empty result",
+            score: 0.85
+        }
+        steps = steps.push(s)
+        score_sum = score_sum + 0.85
+        budget_used = budget_used + 1
+    }
+    if max_steps >= 3 {
+        let s = AutonomyStep {
+            subgoal: sg3,
+            exec: "done: " + sg3,
+            critique: "non-empty result",
+            score: 0.85
+        }
+        steps = steps.push(s)
+        score_sum = score_sum + 0.85
+        budget_used = budget_used + 1
+    }
+
+    let n_steps = len(steps)
+    let avg_score = if n_steps > 0 { score_sum / to_float(n_steps) } else { 0.0 }
+    let truncated = max_steps < 3
+    let verdict = if avg_score >= 0.80 { "PASS" }
+                  else if avg_score >= 0.50 { "PARTIAL" }
+                  else { "FAIL" }
+    return AutonomyResult {
+        steps: steps,
+        terminal_score: avg_score,
+        verdict: verdict,
+        truncated: truncated
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 6. Hire response composition + tone post-filter
+// ═══════════════════════════════════════════════════════════════
+
+struct HireTaskResponse {
+    answer:          string,
+    steps_n:         int,
+    steps_summary:   string,    // "G1:0.85; G2:0.85; G3:0.85" — 짧은 trace 표시
+    score:           float,
+    tone:            string,
+    persona:         string,
+    verdict:         string,
+    truncated:       bool,
+    fallback_persona: bool,
+    fallback_tone:    bool,
+    error:           string
+}
+
+fn hr_summarize_steps(steps: [AutonomyStep]) -> string {
+    let n = len(steps)
+    let mut s = ""
+    let mut i = 0
+    while i < n {
+        // score 두 자리 정수 변환 (str(float) 회피, lore_serve 와 동일 패턴)
+        let sc_int = to_int(steps[i].score * 100.0)
+        if i > 0 { s = s + "; " }
+        s = s + "G" + to_string(i + 1) + ":" + to_string(sc_int)
+        i = i + 1
+    }
+    return s
+}
+
+// hr_compose_answer: synthesize an answer string from autonomy trace + tone.
+// tone marker 는 응답 head 에 [tone=<label>] 로 뷰. T3 에서 검출.
+fn hr_compose_answer(task: string, trace: AutonomyResult,
+                     tone_label: string, persona_label: string) -> string {
+    let head = "[tone=" + tone_label + "][persona=" + persona_label + "]"
+    let body = " " + task + " — verdict=" + trace.verdict
+    return head + body
+}
+
+// hr_handle_task: 단일 entry point — body 만 받아 response struct return.
+// HTTP 파이프라인 mount 시 이 함수만 호출하면 됨.
+//
+//   POST /hire/task body → HireTaskResponse
+//
+// flow:
+//   (1) parse request
+//   (2) resolve persona (fallback: default)
+//   (3) resolve tone (fallback: persona.default_tone, then "daily")
+//   (4) run autonomy mock (실 연결 시 hr_run_autonomy_claude swap)
+//   (5) compose answer with tone marker
+fn hr_handle_task(body: string,
+                  presets: [StylePreset],
+                  personas: [PersonaSpec]) -> HireTaskResponse {
+    let req = hr_parse_task_request(body)
+    if len(req.task) == 0 {
+        return HireTaskResponse {
+            answer: "",
+            steps_n: 0,
+            steps_summary: "",
+            score: 0.0,
+            tone: "daily",
+            persona: "default",
+            verdict: "FAIL",
+            truncated: false,
+            fallback_persona: false,
+            fallback_tone: false,
+            error: "missing 'task' field"
+        }
+    }
+
+    // (2) persona resolve
+    let pres = hr_resolve_persona(personas, req.persona)
+    let persona_spec = pres.spec
+
+    // (3) tone resolve — 우선순위 explicit tone → persona default → "daily"
+    let mut tone_label = req.tone
+    let mut fallback_tone = false
+    if len(tone_label) == 0 {
+        tone_label = persona_spec.default_tone
+        fallback_tone = true
+    }
+    // verify tone exists in presets, else daily fallback
+    let n_presets = len(presets)
+    let mut tone_found = false
+    let mut i = 0
+    while i < n_presets {
+        if presets[i].label == tone_label { tone_found = true }
+        i = i + 1
+    }
+    if !tone_found {
+        tone_label = "daily"
+        fallback_tone = true
+    }
+
+    // (4) run autonomy mock
+    let trace = hr_run_autonomy_mock(req.task, req.budget)
+
+    // (5) compose
+    let answer = hr_compose_answer(req.task, trace, tone_label, persona_spec.label)
+    let steps_summary = hr_summarize_steps(trace.steps)
+
+    return HireTaskResponse {
+        answer: answer,
+        steps_n: len(trace.steps),
+        steps_summary: steps_summary,
+        score: trace.terminal_score,
+        tone: tone_label,
+        persona: persona_spec.label,
+        verdict: trace.verdict,
+        truncated: trace.truncated,
+        fallback_persona: pres.fallback_used,
+        fallback_tone: fallback_tone,
+        error: ""
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 7. /hire/status — last n entries
+// ═══════════════════════════════════════════════════════════════
+//
+// In-memory ring buffer of last 32 hire entries. 본 파일에선 caller 가
+// HireStatusLog 를 hold 하고 hr_log_append 로 push (server state).
+// 실 mounting 시 ServerState.hire_log 에 보관.
+
+struct HireLogEntry {
+    task:    string,
+    tone:    string,
+    persona: string,
+    score:   float,
+    verdict: string,
+    ts_ms:   int
+}
+
+struct HireStatusLog {
+    entries:   [HireLogEntry],
+    n:         int,
+    max_n:     int,
+    total:     int   // monotonic count
+}
+
+fn hr_log_new(max_n: int) -> HireStatusLog {
+    return HireStatusLog {
+        entries: [],
+        n: 0,
+        max_n: max_n,
+        total: 0
+    }
+}
+
+fn hr_log_append(log: HireStatusLog, e: HireLogEntry) -> HireStatusLog {
+    let cap = log.max_n
+    let n = log.n
+    let mut new_entries = []
+    if n < cap {
+        let mut i = 0
+        while i < n {
+            new_entries = new_entries.push(log.entries[i])
+            i = i + 1
+        }
+        new_entries = new_entries.push(e)
+        return HireStatusLog {
+            entries: new_entries,
+            n: n + 1,
+            max_n: cap,
+            total: log.total + 1
+        }
+    }
+    // ring: drop oldest
+    let mut i = 1
+    while i < n {
+        new_entries = new_entries.push(log.entries[i])
+        i = i + 1
+    }
+    new_entries = new_entries.push(e)
+    return HireStatusLog {
+        entries: new_entries,
+        n: n,
+        max_n: cap,
+        total: log.total + 1
+    }
+}
+
+// hr_status_summary_json: render last n entries as JSON-like string.
+// 실 http_server 에서는 json_stringify 사용. 본 파일은 standalone test 위해
+// 자체 string 직렬화.
+fn hr_status_summary_json(log: HireStatusLog) -> string {
+    let n = log.n
+    let mut s = "{\"total\":" + to_string(log.total)
+    s = s + ",\"recent_n\":" + to_string(n)
+    s = s + ",\"entries\":["
+    let mut i = 0
+    while i < n {
+        let e = log.entries[i]
+        if i > 0 { s = s + "," }
+        let sc_int = to_int(e.score * 100.0)
+        s = s + "{\"task\":\"" + e.task
+            + "\",\"tone\":\"" + e.tone
+            + "\",\"persona\":\"" + e.persona
+            + "\",\"score\":" + to_string(sc_int)
+            + ",\"verdict\":\"" + e.verdict
+            + "\",\"ts_ms\":" + to_string(e.ts_ms) + "}"
+        i = i + 1
+    }
+    s = s + "]}"
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 8. /hire/capabilities — persona/tone enumeration
+// ═══════════════════════════════════════════════════════════════
+
+fn hr_capabilities_json(presets: [StylePreset], personas: [PersonaSpec]) -> string {
+    let mut s = "{\"personas\":["
+    let np = len(personas)
+    let mut i = 0
+    while i < np {
+        if i > 0 { s = s + "," }
+        let p = personas[i]
+        s = s + "{\"id\":" + to_string(p.id)
+            + ",\"label\":\"" + p.label
+            + "\",\"default_tone\":\"" + p.default_tone + "\"}"
+        i = i + 1
+    }
+    s = s + "],\"tones\":["
+    let nt = len(presets)
+    let mut j = 0
+    while j < nt {
+        if j > 0 { s = s + "," }
+        let pr = presets[j]
+        s = s + "{\"id\":" + to_string(pr.id)
+            + ",\"label\":\"" + pr.label + "\"}"
+        j = j + 1
+    }
+    s = s + "]}"
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 9. Response JSON renderer (for HTTP mount)
+// ═══════════════════════════════════════════════════════════════
+
+fn hr_response_to_json(r: HireTaskResponse) -> string {
+    let sc_int = to_int(r.score * 100.0)
+    let mut s = "{\"answer\":\"" + r.answer
+    s = s + "\",\"steps_n\":" + to_string(r.steps_n)
+    s = s + ",\"steps_summary\":\"" + r.steps_summary
+    s = s + "\",\"score\":" + to_string(sc_int)
+    s = s + ",\"tone\":\"" + r.tone
+    s = s + "\",\"persona\":\"" + r.persona
+    s = s + "\",\"verdict\":\"" + r.verdict
+    s = s + "\",\"truncated\":" + (if r.truncated { "true" } else { "false" })
+    s = s + ",\"fallback_persona\":" + (if r.fallback_persona { "true" } else { "false" })
+    s = s + ",\"fallback_tone\":" + (if r.fallback_tone { "true" } else { "false" })
+    s = s + ",\"error\":\"" + r.error + "\"}"
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 10. Self-tests (T1–T5)
+// ═══════════════════════════════════════════════════════════════
+
+fn hr_str_contains(haystack: string, needle: string) -> bool {
+    return haystack.index_of(needle) >= 0
+}
+
+// T1: /hire/capabilities — 200 + persona/tone lists sane.
+fn hr_check_T1() -> bool {
+    let presets = hr_presets_extended()
+    let personas = hr_personas()
+    let json = hr_capabilities_json(presets, personas)
+    // 5 personas + 9 tones expected
+    if !hr_str_contains(json, "\"personas\":[") {
+        println("  T1 FAIL: missing personas list")
+        return false
+    }
+    if !hr_str_contains(json, "\"tones\":[") {
+        println("  T1 FAIL: missing tones list")
+        return false
+    }
+    if !hr_str_contains(json, "\"label\":\"default\"") {
+        println("  T1 FAIL: missing default persona")
+        return false
+    }
+    if !hr_str_contains(json, "\"label\":\"sorceress\"") {
+        println("  T1 FAIL: missing sorceress persona")
+        return false
+    }
+    if !hr_str_contains(json, "\"label\":\"senpai\"") {
+        println("  T1 FAIL: missing senpai tone")
+        return false
+    }
+    if !hr_str_contains(json, "\"label\":\"daily\"") {
+        println("  T1 FAIL: missing daily tone")
+        return false
+    }
+    // counts: personas 5, tones 9
+    if len(personas) != 5 {
+        println("  T1 FAIL: personas count " + to_string(len(personas)) + " expected 5")
+        return false
+    }
+    if len(presets) != 9 {
+        println("  T1 FAIL: tones count " + to_string(len(presets)) + " expected 9")
+        return false
+    }
+    return true
+}
+
+// T2: /hire/task simple — mock determinism + tone/persona defaults present.
+fn hr_check_T2() -> bool {
+    let presets = hr_presets_extended()
+    let personas = hr_personas()
+    let body = "{\"task\":\"summarize email about Q3 budget\",\"budget\":10}"
+    let r = hr_handle_task(body, presets, personas)
+    if len(r.error) > 0 {
+        println("  T2 FAIL: error=" + r.error)
+        return false
+    }
+    if r.steps_n != 3 {
+        println("  T2 FAIL: steps_n=" + to_string(r.steps_n) + " expected 3 (mock)")
+        return false
+    }
+    if r.persona != "default" {
+        println("  T2 FAIL: persona=" + r.persona + " expected default")
+        return false
+    }
+    if r.tone != "daily" {
+        println("  T2 FAIL: tone=" + r.tone + " expected daily (default persona)")
+        return false
+    }
+    if r.verdict != "PASS" {
+        println("  T2 FAIL: verdict=" + r.verdict + " expected PASS")
+        return false
+    }
+    if !hr_str_contains(r.answer, "summarize email about Q3 budget") {
+        println("  T2 FAIL: echo missing in answer: " + r.answer)
+        return false
+    }
+    if !hr_str_contains(r.answer, "[tone=daily]") {
+        println("  T2 FAIL: tone marker missing: " + r.answer)
+        return false
+    }
+    // Determinism — second call returns identical
+    let r2 = hr_handle_task(body, presets, personas)
+    if r2.answer != r.answer {
+        println("  T2 FAIL: not deterministic (answer mismatch)")
+        return false
+    }
+    if hr_fabs(r2.score - r.score) > 0.0 {
+        println("  T2 FAIL: not deterministic (score mismatch)")
+        return false
+    }
+    return true
+}
+
+// T3: /hire/task tone switch — tone=senpai → response.tone=senpai + marker.
+fn hr_check_T3() -> bool {
+    let presets = hr_presets_extended()
+    let personas = hr_personas()
+    let body = "{\"task\":\"reply with encouragement\",\"tone\":\"senpai\",\"budget\":5}"
+    let r = hr_handle_task(body, presets, personas)
+    if r.tone != "senpai" {
+        println("  T3 FAIL: tone=" + r.tone + " expected senpai")
+        return false
+    }
+    if r.fallback_tone {
+        println("  T3 FAIL: fallback_tone=true (should be explicit)")
+        return false
+    }
+    if !hr_str_contains(r.answer, "[tone=senpai]") {
+        println("  T3 FAIL: marker missing in answer: " + r.answer)
+        return false
+    }
+    // Also verify stoic_mentor + playful + professional + concise
+    let labels = ["stoic_mentor", "playful", "professional", "concise"]
+    let mut i = 0
+    while i < 4 {
+        let body2 = "{\"task\":\"t\",\"tone\":\"" + labels[i] + "\"}"
+        let r2 = hr_handle_task(body2, presets, personas)
+        if r2.tone != labels[i] {
+            println("  T3 FAIL: " + labels[i] + " not honored, got " + r2.tone)
+            return false
+        }
+        if !hr_str_contains(r2.answer, "[tone=" + labels[i] + "]") {
+            println("  T3 FAIL: " + labels[i] + " marker missing")
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// T4: /hire/task bad persona → fallback to default.
+fn hr_check_T4() -> bool {
+    let presets = hr_presets_extended()
+    let personas = hr_personas()
+
+    // (a) unknown persona
+    let body_a = "{\"task\":\"hello\",\"persona\":\"alien_overlord\"}"
+    let r_a = hr_handle_task(body_a, presets, personas)
+    if r_a.persona != "default" {
+        println("  T4 FAIL(a): persona=" + r_a.persona + " expected default")
+        return false
+    }
+    if !r_a.fallback_persona {
+        println("  T4 FAIL(a): fallback_persona=false (expected true)")
+        return false
+    }
+
+    // (b) missing persona (none provided) — also defaults
+    let body_b = "{\"task\":\"hello\"}"
+    let r_b = hr_handle_task(body_b, presets, personas)
+    if r_b.persona != "default" {
+        println("  T4 FAIL(b): persona=" + r_b.persona)
+        return false
+    }
+    if !r_b.fallback_persona {
+        println("  T4 FAIL(b): fallback_persona=false")
+        return false
+    }
+
+    // (c) valid persona — no fallback
+    let body_c = "{\"task\":\"hello\",\"persona\":\"sorceress\"}"
+    let r_c = hr_handle_task(body_c, presets, personas)
+    if r_c.persona != "sorceress" {
+        println("  T4 FAIL(c): persona=" + r_c.persona)
+        return false
+    }
+    if r_c.fallback_persona {
+        println("  T4 FAIL(c): unexpected fallback")
+        return false
+    }
+    if r_c.tone != "fantasy" {
+        println("  T4 FAIL(c): expected sorceress.default_tone=fantasy, got " + r_c.tone)
+        return false
+    }
+
+    // (d) missing task → error
+    let body_d = "{\"persona\":\"default\"}"
+    let r_d = hr_handle_task(body_d, presets, personas)
+    if len(r_d.error) == 0 {
+        println("  T4 FAIL(d): expected error for missing task")
+        return false
+    }
+    return true
+}
+
+// T5: /hire/status — log entries format + count.
+fn hr_check_T5() -> bool {
+    let mut log = hr_log_new(8)
+    let mut i = 0
+    while i < 5 {
+        let e = HireLogEntry {
+            task: "task_" + to_string(i),
+            tone: "daily",
+            persona: "default",
+            score: 0.85,
+            verdict: "PASS",
+            ts_ms: 1000000 + i * 100
+        }
+        log = hr_log_append(log, e)
+        i = i + 1
+    }
+    if log.n != 5 {
+        println("  T5 FAIL: n=" + to_string(log.n) + " expected 5")
+        return false
+    }
+    if log.total != 5 {
+        println("  T5 FAIL: total=" + to_string(log.total) + " expected 5")
+        return false
+    }
+    let json = hr_status_summary_json(log)
+    if !hr_str_contains(json, "\"total\":5") {
+        println("  T5 FAIL: total marker missing")
+        return false
+    }
+    if !hr_str_contains(json, "\"recent_n\":5") {
+        println("  T5 FAIL: recent_n marker missing")
+        return false
+    }
+    if !hr_str_contains(json, "\"task\":\"task_0\"") {
+        println("  T5 FAIL: first task missing in entries")
+        return false
+    }
+    if !hr_str_contains(json, "\"task\":\"task_4\"") {
+        println("  T5 FAIL: last task missing in entries")
+        return false
+    }
+    if !hr_str_contains(json, "\"verdict\":\"PASS\"") {
+        println("  T5 FAIL: verdict missing")
+        return false
+    }
+
+    // Ring buffer test — 10 push to capacity 8
+    let mut log2 = hr_log_new(8)
+    let mut k = 0
+    while k < 10 {
+        let e = HireLogEntry {
+            task: "ring_" + to_string(k),
+            tone: "daily",
+            persona: "default",
+            score: 0.85,
+            verdict: "PASS",
+            ts_ms: 2000000 + k * 100
+        }
+        log2 = hr_log_append(log2, e)
+        k = k + 1
+    }
+    if log2.n != 8 {
+        println("  T5 FAIL: ring n=" + to_string(log2.n) + " expected 8 (cap)")
+        return false
+    }
+    if log2.total != 10 {
+        println("  T5 FAIL: ring total=" + to_string(log2.total) + " expected 10")
+        return false
+    }
+    let json2 = hr_status_summary_json(log2)
+    // ring_0/ring_1 should have been dropped, ring_9 should be present
+    if hr_str_contains(json2, "\"task\":\"ring_0\"") {
+        println("  T5 FAIL: ring_0 should be dropped from cap-8 ring")
+        return false
+    }
+    if !hr_str_contains(json2, "\"task\":\"ring_9\"") {
+        println("  T5 FAIL: ring_9 missing from ring buffer")
+        return false
+    }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 11. main — embedded 5 tests
+// ═══════════════════════════════════════════════════════════════
+
+fn hr_run_embedded_tests() -> bool {
+    println("[hire_routes] TSRV-P4-1 — http /hire endpoints (autonomy + style + lore)")
+    println("  3 routes: GET /hire/capabilities, POST /hire/task, GET /hire/status")
+    println("  mock autonomy_loop (deterministic), inline style + persona registry")
+    println("")
+
+    let t1 = hr_check_T1()
+    if t1 { println("T1 PASS — /hire/capabilities (5 personas + 9 tones)") }
+           else { println("T1 FAIL") }
+
+    let t2 = hr_check_T2()
+    if t2 { println("T2 PASS — /hire/task mock e2e + determinism") }
+           else { println("T2 FAIL") }
+
+    let t3 = hr_check_T3()
+    if t3 { println("T3 PASS — tone switch (senpai/stoic_mentor/playful/professional/concise)") }
+           else { println("T3 FAIL") }
+
+    let t4 = hr_check_T4()
+    if t4 { println("T4 PASS — persona fallback (unknown / missing / valid / no-task)") }
+           else { println("T4 FAIL") }
+
+    let t5 = hr_check_T5()
+    if t5 { println("T5 PASS — /hire/status log + ring buffer") }
+           else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    println("")
+    if all_pass {
+        println("[hire_routes] ALL 5/5 PASS — TSRV-P4-1 scaffold_done")
+    } else {
+        println("[hire_routes] SOME FAILED")
+    }
+    return all_pass
+}
+
+fn main() {
+    let _ = hr_run_embedded_tests()
+}
+
+main()

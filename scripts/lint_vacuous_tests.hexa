@@ -1,0 +1,537 @@
+// ═══════════════════════════════════════════════════════════
+// scripts/lint_vacuous_tests.hexa — CI vacuous-test lint scanner
+//
+// DECISION_LOG.csv #12 (ACCEPTED 2026-04-16):
+//   "Ban vacuous tests project-wide via CI lint rule. Tests
+//    with no assertions pass vacuously and provide zero
+//    coverage — discovered in test_conscious_memory.hexa
+//    (10 cases)".
+//
+// URGENT_ACTION_LIST.md P1 item #14.
+//
+// What it scans:
+//   - tests/*.hexa
+//   - anima-*/test_*.hexa  (anima-agent, anima-speak, ...)
+//   - anima-*/tests/*.hexa (future-proof)
+//   - training/test_*.hexa
+//   - serving/test_*.hexa
+//
+// Function discovery:
+//   - any top-level `fn test_*(...)` or `fn *_test(...)`
+//
+// Vacuous patterns (error level):
+//   E1. body contains the literal token `TODO[assert]`
+//   E2. body has no check primitives at all
+//         (no `if`, no `assert_`, no `assert(`, no `fail_count`,
+//          no `return false`, no `panic(`, no `exit(`, no `PASS`/`FAIL` markers)
+//   E3. body is effectively empty (no statements besides comments)
+//
+// Warning level (possibly vacuous):
+//   W1. body only contains `println(...)` statements + no checks
+//
+// Invocation:
+//   hexa run scripts/lint_vacuous_tests.hexa                  (terminal text)
+//   hexa run scripts/lint_vacuous_tests.hexa --json           (json to stdout)
+//   hexa run scripts/lint_vacuous_tests.hexa --roots tests/,training/,serving/
+//   hexa run scripts/lint_vacuous_tests.hexa --exclude tests/test_conscious_memory.hexa
+//   hexa run scripts/lint_vacuous_tests.hexa --emit shared/state/vacuous_test_latest.json
+//
+// Exit:
+//   0 always — the lint itself is advisory; use
+//   scripts/test_vacuous_lint_gate.hexa as the CI gate wrapper.
+//
+// Author: 2026-04-16, agent-a2714973 (P1 URGENT-TEST #14 follow-up).
+// ═══════════════════════════════════════════════════════════
+
+// ─── Configuration ───────────────────────────────────────────
+
+fn default_roots() -> string {
+    // comma-separated list of roots to walk
+    return "tests,training,serving,anima-agent,anima-speak,anima-physics,anima-body,anima-core,anima-hexad,anima-measurement,anima-engines,anima-eeg,anima-tools"
+}
+
+fn repo_root() -> string {
+    let env_root = env("ANIMA_REPO_ROOT")
+    if env_root != "" { return env_root }
+    let git_root = exec("git rev-parse --show-toplevel 2>/dev/null").trim()
+    if git_root != "" { return git_root }
+    return exec("printenv HOME").trim() + "/Dev/anima"
+}
+
+// ─── Small helpers ───────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "\\r")
+    r = r.replace("\t", "\\t")
+    return r
+}
+
+fn parse_flag_value(args_str: string, flag: string) -> string {
+    // returns the value after `flag ` or `flag=VAL`, "" if absent
+    let eq = args_str.index_of(flag + "=")
+    if eq >= 0 {
+        let after = args_str.substring(eq + len(flag) + 1, len(args_str))
+        let sp = after.index_of(" ")
+        if sp < 0 { return after }
+        return after.substring(0, sp)
+    }
+    let sp_form = args_str.index_of(flag + " ")
+    if sp_form >= 0 {
+        let after = args_str.substring(sp_form + len(flag) + 1, len(args_str))
+        let sp = after.index_of(" ")
+        if sp < 0 { return after.trim() }
+        return after.substring(0, sp).trim()
+    }
+    return ""
+}
+
+fn has_flag(args_str: string, flag: string) -> bool {
+    return args_str.index_of(flag) >= 0
+}
+
+// ─── File discovery ──────────────────────────────────────────
+
+fn walk_test_files(root_abs: string, rel_root: string) -> string {
+    // returns newline-joined list of test file paths (abs) under root_abs.
+    // patterns: test_*.hexa or *_test.hexa (case-sensitive), any depth.
+    // excludes build/ archive/ _archive/ .claude/ .git/ directories.
+    if !dir_exists(root_abs) { return "" }
+    // use `find` because native directory traversal on stage1 hexa is
+    // verbose and we already depend on shell tools for this lint.
+    let cmd = "find '" + root_abs + "' "
+        + "-type d \\( -name build -o -name archive -o -name _archive -o -name .claude -o -name .git -o -name __pycache__ -o -name .worktrees \\) -prune -o "
+        + "-type f \\( -name 'test_*.hexa' -o -name '*_test.hexa' \\) -print "
+        + "2>/dev/null"
+    let out = _str(exec(cmd)).trim()
+    return out
+}
+
+fn dir_exists(path: string) -> bool {
+    let out = _str(exec("test -d '" + path + "' && echo y || echo n")).trim()
+    return out == "y"
+}
+
+fn collect_all_files(roots_csv: string, repo: string) -> string {
+    let mut all_lines = ""
+    let roots = roots_csv.split(",")
+    for r in roots {
+        let rel = _str(r).trim()
+        if rel == "" { continue }
+        let abs = repo + "/" + rel
+        let part = walk_test_files(abs, rel)
+        if part == "" { continue }
+        if all_lines == "" {
+            all_lines = part
+        } else {
+            all_lines = all_lines + "\n" + part
+        }
+    }
+    return all_lines
+}
+
+// ─── Function / body extraction ──────────────────────────────
+
+fn is_test_fn_header(trimmed: string) -> string {
+    // returns the function name if the line is a `fn test_*` or `fn *_test`
+    // header, else "".
+    if !trimmed.starts_with("fn ") { return "" }
+    // skip `fn main`, `fn run`, etc.
+    let after_fn = trimmed.substring(3, len(trimmed))
+    let paren = after_fn.index_of("(")
+    if paren <= 0 { return "" }
+    let name = after_fn.substring(0, paren).trim()
+    if name == "" { return "" }
+    // Must start with `test_` OR end with `_test`.
+    if name.starts_with("test_") { return name }
+    if name.ends_with("_test") { return name }
+    return ""
+}
+
+fn extract_body(lines: list, start_idx: i64) -> string {
+    // brace-balanced body extractor starting at start_idx (fn header line).
+    // Ignores braces inside string/char literals and line comments.
+    // Returns body INCLUDING the header line (so we can count stmts).
+    let mut i = start_idx
+    let n = len(lines)
+    let mut depth = 0
+    let mut started = false
+    let mut body = ""
+    while i < n {
+        let line = _str(lines[i])
+        body = body + line + "\n"
+        // char-level scan of this line
+        let m = len(line)
+        let mut j = 0
+        let mut in_str = false
+        let mut in_ch = false
+        let mut in_linecom = false
+        while j < m {
+            let ch = line.substring(j, j + 1)
+            if in_linecom { j = j + 1; continue }
+            if in_str {
+                if ch == "\\" && j + 1 < m { j = j + 2; continue }
+                if ch == "\"" { in_str = false }
+                j = j + 1
+                continue
+            }
+            if in_ch {
+                if ch == "\\" && j + 1 < m { j = j + 2; continue }
+                if ch == "'" { in_ch = false }
+                j = j + 1
+                continue
+            }
+            if ch == "\"" { in_str = true; j = j + 1; continue }
+            if ch == "'" { in_ch = true; j = j + 1; continue }
+            if ch == "/" && j + 1 < m {
+                let nxt = line.substring(j + 1, j + 2)
+                if nxt == "/" { in_linecom = true; j = j + 2; continue }
+            }
+            if ch == "{" {
+                depth = depth + 1
+                started = true
+            } else if ch == "}" {
+                depth = depth - 1
+                if started && depth == 0 {
+                    return body
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return body
+}
+
+// ─── Vacuous classification ──────────────────────────────────
+
+struct BodyAnalysis {
+    has_todo_assert: bool,
+    has_check: bool,
+    has_println: bool,
+    non_comment_stmt_count: i64
+}
+
+fn strip_comments_and_blanks(body: string) -> string {
+    // return body with line comments stripped and empty lines removed
+    let lines = body.split("\n")
+    let mut out = ""
+    let mut i = 0
+    while i < len(lines) {
+        let raw = _str(lines[i])
+        // strip trailing line comment
+        let com = raw.index_of("//")
+        let mut stripped = raw
+        if com >= 0 {
+            stripped = raw.substring(0, com)
+        }
+        let t = stripped.trim()
+        if t != "" {
+            if out == "" { out = t } else { out = out + "\n" + t }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn analyze_body(body: string) -> BodyAnalysis {
+    let mut a = BodyAnalysis {
+        has_todo_assert: false,
+        has_check: false,
+        has_println: false,
+        non_comment_stmt_count: 0
+    }
+    if body.index_of("TODO[assert]") >= 0 { a.has_todo_assert = true }
+
+    // Checks: we look for any of the check primitives.
+    // NOTE: we check BEFORE stripping comments to catch `if cond` lines
+    // that had trailing comments; index_of on the raw body is fine because
+    // these tokens don't legitimately appear inside string literals in
+    // any real test file (the lint is a heuristic, not a parser).
+    let checks = [
+        "assert_",
+        "assert(",
+        " if ",      // space-guarded to avoid `if` inside identifiers
+        "\tif ",
+        "\nif ",
+        " if(",
+        "\tif(",
+        "\nif(",
+        "fail_count",
+        "pass_count",
+        "return false",
+        "return true && ",  // e.g. return true && cond
+        "panic(",
+        "exit(",
+        " PASS",
+        " FAIL",
+        "== ",       // comparison operators usually appear in checks
+        "!= ",
+        ">= ",
+        "<= "
+    ]
+    for tok in checks {
+        let t = _str(tok)
+        if body.index_of(t) >= 0 { a.has_check = true; break }
+    }
+
+    if body.index_of("println(") >= 0 { a.has_println = true }
+    if body.index_of("print(") >= 0 { a.has_println = true }
+
+    // Count stmts by counting non-empty non-comment lines that are NOT
+    // the `fn` header or the closing `}`.
+    let stripped = strip_comments_and_blanks(body)
+    let lines = stripped.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = _str(lines[i]).trim()
+        if ln == "" { i = i + 1; continue }
+        if ln.starts_with("fn ") { i = i + 1; continue }
+        if ln == "}" || ln == "{" { i = i + 1; continue }
+        // skip `) {` or `{` trailing lines
+        if ln == ") {" { i = i + 1; continue }
+        a.non_comment_stmt_count = a.non_comment_stmt_count + 1
+        i = i + 1
+    }
+    return a
+}
+
+// ─── Per-file scan ───────────────────────────────────────────
+
+struct FileReport {
+    files_scanned: i64,
+    functions_scanned: i64,
+    errors: list,   // list of "file|fn|line|reason"
+    warnings: list  // same format
+}
+
+fn scan_file(rel_path: string, abs_path: string, report_errs: list, report_warns: list) -> i64 {
+    // mutates report lists; returns number of functions scanned.
+    if !file_exists(abs_path) { return 0 }
+    let content = read_file(abs_path)
+    let lines = content.split("\n")
+    let mut fn_count = 0
+    let mut i = 0
+    let n = len(lines)
+    while i < n {
+        let raw = _str(lines[i])
+        let t = raw.trim()
+        let name = is_test_fn_header(t)
+        if name == "" { i = i + 1; continue }
+        let line_no = i + 1
+        let body = extract_body(lines, i)
+        let a = analyze_body(body)
+        fn_count = fn_count + 1
+
+        // E1: TODO[assert]
+        if a.has_todo_assert {
+            report_errs.push(rel_path + "|" + name + "|" + to_string(line_no) + "|vacuous: contains TODO[assert]")
+        } else if a.non_comment_stmt_count == 0 {
+            // E3: empty body
+            report_errs.push(rel_path + "|" + name + "|" + to_string(line_no) + "|vacuous: empty body")
+        } else if !a.has_check {
+            if a.has_println && a.non_comment_stmt_count >= 1 {
+                // W1: println-only → warning
+                report_warns.push(rel_path + "|" + name + "|" + to_string(line_no) + "|possibly vacuous: only prints, no checks")
+            } else {
+                // E2: no checks at all
+                report_errs.push(rel_path + "|" + name + "|" + to_string(line_no) + "|vacuous: no checks")
+            }
+        }
+
+        // advance i past the body
+        // count the number of lines in the extracted body
+        let body_lines = body.split("\n")
+        i = i + len(body_lines) - 1
+        if i < line_no { i = line_no }  // safety — never go backwards
+    }
+    return fn_count
+}
+
+// ─── Aggregate + output ──────────────────────────────────────
+
+fn render_text(
+    files_scanned: i64,
+    functions_scanned: i64,
+    errs: list,
+    warns: list
+) -> string {
+    let mut out = ""
+    out = out + "=== lint_vacuous_tests ===\n"
+    out = out + "files_scanned:     " + to_string(files_scanned) + "\n"
+    out = out + "functions_scanned: " + to_string(functions_scanned) + "\n"
+    out = out + "errors:            " + to_string(len(errs)) + "\n"
+    out = out + "warnings:          " + to_string(len(warns)) + "\n"
+    out = out + "\n"
+    if len(errs) > 0 {
+        out = out + "ERRORS:\n"
+        let mut i = 0
+        while i < len(errs) {
+            out = out + "  " + _str(errs[i]) + "\n"
+            i = i + 1
+        }
+        out = out + "\n"
+    }
+    if len(warns) > 0 {
+        out = out + "WARNINGS:\n"
+        let mut i = 0
+        while i < len(warns) {
+            out = out + "  " + _str(warns[i]) + "\n"
+            i = i + 1
+        }
+        out = out + "\n"
+    }
+    if len(errs) == 0 && len(warns) == 0 {
+        out = out + "No vacuous tests detected.\n"
+    }
+    return out
+}
+
+fn render_json(
+    files_scanned: i64,
+    functions_scanned: i64,
+    errs: list,
+    warns: list
+) -> string {
+    let mut out = "{\n"
+    out = out + "  \"files_scanned\": " + to_string(files_scanned) + ",\n"
+    out = out + "  \"functions_scanned\": " + to_string(functions_scanned) + ",\n"
+    out = out + "  \"errors\": ["
+    let mut i = 0
+    while i < len(errs) {
+        let line = _str(errs[i])
+        let parts = line.split("|")
+        let file = _str(parts[0])
+        let fnname = _str(parts[1])
+        let ln = _str(parts[2])
+        let reason = _str(parts[3])
+        if i > 0 { out = out + "," }
+        out = out + "\n    {\"file\": \"" + json_escape(file)
+            + "\", \"fn\": \"" + json_escape(fnname)
+            + "\", \"line\": " + ln
+            + ", \"reason\": \"" + json_escape(reason) + "\"}"
+        i = i + 1
+    }
+    if len(errs) > 0 { out = out + "\n  " }
+    out = out + "],\n"
+    out = out + "  \"warnings\": ["
+    let mut j = 0
+    while j < len(warns) {
+        let line = _str(warns[j])
+        let parts = line.split("|")
+        let file = _str(parts[0])
+        let fnname = _str(parts[1])
+        let ln = _str(parts[2])
+        let reason = _str(parts[3])
+        if j > 0 { out = out + "," }
+        out = out + "\n    {\"file\": \"" + json_escape(file)
+            + "\", \"fn\": \"" + json_escape(fnname)
+            + "\", \"line\": " + ln
+            + ", \"reason\": \"" + json_escape(reason) + "\"}"
+        j = j + 1
+    }
+    if len(warns) > 0 { out = out + "\n  " }
+    out = out + "]\n"
+    out = out + "}\n"
+    return out
+}
+
+// ─── Main ────────────────────────────────────────────────────
+
+fn main() {
+    let argv = args()
+    // args() returns [interpreter, script, ...user_args]; skip first two.
+    let mut args_str = ""
+    let mut ai = 2
+    while ai < len(argv) {
+        let a = _str(argv[ai])
+        if args_str == "" { args_str = a } else { args_str = args_str + " " + a }
+        ai = ai + 1
+    }
+    let json_mode = has_flag(args_str, "--json")
+    let repo = repo_root()
+
+    // Parse --roots (optional) and --exclude (optional)
+    let mut roots_csv = parse_flag_value(args_str, "--roots")
+    if roots_csv == "" { roots_csv = default_roots() }
+    let exclude_csv = parse_flag_value(args_str, "--exclude")
+    let emit_path = parse_flag_value(args_str, "--emit")
+
+    // Collect target files
+    let files_str = collect_all_files(roots_csv, repo)
+    let mut rel_files = []
+    if files_str != "" {
+        let abs_lines = files_str.split("\n")
+        let mut i = 0
+        while i < len(abs_lines) {
+            let abs = _str(abs_lines[i]).trim()
+            if abs == "" { i = i + 1; continue }
+            // compute repo-relative path
+            let mut rel = abs
+            if abs.starts_with(repo + "/") {
+                rel = abs.substring(len(repo) + 1, len(abs))
+            }
+            // apply excludes
+            let mut skip = false
+            if exclude_csv != "" {
+                let ex = exclude_csv.split(",")
+                for e in ex {
+                    let es = _str(e).trim()
+                    if es == "" { continue }
+                    if rel == es || rel.starts_with(es + "/") || rel.index_of(es) >= 0 {
+                        skip = true
+                        break
+                    }
+                }
+            }
+            if !skip {
+                rel_files.push(rel)
+            }
+            i = i + 1
+        }
+    }
+
+    // Scan each file
+    let errs = []
+    let warns = []
+    let mut files_scanned = 0
+    let mut functions_scanned = 0
+    let mut fi = 0
+    while fi < len(rel_files) {
+        let rel = _str(rel_files[fi])
+        let abs = repo + "/" + rel
+        files_scanned = files_scanned + 1
+        let n_fn = scan_file(rel, abs, errs, warns)
+        functions_scanned = functions_scanned + n_fn
+        fi = fi + 1
+    }
+
+    // Render + print
+    let txt = ""
+    let rendered = ""
+    if json_mode {
+        let js = render_json(files_scanned, functions_scanned, errs, warns)
+        println(js)
+        if emit_path != "" {
+            write_file(repo + "/" + emit_path, js)
+        }
+    } else {
+        let t = render_text(files_scanned, functions_scanned, errs, warns)
+        println(t)
+        if emit_path != "" {
+            let js = render_json(files_scanned, functions_scanned, errs, warns)
+            write_file(repo + "/" + emit_path, js)
+        }
+    }
+}
+
+main()

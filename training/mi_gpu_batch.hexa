@@ -1,0 +1,244 @@
+// training/mi_gpu_batch.hexa — GPU-batched Mutual Information for 110 phi engines
+//
+// Perf attack #5: 110 phi engines each compute MI(a, b) on CPU with an 8-bin
+// log-histogram. Serial latency dominates the phi-measure phase of training.
+// This module fuses all 110 MIs into ONE CUDA kernel launch.
+//
+// Numerical contract (must match training/phi_auto_measure.hexa line 94-185):
+//   MI_BINS = 8
+//   lo = min(min(a), min(b));  hi = max(max(a), max(b))
+//   H(a)   = -sum_k p_k * ln(p_k)    with p_k = count_k / N   (k in [0,8))
+//   H(b)   = same with b
+//   H(a,b) = -sum_{i,j} p_{ij} * ln(p_{ij})   with p_{ij} = count_{ij}/N
+//   MI     = max(0, H(a) + H(b) - H(a,b))
+//
+// Kernel layout:
+//   Input:  a_dev, b_dev  — [B, N] float32 each  (B = engine batch, N = samples)
+//   Input:  lo_dev, hi_dev — [B] float32 each    (pre-computed per-row min/max)
+//   Output: mi_dev        — [B] float32
+//   Grid:   B blocks, 256 threads per block, each block handles one engine row
+//   Shmem:  MI_BINS*sizeof(int) + MI_BINS*sizeof(int) + MI_BINS*MI_BINS*sizeof(int)
+//           = 8*4 + 8*4 + 64*4 = 320 B  (trivial; fits L1 easily)
+//
+// Run:
+//   HEXA=$HEXA_LANG/target/release/hexa
+//   $HEXA training/mi_gpu_batch.hexa                 # runs poc_bench()
+//
+// Depends on:
+//   self/ml/cuda_ffi.hexa   (cuda_init, cuda_malloc, cuda_memcpy_*, cuda_free)
+//   self/ml/cuda_rtc.hexa   (rtc_init, rtc_compile_ptx, rtc_load_module,
+//                            rtc_get_function, rtc_launch, rtc_sync)
+
+use self::ml::cuda_ffi
+use self::ml::cuda_rtc
+
+// --- Kernel source ---------------------------------------------------
+//
+// One block per engine. Each thread processes N/256 samples, atomically
+// incrementing shared-memory histograms. A single reduction then computes
+// H(a), H(b), H(a,b), and MI into mi[blockIdx.x].
+
+let MI_GPU_KERNEL_SRC = "extern \"C\" __global__ void mi_batch_kernel(\n    const float* __restrict__ a,\n    const float* __restrict__ b,\n    const float* __restrict__ lo_arr,\n    const float* __restrict__ hi_arr,\n    float* __restrict__ mi_out,\n    int N)\n{\n    const int NB = 8;\n    const int NB2 = 64;\n    __shared__ int ha[8];\n    __shared__ int hb[8];\n    __shared__ int hj[64];\n    int tid = threadIdx.x;\n    int bid = blockIdx.x;\n    // zero shared\n    if (tid < NB) { ha[tid] = 0; hb[tid] = 0; }\n    if (tid < NB2) { hj[tid] = 0; }\n    __syncthreads();\n    float lo = lo_arr[bid];\n    float hi = hi_arr[bid];\n    float denom = hi - lo;\n    bool degenerate = (denom <= 0.0f);\n    float invd = degenerate ? 0.0f : (1.0f / denom);\n    const float* ap = a + bid * N;\n    const float* bp = b + bid * N;\n    for (int i = tid; i < N; i += blockDim.x) {\n        float xa = ap[i];\n        float xb = bp[i];\n        int ia = 0;\n        int ib = 0;\n        if (!degenerate) {\n            float ta = (xa - lo) * invd;\n            float tb = (xb - lo) * invd;\n            int ra = (int)(ta * (float)NB);\n            int rb = (int)(tb * (float)NB);\n            if (ra < 0) ra = 0; if (ra >= NB) ra = NB - 1;\n            if (rb < 0) rb = 0; if (rb >= NB) rb = NB - 1;\n            ia = ra; ib = rb;\n        }\n        atomicAdd(&ha[ia], 1);\n        atomicAdd(&hb[ib], 1);\n        atomicAdd(&hj[ia * NB + ib], 1);\n    }\n    __syncthreads();\n    if (tid == 0) {\n        float inv_n = 1.0f / (float)N;\n        float H_a = 0.0f, H_b = 0.0f, H_ab = 0.0f;\n        for (int k = 0; k < NB; k++) {\n            float pa = (float)ha[k] * inv_n;\n            float pb = (float)hb[k] * inv_n;\n            if (pa > 0.0f) H_a -= pa * logf(pa);\n            if (pb > 0.0f) H_b -= pb * logf(pb);\n        }\n        for (int k = 0; k < NB2; k++) {\n            float pj = (float)hj[k] * inv_n;\n            if (pj > 0.0f) H_ab -= pj * logf(pj);\n        }\n        float mi = H_a + H_b - H_ab;\n        if (mi < 0.0f) mi = 0.0f;\n        mi_out[bid] = mi;\n    }\n}\n"
+
+// --- CPU reference (bit-identical to phi_auto_measure.hexa) ----------
+
+let MI_BINS = 8
+
+fn ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn cpu_bin_index(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn cpu_mi(a: array, b: array, lo: float, hi: float) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let nb = MI_BINS
+    let nb2 = nb * nb
+    let mut ha = []
+    let mut hb = []
+    let mut hj = []
+    let mut k = 0
+    while k < nb { ha = ha.push(0); hb = hb.push(0); k = k + 1 }
+    k = 0
+    while k < nb2 { hj = hj.push(0); k = k + 1 }
+    let mut i = 0
+    while i < n {
+        let ia = cpu_bin_index(a[i], lo, hi, nb)
+        let ib = cpu_bin_index(b[i], lo, hi, nb)
+        ha[ia] = ha[ia] + 1
+        hb[ib] = hb[ib] + 1
+        hj[ia * nb + ib] = hj[ia * nb + ib] + 1
+        i = i + 1
+    }
+    let inv_n = 1.0 / to_float(n)
+    let mut H_a = 0.0
+    let mut H_b = 0.0
+    let mut H_ab = 0.0
+    k = 0
+    while k < nb {
+        let pa = to_float(ha[k]) * inv_n
+        let pb = to_float(hb[k]) * inv_n
+        if pa > 0.0 { H_a = H_a - pa * ln_safe(pa) }
+        if pb > 0.0 { H_b = H_b - pb * ln_safe(pb) }
+        k = k + 1
+    }
+    k = 0
+    while k < nb2 {
+        let pj = to_float(hj[k]) * inv_n
+        if pj > 0.0 { H_ab = H_ab - pj * ln_safe(pj) }
+        k = k + 1
+    }
+    let mi = H_a + H_b - H_ab
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+fn row_minmax(v: array) -> array {
+    let n = len(v)
+    let mut mn = v[0]
+    let mut mx = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < mn { mn = v[i] }
+        if v[i] > mx { mx = v[i] }
+        i = i + 1
+    }
+    return [mn, mx]
+}
+
+// --- GPU batch driver ------------------------------------------------
+//
+// mi_gpu_batch(A, B) -> [f32 × engines]
+//   A, B : hexa array-of-array, each row length N (all rows same N).
+
+fn mi_gpu_batch_launch(a_host, b_host, lo_host, hi_host, batch, n) {
+    let _ = cuda_init()
+    let _ = rtc_init()
+    let bytes_ab  = batch * n * 4
+    let bytes_row = batch * 4
+    let a_dev  = cuda_malloc(bytes_ab)
+    let b_dev  = cuda_malloc(bytes_ab)
+    let lo_dev = cuda_malloc(bytes_row)
+    let hi_dev = cuda_malloc(bytes_row)
+    let mi_dev = cuda_malloc(bytes_row)
+    let _ = cuda_memcpy_h2d(a_dev,  a_host,  bytes_ab)
+    let _ = cuda_memcpy_h2d(b_dev,  b_host,  bytes_ab)
+    let _ = cuda_memcpy_h2d(lo_dev, lo_host, bytes_row)
+    let _ = cuda_memcpy_h2d(hi_dev, hi_host, bytes_row)
+    let ptx = rtc_compile_ptx(MI_GPU_KERNEL_SRC, "mi_batch.cu")
+    let module = rtc_load_module(ptx)
+    let func = rtc_get_function(module, "mi_batch_kernel")
+    let arg_a  = alloc_raw(8); write_i64(arg_a,  0, ptr_addr(a_dev))
+    let arg_b  = alloc_raw(8); write_i64(arg_b,  0, ptr_addr(b_dev))
+    let arg_lo = alloc_raw(8); write_i64(arg_lo, 0, ptr_addr(lo_dev))
+    let arg_hi = alloc_raw(8); write_i64(arg_hi, 0, ptr_addr(hi_dev))
+    let arg_mi = alloc_raw(8); write_i64(arg_mi, 0, ptr_addr(mi_dev))
+    let arg_n  = alloc_raw(4); write_i32(arg_n,  0, n)
+    let args = [arg_a, arg_b, arg_lo, arg_hi, arg_mi, arg_n]
+    // one block per engine, 256 threads each
+    let _ = rtc_launch(func, batch, 1, 1, 256, 1, 1, args)
+    let _ = rtc_sync()
+    let mi_host = alloc_raw(bytes_row)
+    let _ = cuda_memcpy_d2h(mi_host, mi_dev, bytes_row)
+    cuda_free(a_dev); cuda_free(b_dev)
+    cuda_free(lo_dev); cuda_free(hi_dev); cuda_free(mi_dev)
+    return mi_host
+}
+
+// --- PoC / benchmark --------------------------------------------------
+
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn poc_bench() {
+    let batch = 5         // PoC: 5 engines (full run will use 110)
+    let n = 1024          // samples per engine (typical for phi_*_measure)
+    println("[mi_gpu_batch] PoC batch=" + str(batch) + " N=" + str(n))
+    // Build a/b rows, flatten into packed host buffers, pre-compute lo/hi.
+    let a_buf  = alloc_raw(batch * n * 4)
+    let b_buf  = alloc_raw(batch * n * 4)
+    let lo_buf = alloc_raw(batch * 4)
+    let hi_buf = alloc_raw(batch * 4)
+    let mut all_a = []
+    let mut all_b = []
+    let mut e = 0
+    while e < batch {
+        let a = det_rand(n, 1337 + e * 7)
+        let b = det_rand(n, 9001 + e * 11)
+        all_a = all_a.push(a)
+        all_b = all_b.push(b)
+        let mm_a = row_minmax(a)
+        let mm_b = row_minmax(b)
+        let lo = if mm_a[0] < mm_b[0] { mm_a[0] } else { mm_b[0] }
+        let hi = if mm_a[1] > mm_b[1] { mm_a[1] } else { mm_b[1] }
+        let mut i = 0
+        while i < n {
+            write_f32(a_buf, (e * n + i) * 4, a[i])
+            write_f32(b_buf, (e * n + i) * 4, b[i])
+            i = i + 1
+        }
+        write_f32(lo_buf, e * 4, lo)
+        write_f32(hi_buf, e * 4, hi)
+        e = e + 1
+    }
+    // --- CPU reference (time per-engine, summed) ---
+    let t0 = now_ms()
+    let mut cpu_vals = []
+    e = 0
+    while e < batch {
+        let mm_a = row_minmax(all_a[e])
+        let mm_b = row_minmax(all_b[e])
+        let lo = if mm_a[0] < mm_b[0] { mm_a[0] } else { mm_b[0] }
+        let hi = if mm_a[1] > mm_b[1] { mm_a[1] } else { mm_b[1] }
+        cpu_vals = cpu_vals.push(cpu_mi(all_a[e], all_b[e], lo, hi))
+        e = e + 1
+    }
+    let t_cpu = now_ms() - t0
+    // --- GPU batched ---
+    let t1 = now_ms()
+    let mi_host = mi_gpu_batch_launch(a_buf, b_buf, lo_buf, hi_buf, batch, n)
+    let t_gpu = now_ms() - t1
+    // --- compare ---
+    let mut max_err = 0.0
+    e = 0
+    while e < batch {
+        let g = deref_f32(mi_host, e * 4)
+        let c = cpu_vals[e]
+        let d = if (g - c) < 0.0 { c - g } else { g - c }
+        if d > max_err { max_err = d }
+        println("  engine " + str(e) + " cpu=" + str(c) + " gpu=" + str(g) + " |d|=" + str(d))
+        e = e + 1
+    }
+    println("[mi_gpu_batch] CPU " + str(batch) + "× = " + str(t_cpu) + " ms")
+    println("[mi_gpu_batch] GPU batch = " + str(t_gpu) + " ms")
+    println("[mi_gpu_batch] max |CPU - GPU| = " + str(max_err))
+    println("[mi_gpu_batch] tolerance check: " + (if max_err < 0.001 { "PASS" } else { "FAIL" }))
+    free_raw(a_buf,  batch * n * 4)
+    free_raw(b_buf,  batch * n * 4)
+    free_raw(lo_buf, batch * 4)
+    free_raw(hi_buf, batch * 4)
+    free_raw(mi_host, batch * 4)
+}
+
+fn main() {
+    poc_bench()
+}

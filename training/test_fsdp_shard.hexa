@@ -1,0 +1,380 @@
+// ===============================================================
+//  training/test_fsdp_shard.hexa — C9 FSDP shard regression test
+//
+//  Runs WITHOUT CUDA. Exercises the pure-CPU surface of
+//  training/fsdp_shard.hexa so a Mac/Linux dev box can verify
+//  the math correctness of the layer-wise sharding before any
+//  H100 round-trip. The CUDA-touching helpers (fsdp_init,
+//  fsdp_save_ckpt body) are exercised on H100 from a separate
+//  smoke. Here we focus on:
+//
+//    T1  init layout — for any (NL, world_size) the per-rank
+//        ranges are contiguous, exhaustive, non-overlapping, and
+//        only rank 0 owns the shared embed/lmh tensors.
+//    T2  single-rank no-op — world_size==1 collectives short
+//        circuit (return 0/OK), savings_ratio is 0.0, and the
+//        per-rank byte accounting equals the full unsharded
+//        baseline (sanity: nothing was actually freed).
+//    T3  ckpt header roundtrip byte-identical — the FSDP
+//        descriptor line that fsdp_save_ckpt writes survives a
+//        write→read→parse cycle and matches the input fields
+//        exactly. Single-rank path naming is `{base}.rank0of1`
+//        and the multi-rank naming follows `.rank{r}of{w}`.
+//
+//  Run:
+//    hexa run training/test_fsdp_shard.hexa
+//
+//  Exit contract: prints "fsdp_shard regression: <pass>/<total> PASS"
+//  as the final line so a CI runner can scrape it.
+// ===============================================================
+
+use "fsdp_shard"
+use "nccl_ffi"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn assert_true(name: string, cond: bool) {
+    if cond {
+        println("  " + name + ": PASS")
+        pass_count = pass_count + 1
+    } else {
+        println("  " + name + ": FAIL")
+        fail_count = fail_count + 1
+    }
+}
+
+fn assert_eq_int(name: string, got: int, want: int) {
+    if got == want {
+        println("  " + name + ": PASS (= " + str(got) + ")")
+        pass_count = pass_count + 1
+    } else {
+        println("  " + name + ": FAIL got=" + str(got) + " want=" + str(want))
+        fail_count = fail_count + 1
+    }
+}
+
+fn assert_eq_str(name: string, got: string, want: string) {
+    if got == want {
+        println("  " + name + ": PASS (= '" + got + "')")
+        pass_count = pass_count + 1
+    } else {
+        println("  " + name + ": FAIL got='" + got + "' want='" + want + "'")
+        fail_count = fail_count + 1
+    }
+}
+
+println("=== test_fsdp_shard.hexa — C9 layer-wise FSDP regression ===")
+println("")
+
+// ───────────────────────────────────────────────────────────────
+//  T1  Init layout — contiguous, exhaustive, non-overlapping
+//
+//  We enumerate every common (NL, world_size) the CLM curriculum
+//  will hit: NL=12 (100M scale-1), NL=16 (350M scale-2), NL=24
+//  (1B scale-3), NL=32 (7B target), NL=36 (2.8B v5), all under
+//  world_size in {1, 2, 4, 8}. For each pair we assert that:
+//
+//    a) layer_begin(0) == 0
+//    b) layer_end(world-1) == NL
+//    c) sum of layer_count(r) over all ranks == NL
+//    d) for any rank r, fsdp_owner_of_layer returns r for every
+//       layer in [begin(r), end(r))
+//    e) for every layer in [0, NL), exactly one rank claims it
+//
+//  These five invariants catch every off-by-one in the begin/end
+//  helpers — if any pair (NL, world) splits unevenly we still
+//  pass because we use NL*r/world and NL*(r+1)/world which is
+//  ceil/floor consistent.
+// ───────────────────────────────────────────────────────────────
+
+println("T1: init layout invariants over (NL × world_size)")
+
+fn t1_check_pair(nl: int, world: int) -> int {
+    let mut local_pass = 0
+
+    // a) begin[0] == 0
+    if fsdp_layer_begin(nl, world, 0) == 0 { local_pass = local_pass + 1 }
+    // b) end[world-1] == nl
+    if fsdp_layer_end(nl, world, world - 1) == nl { local_pass = local_pass + 1 }
+    // c) sum of layer_count == nl
+    let mut s = 0
+    let mut r = 0
+    while r < world {
+        s = s + fsdp_layer_count(nl, world, r)
+        r = r + 1
+    }
+    if s == nl { local_pass = local_pass + 1 }
+    // d) owner(layer) == r for every layer in [begin(r), end(r))
+    let mut owner_ok = true
+    r = 0
+    while r < world {
+        let beg = fsdp_layer_begin(nl, world, r)
+        let end = fsdp_layer_end(nl, world, r)
+        let mut li = beg
+        while li < end {
+            if fsdp_owner_of_layer(nl, world, li) != r { owner_ok = false }
+            li = li + 1
+        }
+        r = r + 1
+    }
+    if owner_ok { local_pass = local_pass + 1 }
+    // e) every layer claimed by exactly one rank
+    let mut every_layer_ok = true
+    let mut li = 0
+    while li < nl {
+        let mut claims = 0
+        let mut rr = 0
+        while rr < world {
+            if li >= fsdp_layer_begin(nl, world, rr) && li < fsdp_layer_end(nl, world, rr) {
+                claims = claims + 1
+            }
+            rr = rr + 1
+        }
+        if claims != 1 { every_layer_ok = false }
+        li = li + 1
+    }
+    if every_layer_ok { local_pass = local_pass + 1 }
+
+    return local_pass
+}
+
+let mut t1_total_checks = 0
+let mut t1_total_pass = 0
+let nls = [12, 16, 24, 32, 36]
+let worlds = [1, 2, 4, 8]
+let mut ni = 0
+while ni < len(nls) {
+    let mut wi = 0
+    while wi < len(worlds) {
+        let nl = nls[ni]
+        let w = worlds[wi]
+        let p = t1_check_pair(nl, w)
+        t1_total_checks = t1_total_checks + 5
+        t1_total_pass = t1_total_pass + p
+        if p != 5 {
+            println("  T1.fail NL=" + str(nl) + " world=" + str(w) + " — passed " + str(p) + "/5 checks")
+        }
+        wi = wi + 1
+    }
+    ni = ni + 1
+}
+
+assert_eq_int("T1.a all (NL × world) invariants pass", t1_total_pass, t1_total_checks)
+println("    (5 invariants × " + str(len(nls) * len(worlds)) + " pairs = " + str(t1_total_checks) + " checks)")
+
+// Spot-check a known split: NL=32 / world=2 -> [0,16), [16,32)
+assert_eq_int("T1.b NL=32 w=2 r=0 begin", fsdp_layer_begin(32, 2, 0), 0)
+assert_eq_int("T1.c NL=32 w=2 r=0 end",   fsdp_layer_end(32, 2, 0),   16)
+assert_eq_int("T1.d NL=32 w=2 r=1 begin", fsdp_layer_begin(32, 2, 1), 16)
+assert_eq_int("T1.e NL=32 w=2 r=1 end",   fsdp_layer_end(32, 2, 1),   32)
+// Owner of layer 16 must be rank 1 (boundary case)
+assert_eq_int("T1.f NL=32 w=2 owner(15)", fsdp_owner_of_layer(32, 2, 15), 0)
+assert_eq_int("T1.g NL=32 w=2 owner(16)", fsdp_owner_of_layer(32, 2, 16), 1)
+println("")
+
+// ───────────────────────────────────────────────────────────────
+//  T2  Single-rank no-op
+//
+//  For world_size == 1, every rank trivially owns every layer.
+//  We assert that the layer iteration helpers all return the
+//  full range, the savings_ratio is exactly 0.0 (nothing saved
+//  vs a non-FSDP run), and the NCCL stub init reports OK.
+//
+//  The byte accounting check uses a synthetic GpuClmConfig — it
+//  does NOT touch CUDA, just exercises the pure arithmetic
+//  helpers fsdp_param_bytes_per_layer / fsdp_param_bytes_per_rank.
+//
+//  We construct a synthetic FsdpState by hand because
+//  fsdp_init() touches gpu_zeros which would require a CUDA
+//  runtime. The synthesized state is a faithful representation
+//  of what fsdp_init would produce on a single rank: all layers
+//  owned, has_shared=true, an empty optimizer_shards list (the
+//  real init would populate this with real device pointers but
+//  the byte accounting helpers do not need them).
+// ───────────────────────────────────────────────────────────────
+
+println("T2: single-rank world_size=1 no-op behavior")
+
+// A small synthetic config matching the gpu_clm_config_smoke shape.
+let smoke_cfg = GpuClmConfig {
+    D:          16,
+    FF:         32,
+    NL:         4,
+    VOCAB:      256,
+    SEQ:        16,
+    RANK:       4,
+    EPS:        0.00001,
+    INIT_SCALE: 0.1
+}
+
+// Manually build a single-rank state — we cannot call fsdp_init
+// here because gpu_zeros would invoke CUDA.
+let single_rank_state = FsdpState {
+    rank:             0,
+    world_size:       1,
+    nl:               smoke_cfg.NL,
+    layer_begin:      0,
+    layer_end:        smoke_cfg.NL,
+    optimizer_shards: [],
+    has_shared:       true,
+    m_embed: 0, v_embed: 0,
+    m_lmh_U: 0, v_lmh_U: 0,
+    m_lmh_V: 0, v_lmh_V: 0
+}
+
+assert_true("T2.a layer_begin == 0", single_rank_state.layer_begin == 0)
+assert_eq_int("T2.b layer_end == NL", single_rank_state.layer_end, smoke_cfg.NL)
+assert_true("T2.c has_shared (rank 0)", single_rank_state.has_shared)
+
+// Every layer should be owned by this rank.
+let mut all_owned = true
+let mut li = 0
+while li < smoke_cfg.NL {
+    if !fsdp_owns_layer(single_rank_state, li) { all_owned = false }
+    li = li + 1
+}
+assert_true("T2.d every layer owned (rank 0, w=1)", all_owned)
+
+// Local layer index is identity when layer_begin == 0.
+assert_eq_int("T2.e local index of layer 0", fsdp_local_layer_index(single_rank_state, 0), 0)
+assert_eq_int("T2.f local index of layer 3", fsdp_local_layer_index(single_rank_state, 3), 3)
+
+// Savings ratio must be exactly 0 — nothing is sharded away.
+let ratio = fsdp_savings_ratio(single_rank_state, smoke_cfg)
+assert_true("T2.g savings_ratio == 0.0 on world_size=1", ratio == 0.0)
+
+// Byte accounting: per-rank == full unsharded layer footprint
+// + shared, because the rank owns everything.
+let expected_layer_bytes = smoke_cfg.NL * fsdp_param_bytes_per_layer(smoke_cfg)
+let expected_shared_bytes = (smoke_cfg.VOCAB * smoke_cfg.D * 4)
+                          + (smoke_cfg.D * smoke_cfg.RANK * 4)
+                          + (smoke_cfg.RANK * smoke_cfg.VOCAB * 4)
+let expected_param_bytes = expected_layer_bytes + expected_shared_bytes
+let actual_param_bytes = fsdp_param_bytes_per_rank(single_rank_state, smoke_cfg)
+assert_eq_int("T2.h param_bytes_per_rank == full unsharded",
+              actual_param_bytes, expected_param_bytes)
+
+// AdamW = 2× param footprint.
+let actual_optim_bytes = fsdp_optim_bytes_per_rank(single_rank_state, smoke_cfg)
+assert_eq_int("T2.i optim_bytes_per_rank == 2 × param",
+              actual_optim_bytes, 2 * expected_param_bytes)
+
+// Total = params + grads + optim (4P / N, with N=1 -> 4P).
+let actual_total_bytes = fsdp_total_bytes_per_rank(single_rank_state, smoke_cfg)
+assert_eq_int("T2.j total_bytes_per_rank == 4P (single rank)",
+              actual_total_bytes, 4 * expected_param_bytes)
+
+// NCCL stub: init with world_size=1 must return NCCL_OK and the
+// barrier must also be a trivial OK. This proves the single-rank
+// path stays out of the TODO branch entirely.
+let init_rc = nccl_init(1, 0)
+assert_eq_int("T2.k nccl_init(1,0) == NCCL_OK", init_rc, NCCL_OK)
+assert_eq_int("T2.l nccl_world_size() == 1", nccl_world_size(), 1)
+assert_eq_int("T2.m nccl_rank() == 0",       nccl_rank(),       0)
+assert_eq_int("T2.n nccl_barrier() == NCCL_OK", nccl_barrier(), NCCL_OK)
+let bcast_rc = nccl_broadcast_layer(0, 0, smoke_cfg.D, smoke_cfg.FF)
+assert_eq_int("T2.o nccl_broadcast_layer (w=1) == NCCL_OK", bcast_rc, NCCL_OK)
+let rs_rc = nccl_reduce_scatter_layer(0, 0, 0)
+assert_eq_int("T2.p nccl_reduce_scatter_layer (w=1) == NCCL_OK", rs_rc, NCCL_OK)
+let shutdown_rc = nccl_shutdown()
+assert_eq_int("T2.q nccl_shutdown() == NCCL_OK", shutdown_rc, NCCL_OK)
+
+println("")
+
+// ───────────────────────────────────────────────────────────────
+//  T3  Ckpt header roundtrip byte-identical
+//
+//  fsdp_save_ckpt writes a header line of the form
+//    __FSDP__ rank=R world=W layer_begin=B layer_end=E has_shared=S NL=N
+//
+//  We build the header via fsdp_header_line, write it to a temp
+//  file, read it back, and compare byte-for-byte. We also verify
+//  the path naming for a few representative (world,rank) pairs.
+//
+//  Running this test on a Mac without CUDA proves the helper
+//  text is stable across hexa builds — the only way the byte
+//  layout could change is a hexa string formatting regression
+//  or a manual edit to fsdp_header_line, both of which would
+//  show up here as a fail.
+// ───────────────────────────────────────────────────────────────
+
+println("T3: ckpt header + path roundtrip byte-identical")
+
+// T3.a — single-rank path naming
+let p1 = fsdp_shard_path("/tmp/clm7b.ckpt", 1, 0)
+assert_eq_str("T3.a single-rank path", p1, "/tmp/clm7b.ckpt.rank0of1")
+
+// T3.b — 2-rank path naming
+let p2a = fsdp_shard_path("/tmp/clm7b.ckpt", 2, 0)
+let p2b = fsdp_shard_path("/tmp/clm7b.ckpt", 2, 1)
+assert_eq_str("T3.b 2-rank rank=0 path", p2a, "/tmp/clm7b.ckpt.rank0of2")
+assert_eq_str("T3.c 2-rank rank=1 path", p2b, "/tmp/clm7b.ckpt.rank1of2")
+
+// T3.d — 8-rank path naming
+let p8 = fsdp_shard_path("/workspace/ckpt/final.hexackpt", 8, 5)
+assert_eq_str("T3.d 8-rank rank=5 path", p8, "/workspace/ckpt/final.hexackpt.rank5of8")
+
+// T3.e — header line for single-rank
+let h_single = fsdp_header_line(0, 1, 0, 32, true, 32)
+let h_single_want = "__FSDP__ rank=0 world=1 layer_begin=0 layer_end=32 has_shared=1 NL=32"
+assert_eq_str("T3.e single-rank header", h_single, h_single_want)
+
+// T3.f — header line for 2-rank rank=1 (no shared)
+let h_r1 = fsdp_header_line(1, 2, 16, 32, false, 32)
+let h_r1_want = "__FSDP__ rank=1 world=2 layer_begin=16 layer_end=32 has_shared=0 NL=32"
+assert_eq_str("T3.f 2-rank rank=1 header", h_r1, h_r1_want)
+
+// T3.g — write header to a temp file, read back, compare
+let tmp = "/tmp/__fsdp_shard_test_header.txt"
+let written = "HEXACKPT-v1\n" + h_single + "\n"
+let _ = write_file(tmp, written)
+let readback = read_file(tmp)
+assert_eq_str("T3.g header file roundtrip byte-identical", readback, written)
+
+// T3.h — extract just the FSDP line and compare to the input.
+// We use trim() instead of slicing to keep the test resilient to
+// trailing newlines from the file API.
+let lines_h = readback.split("\n")
+let mut fsdp_line = ""
+let mut li_h = 0
+while li_h < len(lines_h) {
+    let ln = lines_h[li_h]
+    if ln != "" && ln != "HEXACKPT-v1" {
+        fsdp_line = ln
+    }
+    li_h = li_h + 1
+}
+assert_eq_str("T3.h parsed FSDP header line equals input", fsdp_line, h_single)
+
+// T3.i — multi-rank header roundtrip (ensures world>1 still
+// formats deterministically, even though the hot-path collectives
+// would fail with NCCL_TODO_RC at runtime).
+let tmp2 = "/tmp/__fsdp_shard_test_header_r1.txt"
+let written2 = "HEXACKPT-v1\n" + h_r1 + "\n"
+let _ = write_file(tmp2, written2)
+let readback2 = read_file(tmp2)
+assert_eq_str("T3.i 2-rank header file roundtrip", readback2, written2)
+
+// T3.j — TODO RC visibility: a multi-rank init MUST return
+// NCCL_TODO_RC so a launcher cannot silently desync. This is
+// the only place the test deliberately exercises the >1 path.
+let multi_rc = nccl_init(2, 0)
+assert_eq_int("T3.j nccl_init(2,0) returns NCCL_TODO_RC", multi_rc, NCCL_TODO_RC)
+// Reset module state so subsequent tests (none here) get a clean slate.
+let _ = nccl_init(1, 0)
+
+println("")
+
+// ───────────────────────────────────────────────────────────────
+//  Final summary
+// ───────────────────────────────────────────────────────────────
+
+let total = pass_count + fail_count
+println("===")
+println("fsdp_shard regression: " + str(pass_count) + "/" + str(total) + " PASS")
+if fail_count == 0 {
+    println("VERDICT: pass")
+} else {
+    println("VERDICT: fail (" + str(fail_count) + " failures)")
+}

@@ -1,0 +1,473 @@
+// anima-speak/corpus_pipeline.hexa — Voice Corpus Collection Pipeline
+//
+// Roadmap:
+//   shared/roadmaps/anima-train.json
+//     TSRV-P3-1 remaining_work — neural_vocoder.hexa wire 전 음성 corpus 수집
+//     TALM-VOICE-P1 (new)      — 10 프로파일 × YouTube 음성 corpus → R2 백업
+//
+// Pipeline (URL + profile_name → registry entry):
+//   1) yt-dlp     : best audio download → corpus/{profile}/raw/
+//   2) ffmpeg     : 16kHz mono WAV     → corpus/{profile}/wav16k/
+//   3) whisper    : Korean transcribe   → corpus/{profile}/transcript/
+//   4) sha256     : integrity hash
+//   5) rclone     : R2 upload           → r2:anima-corpus/voice/{profile}/
+//   6) registry   : append to shared/state/voice_corpus_registry.json
+//
+// Hexa quirk avoidance (memory):
+//   - struct list aliasing — SoA scalar arrays (ids, names, hours_arr).
+//   - lists pass-by-value — mutator returns new array.
+//   - string API quirks   — substring/contains/index_of only, no slicing on
+//     multibyte strings.
+//   - HEXA-FIRST (R1)     — wraps yt-dlp/ffmpeg/whisper/rclone via exec().
+//                           No new .py/.rs/.sh files are created.
+//
+// Usage (CLI dispatch via main):
+//   $HEXA anima-speak/corpus_pipeline.hexa init
+//       — create shared/state/voice_corpus_registry.json with 10 profile slots
+//   $HEXA anima-speak/corpus_pipeline.hexa download <profile> <url>
+//       — single-URL pipeline run (Phase 2 sample test)
+//   $HEXA anima-speak/corpus_pipeline.hexa search <profile> <query> <n>
+//       — ytsearchN: bulk download + pipeline
+//   $HEXA anima-speak/corpus_pipeline.hexa upload <profile>
+//       — rclone copy local profile dir to r2:anima-corpus/voice/{profile}/
+//   $HEXA anima-speak/corpus_pipeline.hexa list
+//       — print registry summary
+
+// ═══════════════════════════════════════════════════════════════
+//  Constants
+// ═══════════════════════════════════════════════════════════════
+
+let CORPUS_ROOT     = "/Users/ghost/Dev/anima/anima-speak/corpus"
+let REGISTRY_PATH   = "/Users/ghost/Dev/anima/shared/state/voice_corpus_registry.json"
+let R2_REMOTE       = "r2:anima-corpus/voice"
+let WHISPER_MODEL   = "small"     // small balances ko quality vs CPU time
+let WHISPER_LANG    = "ko"
+let MIN_DURATION_S  = 30          // skip clips < 30s
+let MAX_PER_SEARCH  = 5           // safety cap per ytsearch query
+
+// ═══════════════════════════════════════════════════════════════
+//  Profile catalog (mirrors rp_voice_profiles.hexa, SoA)
+// ═══════════════════════════════════════════════════════════════
+
+fn profile_names() -> array {
+    return ["school_idol", "senpai", "knight", "sorceress", "noir_detective",
+            "horror_whisper", "childhood_friend", "demon_lord", "childlike",
+            "stoic_mentor"]
+}
+
+fn profile_search_query(name: string) -> string {
+    // Korean-language YouTube search queries tuned per archetype.
+    // Avoid commercial copyrighted clips by preferring fan dubs / amateur drama / asmr.
+    if name == "school_idol"      { return "한국어 여고생 더빙 오디오 드라마" }
+    if name == "senpai"           { return "한국어 남자 선배 더빙 오디오 드라마" }
+    if name == "knight"           { return "한국어 판타지 기사 더빙 오디오 드라마" }
+    if name == "sorceress"        { return "한국어 여마법사 더빙 판타지 오디오" }
+    if name == "noir_detective"   { return "한국어 느와르 탐정 라디오 드라마" }
+    if name == "horror_whisper"   { return "한국어 호러 속삭임 ASMR" }
+    if name == "childhood_friend" { return "한국어 소꿉친구 여성 더빙 오디오" }
+    if name == "demon_lord"       { return "한국어 마왕 더빙 판타지" }
+    if name == "childlike"        { return "한국어 어린이 동화 낭독" }
+    if name == "stoic_mentor"     { return "한국어 무뚝뚝 스승 더빙 오디오" }
+    return "한국어 음성 오디오 드라마"
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn shell_escape(s: string) -> string {
+    return "'" + s.replace("'", "'" + "\\" + "'" + "'") + "'"
+}
+
+fn ensure_dir(path: string) {
+    let _ = exec("mkdir -p " + shell_escape(path))
+}
+
+fn profile_dir(name: string, sub: string) -> string {
+    return CORPUS_ROOT + "/" + name + "/" + sub
+}
+
+fn timestamp_tag() -> string {
+    return exec("date -u +%Y%m%dT%H%M%SZ").trim()
+}
+
+fn file_sha256(path: string) -> string {
+    let out = exec("shasum -a 256 " + shell_escape(path) + " 2>/dev/null | awk '{print $1}'").trim()
+    return out
+}
+
+fn file_bytes(path: string) -> int {
+    let out = exec("stat -f %z " + shell_escape(path) + " 2>/dev/null").trim()
+    if len(out) == 0 { return 0 }
+    return to_int(out)
+}
+
+fn audio_duration_s(path: string) -> float {
+    let out = exec("ffprobe -v error -show_entries format=duration -of csv=p=0 "
+                   + shell_escape(path) + " 2>/dev/null").trim()
+    if len(out) == 0 { return 0.0 }
+    return to_float(out)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  yt-dlp wrapper — download best audio
+// ═══════════════════════════════════════════════════════════════
+
+// Returns absolute path of the downloaded raw file, or "" on failure.
+// Uses a unique tag to disambiguate concurrent downloads.
+fn yt_download(url_or_search: string, out_dir: string, tag: string) -> string {
+    ensure_dir(out_dir)
+    let outtmpl = out_dir + "/" + tag + "_%(id)s.%(ext)s"
+    // Best audio, m4a/opus preferred, fallback to bestaudio
+    // --no-playlist: never auto-expand
+    // --max-downloads 1 for single URL; ytsearch uses its own count
+    let cmd = "yt-dlp --no-playlist --no-warnings"
+            + " -f bestaudio/best"
+            + " -x --audio-format flac"
+            + " --restrict-filenames"
+            + " -o " + shell_escape(outtmpl)
+            + " --print after_move:filepath"
+            + " " + shell_escape(url_or_search)
+            + " 2>/dev/null"
+    let out = exec(cmd).trim()
+    // exec returns possibly multi-line: take last non-empty line as filepath
+    let lines = out.split("\n")
+    let mut i = len(lines) - 1
+    while i >= 0 {
+        let ln = lines[i].trim()
+        if len(ln) > 0 { return ln }
+        i = i - 1
+    }
+    return ""
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ffmpeg wrapper — 16kHz mono WAV
+// ═══════════════════════════════════════════════════════════════
+
+fn convert_16k_mono(in_path: string, out_dir: string) -> string {
+    ensure_dir(out_dir)
+    // Strip extension, append .wav
+    let base = exec("basename " + shell_escape(in_path) + " | sed 's/\\.[^.]*$//'").trim()
+    if len(base) == 0 { return "" }
+    let out_path = out_dir + "/" + base + ".wav"
+    let cmd = "ffmpeg -y -loglevel error -i " + shell_escape(in_path)
+            + " -ac 1 -ar 16000 -c:a pcm_s16le "
+            + shell_escape(out_path) + " 2>/dev/null"
+    let _ = exec(cmd)
+    if file_bytes(out_path) == 0 { return "" }
+    return out_path
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  whisper wrapper — Korean transcription
+// ═══════════════════════════════════════════════════════════════
+
+fn transcribe_ko(wav_path: string, out_dir: string) -> string {
+    ensure_dir(out_dir)
+    // whisper writes <basename>.txt/.srt/.vtt into output_dir
+    let cmd = "whisper " + shell_escape(wav_path)
+            + " --model " + WHISPER_MODEL
+            + " --language " + WHISPER_LANG
+            + " --output_format txt"
+            + " --output_dir " + shell_escape(out_dir)
+            + " --fp16 False"
+            + " 2>/dev/null >/dev/null"
+    let _ = exec(cmd)
+    let base = exec("basename " + shell_escape(wav_path) + " | sed 's/\\.[^.]*$//'").trim()
+    let txt_path = out_dir + "/" + base + ".txt"
+    if file_bytes(txt_path) == 0 { return "" }
+    return txt_path
+}
+
+fn transcript_chars(path: string) -> int {
+    if file_bytes(path) == 0 { return 0 }
+    let out = exec("wc -c < " + shell_escape(path) + " 2>/dev/null").trim()
+    if len(out) == 0 { return 0 }
+    return to_int(out)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  rclone — upload to R2
+// ═══════════════════════════════════════════════════════════════
+
+fn r2_upload_profile(profile: string) -> bool {
+    let local = CORPUS_ROOT + "/" + profile
+    let remote = R2_REMOTE + "/" + profile
+    let cmd = "rclone copy " + shell_escape(local) + " " + shell_escape(remote)
+            + " --transfers 4 --checkers 4 --quiet 2>&1"
+    let out = exec(cmd)
+    // Verify by remote listing
+    let probe = exec("rclone size " + shell_escape(remote) + " 2>/dev/null").trim()
+    return len(probe) > 0
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Registry I/O — JSON build via string concat (SoA)
+// ═══════════════════════════════════════════════════════════════
+//
+// Format:
+// {
+//   "schema": "voice_corpus_registry/v1",
+//   "updated_at": "<utc>",
+//   "profiles": [
+//     {
+//       "id": 0, "name": "school_idol", "total_hours": 0.0,
+//       "sources": [
+//         {"url":"...","duration_s":...,"local_path":"...","r2_path":"...",
+//          "transcript_path":"...","sha256":"...","ok":true}
+//       ]
+//     }, ...
+//   ]
+// }
+
+fn json_str(s: string) -> string {
+    // Minimal JSON string escape (\\, \", control chars dropped).
+    let a = s.replace("\\", "\\\\")
+    let b = a.replace("\"", "\\\"")
+    let c = b.replace("\n", " ")
+    let d = c.replace("\r", " ")
+    let e = d.replace("\t", " ")
+    return "\"" + e + "\""
+}
+
+fn empty_registry_json() -> string {
+    let names = profile_names()
+    let mut s = "{\n  \"schema\": \"voice_corpus_registry/v1\",\n"
+    s = s + "  \"updated_at\": " + json_str(timestamp_tag()) + ",\n"
+    s = s + "  \"r2_remote\": " + json_str(R2_REMOTE) + ",\n"
+    s = s + "  \"profiles\": [\n"
+    let mut i = 0
+    while i < len(names) {
+        s = s + "    {\"id\": " + to_string(i)
+            + ", \"name\": " + json_str(names[i])
+            + ", \"total_hours\": 0.0, \"sources\": []}"
+        if i < len(names) - 1 { s = s + "," }
+        s = s + "\n"
+        i = i + 1
+    }
+    s = s + "  ]\n}\n"
+    return s
+}
+
+fn cmd_init() -> int {
+    ensure_dir(CORPUS_ROOT)
+    let names = profile_names()
+    let mut i = 0
+    while i < len(names) {
+        ensure_dir(profile_dir(names[i], "raw"))
+        ensure_dir(profile_dir(names[i], "wav16k"))
+        ensure_dir(profile_dir(names[i], "transcript"))
+        ensure_dir(profile_dir(names[i], "meta"))
+        i = i + 1
+    }
+    ensure_dir("/Users/ghost/Dev/anima/shared/state")
+    let json = empty_registry_json()
+    let _ = write_file(REGISTRY_PATH, json)
+    println("[init] registry written: " + REGISTRY_PATH)
+    println("[init] 10 profile dirs ready under: " + CORPUS_ROOT)
+    return 0
+}
+
+// Append a single source to a profile in registry (read-modify-write via jq).
+// jq is available on macOS via brew (homebrew default since dev tools).
+fn registry_append_source(profile: string, source_json: string) -> bool {
+    let probe = exec("command -v jq >/dev/null 2>&1 && echo y || echo n").trim()
+    if probe != "y" {
+        println("[registry] WARN: jq missing — skipping registry append for " + profile)
+        return false
+    }
+    let tmp = REGISTRY_PATH + ".tmp"
+    let filter = ".profiles |= map(if .name == \"" + profile + "\""
+               + " then .sources += [" + source_json + "] else . end)"
+    let cmd = "jq " + shell_escape(filter) + " " + shell_escape(REGISTRY_PATH)
+            + " > " + shell_escape(tmp)
+            + " && mv " + shell_escape(tmp) + " " + shell_escape(REGISTRY_PATH)
+    let _ = exec(cmd)
+    return true
+}
+
+fn build_source_json(url: string, duration_s: float, local_path: string,
+                     r2_path: string, transcript_path: string, sha256: string,
+                     ok: bool) -> string {
+    let ok_str = "false"
+    if ok { ok_str = "true" }
+    let mut s = "{\"url\": " + json_str(url)
+    s = s + ", \"duration_s\": " + to_string(duration_s)
+    s = s + ", \"local_path\": " + json_str(local_path)
+    s = s + ", \"r2_path\": " + json_str(r2_path)
+    s = s + ", \"transcript_path\": " + json_str(transcript_path)
+    s = s + ", \"sha256\": " + json_str(sha256)
+    s = s + ", \"ok\": " + ok_str + "}"
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Pipeline — single URL
+// ═══════════════════════════════════════════════════════════════
+
+fn pipeline_url(profile: string, url: string) -> bool {
+    println("[pipeline] profile=" + profile + " url=" + url)
+    let raw_dir   = profile_dir(profile, "raw")
+    let wav_dir   = profile_dir(profile, "wav16k")
+    let trans_dir = profile_dir(profile, "transcript")
+    let tag = timestamp_tag()
+
+    let raw_path = yt_download(url, raw_dir, tag)
+    if len(raw_path) == 0 {
+        println("[pipeline] yt-dlp FAIL: " + url)
+        return false
+    }
+    println("[pipeline] downloaded: " + raw_path + " (" + to_string(file_bytes(raw_path)) + " bytes)")
+
+    let dur = audio_duration_s(raw_path)
+    if dur < to_float(MIN_DURATION_S) {
+        println("[pipeline] SKIP short clip: " + to_string(dur) + "s < " + to_string(MIN_DURATION_S))
+        let _ = exec("rm -f " + shell_escape(raw_path))
+        return false
+    }
+
+    let wav_path = convert_16k_mono(raw_path, wav_dir)
+    if len(wav_path) == 0 {
+        println("[pipeline] ffmpeg FAIL")
+        return false
+    }
+    println("[pipeline] wav16k: " + wav_path + " (" + to_string(file_bytes(wav_path)) + " bytes)")
+
+    let trans_path = transcribe_ko(wav_path, trans_dir)
+    if len(trans_path) == 0 {
+        println("[pipeline] whisper FAIL")
+        return false
+    }
+    let chars = transcript_chars(trans_path)
+    println("[pipeline] transcript: " + trans_path + " (" + to_string(chars) + " chars)")
+    if chars < 20 {
+        println("[pipeline] SKIP empty transcript (chars=" + to_string(chars) + ")")
+        return false
+    }
+
+    let sha = file_sha256(wav_path)
+    let r2_path = R2_REMOTE + "/" + profile + "/wav16k/" + exec("basename " + shell_escape(wav_path)).trim()
+
+    let src_json = build_source_json(url, dur, wav_path, r2_path, trans_path, sha, true)
+    let _ = registry_append_source(profile, src_json)
+    println("[pipeline] OK profile=" + profile + " dur=" + to_string(dur) + "s sha=" + sha.substring(0, 12))
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ytsearchN — pull N URLs by query then run pipeline on each
+// ═══════════════════════════════════════════════════════════════
+
+fn pipeline_search(profile: string, query: string, n: int) -> int {
+    let nn = n
+    let cap = MAX_PER_SEARCH
+    let mut k = nn
+    if k > cap { k = cap }
+    let search_spec = "ytsearch" + to_string(k) + ":" + query
+    println("[search] profile=" + profile + " spec=" + search_spec)
+
+    // First, list URLs only.
+    let cmd = "yt-dlp --no-warnings --flat-playlist --print url "
+            + shell_escape(search_spec) + " 2>/dev/null"
+    let out = exec(cmd)
+    let lines = out.split("\n")
+    let mut urls = []
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if len(ln) > 0 && ln.contains("http") {
+            urls = urls.push(ln)
+        }
+        i = i + 1
+    }
+    println("[search] " + to_string(len(urls)) + " urls found")
+
+    let mut ok_count = 0
+    let mut j = 0
+    while j < len(urls) {
+        let r = pipeline_url(profile, urls[j])
+        if r { ok_count = ok_count + 1 }
+        j = j + 1
+    }
+    println("[search] profile=" + profile + " ok=" + to_string(ok_count) + "/" + to_string(len(urls)))
+    return ok_count
+}
+
+fn cmd_upload(profile: string) -> int {
+    let ok = r2_upload_profile(profile)
+    if ok {
+        println("[upload] profile=" + profile + " R2 OK")
+        return 0
+    }
+    println("[upload] profile=" + profile + " R2 FAIL")
+    return 1
+}
+
+fn cmd_list() -> int {
+    let exists = file_exists(REGISTRY_PATH)
+    if !exists {
+        println("[list] no registry — run init first")
+        return 1
+    }
+    let probe = exec("command -v jq >/dev/null 2>&1 && echo y || echo n").trim()
+    if probe == "y" {
+        let summary = exec("jq -r '.profiles[] | \"\\(.id) \\(.name) sources=\\(.sources | length)\"' "
+                           + shell_escape(REGISTRY_PATH))
+        println(summary)
+    } else {
+        let raw = exec("cat " + shell_escape(REGISTRY_PATH))
+        println(raw)
+    }
+    return 0
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Main dispatch
+// ═══════════════════════════════════════════════════════════════
+
+fn main() -> int {
+    // args[0] = hexa binary, args[1] = .hexa script path,
+    // args[2..N] = our user-level args. Skip the first two.
+    let av = args()
+    if len(av) < 3 {
+        println("usage: corpus_pipeline <init|download|search|upload|list> [args]")
+        return 2
+    }
+    let sub = av[2]
+    if sub == "init" {
+        return cmd_init()
+    }
+    if sub == "download" {
+        if len(av) < 5 {
+            println("usage: corpus_pipeline download <profile> <url>")
+            return 2
+        }
+        let ok = pipeline_url(av[3], av[4])
+        if ok { return 0 }
+        return 1
+    }
+    if sub == "search" {
+        if len(av) < 5 {
+            println("usage: corpus_pipeline search <profile> <query> [n]")
+            return 2
+        }
+        let mut n = 3
+        if len(av) >= 6 { n = to_int(av[5]) }
+        let _ = pipeline_search(av[3], av[4], n)
+        return 0
+    }
+    if sub == "upload" {
+        if len(av) < 4 {
+            println("usage: corpus_pipeline upload <profile>")
+            return 2
+        }
+        return cmd_upload(av[3])
+    }
+    if sub == "list" {
+        return cmd_list()
+    }
+    println("unknown subcommand: " + sub)
+    return 2
+}
+// hexa auto-invokes main() — no top-level call required (would double-execute).

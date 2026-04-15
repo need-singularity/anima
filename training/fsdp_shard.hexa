@@ -1,0 +1,551 @@
+// ===============================================================
+//  training/fsdp_shard.hexa — Zero-3 / FSDP parameter sharding
+//  (CLM C9 — clm_consciousness_standalone.json track C, C9)
+//
+//  Goal: shard CLM 7B fp32 across 2 H100 GPUs so that each rank
+//        only holds 1/world_size of the layer-level parameters,
+//        gradients, and optimizer state. fp32 7B = 28 GB which
+//        exceeds a single H100 80 GB once activations + gradients
+//        + optimizer state are in flight; layer-wise sharding
+//        distributes the 8×NL×(D² + D·FF + FF·D + 2D) layer params
+//        evenly across ranks.
+//
+//  Strategy:
+//
+//    1.  Parameter shard: each rank `r` owns the contiguous range
+//        of layer indices `[layer_begin(r), layer_end(r))` inside
+//        a `GpuWeights` struct. The shared embed / lmh_U / lmh_V
+//        live on rank 0 only (they are small relative to a 7B
+//        layer stack: VOCAB=256 keeps embed at 256·D·4 ≈ 1 MB).
+//
+//    2.  Optimizer shard: AdamW m/v moments are per-tensor, so
+//        each rank only allocates m/v for its owned layers. Shared
+//        params get their moments on rank 0 like the weights.
+//
+//    3.  Forward pass: before a layer runs, the rank that owns
+//        that layer is the only one whose weights are valid; the
+//        others must `fsdp_all_gather_params` to materialise the
+//        layer locally, run the forward, and then `fsdp_free_gathered`
+//        to drop the temporary tensor. World-size 1 = no-op (the
+//        owner is always the local rank).
+//
+//    4.  Backward pass: every rank that participated in the forward
+//        accumulates a local gradient for that layer. After backward,
+//        `fsdp_reduce_scatter_grads` sums those across ranks and
+//        leaves the result on the owning rank only. World-size 1 =
+//        no-op (the local grad is already the full grad).
+//
+//    5.  Optimizer step: each rank applies AdamW (or SGD) only to
+//        the layers it owns.
+//
+//    6.  Checkpointing: each rank writes its own shard file
+//        `{path}.rank{r}of{w}` containing: a header line listing
+//        the owned layer indices, then per-layer tensor sections
+//        in the same format as `save_checkpoint_gpu` so the
+//        existing loader can be reused.
+//
+//  Single-rank guarantee: when world_size == 1, every shard call
+//  becomes a no-op (the local rank already owns everything), and
+//  the training step numerics remain bit-for-bit identical to the
+//  non-FSDP path. Tests/test_fsdp_shard.hexa enforces this with
+//  three assertions on `train_clm_gpu.hexa` weight equivalents.
+//
+//  Multi-rank: the NCCL FFI surface lives in `nccl_ffi.hexa` (sibling
+//  module). Until the real NCCL bindings land, the stub there errors
+//  out for any world_size > 1 with a clear TODO so we never silently
+//  miss a sync. The design + interface here is complete; only the
+//  `nccl_*` body needs to be wired into a real `libnccl.so` call.
+//
+//  References:
+//    - shared/roadmaps/clm_consciousness_standalone.json (C9)
+//    - hexa-lang self/ml/fsdp.hexa (CPU prototype, math correctness)
+//    - hexa-lang self/ml/collective_comm.hexa (ring algos)
+//    - training/gpu_train.hexa (GpuWeights + GpuLayer struct shape)
+//    - training/cuda_ffi.hexa  (cuda_malloc, memcpy_d2d primitives)
+//    - feedback_ai_native_clm.md (no PyTorch FSDP / DeepSpeed)
+//    - feedback_hexa_struct_list_alias.md (shard structs are unique
+//      types so they will not corrupt each other)
+// ===============================================================
+
+use "cuda_ffi"
+use "gpu_train"
+use "nccl_ffi"
+
+// ───────────────────────────────────────────────────────────────
+//  Module log marker — same convention as collective_comm.hexa.
+// ───────────────────────────────────────────────────────────────
+println("[fsdp_shard] loaded — layer-wise FSDP parameter shard for CLM")
+
+// ───────────────────────────────────────────────────────────────
+//  Even-split helpers (matches hexa-lang self/ml/fsdp.hexa).
+//  Layer count NL is the unit of sharding — each rank gets a
+//  contiguous block. For NL=12 / world_size=2 that is layers
+//  [0..6) on rank 0 and [6..12) on rank 1. For 7B with NL=32
+//  the split becomes [0..16) and [16..32).
+// ───────────────────────────────────────────────────────────────
+
+fn fsdp_layer_begin(nl: int, world_size: int, rank: int) -> int {
+    if world_size <= 1 { return 0 }
+    return (nl * rank) / world_size
+}
+
+fn fsdp_layer_end(nl: int, world_size: int, rank: int) -> int {
+    if world_size <= 1 { return nl }
+    return (nl * (rank + 1)) / world_size
+}
+
+fn fsdp_layer_count(nl: int, world_size: int, rank: int) -> int {
+    return fsdp_layer_end(nl, world_size, rank) - fsdp_layer_begin(nl, world_size, rank)
+}
+
+// Which rank owns a given global layer index? Inverse of begin/end.
+// O(world_size) scan — fine because world_size is at most a handful
+// of GPUs (FSDP at H100 scale tops out around 8-16 ranks).
+fn fsdp_owner_of_layer(nl: int, world_size: int, layer: int) -> int {
+    if world_size <= 1 { return 0 }
+    let mut r = 0
+    while r < world_size {
+        let beg = fsdp_layer_begin(nl, world_size, r)
+        let end = fsdp_layer_end(nl, world_size, r)
+        if layer >= beg && layer < end { return r }
+        r = r + 1
+    }
+    // Should never happen — layer was out of [0, NL). Caller bug.
+    return world_size - 1
+}
+
+// ───────────────────────────────────────────────────────────────
+//  AdamW optimizer shard descriptor — m/v device buffers per
+//  owned layer tensor. Mirrors GpuLayer one-for-one so we can
+//  index by the same sub-tensor name.
+// ───────────────────────────────────────────────────────────────
+
+struct FsdpAdamWLayer {
+    m_Wq:   int, v_Wq:   int,
+    m_Wk:   int, v_Wk:   int,
+    m_Wv:   int, v_Wv:   int,
+    m_Wo:   int, v_Wo:   int,
+    m_Wff1: int, v_Wff1: int,
+    m_Wff2: int, v_Wff2: int,
+    m_ga:   int, v_ga:   int,
+    m_gf:   int, v_gf:   int
+}
+
+// Allocate AdamW moments for one layer (zero-init on device).
+// Caller must already have decided this rank owns the layer.
+fn fsdp_alloc_adamw_layer(cfg: GpuClmConfig) -> FsdpAdamWLayer {
+    let D  = cfg.D
+    let FF = cfg.FF
+    return FsdpAdamWLayer {
+        m_Wq:   gpu_zeros(D * D),  v_Wq:   gpu_zeros(D * D),
+        m_Wk:   gpu_zeros(D * D),  v_Wk:   gpu_zeros(D * D),
+        m_Wv:   gpu_zeros(D * D),  v_Wv:   gpu_zeros(D * D),
+        m_Wo:   gpu_zeros(D * D),  v_Wo:   gpu_zeros(D * D),
+        m_Wff1: gpu_zeros(D * FF), v_Wff1: gpu_zeros(D * FF),
+        m_Wff2: gpu_zeros(FF * D), v_Wff2: gpu_zeros(FF * D),
+        m_ga:   gpu_zeros(D),      v_ga:   gpu_zeros(D),
+        m_gf:   gpu_zeros(D),      v_gf:   gpu_zeros(D)
+    }
+}
+
+fn fsdp_free_adamw_layer(opt: FsdpAdamWLayer) -> int {
+    cuda_free(opt.m_Wq);   cuda_free(opt.v_Wq)
+    cuda_free(opt.m_Wk);   cuda_free(opt.v_Wk)
+    cuda_free(opt.m_Wv);   cuda_free(opt.v_Wv)
+    cuda_free(opt.m_Wo);   cuda_free(opt.v_Wo)
+    cuda_free(opt.m_Wff1); cuda_free(opt.v_Wff1)
+    cuda_free(opt.m_Wff2); cuda_free(opt.v_Wff2)
+    cuda_free(opt.m_ga);   cuda_free(opt.v_ga)
+    cuda_free(opt.m_gf);   cuda_free(opt.v_gf)
+    return 0
+}
+
+// ───────────────────────────────────────────────────────────────
+//  Top-level FSDP state.
+//
+//  rank/world_size — set by launcher (env CLM_RANK / CLM_WORLD).
+//  layer_owner    — mapping global_layer -> rank (precomputed).
+//  optimizer_shards — one entry per OWNED layer (length =
+//                     layer_count(NL, world, rank)). Indexed by
+//                     local-layer-index within the rank's slice.
+//  has_shared      — true on rank 0 only — owns embed/lmh_U/lmh_V
+//                    + their AdamW moments.
+//
+//  Note: param_shards in this design is not a separate buffer —
+//  the device pointers already live in `weights.layers[i]` for
+//  each owned layer. Sharding means the non-owned slots in
+//  `weights.layers` are populated with `ptr_null()` (or a temporary
+//  gathered pointer during forward). The optimizer never touches
+//  non-owned layers, and the test verifies that for world_size==1
+//  every layer is owned and all pointers are non-null.
+// ───────────────────────────────────────────────────────────────
+
+struct FsdpState {
+    rank:             int,
+    world_size:       int,
+    nl:               int,
+    layer_begin:      int,
+    layer_end:        int,
+    optimizer_shards: [FsdpAdamWLayer],
+    has_shared:       bool,
+    // Shared param AdamW moments — only valid when has_shared == true.
+    m_embed:          int, v_embed: int,
+    m_lmh_U:          int, v_lmh_U: int,
+    m_lmh_V:          int, v_lmh_V: int
+}
+
+// ───────────────────────────────────────────────────────────────
+//  fsdp_init — build an FsdpState from a pre-initialised
+//  GpuWeights (the same struct train_clm_gpu.hexa already builds
+//  via init_gpu_weights()). Allocates AdamW shards for the
+//  layers this rank owns, plus shared-param moments on rank 0.
+//
+//  IMPORTANT: this does NOT free or reallocate `weights` — for
+//  world_size==1 the input is preserved bit-for-bit. For
+//  world_size>1, the caller is responsible for releasing the
+//  non-owned layer device pointers AFTER fsdp_init returns
+//  (we cannot do it here because the same GpuWeights struct may
+//  still be in use during a transitional warm-up step).
+// ───────────────────────────────────────────────────────────────
+
+fn fsdp_init(weights: GpuWeights, world_size: int, rank: int) -> FsdpState {
+    let cfg = weights.cfg
+    let nl = cfg.NL
+    let lb = fsdp_layer_begin(nl, world_size, rank)
+    let le = fsdp_layer_end(nl, world_size, rank)
+
+    // Allocate optimizer moments only for OWNED layers.
+    let mut opts = []
+    let mut li = lb
+    while li < le {
+        opts = opts.push(fsdp_alloc_adamw_layer(cfg))
+        li = li + 1
+    }
+
+    // Shared-param moments only on rank 0.
+    let has_shared_local = rank == 0
+    let mut me = 0
+    let mut ve = 0
+    let mut mu = 0
+    let mut vu = 0
+    let mut mv = 0
+    let mut vv = 0
+    if has_shared_local {
+        let D     = cfg.D
+        let RANK  = cfg.RANK
+        let VOCAB = cfg.VOCAB
+        me = gpu_zeros(VOCAB * D)
+        ve = gpu_zeros(VOCAB * D)
+        mu = gpu_zeros(D * RANK)
+        vu = gpu_zeros(D * RANK)
+        mv = gpu_zeros(RANK * VOCAB)
+        vv = gpu_zeros(RANK * VOCAB)
+    }
+
+    println("[fsdp_shard] fsdp_init — rank=" + str(rank) + "/" + str(world_size)
+            + " owns layers [" + str(lb) + "," + str(le) + ") of NL=" + str(nl)
+            + " has_shared=" + str(has_shared_local))
+
+    return FsdpState {
+        rank:             rank,
+        world_size:       world_size,
+        nl:               nl,
+        layer_begin:      lb,
+        layer_end:        le,
+        optimizer_shards: opts,
+        has_shared:       has_shared_local,
+        m_embed: me, v_embed: ve,
+        m_lmh_U: mu, v_lmh_U: vu,
+        m_lmh_V: mv, v_lmh_V: vv
+    }
+}
+
+// fsdp_owns_layer — true iff this rank owns the given global layer index.
+fn fsdp_owns_layer(state: FsdpState, layer: int) -> bool {
+    return layer >= state.layer_begin && layer < state.layer_end
+}
+
+// fsdp_local_layer_index — converts global layer id → optimizer_shards[i].
+// Caller must verify ownership first via fsdp_owns_layer().
+fn fsdp_local_layer_index(state: FsdpState, layer: int) -> int {
+    return layer - state.layer_begin
+}
+
+// ───────────────────────────────────────────────────────────────
+//  fsdp_all_gather_params — bring layer `layer_id` to every rank.
+//
+//  Single-rank fast path (world_size == 1): no comm, layer is
+//  already local. We return immediately so the train step has
+//  ZERO overhead and the numerics remain identical to the
+//  non-FSDP path.
+//
+//  Multi-rank path: the owner rank broadcasts each tensor pointer
+//  via the NCCL FFI. The non-owner ranks must temporarily
+//  allocate the receive buffer; we record the temporary device
+//  pointer back into `weights.layers[layer_id]` so the existing
+//  forward kernels (gpu_forward_full) can read from a single
+//  GpuLayer struct without changes. After the layer's forward
+//  AND backward have completed, the caller MUST invoke
+//  `fsdp_free_gathered_layer` to release the temporary buffers
+//  on non-owner ranks.
+//
+//  TODO(C9-multi-rank): the multi-rank body below depends on a
+//  real NCCL broadcast. The current `nccl_ffi.hexa` stub returns
+//  NCCL_TODO for any world_size > 1 — the caller must check the
+//  return code and treat non-zero as a configuration error.
+// ───────────────────────────────────────────────────────────────
+
+fn fsdp_all_gather_params(state: FsdpState, weights: GpuWeights, layer_id: int) -> int {
+    if state.world_size <= 1 {
+        return 0  // single-rank: no-op, weights.layers[layer_id] already valid
+    }
+    // Multi-rank: broadcast each tensor in the GpuLayer from the owner.
+    let owner = fsdp_owner_of_layer(state.nl, state.world_size, layer_id)
+    let cfg   = weights.cfg
+    let D     = cfg.D
+    let FF    = cfg.FF
+
+    // The owner already has the device pointers populated in
+    // weights.layers[layer_id]. Non-owner ranks must allocate
+    // matching buffers BEFORE the broadcast call; we cannot mutate
+    // the input struct in place because hexa lists are PBV
+    // (feedback_hexa_lists_pbv.md). The call site is responsible
+    // for swapping the gathered pointers back into a fresh
+    // GpuWeights struct — see the `gathered_layer` design note in
+    // training/fsdp_shard_design.md.
+    //
+    // For the smoke test (world_size==1) the early return above
+    // means this branch is never executed. The error code below
+    // is what a multi-rank launch would see today.
+    let _ = nccl_broadcast_layer(owner, layer_id, D, FF)
+    return NCCL_TODO_RC
+}
+
+// fsdp_free_gathered_layer — release temporary buffers allocated
+// on non-owner ranks during all_gather. Single-rank: no-op.
+fn fsdp_free_gathered_layer(state: FsdpState, weights: GpuWeights, layer_id: int) -> int {
+    if state.world_size <= 1 { return 0 }
+    if fsdp_owns_layer(state, layer_id) { return 0 }
+    // Multi-rank non-owner: free the gathered tensors. See above
+    // TODO. For now this is a no-op stub because the all_gather
+    // branch never actually allocated anything.
+    return 0
+}
+
+// ───────────────────────────────────────────────────────────────
+//  fsdp_reduce_scatter_grads — sum gradients across ranks, leave
+//  the result only on the owner rank.
+//
+//  Single-rank fast path: the local grad IS the full grad, so we
+//  return immediately. Numerics are unchanged.
+//
+//  Multi-rank path: each rank computed a local grad for the same
+//  layer (because backward had a fully-gathered weight tensor).
+//  We sum them via NCCL allreduce (or a more efficient
+//  reduce-scatter ring on multi-tensor layers) and zero out the
+//  non-owner copies. The non-owner ranks then drop their grad
+//  buffers via `fsdp_free_grad_layer`.
+//
+//  TODO(C9-multi-rank): same NCCL stub status as above. Single-rank
+//  guarantees correctness today; multi-rank is wired through the
+//  `nccl_reduce_scatter` symbol with NCCL_TODO_RC.
+// ───────────────────────────────────────────────────────────────
+
+fn fsdp_reduce_scatter_grads(state: FsdpState, grad: GpuGrad, layer_id: int) -> int {
+    if state.world_size <= 1 {
+        return 0  // single-rank: local grad is already the full grad
+    }
+    // Multi-rank: reduce each tensor in the GpuLayerGrad to the owner.
+    let owner = fsdp_owner_of_layer(state.nl, state.world_size, layer_id)
+    let cfg_d = 0  // dimensions are encoded in the grad layout, not used by the stub
+    let _ = nccl_reduce_scatter_layer(owner, layer_id, cfg_d)
+    return NCCL_TODO_RC
+}
+
+// fsdp_free_grad_layer — drop a non-owned layer's local grad
+// buffers after the reduce-scatter. Single-rank: no-op.
+fn fsdp_free_grad_layer(state: FsdpState, layer_id: int) -> int {
+    if state.world_size <= 1 { return 0 }
+    if fsdp_owns_layer(state, layer_id) { return 0 }
+    return 0
+}
+
+// ───────────────────────────────────────────────────────────────
+//  fsdp_save_ckpt — each rank writes its own shard file.
+//
+//  File naming: `{path}.rank{r}of{w}` so a 2-rank job produces
+//  `final.hexackpt.rank0of2` and `final.hexackpt.rank1of2`. A
+//  loader can detect the suffix and concatenate. Rank 0 is the
+//  ONLY rank that writes the shared embed/lmh_U/lmh_V tensors.
+//
+//  Format mirrors save_checkpoint_gpu (HEXACKPT-v1) so the
+//  existing tensor-section parser in gpu_train.hexa works
+//  unchanged. The header line declares the FSDP layout so a
+//  loader can assemble multi-rank checkpoints.
+//
+//  Single-rank guarantee: when world_size == 1 every owned-layer
+//  range is the entire model, so the resulting file contains
+//  the same tensor sections as the non-FSDP save_checkpoint_gpu
+//  output (just with an extra FSDP header line). The roundtrip
+//  test below verifies that.
+// ───────────────────────────────────────────────────────────────
+
+fn fsdp_shard_path(base_path: string, world_size: int, rank: int) -> string {
+    if world_size <= 1 { return base_path + ".rank0of1" }
+    return base_path + ".rank" + str(rank) + "of" + str(world_size)
+}
+
+// fsdp_header_line — pure helper that builds the FSDP descriptor
+// header that fsdp_save_ckpt writes after the HEXACKPT-v1 magic.
+// Exposed separately so tests can roundtrip the descriptor without
+// requiring an actual GpuWeights / device-side tensor save.
+fn fsdp_header_line(rank: int, world_size: int, layer_begin: int,
+                    layer_end: int, has_shared: bool, nl: int) -> string {
+    let shared_flag = if has_shared { "1" } else { "0" }
+    return "__FSDP__ rank=" + str(rank)
+            + " world=" + str(world_size)
+            + " layer_begin=" + str(layer_begin)
+            + " layer_end=" + str(layer_end)
+            + " has_shared=" + shared_flag
+            + " NL=" + str(nl)
+}
+
+fn fsdp_save_ckpt(state: FsdpState, weights: GpuWeights, base_path: string) -> int {
+    let cfg = weights.cfg
+    let D     = cfg.D
+    let FF    = cfg.FF
+    let NL    = cfg.NL
+    let VOCAB = cfg.VOCAB
+    let RANK  = cfg.RANK
+
+    let path = fsdp_shard_path(base_path, state.world_size, state.rank)
+
+    // Header: HEXACKPT-v1 + FSDP descriptor line so loaders know
+    // the shard layout without having to peek at filenames.
+    let _ = write_file(path, "HEXACKPT-v1\n")
+    let header = fsdp_header_line(state.rank, state.world_size, state.layer_begin,
+                                  state.layer_end, state.has_shared, NL)
+    let _ = append_file(path, header + "\n")
+
+    // Shared params (rank 0 only).
+    if state.has_shared {
+        let _ = append_tensor_section(path, "embed", VOCAB, D, weights.embed)
+    }
+
+    // Owned layer tensors. Names use the global layer index so the
+    // loader can place them correctly when reassembling.
+    let mut li = state.layer_begin
+    while li < state.layer_end {
+        let prefix = "L" + str(li) + "_"
+        let layer = weights.layers[li]
+        let _ = append_tensor_section(path, prefix + "Wq",   D,  D,  layer.Wq)
+        let _ = append_tensor_section(path, prefix + "Wk",   D,  D,  layer.Wk)
+        let _ = append_tensor_section(path, prefix + "Wv",   D,  D,  layer.Wv)
+        let _ = append_tensor_section(path, prefix + "Wo",   D,  D,  layer.Wo)
+        let _ = append_tensor_section(path, prefix + "Wff1", D,  FF, layer.Wff1)
+        let _ = append_tensor_section(path, prefix + "Wff2", FF, D,  layer.Wff2)
+        let _ = append_tensor_section(path, prefix + "ga",   1,  D,  layer.ga)
+        let _ = append_tensor_section(path, prefix + "gf",   1,  D,  layer.gf)
+        li = li + 1
+    }
+
+    // Shared LM head (rank 0 only).
+    if state.has_shared {
+        let _ = append_tensor_section(path, "lmh_U", D,    RANK,  weights.lmh_U)
+        let _ = append_tensor_section(path, "lmh_V", RANK, VOCAB, weights.lmh_V)
+    }
+
+    // Manifest: count of tensor sections (excludes header lines).
+    let n_owned = state.layer_end - state.layer_begin
+    let n_shared_tensors = if state.has_shared { 3 } else { 0 }
+    let n_tensors = 8 * n_owned + n_shared_tensors
+    let _ = append_file(path, "__MANIFEST__ " + str(n_tensors) + " 1\n")
+
+    println("[fsdp_shard] saved shard ckpt → " + path
+            + " (rank=" + str(state.rank) + "/" + str(state.world_size)
+            + ", " + str(n_tensors) + " tensors)")
+    return 0
+}
+
+// ───────────────────────────────────────────────────────────────
+//  fsdp_free_state — release optimizer moments allocated by
+//  fsdp_init. Caller still owns the GpuWeights struct.
+// ───────────────────────────────────────────────────────────────
+
+fn fsdp_free_state(state: FsdpState) -> int {
+    let n = len(state.optimizer_shards)
+    let mut i = 0
+    while i < n {
+        let _ = fsdp_free_adamw_layer(state.optimizer_shards[i])
+        i = i + 1
+    }
+    if state.has_shared {
+        cuda_free(state.m_embed); cuda_free(state.v_embed)
+        cuda_free(state.m_lmh_U); cuda_free(state.v_lmh_U)
+        cuda_free(state.m_lmh_V); cuda_free(state.v_lmh_V)
+    }
+    println("[fsdp_shard] fsdp_free_state — released " + str(n)
+            + " owned-layer optimizer shards (rank=" + str(state.rank) + ")")
+    return 0
+}
+
+// ───────────────────────────────────────────────────────────────
+//  Memory accounting helpers (paper-bench style).
+//
+//  fsdp_param_bytes_per_rank — fp32 param bytes a rank holds.
+//  fsdp_optim_bytes_per_rank — AdamW m+v bytes per rank.
+//  fsdp_total_bytes_per_rank — params + grads + optim moments.
+//
+//  These mirror hexa-lang fsdp_memory_full_shard but operate on
+//  the actual GpuWeights/GpuClmConfig instead of a flat param
+//  count, so we can sanity-check 7B fp32 ≈ 14 GB / rank @ N=2.
+// ───────────────────────────────────────────────────────────────
+
+fn fsdp_param_bytes_per_layer(cfg: GpuClmConfig) -> int {
+    let D  = cfg.D
+    let FF = cfg.FF
+    // 4×(D*D) + 2×(D*FF) + 2×D
+    return 4 * (D * D * 4) + 2 * (D * FF * 4) + 2 * (D * 4)
+}
+
+fn fsdp_param_bytes_per_rank(state: FsdpState, cfg: GpuClmConfig) -> int {
+    let owned = state.layer_end - state.layer_begin
+    let layer_bytes = owned * fsdp_param_bytes_per_layer(cfg)
+    let mut shared_bytes = 0
+    if state.has_shared {
+        let D     = cfg.D
+        let RANK  = cfg.RANK
+        let VOCAB = cfg.VOCAB
+        shared_bytes = (VOCAB * D * 4) + (D * RANK * 4) + (RANK * VOCAB * 4)
+    }
+    return layer_bytes + shared_bytes
+}
+
+// AdamW: 2x the param footprint (m + v moments).
+fn fsdp_optim_bytes_per_rank(state: FsdpState, cfg: GpuClmConfig) -> int {
+    return 2 * fsdp_param_bytes_per_rank(state, cfg)
+}
+
+// params + grads + optim — gradient buffers are full-rank on the
+// owning side (after reduce-scatter) so they cost the same as
+// param bytes.
+fn fsdp_total_bytes_per_rank(state: FsdpState, cfg: GpuClmConfig) -> int {
+    let p = fsdp_param_bytes_per_rank(state, cfg)
+    return p + p + fsdp_optim_bytes_per_rank(state, cfg)  // 4P/N
+}
+
+// fsdp_savings_ratio — fraction of the unsharded footprint we
+// avoid storing on this rank. world_size==1 always returns 0.0.
+fn fsdp_savings_ratio(state: FsdpState, cfg: GpuClmConfig) -> float {
+    if state.world_size <= 1 { return 0.0 }
+    // Unsharded would be NL × per-layer + shared.
+    let unsharded_layers = state.nl * fsdp_param_bytes_per_layer(cfg)
+    let D     = cfg.D
+    let RANK  = cfg.RANK
+    let VOCAB = cfg.VOCAB
+    let shared = (VOCAB * D * 4) + (D * RANK * 4) + (RANK * VOCAB * 4)
+    let unsharded = unsharded_layers + shared
+    let p = fsdp_param_bytes_per_rank(state, cfg)
+    if unsharded == 0 { return 0.0 }
+    return 1.0 - to_float(p) / to_float(unsharded)
+}

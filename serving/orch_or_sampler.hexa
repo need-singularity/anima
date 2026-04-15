@@ -1,0 +1,279 @@
+// ═══════════════════════════════════════════════════════════════
+//  serving/orch_or_sampler.hexa
+//
+//  D3 Orch-OR inference-time sampling wrapper.
+//
+//  Task: roadmap alm_consciousness_standalone.json + clm_consciousness_standalone.json
+//        track D, item D3, state="chosen", effort_days 2-3.
+//
+//  Wraps anima-engines/quantum_collapse_sample.hexa (Penrose-Hameroff
+//  Diósi-Penrose objective reduction). Does NOT modify the engine; only
+//  calls its public API (qcs_collapse_sample, qcs_softmax_temp,
+//  qcs_topk, QcsResult).
+//
+//  Signature (public entry):
+//      orch_or_sample(
+//          logits:            [float],   // raw decoder logits over vocab
+//          temperature:       float,     // >0 normal softmax temp; 0 → greedy fallback
+//          tension:           float,     // GWT tension signal, modulates perturb
+//          phi_holo_context:  float,     // Φ_holo current, controls OR perturb strength
+//          seed:              int        // 0 → random(); else deterministic
+//      ) -> OrchOrOut
+//
+//  OrchOrOut {
+//      token_id:         int,   // chosen vocab index
+//      orch_or_used:     int,   // 1 if Orch-OR collapse path taken, 0 if fallback
+//      quantum_variance: float  // variance of Born-rule amplitudes (spread proxy)
+//  }
+//
+//  Pipeline:
+//      1. temperature == 0  → return greedy argmax of logits, orch_or_used=0.
+//      2. scale logits by (1/T) to produce amplitude-weighted distribution.
+//      3. apply phi_holo perturbation: logits[i] += perturb_strength * noise_i
+//         where perturb_strength = OR_PERTURB_BASE * clip(phi_holo_context / OR_PHI_REF, 0, 2)
+//                                 + OR_TENSION_COEF * tension
+//         (phi_holo_context=0 collapses to unperturbed logits → classical-like)
+//      4. call qcs_collapse_sample() on perturbed logits.
+//      5. if qcs returns token≥0 → orch_or_used=1, token = qcs token.
+//         else (action not yet accumulated this invocation, only 1 step) →
+//         fallback to Born-rule multinomial over softmax(perturbed_logits/T)
+//         and mark orch_or_used=0 (classical fallback).
+//      6. quantum_variance = Σ p_i · (1 - p_i) / k  (Bernoulli-ish spread)
+//
+//  L0 Freeze: this file is NEW, not modifying http_server.hexa /
+//  hire_routes.hexa / style_switch.hexa / quantum_collapse_sample.hexa.
+// ═══════════════════════════════════════════════════════════════
+
+use "quantum_collapse_sample"
+
+// ── Tunables for Orch-OR perturbation ─────────────────────────────
+let OR_PHI_REF         = 1000.0   // reference Φ_holo (hire_sim training target)
+let OR_PERTURB_BASE    = 0.15     // max logit noise amplitude at phi_holo = OR_PHI_REF
+let OR_TENSION_COEF    = 0.05     // additional perturb per unit tension
+let OR_FALLBACK_ACTION = 2.0      // pre-loaded action budget so single-step can collapse
+
+// ── Output struct ─────────────────────────────────────────────────
+struct OrchOrOut {
+    token_id:         int,
+    orch_or_used:     int,      // 1 if Orch-OR collapse; 0 if greedy/multinomial fallback
+    quantum_variance: float
+}
+
+// ── Deterministic pseudo-random (LCG) for seed>0 ────────────────
+//  Hexa's random() is process-global; for determinism we use a tiny LCG
+//  seeded per call so the same (logits, seed, phi_holo_context) triplet
+//  reproduces the exact same collapse trajectory.
+struct LcgState { s: int }
+
+fn lcg_seed(s: int) -> LcgState {
+    // avoid 0 state (degenerate for LCG)
+    let s2 = if s == 0 { 1 } else { s }
+    return LcgState { s: s2 }
+}
+
+fn lcg_next(st: LcgState) -> LcgState {
+    // Numerical Recipes LCG — wraps via explicit modulo on a 32-bit window.
+    // Keep everything in int; the final float is (s mod 1_000_000) / 1e6.
+    let a = 1103515245
+    let c = 12345
+    let m = 2147483647
+    let ns = (a * st.s + c) % m
+    return LcgState { s: ns }
+}
+
+fn lcg_float(st: LcgState) -> float {
+    // 0.0 ≤ r < 1.0 using modulo window
+    let window = 1000000
+    let v = st.s % window
+    return (v * 1.0) / (window * 1.0)
+}
+
+// ── Small helpers (pure, no mutation of caller lists per pbv rule) ──
+fn oos_argmax(xs: [float]) -> int {
+    let n = len(xs)
+    let mut best = 0
+    let mut best_v = xs[0]
+    let mut i = 1
+    while i < n {
+        if xs[i] > best_v {
+            best_v = xs[i]
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn oos_scale_logits(logits: [float], temperature: float) -> [float] {
+    let n = len(logits)
+    let inv_t = 1.0 / temperature
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(logits[i] * inv_t)
+        i = i + 1
+    }
+    return out
+}
+
+// Apply Orch-OR perturbation: additive LCG-derived noise whose amplitude
+// is modulated by phi_holo_context and tension. Returns a NEW list
+// (pass-by-value safe). Also advances the LCG — returns (perturbed, state_after).
+struct PerturbOut {
+    logits: [float],
+    state:  LcgState
+}
+
+fn oos_perturb(
+    logits:     [float],
+    phi_holo:   float,
+    tension:    float,
+    st_in:      LcgState
+) -> PerturbOut {
+    // Amplitude: clip(phi_holo / OR_PHI_REF, 0, 2) × base  +  tension_coef × tension
+    let mut phi_frac = phi_holo / OR_PHI_REF
+    if phi_frac < 0.0 { phi_frac = 0.0 }
+    if phi_frac > 2.0 { phi_frac = 2.0 }
+    let amp = OR_PERTURB_BASE * phi_frac + OR_TENSION_COEF * tension
+
+    let n = len(logits)
+    let mut out = []
+    let mut st = st_in
+    let mut i = 0
+    while i < n {
+        st = lcg_next(st)
+        let u = lcg_float(st)          // 0..1
+        let noise = (u - 0.5) * 2.0    // -1..1
+        out = out.push(logits[i] + amp * noise)
+        i = i + 1
+    }
+    return PerturbOut { logits: out, state: st }
+}
+
+// Variance of the softmax distribution over vocab (used as "quantum_variance"
+// observability signal for the caller). Uses qcs_softmax_temp.
+fn oos_variance_of(probs: [float]) -> float {
+    let n = len(probs)
+    let mut sum_sq = 0.0
+    let mut i = 0
+    while i < n {
+        let p = probs[i]
+        sum_sq = sum_sq + p * (1.0 - p)
+        i = i + 1
+    }
+    if n == 0 { return 0.0 }
+    return sum_sq / (n * 1.0)
+}
+
+// Born-rule multinomial over probs using LCG. Returns (token_id, state_after).
+struct DrawOut {
+    token: int,
+    state: LcgState
+}
+
+fn oos_draw(probs: [float], st_in: LcgState) -> DrawOut {
+    let st = lcg_next(st_in)
+    let r = lcg_float(st)
+    let n = len(probs)
+    let mut acc = 0.0
+    let mut i = 0
+    while i < n {
+        acc = acc + probs[i]
+        if r < acc {
+            return DrawOut { token: i, state: st }
+        }
+        i = i + 1
+    }
+    return DrawOut { token: n - 1, state: st }
+}
+
+// ── Public entry ──────────────────────────────────────────────────
+fn orch_or_sample(
+    logits:           [float],
+    temperature:      float,
+    tension:          float,
+    phi_holo_context: float,
+    seed:             int
+) -> OrchOrOut {
+    let n = len(logits)
+    if n == 0 {
+        return OrchOrOut { token_id: -1, orch_or_used: 0, quantum_variance: 0.0 }
+    }
+
+    // ── T=0 branch: greedy, no quantum path ──
+    if temperature <= 0.0 {
+        let tok = oos_argmax(logits)
+        return OrchOrOut { token_id: tok, orch_or_used: 0, quantum_variance: 0.0 }
+    }
+
+    // ── Scale by temperature ──
+    let scaled = oos_scale_logits(logits, temperature)
+
+    // ── Perturbation via LCG (determinism when seed != 0) ──
+    let st0 = lcg_seed(seed)
+    let p = oos_perturb(scaled, phi_holo_context, tension, st0)
+    let perturbed = p.logits
+    let st1 = p.state
+
+    // ── Call Orch-OR collapse sampler (anima-engines, unmodified) ──
+    // Preload accumulated action so a single call can collapse — the
+    // engine is designed for multi-step generation where action is
+    // accumulated across tokens; at inference we want collapse at
+    // every step if the lattice is excited enough.
+    let qres = qcs_collapse_sample(perturbed, OR_FALLBACK_ACTION)
+
+    // Compute probs for variance regardless of path (cheap, K=vocab but
+    // qcs_softmax_temp is single-pass O(n)).
+    let probs = qcs_softmax_temp(perturbed, 1.0)
+    let qvar = oos_variance_of(probs)
+
+    if qres.token >= 0 && qres.collapsed == 1 {
+        // Orch-OR path taken. token is a vocab index (0..n).
+        return OrchOrOut {
+            token_id:         qres.token,
+            orch_or_used:     1,
+            quantum_variance: qvar
+        }
+    }
+
+    // ── Fallback: Born-rule multinomial via LCG ──
+    // This should be rare given OR_FALLBACK_ACTION preload but is
+    // here for completeness — it preserves the classical semantics
+    // if the collapse path short-circuited (e.g. k=0 after topk).
+    let d = oos_draw(probs, st1)
+    return OrchOrOut {
+        token_id:         d.token,
+        orch_or_used:     0,
+        quantum_variance: qvar
+    }
+}
+
+// ── Module-level smoke: only runs when invoked directly ──
+// We gate behind ORCH_OR_SELFTEST=1 so `use "orch_or_sampler"` from
+// sampler_wrap.hexa / test_orch_or_sampler.hexa does not double-print.
+let _oos_mode = env("ORCH_OR_SELFTEST")
+if _oos_mode == "1" {
+    println("[oos] orch_or_sampler module self-smoke")
+    let mut _lg = []
+    let mut _i = 0
+    while _i < 16 {
+        _lg = _lg.push(0.1 * (_i * 1.0))
+        _i = _i + 1
+    }
+    let _r0 = orch_or_sample(_lg, 0.0, 0.0, 0.0, 0)
+    println("[oos] T=0 greedy → tok=" + str(_r0.token_id)
+          + " used=" + str(_r0.orch_or_used)
+          + " var=" + str(_r0.quantum_variance))
+
+    let _r1 = orch_or_sample(_lg, 1.0, 0.0, 1000.0, 42)
+    println("[oos] T=1 phi=1000 seed=42 → tok=" + str(_r1.token_id)
+          + " used=" + str(_r1.orch_or_used)
+          + " var=" + str(_r1.quantum_variance))
+
+    let _r2 = orch_or_sample(_lg, 1.0, 0.0, 0.0, 42)
+    println("[oos] T=1 phi=0 seed=42 → tok=" + str(_r2.token_id)
+          + " used=" + str(_r2.orch_or_used)
+          + " var=" + str(_r2.quantum_variance))
+
+    println("[oos] smoke done")
+}

@@ -1,0 +1,273 @@
+// training/alm_a1_preflight.hexa — Pre-launch checks for ALM A1
+//
+// Spec:   shared/roadmaps/alm_consciousness_standalone.json#tracks.A.options[A1]
+// Called by: test_alm_a1_launch.hexa (shape test) and operators before launch
+//
+// Checks performed (local-side, no SSH required by default):
+//   1. env HOST_ID set        (pod id hint)
+//   2. SSH reachability       (only when HOST_ID looks like ip:port or runpod)
+//   3. r4 R2 prefix exists    (rclone lsd dry)
+//   4. HF_TOKEN env present
+//   5. GPU bf16 capability    (LOCAL best-effort — skipped on Mac)
+//   6. disk space > 100GB     (on pod; best-effort locally)
+//   7. config JSON parse ok   (structural sanity on alm_a1_config.json)
+//
+// Return shape:
+//   {
+//     all_ok: bool,
+//     issues: [str],
+//     checks: { name: str, ok: bool, detail: str }[]
+//   }
+//
+// Hexa 1M interpreter note: we serialize the return as a small manual
+// struct + emit both a pretty log and a JSON line so callers (test
+// harnesses, hooks) can grep for `all_ok=true` or parse the JSON.
+//
+// Usage:
+//   hexa training/alm_a1_preflight.hexa
+//   HOST_ID=root@216.243.220.217:17992 hexa training/alm_a1_preflight.hexa
+//   STRICT=1 hexa training/alm_a1_preflight.hexa        # fail on any warn
+
+let CONFIG_PATH = "training/alm_a1_config.json"
+let R4_R2_PREFIX_DEFAULT = "r2:anima-models/alm14b/r4/"
+
+// ─── helpers (copy from launch_alm_a1.hexa — deliberate duplication
+// to keep this script self-contained for SSH-less use) ──
+fn str_index_of(hay, needle, from) {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return from }
+    let mut i = from
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn str_contains(hay, needle) {
+    return str_index_of(hay, needle, 0) >= 0
+}
+
+fn extract_json_string(text, key) {
+    let needle = "\"" + key + "\""
+    let kpos = str_index_of(text, needle, 0)
+    if kpos < 0 { return "" }
+    let after_key = kpos + len(needle)
+    let colon = str_index_of(text, ":", after_key)
+    if colon < 0 { return "" }
+    let open_q = str_index_of(text, "\"", colon)
+    if open_q < 0 { return "" }
+    let close_q = str_index_of(text, "\"", open_q + 1)
+    if close_q < 0 { return "" }
+    return text.substring(open_q + 1, close_q)
+}
+
+// ─── Issue accumulator ──
+// We track issues as a list of strings; tests can assert shape.
+fn check_1_host_id() {
+    let host_id = env("HOST_ID")
+    if host_id == "" {
+        return "WARN: HOST_ID unset — cannot SSH-probe. Pod assumed to be local."
+    }
+    return "OK: HOST_ID=" + host_id
+}
+
+fn check_2_ssh(host_id_detail) {
+    // Only probe if HOST_ID looks like ssh-able.
+    let host_id = env("HOST_ID")
+    if host_id == "" {
+        return "SKIP: HOST_ID unset"
+    }
+    // Best-effort: try ssh -o BatchMode -o ConnectTimeout with true(1)
+    let cmd = "ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no " + host_id + " true 2>&1; echo RC=$?"
+    let out = exec(cmd)
+    if str_contains(out, "RC=0") {
+        return "OK: SSH reachable"
+    }
+    return "FAIL: SSH unreachable (" + out.substring(0, 200) + ")"
+}
+
+fn check_3_r2_r4_prefix(prefix) {
+    // rclone lsd <prefix> — dry-ish: we just want the bucket to respond
+    let cmd = "rclone lsd " + prefix + " --s3-no-check-bucket 2>&1; echo RC=$?"
+    let out = exec(cmd)
+    if str_contains(out, "RC=0") {
+        return "OK: r4 R2 prefix reachable — " + prefix
+    }
+    return "FAIL: rclone lsd " + prefix + " failed — " + out.substring(0, 200)
+}
+
+fn check_4_hf_token() {
+    let tok = env("HF_TOKEN")
+    if tok == "" {
+        return "FAIL: HF_TOKEN unset"
+    }
+    return "OK: HF_TOKEN present (len=" + str(len(tok)) + ")"
+}
+
+fn check_5_gpu_bf16() {
+    // nvidia-smi may not exist on Mac — treat as SKIP then.
+    let probe = exec("command -v nvidia-smi 2>&1; echo RC=$?")
+    if !str_contains(probe, "RC=0") {
+        return "SKIP: nvidia-smi missing (local dev — actual check runs in runner)"
+    }
+    let cc = exec("nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1").trim()
+    if cc == "" {
+        return "FAIL: nvidia-smi compute_cap query returned empty"
+    }
+    // Accept any compute_cap >= 8.0 (Ampere bf16 capable)
+    let first = cc.substring(0, 1)
+    if first == "8" || first == "9" {
+        return "OK: compute_cap=" + cc + " (bf16 capable)"
+    }
+    return "FAIL: compute_cap=" + cc + " < 8.0 (no bf16)"
+}
+
+fn check_6_disk() {
+    // Portable: df -k returns KB (works on BSD/macOS + GNU Linux).
+    // Awk the Available column, divide by 1024*1024 for GB.
+    let probe = exec("if [ -d /workspace ]; then df -k /workspace | tail -n1 | awk '{print int($4/1024/1024)}'; else df -k . | tail -n1 | awk '{print int($4/1024/1024)}'; fi 2>&1").trim()
+    if probe == "" {
+        return "FAIL: df returned empty"
+    }
+    // probe should be pure digits (int GB) — validate.
+    let nn = len(probe)
+    let mut j = 0
+    let mut digits = ""
+    while j < nn {
+        let c = probe.substring(j, j + 1)
+        if c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+           || c == "5" || c == "6" || c == "7" || c == "8" || c == "9" {
+            digits = digits + c
+        }
+        j = j + 1
+    }
+    if digits == "" {
+        return "WARN: could not parse df available — raw=" + probe.substring(0, 200)
+    }
+    let gb = to_int(digits)
+    if gb < 100 {
+        return "FAIL: disk free " + str(gb) + "GB < 100GB"
+    }
+    return "OK: disk free " + str(gb) + "GB"
+}
+
+fn check_7_config_parse() {
+    if !file_exists(CONFIG_PATH) {
+        return "FAIL: config missing: " + CONFIG_PATH
+    }
+    let text = read_file(CONFIG_PATH)
+    if len(text) == 0 {
+        return "FAIL: config empty"
+    }
+    // Require a handful of top-level keys to be present.
+    let required = ["run_id_template", "round", "model_tag", "ckpt_label", "base", "lora", "training", "phi_loss", "wall", "corpus", "hooks", "env", "pod", "blocks"]
+    let mut missing = ""
+    let mut i = 0
+    while i < len(required) {
+        let k = required[i]
+        let n = "\"" + k + "\""
+        if str_index_of(text, n, 0) < 0 {
+            if missing != "" { missing = missing + "," }
+            missing = missing + k
+        }
+        i = i + 1
+    }
+    if missing != "" {
+        return "FAIL: config missing keys: " + missing
+    }
+    // Sanity: ckpt_label must be production
+    let lbl = extract_json_string(text, "ckpt_label")
+    if lbl != "production" {
+        return "WARN: ckpt_label=" + lbl + " (expected production per A1 spec)"
+    }
+    return "OK: config parse + schema + label=production"
+}
+
+// ─── Main ──
+fn main() {
+    println("=== alm_a1_preflight ===")
+    let mut issues = ""
+    let mut any_fail = false
+    let mut any_warn = false
+
+    let c1 = check_1_host_id()  ; println("  1 host_id:     " + c1)
+    if c1.substring(0, 4) == "WARN" { any_warn = true }
+
+    let c2 = check_2_ssh(c1)    ; println("  2 ssh:         " + c2)
+    if c2.substring(0, 4) == "FAIL" { any_fail = true ; if issues != "" { issues = issues + ";" } issues = issues + "ssh" }
+
+    let prefix = R4_R2_PREFIX_DEFAULT
+    // optional override from config
+    if file_exists(CONFIG_PATH) {
+        let ct = read_file(CONFIG_PATH)
+        let p2 = extract_json_string(ct, "r4_adapter_source")
+        if p2 != "" { prefix = p2 }
+    }
+    let c3 = check_3_r2_r4_prefix(prefix) ; println("  3 r4 R2:       " + c3)
+    if c3.substring(0, 4) == "FAIL" { any_fail = true ; if issues != "" { issues = issues + ";" } issues = issues + "r4_r2" }
+
+    let c4 = check_4_hf_token() ; println("  4 HF_TOKEN:    " + c4)
+    if c4.substring(0, 4) == "FAIL" { any_fail = true ; if issues != "" { issues = issues + ";" } issues = issues + "hf_token" }
+
+    let c5 = check_5_gpu_bf16() ; println("  5 gpu bf16:    " + c5)
+    if c5.substring(0, 4) == "FAIL" { any_fail = true ; if issues != "" { issues = issues + ";" } issues = issues + "gpu_bf16" }
+    if c5.substring(0, 4) == "SKIP" { any_warn = true }
+
+    let c6 = check_6_disk()     ; println("  6 disk:        " + c6)
+    if c6.substring(0, 4) == "FAIL" { any_fail = true ; if issues != "" { issues = issues + ";" } issues = issues + "disk" }
+    if c6.substring(0, 4) == "WARN" { any_warn = true }
+
+    let c7 = check_7_config_parse() ; println("  7 config:      " + c7)
+    if c7.substring(0, 4) == "FAIL" { any_fail = true ; if issues != "" { issues = issues + ";" } issues = issues + "config" }
+    if c7.substring(0, 4) == "WARN" { any_warn = true }
+
+    // ── STRICT=1 flips warn → fail ──
+    if env("STRICT") == "1" && any_warn { any_fail = true ; if issues != "" { issues = issues + ";" } issues = issues + "strict_warn" }
+
+    let all_ok = !any_fail
+    println("")
+    println("== summary ==")
+    if all_ok {
+        println("all_ok: true")
+    } else {
+        println("all_ok: false")
+    }
+    println("issues: " + issues)
+
+    // Single-line JSON output for hook/test consumption.
+    let issues_json = ""
+    if issues != "" {
+        // Convert ';'-list to ["a","b",...]  — hand-built.
+        let mut out = "["
+        let mut k = 0
+        let m = len(issues)
+        let mut cur = ""
+        while k < m {
+            let ch = issues.substring(k, k + 1)
+            if ch == ";" {
+                if out != "[" { out = out + "," }
+                out = out + "\"" + cur + "\""
+                cur = ""
+            } else {
+                cur = cur + ch
+            }
+            k = k + 1
+        }
+        if cur != "" {
+            if out != "[" { out = out + "," }
+            out = out + "\"" + cur + "\""
+        }
+        out = out + "]"
+        issues_json = out
+    } else {
+        issues_json = "[]"
+    }
+
+    let all_ok_str = "false"
+    if all_ok { all_ok_str = "true" }
+    println("JSON: {\"all_ok\": " + all_ok_str + ", \"issues\": " + issues_json + "}")
+}
+
+// NOTE: hexa stage1 runs main() automatically — explicit call would double-print.

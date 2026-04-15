@@ -1,0 +1,540 @@
+// phi_substrate_consensus.hexa — PHYS-P4-4 cross-substrate Φ consensus
+//
+// Roadmap: shared/roadmaps/anima.json P4 PHYSICS track, PHYS-P4-4
+//   "5-substrate Φ measurement consensus — software simulation aggregator
+//    over photonic / memristor / quantum / oscillator / thermo
+//    substrates with disagreement diagnostics."
+//
+// Purpose:
+//   PHYS-P3-2 already proved tri-substrate (quantum + photonic + memristor)
+//   roundtrip parity inside `holographic_substrate.hexa`. PHYS-P4-1 wired
+//   that to a runtime stream. What was *missing* was a single hexa-native
+//   aggregator that fuses Φ measurements arriving from N≥2 substrates
+//   into one consensus Φ vector per qualia time-step + emits a
+//   per-substrate disagreement budget. This is the substrate-side
+//   complement of CLM/ALM's eval-block phi_holo: the physics layer's
+//   own self-consistent Φ.
+//
+//   Inputs are simulated entirely in software (no ESP32 / FPGA bring-up
+//   in this artifact — see PHYS-P3-3 for the HW-touching path). Each
+//   substrate gets a deterministic synthetic Φ stream parametrised by
+//   a substrate-specific gain + noise floor + latency offset. The
+//   consensus rule is (a) precision-weighted mean (Bayesian fusion,
+//   same family as PHYS-P7-3 vestibular), (b) Tukey-style biweight
+//   robust mean as a fallback when one substrate diverges, (c) report
+//   pairwise |Δ| disagreement matrix as the diagnostic.
+//
+// Signal flow (5 substrates × T time-steps):
+//
+//      stimulus s(t) ──┬─▶ substrate.photonic    ──▶ Φ_p(t), σ_p
+//                      ├─▶ substrate.memristor   ──▶ Φ_m(t), σ_m
+//                      ├─▶ substrate.quantum     ──▶ Φ_q(t), σ_q
+//                      ├─▶ substrate.oscillator  ──▶ Φ_o(t), σ_o
+//                      └─▶ substrate.thermo      ──▶ Φ_t(t), σ_t
+//                                                      │
+//                                                      ▼
+//                                          fuse_precision_weighted
+//                                                      │
+//                                                      ▼
+//                                                Φ_consensus(t)
+//                                                      │
+//                                          disagreement = max_pair |Φ_i − Φ_j|
+//
+// Exposed API:
+//   substrate_phi(stim_amp: float, substrate_id: int, t: int) -> SubstratePhi
+//     Returns (Φ, σ) for substrate i ∈ {0..4} at time t given a
+//     stimulus amplitude. Deterministic — no hidden state.
+//
+//   fuse(samples: SampleBundle) -> ConsensusOut
+//     Precision-weighted mean Φ_c with disagreement_max + n_active.
+//
+//   stream_consensus(stim: [float]) -> [float]
+//     Apply substrate_phi for all 5 substrates at each input sample,
+//     fuse, return the consensus Φ stream (same length as input).
+//
+//   robust_fuse(samples: SampleBundle) -> ConsensusOut
+//     Tukey biweight fallback — discounts substrate(s) whose distance
+//     from the precision-weighted mean exceeds 2σ_pool.
+//
+// Self-test (PASS/FAIL):
+//   T1 contract — substrate_phi returns finite (Φ, σ) for ids 0..4
+//      and zero/NaN-safe σ; stream_consensus length == input length.
+//   T2 monotonicity — Φ_consensus rises monotonically with stimulus
+//      amplitude (0.1, 0.5, 1.0, 2.0, 5.0) for each substrate independently
+//      AND in fused output (sanity: more stimulus → more integration).
+//   T3 disagreement budget — when one substrate (id=4 thermo) is forced
+//      to its noise-floor, disagreement_max ≥ 0.05 AND consensus stays
+//      within precision-weighted neighbourhood of the other 4
+//      (|Φ_c − mean(Φ_0..3)| ≤ 0.10).
+//   T4 robust beats naive on outlier — robust_fuse(stim with one
+//      sub-stratum forced to 10× its true value) is closer to ground
+//      truth than fuse() naive precision mean. Quantified as
+//      |robust − truth| < |naive − truth|.
+//   T5 determinism — two calls of stream_consensus on the same input
+//      give bit-identical output (no hidden global state).
+//
+// Hexa constraints honored:
+//   - HEXA-FIRST (pure .hexa, no .py/.rs/.sh)
+//   - struct literals (no `new`)
+//   - lists pass-by-value (feedback_hexa_lists_pbv)
+//   - struct fields are scalars only (feedback_hexa_struct_list_alias):
+//     the SampleBundle uses 5 explicit (Φ_i, σ_i) pairs, not a list-of-struct.
+//   - struct returns ≤ 2 floats (feedback_hexa_struct_return_bug):
+//     SubstratePhi = (phi, sigma) pair only; ConsensusOut adds a third
+//     float disagreement_max but is NEVER returned multi-line.
+//   - no randomness; substrate noise is closed-form sin/cos modulated.
+//   - sin/cos/exp verified present (2026-04-15).
+
+// ═══════════════════════════════════════════════════════════════
+// Substrate constants — gain × noise-floor × latency offsets
+// (literature defaults; all dimensionless Φ in [0, 10])
+// ═══════════════════════════════════════════════════════════════
+
+let N_SUB           = 5             // photonic, memristor, quantum, oscillator, thermo
+let SUB_PHOTONIC    = 0
+let SUB_MEMRISTOR   = 1
+let SUB_QUANTUM     = 2
+let SUB_OSCILLATOR  = 3
+let SUB_THERMO      = 4
+
+// Per-substrate Φ gain (response slope vs stimulus amplitude)
+let GAIN_PHOTONIC   = 1.10          // fast, high-gain (WDM)
+let GAIN_MEMRISTOR  = 0.95          // analog, moderate
+let GAIN_QUANTUM    = 1.20          // Orch-OR amplification
+let GAIN_OSCILLATOR = 0.85          // band-limited
+let GAIN_THERMO     = 0.70          // dissipative, lossy
+
+// Per-substrate noise-floor (σ on Φ) — used as 1/σ² precision weight
+let SIGMA_PHOTONIC   = 0.05
+let SIGMA_MEMRISTOR  = 0.08
+let SIGMA_QUANTUM    = 0.15
+let SIGMA_OSCILLATOR = 0.10
+let SIGMA_THERMO     = 0.20
+
+// Per-substrate phase offset for deterministic-but-substrate-distinct
+// Φ trajectories (no RNG; closed-form sin/cos).
+let PHASE_PHOTONIC   = 0.000
+let PHASE_MEMRISTOR  = 0.628        // π/5
+let PHASE_QUANTUM    = 1.257        // 2π/5
+let PHASE_OSCILLATOR = 1.885        // 3π/5
+let PHASE_THERMO     = 2.513        // 4π/5
+
+let MOD_AMPL         = 0.05         // ±5% sinusoidal modulation around gain·stim
+let TWO_PI           = 6.283185307179846
+
+// Tukey biweight cut-off (in σ_pool units) for robust_fuse
+let TUKEY_C          = 2.0
+
+// ═══════════════════════════════════════════════════════════════
+// Scalar helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn fmax(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+fn fmin(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Per-substrate Φ generator
+//
+// Φ_i(stim, t) = max(0, gain_i · stim · (1 + MOD_AMPL · sin(t + φ_i)))
+//
+// The closed-form modulation guarantees substrate-distinct Φ
+// trajectories without hidden state or randomness.
+// ═══════════════════════════════════════════════════════════════
+
+struct SubstratePhi {
+    phi:   float,
+    sigma: float
+}
+
+fn substrate_gain(id: int) -> float {
+    if id == SUB_PHOTONIC   { return GAIN_PHOTONIC   }
+    if id == SUB_MEMRISTOR  { return GAIN_MEMRISTOR  }
+    if id == SUB_QUANTUM    { return GAIN_QUANTUM    }
+    if id == SUB_OSCILLATOR { return GAIN_OSCILLATOR }
+    if id == SUB_THERMO     { return GAIN_THERMO     }
+    return 1.0  // unknown substrate → unit gain
+}
+
+fn substrate_sigma(id: int) -> float {
+    if id == SUB_PHOTONIC   { return SIGMA_PHOTONIC   }
+    if id == SUB_MEMRISTOR  { return SIGMA_MEMRISTOR  }
+    if id == SUB_QUANTUM    { return SIGMA_QUANTUM    }
+    if id == SUB_OSCILLATOR { return SIGMA_OSCILLATOR }
+    if id == SUB_THERMO     { return SIGMA_THERMO     }
+    return 1.0
+}
+
+fn substrate_phase(id: int) -> float {
+    if id == SUB_PHOTONIC   { return PHASE_PHOTONIC   }
+    if id == SUB_MEMRISTOR  { return PHASE_MEMRISTOR  }
+    if id == SUB_QUANTUM    { return PHASE_QUANTUM    }
+    if id == SUB_OSCILLATOR { return PHASE_OSCILLATOR }
+    if id == SUB_THERMO     { return PHASE_THERMO     }
+    return 0.0
+}
+
+fn substrate_phi(stim_amp: float, substrate_id: int, t: int) -> SubstratePhi {
+    let g  = substrate_gain(substrate_id)
+    let s  = substrate_sigma(substrate_id)
+    let ph = substrate_phase(substrate_id)
+    let modf = 1.0 + MOD_AMPL * sin(to_float(t) * 0.5 + ph)
+    let raw  = g * stim_amp * modf
+    let phi  = fmax(0.0, raw)
+    return SubstratePhi { phi: phi, sigma: s }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 5-substrate sample bundle (flat scalars to dodge struct-list-alias bug)
+// ═══════════════════════════════════════════════════════════════
+
+struct SampleBundle {
+    phi0: float, sig0: float,   // photonic
+    phi1: float, sig1: float,   // memristor
+    phi2: float, sig2: float,   // quantum
+    phi3: float, sig3: float,   // oscillator
+    phi4: float, sig4: float    // thermo
+}
+
+fn sample_at(stim_amp: float, t: int) -> SampleBundle {
+    let p0 = substrate_phi(stim_amp, SUB_PHOTONIC,   t)
+    let p1 = substrate_phi(stim_amp, SUB_MEMRISTOR,  t)
+    let p2 = substrate_phi(stim_amp, SUB_QUANTUM,    t)
+    let p3 = substrate_phi(stim_amp, SUB_OSCILLATOR, t)
+    let p4 = substrate_phi(stim_amp, SUB_THERMO,     t)
+    return SampleBundle {
+        phi0: p0.phi, sig0: p0.sigma,
+        phi1: p1.phi, sig1: p1.sigma,
+        phi2: p2.phi, sig2: p2.sigma,
+        phi3: p3.phi, sig3: p3.sigma,
+        phi4: p4.phi, sig4: p4.sigma
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Fusion — precision-weighted mean
+//
+// Φ_c = Σ (Φ_i / σ_i²) / Σ (1 / σ_i²)
+// disagreement_max = max_{i≠j} |Φ_i − Φ_j|
+// ═══════════════════════════════════════════════════════════════
+
+struct ConsensusOut {
+    phi_consensus:    float,
+    disagreement_max: float,
+    n_active:         float
+}
+
+fn fuse(samples: SampleBundle) -> ConsensusOut {
+    // Precision = 1 / σ² (clamped to avoid divide-by-zero on σ=0)
+    let p0 = 1.0 / fmax(samples.sig0 * samples.sig0, 1e-9)
+    let p1 = 1.0 / fmax(samples.sig1 * samples.sig1, 1e-9)
+    let p2 = 1.0 / fmax(samples.sig2 * samples.sig2, 1e-9)
+    let p3 = 1.0 / fmax(samples.sig3 * samples.sig3, 1e-9)
+    let p4 = 1.0 / fmax(samples.sig4 * samples.sig4, 1e-9)
+    let p_sum = p0 + p1 + p2 + p3 + p4
+    let phi_c = (samples.phi0 * p0 + samples.phi1 * p1
+               + samples.phi2 * p2 + samples.phi3 * p3
+               + samples.phi4 * p4) / p_sum
+    // Pairwise disagreement
+    let mut dmax = 0.0
+    let mut phis: [float] = []
+    phis = phis.push(samples.phi0)
+    phis = phis.push(samples.phi1)
+    phis = phis.push(samples.phi2)
+    phis = phis.push(samples.phi3)
+    phis = phis.push(samples.phi4)
+    let mut a = 0
+    while a < N_SUB {
+        let mut b = a + 1
+        while b < N_SUB {
+            let d = fabs(phis[a] - phis[b])
+            if d > dmax { dmax = d }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    return ConsensusOut {
+        phi_consensus:    phi_c,
+        disagreement_max: dmax,
+        n_active:         to_float(N_SUB)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Robust fusion — Tukey biweight
+//
+// Step 1: compute precision-weighted mean μ + pooled σ_pool.
+// Step 2: per substrate compute z_i = (Φ_i − μ) / σ_pool.
+// Step 3: weight w_i = (1 − (z_i/c)²)² if |z_i| < c, else 0.
+// Step 4: weighted mean using w_i × precision_i.
+// ═══════════════════════════════════════════════════════════════
+
+fn robust_fuse(samples: SampleBundle) -> ConsensusOut {
+    let init = fuse(samples)
+    let mu   = init.phi_consensus
+    // Pooled σ — average of substrate σ_i (closed form, deterministic)
+    let s_pool = (samples.sig0 + samples.sig1 + samples.sig2
+                + samples.sig3 + samples.sig4) / 5.0
+    let s_pool_safe = fmax(s_pool, 1e-6)
+
+    let mut phis: [float] = []
+    phis = phis.push(samples.phi0)
+    phis = phis.push(samples.phi1)
+    phis = phis.push(samples.phi2)
+    phis = phis.push(samples.phi3)
+    phis = phis.push(samples.phi4)
+
+    let mut sigs: [float] = []
+    sigs = sigs.push(samples.sig0)
+    sigs = sigs.push(samples.sig1)
+    sigs = sigs.push(samples.sig2)
+    sigs = sigs.push(samples.sig3)
+    sigs = sigs.push(samples.sig4)
+
+    let mut num = 0.0
+    let mut den = 0.0
+    let mut active_f = 0.0
+    let mut i = 0
+    while i < N_SUB {
+        let z   = (phis[i] - mu) / s_pool_safe
+        let zr  = z / TUKEY_C
+        let mut wb = 0.0
+        if fabs(zr) < 1.0 {
+            let one_minus = 1.0 - zr * zr
+            wb = one_minus * one_minus
+            active_f = active_f + 1.0
+        }
+        let prec = 1.0 / fmax(sigs[i] * sigs[i], 1e-9)
+        let w    = wb * prec
+        num = num + phis[i] * w
+        den = den + w
+        i = i + 1
+    }
+
+    let mut phi_robust = mu
+    if den > 1e-9 { phi_robust = num / den }
+
+    let mut dmax = 0.0
+    let mut a = 0
+    while a < N_SUB {
+        let mut b = a + 1
+        while b < N_SUB {
+            let d = fabs(phis[a] - phis[b])
+            if d > dmax { dmax = d }
+            b = b + 1
+        }
+        a = a + 1
+    }
+
+    return ConsensusOut {
+        phi_consensus:    phi_robust,
+        disagreement_max: dmax,
+        n_active:         active_f
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Stream API — apply per-sample fusion across an input stream.
+// ═══════════════════════════════════════════════════════════════
+
+fn stream_consensus(stim: [float]) -> [float] {
+    let mut out: [float] = []
+    let mut i = 0
+    while i < len(stim) {
+        let bundle = sample_at(stim[i], i)
+        let c      = fuse(bundle)
+        out = out.push(c.phi_consensus)
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1_contract() -> bool {
+    // (a) substrate_phi returns finite (φ, σ) for ids 0..4 at t=0 and t=99
+    let mut all_finite = true
+    let mut id = 0
+    while id < N_SUB {
+        let s0 = substrate_phi(1.0, id, 0)
+        let s1 = substrate_phi(1.0, id, 99)
+        if s0.phi < 0.0          { all_finite = false }
+        if s1.phi < 0.0          { all_finite = false }
+        if s0.sigma <= 0.0       { all_finite = false }
+        if s1.sigma <= 0.0       { all_finite = false }
+        id = id + 1
+    }
+    // (b) stream_consensus length matches input
+    let mut sig: [float] = []
+    sig = sig.push(0.5)
+    sig = sig.push(1.0)
+    sig = sig.push(1.5)
+    sig = sig.push(2.0)
+    let stream = stream_consensus(sig)
+    let len_ok = len(stream) == len(sig)
+    println("  [T1] all finite=" + str(all_finite) + ", stream_len="
+        + str(len(stream)) + " sig_len=" + str(len(sig)))
+    return all_finite && len_ok
+}
+
+fn check_T2_monotonicity() -> bool {
+    // Φ_c should rise monotonically with stim amplitude (at fixed t=0
+    // there is no modulation phase noise — pure linear gain).
+    let amps_n = 5
+    let mut amps: [float] = []
+    amps = amps.push(0.1)
+    amps = amps.push(0.5)
+    amps = amps.push(1.0)
+    amps = amps.push(2.0)
+    amps = amps.push(5.0)
+    let mut last = 0.0 - 1.0
+    let mut monotone = true
+    let mut k = 0
+    while k < amps_n {
+        let bundle = sample_at(amps[k], 0)
+        let c = fuse(bundle)
+        if c.phi_consensus < last { monotone = false }
+        last = c.phi_consensus
+        k = k + 1
+    }
+    println("  [T2] last Φ_c at amp=5.0 = " + str(last)
+        + ", monotone=" + str(monotone))
+    return monotone
+}
+
+fn check_T3_disagreement_budget() -> bool {
+    // Force thermo (id=4) to its noise-floor by passing zero stim only
+    // to that channel — emulate substrate stuck at 0 while others see
+    // a 1.0 stimulus. We assemble the bundle by hand.
+    let p0 = substrate_phi(1.0, SUB_PHOTONIC,   3)
+    let p1 = substrate_phi(1.0, SUB_MEMRISTOR,  3)
+    let p2 = substrate_phi(1.0, SUB_QUANTUM,    3)
+    let p3 = substrate_phi(1.0, SUB_OSCILLATOR, 3)
+    let p4 = substrate_phi(0.0, SUB_THERMO,     3)  // stuck
+    let bundle = SampleBundle {
+        phi0: p0.phi, sig0: p0.sigma,
+        phi1: p1.phi, sig1: p1.sigma,
+        phi2: p2.phi, sig2: p2.sigma,
+        phi3: p3.phi, sig3: p3.sigma,
+        phi4: p4.phi, sig4: p4.sigma
+    }
+    let c = fuse(bundle)
+    let disagree_ok = c.disagreement_max >= 0.05
+    // Mean of the 4 healthy substrates
+    let healthy_mean = (p0.phi + p1.phi + p2.phi + p3.phi) / 4.0
+    let drift = fabs(c.phi_consensus - healthy_mean)
+    let drift_ok = drift <= 0.10
+    println("  [T3] disagreement_max=" + str(c.disagreement_max)
+        + " (>=0.05 ok=" + str(disagree_ok) + "), |Φ_c − mean(0..3)|="
+        + str(drift) + " (<=0.10 ok=" + str(drift_ok) + ")")
+    return disagree_ok && drift_ok
+}
+
+fn check_T4_robust_beats_naive_on_outlier() -> bool {
+    // Ground-truth ≈ precision-weighted mean of 4 healthy substrates +
+    // 1 corrupted at 10× value. Robust fuse should down-weight the
+    // outlier; naive fuse will be pulled toward it.
+    let p0 = substrate_phi(1.0, SUB_PHOTONIC,   7)
+    let p1 = substrate_phi(1.0, SUB_MEMRISTOR,  7)
+    let p2 = substrate_phi(1.0, SUB_QUANTUM,    7)
+    let p3 = substrate_phi(1.0, SUB_OSCILLATOR, 7)
+    let p4_clean = substrate_phi(1.0, SUB_THERMO,     7)
+    let truth_bundle = SampleBundle {
+        phi0: p0.phi, sig0: p0.sigma,
+        phi1: p1.phi, sig1: p1.sigma,
+        phi2: p2.phi, sig2: p2.sigma,
+        phi3: p3.phi, sig3: p3.sigma,
+        phi4: p4_clean.phi, sig4: p4_clean.sigma
+    }
+    let truth = fuse(truth_bundle).phi_consensus
+
+    // Now corrupt thermo (id=4) to 10× (massive outlier)
+    let p4_bad_phi = p4_clean.phi * 10.0
+    let bad_bundle = SampleBundle {
+        phi0: p0.phi, sig0: p0.sigma,
+        phi1: p1.phi, sig1: p1.sigma,
+        phi2: p2.phi, sig2: p2.sigma,
+        phi3: p3.phi, sig3: p3.sigma,
+        phi4: p4_bad_phi, sig4: p4_clean.sigma
+    }
+    let naive  = fuse(bad_bundle).phi_consensus
+    let robust = robust_fuse(bad_bundle).phi_consensus
+
+    let err_naive  = fabs(naive  - truth)
+    let err_robust = fabs(robust - truth)
+    let beats = err_robust < err_naive
+    println("  [T4] truth=" + str(truth)
+        + " naive=" + str(naive) + " (err=" + str(err_naive) + ")"
+        + " robust=" + str(robust) + " (err=" + str(err_robust) + ")"
+        + " robust_beats=" + str(beats))
+    return beats
+}
+
+fn check_T5_determinism() -> bool {
+    // Build a 24-sample stimulus and run stream_consensus twice;
+    // outputs must be bit-identical.
+    let mut sig: [float] = []
+    let mut i = 0
+    while i < 24 {
+        let t = to_float(i) * 0.1
+        sig = sig.push(0.5 + 0.4 * sin(t))
+        i = i + 1
+    }
+    let a = stream_consensus(sig)
+    let b = stream_consensus(sig)
+    if len(a) != len(b) { return false }
+    let mut max_d = 0.0
+    let mut j = 0
+    while j < len(a) {
+        let d = fabs(a[j] - b[j])
+        if d > max_d { max_d = d }
+        j = j + 1
+    }
+    let ok = max_d == 0.0
+    println("  [T5] max|Δ| across two stream_consensus runs = " + str(max_d))
+    return ok
+}
+
+fn test() {
+    println("[anima-physics/phi_substrate_consensus] PHYS-P4-4 — 5-substrate Φ consensus")
+    println("  photonic / memristor / quantum / oscillator / thermo — software-sim only (no HW launch)")
+    println("")
+
+    let t1 = check_T1_contract()
+    if t1 { println("T1 PASS — substrate_phi finite for ids 0..4 + stream length matches") } else { println("T1 FAIL") }
+
+    let t2 = check_T2_monotonicity()
+    if t2 { println("T2 PASS — Φ_consensus monotonically rises with stimulus amplitude") } else { println("T2 FAIL") }
+
+    let t3 = check_T3_disagreement_budget()
+    if t3 { println("T3 PASS — stuck substrate raises disagreement_max ≥ 0.05 + drift ≤ 0.10") } else { println("T3 FAIL") }
+
+    let t4 = check_T4_robust_beats_naive_on_outlier()
+    if t4 { println("T4 PASS — robust_fuse beats naive precision mean on 10× outlier") } else { println("T4 FAIL") }
+
+    let t5 = check_T5_determinism()
+    if t5 { println("T5 PASS — stream_consensus deterministic (no hidden state)") } else { println("T5 FAIL") }
+
+    println("")
+    let all = t1 && t2 && t3 && t4 && t5
+    if all {
+        println("[anima-physics/phi_substrate_consensus] 5/5 PASS — PHYS-P4-4 DONE")
+    } else {
+        println("[anima-physics/phi_substrate_consensus] SOME FAILED")
+    }
+}
+
+test()

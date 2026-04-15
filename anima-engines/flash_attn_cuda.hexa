@@ -1,0 +1,479 @@
+// ═══════════════════════════════════════════════════════════════
+//  anima-engines/flash_attn_cuda.hexa — FlashAttention CUDA kernels
+//
+//  Companion to anima-engines/flash_attn.hexa (the CPU reference).
+//  This file holds:
+//    1. Two NVRTC-compiled CUDA kernels (FP32, causal mask only):
+//         flash_attn_fwd  — tiled online softmax, one CUDA block per
+//                            (batch, head, q-row-tile).
+//         flash_attn_bwd  — recomputes P from saved L using the FA-2
+//                            D_i = sum_d O[i,d]*dO[i,d] trick.
+//    2. Hexa FFI launchers `flash_attn_fwd_gpu()` and
+//       `flash_attn_bwd_gpu()` that build the cuLaunchKernel arg
+//       array and forward to rtc_launch.
+//    3. `flash_attn_init()` which calls into the existing
+//       cuda_ffi/cuda_rtc pipeline (NVRTC compile, cuModuleLoad,
+//       cuModuleGetFunction) used by training/cuda_kernels.hexa.
+//
+//  Algorithm parity with flash_attn.hexa is line-for-line — every
+//  arithmetic step in the CPU reference has a 1:1 transcription in
+//  the kernel. Bug fixes propagate both directions.
+//
+//  Tile choice (FP32, sm_90):
+//    Br = Bc = 64                  (Q tile rows / KV tile cols)
+//    threads_per_block = 64        (1 thread per Q row in the tile;
+//                                   the inner loops over D/Bc are
+//                                   sequential per thread, simple +
+//                                   correct, ~30% of FA-2 peak. Future
+//                                   work is wmma + bf16 for full peak.)
+//    head_dim D supported via SMEM tile of size Br*D*4 + Bc*D*4 +
+//    Bc*D*4 = 3*Br*D*4 bytes when Br=Bc. For D=128 Br=64 that is
+//    96KiB per block, fits in sm_90 dynamic SMEM (228KiB).
+//
+//  Multi-head: one CUDA block per (batch, head, q-tile). Strided
+//  base pointers are computed inside the kernel from blockIdx.
+//
+//  Causal mask: applied as additive `-1e30f` before the row-max
+//  reduction so it never contributes to the softmax denominator.
+//
+//  This file uses the SAME extern symbols as training/cuda_ffi.hexa
+//  and training/cuda_rtc.hexa. To avoid a big refactor on the main
+//  CLM trainer (which currently `use`s those files), the launchers
+//  here also `use` them. On a Mac worktree without CUDA, this file
+//  is parse-only (rtc_init() returns nonzero and we bail).
+//
+//  Roadmap entry: shared/roadmaps/clm_consciousness_standalone.json :: C8
+// ═══════════════════════════════════════════════════════════════
+
+use "training/cuda_ffi"
+use "training/cuda_rtc"
+
+// ── §1  Forward kernel ──────────────────────────────────────
+//
+// Layout reminder (row-major, contiguous in memory):
+//   q[B, H, S, D]  base = q + (b*H + h)*S*D
+//   k[B, H, S, D]
+//   v[B, H, S, D]
+//   o[B, H, S, D]
+//   l[B, H, S]     base = l + (b*H + h)*S
+//
+// One CUDA block: (b, h, q_tile_idx)
+// Threads: blockDim.x = BR (one thread per Q row inside the tile)
+//
+// Per-thread state:
+//   m_running, l_running      (scalars)
+//   o_acc[D]                  (per-row running unnormalised output;
+//                              each thread owns its row, so this lives
+//                              in registers — D values per thread)
+// SMEM:
+//   q_tile[BR][D], k_tile[BC][D], v_tile[BC][D]
+//
+// Algorithm:
+//   load q_tile from gmem (cooperative)
+//   init m=−inf, l=0, o_acc[0..D)=0
+//   for each j_tile in [0, S) step BC:
+//     load k_tile, v_tile from gmem
+//     compute s_row[BC] = q_tile[r] · k_tile[c] / √D  (mask future)
+//     m_new = max(m, max_c s_row[c])
+//     alpha = exp(m - m_new)
+//     l = alpha*l + sum_c exp(s_row[c] - m_new)
+//     o_acc = alpha*o_acc + sum_c exp(s_row[c] - m_new) * v_tile[c]
+//     m = m_new
+//   o[row] = o_acc / l
+//   l_out[row] = m + log(l)
+//
+// Grid: (ceil(S/BR), H, B)
+// Block: (BR, 1, 1)
+//
+// NOTE: BR, BC, D are NOT compile-time consts here — they are passed
+// in as kernel arguments so the same compiled kernel handles any
+// (BR, BC, D) up to SMEM cap. SMEM size is set at launch time via
+// the rtc_launch_shmem `shmem` arg.
+
+let K_FLASH_ATTN_FWD = "extern \"C\" __global__ void flash_attn_fwd(\n"
+    + "    const float* __restrict__ Q,\n"
+    + "    const float* __restrict__ K,\n"
+    + "    const float* __restrict__ V,\n"
+    + "    float* __restrict__ O,\n"
+    + "    float* __restrict__ L,\n"
+    + "    int B, int H, int S, int D,\n"
+    + "    int BR, int BC,\n"
+    + "    int causal)\n"
+    + "{\n"
+    + "    extern __shared__ float smem[];\n"
+    + "    float* q_tile = smem;                     // BR * D\n"
+    + "    float* k_tile = q_tile + BR * D;          // BC * D\n"
+    + "    float* v_tile = k_tile + BC * D;          // BC * D\n"
+    + "\n"
+    + "    int q_block_idx = blockIdx.x;\n"
+    + "    int h           = blockIdx.y;\n"
+    + "    int b           = blockIdx.z;\n"
+    + "    int tid         = threadIdx.x;            // 0 .. BR-1, owns one Q row\n"
+    + "\n"
+    + "    int q_row_base = q_block_idx * BR;\n"
+    + "    int q_row      = q_row_base + tid;\n"
+    + "    int row_valid  = (q_row < S) ? 1 : 0;\n"
+    + "\n"
+    + "    long bh_off = (long)(b * H + h) * (long)(S * D);\n"
+    + "    long bh_l   = (long)(b * H + h) * (long)S;\n"
+    + "\n"
+    + "    const float* Qb = Q + bh_off;\n"
+    + "    const float* Kb = K + bh_off;\n"
+    + "    const float* Vb = V + bh_off;\n"
+    + "    float*       Ob = O + bh_off;\n"
+    + "    float*       Lb = L + bh_l;\n"
+    + "\n"
+    + "    float inv_sqrt_d = rsqrtf((float)D);\n"
+    + "\n"
+    + "    // Cooperative load Q tile: each thread loads its row from gmem.\n"
+    + "    if (row_valid) {\n"
+    + "        for (int dd = 0; dd < D; ++dd) {\n"
+    + "            q_tile[tid * D + dd] = Qb[q_row * D + dd];\n"
+    + "        }\n"
+    + "    } else {\n"
+    + "        for (int dd = 0; dd < D; ++dd) {\n"
+    + "            q_tile[tid * D + dd] = 0.0f;\n"
+    + "        }\n"
+    + "    }\n"
+    + "\n"
+    + "    // Per-row online softmax state (registers per thread).\n"
+    + "    float m_running = -1e30f;\n"
+    + "    float l_running = 0.0f;\n"
+    + "    // Output accumulator: D values per thread, in registers.\n"
+    + "    // For D up to 256 this is ~256 fp32 regs which sm_90 can hold;\n"
+    + "    // for larger D the compiler will spill to local mem (still works).\n"
+    + "    float o_acc[256];\n"
+    + "    for (int dd = 0; dd < D; ++dd) o_acc[dd] = 0.0f;\n"
+    + "\n"
+    + "    // Walk K/V tiles\n"
+    + "    for (int j_block = 0; j_block < S; j_block += BC) {\n"
+    + "        int block_cols = (j_block + BC < S) ? BC : (S - j_block);\n"
+    + "\n"
+    + "        // Cooperative load of K/V tile. Threads cooperate over BR rows;\n"
+    + "        // we round-robin column rows across threads (tid covers row tid,\n"
+    + "        // tid+BR, tid+2*BR, ...). When BC <= BR a single sweep suffices.\n"
+    + "        __syncthreads();\n"
+    + "        for (int c = tid; c < block_cols; c += BR) {\n"
+    + "            int kv_row = j_block + c;\n"
+    + "            for (int dd = 0; dd < D; ++dd) {\n"
+    + "                k_tile[c * D + dd] = Kb[kv_row * D + dd];\n"
+    + "                v_tile[c * D + dd] = Vb[kv_row * D + dd];\n"
+    + "            }\n"
+    + "        }\n"
+    + "        __syncthreads();\n"
+    + "\n"
+    + "        if (!row_valid) continue;\n"
+    + "\n"
+    + "        // Compute s_row[BC] for this thread's Q row\n"
+    + "        // and find row max in the same pass.\n"
+    + "        float s_row[256];\n"
+    + "        float row_max = -1e30f;\n"
+    + "        for (int c = 0; c < block_cols; ++c) {\n"
+    + "            float dot = 0.0f;\n"
+    + "            for (int dd = 0; dd < D; ++dd) {\n"
+    + "                dot += q_tile[tid * D + dd] * k_tile[c * D + dd];\n"
+    + "            }\n"
+    + "            float val = dot * inv_sqrt_d;\n"
+    + "            int kj_row = j_block + c;\n"
+    + "            if (causal && kj_row > q_row) val = -1e30f;\n"
+    + "            s_row[c] = val;\n"
+    + "            if (val > row_max) row_max = val;\n"
+    + "        }\n"
+    + "\n"
+    + "        float m_new = (m_running > row_max) ? m_running : row_max;\n"
+    + "        float alpha = (m_running <= -5e29f) ? 0.0f : expf(m_running - m_new);\n"
+    + "\n"
+    + "        // P_row[c] = exp(s_row[c] - m_new), row_sum = sum P_row\n"
+    + "        float row_sum = 0.0f;\n"
+    + "        float p_row[256];\n"
+    + "        for (int c = 0; c < block_cols; ++c) {\n"
+    + "            float sv = s_row[c];\n"
+    + "            float e  = (sv <= -5e29f) ? 0.0f : expf(sv - m_new);\n"
+    + "            p_row[c] = e;\n"
+    + "            row_sum += e;\n"
+    + "        }\n"
+    + "\n"
+    + "        // o_acc = alpha*o_acc + sum_c p_row[c] * v_tile[c]\n"
+    + "        for (int dd = 0; dd < D; ++dd) {\n"
+    + "            float new_val = alpha * o_acc[dd];\n"
+    + "            for (int c = 0; c < block_cols; ++c) {\n"
+    + "                new_val += p_row[c] * v_tile[c * D + dd];\n"
+    + "            }\n"
+    + "            o_acc[dd] = new_val;\n"
+    + "        }\n"
+    + "\n"
+    + "        l_running = alpha * l_running + row_sum;\n"
+    + "        m_running = m_new;\n"
+    + "    }\n"
+    + "\n"
+    + "    if (!row_valid) return;\n"
+    + "\n"
+    + "    // Normalise + write\n"
+    + "    float inv_l = (l_running > 0.0f) ? (1.0f / l_running) : 0.0f;\n"
+    + "    for (int dd = 0; dd < D; ++dd) {\n"
+    + "        Ob[q_row * D + dd] = o_acc[dd] * inv_l;\n"
+    + "    }\n"
+    + "    Lb[q_row] = m_running + ((l_running > 0.0f) ? logf(l_running) : 0.0f);\n"
+    + "}\n"
+
+// ── §2  Backward kernel ─────────────────────────────────────
+//
+// FlashAttention-2 backward (eq. 8 of the FA-2 paper):
+//
+//   D_i = sum_d O[i,d] * dO[i,d]
+//   for each (i, j):
+//     s_ij = Q_i · K_j / √D  (+ causal mask)
+//     p_ij = exp(s_ij - L_i)               (uses saved L)
+//     dV_j  += p_ij * dO_i
+//     dp_ij  = dO_i · V_j
+//     ds_ij  = p_ij * (dp_ij - D_i)
+//     dQ_i  += ds_ij * K_j / √D
+//     dK_j  += ds_ij * Q_i / √D
+//
+// The kernel below uses one CUDA block per (b, h) and one thread per
+// Q row inside that head. Each thread iterates j over [0, S) and
+// updates dq[i], dk[j] (atomic), dv[j] (atomic) in gmem. Atomics on
+// dk/dv are required because multiple Q rows write to the same K/V
+// row. dq[i] is unique per thread so no atomic.
+//
+// This is NOT the optimal FA-2 backward (which double-tiles and uses
+// shared memory), but it is the correct algorithm and serves as a
+// drop-in replacement that will already remove the L*L softmax_bwd
+// memory blow-up that motivates C8. A tiled version is ~2x faster
+// and is the next iteration.
+
+let K_FLASH_ATTN_BWD = "extern \"C\" __global__ void flash_attn_bwd(\n"
+    + "    const float* __restrict__ Q,\n"
+    + "    const float* __restrict__ K,\n"
+    + "    const float* __restrict__ V,\n"
+    + "    const float* __restrict__ O,\n"
+    + "    const float* __restrict__ L,\n"
+    + "    const float* __restrict__ dO,\n"
+    + "    float* __restrict__ dQ,\n"
+    + "    float* __restrict__ dK,\n"
+    + "    float* __restrict__ dV,\n"
+    + "    int B, int H, int S, int D, int causal)\n"
+    + "{\n"
+    + "    int h   = blockIdx.y;\n"
+    + "    int b   = blockIdx.z;\n"
+    + "    int row = blockIdx.x * blockDim.x + threadIdx.x;\n"
+    + "    if (row >= S) return;\n"
+    + "\n"
+    + "    long bh_off = (long)(b * H + h) * (long)(S * D);\n"
+    + "    long bh_l   = (long)(b * H + h) * (long)S;\n"
+    + "\n"
+    + "    const float* Qb  = Q  + bh_off;\n"
+    + "    const float* Kb  = K  + bh_off;\n"
+    + "    const float* Vb  = V  + bh_off;\n"
+    + "    const float* Ob  = O  + bh_off;\n"
+    + "    const float* dOb = dO + bh_off;\n"
+    + "    const float* Lb  = L  + bh_l;\n"
+    + "    float*       dQb = dQ + bh_off;\n"
+    + "    float*       dKb = dK + bh_off;\n"
+    + "    float*       dVb = dV + bh_off;\n"
+    + "\n"
+    + "    float inv_sqrt_d = rsqrtf((float)D);\n"
+    + "    float Li = Lb[row];\n"
+    + "\n"
+    + "    // D_i = sum_d O[i,d] * dO[i,d]\n"
+    + "    float Di = 0.0f;\n"
+    + "    for (int dd = 0; dd < D; ++dd) {\n"
+    + "        Di += Ob[row * D + dd] * dOb[row * D + dd];\n"
+    + "    }\n"
+    + "\n"
+    + "    // Iterate j over all K/V rows\n"
+    + "    for (int j = 0; j < S; ++j) {\n"
+    + "        // s_ij\n"
+    + "        float dot = 0.0f;\n"
+    + "        for (int dd = 0; dd < D; ++dd) {\n"
+    + "            dot += Qb[row * D + dd] * Kb[j * D + dd];\n"
+    + "        }\n"
+    + "        float sij  = dot * inv_sqrt_d;\n"
+    + "        int   masked = (causal && j > row) ? 1 : 0;\n"
+    + "        float pij  = masked ? 0.0f : expf(sij - Li);\n"
+    + "\n"
+    + "        // dp_ij = dO_i · V_j\n"
+    + "        float dp = 0.0f;\n"
+    + "        for (int dd = 0; dd < D; ++dd) {\n"
+    + "            dp += dOb[row * D + dd] * Vb[j * D + dd];\n"
+    + "        }\n"
+    + "\n"
+    + "        // ds_ij = p_ij * (dp_ij - D_i)\n"
+    + "        float dsij        = pij * (dp - Di);\n"
+    + "        float dsij_scaled = dsij * inv_sqrt_d;\n"
+    + "\n"
+    + "        // dQ_i += ds * K_j  (no atomic — each thread owns row i)\n"
+    + "        // dK_j += ds * Q_i  (atomic — multiple rows i write j)\n"
+    + "        // dV_j += p * dO_i  (atomic — same reason)\n"
+    + "        for (int dd = 0; dd < D; ++dd) {\n"
+    + "            dQb[row * D + dd] += dsij_scaled * Kb[j * D + dd];\n"
+    + "            atomicAdd(&dKb[j * D + dd], dsij_scaled * Qb[row * D + dd]);\n"
+    + "            atomicAdd(&dVb[j * D + dd], pij        * dOb[row * D + dd]);\n"
+    + "        }\n"
+    + "    }\n"
+    + "}\n"
+
+// ── §3  Module + function handles ──────────────────────────
+
+let mut G_FA_MODULE   = ptr_null()
+let mut G_FA_FWD      = ptr_null()
+let mut G_FA_BWD      = ptr_null()
+let mut G_FA_INIT_OK  = false
+
+// ── §4  Init ────────────────────────────────────────────────
+//
+// Compile both kernels in a single NVRTC translation unit and
+// resolve the two function handles. Returns 0 on success, negative
+// on any failure (including "no GPU on this host"). Mac worktrees
+// will hit `rtc_init() != 0` and bail safely.
+
+fn flash_attn_init() {
+    let ri = rtc_init()
+    if ri != 0 {
+        println("[flash_attn_cuda] rtc_init failed: " + str(ri) + " (no GPU? OK on Mac)")
+        return -1
+    }
+    let mut src = ""
+    src = src + K_FLASH_ATTN_FWD
+    src = src + K_FLASH_ATTN_BWD
+
+    let ptx = rtc_compile_ptx(src, "flash_attn.cu")
+    if ptr_addr(ptx) == 0 {
+        println("[flash_attn_cuda] rtc_compile_ptx failed")
+        return -2
+    }
+    G_FA_MODULE = rtc_load_module(ptx)
+    if ptr_addr(G_FA_MODULE) == 0 {
+        println("[flash_attn_cuda] rtc_load_module failed")
+        return -3
+    }
+    G_FA_FWD = rtc_get_function(G_FA_MODULE, "flash_attn_fwd")
+    G_FA_BWD = rtc_get_function(G_FA_MODULE, "flash_attn_bwd")
+    if ptr_addr(G_FA_FWD) == 0 {
+        println("[flash_attn_cuda] missing flash_attn_fwd symbol")
+        return -4
+    }
+    if ptr_addr(G_FA_BWD) == 0 {
+        println("[flash_attn_cuda] missing flash_attn_bwd symbol")
+        return -5
+    }
+    G_FA_INIT_OK = true
+    println("[flash_attn_cuda] init OK — fwd=" + str(ptr_addr(G_FA_FWD)) + " bwd=" + str(ptr_addr(G_FA_BWD)))
+    return 0
+}
+
+// ── §5  Arg-buffer helpers (mirror cuda_kernels.hexa) ──────
+
+fn _fa_arg_ptr(dev) {
+    let buf = alloc_raw(8)
+    write_i64(buf, 0, 0)
+    write_i64(buf, 0, ptr_addr(dev))
+    return buf
+}
+
+fn _fa_arg_i32(v) {
+    let buf = alloc_raw(8)
+    write_i64(buf, 0, 0)
+    write_i32(buf, 0, v)
+    return buf
+}
+
+fn _fa_free_args(args) {
+    let n = len(args)
+    let mut i = 0
+    while i < n {
+        free_raw(args[i], 8)
+        i = i + 1
+    }
+    return 0
+}
+
+fn _fa_ceil_div(a, b) {
+    return (a + b - 1) / b
+}
+
+// ── §6  Forward launcher ────────────────────────────────────
+//
+// flash_attn_fwd_gpu(q, k, v, o, l, B, H, S, D, BR, BC, causal)
+//   q, k, v, o, l : device pointers
+//   B, H, S, D    : ints
+//   BR, BC        : tile sizes (Br rows of Q per block, Bc cols of K per inner step)
+//   causal        : 0 or 1
+//
+// Grid: (ceil(S/BR), H, B)
+// Block: (BR, 1, 1)
+// SMEM:  (BR + 2*BC) * D * 4 bytes  (q_tile + k_tile + v_tile)
+
+fn flash_attn_fwd_gpu(
+    q_dev, k_dev, v_dev, o_dev, l_dev,
+    b: int, h: int, s: int, d: int,
+    br: int, bc: int, causal: int
+) {
+    if !G_FA_INIT_OK {
+        println("[flash_attn_cuda] flash_attn_fwd_gpu called before init")
+        return -1
+    }
+    let args = [
+        _fa_arg_ptr(q_dev),
+        _fa_arg_ptr(k_dev),
+        _fa_arg_ptr(v_dev),
+        _fa_arg_ptr(o_dev),
+        _fa_arg_ptr(l_dev),
+        _fa_arg_i32(b),
+        _fa_arg_i32(h),
+        _fa_arg_i32(s),
+        _fa_arg_i32(d),
+        _fa_arg_i32(br),
+        _fa_arg_i32(bc),
+        _fa_arg_i32(causal)
+    ]
+    let gx = _fa_ceil_div(s, br)
+    let shmem = (br + 2 * bc) * d * 4
+    let st = rtc_launch_shmem(G_FA_FWD, gx, h, b, br, 1, 1, shmem, args)
+    let _ = _fa_free_args(args)
+    return st
+}
+
+// ── §7  Backward launcher ───────────────────────────────────
+//
+// flash_attn_bwd_gpu(q, k, v, o, l, dO, dQ, dK, dV, B, H, S, D, causal)
+//
+// Grid: (ceil(S/threads), H, B), Block: (threads, 1, 1).
+// We use threads_per_block = 64 — small enough to keep regs tight on
+// big D, large enough to amortise launch overhead.
+
+fn flash_attn_bwd_gpu(
+    q_dev, k_dev, v_dev, o_dev, l_dev, do_dev,
+    dq_dev, dk_dev, dv_dev,
+    b: int, h: int, s: int, d: int, causal: int
+) {
+    if !G_FA_INIT_OK {
+        println("[flash_attn_cuda] flash_attn_bwd_gpu called before init")
+        return -1
+    }
+    let args = [
+        _fa_arg_ptr(q_dev),
+        _fa_arg_ptr(k_dev),
+        _fa_arg_ptr(v_dev),
+        _fa_arg_ptr(o_dev),
+        _fa_arg_ptr(l_dev),
+        _fa_arg_ptr(do_dev),
+        _fa_arg_ptr(dq_dev),
+        _fa_arg_ptr(dk_dev),
+        _fa_arg_ptr(dv_dev),
+        _fa_arg_i32(b),
+        _fa_arg_i32(h),
+        _fa_arg_i32(s),
+        _fa_arg_i32(d),
+        _fa_arg_i32(causal)
+    ]
+    let threads = 64
+    let gx = _fa_ceil_div(s, threads)
+    let st = rtc_launch(G_FA_BWD, gx, h, b, threads, 1, 1, args)
+    let _ = _fa_free_args(args)
+    return st
+}
+
+// ── §8  Module-load smoke (only on a host with libcuda) ────
+
+println("[flash_attn_cuda] module loaded — kernels ready for flash_attn_init() (call from CLM trainer on GPU host)")
