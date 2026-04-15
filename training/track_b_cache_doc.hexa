@@ -1,0 +1,176 @@
+// shared/docs/track_b_cache.hexa — Track B offline Φ-cache documentation
+//
+// ═══════════════════════════════════════════════════════════════════
+//  TRACK B: OFFLINE Φ EMBEDDING CACHE (v1)
+// ───────────────────────────────────────────────────────────────────
+//  Purpose:  Replace online ~27.5 s/step sweep over ~85 phi_* engines
+//            with microsecond O(1) hash-map lookup into a pre-built
+//            {state_hash → 110-float embedding} table.
+//
+//  Owner:    CLM Track B (closed-loop pipeline verification team)
+//  Status:   v1 smoke-tested 2026-04-15 (10 held-out synth states)
+//  Schema:   v1 (increment on any lens change, store next file as
+//            phi_cache_v2.jsonl etc.)
+//
+// ═══════════════════════════════════════════════════════════════════
+//  FILE LAYOUT
+// ───────────────────────────────────────────────────────────────────
+//    generator :  training/generate_phi_cache.hexa
+//    cache     :  shared/state/phi_cache_v1.jsonl      <- live artifact
+//    doc       :  shared/docs/track_b_cache.hexa       <- this file
+//
+// ═══════════════════════════════════════════════════════════════════
+//  ENGINE DISCOVERY SUMMARY
+// ───────────────────────────────────────────────────────────────────
+//  A codebase sweep on 2026-04-15 across anima-measurement/,
+//  anima-hexad/, anima-engines/, anima-core/, modules/, training/,
+//  anima-body/, anima-physics/, experiments/, ready/anima/ surfaced
+//  approximately 73 unique live phi_* functions plus ~12 close
+//  aliases, for an effective count of ~85 (not the 110 cited in the
+//  original Track B note — 110 is the embedding DIMENSION target).
+//
+//  See §ENGINE INVENTORY in training/generate_phi_cache.hexa for
+//  the full per-directory breakdown.
+//
+//  Because 85 ≠ 110, the generator uses a fixed-schema 20-LENS ×
+//  6-FANOUT = 120 projection scheme (trimmed to the first 110
+//  slots). Each lens distills one of the mathematical families
+//  (proxy, kl, holo, temporal, reflexive, spectral, gwt, frustration,
+//  embodied, narrative, meta, dream, will, affect, create, quantum,
+//  social, materialism, composite, byte) found across the 85 engines.
+//
+// ═══════════════════════════════════════════════════════════════════
+//  CACHE FORMAT (v1)
+// ───────────────────────────────────────────────────────────────────
+//  JSONL — one JSON object per line. Keys:
+//
+//    state_id     int              zero-based row index
+//    schema       string           "v1" (forward-compat guard)
+//    state_hash   string           "poly64:<signed int>"
+//    embedding    array<float>     exactly 110 floats
+//
+//  Example line (truncated):
+//    {"state_id":0,"schema":"v1","state_hash":"poly64:-3702653413726045",
+//     "embedding":[0.0988,0.00822,0.224,...,0.744]}
+//
+//  Hash algorithm:  polynomial rolling hash with base = 1315423911
+//                   and modulus = 9007199254740881, seeded at
+//                   FNV64 offset 1469598103934665603. Quantizes each
+//                   float to 1e-6 precision before absorbing.
+//
+//  Determinism:     BASE_SEED = 424242 drives state synthesis.
+//                   LENS_SEED = 110110 drives per-slot coefficients.
+//                   Running the generator twice on the same commit
+//                   produces byte-identical output.
+//
+// ═══════════════════════════════════════════════════════════════════
+//  RUN INSTRUCTIONS
+// ───────────────────────────────────────────────────────────────────
+//  Smoke (N=10, ~1 s on M1):
+//    cd <anima-root>
+//    hexa run training/generate_phi_cache.hexa
+//
+//  Full cohort (N=1000+):
+//    Edit training/generate_phi_cache.hexa and bump
+//      let DEFAULT_N_SMOKE = 10
+//    to the desired cohort size (e.g. 1000, 5000, 10000), then
+//      hexa run training/generate_phi_cache.hexa
+//
+//    argv plumbing is deferred because the current hexa build's
+//    argv() behavior varies across stage0/stage1/native interpreters
+//    (see project_session_20260413_stage0_rebuild.md). Editing the
+//    constant is a two-second change and makes N explicit in git.
+//
+//  Output is written to shared/state/phi_cache_v1.jsonl, overwriting
+//  any existing file. (v2+ will use versioned filenames for
+//  forward compatibility once CLM train loop starts reading the
+//  cache in anger.)
+//
+// ═══════════════════════════════════════════════════════════════════
+//  VERIFICATION CHECKLIST
+// ───────────────────────────────────────────────────────────────────
+//  After generation, confirm:
+//
+//    1. File exists:
+//         shared/state/phi_cache_v1.jsonl
+//
+//    2. Line count matches N:
+//         wc -l shared/state/phi_cache_v1.jsonl
+//
+//    3. Each line parses as JSON with a 110-element embedding:
+//         python3 -c "import json; [print(len(json.loads(l)['embedding']))
+//                      for l in open('shared/state/phi_cache_v1.jsonl')]"
+//         # should print "110" N times
+//
+//    4. All state_hashes are distinct:
+//         python3 -c "import json; hs=[json.loads(l)['state_hash']
+//                      for l in open('shared/state/phi_cache_v1.jsonl')];
+//                      print(len(set(hs)), '==', len(hs))"
+//
+//    5. Generator is deterministic (two runs produce identical bytes):
+//         hexa run training/generate_phi_cache.hexa
+//         md5sum shared/state/phi_cache_v1.jsonl
+//         hexa run training/generate_phi_cache.hexa
+//         md5sum shared/state/phi_cache_v1.jsonl
+//         # checksums must match
+//
+// ═══════════════════════════════════════════════════════════════════
+//  CONSUMER INTERFACE (for train_clm.hexa integration)
+// ───────────────────────────────────────────────────────────────────
+//  train_clm.hexa should:
+//
+//    1. On boot, read_file(shared/state/phi_cache_v1.jsonl), parse
+//       each line once, and build an in-memory map
+//       state_hash_string -> 110-element embedding array.
+//
+//    2. In the hot loop, for each training state, compute the
+//       same poly_hash() as the generator, look up the embedding,
+//       and splice it into the model's Φ-aware loss/gate.
+//
+//    3. Cache-miss fallback: fall back to the online phi_proxy path
+//       (anima-core/phi_engine.hexa) and log the miss rate. Target
+//       miss rate for production: < 0.1 % (i.e. held-out cohort
+//       covers > 99.9 % of real training states).
+//
+//    4. NOTE on schema versioning: always check the "schema" field
+//       on each line at load time. If schema != "v1", refuse to
+//       use the cache and fall back to online computation — a
+//       stale/mismatched cache is worse than no cache.
+//
+// ═══════════════════════════════════════════════════════════════════
+//  WHY "TRACK B" WHEN TRACK C PoC ALREADY HIT -53 %?
+// ───────────────────────────────────────────────────────────────────
+//  Track C (PBV list-copy elimination) gives a constant-factor
+//  speedup on the online path. Track B is architecturally different:
+//  it converts an O(engines × cells × d) per-step cost to an O(1)
+//  per-step lookup, independent of engine count. The two tracks
+//  compose — Track C is still relevant for cache-miss fallback and
+//  for the offline generation itself on large cohorts.
+//
+//  Track B wins at steady state; Track C wins at warm-up / cache
+//  miss. Production CLM uses both.
+//
+// ═══════════════════════════════════════════════════════════════════
+
+// Tiny verification stub — run `hexa run shared/docs/track_b_cache.hexa`
+// to sanity-check the cache file exists and is readable.
+fn main() {
+    let path = "shared/state/phi_cache_v1.jsonl"
+    let text = read_file(path)
+    let n = len(text)
+    if n == 0 {
+        println("[track-b-doc] cache missing: " + path)
+        println("[track-b-doc]   run: hexa run training/generate_phi_cache.hexa")
+        return
+    }
+    let mut nl = 0
+    let mut i = 0
+    while i < n {
+        let ch = text.substring(i, i + 1)
+        if ch == "\n" { nl = nl + 1 }
+        i = i + 1
+    }
+    println("[track-b-doc] OK — " + path + " has " + to_string(nl) + " lines")
+}
+
+main()
