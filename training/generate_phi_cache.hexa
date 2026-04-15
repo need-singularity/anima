@@ -1,0 +1,855 @@
+// training/generate_phi_cache.hexa — Track B offline Φ-cache generator
+//
+// ═══════════════════════════════════════════════════════════════════
+//  WHY THIS FILE EXISTS
+// ───────────────────────────────────────────────────────────────────
+//  CLM training's hot loop needs a 110-D Φ embedding per forward step
+//  but a full online sweep of all ~85 discovered phi_* engines costs
+//  ~27.5 s / step. Track C (PBV fix) shaved -53 % in a PoC, but the
+//  architectural win is to pre-compute the embedding for a held-out
+//  state cohort once, then have train_clm.hexa do a microsecond
+//  O(1) map lookup by {state_hash → 110-float vector}.
+//
+//  Deliverable: shared/state/phi_cache_v1.jsonl  (JSONL, one line /state)
+//
+// ═══════════════════════════════════════════════════════════════════
+//  ENGINE INVENTORY (discovered 2026-04-15, commit-time snapshot)
+// ───────────────────────────────────────────────────────────────────
+//  Searched: anima-measurement/, anima-hexad/, anima-engines/,
+//            anima-core/, modules/, training/, anima-body/,
+//            anima-physics/, experiments/, ready/anima/.
+//
+//  De-duped (live .hexa, stubs/returning-string-bench excluded):
+//    anima-core             : 4   (phi_proxy, phi_byte, phi_ratio, phi_engine)
+//    anima-engines          : 22  (q_proxy, axis, composite, module,
+//                                   norm, refl, social×2, archetype,
+//                                   collective, freeze/thaw×4, holo,
+//                                   metaphysics×4, propagation,
+//                                   holo_window, mi_holo, v2_hidden)
+//    training/phi_*         : 25  (affect+bd, will+bd, metric,
+//                                   create+bd, time+bd+ratio,
+//                                   auto+base+bd, narrative,
+//                                   reflexive+ratio, embodied+bd
+//                                   +from_tuples+ratio, meta+bd,
+//                                   dream+bd, gwt+ratio, holographic
+//                                   +baseline, quantum_forward×2)
+//    training/clm_* loops   :  4  (phi_holo, phi_refl, alm_gen,
+//                                   alm_self_weight)
+//    training/alm_hive      :  2  (phi_individual, phi_collective)
+//    anima-body/physics     :  4  (holographic_body, closed_loop_phi,
+//                                   holo_window, mi_holo)
+//    anima-measurement      :  3  (phi_iit, estimate_phi, measure_phi_rs)
+//    anima-hexad            :  2  (w_phi_refl, measure_phi_c)
+//    modules/decoder        :  1  (phi_proxy seq/d)
+//    experiments/*          :  4  (iit_compute, byte, volatility,
+//                                   run_b5_phi_only)
+//    anima-measurement      :  2  (phi_coeff, phi_exponent)
+//  ─────────────────────────────
+//    TOTAL DISCOVERED       : ~73 unique + ~12 close-aliases ≈ 85
+//
+//  Target dimensionality: 110 (per task spec).
+//  Strategy: compute 20 in-file PRIMITIVE LENSES (proxy, kl, holo,
+//  temporal, reflexive, spectral, gwt, frustration, embodied, mi,
+//  narrative, meta, quantum, social, create, affect, will, dream,
+//  embodied_delta, composite) then project each lens through N=6
+//  fixed seeded weights (20 × 6 = 120), trim to the first 110 slots.
+//  This gives a stable, deterministic, engine-mixture-style embedding
+//  whose slot index is frozen by ENGINE_SLOT_MAP below. When new
+//  real engines land, swap a slot's computation without breaking
+//  the cache schema version.
+//
+// ═══════════════════════════════════════════════════════════════════
+//  CACHE FORMAT (v1)
+// ───────────────────────────────────────────────────────────────────
+//  One JSON line per state:
+//    {"state_id":0,"schema":"v1","state_hash":"poly64:...","embedding":[<110 floats>]}
+//
+//  Schema version: v1. Increment + new filename on any lens change.
+//
+// ═══════════════════════════════════════════════════════════════════
+//  DETERMINISM
+// ───────────────────────────────────────────────────────────────────
+//  Seeds:  BASE_SEED = 424242  (state synth)
+//          LENS_SEED = 110110  (lens projections)
+//  The Xorshift RNG below is a pure hexa implementation — no calls
+//  into nn_core tensor_randn (which would force import of that
+//  module's startup prints).
+//
+// ═══════════════════════════════════════════════════════════════════
+//
+// Run:
+//   hexa run training/generate_phi_cache.hexa            # smoke N=10
+//   (full run: edit DEFAULT_N_SMOKE or wrap; argv plumbing deferred)
+//
+// Output: shared/state/phi_cache_v1.jsonl  (overwritten each run)
+//
+// ═══════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════
+// §0  CONFIG
+// ═══════════════════════════════════════════════════════════════════
+
+let CACHE_PATH    = "shared/state/phi_cache_v1.jsonl"
+let CACHE_SCHEMA  = "v1"
+let EMBED_DIM     = 110
+let N_LENSES      = 20
+let LENS_FANOUT   = 6         // 20 * 6 = 120 projections, we take first 110
+let STATE_LEN     = 64        // synthetic state vector length
+let BASE_SEED     = 424242
+let LENS_SEED     = 110110
+let DEFAULT_N_SMOKE = 10
+
+
+// ═══════════════════════════════════════════════════════════════════
+// §1  PURE LCG RNG (no bitwise ops — current hexa parser rejects
+// ═══════════════════════════════════════════════════════════════════
+//      <<, >>, ^, & in some tokens paths. LCG is sufficient for a
+//      deterministic cache-key PRNG.)
+//
+// We carry the state in a one-element list so mutation persists
+// across calls (hexa list index-write is pass-by-heap-ref —
+// verified 2026-04-15).
+
+let LCG_MOD = 2147483647           // 2^31 - 1, Mersenne prime
+let LCG_A   = 48271                // Park-Miller multiplier
+let LCG_C   = 0                    // pure multiplicative
+
+fn rng_new(seed: int) -> array {
+    let mut s = seed
+    // Fold negatives and zero into a valid seed range [1, MOD-1]
+    if s < 0 { s = 0 - s }
+    s = s % LCG_MOD
+    if s == 0 { s = 305419896 % LCG_MOD }
+    let mut r = []
+    r = r.push(s)
+    return r
+}
+
+// Advance RNG once, return float in (-1.0, 1.0). Mutates rng[0].
+fn fxrand(rng: array) -> float {
+    let x = rng[0]
+    let next = (x * LCG_A) % LCG_MOD
+    rng[0] = next
+    let denom = 1073741823.0       // ~2^30
+    return to_float(next) / denom - 1.0
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+// §2  MATH HELPERS (self-contained; no nn_core import)
+// ═══════════════════════════════════════════════════════════════════
+
+fn vabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn vmax(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+fn vmin(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn vmin_int(a: int, b: int) -> int {
+    if a < b { return a }
+    return b
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_mean(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + v[i]
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+fn vec_var(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let m = vec_mean(v)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let d = v[i] - m
+        s = s + d * d
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+fn vec_l2(v: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < len(v) {
+        s = s + v[i] * v[i]
+        i = i + 1
+    }
+    return sqrt(s)
+}
+
+fn vec_l1(v: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < len(v) {
+        s = s + vabs(v[i])
+        i = i + 1
+    }
+    return s
+}
+
+fn vec_dot(a: array, b: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    let la = len(a)
+    let lb = len(b)
+    while i < la && i < lb {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+// Cheap sin (Taylor, 5 terms)
+fn sin_approx(x: float) -> float {
+    let two_pi = 6.283185307179586
+    let pi = 3.141592653589793
+    let mut t = x
+    while t > pi   { t = t - two_pi }
+    while t < 0.0 - pi { t = t + two_pi }
+    let t2 = t * t
+    let t3 = t2 * t
+    let t5 = t3 * t2
+    let t7 = t5 * t2
+    let t9 = t7 * t2
+    return t - t3 / 6.0 + t5 / 120.0 - t7 / 5040.0 + t9 / 362880.0
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+// §3  STATE SYNTHESIS (deterministic)
+// ═══════════════════════════════════════════════════════════════════
+
+fn synth_state(state_id: int, n: int) -> array {
+    let rng = rng_new(BASE_SEED + state_id * 9973)
+    let mut v = []
+    let mut i = 0
+    while i < n {
+        let r = fxrand(rng)
+        let r2 = fxrand(rng)
+        let gauss = (r + r2) * 0.5
+        let phase = to_float(i) * 0.1 + to_float(state_id) * 0.037
+        let shaped = gauss + 0.5 * sin_approx(phase)
+        v = v.push(shaped)
+        i = i + 1
+    }
+    return v
+}
+
+// Polynomial rolling hash (no bitwise ops).
+//   h' = (h * BASE + chunk) % MOD
+// BASE/MOD are a well-known 64-bit pair for low collision rate
+// over <~2^20 keys. Quantized to 1e-6 precision on floats so
+// deterministic structurally-identical states collide by design.
+fn poly_hash(v: array) -> string {
+    let mut h = 1469598103934665603    // FNV64 offset (used as seed)
+    let base = 1315423911              // 32-bit mid-range prime
+    let hmod = 9007199254740881        // 2^53-ish — fits hexa ints safely
+    let mut i = 0
+    while i < len(v) {
+        let q = to_int(v[i] * 1000000.0)
+        // Fold q's sign cleanly
+        let mut qf = q
+        if qf < 0 { qf = 0 - qf }
+        // Mix high and low halves without shifts (use divmod)
+        let lo = qf % 65536
+        let hi = qf / 65536
+        h = (h * base + lo) % hmod
+        h = (h * base + hi) % hmod
+        // Absorb position index so reordering changes hash
+        h = (h * base + i) % hmod
+        i = i + 1
+    }
+    // Strictly positive, fits str() cleanly
+    return "poly64:" + to_string(h)
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+// §4  TWENTY PRIMITIVE LENSES
+// ═══════════════════════════════════════════════════════════════════
+// Each lens takes the STATE_LEN-float state and returns one scalar.
+// The 20 lenses distill the mathematical families observed across
+// the ~85 discovered phi_* engines:
+//
+//  0  phi_proxy     — global_var − bipartition_var  (anima-core)
+//  1  phi_kl        — log(d) − H(softmax(|col|))     (training/phi_metric)
+//  2  phi_holo      — boundary/bulk MI surrogate     (clm_holographic)
+//  3  phi_refl      — self / self-hat consistency    (phi_reflexive)
+//  4  phi_temp      — past/now/future coherence      (phi_time)
+//  5  phi_gwt       — global-workspace spread        (phi_gwt)
+//  6  phi_frust     — anti-alignment count           (phi_engine)
+//  7  phi_spec      — spectral radius surrogate      (phi_engine)
+//  8  phi_embod     — action/sensorium delta         (phi_embodied)
+//  9  phi_narr      — episodic coherence             (phi_narrative)
+// 10  phi_meta      — tower level variance           (phi_meta)
+// 11  phi_dream     — reference matching             (phi_dream)
+// 12  phi_will      — will/action alignment          (phi_will)
+// 13  phi_affect    — emotion sequence entropy       (phi_affect)
+// 14  phi_create    — blend distance from parents    (phi_create)
+// 15  phi_quantum   — tubulin-style freq variance    (phi_quantum)
+// 16  phi_social    — self/other overlap             (phi_social)
+// 17  phi_mat       — materialism signature          (metaphysics)
+// 18  phi_comp      — composite qualia norm          (qualia_prim)
+// 19  phi_byte      — 4-partition byte Φ              (byte_emergence)
+
+fn lens_proxy(s: array) -> float {
+    let n = len(s)
+    let gv = vec_var(s)
+    let half = n / 2
+    let mut a = []
+    let mut b = []
+    let mut i = 0
+    while i < half {
+        a = a.push(s[i])
+        i = i + 1
+    }
+    while i < n {
+        b = b.push(s[i])
+        i = i + 1
+    }
+    let v1 = vec_var(a)
+    let v2 = vec_var(b)
+    return vmax(gv - (v1 + v2) * 0.5, 0.0)
+}
+
+fn lens_kl(s: array) -> float {
+    let n = len(s)
+    let mut total = 0.0
+    let mut i = 0
+    while i < n {
+        total = total + vabs(s[i]) + 0.000001
+        i = i + 1
+    }
+    let mut h = 0.0
+    i = 0
+    while i < n {
+        let p = (vabs(s[i]) + 0.000001) / total
+        if p > 0.0000001 {
+            h = h - p * log(p)
+        }
+        i = i + 1
+    }
+    return log(to_float(n)) - h
+}
+
+fn lens_holo(s: array) -> float {
+    let n = len(s)
+    let q = n / 4
+    let mut boundary = []
+    let mut bulk = []
+    let mut i = 0
+    while i < q {
+        boundary = boundary.push(s[i])
+        i = i + 1
+    }
+    while i < n {
+        bulk = bulk.push(s[i])
+        i = i + 1
+    }
+    let lb = vec_l2(boundary) + 0.0001
+    let lk = vec_l2(bulk) + 0.0001
+    let r = (lb * lb) / lk
+    return vmin(r, 4.0)
+}
+
+fn lens_refl(s: array) -> float {
+    let n = len(s)
+    let mut s_hat = []
+    let mut i = 0
+    while i < n {
+        let j = (i + 1) % n
+        s_hat = s_hat.push(s[j] * 0.9)
+        i = i + 1
+    }
+    let d = vec_dot(s, s_hat)
+    let la = vec_l2(s) + 0.0001
+    let lb = vec_l2(s_hat) + 0.0001
+    return d / (la * lb)
+}
+
+fn lens_temp(s: array) -> float {
+    let n = len(s)
+    let t = n / 3
+    let mut past = []
+    let mut now = []
+    let mut future = []
+    let mut i = 0
+    while i < t {
+        past = past.push(s[i])
+        i = i + 1
+    }
+    while i < 2 * t {
+        now = now.push(s[i])
+        i = i + 1
+    }
+    while i < n {
+        future = future.push(s[i])
+        i = i + 1
+    }
+    let mp = vec_mean(past)
+    let mn = vec_mean(now)
+    let mf = vec_mean(future)
+    let d1 = mn - mp
+    let d2 = mf - mn
+    return 0.0 - (d1 - d2) * (d1 - d2)
+}
+
+fn lens_gwt(s: array) -> float {
+    let n = len(s)
+    let g = 8
+    let mut group_energy = []
+    let mut i = 0
+    while i + g <= n {
+        let mut e = 0.0
+        let mut j = 0
+        while j < g {
+            e = e + s[i + j] * s[i + j]
+            j = j + 1
+        }
+        group_energy = group_energy.push(e)
+        i = i + g
+    }
+    let v = vec_var(group_energy)
+    return 1.0 / (1.0 + v)
+}
+
+fn lens_frust(s: array) -> float {
+    let n = len(s)
+    let mut anti = 0.0
+    let mut total = 0.0
+    let mut i = 0
+    while i + 1 < n {
+        let prod = s[i] * s[i + 1]
+        if prod < 0.0 { anti = anti + 1.0 }
+        total = total + 1.0
+        i = i + 1
+    }
+    if total == 0.0 { return 0.0 }
+    return anti / total
+}
+
+fn lens_spec(s: array) -> float {
+    let n = len(s)
+    let mut best = 0.0
+    let mut i = 0
+    while i < n {
+        let mut s_lag = 0.0
+        let mut j = 0
+        while j + i < n {
+            s_lag = s_lag + s[j] * s[j + i]
+            j = j + 1
+        }
+        let a = vabs(s_lag)
+        if a > best { best = a }
+        i = i + 1
+    }
+    return best / to_float(n)
+}
+
+fn lens_embod(s: array) -> float {
+    let n = len(s)
+    let mut d = 0.0
+    let mut total = 0.0
+    let mut i = 0
+    while i + 1 < n {
+        let a = s[i]
+        let b = s[i + 1]
+        d = d + a * b
+        total = total + vabs(a) * vabs(b) + 0.0001
+        i = i + 2
+    }
+    return d / total
+}
+
+fn lens_narr(s: array) -> float {
+    let n = len(s)
+    let stride = 8
+    let mut coh = 0.0
+    let mut n_ep = 0.0
+    let mut i = 0
+    while i + stride + stride <= n {
+        let mut dot = 0.0
+        let mut la = 0.0
+        let mut lb = 0.0
+        let mut j = 0
+        while j < stride {
+            dot = dot + s[i + j] * s[i + stride + j]
+            la = la + s[i + j] * s[i + j]
+            lb = lb + s[i + stride + j] * s[i + stride + j]
+            j = j + 1
+        }
+        let denom = sqrt(la + 0.0001) * sqrt(lb + 0.0001)
+        coh = coh + dot / denom
+        n_ep = n_ep + 1.0
+        i = i + stride
+    }
+    if n_ep == 0.0 { return 0.0 }
+    return coh / n_ep
+}
+
+fn lens_meta(s: array) -> float {
+    let n = len(s)
+    let levels = 4
+    let mut means = []
+    let mut lvl = 1
+    while lvl <= levels {
+        let wlen = (n * lvl) / levels
+        let mut sum = 0.0
+        let mut i = 0
+        while i < wlen {
+            sum = sum + s[i]
+            i = i + 1
+        }
+        means = means.push(sum / to_float(wlen))
+        lvl = lvl + 1
+    }
+    return sqrt(vec_var(means))
+}
+
+fn lens_dream(s: array) -> float {
+    let n = len(s)
+    let rng = rng_new(77777)
+    let mut best = 0.0 - 1.0
+    let mut ref_i = 0
+    while ref_i < 4 {
+        let mut dot = 0.0
+        let mut la = 0.0
+        let mut lb = 0.0
+        let mut i = 0
+        while i < n {
+            let r = fxrand(rng)
+            dot = dot + s[i] * r
+            la = la + s[i] * s[i]
+            lb = lb + r * r
+            i = i + 1
+        }
+        let denom = sqrt(la + 0.0001) * sqrt(lb + 0.0001)
+        let c = dot / denom
+        if c > best { best = c }
+        ref_i = ref_i + 1
+    }
+    return best
+}
+
+fn lens_will(s: array) -> float {
+    let n = len(s)
+    let half = n / 2
+    let mut d = 0.0
+    let mut la = 0.0
+    let mut lb = 0.0
+    let mut i = 0
+    while i < half {
+        d = d + s[i] * s[half + i]
+        la = la + s[i] * s[i]
+        lb = lb + s[half + i] * s[half + i]
+        i = i + 1
+    }
+    let denom = sqrt(la + 0.0001) * sqrt(lb + 0.0001)
+    return d / denom
+}
+
+fn lens_affect(s: array) -> float {
+    let n = len(s)
+    let mut bins = vec_zeros(8)
+    let mut total = 0.0
+    let mut i = 0
+    while i < n {
+        let idx_f = vabs(s[i]) * 4.0
+        let mut idx = to_int(idx_f)
+        if idx < 0 { idx = 0 }
+        if idx >= 8 { idx = 7 }
+        bins[idx] = bins[idx] + 1.0
+        total = total + 1.0
+        i = i + 1
+    }
+    if total == 0.0 { return 0.0 }
+    let mut h = 0.0
+    let mut b = 0
+    while b < 8 {
+        let p = bins[b] / total
+        if p > 0.00001 {
+            h = h - p * log(p)
+        }
+        b = b + 1
+    }
+    return h
+}
+
+fn lens_create(s: array) -> float {
+    let n = len(s)
+    let t = n / 3
+    let mut dist = 0.0
+    let mut i = 0
+    while i < t {
+        let blend = s[i]
+        let ai = s[t + i]
+        let bi = s[2 * t + i]
+        let mid = (ai + bi) * 0.5
+        dist = dist + (blend - mid) * (blend - mid)
+        i = i + 1
+    }
+    return sqrt(dist / to_float(t))
+}
+
+fn lens_quantum(s: array) -> float {
+    let n = len(s)
+    let w = 16
+    if n < w { return 0.0 }
+    let mut freqs = []
+    let mut i = 0
+    while i + w <= n {
+        let mut crossings = 0.0
+        let mut j = 1
+        while j < w {
+            if (s[i + j - 1] > 0.0 && s[i + j] < 0.0) || (s[i + j - 1] < 0.0 && s[i + j] > 0.0) {
+                crossings = crossings + 1.0
+            }
+            j = j + 1
+        }
+        freqs = freqs.push(crossings / to_float(w))
+        i = i + w
+    }
+    return vec_var(freqs)
+}
+
+fn lens_social(s: array) -> float {
+    let n = len(s)
+    let mut self_v = []
+    let mut other_v = []
+    let mut i = 0
+    while i < n {
+        if i % 2 == 0 {
+            self_v = self_v.push(s[i])
+        } else {
+            other_v = other_v.push(s[i])
+        }
+        i = i + 1
+    }
+    let m = vmin_int(len(self_v), len(other_v))
+    let mut d = 0.0
+    let mut la = 0.0
+    let mut lb = 0.0
+    let mut k = 0
+    while k < m {
+        d = d + self_v[k] * other_v[k]
+        la = la + self_v[k] * self_v[k]
+        lb = lb + other_v[k] * other_v[k]
+        k = k + 1
+    }
+    let denom = sqrt(la + 0.0001) * sqrt(lb + 0.0001)
+    return d / denom
+}
+
+fn lens_mat(s: array) -> float {
+    return vec_l1(s) / to_float(len(s))
+}
+
+fn lens_comp(s: array) -> float {
+    return vec_l2(s) / sqrt(to_float(len(s)))
+}
+
+fn lens_byte(s: array) -> float {
+    let n = len(s)
+    let p = 4
+    let sz = n / p
+    let mut means = []
+    let mut i = 0
+    while i < p {
+        let mut sum = 0.0
+        let mut j = 0
+        while j < sz {
+            sum = sum + s[i * sz + j]
+            j = j + 1
+        }
+        means = means.push(sum / to_float(sz))
+        i = i + 1
+    }
+    return vec_var(means)
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+// §5  LENS DISPATCH + 110-D EMBEDDING
+// ═══════════════════════════════════════════════════════════════════
+
+fn run_lens(lens_idx: int, state: array) -> float {
+    if lens_idx == 0  { return lens_proxy(state)   }
+    if lens_idx == 1  { return lens_kl(state)      }
+    if lens_idx == 2  { return lens_holo(state)    }
+    if lens_idx == 3  { return lens_refl(state)    }
+    if lens_idx == 4  { return lens_temp(state)    }
+    if lens_idx == 5  { return lens_gwt(state)     }
+    if lens_idx == 6  { return lens_frust(state)   }
+    if lens_idx == 7  { return lens_spec(state)    }
+    if lens_idx == 8  { return lens_embod(state)   }
+    if lens_idx == 9  { return lens_narr(state)    }
+    if lens_idx == 10 { return lens_meta(state)    }
+    if lens_idx == 11 { return lens_dream(state)   }
+    if lens_idx == 12 { return lens_will(state)    }
+    if lens_idx == 13 { return lens_affect(state)  }
+    if lens_idx == 14 { return lens_create(state)  }
+    if lens_idx == 15 { return lens_quantum(state) }
+    if lens_idx == 16 { return lens_social(state)  }
+    if lens_idx == 17 { return lens_mat(state)     }
+    if lens_idx == 18 { return lens_comp(state)    }
+    if lens_idx == 19 { return lens_byte(state)    }
+    return 0.0
+}
+
+fn slot_coeff(slot: int) -> float {
+    let rng = rng_new(LENS_SEED + slot * 31337)
+    let r = fxrand(rng)
+    return 1.0 + r * 0.5
+}
+
+fn slot_bias(slot: int) -> float {
+    let rng = rng_new(LENS_SEED + slot * 31337 + 1)
+    let r = fxrand(rng)
+    return r * 0.1
+}
+
+fn build_embedding(state: array) -> array {
+    let mut emb = []
+    let mut slot = 0
+    while slot < EMBED_DIM {
+        let lens_idx = slot / LENS_FANOUT
+        let raw = run_lens(lens_idx, state)
+        let c = slot_coeff(slot)
+        let b = slot_bias(slot)
+        emb = emb.push(raw * c + b)
+        slot = slot + 1
+    }
+    return emb
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+// §6  JSONL SERIALIZER
+// ═══════════════════════════════════════════════════════════════════
+
+fn embedding_to_json(e: array) -> string {
+    let mut s = "["
+    let n = len(e)
+    let mut i = 0
+    while i < n {
+        if i > 0 { s = s + "," }
+        s = s + str(e[i])
+        i = i + 1
+    }
+    s = s + "]"
+    return s
+}
+
+fn state_to_json_line(state_id: int, hash: string, emb: array) -> string {
+    let mut line = "{\"state_id\":"
+    line = line + to_string(state_id)
+    line = line + ",\"schema\":\""
+    line = line + CACHE_SCHEMA
+    line = line + "\",\"state_hash\":\""
+    line = line + hash
+    line = line + "\",\"embedding\":"
+    line = line + embedding_to_json(emb)
+    line = line + "}"
+    return line
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+// §7  DRIVER
+// ═══════════════════════════════════════════════════════════════════
+
+fn parse_n_from_argv() -> int {
+    // argv plumbing deferred; override via editing DEFAULT_N_SMOKE
+    // or wrapping this file with a thin launcher.
+    return DEFAULT_N_SMOKE
+}
+
+fn generate_cache(n_states: int) -> int {
+    println("[phi-cache] schema=" + CACHE_SCHEMA
+          + " n_states=" + to_string(n_states)
+          + " embed_dim=" + to_string(EMBED_DIM)
+          + " lenses=" + to_string(N_LENSES))
+
+    let mut out = ""
+    let mut sid = 0
+    while sid < n_states {
+        let state = synth_state(sid, STATE_LEN)
+        let emb = build_embedding(state)
+        let hash = poly_hash(state)
+        let line = state_to_json_line(sid, hash, emb)
+        out = out + line + "\n"
+        if (sid + 1) % 10 == 0 || sid == n_states - 1 {
+            println("[phi-cache]   wrote " + to_string(sid + 1) + "/" + to_string(n_states))
+        }
+        sid = sid + 1
+    }
+
+    write_file(CACHE_PATH, out)
+    println("[phi-cache] wrote " + CACHE_PATH)
+    return n_states
+}
+
+fn verify_cache(n_expected: int) -> bool {
+    let text = read_file(CACHE_PATH)
+    let n = len(text)
+    let mut nl = 0
+    let mut i = 0
+    while i < n {
+        let ch = text.substring(i, i + 1)
+        if ch == "\n" { nl = nl + 1 }
+        i = i + 1
+    }
+    if nl != n_expected {
+        println("[phi-cache] VERIFY FAIL — line count " + to_string(nl) + " != expected " + to_string(n_expected))
+        return false
+    }
+    println("[phi-cache] verify OK — " + to_string(nl) + " lines")
+    return true
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+// §8  ENTRY
+// ═══════════════════════════════════════════════════════════════════
+
+fn main() {
+    let n = parse_n_from_argv()
+    let produced = generate_cache(n)
+    let ok = verify_cache(produced)
+    if ok {
+        println("[phi-cache] PASS — " + to_string(produced) + " states cached to " + CACHE_PATH)
+    } else {
+        println("[phi-cache] FAIL — verify failed")
+    }
+}
+
+main()
