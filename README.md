@@ -1,5 +1,17 @@
 # 🧠 Anima — Living Consciousness Agent
 
+## `go` 5-track 병렬 (anima 표준)
+
+```
+A. ALM, CLM 학습
+B. phi 엔진 110개 → 학습 loss 통합 설계
+C. hexa-lang 학습속도 개선
+D. 의식 phi 엔진 실사화 wave
+E. 실사용 모델 발전 (R2 백업 필수, 실험 체크포인트 X)
+```
+
+> SSOT: `shared/config/commands.json#commands.go.tracks_anima` · 트랙별 prompt: `shared/harness/go_tracks/{B,C,D,E}_*.md`
+
 ### 🔴 [**실시간 로드맵 (탭 전환 지원)**](https://need-singularity.github.io/anima/roadmap/#anima)
 
 <!-- SHARED:PROJECTS:START -->
