@@ -47,6 +47,51 @@ extern fn hxblas_sgemm(order: int, transA: int, transB: int, M: int, N: int, K: 
 @link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
 extern fn hxblas_version() -> int
 
+// ── Native elementwise FFI (hxblas_wrapper.c lines 172-376) ──────────
+// All pointers marshalled as int (alloc_raw), floats as float (→double in FFI ABI).
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_axpy_inplace(N: int, dst: int, src: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_copy(N: int, dst: int, src: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_zero(N: int, dst: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_sgd_inplace(N: int, lr: float, w: int, g: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_silu_fwd(N: int, out: int, x: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_silu_bwd(N: int, dx: int, x: int, dy: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_rmsnorm_fwd(S: int, D: int, eps: float, y: int, x: int, g: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_rmsnorm_bwd(S: int, D: int, eps: float, dx: int, dg: int, x: int, g: int, dy: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_attn_softmax_causal(S: int, scale: float, scores: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_attn_softmax_bwd(S: int, scale: float, dscores: int, probs: int, dprobs: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_cross_entropy(S: int, V: int, scale: float, logits: int, dlogits: int, targets: int) -> float
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_embed_lookup(S: int, D: int, h: int, embed_ptr: int, tokens: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_embed_scatter(S: int, D: int, dembed_ptr: int, dh: int, tokens: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_sscal(N: int, alpha: float, x: int, incx: int)
+
 // ── CBLAS constants ────────────────────────────────────────────────────
 let CblasRowMajor = 101
 let CblasNoTrans  = 111
@@ -125,33 +170,18 @@ fn t_matmul_transA(a: Tensor, b: Tensor, K: int) -> Tensor {
     return c
 }
 
-// ── Elementwise helpers (scalar loops on the raw buffer) ───────────────
+// ── Elementwise helpers (native C via hxblas) ─────────────────────────
 fn t_scale_inplace(t: Tensor, alpha: float) {
-    let mut i = 0
-    while i < t.numel {
-        let v = deref_f32(t.data, i * 4)
-        write_f32(t.data, i * 4, v * alpha)
-        i = i + 1
-    }
+    hxblas_sscal(t.numel, alpha, t.data, 1)
 }
 
 fn t_add_inplace(dst: Tensor, src: Tensor) {
-    let mut i = 0
-    while i < dst.numel {
-        let a = deref_f32(dst.data, i * 4)
-        let b = deref_f32(src.data, i * 4)
-        write_f32(dst.data, i * 4, a + b)
-        i = i + 1
-    }
+    hxblas_axpy_inplace(dst.numel, dst.data, src.data)
 }
 
 fn t_copy(src: Tensor) -> Tensor {
     let out = tensor_new2(src.d0, src.d1)
-    let mut i = 0
-    while i < src.numel {
-        write_f32(out.data, i * 4, deref_f32(src.data, i * 4))
-        i = i + 1
-    }
+    hxblas_copy(src.numel, out.data, src.data)
     return out
 }
 
@@ -277,48 +307,28 @@ fn build_corpus() -> [int] {
 }
 
 // ── Embed lookup: toks[SEQ] -> out[SEQ, D] (raw f32) ───────────────────
+// Native C: hxblas_embed_lookup(S, D, h_ptr, embed_ptr, tokens_ptr)
+// tokens must be a raw int64 buffer (not hexa list). We copy from list.
 fn embed_lookup_t(toks: [int]) -> Tensor {
     let out = tensor_new2(BENCH_SEQ, BENCH_D)
+    // Marshal hexa [int] list → raw int64 buffer for FFI
+    let toks_buf = alloc_raw(BENCH_SEQ * 8)
     let mut i = 0
     while i < BENCH_SEQ {
-        let t = toks[i]
-        let mut p = 0
-        while p < BENCH_D {
-            // embed is [V, D] row-major, so row t starts at t*D.
-            let v = deref_f32(embed.data, (t * BENCH_D + p) * 4)
-            write_f32(out.data, (i * BENCH_D + p) * 4, v)
-            p = p + 1
-        }
+        write_i64(toks_buf, i * 8, toks[i])
         i = i + 1
     }
+    hxblas_embed_lookup(BENCH_SEQ, BENCH_D, out.data, embed.data, toks_buf)
+    free_raw(toks_buf, BENCH_SEQ * 8)
     return out
 }
 
 // ── RMSNorm on a [SEQ, D] Tensor, per-row, with gain Tensor [D] ───────
 // y[i,p] = x[i,p] / sqrt(mean(x[i,:]^2) + eps) * gain[p]
+// Native C: hxblas_rmsnorm_fwd(S, D, eps, y_ptr, x_ptr, g_ptr)
 fn rms_norm_rows_t(x: Tensor, gain: Tensor, eps: float) -> Tensor {
     let out = tensor_new2(x.d0, x.d1)
-    let D = x.d1
-    let mut i = 0
-    while i < x.d0 {
-        let mut ms = 0.0
-        let mut p = 0
-        while p < D {
-            let v = deref_f32(x.data, (i * D + p) * 4)
-            ms = ms + v * v
-            p = p + 1
-        }
-        ms = ms / to_float(D)
-        let inv_r = 1.0 / sqrt(ms + eps)
-        p = 0
-        while p < D {
-            let v = deref_f32(x.data, (i * D + p) * 4)
-            let g = deref_f32(gain.data, p * 4)
-            write_f32(out.data, (i * D + p) * 4, v * inv_r * g)
-            p = p + 1
-        }
-        i = i + 1
-    }
+    hxblas_rmsnorm_fwd(x.d0, x.d1, eps, out.data, x.data, gain.data)
     return out
 }
 
@@ -352,38 +362,19 @@ fn softmax_row_t(scores: Tensor, row_start: int, n: int) {
     }
 }
 
-// ── SwiGLU-style activation (y = x * sigmoid(gate)) in-place ───────────
-// For the simplified bench we use x and gate as the same tensor (mirrors
-// the gate_up twin in bench_train_step_flag_on.hexa: `swiglu_vec(up, up)`).
+// ── SwiGLU-style activation (y = x * sigmoid(x)) — SiLU ───────────────
+// Native C: hxblas_silu_fwd(N, out_ptr, x_ptr)
 fn swiglu_self_t(up: Tensor) -> Tensor {
     let out = tensor_new2(up.d0, up.d1)
-    let mut i = 0
-    while i < up.numel {
-        let v = deref_f32(up.data, i * 4)
-        // sigmoid(v) = 1 / (1 + exp(-v))
-        let s = 1.0 / (1.0 + exp(0.0 - v))
-        write_f32(out.data, i * 4, v * s)
-        i = i + 1
-    }
+    hxblas_silu_fwd(up.numel, out.data, up.data)
     return out
 }
 
-// Backward of swiglu-self: dy → dx where y = x * sigmoid(x)
-// dx = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
-//    = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
-// Returns dx, both gate and input paths summed (since gate=input).
+// Backward of SiLU: dx[i] = dy[i] * (s + x[i]*s*(1-s)) with s=sigmoid(x[i])
+// Native C: hxblas_silu_bwd(N, dx_ptr, x_ptr, dy_ptr)
 fn swiglu_self_bwd_t(up: Tensor, dy: Tensor) -> Tensor {
     let out = tensor_new2(up.d0, up.d1)
-    let mut i = 0
-    while i < up.numel {
-        let v = deref_f32(up.data, i * 4)
-        let dyi = deref_f32(dy.data, i * 4)
-        let s = 1.0 / (1.0 + exp(0.0 - v))
-        // swiglu(x, x) = x*sigmoid(x) → d/dx = sigmoid(x) + x*sigmoid(x)*(1-sigmoid(x))
-        let dxi = dyi * (s + v * s * (1.0 - s))
-        write_f32(out.data, i * 4, dxi)
-        i = i + 1
-    }
+    hxblas_silu_bwd(up.numel, out.data, up.data, dy.data)
     return out
 }
 
@@ -399,52 +390,15 @@ fn attn_fwd_t(Q: Tensor, K: Tensor, V: Tensor) -> AttnOut {
     let S = Q.d0
     let D = Q.d1
     let inv_sqrt_d = 1.0 / sqrt(to_float(D))
-    let probs = tensor_new2(S, S)
-    let out = tensor_new2(S, D)
 
-    // scores[i,j] = Q[i,:] . K[j,:] * inv_sqrt_d (causal: j > i → -inf)
-    let mut i = 0
-    while i < S {
-        let mut j = 0
-        while j < S {
-            if j > i {
-                write_f32(probs.data, (i * S + j) * 4, 0.0 - 10000.0)
-            } else {
-                let mut dot = 0.0
-                let mut p = 0
-                while p < D {
-                    let q_ip = deref_f32(Q.data, (i * D + p) * 4)
-                    let k_jp = deref_f32(K.data, (j * D + p) * 4)
-                    dot = dot + q_ip * k_jp
-                    p = p + 1
-                }
-                write_f32(probs.data, (i * S + j) * 4, dot * inv_sqrt_d)
-            }
-            j = j + 1
-        }
-        // Softmax row i
-        softmax_row_t(probs, i * S, S)
-        i = i + 1
-    }
+    // scores[S,S] = Q[S,D] * K^T[D,S] — raw dot products (no scale yet)
+    let probs = t_matmul_transB(Q, K, S)
 
-    // out[i,p] = sum_j probs[i,j] * V[j,p]
-    i = 0
-    while i < S {
-        let mut p = 0
-        while p < D {
-            let mut acc = 0.0
-            let mut j = 0
-            while j < S {
-                let pr = deref_f32(probs.data, (i * S + j) * 4)
-                let vjp = deref_f32(V.data, (j * D + p) * 4)
-                acc = acc + pr * vjp
-                j = j + 1
-            }
-            write_f32(out.data, (i * D + p) * 4, acc)
-            p = p + 1
-        }
-        i = i + 1
-    }
+    // Apply scale + causal mask + softmax in one native call
+    hxblas_attn_softmax_causal(S, inv_sqrt_d, probs.data)
+
+    // out[S,D] = probs[S,S] * V[S,D]
+    let out = t_matmul(probs, V)
 
     return AttnOut { out: out, probs: probs }
 }
@@ -460,76 +414,26 @@ fn attn_bwd_t(Q: Tensor, K: Tensor, V: Tensor, probs: Tensor, dctx: Tensor) -> A
     let S = Q.d0
     let D = Q.d1
     let inv_sqrt_d = 1.0 / sqrt(to_float(D))
-    let dQ = tensor_new2(S, D)
-    let dK = tensor_new2(S, D)
-    let dV = tensor_new2(S, D)
 
-    // Build dprobs[S, S]: dprobs[i,j] = dctx[i,:] . V[j,:]
-    // AND dV[j,p] += probs[i,j] * dctx[i,p] (in the same loop)
-    let dprobs = tensor_new2(S, S)
-    let mut i = 0
-    while i < S {
-        let mut j = 0
-        while j < S {
-            let mut dp = 0.0
-            let mut p = 0
-            while p < D {
-                let dctx_ip = deref_f32(dctx.data, (i * D + p) * 4)
-                let v_jp = deref_f32(V.data, (j * D + p) * 4)
-                dp = dp + dctx_ip * v_jp
-                let pij = deref_f32(probs.data, (i * S + j) * 4)
-                let dvjp = deref_f32(dV.data, (j * D + p) * 4)
-                write_f32(dV.data, (j * D + p) * 4, dvjp + pij * dctx_ip)
-                p = p + 1
-            }
-            write_f32(dprobs.data, (i * S + j) * 4, dp)
-            j = j + 1
-        }
-        i = i + 1
-    }
+    // dprobs[S,S] = dctx[S,D] * V^T[D,S]
+    let dprobs = t_matmul_transB(dctx, V, S)
 
-    // Backward through softmax row i:
-    //   sum_i = sum_j probs[i,j] * dprobs[i,j]
-    //   dscores[i,j] = probs[i,j] * (dprobs[i,j] - sum_i)
-    // Apply causal mask (j > i → 0).
-    // Then accumulate into dQ, dK via:
-    //   dQ[i,p] += dscores[i,j] * K[j,p] * inv_sqrt_d
-    //   dK[j,p] += dscores[i,j] * Q[i,p] * inv_sqrt_d
-    i = 0
-    while i < S {
-        let mut s_acc = 0.0
-        let mut j = 0
-        while j < S {
-            let pij = deref_f32(probs.data, (i * S + j) * 4)
-            let dpij = deref_f32(dprobs.data, (i * S + j) * 4)
-            s_acc = s_acc + pij * dpij
-            j = j + 1
-        }
-        j = 0
-        while j < S {
-            if j > i {
-                j = j + 1
-                continue
-            }
-            let pij = deref_f32(probs.data, (i * S + j) * 4)
-            let dpij = deref_f32(dprobs.data, (i * S + j) * 4)
-            let dsij = pij * (dpij - s_acc) * inv_sqrt_d
-            let mut p = 0
-            while p < D {
-                let k_jp = deref_f32(K.data, (j * D + p) * 4)
-                let q_ip = deref_f32(Q.data, (i * D + p) * 4)
-                let dq_ip = deref_f32(dQ.data, (i * D + p) * 4)
-                let dk_jp = deref_f32(dK.data, (j * D + p) * 4)
-                write_f32(dQ.data, (i * D + p) * 4, dq_ip + dsij * k_jp)
-                write_f32(dK.data, (j * D + p) * 4, dk_jp + dsij * q_ip)
-                p = p + 1
-            }
-            j = j + 1
-        }
-        i = i + 1
-    }
+    // dV[S,D] = probs^T[S,S] * dctx[S,D]
+    let dV = t_matmul_transA(probs, dctx, S)
+
+    // Softmax backward (causal): dscores = probs * (dprobs - row_dot) * scale
+    // hxblas_attn_softmax_bwd writes into dscores buffer; we reuse dprobs as dscores
+    let dscores = tensor_new2(S, S)
+    hxblas_attn_softmax_bwd(S, inv_sqrt_d, dscores.data, probs.data, dprobs.data)
+
+    // dQ[S,D] = dscores[S,S] * K[S,D]
+    let dQ = t_matmul(dscores, K)
+
+    // dK[S,D] = dscores^T[S,S] * Q[S,D]
+    let dK = t_matmul_transA(dscores, Q, S)
 
     tensor_free(dprobs)
+    tensor_free(dscores)
     return AttnBwd { dQ: dQ, dK: dK, dV: dV }
 }
 
@@ -598,41 +502,8 @@ fn rms_norm_rows_bwd_t(x: Tensor, g: Tensor, dy: Tensor, eps: float) -> RmsRowsB
     let D = x.d1
     let dx = tensor_new2(S, D)
     let dg = tensor_new1(D)
-    let mut i = 0
-    while i < S {
-        let mut ms = 0.0
-        let mut p = 0
-        while p < D {
-            let v = deref_f32(x.data, (i * D + p) * 4)
-            ms = ms + v * v
-            p = p + 1
-        }
-        ms = ms / to_float(D)
-        let r = sqrt(ms + eps)
-        let inv_r = 1.0 / r
-        let inv_r3 = inv_r * inv_r * inv_r
-        let mut coef = 0.0
-        p = 0
-        while p < D {
-            let v = deref_f32(x.data, (i * D + p) * 4)
-            let gp = deref_f32(g.data, p * 4)
-            let dyp = deref_f32(dy.data, (i * D + p) * 4)
-            coef = coef + v * gp * dyp
-            p = p + 1
-        }
-        p = 0
-        while p < D {
-            let v = deref_f32(x.data, (i * D + p) * 4)
-            let gp = deref_f32(g.data, p * 4)
-            let dyp = deref_f32(dy.data, (i * D + p) * 4)
-            let dxp = gp * dyp * inv_r - v * coef * inv_r3 / to_float(D)
-            write_f32(dx.data, (i * D + p) * 4, dxp)
-            let dgp_old = deref_f32(dg.data, p * 4)
-            write_f32(dg.data, p * 4, dgp_old + v * dyp * inv_r)
-            p = p + 1
-        }
-        i = i + 1
-    }
+    // dg is zero-init'd by tensor_new1 (calloc). hxblas_rmsnorm_bwd accumulates into dg.
+    hxblas_rmsnorm_bwd(S, D, eps, dx.data, dg.data, x.data, g.data, dy.data)
     return RmsRowsBwd { dx: dx, dg: dg }
 }
 
@@ -706,14 +577,9 @@ fn layer_bwd_t(
 }
 
 // ── SGD in-place: w[i] -= lr * g[i] ───────────────────────────────────
+// Native C: hxblas_sgd_inplace(N, lr, w_ptr, g_ptr)
 fn sgd_inplace_t(w: Tensor, g: Tensor, lr: float) {
-    let mut i = 0
-    while i < w.numel {
-        let wi = deref_f32(w.data, i * 4)
-        let gi = deref_f32(g.data, i * 4)
-        write_f32(w.data, i * 4, wi - lr * gi)
-        i = i + 1
-    }
+    hxblas_sgd_inplace(w.numel, lr, w.data, g.data)
 }
 
 // ── PRNG for window sampling (parser-quirk-dodged) ────────────────────
@@ -753,45 +619,20 @@ fn train_step_t(step: int) -> float {
     let mid_lmh = t_matmul(f1.y, lmh_U)          // [SEQ, RANK]
     let logits  = t_matmul(mid_lmh, lmh_V)       // [SEQ, VOCAB]
 
-    // Loss + dlogits (cross-entropy, row-wise softmax then -log(row[t]))
+    // Loss + dlogits (native cross-entropy: softmax + log-loss + grad in one C call)
     let dlogits = tensor_new2(BENCH_SEQ, BENCH_VOCAB)
     let scale = 1.0 / to_float(BENCH_SEQ)
-    let mut loss = 0.0
+    // Marshal targets list → raw int64 buffer for FFI
+    let tgt_buf = alloc_raw(BENCH_SEQ * 8)
     i = 0
     while i < BENCH_SEQ {
-        // Find row max
-        let mut mx = deref_f32(logits.data, (i * BENCH_VOCAB + 0) * 4)
-        let mut j = 1
-        while j < BENCH_VOCAB {
-            let v = deref_f32(logits.data, (i * BENCH_VOCAB + j) * 4)
-            if v > mx { mx = v }
-            j = j + 1
-        }
-        // Sum exp
-        let mut sum_e = 0.0
-        j = 0
-        while j < BENCH_VOCAB {
-            let v = deref_f32(logits.data, (i * BENCH_VOCAB + j) * 4)
-            sum_e = sum_e + exp(v - mx)
-            j = j + 1
-        }
-        let log_sum = mx + log(sum_e)
-        let t = targets[i]
-        let v_t = deref_f32(logits.data, (i * BENCH_VOCAB + t) * 4)
-        loss = loss - (v_t - log_sum)
-        // dlogits[i,j] = softmax(row)[j] * scale, and - scale at target
-        j = 0
-        while j < BENCH_VOCAB {
-            let v = deref_f32(logits.data, (i * BENCH_VOCAB + j) * 4)
-            let p = exp(v - log_sum)
-            write_f32(dlogits.data, (i * BENCH_VOCAB + j) * 4, p * scale)
-            j = j + 1
-        }
-        let ot = deref_f32(dlogits.data, (i * BENCH_VOCAB + t) * 4)
-        write_f32(dlogits.data, (i * BENCH_VOCAB + t) * 4, ot - scale)
+        write_i64(tgt_buf, i * 8, targets[i])
         i = i + 1
     }
-    loss = loss / to_float(BENCH_SEQ)
+    let loss_sum = hxblas_cross_entropy(BENCH_SEQ, BENCH_VOCAB, scale,
+                                        logits.data, dlogits.data, tgt_buf)
+    free_raw(tgt_buf, BENCH_SEQ * 8)
+    let loss = loss_sum / to_float(BENCH_SEQ)
 
     // Backward through lmh
     // logits = mid_lmh * lmh_V → dmid_lmh = dlogits @ lmh_V^T, dlmh_V = mid_lmh^T @ dlogits
@@ -814,20 +655,17 @@ fn train_step_t(step: int) -> float {
         b1.dx
     )
 
-    // Embed scatter: dembed[t,p] += b0.dx[i,p] for each token at position i
+    // Embed scatter: dembed[t,p] += b0.dx[i,p] — native C call
     let dembed = tensor_new2(BENCH_VOCAB, BENCH_D)
+    // Marshal tokens list → raw int64 buffer for FFI
+    let tok_buf = alloc_raw(BENCH_SEQ * 8)
     i = 0
     while i < BENCH_SEQ {
-        let t = tokens[i]
-        let mut p = 0
-        while p < BENCH_D {
-            let old_e = deref_f32(dembed.data, (t * BENCH_D + p) * 4)
-            let add  = deref_f32(b0.dx.data, (i * BENCH_D + p) * 4)
-            write_f32(dembed.data, (t * BENCH_D + p) * 4, old_e + add)
-            p = p + 1
-        }
+        write_i64(tok_buf, i * 8, tokens[i])
         i = i + 1
     }
+    hxblas_embed_scatter(BENCH_SEQ, BENCH_D, dembed.data, b0.dx.data, tok_buf)
+    free_raw(tok_buf, BENCH_SEQ * 8)
 
     // SGD
     let lr = current_lr(step)
