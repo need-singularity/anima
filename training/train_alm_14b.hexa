@@ -112,17 +112,33 @@ fn main() {
         "DEFAULT_SAVE_EVERY = 2000\n" +
         "DEFAULT_EVAL_EVERY = 500\n" +
         "\n" +
-        "def upload_to_r2(local_path, model_tag, round_num, step):\n" +
-        "    r2_dest = f'r2:anima-models/{model_tag}/r{round_num}/step_{step}/'\n" +
-        "    print(f'[r2] uploading {local_path} -> {r2_dest}', flush=True)\n" +
+        "# ─── E1/E2/E3 post-save hook (2026-04-16) ───────────────────────\n" +
+        "# Replaces the prior inline rclone path with a delegating call to\n" +
+        "# scripts/ckpt_backup_hook.hexa, which respects ckpt_policy.json:\n" +
+        "#   experiment → no R2 upload, .r2_uploaded marker only\n" +
+        "#   production → R2 anima-models/<tag>/r<round>/step_<step>/\n" +
+        "#   archive    → R2 anima-models/archive/<tag>/...\n" +
+        "# Idempotent + partial-safe; reads ckpt_meta.json sidecar emitted\n" +
+        "# below (canonical name; train_meta.json kept as legacy fallback).\n" +
+        "def invoke_ckpt_backup_hook(local_path, label):\n" +
+        "    # Resolve hook script path: HEXA_CKPT_HOOK env wins; else look\n" +
+        "    # next to this script via the ANIMA_ROOT env (set by launcher).\n" +
+        "    hook = os.environ.get('HEXA_CKPT_HOOK', '')\n" +
+        "    if not hook:\n" +
+        "        anima_root = os.environ.get('ANIMA_ROOT', '/workspace/anima')\n" +
+        "        hook = f'{anima_root}/scripts/ckpt_backup_hook.hexa'\n" +
+        "    if not os.path.exists(hook):\n" +
+        "        print(f'[ckpt-hook] script not found {hook} — skipping (label={label})', flush=True)\n" +
+        "        return\n" +
+        "    cmd = ['hexa', hook, str(local_path), str(label)]\n" +
+        "    print(f'[ckpt-hook] {\" \".join(cmd)}', flush=True)\n" +
         "    try:\n" +
-        "        result = subprocess.run(['rclone', 'copy', str(local_path), r2_dest, '--s3-no-check-bucket'], capture_output=True, text=True, timeout=600)\n" +
-        "        if result.returncode == 0:\n" +
-        "            print(f'[r2] uploaded {model_tag}-r{round_num}-s{step}', flush=True)\n" +
-        "        else:\n" +
-        "            print(f'[r2] upload failed: {result.stderr[:200]}', flush=True)\n" +
+        "        result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)\n" +
+        "        if result.stdout: print(result.stdout, flush=True)\n" +
+        "        if result.returncode != 0:\n" +
+        "            print(f'[ckpt-hook] FAILED rc={result.returncode} stderr={result.stderr[:400]}', flush=True)\n" +
         "    except Exception as e:\n" +
-        "        print(f'[r2] upload error: {e}', flush=True)\n" +
+        "        print(f'[ckpt-hook] error: {e}', flush=True)\n" +
         "\n" +
         "# ─── ALM-P4-1 / P4-2 : Holographic head + loss + Φ_holo ──────────\n" +
         "# Python mirror of the three .hexa P3 artifacts:\n" +
@@ -566,9 +582,33 @@ fn main() {
         "            print(f'[save] {save_path}')\n" +
         "            model.save_pretrained(str(save_path))\n" +
         "            tokenizer.save_pretrained(str(save_path))\n" +
-        "            meta = {'step': step, 'loss': best_loss, 'base': args.base, 'lora_r': args.lora_r, 'corpus': args.corpus, 'elapsed_min': (time.time() - t0) / 60}\n" +
-        "            with open(save_path / 'train_meta.json', 'w') as f: json.dump(meta, f, indent=2)\n" +
-        "            upload_to_r2(save_path, args.model_tag, args.round, step)\n" +
+        "            # ── E2/E3 sidecar (canonical name) — read by ckpt_backup_hook.hexa ──\n" +
+        "            try:\n" +
+        "                _git_sha = subprocess.run(['git', '-C', os.environ.get('ANIMA_ROOT', '.'), 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True, timeout=5).stdout.strip()\n" +
+        "            except Exception:\n" +
+        "                _git_sha = 'unknown'\n" +
+        "            try:\n" +
+        "                _host = subprocess.run(['hostname'], capture_output=True, text=True, timeout=5).stdout.strip()\n" +
+        "            except Exception:\n" +
+        "                _host = 'unknown'\n" +
+        "            ckpt_meta = {\n" +
+        "                'model_tag': args.model_tag,\n" +
+        "                'round': args.round,\n" +
+        "                'step': step,\n" +
+        "                'label': args.ckpt_label,\n" +
+        "                'phi_holo': float(phi_holo_mean) if 'phi_holo_mean' in dir() else 0.0,\n" +
+        "                'ce_loss': float(best_loss),\n" +
+        "                'wall_clock_minutes': (time.time() - t0) / 60,\n" +
+        "                'git_sha': _git_sha,\n" +
+        "                'host': _host,\n" +
+        "                'base': args.base,\n" +
+        "                'lora_r': args.lora_r,\n" +
+        "                'corpus': args.corpus,\n" +
+        "            }\n" +
+        "            with open(save_path / 'ckpt_meta.json', 'w') as f: json.dump(ckpt_meta, f, indent=2)\n" +
+        "            # Legacy alias for any tooling still reading train_meta.json.\n" +
+        "            with open(save_path / 'train_meta.json', 'w') as f: json.dump(ckpt_meta, f, indent=2)\n" +
+        "            invoke_ckpt_backup_hook(save_path, args.ckpt_label)\n" +
         "    elapsed_total = (time.time() - t0) / 60\n" +
         "    print(f'\\n{sep}')\n" +
         "    print(f'[train] DONE -- {args.steps} steps in {elapsed_total:.1f} min')\n" +
@@ -594,6 +634,12 @@ fn main() {
         "    parser.add_argument('--eval-every', type=int, default=DEFAULT_EVAL_EVERY)\n" +
         "    parser.add_argument('--model-tag', default='alm14b')\n" +
         "    parser.add_argument('--round', type=int, default=1)\n" +
+        "    # ── E2 ckpt label routing — production|experiment|archive ─\n" +
+        "    # Default per shared/config/decisions.json ckpt_label_default=experiment.\n" +
+        "    # Hook reads this label + ckpt_meta.json sidecar to decide R2 routing.\n" +
+        "    parser.add_argument('--ckpt-label', dest='ckpt_label', default='experiment',\n" +
+        "                        choices=['production', 'experiment', 'archive'],\n" +
+        "                        help='E2 label — controls R2 retention via ckpt_backup_hook.hexa')\n" +
         "    parser.add_argument('--smoke', action='store_true')\n" +
         "    # ── Session speedup flags (20260415) — all default OFF ─────\n" +
         "    # Safe baseline (TF32+cudnn+fused AdamW+pin_memory) is always on.\n" +

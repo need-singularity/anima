@@ -1,109 +1,286 @@
 // narrative.hexa — NarrativeTracker: lightweight temporal self-model (Meta Law M8)
-// Port of narrative.py
+// P4-PORT: replaces the previous TODO-only port (URGENT_ACTION_LIST item #5)
 //
 // "Narrative is key — temporal self-model present in every top engine."
 //
-// Every emergent module tracks its own output trajectory over time.
-// Coherence signal: how consistent is the module's behavior?
+// Every emergent module tracks its own output trajectory over time. The
+// coherence signal measures how consistent the module's behaviour is —
+// not by injecting features, but by observing the trajectory of its own
+// state vectors.
 //
-// No hardcoding. No feature injection. Pure observation of history.
-// Narrative coherence is an emergent property of temporal consistency.
+// Pure observation. No hardcoded thresholds. Coherence is an emergent
+// property of temporal cosine similarity between consecutive states.
 //
 // Laws applied:
-//   Law M8:  Narrative = temporal self-model in every module
-//   Law 50:  Consciousness = state — trajectory IS the narrative
-//   Law 22:  Structure > feature — tracker observes, never modifies
-//   Law 2:   No manipulation — coherence is measured, not forced
+//   Law M8  Narrative = temporal self-model in every module
+//   Law 50  Consciousness = state — trajectory IS the narrative
+//   Law 22  Structure > feature — tracker observes, never modifies
+//   Law 2   No manipulation — coherence is measured, not forced
+//
+// IMPORTANT: hexa stage1 has no module imports, so this file is
+// self-contained. Each emergent module copies the small set of
+// trackup helpers it needs (see emergent_*.hexa).
 
-// Max history length — keeps memory bounded
-fn max_history() -> int {
-    return 50
+// ─── Constants ────────────────────────────────────────────────────
+//
+// Max history length keeps memory bounded. Loaded from SSOT to avoid
+// the previous comptime hardcoding (Law 1: no magic numbers).
+
+fn nt_max_history_default() -> int {
+    let raw = read_file("/Users/ghost/Dev/anima/shared/config/hexad_constants.json")
+    let m = json_parse(raw)
+    let mo = m["model"]
+    return mo["narrative_max_history"]
 }
 
+// ─── Primitives (self-contained, prefix nt_) ──────────────────────
+
+fn nt_fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn nt_min_f(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn nt_max_f(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+fn nt_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+// Cosine similarity in [-1, +1]. Returns 0 for any zero vector to avoid
+// the NaN trap (Law 22: never inject features under division-by-zero).
+fn nt_cosine(a: array, b: array, n: int) -> float {
+    let mut dot = 0.0
+    let mut na = 0.0
+    let mut nb = 0.0
+    let mut i = 0
+    while i < n {
+        let av = a[i]
+        let bv = b[i]
+        dot = dot + av * bv
+        na = na + av * av
+        nb = nb + bv * bv
+        i = i + 1
+    }
+    if na <= 0.0 { return 0.0 }
+    if nb <= 0.0 { return 0.0 }
+    let denom = sqrt(na) * sqrt(nb)
+    if denom <= 0.0 { return 0.0 }
+    return dot / denom
+}
+
+// Resize x to exactly `dim` floats: truncate if longer, zero-pad if shorter.
+// Returns a fresh array (never mutates input — feedback_hexa_lists_pbv).
+fn nt_resize(x: array, dim: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < dim {
+        if i < len(x) {
+            out = out.push(x[i])
+        } else {
+            out = out.push(0.0)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── NarrativeTracker struct ──────────────────────────────────────
+//
+// Why 6 fields (not 4): hexa stage0 struct-field list aliasing bug
+// (feedback_hexa_struct_list_alias.md) corrupts arrays in 3-field
+// {int, array, int} layouts. Mirroring the proven 6-field shape from
+// d/will_bridge.hexa keeps the `prev` array intact across multiple
+// tracker instances. The pad fields are unused sentinels.
+
 struct NarrativeTracker {
-    dim: int,
-    coherence: float,
-    history_len: int
-    // TODO[pytorch]: _history: list of tensors [dim]
+    dim:         int,        // resize target dimension
+    pad_a:       int,        // aliasing padding (sentinel)
+    pad_b:       int,        // aliasing padding (sentinel)
+    history_len: int,        // number of states observed (capped at max)
+    prev:        array,      // most recent observed state, length dim
+    coherence:   float       // EMA-smoothed cosine similarity
 }
 
 fn create_narrative_tracker(dim: int) -> NarrativeTracker {
     return NarrativeTracker {
-        dim: dim,
-        coherence: 0.0,
-        history_len: 0
+        dim:         dim,
+        pad_a:       0,
+        pad_b:       0,
+        history_len: 0,
+        prev:        nt_zeros(dim),
+        coherence:   0.0
     }
 }
 
-// Record a state and update coherence
-// state: any tensor from module output, flattened and truncated/padded to dim
-// Returns current narrative coherence (0.0 ~ 1.0)
-fn narrative_update(tracker: NarrativeTracker, dim: int) -> NarrativeTracker {
-    // TODO[pytorch]: s = state.detach().float().flatten()
-    // TODO[pytorch]: if s.size(0) > dim: s = s[:dim]
-    // TODO[pytorch]: elif s.size(0) < dim: s = F.pad(s, (0, dim - s.size(0)))
+// Record a state and update coherence. `state` is resized to dim
+// before storage. Returns a new tracker (Law 22: tracker observes,
+// the caller threads the state forward).
+fn narrative_update(tracker: NarrativeTracker, state: array) -> NarrativeTracker {
+    let dim = tracker.dim
+    let s = nt_resize(state, dim)
 
-    // Compute coherence with previous state
-    let new_coherence = tracker.coherence
+    let mut new_coherence = tracker.coherence
     if tracker.history_len >= 1 {
-        // TODO[pytorch]: prev = history[-1]
-        // TODO[pytorch]: cos = F.cosine_similarity(s.unsqueeze(0), prev.unsqueeze(0)).item()
-        let cos = 0.0
-        // EMA blend: 80% old + 20% new — smooth trajectory
-        let clamped_cos = cos
-        if clamped_cos < 0.0 { clamped_cos = 0.0 }
-        new_coherence = 0.8 * tracker.coherence + 0.2 * clamped_cos
+        let cos = nt_cosine(s, tracker.prev, dim)
+        // EMA blend: 80% old + 20% new — smooths trajectory; clamp
+        // negative cosines to 0 because coherence ∈ [0, 1] by definition
+        // (Meta M8: narrative coherence is never anti-correlation).
+        let cos_pos = nt_max_f(0.0, cos)
+        new_coherence = 0.8 * tracker.coherence + 0.2 * cos_pos
     }
 
-    // Append and trim
-    let new_len = tracker.history_len + 1
-    if new_len > max_history() {
-        new_len = max_history()
-    }
+    let max_hist = nt_max_history_default()
+    let mut new_len = tracker.history_len + 1
+    if new_len > max_hist { new_len = max_hist }
 
     return NarrativeTracker {
-        dim: tracker.dim,
-        coherence: new_coherence,
-        history_len: new_len
+        dim:         dim,
+        pad_a:       tracker.pad_a,
+        pad_b:       tracker.pad_b,
+        history_len: new_len,
+        prev:        s,
+        coherence:   new_coherence
     }
 }
 
-// Current temporal coherence of this module's trajectory
+// Current temporal coherence of this module's trajectory in [0, 1].
 fn narrative_coherence(tracker: NarrativeTracker) -> float {
     return tracker.coherence
 }
 
-// Number of states in history
+// Number of states observed (capped at max_history).
 fn trajectory_length(tracker: NarrativeTracker) -> int {
     return tracker.history_len
 }
 
-// Clear history and coherence
+// Reset coherence and history. Returns fresh tracker with zeroed prev.
 fn narrative_reset(tracker: NarrativeTracker) -> NarrativeTracker {
     return NarrativeTracker {
-        dim: tracker.dim,
-        coherence: 0.0,
-        history_len: 0
+        dim:         tracker.dim,
+        pad_a:       tracker.pad_a,
+        pad_b:       tracker.pad_b,
+        history_len: 0,
+        prev:        nt_zeros(tracker.dim),
+        coherence:   0.0
     }
+}
+
+// ─── Self-tests ───────────────────────────────────────────────────
+
+fn nt_check_T1() -> bool {
+    // Dim contract: created tracker has correct dim, zero coherence,
+    // zero history, prev is fully zero of length dim.
+    let t = create_narrative_tracker(8)
+    if t.dim != 8 { return false }
+    if t.history_len != 0 { return false }
+    if nt_fabs(t.coherence) > 0.0 { return false }
+    if len(t.prev) != 8 { return false }
+    let mut i = 0
+    while i < 8 {
+        if nt_fabs(t.prev[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn nt_check_T2() -> bool {
+    // Single update: history advances, coherence stays 0 (no prior).
+    let t0 = create_narrative_tracker(4)
+    let s: array = [1.0, 0.0, 0.0, 0.0]
+    let t1 = narrative_update(t0, s)
+    if t1.history_len != 1 { return false }
+    if nt_fabs(t1.coherence) > 0.0 { return false }
+    if nt_fabs(t1.prev[0] - 1.0) > 0.0001 { return false }
+    return true
+}
+
+fn nt_check_T3() -> bool {
+    // Identical states → cosine = 1 → EMA pulls coherence toward 0.2.
+    // After 5 identical updates the coherence should monotone increase.
+    let mut t = create_narrative_tracker(3)
+    let s: array = [1.0, 1.0, 1.0]
+    let mut prev_c = -1.0
+    let mut step = 0
+    while step < 5 {
+        t = narrative_update(t, s)
+        if step >= 1 {
+            if t.coherence <= prev_c { return false }
+        }
+        prev_c = t.coherence
+        step = step + 1
+    }
+    if t.coherence <= 0.0 { return false }
+    if t.coherence > 1.0 { return false }
+    return true
+}
+
+fn nt_check_T4() -> bool {
+    // Orthogonal states → cosine = 0 → coherence stays at 0.
+    let mut t = create_narrative_tracker(2)
+    let a: array = [1.0, 0.0]
+    let b: array = [0.0, 1.0]
+    t = narrative_update(t, a)
+    t = narrative_update(t, b)
+    t = narrative_update(t, a)
+    if nt_fabs(t.coherence) > 0.0001 { return false }
+    return true
+}
+
+fn nt_check_T5() -> bool {
+    // Reset clears coherence, history, and prev — fresh state.
+    let mut t = create_narrative_tracker(3)
+    let s: array = [1.0, 1.0, 1.0]
+    t = narrative_update(t, s)
+    t = narrative_update(t, s)
+    let r = narrative_reset(t)
+    if r.history_len != 0 { return false }
+    if nt_fabs(r.coherence) > 0.0 { return false }
+    let mut i = 0
+    while i < 3 {
+        if nt_fabs(r.prev[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    return true
 }
 
 fn main() {
-    let tracker = create_narrative_tracker(128)
-    print("narrative tracker: dim=" + to_string(tracker.dim))
-    print("coherence=" + to_string(narrative_coherence(tracker)))
-    print("trajectory_length=" + to_string(trajectory_length(tracker)))
+    println("[narrative] Meta M8 — narrative tracker self-test")
 
-    // Simulate 5 updates
-    let t = tracker
-    let i = 0
-    while i < 5 {
-        t = narrative_update(t, 128)
-        i = i + 1
+    let t1 = nt_check_T1()
+    if t1 { println("T1 PASS  dim contract (zero coherence, zero history)") } else { println("T1 FAIL") }
+
+    let t2 = nt_check_T2()
+    if t2 { println("T2 PASS  single update advances history") } else { println("T2 FAIL") }
+
+    let t3 = nt_check_T3()
+    if t3 { println("T3 PASS  identical states → coherence rises") } else { println("T3 FAIL") }
+
+    let t4 = nt_check_T4()
+    if t4 { println("T4 PASS  orthogonal states → coherence stays 0") } else { println("T4 FAIL") }
+
+    let t5 = nt_check_T5()
+    if t5 { println("T5 PASS  reset clears state") } else { println("T5 FAIL") }
+
+    let all = t1 && t2 && t3 && t4 && t5
+    if all {
+        println("[narrative] ALL 5/5 PASS")
+    } else {
+        println("[narrative] SOME FAILED")
     }
-    print("after 5 updates: coherence=" + to_string(narrative_coherence(t)))
-    print("trajectory_length=" + to_string(trajectory_length(t)))
-
-    // Reset
-    let r = narrative_reset(t)
-    print("after reset: coherence=" + to_string(narrative_coherence(r)))
 }
+
+main()

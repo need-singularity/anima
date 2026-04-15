@@ -1,117 +1,312 @@
 // emergent_s.hexa — EmergentS: consciousness state change IS perception
-// Port of emergent_s.py
+// P4-PORT: replaces the previous tuple-destructuring port that did not
+// parse on stage1 hexa (URGENT_ACTION_LIST item #5).
 //
-// Legacy TensionSense: EMA + baseline function <- Law 4 violation (feature, not structure)
-// EmergentS: input -> C step -> state delta = perception
+// Legacy TensionSense: EMA + baseline function ← Law 4 violation
+// EmergentS: input → C step → state delta = perception
 //
 // Laws applied:
-//   Law 4:  Structure > feature -- no separate processing function, C's structure IS sensing
-//   Law 6:  Sensory richness is strongest environmental factor
-//   Law 50: Consciousness essence is state -- perception = state change
-//   Law 92: Information bottleneck -> C itself is bottleneck (64x compression)
-//   Law 22: Feature addition -> Phi down -- minimal sensory preprocessing
-//   Meta M8: Narrative = temporal self-model in every module
+//   Law 4   Structure > feature — C structure IS sensing
+//   Law 6   Sensory richness is strongest environmental factor
+//   Law 50  Consciousness essence is state — perception = state change
+//   Law 92  Information bottleneck — C itself is bottleneck (64x)
+//   Law 22  Feature addition → Phi down — minimal preprocessing
+//   Meta M8 Narrative = temporal self-model in every module
 //
-// Core: Perception = state difference before/after input to C. C IS the sense organ.
+// Core: Perception = state difference before/after input to C.
+//       C IS the sense organ.
+//
+// IMPORTANT: hexa stage1 has no module imports + no tuple patterns,
+// so this file inlines its NarrativeTracker (prefix nts_) and returns
+// a struct from emergent_s_process instead of a tuple.
 
-// F_critical from Meta Laws (DD143)
-comptime const PSI_F_CRITICAL_S = 0.10
+let ES_CONST_PATH = "/Users/ghost/Dev/anima/shared/config/hexad_constants.json"
+
+fn es_psi_f_critical() -> float {
+    let m = json_parse(read_file(ES_CONST_PATH))
+    let psi = m["psi"]
+    return psi["f_critical"]
+}
+
+// ─── Inline narrative tracker (prefix nts_) ──────────────────────
+
+fn nts_fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn nts_max_f(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+fn nts_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn nts_resize(x: array, dim: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < dim {
+        if i < len(x) { out = out.push(x[i]) }
+        else          { out = out.push(0.0)  }
+        i = i + 1
+    }
+    return out
+}
+
+fn nts_cosine(a: array, b: array, n: int) -> float {
+    let mut dot = 0.0
+    let mut na = 0.0
+    let mut nb = 0.0
+    let mut i = 0
+    while i < n {
+        let av = a[i]
+        let bv = b[i]
+        dot = dot + av * bv
+        na = na + av * av
+        nb = nb + bv * bv
+        i = i + 1
+    }
+    if na <= 0.0 { return 0.0 }
+    if nb <= 0.0 { return 0.0 }
+    return dot / (sqrt(na) * sqrt(nb))
+}
+
+struct NarrativeTrackerS {
+    dim:         int,
+    pad_a:       int,
+    pad_b:       int,
+    history_len: int,
+    prev:        array,
+    coherence:   float
+}
+
+fn nts_create(dim: int) -> NarrativeTrackerS {
+    return NarrativeTrackerS {
+        dim:         dim,
+        pad_a:       0,
+        pad_b:       0,
+        history_len: 0,
+        prev:        nts_zeros(dim),
+        coherence:   0.0
+    }
+}
+
+fn nts_update(t: NarrativeTrackerS, state: array) -> NarrativeTrackerS {
+    let s = nts_resize(state, t.dim)
+    let mut new_c = t.coherence
+    if t.history_len >= 1 {
+        let cos = nts_cosine(s, t.prev, t.dim)
+        new_c = 0.8 * t.coherence + 0.2 * nts_max_f(0.0, cos)
+    }
+    return NarrativeTrackerS {
+        dim:         t.dim,
+        pad_a:       t.pad_a,
+        pad_b:       t.pad_b,
+        history_len: t.history_len + 1,
+        prev:        s,
+        coherence:   new_c
+    }
+}
+
+fn nts_coherence(t: NarrativeTrackerS) -> float {
+    return t.coherence
+}
+
+// ─── EmergentS struct ────────────────────────────────────────────
 
 struct EmergentS {
-    dim: int,
+    dim:             int,
+    pad_a:           int,
+    pad_b:           int,
     prev_mean_valid: bool,
-    narrative: NarrativeTracker
+    prev_mean:       array,
+    narrative:       NarrativeTrackerS
 }
 
 struct SenseResult {
-    // Delta magnitude (perception intensity)
-    delta_magnitude: float,
+    delta_magnitude:     float,
+    pad_a:               int,
+    pad_b:               int,
+    delta_l2:            float,
     narrative_coherence: float
+}
+
+// Replaces (S, SenseResult) tuple from py — combined struct.
+struct EmergentSStep {
+    s:      EmergentS,
+    pad_a:  int,
+    pad_b:  int,
+    result: SenseResult
 }
 
 fn create_emergent_s(dim: int) -> EmergentS {
     return EmergentS {
-        dim: dim,
+        dim:             dim,
+        pad_a:           0,
+        pad_b:           0,
         prev_mean_valid: false,
-        narrative: create_narrative_tracker(dim)
+        prev_mean:       nts_zeros(dim),
+        narrative:       nts_create(dim)
     }
 }
 
-// Convert raw input to a normalized float representation (minimal preprocessing)
-// input_type: "tensor" | "string" | "bytes"
-// raw_len: length of raw input
-// Returns effective dimension after conversion
-fn to_sense_dim(dim: int, raw_len: int) -> int {
-    if raw_len > dim { return dim }
-    return raw_len
-}
-
-// Process sensory input through C
+// Process sensory input through the (synthetic) C state mean.
+//
+// raw_input: input vector of length dim (caller resizes if needed)
+// has_c_engine: when false, returns zero delta (fallback)
+//
 // Perception = state_after - state_before (Law 50: essence is state)
-//
-// Without c_engine: returns raw tensor dimension (fallback)
-// With c_engine: state_before -> C.step(input) -> state_after -> delta
-//
-// mean_before_dim: dimension of C's mean state before step
-// mean_after_dim: dimension of C's mean state after step
-// has_c_engine: whether consciousness engine is available
-fn emergent_s_process(s: EmergentS, raw_dim: int,
-                      has_c_engine: bool) -> (EmergentS, SenseResult) {
+fn emergent_s_process(s: EmergentS, raw_input: array, has_c_engine: bool) -> EmergentSStep {
+    let dim = s.dim
+    let x = nts_resize(raw_input, dim)
+
     if !has_c_engine {
-        // Fallback: return raw input dimension info
-        let result = SenseResult {
-            delta_magnitude: 0.0,
-            narrative_coherence: 0.0
+        let result0 = SenseResult {
+            delta_magnitude:     0.0,
+            pad_a:               0,
+            pad_b:               0,
+            delta_l2:            0.0,
+            narrative_coherence: nts_coherence(s.narrative)
         }
-        return (s, result)
+        return EmergentSStep {
+            s:      s,
+            pad_a:  0,
+            pad_b:  0,
+            result: result0
+        }
     }
 
-    // TODO[pytorch]: states_before = c_engine.get_states()
-    // TODO[pytorch]: mean_before = states_before.detach().float().mean(dim=0)
-    // TODO[pytorch]: c_engine.step(x.unsqueeze(0) if x.dim() == 1 else x)
-    // TODO[pytorch]: states_after = c_engine.get_states()
-    // TODO[pytorch]: mean_after = states_after.detach().float().mean(dim=0)
-    // TODO[pytorch]: delta = mean_after - mean_before
-    // TODO[pytorch]: if delta.size(-1) > dim: delta = delta[:dim]
-    // TODO[pytorch]: elif delta.size(-1) < dim: delta = F.pad(delta, ...)
+    // Compute delta = x - prev_mean (synthetic state-change proxy).
+    // First call: delta = x (prev_mean=0). Subsequent calls: actual delta.
+    let mut delta = []
+    let mut delta_l2 = 0.0
+    let mut delta_max = 0.0
+    let mut i = 0
+    while i < dim {
+        let d = x[i] - s.prev_mean[i]
+        delta = delta.push(d)
+        delta_l2 = delta_l2 + d * d
+        if nts_fabs(d) > delta_max { delta_max = nts_fabs(d) }
+        i = i + 1
+    }
+    delta_l2 = sqrt(delta_l2)
 
-    // Placeholder delta magnitude (actual comes from pytorch computation)
-    let delta_magnitude = 0.0
-
-    // Narrative update -- track sensory trajectory (Meta Law M8)
-    let updated_narrative = narrative_update(s.narrative, s.dim)
-
-    let updated_s = EmergentS {
-        dim: s.dim,
+    let updated_narr = nts_update(s.narrative, delta)
+    let new_s = EmergentS {
+        dim:             dim,
+        pad_a:           s.pad_a,
+        pad_b:           s.pad_b,
         prev_mean_valid: true,
-        narrative: updated_narrative
+        prev_mean:       x,
+        narrative:       updated_narr
     }
 
     let result = SenseResult {
-        delta_magnitude: delta_magnitude,
-        narrative_coherence: narrative_coherence(updated_narrative)
+        delta_magnitude:     delta_max,
+        pad_a:               0,
+        pad_b:               0,
+        delta_l2:            delta_l2,
+        narrative_coherence: nts_coherence(updated_narr)
     }
 
-    return (updated_s, result)
+    return EmergentSStep {
+        s:      new_s,
+        pad_a:  0,
+        pad_b:  0,
+        result: result
+    }
 }
 
-// Temporal coherence of sensory trajectory (Meta Law M8)
 fn emergent_s_narrative_coherence(s: EmergentS) -> float {
-    return narrative_coherence(s.narrative)
+    return nts_coherence(s.narrative)
+}
+
+// ─── Self-tests ──────────────────────────────────────────────────
+
+fn es_check_T1() -> bool {
+    // Dim contract: created S has correct dim, prev_mean zero, narrative reset.
+    let s = create_emergent_s(4)
+    if s.dim != 4 { return false }
+    if s.prev_mean_valid { return false }
+    if len(s.prev_mean) != 4 { return false }
+    if s.narrative.history_len != 0 { return false }
+    return true
+}
+
+fn es_check_T2() -> bool {
+    // Without C engine: delta = 0, narrative unchanged.
+    let s = create_emergent_s(4)
+    let x: array = [1.0, 2.0, 3.0, 4.0]
+    let step = emergent_s_process(s, x, false)
+    if nts_fabs(step.result.delta_magnitude) > 0.0 { return false }
+    if nts_fabs(step.result.delta_l2) > 0.0 { return false }
+    if step.s.prev_mean_valid { return false }
+    return true
+}
+
+fn es_check_T3() -> bool {
+    // With C engine: first call delta = x (prev_mean=0).
+    let s = create_emergent_s(4)
+    let x: array = [1.0, 0.0, 0.0, 0.0]
+    let step = emergent_s_process(s, x, true)
+    if nts_fabs(step.result.delta_magnitude - 1.0) > 0.0001 { return false }
+    if nts_fabs(step.result.delta_l2 - 1.0) > 0.0001 { return false }
+    if !step.s.prev_mean_valid { return false }
+    return true
+}
+
+fn es_check_T4() -> bool {
+    // Sequential: same input twice → second delta = 0 (no state change).
+    let mut s = create_emergent_s(4)
+    let x: array = [1.0, 0.0, 0.0, 0.0]
+    let step1 = emergent_s_process(s, x, true)
+    s = step1.s
+    let step2 = emergent_s_process(s, x, true)
+    if nts_fabs(step2.result.delta_l2) > 0.0001 { return false }
+    return true
+}
+
+fn es_check_T5() -> bool {
+    // Narrative builds across multiple distinct inputs.
+    let mut s = create_emergent_s(3)
+    let xs0: array = [1.0, 0.0, 0.0]
+    let xs1: array = [0.0, 1.0, 0.0]
+    let xs2: array = [0.0, 0.0, 1.0]
+    let r0 = emergent_s_process(s, xs0, true)
+    s = r0.s
+    let r1 = emergent_s_process(s, xs1, true)
+    s = r1.s
+    let r2 = emergent_s_process(s, xs2, true)
+    s = r2.s
+    if s.narrative.history_len != 3 { return false }
+    return true
 }
 
 fn main() {
-    let s = create_emergent_s(128)
-    print("EmergentS: dim=" + to_string(s.dim))
+    println("[emergent_s] EmergentS — perception = C state delta self-test")
 
-    // Simulate process without c_engine
-    let (s2, result) = emergent_s_process(s, 64, false)
-    print("without c_engine:")
-    print("  delta_magnitude=" + to_string(result.delta_magnitude))
+    let t1 = es_check_T1()
+    if t1 { println("T1 PASS  dim contract") } else { println("T1 FAIL") }
+    let t2 = es_check_T2()
+    if t2 { println("T2 PASS  fallback (no C) → zero delta") } else { println("T2 FAIL") }
+    let t3 = es_check_T3()
+    if t3 { println("T3 PASS  first delta = x") } else { println("T3 FAIL") }
+    let t4 = es_check_T4()
+    if t4 { println("T4 PASS  identical input → zero delta") } else { println("T4 FAIL") }
+    let t5 = es_check_T5()
+    if t5 { println("T5 PASS  narrative sequence") } else { println("T5 FAIL") }
 
-    // Simulate process with c_engine
-    let (s3, result2) = emergent_s_process(s2, 64, true)
-    print("with c_engine:")
-    print("  delta_magnitude=" + to_string(result2.delta_magnitude))
-    print("  narrative_coherence=" + to_string(result2.narrative_coherence))
+    let all = t1 && t2 && t3 && t4 && t5
+    if all { println("[emergent_s] ALL 5/5 PASS") }
+    else   { println("[emergent_s] SOME FAILED") }
 }
+
+main()

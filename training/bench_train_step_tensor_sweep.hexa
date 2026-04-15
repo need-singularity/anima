@@ -37,6 +37,42 @@ extern fn hxblas_sgemm(order: int, transA: int, transB: int, M: int, N: int, K: 
 @link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
 extern fn hxblas_version() -> int
 
+// ── Native fused attention softmax kernels (scale + causal mask + softmax in C)
+// ROOT CAUSE FIX: replaces O(S²) scalar hexa loops in attn_fwd_t/attn_bwd_t
+// which were the #1 MFU bottleneck (60%+ CPU in boxed int arithmetic).
+// These C functions do the same math but with native float*, no boxing overhead.
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_attn_softmax_causal(S: int, scale: float, scores: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_attn_softmax_bwd(S: int, scale: float, dscores: int, probs: int, dprobs: int)
+
+// ── Native elementwise + CE + embed FFI (hxblas_wrapper.c) ──────────
+// ROOT CAUSE: scalar deref_f32/write_f32 loops in Hexa compile to boxed
+// int arithmetic (hexa_mul/hexa_add per element), dominating >50% of step
+// time even after BLAS matmul port. These C functions do the same math
+// with native float* pointers — one FFI call per whole tensor.
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_axpy_inplace(N: int, dst: int, src: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_copy(N: int, dst: int, src: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_zero(N: int, dst: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_sgd_inplace(N: int, lr: float, w: int, g: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_cross_entropy(S: int, V: int, scale: float, logits: int, dlogits: int, targets: int) -> float
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_embed_lookup(S: int, D: int, h: int, embed_ptr: int, tokens: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_embed_scatter(S: int, D: int, dembed_ptr: int, dh: int, tokens: int)
+
 // ── vDSP (Accelerate) eltwise FFI — 2026-04-16 port (5-20x 예상) ─────
 @link("/Users/ghost/Dev/anima/training/build/libhxvdsp.dylib")
 extern fn hxvdsp_rmsnorm_fwd(S: int, D: int, x: *Void, gain: *Void, eps: float, out: *Void)
@@ -117,23 +153,17 @@ fn t_matmul_transA(a: Tensor, b: Tensor, K: int) -> Tensor {
 }
 
 // ── Elementwise helpers ───────────────────────────────────────────────
+// ROOT CAUSE FIX: scalar deref_f32/write_f32 loop compiled to boxed int
+// arithmetic per element. Native C hxblas_axpy_inplace does dst[i]+=src[i]
+// in a tight float* loop that auto-vectorises to NEON on Apple Silicon.
 fn t_add_inplace(dst: Tensor, src: Tensor) {
-    let mut i = 0
-    while i < dst.numel {
-        let a = deref_f32(dst.data, i * 4)
-        let b = deref_f32(src.data, i * 4)
-        write_f32(dst.data, i * 4, a + b)
-        i = i + 1
-    }
+    hxblas_axpy_inplace(dst.numel, dst.data, src.data)
 }
 
+// ROOT CAUSE FIX: scalar copy loop → native memcpy via hxblas_copy.
 fn t_copy(src: Tensor) -> Tensor {
     let out = tensor_new2(src.d0, src.d1)
-    let mut i = 0
-    while i < src.numel {
-        write_f32(out.data, i * 4, deref_f32(src.data, i * 4))
-        i = i + 1
-    }
+    hxblas_copy(src.numel, out.data, src.data)
     return out
 }
 
@@ -219,27 +249,14 @@ fn attn_fwd_t(Q: Tensor, K: Tensor, V: Tensor) -> AttnOut {
     let D = Q.d1
     let inv_sqrt_d = 1.0 / sqrt(to_float(D))
 
-    // Q @ K^T → probs[S, S] via BLAS (K stored [S, D] row-major)
+    // Q @ K^T → probs[S, S] via BLAS sgemm (K stored [S, D] row-major)
     let probs = t_matmul_transB(Q, K, S)
 
-    // in-place scale + causal mask + per-row softmax (O(S²) scalar leftover)
-    let mut i = 0
-    while i < S {
-        let mut j = 0
-        while j < S {
-            if j > i {
-                write_f32(probs.data, (i * S + j) * 4, 0.0 - 10000.0)
-            } else {
-                let v = deref_f32(probs.data, (i * S + j) * 4)
-                write_f32(probs.data, (i * S + j) * 4, v * inv_sqrt_d)
-            }
-            j = j + 1
-        }
-        softmax_row_t(probs, i * S, S)
-        i = i + 1
-    }
+    // Fused scale + causal mask + softmax in native C — replaces O(S²) scalar
+    // hexa loop that was the #1 MFU bottleneck (boxed int mul/add per element).
+    hxblas_attn_softmax_causal(S, inv_sqrt_d, probs.data)
 
-    // probs @ V → out[S, D] via BLAS
+    // probs @ V → out[S, D] via BLAS sgemm
     let out = t_matmul(probs, V)
 
     return AttnOut { out: out, probs: probs }
@@ -256,46 +273,27 @@ fn attn_bwd_t(Q: Tensor, K: Tensor, V: Tensor, probs: Tensor, dctx: Tensor) -> A
     let D = Q.d1
     let inv_sqrt_d = 1.0 / sqrt(to_float(D))
 
-    // dV = probs^T @ dctx   (S,S)^T @ (S,D) → (S,D) via BLAS
+    // dV = probs^T @ dctx   (S,S)^T @ (S,D) → (S,D) via BLAS sgemm
     let dV = t_matmul_transA(probs, dctx, S)
 
-    // dprobs = dctx @ V^T   (S,D) @ (S,D)^T → (S,S) via BLAS
+    // dprobs = dctx @ V^T   (S,D) @ (S,D)^T → (S,S) via BLAS sgemm
     let dprobs = t_matmul_transB(dctx, V, S)
 
-    // softmax bwd + causal mask — build dS[S,S] (O(S²) scalar leftover)
-    let dS = tensor_new2(S, S)
-    let mut i = 0
-    while i < S {
-        let mut s_acc = 0.0
-        let mut j = 0
-        while j < S {
-            let pij = deref_f32(probs.data, (i * S + j) * 4)
-            let dpij = deref_f32(dprobs.data, (i * S + j) * 4)
-            s_acc = s_acc + pij * dpij
-            j = j + 1
-        }
-        j = 0
-        while j < S {
-            if j > i {
-                write_f32(dS.data, (i * S + j) * 4, 0.0)
-            } else {
-                let pij = deref_f32(probs.data, (i * S + j) * 4)
-                let dpij = deref_f32(dprobs.data, (i * S + j) * 4)
-                write_f32(dS.data, (i * S + j) * 4, pij * (dpij - s_acc) * inv_sqrt_d)
-            }
-            j = j + 1
-        }
-        i = i + 1
-    }
+    // Fused softmax-backward with causal mask in native C — replaces O(S²)
+    // scalar hexa loop (2 passes per row: dot-product + jacobian-vector product).
+    // hxblas_attn_softmax_bwd writes dscores = probs * (dprobs - row_dot) * scale,
+    // with j > i masked to 0.
+    let dscores = tensor_new2(S, S)
+    hxblas_attn_softmax_bwd(S, inv_sqrt_d, dscores.data, probs.data, dprobs.data)
 
-    // dQ = dS @ K      (S,S) @ (S,D) → (S,D) via BLAS
-    let dQ = t_matmul(dS, K)
+    // dQ = dscores @ K      (S,S) @ (S,D) → (S,D) via BLAS sgemm
+    let dQ = t_matmul(dscores, K)
 
-    // dK = dS^T @ Q    (S,S)^T @ (S,D) → (S,D) via BLAS
-    let dK = t_matmul_transA(dS, Q, S)
+    // dK = dscores^T @ Q    (S,S)^T @ (S,D) → (S,D) via BLAS sgemm
+    let dK = t_matmul_transA(dscores, Q, S)
 
     tensor_free(dprobs)
-    tensor_free(dS)
+    tensor_free(dscores)
     return AttnBwd { dQ: dQ, dK: dK, dV: dV }
 }
 
@@ -420,14 +418,10 @@ fn layer_bwd_t(
 }
 
 // ── SGD in-place ──────────────────────────────────────────────────────
+// ROOT CAUSE FIX: scalar SGD loop → native C w[i]-=lr*g[i] loop.
+// Eliminates boxed int per-element overhead on large weight tensors.
 fn sgd_inplace_t(w: Tensor, g: Tensor, lr: float) {
-    let mut i = 0
-    while i < w.numel {
-        let wi = deref_f32(w.data, i * 4)
-        let gi = deref_f32(g.data, i * 4)
-        write_f32(w.data, i * 4, wi - lr * gi)
-        i = i + 1
-    }
+    hxblas_sgd_inplace(w.numel, lr, w.data, g.data)
 }
 
 // ── PRNG for window sampling ──────────────────────────────────────────

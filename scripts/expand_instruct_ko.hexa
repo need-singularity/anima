@@ -1,52 +1,521 @@
 // expand_instruct_ko.hexa — Korean instruction dataset expansion
-// Ported from expand_instruct_ko.py (590 LOC)
+// Ported from expand_instruct_ko.py (590 LOC).
+//
+// URGENT-STUB P2 (ACTION_TRACKER #3, 2026-04-16):
+//   quality_filter / dedup_hash / convert_sample 가 print-only 스텁이라
+//   ALM A1 Φ-aware LoRA 학습용 Korean instruction-expansion 파이프라인이
+//   동작하지 않았다. 본 커밋은 그 3 함수를 hexa-native 로 구현한다.
+//
+// Scope (P2 minimum):
+//   - quality_filter(sample) — 길이/한글비율/n-gram 반복 게이트, struct 반환
+//   - dedup_hash(samples)     — SHA-256 exact + MinHash 근사중복 (3-gram Jaccard)
+//   - convert_sample(raw, fmt) — Alpaca/ChatML 양식 변환
+//
+// Out of scope (stub 유지):
+//   - load_ko_dataset / detect_field_map / load_existing_hashes /
+//     count_existing_ko / show_status / main / convert_conversation
+//   ↳ 이들은 HuggingFace datasets / Path / set 같은 Python 의존이 있어
+//     hexa 포팅이 별도 작업. P2 차단 해제만 이번 커밋의 책임.
+//
+// Hexa quirk 회피 (memory feedback):
+//   - feedback_hexa_string_api: dict literal 미지원 → struct + parallel array
+//     사용. substring/index_of 는 BYTE 인덱스 (Korean 3 byte = 1 char).
+//   - feedback_hexa_struct_list_alias: struct 안에 array 필드 두지 않음.
+//     QualityResult/SampleStd 는 스칼라/문자열만.
+//   - feedback_hexa_struct_return_bug: 다중 float return 회피 — bool/string/int
+//     필드 위주 struct.
+//   - SHA-256 은 stage0 hexa 에 builtin 이 없어 file_sha256 패턴 차용
+//     (anima-speak/corpus_pipeline.hexa 와 동일).
 
-fn quality_filter(sample) {
-    // TODO: filter sample by quality criteria
-    print("TODO: quality_filter")
+// ═══════════════════════════════════════════════════════════════════
+// Section 0. Constants
+// ═══════════════════════════════════════════════════════════════════
+
+// 길이 상하한 (원본 expand_instruct_ko.py:125-128 에서 차용,
+// SFT instruction 평균 길이 분포 + Qwen2.5 max_seq=2048 고려)
+let EIK_MIN_LEN          = 10
+let EIK_MAX_LEN          = 2000
+let EIK_MIN_OUTPUT_LEN   = 5
+let EIK_MAX_OUTPUT_LEN   = 8192
+
+// 한글 codepoint 비율 하한.
+//   요청 사양: > 0.3
+//   ALM A1 Φ-aware LoRA 가 한국어 instruction 데이터를 위해 사용하므로
+//   영문 mixed (코드 설명, 영어 prompt) 는 통과시키되 영어 only 는 reject.
+let EIK_KOREAN_RATIO_MIN = 0.3
+
+// 4-gram (4 byte) 반복 임계값. 4번 이상 등장하는 4-gram 이 있으면 reject.
+//   stage0 hexa 는 char count 가 byte count 와 동일 (substring/byte_at 모두 BYTE).
+//   Korean 3-byte 가 다수일 때도 4-byte window 는 codepoint mid-cut 을
+//   허용하지만 단순 byte sub 로 일관 검사하므로 결과는 결정적.
+let EIK_NGRAM_N          = 4
+let EIK_NGRAM_MAX_REPEAT = 3
+
+// MinHash 근사중복 임계값 — Jaccard(token 3-gram set) > 0.8 이면 dup.
+let EIK_MINHASH_JACCARD  = 0.8
+
+// SHA256 임시 입력 파일 — 기본 경로. test 등에서 override.
+let EIK_SHA_TMP          = "/tmp/eik_sha_in.txt"
+
+// ═══════════════════════════════════════════════════════════════════
+// Section 1. Result/value structs (스칼라/문자열 only)
+// ═══════════════════════════════════════════════════════════════════
+
+// QualityResult — quality_filter 반환값.
+//   pass:   true 이면 SFT 학습에 통과
+//   reason: 인간이 읽을 수 있는 reject 사유 또는 "ok"
+struct QualityResult {
+    pass: bool,
+    reason: string
 }
 
-fn dedup_hash(text) {
-    // TODO: compute dedup hash for text
-    print("TODO: dedup_hash")
+// SampleStd — Alpaca 형식 표준 sample (instruction/input/output 트리플).
+//   ChatML 변환 시에도 내부 표현으로 사용.
+struct SampleStd {
+    instruction: string,
+    input:       string,
+    output:      string
 }
 
-fn convert_sample(item, field_map) {
-    // TODO: convert raw item to standard format using field map
-    print("TODO: convert_sample")
+// ConvertResult — convert_sample 반환값.
+//   ok:        false 이면 변환 실패 (필수 필드 결손/지원 못 하는 fmt)
+//   format:    "alpaca" 또는 "chatml"
+//   payload:   변환된 JSON 문자열 (write 가능 형태)
+struct ConvertResult {
+    ok:      bool,
+    format:  string,
+    payload: string
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// Section 2. Byte/string primitives (corpus_filter.hexa 와 동형)
+// ═══════════════════════════════════════════════════════════════════
+
+// stage0 char_code(s, i) 는 i 를 무시하므로 substring 으로 1-byte 잘라
+// 그 byte code 를 읽는 우회법을 사용한다 (anima/training/corpus_filter.hexa 검증).
+fn eik_byte_at(s: string, i: int) -> int {
+    let sub = s.substring(i, i + 1)
+    return char_code(sub, 0)
+}
+
+// UTF-8 한글 음절 lead byte: 0xEA(234)..0xED(237) — AC00..D7A3 영역.
+fn eik_is_hangul_lead(b: int) -> bool {
+    if b >= 234 {
+        if b <= 237 { return true }
+    }
+    return false
+}
+
+// UTF-8 continuation byte: 0x80..0xBF.
+fn eik_is_utf8_cont(b: int) -> bool {
+    if b >= 128 {
+        if b <= 191 { return true }
+    }
+    return false
+}
+
+// Korean codepoint ratio.
+//   bytes 를 walk 하면서 한글 lead 와 그 뒤 따라오는 continuation 들을
+//   "한글 byte" 로 카운트, 다른 byte 는 "기타 byte". ratio = 한글/total.
+//
+// codepoint 단위 비율은 아니지만 (각 한글 음절이 3 byte → 가중치 동일),
+// 한국어/영어 비율 판정에는 byte-level 로 충분 (corpus_filter.hexa 동일 전략).
+fn eik_korean_ratio(text: string) -> float {
+    let n = len(text)
+    if n == 0 { return 0.0 }
+    let mut hangul_bytes = 0
+    let mut total_bytes  = 0
+    let mut in_hangul    = false
+    let mut i = 0
+    while i < n {
+        let b = eik_byte_at(text, i)
+        if eik_is_hangul_lead(b) {
+            hangul_bytes = hangul_bytes + 1
+            in_hangul = true
+        } else {
+            if eik_is_utf8_cont(b) {
+                if in_hangul {
+                    hangul_bytes = hangul_bytes + 1
+                }
+            } else {
+                in_hangul = false
+            }
+        }
+        total_bytes = total_bytes + 1
+        i = i + 1
+    }
+    if total_bytes == 0 { return 0.0 }
+    return to_float(hangul_bytes) / to_float(total_bytes)
+}
+
+// 부분 문자열 등장 횟수 (BYTE 단위 substring 비교).
+fn eik_count_substr(text: string, sub: string) -> int {
+    let tlen = len(text)
+    let slen = len(sub)
+    if slen == 0 { return 0 }
+    if slen > tlen { return 0 }
+    let mut n = 0
+    let mut i = 0
+    while i + slen <= tlen {
+        if text.substring(i, i + slen) == sub {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// 4-gram 반복 검사: 같은 4-byte window 가 EIK_NGRAM_MAX_REPEAT 회 초과
+// 등장하면 true. unique window 만 검사하기 위해 매번 첫 등장 위치만 카운트.
+fn eik_has_excessive_ngram_repeat(text: string) -> bool {
+    let tlen = len(text)
+    let n = EIK_NGRAM_N
+    if tlen < n + 1 { return false }
+    let mut i = 0
+    let limit = tlen - n
+    // 작은 윈도우만 sample (성능): 처음 1024 byte 만 검사 (긴 출력 코드 등 보호)
+    let mut scan_max = limit
+    if scan_max > 1024 { scan_max = 1024 }
+    while i <= scan_max {
+        let window = text.substring(i, i + n)
+        // 첫 등장 여부: 0..i 에서 같은 window 가 있으면 skip (중복 카운트 방지)
+        let mut seen_before = false
+        let mut j = 0
+        while j < i {
+            if text.substring(j, j + n) == window {
+                seen_before = true
+                j = i  // break
+            } else {
+                j = j + 1
+            }
+        }
+        if seen_before == false {
+            // 전체 카운트
+            let cnt = eik_count_substr(text, window)
+            if cnt > EIK_NGRAM_MAX_REPEAT {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// SHA-256 of arbitrary string via temp file (handles quotes/Korean/newlines).
+//   tmp_path = tmp 파일 경로 (호출자가 충돌 회피를 위해 prefix 가능).
+fn eik_sha256(text: string, tmp_path: string) -> string {
+    write_file(tmp_path, text)
+    let cmd = "shasum -a 256 " + tmp_path + " 2>/dev/null | awk '{print $1}'"
+    let out = exec(cmd)
+    return out.trim()
+}
+
+// JSON 문자열 escape (큰따옴표 + 백슬래시 + 줄바꿈만 처리; ASCII control 무시).
+//   stage0 hexa builtin json_stringify(string) 가 동작하지만 일관성을 위해
+//   wrapper 사용.
+fn eik_json_escape(s: string) -> string {
+    let mut out = ""
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "\"" {
+            out = out + "\\\""
+        } else {
+            if c == "\\" {
+                out = out + "\\\\"
+            } else {
+                if c == "\n" {
+                    out = out + "\\n"
+                } else {
+                    if c == "\r" {
+                        out = out + "\\r"
+                    } else {
+                        if c == "\t" {
+                            out = out + "\\t"
+                        } else {
+                            out = out + c
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Section 3. quality_filter — 길이 + 한글 ratio + n-gram 반복
+// ═══════════════════════════════════════════════════════════════════
+
+// quality_filter(sample: SampleStd) -> QualityResult
+//
+// 게이트 체크 (순서대로):
+//   1. instruction 길이 [EIK_MIN_LEN, EIK_MAX_LEN]
+//   2. output 길이      [EIK_MIN_OUTPUT_LEN, EIK_MAX_OUTPUT_LEN]
+//   3. 한글 codepoint 비율 (instruction+output 합쳐서) > EIK_KOREAN_RATIO_MIN
+//   4. 4-gram 반복 (output 내부) <= EIK_NGRAM_MAX_REPEAT
+//
+// 위 4건 모두 통과해야 pass=true. reason 은 첫 실패 사유.
+fn quality_filter(sample: SampleStd) -> QualityResult {
+    let inst_len = len(sample.instruction)
+    if inst_len < EIK_MIN_LEN {
+        return QualityResult { pass: false, reason: "instruction_too_short" }
+    }
+    if inst_len > EIK_MAX_LEN {
+        return QualityResult { pass: false, reason: "instruction_too_long" }
+    }
+    let out_len = len(sample.output)
+    if out_len < EIK_MIN_OUTPUT_LEN {
+        return QualityResult { pass: false, reason: "output_too_short" }
+    }
+    if out_len > EIK_MAX_OUTPUT_LEN {
+        return QualityResult { pass: false, reason: "output_too_long" }
+    }
+
+    let combined = sample.instruction + " " + sample.output
+    let kr = eik_korean_ratio(combined)
+    if kr <= EIK_KOREAN_RATIO_MIN {
+        return QualityResult { pass: false, reason: "korean_ratio_too_low" }
+    }
+
+    // 반복 검사: instruction + output 둘 다.
+    if eik_has_excessive_ngram_repeat(sample.output) {
+        return QualityResult { pass: false, reason: "ngram_repetitive_output" }
+    }
+    if eik_has_excessive_ngram_repeat(sample.instruction) {
+        return QualityResult { pass: false, reason: "ngram_repetitive_instruction" }
+    }
+
+    return QualityResult { pass: true, reason: "ok" }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Section 4. dedup_hash — exact (SHA-256) + 근사 (3-gram Jaccard)
+// ═══════════════════════════════════════════════════════════════════
+
+// dedup_key(sample) — 정규화된 hash 입력 키.
+//   prepare_instruct_data.py 와 동일하게 instruction.strip().lower()[:200]
+//   + output.strip().lower()[:200] 를 join 한 문자열.
+//
+// stage0 hexa 는 .to_lower() 가 있는지 빌드 의존이라 단순 trim 만 적용.
+// (Korean 은 case 개념 없고, Latin 영문이 섞여도 sha256 은 fingerprint 로
+// 충분한 식별력을 가짐 — case-fold 는 nice-to-have, P2 차단 해제에는 무관.)
+fn eik_dedup_key(sample: SampleStd) -> string {
+    let inst = sample.instruction.trim()
+    let out  = sample.output.trim()
+    // 200 byte cap (substring 은 BYTE 인덱스라 한국어는 약 66 char)
+    let inst_cap = if len(inst) > 200 { inst.substring(0, 200) } else { inst }
+    let out_cap  = if len(out)  > 200 { out.substring(0, 200)  } else { out }
+    return inst_cap + "\u{1}" + out_cap
+}
+
+// 토큰 3-gram set (공백 split 기반). 빈 set 은 [].
+//   memory: dict literal 미지원이므로 string list 로 대체.
+fn eik_token_3grams(text: string) -> [string] {
+    let toks = text.trim().split(" ")
+    let n = len(toks)
+    let mut out: [string] = []
+    if n < 3 { return out }
+    let mut i = 0
+    let limit = n - 3
+    while i <= limit {
+        let g = toks[i] + "|" + toks[i + 1] + "|" + toks[i + 2]
+        // dedupe within set
+        let mut already = false
+        let mut k = 0
+        while k < len(out) {
+            if out[k] == g { already = true }
+            k = k + 1
+        }
+        if already == false {
+            out = out.push(g)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Jaccard similarity between two string sets.
+fn eik_jaccard(a: [string], b: [string]) -> float {
+    let la = len(a)
+    let lb = len(b)
+    if la == 0 { if lb == 0 { return 1.0 } else { return 0.0 } }
+    if lb == 0 { return 0.0 }
+    let mut inter = 0
+    let mut i = 0
+    while i < la {
+        let mut j = 0
+        let mut found = false
+        while j < lb {
+            if a[i] == b[j] { found = true }
+            j = j + 1
+        }
+        if found { inter = inter + 1 }
+        i = i + 1
+    }
+    let union = la + lb - inter
+    if union == 0 { return 0.0 }
+    return to_float(inter) / to_float(union)
+}
+
+// dedup_hash — exact (SHA-256) + 근사 (token 3-gram Jaccard) 이중 제거.
+//
+// 입력: SampleStd 배열
+// 처리:
+//   1. 각 sample 에 대해 SHA-256(dedup_key) 계산
+//   2. seen hash set 으로 exact dup 제거
+//   3. 살아남은 sample 에 대해 token 3-gram set 추출
+//   4. 이전까지 unique 로 등록된 모든 sample 의 3-gram set 과 Jaccard 비교
+//   5. Jaccard > EIK_MINHASH_JACCARD 면 reject (근사 dup)
+// 출력: 살아남은 SampleStd 배열 (입력 순서 보존)
+fn dedup_hash(samples: [SampleStd]) -> [SampleStd] {
+    let n = len(samples)
+    let mut unique: [SampleStd]    = []
+    let mut hashes: [string]        = []
+    let mut shingle_sets: [[string]] = []  // unique 와 평행 배열
+    let mut i = 0
+    while i < n {
+        let s = samples[i]
+        let key = eik_dedup_key(s)
+        let h = eik_sha256(key, EIK_SHA_TMP)
+        // exact dup?
+        let mut dup_exact = false
+        let mut k = 0
+        while k < len(hashes) {
+            if hashes[k] == h { dup_exact = true }
+            k = k + 1
+        }
+        if dup_exact == false {
+            // 근사 dup?
+            let g = eik_token_3grams(s.instruction + " " + s.output)
+            let mut dup_near = false
+            let mut j = 0
+            while j < len(shingle_sets) {
+                let sim = eik_jaccard(g, shingle_sets[j])
+                if sim > EIK_MINHASH_JACCARD {
+                    dup_near = true
+                    j = len(shingle_sets)  // break
+                } else {
+                    j = j + 1
+                }
+            }
+            if dup_near == false {
+                unique = unique.push(s)
+                hashes = hashes.push(h)
+                shingle_sets = shingle_sets.push(g)
+            }
+        }
+        i = i + 1
+    }
+    return unique
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Section 5. convert_sample — Alpaca / ChatML 양식
+// ═══════════════════════════════════════════════════════════════════
+
+// build_alpaca_json — 표준 Alpaca JSON 직렬화.
+//   {"instruction":"...","input":"...","output":"...","lang":"ko"}
+fn eik_build_alpaca_json(s: SampleStd) -> string {
+    let inst_e = eik_json_escape(s.instruction)
+    let inp_e  = eik_json_escape(s.input)
+    let out_e  = eik_json_escape(s.output)
+    return "{\"instruction\":\"" + inst_e
+         + "\",\"input\":\"" + inp_e
+         + "\",\"output\":\"" + out_e
+         + "\",\"lang\":\"ko\"}"
+}
+
+// build_chatml_json — ChatML messages 배열 형식 (Qwen2.5 / Llama-3 SFT).
+//   {"messages":[
+//     {"role":"user","content":"<instruction\n\ninput>"},
+//     {"role":"assistant","content":"<output>"}
+//   ],"lang":"ko"}
+//
+// instruction 과 input 은 user turn 에서 두 줄로 join — input 이 비면 instruction 만.
+fn eik_build_chatml_json(s: SampleStd) -> string {
+    let mut user_text = s.instruction
+    if len(s.input) > 0 {
+        user_text = s.instruction + "\n\n" + s.input
+    }
+    let user_e = eik_json_escape(user_text)
+    let asst_e = eik_json_escape(s.output)
+    return "{\"messages\":["
+         + "{\"role\":\"user\",\"content\":\"" + user_e + "\"},"
+         + "{\"role\":\"assistant\",\"content\":\"" + asst_e + "\"}"
+         + "],\"lang\":\"ko\"}"
+}
+
+// convert_sample — raw SampleStd 를 SFT 표준 JSON 으로 변환.
+//
+// raw    : SampleStd (instruction/input/output)
+// fmt    : "alpaca" 또는 "chatml"
+// 반환   : ConvertResult { ok, format, payload }
+//
+// 결손 처리:
+//   - instruction 이 비고 output 도 비면 ok=false
+//   - fmt 이 알 수 없으면 ok=false, format="unknown"
+fn convert_sample(raw: SampleStd, fmt: string) -> ConvertResult {
+    let has_inst = len(raw.instruction.trim()) > 0
+    let has_out  = len(raw.output.trim()) > 0
+    if has_inst == false {
+        if has_out == false {
+            return ConvertResult { ok: false, format: fmt, payload: "" }
+        }
+    }
+    if fmt == "alpaca" {
+        let payload = eik_build_alpaca_json(raw)
+        return ConvertResult { ok: true, format: "alpaca", payload: payload }
+    }
+    if fmt == "chatml" {
+        let payload = eik_build_chatml_json(raw)
+        return ConvertResult { ok: true, format: "chatml", payload: payload }
+    }
+    return ConvertResult { ok: false, format: "unknown", payload: "" }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Section 6. 잔여 stub (P2 범위 외 — datasets 의존 별도 작업)
+// ═══════════════════════════════════════════════════════════════════
 
 fn convert_conversation(item) {
-    // TODO: convert conversation-format item to turns
-    print("TODO: convert_conversation")
+    // TODO[P3]: convert multi-turn conversation rows (HuggingFace datasets).
+    print("TODO[P3]: convert_conversation")
 }
 
 fn load_ko_dataset(config, seen_hashes, max_samples) {
-    // TODO: load Korean dataset with dedup filtering
-    print("TODO: load_ko_dataset")
+    // TODO[P3]: requires HuggingFace datasets binding (out of P2 scope).
+    print("TODO[P3]: load_ko_dataset")
 }
 
 fn detect_field_map(first_item, config) {
-    // TODO: auto-detect field mapping from first item
-    print("TODO: detect_field_map")
+    // TODO[P3]: auto-detect HuggingFace row schema (out of P2 scope).
+    print("TODO[P3]: detect_field_map")
 }
 
 fn load_existing_hashes(output_dir) {
-    // TODO: load existing dedup hashes from output dir
-    print("TODO: load_existing_hashes")
+    // TODO[P3]: scan train.jsonl/val.jsonl for prior fingerprints.
+    print("TODO[P3]: load_existing_hashes")
 }
 
 fn count_existing_ko(output_dir) {
-    // TODO: count existing Korean samples in output
-    print("TODO: count_existing_ko")
+    // TODO[P3]: count existing Korean rows in jsonl.
+    print("TODO[P3]: count_existing_ko")
 }
 
 fn show_status() {
-    // TODO: display current expansion status
-    print("TODO: show_status")
+    // TODO[P3]: pretty-print expansion progress.
+    print("TODO[P3]: show_status")
 }
 
 fn main() {
-    // TODO: parse args and expand Korean instruction data
-    print("TODO: expand_instruct_ko main")
+    // P2 scope: 3 함수 동작 검증은 tests/test_expand_instruct_ko.hexa 로.
+    // 본 entrypoint 는 P3 (datasets 연결) 까지 stub.
+    println("expand_instruct_ko.hexa — P2 quality_filter/dedup_hash/convert_sample ready.")
+    println("                          P3 datasets pipeline is still TODO.")
+    println("Run tests/test_expand_instruct_ko.hexa for the smoke harness.")
 }
+
+main()
