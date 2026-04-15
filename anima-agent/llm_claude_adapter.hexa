@@ -197,35 +197,69 @@ fn parse_score_primary(resp: string, idx: int) -> CriticReply {
 
 // Keyword sentiment heuristic.
 // Positive signals → 0.85; negative → 0.40; neutral → 0.60.
-// Case-insensitive substring match on the response text.
+// Case-insensitive WORD-BOUNDARY match on the response text (keywords
+// wrapped in spaces to avoid false positives like "clear" in "unclear").
+// Note: negative keys are checked FIRST so "incomplete" wins over a stray
+// "good" in polite preamble ("a good attempt but incomplete").
 fn heuristic_reply(resp: string, tag: int) -> CriticReply {
+    // Normalize: lowercase, replace punctuation with spaces, pad with spaces
+    // so both leading and trailing keywords hit via " keyword " match.
     let lo = resp.to_lower()
-    let pos_keys = ["excellent", "great", "well-done", "well done", "high quality",
-                    "complete", "accurate", "thorough", "correct", "covers all",
-                    "good", "solid", "clear", "on point", "comprehensive", "fulfills"]
-    let neg_keys = ["poor", "incomplete", "missing", "wrong", "incorrect",
-                    "vague", "unclear", "fails", "does not", "doesn't", "off topic",
-                    "off-topic", "irrelevant", "shallow", "inadequate"]
-    let mut has_pos = false
+    let normalized = " " + punct_to_space(lo) + " "
+    let pos_keys = [" excellent ", " great ", " well-done ", " well done ",
+                    " high quality ", " complete ", " accurate ", " thorough ",
+                    " correct ", " covers all ", " good ", " solid ", " clear ",
+                    " on point ", " comprehensive ", " fulfills ", " fulfilled ",
+                    " hits ", " strong "]
+    // Note: apostrophes are stripped by punct_to_space, so "doesn't" becomes
+    // "doesn t" (with the separator space). We match " doesn t " accordingly.
+    let neg_keys = [" poor ", " incomplete ", " missing ", " wrong ", " incorrect ",
+                    " vague ", " unclear ", " fails ", " does not ", " doesn t ",
+                    " off topic ", " off-topic ", " irrelevant ", " shallow ",
+                    " inadequate ", " lacks ", " lacking ", " omits ", " fails to "]
+    // Negative first (stronger signal for grading)
     let mut has_neg = false
-    let mut i = 0
-    while i < len(pos_keys) {
-        if lo.contains(pos_keys[i]) { has_pos = true }
-        i = i + 1
-    }
     let mut j = 0
     while j < len(neg_keys) {
-        if lo.contains(neg_keys[j]) { has_neg = true }
+        if normalized.contains(neg_keys[j]) { has_neg = true }
         j = j + 1
     }
-    let score = if has_pos && !has_neg { 0.85 }
-                else if has_neg && !has_pos { 0.40 }
+    let mut has_pos = false
+    let mut i = 0
+    while i < len(pos_keys) {
+        if normalized.contains(pos_keys[i]) { has_pos = true }
+        i = i + 1
+    }
+    let score = if has_neg { 0.40 }
+                else if has_pos { 0.85 }
                 else { 0.60 }
     let tag_str = "[fallback=" + to_string(tag) + "]"
     return CriticReply {
         score: score,
         reason: summarize_reason(resp) + " " + tag_str
     }
+}
+
+// Replace ASCII punctuation with spaces so word-boundary matching works.
+// Do NOT replace '-' (some keys contain hyphens, e.g. "well-done", "off-topic").
+fn punct_to_space(s: string) -> string {
+    let mut r = s
+    r = r.replace(".", " ")
+    r = r.replace(",", " ")
+    r = r.replace(";", " ")
+    r = r.replace(":", " ")
+    r = r.replace("!", " ")
+    r = r.replace("?", " ")
+    r = r.replace("(", " ")
+    r = r.replace(")", " ")
+    r = r.replace("[", " ")
+    r = r.replace("]", " ")
+    r = r.replace("\"", " ")
+    r = r.replace("'", " ")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
 }
 
 // Clamp a float into [0, 1].
@@ -237,7 +271,9 @@ fn clamp01(x: float) -> float {
 
 // Return response truncated to its first ~160 chars, single-line.
 fn summarize_reason(resp: string) -> string {
-    let flat = resp.replace("\n", " ").replace("\r", " ").trim()
+    let f1 = resp.replace("\n", " ")
+    let f2 = f1.replace("\r", " ")
+    let flat = f2.trim()
     let n = len(flat)
     if n <= 160 { return flat }
     return flat.substring(0, 160)
