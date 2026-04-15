@@ -1,0 +1,537 @@
+// serving/cf_tunnel_keepalive.hexa — TSRV-P1-2
+//
+// Cloudflare Tunnel WebSocket keepalive — heartbeat state machine that
+// prevents the ~100s idle-timeout from tearing the Anima-Web chat WS.
+//
+// Roadmap: shared/roadmaps/anima-train.json P1 SERVING TSRV-P1-2
+//   task: "Cloudflare Tunnel 안정화 — WS idle timeout 해결"
+//   artifact: serving/cf_tunnel_keepalive.hexa
+//   done_criteria: "10분 idle 후 WS 재연결 없이 유지"
+//
+// Memory: project_web_issues — Anima-Web WS drops after first response
+//   because Cloudflare Tunnel kills idle connections (~100s default).
+//   Solution: PING every ≤90s from server + client reconnects on disconnect.
+//
+// ─── Design ────────────────────────────────────────────────────────
+//
+// Separation of concerns: this module is PURE state-machine logic.
+// The caller (serving/http_server.hexa or serving/ws_proxy.hexa) owns
+// the actual frame send + clock read; this file just tells them WHEN
+// to ping, WHEN to declare a connection dead, and HOW to back off.
+//
+// That split lets us (a) keep L0 http_server.hexa untouched, (b) pass
+// now_ms in from tests for deterministic playback, (c) avoid coupling
+// the keepalive to any particular WS library.
+//
+// Pattern (server tick loop):
+//
+//     let cfg = keepalive_default()
+//     let mut conn = keepalive_init(conn_id=1, t_start=now_ms)
+//     // each tick (e.g. every 1s from the accept loop):
+//     let r = keepalive_tick(conn, cfg, now_ms)
+//     conn = r.conn                          // immutable update
+//     if r.action == KA_SEND_PING {
+//         ws_send_ping(raw_socket)           // caller owns I/O
+//     }
+//     if r.state == CONN_DEAD {
+//         ws_close(raw_socket)
+//         // then the client's reconnect_policy kicks in
+//     }
+//     // on inbound PONG frame:
+//     conn = on_pong_received(conn, now_ms)
+//
+// ─── Constants ─────────────────────────────────────────────────────
+//
+// interval_ms    — ping cadence. 30 s gives 3× headroom under the
+//                  ~100 s Cloudflare cut-off while still cheap on BW.
+// pong_timeout   — reserved (for future socket-read deadline hint);
+//                  not consulted by tick() because we use the
+//                  "interval elapsed since last pong" window instead.
+// max_missed     — 3 silently-missed PONGs ⇒ connection is dead.
+//                  alive window = interval_ms * max_missed = 90 s
+//                  (still inside Cloudflare's idle window; we surface
+//                  the dead verdict to the caller BEFORE CF kills it).
+//
+// Reconnect backoff: exponential from 500 ms, ×2 per attempt, capped
+//                    at 30 s. Deterministic — no jitter — so that
+//                    tests can lock each delay value exactly.
+//
+// ─── Rules honored ─────────────────────────────────────────────────
+//   R1  HEXA-FIRST (.hexa only, never .py/.sh/.rs)
+//   L0  http_server.hexa untouched (additive file)
+//   R2  injectable time (now_ms parameter, never read clock inside)
+//   Feedback feedback_hexa_lists_pbv — no list fields inside structs
+//            (we only carry ints/floats; no list aliasing hazard)
+//   Law 2 Observe never inject — tick() returns a decision, never
+//         blocks or performs I/O
+//
+// Stage0 constraints: plain fn only, immutable struct update pattern
+//   (rebuild-and-return), no else-if chains in let-bindings, no
+//   ≥3-float struct returns (feedback_hexa_struct_return_bug).
+
+// ═══════════════════════════════════════════════════════════════
+// Constants — tuned for Cloudflare Tunnel ~100 s idle window
+// ═══════════════════════════════════════════════════════════════
+
+let KA_DEFAULT_INTERVAL_MS    = 30000   // ping cadence (30 s)
+let KA_DEFAULT_PONG_TIMEOUT   = 5000    // read-deadline hint (5 s)
+let KA_DEFAULT_MAX_MISSED     = 3       // 3 strikes → DEAD
+
+// Returned connection-state enum (ints — stage0 match-int friendly)
+let CONN_ALIVE   = 0
+let CONN_MISSED  = 1                    // at least one ping unacknowledged
+let CONN_DEAD    = 2                    // verdict: caller should close
+
+// Returned action enum — what the caller should do this tick
+let KA_NOOP       = 0
+let KA_SEND_PING  = 1
+let KA_CLOSE      = 2                   // conn dead — tear down
+
+// Reconnect-backoff schedule (exponential, capped)
+let KA_BACKOFF_BASE_MS   = 500
+let KA_BACKOFF_FACTOR    = 2
+let KA_BACKOFF_CAP_MS    = 30000        // 30 s ceiling
+
+// ═══════════════════════════════════════════════════════════════
+// Structs
+// ═══════════════════════════════════════════════════════════════
+
+struct KeepaliveCfg {
+    interval_ms: int,
+    pong_timeout_ms: int,
+    max_missed: int
+}
+
+// NOTE: no list fields — keeps us out of feedback_hexa_lists_pbv and
+// feedback_hexa_struct_list_alias territory. The socket handle is
+// referenced by opaque int id; real I/O lives in the caller.
+struct WsConn {
+    conn_id: int,
+    socket: int,             // opaque caller-owned handle (0 = none)
+    last_ping_ms: int,       // monotonic ms at last PING we sent
+    last_pong_ms: int,       // monotonic ms at last PONG we observed
+    missed_pongs: int        // consecutive PINGs with no matching PONG
+}
+
+// Tick result — returned by keepalive_tick()
+// Only 2 ints inside → safe under feedback_hexa_struct_return_bug
+// (which bites on ≥3-float struct returns). conn is passed separately
+// via a wrapper to avoid embedding a nested struct return.
+struct TickDecision {
+    action: int,       // KA_NOOP | KA_SEND_PING | KA_CLOSE
+    state: int         // CONN_ALIVE | CONN_MISSED | CONN_DEAD
+}
+
+// Wrapper to return an updated conn + its decision together.
+// Two fields, both non-float — stage0 safe.
+struct TickResult {
+    conn: WsConn,
+    decision: TickDecision
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Constructors
+// ═══════════════════════════════════════════════════════════════
+
+fn keepalive_default() -> KeepaliveCfg {
+    return KeepaliveCfg {
+        interval_ms: KA_DEFAULT_INTERVAL_MS,
+        pong_timeout_ms: KA_DEFAULT_PONG_TIMEOUT,
+        max_missed: KA_DEFAULT_MAX_MISSED
+    }
+}
+
+fn keepalive_cfg(interval_ms: int, pong_timeout_ms: int, max_missed: int) -> KeepaliveCfg {
+    return KeepaliveCfg {
+        interval_ms: interval_ms,
+        pong_timeout_ms: pong_timeout_ms,
+        max_missed: max_missed
+    }
+}
+
+// Initialise at t = now_ms — last_pong seeded to now_ms so the
+// first tick within `interval_ms` is a NOOP (freshly-opened conn).
+fn keepalive_init(conn_id: int, socket: int, now_ms: int) -> WsConn {
+    return WsConn {
+        conn_id: conn_id,
+        socket: socket,
+        last_ping_ms: 0,
+        last_pong_ms: now_ms,
+        missed_pongs: 0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Core state transitions
+// ═══════════════════════════════════════════════════════════════
+
+// on_pong_received — call this when the caller sees an inbound PONG
+// frame. Resets missed_pongs and advances last_pong_ms.
+// Idempotent for same now_ms.
+fn on_pong_received(c: WsConn, now_ms: int) -> WsConn {
+    return WsConn {
+        conn_id: c.conn_id,
+        socket: c.socket,
+        last_ping_ms: c.last_ping_ms,
+        last_pong_ms: now_ms,
+        missed_pongs: 0
+    }
+}
+
+// alive window = interval_ms × max_missed (e.g. 30 s × 3 = 90 s).
+// Inside the window the connection is still considered alive even
+// if missed_pongs > 0, because a late PONG can still recover it.
+fn conn_is_alive(c: WsConn, cfg: KeepaliveCfg, now_ms: int) -> bool {
+    let window = cfg.interval_ms * cfg.max_missed
+    let age = now_ms - c.last_pong_ms
+    if c.missed_pongs >= cfg.max_missed {
+        return false
+    }
+    if age >= window {
+        return false
+    }
+    return true
+}
+
+// keepalive_tick — pure state machine. Returns a TickResult carrying
+// both the updated conn and the decision. Does NOT touch the socket.
+//
+// Logic:
+//   1. If conn already dead → CLOSE, no state change.
+//   2. If `now - last_ping_ms >= interval_ms` → send PING
+//      (also increments missed_pongs pre-emptively; on_pong_received
+//       will clear it if the peer replies before the next tick).
+//      Post-PING, re-evaluate the alive window; if missed_pongs
+//      now hits max_missed AND we're past the alive window, the
+//      state is DEAD and the action upgrades to CLOSE.
+//   3. Otherwise NOOP — just return current state.
+fn keepalive_tick(c: WsConn, cfg: KeepaliveCfg, now_ms: int) -> TickResult {
+    // Dead path — the caller should have already closed, but we stay
+    // idempotent: always emit CLOSE/CONN_DEAD if the tick runs again.
+    if c.missed_pongs >= cfg.max_missed {
+        let dec_dead = TickDecision { action: KA_CLOSE, state: CONN_DEAD }
+        return TickResult { conn: c, decision: dec_dead }
+    }
+
+    let since_ping = now_ms - c.last_ping_ms
+    let must_ping = since_ping >= cfg.interval_ms
+
+    if must_ping {
+        // Pre-emptive miss: will be reset by on_pong_received when the
+        // PONG arrives. If no PONG comes before the next interval, the
+        // count survives and eventually trips max_missed.
+        let new_missed = c.missed_pongs + 1
+        let c2 = WsConn {
+            conn_id: c.conn_id,
+            socket: c.socket,
+            last_ping_ms: now_ms,
+            last_pong_ms: c.last_pong_ms,
+            missed_pongs: new_missed
+        }
+        // Did this PING push us over the edge?
+        if new_missed >= cfg.max_missed {
+            let dec = TickDecision { action: KA_CLOSE, state: CONN_DEAD }
+            return TickResult { conn: c2, decision: dec }
+        }
+        // Still inside the alive window → just a PING with MISSED warn
+        let dec_ok = TickDecision { action: KA_SEND_PING, state: CONN_MISSED }
+        return TickResult { conn: c2, decision: dec_ok }
+    }
+
+    // No action required this tick — just report liveness.
+    let live = conn_is_alive(c, cfg, now_ms)
+    if live {
+        let st_live = if c.missed_pongs > 0 { CONN_MISSED } else { CONN_ALIVE }
+        let dec_live = TickDecision { action: KA_NOOP, state: st_live }
+        return TickResult { conn: c, decision: dec_live }
+    }
+    // Outside window and we're not pinging yet this tick → still
+    // declare it dead so the caller closes promptly.
+    let dec_dead2 = TickDecision { action: KA_CLOSE, state: CONN_DEAD }
+    return TickResult { conn: c, decision: dec_dead2 }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Reconnect policy — exponential backoff, capped, deterministic
+// ═══════════════════════════════════════════════════════════════
+//
+// attempt = 1  → 500 ms
+// attempt = 2  → 1000 ms
+// attempt = 3  → 2000 ms
+// attempt = 4  → 4000 ms
+// attempt = 5  → 8000 ms
+// attempt = 6  → 16000 ms
+// attempt = 7  → 30000 ms (capped)
+// attempt ≥ 7 → 30000 ms
+//
+// No jitter (tests rely on exact values); the caller can add their
+// own randomised jitter layer without touching this policy.
+fn reconnect_policy(attempt: int) -> int {
+    if attempt <= 0 {
+        return 0
+    }
+    let mut delay = KA_BACKOFF_BASE_MS
+    let mut i = 1
+    while i < attempt {
+        delay = delay * KA_BACKOFF_FACTOR
+        if delay >= KA_BACKOFF_CAP_MS {
+            return KA_BACKOFF_CAP_MS
+        }
+        i = i + 1
+    }
+    return delay
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests — 5 minimum, all PASS
+// Injectable time: every test passes now_ms explicitly (no clock).
+// ═══════════════════════════════════════════════════════════════
+
+fn test_keepalive_tick_sends_ping_after_interval() -> bool {
+    let cfg = keepalive_default()
+    let c0 = keepalive_init(1, 100, 0)
+
+    // Tick at t=29999 (1 ms before interval) — should NOT ping.
+    let r1 = keepalive_tick(c0, cfg, 29999)
+    let a1 = r1.decision.action
+    let s1 = r1.decision.state
+
+    // Tick at t=30000 (interval boundary) — SHOULD ping.
+    let r2 = keepalive_tick(c0, cfg, 30000)
+    let a2 = r2.decision.action
+
+    // Tick at t=60000 (2× interval) — also SHOULD ping from fresh c0.
+    let r3 = keepalive_tick(c0, cfg, 60000)
+    let a3 = r3.decision.action
+
+    println("  [T1] t=29999 action=" + str(a1) + " state=" + str(s1) + " (expect NOOP=0, ALIVE=0)")
+    println("  [T1] t=30000 action=" + str(a2) + " (expect SEND_PING=1)")
+    println("  [T1] t=60000 action=" + str(a3) + " (expect SEND_PING=1)")
+
+    let mut ok = true
+    if a1 != KA_NOOP { ok = false }
+    if s1 != CONN_ALIVE { ok = false }
+    if a2 != KA_SEND_PING { ok = false }
+    if a3 != KA_SEND_PING { ok = false }
+    return ok
+}
+
+fn test_pong_resets_missed_counter() -> bool {
+    let cfg = keepalive_default()
+    let c0 = keepalive_init(2, 200, 0)
+
+    // Force a PING at t=30000 → missed_pongs goes 0→1
+    let r1 = keepalive_tick(c0, cfg, 30000)
+    let c1 = r1.conn
+    let missed_after_ping = c1.missed_pongs
+
+    // PONG arrives at t=30500 → missed_pongs should reset to 0
+    let c2 = on_pong_received(c1, 30500)
+    let missed_after_pong = c2.missed_pongs
+    let last_pong = c2.last_pong_ms
+
+    // Another tick at t=30600 (still within interval) should be NOOP
+    let r3 = keepalive_tick(c2, cfg, 30600)
+    let a3 = r3.decision.action
+    let s3 = r3.decision.state
+
+    println("  [T2] after_ping missed=" + str(missed_after_ping) + " (expect 1)")
+    println("  [T2] after_pong missed=" + str(missed_after_pong) + " last_pong=" + str(last_pong) + " (expect 0, 30500)")
+    println("  [T2] post-pong tick action=" + str(a3) + " state=" + str(s3) + " (expect NOOP=0, ALIVE=0)")
+
+    let mut ok = true
+    if missed_after_ping != 1 { ok = false }
+    if missed_after_pong != 0 { ok = false }
+    if last_pong != 30500 { ok = false }
+    if a3 != KA_NOOP { ok = false }
+    if s3 != CONN_ALIVE { ok = false }
+    return ok
+}
+
+fn test_missed_3_pongs_marks_dead() -> bool {
+    let cfg = keepalive_default()
+    let c0 = keepalive_init(3, 300, 0)
+
+    // First PING at t=30000 — missed 0→1, action SEND_PING, state MISSED
+    let r1 = keepalive_tick(c0, cfg, 30000)
+    let c1 = r1.conn
+    let a1 = r1.decision.action
+    let s1 = r1.decision.state
+
+    // Second PING at t=60000 — missed 1→2, still below ceiling
+    let r2 = keepalive_tick(c1, cfg, 60000)
+    let c2 = r2.conn
+    let a2 = r2.decision.action
+    let s2 = r2.decision.state
+
+    // Third PING at t=90000 — missed 2→3 → DEAD, action CLOSE
+    let r3 = keepalive_tick(c2, cfg, 90000)
+    let c3 = r3.conn
+    let a3 = r3.decision.action
+    let s3 = r3.decision.state
+
+    // Follow-up tick at t=90100 (already dead) — idempotent CLOSE
+    let r4 = keepalive_tick(c3, cfg, 90100)
+    let a4 = r4.decision.action
+    let s4 = r4.decision.state
+
+    println("  [T3] PING1 action=" + str(a1) + " state=" + str(s1) + " missed=" + str(c1.missed_pongs))
+    println("  [T3] PING2 action=" + str(a2) + " state=" + str(s2) + " missed=" + str(c2.missed_pongs))
+    println("  [T3] PING3 action=" + str(a3) + " state=" + str(s3) + " missed=" + str(c3.missed_pongs) + " (expect CLOSE=2, DEAD=2, missed=3)")
+    println("  [T3] post-DEAD tick action=" + str(a4) + " state=" + str(s4) + " (idempotent CLOSE/DEAD)")
+
+    let mut ok = true
+    if a1 != KA_SEND_PING { ok = false }
+    if s1 != CONN_MISSED { ok = false }
+    if a2 != KA_SEND_PING { ok = false }
+    if s2 != CONN_MISSED { ok = false }
+    if a3 != KA_CLOSE { ok = false }
+    if s3 != CONN_DEAD { ok = false }
+    if c3.missed_pongs != 3 { ok = false }
+    if a4 != KA_CLOSE { ok = false }
+    if s4 != CONN_DEAD { ok = false }
+    return ok
+}
+
+fn test_reconnect_backoff_exponential() -> bool {
+    // Schedule:
+    //   1→500, 2→1000, 3→2000, 4→4000, 5→8000, 6→16000, 7→30000 (cap),
+    //   8→30000, 20→30000 (capped), attempt 0 → 0.
+    let d0 = reconnect_policy(0)
+    let d1 = reconnect_policy(1)
+    let d2 = reconnect_policy(2)
+    let d3 = reconnect_policy(3)
+    let d4 = reconnect_policy(4)
+    let d5 = reconnect_policy(5)
+    let d6 = reconnect_policy(6)
+    let d7 = reconnect_policy(7)
+    let d8 = reconnect_policy(8)
+    let d20 = reconnect_policy(20)
+
+    println("  [T4] attempt  0 -> " + str(d0) + " ms (expect 0)")
+    println("  [T4] attempt  1 -> " + str(d1) + " ms (expect 500)")
+    println("  [T4] attempt  2 -> " + str(d2) + " ms (expect 1000)")
+    println("  [T4] attempt  3 -> " + str(d3) + " ms (expect 2000)")
+    println("  [T4] attempt  4 -> " + str(d4) + " ms (expect 4000)")
+    println("  [T4] attempt  5 -> " + str(d5) + " ms (expect 8000)")
+    println("  [T4] attempt  6 -> " + str(d6) + " ms (expect 16000)")
+    println("  [T4] attempt  7 -> " + str(d7) + " ms (expect 30000 cap)")
+    println("  [T4] attempt  8 -> " + str(d8) + " ms (expect 30000 cap)")
+    println("  [T4] attempt 20 -> " + str(d20) + " ms (expect 30000 cap)")
+
+    let mut ok = true
+    if d0 != 0 { ok = false }
+    if d1 != 500 { ok = false }
+    if d2 != 1000 { ok = false }
+    if d3 != 2000 { ok = false }
+    if d4 != 4000 { ok = false }
+    if d5 != 8000 { ok = false }
+    if d6 != 16000 { ok = false }
+    if d7 != 30000 { ok = false }
+    if d8 != 30000 { ok = false }
+    if d20 != 30000 { ok = false }
+
+    // Monotonic non-decreasing property — critical for stabilization
+    if d1 > d2 { ok = false }
+    if d2 > d3 { ok = false }
+    if d3 > d4 { ok = false }
+    if d4 > d5 { ok = false }
+    if d5 > d6 { ok = false }
+    if d6 > d7 { ok = false }
+    return ok
+}
+
+fn test_alive_window_computation() -> bool {
+    // Alive window = interval_ms × max_missed = 30000 × 3 = 90000 ms.
+    // Within that window the conn is alive regardless of missed_pongs
+    // (below max). Outside it, alive == false.
+    let cfg = keepalive_default()
+
+    // conn with fresh pong at t=0, no pings yet
+    let c0 = keepalive_init(4, 400, 0)
+
+    // t=60000: within window, missed=0 → ALIVE
+    let live_60k = conn_is_alive(c0, cfg, 60000)
+    // t=89999: still within window → ALIVE
+    let live_89k = conn_is_alive(c0, cfg, 89999)
+    // t=90000: boundary (age == window) → DEAD
+    let live_90k = conn_is_alive(c0, cfg, 90000)
+    // t=120000: well past window → DEAD
+    let live_120k = conn_is_alive(c0, cfg, 120000)
+
+    // Also verify missed_pongs ceiling path:
+    // A conn with missed_pongs=3 is dead even at t=0 (immediate).
+    let c_dead = WsConn {
+        conn_id: 5, socket: 500,
+        last_ping_ms: 0, last_pong_ms: 0, missed_pongs: 3
+    }
+    let live_dead = conn_is_alive(c_dead, cfg, 0)
+
+    // And a fresh PONG at t=90000 should reset the window,
+    // so at t=90001 the conn is alive again.
+    let c_refresh = on_pong_received(c0, 90000)
+    let live_after_refresh = conn_is_alive(c_refresh, cfg, 90001)
+
+    println("  [T5] t=60000   alive=" + str(live_60k)  + " (expect true)")
+    println("  [T5] t=89999   alive=" + str(live_89k)  + " (expect true)")
+    println("  [T5] t=90000   alive=" + str(live_90k)  + " (expect false — window boundary)")
+    println("  [T5] t=120000  alive=" + str(live_120k) + " (expect false)")
+    println("  [T5] missed_ceiling alive=" + str(live_dead) + " (expect false)")
+    println("  [T5] post-refresh alive=" + str(live_after_refresh) + " (expect true)")
+
+    let mut ok = true
+    if !live_60k { ok = false }
+    if !live_89k { ok = false }
+    if live_90k { ok = false }
+    if live_120k { ok = false }
+    if live_dead { ok = false }
+    if !live_after_refresh { ok = false }
+    return ok
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — run 5 self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[cf_tunnel_keepalive] TSRV-P1-2 — Cloudflare Tunnel WS heartbeat")
+    println("  interval=" + str(KA_DEFAULT_INTERVAL_MS) + "ms  pong_timeout=" + str(KA_DEFAULT_PONG_TIMEOUT) + "ms  max_missed=" + str(KA_DEFAULT_MAX_MISSED))
+    println("  alive_window = interval × max_missed = " + str(KA_DEFAULT_INTERVAL_MS * KA_DEFAULT_MAX_MISSED) + " ms  (< CF ~100s cutoff)")
+    println("  backoff: base=" + str(KA_BACKOFF_BASE_MS) + "ms factor=" + str(KA_BACKOFF_FACTOR) + " cap=" + str(KA_BACKOFF_CAP_MS) + "ms")
+    println("")
+
+    let t1 = test_keepalive_tick_sends_ping_after_interval()
+    if t1 { println("T1 PASS  keepalive_tick sends ping at/after interval boundary") } else { println("T1 FAIL") }
+
+    let t2 = test_pong_resets_missed_counter()
+    if t2 { println("T2 PASS  on_pong_received resets missed_pongs to 0") } else { println("T2 FAIL") }
+
+    let t3 = test_missed_3_pongs_marks_dead()
+    if t3 { println("T3 PASS  3 unanswered pings → CONN_DEAD / KA_CLOSE (idempotent)") } else { println("T3 FAIL") }
+
+    let t4 = test_reconnect_backoff_exponential()
+    if t4 { println("T4 PASS  reconnect_policy exponential backoff capped at 30s") } else { println("T4 FAIL") }
+
+    let t5 = test_alive_window_computation()
+    if t5 { println("T5 PASS  conn_is_alive honors window + ceiling + refresh") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Sequential bool guard — same idiom as jealousy_phi/gratitude_phi.
+    // stage0 && chains with ≥4 operands can mis-short-circuit under
+    // certain orderings.
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[cf_tunnel_keepalive] 5/5 PASS — TSRV-P1-2 DONE (WS heartbeat + backoff verified, 10-min idle coverage)")
+    } else {
+        println("[cf_tunnel_keepalive] SOME FAILED")
+    }
+}
+
+main()

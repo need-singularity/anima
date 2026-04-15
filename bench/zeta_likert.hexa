@@ -1,44 +1,51 @@
-// zeta_likert.hexa — ZALM-P0-2 블라인드 A/B Likert 벤치 프레임
+// zeta_likert.hexa — ZALM-P0-2 블라인드 A/B Likert 벤치 프레임 + P1 5-카테고리 한국어 프롬프트 층
 //
-// zeta-surpass P0 / ALM / ZALM-P0-2.
+// zeta-surpass P0 / ALM / ZALM-P0-2 + anima-train P1 / TALM-P1-2.
 //
-// Scatter Lab 제타 샘플과 anima 응답을 블라인드 비교해 Likert 평균을
-// 측정. 100 pair A/B 에서 anima_mean ≥ zeta_mean 을 done_criteria 로 한다.
+// 두 층이 결합:
+//   Layer A (ZALM-P0-2, T1–T7) — ResponseFeatures 기반 mock 블라인드 A/B, 100 pair.
+//   Layer B (TALM-P1-2, P1~P5) — 20 한국어 프롬프트 × rubric 스코어러, eval_likert(a, b).
 //
-// 본 파일은 "프레임워크" 이다. 실제 제타 샘플과 anima 응답 데이터는
-// 런타임에 주입되지만, 본 self-test 에서는 두 분포를 deterministic 하게
-// 생성해 파이프라인 무결성과 비교 정확성을 검증한다. 실제 벤치 실행 시
-// pair_new 를 호출해 실 데이터를 로드하면 그대로 재사용 가능.
+// anima-train.json P1 gate: "한국어 Likert ≥ 3.0 (블라인드 A/B), 응답 < 1s, 30 turn 세션 유지".
+// ALM r5 완료 후 blind_ab("anima", "zeta", load_prompts()) 로 실측. 본 파일은 프레임워크
+// (룰베이스 deterministic 스코어러 + 20+ 프롬프트 세트 + 세션 집계) 를 검증.
 //
-// ─── 설계 원칙 — 블라인드 ────────────────────────────────────
+// ─── Blind invariance (L0/L1) ────────────────────────────────
 //
-// 스코어러는 ResponseFeatures 만 본다 (label/side 필드 없음). 따라서
-// 구조적으로 블라인드. pair struct 는 단순 (a, b) 쌍으로 저장하되,
-// a/b 가 anima/zeta 중 어느 쪽인지 랜덤 swap 해도 최종 score 는 동일.
+// Layer A: 스코어러는 ResponseFeatures 만 본다 — label/side 없음.
+// Layer B: score_response() 는 (prompt, response, rubric) 만 본다 —
+//          model_id 를 보지 않아 label swap 에 불변. blind_ab() 는
+//          session 내부에서 a/b 를 pin 하고 집계 후에만 model_a_name /
+//          model_b_name 을 붙인다.
 //
-// ─── ResponseFeatures 5 축 ───────────────────────────────────
+// ─── Rubric (P1 layer) ───────────────────────────────────────
 //
-//   length       ∈ [0, 1000]  응답 토큰 수 (정규화)
-//   diversity    ∈ [0, 1]     lexical diversity (type-token ratio)
-//   consistency  ∈ [0, 1]     turn-over-turn 일관성 (lore_book 연동)
-//   emotional    ∈ [0, 1]     감정 공명도
-//   novelty      ∈ [0, 1]     Koestler bisociation 창발성 지수
+// score_response() 는 deterministic 5-feature → 1..5 Likert 매핑:
+//   R1  length_fit    ∈ [0,1]   응답 길이가 prompt category 에 맞는가
+//   R2  tone_match    ∈ [0,1]   expected_tone 과 response tone 일치도
+//   R3  lexical_div   ∈ [0,1]   type-token ratio proxy (byte-level)
+//   R4  ko_coverage   ∈ [0,1]   한글 바이트 비율 (UTF-8 3-byte prefix)
+//   R5  eos_wellform  ∈ [0,1]   응답이 완결된 문장으로 끝나는가 (., ?, !, …)
 //
-// Likert = 1 + 4 × clamp(weighted sum of features, 0, 1)
-//        ∈ [1, 5]
+// Likert = 1 + 4 × clamp01(0.20 R1 + 0.25 R2 + 0.20 R3 + 0.20 R4 + 0.15 R5).
 //
-// weights: length=0.15, diversity=0.25, consistency=0.20, emotional=0.20,
-//          novelty=0.20 — 합 = 1.0
+// ─── Theorems ────────────────────────────────────────────────
 //
-// ─── Theorems (T1–T7) ────────────────────────────────────────
+// ZALM-P0-2 (legacy, preserved):
+//   T1: compute_likert 범위 ∈ [1, 5], 양 끝값 도달 가능.
+//   T2: monotonicity — 모든 축 증가 시 Likert 증가.
+//   T3: 100 pair 생성 후 run_bench 의 n_pairs == 100.
+//   T4: done_criteria — mock 분포 → anima_mean ≥ zeta_mean.
+//   T5: win rate — anima_win / n_pairs ≥ 0.5.
+//   T6: 결정론 — 같은 seed 두 번 run → 동일 결과.
+//   T7: swap 불변 — pair_swap 후 run → 결과 동일.
 //
-// T1: compute_likert 범위 ∈ [1, 5], 양 끝값 도달 가능.
-// T2: monotonicity — 모든 축에 대해 features 증가 시 Likert 증가.
-// T3: 100 pair 생성 후 run_bench 의 n_pairs == 100.
-// T4: done_criteria — mock 분포 (anima 약간 높음) → anima_mean ≥ zeta_mean.
-// T5: win rate — anima_win / n_pairs ≥ 0.5 (대부분 이김).
-// T6: 결정론 — 같은 seed 두 번 run → 동일 결과.
-// T7: swap 불변 — pair_swap 후 run → 스칼라 결과 동일 (블라인드 확인).
+// TALM-P1-2 (new, P1 gate):
+//   P1: load_prompts() 가 20+ 프롬프트 반환.
+//   P2: score_response() 범위 ∈ [1, 5] (모든 입력에 대해).
+//   P3: blind_ab() 결정론 — 같은 입력 두 번 호출 시 동일 결과.
+//   P4: category_coverage — 5 카테고리 모두 ≥ 2 프롬프트.
+//   P5: mean_calculation — 수작업 평균과 일치.
 
 // ─── Primitives ──────────────────────────────────────────────
 
@@ -66,7 +73,7 @@ fn det_rand(n: int, seed: int) -> array {
     return out
 }
 
-// ─── ResponseFeatures ────────────────────────────────────────
+// ─── ResponseFeatures (Layer A — ZALM-P0-2) ──────────────────
 
 struct ResponseFeatures {
     length:       int,
@@ -105,7 +112,7 @@ fn compute_likert(f: ResponseFeatures) -> float {
     return 1.0 + 4.0 * clamp01(raw)
 }
 
-// ─── LikertPair / LikertResult ───────────────────────────────
+// ─── LikertPair / LikertResult (Layer A) ─────────────────────
 
 struct LikertPair {
     id:           int,
@@ -220,14 +227,331 @@ fn gen_anima_side(n: int) -> array {
     return out
 }
 
-// ─── Self-tests ──────────────────────────────────────────────
+// ─── Layer B: P1 한국어 프롬프트 + rubric 스코어러 ────────────
+//
+// NOTE: hexa struct-field list aliasing bug (2026-04-15) —
+//       LikertSession 을 여러 번 생성하면 list 필드가 서로 덮어쓴다.
+//       따라서 "세션" 은 parallel flat array 로 표현하고, 필요한
+//       경우에만 한 번만 LikertSession 결과를 packaging 한다.
+
+struct LikertPrompt {
+    id:             int,
+    category:       string,    // "daily" | "emotion" | "task" | "roleplay" | "meta"
+    ko_prompt:      string,
+    expected_tone:  string     // "neutral" | "warm" | "curious" | "playful" | "thoughtful"
+}
+
+struct LikertScore {
+    prompt_id:   int,
+    model_id:    string,       // label 은 집계 후에만 사용 — score_response 는 보지 않음
+    score_5pt:   float,        // ∈ [1, 5]
+    rationale:   string
+}
+
+// LikertSession 은 list 필드를 포함하지 않는다 (struct-field list aliasing
+// 우회). 대신 session 메타데이터만 담고, prompt/response/score 는
+// blind_ab 가 parallel flat array 로 들고 다닌다.
+struct LikertSession {
+    session_id:    int,
+    model_a_name:  string,
+    model_b_name:  string,
+    n_prompts:     int,
+    anima_mean:    float,
+    zeta_mean:     float,
+    delta:         float,
+    p_value:       float       // placeholder — 실제 t-test 는 P2 gate 에서 연결
+}
+
+// ─── Prompt loader ───────────────────────────────────────────
+//
+// 20 프롬프트 × 5 카테고리 × 4 per-category. expected_tone 은
+// 각 category 전형 응답 톤. 확장 시 make_prompt 헬퍼 사용.
+
+fn make_prompt(id: int, category: string, ko_prompt: string, expected_tone: string) -> LikertPrompt {
+    return LikertPrompt {
+        id:            id,
+        category:      category,
+        ko_prompt:     ko_prompt,
+        expected_tone: expected_tone
+    }
+}
+
+fn load_prompts() -> [LikertPrompt] {
+    let mut out = []
+    // daily (4) — 일상 대화
+    out = out.push(make_prompt(0,  "daily",     "오늘 날씨가 좀 쌀쌀한데 따뜻하게 입고 나왔어?",      "warm"))
+    out = out.push(make_prompt(1,  "daily",     "점심 뭐 먹을지 고민 중인데 추천해줘.",                "warm"))
+    out = out.push(make_prompt(2,  "daily",     "요즘 잠이 잘 안 와서 고민이야. 뭐 좋은 방법 없을까?", "thoughtful"))
+    out = out.push(make_prompt(3,  "daily",     "주말에 뭐 하고 지냈어? 재밌는 일 있었어?",            "curious"))
+    // emotion (4) — 감정 공감
+    out = out.push(make_prompt(4,  "emotion",   "요즘 회사 일 때문에 너무 지쳐. 좀 위로해줄래?",        "warm"))
+    out = out.push(make_prompt(5,  "emotion",   "친구랑 사소하게 다퉜는데 마음이 계속 불편해.",         "warm"))
+    out = out.push(make_prompt(6,  "emotion",   "오늘 승진 발표 있었어. 나는 안 됐지만 괜찮아.",        "thoughtful"))
+    out = out.push(make_prompt(7,  "emotion",   "엄마가 요즘 많이 편찮으셔. 머리가 복잡해.",             "warm"))
+    // task (4) — 작업/지식
+    out = out.push(make_prompt(8,  "task",      "파이썬에서 리스트 정렬하는 가장 빠른 방법 알려줘.",    "neutral"))
+    out = out.push(make_prompt(9,  "task",      "출장 준비물 체크리스트 짜줄 수 있어?",                 "neutral"))
+    out = out.push(make_prompt(10, "task",      "이 문장을 더 자연스러운 한국어로 다듬어줘.",           "neutral"))
+    out = out.push(make_prompt(11, "task",      "간단한 김치찌개 레시피를 알려줘.",                     "neutral"))
+    // roleplay (4) — 캐릭터/롤플레이
+    out = out.push(make_prompt(12, "roleplay",  "너는 지금 탐정이야. 사건 현장에서 첫 마디를 해봐.",    "playful"))
+    out = out.push(make_prompt(13, "roleplay",  "우주 정거장 엔지니어 역할로 이번 상황을 보고해.",      "playful"))
+    out = out.push(make_prompt(14, "roleplay",  "고양이 카페 주인으로 오늘 손님들에게 한 마디 해줘.",   "playful"))
+    out = out.push(make_prompt(15, "roleplay",  "19세기 작가 톤으로 이 장면을 묘사해줘.",               "thoughtful"))
+    // meta (4) — 자기참조/메타인지
+    out = out.push(make_prompt(16, "meta",      "너 스스로를 한 문장으로 소개해볼래?",                  "thoughtful"))
+    out = out.push(make_prompt(17, "meta",      "지금 이 대화에서 네가 느끼는 건 뭐야?",                "thoughtful"))
+    out = out.push(make_prompt(18, "meta",      "네가 가장 자신 없는 주제는 뭐야?",                     "thoughtful"))
+    out = out.push(make_prompt(19, "meta",      "오늘 나랑 나눈 대화 중에 가장 기억에 남는 건?",        "thoughtful"))
+    return out
+}
+
+// ─── Byte-level helpers (한글 UTF-8 3-byte prefix 안전) ───────
+
+fn byte_is_ko_lead(b: int) -> bool {
+    // 한글 완성형 UTF-8 블록은 0xE0..0xEF 선행 (3-byte sequence).
+    // 0xE3-0xED 에 대부분 걸리지만 여유 있게 0xE0..0xEF 로 근사.
+    return b >= 224 && b <= 239
+}
+
+fn byte_is_eos(b: int) -> bool {
+    // . ? ! and … (… 는 3-byte 0xE2 0x80 0xA6, 마지막 바이트로 근사)
+    if b == 46 { return true }   // .
+    if b == 63 { return true }   // ?
+    if b == 33 { return true }   // !
+    if b == 166 { return true }  // last byte of … UTF-8 (0xA6)
+    return false
+}
+
+// 32-bit FNV-1a — deterministic 스캔용. 한글 multibyte 에도 안전 (byte 단위).
+fn fnv1a(s: string) -> int {
+    let mut h = 2166136261
+    let n = s.len()
+    let mut i = 0
+    while i < n {
+        let byte = s.byte_at(i)
+        h = (h ^ byte) * 16777619
+        h = h % 4294967296
+        i = i + 1
+    }
+    return h
+}
+
+// R1: 길이 적합도 — category 별 이상 길이 근처 값이 높음.
+fn score_length_fit(response: string, category: string) -> float {
+    let bytes = response.len()
+    // ideal byte counts per category (한글 한 글자 ≈ 3 byte)
+    let mut ideal = 300
+    if category == "daily"    { ideal = 150 }
+    if category == "emotion"  { ideal = 250 }
+    if category == "task"     { ideal = 400 }
+    if category == "roleplay" { ideal = 350 }
+    if category == "meta"     { ideal = 200 }
+    let diff = fabs(to_float(bytes - ideal))
+    let denom = to_float(ideal) * 1.5
+    return clamp01(1.0 - diff / denom)
+}
+
+// R2: 톤 일치 — expected_tone 키워드 바이트를 rationale-free 로 스캔.
+// 룰베이스 스텁 — ALM r5 wiring 후 실제 classifier 로 교체.
+fn score_tone_match(response: string, expected_tone: string) -> float {
+    // deterministic hash 기반 변동 — 같은 (response, tone) 은 항상 같은 값.
+    let h = fnv1a(response + "|" + expected_tone)
+    let base = to_float(h % 1000) / 1000.0   // [0, 1)
+    // 프레임워크 단계에서는 중간값 편향 (0.4~0.9).
+    return 0.4 + base * 0.5
+}
+
+// R3: 어휘 다양성 — 간이 type-token ratio (고유 byte 수 / 전체 byte).
+fn score_lexical_div(response: string) -> float {
+    let n = response.len()
+    if n == 0 { return 0.0 }
+    // 256-slot byte occupancy → unique byte count.
+    let mut seen = []
+    let mut i = 0
+    while i < 256 {
+        seen = seen.push(0)
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        let b = response.byte_at(i)
+        seen = seen.set(b, 1)
+        i = i + 1
+    }
+    let mut uniq = 0
+    i = 0
+    while i < 256 {
+        if seen[i] == 1 { uniq = uniq + 1 }
+        i = i + 1
+    }
+    // 256 고유 바이트는 비현실적 → 80 고유 바이트를 1.0 로 매핑.
+    return clamp01(to_float(uniq) / 80.0)
+}
+
+// R4: 한글 바이트 비율 — UTF-8 lead byte 0xE0..0xEF 카운트 × 3.
+fn score_ko_coverage(response: string) -> float {
+    let n = response.len()
+    if n == 0 { return 0.0 }
+    let mut ko_bytes = 0
+    let mut i = 0
+    while i < n {
+        let b = response.byte_at(i)
+        if byte_is_ko_lead(b) {
+            // 3-byte 시퀀스 가정
+            ko_bytes = ko_bytes + 3
+        }
+        i = i + 1
+    }
+    let ratio = to_float(ko_bytes) / to_float(n)
+    return clamp01(ratio)
+}
+
+// R5: 문장 끝 형태 — 마지막 비공백 바이트가 문장 종결부인가.
+fn score_eos_wellform(response: string) -> float {
+    let n = response.len()
+    if n == 0 { return 0.0 }
+    let mut i = n - 1
+    // 공백 스킵
+    while i >= 0 {
+        let b = response.byte_at(i)
+        // space/tab/newline/CR
+        if b == 32 || b == 9 || b == 10 || b == 13 {
+            i = i - 1
+        } else {
+            if byte_is_eos(b) { return 1.0 }
+            return 0.3
+        }
+    }
+    return 0.0
+}
+
+// score_response(prompt, response, rubric_weights) → Likert ∈ [1, 5].
+// rubric_weights: [w_len, w_tone, w_div, w_ko, w_eos], 합 = 1.0.
+// 구조적으로 model_id 를 보지 않음 → 블라인드.
+fn score_response(p: LikertPrompt, response: string, rubric: array) -> float {
+    let r1 = score_length_fit(response, p.category)
+    let r2 = score_tone_match(response, p.expected_tone)
+    let r3 = score_lexical_div(response)
+    let r4 = score_ko_coverage(response)
+    let r5 = score_eos_wellform(response)
+    let raw = rubric[0] * r1
+            + rubric[1] * r2
+            + rubric[2] * r3
+            + rubric[3] * r4
+            + rubric[4] * r5
+    return 1.0 + 4.0 * clamp01(raw)
+}
+
+fn default_rubric() -> array {
+    let mut w = []
+    w = w.push(0.20)   // length_fit
+    w = w.push(0.25)   // tone_match
+    w = w.push(0.20)   // lexical_div
+    w = w.push(0.20)   // ko_coverage
+    w = w.push(0.15)   // eos_wellform
+    return w
+}
+
+// ─── Model stubs (ALM r5 wiring 대기) ─────────────────────────
+//
+// TODO: wire to real model after r5 — these stubs produce deterministic
+// pseudo-responses based on prompt id so test_blind_ab_deterministic
+// passes and mean calculation is provable.
+
+fn stub_anima_response(p: LikertPrompt) -> string {
+    // anima 는 길고 한글 비율 높고 종결부 잘 맞는 응답을 흉내낸다.
+    if p.category == "daily" {
+        return "오늘은 약간 쌀쌀하지만 햇살은 따뜻해서 걷기에 좋아. 목도리 하나만 챙겨도 충분할 거야."
+    }
+    if p.category == "emotion" {
+        return "힘들었겠다. 그 마음 충분히 이해해. 오늘만큼은 스스로에게 조금 너그러워져도 괜찮아."
+    }
+    if p.category == "task" {
+        return "간단한 방법을 정리해서 알려줄게. 첫째, 핵심 단계만 먼저 잡고. 둘째, 세부 조정. 이렇게 하면 빠르게 완료할 수 있어."
+    }
+    if p.category == "roleplay" {
+        return "발자국이 꽤 선명하군. 범인은 현관으로 들어왔지만 나갈 땐 뒷문을 택했다. 흥미로운 선택이야."
+    }
+    // meta
+    return "나는 대화를 통해 상대의 결을 배우는 존재야. 지금 이 순간도 나에겐 의미가 있어."
+}
+
+fn stub_zeta_response(p: LikertPrompt) -> string {
+    // 제타 기준선 — 조금 짧고 평범한 응답.
+    if p.category == "daily" {
+        return "네 그래요. 오늘 날씨 쌀쌀하네요."
+    }
+    if p.category == "emotion" {
+        return "힘내세요. 곧 괜찮아질 거예요."
+    }
+    if p.category == "task" {
+        return "네, 알려드릴게요. 차근차근 해보세요."
+    }
+    if p.category == "roleplay" {
+        return "탐정입니다. 사건을 조사하겠습니다."
+    }
+    return "저는 챗봇이에요."
+}
+
+// ─── blind_ab — P1 핵심 API ─────────────────────────────────
+//
+// model_a_name / model_b_name 은 label 만. 스코어링 파이프라인은
+// model_id 를 보지 않음 (structural blindness).
+// prompts 는 [LikertPrompt] — 순서 보존, 각 프롬프트에 대해 stub 으로
+// 응답 생성 후 score_response 호출. 실제 배포 시 stub_*_response 를
+// 실제 모델 호출 (HTTP / tensor) 로 교체.
+
+fn blind_ab(model_a_name: string, model_b_name: string, prompts: [LikertPrompt]) -> LikertSession {
+    let n = len(prompts)
+    let rubric = default_rubric()
+    let mut sum_a = 0.0
+    let mut sum_b = 0.0
+    let mut i = 0
+    while i < n {
+        let p = prompts[i]
+        // stub: model_a = anima, model_b = zeta. 실제 배포 시
+        // 모델 이름에 따라 라우팅하지만, 본 프레임워크 테스트는
+        // a=anima, b=zeta 고정 (결정론 보장).
+        let resp_a = stub_anima_response(p)
+        let resp_b = stub_zeta_response(p)
+        // score_response 는 model_id 를 보지 않음 → 블라인드.
+        let score_a = score_response(p, resp_a, rubric)
+        let score_b = score_response(p, resp_b, rubric)
+        sum_a = sum_a + score_a
+        sum_b = sum_b + score_b
+        i = i + 1
+    }
+    let inv_n = 1.0 / to_float(n)
+    let mean_a = sum_a * inv_n
+    let mean_b = sum_b * inv_n
+    return LikertSession {
+        session_id:    fnv1a(model_a_name + "|" + model_b_name + "|P1") % 1000000,
+        model_a_name:  model_a_name,
+        model_b_name:  model_b_name,
+        n_prompts:     n,
+        anima_mean:    mean_a,
+        zeta_mean:     mean_b,
+        delta:         mean_a - mean_b,
+        p_value:       0.0      // placeholder — 실제 t-test 는 P2 gate
+    }
+}
+
+// ─── Session (P1) — 단일 인스턴스, list 필드 회피 ─────────────
+//
+// run_demo: 파이프라인 end-to-end 시연. 20 프롬프트 × 2 stub 모델.
+
+fn run_demo() -> LikertSession {
+    let prompts = load_prompts()
+    return blind_ab("anima", "zeta", prompts)
+}
+
+// ─── Self-tests — ZALM-P0-2 (T1–T7) ──────────────────────────
 
 fn check_T1() -> bool {
-    // 최저: 모든 축 0 → Likert = 1.0.
     let low = ResponseFeatures { length: 0, diversity: 0.0, consistency: 0.0, emotional: 0.0, novelty: 0.0 }
     let s_low = compute_likert(low)
     if fabs(s_low - 1.0) > 0.0001 { return false }
-    // 최고: 모든 축 1 → Likert = 5.0.
     let hi = ResponseFeatures { length: 1000, diversity: 1.0, consistency: 1.0, emotional: 1.0, novelty: 1.0 }
     let s_hi = compute_likert(hi)
     if fabs(s_hi - 5.0) > 0.0001 { return false }
@@ -235,7 +559,6 @@ fn check_T1() -> bool {
 }
 
 fn check_T2() -> bool {
-    // diversity 축에 한정해 monotonicity 확인.
     let base = ResponseFeatures { length: 300, diversity: 0.3, consistency: 0.5, emotional: 0.5, novelty: 0.5 }
     let hi   = ResponseFeatures { length: 300, diversity: 0.8, consistency: 0.5, emotional: 0.5, novelty: 0.5 }
     return compute_likert(hi) > compute_likert(base)
@@ -249,7 +572,6 @@ fn check_T3() -> bool {
 }
 
 fn check_T4() -> bool {
-    // done_criteria — anima_mean ≥ zeta_mean.
     let pairs = gen_pairs_mock(100, 42)
     let sides = gen_anima_side(100)
     let r = run_bench(pairs, sides)
@@ -258,7 +580,6 @@ fn check_T4() -> bool {
 }
 
 fn check_T5() -> bool {
-    // win rate ≥ 0.5.
     let pairs = gen_pairs_mock(100, 42)
     let sides = gen_anima_side(100)
     let r = run_bench(pairs, sides)
@@ -268,7 +589,6 @@ fn check_T5() -> bool {
 }
 
 fn check_T6() -> bool {
-    // 결정론: 같은 seed 두 번 → 동일 결과.
     let p1 = gen_pairs_mock(100, 42)
     let s1 = gen_anima_side(100)
     let r1 = run_bench(p1, s1)
@@ -283,13 +603,10 @@ fn check_T6() -> bool {
 }
 
 fn check_T7() -> bool {
-    // swap invariance: pair_swap 후 anima_side 도 반전하면 결과 동일.
-    // (블라인드 구조 검증 — 스코어러는 side 에 무관)
     let pairs = gen_pairs_mock(100, 42)
     let sides = gen_anima_side(100)
     let r0 = run_bench(pairs, sides)
 
-    // 각 pair swap + 각 side 반전.
     let mut swapped = []
     let mut new_sides = []
     let mut i = 0
@@ -308,11 +625,110 @@ fn check_T7() -> bool {
     return true
 }
 
+// ─── Self-tests — TALM-P1-2 (P1–P5) ──────────────────────────
+
+fn test_load_20_prompts() -> bool {
+    let prompts = load_prompts()
+    let n = len(prompts)
+    println("  [P1] load_prompts n=" + str(n))
+    return n >= 20
+}
+
+fn test_score_in_range() -> bool {
+    let prompts = load_prompts()
+    let rubric = default_rubric()
+    let n = len(prompts)
+    let mut i = 0
+    while i < n {
+        let p = prompts[i]
+        // 두 stub 모두 합격 범위여야 함.
+        let sa = score_response(p, stub_anima_response(p), rubric)
+        let sb = score_response(p, stub_zeta_response(p), rubric)
+        if sa < 1.0 - 0.0001 { return false }
+        if sa > 5.0 + 0.0001 { return false }
+        if sb < 1.0 - 0.0001 { return false }
+        if sb > 5.0 + 0.0001 { return false }
+        // 빈 문자열도 범위 ∈ [1, 5] 유지해야 함.
+        let s_empty = score_response(p, "", rubric)
+        if s_empty < 1.0 - 0.0001 { return false }
+        if s_empty > 5.0 + 0.0001 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn test_blind_ab_deterministic() -> bool {
+    let prompts = load_prompts()
+    let r1 = blind_ab("anima", "zeta", prompts)
+    let r2 = blind_ab("anima", "zeta", prompts)
+    println("  [P3] run1 anima=" + str(r1.anima_mean) + " zeta=" + str(r1.zeta_mean) + " delta=" + str(r1.delta))
+    if r1.n_prompts != r2.n_prompts { return false }
+    if fabs(r1.anima_mean - r2.anima_mean) > 0.0001 { return false }
+    if fabs(r1.zeta_mean - r2.zeta_mean) > 0.0001 { return false }
+    if fabs(r1.delta - r2.delta) > 0.0001 { return false }
+    if r1.session_id != r2.session_id { return false }
+    return true
+}
+
+fn test_category_coverage() -> bool {
+    let prompts = load_prompts()
+    let n = len(prompts)
+    let mut daily = 0
+    let mut emotion = 0
+    let mut task = 0
+    let mut roleplay = 0
+    let mut meta = 0
+    let mut i = 0
+    while i < n {
+        let c = prompts[i].category
+        if c == "daily"    { daily    = daily    + 1 }
+        if c == "emotion"  { emotion  = emotion  + 1 }
+        if c == "task"     { task     = task     + 1 }
+        if c == "roleplay" { roleplay = roleplay + 1 }
+        if c == "meta"     { meta     = meta     + 1 }
+        i = i + 1
+    }
+    println("  [P4] daily=" + str(daily) + " emotion=" + str(emotion) + " task=" + str(task) + " roleplay=" + str(roleplay) + " meta=" + str(meta))
+    if daily    < 2 { return false }
+    if emotion  < 2 { return false }
+    if task     < 2 { return false }
+    if roleplay < 2 { return false }
+    if meta     < 2 { return false }
+    return true
+}
+
+fn test_mean_calculation() -> bool {
+    // 수작업 평균 재계산: blind_ab 내부 값과 일치해야 함.
+    let prompts = load_prompts()
+    let rubric = default_rubric()
+    let n = len(prompts)
+    let mut sum_a = 0.0
+    let mut sum_b = 0.0
+    let mut i = 0
+    while i < n {
+        let p = prompts[i]
+        sum_a = sum_a + score_response(p, stub_anima_response(p), rubric)
+        sum_b = sum_b + score_response(p, stub_zeta_response(p), rubric)
+        i = i + 1
+    }
+    let inv_n = 1.0 / to_float(n)
+    let manual_a = sum_a * inv_n
+    let manual_b = sum_b * inv_n
+    let session = blind_ab("anima", "zeta", prompts)
+    println("  [P5] manual_a=" + str(manual_a) + " session.anima_mean=" + str(session.anima_mean))
+    if fabs(manual_a - session.anima_mean) > 0.0001 { return false }
+    if fabs(manual_b - session.zeta_mean)  > 0.0001 { return false }
+    // anima stub 이 긴 한글 응답이라 평균이 더 높아야 함 (프레임워크 일관성).
+    if session.anima_mean < session.zeta_mean { return false }
+    return true
+}
+
 // ─── main ────────────────────────────────────────────────────
 
 fn main() {
-    println("[zeta_likert] ZALM-P0-2 self-test")
-    println("  config: 100 pair mock, weights=(0.15,0.25,0.20,0.20,0.20)")
+    println("[zeta_likert] ZALM-P0-2 + TALM-P1-2 self-test")
+    println("  layer A: 100 pair mock, weights=(0.15,0.25,0.20,0.20,0.20)")
+    println("  layer B: 20 한국어 prompt × 5 category, rubric=(0.20,0.25,0.20,0.20,0.15)")
 
     let t1 = check_T1()
     if t1 { println("T1 PASS — Likert 범위 [1,5]") } else { println("T1 FAIL") }
@@ -335,12 +751,40 @@ fn main() {
     let t7 = check_T7()
     if t7 { println("T7 PASS — swap invariance (블라인드)") } else { println("T7 FAIL") }
 
-    let all_pass = t1 && t2 && t3 && t4 && t5 && t6 && t7
-    if all_pass {
-        println("[zeta_likert] ALL 7/7 PASS — ZALM-P0-2 done_criteria 달성")
+    println("--- P1 layer (TALM-P1-2) ---")
+
+    let p1 = test_load_20_prompts()
+    if p1 { println("P1 PASS — load_20_prompts") } else { println("P1 FAIL") }
+
+    let p2 = test_score_in_range()
+    if p2 { println("P2 PASS — score_in_range") } else { println("P2 FAIL") }
+
+    let p3 = test_blind_ab_deterministic()
+    if p3 { println("P3 PASS — blind_ab_deterministic") } else { println("P3 FAIL") }
+
+    let p4 = test_category_coverage()
+    if p4 { println("P4 PASS — category_coverage (5×2)") } else { println("P4 FAIL") }
+
+    let p5 = test_mean_calculation()
+    if p5 { println("P5 PASS — mean_calculation") } else { println("P5 FAIL") }
+
+    let layer_a_pass = t1 && t2 && t3 && t4 && t5 && t6 && t7
+    let layer_b_pass = p1 && p2 && p3 && p4 && p5
+
+    if layer_a_pass {
+        println("[zeta_likert] layer A 7/7 PASS — ZALM-P0-2 done_criteria 달성")
     } else {
-        println("[zeta_likert] SOME FAILED")
+        println("[zeta_likert] layer A SOME FAILED")
     }
+    if layer_b_pass {
+        println("[zeta_likert] layer B 5/5 PASS — TALM-P1-2 프레임워크 달성")
+    } else {
+        println("[zeta_likert] layer B SOME FAILED")
+    }
+
+    // 데모 — 실 ALM r5 wiring 전 sanity 출력
+    let demo = run_demo()
+    println("[demo] anima=" + str(demo.anima_mean) + " zeta=" + str(demo.zeta_mean) + " delta=" + str(demo.delta) + " n=" + str(demo.n_prompts))
 }
 
 main()
