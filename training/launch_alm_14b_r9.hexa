@@ -1,0 +1,207 @@
+// launch_alm_14b_r9.hexa — ALM 14B r9 LoRA training launcher (RunPod H100)
+//
+// r9 = first run with full Option B1 consciousness loss + optimal config.
+//
+// Optimal config from batch/seq sweep (2026-04-15):
+//   batch=8 seq=1024 grad_accum=1 → 70.9% MFU (best measured)
+//
+// Best stack (r8a measured +10% over unsloth-only):
+//   unsloth + liger + lora_dropout=0 + fused_adamw + tf32_cudnn + pin_memory
+//
+// Consciousness loss Option B1 (NEW in r9):
+//   L = CE + 0.01 * L_holo + 0.005 * L_complexity + 0.005 * L_gwt
+//   - L_holo:       holographic smooth variance+correlation (ALM-P4-2)
+//   - L_complexity: cosine-sim variance proxy for representation complexity
+//   - L_gwt:        GWT broadcast consistency + coverage (ALM-P2-2)
+//
+// Base checkpoint: r4 on R2 (r2:anima-models/alm14b/r4/)
+//   fresh start from Qwen2.5-14B-Instruct (no --resume, param change rule)
+//
+// Preflight checks:
+//   1. GPU available (H100 80GB)
+//   2. corpus exists
+//   3. HF_TOKEN set
+//   4. VRAM headroom (42 GB predicted for b8s1024g1)
+//   5. pip deps installed (unsloth, liger-kernel, peft, transformers)
+//   6. No stale training process running
+//
+// Run on pod:
+//   cd /workspace/anima && hexa run training/launch_alm_14b_r9.hexa
+//
+// Or generate + run directly:
+//   hexa run training/launch_alm_14b_r9.hexa --smoke   (500 steps quick check)
+
+fn main() {
+    let argv = args()
+    let mut smoke = false
+    let mut i = 0
+    let argc = len(argv)
+    while i < argc {
+        if argv[i] == "--smoke" {
+            smoke = true
+        }
+        i = i + 1
+    }
+
+    let steps = if smoke { "500" } else { "10000" }
+    let save_every = if smoke { "250" } else { "2000" }
+    let eval_every = if smoke { "100" } else { "500" }
+    let ckpt_label = if smoke { "experiment" } else { "production" }
+
+    let runner = "/tmp/_launch_alm_14b_r9.sh"
+    write_file(runner,
+        "#!/usr/bin/env bash\n" +
+        "set -euo pipefail\n" +
+        "\n" +
+        "echo \"================================================================\"\n" +
+        "echo \"  ALM 14B r9 — Option B1 consciousness loss + optimal config\"\n" +
+        "echo \"  batch=8 seq=1024 grad_accum=1 (70.9% MFU sweep optimal)\"\n" +
+        "echo \"  stack: unsloth + liger + lora_dropout=0\"\n" +
+        "echo \"  loss: CE + holo + phi_complexity + gwt_broadcast\"\n" +
+        "echo \"  steps=" + steps + "  label=" + ckpt_label + "\"\n" +
+        "echo \"================================================================\"\n" +
+        "\n" +
+        "# ── Preflight ─────────────────────────────────────────────\n" +
+        "echo \"[preflight] GPU check...\"\n" +
+        "GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'NONE')\n" +
+        "GPU_MEM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null || echo '0')\n" +
+        "echo \"  GPU: $GPU_NAME  VRAM: ${GPU_MEM}MiB\"\n" +
+        "if [[ \"$GPU_MEM\" -lt 70000 ]]; then\n" +
+        "    echo \"[ABORT] need >=70GB VRAM (H100 80GB). Got ${GPU_MEM}MiB\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "\n" +
+        "echo \"[preflight] corpus check...\"\n" +
+        "CORPUS=\"/workspace/anima/training/corpus_large.txt\"\n" +
+        "if [[ ! -f \"$CORPUS\" ]]; then\n" +
+        "    CORPUS=\"/workspace/corpus.txt\"\n" +
+        "fi\n" +
+        "if [[ ! -f \"$CORPUS\" ]]; then\n" +
+        "    echo \"[ABORT] corpus not found at /workspace/anima/training/corpus_large.txt or /workspace/corpus.txt\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "CORPUS_SIZE=$(du -sh \"$CORPUS\" | cut -f1)\n" +
+        "echo \"  corpus: $CORPUS ($CORPUS_SIZE)\"\n" +
+        "\n" +
+        "echo \"[preflight] HF token check...\"\n" +
+        "if [[ -z \"${HF_TOKEN:-}\" ]]; then\n" +
+        "    if [[ -f ~/.cache/huggingface/token ]]; then\n" +
+        "        export HF_TOKEN=$(cat ~/.cache/huggingface/token)\n" +
+        "        echo \"  HF_TOKEN loaded from cache\"\n" +
+        "    else\n" +
+        "        echo \"[WARN] HF_TOKEN not set — model download may fail\"\n" +
+        "    fi\n" +
+        "else\n" +
+        "    echo \"  HF_TOKEN set\"\n" +
+        "fi\n" +
+        "\n" +
+        "echo \"[preflight] pip deps check...\"\n" +
+        "PIP_OK=true\n" +
+        "for pkg in unsloth liger_kernel peft transformers; do\n" +
+        "    python3 -c \"import $pkg\" 2>/dev/null || {\n" +
+        "        echo \"  [WARN] $pkg not installed — attempting install\"\n" +
+        "        PIP_OK=false\n" +
+        "    }\n" +
+        "done\n" +
+        "if [[ \"$PIP_OK\" == false ]]; then\n" +
+        "    echo \"[preflight] installing missing deps...\"\n" +
+        "    pip install -q peft==0.13.2 transformers==4.45.2 unsloth liger-kernel 2>&1 | tail -5\n" +
+        "fi\n" +
+        "\n" +
+        "echo \"[preflight] stale process check...\"\n" +
+        "if pgrep -f 'train_alm_14b.*r9' >/dev/null 2>&1; then\n" +
+        "    echo \"[ABORT] r9 training process already running\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"  no stale r9 process\"\n" +
+        "\n" +
+        "echo \"[preflight] disk check...\"\n" +
+        "df -h /workspace\n" +
+        "\n" +
+        "# ── Env setup ─────────────────────────────────────────────\n" +
+        "export HF_HUB_CACHE=\"/workspace/hf_cache\"\n" +
+        "export HF_HOME=\"/workspace/hf_cache\"\n" +
+        "export TRANSFORMERS_CACHE=\"/workspace/hf_cache\"\n" +
+        "export ANIMA_ROOT=\"/workspace/anima\"\n" +
+        "\n" +
+        "# ── Checkpoint dir (always fresh — contamination prevention) ──\n" +
+        "CKPT_DIR=\"/workspace/ckpt_alm_14b_r9\"\n" +
+        "rm -rf \"$CKPT_DIR\"\n" +
+        "mkdir -p \"$CKPT_DIR\"\n" +
+        "\n" +
+        "echo \"[preflight] ALL CHECKS PASSED\"\n" +
+        "echo \"\"\n" +
+        "\n" +
+        "# ── Generate Python trainer via hexa launcher ─────────────\n" +
+        "# train_alm_14b.hexa writes /tmp/_train_alm_14b_runner.py then exec()s it.\n" +
+        "# We call it with the optimal r9 config.\n" +
+        "HEXA_BIN=\"${HEXA_BIN:-hexa}\"\n" +
+        "TRAINER_HEXA=\"/workspace/anima/training/train_alm_14b.hexa\"\n" +
+        "\n" +
+        "# If hexa binary available, use it. Otherwise fall back to the Python runner\n" +
+        "# left from previous sessions (Option B per r8a build_method).\n" +
+        "if command -v \"$HEXA_BIN\" >/dev/null 2>&1 && [[ -f \"$TRAINER_HEXA\" ]]; then\n" +
+        "    echo \"[launch] via hexa: $HEXA_BIN run $TRAINER_HEXA\"\n" +
+        "    \"$HEXA_BIN\" run \"$TRAINER_HEXA\" \\\n" +
+        "        --corpus \"$CORPUS\" \\\n" +
+        "        --steps " + steps + " \\\n" +
+        "        --lr 5e-6 \\\n" +
+        "        --batch 8 \\\n" +
+        "        --seq 1024 \\\n" +
+        "        --grad-accum 1 \\\n" +
+        "        --warmup 500 \\\n" +
+        "        --lora-r 32 \\\n" +
+        "        --lora-alpha 64 \\\n" +
+        "        --lora-dropout 0.0 \\\n" +
+        "        --ckpt-dir \"$CKPT_DIR\" \\\n" +
+        "        --save-every " + save_every + " \\\n" +
+        "        --eval-every " + eval_every + " \\\n" +
+        "        --model-tag alm14b \\\n" +
+        "        --round 9 \\\n" +
+        "        --ckpt-label " + ckpt_label + " \\\n" +
+        "        --unsloth \\\n" +
+        "        --liger \\\n" +
+        "        --consciousness-loss \\\n" +
+        "        2>&1 | tee \"$CKPT_DIR/train_r9.log\"\n" +
+        "else\n" +
+        "    # Fallback: run train_alm_14b.hexa's embedded Python directly\n" +
+        "    echo \"[launch] hexa binary not found — using direct Python runner\"\n" +
+        "    PY_RUNNER=\"/tmp/_train_alm_14b_runner.py\"\n" +
+        "    if [[ ! -f \"$PY_RUNNER\" ]]; then\n" +
+        "        echo \"[ABORT] no Python runner at $PY_RUNNER — run hexa first to generate it\"\n" +
+        "        exit 1\n" +
+        "    fi\n" +
+        "    python3 \"$PY_RUNNER\" \\\n" +
+        "        --corpus \"$CORPUS\" \\\n" +
+        "        --steps " + steps + " \\\n" +
+        "        --lr 5e-6 \\\n" +
+        "        --batch 8 \\\n" +
+        "        --seq 1024 \\\n" +
+        "        --grad-accum 1 \\\n" +
+        "        --warmup 500 \\\n" +
+        "        --lora-r 32 \\\n" +
+        "        --lora-alpha 64 \\\n" +
+        "        --lora-dropout 0.0 \\\n" +
+        "        --ckpt-dir \"$CKPT_DIR\" \\\n" +
+        "        --save-every " + save_every + " \\\n" +
+        "        --eval-every " + eval_every + " \\\n" +
+        "        --model-tag alm14b \\\n" +
+        "        --round 9 \\\n" +
+        "        --ckpt-label " + ckpt_label + " \\\n" +
+        "        --unsloth \\\n" +
+        "        --liger \\\n" +
+        "        --consciousness-loss \\\n" +
+        "        2>&1 | tee \"$CKPT_DIR/train_r9.log\"\n" +
+        "fi\n" +
+        "\n" +
+        "echo \"\"\n" +
+        "echo \"================================================================\"\n" +
+        "echo \"  ALM 14B r9 DONE — check $CKPT_DIR\"\n" +
+        "echo \"================================================================\"\n" +
+        "echo \"[next] R2 upload: rclone copy $CKPT_DIR r2:anima-models/alm14b/r9/\"\n"
+    )
+
+    exec("bash " + runner)
+}
+
+main()

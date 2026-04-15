@@ -663,6 +663,107 @@ fn replace_float_at(arr: array, idx: int, val: float) -> array {
     return out
 }
 
+// ── Stratified subset selector ───────────────────────────────────────
+// Extract `per_domain` tasks from each of the 6 domains, preserving
+// order (seed 30 = first 5 per domain). Used by run_hire_sim_claude
+// and the stratified30 gate check.
+
+fn subset_stratified(tasks: array, per_domain: int) -> array {
+    let domains = ["email", "code", "meeting", "doc", "schedule", "research"]
+    let mut out = []
+    let mut di = 0
+    while di < len(domains) {
+        let dname = domains[di]
+        let mut taken = 0
+        let mut ti = 0
+        while ti < len(tasks) && taken < per_domain {
+            if tasks[ti].domain == dname {
+                out = out.push(tasks[ti])
+                taken = taken + 1
+            }
+            ti = ti + 1
+        }
+        di = di + 1
+    }
+    return out
+}
+
+// ── Difficulty distribution counter ─────────────────────────────────
+
+struct DifficultyDist {
+    easy: int,
+    medium: int,
+    hard: int
+}
+
+fn count_difficulty(tasks: array) -> DifficultyDist {
+    let mut e = 0
+    let mut m = 0
+    let mut h = 0
+    let mut i = 0
+    while i < len(tasks) {
+        if tasks[i].difficulty == "easy" { e = e + 1 }
+        else if tasks[i].difficulty == "medium" { m = m + 1 }
+        else if tasks[i].difficulty == "hard" { h = h + 1 }
+        i = i + 1
+    }
+    return DifficultyDist { easy: e, medium: m, hard: h }
+}
+
+// ── Stratified-30 gate check (v3.0 Agent gate) ─────────────────────
+// Runs 30-task stratified subset (5 per domain) through the autonomy
+// loop and checks against thresholds.
+//
+// Gate criteria:
+//   ALM: completion_rate >= 0.85
+//   CLM: completion_rate >= 0.80
+//   Both: intervention_rate <= 5/hr, avg_time <= 600s
+//
+// Returns a structured result with the sub-result + gate verdicts.
+
+struct StratifiedGateResult {
+    sim_result: HireSimResult,
+    alm_pass: bool,            // rate >= 0.85
+    clm_pass: bool,            // rate >= 0.80
+    interv_pass: bool,         // rate/hr <= 5
+    time_pass: bool,           // avg_time <= 600s
+    gate_alm: string,          // "PASS" | "FAIL"
+    gate_clm: string           // "PASS" | "FAIL"
+}
+
+fn run_stratified30_gate(adapter: LLMAdapter, tasks: array, max_depth: int, budget: int) -> StratifiedGateResult {
+    let subset = subset_stratified(tasks, 5)
+    let result = run_hire_sim_with_depth(adapter, subset, max_depth, budget)
+
+    let alm_pass = result.completion_rate >= 0.85
+    let clm_pass = result.completion_rate >= 0.80
+    let interv_pass = result.intervention_rate_per_hour <= 5.0
+    let time_pass = result.avg_time_s <= 600.0
+
+    let gate_alm = if alm_pass && interv_pass && time_pass { "PASS" } else { "FAIL" }
+    let gate_clm = if clm_pass && interv_pass && time_pass { "PASS" } else { "FAIL" }
+
+    return StratifiedGateResult {
+        sim_result: result,
+        alm_pass: alm_pass,
+        clm_pass: clm_pass,
+        interv_pass: interv_pass,
+        time_pass: time_pass,
+        gate_alm: gate_alm,
+        gate_clm: gate_clm
+    }
+}
+
+fn stratified_gate_report(g: StratifiedGateResult) -> string {
+    let mut s = hire_sim_report(g.sim_result)
+    s = s + "\n  stratified30 gate:\n"
+    s = s + "    ALM (rate>=0.85): " + g.gate_alm + " (" + to_string(g.sim_result.completion_rate) + ")\n"
+    s = s + "    CLM (rate>=0.80): " + g.gate_clm + " (" + to_string(g.sim_result.completion_rate) + ")\n"
+    s = s + "    interv/hr<=5:     " + (if g.interv_pass { "PASS" } else { "FAIL" }) + " (" + to_string(g.sim_result.intervention_rate_per_hour) + ")\n"
+    s = s + "    avg_time<=600s:   " + (if g.time_pass { "PASS" } else { "FAIL" }) + " (" + to_string(g.sim_result.avg_time_s) + ")\n"
+    return s
+}
+
 // ── Reporter ─────────────────────────────────────────────────────────
 
 fn hire_sim_report(r: HireSimResult) -> string {

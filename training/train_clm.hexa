@@ -354,6 +354,60 @@ fn train_init(cfg: ScaleConfig, total_steps: int) -> TrainState {
 //   use "loss_blas_only"
 //   use "lm_head_uv"
 
+// ─── §A0  BLAS FFI (cblas_sgemm via hxblas_wrapper.c) ─────────────
+//
+// ROOT CAUSE FIX (blocker #1, 2026-04-16): _block_attn inner loops were
+// O(S²D) scalar hexa ops — _tslice + _tdot per (i,j) pair with boxed int
+// index arithmetic. These loops dominated 60%+ of step time at d>=128.
+//
+// Fix: marshal list→raw f32 buffer, call cblas_sgemm for Q@K^T and probs@V,
+// use fused C softmax (hxblas_attn_softmax_causal) for scale+mask+softmax.
+// Expected 10-50x speedup on the attention hot path.
+//
+// Physical path:
+//   training/hxblas_wrapper.c → training/build/libhxblas.dylib
+//   → cblas_sgemm (Accelerate on Apple, OpenBLAS on Linux)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_sgemm(order: int, transA: int, transB: int, M: int, N: int, K: int, alpha: float, A: *Void, lda: int, B: *Void, ldb: int, beta: float, C: *Void, ldc: int)
+
+// Fused scale + causal mask + softmax over S×S scores matrix (in-place).
+// Replaces O(S²) scalar loop with native C float* path.
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_attn_softmax_causal(S: int, scale: float, scores: int)
+
+// CBLAS enum constants (row-major, no-transpose, transpose)
+comptime const CBLAS_ROW_MAJOR = 101
+comptime const CBLAS_NO_TRANS  = 111
+comptime const CBLAS_TRANS     = 112
+
+// ─── §A0.1  List↔raw buffer marshalling ───────────────────────────
+//
+// _block_attn uses [float] lists for its interface (Q/K/V/output are all
+// [float]). BLAS requires contiguous f32 buffers. These helpers marshal
+// between the two representations. The copy overhead is O(N) which is
+// negligible compared to the O(S²D) BLAS matmul they enable.
+
+// Copy [float] list slice into a raw f32 buffer (already allocated).
+// Copies len elements from list[offset..offset+len] into buf at byte 0.
+fn _list_to_raw(list: [float], offset: int, count: int, buf: int) {
+    let mut i = 0
+    while i < count {
+        write_f32(buf, i * 4, list[offset + i])
+        i = i + 1
+    }
+}
+
+// Copy raw f32 buffer into a [float] list slice (already allocated).
+// Reads count elements from buf and writes into list[offset..offset+count].
+fn _raw_to_list(buf: int, count: int, list: [float], offset: int) {
+    let mut i = 0
+    while i < count {
+        list[offset + i] = deref_f32(buf, i * 4)
+        i = i + 1
+    }
+}
+
 // ─── §A  Tensor primitives (inlined from nn_core.hexa) ────────────
 
 comptime const DECODER_EPS = 0.000001
@@ -683,67 +737,123 @@ fn _block_attn(
     let head_dim = d / n_head
     let d_kv = n_kv_head * head_dim
     let kv_repeat = n_head / n_kv_head
-    let scale = 1.0 / sqrt(to_float(head_dim))
+    let inv_sqrt_d = 1.0 / sqrt(to_float(head_dim))
 
-    // Projections
+    // Projections (list-backed matmul — these are [seq,d]×[d,d] and
+    // [seq,d]×[d,d_kv], which are BLAS-able too but are already O(S*D²)
+    // not O(S²D), so the attention inner loop is the priority).
     let Q = _matmul(x_normed, blk.Wq, seq, d, d)          // [seq × d]
     let K = _matmul(x_normed, blk.Wk, seq, d, d_kv)       // [seq × d_kv]
     let V = _matmul(x_normed, blk.Wv, seq, d, d_kv)       // [seq × d_kv]
 
-    // Per-head attention with GQA
+    // ── BLAS-backed per-head attention with GQA ──────────────────────
+    //
+    // ROOT CAUSE FIX (blocker #1): the old scalar path did O(S²) _tslice +
+    // _tdot per (si,sj) pair, with boxed int index arithmetic in every
+    // inner iteration. The hexa codegen emits hexa_mul/hexa_add for each
+    // `si * d + h * head_dim + k` expression — 3 boxed int ops per element.
+    // At d=384, seq=256 this was ~25M boxed int ops per head per layer.
+    //
+    // New path: marshal Q_h/K_kv/V_kv into contiguous f32 buffers,
+    // call cblas_sgemm for Q_h @ K_kv^T (scores) and probs @ V_kv (context),
+    // and use the fused C softmax (hxblas_attn_softmax_causal) for
+    // scale + causal mask + softmax in one native pass.
+    //
+    // Per-head buffer sizes: Q_h[seq,hd], K_kv[seq,hd], V_kv[seq,hd],
+    // scores[seq,seq], ctx_h[seq,hd]. Allocated once per head, reused.
+
     let mut out = _tz(seq * d)
+
+    // Pre-allocate raw f32 buffers for per-head BLAS ops
+    let buf_qh     = alloc_raw(seq * head_dim * 4)  // Q_h[seq, head_dim]
+    let buf_kv_k   = alloc_raw(seq * head_dim * 4)  // K_kv[seq, head_dim]
+    let buf_kv_v   = alloc_raw(seq * head_dim * 4)  // V_kv[seq, head_dim]
+    let buf_scores = alloc_raw(seq * seq * 4)        // scores[seq, seq]
+    let buf_ctx    = alloc_raw(seq * head_dim * 4)   // ctx_h[seq, head_dim]
+
     let mut h = 0
     while h < n_head {
         let kv_idx = h / kv_repeat
-        // Extract Q head h, K/V head kv_idx
+
+        // ── Marshal Q head h into contiguous buffer ──────────────────
+        // Q is [seq, d] flat; head h occupies columns [h*hd .. (h+1)*hd]
         let mut si = 0
         while si < seq {
-            // Query slice for this head: Q[si, h*head_dim .. (h+1)*head_dim]
-            let q_row = _tslice(Q, si * d + h * head_dim, si * d + (h + 1) * head_dim)
-
-            // Compute scores against all key positions (causal: j <= si)
-            let mut scores = []
-            let mut sj = 0
-            while sj < seq {
-                if sj <= si {
-                    let k_row = _tslice(K, sj * d_kv + kv_idx * head_dim,
-                                           sj * d_kv + (kv_idx + 1) * head_dim)
-                    scores = scores.push(_tdot(q_row, k_row) * scale)
-                } else {
-                    scores = scores.push(0.0 - 1000000000000000000000000000000.0)   // causal mask (1e30 expanded for stage1 parser)
-                }
-                sj = sj + 1
-            }
-
-            // Softmax over scores
-            let attn_w = _softmax(scores)
-
-            // Weighted sum of V heads
-            let mut head_out = _tz(head_dim)
-            sj = 0
-            while sj < seq {
-                if attn_w[sj] > 0.000000000001 {   // 1e-12 expanded for stage1 parser
-                    let v_row = _tslice(V, sj * d_kv + kv_idx * head_dim,
-                                           sj * d_kv + (kv_idx + 1) * head_dim)
-                    let mut p = 0
-                    while p < head_dim {
-                        head_out[p] = head_out[p] + attn_w[sj] * v_row[p]
-                        p = p + 1
-                    }
-                }
-                sj = sj + 1
-            }
-
-            // Write to output: out[si, h*head_dim .. (h+1)*head_dim]
             let mut p = 0
             while p < head_dim {
-                out[si * d + h * head_dim + p] = head_out[p]
+                let val = Q[si * d + h * head_dim + p]
+                write_f32(buf_qh, (si * head_dim + p) * 4, val)
                 p = p + 1
             }
             si = si + 1
         }
+
+        // ── Marshal K head kv_idx into contiguous buffer ─────────────
+        // K is [seq, d_kv]; head kv_idx occupies columns [kv_idx*hd .. (kv_idx+1)*hd]
+        si = 0
+        while si < seq {
+            let mut p = 0
+            while p < head_dim {
+                let val = K[si * d_kv + kv_idx * head_dim + p]
+                write_f32(buf_kv_k, (si * head_dim + p) * 4, val)
+                p = p + 1
+            }
+            si = si + 1
+        }
+
+        // ── Marshal V head kv_idx into contiguous buffer ─────────────
+        si = 0
+        while si < seq {
+            let mut p = 0
+            while p < head_dim {
+                let val = V[si * d_kv + kv_idx * head_dim + p]
+                write_f32(buf_kv_v, (si * head_dim + p) * 4, val)
+                p = p + 1
+            }
+            si = si + 1
+        }
+
+        // ── scores[S,S] = Q_h[S,hd] @ K_kv[S,hd]^T  via BLAS sgemm ─
+        // C = A * B^T: transB=CBLAS_TRANS, M=S, N=S, K=hd
+        hxblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
+                     seq, seq, head_dim,
+                     1.0, buf_qh, head_dim,
+                     buf_kv_k, head_dim,
+                     0.0, buf_scores, seq)
+
+        // ── Fused scale + causal mask + softmax (native C) ───────────
+        // hxblas_attn_softmax_causal: scales by inv_sqrt_d, masks j>i
+        // to -1e30, applies row-wise softmax. All in one O(S²) C loop
+        // with native float* — no boxed int overhead.
+        hxblas_attn_softmax_causal(seq, inv_sqrt_d, buf_scores)
+
+        // ── ctx[S,hd] = probs[S,S] @ V_kv[S,hd]  via BLAS sgemm ────
+        hxblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                     seq, head_dim, seq,
+                     1.0, buf_scores, seq,
+                     buf_kv_v, head_dim,
+                     0.0, buf_ctx, head_dim)
+
+        // ── Unmarshal ctx_h back into output list ────────────────────
+        si = 0
+        while si < seq {
+            let mut p = 0
+            while p < head_dim {
+                out[si * d + h * head_dim + p] = deref_f32(buf_ctx, (si * head_dim + p) * 4)
+                p = p + 1
+            }
+            si = si + 1
+        }
+
         h = h + 1
     }
+
+    // Free per-head BLAS buffers
+    free_raw(buf_qh,     seq * head_dim * 4)
+    free_raw(buf_kv_k,   seq * head_dim * 4)
+    free_raw(buf_kv_v,   seq * head_dim * 4)
+    free_raw(buf_scores, seq * seq * 4)
+    free_raw(buf_ctx,    seq * head_dim * 4)
 
     // Output projection: [seq × d] @ Wo[d × d] → [seq × d]
     return _matmul(out, blk.Wo, seq, d, d)

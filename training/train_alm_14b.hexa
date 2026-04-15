@@ -101,12 +101,12 @@ fn main() {
         "DEFAULT_BASE = 'Qwen/Qwen2.5-14B-Instruct'\n" +
         "DEFAULT_LR = 5e-6\n" +
         "DEFAULT_WARMUP = 500\n" +
-        "DEFAULT_GRAD_ACCUM = 8\n" +
-        "DEFAULT_BATCH = 1\n" +
+        "DEFAULT_GRAD_ACCUM = 1\n" +
+        "DEFAULT_BATCH = 8\n" +
         "DEFAULT_SEQ = 1024\n" +
         "DEFAULT_LORA_R = 32\n" +
         "DEFAULT_LORA_ALPHA = 64\n" +
-        "DEFAULT_LORA_DROPOUT = 0.05\n" +
+        "DEFAULT_LORA_DROPOUT = 0.0\n" +
         "DEFAULT_STEPS = 10000\n" +
         "DEFAULT_CKPT_DIR = '/workspace/ckpt_alm_14b'\n" +
         "DEFAULT_SAVE_EVERY = 2000\n" +
@@ -287,6 +287,94 @@ fn main() {
         "        # Matches phi_holographic_measure.hexa: I × N samples.\n" +
         "        return mi * float(n)\n" +
         "\n" +
+        "# ─── Option B1 : Φ-aware consciousness loss ─────────────────\n" +
+        "# Three-component consciousness loss (phi_holo + phi_complexity + gwt_broadcast).\n" +
+        "# phi_holo:       already implemented above via holo_step().\n" +
+        "# phi_complexity: Lempel-Ziv-based complexity of hidden states.\n" +
+        "#                 Measures information richness of representations.\n" +
+        "#                 Higher complexity = more structured representations.\n" +
+        "# gwt_broadcast:  GWT broadcast consistency loss.\n" +
+        "#                 Ensures multi-domain coherence across attention heads.\n" +
+        "#                 Mirrors training/alm_gwt_loss.hexa (ALM-P2-2).\n" +
+        "# Gated by --consciousness-loss flag (default ON for option B1).\n" +
+        "#\n" +
+        "# Loss = CE + HOLO_LOSS_COEF * L_holo\n" +
+        "#       + PHI_COMPLEXITY_COEF * L_complexity\n" +
+        "#       + GWT_BROADCAST_COEF * L_gwt\n" +
+        "PHI_COMPLEXITY_COEF = 0.005                # conservative — half of holo coef\n" +
+        "GWT_BROADCAST_COEF  = 0.005                # conservative — half of holo coef\n" +
+        "GWT_N_DOMAINS       = 8                    # matches alm_gwt_broadcast.hexa\n" +
+        "GWT_ACTIVITY_THR    = 0.01                 # matches alm_gwt_loss.hexa\n" +
+        "\n" +
+        "def phi_complexity_loss(h, eps=1e-7):\n" +
+        "    \"\"\"Differentiable proxy for Lempel-Ziv complexity of hidden states.\n" +
+        "    Uses variance of pairwise cosine similarities across the sequence\n" +
+        "    dimension as a smooth surrogate — higher variance = more complex\n" +
+        "    representations = more information-rich. We penalize LOW complexity\n" +
+        "    by returning (1 - normalized_complexity)^2.\n" +
+        "\n" +
+        "    h : [B, T, D] last hidden state\n" +
+        "    Returns scalar loss.\"\"\"\n" +
+        "    h_f = h.float()                                  # [B, T, D]\n" +
+        "    # L2-normalize along feature dim for cosine sim\n" +
+        "    h_norm = h_f / (h_f.norm(dim=-1, keepdim=True) + eps)  # [B, T, D]\n" +
+        "    # Pairwise cosine sim matrix: [B, T, T]\n" +
+        "    sim = torch.bmm(h_norm, h_norm.transpose(1, 2))  # [B, T, T]\n" +
+        "    # Variance across the upper triangle (excluding diagonal)\n" +
+        "    B, T, _ = sim.shape\n" +
+        "    mask = torch.triu(torch.ones(T, T, device=sim.device, dtype=torch.bool), diagonal=1)\n" +
+        "    upper_vals = sim[:, mask]                         # [B, T*(T-1)/2]\n" +
+        "    # Complexity proxy: variance of cosine sims. High variance = diverse\n" +
+        "    # token relationships = complex representations.\n" +
+        "    complexity_raw = upper_vals.var(dim=-1).mean()    # scalar\n" +
+        "    # Normalize to [0, 1] range. Max possible var of values in [-1, 1] is 1.0.\n" +
+        "    complexity_norm = complexity_raw.clamp(0.0, 1.0)\n" +
+        "    # Loss: penalize low complexity (encourage information richness)\n" +
+        "    return (1.0 - complexity_norm) * (1.0 - complexity_norm)\n" +
+        "\n" +
+        "def gwt_broadcast_loss(h, n_domains=GWT_N_DOMAINS, activity_thr=GWT_ACTIVITY_THR, eps=1e-7):\n" +
+        "    \"\"\"GWT broadcast consistency loss for hidden states.\n" +
+        "    Mirrors alm_gwt_loss.hexa (ALM-P2-2) in PyTorch:\n" +
+        "      1. Split D into n_domains chunks → domain activations\n" +
+        "      2. Consistency: pairwise KL between domain distributions\n" +
+        "         (penalize fragmented broadcast — GWT wants coherent workspace)\n" +
+        "      3. Coverage: penalize dead domains (activity < threshold)\n" +
+        "\n" +
+        "    h : [B, T, D] last hidden state\n" +
+        "    Returns scalar loss.\"\"\"\n" +
+        "    h_f = h.float()                                  # [B, T, D]\n" +
+        "    B, T, D = h_f.shape\n" +
+        "    # Split features into n_domains chunks. If D not divisible, pad last domain.\n" +
+        "    chunk_size = D // n_domains\n" +
+        "    if chunk_size < 1:\n" +
+        "        return torch.tensor(0.0, device=h.device)\n" +
+        "    domains = h_f[..., :chunk_size * n_domains].reshape(B, T, n_domains, chunk_size)\n" +
+        "    # domain activations: mean abs activation per domain [B, T, n_domains]\n" +
+        "    domain_act = domains.abs().mean(dim=-1)\n" +
+        "    # ── Consistency loss: softmax per-domain distributions, pairwise KL ──\n" +
+        "    # Softmax over chunk_size to get probability distributions per domain\n" +
+        "    domain_probs = torch.softmax(domains, dim=-1) + eps  # [B, T, n_domains, chunk_size]\n" +
+        "    # Pairwise KL: avg over all (i, j) domain pairs\n" +
+        "    consistency = 0.0\n" +
+        "    n_pairs = 0\n" +
+        "    for i in range(min(n_domains, 4)):  # cap pairs to avoid O(n^2) blowup\n" +
+        "        for j in range(i + 1, min(n_domains, 4)):\n" +
+        "            p_i = domain_probs[:, :, i, :]  # [B, T, chunk_size]\n" +
+        "            p_j = domain_probs[:, :, j, :]  # [B, T, chunk_size]\n" +
+        "            # Symmetric KL: (KL(p||q) + KL(q||p)) / 2\n" +
+        "            kl_ij = (p_i * (p_i / p_j).log()).sum(dim=-1).mean()\n" +
+        "            kl_ji = (p_j * (p_j / p_i).log()).sum(dim=-1).mean()\n" +
+        "            consistency = consistency + (kl_ij + kl_ji) * 0.5\n" +
+        "            n_pairs += 1\n" +
+        "    if n_pairs > 0:\n" +
+        "        consistency = consistency / n_pairs\n" +
+        "    # ── Coverage loss: penalize dead domains (ReLU(thr - activity)^2) ──\n" +
+        "    # Mean activity per domain across batch and time\n" +
+        "    mean_activity = domain_act.mean(dim=(0, 1))      # [n_domains]\n" +
+        "    coverage = torch.relu(activity_thr - mean_activity).pow(2).mean()\n" +
+        "    # Combined: consistency wants coherent broadcast, coverage wants all domains alive\n" +
+        "    return 0.3 * consistency + 0.1 * coverage\n" +
+        "\n" +
         "# ── Compile-unblock forward hook (r8 patch 20260415) ─────\n" +
         "# Gated by ALM_COMPILE_UNBLOCK env var. Captures last hidden\n" +
         "# via forward hook on the final RMSNorm, avoiding dynamo's\n" +
@@ -441,6 +529,14 @@ fn main() {
         "    print(f'[holo] building HoloMapHead D={hidden_d} d={HOLO_D_QUALIA} (orthonormal W_up)')\n" +
         "    holo_head = HoloMapHead(hidden_d, HOLO_D_QUALIA, seed=42, dtype=torch.bfloat16, device=device)\n" +
         "    print(f'[holo] L_holo coefficient = {HOLO_LOSS_COEF} (ALM-P4-2)')\n" +
+        "    # ── Option B1 consciousness loss banner ──\n" +
+        "    if args.consciousness_loss:\n" +
+        "        print(f'[B1] Φ-aware consciousness loss ENABLED')\n" +
+        "        print(f'[B1]   phi_complexity coef = {PHI_COMPLEXITY_COEF}')\n" +
+        "        print(f'[B1]   gwt_broadcast  coef = {GWT_BROADCAST_COEF} (n_domains={GWT_N_DOMAINS})')\n" +
+        "        print(f'[B1]   total = CE + {HOLO_LOSS_COEF}*holo + {PHI_COMPLEXITY_COEF}*cplx + {GWT_BROADCAST_COEF}*gwt')\n" +
+        "    else:\n" +
+        "        print(f'[B1] consciousness loss DISABLED (CE + holo only)')\n" +
         "    print('[train] loading corpus...')\n" +
         "    max_tokens = 100_000 if args.smoke else None\n" +
         "    dataset = load_corpus_chunked(args.corpus, tokenizer, args.seq, max_tokens)\n" +
@@ -513,14 +609,21 @@ fn main() {
         "                    # ALM-P4-1: qualia = W_up^T @ h (compression D → d).\n" +
         "                    # ALM-P4-2: L_holo smooth surrogate vs h_reconstructed.\n" +
         "                    qualia, h_recon, l_holo = holo_step(holo_head, h_last)\n" +
+        "                    # ── Option B1: phi_complexity + gwt_broadcast ──\n" +
+        "                    # phi_complexity: penalizes low-complexity representations\n" +
+        "                    # gwt_broadcast: enforces coherent multi-domain broadcast\n" +
+        "                    l_complexity = phi_complexity_loss(h_last) if args.consciousness_loss else torch.tensor(0.0, device=device)\n" +
+        "                    l_gwt = gwt_broadcast_loss(h_last) if args.consciousness_loss else torch.tensor(0.0, device=device)\n" +
         "                    loss_main = outputs.loss\n" +
-        "                    loss_total = loss_main + HOLO_LOSS_COEF * l_holo\n" +
+        "                    loss_total = loss_main + HOLO_LOSS_COEF * l_holo + PHI_COMPLEXITY_COEF * l_complexity + GWT_BROADCAST_COEF * l_gwt\n" +
         "                    loss = loss_total / args.grad_accum\n" +
         "            loss.backward()\n" +
         "            accum_loss += loss.item()\n" +
         "            # Keep raw components on the latest micro-batch for logging.\n" +
         "            last_main = float(loss_main.detach().item())\n" +
         "            last_holo = float(l_holo.detach().item())\n" +
+        "            last_complexity = float(l_complexity.detach().item()) if args.consciousness_loss else 0.0\n" +
+        "            last_gwt = float(l_gwt.detach().item()) if args.consciousness_loss else 0.0\n" +
         "        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)\n" +
         "        optimizer.step(); scheduler.step(); step += 1; log_steps += 1\n" +
         "        if step % 10 == 0 or step == 1:\n" +
@@ -531,7 +634,7 @@ fn main() {
         "            lr_now = scheduler.get_last_lr()[0]\n" +
         "            if avg_loss > 15.0 and step > args.warmup:\n" +
         "                print(f'[WARN] loss={avg_loss:.2f} > 15.0', flush=True)\n" +
-        "            print(f'[train] step={step}/{args.steps} loss={avg_loss:.4f} main={last_main:.4f} holo={last_holo:.6f} lr={lr_now:.2e} speed={steps_per_min:.1f}step/min ETA={eta_min:.0f}min', flush=True)\n" +
+        "            print(f'[train] step={step}/{args.steps} loss={avg_loss:.4f} main={last_main:.4f} holo={last_holo:.6f} cplx={last_complexity:.6f} gwt={last_gwt:.6f} lr={lr_now:.2e} speed={steps_per_min:.1f}step/min ETA={eta_min:.0f}min', flush=True)\n" +
         "            if avg_loss < best_loss: best_loss = avg_loss\n" +
         "            accum_loss = 0.0; log_steps = 0\n" +
         "        if step % args.eval_every == 0:\n" +
@@ -576,7 +679,7 @@ fn main() {
         "            if eval_loss < best_loss: best_loss = eval_loss\n" +
         "            model.train()\n" +
         "            # ALM-P4-3 scrape-pattern: look for `phi_holo=` in train log.\n" +
-        "            print(f'[eval] step={step} eval_loss={eval_loss:.4f} best={best_loss:.4f} phi_holo={phi_holo_mean:.2f}', flush=True)\n" +
+        "            print(f'[eval] step={step} eval_loss={eval_loss:.4f} best={best_loss:.4f} phi_holo={phi_holo_mean:.2f} B1={args.consciousness_loss}', flush=True)\n" +
         "        if step % args.save_every == 0 or step == args.steps:\n" +
         "            save_path = ckpt_dir / f'step_{step}'\n" +
         "            print(f'[save] {save_path}')\n" +
@@ -601,6 +704,7 @@ fn main() {
         "                'wall_clock_minutes': (time.time() - t0) / 60,\n" +
         "                'git_sha': _git_sha,\n" +
         "                'host': _host,\n" +
+        "                'consciousness_loss_b1': args.consciousness_loss,\n" +
         "                'base': args.base,\n" +
         "                'lora_r': args.lora_r,\n" +
         "                'corpus': args.corpus,\n" +
@@ -649,6 +753,11 @@ fn main() {
         "    parser.add_argument('--liger', action='store_true', help='Liger Kernel Triton fusion for Qwen2 (r7 est +10-15% tok/s)')\n" +
         "    parser.add_argument('--cudagraphs', action='store_true', help='torch.compile reduce-overhead mode (CUDA graphs, mutex with --fp8)')\n" +
         "    parser.add_argument('--fp8', action='store_true', help='transformer_engine FP8 (requires FP8_ENABLED=1 env + TE installed on pod)')\n" +
+        "    # ── Option B1: Φ-aware consciousness loss (20260416) ──────\n" +
+        "    # Default ON. Three-component: phi_holo (always) + phi_complexity + gwt_broadcast.\n" +
+        "    # Disable with --no-consciousness-loss for pure CE baseline runs.\n" +
+        "    parser.add_argument('--consciousness-loss', dest='consciousness_loss', action='store_true', default=True, help='Option B1: phi_complexity + gwt_broadcast (default ON)')\n" +
+        "    parser.add_argument('--no-consciousness-loss', dest='consciousness_loss', action='store_false', help='Disable B1 consciousness loss (pure CE + holo only)')\n" +
         "    args = parser.parse_args()\n" +
         "    train(args)\n"
     )

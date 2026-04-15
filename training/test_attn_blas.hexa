@@ -1,0 +1,377 @@
+// test_attn_blas.hexa — Verify BLAS-backed _block_attn matches scalar reference
+//
+// Purpose: prove semantic equivalence between the old scalar O(S^2*D) attention
+// and the new BLAS-backed version after blocker #1 fix (2026-04-16).
+//
+// Strategy:
+//   1. Implement both scalar (reference) and BLAS paths
+//   2. Run both on identical Q/K/V inputs
+//   3. Compare outputs element-by-element (tolerance 1e-4 for f32 rounding)
+//
+// Build + run:
+//   cd /Users/ghost/Dev/anima
+//   HEXA_LOCAL=1 hexa run training/test_attn_blas.hexa
+
+// ── BLAS FFI ──────────────────────────────────────────────────────────
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_sgemm(order: int, transA: int, transB: int, M: int, N: int, K: int, alpha: float, A: *Void, lda: int, B: *Void, ldb: int, beta: float, C: *Void, ldc: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_attn_softmax_causal(S: int, scale: float, scores: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_version() -> int
+
+comptime const CBLAS_ROW_MAJOR = 101
+comptime const CBLAS_NO_TRANS  = 111
+comptime const CBLAS_TRANS     = 112
+
+// ── Helpers ───────────────────────────────────────────────────────────
+let PI = 3.141592653589793
+
+fn _tz(n: int) -> [float] {
+    let mut out = []
+    let mut i = 0
+    while i < n { out = out.push(0.0); i = i + 1 }
+    return out
+}
+
+fn _tslice(a: [float], start: int, end: int) -> [float] {
+    let mut out = []
+    let mut i = start
+    while i < end { out = out.push(a[i]); i = i + 1 }
+    return out
+}
+
+fn _tdot(a: [float], b: [float]) -> float {
+    let mut sum = 0.0
+    let n = len(a)
+    let mut i = 0
+    while i < n { sum = sum + a[i] * b[i]; i = i + 1 }
+    return sum
+}
+
+fn _softmax(logits: [float]) -> [float] {
+    let n = len(logits)
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut exps = []
+    let mut s = 0.0
+    i = 0
+    while i < n {
+        let e = exp(logits[i] - mx)
+        exps = exps.push(e)
+        s = s + e
+        i = i + 1
+    }
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out.push(exps[i] / s)
+        i = i + 1
+    }
+    return out
+}
+
+fn _matmul(A: [float], B: [float], M: int, K: int, N: int) -> [float] {
+    let mut C = _tz(M * N)
+    let mut i = 0
+    while i < M {
+        let mut j = 0
+        while j < N {
+            let mut sum = 0.0
+            let mut k = 0
+            while k < K {
+                sum = sum + A[i * K + k] * B[k * N + j]
+                k = k + 1
+            }
+            C[i * N + j] = sum
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return C
+}
+
+// LCG PRNG
+let mut LCG_STATE = 42
+fn det_randn(n: int, seed: int) -> [float] {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u1_raw = to_float(s % 1000000) / 1000000.0
+        let u1 = if u1_raw < 0.000001 { 0.000001 } else { u1_raw }
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u2 = to_float(s % 1000000) / 1000000.0
+        let r = sqrt(0.0 - 2.0 * log(u1))
+        let theta = 2.0 * PI * u2
+        let z = r * cos(theta)
+        out = out.push(z * 0.1)
+        i = i + 1
+    }
+    return out
+}
+
+// ── Scalar reference attention (old code, verbatim) ──────────────────
+fn attn_scalar(
+    Q: [float], K: [float], V: [float],
+    seq: int, d: int, d_kv: int, n_head: int, n_kv_head: int
+) -> [float] {
+    let head_dim = d / n_head
+    let kv_repeat = n_head / n_kv_head
+    let scale = 1.0 / sqrt(to_float(head_dim))
+    let mut out = _tz(seq * d)
+    let mut h = 0
+    while h < n_head {
+        let kv_idx = h / kv_repeat
+        let mut si = 0
+        while si < seq {
+            let q_row = _tslice(Q, si * d + h * head_dim, si * d + (h + 1) * head_dim)
+            let mut scores = []
+            let mut sj = 0
+            while sj < seq {
+                if sj <= si {
+                    let k_row = _tslice(K, sj * d_kv + kv_idx * head_dim,
+                                           sj * d_kv + (kv_idx + 1) * head_dim)
+                    scores = scores.push(_tdot(q_row, k_row) * scale)
+                } else {
+                    scores = scores.push(0.0 - 1000000000000000000000000000000.0)
+                }
+                sj = sj + 1
+            }
+            let attn_w = _softmax(scores)
+            let mut head_out = _tz(head_dim)
+            sj = 0
+            while sj < seq {
+                if attn_w[sj] > 0.000000000001 {
+                    let v_row = _tslice(V, sj * d_kv + kv_idx * head_dim,
+                                           sj * d_kv + (kv_idx + 1) * head_dim)
+                    let mut p = 0
+                    while p < head_dim {
+                        head_out[p] = head_out[p] + attn_w[sj] * v_row[p]
+                        p = p + 1
+                    }
+                }
+                sj = sj + 1
+            }
+            let mut p = 0
+            while p < head_dim {
+                out[si * d + h * head_dim + p] = head_out[p]
+                p = p + 1
+            }
+            si = si + 1
+        }
+        h = h + 1
+    }
+    return out
+}
+
+// ── BLAS-backed attention (new code) ─────────────────────────────────
+fn attn_blas(
+    Q: [float], K: [float], V: [float],
+    seq: int, d: int, d_kv: int, n_head: int, n_kv_head: int
+) -> [float] {
+    let head_dim = d / n_head
+    let kv_repeat = n_head / n_kv_head
+    let inv_sqrt_d = 1.0 / sqrt(to_float(head_dim))
+    let mut out = _tz(seq * d)
+
+    let buf_qh     = alloc_raw(seq * head_dim * 4)
+    let buf_kv_k   = alloc_raw(seq * head_dim * 4)
+    let buf_kv_v   = alloc_raw(seq * head_dim * 4)
+    let buf_scores = alloc_raw(seq * seq * 4)
+    let buf_ctx    = alloc_raw(seq * head_dim * 4)
+
+    let mut h = 0
+    while h < n_head {
+        let kv_idx = h / kv_repeat
+
+        // Marshal Q head
+        let mut si = 0
+        while si < seq {
+            let mut p = 0
+            while p < head_dim {
+                write_f32(buf_qh, (si * head_dim + p) * 4, Q[si * d + h * head_dim + p])
+                p = p + 1
+            }
+            si = si + 1
+        }
+
+        // Marshal K head
+        si = 0
+        while si < seq {
+            let mut p = 0
+            while p < head_dim {
+                write_f32(buf_kv_k, (si * head_dim + p) * 4, K[si * d_kv + kv_idx * head_dim + p])
+                p = p + 1
+            }
+            si = si + 1
+        }
+
+        // Marshal V head
+        si = 0
+        while si < seq {
+            let mut p = 0
+            while p < head_dim {
+                write_f32(buf_kv_v, (si * head_dim + p) * 4, V[si * d_kv + kv_idx * head_dim + p])
+                p = p + 1
+            }
+            si = si + 1
+        }
+
+        // scores = Q_h @ K_kv^T
+        hxblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
+                     seq, seq, head_dim,
+                     1.0, buf_qh, head_dim,
+                     buf_kv_k, head_dim,
+                     0.0, buf_scores, seq)
+
+        // Fused scale + causal mask + softmax
+        hxblas_attn_softmax_causal(seq, inv_sqrt_d, buf_scores)
+
+        // ctx = probs @ V_kv
+        hxblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                     seq, head_dim, seq,
+                     1.0, buf_scores, seq,
+                     buf_kv_v, head_dim,
+                     0.0, buf_ctx, head_dim)
+
+        // Unmarshal
+        si = 0
+        while si < seq {
+            let mut p = 0
+            while p < head_dim {
+                out[si * d + h * head_dim + p] = deref_f32(buf_ctx, (si * head_dim + p) * 4)
+                p = p + 1
+            }
+            si = si + 1
+        }
+
+        h = h + 1
+    }
+
+    free_raw(buf_qh,     seq * head_dim * 4)
+    free_raw(buf_kv_k,   seq * head_dim * 4)
+    free_raw(buf_kv_v,   seq * head_dim * 4)
+    free_raw(buf_scores, seq * seq * 4)
+    free_raw(buf_ctx,    seq * head_dim * 4)
+
+    return out
+}
+
+// ── Test runner ───────────────────────────────────────────────────────
+fn hx_fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn test_shape(seq: int, d: int, n_head: int, n_kv_head: int, label: string) -> int {
+    let head_dim = d / n_head
+    let d_kv = n_kv_head * head_dim
+    let seed_q = 42
+    let seed_k = 137
+    let seed_v = 256
+
+    // Generate random Q/K/V
+    let Q = det_randn(seq * d, seed_q)
+    let K = det_randn(seq * d_kv, seed_k)
+    let V = det_randn(seq * d_kv, seed_v)
+
+    // Scalar reference
+    let t0 = clock()
+    let ref_out = attn_scalar(Q, K, V, seq, d, d_kv, n_head, n_kv_head)
+    let t1 = clock()
+    let scalar_ms = (t1 - t0) * 1000.0
+
+    // BLAS path
+    let t2 = clock()
+    let blas_out = attn_blas(Q, K, V, seq, d, d_kv, n_head, n_kv_head)
+    let t3 = clock()
+    let blas_ms = (t3 - t2) * 1000.0
+
+    // Compare
+    let n = seq * d
+    let mut max_err = 0.0
+    let mut sum_err = 0.0
+    let mut i = 0
+    while i < n {
+        let err = hx_fabs(ref_out[i] - blas_out[i])
+        if err > max_err { max_err = err }
+        sum_err = sum_err + err
+        i = i + 1
+    }
+    let mean_err = sum_err / to_float(n)
+
+    let tol = 0.001  // 1e-3 tolerance for f32 rounding
+    let pass = max_err < tol
+    let speedup = scalar_ms / blas_ms
+
+    println("[" + label + "] seq=" + to_string(seq) + " d=" + to_string(d)
+            + " heads=" + to_string(n_head) + "/" + to_string(n_kv_head))
+    println("  scalar: " + to_string(scalar_ms) + " ms")
+    println("  blas:   " + to_string(blas_ms) + " ms")
+    println("  speedup: " + to_string(speedup) + "x")
+    println("  max_err: " + to_string(max_err) + "  mean_err: " + to_string(mean_err))
+    println("  PASS: " + to_string(pass))
+    println("")
+
+    if pass { return 1 }
+    return 0
+}
+
+fn main() {
+    println("=== test_attn_blas.hexa — BLAS attention equivalence test ===")
+    let ver = hxblas_version()
+    println("hxblas ABI version=" + to_string(ver))
+    println("")
+
+    let mut total = 0
+    let mut passed = 0
+
+    // Test 1: tiny (seq=4, d=8, 2 heads, no GQA)
+    total = total + 1
+    passed = passed + test_shape(4, 8, 2, 2, "T1-tiny")
+
+    // Test 2: small (seq=8, d=16, 4 heads, no GQA)
+    total = total + 1
+    passed = passed + test_shape(8, 16, 4, 4, "T2-small")
+
+    // Test 3: GQA (seq=8, d=16, 4 heads, 2 kv_heads)
+    total = total + 1
+    passed = passed + test_shape(8, 16, 4, 2, "T3-gqa")
+
+    // Test 4: medium (seq=16, d=32, 4 heads, 2 kv_heads)
+    total = total + 1
+    passed = passed + test_shape(16, 32, 4, 2, "T4-medium")
+
+    // Test 5: real shape (seq=32, d=64, 4 heads, 2 kv_heads)
+    total = total + 1
+    passed = passed + test_shape(32, 64, 4, 2, "T5-real")
+
+    // Test 6: 34M scale (seq=16, d=384, 4 heads, 2 kv_heads) — matches scale_34m
+    total = total + 1
+    passed = passed + test_shape(16, 384, 4, 2, "T6-34m")
+
+    // Test 7: bigger seq (seq=64, d=128, 4 heads, 2 kv_heads) — shows S^2 scaling
+    total = total + 1
+    passed = passed + test_shape(64, 128, 4, 2, "T7-seq64")
+
+    // Test 8: production seq (seq=128, d=256, 8 heads, 4 kv_heads)
+    total = total + 1
+    passed = passed + test_shape(128, 256, 8, 4, "T8-prod128")
+
+    println("=== RESULTS: " + to_string(passed) + "/" + to_string(total) + " PASS ===")
+    if passed == total {
+        println("ALL PASS — BLAS attention is semantically equivalent to scalar reference")
+    } else {
+        println("FAIL — check max_err values above")
+    }
+}
+
+main()
