@@ -1,0 +1,480 @@
+// ═══════════════════════════════════════════════════════════════
+//  gpu_grad_engine.hexa — GPU reverse-mode autograd engine
+//
+//  Tape-based automatic differentiation. All gradient computation
+//  stays on GPU (no D2H during training, only for loss reporting).
+//
+//  Tape entries: [op_code, output_gt, ...input_gts, ...dims]
+//  Backward traverses tape in reverse, dispatching grad kernels.
+//
+//  Op codes:
+//    0=matmul, 1=matmul_tn, 2=matmul_nt, 3=relu, 4=gelu
+//    5=softmax, 6=add, 7=layernorm, 8=embedding, 9=cross_entropy
+// ═══════════════════════════════════════════════════════════════
+
+use "cuda_ffi"
+use "gpu_tensor"
+
+// ── Tape storage ─────────────────────────────────────────────
+let mut TAPE = []
+let mut TAPE_LEN = 0
+
+fn tape_clear() {
+    TAPE = []
+    TAPE_LEN = 0
+}
+
+fn tape_push(entry) {
+    TAPE = TAPE.push(entry)
+    TAPE_LEN = TAPE_LEN + 1
+}
+
+// ── Recorded forward operations ──────────────────────────────
+// Each returns a GpuTensor and records the op on tape.
+
+// Linear forward: Y[M×N] = X[M×K] @ W[K×N]
+// Records: [0, Y, X, W, M, K, N]
+fn gpu_linear_fwd(X_gt, W_gt) {
+    let Y_gt = gpu_matmul(X_gt, W_gt)
+    tape_push([0, Y_gt, X_gt, W_gt, gt_rows(X_gt), gt_cols(X_gt), gt_cols(W_gt)])
+    Y_gt
+}
+
+// Linear forward with pre-allocated output
+fn gpu_linear_fwd_into(X_gt, W_gt, Y_gt) {
+    let _ = gpu_matmul_into(X_gt, W_gt, Y_gt)
+    tape_push([0, Y_gt, X_gt, W_gt, gt_rows(X_gt), gt_cols(X_gt), gt_cols(W_gt)])
+    Y_gt
+}
+
+// ReLU forward (host fallback)
+// Records: [3, Y, X]
+fn gpu_relu_fwd(X_gt) {
+    let Y_gt = gpu_relu_host(X_gt)
+    tape_push([3, Y_gt, X_gt])
+    Y_gt
+}
+
+// GELU forward (host fallback)
+// Records: [4, Y, X]
+fn gpu_gelu_fwd(X_gt) {
+    let Y_gt = gpu_gelu_host(X_gt)
+    tape_push([4, Y_gt, X_gt])
+    Y_gt
+}
+
+// Softmax forward (host fallback)
+// Records: [5, Y, X]
+fn gpu_softmax_fwd(X_gt) {
+    let Y_gt = gpu_softmax_host(X_gt)
+    tape_push([5, Y_gt, X_gt])
+    Y_gt
+}
+
+// Add: C = A + B (via cuBLAS axpy into copy of A)
+// Records: [6, C, A, B]
+fn gpu_add_fwd(A_gt, B_gt) {
+    let C_gt = gpu_tensor_zeros(gt_rows(A_gt), gt_cols(A_gt))
+    let _ = gpu_copy(A_gt, C_gt)
+    let _ = gpu_add_inplace(C_gt, B_gt)
+    tape_push([6, C_gt, A_gt, B_gt])
+    C_gt
+}
+
+// Residual add in-place: A += B (no new allocation)
+// Records: [6, A, A, B]
+fn gpu_residual_add(A_gt, B_gt) {
+    let _ = gpu_add_inplace(A_gt, B_gt)
+    tape_push([6, A_gt, A_gt, B_gt])
+    A_gt
+}
+
+// LayerNorm forward (host fallback)
+// Records: [7, Y, X, rows, cols]
+fn gpu_layernorm_fwd(X_gt) {
+    let Y_gt = gpu_layernorm_host(X_gt, 1.0e-5)
+    tape_push([7, Y_gt, X_gt, gt_rows(X_gt), gt_cols(X_gt)])
+    Y_gt
+}
+
+// ── Cross-entropy loss ───────────────────────────────────────
+// logits[batch×vocab] + targets[batch] → scalar loss
+// Returns [loss_value, probs_gt, targets_dev]
+fn gpu_cross_entropy_loss(logits_gt, targets_arr) {
+    let batch = gt_rows(logits_gt)
+    let vocab = gt_cols(logits_gt)
+
+    // Softmax on logits
+    let probs_gt = gpu_softmax_host(logits_gt)
+
+    // Compute loss: -1/N * sum(log(probs[i][target[i]]))
+    let n = batch * vocab
+    let host = alloc_raw(n * 4)
+    let _ = cuda_memcpy_d2h(host, gt_ptr(probs_gt), n * 4)
+
+    let mut loss = 0.0
+    let mut i = 0
+    while i < batch {
+        let t = targets_arr[i]
+        let p = deref_f32(host, i * vocab + t)
+        let lp = log(p + 1.0e-10)
+        loss = loss - lp
+        i = i + 1
+    }
+    loss = loss / (batch * 1.0)
+    free_raw(host, n * 4)
+
+    // Upload targets as i32 to GPU for backward
+    let targets_dev = int_array_to_gpu(targets_arr)
+
+    // Record on tape: [9, probs_gt, logits_gt, targets_dev, batch, vocab]
+    tape_push([9, probs_gt, logits_gt, targets_dev, batch, vocab])
+
+    let result = [loss, probs_gt, targets_dev]
+    return result
+}
+
+// ── Backward pass ────────────────────────────────────────────
+// grad_table: maps GpuTensor dev_ptr (as int) → gradient GpuTensor
+// We use parallel arrays: grad_keys[i] = ptr_addr, grad_vals[i] = grad_gt
+
+let mut GRAD_KEYS = []
+let mut GRAD_VALS = []
+let mut GRAD_COUNT = 0
+
+fn grad_table_clear() {
+    GRAD_KEYS = []
+    GRAD_VALS = []
+    GRAD_COUNT = 0
+}
+
+fn grad_table_set(key, val_gt) {
+    let k = ptr_addr(gt_ptr(key))
+    // Check if exists
+    let mut i = 0
+    while i < GRAD_COUNT {
+        if GRAD_KEYS[i] == k {
+            // Accumulate: existing += new
+            let _ = gpu_add_inplace(GRAD_VALS[i], val_gt)
+            return 0
+        }
+        i = i + 1
+    }
+    // New entry
+    GRAD_KEYS = GRAD_KEYS.push(k)
+    GRAD_VALS = GRAD_VALS.push(val_gt)
+    GRAD_COUNT = GRAD_COUNT + 1
+    0
+}
+
+fn grad_table_get(key) {
+    let k = ptr_addr(gt_ptr(key))
+    let mut i = 0
+    while i < GRAD_COUNT {
+        if GRAD_KEYS[i] == k {
+            return GRAD_VALS[i]
+        }
+        i = i + 1
+    }
+    // Return placeholder GpuTensor [ptr_null, 0, 0, 0, 0] so callers can
+    // uniformly do gt_ptr(g) and ptr_addr(gt_ptr(g)) without type errors.
+    // Distinguishable from a real grad by its zero device pointer.
+    [ptr_null(), 0, 0, 0, 0]
+}
+
+fn grad_table_has(key) {
+    let k = ptr_addr(gt_ptr(key))
+    let mut i = 0
+    while i < GRAD_COUNT {
+        if GRAD_KEYS[i] == k {
+            return 1
+        }
+        i = i + 1
+    }
+    0
+}
+
+// Get or create zero gradient for a tensor
+fn ensure_grad(gt) {
+    if grad_table_has(gt) == 1 {
+        return grad_table_get(gt)
+    }
+    let g = gpu_tensor_zeros(gt_rows(gt), gt_cols(gt))
+    grad_table_set(gt, g)
+    g
+}
+
+// ── Backward dispatch ────────────────────────────────────────
+
+fn backward(loss_gt) {
+    // Seed: d(loss)/d(loss) = 1.0
+    let seed = gpu_tensor_zeros(gt_rows(loss_gt), gt_cols(loss_gt))
+    // Fill seed with 1.0
+    let _ = gpu_sscal(gt_ptr(seed), gt_numel(seed), 0.0)
+    let _ = gpu_saxpy(gt_ptr(seed), gt_ptr(seed), gt_numel(seed), 0.0)
+    // Actually just set first element to 1.0 for scalar loss
+    let host_one = alloc_raw(4)
+    write_f32(host_one, 0, 1.0)
+    let _ = cuda_memcpy_h2d(gt_ptr(seed), host_one, 4)
+    free_raw(host_one, 4)
+    grad_table_set(loss_gt, seed)
+
+    // Traverse tape in reverse
+    let mut idx = TAPE_LEN - 1
+    while idx >= 0 {
+        let entry = TAPE[idx]
+        let op = entry[0]
+
+        if op == 0 {
+            // matmul backward: Y = X @ W
+            // dX = dY @ W^T, dW = X^T @ dY
+            let Y_gt = entry[1]
+            let X_gt = entry[2]
+            let W_gt = entry[3]
+            let M = entry[4]
+            let K = entry[5]
+            let N = entry[6]
+            let dY = ensure_grad(Y_gt)
+            // dX = dY @ W^T  → [M×K]
+            let dX = gpu_tensor_zeros(M, K)
+            let _ = gpu_sgemm_nt(gt_ptr(dY), gt_ptr(W_gt), gt_ptr(dX), M, K, N)
+            grad_table_set(X_gt, dX)
+            // dW = X^T @ dY → [K×N]
+            let dW = gpu_tensor_zeros(K, N)
+            let _ = gpu_sgemm_tn(gt_ptr(X_gt), gt_ptr(dY), gt_ptr(dW), K, N, M)
+            grad_table_set(W_gt, dW)
+        }
+
+        if op == 3 {
+            // ReLU backward: dx = dy * (x > 0)
+            let Y_gt = entry[1]
+            let X_gt = entry[2]
+            let dY = ensure_grad(Y_gt)
+            let n = gt_numel(X_gt)
+            // Host fallback for ReLU mask
+            let x_host = alloc_raw(n * 4)
+            let dy_host = alloc_raw(n * 4)
+            let dx_host = alloc_raw(n * 4)
+            let _ = cuda_memcpy_d2h(x_host, gt_ptr(X_gt), n * 4)
+            let _ = cuda_memcpy_d2h(dy_host, gt_ptr(dY), n * 4)
+            let mut i = 0
+            while i < n {
+                let xv = deref_f32(x_host, i)
+                if xv > 0.0 {
+                    write_f32(dx_host, i, deref_f32(dy_host, i))
+                } else {
+                    write_f32(dx_host, i, 0.0)
+                }
+                i = i + 1
+            }
+            let dX = gpu_tensor_zeros(gt_rows(X_gt), gt_cols(X_gt))
+            let _ = cuda_memcpy_h2d(gt_ptr(dX), dx_host, n * 4)
+            free_raw(x_host, n * 4)
+            free_raw(dy_host, n * 4)
+            free_raw(dx_host, n * 4)
+            grad_table_set(X_gt, dX)
+        }
+
+        if op == 4 {
+            // GELU backward: dx = dy * gelu'(x)
+            // gelu'(x) approx = 0.5*(1+tanh(a)) + 0.5*x*(1-tanh(a)^2)*a'
+            // where a = sqrt(2/pi)*(x + 0.044715*x^3)
+            let Y_gt = entry[1]
+            let X_gt = entry[2]
+            let dY = ensure_grad(Y_gt)
+            let n = gt_numel(X_gt)
+            let x_host = alloc_raw(n * 4)
+            let dy_host = alloc_raw(n * 4)
+            let dx_host = alloc_raw(n * 4)
+            let _ = cuda_memcpy_d2h(x_host, gt_ptr(X_gt), n * 4)
+            let _ = cuda_memcpy_d2h(dy_host, gt_ptr(dY), n * 4)
+            let sqrt_2_pi = 0.7978845608
+            let mut i = 0
+            while i < n {
+                let x = deref_f32(x_host, i)
+                let x3 = x * x * x
+                let inner = sqrt_2_pi * (x + 0.044715 * x3)
+                let e2z = exp(2.0 * inner)
+                let th = (e2z - 1.0) / (e2z + 1.0)
+                let th2 = th * th
+                let da = sqrt_2_pi * (1.0 + 0.134145 * x * x)
+                let gelu_grad = 0.5 * (1.0 + th) + 0.5 * x * (1.0 - th2) * da
+                write_f32(dx_host, i, deref_f32(dy_host, i) * gelu_grad)
+                i = i + 1
+            }
+            let dX = gpu_tensor_zeros(gt_rows(X_gt), gt_cols(X_gt))
+            let _ = cuda_memcpy_h2d(gt_ptr(dX), dx_host, n * 4)
+            free_raw(x_host, n * 4)
+            free_raw(dy_host, n * 4)
+            free_raw(dx_host, n * 4)
+            grad_table_set(X_gt, dX)
+        }
+
+        if op == 5 {
+            // Softmax backward: dx = probs * (dy - sum(dy*probs))
+            let Y_gt = entry[1]
+            let X_gt = entry[2]
+            let dY = ensure_grad(Y_gt)
+            let rows = gt_rows(X_gt)
+            let cols = gt_cols(X_gt)
+            let n = rows * cols
+            let p_host = alloc_raw(n * 4)
+            let dy_host = alloc_raw(n * 4)
+            let dx_host = alloc_raw(n * 4)
+            let _ = cuda_memcpy_d2h(p_host, gt_ptr(Y_gt), n * 4)
+            let _ = cuda_memcpy_d2h(dy_host, gt_ptr(dY), n * 4)
+            let mut r = 0
+            while r < rows {
+                let base = r * cols
+                let mut dot = 0.0
+                let mut j = 0
+                while j < cols {
+                    dot = dot + deref_f32(p_host, base + j) * deref_f32(dy_host, base + j)
+                    j = j + 1
+                }
+                j = 0
+                while j < cols {
+                    let p = deref_f32(p_host, base + j)
+                    let dy = deref_f32(dy_host, base + j)
+                    write_f32(dx_host, base + j, p * (dy - dot))
+                    j = j + 1
+                }
+                r = r + 1
+            }
+            let dX = gpu_tensor_zeros(rows, cols)
+            let _ = cuda_memcpy_h2d(gt_ptr(dX), dx_host, n * 4)
+            free_raw(p_host, n * 4)
+            free_raw(dy_host, n * 4)
+            free_raw(dx_host, n * 4)
+            grad_table_set(X_gt, dX)
+        }
+
+        if op == 6 {
+            // Add backward: dA += dC, dB += dC
+            let C_gt = entry[1]
+            let A_gt = entry[2]
+            let B_gt = entry[3]
+            let dC = ensure_grad(C_gt)
+            // Gradient flows to both inputs
+            let dA = gpu_tensor_zeros(gt_rows(A_gt), gt_cols(A_gt))
+            let _ = gpu_copy(dC, dA)
+            grad_table_set(A_gt, dA)
+            let dB = gpu_tensor_zeros(gt_rows(B_gt), gt_cols(B_gt))
+            let _ = gpu_copy(dC, dB)
+            grad_table_set(B_gt, dB)
+        }
+
+        if op == 7 {
+            // LayerNorm backward (simplified)
+            // dx_i = (1/sigma) * (dy_i - mean(dy) - x_norm_i * mean(dy * x_norm))
+            let Y_gt = entry[1]
+            let X_gt = entry[2]
+            let rows = entry[3]
+            let cols = entry[4]
+            let dY = ensure_grad(Y_gt)
+            let n = rows * cols
+            let x_host = alloc_raw(n * 4)
+            let dy_host = alloc_raw(n * 4)
+            let dx_host = alloc_raw(n * 4)
+            let _ = cuda_memcpy_d2h(x_host, gt_ptr(X_gt), n * 4)
+            let _ = cuda_memcpy_d2h(dy_host, gt_ptr(dY), n * 4)
+            let eps = 1.0e-5
+            let mut r = 0
+            while r < rows {
+                let base = r * cols
+                // Compute mean, var of input
+                let mut sum_x = 0.0
+                let mut j = 0
+                while j < cols {
+                    sum_x = sum_x + deref_f32(x_host, base + j)
+                    j = j + 1
+                }
+                let mean_x = sum_x / (cols * 1.0)
+                let mut var_x = 0.0
+                j = 0
+                while j < cols {
+                    let d = deref_f32(x_host, base + j) - mean_x
+                    var_x = var_x + d * d
+                    j = j + 1
+                }
+                let rstd = 1.0 / sqrt(var_x / (cols * 1.0) + eps)
+                // Compute mean(dy) and mean(dy * x_norm)
+                let mut sum_dy = 0.0
+                let mut sum_dy_xn = 0.0
+                j = 0
+                while j < cols {
+                    let dy_v = deref_f32(dy_host, base + j)
+                    let xn = (deref_f32(x_host, base + j) - mean_x) * rstd
+                    sum_dy = sum_dy + dy_v
+                    sum_dy_xn = sum_dy_xn + dy_v * xn
+                    j = j + 1
+                }
+                let mean_dy = sum_dy / (cols * 1.0)
+                let mean_dy_xn = sum_dy_xn / (cols * 1.0)
+                // dx
+                j = 0
+                while j < cols {
+                    let xn = (deref_f32(x_host, base + j) - mean_x) * rstd
+                    let dy_v = deref_f32(dy_host, base + j)
+                    let dx_v = rstd * (dy_v - mean_dy - xn * mean_dy_xn)
+                    write_f32(dx_host, base + j, dx_v)
+                    j = j + 1
+                }
+                r = r + 1
+            }
+            let dX = gpu_tensor_zeros(rows, cols)
+            let _ = cuda_memcpy_h2d(gt_ptr(dX), dx_host, n * 4)
+            free_raw(x_host, n * 4)
+            free_raw(dy_host, n * 4)
+            free_raw(dx_host, n * 4)
+            grad_table_set(X_gt, dX)
+        }
+
+        if op == 9 {
+            // Cross-entropy backward: dx = (probs - one_hot(targets)) / batch
+            let probs_gt = entry[1]
+            let logits_gt = entry[2]
+            let targets_dev = entry[3]
+            let batch = entry[4]
+            let vocab = entry[5]
+            let n = batch * vocab
+            // Download probs and targets
+            let p_host = alloc_raw(n * 4)
+            let t_host = alloc_raw(batch * 4)
+            let _ = cuda_memcpy_d2h(p_host, gt_ptr(probs_gt), n * 4)
+            let _ = cuda_memcpy_d2h(t_host, targets_dev, batch * 4)
+            // dx = probs; dx[i][target[i]] -= 1.0; dx /= batch
+            let scale = 1.0 / (batch * 1.0)
+            let mut i = 0
+            while i < batch {
+                let t = deref_i32(t_host, i)
+                let mut j = 0
+                while j < vocab {
+                    let p = deref_f32(p_host, i * vocab + j)
+                    if j == t {
+                        write_f32(p_host, i * vocab + j, (p - 1.0) * scale)
+                    } else {
+                        write_f32(p_host, i * vocab + j, p * scale)
+                    }
+                    j = j + 1
+                }
+                i = i + 1
+            }
+            let dLogits = gpu_tensor_zeros(batch, vocab)
+            let _ = cuda_memcpy_h2d(gt_ptr(dLogits), p_host, n * 4)
+            free_raw(p_host, n * 4)
+            free_raw(t_host, batch * 4)
+            grad_table_set(logits_gt, dLogits)
+        }
+
+        idx = idx - 1
+    }
+    0
+}
+
+// ── Get gradient for a parameter ─────────────────────────────
+fn get_grad(param_gt) {
+    grad_table_get(param_gt)
+}
+
+println("[gpu_grad_engine] loaded — tape-based reverse AD on GPU")

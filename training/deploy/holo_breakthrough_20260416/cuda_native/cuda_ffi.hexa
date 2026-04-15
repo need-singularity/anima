@@ -1,0 +1,824 @@
+// ═══════════════════════════════════════════════════════════════
+//  cuda_ffi.hexa — Pure hexa CUDA/cuBLAS FFI bindings
+//
+//  All GPU operations via extern fn + dlopen to:
+//    libcudart.so  (CUDA runtime)
+//    libcublas.so  (cuBLAS BLAS)
+//
+//  Pointers are hexa Pointer type (u64).
+//  Float scalars for cuBLAS passed as pointers to host f32 buffers.
+//
+//  NOTE (CR1): extern hexa-side names are snake_case with `_raw` suffix
+//  where needed to avoid colliding with C stdlib / hexa builtins /
+//  runtime.c symbols when codegen_c2 emits wrappers. Each extern has
+//  an `@symbol("original_c_name")` so dlsym resolves to libcudart/libcublas.
+//
+//  Usage:
+//    use "self/ml/cuda_ffi"
+//    let ok = cuda_init()
+//    let dev_ptr = cuda_malloc(1024 * 4)
+//    ...
+// ═══════════════════════════════════════════════════════════════
+
+// ── CUDA Runtime (libcudart) ─────────────────────────────────
+
+@link("cudart")
+extern fn cudaSetDevice(device: int) -> int
+
+@link("cudart")
+extern fn cudaMalloc(ptr_ptr: *Void, size: int) -> int
+
+@link("cudart")
+extern fn cudaFree(dev_ptr: *Void) -> int
+
+@link("cudart")
+extern fn cudaMemcpy(dst: *Void, src: *Void, count: int, kind: int) -> int
+
+@link("cudart")
+extern fn cudaMemset(dev_ptr: *Void, value: int, count: int) -> int
+
+@link("cudart")
+extern fn cudaDeviceSynchronize() -> int
+
+@link("cudart")
+extern fn cudaStreamCreate(stream_ptr: *Void) -> int
+
+@link("cudart")
+extern fn cudaStreamSynchronize(stream: *Void) -> int
+
+@link("cudart")
+extern fn cudaStreamDestroy(stream: *Void) -> int
+
+@link("cudart")
+extern fn cudaMemGetInfo(free_ptr: *Void, total_ptr: *Void) -> int
+
+@link("cudart")
+extern fn cudaGetLastError() -> int
+
+@link("cudart")
+extern fn cudaMemcpyAsync(dst: *Void, src: *Void, count: int, kind: int, stream: *Void) -> int
+
+// ── CUDA Events (stream synchronization) ────────────────────
+
+@link("cudart")
+extern fn cudaEventCreate(event_ptr: *Void) -> int
+
+@link("cudart")
+extern fn cudaEventDestroy(event: *Void) -> int
+
+@link("cudart")
+extern fn cudaEventRecord(event: *Void, stream: *Void) -> int
+
+@link("cudart")
+extern fn cudaStreamWaitEvent(stream: *Void, event: *Void, flags: int) -> int
+
+@link("cudart")
+extern fn cudaEventSynchronize(event: *Void) -> int
+
+// ── CUDA Graph (capture + replay) ───────────────────────────
+//
+//  cudaStreamBeginCapture/EndCapture record all GPU work issued
+//  on a stream into a graph, which can then be instantiated and
+//  replayed in a single launch — eliminates per-kernel launch
+//  overhead for fixed-shape workloads (CLM training).
+//
+//  mode constants for cudaStreamBeginCapture:
+//    0 = cudaStreamCaptureModeGlobal
+//    1 = cudaStreamCaptureModeThreadLocal
+//    2 = cudaStreamCaptureModeRelaxed
+
+@link("cudart")
+extern fn cudaStreamBeginCapture(stream: *Void, mode: int) -> int
+
+@link("cudart")
+extern fn cudaStreamEndCapture(stream: *Void, graph_ptr: *Void) -> int
+
+@link("cudart")
+extern fn cudaGraphInstantiate(exec_ptr: *Void, graph: *Void, errNode: *Void, errBuf: *Void, bufSize: int) -> int
+
+@link("cudart")
+extern fn cudaGraphLaunch(exec: *Void, stream: *Void) -> int
+
+@link("cudart")
+extern fn cudaGraphExecDestroy(exec: *Void) -> int
+
+@link("cudart")
+extern fn cudaGraphDestroy(graph: *Void) -> int
+
+// ── cuBLAS ───────────────────────────────────────────────────
+
+@link("cublas")
+extern fn cublasCreate_v2(handle_ptr: *Void) -> int
+
+@link("cublas")
+extern fn cublasDestroy_v2(hnd: *Void) -> int
+
+@link("cublas")
+extern fn cublasSetStream_v2(hnd: *Void, strm: *Void) -> int
+
+@link("cublas")
+extern fn cublasSetMathMode(hnd: *Void, mode: int) -> int
+
+// cublasSgemm_v2(hnd, transa, transb, m, n, k, alpha_ptr, A, lda, B, ldb, beta_ptr, C, ldc)
+@link("cublas")
+extern fn cublasSgemm_v2(hnd: *Void, transa: int, transb: int, m: int, n: int, k: int, alpha: *Void, A: *Void, lda: int, B: *Void, ldb: int, beta: *Void, C: *Void, ldc: int) -> int
+
+// cublasSaxpy_v2(hnd, n, alpha_ptr, x, incx, y, incy)
+@link("cublas")
+extern fn cublasSaxpy_v2(hnd: *Void, n: int, alpha: *Void, x: *Void, incx: int, y: *Void, incy: int) -> int
+
+// cublasSscal_v2(hnd, n, alpha_ptr, x, incx)
+@link("cublas")
+extern fn cublasSscal_v2(hnd: *Void, n: int, alpha: *Void, x: *Void, incx: int) -> int
+
+// cublasSdot_v2(hnd, n, x, incx, y, incy, result_ptr)
+@link("cublas")
+extern fn cublasSdot_v2(hnd: *Void, n: int, x: *Void, incx: int, y: *Void, incy: int, result: *Void) -> int
+
+// cublasSnrm2_v2(hnd, n, x, incx, result_ptr)
+@link("cublas")
+extern fn cublasSnrm2_v2(hnd: *Void, n: int, x: *Void, incx: int, result: *Void) -> int
+
+// cublasSgemmBatched — batched SGEMM for processing multiple micro-batches
+// in a single cuBLAS call (#23). Each batch element is an independent GEMM:
+//   C[i] = alpha * op(A[i]) * op(B[i]) + beta * C[i]
+// Aarray/Barray/Carray are device arrays of device pointers (float**).
+@link("cublas")
+extern fn cublasSgemmBatched(hnd: *Void, transa: int, transb: int, m: int, n: int, k: int, alpha: *Void, Aarray: *Void, lda: int, Barray: *Void, ldb: int, beta: *Void, Carray: *Void, ldc: int, batchCount: int) -> int
+
+// cublasSgemmStridedBatched — strided variant for contiguous micro-batch buffers.
+// Avoids building pointer arrays; strides define the offset between batches.
+//   C[i] = alpha * op(A + i*strideA) * op(B + i*strideB) + beta * (C + i*strideC)
+// strideA/B/C are in elements (not bytes).
+@link("cublas")
+extern fn cublasSgemmStridedBatched(hnd: *Void, transa: int, transb: int, m: int, n: int, k: int, alpha: *Void, A: *Void, lda: int, strideA: int, B: *Void, ldb: int, strideB: int, beta: *Void, C: *Void, ldc: int, strideC: int, batchCount: int) -> int
+
+// ── cudaMemcpy direction constants ───────────────────────────
+let MEMCPY_H2H = 0
+let MEMCPY_H2D = 1
+let MEMCPY_D2H = 2
+let MEMCPY_D2D = 3
+
+// cuBLAS operation constants
+let CUBLAS_OP_N = 0
+let CUBLAS_OP_T = 1
+
+// cuBLAS math mode
+let CUBLAS_DEFAULT_MATH = 0
+let CUBLAS_TENSOR_OP_MATH = 1
+
+// ── CUDA Graph capture mode constants ────────────────────────
+let CUDA_STREAM_CAPTURE_MODE_GLOBAL       = 0
+let CUDA_STREAM_CAPTURE_MODE_THREAD_LOCAL = 1
+let CUDA_STREAM_CAPTURE_MODE_RELAXED      = 2
+
+// ── Global state (handle + stream + scalar buffers) ──────────
+let mut G_CUBLAS_HANDLE = ptr_null()
+let mut G_CUDA_STREAM   = ptr_null()
+
+// Multi-stream state (#21): compute_stream for matmul/kernels,
+// memcpy_stream for d2d copies. Events synchronize between them.
+let mut G_COMPUTE_STREAM = ptr_null()
+let mut G_MEMCPY_STREAM  = ptr_null()
+let mut G_OVERLAP_EVENT  = ptr_null()   // signals memcpy done
+let mut G_COMPUTE_EVENT  = ptr_null()   // signals compute done
+let mut G_MULTI_STREAM   = false        // true after cuda_init_streams()
+
+// CUDA Graph state (#22): captured exec graph for replay
+let mut G_CUDA_GRAPH_EXEC = ptr_null()  // instantiated graph
+let mut G_GRAPH_CAPTURED  = false       // true after first capture
+
+// Host-allocated f32 scalar buffers for cuBLAS alpha/beta
+let mut G_ALPHA_PTR = ptr_null()
+let mut G_BETA_ZERO_PTR = ptr_null()
+let mut G_BETA_ONE_PTR = ptr_null()
+
+// ── Initialization ───────────────────────────────────────────
+
+fn cuda_init() {
+    // Set device 0
+    let err = cudaSetDevice(0)
+    if err != 0 {
+        println("[cuda_ffi] cudaSetDevice failed: " + str(err))
+        return -1
+    }
+
+    // Create cuBLAS handle
+    let handle_buf = alloc_raw(8)
+    let st = cublasCreate_v2(handle_buf)
+    if st != 0 {
+        println("[cuda_ffi] cublasCreate_v2 failed: " + str(st))
+        free_raw(handle_buf, 8)
+        return -2
+    }
+    G_CUBLAS_HANDLE = ptr_from_int(deref(handle_buf))
+    free_raw(handle_buf, 8)
+
+    // Create stream
+    let stream_buf = alloc_raw(8)
+    let serr = cudaStreamCreate(stream_buf)
+    if serr != 0 {
+        println("[cuda_ffi] cudaStreamCreate failed: " + str(serr))
+        free_raw(stream_buf, 8)
+        return -3
+    }
+    G_CUDA_STREAM = ptr_from_int(deref(stream_buf))
+    free_raw(stream_buf, 8)
+
+    // Bind stream to cuBLAS
+    let _ = cublasSetStream_v2(G_CUBLAS_HANDLE, G_CUDA_STREAM)
+    // Enable tensor cores
+    let _ = cublasSetMathMode(G_CUBLAS_HANDLE, CUBLAS_DEFAULT_MATH)
+
+    // Allocate scalar buffers (persistent host memory)
+    G_ALPHA_PTR = alloc_raw(4)
+    write_f32(G_ALPHA_PTR, 0, 1.0)
+
+    G_BETA_ZERO_PTR = alloc_raw(4)
+    write_f32(G_BETA_ZERO_PTR, 0, 0.0)
+
+    G_BETA_ONE_PTR = alloc_raw(4)
+    write_f32(G_BETA_ONE_PTR, 0, 1.0)
+
+    println("[cuda_ffi] initialized — handle=" + str(ptr_addr(G_CUBLAS_HANDLE)))
+    0
+}
+
+fn cuda_shutdown() {
+    if ptr_addr(G_CUBLAS_HANDLE) != 0 {
+        let _ = cublasDestroy_v2(G_CUBLAS_HANDLE)
+    }
+    if ptr_addr(G_CUDA_STREAM) != 0 {
+        let _ = cudaStreamDestroy(G_CUDA_STREAM)
+    }
+    if ptr_addr(G_ALPHA_PTR) != 0 {
+        free_raw(G_ALPHA_PTR, 4)
+    }
+    if ptr_addr(G_BETA_ZERO_PTR) != 0 {
+        free_raw(G_BETA_ZERO_PTR, 4)
+    }
+    if ptr_addr(G_BETA_ONE_PTR) != 0 {
+        free_raw(G_BETA_ONE_PTR, 4)
+    }
+    G_CUBLAS_HANDLE = ptr_null()
+    G_CUDA_STREAM = ptr_null()
+    0
+}
+
+// ── Memory helpers ───────────────────────────────────────────
+
+// cuda_malloc(nbytes) -> device Pointer
+fn cuda_malloc(nbytes) {
+    let ptr_buf = alloc_raw(8)
+    write_i64(ptr_buf, 0, 0)
+    let err = cudaMalloc(ptr_buf, nbytes)
+    if err != 0 {
+        println("[cuda_ffi] cuda_malloc(" + str(nbytes) + ") failed: " + str(err))
+        free_raw(ptr_buf, 8)
+        return ptr_null()
+    }
+    let dev = ptr_from_int(deref(ptr_buf))
+    free_raw(ptr_buf, 8)
+    dev
+}
+
+// cuda_free(dev_ptr)
+fn cuda_free(dev_ptr) {
+    let _ = cudaFree(dev_ptr)
+    0
+}
+
+// cuda_memcpy_h2d(dev_dst, host_src, nbytes)
+fn cuda_memcpy_h2d(dev_dst, host_src, nbytes) {
+    cudaMemcpy(dev_dst, host_src, nbytes, MEMCPY_H2D)
+}
+
+// cuda_memcpy_d2h(host_dst, dev_src, nbytes)
+fn cuda_memcpy_d2h(host_dst, dev_src, nbytes) {
+    cudaMemcpy(host_dst, dev_src, nbytes, MEMCPY_D2H)
+}
+
+// cuda_memcpy_d2d(dev_dst, dev_src, nbytes)
+fn cuda_memcpy_d2d(dev_dst, dev_src, nbytes) {
+    cudaMemcpy(dev_dst, dev_src, nbytes, MEMCPY_D2D)
+}
+
+// cuda_memset_zero(dev_ptr, nbytes)
+fn cuda_memset_zero(dev_ptr, nbytes) {
+    cudaMemset(dev_ptr, 0, nbytes)
+}
+
+fn cuda_sync() {
+    cudaStreamSynchronize(G_CUDA_STREAM)
+}
+
+fn cuda_device_sync() {
+    cudaDeviceSynchronize()
+}
+
+// ── GPU memory info ──────────────────────────────────────────
+
+fn cuda_mem_info() {
+    let free_buf = alloc_raw(8)
+    let total_buf = alloc_raw(8)
+    let _ = cudaMemGetInfo(free_buf, total_buf)
+    let free_bytes = deref(free_buf)
+    let total_bytes = deref(total_buf)
+    free_raw(free_buf, 8)
+    free_raw(total_buf, 8)
+    let free_mb = free_bytes / (1024 * 1024)
+    let total_mb = total_bytes / (1024 * 1024)
+    println("[cuda_ffi] GPU memory: " + str(free_mb) + " MB free / " + str(total_mb) + " MB total")
+    free_bytes
+}
+
+// ── cuBLAS SGEMM wrappers (row-major) ────────────────────────
+// All matrices stored in ROW-MAJOR in hexa.
+// cuBLAS expects column-major. Trick: C = A*B row-major
+// is equivalent to C^T = B^T * A^T in column-major.
+// So we call cublasSgemm_v2(N, N, N_cols, M_rows, K, alpha, B, N_cols, A, K, beta, C, N_cols)
+
+// gpu_sgemm(A, B, C, M, N, K) — C[M×N] = A[M×K] * B[K×N]
+fn gpu_sgemm(A_dev, B_dev, C_dev, M, N, K) {
+    let st = cublasSgemm_v2(G_CUBLAS_HANDLE, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, G_ALPHA_PTR, B_dev, N, A_dev, K, G_BETA_ZERO_PTR, C_dev, N)
+    if st != 0 {
+        println("[cuda_ffi] sgemm failed: " + str(st))
+    }
+    st
+}
+
+// gpu_sgemm_acc(A, B, C, M, N, K) — C[M×N] += A[M×K] * B[K×N]
+fn gpu_sgemm_acc(A_dev, B_dev, C_dev, M, N, K) {
+    cublasSgemm_v2(G_CUBLAS_HANDLE, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, G_ALPHA_PTR, B_dev, N, A_dev, K, G_BETA_ONE_PTR, C_dev, N)
+}
+
+// gpu_sgemm_tn(A, B, C, M, N, K) — C[M×N] = A^T[M×K] * B[K×N]
+// A is stored as [K×M], transposed to [M×K]
+fn gpu_sgemm_tn(A_dev, B_dev, C_dev, M, N, K) {
+    cublasSgemm_v2(G_CUBLAS_HANDLE, CUBLAS_OP_N, CUBLAS_OP_T, N, M, K, G_ALPHA_PTR, B_dev, N, A_dev, M, G_BETA_ZERO_PTR, C_dev, N)
+}
+
+// gpu_sgemm_nt(A, B, C, M, N, K) — C[M×N] = A[M×K] * B^T[K×N]
+// B is stored as [N×K], transposed to [K×N]
+fn gpu_sgemm_nt(A_dev, B_dev, C_dev, M, N, K) {
+    cublasSgemm_v2(G_CUBLAS_HANDLE, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, G_ALPHA_PTR, B_dev, K, A_dev, K, G_BETA_ZERO_PTR, C_dev, N)
+}
+
+// ── cuBLAS vector operations ─────────────────────────────────
+
+// gpu_saxpy(x, y, n, alpha_f32) — y = alpha*x + y
+fn gpu_saxpy(x_dev, y_dev, n, alpha_val) {
+    let alpha_buf = alloc_raw(4)
+    write_f32(alpha_buf, 0, alpha_val)
+    let st = cublasSaxpy_v2(G_CUBLAS_HANDLE, n, alpha_buf, x_dev, 1, y_dev, 1)
+    free_raw(alpha_buf, 4)
+    st
+}
+
+// gpu_sscal(x, n, alpha_f32) — x = alpha*x
+fn gpu_sscal(x_dev, n, alpha_val) {
+    let alpha_buf = alloc_raw(4)
+    write_f32(alpha_buf, 0, alpha_val)
+    let st = cublasSscal_v2(G_CUBLAS_HANDLE, n, alpha_buf, x_dev, 1)
+    free_raw(alpha_buf, 4)
+    st
+}
+
+// gpu_sdot(x, y, n) -> f32 dot product
+fn gpu_sdot(x_dev, y_dev, n) {
+    let result_buf = alloc_raw(4)
+    write_f32(result_buf, 0, 0.0)
+    let _ = cublasSdot_v2(G_CUBLAS_HANDLE, n, x_dev, 1, y_dev, 1, result_buf)
+    let val = deref_f32(result_buf, 0)
+    free_raw(result_buf, 4)
+    val
+}
+
+// gpu_snrm2(x, n) -> f32 L2 norm
+fn gpu_snrm2(x_dev, n) {
+    let result_buf = alloc_raw(4)
+    write_f32(result_buf, 0, 0.0)
+    let _ = cublasSnrm2_v2(G_CUBLAS_HANDLE, n, x_dev, 1, result_buf)
+    let val = deref_f32(result_buf, 0)
+    free_raw(result_buf, 4)
+    val
+}
+
+// ── Tensor ↔ GPU transfer ────────────────────────────────────
+
+// Upload hexa tensor to GPU (f64 → f32 conversion on host, then H2D)
+fn tensor_to_gpu(t) {
+    let n = len(t)
+    let host_buf = tensor_data_f32_ptr(t)
+    let dev = cuda_malloc(n * 4)
+    let _ = cuda_memcpy_h2d(dev, host_buf, n * 4)
+    free_raw(host_buf, n * 4)
+    dev
+}
+
+// Download GPU tensor to hexa (D2H then f32 → f64)
+fn tensor_from_gpu(dev_ptr, n) {
+    let host_buf = alloc_raw(n * 4)
+    let _ = cuda_memcpy_d2h(host_buf, dev_ptr, n * 4)
+    let t = tensor_from_f32_ptr(host_buf, n)
+    free_raw(host_buf, n * 4)
+    t
+}
+
+// Allocate zeroed GPU tensor
+fn gpu_zeros(n) {
+    let dev = cuda_malloc(n * 4)
+    let _ = cuda_memset_zero(dev, n * 4)
+    dev
+}
+
+// Upload int array to GPU as i32
+fn int_array_to_gpu(arr) {
+    let n = len(arr)
+    let host_buf = alloc_raw(n * 4)
+    let mut i = 0
+    while i < n {
+        write_i32(host_buf, i * 4, arr[i])
+        i = i + 1
+    }
+    let dev = cuda_malloc(n * 4)
+    let _ = cuda_memcpy_h2d(dev, host_buf, n * 4)
+    free_raw(host_buf, n * 4)
+    dev
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Multi-stream support (#21): dual-stream pipeline
+//
+//  compute_stream:  matmul (cuBLAS) + custom kernels
+//  memcpy_stream:   d2d copies (next micro-batch prefetch)
+//
+//  Flow per micro-batch:
+//    1. memcpy_stream: d2d copy next batch into staging buffers
+//    2. cudaEventRecord(G_OVERLAP_EVENT, memcpy_stream)
+//    3. cudaStreamWaitEvent(compute_stream, G_OVERLAP_EVENT)
+//    4. compute_stream: fwd + bwd on current batch
+//    5. cudaEventRecord(G_COMPUTE_EVENT, compute_stream)
+//    6. cudaStreamWaitEvent(memcpy_stream, G_COMPUTE_EVENT)
+// ═══════════════════════════════════════════════════════════════
+
+fn cuda_init_streams() {
+    // Allocate compute stream
+    let cs_buf = alloc_raw(8)
+    let cs_err = cudaStreamCreate(cs_buf)
+    if cs_err != 0 {
+        println("[cuda_ffi] cudaStreamCreate(compute) failed: " + str(cs_err))
+        free_raw(cs_buf, 8)
+        return -1
+    }
+    G_COMPUTE_STREAM = ptr_from_int(deref(cs_buf))
+    free_raw(cs_buf, 8)
+
+    // Allocate memcpy stream
+    let ms_buf = alloc_raw(8)
+    let ms_err = cudaStreamCreate(ms_buf)
+    if ms_err != 0 {
+        println("[cuda_ffi] cudaStreamCreate(memcpy) failed: " + str(ms_err))
+        free_raw(ms_buf, 8)
+        return -2
+    }
+    G_MEMCPY_STREAM = ptr_from_int(deref(ms_buf))
+    free_raw(ms_buf, 8)
+
+    // Create sync events
+    let oe_buf = alloc_raw(8)
+    let oe_err = cudaEventCreate(oe_buf)
+    if oe_err != 0 {
+        println("[cuda_ffi] cudaEventCreate(overlap) failed: " + str(oe_err))
+        free_raw(oe_buf, 8)
+        return -3
+    }
+    G_OVERLAP_EVENT = ptr_from_int(deref(oe_buf))
+    free_raw(oe_buf, 8)
+
+    let ce_buf = alloc_raw(8)
+    let ce_err = cudaEventCreate(ce_buf)
+    if ce_err != 0 {
+        println("[cuda_ffi] cudaEventCreate(compute) failed: " + str(ce_err))
+        free_raw(ce_buf, 8)
+        return -4
+    }
+    G_COMPUTE_EVENT = ptr_from_int(deref(ce_buf))
+    free_raw(ce_buf, 8)
+
+    // Bind cuBLAS to compute stream (all sgemm ops go here)
+    let _ = cublasSetStream_v2(G_CUBLAS_HANDLE, G_COMPUTE_STREAM)
+
+    G_MULTI_STREAM = true
+    println("[cuda_ffi] multi-stream init OK — compute=" + str(ptr_addr(G_COMPUTE_STREAM))
+            + " memcpy=" + str(ptr_addr(G_MEMCPY_STREAM)))
+    0
+}
+
+fn cuda_shutdown_streams() {
+    if ptr_addr(G_OVERLAP_EVENT) != 0 {
+        let _ = cudaEventDestroy(G_OVERLAP_EVENT)
+        G_OVERLAP_EVENT = ptr_null()
+    }
+    if ptr_addr(G_COMPUTE_EVENT) != 0 {
+        let _ = cudaEventDestroy(G_COMPUTE_EVENT)
+        G_COMPUTE_EVENT = ptr_null()
+    }
+    if ptr_addr(G_COMPUTE_STREAM) != 0 {
+        let _ = cudaStreamDestroy(G_COMPUTE_STREAM)
+        G_COMPUTE_STREAM = ptr_null()
+    }
+    if ptr_addr(G_MEMCPY_STREAM) != 0 {
+        let _ = cudaStreamDestroy(G_MEMCPY_STREAM)
+        G_MEMCPY_STREAM = ptr_null()
+    }
+    G_MULTI_STREAM = false
+    0
+}
+
+// Async d2d memcpy on the memcpy stream (for next-batch prefetch)
+fn cuda_memcpy_d2d_async(dev_dst, dev_src, nbytes) {
+    if G_MULTI_STREAM {
+        return cudaMemcpyAsync(dev_dst, dev_src, nbytes, MEMCPY_D2D, G_MEMCPY_STREAM)
+    }
+    // Fallback: sync d2d on default path
+    cudaMemcpy(dev_dst, dev_src, nbytes, MEMCPY_D2D)
+}
+
+// Record that memcpy is done, make compute stream wait for it
+fn cuda_signal_memcpy_done() {
+    if !G_MULTI_STREAM { return 0 }
+    let _ = cudaEventRecord(G_OVERLAP_EVENT, G_MEMCPY_STREAM)
+    cudaStreamWaitEvent(G_COMPUTE_STREAM, G_OVERLAP_EVENT, 0)
+}
+
+// Record that compute is done, make memcpy stream wait for it
+fn cuda_signal_compute_done() {
+    if !G_MULTI_STREAM { return 0 }
+    let _ = cudaEventRecord(G_COMPUTE_EVENT, G_COMPUTE_STREAM)
+    cudaStreamWaitEvent(G_MEMCPY_STREAM, G_COMPUTE_EVENT, 0)
+}
+
+// Sync compute stream (wait for all compute to finish)
+fn cuda_sync_compute() {
+    if G_MULTI_STREAM {
+        return cudaStreamSynchronize(G_COMPUTE_STREAM)
+    }
+    cudaStreamSynchronize(G_CUDA_STREAM)
+}
+
+// Sync memcpy stream
+fn cuda_sync_memcpy() {
+    if G_MULTI_STREAM {
+        return cudaStreamSynchronize(G_MEMCPY_STREAM)
+    }
+    0
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  CUDA Graph capture + replay (#22)
+//
+//  For static-shape workloads (CLM: D/SEQ/VOCAB all fixed), the
+//  entire fwd+bwd+optimizer step can be captured into a CUDA graph
+//  on the first step, then replayed with a single launch call on
+//  all subsequent steps. This eliminates per-kernel launch overhead
+//  (typically 5-10 us per kernel x hundreds of kernels = 1-3 ms).
+//
+//  Usage:
+//    cuda_graph_begin_capture()     // start capture on compute stream
+//    ... run fwd + bwd + optim ...  // all ops recorded, not executed
+//    cuda_graph_end_capture()       // stop capture, instantiate graph
+//    // Subsequent steps:
+//    cuda_graph_replay()            // single launch replays all ops
+//    cuda_graph_destroy()           // cleanup when done
+// ═══════════════════════════════════════════════════════════════
+
+fn cuda_graph_begin_capture() {
+    let stream = if G_MULTI_STREAM { G_COMPUTE_STREAM } else { G_CUDA_STREAM }
+    let err = cudaStreamBeginCapture(stream, CUDA_STREAM_CAPTURE_MODE_GLOBAL)
+    if err != 0 {
+        println("[cuda_ffi] cudaStreamBeginCapture failed: " + str(err))
+        return -1
+    }
+    0
+}
+
+fn cuda_graph_end_capture() {
+    let stream = if G_MULTI_STREAM { G_COMPUTE_STREAM } else { G_CUDA_STREAM }
+
+    // End capture — produces a cudaGraph_t
+    let graph_buf = alloc_raw(8)
+    let err = cudaStreamEndCapture(stream, graph_buf)
+    if err != 0 {
+        println("[cuda_ffi] cudaStreamEndCapture failed: " + str(err))
+        free_raw(graph_buf, 8)
+        return -1
+    }
+    let graph = ptr_from_int(deref(graph_buf))
+    free_raw(graph_buf, 8)
+
+    // Instantiate — produces a cudaGraphExec_t
+    let exec_buf = alloc_raw(8)
+    let ierr = cudaGraphInstantiate(exec_buf, graph, ptr_null(), ptr_null(), 0)
+    if ierr != 0 {
+        println("[cuda_ffi] cudaGraphInstantiate failed: " + str(ierr))
+        let _ = cudaGraphDestroy(graph)
+        free_raw(exec_buf, 8)
+        return -2
+    }
+    G_CUDA_GRAPH_EXEC = ptr_from_int(deref(exec_buf))
+    free_raw(exec_buf, 8)
+
+    // Free the intermediate graph (exec is self-contained)
+    let _ = cudaGraphDestroy(graph)
+
+    G_GRAPH_CAPTURED = true
+    println("[cuda_ffi] CUDA graph captured + instantiated OK")
+    0
+}
+
+fn cuda_graph_replay() {
+    if !G_GRAPH_CAPTURED {
+        println("[cuda_ffi] ERROR: no captured graph to replay")
+        return -1
+    }
+    let stream = if G_MULTI_STREAM { G_COMPUTE_STREAM } else { G_CUDA_STREAM }
+    let err = cudaGraphLaunch(G_CUDA_GRAPH_EXEC, stream)
+    if err != 0 {
+        println("[cuda_ffi] cudaGraphLaunch failed: " + str(err))
+        return -1
+    }
+    0
+}
+
+fn cuda_graph_destroy() {
+    if ptr_addr(G_CUDA_GRAPH_EXEC) != 0 {
+        let _ = cudaGraphExecDestroy(G_CUDA_GRAPH_EXEC)
+        G_CUDA_GRAPH_EXEC = ptr_null()
+    }
+    G_GRAPH_CAPTURED = false
+    0
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Batch GEMM (#23) — process GRAD_ACC micro-batches in one call
+//
+//  cublasSgemmStridedBatched processes B independent GEMMs where
+//  consecutive batch elements are offset by a fixed stride in the
+//  same contiguous buffer. This is ideal for gradient accumulation:
+//  we lay out all micro-batch activations contiguously, run one
+//  strided-batched GEMM, and get all results in one cuBLAS call.
+//
+//  Row-major trick (same as gpu_sgemm): C = A*B row-major is
+//  C^T = B^T * A^T col-major. For strided batched we apply the
+//  same transposition per batch element.
+//
+//  gpu_sgemm_strided_batched(A, B, C, M, N, K, batch_count)
+//    A[b]: [M, K] at offset b * M * K   (row-major)
+//    B:    [K, N] shared across all batches (weight matrix)
+//    C[b]: [M, N] at offset b * M * N   (row-major)
+//
+//  "B shared" variant: weights don't change across micro-batches,
+//  so strideB = 0. This is the common case in forward pass where
+//  each micro-batch multiplies by the same weight matrix.
+// ═══════════════════════════════════════════════════════════════
+
+// gpu_sgemm_strided_batched: C[b] = A[b] @ B, for b in 0..batch_count-1
+//   A contiguous: batch b starts at A + b * M * K
+//   B shared:     same B for all batches (strideB = 0)
+//   C contiguous: batch b starts at C + b * M * N
+fn gpu_sgemm_strided_batched(A_dev, B_dev, C_dev, M, N, K, batch_count) {
+    let strideA = M * K
+    let strideB = 0       // B is shared (same weight matrix for all batches)
+    let strideC = M * N
+    // Row-major trick: C^T = B^T @ A^T in col-major
+    // cublas col-major: m=N, n=M, k=K, lda=N (for B), ldb=K (for A), ldc=N (for C)
+    let st = cublasSgemmStridedBatched(G_CUBLAS_HANDLE,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        N, M, K,
+        G_ALPHA_PTR,
+        B_dev, N, strideB,
+        A_dev, K, strideA,
+        G_BETA_ZERO_PTR,
+        C_dev, N, strideC,
+        batch_count)
+    if st != 0 {
+        println("[cuda_ffi] sgemm_strided_batched failed: " + str(st))
+    }
+    st
+}
+
+// gpu_sgemm_strided_batched_nt: C[b] = A[b] @ B^T, for b in 0..batch_count-1
+//   B is stored as [N, K] and transposed to [K, N].
+fn gpu_sgemm_strided_batched_nt(A_dev, B_dev, C_dev, M, N, K, batch_count) {
+    let strideA = M * K
+    let strideB = 0
+    let strideC = M * N
+    // Row-major: C^T = (B^T)^T @ A^T = B @ A^T in col-major
+    // But we want A @ B^T in row-major = (B^T)^T^T @ ... let's use the identity:
+    // Row-major C[M,N] = A[M,K] @ B^T[K,N], B stored [N,K]
+    // Col-major: C^T[N,M] = B[N,K] @ A^T[K,M]
+    //   transa=T (transpose B stored [N,K] -> already fine as col-major input)
+    //   No wait: cublas sees B as col-major [N,K] = already B.
+    //   We need B @ A^T: transa=CUBLAS_OP_T for A, transb=CUBLAS_OP_N for B
+    // Actually: standard trick for row-major A@B^T:
+    //   cublas(m=N, n=M, k=K, opA=T, opB=N, A=B_dev, lda=K, B=A_dev, ldb=K)
+    let st = cublasSgemmStridedBatched(G_CUBLAS_HANDLE,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K,
+        G_ALPHA_PTR,
+        B_dev, K, strideB,
+        A_dev, K, strideA,
+        G_BETA_ZERO_PTR,
+        C_dev, N, strideC,
+        batch_count)
+    if st != 0 {
+        println("[cuda_ffi] sgemm_strided_batched_nt failed: " + str(st))
+    }
+    st
+}
+
+// gpu_sgemm_strided_batched_tn: C[b] = A[b]^T @ B[b], both batched
+//   A stored [K, M], transposed to [M, K]. Both A and B are batched.
+fn gpu_sgemm_strided_batched_tn(A_dev, B_dev, C_dev, M, N, K, strideA, strideB, strideC, batch_count) {
+    // Row-major: C[M,N] = A^T[M,K] @ B[K,N], A stored [K,M]
+    // Col-major: C^T[N,M] = B^T[N,K] @ A[K,M]
+    //   cublas: transA=N, transB=T for the col-major view
+    //   m=N, n=M, k=K, A_data=B, lda=N, B_data=A, ldb=M
+    let st = cublasSgemmStridedBatched(G_CUBLAS_HANDLE,
+        CUBLAS_OP_N, CUBLAS_OP_T,
+        N, M, K,
+        G_ALPHA_PTR,
+        B_dev, N, strideB,
+        A_dev, M, strideA,
+        G_BETA_ZERO_PTR,
+        C_dev, N, strideC,
+        batch_count)
+    if st != 0 {
+        println("[cuda_ffi] sgemm_strided_batched_tn failed: " + str(st))
+    }
+    st
+}
+
+// gpu_sgemm_strided_batched_both: C[b] = A[b] @ B[b], both A and B batched
+//   strideA, strideB, strideC all caller-supplied (for attention ops).
+fn gpu_sgemm_strided_batched_both(A_dev, B_dev, C_dev, M, N, K, strideA, strideB, strideC, batch_count) {
+    let st = cublasSgemmStridedBatched(G_CUBLAS_HANDLE,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        N, M, K,
+        G_ALPHA_PTR,
+        B_dev, N, strideB,
+        A_dev, K, strideA,
+        G_BETA_ZERO_PTR,
+        C_dev, N, strideC,
+        batch_count)
+    if st != 0 {
+        println("[cuda_ffi] sgemm_strided_batched_both failed: " + str(st))
+    }
+    st
+}
+
+// gpu_sgemm_strided_batched_both_nt: C[b] = A[b] @ B[b]^T, both batched
+//   A[b]: [M, K], B[b]: [N, K] (transposed to [K, N]).
+fn gpu_sgemm_strided_batched_both_nt(A_dev, B_dev, C_dev, M, N, K, strideA, strideB, strideC, batch_count) {
+    // Row-major C[M,N] = A[M,K] @ B^T[K,N], B stored [N,K]
+    // Col-major: C^T[N,M] = B[N,K] @ A^T[K,M]
+    //   but we want the transpose of B in the mult, so:
+    //   cublas col-major: opA=T (for B), opB=N (for A)
+    //   m=N, n=M, k=K, A_data=B_dev lda=K, B_data=A_dev ldb=K
+    let st = cublasSgemmStridedBatched(G_CUBLAS_HANDLE,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K,
+        G_ALPHA_PTR,
+        B_dev, K, strideB,
+        A_dev, K, strideA,
+        G_BETA_ZERO_PTR,
+        C_dev, N, strideC,
+        batch_count)
+    if st != 0 {
+        println("[cuda_ffi] sgemm_strided_batched_both_nt failed: " + str(st))
+    }
+    st
+}
+
+// gpu_sgemm_strided_batched_acc: C[b] += A[b] @ B, beta=1 (accumulate)
+fn gpu_sgemm_strided_batched_acc(A_dev, B_dev, C_dev, M, N, K, batch_count) {
+    let strideA = M * K
+    let strideB = 0
+    let strideC = M * N
+    let st = cublasSgemmStridedBatched(G_CUBLAS_HANDLE,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        N, M, K,
+        G_ALPHA_PTR,
+        B_dev, N, strideB,
+        A_dev, K, strideA,
+        G_BETA_ONE_PTR,
+        C_dev, N, strideC,
+        batch_count)
+    if st != 0 {
+        println("[cuda_ffi] sgemm_strided_batched_acc failed: " + str(st))
+    }
+    st
+}
+
+println("[cuda_ffi] module loaded — CUDA/cuBLAS extern FFI bindings ready (batch GEMM #23 included)")

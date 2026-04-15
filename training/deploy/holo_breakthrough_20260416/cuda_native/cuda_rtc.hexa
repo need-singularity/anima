@@ -1,0 +1,626 @@
+// ═══════════════════════════════════════════════════════════════
+//  cuda_rtc.hexa — Pure hexa NVRTC + CUDA driver API FFI bindings
+//
+//  Runtime compilation pipeline:
+//    libnvrtc.so   (NVRTC: CUDA C → PTX)
+//    libcuda.so    (CUDA driver API: ctx + module + launch)
+//
+//  Sits on top of cuda_ffi.hexa for device memory (cuda_malloc /
+//  cuda_memcpy_h2d / cuda_memcpy_d2h / cuda_device_sync).
+//
+//  NOTE (CR1): extern hexa-side names are snake_case with `_raw`
+//  suffix where needed to avoid colliding with C stdlib / hexa
+//  builtins / runtime.c symbols when codegen_c2 emits wrappers.
+//  Each extern carries `@symbol("original_c_name")` so dlsym
+//  resolves into libnvrtc / libcuda.
+//
+//  Usage:
+//    use "cuda_ffi"
+//    use "self/ml/cuda_rtc"
+//    let _   = cuda_init()
+//    let _   = rtc_init()
+//    let ptx = rtc_compile_ptx(KERNEL_SRC, "vec_add.cu")
+//    let mod = rtc_load_module(ptx)
+//    let fn_ = rtc_get_function(mod, "vec_add")
+//    let _   = rtc_launch_1d(fn_, 1024, args)
+// ═══════════════════════════════════════════════════════════════
+
+use "cuda_ffi"
+
+// ── NVRTC (libnvrtc) ─────────────────────────────────────────
+
+@link("nvrtc")
+extern fn nvrtcCreateProgram(prog: *Void, src: *Void, name: *Void, numHeaders: int, headers: *Void, includeNames: *Void) -> int
+
+@link("nvrtc")
+extern fn nvrtcCompileProgram(prog: *Void, numOptions: int, options: *Void) -> int
+
+@link("nvrtc")
+extern fn nvrtcGetPTXSize(prog: *Void, sizeRet: *Void) -> int
+
+@link("nvrtc")
+extern fn nvrtcGetPTX(prog: *Void, ptx: *Void) -> int
+
+@link("nvrtc")
+extern fn nvrtcDestroyProgram(prog: *Void) -> int
+
+@link("nvrtc")
+extern fn nvrtcGetProgramLogSize(prog: *Void, sizeRet: *Void) -> int
+
+@link("nvrtc")
+extern fn nvrtcGetProgramLog(prog: *Void, log: *Void) -> int
+
+@link("nvrtc")
+extern fn nvrtcGetErrorString(result: int) -> *Void
+
+// ── CUDA driver API (libcuda) ────────────────────────────────
+
+@link("cuda")
+extern fn cuInit(flags: int) -> int
+
+@link("cuda")
+extern fn cuDeviceGet(dev: *Void, ordinal: int) -> int
+
+@link("cuda")
+extern fn cuCtxCreate_v2(ctx: *Void, flags: int, dev: int) -> int
+
+@link("cuda")
+extern fn cuCtxGetCurrent(ctx: *Void) -> int
+
+@link("cuda")
+extern fn cuDevicePrimaryCtxRetain(ctx: *Void, dev: int) -> int
+
+@link("cuda")
+extern fn cuCtxSetCurrent(ctx: *Void) -> int
+
+@link("cuda")
+extern fn cuModuleLoadData(module: *Void, image: *Void) -> int
+
+@link("cuda")
+extern fn cuModuleGetFunction(func: *Void, module: *Void, name: *Void) -> int
+
+@link("cuda")
+extern fn cuLaunchKernel(func: *Void, gx: int, gy: int, gz: int, bx: int, by: int, bz: int, shmem: int, stream: *Void, args: *Void, extra: *Void) -> int
+
+// cuLaunchKernelEx takes 4 args — avoids hexa FFI fragility with 11-arg variadics.
+// CUlaunchConfig struct layout (40 bytes on 64-bit):
+//   off  0: u32 gridDimX
+//   off  4: u32 gridDimY
+//   off  8: u32 gridDimZ
+//   off 12: u32 blockDimX
+//   off 16: u32 blockDimY
+//   off 20: u32 blockDimZ
+//   off 24: u32 sharedMemBytes
+//   off 28: u32 _padding (for 8-byte alignment of next field)
+//   off 32: CUstream hStream (8 bytes)
+//   off 40: CUlaunchAttribute* attrs (8 bytes)
+//   off 48: u32 numAttrs
+@link("cuda")
+extern fn cuLaunchKernelEx(config: *Void, func: *Void, params: *Void, extra: *Void) -> int
+
+@link("cuda")
+extern fn cuModuleUnload(module: *Void) -> int
+
+// ── Constants ────────────────────────────────────────────────
+
+let NVRTC_SUCCESS = 0
+let CUDA_SUCCESS  = 0
+
+let RTC_DEFAULT_BLOCK = 256
+
+let RTC_CACHE_DIR = ".hexa-cache"
+
+// ── Global state ─────────────────────────────────────────────
+
+let mut G_RTC_INITED   = 0
+let mut G_RTC_DEVICE   = 0
+let mut G_RTC_CONTEXT  = ptr_null()
+
+// Holds the last cache-hit PTX string so that the cstring() pointer
+// returned by rtc_compile_ptx remains valid for the caller's lifetime.
+// Must NOT be garbage-collected while cuModuleLoadData is using it.
+let mut G_RTC_CACHED_PTX = ""
+
+// ── Initialization ───────────────────────────────────────────
+
+fn rtc_init() {
+    if G_RTC_INITED != 0 {
+        return 0
+    }
+
+    // cuInit(0)
+    let ie = cuInit(0)
+    if ie != 0 {
+        println("[cuda_rtc] cuInit failed: " + str(ie))
+        return -1
+    }
+
+    // cuDeviceGet(&dev, 0)
+    let dev_buf = alloc_raw(4)
+    write_i32(dev_buf, 0, 0)
+    let de = cuDeviceGet(dev_buf, 0)
+    if de != 0 {
+        println("[cuda_rtc] cuDeviceGet failed: " + str(de))
+        free_raw(dev_buf, 4)
+        return -2
+    }
+    G_RTC_DEVICE = 0
+    free_raw(dev_buf, 4)
+
+    // FIX 2026-04-12: cudart primary context is lazy. cuCtxGetCurrent
+    // returns NULL on the driver-API side even after cuda_init. We must
+    // explicitly retain the primary context via cuDevicePrimaryCtxRetain
+    // and bind it with cuCtxSetCurrent. This ensures driver-API cuModule
+    // and cuLaunchKernel see the SAME context as cudart's cudaMalloc
+    // allocations. Using a separately-created cuCtxCreate_v2 context
+    // gives a dual-context setup that fails with CUDA_ERROR_INVALID_VALUE
+    // on launch because device pointers belong to a different context.
+    let ctx_buf = alloc_raw(8)
+    write_i64(ctx_buf, 0, 0)
+    let pe = cuDevicePrimaryCtxRetain(ctx_buf, G_RTC_DEVICE)
+    if pe != 0 {
+        println("[cuda_rtc] cuDevicePrimaryCtxRetain failed: " + str(pe))
+        free_raw(ctx_buf, 8)
+        return -3
+    }
+    G_RTC_CONTEXT = ptr_from_int(deref(ctx_buf))
+    free_raw(ctx_buf, 8)
+
+    let se = cuCtxSetCurrent(G_RTC_CONTEXT)
+    if se != 0 {
+        println("[cuda_rtc] cuCtxSetCurrent failed: " + str(se))
+        return -4
+    }
+
+    G_RTC_INITED = 1
+    println("[cuda_rtc] initialized — ctx=" + str(ptr_addr(G_RTC_CONTEXT)))
+    0
+}
+
+// ── PTX disk cache ───────────────────────────────────────────
+//
+// Hash the kernel source string (DJB2) and cache compiled PTX to
+// .hexa-cache/ptx_{hash}.ptx.  Eliminates NVRTC JIT overhead on
+// repeated runs with unchanged kernel sources.
+
+// rtc_hash_source(src) -> int
+//   DJB2 hash of the kernel source string.  Deterministic, fast,
+//   sufficient for cache keying (collision = harmless recompile
+//   on the extremely rare hash collision, correct PTX regardless).
+fn rtc_hash_source(src) {
+    // FIX 2026-04-12: chars() returns Char array; Int+Char unsupported.
+    // Use char_code(src, i) → Int directly. O(n) single pass.
+    let mut h = 5381
+    let n = len(src)
+    let mut i = 0
+    while i < n {
+        h = ((h * 33) + char_code(src, i)) % 1000000007
+        i = i + 1
+    }
+    if h < 0 { h = 0 - h }
+    h = ((h * 31) + n) % 1000000007
+    if h < 0 { h = 0 - h }
+    h
+}
+
+// rtc_cache_path(src) -> string
+//   Returns ".hexa-cache/ptx_{hash}.ptx" for the given source.
+fn rtc_cache_path(src) {
+    let h = rtc_hash_source(src)
+    RTC_CACHE_DIR + "/ptx_" + str(h) + ".ptx"
+}
+
+// rtc_ensure_cache_dir()
+//   Creates .hexa-cache/ if it does not exist.
+fn rtc_ensure_cache_dir() {
+    if !file_exists(RTC_CACHE_DIR) {
+        exec("mkdir -p " + RTC_CACHE_DIR)
+    }
+}
+
+// rtc_clear_cache()
+//   Deletes all cached PTX files from .hexa-cache/.
+//   Safe to call at any time; next compile will simply re-JIT.
+fn rtc_clear_cache() {
+    if !file_exists(RTC_CACHE_DIR) {
+        println("[cuda_rtc] cache dir does not exist, nothing to clear")
+        return 0
+    }
+    let _ = exec("rm -f " + RTC_CACHE_DIR + "/ptx_*.ptx")
+    println("[cuda_rtc] PTX cache cleared: " + RTC_CACHE_DIR)
+    0
+}
+
+// ── NVRTC compile pipeline ───────────────────────────────────
+
+// rtc_compile_ptx(src, name) -> *Void
+//   호스트측 PTX 바이트 버퍼를 반환. 실패시 ptr_null().
+//
+//   Cache layer (2026-04-12): hashes the source string and checks
+//   .hexa-cache/ptx_{hash}.ptx before invoking NVRTC. On cache hit
+//   the returned pointer is cstring() of an internal global — do NOT
+//   free_raw it. On cache miss the returned pointer is alloc_raw'd
+//   as before. In practice, callers (cuda_kernels.hexa) never free
+//   the PTX buffer so this is transparent.
+//
+//   NOTE: cstring(s) 는 hexa 문자열 내부 버퍼의 *Byte 를 그대로 반환한다.
+//         별도 alloc 이 아니므로 free_raw 하면 안 된다.
+fn rtc_compile_ptx(src, name) {
+    // ── Cache check ──────────────────────────────────────────
+    let cache_file = rtc_cache_path(src)
+    if file_exists(cache_file) {
+        let cached = read_file(cache_file)
+        if len(cached) > 0 {
+            println("[cuda_rtc] cache HIT '" + name + "' → " + cache_file + " (" + str(len(cached)) + " bytes)")
+            // Keep the string alive in a global so the cstring pointer
+            // survives until the caller's rtc_load_module consumes it.
+            G_RTC_CACHED_PTX = cached
+            return cstring(G_RTC_CACHED_PTX)
+        }
+    }
+    println("[cuda_rtc] cache MISS '" + name + "' — compiling via NVRTC")
+
+    let src_cstr  = cstring(src)
+    let name_cstr = cstring(name)
+
+    // nvrtcCreateProgram(&prog, src, name, 0, NULL, NULL)
+    let prog_buf = alloc_raw(8)
+    write_i64(prog_buf, 0, 0)
+    let ce = nvrtcCreateProgram(prog_buf, src_cstr, name_cstr, 0, ptr_null(), ptr_null())
+    if ce != 0 {
+        println("[cuda_rtc] nvrtcCreateProgram failed: " + str(ce))
+        free_raw(prog_buf, 8)
+        return ptr_null()
+    }
+    // FIX 2026-04-12: keep prog_buf alive for the whole lifetime.
+    // nvrtcDestroyProgram requires nvrtcProgram* (pointer-to-handle),
+    // so we must pass prog_buf (the buffer that holds the handle), not
+    // the dereferenced handle value. Freeing prog_buf before destroy
+    // segfaults inside libnvrtc.
+    let prog = ptr_from_int(deref(prog_buf))
+
+    // nvrtcCompileProgram(prog, 0, NULL) — takes handle by value
+    let cc = nvrtcCompileProgram(prog, 0, ptr_null())
+    if cc != 0 {
+        println("[cuda_rtc] nvrtcCompileProgram failed: " + str(cc))
+        // 컴파일 로그 덤프
+        let log_size_buf = alloc_raw(8)
+        write_i64(log_size_buf, 0, 0)
+        let _ = nvrtcGetProgramLogSize(prog, log_size_buf)
+        let log_size = deref(log_size_buf)
+        free_raw(log_size_buf, 8)
+        if log_size > 1 {
+            let log_buf = alloc_raw(log_size)
+            let _ = nvrtcGetProgramLog(prog, log_buf)
+            let log_str = from_cstring(log_buf)
+            println("[cuda_rtc] --- NVRTC log ---")
+            println(log_str)
+            println("[cuda_rtc] -----------------")
+            free_raw(log_buf, log_size)
+        }
+        let _ = nvrtcDestroyProgram(prog_buf)
+        free_raw(prog_buf, 8)
+        return ptr_null()
+    }
+
+    // nvrtcGetPTXSize(prog, &size)
+    let size_buf = alloc_raw(8)
+    write_i64(size_buf, 0, 0)
+    let se = nvrtcGetPTXSize(prog, size_buf)
+    if se != 0 {
+        println("[cuda_rtc] nvrtcGetPTXSize failed: " + str(se))
+        free_raw(size_buf, 8)
+        let _ = nvrtcDestroyProgram(prog_buf)
+        free_raw(prog_buf, 8)
+        return ptr_null()
+    }
+    let ptx_size = deref(size_buf)
+    free_raw(size_buf, 8)
+
+    // nvrtcGetPTX(prog, ptx_buf)
+    let ptx_buf = alloc_raw(ptx_size)
+    let pe = nvrtcGetPTX(prog, ptx_buf)
+    if pe != 0 {
+        println("[cuda_rtc] nvrtcGetPTX failed: " + str(pe))
+        free_raw(ptx_buf, ptx_size)
+        let _ = nvrtcDestroyProgram(prog_buf)
+        free_raw(prog_buf, 8)
+        return ptr_null()
+    }
+
+    // 정리 — destroy BEFORE freeing prog_buf
+    let _ = nvrtcDestroyProgram(prog_buf)
+    free_raw(prog_buf, 8)
+
+    println("[cuda_rtc] compiled '" + name + "' → " + str(ptx_size) + " bytes PTX")
+
+    // ── Write to disk cache ──────────────────────────────────
+    rtc_ensure_cache_dir()
+    let ptx_str = from_cstring(ptx_buf)
+    write_file(cache_file, ptx_str)
+    println("[cuda_rtc] cache WRITE → " + cache_file)
+
+    ptx_buf
+}
+
+// rtc_compile_ptx_size(src, name) -> int
+//   PTX 바이트 길이만 반환 (디버그/측정용).
+fn rtc_compile_ptx_size(src, name) {
+    let src_cstr  = cstring(src)
+    let name_cstr = cstring(name)
+
+    let prog_buf = alloc_raw(8)
+    write_i64(prog_buf, 0, 0)
+    let ce = nvrtcCreateProgram(prog_buf, src_cstr, name_cstr, 0, ptr_null(), ptr_null())
+    if ce != 0 {
+        free_raw(prog_buf, 8)
+        return -1
+    }
+    // FIX 2026-04-12: same as rtc_compile_ptx — keep prog_buf alive
+    // for Destroy's pointer-to-handle argument.
+    let prog = ptr_from_int(deref(prog_buf))
+
+    let cc = nvrtcCompileProgram(prog, 0, ptr_null())
+    if cc != 0 {
+        let _ = nvrtcDestroyProgram(prog_buf)
+        free_raw(prog_buf, 8)
+        return -2
+    }
+
+    let size_buf = alloc_raw(8)
+    write_i64(size_buf, 0, 0)
+    let _ = nvrtcGetPTXSize(prog, size_buf)
+    let ptx_size = deref(size_buf)
+    free_raw(size_buf, 8)
+
+    let _ = nvrtcDestroyProgram(prog_buf)
+    free_raw(prog_buf, 8)
+    ptx_size
+}
+
+// ── Module / Function load ───────────────────────────────────
+
+// rtc_load_module(ptx_ptr) -> *Void  (CUmodule)
+fn rtc_load_module(ptx_ptr) {
+    let mod_buf = alloc_raw(8)
+    write_i64(mod_buf, 0, 0)
+    let me = cuModuleLoadData(mod_buf, ptx_ptr)
+    if me != 0 {
+        println("[cuda_rtc] cuModuleLoadData failed: " + str(me))
+        free_raw(mod_buf, 8)
+        return ptr_null()
+    }
+    let module = ptr_from_int(deref(mod_buf))
+    free_raw(mod_buf, 8)
+    module
+}
+
+// rtc_get_function(module, name) -> *Void  (CUfunction)
+fn rtc_get_function(module, name) {
+    let name_cstr = cstring(name)
+    let fn_buf = alloc_raw(8)
+    write_i64(fn_buf, 0, 0)
+    let fe = cuModuleGetFunction(fn_buf, module, name_cstr)
+    if fe != 0 {
+        println("[cuda_rtc] cuModuleGetFunction('" + name + "') failed: " + str(fe))
+        free_raw(fn_buf, 8)
+        return ptr_null()
+    }
+    let func = ptr_from_int(deref(fn_buf))
+    free_raw(fn_buf, 8)
+    func
+}
+
+// rtc_unload_module(module)
+fn rtc_unload_module(module) {
+    cuModuleUnload(module)
+}
+
+// ── Kernel launch ────────────────────────────────────────────
+
+// rtc_launch(func, gx, gy, gz, bx, by, bz, args_array)
+//   args_array : hexa array of *Void (각 원소는 이미 alloc_raw 된 인자 셀)
+//   호스트측 void* params[N] 버퍼를 즉석에서 만들어 전달한 뒤 free.
+//
+//   NOTE: write_i64(ptr, off, val) 의 off 는 BYTE 오프셋이다.
+//         params_buf 는 *Void 배열이므로 슬롯 i 의 byte off = i * 8.
+fn rtc_launch(func, gx, gy, gz, bx, by, bz, args_array) {
+    // Delegate to rtc_launch_shmem with shmem=0 — uses cuLaunchKernelEx
+    // to avoid the 11-arg hexa FFI fragility of plain cuLaunchKernel.
+    rtc_launch_shmem(func, gx, gy, gz, bx, by, bz, 0, args_array)
+}
+
+// rtc_launch_1d(func, total_threads, args)
+//   block=256, grid=ceil(total/256)
+fn rtc_launch_1d(func, total_threads, args) {
+    let block = RTC_DEFAULT_BLOCK
+    let grid = (total_threads + block - 1) / block
+    rtc_launch(func, grid, 1, 1, block, 1, 1, args)
+}
+
+// rtc_launch_shmem(func, gx,gy,gz, bx,by,bz, shmem_bytes, args_array)
+//   Same as rtc_launch but with explicit dynamic shared memory.
+//   Required for kernels using `extern __shared__` (rms_norm, softmax, ce_loss).
+//   Uses cuLaunchKernelEx (4-arg) to avoid hexa FFI 11-arg fragility.
+//
+//   CRITICAL 2026-04-12: runtime.c write_i32/write_i64/deref_f32 use BYTE
+//   OFFSET (memcpy at (uint8_t*)p + off).  All offsets below are byte offsets.
+fn rtc_launch_shmem(func, gx, gy, gz, bx, by, bz, shmem_bytes, args_array) {
+    let n = len(args_array)
+    let params_buf = alloc_raw(n * 8)
+    let mut i = 0
+    while i < n {
+        write_i64(params_buf, i * 8, ptr_addr(args_array[i]))
+        i = i + 1
+    }
+    // Build CUlaunchConfig struct (56 bytes)
+    let cfg = alloc_raw(56)
+    let mut z = 0
+    while z < 7 { write_i64(cfg, z * 8, 0); z = z + 1 }   // zero 56 bytes
+    // i32 fields at byte 0,4,8,12,16,20,24
+    write_i32(cfg, 0, gx)
+    write_i32(cfg, 4, gy)
+    write_i32(cfg, 8, gz)
+    write_i32(cfg, 12, bx)
+    write_i32(cfg, 16, by)
+    write_i32(cfg, 20, bz)
+    write_i32(cfg, 24, shmem_bytes)
+    // byte 28-31 = padding (zeroed)
+    // byte 32-39 = stream  (NULL, zeroed)
+    // byte 40-47 = attrs   (NULL, zeroed)
+    // byte 48-51 = numAttrs (0, zeroed)
+    let st = cuLaunchKernelEx(cfg, func, params_buf, ptr_null())
+    free_raw(cfg, 56)
+    free_raw(params_buf, n * 8)
+    if st != 0 {
+        println("[cuda_rtc] cuLaunchKernelEx failed: " + str(st) + " (shmem=" + str(shmem_bytes) + ")")
+    }
+    st
+}
+
+// rtc_sync() — 디바이스 전체 동기화
+fn rtc_sync() {
+    cudaDeviceSynchronize()
+}
+
+// ── Smoke test (vector add) ──────────────────────────────────
+//
+// 수동 호출: smoke_test()
+// 자동 실행은 하지 않는다.
+//
+
+let VEC_ADD_SRC = "extern \"C\" __global__ void vec_add(float* a, float* b, float* c, int n) {\n    int i = blockIdx.x * blockDim.x + threadIdx.x;\n    if (i < n) c[i] = a[i] + b[i];\n}\n"
+
+fn smoke_test() {
+    println("[cuda_rtc] === smoke_test: vec_add 1024 ===")
+
+    // 0. cudart + driver init
+    let _ = cuda_init()
+    let ri = rtc_init()
+    if ri != 0 {
+        println("[cuda_rtc] smoke_test: rtc_init failed")
+        return -1
+    }
+
+    let n = 1024
+    let nbytes = n * 4
+
+    // 1. 호스트 입력 a, b 채우기 (write_f32 off = byte offset)
+    let a_host = alloc_raw(nbytes)
+    let b_host = alloc_raw(nbytes)
+    let mut i = 0
+    while i < n {
+        write_f32(a_host, i * 4, (i + 1) * 1.0)
+        write_f32(b_host, i * 4, (i + 1) * 1.0)
+        i = i + 1
+    }
+
+    // 2. 디바이스 버퍼 3개
+    let a_dev = cuda_malloc(nbytes)
+    let b_dev = cuda_malloc(nbytes)
+    let c_dev = cuda_malloc(nbytes)
+
+    // 3. H2D 업로드
+    let _ = cuda_memcpy_h2d(a_dev, a_host, nbytes)
+    let _ = cuda_memcpy_h2d(b_dev, b_host, nbytes)
+
+    // 4. PTX 컴파일 → 모듈 로드 → 함수 핸들
+    let ptx = rtc_compile_ptx(VEC_ADD_SRC, "vec_add.cu")
+    if ptr_addr(ptx) == 0 {
+        println("[cuda_rtc] smoke_test: compile FAIL")
+        cuda_free(a_dev)
+        cuda_free(b_dev)
+        cuda_free(c_dev)
+        free_raw(a_host, nbytes)
+        free_raw(b_host, nbytes)
+        return -2
+    }
+    let module = rtc_load_module(ptx)
+    if ptr_addr(module) == 0 {
+        println("[cuda_rtc] smoke_test: load FAIL")
+        // ptx may be cstring() of cached global — do not free_raw
+        cuda_free(a_dev)
+        cuda_free(b_dev)
+        cuda_free(c_dev)
+        free_raw(a_host, nbytes)
+        free_raw(b_host, nbytes)
+        return -3
+    }
+    let func = rtc_get_function(module, "vec_add")
+    if ptr_addr(func) == 0 {
+        println("[cuda_rtc] smoke_test: get_function FAIL")
+        let _ = rtc_unload_module(module)
+        // ptx may be cstring() of cached global — do not free_raw
+        cuda_free(a_dev)
+        cuda_free(b_dev)
+        cuda_free(c_dev)
+        free_raw(a_host, nbytes)
+        free_raw(b_host, nbytes)
+        return -4
+    }
+
+    // 5. 인자 배열 준비
+    //    각 인자는 호스트 측 셀로 alloc_raw 한 뒤 디바이스 포인터/스칼라를 기록
+    let arg_a = alloc_raw(8)
+    write_i64(arg_a, 0, ptr_addr(a_dev))
+
+    let arg_b = alloc_raw(8)
+    write_i64(arg_b, 0, ptr_addr(b_dev))
+
+    let arg_c = alloc_raw(8)
+    write_i64(arg_c, 0, ptr_addr(c_dev))
+
+    let arg_n = alloc_raw(4)
+    write_i32(arg_n, 0, n)
+
+    let args = [arg_a, arg_b, arg_c, arg_n]
+
+    // 6. launch — block=256, grid=4 (1024 threads)
+    let lst = rtc_launch(func, 4, 1, 1, 256, 1, 1, args)
+    if lst != 0 {
+        println("[cuda_rtc] smoke_test: launch returned " + str(lst))
+    }
+    let _ = rtc_sync()
+
+    // 7. D2H 회수
+    let c_host = alloc_raw(nbytes)
+    let _ = cuda_memcpy_d2h(c_host, c_dev, nbytes)
+
+    // 8. 검증 (deref_f32 off = byte 오프셋)
+    let mut pass = 0
+    let mut fail = 0
+    let mut j = 0
+    while j < n {
+        let expect = (j + 1) * 2.0
+        let got = deref_f32(c_host, j * 4)
+        let diff = got - expect
+        let absd = if diff < 0.0 { 0.0 - diff } else { diff }
+        if absd < 0.0001 {
+            pass = pass + 1
+        } else {
+            fail = fail + 1
+        }
+        j = j + 1
+    }
+    println("[cuda_rtc] smoke_test: PASS=" + str(pass) + " FAIL=" + str(fail) + " / " + str(n))
+
+    // 9. cleanup
+    free_raw(arg_a, 8)
+    free_raw(arg_b, 8)
+    free_raw(arg_c, 8)
+    free_raw(arg_n, 4)
+    free_raw(c_host, nbytes)
+    free_raw(a_host, nbytes)
+    free_raw(b_host, nbytes)
+    cuda_free(a_dev)
+    cuda_free(b_dev)
+    cuda_free(c_dev)
+    let _ = rtc_unload_module(module)
+    // NOTE: do NOT free_raw(ptx) — on cache hit, ptx is cstring() of
+    // an internal global (not alloc_raw'd). cuModuleLoadData already
+    // copied the PTX into the module, so no leak.
+
+    if fail == 0 { 0 } else { -5 }
+}
+
+println("[cuda_rtc] module loaded — NVRTC + driver API bindings ready")

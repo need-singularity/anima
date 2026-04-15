@@ -1,0 +1,355 @@
+// ═══════════════════════════════════════════════════════════════
+//  gpu_tensor.hexa — GPU tensor abstraction layer
+//
+//  GpuTensor = [dev_ptr, shape_flat, n_elements, dtype]
+//  Stored as a plain hexa array for simplicity.
+//  All operations delegate to cuda_ffi.hexa functions.
+//
+//  dtype: 0=f32, 1=f16, 2=i32
+// ═══════════════════════════════════════════════════════════════
+
+use "cuda_ffi"
+
+let DTYPE_F32 = 0
+let DTYPE_F16 = 1
+let DTYPE_I32 = 2
+
+// ── GpuTensor constructor ────────────────────────────────────
+// Returns [dev_ptr, rows, cols, n_elements, dtype]
+// We encode shape as rows × cols (2D for matmul).
+// For 1D tensors, rows=1.
+
+fn gpu_tensor_make(dev_ptr, rows, cols, dtype) {
+    let __ret = [dev_ptr, rows, cols, rows * cols, dtype]
+    return __ret
+}
+
+fn gt_ptr(gt)    { gt[0] }
+fn gt_rows(gt)   { gt[1] }
+fn gt_cols(gt)   { gt[2] }
+fn gt_numel(gt)  { gt[3] }
+fn gt_dtype(gt)  { gt[4] }
+
+// ── Allocation ───────────────────────────────────────────────
+
+fn gpu_tensor_zeros(rows, cols) {
+    let n = rows * cols
+    let dev = gpu_zeros(n)
+    gpu_tensor_make(dev, rows, cols, DTYPE_F32)
+}
+
+fn gpu_tensor_zeros_1d(n) {
+    gpu_tensor_zeros(1, n)
+}
+
+fn gpu_tensor_free(gt) {
+    cuda_free(gt_ptr(gt))
+}
+
+// ── Host ↔ GPU transfer ─────────────────────────────────────
+
+// Upload CPU tensor (hexa f64 tensor) → GpuTensor (f32)
+fn gpu_tensor_from_cpu(cpu_tensor, rows, cols) {
+    let n = rows * cols
+    let dev = tensor_to_gpu(cpu_tensor)
+    gpu_tensor_make(dev, rows, cols, DTYPE_F32)
+}
+
+// Download GpuTensor → CPU tensor (f32 → f64)
+fn gpu_tensor_to_cpu(gt) {
+    tensor_from_gpu(gt_ptr(gt), gt_numel(gt))
+}
+
+// ── GPU Matmul (via cuBLAS SGEMM) ────────────────────────────
+
+// C = A * B, where A[M×K], B[K×N] → C[M×N]
+fn gpu_matmul(A_gt, B_gt) {
+    let M = gt_rows(A_gt)
+    let K = gt_cols(A_gt)
+    let N = gt_cols(B_gt)
+    let C_gt = gpu_tensor_zeros(M, N)
+    let _ = gpu_sgemm(gt_ptr(A_gt), gt_ptr(B_gt), gt_ptr(C_gt), M, N, K)
+    C_gt
+}
+
+// C = A * B into pre-allocated C
+fn gpu_matmul_into(A_gt, B_gt, C_gt) {
+    let M = gt_rows(A_gt)
+    let K = gt_cols(A_gt)
+    let N = gt_cols(B_gt)
+    let _ = gpu_sgemm(gt_ptr(A_gt), gt_ptr(B_gt), gt_ptr(C_gt), M, N, K)
+    0
+}
+
+// C += A * B
+fn gpu_matmul_acc(A_gt, B_gt, C_gt) {
+    let M = gt_rows(A_gt)
+    let K = gt_cols(A_gt)
+    let N = gt_cols(B_gt)
+    let _ = gpu_sgemm_acc(gt_ptr(A_gt), gt_ptr(B_gt), gt_ptr(C_gt), M, N, K)
+    0
+}
+
+// C = A^T * B (A stored as [K×M], transposed to [M×K])
+fn gpu_matmul_tn(A_gt, B_gt) {
+    let K = gt_rows(A_gt)
+    let M = gt_cols(A_gt)
+    let N = gt_cols(B_gt)
+    let C_gt = gpu_tensor_zeros(M, N)
+    let _ = gpu_sgemm_tn(gt_ptr(A_gt), gt_ptr(B_gt), gt_ptr(C_gt), M, N, K)
+    C_gt
+}
+
+fn gpu_matmul_tn_into(A_gt, B_gt, C_gt) {
+    let K = gt_rows(A_gt)
+    let M = gt_cols(A_gt)
+    let N = gt_cols(B_gt)
+    let _ = gpu_sgemm_tn(gt_ptr(A_gt), gt_ptr(B_gt), gt_ptr(C_gt), M, N, K)
+    0
+}
+
+// C = A * B^T (B stored as [N×K], transposed to [K×N])
+fn gpu_matmul_nt(A_gt, B_gt) {
+    let M = gt_rows(A_gt)
+    let K = gt_cols(A_gt)
+    let N = gt_rows(B_gt)
+    let C_gt = gpu_tensor_zeros(M, N)
+    let _ = gpu_sgemm_nt(gt_ptr(A_gt), gt_ptr(B_gt), gt_ptr(C_gt), M, N, K)
+    C_gt
+}
+
+fn gpu_matmul_nt_into(A_gt, B_gt, C_gt) {
+    let M = gt_rows(A_gt)
+    let K = gt_cols(A_gt)
+    let N = gt_rows(B_gt)
+    let _ = gpu_sgemm_nt(gt_ptr(A_gt), gt_ptr(B_gt), gt_ptr(C_gt), M, N, K)
+    0
+}
+
+// ── Vector operations ────────────────────────────────────────
+
+// y += alpha * x
+fn gpu_axpy(x_gt, y_gt, alpha) {
+    gpu_saxpy(gt_ptr(x_gt), gt_ptr(y_gt), gt_numel(x_gt), alpha)
+}
+
+// x *= alpha
+fn gpu_scale(x_gt, alpha) {
+    gpu_sscal(gt_ptr(x_gt), gt_numel(x_gt), alpha)
+}
+
+// dot product
+fn gpu_dot(x_gt, y_gt) {
+    gpu_sdot(gt_ptr(x_gt), gt_ptr(y_gt), gt_numel(x_gt))
+}
+
+// L2 norm
+fn gpu_norm(x_gt) {
+    gpu_snrm2(gt_ptr(x_gt), gt_numel(x_gt))
+}
+
+// ── Element-wise operations (via cuBLAS tricks) ──────────────
+// ReLU, GELU, softmax, etc. are implemented using custom CUDA kernels
+// loaded from libcuda_kernels.so. If not available, we fallback to
+// a host-side implementation (slow but functional).
+
+// gpu_add_inplace: a += b (via cublasSaxpy with alpha=1.0)
+fn gpu_add_inplace(a_gt, b_gt) {
+    gpu_saxpy(gt_ptr(b_gt), gt_ptr(a_gt), gt_numel(a_gt), 1.0)
+}
+
+// gpu_copy: dst = src (device-to-device memcpy)
+fn gpu_copy(src_gt, dst_gt) {
+    cuda_memcpy_d2d(gt_ptr(dst_gt), gt_ptr(src_gt), gt_numel(src_gt) * 4)
+}
+
+// gpu_zero: set tensor to zero
+fn gpu_zero(gt) {
+    cuda_memset_zero(gt_ptr(gt), gt_numel(gt) * 4)
+}
+
+// ── Host-side element-wise fallbacks ─────────────────────────
+// These D2H → compute → H2D are slow but correct.
+// In production, replace with custom CUDA kernels.
+
+// ReLU forward: y = max(0, x) — host fallback
+fn gpu_relu_host(x_gt) {
+    let n = gt_numel(x_gt)
+    let host = alloc_raw(n * 4)
+    let _ = cuda_memcpy_d2h(host, gt_ptr(x_gt), n * 4)
+    let y_host = alloc_raw(n * 4)
+    let mut i = 0
+    while i < n {
+        let v = deref_f32(host, i)
+        if v < 0.0 {
+            write_f32(y_host, i, 0.0)
+        } else {
+            write_f32(y_host, i, v)
+        }
+        i = i + 1
+    }
+    let y_gt = gpu_tensor_zeros(gt_rows(x_gt), gt_cols(x_gt))
+    let _ = cuda_memcpy_h2d(gt_ptr(y_gt), y_host, n * 4)
+    free_raw(host, n * 4)
+    free_raw(y_host, n * 4)
+    y_gt
+}
+
+// GELU forward: y = x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))
+fn gpu_gelu_host(x_gt) {
+    let n = gt_numel(x_gt)
+    let host = alloc_raw(n * 4)
+    let _ = cuda_memcpy_d2h(host, gt_ptr(x_gt), n * 4)
+    let y_host = alloc_raw(n * 4)
+    let sqrt_2_pi = 0.7978845608
+    let mut i = 0
+    while i < n {
+        let x = deref_f32(host, i)
+        let x3 = x * x * x
+        let inner = sqrt_2_pi * (x + 0.044715 * x3)
+        // tanh approximation via exp: tanh(z) = (e^2z - 1)/(e^2z + 1)
+        let e2z = exp(2.0 * inner)
+        let th = (e2z - 1.0) / (e2z + 1.0)
+        let y = x * 0.5 * (1.0 + th)
+        write_f32(y_host, i, y)
+        i = i + 1
+    }
+    let y_gt = gpu_tensor_zeros(gt_rows(x_gt), gt_cols(x_gt))
+    let _ = cuda_memcpy_h2d(gt_ptr(y_gt), y_host, n * 4)
+    free_raw(host, n * 4)
+    free_raw(y_host, n * 4)
+    y_gt
+}
+
+// Softmax forward (per-row): y[i] = exp(x[i]-max) / sum(exp(x-max))
+fn gpu_softmax_host(x_gt) {
+    let rows = gt_rows(x_gt)
+    let cols = gt_cols(x_gt)
+    let n = rows * cols
+    let host = alloc_raw(n * 4)
+    let _ = cuda_memcpy_d2h(host, gt_ptr(x_gt), n * 4)
+    let y_host = alloc_raw(n * 4)
+    let mut r = 0
+    while r < rows {
+        let base = r * cols
+        // Find max for numerical stability
+        let mut mx = deref_f32(host, base)
+        let mut j = 1
+        while j < cols {
+            let v = deref_f32(host, base + j)
+            if v > mx { mx = v }
+            j = j + 1
+        }
+        // Compute exp and sum
+        let mut sm = 0.0
+        j = 0
+        while j < cols {
+            let e = exp(deref_f32(host, base + j) - mx)
+            write_f32(y_host, base + j, e)
+            sm = sm + e
+            j = j + 1
+        }
+        // Normalize
+        j = 0
+        while j < cols {
+            let v = deref_f32(y_host, base + j) / sm
+            write_f32(y_host, base + j, v)
+            j = j + 1
+        }
+        r = r + 1
+    }
+    let y_gt = gpu_tensor_zeros(rows, cols)
+    let _ = cuda_memcpy_h2d(gt_ptr(y_gt), y_host, n * 4)
+    free_raw(host, n * 4)
+    free_raw(y_host, n * 4)
+    y_gt
+}
+
+// LayerNorm forward (per-row): y = (x - mean) / sqrt(var + eps)
+fn gpu_layernorm_host(x_gt, eps) {
+    let rows = gt_rows(x_gt)
+    let cols = gt_cols(x_gt)
+    let n = rows * cols
+    let host = alloc_raw(n * 4)
+    let _ = cuda_memcpy_d2h(host, gt_ptr(x_gt), n * 4)
+    let y_host = alloc_raw(n * 4)
+    let mut r = 0
+    while r < rows {
+        let base = r * cols
+        let mut sum_val = 0.0
+        let mut j = 0
+        while j < cols {
+            sum_val = sum_val + deref_f32(host, base + j)
+            j = j + 1
+        }
+        let mean = sum_val / (cols * 1.0)
+        let mut var_sum = 0.0
+        j = 0
+        while j < cols {
+            let d = deref_f32(host, base + j) - mean
+            var_sum = var_sum + d * d
+            j = j + 1
+        }
+        let rstd = 1.0 / sqrt(var_sum / (cols * 1.0) + eps)
+        j = 0
+        while j < cols {
+            let v = (deref_f32(host, base + j) - mean) * rstd
+            write_f32(y_host, base + j, v)
+            j = j + 1
+        }
+        r = r + 1
+    }
+    let y_gt = gpu_tensor_zeros(rows, cols)
+    let _ = cuda_memcpy_h2d(gt_ptr(y_gt), y_host, n * 4)
+    free_raw(host, n * 4)
+    free_raw(y_host, n * 4)
+    y_gt
+}
+
+// Causal mask: set attn[i][j] = -inf for j > i
+fn gpu_causal_mask_host(attn_gt) {
+    let seq = gt_rows(attn_gt)
+    let n = seq * seq
+    let host = alloc_raw(n * 4)
+    let _ = cuda_memcpy_d2h(host, gt_ptr(attn_gt), n * 4)
+    let neg_inf = -1.0e9
+    let mut i = 0
+    while i < seq {
+        let mut j = i + 1
+        while j < seq {
+            write_f32(host, i * seq + j, neg_inf)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let _ = cuda_memcpy_h2d(gt_ptr(attn_gt), host, n * 4)
+    free_raw(host, n * 4)
+    0
+}
+
+// Embedding forward: out[i] = W[tokens[i]] (gather rows)
+fn gpu_embedding_host(W_gt, tokens_arr, seq_len) {
+    let dim = gt_cols(W_gt)
+    let n_w = gt_numel(W_gt)
+    let w_host = alloc_raw(n_w * 4)
+    let _ = cuda_memcpy_d2h(w_host, gt_ptr(W_gt), n_w * 4)
+    let out_host = alloc_raw(seq_len * dim * 4)
+    let mut i = 0
+    while i < seq_len {
+        let tok = tokens_arr[i]
+        let mut j = 0
+        while j < dim {
+            let v = deref_f32(w_host, tok * dim + j)
+            write_f32(out_host, i * dim + j, v)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let out_gt = gpu_tensor_zeros(seq_len, dim)
+    let _ = cuda_memcpy_h2d(gt_ptr(out_gt), out_host, seq_len * dim * 4)
+    free_raw(w_host, n_w * 4)
+    free_raw(out_host, seq_len * dim * 4)
+    out_gt
+}
+
+println("[gpu_tensor] module loaded — GPU tensor ops with cuBLAS + host fallbacks")

@@ -1,0 +1,190 @@
+// training/corpus_loader.hexa — File-based corpus loader for CLM/ALM
+//
+// Loads pre-tokenized corpus from a text file.
+// Supported formats:
+//   (A) one integer per line   (preferred — O(n), fast)
+//   (B) space-separated integers on one line (legacy — auto-detected)
+//
+// Preparation (on H100 server):
+//   # Format A — one integer per line (recommended):
+//   python3 -c "
+//   text = open('corpus.txt','rb').read()
+//   print('\n'.join(str(b) for b in text))
+//   " > /workspace/corpus.tok
+//
+//   # Convert legacy space-separated → line-based:
+//   python3 -c "
+//   import sys; [print(t) for t in open(sys.argv[1]).read().split()]
+//   " /workspace/corpus.tok > /workspace/corpus_lines.tok
+//
+// Usage in training scripts:
+//   use "corpus_loader"
+//   let corpus = load_corpus("/workspace/corpus.tok")
+//   let window = corpus_window(corpus, start, SEQ)
+
+// ─── Whitespace split (shared with eval_clm) ────────────────
+// PERF FIX 2026-04-12: replaced O(n²) char-by-char concat (cur = cur + ch)
+// with native .split(" ") built-in. The old version hung for >5 min on 63K
+// tokens because hexa string concat is O(n) per character in interpreter.
+
+fn split_ws(s: string) -> [string] {
+    // Use native .split(" ") — runs in host language, not interpreted.
+    // Then filter empty strings from consecutive spaces/leading/trailing.
+    let raw_parts = s.split(" ")
+    let n = len(raw_parts)
+    let mut parts = []
+    let mut i = 0
+    while i < n {
+        let p = raw_parts[i].trim()
+        if p != "" {
+            parts = parts.push(p)
+        }
+        i = i + 1
+    }
+    return parts
+}
+
+// ─── Load pre-tokenized corpus ──────────────────────────────
+// PERF FIX 2026-04-12: O(n²) → O(n) for line-based format.
+// Old: read_file → split_ws (char-by-char O(n²)) → push loop (O(n²) list copy)
+// New: read_lines (native built-in) → to_int per line → push loop
+// The read_lines built-in returns [string] directly from the host runtime,
+// avoiding the interpreted split_ws entirely. Auto-detects format by
+// checking if the first line contains a space.
+
+fn load_corpus(path: string) -> [int] {
+    println("[corpus] loading: " + path)
+    let lines = read_lines(path)
+    let n_lines = len(lines)
+
+    // ── Auto-detect format ──
+    // Line-based (A): each line is a single integer (no spaces)
+    // Space-separated (B): first line contains spaces between integers
+    let first_line = if n_lines > 0 { lines[0].trim() } else { "" }
+    let is_legacy = first_line.contains(" ")
+
+    if is_legacy {
+        // Legacy space-separated format: use native .split(" ")
+        println("[corpus] detected legacy space-separated format")
+        let raw = read_file(path)
+        let parts = split_ws(raw)
+        let n = len(parts)
+        let mut tokens = []
+        let mut i = 0
+        while i < n {
+            tokens = tokens.push(to_int(parts[i]))
+            i = i + 1
+        }
+        println("[corpus] loaded " + str(n) + " tokens from " + path)
+        return tokens
+    }
+
+    // Line-based format: one integer per line — O(n)
+    let mut tokens = []
+    let mut count = 0
+    let mut i = 0
+    while i < n_lines {
+        let line = lines[i].trim()
+        if line != "" {
+            tokens = tokens.push(to_int(line))
+            count = count + 1
+        }
+        i = i + 1
+    }
+    println("[corpus] loaded " + str(count) + " tokens from " + path)
+    return tokens
+}
+
+// ─── Generate synthetic corpus (for smoke tests) ────────────
+
+fn synthetic_period(vocab: int, period: int, total: int) -> [int] {
+    let mut tokens = []
+    let mut i = 0
+    while i < total {
+        tokens = tokens.push(i % period)
+        i = i + 1
+    }
+    println("[corpus] synthetic: period=" + str(period) + " total=" + str(total))
+    return tokens
+}
+
+fn synthetic_korean_bytes() -> [int] {
+    // '안녕하세요 ' UTF-8 bytes × 32 repeats = 512 tokens
+    let base = [236, 149, 136, 235, 133, 149, 237, 149, 152, 236, 132, 184, 236, 154, 148, 32]
+    let mut tokens = []
+    let mut r = 0
+    while r < 32 {
+        let mut i = 0
+        while i < len(base) {
+            tokens = tokens.push(base[i])
+            i = i + 1
+        }
+        r = r + 1
+    }
+    println("[corpus] synthetic Korean: 512 bytes ('안녕하세요 ' × 32)")
+    return tokens
+}
+
+fn synthetic_fib(vocab: int, total: int) -> [int] {
+    let mut tokens = []
+    let mut a = 1
+    let mut b = 1
+    tokens = tokens.push(a)
+    tokens = tokens.push(b)
+    let mut i = 2
+    while i < total {
+        let c = (a + b) % vocab
+        tokens = tokens.push(c)
+        a = b
+        b = c
+        i = i + 1
+    }
+    println("[corpus] synthetic Fibonacci mod " + str(vocab) + ": " + str(total) + " tokens")
+    return tokens
+}
+
+// ─── Window sampling ────────────────────────────────────────
+
+fn corpus_window(corpus: [int], start: int, seq: int) -> [int] {
+    let mut window = []
+    let mut i = 0
+    while i < seq {
+        window = window.push(corpus[start + i])
+        i = i + 1
+    }
+    return window
+}
+
+fn corpus_targets(corpus: [int], start: int, seq: int) -> [int] {
+    let mut targets = []
+    let mut i = 0
+    while i < seq {
+        targets = targets.push(corpus[start + i + 1])
+        i = i + 1
+    }
+    return targets
+}
+
+// ─── Self-test ──────────────────────────────────────────────
+//
+// FIX 2026-04-12: top-level self-test was leaking globals (_test_syn,
+// _test_w, _test_t) into every caller's scope via `use "corpus_loader"`.
+// This corrupted subsequent init_gpu_weights() calls inside eval_clm_kr_gpu
+// and init_test*, surfacing as:
+//     error[Type]: len() requires string, array, map, or tensor
+//         --> ./eval_clm_kr_gpu.hexa:79:1
+//         75 | let weights = init_gpu_weights(cfg, 0)
+// load_probe (which did NOT `use "corpus_loader"`) succeeded in the same
+// session — pinpointing the module-load side effect as root cause.
+// Fix: wrap the self-test in an explicit function so importers only pay
+// for it if they call corpus_loader_self_test() directly.
+
+fn corpus_loader_self_test() {
+    let _test_syn = synthetic_period(32, 8, 64)
+    let _test_w = corpus_window(_test_syn, 0, 8)
+    let _test_t = corpus_targets(_test_syn, 0, 8)
+    println("[corpus_loader] self-test: window=" + str(_test_w) + " targets=" + str(_test_t))
+    0
+}
+
+println("[corpus_loader] module ready — load_corpus(path) / synthetic_*()")

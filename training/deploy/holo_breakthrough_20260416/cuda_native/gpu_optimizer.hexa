@@ -1,0 +1,151 @@
+// ═══════════════════════════════════════════════════════════════
+//  gpu_optimizer.hexa — AdamW optimizer on GPU
+//
+//  All moment buffers (m1, m2) live on GPU.
+//  Weight updates via cuBLAS (sscal + saxpy) — no D2H transfers.
+//
+//  AdamW update rule:
+//    m = beta1*m + (1-beta1)*g
+//    v = beta2*v + (1-beta2)*g^2
+//    m_hat = m / (1 - beta1^t)
+//    v_hat = v / (1 - beta2^t)
+//    w = w * (1 - lr*wd) - lr * m_hat / (sqrt(v_hat) + eps)
+//
+//  For the v*g^2 step, we need element-wise multiply which cuBLAS
+//  doesn't provide. We use a host fallback for v update, but keep
+//  the main weight update on GPU via saxpy/sscal.
+// ═══════════════════════════════════════════════════════════════
+
+use "cuda_ffi"
+use "gpu_tensor"
+
+// ── AdamW hyperparameters ────────────────────────────────────
+let ADAM_BETA1 = 0.9
+let ADAM_BETA2 = 0.999
+let ADAM_EPS   = 1.0e-8
+let ADAM_WD    = 0.1
+
+// ── Optimizer state per parameter ────────────────────────────
+// [param_gt, m1_gt, m2_gt, n_elements]
+
+fn adam_state_create(param_gt) {
+    let n = gt_numel(param_gt)
+    let m1 = gpu_tensor_zeros(gt_rows(param_gt), gt_cols(param_gt))
+    let m2 = gpu_tensor_zeros(gt_rows(param_gt), gt_cols(param_gt))
+    let state = [param_gt, m1, m2, n]
+    return state
+}
+
+// ── AdamW step (hybrid GPU/host for v update) ────────────────
+// Uses cuBLAS for everything except element-wise g^2 and sqrt(v)
+fn adam_step(state, grad_gt, lr, t) {
+    let param_gt = state[0]
+    let m1_gt = state[1]
+    let m2_gt = state[2]
+    let n = state[3]
+
+    // ── Weight decay: param *= (1 - lr * wd) ──
+    let decay = 1.0 - lr * ADAM_WD
+    let _ = gpu_sscal(gt_ptr(param_gt), n, decay)
+
+    // ── m1 = beta1 * m1 + (1-beta1) * g ──
+    // m1 *= beta1
+    let _ = gpu_sscal(gt_ptr(m1_gt), n, ADAM_BETA1)
+    // m1 += (1-beta1) * g
+    let _ = gpu_saxpy(gt_ptr(grad_gt), gt_ptr(m1_gt), n, 1.0 - ADAM_BETA1)
+
+    // ── m2 = beta2 * m2 + (1-beta2) * g^2 ──
+    // This requires element-wise g^2. Host fallback.
+    let g_host = alloc_raw(n * 4)
+    let v_host = alloc_raw(n * 4)
+    let _ = cuda_memcpy_d2h(g_host, gt_ptr(grad_gt), n * 4)
+    let _ = cuda_memcpy_d2h(v_host, gt_ptr(m2_gt), n * 4)
+    let ob2 = 1.0 - ADAM_BETA2
+    let mut i = 0
+    while i < n {
+        let g = deref_f32(g_host, i)
+        let v_old = deref_f32(v_host, i)
+        let v_new = ADAM_BETA2 * v_old + ob2 * g * g
+        write_f32(v_host, i, v_new)
+        i = i + 1
+    }
+    let _ = cuda_memcpy_h2d(gt_ptr(m2_gt), v_host, n * 4)
+
+    // ── Bias correction ──
+    let bc1 = 1.0 - pow(ADAM_BETA1, t * 1.0)
+    let bc2 = 1.0 - pow(ADAM_BETA2, t * 1.0)
+
+    // ── Compute update: param -= lr * m1_hat / (sqrt(m2_hat) + eps) ──
+    // Host fallback for the division by sqrt(v)
+    let m_host = alloc_raw(n * 4)
+    let _ = cuda_memcpy_d2h(m_host, gt_ptr(m1_gt), n * 4)
+    let upd_host = alloc_raw(n * 4)
+    i = 0
+    while i < n {
+        let m_hat = deref_f32(m_host, i) / bc1
+        let v_hat = deref_f32(v_host, i) / bc2
+        let step = lr * m_hat / (sqrt(v_hat) + ADAM_EPS)
+        write_f32(upd_host, i, step)
+        i = i + 1
+    }
+    free_raw(g_host, n * 4)
+    free_raw(v_host, n * 4)
+    free_raw(m_host, n * 4)
+
+    // Upload update and subtract from param
+    let upd_dev = cuda_malloc(n * 4)
+    let _ = cuda_memcpy_h2d(upd_dev, upd_host, n * 4)
+    free_raw(upd_host, n * 4)
+    // param -= update  (saxpy with alpha=-1.0)
+    let _ = gpu_saxpy(upd_dev, gt_ptr(param_gt), n, -1.0)
+    let _ = cuda_free(upd_dev)
+
+    0
+}
+
+// ── Cosine LR schedule with linear warmup ────────────────────
+fn lr_cosine(step, warmup, total, peak, minimum) {
+    if step < warmup {
+        return peak * (step * 1.0) / (warmup * 1.0)
+    }
+    if step >= total {
+        return minimum
+    }
+    let prog = (step - warmup) * 1.0 / ((total - warmup) * 1.0)
+    let x = prog * 3.14159265358979
+    let x2 = x * x
+    let x4 = x2 * x2
+    let x6 = x4 * x2
+    let cos_v = 1.0 - x2 / 2.0 + x4 / 24.0 - x6 / 720.0
+    minimum + (peak - minimum) * 0.5 * (1.0 + cos_v)
+}
+
+// ── Gradient clipping (global norm) ──────────────────────────
+fn gpu_clip_grad_norm(grad_gts, max_norm) {
+    let n_params = len(grad_gts)
+    let mut total_norm_sq = 0.0
+    let mut i = 0
+    while i < n_params {
+        let g = grad_gts[i]
+        if ptr_addr(gt_ptr(g)) != 0 {
+            let nrm = gpu_snrm2(gt_ptr(g), gt_numel(g))
+            total_norm_sq = total_norm_sq + nrm * nrm
+        }
+        i = i + 1
+    }
+    let total_norm = sqrt(total_norm_sq)
+    if total_norm > max_norm {
+        let scale = max_norm / (total_norm + 1.0e-8)
+        i = 0
+        while i < n_params {
+            let g = grad_gts[i]
+            if ptr_addr(gt_ptr(g)) != 0 {
+                let _ = gpu_sscal(gt_ptr(g), gt_numel(g), scale)
+            }
+            i = i + 1
+        }
+    }
+    total_norm
+}
+
+println("[gpu_optimizer] loaded — AdamW on GPU with cosine LR")
