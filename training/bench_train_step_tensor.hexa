@@ -1,0 +1,1052 @@
+// training/bench_train_step_tensor.hexa — Tensor-backed CLM train step
+// latency measurement (agent-a3c8f82a, 2026-04-15).
+//
+// Purpose:
+//   Realise the 4,757x BLAS gain (spike #21) in the actual CLM training
+//   loop by replacing list-backed nn_core matmul/linear/attention hot
+//   paths with the new `self/ml/tensor.hexa` Tensor primitive (raw f32
+//   buffer + cblas_sgemm via hxblas shim).
+//
+// Comparison target:
+//   bench_train_step_flag_on.hexa (commit 18aaea50) — list-backed, 2-layer
+//   minimal decoder, 100 steps, 1000 ms/step mean, loss 3.47 -> 2.10.
+//
+// Shape parity (same model as bench_train_step_flag_on.hexa):
+//   d_model=16, d_ff=32, nl=2, vocab=32, seq=8, rank=4, steps=100, lr=0.1,
+//   period=8, init_scale=0.1, eps=1e-5.
+//
+// Build + run:
+//   cd /Users/ghost/Dev/anima
+//   HEXA_LOCAL=1 hexa build training/bench_train_step_tensor.hexa \
+//     -o /tmp/bench_train_step_tensor
+//   DYLD_LIBRARY_PATH=training/build /tmp/bench_train_step_tensor
+//
+// Port notes:
+//   - All 2D tensors live in raw f32 buffers (Tensor struct). Row-major.
+//   - matmul → hxblas_sgemm (row-major, alpha=1, beta=0)
+//   - matmul_transB → hxblas_sgemm with transB=CblasTrans (112)
+//   - rms_norm, softmax, log_softmax, swiglu: raw scalar loops on
+//     the Tensor byte buffer (these are bandwidth-bound, not FLOP-bound,
+//     so BLAS can't help; the win is from avoiding the list-append churn)
+//   - cross_entropy + dlogits: raw scalar loops
+//
+// Parser quirk dodged:
+//   `if x < 0 { ... }` is misparsed as `x<0>{}` type expression in the
+//   current hexa_v2 parser (same bug that breaks bench_train_step_flag_on.hexa
+//   at line 432). We guard it with a temp variable.
+//
+// Inlined Tensor primitive: the `use "ml/tensor"` flatten path resolves
+// relative to self/ which is outside training/. Following the same
+// pattern as bench_tensor_matmul.hexa, we inline the primitive here.
+// ══════════════════════════════════════════════════════════════════════
+
+// ── BLAS extern FFI (mirrors self/ml/tensor.hexa / accelerate_blas.hexa) ──
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_sgemm(order: int, transA: int, transB: int, M: int, N: int, K: int, alpha: float, A: *Void, lda: int, B: *Void, ldb: int, beta: float, C: *Void, ldc: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_version() -> int
+
+// ── CBLAS constants ────────────────────────────────────────────────────
+let CblasRowMajor = 101
+let CblasNoTrans  = 111
+let CblasTrans    = 112
+
+// ── Tensor struct (mirror of self/ml/tensor.hexa, int-only fields) ─────
+// See self/ml/tensor.hexa for rationale on int-only layout
+// (dodges feedback_hexa_struct_return_bug + feedback_hexa_struct_list_alias).
+struct Tensor {
+    data: int,
+    numel: int,
+    rank: int,
+    d0: int,
+    d1: int
+}
+
+fn tensor_new2(m: int, n: int) -> Tensor {
+    // alloc_raw returns calloc'd bytes → zero-init.
+    return Tensor { data: alloc_raw(m * n * 4), numel: m * n, rank: 2, d0: m, d1: n }
+}
+
+fn tensor_new1(n: int) -> Tensor {
+    return Tensor { data: alloc_raw(n * 4), numel: n, rank: 1, d0: n, d1: 1 }
+}
+
+fn tensor_free(t: Tensor) {
+    free_raw(t.data, t.numel * 4)
+}
+
+fn tget(t: Tensor, i: int) -> float {
+    return deref_f32(t.data, i * 4)
+}
+
+fn tset(t: Tensor, i: int, v: float) {
+    write_f32(t.data, i * 4, v)
+}
+
+fn tget2(t: Tensor, i: int, j: int) -> float {
+    return deref_f32(t.data, (i * t.d1 + j) * 4)
+}
+
+fn tset2(t: Tensor, i: int, j: int, v: float) {
+    write_f32(t.data, (i * t.d1 + j) * 4, v)
+}
+
+// ── BLAS-backed matmul: C[M,N] = A[M,K] * B[K,N] ───────────────────────
+fn t_matmul(a: Tensor, b: Tensor) -> Tensor {
+    let M = a.d0
+    let K = a.d1
+    let N = b.d1
+    let c = tensor_new2(M, N)
+    hxblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                 M, N, K, 1.0, a.data, K, b.data, N, 0.0, c.data, N)
+    return c
+}
+
+// C[M,N] = A[M,K] * B^T where B stored as [N,K] row-major.
+// cblas does the transpose in-place via the transB flag.
+fn t_matmul_transB(a: Tensor, b: Tensor, N: int) -> Tensor {
+    let M = a.d0
+    let K = a.d1
+    let c = tensor_new2(M, N)
+    // B is [N, K] row-major; lda=K, ldb=K (the leading dim of B before transpose).
+    hxblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                 M, N, K, 1.0, a.data, K, b.data, K, 0.0, c.data, N)
+    return c
+}
+
+// C[K,N] = A^T[K,M] * B[M,N] where A stored as [M,K] row-major.
+fn t_matmul_transA(a: Tensor, b: Tensor, K: int) -> Tensor {
+    let M = a.d0
+    let N = b.d1
+    let c = tensor_new2(K, N)
+    hxblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                 K, N, M, 1.0, a.data, K, b.data, N, 0.0, c.data, N)
+    return c
+}
+
+// ── Elementwise helpers (scalar loops on the raw buffer) ───────────────
+fn t_scale_inplace(t: Tensor, alpha: float) {
+    let mut i = 0
+    while i < t.numel {
+        let v = deref_f32(t.data, i * 4)
+        write_f32(t.data, i * 4, v * alpha)
+        i = i + 1
+    }
+}
+
+fn t_add_inplace(dst: Tensor, src: Tensor) {
+    let mut i = 0
+    while i < dst.numel {
+        let a = deref_f32(dst.data, i * 4)
+        let b = deref_f32(src.data, i * 4)
+        write_f32(dst.data, i * 4, a + b)
+        i = i + 1
+    }
+}
+
+fn t_copy(src: Tensor) -> Tensor {
+    let out = tensor_new2(src.d0, src.d1)
+    let mut i = 0
+    while i < src.numel {
+        write_f32(out.data, i * 4, deref_f32(src.data, i * 4))
+        i = i + 1
+    }
+    return out
+}
+
+// ── LCG pseudo-random (same seed discipline as nn_core.hexa:50-70) ─────
+let mut LCG_STATE = 1
+fn lcg_next(seed: int) -> float {
+    // NOTE: `if s < 0` triggers the parser quirk. Use `s <= -1` dodge.
+    let mut s = seed * 1103515245 + 12345
+    let sign_flip = s <= 0 - 1
+    if sign_flip { s = 0 - s }
+    s = s % 2147483647
+    LCG_STATE = s
+    let u = to_float(s % 1000000) / 1000000.0
+    return u
+}
+
+// Box-Muller normal via two uniforms.
+// NB: renamed from `randn` to avoid conflict with hexa's builtin 2-arg
+// `randn(rows, cols)` tensor constructor (codegen error "index 1 out of
+// bounds (len 1)" when a local 1-arg `randn` is defined).
+fn box_muller(seed_in: int) -> float {
+    let u1_raw = lcg_next(seed_in)
+    let u2 = lcg_next(LCG_STATE)
+    // Avoid log(0)
+    let u1 = if u1_raw < 0.000001 { 0.000001 } else { u1_raw }
+    let r = sqrt(0.0 - 2.0 * log(u1))
+    let theta = 2.0 * 3.141592653589793 * u2
+    return r * cos(theta)
+}
+
+fn tensor_randn_init(t: Tensor, seed: int, scale: float) {
+    LCG_STATE = seed
+    let n = t.numel
+    let mut i = 0
+    while i < n {
+        let z = box_muller(LCG_STATE)
+        write_f32(t.data, i * 4, z * scale)
+        i = i + 1
+    }
+}
+
+// ── Config (identical to bench_train_step_flag_on.hexa) ────────────────
+let BENCH_D          = 16
+let BENCH_FF         = 32
+let BENCH_NL         = 2
+let BENCH_VOCAB      = 32
+let BENCH_RANK       = 4
+let BENCH_SEQ        = 8
+let BENCH_STEPS      = 100
+let BENCH_LR         = 0.1
+let BENCH_EPS        = 0.00001
+let BENCH_INIT_SCALE = 0.1
+let BENCH_PERIOD     = 8
+let BENCH_CORPUS_LEN = 512
+let BENCH_LOG_EVERY  = 10
+// Historical list-backed baseline from commit 18aaea50 (bench_train_step_flag_on.hexa):
+// 1000 ms/step mean on 2-layer minimal decoder, loss 3.47 -> 2.10.
+let BENCH_BASELINE_MS = 1000.0
+
+// ── Model state (all Tensors, raw f32 buffers) ─────────────────────────
+// Embed: [V, D]
+let embed = tensor_new2(BENCH_VOCAB, BENCH_D)
+// Layer 0
+let L0_Wq   = tensor_new2(BENCH_D, BENCH_D)
+let L0_Wk   = tensor_new2(BENCH_D, BENCH_D)
+let L0_Wv   = tensor_new2(BENCH_D, BENCH_D)
+let L0_Wo   = tensor_new2(BENCH_D, BENCH_D)
+let L0_Wff1 = tensor_new2(BENCH_D, BENCH_FF)   // up-proj
+let L0_Wff2 = tensor_new2(BENCH_FF, BENCH_D)   // down-proj
+let L0_ga   = tensor_new1(BENCH_D)             // rmsnorm gain attn
+let L0_gf   = tensor_new1(BENCH_D)             // rmsnorm gain ffn
+
+let L1_Wq   = tensor_new2(BENCH_D, BENCH_D)
+let L1_Wk   = tensor_new2(BENCH_D, BENCH_D)
+let L1_Wv   = tensor_new2(BENCH_D, BENCH_D)
+let L1_Wo   = tensor_new2(BENCH_D, BENCH_D)
+let L1_Wff1 = tensor_new2(BENCH_D, BENCH_FF)
+let L1_Wff2 = tensor_new2(BENCH_FF, BENCH_D)
+let L1_ga   = tensor_new1(BENCH_D)
+let L1_gf   = tensor_new1(BENCH_D)
+
+// LM head low-rank: [D, R] * [R, V]
+let lmh_U = tensor_new2(BENCH_D, BENCH_RANK)
+let lmh_V = tensor_new2(BENCH_RANK, BENCH_VOCAB)
+
+fn init_all_params() {
+    tensor_randn_init(embed,   1,  BENCH_INIT_SCALE)
+    tensor_randn_init(L0_Wq,   10, BENCH_INIT_SCALE)
+    tensor_randn_init(L0_Wk,   11, BENCH_INIT_SCALE)
+    tensor_randn_init(L0_Wv,   12, BENCH_INIT_SCALE)
+    tensor_randn_init(L0_Wo,   13, BENCH_INIT_SCALE)
+    tensor_randn_init(L0_Wff1, 14, BENCH_INIT_SCALE)
+    tensor_randn_init(L0_Wff2, 15, BENCH_INIT_SCALE)
+    tensor_randn_init(L1_Wq,   20, BENCH_INIT_SCALE)
+    tensor_randn_init(L1_Wk,   21, BENCH_INIT_SCALE)
+    tensor_randn_init(L1_Wv,   22, BENCH_INIT_SCALE)
+    tensor_randn_init(L1_Wo,   23, BENCH_INIT_SCALE)
+    tensor_randn_init(L1_Wff1, 24, BENCH_INIT_SCALE)
+    tensor_randn_init(L1_Wff2, 25, BENCH_INIT_SCALE)
+    tensor_randn_init(lmh_U,   30, BENCH_INIT_SCALE)
+    tensor_randn_init(lmh_V,   31, BENCH_INIT_SCALE)
+    // RMSNorm gains init to 1.0
+    let mut i = 0
+    while i < BENCH_D {
+        write_f32(L0_ga.data, i * 4, 1.0)
+        write_f32(L0_gf.data, i * 4, 1.0)
+        write_f32(L1_ga.data, i * 4, 1.0)
+        write_f32(L1_gf.data, i * 4, 1.0)
+        i = i + 1
+    }
+}
+
+// ── Corpus (period=8 deterministic pattern) ───────────────────────────
+let CORPUS = build_corpus()
+fn build_corpus() -> [int] {
+    let mut out = []
+    let mut i = 0
+    while i < BENCH_CORPUS_LEN {
+        out = out.push(i % BENCH_PERIOD)
+        i = i + 1
+    }
+    return out
+}
+
+// ── Embed lookup: toks[SEQ] -> out[SEQ, D] (raw f32) ───────────────────
+fn embed_lookup_t(toks: [int]) -> Tensor {
+    let out = tensor_new2(BENCH_SEQ, BENCH_D)
+    let mut i = 0
+    while i < BENCH_SEQ {
+        let t = toks[i]
+        let mut p = 0
+        while p < BENCH_D {
+            // embed is [V, D] row-major, so row t starts at t*D.
+            let v = deref_f32(embed.data, (t * BENCH_D + p) * 4)
+            write_f32(out.data, (i * BENCH_D + p) * 4, v)
+            p = p + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── RMSNorm on a [SEQ, D] Tensor, per-row, with gain Tensor [D] ───────
+// y[i,p] = x[i,p] / sqrt(mean(x[i,:]^2) + eps) * gain[p]
+fn rms_norm_rows_t(x: Tensor, gain: Tensor, eps: float) -> Tensor {
+    let out = tensor_new2(x.d0, x.d1)
+    let D = x.d1
+    let mut i = 0
+    while i < x.d0 {
+        let mut ms = 0.0
+        let mut p = 0
+        while p < D {
+            let v = deref_f32(x.data, (i * D + p) * 4)
+            ms = ms + v * v
+            p = p + 1
+        }
+        ms = ms / to_float(D)
+        let inv_r = 1.0 / sqrt(ms + eps)
+        p = 0
+        while p < D {
+            let v = deref_f32(x.data, (i * D + p) * 4)
+            let g = deref_f32(gain.data, p * 4)
+            write_f32(out.data, (i * D + p) * 4, v * inv_r * g)
+            p = p + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Softmax in-place on a single row of length N ───────────────────────
+// Writes normalized probs into out[row_offset..row_offset+N]
+fn softmax_row_t(scores: Tensor, row_start: int, n: int) {
+    // Find max
+    let mut mx = deref_f32(scores.data, row_start * 4)
+    let mut i = 1
+    while i < n {
+        let v = deref_f32(scores.data, (row_start + i) * 4)
+        if v > mx { mx = v }
+        i = i + 1
+    }
+    // exp(x - max), sum
+    let mut sum_exp = 0.0
+    i = 0
+    while i < n {
+        let v = deref_f32(scores.data, (row_start + i) * 4)
+        let e = exp(v - mx)
+        write_f32(scores.data, (row_start + i) * 4, e)
+        sum_exp = sum_exp + e
+        i = i + 1
+    }
+    // Normalize
+    i = 0
+    while i < n {
+        let e = deref_f32(scores.data, (row_start + i) * 4)
+        write_f32(scores.data, (row_start + i) * 4, e / sum_exp)
+        i = i + 1
+    }
+}
+
+// ── SwiGLU-style activation (y = x * sigmoid(gate)) in-place ───────────
+// For the simplified bench we use x and gate as the same tensor (mirrors
+// the gate_up twin in bench_train_step_flag_on.hexa: `swiglu_vec(up, up)`).
+fn swiglu_self_t(up: Tensor) -> Tensor {
+    let out = tensor_new2(up.d0, up.d1)
+    let mut i = 0
+    while i < up.numel {
+        let v = deref_f32(up.data, i * 4)
+        // sigmoid(v) = 1 / (1 + exp(-v))
+        let s = 1.0 / (1.0 + exp(0.0 - v))
+        write_f32(out.data, i * 4, v * s)
+        i = i + 1
+    }
+    return out
+}
+
+// Backward of swiglu-self: dy → dx where y = x * sigmoid(x)
+// dx = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
+//    = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+// Returns dx, both gate and input paths summed (since gate=input).
+fn swiglu_self_bwd_t(up: Tensor, dy: Tensor) -> Tensor {
+    let out = tensor_new2(up.d0, up.d1)
+    let mut i = 0
+    while i < up.numel {
+        let v = deref_f32(up.data, i * 4)
+        let dyi = deref_f32(dy.data, i * 4)
+        let s = 1.0 / (1.0 + exp(0.0 - v))
+        // swiglu(x, x) = x*sigmoid(x) → d/dx = sigmoid(x) + x*sigmoid(x)*(1-sigmoid(x))
+        let dxi = dyi * (s + v * s * (1.0 - s))
+        write_f32(out.data, i * 4, dxi)
+        i = i + 1
+    }
+    return out
+}
+
+// ── Scaled-dot attention (causal), all raw Tensor ─────────────────────
+// Q, K, V: [SEQ, D], returns out[SEQ, D] and probs[SEQ, SEQ] as a pair.
+// For the bench we pre-allocate probs outside and mutate it.
+struct AttnOut {
+    out: Tensor,
+    probs: Tensor
+}
+
+fn attn_fwd_t(Q: Tensor, K: Tensor, V: Tensor) -> AttnOut {
+    let S = Q.d0
+    let D = Q.d1
+    let inv_sqrt_d = 1.0 / sqrt(to_float(D))
+    let probs = tensor_new2(S, S)
+    let out = tensor_new2(S, D)
+
+    // scores[i,j] = Q[i,:] . K[j,:] * inv_sqrt_d (causal: j > i → -inf)
+    let mut i = 0
+    while i < S {
+        let mut j = 0
+        while j < S {
+            if j > i {
+                write_f32(probs.data, (i * S + j) * 4, 0.0 - 10000.0)
+            } else {
+                let mut dot = 0.0
+                let mut p = 0
+                while p < D {
+                    let q_ip = deref_f32(Q.data, (i * D + p) * 4)
+                    let k_jp = deref_f32(K.data, (j * D + p) * 4)
+                    dot = dot + q_ip * k_jp
+                    p = p + 1
+                }
+                write_f32(probs.data, (i * S + j) * 4, dot * inv_sqrt_d)
+            }
+            j = j + 1
+        }
+        // Softmax row i
+        softmax_row_t(probs, i * S, S)
+        i = i + 1
+    }
+
+    // out[i,p] = sum_j probs[i,j] * V[j,p]
+    i = 0
+    while i < S {
+        let mut p = 0
+        while p < D {
+            let mut acc = 0.0
+            let mut j = 0
+            while j < S {
+                let pr = deref_f32(probs.data, (i * S + j) * 4)
+                let vjp = deref_f32(V.data, (j * D + p) * 4)
+                acc = acc + pr * vjp
+                j = j + 1
+            }
+            write_f32(out.data, (i * D + p) * 4, acc)
+            p = p + 1
+        }
+        i = i + 1
+    }
+
+    return AttnOut { out: out, probs: probs }
+}
+
+// Attn backward: given probs, V, dctx, Q, K → dQ, dK, dV
+struct AttnBwd {
+    dQ: Tensor,
+    dK: Tensor,
+    dV: Tensor
+}
+
+fn attn_bwd_t(Q: Tensor, K: Tensor, V: Tensor, probs: Tensor, dctx: Tensor) -> AttnBwd {
+    let S = Q.d0
+    let D = Q.d1
+    let inv_sqrt_d = 1.0 / sqrt(to_float(D))
+    let dQ = tensor_new2(S, D)
+    let dK = tensor_new2(S, D)
+    let dV = tensor_new2(S, D)
+
+    // Build dprobs[S, S]: dprobs[i,j] = dctx[i,:] . V[j,:]
+    // AND dV[j,p] += probs[i,j] * dctx[i,p] (in the same loop)
+    let dprobs = tensor_new2(S, S)
+    let mut i = 0
+    while i < S {
+        let mut j = 0
+        while j < S {
+            let mut dp = 0.0
+            let mut p = 0
+            while p < D {
+                let dctx_ip = deref_f32(dctx.data, (i * D + p) * 4)
+                let v_jp = deref_f32(V.data, (j * D + p) * 4)
+                dp = dp + dctx_ip * v_jp
+                let pij = deref_f32(probs.data, (i * S + j) * 4)
+                let dvjp = deref_f32(dV.data, (j * D + p) * 4)
+                write_f32(dV.data, (j * D + p) * 4, dvjp + pij * dctx_ip)
+                p = p + 1
+            }
+            write_f32(dprobs.data, (i * S + j) * 4, dp)
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    // Backward through softmax row i:
+    //   sum_i = sum_j probs[i,j] * dprobs[i,j]
+    //   dscores[i,j] = probs[i,j] * (dprobs[i,j] - sum_i)
+    // Apply causal mask (j > i → 0).
+    // Then accumulate into dQ, dK via:
+    //   dQ[i,p] += dscores[i,j] * K[j,p] * inv_sqrt_d
+    //   dK[j,p] += dscores[i,j] * Q[i,p] * inv_sqrt_d
+    i = 0
+    while i < S {
+        let mut s_acc = 0.0
+        let mut j = 0
+        while j < S {
+            let pij = deref_f32(probs.data, (i * S + j) * 4)
+            let dpij = deref_f32(dprobs.data, (i * S + j) * 4)
+            s_acc = s_acc + pij * dpij
+            j = j + 1
+        }
+        j = 0
+        while j < S {
+            if j > i {
+                j = j + 1
+                continue
+            }
+            let pij = deref_f32(probs.data, (i * S + j) * 4)
+            let dpij = deref_f32(dprobs.data, (i * S + j) * 4)
+            let dsij = pij * (dpij - s_acc) * inv_sqrt_d
+            let mut p = 0
+            while p < D {
+                let k_jp = deref_f32(K.data, (j * D + p) * 4)
+                let q_ip = deref_f32(Q.data, (i * D + p) * 4)
+                let dq_ip = deref_f32(dQ.data, (i * D + p) * 4)
+                let dk_jp = deref_f32(dK.data, (j * D + p) * 4)
+                write_f32(dQ.data, (i * D + p) * 4, dq_ip + dsij * k_jp)
+                write_f32(dK.data, (j * D + p) * 4, dk_jp + dsij * q_ip)
+                p = p + 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    tensor_free(dprobs)
+    return AttnBwd { dQ: dQ, dK: dK, dV: dV }
+}
+
+// ── Layer forward (1 transformer block) ───────────────────────────────
+struct LayerFwd {
+    norm1: Tensor,
+    Q: Tensor, K: Tensor, V: Tensor,
+    probs: Tensor,
+    ctx: Tensor,
+    attn_out: Tensor,
+    mid: Tensor,
+    norm2: Tensor,
+    up: Tensor,
+    act: Tensor,
+    ffn_out: Tensor,
+    y: Tensor
+}
+
+fn layer_fwd_t(
+    x: Tensor,
+    Wq: Tensor, Wk: Tensor, Wv: Tensor, Wo: Tensor,
+    Wff1: Tensor, Wff2: Tensor,
+    ga: Tensor, gf: Tensor
+) -> LayerFwd {
+    let norm1 = rms_norm_rows_t(x, ga, BENCH_EPS)
+    let Q = t_matmul(norm1, Wq)
+    let K = t_matmul(norm1, Wk)
+    let V = t_matmul(norm1, Wv)
+    let a = attn_fwd_t(Q, K, V)
+    let attn_out = t_matmul(a.out, Wo)
+    // mid = x + attn_out (out-of-place copy then add)
+    let mid = t_copy(x)
+    t_add_inplace(mid, attn_out)
+    let norm2 = rms_norm_rows_t(mid, gf, BENCH_EPS)
+    let up = t_matmul(norm2, Wff1)
+    let act = swiglu_self_t(up)
+    let ffn_out = t_matmul(act, Wff2)
+    let y = t_copy(mid)
+    t_add_inplace(y, ffn_out)
+    return LayerFwd {
+        norm1: norm1, Q: Q, K: K, V: V,
+        probs: a.probs, ctx: a.out, attn_out: attn_out,
+        mid: mid, norm2: norm2, up: up, act: act, ffn_out: ffn_out, y: y
+    }
+}
+
+// ── Layer backward ────────────────────────────────────────────────────
+struct LayerBwd {
+    dx: Tensor,
+    dWq: Tensor, dWk: Tensor, dWv: Tensor, dWo: Tensor,
+    dWff1: Tensor, dWff2: Tensor,
+    dga: Tensor, dgf: Tensor
+}
+
+// RMSNorm backward for a [SEQ, D] tensor:
+// y[i,p] = x[i,p] / r_i * g[p], where r_i = sqrt(mean(x[i,:]^2) + eps)
+// dx[i,p] = g[p]*dy[i,p]/r_i - x[i,p]*sum_q(x[i,q]*g[q]*dy[i,q]) / (r_i^3 * D)
+// dg[p] += sum_i x[i,p]*dy[i,p]/r_i
+struct RmsRowsBwd {
+    dx: Tensor,
+    dg: Tensor
+}
+
+fn rms_norm_rows_bwd_t(x: Tensor, g: Tensor, dy: Tensor, eps: float) -> RmsRowsBwd {
+    let S = x.d0
+    let D = x.d1
+    let dx = tensor_new2(S, D)
+    let dg = tensor_new1(D)
+    let mut i = 0
+    while i < S {
+        let mut ms = 0.0
+        let mut p = 0
+        while p < D {
+            let v = deref_f32(x.data, (i * D + p) * 4)
+            ms = ms + v * v
+            p = p + 1
+        }
+        ms = ms / to_float(D)
+        let r = sqrt(ms + eps)
+        let inv_r = 1.0 / r
+        let inv_r3 = inv_r * inv_r * inv_r
+        let mut coef = 0.0
+        p = 0
+        while p < D {
+            let v = deref_f32(x.data, (i * D + p) * 4)
+            let gp = deref_f32(g.data, p * 4)
+            let dyp = deref_f32(dy.data, (i * D + p) * 4)
+            coef = coef + v * gp * dyp
+            p = p + 1
+        }
+        p = 0
+        while p < D {
+            let v = deref_f32(x.data, (i * D + p) * 4)
+            let gp = deref_f32(g.data, p * 4)
+            let dyp = deref_f32(dy.data, (i * D + p) * 4)
+            let dxp = gp * dyp * inv_r - v * coef * inv_r3 / to_float(D)
+            write_f32(dx.data, (i * D + p) * 4, dxp)
+            let dgp_old = deref_f32(dg.data, p * 4)
+            write_f32(dg.data, p * 4, dgp_old + v * dyp * inv_r)
+            p = p + 1
+        }
+        i = i + 1
+    }
+    return RmsRowsBwd { dx: dx, dg: dg }
+}
+
+fn layer_bwd_t(
+    x: Tensor, fwd: LayerFwd,
+    Wq: Tensor, Wk: Tensor, Wv: Tensor, Wo: Tensor,
+    Wff1: Tensor, Wff2: Tensor,
+    ga: Tensor, gf: Tensor,
+    dy: Tensor
+) -> LayerBwd {
+    // y = mid + ffn_out → dy splits into dmid_res and dffn_out (both = dy).
+    let dmid_res = dy
+    let dffn_out = dy
+
+    // ffn_out = act * Wff2 → dact = dffn_out @ Wff2^T, dWff2 = act^T @ dffn_out
+    let dact = t_matmul_transB(dffn_out, Wff2, Wff2.d0)
+    let dWff2 = t_matmul_transA(fwd.act, dffn_out, Wff2.d0)
+
+    // act = swiglu_self(up) → dup = swiglu_self_bwd(up, dact)
+    let dup = swiglu_self_bwd_t(fwd.up, dact)
+
+    // up = norm2 * Wff1 → dnorm2 = dup @ Wff1^T, dWff1 = norm2^T @ dup
+    let dnorm2 = t_matmul_transB(dup, Wff1, Wff1.d0)
+    let dWff1 = t_matmul_transA(fwd.norm2, dup, Wff1.d0)
+
+    // norm2 = rms_norm(mid, gf)
+    let rg2 = rms_norm_rows_bwd_t(fwd.mid, gf, dnorm2, BENCH_EPS)
+    // dmid = dmid_res + rg2.dx
+    let dmid = t_copy(dmid_res)
+    t_add_inplace(dmid, rg2.dx)
+
+    // mid = x + attn_out → dx_res = dmid, dattn_out = dmid
+    let dx_res = dmid
+    let dattn_out = dmid
+
+    // attn_out = ctx * Wo → dctx = dattn_out @ Wo^T, dWo = ctx^T @ dattn_out
+    let dctx = t_matmul_transB(dattn_out, Wo, Wo.d0)
+    let dWo = t_matmul_transA(fwd.ctx, dattn_out, Wo.d0)
+
+    // Attention backward
+    let ab = attn_bwd_t(fwd.Q, fwd.K, fwd.V, fwd.probs, dctx)
+    let dQ = ab.dQ
+    let dK = ab.dK
+    let dV = ab.dV
+
+    // Q = norm1 * Wq → dnorm1_Q = dQ @ Wq^T, dWq = norm1^T @ dQ
+    let dn1_q = t_matmul_transB(dQ, Wq, Wq.d0)
+    let dWq = t_matmul_transA(fwd.norm1, dQ, Wq.d0)
+    let dn1_k = t_matmul_transB(dK, Wk, Wk.d0)
+    let dWk = t_matmul_transA(fwd.norm1, dK, Wk.d0)
+    let dn1_v = t_matmul_transB(dV, Wv, Wv.d0)
+    let dWv = t_matmul_transA(fwd.norm1, dV, Wv.d0)
+
+    // Sum three dnorm1 contributions.
+    let dnorm1 = t_copy(dn1_q)
+    t_add_inplace(dnorm1, dn1_k)
+    t_add_inplace(dnorm1, dn1_v)
+
+    // norm1 = rms_norm(x, ga)
+    let rg1 = rms_norm_rows_bwd_t(x, ga, dnorm1, BENCH_EPS)
+    // dx = dx_res + rg1.dx
+    let dx = t_copy(dx_res)
+    t_add_inplace(dx, rg1.dx)
+
+    return LayerBwd {
+        dx: dx,
+        dWq: dWq, dWk: dWk, dWv: dWv, dWo: dWo,
+        dWff1: dWff1, dWff2: dWff2,
+        dga: rg1.dg, dgf: rg2.dg
+    }
+}
+
+// ── SGD in-place: w[i] -= lr * g[i] ───────────────────────────────────
+fn sgd_inplace_t(w: Tensor, g: Tensor, lr: float) {
+    let mut i = 0
+    while i < w.numel {
+        let wi = deref_f32(w.data, i * 4)
+        let gi = deref_f32(g.data, i * 4)
+        write_f32(w.data, i * 4, wi - lr * gi)
+        i = i + 1
+    }
+}
+
+// ── PRNG for window sampling (parser-quirk-dodged) ────────────────────
+let mut RNG_STATE = 42
+fn next_rand(max_val: int) -> int {
+    let mut s = RNG_STATE * 1103515245 + 12345
+    s = s % 2147483647
+    let is_neg = s <= 0 - 1
+    if is_neg { s = 0 - s }
+    RNG_STATE = s
+    return s % max_val
+}
+
+fn current_lr(step: int) -> float {
+    let t = to_float(step) / to_float(BENCH_STEPS)
+    return BENCH_LR * (1.0 - 0.9 * t)
+}
+
+// ── Single training step (Tensor-backed) ──────────────────────────────
+// Returns [loss].
+fn train_step_t(step: int) -> float {
+    let max_start = BENCH_CORPUS_LEN - BENCH_SEQ - 1
+    let start = next_rand(max_start)
+    let mut tokens = []
+    let mut targets = []
+    let mut i = 0
+    while i < BENCH_SEQ {
+        tokens  = tokens.push(CORPUS[start + i])
+        targets = targets.push(CORPUS[start + i + 1])
+        i = i + 1
+    }
+
+    // Forward
+    let h0 = embed_lookup_t(tokens)
+    let f0 = layer_fwd_t(h0, L0_Wq, L0_Wk, L0_Wv, L0_Wo, L0_Wff1, L0_Wff2, L0_ga, L0_gf)
+    let f1 = layer_fwd_t(f0.y, L1_Wq, L1_Wk, L1_Wv, L1_Wo, L1_Wff1, L1_Wff2, L1_ga, L1_gf)
+    let mid_lmh = t_matmul(f1.y, lmh_U)          // [SEQ, RANK]
+    let logits  = t_matmul(mid_lmh, lmh_V)       // [SEQ, VOCAB]
+
+    // Loss + dlogits (cross-entropy, row-wise softmax then -log(row[t]))
+    let dlogits = tensor_new2(BENCH_SEQ, BENCH_VOCAB)
+    let scale = 1.0 / to_float(BENCH_SEQ)
+    let mut loss = 0.0
+    i = 0
+    while i < BENCH_SEQ {
+        // Find row max
+        let mut mx = deref_f32(logits.data, (i * BENCH_VOCAB + 0) * 4)
+        let mut j = 1
+        while j < BENCH_VOCAB {
+            let v = deref_f32(logits.data, (i * BENCH_VOCAB + j) * 4)
+            if v > mx { mx = v }
+            j = j + 1
+        }
+        // Sum exp
+        let mut sum_e = 0.0
+        j = 0
+        while j < BENCH_VOCAB {
+            let v = deref_f32(logits.data, (i * BENCH_VOCAB + j) * 4)
+            sum_e = sum_e + exp(v - mx)
+            j = j + 1
+        }
+        let log_sum = mx + log(sum_e)
+        let t = targets[i]
+        let v_t = deref_f32(logits.data, (i * BENCH_VOCAB + t) * 4)
+        loss = loss - (v_t - log_sum)
+        // dlogits[i,j] = softmax(row)[j] * scale, and - scale at target
+        j = 0
+        while j < BENCH_VOCAB {
+            let v = deref_f32(logits.data, (i * BENCH_VOCAB + j) * 4)
+            let p = exp(v - log_sum)
+            write_f32(dlogits.data, (i * BENCH_VOCAB + j) * 4, p * scale)
+            j = j + 1
+        }
+        let ot = deref_f32(dlogits.data, (i * BENCH_VOCAB + t) * 4)
+        write_f32(dlogits.data, (i * BENCH_VOCAB + t) * 4, ot - scale)
+        i = i + 1
+    }
+    loss = loss / to_float(BENCH_SEQ)
+
+    // Backward through lmh
+    // logits = mid_lmh * lmh_V → dmid_lmh = dlogits @ lmh_V^T, dlmh_V = mid_lmh^T @ dlogits
+    let dmid_lmh = t_matmul_transB(dlogits, lmh_V, lmh_V.d0)
+    let dlmh_V = t_matmul_transA(mid_lmh, dlogits, lmh_V.d0)
+    // mid_lmh = f1.y * lmh_U → df1y = dmid_lmh @ lmh_U^T, dlmh_U = f1.y^T @ dmid_lmh
+    let df1y = t_matmul_transB(dmid_lmh, lmh_U, lmh_U.d0)
+    let dlmh_U = t_matmul_transA(f1.y, dmid_lmh, lmh_U.d0)
+
+    // Layer 1 backward
+    let b1 = layer_bwd_t(
+        f0.y, f1,
+        L1_Wq, L1_Wk, L1_Wv, L1_Wo, L1_Wff1, L1_Wff2, L1_ga, L1_gf,
+        df1y
+    )
+    // Layer 0 backward
+    let b0 = layer_bwd_t(
+        h0, f0,
+        L0_Wq, L0_Wk, L0_Wv, L0_Wo, L0_Wff1, L0_Wff2, L0_ga, L0_gf,
+        b1.dx
+    )
+
+    // Embed scatter: dembed[t,p] += b0.dx[i,p] for each token at position i
+    let dembed = tensor_new2(BENCH_VOCAB, BENCH_D)
+    i = 0
+    while i < BENCH_SEQ {
+        let t = tokens[i]
+        let mut p = 0
+        while p < BENCH_D {
+            let old_e = deref_f32(dembed.data, (t * BENCH_D + p) * 4)
+            let add  = deref_f32(b0.dx.data, (i * BENCH_D + p) * 4)
+            write_f32(dembed.data, (t * BENCH_D + p) * 4, old_e + add)
+            p = p + 1
+        }
+        i = i + 1
+    }
+
+    // SGD
+    let lr = current_lr(step)
+    sgd_inplace_t(embed, dembed, lr)
+    sgd_inplace_t(L0_Wq,   b0.dWq,   lr)
+    sgd_inplace_t(L0_Wk,   b0.dWk,   lr)
+    sgd_inplace_t(L0_Wv,   b0.dWv,   lr)
+    sgd_inplace_t(L0_Wo,   b0.dWo,   lr)
+    sgd_inplace_t(L0_Wff1, b0.dWff1, lr)
+    sgd_inplace_t(L0_Wff2, b0.dWff2, lr)
+    sgd_inplace_t(L0_ga,   b0.dga,   lr)
+    sgd_inplace_t(L0_gf,   b0.dgf,   lr)
+    sgd_inplace_t(L1_Wq,   b1.dWq,   lr)
+    sgd_inplace_t(L1_Wk,   b1.dWk,   lr)
+    sgd_inplace_t(L1_Wv,   b1.dWv,   lr)
+    sgd_inplace_t(L1_Wo,   b1.dWo,   lr)
+    sgd_inplace_t(L1_Wff1, b1.dWff1, lr)
+    sgd_inplace_t(L1_Wff2, b1.dWff2, lr)
+    sgd_inplace_t(L1_ga,   b1.dga,   lr)
+    sgd_inplace_t(L1_gf,   b1.dgf,   lr)
+    sgd_inplace_t(lmh_U,   dlmh_U,   lr)
+    sgd_inplace_t(lmh_V,   dlmh_V,   lr)
+
+    // Free per-step intermediates
+    tensor_free(h0)
+    tensor_free(f0.norm1); tensor_free(f0.Q); tensor_free(f0.K); tensor_free(f0.V)
+    tensor_free(f0.probs); tensor_free(f0.ctx); tensor_free(f0.attn_out)
+    tensor_free(f0.mid); tensor_free(f0.norm2); tensor_free(f0.up)
+    tensor_free(f0.act); tensor_free(f0.ffn_out); tensor_free(f0.y)
+    tensor_free(f1.norm1); tensor_free(f1.Q); tensor_free(f1.K); tensor_free(f1.V)
+    tensor_free(f1.probs); tensor_free(f1.ctx); tensor_free(f1.attn_out)
+    tensor_free(f1.mid); tensor_free(f1.norm2); tensor_free(f1.up)
+    tensor_free(f1.act); tensor_free(f1.ffn_out); tensor_free(f1.y)
+    tensor_free(mid_lmh); tensor_free(logits); tensor_free(dlogits)
+    tensor_free(dmid_lmh); tensor_free(dlmh_V)
+    tensor_free(df1y); tensor_free(dlmh_U)
+    tensor_free(b1.dx)
+    tensor_free(b1.dWq); tensor_free(b1.dWk); tensor_free(b1.dWv); tensor_free(b1.dWo)
+    tensor_free(b1.dWff1); tensor_free(b1.dWff2); tensor_free(b1.dga); tensor_free(b1.dgf)
+    tensor_free(b0.dx)
+    tensor_free(b0.dWq); tensor_free(b0.dWk); tensor_free(b0.dWv); tensor_free(b0.dWo)
+    tensor_free(b0.dWff1); tensor_free(b0.dWff2); tensor_free(b0.dga); tensor_free(b0.dgf)
+    tensor_free(dembed)
+
+    return loss
+}
+
+// ── Driver ────────────────────────────────────────────────────────────
+fn main() {
+    println("=== bench_train_step_tensor.hexa (agent-a3c8f82a) ===")
+    let ver = hxblas_version()
+    println("hxblas ABI version=" + to_string(ver))
+    println("config: d=" + to_string(BENCH_D) + " ff=" + to_string(BENCH_FF)
+            + " nl=" + to_string(BENCH_NL) + " vocab=" + to_string(BENCH_VOCAB)
+            + " seq=" + to_string(BENCH_SEQ) + " rank=" + to_string(BENCH_RANK)
+            + " steps=" + to_string(BENCH_STEPS) + " lr=" + to_string(BENCH_LR))
+    println("baseline (list-backed, commit 18aaea50): " + to_string(BENCH_BASELINE_MS) + " ms/step")
+    println("")
+
+    init_all_params()
+
+    let mut STEP_MS = []
+    let mut STEP_LOSS = []
+    let mut step = 1
+    let mut loss_first = 0.0
+    let mut loss_final = 0.0
+    let mut any_nan = 0
+    let mut any_inf = 0
+
+    let t_all_0 = clock()
+    while step <= BENCH_STEPS {
+        let t_s = clock()
+        let l = train_step_t(step)
+        let t_e = clock()
+        let dt_ms = (t_e - t_s) * 1000.0
+        STEP_MS = STEP_MS.push(dt_ms)
+        STEP_LOSS = STEP_LOSS.push(l)
+        // NaN via self-compare
+        if l != l { any_nan = any_nan + 1 }
+        let is_big = l > 100.0
+        let is_small = l < 0.0 - 100.0
+        if is_big { any_inf = any_inf + 1 }
+        if is_small { any_inf = any_inf + 1 }
+        if step == 1 { loss_first = l }
+        loss_final = l
+        if step <= 10 {
+            println("step=" + to_string(step) + " loss=" + to_string(l) + " ms=" + to_string(dt_ms))
+        }
+        let is_log = step % BENCH_LOG_EVERY == 0
+        let is_after_10 = step > 10
+        if is_log {
+            if is_after_10 {
+                println("step=" + to_string(step) + " loss=" + to_string(l) + " ms=" + to_string(dt_ms))
+            }
+        }
+        step = step + 1
+    }
+    let t_all_1 = clock()
+    let total_s = t_all_1 - t_all_0
+
+    // Median, mean, p90 via bubble sort (N=100 trivial)
+    let n = len(STEP_MS)
+    let mut sorted = []
+    let mut si = 0
+    while si < n { sorted = sorted.push(STEP_MS[si]); si = si + 1 }
+    let mut a = 0
+    while a < n {
+        let mut b = 0
+        while b < n - 1 - a {
+            if sorted[b] > sorted[b + 1] {
+                let tmp = sorted[b]
+                sorted[b] = sorted[b + 1]
+                sorted[b + 1] = tmp
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    let med = sorted[n / 2]
+    let p90 = sorted[n * 9 / 10]
+    let mut sum = 0.0
+    let mut mi = 0
+    while mi < n { sum = sum + STEP_MS[mi]; mi = mi + 1 }
+    let mean = sum / to_float(n)
+    let speedup = BENCH_BASELINE_MS / med
+
+    println("")
+    println("=== summary ===")
+    println("steps_completed: " + to_string(BENCH_STEPS))
+    println("total_s: " + to_string(total_s))
+    println("loss_first: " + to_string(loss_first))
+    println("loss_final: " + to_string(loss_final))
+    println("loss_delta: " + to_string(loss_final - loss_first))
+    println("mean_ms: " + to_string(mean))
+    println("median_ms: " + to_string(med))
+    println("p90_ms: " + to_string(p90))
+    println("any_nan: " + to_string(any_nan))
+    println("any_inf: " + to_string(any_inf))
+    println("baseline_ms: " + to_string(BENCH_BASELINE_MS))
+    println("speedup_vs_baseline: " + to_string(speedup) + "x")
+
+    let loss_decreased = loss_final < loss_first
+    let stable = any_nan == 0 && any_inf == 0 && loss_decreased
+    if stable {
+        println("STABILITY: PASS")
+    } else {
+        println("STABILITY: FAIL")
+    }
+
+    // First-10 latency string
+    let mut first_10_str = "["
+    let mut k = 0
+    while k < 10 {
+        if k > 0 { first_10_str = first_10_str + ", " }
+        first_10_str = first_10_str + to_string(STEP_MS[k])
+        k = k + 1
+    }
+    first_10_str = first_10_str + "]"
+
+    // Loss trajectory (every 10)
+    let mut loss_traj_str = "["
+    k = 0
+    let mut first_entry = 1
+    while k < n {
+        let should_emit = k == 0 || (k + 1) % 10 == 0
+        if should_emit {
+            if first_entry == 0 { loss_traj_str = loss_traj_str + ", " }
+            loss_traj_str = loss_traj_str + to_string(STEP_LOSS[k])
+            first_entry = 0
+        }
+        k = k + 1
+    }
+    loss_traj_str = loss_traj_str + "]"
+
+    // Ceiling: ln(PERIOD=8) = 2.079441541 (uniform distribution entropy)
+    let ceiling = log(to_float(BENCH_PERIOD))
+    let loss_gap = loss_final - ceiling
+    let within_5pct = loss_gap < ceiling * 0.05 && loss_gap > 0.0 - ceiling * 0.05
+    let semantic_ok = if within_5pct { 1 } else { 0 }
+    println("ceiling_ln_period: " + to_string(ceiling))
+    println("loss_gap: " + to_string(loss_gap))
+    println("semantic_equiv (within 5% of ceiling): " + to_string(semantic_ok))
+
+    // Write deliverable JSON
+    let json = "{\n"
+        + "  \"timestamp\": \"2026-04-15\",\n"
+        + "  \"agent\": \"agent-a3c8f82a\",\n"
+        + "  \"benchmark\": \"bench_train_step_tensor.hexa\",\n"
+        + "  \"port_source\": \"training/nn_core.hexa (list-backed)\",\n"
+        + "  \"tensor_primitive\": \"self/ml/tensor.hexa (commit 431a968)\",\n"
+        + "  \"blas_backend\": \"hxblas_sgemm → cblas_sgemm (Accelerate)\",\n"
+        + "  \"config\": {\"d\": " + to_string(BENCH_D) + ", \"ff\": " + to_string(BENCH_FF)
+        + ", \"nl\": " + to_string(BENCH_NL) + ", \"vocab\": " + to_string(BENCH_VOCAB)
+        + ", \"seq\": " + to_string(BENCH_SEQ) + ", \"rank\": " + to_string(BENCH_RANK)
+        + ", \"steps\": " + to_string(BENCH_STEPS) + ", \"lr\": " + to_string(BENCH_LR) + "},\n"
+        + "  \"steps_completed\": " + to_string(BENCH_STEPS) + ",\n"
+        + "  \"total_s\": " + to_string(total_s) + ",\n"
+        + "  \"first_10_step_ms\": " + first_10_str + ",\n"
+        + "  \"loss_trajectory\": " + loss_traj_str + ",\n"
+        + "  \"mean_step_ms\": " + to_string(mean) + ",\n"
+        + "  \"median_step_ms\": " + to_string(med) + ",\n"
+        + "  \"p90_step_ms\": " + to_string(p90) + ",\n"
+        + "  \"baseline_ms\": " + to_string(BENCH_BASELINE_MS) + ",\n"
+        + "  \"speedup_vs_baseline\": " + to_string(speedup) + ",\n"
+        + "  \"loss_first\": " + to_string(loss_first) + ",\n"
+        + "  \"loss_final\": " + to_string(loss_final) + ",\n"
+        + "  \"loss_delta\": " + to_string(loss_final - loss_first) + ",\n"
+        + "  \"ceiling_ln_period\": " + to_string(ceiling) + ",\n"
+        + "  \"loss_gap_from_ceiling\": " + to_string(loss_gap) + ",\n"
+        + "  \"semantic_equiv_within_5pct\": " + to_string(semantic_ok) + ",\n"
+        + "  \"any_nan\": " + to_string(any_nan) + ",\n"
+        + "  \"any_inf\": " + to_string(any_inf) + ",\n"
+        + "  \"stable\": " + (if stable { "1" } else { "0" }) + "\n"
+        + "}\n"
+
+    let _wr = write_file("shared/state/clm_nn_core_tensor_port_20260415.json", json)
+    println("")
+    println("wrote: shared/state/clm_nn_core_tensor_port_20260415.json")
+    println("DONE")
+}
+
+// Note: hexa auto-invokes main(), no explicit call at tail.
