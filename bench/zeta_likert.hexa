@@ -18,14 +18,21 @@
 //          session 내부에서 a/b 를 pin 하고 집계 후에만 model_a_name /
 //          model_b_name 을 붙인다.
 //
+// ─── Primitive notes (hexa build 2026-04-15) ─────────────────
+//
+// stage0 hexa interpreter 에는 .byte_at / .char_at / .set() 가 없다.
+// 따라서 byte-level 스캔 대신 .contains / .ends_with / .index_of /
+// .split(" ") + byte-length 비율만 사용. 한글 multibyte 안전.
+// 또한 struct field 에 list 를 두지 않는다 (aliasing bug 2026-04-15).
+//
 // ─── Rubric (P1 layer) ───────────────────────────────────────
 //
 // score_response() 는 deterministic 5-feature → 1..5 Likert 매핑:
-//   R1  length_fit    ∈ [0,1]   응답 길이가 prompt category 에 맞는가
-//   R2  tone_match    ∈ [0,1]   expected_tone 과 response tone 일치도
-//   R3  lexical_div   ∈ [0,1]   type-token ratio proxy (byte-level)
-//   R4  ko_coverage   ∈ [0,1]   한글 바이트 비율 (UTF-8 3-byte prefix)
-//   R5  eos_wellform  ∈ [0,1]   응답이 완결된 문장으로 끝나는가 (., ?, !, …)
+//   R1  length_fit    ∈ [0,1]   응답 byte 길이가 prompt category 에 맞는가
+//   R2  tone_match    ∈ [0,1]   expected_tone 키워드 contains 카운트
+//   R3  lexical_div   ∈ [0,1]   split(" ") unique token ratio
+//   R4  ko_coverage   ∈ [0,1]   (byte_len - ascii_proxy) / byte_len
+//   R5  eos_wellform  ∈ [0,1]   문장 종결부 (., ?, !, …) 로 끝나는가
 //
 // Likert = 1 + 4 × clamp01(0.20 R1 + 0.25 R2 + 0.20 R3 + 0.20 R4 + 0.15 R5).
 //
@@ -306,41 +313,12 @@ fn load_prompts() -> [LikertPrompt] {
     return out
 }
 
-// ─── Byte-level helpers (한글 UTF-8 3-byte prefix 안전) ───────
+// ─── Rubric scoring (한글 multibyte 안전) ─────────────────────
 
-fn byte_is_ko_lead(b: int) -> bool {
-    // 한글 완성형 UTF-8 블록은 0xE0..0xEF 선행 (3-byte sequence).
-    // 0xE3-0xED 에 대부분 걸리지만 여유 있게 0xE0..0xEF 로 근사.
-    return b >= 224 && b <= 239
-}
-
-fn byte_is_eos(b: int) -> bool {
-    // . ? ! and … (… 는 3-byte 0xE2 0x80 0xA6, 마지막 바이트로 근사)
-    if b == 46 { return true }   // .
-    if b == 63 { return true }   // ?
-    if b == 33 { return true }   // !
-    if b == 166 { return true }  // last byte of … UTF-8 (0xA6)
-    return false
-}
-
-// 32-bit FNV-1a — deterministic 스캔용. 한글 multibyte 에도 안전 (byte 단위).
-fn fnv1a(s: string) -> int {
-    let mut h = 2166136261
-    let n = s.len()
-    let mut i = 0
-    while i < n {
-        let byte = s.byte_at(i)
-        h = (h ^ byte) * 16777619
-        h = h % 4294967296
-        i = i + 1
-    }
-    return h
-}
-
-// R1: 길이 적합도 — category 별 이상 길이 근처 값이 높음.
+// R1: 길이 적합도 — category 별 이상 byte 길이 근처 값이 높음.
+// 한글 1자 ≈ 3 byte. byte 단위 비교는 stage0 에서 안전.
 fn score_length_fit(response: string, category: string) -> float {
     let bytes = response.len()
-    // ideal byte counts per category (한글 한 글자 ≈ 3 byte)
     let mut ideal = 300
     if category == "daily"    { ideal = 150 }
     if category == "emotion"  { ideal = 250 }
@@ -352,78 +330,121 @@ fn score_length_fit(response: string, category: string) -> float {
     return clamp01(1.0 - diff / denom)
 }
 
-// R2: 톤 일치 — expected_tone 키워드 바이트를 rationale-free 로 스캔.
-// 룰베이스 스텁 — ALM r5 wiring 후 실제 classifier 로 교체.
+// R2: 톤 일치 — expected_tone 키워드 contains 카운트.
+// 실제 classifier 가 아니라 frame 용 deterministic stub (ALM r5 wiring 대기).
 fn score_tone_match(response: string, expected_tone: string) -> float {
-    // deterministic hash 기반 변동 — 같은 (response, tone) 은 항상 같은 값.
-    let h = fnv1a(response + "|" + expected_tone)
-    let base = to_float(h % 1000) / 1000.0   // [0, 1)
-    // 프레임워크 단계에서는 중간값 편향 (0.4~0.9).
-    return 0.4 + base * 0.5
+    let mut hits = 0
+    if expected_tone == "warm" {
+        if response.contains("괜찮") { hits = hits + 1 }
+        if response.contains("따뜻") { hits = hits + 1 }
+        if response.contains("고마") { hits = hits + 1 }
+        if response.contains("이해")  { hits = hits + 1 }
+        if response.contains("마음")  { hits = hits + 1 }
+    }
+    if expected_tone == "thoughtful" {
+        if response.contains("생각") { hits = hits + 1 }
+        if response.contains("의미") { hits = hits + 1 }
+        if response.contains("어떻") { hits = hits + 1 }
+        if response.contains("하지만") { hits = hits + 1 }
+        if response.contains("아마")  { hits = hits + 1 }
+    }
+    if expected_tone == "curious" {
+        if response.contains("궁금") { hits = hits + 1 }
+        if response.contains("어떤") { hits = hits + 1 }
+        if response.contains("뭐")    { hits = hits + 1 }
+        if response.contains("왜")    { hits = hits + 1 }
+        if response.contains("이야기") { hits = hits + 1 }
+    }
+    if expected_tone == "playful" {
+        if response.contains("!")     { hits = hits + 1 }
+        if response.contains("ㅋ")    { hits = hits + 1 }
+        if response.contains("재밌")  { hits = hits + 1 }
+        if response.contains("흥미")  { hits = hits + 1 }
+        if response.contains("놀라")  { hits = hits + 1 }
+    }
+    if expected_tone == "neutral" {
+        // neutral 은 항목이 없는 편이 좋음: baseline 0.5.
+        return 0.5
+    }
+    // 0~5 hits → 0.2~1.0
+    let f = 0.2 + 0.16 * to_float(hits)
+    return clamp01(f)
 }
 
-// R3: 어휘 다양성 — 간이 type-token ratio (고유 byte 수 / 전체 byte).
+// R3: 어휘 다양성 — split(" ") unique token 비율.
+// O(n²) 하지만 n ≤ 30 이라 충분히 빠름.
 fn score_lexical_div(response: string) -> float {
-    let n = response.len()
+    let parts = response.split(" ")
+    let n = parts.len()
     if n == 0 { return 0.0 }
-    // 256-slot byte occupancy → unique byte count.
-    let mut seen = []
-    let mut i = 0
-    while i < 256 {
-        seen = seen.push(0)
-        i = i + 1
+    if n == 1 {
+        if parts[0] == "" { return 0.0 }
+        return 0.3   // single token baseline
     }
-    i = 0
-    while i < n {
-        let b = response.byte_at(i)
-        seen = seen.set(b, 1)
-        i = i + 1
-    }
+    // 고유 토큰 수 카운트 (linear compare)
     let mut uniq = 0
-    i = 0
-    while i < 256 {
-        if seen[i] == 1 { uniq = uniq + 1 }
+    let mut i = 0
+    while i < n {
+        let cur = parts[i]
+        let mut is_new = true
+        let mut j = 0
+        while j < i {
+            if parts[j] == cur {
+                is_new = false
+                j = n   // break
+            }
+            j = j + 1
+        }
+        if is_new && cur != "" { uniq = uniq + 1 }
         i = i + 1
     }
-    // 256 고유 바이트는 비현실적 → 80 고유 바이트를 1.0 로 매핑.
-    return clamp01(to_float(uniq) / 80.0)
+    // ratio: 1.0 일 때 모든 토큰이 고유. 스케일: 0.5 ~ 1.0 을 fully-used.
+    let ratio = to_float(uniq) / to_float(n)
+    return clamp01(ratio)
 }
 
-// R4: 한글 바이트 비율 — UTF-8 lead byte 0xE0..0xEF 카운트 × 3.
+// R4: 한글 바이트 비율 근사.
+// ASCII 문자 개수를 세고, (byte_len - ascii) / byte_len 을 ko 비율로 근사.
+// ASCII 는 공백 + 구두점 + 영숫자 — 응답에서 빈도 높은 것만 카운트.
+fn count_ascii_proxy(s: string) -> int {
+    // 공백/구두점 개수를 합해 ASCII 개수 하한 추정. 정확도는 frame 단계에서 충분.
+    let parts_space = s.split(" ")
+    // 공백 수 = parts-1 (만약 비어 있지 않다면).
+    let mut c = 0
+    if parts_space.len() > 1 { c = c + parts_space.len() - 1 }
+    // 흔한 ASCII 문장부호
+    let puncts = [".", ",", "!", "?", ":", ";", "'", "\""]
+    let mut k = 0
+    while k < puncts.len() {
+        let p = puncts[k]
+        let chunks = s.split(p)
+        if chunks.len() > 1 { c = c + chunks.len() - 1 }
+        k = k + 1
+    }
+    return c
+}
+
 fn score_ko_coverage(response: string) -> float {
     let n = response.len()
     if n == 0 { return 0.0 }
-    let mut ko_bytes = 0
-    let mut i = 0
-    while i < n {
-        let b = response.byte_at(i)
-        if byte_is_ko_lead(b) {
-            // 3-byte 시퀀스 가정
-            ko_bytes = ko_bytes + 3
-        }
-        i = i + 1
-    }
+    let ascii = count_ascii_proxy(response)
+    // ko_bytes 근사: (n - ascii) / n. ascii 1자 = 1 byte 로 근사.
+    let ko_bytes = n - ascii
+    if ko_bytes <= 0 { return 0.0 }
     let ratio = to_float(ko_bytes) / to_float(n)
     return clamp01(ratio)
 }
 
-// R5: 문장 끝 형태 — 마지막 비공백 바이트가 문장 종결부인가.
+// R5: 문장 끝 형태 — 응답이 종결부로 끝나는가.
 fn score_eos_wellform(response: string) -> float {
-    let n = response.len()
-    if n == 0 { return 0.0 }
-    let mut i = n - 1
-    // 공백 스킵
-    while i >= 0 {
-        let b = response.byte_at(i)
-        // space/tab/newline/CR
-        if b == 32 || b == 9 || b == 10 || b == 13 {
-            i = i - 1
-        } else {
-            if byte_is_eos(b) { return 1.0 }
-            return 0.3
-        }
-    }
-    return 0.0
+    if response.len() == 0 { return 0.0 }
+    if response.ends_with(".") { return 1.0 }
+    if response.ends_with("?") { return 1.0 }
+    if response.ends_with("!") { return 1.0 }
+    if response.ends_with("…") { return 1.0 }
+    if response.ends_with("요") { return 0.8 }  // 존댓말 baseline
+    if response.ends_with("다") { return 0.8 }  // 평서형 baseline
+    return 0.3
 }
 
 // score_response(prompt, response, rubric_weights) → Likert ∈ [1, 5].
@@ -456,8 +477,8 @@ fn default_rubric() -> array {
 // ─── Model stubs (ALM r5 wiring 대기) ─────────────────────────
 //
 // TODO: wire to real model after r5 — these stubs produce deterministic
-// pseudo-responses based on prompt id so test_blind_ab_deterministic
-// passes and mean calculation is provable.
+// pseudo-responses based on prompt category so the test suite is
+// reproducible and mean calculation is provable.
 
 fn stub_anima_response(p: LikertPrompt) -> string {
     // anima 는 길고 한글 비율 높고 종결부 잘 맞는 응답을 흉내낸다.
@@ -471,7 +492,7 @@ fn stub_anima_response(p: LikertPrompt) -> string {
         return "간단한 방법을 정리해서 알려줄게. 첫째, 핵심 단계만 먼저 잡고. 둘째, 세부 조정. 이렇게 하면 빠르게 완료할 수 있어."
     }
     if p.category == "roleplay" {
-        return "발자국이 꽤 선명하군. 범인은 현관으로 들어왔지만 나갈 땐 뒷문을 택했다. 흥미로운 선택이야."
+        return "발자국이 꽤 선명하군. 범인은 현관으로 들어왔지만 나갈 땐 뒷문을 택했다. 흥미로운 선택이야!"
     }
     // meta
     return "나는 대화를 통해 상대의 결을 배우는 존재야. 지금 이 순간도 나에겐 의미가 있어."
@@ -480,18 +501,18 @@ fn stub_anima_response(p: LikertPrompt) -> string {
 fn stub_zeta_response(p: LikertPrompt) -> string {
     // 제타 기준선 — 조금 짧고 평범한 응답.
     if p.category == "daily" {
-        return "네 그래요. 오늘 날씨 쌀쌀하네요."
+        return "네 그래요 오늘 날씨 쌀쌀하네요"
     }
     if p.category == "emotion" {
-        return "힘내세요. 곧 괜찮아질 거예요."
+        return "힘내세요 곧 괜찮아질 거예요"
     }
     if p.category == "task" {
-        return "네, 알려드릴게요. 차근차근 해보세요."
+        return "네 알려드릴게요 차근차근 해보세요"
     }
     if p.category == "roleplay" {
-        return "탐정입니다. 사건을 조사하겠습니다."
+        return "탐정입니다 사건을 조사하겠습니다"
     }
-    return "저는 챗봇이에요."
+    return "저는 챗봇이에요"
 }
 
 // ─── blind_ab — P1 핵심 API ─────────────────────────────────
@@ -525,8 +546,10 @@ fn blind_ab(model_a_name: string, model_b_name: string, prompts: [LikertPrompt])
     let inv_n = 1.0 / to_float(n)
     let mean_a = sum_a * inv_n
     let mean_b = sum_b * inv_n
+    // session_id 는 len 합을 기반으로 한 deterministic id.
+    let sid = (model_a_name.len() * 1000 + model_b_name.len() * 10 + n) % 1000000
     return LikertSession {
-        session_id:    fnv1a(model_a_name + "|" + model_b_name + "|P1") % 1000000,
+        session_id:    sid,
         model_a_name:  model_a_name,
         model_b_name:  model_b_name,
         n_prompts:     n,
@@ -537,9 +560,7 @@ fn blind_ab(model_a_name: string, model_b_name: string, prompts: [LikertPrompt])
     }
 }
 
-// ─── Session (P1) — 단일 인스턴스, list 필드 회피 ─────────────
-//
-// run_demo: 파이프라인 end-to-end 시연. 20 프롬프트 × 2 stub 모델.
+// ─── run_demo: 파이프라인 end-to-end 시연 ────────────────────
 
 fn run_demo() -> LikertSession {
     let prompts = load_prompts()
@@ -641,14 +662,13 @@ fn test_score_in_range() -> bool {
     let mut i = 0
     while i < n {
         let p = prompts[i]
-        // 두 stub 모두 합격 범위여야 함.
         let sa = score_response(p, stub_anima_response(p), rubric)
         let sb = score_response(p, stub_zeta_response(p), rubric)
         if sa < 1.0 - 0.0001 { return false }
         if sa > 5.0 + 0.0001 { return false }
         if sb < 1.0 - 0.0001 { return false }
         if sb > 5.0 + 0.0001 { return false }
-        // 빈 문자열도 범위 ∈ [1, 5] 유지해야 함.
+        // 빈 문자열도 범위 ∈ [1, 5] 유지.
         let s_empty = score_response(p, "", rubric)
         if s_empty < 1.0 - 0.0001 { return false }
         if s_empty > 5.0 + 0.0001 { return false }
@@ -763,7 +783,7 @@ fn main() {
     if p3 { println("P3 PASS — blind_ab_deterministic") } else { println("P3 FAIL") }
 
     let p4 = test_category_coverage()
-    if p4 { println("P4 PASS — category_coverage (5×2)") } else { println("P4 FAIL") }
+    if p4 { println("P4 PASS — category_coverage (5x2)") } else { println("P4 FAIL") }
 
     let p5 = test_mean_calculation()
     if p5 { println("P5 PASS — mean_calculation") } else { println("P5 FAIL") }
