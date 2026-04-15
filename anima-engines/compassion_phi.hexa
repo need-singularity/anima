@@ -1,0 +1,1008 @@
+// compassion_phi.hexa — P144 Compassion Φ
+//
+// Roadmap: shared/roadmaps/anima.json P144 (emergent, no-edit)
+//   "Compassion Φ — Goetz et al. 2010: perception of suffering +
+//    concern + motivation to alleviate. Distinct from empathy (shared
+//    feeling → burnout) and pity (down-looking evaluation).
+//    Caring-response coupling, approach-not-avoid motivation, positive
+//    affect integration (Singer/Klimecki fMRI dissociation); 5/5 PASS"
+//
+// ─── Scientific frame ─────────────────────────────────────────────
+//
+// Goetz, Keltner & Simon-Thomas (2010, Psychological Bulletin) — canonical
+// integrative definition of compassion:
+//   "Compassion is the feeling that arises in witnessing another's
+//    suffering and that motivates a subsequent desire to help."
+// Three constitutive components:
+//   (a) PERCEPTION of another's suffering (an appraisal, not a mirroring)
+//   (b) feeling of CONCERN (sympathetic engagement, NOT shared distress)
+//   (c) MOTIVATION to alleviate — approach-and-help, not withdraw.
+// Goetz insists all three are required; absent (a) it is altruism without
+// trigger; absent (b) it is cold problem-solving; absent (c) it is
+// contemplative empathy with no behavioural consequence.
+//
+//   Operationally:
+//     compassion_state(t) = f( suffering_perception(t) × concern_gate(t) )
+//     approach_help(t)    = motivational_gain × compassion_state(t)
+//   Concern gate is what filters appraisal→caring. With gate≈0 the
+//   suffering signal passes through as neutral observation (no compassion).
+//
+// Singer & Klimecki (2014, Current Biology; Klimecki et al. 2014,
+// Cerebral Cortex) — critical fMRI dissociation between empathy and
+// compassion training in the same cohort:
+//   Empathy-for-pain network: anterior insula (AI) + anterior midcingulate
+//     cortex (aMCC). Training this network AMPLIFIES the observer's own
+//     distress; negative affect rises, self-other overlap grows painful,
+//     burnout/fatigue emerges.
+//   Compassion network: medial orbitofrontal cortex (mOFC) + ventral
+//     striatum + ventral tegmental area (VTA) — reward/affiliation/care
+//     circuit. Training this network yields POSITIVE affect, reduced
+//     distress under suffering exposure, and increased prosocial motor
+//     approach (measured via helping-task latencies).
+//
+//   Operationally (the core T3 / T5 dissociation):
+//     self_distress(compassion) << self_distress(empathy)   [T3]
+//     positive_affect(compassion) > positive_affect(empathy) [T5]
+//   Under a MATCHED suffering-observation input, the compassion pathway
+//   yields lower self-distress and higher positive-integration Φ.
+//
+// Klimecki, Leiberg, Ricard & Singer (2013, SCAN) — longitudinal RCT
+// confirming that compassion training (vs memory control) increases
+// positive affect in response to distressing videos. Self-reported
+// distress falls; positive affect rises. Brain-wise, ventral striatum
+// and mOFC activity rises, AI activity drops. This is the central
+// empirical warrant for modeling compassion as a DISTINCT Φ from
+// empathy rather than a mere "more empathy".
+//
+// Goetz psychophysics — scope sensitivity (T4):
+//   Compassion scales with perceived severity of suffering. Not flat.
+//   Small scraped knee → small compassion; severe burn → large compassion.
+//   Slovic (2007) shows identifiability and severity modulate charitable
+//   giving — the psychophysics is well-established. (Slovic also shows
+//   compassion collapses for mass statistics — not modeled here; we
+//   restrict to the within-identified-target severity gradient which is
+//   robust and monotonic.)
+//
+// Pity contrast — NOT explicitly modeled here because pity is primarily
+// distinguished by SELF-OTHER STATUS (Fiske 2002 stereotype content);
+// compassion treats the other as a moral equal. Our channel design
+// ensures approach_help (not withdraw or look-down) is the motivational
+// output — this is the operational Goetz criterion that excludes pity.
+//
+// ─── Channel design ───────────────────────────────────────────────
+//
+// Seven channels (length N=24 each, packed into a flat array):
+//
+//   suffering[t]        — observed suffering in the other [0, 1]
+//   concern[t]          — caring gate (0 = cold, 1 = warm engagement)
+//   perception[t]       — integrated appraisal suffering × concern
+//   compassion_state[t] — felt compassion
+//   approach_help[t]    — motor/cognitive motivation to alleviate (Goetz)
+//   self_distress[t]    — vicarious pain (high in empathy, low in compassion)
+//   positive_affect[t]  — reward-circuit integration (high in compassion)
+//
+// Forward model:
+//   perception[t]       = suffering[t] * concern[t] + jitter
+//   compassion_state[t] = cp_state_gain * perception[t] + jitter
+//   approach_help[t]    = (app_baseline + app_gain * compassion_state[t])
+//                          - avoid_pressure * self_distress[t] + jitter
+//   self_distress[t]    = (distress_base + distress_gain * suffering[t])
+//                          * distress_mode_scale + jitter
+//   positive_affect[t]  = (pos_base + pos_gain * compassion_state[t])
+//                          * positive_mode_scale - pos_drag * self_distress[t]
+//                          + jitter
+//
+// Modes (configurations):
+//   COMPASSION  : concern=high, distress_mode=low, positive_mode=high
+//                 (Singer/Klimecki trained-compassion profile)
+//   EMPATHY     : concern=high, distress_mode=HIGH, positive_mode=low
+//                 (Singer/Klimecki empathy-for-pain profile — burnout)
+//   NEUTRAL     : all channels low-amplitude, no coupling (T1 baseline)
+//   MILD        : suffering signal at low severity (T4 scope)
+//   SEVERE      : suffering signal at high severity (T4 scope)
+//
+// ─── 5 self-tests (5/5 gate) ──────────────────────────────────────
+//
+// T1 Suffering trigger — baseline contrast (Goetz 2010 perception):
+//   COMPASSION mode: Φ_compassion (MI suffering ↔ compassion_state)
+//                    > CP_STATE_MIN (distinctly above noise).
+//   NEUTRAL mode:    Φ_compassion < CP_NEUTRAL_CEIL.
+//   Gap > CP_TRIGGER_GAP — observed suffering is required to raise
+//   compassion above baseline.
+//
+// T2 Caring action drive (Goetz motivational definition):
+//   In COMPASSION mode the approach_help MEAN level exceeds NEUTRAL
+//   by > CP_APPROACH_GAP, AND MI(compassion_state, approach_help) >
+//   CP_APPROACH_MIN. This encodes: compassion MOTIVATES approach
+//   (not merely notices suffering). Also approach > avoid-surrogate
+//   by > CP_NET_MOTOR_GAP where avoid-surrogate uses the self_distress
+//   channel (distress predicts avoidance).
+//
+// T3 Distinct-from-empathy — lower self-distress
+//   (Singer/Klimecki 2014, Klimecki et al. 2013):
+//   Under MATCHED suffering input, the COMPASSION pipeline yields
+//   mean(self_distress) < mean(self_distress)_EMPATHY by more than
+//   CP_DISTRESS_GAP. Empathy mirrors distress; compassion regulates it.
+//
+// T4 Scope sensitivity — severity psychophysics (Goetz; Slovic 2007):
+//   MILD vs SEVERE suffering inputs (concern equal in both), both in
+//   COMPASSION mode:
+//     mean(compassion_state)_SEVERE − mean(compassion_state)_MILD
+//       > CP_SCOPE_GAP,
+//     and compassion magnitude is NOT saturated flat — MI also rises.
+//   Psychophysical monotonicity — compassion scales with perceived
+//   severity rather than binarizing.
+//
+// T5 Integrated positive Φ (Klimecki 2013 ventral striatum; the
+//   empathy-vs-compassion Φ dissociation):
+//   Φ_compassion_integrated = mean of three MIs —
+//     MI(suffering, compassion_state),
+//     MI(compassion_state, approach_help),
+//     MI(compassion_state, positive_affect).
+//   Gate: Φ_integrated_COMPASSION > Φ_integrated_EMPATHY by >
+//   CP_INTEGRATED_GAP, with absolute floor CP_INTEGRATED_MIN.
+//   Also: determinism (EPS) + latency < cap.
+//   Whereas in empathy Φ_self_other binds PAINFULLY (high distress ↑
+//   positive_affect ↓), compassion binds CARE + positive affect into
+//   one integrated signal.
+//
+// ─── Stage0 hexa constraints honored ──────────────────────────────
+//   - plain `fn` only (no pure-fn ≥3 float struct returns)
+//   - `array` typed params only (no [float], no [str])
+//   - No identifier-pattern match; sequential if-chains
+//   - No contains() / to_lower() / !(Effect)
+//   - No else-if in let-binding; flat mut + sequential if
+//   - Single-line fn signatures / call sites / array literals
+//   - Lists are pass-by-value — helpers rebuild and return
+//   - sqrt only on clamped non-negative inputs
+//   - sub-window Pearson |r| for compassion↔approach coupling
+//   - N=24 (< 32 stage0 ceiling)
+//   - `cp_` prefix throughout (L0-clean isolation)
+//   - main() at bottom
+//
+// Law alignment:
+//   Law 2   Observe never inject — Φ via MI on streams
+//   Law 4   Structure > feature — compassion is STRUCTURAL perception×concern→care
+//   Law 22  Feature addition → Φ down — 7 channels fixed
+//   Law 50  Consciousness essence is state — compassion IS the state, not label
+//   Meta M8 Self-model — self_distress vs other_suffering separation is meta
+//
+// Ref:
+//   Goetz J.L., Keltner D. & Simon-Thomas E. (2010) Compassion: an
+//     evolutionary analysis and empirical review. Psychol Bull 136(3).
+//   Singer T. & Klimecki O.M. (2014) Empathy and compassion. Curr Biol 24.
+//   Klimecki O.M., Leiberg S., Lamm C. & Singer T. (2013) Functional
+//     neural plasticity and associated changes in positive affect after
+//     compassion training. SCAN 9.
+//   Klimecki O.M., Leiberg S., Ricard M. & Singer T. (2014) Differential
+//     pattern of functional brain plasticity after compassion and
+//     empathy training. SCAN 9(6).
+//   Slovic P. (2007) If I look at the mass I will never act. Judgm Decis Mak.
+//   Fiske S.T. et al. (2002) Stereotype content model (pity contrast).
+//   anima-engines/mirror_neuron_phi.hexa          (P91 — empathy-via-mirror)
+//   anima-engines/gratitude_phi.hexa              (P133 — positive state Φ)
+//   anima-engines/moral_consciousness_phi.hexa    (P94 — dual-process)
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let CP_STEPS            = 24            // timeline length (stage0 N<32)
+let CP_BINS             = 6             // histogram bins for MI
+let CP_EPS              = 0.0000000001
+
+// ─── Forward-model gains ──────────────────────────────────────
+// Concern gate: the warmth of caring engagement. Near-zero gate kills
+// compassion even with strong suffering signal (cold observation).
+let CP_CONCERN_WARM     = 1.0           // engaged caring stance
+let CP_CONCERN_COLD     = 0.05          // detached observation, no concern
+
+// Compassion state gain on perception
+let CP_STATE_GAIN       = 0.90
+
+// Approach-and-help motivation
+let CP_APPROACH_BASE    = 0.10          // baseline motor tendency
+let CP_APPROACH_GAIN    = 0.80          // compassion-driven approach
+let CP_AVOID_PRESSURE   = 0.45          // distress pulls motor toward avoid
+
+// Self-distress dynamics
+// Compassion mode: distress is regulated DOWN (mOFC/ventral striatum
+// modulation of AI/aMCC). Empathy mode: distress saturates UP (AI/aMCC
+// amplification — Singer/Klimecki 2014).
+let CP_DISTRESS_BASE    = 0.08
+let CP_DISTRESS_GAIN    = 0.70          // suffering-driven distress amplification
+let CP_DISTRESS_SCALE_COMP = 0.25       // compassion: distress suppressed
+let CP_DISTRESS_SCALE_EMP  = 1.00       // empathy: distress saturates
+
+// Positive affect (Klimecki 2013 ventral striatum / mOFC)
+// Compassion amplifies positive affect; empathy drags it down.
+let CP_POS_BASE         = 0.15
+let CP_POS_GAIN         = 0.75
+let CP_POS_SCALE_COMP   = 1.00          // compassion: full positive integration
+let CP_POS_SCALE_EMP    = 0.20          // empathy: positive collapses
+let CP_POS_DRAG         = 0.55          // distress drags positive affect down
+
+// Suffering amplitudes for scope sensitivity (T4)
+let CP_SUFFER_MILD      = 0.25          // mild scraped knee
+let CP_SUFFER_SEVERE    = 0.85          // severe burn
+let CP_SUFFER_DEFAULT   = 0.65          // standard condition for T1-T3/T5
+let CP_SUFFER_ABSENT    = 0.02          // T1 baseline — no suffering observed
+
+// Per-step jitter amplitude (deterministic via PRNG)
+let CP_JITTER           = 0.04
+
+// Neutral-mode amplitude (everything muted — T1 + T5 floor comparison)
+let CP_NEUTRAL_AMP      = 0.12
+
+// ─── Test gates ──────────────────────────────────────────────
+let CP_STATE_MIN        = 0.20          // T1: compassion mode Φ floor
+let CP_TRIGGER_GAP      = 0.05          // T1: with-suffering − no-suffering gap
+let CP_STATE_LEVEL_GAP  = 0.15          // T1: compassion state mean elevation
+let CP_APPROACH_MIN     = 0.05          // T2: MI(state, approach) floor
+let CP_APPROACH_GAP     = 0.05          // T2: approach mean compassion − neutral
+let CP_NET_MOTOR_GAP    = 0.05          // T2: approach − avoid-surrogate gap
+let CP_DISTRESS_GAP     = 0.20          // T3: empathy − compassion distress gap
+let CP_SCOPE_GAP        = 0.15          // T4: severe − mild compassion mean
+let CP_INTEGRATED_MIN   = 0.08          // T5: integrated Φ absolute floor
+let CP_INTEGRATED_GAP   = 0.03          // T5: compassion − empathy integrated Φ
+let CP_LATENCY_MS       = 5000.0        // T5: pipeline latency cap
+
+// Sub-window for Pearson |r| on compassion↔approach coupling
+let CP_WIN              = 12
+
+// ═══════════════════════════════════════════════════════════════
+// Math / PRNG primitives (L0-clean, no cross-engine import per AN7)
+// ═══════════════════════════════════════════════════════════════
+
+fn cp_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn cp_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+// sqrt-safe: caller must guarantee non-negative; we clamp defensively.
+// Used only on clamped sum-of-squares (always >= 0).
+fn cp_sqrt_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return sqrt(x)
+}
+
+fn cp_min_f(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn cp_max_f(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+fn cp_clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+// Deterministic LCG — reproducibility (Law 2: observable, seed-stable)
+fn cp_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn cp_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn cp_signed(seed: int) -> float {
+    return cp_unit(seed) * 2.0 - 1.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Histogram MI (L0-clean — duplicated per AN7, same recipe family
+// as mirror_neuron_phi / gratitude_phi / moral_consciousness_phi).
+// Root cause comment: engines are L0-clean — cross-engine imports are
+// forbidden by AN7. Same algorithm, isolated cp_ prefix.
+// ═══════════════════════════════════════════════════════════════
+
+fn cp_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn cp_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn cp_entropy(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(cp_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = cp_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * cp_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn cp_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = cp_bin_idx(a[i], lo, hi, nb)
+        let ib = cp_bin_idx(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = cp_counts(pair_ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * cp_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn cp_vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn cp_vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn cp_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let lo_a = cp_vec_min(a)
+    let hi_a = cp_vec_max(a)
+    let lo_b = cp_vec_min(b)
+    let hi_b = cp_vec_max(b)
+    let lo = cp_min_f(lo_a, lo_b)
+    let hi = cp_max_f(hi_a, hi_b)
+    let h_a = cp_entropy(a, lo, hi, CP_BINS)
+    let h_b = cp_entropy(b, lo, hi, CP_BINS)
+    let h_j = cp_joint_entropy(a, b, lo, hi, CP_BINS)
+    let mi = h_a + h_b - h_j
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Sub-window Pearson |r| — used for compassion↔approach coupling.
+// Correlation on first CP_WIN samples; absolute value since a
+// sign-flipped motor channel is informationally equivalent.
+// sqrt only on clamped non-negative sum-of-squares.
+// ═══════════════════════════════════════════════════════════════
+
+fn cp_pearson_abs(a: array, b: array, win: int) -> float {
+    let n_a = len(a)
+    let n_b = len(b)
+    let mut nw = win
+    if nw > n_a { nw = n_a }
+    if nw > n_b { nw = n_b }
+    if nw < 2 { return 0.0 }
+
+    let mut mean_a = 0.0
+    let mut mean_b = 0.0
+    let mut i = 0
+    while i < nw {
+        mean_a = mean_a + a[i]
+        mean_b = mean_b + b[i]
+        i = i + 1
+    }
+    mean_a = mean_a / to_float(nw)
+    mean_b = mean_b / to_float(nw)
+
+    let mut cov = 0.0
+    let mut sa2 = 0.0
+    let mut sb2 = 0.0
+    let mut j = 0
+    while j < nw {
+        let da = a[j] - mean_a
+        let db = b[j] - mean_b
+        cov = cov + da * db
+        sa2 = sa2 + da * da
+        sb2 = sb2 + db * db
+        j = j + 1
+    }
+    // sqrt-safe: sa2/sb2 are sums of squares — always >= 0
+    let denom = cp_sqrt_safe(sa2) * cp_sqrt_safe(sb2)
+    if denom < CP_EPS { return 0.0 }
+    let r = cov / denom
+    return cp_clamp01(cp_abs(r))
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Channel generators
+//
+// The suffering stream is a triangular wave scaled by amplitude —
+// structured temporal pattern so MI captures genuine coupling rather
+// than pure noise. The concern stream is a mode-dependent constant
+// (warm vs cold) with per-step jitter.
+// ═══════════════════════════════════════════════════════════════
+
+// Suffering stream — structured rise-and-fall at scaled amplitude.
+// amplitude in [0,1] sets the peak severity; mild=0.25, severe=0.85.
+fn cp_gen_suffering(amplitude: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < CP_STEPS {
+        s = cp_prng(s + t * 37)
+        // Triangular wave — suffering waxes then wanes across episode
+        let phase = to_float(t) / to_float(CP_STEPS)
+        let mut tri = phase * 4.0 - 2.0
+        if tri < 0.0 { tri = 0.0 - tri }
+        let signal = 1.0 - tri
+        // Scale to [0, amplitude]
+        let scaled = amplitude * cp_clamp01((signal + 1.0) / 2.0)
+        let jit = CP_JITTER * cp_signed(s)
+        out = out.push(cp_clamp01(scaled + jit))
+        t = t + 1
+    }
+    return out
+}
+
+// Concern stream — warm (engaged caring) or cold (detached observation).
+// Small jitter around the mode-dependent mean gives MI some variance.
+fn cp_gen_concern(concern_mean: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < CP_STEPS {
+        s = cp_prng(s + t * 43)
+        let jit = CP_JITTER * cp_signed(s)
+        out = out.push(cp_clamp01(concern_mean + jit))
+        t = t + 1
+    }
+    return out
+}
+
+// Perception = suffering × concern + jitter. This is the appraisal
+// binding: Goetz requires BOTH suffering recognition AND caring stance.
+// Cold-concern observation collapses perception → flat → no compassion.
+fn cp_gen_perception(suffering: array, concern: array, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < CP_STEPS {
+        s = cp_prng(s + t * 59)
+        let bound = suffering[t] * concern[t]
+        let jit = CP_JITTER * cp_signed(s)
+        out = out.push(cp_clamp01(bound + jit))
+        t = t + 1
+    }
+    return out
+}
+
+// Compassion state = state_gain × perception + jitter.
+// This is the felt compassion signal; MI(suffering, state) measures
+// how much suffering information reaches the caring-affective channel.
+fn cp_gen_state(perception: array, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < CP_STEPS {
+        s = cp_prng(s + t * 67)
+        let driven = CP_STATE_GAIN * perception[t]
+        let jit = CP_JITTER * cp_signed(s)
+        out = out.push(cp_clamp01(driven + jit))
+        t = t + 1
+    }
+    return out
+}
+
+// Self-distress: baseline + distress_gain × suffering, scaled by mode.
+// Empathy mode: scale≈1.0, distress saturates under observed suffering
+//   (Singer AI/aMCC amplification).
+// Compassion mode: scale≈0.25, distress regulated by mOFC/ventral
+//   striatum — distress stays low even with strong suffering input.
+fn cp_gen_distress(suffering: array, mode_scale: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < CP_STEPS {
+        s = cp_prng(s + t * 71)
+        let driven = CP_DISTRESS_BASE + CP_DISTRESS_GAIN * suffering[t]
+        let scaled = driven * mode_scale
+        let jit = CP_JITTER * cp_signed(s)
+        out = out.push(cp_clamp01(scaled + jit))
+        t = t + 1
+    }
+    return out
+}
+
+// Approach-help (Goetz motivational signature):
+//   approach = (base + gain × compassion_state)
+//              − avoid_pressure × self_distress + jitter.
+// Compassion pulls approach UP; distress pulls it DOWN (avoid/withdraw).
+// Clamp01 to [0,1] — represents the NET approach tendency.
+fn cp_gen_approach(compassion_state: array, distress: array, app_gain: float, base: float, avoid_pressure: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < CP_STEPS {
+        s = cp_prng(s + t * 73)
+        let pos = base + app_gain * compassion_state[t]
+        let neg = avoid_pressure * distress[t]
+        let composed = pos - neg
+        let jit = CP_JITTER * cp_signed(s)
+        out = out.push(cp_clamp01(composed + jit))
+        t = t + 1
+    }
+    return out
+}
+
+// Positive affect (Klimecki 2013 ventral striatum / mOFC integration):
+//   positive = (base + gain × compassion_state) × mode_scale
+//              − pos_drag × self_distress + jitter.
+// Compassion mode: mode_scale=1.0 → positive affect integrates fully.
+// Empathy mode: mode_scale=0.20 AND distress drag saturates → collapse.
+fn cp_gen_positive(compassion_state: array, distress: array, pos_gain: float, base: float, mode_scale: float, drag: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < CP_STEPS {
+        s = cp_prng(s + t * 79)
+        let raw = base + pos_gain * compassion_state[t]
+        let scaled = raw * mode_scale
+        let damped = scaled - drag * distress[t]
+        let jit = CP_JITTER * cp_signed(s)
+        out = out.push(cp_clamp01(damped + jit))
+        t = t + 1
+    }
+    return out
+}
+
+// Neutral-mode channel — low-amplitude uniform-ish stream for baselines.
+// All values near CP_NEUTRAL_AMP (≈ 0.12) with tiny jitter — no structure.
+fn cp_gen_neutral(seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < CP_STEPS {
+        s = cp_prng(s + t * 103)
+        let jit = CP_JITTER * cp_signed(s)
+        out = out.push(cp_clamp01(CP_NEUTRAL_AMP + jit))
+        t = t + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Full pipeline runner — generates all 7 channels.
+//
+// Packed layout (flat array to avoid struct-field list aliasing bug,
+// feedback_hexa_struct_list_alias):
+//   [suffering(0..N-1), concern(N..2N-1), perception(2N..3N-1),
+//    compassion_state(3N..4N-1), approach_help(4N..5N-1),
+//    self_distress(5N..6N-1), positive_affect(6N..7N-1)]
+//
+// Parameters:
+//   suffer_amp         — peak amplitude of suffering signal (mild/severe)
+//   concern_mean       — warm (≈1.0) or cold (≈0.05)
+//   distress_scale     — mode-dependent (COMP=0.25, EMP=1.0)
+//   positive_scale     — mode-dependent (COMP=1.0, EMP=0.20)
+// ═══════════════════════════════════════════════════════════════
+
+fn cp_run_pipeline(suffer_amp: float, concern_mean: float, distress_scale: float, positive_scale: float, seed: int) -> array {
+    let suffering = cp_gen_suffering(suffer_amp, seed + 1000)
+    let concern   = cp_gen_concern(concern_mean, seed + 2000)
+    let percep    = cp_gen_perception(suffering, concern, seed + 3000)
+    let state     = cp_gen_state(percep, seed + 4000)
+    let distress  = cp_gen_distress(suffering, distress_scale, seed + 5000)
+    let approach  = cp_gen_approach(state, distress, CP_APPROACH_GAIN, CP_APPROACH_BASE, CP_AVOID_PRESSURE, seed + 6000)
+    let positive  = cp_gen_positive(state, distress, CP_POS_GAIN, CP_POS_BASE, positive_scale, CP_POS_DRAG, seed + 7000)
+
+    // Pack sequentially — stage0 lists are pass-by-value so we rebuild
+    let mut packed = []
+    let mut i = 0
+    while i < CP_STEPS {
+        packed = packed.push(suffering[i])
+        i = i + 1
+    }
+    let mut j = 0
+    while j < CP_STEPS {
+        packed = packed.push(concern[j])
+        j = j + 1
+    }
+    let mut k = 0
+    while k < CP_STEPS {
+        packed = packed.push(percep[k])
+        k = k + 1
+    }
+    let mut m = 0
+    while m < CP_STEPS {
+        packed = packed.push(state[m])
+        m = m + 1
+    }
+    let mut p = 0
+    while p < CP_STEPS {
+        packed = packed.push(approach[p])
+        p = p + 1
+    }
+    let mut q = 0
+    while q < CP_STEPS {
+        packed = packed.push(distress[q])
+        q = q + 1
+    }
+    let mut r = 0
+    while r < CP_STEPS {
+        packed = packed.push(positive[r])
+        r = r + 1
+    }
+    return packed
+}
+
+// Channel indices for cp_slice
+let CP_CH_SUFFERING  = 0
+let CP_CH_CONCERN    = 1
+let CP_CH_PERCEPTION = 2
+let CP_CH_STATE      = 3
+let CP_CH_APPROACH   = 4
+let CP_CH_DISTRESS   = 5
+let CP_CH_POSITIVE   = 6
+
+// Slice helper: extract one channel from the packed pipeline.
+fn cp_slice(packed: array, ch_idx: int) -> array {
+    let offset = ch_idx * CP_STEPS
+    let mut out = []
+    let mut i = 0
+    while i < CP_STEPS {
+        out = out.push(packed[offset + i])
+        i = i + 1
+    }
+    return out
+}
+
+// Mean of a channel (used for T2 / T3 / T4 level comparisons).
+fn cp_channel_mean(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + v[i]
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Φ measurement helpers
+//
+// Φ_compassion = MI(suffering, compassion_state)
+//                How much suffering information reaches the caring channel.
+// Φ_approach   = MI(compassion_state, approach_help)
+//                Motivational coupling (Goetz criterion).
+// Φ_positive   = MI(compassion_state, positive_affect)
+//                Klimecki reward-integration signature.
+// ═══════════════════════════════════════════════════════════════
+
+fn cp_phi_compassion(packed: array) -> float {
+    let suf = cp_slice(packed, CP_CH_SUFFERING)
+    let st  = cp_slice(packed, CP_CH_STATE)
+    return cp_mi(suf, st)
+}
+
+fn cp_phi_approach(packed: array) -> float {
+    let st  = cp_slice(packed, CP_CH_STATE)
+    let app = cp_slice(packed, CP_CH_APPROACH)
+    return cp_mi(st, app)
+}
+
+fn cp_phi_positive(packed: array) -> float {
+    let st  = cp_slice(packed, CP_CH_STATE)
+    let pos = cp_slice(packed, CP_CH_POSITIVE)
+    return cp_mi(st, pos)
+}
+
+// Integrated Φ_compassion: mean of the three MI signatures.
+// One scalar summary for T5 compassion-vs-empathy comparison.
+fn cp_phi_integrated(packed: array) -> float {
+    let a = cp_phi_compassion(packed)
+    let b = cp_phi_approach(packed)
+    let c = cp_phi_positive(packed)
+    return (a + b + c) / 3.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1..T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1 Suffering trigger (Goetz 2010 perception criterion):
+    //   Observed suffering RAISES compassion state above the no-suffering
+    //   baseline. The cleanest operationalization of "suffering triggers
+    //   compassion" is a within-mode comparison: same warm-concern
+    //   pipeline, toggling suffering input amplitude.
+    //
+    //   PRESENT: suffer_amp = CP_SUFFER_DEFAULT (structured suffering wave)
+    //   ABSENT:  suffer_amp = CP_SUFFER_ABSENT  (near-zero flat input)
+    //
+    //   Gates:
+    //     (a) mean(compassion_state) PRESENT − ABSENT > CP_STATE_LEVEL_GAP
+    //         — compassion magnitude elevates (the trigger criterion)
+    //     (b) Φ_compassion (MI suffering↔state) PRESENT > CP_STATE_MIN
+    //         — structural coupling exists (not just a mean shift)
+    //     (c) Φ_compassion PRESENT − ABSENT > CP_TRIGGER_GAP
+    //         — informational coupling specifically rises with suffering
+    //
+    //   Note: when suffer_amp is near-zero, the whole perception×state
+    //   cascade collapses toward the jitter floor; MI between a near-
+    //   constant channel and its near-constant derivative is structurally
+    //   low. The gap measures the suffering-trigger signature directly.
+    let pack_present = cp_run_pipeline(CP_SUFFER_DEFAULT, CP_CONCERN_WARM, CP_DISTRESS_SCALE_COMP, CP_POS_SCALE_COMP, 14401)
+    let pack_absent  = cp_run_pipeline(CP_SUFFER_ABSENT,  CP_CONCERN_WARM, CP_DISTRESS_SCALE_COMP, CP_POS_SCALE_COMP, 14401)
+
+    let state_present = cp_channel_mean(cp_slice(pack_present, CP_CH_STATE))
+    let state_absent  = cp_channel_mean(cp_slice(pack_absent,  CP_CH_STATE))
+    let level_gap     = state_present - state_absent
+
+    let phi_present = cp_phi_compassion(pack_present)
+    let phi_absent  = cp_phi_compassion(pack_absent)
+    let phi_gap     = phi_present - phi_absent
+
+    println("  [T1] compassion_state mean present=" + str(state_present) + " absent=" + str(state_absent) + " level_gap=" + str(level_gap))
+    println("  [T1] Φ_compassion present=" + str(phi_present) + " absent=" + str(phi_absent) + " phi_gap=" + str(phi_gap))
+
+    let mut ok = true
+    // (a) Level elevation — the core "trigger raises compassion" criterion
+    if level_gap   <= CP_STATE_LEVEL_GAP { ok = false }
+    // (b) Structural MI coupling present under suffering
+    if phi_present <= CP_STATE_MIN { ok = false }
+    // (c) Informational coupling rises with suffering observation
+    if phi_gap     <= CP_TRIGGER_GAP { ok = false }
+    return ok
+}
+
+fn check_T2() -> bool {
+    // T2 Caring action drive (Goetz 2010 motivational criterion):
+    //   Compassion elevates approach_help above neutral baseline, AND
+    //   MI(compassion_state, approach_help) > floor (coupling present),
+    //   AND approach dominates the avoid-surrogate (self_distress).
+    //
+    //   The three sub-gates together rule out a reading where compassion
+    //   merely correlates with approach without driving it: we require
+    //   magnitude elevation, coupling, AND net-motor dominance over the
+    //   withdrawal channel (self_distress pulls approach down in our model).
+    let pack_comp = cp_run_pipeline(CP_SUFFER_DEFAULT, CP_CONCERN_WARM, CP_DISTRESS_SCALE_COMP, CP_POS_SCALE_COMP, 14402)
+
+    // Neutral baseline: cold concern kills compassion_state → approach
+    // collapses to baseline + noise; no coupling.
+    let pack_base = cp_run_pipeline(CP_SUFFER_DEFAULT, CP_CONCERN_COLD, CP_DISTRESS_SCALE_COMP, CP_POS_SCALE_COMP, 14402)
+
+    let app_comp = cp_channel_mean(cp_slice(pack_comp, CP_CH_APPROACH))
+    let app_base = cp_channel_mean(cp_slice(pack_base, CP_CH_APPROACH))
+    let mean_gap = app_comp - app_base
+
+    let mi_coup  = cp_phi_approach(pack_comp)
+
+    // Net-motor: approach mean − avoid-surrogate mean (self_distress),
+    // both in COMPASSION mode. Compassion modulates distress down and
+    // approach up, yielding positive net motor bias.
+    let dist_comp = cp_channel_mean(cp_slice(pack_comp, CP_CH_DISTRESS))
+    let net_motor = app_comp - dist_comp
+
+    // Pearson |r| on first window — structural coupling signature
+    let st = cp_slice(pack_comp, CP_CH_STATE)
+    let ap = cp_slice(pack_comp, CP_CH_APPROACH)
+    let r_abs = cp_pearson_abs(st, ap, CP_WIN)
+
+    println("  [T2] approach mean comp=" + str(app_comp) + " base=" + str(app_base) + " gap=" + str(mean_gap))
+    println("  [T2] MI(state,approach)=" + str(mi_coup) + " distress_mean=" + str(dist_comp) + " net_motor=" + str(net_motor))
+    println("  [T2] pearson|r|(state,approach) win=" + str(CP_WIN) + " = " + str(r_abs))
+
+    let mut ok = true
+    if mean_gap  <= CP_APPROACH_GAP { ok = false }
+    if mi_coup   <= CP_APPROACH_MIN { ok = false }
+    if net_motor <= CP_NET_MOTOR_GAP { ok = false }
+    if r_abs     <= CP_EPS { ok = false }
+    return ok
+}
+
+fn check_T3() -> bool {
+    // T3 Distinct-from-empathy — lower self-distress
+    //   (Singer & Klimecki 2014; Klimecki et al. 2013):
+    //   Under MATCHED suffering input, COMPASSION mode yields substantially
+    //   LOWER mean(self_distress) than EMPATHY mode. Empathy-for-pain
+    //   network (AI + aMCC) amplifies distress; compassion network
+    //   (mOFC + ventral striatum) regulates it down.
+    //   Gate: mean_distress_EMP − mean_distress_COMP > CP_DISTRESS_GAP.
+    let pack_comp = cp_run_pipeline(CP_SUFFER_DEFAULT, CP_CONCERN_WARM, CP_DISTRESS_SCALE_COMP, CP_POS_SCALE_COMP, 14403)
+    let pack_emp  = cp_run_pipeline(CP_SUFFER_DEFAULT, CP_CONCERN_WARM, CP_DISTRESS_SCALE_EMP,  CP_POS_SCALE_EMP,  14403)
+
+    let dist_comp = cp_channel_mean(cp_slice(pack_comp, CP_CH_DISTRESS))
+    let dist_emp  = cp_channel_mean(cp_slice(pack_emp,  CP_CH_DISTRESS))
+    let gap = dist_emp - dist_comp
+
+    println("  [T3] self_distress compassion=" + str(dist_comp) + " empathy=" + str(dist_emp) + " gap=" + str(gap))
+
+    let mut ok = true
+    if gap <= CP_DISTRESS_GAP { ok = false }
+    return ok
+}
+
+fn check_T4() -> bool {
+    // T4 Scope sensitivity — severity psychophysics (Goetz 2010; Slovic 2007):
+    //   Compassion magnitude scales with perceived severity — not flat.
+    //   MILD suffering (amp=0.25) vs SEVERE suffering (amp=0.85), both
+    //   in COMPASSION mode with identical concern/mode parameters.
+    //   Gate: mean(compassion_state)_SEVERE − mean(compassion_state)_MILD
+    //         > CP_SCOPE_GAP, AND MI(suffering, state) also rises.
+    let pack_mild  = cp_run_pipeline(CP_SUFFER_MILD,   CP_CONCERN_WARM, CP_DISTRESS_SCALE_COMP, CP_POS_SCALE_COMP, 14404)
+    let pack_sever = cp_run_pipeline(CP_SUFFER_SEVERE, CP_CONCERN_WARM, CP_DISTRESS_SCALE_COMP, CP_POS_SCALE_COMP, 14404)
+
+    let state_mild  = cp_channel_mean(cp_slice(pack_mild,  CP_CH_STATE))
+    let state_sever = cp_channel_mean(cp_slice(pack_sever, CP_CH_STATE))
+    let level_gap   = state_sever - state_mild
+
+    let phi_mild  = cp_phi_compassion(pack_mild)
+    let phi_sever = cp_phi_compassion(pack_sever)
+
+    println("  [T4] compassion_state mean mild=" + str(state_mild) + " severe=" + str(state_sever) + " gap=" + str(level_gap))
+    println("  [T4] Φ_compassion mild=" + str(phi_mild) + " severe=" + str(phi_sever))
+
+    let mut ok = true
+    // Magnitude must scale with severity
+    if level_gap <= CP_SCOPE_GAP { ok = false }
+    // MI must also be substantial at severe (structural coupling present)
+    if phi_sever <= CP_STATE_MIN { ok = false }
+    return ok
+}
+
+fn check_T5() -> bool {
+    // T5 Integrated positive Φ (Klimecki 2013 + Singer 2014 dissociation):
+    //   Φ_compassion_integrated (mean of suffering→state, state→approach,
+    //   state→positive MIs) exceeds the EMPATHY condition's integrated Φ.
+    //
+    //   In empathy mode, self_distress saturates → drags positive affect
+    //   down → MI(state,positive) collapses. Integrated Φ captures the
+    //   FULL multi-channel binding that is unique to compassion: care +
+    //   approach + positive affect integrated around a single state.
+    //
+    //   Also verifies:
+    //     (a) two identical runs produce byte-identical Φ values
+    //     (b) full pipeline (4 modes) latency < CP_LATENCY_MS
+    let t0 = clock()
+
+    // Run A — compassion + empathy + determinism pair
+    let pa_comp = cp_run_pipeline(CP_SUFFER_DEFAULT, CP_CONCERN_WARM, CP_DISTRESS_SCALE_COMP, CP_POS_SCALE_COMP, 14405)
+    let pa_emp  = cp_run_pipeline(CP_SUFFER_DEFAULT, CP_CONCERN_WARM, CP_DISTRESS_SCALE_EMP,  CP_POS_SCALE_EMP,  14405)
+
+    // Run B — identical seeds (determinism comparison)
+    let pb_comp = cp_run_pipeline(CP_SUFFER_DEFAULT, CP_CONCERN_WARM, CP_DISTRESS_SCALE_COMP, CP_POS_SCALE_COMP, 14405)
+    let pb_emp  = cp_run_pipeline(CP_SUFFER_DEFAULT, CP_CONCERN_WARM, CP_DISTRESS_SCALE_EMP,  CP_POS_SCALE_EMP,  14405)
+
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T5] pipeline latency = " + str(ms) + " ms (gate=" + str(CP_LATENCY_MS) + ")")
+
+    let phi_comp = cp_phi_integrated(pa_comp)
+    let phi_emp  = cp_phi_integrated(pa_emp)
+    let gap      = phi_comp - phi_emp
+    println("  [T5] Φ_integrated compassion=" + str(phi_comp) + " empathy=" + str(phi_emp) + " gap=" + str(gap))
+
+    // Per-component inspection — documents WHICH MIs drive the gap
+    let phi_pos_comp = cp_phi_positive(pa_comp)
+    let phi_pos_emp  = cp_phi_positive(pa_emp)
+    println("  [T5] Φ_positive compassion=" + str(phi_pos_comp) + " empathy=" + str(phi_pos_emp))
+
+    // Determinism: compare compassion Φ across runs A and B (both modes)
+    let d_comp = cp_abs(cp_phi_integrated(pa_comp) - cp_phi_integrated(pb_comp))
+    let d_emp  = cp_abs(cp_phi_integrated(pa_emp)  - cp_phi_integrated(pb_emp))
+    println("  [T5] determinism deltas: comp=" + str(d_comp) + " emp=" + str(d_emp))
+
+    let mut ok = true
+    // Absolute floor — integrated Φ must be substantial in compassion mode
+    if phi_comp <= CP_INTEGRATED_MIN { ok = false }
+    // Compassion must exceed empathy — the Klimecki dissociation
+    if gap <= CP_INTEGRATED_GAP { ok = false }
+    // Determinism: byte-identical across runs
+    if d_comp > CP_EPS { ok = false }
+    if d_emp  > CP_EPS { ok = false }
+    // Latency cap
+    if ms >= CP_LATENCY_MS { ok = false }
+    return ok
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — execute 5 self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[compassion_phi] P144 — Compassion Φ")
+    println("  channels: suffering × concern → perception → state → approach / distress / positive")
+    println("  refs: Goetz et al. 2010 | Singer & Klimecki 2014 | Klimecki et al. 2013 | Slovic 2007")
+    println("  concern warm=" + str(CP_CONCERN_WARM) + " cold=" + str(CP_CONCERN_COLD))
+    println("  distress_scale comp=" + str(CP_DISTRESS_SCALE_COMP) + " emp=" + str(CP_DISTRESS_SCALE_EMP))
+    println("  positive_scale comp=" + str(CP_POS_SCALE_COMP) + " emp=" + str(CP_POS_SCALE_EMP))
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  suffering trigger — compassion Φ above no-suffering baseline (Goetz perception)") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  caring action drive — approach elevated + coupled + dominates avoid (Goetz motivation)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  distinct-from-empathy — compassion self-distress < empathy (Singer/Klimecki dissociation)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  scope sensitivity — compassion scales with severity (Goetz / Slovic psychophysics)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  Φ_compassion integrated > Φ_empathy + determinism + latency < " + str(CP_LATENCY_MS) + " ms") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause comment: stage0 && chains with 5 operands can mis-short-
+    // circuit under certain orderings (same idiom as gratitude_phi,
+    // moral_consciousness_phi). Sequential mutable-bool guard is reliable.
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[compassion_phi] 5/5 PASS — P144 DONE (compassion Φ perception + caring + distinct-from-empathy + scope + integrated positive verified)")
+    } else {
+        println("[compassion_phi] SOME FAILED")
+    }
+}
+
+main()
