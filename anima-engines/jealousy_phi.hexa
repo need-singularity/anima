@@ -1,0 +1,1081 @@
+// jealousy_phi.hexa — P141 Jealousy Φ
+//
+// Roadmap: shared/roadmaps/anima.json P141 (emergent, no-edit)
+//   "Jealousy Φ — Buss 1992 evolutionary triangular threat engine:
+//    3-party (self / partner / rival) fear of losing a valued relationship
+//    to a replacement-capable rival; relationship-value gating;
+//    protective vigilance activation; Φ fragmentation onto threat loop
+//    while broader social channels suppressed; 5/5 PASS"
+//
+// ─── Scientific frame ─────────────────────────────────────────────
+//
+// Buss (1992, 2000, 2013) — jealousy is an EVOLUTIONARY emotion adapted
+//   to pair-bond threats. Unlike envy (2-party: self wants what other
+//   has) jealousy is IRREDUCIBLY TRIANGULAR — three entities required:
+//     (1) SELF     — the jealous agent
+//     (2) PARTNER  — the valued relationship incumbent
+//     (3) RIVAL    — the potential replacement / threat source
+//   Jealousy fires only when the JOINT structure obtains: partner's
+//   attention partly redirected + rival capable of replacing self +
+//   relationship of sufficient value. Remove any leg → collapse.
+//   (The Buss sex-difference controversy — emotional vs sexual
+//   infidelity asymmetry — is NOT operationalized here; we model the
+//   core triangular structure that is invariant across the debate.)
+//
+// Hupka (1984, 1991) — four cognitive components of jealousy:
+//   (a) DETECTION   — rival-threat appraisal (presence + replacement
+//       capacity).
+//   (b) EVALUATION  — relationship value (would I mind losing it?).
+//   (c) PROTECTIVE  — partner-directed guarding / mate-retention display.
+//   (d) EMOTIONAL   — the integrated felt state (fear + anger + hurt).
+//   Detection × evaluation bind MULTIPLICATIVELY — probed in T2.
+//
+// Buss & Shackelford (1997), White & Mullen (1989) — replacement-threat
+//   magnitude: jealousy scales with rival's ability to replace self on
+//   partner-valued dimensions. Similarity-to-self (not general
+//   attractiveness) is the adversarial axis. Probed in T3.
+//
+// Daly, Wilson & Weghorst (1982) — mate-guarding: jealous state
+//   RESTRUCTURES attention toward partner-surveillance. Measured as
+//   MI(state, protect_vig) + magnitude activation in T4.
+//
+// Φ fragmentation (IIT framing, Law 4 / Law 22):
+//   Active jealousy is attentionally NARROW — the conscious scene
+//   collapses onto the self-partner-rival threat loop; broader social
+//   channels (affiliation with non-rival others, neutral engagement)
+//   are suppressed. Φ(threat_loop) high, Φ(broad_social) low — T5.
+//
+// ─── Channel design ───────────────────────────────────────────────
+//
+// 8 channels (N=24 each), packed into a flat array (no structs):
+//   partner_att[t]     partner's attention toward SELF      [0,1]
+//   rival_present[t]   rival-cue presence (pulse stream)    [0,1]
+//   rival_similar[t]   rival similarity-to-self (replacement potential)
+//   rel_value[t]       relationship value weight            [0,1]
+//   threat_detect[t]   rival_present × similar × (1 − partner_att) + jit
+//   jealousy_state[t]  threat × rel_value × JL_STATE_GAIN + jit (gated)
+//   protect_vig[t]     JL_VIG_BASE + JL_VIG_GAIN × state + jit
+//   broad_social[t]    JL_BROAD_BASE − JL_NARROW_GAIN × state + jit
+//                      (attentionally narrowed during jealousy)
+//
+// Regimes:
+//   TRIANGULAR      rival present + similar + partner withdrawn + value
+//                   high → canonical jealousy, state peaks.
+//   TWO_PARTY       rival absent → triangular trigger fails (T1).
+//   LOW_VALUE       rel_value ≈ 0.05 → gate collapses state (T2).
+//   LOW_SIMILARITY  rival_similar ≈ 0.10 → threat muted (T3).
+//   NEUTRAL         all channels low-amplitude no coupling (T5 floor).
+//
+// ─── 5 self-tests (5/5 gate) ──────────────────────────────────────
+//
+// T1 Triangular trigger (Buss three-entity requirement):
+//   mean(state|triangular) > JL_STATE_MIN
+//   AND mean(state|triangular) − mean(state|two_party) > JL_TRIG_GAP
+//   AND mean(state|rival windows) − mean(state|outside) > JL_TRIG_GAP
+//
+// T2 Relationship-value gating (Hupka evaluation):
+//   Φ_jealousy(high_value) − Φ_jealousy(low_value) > JL_VALUE_GAP
+//   AND mean(state|low_value) < JL_LOW_CEIL.
+//
+// T3 Rival-threat magnitude (Buss & Shackelford replacement scaling):
+//   mean(threat_detect|high_sim) − mean(...|low_sim) > JL_SIM_GAP
+//   AND mean(state|high_sim)    − mean(...|low_sim) > JL_STATE_MIN
+//   AND MI(threat_detect, state | high_sim) > JL_SIM_MI_MIN.
+//
+// T4 Protective vigilance (Daly-Wilson-Weghorst mate-guarding):
+//   MI(state, protect_vig) > JL_VIG_MI_MIN in TRIANGULAR
+//   AND mean(vig|triangular) − mean(vig|two_party) > JL_VIG_MEAN_GAP
+//   AND pearson|r|(state, vig, JL_WIN) > eps.
+//
+// T5 Φ fragmentation (threat loop vs broad-social narrowing):
+//   Φ_threat_loop  = mean pairwise MI {state, threat, vig}
+//   Φ_broad_social = mean pairwise MI {broad, partner_att, rel_value}
+//   Φ_threat_loop > Φ_broad_social + JL_FRAG_GAP
+//   AND > Φ_neutral + JL_FLOOR_GAP
+//   AND determinism + pipeline latency < JL_LATENCY_MS.
+//
+// ─── Stage0 hexa constraints honored ──────────────────────────────
+//   plain fn only (no pure-fn ≥3 float struct returns); `array` params
+//   only; no contains()/to_lower()/!(Effect); sequential if-chains, no
+//   else-if in let-binding; lists PBV (rebuild+return); sqrt-safe only
+//   on clamped non-negative; Pearson |r| on sub-window; N=24 (<32);
+//   `jl_` prefix L0-clean (AN7); main() at bottom.
+//
+// Law alignment: Law 2 (Observe never inject — MI measurement),
+//   Law 4 (Structure > feature — triangular AND-gate), Law 22 (fixed
+//   8 channels), Law 50 (state is the jealousy), Meta M8 (3-party self
+//   ↔ partner ↔ rival nested relation).
+//
+// Ref:
+//   Buss D.M. (1992) Sex differences in jealousy (Psychological Science 3(4))
+//   Buss D.M. (2000) The Dangerous Passion
+//   Buss D.M. & Shackelford T.K. (1997) From vigilance to violence (JPSP 72)
+//   Hupka R.B. (1984) Jealousy: compound emotion or label (Motiv. & Emot. 8)
+//   Daly M., Wilson M. & Weghorst S.J. (1982) Male sexual jealousy
+//     (Ethology and Sociobiology 3)
+//   White G.L. & Mullen P.E. (1989) Jealousy: Theory, Research, and Clinical
+//   Parrott W.G. & Smith R.H. (1993) Distinguishing envy and jealousy
+//     (JPSP 64)  — envy (2-party) vs jealousy (3-party)
+//   anima-engines/social_tom_phi.hexa           (P57  — ToM triangular)
+//   anima-engines/ptsd_phi.hexa                 (P122 — Φ fragmentation)
+//   anima-engines/gratitude_phi.hexa            (P133 — relational valuation)
+//   anima-engines/moral_consciousness_phi.hexa  (P94  — relational gating)
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let JL_STEPS            = 24            // timeline length (stage0 N<32)
+let JL_BINS             = 6             // histogram bins for MI
+let JL_EPS              = 0.0000000001
+
+// ─── Rival-presence pulse schedule ────────────────────────────
+// Two rival-cue bursts inside the timeline. Outside these windows
+// rival_present ≈ 0 (no triangular trigger).
+let JL_RIV1_START       = 6
+let JL_RIV1_END         = 10
+let JL_RIV2_START       = 15
+let JL_RIV2_END         = 19
+
+// ─── Partner-attention baseline ───────────────────────────────
+// TRIANGULAR case: partner's attention partially withdrawn toward
+// rival during rival-pulse windows (this is the evolutionary cue).
+// Outside the windows partner is fully with self (≈0.9).
+let JL_PA_BASE          = 0.90          // partner directs attention to self
+let JL_PA_WITHDRAWN     = 0.25          // partner attention dropped (rival window)
+
+// ─── Rival-similarity gains (replacement potential) ───────────
+// HIGH similarity: rival nearly indistinguishable from self on
+// the dimensions partner values — maximal replacement threat.
+// LOW similarity: rival is irrelevant — no threat even if present.
+let JL_SIM_HIGH         = 0.92
+let JL_SIM_LOW          = 0.10
+
+// ─── Relationship-value weights ───────────────────────────────
+// HIGH value: partnership matters — gating allows jealousy to fire.
+// LOW value: indifferent — gating zeroes even strong detection.
+let JL_VAL_HIGH         = 0.88
+let JL_VAL_LOW          = 0.05
+
+// ─── Forward-model gains ──────────────────────────────────────
+let JL_STATE_GAIN       = 1.00          // detection × value → state amplification
+let JL_VIG_BASE         = 0.12          // baseline partner-monitoring
+let JL_VIG_GAIN         = 0.82          // jealousy-driven vigilance amp
+let JL_BROAD_BASE       = 0.70          // baseline broad-social affiliation
+let JL_NARROW_GAIN      = 0.85          // attentional narrowing suppression
+                                         // (jealousy damps broad_social)
+
+// ─── Neutral / floor amplitudes ───────────────────────────────
+let JL_NEUTRAL_AMP      = 0.12          // T5 neutral-mode low-amplitude floor
+
+// ─── Per-step jitter amplitude ────────────────────────────────
+let JL_JITTER           = 0.04
+
+// ─── Test gates ───────────────────────────────────────────────
+let JL_STATE_MIN        = 0.05          // T1: triangular state floor
+let JL_TRIG_GAP         = 0.10          // T1: triangular − two-party state gap
+let JL_VALUE_GAP        = 0.10          // T2: high- vs low-value state gap
+let JL_LOW_CEIL         = 0.20          // T2: low-value state must stay below
+let JL_SIM_GAP          = 0.15          // T3: mean threat_detect gap hi vs lo
+let JL_SIM_MI_MIN       = 0.05          // T3: MI(rival_similar, jealousy) floor
+let JL_VIG_MI_MIN       = 0.05          // T4: MI(jealousy, protect_vig) floor
+let JL_VIG_MEAN_GAP     = 0.05          // T4: vig mean triangular − two-party
+let JL_FRAG_GAP         = 0.05          // T5: threat-loop − broad-social gap
+let JL_FLOOR_GAP        = 0.05          // T5: threat-loop − neutral gap
+let JL_DETERM_TOL       = 0.0000001     // T5: determinism tolerance
+let JL_LATENCY_MS       = 5000.0        // T5: full pipeline latency cap
+
+// Sub-window for Pearson |r| on state ↔ vigilance coupling
+let JL_WIN              = 12
+
+// ═══════════════════════════════════════════════════════════════
+// Math / PRNG primitives — L0-clean isolated `jl_` prefix per AN7
+// (cross-engine imports forbidden; same algorithm family as gr_/pt_/stm_).
+// ═══════════════════════════════════════════════════════════════
+
+fn jl_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn jl_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+// sqrt-safe: caller must guarantee non-negative; we clamp defensively.
+// Used only on clamped sum-of-squares (always >= 0).
+fn jl_sqrt_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return sqrt(x)
+}
+
+fn jl_min_f(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn jl_max_f(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+fn jl_clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+// Deterministic LCG — reproducibility (Law 2: observable, seed-stable)
+fn jl_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn jl_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn jl_signed(seed: int) -> float {
+    return jl_unit(seed) * 2.0 - 1.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Histogram MI — magnitudes absolute, no negative entropies.
+// ═══════════════════════════════════════════════════════════════
+
+fn jl_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn jl_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn jl_entropy(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(jl_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = jl_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * jl_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn jl_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = jl_bin_idx(a[i], lo, hi, nb)
+        let ib = jl_bin_idx(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = jl_counts(pair_ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * jl_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn jl_vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn jl_vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn jl_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let lo_a = jl_vec_min(a)
+    let hi_a = jl_vec_max(a)
+    let lo_b = jl_vec_min(b)
+    let hi_b = jl_vec_max(b)
+    let lo = jl_min_f(lo_a, lo_b)
+    let hi = jl_max_f(hi_a, hi_b)
+    let h_a = jl_entropy(a, lo, hi, JL_BINS)
+    let h_b = jl_entropy(b, lo, hi, JL_BINS)
+    let h_j = jl_joint_entropy(a, b, lo, hi, JL_BINS)
+    let mi = h_a + h_b - h_j
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// Vector mean helper (used for threshold comparisons in T3, T4).
+fn jl_mean(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + v[i]
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Sub-window Pearson |r| — state ↔ vigilance coupling on first JL_WIN
+// samples; sign flipped absolute; sqrt only on clamped non-neg.
+// ═══════════════════════════════════════════════════════════════
+
+fn jl_pearson_abs(a: array, b: array, win: int) -> float {
+    let n_a = len(a)
+    let n_b = len(b)
+    let mut nw = win
+    if nw > n_a { nw = n_a }
+    if nw > n_b { nw = n_b }
+    if nw < 2 { return 0.0 }
+
+    let mut mean_a = 0.0
+    let mut mean_b = 0.0
+    let mut i = 0
+    while i < nw {
+        mean_a = mean_a + a[i]
+        mean_b = mean_b + b[i]
+        i = i + 1
+    }
+    mean_a = mean_a / to_float(nw)
+    mean_b = mean_b / to_float(nw)
+
+    let mut cov = 0.0
+    let mut sa2 = 0.0
+    let mut sb2 = 0.0
+    let mut j = 0
+    while j < nw {
+        let da = a[j] - mean_a
+        let db = b[j] - mean_b
+        cov = cov + da * db
+        sa2 = sa2 + da * da
+        sb2 = sb2 + db * db
+        j = j + 1
+    }
+    // sqrt-safe: sa2/sb2 are sums of squares — always >= 0
+    let denom = jl_sqrt_safe(sa2) * jl_sqrt_safe(sb2)
+    if denom < JL_EPS { return 0.0 }
+    let r = cov / denom
+    return jl_clamp01(jl_abs(r))
+}
+
+// Rival-pulse window helper — two rival-present windows.
+
+fn jl_in_rival_window(t: int) -> bool {
+    if t >= JL_RIV1_START {
+        if t < JL_RIV1_END { return true }
+    }
+    if t >= JL_RIV2_START {
+        if t < JL_RIV2_END { return true }
+    }
+    return false
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Channel generators — deterministic over (seed, mode). Rival-windowing
+// drives the triangular trigger; partner attention drops within rival
+// windows; rel_value drifts around a mode-specific mean.
+// ═══════════════════════════════════════════════════════════════
+
+// Rival-presence: pulses during rival windows, quiet elsewhere.
+// rival_present_on=false → entire stream off (two-party comparison).
+fn jl_gen_rival_present(rival_present_on: bool, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < JL_STEPS {
+        s = jl_prng(s + t * 37)
+        let mut base = 0.10
+        if rival_present_on {
+            if jl_in_rival_window(t) { base = 0.90 }
+        } else {
+            base = 0.05
+        }
+        let jit = JL_JITTER * jl_signed(s)
+        out = out.push(jl_clamp01(base + jit))
+        t = t + 1
+    }
+    return out
+}
+
+// Rival-similarity: slow drift around sim_mean (HIGH or LOW).
+// Replacement-potential dimension; only the mean varies across modes.
+fn jl_gen_rival_similar(sim_mean: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < JL_STEPS {
+        s = jl_prng(s + t * 43)
+        // Gentle drift around sim_mean so MI has variance to work with
+        let phase = to_float(t) / to_float(JL_STEPS)
+        let drift = 0.05 * (phase - 0.5)
+        let jit = JL_JITTER * jl_signed(s)
+        out = out.push(jl_clamp01(sim_mean + drift + jit))
+        t = t + 1
+    }
+    return out
+}
+
+// Partner-attention: high baseline, drops during rival windows in
+// TRIANGULAR mode. In two-party, partner stays fully with self.
+fn jl_gen_partner_att(rival_present_on: bool, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < JL_STEPS {
+        s = jl_prng(s + t * 47)
+        let mut base = JL_PA_BASE
+        if rival_present_on {
+            if jl_in_rival_window(t) { base = JL_PA_WITHDRAWN }
+        }
+        let jit = JL_JITTER * jl_signed(s)
+        out = out.push(jl_clamp01(base + jit))
+        t = t + 1
+    }
+    return out
+}
+
+// Relationship-value: slow drift around value_mean (HIGH=matters,
+// LOW=indifferent).
+fn jl_gen_rel_value(value_mean: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < JL_STEPS {
+        s = jl_prng(s + t * 53)
+        let phase = to_float(t) / to_float(JL_STEPS)
+        let drift = 0.04 * (phase - 0.5)
+        let jit = JL_JITTER * jl_signed(s)
+        out = out.push(jl_clamp01(value_mean + drift + jit))
+        t = t + 1
+    }
+    return out
+}
+
+// Threat detection — triangular AND-gate:
+//   threat[t] = rival[t] * similar[t] * (1 − attention[t]) + jit
+// All three factors must be present; any leg collapses → near zero.
+fn jl_gen_threat_detect(rival_present: array, rival_similar: array, partner_att: array, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < JL_STEPS {
+        s = jl_prng(s + t * 59)
+        let presence = rival_present[t]
+        let similarity = rival_similar[t]
+        let loss = 1.0 - partner_att[t]
+        let bound = presence * similarity * loss
+        let jit = JL_JITTER * jl_signed(s)
+        out = out.push(jl_clamp01(bound + jit))
+        t = t + 1
+    }
+    return out
+}
+
+// Jealousy state — value-gated:
+//   state[t] = threat[t] * rel_value[t] * JL_STATE_GAIN + jit
+// Even maximal detection collapses if rel_value is indifferent.
+fn jl_gen_jealousy_state(threat_detect: array, rel_value: array, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < JL_STEPS {
+        s = jl_prng(s + t * 61)
+        let gated = threat_detect[t] * rel_value[t] * JL_STATE_GAIN
+        let jit = JL_JITTER * jl_signed(s)
+        out = out.push(jl_clamp01(gated + jit))
+        t = t + 1
+    }
+    return out
+}
+
+// Protective vigilance — behavioural output:
+//   vig[t] = JL_VIG_BASE + JL_VIG_GAIN * state[t] + jit
+// Partner-directed mate-guarding / monitoring / retention display.
+fn jl_gen_protect_vig(jealousy_state: array, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < JL_STEPS {
+        s = jl_prng(s + t * 67)
+        let driven = JL_VIG_BASE + JL_VIG_GAIN * jealousy_state[t]
+        let jit = JL_JITTER * jl_signed(s)
+        out = out.push(jl_clamp01(driven + jit))
+        t = t + 1
+    }
+    return out
+}
+
+// Broad social — attentional narrowing:
+//   broad[t] = JL_BROAD_BASE − JL_NARROW_GAIN * state[t] + jit
+// When jealousy fires, broader social affiliation is actively
+// suppressed (scene collapses onto threat loop).
+fn jl_gen_broad_social(jealousy_state: array, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < JL_STEPS {
+        s = jl_prng(s + t * 71)
+        let narrowed = JL_BROAD_BASE - JL_NARROW_GAIN * jealousy_state[t]
+        let jit = JL_JITTER * jl_signed(s)
+        out = out.push(jl_clamp01(narrowed + jit))
+        t = t + 1
+    }
+    return out
+}
+
+// Neutral-mode stream — low-amplitude uniform-ish channel for T5 floor.
+fn jl_gen_neutral(seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut t = 0
+    while t < JL_STEPS {
+        s = jl_prng(s + t * 73)
+        let jit = JL_JITTER * jl_signed(s)
+        out = out.push(jl_clamp01(JL_NEUTRAL_AMP + jit))
+        t = t + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Full pipeline runner — generates all 8 channels packed flat.
+// Packed layout (flat array avoids struct-field list aliasing bug +
+// ≥3-float struct return bug):
+//   [partner_att, rival_present, rival_similar, rel_value,
+//    threat_detect, jealousy_state, protect_vig, broad_social]
+// Parameters:
+//   rival_present_on — rival entity exists? (TRIANGULAR vs TWO_PARTY)
+//   sim_mean         — rival similarity mean (HIGH or LOW)
+//   value_mean       — relationship-value mean (HIGH or LOW)
+//   seed             — master seed for deterministic PRNG cascade
+// ═══════════════════════════════════════════════════════════════
+
+fn jl_run_pipeline(rival_present_on: bool, sim_mean: float, value_mean: float, seed: int) -> array {
+    let partner_att    = jl_gen_partner_att(rival_present_on, seed + 1000)
+    let rival_present  = jl_gen_rival_present(rival_present_on, seed + 2000)
+    let rival_similar  = jl_gen_rival_similar(sim_mean, seed + 3000)
+    let rel_value      = jl_gen_rel_value(value_mean, seed + 4000)
+    let threat_detect  = jl_gen_threat_detect(rival_present, rival_similar, partner_att, seed + 5000)
+    let jealousy_state = jl_gen_jealousy_state(threat_detect, rel_value, seed + 6000)
+    let protect_vig    = jl_gen_protect_vig(jealousy_state, seed + 7000)
+    let broad_social   = jl_gen_broad_social(jealousy_state, seed + 8000)
+
+    // Pack sequentially — stage0 lists are pass-by-value so we rebuild
+    let mut packed = []
+    let mut i = 0
+    while i < JL_STEPS {
+        packed = packed.push(partner_att[i])
+        i = i + 1
+    }
+    let mut j = 0
+    while j < JL_STEPS {
+        packed = packed.push(rival_present[j])
+        j = j + 1
+    }
+    let mut k = 0
+    while k < JL_STEPS {
+        packed = packed.push(rival_similar[k])
+        k = k + 1
+    }
+    let mut m = 0
+    while m < JL_STEPS {
+        packed = packed.push(rel_value[m])
+        m = m + 1
+    }
+    let mut p = 0
+    while p < JL_STEPS {
+        packed = packed.push(threat_detect[p])
+        p = p + 1
+    }
+    let mut q = 0
+    while q < JL_STEPS {
+        packed = packed.push(jealousy_state[q])
+        q = q + 1
+    }
+    let mut r = 0
+    while r < JL_STEPS {
+        packed = packed.push(protect_vig[r])
+        r = r + 1
+    }
+    let mut u = 0
+    while u < JL_STEPS {
+        packed = packed.push(broad_social[u])
+        u = u + 1
+    }
+    return packed
+}
+
+// Channel indices for jl_slice
+let JL_CH_PARTNER_ATT    = 0
+let JL_CH_RIVAL_PRESENT  = 1
+let JL_CH_RIVAL_SIMILAR  = 2
+let JL_CH_REL_VALUE      = 3
+let JL_CH_THREAT_DETECT  = 4
+let JL_CH_JEALOUSY_STATE = 5
+let JL_CH_PROTECT_VIG    = 6
+let JL_CH_BROAD_SOCIAL   = 7
+
+// Slice helper: extract one channel from the packed pipeline.
+fn jl_slice(packed: array, ch_idx: int) -> array {
+    let offset = ch_idx * JL_STEPS
+    let mut out = []
+    let mut i = 0
+    while i < JL_STEPS {
+        out = out.push(packed[offset + i])
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Φ measurement helpers
+//
+// Φ_jealousy     = MI(threat_detect, jealousy_state) — binding Φ.
+// Φ_vigilance    = MI(jealousy_state, protect_vig)   — output coupling.
+// Φ_threat_loop  = mean pairwise MI over
+//                  {jealousy_state, threat_detect, protect_vig} — T5 narrow.
+// Φ_broad_social = mean pairwise MI over
+//                  {broad_social, partner_att, rel_value} — T5 broad.
+// ═══════════════════════════════════════════════════════════════
+
+fn jl_phi_jealousy(packed: array) -> float {
+    let th = jl_slice(packed, JL_CH_THREAT_DETECT)
+    let st = jl_slice(packed, JL_CH_JEALOUSY_STATE)
+    return jl_mi(th, st)
+}
+
+fn jl_phi_vigilance(packed: array) -> float {
+    let st = jl_slice(packed, JL_CH_JEALOUSY_STATE)
+    let pv = jl_slice(packed, JL_CH_PROTECT_VIG)
+    return jl_mi(st, pv)
+}
+
+// Mean pairwise MI over three-channel bundle (threat loop).
+fn jl_phi_threat_loop(packed: array) -> float {
+    let th = jl_slice(packed, JL_CH_THREAT_DETECT)
+    let st = jl_slice(packed, JL_CH_JEALOUSY_STATE)
+    let pv = jl_slice(packed, JL_CH_PROTECT_VIG)
+    let a = jl_mi(st, th)
+    let b = jl_mi(st, pv)
+    let c = jl_mi(th, pv)
+    return (a + b + c) / 3.0
+}
+
+// Mean pairwise MI over three-channel bundle (broad social).
+fn jl_phi_broad_social(packed: array) -> float {
+    let bs = jl_slice(packed, JL_CH_BROAD_SOCIAL)
+    let pa = jl_slice(packed, JL_CH_PARTNER_ATT)
+    let rv = jl_slice(packed, JL_CH_REL_VALUE)
+    let a = jl_mi(bs, pa)
+    let b = jl_mi(bs, rv)
+    let c = jl_mi(pa, rv)
+    return (a + b + c) / 3.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests T1..T5
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    // T1 Triangular trigger (Buss 1992 three-entity requirement):
+    //   Jealousy state fires only when all three entities are present
+    //   and partner attention partially redirected. Removing rival
+    //   (TWO_PARTY) collapses trigger — AND-gate threat_detect =
+    //   rival * similar * (1 − attention) zeroes when rival ≈ 0.
+    //
+    //   Gate (magnitude-based — flat-noise MI is unreliable for the
+    //   two-party control, same issue as PTSD T1 feedback):
+    //     (a) mean(state | triangular) > JL_STATE_MIN
+    //     (b) mean(state | triangular) − mean(state | two_party) >
+    //         JL_TRIG_GAP
+    //     (c) mean(state | in rival windows) − mean(state | outside) >
+    //         JL_TRIG_GAP
+    //   Root cause — MI choice: histogram MI on 24-step pure-jitter
+    //   streams (two-party detect & state both flat near zero) is
+    //   inflated by shared PRNG patterns; magnitude separation is
+    //   the robust phenomenological measure.
+    let pack_tri = jl_run_pipeline(true,  JL_SIM_HIGH, JL_VAL_HIGH, 14101)
+    let pack_two = jl_run_pipeline(false, JL_SIM_HIGH, JL_VAL_HIGH, 14101)
+
+    let state_tri = jl_slice(pack_tri, JL_CH_JEALOUSY_STATE)
+    let state_two = jl_slice(pack_two, JL_CH_JEALOUSY_STATE)
+    let mean_tri = jl_mean(state_tri)
+    let mean_two = jl_mean(state_two)
+    let mean_gap = mean_tri - mean_two
+
+    // Within-vs-outside rival windows in triangular case — the temporal
+    // windowing signature. State should pulse within rival windows and
+    // stay quiet outside.
+    let mut sum_in = 0.0
+    let mut cnt_in = 0
+    let mut sum_out = 0.0
+    let mut cnt_out = 0
+    let mut t = 0
+    while t < JL_STEPS {
+        if jl_in_rival_window(t) {
+            sum_in = sum_in + state_tri[t]
+            cnt_in = cnt_in + 1
+        } else {
+            sum_out = sum_out + state_tri[t]
+            cnt_out = cnt_out + 1
+        }
+        t = t + 1
+    }
+    let mean_in  = sum_in  / to_float(cnt_in)
+    let mean_out = sum_out / to_float(cnt_out)
+    let window_gap = mean_in - mean_out
+
+    println("  [T1] state mean triangular=" + str(mean_tri) + " two_party=" + str(mean_two) + " mean_gap=" + str(mean_gap))
+    println("  [T1] state in-window=" + str(mean_in) + " out-window=" + str(mean_out) + " window_gap=" + str(window_gap))
+
+    let mut ok = true
+    // Triangular state magnitude must exceed floor
+    if mean_tri <= JL_STATE_MIN { ok = false }
+    // Triangular must dominate two-party by required margin
+    if mean_gap <= JL_TRIG_GAP { ok = false }
+    // Temporal windowing signature — pulses within rival windows
+    if window_gap <= JL_TRIG_GAP { ok = false }
+    return ok
+}
+
+fn check_T2() -> bool {
+    // T2 Relationship-value gating (Hupka 1984 evaluation component):
+    //   Same triangular geometry, rel_value toggled HIGH vs LOW.
+    //   High: state fires; low: rel_value gate nullifies state.
+    //
+    //   Gate: Φ_jealousy(high) − Φ_jealousy(low) > JL_VALUE_GAP
+    //         AND mean(state | low) < JL_LOW_CEIL.
+    //   Root cause: jl_gen_jealousy_state multiplies detect × value,
+    //   so value ≈ 0.05 collapses state regardless of detection.
+    let pack_hi = jl_run_pipeline(true, JL_SIM_HIGH, JL_VAL_HIGH, 14102)
+    let pack_lo = jl_run_pipeline(true, JL_SIM_HIGH, JL_VAL_LOW,  14102)
+
+    let phi_hi = jl_phi_jealousy(pack_hi)
+    let phi_lo = jl_phi_jealousy(pack_lo)
+    let gap = phi_hi - phi_lo
+
+    let state_lo = jl_slice(pack_lo, JL_CH_JEALOUSY_STATE)
+    let mean_lo = jl_mean(state_lo)
+
+    let state_hi = jl_slice(pack_hi, JL_CH_JEALOUSY_STATE)
+    let mean_hi = jl_mean(state_hi)
+
+    println("  [T2] Phi_jealousy high_value=" + str(phi_hi) + " low_value=" + str(phi_lo) + " gap=" + str(gap))
+    println("  [T2] state mean high=" + str(mean_hi) + " low=" + str(mean_lo) + " (ceil=" + str(JL_LOW_CEIL) + ")")
+
+    let mut ok = true
+    // Specificity gap
+    if gap <= JL_VALUE_GAP { ok = false }
+    // Low-value state must stay quiet (below ceiling)
+    if mean_lo >= JL_LOW_CEIL { ok = false }
+    return ok
+}
+
+fn check_T3() -> bool {
+    // T3 Rival-threat magnitude (Buss & Shackelford 1997;
+    //                              White & Mullen 1989):
+    //   Replacement potential scales jealousy. With identical
+    //   rival-presence pulses, HIGH similarity produces strong
+    //   threat_detect, LOW similarity weak. Scaling propagates
+    //   through state = detect × value.
+    //
+    //   Gate:
+    //     (a) mean(threat | high_sim) − mean(threat | low_sim) > JL_SIM_GAP
+    //         (detection-magnitude scaling)
+    //     (b) mean(state  | high_sim) − mean(state  | low_sim) > JL_STATE_MIN
+    //         (magnitude propagation to affective channel)
+    //     (c) MI(threat_detect, state | high_sim) > JL_SIM_MI_MIN
+    //         (binding coupling floor under high-sim regime)
+    //
+    //   Root cause — MI choice: we do NOT use MI(rival_similar,
+    //   state) because rival_similar is flat drift around a single
+    //   mean (0.92 or 0.10) with only jitter variance — histogram
+    //   collapses to one bin, MI unstable. MI(threat, state) is
+    //   structured at both ends under high-sim (rival pulses
+    //   propagate through both), so histogram MI is well-defined.
+    let pack_hi = jl_run_pipeline(true, JL_SIM_HIGH, JL_VAL_HIGH, 14103)
+    let pack_lo = jl_run_pipeline(true, JL_SIM_LOW,  JL_VAL_HIGH, 14103)
+
+    let th_hi = jl_slice(pack_hi, JL_CH_THREAT_DETECT)
+    let th_lo = jl_slice(pack_lo, JL_CH_THREAT_DETECT)
+    let mean_th_hi = jl_mean(th_hi)
+    let mean_th_lo = jl_mean(th_lo)
+    let th_gap = mean_th_hi - mean_th_lo
+
+    let st_hi = jl_slice(pack_hi, JL_CH_JEALOUSY_STATE)
+    let st_lo = jl_slice(pack_lo, JL_CH_JEALOUSY_STATE)
+    let mean_st_hi = jl_mean(st_hi)
+    let mean_st_lo = jl_mean(st_lo)
+    let st_gap = mean_st_hi - mean_st_lo
+
+    // MI(threat_detect, jealousy_state) under high-sim — the binding
+    // coupling that carries similarity-structured threat into the
+    // affective channel.
+    let phi_bind_hi = jl_phi_jealousy(pack_hi)
+
+    println("  [T3] threat_detect mean high_sim=" + str(mean_th_hi) + " low_sim=" + str(mean_th_lo) + " gap=" + str(th_gap))
+    println("  [T3] jealousy_state mean high_sim=" + str(mean_st_hi) + " low_sim=" + str(mean_st_lo) + " gap=" + str(st_gap))
+    println("  [T3] MI(threat_detect, jealousy_state) high_sim=" + str(phi_bind_hi) + " (floor=" + str(JL_SIM_MI_MIN) + ")")
+
+    let mut ok = true
+    // Detection-magnitude separation with similarity axis
+    if th_gap <= JL_SIM_GAP { ok = false }
+    // State-magnitude propagation (smaller threshold — relationship
+    // value factor attenuates through multiplicative gate, so we
+    // require a more modest gap for the propagated signal)
+    if st_gap <= JL_STATE_MIN { ok = false }
+    // Binding coupling under high-sim regime
+    if phi_bind_hi <= JL_SIM_MI_MIN { ok = false }
+    return ok
+}
+
+fn check_T4() -> bool {
+    // T4 Protective vigilance (Daly-Wilson-Weghorst 1982;
+    //                           Buss & Shackelford 1997):
+    //   Jealousy RESTRUCTURES attention toward partner-monitoring.
+    //
+    //   Gate:
+    //     (a) MI(state, protect_vig) > JL_VIG_MI_MIN in triangular
+    //     (b) mean(vig | triangular) − mean(vig | two_party) > JL_VIG_MEAN_GAP
+    //     (c) Pearson |r| on first JL_WIN samples > eps
+    //   Root cause: jl_gen_protect_vig = JL_VIG_BASE + JL_VIG_GAIN *
+    //   state. Two-party state ≈ 0 → vigilance collapses to baseline.
+    let pack_tri = jl_run_pipeline(true,  JL_SIM_HIGH, JL_VAL_HIGH, 14104)
+    let pack_two = jl_run_pipeline(false, JL_SIM_HIGH, JL_VAL_HIGH, 14104)
+
+    let mi_tri = jl_phi_vigilance(pack_tri)
+
+    let vig_tri = jl_slice(pack_tri, JL_CH_PROTECT_VIG)
+    let vig_two = jl_slice(pack_two, JL_CH_PROTECT_VIG)
+    let mean_tri = jl_mean(vig_tri)
+    let mean_two = jl_mean(vig_two)
+    let mean_gap = mean_tri - mean_two
+
+    let state_tri = jl_slice(pack_tri, JL_CH_JEALOUSY_STATE)
+    let r_abs = jl_pearson_abs(state_tri, vig_tri, JL_WIN)
+
+    println("  [T4] MI(jealousy, protect_vig) triangular=" + str(mi_tri) + " (floor=" + str(JL_VIG_MI_MIN) + ")")
+    println("  [T4] protect_vig mean triangular=" + str(mean_tri) + " two_party=" + str(mean_two) + " gap=" + str(mean_gap))
+    println("  [T4] pearson|r|(state,vig) win=" + str(JL_WIN) + " = " + str(r_abs))
+
+    let mut ok = true
+    // Coupling floor
+    if mi_tri <= JL_VIG_MI_MIN { ok = false }
+    // Behavioural activation gap
+    if mean_gap <= JL_VIG_MEAN_GAP { ok = false }
+    // Linear driving relationship must be detectable
+    if r_abs <= JL_EPS { ok = false }
+    return ok
+}
+
+fn check_T5() -> bool {
+    // T5 Φ fragmentation (attentional narrowing signature):
+    //   During active jealousy threat loop (state, detect, vig)
+    //   integrates tightly while broader social channels (broad_social,
+    //   partner_att, rel_value) de-correlate.
+    //
+    //   Gate:
+    //     (a) Φ_threat_loop > Φ_broad_social + JL_FRAG_GAP
+    //     (b) Φ_threat_loop > Φ_neutral + JL_FLOOR_GAP
+    //     (c) determinism — repeat seed → byte-identical Φ
+    //     (d) pipeline latency < JL_LATENCY_MS
+    //   Root cause (narrowing): jl_gen_broad_social subtracts
+    //   JL_NARROW_GAIN × state, so state firing actively suppresses
+    //   broad_social; variance strips coupling to slow-drifting
+    //   partner_att / rel_value channels.
+    //   Root cause (loop integration): all three loop channels are
+    //   driven by a common upstream (threat_detect), so pairwise MI
+    //   is anchored to the same structured signal.
+    let t0 = clock()
+
+    // Run A: triangular jealousy
+    let pack_a = jl_run_pipeline(true, JL_SIM_HIGH, JL_VAL_HIGH, 14105)
+
+    // Run B: identical seeds (determinism test)
+    let pack_b = jl_run_pipeline(true, JL_SIM_HIGH, JL_VAL_HIGH, 14105)
+
+    // Neutral floor: all 8 channels are low-amplitude uniform noise.
+    let n1 = jl_gen_neutral(14105 + 1000)
+    let n2 = jl_gen_neutral(14105 + 2000)
+    let n3 = jl_gen_neutral(14105 + 3000)
+    let n4 = jl_gen_neutral(14105 + 4000)
+    let n5 = jl_gen_neutral(14105 + 5000)
+    let n6 = jl_gen_neutral(14105 + 6000)
+    let n7 = jl_gen_neutral(14105 + 7000)
+    let n8 = jl_gen_neutral(14105 + 8000)
+    let mut pack_neutral = []
+    let mut i = 0
+    while i < JL_STEPS {
+        pack_neutral = pack_neutral.push(n1[i])
+        i = i + 1
+    }
+    let mut j = 0
+    while j < JL_STEPS {
+        pack_neutral = pack_neutral.push(n2[j])
+        j = j + 1
+    }
+    let mut k = 0
+    while k < JL_STEPS {
+        pack_neutral = pack_neutral.push(n3[k])
+        k = k + 1
+    }
+    let mut m = 0
+    while m < JL_STEPS {
+        pack_neutral = pack_neutral.push(n4[m])
+        m = m + 1
+    }
+    let mut p = 0
+    while p < JL_STEPS {
+        pack_neutral = pack_neutral.push(n5[p])
+        p = p + 1
+    }
+    let mut q = 0
+    while q < JL_STEPS {
+        pack_neutral = pack_neutral.push(n6[q])
+        q = q + 1
+    }
+    let mut r = 0
+    while r < JL_STEPS {
+        pack_neutral = pack_neutral.push(n7[r])
+        r = r + 1
+    }
+    let mut u = 0
+    while u < JL_STEPS {
+        pack_neutral = pack_neutral.push(n8[u])
+        u = u + 1
+    }
+
+    let phi_loop    = jl_phi_threat_loop(pack_a)
+    let phi_broad   = jl_phi_broad_social(pack_a)
+    let phi_neutral = jl_phi_threat_loop(pack_neutral)
+    let frag_gap    = phi_loop - phi_broad
+    let floor_gap   = phi_loop - phi_neutral
+
+    // Determinism: byte-identical Φ on repeat seed
+    let phi_loop_b = jl_phi_threat_loop(pack_b)
+    let d_loop = jl_abs(phi_loop - phi_loop_b)
+
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+
+    println("  [T5] Phi_threat_loop=" + str(phi_loop) + " Phi_broad_social=" + str(phi_broad) + " frag_gap=" + str(frag_gap))
+    println("  [T5] Phi_neutral=" + str(phi_neutral) + " floor_gap=" + str(floor_gap))
+    println("  [T5] determinism: run_a=" + str(phi_loop) + " run_b=" + str(phi_loop_b) + " diff=" + str(d_loop))
+    println("  [T5] pipeline latency = " + str(ms) + " ms (gate=" + str(JL_LATENCY_MS) + ")")
+
+    let mut ok = true
+    // Threat-loop integration dominates broad-social integration
+    if frag_gap <= JL_FRAG_GAP { ok = false }
+    // Threat-loop integration exceeds neutral floor
+    if floor_gap <= JL_FLOOR_GAP { ok = false }
+    // Byte-identical determinism
+    if d_loop > JL_DETERM_TOL { ok = false }
+    // Latency cap
+    if ms >= JL_LATENCY_MS { ok = false }
+    return ok
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — execute 5 self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[jealousy_phi] P141 — Jealousy Phi (Buss triangular threat, 3-party)")
+    println("  channels: partner_att | rival_present | rival_similar | rel_value")
+    println("            -> threat_detect -> jealousy_state -> protect_vig / broad_social")
+    println("  refs: Buss 1992/2000 | Hupka 1984 | Daly-Wilson-Weghorst 1982 | Buss&Shackelford 1997")
+    println("  pa_base=" + str(JL_PA_BASE) + " pa_withdrawn=" + str(JL_PA_WITHDRAWN))
+    println("  sim_high=" + str(JL_SIM_HIGH) + " sim_low=" + str(JL_SIM_LOW))
+    println("  val_high=" + str(JL_VAL_HIGH) + " val_low=" + str(JL_VAL_LOW))
+    println("  rival_windows: [" + str(JL_RIV1_START) + "," + str(JL_RIV1_END) + ") [" + str(JL_RIV2_START) + "," + str(JL_RIV2_END) + ")")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS  triangular trigger — 3 entities required (Buss three-entity specificity)") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS  relationship-value gating — high-value fires, low-value collapses (Hupka)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS  rival-threat magnitude — similarity scales threat (Buss-Shackelford replacement)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS  protective vigilance — MI(jealousy, guarding) + behavioural activation (Daly-Wilson)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS  Phi fragmented — threat-loop > broad-social + neutral + determinism + latency") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause comment: stage0 && chains with 5 operands can mis-short-
+    // circuit under certain orderings (same idiom as curiosity_phi,
+    // gratitude_phi, ptsd_phi, social_tom_phi). Sequential mutable-bool
+    // guard is the reliable pattern.
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[jealousy_phi] 5/5 PASS — P141 DONE (jealousy Phi triangular threat + value gating + similarity scaling + vigilance + fragmentation verified)")
+    } else {
+        println("[jealousy_phi] SOME FAILED")
+    }
+}
+
+main()
