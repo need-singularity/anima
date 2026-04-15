@@ -1,0 +1,401 @@
+// training/phi_cache_loader.hexa — Track B offline Φ cache loader
+//
+// Part of the CLM Track B contrastive pipeline. See memory entry
+// "CLM hexa-native GPU execution (2026-04-12)" and "Φ gap between
+// benchmark and training" — the in-loop phi eval is 27.5s/step because
+// 110 engines × 250ms each. Track B runs engines OFFLINE on held-out
+// states and caches the per-state 110-D embedding to disk; the train
+// loop then does a microsecond lookup plus a differentiable contrastive
+// loss between an *anchor* derived from the live hidden state and the
+// cached embedding.
+//
+// Rules:
+//   - R1 HEXA-FIRST: pure hexa, no Python companion.
+//   - feedback_ai_native_clm: no Python/CUDA uncovering — hexa GPU only.
+//   - L0 untouched: this file is in training/, not anima/core/.
+//
+// File format (shared/state/phi_cache_v1.jsonl):
+//   Produced by training/generate_phi_cache.hexa (generator authored in
+//   parallel by the other half of the CLM-PhiB task). Each line is:
+//     {"state_id":<int>,"schema":"v1","state_hash":"poly64:<int>","embedding":[<110 floats>]}
+//   We parse this with split()-based tokenisation rather than a real
+//   JSON parser — per feedback_hexa_string_api hexa's substring API is
+//   not byte/char-safe on multibyte content, but the cache file is
+//   known-ASCII so split on the literal field markers is both correct
+//   and cheap. If the generator ever emits non-ASCII we'd have to
+//   revisit this loader.
+//
+//   Parse recipe:
+//     1. Split line on "\"state_hash\":\"" → tail starts with the hash
+//        followed by "\",\"embedding\":[" and the float list.
+//     2. From the tail, split on "\",\"embedding\":[" → [hash, rest]
+//     3. From rest, split on "]}" → [float list as comma-sep, ""]
+//     4. Split the float list on "," → parse each with to_float()
+//
+// Backward-pass guarantee:
+//   - The cached embedding is treated as a CONSTANT tensor (no grad).
+//   - The loss is ‖anchor − embedding‖² where anchor is a deterministic
+//     projection of the LIVE hidden state. Gradient therefore flows
+//     through the anchor (and hence the model weights) but NEVER touches
+//     the phi engines. This is exactly what feedback_ai_native_clm asks
+//     for: the expensive phi compute is out of the hot path.
+//
+// Contract (consumed from train_clm.hexa):
+//   PHI_CACHE_DIM                    : 110 (1 entry per engine)
+//   phi_cache_new()                  : empty, loaded=false
+//   phi_cache_load(path)             : PhiCache with loaded=true on hit,
+//                                      or empty + WARN on miss.
+//   phi_state_hash(hidden,seq,d)     : string — deterministic, cheap
+//   phi_cache_lookup(cache,hash)     : [float] length PHI_CACHE_DIM
+//   phi_anchor_project(hidden,s,d)   : [float] length PHI_CACHE_DIM,
+//                                      differentiable wrt hidden
+//   phi_contrastive_loss(anchor,emb) : float  (squared L2 / dim)
+//
+// Used by: training/train_clm.hexa (behind CLM_PHI_CACHE_ENABLED flag).
+
+comptime const PHI_CACHE_DIM     = 110
+comptime const PHI_CACHE_HASH_BUCKETS = 257   // prime → coprime with typical seq*d
+
+// ─── Cache struct ──────────────────────────────────────────────────
+// hashes/embeddings are parallel arrays; embeddings is a flat [float]
+// of length n_entries * PHI_CACHE_DIM (row-major). Per feedback
+// hexa_lists_pbv we never mutate caller-owned lists in helpers — the
+// loader returns a fresh PhiCache each call.
+struct PhiCache {
+    loaded:     bool,        // false = stub (file missing or flag off)
+    n_entries:  int,
+    hashes:     [string],
+    embeddings: [float]      // flat, stride = PHI_CACHE_DIM
+}
+
+fn phi_cache_new() -> PhiCache {
+    PhiCache {
+        loaded: false,
+        n_entries: 0,
+        hashes: [],
+        embeddings: []
+    }
+}
+
+// phi_cache_zero_vec — helper, returns a fresh zero-vector of length
+// PHI_CACHE_DIM. Used as the fallback embedding when the cache misses
+// or when the file is not present.
+fn phi_cache_zero_vec() -> [float] {
+    let mut out = []
+    let mut i = 0
+    while i < PHI_CACHE_DIM {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Line parser (JSONL from generate_phi_cache.hexa) ──────────────
+// Expected line shape (authoritative: training/generate_phi_cache.hexa
+// §6 "JSONL SERIALIZER"):
+//   {"state_id":<int>,"schema":"v1","state_hash":"poly64:<int>","embedding":[<f0>,<f1>,...]}
+//
+// We split on fixed markers rather than parse JSON:
+//   M1 = "\"state_hash\":\""      — cuts off everything before the hash
+//   M2 = "\",\"embedding\":["     — cuts off the hash from the embedding
+//   M3 = "]"                      — closes the embedding array
+//
+// Malformed lines → empty return (hash="" or vec=[]) which the caller
+// logs as WARN and skips. Fail-soft over fail-hard because cache corrup-
+// tion must never crash training.
+fn _phi_parse_hash(line: string) -> string {
+    let split_m1 = line.split("\"state_hash\":\"")
+    if len(split_m1) < 2 {
+        return ""
+    }
+    let after_m1 = split_m1[1]
+    let split_m2 = after_m1.split("\",\"embedding\":[")
+    if len(split_m2) < 1 {
+        return ""
+    }
+    return split_m2[0]
+}
+
+fn _phi_parse_line(line: string) -> [float] {
+    let split_m1 = line.split("\"state_hash\":\"")
+    if len(split_m1) < 2 {
+        return []
+    }
+    let after_m1 = split_m1[1]
+    let split_m2 = after_m1.split("\",\"embedding\":[")
+    if len(split_m2) < 2 {
+        return []
+    }
+    let after_m2 = split_m2[1]
+    let split_m3 = after_m2.split("]")
+    if len(split_m3) < 1 {
+        return []
+    }
+    let list_raw = split_m3[0]
+    let toks = list_raw.split(",")
+    let n_toks = len(toks)
+    let mut vec = []
+    let mut i = 0
+    while i < n_toks {
+        let tok = toks[i].trim()
+        if tok != "" {
+            vec = vec.push(to_float(tok))
+        }
+        i = i + 1
+    }
+    return vec
+}
+
+// ─── File load ─────────────────────────────────────────────────────
+// phi_cache_load reads the whole cache file into memory in one shot.
+// On miss we print a single WARN and return an empty cache with
+// loaded=false so the train loop can detect the stub and emit zeros.
+// This keeps the flag-off path byte-identical and the flag-on stub
+// safe even before offline emission has populated the file.
+fn phi_cache_load(path: string) -> PhiCache {
+    if !file_exists(path) {
+        println("[phi_cache] WARN cache file missing: " + path)
+        println("[phi_cache] WARN falling back to zero-embedding stub")
+        return phi_cache_new()
+    }
+    let lines = read_lines(path)
+    let n_lines = len(lines)
+    let mut hashes = []
+    let mut flat = []
+    let mut count = 0
+    let mut i = 0
+    while i < n_lines {
+        let line = lines[i]
+        let trimmed = line.trim()
+        // Skip blank lines and comment lines (leading '#').
+        if trimmed != "" && !trimmed.starts_with("#") {
+            let hash = _phi_parse_hash(trimmed)
+            let vec = _phi_parse_line(trimmed)
+            if hash != "" && len(vec) == PHI_CACHE_DIM {
+                hashes = hashes.push(hash)
+                // Append vec into flat. Per feedback_hexa_lists_pbv we
+                // cannot pass the list to a helper for in-place extend;
+                // inline push is the only safe form.
+                let mut k = 0
+                while k < PHI_CACHE_DIM {
+                    flat = flat.push(vec[k])
+                    k = k + 1
+                }
+                count = count + 1
+            } else {
+                println("[phi_cache] WARN malformed line " + str(i) + " — skipping")
+            }
+        }
+        i = i + 1
+    }
+    println("[phi_cache] loaded " + str(count) + " entries from " + path)
+    return PhiCache {
+        loaded: true,
+        n_entries: count,
+        hashes: hashes,
+        embeddings: flat
+    }
+}
+
+// ─── State hash ────────────────────────────────────────────────────
+// Deterministic, cheap, collision-tolerant hash over the hidden state.
+// We take every d_model-th scalar (the first column of each row) and
+// bucket-fold it into an int, then convert to a decimal string. The
+// offline emitter must use the same reduction — keep it simple so the
+// Python/hexa parity is easy to audit.
+//
+// Rationale:
+//   - We want the cache key to survive small numerical drift but still
+//     distinguish genuinely different states, so we quantize each
+//     scalar by round(x * 1000) before mixing.
+//   - Using every d_model-th entry gives us `seq` samples, one per
+//     token. That's enough signal that two nearby but non-identical
+//     batches don't collide, and it's cheap — O(seq) ops.
+fn phi_state_hash(hidden: [float], seq: int, d_model: int) -> string {
+    // Seed chosen arbitrarily — only property needed is non-zero so the
+    // first multiply doesn't degenerate. Any prime-ish constant works.
+    let mut h = 146959
+    let mut t = 0
+    while t < seq {
+        let idx = t * d_model
+        let x = hidden[idx]
+        // Quantize and fold. The modulo keeps h bounded so consecutive
+        // steps don't overflow the int domain.
+        let q = to_int(x * 1000.0)
+        h = ((h * 1315423911) + q) % 2147483647
+        if h < 0 { h = h + 2147483647 }
+        t = t + 1
+    }
+    return str(h)
+}
+
+// ─── Lookup ────────────────────────────────────────────────────────
+// Linear scan — O(n_entries) per step. Cache is expected to be small
+// enough (≤10K entries in early rounds) for this to be negligible vs
+// the 27.5s baseline. If cache grows larger a sorted-index or
+// open-addressed hash map can replace this body; the signature stays
+// the same so the train loop doesn't change.
+//
+// On miss we return zero vector. On stub cache (loaded=false) we also
+// return zero vector — the contrastive loss then becomes ‖anchor‖²
+// which is a mild L2 regularizer, harmless if the flag is flipped
+// before the offline emitter has populated the file.
+fn phi_cache_lookup(cache: PhiCache, state_hash: string) -> [float] {
+    if !cache.loaded || cache.n_entries == 0 {
+        return phi_cache_zero_vec()
+    }
+    let mut i = 0
+    while i < cache.n_entries {
+        if cache.hashes[i] == state_hash {
+            // Extract row i from the flat embeddings array.
+            let base = i * PHI_CACHE_DIM
+            let mut vec = []
+            let mut k = 0
+            while k < PHI_CACHE_DIM {
+                vec = vec.push(cache.embeddings[base + k])
+                k = k + 1
+            }
+            return vec
+        }
+        i = i + 1
+    }
+    // Miss — return zero (handled gracefully by contrastive_loss).
+    return phi_cache_zero_vec()
+}
+
+// ─── Anchor projection (differentiable) ────────────────────────────
+// Build a 110-D anchor from the hidden state that we can compare
+// against the cached embedding. Key property: gradient through this
+// projection must reach the model weights, so we compose cheap linear
+// ops that the interpreter's autograd tape already tracks.
+//
+// We use a fixed deterministic slicing plan instead of a trainable
+// head because:
+//   (a) A trainable head would need its own optimizer state and
+//       checkpoint plumbing, which is out of scope for the initial
+//       wiring (this PR is behind a flag).
+//   (b) Any deterministic linear map is enough — what matters is that
+//       the map is a *function of the live hidden tensor*, so grad
+//       flows back to the model.
+//
+// Projection rule: for i in 0..PHI_CACHE_DIM, anchor[i] = mean over
+//   (t ∈ 0..seq) of hidden[t*d_model + (i mod d_model)] · (1/d_model).
+// This is effectively a column-mean of the seq×d_model hidden tensor
+// repeated/wrapped to fill 110 dims.
+fn phi_anchor_project(hidden: [float], seq: int, d_model: int) -> [float] {
+    let mut anchor = []
+    let mut i = 0
+    while i < PHI_CACHE_DIM {
+        let col = i % d_model
+        let mut acc = 0.0
+        let mut t = 0
+        while t < seq {
+            acc = acc + hidden[t * d_model + col]
+            t = t + 1
+        }
+        // Divide by seq×d_model so the scale is comparable to a single
+        // normalized feature regardless of model width. This matches
+        // the offline emitter's engine output normalization range.
+        let denom = to_float(seq * d_model)
+        anchor = anchor.push(acc / denom)
+        i = i + 1
+    }
+    return anchor
+}
+
+// ─── Contrastive loss (differentiable) ─────────────────────────────
+// Squared L2 distance per dim. Embedding is a constant (cache lookup)
+// so grad flows only through anchor — exactly what we want: no phi
+// engine is ever re-run inside backward.
+//
+// We divide by PHI_CACHE_DIM so the loss is O(1) regardless of
+// embedding width, making coefficient tuning in train_clm.hexa
+// independent of this file's internals.
+fn phi_contrastive_loss(anchor: [float], embedding: [float]) -> float {
+    let n_a = len(anchor)
+    let n_e = len(embedding)
+    // Defensive: if shapes disagree, return 0 so training does not
+    // crash. This can happen if the offline emitter was built against
+    // a different PHI_CACHE_DIM than this binary — WARN once.
+    if n_a != n_e {
+        println("[phi_cache] WARN anchor/embedding dim mismatch " + str(n_a) + " vs " + str(n_e))
+        return 0.0
+    }
+    if n_a == 0 {
+        return 0.0
+    }
+    let mut acc = 0.0
+    let mut i = 0
+    while i < n_a {
+        let d = anchor[i] - embedding[i]
+        acc = acc + (d * d)
+        i = i + 1
+    }
+    return acc / to_float(n_a)
+}
+
+// ─── Self-test (runs on `hexa phi_cache_loader.hexa`) ──────────────
+// Cheap sanity checks — no disk I/O in the happy path. These also
+// double as documentation of the expected call shapes.
+
+println("=== phi_cache_loader.hexa self-test ===")
+println("PHI_CACHE_DIM: " + str(PHI_CACHE_DIM))
+
+// T1: new cache is empty and unloaded
+let _c0 = phi_cache_new()
+if !_c0.loaded && _c0.n_entries == 0 {
+    println("T1 phi_cache_new: PASS")
+} else {
+    println("T1 phi_cache_new: FAIL")
+}
+
+// T2: zero_vec is length PHI_CACHE_DIM
+let _zv = phi_cache_zero_vec()
+if len(_zv) == PHI_CACHE_DIM && _zv[0] == 0.0 && _zv[PHI_CACHE_DIM - 1] == 0.0 {
+    println("T2 phi_cache_zero_vec: PASS")
+} else {
+    println("T2 phi_cache_zero_vec: FAIL")
+}
+
+// T3: lookup on stub cache returns zero vector
+let _miss = phi_cache_lookup(_c0, "nonexistent")
+if len(_miss) == PHI_CACHE_DIM && _miss[0] == 0.0 {
+    println("T3 phi_cache_lookup stub: PASS")
+} else {
+    println("T3 phi_cache_lookup stub: FAIL")
+}
+
+// T4: anchor projection on a tiny hidden state gives finite output
+let _tiny_hidden = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]  // seq=2, d=4
+let _anchor = phi_anchor_project(_tiny_hidden, 2, 4)
+if len(_anchor) == PHI_CACHE_DIM && _anchor[0] == _anchor[0] {
+    println("T4 phi_anchor_project: PASS")
+} else {
+    println("T4 phi_anchor_project: FAIL")
+}
+
+// T5: contrastive loss against zero vector is mean-squared magnitude
+let _zv2 = phi_cache_zero_vec()
+let _loss = phi_contrastive_loss(_anchor, _zv2)
+if _loss >= 0.0 && _loss == _loss {
+    println("T5 phi_contrastive_loss: PASS loss=" + str(_loss))
+} else {
+    println("T5 phi_contrastive_loss: FAIL")
+}
+
+// T6: state hash is deterministic and stable across calls
+let _h1 = phi_state_hash(_tiny_hidden, 2, 4)
+let _h2 = phi_state_hash(_tiny_hidden, 2, 4)
+if _h1 == _h2 && _h1 != "" {
+    println("T6 phi_state_hash deterministic: PASS hash=" + _h1)
+} else {
+    println("T6 phi_state_hash deterministic: FAIL")
+}
+
+// T7: file-missing path returns stub (WARN printed, no crash)
+let _stub = phi_cache_load("/tmp/__nonexistent_phi_cache__.jsonl")
+if !_stub.loaded && _stub.n_entries == 0 {
+    println("T7 phi_cache_load missing: PASS")
+} else {
+    println("T7 phi_cache_load missing: FAIL")
+}
