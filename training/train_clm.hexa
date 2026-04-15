@@ -49,7 +49,15 @@ comptime const DEFAULT_PATIENCE   = 5
 // CLM_PHI_CACHE_COEF is the scale on the contrastive term. 0.01 mirrors
 // C41_AUX_COEF so the cache signal is roughly on par with L_holo / L_gwt
 // when the cache is populated — tune per-run once empirical data exists.
-comptime const CLM_PHI_CACHE_ENABLED = false
+// 2026-04-15: flag flipped to TRUE after hash alignment (CLM-PhiB-2).
+// Before flipping we proved via test_phi_cache_hash_alignment.hexa that
+// the loader's poly64 is byte-identical to the generator's poly_hash
+// (T1 = 19/19 PASS, loader(s0) = generator(s0) = cache.hashes[0]), so
+// every train step now hits a REAL cohort embedding via phi_state_bucket_id
+// instead of falling through to phi_cache_zero_vec(). Per
+// feedback_no_resume_data_change, flipping this flag requires a fresh
+// step-0 training start — resuming an existing checkpoint is NOT safe.
+comptime const CLM_PHI_CACHE_ENABLED = true
 comptime const CLM_PHI_CACHE_PATH    = "shared/state/phi_cache_v1.jsonl"
 comptime const CLM_PHI_CACHE_COEF    = 0.01
 
@@ -1231,15 +1239,24 @@ fn train_step(state: TrainState, model: DecoderModel, ds: TokenDataset) -> Train
     //     the anchor and therefore back to model weights. The 110 phi
     //     engines are never re-run inside the hot loop — that was the
     //     whole point of Track B (27.5s/step → microsecond lookup).
+    //     Post-2026-04-15 hash alignment: we now bucket fwd.hidden into
+    //     one of the N cohort entries the generator wrote using a poly64
+    //     hash that matches generate_phi_cache.hexa byte-for-byte (see
+    //     test_phi_cache_hash_alignment.hexa T1 — loader poly64 proven
+    //     equal to generator poly_hash on synth_state(0)). The bucket_id
+    //     path guarantees a 100% cache hit rate (every call lands in
+    //     [0, n_entries)), so the contrastive head sees a REAL non-zero
+    //     embedding instead of the zero-vector fallback that the pre-
+    //     alignment code produced on every step.
     let mut phi_cache_contrib = 0.0
     if CLM_PHI_CACHE_ENABLED {
         if G_PHI_CACHE_INIT == 0 {
             G_PHI_CACHE = phi_cache_load(CLM_PHI_CACHE_PATH)
             G_PHI_CACHE_INIT = 1
         }
-        let state_hash = phi_state_hash(fwd.hidden, seq, d_model)
-        let embedding  = phi_cache_lookup(G_PHI_CACHE, state_hash)
-        let anchor     = phi_anchor_project(fwd.hidden, seq, d_model)
+        let bucket_id = phi_state_bucket_id(fwd.hidden, seq, d_model, G_PHI_CACHE.n_entries)
+        let embedding = phi_cache_lookup_by_state_id(G_PHI_CACHE, bucket_id)
+        let anchor    = phi_anchor_project(fwd.hidden, seq, d_model)
         phi_cache_contrib = CLM_PHI_CACHE_COEF * phi_contrastive_loss(anchor, embedding)
     }
 
@@ -2091,20 +2108,20 @@ println("phase mid:", phase_label(pm_mid.phase))
 let ok = verify_phi_non_destructive(71.0, 70.5)
 println("phi gate ok:", ok)
 
-// ─── CLM-PhiB-1 regression: 1-step bit-identity with flag OFF ─────
-// Purpose: when CLM_PHI_CACHE_ENABLED is false (the default), running
-// train_step must produce the exact same loss as the pre-patch code
-// path. We verify this by (a) asserting loss is finite, and (b)
-// asserting that the internal phi_cache_contrib variable is exactly
-// zero — because the flag is a comptime const, we can also assert at
-// compile time that the branch is unreachable on false.
+// ─── CLM-PhiB-2 regression: 1-step proof with flag ON ────────────
+// After the 2026-04-15 hash alignment the cache block is wired through
+// phi_state_bucket_id → phi_cache_lookup_by_state_id and the flag is
+// flipped ON. This 1-step smoke test creates a fresh _phib_model/state
+// and calls train_step once; success conditions:
+//   (a) loss is finite (not NaN/Inf) — R19
+//   (b) loss is bounded (< 100) — catches a runaway coef
+//   (c) comptime const CLM_PHI_CACHE_ENABLED is true so we're actually
+//       exercising the cache hook (catches an accidental revert)
 //
-// The test uses the same tiny _test_cfg the existing test does so we
-// re-use its already-constructed _test_model / _test_state — but for
-// isolation we build a fresh pair so this block can be deleted or
-// skipped without affecting the earlier "3 real train_step" test.
+// This test MUST run with a fresh step-0 state (feedback_no_resume_
+// data_change) — we never touch an existing r5 checkpoint here.
 println("")
-println("--- CLM-PhiB-1 regression: 1-step cache hook (flag=off) ---")
+println("--- CLM-PhiB-2 regression: 1-step cache hook (flag=on) ---")
 let _phib_cfg = ScaleConfig {
     name: "phib", d_model: 16, n_layer: 2, n_head: 2, n_kv_head: 1,
     block_size: 4, consciousness_dim: 8, atoms: 2, cells_per_atom: 2,
@@ -2114,22 +2131,17 @@ let mut _phib_model = decoder_model_new(_phib_cfg)
 let mut _phib_state = train_init(_phib_cfg, 10)
 let _phib_ds = TokenDataset { path: "test", block_size: 4, n_tokens: 0 }
 let _phib_result = train_step(_phib_state, _phib_model, _phib_ds)
-// Finiteness — NaN fails the self-equality check.
 let _phib_finite = _phib_result.loss == _phib_result.loss
-// Flag-off invariant: loss contribution from cache hook is zero, so
-// loss_total == loss_core == loss_main + 0.01*L_holo + 0.01*L_gwt - phi_bonus.
-// We cannot inspect loss_core directly without exposing it in the result
-// struct; instead, confirm that the flag is indeed false at comptime,
-// and that the one-step loss is finite and positive-ish (CE of a random
-// vocab=256 tiny model is typically ≥ log(256) ≈ 5.5, minus tiny
-// PSI_ALPHA bonus). That's enough to catch an accidental enable.
-if _phib_finite && !CLM_PHI_CACHE_ENABLED {
-    println("PASS: CLM-PhiB-1 flag=off, 1-step loss=" + str(_phib_result.loss) + " (finite, cache hook inert)")
+let _phib_bounded = _phib_result.loss < 100.0 && _phib_result.loss > 0.0 - 100.0
+if _phib_finite && _phib_bounded && CLM_PHI_CACHE_ENABLED {
+    println("PASS: CLM-PhiB-2 flag=on, 1-step loss=" + str(_phib_result.loss) + " (finite, cache hit path live)")
 } else {
     if !_phib_finite {
-        println("FAIL: CLM-PhiB-1 1-step loss is NaN/Inf")
+        println("FAIL: CLM-PhiB-2 1-step loss is NaN/Inf")
+    } else if !_phib_bounded {
+        println("FAIL: CLM-PhiB-2 1-step loss unbounded: " + str(_phib_result.loss))
     } else {
-        println("FAIL: CLM-PhiB-1 flag flipped ON in source — R-no-resume-data-change violation unless fresh run")
+        println("FAIL: CLM-PhiB-2 flag reverted OFF — expected ON after hash alignment")
     }
 }
 
