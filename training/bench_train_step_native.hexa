@@ -1,0 +1,290 @@
+// bench_train_step_native.hexa — CLM native compile spike
+//
+// Measures CLM train_step forward-pass compute in a native binary vs interpreted.
+// The full train_clm.hexa binary hits the stage0 struct-literal codegen bug
+// (no-arg constructors map-collapse) so we can't time its real train_step
+// directly. Instead we reproduce the same arithmetic pattern using
+// array-only primitives that are known-good on both the interpreter and
+// the hexa_v2 → C native path.
+//
+// Pattern matches one decoder layer's hot work at tiny-config:
+//   d_model = 16, d_ff = 64, seq = 4, n_head = 2
+//   forward compute: RMSNorm -> QKV matmul -> Softmax -> Attn out ->
+//                    RMSNorm -> SwiGLU FFN -> residual
+// That's the bulk of one train_step at tiny config, minus the backward
+// pass (which is roughly similar shape/flops — included via doubled loop).
+//
+// Known gaps worked around:
+//   (a) explicit `return` on every fn (stage0 implicit tail-return bug)
+//   (b) no scientific notation floats
+//   (c) no struct literals in no-arg fns (everything passed as args)
+//   (d) no theorem block
+
+// ─── Timing helper ──────────────────────────────────────────────
+fn now_ns() -> int {
+    let r = exec("date +%s%N 2>/dev/null || gdate +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))'")
+    let t = r.trim()
+    if t == "" { return 0 }
+    return to_int(t)
+}
+
+// ─── Array primitives (same as train_clm.hexa §A) ──────────────
+fn _tz(n: int) -> [float] {
+    let mut out = []
+    let mut i = 0
+    while i < n { out = out.push(0.0); i = i + 1 }
+    return out
+}
+
+fn _trandn(n: int, seed: int) -> [float] {
+    let PI = 3.141592653589793
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u1_raw = to_float(s % 1000000) / 1000000.0
+        let u1 = if u1_raw < 0.000001 { 0.000001 } else { u1_raw }
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u2 = to_float(s % 1000000) / 1000000.0
+        let r = sqrt(0.0 - 2.0 * log(u1))
+        let theta = 2.0 * PI * u2
+        let z = r * cos(theta)
+        out = out.push(z * 0.02)
+        i = i + 1
+    }
+    return out
+}
+
+fn _matmul(A: [float], B: [float], M: int, K: int, N: int) -> [float] {
+    let mut C = _tz(M * N)
+    let mut i = 0
+    while i < M {
+        let mut j = 0
+        while j < N {
+            let mut sum = 0.0
+            let mut k = 0
+            while k < K {
+                sum = sum + A[i * K + k] * B[k * N + j]
+                k = k + 1
+            }
+            C[i * N + j] = sum
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return C
+}
+
+fn _softmax(logits: [float]) -> [float] {
+    let n = len(logits)
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut exps = []
+    let mut s = 0.0
+    i = 0
+    while i < n {
+        let e = exp(logits[i] - mx)
+        exps = exps.push(e)
+        s = s + e
+        i = i + 1
+    }
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out.push(exps[i] / s)
+        i = i + 1
+    }
+    return out
+}
+
+fn _rmsnorm(x: [float], d: int) -> [float] {
+    let mut ss = 0.0
+    let mut i = 0
+    while i < d { ss = ss + x[i] * x[i]; i = i + 1 }
+    let rms = sqrt(ss / to_float(d) + 0.000001)
+    let mut out = []
+    i = 0
+    while i < d { out = out.push(x[i] / rms); i = i + 1 }
+    return out
+}
+
+fn _silu(x: float) -> float {
+    // silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+    let e = exp(0.0 - x)
+    return x / (1.0 + e)
+}
+
+// ─── Single forward-step compute kernel ─────────────────────────
+// Input: hidden state [seq × d], weight bundle, config
+// Output: new hidden [seq × d]
+// Work: roughly one decoder layer (attn + FFN)
+fn forward_step(h: [float], Wq: [float], Wk: [float], Wv: [float], Wo: [float],
+                Wgate: [float], Wup: [float], Wdown: [float],
+                seq: int, d: int, d_ff: int) -> [float] {
+    // 1. RMSNorm each row
+    let mut x = _tz(seq * d)
+    let mut si = 0
+    while si < seq {
+        let mut row = []
+        let mut k = 0
+        while k < d { row = row.push(h[si * d + k]); k = k + 1 }
+        let rn = _rmsnorm(row, d)
+        k = 0
+        while k < d { x[si * d + k] = rn[k]; k = k + 1 }
+        si = si + 1
+    }
+
+    // 2. QKV projections: [seq × d] @ [d × d] → [seq × d]
+    let Q = _matmul(x, Wq, seq, d, d)
+    let K = _matmul(x, Wk, seq, d, d)
+    let V = _matmul(x, Wv, seq, d, d)
+
+    // 3. Attention scores [seq × seq]
+    let scale = 1.0 / sqrt(to_float(d))
+    let mut scores = _tz(seq * seq)
+    si = 0
+    while si < seq {
+        let mut sj = 0
+        while sj < seq {
+            if sj <= si {
+                let mut sum = 0.0
+                let mut k = 0
+                while k < d {
+                    sum = sum + Q[si * d + k] * K[sj * d + k]
+                    k = k + 1
+                }
+                scores[si * seq + sj] = sum * scale
+            } else {
+                scores[si * seq + sj] = 0.0 - 1000000000000000000000000000000.0
+            }
+            sj = sj + 1
+        }
+        si = si + 1
+    }
+
+    // 4. Row-wise softmax + weighted V
+    let mut attn_out = _tz(seq * d)
+    si = 0
+    while si < seq {
+        let mut row = []
+        let mut sj = 0
+        while sj < seq { row = row.push(scores[si * seq + sj]); sj = sj + 1 }
+        let w = _softmax(row)
+        let mut k = 0
+        while k < d {
+            let mut sum = 0.0
+            sj = 0
+            while sj < seq {
+                sum = sum + w[sj] * V[sj * d + k]
+                sj = sj + 1
+            }
+            attn_out[si * d + k] = sum
+            k = k + 1
+        }
+        si = si + 1
+    }
+
+    // 5. Output projection
+    let o = _matmul(attn_out, Wo, seq, d, d)
+
+    // 6. Residual add
+    let mut h1 = _tz(seq * d)
+    let mut idx = 0
+    while idx < seq * d {
+        h1[idx] = h[idx] + o[idx]
+        idx = idx + 1
+    }
+
+    // 7. Post-attn RMSNorm
+    let mut x2 = _tz(seq * d)
+    si = 0
+    while si < seq {
+        let mut row = []
+        let mut k = 0
+        while k < d { row = row.push(h1[si * d + k]); k = k + 1 }
+        let rn = _rmsnorm(row, d)
+        k = 0
+        while k < d { x2[si * d + k] = rn[k]; k = k + 1 }
+        si = si + 1
+    }
+
+    // 8. SwiGLU FFN: gate = silu(x2 @ Wgate), up = x2 @ Wup, h_ff = (gate * up) @ Wdown
+    let gate = _matmul(x2, Wgate, seq, d, d_ff)
+    let up   = _matmul(x2, Wup,   seq, d, d_ff)
+    let mut ga = _tz(seq * d_ff)
+    let mut gi = 0
+    while gi < seq * d_ff {
+        ga[gi] = _silu(gate[gi]) * up[gi]
+        gi = gi + 1
+    }
+    let ffn = _matmul(ga, Wdown, seq, d_ff, d)
+
+    // 9. Final residual
+    let mut h2 = _tz(seq * d)
+    idx = 0
+    while idx < seq * d {
+        h2[idx] = h1[idx] + ffn[idx]
+        idx = idx + 1
+    }
+    return h2
+}
+
+// ─── Benchmark driver ───────────────────────────────────────────
+println("=== bench_train_step_native.hexa ===")
+let seq = 4
+let d = 16
+let d_ff = 64
+let n_layer = 2
+let n_iters = 10
+println("config: seq=" + str(seq) + " d=" + str(d) + " d_ff=" + str(d_ff) +
+        " n_layer=" + str(n_layer) + " iters=" + str(n_iters))
+
+// Initialize weights once (outside the timed loop)
+let Wq    = _trandn(d * d,    1001)
+let Wk    = _trandn(d * d,    1002)
+let Wv    = _trandn(d * d,    1003)
+let Wo    = _trandn(d * d,    1004)
+let Wgate = _trandn(d * d_ff, 1005)
+let Wup   = _trandn(d * d_ff, 1006)
+let Wdown = _trandn(d_ff * d, 1007)
+let Wq2    = _trandn(d * d,    2001)
+let Wk2    = _trandn(d * d,    2002)
+let Wv2    = _trandn(d * d,    2003)
+let Wo2    = _trandn(d * d,    2004)
+let Wgate2 = _trandn(d * d_ff, 2005)
+let Wup2   = _trandn(d * d_ff, 2006)
+let Wdown2 = _trandn(d_ff * d, 2007)
+
+// Warmup iteration
+let mut h = _trandn(seq * d, 42)
+let h_warm = forward_step(h, Wq, Wk, Wv, Wo, Wgate, Wup, Wdown, seq, d, d_ff)
+let h_warm2 = forward_step(h_warm, Wq2, Wk2, Wv2, Wo2, Wgate2, Wup2, Wdown2, seq, d, d_ff)
+println("warmup h[0] = " + str(h_warm2[0]))
+
+// ── Timed loop ──
+// One "step" = forward pass through n_layer decoder layers on seq×d input.
+// This is the dominant compute of tiny-config train_step.
+let t0 = now_ns()
+let mut k = 0
+let mut h_cur = _trandn(seq * d, 42)
+while k < n_iters {
+    let h_l1 = forward_step(h_cur, Wq, Wk, Wv, Wo, Wgate, Wup, Wdown, seq, d, d_ff)
+    let h_l2 = forward_step(h_l1, Wq2, Wk2, Wv2, Wo2, Wgate2, Wup2, Wdown2, seq, d, d_ff)
+    h_cur = h_l2
+    k = k + 1
+}
+let t1 = now_ns()
+let total_ns = t1 - t0
+let per_step_ns = total_ns / n_iters
+println("total_ns:     " + str(total_ns))
+println("per_step_ns:  " + str(per_step_ns))
+println("per_step_us:  " + str(to_float(per_step_ns) / 1000.0))
+println("per_step_ms:  " + str(to_float(per_step_ns) / 1000000.0))
+println("final h[0]:   " + str(h_cur[0]))
+println("final h[15]:  " + str(h_cur[15]))
+println("=== bench complete ===")
