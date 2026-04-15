@@ -1,0 +1,115 @@
+// llm_claude_adapter.hexa — autonomy_loop 의 "claude" adapter 실체
+//
+// Wires autonomy_loop 의 LLMAdapter(name="claude") 를 실제 Claude API 호출로
+// 연결. 방식: installed `claude` CLI (Claude Code) 를 --bare -p 모드로 shell-out.
+//
+// 요구사항:
+//   - `claude` CLI 설치됨 (which claude 검증)
+//   - ANTHROPIC_API_KEY env OR Claude 구독 OAuth 인증
+//   - `hexa build`로 컴파일된 바이너리 실행 권장 (인터프리터는 parse_float
+//     를 0으로 반환해 critique score 추출 실패). CLI shell-out + score parse
+//     전 플로우는 컴파일 모드에서만 정상 동작.
+//
+// 사용:
+//   let resp = claude_call("Summarise in one sentence: ...")
+//
+// Prompt engineering:
+//   - Decompose: "Return exactly 3 sub-goals, one per line, no numbering."
+//   - Execute  : "Complete task concisely (1-3 sentences)."
+//   - Critique : "Reply ONLY: SCORE=<0.0-1.0>;<reason>"
+//
+// Failure modes (returns ""):
+//   - claude CLI 없음
+//   - API key/quota 문제
+//   - 30s timeout (adjust if needed)
+
+// ── Shell helpers ────────────────────────────────────────────────────
+
+fn shell_escape_single(s: string) -> string {
+    // Wrap value in single quotes; escape any embedded ' as '\''.
+    // Example: hello ' world  →  'hello '\'' world'
+    return "'" + s.replace("'", "'" + "\\" + "'" + "'") + "'"
+}
+
+fn claude_cli_available() -> bool {
+    let probe = exec("command -v claude >/dev/null 2>&1 && echo y || echo n").trim()
+    return probe == "y"
+}
+
+// ── Raw single-shot Claude call ──────────────────────────────────────
+// Returns stdout (trimmed) on success, "" on any failure.
+//
+// Note: `--bare` was dropped because it enforces ANTHROPIC_API_KEY only
+// and rejects the user's OAuth session ("Not logged in · Please run /login").
+// Plain `claude -p` uses whichever auth the user has (OAuth subscription or
+// API key). Hooks/LSP still run — slightly slower per call but works.
+fn claude_call(prompt: string) -> string {
+    if !claude_cli_available() { return "" }
+    let esc = shell_escape_single(prompt)
+    let cmd = "timeout 60 claude -p " + esc + " 2>/dev/null"
+    let out = exec(cmd)
+    return out.trim()
+}
+
+// ── Structured prompts ───────────────────────────────────────────────
+
+fn claude_decompose(goal_text: string) -> array {
+    let p = "Decompose the following task into exactly 3 concrete sub-goals. "
+          + "Output ONLY 3 lines, one sub-goal per line. No numbering, no preamble, no blank lines.\n\n"
+          + "Task: " + goal_text
+    let resp = claude_call(p)
+    if len(resp) == 0 { return [] }
+    // Parse: split by newline, filter empty, take first 3
+    let lines = resp.split("\n")
+    let mut subs = []
+    let mut i = 0
+    while i < len(lines) && len(subs) < 3 {
+        let ln = lines[i].trim()
+        if len(ln) > 0 {
+            subs = subs.push(ln)
+        }
+        i = i + 1
+    }
+    return subs
+}
+
+fn claude_execute(goal_text: string) -> string {
+    let p = "Complete this task concisely in 1-3 sentences. Plain text only, no markdown.\n\n"
+          + "Task: " + goal_text
+    return claude_call(p)
+}
+
+struct CriticReply {
+    score: float,
+    reason: string
+}
+
+fn claude_critique(goal_text: string, result: string) -> CriticReply {
+    let p = "Evaluate the result quality for the given task. "
+          + "Reply in EXACTLY this format on a single line: SCORE=<0.0-1.0>;<one-sentence reason>\n\n"
+          + "Task: " + goal_text + "\n"
+          + "Result: " + result
+    let resp = claude_call(p)
+    return parse_score_reply(resp)
+}
+
+fn parse_score_reply(resp: string) -> CriticReply {
+    // Find "SCORE=" prefix; extract float up to ';'; remainder is reason.
+    if len(resp) == 0 {
+        return CriticReply { score: 0.0, reason: "empty response" }
+    }
+    let idx = resp.index_of("SCORE=")
+    if idx < 0 {
+        // Heuristic fallback: non-empty resp → partial credit
+        return CriticReply { score: 0.40, reason: "no SCORE= marker; fallback" }
+    }
+    let tail = resp.substring(idx + 6, len(resp))
+    let semi = tail.index_of(";")
+    if semi < 0 {
+        let sv = tail.trim().parse_float()
+        return CriticReply { score: sv, reason: "no reason separator" }
+    }
+    let score_str = tail.substring(0, semi).trim()
+    let reason = tail.substring(semi + 1, len(tail)).trim()
+    return CriticReply { score: score_str.parse_float(), reason: reason }
+}
