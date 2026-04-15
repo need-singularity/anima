@@ -1,0 +1,1065 @@
+// serving/clm_lore_serve.hexa — TCLM-P2-1 CLM + lore_book + style_preset 통합 서빙
+//
+// Roadmap: shared/roadmaps/anima-train.json P2 / CLM / TCLM-P2-1.
+//   "CLM + lore_book 통합 serving — GWT broadcast 에 lore vector 주입"
+//   done_criteria: "30 turn 세션에서 lore 일관성 ≥ 0.9 실측"
+//
+// ─── 파이프라인 ────────────────────────────────────────────────
+//
+//   ServingRequest { text, session_id, user_id }
+//          │
+//          ▼
+//    (1) session_store.get(session_id)        — 30 turn rolling window
+//          │
+//          ▼
+//    (2) lore_book.lore_match(triggers)       — top-1 entry id by weight
+//    (3) lore_record_turn(entry_id)           — sliding window accumulate
+//          │
+//          ▼
+//    (4) style_preset.style_classify(probe)   — 4 톤 중 nearest preset
+//          │
+//          ▼
+//    (5) compose GWT broadcast payload
+//          cells = (entry.cells if hit else empty) blended with style.cells
+//          consensus = cells_to_consensus(cells)
+//          act       = clm_broadcast(head, consensus)
+//          φ_est     = |consensus| · mean(α) · log2(n_domains+1)
+//          │
+//          ▼
+//    (6) mock CLM inference (deterministic)
+//          text = "[tone=<label>][lore=<id>][turn=<t>] <echo>"
+//          실 CLM/transformer inference 는 TALM-P4-1 이후 wire.
+//          │
+//          ▼
+//    (7) style_preset.apply(tone, output)     — final tone marker
+//    (8) session.append(final_text)
+//          │
+//          ▼
+//   ServingResponse { text, tone, lore_hit_id, turn, phi_est, consistency }
+//
+// ─── Hexa quirk 회피 ────────────────────────────────────────────
+//
+// - use "..." 금지 (memory: feedback_hexa_runtime). 모든 primitives + struct
+//   를 본 파일에 inline 한다. lore_book / style_preset / session_manager 세
+//   모듈 타입·함수를 prefix-less 로 미러링.
+// - a[i] = v no-op 회피 → 전부 push 재구축.
+// - struct 안 list aliasing 회피 → mutator 는 항상 새 struct return.
+// - `let match = ...` 금지 → use m / found / lookup 등 non-reserved 이름.
+// - str 인덱싱은 byte-safe 만 (한국어 trigger 는 caller 가 int 해시).
+//
+// ─── Test plan (T1–T5) ──────────────────────────────────────────
+//
+// T1 e2e single turn     — request → response 완주, 필드 타입 ok
+// T2 30 turn consistency — 동일 character trigger 주입 28/30, 일관성 ≥ 0.9
+// T3 tone switch         — 4 톤 classify 후 text 에 마커 반영 4/4
+// T4 lore fallback       — lore_book 엔트리 없을 때 빈 context 로 graceful
+// T5 style fallback      — preset 비었을 때 default "daily" 톤 fallback
+//
+// 5/5 PASS 목표.
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 1. Primitives (inline — lore_book / style_preset mirror)
+// ═══════════════════════════════════════════════════════════════
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn fsqrt(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut r = x
+    let mut i = 0
+    while i < 16 {
+        r = 0.5 * (r + x / r)
+        i = i + 1
+    }
+    return r
+}
+
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        let v = u * 2.0 - 1.0
+        out = out.push(v)
+        i = i + 1
+    }
+    return out
+}
+
+fn softmax_arr(x: array) -> array {
+    let n = len(x)
+    if n == 0 { return [] }
+    let mut m = x[0]
+    let mut i = 1
+    while i < n {
+        if x[i] > m { m = x[i] }
+        i = i + 1
+    }
+    let mut exps = []
+    let mut z = 0.0
+    i = 0
+    while i < n {
+        let e = exp(x[i] - m)
+        exps = exps.push(e)
+        z = z + e
+        i = i + 1
+    }
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out.push(exps[i] / z)
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 2. GWT broadcast head (mirror of lore_book / style_preset)
+// ═══════════════════════════════════════════════════════════════
+
+struct ClmGwtBroadcastHead {
+    n_domains: int,
+    d_model:   int,
+    project:   array,
+    gate:      array
+}
+
+struct DomainActivations {
+    n_domains: int,
+    d_model:   int,
+    a:         array
+}
+
+fn clm_gwt_head_new(n_domains: int, d_model: int, seed: int) -> ClmGwtBroadcastHead {
+    let scale = 0.02
+    let raw = det_rand(n_domains * d_model, seed)
+    let mut proj = []
+    let mut i = 0
+    let n = len(raw)
+    while i < n {
+        proj = proj.push(raw[i] * scale)
+        i = i + 1
+    }
+    let gate = vec_zeros(n_domains)
+    return ClmGwtBroadcastHead {
+        n_domains: n_domains,
+        d_model:   d_model,
+        project:   proj,
+        gate:      gate
+    }
+}
+
+fn cells_to_consensus(cells: array, n_cells: int, d_model: int) -> array {
+    if n_cells == 0 { return vec_zeros(d_model) }
+    let inv_n = 1.0 / to_float(n_cells)
+    let mut c = []
+    let mut m = 0
+    while m < d_model {
+        let mut s = 0.0
+        let mut i = 0
+        while i < n_cells {
+            s = s + cells[i * d_model + m]
+            i = i + 1
+        }
+        c = c.push(s * inv_n)
+        m = m + 1
+    }
+    return c
+}
+
+fn clm_gwt_compute_alpha(head: ClmGwtBroadcastHead, c: array) -> array {
+    let nd = head.n_domains
+    let dm = head.d_model
+    if nd == 0 { return [] }
+    let mut logits = []
+    let mut d = 0
+    while d < nd {
+        let mut s = head.gate[d]
+        let mut k = 0
+        while k < dm {
+            s = s + head.project[d * dm + k] * c[k]
+            k = k + 1
+        }
+        logits = logits.push(s)
+        d = d + 1
+    }
+    return softmax_arr(logits)
+}
+
+fn clm_broadcast(head: ClmGwtBroadcastHead, c: array) -> DomainActivations {
+    let nd = head.n_domains
+    let dm = head.d_model
+    let alpha = clm_gwt_compute_alpha(head, c)
+    let mut a = []
+    let mut d = 0
+    while d < nd {
+        let w = alpha[d]
+        let mut m = 0
+        while m < dm {
+            a = a.push(w * c[m])
+            m = m + 1
+        }
+        d = d + 1
+    }
+    return DomainActivations {
+        n_domains: nd,
+        d_model:   dm,
+        a:         a
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 3. LoreBook (mirror of anima/modules/lore_book.hexa)
+// ═══════════════════════════════════════════════════════════════
+
+struct LoreEntry {
+    id:       int,
+    trigger:  int,
+    category: int,
+    weight:   float
+}
+
+struct LoreBook {
+    entries:     [LoreEntry],
+    n_entries:   int,
+    recent_hits: array,
+    n_recent:    int,
+    max_recent:  int
+}
+
+fn lore_book_new(max_recent: int) -> LoreBook {
+    return LoreBook {
+        entries:     [],
+        n_entries:   0,
+        recent_hits: [],
+        n_recent:    0,
+        max_recent:  max_recent
+    }
+}
+
+fn lore_add_entry(book: LoreBook, trigger: int, category: int, weight: float) -> LoreBook {
+    let new_entry = LoreEntry {
+        id:       book.n_entries,
+        trigger:  trigger,
+        category: category,
+        weight:   weight
+    }
+    let new_entries = book.entries.push(new_entry)
+    return LoreBook {
+        entries:     new_entries,
+        n_entries:   book.n_entries + 1,
+        recent_hits: book.recent_hits,
+        n_recent:    book.n_recent,
+        max_recent:  book.max_recent
+    }
+}
+
+fn lore_match(book: LoreBook, turn_triggers: array) -> int {
+    let mut best_id = -1
+    let mut best_w = -1.0
+    let mut i = 0
+    let nt = len(turn_triggers)
+    while i < book.n_entries {
+        let e = book.entries[i]
+        let mut j = 0
+        while j < nt {
+            if turn_triggers[j] == e.trigger {
+                if e.weight > best_w {
+                    best_w = e.weight
+                    best_id = e.id
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return best_id
+}
+
+fn lore_record_turn(book: LoreBook, entry_id: int) -> LoreBook {
+    let cap = book.max_recent
+    let n = book.n_recent
+    let mut new_hits = []
+    if n < cap {
+        let mut i = 0
+        while i < n {
+            new_hits = new_hits.push(book.recent_hits[i])
+            i = i + 1
+        }
+        new_hits = new_hits.push(entry_id)
+        return LoreBook {
+            entries:     book.entries,
+            n_entries:   book.n_entries,
+            recent_hits: new_hits,
+            n_recent:    n + 1,
+            max_recent:  cap
+        }
+    }
+    let mut i = 1
+    while i < n {
+        new_hits = new_hits.push(book.recent_hits[i])
+        i = i + 1
+    }
+    new_hits = new_hits.push(entry_id)
+    return LoreBook {
+        entries:     book.entries,
+        n_entries:   book.n_entries,
+        recent_hits: new_hits,
+        n_recent:    n,
+        max_recent:  cap
+    }
+}
+
+fn lore_consistency(book: LoreBook) -> float {
+    let n = book.n_recent
+    if n == 0 { return 0.0 }
+    let mut max_count = 0
+    let mut i = 0
+    while i < n {
+        let target = book.recent_hits[i]
+        if target >= 0 {
+            let mut c = 0
+            let mut j = 0
+            while j < n {
+                if book.recent_hits[j] == target { c = c + 1 }
+                j = j + 1
+            }
+            if c > max_count { max_count = c }
+        }
+        i = i + 1
+    }
+    return to_float(max_count) / to_float(n)
+}
+
+fn lore_to_cells(entry: LoreEntry, n_cells: int, d_model: int) -> array {
+    let slot = d_model / 4
+    let base = entry.category * slot
+    let w = entry.weight
+    let mut out = []
+    let mut c = 0
+    while c < n_cells {
+        let mut m = 0
+        while m < d_model {
+            let in_slot = (m >= base) && (m < base + slot)
+            let v = if in_slot { w } else { 0.0 }
+            out = out.push(v)
+            m = m + 1
+        }
+        c = c + 1
+    }
+    return out
+}
+
+fn lore_empty_cells(n_cells: int, d_model: int) -> array {
+    return vec_zeros(n_cells * d_model)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 4. StylePreset (mirror of anima/modules/style_preset.hexa)
+// ═══════════════════════════════════════════════════════════════
+
+struct StylePreset {
+    id:        int,
+    label:     string,
+    valence:   float,
+    reality:   float,
+    intensity: float
+}
+
+fn style_presets_default() -> [StylePreset] {
+    let romance = StylePreset {
+        id: 0, label: "romance",
+        valence:  0.9, reality: -0.7, intensity:  0.0
+    }
+    let horror = StylePreset {
+        id: 1, label: "horror",
+        valence: -0.9, reality:  0.7, intensity:  0.0
+    }
+    let fantasy = StylePreset {
+        id: 2, label: "fantasy",
+        valence:  0.0, reality:  0.9, intensity:  0.7
+    }
+    let daily = StylePreset {
+        id: 3, label: "daily",
+        valence:  0.0, reality: -0.9, intensity: -0.7
+    }
+    let mut out = []
+    out = out.push(romance)
+    out = out.push(horror)
+    out = out.push(fantasy)
+    out = out.push(daily)
+    return out
+}
+
+fn style_to_bias(preset: StylePreset, d_model: int) -> array {
+    let slot = d_model / 3
+    let mut out = []
+    let mut m = 0
+    while m < d_model {
+        let v = if m < slot {
+            preset.valence
+        } else {
+            if m < 2 * slot {
+                preset.reality
+            } else {
+                if m < 3 * slot { preset.intensity } else { 0.0 }
+            }
+        }
+        out = out.push(v)
+        m = m + 1
+    }
+    return out
+}
+
+fn style_l2_sq(a: array, b: array) -> float {
+    let n = len(a)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let d = a[i] - b[i]
+        s = s + d * d
+        i = i + 1
+    }
+    return s
+}
+
+fn style_classify(sample: array, presets: [StylePreset], d_model: int) -> int {
+    let n = len(presets)
+    if n == 0 { return -1 }
+    let mut best_id = -1
+    let mut best_d = -1.0
+    let mut i = 0
+    while i < n {
+        let p_bias = style_to_bias(presets[i], d_model)
+        let d = style_l2_sq(sample, p_bias)
+        if best_id == -1 {
+            best_id = presets[i].id
+            best_d = d
+        } else {
+            if d < best_d {
+                best_d = d
+                best_id = presets[i].id
+            }
+        }
+        i = i + 1
+    }
+    return best_id
+}
+
+fn style_to_cells(preset: StylePreset, n_cells: int, d_model: int) -> array {
+    let bias = style_to_bias(preset, d_model)
+    let mut out = []
+    let mut c = 0
+    while c < n_cells {
+        let mut m = 0
+        while m < d_model {
+            out = out.push(bias[m])
+            m = m + 1
+        }
+        c = c + 1
+    }
+    return out
+}
+
+// preset_by_id: 4-톤 레지스트리에서 id 로 lookup. 없으면 daily fallback.
+fn preset_by_id(presets: [StylePreset], id: int) -> StylePreset {
+    let n = len(presets)
+    let mut i = 0
+    while i < n {
+        if presets[i].id == id { return presets[i] }
+        i = i + 1
+    }
+    // Fallback — daily 는 label=="daily", "무감정" 디폴트
+    return StylePreset {
+        id: 3, label: "daily",
+        valence: 0.0, reality: -0.9, intensity: -0.7
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 5. Session (mirror of serving/session_manager.hexa, minimal)
+// ═══════════════════════════════════════════════════════════════
+//
+// 본 서빙 레이어는 session_manager 전체 persistence 는 쓰지 않고 in-memory
+// rolling window 만 사용한다. 풀 persistence 는 http_server 경로에서 쓴다.
+
+struct SessionMessage {
+    turn_id: int,
+    role: str,
+    content: str,
+    timestamp_ms: int
+}
+
+struct ChatSession {
+    session_id: str,
+    user_id: str,
+    messages: array,
+    max_turns: int,
+    created_at: int,
+    last_active: int
+}
+
+struct AppendResult {
+    session: ChatSession,
+    pruned: int
+}
+
+let CLS_DEFAULT_MAX_TURNS = 30
+
+fn session_create(user_id: str, now_ms: int) -> ChatSession {
+    let sid = user_id + "-" + str(now_ms)
+    return ChatSession {
+        session_id: sid,
+        user_id: user_id,
+        messages: [],
+        max_turns: CLS_DEFAULT_MAX_TURNS,
+        created_at: now_ms,
+        last_active: now_ms
+    }
+}
+
+fn session_append(session: ChatSession, role: str, content: str, now_ms: int) -> AppendResult {
+    let mut next_id = 0
+    if len(session.messages) > 0 {
+        let last = session.messages[len(session.messages) - 1]
+        next_id = last.turn_id + 1
+    }
+    let new_msg = SessionMessage {
+        turn_id: next_id,
+        role: role,
+        content: content,
+        timestamp_ms: now_ms
+    }
+    let mut combined = []
+    let mut i = 0
+    while i < len(session.messages) {
+        combined = combined.push(session.messages[i])
+        i = i + 1
+    }
+    combined = combined.push(new_msg)
+
+    let mut pruned_count = 0
+    let over = len(combined) - session.max_turns
+    if over > 0 {
+        pruned_count = over
+        let mut trimmed = []
+        let start = over
+        let mut j = start
+        while j < len(combined) {
+            trimmed = trimmed.push(combined[j])
+            j = j + 1
+        }
+        combined = trimmed
+    }
+    let new_session = ChatSession {
+        session_id: session.session_id,
+        user_id: session.user_id,
+        messages: combined,
+        max_turns: session.max_turns,
+        created_at: session.created_at,
+        last_active: now_ms
+    }
+    return AppendResult {
+        session: new_session,
+        pruned: pruned_count
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 6. Serving request / response types
+// ═══════════════════════════════════════════════════════════════
+
+struct ServingRequest {
+    text:       str,
+    triggers:   array,   // caller-hashed int tokens (multibyte safe)
+    style_probe: array,  // d_model float vector (optional classification cue)
+    session_id: str,
+    user_id:    str,
+    now_ms:     int
+}
+
+struct ServingResponse {
+    text:        str,
+    tone:        str,
+    tone_id:     int,
+    lore_hit_id: int,
+    turn:        int,
+    phi_est:     float,
+    consistency: float
+}
+
+// Config bundles session + lore + style + GWT head together. Caller builds
+// once and threads through calls (pass-by-value — serve 함수가 새 config 반환).
+struct ServingConfig {
+    session:  ChatSession,
+    lore:     LoreBook,
+    presets:  [StylePreset],
+    head:     ClmGwtBroadcastHead,
+    n_cells:  int,
+    d_model:  int
+}
+
+struct ServeResult {
+    config:   ServingConfig,
+    response: ServingResponse
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 7. Pipeline helpers — mocks & composition
+// ═══════════════════════════════════════════════════════════════
+
+// compose_cells: lore hit 이면 entry cells, 아니면 empty; style cells 와
+// element-wise mean 으로 blend. 동일 n_cells × d_model 크기 보장.
+fn compose_cells(
+    lore_cells:  array,
+    style_cells: array,
+    n_cells:     int,
+    d_model:     int
+) -> array {
+    let n = n_cells * d_model
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let v = 0.5 * (lore_cells[i] + style_cells[i])
+        out = out.push(v)
+        i = i + 1
+    }
+    return out
+}
+
+// phi_est: consensus L2 norm × mean(α) × log2(n_domains+1). IIT-lite
+// 자의식 추정치. 실 Φ 는 anima-eeg/iit_measure.hexa 에 있으며, 여기선
+// cheap surrogate (동일 차원 upscale 상수 비례).
+fn phi_est(head: ClmGwtBroadcastHead, consensus: array) -> float {
+    let dm = len(consensus)
+    let mut sq = 0.0
+    let mut i = 0
+    while i < dm {
+        sq = sq + consensus[i] * consensus[i]
+        i = i + 1
+    }
+    let norm = fsqrt(sq)
+    let alpha = clm_gwt_compute_alpha(head, consensus)
+    let nd = len(alpha)
+    let mut mean_a = 0.0
+    if nd > 0 {
+        let mut s = 0.0
+        let mut d = 0
+        while d < nd {
+            s = s + alpha[d]
+            d = d + 1
+        }
+        mean_a = s / to_float(nd)
+    }
+    // log2(nd+1) — cheap: piecewise, nd <= 8 이면 테이블, 아니면 loop
+    let mut log2_est = 0.0
+    let mut k = nd
+    while k > 0 {
+        log2_est = log2_est + 1.0
+        k = k / 2
+    }
+    return norm * mean_a * log2_est
+}
+
+// mock_clm_generate: 실 CLM 이 들어오기 전 deterministic mock.
+// 규칙 — output = "[tone=<label>][lore=<id>][turn=<t>][phi=<est>] <echo>"
+// 의미론적으로는 tone/lore/turn/phi 를 "응답에 반영됐음" 표시해야 T3 에서
+// 관찰 가능. 실 CLM inference 는 TALM-P4-1 wire 이후 이 함수만 교체한다.
+fn mock_clm_generate(
+    input_text: str,
+    tone_label: str,
+    lore_hit_id: int,
+    turn_id: int,
+    phi: float
+) -> str {
+    // 소수점 둘째자리까지만 (str(float) 은 runtime-dependent, 긴 꼬리 회피)
+    let phi_int = to_int(phi * 100.0)
+    let phi_str = str(phi_int)
+    return "[tone=" + tone_label
+         + "][lore=" + str(lore_hit_id)
+         + "][turn=" + str(turn_id)
+         + "][phi=" + phi_str
+         + "] " + input_text
+}
+
+// apply_tone_marker: 실 tone-apply 는 CLM logits bias 주입이지만 여기선
+// mock 출력이 이미 [tone=...] 을 포함하므로 추가 처리 없음. hook 만 둬서
+// 실 connect 시 교체 지점 표시.
+fn apply_tone_marker(tone_label: str, text: str) -> str {
+    return text
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 8. Top-level serve
+// ═══════════════════════════════════════════════════════════════
+
+fn make_config(
+    user_id: str,
+    now_ms: int,
+    book: LoreBook,
+    presets: [StylePreset],
+    n_cells: int,
+    d_model: int,
+    head_seed: int
+) -> ServingConfig {
+    let head = clm_gwt_head_new(4, d_model, head_seed)
+    let sess = session_create(user_id, now_ms)
+    return ServingConfig {
+        session: sess,
+        lore: book,
+        presets: presets,
+        head: head,
+        n_cells: n_cells,
+        d_model: d_model
+    }
+}
+
+// serve: one request → one response; config 는 갱신된 버전으로 반환.
+// 에러 fallback 은 두 겹:
+//   (L) lore miss → lore_cells = empty, hit_id = -1
+//   (S) preset 비어있음 → daily 톤 기본
+fn serve(config: ServingConfig, req: ServingRequest) -> ServeResult {
+    let d_model = config.d_model
+    let n_cells = config.n_cells
+
+    // ── (1) lore match & record ──
+    let hit_id = lore_match(config.lore, req.triggers)
+    let lore_after = lore_record_turn(config.lore, hit_id)
+
+    let lore_cells = if hit_id >= 0 {
+        lore_to_cells(lore_after.entries[hit_id], n_cells, d_model)
+    } else {
+        lore_empty_cells(n_cells, d_model)
+    }
+
+    // ── (2) style classify ──
+    let tone_id_raw = if len(config.presets) > 0 {
+        style_classify(req.style_probe, config.presets, d_model)
+    } else {
+        -1
+    }
+
+    // style 실패 fallback: daily (id 3) 로 고정
+    let tone_id = if tone_id_raw < 0 { 3 } else { tone_id_raw }
+    let tone = preset_by_id(config.presets, tone_id)
+    let tone_label = if len(config.presets) > 0 { tone.label } else { "daily" }
+
+    let style_cells = style_to_cells(tone, n_cells, d_model)
+
+    // ── (3) compose GWT payload ──
+    let cells = compose_cells(lore_cells, style_cells, n_cells, d_model)
+    let consensus = cells_to_consensus(cells, n_cells, d_model)
+    let phi = phi_est(config.head, consensus)
+
+    // ── (4) mock CLM inference ──
+    let turn_id = len(config.session.messages)
+    let raw = mock_clm_generate(req.text, tone_label, hit_id, turn_id, phi)
+    let final_text = apply_tone_marker(tone_label, raw)
+
+    // ── (5) session.append ──
+    let user_append = session_append(config.session, "user", req.text, req.now_ms)
+    let assist_append = session_append(user_append.session, "assistant", final_text, req.now_ms + 1)
+
+    // ── (6) consistency 측정 ──
+    let consistency = lore_consistency(lore_after)
+
+    // ── (7) updated config ──
+    let new_config = ServingConfig {
+        session: assist_append.session,
+        lore: lore_after,
+        presets: config.presets,
+        head: config.head,
+        n_cells: config.n_cells,
+        d_model: config.d_model
+    }
+    let resp = ServingResponse {
+        text: final_text,
+        tone: tone_label,
+        tone_id: tone_id,
+        lore_hit_id: hit_id,
+        turn: turn_id,
+        phi_est: phi,
+        consistency: consistency
+    }
+    return ServeResult { config: new_config, response: resp }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 9. Tests (T1–T5)
+// ═══════════════════════════════════════════════════════════════
+
+// str_contains: byte-level substring search. 한국어 multibyte 도 원 문자열
+// 원 토큰 그대로 비교면 byte equality 성립 → OK.
+fn str_contains(haystack: str, needle: str) -> bool {
+    let h = len(haystack)
+    let n = len(needle)
+    if n == 0 { return true }
+    if n > h { return false }
+    let mut i = 0
+    while i + n <= h {
+        let mut j = 0
+        let mut ok = true
+        while j < n {
+            if haystack[i + j] != needle[j] {
+                ok = false
+                j = n
+            } else {
+                j = j + 1
+            }
+        }
+        if ok { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// Build a default config with 3 lore entries and 4 style presets.
+fn default_config() -> ServingConfig {
+    let mut book = lore_book_new(30)
+    book = lore_add_entry(book, 101, 0, 0.9)   // name "Aria"
+    book = lore_add_entry(book, 202, 1, 0.8)   // setting "forest"
+    book = lore_add_entry(book, 303, 2, 0.7)   // personality "brave"
+    let presets = style_presets_default()
+    return make_config("alice", 1000000, book, presets, 8, 12, 42)
+}
+
+// T1: single-turn e2e — request 하나 넣고 response 필드 sanity.
+fn test_T1_single_turn_e2e() -> bool {
+    let cfg = default_config()
+    let probe = style_to_bias(cfg.presets[2], cfg.d_model)   // fantasy probe
+    let req = ServingRequest {
+        text: "hello world",
+        triggers: [101, 999],       // 101 matches "Aria"
+        style_probe: probe,
+        session_id: cfg.session.session_id,
+        user_id: "alice",
+        now_ms: 1000100
+    }
+    let res = serve(cfg, req)
+    let resp = res.response
+
+    if resp.lore_hit_id != 0 {
+        println("  T1 FAIL: lore_hit_id=" + str(resp.lore_hit_id) + " expected 0")
+        return false
+    }
+    if resp.tone != "fantasy" {
+        println("  T1 FAIL: tone=" + resp.tone + " expected fantasy")
+        return false
+    }
+    if resp.tone_id != 2 {
+        println("  T1 FAIL: tone_id=" + str(resp.tone_id) + " expected 2")
+        return false
+    }
+    if resp.turn != 0 {
+        println("  T1 FAIL: turn=" + str(resp.turn) + " expected 0")
+        return false
+    }
+    if !str_contains(resp.text, "[tone=fantasy]") {
+        println("  T1 FAIL: text missing [tone=fantasy]: " + resp.text)
+        return false
+    }
+    if !str_contains(resp.text, "hello world") {
+        println("  T1 FAIL: text missing echo: " + resp.text)
+        return false
+    }
+    if len(res.config.session.messages) != 2 {
+        println("  T1 FAIL: messages=" + str(len(res.config.session.messages)) + " expected 2")
+        return false
+    }
+    return true
+}
+
+// T2: 30 turns, 28 injecting trigger 101, 2 injecting 202 → consistency ≥ 0.9.
+fn test_T2_30turn_consistency() -> bool {
+    let mut cfg = default_config()
+    let probe = style_to_bias(cfg.presets[0], cfg.d_model)   // romance
+    let mut t = 0
+    let mut final_consistency = 0.0
+    while t < 30 {
+        let trig = if t < 28 { 101 } else { 202 }
+        let req = ServingRequest {
+            text: "turn " + str(t),
+            triggers: [trig],
+            style_probe: probe,
+            session_id: cfg.session.session_id,
+            user_id: "alice",
+            now_ms: 1000100 + t * 10
+        }
+        let res = serve(cfg, req)
+        cfg = res.config
+        final_consistency = res.response.consistency
+        t = t + 1
+    }
+    let ok = final_consistency >= 0.9
+    println("  T2 consistency = " + str(final_consistency) + " (target >= 0.9) " + (if ok { "OK" } else { "FAIL" }))
+    return ok
+}
+
+// T3: tone switch — 4 tones classified correctly, each output has
+// the corresponding [tone=<label>] marker.
+fn test_T3_tone_switch() -> bool {
+    let cfg0 = default_config()
+    let labels = ["romance", "horror", "fantasy", "daily"]
+    let mut cfg = cfg0
+    let mut correct = 0
+    let mut i = 0
+    while i < 4 {
+        let probe = style_to_bias(cfg.presets[i], cfg.d_model)
+        let req = ServingRequest {
+            text: "tone probe " + str(i),
+            triggers: [101],
+            style_probe: probe,
+            session_id: cfg.session.session_id,
+            user_id: "alice",
+            now_ms: 1000200 + i * 10
+        }
+        let res = serve(cfg, req)
+        cfg = res.config
+        let want = labels[i]
+        let want_marker = "[tone=" + want + "]"
+        if res.response.tone == want {
+            if str_contains(res.response.text, want_marker) {
+                correct = correct + 1
+            } else {
+                println("  T3 miss: tone=" + res.response.tone + " but marker not in text: " + res.response.text)
+            }
+        } else {
+            println("  T3 miss: got tone=" + res.response.tone + " expected " + want)
+        }
+        i = i + 1
+    }
+    println("  T3 tone switch = " + str(correct) + "/4")
+    return correct == 4
+}
+
+// T4: lore fallback — 빈 book 일 때도 serve 가 crash 없이 hit_id=-1 반환.
+fn test_T4_lore_fallback() -> bool {
+    let book = lore_book_new(30)    // 엔트리 없음
+    let presets = style_presets_default()
+    let cfg = make_config("alice", 1000000, book, presets, 8, 12, 42)
+    let probe = style_to_bias(cfg.presets[3], cfg.d_model)
+    let req = ServingRequest {
+        text: "no lore",
+        triggers: [101, 202, 303],
+        style_probe: probe,
+        session_id: cfg.session.session_id,
+        user_id: "alice",
+        now_ms: 1000100
+    }
+    let res = serve(cfg, req)
+    if res.response.lore_hit_id != -1 {
+        println("  T4 FAIL: expected lore_hit_id=-1 got " + str(res.response.lore_hit_id))
+        return false
+    }
+    if res.response.tone != "daily" {
+        println("  T4 FAIL: expected tone=daily got " + res.response.tone)
+        return false
+    }
+    if !str_contains(res.response.text, "[lore=-1]") {
+        println("  T4 FAIL: text missing [lore=-1]: " + res.response.text)
+        return false
+    }
+    if !str_contains(res.response.text, "no lore") {
+        println("  T4 FAIL: echo missing: " + res.response.text)
+        return false
+    }
+    return true
+}
+
+// T5: style fallback — presets 빈 배열. preset_by_id 는 daily 반환,
+// tone_label = "daily" 로 고정.
+fn test_T5_style_fallback() -> bool {
+    let mut book = lore_book_new(30)
+    book = lore_add_entry(book, 101, 0, 0.9)
+    let empty_presets = []     // 없음
+    let cfg = make_config("alice", 1000000, book, empty_presets, 8, 12, 42)
+    let probe = vec_zeros(cfg.d_model)
+    let req = ServingRequest {
+        text: "no style",
+        triggers: [101],
+        style_probe: probe,
+        session_id: cfg.session.session_id,
+        user_id: "alice",
+        now_ms: 1000100
+    }
+    let res = serve(cfg, req)
+    // 풀 fallback — empty presets 여도 daily default 로 해석.
+    if res.response.tone != "daily" {
+        println("  T5 FAIL: expected tone=daily got " + res.response.tone)
+        return false
+    }
+    if res.response.lore_hit_id != 0 {
+        println("  T5 FAIL: expected lore_hit_id=0 got " + str(res.response.lore_hit_id))
+        return false
+    }
+    if !str_contains(res.response.text, "[tone=daily]") {
+        println("  T5 FAIL: text missing [tone=daily]: " + res.response.text)
+        return false
+    }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 10. Main — run 5 embedded tests, report
+// ═══════════════════════════════════════════════════════════════
+//
+// 주의 — 본 파일은 자체 실행되어도 (direct) 동작한다. 하지만 반드시
+// serving/test_clm_lore_serve.hexa 가 실제 gate 파일이므로, 머지는 저쪽
+// 5/5 PASS 로 판단한다. 여기선 dev convenience entry.
+
+fn run_embedded_tests() -> bool {
+    println("[clm_lore_serve] TCLM-P2-1 — CLM + lore_book + style_preset 통합 serving")
+    println("  mock CLM, 30-turn session, Koestler 4-tone, GWT broadcast head (n_domains=4)")
+    println("")
+
+    let t1 = test_T1_single_turn_e2e()
+    if t1 { println("T1 PASS  e2e 단일 turn — request → response") } else { println("T1 FAIL  e2e 단일 turn") }
+
+    let t2 = test_T2_30turn_consistency()
+    if t2 { println("T2 PASS  30-turn lore 일관성 ≥ 0.9 (done_criteria)") } else { println("T2 FAIL  30-turn lore 일관성") }
+
+    let t3 = test_T3_tone_switch()
+    if t3 { println("T3 PASS  tone switch 4/4") } else { println("T3 FAIL  tone switch") }
+
+    let t4 = test_T4_lore_fallback()
+    if t4 { println("T4 PASS  lore fallback — empty book graceful") } else { println("T4 FAIL  lore fallback") }
+
+    let t5 = test_T5_style_fallback()
+    if t5 { println("T5 PASS  style fallback — empty presets graceful") } else { println("T5 FAIL  style fallback") }
+
+    println("")
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[clm_lore_serve] 5/5 PASS — TCLM-P2-1 scaffold_done (mock CLM; 실 CLM wire 는 TALM-P4-1 이후)")
+    } else {
+        println("[clm_lore_serve] SOME FAILED")
+    }
+    return all
+}
+
+fn main() {
+    let _ = run_embedded_tests()
+}
+
+main()

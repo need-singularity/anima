@@ -16,7 +16,15 @@
 // Prompt engineering:
 //   - Decompose: "Return exactly 3 sub-goals, one per line, no numbering."
 //   - Execute  : "Complete task concisely (1-3 sentences)."
-//   - Critique : "Reply ONLY: SCORE=<0.0-1.0>;<reason>"
+//   - Critique : "Reply ONLY: SCORE=<0.0-1.0>;<reason>"  — retry + fallback on format miss
+//
+// Critique parser robustness (v2, 2026-04-16):
+//   Primary  : exact `SCORE=X.XX;reason` marker
+//   Fallback1: first float in [0,1] anywhere in the response → score
+//   Fallback2: keyword sentiment heuristic (positive=0.85 / negative=0.40 / neutral=0.60)
+//   Retry    : one re-prompt "Reply with exactly SCORE=X.XX;reason" if primary marker
+//              AND fallback1 both fail on the first response.
+//   Tag      : reason suffixed with "[fallback=N]" when non-primary path used.
 //
 // Failure modes (returns ""):
 //   - claude CLI 없음
@@ -84,32 +92,225 @@ struct CriticReply {
     reason: string
 }
 
-fn claude_critique(goal_text: string, result: string) -> CriticReply {
-    let p = "Evaluate the result quality for the given task. "
-          + "Reply in EXACTLY this format on a single line: SCORE=<0.0-1.0>;<one-sentence reason>\n\n"
-          + "Task: " + goal_text + "\n"
-          + "Result: " + result
-    let resp = claude_call(p)
-    return parse_score_reply(resp)
+// Build the primary critique prompt. Tightened (v2): explicit single-line
+// format + 2 examples so Claude reliably emits `SCORE=X.XX;reason`.
+fn build_critique_prompt(goal_text: string, result: string) -> string {
+    return "You are a strict rubric grader. Evaluate whether the Result fulfills the Task. "
+         + "Output MUST be EXACTLY one line in this format and nothing else:\n"
+         + "SCORE=<number between 0.00 and 1.00>;<one sentence reason>\n"
+         + "Examples:\n"
+         + "SCORE=0.92;covers all three bullet points and uses precise figures\n"
+         + "SCORE=0.45;mentions topic but omits the requested action items\n"
+         + "Do not add preamble, markdown, code fences, or extra lines.\n\n"
+         + "Task: " + goal_text + "\n"
+         + "Result: " + result
 }
 
+// Retry prompt used when the first response lacked a parseable SCORE= marker
+// and no bare float could be recovered.
+fn build_retry_prompt(goal_text: string, result: string) -> string {
+    return "Your previous reply was not in the required format. "
+         + "Reply with EXACTLY one line and nothing else: SCORE=<0.00-1.00>;<one sentence reason>. "
+         + "No preamble. No code fences. No extra lines.\n\n"
+         + "Task: " + goal_text + "\n"
+         + "Result: " + result
+}
+
+fn claude_critique(goal_text: string, result: string) -> CriticReply {
+    let p = build_critique_prompt(goal_text, result)
+    let resp = claude_call(p)
+    // Primary + Fallback1 pass on first response
+    let first = parse_score_reply(resp)
+    // If primary marker found → done (score > 0, not from heuristic tag)
+    if first.score > 0.0 && !first.reason.contains("[fallback=") {
+        return first
+    }
+    // If first returned fallback1 (float scan) → accept (already good quality signal)
+    if first.reason.contains("[fallback=1]") {
+        return first
+    }
+    // Primary missing AND fallback1 missed → retry once with stricter prompt
+    let rp = build_retry_prompt(goal_text, result)
+    let resp2 = claude_call(rp)
+    if len(resp2) > 0 {
+        let second = parse_score_reply(resp2)
+        if second.score > 0.0 && !second.reason.contains("[fallback=") {
+            return second
+        }
+        if second.reason.contains("[fallback=1]") {
+            return second
+        }
+        // Retry also failed — use heuristic on second response (more
+        // explicit format re-statement may still surface sentiment signal)
+        return heuristic_reply(resp2, 2)
+    }
+    // Retry produced nothing — final heuristic on original response
+    return heuristic_reply(resp, 2)
+}
+
+// Parse a Claude response into a CriticReply.
+// Strategy:
+//   1) Locate `SCORE=` marker (primary).
+//   2) If missing, scan for the first float-looking token in [0,1] (fallback1).
+//   3) If no float either, return an empty reply so caller can decide retry/heuristic.
 fn parse_score_reply(resp: string) -> CriticReply {
-    // Find "SCORE=" prefix; extract float up to ';'; remainder is reason.
     if len(resp) == 0 {
         return CriticReply { score: 0.0, reason: "empty response" }
     }
     let idx = resp.index_of("SCORE=")
-    if idx < 0 {
-        // Heuristic fallback: non-empty resp → partial credit
-        return CriticReply { score: 0.40, reason: "no SCORE= marker; fallback" }
+    if idx >= 0 {
+        return parse_score_primary(resp, idx)
     }
+    // Fallback 1: scan for first float in response
+    let fb1 = scan_first_float_in_range(resp)
+    if fb1 >= 0.0 {
+        return CriticReply {
+            score: fb1,
+            reason: summarize_reason(resp) + " [fallback=1]"
+        }
+    }
+    // No score signal at all → empty reply (caller may retry)
+    return CriticReply { score: 0.0, reason: "no SCORE marker, no float [fallback=0]" }
+}
+
+// Primary path: SCORE= marker found at idx. Extract score and reason.
+fn parse_score_primary(resp: string, idx: int) -> CriticReply {
     let tail = resp.substring(idx + 6, len(resp))
     let semi = tail.index_of(";")
     if semi < 0 {
-        let sv = tail.trim().parse_float()
-        return CriticReply { score: sv, reason: "no reason separator" }
+        // No reason separator → still accept the score, use leading line as reason
+        let score_token = first_number_token(tail)
+        let sv = score_token.parse_float()
+        let sv_clamped = clamp01(sv)
+        return CriticReply {
+            score: sv_clamped,
+            reason: "no reason separator"
+        }
     }
     let score_str = tail.substring(0, semi).trim()
     let reason = tail.substring(semi + 1, len(tail)).trim()
-    return CriticReply { score: score_str.parse_float(), reason: reason }
+    let sv = score_str.parse_float()
+    // parse_float may return 0 on non-numeric head; detect this via leading-char check
+    let sv_clamped = clamp01(sv)
+    return CriticReply { score: sv_clamped, reason: reason }
+}
+
+// Keyword sentiment heuristic.
+// Positive signals → 0.85; negative → 0.40; neutral → 0.60.
+// Case-insensitive substring match on the response text.
+fn heuristic_reply(resp: string, tag: int) -> CriticReply {
+    let lo = resp.to_lower()
+    let pos_keys = ["excellent", "great", "well-done", "well done", "high quality",
+                    "complete", "accurate", "thorough", "correct", "covers all",
+                    "good", "solid", "clear", "on point", "comprehensive", "fulfills"]
+    let neg_keys = ["poor", "incomplete", "missing", "wrong", "incorrect",
+                    "vague", "unclear", "fails", "does not", "doesn't", "off topic",
+                    "off-topic", "irrelevant", "shallow", "inadequate"]
+    let mut has_pos = false
+    let mut has_neg = false
+    let mut i = 0
+    while i < len(pos_keys) {
+        if lo.contains(pos_keys[i]) { has_pos = true }
+        i = i + 1
+    }
+    let mut j = 0
+    while j < len(neg_keys) {
+        if lo.contains(neg_keys[j]) { has_neg = true }
+        j = j + 1
+    }
+    let score = if has_pos && !has_neg { 0.85 }
+                else if has_neg && !has_pos { 0.40 }
+                else { 0.60 }
+    let tag_str = "[fallback=" + to_string(tag) + "]"
+    return CriticReply {
+        score: score,
+        reason: summarize_reason(resp) + " " + tag_str
+    }
+}
+
+// Clamp a float into [0, 1].
+fn clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+// Return response truncated to its first ~160 chars, single-line.
+fn summarize_reason(resp: string) -> string {
+    let flat = resp.replace("\n", " ").replace("\r", " ").trim()
+    let n = len(flat)
+    if n <= 160 { return flat }
+    return flat.substring(0, 160)
+}
+
+// ── Number scanners (no regex; char-code walk) ──────────────────────
+
+// Return the leading numeric token of `s` (skip leading whitespace).
+// Stops at first non-digit/non-dot/non-minus character after the head.
+fn first_number_token(s: string) -> string {
+    let n = len(s)
+    let mut i = 0
+    // Skip leading whitespace
+    while i < n {
+        let b = byte_at_parse(s, i)
+        if b == 32 || b == 9 { i = i + 1 } else { break }
+    }
+    let start = i
+    let mut saw_digit = false
+    let mut saw_dot = false
+    // Optional leading sign
+    if i < n {
+        let b0 = byte_at_parse(s, i)
+        if b0 == 45 { i = i + 1 }  // '-'
+    }
+    while i < n {
+        let b = byte_at_parse(s, i)
+        if b >= 48 && b <= 57 {
+            saw_digit = true
+            i = i + 1
+        } else if b == 46 && !saw_dot {
+            saw_dot = true
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    if !saw_digit { return "" }
+    return s.substring(start, i)
+}
+
+// Scan response for the first float token that lies in [0, 1]. Returns
+// the value, or -1.0 if no such token found.
+fn scan_first_float_in_range(s: string) -> float {
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let b = byte_at_parse(s, i)
+        // Candidate start = digit or '.' (strict: require digit to avoid "."
+        // matching random punctuation paths).
+        if b >= 48 && b <= 57 {
+            let tok = first_number_token(s.substring(i, n))
+            let tl = len(tok)
+            if tl > 0 {
+                let v = tok.parse_float()
+                if v >= 0.0 && v <= 1.0 {
+                    return v
+                }
+                i = i + tl
+            } else {
+                i = i + 1
+            }
+        } else {
+            i = i + 1
+        }
+    }
+    return 0.0 - 1.0
+}
+
+// Byte access helper — stage0's char_code(s, i) ignores i (always returns
+// byte 0), so we use substring(i, i+1) then char_code(sub, 0) which DOES
+// work. Mirrors training/corpus_filter.hexa / anima-engines byte_at.
+fn byte_at_parse(s: string, i: int) -> int {
+    let sub = s.substring(i, i + 1)
+    return char_code(sub, 0)
 }
