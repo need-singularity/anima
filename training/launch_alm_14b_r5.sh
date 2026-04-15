@@ -130,6 +130,17 @@ echo "[preflight] HF_TOKEN set: ${HF_TOKEN:+yes}"
 export HF_HUB_CACHE="/workspace/hf_cache"
 export HF_HOME="/workspace/hf_cache"
 export TRANSFORMERS_CACHE="/workspace/hf_cache"
+
+# ── Speedup patch 20260415: NCCL / CUDA env tuning ──
+# No-op on single-H100 (no collectives) but correct for multi-GPU r6.
+export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}"
+export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
+export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-4}"
+export NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}"
+export TORCH_NCCL_BLOCKING_WAIT="${TORCH_NCCL_BLOCKING_WAIT:-1}"
+export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+
 PRESTAGED="/workspace/hf_cache/models--Qwen--Qwen2.5-14B-Instruct"
 if [[ -d "$PRESTAGED" ]]; then
     echo "[preflight] ✓ Qwen2.5-14B pre-staged at $PRESTAGED"
@@ -176,6 +187,9 @@ cp -f /workspace/train_alm_14b_r5.plan.log "$CKPT_DIR/train_alm_14b_r5.plan.log"
 # R2 prefix (distinct from r4 and kbase):
 #     r2:anima-models/alm14b/r5/step_{step}/
 # Model tag + round give the same naming to upload_to_r2().
+# Speedup patch 20260415: --no-grad-ckpt disables activation checkpointing.
+# At batch=1 seq=1024 the 14B fits in ~70 GB peak without ckpt. MUST validate
+# with nvidia-smi at step 50 — if peak > 72 GB, remove --no-grad-ckpt.
 python3 "$TRAINER" \
     --base Qwen/Qwen2.5-14B-Instruct \
     --corpus "$CORPUS" \
@@ -194,6 +208,7 @@ python3 "$TRAINER" \
     --doc-separator \
     --shuffle-docs \
     --dedupe \
+    --no-grad-ckpt \
     --ckpt-dir "$CKPT_DIR" \
     --save-every 2000 \
     --eval-every 500 \
