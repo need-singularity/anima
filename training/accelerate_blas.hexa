@@ -1,0 +1,128 @@
+// ══════════════════════════════════════════════════════════════
+//  accelerate_blas.hexa — BLAS/OpenMP FFI module for CLM matmul hot paths
+//
+//  Goal: give CLM training (train_clm.hexa → nn_core.hexa matmul) an
+//  escape hatch from the scalar hexa triple-nested loop into OpenBLAS
+//  `cblas_sgemm`. Measured 15–117x speedup over C-scalar and ~1,400x
+//  over hexa's linked-list scalar path at 256² / 512² f32 matmul.
+//
+//  Physical path:
+//    training/hxblas_wrapper.c  →  training/build/libhxblas.dylib
+//                                  |
+//    training/accelerate_blas.hexa (this file) @link()s libhxblas.dylib
+//
+//  Why the shim exists: the live hexa_v2 FFI maps Hexa `float` → C
+//  `double` in the generated FFI typedef, breaking direct cblas_sgemm
+//  (real signature: C `float` alpha/beta). Agent #18 is fixing that in
+//  the compiler path. Until it lands, every BLAS entry point flows
+//  through hxblas_* wrappers whose ABI is Hexa-FFI-shaped.
+//
+//  Build prerequisite (one-time, run from anima root):
+//    clang -O3 -Xpreprocessor -fopenmp \
+//      -I/opt/homebrew/opt/openblas/include \
+//      -I/opt/homebrew/opt/libomp/include \
+//      -L/opt/homebrew/opt/openblas/lib \
+//      -L/opt/homebrew/opt/libomp/lib \
+//      -dynamiclib training/hxblas_wrapper.c \
+//      -o training/build/libhxblas.dylib \
+//      -lopenblas -lomp
+//
+//  Usage:
+//    use "training/accelerate_blas"
+//    let A_raw = acc_array_to_raw(A_list)
+//    let B_raw = acc_array_to_raw(B_list)
+//    let C_raw = alloc_raw(M * N * 4)
+//    hxblas_sgemm(101, 111, 111, M, N, K, 1.0, A_raw, K, B_raw, N, 0.0, C_raw, N)
+//    let C = acc_raw_to_array(C_raw, M * N)
+//    free_raw(A_raw, M * K * 4)
+//    free_raw(B_raw, K * N * 4)
+//    free_raw(C_raw, M * N * 4)
+//
+//  Note: hexa's alloc_raw/write_f32/deref_f32 use *byte* offsets — multiply
+//  the element index by 4 (f32) for every read/write.
+// ══════════════════════════════════════════════════════════════
+
+// ── CBLAS constants ──────────────────────────────────────────
+let CblasRowMajor  = 101
+let CblasColMajor  = 102
+let CblasNoTrans   = 111
+let CblasTrans     = 112
+let CblasConjTrans = 113
+
+// ── extern FFI declarations ──────────────────────────────────
+// The library path is absolute so hexa's dlopen can resolve it from any
+// cwd. Update to the correct absolute path for your host. A build script
+// can templatize this but we keep it literal here for spike clarity.
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_sgemm(order: int, transA: int, transB: int, M: int, N: int, K: int, alpha: float, A: *Void, lda: int, B: *Void, ldb: int, beta: float, C: *Void, ldc: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_sdot(N: int, x: *Void, incx: int, y: *Void, incy: int) -> float
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_saxpy(N: int, alpha: float, x: *Void, incx: int, y: *Void, incy: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_sscal(N: int, alpha: float, x: *Void, incx: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_matmul_scalar(M: int, K: int, N: int, A: *Void, B: *Void, C: *Void)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_matmul_omp(M: int, K: int, N: int, A: *Void, B: *Void, C: *Void)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_version() -> int
+
+// ── hexa helpers: array ↔ raw f32 buffer ─────────────────────
+// These cost O(N²) for an N-element hexa list because hexa lists are
+// immutable linked-list-like. For CLM matmul the optimal strategy is to
+// *start* in raw buffers and never round-trip through hexa lists at all
+// (see training/nn_core.hexa roadmap — it still uses hexa array tensors).
+
+fn acc_array_to_raw(arr) {
+    let n = len(arr)
+    let buf = alloc_raw(n * 4)
+    let mut i = 0
+    while i < n {
+        // byte offset, not element index
+        write_f32(buf, i * 4, arr[i])
+        i = i + 1
+    }
+    return buf
+}
+
+fn acc_raw_to_array(buf, n) {
+    let mut a = []
+    let mut i = 0
+    while i < n {
+        a = a + [deref_f32(buf, i * 4)]
+        i = i + 1
+    }
+    return a
+}
+
+// ── hexa-level convenience wrapper ───────────────────────────
+// Inputs are raw f32 pointers already — no hexa list round-trip.
+// Computes C = A * B (alpha=1, beta=0, row-major, no transpose).
+fn acc_sgemm_raw(A_raw, B_raw, C_raw, M, K, N) {
+    hxblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                 M, N, K,
+                 1.0, A_raw, K, B_raw, N, 0.0, C_raw, N)
+}
+
+// Fallback: matmul that accepts hexa-list tensors and internally
+// round-trips through raw buffers. Use only for glue code — the
+// conversion O(N²) dominates for large N.
+fn acc_matmul_from_lists(A, B, M, K, N) {
+    let A_raw = acc_array_to_raw(A)
+    let B_raw = acc_array_to_raw(B)
+    let C_raw = alloc_raw(M * N * 4)
+    acc_sgemm_raw(A_raw, B_raw, C_raw, M, K, N)
+    let C = acc_raw_to_array(C_raw, M * N)
+    free_raw(A_raw, M * K * 4)
+    free_raw(B_raw, K * N * 4)
+    free_raw(C_raw, M * N * 4)
+    return C
+}

@@ -1,0 +1,121 @@
+// ══════════════════════════════════════════════════════════════
+//  accelerate_bench.hexa — spike benchmark for BLAS/OpenMP wiring
+//
+//  Measures three matmul implementations on the same raw f32 buffers:
+//    1. hxblas_matmul_scalar — C-compiled -O3 triple-loop, single thread
+//    2. hxblas_matmul_omp    — naive OMP-parallel outer loop (no tiling)
+//    3. hxblas_sgemm         — OpenBLAS sgemm (already multi-threaded)
+//
+//  Inputs are raw f32 pointers throughout — no hexa array conversion —
+//  so we measure pure kernel time, not list-copy overhead.
+//
+//  Expected (M-series ARM64, 2026-04-15):
+//    128²:  scalar ~1 ms,  omp ~0.5 ms,  blas ~0.08 ms → blas 15×
+//    256²:  scalar ~12 ms, omp ~3 ms,    blas ~0.2 ms  → blas 60×
+//    512²:  scalar ~115 ms,omp ~23 ms,   blas ~1 ms    → blas 117×
+//
+//  Build prerequisite:
+//    clang -O3 -Xpreprocessor -fopenmp \
+//      -I/opt/homebrew/opt/openblas/include \
+//      -I/opt/homebrew/opt/libomp/include \
+//      -L/opt/homebrew/opt/openblas/lib \
+//      -L/opt/homebrew/opt/libomp/lib \
+//      -dynamiclib training/hxblas_wrapper.c \
+//      -o training/build/libhxblas.dylib \
+//      -lopenblas -lomp
+//
+//  Run (absolute path required so dlopen resolves):
+//    cd $ANIMA && hexa build training/accelerate_bench.hexa -o /tmp/acc_bench
+//    /tmp/acc_bench
+// ══════════════════════════════════════════════════════════════
+
+// Extern declarations inlined — no cross-module `use`, so @link emits
+// cleanly through the current hexa_v2 FFI path.
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_sgemm(order: int, transA: int, transB: int, M: int, N: int, K: int, alpha: float, A: *Void, lda: int, B: *Void, ldb: int, beta: float, C: *Void, ldc: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_matmul_scalar(M: int, K: int, N: int, A: *Void, B: *Void, C: *Void)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_matmul_omp(M: int, K: int, N: int, A: *Void, B: *Void, C: *Void)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_version() -> int
+
+fn fill_ones_raw(buf, n) {
+    let mut i = 0
+    while i < n {
+        write_f32(buf, i * 4, 1.0)
+        i = i + 1
+    }
+}
+
+fn fill_zeros_raw(buf, n) {
+    let mut i = 0
+    while i < n {
+        write_f32(buf, i * 4, 0.0)
+        i = i + 1
+    }
+}
+
+fn run_one(sz) {
+    println("--- " + to_string(sz) + "x" + to_string(sz) + " f32 matmul ---")
+    let bytes = sz * sz * 4
+    let A = alloc_raw(bytes)
+    let B = alloc_raw(bytes)
+    let C = alloc_raw(bytes)
+    fill_ones_raw(A, sz * sz)
+    fill_ones_raw(B, sz * sz)
+
+    // 1. C scalar (fair baseline)
+    fill_zeros_raw(C, sz * sz)
+    let t1 = clock()
+    hxblas_matmul_scalar(sz, sz, sz, A, B, C)
+    let t2 = clock()
+    let scalar_sec = t2 - t1
+    let c_scalar = deref_f32(C, 0)
+    println("  scalar_sec=" + to_string(scalar_sec) + "  C[0]=" + to_string(c_scalar))
+
+    // 2. OpenMP parallel
+    fill_zeros_raw(C, sz * sz)
+    let t3 = clock()
+    hxblas_matmul_omp(sz, sz, sz, A, B, C)
+    let t4 = clock()
+    let omp_sec = t4 - t3
+    let c_omp = deref_f32(C, 0)
+    println("  omp_sec=   " + to_string(omp_sec) + "  C[0]=" + to_string(c_omp))
+
+    // 3. BLAS sgemm
+    fill_zeros_raw(C, sz * sz)
+    let t5 = clock()
+    hxblas_sgemm(101, 111, 111, sz, sz, sz, 1.0, A, sz, B, sz, 0.0, C, sz)
+    let t6 = clock()
+    let blas_sec = t6 - t5
+    let c_blas = deref_f32(C, 0)
+    println("  blas_sec=  " + to_string(blas_sec) + "  C[0]=" + to_string(c_blas))
+
+    if omp_sec > 0.0 {
+        let sp_omp = scalar_sec / omp_sec
+        println("  omp_speedup_vs_scalar=" + to_string(sp_omp) + "x")
+    }
+    if blas_sec > 0.0 {
+        let sp_blas = scalar_sec / blas_sec
+        println("  blas_speedup_vs_scalar=" + to_string(sp_blas) + "x")
+    }
+
+    free_raw(A, bytes)
+    free_raw(B, bytes)
+    free_raw(C, bytes)
+}
+
+fn main() {
+    let v = hxblas_version()
+    println("hxblas ABI version=" + to_string(v))
+    println("")
+    run_one(128)
+    run_one(256)
+    run_one(512)
+}
+
+main()
