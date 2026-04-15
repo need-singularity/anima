@@ -288,9 +288,11 @@ fn attn_fwd_t(Q: Tensor, K: Tensor, V: Tensor) -> AttnOut {
     let S = Q.d0
     let D = Q.d1
     let inv_sqrt_d = 1.0 / sqrt(to_float(D))
-    let probs = tensor_new2(S, S)
-    let out = tensor_new2(S, D)
 
+    // Q @ K^T → probs[S, S] via BLAS (K stored [S, D] row-major)
+    let probs = t_matmul_transB(Q, K, S)
+
+    // in-place scale + causal mask + per-row softmax (O(S²) scalar leftover)
     let mut i = 0
     while i < S {
         let mut j = 0
@@ -298,15 +300,8 @@ fn attn_fwd_t(Q: Tensor, K: Tensor, V: Tensor) -> AttnOut {
             if j > i {
                 write_f32(probs.data, (i * S + j) * 4, 0.0 - 10000.0)
             } else {
-                let mut dot = 0.0
-                let mut p = 0
-                while p < D {
-                    let q_ip = deref_f32(Q.data, (i * D + p) * 4)
-                    let k_jp = deref_f32(K.data, (j * D + p) * 4)
-                    dot = dot + q_ip * k_jp
-                    p = p + 1
-                }
-                write_f32(probs.data, (i * S + j) * 4, dot * inv_sqrt_d)
+                let v = deref_f32(probs.data, (i * S + j) * 4)
+                write_f32(probs.data, (i * S + j) * 4, v * inv_sqrt_d)
             }
             j = j + 1
         }
@@ -314,23 +309,8 @@ fn attn_fwd_t(Q: Tensor, K: Tensor, V: Tensor) -> AttnOut {
         i = i + 1
     }
 
-    i = 0
-    while i < S {
-        let mut p = 0
-        while p < D {
-            let mut acc = 0.0
-            let mut j = 0
-            while j < S {
-                let pr = deref_f32(probs.data, (i * S + j) * 4)
-                let vjp = deref_f32(V.data, (j * D + p) * 4)
-                acc = acc + pr * vjp
-                j = j + 1
-            }
-            write_f32(out.data, (i * D + p) * 4, acc)
-            p = p + 1
-        }
-        i = i + 1
-    }
+    // probs @ V → out[S, D] via BLAS
+    let out = t_matmul(probs, V)
 
     return AttnOut { out: out, probs: probs }
 }
@@ -345,33 +325,16 @@ fn attn_bwd_t(Q: Tensor, K: Tensor, V: Tensor, probs: Tensor, dctx: Tensor) -> A
     let S = Q.d0
     let D = Q.d1
     let inv_sqrt_d = 1.0 / sqrt(to_float(D))
-    let dQ = tensor_new2(S, D)
-    let dK = tensor_new2(S, D)
-    let dV = tensor_new2(S, D)
 
-    let dprobs = tensor_new2(S, S)
+    // dV = probs^T @ dctx   (S,S)^T @ (S,D) → (S,D) via BLAS
+    let dV = t_matmul_transA(probs, dctx, S)
+
+    // dprobs = dctx @ V^T   (S,D) @ (S,D)^T → (S,S) via BLAS
+    let dprobs = t_matmul_transB(dctx, V, S)
+
+    // softmax bwd + causal mask — build dS[S,S] (O(S²) scalar leftover)
+    let dS = tensor_new2(S, S)
     let mut i = 0
-    while i < S {
-        let mut j = 0
-        while j < S {
-            let mut dp = 0.0
-            let mut p = 0
-            while p < D {
-                let dctx_ip = deref_f32(dctx.data, (i * D + p) * 4)
-                let v_jp = deref_f32(V.data, (j * D + p) * 4)
-                dp = dp + dctx_ip * v_jp
-                let pij = deref_f32(probs.data, (i * S + j) * 4)
-                let dvjp = deref_f32(dV.data, (j * D + p) * 4)
-                write_f32(dV.data, (j * D + p) * 4, dvjp + pij * dctx_ip)
-                p = p + 1
-            }
-            write_f32(dprobs.data, (i * S + j) * 4, dp)
-            j = j + 1
-        }
-        i = i + 1
-    }
-
-    i = 0
     while i < S {
         let mut s_acc = 0.0
         let mut j = 0
@@ -384,28 +347,25 @@ fn attn_bwd_t(Q: Tensor, K: Tensor, V: Tensor, probs: Tensor, dctx: Tensor) -> A
         j = 0
         while j < S {
             if j > i {
-                j = j + 1
-                continue
-            }
-            let pij = deref_f32(probs.data, (i * S + j) * 4)
-            let dpij = deref_f32(dprobs.data, (i * S + j) * 4)
-            let dsij = pij * (dpij - s_acc) * inv_sqrt_d
-            let mut p = 0
-            while p < D {
-                let k_jp = deref_f32(K.data, (j * D + p) * 4)
-                let q_ip = deref_f32(Q.data, (i * D + p) * 4)
-                let dq_ip = deref_f32(dQ.data, (i * D + p) * 4)
-                let dk_jp = deref_f32(dK.data, (j * D + p) * 4)
-                write_f32(dQ.data, (i * D + p) * 4, dq_ip + dsij * k_jp)
-                write_f32(dK.data, (j * D + p) * 4, dk_jp + dsij * q_ip)
-                p = p + 1
+                write_f32(dS.data, (i * S + j) * 4, 0.0)
+            } else {
+                let pij = deref_f32(probs.data, (i * S + j) * 4)
+                let dpij = deref_f32(dprobs.data, (i * S + j) * 4)
+                write_f32(dS.data, (i * S + j) * 4, pij * (dpij - s_acc) * inv_sqrt_d)
             }
             j = j + 1
         }
         i = i + 1
     }
 
+    // dQ = dS @ K      (S,S) @ (S,D) → (S,D) via BLAS
+    let dQ = t_matmul(dS, K)
+
+    // dK = dS^T @ Q    (S,S)^T @ (S,D) → (S,D) via BLAS
+    let dK = t_matmul_transA(dS, Q, S)
+
     tensor_free(dprobs)
+    tensor_free(dS)
     return AttnBwd { dQ: dQ, dK: dK, dV: dV }
 }
 
