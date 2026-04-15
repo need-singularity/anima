@@ -1,0 +1,648 @@
+// serving/session_manager.hexa — 30-turn rolling session window (P1 TSRV-P1-1)
+//
+// Roadmap gate: shared/roadmaps/anima-train.json P1 SERVING
+//   "30 turn window + 기본 메모리, 30 turn 유지, 세션 복구 가능"
+//   Anima Web UI multi-turn chat substrate.
+//
+// ─── Design ───────────────────────────────────────────────────────
+//
+// Structs
+//   SessionMessage { turn_id, role, content, timestamp_ms }
+//   ChatSession    { session_id, user_id, messages, max_turns=30,
+//                    created_at, last_active }
+//   SessionStore   { sessions }                    — in-memory list
+//   SessionLookup  { found, session }              — sentinel for get
+//   AppendResult   { session, pruned }             — append returns both
+//
+// Functions
+//   session_create(user_id, now_ms) -> ChatSession
+//   session_append(session, role, content, now_ms) -> AppendResult
+//      (updates last_active, returns pruned count when overflow)
+//   store_new() -> SessionStore
+//   store_put(store, session) -> SessionStore
+//   store_get(store, session_id) -> SessionLookup
+//   session_prune_idle(store, now_ms, idle_ms=600000) -> SessionStore
+//      (also returns pruned count via length diff)
+//   session_save(session, dir) -> bool
+//   session_load(session_id, dir) -> SessionLookup
+//
+// Persistence format (escaped TSV, no JSON)
+//   file: <dir>/<session_id>.sess
+//   line 0:  HDR  <session_id>  <user_id>  <max_turns>  <created_at>  <last_active>
+//   line N:  MSG  <turn_id>     <role>     <content-esc>  <timestamp_ms>
+//   content escape: "\n" → "\\n", "\t" → "\\t", "\\" → "\\\\"
+//   Rationale: hexa JSON builtin + multibyte string slicing is flaky
+//   (memory:feedback_hexa_string_api) so a deterministic TSV with a
+//   char-by-char escaper is safer and round-trip stable.
+//
+// Hexa constraints honored
+//   - Lists are pass-by-value (memory:feedback_hexa_lists_pbv) — every
+//     helper REBUILDS and RETURNS. No mutation across call boundary.
+//   - Struct list-field aliasing bug (memory:feedback_hexa_struct_list_alias):
+//     never store two live structs each carrying an array unless one is
+//     the replacement for the other. We only ever keep ONE mutation
+//     frontier per call.
+//   - No `pure fn` with ≥3 float struct returns.
+//   - `sm_` prefix for helpers (L0-clean / AN7).
+//   - Time (now_ms) is INJECTED by caller for determinism in tests.
+//   - Does not modify http_server.hexa — additive file.
+//
+// CLI
+//   hexa run serving/session_manager.hexa --verify    — run 5 tests
+//   (loaded as library by import in http_server — when chat wiring lands)
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let SM_DEFAULT_MAX_TURNS   = 30
+let SM_DEFAULT_IDLE_MS     = 600000        // 10 min idle cap
+let SM_HDR_TAG             = "HDR"
+let SM_MSG_TAG             = "MSG"
+let SM_FIELD_SEP           = "\t"
+let SM_LINE_SEP            = "\n"
+let SM_FILE_EXT            = ".sess"
+
+// ═══════════════════════════════════════════════════════════════
+// Structs
+// ═══════════════════════════════════════════════════════════════
+
+struct SessionMessage {
+    turn_id: int,
+    role: str,
+    content: str,
+    timestamp_ms: int
+}
+
+struct ChatSession {
+    session_id: str,
+    user_id: str,
+    messages: array,
+    max_turns: int,
+    created_at: int,
+    last_active: int
+}
+
+struct SessionStore {
+    sessions: array
+}
+
+struct SessionLookup {
+    found: bool,
+    session: ChatSession
+}
+
+struct AppendResult {
+    session: ChatSession,
+    pruned: int
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers — escape / unescape for TSV persistence
+// ═══════════════════════════════════════════════════════════════
+
+// Escape \, \t, \n so they never collide with TSV delimiters.
+// Order matters: backslash FIRST so we don't double-escape our own inserts.
+fn sm_escape(raw: str) -> str {
+    let mut out = ""
+    let mut i = 0
+    while i < len(raw) {
+        let c = raw[i]
+        if c == "\\" {
+            out = out + "\\\\"
+        } else {
+            if c == "\n" {
+                out = out + "\\n"
+            } else {
+                if c == "\t" {
+                    out = out + "\\t"
+                } else {
+                    out = out + c
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Inverse of sm_escape. Walks char-by-char; on '\\' peeks the next char
+// and restores the original. Lone '\\' at end copied verbatim.
+fn sm_unescape(enc: str) -> str {
+    let mut out = ""
+    let mut i = 0
+    while i < len(enc) {
+        let c = enc[i]
+        if c == "\\" {
+            let j = i + 1
+            if j < len(enc) {
+                let d = enc[j]
+                if d == "n" {
+                    out = out + "\n"
+                    i = i + 2
+                } else {
+                    if d == "t" {
+                        out = out + "\t"
+                        i = i + 2
+                    } else {
+                        if d == "\\" {
+                            out = out + "\\"
+                            i = i + 2
+                        } else {
+                            out = out + c
+                            i = i + 1
+                        }
+                    }
+                }
+            } else {
+                out = out + c
+                i = i + 1
+            }
+        } else {
+            out = out + c
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// session_create
+// ═══════════════════════════════════════════════════════════════
+
+// Construct a fresh empty session for the given user, timestamped now_ms.
+// session_id is <user_id>-<now_ms> so repeated creates for the same user
+// at the same tick are a caller bug (document + test T1).
+fn session_create(user_id: str, now_ms: int) -> ChatSession {
+    let sid = user_id + "-" + str(now_ms)
+    return ChatSession {
+        session_id: sid,
+        user_id: user_id,
+        messages: [],
+        max_turns: SM_DEFAULT_MAX_TURNS,
+        created_at: now_ms,
+        last_active: now_ms
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// session_append
+// ═══════════════════════════════════════════════════════════════
+
+// Append a (role, content) turn to session. If the message count would
+// exceed session.max_turns, drop the oldest messages first (FIFO).
+// Returns AppendResult{ session=new, pruned=count_dropped }.
+// The caller must use the returned session — the input is unchanged
+// (lists are pass-by-value in hexa).
+fn session_append(session: ChatSession, role: str, content: str, now_ms: int) -> AppendResult {
+    // Build the new message. turn_id is MONOTONIC per session — it never
+    // decreases even after pruning. Source of truth: last surviving
+    // message's turn_id + 1, else 0 on empty.
+    let mut next_id = 0
+    if len(session.messages) > 0 {
+        let last = session.messages[len(session.messages) - 1]
+        next_id = last.turn_id + 1
+    }
+    let new_msg = SessionMessage {
+        turn_id: next_id,
+        role: role,
+        content: content,
+        timestamp_ms: now_ms
+    }
+
+    // Rebuild messages = old_messages ++ [new_msg]
+    let mut combined = []
+    let mut i = 0
+    while i < len(session.messages) {
+        combined = combined.push(session.messages[i])
+        i = i + 1
+    }
+    combined = combined.push(new_msg)
+
+    // Overflow: drop oldest until we fit in max_turns
+    let mut pruned_count = 0
+    let over = len(combined) - session.max_turns
+    if over > 0 {
+        pruned_count = over
+        // Keep the last max_turns
+        let mut trimmed = []
+        let start = over
+        let mut j = start
+        while j < len(combined) {
+            trimmed = trimmed.push(combined[j])
+            j = j + 1
+        }
+        combined = trimmed
+    }
+
+    let new_session = ChatSession {
+        session_id: session.session_id,
+        user_id: session.user_id,
+        messages: combined,
+        max_turns: session.max_turns,
+        created_at: session.created_at,
+        last_active: now_ms
+    }
+
+    return AppendResult {
+        session: new_session,
+        pruned: pruned_count
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SessionStore — in-memory
+// ═══════════════════════════════════════════════════════════════
+
+fn store_new() -> SessionStore {
+    return SessionStore { sessions: [] }
+}
+
+// Upsert: replace if session_id exists, otherwise append.
+// Returns a fresh store (pass-by-value rebuild).
+fn store_put(store: SessionStore, session: ChatSession) -> SessionStore {
+    let mut rebuilt = []
+    let mut found = false
+    let mut i = 0
+    while i < len(store.sessions) {
+        let cur = store.sessions[i]
+        if cur.session_id == session.session_id {
+            rebuilt = rebuilt.push(session)
+            found = true
+        } else {
+            rebuilt = rebuilt.push(cur)
+        }
+        i = i + 1
+    }
+    if !found {
+        rebuilt = rebuilt.push(session)
+    }
+    return SessionStore { sessions: rebuilt }
+}
+
+// Retrieve by session_id. Returns SessionLookup{found=false, session=empty}
+// sentinel if not present (hexa has no native option type).
+fn store_get(store: SessionStore, session_id: str) -> SessionLookup {
+    let mut i = 0
+    while i < len(store.sessions) {
+        let cur = store.sessions[i]
+        if cur.session_id == session_id {
+            return SessionLookup { found: true, session: cur }
+        }
+        i = i + 1
+    }
+    let empty = ChatSession {
+        session_id: "",
+        user_id: "",
+        messages: [],
+        max_turns: SM_DEFAULT_MAX_TURNS,
+        created_at: 0,
+        last_active: 0
+    }
+    return SessionLookup { found: false, session: empty }
+}
+
+// Remove sessions whose last_active is older than now_ms - idle_ms.
+// Returns a fresh store. Count pruned = old_len - new_len.
+fn session_prune_idle(store: SessionStore, now_ms: int, idle_ms: int) -> SessionStore {
+    let cutoff = now_ms - idle_ms
+    let mut rebuilt = []
+    let mut i = 0
+    while i < len(store.sessions) {
+        let cur = store.sessions[i]
+        if cur.last_active >= cutoff {
+            rebuilt = rebuilt.push(cur)
+        }
+        i = i + 1
+    }
+    return SessionStore { sessions: rebuilt }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Persistence — TSV escape/unescape
+// ═══════════════════════════════════════════════════════════════
+
+// Serialize one message to a single escaped TSV line (no newline).
+fn sm_msg_to_line(m: SessionMessage) -> str {
+    return SM_MSG_TAG + SM_FIELD_SEP
+         + str(m.turn_id) + SM_FIELD_SEP
+         + m.role + SM_FIELD_SEP
+         + sm_escape(m.content) + SM_FIELD_SEP
+         + str(m.timestamp_ms)
+}
+
+// Build the full file content for a session (HDR line + N MSG lines).
+fn sm_session_to_text(session: ChatSession) -> str {
+    let hdr = SM_HDR_TAG + SM_FIELD_SEP
+            + session.session_id + SM_FIELD_SEP
+            + session.user_id + SM_FIELD_SEP
+            + str(session.max_turns) + SM_FIELD_SEP
+            + str(session.created_at) + SM_FIELD_SEP
+            + str(session.last_active)
+    let mut out = hdr
+    let mut i = 0
+    while i < len(session.messages) {
+        out = out + SM_LINE_SEP + sm_msg_to_line(session.messages[i])
+        i = i + 1
+    }
+    return out
+}
+
+// Persist session to <dir>/<session_id>.sess. Ensures dir exists.
+// Returns true on success (write_file has no return — we just attest).
+fn session_save(session: ChatSession, dir: str) -> bool {
+    exec("mkdir -p " + dir)
+    let path = dir + "/" + session.session_id + SM_FILE_EXT
+    let txt = sm_session_to_text(session)
+    write_file(path, txt)
+    return true
+}
+
+// Load session from file. Returns SessionLookup{found,session}.
+// found=false if the file is missing or malformed (header line bad).
+fn session_load(session_id: str, dir: str) -> SessionLookup {
+    let path = dir + "/" + session_id + SM_FILE_EXT
+    let empty = ChatSession {
+        session_id: "",
+        user_id: "",
+        messages: [],
+        max_turns: SM_DEFAULT_MAX_TURNS,
+        created_at: 0,
+        last_active: 0
+    }
+    if !file_exists(path) {
+        return SessionLookup { found: false, session: empty }
+    }
+    let raw = read_file(path)
+    let lines = split(raw, SM_LINE_SEP)
+    if len(lines) < 1 {
+        return SessionLookup { found: false, session: empty }
+    }
+
+    // Parse header
+    let hdr_parts = split(lines[0], SM_FIELD_SEP)
+    if len(hdr_parts) < 6 {
+        return SessionLookup { found: false, session: empty }
+    }
+    if hdr_parts[0] != SM_HDR_TAG {
+        return SessionLookup { found: false, session: empty }
+    }
+    let sid = hdr_parts[1]
+    let uid = hdr_parts[2]
+    let mx = to_int(hdr_parts[3])
+    let cr = to_int(hdr_parts[4])
+    let la = to_int(hdr_parts[5])
+
+    // Parse message lines (lines[1..])
+    let mut msgs = []
+    let mut i = 1
+    while i < len(lines) {
+        let line = lines[i]
+        if len(line) > 0 {
+            let parts = split(line, SM_FIELD_SEP)
+            if len(parts) >= 5 {
+                if parts[0] == SM_MSG_TAG {
+                    let m = SessionMessage {
+                        turn_id: to_int(parts[1]),
+                        role: parts[2],
+                        content: sm_unescape(parts[3]),
+                        timestamp_ms: to_int(parts[4])
+                    }
+                    msgs = msgs.push(m)
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    let loaded = ChatSession {
+        session_id: sid,
+        user_id: uid,
+        messages: msgs,
+        max_turns: mx,
+        created_at: cr,
+        last_active: la
+    }
+    return SessionLookup { found: true, session: loaded }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-tests (5/5 gate)
+// ═══════════════════════════════════════════════════════════════
+
+fn test_create_empty_session() -> bool {
+    let now = 1000000
+    let s = session_create("alice", now)
+    if s.user_id != "alice" { return false }
+    if len(s.messages) != 0 { return false }
+    if s.max_turns != 30 { return false }
+    if s.created_at != now { return false }
+    if s.last_active != now { return false }
+    if s.session_id != "alice-1000000" { return false }
+    return true
+}
+
+fn test_append_within_window() -> bool {
+    let s0 = session_create("bob", 2000)
+    let r1 = session_append(s0, "user", "hi", 2100)
+    if r1.pruned != 0 { return false }
+    if len(r1.session.messages) != 1 { return false }
+    if r1.session.last_active != 2100 { return false }
+    let m0 = r1.session.messages[0]
+    if m0.turn_id != 0 { return false }
+    if m0.role != "user" { return false }
+    if m0.content != "hi" { return false }
+    if m0.timestamp_ms != 2100 { return false }
+
+    let r2 = session_append(r1.session, "assistant", "hello bob", 2200)
+    if r2.pruned != 0 { return false }
+    if len(r2.session.messages) != 2 { return false }
+    if r2.session.last_active != 2200 { return false }
+    let m1 = r2.session.messages[1]
+    if m1.turn_id != 1 { return false }
+    if m1.role != "assistant" { return false }
+    if m1.content != "hello bob" { return false }
+
+    // Immutability: s0 unchanged after both appends
+    if len(s0.messages) != 0 { return false }
+    if s0.last_active != 2000 { return false }
+    return true
+}
+
+fn test_append_beyond_30_prunes_oldest() -> bool {
+    let mut cur = session_create("carol", 5000)
+    // Push 35 turns — first 5 should be pruned.
+    let mut t = 0
+    let mut total_pruned = 0
+    while t < 35 {
+        let role = "user"
+        let content = "msg-" + str(t)
+        let r = session_append(cur, role, content, 5000 + t)
+        cur = r.session
+        total_pruned = total_pruned + r.pruned
+        t = t + 1
+    }
+    if len(cur.messages) != 30 { return false }
+    // The only overflow happens when the 31st message is inserted,
+    // and again on 32..35 — 5 appends each drop 1. So total_pruned = 5.
+    if total_pruned != 5 { return false }
+
+    // After pruning, the oldest surviving message should be "msg-5"
+    // (turn_id was 5 when inserted) and the newest should be "msg-34".
+    let first = cur.messages[0]
+    if first.content != "msg-5" { return false }
+    if first.turn_id != 5 { return false }
+    let last = cur.messages[29]
+    if last.content != "msg-34" { return false }
+    if last.turn_id != 34 { return false }
+    if cur.last_active != 5000 + 34 { return false }
+    return true
+}
+
+fn test_save_load_roundtrip() -> bool {
+    let dir = "/tmp/sm_test_sessions_roundtrip"
+    exec("rm -rf " + dir)
+
+    let s0 = session_create("dave", 8000)
+    let r1 = session_append(s0, "user", "line1\nline2", 8100)
+    let r2 = session_append(r1.session, "assistant", "with\ttab\tand\\slash", 8200)
+    let r3 = session_append(r2.session, "user", "ascii only", 8300)
+
+    let orig = r3.session
+    let ok = session_save(orig, dir)
+    if !ok { return false }
+
+    let look = session_load(orig.session_id, dir)
+    if !look.found { return false }
+    let loaded = look.session
+
+    if loaded.session_id != orig.session_id { return false }
+    if loaded.user_id != orig.user_id { return false }
+    if loaded.max_turns != orig.max_turns { return false }
+    if loaded.created_at != orig.created_at { return false }
+    if loaded.last_active != orig.last_active { return false }
+    if len(loaded.messages) != 3 { return false }
+
+    // Content round-trips through escape layer
+    let m0 = loaded.messages[0]
+    if m0.content != "line1\nline2" { return false }
+    if m0.turn_id != 0 { return false }
+    if m0.role != "user" { return false }
+    if m0.timestamp_ms != 8100 { return false }
+
+    let m1 = loaded.messages[1]
+    if m1.content != "with\ttab\tand\\slash" { return false }
+    if m1.role != "assistant" { return false }
+
+    let m2 = loaded.messages[2]
+    if m2.content != "ascii only" { return false }
+    if m2.timestamp_ms != 8300 { return false }
+
+    // Missing file → not found
+    let miss = session_load("does-not-exist", dir)
+    if miss.found { return false }
+
+    exec("rm -rf " + dir)
+    return true
+}
+
+fn test_prune_idle_sessions() -> bool {
+    // Build a store with 4 sessions at varied last_active
+    let mut store = store_new()
+
+    let s_fresh = session_create("u1", 100000)
+    store = store_put(store, s_fresh)
+
+    let s_warm = session_create("u2", 50000)
+    store = store_put(store, s_warm)
+
+    let s_old = session_create("u3", 10000)
+    store = store_put(store, s_old)
+
+    let s_ancient = session_create("u4", 1)
+    store = store_put(store, s_ancient)
+
+    if len(store.sessions) != 4 { return false }
+
+    // store_get roundtrip
+    let got = store_get(store, s_warm.session_id)
+    if !got.found { return false }
+    if got.session.user_id != "u2" { return false }
+
+    let miss = store_get(store, "no-such")
+    if miss.found { return false }
+
+    // Prune: now_ms=100000, idle_ms=60000
+    //   cutoff = 40000
+    //   u1 last_active=100000 >= 40000  keep
+    //   u2 last_active=50000  >= 40000  keep
+    //   u3 last_active=10000  <  40000  drop
+    //   u4 last_active=1      <  40000  drop
+    let pruned = session_prune_idle(store, 100000, 60000)
+    if len(pruned.sessions) != 2 { return false }
+
+    let after_fresh = store_get(pruned, s_fresh.session_id)
+    if !after_fresh.found { return false }
+    let after_warm = store_get(pruned, s_warm.session_id)
+    if !after_warm.found { return false }
+    let after_old = store_get(pruned, s_old.session_id)
+    if after_old.found { return false }
+    let after_ancient = store_get(pruned, s_ancient.session_id)
+    if after_ancient.found { return false }
+
+    // Original store untouched (pass-by-value rebuild semantics)
+    if len(store.sessions) != 4 { return false }
+
+    // Overwrite via store_put (upsert semantics)
+    let r = session_append(s_fresh, "user", "hello", 100500)
+    let store2 = store_put(store, r.session)
+    if len(store2.sessions) != 4 { return false }
+    let again = store_get(store2, s_fresh.session_id)
+    if !again.found { return false }
+    if len(again.session.messages) != 1 { return false }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — --verify runs the 5 self-tests, else prints usage
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[session_manager] P1 TSRV-P1-1 — 30-turn rolling window")
+    println("  max_turns=" + str(SM_DEFAULT_MAX_TURNS) + " idle_ms=" + str(SM_DEFAULT_IDLE_MS))
+    println("")
+
+    let t1 = test_create_empty_session()
+    if t1 { println("T1 PASS  create empty session (alice-ts seeded, max_turns=30)") } else { println("T1 FAIL  create empty session") }
+
+    let t2 = test_append_within_window()
+    if t2 { println("T2 PASS  append within 30-turn window (immutable input preserved)") } else { println("T2 FAIL  append within window") }
+
+    let t3 = test_append_beyond_30_prunes_oldest()
+    if t3 { println("T3 PASS  append beyond 30 prunes oldest (35 in, 30 kept, 5 pruned)") } else { println("T3 FAIL  append beyond 30 prunes oldest") }
+
+    let t4 = test_save_load_roundtrip()
+    if t4 { println("T4 PASS  save/load roundtrip (escaped TSV; newline + tab + backslash preserved)") } else { println("T4 FAIL  save/load roundtrip") }
+
+    let t5 = test_prune_idle_sessions()
+    if t5 { println("T5 PASS  prune idle sessions (cutoff-based; store_get sentinel; upsert)") } else { println("T5 FAIL  prune idle sessions") }
+
+    println("")
+
+    // Sequential mutable-bool guard — same idiom as anima-engines/*_phi.hexa
+    // (stage0 && chains with many operands can mis-short-circuit).
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[session_manager] 5/5 PASS — P1 TSRV-P1-1 DONE (30-turn window + memory + recovery verified)")
+    } else {
+        println("[session_manager] SOME FAILED")
+    }
+}
+
+main()
