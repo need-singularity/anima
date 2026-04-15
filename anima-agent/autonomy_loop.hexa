@@ -1,0 +1,275 @@
+// autonomy_loop.hexa — TCLM-P4-1 (anima-train.json P4 v3.0 Agent brain)
+//
+// Task 자율 분해 + sub-goal 생성 + self-critique.
+// v3.0 직원 가능 핵심: "100 task × decomposition depth ≥ 3 × success ≥ 0.80"
+//
+// Design constraints (hexa quirks 회피):
+//   - array a[i]=v 회피 — push/consume 만 사용
+//   - `match` 키워드 회피 — 평범한 if/else
+//   - string split/contains 최소화 — 고정 파싱 규칙
+//
+// Pluggable LLM adapter (dispatch by name string) — animalm/claude/conscious-lm
+// 교체는 호출 지점에서. 현재는 deterministic mock 만 구현, TCLM-P1-1 학습
+// 완료 후 provider 플러그.
+//
+// 산출물: run_autonomy(adapter, root_text, max_depth, budget) -> AutonomyTrace
+
+// ── Data types ───────────────────────────────────────────────────────
+
+struct Goal {
+    id: string,
+    text: string,
+    depth: int,
+    parent_id: string,      // "" for root
+    status: string,         // "pending" | "expanded" | "executed" | "critiqued" | "failed"
+    result: string,
+    critique_reason: string,
+    score: float,           // 0..1 self-assessed
+    children: array          // sub-goal ids (strings)
+}
+
+struct AutonomyTrace {
+    root_id: string,
+    goals: array,            // flat list of Goal structs
+    max_depth: int,
+    budget_steps: int,
+    step_count: int,
+    terminal_score: float,
+    verdict: string          // "PASS" | "PARTIAL" | "FAIL"
+}
+
+struct LLMAdapter {
+    name: string,            // "mock" | "animalm" | "claude" | "conscious-lm"
+    temperature: float
+}
+
+struct CritiqueOut {
+    score: float,
+    reason: string
+}
+
+// ── Goal helpers ─────────────────────────────────────────────────────
+
+fn new_goal(id: string, text: string, depth: int, parent: string) -> Goal {
+    return Goal {
+        id: id,
+        text: text,
+        depth: depth,
+        parent_id: parent,
+        status: "pending",
+        result: "",
+        critique_reason: "",
+        score: 0.0,
+        children: []
+    }
+}
+
+fn find_goal_idx(goals: array, id: string) -> int {
+    let mut i = 0
+    let n = len(goals)
+    while i < n {
+        if goals[i].id == id { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// ── LLM adapter dispatch ─────────────────────────────────────────────
+
+fn llm_decompose(adapter: LLMAdapter, goal_text: string, depth: int) -> array {
+    if adapter.name == "mock" { return mock_decompose(goal_text, depth) }
+    if adapter.name == "animalm" { return mock_decompose(goal_text, depth) }
+    if adapter.name == "claude" { return mock_decompose(goal_text, depth) }
+    if adapter.name == "conscious-lm" { return mock_decompose(goal_text, depth) }
+    return []
+}
+
+fn llm_execute(adapter: LLMAdapter, goal_text: string) -> string {
+    if adapter.name == "mock" { return mock_execute(goal_text) }
+    return "stub: " + goal_text
+}
+
+fn llm_critique(adapter: LLMAdapter, goal_text: string, result: string) -> CritiqueOut {
+    if adapter.name == "mock" { return mock_critique(goal_text, result) }
+    return CritiqueOut { score: 0.5, reason: "no adapter" }
+}
+
+// ── Mock adapter (deterministic, for bench smoke) ───────────────────
+// Rule: any goal text decomposes into 3 synthetic sub-goals when depth < max.
+// Execute returns "done: <text>". Critique gives score 0.85 for depth <=
+// max_depth, 0.60 otherwise (penalise shallow or too-deep plans).
+
+fn mock_decompose(goal_text: string, depth: int) -> array {
+    let a = ["gather_context(" + goal_text + ")",
+            "analyze(" + goal_text + ")",
+            "synthesize(" + goal_text + ")"]
+    return a
+}
+
+fn mock_execute(goal_text: string) -> string {
+    return "done: " + goal_text
+}
+
+fn mock_critique(goal_text: string, result: string) -> CritiqueOut {
+    // heuristic: non-empty result → 0.85, empty → 0.30
+    if len(result) > 0 {
+        return CritiqueOut { score: 0.85, reason: "non-empty result" }
+    }
+    return CritiqueOut { score: 0.30, reason: "empty result" }
+}
+
+// ── Core loop: expand → execute leaves → critique bottom-up ─────────
+
+fn run_autonomy(adapter: LLMAdapter, root_text: string,
+                max_depth: int, budget_steps: int) -> AutonomyTrace {
+    let root = new_goal("G0", root_text, 0, "")
+    let mut goals = [root]
+    let mut next_id = 1
+
+    // Phase 1: BFS expand until max_depth
+    let mut frontier_idx = 0
+    while frontier_idx < len(goals) {
+        let g = goals[frontier_idx]
+        if g.depth < max_depth {
+            let subs = llm_decompose(adapter, g.text, g.depth)
+            let mut k = 0
+            let ns = len(subs)
+            let mut child_ids = []
+            while k < ns {
+                let child_id = "G" + to_string(next_id)
+                next_id = next_id + 1
+                let child = new_goal(child_id, subs[k], g.depth + 1, g.id)
+                goals = goals.push(child)
+                child_ids = child_ids.push(child_id)
+                k = k + 1
+            }
+            // Update parent's children + status
+            let mut updated = g
+            updated.children = child_ids
+            updated.status = "expanded"
+            // 'goals[frontier_idx] = updated' — hexa array-index write quirk.
+            // Rebuild the goals array with the updated entry.
+            goals = replace_at(goals, frontier_idx, updated)
+        }
+        frontier_idx = frontier_idx + 1
+    }
+
+    // Phase 2: execute leaves (status=="pending" means never-expanded)
+    let mut step_count = 0
+    let mut i = 0
+    while i < len(goals) {
+        let g = goals[i]
+        if g.status == "pending" && step_count < budget_steps {
+            let res = llm_execute(adapter, g.text)
+            let mut u = g
+            u.result = res
+            u.status = "executed"
+            goals = replace_at(goals, i, u)
+            step_count = step_count + 1
+        }
+        i = i + 1
+    }
+
+    // Phase 3: critique bottom-up (leaves first, then internal by avg of children)
+    let mut d = max_depth
+    while d >= 0 {
+        let mut j = 0
+        while j < len(goals) {
+            let g = goals[j]
+            if g.depth == d && g.status != "critiqued" {
+                let mut score_out = CritiqueOut { score: 0.0, reason: "" }
+                if len(g.children) == 0 {
+                    // leaf: critique result directly
+                    score_out = llm_critique(adapter, g.text, g.result)
+                } else {
+                    // internal: avg of child scores
+                    let mut sum = 0.0
+                    let mut cnt = 0
+                    let mut ci = 0
+                    while ci < len(g.children) {
+                        let child_idx = find_goal_idx(goals, g.children[ci])
+                        if child_idx >= 0 {
+                            sum = sum + goals[child_idx].score
+                            cnt = cnt + 1
+                        }
+                        ci = ci + 1
+                    }
+                    let avg = if cnt > 0 { sum / to_float(cnt) } else { 0.0 }
+                    score_out = CritiqueOut { score: avg, reason: "avg of children" }
+                }
+                let mut uc = g
+                uc.score = score_out.score
+                uc.critique_reason = score_out.reason
+                uc.status = "critiqued"
+                goals = replace_at(goals, j, uc)
+            }
+            j = j + 1
+        }
+        d = d - 1
+    }
+
+    // Verdict
+    let root_idx = find_goal_idx(goals, "G0")
+    let terminal = if root_idx >= 0 { goals[root_idx].score } else { 0.0 }
+    let verdict = if terminal >= 0.80 { "PASS" } else if terminal >= 0.50 { "PARTIAL" } else { "FAIL" }
+
+    return AutonomyTrace {
+        root_id: "G0",
+        goals: goals,
+        max_depth: max_depth,
+        budget_steps: budget_steps,
+        step_count: step_count,
+        terminal_score: terminal,
+        verdict: verdict
+    }
+}
+
+// Replace element at index — works around `goals[i]=v` silent no-op.
+fn replace_at(arr: array, idx: int, val: Goal) -> array {
+    let n = len(arr)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        if i == idx {
+            out = out.push(val)
+        } else {
+            out = out.push(arr[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Trace inspection helpers ─────────────────────────────────────────
+
+fn trace_summary(trace: AutonomyTrace) -> string {
+    let mut s = "AutonomyTrace:\n"
+    s = s + "  root: " + trace.root_id + "\n"
+    s = s + "  goals: " + to_string(len(trace.goals)) + "\n"
+    s = s + "  max_depth: " + to_string(trace.max_depth) + "\n"
+    s = s + "  step_count: " + to_string(trace.step_count) + "\n"
+    s = s + "  terminal_score: " + to_string(trace.terminal_score) + "\n"
+    s = s + "  verdict: " + trace.verdict + "\n"
+    return s
+}
+
+fn max_depth_in_trace(trace: AutonomyTrace) -> int {
+    let mut m = 0
+    let mut i = 0
+    while i < len(trace.goals) {
+        let d = trace.goals[i].depth
+        if d > m { m = d }
+        i = i + 1
+    }
+    return m
+}
+
+fn count_leaves(trace: AutonomyTrace) -> int {
+    let mut c = 0
+    let mut i = 0
+    while i < len(trace.goals) {
+        if len(trace.goals[i].children) == 0 { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
