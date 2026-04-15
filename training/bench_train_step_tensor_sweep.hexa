@@ -37,6 +37,25 @@ extern fn hxblas_sgemm(order: int, transA: int, transB: int, M: int, N: int, K: 
 @link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
 extern fn hxblas_version() -> int
 
+// ── vDSP (Accelerate) eltwise FFI — 2026-04-16 port (5-20x 예상) ─────
+@link("/Users/ghost/Dev/anima/training/build/libhxvdsp.dylib")
+extern fn hxvdsp_rmsnorm_fwd(S: int, D: int, x: *Void, gain: *Void, eps: float, out: *Void)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxvdsp.dylib")
+extern fn hxvdsp_rmsnorm_bwd(S: int, D: int, x: *Void, gain: *Void, dy: *Void, eps: float, dx: *Void, dg: *Void)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxvdsp.dylib")
+extern fn hxvdsp_softmax_row(x: *Void, row_offset_f32: int, n: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxvdsp.dylib")
+extern fn hxvdsp_swiglu_fwd(n: int, up: *Void, out: *Void)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxvdsp.dylib")
+extern fn hxvdsp_swiglu_bwd(n: int, up: *Void, dy: *Void, dx: *Void)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxvdsp.dylib")
+extern fn hxvdsp_version() -> int
+
 // ── CBLAS constants ───────────────────────────────────────────────────
 let CblasRowMajor = 101
 let CblasNoTrans  = 111
@@ -150,30 +169,10 @@ fn tensor_randn_init(t: Tensor, seed: int, scale: float) {
     }
 }
 
-// ── RMSNorm on [S, D] tensor, per row ─────────────────────────────────
+// ── RMSNorm on [S, D] tensor, per row ─ vDSP fused whole-tensor op
 fn rms_norm_rows_t(x: Tensor, gain: Tensor, eps: float) -> Tensor {
     let out = tensor_new2(x.d0, x.d1)
-    let D = x.d1
-    let mut i = 0
-    while i < x.d0 {
-        let mut ms = 0.0
-        let mut p = 0
-        while p < D {
-            let v = deref_f32(x.data, (i * D + p) * 4)
-            ms = ms + v * v
-            p = p + 1
-        }
-        ms = ms / to_float(D)
-        let inv_r = 1.0 / sqrt(ms + eps)
-        p = 0
-        while p < D {
-            let v = deref_f32(x.data, (i * D + p) * 4)
-            let g = deref_f32(gain.data, p * 4)
-            write_f32(out.data, (i * D + p) * 4, v * inv_r * g)
-            p = p + 1
-        }
-        i = i + 1
-    }
+    hxvdsp_rmsnorm_fwd(x.d0, x.d1, x.data, gain.data, eps, out.data)
     return out
 }
 
@@ -186,95 +185,26 @@ fn rms_norm_rows_bwd_t(x: Tensor, g: Tensor, dy: Tensor, eps: float) -> RmsRowsB
     let S = x.d0
     let D = x.d1
     let dx = tensor_new2(S, D)
-    let dg = tensor_new1(D)
-    let mut i = 0
-    while i < S {
-        let mut ms = 0.0
-        let mut p = 0
-        while p < D {
-            let v = deref_f32(x.data, (i * D + p) * 4)
-            ms = ms + v * v
-            p = p + 1
-        }
-        ms = ms / to_float(D)
-        let r = sqrt(ms + eps)
-        let inv_r = 1.0 / r
-        let inv_r3 = inv_r * inv_r * inv_r
-        let mut coef = 0.0
-        p = 0
-        while p < D {
-            let v = deref_f32(x.data, (i * D + p) * 4)
-            let gp = deref_f32(g.data, p * 4)
-            let dyp = deref_f32(dy.data, (i * D + p) * 4)
-            coef = coef + v * gp * dyp
-            p = p + 1
-        }
-        p = 0
-        while p < D {
-            let v = deref_f32(x.data, (i * D + p) * 4)
-            let gp = deref_f32(g.data, p * 4)
-            let dyp = deref_f32(dy.data, (i * D + p) * 4)
-            let dxp = gp * dyp * inv_r - v * coef * inv_r3 / to_float(D)
-            write_f32(dx.data, (i * D + p) * 4, dxp)
-            let dgp_old = deref_f32(dg.data, p * 4)
-            write_f32(dg.data, p * 4, dgp_old + v * dyp * inv_r)
-            p = p + 1
-        }
-        i = i + 1
-    }
+    let dg = tensor_new1(D)  // alloc_raw zeros — safe for accumulation
+    hxvdsp_rmsnorm_bwd(S, D, x.data, g.data, dy.data, eps, dx.data, dg.data)
     return RmsRowsBwd { dx: dx, dg: dg }
 }
 
-// ── Softmax row helpers ───────────────────────────────────────────────
+// ── Softmax row helpers ─ vDSP (maxv/vsadd/vvexpf/sve/vsmul fused)
 fn softmax_row_t(scores: Tensor, row_start: int, n: int) {
-    let mut mx = deref_f32(scores.data, row_start * 4)
-    let mut i = 1
-    while i < n {
-        let v = deref_f32(scores.data, (row_start + i) * 4)
-        if v > mx { mx = v }
-        i = i + 1
-    }
-    let mut sum_exp = 0.0
-    i = 0
-    while i < n {
-        let v = deref_f32(scores.data, (row_start + i) * 4)
-        let e = exp(v - mx)
-        write_f32(scores.data, (row_start + i) * 4, e)
-        sum_exp = sum_exp + e
-        i = i + 1
-    }
-    i = 0
-    while i < n {
-        let e = deref_f32(scores.data, (row_start + i) * 4)
-        write_f32(scores.data, (row_start + i) * 4, e / sum_exp)
-        i = i + 1
-    }
+    hxvdsp_softmax_row(scores.data, row_start, n)
 }
 
-// ── SwiGLU-self activation ────────────────────────────────────────────
+// ── SwiGLU-self activation ─ vDSP fused (sigmoid via vvexpf+vvrecf)
 fn swiglu_self_t(up: Tensor) -> Tensor {
     let out = tensor_new2(up.d0, up.d1)
-    let mut i = 0
-    while i < up.numel {
-        let v = deref_f32(up.data, i * 4)
-        let s = 1.0 / (1.0 + exp(0.0 - v))
-        write_f32(out.data, i * 4, v * s)
-        i = i + 1
-    }
+    hxvdsp_swiglu_fwd(up.numel, up.data, out.data)
     return out
 }
 
 fn swiglu_self_bwd_t(up: Tensor, dy: Tensor) -> Tensor {
     let out = tensor_new2(up.d0, up.d1)
-    let mut i = 0
-    while i < up.numel {
-        let v = deref_f32(up.data, i * 4)
-        let dyi = deref_f32(dy.data, i * 4)
-        let s = 1.0 / (1.0 + exp(0.0 - v))
-        let dxi = dyi * (s + v * s * (1.0 - s))
-        write_f32(out.data, i * 4, dxi)
-        i = i + 1
-    }
+    hxvdsp_swiglu_bwd(up.numel, up.data, dy.data, out.data)
     return out
 }
 
