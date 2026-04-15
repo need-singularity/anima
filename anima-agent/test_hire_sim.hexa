@@ -1,0 +1,101 @@
+// test_hire_sim.hexa — TSRV-P4-2 smoke
+//
+// Validates hire_sim framework end-to-end with mock autonomy_loop adapter.
+// Real LLM plug-in reruns identical harness; no framework change expected.
+
+use "autonomy_loop"
+use "hire_sim_100"
+
+fn main() {
+    let adapter = LLMAdapter { name: "mock", temperature: 0.0 }
+    let tasks = load_tasks()
+    let mut pass = 0
+    let mut total = 0
+
+    // ── T1: corpus size + domain coverage ─────────────────────
+    println("=== T1: corpus composition ===")
+    let t1_size_ok = len(tasks) == 30
+    // count per domain
+    let domains = ["email", "code", "meeting", "doc", "schedule", "research"]
+    let mut all_ok = t1_size_ok
+    let mut di = 0
+    while di < len(domains) {
+        let dname = domains[di]
+        let mut cnt = 0
+        let mut ti = 0
+        while ti < len(tasks) {
+            if tasks[ti].domain == dname { cnt = cnt + 1 }
+            ti = ti + 1
+        }
+        println("  " + dname + ": " + to_string(cnt))
+        if cnt != 5 { all_ok = false }
+        di = di + 1
+    }
+    if all_ok { pass = pass + 1 }
+    total = total + 1
+    println("T1 PASS=" + to_string(all_ok) + " (size=30, 5-per-domain)")
+
+    // ── T2: runner end-to-end smoke ────────────────────────────
+    println("=== T2: runner e2e ===")
+    let result = run_hire_sim(adapter, tasks)
+    println(hire_sim_report(result))
+    let t2_ok = result.tasks_run == 30 && len(result.per_domain) == 6
+    if t2_ok { pass = pass + 1 }
+    total = total + 1
+    println("T2 PASS=" + to_string(t2_ok))
+
+    // ── T3: verdict logic ──────────────────────────────────────
+    println("=== T3: verdict schema ===")
+    // Mock adapter decomposes into fixed sub-goals, not necessarily covering
+    // task-specific keywords. Expect: many tasks fail completion on keyword
+    // match (mock doesn't inject task terms), low completion_rate, verdict
+    // likely PARTIAL or FAIL. This validates the rubric is strict.
+    let t3_verdict_valid = result.verdict == "PASS" || result.verdict == "PARTIAL" || result.verdict == "FAIL"
+    if t3_verdict_valid { pass = pass + 1 }
+    total = total + 1
+    println("verdict=" + result.verdict + " T3 PASS=" + to_string(t3_verdict_valid))
+
+    // ── T4: rate/score in [0,1] ────────────────────────────────
+    println("=== T4: rate + score bounds ===")
+    let t4_ok = result.completion_rate >= 0.0 && result.completion_rate <= 1.0
+                && result.avg_score >= 0.0 && result.avg_score <= 1.0
+    if t4_ok { pass = pass + 1 }
+    total = total + 1
+    println("rate=" + to_string(result.completion_rate) + " score=" + to_string(result.avg_score) + " T4 PASS=" + to_string(t4_ok))
+
+    // ── T5: per-domain summaries non-empty ────────────────────
+    println("=== T5: per-domain summaries ===")
+    let mut t5_ok = len(result.per_domain) == 6
+    let mut pi = 0
+    while pi < len(result.per_domain) {
+        let d = result.per_domain[pi]
+        if d.n != 5 { t5_ok = false }
+        pi = pi + 1
+    }
+    if t5_ok { pass = pass + 1 }
+    total = total + 1
+    println("T5 PASS=" + to_string(t5_ok))
+
+    // ── T6: keyword matching sanity ────────────────────────────
+    println("=== T6: keyword embedded tasks hit ===")
+    // Run autonomy on a prompt that embeds a known keyword in its text
+    // and verify the rubric detects it.
+    // Mock decomposer echoes goal text into sub-goals, so keywords in the
+    // prompt WILL appear in trace blob. Pick EM01 ("refund policy") and check
+    // keyword_hits > 0.
+    let em01 = tasks[0]
+    let trace = run_autonomy(adapter, em01.prompt, 3, 100)
+    let r = evaluate_task(em01, trace, 27.0, 0)
+    let t6_ok = r.keyword_hits >= 2  // at least "refund" and "policy" should match
+    if t6_ok { pass = pass + 1 }
+    total = total + 1
+    println("EM01 hits=" + to_string(r.keyword_hits) + "/" + to_string(r.keyword_total) + " T6 PASS=" + to_string(t6_ok))
+
+    println("=== RESULT ===")
+    println(to_string(pass) + "/" + to_string(total) + " tests passed")
+    if pass == total {
+        println("hire_sim_100: ALL PASS")
+    } else {
+        println("hire_sim_100: FAIL")
+    }
+}

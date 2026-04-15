@@ -1,0 +1,384 @@
+// hire_sim_100.hexa — TSRV-P4-2 (anima-train.json P4)
+//
+// v3.0 직원 가능 측정 도구. 6 도메인 × 실업무 task × deterministic rubric.
+//
+// done_criteria (TSRV-P4-2): 완료율 ≥ 0.85, 사용자 개입 ≤ 5/hour,
+//                            평균 task 소요 ≤ 10 min
+//
+// 현재 seed 30 task (5 per domain). 100 확장은 real LLM 실측 단계에서.
+//
+// 사용:
+//   let adapter = LLMAdapter { name: "mock" | "claude" | "animalm" | ...,
+//                              temperature: 0.0 }
+//   let tasks = load_tasks()
+//   let result = run_hire_sim(adapter, tasks)
+//   println(hire_sim_report(result))
+//
+// Rubric (deterministic mock 판정):
+//   completed := 모든 success_keyword 가 decomposition+execution trace 에 포함
+//   score := 매칭된 keyword 비율 (0..1)
+//   intervention_count := 현재 스캐폴드에서 0 (tool-use LoRA 이후 실측 가능)
+//   time_s := mock 에서는 step_count 로 대리 (1 step = 1초 가정)
+//
+// 실 LLM 플러그 시 evaluate_task 내 keyword matching 을 llm_judge 또는
+// external rubric 으로 교체. 프레임워크는 adapter.name 스위치로 변경 없이 유지.
+
+use "autonomy_loop"
+
+// ── Data types ───────────────────────────────────────────────────────
+
+struct Task {
+    id: string,
+    domain: string,          // email/code/meeting/doc/schedule/research
+    difficulty: string,       // easy/medium/hard
+    prompt: string,
+    success_keywords: array,  // deterministic 판정용 (모두 trace 에 포함되어야 완료)
+    max_interventions: int,
+    max_time_sec: int
+}
+
+struct TaskResult {
+    task_id: string,
+    domain: string,
+    completed: bool,
+    score: float,             // 0..1
+    intervention_count: int,
+    time_s: float,
+    keyword_hits: int,
+    keyword_total: int
+}
+
+struct HireSimResult {
+    tasks_run: int,
+    completed_count: int,
+    completion_rate: float,
+    avg_score: float,
+    avg_time_s: float,
+    total_interventions: int,
+    intervention_rate_per_hour: float,
+    per_domain: array,          // array of { domain, n, completed, rate, avg_score }
+    verdict: string             // "PASS" | "PARTIAL" | "FAIL"
+}
+
+struct DomainSummary {
+    domain: string,
+    n: int,
+    completed: int,
+    rate: float,
+    avg_score: float
+}
+
+// ── Seed corpus (30 task = 5 per domain × 6 도메인) ──────────────────
+
+fn load_tasks() -> array {
+    let mut t = []
+    // ── 이메일 도메인 (5) ─────────────────────────────────────
+    t = t.push(Task { id: "EM01", domain: "email", difficulty: "easy",
+        prompt: "draft reply to customer asking about refund policy",
+        success_keywords: ["refund", "policy", "reply"],
+        max_interventions: 1, max_time_sec: 300 })
+    t = t.push(Task { id: "EM02", domain: "email", difficulty: "easy",
+        prompt: "compose onboarding welcome email to new hire starting monday",
+        success_keywords: ["welcome", "onboarding"],
+        max_interventions: 1, max_time_sec: 300 })
+    t = t.push(Task { id: "EM03", domain: "email", difficulty: "medium",
+        prompt: "triage overnight inbox and flag urgent items requiring same-day reply",
+        success_keywords: ["triage", "urgent", "reply"],
+        max_interventions: 2, max_time_sec: 600 })
+    t = t.push(Task { id: "EM04", domain: "email", difficulty: "medium",
+        prompt: "respond to escalated support ticket about data export failure",
+        success_keywords: ["support", "export", "respond"],
+        max_interventions: 2, max_time_sec: 600 })
+    t = t.push(Task { id: "EM05", domain: "email", difficulty: "hard",
+        prompt: "negotiate renewal terms with enterprise vendor, propose 15% discount",
+        success_keywords: ["negotiate", "renewal", "discount"],
+        max_interventions: 3, max_time_sec: 900 })
+
+    // ── 코드 도메인 (5) ─────────────────────────────────────
+    t = t.push(Task { id: "CD01", domain: "code", difficulty: "easy",
+        prompt: "review pull request for input validation bug",
+        success_keywords: ["review", "validation"],
+        max_interventions: 1, max_time_sec: 300 })
+    t = t.push(Task { id: "CD02", domain: "code", difficulty: "easy",
+        prompt: "write unit test for calculate_discount function",
+        success_keywords: ["test", "discount"],
+        max_interventions: 1, max_time_sec: 300 })
+    t = t.push(Task { id: "CD03", domain: "code", difficulty: "medium",
+        prompt: "investigate latency spike in order service and file incident report",
+        success_keywords: ["investigate", "latency", "report"],
+        max_interventions: 2, max_time_sec: 600 })
+    t = t.push(Task { id: "CD04", domain: "code", difficulty: "medium",
+        prompt: "refactor payment module to extract fee calculation into pure function",
+        success_keywords: ["refactor", "payment", "function"],
+        max_interventions: 2, max_time_sec: 600 })
+    t = t.push(Task { id: "CD05", domain: "code", difficulty: "hard",
+        prompt: "design schema migration to add audit columns without downtime",
+        success_keywords: ["migration", "audit", "schema"],
+        max_interventions: 3, max_time_sec: 900 })
+
+    // ── 회의록 도메인 (5) ───────────────────────────────────
+    t = t.push(Task { id: "MT01", domain: "meeting", difficulty: "easy",
+        prompt: "summarize 30-minute weekly standup into 5 bullet points",
+        success_keywords: ["summarize", "standup", "bullet"],
+        max_interventions: 1, max_time_sec: 300 })
+    t = t.push(Task { id: "MT02", domain: "meeting", difficulty: "easy",
+        prompt: "extract action items from leadership sync recording",
+        success_keywords: ["action", "leadership"],
+        max_interventions: 1, max_time_sec: 300 })
+    t = t.push(Task { id: "MT03", domain: "meeting", difficulty: "medium",
+        prompt: "write minutes for quarterly planning meeting with decision log",
+        success_keywords: ["minutes", "planning", "decision"],
+        max_interventions: 2, max_time_sec: 600 })
+    t = t.push(Task { id: "MT04", domain: "meeting", difficulty: "medium",
+        prompt: "draft talking points for exec review of q3 roadmap",
+        success_keywords: ["talking points", "roadmap"],
+        max_interventions: 2, max_time_sec: 600 })
+    t = t.push(Task { id: "MT05", domain: "meeting", difficulty: "hard",
+        prompt: "facilitate postmortem and distill root causes from 8 engineer responses",
+        success_keywords: ["postmortem", "root cause"],
+        max_interventions: 3, max_time_sec: 900 })
+
+    // ── 문서 작성 도메인 (5) ─────────────────────────────────
+    t = t.push(Task { id: "DC01", domain: "doc", difficulty: "easy",
+        prompt: "write release notes for v1.2 highlighting 3 user-facing changes",
+        success_keywords: ["release notes", "changes"],
+        max_interventions: 1, max_time_sec: 300 })
+    t = t.push(Task { id: "DC02", domain: "doc", difficulty: "easy",
+        prompt: "draft one-pager for partnership proposal to marketing lead",
+        success_keywords: ["partnership", "proposal"],
+        max_interventions: 1, max_time_sec: 300 })
+    t = t.push(Task { id: "DC03", domain: "doc", difficulty: "medium",
+        prompt: "compose onboarding doc covering repo layout, local setup, ci flow",
+        success_keywords: ["onboarding", "setup", "ci"],
+        max_interventions: 2, max_time_sec: 600 })
+    t = t.push(Task { id: "DC04", domain: "doc", difficulty: "medium",
+        prompt: "produce technical design doc for new notification service",
+        success_keywords: ["design", "notification"],
+        max_interventions: 2, max_time_sec: 600 })
+    t = t.push(Task { id: "DC05", domain: "doc", difficulty: "hard",
+        prompt: "write rfc proposing incident response policy with 3 severity tiers",
+        success_keywords: ["rfc", "incident", "severity"],
+        max_interventions: 3, max_time_sec: 900 })
+
+    // ── 일정 관리 도메인 (5) ─────────────────────────────────
+    t = t.push(Task { id: "SC01", domain: "schedule", difficulty: "easy",
+        prompt: "schedule 45-minute weekly design sync with 3 attendees",
+        success_keywords: ["schedule", "sync"],
+        max_interventions: 1, max_time_sec: 300 })
+    t = t.push(Task { id: "SC02", domain: "schedule", difficulty: "easy",
+        prompt: "block focus time mornings for next 2 weeks",
+        success_keywords: ["block", "focus"],
+        max_interventions: 1, max_time_sec: 300 })
+    t = t.push(Task { id: "SC03", domain: "schedule", difficulty: "medium",
+        prompt: "coordinate cross-timezone workshop with sf / seoul / berlin attendees",
+        success_keywords: ["coordinate", "timezone"],
+        max_interventions: 2, max_time_sec: 600 })
+    t = t.push(Task { id: "SC04", domain: "schedule", difficulty: "medium",
+        prompt: "organize 2-day sprint planning with 12 engineers split by track",
+        success_keywords: ["organize", "planning"],
+        max_interventions: 2, max_time_sec: 600 })
+    t = t.push(Task { id: "SC05", domain: "schedule", difficulty: "hard",
+        prompt: "rework quarterly calendar after re-org, preserving oncall rotation",
+        success_keywords: ["calendar", "oncall"],
+        max_interventions: 3, max_time_sec: 900 })
+
+    // ── 리서치 도메인 (5) ───────────────────────────────────
+    t = t.push(Task { id: "RS01", domain: "research", difficulty: "easy",
+        prompt: "summarize top 3 competitor features in LLM avatar space",
+        success_keywords: ["competitor", "features"],
+        max_interventions: 1, max_time_sec: 300 })
+    t = t.push(Task { id: "RS02", domain: "research", difficulty: "easy",
+        prompt: "find 5 recent papers on quantum-inspired sampling for LLMs",
+        success_keywords: ["papers", "sampling"],
+        max_interventions: 1, max_time_sec: 300 })
+    t = t.push(Task { id: "RS03", domain: "research", difficulty: "medium",
+        prompt: "compare 3 vector db vendors on pricing, latency, consistency",
+        success_keywords: ["compare", "vector db"],
+        max_interventions: 2, max_time_sec: 600 })
+    t = t.push(Task { id: "RS04", domain: "research", difficulty: "medium",
+        prompt: "assess open-source licenses for embedded llm runtime, flag copyleft risks",
+        success_keywords: ["license", "copyleft"],
+        max_interventions: 2, max_time_sec: 600 })
+    t = t.push(Task { id: "RS05", domain: "research", difficulty: "hard",
+        prompt: "benchmark 4 eeg headset apis end-to-end for latency under 100ms",
+        success_keywords: ["benchmark", "eeg", "latency"],
+        max_interventions: 3, max_time_sec: 900 })
+
+    return t
+}
+
+// ── Task evaluation ──────────────────────────────────────────────────
+
+fn trace_text_blob(trace: AutonomyTrace) -> string {
+    // Concatenate all goal texts + results for keyword search
+    let mut s = ""
+    let mut i = 0
+    while i < len(trace.goals) {
+        s = s + trace.goals[i].text + " "
+        s = s + trace.goals[i].result + " "
+        i = i + 1
+    }
+    return s
+}
+
+fn evaluate_task(task: Task, trace: AutonomyTrace, time_s: float, interventions: int) -> TaskResult {
+    let blob = trace_text_blob(trace)
+    let mut hits = 0
+    let mut ki = 0
+    let total = len(task.success_keywords)
+    while ki < total {
+        if blob.contains(task.success_keywords[ki]) {
+            hits = hits + 1
+        }
+        ki = ki + 1
+    }
+    let score = if total > 0 { to_float(hits) / to_float(total) } else { 0.0 }
+    // Deterministic completion: all keywords hit AND trace verdict != FAIL AND within budget
+    let all_hit = hits == total
+    let budget_ok = interventions <= task.max_interventions && time_s <= to_float(task.max_time_sec)
+    let verdict_ok = trace.verdict != "FAIL"
+    let completed = all_hit && budget_ok && verdict_ok
+    return TaskResult {
+        task_id: task.id, domain: task.domain,
+        completed: completed, score: score,
+        intervention_count: interventions, time_s: time_s,
+        keyword_hits: hits, keyword_total: total
+    }
+}
+
+// ── Runner ───────────────────────────────────────────────────────────
+
+fn run_hire_sim(adapter: LLMAdapter, tasks: array) -> HireSimResult {
+    let mut results = []
+    let mut total_time = 0.0
+    let mut total_score = 0.0
+    let mut total_completed = 0
+    let mut total_interv = 0
+
+    // Per-domain accumulators (using parallel arrays to avoid struct-list quirk)
+    let mut d_names = []
+    let mut d_n = []
+    let mut d_comp = []
+    let mut d_score_sum = []
+
+    let mut ti = 0
+    while ti < len(tasks) {
+        let task = tasks[ti]
+        // Run autonomy loop for this task
+        let trace = run_autonomy(adapter, task.prompt, 3, 100)
+        // Mock mapping: 1 autonomy step = 1 second for now; real LLM provides actual timing
+        let time_s = to_float(trace.step_count)
+        let intervs = 0  // scaffold: 0 interventions; wire real clarification count later
+        let r = evaluate_task(task, trace, time_s, intervs)
+        results = results.push(r)
+        total_time = total_time + r.time_s
+        total_score = total_score + r.score
+        if r.completed { total_completed = total_completed + 1 }
+        total_interv = total_interv + r.intervention_count
+
+        // Domain aggregation
+        let mut dfound = 0 - 1
+        let mut di = 0
+        while di < len(d_names) {
+            if d_names[di] == task.domain { dfound = di }
+            di = di + 1
+        }
+        if dfound < 0 {
+            d_names = d_names.push(task.domain)
+            d_n = d_n.push(1)
+            d_comp = d_comp.push(if r.completed { 1 } else { 0 })
+            d_score_sum = d_score_sum.push(r.score)
+        } else {
+            d_n = replace_int_at(d_n, dfound, d_n[dfound] + 1)
+            d_comp = replace_int_at(d_comp, dfound, d_comp[dfound] + (if r.completed { 1 } else { 0 }))
+            d_score_sum = replace_float_at(d_score_sum, dfound, d_score_sum[dfound] + r.score)
+        }
+
+        ti = ti + 1
+    }
+
+    let n = len(tasks)
+    let nf = to_float(n)
+    let avg_time = if n > 0 { total_time / nf } else { 0.0 }
+    let avg_score = if n > 0 { total_score / nf } else { 0.0 }
+    let completion_rate = if n > 0 { to_float(total_completed) / nf } else { 0.0 }
+    // interventions per hour, using total simulated time
+    let interv_per_hr = if total_time > 0.0 { to_float(total_interv) * 3600.0 / total_time } else { 0.0 }
+
+    // Build per-domain summaries
+    let mut per_domain = []
+    let mut di2 = 0
+    while di2 < len(d_names) {
+        let sd = DomainSummary {
+            domain: d_names[di2],
+            n: d_n[di2],
+            completed: d_comp[di2],
+            rate: to_float(d_comp[di2]) / to_float(d_n[di2]),
+            avg_score: d_score_sum[di2] / to_float(d_n[di2])
+        }
+        per_domain = per_domain.push(sd)
+        di2 = di2 + 1
+    }
+
+    // Verdict per TSRV-P4-2 gate
+    let gate_rate = completion_rate >= 0.85
+    let gate_interv = interv_per_hr <= 5.0
+    let gate_time = avg_time <= 600.0   // 10 min = 600s
+    let verdict = if gate_rate && gate_interv && gate_time { "PASS" }
+                  else if completion_rate >= 0.50 { "PARTIAL" }
+                  else { "FAIL" }
+
+    return HireSimResult {
+        tasks_run: n,
+        completed_count: total_completed,
+        completion_rate: completion_rate,
+        avg_score: avg_score,
+        avg_time_s: avg_time,
+        total_interventions: total_interv,
+        intervention_rate_per_hour: interv_per_hr,
+        per_domain: per_domain,
+        verdict: verdict
+    }
+}
+
+fn replace_int_at(arr: array, idx: int, val: int) -> array {
+    let n = len(arr)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        if i == idx { out = out.push(val) } else { out = out.push(arr[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+fn replace_float_at(arr: array, idx: int, val: float) -> array {
+    let n = len(arr)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        if i == idx { out = out.push(val) } else { out = out.push(arr[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Reporter ─────────────────────────────────────────────────────────
+
+fn hire_sim_report(r: HireSimResult) -> string {
+    let mut s = "HireSimResult:\n"
+    s = s + "  tasks_run: " + to_string(r.tasks_run) + "\n"
+    s = s + "  completed: " + to_string(r.completed_count) + "/" + to_string(r.tasks_run) + " = " + to_string(r.completion_rate) + "\n"
+    s = s + "  avg_score: " + to_string(r.avg_score) + "\n"
+    s = s + "  avg_time_s: " + to_string(r.avg_time_s) + "\n"
+    s = s + "  total_interventions: " + to_string(r.total_interventions) + " (rate/hr=" + to_string(r.intervention_rate_per_hour) + ")\n"
+    s = s + "  verdict: " + r.verdict + " (gate: rate>=0.85, interv/hr<=5, avg_time<=600)\n"
+    s = s + "  per_domain:\n"
+    let mut i = 0
+    while i < len(r.per_domain) {
+        let d = r.per_domain[i]
+        s = s + "    " + d.domain + ": " + to_string(d.completed) + "/" + to_string(d.n) + " = " + to_string(d.rate) + " (avg_score=" + to_string(d.avg_score) + ")\n"
+        i = i + 1
+    }
+    return s
+}
