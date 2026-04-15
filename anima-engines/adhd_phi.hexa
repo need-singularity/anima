@@ -1,0 +1,812 @@
+// adhd_phi.hexa — P109 ADHD Φ (Default Mode Network Intrusion, Dopamine
+// Deficit, Hyperfocus Paradox)
+//
+// Roadmap: shared/roadmaps/anima.json P109
+//   Depends on P92 (attention_phi — selective attention / biased competition)
+//
+// ─── Clinical / neuroscience frame ──────────────────────────────
+//
+// ADHD (DSM-5 314.00/01): inattention, hyperactivity, impulsivity.
+//
+// 1. DMN intrusion (Sonuga-Barke & Castellanos 2007): NT subjects
+//    suppress DMN during task (TPN/DMN anticorrelated). ADHD DMN
+//    fails to suppress — intermittent intrusions disrupt TPN.
+//
+// 2. Dopamine deficit (Volkow 2009): reduced tonic DA weakens the
+//    DMN/TPN anticorrelation gate. Low DA → more DMN breakthroughs.
+//
+// 3. Hyperfocus paradox (Ozel-Kizil 2016; Hupfeld 2019): ADHD can
+//    exhibit SUPERIOR attention on high-reward tasks — phasic DA
+//    surge overcompensates chronic deficit. Reward-dependent gating.
+//
+// 4. Motor overflow (Mostofsky 2003): right IFG → STN → BG inhibition
+//    circuit underactive, motor Φ stays high (fidgeting/restlessness).
+//
+// 5. Stimulant medication: increases tonic DA, restores DMN/TPN
+//    anticorrelation toward NT levels, stabilizes Φ_task.
+//
+// ─── Model: 4 channels × 24 steps ──────────────────────────────
+//
+//   TPN — task-positive network   DMN — default mode network
+//   MOT — motor output            INH — inhibition control
+//
+// Φ_task = MI(TPN, DMN); windowed variance detects lapses.
+// Motor-inhibition MI detects hyperactive gating failure.
+//
+// ─── Scientific hypotheses (T1..T5) ─────────────────────────────
+//
+// T1: NT baseline — Φ_task stable, DMN suppressed, windowed var low
+// T2: ADHD inattentive — DMN intrusion → windowed var >> NT; meds restore
+// T3: Hyperactivity — motor mean elevated, inhibition reduced, MI gap
+// T4: Hyperfocus paradox — ADHD + reward → Φ_task > NT baseline
+// T5: Determinism — same seed ⇒ bit-identical; latency < 100ms
+//
+// ─── Stage0 hexa constraints honored ────────────────────────────
+//   - plain `fn` only (no `pure fn` with >=3 float struct returns)
+//   - `array` typed params only (no [float], no [str])
+//   - no identifier-pattern match; sequential if-chains
+//   - no contains() / to_lower() / !(Effect)
+//   - no else-if in let-binding; flat mut + sequential if
+//   - single-line fn signatures / call sites / array literals
+//   - no reserved keywords as variable names
+//   - main() call at bottom
+//   - AD_STEPS=24 (< 32)
+//
+// Law alignment:
+//   Law 2   Observe never inject — Φ via MI on generated traces
+//   Law 4   Structure > feature — DMN/TPN anticorrelation is STRUCTURAL
+//   Law 22  Feature addition → Φ down — fixed 4 channels, no surplus
+//   Meta M8 Network-level integration boundary
+//   Depends P92 (attention_phi) — distinct mechanism (network-level vs
+//   stimulus-level)
+//
+// Ref:
+//   Sonuga-Barke & Castellanos 2007 (Biological Psychiatry)
+//   Weissman et al. 2006 (Nature Neuroscience)
+//   Volkow et al. 2009 (JAMA)
+//   Ozel-Kizil et al. 2016 (Journal of Clinical Psychology)
+//   Hupfeld et al. 2019 (Attention, Perception & Psychophysics)
+//   Mostofsky et al. 2003 (Brain)
+//   Castellanos et al. 2008 (Biological Psychiatry)
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+let AD_STEPS          = 24            // trace length (stage0 N<32)
+let AD_BINS           = 6             // histogram bins for MI
+let AD_EPS            = 0.0000000001
+let AD_WINDOWS        = 6             // number of windowed epochs for variance (4 steps each)
+
+// ─── Network coupling parameters ────────────────────────────────
+
+// NT: strong anticorrelation between TPN and DMN during task
+let AD_TPN_DMN_ANTICORR  = 0.85      // TPN-DMN coupling (anticorrelated)
+let AD_NT_NOISE          = 0.04       // NT baseline noise per step
+
+// ADHD: DMN intrusion — periodic spikes where DMN escapes suppression
+let AD_INTRUSION_PROB     = 0.45      // probability of DMN spike per step (elevated)
+let AD_INTRUSION_AMP      = 0.90      // amplitude of DMN intrusion spike (strong)
+let AD_ADHD_NOISE         = 0.06      // slightly noisier baseline
+
+// Hyperactivity: motor channel elevation, inhibition depression
+let AD_MOT_NT_BASE        = 0.25      // NT motor channel baseline
+let AD_MOT_ADHD_BASE      = 0.70      // ADHD-H motor channel baseline
+let AD_INH_NT_BASE        = 0.75      // NT inhibition baseline
+let AD_INH_ADHD_BASE      = 0.30      // ADHD-H inhibition baseline
+let AD_MOT_INH_COUPLE_NT  = 0.80      // NT motor-inhibition coupling
+let AD_MOT_INH_COUPLE_ADHD = 0.30     // ADHD weakened motor-inhibition coupling
+
+// Hyperfocus: phasic dopamine surge under high reward
+let AD_REWARD_GAIN        = 1.40      // reward amplification of TPN
+let AD_REWARD_DMN_SUPP    = 0.95      // reward-driven DMN suppression (stronger than NT)
+let AD_REWARD_NOISE       = 0.02      // reduced noise under hyperfocus
+
+// Medication: tonic DA restoration
+let AD_MED_ANTICORR       = 0.80      // medication restores anticorrelation near NT
+let AD_MED_NOISE          = 0.05      // medication stabilizes noise near NT
+let AD_MED_INTRUSION_PROB = 0.08      // medication greatly reduces intrusion rate
+let AD_MED_MOT_BASE       = 0.30      // medication normalizes motor
+let AD_MED_INH_BASE       = 0.65      // medication restores inhibition
+
+// ─── Test thresholds ────────────────────────────────────────────
+
+let AD_PHI_TASK_MIN       = 0.05      // minimum task Φ for NT baseline
+let AD_NT_VAR_CEIL        = 0.06      // NT windowed Φ variance ceiling (some natural MI jitter)
+let AD_INTRUSION_GAP      = 0.003     // ADHD variance must exceed NT by this
+let AD_MOTOR_ELEV_THRESH  = 0.50      // ADHD motor mean must exceed this
+let AD_INHIB_REDUCE_THRESH = 0.50     // ADHD inhibition mean must be below this
+let AD_MOTOR_MI_GAP       = 0.03      // NT motor MI must exceed ADHD motor MI by this
+let AD_HYPER_GAP          = 0.01      // hyperfocus Φ_task must exceed NT by this
+let AD_MED_VAR_RECOVERY   = 0.002     // medicated variance must drop below ADHD by this
+
+// ═══════════════════════════════════════════════════════════════
+// Math / PRNG primitives (L0-clean, no cross-engine import per AN7)
+// ═══════════════════════════════════════════════════════════════
+
+fn ad_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ad_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn ad_min_f(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn ad_max_f(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+fn ad_clamp(x: float, lo: float, hi: float) -> float {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+// Deterministic LCG — reproducibility (Law 2: observable, seed-stable)
+fn ad_prng(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483648
+}
+
+fn ad_unit(seed: int) -> float {
+    return to_float(seed % 1000000) / 1000000.0
+}
+
+fn ad_signed(seed: int) -> float {
+    return ad_unit(seed) * 2.0 - 1.0
+}
+
+// Triangular wave oscillator for structured base signals
+fn ad_tri_wave(phase: float) -> float {
+    let mut p = phase
+    while p >= 1.0 { p = p - 1.0 }
+    while p < 0.0 { p = p + 1.0 }
+    if p < 0.5 { return 4.0 * p - 1.0 }
+    return 3.0 - 4.0 * p
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Histogram MI — mutual information from binned traces
+// (duplicated per AN7 L0-clean — no cross-engine import)
+// ═══════════════════════════════════════════════════════════════
+
+fn ad_bin_idx(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn ad_counts(ids: array, nb: int) -> array {
+    let n = len(ids)
+    let mut c = []
+    let mut k = 0
+    while k < nb {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < n {
+            if ids[i] == k { acc = acc + 1.0 }
+            i = i + 1
+        }
+        c = c.push(acc)
+        k = k + 1
+    }
+    return c
+}
+
+fn ad_entropy(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut ids = []
+    let mut i = 0
+    while i < n {
+        ids = ids.push(ad_bin_idx(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let cnt = ad_counts(ids, nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * ad_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn ad_joint_entropy(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = ad_bin_idx(a[i], lo, hi, nb)
+        let ib = ad_bin_idx(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let cnt = ad_counts(pair_ids, nb * nb)
+    let inv = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb * nb {
+        let p = cnt[k] * inv
+        if p > 0.0 { h = h - p * ad_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn ad_vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn ad_vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn ad_mi(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let lo_a = ad_vec_min(a)
+    let hi_a = ad_vec_max(a)
+    let lo_b = ad_vec_min(b)
+    let hi_b = ad_vec_max(b)
+    let lo = ad_min_f(lo_a, lo_b)
+    let hi = ad_max_f(hi_a, hi_b)
+    let h_a = ad_entropy(a, lo, hi, AD_BINS)
+    let h_b = ad_entropy(b, lo, hi, AD_BINS)
+    let h_j = ad_joint_entropy(a, b, lo, hi, AD_BINS)
+    let mi = h_a + h_b - h_j
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Statistical helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn ad_mean(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + v[i]
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+fn ad_variance(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mu = ad_mean(v)
+    let mut ss = 0.0
+    let mut i = 0
+    while i < n {
+        let d = v[i] - mu
+        ss = ss + d * d
+        i = i + 1
+    }
+    return ss / to_float(n)
+}
+
+// Extract a sub-array [start..start+wlen) from v
+fn ad_window(v: array, start: int, wlen: int) -> array {
+    let mut w = []
+    let n = len(v)
+    let mut i = 0
+    while i < wlen {
+        let idx = start + i
+        if idx < n {
+            w = w.push(v[idx])
+        }
+        i = i + 1
+    }
+    return w
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Signal generators — 4 channels: TPN, DMN, MOT, INH
+// ═══════════════════════════════════════════════════════════════
+
+// TPN: structured oscillatory task signal. harmonics adds reward-driven richness.
+fn ad_gen_tpn(amplitude: float, harmonics: float, noise: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < AD_STEPS {
+        let phase = to_float(i) / to_float(AD_STEPS)
+        // Fundamental + optional harmonic content (richer task engagement)
+        let base = amplitude * ad_tri_wave(phase * 3.0 + 0.1)
+        let harm = harmonics * ad_tri_wave(phase * 7.0 + 0.4)
+        s = ad_prng(s)
+        let jitter = ad_signed(s) * noise
+        out = out.push(ad_clamp(base + harm + jitter, -1.0, 1.0))
+        i = i + 1
+    }
+    return out
+}
+
+// DMN: anticorrelated with TPN (suppressed). bias_down = prefrontal suppression.
+// intrusion_prob/amp = ADHD stochastic mind-wandering spikes.
+fn ad_gen_dmn(tpn: array, anticorr: float, bias_down: float, intrusion_prob: float, intrusion_amp: float, noise: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < AD_STEPS {
+        // Anticorrelated base: DMN = -anticorr * TPN (suppressed when TPN active)
+        // bias_down shifts mean negative (prefrontal task suppression of DMN)
+        let anti_base = 0.0 - anticorr * tpn[i] - bias_down
+        // DMN intrusion: stochastic spike that breaks anticorrelation
+        s = ad_prng(s)
+        let roll = ad_unit(s)
+        let mut intrusion = 0.0
+        if roll < intrusion_prob {
+            s = ad_prng(s)
+            // Root cause: intrusion is a POSITIVE spike in DMN during task
+            // (mind-wandering event). Amplitude varies per event.
+            intrusion = intrusion_amp * (0.5 + 0.5 * ad_unit(s))
+        }
+        s = ad_prng(s)
+        let jitter = ad_signed(s) * noise
+        let val = anti_base + intrusion + jitter
+        out = out.push(ad_clamp(val, -1.0, 1.0))
+        i = i + 1
+    }
+    return out
+}
+
+// MOT: motor output. NT=low, ADHD-H=elevated (restless fidgeting).
+fn ad_gen_motor(base_amp: float, variability: float, noise: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < AD_STEPS {
+        let phase = to_float(i) / to_float(AD_STEPS)
+        // Motor signal: base level + oscillatory restlessness
+        let osc = variability * ad_tri_wave(phase * 5.0 + 0.3)
+        s = ad_prng(s)
+        let jitter = ad_signed(s) * noise
+        let val = base_amp + osc + jitter
+        out = out.push(ad_clamp(val, -1.0, 1.0))
+        i = i + 1
+    }
+    return out
+}
+
+// INH: inhibition control. Anticorrelates with motor — coupling strength varies.
+fn ad_gen_inhibition(motor: array, base_level: float, coupling: float, noise: float, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < AD_STEPS {
+        // Inhibition = base - coupling * motor_activity (suppresses motor)
+        let suppress = base_level - coupling * ad_abs(motor[i])
+        s = ad_prng(s)
+        let jitter = ad_signed(s) * noise
+        let val = suppress + jitter
+        out = out.push(ad_clamp(val, -1.0, 1.0))
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Phi measurement functions
+// ═══════════════════════════════════════════════════════════════
+
+// Φ_task: MI(TPN, DMN) — structured anticorrelation = high MI.
+fn ad_phi_task(tpn: array, dmn: array) -> float {
+    return ad_mi(tpn, dmn)
+}
+
+// Windowed Φ variance: NT=low (stable), ADHD=high (lapses from intrusions).
+fn ad_phi_task_windowed_variance(tpn: array, dmn: array) -> float {
+    let wlen = AD_STEPS / AD_WINDOWS
+    let mut phis = []
+    let mut w = 0
+    while w < AD_WINDOWS {
+        let start = w * wlen
+        let tpn_w = ad_window(tpn, start, wlen)
+        let dmn_w = ad_window(dmn, start, wlen)
+        let phi_w = ad_mi(tpn_w, dmn_w)
+        phis = phis.push(phi_w)
+        w = w + 1
+    }
+    return ad_variance(phis)
+}
+
+// Motor-inhibition MI: NT=high (coupled), ADHD-H=low (decoupled gating).
+fn ad_phi_motor_inhib(motor: array, inhib: array) -> float {
+    return ad_mi(motor, inhib)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Composite state generators — NT / ADHD / Hyperfocus / Medicated
+// ═══════════════════════════════════════════════════════════════
+
+fn ad_gen_nt_tpn(seed: int) -> array {
+    // harmonics=0.0: NT baseline has single-frequency task engagement
+    return ad_gen_tpn(0.75, 0.0, AD_NT_NOISE, seed)
+}
+
+fn ad_gen_nt_dmn(tpn: array, seed: int) -> array {
+    // bias_down=0.10: prefrontal task-mode suppression pushes DMN below zero
+    // Zero intrusion probability — NT has clean, stable anticorrelation
+    return ad_gen_dmn(tpn, AD_TPN_DMN_ANTICORR, 0.10, 0.0, 0.0, AD_NT_NOISE, seed)
+}
+
+fn ad_gen_nt_motor(seed: int) -> array {
+    return ad_gen_motor(AD_MOT_NT_BASE, 0.08, AD_NT_NOISE, seed)
+}
+
+fn ad_gen_nt_inhib(motor: array, seed: int) -> array {
+    return ad_gen_inhibition(motor, AD_INH_NT_BASE, AD_MOT_INH_COUPLE_NT, AD_NT_NOISE, seed)
+}
+
+fn ad_gen_adhd_tpn(seed: int) -> array {
+    // harmonics=0.0: ADHD TPN same frequency content but weaker + noisier
+    return ad_gen_tpn(0.70, 0.0, AD_ADHD_NOISE, seed)
+}
+
+fn ad_gen_adhd_dmn(tpn: array, seed: int) -> array {
+    // bias_down=0.0: ADHD lacks prefrontal suppression of DMN
+    // High intrusion probability + amplitude creates window-to-window variance
+    return ad_gen_dmn(tpn, AD_TPN_DMN_ANTICORR * 0.60, 0.0, AD_INTRUSION_PROB, AD_INTRUSION_AMP, AD_ADHD_NOISE, seed)
+}
+
+fn ad_gen_adhd_motor(seed: int) -> array {
+    return ad_gen_motor(AD_MOT_ADHD_BASE, 0.20, AD_ADHD_NOISE, seed)
+}
+
+fn ad_gen_adhd_inhib(motor: array, seed: int) -> array {
+    return ad_gen_inhibition(motor, AD_INH_ADHD_BASE, AD_MOT_INH_COUPLE_ADHD, AD_ADHD_NOISE, seed)
+}
+
+fn ad_gen_hyper_tpn(seed: int) -> array {
+    // Root cause: hyperfocus produces RICHER task engagement (multi-frequency)
+    // because reward-driven DA surge activates deeper task processing layers.
+    // harmonics=0.30: adds second harmonic — more bin diversity → higher MI
+    return ad_gen_tpn(0.75 * AD_REWARD_GAIN, 0.30, AD_REWARD_NOISE, seed)
+}
+
+fn ad_gen_hyper_dmn(tpn: array, seed: int) -> array {
+    // bias_down=0.10: reward DA surge strongly suppresses DMN, but less than
+    // NT bias so the TPN gain (amplitude 1.40x) is what produces superior MI
+    return ad_gen_dmn(tpn, AD_REWARD_DMN_SUPP, 0.10, 0.0, 0.0, AD_REWARD_NOISE, seed)
+}
+
+fn ad_gen_med_tpn(seed: int) -> array {
+    // harmonics=0.0: medication restores stable baseline, no reward enrichment
+    return ad_gen_tpn(0.72, 0.0, AD_MED_NOISE, seed)
+}
+
+fn ad_gen_med_dmn(tpn: array, seed: int) -> array {
+    // bias_down=0.12: medication restores prefrontal suppression near NT levels
+    return ad_gen_dmn(tpn, AD_MED_ANTICORR, 0.12, AD_MED_INTRUSION_PROB, AD_INTRUSION_AMP * 0.3, AD_MED_NOISE, seed)
+}
+
+fn ad_gen_med_motor(seed: int) -> array {
+    return ad_gen_motor(AD_MED_MOT_BASE, 0.10, AD_MED_NOISE, seed)
+}
+
+fn ad_gen_med_inhib(motor: array, seed: int) -> array {
+    return ad_gen_inhibition(motor, AD_MED_INH_BASE, AD_MOT_INH_COUPLE_NT * 0.85, AD_MED_NOISE, seed)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// T1: NT baseline — task Φ stable, DMN suppressed during task
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T1() -> bool {
+    println("  --- T1: NT baseline (task Φ stable, DMN suppressed) ---")
+    let tpn = ad_gen_nt_tpn(10001)
+    let dmn = ad_gen_nt_dmn(tpn, 10101)
+
+    let phi_task = ad_phi_task(tpn, dmn)
+    let phi_var = ad_phi_task_windowed_variance(tpn, dmn)
+    let dmn_mu = ad_mean(dmn)
+
+    println("  [T1] Φ_task=" + str(phi_task) + " windowed_var=" + str(phi_var) + " DMN_mean=" + str(dmn_mu))
+
+    let mut ok = true
+    // Task Φ must be above minimum (structured anticorrelation)
+    if phi_task <= AD_PHI_TASK_MIN {
+        println("  [T1] FAIL: Φ_task <= " + str(AD_PHI_TASK_MIN))
+        ok = false
+    }
+    // Windowed variance must be low (stable attention)
+    if phi_var >= AD_NT_VAR_CEIL {
+        println("  [T1] FAIL: windowed_var >= " + str(AD_NT_VAR_CEIL))
+        ok = false
+    }
+    // DMN mean should be negative (suppressed during task)
+    if dmn_mu >= 0.0 {
+        println("  [T1] FAIL: DMN_mean >= 0 (not suppressed)")
+        ok = false
+    }
+    return ok
+}
+
+// ═══════════════════════════════════════════════════════════════
+// T2: ADHD inattentive — DMN intrusion variance >> NT
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T2() -> bool {
+    println("  --- T2: ADHD inattentive (DMN intrusion variance >> NT) ---")
+    // NT reference
+    let tpn_nt = ad_gen_nt_tpn(20001)
+    let dmn_nt = ad_gen_nt_dmn(tpn_nt, 20101)
+    let var_nt = ad_phi_task_windowed_variance(tpn_nt, dmn_nt)
+
+    // ADHD inattentive
+    let tpn_adhd = ad_gen_adhd_tpn(20201)
+    let dmn_adhd = ad_gen_adhd_dmn(tpn_adhd, 20301)
+    let var_adhd = ad_phi_task_windowed_variance(tpn_adhd, dmn_adhd)
+
+    // Medicated ADHD — variance should drop toward NT
+    let tpn_med = ad_gen_med_tpn(20401)
+    let dmn_med = ad_gen_med_dmn(tpn_med, 20501)
+    let var_med = ad_phi_task_windowed_variance(tpn_med, dmn_med)
+
+    let adhd_gap = var_adhd - var_nt
+    let med_recovery = var_adhd - var_med
+
+    println("  [T2] var_NT=" + str(var_nt) + " var_ADHD=" + str(var_adhd) + " var_MED=" + str(var_med))
+    println("  [T2] ADHD-NT gap=" + str(adhd_gap) + " medication recovery=" + str(med_recovery))
+
+    let mut ok = true
+    // ADHD variance must strictly exceed NT by the intrusion gap
+    if adhd_gap <= AD_INTRUSION_GAP {
+        println("  [T2] FAIL: ADHD variance gap <= " + str(AD_INTRUSION_GAP))
+        ok = false
+    }
+    // Medication must reduce variance (recovery > threshold)
+    if med_recovery <= AD_MED_VAR_RECOVERY {
+        println("  [T2] FAIL: medication variance recovery <= " + str(AD_MED_VAR_RECOVERY))
+        ok = false
+    }
+    return ok
+}
+
+// ═══════════════════════════════════════════════════════════════
+// T3: Hyperactivity — motor Φ elevated, inhibition reduced
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T3() -> bool {
+    println("  --- T3: Hyperactivity (motor elevated, inhibition reduced) ---")
+    // NT motor/inhibition
+    let mot_nt = ad_gen_nt_motor(30001)
+    let inh_nt = ad_gen_nt_inhib(mot_nt, 30101)
+    let mot_mu_nt = ad_mean(mot_nt)
+    let inh_mu_nt = ad_mean(inh_nt)
+    let mi_nt = ad_phi_motor_inhib(mot_nt, inh_nt)
+
+    // ADHD-H motor/inhibition
+    let mot_adhd = ad_gen_adhd_motor(30201)
+    let inh_adhd = ad_gen_adhd_inhib(mot_adhd, 30301)
+    let mot_mu_adhd = ad_mean(mot_adhd)
+    let inh_mu_adhd = ad_mean(inh_adhd)
+    let mi_adhd = ad_phi_motor_inhib(mot_adhd, inh_adhd)
+
+    let mi_gap = mi_nt - mi_adhd
+
+    println("  [T3] NT: motor_mean=" + str(mot_mu_nt) + " inhib_mean=" + str(inh_mu_nt) + " MI=" + str(mi_nt))
+    println("  [T3] ADHD: motor_mean=" + str(mot_mu_adhd) + " inhib_mean=" + str(inh_mu_adhd) + " MI=" + str(mi_adhd))
+    println("  [T3] MI gap (NT - ADHD)=" + str(mi_gap))
+
+    let mut ok = true
+    // ADHD motor mean must be elevated
+    if mot_mu_adhd <= AD_MOTOR_ELEV_THRESH {
+        println("  [T3] FAIL: ADHD motor_mean <= " + str(AD_MOTOR_ELEV_THRESH))
+        ok = false
+    }
+    // ADHD inhibition mean must be reduced
+    if inh_mu_adhd >= AD_INHIB_REDUCE_THRESH {
+        println("  [T3] FAIL: ADHD inhib_mean >= " + str(AD_INHIB_REDUCE_THRESH))
+        ok = false
+    }
+    // NT motor-inhibition MI must exceed ADHD (intact gating)
+    if mi_gap <= AD_MOTOR_MI_GAP {
+        println("  [T3] FAIL: MI gap <= " + str(AD_MOTOR_MI_GAP))
+        ok = false
+    }
+    return ok
+}
+
+// ═══════════════════════════════════════════════════════════════
+// T4: Hyperfocus paradox — ADHD + high reward → Φ_task > NT
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T4() -> bool {
+    println("  --- T4: Hyperfocus paradox (ADHD + reward > NT) ---")
+    // NT baseline task Φ
+    let tpn_nt = ad_gen_nt_tpn(40001)
+    let dmn_nt = ad_gen_nt_dmn(tpn_nt, 40101)
+    let phi_nt = ad_phi_task(tpn_nt, dmn_nt)
+
+    // ADHD WITHOUT reward (low Φ, for comparison)
+    let tpn_adhd = ad_gen_adhd_tpn(40201)
+    let dmn_adhd = ad_gen_adhd_dmn(tpn_adhd, 40301)
+    let phi_adhd = ad_phi_task(tpn_adhd, dmn_adhd)
+
+    // ADHD WITH high reward (hyperfocus) — phasic DA surge
+    let tpn_hyper = ad_gen_hyper_tpn(40401)
+    let dmn_hyper = ad_gen_hyper_dmn(tpn_hyper, 40501)
+    let phi_hyper = ad_phi_task(tpn_hyper, dmn_hyper)
+
+    let hyper_vs_nt = phi_hyper - phi_nt
+    let hyper_vs_adhd = phi_hyper - phi_adhd
+
+    println("  [T4] Φ_task: NT=" + str(phi_nt) + " ADHD=" + str(phi_adhd) + " hyperfocus=" + str(phi_hyper))
+    println("  [T4] hyperfocus - NT=" + str(hyper_vs_nt) + " hyperfocus - ADHD=" + str(hyper_vs_adhd))
+
+    let mut ok = true
+    // Hyperfocus must exceed NT (the paradox)
+    if hyper_vs_nt <= AD_HYPER_GAP {
+        println("  [T4] FAIL: hyperfocus Φ not > NT + " + str(AD_HYPER_GAP))
+        ok = false
+    }
+    // Hyperfocus must also exceed unmedicated ADHD (internal consistency)
+    if hyper_vs_adhd <= 0.0 {
+        println("  [T4] FAIL: hyperfocus Φ not > unmedicated ADHD")
+        ok = false
+    }
+    return ok
+}
+
+// ═══════════════════════════════════════════════════════════════
+// T5: Determinism + latency
+// ═══════════════════════════════════════════════════════════════
+
+fn check_T5() -> bool {
+    println("  --- T5: Determinism + latency ---")
+    let t0 = timestamp()
+
+    // Run 1
+    let tpn_a = ad_gen_nt_tpn(50001)
+    let dmn_a = ad_gen_nt_dmn(tpn_a, 50101)
+    let phi_a = ad_phi_task(tpn_a, dmn_a)
+    let var_a = ad_phi_task_windowed_variance(tpn_a, dmn_a)
+
+    let tpn_adhd_a = ad_gen_adhd_tpn(50201)
+    let dmn_adhd_a = ad_gen_adhd_dmn(tpn_adhd_a, 50301)
+    let phi_adhd_a = ad_phi_task(tpn_adhd_a, dmn_adhd_a)
+
+    let mot_a = ad_gen_adhd_motor(50401)
+    let inh_a = ad_gen_adhd_inhib(mot_a, 50501)
+    let mi_a = ad_phi_motor_inhib(mot_a, inh_a)
+
+    let tpn_h_a = ad_gen_hyper_tpn(50601)
+    let dmn_h_a = ad_gen_hyper_dmn(tpn_h_a, 50701)
+    let phi_h_a = ad_phi_task(tpn_h_a, dmn_h_a)
+
+    // Run 2 (same seeds)
+    let tpn_b = ad_gen_nt_tpn(50001)
+    let dmn_b = ad_gen_nt_dmn(tpn_b, 50101)
+    let phi_b = ad_phi_task(tpn_b, dmn_b)
+    let var_b = ad_phi_task_windowed_variance(tpn_b, dmn_b)
+
+    let tpn_adhd_b = ad_gen_adhd_tpn(50201)
+    let dmn_adhd_b = ad_gen_adhd_dmn(tpn_adhd_b, 50301)
+    let phi_adhd_b = ad_phi_task(tpn_adhd_b, dmn_adhd_b)
+
+    let mot_b = ad_gen_adhd_motor(50401)
+    let inh_b = ad_gen_adhd_inhib(mot_b, 50501)
+    let mi_b = ad_phi_motor_inhib(mot_b, inh_b)
+
+    let tpn_h_b = ad_gen_hyper_tpn(50601)
+    let dmn_h_b = ad_gen_hyper_dmn(tpn_h_b, 50701)
+    let phi_h_b = ad_phi_task(tpn_h_b, dmn_h_b)
+
+    let t1_time = timestamp()
+    let elapsed = t1_time - t0
+
+    println("  [T5] Run1: phi_NT=" + str(phi_a) + " var_NT=" + str(var_a) + " phi_ADHD=" + str(phi_adhd_a) + " MI_mot=" + str(mi_a) + " phi_hyper=" + str(phi_h_a))
+    println("  [T5] Run2: phi_NT=" + str(phi_b) + " var_NT=" + str(var_b) + " phi_ADHD=" + str(phi_adhd_b) + " MI_mot=" + str(mi_b) + " phi_hyper=" + str(phi_h_b))
+    println("  [T5] elapsed=" + str(elapsed) + "ms")
+
+    let mut ok = true
+    // Bit-identical check
+    if phi_a != phi_b {
+        println("  [T5] FAIL: phi_NT not deterministic")
+        ok = false
+    }
+    if var_a != var_b {
+        println("  [T5] FAIL: var_NT not deterministic")
+        ok = false
+    }
+    if phi_adhd_a != phi_adhd_b {
+        println("  [T5] FAIL: phi_ADHD not deterministic")
+        ok = false
+    }
+    if mi_a != mi_b {
+        println("  [T5] FAIL: MI_motor not deterministic")
+        ok = false
+    }
+    if phi_h_a != phi_h_b {
+        println("  [T5] FAIL: phi_hyper not deterministic")
+        ok = false
+    }
+    // Latency under 100ms
+    if elapsed > 100.0 {
+        println("  [T5] FAIL: elapsed > 100ms")
+        ok = false
+    }
+    return ok
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — execute 5 self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[adhd_phi] P109 — ADHD Φ (DMN Intrusion / Dopamine Deficit / Hyperfocus Paradox)")
+    println("  steps=" + str(AD_STEPS) + " bins=" + str(AD_BINS) + " windows=" + str(AD_WINDOWS))
+    println("  refs: Sonuga-Barke & Castellanos 2007 | Volkow 2009 | Ozel-Kizil 2016 | Mostofsky 2003")
+    println("")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — NT baseline (task Φ stable, DMN suppressed during task)") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — ADHD inattentive (DMN intrusion variance >> NT, medication restores)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — hyperactivity (motor elevated, inhibition reduced, MI gap)") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — hyperfocus paradox (ADHD + reward Φ > NT baseline)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — determinism + latency (bit-identical, <100ms)") } else { println("T5 FAIL") }
+
+    println("")
+
+    // Root cause comment: stage0 long && chains may mishandle short-circuit
+    // ordering — use a mutable bool accumulator with sequential guards
+    // (same idiom as depersonalization_phi / dissociation_phi).
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+
+    if all {
+        println("[adhd_phi] 5/5 PASS — P109 DONE")
+    } else {
+        println("[adhd_phi] SOME FAILED")
+    }
+}
+
+main()
