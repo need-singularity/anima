@@ -3,11 +3,12 @@
 R14: shared/ JSON 단일진실, 이 파일은 참조만.
 
 ref:
-  cfg        shared/config/project_config.json    학습 CLI/상수/하이퍼
-  infra      shared/config/infrastructure.json    H100/R2/RunPod
-  vastai     shared/config/vastai.json            multi-GPU/bf16/model_path
-  rules      shared/config/absolute_rules.json    R1~R21 + AN1~AN7
-  laws       anima/config/consciousness_laws.json 법칙 등록 전 검증
+  cfg        shared/config/project_config.json        학습 CLI/상수/하이퍼
+  infra      shared/config/infrastructure.json        H100/R2/RunPod
+  vastai     shared/config/vastai.json                multi-GPU/bf16/model_path
+  rules      shared/config/absolute_rules.json        R1~R21 + AN1~AN7
+  laws       anima/config/consciousness_laws.json     법칙 등록 전 검증
+  ceilings   shared/state/training_speed_ceilings.json  ALM/CLM 물리 천장 측정 + 헤드룸 + 레버 (SSOT, 매 런 갱신)
   parent     /CLAUDE.md
 
 exec:
