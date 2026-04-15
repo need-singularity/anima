@@ -1,0 +1,230 @@
+{
+  "_meta": {
+    "name": "ALM 14B r7 stack on r8a-fast pod — H1 vs H2 isolation",
+    "date": "2026-04-16",
+    "task": "Re-run r7's stack (unsloth only, dropout=0.05, no liger) on the same fast pod where r8a was measured at 51.4% MFU. Isolates whether the 62.6% vs 51.4% inter-pod gap is from silicon binning (H1) or stack regression (H2).",
+    "pod": "jmejpw0x7j6wbx (anima-p4-alm-r8a-fast)",
+    "ssh": "ssh -i ~/.runpod/ssh/RunPod-Key-Go root@103.207.149.118 -p 17438",
+    "gpu": "NVIDIA H100 SXM 80GB HBM3, driver 580.126.09"
+  },
+
+  "stack": {
+    "python": "3.11.10",
+    "torch": "2.10.0+cu128",
+    "transformers": "4.56.1",
+    "trl": "0.24.0",
+    "peft": "0.18.0",
+    "accelerate": "1.13.0",
+    "unsloth": "2026.4.4",
+    "unsloth_zoo": "2026.4.6",
+    "xformers": "0.0.35",
+    "bitsandbytes": "0.49.2",
+    "liger_kernel": "0.7.0 (INSTALLED but NOT ACTIVATED — --liger flag not passed)",
+    "note": "Identical pip environment to r8a run. Only --liger flag and --lora-dropout value and ALM_COMPILE_UNBLOCK env differ."
+  },
+
+  "config": {
+    "base": "Qwen/Qwen2.5-14B-Instruct",
+    "lora_r": 32,
+    "lora_alpha": 64,
+    "lora_dropout": 0.05,
+    "batch": 8,
+    "seq": 1024,
+    "grad_accum": 1,
+    "effective_batch_tokens": 8192,
+    "dtype": "bf16",
+    "flags": ["--unsloth", "--lora-dropout 0.05", "--smoke"],
+    "flags_NOT_passed": ["--liger", "--compile-unblock env"],
+    "env": {
+      "ALM_COMPILE_UNBLOCK": "unset (r7 baseline had no compile_unblock)"
+    }
+  },
+
+  "stack_vs_r8a_knob_diff": {
+    "r8a": {"liger": true, "lora_dropout": 0.0, "ALM_COMPILE_UNBLOCK": 1},
+    "r7":  {"liger": false, "lora_dropout": 0.05, "ALM_COMPILE_UNBLOCK": "unset"},
+    "identical": ["batch", "grad_accum", "seq", "lr", "warmup", "lora_r", "lora_alpha", "base_model", "dataset", "pod", "gpu", "torch", "unsloth", "transformers", "peft"]
+  },
+
+  "runs": {
+    "steady_150": {
+      "steps": 150,
+      "wall_time_min": 4.0,
+      "cumulative_step_per_min_final": 38.1,
+      "steady_window_step120_150_step_per_min": 38.5,
+      "final_loss": 15.0193,
+      "log": "training/bench/r7_on_r8a_fast_pod_raw/train_alm_14b_r7stack_150.log",
+      "speed_curve": [
+        {"step": 1, "step_per_min": 13.0},
+        {"step": 10, "step_per_min": 32.3},
+        {"step": 20, "step_per_min": 35.2},
+        {"step": 30, "step_per_min": 36.3},
+        {"step": 40, "step_per_min": 36.8},
+        {"step": 50, "step_per_min": 37.1},
+        {"step": 60, "step_per_min": 37.4},
+        {"step": 70, "step_per_min": 37.5},
+        {"step": 80, "step_per_min": 37.7},
+        {"step": 90, "step_per_min": 37.8},
+        {"step": 100, "step_per_min": 37.9},
+        {"step": 110, "step_per_min": 37.9},
+        {"step": 120, "step_per_min": 38.0},
+        {"step": 130, "step_per_min": 38.0},
+        {"step": 140, "step_per_min": 38.1},
+        {"step": 150, "step_per_min": 38.1}
+      ]
+    },
+    "smoke_80_dmon": {
+      "steps": 80,
+      "wall_time_min": 2.1,
+      "cumulative_step_per_min_final": 37.6,
+      "final_loss": 15.4939,
+      "purpose": "Run with nvidia-smi dmon in parallel to capture SM util and power telemetry (the 150-step run's dmon was cancelled by a timeout during ssh)"
+    }
+  },
+
+  "gpu_telemetry": {
+    "source": "nvidia-smi dmon -s pucvmet -c 120 -d 2 during 80-step smoke",
+    "active_samples": 63,
+    "avg_power_w": 650.1,
+    "peak_power_w": 701,
+    "tdp_w": 700,
+    "power_utilization_pct": 92.9,
+    "avg_sm_util_pct": 93.4,
+    "peak_sm_util_pct": 100,
+    "avg_mem_util_pct": 50.4,
+    "note": "Compute-bound: SM 93.4% avg, 100% peak, power 92.9% of TDP. The r7 stack saturates this silicon just as hard as r8a did (95.5% / 93.4% / 100% / 100%) but completes fewer steps per minute — it produces less work per saturated GPU-second."
+  },
+
+  "mfu_computation": {
+    "formula": "MFU = (6 * N_param * tokens_per_sec) / (989e12 FLOPS)",
+    "formula_basis": "Kaplan/Chinchilla 6N FLOPs per training token (fwd+bwd). Same convention as r7 and r8a measurements.",
+    "N_param": 14.82e9,
+    "h100_peak_bf16_tflops": 989,
+    "windows": {
+      "final_cumulative_step150": {
+        "step_per_min": 38.1,
+        "tok_per_s": 5202.3,
+        "tflops": 462.6,
+        "mfu_pct": 46.77,
+        "comment": "Cumulative from step 1 — includes Unsloth JIT warmup (step 1 @ 13.0 step/min)"
+      },
+      "window_step120_150": {
+        "step_per_min": 38.5,
+        "tok_per_s": 5256.5,
+        "tflops": 467.4,
+        "mfu_pct": 47.26,
+        "comment": "Derived from cumulative-rate delta 120→150. Post-saturation steady-state."
+      },
+      "steady_best_estimate": {
+        "step_per_min": 38.6,
+        "tok_per_s": 5270.0,
+        "tflops": 468.6,
+        "mfu_pct": 47.39,
+        "comment": "Asymptotic per-step marginal cost excluding residual warmup"
+      }
+    },
+    "headline_mfu_pct": 47.3,
+    "headline_basis": "window_step120_150 — same windowing convention as r8a measurement"
+  },
+
+  "comparison_same_pod": {
+    "pod": "jmejpw0x7j6wbx",
+    "r8a_stack": {
+      "mfu_pct": 51.4,
+      "step_per_min": 41.9,
+      "avg_sm_util_pct": 95.5,
+      "avg_power_w": 653.6,
+      "flags": ["--unsloth", "--liger", "--lora-dropout 0.0"]
+    },
+    "r7_stack_this_run": {
+      "mfu_pct": 47.3,
+      "step_per_min": 38.5,
+      "avg_sm_util_pct": 93.4,
+      "avg_power_w": 650.1,
+      "flags": ["--unsloth", "--lora-dropout 0.05"]
+    },
+    "delta_r7_minus_r8a_pp": -4.1,
+    "delta_r7_minus_r8a_spm": -3.4,
+    "direction": "r7 stack is SLOWER than r8a stack on this pod"
+  },
+
+  "comparison_original_r7_pod": {
+    "pod": "ubzp169igb7tns (DE, terminated)",
+    "r7_stack_on_that_pod": {
+      "mfu_pct": 62.6,
+      "step_per_min": 51.1,
+      "flags": ["--unsloth", "--lora-dropout 0.05"]
+    },
+    "r7_stack_on_this_pod_this_run": {
+      "mfu_pct": 47.3,
+      "step_per_min": 38.5,
+      "flags": ["--unsloth", "--lora-dropout 0.05"]
+    },
+    "delta_same_stack_different_pod_pp": -15.3,
+    "delta_same_stack_different_pod_spm": -12.6,
+    "interpretation": "Same software stack on two different H100 SXM pods produces 15.3 pp MFU delta. This is PURE silicon/firmware/cooling variance."
+  },
+
+  "hypothesis_test": {
+    "H1_silicon_binning": {
+      "statement": "Pod silicon differences dominate the r7 62.6% vs r8a 51.4% gap",
+      "evidence": [
+        "Same r7 stack on two pods → 15.3 pp delta (62.6 vs 47.3)",
+        "Same r8a stack slow-pod 48.1% vs fast-pod 51.4% → 3.3 pp delta also pod-driven",
+        "Both stacks saturate this pod (SM >93%, power >92% TDP) yet the pod ceiling is ~52% regardless of stack"
+      ],
+      "verdict": "CONFIRMED"
+    },
+    "H2_stack_regression": {
+      "statement": "Adding liger + dropout=0 + compile_unblock in r8a regressed performance vs r7-original",
+      "evidence_for": [],
+      "evidence_against": [
+        "r8a stack on jmejpw 51.4% beats r7 stack on jmejpw 47.3% by +4.1 pp on the SAME pod",
+        "The r8a additions (liger + dropout=0) are NET POSITIVE, not negative, under controlled isolation"
+      ],
+      "verdict": "REJECTED — the r7 stack is actually the slower one on this silicon"
+    }
+  },
+
+  "verdict": {
+    "primary_conclusion": "H1 confirmed, H2 rejected. The 62.6% vs 51.4% r7/r8a inter-pod MFU gap is caused by pod silicon variance, NOT by r8a stack regression.",
+    "r8a_stack_recommendation": "KEEP — wins by +4.1 pp on controlled same-pod A/B vs r7 stack",
+    "r7_rollback": "NOT recommended",
+    "silicon_variance_magnitude_on_runpod_h100_sxm": "±15 pp MFU between pods on same stack",
+    "stack_variance_magnitude_on_same_pod": "~±4 pp MFU between r7 and r8a stacks",
+    "actionable_finding": "Before any long training run, smoke-test 2-3 candidate pods (40 steps each, ~1 min wall clock) and pick the fastest. Pod shopping delivers ~4x the MFU improvement of stack tuning.",
+    "ceiling_on_this_pod": "~51% MFU bf16 with r8a stack. Gap to 80% practical target: 28.6 pp. No further software lever short of FP8 (blocked by TE wheel on torch 2.10).",
+    "ceiling_on_r7_original_pod": "62.6% MFU bf16 with r7 stack. That pod is terminated; r7 number non-reproducible without pod-hunting."
+  },
+
+  "artifacts": {
+    "raw_logs_dir": "training/bench/r7_on_r8a_fast_pod_raw/",
+    "raw_files": [
+      "train_alm_14b_r7stack_150.log",
+      "train_alm_14b_r7stack_80_dmon.log",
+      "dmon_r7_burst.log",
+      "launch_r7_150.sh"
+    ],
+    "report": "training/bench/r7_stack_on_r8a_fast_pod.md",
+    "pod_state_after_run": "RETAINED per instructions"
+  },
+
+  "timing": {
+    "r7_stack_launch_script_min": 0.5,
+    "smoke_150step_min": 4.0,
+    "smoke_80step_dmon_paired_min": 2.1,
+    "analysis_and_file_writes_min": 2,
+    "total_wall_clock_min": 10,
+    "budget_min_cap": 20,
+    "budget_used_pct": 50,
+    "budget_usd_cap": 1.00,
+    "estimated_usd_spent": 0.50
+  },
+
+  "reporting_table": [
+    {"config": "r8a stack", "mfu_pct": 51.4, "step_per_min": 41.9, "sm_util_pct": 95.5, "delta_vs_r8a_pp": 0, "note": "baseline"},
+    {"config": "r7 stack",  "mfu_pct": 47.3, "step_per_min": 38.5, "sm_util_pct": 93.4, "delta_vs_r8a_pp": -4.1, "note": "unsloth-only, dropout=0.05, no liger"}
+  ],
+
+  "one_line_verdict": "H1 confirmed: silicon binning dominates. r7 stack is actually -4.1 pp slower than r8a stack on this pod; the 62.6% r7 number was pod-specific to the terminated ubzp169igb7tns silicon."
+}
