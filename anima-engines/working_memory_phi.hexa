@@ -857,19 +857,30 @@ fn wm_maintain(packed: array, rehearse_slots: array, n_steps: int, seed: int) ->
         // post_bleed is laid out as [t=0: all slots, t=1: all slots, ...]
         // Reshape to buffer-shape after bleed. We do the bleed in-place over
         // this time-major array, then transpose back.
+        //
+        // PoC-1 optimization (2026-04-15): eliminated wm_arr_set calls from
+        // inner bleed loop. Root cause: hexa lists are pass-by-value, so
+        // wm_arr_set(arr, i, v) copies the entire array each call. For the
+        // WM bleed loop that is 7 * 24 = 168 copies of a 168-element array
+        // per maintenance step — O(n^3) in slot count / trace length just
+        // to update scalars. Replacement strategy:
+        //   (1) bleed_add accumulated via scalar reducers inside the b2
+        //       loop, then pushed once per a2 iteration.
+        //   (2) per-tt row updates collected in a small 7-slot row_new list
+        //       built via push, then post_bleed rebuilt as a single
+        //       streaming pass at the end of each tt iteration. One full
+        //       copy of post_bleed per tt instead of 7.
+        // Semantics are preserved exactly — no value changes.
         let mut s2 = s
         let mut tt = 0
         while tt < WM_TRACE_LEN {
-            // For each pair (a,b) compute shared contribution first
+            // For each source slot a2, accumulate bleed contribution into
+            // scalar `acc`, then push once. No wm_arr_set on bleed_add.
             let mut bleed_add = []
-            let mut q = 0
-            while q < WM_CAPACITY {
-                bleed_add = bleed_add.push(0.0)
-                q = q + 1
-            }
             let mut a2 = 0
             while a2 < WM_CAPACITY {
                 let occ_a = occupancy[a2]
+                let mut acc = 0.0
                 if occ_a > 0.0 {
                     let mut b2 = 0
                     while b2 < WM_CAPACITY {
@@ -893,16 +904,19 @@ fn wm_maintain(packed: array, rehearse_slots: array, n_steps: int, seed: int) ->
                                 }
                                 let idx_b = tt * WM_CAPACITY + b2
                                 let contribution = WM_INTF_COEFF * sim * post_bleed[idx_b] * occ_b
-                                bleed_add = wm_arr_set(bleed_add, a2, bleed_add[a2] + contribution)
+                                acc = acc + contribution
                             }
                         }
                         b2 = b2 + 1
                     }
                 }
+                bleed_add = bleed_add.push(acc)
                 a2 = a2 + 1
             }
-            // Apply bleed_add to post_bleed row tt (corrupting bleed ONLY
-            // between dissimilar-non-chunk slots — chunk pairs we zeroed).
+            // First pass: compute the 7 updated slot values for this tt row
+            // into a fresh row_new list. Noise RNG state s2 must match the
+            // original call order (tt outer, c inner) — preserved below.
+            let mut row_new = []
             let mut c = 0
             while c < WM_CAPACITY {
                 let idx = tt * WM_CAPACITY + c
@@ -921,9 +935,30 @@ fn wm_maintain(packed: array, rehearse_slots: array, n_steps: int, seed: int) ->
                 } else {
                     updated = post_bleed[idx] - bleed_add[c] + noise
                 }
-                post_bleed = wm_arr_set(post_bleed, idx, updated)
+                row_new = row_new.push(updated)
                 c = c + 1
             }
+            // Second pass: rebuild post_bleed in one sweep, substituting
+            // row_new for the current tt row. Single full-copy per tt
+            // instead of WM_CAPACITY wm_arr_set calls = 7x fewer copies.
+            let mut rebuilt = []
+            let n_pb = len(post_bleed)
+            let row_start = tt * WM_CAPACITY
+            let row_end = row_start + WM_CAPACITY
+            let mut pbi = 0
+            while pbi < n_pb {
+                if pbi >= row_start {
+                    if pbi < row_end {
+                        rebuilt = rebuilt.push(row_new[pbi - row_start])
+                    } else {
+                        rebuilt = rebuilt.push(post_bleed[pbi])
+                    }
+                } else {
+                    rebuilt = rebuilt.push(post_bleed[pbi])
+                }
+                pbi = pbi + 1
+            }
+            post_bleed = rebuilt
             tt = tt + 1
         }
         s = s2
