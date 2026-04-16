@@ -1,0 +1,518 @@
+// ═══════════════════════════════════════════════════════════════
+//  serving/edge/mla_kv.hexa — Multi-head Latent Attention KV cache
+//  DeepSeek-style latent projection with tau=4 compression.
+//
+//  ALM 14B: 40 layers, 40 heads, d_head=128, GQA 8 KV heads.
+//  Standard KV: seq * 40 * 8 * 128 * 2B * 2 = ~0.30GB at 2048 seq.
+//  MLA latent:  seq * 40 * 8 * 32  * 2B * 2 = ~0.075GB (80% reduction).
+//
+//  Core idea: project K,V into d_latent = d_head / tau = 128 / 4 = 32.
+//    k_latent = proj_k @ k        (compress)
+//    k_approx = proj_k_inv @ k_latent  (decompress)
+//
+//  n6 resonance: tau=4, 2^(sigma-tau) = 2^(12-4) = 256 page size.
+//
+//  Public API:
+//    mla_config_default() -> MLAConfig
+//    mla_cache_new(config) -> MLACache
+//    mla_compress_kv(config, k, v, proj_k, proj_v) -> array
+//    mla_decompress_kv(config, k_latent, v_latent, proj_k_inv, proj_v_inv) -> array
+//    mla_append(cache, k_latent, v_latent) -> MLACache
+//    mla_get_kv(cache, layer) -> array
+//    mla_memory_bytes(cache) -> int
+//    mla_stats(cache) -> string
+//
+//  Self-tests: 8 tests at bottom (run: hexa serving/edge/mla_kv.hexa)
+// ═══════════════════════════════════════════════════════════════
+
+// ── Constants ───────────────────────────────────────────────────
+
+comptime const DEFAULT_N_LAYERS   = 40     // ALM 14B transformer layers
+comptime const DEFAULT_N_KV_HEADS = 8      // GQA KV head count
+comptime const DEFAULT_D_HEAD     = 128    // dimension per head
+comptime const DEFAULT_TAU        = 4      // compression ratio
+comptime const DEFAULT_D_LATENT   = 32     // d_head / tau = 128 / 4
+comptime const DEFAULT_MAX_SEQ    = 2048   // max sequence length
+comptime const DEFAULT_PAGE_SIZE  = 256    // 2^(sigma-tau) = 2^(12-4) tokens per page
+comptime const BYTES_PER_ELEMENT  = 2      // bf16 / fp16
+
+// ── Structs ─────────────────────────────────────────────────────
+
+struct MLAConfig {
+    n_layers: int,
+    n_kv_heads: int,
+    d_head: int,
+    d_latent: int,
+    max_seq: int,
+    tau: int
+}
+
+struct MLACache {
+    config: MLAConfig,
+    k_latent: array,       // flattened [n_layers * max_seq * n_kv_heads * d_latent]
+    v_latent: array,       // flattened [n_layers * max_seq * n_kv_heads * d_latent]
+    seq_len: int,
+    page_size: int
+}
+
+// ── Config constructor ──────────────────────────────────────────
+
+fn mla_config_default() -> MLAConfig {
+    let cfg = MLAConfig {
+        n_layers: DEFAULT_N_LAYERS,
+        n_kv_heads: DEFAULT_N_KV_HEADS,
+        d_head: DEFAULT_D_HEAD,
+        d_latent: DEFAULT_D_LATENT,
+        max_seq: DEFAULT_MAX_SEQ,
+        tau: DEFAULT_TAU
+    }
+    return cfg
+}
+
+fn mla_config_new(n_layers: int, n_kv_heads: int, d_head: int, tau: int, max_seq: int) -> MLAConfig {
+    let d_latent = d_head / tau
+    let cfg = MLAConfig {
+        n_layers: n_layers,
+        n_kv_heads: n_kv_heads,
+        d_head: d_head,
+        d_latent: d_latent,
+        max_seq: max_seq,
+        tau: tau
+    }
+    return cfg
+}
+
+// ── Cache constructor ───────────────────────────────────────────
+
+fn mla_cache_new(config: MLAConfig) -> MLACache {
+    // Allocate flattened arrays for k and v latent caches.
+    // Layout: [n_layers][max_seq][n_kv_heads][d_latent] flattened.
+    let total = config.n_layers * config.max_seq * config.n_kv_heads * config.d_latent
+    let mut k_lat = []
+    let mut v_lat = []
+    let mut i = 0
+    while i < total {
+        k_lat = k_lat + [0.0]
+        v_lat = v_lat + [0.0]
+        i = i + 1
+    }
+    let cache = MLACache {
+        config: config,
+        k_latent: k_lat,
+        v_latent: v_lat,
+        seq_len: 0,
+        page_size: DEFAULT_PAGE_SIZE
+    }
+    return cache
+}
+
+// ── Flat index helper ───────────────────────────────────────────
+// Index into [n_layers][max_seq][n_kv_heads][d_latent]
+
+fn _flat_idx(config: MLAConfig, layer: int, seq: int, head: int, d: int) -> int {
+    // layer * (max_seq * n_kv_heads * d_latent)
+    // + seq * (n_kv_heads * d_latent)
+    // + head * d_latent
+    // + d
+    let idx = layer * (config.max_seq * config.n_kv_heads * config.d_latent) + seq * (config.n_kv_heads * config.d_latent) + head * config.d_latent + d
+    return idx
+}
+
+// ── Compress: project full K,V into latent space ────────────────
+// k_latent = proj_k @ k  where proj_k is [d_latent x d_head]
+// Input k: [n_kv_heads * d_head] for a single token across all heads.
+// Input proj_k: [d_latent * d_head] projection matrix.
+// Returns: [n_kv_heads * d_latent] compressed representation.
+
+fn mla_compress_kv(config: MLAConfig, k: array, v: array, proj_k: array, proj_v: array) -> array {
+    let n_h = config.n_kv_heads
+    let d_h = config.d_head
+    let d_l = config.d_latent
+    // k is [n_kv_heads * d_head], proj_k is [d_latent * d_head]
+    // For each head, compute k_latent[head] = proj_k @ k[head]
+    let mut k_out = []
+    let mut v_out = []
+    let mut h = 0
+    while h < n_h {
+        let head_off = h * d_h
+        // Project this head's K into latent space
+        let mut li = 0
+        while li < d_l {
+            let mut dot_k = 0.0
+            let mut dot_v = 0.0
+            let mut j = 0
+            while j < d_h {
+                // proj_k layout: [d_latent][d_head] row-major
+                let proj_idx = li * d_h + j
+                dot_k = dot_k + proj_k[proj_idx] * k[head_off + j]
+                dot_v = dot_v + proj_v[proj_idx] * v[head_off + j]
+                j = j + 1
+            }
+            k_out = k_out + [dot_k]
+            v_out = v_out + [dot_v]
+            li = li + 1
+        }
+        h = h + 1
+    }
+    // Return [k_compressed, v_compressed] concatenated.
+    // k_out: [n_kv_heads * d_latent], v_out: [n_kv_heads * d_latent]
+    return k_out + v_out
+}
+
+// ── Decompress: reconstruct from latent back to full dimension ──
+// k_approx = proj_k_inv @ k_latent  where proj_k_inv is [d_head x d_latent]
+// Input k_latent: [n_kv_heads * d_latent]
+// Returns: [k_approx, v_approx] concatenated, each [n_kv_heads * d_head]
+
+fn mla_decompress_kv(config: MLAConfig, k_latent: array, v_latent: array, proj_k_inv: array, proj_v_inv: array) -> array {
+    let n_h = config.n_kv_heads
+    let d_h = config.d_head
+    let d_l = config.d_latent
+    let mut k_out = []
+    let mut v_out = []
+    let mut h = 0
+    while h < n_h {
+        let head_off = h * d_l
+        // Reconstruct this head: proj_k_inv [d_head x d_latent] @ k_latent[head]
+        let mut di = 0
+        while di < d_h {
+            let mut dot_k = 0.0
+            let mut dot_v = 0.0
+            let mut j = 0
+            while j < d_l {
+                // proj_k_inv layout: [d_head][d_latent] row-major
+                let proj_idx = di * d_l + j
+                dot_k = dot_k + proj_k_inv[proj_idx] * k_latent[head_off + j]
+                dot_v = dot_v + proj_v_inv[proj_idx] * v_latent[head_off + j]
+                j = j + 1
+            }
+            k_out = k_out + [dot_k]
+            v_out = v_out + [dot_v]
+            di = di + 1
+        }
+        h = h + 1
+    }
+    return k_out + v_out
+}
+
+// ── Append compressed KV for one token to cache ─────────────────
+// k_latent, v_latent: [n_layers * n_kv_heads * d_latent] for this token
+// across all layers. Returns updated cache.
+
+fn mla_append(cache: MLACache, k_latent: array, v_latent: array) -> MLACache {
+    let config = cache.config
+    let seq = cache.seq_len
+    if seq >= config.max_seq {
+        // Cache full — caller should evict or rotate.
+        // For now, silently refuse to append beyond max_seq.
+        return cache
+    }
+    let n_l = config.n_layers
+    let n_h = config.n_kv_heads
+    let d_l = config.d_latent
+    // k_latent input layout: [n_layers][n_kv_heads][d_latent]
+    let mut new_k = cache.k_latent
+    let mut new_v = cache.v_latent
+    let mut layer = 0
+    while layer < n_l {
+        let mut h = 0
+        while h < n_h {
+            let mut d = 0
+            while d < d_l {
+                let src_idx = layer * (n_h * d_l) + h * d_l + d
+                let dst_idx = _flat_idx(config, layer, seq, h, d)
+                new_k[dst_idx] = k_latent[src_idx]
+                new_v[dst_idx] = v_latent[src_idx]
+                d = d + 1
+            }
+            h = h + 1
+        }
+        layer = layer + 1
+    }
+    let out = MLACache {
+        config: config,
+        k_latent: new_k,
+        v_latent: new_v,
+        seq_len: seq + 1,
+        page_size: cache.page_size
+    }
+    return out
+}
+
+// ── Get KV for a specific layer ─────────────────────────────────
+// Returns [k_latent_flat, v_latent_flat] for given layer.
+// k_latent_flat: [seq_len * n_kv_heads * d_latent]
+
+fn mla_get_kv(cache: MLACache, layer: int) -> array {
+    let config = cache.config
+    let n_h = config.n_kv_heads
+    let d_l = config.d_latent
+    let seq = cache.seq_len
+    let mut k_out = []
+    let mut v_out = []
+    let mut s = 0
+    while s < seq {
+        let mut h = 0
+        while h < n_h {
+            let mut d = 0
+            while d < d_l {
+                let idx = _flat_idx(config, layer, s, h, d)
+                k_out = k_out + [cache.k_latent[idx]]
+                v_out = v_out + [cache.v_latent[idx]]
+                d = d + 1
+            }
+            h = h + 1
+        }
+        s = s + 1
+    }
+    return k_out + v_out
+}
+
+// ── Memory footprint in bytes ───────────────────────────────────
+// Compressed: seq_len * n_layers * n_kv_heads * d_latent * 2B * 2 (K+V)
+
+fn mla_memory_bytes(cache: MLACache) -> int {
+    let config = cache.config
+    let elements = cache.seq_len * config.n_layers * config.n_kv_heads * config.d_latent
+    // K + V, each element is BYTES_PER_ELEMENT bytes (bf16)
+    let bytes = elements * BYTES_PER_ELEMENT * 2
+    return bytes
+}
+
+// ── Full-precision (non-MLA) memory for comparison ──────────────
+
+fn standard_kv_memory_bytes(config: MLAConfig, seq_len: int) -> int {
+    let elements = seq_len * config.n_layers * config.n_kv_heads * config.d_head
+    let bytes = elements * BYTES_PER_ELEMENT * 2
+    return bytes
+}
+
+// ── Compression ratio ───────────────────────────────────────────
+
+fn mla_compression_ratio(config: MLAConfig) -> float {
+    // ratio = d_head / d_latent = tau
+    let ratio = config.d_head / config.d_latent
+    return ratio * 1.0
+}
+
+// ── Pages used ──────────────────────────────────────────────────
+
+fn mla_pages_used(cache: MLACache) -> int {
+    if cache.seq_len == 0 {
+        return 0
+    }
+    // Ceiling division: (seq_len + page_size - 1) / page_size
+    let pages = (cache.seq_len + cache.page_size - 1) / cache.page_size
+    return pages
+}
+
+// ── Stats string ────────────────────────────────────────────────
+
+fn mla_stats(cache: MLACache) -> string {
+    let config = cache.config
+    let mla_bytes = mla_memory_bytes(cache)
+    let std_bytes = standard_kv_memory_bytes(config, cache.seq_len)
+    let ratio = mla_compression_ratio(config)
+    let pages = mla_pages_used(cache)
+    let mla_mb = mla_bytes / (1024 * 1024)
+    let std_mb = std_bytes / (1024 * 1024)
+    let saved_mb = std_mb - mla_mb
+    let s = "MLA KV Cache Stats:" + "\n" + "  seq_len:       " + to_string(cache.seq_len) + " / " + to_string(config.max_seq) + "\n" + "  layers:        " + to_string(config.n_layers) + "\n" + "  kv_heads:      " + to_string(config.n_kv_heads) + "\n" + "  d_head:        " + to_string(config.d_head) + " -> d_latent: " + to_string(config.d_latent) + "\n" + "  tau:           " + to_string(config.tau) + "x compression" + "\n" + "  page_size:     " + to_string(cache.page_size) + " tokens" + "\n" + "  pages_used:    " + to_string(pages) + "\n" + "  MLA memory:    " + to_string(mla_mb) + " MB" + "\n" + "  Std memory:    " + to_string(std_mb) + " MB" + "\n" + "  Saved:         " + to_string(saved_mb) + " MB"
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn _assert(cond: bool, msg: string) {
+    if cond {
+        println("  PASS: " + msg)
+    }
+    if cond == false {
+        println("  FAIL: " + msg)
+    }
+}
+
+fn _test_config_defaults() {
+    println("[test 1] config defaults")
+    let cfg = mla_config_default()
+    _assert(cfg.n_layers == 40, "n_layers == 40")
+    _assert(cfg.n_kv_heads == 8, "n_kv_heads == 8")
+    _assert(cfg.d_head == 128, "d_head == 128")
+    _assert(cfg.d_latent == 32, "d_latent == 128/4 == 32")
+    _assert(cfg.tau == 4, "tau == 4")
+    _assert(cfg.max_seq == 2048, "max_seq == 2048")
+}
+
+fn _test_cache_creation() {
+    // Use tiny config to avoid large allocation in tests.
+    println("[test 2] cache creation (tiny)")
+    let cfg = mla_config_new(2, 2, 8, 4, 16)
+    // d_latent = 8/4 = 2
+    _assert(cfg.d_latent == 2, "d_latent = d_head/tau = 2")
+    let cache = mla_cache_new(cfg)
+    _assert(cache.seq_len == 0, "initial seq_len == 0")
+    _assert(cache.page_size == 256, "page_size == 256")
+    // Total elements: 2 layers * 16 seq * 2 heads * 2 d_latent = 128
+    let expected_len = 2 * 16 * 2 * 2
+    _assert(len(cache.k_latent) == expected_len, "k_latent length == 128")
+    _assert(len(cache.v_latent) == expected_len, "v_latent length == 128")
+}
+
+fn _test_compress_decompress() {
+    // Verify round-trip: compress then decompress with identity-like projection.
+    // Use d_head=4, d_latent=2 (tau=2), n_kv_heads=1 for simplicity.
+    println("[test 3] compress/decompress round-trip")
+    let cfg = mla_config_new(1, 1, 4, 2, 8)
+    // proj_k: [d_latent=2][d_head=4] = identity-like: take first 2 dims
+    //   [[1,0,0,0],[0,1,0,0]]
+    let proj_k = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    let proj_v = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    // proj_k_inv: [d_head=4][d_latent=2] = transpose
+    //   [[1,0],[0,1],[0,0],[0,0]]
+    let proj_k_inv = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    let proj_v_inv = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    // k = [3.0, 7.0, 1.0, 2.0], v = [5.0, 9.0, 4.0, 6.0]
+    let k = [3.0, 7.0, 1.0, 2.0]
+    let v = [5.0, 9.0, 4.0, 6.0]
+    // Compress: k_latent should be [3.0, 7.0], v_latent should be [5.0, 9.0]
+    let compressed = mla_compress_kv(cfg, k, v, proj_k, proj_v)
+    // compressed = k_out ++ v_out = [3.0, 7.0, 5.0, 9.0]
+    _assert(len(compressed) == 4, "compressed length == 4 (2 k + 2 v)")
+    _assert(compressed[0] == 3.0, "k_latent[0] == 3.0")
+    _assert(compressed[1] == 7.0, "k_latent[1] == 7.0")
+    _assert(compressed[2] == 5.0, "v_latent[0] == 5.0")
+    _assert(compressed[3] == 9.0, "v_latent[1] == 9.0")
+    // Decompress
+    let k_lat = [compressed[0], compressed[1]]
+    let v_lat = [compressed[2], compressed[3]]
+    let decompressed = mla_decompress_kv(cfg, k_lat, v_lat, proj_k_inv, proj_v_inv)
+    // decompressed = k_approx ++ v_approx
+    // k_approx = [[1,0],[0,1],[0,0],[0,0]] @ [3,7] = [3.0, 7.0, 0.0, 0.0]
+    _assert(decompressed[0] == 3.0, "k_approx[0] == 3.0 (recovered)")
+    _assert(decompressed[1] == 7.0, "k_approx[1] == 7.0 (recovered)")
+    _assert(decompressed[2] == 0.0, "k_approx[2] == 0.0 (lost dim)")
+    _assert(decompressed[3] == 0.0, "k_approx[3] == 0.0 (lost dim)")
+}
+
+fn _test_append_and_get() {
+    println("[test 4] append and get_kv")
+    // 2 layers, 1 head, d_head=4, tau=2 -> d_latent=2, max_seq=4
+    let cfg = mla_config_new(2, 1, 4, 2, 4)
+    let mut cache = mla_cache_new(cfg)
+    // Append token 0: k_latent for all layers = [layer0_h0: 1.0, 2.0, layer1_h0: 3.0, 4.0]
+    let k0 = [1.0, 2.0, 3.0, 4.0]
+    let v0 = [10.0, 20.0, 30.0, 40.0]
+    cache = mla_append(cache, k0, v0)
+    _assert(cache.seq_len == 1, "seq_len == 1 after first append")
+    // Get layer 0
+    let kv0 = mla_get_kv(cache, 0)
+    // kv0 = k_flat ++ v_flat, k_flat = [1.0, 2.0] (1 seq * 1 head * 2 d_latent)
+    _assert(kv0[0] == 1.0, "layer 0 k[0] == 1.0")
+    _assert(kv0[1] == 2.0, "layer 0 k[1] == 2.0")
+    _assert(kv0[2] == 10.0, "layer 0 v[0] == 10.0")
+    _assert(kv0[3] == 20.0, "layer 0 v[1] == 20.0")
+    // Get layer 1
+    let kv1 = mla_get_kv(cache, 1)
+    _assert(kv1[0] == 3.0, "layer 1 k[0] == 3.0")
+    _assert(kv1[1] == 4.0, "layer 1 k[1] == 4.0")
+    _assert(kv1[2] == 30.0, "layer 1 v[0] == 30.0")
+    _assert(kv1[3] == 40.0, "layer 1 v[1] == 40.0")
+    // Append second token
+    let k1 = [5.0, 6.0, 7.0, 8.0]
+    let v1 = [50.0, 60.0, 70.0, 80.0]
+    cache = mla_append(cache, k1, v1)
+    _assert(cache.seq_len == 2, "seq_len == 2 after second append")
+    // Get layer 0 now has 2 tokens
+    let kv0_2 = mla_get_kv(cache, 0)
+    // k_flat: [tok0_h0_d0, tok0_h0_d1, tok1_h0_d0, tok1_h0_d1]
+    _assert(len(kv0_2) == 8, "layer 0 kv length == 8 (2 seq * 1 head * 2 d * 2 kv)")
+    _assert(kv0_2[2] == 5.0, "layer 0 tok1 k[0] == 5.0")
+    _assert(kv0_2[3] == 6.0, "layer 0 tok1 k[1] == 6.0")
+}
+
+fn _test_memory_bytes() {
+    println("[test 5] memory_bytes calculation")
+    // Full config: 40 layers, 8 heads, d_latent=32
+    let cfg = mla_config_default()
+    // At seq=2048: 2048 * 40 * 8 * 32 * 2 * 2 = 83,886,080 bytes = ~80 MB
+    // Simulate via formula (don't allocate full cache)
+    let seq = 2048
+    let elements = seq * cfg.n_layers * cfg.n_kv_heads * cfg.d_latent
+    let expected = elements * BYTES_PER_ELEMENT * 2
+    // Standard: 2048 * 40 * 8 * 128 * 2 * 2 = 335,544,320 bytes = ~320 MB
+    let std_expected = seq * cfg.n_layers * cfg.n_kv_heads * cfg.d_head * BYTES_PER_ELEMENT * 2
+    _assert(expected == 83886080, "MLA bytes == 83886080 (~80MB)")
+    _assert(std_expected == 335544320, "Std bytes == 335544320 (~320MB)")
+    // Compression: 335544320 / 83886080 = 4.0x = tau
+    let ratio = std_expected / expected
+    _assert(ratio == 4, "compression ratio == tau == 4")
+}
+
+fn _test_compression_ratio() {
+    println("[test 6] compression_ratio")
+    let cfg = mla_config_default()
+    let r = mla_compression_ratio(cfg)
+    _assert(r == 4.0, "ratio == 4.0 (d_head/d_latent = 128/32)")
+    // Custom: d_head=64, tau=8 -> d_latent=8 -> ratio=8
+    let cfg2 = mla_config_new(1, 1, 64, 8, 16)
+    let r2 = mla_compression_ratio(cfg2)
+    _assert(r2 == 8.0, "ratio == 8.0 for tau=8")
+}
+
+fn _test_pages_used() {
+    println("[test 7] pages_used")
+    let cfg = mla_config_new(1, 1, 4, 2, 512)
+    let mut cache = mla_cache_new(cfg)
+    _assert(mla_pages_used(cache) == 0, "0 pages when empty")
+    // Append 1 token -> 1 page
+    let k = [1.0, 2.0]
+    let v = [3.0, 4.0]
+    cache = mla_append(cache, k, v)
+    _assert(mla_pages_used(cache) == 1, "1 page after 1 token")
+    // Append 255 more tokens -> still 1 page (256 tokens / 256 page_size)
+    let mut t = 1
+    while t < 256 {
+        cache = mla_append(cache, k, v)
+        t = t + 1
+    }
+    _assert(cache.seq_len == 256, "seq_len == 256")
+    _assert(mla_pages_used(cache) == 1, "1 page at exactly 256 tokens")
+    // Append 1 more -> 2 pages
+    cache = mla_append(cache, k, v)
+    _assert(mla_pages_used(cache) == 2, "2 pages at 257 tokens")
+}
+
+fn _test_cache_full_guard() {
+    println("[test 8] cache full guard (max_seq)")
+    let cfg = mla_config_new(1, 1, 4, 2, 2)
+    let mut cache = mla_cache_new(cfg)
+    let k = [1.0, 2.0]
+    let v = [3.0, 4.0]
+    cache = mla_append(cache, k, v)
+    cache = mla_append(cache, k, v)
+    _assert(cache.seq_len == 2, "seq_len == max_seq == 2")
+    // Third append should be silently refused
+    cache = mla_append(cache, k, v)
+    _assert(cache.seq_len == 2, "seq_len still 2 after overflow attempt")
+}
+
+// ── Main ────────────────────────────────────────────────────────
+
+fn main() {
+    println("serving/edge/mla_kv.hexa — MLA KV cache self-tests")
+    println("====================================================")
+    _test_config_defaults()
+    _test_cache_creation()
+    _test_compress_decompress()
+    _test_append_and_get()
+    _test_memory_bytes()
+    _test_compression_ratio()
+    _test_pages_used()
+    _test_cache_full_guard()
+    println("====================================================")
+    println("All MLA KV cache tests complete.")
+}
+
+main()

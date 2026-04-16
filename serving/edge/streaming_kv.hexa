@@ -1,0 +1,352 @@
+// serving/edge/streaming_kv.hexa — StreamingLLM sink token manager
+// n6 technique #58: infinite context length on M4 via attention sink tokens.
+//
+// StreamingLLM insight: the first tau tokens absorb disproportionate attention
+// mass regardless of content. Keeping them as permanent "sinks" stabilises
+// softmax even when the rest of the KV cache is a sliding window.
+//
+// Layout (default tau=4, W=508, total=512):
+//   [sink_0 sink_1 sink_2 sink_3 | window_0 .. window_507]
+//
+// Combined with MLA compression → 0.06 GB KV fixed for any conversation
+// length. Critical for long trading sessions without KV cache blowup.
+//
+// Usage:
+//   let cfg = stream_config_default()
+//   let kv  = stream_kv_new(cfg)
+//   kv = stream_append(kv, 101)   // repeat for each token
+//   let ctx = stream_get_context(kv)
+//   let n   = stream_context_length(kv)
+//   let s   = stream_stats(kv)
+
+// ─── Config ─────────────────────────────────────────────────────────
+
+struct StreamConfig {
+    n_sink: int,
+    window_size: int,
+    max_seq: int
+}
+
+// ─── KV State ───────────────────────────────────────────────────────
+// sink_tokens:  fixed array of first n_sink token ids (never evicted)
+// window_tokens: ring buffer of recent tokens (FIFO eviction)
+// write_pos:   next write index into window_tokens (mod window_size)
+// window_count: how many slots in window_tokens are occupied (≤ window_size)
+
+struct StreamKV {
+    config: StreamConfig,
+    sink_tokens: array,
+    window_tokens: array,
+    sink_filled: int,
+    write_pos: int,
+    window_count: int,
+    total_seen: int,
+    eviction_count: int
+}
+
+// ─── Constructors ───────────────────────────────────────────────────
+
+fn stream_config_default() -> StreamConfig {
+    // tau=4 sink + 508 sliding window = 512 total context
+    let cfg = StreamConfig {
+        n_sink: 4,
+        window_size: 508,
+        max_seq: 512
+    }
+    return cfg
+}
+
+fn stream_config_new(n_sink: int, window_size: int) -> StreamConfig {
+    let cfg = StreamConfig {
+        n_sink: n_sink,
+        window_size: window_size,
+        max_seq: n_sink + window_size
+    }
+    return cfg
+}
+
+fn stream_kv_new(config: StreamConfig) -> StreamKV {
+    // Pre-allocate window array to window_size with zeroes.
+    // Ring buffer semantics: write_pos wraps, window_count caps at window_size.
+    let mut sink = []
+    let mut window = []
+
+    // Pre-fill window slots so indexing works before the buffer is full
+    let mut i = 0
+    while i < config.window_size {
+        window = append(window, 0)
+        i = i + 1
+    }
+
+    let kv = StreamKV {
+        config: config,
+        sink_tokens: sink,
+        window_tokens: window,
+        sink_filled: 0,
+        write_pos: 0,
+        window_count: 0,
+        total_seen: 0,
+        eviction_count: 0
+    }
+    return kv
+}
+
+// ─── Core operations ────────────────────────────────────────────────
+
+fn stream_append(kv: StreamKV, token: int) -> StreamKV {
+    // First n_sink tokens are captured as permanent attention sinks.
+    // All subsequent tokens enter the sliding window ring buffer.
+    let mut sink_tokens   = kv.sink_tokens
+    let mut window_tokens = kv.window_tokens
+    let mut sink_filled   = kv.sink_filled
+    let mut write_pos     = kv.write_pos
+    let mut window_count  = kv.window_count
+    let mut eviction_count = kv.eviction_count
+
+    if sink_filled < kv.config.n_sink {
+        // Still filling sink slots — these tokens are never evicted
+        sink_tokens = append(sink_tokens, token)
+        sink_filled = sink_filled + 1
+    } else {
+        // Window ring buffer — overwrite oldest slot when full
+        if window_count >= kv.config.window_size {
+            // Eviction: oldest token in the ring is overwritten
+            eviction_count = eviction_count + 1
+        }
+        window_tokens[write_pos] = token
+        write_pos = (write_pos + 1) % kv.config.window_size
+        if window_count < kv.config.window_size {
+            window_count = window_count + 1
+        }
+    }
+
+    let out = StreamKV {
+        config: kv.config,
+        sink_tokens: sink_tokens,
+        window_tokens: window_tokens,
+        sink_filled: sink_filled,
+        write_pos: write_pos,
+        window_count: window_count,
+        total_seen: kv.total_seen + 1,
+        eviction_count: eviction_count
+    }
+    return out
+}
+
+fn stream_evict_if_needed(kv: StreamKV) -> StreamKV {
+    // Ring buffer handles eviction implicitly on append.
+    // This function is a no-op checkpoint — returns current state unchanged.
+    // Provided for API symmetry; real eviction happens inside stream_append.
+    return kv
+}
+
+// ─── Retrieval ──────────────────────────────────────────────────────
+
+fn stream_get_context(kv: StreamKV) -> array {
+    // Returns [sink_0..sink_{tau-1}, window_oldest..window_newest]
+    // suitable for passing to the attention kernel.
+    let mut ctx = []
+
+    // 1. Copy sink tokens
+    let mut i = 0
+    while i < kv.sink_filled {
+        ctx = append(ctx, kv.sink_tokens[i])
+        i = i + 1
+    }
+
+    // 2. Copy window tokens in chronological order (oldest first)
+    if kv.window_count > 0 {
+        // Ring buffer read start: oldest entry
+        let mut read_pos = 0
+        if kv.window_count >= kv.config.window_size {
+            // Buffer is full — oldest is at write_pos (next to be overwritten)
+            read_pos = kv.write_pos
+        }
+        // else buffer not yet full — oldest is at index 0, read_pos already 0
+
+        let mut j = 0
+        while j < kv.window_count {
+            let idx = (read_pos + j) % kv.config.window_size
+            ctx = append(ctx, kv.window_tokens[idx])
+            j = j + 1
+        }
+    }
+
+    return ctx
+}
+
+fn stream_context_length(kv: StreamKV) -> int {
+    return kv.sink_filled + kv.window_count
+}
+
+fn stream_stats(kv: StreamKV) -> string {
+    // Human-readable stats line for debugging / monitoring
+    let ctx_len = stream_context_length(kv)
+    let s = "StreamKV: ctx=" + to_string(ctx_len) + "/" + to_string(kv.config.max_seq) + " sink=" + to_string(kv.sink_filled) + "/" + to_string(kv.config.n_sink) + " window=" + to_string(kv.window_count) + "/" + to_string(kv.config.window_size) + " total_seen=" + to_string(kv.total_seen) + " evicted=" + to_string(kv.eviction_count)
+    return s
+}
+
+// ─── Self-tests ─────────────────────────────────────────────────────
+
+fn test_default_config() -> int {
+    let cfg = stream_config_default()
+    if cfg.n_sink != 4 { println("FAIL test_default_config: n_sink"); return 1 }
+    if cfg.window_size != 508 { println("FAIL test_default_config: window_size"); return 1 }
+    if cfg.max_seq != 512 { println("FAIL test_default_config: max_seq"); return 1 }
+    println("PASS test_default_config")
+    return 0
+}
+
+fn test_sink_fill() -> int {
+    // First 4 tokens should go into sink, not window
+    let cfg = stream_config_new(4, 8)
+    let mut kv = stream_kv_new(cfg)
+    kv = stream_append(kv, 10)
+    kv = stream_append(kv, 20)
+    kv = stream_append(kv, 30)
+    kv = stream_append(kv, 40)
+
+    if kv.sink_filled != 4 { println("FAIL test_sink_fill: sink_filled=" + to_string(kv.sink_filled)); return 1 }
+    if kv.window_count != 0 { println("FAIL test_sink_fill: window_count=" + to_string(kv.window_count)); return 1 }
+    if kv.total_seen != 4 { println("FAIL test_sink_fill: total_seen"); return 1 }
+
+    let ctx = stream_get_context(kv)
+    if len(ctx) != 4 { println("FAIL test_sink_fill: ctx len=" + to_string(len(ctx))); return 1 }
+    if ctx[0] != 10 { println("FAIL test_sink_fill: ctx[0]"); return 1 }
+    if ctx[3] != 40 { println("FAIL test_sink_fill: ctx[3]"); return 1 }
+
+    println("PASS test_sink_fill")
+    return 0
+}
+
+fn test_window_append() -> int {
+    // After sink is full, tokens enter the sliding window
+    let cfg = stream_config_new(2, 4)
+    let mut kv = stream_kv_new(cfg)
+    // Fill sink
+    kv = stream_append(kv, 1)
+    kv = stream_append(kv, 2)
+    // Fill window
+    kv = stream_append(kv, 3)
+    kv = stream_append(kv, 4)
+    kv = stream_append(kv, 5)
+
+    if kv.sink_filled != 2 { println("FAIL test_window_append: sink"); return 1 }
+    if kv.window_count != 3 { println("FAIL test_window_append: window_count=" + to_string(kv.window_count)); return 1 }
+    if kv.eviction_count != 0 { println("FAIL test_window_append: eviction_count"); return 1 }
+
+    let ctx = stream_get_context(kv)
+    // Expected: [1, 2, 3, 4, 5]
+    if len(ctx) != 5 { println("FAIL test_window_append: ctx len=" + to_string(len(ctx))); return 1 }
+    if ctx[0] != 1 { println("FAIL test_window_append: ctx[0]"); return 1 }
+    if ctx[2] != 3 { println("FAIL test_window_append: ctx[2]"); return 1 }
+    if ctx[4] != 5 { println("FAIL test_window_append: ctx[4]"); return 1 }
+
+    let clen = stream_context_length(kv)
+    if clen != 5 { println("FAIL test_window_append: context_length"); return 1 }
+
+    println("PASS test_window_append")
+    return 0
+}
+
+fn test_eviction() -> int {
+    // When window overflows, oldest non-sink tokens are evicted
+    let cfg = stream_config_new(2, 3)   // total max = 5
+    let mut kv = stream_kv_new(cfg)
+    // Sink: tokens 1, 2
+    kv = stream_append(kv, 1)
+    kv = stream_append(kv, 2)
+    // Window: tokens 3, 4, 5 (fills window of size 3)
+    kv = stream_append(kv, 3)
+    kv = stream_append(kv, 4)
+    kv = stream_append(kv, 5)
+    // Now window is full. Next append evicts token 3.
+    kv = stream_append(kv, 6)
+    // Next append evicts token 4.
+    kv = stream_append(kv, 7)
+
+    if kv.eviction_count != 2 { println("FAIL test_eviction: eviction_count=" + to_string(kv.eviction_count)); return 1 }
+    if kv.window_count != 3 { println("FAIL test_eviction: window_count=" + to_string(kv.window_count)); return 1 }
+    if kv.total_seen != 7 { println("FAIL test_eviction: total_seen"); return 1 }
+
+    let ctx = stream_get_context(kv)
+    // Expected: [1, 2] (sink) + [5, 6, 7] (window, oldest first)
+    if len(ctx) != 5 { println("FAIL test_eviction: ctx len=" + to_string(len(ctx))); return 1 }
+    if ctx[0] != 1 { println("FAIL test_eviction: ctx[0] sink"); return 1 }
+    if ctx[1] != 2 { println("FAIL test_eviction: ctx[1] sink"); return 1 }
+    if ctx[2] != 5 { println("FAIL test_eviction: ctx[2] oldest window"); return 1 }
+    if ctx[3] != 6 { println("FAIL test_eviction: ctx[3]"); return 1 }
+    if ctx[4] != 7 { println("FAIL test_eviction: ctx[4] newest window"); return 1 }
+
+    println("PASS test_eviction")
+    return 0
+}
+
+fn test_long_stream() -> int {
+    // Simulate a long trading session: 2000 tokens through a 512-slot cache
+    let cfg = stream_config_default()   // 4 sink + 508 window
+    let mut kv = stream_kv_new(cfg)
+
+    let mut t = 0
+    while t < 2000 {
+        kv = stream_append(kv, t)
+        t = t + 1
+    }
+
+    // Context length should be capped at max_seq (512)
+    let clen = stream_context_length(kv)
+    if clen != 512 { println("FAIL test_long_stream: context_length=" + to_string(clen)); return 1 }
+
+    // Sink tokens are the first 4 ever seen (0, 1, 2, 3)
+    let ctx = stream_get_context(kv)
+    if ctx[0] != 0 { println("FAIL test_long_stream: sink[0]=" + to_string(ctx[0])); return 1 }
+    if ctx[1] != 1 { println("FAIL test_long_stream: sink[1]"); return 1 }
+    if ctx[2] != 2 { println("FAIL test_long_stream: sink[2]"); return 1 }
+    if ctx[3] != 3 { println("FAIL test_long_stream: sink[3]"); return 1 }
+
+    // Window should contain the last 508 tokens: 1492..1999
+    if ctx[4] != 1492 { println("FAIL test_long_stream: window_oldest=" + to_string(ctx[4]) + " expected 1492"); return 1 }
+    if ctx[511] != 1999 { println("FAIL test_long_stream: window_newest=" + to_string(ctx[511]) + " expected 1999"); return 1 }
+
+    // Eviction count = total_seen - n_sink - window_size = 2000 - 4 - 508 = 1488
+    if kv.eviction_count != 1488 { println("FAIL test_long_stream: eviction_count=" + to_string(kv.eviction_count)); return 1 }
+
+    println("PASS test_long_stream")
+    return 0
+}
+
+fn test_stats_string() -> int {
+    // Verify stats returns a non-empty string with expected substrings
+    let cfg = stream_config_new(2, 4)
+    let mut kv = stream_kv_new(cfg)
+    kv = stream_append(kv, 100)
+    kv = stream_append(kv, 200)
+    kv = stream_append(kv, 300)
+
+    let s = stream_stats(kv)
+    // Root cause: hexa lacks string contains; check length as sanity
+    if len(s) < 20 { println("FAIL test_stats_string: too short"); return 1 }
+    println("  stats: " + s)
+    println("PASS test_stats_string")
+    return 0
+}
+
+// ─── Main ───────────────────────────────────────────────────────────
+
+fn main() -> int {
+    println("── streaming_kv self-tests ──")
+    let mut fails = 0
+    fails = fails + test_default_config()
+    fails = fails + test_sink_fill()
+    fails = fails + test_window_append()
+    fails = fails + test_eviction()
+    fails = fails + test_long_stream()
+    fails = fails + test_stats_string()
+
+    if fails == 0 {
+        println("── ALL 6 PASS ──")
+    } else {
+        println("── " + to_string(fails) + " FAIL ──")
+    }
+    return fails
+}

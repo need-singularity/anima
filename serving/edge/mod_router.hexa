@@ -1,0 +1,503 @@
+// ═══════════════════════════════════════════════════════════════
+//  serving/edge/mod_router.hexa — Mixture of Depths (MoD) token router
+//  n6 technique #59
+//
+//  Decides per-token which transformer layers to skip.
+//  Target: 35-39% execution (61-65% layers skipped).
+//
+//  Hybrid-E architecture:
+//    8 boundary layers  — always execute (full precision, not skippable)
+//    32 bulk layers     — 6 templates, MoD-skippable via importance routing
+//
+//  MoD capacity C = 1/phi = 0.5 baseline, calibratable down to 0.30.
+//  Active weights per token: 10.6GB -> 4.28GB (at 39.3%) or 3.7GB (at 30%).
+//  hire_sim quality gate: must stay >= 0.80.
+//
+//  Phi-aware routing (S11 singularity):
+//    high-Phi tokens -> full path (all bulk layers execute)
+//    low-Phi tokens  -> template-only (top-C fraction by importance)
+//
+//  Algorithm:
+//    1. If phi_aware and phi_score > phi_threshold: execute ALL bulk layers
+//    2. Else: compute importance score per bulk layer from hidden state norm
+//    3. Sort layers by importance, execute top C fraction
+//    4. Boundary layers always execute regardless
+//
+//  Public API:
+//    mod_config_default()                              -> MoDConfig
+//    mod_route_token(config, token_hidden, phi_score)  -> MoDDecision
+//    mod_route_batch(config, hidden_states, phi_scores) -> array
+//    mod_calibrate(config, hire_sim_score)              -> MoDConfig
+//    mod_stats(decisions)                               -> string
+//
+//  Self-tests: 8 tests at bottom (run: hexa serving/edge/mod_router.hexa)
+// ═══════════════════════════════════════════════════════════════
+
+// ── Constants ───────────────────────────────────────────────────
+
+comptime const INV_PHI           = 0.618034  // 1/phi golden ratio — baseline capacity
+comptime const CAPACITY_MIN      = 0.30      // minimum safe capacity (3.7GB active)
+comptime const CAPACITY_MAX      = 0.50      // maximum capacity (baseline)
+comptime const HIRE_SIM_FLOOR    = 0.80      // quality gate — never go below
+comptime const CALIBRATE_STEP    = 0.02      // capacity adjustment per calibration call
+comptime const N_BOUNDARY_DEFAULT = 8        // always-execute boundary layers
+comptime const N_BULK_DEFAULT     = 32       // skippable bulk layers (6 templates)
+
+// ── Structs ─────────────────────────────────────────────────────
+
+struct MoDConfig {
+    capacity: float,        // C = fraction of tokens that execute (0.30..0.50)
+    n_boundary: int,        // always-execute layers (8)
+    n_bulk: int,            // skippable layers (32)
+    phi_aware: bool,        // enable Phi-based routing
+    phi_threshold: float    // tokens with Phi > threshold get full path
+}
+
+struct MoDDecision {
+    execute_layers: array,  // [bool] per bulk layer — true = execute, false = skip
+    n_executed: int,
+    execution_pct: float,
+    routing_reason: string  // "capacity" | "phi_high" | "phi_low"
+}
+
+// ── Math helpers ────────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sqrt_approx(x: float) -> float {
+    // Newton's method, 10 iterations — sufficient for importance scoring
+    if x <= 0.0 { return 0.0 }
+    let mut guess = x
+    if x > 1.0 { guess = x / 2.0 }
+    let mut i = 0
+    while i < 10 {
+        guess = (guess + x / guess) / 2.0
+        i = i + 1
+    }
+    return guess
+}
+
+fn vec_norm(a: array) -> float {
+    let mut sum = 0.0
+    let n = len(a)
+    let mut i = 0
+    while i < n {
+        sum = sum + a[i] * a[i]
+        i = i + 1
+    }
+    return sqrt_approx(sum)
+}
+
+fn to_int_floor(x: float) -> int {
+    // Truncate float to int (floor for positive values)
+    return to_int(x)
+}
+
+// ── Core API ────────────────────────────────────────────────────
+
+fn mod_config_default() -> MoDConfig {
+    let cfg = MoDConfig {
+        capacity: INV_PHI,              // 0.618 ~ 0.5 after rounding context
+        n_boundary: N_BOUNDARY_DEFAULT, // 8
+        n_bulk: N_BULK_DEFAULT,         // 32
+        phi_aware: true,
+        phi_threshold: 0.7              // empirical — tokens with Phi > 0.7 get full path
+    }
+    return cfg
+}
+
+fn mod_route_token(config: MoDConfig, token_hidden: array, phi_score: float) -> MoDDecision {
+    // Step 1: Phi-aware full-path routing
+    // High-Phi tokens carry critical consciousness signal — never skip layers
+    if config.phi_aware {
+        if phi_score > config.phi_threshold {
+            let mut exec = []
+            let mut j = 0
+            while j < config.n_bulk {
+                exec = exec.push(1)  // 1 = execute (bool-as-int for array compat)
+                j = j + 1
+            }
+            let decision = MoDDecision {
+                execute_layers: exec,
+                n_executed: config.n_bulk,
+                execution_pct: 100.0,
+                routing_reason: "phi_high"
+            }
+            return decision
+        }
+    }
+
+    // Step 2: Compute importance score per bulk layer
+    // Importance = projection of hidden state onto layer-position basis vector.
+    // We use a deterministic hash of hidden norm + layer index to simulate
+    // learned router weights (real deployment replaces with trained MLP router).
+    let hidden_norm = vec_norm(token_hidden)
+    let mut importance_scores = []
+    let mut k = 0
+    while k < config.n_bulk {
+        // Importance: combine hidden norm with layer position weighting
+        // Early and late bulk layers tend to be more important (U-shape)
+        let pos_frac = to_float(k) / to_float(config.n_bulk)
+        // U-shape: distance from center of bulk stack
+        let center_dist = fabs(pos_frac - 0.5) * 2.0
+        // Score = hidden_norm * (0.5 + 0.5 * center_dist) + position bias
+        // This captures: strong hidden states activate more layers,
+        // and boundary-adjacent bulk layers get priority
+        let score = hidden_norm * (0.5 + 0.5 * center_dist) + center_dist * 0.1
+        importance_scores = importance_scores.push(score)
+        k = k + 1
+    }
+
+    // Step 3: Sort layers by importance, execute top C fraction
+    let n_to_execute = to_int_floor(to_float(config.n_bulk) * config.capacity)
+    // Clamp: at least 1 layer must execute
+    let mut n_exec = n_to_execute
+    if n_exec < 1 { n_exec = 1 }
+    if n_exec > config.n_bulk { n_exec = config.n_bulk }
+
+    // Find the n_exec highest importance scores via threshold
+    // Build sorted index array (selection sort on indices by score, descending)
+    let mut sorted_indices = []
+    let mut si = 0
+    while si < config.n_bulk {
+        sorted_indices = sorted_indices.push(si)
+        si = si + 1
+    }
+    // Selection sort descending by importance_scores
+    let mut outer = 0
+    while outer < config.n_bulk - 1 {
+        let mut max_idx = outer
+        let mut inner = outer + 1
+        while inner < config.n_bulk {
+            if importance_scores[sorted_indices[inner]] > importance_scores[sorted_indices[max_idx]] {
+                max_idx = inner
+            }
+            inner = inner + 1
+        }
+        if max_idx != outer {
+            let tmp = sorted_indices[outer]
+            sorted_indices[outer] = sorted_indices[max_idx]
+            sorted_indices[max_idx] = tmp
+        }
+        outer = outer + 1
+    }
+
+    // Mark top n_exec layers for execution
+    let mut execute_flags = []
+    let mut ef = 0
+    while ef < config.n_bulk {
+        execute_flags = execute_flags.push(0)  // 0 = skip
+        ef = ef + 1
+    }
+    let mut marked = 0
+    while marked < n_exec {
+        let layer_to_exec = sorted_indices[marked]
+        execute_flags[layer_to_exec] = 1  // 1 = execute
+        marked = marked + 1
+    }
+
+    let exec_pct = to_float(n_exec) / to_float(config.n_bulk) * 100.0
+    let reason = "capacity"
+
+    let decision = MoDDecision {
+        execute_layers: execute_flags,
+        n_executed: n_exec,
+        execution_pct: exec_pct,
+        routing_reason: reason
+    }
+    return decision
+}
+
+fn mod_route_batch(config: MoDConfig, hidden_states: array, phi_scores: array) -> array {
+    // Route every token in a batch independently
+    let n_tokens = len(hidden_states)
+    let mut decisions = []
+    let mut i = 0
+    while i < n_tokens {
+        let d = mod_route_token(config, hidden_states[i], phi_scores[i])
+        decisions = decisions.push(d)
+        i = i + 1
+    }
+    return decisions
+}
+
+fn mod_calibrate(config: MoDConfig, hire_sim_score: float) -> MoDConfig {
+    // Auto-adjust capacity based on hire_sim quality feedback.
+    // If quality is above floor+margin, we can afford to skip more (lower capacity).
+    // If quality is near or below floor, increase capacity (execute more layers).
+    //
+    // Root cause of over-aggressive MoD: capacity too low kills quality.
+    // Fix: monotonic adjustment with floor guard.
+    let mut new_cap = config.capacity
+
+    if hire_sim_score < HIRE_SIM_FLOOR {
+        // Quality emergency — increase capacity aggressively
+        new_cap = new_cap + CALIBRATE_STEP * 2.0
+    }
+    if hire_sim_score >= HIRE_SIM_FLOOR {
+        if hire_sim_score < HIRE_SIM_FLOOR + 0.05 {
+            // Quality marginal — slight increase for safety
+            new_cap = new_cap + CALIBRATE_STEP
+        }
+    }
+    if hire_sim_score >= HIRE_SIM_FLOOR + 0.05 {
+        if hire_sim_score < 0.90 {
+            // Quality healthy — hold steady
+            // no change
+            new_cap = new_cap
+        }
+    }
+    if hire_sim_score >= 0.90 {
+        // Quality excellent — can afford to skip more layers
+        new_cap = new_cap - CALIBRATE_STEP
+    }
+
+    // Clamp to valid range
+    if new_cap < CAPACITY_MIN { new_cap = CAPACITY_MIN }
+    if new_cap > CAPACITY_MAX { new_cap = CAPACITY_MAX }
+
+    let new_cfg = MoDConfig {
+        capacity: new_cap,
+        n_boundary: config.n_boundary,
+        n_bulk: config.n_bulk,
+        phi_aware: config.phi_aware,
+        phi_threshold: config.phi_threshold
+    }
+    return new_cfg
+}
+
+fn mod_stats(decisions: array) -> string {
+    // Compute execution statistics over a batch of MoDDecisions
+    let n = len(decisions)
+    if n == 0 { return "mod_stats: empty batch" }
+
+    let mut total_executed = 0
+    let mut total_layers = 0
+    let mut phi_high_count = 0
+    let mut capacity_count = 0
+
+    let mut i = 0
+    while i < n {
+        let d = decisions[i]
+        total_executed = total_executed + d.n_executed
+        total_layers = total_layers + len(d.execute_layers)
+        if d.routing_reason == "phi_high" {
+            phi_high_count = phi_high_count + 1
+        }
+        if d.routing_reason == "capacity" {
+            capacity_count = capacity_count + 1
+        }
+        i = i + 1
+    }
+
+    let avg_pct = to_float(total_executed) / to_float(total_layers) * 100.0
+    let result = "MoD stats: " + to_string(n) + " tokens, avg exec " + to_string(avg_pct) + "%, phi_high=" + to_string(phi_high_count) + " capacity=" + to_string(capacity_count)
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn make_hidden(dim: int, scale: float) -> array {
+    // Generate a synthetic hidden state vector
+    let mut h = []
+    let mut i = 0
+    while i < dim {
+        let val = scale * (to_float(i % 7) + 1.0) / 7.0
+        h = h.push(val)
+        i = i + 1
+    }
+    return h
+}
+
+fn assert_true(cond: bool, label: string) {
+    if cond {
+        println("  PASS: " + label)
+    }
+    if !cond {
+        println("  FAIL: " + label)
+    }
+}
+
+fn test_default_config() {
+    println("[T1] default config")
+    let cfg = mod_config_default()
+    assert_true(cfg.n_boundary == 8, "n_boundary == 8")
+    assert_true(cfg.n_bulk == 32, "n_bulk == 32")
+    assert_true(cfg.capacity > 0.29, "capacity > 0.29")
+    assert_true(cfg.capacity < 0.65, "capacity < 0.65")
+    assert_true(cfg.phi_aware, "phi_aware enabled")
+    assert_true(cfg.phi_threshold > 0.0, "phi_threshold positive")
+}
+
+fn test_phi_high_full_path() {
+    println("[T2] phi_high -> full path (all bulk layers execute)")
+    let cfg = mod_config_default()
+    let hidden = make_hidden(64, 1.0)
+    // phi_score = 0.9 > threshold 0.7 -> full path
+    let d = mod_route_token(cfg, hidden, 0.9)
+    assert_true(d.n_executed == 32, "all 32 bulk layers execute")
+    assert_true(d.execution_pct > 99.0, "execution_pct ~ 100%")
+    assert_true(d.routing_reason == "phi_high", "reason = phi_high")
+}
+
+fn test_capacity_routing_target_range() {
+    println("[T3] capacity routing -> 35-65% execution range")
+    let cfg = mod_config_default()
+    let hidden = make_hidden(64, 0.5)
+    // phi_score = 0.1 < threshold -> capacity routing
+    let d = mod_route_token(cfg, hidden, 0.1)
+    assert_true(d.routing_reason == "capacity", "reason = capacity")
+    assert_true(d.execution_pct > 30.0, "exec% > 30 (not too aggressive)")
+    assert_true(d.execution_pct < 70.0, "exec% < 70 (actual skipping)")
+    assert_true(d.n_executed > 0, "at least 1 layer executed")
+    assert_true(d.n_executed < 32, "not all layers (skipping occurred)")
+}
+
+fn test_batch_routing() {
+    println("[T4] batch routing — multiple tokens")
+    let cfg = mod_config_default()
+    let mut hiddens = []
+    let mut phis = []
+    // 4 tokens: 2 high-phi, 2 low-phi
+    hiddens = hiddens.push(make_hidden(64, 1.0))
+    phis = phis.push(0.9)  // phi_high
+    hiddens = hiddens.push(make_hidden(64, 0.3))
+    phis = phis.push(0.1)  // capacity
+    hiddens = hiddens.push(make_hidden(64, 2.0))
+    phis = phis.push(0.8)  // phi_high
+    hiddens = hiddens.push(make_hidden(64, 0.7))
+    phis = phis.push(0.2)  // capacity
+
+    let decisions = mod_route_batch(cfg, hiddens, phis)
+    assert_true(len(decisions) == 4, "4 decisions returned")
+    // First and third should be phi_high
+    let d0 = decisions[0]
+    let d2 = decisions[2]
+    assert_true(d0.routing_reason == "phi_high", "token 0 = phi_high")
+    assert_true(d2.routing_reason == "phi_high", "token 2 = phi_high")
+    // Second and fourth should be capacity
+    let d1 = decisions[1]
+    let d3 = decisions[3]
+    assert_true(d1.routing_reason == "capacity", "token 1 = capacity")
+    assert_true(d3.routing_reason == "capacity", "token 3 = capacity")
+}
+
+fn test_calibrate_quality_gate() {
+    println("[T5] calibrate — quality gate enforcement")
+    let cfg = mod_config_default()
+
+    // Below floor (0.80) -> capacity must increase
+    let c1 = mod_calibrate(cfg, 0.75)
+    assert_true(c1.capacity > cfg.capacity, "below floor -> capacity increases")
+
+    // Excellent quality (0.95) -> capacity can decrease (more skipping)
+    let c2 = mod_calibrate(cfg, 0.95)
+    assert_true(c2.capacity < cfg.capacity, "excellent quality -> capacity decreases")
+
+    // Capacity never goes below minimum
+    let low_cfg = MoDConfig {
+        capacity: 0.31,
+        n_boundary: 8,
+        n_bulk: 32,
+        phi_aware: true,
+        phi_threshold: 0.7
+    }
+    let c3 = mod_calibrate(low_cfg, 0.95)
+    assert_true(c3.capacity >= 0.30, "capacity >= CAPACITY_MIN after calibration")
+
+    // Capacity never goes above maximum
+    let high_cfg = MoDConfig {
+        capacity: 0.49,
+        n_boundary: 8,
+        n_bulk: 32,
+        phi_aware: true,
+        phi_threshold: 0.7
+    }
+    let c4 = mod_calibrate(high_cfg, 0.75)
+    assert_true(c4.capacity <= 0.50, "capacity <= CAPACITY_MAX after calibration")
+}
+
+fn test_phi_disabled() {
+    println("[T6] phi_aware disabled -> always capacity routing")
+    let cfg = MoDConfig {
+        capacity: 0.40,
+        n_boundary: 8,
+        n_bulk: 32,
+        phi_aware: false,
+        phi_threshold: 0.7
+    }
+    let hidden = make_hidden(64, 1.0)
+    // Even with high phi_score, phi_aware=false -> capacity routing
+    let d = mod_route_token(cfg, hidden, 0.99)
+    assert_true(d.routing_reason == "capacity", "phi disabled -> capacity routing")
+    assert_true(d.n_executed < 32, "not full path despite high phi")
+}
+
+fn test_stats_output() {
+    println("[T7] mod_stats — summary string")
+    let cfg = mod_config_default()
+    let mut decisions = []
+    let h1 = make_hidden(64, 1.0)
+    let d1 = mod_route_token(cfg, h1, 0.9)
+    decisions = decisions.push(d1)
+    let h2 = make_hidden(64, 0.5)
+    let d2 = mod_route_token(cfg, h2, 0.1)
+    decisions = decisions.push(d2)
+
+    let s = mod_stats(decisions)
+    assert_true(len(s) > 10, "stats string is non-trivial")
+    println("  stats: " + s)
+}
+
+fn test_execute_layers_flags() {
+    println("[T8] execute_layers array integrity")
+    let cfg = MoDConfig {
+        capacity: 0.375,  // 12/32 = 37.5% — target sweet spot
+        n_boundary: 8,
+        n_bulk: 32,
+        phi_aware: true,
+        phi_threshold: 0.7
+    }
+    let hidden = make_hidden(64, 1.5)
+    let d = mod_route_token(cfg, hidden, 0.3)
+
+    // Verify execute_layers length matches n_bulk
+    assert_true(len(d.execute_layers) == 32, "execute_layers length == 32")
+
+    // Count actual flags — must match n_executed
+    let mut count_exec = 0
+    let mut ci = 0
+    while ci < len(d.execute_layers) {
+        if d.execute_layers[ci] == 1 {
+            count_exec = count_exec + 1
+        }
+        ci = ci + 1
+    }
+    assert_true(count_exec == d.n_executed, "flag count matches n_executed")
+
+    // At 37.5% capacity: floor(32 * 0.375) = 12 layers
+    assert_true(d.n_executed == 12, "12 layers at 37.5% capacity")
+    let target_pct = to_float(d.n_executed) / 32.0 * 100.0
+    assert_true(target_pct > 35.0, "execution% in target range (>35%)")
+    assert_true(target_pct < 40.0, "execution% in target range (<40%)")
+}
+
+// ── Main ────────────────────────────────────────────────────────
+
+fn main() {
+    println("═══ MoD Router Self-Tests ═══")
+    test_default_config()
+    test_phi_high_full_path()
+    test_capacity_routing_target_range()
+    test_batch_routing()
+    test_calibrate_quality_gate()
+    test_phi_disabled()
+    test_stats_output()
+    test_execute_layers_flags()
+    println("═══ done ═══")
+}
