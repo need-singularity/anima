@@ -592,8 +592,13 @@ fn hr_compose_answer(task: string, trace: AutonomyResult,
 //   (1) parse request
 //   (2) resolve persona (fallback: default)
 //   (3) resolve tone (fallback: persona.default_tone, then "daily")
-//   (4) run autonomy mock (실 연결 시 hr_run_autonomy_claude swap)
+//   (4) run autonomy — Claude (with tool-use + self-critique) if available,
+//       mock fallback otherwise. Adapter selection is automatic.
 //   (5) compose answer with tone marker
+//
+// v3.0 gate wire (2026-04-16): hr_run_autonomy_claude replaces
+// hr_run_autonomy_mock as the primary path. The mock path is preserved
+// as automatic fallback when Claude CLI is unavailable.
 fn hr_handle_task(body: string,
                   presets: [StylePreset],
                   personas: [PersonaSpec]) -> HireTaskResponse {
@@ -604,6 +609,9 @@ fn hr_handle_task(body: string,
             steps_n: 0,
             steps_summary: "",
             score: 0.0,
+            confidence: 0.0,
+            tool_use_count: 0,
+            adapter_used: "none",
             tone: "daily",
             persona: "default",
             verdict: "FAIL",
@@ -638,8 +646,12 @@ fn hr_handle_task(body: string,
         fallback_tone = true
     }
 
-    // (4) run autonomy mock
-    let trace = hr_run_autonomy_mock(req.task, req.budget)
+    // (4) run autonomy — try Claude first, auto-fallback to mock
+    // Root cause comment: previously this always called hr_run_autonomy_mock,
+    // so /hire/task never actually executed tasks via Claude or used tools.
+    // Now hr_run_autonomy_claude is the primary path, and it internally
+    // falls back to mock if Claude CLI is unavailable.
+    let trace = hr_run_autonomy_claude(req.task, req.budget)
 
     // (5) compose
     let answer = hr_compose_answer(req.task, trace, tone_label, persona_spec.label)
@@ -650,6 +662,78 @@ fn hr_handle_task(body: string,
         steps_n: len(trace.steps),
         steps_summary: steps_summary,
         score: trace.terminal_score,
+        confidence: trace.confidence,
+        tool_use_count: trace.tool_use_count,
+        adapter_used: trace.adapter_used,
+        tone: tone_label,
+        persona: persona_spec.label,
+        verdict: trace.verdict,
+        truncated: trace.truncated,
+        fallback_persona: pres.fallback_used,
+        fallback_tone: fallback_tone,
+        error: ""
+    }
+}
+
+// hr_handle_task_mock: deterministic-only entry point for standalone tests.
+// Tests T1-T5 must remain deterministic, so they call this instead of
+// hr_handle_task (which now dispatches to Claude when available).
+fn hr_handle_task_mock(body: string,
+                       presets: [StylePreset],
+                       personas: [PersonaSpec]) -> HireTaskResponse {
+    let req = hr_parse_task_request(body)
+    if len(req.task) == 0 {
+        return HireTaskResponse {
+            answer: "",
+            steps_n: 0,
+            steps_summary: "",
+            score: 0.0,
+            confidence: 0.0,
+            tool_use_count: 0,
+            adapter_used: "none",
+            tone: "daily",
+            persona: "default",
+            verdict: "FAIL",
+            truncated: false,
+            fallback_persona: false,
+            fallback_tone: false,
+            error: "missing 'task' field"
+        }
+    }
+
+    let pres = hr_resolve_persona(personas, req.persona)
+    let persona_spec = pres.spec
+
+    let mut tone_label = req.tone
+    let mut fallback_tone = false
+    if len(tone_label) == 0 {
+        tone_label = persona_spec.default_tone
+        fallback_tone = true
+    }
+    let n_presets = len(presets)
+    let mut tone_found = false
+    let mut i = 0
+    while i < n_presets {
+        if presets[i].label == tone_label { tone_found = true }
+        i = i + 1
+    }
+    if !tone_found {
+        tone_label = "daily"
+        fallback_tone = true
+    }
+
+    let trace = hr_run_autonomy_mock(req.task, req.budget)
+    let answer = hr_compose_answer(req.task, trace, tone_label, persona_spec.label)
+    let steps_summary = hr_summarize_steps(trace.steps)
+
+    return HireTaskResponse {
+        answer: answer,
+        steps_n: len(trace.steps),
+        steps_summary: steps_summary,
+        score: trace.terminal_score,
+        confidence: trace.confidence,
+        tool_use_count: trace.tool_use_count,
+        adapter_used: trace.adapter_used,
         tone: tone_label,
         persona: persona_spec.label,
         verdict: trace.verdict,
@@ -787,11 +871,15 @@ fn hr_capabilities_json(presets: [StylePreset], personas: [PersonaSpec]) -> stri
 
 fn hr_response_to_json(r: HireTaskResponse) -> string {
     let sc_int = to_int(r.score * 100.0)
+    let conf_int = to_int(r.confidence * 100.0)
     let mut s = "{\"answer\":\"" + r.answer
     s = s + "\",\"steps_n\":" + to_string(r.steps_n)
     s = s + ",\"steps_summary\":\"" + r.steps_summary
     s = s + "\",\"score\":" + to_string(sc_int)
-    s = s + ",\"tone\":\"" + r.tone
+    s = s + ",\"confidence\":" + to_string(conf_int)
+    s = s + ",\"tool_use_count\":" + to_string(r.tool_use_count)
+    s = s + ",\"adapter_used\":\"" + r.adapter_used
+    s = s + "\",\"tone\":\"" + r.tone
     s = s + "\",\"persona\":\"" + r.persona
     s = s + "\",\"verdict\":\"" + r.verdict
     s = s + "\",\"truncated\":" + (if r.truncated { "true" } else { "false" })
@@ -856,7 +944,7 @@ fn hr_check_T2() -> bool {
     let presets = hr_presets_extended()
     let personas = hr_personas()
     let body = "{\"task\":\"summarize email about Q3 budget\",\"budget\":10}"
-    let r = hr_handle_task(body, presets, personas)
+    let r = hr_handle_task_mock(body, presets, personas)
     if len(r.error) > 0 {
         println("  T2 FAIL: error=" + r.error)
         return false
@@ -886,7 +974,7 @@ fn hr_check_T2() -> bool {
         return false
     }
     // Determinism — second call returns identical
-    let r2 = hr_handle_task(body, presets, personas)
+    let r2 = hr_handle_task_mock(body, presets, personas)
     if r2.answer != r.answer {
         println("  T2 FAIL: not deterministic (answer mismatch)")
         return false
@@ -903,7 +991,7 @@ fn hr_check_T3() -> bool {
     let presets = hr_presets_extended()
     let personas = hr_personas()
     let body = "{\"task\":\"reply with encouragement\",\"tone\":\"senpai\",\"budget\":5}"
-    let r = hr_handle_task(body, presets, personas)
+    let r = hr_handle_task_mock(body, presets, personas)
     if r.tone != "senpai" {
         println("  T3 FAIL: tone=" + r.tone + " expected senpai")
         return false
@@ -921,7 +1009,7 @@ fn hr_check_T3() -> bool {
     let mut i = 0
     while i < 4 {
         let body2 = "{\"task\":\"t\",\"tone\":\"" + labels[i] + "\"}"
-        let r2 = hr_handle_task(body2, presets, personas)
+        let r2 = hr_handle_task_mock(body2, presets, personas)
         if r2.tone != labels[i] {
             println("  T3 FAIL: " + labels[i] + " not honored, got " + r2.tone)
             return false
@@ -942,7 +1030,7 @@ fn hr_check_T4() -> bool {
 
     // (a) unknown persona
     let body_a = "{\"task\":\"hello\",\"persona\":\"alien_overlord\"}"
-    let r_a = hr_handle_task(body_a, presets, personas)
+    let r_a = hr_handle_task_mock(body_a, presets, personas)
     if r_a.persona != "default" {
         println("  T4 FAIL(a): persona=" + r_a.persona + " expected default")
         return false
@@ -954,7 +1042,7 @@ fn hr_check_T4() -> bool {
 
     // (b) missing persona (none provided) — also defaults
     let body_b = "{\"task\":\"hello\"}"
-    let r_b = hr_handle_task(body_b, presets, personas)
+    let r_b = hr_handle_task_mock(body_b, presets, personas)
     if r_b.persona != "default" {
         println("  T4 FAIL(b): persona=" + r_b.persona)
         return false
@@ -966,7 +1054,7 @@ fn hr_check_T4() -> bool {
 
     // (c) valid persona — no fallback
     let body_c = "{\"task\":\"hello\",\"persona\":\"sorceress\"}"
-    let r_c = hr_handle_task(body_c, presets, personas)
+    let r_c = hr_handle_task_mock(body_c, presets, personas)
     if r_c.persona != "sorceress" {
         println("  T4 FAIL(c): persona=" + r_c.persona)
         return false
@@ -982,7 +1070,7 @@ fn hr_check_T4() -> bool {
 
     // (d) missing task → error
     let body_d = "{\"persona\":\"default\"}"
-    let r_d = hr_handle_task(body_d, presets, personas)
+    let r_d = hr_handle_task_mock(body_d, presets, personas)
     if len(r_d.error) == 0 {
         println("  T4 FAIL(d): expected error for missing task")
         return false
