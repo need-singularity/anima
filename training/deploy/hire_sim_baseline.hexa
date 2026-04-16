@@ -1,0 +1,669 @@
+// hire_sim_baseline.hexa — STRICT deterministic ALM hire_sim runner
+//
+// Hexa port of training/deploy/hire_sim_alm_runner.py (Path E baseline).
+// Mirrors hire_sim_judge.hexa::judge logic exactly:
+//   - keyword coverage in [0,1] (lowercase substring match)
+//   - length floor per domain (40 for code/research, 30 for schedule/email/meeting/doc)
+//   - rule-specific extra check:
+//       code      -> looks_like_code (fenced block / kw / operator density >= 3)
+//       schedule  -> contains_digit
+//       text_match (no extra) for email/meeting/doc/research
+//   - completion = all_hit AND length_ok AND extra_ok
+//
+// Endpoint contract: POST $HIRE_SIM_ENDPOINT, body {"task_id","prompt"},
+// response JSON with "text" or "output" field.
+//
+// Mock mode: if HIRE_SIM_ENDPOINT is empty OR HIRE_SIM_MOCK=1, skip network
+// and emit a fixed mock report (used for build/run smoke verification).
+//
+// Critical inline policy: this file is fully self-contained. No `use` of
+// hire_sim_100 / hire_sim_judge / hire_sim_runner / autonomy_loop —
+// stage0 silent-exit bug (feedback_hexa_silent_exit_5_imports.md) emits
+// empty main() when use chain spans 3+ real modules.
+
+// ── Inline data types (no struct fields with >=3 floats — use parallel arrays) ──
+
+struct Task {
+    id: string,
+    domain: string,
+    difficulty: string,
+    prompt: string,
+    keywords: array
+}
+
+struct JudgeRow {
+    task_id: string,
+    domain: string,
+    difficulty: string,
+    rule: string,
+    completion: bool,
+    hits: int,
+    total: int,
+    score: float,
+    actual_len: int,
+    detail: string,
+    actual_preview: string,
+    latency_ms: int,
+    net_status: string
+}
+
+// ── Config (env-driven) ─────────────────────────────────────────────────
+
+fn env_or(key: string, fallback: string) -> string {
+    let v = env(key)
+    if v == "" { return fallback }
+    return v
+}
+
+fn env_int_or(key: string, fallback: int) -> int {
+    let v = env(key)
+    if v == "" { return fallback }
+    return to_int(v)
+}
+
+let CORPUS_PATH = env_or("HIRE_SIM_CORPUS",
+    "/Users/ghost/Dev/anima/anima-agent/hire_sim_100.hexa")
+let ENDPOINT = env_or("HIRE_SIM_ENDPOINT", "")
+let MAX_TASKS = env_int_or("HIRE_SIM_MAX_TASKS", 30)
+let OUTPUT = env_or("HIRE_SIM_OUTPUT",
+    "/Users/ghost/Dev/anima/training/deploy/hire_sim_baseline_out.json")
+let TIMEOUT = env_int_or("HIRE_SIM_TIMEOUT", 90)
+let MOCK = env_or("HIRE_SIM_MOCK", "")
+
+// ── Corpus parser (string walk, byte-index safe for ASCII corpus) ────────
+// The corpus uses ASCII-only Task entries; comments may contain CJK but
+// we only scan inside `Task { ... success_keywords: [...] }` slices, all ASCII.
+
+fn find_from(s: string, needle: string, from_idx: int) -> int {
+    let n = len(s)
+    let m = len(needle)
+    if m == 0 { return from_idx }
+    if from_idx >= n { return -1 }
+    let mut i = from_idx
+    while i + m <= n {
+        if s.substring(i, i + m) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn slice_between(s: string, start_marker: string, end_marker: string,
+                 from_idx: int) -> string {
+    let i = find_from(s, start_marker, from_idx)
+    if i < 0 { return "" }
+    let body_start = i + len(start_marker)
+    let j = find_from(s, end_marker, body_start)
+    if j < 0 { return "" }
+    return s.substring(body_start, j)
+}
+
+// Extract a quoted string after `field:` within `block`, e.g. `id: "EM01"` -> `EM01`
+fn extract_quoted(block: string, field: string) -> string {
+    let key = field + ":"
+    let i = find_from(block, key, 0)
+    if i < 0 { return "" }
+    let q1 = find_from(block, "\"", i + len(key))
+    if q1 < 0 { return "" }
+    let q2 = find_from(block, "\"", q1 + 1)
+    if q2 < 0 { return "" }
+    return block.substring(q1 + 1, q2)
+}
+
+// Parse `success_keywords: ["a", "b", "c"]` into an array of strings.
+fn extract_kws(block: string) -> array {
+    let i = find_from(block, "success_keywords:", 0)
+    if i < 0 { return [] }
+    let lb = find_from(block, "[", i)
+    let rb = find_from(block, "]", lb + 1)
+    if lb < 0 || rb < 0 { return [] }
+    let inner = block.substring(lb + 1, rb)
+    let mut out = []
+    let n = len(inner)
+    let mut p = 0
+    while p < n {
+        let q1 = find_from(inner, "\"", p)
+        if q1 < 0 { return out }
+        let q2 = find_from(inner, "\"", q1 + 1)
+        if q2 < 0 { return out }
+        out = out.push(inner.substring(q1 + 1, q2))
+        p = q2 + 1
+    }
+    return out
+}
+
+fn load_tasks() -> array {
+    let raw = read_file(CORPUS_PATH)
+    let mut out = []
+    let n = len(raw)
+    let mut cursor = 0
+    while cursor < n {
+        let i = find_from(raw, "Task { id:", cursor)
+        if i < 0 { return out }
+        // Block ends at the next `})` close-call paren following success_keywords
+        let kw_idx = find_from(raw, "success_keywords:", i)
+        if kw_idx < 0 { return out }
+        let rb = find_from(raw, "]", kw_idx)
+        if rb < 0 { return out }
+        let block = raw.substring(i, rb + 1)
+        let id = extract_quoted(block, "id")
+        let domain = extract_quoted(block, "domain")
+        let diff = extract_quoted(block, "difficulty")
+        let prompt = extract_quoted(block, "prompt")
+        let kws = extract_kws(block)
+        if id != "" && domain != "" {
+            out = out.push(Task {
+                id: id, domain: domain, difficulty: diff,
+                prompt: prompt, keywords: kws
+            })
+        }
+        cursor = rb + 1
+    }
+    return out
+}
+
+// ── Stratify (mirror hire_sim_alm_runner.py) ──────────────────────────────
+
+fn collect_domains(tasks: array) -> array {
+    let mut domains = []
+    let mut i = 0
+    while i < len(tasks) {
+        let d = tasks[i].domain
+        let mut found = false
+        let mut k = 0
+        while k < len(domains) {
+            if domains[k] == d { found = true }
+            k = k + 1
+        }
+        if !found { domains = domains.push(d) }
+        i = i + 1
+    }
+    return domains
+}
+
+fn stratify(tasks: array, n: int) -> array {
+    let domains = collect_domains(tasks)
+    let dn = len(domains)
+    if dn == 0 { return [] }
+    let per = n / dn
+    let rem = n - per * dn
+    let mut out = []
+    let mut idx = 0
+    while idx < dn {
+        let dname = domains[idx]
+        let take = if idx < rem { per + 1 } else { per }
+        let mut taken = 0
+        let mut ti = 0
+        while ti < len(tasks) && taken < take {
+            if tasks[ti].domain == dname {
+                out = out.push(tasks[ti])
+                taken = taken + 1
+            }
+            ti = ti + 1
+        }
+        idx = idx + 1
+    }
+    // Trim to exactly n
+    let mut clipped = []
+    let mut c = 0
+    while c < len(out) && c < n {
+        clipped = clipped.push(out[c])
+        c = c + 1
+    }
+    return clipped
+}
+
+// ── Strict judge (mirror hire_sim_judge.hexa::judge) ──────────────────────
+
+fn min_chars_for(domain: string) -> int {
+    if domain == "code" { return 40 }
+    if domain == "schedule" { return 30 }
+    if domain == "research" { return 40 }
+    return 30
+}
+
+fn pick_rule(domain: string) -> string {
+    if domain == "code" { return "code_execution" }
+    if domain == "schedule" { return "numeric_tolerance" }
+    return "text_match"
+}
+
+fn count_char_any(s: string, chars: string) -> int {
+    let n = len(s)
+    let mut cnt = 0
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if chars.contains(ch) { cnt = cnt + 1 }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn looks_like_code(resp: string) -> bool {
+    if resp.contains("```") { return true }
+    let lo = resp.to_lower()
+    let keys = ["def ", "fn ", "function ", "class ", "import ", "return ",
+                "public ", "private ", "var ", "let ", "const ", "void "]
+    let mut ki = 0
+    while ki < len(keys) {
+        if lo.contains(keys[ki]) { return true }
+        ki = ki + 1
+    }
+    let ops = count_char_any(resp, "(){}=")
+    if ops >= 3 { return true }
+    return false
+}
+
+fn contains_digit(s: string) -> bool {
+    let digits = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+    let mut i = 0
+    while i < len(digits) {
+        if s.contains(digits[i]) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn build_detail(all_hit: bool, length_ok: bool, extra_ok: bool,
+                hits: int, total: int, actual_len: int, min_c: int,
+                extra_reason: string) -> string {
+    let mut s = ""
+    if all_hit {
+        s = s + "keywords=" + to_string(hits) + "/" + to_string(total)
+    } else {
+        s = s + "keyword_miss=" + to_string(hits) + "/" + to_string(total)
+    }
+    s = s + "; "
+    if length_ok {
+        s = s + "len=" + to_string(actual_len) + ">=" + to_string(min_c)
+    } else {
+        s = s + "too_short=" + to_string(actual_len) + "<" + to_string(min_c)
+    }
+    s = s + "; "
+    if extra_ok {
+        s = s + "extra=ok"
+    } else {
+        s = s + "extra_fail(" + extra_reason + ")"
+    }
+    return s
+}
+
+fn judge_strict(task: Task, actual: string, latency_ms: int, status: string) -> JudgeRow {
+    let lo = actual.to_lower()
+    let total = len(task.keywords)
+    let mut hits = 0
+    let mut i = 0
+    while i < total {
+        let kw = task.keywords[i].to_lower()
+        if lo.contains(kw) { hits = hits + 1 }
+        i = i + 1
+    }
+    let score = if total > 0 { to_float(hits) / to_float(total) } else { 0.0 }
+    let all_hit = hits == total
+    let min_c = min_chars_for(task.domain)
+    let length_ok = len(actual) >= min_c
+    let rule = pick_rule(task.domain)
+    let mut extra_ok = true
+    let mut extra_reason = ""
+    if rule == "code_execution" {
+        extra_ok = looks_like_code(actual)
+        if !extra_ok { extra_reason = "no code block / identifier density too low" }
+    } else if rule == "numeric_tolerance" {
+        extra_ok = contains_digit(actual)
+        if !extra_ok { extra_reason = "no numeric token" }
+    }
+    let completion = all_hit && length_ok && extra_ok
+    let detail = build_detail(all_hit, length_ok, extra_ok,
+                              hits, total, len(actual), min_c, extra_reason)
+    let preview_end = if len(actual) < 200 { len(actual) } else { 200 }
+    let preview = if len(actual) > 0 { actual.substring(0, preview_end) } else { "" }
+    return JudgeRow {
+        task_id: task.id,
+        domain: task.domain,
+        difficulty: task.difficulty,
+        rule: rule,
+        completion: completion,
+        hits: hits,
+        total: total,
+        score: score,
+        actual_len: len(actual),
+        detail: detail,
+        actual_preview: preview,
+        latency_ms: latency_ms,
+        net_status: status
+    }
+}
+
+// ── JSON helpers ─────────────────────────────────────────────────────────
+
+fn json_escape(s: string) -> string {
+    let n = len(s)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if ch == "\"" { out = out + "\\\"" }
+        else if ch == "\\" { out = out + "\\\\" }
+        else if ch == "\n" { out = out + "\\n" }
+        else if ch == "\r" { out = out + "\\r" }
+        else if ch == "\t" { out = out + "\\t" }
+        else { out = out + ch }
+        i = i + 1
+    }
+    return out
+}
+
+// Try "text" first then "output" then "response" then "generated".
+// Returns the value or empty string if none found.
+fn extract_output_field(json_raw: string) -> string {
+    let keys = ["text", "output", "response", "generated"]
+    let mut k = 0
+    while k < len(keys) {
+        let needle = "\"" + keys[k] + "\":"
+        let i = find_from(json_raw, needle, 0)
+        if i >= 0 {
+            // Skip whitespace then expect opening quote
+            let mut p = i + len(needle)
+            while p < len(json_raw) && json_raw.substring(p, p + 1) == " " {
+                p = p + 1
+            }
+            if p < len(json_raw) && json_raw.substring(p, p + 1) == "\"" {
+                // Find matching closing quote, honoring backslash-escapes.
+                let mut q = p + 1
+                let n = len(json_raw)
+                let mut buf = ""
+                while q < n {
+                    let ch = json_raw.substring(q, q + 1)
+                    if ch == "\\" && q + 1 < n {
+                        let nxt = json_raw.substring(q + 1, q + 2)
+                        if nxt == "n" { buf = buf + "\n" }
+                        else if nxt == "t" { buf = buf + "\t" }
+                        else if nxt == "r" { buf = buf + "\r" }
+                        else if nxt == "\"" { buf = buf + "\"" }
+                        else if nxt == "\\" { buf = buf + "\\" }
+                        else { buf = buf + nxt }
+                        q = q + 2
+                    } else if ch == "\"" {
+                        return buf
+                    } else {
+                        buf = buf + ch
+                        q = q + 1
+                    }
+                }
+            }
+        }
+        k = k + 1
+    }
+    return ""
+}
+
+// ── Endpoint call (curl via exec) ────────────────────────────────────────
+// Returns [actual_text, status_string, latency_ms_string] as 3-element array
+// to avoid hexa multi-float struct return bug.
+
+struct EndpointResult {
+    text: string,
+    status: string,
+    latency_ms: int
+}
+
+fn call_endpoint(task: Task) -> EndpointResult {
+    if MOCK == "1" || ENDPOINT == "" {
+        // Mock: return a string that hits all keywords + extra rules so the
+        // pipeline produces a non-empty report on smoke runs.
+        let mut mocked = "MOCK reply for " + task.id + " in " + task.domain + ": "
+        let mut k = 0
+        while k < len(task.keywords) {
+            mocked = mocked + task.keywords[k] + " "
+            k = k + 1
+        }
+        // Pad length
+        mocked = mocked + " ----- mock body padding to clear domain length floors. "
+        // Add code-block + digits to satisfy code/schedule extras universally.
+        mocked = mocked + "\n```\nfn mock() { return 42; }\n```\n"
+        return EndpointResult { text: mocked, status: "mock", latency_ms: 1 }
+    }
+    let body = "{\"task_id\":\"" + json_escape(task.id) + "\",\"prompt\":\""
+               + json_escape(task.prompt) + "\"}"
+    // Curl to a temp file so we capture response without shell quoting issues
+    // around payload bodies.
+    let body_file = "/tmp/_hire_sim_body_" + task.id + ".json"
+    write_file(body_file, body)
+    let resp_file = "/tmp/_hire_sim_resp_" + task.id + ".txt"
+    let cmd = "curl -s -m " + to_string(TIMEOUT)
+            + " -X POST -H 'Content-Type: application/json'"
+            + " -H 'User-Agent: curl/8.7.1' -H 'Accept: */*'"
+            + " --data @" + body_file
+            + " -o " + resp_file
+            + " -w '%{http_code} %{time_total}'"
+            + " " + ENDPOINT
+            + " 2>/dev/null"
+    let meta = exec(cmd).trim()
+    let raw = read_file(resp_file)
+    // Parse "<http_code> <time_seconds>"
+    let mut http_code = ""
+    let mut time_s = "0"
+    let sp = find_from(meta, " ", 0)
+    if sp > 0 {
+        http_code = meta.substring(0, sp)
+        time_s = meta.substring(sp + 1, len(meta))
+    }
+    let latency_ms = to_int(to_float(time_s) * 1000.0)
+    if raw == "" {
+        return EndpointResult { text: "", status: "ERR:empty:" + http_code,
+                                 latency_ms: latency_ms }
+    }
+    let extracted = extract_output_field(raw)
+    if extracted != "" {
+        return EndpointResult { text: extracted, status: "ok",
+                                 latency_ms: latency_ms }
+    }
+    // No known key — return raw body so judge can still grade against it
+    return EndpointResult { text: raw, status: "no-known-key",
+                             latency_ms: latency_ms }
+}
+
+// ── Aggregation ──────────────────────────────────────────────────────────
+
+fn idx_in(arr: array, key: string) -> int {
+    let mut i = 0
+    while i < len(arr) {
+        if arr[i] == key { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn replace_int_at(arr: array, idx: int, val: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(arr) {
+        if i == idx { out = out.push(val) } else { out = out.push(arr[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+fn replace_float_at(arr: array, idx: int, val: float) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(arr) {
+        if i == idx { out = out.push(val) } else { out = out.push(arr[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Report writer ────────────────────────────────────────────────────────
+
+fn fmt_pct(num: int, denom: int) -> string {
+    if denom == 0 { return "0.0000" }
+    let r = to_float(num) / to_float(denom)
+    return to_string(r)
+}
+
+fn fmt_avg_f(sum: float, denom: int) -> string {
+    if denom == 0 { return "0.0000" }
+    let r = sum / to_float(denom)
+    return to_string(r)
+}
+
+fn write_report(rows: array, n_total: int, started_iso: string) {
+    let n = len(rows)
+    let mut completed = 0
+    let mut score_sum = 0.0
+    let mut i = 0
+    while i < n {
+        if rows[i].completion { completed = completed + 1 }
+        score_sum = score_sum + rows[i].score
+        i = i + 1
+    }
+    let completion_rate = if n > 0 { to_float(completed) / to_float(n) } else { 0.0 }
+    let avg_score = if n > 0 { score_sum / to_float(n) } else { 0.0 }
+
+    // Per-domain accumulators (parallel arrays)
+    let mut d_names = []
+    let mut d_n = []
+    let mut d_done = []
+    let mut d_score = []
+    let mut r = 0
+    while r < n {
+        let row = rows[r]
+        let pos = idx_in(d_names, row.domain)
+        if pos < 0 {
+            d_names = d_names.push(row.domain)
+            d_n = d_n.push(1)
+            d_done = d_done.push(if row.completion { 1 } else { 0 })
+            d_score = d_score.push(row.score)
+        } else {
+            d_n = replace_int_at(d_n, pos, d_n[pos] + 1)
+            let inc = if row.completion { 1 } else { 0 }
+            d_done = replace_int_at(d_done, pos, d_done[pos] + inc)
+            d_score = replace_float_at(d_score, pos, d_score[pos] + row.score)
+        }
+        r = r + 1
+    }
+
+    let alm_pass_85 = completion_rate >= 0.85
+    let clm_pass_80 = completion_rate >= 0.80
+    let mut verdict = "BLOCKED_<0.60"
+    if alm_pass_85 { verdict = "PASS_ALM_0.85" }
+    else if clm_pass_80 { verdict = "PASS_CLM_0.80" }
+    else if completion_rate >= 0.60 { verdict = "CLOSE_0.60-0.80" }
+
+    // ── Build JSON ───────────────────────────────────────────────────
+    let mut j = "{\n"
+    j = j + "  \"ts_utc\": \"" + json_escape(started_iso) + "\",\n"
+    j = j + "  \"path\": \"baseline_strict\",\n"
+    j = j + "  \"endpoint\": \"" + json_escape(ENDPOINT) + "\",\n"
+    j = j + "  \"judge_mode\": \"deterministic_keyword (hire_sim_judge.hexa mirror)\",\n"
+    j = j + "  \"n_tasks\": " + to_string(n) + ",\n"
+    j = j + "  \"n_total_corpus\": " + to_string(n_total) + ",\n"
+    j = j + "  \"completion_rate\": " + to_string(completion_rate) + ",\n"
+    j = j + "  \"avg_score\": " + to_string(avg_score) + ",\n"
+    j = j + "  \"completed_count\": " + to_string(completed) + ",\n"
+    j = j + "  \"by_domain\": {\n"
+    let mut k = 0
+    while k < len(d_names) {
+        let nn = d_n[k]
+        let dd = d_done[k]
+        let ss = d_score[k]
+        let rate_s = fmt_pct(dd, nn)
+        let avg_s = fmt_avg_f(ss, nn)
+        j = j + "    \"" + json_escape(d_names[k]) + "\": {"
+        j = j + "\"n\": " + to_string(nn)
+        j = j + ", \"completed\": " + to_string(dd)
+        j = j + ", \"completion_rate\": " + rate_s
+        j = j + ", \"avg_score\": " + avg_s + "}"
+        if k + 1 < len(d_names) { j = j + "," }
+        j = j + "\n"
+        k = k + 1
+    }
+    j = j + "  },\n"
+    j = j + "  \"gates\": {\"alm_0.85\": " + (if alm_pass_85 { "true" } else { "false" })
+    j = j + ", \"clm_0.80\": " + (if clm_pass_80 { "true" } else { "false" })
+    j = j + ", \"verdict\": \"" + verdict + "\"},\n"
+    j = j + "  \"per_task\": [\n"
+    let mut p = 0
+    while p < n {
+        let row = rows[p]
+        j = j + "    {\"task_id\": \"" + json_escape(row.task_id) + "\""
+        j = j + ", \"domain\": \"" + json_escape(row.domain) + "\""
+        j = j + ", \"difficulty\": \"" + json_escape(row.difficulty) + "\""
+        j = j + ", \"rule\": \"" + json_escape(row.rule) + "\""
+        j = j + ", \"completion\": " + (if row.completion { "true" } else { "false" })
+        j = j + ", \"hits\": " + to_string(row.hits)
+        j = j + ", \"total\": " + to_string(row.total)
+        j = j + ", \"score\": " + to_string(row.score)
+        j = j + ", \"actual_len\": " + to_string(row.actual_len)
+        j = j + ", \"latency_ms\": " + to_string(row.latency_ms)
+        j = j + ", \"net_status\": \"" + json_escape(row.net_status) + "\""
+        j = j + ", \"detail\": \"" + json_escape(row.detail) + "\""
+        j = j + ", \"actual_preview\": \"" + json_escape(row.actual_preview) + "\"}"
+        if p + 1 < n { j = j + "," }
+        j = j + "\n"
+        p = p + 1
+    }
+    j = j + "  ]\n}\n"
+    write_file(OUTPUT, j)
+
+    // ── Console summary ─────────────────────────────────────────────
+    println("")
+    println("=== RESULTS (baseline strict) ===")
+    println("  completion_rate : " + to_string(completion_rate)
+            + " (" + to_string(completed) + "/" + to_string(n) + ")")
+    println("  avg_score       : " + to_string(avg_score))
+    println("  ALM gate 0.85   : " + (if alm_pass_85 { "PASS" } else { "FAIL" }))
+    println("  CLM gate 0.80   : " + (if clm_pass_80 { "PASS" } else { "FAIL" }))
+    println("  verdict         : " + verdict)
+    println("  by_domain:")
+    let mut q = 0
+    while q < len(d_names) {
+        println("    " + d_names[q]
+                + " n=" + to_string(d_n[q])
+                + " done=" + to_string(d_done[q])
+                + " rate=" + fmt_pct(d_done[q], d_n[q])
+                + " avg=" + fmt_avg_f(d_score[q], d_n[q]))
+        q = q + 1
+    }
+    println("  report: " + OUTPUT)
+}
+
+// ── Main ────────────────────────────────────────────────────────────────
+
+fn now_iso() -> string {
+    return exec("date -u '+%Y-%m-%dT%H:%M:%SZ'").trim()
+}
+
+fn main() {
+    println("=== hire_sim baseline (Path E strict deterministic) ===")
+    println("endpoint : " + (if ENDPOINT == "" { "<MOCK>" } else { ENDPOINT }))
+    println("output   : " + OUTPUT)
+    println("max_tasks: " + to_string(MAX_TASKS))
+    println("corpus   : " + CORPUS_PATH)
+    let tasks_all = load_tasks()
+    println("loaded " + to_string(len(tasks_all)) + " tasks from corpus")
+    let stratified = stratify(tasks_all, MAX_TASKS)
+    println("stratified -> " + to_string(len(stratified)) + " tasks")
+    println("")
+    let started = now_iso()
+    let mut rows = []
+    let mut i = 0
+    while i < len(stratified) {
+        let t = stratified[i]
+        let r = call_endpoint(t)
+        let row = judge_strict(t, r.text, r.latency_ms, r.status)
+        rows = rows.push(row)
+        let flag = if row.completion { "OK " } else { "XX " }
+        println("  [" + to_string(i + 1) + "/" + to_string(len(stratified)) + "] "
+                + flag + t.id + " [" + t.domain + "/" + t.difficulty + "]"
+                + " score=" + to_string(row.score)
+                + " hits=" + to_string(row.hits) + "/" + to_string(row.total)
+                + " len=" + to_string(row.actual_len)
+                + "  " + row.detail)
+        i = i + 1
+    }
+    write_report(rows, len(tasks_all), started)
+}
+
+main()
