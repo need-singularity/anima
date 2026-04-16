@@ -141,6 +141,68 @@ fn mock_weight_identity(in_dim: int, out_dim: int) -> [float] {
 }
 
 // ════════════════════════════════════════════════════════════════════
+// Section 2b. Checkpoint loader — W_ctrl from ckpt_w_ctrl.json
+//
+// JSON format: {"data": [f0, f1, ...]} — 4608 floats row-major.
+// Falls back to mock_weight_identity if file missing or parse fails.
+// ════════════════════════════════════════════════════════════════════
+
+fn load_w_ctrl(path: string) -> [float] {
+    let raw = read_file(path)
+    if len(raw) < 10 {
+        println("[neural_vocoder] no checkpoint at " + path + " — using mock weights")
+        return mock_weight_identity(LATENT_DIM, CTRL_DIM)
+    }
+    // Find "data": [ ... ] — extract the array of floats
+    let marker = "\"data\": ["
+    let pos = raw.index_of(marker)
+    if pos < 0 {
+        println("[neural_vocoder] checkpoint parse fail — using mock weights")
+        return mock_weight_identity(LATENT_DIM, CTRL_DIM)
+    }
+    let start = pos + len(marker)
+    // Find closing ']' by scanning from start (no 2-arg index_of in stage0)
+    let tail = raw.substring(start, len(raw))
+    let end_pos = tail.index_of("]")
+    if end_pos < 0 {
+        return mock_weight_identity(LATENT_DIM, CTRL_DIM)
+    }
+    // Parse comma-separated floats
+    let nums_str = tail.substring(0, end_pos)
+    let mut W = []
+    let mut buf = ""
+    let mut i = 0
+    let slen = len(nums_str)
+    while i < slen {
+        let c = nums_str.substring(i, i + 1)
+        if c == "," {
+            if len(buf) > 0 {
+                let v = parse_float(buf)
+                W = W + [v]
+                buf = ""
+            }
+        } else if c == " " || c == "\n" || c == "\r" || c == "\t" {
+            // skip whitespace
+        } else {
+            buf = buf + c
+        }
+        i = i + 1
+    }
+    // Last value
+    if len(buf) > 0 {
+        let v = parse_float(buf)
+        W = W + [v]
+    }
+    if len(W) != CTRL_DIM * LATENT_DIM {
+        println("[neural_vocoder] checkpoint size mismatch: " + to_string(len(W))
+                + " expected " + to_string(CTRL_DIM * LATENT_DIM) + " — using mock")
+        return mock_weight_identity(LATENT_DIM, CTRL_DIM)
+    }
+    println("[neural_vocoder] loaded W_ctrl from " + path + " (" + to_string(len(W)) + " params)")
+    return W
+}
+
+// ════════════════════════════════════════════════════════════════════
 // Section 3. Stage A — Latent → control signals
 // ════════════════════════════════════════════════════════════════════
 
@@ -305,9 +367,9 @@ fn decode_wave(latent_frames: [[float]], sample_rate: int) -> [float] {
     }
 
     // ── Stage A: latent → ctrl per frame ──
-    // Mock-weight identity until trained weights load. Production
-    // path will load W from a checkpoint via load_weights() (TODO).
-    let W_ctrl = mock_weight_identity(LATENT_DIM, CTRL_DIM)
+    // Load trained W_ctrl from checkpoint; fallback to mock-weight identity.
+    let ckpt_path = env("SPEAK_CKPT_W_CTRL")
+    let W_ctrl = if ckpt_path != "" { load_w_ctrl(ckpt_path) } else { load_w_ctrl("anima-speak/ckpt_w_ctrl.json") }
 
     let mut ctrl_frames = []
     let mut f = 0
