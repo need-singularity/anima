@@ -2452,7 +2452,9 @@ HexaVal gpu_embed_lookup_fwd(HexaVal W_dev, HexaVal toks_dev, HexaVal out_dev, H
 
 HexaVal gpu_rms_norm_fwd(HexaVal x_dev, HexaVal g_dev, HexaVal out_dev, HexaVal rstd_dev, HexaVal N, HexaVal D, HexaVal eps) {
     HexaVal args = hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_new(), _arg_ptr(x_dev)), _arg_ptr(g_dev)), _arg_ptr(out_dev)), _arg_ptr(rstd_dev)), _arg_i32(N)), _arg_i32(D)), _arg_f32(eps));
-    HexaVal st = rtc_launch_shmem(G_K_rms_norm_fwd, N, hexa_int(1), hexa_int(1), D, hexa_int(1), hexa_int(1), hexa_mul(D, hexa_int(4)), args);
+    // Cap blockDim at 1024 (CUDA max) — kernel uses loop for D>blockDim
+    HexaVal blk = (D.i > 1024) ? hexa_int(1024) : D;
+    HexaVal st = rtc_launch_shmem(G_K_rms_norm_fwd, N, hexa_int(1), hexa_int(1), blk, hexa_int(1), hexa_int(1), hexa_mul(D, hexa_int(4)), args);
     HexaVal _ = _free_args(args);
     return st;
 }
@@ -2460,7 +2462,7 @@ HexaVal gpu_rms_norm_fwd(HexaVal x_dev, HexaVal g_dev, HexaVal out_dev, HexaVal 
 
 HexaVal gpu_softmax_rows_fwd(HexaVal x_dev, HexaVal out_dev, HexaVal R, HexaVal C, HexaVal causal_int) {
     HexaVal args = hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_new(), _arg_ptr(x_dev)), _arg_ptr(out_dev)), _arg_i32(R)), _arg_i32(C)), _arg_i32(causal_int));
-    HexaVal st = rtc_launch_shmem(G_K_softmax_rows_fwd, R, hexa_int(1), hexa_int(1), C, hexa_int(1), hexa_int(1), hexa_mul(C, hexa_int(4)), args);
+    HexaVal st = rtc_launch_shmem(G_K_softmax_rows_fwd, R, hexa_int(1), hexa_int(1), (C.i>1024?hexa_int(1024):C), hexa_int(1), hexa_int(1), hexa_mul(C, hexa_int(4)), args);
     HexaVal _ = _free_args(args);
     return st;
 }
@@ -2518,7 +2520,7 @@ HexaVal gpu_embed_lookup_bwd(HexaVal dy_dev, HexaVal toks_dev, HexaVal dW_dev, H
 
 HexaVal gpu_rms_norm_bwd(HexaVal x_dev, HexaVal g_dev, HexaVal dy_dev, HexaVal rstd_dev, HexaVal dx_dev, HexaVal dg_partial_dev, HexaVal N, HexaVal D, HexaVal eps) {
     HexaVal args = hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_new(), _arg_ptr(x_dev)), _arg_ptr(g_dev)), _arg_ptr(dy_dev)), _arg_ptr(rstd_dev)), _arg_ptr(dx_dev)), _arg_ptr(dg_partial_dev)), _arg_i32(N)), _arg_i32(D)), _arg_f32(eps));
-    HexaVal st = rtc_launch_shmem(G_K_rms_norm_bwd, N, hexa_int(1), hexa_int(1), D, hexa_int(1), hexa_int(1), hexa_mul(D, hexa_int(4)), args);
+    HexaVal st = rtc_launch_shmem(G_K_rms_norm_bwd, N, hexa_int(1), hexa_int(1), (D.i>1024?hexa_int(1024):D), hexa_int(1), hexa_int(1), hexa_mul(D, hexa_int(4)), args);
     HexaVal _ = _free_args(args);
     return st;
 }
@@ -2526,7 +2528,7 @@ HexaVal gpu_rms_norm_bwd(HexaVal x_dev, HexaVal g_dev, HexaVal dy_dev, HexaVal r
 
 HexaVal gpu_softmax_rows_bwd(HexaVal probs_dev, HexaVal dp_dev, HexaVal ds_dev, HexaVal R, HexaVal C) {
     HexaVal args = hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_new(), _arg_ptr(probs_dev)), _arg_ptr(dp_dev)), _arg_ptr(ds_dev)), _arg_i32(R)), _arg_i32(C));
-    HexaVal st = rtc_launch_shmem(G_K_softmax_rows_bwd, R, hexa_int(1), hexa_int(1), C, hexa_int(1), hexa_int(1), hexa_mul(C, hexa_int(4)), args);
+    HexaVal st = rtc_launch_shmem(G_K_softmax_rows_bwd, R, hexa_int(1), hexa_int(1), (C.i>1024?hexa_int(1024):C), hexa_int(1), hexa_int(1), hexa_mul(C, hexa_int(4)), args);
     HexaVal _ = _free_args(args);
     return st;
 }
@@ -2546,7 +2548,7 @@ HexaVal gpu_ce_loss_grad(HexaVal logits_dev, HexaVal targets_dev, HexaVal loss_o
     HexaVal _ = hexa_void();
     _ = cuda_memset_zero(loss_out_dev, hexa_int(4));
     HexaVal args = hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_new(), _arg_ptr(logits_dev)), _arg_ptr(targets_dev)), _arg_ptr(loss_out_dev)), _arg_ptr(dlogits_dev)), _arg_i32(R)), _arg_i32(C));
-    HexaVal st = rtc_launch_shmem(G_K_ce_loss_grad, R, hexa_int(1), hexa_int(1), C, hexa_int(1), hexa_int(1), hexa_mul(C, hexa_int(4)), args);
+    HexaVal st = rtc_launch_shmem(G_K_ce_loss_grad, R, hexa_int(1), hexa_int(1), (C.i>1024?hexa_int(1024):C), hexa_int(1), hexa_int(1), hexa_mul(C, hexa_int(4)), args);
     _ = _free_args(args);
     if (hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(st, hexa_int(0)))))) {
         hexa_println(hexa_add(hexa_str("[cuda_kernels] ce_loss_grad launch failed: "), hexa_to_string(st)));
@@ -2564,7 +2566,7 @@ HexaVal gpu_ce_loss_grad(HexaVal logits_dev, HexaVal targets_dev, HexaVal loss_o
 
 HexaVal gpu_fused_pre_attn_fwd(HexaVal x_dev, HexaVal ga_dev, HexaVal norm1_dev, HexaVal rstd1_dev, HexaVal N, HexaVal D, HexaVal eps) {
     HexaVal args = hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_new(), _arg_ptr(x_dev)), _arg_ptr(ga_dev)), _arg_ptr(norm1_dev)), _arg_ptr(rstd1_dev)), _arg_i32(N)), _arg_i32(D)), _arg_f32(eps));
-    HexaVal st = rtc_launch_shmem(G_K_fused_pre_attn_fwd, N, hexa_int(1), hexa_int(1), D, hexa_int(1), hexa_int(1), hexa_mul(D, hexa_int(4)), args);
+    HexaVal st = rtc_launch_shmem(G_K_fused_pre_attn_fwd, N, hexa_int(1), hexa_int(1), (D.i>1024?hexa_int(1024):D), hexa_int(1), hexa_int(1), hexa_mul(D, hexa_int(4)), args);
     HexaVal _ = _free_args(args);
     return st;
 }
@@ -2572,7 +2574,7 @@ HexaVal gpu_fused_pre_attn_fwd(HexaVal x_dev, HexaVal ga_dev, HexaVal norm1_dev,
 
 HexaVal gpu_fused_attn_post_fwd(HexaVal scores_dev, HexaVal probs_dev, HexaVal R, HexaVal C, HexaVal inv_sqrt_d) {
     HexaVal args = hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_new(), _arg_ptr(scores_dev)), _arg_ptr(probs_dev)), _arg_i32(R)), _arg_i32(C)), _arg_f32(inv_sqrt_d));
-    HexaVal st = rtc_launch_shmem(G_K_fused_attn_post_fwd, R, hexa_int(1), hexa_int(1), C, hexa_int(1), hexa_int(1), hexa_mul(C, hexa_int(4)), args);
+    HexaVal st = rtc_launch_shmem(G_K_fused_attn_post_fwd, R, hexa_int(1), hexa_int(1), (C.i>1024?hexa_int(1024):C), hexa_int(1), hexa_int(1), hexa_mul(C, hexa_int(4)), args);
     HexaVal _ = _free_args(args);
     return st;
 }
@@ -2580,7 +2582,7 @@ HexaVal gpu_fused_attn_post_fwd(HexaVal scores_dev, HexaVal probs_dev, HexaVal R
 
 HexaVal gpu_fused_mid_ffn_fwd(HexaVal x_dev, HexaVal attn_out_dev, HexaVal gf_dev, HexaVal mid_dev, HexaVal norm2_dev, HexaVal rstd2_dev, HexaVal N, HexaVal D, HexaVal eps) {
     HexaVal args = hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_new(), _arg_ptr(x_dev)), _arg_ptr(attn_out_dev)), _arg_ptr(gf_dev)), _arg_ptr(mid_dev)), _arg_ptr(norm2_dev)), _arg_ptr(rstd2_dev)), _arg_i32(N)), _arg_i32(D)), _arg_f32(eps));
-    HexaVal st = rtc_launch_shmem(G_K_fused_mid_ffn_fwd, N, hexa_int(1), hexa_int(1), D, hexa_int(1), hexa_int(1), hexa_mul(D, hexa_int(4)), args);
+    HexaVal st = rtc_launch_shmem(G_K_fused_mid_ffn_fwd, N, hexa_int(1), hexa_int(1), (D.i>1024?hexa_int(1024):D), hexa_int(1), hexa_int(1), hexa_mul(D, hexa_int(4)), args);
     HexaVal _ = _free_args(args);
     return st;
 }
@@ -2608,7 +2610,7 @@ HexaVal gpu_fused_swiglu_merge_bwd(HexaVal up_dev, HexaVal gate_dev, HexaVal dy_
 
 HexaVal gpu_fused_mid_ffn_bwd(HexaVal mid_dev, HexaVal gf_dev, HexaVal dnorm2_dev, HexaVal rstd2_dev, HexaVal dy_dev, HexaVal dmid_dev, HexaVal dgf_dev, HexaVal N, HexaVal D, HexaVal eps) {
     HexaVal args = hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_new(), _arg_ptr(mid_dev)), _arg_ptr(gf_dev)), _arg_ptr(dnorm2_dev)), _arg_ptr(rstd2_dev)), _arg_ptr(dy_dev)), _arg_ptr(dmid_dev)), _arg_ptr(dgf_dev)), _arg_i32(N)), _arg_i32(D)), _arg_f32(eps));
-    HexaVal st = rtc_launch_shmem(G_K_fused_mid_ffn_bwd, N, hexa_int(1), hexa_int(1), D, hexa_int(1), hexa_int(1), hexa_mul(D, hexa_int(4)), args);
+    HexaVal st = rtc_launch_shmem(G_K_fused_mid_ffn_bwd, N, hexa_int(1), hexa_int(1), (D.i>1024?hexa_int(1024):D), hexa_int(1), hexa_int(1), hexa_mul(D, hexa_int(4)), args);
     HexaVal _ = _free_args(args);
     return st;
 }
@@ -2616,7 +2618,7 @@ HexaVal gpu_fused_mid_ffn_bwd(HexaVal mid_dev, HexaVal gf_dev, HexaVal dnorm2_de
 
 HexaVal gpu_fused_attn_post_bwd(HexaVal probs_dev, HexaVal dp_dev, HexaVal dscores_dev, HexaVal R, HexaVal C, HexaVal inv_sqrt_d) {
     HexaVal args = hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_new(), _arg_ptr(probs_dev)), _arg_ptr(dp_dev)), _arg_ptr(dscores_dev)), _arg_i32(R)), _arg_i32(C)), _arg_f32(inv_sqrt_d));
-    HexaVal st = rtc_launch_shmem(G_K_fused_attn_post_bwd, R, hexa_int(1), hexa_int(1), C, hexa_int(1), hexa_int(1), hexa_mul(C, hexa_int(4)), args);
+    HexaVal st = rtc_launch_shmem(G_K_fused_attn_post_bwd, R, hexa_int(1), hexa_int(1), (C.i>1024?hexa_int(1024):C), hexa_int(1), hexa_int(1), hexa_mul(C, hexa_int(4)), args);
     HexaVal _ = _free_args(args);
     return st;
 }
@@ -2624,7 +2626,7 @@ HexaVal gpu_fused_attn_post_bwd(HexaVal probs_dev, HexaVal dp_dev, HexaVal dscor
 
 HexaVal gpu_fused_pre_attn_bwd(HexaVal x_dev, HexaVal ga_dev, HexaVal dnorm1_dev, HexaVal rstd1_dev, HexaVal dmid_dev, HexaVal dx_dev, HexaVal dga_dev, HexaVal N, HexaVal D, HexaVal eps) {
     HexaVal args = hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_new(), _arg_ptr(x_dev)), _arg_ptr(ga_dev)), _arg_ptr(dnorm1_dev)), _arg_ptr(rstd1_dev)), _arg_ptr(dmid_dev)), _arg_ptr(dx_dev)), _arg_ptr(dga_dev)), _arg_i32(N)), _arg_i32(D)), _arg_f32(eps));
-    HexaVal st = rtc_launch_shmem(G_K_fused_pre_attn_bwd, N, hexa_int(1), hexa_int(1), D, hexa_int(1), hexa_int(1), hexa_mul(D, hexa_int(4)), args);
+    HexaVal st = rtc_launch_shmem(G_K_fused_pre_attn_bwd, N, hexa_int(1), hexa_int(1), (D.i>1024?hexa_int(1024):D), hexa_int(1), hexa_int(1), hexa_mul(D, hexa_int(4)), args);
     HexaVal _ = _free_args(args);
     return st;
 }
@@ -4509,8 +4511,10 @@ int main(int argc, char** argv) {
     /* import: cuda_ffi */
     /* import: cuda_rtc */
     K_EMBED_LOOKUP = hexa_str("extern \"C\" __global__ void embed_lookup(const float* W, const int* toks, float* out, int V, int D, int N) {\n    int n = blockIdx.x * blockDim.x + threadIdx.x;\n    int d = blockIdx.y * blockDim.y + threadIdx.y;\n    if (n >= N || d >= D) return;\n    int t = toks[n];\n    out[n * D + d] = W[t * D + d];\n}\n");
-    K_RMS_NORM_FWD = hexa_str("extern \"C\" __global__ void rms_norm_fwd(const float* x, const float* g, float* out, float* rstd, int N, int D, float eps) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= N || tid >= D) return;\n    extern __shared__ float sdata[];\n    float v = x[row * D + tid];\n    sdata[tid] = v * v;\n    __syncthreads();\n    // tree reduction (D <= 1024, blockDim.x == D)\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid + s];\n        __syncthreads();\n    }\n    float ms = sdata[0] / (float)D;\n    float r  = rsqrtf(ms + eps);\n    if (tid == 0) rstd[row] = r;\n    out[row * D + tid] = v * r * g[tid];\n}\n");
-    K_SOFTMAX_ROWS_FWD = hexa_str("extern \"C\" __global__ void softmax_rows_fwd(const float* x, float* out, int R, int C, int causal) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= R || tid >= C) return;\n    extern __shared__ float sdata[];\n    float v = x[row * C + tid];\n    if (causal != 0 && tid > row) v = -1e30f;\n    sdata[tid] = v;\n    __syncthreads();\n    // max reduction\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) {\n            float a = sdata[tid];\n            float b = sdata[tid + s];\n            sdata[tid] = a > b ? a : b;\n        }\n        __syncthreads();\n    }\n    float mx = sdata[0];\n    __syncthreads();\n    float e = expf(v - mx);\n    sdata[tid] = e;\n    __syncthreads();\n    // sum reduction\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid + s];\n        __syncthreads();\n    }\n    float sum = sdata[0];\n    out[row * C + tid] = e / sum;\n}\n");
+    // D>1024 safe: stride loop pattern
+    K_RMS_NORM_FWD = hexa_str("extern \"C\" __global__ void rms_norm_fwd(const float* x, const float* g, float* out, float* rstd, int N, int D, float eps) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= N) return;\n    extern __shared__ float sdata[];\n    float sum_sq = 0.0f;\n    for (int i = tid; i < D; i += blockDim.x) { float v = x[row*D+i]; sum_sq += v*v; }\n    sdata[tid] = sum_sq;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid + s];\n        __syncthreads();\n    }\n    float ms = sdata[0] / (float)D;\n    float r = rsqrtf(ms + eps);\n    if (tid == 0) rstd[row] = r;\n    for (int i = tid; i < D; i += blockDim.x) { out[row*D+i] = x[row*D+i] * r * g[i]; }\n}\n");
+    // C>1024 safe: stride loop for max/sum reductions
+    K_SOFTMAX_ROWS_FWD = hexa_str("extern \"C\" __global__ void softmax_rows_fwd(const float* x, float* out, int R, int C, int causal) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= R) return;\n    extern __shared__ float sdata[];\n    float local_max = -1e30f;\n    for (int i = tid; i < C; i += blockDim.x) {\n        float v = x[row*C+i];\n        if (causal != 0 && i > row) v = -1e30f;\n        if (v > local_max) local_max = v;\n    }\n    sdata[tid] = local_max;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) { float b=sdata[tid+s]; if(b>sdata[tid]) sdata[tid]=b; }\n        __syncthreads();\n    }\n    float mx = sdata[0];\n    __syncthreads();\n    float local_sum = 0.0f;\n    for (int i = tid; i < C; i += blockDim.x) {\n        float v = x[row*C+i];\n        if (causal != 0 && i > row) v = -1e30f;\n        local_sum += expf(v - mx);\n    }\n    sdata[tid] = local_sum;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid+s];\n        __syncthreads();\n    }\n    float sum = sdata[0];\n    for (int i = tid; i < C; i += blockDim.x) {\n        float v = x[row*C+i];\n        if (causal != 0 && i > row) v = -1e30f;\n        out[row*C+i] = expf(v - mx) / sum;\n    }\n}\n");
     K_SWIGLU_FWD = hexa_str("extern \"C\" __global__ void swiglu_fwd(const float* up, const float* gate, float* out, int N) {\n    int i = blockIdx.x * blockDim.x + threadIdx.x;\n    if (i >= N) return;\n    float g = gate[i];\n    float s = 1.0f / (1.0f + expf(-g));\n    out[i] = up[i] * s;\n}\n");
     K_ADD_INPLACE = hexa_str("extern \"C\" __global__ void add_inplace(float* a, const float* b, int N) {\n    int i = blockIdx.x * blockDim.x + threadIdx.x;\n    if (i >= N) return;\n    a[i] = a[i] + b[i];\n}\n");
     K_MUL_SCALAR = hexa_str("extern \"C\" __global__ void mul_scalar(const float* a, float s, float* out, int N) {\n    int i = blockIdx.x * blockDim.x + threadIdx.x;\n    if (i >= N) return;\n    out[i] = a[i] * s;\n}\n");
