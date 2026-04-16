@@ -477,7 +477,7 @@ def train(args):
 
     if device.type == "cuda":
         gpu_name = torch.cuda.get_device_name(0)
-        vram_gb = torch.cuda.get_device_properties(0).total_mem / 1e9
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
         print(f"[train] GPU: {gpu_name}, VRAM: {vram_gb:.1f} GB", flush=True)
         # Verify H100 or compatible
         if "H100" not in gpu_name and not args.force_gpu:
