@@ -1,0 +1,66 @@
+{
+  "_meta": {
+    "name": "ALM 14B r11 LoRA — r10 regression fix plan",
+    "ts_utc": "2026-04-16T11:05:00Z",
+    "status": "STAGED — awaiting GPU (current 2 H100s used: serve + clm-r4)",
+    "based_on": "training/deploy/alm_r10_regression_diagnosis.json"
+  },
+  "goal": {
+    "primary": "Beat r9 lenient baseline 0.8667 on hire_sim without regressing free-form domains",
+    "secondary": "Maintain conversational fluency (Likert mean ≥ r9)",
+    "non_goal": "Push hire_sim ≥ 0.95 — diminishing returns, focus on robustness"
+  },
+  "training_parameters": {
+    "base_lora": "/runpod/ckpt_r9 (NOT r10 — start fresh from r9 best)",
+    "lr": "5e-7",
+    "lr_rationale": "4× lower than r10 (2e-6). Stack-on-LoRA training amplifies effective lr; r10 EMA stayed at 7.84 (model diverging). 5e-7 should converge instead of diverge.",
+    "steps": 500,
+    "steps_rationale": "3× shorter than r10. r10's 1500 steps × 100-task corpus = ~15 epochs of memorization. 500 steps × mixed corpus = ~1.5 epochs, gentler.",
+    "warmup": 50,
+    "lora_r": 8,
+    "lora_alpha": 16,
+    "lora_rationale": "Half of r10's r=16/alpha=32. Smaller rank constrains drift. 8/16 is industry-default for fine-tuning instruct models.",
+    "batch": 4,
+    "seq": 1024,
+    "save_every": 100,
+    "eval_every": 100,
+    "patience": 5
+  },
+  "corpus_design": {
+    "mix_ratio": {"korean_general_conversation": 0.8, "hire_sim_tasks": 0.2},
+    "korean_general_sources": [
+      "anima-agent/training/corpora/korean_dialogue.txt (if exists, else need to create)",
+      "Public KO datasets: KMMLU instructions, NSMC, Korean dialogue from huggingface"
+    ],
+    "hire_sim_subset": "hire_sim_100.hexa first 20 tasks (NOT 100, prevent over-rep)",
+    "preprocessing": [
+      "Dedup by hash",
+      "Length filter: 50-2000 chars per sample",
+      "Token cap: total ~5000 samples × 800 tokens avg = 4M tokens"
+    ]
+  },
+  "expected_metrics": {
+    "final_loss_target": "≤ 3.0 (vs base ~2.0, vs r10 7.82)",
+    "loss_trace_check": "step 100 loss should be ≤ 5.0 — if higher, abort and retune lr",
+    "hire_sim_lenient": "≥ 0.85 (match r9, no regression)",
+    "likert_mean": "≥ 5.0 (subjective, dev-set sample)"
+  },
+  "abort_criteria": [
+    "loss > 6.0 at step 200 → kill, lr too high",
+    "loss decreasing but eval_loss diverging → kill, overfitting",
+    "hire_sim < 0.7 at step 300 mid-eval → kill, regression starting"
+  ],
+  "post_training_eval": [
+    "hire_sim lenient (30 stratified) — must hit ≥ 0.85",
+    "likert_eval (30 conversational prompts) — manual rating",
+    "smoke test: 20 free-form Korean prompts, qualitative check"
+  ],
+  "blocked_by": "Free H100 GPU (current usage: itfl66q4z768kh-serve + 0ws0tlmo9e04v7-clm-r4). Per H100-2-pod policy, must wait for clm-r4 to finish (~41h) OR get user approval for 3rd pod.",
+  "next_step_when_unblocked": [
+    "1. Spin up new H100 pod or reuse clm-r4 pod",
+    "2. SCP r9 base ckpt + corpus + train_alm_r11.py",
+    "3. Fire training + monitor",
+    "4. Auto-eval on completion",
+    "5. If ≥ r9: deploy as new prod LoRA. If <: keep r9, plan r12."
+  ]
+}
