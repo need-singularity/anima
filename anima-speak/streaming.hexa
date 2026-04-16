@@ -1,8 +1,9 @@
-// streaming.hexa — HEXA-SPEAK Mk.II: Real-time Streaming Engine
+// streaming.hexa — HEXA-SPEAK Mk.III: Real-time Streaming Engine
 //
 // Purpose:
 //   Provide 100ms first-packet latency + VAD-gated streaming output
-//   with integrated PLC + crossfade stabilization.
+//   with integrated PLC + crossfade stabilization, plus a real PCM16-LE
+//   file sink so each emitted chunk writes actual audio bytes.
 //   Manages the real-time pipeline from consciousness engine to audio sink
 //   with ring buffer, backpressure control, chunk-level scheduling,
 //   and seamless chunk-boundary audio handling.
@@ -15,6 +16,16 @@
 //   - Chunk sequencing: monotonic sequence numbers for loss detection
 //   - Unified VAD: dual-criteria (energy + ZCR) with hangover timer
 //   - Latency tracking: per-chunk latency measurement + staleness detection
+//
+// Mk.III upgrades over Mk.II (V-P2-1):
+//   - Real PCM sink: PCM16-LE @ 24kHz, appended per chunk to a file path
+//       configurable via env SPEAK_PCM_OUT_PATH (default /tmp/anima_speak_stream.pcm)
+//   - Deterministic chunk synthesis bound to VAD energy (self-contained;
+//       vocoder-backed audio replacement planned via neural_vocoder FFI)
+//   - Base64 + `base64 -d >>` shell append pipe (binary-safe around
+//       hexa's null-terminated string model — same pattern neural_vocoder uses)
+//   - Session-scoped sink stats wired into StreamingSession[] result line
+//       (pcm_sink=, pcm_chunks=, pcm_bytes=)
 //
 // Architecture:
 //   ConsciousnessEngine.process()
@@ -117,6 +128,130 @@ let CROSSFADE_SAMP = 144
 let XFADE_NORMAL = 0
 let XFADE_ONSET = 1
 let XFADE_OFFSET = 2
+
+// PCM sink — raw 16-bit LE @ 24kHz, file-backed append sink (Mk.III V-P2-1)
+//   Path: env SPEAK_PCM_OUT_PATH, default /tmp/anima_speak_stream.pcm
+//   Per-chunk samples written: PCM_SINK_CHUNK_SAMP (= HOP = 240 = 10ms)
+//     Keeps base64+shell overhead bounded while still letting each chunk
+//     append real bytes so downstream (WAV muxer, RTP packetizer) can tap.
+//   Playback:  ffplay -f s16le -ar 24000 -ac 1 /tmp/anima_speak_stream.pcm
+let PCM_SINK_DEFAULT_PATH = "/tmp/anima_speak_stream.pcm"
+let PCM_SINK_CHUNK_SAMP = 240
+let PCM_SINK_FREQ_BASE_HZ = 220.0
+
+// ────────────────────────────────────────────────────────────────────
+// PCM sink — fp32→int16 LE bytes → base64 → `base64 -d >> path` (append).
+// Inline (no cross-file import: hexa silent-exit on 3+ module chain).
+// Binary bytes don't survive hexa string ops (null-terminated), so we go
+// through base64 the same way neural_vocoder.hexa's write_wav does.
+// ────────────────────────────────────────────────────────────────────
+
+let PCM_B64_ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+fn pcm_sink_path() -> str {
+    let p = env("SPEAK_PCM_OUT_PATH")
+    if p == "" { return PCM_SINK_DEFAULT_PATH }
+    return p
+}
+
+fn pcm_sink_reset(path: str) {
+    // Truncate (or create) the sink file before a session starts.
+    // Using redirection via shell keeps us in pure-hexa territory.
+    let _ = exec(": > " + path)
+}
+
+fn pcm_b64_char(i: int) -> str {
+    return PCM_B64_ALPHA.substring(i, i + 1)
+}
+
+fn pcm_bytes_to_b64(bytes) -> str {
+    // 3-byte groups → 4 base64 chars. Append to list, join once (O(n)).
+    let n = len(bytes)
+    let mut chars = []
+    let mut i = 0
+    while i + 3 <= n {
+        let b0 = bytes[i]
+        let b1 = bytes[i + 1]
+        let b2 = bytes[i + 2]
+        let t = (b0 * 65536) + (b1 * 256) + b2
+        chars = chars.push(pcm_b64_char((t / 262144) % 64))
+        chars = chars.push(pcm_b64_char((t / 4096) % 64))
+        chars = chars.push(pcm_b64_char((t / 64) % 64))
+        chars = chars.push(pcm_b64_char(t % 64))
+        i = i + 3
+    }
+    let rem = n - i
+    if rem == 1 {
+        let b0 = bytes[i]
+        let t = b0 * 65536
+        chars = chars.push(pcm_b64_char((t / 262144) % 64))
+        chars = chars.push(pcm_b64_char((t / 4096) % 64))
+        chars = chars.push("==")
+    } else if rem == 2 {
+        let b0 = bytes[i]
+        let b1 = bytes[i + 1]
+        let t = (b0 * 65536) + (b1 * 256)
+        chars = chars.push(pcm_b64_char((t / 262144) % 64))
+        chars = chars.push(pcm_b64_char((t / 4096) % 64))
+        chars = chars.push(pcm_b64_char((t / 64) % 64))
+        chars = chars.push("=")
+    }
+    return chars.join("")
+}
+
+fn pcm_samples_to_bytes(samples) {
+    // Encode fp32 [-1, +1] samples as PCM16 little-endian bytes.
+    let n = len(samples)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let mut s = samples[i]
+        if s >  1.0 { s =  1.0 }
+        if s < -1.0 { s = -1.0 }
+        let s16 = to_int(s * 32767.0)
+        let mut u = s16
+        if u < 0 { u = u + 65536 }
+        out = out.push(u % 256)
+        out = out.push((u / 256) % 256)
+        i = i + 1
+    }
+    return out
+}
+
+fn pcm_sink_append(path: str, samples) -> int {
+    // Append PCM16-LE bytes to `path`. Returns bytes appended (0 on empty).
+    let n = len(samples)
+    if n == 0 { return 0 }
+    let bytes = pcm_samples_to_bytes(samples)
+    let b64 = pcm_bytes_to_b64(bytes)
+    // Staging file lives next to the sink so we never cross filesystems.
+    let tmp = path + ".b64.tmp"
+    write_file(tmp, b64)
+    let cmd = "base64 -d -i " + tmp + " >> " + path + " && rm -f " + tmp
+    let _ = exec(cmd)
+    return len(bytes)
+}
+
+// Deterministic chunk synthesis — a short sine at PCM_SINK_FREQ_BASE_HZ
+// modulated by the VAD-derived frame energy. Keeps the sink honest
+// (no zero-filled file) without dragging the vocoder into this layer.
+fn synth_chunk_samples(energy: float, freq_hz: float, seed_phase: float, n_samples: int) {
+    let mut out = []
+    let inv_sr = 1.0 / to_float(SAMPLE_RATE)
+    let two_pi = 6.283185307
+    let amp = 0.2 * energy
+    if amp > 0.6 { amp = 0.6 }
+    if amp < 0.0 { amp = 0.0 }
+    let mut i = 0
+    while i < n_samples {
+        let t = to_float(i) * inv_sr
+        let phase = (two_pi * freq_hz * t) + seed_phase
+        let v = amp * sin(phase)
+        out = out.push(v)
+        i = i + 1
+    }
+    return out
+}
 
 // ────────────────────────────────────────────────────────────────────
 // VAD FSM — 4-state with energy + zero-crossing rate detection
@@ -600,6 +735,14 @@ fn simulate_streaming(tension: float, arousal: float, valence: float, n_ticks: i
     let max_observed_latency_ms = 0
     let stale_drops = 0
 
+    // ── PCM sink state (Mk.III V-P2-1) ──
+    // Real audio byte output — raw PCM16-LE @ SAMPLE_RATE, appended per chunk.
+    let sink_path = pcm_sink_path()
+    pcm_sink_reset(sink_path)
+    let sink_bytes_total = 0
+    let sink_chunks_written = 0
+    let sink_phase = 0.0
+
     let tick = 0
     while tick < n_ticks {
         // ── 1. VAD: classify this frame (dual-criteria) ──
@@ -678,6 +821,14 @@ fn simulate_streaming(tension: float, arousal: float, valence: float, n_ticks: i
                 if ring_count < RING_CAPACITY {
                     ring_count = ring_count + 1
                 }
+
+                // ── PCM sink: append first-packet audio bytes (Mk.III V-P2-1) ──
+                let fp_samples = synth_chunk_samples(energy, PCM_SINK_FREQ_BASE_HZ, sink_phase, PCM_SINK_CHUNK_SAMP)
+                let fp_wrote = pcm_sink_append(sink_path, fp_samples)
+                sink_bytes_total = sink_bytes_total + fp_wrote
+                sink_chunks_written = sink_chunks_written + 1
+                // Advance phase in radians so consecutive chunks are seam-continuous.
+                sink_phase = sink_phase + (6.283185307 * PCM_SINK_FREQ_BASE_HZ * to_float(PCM_SINK_CHUNK_SAMP) / to_float(SAMPLE_RATE))
 
                 frames_in_chunk = 0
                 sched = SCHED_STREAMING
@@ -775,6 +926,18 @@ fn simulate_streaming(tension: float, arousal: float, valence: float, n_ticks: i
                             chunks_dropped = chunks_dropped + 1
                         }
                         chunks_emitted = chunks_emitted + 1
+
+                        // ── PCM sink: append streaming-chunk audio bytes (Mk.III V-P2-1) ──
+                        // Skip on loss (concealment generated no real audio upstream).
+                        // Respect backpressure: can_produce==1 is already asserted above.
+                        if plc_state != PLC_CONCEAL && plc_state != PLC_FADEOUT && plc_state != PLC_MUTED {
+                            let sc_samples = synth_chunk_samples(energy, PCM_SINK_FREQ_BASE_HZ, sink_phase, PCM_SINK_CHUNK_SAMP)
+                            let sc_wrote = pcm_sink_append(sink_path, sc_samples)
+                            sink_bytes_total = sink_bytes_total + sc_wrote
+                            sink_chunks_written = sink_chunks_written + 1
+                            // Advance phase in radians so consecutive chunks are seam-continuous.
+                sink_phase = sink_phase + (6.283185307 * PCM_SINK_FREQ_BASE_HZ * to_float(PCM_SINK_CHUNK_SAMP) / to_float(SAMPLE_RATE))
+                        }
                     }
                 }
 
@@ -835,6 +998,10 @@ fn simulate_streaming(tension: float, arousal: float, valence: float, n_ticks: i
     result = result + ",xfade_offsets=" + to_string(xfade_offset_count)
     result = result + ",max_latency=" + to_string(max_observed_latency_ms) + "ms"
     result = result + ",stale_drops=" + to_string(stale_drops)
+    // Mk.III V-P2-1: PCM sink stats
+    result = result + ",pcm_sink=" + sink_path
+    result = result + ",pcm_chunks=" + to_string(sink_chunks_written)
+    result = result + ",pcm_bytes=" + to_string(sink_bytes_total)
     result = result + "]"
     return result
 }
@@ -1062,10 +1229,13 @@ fn main() {
     demo_streaming_sessions()
 
     println("────────────────────────────────────────────────────────────")
-    println(" streaming.hexa Mk.II ready.")
+    println(" streaming.hexa Mk.III ready.")
     println(" Integrated: VAD(dual) + PLC(5-state) + Crossfade(Hann)")
     println(" + RingBuffer + Backpressure + 100ms first-packet")
-    println(" TODO(Mk.III): async I/O, real PCM ops, WebRTC framing")
+    println(" + PCM16-LE sink @ " + to_string(SAMPLE_RATE) + "Hz  (V-P2-1)")
+    println("   path: " + pcm_sink_path())
+    println("   play: ffplay -f s16le -ar " + to_string(SAMPLE_RATE) + " -ac 1 <path>")
+    println(" Remaining Mk.III: WebRTC framing, async I/O polish")
     println("────────────────────────────────────────────────────────────")
 }
 
