@@ -1,0 +1,323 @@
+// ════════════════════════════════════════════════════════════════
+//  scripts/ckpt_name_lint.hexa — E3 ckpt naming convention linter
+//
+//  Roadmap: shared/roadmaps/alm_consciousness_standalone.json
+//           tracks.E.options.E3 (chosen, day_0)
+//
+//  Purpose:
+//    Scan ckpt directories on disk and report violations of the naming
+//    convention defined in shared/config/ckpt_policy.json:
+//
+//      ALM:  alm{size}-phi-r{round}-s{step}
+//      CLM:  clm{size}-phi-{stage}-r{round}-s{step}
+//
+//    Forbidden patterns (severity ERROR):
+//      v\d+   — feedback_no_version_in_filename
+//
+//    Soft warns (severity WARN):
+//      _final / final_  — ambiguous, prefer explicit step
+//      tmp / temp / testN — scratch names should not reach R2
+//      no alm/clm prefix — does not match policy
+//
+//  Usage:
+//    hexa scripts/ckpt_name_lint.hexa                       # scan default roots
+//    hexa scripts/ckpt_name_lint.hexa /path/to/ckpts        # scan given root
+//    hexa scripts/ckpt_name_lint.hexa --json out.json       # write JSON report
+//    hexa scripts/ckpt_name_lint.hexa --strict               # exit 1 on any ERROR
+//
+//  Default scan roots (any that exist):
+//    checkpoints/
+//    models/animalm/checkpoints/
+//    /workspace/ckpt_alm_14b_r4/   (pod-side, only if running on H100)
+//
+//  HEXA-FIRST: zero new .py/.rs/.sh; uses only safe string API subset.
+// ════════════════════════════════════════════════════════════════
+
+let DEFAULT_ROOTS = [
+    "checkpoints",
+    "models/animalm/checkpoints",
+    "/workspace/ckpt_alm_14b_r4",
+    "/workspace/ckpt_alm_14b_r5",
+    "/workspace/ckpt_alm_14b_r4/step_2000"
+]
+
+// ── String helpers (safe subset) ──
+
+fn str_contains(hay, needle) {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return true }
+    if nn > hn { return false }
+    let mut i = 0
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn str_ends_with(hay, suffix) {
+    let hn = len(hay)
+    let sn = len(suffix)
+    if sn > hn { return false }
+    return hay.substring(hn - sn, hn) == suffix
+}
+
+fn is_digit(ch) {
+    if ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4"
+       || ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9" {
+        return true
+    }
+    return false
+}
+
+// ── Naming checks ──
+
+fn has_v_digit(name) {
+    let n = len(name)
+    let mut i = 0
+    while i < n - 1 {
+        let ch = name.substring(i, i + 1)
+        if ch == "v" {
+            let next = name.substring(i + 1, i + 2)
+            if is_digit(next) {
+                let mut prev_ok = (i == 0)
+                if !prev_ok {
+                    let prev = name.substring(i - 1, i)
+                    if prev == "-" || prev == "_" || prev == "/" || prev == "." { prev_ok = true }
+                }
+                if prev_ok { return true }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn has_final_token(name) {
+    if str_ends_with(name, "_final") { return true }
+    if str_contains(name, "final_") { return true }
+    if name == "final" { return true }
+    return false
+}
+
+fn has_scratch_token(name) {
+    if str_contains(name, "tmp") { return true }
+    if str_contains(name, "temp") { return true }
+    let n = len(name)
+    if n >= 4 {
+        if name.substring(0, 4) == "test" {
+            // test followed by digit/end -> scratch
+            if n == 4 { return true }
+            let nxt = name.substring(4, 5)
+            if is_digit(nxt) { return true }
+        }
+    }
+    return false
+}
+
+fn has_canonical_prefix(name) {
+    if name.starts_with("alm") || name.starts_with("clm") || name.starts_with("step_") { return true }
+    return false
+}
+
+// Returns a list of violation strings; empty list = clean.
+fn lint_basename(name) {
+    let mut out = []
+    if has_v_digit(name) {
+        out = out.push("ERROR: forbidden pattern v\\d+ (feedback_no_version_in_filename)")
+    }
+    if has_final_token(name) {
+        out = out.push("WARN: ambiguous '_final/final_' — prefer explicit step number")
+    }
+    if has_scratch_token(name) {
+        out = out.push("WARN: scratch token (tmp/temp/testN) should not reach R2 ckpt prefix")
+    }
+    if !has_canonical_prefix(name) {
+        out = out.push("WARN: missing alm/clm/step_ prefix — does not match ckpt_policy naming convention")
+    }
+    return out
+}
+
+// ── Filesystem walking ──
+
+fn list_ckpt_subdirs(root) {
+    // Use ls (one level) + filter for directories. Avoids deep recursion to
+    // keep the linter fast and the shell-out simple. Trainers create
+    // step_N subdirs at depth 1 under the run dir, and run dirs at depth 1
+    // under the ckpt root — we scan both.
+    if !file_exists(root) { return [] }
+    let cmd = "find " + root + " -maxdepth 2 -type d 2>/dev/null"
+    let out = exec(cmd)
+    let mut dirs = []
+    let n = len(out)
+    let mut start = 0
+    let mut i = 0
+    while i < n {
+        if out.substring(i, i + 1) == "\n" {
+            if i > start {
+                dirs = dirs.push(out.substring(start, i))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n { dirs = dirs.push(out.substring(start, n)) }
+    return dirs
+}
+
+fn basename_of(path) {
+    return exec("basename " + path).trim()
+}
+
+// ── Main ──
+
+fn main() {
+    // hexa argv: [hexa_bin, script_path, user_args...]
+    let argv = args()
+    let argc = len(argv)
+
+    let mut roots = []
+    let mut json_out = ""
+    let mut strict = false
+    let mut i = 2
+    while i < argc {
+        let a = argv[i]
+        if a == "--json" && i + 1 < argc {
+            json_out = argv[i + 1]
+            i = i + 2
+        } else if a == "--strict" {
+            strict = true
+            i = i + 1
+        } else if a.starts_with("--") {
+            i = i + 1
+        } else {
+            roots = roots.push(a)
+            i = i + 1
+        }
+    }
+    if len(roots) == 0 {
+        let mut k = 0
+        while k < len(DEFAULT_ROOTS) {
+            roots = roots.push(DEFAULT_ROOTS[k])
+            k = k + 1
+        }
+    }
+
+    println("=== ckpt_name_lint ===")
+    println("policy: shared/config/ckpt_policy.json")
+    println("roots:")
+    let mut r = 0
+    while r < len(roots) {
+        let exists = file_exists(roots[r])
+        let mark = "(missing)"
+        if exists { mark = "(present)" }
+        println("  " + roots[r] + " " + mark)
+        r = r + 1
+    }
+    println("")
+
+    let mut total_dirs = 0
+    let mut total_violations = 0
+    let mut total_errors = 0
+    let mut total_warns = 0
+    let mut violation_lines = []
+
+    let mut ri = 0
+    while ri < len(roots) {
+        let root = roots[ri]
+        if !file_exists(root) {
+            ri = ri + 1
+            continue
+        }
+        let dirs = list_ckpt_subdirs(root)
+        let mut di = 0
+        while di < len(dirs) {
+            let path = dirs[di]
+            // Skip the root itself.
+            if path != root && len(path) > 0 {
+                let bname = basename_of(path)
+                let viols = lint_basename(bname)
+                total_dirs = total_dirs + 1
+                if len(viols) > 0 {
+                    println("[VIOLATION] " + path)
+                    let mut vi = 0
+                    while vi < len(viols) {
+                        let v = viols[vi]
+                        println("    " + v)
+                        if v.starts_with("ERROR") {
+                            total_errors = total_errors + 1
+                        } else {
+                            total_warns = total_warns + 1
+                        }
+                        total_violations = total_violations + 1
+                        // For json out: pack as path|severity|message
+                        violation_lines = violation_lines.push(path + "|" + v)
+                        vi = vi + 1
+                    }
+                }
+            }
+            di = di + 1
+        }
+        ri = ri + 1
+    }
+
+    println("")
+    println("=== summary ===")
+    println("dirs scanned   : " + str(total_dirs))
+    println("violations     : " + str(total_violations))
+    println("  ERROR        : " + str(total_errors))
+    println("  WARN         : " + str(total_warns))
+
+    if json_out != "" {
+        let mut json = "{\n"
+        json = json + "  \"_meta\": {\"name\": \"ckpt_name_lint baseline\", \"date\": \"" + exec("date -u +%Y-%m-%d").trim() + "\"},\n"
+        json = json + "  \"dirs_scanned\": " + str(total_dirs) + ",\n"
+        json = json + "  \"violations_total\": " + str(total_violations) + ",\n"
+        json = json + "  \"errors\": " + str(total_errors) + ",\n"
+        json = json + "  \"warns\": " + str(total_warns) + ",\n"
+        json = json + "  \"violations\": [\n"
+        let mut vk = 0
+        while vk < len(violation_lines) {
+            let line = violation_lines[vk]
+            // Find first | (separator).
+            let bar = -1
+            let mut bi = 0
+            let bn = len(line)
+            while bi < bn {
+                if line.substring(bi, bi + 1) == "|" {
+                    bar = bi
+                    break
+                }
+                bi = bi + 1
+            }
+            if bar > 0 {
+                let p = line.substring(0, bar)
+                let m = line.substring(bar + 1, bn)
+                let mut sev = "WARN"
+                if m.starts_with("ERROR") { sev = "ERROR" }
+                json = json + "    {\"path\": \"" + p + "\", \"severity\": \"" + sev + "\", \"message\": \"" + m + "\"}"
+                if vk < len(violation_lines) - 1 { json = json + "," }
+                json = json + "\n"
+            }
+            vk = vk + 1
+        }
+        json = json + "  ]\n"
+        json = json + "}\n"
+        write_file(json_out, json)
+        println("")
+        println("json report: " + json_out)
+    }
+
+    if total_errors > 0 {
+        println("")
+        println("FAIL: " + str(total_errors) + " ERROR-level violations — fix before promotion to production label")
+        if strict {
+            // Exit 1 so CI/pre-commit can gate on naming violations.
+            exec("exit 1")
+        }
+    } else {
+        println("")
+        println("OK: no ERROR-level violations")
+    }
+}

@@ -1,0 +1,323 @@
+// ════════════════════════════════════════════════════════════════
+//  scripts/ckpt_rotation.hexa — E4 experiment ckpt auto-purge
+//
+//  Roadmap: shared/roadmaps/alm_consciousness_standalone.json
+//           tracks.E.options.E4 (chosen)
+//
+//  Purpose:
+//    Scan local ckpt directories and purge experiment-labeled ckpts
+//    that have outlived their retention window. Production ckpts are
+//    NEVER touched. Archive ckpts older than 30 days are eligible.
+//
+//  Retention rules (from ckpt_policy.json):
+//    production  -> permanent, never rotated
+//    experiment  -> pod-lifetime only (retention_days=0, purge on sweep)
+//    archive     -> cold 30 days, then eligible for purge
+//
+//  Logic:
+//    For each ckpt subdir under the scan roots:
+//      1. Read ckpt_meta.json (or train_meta.json fallback)
+//      2. Extract "label" field
+//      3. If label == "experiment" -> purge immediately (pod-lifetime)
+//      4. If label == "archive" -> check dir mtime vs 30 days
+//      5. If label == "production" -> skip (never purge)
+//      6. If no sidecar -> skip with WARN (don't destroy unknown data)
+//
+//  Safety:
+//    - Default mode is DRY-RUN. Pass --confirm to actually delete.
+//    - Dirs with .r2_uploaded marker that are "production" are never touched.
+//    - Logs every action to stdout for audit trail.
+//
+//  Usage:
+//    hexa scripts/ckpt_rotation.hexa                        # dry-run, default roots
+//    hexa scripts/ckpt_rotation.hexa --confirm              # actually purge
+//    hexa scripts/ckpt_rotation.hexa /path/to/ckpts         # custom root
+//    hexa scripts/ckpt_rotation.hexa --archive-days 14      # override 30d default
+//
+//  HEXA-FIRST: zero new .py/.rs/.sh; safe string API subset only.
+// ════════════════════════════════════════════════════════════════
+
+let DEFAULT_ROOTS = [
+    "checkpoints",
+    "models/animalm/checkpoints",
+    "/workspace/ckpt_alm_14b_r4",
+    "/workspace/ckpt_alm_14b_r5"
+]
+
+let SIDECAR_NAME  = "ckpt_meta.json"
+let SIDECAR_LEGACY = "train_meta.json"
+let DEFAULT_ARCHIVE_DAYS = 30
+
+// ── String helpers ──
+
+fn str_contains(hay, needle) {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return true }
+    if nn > hn { return false }
+    let mut i = 0
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn str_index_of(hay, needle, from) {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return from }
+    let mut i = from
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn extract_json_string(text, key) {
+    let needle = "\"" + key + "\""
+    let kpos = str_index_of(text, needle, 0)
+    if kpos < 0 { return "" }
+    let after_key = kpos + len(needle)
+    let colon = str_index_of(text, ":", after_key)
+    if colon < 0 { return "" }
+    let open_q = str_index_of(text, "\"", colon)
+    if open_q < 0 { return "" }
+    let close_q = str_index_of(text, "\"", open_q + 1)
+    if close_q < 0 { return "" }
+    return text.substring(open_q + 1, close_q)
+}
+
+// ── Logging ──
+
+fn now_stamp() {
+    return exec("date +%Y-%m-%dT%H:%M:%S").trim()
+}
+
+fn log_info(msg) {
+    println("[ckpt_rotation " + now_stamp() + "] " + msg)
+}
+
+fn log_warn(msg) {
+    println("[ckpt_rotation " + now_stamp() + " WARN] " + msg)
+}
+
+// ── Sidecar reader ──
+
+fn read_label_from_dir(ckpt_dir) {
+    let sidecar_path = ckpt_dir + "/" + SIDECAR_NAME
+    let mut text = ""
+    if file_exists(sidecar_path) {
+        text = read_file(sidecar_path)
+    } else {
+        let legacy = ckpt_dir + "/" + SIDECAR_LEGACY
+        if file_exists(legacy) {
+            text = read_file(legacy)
+        }
+    }
+    if len(text) == 0 { return "" }
+    return extract_json_string(text, "label")
+}
+
+// ── Age check ──
+
+fn dir_age_days(path) {
+    // Uses stat to get modification time, compares to now.
+    // Returns integer days since last modification.
+    // Platform: tries GNU stat first (Linux pods), falls back to BSD (macOS).
+    let gnu = exec("stat -c %Y " + path + " 2>/dev/null || echo ''").trim()
+    let mut mtime_str = gnu
+    if len(mtime_str) == 0 {
+        // BSD stat (macOS).
+        mtime_str = exec("stat -f %m " + path + " 2>/dev/null || echo ''").trim()
+    }
+    if len(mtime_str) == 0 { return -1 }
+
+    let now_str = exec("date +%s").trim()
+    // Both are epoch seconds as strings. Parse by shelling out to avoid
+    // integer parsing in hexa's safe subset.
+    let diff_str = exec("echo $(( " + now_str + " - " + mtime_str + " ))").trim()
+    let days_str = exec("echo $(( " + diff_str + " / 86400 ))").trim()
+
+    // Convert to int. Simple: exec("expr ...") or use the string as-is for comparison.
+    // We'll shell out for the comparison too to stay safe.
+    return days_str
+}
+
+fn days_exceeds(days_str, threshold) {
+    // Compare two numbers via shell since hexa safe subset lacks int parsing.
+    let result = exec("[ " + days_str + " -ge " + str(threshold) + " ] && echo yes || echo no").trim()
+    return result == "yes"
+}
+
+// ── List ckpt subdirs ──
+
+fn list_ckpt_subdirs(root) {
+    if !file_exists(root) { return [] }
+    let cmd = "find " + root + " -maxdepth 1 -mindepth 1 -type d 2>/dev/null"
+    let out = exec(cmd)
+    let mut dirs = []
+    let n = len(out)
+    let mut start = 0
+    let mut i = 0
+    while i < n {
+        if out.substring(i, i + 1) == "\n" {
+            if i > start {
+                dirs = dirs.push(out.substring(start, i))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n { dirs = dirs.push(out.substring(start, n)) }
+    return dirs
+}
+
+fn basename_of(path) {
+    return exec("basename " + path).trim()
+}
+
+fn dir_size_human(path) {
+    return exec("du -sh " + path + " 2>/dev/null | cut -f1").trim()
+}
+
+// ── Main ──
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+
+    let mut roots = []
+    let mut confirm = false
+    let mut archive_days = DEFAULT_ARCHIVE_DAYS
+    let mut i = 2
+    while i < argc {
+        let a = argv[i]
+        if a == "--confirm" {
+            confirm = true
+            i = i + 1
+        } else if a == "--archive-days" && i + 1 < argc {
+            // Shell-parse the next arg as int.
+            archive_days = argv[i + 1]
+            i = i + 2
+        } else if a.starts_with("--") {
+            i = i + 1
+        } else {
+            roots = roots.push(a)
+            i = i + 1
+        }
+    }
+    if len(roots) == 0 {
+        let mut k = 0
+        while k < len(DEFAULT_ROOTS) {
+            roots = roots.push(DEFAULT_ROOTS[k])
+            k = k + 1
+        }
+    }
+
+    let mode_str = "DRY-RUN"
+    if confirm { mode_str = "CONFIRM (will delete)" }
+
+    println("=== ckpt_rotation (E4) ===")
+    println("mode: " + mode_str)
+    println("archive retention: " + str(archive_days) + " days")
+    println("roots:")
+    let mut r = 0
+    while r < len(roots) {
+        let ex = file_exists(roots[r])
+        let mark = "(missing)"
+        if ex { mark = "(present)" }
+        println("  " + roots[r] + " " + mark)
+        r = r + 1
+    }
+    println("")
+
+    let mut purged = 0
+    let mut skipped_production = 0
+    let mut skipped_no_sidecar = 0
+    let mut skipped_archive_young = 0
+
+    let mut ri = 0
+    while ri < len(roots) {
+        let root = roots[ri]
+        if !file_exists(root) { ri = ri + 1 ; continue }
+        let dirs = list_ckpt_subdirs(root)
+        let mut di = 0
+        while di < len(dirs) {
+            let path = dirs[di]
+            let bname = basename_of(path)
+            let label = read_label_from_dir(path)
+
+            if label == "" {
+                log_warn("SKIP (no sidecar): " + path)
+                skipped_no_sidecar = skipped_no_sidecar + 1
+                di = di + 1
+                continue
+            }
+
+            if label == "production" {
+                // Production ckpts are NEVER purged.
+                skipped_production = skipped_production + 1
+                di = di + 1
+                continue
+            }
+
+            if label == "experiment" {
+                // Experiment ckpts have retention_days=0: purge immediately.
+                let size = dir_size_human(path)
+                log_info("PURGE experiment: " + path + " (" + size + ")")
+                if confirm {
+                    let _ = exec("rm -rf " + path)
+                    log_info("  DELETED: " + path)
+                } else {
+                    log_info("  (dry-run, would delete)")
+                }
+                purged = purged + 1
+                di = di + 1
+                continue
+            }
+
+            if label == "archive" {
+                // Archive ckpts: check age against retention threshold.
+                let age = dir_age_days(path)
+                if age == "-1" {
+                    log_warn("SKIP (cannot determine age): " + path)
+                    di = di + 1
+                    continue
+                }
+                if days_exceeds(age, archive_days) {
+                    let size = dir_size_human(path)
+                    log_info("PURGE archive (age=" + age + "d): " + path + " (" + size + ")")
+                    if confirm {
+                        let _ = exec("rm -rf " + path)
+                        log_info("  DELETED: " + path)
+                    } else {
+                        log_info("  (dry-run, would delete)")
+                    }
+                    purged = purged + 1
+                } else {
+                    skipped_archive_young = skipped_archive_young + 1
+                }
+                di = di + 1
+                continue
+            }
+
+            // Unknown label — skip with warning.
+            log_warn("SKIP (unknown label '" + label + "'): " + path)
+            di = di + 1
+        }
+        ri = ri + 1
+    }
+
+    println("")
+    println("=== summary ===")
+    println("purged (or would purge) : " + str(purged))
+    println("skipped production      : " + str(skipped_production))
+    println("skipped no-sidecar      : " + str(skipped_no_sidecar))
+    println("skipped archive (young) : " + str(skipped_archive_young))
+    if !confirm && purged > 0 {
+        println("")
+        println("Run with --confirm to actually delete.")
+    }
+}

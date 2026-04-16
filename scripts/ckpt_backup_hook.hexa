@@ -1,0 +1,461 @@
+// ════════════════════════════════════════════════════════════════
+//  scripts/ckpt_backup_hook.hexa — E1/E2/E3/E7 ckpt backup post-save hook
+//
+//  Roadmap: shared/roadmaps/alm_consciousness_standalone.json
+//           tracks.E.options[E1, E2, E3, E7]
+//
+//  Purpose (post-save hook for ALM/CLM trainers):
+//    1. Read sidecar ckpt_meta.json from ckpt dir
+//    2. Resolve label (production | experiment | archive) from arg or sidecar
+//    3. Look up R2 prefix from shared/config/ckpt_policy.json
+//    4. If label.r2_upload == true -> rclone copy (idempotent, partial-safe)
+//    5. Generate sha256 manifest (E7) before upload
+//    6. Touch .r2_uploaded marker on success
+//
+//  Idempotency contract:
+//    .r2_uploaded     — present  -> skip entirely (already done)
+//    .r2_uploading    — present alone -> prior run died mid-upload -> re-upload
+//    neither          — fresh upload
+//
+//  Naming enforcement (E3): cross-checks ckpt dir basename against
+//  ckpt_policy.json naming_convention.{alm,clm}.regex; rejects v\d+
+//  per feedback_no_version_in_filename.
+//
+//  Manifest (E7): sha256 checksums of all files in ckpt dir, written
+//  to ckpt_manifest.sha256 in the ckpt dir before rclone upload.
+//  Uploaded alongside the ckpt files for integrity verification.
+//
+//  Usage:
+//    hexa scripts/ckpt_backup_hook.hexa <ckpt_dir> <label>
+//    hexa scripts/ckpt_backup_hook.hexa <ckpt_dir> <label> --dry-run
+//    hexa scripts/ckpt_backup_hook.hexa <ckpt_dir> --from-sidecar
+//
+//  Env override:
+//    CKPT_POLICY=/path/to/ckpt_policy.json
+//    DRY_RUN=1
+//
+//  Constraints (per CLAUDE.md):
+//    - HEXA-FIRST: zero new .py/.rs/.sh
+//    - String API: substring + len + trim + starts_with only (no .split/.replace/.contains/.find)
+//    - rclone via shell-out only; credentials remain in ~/.config/rclone/
+// ════════════════════════════════════════════════════════════════
+
+let DEFAULT_POLICY_PATH = "shared/config/ckpt_policy.json"
+let MARKER_DONE         = ".r2_uploaded"
+let MARKER_PARTIAL      = ".r2_uploading"
+let SIDECAR_NAME        = "ckpt_meta.json"
+let MANIFEST_NAME       = "ckpt_manifest.sha256"
+
+// ── Manual string helpers (safe subset, mirrors r2_sidecar_zstd.hexa) ─
+
+fn str_contains(hay, needle) {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return true }
+    if nn > hn { return false }
+    let mut i = 0
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn str_index_of(hay, needle, from) {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return from }
+    let mut i = from
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn extract_json_string(text, key) {
+    // Naive JSON string extractor: looks for "key": "value" sequence.
+    // Returns the value substring, or empty string on miss. Good enough
+    // for the flat sidecar emitted by the trainer (no nested objects).
+    let needle = "\"" + key + "\""
+    let kpos = str_index_of(text, needle, 0)
+    if kpos < 0 { return "" }
+    let after_key = kpos + len(needle)
+    // Find the colon after the key.
+    let colon = str_index_of(text, ":", after_key)
+    if colon < 0 { return "" }
+    // Find the opening quote of the value.
+    let open_q = str_index_of(text, "\"", colon)
+    if open_q < 0 { return "" }
+    // Find the closing quote.
+    let close_q = str_index_of(text, "\"", open_q + 1)
+    if close_q < 0 { return "" }
+    return text.substring(open_q + 1, close_q)
+}
+
+fn extract_json_int_str(text, key) {
+    // Naive JSON number extractor: "key": NNN  -> returns the digit run as a string.
+    // Used for round + step fields. Returns empty string on miss.
+    let needle = "\"" + key + "\""
+    let kpos = str_index_of(text, needle, 0)
+    if kpos < 0 { return "" }
+    let after_key = kpos + len(needle)
+    let colon = str_index_of(text, ":", after_key)
+    if colon < 0 { return "" }
+    let n = len(text)
+    let mut i = colon + 1
+    // Skip whitespace.
+    while i < n {
+        let ch = text.substring(i, i + 1)
+        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" { i = i + 1 } else { break }
+    }
+    let mut j = i
+    while j < n {
+        let cj = text.substring(j, j + 1)
+        if cj == "0" || cj == "1" || cj == "2" || cj == "3" || cj == "4"
+           || cj == "5" || cj == "6" || cj == "7" || cj == "8" || cj == "9" {
+            j = j + 1
+        } else {
+            break
+        }
+    }
+    if j == i { return "" }
+    return text.substring(i, j)
+}
+
+// ── Logging ──
+
+fn now_stamp() {
+    return exec("date +%Y-%m-%dT%H:%M:%S").trim()
+}
+
+fn log_info(msg) {
+    println("[ckpt_backup_hook " + now_stamp() + "] " + msg)
+}
+
+fn log_warn(msg) {
+    println("[ckpt_backup_hook " + now_stamp() + " WARN] " + msg)
+}
+
+fn log_err(msg) {
+    println("[ckpt_backup_hook " + now_stamp() + " ERR] " + msg)
+}
+
+// ── Naming validation (E3) ──
+
+fn validate_basename(basename) {
+    // Reject v\d+ (any "v" followed by a digit). Walks the string by hand
+    // because we don't have regex in the safe API subset.
+    let n = len(basename)
+    let mut i = 0
+    while i < n - 1 {
+        let ch = basename.substring(i, i + 1)
+        if ch == "v" {
+            let next = basename.substring(i + 1, i + 2)
+            if next == "0" || next == "1" || next == "2" || next == "3" || next == "4"
+               || next == "5" || next == "6" || next == "7" || next == "8" || next == "9" {
+                // Make sure we're not inside a hash-like blob: require word boundary.
+                let prev_ok = i == 0
+                if !prev_ok {
+                    let prev = basename.substring(i - 1, i)
+                    if prev == "-" || prev == "_" || prev == "/" || prev == "." { prev_ok = true }
+                }
+                if prev_ok {
+                    return "ERROR: forbidden pattern v\\d+ (feedback_no_version_in_filename) at offset " + str(i)
+                }
+            }
+        }
+        i = i + 1
+    }
+    // Suggest the canonical schema if name doesn't start with alm/clm.
+    if !basename.starts_with("alm") && !basename.starts_with("clm") && !basename.starts_with("step_") {
+        return "WARN: basename does not start with alm/clm/step_ — does not match ckpt_policy naming convention"
+    }
+    return "OK"
+}
+
+// ── Sidecar reader ──
+
+fn read_sidecar(ckpt_dir) {
+    let sidecar_path = ckpt_dir + "/" + SIDECAR_NAME
+    if !file_exists(sidecar_path) {
+        // Fallback: legacy trainer wrote train_meta.json instead.
+        let legacy = ckpt_dir + "/train_meta.json"
+        if file_exists(legacy) {
+            log_warn("sidecar " + SIDECAR_NAME + " missing — falling back to train_meta.json")
+            return read_file(legacy)
+        }
+        return ""
+    }
+    return read_file(sidecar_path)
+}
+
+// ── Marker management (idempotency) ──
+//
+// Note on policy loading: the routing decision (production/experiment/archive ->
+// upload? + R2 prefix) is mirrored hard-coded in label_uploads() + r2_prefix_for()
+// below. ckpt_policy.json remains the SSOT for documentation + the linter,
+// but the hook does NOT shell out to jq, keeping it portable on minimal pods.
+
+fn check_markers(ckpt_dir) {
+    let done = ckpt_dir + "/" + MARKER_DONE
+    let partial = ckpt_dir + "/" + MARKER_PARTIAL
+    if file_exists(done) {
+        return "DONE"
+    }
+    if file_exists(partial) {
+        return "PARTIAL"
+    }
+    return "FRESH"
+}
+
+fn mark_partial(ckpt_dir) {
+    let _ = exec("touch " + ckpt_dir + "/" + MARKER_PARTIAL)
+}
+
+fn mark_done(ckpt_dir) {
+    let stamp = now_stamp()
+    let marker = ckpt_dir + "/" + MARKER_DONE
+    write_file(marker, "uploaded_at=" + stamp + "\n")
+    let _ = exec("rm -f " + ckpt_dir + "/" + MARKER_PARTIAL)
+}
+
+// ── Label resolution (E2) ──
+
+fn resolve_label(arg_label, sidecar_text) {
+    if arg_label != "" && arg_label != "--from-sidecar" { return arg_label }
+    let sidecar_label = extract_json_string(sidecar_text, "label")
+    if sidecar_label != "" { return sidecar_label }
+    // Decisions default.
+    return "experiment"
+}
+
+fn label_uploads(label) {
+    // Hard-coded mirror of ckpt_policy.json labels[*].r2_upload, in case
+    // jq is missing on the pod. Source of truth = ckpt_policy.json.
+    if label == "production" { return true }
+    if label == "archive" { return true }
+    if label == "experiment" { return false }
+    log_warn("unknown label '" + label + "' — defaulting to no-upload")
+    return false
+}
+
+fn r2_prefix_for(label, model_tag, round_str, step_str) {
+    if label == "production" {
+        return "r2:anima-models/" + model_tag + "/r" + round_str + "/step_" + step_str + "/"
+    }
+    if label == "archive" {
+        return "r2:anima-models/archive/" + model_tag + "/r" + round_str + "/step_" + step_str + "/"
+    }
+    return ""
+}
+
+// ── sha256 manifest generation (E7) ──
+//
+// Root cause: H100 pod preemption or disk corruption can silently
+// damage ckpt files. A manifest written BEFORE upload lets the
+// downloader verify integrity with `sha256sum -c ckpt_manifest.sha256`.
+
+fn generate_manifest(ckpt_dir) {
+    // Generate sha256 checksums for all non-marker files in the ckpt dir.
+    // Output goes to ckpt_manifest.sha256 in the same dir.
+    // Uses find + sha256sum (Linux) or shasum -a 256 (macOS) via shell.
+    let manifest_path = ckpt_dir + "/" + MANIFEST_NAME
+
+    // Detect which sha256 tool is available (pods run Linux).
+    let sha_tool_check = exec("command -v sha256sum 2>/dev/null || echo ''").trim()
+    let mut sha_cmd = "shasum -a 256"
+    if len(sha_tool_check) > 0 {
+        sha_cmd = "sha256sum"
+    }
+
+    // Build a find command that lists all regular files except markers and
+    // the manifest itself, then feeds them to the hash tool.
+    // -maxdepth 1: ckpt dirs are flat (adapter_model.safetensors, config.json, etc.)
+    let find_cmd = "cd " + ckpt_dir + " && find . -maxdepth 1 -type f " +
+        "! -name '" + MARKER_DONE + "' " +
+        "! -name '" + MARKER_PARTIAL + "' " +
+        "! -name '" + MANIFEST_NAME + "' " +
+        "-print0 | xargs -0 " + sha_cmd + " 2>/dev/null | sort"
+    let result = exec(find_cmd)
+
+    if len(result.trim()) == 0 {
+        log_warn("manifest: no files found to hash in " + ckpt_dir)
+        return false
+    }
+
+    write_file(manifest_path, result)
+    // Count lines = number of files hashed.
+    let line_count = exec("wc -l < " + manifest_path).trim()
+    log_info("manifest: " + line_count + " files hashed -> " + manifest_path)
+    return true
+}
+
+fn verify_manifest(ckpt_dir) {
+    // Verify the sha256 manifest in a ckpt dir. Returns true if all pass.
+    // Used by ckpt_promote.hexa (E5) before production label assignment.
+    let manifest_path = ckpt_dir + "/" + MANIFEST_NAME
+    if !file_exists(manifest_path) {
+        log_err("verify_manifest: " + manifest_path + " not found")
+        return false
+    }
+
+    let sha_tool_check = exec("command -v sha256sum 2>/dev/null || echo ''").trim()
+    let mut check_cmd = "cd " + ckpt_dir + " && shasum -a 256 -c " + MANIFEST_NAME + " 2>&1"
+    if len(sha_tool_check) > 0 {
+        check_cmd = "cd " + ckpt_dir + " && sha256sum -c " + MANIFEST_NAME + " 2>&1"
+    }
+
+    let result = exec(check_cmd + "; echo RC=$?")
+    if str_contains(result, "RC=0") {
+        log_info("verify_manifest: all checksums OK")
+        return true
+    } else {
+        log_err("verify_manifest: FAILED — output:\n" + result)
+        return false
+    }
+}
+
+// ── rclone command builder ──
+
+fn build_rclone_cmd(local_dir, remote_prefix, dry_run) {
+    let base = "rclone copy " + local_dir + " " + remote_prefix
+    let flags = " --s3-no-check-bucket --transfers 4 --progress"
+    if dry_run {
+        return base + flags + " --dry-run"
+    }
+    return base + flags
+}
+
+// ── Main ──
+
+fn main() {
+    // hexa argv layout: [hexa_bin, script_path, user_args...]
+    // User args therefore start at index 2.
+    let argv = args()
+    let argc = len(argv)
+    if argc < 3 {
+        println("usage: hexa scripts/ckpt_backup_hook.hexa <ckpt_dir> <label|--from-sidecar> [--dry-run]")
+        println("  label: production | experiment | archive")
+        println("  --from-sidecar: read label from ckpt_meta.json in ckpt dir")
+        println("  --dry-run: print rclone command without executing")
+        return
+    }
+
+    let ckpt_dir = argv[2]
+    let mut arg_label = ""
+    if argc >= 4 { arg_label = argv[3] }
+    let mut dry_run = false
+    if env("DRY_RUN") == "1" { dry_run = true }
+    let mut i = 3
+    while i < argc {
+        if argv[i] == "--dry-run" { dry_run = true }
+        i = i + 1
+    }
+
+    log_info("ckpt_dir=" + ckpt_dir + " arg_label=" + arg_label + " dry_run=" + str(dry_run))
+
+    // ── Validate ckpt dir exists ──
+    if !file_exists(ckpt_dir) {
+        log_err("ckpt dir not found: " + ckpt_dir)
+        return
+    }
+
+    // ── Idempotency check ──
+    let marker_state = check_markers(ckpt_dir)
+    if marker_state == "DONE" {
+        log_info("marker " + MARKER_DONE + " present — skipping (already uploaded)")
+        return
+    }
+    if marker_state == "PARTIAL" {
+        log_warn("marker " + MARKER_PARTIAL + " present without " + MARKER_DONE + " — prior upload interrupted, re-uploading")
+    }
+
+    // ── Read sidecar ──
+    let sidecar_text = read_sidecar(ckpt_dir)
+    if len(sidecar_text) == 0 {
+        log_warn("no sidecar found — relying on cli args + defaults")
+    }
+
+    // ── Resolve label ──
+    let label = resolve_label(arg_label, sidecar_text)
+    log_info("resolved label=" + label)
+
+    // ── Naming validation (E3) ──
+    let basename_cmd = "basename " + ckpt_dir
+    let basename = exec(basename_cmd).trim()
+    let lint = validate_basename(basename)
+    if lint != "OK" {
+        log_warn("naming lint: " + lint)
+        // Continue — lint is advisory at hook time. Linter script catches
+        // hard rejection at promotion time.
+    }
+
+    // ── Decide upload routing ──
+    let should_upload = label_uploads(label)
+    if !should_upload {
+        log_info("label=" + label + " has r2_upload=false — skipping R2 (per ckpt_policy)")
+        // Mark done to skip on resume even for experiment ckpts.
+        mark_done(ckpt_dir)
+        log_info("marker " + MARKER_DONE + " written (no-upload path)")
+        return
+    }
+
+    // ── Resolve R2 prefix (need model_tag, round, step) ──
+    let mut model_tag = extract_json_string(sidecar_text, "model_tag")
+    let mut round_str = extract_json_int_str(sidecar_text, "round")
+    let mut step_str = extract_json_int_str(sidecar_text, "step")
+
+    if model_tag == "" {
+        // Try to derive from basename: alm14b-phi-r4-s10000 -> alm14b
+        if basename.starts_with("alm") || basename.starts_with("clm") {
+            let dash = str_index_of(basename, "-", 0)
+            if dash > 0 {
+                model_tag = basename.substring(0, dash)
+            }
+        }
+        if model_tag == "" { model_tag = "alm14b" }
+        log_warn("model_tag not in sidecar — inferred=" + model_tag)
+    }
+    if round_str == "" { round_str = "1" ; log_warn("round not in sidecar — defaulted to 1") }
+    if step_str == "" { step_str = "0" ; log_warn("step not in sidecar — defaulted to 0") }
+
+    let remote_prefix = r2_prefix_for(label, model_tag, round_str, step_str)
+    if remote_prefix == "" {
+        log_err("could not derive R2 prefix for label=" + label)
+        return
+    }
+
+    log_info("R2 prefix: " + remote_prefix)
+
+    // ── Generate sha256 manifest (E7) BEFORE upload ──
+    // Root cause for this ordering: if we upload first and then hash,
+    // a power-loss between steps means R2 has unverifiable files.
+    let manifest_ok = generate_manifest(ckpt_dir)
+    if !manifest_ok {
+        log_warn("manifest generation produced no hashes — upload will proceed without manifest")
+    }
+
+    // ── Mark partial BEFORE upload ──
+    if !dry_run {
+        mark_partial(ckpt_dir)
+    }
+
+    // ── Build + execute rclone ──
+    let rclone_cmd = build_rclone_cmd(ckpt_dir, remote_prefix, dry_run)
+    log_info("rclone cmd: " + rclone_cmd)
+
+    if dry_run {
+        log_info("DRY-RUN: not executing rclone")
+        return
+    }
+
+    let result = exec(rclone_cmd + "; echo RC=$?")
+    if str_contains(result, "RC=0") {
+        log_info("rclone OK — marking " + MARKER_DONE)
+        mark_done(ckpt_dir)
+    } else {
+        log_err("rclone FAILED — leaving " + MARKER_PARTIAL + " for retry")
+        log_err("output_tail=" + result.substring(0, 400))
+    }
+}
