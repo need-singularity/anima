@@ -56,14 +56,267 @@
 //   verifies determinism + latency bounds + meta sidecar shape.
 
 // ════════════════════════════════════════════════════════════════════
-//  Section 0. Imports
-// ════════════════════════════════════════════════════════════════════
+//  Section 0. Inlined neural_vocoder (stage0 lacks `import`)
 //
-// neural_vocoder.hexa provides decode_wave() + write_wav() — the real
-// Mk.III synthesis path. Import does not auto-invoke the imported
-// file's main(), verified 2026-04-16 (hexa import semantics).
+//  Source: anima-speak/neural_vocoder.hexa Mk.III (2026-04-16)
+//  Reason: stage0 parser rejects `import "./neural_vocoder.hexa"`.
+//          Inlining decode_wave() + write_wav() + dependencies.
+//          Remove this block when stage0 gains import support.
+// ════════════════════════════════════════════════════════════════════
 
-import "./neural_vocoder.hexa"
+let SAMPLE_RATE   = 24000
+let HOP           = 240
+let LATENT_DIM    = 384
+let N_PARTIALS    = 6
+let CTRL_DIM      = 12
+let TWO_PI        = 6.283185307179586
+let BASE_FREQ_HZ  = 200.0
+let MAX_GAIN      = 0.18
+let B64_ALPHA     = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+fn vec_zeros(n: int) -> [float] {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [0.0]
+        i = i + 1
+    }
+    return out
+}
+
+fn linear_proj(x: [float], W: [float], b: [float], in_dim: int, out_dim: int) -> [float] {
+    let mut y = []
+    let mut i = 0
+    let has_bias = (len(b) == out_dim)
+    while i < out_dim {
+        let mut s = 0.0
+        if has_bias { s = b[i] }
+        let mut j = 0
+        while j < in_dim {
+            s = s + W[i * in_dim + j] * x[j]
+            j = j + 1
+        }
+        y = y + [s]
+        i = i + 1
+    }
+    return y
+}
+
+fn tanh_vec(x: [float]) -> [float] {
+    let mut y = []
+    let mut i = 0
+    while i < len(x) {
+        y = y + [tanh(x[i])]
+        i = i + 1
+    }
+    return y
+}
+
+fn mock_weight_identity(in_dim: int, out_dim: int) -> [float] {
+    let mut W = []
+    let mut o = 0
+    while o < out_dim {
+        let mut i = 0
+        while i < in_dim {
+            if i % out_dim == o {
+                W = W + [1.0 / to_float(in_dim / out_dim)]
+            } else {
+                W = W + [0.0]
+            }
+            i = i + 1
+        }
+        o = o + 1
+    }
+    return W
+}
+
+fn latent_to_ctrl(latent_frame: [float], W: [float]) -> [float] {
+    let raw = linear_proj(latent_frame, W, [], LATENT_DIM, CTRL_DIM)
+    return tanh_vec(raw)
+}
+
+fn freq_from_offset(partial_idx: int, offset: float) -> float {
+    let nominal = BASE_FREQ_HZ * to_float(partial_idx + 1)
+    let LN2 = 0.6931471805599453
+    let scale = exp(offset * LN2)
+    return nominal * scale
+}
+
+fn synth_additive(ctrl_frames: [[float]], n_samples: int) -> [float] {
+    let mut phase = vec_zeros(N_PARTIALS)
+    let mut out = []
+    let inv_sr = 1.0 / to_float(SAMPLE_RATE)
+    let n_frames = len(ctrl_frames)
+    let mut t = 0
+    while t < n_samples {
+        let frame_pos = to_float(t) / to_float(HOP)
+        let mut f0 = to_int(frame_pos)
+        if f0 < 0 { f0 = 0 }
+        if f0 >= n_frames { f0 = n_frames - 1 }
+        let mut f1 = f0 + 1
+        if f1 >= n_frames { f1 = n_frames - 1 }
+        let alpha = frame_pos - to_float(f0)
+        let mut s = 0.0
+        let mut p = 0
+        while p < N_PARTIALS {
+            let off_a = ctrl_frames[f0][p * 2]
+            let off_b = ctrl_frames[f1][p * 2]
+            let off = off_a * (1.0 - alpha) + off_b * alpha
+            let gain_a = ctrl_frames[f0][p * 2 + 1]
+            let gain_b = ctrl_frames[f1][p * 2 + 1]
+            let gain = gain_a * (1.0 - alpha) + gain_b * alpha
+            let freq = freq_from_offset(p, off)
+            let dphi = TWO_PI * freq * inv_sr
+            phase[p] = phase[p] + dphi
+            if phase[p] > TWO_PI { phase[p] = phase[p] - TWO_PI }
+            if phase[p] < 0.0   { phase[p] = phase[p] + TWO_PI }
+            s = s + gain * MAX_GAIN * sin(phase[p])
+            p = p + 1
+        }
+        out = out + [s]
+        t = t + 1
+    }
+    return out
+}
+
+fn decode_wave(latent_frames: [[float]], sample_rate: int) -> [float] {
+    if sample_rate != SAMPLE_RATE {
+        println("[neural_vocoder] sample_rate mismatch: got "
+                + to_string(sample_rate) + " expected " + to_string(SAMPLE_RATE))
+        return []
+    }
+    let n_frames = len(latent_frames)
+    if n_frames == 0 { return [] }
+    if len(latent_frames[0]) != LATENT_DIM {
+        println("[neural_vocoder] latent dim mismatch: got "
+                + to_string(len(latent_frames[0]))
+                + " expected " + to_string(LATENT_DIM))
+        return []
+    }
+    let W_ctrl = mock_weight_identity(LATENT_DIM, CTRL_DIM)
+    let mut ctrl_frames = []
+    let mut f = 0
+    while f < n_frames {
+        let c = latent_to_ctrl(latent_frames[f], W_ctrl)
+        ctrl_frames = ctrl_frames + [c]
+        f = f + 1
+    }
+    let n_samples = n_frames * HOP
+    return synth_additive(ctrl_frames, n_samples)
+}
+
+// -- WAV I/O (PCM16 mono, base64→shell decode) --
+
+fn b64_char(i: int) -> string {
+    return B64_ALPHA.substring(i, i + 1)
+}
+
+fn bytes_to_b64(bytes: [int]) -> string {
+    let n = len(bytes)
+    let mut out = ""
+    let mut i = 0
+    while i + 3 <= n {
+        let b0 = bytes[i]
+        let b1 = bytes[i + 1]
+        let b2 = bytes[i + 2]
+        let t = (b0 * 65536) + (b1 * 256) + b2
+        out = out + b64_char((t / 262144) % 64)
+        out = out + b64_char((t / 4096) % 64)
+        out = out + b64_char((t / 64) % 64)
+        out = out + b64_char(t % 64)
+        i = i + 3
+    }
+    let rem = n - i
+    if rem == 1 {
+        let b0 = bytes[i]
+        let t = b0 * 65536
+        out = out + b64_char((t / 262144) % 64)
+        out = out + b64_char((t / 4096) % 64)
+        out = out + "=="
+    } else if rem == 2 {
+        let b0 = bytes[i]
+        let b1 = bytes[i + 1]
+        let t = (b0 * 65536) + (b1 * 256)
+        out = out + b64_char((t / 262144) % 64)
+        out = out + b64_char((t / 4096) % 64)
+        out = out + b64_char((t / 64) % 64)
+        out = out + "="
+    }
+    return out
+}
+
+fn push_u32_le(bytes: [int], v: int) -> [int] {
+    let mut u = v
+    if u < 0 { u = u + 4294967296 }
+    let b0 = u % 256
+    let b1 = (u / 256) % 256
+    let b2 = (u / 65536) % 256
+    let b3 = (u / 16777216) % 256
+    return bytes + [b0, b1, b2, b3]
+}
+
+fn push_u16_le(bytes: [int], v: int) -> [int] {
+    let mut u = v
+    if u < 0 { u = u + 65536 }
+    let b0 = u % 256
+    let b1 = (u / 256) % 256
+    return bytes + [b0, b1]
+}
+
+fn push_str(bytes: [int], s: string) -> [int] {
+    let mut out = bytes
+    let mut i = 0
+    while i < len(s) {
+        let sub = s.substring(i, i + 1)
+        out = out + [char_code(sub, 0)]
+        i = i + 1
+    }
+    return out
+}
+
+fn build_wav_bytes(samples: [float], sample_rate: int) -> [int] {
+    let n = len(samples)
+    let data_len = n * 2
+    let chunk_size = 36 + data_len
+    let mut bytes = []
+    bytes = push_str(bytes, "RIFF")
+    bytes = push_u32_le(bytes, chunk_size)
+    bytes = push_str(bytes, "WAVE")
+    bytes = push_str(bytes, "fmt ")
+    bytes = push_u32_le(bytes, 16)
+    bytes = push_u16_le(bytes, 1)
+    bytes = push_u16_le(bytes, 1)
+    bytes = push_u32_le(bytes, sample_rate)
+    bytes = push_u32_le(bytes, sample_rate * 2)
+    bytes = push_u16_le(bytes, 2)
+    bytes = push_u16_le(bytes, 16)
+    bytes = push_str(bytes, "data")
+    bytes = push_u32_le(bytes, data_len)
+    let mut i = 0
+    while i < n {
+        let mut s = samples[i]
+        if s >  1.0 { s =  1.0 }
+        if s < -1.0 { s = -1.0 }
+        let s16 = to_int(s * 32767.0)
+        bytes = push_u16_le(bytes, s16)
+        i = i + 1
+    }
+    return bytes
+}
+
+fn write_wav(path: string, samples: [float], sample_rate: int) -> bool {
+    if len(samples) == 0 {
+        println("[neural_vocoder] write_wav: empty samples — skipping write")
+        return false
+    }
+    let bytes = build_wav_bytes(samples, sample_rate)
+    let b64 = bytes_to_b64(bytes)
+    let tmp = path + ".b64"
+    write_file(tmp, b64)
+    let cmd = "base64 -d -i " + tmp + " > " + path + " && rm -f " + tmp
+    let _ = exec(cmd)
+    return true
+}
 
 // ════════════════════════════════════════════════════════════════════
 //  Section 1. Constants

@@ -14,7 +14,7 @@
 | **Dispatch logic** (JSON route → handler) | PASS 7/7 | none — `serve_alm_native.hexa` self-test passes |
 | **voice_routes / hire_routes mount** | PASS | none — imports and routes resolved in scaffold |
 | **HTTP parse** (`method path body` from stdin) | PASS | none — tested via direct stdin pipe |
-| **Real socket bind/accept/read/write** | **FAIL** | `hexa_stage0` binary has **no `net_listen` builtin**. `self/std_net.hexa` lives only in worktree `rt-32-j`, not merged |
+| **Real socket bind/accept/read/write** | **FAIL** | `hexa_stage0` binary has **no `net_listen` builtin**. `self/std_net.hexa` wrapper calls `__builtin_net_*` but stage0 C runtime never got the impl ported (original was Rust `src/std_net.rs`, deleted during self-host absorption at hexa-lang@94ffd0f). **Original rt-32-j claim was incorrect — verified 2026-04-16 merge agent.** |
 | **socat bridge (per-conn SYSTEM:)** | **FAIL** | `read_stdin()` uses line-by-line `input()` loop; deadlocks on HTTP/1.1 half-open socket that never reaches EOF |
 | **Qwen 14B FFI forward** | **MOCK** | `libhxqwen14b.so` not built. `hxlmhead.so` exists on Mac only; Linux build missing |
 
@@ -45,9 +45,9 @@
 
 ### 1.3 `self/std_net.hexa` existence
 
-- Found in `/Users/ghost/Dev/hexa-lang/.claude/worktrees/rt-32-j/self/std_net.hexa` (worktree branch)
+- **Exists on main** (`/Users/ghost/Dev/hexa-lang/self/std_net.hexa`) — bytes identical to worktrees
 - Delegates to `__builtin_net_listen` / `__builtin_net_accept` / etc.
-- **Not compiled into live `hexa_stage0`**. Needs hexa-lang maintainer to land rt-32-j or equivalent.
+- **Not compiled into live `hexa_stage0`**. The C impl was in the deleted Rust `src/std_net.rs` (hexa-lang@94ffd0f self-host absorption). Need to port to `self/runtime.c` or a new `self/native/net.c` and register in stage0 builtin dispatch. (rt-32-j claim was incorrect — verified 2026-04-16.)
 
 ### 1.4 ALM pod status (untouched)
 
@@ -112,10 +112,11 @@ Three routes evaluated:
 
 ### 4.1 CRITICAL: hexa runtime missing `net_listen`/accept/read/write/close
 
-- **Who owns:** hexa-lang repo maintainer (branch `rt-32-j` has it)
-- **Path:** merge `rt-32-j` into main, rebuild `hexa_stage0`, redeploy `shared/bin/hexa`
-- **Effort estimate:** 1 day (runtime already exists, just needs compile + smoke tests)
+- **Who owns:** hexa-lang repo maintainer
+- **Path:** Port C impl (was Rust `src/std_net.rs`, deleted at 94ffd0f) into `self/runtime.c` or `self/native/net.c`. Register 8 symbols (`net_listen`, `net_accept`, `net_read`, `net_write`, `net_close`, `net_connect`, `http_get`, `http_serve`) in stage0 builtin dispatch. Rebuild `hexa.real`. Original Rust logic available at hexa-lang@ef92fc6 in git history.
+- **Effort estimate:** 2-3 days (C port + dispatch wiring + smoke tests)
 - **Test:** `hexa run serve_alm_native.hexa` with `RUNTIME_HAS_NET=true` should bind :8090
+- **NOTE:** Earlier "merge rt-32-j" path was incorrect (verified 2026-04-16 — rt-32-j is env-define-batch, unrelated to networking)
 
 ### 4.2 HIGH: `libhxqwen14b.so` not built
 
@@ -148,7 +149,7 @@ Three routes evaluated:
 
 ### Phase 1 — Land `net_listen` in hexa runtime (1 day, blocks everything)
 
-1. hexa-lang maintainer merges `rt-32-j` → main
+1. hexa-lang maintainer ports net builtins (Rust `src/std_net.rs` at hexa-lang@ef92fc6 → C in `self/runtime.c`) + registers in stage0 builtin dispatch
 2. Rebuild `hexa_stage0` (macOS + Linux)
 3. Redeploy `shared/bin/hexa` wrapper resolves to rebuilt binary
 4. Verify: `hexa run test_net.hexa` (from §1.2) returns `LISTEN ok`

@@ -283,6 +283,245 @@ fn vr_tts_mock(reply_text: string) -> VrTtsResult {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  Section 4b. Real vocoder path (inlined from neural_vocoder.hexa)
+//  Reason: stage0 lacks import/use cross-dir. Remove when fixed.
+//  Source: anima-speak/neural_vocoder.hexa Mk.III (2026-04-16)
+// ═══════════════════════════════════════════════════════════════
+
+let VR_HOP = 240
+let VR_LATENT_DIM = 384
+let VR_N_PARTIALS = 6
+let VR_CTRL_DIM = 12
+let VR_TWO_PI = 6.283185307179586
+let VR_BASE_FREQ = 200.0
+let VR_MAX_GAIN = 0.18
+let VR_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+fn vr_zeros(n: int) -> [float] {
+    let mut out = []
+    let mut i = 0
+    while i < n { out = out + [0.0]; i = i + 1 }
+    return out
+}
+
+fn vr_linear(x: [float], W: [float], in_d: int, out_d: int) -> [float] {
+    let mut y = []
+    let mut i = 0
+    while i < out_d {
+        let mut s = 0.0
+        let mut j = 0
+        while j < in_d { s = s + W[i * in_d + j] * x[j]; j = j + 1 }
+        y = y + [s]
+        i = i + 1
+    }
+    return y
+}
+
+fn vr_tanh_v(x: [float]) -> [float] {
+    let mut y = []
+    let mut i = 0
+    while i < len(x) { y = y + [tanh(x[i])]; i = i + 1 }
+    return y
+}
+
+fn vr_mock_w(in_d: int, out_d: int) -> [float] {
+    let mut W = []
+    let mut o = 0
+    while o < out_d {
+        let mut i = 0
+        while i < in_d {
+            if i % out_d == o { W = W + [1.0 / to_float(in_d / out_d)] } else { W = W + [0.0] }
+            i = i + 1
+        }
+        o = o + 1
+    }
+    return W
+}
+
+fn vr_lat2ctrl(frame: [float], W: [float]) -> [float] {
+    return vr_tanh_v(vr_linear(frame, W, VR_LATENT_DIM, VR_CTRL_DIM))
+}
+
+fn vr_freq_off(p: int, off: float) -> float {
+    let nom = VR_BASE_FREQ * to_float(p + 1)
+    return nom * exp(off * 0.6931471805599453)
+}
+
+fn vr_synth(ctrl: [[float]], n_samp: int) -> [float] {
+    let mut phase = vr_zeros(VR_N_PARTIALS)
+    let mut out = []
+    let inv_sr = 1.0 / to_float(VR_SAMPLE_RATE)
+    let nf = len(ctrl)
+    let mut t = 0
+    while t < n_samp {
+        let fp = to_float(t) / to_float(VR_HOP)
+        let mut f0 = to_int(fp)
+        if f0 < 0 { f0 = 0 }
+        if f0 >= nf { f0 = nf - 1 }
+        let mut f1 = f0 + 1
+        if f1 >= nf { f1 = nf - 1 }
+        let a = fp - to_float(f0)
+        let mut s = 0.0
+        let mut p = 0
+        while p < VR_N_PARTIALS {
+            let oa = ctrl[f0][p * 2]
+            let ob = ctrl[f1][p * 2]
+            let off = oa * (1.0 - a) + ob * a
+            let ga = ctrl[f0][p * 2 + 1]
+            let gb = ctrl[f1][p * 2 + 1]
+            let g = ga * (1.0 - a) + gb * a
+            let dphi = VR_TWO_PI * vr_freq_off(p, off) * inv_sr
+            phase[p] = phase[p] + dphi
+            if phase[p] > VR_TWO_PI { phase[p] = phase[p] - VR_TWO_PI }
+            s = s + g * VR_MAX_GAIN * sin(phase[p])
+            p = p + 1
+        }
+        out = out + [s]
+        t = t + 1
+    }
+    return out
+}
+
+fn vr_decode_wave(latent: [[float]]) -> [float] {
+    let nf = len(latent)
+    if nf == 0 { return [] }
+    if len(latent[0]) != VR_LATENT_DIM { return [] }
+    let W = vr_mock_w(VR_LATENT_DIM, VR_CTRL_DIM)
+    let mut cf = []
+    let mut f = 0
+    while f < nf { cf = cf + [vr_lat2ctrl(latent[f], W)]; f = f + 1 }
+    return vr_synth(cf, nf * VR_HOP)
+}
+
+// WAV byte builder → base64 string (POSIX-free, pure hexa)
+fn vr_b64c(i: int) -> string { return VR_B64.substring(i, i + 1) }
+
+fn vr_to_b64(bytes: [int]) -> string {
+    let n = len(bytes)
+    let mut out = ""
+    let mut i = 0
+    while i + 3 <= n {
+        let t = (bytes[i] * 65536) + (bytes[i+1] * 256) + bytes[i+2]
+        out = out + vr_b64c((t/262144)%64) + vr_b64c((t/4096)%64) + vr_b64c((t/64)%64) + vr_b64c(t%64)
+        i = i + 3
+    }
+    let rem = n - i
+    if rem == 1 {
+        let t = bytes[i] * 65536
+        out = out + vr_b64c((t/262144)%64) + vr_b64c((t/4096)%64) + "=="
+    } else if rem == 2 {
+        let t = (bytes[i] * 65536) + (bytes[i+1] * 256)
+        out = out + vr_b64c((t/262144)%64) + vr_b64c((t/4096)%64) + vr_b64c((t/64)%64) + "="
+    }
+    return out
+}
+
+fn vr_pu32(b: [int], v: int) -> [int] {
+    let mut u = v
+    if u < 0 { u = u + 4294967296 }
+    return b + [u%256, (u/256)%256, (u/65536)%256, (u/16777216)%256]
+}
+
+fn vr_pu16(b: [int], v: int) -> [int] {
+    let mut u = v
+    if u < 0 { u = u + 65536 }
+    return b + [u%256, (u/256)%256]
+}
+
+fn vr_pstr(b: [int], s: string) -> [int] {
+    let mut o = b
+    let mut i = 0
+    while i < len(s) { o = o + [char_code(s.substring(i, i+1), 0)]; i = i + 1 }
+    return o
+}
+
+fn vr_wav_bytes(samples: [float]) -> [int] {
+    let n = len(samples)
+    let dl = n * 2
+    let mut b = []
+    b = vr_pstr(b, "RIFF")
+    b = vr_pu32(b, 36 + dl)
+    b = vr_pstr(b, "WAVE")
+    b = vr_pstr(b, "fmt ")
+    b = vr_pu32(b, 16)
+    b = vr_pu16(b, 1)
+    b = vr_pu16(b, 1)
+    b = vr_pu32(b, VR_SAMPLE_RATE)
+    b = vr_pu32(b, VR_SAMPLE_RATE * 2)
+    b = vr_pu16(b, 2)
+    b = vr_pu16(b, 16)
+    b = vr_pstr(b, "data")
+    b = vr_pu32(b, dl)
+    let mut i = 0
+    while i < n {
+        let mut s = samples[i]
+        if s > 1.0 { s = 1.0 }
+        if s < -1.0 { s = -1.0 }
+        b = vr_pu16(b, to_int(s * 32767.0))
+        i = i + 1
+    }
+    return b
+}
+
+// Text → latent: hash-seeded sinusoidal pattern (deterministic, no RNG)
+fn vr_latent_from_text(text: string, nf: int) -> [[float]] {
+    let h = vr_djb2(text)
+    let mut frames = []
+    let mut f = 0
+    while f < nf {
+        let mut row = []
+        let mut j = 0
+        while j < VR_LATENT_DIM {
+            let seed = (h + f * 17 + j * 31) % 100000
+            let ph = to_float(seed) * 0.0000628318 + to_float(f) * 0.05
+            row = row + [0.4 * sin(ph) + 0.2 * sin(ph * 3.1)]
+            j = j + 1
+        }
+        frames = frames + [row]
+        f = f + 1
+    }
+    return frames
+}
+
+// Real vocoder TTS — returns base64-encoded WAV in payload_text
+fn vr_tts_vocoder(reply_text: string) -> VrTtsResult {
+    let mut n_frames = 8
+    let ef = env("SPEAK_VOCODER_FRAMES")
+    if ef != "" {
+        let p = ef.parse_int()
+        if p > 0 { n_frames = p }
+    }
+    let latent = vr_latent_from_text(reply_text, n_frames)
+    let samples = vr_decode_wave(latent)
+    let ok = (len(samples) > 0)
+    let payload = if ok { vr_to_b64(vr_wav_bytes(samples)) } else { vr_fake_pcm(vr_djb2(reply_text), 0) }
+    let blob = VrWavBlob {
+        sample_rate: VR_SAMPLE_RATE,
+        channels: VR_CHANNELS,
+        bits: VR_BITS_PER_SAMPLE,
+        n_samples: len(samples),
+        payload_text: payload
+    }
+    return VrTtsResult {
+        audio: blob,
+        backend: if ok { "vocoder" } else { "vocoder-fallback" },
+        latency_ms: VR_MOCK_TTS_LATENCY_MS,
+        ok: true
+    }
+}
+
+// TTS dispatch — env SPEAK_TTS_BACKEND selects mock or vocoder
+fn vr_tts_dispatch(reply_text: string) -> VrTtsResult {
+    let backend = env("SPEAK_TTS_BACKEND")
+    if backend == "vocoder" {
+        let r = vr_tts_vocoder(reply_text)
+        if r.ok && len(r.audio.payload_text) > 100 { return r }
+        // fallback to mock on failure
+    }
+    return vr_tts_mock(reply_text)
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  Section 5. JSON helpers (byte-only ASCII marker scan)
 // ═══════════════════════════════════════════════════════════════
 
@@ -448,8 +687,8 @@ fn vr_handle_tts(body: string) -> VrTtsResponse {
         vr_fallback_profile()
     }
 
-    // TTS synthesis
-    let tts = vr_tts_mock(text)
+    // TTS synthesis — dispatch to vocoder or mock based on env
+    let tts = vr_tts_dispatch(text)
     let params = vr_profile_to_params(profile)
 
     // Compute total latency (TTS only for this endpoint)
@@ -545,7 +784,7 @@ fn vr_handle_e2e(body: string) -> VrE2eResponse {
     }
 
     // (d) TTS
-    let tts = vr_tts_mock(llm.reply)
+    let tts = vr_tts_dispatch(llm.reply)
     let total = stt.latency_ms + llm.latency_ms + tts.latency_ms
 
     return VrE2eResponse {
