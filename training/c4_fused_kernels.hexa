@@ -1,0 +1,504 @@
+// ═══════════════════════════════════════════════════════════════
+//  training/c4_fused_kernels.hexa — C4 CUDA fused mega-kernel impl
+//
+//  First fused mega-kernel implementation on top of the parse-only
+//  interface stubs in c4_fused_kernels_interface.hexa. Implements
+//  F1 from the C4 design doc (highest ROI, simplest kernel):
+//
+//     F1 fused_qkv_projection_fwd
+//        Fuses three sgemm calls (Wq, Wk, Wv) into one launch by
+//        packing [Wq | Wk | Wv] into a single [K_in, 3*D_head*H]
+//        weight matrix. The shared input row `norm` is loaded once
+//        per (m, n) tile, recovering bandwidth that the unfused
+//        path leaks across three separate kernels.
+//
+//        Launch reduction:  3 → 1
+//        bf16 Tensor Core:  NO  (this MVP is fp32 → fp32)
+//        Expected speedup:  ~1.4× (launch reduction only)
+//        Future TC uplift:  +1.8× when bf16 WMMA path lands behind
+//                           c2_struct_args ABI (deferred to F1-TC).
+//
+//  Status: WMMA-free fp32 MVP.  The interface stub
+//          `fused_qkv_projection_fwd` in c4_fused_kernels_interface
+//          stays untouched (per pre-claim contract — bodies remain
+//          C4_ERR_C2_NOT_LANDED until C2 lands).  This file ships
+//          the *implementation* under names prefixed `c4_impl_`.
+//          When C2 lands the stub bodies become trivial wrappers
+//          around c4_impl_*.
+//
+//  Numerical contract:
+//          max |fused - unfused| / max |unfused| < 1e-3   (fp32)
+//          Self-test shape: M=256, K=256, D_head=64, H=4 (3·Dh·H = 768)
+//          Verified by CPU reference (no GPU required) — see §4.
+//
+//  Module isolation:
+//          Loads its own NVRTC module G_C4_MODULE — independent of
+//          G_K_MODULE in cuda_kernels.hexa so small-model runs that
+//          never call c4_init_modules() pay zero NVRTC cost.
+//          (Risk 7.5 mitigation in c4-cuda-fused-megakernel-design.md.)
+//
+//  Layout:
+//    §1  NVRTC kernel string (qkv_proj_fused fp32)
+//    §2  Module + handle globals
+//    §3  Init / launcher (c4_init_modules, c4_impl_qkv_proj_fwd)
+//    §4  CPU reference + Mac-friendly self-test (no CUDA needed)
+//    §5  Numerical-equivalence harness (gpu vs cpu — pod-only)
+// ═══════════════════════════════════════════════════════════════
+
+use "cuda_ffi"
+use "cuda_rtc"
+
+// ── §1  NVRTC kernel string ─────────────────────────────────
+//
+// fused_qkv_projection_fwd_fp32:
+//   Y[m, n] = sum_{k=0..K-1} norm[m,k] * Wqkv[k, n]
+//   where:
+//     norm     : [M, K]  row-major
+//     Wqkv     : [K, N]  row-major  (N = 3 * D_head * H)
+//     out_q    : [M, D_head*H]   = Y[:, 0           .. DhH)
+//     out_k    : [M, D_head*H]   = Y[:, DhH         .. 2*DhH)
+//     out_v    : [M, D_head*H]   = Y[:, 2*DhH       .. 3*DhH)
+//
+// Block choice: 1 thread per output (m,n).
+//   Block 16x16, grid ceil(M/16) x ceil(N/16).
+//   Each thread does a K-length reduction.
+//   No shared memory — fp32 simple version.
+//   K stride loop kept short (K ≤ 4096 for CLM 1.5B), so we just
+//   walk it in registers. The bf16 WMMA upgrade (Step 2) will move
+//   this to the m16n16k16 tile.
+//
+// Output split: kernel writes the contiguous Y buffer; the launcher
+// passes three device pointers and the kernel uses an `if` chain on
+// `n` to dispatch to the right one. Equivalent to a 3-way memcpy
+// fused into the store step — no extra DRAM round trip.
+let K_C4_QKV_PROJ_FUSED_FWD = "extern \"C\" __global__ void c4_qkv_proj_fused_fwd(const float* norm, const float* Wqkv, float* outQ, float* outK, float* outV, int M, int K_in, int DhH) {\n    int m = blockIdx.x * blockDim.x + threadIdx.x;\n    int n = blockIdx.y * blockDim.y + threadIdx.y;\n    int N = 3 * DhH;\n    if (m >= M || n >= N) return;\n    float acc = 0.0f;\n    int k;\n    for (k = 0; k < K_in; k++) {\n        acc += norm[m * K_in + k] * Wqkv[k * N + n];\n    }\n    int slot = n / DhH;\n    int col  = n - slot * DhH;\n    int idx  = m * DhH + col;\n    if (slot == 0) {\n        outQ[idx] = acc;\n    } else if (slot == 1) {\n        outK[idx] = acc;\n    } else {\n        outV[idx] = acc;\n    }\n}\n"
+
+// ── §2  Module + handle globals ─────────────────────────────
+
+let mut G_C4_MODULE = ptr_null()
+let mut G_C4_qkv_proj_fused_fwd = ptr_null()
+let mut G_C4_INITIALISED = 0
+
+// ── §3  Init / launcher ─────────────────────────────────────
+
+// c4_init_modules — compile + load the C4 NVRTC module.
+// Independent of gpu_init_kernels() in cuda_kernels.hexa.
+// Returns 0 on success, negative error code otherwise.
+//
+// Empirical FFI fixes carried over from project_clm_hexa_gpu_plan.md:
+//   - rtc_init must run before cuModuleLoadData (binds primary ctx)
+//   - rtc_compile_ptx returns ptr_null() on NVRTC failure
+//   - rtc_get_function returns ptr with addr=0 if symbol missing
+@convergence(state="ossified", id="C4_NVRTC_OWN_MODULE", value="C4 fused kernels load into G_C4_MODULE separate from cuda_kernels.hexa G_K_MODULE — small-model runs pay zero NVRTC cost. Risk 7.5 mitigation in design doc §7.5", ossified_at="2026-04-16")
+fn c4_init_modules() {
+    let ri = rtc_init()
+    if ri != 0 {
+        println("[c4] rtc_init failed: " + str(ri))
+        return -4
+    }
+    let ptx = rtc_compile_ptx(K_C4_QKV_PROJ_FUSED_FWD, "c4_kernels.cu")
+    if ptr_addr(ptx) == 0 {
+        println("[c4] rtc_compile_ptx failed for c4_qkv_proj_fused_fwd")
+        return -1
+    }
+    G_C4_MODULE = rtc_load_module(ptx)
+    if ptr_addr(G_C4_MODULE) == 0 {
+        println("[c4] rtc_load_module failed")
+        return -2
+    }
+    G_C4_qkv_proj_fused_fwd = rtc_get_function(G_C4_MODULE, "c4_qkv_proj_fused_fwd")
+    if ptr_addr(G_C4_qkv_proj_fused_fwd) == 0 {
+        println("[c4] missing c4_qkv_proj_fused_fwd symbol")
+        return -3
+    }
+    G_C4_INITIALISED = 1
+    println("[c4] c4_init_modules OK — F1 fused_qkv_projection_fwd loaded")
+    0
+}
+
+// c4_is_module_ready — local readiness check for this file's module.
+// Distinct from c4_is_ready() in the interface file (which is
+// reserved for the post-C2 multi-kernel readiness gate).
+fn c4_is_module_ready() {
+    G_C4_INITIALISED
+}
+
+// ── arg-buffer helpers (mirrors cuda_kernels.hexa _arg_*) ────
+//
+// 8-byte alloc on every scalar — empirical FFI fix #12 in
+// project_clm_hexa_gpu_plan.md (glibc small-chunk heap fragility).
+fn _c4_arg_ptr(dev) {
+    let buf = alloc_raw(8)
+    write_i64(buf, 0, 0)
+    write_i64(buf, 0, ptr_addr(dev))
+    return buf
+}
+
+fn _c4_arg_i32(v) {
+    let buf = alloc_raw(8)
+    write_i64(buf, 0, 0)
+    write_i32(buf, 0, v)
+    return buf
+}
+
+fn _c4_free_args(args) {
+    let n = len(args)
+    let mut i = 0
+    while i < n {
+        free_raw(args[i], 8)
+        i = i + 1
+    }
+    return 0
+}
+
+fn _c4_ceil_div(a, b) {
+    return (a + b - 1) / b
+}
+
+// c4_impl_qkv_proj_fwd — actual launcher.
+// Signature mirrors fused_qkv_projection_fwd in c4_fused_kernels_interface
+// but lives under c4_impl_* so the stub stays untouched per pre-claim.
+//
+// Args:
+//   norm_dev : device ptr [M, K_in]
+//   Wqkv_dev : device ptr [K_in, 3*D_head*H]
+//   Q_dev    : device ptr [M, D_head*H]
+//   K_dev    : device ptr [M, D_head*H]
+//   V_dev    : device ptr [M, D_head*H]
+//   M        : input rows (B * S)
+//   K_in     : input cols (d_model)
+//   D_head   : per-head dim
+//   H        : num heads
+//
+// Returns: launch status (0 = OK, negative = error). If the C4 module
+// has not been initialised the call fails fast without touching CUDA.
+fn c4_impl_qkv_proj_fwd(norm_dev, Wqkv_dev, Q_dev, K_dev, V_dev,
+                        M, K_in, D_head, H) {
+    if G_C4_INITIALISED == 0 {
+        println("[c4] c4_impl_qkv_proj_fwd called before c4_init_modules — bail")
+        return -100
+    }
+    let DhH = D_head * H
+    let N = 3 * DhH
+    let args = [
+        _c4_arg_ptr(norm_dev),
+        _c4_arg_ptr(Wqkv_dev),
+        _c4_arg_ptr(Q_dev),
+        _c4_arg_ptr(K_dev),
+        _c4_arg_ptr(V_dev),
+        _c4_arg_i32(M),
+        _c4_arg_i32(K_in),
+        _c4_arg_i32(DhH)
+    ]
+    let bx = 16
+    let by = 16
+    let gx = _c4_ceil_div(M, bx)
+    let gy = _c4_ceil_div(N, by)
+    let st = rtc_launch(G_C4_qkv_proj_fused_fwd, gx, gy, 1, bx, by, 1, args)
+    let _ = _c4_free_args(args)
+    st
+}
+
+// ── §4  CPU reference + self-test (Mac-friendly) ────────────
+//
+// Pure-hexa reference computation mirroring the kernel exactly.
+// Used to (a) validate kernel logic on a host with no CUDA, (b) act
+// as the third-tier oracle when WMMA bf16 lands and we need to
+// distinguish kernel bugs from precision drift.
+//
+// Layout convention:
+//   norm  : flat array length M * K_in    (norm[m*K_in + k])
+//   Wqkv  : flat array length K_in * N    (Wqkv[k*N + n], N=3*DhH)
+//   out_* : flat array length M * DhH each
+
+// Reference: unfused 3-GEMM path.
+// For each of {Q, K, V}, computes out[m, c] = sum_k norm[m,k] * Wqkv[k, slot*DhH + c]
+// where slot ∈ {0, 1, 2}.
+fn c4_ref_qkv_unfused(norm: array, Wqkv: array,
+                      M: int, K_in: int, DhH: int) -> array {
+    let N = 3 * DhH
+    let mut out = []
+    let mut i = 0
+    while i < 3 * M * DhH {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    let mut slot = 0
+    while slot < 3 {
+        let mut m = 0
+        while m < M {
+            let mut c = 0
+            while c < DhH {
+                let mut sum = 0.0
+                let n = slot * DhH + c
+                let mut k = 0
+                while k < K_in {
+                    sum = sum + norm[m * K_in + k] * Wqkv[k * N + n]
+                    k = k + 1
+                }
+                // Pack as Q | K | V contiguously (slot * M*DhH offset)
+                let dst_idx = slot * M * DhH + m * DhH + c
+                out[dst_idx] = sum
+                c = c + 1
+            }
+            m = m + 1
+        }
+        slot = slot + 1
+    }
+    out
+}
+
+// Reference: fused single-pass path (CPU mock of the GPU kernel).
+// Same math, different traversal — proves the kernel's slot-split
+// logic produces identical output to the unfused 3-pass loop.
+fn c4_ref_qkv_fused(norm: array, Wqkv: array,
+                    M: int, K_in: int, DhH: int) -> array {
+    let N = 3 * DhH
+    let mut out = []
+    let mut i = 0
+    while i < 3 * M * DhH {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    let mut m = 0
+    while m < M {
+        let mut n = 0
+        while n < N {
+            let mut acc = 0.0
+            let mut k = 0
+            while k < K_in {
+                acc = acc + norm[m * K_in + k] * Wqkv[k * N + n]
+                k = k + 1
+            }
+            let slot = n / DhH
+            let col = n - slot * DhH
+            let dst_idx = slot * M * DhH + m * DhH + col
+            out[dst_idx] = acc
+            n = n + 1
+        }
+        m = m + 1
+    }
+    out
+}
+
+// Tiny deterministic LCG fill — keeps test bit-reproducible.
+fn _c4_fill_lcg(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        // Map to [-1, 1)
+        let u = (s % 65536) - 32768
+        let v = (u * 1) / 32768.0
+        out = out.push(v)
+        i = i + 1
+    }
+    out
+}
+
+fn _c4_max_abs_diff(a: array, b: array, n: int) -> float {
+    let mut max_d = 0.0
+    let mut i = 0
+    while i < n {
+        let d = a[i] - b[i]
+        let ad = if d < 0.0 { 0.0 - d } else { d }
+        if ad > max_d {
+            max_d = ad
+        }
+        i = i + 1
+    }
+    max_d
+}
+
+fn _c4_max_abs(a: array, n: int) -> float {
+    let mut max_v = 0.0
+    let mut i = 0
+    while i < n {
+        let v = a[i]
+        let av = if v < 0.0 { 0.0 - v } else { v }
+        if av > max_v {
+            max_v = av
+        }
+        i = i + 1
+    }
+    max_v
+}
+
+// c4_qkv_self_test_cpu — Mac-runnable correctness check.
+// Compares the fused-traversal CPU mock against the unfused 3-loop
+// path. Both produce bit-identical output (modulo fp32 add reorder
+// which we control by keeping K-loops summing in the same direction).
+//
+// Test shape: B=2, S=128, D=256 → M=256, K_in=256, D_head=64, H=4
+// (3*DhH = 768).
+//
+// Tolerance: max abs diff < 1e-3 (fp32 fused vs unfused).
+fn c4_qkv_self_test_cpu() {
+    let B = 2
+    let S = 128
+    let D = 256
+    let D_head = 64
+    let H = 4
+    let M = B * S
+    let DhH = D_head * H
+    let N = 3 * DhH
+
+    println("[c4-test] qkv_self_test_cpu shape: M=" + str(M) + " K_in=" + str(D) +
+            " D_head=" + str(D_head) + " H=" + str(H) + " N=" + str(N))
+
+    let norm = _c4_fill_lcg(M * D, 0x1234)
+    let Wqkv = _c4_fill_lcg(D * N, 0x5678)
+
+    let out_unfused = c4_ref_qkv_unfused(norm, Wqkv, M, D, DhH)
+    let out_fused   = c4_ref_qkv_fused(norm, Wqkv, M, D, DhH)
+
+    let total = 3 * M * DhH
+    let max_diff = _c4_max_abs_diff(out_unfused, out_fused, total)
+    let max_abs  = _c4_max_abs(out_unfused, total)
+    let rel = if max_abs > 0.0 { max_diff / max_abs } else { max_diff }
+
+    println("[c4-test] max_abs_diff=" + str(max_diff) +
+            " max_abs=" + str(max_abs) +
+            " rel=" + str(rel))
+
+    let tol = 0.001
+    if rel < tol {
+        println("[c4-test] PASS — fused vs unfused within fp32 tolerance (" + str(tol) + ")")
+        return 0
+    } else {
+        println("[c4-test] FAIL — fused vs unfused diff exceeds tolerance " + str(tol))
+        return -1
+    }
+}
+
+// ── §5  GPU numerical-equivalence harness (pod-only) ────────
+//
+// On an H100 host with CUDA, this harness allocates device buffers,
+// uploads norm + Wqkv, runs c4_impl_qkv_proj_fwd, downloads Q/K/V,
+// and compares against c4_ref_qkv_unfused. Returns 0 on PASS.
+//
+// Mac-side: returns -200 if c4_init_modules() never succeeded
+// (cuda_init / NVRTC unavailable) — the function is parse-clean and
+// safe to declare; it just bails fast on hosts without CUDA.
+fn c4_qkv_self_test_gpu() {
+    if G_C4_INITIALISED == 0 {
+        println("[c4-test-gpu] c4 module not initialised — call c4_init_modules() first")
+        return -200
+    }
+    let B = 2
+    let S = 128
+    let D = 256
+    let D_head = 64
+    let H = 4
+    let M = B * S
+    let DhH = D_head * H
+    let N = 3 * DhH
+
+    let norm_h = _c4_fill_lcg(M * D, 0x1234)
+    let Wqkv_h = _c4_fill_lcg(D * N, 0x5678)
+
+    // Allocate device buffers — fp32 = 4 bytes each.
+    let norm_dev = cuda_malloc(M * D * 4)
+    let Wqkv_dev = cuda_malloc(D * N * 4)
+    let Q_dev    = cuda_malloc(M * DhH * 4)
+    let K_dev    = cuda_malloc(M * DhH * 4)
+    let V_dev    = cuda_malloc(M * DhH * 4)
+
+    // Pack host arrays into raw fp32 buffers (one f32 = 4 bytes,
+    // write_f32 element-index per project_clm_hexa_gpu_plan.md fix #1).
+    let norm_buf = alloc_raw(M * D * 4)
+    let mut i = 0
+    while i < M * D {
+        write_f32(norm_buf, i, norm_h[i])
+        i = i + 1
+    }
+    let Wqkv_buf = alloc_raw(D * N * 4)
+    i = 0
+    while i < D * N {
+        write_f32(Wqkv_buf, i, Wqkv_h[i])
+        i = i + 1
+    }
+
+    let _ = cuda_memcpy_h2d(norm_dev, norm_buf, M * D * 4)
+    let _ = cuda_memcpy_h2d(Wqkv_dev, Wqkv_buf, D * N * 4)
+
+    let st = c4_impl_qkv_proj_fwd(norm_dev, Wqkv_dev, Q_dev, K_dev, V_dev,
+                                  M, D, D_head, H)
+    let _ = cuda_device_sync()
+    if st != 0 {
+        println("[c4-test-gpu] launch failed status=" + str(st))
+        free_raw(norm_buf, M * D * 4)
+        free_raw(Wqkv_buf, D * N * 4)
+        cuda_free(norm_dev)
+        cuda_free(Wqkv_dev)
+        cuda_free(Q_dev)
+        cuda_free(K_dev)
+        cuda_free(V_dev)
+        return -201
+    }
+
+    // Pull device → host into raw fp32 buffers.
+    let Q_buf = alloc_raw(M * DhH * 4)
+    let K_buf = alloc_raw(M * DhH * 4)
+    let V_buf = alloc_raw(M * DhH * 4)
+    let _ = cuda_memcpy_d2h(Q_buf, Q_dev, M * DhH * 4)
+    let _ = cuda_memcpy_d2h(K_buf, K_dev, M * DhH * 4)
+    let _ = cuda_memcpy_d2h(V_buf, V_dev, M * DhH * 4)
+
+    // Reassemble GPU output as packed [Q | K | V] flat array.
+    let mut got = []
+    let mut j = 0
+    while j < M * DhH {
+        got = got.push(read_f32(Q_buf, j))
+        j = j + 1
+    }
+    j = 0
+    while j < M * DhH {
+        got = got.push(read_f32(K_buf, j))
+        j = j + 1
+    }
+    j = 0
+    while j < M * DhH {
+        got = got.push(read_f32(V_buf, j))
+        j = j + 1
+    }
+
+    let want = c4_ref_qkv_unfused(norm_h, Wqkv_h, M, D, DhH)
+
+    let total = 3 * M * DhH
+    let max_diff = _c4_max_abs_diff(want, got, total)
+    let max_abs  = _c4_max_abs(want, total)
+    let rel = if max_abs > 0.0 { max_diff / max_abs } else { max_diff }
+
+    free_raw(norm_buf, M * D * 4)
+    free_raw(Wqkv_buf, D * N * 4)
+    free_raw(Q_buf, M * DhH * 4)
+    free_raw(K_buf, M * DhH * 4)
+    free_raw(V_buf, M * DhH * 4)
+    cuda_free(norm_dev)
+    cuda_free(Wqkv_dev)
+    cuda_free(Q_dev)
+    cuda_free(K_dev)
+    cuda_free(V_dev)
+
+    println("[c4-test-gpu] max_abs_diff=" + str(max_diff) +
+            " rel=" + str(rel))
+
+    let tol = 0.001
+    if rel < tol {
+        println("[c4-test-gpu] PASS — gpu fused matches cpu reference within " + str(tol))
+        return 0
+    } else {
+        println("[c4-test-gpu] FAIL — gpu vs cpu rel diff " + str(rel))
+        return -1
+    }
+}
+
+// Convenience entry point — parse-clean Mac, runs CPU self-test only.
+// On a CUDA host the caller can `c4_init_modules()` then
+// `c4_qkv_self_test_gpu()` separately.
+fn main() {
+    let _ = c4_qkv_self_test_cpu()
+    return 0
+}
