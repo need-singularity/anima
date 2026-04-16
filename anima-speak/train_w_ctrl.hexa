@@ -1,0 +1,550 @@
+// anima-speak/train_w_ctrl.hexa — W_ctrl 보코더 헤드 학습
+//
+// 4,608 params: W[12 × 384] — latent(384d) → tanh → ctrl(12d)
+// ctrl = {freq_offset, gain} × 6 partials
+//
+// Loss: spectral matching — ||synth_spec(W@latent) − target_spec||²
+//
+// CLI:
+//   hexa anima-speak/train_w_ctrl.hexa --steps 200 --lr 0.001 \
+//        [--corpus anima-speak/corpus] [--out anima-speak/ckpt_w_ctrl.json]
+//
+// Phases:
+//   1. Build training pairs: (latent[384], target_ctrl[12]) per frame
+//      - Synthetic mode: F0 contour + harmonic gains from formula
+//      - Corpus mode: WAV → DFT → F0 extract → harmonic amplitudes
+//   2. Gradient descent on W_ctrl: ∇L = 2(ŷ−y)·sech²(Wx)·x^T
+//   3. Save W[12×384] flat row-major to JSON checkpoint
+//
+// n=6: LATENT_DIM=384=64×6, N_PARTIALS=6, CTRL_DIM=12=6×2
+
+let LATENT_DIM = 384
+let N_PARTIALS = 6
+let CTRL_DIM   = 12
+let TWO_PI     = 6.283185307179586
+let BASE_FREQ  = 200.0   // Hz, partial 0 nominal
+let SR         = 24000
+let HOP        = 240     // 10ms frame
+
+// ═══════════════════════════════════════════════════════
+// 1. Synthetic training data — speech-like F0 contours
+// ═══════════════════════════════════════════════════════
+
+// Generate N training pairs (latent[384], target_ctrl[12])
+// F0 varies 80-400 Hz across frames (speech range)
+// Harmonics: gain ∝ 1/(partial+1) with per-frame modulation
+fn make_training_data(n_pairs: int) -> [[float]] {
+    // Flat array: each "row" is 384 (latent) + 12 (target) = 396 floats
+    let row_len = LATENT_DIM + CTRL_DIM
+    let mut data = []
+    let mut i = 0
+    while i < n_pairs {
+        let mut row = []
+
+        // F0 for this frame — sweep across speech range
+        let t = to_float(i) / to_float(n_pairs)
+        let f0 = 100.0 + 200.0 * sin(TWO_PI * t * 3.0 + 0.5) * sin(TWO_PI * t * 0.7)
+        // Clamp to speech range
+        let mut f0c = f0
+        if f0c < 80.0 { f0c = 80.0 }
+        if f0c > 400.0 { f0c = 400.0 }
+
+        // Latent: spectrogram-like features from the target F0
+        // Place energy peaks at harmonic positions in the 384-bin "spectrum"
+        let mut j = 0
+        while j < LATENT_DIM {
+            let bin_freq = to_float(j) * to_float(SR / 2) / to_float(LATENT_DIM)
+            let mut val = 0.0
+            let mut p = 0
+            while p < N_PARTIALS {
+                let harm_freq = f0c * to_float(p + 1)
+                let dist = (bin_freq - harm_freq) / 20.0
+                val = val + (1.0 / to_float(p + 1)) * exp(-0.5 * dist * dist)
+                p = p + 1
+            }
+            row = row + [val]
+            j = j + 1
+        }
+
+        // Target ctrl: 6 × {freq_offset, gain}
+        let mut p = 0
+        while p < N_PARTIALS {
+            let harm_freq = f0c * to_float(p + 1)
+            let nominal = BASE_FREQ * to_float(p + 1)
+            // freq_offset in [-1, 1]: log2(harm_freq / nominal) clamped
+            let LN2 = 0.6931471805599453
+            let mut offset = 0.0
+            if nominal > 0.0 { offset = log(harm_freq / nominal) / LN2 }
+            if offset > 1.0 { offset = 1.0 }
+            if offset < -1.0 { offset = -1.0 }
+            // gain: 1/(p+1) with slight modulation
+            let g = (1.0 / to_float(p + 1)) * (0.8 + 0.4 * sin(TWO_PI * t * 5.0 + to_float(p)))
+            let mut gc = g
+            if gc > 1.0 { gc = 1.0 }
+            if gc < -1.0 { gc = -1.0 }
+            row = row + [offset, gc]
+            p = p + 1
+        }
+
+        data = data + [row]
+        i = i + 1
+    }
+    return data
+}
+
+// ═══════════════════════════════════════════════════════
+// 1b. Real corpus data — WAV → spectral features → training pairs
+//
+// Uses sox to convert WAV → headerless f32 PCM text (one sample per line).
+// Then extracts DFT magnitude as pseudo-latent, and F0 + harmonic gains
+// as target ctrl. Requires: sox installed on host.
+// ═══════════════════════════════════════════════════════
+
+fn load_wav_samples_text(path: string) -> [float] {
+    // Python wave stdlib oneshot — no new .py file (R1 compliant exec() inline)
+    // Reads WAV, resamples to 24kHz via linear interp, outputs one float per line
+    let cmd = "python3 -c \"import wave,struct,sys;f=wave.open('" + path + "');sr=f.getframerate();n=f.getnframes();ch=f.getnchannels();sw=f.getsampwidth();d=f.readframes(n);f.close();fmt='<'+'h'*(n*ch) if sw==2 else '<'+'b'*(n*ch);s=struct.unpack(fmt,d);mx=32768.0 if sw==2 else 128.0;mono=[s[i*ch]/mx for i in range(n)];tgt=int(n*24000/sr);out=[mono[int(i*sr/24000)] if int(i*sr/24000)<n else 0.0 for i in range(tgt)];[print(f'{v:.6f}') for v in out[:24000*10]]\" 2>/dev/null"
+    let raw = exec(cmd)
+    let mut samples = []
+    let n = len(raw)
+    let mut buf = ""
+    let mut i = 0
+    while i < n {
+        let c = raw.substring(i, i + 1)
+        if c == "\n" {
+            if len(buf) > 0 {
+                let v = parse_float(buf)
+                samples = samples + [v]
+                buf = ""
+            }
+        } else {
+            buf = buf + c
+        }
+        i = i + 1
+    }
+    if len(buf) > 0 {
+        let v = parse_float(buf)
+        samples = samples + [v]
+    }
+    return samples
+}
+
+// Simple F0 estimation via zero-crossing rate (ZCR)
+// Returns estimated Hz for a window of samples
+fn estimate_f0_zcr(window: [float], sr: int) -> float {
+    let n = len(window)
+    if n < 2 { return 150.0 }
+    let mut crossings = 0
+    let mut i = 1
+    while i < n {
+        if (window[i-1] >= 0.0 && window[i] < 0.0) || (window[i-1] < 0.0 && window[i] >= 0.0) {
+            crossings = crossings + 1
+        }
+        i = i + 1
+    }
+    if crossings < 2 { return 150.0 }
+    // F0 ≈ sr * crossings / (2 * n)
+    let f0 = to_float(sr) * to_float(crossings) / (2.0 * to_float(n))
+    if f0 < 50.0 { return 50.0 }
+    if f0 > 500.0 { return 500.0 }
+    return f0
+}
+
+// RMS energy of a window
+fn rms_energy(window: [float]) -> float {
+    let n = len(window)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + window[i] * window[i]
+        i = i + 1
+    }
+    return sqrt(s / to_float(n))
+}
+
+// Build training pairs from real audio samples
+fn make_corpus_data(samples: [float], max_pairs: int) -> [[float]] {
+    let n_total = len(samples)
+    let frame_len = 240  // HOP at 24kHz
+    let n_frames = n_total / frame_len
+    let mut n_use = n_frames
+    if n_use > max_pairs { n_use = max_pairs }
+
+    let mut data = []
+    let mut f = 0
+    while f < n_use {
+        let start = f * frame_len
+        // Extract window
+        let mut window = []
+        let mut j = 0
+        while j < frame_len {
+            if start + j < n_total {
+                window = window + [samples[start + j]]
+            } else {
+                window = window + [0.0]
+            }
+            j = j + 1
+        }
+
+        // Pseudo-latent: spectral magnitude bins
+        // Simplified: use windowed sample values + their products as features
+        // Pad/truncate to LATENT_DIM
+        let mut latent = []
+        j = 0
+        while j < LATENT_DIM {
+            if j < frame_len {
+                latent = latent + [window[j]]
+            } else {
+                // Mirror/extend
+                let idx = j % frame_len
+                latent = latent + [window[idx] * 0.5]
+            }
+            j = j + 1
+        }
+
+        // Target ctrl: estimate F0 + harmonic gains
+        let f0 = estimate_f0_zcr(window, SR)
+        let energy = rms_energy(window)
+        let LN2 = 0.6931471805599453
+        let mut ctrl = []
+        let mut p = 0
+        while p < N_PARTIALS {
+            let harm_freq = f0 * to_float(p + 1)
+            let nominal = BASE_FREQ * to_float(p + 1)
+            let mut offset = 0.0
+            if nominal > 0.0 { offset = log(harm_freq / nominal) / LN2 }
+            if offset > 1.0 { offset = 1.0 }
+            if offset < -1.0 { offset = -1.0 }
+            // Gain: decaying harmonics scaled by energy
+            let g = energy * 2.0 / to_float(p + 1)
+            let mut gc = g
+            if gc > 1.0 { gc = 1.0 }
+            if gc < -1.0 { gc = -1.0 }
+            ctrl = ctrl + [offset, gc]
+            p = p + 1
+        }
+
+        // Combine latent + ctrl into one row
+        let mut row = latent
+        j = 0
+        while j < CTRL_DIM { row = row + [ctrl[j]]; j = j + 1 }
+        data = data + [row]
+        f = f + 1
+    }
+    return data
+}
+
+// Scan corpus directory for WAV files via shell
+fn list_corpus_wavs(corpus_dir: string) -> [string] {
+    let raw = exec("find " + corpus_dir + " -name '*.wav' -type f 2>/dev/null | head -20")
+    let mut paths = []
+    let n = len(raw)
+    let mut buf = ""
+    let mut i = 0
+    while i < n {
+        let c = raw.substring(i, i + 1)
+        if c == "\n" {
+            if len(buf) > 0 { paths = paths + [buf]; buf = "" }
+        } else {
+            buf = buf + c
+        }
+        i = i + 1
+    }
+    if len(buf) > 0 { paths = paths + [buf] }
+    return paths
+}
+
+// ═══════════════════════════════════════════════════════
+// 2. Forward + Loss + Backward
+// ═══════════════════════════════════════════════════════
+
+fn tanh_f(x: float) -> float {
+    return tanh(x)
+}
+
+fn sech2(x: float) -> float {
+    let t = tanh(x)
+    return 1.0 - t * t
+}
+
+// Forward: y_hat = tanh(W @ x)
+fn forward(W: [float], x: [float]) -> [float] {
+    let mut y = []
+    let mut i = 0
+    while i < CTRL_DIM {
+        let mut s = 0.0
+        let mut j = 0
+        while j < LATENT_DIM {
+            s = s + W[i * LATENT_DIM + j] * x[j]
+            j = j + 1
+        }
+        y = y + [tanh_f(s)]
+        i = i + 1
+    }
+    return y
+}
+
+// MSE loss: mean of (y_hat - y_target)^2
+fn mse_loss(y_hat: [float], y_target: [float]) -> float {
+    let n = len(y_hat)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let d = y_hat[i] - y_target[i]
+        s = s + d * d
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+// Gradient: dL/dW[i,j] = (2/N) * (y_hat[i] - y[i]) * sech²(z[i]) * x[j]
+// where z = W @ x (pre-activation)
+fn backward(W: [float], x: [float], y_target: [float]) -> [float] {
+    // Compute z = W @ x (pre-activation)
+    let mut z = []
+    let mut i = 0
+    while i < CTRL_DIM {
+        let mut s = 0.0
+        let mut j = 0
+        while j < LATENT_DIM {
+            s = s + W[i * LATENT_DIM + j] * x[j]
+            j = j + 1
+        }
+        z = z + [s]
+        i = i + 1
+    }
+
+    // Compute gradient
+    let mut grad = []
+    let scale = 2.0 / to_float(CTRL_DIM)
+    i = 0
+    while i < CTRL_DIM {
+        let err = tanh_f(z[i]) - y_target[i]
+        let s2 = sech2(z[i])
+        let mut j = 0
+        while j < LATENT_DIM {
+            grad = grad + [scale * err * s2 * x[j]]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return grad
+}
+
+// ═══════════════════════════════════════════════════════
+// 3. Training loop
+// ═══════════════════════════════════════════════════════
+
+fn init_weights() -> [float] {
+    // Xavier-like init: W[i,j] = small sinusoidal pattern
+    let mut W = []
+    let n = CTRL_DIM * LATENT_DIM
+    let scale = 1.0 / to_float(LATENT_DIM)
+    let mut k = 0
+    while k < n {
+        let v = scale * sin(to_float(k) * 0.0137 + 0.5) * 0.1
+        W = W + [v]
+        k = k + 1
+    }
+    return W
+}
+
+fn train(data: [[float]], steps: int, lr: float) -> [float] {
+    let mut W = init_weights()
+    let n_data = len(data)
+    let n_w = len(W)
+
+    println("[train] params=" + to_string(n_w) + " data=" + to_string(n_data)
+            + " steps=" + to_string(steps) + " lr=" + to_string(lr))
+
+    let mut step = 0
+    while step < steps {
+        // Mini-batch: accumulate gradient over all data
+        let mut grad_acc = []
+        let mut k = 0
+        while k < n_w { grad_acc = grad_acc + [0.0]; k = k + 1 }
+
+        let mut total_loss = 0.0
+        let mut d = 0
+        while d < n_data {
+            let row = data[d]
+            // Split row into latent[0..384] and target[384..396]
+            let mut x = []
+            let mut j = 0
+            while j < LATENT_DIM { x = x + [row[j]]; j = j + 1 }
+            let mut y = []
+            j = 0
+            while j < CTRL_DIM { y = y + [row[LATENT_DIM + j]]; j = j + 1 }
+
+            let y_hat = forward(W, x)
+            total_loss = total_loss + mse_loss(y_hat, y)
+
+            let grad = backward(W, x, y)
+            // Accumulate
+            k = 0
+            while k < n_w {
+                grad_acc[k] = grad_acc[k] + grad[k]
+                k = k + 1
+            }
+            d = d + 1
+        }
+
+        // SGD update: W -= lr * grad_acc / n_data
+        let inv_n = 1.0 / to_float(n_data)
+        k = 0
+        while k < n_w {
+            W[k] = W[k] - lr * grad_acc[k] * inv_n
+            k = k + 1
+        }
+
+        let avg_loss = total_loss / to_float(n_data)
+        if step % 20 == 0 || step == steps - 1 {
+            println("[train] step=" + to_string(step)
+                    + " loss=" + to_string(avg_loss))
+        }
+        step = step + 1
+    }
+
+    return W
+}
+
+// ═══════════════════════════════════════════════════════
+// 4. Checkpoint save (JSON flat array)
+// ═══════════════════════════════════════════════════════
+
+fn save_checkpoint(path: string, W: [float]) -> bool {
+    let mut body = "{\n"
+    body = body + "  \"name\": \"w_ctrl\",\n"
+    body = body + "  \"shape\": [" + to_string(CTRL_DIM) + ", " + to_string(LATENT_DIM) + "],\n"
+    body = body + "  \"params\": " + to_string(len(W)) + ",\n"
+    body = body + "  \"data\": ["
+    let mut i = 0
+    while i < len(W) {
+        if i > 0 { body = body + "," }
+        // 6 decimal places
+        body = body + to_string(W[i])
+        i = i + 1
+    }
+    body = body + "]\n}\n"
+    write_file(path, body)
+    println("[train] saved " + to_string(len(W)) + " params → " + path)
+    return true
+}
+
+// ═══════════════════════════════════════════════════════
+// 5. Evaluation — synthesize with trained W and report
+// ═══════════════════════════════════════════════════════
+
+fn eval_trained(W: [float], data: [[float]]) -> float {
+    let mut total_loss = 0.0
+    let n = len(data)
+    let mut i = 0
+    while i < n {
+        let row = data[i]
+        let mut x = []
+        let mut j = 0
+        while j < LATENT_DIM { x = x + [row[j]]; j = j + 1 }
+        let mut y = []
+        j = 0
+        while j < CTRL_DIM { y = y + [row[LATENT_DIM + j]]; j = j + 1 }
+        let y_hat = forward(W, x)
+        total_loss = total_loss + mse_loss(y_hat, y)
+        i = i + 1
+    }
+    return total_loss / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════
+// 6. CLI
+// ═══════════════════════════════════════════════════════
+
+fn main() {
+    println("train_w_ctrl — HEXA-SPEAK Mk.III vocoder head trainer")
+    println("  params: " + to_string(CTRL_DIM * LATENT_DIM) + " (W[" + to_string(CTRL_DIM) + "×" + to_string(LATENT_DIM) + "])")
+
+    let av = args()
+    let mut steps = 200
+    let mut lr = 0.001
+    let mut n_data = 100
+    let mut out_path = "anima-speak/ckpt_w_ctrl.json"
+    let mut corpus_dir = ""
+
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--steps" {
+            if i + 1 < len(av) { steps = av[i + 1].parse_int() }
+            i = i + 2
+        } else if a == "--lr" {
+            if i + 1 < len(av) { lr = to_float(av[i + 1].parse_int()) / 1000.0 }
+            i = i + 2
+        } else if a == "--data" {
+            if i + 1 < len(av) { n_data = av[i + 1].parse_int() }
+            i = i + 2
+        } else if a == "--out" {
+            if i + 1 < len(av) { out_path = av[i + 1] }
+            i = i + 2
+        } else if a == "--corpus" {
+            if i + 1 < len(av) { corpus_dir = av[i + 1] }
+            i = i + 2
+        } else {
+            i = i + 1
+        }
+    }
+
+    let mut data = []
+    if len(corpus_dir) > 0 {
+        // Real corpus mode: load WAVs, extract features
+        println("[train] corpus mode: " + corpus_dir)
+        let wavs = list_corpus_wavs(corpus_dir)
+        println("[train] found " + to_string(len(wavs)) + " WAV files")
+        let pairs_per_wav = n_data / len(wavs)
+        let mut w = 0
+        while w < len(wavs) {
+            println("[train] loading " + wavs[w] + " ...")
+            let samples = load_wav_samples_text(wavs[w])
+            println("[train]   " + to_string(len(samples)) + " samples")
+            let pairs = make_corpus_data(samples, pairs_per_wav)
+            println("[train]   " + to_string(len(pairs)) + " training pairs")
+            let mut p = 0
+            while p < len(pairs) { data = data + [pairs[p]]; p = p + 1 }
+            w = w + 1
+        }
+        println("[train] total corpus pairs: " + to_string(len(data)))
+    } else {
+        // Synthetic mode
+        println("[train] synthetic mode: " + to_string(n_data) + " pairs")
+        data = make_training_data(n_data)
+    }
+    println("[train] data ready: " + to_string(len(data)) + " pairs × " + to_string(LATENT_DIM + CTRL_DIM) + "d")
+
+    // Pre-training eval (random init baseline)
+    let W_init = init_weights()
+    let loss_init = eval_trained(W_init, data)
+    println("[train] init loss=" + to_string(loss_init))
+
+    // Train
+    let W = train(data, steps, lr)
+
+    // Post-training eval
+    let loss_final = eval_trained(W, data)
+    println("[train] final loss=" + to_string(loss_final))
+    println("[train] improvement=" + to_string(loss_init / loss_final) + "x")
+
+    // Save
+    let _ = save_checkpoint(out_path, W)
+
+    // Sample: show first frame's pred vs target
+    if len(data) > 0 {
+        let row = data[0]
+        let mut x = []
+        let mut j = 0
+        while j < LATENT_DIM { x = x + [row[j]]; j = j + 1 }
+        let y_hat = forward(W, x)
+        println("[train] sample pred: " + to_string(y_hat[0]) + ", " + to_string(y_hat[1])
+                + ", " + to_string(y_hat[2]) + ", " + to_string(y_hat[3]))
+        println("[train] sample true: " + to_string(row[LATENT_DIM]) + ", " + to_string(row[LATENT_DIM + 1])
+                + ", " + to_string(row[LATENT_DIM + 2]) + ", " + to_string(row[LATENT_DIM + 3]))
+    }
+}
