@@ -1,0 +1,479 @@
+// training/corpus_fetch.hexa — CLM 7B 140GB corpus fetch scaffold
+//
+// Plan SSOT: shared/state/corpus_140gb_plan.json
+//
+// Purpose:
+//   Hexa-native scaffold that wraps the 140GB corpus acquisition pipeline
+//   for AnimaLM 7B scale-up (Chinchilla-optimal = 7B × 20 tokens/param).
+//
+//   This is a *scaffold* — fetch/dedup/filter bodies return typed
+//   placeholder values. Real network IO is deferred to a future pass
+//   once the user approves sources (D1-D5 in the plan JSON).
+//
+// Relationship to existing corpus files:
+//   - corpus_harvest.hexa  (P22-1)  discovers + scores candidates, writes
+//                                   a manifest. Operates on parallel arrays.
+//                                   This file CALLS into that shape.
+//   - corpus_filter.hexa   (P22-2)  quality filter. We wire its gates here
+//                                   through stub calls.
+//   - corpus_loader.hexa            legacy token loader (CPU path).
+//   - clm_mmap_loader.hexa          mmap loader for training (5.38GB → 140GB).
+//
+// Stage0 constraints (see feedback_hexa_*):
+//   - lists pass-by-value (feedback_hexa_lists_pbv) — return rebuilt lists
+//   - no && in compound booleans (nested if)
+//   - single-line return expressions (feedback_hexa_struct_return_bug Bug 2)
+//   - no struct with list fields (feedback_hexa_struct_list_alias) — use
+//     flat top-level arrays or int-only structs
+//   - no ≥3-float struct returns (feedback_hexa_struct_return_bug Bug 1) —
+//     return [float] instead
+//
+// Self-tests (T1–T3):
+//   T1 CorpusSource struct instantiation + field access (int-only fields
+//      + string fields; no list field, sidesteps aliasing bug)
+//   T2 registry returns ≥ 4 sources with non-empty URLs
+//   T3 list handling: push / index / len round-trip works as pass-by-value
+//
+// Run:
+//   $HEXA training/corpus_fetch.hexa            # self-test 3/3
+//   $HEXA training/corpus_fetch.hexa --plan     # print fetch plan (dry)
+
+// =====================================================================
+// Constants
+// =====================================================================
+
+let PLAN_PATH       = "shared/state/corpus_140gb_plan.json"
+let OUT_DIR         = "data/corpus_v2_raw"
+let R2_PREFIX       = "r2:anima-models/corpus/v2"
+let TARGET_GB       = 140.0
+let OVERPROVISION_GB = 180.0
+
+// Filter kind tags. A simple string tag avoids fn-pointer fields which
+// stage0 does not model well.
+let FILTER_NONE        = "none"
+let FILTER_KOREAN      = "korean"
+let FILTER_ENGLISH     = "english"
+let FILTER_CODE_PERMISSIVE = "code_permissive"
+let FILTER_PARALLEL    = "parallel"
+
+// =====================================================================
+// CorpusSource struct (int/float/string scalar fields only; no list field)
+//
+// NOTE: We deliberately use ONLY scalar fields to sidestep the
+// hexa struct-list aliasing bug (feedback_hexa_struct_list_alias).
+// Lists that "belong" to a source are stored as TOP-LEVEL parallel
+// arrays keyed by the source's int `idx` (see registry_* helpers
+// in corpus_harvest.hexa for the same pattern).
+// =====================================================================
+
+struct CorpusSource {
+    idx: int,           // index into parallel-array registry
+    name: string,       // human-readable
+    url: string,        // canonical fetch URL (or search query if none)
+    size_gb: float,     // estimated decompressed size
+    filter_fn: string   // filter-kind tag (see FILTER_* constants)
+}
+
+fn make_source(idx: int, name: string, url: string, size_gb: float, filter_fn: string) -> CorpusSource {
+    return CorpusSource {
+        idx: idx,
+        name: name,
+        url: url,
+        size_gb: size_gb,
+        filter_fn: filter_fn
+    }
+}
+
+// =====================================================================
+// Registry — parallel arrays (safe for stage0)
+//
+// These mirror a *subset* of shared/state/corpus_140gb_plan.json.
+// The plan JSON is SSOT; this registry is a fast-path for hexa code
+// that doesn't want to parse JSON.
+// =====================================================================
+
+fn registry_names() -> [string] {
+    return [
+        "kowiki_dump",
+        "cc100_ko",
+        "oscar_ko",
+        "pile_cc_slice",
+        "stack_v2_permissive",
+        "enwiki_dump",
+        "arxiv_abstracts",
+        "korean_en_parallel"
+    ]
+}
+
+fn registry_urls() -> [string] {
+    return [
+        "https://dumps.wikimedia.org/kowiki/latest/kowiki-latest-pages-articles.xml.bz2",
+        "https://data.statmt.org/cc-100/ko.txt.xz",
+        "hf://oscar-corpus/OSCAR-2301/ko",
+        "hf://monology/pile-uncopyrighted",
+        "hf://bigcode/the-stack-v2-dedup",
+        "https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles.xml.bz2",
+        "search://arxiv_bulk_metadata",
+        "hf://Helsinki-NLP/opus_ko_en"
+    ]
+}
+
+fn registry_sizes() -> [float] {
+    return [
+        5.5,
+        54.0,
+        45.0,
+        40.0,
+        30.0,
+        10.0,
+        4.0,
+        6.0
+    ]
+}
+
+fn registry_filters() -> [string] {
+    return [
+        "korean",
+        "korean",
+        "korean",
+        "english",
+        "code_permissive",
+        "english",
+        "english",
+        "parallel"
+    ]
+}
+
+// =====================================================================
+// build_registry — returns [CorpusSource]
+//
+// Each call creates a NEW list of sources. Since CorpusSource has no
+// list fields, struct-list aliasing (feedback_hexa_struct_list_alias)
+// does NOT apply — we can safely hold multiple instances in a list.
+// =====================================================================
+
+fn build_registry() -> [CorpusSource] {
+    let names   = registry_names()
+    let urls    = registry_urls()
+    let sizes   = registry_sizes()
+    let filters = registry_filters()
+
+    let n = len(names)
+    let mut out: [CorpusSource] = []
+    let mut i = 0
+    while i < n {
+        let src = make_source(i, names[i], urls[i], sizes[i], filters[i])
+        out = out.push(src)
+        i = i + 1
+    }
+    return out
+}
+
+// =====================================================================
+// total_registry_gb — sum of size_gb over all sources
+// =====================================================================
+
+fn total_registry_gb(sources: [CorpusSource]) -> float {
+    let n = len(sources)
+    let mut total = 0.0
+    let mut i = 0
+    while i < n {
+        total = total + sources[i].size_gb
+        i = i + 1
+    }
+    return total
+}
+
+// =====================================================================
+// fetch — STUB
+//
+// Real impl will branch on URL scheme:
+//   https://   → curl -L --retry 3 -C - -o <out>
+//   hf://      → huggingface-cli download OR direct resolve URL
+//   search://  → document the query, no fetch
+//
+// Returns the planned output path. A real fetch would return the
+// downloaded-bytes count; we return -1 to signal "not yet implemented"
+// while keeping the typed contract.
+// =====================================================================
+
+fn fetch(src: CorpusSource, dry_run: bool) -> int {
+    let out_path = OUT_DIR + "/" + src.name + ".raw"
+    let cmd = plan_fetch_command(src)
+    println("[fetch] " + src.name + " (" + str(src.size_gb) + " GB)")
+    println("  url:  " + src.url)
+    println("  out:  " + out_path)
+    println("  cmd:  " + cmd)
+
+    if dry_run {
+        return -1
+    }
+    // Real fetch deferred — user must approve D1-D5 in the plan JSON first.
+    println("  [STUB] fetch execution gated on user D1-D5 approval; returning -1")
+    return -1
+}
+
+fn plan_fetch_command(src: CorpusSource) -> string {
+    let out_path = OUT_DIR + "/" + src.name + ".raw"
+
+    // Manual URL-scheme dispatch. Nested ifs because stage0 has no
+    // case/switch and `&&` is discouraged in compound booleans.
+    if starts_with(src.url, "https://") {
+        return "curl -L --retry 3 -C - -o '" + out_path + "' '" + src.url + "'"
+    }
+    if starts_with(src.url, "http://") {
+        return "curl -L --retry 3 -C - -o '" + out_path + "' '" + src.url + "'"
+    }
+    if starts_with(src.url, "hf://") {
+        let repo = substring_after(src.url, "hf://")
+        return "huggingface-cli download '" + repo + "' --local-dir '" + out_path + "'"
+    }
+    if starts_with(src.url, "search://") {
+        return "echo 'SEARCH REQUIRED: " + src.url + " — document query, no automated fetch'"
+    }
+    return "echo 'unknown URL scheme for " + src.name + "'"
+}
+
+// =====================================================================
+// dedup — STUB
+//
+// Real impl will:
+//   1. stream lines from raw shard
+//   2. sha256(line) → bloom filter → hash table (first-seen wins)
+//   3. emit dedup_{src.name}.txt
+//
+// Returns: estimated kept-line count. -1 = not yet implemented.
+// =====================================================================
+
+fn dedup(src: CorpusSource, dry_run: bool) -> int {
+    let in_path = OUT_DIR + "/" + src.name + ".raw"
+    let out_path = OUT_DIR + "/" + src.name + ".dedup"
+    println("[dedup] " + src.name + ": " + in_path + " -> " + out_path)
+    if dry_run {
+        return -1
+    }
+    println("  [STUB] dedup execution deferred; see corpus_filter.hexa for line-level dedup primitive")
+    return -1
+}
+
+// =====================================================================
+// filter — STUB
+//
+// Dispatches on src.filter_fn tag to the appropriate filter pipeline
+// (delegated to corpus_filter.hexa in the real impl). For now we just
+// print the intended filter chain.
+// =====================================================================
+
+fn filter(src: CorpusSource, dry_run: bool) -> int {
+    let in_path = OUT_DIR + "/" + src.name + ".dedup"
+    let out_path = OUT_DIR + "/" + src.name + ".clean"
+    let chain = filter_chain_for(src.filter_fn)
+    println("[filter] " + src.name + " (" + src.filter_fn + "): " + chain)
+    println("  " + in_path + " -> " + out_path)
+    if dry_run {
+        return -1
+    }
+    println("  [STUB] filter execution delegates to training/corpus_filter.hexa")
+    return -1
+}
+
+fn filter_chain_for(kind: string) -> string {
+    if kind == "korean" {
+        return "length + hangul_ratio>=0.35 + entropy + mojibake + toxicity"
+    }
+    if kind == "english" {
+        return "length + latin_ratio>=0.60 + entropy + mojibake + toxicity"
+    }
+    if kind == "code_permissive" {
+        return "length + ascii_printable>=0.90 + license_spdx_allowlist"
+    }
+    if kind == "parallel" {
+        return "length + both_sides_nonempty + length_ratio_0.3_3.0"
+    }
+    return "length + entropy"
+}
+
+// =====================================================================
+// orchestrate — walks the registry, invokes fetch/dedup/filter per src
+//
+// Defaults to dry_run=true. Real pipeline invocation requires user
+// approval of D1-D5 in shared/state/corpus_140gb_plan.json.
+// =====================================================================
+
+fn orchestrate(dry_run: bool) -> float {
+    let sources = build_registry()
+    let n = len(sources)
+    println("[orchestrate] " + str(n) + " sources; dry_run=" + str(dry_run))
+    println("  target: " + str(TARGET_GB) + " GB, overprovision: " + str(OVERPROVISION_GB) + " GB")
+    println("")
+
+    let mut i = 0
+    while i < n {
+        let src = sources[i]
+        let _f = fetch(src, dry_run)
+        let _d = dedup(src, dry_run)
+        let _q = filter(src, dry_run)
+        println("")
+        i = i + 1
+    }
+    let total = total_registry_gb(sources)
+    println("[orchestrate] registry total: " + str(total) + " GB (target " + str(TARGET_GB) + " GB)")
+    return total
+}
+
+// =====================================================================
+// String helpers — hexa stage0 has limited string API (see
+// feedback_hexa_string_api). These wrappers keep use sites readable.
+// =====================================================================
+
+fn starts_with(s: string, prefix: string) -> bool {
+    let plen = len(prefix)
+    let slen = len(s)
+    if plen > slen { return false }
+    let head = s.substring(0, plen)
+    return head == prefix
+}
+
+fn substring_after(s: string, prefix: string) -> string {
+    let plen = len(prefix)
+    let slen = len(s)
+    if plen > slen { return s }
+    return s.substring(plen, slen)
+}
+
+// =====================================================================
+// Self-tests (T1–T3)
+// =====================================================================
+
+fn check_T1_struct_field_access() -> bool {
+    let src = make_source(0, "test_src", "https://example.com/x.txt.gz", 1.25, FILTER_KOREAN)
+    let name_ok = src.name == "test_src"
+    let url_ok  = src.url == "https://example.com/x.txt.gz"
+    let size_ok = src.size_gb > 1.24
+    let size_hi = src.size_gb < 1.26
+    let filter_ok = src.filter_fn == "korean"
+    let idx_ok = src.idx == 0
+
+    // Nested ifs instead of && — per stage0 compound-boolean guidance.
+    let mut ok = false
+    if name_ok {
+        if url_ok {
+            if size_ok {
+                if size_hi {
+                    if filter_ok {
+                        if idx_ok {
+                            ok = true
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println("  [T1] struct fields: name=" + str(name_ok) + " url=" + str(url_ok) + " size_ok=" + str(size_ok) + " filter=" + str(filter_ok) + " idx=" + str(idx_ok))
+    return ok
+}
+
+fn check_T2_registry_shape() -> bool {
+    let sources = build_registry()
+    let n = len(sources)
+    let size_ok = n >= 4
+    if size_ok == false {
+        println("  [T2] registry size " + str(n) + " < 4 — FAIL")
+        return false
+    }
+    let mut all_urls_nonempty = true
+    let mut i = 0
+    while i < n {
+        if len(sources[i].url) == 0 {
+            all_urls_nonempty = false
+        }
+        i = i + 1
+    }
+    let total = total_registry_gb(sources)
+    let total_gate = total >= 100.0
+    println("  [T2] registry=" + str(n) + " urls_ok=" + str(all_urls_nonempty) + " total_gb=" + str(total) + " (>=100)")
+    let mut ok = false
+    if all_urls_nonempty {
+        if total_gate {
+            ok = true
+        }
+    }
+    return ok
+}
+
+fn check_T3_list_pbv() -> bool {
+    // Verify list push / index / len round-trip, and that pass-by-value
+    // does not mutate the caller's list (feedback_hexa_lists_pbv).
+    let mut xs: [int] = []
+    xs = xs.push(10)
+    xs = xs.push(20)
+    xs = xs.push(30)
+
+    let before = len(xs)
+    let _ignored = try_mutate(xs)
+    let after = len(xs)
+
+    let idx_ok = xs[1] == 20
+    let len_stable = before == after
+    let len_is_3 = before == 3
+
+    let mut ok = false
+    if idx_ok {
+        if len_stable {
+            if len_is_3 {
+                ok = true
+            }
+        }
+    }
+    println("  [T3] list pbv: before=" + str(before) + " after=" + str(after) + " xs[1]=" + str(xs[1]))
+    return ok
+}
+
+fn try_mutate(ys: [int]) -> int {
+    // This mutation must NOT be visible to the caller because lists are PBV.
+    let mut zs = ys
+    zs = zs.push(999)
+    zs = zs.push(999)
+    return len(zs)
+}
+
+fn test() {
+    println("[training/corpus_fetch] CLM 7B 140GB corpus fetch scaffold")
+    println("  plan:    " + PLAN_PATH)
+    println("  out_dir: " + OUT_DIR)
+    println("  target:  " + str(TARGET_GB) + " GB")
+    println("")
+
+    let t1 = check_T1_struct_field_access()
+    if t1 { println("T1 PASS — CorpusSource struct field access clean") } else { println("T1 FAIL") }
+
+    let t2 = check_T2_registry_shape()
+    if t2 { println("T2 PASS — registry has >=4 sources, URLs non-empty, total>=100GB") } else { println("T2 FAIL") }
+
+    let t3 = check_T3_list_pbv()
+    if t3 { println("T3 PASS — list push/index/len + pass-by-value semantics stable") } else { println("T3 FAIL") }
+
+    println("")
+    let mut pass_count = 0
+    if t1 { pass_count = pass_count + 1 }
+    if t2 { pass_count = pass_count + 1 }
+    if t3 { pass_count = pass_count + 1 }
+
+    let all_pass = pass_count == 3
+    if all_pass {
+        println("[training/corpus_fetch] 3/3 PASS — scaffold ready")
+        println("")
+        println("[orchestrate] dry-run preview (no network IO):")
+        let total = orchestrate(true)
+        println("")
+        println("NEXT STEPS:")
+        println("  1. User approves D1-D5 in " + PLAN_PATH)
+        println("  2. Replace fetch/dedup/filter stubs with real exec() calls")
+        println("  3. Wire filter() into training/corpus_filter.hexa streaming mode")
+        println("  4. Pilot on smallest source (kowiki) end-to-end")
+    } else {
+        println("[training/corpus_fetch] " + str(pass_count) + "/3 PASS — SOME FAILED")
+    }
+}
+
+test()
