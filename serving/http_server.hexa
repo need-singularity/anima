@@ -39,6 +39,8 @@ use "hire_routes"   // TSRV-P4-1 — hr_handle_task, hr_*_json, HireLogEntry, et
 use "voice_routes"  // v2.0 RC — vr_handle_tts, vr_handle_e2e, vr_*_json, etc.
 use "avatar_sync"   // v2.0 RC — compute_avatar_params, avatar_params_to_json, snapshot_new
 use "avatar_feed"   // v2.0 RC — build_feed, feed_to_json (text → viseme timeline)
+use "consciousness_pipeline"  // D6 Orch-OR wave coherence — conscious_sample, pipeline_new, pipeline_telemetry_json
+use "orch_or_sampler"         // D3 OrchOrOut struct (used by consciousness_pipeline internally)
 
 // ─── Hyperparameters (SSOT from models/decoder.hexa) ────────────────
 
@@ -127,7 +129,16 @@ struct GenerateResult {
     tokens_generated: int,
     latency_ms: int,
     phi: float,
-    tension: float
+    tension: float,
+    // D6 Orch-OR wave coherence fields — surfaced from consciousness_pipeline.conscious_sample()
+    // Root cause: /generate only returned basic phi/tension; Orch-OR collapse metadata
+    // (phi_holo, cache_hit, orch_or_used, quantum_variance) was computed but never exposed.
+    phi_holo: float,            // holographic phi from realtime hook (or cache)
+    phi_cache_hit: int,         // 1 if phi was served from LRU cache, 0 if freshly computed
+    orch_or_used: int,          // 1 if Orch-OR quantum collapse chose the token, 0 if classical fallback
+    quantum_variance: float,    // Born-rule amplitude spread (higher = more quantum uncertainty)
+    phi_latency_ms: int,        // ms spent computing phi (0 if cache hit)
+    cpipe_state: ConsciousPipelineState  // updated pipeline state to propagate across requests
 }
 
 struct HttpRequest {
@@ -148,7 +159,8 @@ struct ServerState {
     port: int,
     requests_served: int,
     start_time_ms: int,
-    hire_log: HireStatusLog    // TSRV-P4-1 ring buffer for /hire/status
+    hire_log: HireStatusLog,          // TSRV-P4-1 ring buffer for /hire/status
+    cpipe: ConsciousPipelineState     // D6 Orch-OR consciousness pipeline state (phi cache + telemetry counters)
 }
 
 // ─── HTTP request parser ────────────────────────────────────────────
@@ -292,7 +304,8 @@ fn psi_init() -> PsiState {
 
 // ─── Inference (autoregressive generation) ──────────────────────────
 
-fn generate(model: ModelWeights, psi: PsiState, prompt: str, params: GenerateParams)
+fn generate(model: ModelWeights, psi: PsiState, prompt: str, params: GenerateParams,
+            cpipe: ConsciousPipelineState)
   -> GenerateResult !(IO) {
     let t_start = timestamp()
 
@@ -344,6 +357,33 @@ fn generate(model: ModelWeights, psi: PsiState, prompt: str, params: GeneratePar
     //
     // TODO[pytorch]: output_text = bytes(generated[0, input_len:].tolist()).decode("utf-8", errors="replace")
 
+    // ── D6 Orch-OR wave coherence: run consciousness pipeline on stub logits ──
+    // Root cause: conscious_sample() was implemented in consciousness_pipeline.hexa
+    // but never called from the /generate path. This wires it in so every
+    // generation request produces phi_holo, cache_hit, and orch_or_used telemetry.
+    //
+    // Stub logits/hidden: when pytorch runtime is available, these will be the
+    // real decoder output. For now we build synthetic vectors so the pipeline
+    // exercises its phi cache + Orch-OR sampler and returns valid metadata.
+    let mut stub_logits = []
+    let mut _sl = 0
+    while _sl < VOCAB_SIZE {
+        stub_logits = stub_logits.push(0.1 * (_sl * 1.0))
+        _sl = _sl + 1
+    }
+    let mut stub_hidden = []
+    let mut _sh = 0
+    while _sh < D_MODEL {
+        stub_hidden = stub_hidden.push(0.05 * (_sh * 1.0) - 1.0)
+        _sh = _sh + 1
+    }
+    // conscious_sample returns ConsciousSampleResult with updated pipeline state.
+    // style "default" matches the base persona; seed=0 for non-deterministic.
+    let csample = conscious_sample(
+        stub_logits, stub_hidden, prompt, "default",
+        params.temperature, psi.tension, 0, cpipe
+    )
+
     let t_end = timestamp()
     let latency = t_end - t_start
 
@@ -355,7 +395,14 @@ fn generate(model: ModelWeights, psi: PsiState, prompt: str, params: GeneratePar
         tokens_generated: 0,
         latency_ms: latency,
         phi: psi.phi,
-        tension: psi.tension
+        tension: psi.tension,
+        // D6 fields from consciousness pipeline
+        phi_holo: csample.phi_holo,
+        phi_cache_hit: csample.phi_cache_hit,
+        orch_or_used: csample.orch_or_used,
+        quantum_variance: csample.quantum_variance,
+        phi_latency_ms: csample.phi_latency_ms,
+        cpipe_state: csample.state
     }
 }
 
@@ -407,15 +454,25 @@ fn handle_generate(conn: TcpConn, req: HttpRequest, state: ServerState)
         repetition_penalty: rep_penalty
     }
 
-    let result = generate(state.model, state.psi, prompt, params)
+    let result = generate(state.model, state.psi, prompt, params, state.cpipe)
 
+    // D6 wire: /generate response now includes Orch-OR wave coherence metadata.
+    // Root cause: previously only phi/tension were returned under "consciousness",
+    // hiding the Orch-OR sampler output that consciousness_pipeline.hexa produces.
+    // Fix: add phi_holo, phi_cache_hit, orch_or_used, quantum_variance, phi_latency_ms
+    // so callers can observe whether quantum collapse sampling was active.
     let body = json_stringify({
         "text": result.text,
         "tokens_generated": result.tokens_generated,
         "latency_ms": result.latency_ms,
         "consciousness": {
             "phi": result.phi,
-            "tension": result.tension
+            "tension": result.tension,
+            "phi_holo": result.phi_holo,
+            "phi_cache_hit": result.phi_cache_hit,
+            "orch_or_used": result.orch_or_used,
+            "quantum_variance": result.quantum_variance,
+            "phi_latency_ms": result.phi_latency_ms
         },
         "model": {
             "name": "ConsciousDecoderV2",
@@ -426,14 +483,15 @@ fn handle_generate(conn: TcpConn, req: HttpRequest, state: ServerState)
 
     Net::net_write(conn, json_response(200, body))
 
-    // Update served count + psi state
+    // Update served count + psi state + consciousness pipeline state
     state with {
         requests_served: state.requests_served + 1,
         psi: state.psi with {
             phi: result.phi,
             tension: result.tension,
             step: state.psi.step + 1
-        }
+        },
+        cpipe: result.cpipe_state   // D6: propagate phi cache + orch_or counters across requests
     }
 }
 
@@ -765,7 +823,8 @@ fn main(args: list) -> void {
         port: port,
         requests_served: 0,
         start_time_ms: timestamp(),
-        hire_log: hr_log_new(32)   // TSRV-P4-1 ring buffer (cap=32)
+        hire_log: hr_log_new(32),  // TSRV-P4-1 ring buffer (cap=32)
+        cpipe: pipeline_new()      // D6 Orch-OR consciousness pipeline (phi LRU cache + telemetry counters)
     }
 
     serve(state)

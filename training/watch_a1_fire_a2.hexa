@@ -1,0 +1,223 @@
+// training/watch_a1_fire_a2.hexa — A1 completion watcher + A2 auto-fire
+//
+// Purpose:
+//   Detect A1 step_3000 completion (the final ckpt) and automatically launch
+//   A2-Orch on the SAME pod (lnzliav2e8du6i) with no human intervention.
+//   After A2-Orch completes, fire A2-Tool sequentially.
+//
+// Detection signals (ANY of):
+//   1. /workspace/ckpt_alm14b_phi_a1_*/step_3000/adapter_config.json exists
+//   2. /workspace/ckpt_alm14b_phi_a1_*/READY_A1_DONE marker file
+//   3. Training tmux window "alm-a1" exits (no process matches pattern)
+//
+// GPU idle gate (fail-safe):
+//   Before firing A2, re-verify GPU util<5% AND mem<2GB used.
+//   If A1 respawns or a sibling hot-grabs the GPU, do NOT fire A2.
+//
+// Run (pod-side):
+//   tmux new -d -s watch_a2 'cd /workspace/anima && hexa run training/watch_a1_fire_a2.hexa'
+//
+//   Confirm: tmux has-session -t watch_a2 && echo OK
+//
+// Configuration via env (optional):
+//   POLL_SECONDS     default 60    — between checks
+//   MAX_WAIT_HOURS   default 16    — refuse to fire if A1 stalls > this
+//   SKIP_ORCH        default 0     — if 1, skip A2-Orch, go straight to A2-Tool
+//   SKIP_TOOL        default 0     — if 1, stop after A2-Orch
+//   DRY_RUN          default 0     — if 1, log detection but do not fire
+//
+// Guardrails:
+//   - Writes /workspace/ckpt_alm14b_phi_a2_orch_*/READY_A2_ORCH_DONE marker
+//     which triggers A2-Tool fire (chain is explicit, not implicit).
+//   - If detection loops >MAX_WAIT_HOURS without trigger, exits with error
+//     and writes /workspace/WATCHER_A2_STALLED for operator visibility.
+//   - Logs to /workspace/watch_a1_fire_a2.log (append, not overwrite).
+//   - Fails closed: any preflight fail → refuse to fire, log, continue polling.
+
+let POLL_SECONDS_DEFAULT = 60
+let MAX_WAIT_HOURS_DEFAULT = 16
+
+fn log_line(msg) {
+    let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+    let full = "[" + ts + "] [watch_a2] " + msg
+    println(full)
+    // append to log
+    exec("echo '" + full.replace("'", "'\\''") + "' >> /workspace/watch_a1_fire_a2.log 2>/dev/null || true")
+}
+
+fn env_int(name, default_val) {
+    let v = env(name)
+    if v == "" { return default_val }
+    let n = to_int(v)
+    if n <= 0 { return default_val }
+    return n
+}
+
+fn a1_ckpt_done() -> bool {
+    // Check for step_3000 adapter (primary signal)
+    let probe = exec("ls /workspace/ckpt_alm14b_phi_a1_*/step_3000/adapter_config.json 2>/dev/null | head -n1").trim()
+    if len(probe) > 0 { return true }
+    // Check for READY_A1_DONE marker
+    let marker = exec("ls /workspace/ckpt_alm14b_phi_a1_*/READY_A1_DONE 2>/dev/null | head -n1").trim()
+    if len(marker) > 0 { return true }
+    return false
+}
+
+fn a2_orch_ckpt_done() -> bool {
+    let probe = exec("ls /workspace/ckpt_alm14b_phi_a2_orch_*/step_3000/adapter_config.json 2>/dev/null | head -n1").trim()
+    if len(probe) > 0 { return true }
+    let marker = exec("ls /workspace/ckpt_alm14b_phi_a2_orch_*/READY_A2_ORCH_DONE 2>/dev/null | head -n1").trim()
+    if len(marker) > 0 { return true }
+    return false
+}
+
+fn gpu_is_idle() -> bool {
+    // util<5 AND mem<2000 MiB
+    let util_raw = exec("nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -n1").trim()
+    let used_raw = exec("nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -n1").trim()
+    if util_raw == "" { return false }
+    if used_raw == "" { return false }
+    let util = to_int(util_raw)
+    let used = to_int(used_raw)
+    if util > 5 { return false }
+    if used > 2000 { return false }
+    return true
+}
+
+fn a1_tmux_alive() -> bool {
+    let out = exec("tmux has-session -t alm-a1 2>/dev/null; echo RC=$?")
+    if str_contains_s(out, "RC=0") { return true }
+    return false
+}
+
+fn str_contains_s(hay, needle) -> bool {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return true }
+    let mut i = 0
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn fire_a2_orch() -> bool {
+    log_line("firing A2-Orch (tmux session: alm-a2-orch)")
+    if env("DRY_RUN") == "1" {
+        log_line("DRY_RUN=1 — would exec: tmux new -d -s alm-a2-orch 'cd /workspace/anima && hexa run training/launch_alm_a2_orch.hexa 2>&1 | tee /workspace/alm_a2_orch.log'")
+        return true
+    }
+    let cmd = "tmux new -d -s alm-a2-orch 'cd /workspace/anima && hexa run training/launch_alm_a2_orch.hexa 2>&1 | tee /workspace/alm_a2_orch.log; echo [WATCHER] A2-Orch session ended; sleep 3600'"
+    let out = exec(cmd + "; echo RC=$?")
+    if !str_contains_s(out, "RC=0") {
+        log_line("FAIL: tmux new for A2-Orch returned non-zero: " + out.substring(0, 200))
+        return false
+    }
+    log_line("A2-Orch tmux session launched")
+    return true
+}
+
+fn fire_a2_tool() -> bool {
+    log_line("firing A2-Tool (tmux session: alm-a2-tool)")
+    if env("DRY_RUN") == "1" {
+        log_line("DRY_RUN=1 — would exec: tmux new -d -s alm-a2-tool 'cd /workspace/anima && hexa run training/launch_alm_a2_tool.hexa 2>&1 | tee /workspace/alm_a2_tool.log'")
+        return true
+    }
+    let cmd = "tmux new -d -s alm-a2-tool 'cd /workspace/anima && hexa run training/launch_alm_a2_tool.hexa 2>&1 | tee /workspace/alm_a2_tool.log; echo [WATCHER] A2-Tool session ended; sleep 3600'"
+    let out = exec(cmd + "; echo RC=$?")
+    if !str_contains_s(out, "RC=0") {
+        log_line("FAIL: tmux new for A2-Tool returned non-zero: " + out.substring(0, 200))
+        return false
+    }
+    log_line("A2-Tool tmux session launched")
+    return true
+}
+
+fn main() {
+    let poll_s = env_int("POLL_SECONDS", POLL_SECONDS_DEFAULT)
+    let max_wait_h = env_int("MAX_WAIT_HOURS", MAX_WAIT_HOURS_DEFAULT)
+    let skip_orch = env("SKIP_ORCH") == "1"
+    let skip_tool = env("SKIP_TOOL") == "1"
+
+    log_line("=== watch_a1_fire_a2 START ===")
+    log_line("poll_s=" + str(poll_s) + " max_wait_h=" + str(max_wait_h) + " skip_orch=" + str(skip_orch) + " skip_tool=" + str(skip_tool))
+
+    let max_iterations = (max_wait_h * 3600) / poll_s
+    let mut iteration = 0
+    let mut a2_orch_fired = false
+    let mut a2_tool_fired = false
+
+    while iteration < max_iterations {
+        // ── Phase 1: wait for A1 completion, then fire A2-Orch ──
+        if !a2_orch_fired && !skip_orch {
+            if a1_ckpt_done() {
+                log_line("A1 step_3000 detected — running preflight for A2-Orch")
+                // give A1 process 30s to flush + release GPU
+                exec("sleep 30")
+                if !gpu_is_idle() {
+                    log_line("GPU still busy (A1 might still be flushing) — will recheck next iter")
+                } else {
+                    if fire_a2_orch() {
+                        a2_orch_fired = true
+                        log_line("A2-Orch launched. Now monitoring for A2-Orch step_3000 completion...")
+                    } else {
+                        log_line("A2-Orch fire FAILED — will retry next iter")
+                    }
+                }
+            }
+        }
+        if skip_orch && !a2_orch_fired {
+            // pretend Orch done so Tool phase can run
+            log_line("SKIP_ORCH=1 — bypassing A2-Orch")
+            a2_orch_fired = true
+        }
+
+        // ── Phase 2: wait for A2-Orch completion, then fire A2-Tool ──
+        if a2_orch_fired && !a2_tool_fired && !skip_tool {
+            let orch_done = a2_orch_ckpt_done() || skip_orch
+            if orch_done {
+                log_line("A2-Orch complete (or SKIP_ORCH) — running preflight for A2-Tool")
+                exec("sleep 30")
+                if !gpu_is_idle() {
+                    log_line("GPU not idle post-A2-Orch — recheck next iter")
+                } else {
+                    if fire_a2_tool() {
+                        a2_tool_fired = true
+                        log_line("A2-Tool launched. Watcher will now exit after final ack.")
+                    } else {
+                        log_line("A2-Tool fire FAILED — will retry next iter")
+                    }
+                }
+            }
+        }
+        if skip_tool && a2_orch_fired && !a2_tool_fired {
+            log_line("SKIP_TOOL=1 — watcher done after A2-Orch fire")
+            a2_tool_fired = true
+        }
+
+        // ── Exit condition: both fired ──
+        if a2_orch_fired && a2_tool_fired {
+            log_line("=== All A2 rounds launched — watcher EXITING ===")
+            // Final sanity: list tmux sessions
+            let tmux_ls = exec("tmux ls 2>&1").trim()
+            log_line("tmux status: " + tmux_ls.substring(0, 400))
+            return
+        }
+
+        // ── Sleep until next poll ──
+        if iteration % 5 == 0 {
+            let a1_done_str = if a1_ckpt_done() { "yes" } else { "no" }
+            let a2o_done_str = if a2_orch_ckpt_done() { "yes" } else { "no" }
+            let gpu_idle_str = if gpu_is_idle() { "yes" } else { "no" }
+            log_line("poll#" + str(iteration) + " a1_done=" + a1_done_str + " a2_orch_done=" + a2o_done_str + " gpu_idle=" + gpu_idle_str + " orch_fired=" + str(a2_orch_fired) + " tool_fired=" + str(a2_tool_fired))
+        }
+        exec("sleep " + str(poll_s))
+        iteration = iteration + 1
+    }
+
+    // ── Timeout: max_wait_h exceeded without trigger ──
+    log_line("ERROR: max_wait_h=" + str(max_wait_h) + "h exceeded without launching A2 chain")
+    exec("touch /workspace/WATCHER_A2_STALLED")
+    log_line("=== watcher STALLED (marker written) ===")
+}

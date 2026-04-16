@@ -1,0 +1,286 @@
+// training/launch_alm_a2_tool.hexa — ALM A2-Tool launcher
+//                                    (A1+A2-Orch merged base + tool-use LoRA)
+//
+// Spec:   shared/roadmaps/alm_consciousness_standalone.json#tracks.A.options[A2]
+// Config: training/alm_a2_tool_config.json   (SSOT for all hyperparameters)
+// Day:    day_2/3  — after A2-Orch step_3000 adapter in R2
+// Budget: 6h / $18 on SAME H100 pod (lnzliav2e8du6i)
+//
+// Why NEW launcher (not edit of train_alm_14b.hexa):
+//   Total .py ban (2026-04-16) forbids creating new .py. Launcher delegates
+//   to existing train_alm_14b.hexa bash runner. A2-Tool adds:
+//     1. merge A1+A2-Orch adapters into base before LoRA init
+//     2. swap corpus to training/corpus_tool/seed_tool_corpus.jsonl
+//     3. lighter LoRA (r32) targeting attention-only (no MLP)
+//     4. fewer steps (1500) to avoid overfitting narrow corpus
+//
+// Resume semantics:
+//   Sequential-merge: Qwen → merge A1 → merge A2-Orch → fresh tool LoRA.
+//   Corpus changes (large → tool jsonl) but this is a NEW round on a NEW
+//   base (2 merges applied) — not mid-training data swap. Policy satisfied.
+//
+// Naming (E3):
+//   run_id = alm14b-phi-a2-tool-{date}
+//   ckpt   = step_{N}
+
+let CONFIG_PATH = "training/alm_a2_tool_config.json"
+
+// ─── Helpers (shared shape with launch_alm_a1 / launch_alm_a2_orch) ──
+fn str_index_of(hay, needle, from) {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return from }
+    let mut i = from
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn extract_json_string(text, key) {
+    let needle = "\"" + key + "\""
+    let kpos = str_index_of(text, needle, 0)
+    if kpos < 0 { return "" }
+    let after_key = kpos + len(needle)
+    let colon = str_index_of(text, ":", after_key)
+    if colon < 0 { return "" }
+    let open_q = str_index_of(text, "\"", colon)
+    if open_q < 0 { return "" }
+    let close_q = str_index_of(text, "\"", open_q + 1)
+    if close_q < 0 { return "" }
+    return text.substring(open_q + 1, close_q)
+}
+
+fn resolve_date() {
+    return exec("date +%Y%m%d").trim()
+}
+
+fn log_info(msg) {
+    println("[launch_alm_a2_tool] " + msg)
+}
+
+fn log_err(msg) {
+    println("[launch_alm_a2_tool ERR] " + msg)
+}
+
+@convergence(state="ossified", id="A2_TOOL_CORPUS_SSOT", value="Tool corpus is training/corpus_tool/seed_tool_corpus.jsonl (50 examples, 10 categories, synthetic deterministic via training/build_tool_corpus.hexa). Launcher refuses if missing + auto-regens via build_tool_corpus.hexa. Never use external corpus — violates AN2 license-clean", ossified_at="2026-04-17")
+@convergence(state="ossified", id="A2_TOOL_GATE_ALREADY_PASSED", value="shared/state/tool_use_gate_20260416.json confirms avg_score=0.933 completion=0.867 on r9 LoRA — gate PASSED before A2-Tool runs. A2-Tool round is consolidation (reusable adapter), not gating. Lenient judge is gate-authoritative (deterministic_strict optional)", ossified_at="2026-04-17")
+fn main() {
+    let config_text = ""
+    if file_exists(CONFIG_PATH) {
+        config_text = read_file(CONFIG_PATH)
+    } else {
+        let anima_root = env("ANIMA_ROOT")
+        if anima_root == "" { anima_root = "." }
+        let fallback = anima_root + "/" + CONFIG_PATH
+        if file_exists(fallback) {
+            config_text = read_file(fallback)
+        } else {
+            log_err("config not found: " + CONFIG_PATH)
+            return
+        }
+    }
+    if len(config_text) == 0 {
+        log_err("config empty: " + CONFIG_PATH)
+        return
+    }
+    let cfg_label = extract_json_string(config_text, "ckpt_label")
+    if cfg_label != "production" {
+        log_err("config ckpt_label=" + cfg_label + " (expected production for A2-Tool)")
+        return
+    }
+
+    // ── FROZEN A2-Tool defaults (mirror training/alm_a2_tool_config.json) ──
+    let base_name       = "Qwen/Qwen2.5-14B-Instruct"
+    let steps_str       = "1500"
+    let lr_str          = "3e-6"
+    let warmup_str      = "100"
+    let batch_str       = "1"
+    let grad_accum_str  = "8"
+    let seq_str         = "1024"
+    let save_every_str  = "500"
+    let eval_every_str  = "100"
+    let lora_r_str      = "32"
+    let lora_alpha_str  = "64"
+    let dropout_str     = "0.05"
+    let round_str       = "2"
+    let model_tag       = "alm14b"
+    let ckpt_label      = "production"
+    let corpus_path     = "/workspace/anima/training/corpus_tool/seed_tool_corpus.jsonl"
+    let corpus_builder  = "/workspace/anima/training/build_tool_corpus.hexa"
+    let a1_r2_prefix    = "r2:anima-models/alm14b/a1_20260416/step_3000/"
+    let a2_orch_r2      = "r2:anima-models/alm14b/a2_20260416_orch/step_3000/"
+    let a1_local_glob   = "/workspace/ckpt_alm14b_phi_a1_*/step_3000"
+    let a2_orch_local   = "/workspace/ckpt_alm14b_phi_a2_orch_*/step_3000"
+
+    let date = resolve_date()
+    let run_id = "alm14b-phi-a2-tool-" + date
+    let ckpt_dir = "/workspace/ckpt_alm14b_phi_a2_tool_" + date
+
+    log_info("run_id=" + run_id)
+    log_info("ckpt_dir=" + ckpt_dir)
+    log_info("base=" + base_name + "  steps=" + steps_str + "  lr=" + lr_str)
+    log_info("lora r=" + lora_r_str + " alpha=" + lora_alpha_str + " (attention-only)")
+    log_info("corpus=" + corpus_path + " (jsonl, 50 examples)")
+
+    let runner = "/tmp/_launch_alm_a2_tool_runner.sh"
+    write_file(runner,
+        "#!/usr/bin/env bash\n" +
+        "set -euo pipefail\n" +
+        "\n" +
+        "echo \"============================================\"\n" +
+        "echo \"  ALM A2-Tool -- A1+A2-Orch merged base + tool-use LoRA\"\n" +
+        "echo \"  run_id = " + run_id + "\"\n" +
+        "echo \"  ckpt   = " + ckpt_dir + "\"\n" +
+        "echo \"  lora   = r" + lora_r_str + " alpha" + lora_alpha_str + " (attn-only)\"\n" +
+        "echo \"  steps  = " + steps_str + "   lr=" + lr_str + "  warmup=" + warmup_str + "\"\n" +
+        "echo \"  corpus = tool-use jsonl (50 examples)\"\n" +
+        "echo \"  label  = " + ckpt_label + "\"\n" +
+        "echo \"============================================\"\n" +
+        "\n" +
+        "# ── preflight: forbidden markers ──\n" +
+        "for m in /workspace/READY_FOR_32B /workspace/READY_FOR_R5_KBASE; do\n" +
+        "    if [[ -f \"$m\" ]]; then\n" +
+        "        echo \"[preflight] forbidden marker: $m -- refusing\"\n" +
+        "        exit 1\n" +
+        "    fi\n" +
+        "done\n" +
+        "\n" +
+        "# ── preflight: GPU bf16 + idle ──\n" +
+        "nvidia-smi --query-gpu=name,memory.total,memory.free,compute_cap --format=csv,noheader\n" +
+        "CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '.')\n" +
+        "if [[ -z \"$CC\" ]] || (( CC < 80 )); then echo \"[preflight] bf16 unsafe\"; exit 1; fi\n" +
+        "UTIL=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | head -n1)\n" +
+        "USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -n1)\n" +
+        "if (( UTIL > 5 )) || (( USED > 2000 )); then\n" +
+        "    echo \"[preflight] GPU not idle util=${UTIL}%% used=${USED}MiB -- refusing\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[preflight] GPU idle bf16 OK\"\n" +
+        "\n" +
+        "# ── preflight: disk + MFS quota ──\n" +
+        "FREE_GB=$(df -BG /workspace | tail -n1 | awk '{print $4}' | tr -d 'G')\n" +
+        "if [[ \"$FREE_GB\" -lt 100 ]]; then echo \"[preflight] disk ${FREE_GB}GB<100\"; exit 1; fi\n" +
+        "if ! dd if=/dev/zero of=/workspace/_q_test_a2t bs=1M count=20000 status=none 2>/dev/null; then\n" +
+        "    echo \"[preflight] MFS quota write test FAILED\"; rm -f /workspace/_q_test_a2t; exit 1\n" +
+        "fi\n" +
+        "rm -f /workspace/_q_test_a2t\n" +
+        "echo \"[preflight] disk ${FREE_GB}GB + MFS 20GB OK\"\n" +
+        "\n" +
+        "# ── preflight: HF_TOKEN ──\n" +
+        "if [[ -z \"${HF_TOKEN:-}\" ]]; then echo \"[preflight] HF_TOKEN unset\"; exit 1; fi\n" +
+        "\n" +
+        "# ── preflight: A1 adapter (local OR R2) ──\n" +
+        "A1_LOCAL=\"\"\n" +
+        "for d in " + a1_local_glob + "; do\n" +
+        "    if [[ -d \"$d\" && -f \"$d/adapter_config.json\" ]]; then A1_LOCAL=\"$d\"; break; fi\n" +
+        "done\n" +
+        "if [[ -z \"$A1_LOCAL\" ]]; then\n" +
+        "    if ! rclone lsd \"" + a1_r2_prefix + "\" --s3-no-check-bucket >/dev/null 2>&1; then\n" +
+        "        echo \"[preflight] A1 missing local AND R2 -- refusing\"; exit 1\n" +
+        "    fi\n" +
+        "    mkdir -p /workspace/a1_r2_stage_tool\n" +
+        "    rclone copy \"" + a1_r2_prefix + "\" /workspace/a1_r2_stage_tool --s3-no-check-bucket --transfers 4 --progress\n" +
+        "    A1_LOCAL=\"/workspace/a1_r2_stage_tool\"\n" +
+        "fi\n" +
+        "echo \"[preflight] A1 src = $A1_LOCAL\"\n" +
+        "\n" +
+        "# ── preflight: A2-Orch adapter (local OR R2) ──\n" +
+        "A2O_LOCAL=\"\"\n" +
+        "for d in " + a2_orch_local + "; do\n" +
+        "    if [[ -d \"$d\" && -f \"$d/adapter_config.json\" ]]; then A2O_LOCAL=\"$d\"; break; fi\n" +
+        "done\n" +
+        "if [[ -z \"$A2O_LOCAL\" ]]; then\n" +
+        "    if ! rclone lsd \"" + a2_orch_r2 + "\" --s3-no-check-bucket >/dev/null 2>&1; then\n" +
+        "        echo \"[preflight] A2-Orch missing local AND R2 -- refusing\"; exit 1\n" +
+        "    fi\n" +
+        "    mkdir -p /workspace/a2_orch_r2_stage_tool\n" +
+        "    rclone copy \"" + a2_orch_r2 + "\" /workspace/a2_orch_r2_stage_tool --s3-no-check-bucket --transfers 4 --progress\n" +
+        "    A2O_LOCAL=\"/workspace/a2_orch_r2_stage_tool\"\n" +
+        "fi\n" +
+        "echo \"[preflight] A2-Orch src = $A2O_LOCAL\"\n" +
+        "\n" +
+        "# ── preflight: tool corpus (auto-regen if missing) ──\n" +
+        "CORPUS=\"" + corpus_path + "\"\n" +
+        "if [[ ! -f \"$CORPUS\" ]]; then\n" +
+        "    echo \"[preflight] tool corpus missing -- regenerating via build_tool_corpus.hexa\"\n" +
+        "    HEXA_BIN=\"${HEXA_BIN:-/usr/local/bin/hexa}\"\n" +
+        "    if [[ ! -x \"$HEXA_BIN\" ]]; then HEXA_BIN=\"$(command -v hexa)\"; fi\n" +
+        "    if [[ -z \"$HEXA_BIN\" || ! -f \"" + corpus_builder + "\" ]]; then\n" +
+        "        echo \"[preflight] cannot regen (hexa or builder missing) -- refusing\"\n" +
+        "        exit 1\n" +
+        "    fi\n" +
+        "    \"$HEXA_BIN\" run \"" + corpus_builder + "\"\n" +
+        "fi\n" +
+        "if [[ ! -f \"$CORPUS\" ]]; then echo \"[preflight] corpus still missing post-regen\"; exit 1; fi\n" +
+        "LINES=$(wc -l < \"$CORPUS\")\n" +
+        "if (( LINES < 30 )); then echo \"[preflight] corpus only $LINES lines (<30) -- refusing\"; exit 1; fi\n" +
+        "echo \"[preflight] corpus $CORPUS ($LINES lines) OK\"\n" +
+        "\n" +
+        "# ── preflight: naming regex ──\n" +
+        "RUN_ID=\"" + run_id + "\"\n" +
+        "if ! [[ \"$RUN_ID\" =~ ^alm14b-phi-a2-tool-[0-9]{8}$ ]]; then\n" +
+        "    echo \"[preflight] run_id $RUN_ID fails regex\"; exit 1\n" +
+        "fi\n" +
+        "\n" +
+        "# ── env ──\n" +
+        "export HF_HUB_CACHE=\"/workspace/hf_cache\"\n" +
+        "export HF_HOME=\"/workspace/hf_cache\"\n" +
+        "export TRANSFORMERS_CACHE=\"/workspace/hf_cache\"\n" +
+        "export ANIMA_ROOT=\"/workspace/anima\"\n" +
+        "export HEXA_CKPT_HOOK=\"/workspace/anima/scripts/ckpt_backup_hook.hexa\"\n" +
+        "export ADAPTER_MERGE_SRC=\"$A1_LOCAL\"\n" +
+        "export ADAPTER_MERGE_SRC2=\"$A2O_LOCAL\"\n" +
+        "export TOOL_USE_CORPUS=\"1\"\n" +
+        "\n" +
+        "# ── launch training ──\n" +
+        "CKPT_DIR=\"" + ckpt_dir + "\"\n" +
+        "if [[ -d \"$CKPT_DIR\" ]]; then echo \"[preflight] $CKPT_DIR exists\"; exit 1; fi\n" +
+        "mkdir -p \"$CKPT_DIR\"\n" +
+        "cp -r \"$A1_LOCAL\"   \"$CKPT_DIR/a1_adapter\"   || true\n" +
+        "cp -r \"$A2O_LOCAL\" \"$CKPT_DIR/a2_orch_adapter\" || true\n" +
+        "\n" +
+        "TRAINER_HEXA=\"/workspace/anima/training/train_alm_14b.hexa\"\n" +
+        "HEXA_BIN=\"${HEXA_BIN:-/usr/local/bin/hexa}\"\n" +
+        "if [[ ! -x \"$HEXA_BIN\" ]]; then HEXA_BIN=\"$(command -v hexa)\"; fi\n" +
+        "if [[ -z \"$HEXA_BIN\" || ! -f \"$TRAINER_HEXA\" ]]; then echo \"[launch] toolchain missing\"; exit 1; fi\n" +
+        "\n" +
+        "\"$HEXA_BIN\" run \"$TRAINER_HEXA\" -- \\\n" +
+        "    --base " + base_name + " \\\n" +
+        "    --corpus \"$CORPUS\" \\\n" +
+        "    --steps " + steps_str + " \\\n" +
+        "    --lr " + lr_str + " \\\n" +
+        "    --batch " + batch_str + " \\\n" +
+        "    --grad-accum " + grad_accum_str + " \\\n" +
+        "    --seq " + seq_str + " \\\n" +
+        "    --warmup " + warmup_str + " \\\n" +
+        "    --lora-r " + lora_r_str + " \\\n" +
+        "    --lora-alpha " + lora_alpha_str + " \\\n" +
+        "    --lora-dropout " + dropout_str + " \\\n" +
+        "    --target-modules q_proj k_proj v_proj o_proj \\\n" +
+        "    --ckpt-dir \"$CKPT_DIR\" \\\n" +
+        "    --save-every " + save_every_str + " \\\n" +
+        "    --eval-every " + eval_every_str + " \\\n" +
+        "    --model-tag " + model_tag + " \\\n" +
+        "    --round " + round_str + " \\\n" +
+        "    --ckpt-label " + ckpt_label + " \\\n" +
+        "    2>&1 | tee \"$CKPT_DIR/train_" + run_id + ".log\"\n" +
+        "\n" +
+        "echo \"[done] A2-Tool training complete -- $CKPT_DIR\"\n" +
+        "rclone copy \"$CKPT_DIR\" \"r2:anima-models/alm14b/a2_20260416_tool/\" -v --s3-no-check-bucket --transfers 4 || true\n" +
+        "touch \"$CKPT_DIR/READY_A2_TOOL_DONE\"\n" +
+        "echo \"[next] hexa training/eval_alm_14b.hexa --ckpt $CKPT_DIR/step_" + steps_str + "\"\n"
+    )
+
+    log_info("runner emitted: " + runner)
+
+    if env("DRY_RUN") == "1" {
+        log_info("DRY_RUN=1 — not executing runner")
+        log_info("inspect: cat " + runner)
+        return
+    }
+
+    log_info("exec bash " + runner)
+    exec("bash " + runner)
+}

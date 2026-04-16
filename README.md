@@ -1149,3 +1149,7 @@ brainflow integration               — EEG/OpenBCI (optional)
   ✗ 멀티모달 — 텍스트 대화부터 완성
   ✗ 다중 사용자 — 1:1부터 검증
 ```
+
+---
+
+> **[M4 16GB Edge Deploy Roadmap](training/deploy/m4_edge_deploy_roadmap.md)** — ALM 14B → Mac Mini M4 16GB, 양자화 zero, Hybrid-E 압축 (smash + free DFS)

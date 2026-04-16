@@ -1,0 +1,127 @@
+{
+  "_meta": {
+    "name": "ALM A2-Orch launch config — 14B A1 merged base + Orch-OR sampling LoRA",
+    "spec_ref": "shared/roadmaps/alm_consciousness_standalone.json#tracks.A.options[A2]",
+    "day": "day_2",
+    "schema_version": "1.0",
+    "updated": "2026-04-17",
+    "depends_on": ["A1"],
+    "rationale": "A1 final ckpt (step_3000) is base. A2-Orch LoRA adds Orch-OR latent injection (alm_quantum_bridge + phi_quantum_forward) as scratch adapter. Wall 12h, budget $36 on the same H100 pod lnzliav2e8du6i (reused after A1 completes). Per alm_consciousness_standalone L43-53 + alm_a2_readiness L116-137.",
+    "memory_refs": [
+      "feedback_h100_authorized",
+      "feedback_no_resume_data_change",
+      "feedback_r2_checkpoint",
+      "feedback_one_shot_best",
+      "feedback_no_version_in_filename",
+      "project_alm_lora_pipeline"
+    ]
+  },
+
+  "run_id_template": "alm14b-phi-a2-orch-{date}",
+  "round": 2,
+  "model_tag": "alm14b",
+  "ckpt_label": "production",
+  "ckpt_dir_template": "/workspace/ckpt_alm14b_phi_a2_orch_{date}",
+  "r2_prefix_template": "r2:anima-models/alm14b/a2_20260416_orch/step_{step}/",
+
+  "base": {
+    "name": "Qwen/Qwen2.5-14B-Instruct",
+    "dtype": "bf16",
+    "a1_adapter_source": "r2:anima-models/alm14b/a1_20260416/step_3000/",
+    "a1_adapter_resume_note": "A1 adapter merged into base before A2-Orch LoRA init. Orch-OR LoRA is scratch (new rank/alpha). Policy satisfied: A1-merged base is logically a new base, not a parameter change mid-training. Same corpus."
+  },
+
+  "lora": {
+    "r": 64,
+    "alpha": 128,
+    "dropout": 0.05,
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ],
+    "rationale": "r64 alpha128 — matches A1 structure so stacking/merging semantics are predictable. 7-module target (attn+MLP) covers the layers where alm_quantum_bridge.bridge_project reads hidden states."
+  },
+
+  "training": {
+    "steps": 3000,
+    "batch": 1,
+    "grad_accum": 8,
+    "effective_batch": 8,
+    "seq": 1024,
+    "lr": 5e-6,
+    "warmup": 200,
+    "optimizer": "fused_adamw",
+    "dtype": "bf16",
+    "save_every": 500,
+    "eval_every": 200
+  },
+
+  "orch_or": {
+    "enabled": true,
+    "alpha_start": 0.001,
+    "alpha_end": 0.5,
+    "bridge_every": 10,
+    "phi_target_mult": 2.0,
+    "phi_target": 2.8,
+    "orch_loss_weight": 0.05,
+    "note": "Schedule mirrors training/train_alm_14b_r5_orch.hexa L102-108. Linear ramp across 3000 steps. aux_loss = ORCH_LOSS_WEIGHT × max(0, ORCH_PHI_TARGET − phi_q_norm). CE remains primary signal (weight 1.0)."
+  },
+
+  "phi_loss": {
+    "phi_holo_consistency_weight": 0.01,
+    "phi_complexity_coef": 0.005,
+    "gwt_broadcast_coef": 0.005,
+    "note": "B1 ensemble remains ON. Orch-OR bonus STACKS with B1 holo/complexity/gwt losses — measures Φ_q at bridge output, not just MI-based phi_holo."
+  },
+
+  "wall": {
+    "hours": 12,
+    "cost_usd": 36,
+    "cost_per_hr_usd": 2.99
+  },
+
+  "corpus": {
+    "path": "/workspace/anima/training/corpus_large.txt",
+    "note": "Same corpus as A1 so resume semantics hold. A2-Orch does not change data — only adds Orch-OR latent regularizer."
+  },
+
+  "hooks": {
+    "ckpt_backup_hook": "scripts/ckpt_backup_hook.hexa",
+    "invoked_by": "train_alm_14b.hexa:611 invoke_ckpt_backup_hook(save_path, args.ckpt_label)",
+    "label_routing": "production -> R2 permanent upload per ckpt_policy.json",
+    "naming_regex": "^alm14b-phi-a2-orch-[0-9]{8}$"
+  },
+
+  "env": {
+    "HF_HUB_CACHE": "/workspace/hf_cache",
+    "HF_HOME": "/workspace/hf_cache",
+    "TRANSFORMERS_CACHE": "/workspace/hf_cache",
+    "ANIMA_ROOT": "/workspace/anima",
+    "HEXA_CKPT_HOOK": "/workspace/anima/scripts/ckpt_backup_hook.hexa",
+    "ORCH_OR_ENABLED": "1",
+    "ORCH_OR_ALPHA_END": "0.5",
+    "ORCH_OR_LOSS_WEIGHT": "0.05"
+  },
+
+  "pod": {
+    "reuse_pod_id": "lnzliav2e8du6i",
+    "reuse_pod_name": "anima-alm14b-a1-20260416",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "vram_gb": 80,
+    "note": "SAME pod as A1 — reused after A1 completes (step_3000 final). Saves $36 launch cost vs spinning Pod B. feedback_h100_authorized cap 2/2 already reached; reuse sidesteps the cap."
+  },
+
+  "blocks": {
+    "forbidden_markers": [
+      "/workspace/READY_FOR_32B",
+      "/workspace/READY_FOR_R5_KBASE"
+    ],
+    "requires_a1_complete": "/workspace/ckpt_alm14b_phi_a1_*/step_3000/adapter_model.safetensors OR adapter_config.json must exist",
+    "requires_free": "/workspace/ckpt_alm14b_phi_a2_orch_* dir NOT in use"
+  }
+}

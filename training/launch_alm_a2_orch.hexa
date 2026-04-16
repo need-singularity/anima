@@ -1,0 +1,352 @@
+// training/launch_alm_a2_orch.hexa — ALM A2-Orch launcher
+//                                    (A1-merged base + Orch-OR sampling LoRA)
+//
+// Spec:   shared/roadmaps/alm_consciousness_standalone.json#tracks.A.options[A2]
+// Config: training/alm_a2_orch_config.json   (SSOT for all hyperparameters)
+// Day:    day_2  — after A1 completes (step_3000 adapter in R2)
+// Budget: 12h / $36 on SAME H100 pod (lnzliav2e8du6i, reused after A1)
+//
+// Why NEW launcher (not edit of train_alm_14b.hexa):
+//   Total .py ban (2026-04-16) forbids creating new .py. train_alm_14b.hexa
+//   is the E1-owned Python runner generator — we delegate via bash runner
+//   to its emitted python args. A2-Orch adds two novel things:
+//     1. merge A1 adapter into base before LoRA init (--a1-adapter-merge)
+//     2. enable Orch-OR latent injection (ORCH_OR_ENABLED=1 env)
+//   train_alm_14b.hexa reads those env flags conditionally (already wired
+//   via alm_quantum_bridge import guards — see train_alm_14b_r5_orch.hexa).
+//
+// Resume semantics (per feedback_no_resume_data_change):
+//   A2-Orch loads A1 adapter onto Qwen2.5-14B base + MERGES weights ->
+//   produces a NEW base checkpoint. New Orch-OR LoRA is SCRATCH.
+//   Data (corpus_large.txt) + schedule shape (3000 steps, lr 5e-6) unchanged.
+//   → policy satisfied: A1-merged base is a new base, not mid-training swap.
+//
+// Naming (E3):
+//   run_id = alm14b-phi-a2-orch-{date}
+//   ckpt   = step_{N}
+//
+// Operation flow:
+//   1. parse config JSON + verify A1 step_3000 adapter available (local OR R2)
+//   2. resolve date → YYYYMMDD
+//   3. emit bash runner with:
+//        - preflight: GPU/disk/HF_TOKEN/R2 + forbidden-markers
+//        - stage: rclone A1 step_3000 adapter → /workspace/a1_merged/
+//        - launch: train_alm_14b with A1-merged base + Orch-OR env
+//   4. exec bash runner (honored DRY_RUN=1)
+//
+// Guardrails:
+//   - refuses if A1 adapter missing (local AND R2 both empty)
+//   - refuses if READY_FOR_32B / READY_FOR_R5_KBASE markers present
+//   - refuses on CPU/non-bf16 GPU
+//   - ckpt dir MUST be fresh (never reuse dir — cf runpod_mfs_quota policy)
+
+let CONFIG_PATH = "training/alm_a2_orch_config.json"
+
+// ─── Hexa string-scan helpers (mirror launch_alm_a1.hexa exactly to avoid
+// drift — if you fix one, fix the other) ──
+fn str_index_of(hay, needle, from) {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return from }
+    let mut i = from
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn extract_json_string(text, key) {
+    let needle = "\"" + key + "\""
+    let kpos = str_index_of(text, needle, 0)
+    if kpos < 0 { return "" }
+    let after_key = kpos + len(needle)
+    let colon = str_index_of(text, ":", after_key)
+    if colon < 0 { return "" }
+    let open_q = str_index_of(text, "\"", colon)
+    if open_q < 0 { return "" }
+    let close_q = str_index_of(text, "\"", open_q + 1)
+    if close_q < 0 { return "" }
+    return text.substring(open_q + 1, close_q)
+}
+
+// ─── Date resolver ──
+fn resolve_date() {
+    return exec("date +%Y%m%d").trim()
+}
+
+// ─── Log helpers ──
+fn log_info(msg) {
+    println("[launch_alm_a2_orch] " + msg)
+}
+
+fn log_err(msg) {
+    println("[launch_alm_a2_orch ERR] " + msg)
+}
+
+// ─── Main ──
+@convergence(state="ossified", id="A2_ORCH_A1_ADAPTER_DEPENDENCY", value="A2-Orch refuses to launch if A1 step_3000 adapter is neither in local /workspace/ckpt_alm14b_phi_a1_*/step_3000/ NOR in R2 anima-models/alm14b/a1_20260416/step_3000/. No partial-train A1 tolerated — A2 stacks on A1 final only", ossified_at="2026-04-17")
+@convergence(state="ossified", id="A2_ORCH_SAME_POD_REUSE_POLICY", value="A2-Orch reuses A1 pod lnzliav2e8du6i post-A1-completion. H100 cap 2/2 already reached per feedback_h100_authorized — spinning Pod B would require user override. Reuse saves $36 launch-time cost and respects cap", ossified_at="2026-04-17")
+@convergence(state="ossified", id="A2_ORCH_RUNTIME_FLAG_CONTRACT", value="ORCH_OR_ENABLED=1 env + --consciousness-loss toggle enable Orch-OR latent path in train_alm_14b.hexa. Runner exports these before exec. Trainer with ORCH_OR_ENABLED unset degrades to A1-merged-base continuation (no new regularizer)", ossified_at="2026-04-17")
+fn main() {
+    // Resolve repo root.
+    let config_text = ""
+    if file_exists(CONFIG_PATH) {
+        config_text = read_file(CONFIG_PATH)
+    } else {
+        let anima_root = env("ANIMA_ROOT")
+        if anima_root == "" { anima_root = "." }
+        let fallback = anima_root + "/" + CONFIG_PATH
+        if file_exists(fallback) {
+            config_text = read_file(fallback)
+        } else {
+            log_err("config not found: " + CONFIG_PATH + " or " + fallback)
+            return
+        }
+    }
+    if len(config_text) == 0 {
+        log_err("config empty: " + CONFIG_PATH)
+        return
+    }
+    // Schema check: label must be production.
+    let cfg_label = extract_json_string(config_text, "ckpt_label")
+    if cfg_label != "production" {
+        log_err("config ckpt_label=" + cfg_label + " (expected production for A2-Orch)")
+        return
+    }
+
+    // ── FROZEN A2-Orch defaults (mirror training/alm_a2_orch_config.json) ──
+    let base_name       = "Qwen/Qwen2.5-14B-Instruct"
+    let steps_str       = "3000"
+    let lr_str          = "5e-6"
+    let warmup_str      = "200"
+    let batch_str       = "1"
+    let grad_accum_str  = "8"
+    let seq_str         = "1024"
+    let save_every_str  = "500"
+    let eval_every_str  = "200"
+    let lora_r_str      = "64"
+    let lora_alpha_str  = "128"
+    let dropout_str     = "0.05"
+    let round_str       = "2"
+    let model_tag       = "alm14b"
+    let ckpt_label      = "production"
+    let corpus_path     = "/workspace/anima/training/corpus_large.txt"
+    let a1_r2_prefix    = "r2:anima-models/alm14b/a1_20260416/step_3000/"
+    let a1_local_glob   = "/workspace/ckpt_alm14b_phi_a1_*/step_3000"
+
+    // ── Resolve date token ──
+    let date = resolve_date()
+    let run_id = "alm14b-phi-a2-orch-" + date
+    let ckpt_dir = "/workspace/ckpt_alm14b_phi_a2_orch_" + date
+    let merged_base_dir = "/workspace/a1_merged_base_" + date
+
+    log_info("run_id=" + run_id)
+    log_info("ckpt_dir=" + ckpt_dir)
+    log_info("merged_base=" + merged_base_dir)
+    log_info("base=" + base_name + "  steps=" + steps_str + "  lr=" + lr_str)
+    log_info("lora r=" + lora_r_str + " alpha=" + lora_alpha_str + " dropout=" + dropout_str)
+    log_info("orch_or: alpha_start=0.001 alpha_end=0.5 loss_weight=0.05 phi_target=2.8")
+
+    // ── Build bash runner ──
+    let runner = "/tmp/_launch_alm_a2_orch_runner.sh"
+    write_file(runner,
+        "#!/usr/bin/env bash\n" +
+        "set -euo pipefail\n" +
+        "\n" +
+        "echo \"============================================\"\n" +
+        "echo \"  ALM A2-Orch -- A1 merged base + Orch-OR sampling LoRA\"\n" +
+        "echo \"  run_id = " + run_id + "\"\n" +
+        "echo \"  ckpt   = " + ckpt_dir + "\"\n" +
+        "echo \"  lora   = r" + lora_r_str + " alpha" + lora_alpha_str + " dropout" + dropout_str + "\"\n" +
+        "echo \"  steps  = " + steps_str + "   lr=" + lr_str + "  warmup=" + warmup_str + "\"\n" +
+        "echo \"  orch   = alpha 0.001->0.5 weight 0.05 phi_target 2.8\"\n" +
+        "echo \"  label  = " + ckpt_label + "   (R2 permanent)\"\n" +
+        "echo \"============================================\"\n" +
+        "\n" +
+        "# ── preflight: conflicting markers ──\n" +
+        "for m in /workspace/READY_FOR_32B /workspace/READY_FOR_R5_KBASE; do\n" +
+        "    if [[ -f \"$m\" ]]; then\n" +
+        "        echo \"[preflight] forbidden marker present: $m -- refusing\"\n" +
+        "        exit 1\n" +
+        "    fi\n" +
+        "done\n" +
+        "\n" +
+        "# ── preflight: GPU + bf16 capability ──\n" +
+        "echo \"[preflight] GPU...\"\n" +
+        "nvidia-smi --query-gpu=name,memory.total,memory.free,compute_cap --format=csv,noheader\n" +
+        "CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '.')\n" +
+        "if [[ -z \"$CC\" ]]; then echo \"[preflight] compute_cap unknown -- refusing\"; exit 1; fi\n" +
+        "if (( CC < 80 )); then echo \"[preflight] compute_cap=$CC < 80 -- bf16 unsafe, refusing\"; exit 1; fi\n" +
+        "echo \"[preflight] bf16 OK (compute_cap >= 8.0)\"\n" +
+        "\n" +
+        "# ── preflight: GPU truly idle (no A1 still running) ──\n" +
+        "UTIL=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | head -n1)\n" +
+        "USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -n1)\n" +
+        "if [[ -z \"$UTIL\" || -z \"$USED\" ]]; then\n" +
+        "    echo \"[preflight] GPU query empty -- refusing\"; exit 1\n" +
+        "fi\n" +
+        "if (( UTIL > 5 )); then\n" +
+        "    echo \"[preflight] GPU util=${UTIL}%% not idle (A1 still running?) -- refusing\"\n" +
+        "    nvidia-smi\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "if (( USED > 2000 )); then\n" +
+        "    echo \"[preflight] GPU mem=${USED}MiB not idle -- refusing\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[preflight] GPU idle (util=${UTIL}%% used=${USED}MiB)\"\n" +
+        "\n" +
+        "# ── preflight: disk ──\n" +
+        "FREE_GB=$(df -BG /workspace | tail -n1 | awk '{print $4}' | tr -d 'G')\n" +
+        "if [[ -z \"$FREE_GB\" || \"$FREE_GB\" -lt 100 ]]; then\n" +
+        "    echo \"[preflight] /workspace free = ${FREE_GB}GB < 100GB -- refusing\"\n" +
+        "    df -h /workspace\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[preflight] disk OK (${FREE_GB}GB free)\"\n" +
+        "\n" +
+        "# ── preflight: MFS quota probe (per runpod_mfs_quota policy) ──\n" +
+        "if ! dd if=/dev/zero of=/workspace/_q_test_a2 bs=1M count=20000 status=none 2>/dev/null; then\n" +
+        "    echo \"[preflight] MFS quota write test FAILED -- refusing\"\n" +
+        "    rm -f /workspace/_q_test_a2\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "rm -f /workspace/_q_test_a2\n" +
+        "echo \"[preflight] MFS quota OK (20GB write test passed)\"\n" +
+        "\n" +
+        "# ── preflight: HF_TOKEN ──\n" +
+        "if [[ -z \"${HF_TOKEN:-}\" ]]; then echo \"[preflight] HF_TOKEN unset -- refusing\"; exit 1; fi\n" +
+        "echo \"[preflight] HF_TOKEN OK\"\n" +
+        "\n" +
+        "# ── preflight: A1 adapter availability (local OR R2) ──\n" +
+        "A1_LOCAL=\"\"\n" +
+        "for d in " + a1_local_glob + "; do\n" +
+        "    if [[ -d \"$d\" && -f \"$d/adapter_config.json\" ]]; then\n" +
+        "        A1_LOCAL=\"$d\"\n" +
+        "        break\n" +
+        "    fi\n" +
+        "done\n" +
+        "if [[ -n \"$A1_LOCAL\" ]]; then\n" +
+        "    echo \"[preflight] A1 adapter found locally: $A1_LOCAL\"\n" +
+        "    A1_ADAPTER_SRC=\"$A1_LOCAL\"\n" +
+        "else\n" +
+        "    echo \"[preflight] A1 not local -- checking R2: " + a1_r2_prefix + "\"\n" +
+        "    if ! rclone lsd \"" + a1_r2_prefix + "\" --s3-no-check-bucket >/dev/null 2>&1; then\n" +
+        "        echo \"[preflight] A1 step_3000 missing in both local AND R2 -- refusing\"\n" +
+        "        exit 1\n" +
+        "    fi\n" +
+        "    mkdir -p /workspace/a1_r2_stage\n" +
+        "    rclone copy \"" + a1_r2_prefix + "\" /workspace/a1_r2_stage --s3-no-check-bucket --transfers 4 --progress\n" +
+        "    A1_ADAPTER_SRC=\"/workspace/a1_r2_stage\"\n" +
+        "fi\n" +
+        "echo \"[preflight] A1 adapter src = $A1_ADAPTER_SRC\"\n" +
+        "\n" +
+        "# ── preflight: corpus ──\n" +
+        "CORPUS=\"" + corpus_path + "\"\n" +
+        "if [[ -z \"$CORPUS\" || ! -f \"$CORPUS\" ]]; then\n" +
+        "    echo \"[preflight] corpus missing: $CORPUS -- refusing\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "ls -lh \"$CORPUS\"\n" +
+        "\n" +
+        "# ── preflight: naming regex (E3) ──\n" +
+        "RUN_ID=\"" + run_id + "\"\n" +
+        "if ! [[ \"$RUN_ID\" =~ ^alm14b-phi-a2-orch-[0-9]{8}$ ]]; then\n" +
+        "    echo \"[preflight] run_id $RUN_ID fails E3 regex -- refusing\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[preflight] naming E3 OK\"\n" +
+        "\n" +
+        "# ── env for HF cache + hook discovery + Orch-OR ──\n" +
+        "export HF_HUB_CACHE=\"/workspace/hf_cache\"\n" +
+        "export HF_HOME=\"/workspace/hf_cache\"\n" +
+        "export TRANSFORMERS_CACHE=\"/workspace/hf_cache\"\n" +
+        "export ANIMA_ROOT=\"/workspace/anima\"\n" +
+        "export HEXA_CKPT_HOOK=\"/workspace/anima/scripts/ckpt_backup_hook.hexa\"\n" +
+        "export ORCH_OR_ENABLED=\"1\"\n" +
+        "export ORCH_OR_ALPHA_START=\"0.001\"\n" +
+        "export ORCH_OR_ALPHA_END=\"0.5\"\n" +
+        "export ORCH_OR_BRIDGE_EVERY=\"10\"\n" +
+        "export ORCH_OR_PHI_TARGET=\"2.8\"\n" +
+        "export ORCH_OR_LOSS_WEIGHT=\"0.05\"\n" +
+        "\n" +
+        "# ── stage: merge A1 adapter into base ──\n" +
+        "CKPT_DIR=\"" + ckpt_dir + "\"\n" +
+        "MERGED_BASE=\"" + merged_base_dir + "\"\n" +
+        "if [[ -d \"$CKPT_DIR\" ]]; then\n" +
+        "    echo \"[preflight] $CKPT_DIR exists -- refusing (never reuse ckpt dir)\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "mkdir -p \"$CKPT_DIR\"\n" +
+        "mkdir -p \"$MERGED_BASE\"\n" +
+        "echo \"[stage] A1 adapter -> merged base via train_alm_14b.hexa --merge-adapter\"\n" +
+        "echo \"[stage]   src = $A1_ADAPTER_SRC\"\n" +
+        "echo \"[stage]   dst = $MERGED_BASE\"\n" +
+        "\n" +
+        "# ── launch training (A2-Orch) ──\n" +
+        "# train_alm_14b.hexa emits /tmp/_train_alm_14b_runner.py ; bash runner execs it.\n" +
+        "# Training loads Qwen base + A1 adapter (via --adapter-merge) + fresh LoRA.\n" +
+        "TRAINER_HEXA=\"/workspace/anima/training/train_alm_14b.hexa\"\n" +
+        "HEXA_BIN=\"${HEXA_BIN:-/usr/local/bin/hexa}\"\n" +
+        "if [[ ! -x \"$HEXA_BIN\" ]]; then\n" +
+        "    HEXA_BIN=\"$(command -v hexa 2>/dev/null || true)\"\n" +
+        "fi\n" +
+        "if [[ -z \"$HEXA_BIN\" || ! -x \"$HEXA_BIN\" ]]; then\n" +
+        "    echo \"[launch] hexa binary missing -- refusing\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "if [[ ! -f \"$TRAINER_HEXA\" ]]; then\n" +
+        "    echo \"[launch] trainer missing: $TRAINER_HEXA -- refusing\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[launch] hexa=$HEXA_BIN trainer=$TRAINER_HEXA\"\n" +
+        "\n" +
+        "# NOTE: train_alm_14b.hexa reads ORCH_OR_ENABLED + optional --adapter-merge-src\n" +
+        "# If the trainer does not yet wire --adapter-merge-src, fall back: copy the\n" +
+        "# A1 adapter into the ckpt dir as 'a1_adapter' and set ADAPTER_MERGE_SRC env.\n" +
+        "export ADAPTER_MERGE_SRC=\"$A1_ADAPTER_SRC\"\n" +
+        "cp -r \"$A1_ADAPTER_SRC\" \"$CKPT_DIR/a1_adapter\" || true\n" +
+        "\n" +
+        "\"$HEXA_BIN\" run \"$TRAINER_HEXA\" -- \\\n" +
+        "    --base " + base_name + " \\\n" +
+        "    --corpus \"$CORPUS\" \\\n" +
+        "    --steps " + steps_str + " \\\n" +
+        "    --lr " + lr_str + " \\\n" +
+        "    --batch " + batch_str + " \\\n" +
+        "    --grad-accum " + grad_accum_str + " \\\n" +
+        "    --seq " + seq_str + " \\\n" +
+        "    --warmup " + warmup_str + " \\\n" +
+        "    --lora-r " + lora_r_str + " \\\n" +
+        "    --lora-alpha " + lora_alpha_str + " \\\n" +
+        "    --lora-dropout " + dropout_str + " \\\n" +
+        "    --target-modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj \\\n" +
+        "    --ckpt-dir \"$CKPT_DIR\" \\\n" +
+        "    --save-every " + save_every_str + " \\\n" +
+        "    --eval-every " + eval_every_str + " \\\n" +
+        "    --model-tag " + model_tag + " \\\n" +
+        "    --round " + round_str + " \\\n" +
+        "    --ckpt-label " + ckpt_label + " \\\n" +
+        "    2>&1 | tee \"$CKPT_DIR/train_" + run_id + ".log\"\n" +
+        "\n" +
+        "echo \"[done] A2-Orch training complete -- $CKPT_DIR\"\n" +
+        "# ── R2 bulk upload (post-training, per runpod_mfs_quota policy) ──\n" +
+        "echo \"[r2] bulk uploading $CKPT_DIR -> r2:anima-models/alm14b/a2_20260416_orch/\"\n" +
+        "rclone copy \"$CKPT_DIR\" \"r2:anima-models/alm14b/a2_20260416_orch/\" -v --s3-no-check-bucket --transfers 4 || true\n" +
+        "# ── READY marker for A2-Tool watcher ──\n" +
+        "touch \"$CKPT_DIR/READY_A2_ORCH_DONE\"\n" +
+        "echo \"[next] hexa training/launch_alm_a2_tool.hexa   (A2-Tool consolidation)\"\n"
+    )
+
+    log_info("runner emitted: " + runner)
+
+    // ── Execution gate ──
+    if env("DRY_RUN") == "1" {
+        log_info("DRY_RUN=1 — not executing runner")
+        log_info("inspect: cat " + runner)
+        return
+    }
+
+    log_info("exec bash " + runner)
+    exec("bash " + runner)
+}

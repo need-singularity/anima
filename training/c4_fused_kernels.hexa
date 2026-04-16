@@ -73,11 +73,54 @@ use "cuda_rtc"
 // fused into the store step — no extra DRAM round trip.
 let K_C4_QKV_PROJ_FUSED_FWD = "extern \"C\" __global__ void c4_qkv_proj_fused_fwd(const float* norm, const float* Wqkv, float* outQ, float* outK, float* outV, int M, int K_in, int DhH) {\n    int m = blockIdx.x * blockDim.x + threadIdx.x;\n    int n = blockIdx.y * blockDim.y + threadIdx.y;\n    int N = 3 * DhH;\n    if (m >= M || n >= N) return;\n    float acc = 0.0f;\n    int k;\n    for (k = 0; k < K_in; k++) {\n        acc += norm[m * K_in + k] * Wqkv[k * N + n];\n    }\n    int slot = n / DhH;\n    int col  = n - slot * DhH;\n    int idx  = m * DhH + col;\n    if (slot == 0) {\n        outQ[idx] = acc;\n    } else if (slot == 1) {\n        outK[idx] = acc;\n    } else {\n        outV[idx] = acc;\n    }\n}\n"
 
+// ── §1.5  F1-TC bf16 WMMA kernel string ─────────────────────
+//
+// c4_qkv_proj_fused_tc_fwd — bf16 Tensor Core variant of F1.
+//
+// Math identical to c4_qkv_proj_fused_fwd; internal accumulation
+// uses nvcuda::wmma 16x16x16 tiles with __nv_bfloat16 inputs and
+// fp32 accumulator. fp32 I/O boundary preserved per design doc §4.2.
+//
+// Grid/block shape change (vs fp32 MVP):
+//   fp32:  block(16,16,1) grid(ceil(M/16),ceil(N/16),1)  — 256 threads/block, 1 thread per output
+//   TC  :  block(32, 1,1) grid(ceil(N/16),ceil(M/16),1)  — 1 warp/block, 1 warp per 16x16 output tile
+//
+// Mirrors hxcuda_matmul_bf16_kernel at hexa-lang/self/native/hxcuda_fused.cu:70-139
+// but adds the Q/K/V slot-split in the store step — slot granularity
+// is per-16-column (DhH is always a multiple of 16 in practice; we
+// decide the slot from `warpN / DhH * 16`, i.e. a single slot per
+// tile), so the store dispatches to outQ/outK/outV based on the tile's
+// base column.
+//
+// Correctness tolerance target: max|TC - fp32_ref| / max|fp32_ref| < 1e-2
+// (bf16 mantissa 8 bits → ~1/128 per-multiply, K=1024 accum → ~1e-2
+// ceiling). Matches design doc §6.1 + prep §f1_tc_bf16_wmma_implementation_plan.
+//
+// Assumption: DhH % 16 == 0 (all anima CLM shapes satisfy this —
+// D_head∈{32,64,128}, H∈{4,8,16} → DhH∈{128,256,512,1024,2048}).
+// A tile never straddles a slot boundary, so slot-per-tile is exact.
+@convergence(state="ossified", id="C4_F1_TC_BF16_WMMA_KERNEL", value="bf16 WMMA 16x16x16 variant of F1 fused QKV projection. fp32 I/O, bf16 internal, fp32 accumulator. Grid is warp-per-tile (bx=32,by=1). Slot-split at tile granularity (DhH%16==0 invariant). Reference: hxcuda_matmul_bf16_kernel.", ossified_at="2026-04-17")
+let K_C4_QKV_PROJ_FUSED_TC_FWD = "#include <cuda_fp16.h>\n#include <cuda_bf16.h>\n#include <mma.h>\nusing namespace nvcuda;\nextern \"C\" __global__ void c4_qkv_proj_fused_tc_fwd(const float* norm, const float* Wqkv, float* outQ, float* outK, float* outV, int M, int K_in, int DhH) {\n    const int WMMA_M = 16;\n    const int WMMA_N = 16;\n    const int WMMA_K = 16;\n    int warpM = blockIdx.y * WMMA_M;\n    int warpN = blockIdx.x * WMMA_N;\n    int N = 3 * DhH;\n    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;\n    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> b_frag;\n    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;\n    wmma::fill_fragment(c_frag, 0.0f);\n    __shared__ __nv_bfloat16 smem_a[16 * 16];\n    __shared__ __nv_bfloat16 smem_b[16 * 16];\n    int tid = threadIdx.x;\n    for (int k_step = 0; k_step < K_in; k_step += WMMA_K) {\n        for (int i = tid; i < WMMA_M * WMMA_K; i += 32) {\n            int row = i / WMMA_K;\n            int col = i % WMMA_K;\n            int gRow = warpM + row;\n            int gCol = k_step + col;\n            float val = 0.0f;\n            if (gRow < M && gCol < K_in) {\n                val = norm[gRow * K_in + gCol];\n            }\n            smem_a[i] = __float2bfloat16(val);\n        }\n        for (int i = tid; i < WMMA_K * WMMA_N; i += 32) {\n            int row = i / WMMA_N;\n            int col = i % WMMA_N;\n            int gRow = k_step + row;\n            int gCol = warpN + col;\n            float val = 0.0f;\n            if (gRow < K_in && gCol < N) {\n                val = Wqkv[gRow * N + gCol];\n            }\n            smem_b[i] = __float2bfloat16(val);\n        }\n        __syncthreads();\n        wmma::load_matrix_sync(a_frag, smem_a, 16);\n        wmma::load_matrix_sync(b_frag, smem_b, 16);\n        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);\n        __syncthreads();\n    }\n    if (warpM >= M || warpN >= N) return;\n    int slot = warpN / DhH;\n    int col0 = warpN - slot * DhH;\n    float* out_base;\n    if (slot == 0) {\n        out_base = outQ;\n    } else if (slot == 1) {\n        out_base = outK;\n    } else {\n        out_base = outV;\n    }\n    wmma::store_matrix_sync(out_base + warpM * DhH + col0, c_frag, DhH, wmma::mem_row_major);\n}\n"
+
+// ── Combined NVRTC translation-unit source ──────────────────
+//
+// The NVRTC module compiles both variants in one TU so a single
+// rtc_load_module call yields both function handles. Headers are
+// emitted once at the top; kernel strings follow as plain bodies.
+// K_C4_QKV_PROJ_FUSED_TC_FWD already includes its own headers +
+// `using namespace nvcuda;` at the top — when concatenated first
+// those decls carry through to the fp32 body which has no includes.
+let K_C4_COMBINED_TU = K_C4_QKV_PROJ_FUSED_TC_FWD + K_C4_QKV_PROJ_FUSED_FWD
+
 // ── §2  Module + handle globals ─────────────────────────────
 
 let mut G_C4_MODULE = ptr_null()
 let mut G_C4_qkv_proj_fused_fwd = ptr_null()
+let mut G_C4_qkv_proj_fused_tc_fwd = ptr_null()
 let mut G_C4_INITIALISED = 0
+// Dispatcher mode override: 0 = fp32 MVP (default), 1 = bf16 WMMA (F1-TC).
+// env var USE_TC=1 or explicit mode='tc' in launcher flips this.
+let mut G_C4_TC_MODE = 0
 
 // ── §3  Init / launcher ─────────────────────────────────────
 
@@ -96,9 +139,13 @@ fn c4_init_modules() {
         println("[c4] rtc_init failed: " + str(ri))
         return -4
     }
-    let ptx = rtc_compile_ptx(K_C4_QKV_PROJ_FUSED_FWD, "c4_kernels.cu")
+    // Compile combined TU — both fp32 and TC variants in one PTX.
+    // TC kernel needs nvrtc >= 11.2 (available on RTX 3090 pod + H100).
+    // Call site passes -arch=sm_86 (3090) / -arch=sm_90 (H100) via
+    // rtc_compile_ptx env; default compute_86 works on both for WMMA bf16.
+    let ptx = rtc_compile_ptx(K_C4_COMBINED_TU, "c4_kernels.cu")
     if ptr_addr(ptx) == 0 {
-        println("[c4] rtc_compile_ptx failed for c4_qkv_proj_fused_fwd")
+        println("[c4] rtc_compile_ptx failed for c4 combined TU (fp32+TC)")
         return -1
     }
     G_C4_MODULE = rtc_load_module(ptx)
@@ -111,9 +158,25 @@ fn c4_init_modules() {
         println("[c4] missing c4_qkv_proj_fused_fwd symbol")
         return -3
     }
+    G_C4_qkv_proj_fused_tc_fwd = rtc_get_function(G_C4_MODULE, "c4_qkv_proj_fused_tc_fwd")
+    if ptr_addr(G_C4_qkv_proj_fused_tc_fwd) == 0 {
+        // Non-fatal — TC variant may be absent on sm_<80 targets.
+        // fp32 path remains available; dispatcher falls back when G_C4_TC_MODE=1 requested.
+        println("[c4] warn: c4_qkv_proj_fused_tc_fwd symbol missing (TC unavailable — arch < sm_80?)")
+    }
     G_C4_INITIALISED = 1
-    println("[c4] c4_init_modules OK — F1 fused_qkv_projection_fwd loaded")
+    println("[c4] c4_init_modules OK — F1 fp32 + F1-TC bf16 WMMA loaded")
     0
+}
+
+// c4_set_tc_mode — runtime toggle for dispatcher.
+//   m=0 → fp32 MVP (default)
+//   m=1 → bf16 WMMA (F1-TC) — requires sm_80+ device
+// Returns the previous mode so callers can save/restore.
+fn c4_set_tc_mode(m) {
+    let prev = G_C4_TC_MODE
+    G_C4_TC_MODE = m
+    return prev
 }
 
 // c4_is_module_ready — local readiness check for this file's module.
@@ -190,11 +253,24 @@ fn c4_impl_qkv_proj_fwd(norm_dev, Wqkv_dev, Q_dev, K_dev, V_dev,
         _c4_arg_i32(K_in),
         _c4_arg_i32(DhH)
     ]
-    let bx = 16
-    let by = 16
-    let gx = _c4_ceil_div(M, bx)
-    let gy = _c4_ceil_div(N, by)
-    let st = rtc_launch(G_C4_qkv_proj_fused_fwd, gx, gy, 1, bx, by, 1, args)
+    // Dispatcher: G_C4_TC_MODE=1 routes to bf16 WMMA kernel when available.
+    // Grid/block layout differs:
+    //   fp32: block(16,16,1) grid(ceil(M/16),ceil(N/16),1) — 1 thread per output
+    //   TC  : block(32, 1,1) grid(ceil(N/16),ceil(M/16),1) — 1 warp per 16x16 tile
+    let mut st = 0
+    if G_C4_TC_MODE == 1 && ptr_addr(G_C4_qkv_proj_fused_tc_fwd) != 0 {
+        let tc_bx = 32
+        let tc_by = 1
+        let tc_gx = _c4_ceil_div(N, 16)
+        let tc_gy = _c4_ceil_div(M, 16)
+        st = rtc_launch(G_C4_qkv_proj_fused_tc_fwd, tc_gx, tc_gy, 1, tc_bx, tc_by, 1, args)
+    } else {
+        let bx = 16
+        let by = 16
+        let gx = _c4_ceil_div(M, bx)
+        let gy = _c4_ceil_div(N, by)
+        st = rtc_launch(G_C4_qkv_proj_fused_fwd, gx, gy, 1, bx, by, 1, args)
+    }
     let _ = _c4_free_args(args)
     st
 }
