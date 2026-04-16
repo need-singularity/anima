@@ -759,15 +759,21 @@ def train(args):
 
         # ── Checkpoint ──
         if step > 0 and step % save_every == 0:
-            # PRE-SAVE ROTATION — delete old ckpts BEFORE save to prevent MFS quota hit
-            # (RunPod MFS has ~47GB session quota invisible to df)
-            existing = sorted(ckpt_dir.glob("step_*"), key=lambda p: int(p.name.split("_")[1]))
-            # Keep only latest 1 before adding new one (total 2 after save)
+            # PRE-SAVE ROTATION — delete ALL old step_* ckpts BEFORE save
+            # RunPod MFS has ~47GB session quota invisible to df. Each 1B ckpt is ~18GB.
+            # Keep only 1 ckpt at peak (the new one). Delete old BEFORE save to fit quota.
             import shutil
-            while len(existing) > 1:
-                old = existing.pop(0)
+            existing = sorted(ckpt_dir.glob("step_*"), key=lambda p: int(p.name.split("_")[1]))
+            for old in existing:
                 shutil.rmtree(old, ignore_errors=True)
                 print(f"[ckpt] pre-save rotated old ckpt: {old.name}", flush=True)
+            # Also clean sibling ckpt_dir_r3* archives that might bloat quota
+            parent = ckpt_dir.parent
+            for sib in parent.glob(f"ckpt_{model_tag}_*"):
+                if sib == ckpt_dir or not sib.is_dir():
+                    continue
+                shutil.rmtree(sib, ignore_errors=True)
+                print(f"[ckpt] pre-save cleaned sibling dir: {sib.name}", flush=True)
 
             spath = ckpt_dir / f"step_{step}"
             spath.mkdir(exist_ok=True)
