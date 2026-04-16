@@ -39,20 +39,28 @@ from torch.utils.data import Dataset, DataLoader
 # ─── R2 Upload ──────────────────────────────────────────────────
 
 def upload_to_r2(local_path, model_tag, round_num, step):
-    """Upload checkpoint to R2 via rclone. Non-blocking on failure."""
+    """Fire-and-forget R2 upload via detached subprocess. NEVER blocks training.
+
+    Writes upload log to /workspace/r2_upload_<step>.log. Child is fully detached
+    (new session, stdin/stdout/stderr → devnull/logfile). pkill rclone from outside
+    will NOT affect this Python process.
+    """
     r2_dest = f"r2:anima-models/{model_tag}/r{round_num}/step_{step}/"
-    print(f"[r2] uploading {local_path} -> {r2_dest}", flush=True)
+    log_path = f"/workspace/r2_upload_step_{step}.log"
+    print(f"[r2] spawning async upload {local_path} -> {r2_dest} (log={log_path})", flush=True)
     try:
-        result = subprocess.run(
+        logf = open(log_path, "w")
+        # Fully detached: new session, no parent wait
+        subprocess.Popen(
             ["rclone", "copy", str(local_path), r2_dest, "--s3-no-check-bucket"],
-            capture_output=True, text=True, timeout=600,
+            stdin=subprocess.DEVNULL,
+            stdout=logf, stderr=logf,
+            start_new_session=True,  # detach from parent process group
+            close_fds=True,
         )
-        if result.returncode == 0:
-            print(f"[r2] uploaded {model_tag}-r{round_num}-s{step}", flush=True)
-        else:
-            print(f"[r2] upload failed: {result.stderr[:200]}", flush=True)
+        # Do NOT wait, do NOT communicate — fire-and-forget
     except Exception as e:
-        print(f"[r2] upload error: {e}", flush=True)
+        print(f"[r2] spawn failed (non-fatal): {e}", flush=True)
 
 
 # ═══════════════════════════════════════════════════════════════════
