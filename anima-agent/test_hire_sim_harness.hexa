@@ -1,0 +1,129 @@
+// test_hire_sim_harness.hexa — THE entry point for the stratified30 gate
+//
+// This file is BOTH the smoke test harness and the production driver for
+// the hire_sim_100 stratified30 gate (extreme.json v3.0_Agent destination,
+// ALM ≥ 0.85 / CLM ≥ 0.80 completion_rate).
+//
+// Why one file for both roles:
+//   The runner/stratify/judge modules are pure libraries (no `fn main`).
+//   flatten_imports mangles collided `main` symbols when multiple files in
+//   the same compilation bundle define `main`, which broke the first
+//   attempt at having a separate driver. Keeping ONE `main` here avoids
+//   mangling and lets the compiled binary invoke `u_main()` correctly.
+//
+// Modes (selected by env / CLI — all default to mock smoke):
+//
+//   Mock smoke (default, no env vars):
+//     /tmp/test_hire_sim_harness
+//     → runs stratify unit test + judge unit test + mock-mode runner
+//       smoke, asserts 30/30, exits 0 on success.
+//
+//   Live endpoint:
+//     HIRE_SIM_ENDPOINT=http://host:port/hire/task /tmp/test_hire_sim_harness
+//     → sends 30 POST requests, judges responses, emits JSON report.
+//
+//   Full 100 (for overall_100_completion_rate field):
+//     HIRE_SIM_RUN_FULL=1 HIRE_SIM_ENDPOINT=... /tmp/test_hire_sim_harness
+//
+//   Custom output dir / baseline:
+//     HIRE_SIM_OUT_DIR=/tmp HIRE_SIM_BASELINE=/path/to.jsonl
+//
+// Build:  hexa build anima-agent/test_hire_sim_harness.hexa -o /tmp/test_hire_sim_harness
+// Run:    /tmp/test_hire_sim_harness
+//
+// NOTE: Must be compiled (not `hexa run`) because hire_sim_runner.hexa uses
+// `parse_float` for the baseline delta, which returns 0 under the interpreter.
+
+use "hire_sim_stratify"
+use "hire_sim_judge"
+use "hire_sim_runner"
+
+fn main() {
+    println("=== test_hire_sim_harness ===")
+    let cfg = load_config()
+    if cfg.mode == "endpoint" {
+        // Production entry: live run, skip unit tests (caller gets the JSON)
+        println("production mode — live endpoint run")
+        println("endpoint=" + cfg.endpoint)
+        println("")
+        let _ = run_hire_sim_gate(cfg)
+        return
+    }
+
+    // Smoke / dev mode: unit tests + mock runner + post-check
+    println("dev mode — running unit tests + mock smoke")
+    println("")
+
+    // 1) Stratify unit test
+    println("[1/3] stratify self-test")
+    let ok_strat = selftest_hire_sim_stratify()
+    println("")
+
+    // 2) Judge unit test
+    println("[2/3] judge self-test")
+    let ok_judge = selftest_hire_sim_judge()
+    println("")
+
+    // 3) Runner mock smoke (full end-to-end, emits JSON to HIRE_SIM_OUT_DIR or default)
+    println("[3/3] runner mock smoke test")
+    // Force mock mode for the smoke regardless of env
+    let smoke_cfg = RunnerConfig {
+        endpoint: "",
+        mode: "mock",
+        timeout_s: cfg.timeout_s,
+        out_dir: cfg.out_dir,
+        baseline_path: cfg.baseline_path,
+        run_full_100: false
+    }
+    let path = run_hire_sim_gate(smoke_cfg)
+    println("")
+
+    // Quick post-check: mock mode should yield 30/30 → completion_rate == 1.0
+    // We verify by re-reading the emitted JSON for the rate field.
+    let ok_smoke = verify_mock_json_all_green(path)
+
+    println("")
+    println("=== test_hire_sim_harness summary ===")
+    let label_strat = if ok_strat { "PASS" } else { "FAIL" }
+    let label_judge = if ok_judge { "PASS" } else { "FAIL" }
+    let label_smoke = if ok_smoke { "PASS" } else { "FAIL" }
+    println("  stratify: " + label_strat)
+    println("  judge   : " + label_judge)
+    println("  smoke   : " + label_smoke + " (" + path + ")")
+    let all_ok = ok_strat && ok_judge && ok_smoke
+    let verdict = if all_ok { "ALL GREEN" } else { "REGRESSION" }
+    println("")
+    println("verdict: " + verdict)
+}
+
+// Inspect the JSON report file and confirm stratified_30_completion_rate == 1.0
+// (mock mode should always be 30/30). Uses substring scan — same strategy as
+// the runner's baseline parser. Safe under both interp and compiled paths.
+fn verify_mock_json_all_green(path: string) -> bool {
+    if !file_exists(path) {
+        println("  verify: report missing at " + path)
+        return false
+    }
+    let raw = read_file(path)
+    let key = "\"stratified_30_completion_rate\""
+    let idx = raw.index_of(key)
+    if idx < 0 {
+        println("  verify: stratified_30_completion_rate not found")
+        return false
+    }
+    let tail = raw.substring(idx + len(key), len(raw))
+    let colon = tail.index_of(":")
+    if colon < 0 { return false }
+    let after = tail.substring(colon + 1, len(tail)).trim()
+    // Mock mode prints 1.0000 — substring check is enough (no float parse needed).
+    let ok = after.index_of("1.0000") == 0
+    // Also verify the gates
+    let alm_ok = raw.contains("\"alm_gate\": {\"threshold\": 0.85, \"pass\": true}")
+    let clm_ok = raw.contains("\"clm_gate\": {\"threshold\": 0.80, \"pass\": true}")
+    let verdict_ok = raw.contains("\"verdict\": \"PASS\"")
+    println("  verify: rate1.0=" + to_string(ok)
+            + " alm_pass=" + to_string(alm_ok)
+            + " clm_pass=" + to_string(clm_ok)
+            + " verdict_pass=" + to_string(verdict_ok))
+    return ok && alm_ok && clm_ok && verdict_ok
+}

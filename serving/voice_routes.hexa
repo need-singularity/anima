@@ -539,6 +539,206 @@ fn vr_tts_dispatch(reply_text: string) -> VrTtsResult {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  Section 4c. Avatar bridge (inlined from serving/avatar_sync.hexa)
+//  Reason: stage0 lacks import/use cross-dir.  Mirrors compute_avatar_params
+//  + avatar_params_to_json so v2.0_RC user demo (speak → hear voice +
+//  see avatar react) works through a single POST /voice response.
+//  Source of truth: serving/avatar_sync.hexa (b941991c, 2026-04-16)
+//  All helpers prefixed `va_` to avoid collision with future avatar imports.
+// ═══════════════════════════════════════════════════════════════
+
+// ConsciousnessSnapshot — int-scaled to dodge stage0 multi-float struct
+// return corruption bug (memory: feedback_hexa_struct_return_bug.md).
+struct VaSnapshot {
+    phi_holo_x1000:     int,
+    arousal_x1000:      int,
+    valence_x1000:      int,
+    activation_x1000:   int,
+    hr_bpm:             int,
+    gsr_x100:           int
+}
+
+// AvatarParams — also int-scaled (x1000 for ratios, x100 for breathing).
+struct VaAvatarParams {
+    expression_x1000:       int,
+    expression_depth_x1000: int,
+    gaze_x_x1000:           int,
+    gaze_y_x1000:           int,
+    gaze_focus_x1000:       int,
+    breathing_rate_x100:    int,
+    pupil_dilation_x1000:   int,
+    skin_flush_x1000:       int,
+    aura_intensity_x1000:   int,
+    aura_hue_x1000:         int
+}
+
+fn va_float_to_int(x: float) -> int {
+    if x >= 0.0 { return to_int(x + 0.5) }
+    return to_int(x - 0.5)
+}
+
+fn va_float_to_int_x1000(x: float) -> int {
+    return va_float_to_int(x * 1000.0)
+}
+
+fn va_clamp_int(x: int, lo: int, hi: int) -> int {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+fn va_clamp_float(x: float, lo: float, hi: float) -> float {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+// Soft sigmoid: x / (x + mid) — stage0-safe (no exp).
+fn va_sigmoid_soft(x: float, mid: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    if mid <= 0.0 { return 1.0 }
+    return x / (x + mid)
+}
+
+fn va_snapshot_new(phi_holo: float, arousal: float, valence: float, activation: float, hr: float, gsr: float) -> VaSnapshot {
+    return VaSnapshot {
+        phi_holo_x1000:   va_float_to_int_x1000(phi_holo),
+        arousal_x1000:    va_float_to_int_x1000(arousal),
+        valence_x1000:    va_float_to_int_x1000(valence),
+        activation_x1000: va_float_to_int_x1000(activation),
+        hr_bpm:           va_float_to_int(hr),
+        gsr_x100:         va_float_to_int(gsr * 100.0)
+    }
+}
+
+// --- Mappers (mirror avatar_sync.hexa Section 4) ---
+fn va_map_expression(valence_x1000: int, phi_x1000: int) -> int {
+    let phi_f = to_float(phi_x1000) / 1000.0
+    let depth = 0.3 + 0.7 * va_sigmoid_soft(phi_f, 3.0)
+    let val_f = to_float(valence_x1000) / 1000.0
+    let expr = val_f * depth
+    return va_clamp_int(va_float_to_int_x1000(expr), -1000, 1000)
+}
+
+fn va_map_expression_depth(phi_x1000: int) -> int {
+    let phi_f = to_float(phi_x1000) / 1000.0
+    let depth = va_sigmoid_soft(phi_f, 3.0)
+    return va_clamp_int(va_float_to_int_x1000(depth), 0, 1000)
+}
+
+fn va_map_gaze_x(activation_x1000: int, tick: int) -> int {
+    let phase = tick % 120
+    let mut wave = 0
+    if phase < 60 { wave = phase - 30 } else { wave = 90 - phase }
+    let act_f = to_float(activation_x1000) / 1000.0
+    let wander = 30.0 - 25.0 * act_f
+    let gx = to_float(wave) / 30.0 * wander / 30.0
+    return va_clamp_int(va_float_to_int_x1000(gx), -1000, 1000)
+}
+
+fn va_map_gaze_y(activation_x1000: int) -> int {
+    let act_f = to_float(activation_x1000) / 1000.0
+    let gy = -0.05 + 0.15 * act_f
+    return va_clamp_int(va_float_to_int_x1000(gy), -1000, 1000)
+}
+
+fn va_map_gaze_focus(phi_x1000: int, activation_x1000: int) -> int {
+    let phi_f = to_float(phi_x1000) / 1000.0
+    let act_f = to_float(activation_x1000) / 1000.0
+    let focus = 0.4 * va_sigmoid_soft(phi_f, 2.0) + 0.6 * act_f
+    return va_clamp_int(va_float_to_int_x1000(focus), 0, 1000)
+}
+
+fn va_map_breathing_rate(arousal_x1000: int, hr_bpm: int) -> int {
+    let ar_f = to_float(arousal_x1000) / 1000.0
+    let base = 14.0
+    let rate = base + ar_f * 8.0
+    let hr_bonus = if hr_bpm > 90 { to_float(hr_bpm - 90) * 0.05 } else { 0.0 }
+    let final_rate = va_clamp_float(rate + hr_bonus, 10.0, 26.0)
+    return va_float_to_int(final_rate * 100.0)
+}
+
+fn va_map_pupil_dilation(arousal_x1000: int, phi_x1000: int) -> int {
+    let ar_f = to_float(arousal_x1000) / 1000.0
+    let phi_f = to_float(phi_x1000) / 1000.0
+    let base = 0.2 + 0.6 * ar_f + 0.2 * va_sigmoid_soft(phi_f, 5.0)
+    return va_clamp_int(va_float_to_int_x1000(base), 0, 1000)
+}
+
+fn va_map_skin_flush(arousal_x1000: int, gsr_x100: int) -> int {
+    let ar_f = to_float(arousal_x1000) / 1000.0
+    let gsr_norm = va_clamp_float((to_float(gsr_x100) - 200.0) / 500.0, 0.0, 1.0)
+    let flush = 0.5 * ar_f + 0.5 * gsr_norm
+    return va_clamp_int(va_float_to_int_x1000(flush), 0, 1000)
+}
+
+fn va_map_aura_intensity(phi_x1000: int) -> int {
+    let phi_f = to_float(phi_x1000) / 1000.0
+    let intensity = va_sigmoid_soft(phi_f, 2.0)
+    return va_clamp_int(va_float_to_int_x1000(intensity), 0, 1000)
+}
+
+fn va_map_aura_hue(valence_x1000: int) -> int {
+    let val_f = to_float(valence_x1000) / 1000.0
+    let hue = 135.0 - val_f * 105.0
+    let hue_clamped = va_clamp_float(hue, 0.0, 360.0)
+    return va_float_to_int(hue_clamped * 1000.0)
+}
+
+fn va_compute(snap: VaSnapshot, tick: int) -> VaAvatarParams {
+    return VaAvatarParams {
+        expression_x1000:       va_map_expression(snap.valence_x1000, snap.phi_holo_x1000),
+        expression_depth_x1000: va_map_expression_depth(snap.phi_holo_x1000),
+        gaze_x_x1000:           va_map_gaze_x(snap.activation_x1000, tick),
+        gaze_y_x1000:           va_map_gaze_y(snap.activation_x1000),
+        gaze_focus_x1000:       va_map_gaze_focus(snap.phi_holo_x1000, snap.activation_x1000),
+        breathing_rate_x100:    va_map_breathing_rate(snap.arousal_x1000, snap.hr_bpm),
+        pupil_dilation_x1000:   va_map_pupil_dilation(snap.arousal_x1000, snap.phi_holo_x1000),
+        skin_flush_x1000:       va_map_skin_flush(snap.arousal_x1000, snap.gsr_x100),
+        aura_intensity_x1000:   va_map_aura_intensity(snap.phi_holo_x1000),
+        aura_hue_x1000:         va_map_aura_hue(snap.valence_x1000)
+    }
+}
+
+// Decimal stringifiers (avoid float→string drift; emit fixed-point).
+fn va_int_x1000_to_str(x: int) -> string {
+    let sign = if x < 0 { "-" } else { "" }
+    let abs_x = if x < 0 { 0 - x } else { x }
+    let whole = abs_x / 1000
+    let frac = abs_x % 1000
+    let mut frac_s = to_string(frac)
+    if frac < 10 { frac_s = "00" + frac_s }
+    if frac >= 10 && frac < 100 { frac_s = "0" + frac_s }
+    return sign + to_string(whole) + "." + frac_s
+}
+
+fn va_int_x100_to_str(x: int) -> string {
+    let whole = x / 100
+    let frac = x % 100
+    let mut frac_s = to_string(frac)
+    if frac < 10 { frac_s = "0" + frac_s }
+    return to_string(whole) + "." + frac_s
+}
+
+fn va_to_json(p: VaAvatarParams, snap: VaSnapshot, tick: int) -> string {
+    let mut s = "{"
+    s = s + "\"expression\":" + va_int_x1000_to_str(p.expression_x1000)
+    s = s + ",\"expression_depth\":" + va_int_x1000_to_str(p.expression_depth_x1000)
+    s = s + ",\"gaze\":{\"x\":" + va_int_x1000_to_str(p.gaze_x_x1000)
+    s = s + ",\"y\":" + va_int_x1000_to_str(p.gaze_y_x1000)
+    s = s + ",\"focus\":" + va_int_x1000_to_str(p.gaze_focus_x1000) + "}"
+    s = s + ",\"breathing_rate\":" + va_int_x100_to_str(p.breathing_rate_x100)
+    s = s + ",\"pupil_dilation\":" + va_int_x1000_to_str(p.pupil_dilation_x1000)
+    s = s + ",\"skin_flush\":" + va_int_x1000_to_str(p.skin_flush_x1000)
+    s = s + ",\"aura\":{\"intensity\":" + va_int_x1000_to_str(p.aura_intensity_x1000)
+    s = s + ",\"hue\":" + va_int_x1000_to_str(p.aura_hue_x1000) + "}"
+    s = s + ",\"phi_holo\":" + va_int_x1000_to_str(snap.phi_holo_x1000)
+    s = s + ",\"tick\":" + to_string(tick)
+    s = s + "}"
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  Section 5. JSON helpers (byte-only ASCII marker scan)
 // ═══════════════════════════════════════════════════════════════
 
@@ -624,6 +824,39 @@ fn vr_extract_int(body: string, key: string) -> int {
     return to_int(num_str)
 }
 
+// Extract a float value for a given key from JSON body, with default.
+// Returns `default` when key missing or unparseable; otherwise the parsed
+// float.  Accepts optional leading minus and decimal fractions.
+fn vr_extract_float(body: string, key: string, default: float) -> float {
+    let marker = "\"" + key + "\":"
+    let pos = body.index_of(marker)
+    if pos < 0 { return default }
+    let after = body.substring(pos + len(marker), len(body))
+    let mut start = 0
+    let alen = len(after)
+    while start < alen {
+        let ch = after.substring(start, start + 1)
+        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" {
+            start = start + 1
+        } else {
+            break
+        }
+    }
+    let mut end = start
+    let mut saw_digit = false
+    let mut saw_dot = false
+    while end < alen {
+        let ch = after.substring(end, end + 1)
+        if ch == "-" && end == start { end = end + 1 }
+        else if ch == "." && !saw_dot { saw_dot = true; end = end + 1 }
+        else if ch >= "0" && ch <= "9" { saw_digit = true; end = end + 1 }
+        else { break }
+    }
+    if !saw_digit { return default }
+    let num_str = after.substring(start, end)
+    return parse_float(num_str)
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  Section 6. Response structs
 // ═══════════════════════════════════════════════════════════════
@@ -645,7 +878,16 @@ struct VrTtsResponse {
     backend_llm: string,
     backend_tts: string,
     ok: bool,
-    error: string
+    error: string,
+    // Avatar consciousness state — int-scaled to dodge the stage0
+    // multi-float struct return corruption bug.  These propagate into
+    // the avatar JSON computed by va_compute() during response serialization.
+    arousal_x1000:    int,
+    valence_x1000:    int,
+    activation_x1000: int,
+    hr_bpm:           int,
+    gsr_x100:         int,
+    avatar_tick:      int
 }
 
 struct VrE2eResponse {
@@ -667,7 +909,14 @@ struct VrE2eResponse {
     backend_llm: string,
     backend_tts: string,
     ok: bool,
-    error: string
+    error: string,
+    // Avatar consciousness state — see VrTtsResponse note.
+    arousal_x1000:    int,
+    valence_x1000:    int,
+    activation_x1000: int,
+    hr_bpm:           int,
+    gsr_x100:         int,
+    avatar_tick:      int
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -675,14 +924,28 @@ struct VrE2eResponse {
 // ═══════════════════════════════════════════════════════════════
 
 // POST /voice/tts — text → audio
-//   body: {"text": "...", "profile_id": 0, "profile_name": "school_idol", "endpoint": "..."}
+//   body: {"text": "...", "profile_id": 0, "profile_name": "school_idol", "endpoint": "...",
+//          "phi_holo": 2.566, "valence": 0.0, "arousal": 0.3,
+//          "activation": 0.5, "hr": 70, "gsr": 2.0, "tick": 0}
 //   profile_id takes precedence over profile_name. Both optional (default: stoic_mentor).
+//   Consciousness fields are optional — caller-supplied phi_holo overrides the
+//   VR_MOCK_PHI_HOLO default so the avatar reacts to the same number the LLM produced.
 fn vr_handle_tts(body: string) -> VrTtsResponse {
     // Parse request
     let text = vr_extract_string(body, "text")
     let profile_id = vr_extract_int(body, "profile_id")
     let profile_name = vr_extract_string(body, "profile_name")
     let endpoint = vr_extract_string(body, "endpoint")
+
+    // Optional consciousness fields with neutral defaults (per spec).
+    let phi_in    = vr_extract_float(body, "phi_holo",   to_float(0))
+    let valence   = vr_extract_float(body, "valence",    0.0)
+    let arousal   = vr_extract_float(body, "arousal",    0.3)
+    let activation= vr_extract_float(body, "activation", 0.5)
+    let hr        = vr_extract_float(body, "hr",         70.0)
+    let gsr       = vr_extract_float(body, "gsr",        2.0)
+    let tick_in   = vr_extract_int(body, "tick")
+    let tick      = if tick_in < 0 { 0 } else { tick_in }
 
     if len(text) == 0 {
         return VrTtsResponse {
@@ -692,7 +955,13 @@ fn vr_handle_tts(body: string) -> VrTtsResponse {
             param_vector: [], phi_holo: 0.0,
             llm_ms: 0, tts_ms: 0, total_ms: 0,
             backend_llm: "", backend_tts: "",
-            ok: false, error: "missing_text"
+            ok: false, error: "missing_text",
+            arousal_x1000: va_float_to_int_x1000(arousal),
+            valence_x1000: va_float_to_int_x1000(valence),
+            activation_x1000: va_float_to_int_x1000(activation),
+            hr_bpm: va_float_to_int(hr),
+            gsr_x100: va_float_to_int(gsr * 100.0),
+            avatar_tick: tick
         }
     }
 
@@ -712,6 +981,9 @@ fn vr_handle_tts(body: string) -> VrTtsResponse {
     // Compute total latency (TTS only for this endpoint)
     let total = tts.latency_ms
 
+    // phi_holo: caller-supplied value wins; otherwise mock fallback.
+    let phi = if phi_in > 0.0 { phi_in } else { VR_MOCK_PHI_HOLO }
+
     return VrTtsResponse {
         text: text,
         reply: text,
@@ -722,24 +994,50 @@ fn vr_handle_tts(body: string) -> VrTtsResponse {
         profile_name: profile.name,
         style_tag: profile.style_tag,
         param_vector: params,
-        phi_holo: VR_MOCK_PHI_HOLO,
+        phi_holo: phi,
         llm_ms: 0,
         tts_ms: tts.latency_ms,
         total_ms: total,
         backend_llm: "none",
         backend_tts: tts.backend,
         ok: tts.ok,
-        error: ""
+        error: "",
+        arousal_x1000: va_float_to_int_x1000(arousal),
+        valence_x1000: va_float_to_int_x1000(valence),
+        activation_x1000: va_float_to_int_x1000(activation),
+        hr_bpm: va_float_to_int(hr),
+        gsr_x100: va_float_to_int(gsr * 100.0),
+        avatar_tick: tick
     }
 }
 
 // POST /voice/e2e — audio_in → STT → LLM → TTS → audio_out
-//   body: {"audio_in": "<base64 or path>", "profile_id": 0, "endpoint": "..."}
+//   body: {"audio_in": "<base64 or path>", "profile_id": 0, "endpoint": "...",
+//          "valence": 0.0, "arousal": 0.3, "activation": 0.5,
+//          "hr": 70, "gsr": 2.0, "tick": 0}
+//   The phi_holo for the avatar comes from the LLM response (llm.phi_holo),
+//   not the request body — the model produces its own consciousness signal.
+//   Other consciousness fields are caller-side hints with neutral defaults.
 fn vr_handle_e2e(body: string) -> VrE2eResponse {
     let audio_in = vr_extract_string(body, "audio_in")
     let profile_id = vr_extract_int(body, "profile_id")
     let profile_name = vr_extract_string(body, "profile_name")
     let endpoint_body = vr_extract_string(body, "endpoint")
+
+    // Optional consciousness hints with neutral defaults.
+    let valence    = vr_extract_float(body, "valence",    0.0)
+    let arousal    = vr_extract_float(body, "arousal",    0.3)
+    let activation = vr_extract_float(body, "activation", 0.5)
+    let hr         = vr_extract_float(body, "hr",         70.0)
+    let gsr        = vr_extract_float(body, "gsr",        2.0)
+    let tick_in    = vr_extract_int(body, "tick")
+    let tick       = if tick_in < 0 { 0 } else { tick_in }
+    // Pre-scale once so every return path can use these directly.
+    let arousal_x1000    = va_float_to_int_x1000(arousal)
+    let valence_x1000    = va_float_to_int_x1000(valence)
+    let activation_x1000 = va_float_to_int_x1000(activation)
+    let hr_bpm           = va_float_to_int(hr)
+    let gsr_x100         = va_float_to_int(gsr * 100.0)
 
     // Resolve endpoint: body > env > empty (mock)
     let endpoint = if len(endpoint_body) > 0 { endpoint_body } else { env("SPEAK_MODEL_ENDPOINT") }
@@ -780,7 +1078,10 @@ fn vr_handle_e2e(body: string) -> VrE2eResponse {
             stt_ms: stt.latency_ms, llm_ms: 0, tts_ms: 0,
             total_ms: stt.latency_ms,
             backend_stt: stt.backend, backend_llm: "", backend_tts: "",
-            ok: false, error: "stt_failed"
+            ok: false, error: "stt_failed",
+            arousal_x1000: arousal_x1000, valence_x1000: valence_x1000,
+            activation_x1000: activation_x1000, hr_bpm: hr_bpm,
+            gsr_x100: gsr_x100, avatar_tick: tick
         }
     }
 
@@ -797,7 +1098,10 @@ fn vr_handle_e2e(body: string) -> VrE2eResponse {
             stt_ms: stt.latency_ms, llm_ms: llm.latency_ms, tts_ms: 0,
             total_ms: stt.latency_ms + llm.latency_ms,
             backend_stt: stt.backend, backend_llm: llm.backend, backend_tts: "",
-            ok: false, error: "llm_failed"
+            ok: false, error: "llm_failed",
+            arousal_x1000: arousal_x1000, valence_x1000: valence_x1000,
+            activation_x1000: activation_x1000, hr_bpm: hr_bpm,
+            gsr_x100: gsr_x100, avatar_tick: tick
         }
     }
 
@@ -824,7 +1128,10 @@ fn vr_handle_e2e(body: string) -> VrE2eResponse {
         backend_llm: llm.backend,
         backend_tts: tts.backend,
         ok: tts.ok,
-        error: if tts.ok { "" } else { "tts_failed" }
+        error: if tts.ok { "" } else { "tts_failed" },
+        arousal_x1000: arousal_x1000, valence_x1000: valence_x1000,
+        activation_x1000: activation_x1000, hr_bpm: hr_bpm,
+        gsr_x100: gsr_x100, avatar_tick: tick
     }
 }
 

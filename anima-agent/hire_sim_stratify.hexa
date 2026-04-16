@@ -1,0 +1,213 @@
+// hire_sim_stratify.hexa — stratified sampling for hire_sim gate harness
+//
+// Role:
+//   Group 100 hire_sim tasks by `domain` (email/code/meeting/doc/schedule/
+//   research) and take an even slice per group, so the 30-task subset has
+//   balanced representation across all task types.
+//
+// Public API:
+//   stratify(tasks, n)                    — even split across all observed domains
+//   stratify_by_domain(tasks, n, domains) — explicit domain order/allowlist
+//   list_domains(tasks)                   — unique domain names in appearance order
+//   domain_counts(tasks)                  — parallel arrays (names, counts)
+//
+// Deterministic ordering:
+//   - domains are discovered in first-seen order (stable across runs)
+//   - within each domain, tasks are taken in the order they appear in the
+//     input list (no shuffling — reproducibility > variance)
+//
+// Rounding policy:
+//   - per_domain = n / num_domains (integer division)
+//   - remainder tasks are distributed across the FIRST (remainder) domains
+//     in discovery order, one extra each. This keeps total count exactly n
+//     when n is not cleanly divisible by num_domains.
+//
+// Invariants:
+//   - len(stratify(tasks, n)) == min(n, len(tasks))
+//   - every returned task preserves its original Task struct
+//   - no side effects; pure function
+//
+// Dependency: hire_sim_100 (for Task struct definition).
+
+use "hire_sim_100"
+
+// ── Domain discovery ─────────────────────────────────────────────────
+
+// Return list of unique domain names in first-seen order.
+// Uses a simple linear-scan string-set because hexa has no native hashmap
+// at this stage and the domain cardinality is tiny (~6).
+fn list_domains(tasks: array) -> array {
+    let mut names = []
+    let mut i = 0
+    let n = len(tasks)
+    while i < n {
+        let d = tasks[i].domain
+        let mut exists = false
+        let mut j = 0
+        while j < len(names) {
+            if names[j] == d { exists = true }
+            j = j + 1
+        }
+        if !exists { names = names.push(d) }
+        i = i + 1
+    }
+    return names
+}
+
+// Parallel arrays (names, counts) — count of tasks per domain.
+// Returns a 2-element array [names_array, counts_array] because hexa
+// structs holding lists leak across instances (known quirk) and we do
+// not want to risk corrupting the count.
+fn domain_counts(tasks: array) -> array {
+    let names = list_domains(tasks)
+    let mut counts = []
+    let mut k = 0
+    while k < len(names) {
+        counts = counts.push(0)
+        k = k + 1
+    }
+    let mut i = 0
+    while i < len(tasks) {
+        let d = tasks[i].domain
+        let mut j = 0
+        while j < len(names) {
+            if names[j] == d {
+                counts = set_int_at(counts, j, counts[j] + 1)
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return [names, counts]
+}
+
+// ── Stratified sampling ──────────────────────────────────────────────
+
+// Group by `domain`, take an even slice from each, preserving input order
+// within each group. Total returned == min(n, len(tasks)).
+//
+// Allocation (n=30, domains=6 → 5 each):
+//   - per_base = n / num_domains              = 5
+//   - remainder = n - per_base * num_domains  = 0
+//   - first `remainder` domains get per_base + 1, rest get per_base
+//
+// Allocation (n=31, domains=6 → 6,5,5,5,5,5):
+//   - per_base = 5, remainder = 1 → email:6, code:5, meeting:5, ...
+//
+// If a domain has fewer tasks than its quota, it contributes all it has
+// (the shortage is NOT redistributed — caller is responsible for picking
+// an n that fits the corpus).
+fn stratify(tasks: array, n: int) -> array {
+    let domains = list_domains(tasks)
+    return stratify_by_domain(tasks, n, domains)
+}
+
+fn stratify_by_domain(tasks: array, n: int, domains: array) -> array {
+    let nd = len(domains)
+    if nd == 0 || n <= 0 { return [] }
+    // Per-domain quotas
+    let per_base = n / nd
+    let remainder = n - per_base * nd
+    let mut quotas = []
+    let mut qi = 0
+    while qi < nd {
+        let q = if qi < remainder { per_base + 1 } else { per_base }
+        quotas = quotas.push(q)
+        qi = qi + 1
+    }
+    // For each domain, scan tasks in order and take up to quota
+    let mut out = []
+    let mut di = 0
+    while di < nd {
+        let dname = domains[di]
+        let quota = quotas[di]
+        let mut taken = 0
+        let mut ti = 0
+        while ti < len(tasks) && taken < quota {
+            if tasks[ti].domain == dname {
+                out = out.push(tasks[ti])
+                taken = taken + 1
+            }
+            ti = ti + 1
+        }
+        di = di + 1
+    }
+    return out
+}
+
+// ── Small helpers ────────────────────────────────────────────────────
+
+// Replace element at idx in an int array. Works around the hexa
+// array-index-write quirk (assignment is a silent no-op).
+fn set_int_at(arr: array, idx: int, val: int) -> array {
+    let n = len(arr)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        if i == idx { out = out.push(val) } else { out = out.push(arr[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Self-test (exported, NOT fn main) ────────────────────────────────
+//
+// NOTE: We intentionally do NOT define `fn main` here. flatten_imports.hexa
+// mangles collided `main` functions across all files in the bundle, which
+// breaks compiled builds of hire_sim_runner.hexa when it `use`s this file.
+// Run self-tests via test_hire_sim_harness.hexa (test driver) or by
+// calling `selftest_hire_sim_stratify()` directly from another harness.
+fn selftest_hire_sim_stratify() -> bool {
+    let all = load_tasks()
+    println("=== hire_sim_stratify self-test ===")
+    println("total tasks: " + to_string(len(all)))
+    let dc = domain_counts(all)
+    let names = dc[0]
+    let counts = dc[1]
+    println("domains observed: " + to_string(len(names)))
+    let mut i = 0
+    while i < len(names) {
+        println("  " + names[i] + ": " + to_string(counts[i]))
+        i = i + 1
+    }
+
+    // 30-task stratified subset
+    let sub30 = stratify(all, 30)
+    println("")
+    println("stratify(tasks, 30) size: " + to_string(len(sub30)))
+    let sub_dc = domain_counts(sub30)
+    let sub_names = sub_dc[0]
+    let sub_counts = sub_dc[1]
+    let mut j = 0
+    while j < len(sub_names) {
+        println("  " + sub_names[j] + ": " + to_string(sub_counts[j]))
+        j = j + 1
+    }
+
+    // Sanity: 31-task shows the remainder distribution
+    let sub31 = stratify(all, 31)
+    println("")
+    println("stratify(tasks, 31) size: " + to_string(len(sub31)))
+    let sub31_dc = domain_counts(sub31)
+    let sub31_names = sub31_dc[0]
+    let sub31_counts = sub31_dc[1]
+    let mut k = 0
+    while k < len(sub31_names) {
+        println("  " + sub31_names[k] + ": " + to_string(sub31_counts[k]))
+        k = k + 1
+    }
+
+    let ok30 = len(sub30) == 30
+    let ok31 = len(sub31) == 31
+    // Per-domain count of 30 should equal 5 for all observed domains
+    let mut ok_balanced = true
+    let mut x = 0
+    while x < len(sub_counts) {
+        if sub_counts[x] != 5 { ok_balanced = false }
+        x = x + 1
+    }
+    let verdict = if ok30 && ok31 && ok_balanced { "PASS" } else { "FAIL" }
+    println("")
+    println("verdict: " + verdict)
+    return ok30 && ok31 && ok_balanced
+}

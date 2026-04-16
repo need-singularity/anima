@@ -1,0 +1,520 @@
+// hire_sim_runner.hexa — stratified30 gate runner for the hire_sim_100 corpus
+//
+// Role:
+//   The closed-loop harness that
+//     (1) loads the 100-task corpus from hire_sim_100,
+//     (2) takes the stratified-30 subset (hire_sim_stratify),
+//     (3) calls a model endpoint ONCE per task, and
+//     (4) judges each response with hire_sim_judge,
+//   then emits a single JSON report under shared/state/hire_sim_gate_<ts>.json.
+//
+// This is the PRIMARY test for extreme.json v3.0_Agent success_criteria:
+//   ALM: hire_sim_100 stratified30 ≥ 0.85 completion_rate
+//   CLM: hire_sim_100 stratified30 ≥ 0.80 completion_rate
+//
+// IMPORTANT — this does NOT touch anima-agent/hire_sim_100.hexa. The SSOT
+// corpus loader (load_tasks) is re-exported via the `use` chain, but all
+// gate logic lives here so hire_sim_100 stays pristine while the user
+// iterates on it.
+//
+// Endpoint contract (HTTP POST):
+//   Request:  POST $HIRE_SIM_ENDPOINT
+//             Content-Type: application/json
+//             {"task_id": "<id>", "prompt": "<task.prompt>"}
+//   Response: {"output": "<actual model text>"}
+//   (Any HTTP 2xx with a top-level "output" string — keys are
+//    extracted via substring, not full JSON parsing, to stay within
+//    stage0 hexa. If the response body has no "output":"..." marker,
+//    the whole body is used as the actual text.)
+//
+// Mock mode:
+//   If HIRE_SIM_ENDPOINT is unset OR HIRE_SIM_MOCK=1, the runner uses
+//   a mock model that echoes the task's success_keywords with padding
+//   so every judge passes — used for SMOKE TEST to verify the harness
+//   end-to-end without spending API budget.
+//
+// Curl timeout: 60s default; override via HIRE_SIM_TIMEOUT=N.
+//
+// Output JSON schema (stable — consumers should not assume more keys):
+//   {
+//     "ts": "...",
+//     "endpoint": "...",
+//     "mode": "mock" | "endpoint",
+//     "n_total": 100,
+//     "n_stratified": 30,
+//     "per_task": [ { "id", "type", "completion", "judge_detail", "rule",
+//                     "hits", "total", "actual_len" } ],
+//     "stratified_30_completion_rate": 0.xxxx,
+//     "overall_100_completion_rate": 0.xxxx | null,
+//     "by_type": { "email": 0.xx, ... },
+//     "alm_gate": { "threshold": 0.85, "pass": true/false },
+//     "clm_gate": { "threshold": 0.80, "pass": true/false },
+//     "verdict": "PASS" | "PARTIAL" | "FAIL",
+//     "baseline": { "run": "...", "rate": 0.xx, "delta": +/- } | null
+//   }
+//
+// Build & run:
+//   hexa run anima-agent/hire_sim_runner.hexa                 # smoke (mock)
+//   HIRE_SIM_ENDPOINT=http://localhost:8080/hire/task \
+//     hexa run anima-agent/hire_sim_runner.hexa               # live
+//   HIRE_SIM_OUT_DIR=/tmp hexa run anima-agent/hire_sim_runner.hexa
+
+use "hire_sim_100"
+use "hire_sim_stratify"
+use "hire_sim_judge"
+
+// ── Config / env ─────────────────────────────────────────────────────
+
+struct RunnerConfig {
+    endpoint: string,
+    mode: string,            // "mock" | "endpoint"
+    timeout_s: int,
+    out_dir: string,
+    baseline_path: string,
+    run_full_100: bool       // if true also runs all 100 for overall rate
+}
+
+fn load_config() -> RunnerConfig {
+    let ep = env_var("HIRE_SIM_ENDPOINT")
+    let forced_mock = env_var("HIRE_SIM_MOCK")
+    let out_dir_raw = env_var("HIRE_SIM_OUT_DIR")
+    let out_dir = if len(out_dir_raw) > 0 { out_dir_raw } else { "/Users/ghost/Dev/anima/shared/state" }
+    let baseline_raw = env_var("HIRE_SIM_BASELINE")
+    let baseline = if len(baseline_raw) > 0 { baseline_raw } else { "/Users/ghost/Dev/anima/shared/state/hire_sim_claude_v2_results.jsonl" }
+    let timeout_raw = env_var("HIRE_SIM_TIMEOUT")
+    let timeout_parsed = if len(timeout_raw) > 0 { timeout_raw.parse_int() } else { 60 }
+    let timeout = if timeout_parsed > 0 { timeout_parsed } else { 60 }
+    let run_full = env_var("HIRE_SIM_RUN_FULL") == "1"
+
+    let mode = if len(ep) == 0 || forced_mock == "1" { "mock" } else { "endpoint" }
+    return RunnerConfig {
+        endpoint: ep,
+        mode: mode,
+        timeout_s: timeout,
+        out_dir: out_dir,
+        baseline_path: baseline,
+        run_full_100: run_full
+    }
+}
+
+// ── Model call ───────────────────────────────────────────────────────
+
+// Send a task prompt to the endpoint and return the model's output text.
+// On any error (non-2xx, timeout, missing key) returns an empty string.
+// Caller treats empty as a failed task.
+fn call_endpoint(cfg: RunnerConfig, task: Task) -> string {
+    // JSON body — manual encode (no strings with quote chars in the prompts,
+    // but still escape defensively)
+    let body = "{\"task_id\":\"" + task.id + "\",\"prompt\":\"" + json_escape(task.prompt) + "\"}"
+    let body_file = "/tmp/hire_sim_body_" + task.id + ".json"
+    write_file(body_file, body)
+    let cmd = "timeout " + to_string(cfg.timeout_s) + " curl -sS -X POST -H 'Content-Type: application/json' "
+            + "-d @" + body_file + " " + cfg.endpoint + " 2>/dev/null"
+    let raw = exec(cmd).trim()
+    // Cleanup body file
+    let _ = exec("rm -f " + body_file)
+    if len(raw) == 0 { return "" }
+    return extract_output_field(raw)
+}
+
+// Mock model: echoes success_keywords + a padding sentence per domain.
+// Designed so every judge rule passes → smoke test should get 30/30.
+fn call_mock(task: Task) -> string {
+    let kws = task.success_keywords
+    let mut joined = ""
+    let mut i = 0
+    while i < len(kws) {
+        if i > 0 { joined = joined + " " }
+        joined = joined + kws[i]
+        i = i + 1
+    }
+    // Domain-specific padding to satisfy each rule's extra check + length floor
+    let pad = domain_pad(task.domain)
+    return "mock completion for " + task.id + ": " + joined + " " + pad
+}
+
+fn domain_pad(domain: string) -> string {
+    if domain == "code" {
+        // fenced block → looks_like_code true
+        return "\n```python\ndef handle():\n    return True\n```"
+    }
+    if domain == "schedule" {
+        return "scheduled for 45 minutes at 10am on 3 days"
+    }
+    if domain == "research" {
+        return "see 5 references and 3 benchmarks with detailed comparison notes attached."
+    }
+    // email / meeting / doc
+    return "Full context and action items included in the body of this response."
+}
+
+// ── JSON response field extraction (substring based) ────────────────
+// Extract the value of top-level key "output" from a simple JSON object.
+// If not found, falls back to the whole raw response. Stage0 hexa has no
+// JSON parser; we rely on the endpoint emitting a simple object with an
+// "output" key and no escaped quotes in the value (documented contract).
+fn extract_output_field(raw: string) -> string {
+    let key = "\"output\""
+    let idx = raw.index_of(key)
+    if idx < 0 { return raw }
+    let after_key = raw.substring(idx + len(key), len(raw))
+    // Skip whitespace and ':'
+    let colon = after_key.index_of(":")
+    if colon < 0 { return raw }
+    let after_colon = after_key.substring(colon + 1, len(after_key))
+    let trimmed = after_colon.trim()
+    if len(trimmed) == 0 { return raw }
+    // Value should start with a quote
+    let first = trimmed.substring(0, 1)
+    if first != "\"" { return raw }
+    // Find matching closing quote (no escape handling — contract forbids)
+    let rest = trimmed.substring(1, len(trimmed))
+    let close = rest.index_of("\"")
+    if close < 0 { return raw }
+    return rest.substring(0, close)
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+// ── Per-task execution ───────────────────────────────────────────────
+
+fn run_one(cfg: RunnerConfig, task: Task) -> JudgeResult {
+    let actual = if cfg.mode == "mock" { call_mock(task) } else { call_endpoint(cfg, task) }
+    return judge(task, actual)
+}
+
+// ── Aggregation ──────────────────────────────────────────────────────
+
+struct AggregateResult {
+    n: int,
+    completed: int,
+    rate: float,
+    by_type_names: array,
+    by_type_rates: array,
+    results: array           // array of JudgeResult
+}
+
+fn aggregate(results: array) -> AggregateResult {
+    let n = len(results)
+    let mut done = 0
+    let mut names = []
+    let mut counts = []     // int per-domain total
+    let mut wins = []       // int per-domain completions
+    let mut i = 0
+    while i < n {
+        let r = results[i]
+        if r.completion { done = done + 1 }
+        let mut found = 0 - 1
+        let mut j = 0
+        while j < len(names) {
+            if names[j] == r.domain { found = j }
+            j = j + 1
+        }
+        if found < 0 {
+            names = names.push(r.domain)
+            counts = counts.push(1)
+            wins = wins.push(if r.completion { 1 } else { 0 })
+        } else {
+            counts = set_int_at_r(counts, found, counts[found] + 1)
+            let add = if r.completion { 1 } else { 0 }
+            wins = set_int_at_r(wins, found, wins[found] + add)
+        }
+        i = i + 1
+    }
+    let rate = if n > 0 { to_float(done) / to_float(n) } else { 0.0 }
+    let mut rates = []
+    let mut k = 0
+    while k < len(names) {
+        let nk = counts[k]
+        let rk = if nk > 0 { to_float(wins[k]) / to_float(nk) } else { 0.0 }
+        rates = rates.push(rk)
+        k = k + 1
+    }
+    return AggregateResult {
+        n: n, completed: done, rate: rate,
+        by_type_names: names, by_type_rates: rates,
+        results: results
+    }
+}
+
+fn set_int_at_r(arr: array, idx: int, val: int) -> array {
+    let n = len(arr)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        if i == idx { out = out.push(val) } else { out = out.push(arr[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Baseline read (JSONL, last line) ─────────────────────────────────
+// Extract the most recent stratified30 completion_rate from the baseline
+// JSONL file. Returns -1.0 if file missing or rate not parseable.
+// Parses only `"completion_rate":<float>` substring — no full JSON.
+fn read_baseline_rate(path: string) -> float {
+    if !file_exists(path) { return 0.0 - 1.0 }
+    let raw = read_file(path)
+    let lines = split_lines_safe(raw)
+    let n = len(lines)
+    if n == 0 { return 0.0 - 1.0 }
+    // Walk lines from the end, find first that has "completion_rate"
+    let mut i = n - 1
+    while i >= 0 {
+        let ln = lines[i]
+        let key = "\"completion_rate\""
+        let idx = ln.index_of(key)
+        if idx >= 0 {
+            let tail = ln.substring(idx + len(key), len(ln))
+            let colon = tail.index_of(":")
+            if colon >= 0 {
+                let after = tail.substring(colon + 1, len(tail)).trim()
+                let tok = leading_float_token(after)
+                if len(tok) > 0 {
+                    return tok.parse_float()
+                }
+            }
+        }
+        i = i - 1
+    }
+    return 0.0 - 1.0
+}
+
+fn split_lines_safe(s: string) -> array {
+    let mut out = []
+    let n = len(s)
+    let mut start = 0
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if ch == "\n" {
+            out = out.push(s.substring(start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n { out = out.push(s.substring(start, n)) }
+    return out
+}
+
+fn leading_float_token(s: string) -> string {
+    // Byte-walk scanner — string `>=`/`<=` return void in stage0 hexa, so we
+    // compare char codes directly. Mirrors byte_at_parse() from
+    // llm_claude_adapter.hexa (substring-then-char_code indirection because
+    // char_code(s, i) ignores i on this build).
+    let n = len(s)
+    let mut i = 0
+    let mut saw_dot = false
+    let mut saw_digit = false
+    // Optional leading sign
+    if i < n {
+        let b = byte_at_runner(s, i)
+        if b == 45 || b == 43 { i = i + 1 }   // '-' or '+'
+    }
+    let start = 0
+    while i < n {
+        let b = byte_at_runner(s, i)
+        if b >= 48 && b <= 57 {               // '0'..'9'
+            saw_digit = true
+            i = i + 1
+        } else if b == 46 && !saw_dot {       // '.'
+            saw_dot = true
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    if !saw_digit { return "" }
+    return s.substring(start, i)
+}
+
+// Byte access helper — same pattern as llm_claude_adapter's byte_at_parse.
+fn byte_at_runner(s: string, i: int) -> int {
+    let sub = s.substring(i, i + 1)
+    return char_code(sub, 0)
+}
+
+// ── JSON report emission ─────────────────────────────────────────────
+
+fn emit_report(cfg: RunnerConfig, agg30: AggregateResult, agg100: AggregateResult,
+               baseline_rate: float) -> string {
+    let ts = exec("date +%Y%m%d_%H%M%S").trim()
+    let iso = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+    let mut s = "{\n"
+    s = s + "  \"ts\": \"" + iso + "\",\n"
+    s = s + "  \"endpoint\": \"" + cfg.endpoint + "\",\n"
+    s = s + "  \"mode\": \"" + cfg.mode + "\",\n"
+    s = s + "  \"n_total\": " + to_string(100) + ",\n"
+    s = s + "  \"n_stratified\": " + to_string(agg30.n) + ",\n"
+    s = s + "  \"per_task\": [\n"
+    let results = agg30.results
+    let mut i = 0
+    while i < len(results) {
+        let r = results[i]
+        let comma = if i < len(results) - 1 { "," } else { "" }
+        s = s + "    {"
+            + "\"id\": \"" + r.task_id + "\","
+            + " \"type\": \"" + r.domain + "\","
+            + " \"rule\": \"" + r.rule + "\","
+            + " \"completion\": " + (if r.completion { "true" } else { "false" }) + ","
+            + " \"hits\": " + to_string(r.hits) + ","
+            + " \"total\": " + to_string(r.total) + ","
+            + " \"score\": " + float_to_fixed4(r.score) + ","
+            + " \"judge_detail\": \"" + json_escape(r.detail) + "\""
+            + "}" + comma + "\n"
+        i = i + 1
+    }
+    s = s + "  ],\n"
+    s = s + "  \"stratified_30_completion_rate\": " + float_to_fixed4(agg30.rate) + ",\n"
+    if cfg.run_full_100 {
+        s = s + "  \"overall_100_completion_rate\": " + float_to_fixed4(agg100.rate) + ",\n"
+    } else {
+        s = s + "  \"overall_100_completion_rate\": null,\n"
+    }
+    s = s + "  \"by_type\": {"
+    let names = agg30.by_type_names
+    let rates = agg30.by_type_rates
+    let mut k = 0
+    while k < len(names) {
+        if k > 0 { s = s + ", " }
+        s = s + "\"" + names[k] + "\": " + float_to_fixed4(rates[k])
+        k = k + 1
+    }
+    s = s + "},\n"
+    let alm_pass = agg30.rate >= 0.85
+    let clm_pass = agg30.rate >= 0.80
+    s = s + "  \"alm_gate\": {\"threshold\": 0.85, \"pass\": " + (if alm_pass { "true" } else { "false" }) + "},\n"
+    s = s + "  \"clm_gate\": {\"threshold\": 0.80, \"pass\": " + (if clm_pass { "true" } else { "false" }) + "},\n"
+    let verdict = if alm_pass { "PASS" }
+                  else if clm_pass { "PARTIAL" }
+                  else if agg30.rate >= 0.50 { "PARTIAL" }
+                  else { "FAIL" }
+    s = s + "  \"verdict\": \"" + verdict + "\",\n"
+    if baseline_rate >= 0.0 {
+        let delta = agg30.rate - baseline_rate
+        s = s + "  \"baseline\": {\"rate\": " + float_to_fixed4(baseline_rate)
+            + ", \"delta\": " + float_to_fixed4(delta)
+            + ", \"source\": \"" + cfg.baseline_path + "\"}\n"
+    } else {
+        s = s + "  \"baseline\": null\n"
+    }
+    s = s + "}\n"
+    // Ensure out dir exists
+    let _ = exec("mkdir -p " + cfg.out_dir)
+    let path = cfg.out_dir + "/hire_sim_gate_" + ts + ".json"
+    write_file(path, s)
+    return path
+}
+
+// Fixed 4-decimal float formatter: "%.4f" equivalent without a native fmt.
+// hexa's to_string for floats on this build prints too few digits for
+// reproducible comparison, so we scale to int and pad.
+fn float_to_fixed4(x: float) -> string {
+    let neg = x < 0.0
+    let v = if neg { 0.0 - x } else { x }
+    let scaled = v * 10000.0
+    // round half-up
+    let ri = to_int(scaled + 0.5)
+    let whole = ri / 10000
+    let frac = ri - whole * 10000
+    let frac_s = pad_left_zero(to_string(frac), 4)
+    let sign = if neg { "-" } else { "" }
+    return sign + to_string(whole) + "." + frac_s
+}
+
+fn pad_left_zero(s: string, width: int) -> string {
+    let n = len(s)
+    if n >= width { return s }
+    let mut r = s
+    let mut i = 0
+    while i < width - n {
+        r = "0" + r
+        i = i + 1
+    }
+    return r
+}
+
+// ── Public harness entry ─────────────────────────────────────────────
+//
+// Runs the full gate and emits the JSON report. Returns the JSON report
+// path so callers (tests, launchers) can reference it.
+fn run_hire_sim_gate(cfg: RunnerConfig) -> string {
+    let all = load_tasks()
+    let n_all = len(all)
+    let sub30 = stratify(all, 30)
+    println("loaded " + to_string(n_all) + " tasks → stratified " + to_string(len(sub30)))
+    println("mode=" + cfg.mode + " endpoint=" + cfg.endpoint)
+    println("")
+
+    // Run stratified-30
+    let mut results30 = []
+    let mut i = 0
+    while i < len(sub30) {
+        let task = sub30[i]
+        let res = run_one(cfg, task)
+        results30 = results30.push(res)
+        let flag = if res.completion { "OK " } else { "XX " }
+        println("  " + flag + task.id + " [" + task.domain + "] " + res.detail)
+        i = i + 1
+    }
+    let agg30 = aggregate(results30)
+
+    // Optionally run full 100 for overall rate
+    let mut agg100 = AggregateResult { n: 0, completed: 0, rate: 0.0,
+        by_type_names: [], by_type_rates: [], results: [] }
+    if cfg.run_full_100 {
+        println("")
+        println("=== running full 100 for overall_100_completion_rate ===")
+        let mut results100 = []
+        let mut j = 0
+        while j < len(all) {
+            let t = all[j]
+            let r = run_one(cfg, t)
+            results100 = results100.push(r)
+            j = j + 1
+        }
+        agg100 = aggregate(results100)
+    }
+
+    // Baseline delta
+    let baseline = read_baseline_rate(cfg.baseline_path)
+
+    // Emit report
+    let path = emit_report(cfg, agg30, agg100, baseline)
+
+    println("")
+    println("=== hire_sim gate result ===")
+    println("  stratified30_rate: " + float_to_fixed4(agg30.rate)
+            + " (" + to_string(agg30.completed) + "/" + to_string(agg30.n) + ")")
+    if cfg.run_full_100 {
+        println("  overall_100_rate : " + float_to_fixed4(agg100.rate))
+    }
+    println("  ALM gate (>=0.85): " + (if agg30.rate >= 0.85 { "PASS" } else { "FAIL" }))
+    println("  CLM gate (>=0.80): " + (if agg30.rate >= 0.80 { "PASS" } else { "FAIL" }))
+    if baseline >= 0.0 {
+        let d = agg30.rate - baseline
+        let sign = if d >= 0.0 { "+" } else { "" }
+        println("  baseline         : " + float_to_fixed4(baseline) + " (Δ " + sign + float_to_fixed4(d) + ")")
+    } else {
+        println("  baseline         : <not found>")
+    }
+    println("")
+    println("report: " + path)
+    return path
+}
+
+// ── Note on entry point ─────────────────────────────────────────────
+//
+// This file is a LIBRARY module — it deliberately does NOT define
+// `fn main`. The production entry point and the smoke test both live in
+// `test_hire_sim_harness.hexa`, which imports this module and invokes
+// `run_hire_sim_gate(load_config())`. See that file's header for the
+// reason (flatten_imports collision-mangling of multiple `main`s).
