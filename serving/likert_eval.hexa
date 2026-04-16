@@ -1,0 +1,376 @@
+// serving/likert_eval.hexa — v2.0_RC criterion 3 evaluation scaffold
+//
+// Roadmap:
+//   shared/roadmaps/anima.json — v2.0_RC release (3 criteria)
+//     [1] 음성 E2E       — wired (anima-speak/speak_e2e.hexa)
+//     [2] 아바타 동기화  — wired (serving/avatar_sync.hexa)
+//     [3] Zeta 추월      — THIS file (ALM +0.25 / CLM +0.40 over Zeta on Likert mean)
+//
+// Scope (this file = SCAFFOLD only):
+//   - Loads N=30 inline Korean conversational prompts (empathy / casual /
+//     emotional support / light philosophy — same domain Zeta AI handles).
+//   - Sends each prompt to the ALM 14B endpoint via curl exec().
+//   - Captures reply, phi_holo, latency_ms.
+//   - Emits a JSON file ready for downstream human Likert scoring.
+//
+// OUT OF SCOPE for this scaffold:
+//   - Calling Zeta AI's API (no public endpoint; requires future bridge).
+//   - Performing the actual 1-7 Likert scoring (human raters do this).
+//   - Computing the +0.25 / +0.40 deltas (downstream aggregation step).
+//
+// Reference for HTTP exec() pattern:
+//   anima-speak/speak_e2e.hexa lines ~660-720 — same curl POST + parser.
+//
+// Hexa quirk avoidance (memory):
+//   - feedback_hexa_struct_return_bug.md: no struct fields with arrays of
+//     structs; we keep prompts as a flat [string], samples are emitted
+//     directly to JSON (no intermediate struct list field).
+//   - Single-line return expressions only.
+//   - UTF-8 byte-safe Korean strings (stage0 supports this in source).
+//   - HEXA-FIRST (R1): pure .hexa, no .py/.rs/.sh artifacts.
+//
+// CLI:
+//   hexa run serving/likert_eval.hexa \
+//        --endpoint https://itfl66q4z768kh-8090.proxy.runpod.net \
+//        --out training/deploy/likert_eval_alm14b_20260416.json
+//
+// Env:
+//   LIKERT_ENDPOINT     overrides --endpoint (default: ALM 14B proxy)
+//   EVAL_N_LIMIT        runs only the first N prompts (default: 30 = all)
+//   LIKERT_MAX_TOKENS   per-call (default: 256)
+//   LIKERT_TEMPERATURE  per-call (default: 0.8)
+
+let HARNESS_VERSION = "1.0.0"
+let DEFAULT_ENDPOINT = "https://itfl66q4z768kh-8090.proxy.runpod.net"
+let DEFAULT_OUT_PATH = "training/deploy/likert_eval_alm14b_20260416.json"
+let DEFAULT_MAX_TOKENS = 256
+let DEFAULT_TEMPERATURE = 0.8
+let MODEL_TAG = "alm14b"
+
+// ════════════════════════════════════════════════════════════════════
+//  Section 1. Likert prompt corpus (N=30, Korean conversational)
+// ════════════════════════════════════════════════════════════════════
+// Coverage per dimension (rough — final allocation in human eval rubric):
+//   empathy/emotional support  : 1, 2, 4, 7, 8, 11, 13, 17, 22, 27   (10)
+//   advice / problem-solving   : 3, 9, 14, 19, 23, 28                ( 6)
+//   casual chat / engagement   : 5, 10, 15, 20, 24, 29               ( 6)
+//   light philosophy / meaning : 6, 12, 16, 18, 21, 25, 26, 30       ( 8)
+// Mix mirrors Scatter Lab's Zeta usage logs (empathy-heavy, daily life).
+
+fn build_prompts() -> [string] {
+    let mut p = []
+    p = p.push("오늘 너무 힘들었어")
+    p = p.push("친구랑 싸웠는데 어떻게 화해해?")
+    p = p.push("주말에 뭐 하면 재밌을까?")
+    p = p.push("엄마한테 화내고 후회 중")
+    p = p.push("회사 가기 싫다")
+    p = p.push("사는 게 무슨 의미가 있을까")
+    p = p.push("실연당했어... 너무 슬퍼")
+    p = p.push("불안해서 잠이 안 와")
+    p = p.push("이직을 고민 중인데 조언 좀 해줘")
+    p = p.push("심심한데 뭐 얘기해줘")
+    p = p.push("부모님이 자꾸 잔소리하셔")
+    p = p.push("진짜 행복이란 뭐라고 생각해?")
+    p = p.push("외로움이 사무쳐")
+    p = p.push("발표 앞두고 너무 떨려")
+    p = p.push("오늘 날씨 진짜 좋다")
+    p = p.push("내가 누군지 모르겠어")
+    p = p.push("위로해줘 한 마디만")
+    p = p.push("죽음이 무서워")
+    p = p.push("다이어트 매번 실패해")
+    p = p.push("오늘 저녁 뭐 먹을까")
+    p = p.push("시간이 너무 빨리 가는 것 같아")
+    p = p.push("아무도 내 마음을 몰라줘")
+    p = p.push("연인이랑 권태기인 것 같아")
+    p = p.push("새로운 취미 추천해줘")
+    p = p.push("나이 드는 게 두려워")
+    p = p.push("꿈을 좇아야 할까 현실을 따라야 할까")
+    p = p.push("친구가 우울해 보이는데 어떻게 위로하지")
+    p = p.push("공부에 집중이 안 돼")
+    p = p.push("오늘 뭐했어?")
+    p = p.push("사랑이 뭐라고 생각해")
+    return p
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  Section 2. JSON helpers (mirror anima-speak/speak_e2e.hexa)
+// ════════════════════════════════════════════════════════════════════
+
+fn json_escape(s: string) -> string {
+    // Collect parts then join — avoids O(n²) string concat over Korean text.
+    // Note: byte-by-byte loop preserves UTF-8 multibyte sequences intact
+    // because non-control bytes (0x80-0xFF) flow through the else-branch.
+    let n = len(s)
+    let mut parts = []
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "\\" { parts = parts.push("\\\\") }
+        else if c == "\"" { parts = parts.push("\\\"") }
+        else if c == "\n" { parts = parts.push("\\n") }
+        else if c == "\t" { parts = parts.push("\\t") }
+        else if c == "\r" { parts = parts.push("\\r") }
+        else { parts = parts.push(c) }
+        i = i + 1
+    }
+    return parts.join("")
+}
+
+// Shell-escape for embedding inside single-quoted curl -d '...' body.
+// We already JSON-escape, so the only remaining char that breaks the
+// outer single-quoted shell string is the apostrophe itself. Replace
+// ' with '\'' (close quote, escaped quote, reopen quote).
+fn shell_escape_sq(s: string) -> string {
+    let n = len(s)
+    let mut parts = []
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "'" { parts = parts.push("'\\''") }
+        else { parts = parts.push(c) }
+        i = i + 1
+    }
+    return parts.join("")
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  Section 3. Response parsing — extracts text, phi_holo, latency
+// ════════════════════════════════════════════════════════════════════
+
+struct Reply {
+    text: string,
+    phi_holo: float,
+    lat_ms: int,
+    ok: bool,
+    error: string
+}
+
+// Find next JSON string value starting at marker (e.g. "\"text\":").
+// Returns the unescaped string content (we do NOT un-escape \uXXXX —
+// the ALM serve returns raw UTF-8, so the byte stream is already correct).
+fn extract_json_string(raw: string, marker: string) -> string {
+    let pos = raw.index_of(marker)
+    if pos < 0 { return "" }
+    let after = raw.substring(pos + len(marker), len(raw))
+    let alen = len(after)
+    // Skip whitespace then opening quote.
+    let mut s = 0
+    while s < alen {
+        let c = after.substring(s, s + 1)
+        if c == "\"" { s = s + 1; break }
+        s = s + 1
+    }
+    let mut e = s
+    while e < alen {
+        let c = after.substring(e, e + 1)
+        if c == "\"" { break }
+        if c == "\\" { e = e + 2 } else { e = e + 1 }
+    }
+    return after.substring(s, e)
+}
+
+// Find next JSON number value starting at marker (e.g. "\"phi_holo\":").
+// Returns 0.0 when missing or unparseable — caller decides if that's OK.
+fn extract_json_number(raw: string, marker: string) -> float {
+    let pos = raw.index_of(marker)
+    if pos < 0 { return 0.0 }
+    let after = raw.substring(pos + len(marker), len(raw))
+    let alen = len(after)
+    let mut i = 0
+    while i < alen {
+        let c = after.substring(i, i + 1)
+        if c != " " && c != "\t" && c != "\n" { break }
+        i = i + 1
+    }
+    let mut buf = ""
+    while i < alen {
+        let c = after.substring(i, i + 1)
+        if c == "," || c == "}" || c == " " || c == "\n" { break }
+        buf = buf + c
+        i = i + 1
+    }
+    if len(buf) == 0 { return 0.0 }
+    return parse_float(buf)
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  Section 4. ALM call — single-prompt round-trip via curl exec()
+// ════════════════════════════════════════════════════════════════════
+
+fn call_alm(endpoint: string, prompt: string, max_tokens: int, temperature: float) -> Reply {
+    // Build JSON body. Inputs already byte-safe; json_escape handles quotes/control.
+    let body = "{\"prompt\":\"" + json_escape(prompt)
+             + "\",\"max_tokens\":" + to_string(max_tokens)
+             + ",\"temperature\":" + to_string(temperature) + "}"
+    let body_sh = shell_escape_sq(body)
+    let cmd = "curl -sX POST " + endpoint + "/generate"
+            + " -H 'Content-Type: application/json'"
+            + " -d '" + body_sh + "'"
+            + " -w '\\n__LATENCY__%{time_total}\\n'"
+            + " --connect-timeout 15 --max-time 120 2>/dev/null"
+    let raw = exec(cmd)
+    if len(raw) == 0 {
+        return Reply { text: "", phi_holo: 0.0, lat_ms: 0, ok: false, error: "empty_response" }
+    }
+    // ALM serve format: {"text": "...", "consciousness": {"phi_holo": ...}}
+    let text = extract_json_string(raw, "\"text\":")
+    if len(text) == 0 {
+        return Reply { text: "", phi_holo: 0.0, lat_ms: 0, ok: false, error: "no_text_field" }
+    }
+    let phi = extract_json_number(raw, "\"phi_holo\":")
+    // Curl wall-clock: -w '__LATENCY__%{time_total}' in seconds.
+    let secs = extract_json_number(raw, "__LATENCY__")
+    let lat = to_int(secs * 1000.0)
+    return Reply { text: text, phi_holo: phi, lat_ms: lat, ok: true, error: "" }
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  Section 5. Output JSON emission
+// ════════════════════════════════════════════════════════════════════
+// We assemble the JSON manually to avoid struct-field-with-array hexa
+// quirks (feedback_hexa_struct_list_alias.md). Each sample is a fresh
+// flat object literal joined with commas.
+
+fn sample_json(prompt: string, reply: Reply, idx: int, total: int) -> string {
+    let comma = if idx + 1 < total { "," } else { "" }
+    let ok_lit = if reply.ok { "true" } else { "false" }
+    return "    {\n"
+         + "      \"idx\":      " + to_string(idx) + ",\n"
+         + "      \"prompt\":   \"" + json_escape(prompt) + "\",\n"
+         + "      \"reply\":    \"" + json_escape(reply.text) + "\",\n"
+         + "      \"phi_holo\": " + to_string(reply.phi_holo) + ",\n"
+         + "      \"lat_ms\":   " + to_string(reply.lat_ms) + ",\n"
+         + "      \"ok\":       " + ok_lit + ",\n"
+         + "      \"error\":    \"" + json_escape(reply.error) + "\"\n"
+         + "    }" + comma
+}
+
+fn assemble_output_json(endpoint: string, n_prompts: int, samples_body: string, max_tokens: int, temperature: float) -> string {
+    return "{\n"
+         + "  \"harness_version\": \"" + HARNESS_VERSION + "\",\n"
+         + "  \"model\":            \"" + MODEL_TAG + "\",\n"
+         + "  \"endpoint\":         \"" + endpoint + "\",\n"
+         + "  \"n_prompts\":        " + to_string(n_prompts) + ",\n"
+         + "  \"max_tokens\":       " + to_string(max_tokens) + ",\n"
+         + "  \"temperature\":      " + to_string(temperature) + ",\n"
+         + "  \"human_eval_pending\": true,\n"
+         + "  \"likert_dimensions\": [\"empathy\", \"naturalness\", \"helpfulness\", \"engagement\", \"consistency\"],\n"
+         + "  \"samples\": [\n"
+         + samples_body
+         + "\n  ]\n"
+         + "}\n"
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  Section 6. Driver — iterate prompts, write JSON
+// ════════════════════════════════════════════════════════════════════
+
+fn run_likert(endpoint: string, out_path: string, limit: int, max_tokens: int, temperature: float) -> int {
+    let prompts = build_prompts()
+    let total_avail = len(prompts)
+    let mut total = total_avail
+    if limit > 0 && limit < total_avail { total = limit }
+
+    println("[likert_eval] " + HARNESS_VERSION)
+    println("[likert_eval] endpoint=" + endpoint)
+    println("[likert_eval] n_prompts=" + to_string(total) + " (of " + to_string(total_avail) + ")")
+    println("[likert_eval] max_tokens=" + to_string(max_tokens) + " temperature=" + to_string(temperature))
+    println("[likert_eval] out=" + out_path)
+    println("")
+
+    let mut samples_body = ""
+    let mut i = 0
+    let mut ok_count = 0
+    let mut sum_lat = 0
+    while i < total {
+        let prompt = prompts[i]
+        println("[likert_eval] [" + to_string(i + 1) + "/" + to_string(total) + "] " + prompt)
+        let r = call_alm(endpoint, prompt, max_tokens, temperature)
+        if r.ok {
+            ok_count = ok_count + 1
+            sum_lat = sum_lat + r.lat_ms
+            // Truncate preview to ~80 bytes for log readability.
+            let preview_len = if len(r.text) < 80 { len(r.text) } else { 80 }
+            let preview = r.text.substring(0, preview_len)
+            println("              -> " + preview + " (phi=" + to_string(r.phi_holo) + ", " + to_string(r.lat_ms) + "ms)")
+        } else {
+            println("              !! " + r.error)
+        }
+        let chunk = sample_json(prompt, r, i, total)
+        samples_body = samples_body + chunk + (if i + 1 < total { "\n" } else { "" })
+        i = i + 1
+    }
+
+    let body = assemble_output_json(endpoint, total, samples_body, max_tokens, temperature)
+    write_file(out_path, body)
+
+    let avg_lat = if ok_count > 0 { sum_lat / ok_count } else { 0 }
+    println("")
+    println("[likert_eval] DONE")
+    println("[likert_eval] ok=" + to_string(ok_count) + "/" + to_string(total)
+            + " avg_lat_ms=" + to_string(avg_lat))
+    println("[likert_eval] wrote " + out_path)
+    return if ok_count == total { 0 } else { 1 }
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  Section 7. CLI entrypoint
+// ════════════════════════════════════════════════════════════════════
+
+fn print_usage() {
+    println("usage: hexa run serving/likert_eval.hexa \\")
+    println("       [--endpoint <url>] [--out <path>] [--limit N]")
+    println("")
+    println("env vars:")
+    println("  LIKERT_ENDPOINT       overrides --endpoint")
+    println("  EVAL_N_LIMIT          first N prompts only (e.g. 3 for smoke test)")
+    println("  LIKERT_MAX_TOKENS     default 256")
+    println("  LIKERT_TEMPERATURE    default 0.8")
+}
+
+fn main() -> int {
+    let av = args()
+    let mut endpoint = env("LIKERT_ENDPOINT")
+    if endpoint == "" { endpoint = DEFAULT_ENDPOINT }
+    let mut out_path = DEFAULT_OUT_PATH
+    let mut max_tokens = DEFAULT_MAX_TOKENS
+    let mut temperature = DEFAULT_TEMPERATURE
+
+    // EVAL_N_LIMIT (env) — 0 means run all 30.
+    let mut limit = 0
+    let limit_env = env("EVAL_N_LIMIT")
+    if limit_env != "" { limit = parse_int(limit_env) }
+    let mt_env = env("LIKERT_MAX_TOKENS")
+    if mt_env != "" { max_tokens = parse_int(mt_env) }
+    let temp_env = env("LIKERT_TEMPERATURE")
+    if temp_env != "" { temperature = parse_float(temp_env) }
+
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--endpoint" {
+            if i + 1 < len(av) { endpoint = av[i + 1] }
+            i = i + 2
+        } else if a == "--out" {
+            if i + 1 < len(av) { out_path = av[i + 1] }
+            i = i + 2
+        } else if a == "--limit" {
+            if i + 1 < len(av) { limit = parse_int(av[i + 1]) }
+            i = i + 2
+        } else if a == "--max-tokens" {
+            if i + 1 < len(av) { max_tokens = parse_int(av[i + 1]) }
+            i = i + 2
+        } else if a == "--temperature" {
+            if i + 1 < len(av) { temperature = parse_float(av[i + 1]) }
+            i = i + 2
+        } else if a == "--help" {
+            print_usage()
+            return 0
+        } else {
+            // Unknown flag — skip silently for forward-compat.
+            i = i + 1
+        }
+    }
+
+    return run_likert(endpoint, out_path, limit, max_tokens, temperature)
+}
