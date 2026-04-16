@@ -41,7 +41,7 @@ Baseline: **r3f** = `eval=1.2296 (ppl 3.42)` @ step 9500, 1.51B params, 10K step
 
 1. `nvidia-smi` reports H100 (refuse otherwise)
 2. `/workspace/corpus_clm_r4.txt` exists and ≥ 4.5 GB
-3. `train_clm_1b.py` + `clm_1b_config.json` present
+3. `train_clm.hexa` + `clm_1b_config.json` present
 4. **MFS quota dd probe**: `dd if=/dev/zero of=/workspace/_q_test bs=1M count=20000` succeeds (per `training/CLAUDE.md` `runpod_mfs_quota`)
 5. `du -sh /workspace` printed; stale CLM ckpts deleted (`rm -rf /workspace/ckpt_clm*` except current)
 6. Fresh ckpt dir created (no `--resume` — data changed → `feedback_no_resume_data_change`)
@@ -63,7 +63,7 @@ eval "$(runpodctl ssh info $POD_ID | jq -r '"POD_IP=" + .ip + " POD_PORT=" + (.p
 SCP="scp -i ~/.runpod/ssh/RunPod-Key-Go -P $POD_PORT"
 SSH="ssh -i ~/.runpod/ssh/RunPod-Key-Go root@$POD_IP -p $POD_PORT"
 $SSH 'mkdir -p /workspace/anima/training'
-$SCP training/train_clm_1b.py        root@$POD_IP:/workspace/anima/training/
+$SCP training/train_clm.hexa        root@$POD_IP:/workspace/anima/training/
 $SCP training/clm_1b_config.json     root@$POD_IP:/workspace/anima/training/
 $SCP training/deploy/clm_r4_launch.hexa root@$POD_IP:/workspace/
 gzip -k training/corpus_clm_r4.txt   # local one-time, ~2 GB output
@@ -80,7 +80,7 @@ $SSH 'tail -f /workspace/ckpt_clm1b_r4/train_r4.log'
 If `hexa` binary is unavailable on the pod (interpreter only path): the launcher
 just builds a bash script at `/tmp/_clm_r4_launch_runner.sh` and execs it — you
 can extract that bash payload and run it directly. The actual training is
-`python3 /workspace/anima/training/train_clm_1b.py --config ... --corpus ... --steps 750000 ...`.
+`hexa /workspace/anima/training/train_clm.hexa --config ... --corpus ... --steps 750000 ...` (Python entry banned per feedback_py_ban_total.md).
 
 ## Abort criteria
 

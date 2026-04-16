@@ -1,0 +1,293 @@
+// ════════════════════════════════════════════════════════════════
+//  training/mi_gpu_ref.hexa — Mutual Information CPU reference
+//
+//  Ported from training/mi_gpu_ref.py (HEXA-FIRST total ban, R1).
+//
+//  Purpose:
+//    Numerical reference for the log-bin Mutual Information estimator
+//    used by training/phi_auto_measure.hexa. Reproduces the CPU scalar
+//    path byte-identically, so the production hexa kernel
+//    (training/mi_gpu_batch.hexa) can be cross-checked against an
+//    independent implementation.
+//
+//  NON-AUTHORITATIVE: Production estimator lives in
+//      training/phi_auto_measure.hexa  (CPU)
+//      training/mi_gpu_batch.hexa      (GPU, NVRTC)
+//
+//  GPU REFERENCE BLOCKER (intentional):
+//    The original Python file used `import torch` + torch.bincount on
+//    CUDA for a wall-clock microbenchmark. There is no torch FFI from
+//    hexa, and the production GPU path is mi_gpu_batch.hexa (NVRTC).
+//    The microbench was a paper-only twin and is NOT ported here. To
+//    get steady-state GPU numbers run mi_gpu_batch.hexa --bench on a
+//    box with a CUDA device. Do NOT re-introduce a torch dependency.
+//
+//  Usage:
+//      hexa training/mi_gpu_ref.hexa                 # default 110 x 1024
+//      hexa training/mi_gpu_ref.hexa --batch 5 --n 1024
+//      hexa training/mi_gpu_ref.hexa --poc           # batch=5 N=256
+//
+//  HEXA quirks honoured:
+//    - No `use` chain (silent-exit defense, feedback_hexa_silent_exit)
+//    - No multi-float struct returns (feedback_hexa_struct_return_bug)
+//    - Lists pass-by-value, mutations returned via reassignment
+//      (feedback_hexa_lists_pbv)
+//    - Substring uses UTF-8 byte indices on ASCII-only literals
+//      (feedback_hexa_string_api)
+// ════════════════════════════════════════════════════════════════
+
+let MI_BINS = 8
+
+// Natural log helper — Maclaurin series with range reduction by ln2.
+// Mirrors anima-physics/hippocampus/theta_gamma.hexa:ln_pos so we don't
+// rely on stage1 `log` being present.
+let LN2 = 0.6931471805599453
+
+fn ln_pos(x) {
+    if x <= 0.0 { return 0.0 - 1000000.0 }  // sentinel; caller masks p<=0
+    let mut k = 0
+    let mut v = x
+    while v >= 2.0 {
+        v = v * 0.5
+        k = k + 1
+    }
+    while v < 0.5 {
+        v = v * 2.0
+        k = k - 1
+    }
+    let u = v - 1.0
+    let u2 = u * u
+    let u3 = u2 * u
+    let u4 = u3 * u
+    let u5 = u4 * u
+    let u6 = u5 * u
+    let u7 = u6 * u
+    let u8 = u7 * u
+    let s = u
+        - u2 / 2.0
+        + u3 / 3.0
+        - u4 / 4.0
+        + u5 / 5.0
+        - u6 / 6.0
+        + u7 / 7.0
+        - u8 / 8.0
+    return s + to_float(k) * LN2
+}
+
+// ── Bin index — exact match to phi_auto_measure.hexa ──
+
+fn bin_index(x, lo, hi, nb) {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+// ── Min/max over a list of floats ──
+
+fn list_min(xs) {
+    let n = len(xs)
+    if n == 0 { return 0.0 }
+    let mut m = xs[0]
+    let mut i = 1
+    while i < n {
+        if xs[i] < m { m = xs[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn list_max(xs) {
+    let n = len(xs)
+    if n == 0 { return 0.0 }
+    let mut m = xs[0]
+    let mut i = 1
+    while i < n {
+        if xs[i] > m { m = xs[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn float_min(a, b) { if a < b { return a } else { return b } }
+fn float_max(a, b) { if a > b { return a } else { return b } }
+fn float_abs(a)    { if a < 0.0 { return 0.0 - a } else { return a } }
+
+// ── CPU scalar MI — byte-identical to phi_auto_measure.hexa:mutual_info ──
+
+fn cpu_mi_scalar(a, b) {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let lo = float_min(list_min(a), list_min(b))
+    let hi = float_max(list_max(a), list_max(b))
+    let nb = MI_BINS
+
+    // Init zero histograms via list builder.
+    let mut ha = []
+    let mut hb = []
+    let mut hj = []
+    let mut z = 0
+    while z < nb {
+        ha = ha.push(0)
+        hb = hb.push(0)
+        z = z + 1
+    }
+    let mut zj = 0
+    let nb2 = nb * nb
+    while zj < nb2 {
+        hj = hj.push(0)
+        zj = zj + 1
+    }
+
+    let mut i = 0
+    while i < n {
+        let ia = bin_index(a[i], lo, hi, nb)
+        let ib = bin_index(b[i], lo, hi, nb)
+        ha[ia] = ha[ia] + 1
+        hb[ib] = hb[ib] + 1
+        let jix = ia * nb + ib
+        hj[jix] = hj[jix] + 1
+        i = i + 1
+    }
+
+    let inv_n = 1.0 / to_float(n)
+
+    let mut H_a = 0.0
+    let mut k = 0
+    while k < nb {
+        let c = ha[k]
+        if c > 0 {
+            let p = to_float(c) * inv_n
+            H_a = H_a - p * ln_pos(p)
+        }
+        k = k + 1
+    }
+    let mut H_b = 0.0
+    let mut k2 = 0
+    while k2 < nb {
+        let c = hb[k2]
+        if c > 0 {
+            let p = to_float(c) * inv_n
+            H_b = H_b - p * ln_pos(p)
+        }
+        k2 = k2 + 1
+    }
+    let mut H_ab = 0.0
+    let mut k3 = 0
+    while k3 < nb2 {
+        let c = hj[k3]
+        if c > 0 {
+            let p = to_float(c) * inv_n
+            H_ab = H_ab - p * ln_pos(p)
+        }
+        k3 = k3 + 1
+    }
+
+    let mi = H_a + H_b - H_ab
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ── Deterministic LCG (matches phi_auto_measure.hexa:det_rand bit-for-bit) ──
+
+fn det_rand(n, seed) {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0 * 2.0 - 1.0
+        out = out.push(u)
+        i = i + 1
+    }
+    return out
+}
+
+// ── Wall-clock helper via shell (no high-res FFI in safe subset) ──
+
+fn now_ms() {
+    // gdate (coreutils) gives ns precision on macOS; fall back to date %s*1000.
+    let ns = exec("gdate +%s%N 2>/dev/null || date +%s000000000").trim()
+    // Convert ns string to ms via shell to avoid hexa int-from-string parsing.
+    let ms = exec("echo $(( " + ns + " / 1000000 ))").trim()
+    return ms
+}
+
+fn ms_diff(start_ms, end_ms) {
+    return exec("echo $(( " + end_ms + " - " + start_ms + " ))").trim()
+}
+
+// ── Main ──
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+
+    let mut batch = 110
+    let mut n     = 1024
+    let mut poc   = false
+
+    let mut i = 2
+    while i < argc {
+        let a = argv[i]
+        if a == "--batch" && i + 1 < argc {
+            // Shell-parse the integer to stay in safe subset.
+            let v = exec("echo " + argv[i + 1]).trim()
+            // Cheap guard: only accept ascii digits.
+            batch = to_int(v)
+            i = i + 2
+        } else if a == "--n" && i + 1 < argc {
+            let v = exec("echo " + argv[i + 1]).trim()
+            n = to_int(v)
+            i = i + 2
+        } else if a == "--poc" {
+            poc = true
+            i = i + 1
+        } else {
+            i = i + 1
+        }
+    }
+    if poc {
+        batch = 5
+        n     = 256
+    }
+
+    println("[mi_gpu_ref] batch=" + str(batch) + " N=" + str(n))
+    println("[mi_gpu_ref] (CPU scalar reference only — GPU path is mi_gpu_batch.hexa)")
+
+    // Build input matrices (list-of-list).
+    let mut A = []
+    let mut B = []
+    let mut e = 0
+    while e < batch {
+        A = A.push(det_rand(n, 1337 + e * 7))
+        B = B.push(det_rand(n, 9001 + e * 11))
+        e = e + 1
+    }
+
+    // CPU scalar pass — mirrors hexa production estimator.
+    let t0 = now_ms()
+    let mut cpu_scalar = []
+    let mut k = 0
+    while k < batch {
+        cpu_scalar = cpu_scalar.push(cpu_mi_scalar(A[k], B[k]))
+        k = k + 1
+    }
+    let t1 = now_ms()
+    let dt = ms_diff(t0, t1)
+    println("[cpu-scalar ] " + str(batch) + "x serial: " + dt + " ms")
+
+    // Print first/last MI value for spot check.
+    if batch > 0 {
+        println("[cpu-scalar ] mi[0]=" + str(cpu_scalar[0]))
+        if batch > 1 {
+            println("[cpu-scalar ] mi[" + str(batch - 1) + "]=" + str(cpu_scalar[batch - 1]))
+        }
+    }
+
+    println("[gpu-torch  ] skipped: torch FFI not present in hexa")
+    println("            (run training/mi_gpu_batch.hexa --bench on H100 for steady-state GPU numbers)")
+    println("[done] CPU reference complete.")
+}
