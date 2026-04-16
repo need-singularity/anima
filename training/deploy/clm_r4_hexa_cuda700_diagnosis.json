@@ -1,0 +1,81 @@
+{
+  "_meta": {
+    "name": "CLM r4 hexa-native CUDA error 700 — re-occurrence on fresh pod",
+    "ts_utc": "2026-04-16T11:33:00Z",
+    "pod": "cvozor3ena4ezy (anima-clm1b-r4-hexa)",
+    "ssh": "87.120.211.211:10710",
+    "type": "ossified-troubleshooting"
+  },
+  "training_run": {
+    "binary": "/workspace/train_clm_native (hexa-compiled, 859K)",
+    "config": {
+      "model": "CLM byte-level KR (zero-Rust, hexa-native)",
+      "D": 512,
+      "FF": 2048,
+      "NL": 12,
+      "VOCAB": 256,
+      "SEQ": 512,
+      "RANK": 64,
+      "BATCH": 1,
+      "GRAD_ACC": 8,
+      "STEPS": 20,
+      "WARMUP": 500,
+      "LR_MAX": 3e-4,
+      "LR_MIN": 3e-5
+    },
+    "context": "Smoke run with STEPS=20 — production target is 750K. Smoke failed at step 3."
+  },
+  "init_phase_succeeded": [
+    "cuda_ffi loaded (CUDA + cuBLAS bindings, 23 batch GEMM)",
+    "cuda_rtc loaded (NVRTC + driver API)",
+    "20 kernels (12 base + 8 fused) NVRTC compiled OK from cache .hexa-cache/ptx_162369251.ptx",
+    "GPU 80484 MB free / 81079 MB total",
+    "Tensor cores enabled (CUBLAS_TENSOR_OP_MATH)",
+    "Corpus load: 134299378 tokens from training/corpus_ko_seed.tok",
+    "GPU weights init OK (seed=54321, scale=0.02)",
+    "fwd/grad/eval buffers allocated on GPU"
+  ],
+  "failure": {
+    "step": 3,
+    "micro_step": 6,
+    "fatal_message": "[train_clm_kr] FATAL — sample_batch returned null at step=3 micro=6",
+    "preceding_errors": [
+      "[cuda_rtc] cuLaunchKernelEx failed: 700 (shmem=0)",
+      "[cuda_ffi] cuda_malloc(4194304) failed: 700 (multiple, sizes 4MB / 1MB / 2KB)",
+      "[cuda_ffi] sgemm failed: 7"
+    ],
+    "error_700_meaning": "CUDA_ERROR_ILLEGAL_ADDRESS — kernel launched with bad pointer or array oob"
+  },
+  "root_cause_hypotheses": [
+    {
+      "id": "H1_kernel_pointer_lifecycle",
+      "claim": "An earlier kernel writes through a freed/reused pointer; subsequent cuda_malloc returns 700 because the context is wedged",
+      "evidence": "First failure was cuLaunchKernelEx (shmem=0), then cascade of cuda_malloc failures. Once a CUDA context hits illegal-address, all subsequent allocations on it fail.",
+      "fix_direction": "Add cudaDeviceSynchronize + cudaGetLastError after every kernel launch in gpu_train hot loop; identify which kernel poisons the context."
+    },
+    {
+      "id": "H2_seq_off_by_one_in_kernel",
+      "claim": "Some kernel indexes [SEQ] when it should index [SEQ-1] or accesses position SEQ in a SEQ-size buffer",
+      "evidence": "12 base + 8 fused kernels; bytes-only vocab 256 should mean small offsets; SEQ=512 hardcoded",
+      "fix_direction": "Run with cuda-memcheck (compute-sanitizer) to localize the OOB access kernel"
+    },
+    {
+      "id": "H3_h100_sm90_specific",
+      "claim": "Per memory project_session_20260412_night.md and feedback_clm_hexa_gpu_plan.md, prior CLM hexa GPU runs hit cuLaunchKernelEx failures on H100 SM90 builds — same family of bug not fully resolved",
+      "evidence": "Same error fingerprint as h100_clm_native_debug.md / h100_clm_native_dmon.log",
+      "fix_direction": "Compare working pod build vs this pod's hxblas/hxccl/hxflash/hxlayer/hxlmhead/hxqwen14b/hxvdsp .so versions; verify SM90 PTX targets in NVRTC compile flags"
+    }
+  ],
+  "next_steps_for_repair_session": [
+    "1. Re-launch with COMPUTE_SANITIZER=1 (or compute-sanitizer wrapper) to localize the kernel that triggers 700",
+    "2. Dump the .ptx-cached kernel that NVRTC compiled (.hexa-cache/ptx_162369251.ptx) and disassemble first",
+    "3. Compare anima-engines/cuda_kernels.hexa kernel definitions vs the 20 entry point list — confirm shape mismatches between kernel signatures and runtime call args",
+    "4. Add per-kernel cudaPeekAtLastError() after each launch in gpu_train.hexa hot loop"
+  ],
+  "blocked_track": "CLM r4 750K production launch is BLOCKED until smoke (STEPS=20) passes. Cannot proceed to 41h run with confidence the binary will stay alive.",
+  "live_state_summary": {
+    "ALM_track": "FROZEN (Python ban + serve down + no hexa-native LoRA trainer)",
+    "CLM_track": "BLOCKED (hexa-native trainer crashes at step 3 on H100 SM90)",
+    "AGI_dual_track_progress": "STALLED — both arms gated on hexa-lang infrastructure work"
+  }
+}
