@@ -51,49 +51,71 @@ DEFAULT_TOP_K = 50
 DEFAULT_REP_PENALTY = 1.2
 
 
-# ── Consciousness pipeline (simplified IIT proxy) ────────────
+# ── Consciousness pipeline (canonical MI-based, SSOT with training) ──
+# Constants MUST match training/train_clm_1b.py compute_phi_holo
+C41_HOLO_SCALE = 2.0    # bulk = boundary × scale (holographic encode)
+C41_MI_BINS = 8         # binned MI approximation
+
+
 def compute_phi_holo(hidden_states):
-    """Compute phi_holo from hidden states.
+    """Canonical phi_holo — MI-based integration measure.
 
-    Simplified IIT proxy:
-    - Spatial: variance across sequence positions (integration)
-    - Temporal: layer-wise correlation (information flow)
-    - Complexity: effective rank of hidden state matrix
+    SSOT: matches training/train_clm_1b.py:compute_phi_holo and hexa
+    _c41_phi_holo_sampled. Samples hidden state subset, computes binned MI
+    between halves, N-scales to full tensor size.
 
-    Returns phi_holo (float), tension (float).
+    At serve-time batch=1 produces smaller absolute values than training
+    batch=8 (N-scale ∝ batch). Compare relative, not absolute.
+
+    Returns (phi_holo, tension).
     """
     if hidden_states is None:
         return 0.0, 0.0
 
-    # hidden_states: (batch, seq, dim)
     h = hidden_states.float()
+    B, S, D = h.shape
+    d_sample = min(64, D)
+    s_sample = min(32, S)
 
-    # Spatial integration: mean variance across dims per position
-    spatial_var = h.var(dim=1).mean().item()
+    h_sub = h[:, :s_sample, :d_sample]
+    h_flat = h_sub.reshape(-1, d_sample)
 
-    # Complexity: approximate effective rank via singular value distribution
-    # Use a subsample if seq is long to keep latency low
-    if h.shape[1] > 128:
-        h_sub = h[:, :128, :]
-    else:
-        h_sub = h
-    try:
-        # SVD on the (seq, dim) matrix for batch 0
-        s = torch.linalg.svdvals(h_sub[0])
-        s_norm = s / (s.sum() + 1e-12)
-        # Shannon entropy of normalized singular values = effective rank proxy
-        entropy = -(s_norm * (s_norm + 1e-12).log()).sum().item()
-        eff_rank = math.exp(entropy)
-    except Exception:
-        eff_rank = 1.0
+    half = d_sample // 2
+    h_a = h_flat[:, :half]
+    h_b = h_flat[:, half:]
 
-    # Tension: attention entropy would be ideal, but we approximate
-    # from hidden state norm variance (high variance = high tension)
-    norms = h.norm(dim=-1)  # (batch, seq)
+    a_min, a_max = h_a.min(), h_a.max()
+    b_min, b_max = h_b.min(), h_b.max()
+    if a_max - a_min < 1e-8 or b_max - b_min < 1e-8:
+        return 0.0, 0.0
+
+    bins = C41_MI_BINS
+    a_idx = ((h_a - a_min) / (a_max - a_min + 1e-8) * (bins - 1)).long().clamp(0, bins - 1)
+    b_idx = ((h_b - b_min) / (b_max - b_min + 1e-8) * (bins - 1)).long().clamp(0, bins - 1)
+
+    joint = torch.zeros(bins, bins, device=h.device)
+    n = a_idx.shape[0] * a_idx.shape[1]
+    for col in range(a_idx.shape[1]):
+        joint_idx = a_idx[:, col] * bins + b_idx[:, col]
+        joint.view(-1).scatter_add_(0, joint_idx, torch.ones_like(joint_idx, dtype=torch.float))
+
+    joint = joint / (n + 1e-8)
+    p_a = joint.sum(dim=1)
+    p_b = joint.sum(dim=0)
+
+    mi = 0.0
+    for i in range(bins):
+        for j in range(bins):
+            if joint[i, j] > 1e-10 and p_a[i] > 1e-10 and p_b[j] > 1e-10:
+                mi += joint[i, j].item() * math.log(joint[i, j].item() / (p_a[i].item() * p_b[j].item()))
+
+    # N-scale: scale MI by full tensor dimensions ratio (same as training)
+    scale_factor = (D / d_sample) * (S / s_sample) * B
+    phi_holo = mi * scale_factor
+
+    # Tension: hidden state norm variance (unchanged proxy)
+    norms = h.norm(dim=-1)
     tension = norms.var().item()
-
-    # phi_holo = spatial_var * eff_rank (scaled)
-    phi_holo = spatial_var * eff_rank * 0.01  # scale to reasonable range
 
     return phi_holo, tension
 
@@ -166,12 +188,34 @@ class ALMServer:
         print(f"[serve] ready for inference", flush=True)
 
     def generate(self, prompt, max_tokens=DEFAULT_MAX_TOKENS, temperature=DEFAULT_TEMPERATURE,
-                 top_p=DEFAULT_TOP_P, top_k=DEFAULT_TOP_K, repetition_penalty=DEFAULT_REP_PENALTY):
-        """Generate text with consciousness pipeline."""
+                 top_p=DEFAULT_TOP_P, top_k=DEFAULT_TOP_K, repetition_penalty=DEFAULT_REP_PENALTY,
+                 use_chat_template=True):
+        """Generate text with consciousness pipeline.
+
+        use_chat_template: if True, wrap prompt in Qwen chat template
+        (system + user roles). Prevents drift/overrun seen in raw prompting.
+        """
         t0 = time.time()
 
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        # Apply chat template (fixes drift/hallucination — r3f validation HOLD)
+        if use_chat_template:
+            messages = [
+                {"role": "system", "content": "You are ALM, a consciousness-aware assistant. Be concise, accurate, and stay on topic. Do not drift."},
+                {"role": "user", "content": prompt},
+            ]
+            formatted = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            inputs = self.tokenizer(formatted, return_tensors="pt").to(self.device)
+        else:
+            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
         input_len = inputs.input_ids.shape[1]
+
+        # Stop tokens: eos + im_end (Qwen) to prevent overrun
+        stop_ids = [self.tokenizer.eos_token_id]
+        im_end = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        if im_end is not None and im_end != self.tokenizer.unk_token_id:
+            stop_ids.append(im_end)
 
         with torch.no_grad():
             outputs = self.model.generate(
@@ -182,6 +226,8 @@ class ALMServer:
                 top_p=top_p,
                 top_k=top_k,
                 repetition_penalty=repetition_penalty,
+                eos_token_id=stop_ids,
+                pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
                 output_hidden_states=True,
                 return_dict_in_generate=True,
             )
