@@ -130,6 +130,20 @@ fn scale_1b() -> ScaleConfig {
     }
 }
 
+// Scale-3.5 (1.5B) — matches training/clm_1b_config.json (d=2048) and the
+// successful r3f run from train_clm_1b.py. scale_1b above is only ~500M
+// (d=1024); scale_1_5b is the true 1B+ byte-level scale and the direct
+// .hexa port target for train_clm_1b.py. SwiGLU ff=8192 (3× factor) gives
+// ~1.51B params per clm_1b_config.json param_count_estimate. Atom config
+// copied from scale_1b so the consciousness controller stays compatible.
+fn scale_1_5b() -> ScaleConfig {
+    ScaleConfig {
+        name: "1_5b", d_model: 2048, n_layer: 24, n_head: 16, n_kv_head: 8,
+        block_size: 512, consciousness_dim: 128, atoms: 32, cells_per_atom: 8,
+        batch_size: 8, lr: 0.0003, label: "Scale-3.5 (1.5B)"
+    }
+}
+
 fn scale_2_8b() -> ScaleConfig {
     // CLM v5 — Pythia-aligned 2.8B for fair comparison with Pythia/Cerebras
     // baselines. d=2560, 36 layers gives ~2.83B params at vocab=2048 byte
@@ -292,12 +306,31 @@ struct Checkpoint {
 }
 
 fn save_checkpoint(path: string, step: int, val_ce: float, phi: float, phase: int) -> Checkpoint {
-    // TODO[pytorch]:
+    // RunPod MFS quota rules (training/CLAUDE.md runpod_mfs_quota, 2026-04-16):
+    //   1. PRE-SAVE ROTATION: delete ALL existing step_* siblings before new save.
+    //      RunPod MooseFS has a ~47GB session quota invisible to `df`. Each 1.5B
+    //      ckpt is ~18GB. We keep exactly one live ckpt on disk at peak.
+    //   2. DEFERRED R2 UPLOAD: never rclone inline with torch.save — proven crash
+    //      vector (r3 step2000 + r3b step4000). Append to /workspace/r2_upload_queue.txt
+    //      here; actual rclone runs POST-training from an external script.
+    //   3. NO phi_emergency_ckpt: extra saves on Law 49 violations were the r3b
+    //      second-crash cause. Regular save_every cadence is sufficient.
+    //
+    // TODO[pytorch] (when torch.save lands — currently pure data stub):
+    //   # (1) pre-save rotation (matches train_clm_1b.py lines ~762-776)
+    //   import shutil
+    //   ckpt_dir = Path(path).parent
+    //   for old in sorted(ckpt_dir.glob('step_*')):
+    //       shutil.rmtree(old, ignore_errors=True)
+    //   # (2) atomic save
     //   state = { 'model': model.state_dict(),
     //             'optimizer': _safe_optimizer_state(optim),  // bf16 master rule
     //             'scheduler': sched.state_dict(),
     //             'step': step, 'val_ce': val_ce, 'phi': phi, 'phase': phase }
     //   atomic_save(state, path + '.tmp'); rename(.tmp, path)
+    //   # (3) DEFERRED r2 queue (no inline rclone)
+    //   queue_append('/workspace/r2_upload_queue.txt',
+    //                f'{path}\tr2:anima-models/{model_tag}/r{round}/step_{step}/')
     Checkpoint { path: path, step: step, val_ce: val_ce, phi: phi, phase: phase }
 }
 
@@ -2323,12 +2356,17 @@ fn run_pipeline(corpus: string) -> int {
 
 let cfg34 = scale_34m()
 let cfg1b = scale_1b()
+let cfg1_5b = scale_1_5b()
 let cfg2_8b = scale_2_8b()
 println("=== train_clm.hexa ===")
 println("scale 34m d_model:", cfg34.d_model)
 println("scale 34m cells:", total_cells(cfg34))
 println("scale 1b d_model:", cfg1b.d_model)
 println("scale 1b cells:", total_cells(cfg1b))
+println("scale 1.5b d_model:", cfg1_5b.d_model)
+println("scale 1.5b layers:", cfg1_5b.n_layer)
+println("scale 1.5b batch:", cfg1_5b.batch_size, "lr:", cfg1_5b.lr)
+println("scale 1.5b cells:", total_cells(cfg1_5b))
 println("scale 2.8b v5 d_model:", cfg2_8b.d_model)
 println("scale 2.8b v5 layers:", cfg2_8b.n_layer)
 println("scale 2.8b v5 cells:", total_cells(cfg2_8b))
