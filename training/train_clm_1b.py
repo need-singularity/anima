@@ -704,7 +704,10 @@ def train(args):
                 l_complexity = compute_complexity_loss(eval_hidden)
 
             # Composite loss (for reporting; actual training uses CE only in backward)
-            l_total_plus = eval_loss + phi_holo_w * l_holo + gwt_w * l_gwt + complexity_w * l_complexity
+            # Phase-adaptive GWT weight: P3 Hexad GWT loss explodes (~77x CE)
+            # Dampen GWT contribution in P3 to prevent eval divergence
+            gwt_phase_w = gwt_w * (0.1 if phase >= 2 else 1.0)  # P3: 0.001, P1/P2: 0.01
+            l_total_plus = eval_loss + phi_holo_w * l_holo + gwt_phase_w * l_gwt + complexity_w * l_complexity
 
             print(f"[eval] step={step} eval_loss={eval_loss:.4f} ppl={eval_ppl:.2f} "
                   f"total+aux={l_total_plus:.4f} phi_holo={phi_holo:.1f} "
