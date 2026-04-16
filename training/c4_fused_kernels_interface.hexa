@@ -1,0 +1,256 @@
+// ═══════════════════════════════════════════════════════════════
+//  training/c4_fused_kernels_interface.hexa — C4 CUDA fused mega-kernel
+//  hexa-side INTERFACE STUBS (pre-claim, pre-C2 landing).
+//
+//  Status:  DESIGN PHASE ONLY — all bodies are placeholders returning
+//           error code -1 until C2 (layer-level fused FFI) lands in the
+//           hexa_lang_session tree (ffi_fused_layer.hexa / libhxlayer.so
+//           extension). Do NOT wire these into training/cuda_kernels.hexa
+//           yet; that file is the live training path.
+//
+//  Pre-claim:
+//    - shared/state/c_track_board.json :: items.C4.status =
+//      "pre_claimed_pending_c2_landing"
+//    - hexa_lang session e541cb6cb8a7 ack at 2026-04-16T14:05Z
+//
+//  Upstream C2 contract (reference only — may evolve during landing):
+//    hexa-lang/self/ml/hxlayer.hexa         (Step 1 — rmsnorm+silu)
+//    hexa-lang/self/ml/hxcuda.hexa          (struct-args ABI probe)
+//    hexa-lang/self/native/hxlayer_linux.c  (C shim, fused row loop)
+//    hexa-lang/self/native/hxcuda_fused.cu  (WMMA bf16 MVP)
+//
+//  Design doc (mandatory read before any implementation work):
+//    docs/c4-cuda-fused-megakernel-design.md
+//
+//  Goal: CLM H100 MFU 27 % → 60 %.  Measured via
+//    shared/state/training_speed_ceilings.json :: CLM.
+//
+//  Parse-only contract: this file declares the signatures, exposes the
+//  integration surface `training/cuda_kernels.hexa` will need, and must
+//  parse cleanly on Mac without CUDA. `hexa parse
+//  training/c4_fused_kernels_interface.hexa` → OK.
+//
+//  Layout of this file:
+//    §1  Module-level constants (tile sizes, WMMA ops — forward-declared)
+//    §2  Fused forward kernel stubs
+//    §3  Fused backward kernel stubs
+//    §4  Tensor-Core bf16 GEMM variants
+//    §5  Init / selector
+//    §6  Integration helpers (called by cuda_kernels.hexa after C2 lands)
+// ═══════════════════════════════════════════════════════════════
+
+// ── §1  Constants ────────────────────────────────────────────
+
+// WMMA tile shape — m16n16k16 is the native H100 (sm_90) bf16 shape.
+// Matches hexa-lang/self/native/hxcuda_fused.cu WMMA_M / WMMA_N / WMMA_K.
+let C4_WMMA_M = 16
+let C4_WMMA_N = 16
+let C4_WMMA_K = 16
+
+// Warp size (threads per warp on NVIDIA).
+let C4_WARP = 32
+
+// Max dynamic shared memory per block on sm_90 (bytes). Used for
+// register-pressure checks inside launchers.
+let C4_SM90_SHMEM_MAX = 228 * 1024
+
+// Fusion status token — returned by stubs until C2 lands.
+let C4_ERR_C2_NOT_LANDED = -1001
+
+// ── §2  Fused forward kernel stubs ──────────────────────────
+
+// fused_layernorm_linear_gelu_fwd
+//   Fuses:  rms_norm(x, g) → mm(norm, W) → gelu(y)
+//   Source ops in unfused path (cuda_kernels.hexa):
+//       gpu_rms_norm_fwd + hxblas_sgemm + elementwise_gelu
+//   Launch reduction: 3 → 1
+//   bf16 TC:          YES (matmul tile is WMMA 16x16x16)
+//   Body: TODO C2-LANDING.
+fn fused_layernorm_linear_gelu_fwd(x_dev, W_dev, g_dev, out_dev,
+                                   M, K, N, eps) -> int {
+    return C4_ERR_C2_NOT_LANDED
+}
+
+// fused_qkv_projection_fwd
+//   Fuses:  norm1 → mm(norm1, Wq) + mm(norm1, Wk) + mm(norm1, Wv)
+//   by packing [Wq | Wk | Wv] into one [D, 3·D_head·H] matrix (shared A).
+//   Launch reduction: 3 → 1  (shared input row, 3x bandwidth recovery)
+//   bf16 TC:          YES
+//   Body: TODO C2-LANDING.
+fn fused_qkv_projection_fwd(norm_dev, Wqkv_dev,
+                            Q_dev, K_dev, V_dev,
+                            M, K_in, D_head, H) -> int {
+    return C4_ERR_C2_NOT_LANDED
+}
+
+// fused_attn_score_softmax_fwd
+//   Fuses:  mm(Q, K^T) / sqrt(d) → causal mask → softmax
+//   Already partially fused in cuda_kernels.hexa (K_FUSED_ATTN_POST_FWD
+//   does scale + softmax together); this adds the GEMM into the same
+//   launch by using a streaming online-softmax on the score tile —
+//   this is the FlashAttention path applied per-layer.
+//   Launch reduction: 2 → 1
+//   bf16 TC:          YES (score GEMM uses WMMA)
+//   Body: TODO C2-LANDING.
+fn fused_attn_score_softmax_fwd(Q_dev, K_dev, probs_dev,
+                                B, H, S, D_head, causal_int) -> int {
+    return C4_ERR_C2_NOT_LANDED
+}
+
+// fused_ffn_swiglu_fwd
+//   Fuses:  rms_norm(mid) → mm(norm, W_up) → mm(norm, W_gate) → swiglu(up, gate) → mm(act, W_down)
+//   Launch reduction: 5 → 1 (with two GEMMs folded via WMMA tile fusion)
+//   bf16 TC:          YES
+//   Body: TODO C2-LANDING.
+fn fused_ffn_swiglu_fwd(mid_dev, Wup_dev, Wgate_dev, Wdown_dev,
+                        g_dev, out_dev,
+                        M, D, D_ff, eps) -> int {
+    return C4_ERR_C2_NOT_LANDED
+}
+
+// fused_embed_resid_layernorm_fwd
+//   Fuses:  embed_lookup(W_emb, toks) → add positional → rms_norm
+//   (No GEMM here — bandwidth-bound fusion on the embedding hot path.)
+//   Launch reduction: 3 → 1
+//   bf16 TC:          NO (no matmul)
+//   Body: TODO C2-LANDING.
+fn fused_embed_resid_layernorm_fwd(W_emb_dev, toks_dev, pos_dev,
+                                   g_dev, out_dev, rstd_dev,
+                                   N, D, V, eps) -> int {
+    return C4_ERR_C2_NOT_LANDED
+}
+
+// fused_lmhead_softmax_ce_fwd
+//   Fuses:  mm(h, W_lmh) → softmax → cross-entropy loss
+//   Matches hexa-lang/self/ml/hxcuda.hexa cuda_fused_lmhead_fwd.
+//   Launch reduction: 3 → 1  (logits tensor never materialised in full)
+//   bf16 TC:          YES (lmhead GEMM)
+//   Body: TODO C2-LANDING.
+fn fused_lmhead_softmax_ce_fwd(h_dev, W_lmh_dev, targets_dev,
+                               loss_dev, probs_dev,
+                               S, D, V) -> int {
+    return C4_ERR_C2_NOT_LANDED
+}
+
+// ── §3  Fused backward kernel stubs ─────────────────────────
+
+// fused_lmhead_softmax_ce_bwd
+//   Fuses:  ce_grad(probs, targets) → mm(dlogits, W_lmh^T) → dh
+//   Launch reduction: 2 → 1
+//   bf16 TC:          YES
+//   Body: TODO C2-LANDING.
+fn fused_lmhead_softmax_ce_bwd(probs_dev, targets_dev, W_lmh_dev,
+                               dh_dev, dW_lmh_dev,
+                               S, D, V) -> int {
+    return C4_ERR_C2_NOT_LANDED
+}
+
+// fused_ffn_swiglu_bwd
+//   Mirror of fused_ffn_swiglu_fwd. Fuses swiglu_bwd with rms_norm_bwd
+//   and the two FFN-layer GEMMs (W_down^T, W_up^T, W_gate^T) into one
+//   launch per layer using WMMA fragments.
+//   Launch reduction: 5 → 1
+//   bf16 TC:          YES
+//   Body: TODO C2-LANDING.
+fn fused_ffn_swiglu_bwd(dy_dev, mid_dev, Wup_dev, Wgate_dev, Wdown_dev,
+                        g_dev, rstd_dev,
+                        dmid_dev, dWup_dev, dWgate_dev, dWdown_dev, dg_dev,
+                        M, D, D_ff) -> int {
+    return C4_ERR_C2_NOT_LANDED
+}
+
+// fused_attn_score_softmax_bwd
+//   Fuses softmax_bwd with the Q·K^T GEMM gradient.
+//   Launch reduction: 2 → 1
+//   bf16 TC:          YES
+//   Body: TODO C2-LANDING.
+fn fused_attn_score_softmax_bwd(Q_dev, K_dev, probs_dev, dp_dev,
+                                dQ_dev, dK_dev,
+                                B, H, S, D_head) -> int {
+    return C4_ERR_C2_NOT_LANDED
+}
+
+// fused_qkv_projection_bwd
+//   Mirror of fused_qkv_projection_fwd — folds three input-grad GEMMs
+//   (dnorm += dQ @ Wq^T + dK @ Wk^T + dV @ Wv^T) into one kernel.
+//   Launch reduction: 3 → 1
+//   bf16 TC:          YES
+//   Body: TODO C2-LANDING.
+fn fused_qkv_projection_bwd(dQ_dev, dK_dev, dV_dev, Wqkv_dev,
+                            dnorm_dev, dWqkv_dev,
+                            M, D, D_head, H) -> int {
+    return C4_ERR_C2_NOT_LANDED
+}
+
+// fused_layernorm_linear_gelu_bwd
+//   Mirror of the §2 forward fusion.
+//   Launch reduction: 3 → 1
+//   bf16 TC:          YES
+//   Body: TODO C2-LANDING.
+fn fused_layernorm_linear_gelu_bwd(dy_dev, x_dev, W_dev, g_dev, rstd_dev,
+                                   dx_dev, dW_dev, dg_dev,
+                                   M, K, N) -> int {
+    return C4_ERR_C2_NOT_LANDED
+}
+
+// ── §4  Tensor-Core bf16 GEMM variants ──────────────────────
+
+// tc_sgemm_bf16
+//   Standalone WMMA bf16 GEMM. Callable where cuBLAS sgemm is used today
+//   once its wall-clock beats the cuBLAS path on H100 (we expect parity
+//   at small M, win at large M due to lower dispatch overhead).
+//   Matches hexa-lang/self/ml/hxcuda.hexa :: cuda_matmul_bf16.
+//   bf16 TC:          YES
+//   Body: TODO C2-LANDING.
+fn tc_sgemm_bf16(A_dev, B_dev, C_dev, M, K, N) -> int {
+    return C4_ERR_C2_NOT_LANDED
+}
+
+// tc_sgemm_bias_gelu_bf16
+//   WMMA bf16 GEMM + bias add + GELU in one kernel — fuses the epilogue
+//   into the tile-store step.
+//   bf16 TC:          YES
+//   Body: TODO C2-LANDING.
+fn tc_sgemm_bias_gelu_bf16(A_dev, B_dev, bias_dev, C_dev, M, K, N) -> int {
+    return C4_ERR_C2_NOT_LANDED
+}
+
+// ── §5  Init + selector ─────────────────────────────────────
+
+// gpu_init_fused_kernels_c4 — the C4 analogue of gpu_init_kernels() in
+// cuda_kernels.hexa. Called once at training startup after rtc_init.
+// Loads the new mega-kernel PTX module and resolves 12 entry points.
+// Body: TODO C2-LANDING.
+fn gpu_init_fused_kernels_c4() -> int {
+    println("[c4] gpu_init_fused_kernels_c4 stub — C2 not landed yet")
+    return C4_ERR_C2_NOT_LANDED
+}
+
+// c4_is_ready — integration guard. Returns 1 once C2 fused FFI is
+// present AND gpu_init_fused_kernels_c4() has succeeded. Callers in
+// cuda_kernels.hexa should bail to the unfused path when this is 0.
+fn c4_is_ready() -> int {
+    return 0
+}
+
+// ── §6  Integration helpers (used by cuda_kernels.hexa post-C2) ──
+
+// c4_select_forward_path — switch between unfused and fused forward
+// depending on readiness + shape. Returns the numeric path tag:
+//   0 = unfused (current cuda_kernels.hexa path)
+//   1 = fused C4 mega-kernels
+// Shape-gate heuristics:
+//   d >= 512 and seq >= 512 → prefer C4 (WMMA win region)
+//   d <  256                → stay unfused (tile granularity wastes TC)
+// Body: TODO C2-LANDING.
+fn c4_select_forward_path(d, seq, batch) -> int {
+    return 0
+}
+
+// c4_select_backward_path — same convention for backward pass.
+// Body: TODO C2-LANDING.
+fn c4_select_backward_path(d, seq, batch) -> int {
+    return 0
+}
+
+// ── end of interface stubs ──────────────────────────────────
