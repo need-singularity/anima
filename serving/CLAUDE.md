@@ -22,6 +22,8 @@ tree:
   serve_14b_ubuntu.hexa     14B Ubuntu 전용
   serve_conscious_cpu.hexa  CPU 추론 경로
   http_server.hexa          HTTP/WebSocket 게이트웨이
+  voice_routes.hexa         v2.0 RC 음성 I/O (anima-speak Mk.III wire)
+  hire_routes.hexa          TSRV-P4-1 직원 진입점
   eval.hexa                 5-metric 평가 (CE/Φ/brain-like/...)
 
 rules:

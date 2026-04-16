@@ -14,10 +14,15 @@ exec:
   $HEXA bench/bench_engine.hexa                     # 메인 엔진 벤치
   $HEXA bench/bench_consciousness_universe.hexa     # 18조건 정식
   $HEXA bench/bench_clm_sweep.hexa                  # ConsciousLM 스윕
+  $HEXA bench/bench_v3_gate.hexa                    # v3.0 gate (hire_sim + phi_holo)
+  $HEXA bench/bench_v3_gate.hexa --track alm        # ALM gate only
+  $HEXA bench/bench_v3_gate.hexa --phi-only         # phi_holo standalone
   $HEXA ready/anima/tests/tests.hexa --verify       # canonical 7조건
 
 tree:
-  bench_engine.hexa                메인 진입점
+  bench.hexa                       메인 진입점 (18조건 + dual Φ + v3 gate dispatch)
+  bench_v3_gate.hexa               v3.0 Agent gate (hire_sim_100 + phi_holo combined)
+  bench_engine.hexa                코어 엔진 벤치 (stub)
   bench_consciousness_*.hexa       의식 지표 (Φ/brain-like/CE)
   bench_{domain}_engines.hexa      도메인 (algebra/evolution/physics/info)
   bench_decoder_*.hexa             디코더 아키 탐색
@@ -25,10 +30,11 @@ tree:
   bench_emergent_*.hexa            Emergent Hexad/Trinity
   bench_*_LEGACY.hexa              폐기 (Φ proxy/IIT 혼동)
   bench_dd{NN}_*.hexa              DD 발견 검증
-  .py 파일                          .hexa 완성 대응 archive (R7)
+  zeta_likert.hexa                 Zeta AI A/B Likert 벤치
 
 rules:
-  - 측정 지표: Φ(IIT 정식), Φ(proxy), CE, brain-like score
+  - 측정 지표: Φ(IIT 정식), Φ(proxy), Φ(holo), CE, brain-like score
+  - v3.0 gate: hire_sim_100 stratified30 + phi_holo (bench_v3_gate.hexa)
   - LEGACY 파일은 실행 금지 (혼동기)
   - 법칙 등록 전 Intervention→measure_laws 폐쇄 검증 필수
   - 벤치 조건은 엔진과 동반 진화 (문서-코드 동기화)
