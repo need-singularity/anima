@@ -1,0 +1,269 @@
+// serving/deploy_voice.hexa — voice_routes deployment to hexa-c4 pod
+//
+// Deploys http_server.hexa + voice_routes.hexa + neural_vocoder.hexa
+// + ckpt_w_ctrl.json to the hexa-c4 RTX 3090 pod and starts the voice
+// server in a tmux session.
+//
+// CLI: hexa serving/deploy_voice.hexa
+//
+// Pod: u01lnnu8ywt92p (hexa-c4, RTX 3090, $0.22/hr)
+// ALM:  itfl66q4z768kh (LIVE — NOT touched by this script)
+//
+// Steps:
+//   1. Check pod connectivity (ssh echo ok)
+//   2. Upload serving/{http_server,voice_routes,hire_routes,avatar_sync,avatar_feed}.hexa
+//   3. Upload anima-speak/neural_vocoder.hexa
+//   4. Upload anima-speak/ckpt_w_ctrl.json
+//   5. Set env vars and start http_server.hexa in tmux "voice-serve"
+//   6. Wait briefly, then verify /voice/health responds
+//
+// L0: NEW file. Does not modify anima/core/{hub,laws,runtime}.hexa.
+// HEXA-FIRST (R1).
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 1. Pod configuration
+// ═══════════════════════════════════════════════════════════════
+
+let POD_ID       = "u01lnnu8ywt92p"
+let POD_HOST     = "64.228.13.219"
+let POD_PORT     = "61461"
+let SSH_KEY      = "/Users/ghost/.runpod/ssh/RunPod-Key-Go"
+let SSH_BASE     = "ssh -i " + SSH_KEY + " -o StrictHostKeyChecking=no root@" + POD_HOST + " -p " + POD_PORT
+let SCP_BASE     = "scp -i " + SSH_KEY + " -o StrictHostKeyChecking=no -P " + POD_PORT
+
+let HEXA_BIN     = "/workspace/hexa-lang/build/hexa_stage0"
+let REMOTE_DIR   = "/workspace/anima-voice"
+let REMOTE_CKPT  = REMOTE_DIR + "/ckpt_w_ctrl.json"
+
+let ALM_ENDPOINT = "https://itfl66q4z768kh-8090.proxy.runpod.net"
+let SERVE_PORT   = "8091"   // voice on 8091 to avoid collision with ALM on 8090
+
+// Local paths
+let LOCAL_SERVING  = "serving"
+let LOCAL_SPEAK    = "anima-speak"
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 2. Helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn dv_log(msg: string) {
+    println("[deploy_voice] " + msg)
+}
+
+fn dv_run(cmd: string) -> string {
+    dv_log("  exec: " + cmd)
+    let result = exec(cmd)
+    return result
+}
+
+fn dv_ssh(remote_cmd: string) -> string {
+    let cmd = SSH_BASE + " '" + remote_cmd + "'"
+    return dv_run(cmd)
+}
+
+fn dv_scp_up(local: string, remote: string) -> string {
+    let cmd = SCP_BASE + " " + local + " root@" + POD_HOST + ":" + remote
+    return dv_run(cmd)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 3. Step 1 — connectivity check
+// ═══════════════════════════════════════════════════════════════
+
+fn dv_check_connectivity() -> bool {
+    dv_log("Step 1: checking pod connectivity (" + POD_ID + ")")
+    let result = dv_ssh("echo ok")
+    let pass = result.index_of("ok") >= 0
+    if pass {
+        dv_log("  PASS — pod reachable")
+    } else {
+        dv_log("  FAIL — pod unreachable. Got: " + result)
+    }
+    return pass
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 4. Step 2 — upload files
+// ═══════════════════════════════════════════════════════════════
+
+fn dv_upload_files() -> bool {
+    dv_log("Step 2: creating remote dir + uploading files")
+
+    // Create remote directory
+    dv_ssh("mkdir -p " + REMOTE_DIR)
+
+    // Upload serving hexa files (http_server + its dependencies)
+    let serving_files = [
+        "http_server.hexa",
+        "voice_routes.hexa",
+        "hire_routes.hexa",
+        "avatar_sync.hexa",
+        "avatar_feed.hexa"
+    ]
+
+    let mut ok = true
+    let mut i = 0
+    while i < len(serving_files) {
+        let f = serving_files[i]
+        let local = LOCAL_SERVING + "/" + f
+        let remote = REMOTE_DIR + "/" + f
+        dv_log("  uploading " + f)
+        dv_scp_up(local, remote)
+        // verify file arrived
+        let check = dv_ssh("test -f " + remote + " && echo exists")
+        if check.index_of("exists") < 0 {
+            dv_log("  FAIL — " + f + " not found on pod")
+            ok = false
+        }
+        i = i + 1
+    }
+
+    // Upload neural_vocoder.hexa from anima-speak/
+    dv_log("  uploading neural_vocoder.hexa")
+    dv_scp_up(LOCAL_SPEAK + "/neural_vocoder.hexa", REMOTE_DIR + "/neural_vocoder.hexa")
+    let nv_check = dv_ssh("test -f " + REMOTE_DIR + "/neural_vocoder.hexa && echo exists")
+    if nv_check.index_of("exists") < 0 {
+        dv_log("  FAIL — neural_vocoder.hexa not found on pod")
+        ok = false
+    }
+
+    // Upload checkpoint
+    dv_log("  uploading ckpt_w_ctrl.json (vocoder weights)")
+    dv_scp_up(LOCAL_SPEAK + "/ckpt_w_ctrl.json", REMOTE_CKPT)
+    let ck_check = dv_ssh("test -f " + REMOTE_CKPT + " && echo exists")
+    if ck_check.index_of("exists") < 0 {
+        dv_log("  FAIL — ckpt_w_ctrl.json not found on pod")
+        ok = false
+    }
+
+    if ok {
+        dv_log("  PASS — all files uploaded")
+    }
+    return ok
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 5. Step 3 — start voice server in tmux
+// ═══════════════════════════════════════════════════════════════
+
+fn dv_start_server() -> bool {
+    dv_log("Step 3: starting voice server in tmux 'voice-serve'")
+
+    // Kill existing tmux session if present (clean restart)
+    dv_ssh("tmux kill-session -t voice-serve 2>/dev/null || true")
+
+    // Build the launch command with env vars
+    // SPEAK_TTS_BACKEND=vocoder  — use real neural vocoder path
+    // SPEAK_MODEL_ENDPOINT       — point LLM calls at live ALM pod
+    // SPEAK_CKPT_PATH            — vocoder checkpoint
+    let env_prefix = "export SPEAK_TTS_BACKEND=vocoder"
+        + " && export SPEAK_MODEL_ENDPOINT=" + ALM_ENDPOINT
+        + " && export SPEAK_CKPT_PATH=" + REMOTE_CKPT
+
+    let serve_cmd = HEXA_BIN + " " + REMOTE_DIR + "/http_server.hexa"
+        + " --checkpoint " + REMOTE_CKPT
+        + " --port " + SERVE_PORT
+
+    let full_cmd = env_prefix + " && cd " + REMOTE_DIR + " && " + serve_cmd
+
+    // Start in tmux
+    let tmux_cmd = "tmux new-session -d -s voice-serve '" + full_cmd + "'"
+    dv_ssh(tmux_cmd)
+
+    // Verify tmux session exists
+    let check = dv_ssh("tmux has-session -t voice-serve 2>/dev/null && echo running")
+    let pass = check.index_of("running") >= 0
+    if pass {
+        dv_log("  PASS — tmux 'voice-serve' session started")
+    } else {
+        dv_log("  FAIL — tmux session not found after launch")
+    }
+    return pass
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 6. Step 4 — verify /voice/health
+// ═══════════════════════════════════════════════════════════════
+
+fn dv_verify_health() -> bool {
+    dv_log("Step 4: verifying /voice/health (waiting 5s for startup)")
+
+    // Wait for server to initialize
+    dv_ssh("sleep 5")
+
+    // Curl the health endpoint from inside the pod
+    let health_cmd = "curl -s -m 10 http://localhost:" + SERVE_PORT + "/voice/health"
+    let result = dv_ssh(health_cmd)
+
+    let has_ok = result.index_of("\"status\":\"ok\"") >= 0
+    let has_version = result.index_of("Mk.III") >= 0
+    let has_vocoder = result.index_of("vocoder") >= 0
+
+    let pass = has_ok && has_version
+    if pass {
+        dv_log("  PASS — /voice/health responded")
+        dv_log("  status=ok, version contains Mk.III")
+        if has_vocoder {
+            dv_log("  backend=vocoder confirmed")
+        }
+    } else {
+        dv_log("  FAIL — health check failed. Response: " + result)
+    }
+    return pass
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 7. Main — run all steps
+// ═══════════════════════════════════════════════════════════════
+
+fn dv_main() {
+    dv_log("=== voice_routes deployment to hexa-c4 ===")
+    dv_log("pod:  " + POD_ID + " (" + POD_HOST + ":" + POD_PORT + ")")
+    dv_log("ALM:  " + ALM_ENDPOINT + " (LIVE — not touched)")
+    dv_log("port: " + SERVE_PORT)
+    dv_log("")
+
+    // Step 1: connectivity
+    let s1 = dv_check_connectivity()
+    if !s1 {
+        dv_log("ABORT — pod not reachable")
+        return
+    }
+
+    // Step 2: upload
+    let s2 = dv_upload_files()
+    if !s2 {
+        dv_log("ABORT — file upload failed")
+        return
+    }
+
+    // Step 3: start server
+    let s3 = dv_start_server()
+    if !s3 {
+        dv_log("WARN — tmux session may not have started, attempting health check anyway")
+    }
+
+    // Step 4: verify health
+    let s4 = dv_verify_health()
+
+    // Summary
+    dv_log("")
+    dv_log("=== deployment summary ===")
+    dv_log("  connectivity:  " + (if s1 { "PASS" } else { "FAIL" }))
+    dv_log("  file upload:   " + (if s2 { "PASS" } else { "FAIL" }))
+    dv_log("  tmux start:    " + (if s3 { "PASS" } else { "FAIL" }))
+    dv_log("  health check:  " + (if s4 { "PASS" } else { "FAIL" }))
+
+    let all = s1 && s2 && s3 && s4
+    if all {
+        dv_log("")
+        dv_log("DEPLOYED — voice server live on pod " + POD_ID + " port " + SERVE_PORT)
+        dv_log("  proxy URL: https://" + POD_ID + "-" + SERVE_PORT + ".proxy.runpod.net")
+        dv_log("  tmux attach: " + SSH_BASE + " -t 'tmux attach -t voice-serve'")
+    } else {
+        dv_log("")
+        dv_log("DEPLOY INCOMPLETE — check logs above")
+    }
+}
+
+dv_main()

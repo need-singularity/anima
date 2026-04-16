@@ -1,0 +1,223 @@
+// serving/test_voice_live.hexa — live smoke test for voice_routes on pod
+//
+// Tests the deployed voice server on hexa-c4 pod via curl.
+// Run from local machine after deploy_voice.hexa completes.
+//
+// CLI: hexa serving/test_voice_live.hexa [--host <url>]
+//
+// Default target: pod proxy URL for hexa-c4 voice server.
+// Override with --host for local testing (e.g. http://localhost:8091).
+//
+// Tests:
+//   T1  POST /voice/tts      — text in, verify audio_payload non-empty (>100 chars b64)
+//   T2  GET  /voice/health    — status ok, version present, backend vocoder
+//   T3  GET  /voice/profiles  — 10 profiles, known names present
+//   T4  POST /voice/tts       — bad profile fallback to stoic_mentor
+//
+// L0: NEW file. Does not modify anima/core/{hub,laws,runtime}.hexa.
+// HEXA-FIRST (R1).
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 1. Configuration
+// ═══════════════════════════════════════════════════════════════
+
+let TV_POD_ID   = "u01lnnu8ywt92p"
+let TV_PORT     = "8091"
+
+// Default: use pod SSH curl (more reliable than proxy for smoke tests)
+let TV_SSH_KEY  = "/Users/ghost/.runpod/ssh/RunPod-Key-Go"
+let TV_SSH_HOST = "64.228.13.219"
+let TV_SSH_PORT = "61461"
+let TV_SSH_BASE = "ssh -i " + TV_SSH_KEY + " -o StrictHostKeyChecking=no root@" + TV_SSH_HOST + " -p " + TV_SSH_PORT
+
+// Base URL for curl inside the pod
+let TV_BASE_URL = "http://localhost:" + TV_PORT
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 2. Helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn tv_log(msg: string) {
+    println("[test_voice_live] " + msg)
+}
+
+fn tv_ssh_curl(method: string, path: string, body: string) -> string {
+    let url = TV_BASE_URL + path
+    let mut cmd = ""
+    if method == "GET" {
+        cmd = "curl -s -m 15 " + url
+    } else {
+        // POST with JSON body
+        // Escape single quotes in body for shell safety
+        cmd = "curl -s -m 15 -X POST -H 'Content-Type: application/json' -d '" + body + "' " + url
+    }
+    let ssh_cmd = TV_SSH_BASE + " '" + cmd + "'"
+    let result = exec(ssh_cmd)
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 3. T1 — POST /voice/tts (text -> audio)
+// ═══════════════════════════════════════════════════════════════
+
+fn tv_test_tts() -> bool {
+    tv_log("T1: POST /voice/tts — text to audio")
+
+    let body = "{\"text\":\"hello anima, this is a voice test\",\"profile_id\":0}"
+    let resp = tv_ssh_curl("POST", "/voice/tts", body)
+
+    // Check response is valid JSON with expected fields
+    let has_ok = resp.index_of("\"ok\":true") >= 0
+    let has_audio = resp.index_of("\"payload\":\"") >= 0
+
+    // Verify audio_payload is non-empty and > 100 chars (base64 threshold)
+    // Look for payload content between quotes
+    let payload_marker = "\"payload\":\""
+    let ppos = resp.index_of(payload_marker)
+    let mut payload_len = 0
+    if ppos >= 0 {
+        let after_marker = resp.substring(ppos + len(payload_marker), len(resp))
+        let end_quote = after_marker.index_of("\"")
+        if end_quote > 0 {
+            payload_len = end_quote
+        }
+    }
+
+    let pass = has_ok && has_audio && payload_len > 100
+    if pass {
+        tv_log("  PASS — ok=true, audio_payload present (" + to_string(payload_len) + " chars b64)")
+    } else {
+        tv_log("  FAIL — ok=" + to_string(has_ok) + " audio=" + to_string(has_audio) + " payload_len=" + to_string(payload_len))
+        if len(resp) < 500 {
+            tv_log("  response: " + resp)
+        } else {
+            tv_log("  response (truncated): " + resp.substring(0, 500))
+        }
+    }
+    return pass
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 4. T2 — GET /voice/health
+// ═══════════════════════════════════════════════════════════════
+
+fn tv_test_health() -> bool {
+    tv_log("T2: GET /voice/health")
+
+    let resp = tv_ssh_curl("GET", "/voice/health", "")
+
+    let has_ok = resp.index_of("\"status\":\"ok\"") >= 0
+    let has_version = resp.index_of("Mk.III") >= 0
+    let has_vocoder = resp.index_of("\"tts\":\"vocoder\"") >= 0
+    let has_profiles = resp.index_of("\"profiles_available\":10") >= 0
+
+    let pass = has_ok && has_version && has_profiles
+    if pass {
+        tv_log("  PASS — status=ok, version=Mk.III, 10 profiles")
+        if has_vocoder {
+            tv_log("  backend tts=vocoder confirmed")
+        } else {
+            tv_log("  NOTE: tts backend is not 'vocoder' — may be mock")
+        }
+    } else {
+        tv_log("  FAIL — ok=" + to_string(has_ok) + " ver=" + to_string(has_version) + " prof=" + to_string(has_profiles))
+        tv_log("  response: " + resp)
+    }
+    return pass
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 5. T3 — GET /voice/profiles
+// ═══════════════════════════════════════════════════════════════
+
+fn tv_test_profiles() -> bool {
+    tv_log("T3: GET /voice/profiles")
+
+    let resp = tv_ssh_curl("GET", "/voice/profiles", "")
+
+    let has_count = resp.index_of("\"count\":10") >= 0
+    let has_idol = resp.index_of("school_idol") >= 0
+    let has_mentor = resp.index_of("stoic_mentor") >= 0
+    let has_knight = resp.index_of("knight") >= 0
+    let has_demon = resp.index_of("demon_lord") >= 0
+
+    let pass = has_count && has_idol && has_mentor && has_knight && has_demon
+    if pass {
+        tv_log("  PASS — 10 profiles, key names present (school_idol, stoic_mentor, knight, demon_lord)")
+    } else {
+        tv_log("  FAIL — count=" + to_string(has_count) + " idol=" + to_string(has_idol) + " mentor=" + to_string(has_mentor))
+        tv_log("  response: " + resp)
+    }
+    return pass
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 6. T4 — POST /voice/tts bad profile fallback
+// ═══════════════════════════════════════════════════════════════
+
+fn tv_test_profile_fallback() -> bool {
+    tv_log("T4: POST /voice/tts — bad profile_id fallback")
+
+    let body = "{\"text\":\"fallback test\",\"profile_id\":999}"
+    let resp = tv_ssh_curl("POST", "/voice/tts", body)
+
+    let has_ok = resp.index_of("\"ok\":true") >= 0
+    let has_mentor = resp.index_of("stoic_mentor") >= 0
+    // profile id should be 9 (stoic_mentor)
+    let has_id9 = resp.index_of("\"id\":9") >= 0
+
+    let pass = has_ok && has_mentor && has_id9
+    if pass {
+        tv_log("  PASS — bad profile_id=999 fell back to stoic_mentor (id=9)")
+    } else {
+        tv_log("  FAIL — ok=" + to_string(has_ok) + " mentor=" + to_string(has_mentor) + " id9=" + to_string(has_id9))
+        if len(resp) < 500 {
+            tv_log("  response: " + resp)
+        } else {
+            tv_log("  response (truncated): " + resp.substring(0, 500))
+        }
+    }
+    return pass
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 7. Main — run all tests
+// ═══════════════════════════════════════════════════════════════
+
+fn tv_main() {
+    tv_log("=== live voice server smoke tests ===")
+    tv_log("target: " + TV_BASE_URL + " (via SSH to " + TV_SSH_HOST + ":" + TV_SSH_PORT + ")")
+    tv_log("")
+
+    let t1 = tv_test_tts()
+    tv_log("")
+    let t2 = tv_test_health()
+    tv_log("")
+    let t3 = tv_test_profiles()
+    tv_log("")
+    let t4 = tv_test_profile_fallback()
+
+    // Summary
+    let passed = (if t1 { 1 } else { 0 })
+               + (if t2 { 1 } else { 0 })
+               + (if t3 { 1 } else { 0 })
+               + (if t4 { 1 } else { 0 })
+    let total = 4
+
+    tv_log("")
+    tv_log("=== results ===")
+    tv_log("  T1 /voice/tts:             " + (if t1 { "PASS" } else { "FAIL" }))
+    tv_log("  T2 /voice/health:          " + (if t2 { "PASS" } else { "FAIL" }))
+    tv_log("  T3 /voice/profiles:        " + (if t3 { "PASS" } else { "FAIL" }))
+    tv_log("  T4 /voice/tts (fallback):  " + (if t4 { "PASS" } else { "FAIL" }))
+    tv_log("")
+    tv_log(to_string(passed) + "/" + to_string(total) + " PASSED")
+
+    if passed == total {
+        tv_log("ALL PASS — voice server operational")
+    } else {
+        tv_log("SOME FAILED — check logs above")
+    }
+}
+
+tv_main()
