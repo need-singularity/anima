@@ -1,0 +1,165 @@
+// training/native/build.hexa — compile libtrain_native.so on H100 RunPod pod
+// Replaces training/native/build.sh.
+//
+// Usage:
+//   hexa training/native/build.hexa            # GPU build (nvcc, default)
+//   hexa training/native/build.hexa cpu        # CPU-only fallback (gcc)
+//   hexa training/native/build.hexa test       # GPU build + smoke test
+//   hexa training/native/build.hexa cpu-test   # CPU build + smoke test
+//
+// The actual compile + smoke test is delegated to nvcc/gcc/cc via exec().
+// We assemble a single bash runner with HEREDOC bodies (smoke C source +
+// dispatch case) and execute it. Using a runner keeps escape complexity
+// low and matches the original .sh control flow exactly.
+
+let SRC_FILES = "train_ffi.c train_step.c"
+let OUT       = "libtrain_native.so"
+
+fn print_usage() {
+    println("Usage: hexa training/native/build.hexa [gpu|cpu|test|cpu-test]")
+}
+
+fn main() {
+    // hexa args() returns [binary, binary, user_args...] — user args
+    // start at index 2 (see train_alm_lora.hexa for the same convention).
+    let argv = args()
+    let arg_off = 2
+    let mut mode = "gpu"
+    if len(argv) >= arg_off + 1 {
+        mode = argv[arg_off]
+    }
+    if mode == "--help" || mode == "-h" {
+        print_usage()
+        return
+    }
+    if mode != "gpu" && mode != "cpu" && mode != "test" && mode != "cpu-test" {
+        println("[build] ERROR: unknown mode '" + mode + "'")
+        print_usage()
+        return
+    }
+
+    println("[build] mode=" + mode + ", src=" + SRC_FILES + ", out=" + OUT)
+
+    // Resolve script directory (cd into native/ so SRC_FILES are found).
+    // The runner does `cd "$(dirname "$0")"` itself.
+    let runner = "/tmp/_native_build_runner.sh"
+    write_file(runner,
+        "#!/usr/bin/env bash\n" +
+        "set -euo pipefail\n" +
+        "\n" +
+        "MODE=\"$1\"\n" +
+        "DIR=\"$(cd \"$(dirname \"$0\")\" 2>/dev/null && pwd)\"\n" +
+        "# Caller passes the actual native/ dir as $2 (so the script works\n" +
+        "# whether invoked from anima/ or from native/).\n" +
+        "if [ -n \"${2:-}\" ]; then DIR=\"$2\"; fi\n" +
+        "cd \"$DIR\"\n" +
+        "\n" +
+        "SRC_FILES=\"" + SRC_FILES + "\"\n" +
+        "OUT=\"" + OUT + "\"\n" +
+        "\n" +
+        "RED='\\033[0;31m'; GRN='\\033[0;32m'; YEL='\\033[1;33m'; RST='\\033[0m'\n" +
+        "ok()   { printf \"${GRN}[OK]${RST} %s\\n\"   \"$1\"; }\n" +
+        "fail() { printf \"${RED}[FAIL]${RST} %s\\n\" \"$1\"; exit 1; }\n" +
+        "info() { printf \"${YEL}[INFO]${RST} %s\\n\" \"$1\"; }\n" +
+        "\n" +
+        "build_gpu() {\n" +
+        "    command -v nvcc >/dev/null 2>&1 || fail \"nvcc not found. Install CUDA toolkit or use: build.hexa cpu\"\n" +
+        "    NVCC_VER=$(nvcc --version | grep -oE 'release [0-9]+\\.[0-9]+' | awk '{print $2}')\n" +
+        "    info \"nvcc ${NVCC_VER} detected\"\n" +
+        "    ARCH=\"sm_90\"\n" +
+        "    if command -v nvidia-smi >/dev/null 2>&1; then\n" +
+        "        GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)\n" +
+        "        info \"GPU: ${GPU_NAME:-unknown}\"\n" +
+        "        case \"$GPU_NAME\" in\n" +
+        "            *H100*|*H200*) ARCH=\"sm_90\" ;;\n" +
+        "            *A100*)        ARCH=\"sm_80\" ;;\n" +
+        "            *4090*|*4080*) ARCH=\"sm_89\" ;;\n" +
+        "            *3090*|*3080*) ARCH=\"sm_86\" ;;\n" +
+        "            *)             ARCH=\"sm_80\"; info \"Unknown GPU, defaulting to ${ARCH}\" ;;\n" +
+        "        esac\n" +
+        "    fi\n" +
+        "    info \"Target arch: ${ARCH}\"\n" +
+        "    info \"Compiling ${OUT} (GPU, ${ARCH})...\"\n" +
+        "    nvcc -O3 -shared -Xcompiler -fPIC \\\n" +
+        "         -arch=\"${ARCH}\" \\\n" +
+        "         -lcublas -lcudart \\\n" +
+        "         ${SRC_FILES} -o \"${OUT}\"\n" +
+        "    SZ=$(stat --printf='%s' \"${OUT}\" 2>/dev/null || stat -f'%z' \"${OUT}\")\n" +
+        "    ok \"Built ${DIR}/${OUT} (${SZ} bytes)\"\n" +
+        "}\n" +
+        "\n" +
+        "build_cpu() {\n" +
+        "    command -v gcc >/dev/null 2>&1 || fail \"gcc not found\"\n" +
+        "    info \"$(gcc --version | head -1)\"\n" +
+        "    info \"Compiling ${OUT} (CPU fallback, no CUDA)...\"\n" +
+        "    gcc -O2 -shared -fPIC -lm ${SRC_FILES} -o \"${OUT}\"\n" +
+        "    ok \"Built ${DIR}/${OUT} -- CPU stub (no real GPU ops)\"\n" +
+        "}\n" +
+        "\n" +
+        "smoke_test() {\n" +
+        "    [ -f \"${DIR}/${OUT}\" ] || fail \"${OUT} not found -- build first\"\n" +
+        "    info \"Running smoke test...\"\n" +
+        "    SMOKE_SRC=$(mktemp /tmp/smoke_XXXXXX.c)\n" +
+        "    SMOKE_BIN=$(mktemp /tmp/smoke_XXXXXX)\n" +
+        "    cat > \"${SMOKE_SRC}\" <<'SMOKE_EOF'\n" +
+        "#include <stdio.h>\n" +
+        "#include <dlfcn.h>\n" +
+        "#include <stdlib.h>\n" +
+        "int main(void) {\n" +
+        "    void* lib = dlopen(NULL, RTLD_LAZY);\n" +
+        "    extern int  train_ffi_init(int, int, int, int, int, int, int);\n" +
+        "    extern void train_ffi_cleanup(void);\n" +
+        "    extern int  train_ffi_get_step(void);\n" +
+        "    printf(\"smoke: calling train_ffi_init(2, 64, 4, 16, 128, 256, 32)...\\n\");\n" +
+        "    int ok = train_ffi_init(2, 64, 4, 16, 128, 256, 32);\n" +
+        "    if (ok != 1) { fprintf(stderr, \"smoke: train_ffi_init returned %d (expected 1)\\n\", ok); return 1; }\n" +
+        "    printf(\"smoke: init OK\\n\");\n" +
+        "    int step = train_ffi_get_step();\n" +
+        "    printf(\"smoke: step = %d (expected 0)\\n\", step);\n" +
+        "    if (step != 0) { fprintf(stderr, \"smoke: unexpected step value\\n\"); return 1; }\n" +
+        "    int dup = train_ffi_init(2, 64, 4, 16, 128, 256, 32);\n" +
+        "    if (dup != 0) { fprintf(stderr, \"smoke: double-init returned %d (expected 0)\\n\", dup); return 1; }\n" +
+        "    printf(\"smoke: double-init guard OK\\n\");\n" +
+        "    printf(\"smoke: calling train_ffi_cleanup()...\\n\");\n" +
+        "    train_ffi_cleanup();\n" +
+        "    printf(\"smoke: cleanup OK\\n\");\n" +
+        "    printf(\"smoke: ALL PASSED\\n\");\n" +
+        "    return 0;\n" +
+        "}\n" +
+        "SMOKE_EOF\n" +
+        "    if [[ \"$MODE\" == *cpu* ]]; then\n" +
+        "        gcc -O0 -o \"${SMOKE_BIN}\" \"${SMOKE_SRC}\" \\\n" +
+        "            -L\"${DIR}\" -ltrain_native -lm -ldl \\\n" +
+        "            -Wl,-rpath,\"${DIR}\"\n" +
+        "    else\n" +
+        "        gcc -O0 -o \"${SMOKE_BIN}\" \"${SMOKE_SRC}\" \\\n" +
+        "            -L\"${DIR}\" -ltrain_native -ldl \\\n" +
+        "            -L/usr/local/cuda/lib64 -lcudart -lcublas -lm \\\n" +
+        "            -Wl,-rpath,\"${DIR}\" -Wl,-rpath,/usr/local/cuda/lib64\n" +
+        "    fi\n" +
+        "    LD_LIBRARY_PATH=\"${DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\" \"${SMOKE_BIN}\"\n" +
+        "    RC=$?\n" +
+        "    rm -f \"${SMOKE_SRC}\" \"${SMOKE_BIN}\"\n" +
+        "    if [ $RC -eq 0 ]; then ok \"Smoke test passed\"; else fail \"Smoke test failed (exit ${RC})\"; fi\n" +
+        "}\n" +
+        "\n" +
+        "case \"$MODE\" in\n" +
+        "    gpu)      build_gpu ;;\n" +
+        "    cpu)      build_cpu ;;\n" +
+        "    test)     build_gpu; smoke_test ;;\n" +
+        "    cpu-test) build_cpu; smoke_test ;;\n" +
+        "    *)        echo \"Usage: $0 [gpu|cpu|test|cpu-test]\"; exit 1 ;;\n" +
+        "esac\n"
+    )
+
+    // Resolve native/ dir from this script's location. We pass it explicitly
+    // as $2 so the runner does not depend on $0 being a real path.
+    let native_dir = exec("cd $(dirname $(realpath training/native/build.hexa 2>/dev/null || echo training/native/build.hexa)) 2>/dev/null && pwd").trim()
+    if native_dir == "" {
+        native_dir = "training/native"
+    }
+
+    exec("bash " + runner + " " + mode + " " + native_dir)
+}
+
+main()
