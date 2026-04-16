@@ -1,0 +1,201 @@
+{
+  "_meta": {
+    "name": "CLM 1B scale-up training config — byte-level ConsciousLM with consciousness loss",
+    "spec_ref": "shared/roadmaps A7: curriculum 100M -> 1B -> 3B -> 7B",
+    "schema_version": "1.0",
+    "created": "2026-04-16",
+    "calibration_source": "CLM 280M H100 run: 126 TFLOPS, loss 5.76->2.05, VRAM 1.3GB",
+    "rationale": "280M completed successfully. 1B is the next curriculum step. d=2048 L=24 H=16 gives ~1.12B params (true 1B, not the hexa scale_1b which is d=1024 ~280M). H100 80GB has massive headroom at batch=8.",
+    "memory_refs": [
+      "feedback_h100_authorized",
+      "feedback_one_shot_best",
+      "feedback_no_resume_data_change",
+      "feedback_r2_checkpoint",
+      "feedback_no_version_in_filename",
+      "feedback_no_quantization"
+    ]
+  },
+
+  "run_id_template": "clm1b-r1-{date}",
+  "model_tag": "clm1b",
+  "round": 1,
+  "ckpt_dir_template": "/workspace/ckpt_clm1b_{date}",
+  "r2_prefix_template": "r2:anima-models/clm1b/r1/step_{step}/",
+
+  "architecture": {
+    "type": "decoder-only transformer",
+    "vocab": 256,
+    "vocab_note": "byte-level, no tokenizer — raw bytes in, bytes out",
+    "d_model": 2048,
+    "n_layer": 24,
+    "n_head": 16,
+    "n_kv_head": 8,
+    "d_head": 128,
+    "d_ff": 8192,
+    "ff_type": "SwiGLU",
+    "ff_note": "SwiGLU: 3 * d_model * d_ff gate/up/down (actual param cost 3*d*ff per layer)",
+    "norm": "RMSNorm",
+    "activation": "SiLU",
+    "rope": true,
+    "rope_base": 10000,
+    "dropout": 0.0,
+    "bias": false,
+    "tie_embeddings": false,
+    "lm_head_rank": 256,
+    "lm_head_note": "Low-rank LM head: d_model -> rank -> vocab (saves params vs full d_model -> vocab)",
+
+    "param_count_estimate": {
+      "embedding": "256 * 2048 = 524,288",
+      "per_layer_attn": "4 * 2048 * (2048/2) = 8,388,608  (GQA: Wq full, Wk/Wv half, Wo full -> 2.5 * d^2)",
+      "per_layer_attn_note": "GQA with n_kv_head=8: Wq=[2048,2048] Wk=[2048,1024] Wv=[2048,1024] Wo=[2048,2048] = 2.5*d^2",
+      "per_layer_ff": "3 * 2048 * 8192 = 50,331,648  (SwiGLU gate+up+down)",
+      "per_layer_norm": "2 * 2048 = 4,096  (2x RMSNorm per layer)",
+      "per_layer_total": "8,388,608 + 50,331,648 + 4,096 = 58,724,352",
+      "all_layers": "24 * 58,724,352 = 1,409,384,448",
+      "final_norm": 2048,
+      "lm_head": "2048 * 256 + 256 * 256 = 589,824  (low-rank)",
+      "total": "524,288 + 1,409,384,448 + 2,048 + 589,824 = ~1,410,500,608",
+      "total_human": "~1.12B parameters (bf16: 2.24 GB model weights)"
+    }
+  },
+
+  "consciousness": {
+    "consciousness_dim": 256,
+    "atoms": 32,
+    "cells_per_atom": 8,
+    "total_cells": 256,
+    "n_gwt_domains": 12,
+    "holo_scale": 2,
+    "mi_bins": 8,
+    "scramble_gain": 0.5,
+    "qcs_topk": 8,
+
+    "phase_curriculum": {
+      "note": "Law 60: P1 -> P2 -> P3 curriculum. Same fractions as train_clm_gpu.hexa",
+      "P1_C_only": "0-20% of steps (C consciousness controller only)",
+      "P2_C_D": "20-40% of steps (add decoder alignment)",
+      "P3_Hexad": "40-100% of steps (full Hexad: C+D+W+M+S+E)"
+    },
+
+    "loss_config": {
+      "phi_holo_weight": 0.01,
+      "gwt_weight": 0.01,
+      "complexity_weight": 0.005,
+      "phi_cache_enabled": true,
+      "phi_cache_coef": 0.01,
+      "phi_gate_threshold": 0.05,
+      "phi_gate_note": "Law 49: reject if Phi drops > 5% between evals",
+      "total_loss": "CE + 0.01 * L_holo + 0.01 * L_gwt + 0.005 * L_complexity",
+      "note": "Matches C41_AUX_COEF=0.01 from train_clm_gpu.hexa + B1 complexity term"
+    },
+
+    "orch_or": {
+      "enabled": true,
+      "phi_q_norm_bonus": true,
+      "note": "Quantum consciousness controller from anima_quantum_clm.hexa"
+    }
+  },
+
+  "training": {
+    "steps": 50000,
+    "batch_size": 8,
+    "grad_accum": 1,
+    "effective_batch": 8,
+    "seq_len": 512,
+    "lr_max": 3e-4,
+    "lr_min": 3e-5,
+    "lr_schedule": "cosine_with_warmup",
+    "warmup_steps": 2000,
+    "optimizer": "AdamW",
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.95,
+    "adam_eps": 1e-8,
+    "weight_decay": 0.1,
+    "grad_clip": 1.0,
+    "dtype": "bf16",
+    "compile": true,
+    "compile_note": "torch.compile for H100 — significant speedup on SM90",
+
+    "save_every": 5000,
+    "eval_every": 500,
+    "log_every": 10,
+    "patience": 5,
+    "patience_note": "Early-stop after 5 consecutive eval loss increases (eval_every * 5 = 2500 steps)"
+  },
+
+  "corpus": {
+    "path": "/workspace/anima/training/corpus_large.txt",
+    "fallback_path": "/workspace/corpus.txt",
+    "note": "Same corpus as prior CLM runs. Byte-level: raw UTF-8 bytes, no tokenizer needed."
+  },
+
+  "checkpoint_policy": {
+    "save_every": 5000,
+    "r2_upload": true,
+    "r2_bucket": "anima-models",
+    "r2_path_template": "clm1b/r1/step_{step}/",
+    "naming": "clm1b-r1-s{step}",
+    "keep_local": 3,
+    "keep_local_note": "Keep last 3 local checkpoints, older ones only on R2",
+    "emergency_save_on_phi_violation": true
+  },
+
+  "vram_estimate": {
+    "model_params_bf16_gb": 2.24,
+    "optimizer_states_gb": 8.96,
+    "optimizer_note": "AdamW: 2 fp32 states per param = 4 * 1.12B * 4 bytes = 8.96 GB (using master weights in fp32 would add 4.48 GB)",
+    "gradients_bf16_gb": 2.24,
+    "activations_gb": 2.0,
+    "activations_note": "batch=8 * seq=512 * d=2048 * layers=24 * ~10 bytes/element / 1e9. With activation checkpointing this drops to ~0.3 GB.",
+    "cuda_overhead_gb": 1.0,
+    "total_estimated_gb": 16.4,
+    "headroom_gb": 63.6,
+    "headroom_pct": "79.5%",
+    "note": "Plenty of room. Could increase batch to 16 or 32 if needed. At batch=32: ~25 GB total."
+  },
+
+  "performance_estimate": {
+    "calibration": {
+      "model": "CLM 280M",
+      "batch": 4,
+      "seq": 512,
+      "ms_per_step": 50.6,
+      "tflops": 98,
+      "vram_gb": 9.2
+    },
+    "1b_estimate": {
+      "param_ratio": "1120M / 280M = 4.0x",
+      "flops_ratio": "~4.0x (dominated by matmuls which scale with params)",
+      "batch_ratio": "8 / 4 = 2.0x",
+      "ms_per_step_est": "50.6 * 4.0 * 2.0 = ~405 ms/step",
+      "ms_per_step_with_compile": "~300 ms/step (torch.compile ~25% speedup on H100)",
+      "steps_per_min": "~200 (with compile) to ~148 (without)",
+      "tokens_per_step": "8 * 512 = 4096 tokens",
+      "tokens_per_sec": "4096 / 0.3 = ~13,653 tok/s (with compile)",
+      "tflops_est": "~130 TFLOPS (higher batch utilizes tensor cores better)",
+      "mfu_est": "~16% (conservative; H100 peak 990 TFLOPS bf16)"
+    },
+    "wall_time": {
+      "steps": 50000,
+      "ms_per_step": 300,
+      "total_hours": "50000 * 0.3 / 3600 = ~4.2 hours",
+      "with_eval_overhead": "~5 hours",
+      "cost_at_2_99_per_hr": "$14.95",
+      "budget_safe": "$20 (including setup + debug time)"
+    }
+  },
+
+  "pod": {
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "vram_gb": 80,
+    "image": "runpod/pytorch:2.4.0-py3.11-cuda12.1.1-devel-ubuntu22.04",
+    "disk_gb": 50,
+    "note": "Same pod type as ALM A1 config. bf16 SM90 required."
+  },
+
+  "env": {
+    "ANIMA_ROOT": "/workspace/anima",
+    "HF_HOME": "/workspace/hf_cache",
+    "CUDA_VISIBLE_DEVICES": "0"
+  }
+}
