@@ -127,7 +127,10 @@ fn load_corpus(path: string) -> array {
             line_start = line_start - 1
         }
         let line_prefix = src.substring(line_start, mpos)
-        if line_prefix.contains("//") {
+        // Skip `// ... Task { ...` comment lines AND `struct Task { ...`
+        // declarations (the corpus file declares the struct above the
+        // seed list — we only want `t.push(Task {` instantiations).
+        if line_prefix.contains("//") || line_prefix.contains("struct ") {
             cur = mpos + len(marker)
             continue
         }
@@ -570,12 +573,22 @@ fn judge_lenient(task: Task, actual: string) -> array {
     // SINGLE-LINE return — feedback_hexa_struct_return_bug warns multi-line
     // returns can drop operands; force everything onto one logical line.
     //
-    // SHIFTED-INDEX layout: empirical stage0 codegen bug 2026-04-16 — the
-    // FIRST element of the FIRST array-literal returned from a callee gets
-    // aliased to the first string literal allocated inside the caller (in
-    // our case "PASS" from the gate ternary in main). To dodge it we put a
-    // throwaway sentinel at index 0 and shift every real field by +1.
-    // Caller (main + emit_report) reads r[1..12] instead of r[0..11].
+    // Layout (kept with leading sentinel for parity with debug history;
+    // could be removed but that means re-shifting all readers — not worth
+    // the diff since there's no perf cost):
+    //   [0] "_sentinel_"   — placeholder
+    //   [1] task_id        string
+    //   [2] domain         string
+    //   [3] difficulty     string
+    //   [4] rule           string  (e.g. "text_match/lenient")
+    //   [5] completion     bool
+    //   [6] hits           int
+    //   [7] total          int
+    //   [8] score          float
+    //   [9] length_ok      bool
+    //  [10] extra_ok       bool
+    //  [11] actual_len     int
+    //  [12] detail         string
     let rule_str = rule + "/lenient"
     let out = ["_sentinel_", task.id, task.domain, task.difficulty, rule_str, completion, hits, total, score, length_ok, extra_ok, actual_len, detail]
     return out
@@ -895,15 +908,8 @@ fn main() {
         println("FAIL: no tasks parsed from corpus — aborting")
         return
     }
-    // DEBUG: peek at first 5 tasks of all[]
-    println("DBG all[0]: " + all[0].id + "/" + all[0].domain + "/" + all[0].difficulty)
-    println("DBG all[1]: " + all[1].id + "/" + all[1].domain + "/" + all[1].difficulty)
-    println("DBG all[2]: " + all[2].id + "/" + all[2].domain + "/" + all[2].difficulty)
-    println("DBG all[5]: " + all[5].id + "/" + all[5].domain + "/" + all[5].difficulty)
-    println("DBG all[99]: " + all[99].id + "/" + all[99].domain + "/" + all[99].difficulty)
     let sub = stratify(all, max_tasks)
     println("stratified: " + to_string(len(sub)) + " tasks")
-    println("DBG sub[0]: " + sub[0].id + "/" + sub[0].domain)
     println("")
 
     // Run
@@ -911,12 +917,8 @@ fn main() {
     let mut i = 0
     while i < len(sub) {
         let task = sub[i]
-        // DEBUG: dump task fields BEFORE judge to isolate corruption layer
-        println("  DBG task[" + to_string(i) + "] id=" + task.id + " domain=" + task.domain + " diff=" + task.difficulty)
         let actual = if mode == "mock" { call_mock(task) } else { call_endpoint(endpoint, timeout_s, task) }
         let r = judge_lenient(task, actual)
-        // DEBUG: dump array after judge
-        println("  DBG r len=" + to_string(len(r)) + " r[0]=" + r[0] + " r[1]=" + r[1] + " r[2]=" + r[2])
         results = results.push(r)
         // SHIFTED: r[0] is sentinel; real fields at r[1..12]
         let flag = if r[5] { "OK " } else { "XX " }
