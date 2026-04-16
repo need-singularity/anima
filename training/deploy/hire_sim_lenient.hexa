@@ -569,8 +569,15 @@ fn judge_lenient(task: Task, actual: string) -> array {
     }
     // SINGLE-LINE return — feedback_hexa_struct_return_bug warns multi-line
     // returns can drop operands; force everything onto one logical line.
+    //
+    // SHIFTED-INDEX layout: empirical stage0 codegen bug 2026-04-16 — the
+    // FIRST element of the FIRST array-literal returned from a callee gets
+    // aliased to the first string literal allocated inside the caller (in
+    // our case "PASS" from the gate ternary in main). To dodge it we put a
+    // throwaway sentinel at index 0 and shift every real field by +1.
+    // Caller (main + emit_report) reads r[1..12] instead of r[0..11].
     let rule_str = rule + "/lenient"
-    let out = [task.id, task.domain, task.difficulty, rule_str, completion, hits, total, score, length_ok, extra_ok, actual_len, detail]
+    let out = ["_sentinel_", task.id, task.domain, task.difficulty, rule_str, completion, hits, total, score, length_ok, extra_ok, actual_len, detail]
     return out
 }
 
@@ -703,13 +710,15 @@ fn float_to_fixed3(x: float) -> string {
 fn emit_report(out_path: string, endpoint: string, mode: string,
                results: array, n_total_corpus: int) -> string {
     let n = len(results)
+    // Per-record indexes are SHIFTED by +1 (sentinel at r[0]) to dodge
+    // the stage0 first-array-element aliasing bug. See judge_lenient.
     let mut completed = 0
     let mut score_sum = 0.0
     let mut i = 0
     while i < n {
         let r = results[i]
-        if r[4] { completed = completed + 1 }
-        score_sum = score_sum + r[7]
+        if r[5] { completed = completed + 1 }
+        score_sum = score_sum + r[8]
         i = i + 1
     }
     let completion_rate = if n > 0 { to_float(completed) / to_float(n) } else { 0.0 }
@@ -723,7 +732,7 @@ fn emit_report(out_path: string, endpoint: string, mode: string,
     let mut j = 0
     while j < n {
         let r = results[j]
-        let dm = r[1]
+        let dm = r[2]
         let mut found = 0 - 1
         let mut k = 0
         while k < len(dnames) {
@@ -733,8 +742,8 @@ fn emit_report(out_path: string, endpoint: string, mode: string,
         if found < 0 {
             dnames = dnames.push(dm)
             dn = dn.push(1)
-            ddone = ddone.push(if r[4] { 1 } else { 0 })
-            dsum = dsum.push(r[7])
+            ddone = ddone.push(if r[5] { 1 } else { 0 })
+            dsum = dsum.push(r[8])
         } else {
             // rebuild parallel arrays (no in-place write)
             let mut dn2 = []
@@ -744,8 +753,8 @@ fn emit_report(out_path: string, endpoint: string, mode: string,
             while x < len(dnames) {
                 if x == found {
                     dn2 = dn2.push(dn[x] + 1)
-                    dd2 = dd2.push(ddone[x] + (if r[4] { 1 } else { 0 }))
-                    ds2 = ds2.push(dsum[x] + r[7])
+                    dd2 = dd2.push(ddone[x] + (if r[5] { 1 } else { 0 }))
+                    ds2 = ds2.push(dsum[x] + r[8])
                 } else {
                     dn2 = dn2.push(dn[x])
                     dd2 = dd2.push(ddone[x])
@@ -823,18 +832,19 @@ fn emit_report(out_path: string, endpoint: string, mode: string,
         let r = results[pi]
         let comma = if pi < n - 1 { "," } else { "" }
         s = s + "    {"
-        s = s + "\"task_id\": \"" + r[0] + "\","
-        s = s + " \"domain\": \"" + r[1] + "\","
-        s = s + " \"difficulty\": \"" + r[2] + "\","
-        s = s + " \"rule\": \"" + r[3] + "\","
-        s = s + " \"completion\": " + (if r[4] { "true" } else { "false" }) + ","
-        s = s + " \"hits\": " + to_string(r[5]) + ","
-        s = s + " \"total\": " + to_string(r[6]) + ","
-        s = s + " \"score\": " + float_to_fixed4(r[7]) + ","
-        s = s + " \"length_ok\": " + (if r[8] { "true" } else { "false" }) + ","
-        s = s + " \"extra_ok\": " + (if r[9] { "true" } else { "false" }) + ","
-        s = s + " \"actual_len\": " + to_string(r[10]) + ","
-        s = s + " \"detail\": \"" + json_escape(r[11]) + "\"}"
+        // SHIFTED: r[0] is the sentinel; real fields start at r[1].
+        s = s + "\"task_id\": \"" + r[1] + "\","
+        s = s + " \"domain\": \"" + r[2] + "\","
+        s = s + " \"difficulty\": \"" + r[3] + "\","
+        s = s + " \"rule\": \"" + r[4] + "\","
+        s = s + " \"completion\": " + (if r[5] { "true" } else { "false" }) + ","
+        s = s + " \"hits\": " + to_string(r[6]) + ","
+        s = s + " \"total\": " + to_string(r[7]) + ","
+        s = s + " \"score\": " + float_to_fixed4(r[8]) + ","
+        s = s + " \"length_ok\": " + (if r[9] { "true" } else { "false" }) + ","
+        s = s + " \"extra_ok\": " + (if r[10] { "true" } else { "false" }) + ","
+        s = s + " \"actual_len\": " + to_string(r[11]) + ","
+        s = s + " \"detail\": \"" + json_escape(r[12]) + "\"}"
         s = s + comma + "\n"
         pi = pi + 1
     }
@@ -894,16 +904,21 @@ fn main() {
     let mut i = 0
     while i < len(sub) {
         let task = sub[i]
+        // DEBUG: dump task fields BEFORE judge to isolate corruption layer
+        println("  DBG task[" + to_string(i) + "] id=" + task.id + " domain=" + task.domain + " diff=" + task.difficulty)
         let actual = if mode == "mock" { call_mock(task) } else { call_endpoint(endpoint, timeout_s, task) }
         let r = judge_lenient(task, actual)
+        // DEBUG: dump array after judge
+        println("  DBG r len=" + to_string(len(r)) + " r[0]=" + r[0] + " r[1]=" + r[1] + " r[2]=" + r[2])
         results = results.push(r)
-        let flag = if r[4] { "OK " } else { "XX " }
+        // SHIFTED: r[0] is sentinel; real fields at r[1..12]
+        let flag = if r[5] { "OK " } else { "XX " }
         println("  [" + to_string(i + 1) + "/" + to_string(len(sub)) + "] "
-                + flag + r[0] + " [" + r[1] + "/" + r[2] + "] "
-                + "score=" + float_to_fixed3(r[7])
-                + " hits=" + to_string(r[5]) + "/" + to_string(r[6])
-                + " len=" + to_string(r[10])
-                + "  " + r[11])
+                + flag + r[1] + " [" + r[2] + "/" + r[3] + "] "
+                + "score=" + float_to_fixed3(r[8])
+                + " hits=" + to_string(r[6]) + "/" + to_string(r[7])
+                + " len=" + to_string(r[11])
+                + "  " + r[12])
         i = i + 1
     }
 
@@ -916,8 +931,9 @@ fn main() {
     let mut k = 0
     while k < n {
         let r = results[k]
-        if r[4] { completed = completed + 1 }
-        score_sum = score_sum + r[7]
+        // SHIFTED indexes (sentinel at r[0])
+        if r[5] { completed = completed + 1 }
+        score_sum = score_sum + r[8]
         k = k + 1
     }
     let completion_rate = if n > 0 { to_float(completed) / to_float(n) } else { 0.0 }
