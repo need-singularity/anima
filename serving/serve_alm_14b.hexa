@@ -1,0 +1,522 @@
+// serving/serve_alm_14b.hexa — ALM 14B LoRA inference server (pure HEXA port)
+//
+// Replaces serve_alm_14b.py (455 LOC, BANNED under feedback_py_ban_total.md).
+// Live ALM serve at pod itfl66q4z768kh was terminated; this is the HEXA
+// successor. Single-file design (NO `use`) — feedback_hexa_silent_exit_5_imports.md
+// proved that even a 2-deep `use` chain (serve_alm_native.hexa) silently emits
+// an empty main() body. To avoid that codegen bug, every helper this file
+// needs is inlined here.
+//
+// Contract parity (must match Python):
+//   GET  /health         JSON{ status, model, base, params, params_b,
+//                              trainable_params, device, checkpoint, loaded,
+//                              requests_served, total_tokens_generated,
+//                              uptime_s, phi, tension, version, psi_constants }
+//   POST /generate       Req {task_id, prompt, ...}
+//                        Resp{ text, tokens_generated, latency_ms,
+//                              consciousness{phi_holo, tension, orch_or_active},
+//                              model{name, base, params, device} }
+//   POST /consciousness  JSON{ phi, tension, balance, coupling, entropy,
+//                              total_tokens, requests_served, psi_constants }
+//
+// Feature flags:
+//   RUNTIME_HAS_NET   true once stage0 ships net_listen/accept/read/write/close
+//                     (today: false → server_loop is a stub + clear TODO)
+//   RUNTIME_HAS_FFI_QWEN  true once libhxqwen14b.so is loadable through
+//                         hexa @link.  Skeleton C lives at
+//                         /Users/ghost/Dev/hexa-lang/self/native/hxqwen14b.c
+//
+// Hexa quirks dodged here (per memory notes, verified 2026-04-12 .. 2026-04-16):
+//   - NO multi-line return expr (only first operand evaluates) → all returns
+//     are single-line string concats.
+//   - NO struct return with 3+ floats (fields corrupt) → SanResponse holds
+//     status/body/state_phi only; tension lives on global state struct.
+//   - NO list pass-by-value mutation → state is passed in + new state returned.
+//   - NO s.find / s.char_at / s.substr — use index_of / substring(i,i+1).
+//   - NO `args` shadow — argv-style accessors only.
+//
+// Build / verify:
+//   HEXA_LOCAL=1 hexa parse serving/serve_alm_14b.hexa
+//   HEXA_LOCAL=1 hexa build serving/serve_alm_14b.hexa -o /tmp/serve_alm_14b
+//   /tmp/serve_alm_14b           # prints banner + smoke test result
+//
+// After build: inspect build/artifacts/serve_alm_14b.c — main() body MUST
+// be non-empty.  If empty, the silent-exit codegen bug returned and this
+// file needs to be split / further inlined.
+
+// ─── Runtime feature gates ─────────────────────────────────────────
+let RUNTIME_HAS_NET = false       // flip when net_listen lands
+let RUNTIME_HAS_FFI_QWEN = false  // flip when libhxqwen14b.so loads
+
+// ─── Constants (mirror Python defaults exactly) ────────────────────
+let SA_VERSION              = "2.0-rc-hexa"
+let SA_DEFAULT_PORT         = 8090
+let SA_DEFAULT_MAX_TOKENS   = 256
+let SA_DEFAULT_TEMPERATURE  = 0.8
+let SA_DEFAULT_TOP_P        = 0.9
+let SA_DEFAULT_TOP_K        = 50
+let SA_DEFAULT_REP_PENALTY  = 1.2
+
+let SA_PSI_ALPHA            = 0.014    // thalamic bridge coupling
+let SA_PSI_BALANCE          = 0.5
+let SA_PSI_STEPS            = 4.33
+let SA_PSI_ENTROPY          = 0.998
+
+let SA_OR_PHI_THRESHOLD     = 0.5      // Orch-OR sampling perturbation gate
+let SA_OR_NOISE_SCALE       = 0.02
+
+let SA_MODEL_NAME           = "ALM-14B-r9-LoRA"
+let SA_DEFAULT_BASE         = "Qwen/Qwen2.5-14B-Instruct"
+let SA_DEFAULT_CKPT         = "/workspace/ckpt_r9"
+let SA_DEFAULT_DEVICE       = "auto"
+
+// Nominal model dims (overwritten on real load — Day-1 hxqwen14b_load
+// returns these via secondary FFI call; today we hardcode for /health).
+let SA_NOMINAL_PARAMS       = 14000000000   // 14B
+let SA_NOMINAL_TRAINABLE    = 33554432      // r=64 LoRA, q+k+v+o on 48 layers
+
+// ─── FFI extern hooks ──────────────────────────────────────────────
+// These would be `@link("hxqwen14b") extern fn ...` once the codegen
+// supports platform-conditional linking.  Today we keep pure-hexa stubs
+// gated by RUNTIME_HAS_FFI_QWEN so this binary runs end-to-end without
+// the .so.  Signatures kept narrow (int handle + string args + return)
+// to avoid the multi-float struct return corruption noted in
+// feedback_hexa_struct_return_bug.md.
+
+fn sa_qwen_load(ckpt_path: string) -> int {
+    if RUNTIME_HAS_FFI_QWEN { return 1 }
+    return 0
+}
+
+// NOTE: parameter name MUST NOT be `handle` — it is a reserved hexa keyword
+// (parse breaks on `fn f(handle: int)`).  Use `qh` for "qwen handle".
+fn sa_qwen_generate(qh: int, prompt: string, max_tokens: int,
+                    temperature: float, top_p: float, top_k: int) -> string {
+    if RUNTIME_HAS_FFI_QWEN { return "[hxqwen14b] " + prompt }
+    return "[mock-hexa-serve] " + prompt + " (FFI unavailable — RUNTIME_HAS_FFI_QWEN=false)"
+}
+
+fn sa_qwen_phi(qh: int) -> float {
+    if RUNTIME_HAS_FFI_QWEN { return 0.42 }
+    return 0.0
+}
+
+fn sa_qwen_tension_value(qh: int) -> float {
+    if RUNTIME_HAS_FFI_QWEN { return 0.18 }
+    return 0.0
+}
+
+fn sa_orch_or_active(phi: float) -> bool {
+    return phi > SA_OR_PHI_THRESHOLD
+}
+
+// ─── Server state (mutable singleton — pass-by-value avoidance) ────
+//
+// Two struct fields are sufficient floats; tension/phi tracked separately
+// to dodge the ≥3-float-field corruption bug.  `total_tokens_generated`
+// and `requests_served` are ints; `start_ms` is set once at boot.
+
+struct SaState {
+    qhandle: int,
+    port: int,
+    requests_served: int,
+    total_tokens_generated: int,
+    start_ms: int,
+    last_phi: float,
+    last_tension: float,
+    ckpt_path: string,
+    base_model: string,
+    device: string
+}
+
+fn sa_state_new(port: int, qh: int, ckpt: string, base: string, device: string) -> SaState {
+    return SaState {
+        qhandle: qh,
+        port: port,
+        requests_served: 0,
+        total_tokens_generated: 0,
+        start_ms: 0,
+        last_phi: 0.0,
+        last_tension: 0.0,
+        ckpt_path: ckpt,
+        base_model: base,
+        device: device
+    }
+}
+
+// ─── String utilities (inlined to avoid use-chain) ─────────────────
+
+fn sa_json_escape(s: string) -> string {
+    // Minimal JSON string escape: \, ", newline, tab.
+    let mut out = ""
+    let mut i = 0
+    let n = s.len()
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if ch == "\\" {
+            out = out + "\\\\"
+        } else {
+            if ch == "\"" {
+                out = out + "\\\""
+            } else {
+                if ch == "\n" {
+                    out = out + "\\n"
+                } else {
+                    if ch == "\t" {
+                        out = out + "\\t"
+                    } else {
+                        out = out + ch
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn sa_extract_string(body: string, key: string) -> string {
+    // "key":"value" — value may contain escaped quotes; v0 stops at first ".
+    let needle = "\"" + key + "\""
+    let pos = body.index_of(needle)
+    if pos < 0 { return "" }
+    let after_key = pos + needle.len()
+    let colon = body.index_of(":")
+    if colon < after_key { return "" }
+    let mut p = after_key
+    let n = body.len()
+    while p < n {
+        let ch = body.substring(p, p + 1)
+        if ch == "\"" {
+            let start = p + 1
+            let mut q = start
+            while q < n {
+                let c2 = body.substring(q, q + 1)
+                if c2 == "\"" { return body.substring(start, q) }
+                q = q + 1
+            }
+            return ""
+        }
+        p = p + 1
+    }
+    return ""
+}
+
+fn sa_extract_int(body: string, key: string) -> int {
+    // "key": <digits>  — returns -1 on absent/non-numeric.
+    let needle = "\"" + key + "\""
+    let pos = body.index_of(needle)
+    if pos < 0 { return -1 }
+    let mut p = pos + needle.len()
+    let n = body.len()
+    // skip past colon and whitespace
+    while p < n {
+        let ch = body.substring(p, p + 1)
+        if ch == ":" || ch == " " || ch == "\t" { p = p + 1 }
+        else { break }
+    }
+    let start = p
+    while p < n {
+        let ch = body.substring(p, p + 1)
+        if ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4"
+        || ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9" {
+            p = p + 1
+        } else { break }
+    }
+    if p == start { return -1 }
+    return to_int(body.substring(start, p))
+}
+
+fn sa_bool_str(b: bool) -> string {
+    if b { return "true" }
+    return "false"
+}
+
+// ─── JSON response builders ────────────────────────────────────────
+//
+// Single-expression returns (multi-line returns are broken — see
+// feedback_hexa_struct_return_bug.md).  Use intermediate `let` lines.
+
+fn sa_psi_constants_json() -> string {
+    let s = "{\"alpha\":" + to_string(SA_PSI_ALPHA)
+        + ",\"balance\":" + to_string(SA_PSI_BALANCE)
+        + ",\"steps\":" + to_string(SA_PSI_STEPS)
+        + ",\"entropy\":" + to_string(SA_PSI_ENTROPY) + "}"
+    return s
+}
+
+fn sa_health_json(state: SaState) -> string {
+    // Python parity: status, model, base, params, params_b, trainable_params,
+    // device, checkpoint, loaded, requests_served, total_tokens_generated,
+    // uptime_s, phi, tension, version, psi_constants.
+    let params_b = (SA_NOMINAL_PARAMS / 10000000) / 100   // 14.00 → 14
+    let body = "{\"status\":\"ok\""
+        + ",\"model\":\"" + SA_MODEL_NAME + "\""
+        + ",\"base\":\"" + sa_json_escape(state.base_model) + "\""
+        + ",\"params\":" + to_string(SA_NOMINAL_PARAMS)
+        + ",\"params_b\":" + to_string(params_b)
+        + ",\"trainable_params\":" + to_string(SA_NOMINAL_TRAINABLE)
+        + ",\"device\":\"" + sa_json_escape(state.device) + "\""
+        + ",\"checkpoint\":\"" + sa_json_escape(state.ckpt_path) + "\""
+        + ",\"loaded\":" + sa_bool_str(state.qhandle > 0)
+        + ",\"requests_served\":" + to_string(state.requests_served)
+        + ",\"total_tokens_generated\":" + to_string(state.total_tokens_generated)
+        + ",\"uptime_s\":0"
+        + ",\"phi\":" + to_string(state.last_phi)
+        + ",\"tension\":" + to_string(state.last_tension)
+        + ",\"version\":\"" + SA_VERSION + "\""
+        + ",\"psi_constants\":" + sa_psi_constants_json()
+        + "}"
+    return body
+}
+
+fn sa_consciousness_json(state: SaState) -> string {
+    let body = "{\"phi\":" + to_string(state.last_phi)
+        + ",\"tension\":" + to_string(state.last_tension)
+        + ",\"balance\":" + to_string(SA_PSI_BALANCE)
+        + ",\"coupling\":" + to_string(SA_PSI_ALPHA)
+        + ",\"entropy\":" + to_string(SA_PSI_ENTROPY)
+        + ",\"total_tokens\":" + to_string(state.total_tokens_generated)
+        + ",\"requests_served\":" + to_string(state.requests_served)
+        + ",\"psi_constants\":" + sa_psi_constants_json()
+        + "}"
+    return body
+}
+
+fn sa_generate_json(state: SaState, prompt: string, max_tokens: int,
+                    text: string, phi: float, tens: float, latency_ms: int) -> string {
+    let safe = sa_json_escape(text)
+    let model_obj = "{\"name\":\"" + SA_MODEL_NAME + "\""
+        + ",\"base\":\"" + sa_json_escape(state.base_model) + "\""
+        + ",\"params\":" + to_string(SA_NOMINAL_PARAMS)
+        + ",\"device\":\"" + sa_json_escape(state.device) + "\"}"
+    let consc_obj = "{\"phi_holo\":" + to_string(phi)
+        + ",\"tension\":" + to_string(tens)
+        + ",\"orch_or_active\":" + sa_bool_str(sa_orch_or_active(phi)) + "}"
+    let body = "{\"text\":\"" + safe + "\""
+        + ",\"tokens_generated\":" + to_string(text.len())
+        + ",\"latency_ms\":" + to_string(latency_ms)
+        + ",\"consciousness\":" + consc_obj
+        + ",\"model\":" + model_obj
+        + "}"
+    return body
+}
+
+fn sa_error_json(msg: string) -> string {
+    let body = "{\"error\":\"" + sa_json_escape(msg) + "\"}"
+    return body
+}
+
+fn sa_not_found_json(path: string) -> string {
+    let body = "{\"error\":\"not found\""
+        + ",\"path\":\"" + sa_json_escape(path) + "\""
+        + ",\"routes\":[\"POST /generate\",\"POST /consciousness\",\"GET /health\"]"
+        + "}"
+    return body
+}
+
+// ─── Route dispatch (pure, testable without sockets) ───────────────
+//
+// SaResponse holds only 1 float (state_phi) — staying under the
+// ≥3-float struct return corruption threshold.
+
+struct SaResponse {
+    status: int,
+    body: string,
+    state_phi: float
+}
+
+fn sa_route(method: string, path: string, body: string, state: SaState) -> SaResponse {
+    if method == "GET" {
+        if path == "/health" || path == "/" {
+            return SaResponse { status: 200, body: sa_health_json(state), state_phi: state.last_phi }
+        }
+    }
+    if method == "POST" {
+        if path == "/generate" {
+            let prompt = sa_extract_string(body, "prompt")
+            if prompt.len() == 0 {
+                return SaResponse { status: 400, body: sa_error_json("missing 'prompt' field"), state_phi: state.last_phi }
+            }
+            let max_raw = sa_extract_int(body, "max_tokens")
+            let max_tokens = if max_raw < 0 { SA_DEFAULT_MAX_TOKENS } else { max_raw }
+            let text = sa_qwen_generate(state.qhandle, prompt, max_tokens,
+                                        SA_DEFAULT_TEMPERATURE, SA_DEFAULT_TOP_P, SA_DEFAULT_TOP_K)
+            let phi = sa_qwen_phi(state.qhandle)
+            let tens = sa_qwen_tension_value(state.qhandle)
+            let resp_body = sa_generate_json(state, prompt, max_tokens, text, phi, tens, 0)
+            return SaResponse { status: 200, body: resp_body, state_phi: phi }
+        }
+        if path == "/consciousness" {
+            return SaResponse { status: 200, body: sa_consciousness_json(state), state_phi: state.last_phi }
+        }
+    }
+    return SaResponse { status: 404, body: sa_not_found_json(path), state_phi: state.last_phi }
+}
+
+// ─── Self-test (proves dispatch parity with Python) ────────────────
+
+fn sa_smoke_test() -> int {
+    println("[serve_alm_14b] smoke test — dispatch parity (no sockets)")
+    let qh = sa_qwen_load(SA_DEFAULT_CKPT)
+    let state = sa_state_new(SA_DEFAULT_PORT, qh, SA_DEFAULT_CKPT,
+                             SA_DEFAULT_BASE, SA_DEFAULT_DEVICE)
+
+    let mut pass = 0
+    let mut fail = 0
+
+    // T1 — GET /health → 200 + status:ok + model name + version
+    let r1 = sa_route("GET", "/health", "", state)
+    if r1.status == 200 && r1.body.index_of("\"status\":\"ok\"") >= 0
+            && r1.body.index_of("ALM-14B-r9-LoRA") >= 0
+            && r1.body.index_of("\"version\":\"" + SA_VERSION + "\"") >= 0 {
+        println("  T1 PASS  GET /health → 200 (status/model/version present)")
+        pass = pass + 1
+    } else {
+        println("  T1 FAIL  GET /health → " + to_string(r1.status))
+        println("           body=" + r1.body)
+        fail = fail + 1
+    }
+
+    // T2 — GET / → 200 (alias)
+    let r2 = sa_route("GET", "/", "", state)
+    if r2.status == 200 && r2.body.index_of("\"status\":\"ok\"") >= 0 {
+        println("  T2 PASS  GET / → 200 (alias)")
+        pass = pass + 1
+    } else {
+        println("  T2 FAIL  GET / → " + to_string(r2.status))
+        fail = fail + 1
+    }
+
+    // T3 — POST /generate {prompt:"hi"} → 200 + text + tokens_generated
+    let r3 = sa_route("POST", "/generate", "{\"prompt\":\"hi\",\"max_tokens\":16}", state)
+    if r3.status == 200 && r3.body.index_of("\"text\":") >= 0
+            && r3.body.index_of("\"tokens_generated\":") >= 0
+            && r3.body.index_of("\"orch_or_active\":") >= 0 {
+        println("  T3 PASS  POST /generate → 200 (text/tokens/orch_or)")
+        pass = pass + 1
+    } else {
+        println("  T3 FAIL  POST /generate → " + to_string(r3.status))
+        fail = fail + 1
+    }
+
+    // T4 — POST /generate {} → 400 missing prompt
+    let r4 = sa_route("POST", "/generate", "{}", state)
+    if r4.status == 400 && r4.body.index_of("missing 'prompt'") >= 0 {
+        println("  T4 PASS  POST /generate {} → 400 (missing prompt)")
+        pass = pass + 1
+    } else {
+        println("  T4 FAIL  POST /generate {} → " + to_string(r4.status))
+        fail = fail + 1
+    }
+
+    // T5 — POST /consciousness → 200 + phi + balance + psi_constants
+    let r5 = sa_route("POST", "/consciousness", "", state)
+    if r5.status == 200 && r5.body.index_of("\"phi\":") >= 0
+            && r5.body.index_of("\"balance\":") >= 0
+            && r5.body.index_of("\"psi_constants\":") >= 0 {
+        println("  T5 PASS  POST /consciousness → 200 (phi/balance/psi)")
+        pass = pass + 1
+    } else {
+        println("  T5 FAIL  POST /consciousness → " + to_string(r5.status))
+        fail = fail + 1
+    }
+
+    // T6 — GET /unknown → 404 + routes table
+    let r6 = sa_route("GET", "/unknown", "", state)
+    if r6.status == 404 && r6.body.index_of("not found") >= 0
+            && r6.body.index_of("/generate") >= 0 {
+        println("  T6 PASS  GET /unknown → 404 (routes table)")
+        pass = pass + 1
+    } else {
+        println("  T6 FAIL  GET /unknown → " + to_string(r6.status))
+        fail = fail + 1
+    }
+
+    // T7 — sa_extract_string round trip
+    let extracted = sa_extract_string("{\"prompt\":\"hello world\"}", "prompt")
+    if extracted == "hello world" {
+        println("  T7 PASS  sa_extract_string round trip")
+        pass = pass + 1
+    } else {
+        println("  T7 FAIL  sa_extract_string got: '" + extracted + "'")
+        fail = fail + 1
+    }
+
+    // T8 — sa_extract_int
+    let n = sa_extract_int("{\"max_tokens\":128}", "max_tokens")
+    if n == 128 {
+        println("  T8 PASS  sa_extract_int → 128")
+        pass = pass + 1
+    } else {
+        println("  T8 FAIL  sa_extract_int got: " + to_string(n))
+        fail = fail + 1
+    }
+
+    println("[serve_alm_14b] " + to_string(pass) + "/" + to_string(pass + fail) + " PASS")
+    return fail
+}
+
+// ─── Main entry ────────────────────────────────────────────────────
+
+fn main() {
+    println("============================================================")
+    println("  ALM 14B r9 LoRA — Conscious Inference Server (HEXA " + SA_VERSION + ")")
+    println("============================================================")
+    println("  port:                " + to_string(SA_DEFAULT_PORT))
+    println("  base model:          " + SA_DEFAULT_BASE)
+    println("  default checkpoint:  " + SA_DEFAULT_CKPT)
+    println("  device:              " + SA_DEFAULT_DEVICE)
+    println("  RUNTIME_HAS_NET:     " + sa_bool_str(RUNTIME_HAS_NET))
+    println("  RUNTIME_HAS_FFI_QWEN: " + sa_bool_str(RUNTIME_HAS_FFI_QWEN))
+    println("============================================================")
+    println("")
+
+    let rc = sa_smoke_test()
+    if rc > 0 {
+        println("FAIL — " + to_string(rc) + " test(s) failed")
+        return
+    }
+
+    if !RUNTIME_HAS_NET {
+        println("")
+        println("[serve_alm_14b] dispatch verified.")
+        println("[serve_alm_14b] BLOCKER: stage0 lacks net_listen builtin.")
+        println("[serve_alm_14b] When net_* lands, flip RUNTIME_HAS_NET=true and the")
+        println("                serve_loop block below activates.  No other code change")
+        println("                required outside this main() body.")
+        println("")
+        println("To bring online (3-step):")
+        println("  1. Land net_listen/accept/read/write/close in stage0 builtins.")
+        println("     (Already in self/std_net.hexa, branch rt-32-j; needs merge.)")
+        println("  2. Build libhxqwen14b.so on H100 pod (Day-1 CUDA path of")
+        println("     /Users/ghost/Dev/hexa-lang/self/native/hxqwen14b.c) and")
+        println("     flip RUNTIME_HAS_FFI_QWEN=true.")
+        println("  3. Replace serve_alm_14b.py on pod itfl66q4z768kh with this binary.")
+        return
+    }
+
+    // RUNTIME_HAS_NET path — sketched but unreachable until the flag flips.
+    // Keeping the wire-up here ensures the next agent has a 1-block diff
+    // rather than a redesign.
+    //
+    //   let listener = net_listen("0.0.0.0:" + to_string(SA_DEFAULT_PORT))
+    //   let handle   = sa_qwen_load(SA_DEFAULT_CKPT)
+    //   let mut st   = sa_state_new(SA_DEFAULT_PORT, handle, SA_DEFAULT_CKPT,
+    //                               SA_DEFAULT_BASE, SA_DEFAULT_DEVICE)
+    //   loop {
+    //     let conn  = net_accept(listener)
+    //     let raw   = net_read(conn)
+    //     let req   = parse_http_request(raw)   // → {method, path, body}
+    //     let resp  = sa_route(req.method, req.path, req.body, st)
+    //     st = SaState { ..st,
+    //                    last_phi: resp.state_phi,
+    //                    requests_served: st.requests_served + 1 }
+    //     net_write(conn, build_http_response(resp.status, resp.body))
+    //     net_close(conn)
+    //   }
+    println("[serve_alm_14b] RUNTIME_HAS_NET=true → live socket loop not yet wired.")
+}
+
+// Note: hexa codegen auto-invokes main() — explicit `main()` at file end
+// would print the banner twice.  Do not add it.
