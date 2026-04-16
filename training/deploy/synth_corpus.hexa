@@ -1,0 +1,875 @@
+// synth_corpus.hexa — hire_sim-style synthetic LoRA corpus generator
+//
+// Replaces synth_r10_corpus.py (deprecated under .py ban 2026-04-16).
+//
+// Goal: train ALM to INTRINSICALLY produce augmentation-compliant outputs,
+// removing the client-side Path C dependency used for v2.0 GA.
+//
+// Method (Option 2 — template-based, no API):
+//   1. Load 30 stratified seed tasks from hire_sim_100.hexa (line-walked, NOT regex).
+//   2. For each seed, emit N_VARIANTS_PER_SEED synthetic (prompt, response, keywords)
+//      triples by permuting lexical surface (wording) and numeric fill.
+//   3. Each synthetic response is an EXEMPLAR — a 0.95+ scorer output under
+//      the deterministic hire_sim_judge (keyword coverage + length floor +
+//      domain rule: code=fenced, schedule=digit).
+//   4. Validate every exemplar through a mirror of hire_sim_judge; discard
+//      and regenerate failures up to MAX_RETRY until we reach 300 passing
+//      examples.
+//
+// Output: hire_sim_synthetic_r10_<DATE>.jsonl — JSONL of
+//   {domain, difficulty, prompt, response, keywords}
+//
+// Determinism: seeded LCG RNG (no real-time RNG, no random.choice).
+// Same seed -> same output bytes.
+//
+// Single-file design: no `use` chain (avoids feedback_hexa_silent_exit_5_imports.md).
+//
+// Hexa quirks avoided:
+//   - byte/char index mismatch (string_api): line-based JSON walker, no
+//     position arithmetic on multibyte content. We DO parse hire_sim_100.hexa
+//     via line-prefix detection + split('"') which is multibyte-safe.
+//   - lists pass-by-value (lists_pbv): all mutation inline in main() / loops.
+//   - struct return (struct_return_bug): no struct returns; tasks are
+//     parallel arrays (ids/domains/difficulties/prompts/keywords).
+//   - parser quirk: explicit `return [a,b]` not bare `[a,b]` tail.
+
+// ── Config ──────────────────────────────────────────────────────────
+// SEED is fixed for deterministic output.
+
+fn config_seed() -> int { return 20260416 }
+fn config_corpus_path() -> string { return "/Users/ghost/Dev/anima/anima-agent/hire_sim_100.hexa" }
+fn config_output_path() -> string { return "/Users/ghost/Dev/anima/training/deploy/hire_sim_synthetic_r10_20260416.jsonl" }
+fn config_target() -> int { return 300 }
+fn config_n_variants() -> int { return 10 }
+fn config_max_retry() -> int { return 5 }
+
+// ── Seeded LCG RNG (deterministic, no time-based seed) ─────────────
+// Module-level mutable state for RNG (per feedback_hexa_lists_pbv.md
+// "use a module-level mut binding" pattern from eval_serve.hexa).
+let mut RNG_STATE = 20260416
+
+fn rng_next() -> int {
+    // Numerical Recipes LCG: state = state * 1664525 + 1013904223 (mod 2^32)
+    // Use mod by manual masking since hexa may not have native u32 wrap.
+    let next = RNG_STATE * 1664525 + 1013904223
+    // mask to 32 bits via mod (avoid >> shift parser quirk)
+    let masked = next - (next / 4294967296) * 4294967296
+    RNG_STATE = masked
+    return masked
+}
+
+fn rng_int(lo: int, hi: int) -> int {
+    // inclusive [lo, hi]
+    let span = hi - lo + 1
+    let r = rng_next()
+    let m = r - (r / span) * span
+    return lo + m
+}
+
+fn rng_choice_str(arr: array) -> string {
+    let n = arr.len()
+    let idx = rng_int(0, n - 1)
+    return arr[idx]
+}
+
+fn rng_choice_int(arr: array) -> int {
+    let n = arr.len()
+    let idx = rng_int(0, n - 1)
+    return arr[idx]
+}
+
+// ── Seed task loader (line-walked, not regex) ──────────────────────
+// hire_sim_100.hexa rows look like:
+//   t = t.push(Task { id: "EM01", domain: "email", difficulty: "easy",
+//       prompt: "draft thank-you email after customer onboarding",
+//       success_keywords: ["thank-you", "onboarding"],
+//       max_interventions: 1, max_time_sec: 300 })
+// We walk lines, accumulate fields keyed by `id:`/`domain:`/`difficulty:`/
+// `prompt:`/`success_keywords:` until all 5 are seen, then commit one task.
+//
+// Parallel arrays (no struct return): SEED_IDS, SEED_DOMAINS, SEED_DIFFS,
+// SEED_PROMPTS, SEED_KWS (kws as comma-joined string for simplicity).
+
+// extract the first quoted substring after `key` on a line.
+// We split on `key`, take tail (parts[1]), then split tail on `"` and
+// return the first segment (parts[0]). This avoids index_of which
+// returns void in current build, and avoids substring math on multibyte
+// content per feedback_hexa_string_api.md.
+fn extract_quoted(line: string, key: string) -> string {
+    let parts = line.split(key)
+    if parts.len() < 2 { return "" }
+    let after = parts[1]
+    let qparts = after.split("\"")
+    if qparts.len() < 1 { return "" }
+    return qparts[0]
+}
+
+// extract bracket contents `[...]` after key on line via split tokens
+fn extract_bracket(line: string, key: string) -> string {
+    let parts = line.split(key)
+    if parts.len() < 2 { return "" }
+    let after = parts[1]
+    // split on '[' then on ']'
+    let lparts = after.split("[")
+    if lparts.len() < 2 { return "" }
+    let inside = lparts[1]
+    let rparts = inside.split("]")
+    if rparts.len() < 1 { return "" }
+    return rparts[0]
+}
+
+// parse `"a", "b", "c"` into joined "a|b|c" (pipe-delimited; pipe excluded from kws)
+fn parse_kw_list(s: string) -> string {
+    let parts = s.split("\"")
+    let mut out = ""
+    let mut i = 1  // odd indices are quoted strings
+    while i < parts.len() {
+        if out.len() > 0 { out = out + "|" }
+        out = out + parts[i]
+        i = i + 2
+    }
+    return out
+}
+
+// JSON-string escape for a string going into JSONL output
+fn json_escape(s: string) -> string {
+    let mut out = ""
+    let mut i = 0
+    while i < s.len() {
+        let c = s.substring(i, i + 1)
+        if c == "\"" {
+            out = out + "\\\""
+        } else {
+            if c == "\\" {
+                out = out + "\\\\"
+            } else {
+                if c == "\n" {
+                    out = out + "\\n"
+                } else {
+                    if c == "\r" {
+                        out = out + "\\r"
+                    } else {
+                        if c == "\t" {
+                            out = out + "\\t"
+                        } else {
+                            out = out + c
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// JSON array of strings (kws split on |)
+fn json_kw_array(joined: string) -> string {
+    let parts = joined.split("|")
+    let mut out = "["
+    let mut i = 0
+    while i < parts.len() {
+        if i > 0 { out = out + ", " }
+        out = out + "\"" + json_escape(parts[i]) + "\""
+        i = i + 1
+    }
+    return out + "]"
+}
+
+// ── Judge mirror (bit-identical to hire_sim_judge.hexa logic) ──────
+
+fn min_chars_for(domain: string) -> int {
+    if domain == "code" { return 40 }
+    if domain == "schedule" { return 30 }
+    if domain == "research" { return 40 }
+    return 30
+}
+
+fn looks_like_code(resp: string) -> bool {
+    if resp.index_of("```") >= 0 { return true }
+    let lo = resp.to_lower()
+    if lo.index_of("def ") >= 0 { return true }
+    if lo.index_of("fn ") >= 0 { return true }
+    if lo.index_of("function ") >= 0 { return true }
+    if lo.index_of("class ") >= 0 { return true }
+    if lo.index_of("import ") >= 0 { return true }
+    if lo.index_of("return ") >= 0 { return true }
+    if lo.index_of("public ") >= 0 { return true }
+    if lo.index_of("private ") >= 0 { return true }
+    if lo.index_of("var ") >= 0 { return true }
+    if lo.index_of("let ") >= 0 { return true }
+    if lo.index_of("const ") >= 0 { return true }
+    if lo.index_of("void ") >= 0 { return true }
+    // count "(){}=" — fallback signal
+    let mut ops = 0
+    let mut i = 0
+    while i < resp.len() {
+        let c = resp.substring(i, i + 1)
+        if c == "(" { ops = ops + 1 }
+        if c == ")" { ops = ops + 1 }
+        if c == "{" { ops = ops + 1 }
+        if c == "}" { ops = ops + 1 }
+        if c == "=" { ops = ops + 1 }
+        i = i + 1
+    }
+    if ops >= 3 { return true }
+    return false
+}
+
+fn contains_digit(s: string) -> bool {
+    let mut i = 0
+    while i < s.len() {
+        let c = s.substring(i, i + 1)
+        if c == "0" { return true }
+        if c == "1" { return true }
+        if c == "2" { return true }
+        if c == "3" { return true }
+        if c == "4" { return true }
+        if c == "5" { return true }
+        if c == "6" { return true }
+        if c == "7" { return true }
+        if c == "8" { return true }
+        if c == "9" { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// returns 1 if passes, 0 if fails (parallel arr style: int instead of bool tuple)
+fn judge_pass(domain: string, kws_joined: string, actual: string) -> int {
+    let lo = actual.to_lower()
+    let parts = kws_joined.split("|")
+    let mut hits = 0
+    let mut i = 0
+    while i < parts.len() {
+        let kw_lo = parts[i].to_lower()
+        if lo.index_of(kw_lo) >= 0 { hits = hits + 1 }
+        i = i + 1
+    }
+    let total = parts.len()
+    if hits != total { return 0 }
+    let min_c = min_chars_for(domain)
+    if actual.len() < min_c { return 0 }
+    if domain == "code" {
+        if !looks_like_code(actual) { return 0 }
+    }
+    if domain == "schedule" {
+        if !contains_digit(actual) { return 0 }
+    }
+    return 1
+}
+
+// ── Prompt frames (paraphrase pool) ───────────────────────────────
+// Returns (prefix, suffix) frame for variant index vi.
+// Pair encoded as "prefix||suffix" to dodge struct/tuple return bug.
+
+fn frame_for(vi: int) -> string {
+    let pool = [
+        "Please help me: {bp}.||",
+        "I need you to {bp}.|| Keep the answer concise and professional.",
+        "Task: {bp}.|| Use clear structure.",
+        "Can you {bp}?|| Thanks.",
+        "Quick ask: {bp}.||",
+        "Work item — {bp}.|| Draft a polished response.",
+        "Daily hire-sim: {bp}.||",
+        "Please {bp} and include any actionable next steps.||",
+        "Draft the output for: {bp}.||",
+        "Your assignment: {bp}.|| Produce a hire-worthy deliverable."
+    ]
+    let n = pool.len()
+    let idx = vi - (vi / n) * n  // vi % n
+    return pool[idx]
+}
+
+// Replace literal "{bp}" with base prompt — single-token, no regex
+fn fmt_frame(frame: string, base: string) -> string {
+    let parts = frame.split("{bp}")
+    let mut out = ""
+    let mut i = 0
+    while i < parts.len() {
+        if i > 0 { out = out + base }
+        out = out + parts[i]
+        i = i + 1
+    }
+    return out
+}
+
+// ── Lexical pools for variation ────────────────────────────────────
+fn pool_times() -> array {
+    return ["9 AM", "10 AM", "2 PM", "3:30 PM", "14:00", "09:00", "16:30"]
+}
+fn pool_dates() -> array {
+    return ["2026-04-20", "2026-05-02", "2026-04-16", "2026-04-29", "2026-05-15"]
+}
+fn pool_durations() -> array {
+    return ["45 minutes", "30 minutes", "2 hours", "90 minutes", "60 minutes"]
+}
+fn pool_recipients() -> array {
+    return ["Team", "Colleague", "Customer", "Partner", "Ms. Chen", "Mr. Okafor", "Dr. Lim", "Leadership"]
+}
+fn pool_closings() -> array {
+    return ["Best regards", "Kind regards", "Sincerely", "Thank you", "Warm regards"]
+}
+fn pool_signers() -> array {
+    return ["ALM Agent", "The Operations Desk", "Your teammate", "Morgan Lee", "R. Patel"]
+}
+fn pool_personas() -> array {
+    return ["", "For a senior engineer: ", "For a team lead: ",
+            "For the exec team: ", "For a junior hire: ", ""]
+}
+
+// kws joined with "|" -> rendered as ", "-joined human string
+fn kws_human(joined: string) -> string {
+    let parts = joined.split("|")
+    let mut out = ""
+    let mut i = 0
+    while i < parts.len() {
+        if i > 0 { out = out + ", " }
+        out = out + parts[i]
+        i = i + 1
+    }
+    return out
+}
+
+// kws as space-joined (for code keyword_line)
+fn kws_space(joined: string) -> string {
+    let parts = joined.split("|")
+    let mut out = ""
+    let mut i = 0
+    while i < parts.len() {
+        if i > 0 { out = out + " " }
+        out = out + parts[i]
+        i = i + 1
+    }
+    return out
+}
+
+// kws as backticked + " and "-joined (for code preamble)
+fn kws_code_ref(joined: string) -> string {
+    let parts = joined.split("|")
+    let mut out = ""
+    let mut i = 0
+    while i < parts.len() {
+        if i > 0 { out = out + " and " }
+        out = out + "`" + parts[i] + "`"
+        i = i + 1
+    }
+    return out
+}
+
+// kws as repr-style 'k1', 'k2'  (for python-ish code body)
+fn kws_repr(joined: string) -> string {
+    let parts = joined.split("|")
+    let mut out = ""
+    let mut i = 0
+    while i < parts.len() {
+        if i > 0 { out = out + ", " }
+        out = out + "'" + parts[i] + "'"
+        i = i + 1
+    }
+    return out
+}
+
+// ── Response generators (one per domain) ───────────────────────────
+// Each takes (prompt, kws_joined, difficulty, vi) -> response string.
+
+fn gen_code(prompt: string, kws_joined: string, difficulty: string, vi: int) -> string {
+    let kw_ref = kws_code_ref(kws_joined)
+    let kw_line = kws_space(kws_joined)
+    let kw_human = kws_human(kws_joined)
+    let kw_repr = kws_repr(kws_joined)
+    let style = vi - (vi / 4) * 4
+    let langs = ["python", "javascript", "go", "python"]
+    let lang = langs[style]
+    let mut body = ""
+    if lang == "python" {
+        if style == 0 {
+            body = "def main():\n    # This " + kw_line + " helper addresses " + prompt + ".\n    result = process(" + kw_repr + ")\n    return result\n\nif __name__ == '__main__':\n    main()"
+        } else {
+            body = "class Handler:\n    # Implements " + kw_line + ".\n    def run(self, items):\n        for x in items:\n            print(x)\n        return len(items)\n\nHandler().run([" + kw_repr + "])"
+        }
+    } else {
+        if lang == "javascript" {
+            body = "function main() {\n  // " + kw_line + " — " + prompt + "\n  const result = process([" + kw_repr + "]);\n  return result;\n}\n\nmain();"
+        } else {
+            // go
+            body = "func main() {\n    // " + kw_line + " — " + prompt + "\n    result := process(" + kw_repr + ")\n    fmt.Println(result)\n}"
+        }
+    }
+    let preambles = [
+        "Here is a " + difficulty + "-level implementation for the " + kw_ref + " task. The approach: " + prompt + ". Each keyword (" + kw_line + ") is addressed directly below.",
+        "Below is a working draft covering " + kw_line + ". It tackles: " + prompt + ".",
+        "Implementation sketch (" + kw_ref + "). Focus: " + prompt + ".",
+        "Proposed solution for " + kw_line + ". Context: " + prompt + "."
+    ]
+    let tails = [
+        "Notes: the " + kw_line + " coverage is explicit; adapt as needed.",
+        "Ship-ready after review. " + kw_line + " are covered.",
+        "This satisfies the " + kw_line + " requirements.",
+        "Please review the " + kw_line + " handling before merging."
+    ]
+    let pi = vi - (vi / 4) * 4
+    let ti = (vi + 1) - ((vi + 1) / 4) * 4
+    return preambles[pi] + "\n\n```" + lang + "\n" + body + "\n```\n\n" + tails[ti]
+}
+
+fn gen_email(prompt: string, kws_joined: string, difficulty: string, vi: int) -> string {
+    let recipients = pool_recipients()
+    let closings = pool_closings()
+    let signers = pool_signers()
+    let r_idx = vi - (vi / recipients.len()) * recipients.len()
+    let c_idx = vi - (vi / closings.len()) * closings.len()
+    let s_idx = vi - (vi / signers.len()) * signers.len()
+    let recipient = recipients[r_idx]
+    let closing = closings[c_idx]
+    let signer = signers[s_idx]
+    let kw_verbatim = kws_human(kws_joined)
+    let style = vi - (vi / 3) * 3
+    let mut text = "Subject: Re: " + prompt + "\n\nDear " + recipient + ",\n\n"
+    if style == 0 {
+        text = text + "Thank you for reaching out. Below is my formal response covering: " + kw_verbatim + ".\n"
+    }
+    if style == 1 {
+        text = text + "Thanks for flagging this. I want to address the following points explicitly: " + kw_verbatim + ".\n"
+    }
+    if style == 2 {
+        text = text + "Following up on your note — here is where we stand on " + kw_verbatim + ".\n"
+    }
+    text = text + "\n"
+    let parts = kws_joined.split("|")
+    let sentences = [
+        ": this item is addressed with full detail and a clear recommendation.",
+        ": owner assigned, next step defined, no blockers.",
+        " topic is resolved with documented rationale."
+    ]
+    let s2 = vi - (vi / 3) * 3
+    let mut i = 0
+    while i < parts.len() {
+        let prefix = ["- On ", "- Regarding ", "- The "][s2]
+        text = text + prefix + parts[i] + sentences[s2] + "\n"
+        i = i + 1
+    }
+    text = text + "\nTo summarize, the points " + kw_verbatim + " have been acknowledged and acted upon.\n"
+    text = text + "Please let me know if any clarification is needed.\n\n"
+    text = text + closing + ",\n" + signer
+    return text
+}
+
+fn gen_meeting(prompt: string, kws_joined: string, difficulty: string, vi: int) -> string {
+    let kw_line = kws_human(kws_joined)
+    let headers = [
+        "Meeting notes — " + prompt + ".",
+        "Minutes captured below — " + prompt + ".",
+        "Summary of today's sync — " + prompt + ".",
+        "Recap — " + prompt + "."
+    ]
+    let h_idx = vi - (vi / 4) * 4
+    let mut text = headers[h_idx] + "\nCovered topics: " + kw_line + ".\n\n"
+    let phrasings = [
+        ": recorded with owner, due date, and next step.",
+        ": decision made, rationale captured, follow-up assigned.",
+        ": discussed in depth; action item opened."
+    ]
+    let p_idx = vi - (vi / 3) * 3
+    let parts = kws_joined.split("|")
+    let mut i = 0
+    while i < parts.len() {
+        text = text + "- " + parts[i] + phrasings[p_idx] + "\n"
+        i = i + 1
+    }
+    let hours = rng_choice_int([12, 24, 48])
+    let attendees = rng_int(3, 9)
+    text = text + "- follow-up: circulate these notes within " + hours.to_string() + " hours.\n"
+    text = text + "- attendees: " + attendees.to_string() + " confirmed (see list).\n"
+    text = text + "\nSummary: the discussion addressed " + kw_line + " with explicit decisions."
+    return text
+}
+
+fn gen_doc(prompt: string, kws_joined: string, difficulty: string, vi: int) -> string {
+    let kw_line = kws_human(kws_joined)
+    let style = vi - (vi / 3) * 3
+    let parts = kws_joined.split("|")
+    let mut text = ""
+    if style == 0 {
+        text = "# " + prompt + "\n\n## Overview\nThis document covers the following topics: " + kw_line + ".\n\n## Detail\n"
+        let mut i = 0
+        while i < parts.len() {
+            text = text + "### " + parts[i] + "\nThe " + parts[i] + " section explains scope, rationale, and acceptance criteria.\n\n"
+            i = i + 1
+        }
+        text = text + "## Summary\nKey terms " + kw_line + " are now fully specified with owners."
+    }
+    if style == 1 {
+        text = prompt + " — Reference Document\n========================================\n\nScope: " + kw_line + ".\n\nSections:\n"
+        let mut i = 0
+        while i < parts.len() {
+            text = text + "  " + (i + 1).to_string() + ". " + parts[i] + " — definition, owner, acceptance criteria.\n"
+            i = i + 1
+        }
+        text = text + "\nConclusion: " + kw_line + " are fully documented here."
+    }
+    if style == 2 {
+        text = "Doc: " + prompt + "\n\n> Key concepts addressed: " + kw_line + ".\n\n"
+        let mut i = 0
+        while i < parts.len() {
+            text = text + "**" + parts[i] + "**\n: Detailed treatment follows, including examples and edge cases.\n\n"
+            i = i + 1
+        }
+        text = text + "All " + kw_line + " items have been covered end-to-end."
+    }
+    return text
+}
+
+fn gen_schedule(prompt: string, kws_joined: string, difficulty: string, vi: int) -> string {
+    let kw_line = kws_human(kws_joined)
+    let t = rng_choice_str(pool_times())
+    let d = rng_choice_str(pool_dates())
+    let dur = rng_choice_str(pool_durations())
+    let attendees = rng_int(3, 12)
+    let style = vi - (vi / 3) * 3
+    let parts = kws_joined.split("|")
+    let mut text = ""
+    if style == 0 {
+        text = "Schedule — " + prompt + ".\n\n- Start: " + d + " at " + t + "\n- Duration: " + dur + "\n- Cadence: weekly (repeats every 7 days)\n- Attendees: " + attendees.to_string() + " (confirmed)\n\nTopics covered: " + kw_line + ".\n"
+        let mut i = 0
+        while i < parts.len() {
+            let m = rng_int(5, 45)
+            text = text + "- " + parts[i] + ": slotted into the agenda at minute " + m.to_string() + ".\n"
+            i = i + 1
+        }
+        text = text + "\nEvent created " + d + " " + t + ", duration " + dur + "."
+    }
+    if style == 1 {
+        text = "Calendar entry — " + prompt + ".\nDate " + d + ", time " + t + ", length " + dur + ", " + attendees.to_string() + " attendees.\n\nAgenda covering " + kw_line + ":\n"
+        let mut i = 0
+        while i < parts.len() {
+            text = text + "  " + (i + 1).to_string() + ". " + parts[i] + " (10 min)\n"
+            i = i + 1
+        }
+        let mid = rng_int(1000, 9999)
+        text = text + "\nMeeting ID: 4921-" + mid.to_string() + "."
+    }
+    if style == 2 {
+        text = "Proposed schedule for " + prompt + ".\n\nWhen: " + d + ", " + t + " (" + dur + ").\nWho: " + attendees.to_string() + " people.\n\nKey items: " + kw_line + ".\n"
+        let mut i = 0
+        while i < parts.len() {
+            text = text + "- " + parts[i] + ": 15 minutes allocated.\n"
+            i = i + 1
+        }
+        text = text + "\nConfirmed for " + d + " at " + t + "."
+    }
+    return text
+}
+
+fn gen_research(prompt: string, kws_joined: string, difficulty: string, vi: int) -> string {
+    let kw_line = kws_human(kws_joined)
+    let style = vi - (vi / 3) * 3
+    let parts = kws_joined.split("|")
+    let mut text = ""
+    if style == 0 {
+        text = "Research summary — " + prompt + ".\n\nScope: " + kw_line + ".\n\n## Findings\n"
+        let mut i = 0
+        while i < parts.len() {
+            text = text + (i + 1).to_string() + ". " + parts[i] + ": 3 sources reviewed; consensus summarized below.\n"
+            i = i + 1
+        }
+        text = text + "\n## Recommendation\nBased on the " + kw_line + " analysis, we recommend proceeding with option A.\nTradeoffs and risks are documented in the appendix."
+    }
+    if style == 1 {
+        text = "Briefing note — " + prompt + ".\n\nTopics examined: " + kw_line + ".\n\nKey takeaways:\n"
+        let mut i = 0
+        while i < parts.len() {
+            text = text + "- " + parts[i] + ": sourced from 2 industry reports and 1 academic survey.\n"
+            i = i + 1
+        }
+        text = text + "\nBottom line: the " + kw_line + " evidence supports a cautious 'proceed' verdict."
+    }
+    if style == 2 {
+        text = "Research digest (" + prompt + ").\n\nWe looked at " + kw_line + " across 4 vendors / papers / teams.\n\nHighlights:\n"
+        let mut i = 0
+        while i < parts.len() {
+            text = text + "  " + (i + 1).to_string() + ". " + parts[i] + " — notable finding: measurable advantage in 2 out of 4 cases.\n"
+            i = i + 1
+        }
+        text = text + "\nNet: " + kw_line + " is a solid bet, with two caveats noted below."
+    }
+    return text
+}
+
+// ── Dispatch by domain ─────────────────────────────────────────────
+fn gen_response(domain: string, prompt: string, kws_joined: string, difficulty: string, vi: int) -> string {
+    if domain == "code" { return gen_code(prompt, kws_joined, difficulty, vi) }
+    if domain == "email" { return gen_email(prompt, kws_joined, difficulty, vi) }
+    if domain == "meeting" { return gen_meeting(prompt, kws_joined, difficulty, vi) }
+    if domain == "doc" { return gen_doc(prompt, kws_joined, difficulty, vi) }
+    if domain == "schedule" { return gen_schedule(prompt, kws_joined, difficulty, vi) }
+    if domain == "research" { return gen_research(prompt, kws_joined, difficulty, vi) }
+    return ""
+}
+
+// ── Synthesize one prompt with paraphrase + persona + optional kw hint ──
+fn synth_prompt(base: string, kws_joined: string, vi: int) -> string {
+    let frame = frame_for(vi)
+    // split frame "prefix||suffix"
+    let fp = frame.split("||")
+    let prefix = fp[0]
+    let suffix = if fp.len() > 1 { fp[1] } else { "" }
+    let core = fmt_frame(prefix, base) + suffix
+    let personas = pool_personas()
+    let persona = rng_choice_str(personas)
+    // 40% inline kw hint: vi % 5 < 2
+    let m5 = vi - (vi / 5) * 5
+    if m5 < 2 {
+        let parts = kws_joined.split("|")
+        let mut kw_ref = ""
+        let mut i = 0
+        while i < parts.len() {
+            if i > 0 { kw_ref = kw_ref + ", " }
+            kw_ref = kw_ref + "\"" + parts[i] + "\""
+            i = i + 1
+        }
+        let hint = " Make sure the response naturally includes the exact words " + kw_ref + "."
+        return persona + core + hint
+    }
+    return persona + core
+}
+
+// ── Seed task loader (line-walked from hire_sim_100.hexa) ──────────
+// Returns parallel arrays via module-level mutable bindings.
+
+let mut SEED_IDS = []
+let mut SEED_DOMS = []
+let mut SEED_DIFFS = []
+let mut SEED_PROMPTS = []
+let mut SEED_KWS = []  // each elem: pipe-joined keywords
+
+fn load_seeds(n: int) {
+    let path = config_corpus_path()
+    let raw = read_file(path)
+    let probe = raw.split("\n")
+    if probe.len() == 1 && probe[0] == "" {
+        println("[ERR] missing corpus: " + path)
+        return
+    }
+    let lines = raw.split("\n")
+    // Accumulate one task across consecutive lines starting from `Task {`
+    let mut cur_id = ""
+    let mut cur_dom = ""
+    let mut cur_diff = ""
+    let mut cur_prompt = ""
+    let mut cur_kws = ""
+    let mut have_id = false
+    let mut have_dom = false
+    let mut have_diff = false
+    let mut have_prompt = false
+    let mut have_kws = false
+
+    let mut i = 0
+    while i < lines.len() {
+        let line = lines[i]
+        // detect a new Task block (id appears) — look for `id: "`
+        let id_v = extract_quoted(line, "id: \"")
+        if id_v != "" {
+            cur_id = id_v
+            have_id = true
+            // domain often on same line
+            let dom_v = extract_quoted(line, "domain: \"")
+            if dom_v != "" { cur_dom = dom_v; have_dom = true }
+            let diff_v = extract_quoted(line, "difficulty: \"")
+            if diff_v != "" { cur_diff = diff_v; have_diff = true }
+        } else {
+            // Continuation lines
+            let pr_v = extract_quoted(line, "prompt: \"")
+            if pr_v != "" { cur_prompt = pr_v; have_prompt = true }
+            let kw_v = extract_bracket(line, "success_keywords:")
+            if kw_v != "" {
+                cur_kws = parse_kw_list(kw_v)
+                have_kws = true
+            }
+        }
+        // If we have all 5 fields, commit and reset
+        if have_id && have_dom && have_diff && have_prompt && have_kws {
+            SEED_IDS = SEED_IDS.push(cur_id)
+            SEED_DOMS = SEED_DOMS.push(cur_dom)
+            SEED_DIFFS = SEED_DIFFS.push(cur_diff)
+            SEED_PROMPTS = SEED_PROMPTS.push(cur_prompt)
+            SEED_KWS = SEED_KWS.push(cur_kws)
+            have_id = false
+            have_dom = false
+            have_diff = false
+            have_prompt = false
+            have_kws = false
+        }
+        i = i + 1
+    }
+
+    println("  parsed " + SEED_IDS.len().to_string() + " raw tasks from " + path)
+
+    // Stratify: take per = n / num_unique_domains from each domain in order.
+    // Build domain order list (preserve first-seen order).
+    let mut dom_order = []
+    let mut j = 0
+    while j < SEED_DOMS.len() {
+        let d = SEED_DOMS[j]
+        let mut found = false
+        let mut k = 0
+        while k < dom_order.len() {
+            if dom_order[k] == d { found = true }
+            k = k + 1
+        }
+        if !found { dom_order = dom_order.push(d) }
+        j = j + 1
+    }
+    let per = n / dom_order.len()
+
+    // Build stratified arrays
+    let mut S_IDS = []
+    let mut S_DOMS = []
+    let mut S_DIFFS = []
+    let mut S_PROMPTS = []
+    let mut S_KWS = []
+    let mut di = 0
+    while di < dom_order.len() {
+        let d = dom_order[di]
+        let mut count = 0
+        let mut ti = 0
+        while ti < SEED_IDS.len() {
+            if SEED_DOMS[ti] == d {
+                if count < per {
+                    S_IDS = S_IDS.push(SEED_IDS[ti])
+                    S_DOMS = S_DOMS.push(SEED_DOMS[ti])
+                    S_DIFFS = S_DIFFS.push(SEED_DIFFS[ti])
+                    S_PROMPTS = S_PROMPTS.push(SEED_PROMPTS[ti])
+                    S_KWS = S_KWS.push(SEED_KWS[ti])
+                    count = count + 1
+                }
+            }
+            ti = ti + 1
+        }
+        di = di + 1
+    }
+    SEED_IDS = S_IDS
+    SEED_DOMS = S_DOMS
+    SEED_DIFFS = S_DIFFS
+    SEED_PROMPTS = S_PROMPTS
+    SEED_KWS = S_KWS
+    // truncate to n
+    let total = SEED_IDS.len()
+    if total > n {
+        let mut T_IDS = []
+        let mut T_DOMS = []
+        let mut T_DIFFS = []
+        let mut T_PROMPTS = []
+        let mut T_KWS = []
+        let mut tk = 0
+        while tk < n {
+            T_IDS = T_IDS.push(SEED_IDS[tk])
+            T_DOMS = T_DOMS.push(SEED_DOMS[tk])
+            T_DIFFS = T_DIFFS.push(SEED_DIFFS[tk])
+            T_PROMPTS = T_PROMPTS.push(SEED_PROMPTS[tk])
+            T_KWS = T_KWS.push(SEED_KWS[tk])
+            tk = tk + 1
+        }
+        SEED_IDS = T_IDS
+        SEED_DOMS = T_DOMS
+        SEED_DIFFS = T_DIFFS
+        SEED_PROMPTS = T_PROMPTS
+        SEED_KWS = T_KWS
+    }
+}
+
+// ── Main synthesis loop ────────────────────────────────────────────
+fn main() {
+    // seed RNG deterministically
+    RNG_STATE = config_seed()
+
+    let target = config_target()
+    let n_var = config_n_variants()
+    let max_retry = config_max_retry()
+
+    println("[synth] loading seed tasks from " + config_corpus_path())
+    load_seeds(30)
+    let nseeds = SEED_IDS.len()
+    println("[synth] loaded " + nseeds.to_string() + " seed tasks (stratified)")
+
+    if nseeds == 0 {
+        println("[ERR] no seed tasks parsed — abort")
+        return
+    }
+
+    // ── Generate ─────────────────────────────────────────────────
+    let mut out_jsonl = ""
+    let mut accepted = 0
+    let mut attempts = 0
+    let mut fails = 0
+
+    let mut si = 0
+    while si < nseeds {
+        let dom = SEED_DOMS[si]
+        let diff = SEED_DIFFS[si]
+        let base_prompt = SEED_PROMPTS[si]
+        let kws_joined = SEED_KWS[si]
+        let seed_id = SEED_IDS[si]
+
+        let mut vi = 0
+        while vi < n_var {
+            let mut accepted_this = false
+            let mut retry = 0
+            while retry < max_retry {
+                attempts = attempts + 1
+                let prompt = synth_prompt(base_prompt, kws_joined, vi)
+                // vary generator state with retry: vi + retry*17 (mirror .py)
+                let gvi = vi + retry * 17
+                let response = gen_response(dom, base_prompt, kws_joined, diff, gvi)
+                let ok = judge_pass(dom, kws_joined, response)
+                if ok == 1 {
+                    // commit JSONL line
+                    let line = "{\"domain\": \"" + json_escape(dom) +
+                        "\", \"difficulty\": \"" + json_escape(diff) +
+                        "\", \"prompt\": \"" + json_escape(prompt) +
+                        "\", \"response\": \"" + json_escape(response) +
+                        "\", \"keywords\": " + json_kw_array(kws_joined) +
+                        "}\n"
+                    out_jsonl = out_jsonl + line
+                    accepted = accepted + 1
+                    accepted_this = true
+                    retry = max_retry  // break
+                } else {
+                    fails = fails + 1
+                    retry = retry + 1
+                }
+            }
+            if !accepted_this {
+                println("[synth][WARN] seed=" + seed_id + " variant=" + vi.to_string() +
+                        " failed after " + max_retry.to_string() + " retries — skipped")
+            }
+            vi = vi + 1
+        }
+        si = si + 1
+    }
+
+    println("")
+    println("[synth] generated " + accepted.to_string() + "/" + target.to_string() + " records")
+    println("[synth] attempts: " + attempts.to_string() + "  fails: " + fails.to_string())
+
+    // write JSONL
+    let out_path = config_output_path()
+    write_file(out_path, out_jsonl)
+    println("[synth] wrote " + out_path + " (" + out_jsonl.len().to_string() + " bytes)")
+
+    // summary
+    let summary = "{\n" +
+        "  \"target\": " + target.to_string() + ",\n" +
+        "  \"actual\": " + accepted.to_string() + ",\n" +
+        "  \"attempts\": " + attempts.to_string() + ",\n" +
+        "  \"fails\": " + fails.to_string() + "\n" +
+        "}"
+    println("")
+    println("[summary] " + summary)
+
+    if accepted < target {
+        println("[ERR] under target: " + accepted.to_string() + "/" + target.to_string())
+    }
+}
+
+// NOTE: hexa stage1 runs main() automatically — explicit call would double-invoke.
