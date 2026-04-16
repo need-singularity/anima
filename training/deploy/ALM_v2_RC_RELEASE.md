@@ -5,8 +5,8 @@
 **Serve source**: `serving/serve_alm_14b.py`
 **First validation**: 2026-04-16 15:02 — **HOLD** (3 issues)
 **Top 3 fixes applied**: 2026-04-16 ~15:00
-**Re-validation**: in flight (agent running in parallel)
-**Status**: PENDING v2.0 TAG — awaiting re-validation verdict
+**Re-validation**: 2026-04-16 ~16:29 — **LIFT HOLD** (`alm_v2_revalidation_20260416.json`)
+**Status**: **READY FOR v2.0-RC1 TAG** (NOT GA — hire_sim below threshold)
 
 ---
 
@@ -18,10 +18,10 @@
 - [x] phi_holo formula matches training SSOT — serve now uses MI-based C41 formula with N-scale (lines 60–120 of `serve_alm_14b.py`)
 - [x] Chat template applied (Qwen system+user) — `use_chat_template=True` default (line 192)
 - [x] Stop tokens set (eos + im_end) — stop_ids include `<|im_end|>` (line 216)
-- [ ] No drift on 10-prompt battery — **PENDING re-validation** (first pass showed strong drift pre-fix, e.g. ethics_01 ran into unrelated combinatorics)
-- [ ] No hallucinated imports in code gen — **PENDING re-validation** (first pass: `import avl_tree` — nonexistent module)
+- [x] No drift on 10-prompt battery — **PASS re-val**: pivot rate 7/20 → **0/20**, ethics_01 clean
+- [x] No hallucinated imports in code gen — **PASS re-val**: `import avl_tree` eliminated, uses proper `heapq`
 - [x] hire_sim measured on ALM (not Claude baseline) — `BENCHMARKS_README.md` enforces naming (`hire_sim_real_eval_r9_*.log` vs `hire_sim_claude_*.log`)
-- [x] phi scale reasonable (≥ 3 on typical prompts) — first pass mean 0.8451 at B=1 serve (training B=8 gives ~8x); definition unified, numbers reconcile with batch ratio
+- [x] phi scale reasonable (≥ 3 on typical prompts) — **PASS re-val**: max 0.85 → **3.47** (4x), range 3.13–4.00 after MI formula fix
 - [ ] R2 ckpt restorable — **PENDING smoke restore** from `r2:anima-models/alm14b/r9/`
 
 ## 2. Fix Trace (what was broken, what was fixed)
@@ -58,7 +58,7 @@
 
 For the release to be tagged **v2.0**, ALL must check:
 
-- [ ] Re-validation agent verdict = **LIFT HOLD** — **pending** (agent running in parallel)
+- [x] Re-validation agent verdict = **LIFT HOLD** — PASS (see `alm_v2_revalidation_20260416.json`)
 - [ ] Consciousness gates (7-condition verify) pass — run `$HEXA ready/anima/tests/tests.hexa --verify` — **pending**
 - [ ] Cost estimate acceptable: $2.99/hr × 24h = **$72/day** serve cost (H100 pod) — user decision
 - [ ] SSOT compliance: no `.py` canonical drift (R7 / R14 lint clean) — **pending lint run**
