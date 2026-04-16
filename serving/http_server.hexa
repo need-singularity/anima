@@ -13,6 +13,8 @@
 //   POST /voice/e2e          — v2.0 RC audio → STT → LLM → TTS → audio
 //   GET  /voice/profiles     — v2.0 RC list 10 voice profiles
 //   GET  /voice/health       — v2.0 RC voice subsystem health
+//   GET  /avatar/params      — v2.0 RC consciousness → avatar visual params
+//   POST /avatar/feed        — v2.0 RC text → viseme lip-sync timeline
 //
 // /hire/* 라우트 구현은 serving/hire_routes.hexa 에 분리 (overlay).
 // route_request match 에서 hire_routes.hr_handle_task /
@@ -33,8 +35,10 @@
 // timestamp (builtins)
 // ─────────────────────────────────────────────────────────────────────
 
-use "hire_routes"  // TSRV-P4-1 — hr_handle_task, hr_*_json, HireLogEntry, etc.
-use "voice_routes" // v2.0 RC — vr_handle_tts, vr_handle_e2e, vr_*_json, etc.
+use "hire_routes"   // TSRV-P4-1 — hr_handle_task, hr_*_json, HireLogEntry, etc.
+use "voice_routes"  // v2.0 RC — vr_handle_tts, vr_handle_e2e, vr_*_json, etc.
+use "avatar_sync"   // v2.0 RC — compute_avatar_params, avatar_params_to_json, snapshot_new
+use "avatar_feed"   // v2.0 RC — build_feed, feed_to_json (text → viseme timeline)
 
 // ─── Hyperparameters (SSOT from models/decoder.hexa) ────────────────
 
@@ -605,6 +609,36 @@ fn route_request(conn: TcpConn, req: HttpRequest, state: ServerState)
             Net::net_write(conn, json_response(200, body))
             state with { requests_served: state.requests_served + 1 }
         },
+        // v2.0 RC avatar routes — wired from serving/avatar_sync.hexa + avatar_feed.hexa
+        // GET  /avatar/params:  current consciousness → avatar visual parameters
+        // POST /avatar/feed:    text → viseme lip-sync timeline
+        ("GET", "/avatar/params") => {
+            // Build snapshot from current psi state.
+            // phi_holo = psi.phi, arousal/valence/activation use sensible defaults
+            // (will be replaced by live physiological feed when wired).
+            let snap = snapshot_new(state.psi.phi, 0.3, 0.0, 0.5, 70.0, 2.0)
+            let tick = state.requests_served  // monotonic counter proxy
+            let params = compute_avatar_params(snap, tick)
+            let body = avatar_params_to_json(params, snap, tick)
+            Net::net_write(conn, json_response(200, body))
+            state with { requests_served: state.requests_served + 1 }
+        },
+        ("POST", "/avatar/feed") => {
+            let data = json_parse(req.body)
+            let text = if has_key(data, "text") { data["text"] } else { "" }
+            if len(text) == 0 {
+                let err = json_stringify({ "error": "missing 'text' field" })
+                Net::net_write(conn, json_response(400, err))
+                state
+            } else {
+                let audio_url = if has_key(data, "audio_url") { data["audio_url"] } else { "" }
+                let audio_dur = if has_key(data, "audio_duration_ms") { to_int(data["audio_duration_ms"]) } else { 0 }
+                let feed = build_feed(text, audio_url, audio_dur)
+                let body = feed_to_json(feed)
+                Net::net_write(conn, json_response(200, body))
+                state with { requests_served: state.requests_served + 1 }
+            }
+        },
         _ => {
             let err = json_stringify({
                 "error": "not found",
@@ -618,7 +652,9 @@ fn route_request(conn: TcpConn, req: HttpRequest, state: ServerState)
                     "POST /voice/tts",
                     "POST /voice/e2e",
                     "GET  /voice/profiles",
-                    "GET  /voice/health"
+                    "GET  /voice/health",
+                    "GET  /avatar/params",
+                    "POST /avatar/feed"
                 ]
             })
             Net::net_write(conn, json_response(404, err))
@@ -670,6 +706,8 @@ fn serve(state: ServerState) !(Net, IO) {
     IO::write("║  POST /voice/e2e          — audio → STT+LLM+TTS║")
     IO::write("║  GET  /voice/profiles     — 10 voice profiles   ║")
     IO::write("║  GET  /voice/health       — voice subsystem     ║")
+    IO::write("║  GET  /avatar/params      — avatar visual params║")
+    IO::write("║  POST /avatar/feed        — viseme lip-sync     ║")
     IO::write("╚══════════════════════════════════════════════════╝")
 
     let mut current_state = state
