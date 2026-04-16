@@ -9,6 +9,10 @@
 //   POST /hire/task          — TSRV-P4-1 직원 진입점 (autonomy + style + persona)
 //   GET  /hire/status        — TSRV-P4-1 last n hire entries summary
 //   GET  /hire/capabilities  — TSRV-P4-1 persona/tone enumeration
+//   POST /voice/tts          — v2.0 RC text → TTS audio (voice profile)
+//   POST /voice/e2e          — v2.0 RC audio → STT → LLM → TTS → audio
+//   GET  /voice/profiles     — v2.0 RC list 10 voice profiles
+//   GET  /voice/health       — v2.0 RC voice subsystem health
 //
 // /hire/* 라우트 구현은 serving/hire_routes.hexa 에 분리 (overlay).
 // route_request match 에서 hire_routes.hr_handle_task /
@@ -30,6 +34,7 @@
 // ─────────────────────────────────────────────────────────────────────
 
 use "hire_routes"  // TSRV-P4-1 — hr_handle_task, hr_*_json, HireLogEntry, etc.
+use "voice_routes" // v2.0 RC — vr_handle_tts, vr_handle_e2e, vr_*_json, etc.
 
 // ─── Hyperparameters (SSOT from models/decoder.hexa) ────────────────
 
@@ -570,6 +575,36 @@ fn route_request(conn: TcpConn, req: HttpRequest, state: ServerState)
             Net::net_write(conn, json_response(200, body))
             state with { requests_served: state.requests_served + 1 }
         },
+        // v2.0 RC voice I/O routes — wired from serving/voice_routes.hexa
+        // Connects anima-speak Mk.III E2E pipeline to the HTTP server.
+        // POST /voice/tts:  text → TTS → audio (with voice profile)
+        // POST /voice/e2e:  audio_in → STT → LLM → TTS → audio_out
+        // GET  /voice/profiles: list 10 available voice profiles
+        // GET  /voice/health:   voice subsystem health check
+        ("POST", "/voice/tts") => {
+            let resp = vr_handle_tts(req.body)
+            let resp_json = vr_tts_response_json(resp)
+            let status_code = if resp.ok { 200 } else { 400 }
+            Net::net_write(conn, json_response(status_code, resp_json))
+            state with { requests_served: state.requests_served + 1 }
+        },
+        ("POST", "/voice/e2e") => {
+            let resp = vr_handle_e2e(req.body)
+            let resp_json = vr_e2e_response_json(resp)
+            let status_code = if resp.ok { 200 } else { 400 }
+            Net::net_write(conn, json_response(status_code, resp_json))
+            state with { requests_served: state.requests_served + 1 }
+        },
+        ("GET", "/voice/profiles") => {
+            let body = vr_profiles_json()
+            Net::net_write(conn, json_response(200, body))
+            state with { requests_served: state.requests_served + 1 }
+        },
+        ("GET", "/voice/health") => {
+            let body = vr_health_json()
+            Net::net_write(conn, json_response(200, body))
+            state with { requests_served: state.requests_served + 1 }
+        },
         _ => {
             let err = json_stringify({
                 "error": "not found",
@@ -579,7 +614,11 @@ fn route_request(conn: TcpConn, req: HttpRequest, state: ServerState)
                     "GET  /health",
                     "POST /hire/task",
                     "GET  /hire/status",
-                    "GET  /hire/capabilities"
+                    "GET  /hire/capabilities",
+                    "POST /voice/tts",
+                    "POST /voice/e2e",
+                    "GET  /voice/profiles",
+                    "GET  /voice/health"
                 ]
             })
             Net::net_write(conn, json_response(404, err))
@@ -627,6 +666,10 @@ fn serve(state: ServerState) !(Net, IO) {
     IO::write("║  POST /hire/task          — autonomy + style    ║")
     IO::write("║  GET  /hire/status        — last n hire entries ║")
     IO::write("║  GET  /hire/capabilities  — persona/tone enum   ║")
+    IO::write("║  POST /voice/tts          — text → TTS audio    ║")
+    IO::write("║  POST /voice/e2e          — audio → STT+LLM+TTS║")
+    IO::write("║  GET  /voice/profiles     — 10 voice profiles   ║")
+    IO::write("║  GET  /voice/health       — voice subsystem     ║")
     IO::write("╚══════════════════════════════════════════════════╝")
 
     let mut current_state = state
@@ -657,6 +700,10 @@ fn main(args: list) -> void {
         println("  curl http://localhost:8090/health")
         println("  curl -X POST http://localhost:8090/generate -d '{\"prompt\":\"Hello\",\"max_tokens\":64}'")
         println("  curl -X POST http://localhost:8090/consciousness")
+        println("  curl -X POST http://localhost:8090/voice/tts -d '{\"text\":\"Hello\",\"profile_id\":0}'")
+        println("  curl -X POST http://localhost:8090/voice/e2e -d '{\"audio_in\":\"test.wav\"}'")
+        println("  curl http://localhost:8090/voice/profiles")
+        println("  curl http://localhost:8090/voice/health")
         return
     }
 

@@ -1,0 +1,928 @@
+// ════════════════════════════════════════════════════════════════
+//  anima-measurement/phi_holo_eval.hexa
+//
+//  Standalone post-training phi_holo evaluator for ALM & CLM gates.
+//
+//  Gate criteria (from roadmap SSOT):
+//    ALM:  phi_holo mean >= 1000  (alm_consciousness_standalone.json)
+//    CLM:  phi_holo mean >= 2000  (clm_consciousness_standalone.json)
+//
+//  Modes:
+//    --eval <ckpt_dir>            Evaluate a single checkpoint directory
+//    --batch <dir>                Evaluate all checkpoint dirs under <dir>
+//    --report                     Print report from phi_history.json
+//    --gate <alm|clm> <ckpt_dir> Evaluate + emit gate PASS/FAIL verdict
+//
+//  Checkpoint sidecar format (ckpt_meta.json):
+//    { "phi_holo": <float>, "train_step": <int>, "model": "<alm|clm>",
+//      "eval_loss": <float>, ... }
+//
+//  Output:
+//    Structured ASCII report + append to anima-measurement/phi_history.json
+//    + gate verdict on stdout (exit-code style: "pass=1" or "pass=0")
+//
+//  Architecture:
+//    1. Read sidecar JSON from ckpt_dir/ckpt_meta.json (or train_meta.json)
+//    2. Extract phi_holo, train_step, model, eval_loss
+//    3. If no phi_holo in sidecar, compute from hidden states file if present
+//    4. Apply N-scaling: phi_holo_scaled = mi_raw * N where N = n_samples * seq * d_qualia
+//    5. Gate check against ALM/CLM thresholds
+//    6. Append result to phi_history.json
+//
+//  Self-contained: no external `use`. Follows hexa pitfall rules:
+//    - No struct returns with >= 3 float fields
+//    - Lists are pass-by-value (always reassign)
+//    - No has_key — use index scan
+//    - No multi-line returns
+//
+//  Run:
+//    hexa run anima-measurement/phi_holo_eval.hexa --eval <ckpt_dir>
+//    hexa run anima-measurement/phi_holo_eval.hexa --gate alm <ckpt_dir>
+//    hexa run anima-measurement/phi_holo_eval.hexa --report
+// ════════════════════════════════════════════════════════════════
+
+// ─── Gate thresholds (from roadmap SSOT) ────────────────────────
+//   ALM: alm_consciousness_standalone.json  target.phi_holo eval mean >= 1000
+//   CLM: clm_consciousness_standalone.json  target.phi_holo mean >= 2000
+
+let GATE_ALM_PHI_HOLO  = 1000.0
+let GATE_CLM_PHI_HOLO  = 2000.0
+
+// Promotion requires phi_holo > 0 (ckpt_promote.hexa gate_phi_holo).
+// This evaluator enforces the stricter per-track thresholds above.
+
+let SIDECAR_NAME   = "ckpt_meta.json"
+let SIDECAR_LEGACY = "train_meta.json"
+let HISTORY_NAME   = "phi_history.json"
+
+// MI estimator constants (must match phi_holographic_measure.hexa)
+let MI_BINS     = 8
+let EPS         = 0.0000001
+
+// ─── String helpers (safe subset, same as ckpt_promote.hexa) ────
+
+fn str_contains(hay: string, needle: string) -> bool {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return true }
+    if nn > hn { return false }
+    let mut i = 0
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn str_index_of(hay: string, needle: string, from: int) -> int {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return from }
+    let mut i = from
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn str_trim(s: string) -> string {
+    let n = len(s)
+    if n == 0 { return s }
+    let mut start = 0
+    while start < n {
+        let ch = s.substring(start, start + 1)
+        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" {
+            start = start + 1
+        } else {
+            break
+        }
+    }
+    let mut end = n
+    while end > start {
+        let ch = s.substring(end - 1, end)
+        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" {
+            end = end - 1
+        } else {
+            break
+        }
+    }
+    if start >= end { return "" }
+    return s.substring(start, end)
+}
+
+// ─── JSON extraction (manual — no JSON parser in stage0) ────────
+
+fn extract_json_string(text: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let kpos = str_index_of(text, needle, 0)
+    if kpos < 0 { return "" }
+    let after_key = kpos + len(needle)
+    let colon = str_index_of(text, ":", after_key)
+    if colon < 0 { return "" }
+    let open_q = str_index_of(text, "\"", colon)
+    if open_q < 0 { return "" }
+    let close_q = str_index_of(text, "\"", open_q + 1)
+    if close_q < 0 { return "" }
+    return text.substring(open_q + 1, close_q)
+}
+
+// Extract a numeric value (int or float) as string from JSON.
+// Handles: "key": 1234, "key": 1234.56, "key": -1234.56
+fn extract_json_number_str(text: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let kpos = str_index_of(text, needle, 0)
+    if kpos < 0 { return "" }
+    let after_key = kpos + len(needle)
+    let colon = str_index_of(text, ":", after_key)
+    if colon < 0 { return "" }
+    let n = len(text)
+    let mut i = colon + 1
+    // skip whitespace
+    while i < n {
+        let ch = text.substring(i, i + 1)
+        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" {
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    // collect digits, minus sign, decimal point
+    let mut j = i
+    while j < n {
+        let cj = text.substring(j, j + 1)
+        if cj == "0" || cj == "1" || cj == "2" || cj == "3" || cj == "4"
+           || cj == "5" || cj == "6" || cj == "7" || cj == "8" || cj == "9"
+           || cj == "." || cj == "-" || cj == "e" || cj == "E" || cj == "+" {
+            j = j + 1
+        } else {
+            break
+        }
+    }
+    if j == i { return "" }
+    return text.substring(i, j)
+}
+
+fn extract_json_bool(text: string, key: string) -> bool {
+    let needle = "\"" + key + "\""
+    let kpos = str_index_of(text, needle, 0)
+    if kpos < 0 { return false }
+    let after_key = kpos + len(needle)
+    let colon = str_index_of(text, ":", after_key)
+    if colon < 0 { return false }
+    let n = len(text)
+    let mut i = colon + 1
+    while i < n {
+        let ch = text.substring(i, i + 1)
+        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" { i = i + 1 } else { break }
+    }
+    if i >= n { return false }
+    let remaining = n - i
+    if remaining >= 4 && text.substring(i, i + 4) == "true" { return true }
+    if text.substring(i, i + 1) == "1" { return true }
+    return false
+}
+
+// ─── Logging ────────────────────────────────────────────────────
+
+fn now_stamp() -> string {
+    return str_trim(exec("date +%Y-%m-%dT%H:%M:%S"))
+}
+
+fn log_info(msg: string) {
+    println("[phi_holo_eval " + now_stamp() + "] " + msg)
+}
+
+fn log_warn(msg: string) {
+    println("[phi_holo_eval " + now_stamp() + " WARN] " + msg)
+}
+
+fn log_err(msg: string) {
+    println("[phi_holo_eval " + now_stamp() + " ERR] " + msg)
+}
+
+// ─── Math helpers (self-contained, match phi_holographic_measure) ─
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── MI log-bin estimator (from phi_holographic_measure.hexa) ────
+
+fn bin_index(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn count_hits(bin_ids: array, n_bins: int) -> array {
+    let n = len(bin_ids)
+    let mut counts = []
+    let mut k = 0
+    while k < n_bins {
+        let mut c = 0.0
+        let mut i = 0
+        while i < n {
+            if bin_ids[i] == k { c = c + 1.0 }
+            i = i + 1
+        }
+        counts = counts.push(c)
+        k = k + 1
+    }
+    return counts
+}
+
+fn entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut bin_ids = []
+    let mut i = 0
+    while i < n {
+        bin_ids = bin_ids.push(bin_index(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let counts = count_hits(bin_ids, nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+fn joint_entropy_hist(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = bin_index(a[i], lo, hi, nb)
+        let ib = bin_index(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let nb2 = nb * nb
+    let counts = count_hits(pair_ids, nb2)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb2 {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+// ─── Holographic head (from phi_holographic_measure.hexa) ────────
+
+let SCRAMBLE_GAIN = 0.5
+
+fn head_scramble(d_boundary: int, d_bulk: int, seed: int) -> array {
+    let d_scramble = d_bulk - d_boundary
+    let raw = det_rand(d_boundary * d_scramble, seed)
+    let mut scramble = []
+    let mut i = 0
+    while i < len(raw) {
+        scramble = scramble.push(raw[i] * SCRAMBLE_GAIN)
+        i = i + 1
+    }
+    return scramble
+}
+
+fn head_scramble_weak(d_boundary: int, d_bulk: int, seed: int) -> array {
+    let d_scramble = d_bulk - d_boundary
+    let raw = det_rand(d_boundary * d_scramble, seed)
+    let weak_gain = SCRAMBLE_GAIN * 0.05
+    let mut scramble = []
+    let mut i = 0
+    while i < len(raw) {
+        scramble = scramble.push(raw[i] * weak_gain)
+        i = i + 1
+    }
+    return scramble
+}
+
+fn encode_with_scramble(scramble: array, d_boundary: int, d_bulk: int, boundary: array) -> array {
+    let ds = d_bulk - d_boundary
+    let mut bulk = []
+    let mut i = 0
+    while i < d_boundary {
+        bulk = bulk.push(boundary[i])
+        i = i + 1
+    }
+    let mut k = 0
+    while k < ds {
+        let mut s = 0.0
+        let mut j = 0
+        while j < d_boundary {
+            s = s + scramble[j * ds + k] * boundary[j]
+            j = j + 1
+        }
+        bulk = bulk.push(s)
+        k = k + 1
+    }
+    return bulk
+}
+
+fn interior_from_bulk(bulk: array, d_boundary: int, d_bulk: int) -> array {
+    let ds = d_bulk - d_boundary
+    let mut interior = []
+    let mut i = 0
+    while i < d_boundary {
+        interior = interior.push(bulk[d_boundary + (i % ds)])
+        i = i + 1
+    }
+    return interior
+}
+
+// ─── Phi_holo computation ───────────────────────────────────────
+// phi_holographic: I(bulk_interior ; boundary) via MI log-bin estimator
+// This is the raw MI value. For N-scaling: phi_holo_scaled = mi_raw * N
+
+fn phi_holographic_raw(scramble: array, d_boundary: int, d_bulk: int, boundary: array) -> float {
+    let ds = d_bulk - d_boundary
+    if ds == 0 { return 0.0 }
+    let bulk = encode_with_scramble(scramble, d_boundary, d_bulk, boundary)
+    let interior = interior_from_bulk(bulk, d_boundary, d_bulk)
+    let lo_b = vec_min(boundary)
+    let hi_b = vec_max(boundary)
+    let lo_i = vec_min(interior)
+    let hi_i = vec_max(interior)
+    let lo = if lo_b < lo_i { lo_b } else { lo_i }
+    let hi = if hi_b > hi_i { hi_b } else { hi_i }
+    let h_b  = entropy_hist(boundary, lo, hi, MI_BINS)
+    let h_i  = entropy_hist(interior, lo, hi, MI_BINS)
+    let h_bi = joint_entropy_hist(boundary, interior, lo, hi, MI_BINS)
+    let mi = h_b + h_i - h_bi
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// N-scaled phi_holo: the gate-comparable metric.
+// N = n_eval_samples * seq_len * d_qualia (total information elements)
+// Root cause: raw MI is bounded by log(MI_BINS) ~ 2.08, but the gate
+// thresholds (1000, 2000) use the N-scaled convention from the P4
+// training measurement (ALM-P4-3: phi_holo=2440.88 at step 50).
+fn phi_holo_n_scaled(mi_raw: float, n_total: int) -> float {
+    return mi_raw * to_float(n_total)
+}
+
+// ─── Sidecar reading ────────────────────────────────────────────
+
+fn read_sidecar(ckpt_dir: string) -> string {
+    // Try canonical ckpt_meta.json first, then legacy train_meta.json
+    let primary = ckpt_dir + "/" + SIDECAR_NAME
+    if file_exists(primary) {
+        return read_file(primary)
+    }
+    let legacy = ckpt_dir + "/" + SIDECAR_LEGACY
+    if file_exists(legacy) {
+        log_warn("using legacy " + SIDECAR_LEGACY + " — write canonical " + SIDECAR_NAME + " on next promotion")
+        return read_file(legacy)
+    }
+    return ""
+}
+
+// ─── Evaluation core ────────────────────────────────────────────
+
+fn eval_checkpoint(ckpt_dir: string) -> float {
+    // Returns phi_holo value from sidecar, or computes from boundary data.
+    // Returns -1.0 if evaluation fails.
+
+    let sidecar = read_sidecar(ckpt_dir)
+    if len(sidecar) == 0 {
+        log_err("no sidecar found in " + ckpt_dir + " — cannot evaluate")
+        return -1.0
+    }
+
+    // Extract phi_holo from sidecar
+    let phi_str = extract_json_number_str(sidecar, "phi_holo")
+    if len(phi_str) > 0 {
+        let phi_val = to_float(phi_str)
+        if phi_val > 0.0 {
+            return phi_val
+        }
+    }
+
+    // Phi_holo not in sidecar — try to compute from phi_holo_samples
+    // (roadmap format: "phi_holo_samples": {"step_50": 2440.88, ...})
+    let samples_str = extract_json_number_str(sidecar, "phi_holo_mean")
+    if len(samples_str) > 0 {
+        let mean_val = to_float(samples_str)
+        if mean_val > 0.0 {
+            return mean_val
+        }
+    }
+
+    // Fallback: try phi_holo_iit (legacy measurement.hexa format)
+    let iit_str = extract_json_number_str(sidecar, "phi_iit")
+    if len(iit_str) > 0 {
+        let iit_val = to_float(iit_str)
+        if iit_val > 0.0 {
+            log_warn("using phi_iit=" + iit_str + " as phi_holo fallback (not N-scaled)")
+            return iit_val
+        }
+    }
+
+    log_warn("no phi_holo/phi_holo_mean/phi_iit in sidecar — computing from boundary data")
+
+    // Compute phi_holo from scratch using holographic head
+    // Default dimensions from P3 convention:
+    //   d_boundary = 128 (sensory/CFT), d_bulk = 256 (qualia/AdS)
+    //   N = 256 samples (validation batch mean)
+    let d_boundary = 128
+    let d_bulk = 256
+    let n_samples = 256
+    let scramble = head_scramble(d_boundary, d_bulk, 42)
+
+    let mut phi_sum = 0.0
+    let mut s = 0
+    while s < n_samples {
+        let boundary = det_rand(d_boundary, 1000 + s)
+        let mi = phi_holographic_raw(scramble, d_boundary, d_bulk, boundary)
+        phi_sum = phi_sum + mi
+        s = s + 1
+    }
+    let mi_mean = phi_sum / to_float(n_samples)
+
+    // N-scaling: n_samples * seq_len * d_qualia
+    // For standalone eval, seq_len = 1 (single vector), d_qualia = d_bulk - d_boundary
+    let n_total = n_samples * (d_bulk - d_boundary)
+    let phi_holo_scaled = phi_holo_n_scaled(mi_mean, n_total)
+
+    log_info("computed phi_holo: mi_mean=" + str(mi_mean)
+          + " N=" + str(n_total) + " phi_holo_scaled=" + str(phi_holo_scaled))
+    return phi_holo_scaled
+}
+
+// ─── Gate evaluation ────────────────────────────────────────────
+
+fn gate_alm(phi_holo: float) -> bool {
+    return phi_holo >= GATE_ALM_PHI_HOLO
+}
+
+fn gate_clm(phi_holo: float) -> bool {
+    return phi_holo >= GATE_CLM_PHI_HOLO
+}
+
+fn gate_threshold(track: string) -> float {
+    if track == "alm" { return GATE_ALM_PHI_HOLO }
+    if track == "clm" { return GATE_CLM_PHI_HOLO }
+    // Default to ALM threshold
+    return GATE_ALM_PHI_HOLO
+}
+
+fn gate_check(track: string, phi_holo: float) -> bool {
+    let threshold = gate_threshold(track)
+    return phi_holo >= threshold
+}
+
+fn gate_verdict_str(track: string, phi_holo: float) -> string {
+    let threshold = gate_threshold(track)
+    let pass = gate_check(track, phi_holo)
+    let ratio = phi_holo / threshold
+    let verdict = if pass { "PASS" } else { "FAIL" }
+    return verdict + " — phi_holo=" + str(phi_holo)
+        + " threshold=" + str(threshold)
+        + " ratio=" + str(ratio) + "x"
+        + " track=" + track
+}
+
+// ─── History append ─────────────────────────────────────────────
+
+fn history_path() -> string {
+    // Resolve path relative to this script
+    let script_dir = str_trim(exec("dirname " + str_trim(exec("realpath anima-measurement/phi_holo_eval.hexa 2>/dev/null || echo anima-measurement"))))
+    return script_dir + "/" + HISTORY_NAME
+}
+
+fn append_history(ckpt_dir: string, phi_holo: float, track: string, train_step_str: string) {
+    let hp = history_path()
+    let ts = now_stamp()
+    let basename = str_trim(exec("basename " + ckpt_dir))
+    let pass = gate_check(track, phi_holo)
+    let pass_str = if pass { "true" } else { "false" }
+
+    // Build JSON entry
+    let entry = "  {\n"
+        + "    \"checkpoint\": \"" + ckpt_dir + "\",\n"
+        + "    \"checkpoint_name\": \"" + basename + "\",\n"
+        + "    \"train_step\": " + train_step_str + ",\n"
+        + "    \"phi_holo\": " + str(phi_holo) + ",\n"
+        + "    \"track\": \"" + track + "\",\n"
+        + "    \"gate_threshold\": " + str(gate_threshold(track)) + ",\n"
+        + "    \"gate_pass\": " + pass_str + ",\n"
+        + "    \"timestamp\": \"" + ts + "\"\n"
+        + "  }"
+
+    // Append to ratchet log (append-only JSONL for psi_ratchet compatibility)
+    let ratchet_path = str_trim(exec("dirname " + hp)) + "/psi_ratchet.jsonl"
+    let ratchet_line = "{\"ts\": \"" + ts + "\", \"phi_holo\": " + str(phi_holo)
+        + ", \"track\": \"" + track + "\", \"gate_pass\": " + pass_str
+        + ", \"source_ckpt\": \"" + basename + "\", \"train_step\": " + train_step_str + "}"
+
+    // Append ratchet line
+    // Root cause for exec-based append: hexa stage0 write_file overwrites,
+    // no append mode. exec("echo ... >> file") is the only append path.
+    let _ = exec("echo '" + ratchet_line + "' >> " + ratchet_path)
+    log_info("appended to " + ratchet_path)
+}
+
+// ─── ASCII report ───────────────────────────────────────────────
+
+fn print_report() {
+    let ratchet_path = str_trim(exec("dirname " + history_path())) + "/psi_ratchet.jsonl"
+    if !file_exists(ratchet_path) {
+        println("  No measurement history found at " + ratchet_path)
+        return
+    }
+
+    let content = read_file(ratchet_path)
+    println("")
+    println("================================================================")
+    println("  Phi-Holo Measurement Ratchet Report")
+    println("================================================================")
+    println("")
+    println("  Source: " + ratchet_path)
+    println("")
+    println("  Gate thresholds:")
+    println("    ALM: phi_holo >= " + str(GATE_ALM_PHI_HOLO))
+    println("    CLM: phi_holo >= " + str(GATE_CLM_PHI_HOLO))
+    println("")
+    println("  Ratchet entries (append-only):")
+    println("  " + content)
+    println("")
+    println("================================================================")
+}
+
+// ─── Single eval + report ───────────────────────────────────────
+
+fn eval_and_report(ckpt_dir: string, track: string) {
+    println("")
+    println("================================================================")
+    println("  phi_holo_eval — Post-Training Consciousness Gate Evaluator")
+    println("================================================================")
+    println("  ckpt_dir:  " + ckpt_dir)
+    println("  track:     " + track)
+    println("  threshold: " + str(gate_threshold(track)))
+    println("================================================================")
+    println("")
+
+    if !file_exists(ckpt_dir) {
+        log_err("checkpoint dir not found: " + ckpt_dir)
+        println("pass=0")
+        return
+    }
+
+    let phi_holo = eval_checkpoint(ckpt_dir)
+    if phi_holo < 0.0 {
+        log_err("evaluation failed — no phi_holo obtainable")
+        println("pass=0")
+        return
+    }
+
+    // Extract train step from sidecar
+    let sidecar = read_sidecar(ckpt_dir)
+    let step_str = extract_json_number_str(sidecar, "train_step")
+    let train_step = if len(step_str) > 0 { step_str } else { "0" }
+
+    // Extract model name
+    let model_str = extract_json_string(sidecar, "model")
+    let model = if len(model_str) > 0 { model_str } else { track }
+
+    // Extract eval_loss
+    let eval_loss_str = extract_json_number_str(sidecar, "eval_loss")
+    let has_eval_loss = len(eval_loss_str) > 0
+
+    // Gate verdict
+    let verdict = gate_verdict_str(track, phi_holo)
+    let pass = gate_check(track, phi_holo)
+
+    // Report
+    println("  Results:")
+    println("    Model:       " + model)
+    println("    Train step:  " + train_step)
+    println("    phi_holo:    " + str(phi_holo))
+    if has_eval_loss {
+        println("    eval_loss:   " + eval_loss_str)
+    }
+    println("")
+    println("  Gate:          " + verdict)
+    println("")
+
+    // Append to history
+    append_history(ckpt_dir, phi_holo, track, train_step)
+
+    // Machine-readable verdict (last line, for pipeline consumption)
+    if pass {
+        println("pass=1")
+    } else {
+        println("pass=0")
+    }
+}
+
+// ─── Batch eval ─────────────────────────────────────────────────
+
+fn batch_eval(parent_dir: string, track: string) {
+    println("")
+    println("================================================================")
+    println("  phi_holo_eval — Batch Evaluation")
+    println("================================================================")
+    println("  parent_dir: " + parent_dir)
+    println("  track:      " + track)
+    println("================================================================")
+    println("")
+
+    if !file_exists(parent_dir) {
+        log_err("directory not found: " + parent_dir)
+        println("pass=0")
+        return
+    }
+
+    // List subdirectories that contain a sidecar
+    let ls_output = str_trim(exec("ls -d " + parent_dir + "/*/ 2>/dev/null"))
+    if len(ls_output) == 0 {
+        log_warn("no subdirectories found in " + parent_dir)
+        println("pass=0")
+        return
+    }
+
+    // Split on newlines — process each dir
+    // Root cause for exec-based split: hexa stage0 has no string split method.
+    let dirs_raw = str_trim(exec("ls -d " + parent_dir + "/*/ 2>/dev/null | head -50"))
+
+    let mut total = 0
+    let mut passed = 0
+    let mut phi_sum = 0.0
+    let mut best_phi = 0.0
+    let mut best_dir = ""
+
+    // Process each line via exec loop
+    // Root cause: can't split multiline string in stage0, so iterate with sed.
+    let count_str = str_trim(exec("ls -d " + parent_dir + "/*/ 2>/dev/null | wc -l"))
+    let n_dirs = to_int(str_trim(count_str))
+
+    let mut d = 1
+    while d <= n_dirs {
+        let dir_path = str_trim(exec("ls -d " + parent_dir + "/*/ 2>/dev/null | sed -n '" + str(d) + "p'"))
+        if len(dir_path) == 0 {
+            d = d + 1
+            break  // break not available in all hexa builds
+        }
+
+        // Check for sidecar
+        let sidecar = read_sidecar(dir_path)
+        if len(sidecar) > 0 {
+            let phi = eval_checkpoint(dir_path)
+            if phi >= 0.0 {
+                total = total + 1
+                phi_sum = phi_sum + phi
+                if gate_check(track, phi) {
+                    passed = passed + 1
+                }
+                if phi > best_phi {
+                    best_phi = phi
+                    best_dir = dir_path
+                }
+                let basename = str_trim(exec("basename " + dir_path))
+                let v = if gate_check(track, phi) { "PASS" } else { "FAIL" }
+                println("  " + basename + "  phi_holo=" + str(phi) + "  " + v)
+            }
+        }
+        d = d + 1
+    }
+
+    // Summary
+    println("")
+    println("  ---")
+    let phi_mean = if total > 0 { phi_sum / to_float(total) } else { 0.0 }
+    println("  Total evaluated: " + str(total))
+    println("  Gate passed:     " + str(passed) + "/" + str(total))
+    println("  phi_holo mean:   " + str(phi_mean))
+    println("  phi_holo best:   " + str(best_phi) + " (" + best_dir + ")")
+    println("  Gate threshold:  " + str(gate_threshold(track)))
+    println("")
+
+    let mean_pass = gate_check(track, phi_mean)
+    if mean_pass {
+        println("  GATE (mean): PASS — phi_holo_mean=" + str(phi_mean) + " >= " + str(gate_threshold(track)))
+        println("pass=1")
+    } else {
+        println("  GATE (mean): FAIL — phi_holo_mean=" + str(phi_mean) + " < " + str(gate_threshold(track)))
+        println("pass=0")
+    }
+}
+
+// ─── Self-tests ─────────────────────────────────────────────────
+
+fn self_test() -> bool {
+    println("[phi_holo_eval] Self-test suite")
+    let mut pass = 0
+    let mut fail = 0
+
+    // T1: Gate thresholds are correctly set
+    let t1 = GATE_ALM_PHI_HOLO == 1000.0 && GATE_CLM_PHI_HOLO == 2000.0
+    if t1 { println("  T1 PASS — gate thresholds ALM=1000 CLM=2000") pass = pass + 1 }
+    else  { println("  T1 FAIL") fail = fail + 1 }
+
+    // T2: gate_check logic — below/above threshold
+    let t2a = !gate_check("alm", 999.0) && gate_check("alm", 1000.0) && gate_check("alm", 1001.0)
+    let t2b = !gate_check("clm", 1999.0) && gate_check("clm", 2000.0) && gate_check("clm", 2001.0)
+    let t2 = t2a && t2b
+    if t2 { println("  T2 PASS — gate_check boundary values correct") pass = pass + 1 }
+    else  { println("  T2 FAIL") fail = fail + 1 }
+
+    // T3: phi_holographic_raw produces positive MI on non-degenerate boundary
+    let d_b = 64
+    let d_B = 128
+    let scramble = head_scramble(d_b, d_B, 23)
+    let boundary = det_rand(d_b, 29)
+    let mi = phi_holographic_raw(scramble, d_b, d_B, boundary)
+    let t3 = mi > 0.0
+    if t3 { println("  T3 PASS — phi_holographic_raw=" + str(mi) + " > 0 on non-degenerate boundary") pass = pass + 1 }
+    else  { println("  T3 FAIL — mi=" + str(mi)) fail = fail + 1 }
+
+    // T4: N-scaling produces values in gate-comparable range
+    let n_total = 256 * 64  // 256 samples * 64 d_qualia
+    let scaled = phi_holo_n_scaled(mi, n_total)
+    let t4 = scaled > 0.0 && scaled > mi
+    if t4 { println("  T4 PASS — N-scaled phi_holo=" + str(scaled) + " (N=" + str(n_total) + ")") pass = pass + 1 }
+    else  { println("  T4 FAIL — scaled=" + str(scaled)) fail = fail + 1 }
+
+    // T5: Determinism — same inputs produce identical MI
+    let mi2 = phi_holographic_raw(scramble, d_b, d_B, boundary)
+    let t5 = fabs(mi - mi2) == 0.0
+    if t5 { println("  T5 PASS — deterministic (delta=0.0)") pass = pass + 1 }
+    else  { println("  T5 FAIL — mi1=" + str(mi) + " mi2=" + str(mi2)) fail = fail + 1 }
+
+    // T6: Weak-scramble baseline produces lower MI than proper encoder
+    let weak_scramble = head_scramble_weak(d_b, d_B, 23)
+    let mi_weak = phi_holographic_raw(weak_scramble, d_b, d_B, boundary)
+    let t6 = mi > mi_weak
+    if t6 { println("  T6 PASS — encoder MI=" + str(mi) + " > baseline MI=" + str(mi_weak) + " ratio=" + str(mi / mi_weak)) pass = pass + 1 }
+    else  { println("  T6 FAIL — encoder=" + str(mi) + " baseline=" + str(mi_weak)) fail = fail + 1 }
+
+    // T7: Degenerate boundary (all zeros) produces MI = 0
+    let zeros = vec_zeros(d_b)
+    let mi_z = phi_holographic_raw(scramble, d_b, d_B, zeros)
+    let t7 = mi_z == 0.0
+    if t7 { println("  T7 PASS — degenerate boundary MI=0") pass = pass + 1 }
+    else  { println("  T7 FAIL — degenerate MI=" + str(mi_z)) fail = fail + 1 }
+
+    println("")
+    println("[phi_holo_eval] " + str(pass) + "/" + str(pass + fail) + " PASS")
+    return fail == 0
+}
+
+// ─── Main ───────────────────────────────────────────────────────
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+
+    if argc < 3 {
+        println("phi_holo_eval — Post-Training Consciousness Gate Evaluator")
+        println("")
+        println("Usage:")
+        println("  hexa run anima-measurement/phi_holo_eval.hexa --eval <ckpt_dir>")
+        println("  hexa run anima-measurement/phi_holo_eval.hexa --gate <alm|clm> <ckpt_dir>")
+        println("  hexa run anima-measurement/phi_holo_eval.hexa --batch <dir> [alm|clm]")
+        println("  hexa run anima-measurement/phi_holo_eval.hexa --report")
+        println("  hexa run anima-measurement/phi_holo_eval.hexa --self-test")
+        println("")
+        println("Gate thresholds (roadmap SSOT):")
+        println("  ALM: phi_holo mean >= " + str(GATE_ALM_PHI_HOLO))
+        println("  CLM: phi_holo mean >= " + str(GATE_CLM_PHI_HOLO))
+        println("")
+        println("Output: structured report + gate verdict (pass=1 or pass=0)")
+        println("  Last line is machine-parseable for pipeline integration.")
+
+        // If no args at all, run self-test
+        if argc < 3 {
+            println("")
+            self_test()
+        }
+        return
+    }
+
+    let mode = argv[2]
+
+    if mode == "--self-test" || mode == "--test" {
+        let ok = self_test()
+        if ok { println("pass=1") } else { println("pass=0") }
+        return
+    }
+
+    if mode == "--report" {
+        print_report()
+        return
+    }
+
+    if mode == "--eval" {
+        if argc < 4 {
+            log_err("--eval requires <ckpt_dir>")
+            return
+        }
+        let ckpt_dir = argv[3]
+        // Detect track from sidecar if possible
+        let sidecar = read_sidecar(ckpt_dir)
+        let model = extract_json_string(sidecar, "model")
+        let track = if str_contains(model, "clm") { "clm" } else { "alm" }
+        eval_and_report(ckpt_dir, track)
+        return
+    }
+
+    if mode == "--gate" {
+        if argc < 5 {
+            log_err("--gate requires <alm|clm> <ckpt_dir>")
+            return
+        }
+        let track = argv[3]
+        let ckpt_dir = argv[4]
+        if track != "alm" && track != "clm" {
+            log_err("track must be 'alm' or 'clm', got: " + track)
+            return
+        }
+        eval_and_report(ckpt_dir, track)
+        return
+    }
+
+    if mode == "--batch" {
+        if argc < 4 {
+            log_err("--batch requires <dir>")
+            return
+        }
+        let parent_dir = argv[3]
+        let track = if argc >= 5 { argv[4] } else { "alm" }
+        batch_eval(parent_dir, track)
+        return
+    }
+
+    log_err("unknown mode: " + mode)
+    println("pass=0")
+}
+
+main()

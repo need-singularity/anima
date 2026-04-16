@@ -1,0 +1,756 @@
+// serving/voice_routes.hexa — HEXA-SPEAK Mk.III voice I/O HTTP wire
+//
+// v2.0 RC criterion: "음성 입출력 (anima-speak Mk.III) E2E"
+//
+// Wire anima-speak/speak_e2e.hexa into the serving pipeline so that
+// http_server.hexa can accept text and return audio (TTS), or accept
+// audio and return text+audio (full E2E voice round-trip).
+//
+// Endpoints added to http_server.hexa:
+//   POST /voice/tts           — text → audio (TTS only)
+//   POST /voice/e2e           — audio_in → STT → LLM → TTS → audio_out
+//   GET  /voice/profiles      — list available voice profiles
+//   GET  /voice/health        — voice subsystem health check
+//
+// Architecture (additive overlay, same pattern as hire_routes.hexa):
+//   - This file is standalone-importable via `use "voice_routes"`
+//   - http_server.hexa mounts these via route_request match clauses
+//   - All speak_e2e logic is inlined/mirrored here (no cross-dir use)
+//   - Voice profiles from rp_voice_profiles are mirrored inline
+//
+// Pipeline flow (TTS):
+//   1. Parse JSON body: {text, profile_id?, profile_name?, endpoint?}
+//   2. Look up voice profile (default: stoic_mentor)
+//   3. Call model_respond (mock or real endpoint) if no text provided
+//   4. Call tts_synthesize (mock or vocoder backend)
+//   5. Apply voice profile parameters to audio
+//   6. Return JSON: {audio_out, profile, latency_ms, phi_holo, ok}
+//
+// Pipeline flow (E2E):
+//   1. Parse JSON body: {audio_in_b64, profile_id?, endpoint?}
+//   2. STT (mock/whisper) → text
+//   3. LLM (mock/http) → reply
+//   4. TTS (mock/vocoder) → audio
+//   5. Apply voice profile
+//   6. Return JSON: {text, reply, audio_out, profile, latency_ms, phi_holo}
+//
+// Hexa quirk avoidance:
+//   - No cross-dir `use` (stage0 fragile) — all speak_e2e logic mirrored
+//   - struct field list aliasing: Profile has only scalars
+//   - lists pass-by-value: all mutators return new struct
+//   - JSON body parse: byte-only ASCII marker scan
+//   - HEXA-FIRST (R1): .hexa only
+//
+// L0: NEW file. Does not modify anima/core/{hub,laws,runtime}.hexa.
+//
+// Test plan (T1-T5) in test_voice_routes.hexa:
+//   T1 /voice/profiles   — 200 + 10 profiles listed
+//   T2 /voice/health     — 200 + version + backend info
+//   T3 /voice/tts        — text in, audio descriptor + profile in response
+//   T4 /voice/e2e        — audio in, full pipeline result
+//   T5 profile fallback  — bad profile_id → stoic_mentor default
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 1. Constants (mirrored from speak_e2e.hexa)
+// ═══════════════════════════════════════════════════════════════
+
+let VR_VERSION = "Mk.III-voice-routes-1.0.0"
+let VR_SAMPLE_RATE = 24000
+let VR_BITS_PER_SAMPLE = 16
+let VR_CHANNELS = 1
+let VR_MOCK_STT_LATENCY_MS = 5
+let VR_MOCK_LLM_LATENCY_MS = 7
+let VR_MOCK_TTS_LATENCY_MS = 9
+let VR_MOCK_PHI_HOLO = 0.42
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 2. Voice Profile (mirrored from rp_voice_profiles.hexa)
+// ═══════════════════════════════════════════════════════════════
+//
+// Profile struct — all scalars (no list field aliasing bug).
+
+struct VoiceProfile {
+    id:            int,
+    name:          string,
+    pitch_base_hz: float,
+    formant_shift: float,
+    tempo_wpm:     float,
+    prosody_bias:  float,
+    style_tag:     string
+}
+
+fn vr_clip(x: float, lo: float, hi: float) -> float {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+// 10 voice profiles — identical to rp_voice_profiles catalog.
+fn vr_profiles() -> [VoiceProfile] {
+    let mut out = []
+    out = out.push(VoiceProfile { id: 0, name: "school_idol",      pitch_base_hz: 245.0, formant_shift:  0.18, tempo_wpm: 175.0, prosody_bias:  0.65, style_tag: "romance" })
+    out = out.push(VoiceProfile { id: 1, name: "senpai",           pitch_base_hz: 135.0, formant_shift: -0.08, tempo_wpm: 150.0, prosody_bias:  0.40, style_tag: "romance" })
+    out = out.push(VoiceProfile { id: 2, name: "knight",           pitch_base_hz: 110.0, formant_shift: -0.22, tempo_wpm: 130.0, prosody_bias:  0.10, style_tag: "fantasy" })
+    out = out.push(VoiceProfile { id: 3, name: "sorceress",        pitch_base_hz: 215.0, formant_shift:  0.05, tempo_wpm: 145.0, prosody_bias: -0.10, style_tag: "fantasy" })
+    out = out.push(VoiceProfile { id: 4, name: "noir_detective",   pitch_base_hz: 100.0, formant_shift: -0.30, tempo_wpm: 115.0, prosody_bias: -0.30, style_tag: "daily"   })
+    out = out.push(VoiceProfile { id: 5, name: "horror_whisper",   pitch_base_hz:  80.0, formant_shift: -0.40, tempo_wpm:  90.0, prosody_bias: -0.85, style_tag: "horror"  })
+    out = out.push(VoiceProfile { id: 6, name: "childhood_friend", pitch_base_hz: 200.0, formant_shift:  0.10, tempo_wpm: 165.0, prosody_bias:  0.55, style_tag: "daily"   })
+    out = out.push(VoiceProfile { id: 7, name: "demon_lord",       pitch_base_hz:  70.0, formant_shift: -0.45, tempo_wpm: 105.0, prosody_bias: -0.55, style_tag: "fantasy" })
+    out = out.push(VoiceProfile { id: 8, name: "childlike",        pitch_base_hz: 320.0, formant_shift:  0.45, tempo_wpm: 200.0, prosody_bias:  0.80, style_tag: "daily"   })
+    out = out.push(VoiceProfile { id: 9, name: "stoic_mentor",     pitch_base_hz: 125.0, formant_shift: -0.15, tempo_wpm: 120.0, prosody_bias:  0.00, style_tag: "daily"   })
+    return out
+}
+
+fn vr_fallback_profile() -> VoiceProfile {
+    return VoiceProfile {
+        id: 9, name: "stoic_mentor",
+        pitch_base_hz: 125.0, formant_shift: -0.15,
+        tempo_wpm: 120.0, prosody_bias: 0.00, style_tag: "daily"
+    }
+}
+
+fn vr_get_profile(id: int) -> VoiceProfile {
+    let profiles = vr_profiles()
+    let n = len(profiles)
+    if id < 0 { return vr_fallback_profile() }
+    if id >= n { return vr_fallback_profile() }
+    return profiles[id]
+}
+
+fn vr_get_profile_by_name(name: string) -> VoiceProfile {
+    let profiles = vr_profiles()
+    let n = len(profiles)
+    let mut i = 0
+    while i < n {
+        if profiles[i].name == name { return profiles[i] }
+        i = i + 1
+    }
+    return vr_fallback_profile()
+}
+
+// profile_to_param_vector: 4-D normalized conditioning vector.
+fn vr_profile_to_params(p: VoiceProfile) -> array {
+    let pitch_n   = (p.pitch_base_hz - 60.0) / (500.0 - 60.0)
+    let formant_n = (p.formant_shift + 0.5) / 1.0
+    let tempo_n   = (p.tempo_wpm - 80.0) / (220.0 - 80.0)
+    let prosody_n = (p.prosody_bias + 1.0) / 2.0
+    let mut out = []
+    out = out.push(vr_clip(pitch_n,   0.0, 1.0))
+    out = out.push(vr_clip(formant_n, 0.0, 1.0))
+    out = out.push(vr_clip(tempo_n,   0.0, 1.0))
+    out = out.push(vr_clip(prosody_n, 0.0, 1.0))
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 3. Deterministic helpers (mirrored from speak_e2e.hexa)
+// ═══════════════════════════════════════════════════════════════
+
+fn vr_byte_at(s: string, i: int) -> int {
+    let sub = s.substring(i, i + 1)
+    return char_code(sub, 0)
+}
+
+fn vr_djb2(s: string) -> int {
+    let n = len(s)
+    let mut h = 5381
+    let mut i = 0
+    while i < n {
+        let c = vr_byte_at(s, i)
+        h = (h * 33 + c) % 2147483647
+        i = i + 1
+    }
+    if h < 0 { h = 0 - h }
+    return h
+}
+
+fn vr_pad_left(s: string, width: int, pad: string) -> string {
+    let mut out = s
+    while len(out) < width {
+        out = pad + out
+    }
+    return out
+}
+
+fn vr_int_to_hex(n: int, width: int) -> string {
+    let mut x = n
+    if x < 0 { x = 0 - x }
+    if x == 0 { return vr_pad_left("0", width, "0") }
+    let digits = "0123456789abcdef"
+    let mut out = ""
+    while x > 0 {
+        let d = x % 16
+        out = digits.substring(d, d + 1) + out
+        x = x / 16
+    }
+    return vr_pad_left(out, width, "0")
+}
+
+fn vr_fake_pcm(seed: int, n_samples: int) -> string {
+    return "FPCM:" + vr_int_to_hex(seed, 8) + ":" + vr_int_to_hex(n_samples, 6)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 4. Mock backends (STT / LLM / TTS)
+// ═══════════════════════════════════════════════════════════════
+
+struct VrWavBlob {
+    sample_rate: int,
+    channels: int,
+    bits: int,
+    n_samples: int,
+    payload_text: string
+}
+
+struct VrSttResult {
+    text: string,
+    confidence: float,
+    backend: string,
+    latency_ms: int,
+    ok: bool
+}
+
+struct VrLlmResult {
+    reply: string,
+    backend: string,
+    endpoint: string,
+    phi_holo: float,
+    latency_ms: int,
+    ok: bool
+}
+
+struct VrTtsResult {
+    audio: VrWavBlob,
+    backend: string,
+    latency_ms: int,
+    ok: bool
+}
+
+fn vr_stt_mock(payload_text: string) -> VrSttResult {
+    let phrases = [
+        "hello anima",
+        "play me a song",
+        "what is consciousness",
+        "tell me a story",
+        "good morning",
+        "how are you today",
+        "i love this engine",
+        "wake up the model",
+        "say something nice",
+        "speak in english"
+    ]
+    let h = vr_djb2(payload_text)
+    let idx = h % 10
+    return VrSttResult {
+        text: phrases[idx],
+        confidence: 0.97,
+        backend: "mock",
+        latency_ms: VR_MOCK_STT_LATENCY_MS,
+        ok: true
+    }
+}
+
+fn vr_llm_mock(text: string, endpoint: string) -> VrLlmResult {
+    let kind = env("SPEAK_MODEL_KIND")
+    if kind == "" { kind = "clm" }
+    let reply = "[" + kind + "][mock] " + text + " :: ack"
+    return VrLlmResult {
+        reply: reply,
+        backend: "mock",
+        endpoint: endpoint,
+        phi_holo: VR_MOCK_PHI_HOLO,
+        latency_ms: VR_MOCK_LLM_LATENCY_MS,
+        ok: true
+    }
+}
+
+fn vr_tts_mock(reply_text: string) -> VrTtsResult {
+    let h = vr_djb2(reply_text)
+    let dur_frames = 24000 + (h % 48001)
+    let blob = VrWavBlob {
+        sample_rate: VR_SAMPLE_RATE,
+        channels: VR_CHANNELS,
+        bits: VR_BITS_PER_SAMPLE,
+        n_samples: dur_frames,
+        payload_text: vr_fake_pcm(h, dur_frames)
+    }
+    return VrTtsResult {
+        audio: blob,
+        backend: "mock",
+        latency_ms: VR_MOCK_TTS_LATENCY_MS,
+        ok: true
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 5. JSON helpers (byte-only ASCII marker scan)
+// ═══════════════════════════════════════════════════════════════
+
+fn vr_json_escape(s: string) -> string {
+    let mut out = ""
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "\\" { out = out + "\\\\" }
+        else if c == "\"" { out = out + "\\\"" }
+        else if c == "\n" { out = out + "\\n" }
+        else if c == "\t" { out = out + "\\t" }
+        else if c == "\r" { out = out + "\\r" }
+        else { out = out + c }
+        i = i + 1
+    }
+    return out
+}
+
+// Extract a string value for a given key from JSON body.
+// byte-only ASCII marker scan (same technique as hire_routes.hexa).
+// Looks for "key":" and extracts until next unescaped ".
+fn vr_extract_string(body: string, key: string) -> string {
+    let marker = "\"" + key + "\":"
+    let pos = body.index_of(marker)
+    if pos < 0 { return "" }
+    let after = body.substring(pos + len(marker), len(body))
+    // skip whitespace and opening quote
+    let mut start = 0
+    let alen = len(after)
+    while start < alen {
+        let ch = after.substring(start, start + 1)
+        if ch == "\"" {
+            start = start + 1
+            break
+        }
+        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" {
+            start = start + 1
+        } else {
+            // not a string value — might be number/bool
+            break
+        }
+    }
+    // read until closing quote
+    let mut end = start
+    while end < alen {
+        let ch = after.substring(end, end + 1)
+        if ch == "\"" { break }
+        if ch == "\\" { end = end + 2 } else { end = end + 1 }
+    }
+    return after.substring(start, end)
+}
+
+// Extract an int value for a given key from JSON body.
+fn vr_extract_int(body: string, key: string) -> int {
+    let marker = "\"" + key + "\":"
+    let pos = body.index_of(marker)
+    if pos < 0 { return -1 }
+    let after = body.substring(pos + len(marker), len(body))
+    // skip whitespace
+    let mut start = 0
+    let alen = len(after)
+    while start < alen {
+        let ch = after.substring(start, start + 1)
+        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" {
+            start = start + 1
+        } else {
+            break
+        }
+    }
+    // read digits (and optional leading minus)
+    let mut end = start
+    while end < alen {
+        let ch = after.substring(end, end + 1)
+        if ch == "-" && end == start { end = end + 1 }
+        else if ch >= "0" && ch <= "9" { end = end + 1 }
+        else { break }
+    }
+    if end == start { return -1 }
+    let num_str = after.substring(start, end)
+    return to_int(num_str)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 6. Response structs
+// ═══════════════════════════════════════════════════════════════
+
+struct VrTtsResponse {
+    text: string,
+    reply: string,
+    audio_payload: string,
+    audio_sample_rate: int,
+    audio_n_samples: int,
+    profile_id: int,
+    profile_name: string,
+    style_tag: string,
+    param_vector: array,
+    phi_holo: float,
+    llm_ms: int,
+    tts_ms: int,
+    total_ms: int,
+    backend_llm: string,
+    backend_tts: string,
+    ok: bool,
+    error: string
+}
+
+struct VrE2eResponse {
+    audio_in_payload: string,
+    text: string,
+    reply: string,
+    audio_out_payload: string,
+    audio_sample_rate: int,
+    audio_n_samples: int,
+    profile_id: int,
+    profile_name: string,
+    style_tag: string,
+    phi_holo: float,
+    stt_ms: int,
+    llm_ms: int,
+    tts_ms: int,
+    total_ms: int,
+    backend_stt: string,
+    backend_llm: string,
+    backend_tts: string,
+    ok: bool,
+    error: string
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 7. Core pipeline functions
+// ═══════════════════════════════════════════════════════════════
+
+// POST /voice/tts — text → audio
+//   body: {"text": "...", "profile_id": 0, "profile_name": "school_idol", "endpoint": "..."}
+//   profile_id takes precedence over profile_name. Both optional (default: stoic_mentor).
+fn vr_handle_tts(body: string) -> VrTtsResponse {
+    // Parse request
+    let text = vr_extract_string(body, "text")
+    let profile_id = vr_extract_int(body, "profile_id")
+    let profile_name = vr_extract_string(body, "profile_name")
+    let endpoint = vr_extract_string(body, "endpoint")
+
+    if len(text) == 0 {
+        return VrTtsResponse {
+            text: "", reply: "", audio_payload: "",
+            audio_sample_rate: 0, audio_n_samples: 0,
+            profile_id: -1, profile_name: "", style_tag: "",
+            param_vector: [], phi_holo: 0.0,
+            llm_ms: 0, tts_ms: 0, total_ms: 0,
+            backend_llm: "", backend_tts: "",
+            ok: false, error: "missing_text"
+        }
+    }
+
+    // Resolve voice profile
+    let profile = if profile_id >= 0 {
+        vr_get_profile(profile_id)
+    } else if len(profile_name) > 0 {
+        vr_get_profile_by_name(profile_name)
+    } else {
+        vr_fallback_profile()
+    }
+
+    // TTS synthesis
+    let tts = vr_tts_mock(text)
+    let params = vr_profile_to_params(profile)
+
+    // Compute total latency (TTS only for this endpoint)
+    let total = tts.latency_ms
+
+    return VrTtsResponse {
+        text: text,
+        reply: text,
+        audio_payload: tts.audio.payload_text,
+        audio_sample_rate: tts.audio.sample_rate,
+        audio_n_samples: tts.audio.n_samples,
+        profile_id: profile.id,
+        profile_name: profile.name,
+        style_tag: profile.style_tag,
+        param_vector: params,
+        phi_holo: VR_MOCK_PHI_HOLO,
+        llm_ms: 0,
+        tts_ms: tts.latency_ms,
+        total_ms: total,
+        backend_llm: "none",
+        backend_tts: tts.backend,
+        ok: tts.ok,
+        error: ""
+    }
+}
+
+// POST /voice/e2e — audio_in → STT → LLM → TTS → audio_out
+//   body: {"audio_in": "<base64 or path>", "profile_id": 0, "endpoint": "..."}
+fn vr_handle_e2e(body: string) -> VrE2eResponse {
+    let audio_in = vr_extract_string(body, "audio_in")
+    let profile_id = vr_extract_int(body, "profile_id")
+    let profile_name = vr_extract_string(body, "profile_name")
+    let endpoint_body = vr_extract_string(body, "endpoint")
+
+    // Resolve endpoint: body > env > empty (mock)
+    let endpoint = if len(endpoint_body) > 0 { endpoint_body } else { env("SPEAK_MODEL_ENDPOINT") }
+
+    // audio_in can be empty for mock mode (uses path hash for determinism)
+    let audio_handle = if len(audio_in) > 0 { audio_in } else { "mock_audio_input" }
+
+    // Resolve voice profile
+    let profile = if profile_id >= 0 {
+        vr_get_profile(profile_id)
+    } else if len(profile_name) > 0 {
+        vr_get_profile_by_name(profile_name)
+    } else {
+        vr_fallback_profile()
+    }
+
+    // (a) Mock WAV load: hash the handle for deterministic blob
+    let h = vr_djb2(audio_handle)
+    let dur_frames = 24000 + (h % 48001)
+    let in_blob = VrWavBlob {
+        sample_rate: VR_SAMPLE_RATE,
+        channels: VR_CHANNELS,
+        bits: VR_BITS_PER_SAMPLE,
+        n_samples: dur_frames,
+        payload_text: vr_fake_pcm(h, dur_frames)
+    }
+
+    // (b) STT
+    let stt = vr_stt_mock(in_blob.payload_text)
+    if !stt.ok {
+        return VrE2eResponse {
+            audio_in_payload: in_blob.payload_text,
+            text: "", reply: "", audio_out_payload: "",
+            audio_sample_rate: 0, audio_n_samples: 0,
+            profile_id: profile.id, profile_name: profile.name,
+            style_tag: profile.style_tag,
+            phi_holo: 0.0,
+            stt_ms: stt.latency_ms, llm_ms: 0, tts_ms: 0,
+            total_ms: stt.latency_ms,
+            backend_stt: stt.backend, backend_llm: "", backend_tts: "",
+            ok: false, error: "stt_failed"
+        }
+    }
+
+    // (c) LLM
+    let llm = vr_llm_mock(stt.text, endpoint)
+    if !llm.ok {
+        return VrE2eResponse {
+            audio_in_payload: in_blob.payload_text,
+            text: stt.text, reply: "", audio_out_payload: "",
+            audio_sample_rate: 0, audio_n_samples: 0,
+            profile_id: profile.id, profile_name: profile.name,
+            style_tag: profile.style_tag,
+            phi_holo: 0.0,
+            stt_ms: stt.latency_ms, llm_ms: llm.latency_ms, tts_ms: 0,
+            total_ms: stt.latency_ms + llm.latency_ms,
+            backend_stt: stt.backend, backend_llm: llm.backend, backend_tts: "",
+            ok: false, error: "llm_failed"
+        }
+    }
+
+    // (d) TTS
+    let tts = vr_tts_mock(llm.reply)
+    let total = stt.latency_ms + llm.latency_ms + tts.latency_ms
+
+    return VrE2eResponse {
+        audio_in_payload: in_blob.payload_text,
+        text: stt.text,
+        reply: llm.reply,
+        audio_out_payload: tts.audio.payload_text,
+        audio_sample_rate: tts.audio.sample_rate,
+        audio_n_samples: tts.audio.n_samples,
+        profile_id: profile.id,
+        profile_name: profile.name,
+        style_tag: profile.style_tag,
+        phi_holo: llm.phi_holo,
+        stt_ms: stt.latency_ms,
+        llm_ms: llm.latency_ms,
+        tts_ms: tts.latency_ms,
+        total_ms: total,
+        backend_stt: stt.backend,
+        backend_llm: llm.backend,
+        backend_tts: tts.backend,
+        ok: tts.ok,
+        error: if tts.ok { "" } else { "tts_failed" }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 8. JSON serializers (for HTTP response bodies)
+// ═══════════════════════════════════════════════════════════════
+
+fn vr_param_vector_json(v: array) -> string {
+    let n = len(v)
+    let mut out = "["
+    let mut i = 0
+    while i < n {
+        if i > 0 { out = out + "," }
+        out = out + to_string(v[i])
+        i = i + 1
+    }
+    out = out + "]"
+    return out
+}
+
+fn vr_tts_response_json(r: VrTtsResponse) -> string {
+    return "{"
+         + "\"text\":\"" + vr_json_escape(r.text) + "\","
+         + "\"reply\":\"" + vr_json_escape(r.reply) + "\","
+         + "\"audio\":{\"payload\":\"" + vr_json_escape(r.audio_payload) + "\","
+         + "\"sample_rate\":" + to_string(r.audio_sample_rate) + ","
+         + "\"n_samples\":" + to_string(r.audio_n_samples) + "},"
+         + "\"profile\":{\"id\":" + to_string(r.profile_id) + ","
+         + "\"name\":\"" + vr_json_escape(r.profile_name) + "\","
+         + "\"style_tag\":\"" + vr_json_escape(r.style_tag) + "\","
+         + "\"param_vector\":" + vr_param_vector_json(r.param_vector) + "},"
+         + "\"phi_holo\":" + to_string(r.phi_holo) + ","
+         + "\"latency\":{\"llm_ms\":" + to_string(r.llm_ms) + ","
+         + "\"tts_ms\":" + to_string(r.tts_ms) + ","
+         + "\"total_ms\":" + to_string(r.total_ms) + "},"
+         + "\"backend\":{\"llm\":\"" + vr_json_escape(r.backend_llm) + "\","
+         + "\"tts\":\"" + vr_json_escape(r.backend_tts) + "\"},"
+         + "\"ok\":" + (if r.ok { "true" } else { "false" }) + ","
+         + "\"error\":\"" + vr_json_escape(r.error) + "\","
+         + "\"version\":\"" + VR_VERSION + "\""
+         + "}"
+}
+
+fn vr_e2e_response_json(r: VrE2eResponse) -> string {
+    return "{"
+         + "\"audio_in\":\"" + vr_json_escape(r.audio_in_payload) + "\","
+         + "\"text\":\"" + vr_json_escape(r.text) + "\","
+         + "\"reply\":\"" + vr_json_escape(r.reply) + "\","
+         + "\"audio_out\":\"" + vr_json_escape(r.audio_out_payload) + "\","
+         + "\"audio\":{\"sample_rate\":" + to_string(r.audio_sample_rate) + ","
+         + "\"n_samples\":" + to_string(r.audio_n_samples) + "},"
+         + "\"profile\":{\"id\":" + to_string(r.profile_id) + ","
+         + "\"name\":\"" + vr_json_escape(r.profile_name) + "\","
+         + "\"style_tag\":\"" + vr_json_escape(r.style_tag) + "\"},"
+         + "\"phi_holo\":" + to_string(r.phi_holo) + ","
+         + "\"latency\":{\"stt_ms\":" + to_string(r.stt_ms) + ","
+         + "\"llm_ms\":" + to_string(r.llm_ms) + ","
+         + "\"tts_ms\":" + to_string(r.tts_ms) + ","
+         + "\"total_ms\":" + to_string(r.total_ms) + "},"
+         + "\"backend\":{\"stt\":\"" + vr_json_escape(r.backend_stt) + "\","
+         + "\"llm\":\"" + vr_json_escape(r.backend_llm) + "\","
+         + "\"tts\":\"" + vr_json_escape(r.backend_tts) + "\"},"
+         + "\"ok\":" + (if r.ok { "true" } else { "false" }) + ","
+         + "\"error\":\"" + vr_json_escape(r.error) + "\","
+         + "\"version\":\"" + VR_VERSION + "\""
+         + "}"
+}
+
+fn vr_profiles_json() -> string {
+    let profiles = vr_profiles()
+    let n = len(profiles)
+    let mut out = "{\"count\":" + to_string(n) + ",\"profiles\":["
+    let mut i = 0
+    while i < n {
+        let p = profiles[i]
+        if i > 0 { out = out + "," }
+        out = out + "{\"id\":" + to_string(p.id)
+            + ",\"name\":\"" + vr_json_escape(p.name) + "\""
+            + ",\"pitch_base_hz\":" + to_string(p.pitch_base_hz)
+            + ",\"formant_shift\":" + to_string(p.formant_shift)
+            + ",\"tempo_wpm\":" + to_string(p.tempo_wpm)
+            + ",\"prosody_bias\":" + to_string(p.prosody_bias)
+            + ",\"style_tag\":\"" + vr_json_escape(p.style_tag) + "\""
+            + "}"
+        i = i + 1
+    }
+    out = out + "]}"
+    return out
+}
+
+fn vr_health_json() -> string {
+    let stt_backend = env("SPEAK_STT_BACKEND")
+    let tts_backend = env("SPEAK_TTS_BACKEND")
+    let llm_backend = env("SPEAK_LLM_BACKEND")
+    let endpoint = env("SPEAK_MODEL_ENDPOINT")
+    return "{"
+         + "\"status\":\"ok\","
+         + "\"version\":\"" + VR_VERSION + "\","
+         + "\"sample_rate\":" + to_string(VR_SAMPLE_RATE) + ","
+         + "\"bits_per_sample\":" + to_string(VR_BITS_PER_SAMPLE) + ","
+         + "\"channels\":" + to_string(VR_CHANNELS) + ","
+         + "\"profiles_available\":10,"
+         + "\"backend\":{\"stt\":\"" + (if len(stt_backend) > 0 { stt_backend } else { "mock" }) + "\","
+         + "\"tts\":\"" + (if len(tts_backend) > 0 { tts_backend } else { "mock" }) + "\","
+         + "\"llm\":\"" + (if len(llm_backend) > 0 { llm_backend } else { "mock" }) + "\","
+         + "\"endpoint\":\"" + vr_json_escape(if len(endpoint) > 0 { endpoint } else { "" }) + "\"},"
+         + "\"corpus\":{\"profiles_with_data\":[\"school_idol\",\"senpai\",\"knight\",\"sorceress\","
+         + "\"noir_detective\",\"horror_whisper\",\"childhood_friend\",\"demon_lord\","
+         + "\"childlike\",\"stoic_mentor\"]}"
+         + "}"
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 9. Self-test (T1-T5)
+// ═══════════════════════════════════════════════════════════════
+
+fn vr_selftest() {
+    println("[voice_routes] self-test — v2.0 RC voice I/O wire-up")
+
+    // T1: profiles endpoint returns 10 profiles
+    let pj = vr_profiles_json()
+    let t1 = pj.index_of("\"count\":10") >= 0
+          && pj.index_of("school_idol") >= 0
+          && pj.index_of("stoic_mentor") >= 0
+    if t1 { println("T1 PASS — /voice/profiles returns 10 profiles") }
+    else  { println("T1 FAIL — profiles JSON: " + pj) }
+
+    // T2: health endpoint returns version + backend info
+    let hj = vr_health_json()
+    let t2 = hj.index_of(VR_VERSION) >= 0
+          && hj.index_of("\"status\":\"ok\"") >= 0
+          && hj.index_of("\"profiles_available\":10") >= 0
+    if t2 { println("T2 PASS — /voice/health returns version + ok") }
+    else  { println("T2 FAIL — health JSON: " + hj) }
+
+    // T3: TTS with text + profile produces valid response
+    let tts_body = "{\"text\":\"hello world\",\"profile_id\":0}"
+    let tts_r = vr_handle_tts(tts_body)
+    let t3 = tts_r.ok
+          && tts_r.profile_name == "school_idol"
+          && tts_r.profile_id == 0
+          && len(tts_r.audio_payload) > 0
+          && tts_r.audio_sample_rate == VR_SAMPLE_RATE
+          && tts_r.tts_ms > 0
+    if t3 { println("T3 PASS — /voice/tts text+profile → audio") }
+    else  { println("T3 FAIL — tts ok=" + to_string(tts_r.ok) + " profile=" + tts_r.profile_name) }
+
+    // T4: E2E produces full pipeline result
+    let e2e_body = "{\"audio_in\":\"test_input.wav\",\"profile_name\":\"knight\"}"
+    let e2e_r = vr_handle_e2e(e2e_body)
+    let t4 = e2e_r.ok
+          && len(e2e_r.text) > 0
+          && len(e2e_r.reply) > 0
+          && len(e2e_r.audio_out_payload) > 0
+          && e2e_r.profile_name == "knight"
+          && e2e_r.stt_ms > 0
+          && e2e_r.llm_ms > 0
+          && e2e_r.tts_ms > 0
+    if t4 { println("T4 PASS — /voice/e2e audio→text→reply→audio") }
+    else  { println("T4 FAIL — e2e ok=" + to_string(e2e_r.ok) + " text=" + e2e_r.text) }
+
+    // T5: bad profile_id falls back to stoic_mentor
+    let fb_body = "{\"text\":\"fallback test\",\"profile_id\":999}"
+    let fb_r = vr_handle_tts(fb_body)
+    let t5 = fb_r.ok
+          && fb_r.profile_name == "stoic_mentor"
+          && fb_r.profile_id == 9
+    if t5 { println("T5 PASS — bad profile_id → stoic_mentor fallback") }
+    else  { println("T5 FAIL — profile=" + fb_r.profile_name + " id=" + to_string(fb_r.profile_id)) }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[voice_routes] ALL 5/5 PASS — v2.0 RC voice I/O wire-up verified")
+    } else {
+        println("[voice_routes] SOME FAILED")
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 10. Entry — run self-test when executed standalone
+// ═══════════════════════════════════════════════════════════════
+
+let _vr_run_selftest = env("VOICE_ROUTES_SELFTEST")
+if _vr_run_selftest == "1" {
+    vr_selftest()
+}

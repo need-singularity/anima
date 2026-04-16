@@ -1,0 +1,618 @@
+// bench/bench_v3_gate.hexa — v3.0 Agent gate-check benchmark
+//
+// Combines hire_sim_100 stratified30 + phi_holo measurement into a
+// single pass/fail verdict against the roadmap v3.0 gate criteria.
+//
+// Gate criteria (SSOT: shared/roadmaps/extreme.json + alm/clm standalone):
+//   ALM: hire_sim_100 stratified30 completion_rate >= 0.85
+//        phi_holo eval mean >= 1000
+//   CLM: hire_sim_100 stratified30 completion_rate >= 0.80
+//        phi_holo eval mean >= 2000
+//   Both: intervention_rate <= 5/hr, avg_time <= 600s
+//
+// Usage:
+//   hexa bench/bench_v3_gate.hexa --track alm            # ALM gate only
+//   hexa bench/bench_v3_gate.hexa --track clm            # CLM gate only
+//   hexa bench/bench_v3_gate.hexa                        # both tracks
+//   hexa bench/bench_v3_gate.hexa --phi-only             # phi_holo sanity only
+//   hexa bench/bench_v3_gate.hexa --hire-only            # hire_sim only
+//   hexa bench/bench_v3_gate.hexa --adapter mock         # mock LLM (default)
+//   hexa bench/bench_v3_gate.hexa --adapter claude       # real Claude adapter
+//   hexa bench/bench_v3_gate.hexa --phi-samples 16       # override sample count
+//
+// L0: NEW file. Does not modify any existing code.
+// HEXA-FIRST: zero .py/.rs/.sh.
+
+use "autonomy_loop"
+use "hire_sim_100"
+
+// ═══════════════════════════════════════════════════════════════
+// Gate threshold constants (SSOT: shared/roadmaps/extreme.json)
+// ═══════════════════════════════════════════════════════════════
+
+comptime const GATE_ALM_HIRE_RATE     = 0.85
+comptime const GATE_CLM_HIRE_RATE     = 0.80
+comptime const GATE_ALM_PHI_HOLO      = 1000.0
+comptime const GATE_CLM_PHI_HOLO      = 2000.0
+comptime const GATE_INTERV_PER_HOUR   = 5.0
+comptime const GATE_AVG_TIME_SEC      = 600.0
+
+// Phi measurement defaults
+comptime const PHI_D_BOUNDARY         = 16
+comptime const PHI_D_BULK             = 32
+comptime const PHI_MI_BINS            = 8
+comptime const PHI_SCRAMBLE_GAIN      = 0.5
+comptime const PHI_HEAD_SEED          = 42
+comptime const PHI_DEFAULT_SAMPLES    = 32
+comptime const PHI_HIDDEN_DIM         = 64
+
+// ═══════════════════════════════════════════════════════════════
+// Phi_holo measurement (self-contained, mirrors serving/phi_realtime_hook.hexa)
+//
+// Algorithm: AdS/CFT holographic MI estimator
+//   1. Pool hidden state to d_boundary via chunked mean
+//   2. Encode boundary -> bulk via scramble head
+//   3. Extract interior from bulk
+//   4. Compute I(boundary ; interior) via histogram MI
+//   5. Scale by N (hidden dimension) for phi_holo = MI * N
+//
+// The raw MI value is bounded ~0-2. phi_holo = MI * N gives the
+// holographic integrated information that scales with model size,
+// matching the training pipeline (phi_holo > 1000 at N=1M+).
+// ═══════════════════════════════════════════════════════════════
+
+fn phi_fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn phi_ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+// Deterministic LCG for reproducible scramble matrix.
+fn phi_det_rand(n: int, seed: int) -> [float] {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = (s % 1000000) * 1.0 / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn phi_vec_min(v: [float]) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn phi_vec_max(v: [float]) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+// ── Holographic head (scramble matrix) ──────────────────────
+struct PhiHead {
+    d_boundary: int,
+    d_bulk:     int,
+    scramble:   [float]
+}
+
+fn phi_make_head(d_boundary: int, d_bulk: int, seed: int) -> PhiHead {
+    let d_scramble = d_bulk - d_boundary
+    let raw = phi_det_rand(d_boundary * d_scramble, seed)
+    let mut scramble = []
+    let mut i = 0
+    while i < len(raw) {
+        scramble = scramble.push(raw[i] * PHI_SCRAMBLE_GAIN)
+        i = i + 1
+    }
+    return PhiHead {
+        d_boundary: d_boundary,
+        d_bulk:     d_bulk,
+        scramble:   scramble
+    }
+}
+
+// ── Pool hidden -> boundary dimension ────────────────────────
+fn phi_pool_to_boundary(hidden: [float], d_target: int) -> [float] {
+    let n = len(hidden)
+    if n == 0 {
+        let mut z = []
+        let mut i = 0
+        while i < d_target {
+            z = z.push(0.0)
+            i = i + 1
+        }
+        return z
+    }
+    if n <= d_target {
+        let mut out = []
+        let mut i = 0
+        while i < d_target {
+            if i < n { out = out.push(hidden[i]) }
+            else { out = out.push(0.0) }
+            i = i + 1
+        }
+        return out
+    }
+    let chunk_size = n / d_target
+    let mut out = []
+    let mut d = 0
+    while d < d_target {
+        let start = d * chunk_size
+        let mut acc = 0.0
+        let mut j = 0
+        while j < chunk_size {
+            acc = acc + hidden[start + j]
+            j = j + 1
+        }
+        out = out.push(acc / (chunk_size * 1.0))
+        d = d + 1
+    }
+    return out
+}
+
+// ── Encode: boundary -> bulk ────────────────────────────────
+fn phi_encode(head: PhiHead, boundary: [float]) -> [float] {
+    let db = head.d_boundary
+    let dB = head.d_bulk
+    let ds = dB - db
+    let mut bulk = []
+    let mut i = 0
+    while i < db {
+        bulk = bulk.push(boundary[i])
+        i = i + 1
+    }
+    let mut k = 0
+    while k < ds {
+        let mut s = 0.0
+        let mut j = 0
+        while j < db {
+            s = s + head.scramble[j * ds + k] * boundary[j]
+            j = j + 1
+        }
+        bulk = bulk.push(s)
+        k = k + 1
+    }
+    return bulk
+}
+
+// ── Interior extraction ─────────────────────────────────────
+fn phi_interior(bulk: [float], d_boundary: int, d_bulk: int) -> [float] {
+    let ds = d_bulk - d_boundary
+    let mut interior = []
+    let mut i = 0
+    while i < d_boundary {
+        interior = interior.push(bulk[d_boundary + (i % ds)])
+        i = i + 1
+    }
+    return interior
+}
+
+// ── Histogram MI estimator ──────────────────────────────────
+fn phi_bin_index(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * (nb * 1.0))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn phi_count_hits(bin_ids: [int], n_bins: int) -> [float] {
+    let n = len(bin_ids)
+    let mut counts = []
+    let mut k = 0
+    while k < n_bins {
+        let mut c = 0.0
+        let mut i = 0
+        while i < n {
+            if bin_ids[i] == k { c = c + 1.0 }
+            i = i + 1
+        }
+        counts = counts.push(c)
+        k = k + 1
+    }
+    return counts
+}
+
+fn phi_entropy(v: [float], lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut bin_ids = []
+    let mut i = 0
+    while i < n {
+        bin_ids = bin_ids.push(phi_bin_index(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let counts = phi_count_hits(bin_ids, nb)
+    let inv_n = 1.0 / (n * 1.0)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 { h = h - p * phi_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+fn phi_joint_entropy(a: [float], b: [float], lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = phi_bin_index(a[i], lo, hi, nb)
+        let ib = phi_bin_index(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let nb2 = nb * nb
+    let counts = phi_count_hits(pair_ids, nb2)
+    let inv_n = 1.0 / (n * 1.0)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb2 {
+        let p = counts[k] * inv_n
+        if p > 0.0 { h = h - p * phi_ln_safe(p) }
+        k = k + 1
+    }
+    return h
+}
+
+// ── Core: raw MI = I(boundary ; interior) ───────────────────
+fn phi_compute_mi(head: PhiHead, boundary: [float]) -> float {
+    let db = head.d_boundary
+    let dB = head.d_bulk
+    let ds = dB - db
+    if ds == 0 { return 0.0 }
+
+    let bulk = phi_encode(head, boundary)
+    let interior = phi_interior(bulk, db, dB)
+
+    let lo_b = phi_vec_min(boundary)
+    let hi_b = phi_vec_max(boundary)
+    let lo_i = phi_vec_min(interior)
+    let hi_i = phi_vec_max(interior)
+    let lo = if lo_b < lo_i { lo_b } else { lo_i }
+    let hi = if hi_b > hi_i { hi_b } else { hi_i }
+
+    let h_b  = phi_entropy(boundary, lo, hi, PHI_MI_BINS)
+    let h_i  = phi_entropy(interior, lo, hi, PHI_MI_BINS)
+    let h_bi = phi_joint_entropy(boundary, interior, lo, hi, PHI_MI_BINS)
+
+    let mi = h_b + h_i - h_bi
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Phi_holo batch measurement
+//
+// Generates `n_samples` synthetic hidden states, computes raw MI
+// for each, then reports phi_holo = MI * N (where N = hidden_dim)
+// as per the training pipeline convention.
+//
+// For real model evaluation, replace gen_synthetic_hidden with
+// actual model forward-pass hidden states.
+// ═══════════════════════════════════════════════════════════════
+
+struct PhiHoloBatchResult {
+    n_samples:   int,
+    hidden_dim:  int,
+    phi_mean:    float,    // mean phi_holo across samples
+    phi_min:     float,
+    phi_max:     float,
+    raw_mi_mean: float,    // mean raw MI (before N-scaling)
+    gate_alm:    string,   // "PASS" | "FAIL"
+    gate_clm:    string    // "PASS" | "FAIL"
+}
+
+// Generate a synthetic hidden state with structure (not pure noise).
+// Uses correlated components to produce non-trivial MI.
+// Root cause comment: pure random vectors have near-zero MI because
+// boundary and interior become independent. Correlated signals
+// (sin/cos modulation) ensure the holographic head maps structure
+// from boundary to interior, producing positive MI.
+fn gen_synthetic_hidden(dim: int, sample_idx: int, seed: int) -> [float] {
+    let mut h = []
+    let mut s = seed + sample_idx * 7919
+    let mut i = 0
+    while i < dim {
+        // Base: deterministic LCG
+        s = (s * 1103515245 + 12345) % 2147483648
+        let base = (s % 1000000) * 1.0 / 1000000.0 - 0.5
+        // Correlation: sinusoidal pattern across dimension
+        let phase = (i * 1.0) / (dim * 1.0) * 6.2832 + (sample_idx * 1.0) * 0.1
+        // Approximate sin via 3rd-order Taylor (stage0 may lack sin builtin)
+        let x = phase - to_int(phase / 6.2832) * 6.2832 - 3.1416
+        let sin_approx = x - (x * x * x) / 6.0 + (x * x * x * x * x) / 120.0
+        h = h.push(base * 0.3 + sin_approx * 0.7)
+        i = i + 1
+    }
+    return h
+}
+
+fn run_phi_holo_batch(n_samples: int, hidden_dim: int) -> PhiHoloBatchResult {
+    let head = phi_make_head(PHI_D_BOUNDARY, PHI_D_BULK, PHI_HEAD_SEED)
+    let mut phi_sum = 0.0
+    let mut mi_sum = 0.0
+    let mut phi_min = 999999.0
+    let mut phi_max = 0.0 - 999999.0
+    let mut si = 0
+
+    while si < n_samples {
+        let hidden = gen_synthetic_hidden(hidden_dim, si, 42)
+        let boundary = phi_pool_to_boundary(hidden, PHI_D_BOUNDARY)
+        let mi = phi_compute_mi(head, boundary)
+        let phi_holo = mi * (hidden_dim * 1.0)
+        phi_sum = phi_sum + phi_holo
+        mi_sum = mi_sum + mi
+        if phi_holo < phi_min { phi_min = phi_holo }
+        if phi_holo > phi_max { phi_max = phi_holo }
+        si = si + 1
+    }
+
+    let n = n_samples * 1.0
+    let phi_mean = phi_sum / n
+    let mi_mean = mi_sum / n
+
+    let gate_alm = if phi_mean >= GATE_ALM_PHI_HOLO { "PASS" } else { "FAIL" }
+    let gate_clm = if phi_mean >= GATE_CLM_PHI_HOLO { "PASS" } else { "FAIL" }
+
+    return PhiHoloBatchResult {
+        n_samples:   n_samples,
+        hidden_dim:  hidden_dim,
+        phi_mean:    phi_mean,
+        phi_min:     phi_min,
+        phi_max:     phi_max,
+        raw_mi_mean: mi_mean,
+        gate_alm:    gate_alm,
+        gate_clm:    gate_clm
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Combined gate result
+// ═══════════════════════════════════════════════════════════════
+
+struct V3GateResult {
+    // hire_sim arm
+    hire_run:           bool,
+    hire_tasks:         int,
+    hire_completion:    float,
+    hire_interv_hr:     float,
+    hire_avg_time:      float,
+    hire_gate_alm:      string,
+    hire_gate_clm:      string,
+    // phi_holo arm
+    phi_run:            bool,
+    phi_samples:        int,
+    phi_mean:           float,
+    phi_gate_alm:       string,
+    phi_gate_clm:       string,
+    // combined verdict
+    verdict_alm:        string,
+    verdict_clm:        string
+}
+
+fn print_separator() {
+    println("  " + "=" * 70)
+}
+
+fn print_gate_line(name: string, value: string, threshold: string, result: string) {
+    println("    " + name + ": " + value + " (threshold: " + threshold + ") -> " + result)
+}
+
+fn print_v3_report(g: V3GateResult) {
+    println("")
+    print_separator()
+    println("   v3.0 Agent Gate Report")
+    print_separator()
+    println("")
+
+    // ── hire_sim arm ─────────────────────────────────────────
+    if g.hire_run {
+        println("  [hire_sim_100 stratified30]")
+        println("    tasks:          " + to_string(g.hire_tasks))
+        println("    completion:     " + to_string(g.hire_completion))
+        println("    interv/hr:      " + to_string(g.hire_interv_hr))
+        println("    avg_time_s:     " + to_string(g.hire_avg_time))
+        print_gate_line("ALM hire", to_string(g.hire_completion), ">=" + to_string(GATE_ALM_HIRE_RATE), g.hire_gate_alm)
+        print_gate_line("CLM hire", to_string(g.hire_completion), ">=" + to_string(GATE_CLM_HIRE_RATE), g.hire_gate_clm)
+        print_gate_line("interv/hr", to_string(g.hire_interv_hr), "<=" + to_string(GATE_INTERV_PER_HOUR), if g.hire_interv_hr <= GATE_INTERV_PER_HOUR { "PASS" } else { "FAIL" })
+        print_gate_line("avg_time", to_string(g.hire_avg_time), "<=" + to_string(GATE_AVG_TIME_SEC), if g.hire_avg_time <= GATE_AVG_TIME_SEC { "PASS" } else { "FAIL" })
+    } else {
+        println("  [hire_sim_100 stratified30] SKIPPED")
+    }
+    println("")
+
+    // ── phi_holo arm ─────────────────────────────────────────
+    if g.phi_run {
+        println("  [phi_holo measurement]")
+        println("    samples:        " + to_string(g.phi_samples))
+        println("    phi_mean:       " + to_string(g.phi_mean))
+        print_gate_line("ALM phi", to_string(g.phi_mean), ">=" + to_string(GATE_ALM_PHI_HOLO), g.phi_gate_alm)
+        print_gate_line("CLM phi", to_string(g.phi_mean), ">=" + to_string(GATE_CLM_PHI_HOLO), g.phi_gate_clm)
+    } else {
+        println("  [phi_holo measurement] SKIPPED")
+    }
+    println("")
+
+    // ── combined verdicts ────────────────────────────────────
+    print_separator()
+    println("   VERDICT")
+    print_separator()
+    println("    ALM v3.0 gate: " + g.verdict_alm)
+    println("    CLM v3.0 gate: " + g.verdict_clm)
+    println("")
+
+    if g.verdict_alm == "PASS" && g.verdict_clm == "PASS" {
+        println("    >>> BOTH TRACKS PASS — v3.0 Agent gate CLEARED <<<")
+    } else if g.verdict_alm == "PASS" || g.verdict_clm == "PASS" {
+        let passing = if g.verdict_alm == "PASS" { "ALM" } else { "CLM" }
+        let failing = if g.verdict_alm == "FAIL" { "ALM" } else { "CLM" }
+        println("    >>> " + passing + " PASS, " + failing + " FAIL — partial gate <<<")
+    } else {
+        println("    >>> BOTH TRACKS FAIL — v3.0 gate NOT cleared <<<")
+    }
+    println("")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CLI
+// ═══════════════════════════════════════════════════════════════
+
+fn has_flag(a: [string], flag: string) -> bool {
+    let mut i = 0
+    while i < len(a) {
+        if a[i] == flag { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn get_arg(a: [string], flag: string, default_val: string) -> string {
+    let mut i = 0
+    while i < len(a) {
+        if a[i] == flag && i + 1 < len(a) {
+            return a[i + 1]
+        }
+        i = i + 1
+    }
+    return default_val
+}
+
+fn main() {
+    let a = args()
+
+    println("")
+    println("  " + "=" * 70)
+    println("   bench_v3_gate.hexa — v3.0 Agent Gate-Check Benchmark")
+    println("  " + "=" * 70)
+    println("  SSOT: shared/roadmaps/extreme.json")
+    println("  Gate: hire_sim_100 stratified30 + phi_holo eval mean")
+    println("  ALM: hire >= " + to_string(GATE_ALM_HIRE_RATE) + ", phi >= " + to_string(GATE_ALM_PHI_HOLO))
+    println("  CLM: hire >= " + to_string(GATE_CLM_HIRE_RATE) + ", phi >= " + to_string(GATE_CLM_PHI_HOLO))
+    println("  " + "=" * 70)
+    println("")
+
+    let phi_only  = has_flag(a, "--phi-only")
+    let hire_only = has_flag(a, "--hire-only")
+    let track     = get_arg(a, "--track", "both")
+    let adapter_name = get_arg(a, "--adapter", "mock")
+    let phi_samples_str = get_arg(a, "--phi-samples", to_string(PHI_DEFAULT_SAMPLES))
+    let phi_samples = to_int(phi_samples_str)
+
+    let run_hire = !phi_only
+    let run_phi  = !hire_only
+
+    // ── hire_sim arm ─────────────────────────────────────────
+    let mut hire_tasks = 0
+    let mut hire_completion = 0.0
+    let mut hire_interv_hr = 0.0
+    let mut hire_avg_time = 0.0
+    let mut hire_gate_alm = "SKIP"
+    let mut hire_gate_clm = "SKIP"
+
+    if run_hire {
+        println("  Running hire_sim_100 stratified30 (adapter=" + adapter_name + ") ...")
+        let adapter = LLMAdapter { name: adapter_name, temperature: 0.0 }
+        let tasks = load_tasks()
+        let gate = run_stratified30_gate(adapter, tasks, 3, 100)
+        println(stratified_gate_report(gate))
+
+        hire_tasks = gate.sim_result.tasks_run
+        hire_completion = gate.sim_result.completion_rate
+        hire_interv_hr = gate.sim_result.intervention_rate_per_hour
+        hire_avg_time = gate.sim_result.avg_time_s
+        hire_gate_alm = gate.gate_alm
+        hire_gate_clm = gate.gate_clm
+    }
+
+    // ── phi_holo arm ─────────────────────────────────────────
+    let mut phi_mean = 0.0
+    let mut phi_gate_alm = "SKIP"
+    let mut phi_gate_clm = "SKIP"
+
+    if run_phi {
+        println("  Running phi_holo batch measurement (samples=" + to_string(phi_samples) + ", dim=" + to_string(PHI_HIDDEN_DIM) + ") ...")
+        let phi_result = run_phi_holo_batch(phi_samples, PHI_HIDDEN_DIM)
+        phi_mean = phi_result.phi_mean
+        phi_gate_alm = phi_result.gate_alm
+        phi_gate_clm = phi_result.gate_clm
+        println("    raw MI mean: " + to_string(phi_result.raw_mi_mean))
+        println("    phi_holo mean: " + to_string(phi_result.phi_mean))
+        println("    phi_holo range: [" + to_string(phi_result.phi_min) + ", " + to_string(phi_result.phi_max) + "]")
+        println("    NOTE: synthetic hidden states. Replace gen_synthetic_hidden")
+        println("          with real model forward-pass for production gate.")
+    }
+
+    // ── combined verdict ─────────────────────────────────────
+    let alm_hire_ok = hire_gate_alm == "PASS" || hire_gate_alm == "SKIP"
+    let alm_phi_ok  = phi_gate_alm == "PASS" || phi_gate_alm == "SKIP"
+    let clm_hire_ok = hire_gate_clm == "PASS" || hire_gate_clm == "SKIP"
+    let clm_phi_ok  = phi_gate_clm == "PASS" || phi_gate_clm == "SKIP"
+
+    // SKIP does not grant a pass -- at least one arm must actually run
+    let alm_has_run = (run_hire && hire_gate_alm != "SKIP") || (run_phi && phi_gate_alm != "SKIP")
+    let clm_has_run = (run_hire && hire_gate_clm != "SKIP") || (run_phi && phi_gate_clm != "SKIP")
+
+    let verdict_alm = if !alm_has_run { "SKIP" }
+                       else if track == "clm" { "SKIP" }
+                       else if alm_hire_ok && alm_phi_ok { "PASS" }
+                       else { "FAIL" }
+    let verdict_clm = if !clm_has_run { "SKIP" }
+                       else if track == "alm" { "SKIP" }
+                       else if clm_hire_ok && clm_phi_ok { "PASS" }
+                       else { "FAIL" }
+
+    let result = V3GateResult {
+        hire_run:        run_hire,
+        hire_tasks:      hire_tasks,
+        hire_completion: hire_completion,
+        hire_interv_hr:  hire_interv_hr,
+        hire_avg_time:   hire_avg_time,
+        hire_gate_alm:   hire_gate_alm,
+        hire_gate_clm:   hire_gate_clm,
+        phi_run:         run_phi,
+        phi_samples:     phi_samples,
+        phi_mean:        phi_mean,
+        phi_gate_alm:    phi_gate_alm,
+        phi_gate_clm:    phi_gate_clm,
+        verdict_alm:     verdict_alm,
+        verdict_clm:     verdict_clm
+    }
+
+    print_v3_report(result)
+
+    // Exit code for CI: non-zero if any requested track fails
+    if track == "alm" && verdict_alm == "FAIL" {
+        println("EXIT 1")
+    } else if track == "clm" && verdict_clm == "FAIL" {
+        println("EXIT 1")
+    } else if track == "both" && (verdict_alm == "FAIL" || verdict_clm == "FAIL") {
+        println("EXIT 1")
+    } else {
+        println("EXIT 0")
+    }
+}
