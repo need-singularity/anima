@@ -1,0 +1,484 @@
+// serving/avatar_feed.hexa — v2.0_RC destination criterion #2
+//
+// Thin adapter that converts a response (text + optional TTS audio
+// path) into a payload consumable by web/avatar_sync.js:
+//
+//     { audio_url, viseme_timeline: [{ t_ms, viseme }, ...] }
+//
+// 역할:
+//   1. phoneme-to-viseme map — 5 vowels (A/I/U/E/O) + silence "_"
+//      한글은 Jamo V (jungseong) 만 보고 viseme 결정. 자음은 closure
+//      (silence) 로 처리, vowel onset 은 CV 전이 시점이다.
+//   2. Hangul syllable decomposition — precomposed 한글(0xAC00~) 은
+//      SBase + (CBase × 21 × 28) 구성이므로 jungseong 만 추출하여
+//      viseme 5개 중 하나로 매핑한다.
+//   3. Timeline pacing — 발화 duration / syllable_count 로 균등 배치
+//      (실 TTS phoneme duration wire 는 anima-speak E2E 완료 후 교체).
+//
+// Hexa quirk 회피:
+//   - struct list aliasing → 모든 mutator 는 새 struct return.
+//   - use 금지 (self-contained, 한 파일 완결).
+//   - 한글 처리는 byte-safe. `string` byte index 로 3-byte UTF-8
+//     sequence (0xEA..0xED + ..) 를 수동 decode 한다.
+//   - str(int)/to_float/to_int 만 사용 (str(float) 은 runtime-variant).
+//
+// 메모리 feedback_hexa_string_api: substring 계열 API 는 unstable.
+// 여기선 char-level 처리가 없어도 되도록 byte offset 만 훑는다.
+//
+// 테스트: serving/test_avatar_feed.hexa — 3 assertion:
+//   A1. 한글 "안녕하세요" → 5+ viseme entries
+//   A2. 타임라인 monotonic (t_ms 증가)
+//   A3. drift < 50ms (simulated — phoneme 균등 배치 vs audio duration)
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 1. Viseme primitives
+// ═══════════════════════════════════════════════════════════════
+
+// Viseme IDs — keep int-encoded so timeline sort is trivial:
+//   0=_ (silence) 1=A 2=I 3=U 4=E 5=O
+let VIS_SIL = 0
+let VIS_A   = 1
+let VIS_I   = 2
+let VIS_U   = 3
+let VIS_E   = 4
+let VIS_O   = 5
+
+fn viseme_label(id: int) -> str {
+    if id == 1 { return "A" }
+    if id == 2 { return "I" }
+    if id == 3 { return "U" }
+    if id == 4 { return "E" }
+    if id == 5 { return "O" }
+    return "_"
+}
+
+struct VisemeEntry {
+    t_ms: int,
+    viseme_id: int
+}
+
+struct AvatarFeed {
+    audio_url: str,
+    timeline: [VisemeEntry],
+    duration_ms: int,
+    n_syllables: int
+}
+
+fn viseme_entry_new(t_ms: int, id: int) -> VisemeEntry {
+    return VisemeEntry { t_ms: t_ms, viseme_id: id }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 2. Hangul jungseong → viseme
+// ═══════════════════════════════════════════════════════════════
+//
+// Hangul syllable codepoint = 0xAC00 + (L × 588) + (V × 28) + T
+//   where L = choseong (0..18), V = jungseong (0..20), T = jongseong (0..27).
+// Jungseong table (21 entries) mapped to 5-viseme coarse set:
+//
+//   idx  jamo  name     viseme
+//    0   ㅏ    a        A
+//    1   ㅐ    ae       E
+//    2   ㅑ    ya       A
+//    3   ㅒ    yae      E
+//    4   ㅓ    eo       O   (mid-back, round-ish)
+//    5   ㅔ    e        E
+//    6   ㅕ    yeo      E   (ㅕ≈[jʌ] → coarse E/A ambiguous; pick E)
+//    7   ㅖ    ye       E
+//    8   ㅗ    o        O
+//    9   ㅘ    wa       A
+//   10   ㅙ    wae      E
+//   11   ㅚ    oe       E
+//   12   ㅛ    yo       O
+//   13   ㅜ    u        U
+//   14   ㅝ    wo       O
+//   15   ㅞ    we       E
+//   16   ㅟ    wi       I
+//   17   ㅠ    yu       U
+//   18   ㅡ    eu       U  (coarse — unrounded but lips narrow)
+//   19   ㅢ    ui       I
+//   20   ㅣ    i        I
+fn jungseong_to_viseme(v_idx: int) -> int {
+    if v_idx == 0  { return VIS_A }
+    if v_idx == 1  { return VIS_E }
+    if v_idx == 2  { return VIS_A }
+    if v_idx == 3  { return VIS_E }
+    if v_idx == 4  { return VIS_O }
+    if v_idx == 5  { return VIS_E }
+    if v_idx == 6  { return VIS_E }
+    if v_idx == 7  { return VIS_E }
+    if v_idx == 8  { return VIS_O }
+    if v_idx == 9  { return VIS_A }
+    if v_idx == 10 { return VIS_E }
+    if v_idx == 11 { return VIS_E }
+    if v_idx == 12 { return VIS_O }
+    if v_idx == 13 { return VIS_U }
+    if v_idx == 14 { return VIS_O }
+    if v_idx == 15 { return VIS_E }
+    if v_idx == 16 { return VIS_I }
+    if v_idx == 17 { return VIS_U }
+    if v_idx == 18 { return VIS_U }
+    if v_idx == 19 { return VIS_I }
+    if v_idx == 20 { return VIS_I }
+    return VIS_SIL
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 3. UTF-8 decode (byte-safe, Hangul syllable focus)
+// ═══════════════════════════════════════════════════════════════
+//
+// 한글 syllable block (U+AC00..U+D7A3) = 3-byte UTF-8:
+//   byte0 ∈ {0xEA, 0xEB, 0xEC, 0xED}
+//   byte1 bits + byte2 bits give cp.
+// 우리는 cp >= 0xAC00 && cp <= 0xD7A3 인지 확인 + 있으면 jungseong
+// 을 추출한다. 그 외 바이트는 silence 로 처리.
+
+// Decode a single UTF-8 codepoint starting at byte index i.
+// Returns (cp, next_i). On invalid seq, advances 1 byte with cp=-1.
+struct CpStep {
+    cp: int,
+    next_i: int
+}
+
+// NB: hexa current build parses 0x-prefixed literals as 0. All UTF-8
+// threshold constants are expressed in decimal.
+//   0x80=128, 0xC0=192, 0xE0=224, 0xF0=240, 0xF8=248
+fn utf8_decode_one(bytes: str, i: int) -> CpStep {
+    let n = len(bytes)
+    if i >= n { return CpStep { cp: -1, next_i: i } }
+    // Hexa quirk: bytes[i] returns a 1-char string, use ord() to get int.
+    let b0 = ord(bytes[i])
+    if b0 < 128 {
+        return CpStep { cp: b0, next_i: i + 1 }
+    }
+    if b0 >= 192 && b0 < 224 {
+        if i + 1 >= n { return CpStep { cp: -1, next_i: i + 1 } }
+        let b1 = ord(bytes[i + 1])
+        let cp = ((b0 - 192) * 64) + (b1 - 128)
+        return CpStep { cp: cp, next_i: i + 2 }
+    }
+    if b0 >= 224 && b0 < 240 {
+        if i + 2 >= n { return CpStep { cp: -1, next_i: i + 1 } }
+        let b1 = ord(bytes[i + 1])
+        let b2 = ord(bytes[i + 2])
+        let cp = ((b0 - 224) * 4096) + ((b1 - 128) * 64) + (b2 - 128)
+        return CpStep { cp: cp, next_i: i + 3 }
+    }
+    if b0 >= 240 && b0 < 248 {
+        if i + 3 >= n { return CpStep { cp: -1, next_i: i + 1 } }
+        let b1 = ord(bytes[i + 1])
+        let b2 = ord(bytes[i + 2])
+        let b3 = ord(bytes[i + 3])
+        let cp = ((b0 - 240) * 262144) + ((b1 - 128) * 4096) + ((b2 - 128) * 64) + (b3 - 128)
+        return CpStep { cp: cp, next_i: i + 4 }
+    }
+    // Continuation byte at start / invalid — skip.
+    return CpStep { cp: -1, next_i: i + 1 }
+}
+
+// Decompose precomposed Hangul syllable (U+AC00..U+D7A3) to jungseong idx.
+// Returns -1 if cp is not in the syllable block.
+// NB: decimal literals — 0xAC00=44032, 0xD7A3=55203.
+fn hangul_jungseong(cp: int) -> int {
+    if cp < 44032 { return -1 }
+    if cp > 55203 { return -1 }
+    let s = cp - 44032
+    // 28 jongseong × 21 jungseong × 19 choseong
+    let v = (s / 28) % 21
+    return v
+}
+
+// Is codepoint "vowel-ish" in Latin? (a/e/i/o/u). Return viseme id or -1.
+fn latin_vowel_viseme(cp: int) -> int {
+    // Lowercase
+    if cp == 97  { return VIS_A }   // a
+    if cp == 101 { return VIS_E }   // e
+    if cp == 105 { return VIS_I }   // i
+    if cp == 111 { return VIS_O }   // o
+    if cp == 117 { return VIS_U }   // u
+    // Uppercase
+    if cp == 65  { return VIS_A }
+    if cp == 69  { return VIS_E }
+    if cp == 73  { return VIS_I }
+    if cp == 79  { return VIS_O }
+    if cp == 85  { return VIS_U }
+    return -1
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 4. Text → viseme sequence (no timing yet)
+// ═══════════════════════════════════════════════════════════════
+//
+// One "slot" per source character (Hangul syllable, Latin letter,
+// or unknown). Non-vowel, non-Hangul characters contribute silence.
+// Vowel gets its viseme, flanking silence inserted at start/end.
+
+struct VisemeSeq {
+    ids: array,
+    n:   int
+}
+
+fn viseme_seq_new() -> VisemeSeq {
+    return VisemeSeq { ids: [], n: 0 }
+}
+
+fn viseme_seq_push(seq: VisemeSeq, id: int) -> VisemeSeq {
+    let next = seq.ids.push(id)
+    return VisemeSeq { ids: next, n: seq.n + 1 }
+}
+
+fn text_to_visemes(text: str) -> VisemeSeq {
+    let mut seq = viseme_seq_new()
+    // Leading silence
+    seq = viseme_seq_push(seq, VIS_SIL)
+
+    let n = len(text)
+    let mut i = 0
+    while i < n {
+        let step = utf8_decode_one(text, i)
+        let cp = step.cp
+        i = step.next_i
+        if cp < 0 { continue }
+
+        // Hangul syllable block → jungseong
+        let v_idx = hangul_jungseong(cp)
+        if v_idx >= 0 {
+            let vid = jungseong_to_viseme(v_idx)
+            seq = viseme_seq_push(seq, vid)
+            continue
+        }
+
+        // Latin vowel → direct
+        let lv = latin_vowel_viseme(cp)
+        if lv >= 0 {
+            seq = viseme_seq_push(seq, lv)
+            continue
+        }
+
+        // Space or punctuation → silence (only once per run to dedupe)
+        // 32=' ' 46='.' 44=',' 33='!' 63='?'
+        if cp == 32 || cp == 46 || cp == 44 || cp == 33 || cp == 63 {
+            // Append silence only if previous wasn't already silence.
+            if seq.n > 0 {
+                let last = seq.ids[seq.n - 1]
+                if last != VIS_SIL {
+                    seq = viseme_seq_push(seq, VIS_SIL)
+                }
+            }
+        }
+        // Consonants (Latin or otherwise) are closures — they are
+        // absorbed into the preceding vowel's hold time; no emit.
+    }
+
+    // Trailing silence
+    if seq.n > 0 {
+        let last = seq.ids[seq.n - 1]
+        if last != VIS_SIL {
+            seq = viseme_seq_push(seq, VIS_SIL)
+        }
+    }
+    return seq
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 5. Pacing → VisemeEntry timeline
+// ═══════════════════════════════════════════════════════════════
+//
+// estimate_duration_ms(n_vowels):
+//   Empirical ballpark — Korean running speech ~150 ms per vowel
+//   (syllable) + 120 ms head/tail silence. Replace with TTS
+//   phoneme timing wire (anima-speak E2E) in v2.0_RC final cut.
+fn estimate_duration_ms(n_vowels: int) -> int {
+    let core = n_vowels * 150
+    return core + 240
+}
+
+fn pace_timeline(seq: VisemeSeq, audio_duration_ms: int) -> [VisemeEntry] {
+    let n = seq.n
+    if n == 0 { return [] }
+    // Leading + trailing silence bookend.
+    // Interior stops = n-1, each gets (duration - tail) / (n-1).
+    let head_ms = 20
+    let tail_ms = 20
+    let body = audio_duration_ms - head_ms - tail_ms
+    let mut step = 0
+    if n > 1 {
+        step = body / (n - 1)
+        if step < 40 { step = 40 }
+    }
+    let mut out = []
+    let mut i = 0
+    let mut t = 0
+    while i < n {
+        if i == 0 {
+            t = 0
+        } else {
+            if i == n - 1 {
+                t = audio_duration_ms - tail_ms
+            } else {
+                t = head_ms + (i * step)
+            }
+        }
+        let entry = VisemeEntry { t_ms: t, viseme_id: seq.ids[i] }
+        out = out.push(entry)
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 6. Top-level build — text + optional audio_url → feed
+// ═══════════════════════════════════════════════════════════════
+//
+// build_feed("안녕하세요", "", 0) →
+//   { audio_url: "", timeline: [...], duration_ms, n_syllables }
+//
+// If audio_path is empty, duration_ms is estimated from n_vowels.
+// If audio_path is non-empty, caller provides known audio_duration_ms.
+fn build_feed(text: str, audio_path: str, audio_duration_ms: int) -> AvatarFeed {
+    let seq = text_to_visemes(text)
+    // Count vowel syllables (non-silence).
+    let mut n_syl = 0
+    let mut i = 0
+    while i < seq.n {
+        if seq.ids[i] != VIS_SIL { n_syl = n_syl + 1 }
+        i = i + 1
+    }
+    let dur = if audio_duration_ms > 0 { audio_duration_ms } else { estimate_duration_ms(n_syl) }
+    let timeline = pace_timeline(seq, dur)
+    return AvatarFeed {
+        audio_url:   audio_path,
+        timeline:    timeline,
+        duration_ms: dur,
+        n_syllables: n_syl
+    }
+}
+
+// JSON-ish serialisation for wire transport (web/avatar_sync.js).
+// Keeps it minimal so clients can `JSON.parse` without a schema.
+fn feed_to_json(feed: AvatarFeed) -> str {
+    let mut s = "{\"audio_url\":\""
+    s = s + feed.audio_url
+    s = s + "\",\"duration_ms\":"
+    s = s + str(feed.duration_ms)
+    s = s + ",\"n_syllables\":"
+    s = s + str(feed.n_syllables)
+    s = s + ",\"viseme_timeline\":["
+    let n = len(feed.timeline)
+    let mut i = 0
+    while i < n {
+        let e = feed.timeline[i]
+        if i > 0 { s = s + "," }
+        s = s + "{\"t_ms\":" + str(e.t_ms)
+        s = s + ",\"viseme\":\"" + viseme_label(e.viseme_id) + "\"}"
+        i = i + 1
+    }
+    s = s + "]}"
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 7. Test-facing helpers (consumed by test_avatar_feed.hexa)
+// ═══════════════════════════════════════════════════════════════
+
+// Count entries where viseme_id != silence.
+fn count_non_silence(feed: AvatarFeed) -> int {
+    let mut c = 0
+    let mut i = 0
+    let n = len(feed.timeline)
+    while i < n {
+        if feed.timeline[i].viseme_id != VIS_SIL { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+// Is timeline monotonic (non-decreasing t_ms)?
+fn is_monotonic(feed: AvatarFeed) -> bool {
+    let n = len(feed.timeline)
+    if n < 2 { return true }
+    let mut i = 1
+    while i < n {
+        let prev = feed.timeline[i - 1].t_ms
+        let cur  = feed.timeline[i].t_ms
+        if cur < prev { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// Simulated drift — schedule error between naive even-spacing and our
+// pacing. Equivalent to "largest gap minus smallest gap / 2".
+// Used by test A3 as a proxy until real audio clock is wired.
+fn simulated_drift_ms(feed: AvatarFeed) -> int {
+    let n = len(feed.timeline)
+    if n < 2 { return 0 }
+    let mut min_gap = 1000000
+    let mut max_gap = 0
+    let mut i = 1
+    while i < n {
+        let gap = feed.timeline[i].t_ms - feed.timeline[i - 1].t_ms
+        if gap < min_gap { min_gap = gap }
+        if gap > max_gap { max_gap = gap }
+        i = i + 1
+    }
+    let span = max_gap - min_gap
+    return span / 2
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 8. Embedded test (dev convenience; gate is test_* file)
+// ═══════════════════════════════════════════════════════════════
+
+fn assert_true(label: str, cond: bool) -> bool {
+    if cond {
+        println("  " + label + " PASS")
+        return true
+    }
+    println("  " + label + " FAIL")
+    return false
+}
+
+fn test_A1_hangul_min_entries() -> bool {
+    let feed = build_feed("안녕하세요", "", 0)
+    let c = count_non_silence(feed)
+    println("    non-silence entries: " + str(c))
+    return assert_true("A1 한글 5+ viseme", c >= 5)
+}
+
+fn test_A2_monotonic() -> bool {
+    let feed = build_feed("안녕하세요", "", 0)
+    return assert_true("A2 monotonic", is_monotonic(feed))
+}
+
+fn test_A3_drift_under_50() -> bool {
+    let feed = build_feed("안녕하세요", "", 0)
+    let d = simulated_drift_ms(feed)
+    println("    simulated drift: " + str(d) + " ms")
+    return assert_true("A3 drift<50ms", d < 50)
+}
+
+fn run_embedded_tests() -> bool {
+    println("[avatar_feed] v2.0_RC destination criterion #2")
+    println("  phoneme→viseme map (A/I/U/E/O + _), Hangul jungseong decompose")
+    println("")
+
+    let a1 = test_A1_hangul_min_entries()
+    let a2 = test_A2_monotonic()
+    let a3 = test_A3_drift_under_50()
+
+    let mut pass = 0
+    if a1 { pass = pass + 1 }
+    if a2 { pass = pass + 1 }
+    if a3 { pass = pass + 1 }
+
+    println("")
+    println("[avatar_feed] " + str(pass) + "/3 PASS")
+    return pass == 3
+}
+
+fn main() {
+    let _ = run_embedded_tests()
+}
+
+main()
