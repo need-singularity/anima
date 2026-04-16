@@ -1,37 +1,611 @@
-// intent_encoder.hexa — HEXA-SPEAK Mk.I: Intent Encoder
+// intent_encoder.hexa — HEXA-SPEAK Mk.III: Intent Encoder
 //
 // Purpose:
-//   Consciousness embedding (384d) → audio-conditioned intent embedding (384d)
+//   Consciousness embedding (384d) -> audio-conditioned intent embedding (384d)
 //   Feeds audio_token_predictor as cross-attention memory.
 //
-// n=6 parameters (no hardcode — comments only, loaded from config at build):
-//   d_in   = 384 = 64 * 6              (consciousness hub embedding dim)
-//   d_out  = 384 = 64 * 6              (audio intent dim, = d_in for residual)
-//   heads  = 6                         (n=6 attention heads)
-//   layers = 2                         (shallow projector, Mk.I)
-//   ff     = 1536 = 384 * 4            (SwiGLU 8/3 ≈ 4x)
+//   Architecture:
+//     LayerNorm(384) -> Linear(384, ff_dim) -> SwiGLU -> Linear(ff_dim, 384) + residual
+//     + RoPE (rotary positional embedding) for sequence > 1
 //
-// BT reference: BT-SPEAK-01 (intent→audio coupling), Law 60 phase P2
-// Mk stage:     Mk.I (skeleton, dummy passthrough)
-// Upstream:     ConsciousnessHub.embed() → this
-// Downstream:   audio_token_predictor.hexa
+//   Math summary:
+//     1. x_norm = LayerNorm(x)                          # stabilize distribution
+//     2. up     = W_up   * x_norm + b_up                # project to ff_dim
+//     3. gate   = W_gate * x_norm + b_gate              # parallel gate projection
+//     4. h      = up * sigmoid(gate)                    # SwiGLU activation
+//     5. down   = W_down * h      + b_down              # project back to 384
+//     6. out    = x + down                              # residual skip connection
+//     For seq > 1, RoPE is applied to x_norm before projection.
+//
+// n=6 parameters (no hardcode — comments only, loaded from config at build):
+//   d_model = 384 = 64 * 6             (consciousness hub embedding dim)
+//   ff_dim  = 1536 = 384 * 4           (SwiGLU feedforward, 8/3 approx 4x)
+//   heads   = 6                        (n=6 attention heads, for RoPE pairing)
+//   layers  = 2                        (shallow projector, Mk.III)
+//   eps     = 1e-5                     (LayerNorm epsilon)
+//
+// BT reference: BT-SPEAK-01 (intent->audio coupling), Law 60 phase P2
+// Mk stage:     Mk.III (real numerical computation, physical limit)
+// Upstream:      ConsciousnessHub.embed() -> this
+// Downstream:    audio_token_predictor.hexa
+//
+// NOTE: All NN primitives are inlined (no cross-file use/import).
+//       Root cause: hexa silent-exit bug on 3+ module import chains
+//       (see feedback_hexa_silent_exit_5_imports.md). Every tensor op
+//       is self-contained in this file to guarantee runtime safety.
 
-let D_IN = 384
-let D_OUT = 384
-let N_HEADS = 6
-let N_LAYERS = 2
+// ================================================================
+// S0  CONSTANTS
+// ================================================================
 
-// TODO(Mk.II): real projector — LayerNorm → Linear(d_in,ff) → SwiGLU → Linear(ff,d_out)
-// TODO(Mk.II): RoPE on intent tokens if sequence > 1
-fn encode_intent(consciousness_vec: str) -> str {
-    // Mk.I dummy: passthrough tag
-    return "intent[" + consciousness_vec + "|d=" + to_string(D_OUT) + ",h=" + to_string(N_HEADS) + "]"
+let D_MODEL = 384              // bridge dim (64 * 6)
+let FF_DIM = 1536              // feedforward dim (384 * 4, SwiGLU effective ~2/3)
+let N_HEADS = 6                // attention heads for RoPE dim pairing
+let N_LAYERS = 2               // projector depth
+let LN_EPS = 0.00001           // LayerNorm epsilon (1e-5)
+let INIT_SEED = 20260416       // deterministic init seed (date-stamped)
+let PI = 3.141592653589793
+
+// ================================================================
+// S1  TENSOR PRIMITIVES (inlined, no cross-file import)
+// ================================================================
+// Root cause for inlining: hexa build emits empty main when use chain
+// spans 3+ modules (feedback_hexa_silent_exit_5_imports.md).
+// nn_core.hexa is the SSOT for these ops; this is a local copy.
+
+fn _zeros(n: int) -> array {
+    // Allocate n-element zero vector
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    out
 }
 
+fn _ones(n: int) -> array {
+    // Allocate n-element ones vector
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(1.0)
+        i = i + 1
+    }
+    out
+}
+
+fn _add(a: array, b: array) -> array {
+    // Element-wise addition: out[i] = a[i] + b[i]
+    let mut out = []
+    let n = len(a)
+    let mut i = 0
+    while i < n {
+        out = out.push(a[i] + b[i])
+        i = i + 1
+    }
+    out
+}
+
+fn _mul_scalar(a: array, s: float) -> array {
+    // Scalar multiply: out[i] = a[i] * s
+    let mut out = []
+    let n = len(a)
+    let mut i = 0
+    while i < n {
+        out = out.push(a[i] * s)
+        i = i + 1
+    }
+    out
+}
+
+fn _dot(a: array, b: array) -> float {
+    // Dot product: sum(a[i] * b[i])
+    let mut sum = 0.0
+    let n = len(a)
+    let mut i = 0
+    while i < n {
+        sum = sum + a[i] * b[i]
+        i = i + 1
+    }
+    sum
+}
+
+fn _norm(a: array) -> float {
+    // L2 norm: sqrt(sum(a[i]^2))
+    sqrt(_dot(a, a))
+}
+
+fn _mean(a: array) -> float {
+    // Arithmetic mean: sum(a) / len(a)
+    let mut s = 0.0
+    let n = len(a)
+    let mut i = 0
+    while i < n {
+        s = s + a[i]
+        i = i + 1
+    }
+    s / to_float(n)
+}
+
+fn _var(a: array) -> float {
+    // Population variance: E[(x - mu)^2]
+    let mu = _mean(a)
+    let n = len(a)
+    let mut acc = 0.0
+    let mut i = 0
+    while i < n {
+        let d = a[i] - mu
+        acc = acc + d * d
+        i = i + 1
+    }
+    acc / to_float(n)
+}
+
+fn _sigmoid(x: float) -> float {
+    // Logistic sigmoid: 1 / (1 + exp(-x))
+    1.0 / (1.0 + exp(0.0 - x))
+}
+
+fn _abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    x
+}
+
+// ================================================================
+// S2  XAVIER INIT (deterministic, seeded LCG)
+// ================================================================
+// Xavier uniform: U[-limit, limit], limit = sqrt(6 / (fan_in + fan_out))
+// Ensures variance preservation across layers for stable training.
+// Uses LCG (Linear Congruential Generator) for reproducibility.
+
+fn _xavier_init(fan_in: int, fan_out: int, seed: int) -> array {
+    let n = fan_in * fan_out
+    let limit = sqrt(6.0 / to_float(fan_in + fan_out))
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        // LCG: s = (s * 1103515245 + 12345) mod 2^31
+        s = (s * 1103515245 + 12345) % 2147483648
+        // Map [0, 999999] -> [-limit, +limit]
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 * limit - limit)
+        i = i + 1
+    }
+    out
+}
+
+// ================================================================
+// S3  LAYER NORM
+// ================================================================
+// LayerNorm(x) = (x - mu) / sqrt(var + eps) * gamma + beta
+//
+// Purpose: normalize activations to zero mean / unit variance per-token.
+// gamma (scale) and beta (shift) are learnable parameters.
+// eps prevents division by zero when variance is near 0.
+
+fn _layer_norm(x: array, gamma: array, beta: array, eps: float) -> array {
+    let mu = _mean(x)
+    let v = _var(x)
+    // inv_std = 1 / sqrt(var + eps) — single division, reused per element
+    let inv_std = 1.0 / sqrt(v + eps)
+    let n = len(x)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        // Normalize, then scale+shift: gamma[i] * (x[i] - mu) * inv_std + beta[i]
+        out = out.push((x[i] - mu) * inv_std * gamma[i] + beta[i])
+        i = i + 1
+    }
+    out
+}
+
+// ================================================================
+// S4  LINEAR LAYER (matvec)
+// ================================================================
+// y = W * x + b
+// W: [out_dim x in_dim] stored row-major (W[i*in_dim + j])
+// x: [in_dim], b: [out_dim], y: [out_dim]
+// Each output y[i] = sum_j(W[i,j] * x[j]) + b[i]
+
+fn _linear(x: array, W: array, b: array, in_dim: int, out_dim: int) -> array {
+    let mut y = _zeros(out_dim)
+    let mut i = 0
+    while i < out_dim {
+        let mut sum = b[i]
+        let mut j = 0
+        while j < in_dim {
+            sum = sum + W[i * in_dim + j] * x[j]
+            j = j + 1
+        }
+        y[i] = sum
+        i = i + 1
+    }
+    y
+}
+
+// ================================================================
+// S5  SwiGLU ACTIVATION
+// ================================================================
+// SwiGLU(x, gate) = x * sigmoid(gate)  (element-wise)
+//
+// From Shazeer 2020 "GLU Variants Improve Transformer":
+//   SwiGLU splits the FF layer into two parallel projections (up + gate).
+//   The gate branch passes through sigmoid, then multiplies the up branch.
+//   This provides smooth, learnable gating — better than ReLU/GELU for
+//   language modeling and audio intent encoding.
+//
+// Effective FF dim after SwiGLU = 2/3 * ff_dim (since two projections
+// share the budget), so ff_dim=1536 gives effective ~1024.
+
+fn _swiglu_vec(x: array, gate: array) -> array {
+    let mut out = []
+    let n = len(x)
+    let mut i = 0
+    while i < n {
+        // SwiGLU: x[i] * sigmoid(gate[i])
+        out = out.push(x[i] * _sigmoid(gate[i]))
+        i = i + 1
+    }
+    out
+}
+
+// ================================================================
+// S6  RoPE (Rotary Positional Embedding)
+// ================================================================
+// RoPE encodes position by rotating pairs of dimensions:
+//   (x[2i], x[2i+1]) rotated by angle = pos * freq_i
+//   where freq_i = 1 / 10000^(2i / d_model)
+//
+// From Su et al. 2021 "RoFormer: Enhanced Transformer with Rotary
+// Position Embedding":
+//   - Encodes absolute position via rotation matrix
+//   - Decays relative attention by distance (desirable for sequences)
+//   - Applied pre-attention in standard usage; here applied pre-projection
+//     to inject positional information into the intent stream
+//
+// For single-token (seq_len=1), RoPE at pos=0 is identity (cos(0)=1,
+// sin(0)=0), so it is a no-op. Only activates for multi-token sequences.
+
+fn _rope(x: array, pos: int, d: int) -> array {
+    let mut out = _zeros(d)
+    let half_d = d / 2
+    let mut i = 0
+    while i < half_d {
+        // Frequency for dimension pair i:
+        // freq = 1 / 10000^(2i/d) — lower frequencies for higher dims
+        let freq = 1.0 / pow(10000.0, 2.0 * to_float(i) / to_float(d))
+        let angle = to_float(pos) * freq
+        let cos_a = cos(angle)
+        let sin_a = sin(angle)
+        let x0 = x[2 * i]
+        let x1 = x[2 * i + 1]
+        // 2D rotation matrix: [cos -sin; sin cos] applied to (x0, x1)
+        out[2 * i] = x0 * cos_a - x1 * sin_a
+        out[2 * i + 1] = x0 * sin_a + x1 * cos_a
+        i = i + 1
+    }
+    out
+}
+
+// ================================================================
+// S7  WEIGHT INITIALIZATION
+// ================================================================
+// All weights are Xavier-initialized with deterministic seeds.
+// Biases are zero-initialized (standard practice).
+//
+// Weight layout for the SwiGLU FFN block:
+//   W_up:   [FF_DIM   x D_MODEL] — up-projection
+//   b_up:   [FF_DIM]             — up bias
+//   W_gate: [FF_DIM   x D_MODEL] — gate projection (parallel to up)
+//   b_gate: [FF_DIM]             — gate bias
+//   W_down: [D_MODEL  x FF_DIM]  — down-projection (back to model dim)
+//   b_down: [D_MODEL]            — down bias
+//   LN_g:   [D_MODEL]            — LayerNorm gamma (init 1.0)
+//   LN_b:   [D_MODEL]            — LayerNorm beta  (init 0.0)
+
+// Layer 0 weights
+let L0_W_UP = _xavier_init(D_MODEL, FF_DIM, INIT_SEED)
+let L0_B_UP = _zeros(FF_DIM)
+let L0_W_GATE = _xavier_init(D_MODEL, FF_DIM, INIT_SEED + 7)
+let L0_B_GATE = _zeros(FF_DIM)
+let L0_W_DOWN = _xavier_init(FF_DIM, D_MODEL, INIT_SEED + 13)
+let L0_B_DOWN = _zeros(D_MODEL)
+let L0_LN_G = _ones(D_MODEL)
+let L0_LN_B = _zeros(D_MODEL)
+
+// Layer 1 weights (second shallow projector layer)
+let L1_W_UP = _xavier_init(D_MODEL, FF_DIM, INIT_SEED + 100)
+let L1_B_UP = _zeros(FF_DIM)
+let L1_W_GATE = _xavier_init(D_MODEL, FF_DIM, INIT_SEED + 107)
+let L1_B_GATE = _zeros(FF_DIM)
+let L1_W_DOWN = _xavier_init(FF_DIM, D_MODEL, INIT_SEED + 113)
+let L1_B_DOWN = _zeros(D_MODEL)
+let L1_LN_G = _ones(D_MODEL)
+let L1_LN_B = _zeros(D_MODEL)
+
+// ================================================================
+// S8  SINGLE PROJECTOR LAYER (LayerNorm -> SwiGLU FFN -> Residual)
+// ================================================================
+// Pre-norm architecture (GPT-2 style):
+//   1. Normalize input with LayerNorm (stabilizes gradients)
+//   2. Two parallel linear projections: up + gate
+//   3. SwiGLU activation: up * sigmoid(gate)
+//   4. Down-projection back to d_model
+//   5. Residual: input + projected
+//
+// This is one "layer" of the shallow projector. With N_LAYERS=2,
+// the encoder applies this block twice for sufficient nonlinearity
+// to transform consciousness embeddings into audio-conditioned intents.
+
+fn _projector_layer(x: array, W_up: array, b_up: array, W_gate: array, b_gate: array, W_down: array, b_down: array, ln_g: array, ln_b: array) -> array {
+    // Step 1: LayerNorm — normalize to zero mean, unit variance
+    let x_norm = _layer_norm(x, ln_g, ln_b, LN_EPS)
+
+    // Step 2a: Up projection — Linear(d_model -> ff_dim)
+    // Projects normalized input to higher dimension for nonlinear transform
+    let up = _linear(x_norm, W_up, b_up, D_MODEL, FF_DIM)
+
+    // Step 2b: Gate projection — Linear(d_model -> ff_dim)
+    // Parallel path that controls information flow via sigmoid gating
+    let gate = _linear(x_norm, W_gate, b_gate, D_MODEL, FF_DIM)
+
+    // Step 3: SwiGLU — element-wise: up[i] * sigmoid(gate[i])
+    // Smooth gating allows gradient flow while filtering irrelevant dims
+    let activated = _swiglu_vec(up, gate)
+
+    // Step 4: Down projection — Linear(ff_dim -> d_model)
+    // Compress back to bridge dimension for residual compatibility
+    let projected = _linear(activated, W_down, b_down, FF_DIM, D_MODEL)
+
+    // Step 5: Residual connection — x + projected
+    // Skip connection preserves input identity, projected adds learned transform.
+    // Critical for gradient flow in deeper networks.
+    _add(x, projected)
+}
+
+// ================================================================
+// S9  ENCODE_INTENT — Main entry point
+// ================================================================
+// Full 2-layer intent encoder:
+//   input (384d) -> [RoPE if pos>0] -> Layer0 -> Layer1 -> output (384d)
+//
+// Parameters:
+//   input_vec: flat array of D_MODEL floats (consciousness embedding)
+//   pos:       sequence position (0 for single-token, >0 for multi-token)
+//
+// Returns: 384d audio-conditioned intent embedding
+
+fn encode_intent(input_vec: array, pos: int) -> array {
+    let mut x = input_vec
+
+    // RoPE: inject positional information for multi-token sequences.
+    // At pos=0, cos(0)=1 and sin(0)=0, so rotation is identity (no-op).
+    // For pos>0, each dimension pair rotates by pos * freq, encoding
+    // relative distance information that decays with attention distance.
+    if pos > 0 {
+        x = _rope(x, pos, D_MODEL)
+    }
+
+    // Layer 0: LayerNorm -> Linear(384->1536) -> SwiGLU -> Linear(1536->384) + residual
+    x = _projector_layer(x, L0_W_UP, L0_B_UP, L0_W_GATE, L0_B_GATE, L0_W_DOWN, L0_B_DOWN, L0_LN_G, L0_LN_B)
+
+    // Layer 1: same architecture, different weights — adds depth for
+    // learning more complex consciousness->intent mappings
+    x = _projector_layer(x, L1_W_UP, L1_B_UP, L1_W_GATE, L1_B_GATE, L1_W_DOWN, L1_B_DOWN, L1_LN_G, L1_LN_B)
+
+    x
+}
+
+// ================================================================
+// S10  SELF-TEST
+// ================================================================
+// Verifies:
+//   T1: Dimensionality preservation (384d in -> 384d out)
+//   T2: SwiGLU gating behavior (gate=large positive -> pass, large negative -> block)
+//   T3: Residual path (output is not zero when input is nonzero)
+//   T4: RoPE effect (pos=0 is identity, pos>0 changes output)
+//   T5: LayerNorm correctness (zero mean, unit variance after norm)
+//   T6: Multi-position sequence consistency (different pos -> different output)
+
+fn self_test_intent_encoder() {
+    println("================================================================")
+    println(" intent_encoder.hexa — HEXA-SPEAK Mk.III Self-Test")
+    println("================================================================")
+    println("")
+
+    let mut pass_count = 0
+    let mut fail_count = 0
+
+    // ── T1: Dimensionality preservation ──
+    // Input 384d ones vector, verify output is also 384d
+    println("[T1] Dimensionality: 384d input -> 384d output")
+    let input_ones = _ones(D_MODEL)
+    let out1 = encode_intent(input_ones, 0)
+    let out1_len = len(out1)
+    if out1_len == D_MODEL {
+        println("  PASS: len(output) = " + to_string(out1_len))
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: len(output) = " + to_string(out1_len) + " expected " + to_string(D_MODEL))
+        fail_count = fail_count + 1
+    }
+    println("")
+
+    // ── T2: SwiGLU gating behavior ──
+    // Test the primitive: large positive gate -> pass through, large negative -> block
+    println("[T2] SwiGLU gating behavior")
+    let gate_open = [5.0, 5.0, 5.0, 5.0]
+    let gate_closed = [-5.0, -5.0, -5.0, -5.0]
+    let signal = [1.0, 2.0, 3.0, 4.0]
+    let open_result = _swiglu_vec(signal, gate_open)
+    let closed_result = _swiglu_vec(signal, gate_closed)
+    // sigmoid(5) approx 0.9933, so open should be close to signal
+    // sigmoid(-5) approx 0.0067, so closed should be near zero
+    let open_ratio = open_result[0] / signal[0]
+    let closed_ratio = closed_result[0] / signal[0]
+    let t2_pass = open_ratio > 0.99 && closed_ratio < 0.01
+    if t2_pass {
+        println("  PASS: open_ratio=" + to_string(open_ratio) + " closed_ratio=" + to_string(closed_ratio))
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: open_ratio=" + to_string(open_ratio) + " closed_ratio=" + to_string(closed_ratio))
+        fail_count = fail_count + 1
+    }
+    println("")
+
+    // ── T3: Residual path (output != 0 for nonzero input) ──
+    // The residual connection (x + projected) guarantees that even if the
+    // projection collapses to zero, the input passes through.
+    println("[T3] Residual path: nonzero input -> nonzero output")
+    let input_small = _mul_scalar(_ones(D_MODEL), 0.01)
+    let out3 = encode_intent(input_small, 0)
+    let out3_norm = _norm(out3)
+    let in3_norm = _norm(input_small)
+    // Output norm must be nonzero (residual guarantees this)
+    if out3_norm > 0.0 {
+        println("  PASS: input_norm=" + to_string(in3_norm) + " output_norm=" + to_string(out3_norm))
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: output_norm=0 (residual path broken)")
+        fail_count = fail_count + 1
+    }
+    println("")
+
+    // ── T4: RoPE effect (pos=0 vs pos=1 differ) ──
+    // At pos=0 RoPE is identity. At pos=1 it rotates dimension pairs.
+    // So encode_intent(x, 0) != encode_intent(x, 1) for nonzero x.
+    println("[T4] RoPE: pos=0 vs pos=1 produce different outputs")
+    let rope_input = _ones(D_MODEL)
+    let out_pos0 = encode_intent(rope_input, 0)
+    let out_pos1 = encode_intent(rope_input, 1)
+    // Compute L2 distance between the two outputs
+    let mut rope_diff = 0.0
+    let mut ri = 0
+    while ri < D_MODEL {
+        let d = out_pos0[ri] - out_pos1[ri]
+        rope_diff = rope_diff + d * d
+        ri = ri + 1
+    }
+    rope_diff = sqrt(rope_diff)
+    if rope_diff > 0.001 {
+        println("  PASS: L2 distance = " + to_string(rope_diff) + " (pos encodes differently)")
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: L2 distance = " + to_string(rope_diff) + " (RoPE has no effect)")
+        fail_count = fail_count + 1
+    }
+    println("")
+
+    // ── T5: LayerNorm correctness ──
+    // After LayerNorm with gamma=1, beta=0, output should have mean~0, var~1
+    println("[T5] LayerNorm: zero mean, unit variance")
+    let ln_input = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    let ln_g = _ones(6)
+    let ln_b = _zeros(6)
+    let ln_out = _layer_norm(ln_input, ln_g, ln_b, LN_EPS)
+    let ln_mean = _mean(ln_out)
+    let ln_var = _var(ln_out)
+    let t5_mean_ok = _abs(ln_mean) < 0.001
+    let t5_var_ok = _abs(ln_var - 1.0) < 0.01
+    if t5_mean_ok && t5_var_ok {
+        println("  PASS: mean=" + to_string(ln_mean) + " var=" + to_string(ln_var))
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: mean=" + to_string(ln_mean) + " var=" + to_string(ln_var))
+        fail_count = fail_count + 1
+    }
+    println("")
+
+    // ── T6: Multi-position consistency ──
+    // Different positions should yield monotonically increasing L2 distance
+    // from pos=0 output, since RoPE rotation angle grows with position.
+    println("[T6] Multi-position: L2 distance grows with position")
+    let mp_input = _ones(D_MODEL)
+    let base_out = encode_intent(mp_input, 0)
+    let out_p2 = encode_intent(mp_input, 2)
+    let out_p5 = encode_intent(mp_input, 5)
+    let mut dist2 = 0.0
+    let mut dist5 = 0.0
+    let mut mi = 0
+    while mi < D_MODEL {
+        let d2 = base_out[mi] - out_p2[mi]
+        let d5 = base_out[mi] - out_p5[mi]
+        dist2 = dist2 + d2 * d2
+        dist5 = dist5 + d5 * d5
+        mi = mi + 1
+    }
+    dist2 = sqrt(dist2)
+    dist5 = sqrt(dist5)
+    if dist5 > dist2 && dist2 > 0.001 {
+        println("  PASS: dist(pos=2)=" + to_string(dist2) + " dist(pos=5)=" + to_string(dist5) + " (monotonic)")
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: dist(pos=2)=" + to_string(dist2) + " dist(pos=5)=" + to_string(dist5))
+        fail_count = fail_count + 1
+    }
+    println("")
+
+    // ── Summary ──
+    println("────────────────────────────────────────────────────────────")
+    println("  Results: " + to_string(pass_count) + " PASS / " + to_string(fail_count) + " FAIL out of 6 tests")
+    if fail_count == 0 {
+        println("  ALL TESTS PASSED")
+    } else {
+        println("  SOME TESTS FAILED")
+    }
+    println("────────────────────────────────────────────────────────────")
+    println("")
+}
+
+// ================================================================
+// S11  MAIN
+// ================================================================
+
 fn main() {
-    println("intent_encoder Mk.I — d_in=" + to_string(D_IN) + " d_out=" + to_string(D_OUT) + " heads=" + to_string(N_HEADS))
-    let v = encode_intent("phi=0.71,arousal=0.42,valence=0.18")
-    println("out: " + v)
+    println("intent_encoder Mk.III — d_model=" + to_string(D_MODEL) + " ff_dim=" + to_string(FF_DIM) + " heads=" + to_string(N_HEADS) + " layers=" + to_string(N_LAYERS))
+    println("")
+
+    // Architecture summary
+    println("Architecture:")
+    println("  input(384d)")
+    println("    |")
+    println("    v")
+    println("  [RoPE] (if pos > 0)")
+    println("    |")
+    println("    v")
+    println("  Layer 0: LayerNorm(384) -> Linear(384,1536) -+-> SwiGLU -> Linear(1536,384) + residual")
+    println("                                                |")
+    println("                                          Linear(384,1536) (gate)")
+    println("    |")
+    println("    v")
+    println("  Layer 1: LayerNorm(384) -> Linear(384,1536) -+-> SwiGLU -> Linear(1536,384) + residual")
+    println("                                                |")
+    println("                                          Linear(384,1536) (gate)")
+    println("    |")
+    println("    v")
+    println("  output(384d)")
+    println("")
+
+    // Run self-tests
+    self_test_intent_encoder()
+
+    // Demo: encode a sample consciousness vector
+    println("Demo: encode ones(384) at pos=0")
+    let demo_input = _ones(D_MODEL)
+    let demo_out = encode_intent(demo_input, 0)
+    println("  input_norm=" + to_string(_norm(demo_input)) + " output_norm=" + to_string(_norm(demo_out)))
+    println("  output[0..4]=" + to_string(demo_out[0]) + ", " + to_string(demo_out[1]) + ", " + to_string(demo_out[2]) + ", " + to_string(demo_out[3]))
+    println("")
+
+    println("Demo: encode ones(384) at pos=3 (RoPE active)")
+    let demo_out_p3 = encode_intent(demo_input, 3)
+    println("  input_norm=" + to_string(_norm(demo_input)) + " output_norm=" + to_string(_norm(demo_out_p3)))
+    println("  output[0..4]=" + to_string(demo_out_p3[0]) + ", " + to_string(demo_out_p3[1]) + ", " + to_string(demo_out_p3[2]) + ", " + to_string(demo_out_p3[3]))
+    println("")
+
+    println("intent_encoder Mk.III ready.")
 }
 
 main()

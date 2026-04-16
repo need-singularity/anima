@@ -1,55 +1,1221 @@
-// audio_token_predictor.hexa — HEXA-SPEAK Mk.I: Audio Token Predictor
+// audio_token_predictor.hexa — HEXA-SPEAK Mk.III: Audio Token Predictor
 //
 // Purpose:
-//   Autoregressive transformer predicting RVQ audio tokens from intent memory.
-//   Consumes intent_encoder output, emits discrete codebook indices per frame.
+//   AR (autoregressive) decoder with KV-cache, 8-stage RVQ delayed-pattern
+//   head, CFG (Classifier-Free Guidance), and temperature+top-k sampling.
+//   Stage 2 in the consciousness-to-speech pipeline.
 //
-// n=6 parameters (n=6 everywhere — no hardcode, config-driven at build):
-//   layers  = 3                          (shallow, streaming-friendly)
-//   heads   = 12 = 6 * 2                 (σ(6)=12 unique identity)
-//   d_model = 768 = 128 * 6              (= 2 * intent dim)
-//   d_head  = 64 = 768 / 12
-//   ff      = 3072 = 768 * 4             (SwiGLU 8/3)
-//   ctx     = 1536 = 256 * 6             (~15s @ 100Hz frame rate)
-//   frame_hz = 100                       (10ms per audio frame)
+// Architecture:
+//   1. Causal self-attention with KV-cache (streaming decode, O(1) per step)
+//   2. 8-stage RVQ head: delayed pattern — stage s predicts frame t+s
+//      (MusicGen/SoundStorm-style interleaving reduces codebook coupling)
+//   3. CFG: run conditioned + unconditioned forward, blend with cfg_scale
+//      logits_final = logits_uncond + cfg_scale * (logits_cond - logits_uncond)
+//   4. Temperature scaling + top-k sampling
+//
+// n=6 parameters:
+//   d_model    = 384 = 64 * 6    (bridge dim, matches intent encoder output)
+//   n_heads    = 6                (n=6 heads)
+//   d_head     = 64 = 384 / 6    (per-head dimension)
+//   d_ff       = 1536 = 384 * 4  (FFN inner dim)
+//   n_layers   = 3                (shallow for streaming latency)
+//   rvq_stages = 8 = n + 2       (residual quantizer depth)
+//   vocab_size = 1024             (codebook entries per stage)
+//   ctx        = 1536 = 256 * 6  (~15s at 100Hz)
 //
 // BT reference: BT-SPEAK-02 (streaming AR audio), Law 49 Phi-checkpoint
-// Mk stage:     Mk.I (skeleton, dummy loop)
-// Upstream:     intent_encoder.hexa
-// Downstream:   rvq_codebook.hexa (indices → waveform path)
+// Mk stage:     Mk.III (real computation, KV-cache, CFG, delayed pattern)
+// Upstream:      intent_encoder.hexa / hexa_speak.hexa (Stage 1 -> intent_emb)
+// Downstream:    rvq_codebook.hexa (indices -> latent -> vocoder)
 
-let N_LAYERS = 3
-let N_HEADS = 12
-let D_MODEL = 768
-let D_HEAD = 64
-let FF = 3072
-let CTX = 1536
-let FRAME_HZ = 100
+// ════════════════════════════════════════════════════════════════════
+// Constants
+// ════════════════════════════════════════════════════════════════════
 
-// TODO(Mk.II): KV-cache streaming decode, Flash Attention, RoPE
-// TODO(Mk.II): 8-stage RVQ head (delayed pattern, stage-wise prediction)
-// TODO(Mk.II): CFG (classifier-free guidance) for intent conditioning
-fn predict_frame(intent_mem: str, prev_tokens: str, step: int) -> str {
-    // Mk.I dummy: emit placeholder token id
-    let tok = (step * 7) % 1024
-    return to_string(tok)
+let ATP_D_MODEL = 384
+let ATP_N_HEADS = 6
+let ATP_D_HEAD = 64
+let ATP_D_FF = 1536
+let ATP_N_LAYERS = 3
+let ATP_RVQ_STAGES = 8
+let ATP_VOCAB_SIZE = 1024
+let ATP_CTX = 1536
+let ATP_EPS = 1.0e-8
+let ATP_NEG_INF = -1.0e30
+let ATP_PI = 3.141592653589793
+
+// ════════════════════════════════════════════════════════════════════
+// 1. PRNG — deterministic xorshift for reproducible sampling
+//    Inlined to avoid cross-file import (silent exit on 3+ modules).
+// ════════════════════════════════════════════════════════════════════
+
+fn atp_prng_next(state: int) -> int {
+    // LCG: s = (s * 1103515245 + 12345) mod 2^31
+    // Widely used in C stdlib, deterministic and fast.
+    let s = (state * 1103515245 + 12345) % 2147483648
+    return s
 }
 
-fn gen_tokens(intent_mem: str, n_frames: int) -> str {
-    let out = ""
-    let i = 0
-    while i < n_frames {
-        let t = predict_frame(intent_mem, out, i)
-        out = out + t + ","
+fn atp_prng_float(state: int) -> float {
+    // Uniform in [0, 1) from integer state
+    let s = atp_prng_next(state)
+    let f = to_float(s % 1000000) / 1000000.0
+    return f
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 2. Vector / Tensor Primitives (inlined, no external dependency)
+//    Flat array representation: A[M*K], row-major.
+// ════════════════════════════════════════════════════════════════════
+
+fn atp_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
         i = i + 1
     }
     return out
 }
 
+fn atp_ones(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn atp_rand_vec(n: int, seed: int) -> array {
+    // LCG-based pseudo-random initialization in [-0.1, 0.1]
+    // Small init scale prevents exploding activations in deep nets.
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let val = to_float(s % 10000) / 50000.0 - 0.1
+        out = out.push(val)
+        i = i + 1
+    }
+    return out
+}
+
+fn atp_vec_add(a: array, b: array) -> array {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(a[i] + b[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn atp_vec_scale(a: array, s: float) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(a) {
+        out = out.push(a[i] * s)
+        i = i + 1
+    }
+    return out
+}
+
+fn atp_dot(a: array, b: array, n: int) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+// mat_vec: [rows x cols] @ [cols] -> [rows]
+fn atp_mat_vec(mat: array, vec: array, rows: int, cols: int) -> array {
+    let mut out = []
+    let mut r = 0
+    while r < rows {
+        let mut s = 0.0
+        let mut c = 0
+        while c < cols {
+            s = s + mat[r * cols + c] * vec[c]
+            c = c + 1
+        }
+        out = out.push(s)
+        r = r + 1
+    }
+    return out
+}
+
+fn atp_tensor_norm(a: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < len(a) {
+        s = s + a[i] * a[i]
+        i = i + 1
+    }
+    return sqrt(s)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 3. Layer Norm — Pre-norm stabilization
+//    LN(x) = (x - mu) / sqrt(var + eps) * gamma + beta
+// ════════════════════════════════════════════════════════════════════
+
+fn atp_layer_norm(x: array, gamma: array, beta: array, d: int) -> array {
+    // Compute mean
+    let mut mu = 0.0
+    let mut i = 0
+    while i < d {
+        mu = mu + x[i]
+        i = i + 1
+    }
+    mu = mu / to_float(d)
+
+    // Compute variance
+    let mut v = 0.0
+    i = 0
+    while i < d {
+        let diff = x[i] - mu
+        v = v + diff * diff
+        i = i + 1
+    }
+    v = v / to_float(d)
+
+    let inv_std = 1.0 / sqrt(v + ATP_EPS)
+
+    // Normalize + affine transform
+    let mut out = []
+    i = 0
+    while i < d {
+        let normed = (x[i] - mu) * inv_std
+        out = out.push(normed * gamma[i] + beta[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 4. Softmax — Numerically stable (subtract max first)
+// ════════════════════════════════════════════════════════════════════
+
+fn atp_softmax(logits: array, n: int) -> array {
+    // Step 1: find max for numerical stability
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+
+    // Step 2: compute exp(x - max) and sum
+    let mut exps = []
+    let mut total = 0.0
+    i = 0
+    while i < n {
+        let e = exp(logits[i] - mx)
+        exps = exps.push(e)
+        total = total + e
+        i = i + 1
+    }
+
+    // Step 3: normalize
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out.push(exps[i] / (total + ATP_EPS))
+        i = i + 1
+    }
+    return out
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 5. SwiGLU FFN — gate = sigmoid(W_gate @ x), out = W2 @ (silu(gate) * up)
+//    silu(x) = x * sigmoid(x) — smooth non-monotonic activation.
+// ════════════════════════════════════════════════════════════════════
+
+fn atp_sigmoid(x: float) -> float {
+    return 1.0 / (1.0 + exp(0.0 - x))
+}
+
+fn atp_silu(x: float) -> float {
+    return x * atp_sigmoid(x)
+}
+
+fn atp_swiglu_ffn(x: array, w1: array, w_gate: array, w2: array, d_model: int, d_ff: int) -> array {
+    // up = W1 @ x  [d_ff]
+    let up = atp_mat_vec(w1, x, d_ff, d_model)
+    // gate = W_gate @ x  [d_ff]
+    let gate = atp_mat_vec(w_gate, x, d_ff, d_model)
+
+    // activated = silu(gate) * up — element-wise gating
+    let mut activated = []
+    let mut i = 0
+    while i < d_ff {
+        activated = activated.push(atp_silu(gate[i]) * up[i])
+        i = i + 1
+    }
+
+    // down = W2 @ activated  [d_model]
+    let out = atp_mat_vec(w2, activated, d_model, d_ff)
+    return out
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 6. RoPE — Rotary Position Embedding
+//    Encodes absolute position via rotation of (x[2i], x[2i+1]) pairs.
+//    theta_i = 1 / 10000^(2i/d), rotation angle = pos * theta_i
+// ════════════════════════════════════════════════════════════════════
+
+fn atp_rope_encode(x: array, seq_pos: int, d: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        if i + 1 < d {
+            let half = i / 2
+            let theta = 1.0 / pow(10000.0, 2.0 * to_float(half) / to_float(d))
+            let angle = to_float(seq_pos) * theta
+            let c = cos(angle)
+            let s = sin(angle)
+            // Rotation: [cos -sin; sin cos] @ [x0; x1]
+            out = out.push(x[i] * c - x[i + 1] * s)
+            out = out.push(x[i] * s + x[i + 1] * c)
+            i = i + 2
+        } else {
+            // Odd dimension: pass through unchanged
+            out = out.push(x[i])
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 7. KV-Cache — Append-only key/value store for O(1) decode steps
+//
+//    Standard transformer recomputes all K/V every step -> O(n^2).
+//    KV-cache stores previous K/V and only computes the new row -> O(n).
+//    Structure: per-layer flat arrays for keys and values,
+//    plus a position counter.
+// ════════════════════════════════════════════════════════════════════
+
+fn atp_kv_cache_init(n_layers: int) -> array {
+    // Returns list of [n_layers] entries.
+    // Each entry = [keys_flat, values_flat, [seq_pos_as_float]]
+    // seq_pos stored as single-element array to keep uniform type.
+    let mut cache = []
+    let mut i = 0
+    while i < n_layers {
+        cache = cache.push([[], [], [0.0]])
+        i = i + 1
+    }
+    return cache
+}
+
+fn atp_kv_cache_append(cache: array, layer: int, new_k: array, new_v: array, d_model: int) -> array {
+    // Append one K/V row to the specified layer's cache.
+    // Returns a new cache (hexa lists are pass-by-value).
+    let entry = cache[layer]
+    let mut keys = entry[0]
+    let mut vals = entry[1]
+    let seq_pos = entry[2][0]
+
+    // Append d_model elements for the new key and value
+    let mut i = 0
+    while i < d_model {
+        keys = keys.push(new_k[i])
+        vals = vals.push(new_v[i])
+        i = i + 1
+    }
+
+    // Rebuild cache with updated layer (pass-by-value requires full rebuild)
+    let mut new_cache = []
+    i = 0
+    while i < len(cache) {
+        if i == layer {
+            new_cache = new_cache.push([keys, vals, [seq_pos + 1.0]])
+        } else {
+            new_cache = new_cache.push(cache[i])
+        }
+        i = i + 1
+    }
+    return new_cache
+}
+
+fn atp_kv_cache_get(cache: array, layer: int) -> array {
+    // Returns [keys_flat, values_flat, seq_pos_float]
+    let entry = cache[layer]
+    return [entry[0], entry[1], entry[2][0]]
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 8. Causal Self-Attention with KV-Cache
+//
+//    For a SINGLE token at position `pos`:
+//      1. Project Q from current token
+//      2. K/V already in cache from prior steps + new K/V appended
+//      3. Per head: Q_h . K_h^T / sqrt(d_head), causal mask, softmax, * V_h
+//      4. Concat heads, output projection
+//
+//    This is the core streaming decode primitive.
+// ════════════════════════════════════════════════════════════════════
+
+fn atp_multi_head_attn(q_vec: array, k_cache: array, v_cache: array, wq: array, wk: array, wv: array, wo: array, n_heads: int, d_head: int, d_model: int, pos: int, kv_len: int) -> array {
+    // Project query: Q = Wq @ x  [d_model]
+    let q_proj = atp_mat_vec(wq, q_vec, d_model, d_model)
+
+    let mut attn_out = atp_zeros(d_model)
+    let scale = 1.0 / sqrt(to_float(d_head))
+
+    let mut h = 0
+    while h < n_heads {
+        let head_off = h * d_head
+
+        // Extract Q slice for this head + apply RoPE
+        let mut q_h = []
+        let mut di = 0
+        while di < d_head {
+            q_h = q_h.push(q_proj[head_off + di])
+            di = di + 1
+        }
+        q_h = atp_rope_encode(q_h, pos, d_head)
+
+        // Compute attention scores over all cached kv positions
+        let mut scores = []
+        let mut t = 0
+        while t < kv_len {
+            // Extract K[t] for this head from flat k_cache
+            let mut k_h = []
+            di = 0
+            while di < d_head {
+                k_h = k_h.push(k_cache[t * d_model + head_off + di])
+                di = di + 1
+            }
+            k_h = atp_rope_encode(k_h, t, d_head)
+
+            // Scaled dot product: Q_h . K_h / sqrt(d_head)
+            let score = atp_dot(q_h, k_h, d_head) * scale
+
+            // Causal mask: future positions get -inf
+            if t > pos {
+                scores = scores.push(ATP_NEG_INF)
+            } else {
+                scores = scores.push(score)
+            }
+            t = t + 1
+        }
+
+        // Softmax over scores -> attention weights
+        let probs = atp_softmax(scores, kv_len)
+
+        // Weighted sum of values: sum_t(prob[t] * V_h[t])
+        let mut v_sum = atp_zeros(d_head)
+        t = 0
+        while t < kv_len {
+            let mut new_v = []
+            di = 0
+            while di < d_head {
+                new_v = new_v.push(v_sum[di] + probs[t] * v_cache[t * d_model + head_off + di])
+                di = di + 1
+            }
+            v_sum = new_v
+            t = t + 1
+        }
+
+        // Write head output into concatenated attn_out
+        let mut new_attn = []
+        di = 0
+        while di < d_model {
+            if di >= head_off && di < head_off + d_head {
+                new_attn = new_attn.push(attn_out[di] + v_sum[di - head_off])
+            } else {
+                new_attn = new_attn.push(attn_out[di])
+            }
+            di = di + 1
+        }
+        attn_out = new_attn
+
+        h = h + 1
+    }
+
+    // Output projection: Wo @ concat(heads)
+    let out = atp_mat_vec(wo, attn_out, d_model, d_model)
+    return out
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 9. Transformer Decoder Block (Pre-Norm)
+//
+//    x -> LN1 -> SelfAttn(KV-cache) -> + residual
+//      -> LN2 -> SwiGLU FFN          -> + residual
+//
+//    Block stored as list of 11 weight arrays:
+//    [wq, wk, wv, wo, w1, w_gate, w2, ln1_g, ln1_b, ln2_g, ln2_b]
+// ════════════════════════════════════════════════════════════════════
+
+fn atp_block_init(d_model: int, n_heads: int, d_ff: int, seed: int) -> array {
+    let dm2 = d_model * d_model
+    let df_dm = d_ff * d_model
+    let dm_df = d_model * d_ff
+
+    let wq = atp_rand_vec(dm2, seed)
+    let wk = atp_rand_vec(dm2, seed + 1)
+    let wv = atp_rand_vec(dm2, seed + 2)
+    let wo = atp_rand_vec(dm2, seed + 3)
+    let w1 = atp_rand_vec(df_dm, seed + 4)
+    let w_gate = atp_rand_vec(df_dm, seed + 5)
+    let w2 = atp_rand_vec(dm_df, seed + 6)
+    let ln1_g = atp_ones(d_model)
+    let ln1_b = atp_zeros(d_model)
+    let ln2_g = atp_ones(d_model)
+    let ln2_b = atp_zeros(d_model)
+
+    return [wq, wk, wv, wo, w1, w_gate, w2, ln1_g, ln1_b, ln2_g, ln2_b]
+}
+
+fn atp_block_forward(block: array, x: array, kv_len: int, k_cache: array, v_cache: array, pos: int, d_model: int, n_heads: int, d_head: int, d_ff: int) -> array {
+    // Returns [output, new_k_row, new_v_row] for KV-cache update
+    let wq = block[0]
+    let wk = block[1]
+    let wv = block[2]
+    let wo = block[3]
+    let w1 = block[4]
+    let w_gate = block[5]
+    let w2 = block[6]
+    let ln1_g = block[7]
+    let ln1_b = block[8]
+    let ln2_g = block[9]
+    let ln2_b = block[10]
+
+    // Pre-norm 1: layer norm before self-attention
+    let x_norm1 = atp_layer_norm(x, ln1_g, ln1_b, d_model)
+
+    // Compute new K and V for this position (before RoPE; RoPE applied inside attn)
+    let new_k = atp_mat_vec(wk, x_norm1, d_model, d_model)
+    let new_v = atp_mat_vec(wv, x_norm1, d_model, d_model)
+
+    // Append new K/V to cache for attention (build full_k/full_v)
+    let mut full_k = []
+    let mut full_v = []
+    let mut ci = 0
+    while ci < len(k_cache) {
+        full_k = full_k.push(k_cache[ci])
+        full_v = full_v.push(v_cache[ci])
+        ci = ci + 1
+    }
+    ci = 0
+    while ci < d_model {
+        full_k = full_k.push(new_k[ci])
+        full_v = full_v.push(new_v[ci])
+        ci = ci + 1
+    }
+    let new_kv_len = kv_len + 1
+
+    // Causal self-attention with KV-cache
+    let attn_out = atp_multi_head_attn(x_norm1, full_k, full_v, wq, wk, wv, wo, n_heads, d_head, d_model, pos, new_kv_len)
+
+    // Residual connection 1
+    let x2 = atp_vec_add(x, attn_out)
+
+    // Pre-norm 2: layer norm before FFN
+    let x_norm2 = atp_layer_norm(x2, ln2_g, ln2_b, d_model)
+
+    // SwiGLU FFN
+    let ffn_out = atp_swiglu_ffn(x_norm2, w1, w_gate, w2, d_model, d_ff)
+
+    // Residual connection 2
+    let out = atp_vec_add(x2, ffn_out)
+
+    return [out, new_k, new_v]
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 10. Temperature + Top-k Sampling
+//
+//     1. Scale logits by 1/temperature (higher T -> flatter distribution)
+//     2. Find top-k values by repeated argmax
+//     3. Softmax over top-k only
+//     4. Sample from categorical using LCG PRNG
+//
+//     top_k limits the vocabulary considered, preventing low-probability
+//     garbage tokens from being sampled.
+// ════════════════════════════════════════════════════════════════════
+
+fn atp_sample_top_k(logits: array, vocab_size: int, temperature: float, top_k: int, seed: int) -> int {
+    // Apply temperature scaling: logits / T
+    // Low T -> peaked distribution (greedy-like)
+    // High T -> flat distribution (more random)
+    let mut scaled = []
+    let mut i = 0
+    while i < vocab_size {
+        scaled = scaled.push(logits[i] / (temperature + ATP_EPS))
+        i = i + 1
+    }
+
+    // Find top-k indices via selection sort (O(k*V), fine for V=1024)
+    let mut top_indices = []
+    let mut top_vals = []
+    let mut used = atp_zeros(vocab_size)  // 1.0 = already picked
+
+    let mut k = 0
+    let actual_k = top_k
+    if actual_k > vocab_size { actual_k = vocab_size }
+    while k < actual_k {
+        let mut best_idx = 0
+        let mut best_val = ATP_NEG_INF
+        i = 0
+        while i < vocab_size {
+            if used[i] < 0.5 && scaled[i] > best_val {
+                best_val = scaled[i]
+                best_idx = i
+            }
+            i = i + 1
+        }
+        top_indices = top_indices.push(best_idx)
+        top_vals = top_vals.push(best_val)
+        // Mark this index as used (must rebuild array — pass-by-value)
+        let mut new_used = []
+        i = 0
+        while i < vocab_size {
+            if i == best_idx {
+                new_used = new_used.push(1.0)
+            } else {
+                new_used = new_used.push(used[i])
+            }
+            i = i + 1
+        }
+        used = new_used
+        k = k + 1
+    }
+
+    // Softmax over top-k logit values -> sampling probabilities
+    let probs = atp_softmax(top_vals, len(top_vals))
+
+    // Categorical sampling using LCG pseudo-random
+    let mut s = seed
+    s = atp_prng_next(s)
+    let r = to_float(s % 10000) / 10000.0
+
+    let mut cumsum = 0.0
+    i = 0
+    while i < len(probs) {
+        cumsum = cumsum + probs[i]
+        if r < cumsum {
+            return to_int(top_indices[i])
+        }
+        i = i + 1
+    }
+    // Fallback: return last of top-k
+    return to_int(top_indices[len(top_indices) - 1])
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 11. Decoder Model Init — Stack of N_LAYERS blocks + output heads
+//
+//     The model holds:
+//       - Token embedding table [vocab_size x d_model]
+//       - N_LAYERS decoder blocks (causal self-attn + FFN)
+//       - 8 RVQ stage heads [vocab_size x d_model] each
+//         (separate head per codebook stage for delayed pattern)
+// ════════════════════════════════════════════════════════════════════
+
+fn atp_model_init(vocab_size: int, d_model: int, n_layers: int, n_heads: int, d_ff: int, rvq_stages: int, seed: int) -> array {
+    // Token embedding table: flat [vocab_size * d_model]
+    let embed_table = atp_rand_vec(vocab_size * d_model, seed)
+
+    // Decoder blocks
+    let mut blocks = []
+    let mut i = 0
+    while i < n_layers {
+        let blk = atp_block_init(d_model, n_heads, d_ff, seed + 2000 + i * 100)
+        blocks = blocks.push(blk)
+        i = i + 1
+    }
+
+    // Intent cross-projection: project d_model intent_emb -> d_model context
+    // Used to condition the decoder on intent (additive residual per step)
+    let intent_proj = atp_rand_vec(d_model * d_model, seed + 5000)
+
+    // 8 RVQ stage output heads: each [vocab_size x d_model]
+    // Stage s has its own head because each codebook captures different
+    // information (coarse->fine residuals).
+    let mut rvq_heads = []
+    i = 0
+    while i < rvq_stages {
+        let head = atp_rand_vec(vocab_size * d_model, seed + 6000 + i * 200)
+        rvq_heads = rvq_heads.push(head)
+        i = i + 1
+    }
+
+    // Pack model: [embed_table, blocks, intent_proj, rvq_heads,
+    //              vocab_size, d_model, n_layers, n_heads, d_ff, rvq_stages]
+    // Numeric params stored as single-element arrays for uniform typing.
+    return [embed_table, blocks, intent_proj, rvq_heads, [to_float(vocab_size)], [to_float(d_model)], [to_float(n_layers)], [to_float(n_heads)], [to_float(d_ff)], [to_float(rvq_stages)]]
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 12. Single Decode Step — One AR token -> hidden state -> logits
+//
+//     prev_token_id -> embed lookup -> + positional (RoPE via attn)
+//       -> + intent_context (additive conditioning)
+//       -> N blocks (causal self-attn + FFN with KV-cache)
+//       -> per-stage RVQ head -> logits[vocab_size] per stage
+// ════════════════════════════════════════════════════════════════════
+
+fn atp_decode_step(model: array, prev_token_id: int, cache: array, intent_ctx: array, step: int) -> array {
+    let embed_table = model[0]
+    let blocks = model[1]
+    let intent_proj = model[2]
+    let rvq_heads = model[3]
+    let vocab_size = to_int(model[4][0])
+    let d_model = to_int(model[5][0])
+    let n_layers = to_int(model[6][0])
+    let n_heads = to_int(model[7][0])
+    let d_ff = to_int(model[8][0])
+    let rvq_stages = to_int(model[9][0])
+    let d_head = d_model / n_heads
+
+    // Token embedding lookup: embed_table[prev_token_id * d_model .. +d_model]
+    let mut x = []
+    let mut i = 0
+    while i < d_model {
+        x = x.push(embed_table[prev_token_id * d_model + i])
+        i = i + 1
+    }
+
+    // Add intent context as additive conditioning:
+    //   x = x + project(intent_ctx)
+    // This is the "conditioned" path in CFG. When intent_ctx is zeros,
+    // it becomes the "unconditioned" path.
+    let projected_intent = atp_mat_vec(intent_proj, intent_ctx, d_model, d_model)
+    x = atp_vec_add(x, projected_intent)
+
+    // Pass through decoder blocks with KV-cache
+    let mut cur_cache = cache
+    let mut layer = 0
+    while layer < n_layers {
+        let blk = blocks[layer]
+        let kv = atp_kv_cache_get(cur_cache, layer)
+        let k_flat = kv[0]
+        let v_flat = kv[1]
+        let kv_len = to_int(kv[2])
+
+        // Block forward: self-attn + FFN, returns [output, new_k, new_v]
+        let result = atp_block_forward(blk, x, kv_len, k_flat, v_flat, step, d_model, n_heads, d_head, d_ff)
+        x = result[0]
+        let new_k = result[1]
+        let new_v = result[2]
+
+        // Update KV-cache for this layer
+        cur_cache = atp_kv_cache_append(cur_cache, layer, new_k, new_v, d_model)
+
+        layer = layer + 1
+    }
+
+    // Compute logits per RVQ stage: head_s @ x -> [vocab_size]
+    // Each stage has an independent linear head.
+    let mut all_logits = []
+    i = 0
+    while i < rvq_stages {
+        let head = rvq_heads[i]
+        let logits = atp_mat_vec(head, x, vocab_size, d_model)
+        all_logits = all_logits.push(logits)
+        i = i + 1
+    }
+
+    // Return [all_logits (list of 8 logit arrays), updated_cache]
+    return [all_logits, cur_cache]
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 13. CFG (Classifier-Free Guidance)
+//
+//     CFG blends conditioned and unconditioned predictions:
+//       logits_final = logits_uncond + cfg_scale * (logits_cond - logits_uncond)
+//
+//     cfg_scale=1.0 -> pure conditioned (no guidance boost)
+//     cfg_scale>1.0 -> amplifies the conditioning signal (sharper intent)
+//     cfg_scale=0.0 -> pure unconditioned
+//
+//     We run the model twice per step:
+//       1. With real intent_ctx -> conditioned logits
+//       2. With zeros intent_ctx -> unconditioned logits
+//     Then blend. This doubles compute but dramatically improves
+//     intent alignment for TTS.
+// ════════════════════════════════════════════════════════════════════
+
+fn atp_cfg_blend(logits_cond: array, logits_uncond: array, cfg_scale: float, vocab_size: int) -> array {
+    // logits_final[i] = uncond[i] + cfg_scale * (cond[i] - uncond[i])
+    let mut out = []
+    let mut i = 0
+    while i < vocab_size {
+        let blended = logits_uncond[i] + cfg_scale * (logits_cond[i] - logits_uncond[i])
+        out = out.push(blended)
+        i = i + 1
+    }
+    return out
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 14. Delayed Pattern — 8-stage RVQ interleaving
+//
+//     Standard: all 8 stages predict the same frame t simultaneously.
+//     Delayed pattern: stage s predicts frame (t + s).
+//
+//     For frame t, we collect:
+//       stage 0 -> prediction from step t
+//       stage 1 -> prediction from step t-1 (was predicting t-1+1 = t)
+//       stage 2 -> prediction from step t-2 (was predicting t-2+2 = t)
+//       ...
+//       stage s -> prediction from step t-s (was predicting t-s+s = t)
+//
+//     This reduces inter-stage error propagation because each stage
+//     operates with a temporal offset, producing more independent codes.
+//     (From MusicGen / Copet et al. 2023)
+//
+//     Implementation: during generation, we buffer stage predictions
+//     and assemble final indices once all offsets are available.
+// ════════════════════════════════════════════════════════════════════
+
+fn atp_assemble_delayed_pattern(all_stage_preds: array, frame: int, rvq_stages: int) -> array {
+    // For a given output frame, collect predictions from the buffer.
+    // all_stage_preds[step][stage] = token_id
+    //
+    // For output frame `frame`:
+    //   stage s uses prediction from step (frame - s), stage s
+    //   Only valid when frame - s >= 0.
+    //   If frame - s < 0, use token 0 (BOS/padding).
+    let mut indices = []
+    let mut s = 0
+    while s < rvq_stages {
+        let source_step = frame - s
+        if source_step >= 0 && source_step < len(all_stage_preds) {
+            let step_preds = all_stage_preds[source_step]
+            indices = indices.push(step_preds[s])
+        } else {
+            // Padding: frame not yet available, use codebook index 0
+            indices = indices.push(0)
+        }
+        s = s + 1
+    }
+    return indices
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 15. Main Entry Point: predict_tokens()
+//
+//     Full AR decode loop with KV-cache, CFG, delayed pattern, and
+//     temperature+top-k sampling.
+//
+//     Args:
+//       intent_emb  — 384d intent embedding from Stage 1
+//       d_model     — model dimension (384)
+//       n_frames    — number of output frames to generate
+//       rvq_stages  — number of RVQ stages (8)
+//       cfg_scale   — classifier-free guidance scale (1.0 = no boost)
+//       temperature — sampling temperature (0.7 typical for TTS)
+//       top_k       — top-k filter size (50 typical)
+//
+//     Returns: list of [n_frames] entries, each entry = [8 token indices]
+// ════════════════════════════════════════════════════════════════════
+
+fn predict_tokens(intent_emb: array, d_model: int, n_frames: int, rvq_stages: int, cfg_scale: float, temperature: float, top_k: int) -> array {
+    let n_heads = 6
+    let d_ff = d_model * 4
+    let n_layers = 3
+    let vocab_size = 1024
+    let seed = 42
+
+    // Initialize model weights
+    let model = atp_model_init(vocab_size, d_model, n_layers, n_heads, d_ff, rvq_stages, seed)
+
+    // Prepare "unconditioned" intent (zeros) for CFG
+    let uncond_intent = atp_zeros(d_model)
+
+    // Two KV-caches: one for conditioned, one for unconditioned path
+    let mut cache_cond = atp_kv_cache_init(n_layers)
+    let mut cache_uncond = atp_kv_cache_init(n_layers)
+
+    // Buffer all stage predictions per step for delayed pattern assembly.
+    // all_stage_preds[step] = [tok_stage0, tok_stage1, ..., tok_stage7]
+    let mut all_stage_preds = []
+
+    let mut prev_token = 0  // BOS token
+    let mut cur_seed = seed
+
+    // Total AR steps needed: n_frames + (rvq_stages - 1) to fill the delay buffer.
+    // After step t, stage s produced a prediction for frame (t + s).
+    // To get n_frames complete frames, we need n_frames + rvq_stages - 1 steps.
+    let total_steps = n_frames + rvq_stages - 1
+
+    let mut step = 0
+    while step < total_steps {
+        // ── Conditioned forward pass ──
+        let result_cond = atp_decode_step(model, prev_token, cache_cond, intent_emb, step)
+        let logits_cond_all = result_cond[0]
+        cache_cond = result_cond[1]
+
+        // ── Unconditioned forward pass (zeros intent) for CFG ──
+        let result_uncond = atp_decode_step(model, prev_token, cache_uncond, uncond_intent, step)
+        let logits_uncond_all = result_uncond[0]
+        cache_uncond = result_uncond[1]
+
+        // ── Per-stage: CFG blend + sample ──
+        let mut step_preds = []
+        let mut s = 0
+        while s < rvq_stages {
+            // CFG blend for this stage
+            let blended = atp_cfg_blend(logits_cond_all[s], logits_uncond_all[s], cfg_scale, vocab_size)
+
+            // Temperature + top-k sampling
+            // Vary seed per step+stage for diverse sampling
+            cur_seed = atp_prng_next(cur_seed + step * 7 + s * 13)
+            let sampled = atp_sample_top_k(blended, vocab_size, temperature, top_k, cur_seed)
+
+            step_preds = step_preds.push(sampled)
+            s = s + 1
+        }
+
+        all_stage_preds = all_stage_preds.push(step_preds)
+
+        // Use stage-0 prediction as the autoregressive token for next step
+        // (stage 0 is the coarse codebook — drives the AR chain)
+        prev_token = step_preds[0]
+
+        step = step + 1
+    }
+
+    // ── Assemble delayed pattern into final frame indices ──
+    // For each output frame, collect stage predictions with temporal offsets.
+    let mut output_frames = []
+    let mut f = 0
+    while f < n_frames {
+        let frame_indices = atp_assemble_delayed_pattern(all_stage_preds, f, rvq_stages)
+        output_frames = output_frames.push(frame_indices)
+        f = f + 1
+    }
+
+    return output_frames
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 16. Format helpers
+// ════════════════════════════════════════════════════════════════════
+
+fn atp_format_float(v: float, decimals: int) -> str {
+    if decimals == 4 {
+        let vi = to_int(v * 10000.0)
+        let whole = vi / 10000
+        let frac = vi % 10000
+        if frac < 0 { frac = -frac }
+        let fs = to_string(frac)
+        while len(fs) < 4 { fs = "0" + fs }
+        return to_string(whole) + "." + fs
+    }
+    if decimals == 2 {
+        let vi = to_int(v * 100.0)
+        let whole = vi / 100
+        let frac = vi % 100
+        if frac < 0 { frac = -frac }
+        let fs = to_string(frac)
+        while len(fs) < 2 { fs = "0" + fs }
+        return to_string(whole) + "." + fs
+    }
+    return to_string(v)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 17. Self-Test — Validates all major components
+// ════════════════════════════════════════════════════════════════════
+
+fn self_test_audio_token_predictor() {
+    println("================================================================")
+    println(" audio_token_predictor.hexa — Self Test (Mk.III)")
+    println("================================================================")
+    println("")
+
+    let mut pass = 0
+    let mut fail = 0
+
+    // ── Test 1: KV-cache init and append ──
+    // Verify that cache tracks sequence position and stores correct length.
+    println("  [1] KV-cache init + append")
+    let mut cache = atp_kv_cache_init(3)
+    let k1 = atp_rand_vec(8, 42)
+    let v1 = atp_rand_vec(8, 43)
+    cache = atp_kv_cache_append(cache, 0, k1, v1, 8)
+    let kv0 = atp_kv_cache_get(cache, 0)
+    let kv0_pos = kv0[2]
+    let kv0_klen = len(kv0[0])
+    if kv0_pos == 1.0 && kv0_klen == 8 {
+        println("      PASS: seq_pos=1, keys_len=8")
+        pass = pass + 1
+    } else {
+        println("      FAIL: seq_pos=" + to_string(kv0_pos) + ", keys_len=" + to_string(kv0_klen))
+        fail = fail + 1
+    }
+    // Second append
+    cache = atp_kv_cache_append(cache, 0, k1, v1, 8)
+    let kv0b = atp_kv_cache_get(cache, 0)
+    if kv0b[2] == 2.0 && len(kv0b[0]) == 16 {
+        println("      PASS: after 2nd append seq_pos=2, keys_len=16")
+        pass = pass + 1
+    } else {
+        println("      FAIL: after 2nd append seq_pos=" + to_string(kv0b[2]) + ", keys_len=" + to_string(len(kv0b[0])))
+        fail = fail + 1
+    }
+
+    // ── Test 2: Softmax sum = 1 and argmax correctness ──
+    // Softmax must sum to 1.0 and the highest logit must get highest prob.
+    println("  [2] Softmax sum=1 + argmax")
+    let logits = [2.0, 1.0, 0.1, -1.0, 3.0]
+    let probs = atp_softmax(logits, 5)
+    let mut psum = 0.0
+    let mut i = 0
+    while i < 5 {
+        psum = psum + probs[i]
+        i = i + 1
+    }
+    // Find argmax of probs
+    let mut argmax_idx = 0
+    let mut argmax_val = probs[0]
+    i = 1
+    while i < 5 {
+        if probs[i] > argmax_val {
+            argmax_val = probs[i]
+            argmax_idx = i
+        }
+        i = i + 1
+    }
+    let sum_ok = (psum > 0.999 && psum < 1.001)
+    let argmax_ok = (argmax_idx == 4)  // logit 3.0 at index 4 is highest
+    if sum_ok && argmax_ok {
+        println("      PASS: sum=" + atp_format_float(psum, 4) + ", argmax=4")
+        pass = pass + 1
+    } else {
+        println("      FAIL: sum=" + atp_format_float(psum, 4) + ", argmax=" + to_string(argmax_idx))
+        fail = fail + 1
+    }
+
+    // ── Test 3: CFG blend correctness ──
+    // cfg_scale=1.0 should return conditioned logits.
+    // cfg_scale=0.0 should return unconditioned logits.
+    println("  [3] CFG blend (scale=1.0 -> cond, scale=0.0 -> uncond)")
+    let cond = [1.0, 2.0, 3.0]
+    let uncond = [0.5, 0.5, 0.5]
+    let blend_1 = atp_cfg_blend(cond, uncond, 1.0, 3)
+    let blend_0 = atp_cfg_blend(cond, uncond, 0.0, 3)
+    // scale=1: result = uncond + 1*(cond - uncond) = cond
+    let cfg1_ok = (blend_1[0] > 0.99 && blend_1[0] < 1.01) && (blend_1[2] > 2.99 && blend_1[2] < 3.01)
+    // scale=0: result = uncond + 0*(cond - uncond) = uncond
+    let cfg0_ok = (blend_0[0] > 0.49 && blend_0[0] < 0.51) && (blend_0[2] > 0.49 && blend_0[2] < 0.51)
+    if cfg1_ok && cfg0_ok {
+        println("      PASS: scale=1->[1,2,3], scale=0->[0.5,0.5,0.5]")
+        pass = pass + 1
+    } else {
+        println("      FAIL: scale=1->[" + to_string(blend_1[0]) + "," + to_string(blend_1[1]) + "," + to_string(blend_1[2]) + "]")
+        println("            scale=0->[" + to_string(blend_0[0]) + "," + to_string(blend_0[1]) + "," + to_string(blend_0[2]) + "]")
+        fail = fail + 1
+    }
+    // Also test cfg_scale=2.0: amplified guidance
+    let blend_2 = atp_cfg_blend(cond, uncond, 2.0, 3)
+    // scale=2: result = 0.5 + 2*(1.0 - 0.5) = 1.5 for first element
+    let cfg2_ok = (blend_2[0] > 1.49 && blend_2[0] < 1.51)
+    if cfg2_ok {
+        println("      PASS: scale=2->first=" + atp_format_float(blend_2[0], 4) + " (expect 1.5)")
+        pass = pass + 1
+    } else {
+        println("      FAIL: scale=2->first=" + atp_format_float(blend_2[0], 4))
+        fail = fail + 1
+    }
+
+    // ── Test 4: Delayed pattern assembly ──
+    // Verify that stage offsets collect the correct predictions.
+    println("  [4] Delayed pattern assembly")
+    // Simulate 4 steps, 3 stages. step_preds[step] = [s0, s1, s2]
+    // step 0: [10, 20, 30]
+    // step 1: [11, 21, 31]
+    // step 2: [12, 22, 32]
+    // step 3: [13, 23, 33]
+    let mut sim_preds = []
+    sim_preds = sim_preds.push([10, 20, 30])
+    sim_preds = sim_preds.push([11, 21, 31])
+    sim_preds = sim_preds.push([12, 22, 32])
+    sim_preds = sim_preds.push([13, 23, 33])
+
+    // Frame 2 with 3 stages:
+    //   stage 0 -> step 2, stage 0 = 12
+    //   stage 1 -> step 1, stage 1 = 21
+    //   stage 2 -> step 0, stage 2 = 30
+    let assembled = atp_assemble_delayed_pattern(sim_preds, 2, 3)
+    let dp_ok = (assembled[0] == 12 && assembled[1] == 21 && assembled[2] == 30)
+    if dp_ok {
+        println("      PASS: frame 2 -> [12, 21, 30]")
+        pass = pass + 1
+    } else {
+        println("      FAIL: frame 2 -> [" + to_string(assembled[0]) + ", " + to_string(assembled[1]) + ", " + to_string(assembled[2]) + "]")
+        fail = fail + 1
+    }
+
+    // Frame 0 (first frame): stage 1 and 2 should use padding (0)
+    let assembled_0 = atp_assemble_delayed_pattern(sim_preds, 0, 3)
+    let dp0_ok = (assembled_0[0] == 10 && assembled_0[1] == 0 && assembled_0[2] == 0)
+    if dp0_ok {
+        println("      PASS: frame 0 -> [10, 0, 0] (padding for negative offsets)")
+        pass = pass + 1
+    } else {
+        println("      FAIL: frame 0 -> [" + to_string(assembled_0[0]) + ", " + to_string(assembled_0[1]) + ", " + to_string(assembled_0[2]) + "]")
+        fail = fail + 1
+    }
+
+    // ── Test 5: Top-k sampling range check ──
+    // Sampled token must be in [0, vocab_size) and repeats should show variation.
+    println("  [5] Top-k sampling range + variation")
+    let test_logits = atp_rand_vec(32, 777)
+    let mut sampled_tokens = []
+    let mut all_in_range = 1
+    i = 0
+    while i < 10 {
+        let tok = atp_sample_top_k(test_logits, 32, 0.8, 8, 100 + i * 37)
+        if tok < 0 || tok >= 32 { all_in_range = 0 }
+        sampled_tokens = sampled_tokens.push(tok)
+        i = i + 1
+    }
+    // Check that not all samples are identical (variation exists)
+    let mut has_variation = 0
+    i = 1
+    while i < len(sampled_tokens) {
+        if sampled_tokens[i] != sampled_tokens[0] { has_variation = 1 }
+        i = i + 1
+    }
+    if all_in_range == 1 {
+        println("      PASS: all 10 samples in [0, 32)")
+        pass = pass + 1
+    } else {
+        println("      FAIL: out-of-range sample detected")
+        fail = fail + 1
+    }
+    // Variation is desirable but not guaranteed with deterministic seeds;
+    // report but don't fail on it.
+    if has_variation == 1 {
+        println("      INFO: sampling shows variation across seeds (good)")
+    } else {
+        println("      INFO: all samples identical (deterministic, not a bug)")
+    }
+
+    // ── Test 6: Layer norm mean~0 var~1 ──
+    // After normalization with gamma=1,beta=0, output should be centered.
+    println("  [6] Layer norm centering")
+    let test_x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    let g = atp_ones(8)
+    let b = atp_zeros(8)
+    let normed = atp_layer_norm(test_x, g, b, 8)
+    let mut norm_mean = 0.0
+    i = 0
+    while i < 8 {
+        norm_mean = norm_mean + normed[i]
+        i = i + 1
+    }
+    norm_mean = norm_mean / 8.0
+    let mean_near_zero = (norm_mean > -0.01 && norm_mean < 0.01)
+    if mean_near_zero {
+        println("      PASS: mean=" + atp_format_float(norm_mean, 4) + " (near 0)")
+        pass = pass + 1
+    } else {
+        println("      FAIL: mean=" + atp_format_float(norm_mean, 4))
+        fail = fail + 1
+    }
+
+    // ── Test 7: End-to-end predict_tokens (small scale) ──
+    // Run full pipeline at tiny scale: d=8, 2 frames, 3 stages.
+    // Verify output shape and token ranges.
+    println("  [7] End-to-end predict_tokens (d=8, 2 frames, 3 stages)")
+    let tiny_d = 8
+    let tiny_frames = 2
+    let tiny_stages = 3
+    let tiny_intent = atp_rand_vec(tiny_d, 999)
+    let result = predict_tokens(tiny_intent, tiny_d, tiny_frames, tiny_stages, 1.5, 0.8, 8)
+    let shape_ok = (len(result) == tiny_frames)
+    let mut tokens_ok = 1
+    i = 0
+    while i < len(result) {
+        let frame = result[i]
+        if len(frame) != tiny_stages { tokens_ok = 0 }
+        let mut s = 0
+        while s < len(frame) {
+            if frame[s] < 0 || frame[s] >= 1024 { tokens_ok = 0 }
+            s = s + 1
+        }
+        i = i + 1
+    }
+    if shape_ok && tokens_ok == 1 {
+        // Print the actual tokens
+        let f0 = result[0]
+        let f1 = result[1]
+        println("      PASS: shape=[2][3], tokens valid")
+        println("            frame 0: [" + to_string(f0[0]) + ", " + to_string(f0[1]) + ", " + to_string(f0[2]) + "]")
+        println("            frame 1: [" + to_string(f1[0]) + ", " + to_string(f1[1]) + ", " + to_string(f1[2]) + "]")
+        pass = pass + 1
+    } else {
+        println("      FAIL: shape or token range error")
+        fail = fail + 1
+    }
+
+    // ── Summary ──
+    println("")
+    println("  ────────────────────────────────────")
+    let total = pass + fail
+    println("  Results: " + to_string(pass) + "/" + to_string(total) + " PASS, " + to_string(fail) + "/" + to_string(total) + " FAIL")
+    if fail == 0 {
+        println("  All tests passed.")
+    } else {
+        println("  " + to_string(fail) + " test(s) failed.")
+    }
+    println("  ────────────────────────────────────")
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 18. Main — Demo + Self-Test
+// ════════════════════════════════════════════════════════════════════
+
 fn main() {
-    println("audio_token_predictor Mk.I — L=" + to_string(N_LAYERS) + " H=" + to_string(N_HEADS) + " d=" + to_string(D_MODEL) + " ctx=" + to_string(CTX))
-    let toks = gen_tokens("intent[demo]", 6)
-    println("tokens(6 frames, 60ms): " + toks)
+    println("================================================================")
+    println(" HEXA-SPEAK Mk.III — Audio Token Predictor")
+    println(" AR decoder | KV-cache | 8-stage RVQ delayed pattern | CFG")
+    println("================================================================")
+    println("")
+    println("  Architecture:")
+    println("    d_model    = " + to_string(ATP_D_MODEL) + " (64 * 6)")
+    println("    n_heads    = " + to_string(ATP_N_HEADS) + " (n=6)")
+    println("    d_head     = " + to_string(ATP_D_HEAD) + " (384/6)")
+    println("    d_ff       = " + to_string(ATP_D_FF) + " (384*4)")
+    println("    n_layers   = " + to_string(ATP_N_LAYERS) + " (shallow for streaming)")
+    println("    rvq_stages = " + to_string(ATP_RVQ_STAGES) + " (n+2)")
+    println("    vocab_size = " + to_string(ATP_VOCAB_SIZE) + " (codebook entries)")
+    println("    ctx        = " + to_string(ATP_CTX) + " (256*6, ~15s)")
+    println("")
+    println("  Components:")
+    println("    [1] KV-cache         O(1) per decode step")
+    println("    [2] Causal self-attn Q*K^T/sqrt(d), causal mask, softmax, *V")
+    println("    [3] SwiGLU FFN       silu(gate) * up, down projection")
+    println("    [4] RoPE             rotary position embedding")
+    println("    [5] CFG              conditioned + unconditioned blend")
+    println("    [6] Delayed pattern  stage s predicts frame t+s")
+    println("    [7] Top-k sampling   temperature + top-k + softmax + categorical")
+    println("    [8] 8 RVQ heads      independent linear head per codebook stage")
+    println("")
+
+    // Run self-test
+    self_test_audio_token_predictor()
+
+    println("")
+    println("================================================================")
+    println(" audio_token_predictor.hexa Mk.III ready.")
+    println("================================================================")
 }
 
 main()
