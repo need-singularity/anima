@@ -1,0 +1,180 @@
+// serving/serve_alm_native_handler.hexa — single-request HTTP handler
+//
+// Companion to serve_alm_native.hexa.
+// Reads ONE HTTP request from stdin, writes ONE HTTP response to stdout.
+//
+// Designed to be invoked by socat per connection:
+//   socat TCP-LISTEN:8090,fork,reuseaddr SYSTEM:"hexa serve_alm_native_handler.hexa"
+//
+// This sidesteps the missing net_listen builtin while keeping the entire
+// dispatch logic in hexa (NO Python, NO subprocess to other interpreters).
+// socat is a 200KB C utility; not a "fallback runtime", just a TCP bridge.
+
+use "voice_routes"
+use "hire_routes"
+
+let SAH_VERSION = "2.0-rc-native-handler"
+let SAH_PSI_BALANCE = 0.5
+let SAH_PSI_ALPHA   = 0.014
+
+// ─── HTTP request parser (stdin) ───────────────────────────────────
+
+struct SahReq {
+    method: string,
+    path: string,
+    body: string,
+    ok: bool
+}
+
+fn sah_parse_request(raw: string) -> SahReq {
+    if len(raw) == 0 {
+        return SahReq { method: "", path: "", body: "", ok: false }
+    }
+    // Find first space → method
+    let sp1 = raw.index_of(" ")
+    if sp1 < 0 {
+        return SahReq { method: "", path: "", body: "", ok: false }
+    }
+    let method = raw.substring(0, sp1)
+    let after_method = raw.substring(sp1 + 1, len(raw))
+    let sp2 = after_method.index_of(" ")
+    if sp2 < 0 {
+        return SahReq { method: "", path: "", body: "", ok: false }
+    }
+    let path = after_method.substring(0, sp2)
+    // Body starts after \r\n\r\n
+    let body_marker = "\r\n\r\n"
+    let bm_pos = raw.index_of(body_marker)
+    let body = if bm_pos >= 0 {
+        raw.substring(bm_pos + 4, len(raw))
+    } else {
+        ""
+    }
+    return SahReq { method: method, path: path, body: body, ok: true }
+}
+
+// ─── JSON response builders ────────────────────────────────────────
+
+fn sah_json_health() -> string {
+    return "{\"status\":\"ok\",\"model\":\"ALM-14B-r9-LoRA\","
+        + "\"version\":\"" + SAH_VERSION + "\","
+        + "\"backend\":\"hexa-native+socat\","
+        + "\"runtime_has_net\":false,"
+        + "\"runtime_has_ffi_qwen\":false,"
+        + "\"psi_constants\":{\"alpha\":" + to_string(SAH_PSI_ALPHA)
+        + ",\"balance\":" + to_string(SAH_PSI_BALANCE) + "}"
+        + "}"
+}
+
+fn sah_json_consciousness() -> string {
+    return "{\"phi\":0.0,\"tension\":0.0,"
+        + "\"balance\":" + to_string(SAH_PSI_BALANCE)
+        + ",\"coupling\":" + to_string(SAH_PSI_ALPHA) + "}"
+}
+
+fn sah_json_generate_mock(prompt: string) -> string {
+    let safe = vr_json_escape(prompt)
+    return "{\"text\":\"[mock-native] " + safe + "\","
+        + "\"tokens_generated\":0,\"latency_ms\":0,"
+        + "\"consciousness\":{\"phi_holo\":0.0,\"tension\":0.0,\"orch_or_active\":false},"
+        + "\"model\":{\"name\":\"ALM-14B-r9-LoRA\",\"backend\":\"hexa-native\"}"
+        + "}"
+}
+
+// ─── Route dispatch ────────────────────────────────────────────────
+
+struct SahResp {
+    status: int,
+    body: string
+}
+
+fn sah_route(method: string, path: string, body: string) -> SahResp {
+    if method == "GET" {
+        if path == "/" || path == "/health" {
+            return SahResp { status: 200, body: sah_json_health() }
+        }
+        if path == "/voice/health" {
+            return SahResp { status: 200, body: vr_health_json() }
+        }
+        if path == "/voice/profiles" {
+            return SahResp { status: 200, body: vr_profiles_json() }
+        }
+        if path == "/hire/capabilities" {
+            let presets = hr_presets_extended()
+            let personas = hr_personas()
+            return SahResp { status: 200, body: hr_capabilities_json(presets, personas) }
+        }
+    }
+    if method == "POST" {
+        if path == "/generate" {
+            let prompt = vr_extract_string(body, "prompt")
+            if len(prompt) == 0 {
+                return SahResp { status: 400, body: "{\"error\":\"missing 'prompt'\"}" }
+            }
+            return SahResp { status: 200, body: sah_json_generate_mock(prompt) }
+        }
+        if path == "/consciousness" {
+            return SahResp { status: 200, body: sah_json_consciousness() }
+        }
+        if path == "/voice/tts" {
+            let resp = vr_handle_tts(body)
+            let json_body = vr_tts_response_json(resp)
+            let code = if resp.ok { 200 } else { 400 }
+            return SahResp { status: code, body: json_body }
+        }
+        if path == "/voice/e2e" {
+            let resp = vr_handle_e2e(body)
+            let json_body = vr_e2e_response_json(resp)
+            let code = if resp.ok { 200 } else { 400 }
+            return SahResp { status: code, body: json_body }
+        }
+    }
+    if method == "OPTIONS" {
+        return SahResp { status: 204, body: "" }
+    }
+    return SahResp {
+        status: 404,
+        body: "{\"error\":\"not found\",\"path\":\"" + vr_json_escape(path) + "\"}"
+    }
+}
+
+fn sah_status_text(code: int) -> string {
+    if code == 200 { return "OK" }
+    if code == 204 { return "No Content" }
+    if code == 400 { return "Bad Request" }
+    if code == 404 { return "Not Found" }
+    if code == 405 { return "Method Not Allowed" }
+    return "Error"
+}
+
+fn sah_build_response(status: int, body: string) -> string {
+    let cl = to_string(len(body))
+    let st = sah_status_text(status)
+    return "HTTP/1.1 " + to_string(status) + " " + st + "\r\n"
+        + "Content-Type: application/json; charset=utf-8\r\n"
+        + "Content-Length: " + cl + "\r\n"
+        + "Access-Control-Allow-Origin: *\r\n"
+        + "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        + "Access-Control-Allow-Headers: Content-Type\r\n"
+        + "Connection: close\r\n"
+        + "\r\n"
+        + body
+}
+
+// ─── Entry: read stdin, dispatch, print to stdout ──────────────────
+
+fn main() {
+    // Read all of stdin into one string. Hexa builtin: read_stdin().
+    let raw = read_stdin()
+    let req = sah_parse_request(raw)
+    if !req.ok {
+        let body = "{\"error\":\"malformed request\"}"
+        print(sah_build_response(400, body))
+        return
+    }
+    let resp = sah_route(req.method, req.path, req.body)
+    print(sah_build_response(resp.status, resp.body))
+}
+
+// NOTE: hexa_stage0 auto-invokes fn main() once at script end.
+// Explicit main() call removed — was firing twice (double response).
