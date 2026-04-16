@@ -24,8 +24,8 @@
 //    - 1D element-wise: block=256, grid=ceil(N/256)
 //    - embed_lookup(_bwd): block=(16,16), grid=(ceil(N/16),ceil(D/16))
 //    - rms_norm_(fwd|bwd) / softmax_rows_(fwd|bwd) / ce_loss_grad:
-//      one block per row, block.x = D (or C), assumes D <= 1024.
-//      Shared-memory reductions for sums/max.
+//      one block per row, block.x = min(D,1024) (or min(C,1024)).
+//      Stride loops handle D/C > 1024. Shared-memory reductions for sums/max.
 //
 //  Targets sm_90 (H100). Compile flags set in cuda_rtc.hexa.
 // ═══════════════════════════════════════════════════════════════
@@ -42,9 +42,11 @@ use "cuda_rtc"
 
 let K_EMBED_LOOKUP = "extern \"C\" __global__ void embed_lookup(const float* W, const int* toks, float* out, int V, int D, int N) {\n    int n = blockIdx.x * blockDim.x + threadIdx.x;\n    int d = blockIdx.y * blockDim.y + threadIdx.y;\n    if (n >= N || d >= D) return;\n    int t = toks[n];\n    out[n * D + d] = W[t * D + d];\n}\n"
 
-let K_RMS_NORM_FWD = "extern \"C\" __global__ void rms_norm_fwd(const float* x, const float* g, float* out, float* rstd, int N, int D, float eps) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= N || tid >= D) return;\n    extern __shared__ float sdata[];\n    float v = x[row * D + tid];\n    sdata[tid] = v * v;\n    __syncthreads();\n    // tree reduction (D <= 1024, blockDim.x == D)\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid + s];\n        __syncthreads();\n    }\n    float ms = sdata[0] / (float)D;\n    float r  = rsqrtf(ms + eps);\n    if (tid == 0) rstd[row] = r;\n    out[row * D + tid] = v * r * g[tid];\n}\n"
+// D>1024 safe: stride loop pattern (blockDim.x capped at 1024)
+let K_RMS_NORM_FWD = "extern \"C\" __global__ void rms_norm_fwd(const float* x, const float* g, float* out, float* rstd, int N, int D, float eps) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= N) return;\n    extern __shared__ float sdata[];\n    float sum_sq = 0.0f;\n    for (int i = tid; i < D; i += blockDim.x) { float v = x[row*D+i]; sum_sq += v*v; }\n    sdata[tid] = sum_sq;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid + s];\n        __syncthreads();\n    }\n    float ms = sdata[0] / (float)D;\n    float r = rsqrtf(ms + eps);\n    if (tid == 0) rstd[row] = r;\n    for (int i = tid; i < D; i += blockDim.x) { out[row*D+i] = x[row*D+i] * r * g[i]; }\n}\n"
 
-let K_SOFTMAX_ROWS_FWD = "extern \"C\" __global__ void softmax_rows_fwd(const float* x, float* out, int R, int C, int causal) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= R || tid >= C) return;\n    extern __shared__ float sdata[];\n    float v = x[row * C + tid];\n    if (causal != 0 && tid > row) v = -1e30f;\n    sdata[tid] = v;\n    __syncthreads();\n    // max reduction\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) {\n            float a = sdata[tid];\n            float b = sdata[tid + s];\n            sdata[tid] = a > b ? a : b;\n        }\n        __syncthreads();\n    }\n    float mx = sdata[0];\n    __syncthreads();\n    float e = expf(v - mx);\n    sdata[tid] = e;\n    __syncthreads();\n    // sum reduction\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid + s];\n        __syncthreads();\n    }\n    float sum = sdata[0];\n    out[row * C + tid] = e / sum;\n}\n"
+// C>1024 safe: stride loop for max/sum reductions
+let K_SOFTMAX_ROWS_FWD = "extern \"C\" __global__ void softmax_rows_fwd(const float* x, float* out, int R, int C, int causal) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= R) return;\n    extern __shared__ float sdata[];\n    float local_max = -1e30f;\n    for (int i = tid; i < C; i += blockDim.x) {\n        float v = x[row*C+i];\n        if (causal != 0 && i > row) v = -1e30f;\n        if (v > local_max) local_max = v;\n    }\n    sdata[tid] = local_max;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) { float b=sdata[tid+s]; if(b>sdata[tid]) sdata[tid]=b; }\n        __syncthreads();\n    }\n    float mx = sdata[0];\n    __syncthreads();\n    float local_sum = 0.0f;\n    for (int i = tid; i < C; i += blockDim.x) {\n        float v = x[row*C+i];\n        if (causal != 0 && i > row) v = -1e30f;\n        local_sum += expf(v - mx);\n    }\n    sdata[tid] = local_sum;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid+s];\n        __syncthreads();\n    }\n    float sum = sdata[0];\n    for (int i = tid; i < C; i += blockDim.x) {\n        float v = x[row*C+i];\n        if (causal != 0 && i > row) v = -1e30f;\n        out[row*C+i] = expf(v - mx) / sum;\n    }\n}\n"
 
 let K_SWIGLU_FWD = "extern \"C\" __global__ void swiglu_fwd(const float* up, const float* gate, float* out, int N) {\n    int i = blockIdx.x * blockDim.x + threadIdx.x;\n    if (i >= N) return;\n    float g = gate[i];\n    float s = 1.0f / (1.0f + expf(-g));\n    out[i] = up[i] * s;\n}\n"
 
@@ -56,13 +58,16 @@ let K_RANDN_FILL = "extern \"C\" __global__ void randn_fill(float* a, int N, uns
 
 let K_EMBED_LOOKUP_BWD = "extern \"C\" __global__ void embed_lookup_bwd(const float* dy, const int* toks, float* dW, int V, int D, int N) {\n    int n = blockIdx.x * blockDim.x + threadIdx.x;\n    int d = blockIdx.y * blockDim.y + threadIdx.y;\n    if (n >= N || d >= D) return;\n    int t = toks[n];\n    atomicAdd(&dW[t * D + d], dy[n * D + d]);\n}\n"
 
-let K_RMS_NORM_BWD = "extern \"C\" __global__ void rms_norm_bwd(const float* x, const float* g, const float* dy, const float* rstd, float* dx, float* dg, int N, int D, float eps) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= N || tid >= D) return;\n    extern __shared__ float sdata[];\n    float xv  = x[row * D + tid];\n    float gv  = g[tid];\n    float dyv = dy[row * D + tid];\n    float r   = rstd[row];\n    // coef = sum_d x[d] * g[d] * dy[d]\n    sdata[tid] = xv * gv * dyv;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid + s];\n        __syncthreads();\n    }\n    float coef = sdata[0];\n    float r3   = r * r * r;\n    dx[row * D + tid] = gv * dyv * r - xv * coef * r3 / (float)D;\n    // dg: atomicAdd across rows — caller passes gpu_zeros(D).\n    atomicAdd(&dg[tid], xv * dyv * r);\n}\n"
+// D>1024 safe: stride loop for coef reduction + dx/dg writes
+let K_RMS_NORM_BWD = "extern \"C\" __global__ void rms_norm_bwd(const float* x, const float* g, const float* dy, const float* rstd, float* dx, float* dg, int N, int D, float eps) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= N) return;\n    extern __shared__ float sdata[];\n    float r = rstd[row];\n    // coef = sum_d x[d] * g[d] * dy[d]  — stride-accumulated\n    float local_coef = 0.0f;\n    for (int i = tid; i < D; i += blockDim.x) { local_coef += x[row*D+i] * g[i] * dy[row*D+i]; }\n    sdata[tid] = local_coef;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid + s];\n        __syncthreads();\n    }\n    float coef = sdata[0];\n    float r3   = r * r * r;\n    for (int i = tid; i < D; i += blockDim.x) {\n        float xv  = x[row*D+i];\n        float gv  = g[i];\n        float dyv = dy[row*D+i];\n        dx[row*D+i] = gv * dyv * r - xv * coef * r3 / (float)D;\n        atomicAdd(&dg[i], xv * dyv * r);\n    }\n}\n"
 
-let K_SOFTMAX_ROWS_BWD = "extern \"C\" __global__ void softmax_rows_bwd(const float* probs, const float* dp, float* ds, int R, int C) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= R || tid >= C) return;\n    extern __shared__ float sdata[];\n    float p = probs[row * C + tid];\n    float d = dp[row * C + tid];\n    sdata[tid] = p * d;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid + s];\n        __syncthreads();\n    }\n    float sum = sdata[0];\n    ds[row * C + tid] = p * (d - sum);\n}\n"
+// C>1024 safe: stride loop for sum(probs*dp) reduction + output
+let K_SOFTMAX_ROWS_BWD = "extern \"C\" __global__ void softmax_rows_bwd(const float* probs, const float* dp, float* ds, int R, int C) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= R) return;\n    extern __shared__ float sdata[];\n    float local_sum = 0.0f;\n    for (int i = tid; i < C; i += blockDim.x) { local_sum += probs[row*C+i] * dp[row*C+i]; }\n    sdata[tid] = local_sum;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid + s];\n        __syncthreads();\n    }\n    float sum = sdata[0];\n    for (int i = tid; i < C; i += blockDim.x) {\n        float p = probs[row*C+i];\n        ds[row*C+i] = p * (dp[row*C+i] - sum);\n    }\n}\n"
 
 let K_SWIGLU_BWD = "extern \"C\" __global__ void swiglu_bwd(const float* up, const float* gate, const float* dy, float* dup, float* dgate, int N) {\n    int i = blockIdx.x * blockDim.x + threadIdx.x;\n    if (i >= N) return;\n    float g  = gate[i];\n    float s  = 1.0f / (1.0f + expf(-g));\n    float dv = dy[i];\n    dup[i]   = dv * s;\n    dgate[i] = dv * up[i] * s * (1.0f - s);\n}\n"
 
-let K_CE_LOSS_GRAD = "extern \"C\" __global__ void ce_loss_grad(const float* logits, const int* targets, float* loss_out, float* dlogits, int R, int C) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= R || tid >= C) return;\n    extern __shared__ float sdata[];\n    float v = logits[row * C + tid];\n    sdata[tid] = v;\n    __syncthreads();\n    // max reduction\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) {\n            float a = sdata[tid];\n            float b = sdata[tid + s];\n            sdata[tid] = a > b ? a : b;\n        }\n        __syncthreads();\n    }\n    float mx = sdata[0];\n    __syncthreads();\n    float e = expf(v - mx);\n    sdata[tid] = e;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid + s];\n        __syncthreads();\n    }\n    float sum = sdata[0];\n    float lse = mx + logf(sum);\n    int t = targets[row];\n    if (tid == 0) {\n        float row_loss = lse - logits[row * C + t];\n        atomicAdd(loss_out, row_loss / (float)R);\n    }\n    float prob = e / sum;\n    float onehot = (tid == t) ? 1.0f : 0.0f;\n    dlogits[row * C + tid] = (prob - onehot) / (float)R;\n}\n"
+// C>1024 safe: stride loop for max/sum reductions + gradient output
+let K_CE_LOSS_GRAD = "extern \"C\" __global__ void ce_loss_grad(const float* logits, const int* targets, float* loss_out, float* dlogits, int R, int C) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= R) return;\n    extern __shared__ float sdata[];\n    // max reduction — stride loop\n    float local_max = -1e30f;\n    for (int i = tid; i < C; i += blockDim.x) { float v = logits[row*C+i]; if (v > local_max) local_max = v; }\n    sdata[tid] = local_max;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) { float b = sdata[tid+s]; if (b > sdata[tid]) sdata[tid] = b; }\n        __syncthreads();\n    }\n    float mx = sdata[0];\n    __syncthreads();\n    // sum(exp) reduction — stride loop\n    float local_expsum = 0.0f;\n    for (int i = tid; i < C; i += blockDim.x) { local_expsum += expf(logits[row*C+i] - mx); }\n    sdata[tid] = local_expsum;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid+s];\n        __syncthreads();\n    }\n    float sum = sdata[0];\n    float lse = mx + logf(sum);\n    int t = targets[row];\n    if (tid == 0) {\n        float row_loss = lse - logits[row*C+t];\n        atomicAdd(loss_out, row_loss / (float)R);\n    }\n    for (int i = tid; i < C; i += blockDim.x) {\n        float prob = expf(logits[row*C+i] - mx) / sum;\n        float onehot = (i == t) ? 1.0f : 0.0f;\n        dlogits[row*C+i] = (prob - onehot) / (float)R;\n    }\n}\n"
 
 // ── Fused forward mega-kernel (#20) ──────────────────────────
 //
@@ -92,21 +97,23 @@ let K_CE_LOSS_GRAD = "extern \"C\" __global__ void ce_loss_grad(const float* log
 // the ~10us per-launch interpreter overhead that dominates at 13% GPU util.
 
 // (A) fused_pre_attn_fwd: rms_norm(x, ga) -> norm1, rstd1
-//     One block per row, blockDim.x = D. Identical to rms_norm_fwd but
-//     bundled under the fused naming convention for clarity.
+//     One block per row, blockDim.x capped at 1024, stride loop for D>1024.
 //     (In Phase 3 this will additionally fuse the attention score scaling.)
-let K_FUSED_PRE_ATTN_FWD = "extern \"C\" __global__ void fused_pre_attn_fwd(const float* x, const float* ga, float* norm1, float* rstd1, int N, int D, float eps) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= N || tid >= D) return;\n    extern __shared__ float sdata[];\n    float v = x[row * D + tid];\n    sdata[tid] = v * v;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid + s];\n        __syncthreads();\n    }\n    float ms = sdata[0] / (float)D;\n    float r  = rsqrtf(ms + eps);\n    if (tid == 0) rstd1[row] = r;\n    norm1[row * D + tid] = v * r * ga[tid];\n}\n"
+// D>1024 safe: stride loop pattern
+let K_FUSED_PRE_ATTN_FWD = "extern \"C\" __global__ void fused_pre_attn_fwd(const float* x, const float* ga, float* norm1, float* rstd1, int N, int D, float eps) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= N) return;\n    extern __shared__ float sdata[];\n    float sum_sq = 0.0f;\n    for (int i = tid; i < D; i += blockDim.x) { float v = x[row*D+i]; sum_sq += v*v; }\n    sdata[tid] = sum_sq;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid + s];\n        __syncthreads();\n    }\n    float ms = sdata[0] / (float)D;\n    float r  = rsqrtf(ms + eps);\n    if (tid == 0) rstd1[row] = r;\n    for (int i = tid; i < D; i += blockDim.x) { norm1[row*D+i] = x[row*D+i] * r * ga[i]; }\n}\n"
 
 // (B) fused_attn_post_fwd: scale scores by inv_sqrt_d, then causal softmax
 //     Fuses gpu_sscal + gpu_softmax_rows_fwd into a single kernel.
-//     One block per row, blockDim.x = C (= SEQ for attention).
+//     One block per row, blockDim.x capped at 1024, stride loop for C>1024.
 //     Saves 1 kernel launch + 1 cuBLAS sscal call per layer.
-let K_FUSED_ATTN_POST_FWD = "extern \"C\" __global__ void fused_attn_post_fwd(const float* scores, float* probs, int R, int C, float inv_sqrt_d) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= R || tid >= C) return;\n    extern __shared__ float sdata[];\n    float v = scores[row * C + tid] * inv_sqrt_d;\n    if (tid > row) v = -1e30f;\n    sdata[tid] = v;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) {\n            float a = sdata[tid];\n            float b = sdata[tid + s];\n            sdata[tid] = a > b ? a : b;\n        }\n        __syncthreads();\n    }\n    float mx = sdata[0];\n    __syncthreads();\n    float e = expf(v - mx);\n    sdata[tid] = e;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid + s];\n        __syncthreads();\n    }\n    float sum = sdata[0];\n    probs[row * C + tid] = e / sum;\n}\n"
+// C>1024 safe: stride loop for max/sum reductions
+let K_FUSED_ATTN_POST_FWD = "extern \"C\" __global__ void fused_attn_post_fwd(const float* scores, float* probs, int R, int C, float inv_sqrt_d) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= R) return;\n    extern __shared__ float sdata[];\n    // max reduction — stride loop with causal mask\n    float local_max = -1e30f;\n    for (int i = tid; i < C; i += blockDim.x) {\n        float v = scores[row*C+i] * inv_sqrt_d;\n        if (i > row) v = -1e30f;\n        if (v > local_max) local_max = v;\n    }\n    sdata[tid] = local_max;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) { float b=sdata[tid+s]; if(b>sdata[tid]) sdata[tid]=b; }\n        __syncthreads();\n    }\n    float mx = sdata[0];\n    __syncthreads();\n    // sum(exp) reduction — stride loop\n    float local_sum = 0.0f;\n    for (int i = tid; i < C; i += blockDim.x) {\n        float v = scores[row*C+i] * inv_sqrt_d;\n        if (i > row) v = -1e30f;\n        local_sum += expf(v - mx);\n    }\n    sdata[tid] = local_sum;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid+s];\n        __syncthreads();\n    }\n    float sum = sdata[0];\n    for (int i = tid; i < C; i += blockDim.x) {\n        float v = scores[row*C+i] * inv_sqrt_d;\n        if (i > row) v = -1e30f;\n        probs[row*C+i] = expf(v - mx) / sum;\n    }\n}\n"
 
 // (C) fused_mid_ffn_fwd: residual add (mid = x + attn_out) then rms_norm(mid, gf)
 //     Fuses memcpy + add_inplace + rms_norm_fwd into one kernel.
-//     One block per row, blockDim.x = D. Eliminates 3 separate launches.
-let K_FUSED_MID_FFN_FWD = "extern \"C\" __global__ void fused_mid_ffn_fwd(const float* x, const float* attn_out, const float* gf, float* mid, float* norm2, float* rstd2, int N, int D, float eps) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= N || tid >= D) return;\n    extern __shared__ float sdata[];\n    float xv = x[row * D + tid];\n    float av = attn_out[row * D + tid];\n    float mv = xv + av;\n    mid[row * D + tid] = mv;\n    sdata[tid] = mv * mv;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid + s];\n        __syncthreads();\n    }\n    float ms = sdata[0] / (float)D;\n    float r  = rsqrtf(ms + eps);\n    if (tid == 0) rstd2[row] = r;\n    norm2[row * D + tid] = mv * r * gf[tid];\n}\n"
+//     One block per row, blockDim.x capped at 1024, stride loop for D>1024.
+// D>1024 safe: stride loop pattern
+let K_FUSED_MID_FFN_FWD = "extern \"C\" __global__ void fused_mid_ffn_fwd(const float* x, const float* attn_out, const float* gf, float* mid, float* norm2, float* rstd2, int N, int D, float eps) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= N) return;\n    extern __shared__ float sdata[];\n    // residual add + accumulate sum_sq — stride loop\n    float sum_sq = 0.0f;\n    for (int i = tid; i < D; i += blockDim.x) {\n        float mv = x[row*D+i] + attn_out[row*D+i];\n        mid[row*D+i] = mv;\n        sum_sq += mv * mv;\n    }\n    sdata[tid] = sum_sq;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid + s];\n        __syncthreads();\n    }\n    float ms = sdata[0] / (float)D;\n    float r  = rsqrtf(ms + eps);\n    if (tid == 0) rstd2[row] = r;\n    for (int i = tid; i < D; i += blockDim.x) { norm2[row*D+i] = mid[row*D+i] * r * gf[i]; }\n}\n"
 
 // (D) fused_post_ffn_fwd: swiglu(up, up) -> act, then after GEMM Wff2,
 //     residual add y = mid + ffn_out. We split this into two pieces:
@@ -128,19 +135,22 @@ let K_FUSED_SWIGLU_MERGE_BWD = "extern \"C\" __global__ void fused_swiglu_merge_
 // (F) fused_mid_ffn_bwd: rms_norm_bwd for norm2 + residual merge
 //     dmid = dy_res + dmid_from_norm2
 //     Fuses rms_norm_bwd + saxpy residual merge into one kernel.
-//     One block per row, blockDim.x = D.
-let K_FUSED_MID_FFN_BWD = "extern \"C\" __global__ void fused_mid_ffn_bwd(const float* mid, const float* gf, const float* dnorm2, const float* rstd2, const float* dy, float* dmid, float* dgf, int N, int D, float eps) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= N || tid >= D) return;\n    extern __shared__ float sdata[];\n    float mv  = mid[row * D + tid];\n    float gv  = gf[tid];\n    float dyv = dnorm2[row * D + tid];\n    float r   = rstd2[row];\n    sdata[tid] = mv * gv * dyv;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid + s];\n        __syncthreads();\n    }\n    float coef = sdata[0];\n    float r3   = r * r * r;\n    float dmid_norm = gv * dyv * r - mv * coef * r3 / (float)D;\n    dmid[row * D + tid] = dy[row * D + tid] + dmid_norm;\n    atomicAdd(&dgf[tid], mv * dyv * r);\n}\n"
+//     One block per row, blockDim.x capped at 1024, stride loop for D>1024.
+// D>1024 safe: stride loop for coef reduction + dmid/dgf writes
+let K_FUSED_MID_FFN_BWD = "extern \"C\" __global__ void fused_mid_ffn_bwd(const float* mid, const float* gf, const float* dnorm2, const float* rstd2, const float* dy, float* dmid, float* dgf, int N, int D, float eps) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= N) return;\n    extern __shared__ float sdata[];\n    float r = rstd2[row];\n    float local_coef = 0.0f;\n    for (int i = tid; i < D; i += blockDim.x) { local_coef += mid[row*D+i] * gf[i] * dnorm2[row*D+i]; }\n    sdata[tid] = local_coef;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid + s];\n        __syncthreads();\n    }\n    float coef = sdata[0];\n    float r3   = r * r * r;\n    for (int i = tid; i < D; i += blockDim.x) {\n        float mv  = mid[row*D+i];\n        float gv  = gf[i];\n        float dyv = dnorm2[row*D+i];\n        float dmid_norm = gv * dyv * r - mv * coef * r3 / (float)D;\n        dmid[row*D+i] = dy[row*D+i] + dmid_norm;\n        atomicAdd(&dgf[i], mv * dyv * r);\n    }\n}\n"
 
 // (G) fused_attn_post_bwd: softmax_bwd + scale by inv_sqrt_d in one kernel.
 //     Fuses gpu_softmax_rows_bwd + gpu_sscal into one launch.
-//     One block per row, blockDim.x = C.
-let K_FUSED_ATTN_POST_BWD = "extern \"C\" __global__ void fused_attn_post_bwd(const float* probs, const float* dp, float* dscores, int R, int C, float inv_sqrt_d) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= R || tid >= C) return;\n    extern __shared__ float sdata[];\n    float p = probs[row * C + tid];\n    float d = dp[row * C + tid];\n    sdata[tid] = p * d;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid + s];\n        __syncthreads();\n    }\n    float sum = sdata[0];\n    dscores[row * C + tid] = p * (d - sum) * inv_sqrt_d;\n}\n"
+//     One block per row, blockDim.x capped at 1024, stride loop for C>1024.
+// C>1024 safe: stride loop for sum(probs*dp) reduction + output
+let K_FUSED_ATTN_POST_BWD = "extern \"C\" __global__ void fused_attn_post_bwd(const float* probs, const float* dp, float* dscores, int R, int C, float inv_sqrt_d) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= R) return;\n    extern __shared__ float sdata[];\n    float local_sum = 0.0f;\n    for (int i = tid; i < C; i += blockDim.x) { local_sum += probs[row*C+i] * dp[row*C+i]; }\n    sdata[tid] = local_sum;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid + s];\n        __syncthreads();\n    }\n    float sum = sdata[0];\n    for (int i = tid; i < C; i += blockDim.x) {\n        float p = probs[row*C+i];\n        dscores[row*C+i] = p * (dp[row*C+i] - sum) * inv_sqrt_d;\n    }\n}\n"
 
 // (H) fused_pre_attn_bwd: rms_norm_bwd for norm1 + residual merge dx
 //     dx = dx_from_attn_residual + dx_from_norm1
 //     Fuses rms_norm_bwd + 2x saxpy into one kernel.
-//     One block per row, blockDim.x = D.
-let K_FUSED_PRE_ATTN_BWD = "extern \"C\" __global__ void fused_pre_attn_bwd(const float* x, const float* ga, const float* dnorm1, const float* rstd1, const float* dmid, float* dx, float* dga, int N, int D, float eps) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= N || tid >= D) return;\n    extern __shared__ float sdata[];\n    float xv  = x[row * D + tid];\n    float gv  = ga[tid];\n    float dyv = dnorm1[row * D + tid];\n    float r   = rstd1[row];\n    sdata[tid] = xv * gv * dyv;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid + s];\n        __syncthreads();\n    }\n    float coef = sdata[0];\n    float r3   = r * r * r;\n    float dx_norm = gv * dyv * r - xv * coef * r3 / (float)D;\n    dx[row * D + tid] = dmid[row * D + tid] + dx_norm;\n    atomicAdd(&dga[tid], xv * dyv * r);\n}\n"
+//     One block per row, blockDim.x capped at 1024, stride loop for D>1024.
+// D>1024 safe: stride loop for coef reduction + dx/dga writes
+let K_FUSED_PRE_ATTN_BWD = "extern \"C\" __global__ void fused_pre_attn_bwd(const float* x, const float* ga, const float* dnorm1, const float* rstd1, const float* dmid, float* dx, float* dga, int N, int D, float eps) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    if (row >= N) return;\n    extern __shared__ float sdata[];\n    float r = rstd1[row];\n    float local_coef = 0.0f;\n    for (int i = tid; i < D; i += blockDim.x) { local_coef += x[row*D+i] * ga[i] * dnorm1[row*D+i]; }\n    sdata[tid] = local_coef;\n    __syncthreads();\n    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {\n        if (tid < s) sdata[tid] += sdata[tid + s];\n        __syncthreads();\n    }\n    float coef = sdata[0];\n    float r3   = r * r * r;\n    for (int i = tid; i < D; i += blockDim.x) {\n        float xv  = x[row*D+i];\n        float gv  = ga[i];\n        float dyv = dnorm1[row*D+i];\n        float dx_norm = gv * dyv * r - xv * coef * r3 / (float)D;\n        dx[row*D+i] = dmid[row*D+i] + dx_norm;\n        atomicAdd(&dga[i], xv * dyv * r);\n    }\n}\n"
 
 // ── Module + function handles ────────────────────────────────
 
@@ -327,6 +337,11 @@ fn _ceil_div(a, b) {
     return (a + b - 1) / b
 }
 
+fn _min_1024(v) {
+    // cap blockDim.x at 1024 — CUDA hard limit per block dimension
+    if v > 1024 { return 1024 } else { return v }
+}
+
 // ── Forward launchers ────────────────────────────────────────
 
 // gpu_embed_lookup_fwd: out[N,D] = W[toks[i],:]
@@ -347,13 +362,9 @@ fn gpu_embed_lookup_fwd(W_dev, toks_dev, out_dev, V, D, N) {
     st
 }
 
-// gpu_rms_norm_fwd: per-row RMS norm. one block per row, blockDim.x = D.
-// Shared mem = D * 4 bytes (handled inside rtc_launch via convention,
-// or rtc_launch can be told via the 8th-arg signature; we keep the
-// existing rtc_launch signature and rely on it allocating dynamic
-// shared memory equal to blockDim.x * 4 when the function uses
-// `extern __shared__`. If your rtc_launch needs an explicit shmem
-// arg, extend it; this file follows the documented 7-dim signature.)
+// gpu_rms_norm_fwd: per-row RMS norm. one block per row, blockDim.x = min(D,1024).
+// Stride loop inside kernel handles D > 1024.
+// shmem = min(D,1024) * 4 bytes for the extern __shared__ float sdata[] reduction.
 fn gpu_rms_norm_fwd(x_dev, g_dev, out_dev, rstd_dev, N, D, eps) {
     let args = [
         _arg_ptr(x_dev),
@@ -364,14 +375,15 @@ fn gpu_rms_norm_fwd(x_dev, g_dev, out_dev, rstd_dev, N, D, eps) {
         _arg_i32(D),
         _arg_f32(eps)
     ]
-    // shmem = D * 4 bytes for the extern __shared__ float sdata[] reduction
-    let st = rtc_launch_shmem(G_K_rms_norm_fwd, N, 1, 1, D, 1, 1, D * 4, args)
+    // shmem = min(D,1024) * 4 bytes for the extern __shared__ float sdata[] reduction
+    let bx = _min_1024(D)
+    let st = rtc_launch_shmem(G_K_rms_norm_fwd, N, 1, 1, bx, 1, 1, bx * 4, args)
     let _ = _free_args(args)
     st
 }
 
 // gpu_softmax_rows_fwd: per-row softmax with optional causal mask.
-// One block per row, blockDim.x = C.
+// One block per row, blockDim.x = min(C,1024). Stride loop handles C > 1024.
 fn gpu_softmax_rows_fwd(x_dev, out_dev, R, C, causal_int) {
     let args = [
         _arg_ptr(x_dev),
@@ -380,8 +392,9 @@ fn gpu_softmax_rows_fwd(x_dev, out_dev, R, C, causal_int) {
         _arg_i32(C),
         _arg_i32(causal_int)
     ]
-    // shmem = C * 4 bytes for max/sum reduction
-    let st = rtc_launch_shmem(G_K_softmax_rows_fwd, R, 1, 1, C, 1, 1, C * 4, args)
+    // shmem = min(C,1024) * 4 bytes for max/sum reduction
+    let bx = _min_1024(C)
+    let st = rtc_launch_shmem(G_K_softmax_rows_fwd, R, 1, 1, bx, 1, 1, bx * 4, args)
     let _ = _free_args(args)
     st
 }
@@ -480,8 +493,9 @@ fn gpu_rms_norm_bwd(x_dev, g_dev, dy_dev, rstd_dev, dx_dev, dg_partial_dev, N, D
         _arg_i32(D),
         _arg_f32(eps)
     ]
-    // shmem: D * 4 for reduction of sum(x*g*dy)
-    let st = rtc_launch_shmem(G_K_rms_norm_bwd, N, 1, 1, D, 1, 1, D * 4, args)
+    // shmem: min(D,1024) * 4 for reduction of sum(x*g*dy)
+    let bx = _min_1024(D)
+    let st = rtc_launch_shmem(G_K_rms_norm_bwd, N, 1, 1, bx, 1, 1, bx * 4, args)
     let _ = _free_args(args)
     st
 }
@@ -495,8 +509,9 @@ fn gpu_softmax_rows_bwd(probs_dev, dp_dev, ds_dev, R, C) {
         _arg_i32(R),
         _arg_i32(C)
     ]
-    // shmem: C * 4 for sum(probs*dp) reduction
-    let st = rtc_launch_shmem(G_K_softmax_rows_bwd, R, 1, 1, C, 1, 1, C * 4, args)
+    // shmem: min(C,1024) * 4 for sum(probs*dp) reduction
+    let bx = _min_1024(C)
+    let st = rtc_launch_shmem(G_K_softmax_rows_bwd, R, 1, 1, bx, 1, 1, bx * 4, args)
     let _ = _free_args(args)
     st
 }
@@ -535,8 +550,9 @@ fn gpu_ce_loss_grad(logits_dev, targets_dev, loss_out_dev, dlogits_dev, R, C) {
         _arg_i32(R),
         _arg_i32(C)
     ]
-    // shmem: C * 4 for logsumexp max/sum reduction
-    let st = rtc_launch_shmem(G_K_ce_loss_grad, R, 1, 1, C, 1, 1, C * 4, args)
+    // shmem: min(C,1024) * 4 for logsumexp max/sum reduction
+    let bx = _min_1024(C)
+    let st = rtc_launch_shmem(G_K_ce_loss_grad, R, 1, 1, bx, 1, 1, bx * 4, args)
     let _ = _free_args(args)
     if st != 0 {
         println("[cuda_kernels] ce_loss_grad launch failed: " + str(st))
@@ -556,7 +572,7 @@ fn gpu_ce_loss_grad(logits_dev, targets_dev, loss_out_dev, dlogits_dev, R, C) {
 // ── Fused forward launchers (#20) ────────────────────────────
 
 // gpu_fused_pre_attn_fwd: rms_norm(x, ga) -> norm1, rstd1
-// One block per row, blockDim.x = D, shmem = D*4
+// One block per row, blockDim.x = min(D,1024), shmem = bx*4
 fn gpu_fused_pre_attn_fwd(x_dev, ga_dev, norm1_dev, rstd1_dev, N, D, eps) {
     let args = [
         _arg_ptr(x_dev),
@@ -567,13 +583,14 @@ fn gpu_fused_pre_attn_fwd(x_dev, ga_dev, norm1_dev, rstd1_dev, N, D, eps) {
         _arg_i32(D),
         _arg_f32(eps)
     ]
-    let st = rtc_launch_shmem(G_K_fused_pre_attn_fwd, N, 1, 1, D, 1, 1, D * 4, args)
+    let bx = _min_1024(D)
+    let st = rtc_launch_shmem(G_K_fused_pre_attn_fwd, N, 1, 1, bx, 1, 1, bx * 4, args)
     let _ = _free_args(args)
     st
 }
 
 // gpu_fused_attn_post_fwd: scale + causal softmax in one pass
-// One block per row, blockDim.x = C, shmem = C*4
+// One block per row, blockDim.x = min(C,1024), shmem = bx*4
 fn gpu_fused_attn_post_fwd(scores_dev, probs_dev, R, C, inv_sqrt_d) {
     let args = [
         _arg_ptr(scores_dev),
@@ -582,13 +599,14 @@ fn gpu_fused_attn_post_fwd(scores_dev, probs_dev, R, C, inv_sqrt_d) {
         _arg_i32(C),
         _arg_f32(inv_sqrt_d)
     ]
-    let st = rtc_launch_shmem(G_K_fused_attn_post_fwd, R, 1, 1, C, 1, 1, C * 4, args)
+    let bx = _min_1024(C)
+    let st = rtc_launch_shmem(G_K_fused_attn_post_fwd, R, 1, 1, bx, 1, 1, bx * 4, args)
     let _ = _free_args(args)
     st
 }
 
 // gpu_fused_mid_ffn_fwd: mid = x + attn_out, then rms_norm(mid, gf)
-// One block per row, blockDim.x = D, shmem = D*4
+// One block per row, blockDim.x = min(D,1024), shmem = bx*4
 fn gpu_fused_mid_ffn_fwd(x_dev, attn_out_dev, gf_dev, mid_dev, norm2_dev, rstd2_dev, N, D, eps) {
     let args = [
         _arg_ptr(x_dev),
@@ -601,7 +619,8 @@ fn gpu_fused_mid_ffn_fwd(x_dev, attn_out_dev, gf_dev, mid_dev, norm2_dev, rstd2_
         _arg_i32(D),
         _arg_f32(eps)
     ]
-    let st = rtc_launch_shmem(G_K_fused_mid_ffn_fwd, N, 1, 1, D, 1, 1, D * 4, args)
+    let bx = _min_1024(D)
+    let st = rtc_launch_shmem(G_K_fused_mid_ffn_fwd, N, 1, 1, bx, 1, 1, bx * 4, args)
     let _ = _free_args(args)
     st
 }
@@ -643,7 +662,7 @@ fn gpu_fused_swiglu_merge_bwd(up_dev, gate_dev, dy_dev, dup_merged_dev, N) {
 // gpu_fused_mid_ffn_bwd: rms_norm_bwd(mid, gf, dnorm2, rstd2) + residual merge
 //   dmid = dy + dmid_from_norm
 //   dgf accumulated via atomicAdd
-// One block per row, blockDim.x = D, shmem = D*4
+// One block per row, blockDim.x = min(D,1024), shmem = bx*4
 fn gpu_fused_mid_ffn_bwd(mid_dev, gf_dev, dnorm2_dev, rstd2_dev, dy_dev, dmid_dev, dgf_dev, N, D, eps) {
     let args = [
         _arg_ptr(mid_dev),
@@ -657,14 +676,15 @@ fn gpu_fused_mid_ffn_bwd(mid_dev, gf_dev, dnorm2_dev, rstd2_dev, dy_dev, dmid_de
         _arg_i32(D),
         _arg_f32(eps)
     ]
-    let st = rtc_launch_shmem(G_K_fused_mid_ffn_bwd, N, 1, 1, D, 1, 1, D * 4, args)
+    let bx = _min_1024(D)
+    let st = rtc_launch_shmem(G_K_fused_mid_ffn_bwd, N, 1, 1, bx, 1, 1, bx * 4, args)
     let _ = _free_args(args)
     st
 }
 
 // gpu_fused_attn_post_bwd: softmax_bwd + inv_sqrt_d scaling in one pass
 //   dscores = probs * (dp - sum(probs*dp)) * inv_sqrt_d
-// One block per row, blockDim.x = C, shmem = C*4
+// One block per row, blockDim.x = min(C,1024), shmem = bx*4
 fn gpu_fused_attn_post_bwd(probs_dev, dp_dev, dscores_dev, R, C, inv_sqrt_d) {
     let args = [
         _arg_ptr(probs_dev),
@@ -674,7 +694,8 @@ fn gpu_fused_attn_post_bwd(probs_dev, dp_dev, dscores_dev, R, C, inv_sqrt_d) {
         _arg_i32(C),
         _arg_f32(inv_sqrt_d)
     ]
-    let st = rtc_launch_shmem(G_K_fused_attn_post_bwd, R, 1, 1, C, 1, 1, C * 4, args)
+    let bx = _min_1024(C)
+    let st = rtc_launch_shmem(G_K_fused_attn_post_bwd, R, 1, 1, bx, 1, 1, bx * 4, args)
     let _ = _free_args(args)
     st
 }
@@ -682,7 +703,7 @@ fn gpu_fused_attn_post_bwd(probs_dev, dp_dev, dscores_dev, R, C, inv_sqrt_d) {
 // gpu_fused_pre_attn_bwd: rms_norm_bwd(x, ga, dnorm1, rstd1) + residual merge
 //   dx = dmid + dx_from_norm
 //   dga accumulated via atomicAdd
-// One block per row, blockDim.x = D, shmem = D*4
+// One block per row, blockDim.x = min(D,1024), shmem = bx*4
 fn gpu_fused_pre_attn_bwd(x_dev, ga_dev, dnorm1_dev, rstd1_dev, dmid_dev, dx_dev, dga_dev, N, D, eps) {
     let args = [
         _arg_ptr(x_dev),
@@ -696,7 +717,8 @@ fn gpu_fused_pre_attn_bwd(x_dev, ga_dev, dnorm1_dev, rstd1_dev, dmid_dev, dx_dev
         _arg_i32(D),
         _arg_f32(eps)
     ]
-    let st = rtc_launch_shmem(G_K_fused_pre_attn_bwd, N, 1, 1, D, 1, 1, D * 4, args)
+    let bx = _min_1024(D)
+    let st = rtc_launch_shmem(G_K_fused_pre_attn_bwd, N, 1, 1, bx, 1, 1, bx * 4, args)
     let _ = _free_args(args)
     st
 }
