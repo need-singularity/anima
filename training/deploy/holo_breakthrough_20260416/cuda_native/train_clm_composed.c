@@ -2638,8 +2638,8 @@ HexaVal GpuClmConfig(HexaVal D, HexaVal FF, HexaVal NL, HexaVal VOCAB, HexaVal S
 
 
 HexaVal gpu_clm_config_default(void) {
-    return GpuClmConfig(hexa_int(512), hexa_int(2048), hexa_int(12), hexa_int(256), hexa_int(512), hexa_int(64), hexa_float(0.00001), hexa_float(0.02));
-    return hexa_void();
+    // scale_1_5b: D=2048, FF=8192, NL=24, VOCAB=256, SEQ=512, RANK=64
+    return GpuClmConfig(hexa_int(2048), hexa_int(8192), hexa_int(24), hexa_int(256), hexa_int(512), hexa_int(64), hexa_float(0.00001), hexa_float(0.02));
 }
 
 
@@ -4520,26 +4520,27 @@ int main(int argc, char** argv) {
     _CKPT_BATCH = hexa_int(64);
     hexa_println(hexa_str("[gpu_train] module loaded — CLM training primitives ready"));
     hexa_println(hexa_str("[corpus_loader] module ready — load_corpus(path) / synthetic_*()"));
-    D = hexa_int(512);
-    FF = hexa_int(2048);
-    NL = hexa_int(12);
+    // === scale_1_5b (1.511B params) + r4 training params (2026-04-16) ===
+    D = hexa_int(2048);       // was 512
+    FF = hexa_int(8192);      // was 2048 (4×D)
+    NL = hexa_int(24);        // was 12
     VOCAB = hexa_int(256);
     SEQ = hexa_int(512);
     RANK = hexa_int(64);
-    BATCH = hexa_int(1);
-    GRAD_ACC = hexa_int(8);
-    STEPS = hexa_int(20);
-    EVAL_EVERY = hexa_int(500);
-    SAVE_EVERY = hexa_int(2000);
-    LOG_EVERY = hexa_int(20);
+    BATCH = hexa_int(8);      // was 1
+    GRAD_ACC = hexa_int(1);   // was 8 (batch=8 sufficient)
+    STEPS = hexa_int(750000); // was 20
+    EVAL_EVERY = hexa_int(2500);  // was 500
+    SAVE_EVERY = hexa_int(5000);  // was 2000
+    LOG_EVERY = hexa_int(100);    // was 20
     LR_MAX = hexa_float(0.0003);
     LR_MIN = hexa_float(0.00003);
-    WARMUP = hexa_int(500);
+    WARMUP = hexa_int(5000);  // was 500
     EPS = hexa_float(0.00001);
     INIT_SCALE = hexa_float(0.02);
     SEED = hexa_int(54321);
-    CKPT_DIR = hexa_str("/workspace/ckpt_clm_byte_kr");
-    R2_PREFIX = hexa_str("r2:anima-models/clm_byte_kr");
+    CKPT_DIR = hexa_str("/workspace/ckpt_clm1b_r4");
+    R2_PREFIX = hexa_str("r2:anima-models/clm1b/r4");
     MODEL_TAG = hexa_str("clm_byte_kr");
     ROUND = hexa_int(1);
     CORPUS_PATH = hexa_str("training/corpus_ko_seed.tok");
