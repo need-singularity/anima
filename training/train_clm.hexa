@@ -381,6 +381,44 @@ comptime const CBLAS_ROW_MAJOR = 101
 comptime const CBLAS_NO_TRANS  = 111
 comptime const CBLAS_TRANS     = 112
 
+// ─── §A0.2  hxlmhead FFI (fused LM-head backward via BLAS) ───────
+//
+// Gated on HXLMHEAD_FFI=1 env var. When active, replaces the naive
+// triple-loop matmuls in decoder_backward (lines 1056-1104) with a
+// single C dispatch through hxlmhead_bwd. The C kernel does:
+//   forward recompute (mid = x@Wu, logits = mid@Wv),
+//   softmax + CE loss,
+//   all 4 backward matmuls (dWv, dmid, dWu, dx)
+// via cblas_sgemm (Accelerate on Mac, OpenBLAS on Linux).
+//
+// Library: hexa-lang/self/native/build/libhxlmhead.dylib
+// Source:  hexa-lang/self/native/hxlmhead_linux.c (v1: BLAS route)
+// Binding: hexa-lang/self/ml/hxlmhead.hexa
+
+@link("/Users/ghost/Dev/hexa-lang/self/native/build/libhxlmhead.dylib")
+extern fn hxlmhead_bwd(args_p: *Void) -> int
+
+@link("/Users/ghost/Dev/hexa-lang/self/native/build/libhxlmhead.dylib")
+extern fn hxlmhead_version() -> int
+
+// HxLMHeadArgs struct field offsets (bytes). Must match hxlmhead_linux.c.
+comptime const HXLMH_OFF_S          = 0
+comptime const HXLMH_OFF_H          = 8
+comptime const HXLMH_OFF_M          = 16
+comptime const HXLMH_OFF_V          = 24
+comptime const HXLMH_OFF_LOSS_SCALE = 32
+comptime const HXLMH_OFF_X          = 40
+comptime const HXLMH_OFF_MID        = 48
+comptime const HXLMH_OFF_TARGETS    = 56
+comptime const HXLMH_OFF_WU         = 64
+comptime const HXLMH_OFF_WV         = 72
+comptime const HXLMH_OFF_DL_DX      = 80
+comptime const HXLMH_OFF_DW_U       = 88
+comptime const HXLMH_OFF_DW_V       = 96
+comptime const HXLMH_OFF_LOSS_OUT   = 104
+comptime const HXLMH_OFF_RESERVED0  = 112
+comptime const HXLMH_STRUCT_BYTES   = 120
+
 // ─── §A0.1  List↔raw buffer marshalling ───────────────────────────
 //
 // _block_attn uses [float] lists for its interface (Q/K/V/output are all
@@ -405,6 +443,120 @@ fn _raw_to_list(buf: int, count: int, list: [float], offset: int) {
     while i < count {
         list[offset + i] = deref_f32(buf, i * 4)
         i = i + 1
+    }
+}
+
+// Copy [int] list into a raw i32 buffer (already allocated).
+// Used to marshal target indices for hxlmhead FFI (C expects int32*).
+fn _ints_to_raw_i32(list: [int], count: int, buf: int) {
+    let mut i = 0
+    while i < count {
+        write_i32(buf, i * 4, list[i])
+        i = i + 1
+    }
+}
+
+// ─── §A0.3  hxlmhead fused backward FFI helper ───────────────────
+//
+// Marshals hexa [float] lists → f32 raw buffers, packs HxLMHeadArgs,
+// dispatches hxlmhead_bwd, then unmarshals output f32 buffers → lists.
+//
+// Returns: { dL_dx: [float], dL_dU: [float], dL_dV: [float], loss: float }
+// On C error (rc < 0), prints a warning and returns sentinel loss = -1.0
+// with zero gradient buffers.
+
+struct LMHeadBwdFFIResult {
+    dL_dx: [float],
+    dL_dU: [float],
+    dL_dV: [float],
+    loss: float
+}
+
+fn _lmhead_bwd_ffi(
+    x: [float], targets: [int],
+    Wu: [float], Wv: [float],
+    loss_scale: float,
+    seq: int, d: int, rank: int, v: int
+) -> LMHeadBwdFFIResult {
+    // Allocate f32 raw buffers for inputs
+    let buf_x   = alloc_raw(seq * d * 4)
+    let buf_Wu  = alloc_raw(d * rank * 4)
+    let buf_Wv  = alloc_raw(rank * v * 4)
+    let buf_tgt = alloc_raw(seq * 4)
+
+    // Marshal hexa lists → f32/i32 raw buffers
+    _list_to_raw(x,  0, seq * d,    buf_x)
+    _list_to_raw(Wu, 0, d * rank,   buf_Wu)
+    _list_to_raw(Wv, 0, rank * v,   buf_Wv)
+    _ints_to_raw_i32(targets, seq,  buf_tgt)
+
+    // Allocate f32 output buffers (zeroed by alloc_raw)
+    let buf_dx  = alloc_raw(seq * d * 4)
+    let buf_dWu = alloc_raw(d * rank * 4)
+    let buf_dWv = alloc_raw(rank * v * 4)
+
+    // mid_p = 0 → C kernel recomputes mid = x @ Wu internally
+    let buf_mid = 0
+
+    // Allocate f64 loss output (8 bytes)
+    let buf_loss = alloc_raw(8)
+    ptr_write(buf_loss, 0, 0.0)
+
+    // Pack HxLMHeadArgs struct
+    let args = alloc_raw(HXLMH_STRUCT_BYTES)
+    ptr_write(args, HXLMH_OFF_S,          seq)
+    ptr_write(args, HXLMH_OFF_H,          d)
+    ptr_write(args, HXLMH_OFF_M,          rank)
+    ptr_write(args, HXLMH_OFF_V,          v)
+    ptr_write(args, HXLMH_OFF_LOSS_SCALE, loss_scale * 1.0)
+    ptr_write(args, HXLMH_OFF_X,          buf_x)
+    ptr_write(args, HXLMH_OFF_MID,        buf_mid)
+    ptr_write(args, HXLMH_OFF_TARGETS,    buf_tgt)
+    ptr_write(args, HXLMH_OFF_WU,         buf_Wu)
+    ptr_write(args, HXLMH_OFF_WV,         buf_Wv)
+    ptr_write(args, HXLMH_OFF_DL_DX,      buf_dx)
+    ptr_write(args, HXLMH_OFF_DW_U,       buf_dWu)
+    ptr_write(args, HXLMH_OFF_DW_V,       buf_dWv)
+    ptr_write(args, HXLMH_OFF_LOSS_OUT,   buf_loss)
+    ptr_write(args, HXLMH_OFF_RESERVED0,  0)
+
+    // Dispatch
+    let rc = hxlmhead_bwd(args)
+
+    // Read loss
+    let loss = ptr_read_f64(buf_loss, 0)
+
+    // Unmarshal output f32 buffers → hexa [float] lists
+    let mut dL_dx_out = _tz(seq * d)
+    let mut dL_dU_out = _tz(d * rank)
+    let mut dL_dV_out = _tz(rank * v)
+
+    if rc >= 0 {
+        _raw_to_list(buf_dx,  seq * d,   dL_dx_out, 0)
+        _raw_to_list(buf_dWu, d * rank,  dL_dU_out, 0)
+        _raw_to_list(buf_dWv, rank * v,  dL_dV_out, 0)
+    }
+
+    // Free all raw buffers
+    free_raw(args,     HXLMH_STRUCT_BYTES)
+    free_raw(buf_loss, 8)
+    free_raw(buf_x,    seq * d * 4)
+    free_raw(buf_Wu,   d * rank * 4)
+    free_raw(buf_Wv,   rank * v * 4)
+    free_raw(buf_tgt,  seq * 4)
+    free_raw(buf_dx,   seq * d * 4)
+    free_raw(buf_dWu,  d * rank * 4)
+    free_raw(buf_dWv,  rank * v * 4)
+
+    if rc < 0 {
+        print("[hxlmhead] bwd FFI error rc=" + str(rc) + ", falling back to zero grads")
+    }
+
+    return LMHeadBwdFFIResult {
+        dL_dx: dL_dx_out,
+        dL_dU: dL_dU_out,
+        dL_dV: dL_dV_out,
+        loss: if rc < 0 { -1.0 } else { loss }
     }
 }
 
@@ -1039,69 +1191,99 @@ fn decoder_backward(
     let v = model.vocab
     let rank = model.lmh_rank
 
-    // 1. CE loss + gradient w.r.t. logits
-    let ce = _ce_fwd_bwd(fwd.logits, targets, seq, v)
-    let dL_dlogits = ce.grad_logits    // [seq × vocab]
+    // ── LM head backward: FFI path (HXLMHEAD_FFI=1) or naive fallback ──
+    //
+    // FFI path: single C dispatch through hxlmhead_bwd does forward
+    // recompute + CE + all 4 backward matmuls via cblas_sgemm.
+    // Naive path: original triple-loop matmuls (CE + dV + dmid + dU + dx).
+    let _use_hxlmhead_ffi = len(env_var("HXLMHEAD_FFI")) > 0
 
-    // 2. Backward through LM head V:
-    //    logits = mid @ V   where mid = [seq × rank], V = [rank × vocab]
-    //    dL/dV = mid^T @ dL_dlogits      [rank × vocab]
-    //    dL/dmid = dL_dlogits @ V^T      [seq × rank]
-    let dL_dV = _matmul_At(fwd.mid, dL_dlogits, seq, rank, v)
-    // For dL/dmid we need dL_dlogits @ V^T. V is [rank × vocab].
-    // V^T is [vocab × rank]. dL_dlogits[seq × vocab] @ V^T[vocab × rank] = [seq × rank]
-    // This is _matmul(dL_dlogits, V^T, seq, v, rank) but we can compute
-    // it as: for each (i,j), sum_k dL_dlogits[i,k] * V[j,k]
-    // which is dL_dlogits @ V^T  where V stored [rank×vocab] → V^T[vocab×rank]
-    let mut dL_dmid = _tz(seq * rank)
-    let mut i = 0
-    while i < seq {
-        let mut j = 0
-        while j < rank {
-            let mut sum = 0.0
-            let mut k = 0
-            while k < v {
-                sum = sum + dL_dlogits[i * v + k] * model.lmh_V[j * v + k]
-                k = k + 1
+    let mut dL_dV = _tz(rank * v)
+    let mut dL_dU = _tz(d * rank)
+    let mut dL_dx = _tz(seq * d)
+    let mut ce_loss = 0.0
+
+    if _use_hxlmhead_ffi {
+        // Fused FFI path: x_final → CE loss + all 4 grad matmuls in one call.
+        // loss_scale=1.0 matches naive _ce_fwd_bwd scale=1/N (C does /S internally).
+        let ffi_res = _lmhead_bwd_ffi(
+            fwd.hidden, targets,
+            model.lmh_U, model.lmh_V,
+            1.0,
+            seq, d, rank, v
+        )
+        dL_dx = ffi_res.dL_dx
+        dL_dU = ffi_res.dL_dU
+        dL_dV = ffi_res.dL_dV
+        ce_loss = ffi_res.loss
+    } else {
+        // ── Naive fallback (original triple-loop path) ──
+
+        // 1. CE loss + gradient w.r.t. logits
+        let ce = _ce_fwd_bwd(fwd.logits, targets, seq, v)
+        let dL_dlogits = ce.grad_logits    // [seq × vocab]
+        ce_loss = ce.loss
+
+        // 2. Backward through LM head V:
+        //    logits = mid @ V   where mid = [seq × rank], V = [rank × vocab]
+        //    dL/dV = mid^T @ dL_dlogits      [rank × vocab]
+        //    dL/dmid = dL_dlogits @ V^T      [seq × rank]
+        dL_dV = _matmul_At(fwd.mid, dL_dlogits, seq, rank, v)
+        // For dL/dmid we need dL_dlogits @ V^T. V is [rank × vocab].
+        // V^T is [vocab × rank]. dL_dlogits[seq × vocab] @ V^T[vocab × rank] = [seq × rank]
+        // This is _matmul(dL_dlogits, V^T, seq, v, rank) but we can compute
+        // it as: for each (i,j), sum_k dL_dlogits[i,k] * V[j,k]
+        // which is dL_dlogits @ V^T  where V stored [rank×vocab] → V^T[vocab×rank]
+        let mut dL_dmid = _tz(seq * rank)
+        let mut i = 0
+        while i < seq {
+            let mut j = 0
+            while j < rank {
+                let mut sum = 0.0
+                let mut k = 0
+                while k < v {
+                    sum = sum + dL_dlogits[i * v + k] * model.lmh_V[j * v + k]
+                    k = k + 1
+                }
+                dL_dmid[i * rank + j] = sum
+                j = j + 1
             }
-            dL_dmid[i * rank + j] = sum
-            j = j + 1
+            i = i + 1
         }
-        i = i + 1
-    }
 
-    // 3. Backward through LM head U:
-    //    mid = x_final @ U   where x_final = [seq × d], U = [d × rank]
-    //    dL/dU = x_final^T @ dL_dmid      [d × rank]
-    let dL_dU = _matmul_At(fwd.hidden, dL_dmid, seq, d, rank)
+        // 3. Backward through LM head U:
+        //    mid = x_final @ U   where x_final = [seq × d], U = [d × rank]
+        //    dL/dU = x_final^T @ dL_dmid      [d × rank]
+        dL_dU = _matmul_At(fwd.hidden, dL_dmid, seq, d, rank)
+
+        // 5. Backward through final RMS norm and blocks
+        //    For the training loop, the critical gradient path is through
+        //    the LM head (which carries the bulk of loss signal for early
+        //    training). Block-level backward propagates the hidden gradient
+        //    to update Wq/Wk/Wv/Wo/Wgate/Wup/Wdown per block.
+        //
+        //    dL/dx_final = dL_dmid @ U^T   [seq × d]
+        dL_dx = _tz(seq * d)
+        i = 0
+        while i < seq {
+            let mut j = 0
+            while j < d {
+                let mut sum = 0.0
+                let mut k = 0
+                while k < rank {
+                    sum = sum + dL_dmid[i * rank + k] * model.lmh_U[j * rank + k]
+                    k = k + 1
+                }
+                dL_dx[i * d + j] = sum
+                j = j + 1
+            }
+            i = i + 1
+        }
+    }
 
     // 4. SGD update on LM head weights
     let new_V = _tsub(model.lmh_V, _tscale(dL_dV, lr))
     let new_U = _tsub(model.lmh_U, _tscale(dL_dU, lr))
-
-    // 5. Backward through final RMS norm and blocks
-    //    For the training loop, the critical gradient path is through
-    //    the LM head (which carries the bulk of loss signal for early
-    //    training). Block-level backward propagates the hidden gradient
-    //    to update Wq/Wk/Wv/Wo/Wgate/Wup/Wdown per block.
-    //
-    //    dL/dx_final = dL_dmid @ U^T   [seq × d]
-    let mut dL_dx = _tz(seq * d)
-    i = 0
-    while i < seq {
-        let mut j = 0
-        while j < d {
-            let mut sum = 0.0
-            let mut k = 0
-            while k < rank {
-                sum = sum + dL_dmid[i * rank + k] * model.lmh_U[j * rank + k]
-                k = k + 1
-            }
-            dL_dx[i * d + j] = sum
-            j = j + 1
-        }
-        i = i + 1
-    }
 
     // 6. Block-level backward (reverse order, simplified SGD on projections)
     //    For each block L-1..0:
@@ -1242,7 +1424,7 @@ fn decoder_backward(
         lmh_V: new_V
     }
 
-    return BackwardResult { model: updated_model, loss: ce.loss }
+    return BackwardResult { model: updated_model, loss: ce_loss }
 }
 
 // ─── §H  Integrated train_step ───────────────────────────────────
