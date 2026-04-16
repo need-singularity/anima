@@ -79,6 +79,21 @@ let BASE_FREQ_HZ  = 200.0       // partial 0 fundamental ~ 200 Hz
 let MAX_GAIN      = 0.18        // headroom: 6-partial sum < 1.0
 
 // ════════════════════════════════════════════════════════════════════
+// Section 1b. Native FFI — hxvocoder C shim (Stage A+B fused)
+//
+// hxvocoder_decode_nv: 4-arg entry (within FFI 6-arg ceiling)
+//   out_p, latent_flat_p, W_ctrl_p, n_frames
+// All constants baked (SR=24000, HOP=240, etc). ~100x over interpreter.
+// Gate: NEUROVOC_NATIVE=1 activates the C path.
+// Build: clang -O3 -shared -fPIC -o libhxvocoder.dylib hxvocoder.c -lm
+// ════════════════════════════════════════════════════════════════════
+@link("hxvocoder")
+extern fn hxvocoder_version() -> int
+
+@link("hxvocoder")
+extern fn hxvocoder_decode_nv(out_p: int, latent_flat_p: int, W_ctrl_p: int, n_frames: int)
+
+// ════════════════════════════════════════════════════════════════════
 // Section 2. Pure-hexa NN primitives (inlined; no `use nn_core`)
 // ════════════════════════════════════════════════════════════════════
 
@@ -473,8 +488,50 @@ fn decode_wave(latent_frames: [[float]], sample_rate: int) -> [float] {
         println("[neural_vocoder] Stage B active — additive synthesis (no CUDA)")
     }
 
-    // ── Stage A: latent → ctrl per frame ──
-    // Load trained W_ctrl from checkpoint; fallback to mock-weight identity.
+    // ── Native fast-path: Stage A+B fused in C (NEUROVOC_NATIVE=1) ──
+    let use_native = env("NEUROVOC_NATIVE")
+    if use_native == "1" {
+        // Marshal hexa arrays → raw f32 buffers for hxvocoder_decode_nv
+        let n_lat = n_frames * LATENT_DIM
+        let latent_buf = alloc_raw(n_lat * 4)
+        let mut fi = 0
+        while fi < n_frames {
+            let mut ji = 0
+            while ji < LATENT_DIM {
+                write_f32(latent_buf, (fi * LATENT_DIM + ji) * 4, latent_frames[fi][ji])
+                ji = ji + 1
+            }
+            fi = fi + 1
+        }
+        // W_ctrl: load checkpoint first
+        let ckpt_p = env("SPEAK_CKPT_W_CTRL")
+        let W_ctrl_n = if ckpt_p != "" { load_w_ctrl(ckpt_p) } else { load_w_ctrl("anima-speak/ckpt_w_ctrl.json") }
+        let n_w = CTRL_DIM * LATENT_DIM
+        let W_buf = alloc_raw(n_w * 4)
+        let mut wi = 0
+        while wi < n_w {
+            write_f32(W_buf, wi * 4, W_ctrl_n[wi])
+            wi = wi + 1
+        }
+        // Output buffer
+        let n_samples = n_frames * HOP
+        let out_buf = alloc_raw(n_samples * 4)
+        // Dispatch to C
+        hxvocoder_decode_nv(out_buf, latent_buf, W_buf, n_frames)
+        // Read back samples
+        let mut wave = []
+        let mut si = 0
+        while si < n_samples {
+            wave = wave.push(deref_f32(out_buf, si * 4))
+            si = si + 1
+        }
+        free_raw(latent_buf, n_lat * 4)
+        free_raw(W_buf, n_w * 4)
+        free_raw(out_buf, n_samples * 4)
+        return wave
+    }
+
+    // ── Fallback: pure-hexa Stage A + B ──
     let ckpt_path = env("SPEAK_CKPT_W_CTRL")
     let W_ctrl = if ckpt_path != "" { load_w_ctrl(ckpt_path) } else { load_w_ctrl("anima-speak/ckpt_w_ctrl.json") }
 
