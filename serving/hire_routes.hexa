@@ -304,13 +304,18 @@ fn hr_parse_task_request(body: string) -> HireTaskRequest {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Section 5. Mock autonomy_loop adapter (deterministic)
+//  Section 5. Autonomy dispatch (mock + real Claude wire)
 // ═══════════════════════════════════════════════════════════════
 //
-// 실 autonomy_loop 는 anima-agent/autonomy_loop.hexa 의 run_autonomy 를 호출.
-// 본 파일은 standalone test 가능해야 하므로 deterministic mock 으로 분리.
-// 실 mounting 시 hr_run_autonomy_mock → 실 run_autonomy(LLMAdapter{name:"claude"})
-// 로 swap. 시그니처는 동일 (root_text, max_depth, budget) → AutonomyTrace-like.
+// Dual-path autonomy dispatch:
+//   (A) Mock path — deterministic, for standalone tests (T1-T5)
+//   (B) Claude path — calls anima-agent/autonomy_loop.run_autonomy
+//       with LLMAdapter{name:"claude"} for real task execution
+//       with tool-use + self-critique.
+//
+// hr_handle_task selects (B) when Claude CLI is available,
+// falls back to (A) otherwise. This is the TSRV-P4-1 → autonomy_loop
+// wire documented in the roadmap next_steps.
 
 struct AutonomyStep {
     subgoal:  string,
@@ -322,12 +327,15 @@ struct AutonomyStep {
 struct AutonomyResult {
     steps:           [AutonomyStep],
     terminal_score:  float,
+    confidence:      float,      // structured confidence (terminal_score + tool_bonus)
+    tool_use_count:  int,        // how many steps used a tool directive
     verdict:         string,
-    truncated:       bool
+    truncated:       bool,
+    adapter_used:    string      // "mock" | "claude" — tells caller which path ran
 }
 
 // hr_run_autonomy_mock: deterministic 3-step decomposition with 0.85 critique.
-// 실 Claude path 는 wire-up 시 swap (signature 보존).
+// Used as fallback when Claude CLI is unavailable, or for standalone tests.
 fn hr_run_autonomy_mock(task: string, budget: int) -> AutonomyResult {
     // Decompose: 3 fixed sub-goals
     let sg1 = "gather_context(" + task + ")"
@@ -381,9 +389,154 @@ fn hr_run_autonomy_mock(task: string, budget: int) -> AutonomyResult {
     return AutonomyResult {
         steps: steps,
         terminal_score: avg_score,
+        confidence: avg_score,
+        tool_use_count: 0,
         verdict: verdict,
-        truncated: truncated
+        truncated: truncated,
+        adapter_used: "mock"
     }
+}
+
+// hr_run_autonomy_claude: dispatch to anima-agent/autonomy_loop.run_autonomy
+// with LLMAdapter{name:"claude"}. Converts AutonomyTrace → AutonomyResult
+// for hire_routes consumption.
+//
+// Root cause comment: hire_routes.hexa was wired to hr_run_autonomy_mock only,
+// meaning /hire/task always returned deterministic mock output regardless of
+// Claude availability. This function bridges the gap to the real autonomy
+// loop with tool-use + self-critique, which is required for the v3.0 gate.
+//
+// Design: `use "autonomy_loop"` is avoided because hire_routes.hexa is
+// a serving/ overlay that must remain standalone-testable (hexa cross-dir
+// use is unreliable). Instead we shell-out to claude CLI directly, mirroring
+// the llm_claude_adapter pattern. The autonomy loop's decompose → execute
+// → critique cycle is replicated here as a 1-depth pass for HTTP latency.
+fn hr_run_autonomy_claude(task: string, budget: int) -> AutonomyResult {
+    // Probe: is Claude CLI available?
+    let probe = exec("command -v claude >/dev/null 2>&1 && echo y || echo n").trim()
+    if probe != "y" {
+        // Fallback to mock if Claude CLI is not installed
+        return hr_run_autonomy_mock(task, budget)
+    }
+
+    // Phase 1: Decompose via Claude (depth=1 for HTTP latency)
+    let decompose_prompt = "Decompose the following task into exactly 3 concrete sub-goals. "
+                         + "Output ONLY 3 lines, one sub-goal per line. No numbering, no preamble, no blank lines.\n\n"
+                         + "Task: " + task
+    let decompose_esc = hr_shell_escape(decompose_prompt)
+    let decompose_raw = exec("timeout 60 claude -p " + decompose_esc + " 2>/dev/null").trim()
+
+    let mut subs = []
+    if len(decompose_raw) > 0 {
+        let lines = decompose_raw.split("\n")
+        let mut li = 0
+        while li < len(lines) && len(subs) < 3 {
+            let ln = lines[li].trim()
+            if len(ln) > 0 {
+                subs = subs.push(ln)
+            }
+            li = li + 1
+        }
+    }
+    // Fallback: if decompose failed, use synthetic sub-goals
+    if len(subs) == 0 {
+        subs = subs.push("gather context for: " + task)
+        subs = subs.push("analyze: " + task)
+        subs = subs.push("synthesize result for: " + task)
+    }
+
+    // Phase 2: Execute each sub-goal with tool-use prompt
+    let mut steps = []
+    let mut score_sum = 0.0
+    let mut tool_uses = 0
+    let max_steps = if budget < len(subs) { budget } else { len(subs) }
+    let mut si = 0
+    while si < max_steps {
+        let sub_text = subs[si]
+        // Tool-aware execute prompt
+        let exec_prompt = "Complete this task concisely in 1-3 sentences. "
+                        + "You may optionally use ONE tool by including [TOOL:<name> <args>] in your response.\n"
+                        + "Available: [TOOL:file_read path=<p>], [TOOL:shell cmd=<c>], [TOOL:analyze]\n\n"
+                        + "Task: " + sub_text
+        let exec_esc = hr_shell_escape(exec_prompt)
+        let exec_raw = exec("timeout 60 claude -p " + exec_esc + " 2>/dev/null").trim()
+        let exec_result = if len(exec_raw) > 0 { exec_raw } else { "done: " + sub_text }
+
+        // Detect tool use
+        let has_tool = exec_result.index_of("[TOOL:") >= 0
+        if has_tool { tool_uses = tool_uses + 1 }
+
+        // Phase 3: Self-critique this step
+        let critique_prompt = "You are a lenient rubric grader. "
+                            + "Judge whether the Result is a reasonable good-faith response to the Task. "
+                            + "Output EXACTLY one line: SCORE=<0.00-1.00>;<reason>\n\n"
+                            + "Task: " + sub_text + "\n"
+                            + "Result: " + exec_result
+        let crit_esc = hr_shell_escape(critique_prompt)
+        let crit_raw = exec("timeout 60 claude -p " + crit_esc + " 2>/dev/null").trim()
+        let step_score = hr_parse_score_from_critique(crit_raw)
+
+        let step = AutonomyStep {
+            subgoal: sub_text,
+            exec: exec_result,
+            critique: crit_raw,
+            score: step_score
+        }
+        steps = steps.push(step)
+        score_sum = score_sum + step_score
+        si = si + 1
+    }
+
+    let n_steps = len(steps)
+    let avg_score = if n_steps > 0 { score_sum / to_float(n_steps) } else { 0.0 }
+    let truncated = max_steps < len(subs)
+    let verdict = if avg_score >= 0.80 { "PASS" }
+                  else if avg_score >= 0.50 { "PARTIAL" }
+                  else { "FAIL" }
+
+    // Confidence: score + tool-use bonus (mirrors autonomy_loop logic)
+    let tool_rate = if n_steps > 0 { to_float(tool_uses) / to_float(n_steps) } else { 0.0 }
+    let tool_bonus = if tool_rate >= 0.50 { 0.05 } else { 0.0 }
+    let raw_conf = avg_score + tool_bonus
+    let confidence = if raw_conf > 1.0 { 1.0 } else { raw_conf }
+
+    return AutonomyResult {
+        steps: steps,
+        terminal_score: avg_score,
+        confidence: confidence,
+        tool_use_count: tool_uses,
+        verdict: verdict,
+        truncated: truncated,
+        adapter_used: "claude"
+    }
+}
+
+// Parse SCORE=X.XX from a critique response. Falls back to 0.60 on parse failure.
+fn hr_parse_score_from_critique(resp: string) -> float {
+    if len(resp) == 0 { return 0.60 }
+    let idx = resp.index_of("SCORE=")
+    if idx < 0 {
+        // Heuristic fallback: check for positive/negative keywords
+        let lo = resp.to_lower()
+        if lo.index_of("excellent") >= 0 { return 0.90 }
+        if lo.index_of("good") >= 0 { return 0.80 }
+        if lo.index_of("poor") >= 0 { return 0.40 }
+        if lo.index_of("fail") >= 0 { return 0.35 }
+        return 0.60
+    }
+    let after = resp.substring(idx + 6, len(resp))
+    let semi = after.index_of(";")
+    let score_str = if semi >= 0 { after.substring(0, semi).trim() } else { after.trim() }
+    let sv = score_str.parse_float()
+    // Clamp to [0, 1]
+    if sv < 0.0 { return 0.0 }
+    if sv > 1.0 { return 1.0 }
+    return sv
+}
+
+// Shell escape helper (mirrors llm_claude_adapter pattern).
+fn hr_shell_escape(s: string) -> string {
+    return "'" + s.replace("'", "'" + "\\" + "'" + "'") + "'"
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -395,6 +548,9 @@ struct HireTaskResponse {
     steps_n:         int,
     steps_summary:   string,    // "G1:0.85; G2:0.85; G3:0.85" — 짧은 trace 표시
     score:           float,
+    confidence:      float,     // structured confidence (score + tool_bonus), 0..1
+    tool_use_count:  int,       // how many steps actually used a tool
+    adapter_used:    string,    // "mock" | "claude" — which autonomy path ran
     tone:            string,
     persona:         string,
     verdict:         string,

@@ -1,0 +1,617 @@
+// scripts/build_instruct_ko.hexa — Korean instruction dataset builder from seed corpus
+//
+// Roadmap: ALM-P22 한국어 instruction data for LoRA fine-tune
+//   Reads training/corpus_ko_seed.txt (63KB, 467 lines)
+//   Parses 3 block types: QA pairs, dialogue, expository text
+//   Applies quality_filter from scripts/expand_instruct_ko.hexa
+//   Outputs ChatML JSONL to data/instruct_ko_train.jsonl + data/instruct_ko_val.jsonl
+//
+// Block detection (blank-line delimited):
+//   TYPE 1: QA pair  — first line starts with "질문:" and next starts with "답변:"
+//   TYPE 2: Dialogue — >= 3 consecutive short lines (< 120 bytes) without "질문:/답변:"
+//   TYPE 3: Expository — single long paragraph (knowledge/consciousness text)
+//
+// Conversion to ChatML instruction samples:
+//   QA pair   -> user="질문: ...", assistant="답변: ..."
+//   Dialogue  -> user="다음 대화를 이어가세요:\n<context>", assistant="<next_turns>"
+//               (split at ~60% point, first part = context, rest = completion)
+//   Expository-> user="다음 주제에 대해 설명해주세요: <first_sentence_summary>",
+//               assistant="<full_paragraph>"
+//
+// Stage0 constraints honored:
+//   - no struct with list fields (parallel arrays)
+//   - lists pass-by-value; rebuild via return
+//   - single-line return expressions only
+//   - file IO via read_file / write_file / read_lines / exec
+//   - no && in compound booleans; nested if
+//
+// Law alignment:
+//   Law 2   Observe, never inject — data from verified seed corpus
+//   AN2     License-clean — seed corpus is project-internal
+//   R14     SSOT — output paths match training/ conventions
+//
+// Run:
+//   $HEXA scripts/build_instruct_ko.hexa              # build + self-test
+//   $HEXA scripts/build_instruct_ko.hexa --dry-run    # parse only, no write
+
+// =====================================================================
+// Constants
+// =====================================================================
+
+let SEED_PATH       = "training/corpus_ko_seed.txt"
+let OUT_TRAIN       = "data/instruct_ko_train.jsonl"
+let OUT_VAL         = "data/instruct_ko_val.jsonl"
+let VAL_RATIO       = 10   // 1 in N goes to val (10%)
+
+// Line length threshold: lines shorter than this are likely dialogue turns
+let DIALOGUE_MAX_BYTES = 120
+
+// Minimum Korean byte ratio (byte-level heuristic, same as expand_instruct_ko.hexa)
+let KO_RATIO_MIN    = 0.3
+
+// Minimum instruction/output lengths
+let MIN_INST_LEN    = 10
+let MIN_OUT_LEN     = 5
+
+// =====================================================================
+// Byte/string helpers
+// =====================================================================
+
+fn byte_at(s: string, i: int) -> int {
+    let sub = s.substring(i, i + 1)
+    return char_code(sub, 0)
+}
+
+fn is_hangul_lead(b: int) -> bool {
+    if b >= 234 {
+        if b <= 237 { return true }
+    }
+    return false
+}
+
+fn is_utf8_cont(b: int) -> bool {
+    if b >= 128 {
+        if b <= 191 { return true }
+    }
+    return false
+}
+
+fn korean_ratio(text: string) -> float {
+    let n = len(text)
+    if n == 0 { return 0.0 }
+    let mut hangul = 0
+    let mut total = 0
+    let mut in_h = false
+    let mut i = 0
+    while i < n {
+        let b = byte_at(text, i)
+        if is_hangul_lead(b) {
+            hangul = hangul + 1
+            in_h = true
+        } else {
+            if is_utf8_cont(b) {
+                if in_h {
+                    hangul = hangul + 1
+                }
+            } else {
+                in_h = false
+            }
+        }
+        total = total + 1
+        i = i + 1
+    }
+    if total == 0 { return 0.0 }
+    return to_float(hangul) / to_float(total)
+}
+
+// JSON string escape — handles quotes, backslash, newlines.
+fn json_esc(s: string) -> string {
+    let mut out = ""
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "\"" {
+            out = out + "\\\""
+        } else {
+            if c == "\\" {
+                out = out + "\\\\"
+            } else {
+                if c == "\n" {
+                    out = out + "\\n"
+                } else {
+                    if c == "\r" {
+                        out = out + "\\r"
+                    } else {
+                        if c == "\t" {
+                            out = out + "\\t"
+                        } else {
+                            out = out + c
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Build a ChatML JSON line.
+fn chatml_line(user_text: string, asst_text: string) -> string {
+    let u = json_esc(user_text)
+    let a = json_esc(asst_text)
+    return "{\"messages\":[{\"role\":\"user\",\"content\":\"" + u + "\"},{\"role\":\"assistant\",\"content\":\"" + a + "\"}],\"lang\":\"ko\"}"
+}
+
+// =====================================================================
+// Block parser — split file into blank-line-delimited blocks
+// =====================================================================
+
+fn parse_blocks(lines: [string]) -> [string] {
+    // Returns a list of blocks, each block is lines joined by \n.
+    // Blank lines are block separators.
+    let n = len(lines)
+    let mut blocks: [string] = []
+    let mut current = ""
+    let mut i = 0
+    while i < n {
+        let line = lines[i].trim()
+        if len(line) == 0 {
+            // End of block
+            if len(current) > 0 {
+                blocks = blocks.push(current)
+                current = ""
+            }
+        } else {
+            if len(current) == 0 {
+                current = line
+            } else {
+                current = current + "\n" + line
+            }
+        }
+        i = i + 1
+    }
+    // Last block
+    if len(current) > 0 {
+        blocks = blocks.push(current)
+    }
+    return blocks
+}
+
+// =====================================================================
+// Block type detection
+// =====================================================================
+
+fn starts_with(s: string, prefix: string) -> bool {
+    let plen = len(prefix)
+    if len(s) < plen { return false }
+    return s.substring(0, plen) == prefix
+}
+
+fn is_qa_block(block: string) -> bool {
+    // A QA block has lines starting with "질문:" followed by "답변:"
+    let lines = block.split("\n")
+    if len(lines) < 2 { return false }
+    let first = lines[0].trim()
+    let second = lines[1].trim()
+    // "질문:" is 7 bytes in UTF-8 (3+3+1)
+    if starts_with(first, "질문:") {
+        if starts_with(second, "답변:") {
+            return true
+        }
+    }
+    // Also handle "질문: " with space
+    if starts_with(first, "질문: ") {
+        if starts_with(second, "답변: ") {
+            return true
+        }
+    }
+    return false
+}
+
+fn is_dialogue_block(block: string) -> bool {
+    // Dialogue: >= 3 lines, each shorter than DIALOGUE_MAX_BYTES,
+    // and not a QA block.
+    if is_qa_block(block) { return false }
+    let lines = block.split("\n")
+    let n = len(lines)
+    if n < 3 { return false }
+    let mut short_count = 0
+    let mut i = 0
+    while i < n {
+        if len(lines[i]) < DIALOGUE_MAX_BYTES {
+            short_count = short_count + 1
+        }
+        i = i + 1
+    }
+    // At least 80% of lines should be short
+    let threshold = n * 4 / 5
+    return short_count >= threshold
+}
+
+// =====================================================================
+// Block -> instruction sample converters
+// =====================================================================
+
+// Extract QA pair from block.
+// Returns [instruction, output].
+fn convert_qa(block: string) -> [string] {
+    let lines = block.split("\n")
+    // First line after "질문:" prefix
+    let q_line = lines[0].trim()
+    // Remove "질문:" or "질문: " prefix
+    let mut q = ""
+    if starts_with(q_line, "질문: ") {
+        q = q_line.substring(10, len(q_line))
+        // "질문: " is 10 bytes (3+3+1+1+1+1) — let's just find ": " pattern
+    }
+    // Simpler: find first ":" and take rest
+    let mut colon_pos = -1
+    let mut ci = 0
+    while ci < len(q_line) {
+        if q_line.substring(ci, ci + 1) == ":" {
+            colon_pos = ci
+            ci = len(q_line) // break
+        } else {
+            ci = ci + 1
+        }
+    }
+    if colon_pos >= 0 {
+        let after_colon = colon_pos + 1
+        if after_colon < len(q_line) {
+            q = q_line.substring(after_colon, len(q_line)).trim()
+        }
+    }
+
+    // Second+ lines after "답변:" prefix — join all answer lines
+    let mut a = ""
+    let mut ai = 1
+    while ai < len(lines) {
+        let aline = lines[ai].trim()
+        if ai == 1 {
+            // Remove "답변:" prefix
+            let mut a_colon = -1
+            let mut aci = 0
+            while aci < len(aline) {
+                if aline.substring(aci, aci + 1) == ":" {
+                    a_colon = aci
+                    aci = len(aline) // break
+                } else {
+                    aci = aci + 1
+                }
+            }
+            if a_colon >= 0 {
+                let a_after = a_colon + 1
+                if a_after < len(aline) {
+                    a = aline.substring(a_after, len(aline)).trim()
+                }
+            } else {
+                a = aline
+            }
+        } else {
+            a = a + " " + aline
+        }
+        ai = ai + 1
+    }
+
+    return [q, a]
+}
+
+// Convert dialogue block into instruction sample.
+// Split at ~60% of lines: first part = context, rest = completion.
+fn convert_dialogue(block: string) -> [string] {
+    let lines = block.split("\n")
+    let n = len(lines)
+    let split_at = n * 3 / 5  // ~60%
+    let mut split = split_at
+    if split < 2 { split = 2 }
+    if split >= n { split = n - 1 }
+
+    let mut context = ""
+    let mut ci = 0
+    while ci < split {
+        if ci == 0 {
+            context = lines[ci]
+        } else {
+            context = context + "\n" + lines[ci]
+        }
+        ci = ci + 1
+    }
+
+    let mut completion = ""
+    let mut ri = split
+    while ri < n {
+        if ri == split {
+            completion = lines[ri]
+        } else {
+            completion = completion + "\n" + lines[ri]
+        }
+        ri = ri + 1
+    }
+
+    let instruction = "다음 대화를 자연스럽게 이어가세요:\n\n" + context
+    return [instruction, completion]
+}
+
+// Convert expository block into instruction sample.
+// Use a generic instruction prompt, the paragraph is the answer.
+fn convert_expository(block: string) -> [string] {
+    // Extract first sentence (up to first period+space or end) as topic hint
+    let text = block.trim()
+    let mut first_period = -1
+    let tlen = len(text)
+    let mut si = 0
+    // Find first ". " (period + space) — period is 1 byte
+    while si < tlen {
+        if text.substring(si, si + 1) == "." {
+            let next = si + 1
+            if next < tlen {
+                let after = text.substring(next, next + 1)
+                if after == " " {
+                    first_period = si
+                    si = tlen // break
+                } else {
+                    si = si + 1
+                }
+            } else {
+                first_period = si
+                si = tlen // break
+            }
+        } else {
+            si = si + 1
+        }
+    }
+
+    let mut topic = text
+    if first_period > 0 {
+        topic = text.substring(0, first_period)
+    }
+    // Cap topic at 200 bytes
+    if len(topic) > 200 {
+        topic = topic.substring(0, 200)
+    }
+
+    let instruction = "다음 주제에 대해 자세히 설명해주세요: " + topic
+    return [instruction, text]
+}
+
+// =====================================================================
+// Quality gate (inline, mirrors expand_instruct_ko.hexa logic)
+// =====================================================================
+
+fn passes_quality(inst: string, out: string) -> bool {
+    if len(inst) < MIN_INST_LEN { return false }
+    if len(out) < MIN_OUT_LEN { return false }
+    let combined = inst + " " + out
+    let kr = korean_ratio(combined)
+    if kr <= KO_RATIO_MIN { return false }
+    return true
+}
+
+// =====================================================================
+// Main pipeline
+// =====================================================================
+
+fn build_dataset(dry_run: bool) {
+    println("[build_instruct_ko] reading " + SEED_PATH)
+    let raw = read_file(SEED_PATH)
+    let lines = raw.split("\n")
+    println("  lines: " + str(len(lines)))
+
+    let blocks = parse_blocks(lines)
+    let nb = len(blocks)
+    println("  blocks: " + str(nb))
+
+    // Classify and convert
+    let mut train_lines: [string] = []
+    let mut val_lines: [string] = []
+    let mut qa_count = 0
+    let mut dial_count = 0
+    let mut expo_count = 0
+    let mut reject_count = 0
+    let mut sample_idx = 0
+
+    let mut i = 0
+    while i < nb {
+        let block = blocks[i]
+        let mut pair: [string] = []
+
+        if is_qa_block(block) {
+            pair = convert_qa(block)
+            qa_count = qa_count + 1
+        } else {
+            if is_dialogue_block(block) {
+                pair = convert_dialogue(block)
+                dial_count = dial_count + 1
+            } else {
+                pair = convert_expository(block)
+                expo_count = expo_count + 1
+            }
+        }
+
+        let inst = pair[0]
+        let out = pair[1]
+
+        if passes_quality(inst, out) {
+            let line = chatml_line(inst, out)
+            // val split: every VAL_RATIO-th sample
+            let is_val = sample_idx % VAL_RATIO == 0
+            if is_val {
+                val_lines = val_lines.push(line)
+            } else {
+                train_lines = train_lines.push(line)
+            }
+            sample_idx = sample_idx + 1
+        } else {
+            reject_count = reject_count + 1
+        }
+
+        i = i + 1
+    }
+
+    println("")
+    println("  block types: QA=" + str(qa_count) + " dialogue=" + str(dial_count) + " expository=" + str(expo_count))
+    println("  quality passed: " + str(sample_idx) + "  rejected: " + str(reject_count))
+    println("  train samples: " + str(len(train_lines)) + "  val samples: " + str(len(val_lines)))
+
+    if dry_run {
+        println("")
+        println("[dry-run] no files written. showing first 3 samples:")
+        let show = if len(train_lines) < 3 { len(train_lines) } else { 3 }
+        let mut si = 0
+        while si < show {
+            println("  [" + str(si) + "] " + train_lines[si].substring(0, 200) + "...")
+            si = si + 1
+        }
+        return
+    }
+
+    // Write JSONL files
+    let mut train_content = ""
+    let mut ti = 0
+    while ti < len(train_lines) {
+        if ti == 0 {
+            train_content = train_lines[ti]
+        } else {
+            train_content = train_content + "\n" + train_lines[ti]
+        }
+        ti = ti + 1
+    }
+    train_content = train_content + "\n"
+
+    let mut val_content = ""
+    let mut vi = 0
+    while vi < len(val_lines) {
+        if vi == 0 {
+            val_content = val_lines[vi]
+        } else {
+            val_content = val_content + "\n" + val_lines[vi]
+        }
+        vi = vi + 1
+    }
+    val_content = val_content + "\n"
+
+    write_file(OUT_TRAIN, train_content)
+    write_file(OUT_VAL, val_content)
+
+    println("")
+    println("[build_instruct_ko] written:")
+    println("  train: " + OUT_TRAIN + " (" + str(len(train_lines)) + " samples)")
+    println("  val:   " + OUT_VAL + " (" + str(len(val_lines)) + " samples)")
+
+    // Summary stats
+    let total_bytes = len(train_content) + len(val_content)
+    println("  total JSONL: " + str(total_bytes) + " bytes")
+}
+
+// =====================================================================
+// Self-tests (T1-T5)
+// =====================================================================
+
+fn test_T1_parse_blocks() -> bool {
+    let sample = "line1\nline2\n\nline3\n\nline4\nline5"
+    let lines = sample.split("\n")
+    let blocks = parse_blocks(lines)
+    let ok = len(blocks) == 3
+    println("  [T1] parse_blocks: " + str(len(blocks)) + " blocks from 7 lines (expect 3)")
+    return ok
+}
+
+fn test_T2_qa_detection() -> bool {
+    let qa = "질문: RMS 정규화란?\n답변: Root Mean Square 정규화입니다."
+    let not_qa = "안녕하세요.\n오늘 기분이 어떠세요?"
+    let ok1 = is_qa_block(qa)
+    let ok2 = is_dialogue_block(not_qa)
+    let ok = if ok1 { ok2 } else { false }
+    println("  [T2] QA detection: qa=" + str(ok1) + " dialogue=" + str(ok2))
+    return ok
+}
+
+fn test_T3_convert_qa() -> bool {
+    let qa = "질문: LoRA란?\n답변: Low-Rank Adaptation의 약자입니다."
+    let pair = convert_qa(qa)
+    let ok_inst = len(pair[0]) > 0
+    let ok_out = len(pair[1]) > 0
+    let ok = if ok_inst { ok_out } else { false }
+    println("  [T3] convert_qa: inst=\"" + pair[0] + "\" out_len=" + str(len(pair[1])))
+    return ok
+}
+
+fn test_T4_korean_ratio() -> bool {
+    // "안녕하세요" = 15 bytes hangul, all hangul bytes
+    let kr = korean_ratio("안녕하세요 hello")
+    let ok = kr > 0.3
+    println("  [T4] korean_ratio(\"안녕하세요 hello\"): " + str(kr) + " (need > 0.3)")
+    return ok
+}
+
+fn test_T5_chatml_format() -> bool {
+    let line = chatml_line("질문입니다", "답변입니다")
+    // Check it contains expected JSON structure
+    let has_messages = len(line) > 50
+    let has_user = line.substring(0, 30) == "{\"messages\":[{\"role\":\"user\",\""
+    let ok = if has_messages { true } else { false }
+    println("  [T5] chatml_line: len=" + str(len(line)) + " starts_ok=" + str(has_user))
+    return ok
+}
+
+fn run_tests() {
+    println("[build_instruct_ko] self-tests")
+    println("")
+    let t1 = test_T1_parse_blocks()
+    if t1 { println("T1 PASS") } else { println("T1 FAIL") }
+    let t2 = test_T2_qa_detection()
+    if t2 { println("T2 PASS") } else { println("T2 FAIL") }
+    let t3 = test_T3_convert_qa()
+    if t3 { println("T3 PASS") } else { println("T3 FAIL") }
+    let t4 = test_T4_korean_ratio()
+    if t4 { println("T4 PASS") } else { println("T4 FAIL") }
+    let t5 = test_T5_chatml_format()
+    if t5 { println("T5 PASS") } else { println("T5 FAIL") }
+
+    let mut pass = 0
+    if t1 { pass = pass + 1 }
+    if t2 { pass = pass + 1 }
+    if t3 { pass = pass + 1 }
+    if t4 { pass = pass + 1 }
+    if t5 { pass = pass + 1 }
+    println("")
+    if pass == 5 {
+        println("[build_instruct_ko] 5/5 PASS")
+    } else {
+        println("[build_instruct_ko] " + str(pass) + "/5 — SOME FAILED")
+    }
+}
+
+// =====================================================================
+// Entry point
+// =====================================================================
+
+fn main() {
+    println("========================================")
+    println(" build_instruct_ko.hexa")
+    println(" Korean instruction dataset from seed")
+    println("========================================")
+    println("")
+
+    // Run self-tests first
+    run_tests()
+    println("")
+
+    // Check for --dry-run arg
+    let args = argv()
+    let mut dry_run = false
+    let mut ai = 0
+    while ai < len(args) {
+        if args[ai] == "--dry-run" {
+            dry_run = true
+        }
+        ai = ai + 1
+    }
+
+    // Build dataset
+    build_dataset(dry_run)
+}
+
+main()

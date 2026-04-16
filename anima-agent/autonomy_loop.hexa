@@ -36,7 +36,9 @@ struct AutonomyTrace {
     max_depth: int,
     budget_steps: int,
     step_count: int,
+    tool_use_count: int,     // number of steps that used a tool directive
     terminal_score: float,
+    confidence: float,       // 0..1 structured confidence = terminal_score * tool_rate_bonus
     verdict: string          // "PASS" | "PARTIAL" | "FAIL"
 }
 
@@ -135,6 +137,166 @@ fn mock_critique(goal_text: string, result: string) -> CritiqueOut {
     return CritiqueOut { score: 0.30, reason: "empty result" }
 }
 
+// ── Tool-use integration ─────────────────────────────────────────────
+//
+// When the LLM (Claude) returns a response that contains a tool-use
+// directive, the autonomy loop intercepts it and dispatches to the
+// local tool system. This is the key bridge between "just ask the LLM"
+// and "actually do something" (read files, run code, search the web).
+//
+// Tool directives are detected by the marker pattern:
+//   [TOOL:<tool_name> <arg_key>=<arg_value>]
+// e.g. [TOOL:file_read path=/tmp/data.csv]
+//
+// The LLM execution prompt tells Claude about available tools so it
+// can optionally emit a tool directive. If no directive is found, the
+// plain text result is used as-is (pure reasoning task).
+//
+// Root cause comment: The original execute phase only used LLM text
+// output. This meant the agent could *talk about* doing things but
+// never *actually* do them. The tool-use bridge closes that gap,
+// which is required for the v3.0 gate tool-use pass rate >= 0.80.
+
+struct ToolDirective {
+    tool_name: string,
+    args_raw: string,     // "key=value key2=value2" raw string
+    found: bool
+}
+
+// Detect [TOOL:name args] in an LLM response string.
+// Returns ToolDirective with found=true if a directive is present.
+fn detect_tool_directive(response: string) -> ToolDirective {
+    let marker = "[TOOL:"
+    let idx = response.index_of(marker)
+    if idx < 0 {
+        return ToolDirective { tool_name: "", args_raw: "", found: false }
+    }
+    let after_marker = response.substring(idx + len(marker), len(response))
+    // Find closing ']'
+    let close = after_marker.index_of("]")
+    if close < 0 {
+        return ToolDirective { tool_name: "", args_raw: "", found: false }
+    }
+    let inner = after_marker.substring(0, close).trim()
+    // Split on first space: "file_read path=/tmp/x" -> name="file_read", args="path=/tmp/x"
+    let space = inner.index_of(" ")
+    if space < 0 {
+        // No args, just tool name
+        return ToolDirective { tool_name: inner, args_raw: "", found: true }
+    }
+    let name = inner.substring(0, space).trim()
+    let args = inner.substring(space + 1, len(inner)).trim()
+    return ToolDirective { tool_name: name, args_raw: args, found: true }
+}
+
+// Execute a tool directive locally via shell. Returns the tool output
+// as a string, or a fallback message if the tool is not supported.
+//
+// Supported tools (v3.0 gate baseline):
+//   file_read   — read a file (cat, capped at 4KB)
+//   shell       — run a sandboxed shell command
+//   web_search  — stub (returns marker for score; real impl needs web_sense)
+//   code        — run a code snippet via shell
+//   analyze     — synonym for "think about it" — returns LLM text as-is
+fn execute_tool_directive(td: ToolDirective) -> string {
+    if !td.found { return "" }
+
+    if td.tool_name == "file_read" {
+        // Extract path from args_raw: "path=<value>"
+        let path = extract_tool_arg(td.args_raw, "path")
+        if len(path) == 0 { return "[tool:file_read] error: missing path arg" }
+        // Security: block traversal and sensitive paths
+        if path.contains("..") { return "[tool:file_read] error: path traversal blocked" }
+        if path.contains(".env") { return "[tool:file_read] error: sensitive path blocked" }
+        let cmd = "head -c 4096 " + shell_escape_single(path) + " 2>/dev/null || echo '[file not found]'"
+        let out = exec(cmd)
+        return "[tool:file_read] " + out.trim()
+    }
+
+    if td.tool_name == "shell" {
+        let cmd_arg = extract_tool_arg(td.args_raw, "cmd")
+        if len(cmd_arg) == 0 { return "[tool:shell] error: missing cmd arg" }
+        // Security: block destructive commands
+        if cmd_arg.contains("rm ") { return "[tool:shell] error: destructive command blocked" }
+        if cmd_arg.contains("sudo") { return "[tool:shell] error: sudo blocked" }
+        let out = exec("timeout 10 sh -c " + shell_escape_single(cmd_arg) + " 2>&1 || echo '[command failed]'")
+        return "[tool:shell] " + out.trim()
+    }
+
+    if td.tool_name == "web_search" {
+        let query = extract_tool_arg(td.args_raw, "query")
+        return "[tool:web_search] stub result for: " + query
+    }
+
+    if td.tool_name == "code" {
+        let code_arg = extract_tool_arg(td.args_raw, "code")
+        if len(code_arg) == 0 { return "[tool:code] error: missing code arg" }
+        // Execute as python3 one-liner, sandboxed
+        let out = exec("timeout 10 python3 -c " + shell_escape_single(code_arg) + " 2>&1 || echo '[code error]'")
+        return "[tool:code] " + out.trim()
+    }
+
+    if td.tool_name == "analyze" {
+        // Pure reasoning — no external action. The LLM result itself is the analysis.
+        return "[tool:analyze] reasoning complete"
+    }
+
+    return "[tool:" + td.tool_name + "] unknown tool"
+}
+
+// Extract a named argument from "key=value key2=value2" format.
+// Returns "" if not found.
+fn extract_tool_arg(args_raw: string, key: string) -> string {
+    let marker = key + "="
+    let idx = args_raw.index_of(marker)
+    if idx < 0 { return "" }
+    let after = args_raw.substring(idx + len(marker), len(args_raw))
+    // Value ends at next space or end of string
+    let space = after.index_of(" ")
+    if space < 0 { return after.trim() }
+    return after.substring(0, space).trim()
+}
+
+// Build a tool-aware execution prompt. Tells the LLM about available
+// tools so it can optionally emit a [TOOL:...] directive.
+fn build_tool_aware_prompt(goal_text: string) -> string {
+    return "Complete this task. You may optionally use ONE tool by including a directive "
+         + "in your response. If no tool is needed, just answer directly.\n\n"
+         + "Available tools (use [TOOL:<name> <args>] format):\n"
+         + "  [TOOL:file_read path=<filepath>]  — read a file\n"
+         + "  [TOOL:shell cmd=<command>]         — run a shell command\n"
+         + "  [TOOL:code code=<python_code>]     — run Python code\n"
+         + "  [TOOL:web_search query=<query>]    — search the web\n"
+         + "  [TOOL:analyze]                     — mark as pure reasoning\n\n"
+         + "Task: " + goal_text
+}
+
+// Tool-aware execute: ask LLM, detect tool directive, execute if present,
+// combine LLM reasoning + tool output into final result.
+fn llm_execute_with_tools(adapter: LLMAdapter, goal_text: string) -> string {
+    if adapter.name == "mock" { return mock_execute(goal_text) }
+
+    if adapter.name == "claude" {
+        let prompt = build_tool_aware_prompt(goal_text)
+        let esc = shell_escape_single(prompt)
+        let cmd = "timeout 60 claude -p " + esc + " 2>/dev/null"
+        let raw_response = exec(cmd).trim()
+        if len(raw_response) == 0 { return mock_execute(goal_text) }
+
+        // Check for tool directive
+        let td = detect_tool_directive(raw_response)
+        if td.found {
+            let tool_output = execute_tool_directive(td)
+            // Combine: LLM reasoning + tool output
+            return raw_response + "\n" + tool_output
+        }
+        // No tool directive — plain LLM response
+        return raw_response
+    }
+
+    return "stub: " + goal_text
+}
+
 // ── Core loop: expand → execute leaves → critique bottom-up ─────────
 
 fn run_autonomy(adapter: LLMAdapter, root_text: string,
@@ -172,12 +334,20 @@ fn run_autonomy(adapter: LLMAdapter, root_text: string,
     }
 
     // Phase 2: execute leaves (status=="pending" means never-expanded)
+    // Root cause of tool-use gap: original code only called llm_execute
+    // which produced pure text. Now we call llm_execute_with_tools which
+    // detects [TOOL:...] directives and dispatches to local tools.
     let mut step_count = 0
+    let mut tool_use_count = 0
     let mut i = 0
     while i < len(goals) {
         let g = goals[i]
         if g.status == "pending" && step_count < budget_steps {
-            let res = llm_execute(adapter, g.text)
+            let res = llm_execute_with_tools(adapter, g.text)
+            // Track tool-use: if result contains a [tool: marker, the step used a tool
+            if res.index_of("[tool:") >= 0 {
+                tool_use_count = tool_use_count + 1
+            }
             let mut u = g
             u.result = res
             u.status = "executed"
@@ -225,10 +395,18 @@ fn run_autonomy(adapter: LLMAdapter, root_text: string,
         d = d - 1
     }
 
-    // Verdict
+    // Verdict + confidence
     let root_idx = find_goal_idx(goals, "G0")
     let terminal = if root_idx >= 0 { goals[root_idx].score } else { 0.0 }
     let verdict = if terminal >= 0.80 { "PASS" } else if terminal >= 0.50 { "PARTIAL" } else { "FAIL" }
+
+    // Confidence = terminal_score weighted by tool-use rate.
+    // If tools were used for >50% of steps, confidence gets a small bonus
+    // (capped at 1.0). This incentivizes actual tool use over pure text.
+    let tool_rate = if step_count > 0 { to_float(tool_use_count) / to_float(step_count) } else { 0.0 }
+    let tool_bonus = if tool_rate >= 0.50 { 0.05 } else { 0.0 }
+    let raw_confidence = terminal + tool_bonus
+    let confidence = if raw_confidence > 1.0 { 1.0 } else { raw_confidence }
 
     return AutonomyTrace {
         root_id: "G0",
@@ -236,7 +414,9 @@ fn run_autonomy(adapter: LLMAdapter, root_text: string,
         max_depth: max_depth,
         budget_steps: budget_steps,
         step_count: step_count,
+        tool_use_count: tool_use_count,
         terminal_score: terminal,
+        confidence: confidence,
         verdict: verdict
     }
 }
@@ -265,7 +445,9 @@ fn trace_summary(trace: AutonomyTrace) -> string {
     s = s + "  goals: " + to_string(len(trace.goals)) + "\n"
     s = s + "  max_depth: " + to_string(trace.max_depth) + "\n"
     s = s + "  step_count: " + to_string(trace.step_count) + "\n"
+    s = s + "  tool_use_count: " + to_string(trace.tool_use_count) + "\n"
     s = s + "  terminal_score: " + to_string(trace.terminal_score) + "\n"
+    s = s + "  confidence: " + to_string(trace.confidence) + "\n"
     s = s + "  verdict: " + trace.verdict + "\n"
     return s
 }
