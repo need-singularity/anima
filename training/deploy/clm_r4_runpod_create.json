@@ -1,0 +1,135 @@
+{
+  "_meta": {
+    "name": "CLM 1B r4 — RunPod H100 pod-create spec",
+    "created": "2026-04-16",
+    "status": "READY (NOT FIRED)",
+    "purpose": "Single-shot pod for CLM 1B r4 training (5.38 GB corpus, 750K steps, target eval<=1.0)",
+    "plan_source": "training/deploy/clm_r4_corpus_plan.json (option B recommended)",
+    "launcher": "training/deploy/clm_r4_launch.hexa",
+    "memory_refs": [
+      "feedback_h100_authorized",
+      "feedback_one_shot_best",
+      "feedback_no_resume_data_change",
+      "feedback_r2_checkpoint",
+      "feedback_no_quantization",
+      "runpod_mfs_quota (training/CLAUDE.md)",
+      "R02_check_disk_before_launch",
+      "R09_checkpoint_every_large",
+      "R12_pod_stop_loses_gpu",
+      "R13_hf_token_required"
+    ],
+    "fire_with": [
+      "# Method A (preferred — file spec):",
+      "runpodctl pod create -f training/deploy/clm_r4_runpod_create.json",
+      "",
+      "# Method B (fallback — CLI flags, mirror the same spec):",
+      "runpodctl create pod \\",
+      "    --name anima-clm1b-r4 \\",
+      "    --imageName runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04 \\",
+      "    --gpuType 'NVIDIA H100 80GB HBM3' \\",
+      "    --gpuCount 1 \\",
+      "    --containerDiskSize 100 \\",
+      "    --volumeSize 0 \\",
+      "    --mem 64 \\",
+      "    --vcpu 16 \\",
+      "    --ports '22/tcp' \\",
+      "    --startSSH \\",
+      "    --secureCloud \\",
+      "    --env PYTHONUNBUFFERED=1 \\",
+      "    --env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\",
+      "    --env ANIMA_ROOT=/workspace/anima \\",
+      "    --env HF_HOME=/workspace/hf_cache"
+    ]
+  },
+
+  "name": "anima-clm1b-r4",
+  "imageName": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+  "gpuTypeId": "NVIDIA H100 80GB HBM3",
+  "gpuCount": 1,
+  "vcpuCount": 16,
+  "minMemoryInGb": 64,
+  "containerDiskInGb": 100,
+  "volumeInGb": 0,
+  "minVcpuCount": 16,
+  "supportPublicIp": true,
+  "startSsh": true,
+  "secureCloud": true,
+  "ports": "22/tcp",
+  "dockerArgs": "",
+
+  "env": [
+    {"key": "PYTHONUNBUFFERED",          "value": "1"},
+    {"key": "PYTORCH_CUDA_ALLOC_CONF",   "value": "expandable_segments:True"},
+    {"key": "CUBLAS_WORKSPACE_CONFIG",   "value": ":4096:8"},
+    {"key": "ANIMA_ROOT",                "value": "/workspace/anima"},
+    {"key": "HF_HOME",                   "value": "/workspace/hf_cache"},
+    {"key": "TRANSFORMERS_CACHE",        "value": "/workspace/hf_cache"}
+  ],
+
+  "_capacity_rationale": {
+    "gpuCount": "1 x H100 80GB sufficient: 1.51B bf16 model = ~3 GB, optimizer = ~12 GB, grads = ~3 GB, activations + cuda overhead ~3 GB -> 21 GB used, 59 GB headroom (per clm_1b_config.json vram_estimate)",
+    "containerDiskInGb": "100 GB (vs 50 default): 5.38 GB corpus + 5.38 GB .gz upload + 3 GB model + 12 GB optimizer + ckpt rotation (3 ckpts x 18 GB during save = 54 GB transient peak); 100 GB gives ~30 GB headroom over peak. r3 used 50 GB and hit MFS quota at step 2000 (CLAUDE.md runpod_mfs_quota).",
+    "volumeInGb": "0 (use container disk only — persistent volume billed separately, training is single-shot per One-Shot Best rule)",
+    "minMemoryInGb": "64 (vs 32 default): byte-level corpus 5 GB needs ~10 GB RAM for chunked reads + dataloader; train_clm_1b.py keeps token windows in CPU memory before GPU dispatch. 32 GB was tight on r3f.",
+    "vcpuCount": "16: dataloader + tokenization parallelism; H100 SXM nodes typically have 16-24 vCPU per GPU.",
+    "secureCloud": "true: required for stable bf16 + cuBLAS workspace (community cloud has been unstable for long-running CLM)",
+    "supportPublicIp": "true: needed for SSH/SCP corpus upload",
+    "ports": "22/tcp only: no Jupyter, no extra services (R12 pod-stop-loses-gpu — fewer surfaces)"
+  },
+
+  "_cost_estimate": {
+    "gpu_hourly_usd": 2.99,
+    "wall_hours_estimated_low": 41.0,
+    "wall_hours_estimated_high": 82.1,
+    "wall_hours_chosen": 41.0,
+    "wall_hours_note": "option B = 750K steps @ ~196 ms/step measured on r3f -> 750000 * 0.196 / 3600 = 40.83 h. Pad +0.2 h for setup/teardown.",
+    "cost_low_usd": 122.6,
+    "cost_high_usd": 245.5,
+    "cost_chosen_usd": 122.6,
+    "cost_chosen_note": "option B; option C (1.5M steps, 82 h, $246) is fallback if eval stalls > 1.0 at step 750K."
+  },
+
+  "_post_create_steps": [
+    "1. runpodctl ssh info <pod_id>            # get ip + port",
+    "2. POD_IP=...; POD_PORT=...               # capture from step 1",
+    "3. ssh -i ~/.runpod/ssh/RunPod-Key-Go root@$POD_IP -p $POD_PORT 'mkdir -p /workspace/anima/training'",
+    "4. # Stage trainer + corpus + launcher (in this order; corpus is the slow one):",
+    "   scp -i ~/.runpod/ssh/RunPod-Key-Go -P $POD_PORT training/train_clm_1b.py        root@$POD_IP:/workspace/anima/training/train_clm_1b.py",
+    "   scp -i ~/.runpod/ssh/RunPod-Key-Go -P $POD_PORT training/clm_1b_config.json     root@$POD_IP:/workspace/anima/training/clm_1b_config.json",
+    "   scp -i ~/.runpod/ssh/RunPod-Key-Go -P $POD_PORT training/deploy/clm_r4_launch.hexa root@$POD_IP:/workspace/clm_r4_launch.hexa",
+    "   # Compress + upload corpus (5.38 GB raw -> ~2 GB gz, much faster scp):",
+    "   gzip -k training/corpus_clm_r4.txt                                                # local",
+    "   scp -i ~/.runpod/ssh/RunPod-Key-Go -P $POD_PORT training/corpus_clm_r4.txt.gz    root@$POD_IP:/workspace/corpus_clm_r4.txt.gz",
+    "   ssh -i ~/.runpod/ssh/RunPod-Key-Go root@$POD_IP -p $POD_PORT 'cd /workspace && gunzip -k corpus_clm_r4.txt.gz'",
+    "5. # Install hexa binary (or skip if launcher is run via bash directly — see notes below):",
+    "   ssh ... 'curl -L $HEXA_BIN_URL -o /usr/local/bin/hexa && chmod +x /usr/local/bin/hexa'",
+    "   # OR (simpler): the launcher is a thin wrapper; you can extract the bash payload and run it directly.",
+    "6. # Fire training in tmux/nohup (R11 nohup-check-disk + R10 verify-script-exists):",
+    "   ssh ... 'tmux new -d -s clm-r4 \"hexa /workspace/clm_r4_launch.hexa 2>&1 | tee /workspace/clm_r4_launch.log\"'",
+    "7. # Tail progress:",
+    "   ssh ... 'tail -f /workspace/ckpt_clm1b_r4/train_r4.log'"
+  ],
+
+  "_abort_criteria": [
+    "MFS quota dd preflight FAILS -> pod is poisoned, terminate and create new pod",
+    "GPU not H100 (unlikely with secureCloud + gpuTypeId set) -> launcher refuses, terminate",
+    "First 100 steps loss not decreasing OR loss NaN/Inf -> abort, investigate (LR? bf16 numerics?)",
+    "Eval at step 50000 (~20% of plan) > 2.0 -> stop, re-evaluate corpus quality",
+    "Wall clock > 60h with eval still > 1.1 -> stop early, save best ckpt, switch to option C in next round",
+    "Pod becomes unresponsive (R12) -> R2 last-known-good ckpt, do NOT pod-stop, terminate-and-rebuild"
+  ],
+
+  "_post_training_r2_upload": {
+    "wait_for": "training process exit (no in-training upload — runpod_mfs_quota mandatory rule)",
+    "upload_cmd": "rclone copy /workspace/ckpt_clm1b_r4 r2:anima-models/clm1b/r4/ -v --s3-no-check-bucket",
+    "verify_cmd": "rclone ls r2:anima-models/clm1b/r4/",
+    "cleanup_after_verify": "rm -rf /workspace/ckpt_clm1b_r4/step_* (keep training_summary.json)",
+    "naming_convention": "clm1b-r4-s{step} -> r2:anima-models/clm1b/r4/step_{step}/"
+  },
+
+  "_teardown": {
+    "trigger": "training_summary.json present AND R2 upload verified AND eval results captured",
+    "cmd": "runpodctl remove pod <pod_id>",
+    "principle": "Idle 0s -> immediate teardown after R2 verify. r3f cost $1.64 for 32 min; r4 = $122 for 41 h."
+  }
+}

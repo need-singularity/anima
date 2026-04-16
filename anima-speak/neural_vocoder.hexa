@@ -92,9 +92,72 @@ fn vec_zeros(n: int) -> [float] {
     return out
 }
 
+// ── BLAS fast-path FFI (macOS Accelerate / Linux libhxblas) ──
+// Mirrors training/accelerate_blas.hexa pattern. Single GEMV via sgemm
+// with M=1, K=in_dim, N=out_dim. W layout: row-major [out_dim × in_dim].
+// Treat W as A^T (since y = W·x = (xᵀ·Wᵀ)ᵀ): row-major matmul of
+//   A=[1×K] · B=[K×N]  with B = Wᵀ stored row-major as [in_dim × out_dim].
+// To avoid an explicit transpose, we use CblasTrans on B (W row-major
+// [out_dim × in_dim] becomes its transpose viewed as [in_dim × out_dim]).
+//
+// Activation gate: NEUROVOC_BLAS=1 enables the fast path on macOS.
+// Default off so that systems without Accelerate (Linux pod build that
+// doesn't link to libhxblas) keep the scalar fallback.
+@link("Accelerate")
+extern fn cblas_sgemm(order: int, transA: int, transB: int, M: int, N: int, K: int, alpha: float, A: *Void, lda: int, B: *Void, ldb: int, beta: float, C: *Void, ldc: int)
+
 // y[out_dim] = W[out_dim × in_dim] · x[in_dim] + b[out_dim]
 // W is row-major flat. b may be empty (treated as zeros).
+//
+// Dual-path: BLAS fast (NEUROVOC_BLAS=1) vs scalar fallback (default).
+// The BLAS path round-trips x and W into raw f32 buffers per call; for
+// a single GEMV (M=1) the conversion overhead can dominate. Best ROI is
+// when the caller pre-stages W once per checkpoint and reuses the raw
+// pointer across many frames — see linear_proj_blas_cached for that.
 fn linear_proj(x: [float], W: [float], b: [float], in_dim: int, out_dim: int) -> [float] {
+    let use_blas = env("NEUROVOC_BLAS")
+    if use_blas == "1" {
+        // Fast path: cblas_sgemm with M=1, transB=Trans so the row-major
+        // [out_dim × in_dim] W is viewed as [in_dim × out_dim] for matmul.
+        // x_buf: [1 × in_dim], W_buf: [out_dim × in_dim] (raw row-major copy).
+        let x_buf = alloc_raw(in_dim * 4)
+        let mut xi = 0
+        while xi < in_dim {
+            write_f32(x_buf, xi * 4, x[xi])
+            xi = xi + 1
+        }
+        let n_w = in_dim * out_dim
+        let W_buf = alloc_raw(n_w * 4)
+        let mut wi = 0
+        while wi < n_w {
+            write_f32(W_buf, wi * 4, W[wi])
+            wi = wi + 1
+        }
+        let C_buf = alloc_raw(out_dim * 4)
+        // CblasRowMajor=101, NoTrans=111, Trans=112
+        // C[1×N] = A[1×K] * B[K×N]; we provide W as [N×K] row-major and pass
+        // transB=Trans so BLAS reads it as [K×N]. Note: ldb is the leading
+        // dim of *as-stored* W = K (in_dim).
+        cblas_sgemm(101, 111, 112,
+                    1, out_dim, in_dim,
+                    1.0, x_buf, in_dim,
+                    W_buf, in_dim,
+                    0.0, C_buf, out_dim)
+        let mut y = []
+        let has_bias_f = (len(b) == out_dim)
+        let mut i = 0
+        while i < out_dim {
+            let mut v = deref_f32(C_buf, i * 4)
+            if has_bias_f { v = v + b[i] }
+            y = y.push(v)
+            i = i + 1
+        }
+        free_raw(x_buf, in_dim * 4)
+        free_raw(W_buf, n_w * 4)
+        free_raw(C_buf, out_dim * 4)
+        return y
+    }
+    // Scalar fallback (portable, default)
     let mut y = []
     let mut i = 0
     let has_bias = (len(b) == out_dim)
