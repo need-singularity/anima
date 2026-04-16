@@ -35,8 +35,24 @@ rules:
   - 장시간 학습은 run_in_background=true 필수
   - 체크포인트 dir 항상 신규 생성 (오염 방지)
 
+runpod_mfs_quota: (2026-04-16 골화 — 3회 crash 확인)
+  rule: /workspace는 MooseFS 세션 쿼터 존재. df TB free여도 ckpt save 중 실패 가능
+  symptom: torch.save 중 파이썬 프로세스 silent exit, 부분 ckpt 파일 (~0.5-6GB, 정상 18GB), dmesg 無 kill 로그
+  preflight: "dd if=/dev/zero of=/workspace/_q_test bs=1M count=20000 status=none && rm /workspace/_q_test" — 실패 시 rm -rf 후 재시도
+  mandatory:
+    - 학습 시작 전: 이전 ckpt dir 전부 정리 (rm -rf /workspace/ckpt_*)
+    - 학습 중: in-Python R2 upload 금지 (DEFERRED 큐만 기록)
+    - 학습 종료 후: rclone으로 ckpt_dir 전체 일괄 R2 업로드
+    - save_every >= 2000 (잦은 저장 금지)
+  forbidden:
+    - torch.save 직후 동기 rclone (r3 step 2000 crash 원인)
+    - phi_emergency_ckpt torch.save (추가 save = 쿼터 압박, r3b step 4000 crash 원인)
+    - 학습 중 수동 pkill rclone (race condition, r3b 2차 crash 원인)
+
 r2_checkpoint:
-  rule: 매 체크포인트 저장 시 R2 자동 업로드 필수 (H100 소실 방지)
+  rule: 학습 종료 후 R2 일괄 업로드 (in-training upload 금지 — MFS quota 트랩)
+  trigger: 학습 프로세스 종료 또는 early-stop 직후
+  method: "rclone copy /workspace/ckpt_clm1b_r3c r2:anima-models/clm1b/r3/ -v --s3-no-check-bucket"
   bucket: anima-models
   naming: "{model}-r{round}-s{step}"
   path: "anima-models/{model}/r{round}/step_{step}/"
