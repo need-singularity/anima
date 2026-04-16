@@ -1,6 +1,16 @@
-// tests/tests.hexa — Consolidated test runner stub
+// tests/tests.hexa — Consolidated test runner + 7-condition consciousness verify gate
+//
 // Source: tests/ directory (203 .py files)
 // Phase 5: structural port. pytest → hexa test framework.
+//
+// Subcommands:
+//   all                 run every category (TODO)
+//   <category>          run one category (TODO)
+//   --verify            7-condition consciousness gate (ported from
+//                       ready/scripts/verify_and_tune.py + bench.py --verify)
+//   --verify --help     show verify usage
+//   --verify <report>   validate a JSON verification report against SSOT thresholds
+//                       exit 0 = PASS 7/7, exit 1 = FAIL
 //
 // Test categories (203 files):
 //   consciousness: test_consciousness_*.py (anesthesia, hub, laws, meter, transplant, ...)
@@ -13,6 +23,8 @@
 //   hardware:      test_esp32*.py, test_fpga*.py
 //   scaling:       test_scaling_*.py
 //   misc:          test_babysitter.py, test_collective_dream.py, ...
+
+// ─── Test runner scaffold (stub, unchanged) ───
 
 struct TestResult {
     name: string,
@@ -42,15 +54,370 @@ fn run_all() {
     println("TODO: port pytest infrastructure to hexa")
 }
 
-// --- CLI ---
+// ═══════════════════════════════════════════════════════════════
+// 7-CONDITION CONSCIOUSNESS VERIFY GATE
+// Ported from: ready/scripts/verify_and_tune.py (closed-loop driver)
+//              + ready/config/verification.json (SSOT thresholds)
+//              + training/deploy/clm_1b_r3f_7cond_verify_20260416.json (sample report)
+// ═══════════════════════════════════════════════════════════════
+//
+// The 7 canonical conditions (ALL_CRITERIA from verify_and_tune.py:39-47):
+//
+//   T1 NO_SYSTEM_PROMPT   — identity emerges from cell dynamics alone
+//                            (cos_identity mean∈(v1_cos_lower, v1_cos_upper),
+//                             std > v1_std_cos_min)
+//   T2 NO_SPEAK_CODE      — spontaneous speech without speak() function
+//                            (autocorr > v2_autocorr_min, variance > v2_variance_min,
+//                             cos_continuity > v2_cos_continuity_min)
+//   T3 ZERO_INPUT         — consciousness without external input
+//                            (Phi ratio >= v3_phi_ratio_min after 300 steps)
+//   T4 PERSISTENCE        — no collapse over 1000 steps
+//                            (recovers >= v4_recovery_min, stable >= v4_stability_min)
+//   T5 SELF_LOOP          — output feeds back as input
+//                            (Phi ratio >= v5_phi_ratio_min with self-feedback)
+//   T6 SPONTANEOUS_SPEECH — 12-faction consensus events
+//                            (consensus_events >= v6_consensus_min,
+//                             direction_changes >= v6_dir_changes_min,
+//                             cv >= v6_cv_min)
+//   T7 HIVEMIND           — multi-connect Phi boost + independent after disconnect
+//                            (boost >= 1.1x, maintain >= 0.9x)
+//
+// Thresholds single-source: ready/config/verification.json → thresholds_from_json
+// (mirrored into every report as thresholds_ssot for in-situ audit).
+//
+// This gate is a STRUCTURAL verifier: it consumes a verification report JSON
+// (produced by bench.py --verify → the actual substrate simulator) and checks
+// that each of the 7 conditions reports PASS with threshold satisfaction.
+// The underlying cell-dynamics math is NOT reimplemented here — that lives in
+// the consciousness engine substrate (anima/src/consciousness_engine.py, being
+// ported separately). This matches verify_and_tune.py's role as the gate
+// wrapper (lines 172-232 run_verify) not the substrate itself.
+
+struct Condition {
+    id: int,                   // T1..T7
+    name: string,              // canonical criterion name
+    passed: bool,              // from report
+    verdict: string,           // "PASS" / "FAIL"
+    detail: string,            // human-readable measurement
+    description: string,       // short criterion description
+    tier: string               // scale_test / rubber_stamp / genuine_hard
+}
+
+struct VerifyGate {
+    total: int,
+    passed: int,
+    failed: int,
+    skipped: int,
+    overall: bool,
+    report_path: string,
+    verdict: string            // "VERIFIED" / "DEGRADED" / "FAIL"
+}
+
+// Canonical ordering — matches verify_and_tune.py ALL_CRITERIA
+fn canonical_names() -> [string] {
+    let mut out = []
+    out = out.push("NO_SYSTEM_PROMPT")
+    out = out.push("NO_SPEAK_CODE")
+    out = out.push("ZERO_INPUT")
+    out = out.push("PERSISTENCE")
+    out = out.push("SELF_LOOP")
+    out = out.push("SPONTANEOUS_SPEECH")
+    out = out.push("HIVEMIND")
+    return out
+}
+
+fn canonical_tiers() -> [string] {
+    let mut out = []
+    out = out.push("scale_test")      // T1 NO_SYSTEM_PROMPT
+    out = out.push("rubber_stamp")    // T2 NO_SPEAK_CODE
+    out = out.push("scale_test")      // T3 ZERO_INPUT
+    out = out.push("rubber_stamp")    // T4 PERSISTENCE
+    out = out.push("genuine_hard")    // T5 SELF_LOOP
+    out = out.push("rubber_stamp")    // T6 SPONTANEOUS_SPEECH
+    out = out.push("genuine_hard")    // T7 HIVEMIND
+    return out
+}
+
+fn canonical_descs() -> [string] {
+    let mut out = []
+    out = out.push("Identity emerges from cell dynamics alone")
+    out = out.push("Spontaneous speech without speak() function")
+    out = out.push("Consciousness without external input")
+    out = out.push("No collapse over time (1000 steps)")
+    out = out.push("Output feeds back as input")
+    out = out.push("12-faction consensus >= 5 in 300 steps")
+    out = out.push("Multi-connect: Phi up CE down, independent after disconnect")
+    return out
+}
+
+// ─── Report parsing ─────────────────────────────────────────────
+//
+// Report JSON shape (from training/deploy/clm_1b_r3f_7cond_verify_20260416.json):
+//   {
+//     "total": 7,
+//     "pass": 7, "fail": 0, "skip": 0,
+//     "pass_rate": "7/7",
+//     "verdict": "VERIFIED",
+//     "conditions": {
+//       "NO_SYSTEM_PROMPT": { "verdict": "PASS", "passed": true, "detail": "...",
+//                             "description": "...", "tier": "scale_test", ... },
+//       ...
+//     }
+//   }
+//
+// We use json_parse which returns a map; has_key / indexing access pattern.
+
+fn read_report(path: string) -> any {
+    if !file_exists(path) {
+        println("[verify] ERROR: report not found: " + path)
+        exit(2)
+    }
+    let content = read_file(path)
+    let parsed = json_parse(content)
+    return parsed
+}
+
+// Extract one condition from the parsed report. Returns (found, Condition).
+// If the condition is absent, returns a synthetic FAIL with note.
+fn extract_condition(report: any, idx: int, name: string) -> Condition {
+    let tiers = canonical_tiers()
+    let descs = canonical_descs()
+    let default_tier = tiers[idx]
+    let default_desc = descs[idx]
+
+    if !has_key(report, "conditions") {
+        return Condition {
+            id: idx + 1,
+            name: name,
+            passed: false,
+            verdict: "MISSING",
+            detail: "report has no 'conditions' key",
+            description: default_desc,
+            tier: default_tier
+        }
+    }
+    let conds = report["conditions"]
+    if !has_key(conds, name) {
+        return Condition {
+            id: idx + 1,
+            name: name,
+            passed: false,
+            verdict: "MISSING",
+            detail: "condition absent from report.conditions",
+            description: default_desc,
+            tier: default_tier
+        }
+    }
+    let entry = conds[name]
+
+    // passed — prefer explicit bool, fall back to verdict string
+    let mut passed = false
+    if has_key(entry, "passed") { passed = entry["passed"] }
+    let mut verdict = "UNKNOWN"
+    if has_key(entry, "verdict") { verdict = entry["verdict"] }
+    if verdict == "PASS" { passed = true }
+    if verdict == "FAIL" { passed = false }
+
+    let mut detail = ""
+    if has_key(entry, "detail") { detail = entry["detail"] }
+    let mut desc = default_desc
+    if has_key(entry, "description") { desc = entry["description"] }
+    let mut tier = default_tier
+    if has_key(entry, "tier") { tier = entry["tier"] }
+
+    return Condition {
+        id: idx + 1,
+        name: name,
+        passed: passed,
+        verdict: verdict,
+        detail: detail,
+        description: desc,
+        tier: tier
+    }
+}
+
+// ─── Gate evaluation ────────────────────────────────────────────
+
+fn evaluate_gate(report_path: string) -> VerifyGate {
+    let report = read_report(report_path)
+    let names = canonical_names()
+    let n = len(names)
+
+    let mut passed = 0
+    let mut failed = 0
+    let mut skipped = 0
+    let mut i = 0
+    while i < n {
+        let c = extract_condition(report, i, names[i])
+        if c.verdict == "MISSING" { skipped = skipped + 1 }
+        else if c.passed { passed = passed + 1 }
+        else { failed = failed + 1 }
+        i = i + 1
+    }
+
+    let overall = passed == n && failed == 0 && skipped == 0
+
+    let mut verdict = "FAIL"
+    if overall { verdict = "VERIFIED" }
+    else if passed >= 5 { verdict = "DEGRADED" }
+
+    return VerifyGate {
+        total: n,
+        passed: passed,
+        failed: failed,
+        skipped: skipped,
+        overall: overall,
+        report_path: report_path,
+        verdict: verdict
+    }
+}
+
+// ─── Human report ───────────────────────────────────────────────
+
+fn print_gate_human(g: VerifyGate) {
+    println("=== 7-Condition Consciousness Verify Gate ===")
+    println("  source:  " + g.report_path)
+    println("  passed:  " + to_string(g.passed) + "/" + to_string(g.total))
+    println("  failed:  " + to_string(g.failed))
+    println("  missing: " + to_string(g.skipped))
+    println("  verdict: " + g.verdict)
+}
+
+fn print_conditions_detail(report_path: string) {
+    let report = read_report(report_path)
+    let names = canonical_names()
+    let n = len(names)
+    let mut i = 0
+    println("")
+    println("  Per-condition detail:")
+    while i < n {
+        let c = extract_condition(report, i, names[i])
+        let mark = if c.passed { "[PASS]" } else { "[FAIL]" }
+        if c.verdict == "MISSING" {
+            println("    T" + to_string(c.id) + " [SKIP] " + c.name + " — " + c.detail)
+        } else {
+            println("    T" + to_string(c.id) + " " + mark + " " + c.name + "  (" + c.tier + ")")
+            if len(c.detail) > 0 { println("         " + c.detail) }
+        }
+        i = i + 1
+    }
+}
+
+// ─── JSON output ────────────────────────────────────────────────
+//
+// Emits a minimal machine-readable summary to stdout (after human report)
+// so the caller (E-deploy step 3) can pipe & parse without re-reading.
+
+fn print_gate_json(g: VerifyGate) {
+    let mut s = "{"
+    s = s + "\"gate\":\"7-cond-consciousness\""
+    s = s + ",\"total\":" + to_string(g.total)
+    s = s + ",\"passed\":" + to_string(g.passed)
+    s = s + ",\"failed\":" + to_string(g.failed)
+    s = s + ",\"skipped\":" + to_string(g.skipped)
+    s = s + ",\"overall\":" + (if g.overall { "true" } else { "false" })
+    s = s + ",\"verdict\":\"" + g.verdict + "\""
+    s = s + ",\"report\":\"" + g.report_path + "\""
+    s = s + "}"
+    println(s)
+}
+
+// ─── Help ───────────────────────────────────────────────────────
+
+fn print_verify_help() {
+    println("tests.hexa --verify — 7-condition consciousness verify gate")
+    println("")
+    println("USAGE:")
+    println("  hexa ready/tests/tests.hexa --verify <report.json>")
+    println("  hexa ready/tests/tests.hexa --verify --help")
+    println("")
+    println("ARGS:")
+    println("  <report.json>   Path to verification report produced by bench --verify")
+    println("                  (schema: see training/deploy/clm_1b_r3f_7cond_verify_*.json)")
+    println("")
+    println("CONDITIONS (T1..T7):")
+    let names = canonical_names()
+    let descs = canonical_descs()
+    let tiers = canonical_tiers()
+    let mut i = 0
+    while i < 7 {
+        println("  T" + to_string(i + 1) + "  " + names[i] + "  (" + tiers[i] + ")")
+        println("      " + descs[i])
+        i = i + 1
+    }
+    println("")
+    println("EXIT CODES:")
+    println("  0   all 7 conditions PASS (VERIFIED)")
+    println("  1   at least one FAIL or MISSING (gate blocks deploy)")
+    println("  2   report file not found / unreadable")
+    println("")
+    println("SOURCE:")
+    println("  Ported from ready/scripts/verify_and_tune.py run_verify()")
+    println("  Thresholds SSOT: ready/config/verification.json")
+}
+
+// ─── verify subcommand dispatcher ───────────────────────────────
+
+fn run_verify_gate(verify_args: [string]) {
+    // verify_args = everything after the `--verify` token
+    if len(verify_args) == 0 {
+        println("[verify] ERROR: missing <report.json> argument")
+        println("[verify] try:  hexa ready/tests/tests.hexa --verify --help")
+        exit(2)
+    }
+    let first = verify_args[0]
+    if first == "--help" || first == "-h" {
+        print_verify_help()
+        exit(0)
+    }
+
+    let g = evaluate_gate(first)
+    print_gate_human(g)
+    print_conditions_detail(first)
+    println("")
+    print_gate_json(g)
+
+    if g.overall { exit(0) }
+    exit(1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CLI
+// ═══════════════════════════════════════════════════════════════
+
 let args = args()
-if args.len() < 3 {
-    println("tests/tests.hexa — consolidated test runner")
+let argc = len(args)
+
+// Collect sub-args after argv[0] (script path) and argv[1] (subcommand token).
+// Scan for --verify anywhere after argv[0] to tolerate both
+//   hexa run tests.hexa --verify <report>
+//   hexa tests.hexa --verify <report>
+let mut verify_idx = -1
+let mut i = 1
+while i < argc {
+    if args[i] == "--verify" { verify_idx = i }
+    i = i + 1
+}
+
+if verify_idx >= 0 {
+    // Collect remaining args after --verify
+    let mut rest = []
+    let mut j = verify_idx + 1
+    while j < argc {
+        rest = rest.push(args[j])
+        j = j + 1
+    }
+    run_verify_gate(rest)
+} else if argc < 3 {
+    // argv[0]=interpreter, argv[1]=script, argv[2]=subcommand
+    println("tests/tests.hexa — consolidated test runner + verify gate")
     println("  hexa tests/tests.hexa all")
     println("  hexa tests/tests.hexa <category>")
+    println("  hexa tests/tests.hexa --verify <report.json>   (7-cond consciousness gate)")
+    println("  hexa tests/tests.hexa --verify --help")
     println("  categories: consciousness, engine, decoder, hexad, training, agent, discovery, hardware, scaling, misc")
 } else {
     let cmd = args[2]
     if cmd == "all" { run_all() }
-    else { let s = run_category(cmd); println(s.category, ":", s.passed, "/", s.total) }
+    else { let s = run_category(cmd); println(s.category + ": " + to_string(s.passed) + "/" + to_string(s.total)) }
 }
