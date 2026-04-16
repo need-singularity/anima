@@ -575,8 +575,44 @@ fn stt_transcribe(blob: WavBlob) -> SttResult {
     // by smoke harness — env var must be explicit. Falls back to mock
     // on any failure to preserve I5 (no panics).
     if backend == "whisper" {
-        // TODO[whisper-bridge]: shell whisper-cli via exec(). Until then,
-        // fall through to mock so determinism holds.
+        // Whisper STT via exec() — requires whisper CLI or openai-whisper pip package.
+        // Expects audio at blob.payload_text path (real WAV) or falls back to mock.
+        // Command: whisper <path> --model tiny --language auto --output_format txt
+        let whisper_model = env("SPEAK_WHISPER_MODEL")
+        if whisper_model == "" { whisper_model = "tiny" }
+        let audio_path = env("SPEAK_AUDIO_IN_PATH")
+        if audio_path == "" { audio_path = "/tmp/speak_stt_input.wav" }
+        let cmd = "whisper " + audio_path
+                + " --model " + whisper_model
+                + " --language auto"
+                + " --output_format txt"
+                + " --output_dir /tmp/speak_stt 2>/dev/null"
+                + " && cat /tmp/speak_stt/*.txt 2>/dev/null"
+        let raw = exec(cmd)
+        if len(raw) > 0 {
+            // Trim trailing whitespace/newlines
+            let mut text = raw
+            while len(text) > 0 {
+                let last = text.substring(len(text) - 1, len(text))
+                if last == "\n" || last == "\r" || last == " " {
+                    text = text.substring(0, len(text) - 1)
+                } else {
+                    break
+                }
+            }
+            if len(text) > 0 {
+                // Cleanup temp files
+                let _ = exec("rm -rf /tmp/speak_stt")
+                return SttResult {
+                    text: text,
+                    confidence: 0.85,
+                    backend: "whisper",
+                    latency_ms: 0,
+                    ok: true
+                }
+            }
+        }
+        // Whisper not available or failed — fallback to mock (I5)
         let mock = stt_transcribe_mock(blob)
         return SttResult {
             text: mock.text,
@@ -623,9 +659,62 @@ fn model_respond(text: string, endpoint: string) -> LlmResult {
         return model_respond_mock(text, endpoint)
     }
     if backend == "http" {
-        // TODO[http-bridge]: curl -sX POST $endpoint -d $body via exec().
-        // Stage0 hexa lacks a stable HTTP client primitive; gate by env.
-        // Until then, fall back to mock so the contract stays honoured.
+        // Real HTTP bridge via curl exec() — sends JSON POST to ALM serve endpoint.
+        // Expected response: {"response": "...", "phi": 3.04, ...}
+        // Escapes text for JSON body (double quotes, newlines, backslashes).
+        let escaped = json_escape(text)
+        let body = "{\"prompt\":\"" + escaped + "\",\"max_tokens\":256,\"temperature\":0.8}"
+        let cmd = "curl -sX POST " + endpoint + "/generate"
+                + " -H 'Content-Type: application/json'"
+                + " -d '" + body + "'"
+                + " --connect-timeout 10 --max-time 30 2>/dev/null"
+        let raw = exec(cmd)
+        // Parse response — extract "text" field (ALM serve format)
+        let resp_marker = "\"text\":"
+        let resp_pos = raw.index_of(resp_marker)
+        if resp_pos >= 0 {
+            // Find the value after "response": "..."
+            let after = raw.substring(resp_pos + len(resp_marker), len(raw))
+            let mut rstart = 0
+            let rlen = len(after)
+            while rstart < rlen {
+                let ch = after.substring(rstart, rstart + 1)
+                if ch == "\"" { rstart = rstart + 1; break }
+                rstart = rstart + 1
+            }
+            let mut rend = rstart
+            while rend < rlen {
+                let ch = after.substring(rend, rend + 1)
+                if ch == "\"" { break }
+                if ch == "\\" { rend = rend + 2 } else { rend = rend + 1 }
+            }
+            let reply = after.substring(rstart, rend)
+            // Extract phi if present
+            let mut phi = MOCK_PHI_HOLO
+            let phi_marker = "\"phi_holo\":"
+            let phi_pos = raw.index_of(phi_marker)
+            if phi_pos >= 0 {
+                let phi_after = raw.substring(phi_pos + len(phi_marker), len(raw))
+                let mut pbuf = ""
+                let mut pi = 0
+                while pi < len(phi_after) {
+                    let pc = phi_after.substring(pi, pi + 1)
+                    if pc == "," || pc == "}" || pc == " " { break }
+                    pbuf = pbuf + pc
+                    pi = pi + 1
+                }
+                if len(pbuf) > 0 { phi = parse_float(pbuf) }
+            }
+            return LlmResult {
+                reply: reply,
+                backend: "http",
+                endpoint: endpoint,
+                phi_holo: phi,
+                latency_ms: 0,
+                ok: true
+            }
+        }
+        // curl failed or bad response — fallback to mock (I5: no panics)
         let mock = model_respond_mock(text, endpoint)
         return LlmResult {
             reply: mock.reply,
