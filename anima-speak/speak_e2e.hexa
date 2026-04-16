@@ -56,6 +56,16 @@
 //   verifies determinism + latency bounds + meta sidecar shape.
 
 // ════════════════════════════════════════════════════════════════════
+//  Section 0. Imports
+// ════════════════════════════════════════════════════════════════════
+//
+// neural_vocoder.hexa provides decode_wave() + write_wav() — the real
+// Mk.III synthesis path. Import does not auto-invoke the imported
+// file's main(), verified 2026-04-16 (hexa import semantics).
+
+import "./neural_vocoder.hexa"
+
+// ════════════════════════════════════════════════════════════════════
 //  Section 1. Constants
 // ════════════════════════════════════════════════════════════════════
 
@@ -83,7 +93,8 @@ struct WavBlob {
     channels: int,
     bits: int,
     n_samples: int,
-    payload_text: string  // base64-ish ASCII fingerprint, NOT real PCM
+    payload_text: string,    // base64-ish ASCII fingerprint (mock path) OR "real" sentinel
+    samples:      [float]    // real fp32 PCM samples (vocoder path); empty on mock
 }
 
 struct SttResult {
@@ -206,14 +217,22 @@ fn load_wav_mock(path: string) -> WavBlob {
         channels: SPEAK_CHANNELS,
         bits: SPEAK_BITS_PER_SAMPLE,
         n_samples: dur_frames,
-        payload_text: fake_pcm_fingerprint(h, dur_frames)
+        payload_text: fake_pcm_fingerprint(h, dur_frames),
+        samples: []
     }
 }
 
-// Mock save_wav: writes a small ASCII RIFF-like header + fingerprint.
-// Real path will replace this with std::wav::write_pcm16. The file
-// always exists after a successful return.
+// save_wav: dispatches between real PCM16 WAV (when blob.samples is
+// populated — vocoder path) and the legacy mock ASCII fingerprint
+// (deterministic-mock path, kept for test_speak_e2e byte-identity).
+// File always exists after a successful return.
 fn save_wav_mock(path: string, blob: WavBlob) -> bool {
+    // Real path: write_wav() from neural_vocoder.hexa — valid RIFF
+    // little-endian PCM16 mono file decodable by ffprobe/sox/afplay.
+    if len(blob.samples) > 0 {
+        return write_wav(path, blob.samples, blob.sample_rate)
+    }
+    // Legacy mock path: ASCII-only fingerprint for determinism tests.
     let header = "RIFF-MOCK\n"
                + "sample_rate=" + to_string(blob.sample_rate) + "\n"
                + "channels=" + to_string(blob.channels) + "\n"
@@ -336,9 +355,8 @@ fn model_respond(text: string, endpoint: string) -> LlmResult {
 //  Section 7. TTS — Text-To-Speech (Mk.III vocoder façade)
 // ════════════════════════════════════════════════════════════════════
 
-// Mock TTS: deterministic WAV blob keyed by reply text. Real path will
-// invoke neural_vocoder.decode_wave via the Mk.III pipeline once the
-// bridge to a hexa-callable vocoder entry point lands.
+// Mock TTS: deterministic WAV blob keyed by reply text. Real path
+// (below) invokes neural_vocoder.decode_wave — wired 2026-04-16.
 fn tts_synthesize_mock(reply_text: string) -> TtsResult {
     let h = djb2_hash(reply_text)
     let dur_frames = 24000 + (h % 48001)
@@ -347,7 +365,8 @@ fn tts_synthesize_mock(reply_text: string) -> TtsResult {
         channels: SPEAK_CHANNELS,
         bits: SPEAK_BITS_PER_SAMPLE,
         n_samples: dur_frames,
-        payload_text: fake_pcm_fingerprint(h, dur_frames)
+        payload_text: fake_pcm_fingerprint(h, dur_frames),
+        samples: []
     }
     return TtsResult {
         audio: blob,
@@ -357,9 +376,66 @@ fn tts_synthesize_mock(reply_text: string) -> TtsResult {
     }
 }
 
+// Build a deterministic [T × LATENT_DIM] latent from reply_text so the
+// vocoder path produces reproducible audio without a trained CLM/ALM
+// upstream. djb2 hash seeds the drift pattern; the latent drives the
+// 6-partial additive synth in neural_vocoder.decode_wave.
+fn latent_from_reply(reply_text: string, n_frames: int) -> [[float]] {
+    let h = djb2_hash(reply_text)
+    let mut frames = []
+    let mut f = 0
+    while f < n_frames {
+        let mut row = []
+        let mut j = 0
+        while j < 384 {
+            // Hash-seeded sinusoidal drift per (frame, dim)
+            let seed = (h + f * 17 + j * 31) % 100000
+            let phase = to_float(seed) * 0.0000628318 + to_float(f) * 0.05
+            let v = 0.4 * sin(phase) + 0.2 * sin(phase * 3.1)
+            row = row + [v]
+            j = j + 1
+        }
+        frames = frames + [row]
+        f = f + 1
+    }
+    return frames
+}
+
+// Real TTS via neural_vocoder.decode_wave. Produces fp32 PCM samples
+// routed through write_wav() at save time. Clamped to 8 frames
+// (80 ms) on the mock-weight smoke path so the hexa pipeline finishes
+// in under ~10 s — production weights will lift this ceiling.
+fn tts_synthesize_vocoder(reply_text: string) -> TtsResult {
+    // Smoke-path duration: 8 frames = 80 ms. Lift via env var once
+    // trained weights + hxcuda iSTFT land.
+    let mut n_frames = 8
+    let env_frames = env("SPEAK_VOCODER_FRAMES")
+    if env_frames != "" {
+        let parsed = env_frames.parse_int()
+        if parsed > 0 { n_frames = parsed }
+    }
+    let latent = latent_from_reply(reply_text, n_frames)
+    let samples = decode_wave(latent, SPEAK_SAMPLE_RATE)
+    let ok = (len(samples) > 0)
+    let blob = WavBlob {
+        sample_rate: SPEAK_SAMPLE_RATE,
+        channels: SPEAK_CHANNELS,
+        bits: SPEAK_BITS_PER_SAMPLE,
+        n_samples: len(samples),
+        payload_text: "real-pcm16",
+        samples: samples
+    }
+    return TtsResult {
+        audio: blob,
+        backend: "vocoder",
+        latency_ms: MOCK_TTS_LATENCY_MS,
+        ok: ok
+    }
+}
+
 // Public-facing TTS entry point.
-//   SPEAK_TTS_BACKEND=mock      → tts_synthesize_mock
-//   SPEAK_TTS_BACKEND=vocoder   → Mk.III neural_vocoder bridge (TODO)
+//   SPEAK_TTS_BACKEND=mock      → tts_synthesize_mock (deterministic stub)
+//   SPEAK_TTS_BACKEND=vocoder   → tts_synthesize_vocoder (Mk.III native)
 fn tts_synthesize(reply_text: string) -> TtsResult {
     let backend = env("SPEAK_TTS_BACKEND")
     if backend == "" { backend = "mock" }
@@ -367,8 +443,12 @@ fn tts_synthesize(reply_text: string) -> TtsResult {
         return tts_synthesize_mock(reply_text)
     }
     if backend == "vocoder" {
-        // TODO[vocoder-bridge]: call neural_vocoder.decode_wave once a
-        // hexa-callable entry point exists. Fallback preserves I5.
+        // Real Mk.III path — hexa-native neural_vocoder.decode_wave.
+        // Falls back to mock on empty output so I5 (no panics) holds.
+        let real = tts_synthesize_vocoder(reply_text)
+        if real.ok && len(real.audio.samples) > 0 {
+            return real
+        }
         let mock = tts_synthesize_mock(reply_text)
         return TtsResult {
             audio: mock.audio,
