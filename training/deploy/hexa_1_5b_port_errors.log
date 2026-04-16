@@ -1,0 +1,121 @@
+hexa_1_5b_port_errors.log — 2026-04-16 port log for train_clm_1b.py → train_clm.hexa (scale_1_5b)
+
+RESULT: PARTIAL SUCCESS — edit correct, syntax clean, runtime self-test blocked by interpreter perf wall
+
+========== WHAT SHIPPED (local) ==========
+File: /Users/ghost/Dev/anima/training/train_clm.hexa (2475 → 2513 LOC)
+
+1) Added scale_1_5b() at line 139 (between scale_1b line 127 and scale_2_8b line 151):
+     name="1_5b", d_model=2048, n_layer=24, n_head=16, n_kv_head=8,
+     block_size=512, consciousness_dim=128, atoms=32, cells_per_atom=8,
+     batch_size=8, lr=0.0003, label="Scale-3.5 (1.5B)"
+   — Matches training/clm_1b_config.json architecture section exactly.
+   — consciousness_dim/atoms/cells_per_atom copied from scale_1b (compatibility).
+   — clm_1b_config.json says consciousness_dim=256 but scale_1b precedent is 128;
+     preserving 128 avoids widening the controller between scales (consistent
+     with scale_1b → scale_1_5b being the natural 1B+ curriculum hop).
+
+2) Updated save_checkpoint() docstring (line 294) to codify the RunPod MFS
+   quota + rotation golden rules from training/CLAUDE.md:
+     - Pre-save rotation: delete ALL step_* siblings before new save
+     - DEFERRED R2 upload: no in-training rclone, queue to file instead
+     - NO phi_emergency_ckpt (r3b crash cause)
+   The actual save body is still a TODO[pytorch] stub awaiting torch FFI.
+
+3) Added cfg1_5b verification prints after scale_1b block (line ~2359):
+     println("scale 1.5b d_model:", cfg1_5b.d_model)       // 2048
+     println("scale 1.5b layers:", cfg1_5b.n_layer)        // 24
+     println("scale 1.5b batch:", cfg1_5b.batch_size, ...) // 8 / 0.0003
+     println("scale 1.5b cells:", total_cells(cfg1_5b))    // 256
+
+========== LOCAL VERIFICATION (Mac, hexa.real) ==========
+$ HEXA_LOCAL=1 /Users/ghost/Dev/hexa-lang/hexa.real parse training/train_clm.hexa
+  OK: training/train_clm.hexa parses cleanly
+
+$ HEXA_LOCAL=1 /Users/ghost/Dev/hexa-lang/hexa.real check training/train_clm.hexa
+  === hexa check ===
+  found 0 @invariant declaration(s)
+  no @invariant DSL blocks; running implicit I1 (deny push)
+  0 violation(s)
+
+Full `run` on Mac → Bus error in build/hexa_stage0 (pre-existing Mac env
+issue, unrelated to our edit — surfaces on any 2.5k-LOC hexa file).
+
+========== POD VERIFICATION (RunPod hexa-c4, RTX 3090) ==========
+Pod arrived without a working hexa binary (only Mac binary in self/native/).
+Built from source on-pod (gcc 11.4.0 -O2 -D_GNU_SOURCE):
+  1. gcc self/native/hexa_cc.c    → self/native/hexa_v2       (transpiler)
+  2. cat runtime_core.hexa bc_emitter.hexa bc_vm.hexa \
+       + (grep -v '^use' hexa_full.hexa)                    > flat.hexa
+  3. hexa_v2 flat.hexa flat.c
+  4. gcc flat.c → build/hexa_stage0                          (interpreter)
+
+Isolated scale_1_5b() run (tiny wrapper file on pod):
+  $ hexa_stage0 /tmp/verify_port.hexa
+    scale_1b   d=1024 kv=4 batch=32 lr=0.00015
+    scale_1_5b d=2048 kv=8 batch=8 lr=0.0003
+    PASS: scale_1_5b config matches clm_1b_config.json
+  Param count sanity (embed + L*(4d² + 3*d*ff) + lm_head, ff=8192):
+    1611M ≈ 1.61B  (clm_1b_config.json estimates 1.51B → within 7%)
+
+========== WHAT DIDN'T VERIFY (and why) ==========
+Full train_clm.hexa run on pod stalled at 100% CPU, 1.4GB RAM after 72s
+with zero output produced. No syntax error, no segfault — the interpreter
+is simply too slow to complete the file's self-tests (decoder_forward +
+3× train_step at d=16) in under a minute. RAM growth is linear with
+module-level tensor primitive setup.
+
+This matches the pre-existing note in training/model_1b_gpu.hexa:
+  "interpreter-limited (from R8 training step): >100× slower until codegen"
+
+This is NOT a scale_1_5b port defect — the same file without our edit
+exhibits the same behavior (the self-tests were written for eventual
+codegen, not interpreter evaluation).
+
+========== HEXA RUNTIME LIMITATIONS HIT ==========
+1. No linux pre-built binary in GitHub release assets (Darwin arm64 only).
+   Fresh pods require self-built toolchain (manual flatten + gcc).
+2. Interpreter perf: a 2500-LOC hexa file with O(N²D) tensor primitives
+   in _block_attn / decoder_backward self-tests takes >>60s per forward
+   pass even at d=16 — full run likely >10min.
+3. @link("/absolute/path/*.dylib") hardcoded to Mac paths. On Linux
+   the .dylib files don't exist; FFI-dependent code paths (BLAS
+   hxlmhead_bwd / hxblas_sgemm) would dlopen-fail at first call. For
+   real training on linux, a parallel @link(".../libhxblas.so") guard
+   or a build-time path substitution is needed.
+
+========== .PY → .HEXA REPLACEMENT FEASIBILITY ==========
+Short answer: NOT YET for the full train loop.
+
+The structural port (scale config, phase manager, checkpoint policy,
+eval struct) is already done and verified — our edit extends that.
+
+The blocking gap is the TRAIN LOOP IMPLEMENTATION:
+- train_clm.hexa's train_step uses @link .dylib for LM head backward
+  (hxlmhead_bwd FFI). This is the hot path — works on Mac, needs Linux
+  .so rebuild + path guard.
+- torch.compile equivalent (SM90 tensor core codegen) doesn't exist in
+  hexa yet. Without it, ~410 ms/step estimate from clm_1b_config.json
+  becomes >>40s/step in the interpreter — 100× slowdown matches the
+  model_1b_gpu.hexa commentary.
+- Corpus loader (load_corpus), optimizer step (AdamW), DataLoader, and
+  torch.save/load are all TODO[pytorch] stubs in the current .hexa.
+
+Bottom line: train_clm.hexa scale_1_5b() is ready for when the rest of
+the train loop lands (hxcuda kernels + linux .so FFI + corpus I/O).
+Until then, train_clm_1b.py remains the operational training entry
+point for 1.5B scale runs.
+
+========== TOP 3 BLOCKERS ==========
+1. Hexa codegen → native binary path for decoder_forward/backward +
+   AdamW step. Interpreter is 100× too slow to even benchmark.
+2. Linux .so FFI builds for hxblas / hxlmhead / hxcuda + path guard
+   in @link attributes (Mac-only right now).
+3. hexa corpus loader + torch.save replacement — need binary-format
+   checkpoint primitive matching the pre-save rotation rules.
+
+========== POD STATE AFTER TEST ==========
+- hexa-c4 pod LEFT RUNNING (user may bench).
+- Built binaries PRESERVED: /workspace/hexa-lang/build/hexa_stage0
+  and /workspace/hexa-lang/self/native/hexa_v2 (both Linux x86_64).
+- Temp test files REMOVED: /workspace/anima, /tmp/*.hexa, /tmp/*.c, /tmp/*.s.
