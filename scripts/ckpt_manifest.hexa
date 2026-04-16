@@ -1,0 +1,295 @@
+// ════════════════════════════════════════════════════════════════
+//  scripts/ckpt_manifest.hexa — E7 R2 manifest + integrity check
+//
+//  Roadmap: shared/roadmaps/alm_consciousness_standalone.json
+//           tracks.E.options.E7 (chosen)
+//
+//  Purpose:
+//    Generate and verify sha256 manifests for checkpoint directories.
+//    The manifest file (ckpt_manifest.sha256) is uploaded alongside
+//    the checkpoint by ckpt_backup_hook.hexa. This standalone tool
+//    provides generate/verify/diff operations for manual or CI use.
+//
+//  Manifest format:
+//    Standard sha256sum output (hash  filename), one per line.
+//    Verifiable with: sha256sum -c ckpt_manifest.sha256
+//
+//  Operations:
+//    generate  — compute sha256 for all files in ckpt dir, write manifest
+//    verify    — check existing manifest against files on disk
+//    diff      — compare local manifest against R2 remote manifest
+//    list      — list all manifests found under scan roots
+//
+//  Usage:
+//    hexa scripts/ckpt_manifest.hexa generate <ckpt_dir>
+//    hexa scripts/ckpt_manifest.hexa verify  <ckpt_dir>
+//    hexa scripts/ckpt_manifest.hexa diff    <ckpt_dir> <r2_prefix>
+//    hexa scripts/ckpt_manifest.hexa list    [root_dir]
+//
+//  HEXA-FIRST: zero new .py/.rs/.sh; safe string API subset only.
+// ════════════════════════════════════════════════════════════════
+
+let MANIFEST_NAME = "ckpt_manifest.sha256"
+let MARKER_DONE   = ".r2_uploaded"
+let MARKER_PARTIAL = ".r2_uploading"
+
+// ── String helpers ──
+
+fn str_contains(hay, needle) {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return true }
+    if nn > hn { return false }
+    let mut i = 0
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ── Logging ──
+
+fn now_stamp() {
+    return exec("date +%Y-%m-%dT%H:%M:%S").trim()
+}
+
+fn log_info(msg) {
+    println("[ckpt_manifest " + now_stamp() + "] " + msg)
+}
+
+fn log_warn(msg) {
+    println("[ckpt_manifest " + now_stamp() + " WARN] " + msg)
+}
+
+fn log_err(msg) {
+    println("[ckpt_manifest " + now_stamp() + " ERR] " + msg)
+}
+
+// ── sha256 tool detection ──
+
+fn detect_sha_tool() {
+    let check = exec("command -v sha256sum 2>/dev/null || echo ''").trim()
+    if len(check) > 0 { return "sha256sum" }
+    return "shasum -a 256"
+}
+
+// ── Generate ──
+
+fn cmd_generate(ckpt_dir) {
+    if !file_exists(ckpt_dir) {
+        log_err("directory not found: " + ckpt_dir)
+        return false
+    }
+
+    let sha_cmd = detect_sha_tool()
+    let manifest_path = ckpt_dir + "/" + MANIFEST_NAME
+
+    // Hash all regular files except markers and the manifest itself.
+    let find_cmd = "cd " + ckpt_dir + " && find . -maxdepth 1 -type f " +
+        "! -name '" + MARKER_DONE + "' " +
+        "! -name '" + MARKER_PARTIAL + "' " +
+        "! -name '" + MANIFEST_NAME + "' " +
+        "! -name '.promoted' " +
+        "-print0 | xargs -0 " + sha_cmd + " 2>/dev/null | sort"
+
+    let result = exec(find_cmd)
+    if len(result.trim()) == 0 {
+        log_warn("no files to hash in " + ckpt_dir)
+        return false
+    }
+
+    write_file(manifest_path, result)
+    let line_count = exec("wc -l < " + manifest_path).trim()
+    log_info("generated: " + manifest_path + " (" + line_count + " files)")
+
+    // Print the manifest for visibility.
+    println("")
+    println("--- manifest contents ---")
+    println(result)
+    return true
+}
+
+// ── Verify ──
+
+fn cmd_verify(ckpt_dir) {
+    if !file_exists(ckpt_dir) {
+        log_err("directory not found: " + ckpt_dir)
+        return false
+    }
+
+    let manifest_path = ckpt_dir + "/" + MANIFEST_NAME
+    if !file_exists(manifest_path) {
+        log_err("manifest not found: " + manifest_path)
+        log_info("hint: generate one with: hexa scripts/ckpt_manifest.hexa generate " + ckpt_dir)
+        return false
+    }
+
+    let sha_tool = detect_sha_tool()
+    let mut check_flag = "-c"
+    let check_cmd = "cd " + ckpt_dir + " && " + sha_tool + " " + check_flag + " " + MANIFEST_NAME + " 2>&1"
+
+    log_info("verifying: " + manifest_path)
+    let result = exec(check_cmd + "; echo RC=$?")
+    println(result)
+
+    if str_contains(result, "RC=0") {
+        println("")
+        log_info("VERIFY: ALL CHECKSUMS OK")
+        return true
+    } else {
+        println("")
+        log_err("VERIFY: FAILED — one or more checksums do not match")
+        return false
+    }
+}
+
+// ── Diff (local vs R2 remote) ──
+
+fn cmd_diff(ckpt_dir, r2_prefix) {
+    if !file_exists(ckpt_dir) {
+        log_err("local directory not found: " + ckpt_dir)
+        return false
+    }
+
+    let local_manifest = ckpt_dir + "/" + MANIFEST_NAME
+    if !file_exists(local_manifest) {
+        log_err("local manifest not found: " + local_manifest)
+        return false
+    }
+
+    // Download the remote manifest to a temp file.
+    let tmp = exec("mktemp /tmp/ckpt_manifest_remote_XXXXXX").trim()
+    let remote_path = r2_prefix + MANIFEST_NAME
+    log_info("downloading remote manifest: " + remote_path)
+
+    let dl_cmd = "rclone copyto " + remote_path + " " + tmp + " --s3-no-check-bucket 2>&1; echo RC=$?"
+    let dl_result = exec(dl_cmd)
+    if !str_contains(dl_result, "RC=0") {
+        log_err("failed to download remote manifest: " + dl_result)
+        let _ = exec("rm -f " + tmp)
+        return false
+    }
+
+    // Diff the two manifests.
+    log_info("comparing local vs remote manifests...")
+    let diff_cmd = "diff " + local_manifest + " " + tmp + " 2>&1"
+    let diff_result = exec(diff_cmd + "; echo RC=$?")
+
+    if str_contains(diff_result, "RC=0") {
+        log_info("DIFF: manifests are IDENTICAL")
+    } else {
+        log_warn("DIFF: manifests differ:")
+        println(diff_result)
+    }
+
+    let _ = exec("rm -f " + tmp)
+    return true
+}
+
+// ── List ──
+
+fn cmd_list(root_dir) {
+    if !file_exists(root_dir) {
+        log_err("root not found: " + root_dir)
+        return
+    }
+
+    log_info("scanning for manifests under: " + root_dir)
+    let find_cmd = "find " + root_dir + " -name '" + MANIFEST_NAME + "' -type f 2>/dev/null | sort"
+    let result = exec(find_cmd)
+
+    if len(result.trim()) == 0 {
+        println("  (no manifests found)")
+        return
+    }
+
+    // For each manifest, count lines and get parent dir.
+    let n = len(result)
+    let mut start = 0
+    let mut count = 0
+    let mut i = 0
+    while i < n {
+        if result.substring(i, i + 1) == "\n" {
+            if i > start {
+                let path = result.substring(start, i)
+                let lines = exec("wc -l < " + path).trim()
+                let dir = exec("dirname " + path).trim()
+                let dir_size = exec("du -sh " + dir + " 2>/dev/null | cut -f1").trim()
+                println("  " + path + " (" + lines + " files, dir=" + dir_size + ")")
+                count = count + 1
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n {
+        let path = result.substring(start, n)
+        if len(path.trim()) > 0 {
+            let lines = exec("wc -l < " + path).trim()
+            println("  " + path + " (" + lines + " files)")
+            count = count + 1
+        }
+    }
+
+    println("")
+    println("total manifests: " + str(count))
+}
+
+// ── Main ──
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+
+    if argc < 3 {
+        println("usage: hexa scripts/ckpt_manifest.hexa <command> [args...]")
+        println("")
+        println("commands:")
+        println("  generate <ckpt_dir>              — compute sha256 manifest for ckpt dir")
+        println("  verify   <ckpt_dir>              — verify existing manifest against files")
+        println("  diff     <ckpt_dir> <r2_prefix>  — compare local manifest vs R2 remote")
+        println("  list     [root_dir]              — find all manifests under a directory")
+        println("")
+        println("The manifest file '" + MANIFEST_NAME + "' is created inside the ckpt dir.")
+        println("It is uploaded alongside ckpt files by ckpt_backup_hook.hexa (E1).")
+        println("Format: standard sha256sum output, verifiable with 'sha256sum -c'.")
+        return
+    }
+
+    let command = argv[2]
+
+    if command == "generate" {
+        if argc < 4 {
+            log_err("generate requires <ckpt_dir>")
+            return
+        }
+        let ok = cmd_generate(argv[3])
+        if !ok { log_err("generate failed") }
+
+    } else if command == "verify" {
+        if argc < 4 {
+            log_err("verify requires <ckpt_dir>")
+            return
+        }
+        let ok = cmd_verify(argv[3])
+        if !ok { log_err("verify failed") }
+
+    } else if command == "diff" {
+        if argc < 5 {
+            log_err("diff requires <ckpt_dir> <r2_prefix>")
+            return
+        }
+        let ok = cmd_diff(argv[3], argv[4])
+        if !ok { log_err("diff failed") }
+
+    } else if command == "list" {
+        let root = "."
+        if argc >= 4 { root = argv[3] }
+        cmd_list(root)
+
+    } else {
+        log_err("unknown command: " + command)
+        println("valid commands: generate, verify, diff, list")
+    }
+}

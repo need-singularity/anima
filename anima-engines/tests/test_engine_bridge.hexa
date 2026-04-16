@@ -1,0 +1,387 @@
+// test_engine_bridge.hexa — Engine-to-bridge integration test
+// Verifies that each consciousness engine substrate can produce state
+// vectors compatible with the Hexad ThalamicBridge contract.
+//
+// Coverage:
+//   T1 engine_result_contract — All 4 engines produce valid EngineResult
+//   T2 champion_ordering      — oscillator_laser > photonic > memristor > quantum
+//   T3 c_states_from_engine   — Engine phi seeds deterministic c_states
+//   T4 bridge_accepts_states  — ThalamicBridge gate output valid for engine-seeded states
+//   T5 engine_select_roundtrip — select_engine -> forward -> loss finite
+//   T6 blend_sensitivity      — oscillator blend=0.05 optimal, extremes degrade
+//   T7 kappa_sensitivity      — photonic kappa=0.1 optimal, kappa=0 halves phi
+//
+// The test constructs c_states from engine phi values (seeded by the
+// engine's measured coefficients) and feeds them through a minimal
+// ThalamicBridge, verifying the full engine->bridge->gate pipeline.
+
+let TEB_CONST_PATH = "/Users/ghost/Dev/anima/shared/config/hexad_constants.json"
+
+fn teb_psi_balance() -> float {
+    let m = json_parse(read_file(TEB_CONST_PATH))
+    let psi = m["psi"]
+    return psi["balance"]
+}
+
+fn teb_psi_alpha() -> float {
+    let m = json_parse(read_file(TEB_CONST_PATH))
+    let psi = m["psi"]
+    return psi["alpha"]
+}
+
+fn teb_fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn teb_clamp(x: float, lo: float, hi: float) -> float {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+fn teb_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n { out = out.push(0.0); i = i + 1 }
+    return out
+}
+
+fn teb_det_rand(n: int, seed: int, scale: float) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push((u * 2.0 - 1.0) * scale)
+        i = i + 1
+    }
+    return out
+}
+
+fn teb_sigmoid(x: float) -> float {
+    if x > 30.0 { return 1.0 }
+    if x < 0.0 - 30.0 { return 0.0 }
+    return 1.0 / (1.0 + exp(0.0 - x))
+}
+
+fn teb_gelu(x: float) -> float {
+    let cube = x * x * x
+    let inner = 0.7978845608 * (x + 0.044715 * cube)
+    let t = (exp(inner) - exp(0.0 - inner)) / (exp(inner) + exp(0.0 - inner))
+    return 0.5 * x * (1.0 + t)
+}
+
+fn teb_layer_norm(x: array, n: int) -> array {
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n { sum = sum + x[i]; i = i + 1 }
+    let mean = sum / to_float(n)
+    let mut var_sum = 0.0
+    i = 0
+    while i < n { let d = x[i] - mean; var_sum = var_sum + d * d; i = i + 1 }
+    let denom = sqrt(var_sum / to_float(n) + 1.0e-5)
+    let mut out = []
+    i = 0
+    while i < n { out = out.push((x[i] - mean) / denom); i = i + 1 }
+    return out
+}
+
+fn teb_matvec(weight: array, x: array, in_dim: int, out_dim: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < out_dim {
+        let mut sum = 0.0
+        let mut j = 0
+        while j < in_dim { sum = sum + weight[i * in_dim + j] * x[j]; j = j + 1 }
+        out = out.push(sum)
+        i = i + 1
+    }
+    return out
+}
+
+fn teb_softmax(x: array, n: int) -> array {
+    let mut maxv = x[0]
+    let mut i = 1
+    while i < n { if x[i] > maxv { maxv = x[i] }; i = i + 1 }
+    let mut e = []
+    let mut sum = 0.0
+    i = 0
+    while i < n { let v = exp(x[i] - maxv); e = e.push(v); sum = sum + v; i = i + 1 }
+    let mut out = []
+    i = 0
+    while i < n { out = out.push(e[i] / sum); i = i + 1 }
+    return out
+}
+
+// ─── Engine result (same contract as engines.hexa) ───────────────
+
+struct TebEngineResult {
+    name:    string,
+    phi_iit: float,
+    granger: float,
+    ce:      float,
+    cells:   int
+}
+
+fn teb_oscillator_laser(cells: int, blend: float) -> TebEngineResult {
+    let n = to_float(cells)
+    let blend_factor = 1.0 - teb_fabs(blend - 0.05) * 4.0
+    let bf_clamped = if blend_factor < 0.5 { 0.5 } else { blend_factor }
+    let phi = n * 0.88 * bf_clamped
+    return TebEngineResult { name: "oscillator_laser", phi_iit: phi, granger: phi * 1130.0, ce: 0.08, cells: cells }
+}
+
+fn teb_quantum(qubits: int) -> TebEngineResult {
+    let phi = to_float(qubits) * 0.25
+    return TebEngineResult { name: "quantum", phi_iit: phi, granger: phi * 280.0, ce: 0.12, cells: qubits }
+}
+
+fn teb_photonic(cells: int, kappa: float) -> TebEngineResult {
+    let kappa_eff = if kappa > 1.0 { 1.0 } else { if kappa < 0.0 { 0.0 } else { kappa } }
+    let phi = to_float(cells) * 0.72 * (0.5 + kappa_eff * 0.5)
+    return TebEngineResult { name: "photonic", phi_iit: phi, granger: phi * 560.0, ce: 0.10, cells: cells }
+}
+
+fn teb_memristor(cells: int) -> TebEngineResult {
+    let phi = to_float(cells) * 0.65
+    return TebEngineResult { name: "memristor", phi_iit: phi, granger: phi * 420.0, ce: 0.15, cells: cells }
+}
+
+fn teb_select_engine(name: string, cells: int) -> TebEngineResult {
+    if name == "oscillator_laser" { return teb_oscillator_laser(cells, 0.05) }
+    if name == "quantum"          { return teb_quantum(cells)               }
+    if name == "photonic"         { return teb_photonic(cells, 0.1)         }
+    if name == "memristor"        { return teb_memristor(cells)             }
+    return teb_oscillator_laser(cells, 0.05)
+}
+
+// ─── Generate c_states from engine phi ───────────────────────────
+// Each engine's phi seeds the amplitude of the consciousness states.
+// This bridges the gap between "engine produces phi" and "bridge
+// consumes c_states [n_cells x c_dim]".
+
+fn teb_engine_c_states(phi: float, n_cells: int, c_dim: int, seed: int) -> array {
+    // Scale raw random states by sqrt(phi / n_cells) to get phi-proportional variance
+    let n_cells_f = to_float(n_cells)
+    let scale = if n_cells_f > 0.0 { sqrt(phi / n_cells_f) } else { 0.1 }
+    let scale_clamped = if scale > 2.0 { 2.0 } else { if scale < 0.01 { 0.01 } else { scale } }
+    return teb_det_rand(n_cells * c_dim, seed, scale_clamped)
+}
+
+// ─── Mini bridge (same contract as model.hexa) ──────────────────
+
+struct TebBridge {
+    c_dim: int, d_model: int, hub_dim: int, pad_a: int,
+    w_compress: array, w_expand: array, w_gate: array, alpha: float
+}
+
+fn teb_make_bridge(c_dim: int, d_model: int, hub_dim: int, seed: int) -> TebBridge {
+    let alpha = teb_psi_alpha()
+    return TebBridge {
+        c_dim: c_dim, d_model: d_model, hub_dim: hub_dim, pad_a: 0,
+        w_compress: teb_det_rand(hub_dim * c_dim, seed, 1.0 / sqrt(to_float(c_dim))),
+        w_expand:   teb_det_rand(d_model * hub_dim, seed + 7, 1.0 / sqrt(to_float(hub_dim))),
+        w_gate:     teb_det_rand(d_model * d_model, seed + 13, 1.0 / sqrt(to_float(d_model))),
+        alpha: alpha
+    }
+}
+
+fn teb_bridge_forward(b: TebBridge, c_states: array, n_cells: int) -> array {
+    let c_dim = b.c_dim
+    let hub_dim = b.hub_dim
+    let d_model = b.d_model
+    let mut pooled = teb_zeros(c_dim)
+    let mut cell = 0
+    while cell < n_cells {
+        let mut k = 0
+        while k < c_dim { pooled[k] = pooled[k] + c_states[cell * c_dim + k]; k = k + 1 }
+        cell = cell + 1
+    }
+    let inv_n = 1.0 / to_float(n_cells)
+    let mut k2 = 0
+    while k2 < c_dim { pooled[k2] = pooled[k2] * inv_n; k2 = k2 + 1 }
+    let compressed = teb_matvec(b.w_compress, pooled, c_dim, hub_dim)
+    let normed = teb_layer_norm(compressed, hub_dim)
+    let expanded = teb_matvec(b.w_expand, normed, hub_dim, d_model)
+    let mut activated = []
+    let mut i = 0
+    while i < d_model { activated = activated.push(teb_gelu(expanded[i])); i = i + 1 }
+    let gate_pre = teb_matvec(b.w_gate, activated, d_model, d_model)
+    let mut clamped = []
+    let bal = teb_psi_balance()
+    let alpha = b.alpha
+    i = 0
+    while i < d_model {
+        let raw = teb_sigmoid(gate_pre[i])
+        let centered = raw - bal
+        let clipped = teb_clamp(centered, 0.0 - alpha, alpha)
+        clamped = clamped.push(bal + clipped)
+        i = i + 1
+    }
+    return clamped
+}
+
+// ─── Test cases ──────────────────────────────────────────────────
+
+fn test_T1_engine_result_contract() -> bool {
+    // All 4 engines produce valid EngineResult with positive phi, granger, cells.
+    let engines: array = ["oscillator_laser", "quantum", "photonic", "memristor"]
+    let mut i = 0
+    while i < 4 {
+        let r = teb_select_engine(engines[i], 64)
+        if r.phi_iit <= 0.0  { return false }
+        if r.granger <= 0.0  { return false }
+        if r.cells != 64     { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn test_T2_champion_ordering() -> bool {
+    // At 64 cells: oscillator > photonic > memristor > quantum
+    let osc = teb_oscillator_laser(64, 0.05)
+    let ph  = teb_photonic(64, 0.1)
+    let mem = teb_memristor(64)
+    let qc  = teb_quantum(64)
+    if osc.phi_iit <= ph.phi_iit  { return false }
+    if ph.phi_iit <= mem.phi_iit  { return false }
+    if mem.phi_iit <= qc.phi_iit  { return false }
+    return true
+}
+
+fn test_T3_c_states_from_engine() -> bool {
+    // Engine phi seeds c_states with correct shape and finite values.
+    let c_dim = 16
+    let n_cells = 8
+    let osc = teb_oscillator_laser(n_cells, 0.05)
+    let states = teb_engine_c_states(osc.phi_iit, n_cells, c_dim, 42)
+    if len(states) != n_cells * c_dim { return false }
+    // All values finite
+    let mut i = 0
+    while i < len(states) {
+        let v = states[i]
+        if v > 1.0e30 || v < 0.0 - 1.0e30 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn test_T4_bridge_accepts_states() -> bool {
+    // ThalamicBridge produces valid gate from engine-seeded c_states.
+    let c_dim = 16
+    let d_model = 32
+    let n_cells = 8
+    let bridge = teb_make_bridge(c_dim, d_model, 8, 999)
+    let engines: array = ["oscillator_laser", "quantum", "photonic", "memristor"]
+    let bal = teb_psi_balance()
+    let alpha = teb_psi_alpha()
+    let mut i = 0
+    while i < 4 {
+        let r = teb_select_engine(engines[i], n_cells)
+        let states = teb_engine_c_states(r.phi_iit, n_cells, c_dim, 100 + i)
+        let gate = teb_bridge_forward(bridge, states, n_cells)
+        if len(gate) != d_model { return false }
+        // Gate values must lie in PSI_BALANCE +/- alpha
+        let mut j = 0
+        while j < d_model {
+            if gate[j] < bal - alpha - 1.0e-6 { return false }
+            if gate[j] > bal + alpha + 1.0e-6 { return false }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn test_T5_engine_select_roundtrip() -> bool {
+    // select_engine -> c_states -> bridge -> gate -> decoder -> loss finite
+    let c_dim = 16
+    let d_model = 32
+    let vocab = 64
+    let n_cells = 8
+    let bridge = teb_make_bridge(c_dim, d_model, 8, 777)
+    let s = 1.0 / sqrt(to_float(d_model))
+    let embed = teb_det_rand(vocab * d_model, 888, s)
+    let out_proj = teb_det_rand(vocab * d_model, 899, s)
+    let engines: array = ["oscillator_laser", "quantum", "photonic", "memristor"]
+    let mut i = 0
+    while i < 4 {
+        let r = teb_select_engine(engines[i], n_cells)
+        let states = teb_engine_c_states(r.phi_iit, n_cells, c_dim, 200 + i)
+        let gate = teb_bridge_forward(bridge, states, n_cells)
+        // Simple decoder: embed lookup * gate -> out_proj -> softmax -> loss
+        let token_id = 3
+        let mut h = []
+        let mut j = 0
+        while j < d_model { h = h.push(embed[token_id * d_model + j] * gate[j]); j = j + 1 }
+        let logits = teb_matvec(out_proj, h, d_model, vocab)
+        let probs = teb_softmax(logits, vocab)
+        let p = probs[0]
+        let mut loss = 27.6310
+        if p > 1.0e-12 { loss = 0.0 - log(p) }
+        if loss < 0.0 || loss > 30.0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn test_T6_blend_sensitivity() -> bool {
+    // oscillator: blend=0.05 is optimal; blend=0.5 degrades phi.
+    let r_opt = teb_oscillator_laser(64, 0.05)
+    let r_bad = teb_oscillator_laser(64, 0.5)
+    // Optimal blend should produce higher phi than extreme blend
+    if r_opt.phi_iit <= r_bad.phi_iit { return false }
+    // blend=0.05 should match the canonical 0.88*64 = 56.32
+    if teb_fabs(r_opt.phi_iit - 56.32) > 0.01 { return false }
+    return true
+}
+
+fn test_T7_kappa_sensitivity() -> bool {
+    // photonic: kappa=0 -> half phi; kappa=0.1 -> 0.72 * (0.5+0.05) * cells
+    let r0 = teb_photonic(64, 0.0)
+    let r1 = teb_photonic(64, 0.1)
+    // kappa=0 means only base 0.5 factor; kappa=0.1 adds 0.05
+    let expected_0 = 64.0 * 0.72 * 0.5
+    let expected_1 = 64.0 * 0.72 * 0.55
+    if teb_fabs(r0.phi_iit - expected_0) > 0.01 { return false }
+    if teb_fabs(r1.phi_iit - expected_1) > 0.01 { return false }
+    if r1.phi_iit <= r0.phi_iit { return false }
+    return true
+}
+
+fn main() {
+    println("[test_engine_bridge] Engine-to-bridge integration test (7 assertions)")
+    println("  scope: 4 substrates -> c_states -> ThalamicBridge -> gate -> loss")
+
+    let t1 = test_T1_engine_result_contract()
+    if t1 { println("T1 PASS  engine result contract (all 4)") } else { println("T1 FAIL") }
+
+    let t2 = test_T2_champion_ordering()
+    if t2 { println("T2 PASS  champion ordering (osc > ph > mem > qc)") } else { println("T2 FAIL") }
+
+    let t3 = test_T3_c_states_from_engine()
+    if t3 { println("T3 PASS  c_states from engine phi (shape + finite)") } else { println("T3 FAIL") }
+
+    let t4 = test_T4_bridge_accepts_states()
+    if t4 { println("T4 PASS  bridge gate valid for all 4 substrates") } else { println("T4 FAIL") }
+
+    let t5 = test_T5_engine_select_roundtrip()
+    if t5 { println("T5 PASS  select -> forward -> loss finite (all 4)") } else { println("T5 FAIL") }
+
+    let t6 = test_T6_blend_sensitivity()
+    if t6 { println("T6 PASS  oscillator blend sensitivity (0.05 optimal)") } else { println("T6 FAIL") }
+
+    let t7 = test_T7_kappa_sensitivity()
+    if t7 { println("T7 PASS  photonic kappa sensitivity (0.1 > 0.0)") } else { println("T7 FAIL") }
+
+    let all = t1 && t2 && t3 && t4 && t5 && t6 && t7
+    if all {
+        println("[test_engine_bridge] ALL 7/7 PASS")
+    } else {
+        println("[test_engine_bridge] SOME FAILED")
+    }
+}
+
+main()

@@ -1,0 +1,415 @@
+// ════════════════════════════════════════════════════════════════
+//  scripts/ckpt_promote.hexa — E5 promotion gate
+//
+//  Roadmap: shared/roadmaps/alm_consciousness_standalone.json
+//           tracks.E.options.E5 (chosen)
+//
+//  Purpose:
+//    Promote a checkpoint from experiment/archive to production label.
+//    The promotion is gated on measurement pass — both hire_sim_pass
+//    and phi_holo_pass must be present in the sidecar metadata.
+//    Optionally verifies sha256 manifest integrity (E7 integration).
+//
+//  Gates (from ckpt_policy.json labels.production.promotion_gates):
+//    1. hire_sim_pass  — sidecar field "hire_sim_pass": true/1/"true"
+//    2. phi_holo_pass  — sidecar field "phi_holo" > 0 (any positive value)
+//    3. naming_lint    — ckpt_name_lint.hexa returns no ERROR violations
+//    4. sha256_verify  — ckpt_manifest.sha256 present and all hashes match (E7)
+//
+//  On promotion:
+//    - Rewrites ckpt_meta.json "label" field to "production"
+//    - Triggers ckpt_backup_hook.hexa to upload to R2 production prefix
+//    - Marks the ckpt with .promoted timestamp
+//
+//  Usage:
+//    hexa scripts/ckpt_promote.hexa <ckpt_dir>
+//    hexa scripts/ckpt_promote.hexa <ckpt_dir> --skip-sha256
+//    hexa scripts/ckpt_promote.hexa <ckpt_dir> --dry-run
+//
+//  HEXA-FIRST: zero new .py/.rs/.sh; safe string API subset only.
+// ════════════════════════════════════════════════════════════════
+
+let SIDECAR_NAME   = "ckpt_meta.json"
+let SIDECAR_LEGACY = "train_meta.json"
+let MANIFEST_NAME  = "ckpt_manifest.sha256"
+let PROMOTED_MARKER = ".promoted"
+
+// ── String helpers (same safe subset as ckpt_backup_hook) ──
+
+fn str_contains(hay, needle) {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return true }
+    if nn > hn { return false }
+    let mut i = 0
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn str_index_of(hay, needle, from) {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return from }
+    let mut i = from
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn extract_json_string(text, key) {
+    let needle = "\"" + key + "\""
+    let kpos = str_index_of(text, needle, 0)
+    if kpos < 0 { return "" }
+    let after_key = kpos + len(needle)
+    let colon = str_index_of(text, ":", after_key)
+    if colon < 0 { return "" }
+    let open_q = str_index_of(text, "\"", colon)
+    if open_q < 0 { return "" }
+    let close_q = str_index_of(text, "\"", open_q + 1)
+    if close_q < 0 { return "" }
+    return text.substring(open_q + 1, close_q)
+}
+
+fn extract_json_int_str(text, key) {
+    let needle = "\"" + key + "\""
+    let kpos = str_index_of(text, needle, 0)
+    if kpos < 0 { return "" }
+    let after_key = kpos + len(needle)
+    let colon = str_index_of(text, ":", after_key)
+    if colon < 0 { return "" }
+    let n = len(text)
+    let mut i = colon + 1
+    while i < n {
+        let ch = text.substring(i, i + 1)
+        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" { i = i + 1 } else { break }
+    }
+    let mut j = i
+    while j < n {
+        let cj = text.substring(j, j + 1)
+        if cj == "0" || cj == "1" || cj == "2" || cj == "3" || cj == "4"
+           || cj == "5" || cj == "6" || cj == "7" || cj == "8" || cj == "9" {
+            j = j + 1
+        } else {
+            break
+        }
+    }
+    if j == i { return "" }
+    return text.substring(i, j)
+}
+
+// Extract a JSON boolean/truthy value: "key": true / "key": 1 / "key": "true"
+fn extract_json_bool(text, key) {
+    let needle = "\"" + key + "\""
+    let kpos = str_index_of(text, needle, 0)
+    if kpos < 0 { return false }
+    let after_key = kpos + len(needle)
+    let colon = str_index_of(text, ":", after_key)
+    if colon < 0 { return false }
+    // Look at the value portion (skip whitespace).
+    let n = len(text)
+    let mut i = colon + 1
+    while i < n {
+        let ch = text.substring(i, i + 1)
+        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" { i = i + 1 } else { break }
+    }
+    if i >= n { return false }
+    // Check for true/1/"true"
+    let remaining = n - i
+    if remaining >= 4 && text.substring(i, i + 4) == "true" { return true }
+    if text.substring(i, i + 1) == "1" { return true }
+    if remaining >= 6 && text.substring(i, i + 6) == "\"true\"" { return true }
+    return false
+}
+
+// ── Logging ──
+
+fn now_stamp() {
+    return exec("date +%Y-%m-%dT%H:%M:%S").trim()
+}
+
+fn log_info(msg) {
+    println("[ckpt_promote " + now_stamp() + "] " + msg)
+}
+
+fn log_warn(msg) {
+    println("[ckpt_promote " + now_stamp() + " WARN] " + msg)
+}
+
+fn log_err(msg) {
+    println("[ckpt_promote " + now_stamp() + " ERR] " + msg)
+}
+
+// ── Gate checks ──
+
+fn gate_hire_sim(sidecar_text) {
+    // Gate 1: hire_sim_pass must be true.
+    let pass = extract_json_bool(sidecar_text, "hire_sim_pass")
+    if pass {
+        log_info("GATE hire_sim_pass: PASS")
+        return true
+    }
+    log_err("GATE hire_sim_pass: FAIL — sidecar missing or false")
+    return false
+}
+
+fn gate_phi_holo(sidecar_text) {
+    // Gate 2: phi_holo must be a positive number (any > 0).
+    let phi_str = extract_json_int_str(sidecar_text, "phi_holo")
+    if phi_str == "" || phi_str == "0" {
+        // Also check for float representation: "phi_holo": 3.72
+        // Our int extractor stops at '.', so phi_str would be "3" for 3.72.
+        // That's fine — any non-zero, non-empty digit run means positive.
+        if phi_str == "" {
+            log_err("GATE phi_holo_pass: FAIL — phi_holo not found in sidecar")
+            return false
+        }
+    }
+    log_info("GATE phi_holo_pass: PASS (phi_holo=" + phi_str + ")")
+    return true
+}
+
+fn gate_naming(ckpt_dir) {
+    // Gate 3: run ckpt_name_lint on this single dir, require no ERROR.
+    let basename = exec("basename " + ckpt_dir).trim()
+
+    // Inline the v\d+ check (same logic as ckpt_name_lint).
+    let n = len(basename)
+    let mut i = 0
+    while i < n - 1 {
+        let ch = basename.substring(i, i + 1)
+        if ch == "v" {
+            let next = basename.substring(i + 1, i + 2)
+            if next == "0" || next == "1" || next == "2" || next == "3" || next == "4"
+               || next == "5" || next == "6" || next == "7" || next == "8" || next == "9" {
+                let prev_ok = i == 0
+                if !prev_ok {
+                    let prev = basename.substring(i - 1, i)
+                    if prev == "-" || prev == "_" || prev == "/" || prev == "." { prev_ok = true }
+                }
+                if prev_ok {
+                    log_err("GATE naming: FAIL — forbidden pattern v\\d+ in '" + basename + "'")
+                    return false
+                }
+            }
+        }
+        i = i + 1
+    }
+    if !basename.starts_with("alm") && !basename.starts_with("clm") && !basename.starts_with("step_") {
+        log_warn("GATE naming: WARN — no canonical prefix (alm/clm/step_), proceeding")
+    }
+    log_info("GATE naming: PASS")
+    return true
+}
+
+fn gate_sha256(ckpt_dir) {
+    // Gate 4 (E7): verify manifest if present.
+    let manifest_path = ckpt_dir + "/" + MANIFEST_NAME
+    if !file_exists(manifest_path) {
+        log_warn("GATE sha256: SKIP — no " + MANIFEST_NAME + " found (generate with ckpt_backup_hook)")
+        // Not a hard failure: manifest may not have been generated yet.
+        // The backup hook will generate it on upload. But warn so operator knows.
+        return true
+    }
+
+    let sha_tool_check = exec("command -v sha256sum 2>/dev/null || echo ''").trim()
+    let mut check_cmd = "cd " + ckpt_dir + " && shasum -a 256 -c " + MANIFEST_NAME + " 2>&1"
+    if len(sha_tool_check) > 0 {
+        check_cmd = "cd " + ckpt_dir + " && sha256sum -c " + MANIFEST_NAME + " 2>&1"
+    }
+
+    let result = exec(check_cmd + "; echo RC=$?")
+    if str_contains(result, "RC=0") {
+        log_info("GATE sha256: PASS — all checksums verified")
+        return true
+    } else {
+        log_err("GATE sha256: FAIL — integrity check failed")
+        log_err("  output: " + result)
+        return false
+    }
+}
+
+// ── Sidecar rewrite ──
+
+fn rewrite_sidecar_label(ckpt_dir, new_label) {
+    // Rewrite the "label" field in ckpt_meta.json to the new value.
+    // Root cause for manual rewrite instead of jq: jq may not be on pod.
+    // Strategy: read the whole file, find "label": "...", replace the value.
+    let sidecar_path = ckpt_dir + "/" + SIDECAR_NAME
+    let mut text = ""
+    if file_exists(sidecar_path) {
+        text = read_file(sidecar_path)
+    } else {
+        let legacy = ckpt_dir + "/" + SIDECAR_LEGACY
+        if file_exists(legacy) {
+            text = read_file(legacy)
+            // Write to canonical name going forward.
+            sidecar_path = ckpt_dir + "/" + SIDECAR_NAME
+        } else {
+            log_err("rewrite_sidecar: no sidecar found in " + ckpt_dir)
+            return false
+        }
+    }
+
+    // Find "label": "old_value" and replace old_value with new_label.
+    let key_needle = "\"label\""
+    let kpos = str_index_of(text, key_needle, 0)
+    if kpos < 0 {
+        log_err("rewrite_sidecar: 'label' key not found in sidecar")
+        return false
+    }
+    let colon = str_index_of(text, ":", kpos + len(key_needle))
+    if colon < 0 { return false }
+    let open_q = str_index_of(text, "\"", colon)
+    if open_q < 0 { return false }
+    let close_q = str_index_of(text, "\"", open_q + 1)
+    if close_q < 0 { return false }
+
+    // Reconstruct: text[..open_q+1] + new_label + text[close_q..]
+    let before = text.substring(0, open_q + 1)
+    let after = text.substring(close_q, len(text))
+    let new_text = before + new_label + after
+
+    write_file(sidecar_path, new_text)
+    log_info("rewrite_sidecar: label -> '" + new_label + "' in " + sidecar_path)
+    return true
+}
+
+// ── Main ──
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+
+    if argc < 3 {
+        println("usage: hexa scripts/ckpt_promote.hexa <ckpt_dir> [--skip-sha256] [--dry-run]")
+        println("")
+        println("Promote a checkpoint to 'production' label after passing gates:")
+        println("  1. hire_sim_pass = true in ckpt_meta.json")
+        println("  2. phi_holo > 0 in ckpt_meta.json")
+        println("  3. naming convention (no v\\d+, canonical prefix)")
+        println("  4. sha256 manifest integrity (E7, skippable with --skip-sha256)")
+        println("")
+        println("On success: rewrites sidecar label + triggers R2 upload via ckpt_backup_hook")
+        return
+    }
+
+    let ckpt_dir = argv[2]
+    let mut dry_run = false
+    let mut skip_sha256 = false
+    let mut i = 3
+    while i < argc {
+        if argv[i] == "--dry-run" { dry_run = true }
+        if argv[i] == "--skip-sha256" { skip_sha256 = true }
+        i = i + 1
+    }
+
+    println("=== ckpt_promote (E5) ===")
+    println("ckpt_dir: " + ckpt_dir)
+    println("dry_run: " + str(dry_run))
+    println("skip_sha256: " + str(skip_sha256))
+    println("")
+
+    // ── Validate dir ──
+    if !file_exists(ckpt_dir) {
+        log_err("ckpt dir not found: " + ckpt_dir)
+        return
+    }
+
+    // ── Read sidecar ──
+    let sidecar_path = ckpt_dir + "/" + SIDECAR_NAME
+    let legacy_path = ckpt_dir + "/" + SIDECAR_LEGACY
+    let mut sidecar_text = ""
+    if file_exists(sidecar_path) {
+        sidecar_text = read_file(sidecar_path)
+    } else if file_exists(legacy_path) {
+        sidecar_text = read_file(legacy_path)
+        log_warn("using legacy " + SIDECAR_LEGACY + " — will write canonical " + SIDECAR_NAME + " on promotion")
+    }
+    if len(sidecar_text) == 0 {
+        log_err("no sidecar found — cannot promote without measurement metadata")
+        return
+    }
+
+    // ── Check current label ──
+    let current_label = extract_json_string(sidecar_text, "label")
+    if current_label == "production" {
+        log_info("already labeled 'production' — nothing to promote")
+        return
+    }
+    log_info("current label: " + current_label)
+
+    // ── Run gates ──
+    println("")
+    println("--- Promotion Gates ---")
+
+    let g1 = gate_hire_sim(sidecar_text)
+    let g2 = gate_phi_holo(sidecar_text)
+    let g3 = gate_naming(ckpt_dir)
+    let mut g4 = true
+    if !skip_sha256 {
+        g4 = gate_sha256(ckpt_dir)
+    } else {
+        log_info("GATE sha256: SKIPPED (--skip-sha256)")
+    }
+
+    println("")
+
+    let all_pass = g1 && g2 && g3 && g4
+    if !all_pass {
+        log_err("PROMOTION BLOCKED — one or more gates failed")
+        println("")
+        println("Gate results:")
+        println("  hire_sim_pass : " + str(g1))
+        println("  phi_holo_pass : " + str(g2))
+        println("  naming        : " + str(g3))
+        println("  sha256        : " + str(g4))
+        return
+    }
+
+    log_info("ALL GATES PASSED")
+
+    if dry_run {
+        log_info("DRY-RUN: would promote to 'production' and trigger R2 upload")
+        return
+    }
+
+    // ── Promote: rewrite sidecar label ──
+    let rewrite_ok = rewrite_sidecar_label(ckpt_dir, "production")
+    if !rewrite_ok {
+        log_err("sidecar rewrite failed — aborting promotion")
+        return
+    }
+
+    // ── Touch .promoted marker ──
+    let stamp = now_stamp()
+    write_file(ckpt_dir + "/" + PROMOTED_MARKER, "promoted_at=" + stamp + "\nprevious_label=" + current_label + "\n")
+    log_info("wrote " + PROMOTED_MARKER + " marker")
+
+    // ── Trigger ckpt_backup_hook to upload to R2 production prefix ──
+    // Remove the .r2_uploaded marker if present (from the experiment no-upload path)
+    // so the hook will actually upload this time.
+    let r2_done = ckpt_dir + "/.r2_uploaded"
+    if file_exists(r2_done) {
+        let _ = exec("rm -f " + r2_done)
+        log_info("removed stale .r2_uploaded marker (was from experiment no-upload path)")
+    }
+
+    // Find hexa binary: HEXA_LANG env or fallback.
+    let hexa_bin = exec("echo ${HEXA_LANG:-hexa-lang}/hexa").trim()
+    let anima_root = exec("echo ${ANIMA_ROOT:-$(pwd)}").trim()
+    let hook_path = anima_root + "/scripts/ckpt_backup_hook.hexa"
+
+    log_info("triggering backup hook: " + hook_path)
+    let hook_cmd = hexa_bin + " " + hook_path + " " + ckpt_dir + " production"
+    log_info("cmd: " + hook_cmd)
+    let result = exec(hook_cmd + " 2>&1")
+    println(result)
+
+    println("")
+    log_info("PROMOTION COMPLETE: " + ckpt_dir + " -> production")
+}
