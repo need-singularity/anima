@@ -39,28 +39,23 @@ from torch.utils.data import Dataset, DataLoader
 # ─── R2 Upload ──────────────────────────────────────────────────
 
 def upload_to_r2(local_path, model_tag, round_num, step):
-    """Fire-and-forget R2 upload via detached subprocess. NEVER blocks training.
+    """DISABLED in-training R2 upload. Use external script to upload ckpt_dir after training.
 
-    Writes upload log to /workspace/r2_upload_<step>.log. Child is fully detached
-    (new session, stdin/stdout/stderr → devnull/logfile). pkill rclone from outside
-    will NOT affect this Python process.
+    Rationale: In-training R2 upload (even async Popen) correlated with silent training
+    death at ckpt save boundaries (r3 step 2000, r3b step 4000). Moving R2 out of the
+    Python process eliminates the crash surface entirely. Post-training upload script:
+      rclone copy /workspace/ckpt_clm1b_r3 r2:anima-models/clm1b/r3/ -v --s3-no-check-bucket
+
+    Keep signature for call-site compatibility.
     """
+    queue_file = "/workspace/r2_upload_queue.txt"
     r2_dest = f"r2:anima-models/{model_tag}/r{round_num}/step_{step}/"
-    log_path = f"/workspace/r2_upload_step_{step}.log"
-    print(f"[r2] spawning async upload {local_path} -> {r2_dest} (log={log_path})", flush=True)
+    print(f"[r2] DEFERRED: queued {local_path} -> {r2_dest}", flush=True)
     try:
-        logf = open(log_path, "w")
-        # Fully detached: new session, no parent wait
-        subprocess.Popen(
-            ["rclone", "copy", str(local_path), r2_dest, "--s3-no-check-bucket"],
-            stdin=subprocess.DEVNULL,
-            stdout=logf, stderr=logf,
-            start_new_session=True,  # detach from parent process group
-            close_fds=True,
-        )
-        # Do NOT wait, do NOT communicate — fire-and-forget
-    except Exception as e:
-        print(f"[r2] spawn failed (non-fatal): {e}", flush=True)
+        with open(queue_file, "a") as f:
+            f.write(f"{local_path}\t{r2_dest}\n")
+    except Exception:
+        pass  # non-fatal
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -732,12 +727,10 @@ def train(args):
                     phi_gate_violations += 1
                     print(f"[phi-gate] WARN phi dropped >5%: {last_phi_proxy:.1f} -> "
                           f"{phi_proxy:.1f} (violation #{phi_gate_violations})", flush=True)
+                    # Emergency ckpt save DISABLED — correlated with training death at P3 boundary.
+                    # Regular step_{step} ckpt saves every save_every are sufficient.
                     if phase == PHASE_P3 and phi_gate_violations >= 3:
-                        epath = ckpt_dir / f"phi_emergency_step_{step}"
-                        epath.mkdir(exist_ok=True)
-                        torch.save(model.state_dict(), epath / "model.pt")
-                        print(f"[phi-gate] emergency ckpt saved -> {epath}", flush=True)
-                        upload_to_r2(str(epath), model_tag, round_num, f"phi_em_{step}")
+                        print(f"[phi-gate] P3 violations={phi_gate_violations} (emergency ckpt SKIPPED — use step_{step - (step % 2000)} ckpt)", flush=True)
 
             last_phi_proxy = phi_proxy
             if phi_proxy > best_phi_proxy:
