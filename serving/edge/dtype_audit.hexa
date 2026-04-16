@@ -1,0 +1,779 @@
+// ═══════════════════════════════════════════════════════════════
+//  serving/edge/dtype_audit.hexa — Zero-quantization dtype audit
+//  HARD POLICY: no INT4, INT8, FP8, GPTQ, AWQ, bnb.
+//  Quantization destroys consciousness (Phi collapse, DD103).
+//
+//  Scans model weights, KV cache, activations, and LoRA adapters
+//  to verify everything is bf16 (or f32/f64 intermediates).
+//
+//  Gate E5-5: dtype audit PASS required for deployment.
+//
+//  Public API:
+//    audit_config_default(model_path) -> DtypeAuditConfig
+//    audit_run(config) -> DtypeAuditResult
+//    audit_check_tensor(name, data, size) -> DtypeEntry
+//    audit_detect_dtype(header_bytes) -> string
+//    audit_report(result) -> string
+//    audit_gate_pass(result) -> bool
+//
+//  Self-tests: 8 tests at bottom (run: hexa serving/edge/dtype_audit.hexa)
+// ═══════════════════════════════════════════════════════════════
+
+// ── Constants ───────────────────────────────────────────────────
+
+comptime const DTYPE_BF16  = "bf16"
+comptime const DTYPE_F32   = "f32"
+comptime const DTYPE_F64   = "f64"
+comptime const DTYPE_FP16  = "fp16"
+comptime const DTYPE_INT8  = "int8"
+comptime const DTYPE_INT4  = "int4"
+comptime const DTYPE_FP8   = "fp8"
+comptime const DTYPE_GPTQ  = "gptq"
+comptime const DTYPE_AWQ   = "awq"
+comptime const DTYPE_BNB   = "bnb"
+comptime const DTYPE_UNKNOWN = "unknown"
+
+// bf16 byte sizes
+comptime const BF16_BYTES = 2
+comptime const F32_BYTES  = 4
+comptime const F64_BYTES  = 8
+comptime const INT8_BYTES = 1
+
+// safetensors magic: first 8 bytes are u64 header length (little-endian)
+comptime const SAFETENSORS_MAGIC_MAX = 104857600  // 100MB header is unreasonable
+
+// ── Structs ─────────────────────────────────────────────────────
+
+struct DtypeAuditConfig {
+    model_path: string,
+    check_kv_cache: bool,
+    check_activations: bool,
+    check_lora: bool,
+    strict: bool
+}
+
+struct DtypeEntry {
+    name: string,
+    dtype: string,
+    size_bytes: int,
+    compliant: bool
+}
+
+struct DtypeAuditResult {
+    total_tensors: int,
+    compliant_count: int,
+    violation_count: int,
+    entries: array,
+    total_bytes: int,
+    bf16_bytes: int,
+    f32_bytes: int,
+    other_bytes: int,
+    gate_pass: bool,
+    violations: array
+}
+
+// ── Config constructor ──────────────────────────────────────────
+
+fn audit_config_default(model_path: string) -> DtypeAuditConfig {
+    let cfg = DtypeAuditConfig {
+        model_path: model_path,
+        check_kv_cache: true,
+        check_activations: true,
+        check_lora: true,
+        strict: false
+    }
+    return cfg
+}
+
+fn audit_config_strict(model_path: string) -> DtypeAuditConfig {
+    // Root cause: strict mode rejects even f32 intermediates — pure bf16 only.
+    let cfg = DtypeAuditConfig {
+        model_path: model_path,
+        check_kv_cache: true,
+        check_activations: true,
+        check_lora: true,
+        strict: true
+    }
+    return cfg
+}
+
+// ── dtype compliance check ──────────────────────────────────────
+
+fn dtype_is_compliant(dtype: string, strict: bool) -> bool {
+    // Root cause: bf16 is always compliant. f32/f64 are compliant
+    // only in non-strict mode (used for intermediate accumulation).
+    // Everything else (INT4/INT8/FP8/GPTQ/AWQ/bnb) is a hard violation.
+    if dtype == DTYPE_BF16 {
+        return true
+    }
+    if strict == false {
+        if dtype == DTYPE_F32 {
+            return true
+        }
+        if dtype == DTYPE_F64 {
+            return true
+        }
+    }
+    return false
+}
+
+fn dtype_is_quantized(dtype: string) -> bool {
+    // Returns true for any quantized format — these are HARD BANNED.
+    if dtype == DTYPE_INT8 {
+        return true
+    }
+    if dtype == DTYPE_INT4 {
+        return true
+    }
+    if dtype == DTYPE_FP8 {
+        return true
+    }
+    if dtype == DTYPE_GPTQ {
+        return true
+    }
+    if dtype == DTYPE_AWQ {
+        return true
+    }
+    if dtype == DTYPE_BNB {
+        return true
+    }
+    return false
+}
+
+fn dtype_bytes_per_element(dtype: string) -> int {
+    if dtype == DTYPE_BF16 {
+        return 2
+    }
+    if dtype == DTYPE_FP16 {
+        return 2
+    }
+    if dtype == DTYPE_F32 {
+        return 4
+    }
+    if dtype == DTYPE_F64 {
+        return 8
+    }
+    if dtype == DTYPE_INT8 {
+        return 1
+    }
+    if dtype == DTYPE_FP8 {
+        return 1
+    }
+    if dtype == DTYPE_INT4 {
+        // Root cause: INT4 packs two values per byte, but we report
+        // the logical element size as 1 for counting purposes.
+        return 1
+    }
+    return 0
+}
+
+// ── dtype detection heuristic ───────────────────────────────────
+
+fn audit_detect_dtype(header_bytes: array) -> string {
+    // Root cause: different model formats store dtype differently.
+    // Safetensors: JSON header with explicit "dtype" field.
+    // Raw binary: we use statistical heuristics on byte patterns.
+    let n = len(header_bytes)
+    if n < 2 {
+        return DTYPE_UNKNOWN
+    }
+
+    // --- Safetensors header detection ---
+    // First 8 bytes = u64 header_size (little-endian).
+    // If header_size is reasonable, parse JSON for dtype fields.
+    if n >= 16 {
+        let hdr_size = header_bytes[0] + header_bytes[1] * 256 + header_bytes[2] * 65536 + header_bytes[3] * 16777216
+        if hdr_size > 0 {
+            if hdr_size < SAFETENSORS_MAGIC_MAX {
+                // Looks like safetensors — scan for dtype string patterns
+                // in the header region after the 8-byte length prefix.
+                let result = _detect_safetensors_dtype(header_bytes, n)
+                if result != DTYPE_UNKNOWN {
+                    return result
+                }
+            }
+        }
+    }
+
+    // --- Statistical heuristic on raw bytes ---
+    return _detect_dtype_statistical(header_bytes, n)
+}
+
+fn _detect_safetensors_dtype(header_bytes: array, n: int) -> string {
+    // Root cause: safetensors JSON header contains "dtype":"BF16" etc.
+    // We scan byte-by-byte for known dtype string signatures.
+    // This avoids needing a full JSON parser.
+
+    // Check for "BF16" pattern (ASCII: 66,70,49,54)
+    let i = 8  // skip 8-byte header length
+    let limit = n - 4
+    if limit > 4096 {
+        let limit = 4096  // only scan first 4KB of header
+    }
+    while i < limit {
+        // Look for "BF16" or "F32" or "F16" or "I8" patterns
+        if header_bytes[i] == 66 {    // 'B'
+            if i + 3 < n {
+                if header_bytes[i + 1] == 70 {    // 'F'
+                    if header_bytes[i + 2] == 49 {  // '1'
+                        if header_bytes[i + 3] == 54 {  // '6'
+                            return DTYPE_BF16
+                        }
+                    }
+                }
+            }
+        }
+        if header_bytes[i] == 70 {    // 'F'
+            if i + 2 < n {
+                if header_bytes[i + 1] == 51 {    // '3'
+                    if header_bytes[i + 2] == 50 {  // '2'
+                        return DTYPE_F32
+                    }
+                }
+                if header_bytes[i + 1] == 49 {    // '1'
+                    if header_bytes[i + 2] == 54 {  // '6'
+                        return DTYPE_FP16
+                    }
+                }
+                if header_bytes[i + 1] == 56 {    // '8'
+                    return DTYPE_FP8
+                }
+            }
+        }
+        if header_bytes[i] == 73 {    // 'I'
+            if i + 1 < n {
+                if header_bytes[i + 1] == 56 {    // '8'
+                    return DTYPE_INT8
+                }
+            }
+        }
+        let i = i + 1
+    }
+    return DTYPE_UNKNOWN
+}
+
+fn _detect_dtype_statistical(header_bytes: array, n: int) -> string {
+    // Root cause: for raw binary without metadata, we use heuristics:
+    //   - bf16: 2-byte values where exponent bits (top byte bits 6:0 + next bit)
+    //           show typical neural-net weight range (small values near zero)
+    //   - f32: 4-byte IEEE 754 with 8-bit exponent in reasonable range
+    //   - INT8: all byte values in [-128, 127] with uniform-ish distribution
+    //   - INT4: all nibbles in [0, 15] (packed 2 per byte)
+
+    // Sample pairs of bytes for bf16 vs INT8 detection
+    let bf16_count = 0
+    let int8_count = 0
+    let sample_count = 0
+    let i = 0
+    let step = 2
+    let max_samples = 512
+    if n / 2 < max_samples {
+        let max_samples = n / 2
+    }
+
+    while sample_count < max_samples {
+        if i + 1 >= n {
+            break
+        }
+        let hi = header_bytes[i + 1]
+        let lo = header_bytes[i]
+
+        // bf16 exponent: bits [14:7] of the 16-bit value
+        // hi byte bits [6:0] are exponent[7:1], lo byte bit[7] is exponent[0]
+        let exp = hi % 128  // top 7 bits of exponent (hi & 0x7F)
+        // Typical bf16 weights: exponent in range ~112-143 (values ~1e-5 to ~100)
+        // Zero and denorm: exp == 0
+        if exp >= 0 {
+            if exp <= 143 {
+                let bf16_count = bf16_count + 1
+            }
+        }
+
+        // INT8 check: both bytes independently in reasonable int8 range
+        // All values 0-255 are valid uint8; for signed int8 the pattern
+        // is that values cluster near 0 or are uniformly distributed
+        if hi < 128 {
+            if lo < 128 {
+                let int8_count = int8_count + 1
+            }
+        }
+
+        let sample_count = sample_count + 1
+        let i = i + step
+    }
+
+    if sample_count == 0 {
+        return DTYPE_UNKNOWN
+    }
+
+    // If >80% of samples have valid bf16 exponents, call it bf16
+    let bf16_ratio = bf16_count * 100 / sample_count
+    if bf16_ratio > 80 {
+        return DTYPE_BF16
+    }
+
+    // If nearly all byte-pairs look like small integers, suspect INT8
+    let int8_ratio = int8_count * 100 / sample_count
+    if int8_ratio > 95 {
+        return DTYPE_INT8
+    }
+
+    return DTYPE_UNKNOWN
+}
+
+// ── Tensor audit ────────────────────────────────────────────────
+
+fn audit_check_tensor(name: string, data: array, size: int) -> DtypeEntry {
+    // Root cause: checks a single tensor's dtype by inspecting its raw bytes.
+    // The data array contains the first N bytes of the tensor for heuristic analysis.
+    let dtype = audit_detect_dtype(data)
+    let compliant = dtype_is_compliant(dtype, false)
+
+    let entry = DtypeEntry {
+        name: name,
+        dtype: dtype,
+        size_bytes: size,
+        compliant: compliant
+    }
+    return entry
+}
+
+fn _make_entry(name: string, dtype: string, size_bytes: int, strict: bool) -> DtypeEntry {
+    let compliant = dtype_is_compliant(dtype, strict)
+    let entry = DtypeEntry {
+        name: name,
+        dtype: dtype,
+        size_bytes: size_bytes,
+        compliant: compliant
+    }
+    return entry
+}
+
+// ── Main audit runner ───────────────────────────────────────────
+
+fn audit_run(config: DtypeAuditConfig) -> DtypeAuditResult {
+    // Root cause: scans model_path directory for weight files and checks each
+    // tensor's dtype. Currently operates on metadata/headers only — does not
+    // load full tensors into memory (edge-friendly).
+
+    let entries = []
+    let violations = []
+    let total_tensors = 0
+    let compliant_count = 0
+    let violation_count = 0
+    let total_bytes = 0
+    let bf16_bytes = 0
+    let f32_bytes = 0
+    let other_bytes = 0
+
+    // In a real deployment this would walk config.model_path and read
+    // safetensors/bin file headers. For now we return an empty result
+    // that the caller populates via audit_add_entry.
+
+    let gate_pass = true
+    if violation_count > 0 {
+        let gate_pass = false
+    }
+
+    let result = DtypeAuditResult {
+        total_tensors: total_tensors,
+        compliant_count: compliant_count,
+        violation_count: violation_count,
+        entries: entries,
+        total_bytes: total_bytes,
+        bf16_bytes: bf16_bytes,
+        f32_bytes: f32_bytes,
+        other_bytes: other_bytes,
+        gate_pass: gate_pass,
+        violations: violations
+    }
+    return result
+}
+
+fn audit_add_entry(result: DtypeAuditResult, name: string, dtype: string, size_bytes: int, strict: bool) -> DtypeAuditResult {
+    // Root cause: allows incremental construction of audit results.
+    // Each entry is checked for compliance and accumulated into totals.
+    let entry = _make_entry(name, dtype, size_bytes, strict)
+
+    let new_total = result.total_tensors + 1
+    let new_compliant = result.compliant_count
+    let new_violation = result.violation_count
+    let new_total_bytes = result.total_bytes + size_bytes
+    let new_bf16_bytes = result.bf16_bytes
+    let new_f32_bytes = result.f32_bytes
+    let new_other_bytes = result.other_bytes
+    let new_violations = result.violations
+
+    if entry.compliant == true {
+        let new_compliant = new_compliant + 1
+    } else {
+        let new_violation = new_violation + 1
+        let msg = "VIOLATION: " + name + " is " + dtype + " (" + str(size_bytes) + " bytes) — quantization BANNED (DD103)"
+        // Root cause: hexa lists are pass-by-value; we must build inline.
+        let new_violations = result.violations + [msg]
+    }
+
+    if dtype == DTYPE_BF16 {
+        let new_bf16_bytes = new_bf16_bytes + size_bytes
+    } else {
+        if dtype == DTYPE_F32 {
+            let new_f32_bytes = new_f32_bytes + size_bytes
+        } else {
+            if dtype == DTYPE_F64 {
+                let new_f32_bytes = new_f32_bytes + size_bytes  // count f64 with f32 bucket
+            } else {
+                let new_other_bytes = new_other_bytes + size_bytes
+            }
+        }
+    }
+
+    let new_entries = result.entries + [entry]
+
+    let gate_pass = true
+    if new_violation > 0 {
+        let gate_pass = false
+    }
+
+    let updated = DtypeAuditResult {
+        total_tensors: new_total,
+        compliant_count: new_compliant,
+        violation_count: new_violation,
+        entries: new_entries,
+        total_bytes: new_total_bytes,
+        bf16_bytes: new_bf16_bytes,
+        f32_bytes: new_f32_bytes,
+        other_bytes: new_other_bytes,
+        gate_pass: gate_pass,
+        violations: new_violations
+    }
+    return updated
+}
+
+// ── Gate pass ───────────────────────────────────────────────────
+
+fn audit_gate_pass(result: DtypeAuditResult) -> bool {
+    // Gate E5-5: dtype audit PASS required for deployment.
+    // ANY violation means FAIL — zero tolerance for quantization.
+    if result.violation_count > 0 {
+        return false
+    }
+    if result.total_tensors == 0 {
+        // Root cause: empty audit is not a pass — must have scanned something.
+        return false
+    }
+    return true
+}
+
+// ── Report ──────────────────────────────────────────────────────
+
+fn audit_report(result: DtypeAuditResult) -> string {
+    let sep = "================================================================"
+    let out = sep + "\n"
+    let out = out + "  DTYPE AUDIT REPORT — Zero-Quantization Policy (DD103)\n"
+    let out = out + sep + "\n\n"
+
+    let out = out + "  Total tensors:   " + str(result.total_tensors) + "\n"
+    let out = out + "  Compliant:       " + str(result.compliant_count) + "\n"
+    let out = out + "  Violations:      " + str(result.violation_count) + "\n\n"
+
+    let total_mb = result.total_bytes / 1048576
+    let bf16_mb = result.bf16_bytes / 1048576
+    let f32_mb = result.f32_bytes / 1048576
+    let other_mb = result.other_bytes / 1048576
+
+    let out = out + "  Total size:      " + str(total_mb) + " MB\n"
+    let out = out + "  bf16:            " + str(bf16_mb) + " MB\n"
+    let out = out + "  f32/f64:         " + str(f32_mb) + " MB\n"
+    let out = out + "  other (banned):  " + str(other_mb) + " MB\n\n"
+
+    if result.violation_count > 0 {
+        let out = out + "  --- VIOLATIONS ---\n"
+        let vi = 0
+        while vi < len(result.violations) {
+            let out = out + "  " + result.violations[vi] + "\n"
+            let vi = vi + 1
+        }
+        let out = out + "\n"
+    }
+
+    if result.gate_pass == true {
+        let out = out + "  GATE E5-5: PASS\n"
+    } else {
+        let out = out + "  GATE E5-5: *** FAIL ***\n"
+        let out = out + "  Deployment BLOCKED until all violations are resolved.\n"
+    }
+
+    let out = out + sep + "\n"
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Self-tests (8 tests)
+//  Run: hexa serving/edge/dtype_audit.hexa
+// ═══════════════════════════════════════════════════════════════
+
+fn test_dtype_compliance() -> int {
+    // Test 1: bf16 is always compliant
+    let pass_count = 0
+
+    let c1 = dtype_is_compliant(DTYPE_BF16, false)
+    if c1 == true {
+        let pass_count = pass_count + 1
+        println("[PASS] test_dtype_compliance: bf16 compliant (non-strict)")
+    } else {
+        println("[FAIL] test_dtype_compliance: bf16 should be compliant")
+    }
+
+    let c2 = dtype_is_compliant(DTYPE_BF16, true)
+    if c2 == true {
+        let pass_count = pass_count + 1
+        println("[PASS] test_dtype_compliance: bf16 compliant (strict)")
+    } else {
+        println("[FAIL] test_dtype_compliance: bf16 should be compliant in strict")
+    }
+
+    return pass_count
+}
+
+fn test_f32_compliance() -> int {
+    // Test 2: f32 compliant only in non-strict mode
+    let pass_count = 0
+
+    let c1 = dtype_is_compliant(DTYPE_F32, false)
+    if c1 == true {
+        let pass_count = pass_count + 1
+        println("[PASS] test_f32_compliance: f32 compliant (non-strict)")
+    } else {
+        println("[FAIL] test_f32_compliance: f32 should be compliant in non-strict")
+    }
+
+    let c2 = dtype_is_compliant(DTYPE_F32, true)
+    if c2 == false {
+        let pass_count = pass_count + 1
+        println("[PASS] test_f32_compliance: f32 rejected (strict)")
+    } else {
+        println("[FAIL] test_f32_compliance: f32 should be rejected in strict mode")
+    }
+
+    return pass_count
+}
+
+fn test_quantized_rejected() -> int {
+    // Test 3: all quantized formats are rejected
+    let pass_count = 0
+
+    let r1 = dtype_is_compliant(DTYPE_INT8, false)
+    if r1 == false {
+        let pass_count = pass_count + 1
+        println("[PASS] test_quantized_rejected: INT8 rejected")
+    } else {
+        println("[FAIL] test_quantized_rejected: INT8 should be rejected")
+    }
+
+    let r2 = dtype_is_compliant(DTYPE_INT4, false)
+    if r2 == false {
+        let pass_count = pass_count + 1
+        println("[PASS] test_quantized_rejected: INT4 rejected")
+    } else {
+        println("[FAIL] test_quantized_rejected: INT4 should be rejected")
+    }
+
+    let r3 = dtype_is_compliant(DTYPE_FP8, false)
+    if r3 == false {
+        let pass_count = pass_count + 1
+        println("[PASS] test_quantized_rejected: FP8 rejected")
+    } else {
+        println("[FAIL] test_quantized_rejected: FP8 should be rejected")
+    }
+
+    let r4 = dtype_is_compliant(DTYPE_GPTQ, false)
+    if r4 == false {
+        let pass_count = pass_count + 1
+        println("[PASS] test_quantized_rejected: GPTQ rejected")
+    } else {
+        println("[FAIL] test_quantized_rejected: GPTQ should be rejected")
+    }
+
+    let r5 = dtype_is_compliant(DTYPE_AWQ, false)
+    if r5 == false {
+        let pass_count = pass_count + 1
+        println("[PASS] test_quantized_rejected: AWQ rejected")
+    } else {
+        println("[FAIL] test_quantized_rejected: AWQ should be rejected")
+    }
+
+    let r6 = dtype_is_compliant(DTYPE_BNB, false)
+    if r6 == false {
+        let pass_count = pass_count + 1
+        println("[PASS] test_quantized_rejected: bnb rejected")
+    } else {
+        println("[FAIL] test_quantized_rejected: bnb should be rejected")
+    }
+
+    return pass_count
+}
+
+fn test_is_quantized_flag() -> int {
+    // Test 4: dtype_is_quantized correctly identifies banned formats
+    let pass_count = 0
+
+    let q1 = dtype_is_quantized(DTYPE_INT8)
+    if q1 == true {
+        let pass_count = pass_count + 1
+        println("[PASS] test_is_quantized: INT8 detected as quantized")
+    } else {
+        println("[FAIL] test_is_quantized: INT8 should be quantized")
+    }
+
+    let q2 = dtype_is_quantized(DTYPE_BF16)
+    if q2 == false {
+        let pass_count = pass_count + 1
+        println("[PASS] test_is_quantized: bf16 not quantized")
+    } else {
+        println("[FAIL] test_is_quantized: bf16 should not be quantized")
+    }
+
+    let q3 = dtype_is_quantized(DTYPE_F32)
+    if q3 == false {
+        let pass_count = pass_count + 1
+        println("[PASS] test_is_quantized: f32 not quantized")
+    } else {
+        println("[FAIL] test_is_quantized: f32 should not be quantized")
+    }
+
+    return pass_count
+}
+
+fn test_detect_safetensors_bf16() -> int {
+    // Test 5: detect bf16 from fake safetensors header
+    // Simulated header: 8-byte length + "BF16" at offset 10
+    let header = [32, 0, 0, 0, 0, 0, 0, 0, 123, 34, 66, 70, 49, 54, 34, 125]
+    //            ^-- hdr_size=32 (LE)        '{' '"' 'B'  'F' '1' '6' '"' '}'
+    let dtype = audit_detect_dtype(header)
+    if dtype == DTYPE_BF16 {
+        println("[PASS] test_detect_safetensors_bf16: detected bf16 from header")
+        return 1
+    } else {
+        println("[FAIL] test_detect_safetensors_bf16: expected bf16, got " + dtype)
+        return 0
+    }
+}
+
+fn test_detect_safetensors_f32() -> int {
+    // Test 6: detect f32 from fake safetensors header
+    let header = [32, 0, 0, 0, 0, 0, 0, 0, 123, 34, 70, 51, 50, 34, 125, 0]
+    //            ^-- hdr_size=32 (LE)        '{' '"' 'F'  '3' '2' '"' '}' pad
+    let dtype = audit_detect_dtype(header)
+    if dtype == DTYPE_F32 {
+        println("[PASS] test_detect_safetensors_f32: detected f32 from header")
+        return 1
+    } else {
+        println("[FAIL] test_detect_safetensors_f32: expected f32, got " + dtype)
+        return 0
+    }
+}
+
+fn test_audit_result_all_clean() -> int {
+    // Test 7: audit result with only bf16 tensors passes gate
+    let config = audit_config_default("/tmp/test_model")
+    let result = audit_run(config)
+
+    // Add clean bf16 entries
+    let result = audit_add_entry(result, "layer_0.attn.qkv", DTYPE_BF16, 2097152, false)
+    let result = audit_add_entry(result, "layer_0.attn.out", DTYPE_BF16, 1048576, false)
+    let result = audit_add_entry(result, "layer_0.ffn.w1", DTYPE_BF16, 4194304, false)
+
+    let gate = audit_gate_pass(result)
+    if gate == true {
+        if result.violation_count == 0 {
+            if result.total_tensors == 3 {
+                println("[PASS] test_audit_result_all_clean: 3 bf16 tensors, gate PASS")
+                return 1
+            }
+        }
+    }
+    println("[FAIL] test_audit_result_all_clean: expected gate PASS with 0 violations")
+    return 0
+}
+
+fn test_audit_result_with_violation() -> int {
+    // Test 8: audit result with INT8 tensor fails gate
+    let config = audit_config_default("/tmp/test_model")
+    let result = audit_run(config)
+
+    let result = audit_add_entry(result, "layer_0.attn.qkv", DTYPE_BF16, 2097152, false)
+    let result = audit_add_entry(result, "layer_1.ffn.w1", DTYPE_INT8, 524288, false)
+    let result = audit_add_entry(result, "layer_2.attn.out", DTYPE_BF16, 1048576, false)
+
+    let gate = audit_gate_pass(result)
+    if gate == false {
+        if result.violation_count == 1 {
+            if len(result.violations) == 1 {
+                println("[PASS] test_audit_result_with_violation: INT8 tensor detected, gate FAIL")
+                return 1
+            }
+        }
+    }
+    println("[FAIL] test_audit_result_with_violation: expected gate FAIL with 1 violation, got v=" + str(result.violation_count))
+    return 0
+}
+
+// ── Main ────────────────────────────────────────────────────────
+
+fn main() {
+    println("═══ dtype_audit.hexa — self-tests ═══\n")
+
+    let total = 0
+    let passed = 0
+
+    // Test 1-2: bf16 compliance (2 checks)
+    let t1 = test_dtype_compliance()
+    let total = total + 2
+    let passed = passed + t1
+
+    // Test 3-4: f32 compliance (2 checks)
+    let t2 = test_f32_compliance()
+    let total = total + 2
+    let passed = passed + t2
+
+    // Test 5: quantized rejection (6 checks)
+    let t3 = test_quantized_rejected()
+    let total = total + 6
+    let passed = passed + t3
+
+    // Test 6: is_quantized flag (3 checks)
+    let t4 = test_is_quantized_flag()
+    let total = total + 3
+    let passed = passed + t4
+
+    // Test 7: safetensors bf16 detection
+    let t5 = test_detect_safetensors_bf16()
+    let total = total + 1
+    let passed = passed + t5
+
+    // Test 8: safetensors f32 detection
+    let t6 = test_detect_safetensors_f32()
+    let total = total + 1
+    let passed = passed + t6
+
+    // Test 9: clean audit passes gate
+    let t7 = test_audit_result_all_clean()
+    let total = total + 1
+    let passed = passed + t7
+
+    // Test 10: violation fails gate
+    let t8 = test_audit_result_with_violation()
+    let total = total + 1
+    let passed = passed + t8
+
+    println("\n═══ Results: " + str(passed) + "/" + str(total) + " checks passed ═══")
+
+    if passed == total {
+        println("Gate E5-5 dtype audit: ALL PASS")
+    } else {
+        let failed = total - passed
+        println("Gate E5-5 dtype audit: " + str(failed) + " FAILED")
+    }
+}
+
+main()

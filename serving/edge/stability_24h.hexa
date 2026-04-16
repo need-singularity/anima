@@ -1,0 +1,645 @@
+// serving/edge/stability_24h.hexa — 24-hour stability test harness for M4 edge server
+// Gate E5-4: 24h stable operation, RSS drift < 100MB
+//
+// Monitors: RSS drift, thermal throttling, response degradation, error rate.
+// M4 22W TDP — Mini chassis adequate cooling but sustained load may throttle.
+//
+// Usage:
+//   let cfg = stability_config_default()
+//   let report = stability_run(cfg)
+//   let ascii = stability_report_ascii(report)
+//   println(ascii)
+//   let pass = report.gate_pass
+
+// ─── Config ─────────────────────────────────────────────────────────
+
+struct StabilityConfig {
+    edge_url: string,
+    duration_hours: int,
+    sample_interval_s: int,
+    report_interval_s: int,
+    test_prompt: string,
+    max_tokens: int,
+    rss_drift_threshold_mb: float,
+    latency_degradation_pct: float
+}
+
+fn stability_config_default() -> StabilityConfig {
+    let cfg = StabilityConfig {
+        edge_url: "http://localhost:8090",
+        duration_hours: 24,
+        sample_interval_s: 60,
+        report_interval_s: 3600,
+        test_prompt: "Explain consciousness in one sentence.",
+        max_tokens: 50,
+        rss_drift_threshold_mb: 100.0,
+        latency_degradation_pct: 20.0
+    }
+    return cfg
+}
+
+// ─── Snapshot ───────────────────────────────────────────────────────
+
+struct StabilitySnapshot {
+    timestamp_s: int,
+    rss_mb: float,
+    tok_per_sec: float,
+    ms_per_tok: float,
+    error_count: int,
+    thermal_throttle: bool
+}
+
+fn snapshot_new(ts: int, rss: float, tps: float, mpt: float, errs: int, throttle: bool) -> StabilitySnapshot {
+    let s = StabilitySnapshot {
+        timestamp_s: ts,
+        rss_mb: rss,
+        tok_per_sec: tps,
+        ms_per_tok: mpt,
+        error_count: errs,
+        thermal_throttle: throttle
+    }
+    return s
+}
+
+// ─── Report ─────────────────────────────────────────────────────────
+
+struct StabilityReport {
+    total_hours: float,
+    total_requests: int,
+    total_errors: int,
+    rss_start_mb: float,
+    rss_end_mb: float,
+    rss_peak_mb: float,
+    rss_drift_mb: float,
+    avg_tok_s: float,
+    min_tok_s: float,
+    max_tok_s: float,
+    thermal_throttle_count: int,
+    gate_pass: bool,
+    snapshots: array
+}
+
+fn report_empty() -> StabilityReport {
+    let r = StabilityReport {
+        total_hours: 0.0,
+        total_requests: 0,
+        total_errors: 0,
+        rss_start_mb: 0.0,
+        rss_end_mb: 0.0,
+        rss_peak_mb: 0.0,
+        rss_drift_mb: 0.0,
+        avg_tok_s: 0.0,
+        min_tok_s: 999999.0,
+        max_tok_s: 0.0,
+        thermal_throttle_count: 0,
+        gate_pass: false,
+        snapshots: []
+    }
+    return r
+}
+
+// ─── Live monitoring helpers ────────────────────────────────────────
+
+// read_process_rss_mb — reads RSS of the edge server process via /proc or sysctl
+// returns RSS in MB, or -1.0 on error
+fn read_process_rss_mb(edge_url: string) -> float {
+    // HTTP GET /health endpoint returns JSON with rss_bytes field
+    // fallback: parse `ps aux` output for the edge server process
+    let resp = http_get(edge_url + "/health")
+    if resp.status != 200 {
+        return -1.0
+    }
+    // parse rss_bytes from health response
+    let rss_bytes = json_get_int(resp.body, "rss_bytes")
+    if rss_bytes <= 0 {
+        return -1.0
+    }
+    let rss_mb = to_float(rss_bytes) / 1048576.0
+    return rss_mb
+}
+
+// check_thermal_throttle — queries edge /health for thermal state
+// M4 throttles at ~100C junction temp, reports via health endpoint
+fn check_thermal_throttle(edge_url: string) -> bool {
+    let resp = http_get(edge_url + "/health")
+    if resp.status != 200 {
+        return false
+    }
+    let throttled = json_get_bool(resp.body, "thermal_throttle")
+    return throttled
+}
+
+// send_test_request — fires a single inference request, returns (tok/s, ms/tok, error)
+struct InferenceResult {
+    tok_per_sec: float,
+    ms_per_tok: float,
+    is_error: bool
+}
+
+fn send_test_request(config: StabilityConfig) -> InferenceResult {
+    let start_ms = time_ms()
+    let resp = http_post(config.edge_url + "/generate", "{\"prompt\":\"" + config.test_prompt + "\",\"max_tokens\":" + to_string(config.max_tokens) + "}")
+    let end_ms = time_ms()
+
+    if resp.status != 200 {
+        let err_result = InferenceResult {
+            tok_per_sec: 0.0,
+            ms_per_tok: 0.0,
+            is_error: true
+        }
+        return err_result
+    }
+
+    let elapsed_ms = end_ms - start_ms
+    let tokens_generated = json_get_int(resp.body, "tokens_generated")
+    if tokens_generated <= 0 {
+        tokens_generated = config.max_tokens
+    }
+
+    let ms_per_tok = to_float(elapsed_ms) / to_float(tokens_generated)
+    let tok_per_sec = 0.0
+    if ms_per_tok > 0.0 {
+        tok_per_sec = 1000.0 / ms_per_tok
+    }
+
+    let result = InferenceResult {
+        tok_per_sec: tok_per_sec,
+        ms_per_tok: ms_per_tok,
+        is_error: false
+    }
+    return result
+}
+
+// ─── Snapshot capture ───────────────────────────────────────────────
+
+fn stability_take_snapshot(config: StabilityConfig) -> StabilitySnapshot {
+    let ts = time_s()
+    let rss = read_process_rss_mb(config.edge_url)
+    let throttle = check_thermal_throttle(config.edge_url)
+    let infer = send_test_request(config)
+
+    let err_count = 0
+    if infer.is_error {
+        err_count = 1
+    }
+
+    let snap = StabilitySnapshot {
+        timestamp_s: ts,
+        rss_mb: rss,
+        tok_per_sec: infer.tok_per_sec,
+        ms_per_tok: infer.ms_per_tok,
+        error_count: err_count,
+        thermal_throttle: throttle
+    }
+    return snap
+}
+
+// ─── Gate checks ────────────────────────────────────────────────────
+
+// stability_check_drift — RSS drift < threshold (E5-4 gate: < 100MB)
+fn stability_check_drift(report: StabilityReport) -> bool {
+    if report.rss_drift_mb < report.rss_drift_mb {
+        // degenerate: use threshold from config default
+    }
+    // drift is absolute difference: end - start
+    // pass if drift < threshold (set during report build)
+    return report.rss_drift_mb < 100.0
+}
+
+// stability_check_drift_with_threshold — explicit threshold version
+fn stability_check_drift_with_threshold(report: StabilityReport, threshold_mb: float) -> bool {
+    return report.rss_drift_mb < threshold_mb
+}
+
+// stability_check_degradation — latency did not degrade beyond threshold
+// compares min_tok_s (baseline, typically early) vs final snapshots
+fn stability_check_degradation(report: StabilityReport) -> bool {
+    // if max_tok_s is 0 there were no successful requests
+    if report.max_tok_s <= 0.0 {
+        return false
+    }
+    // degradation = (max_tok_s - min_tok_s) / max_tok_s * 100
+    // a large spread means significant degradation
+    let spread_pct = (report.max_tok_s - report.min_tok_s) / report.max_tok_s * 100.0
+    return spread_pct < 20.0
+}
+
+// stability_check_degradation_pct — configurable degradation threshold
+fn stability_check_degradation_pct(report: StabilityReport, threshold_pct: float) -> bool {
+    if report.max_tok_s <= 0.0 {
+        return false
+    }
+    let spread_pct = (report.max_tok_s - report.min_tok_s) / report.max_tok_s * 100.0
+    return spread_pct < threshold_pct
+}
+
+// ─── Report builders ────────────────────────────────────────────────
+
+// build_report_from_snapshots — aggregate snapshots into a final report
+fn build_report_from_snapshots(snapshots: array, config: StabilityConfig, elapsed_hours: float) -> StabilityReport {
+    let n = len(snapshots)
+    if n == 0 {
+        return report_empty()
+    }
+
+    let total_errors = 0
+    let throttle_count = 0
+    let sum_tok_s = 0.0
+    let min_tok_s = 999999.0
+    let max_tok_s = 0.0
+    let rss_peak = 0.0
+
+    let first_snap = snapshots[0]
+    let rss_start = first_snap.rss_mb
+
+    let i = 0
+    while i < n {
+        let snap = snapshots[i]
+        total_errors = total_errors + snap.error_count
+
+        if snap.thermal_throttle {
+            throttle_count = throttle_count + 1
+        }
+
+        if snap.tok_per_sec > 0.0 {
+            sum_tok_s = sum_tok_s + snap.tok_per_sec
+            if snap.tok_per_sec < min_tok_s {
+                min_tok_s = snap.tok_per_sec
+            }
+            if snap.tok_per_sec > max_tok_s {
+                max_tok_s = snap.tok_per_sec
+            }
+        }
+
+        if snap.rss_mb > rss_peak {
+            rss_peak = snap.rss_mb
+        }
+
+        i = i + 1
+    }
+
+    let last_snap = snapshots[n - 1]
+    let rss_end = last_snap.rss_mb
+    let rss_drift = rss_end - rss_start
+
+    // absolute drift for gate check
+    let drift_abs = rss_drift
+    if drift_abs < 0.0 {
+        drift_abs = 0.0 - drift_abs
+    }
+
+    let avg_tok_s = 0.0
+    let valid_count = n - total_errors
+    if valid_count > 0 {
+        avg_tok_s = sum_tok_s / to_float(valid_count)
+    }
+
+    if min_tok_s > 999998.0 {
+        min_tok_s = 0.0
+    }
+
+    // gate E5-4: 24h stable, RSS drift < threshold, no crash
+    let drift_ok = drift_abs < config.rss_drift_threshold_mb
+    let degrade_ok = true
+    if max_tok_s > 0.0 {
+        let spread = (max_tok_s - min_tok_s) / max_tok_s * 100.0
+        if spread >= config.latency_degradation_pct {
+            degrade_ok = false
+        }
+    }
+    let error_ratio = to_float(total_errors) / to_float(n)
+    let error_ok = error_ratio < 0.01
+    let gate = drift_ok && degrade_ok && error_ok
+
+    let report = StabilityReport {
+        total_hours: elapsed_hours,
+        total_requests: n,
+        total_errors: total_errors,
+        rss_start_mb: rss_start,
+        rss_end_mb: rss_end,
+        rss_peak_mb: rss_peak,
+        rss_drift_mb: drift_abs,
+        avg_tok_s: avg_tok_s,
+        min_tok_s: min_tok_s,
+        max_tok_s: max_tok_s,
+        thermal_throttle_count: throttle_count,
+        gate_pass: gate,
+        snapshots: snapshots
+    }
+    return report
+}
+
+// ─── Main run loop ──────────────────────────────────────────────────
+
+fn stability_run(config: StabilityConfig) -> StabilityReport {
+    let duration_s = config.duration_hours * 3600
+    let start_s = time_s()
+    let end_s = start_s + duration_s
+
+    let mut snapshots = []
+    let mut last_report_s = start_s
+    let mut sample_count = 0
+
+    println("=== stability_24h: starting " + to_string(config.duration_hours) + "h test ===")
+    println("    target: " + config.edge_url)
+    println("    sample every " + to_string(config.sample_interval_s) + "s, report every " + to_string(config.report_interval_s) + "s")
+    println("    RSS drift threshold: " + to_string(config.rss_drift_threshold_mb) + " MB")
+    println("    latency degradation threshold: " + to_string(config.latency_degradation_pct) + "%")
+    println("")
+
+    while time_s() < end_s {
+        let snap = stability_take_snapshot(config)
+        snapshots = append(snapshots, snap)
+        sample_count = sample_count + 1
+
+        // hourly report
+        let now = time_s()
+        if (now - last_report_s) >= config.report_interval_s {
+            let elapsed_h = to_float(now - start_s) / 3600.0
+            let interim = build_report_from_snapshots(snapshots, config, elapsed_h)
+            println("--- hour " + to_string(to_int(elapsed_h)) + " ---")
+            println("  samples: " + to_string(sample_count))
+            println("  RSS: " + to_string(interim.rss_end_mb) + " MB (drift " + to_string(interim.rss_drift_mb) + " MB)")
+            println("  tok/s: avg=" + to_string(interim.avg_tok_s) + " min=" + to_string(interim.min_tok_s) + " max=" + to_string(interim.max_tok_s))
+            println("  errors: " + to_string(interim.total_errors) + "  throttle: " + to_string(interim.thermal_throttle_count))
+            println("")
+            last_report_s = now
+        }
+
+        // early abort on catastrophic failure (10+ consecutive errors)
+        if sample_count >= 10 {
+            let mut tail_errors = 0
+            let check_start = len(snapshots) - 10
+            let j = check_start
+            while j < len(snapshots) {
+                let cs = snapshots[j]
+                if cs.error_count > 0 {
+                    tail_errors = tail_errors + 1
+                }
+                j = j + 1
+            }
+            if tail_errors >= 10 {
+                println("!!! ABORT: 10 consecutive errors — server likely crashed !!!")
+                let elapsed_h = to_float(time_s() - start_s) / 3600.0
+                let abort_report = build_report_from_snapshots(snapshots, config, elapsed_h)
+                return abort_report
+            }
+        }
+
+        sleep_s(config.sample_interval_s)
+    }
+
+    let total_elapsed_h = to_float(time_s() - start_s) / 3600.0
+    let final_report = build_report_from_snapshots(snapshots, config, total_elapsed_h)
+
+    println("=== stability_24h: COMPLETE ===")
+    println(stability_report_ascii(final_report))
+
+    return final_report
+}
+
+// ─── ASCII report ───────────────────────────────────────────────────
+
+fn stability_report_ascii(report: StabilityReport) -> string {
+    let gate_str = "FAIL"
+    if report.gate_pass {
+        gate_str = "PASS"
+    }
+
+    let s = ""
+    s = s + "+----------------------------------------------+\n"
+    s = s + "|  24h Stability Report — Gate E5-4            |\n"
+    s = s + "+----------------------------------------------+\n"
+    s = s + "| Duration          | " + fmt_pad(to_string(report.total_hours) + " h", 22) + " |\n"
+    s = s + "| Total requests    | " + fmt_pad(to_string(report.total_requests), 22) + " |\n"
+    s = s + "| Total errors      | " + fmt_pad(to_string(report.total_errors), 22) + " |\n"
+    s = s + "+----------------------------------------------+\n"
+    s = s + "| RSS start         | " + fmt_pad(to_string(report.rss_start_mb) + " MB", 22) + " |\n"
+    s = s + "| RSS end           | " + fmt_pad(to_string(report.rss_end_mb) + " MB", 22) + " |\n"
+    s = s + "| RSS peak          | " + fmt_pad(to_string(report.rss_peak_mb) + " MB", 22) + " |\n"
+    s = s + "| RSS drift         | " + fmt_pad(to_string(report.rss_drift_mb) + " MB", 22) + " |\n"
+    s = s + "+----------------------------------------------+\n"
+    s = s + "| tok/s avg         | " + fmt_pad(to_string(report.avg_tok_s), 22) + " |\n"
+    s = s + "| tok/s min         | " + fmt_pad(to_string(report.min_tok_s), 22) + " |\n"
+    s = s + "| tok/s max         | " + fmt_pad(to_string(report.max_tok_s), 22) + " |\n"
+    s = s + "+----------------------------------------------+\n"
+    s = s + "| Thermal throttle  | " + fmt_pad(to_string(report.thermal_throttle_count) + " events", 22) + " |\n"
+    s = s + "| Gate E5-4         | " + fmt_pad(gate_str, 22) + " |\n"
+    s = s + "+----------------------------------------------+\n"
+    return s
+}
+
+fn fmt_pad(val: string, width: int) -> string {
+    let s = val
+    while len(s) < width {
+        s = s + " "
+    }
+    return s
+}
+
+// ─── JSON report ────────────────────────────────────────────────────
+
+fn stability_report_json(report: StabilityReport) -> string {
+    let gate_str = "false"
+    if report.gate_pass {
+        gate_str = "true"
+    }
+
+    let s = "{\n"
+    s = s + "  \"total_hours\": " + to_string(report.total_hours) + ",\n"
+    s = s + "  \"total_requests\": " + to_string(report.total_requests) + ",\n"
+    s = s + "  \"total_errors\": " + to_string(report.total_errors) + ",\n"
+    s = s + "  \"rss_start_mb\": " + to_string(report.rss_start_mb) + ",\n"
+    s = s + "  \"rss_end_mb\": " + to_string(report.rss_end_mb) + ",\n"
+    s = s + "  \"rss_peak_mb\": " + to_string(report.rss_peak_mb) + ",\n"
+    s = s + "  \"rss_drift_mb\": " + to_string(report.rss_drift_mb) + ",\n"
+    s = s + "  \"avg_tok_s\": " + to_string(report.avg_tok_s) + ",\n"
+    s = s + "  \"min_tok_s\": " + to_string(report.min_tok_s) + ",\n"
+    s = s + "  \"max_tok_s\": " + to_string(report.max_tok_s) + ",\n"
+    s = s + "  \"thermal_throttle_count\": " + to_string(report.thermal_throttle_count) + ",\n"
+    s = s + "  \"gate_pass\": " + gate_str + ",\n"
+    s = s + "  \"snapshot_count\": " + to_string(len(report.snapshots)) + "\n"
+    s = s + "}"
+    return s
+}
+
+// ─── Self-tests ─────────────────────────────────────────────────────
+
+fn test_stability_all() {
+    println("=== stability_24h self-tests ===")
+    let mut pass = 0
+    let mut fail = 0
+
+    // test 1: config default produces valid values
+    let cfg = stability_config_default()
+    if cfg.duration_hours == 24 && cfg.sample_interval_s == 60 && cfg.rss_drift_threshold_mb > 0.0 {
+        println("  [PASS] test_config_default")
+        pass = pass + 1
+    } else {
+        println("  [FAIL] test_config_default")
+        fail = fail + 1
+    }
+
+    // test 2: drift detection — under threshold (should PASS gate)
+    let mock_snaps_ok = []
+    let s0 = snapshot_new(0, 400.0, 25.0, 40.0, 0, false)
+    let s1 = snapshot_new(3600, 410.0, 24.5, 40.8, 0, false)
+    let s2 = snapshot_new(7200, 420.0, 24.0, 41.6, 0, false)
+    let s3 = snapshot_new(86400, 450.0, 23.5, 42.5, 0, false)
+    mock_snaps_ok = append(mock_snaps_ok, s0)
+    mock_snaps_ok = append(mock_snaps_ok, s1)
+    mock_snaps_ok = append(mock_snaps_ok, s2)
+    mock_snaps_ok = append(mock_snaps_ok, s3)
+    let report_ok = build_report_from_snapshots(mock_snaps_ok, cfg, 24.0)
+    // drift = 450 - 400 = 50 MB < 100 MB threshold
+    if stability_check_drift(report_ok) && report_ok.rss_drift_mb < 100.0 {
+        println("  [PASS] test_drift_under_threshold")
+        pass = pass + 1
+    } else {
+        println("  [FAIL] test_drift_under_threshold — drift=" + to_string(report_ok.rss_drift_mb))
+        fail = fail + 1
+    }
+
+    // test 3: drift detection — over threshold (should FAIL gate)
+    let mock_snaps_leak = []
+    let l0 = snapshot_new(0, 400.0, 25.0, 40.0, 0, false)
+    let l1 = snapshot_new(43200, 480.0, 24.0, 41.6, 0, false)
+    let l2 = snapshot_new(86400, 620.0, 23.0, 43.4, 0, false)
+    mock_snaps_leak = append(mock_snaps_leak, l0)
+    mock_snaps_leak = append(mock_snaps_leak, l1)
+    mock_snaps_leak = append(mock_snaps_leak, l2)
+    let report_leak = build_report_from_snapshots(mock_snaps_leak, cfg, 24.0)
+    // drift = 620 - 400 = 220 MB > 100 MB threshold
+    if !stability_check_drift(report_leak) && report_leak.rss_drift_mb > 100.0 {
+        println("  [PASS] test_drift_over_threshold")
+        pass = pass + 1
+    } else {
+        println("  [FAIL] test_drift_over_threshold — drift=" + to_string(report_leak.rss_drift_mb))
+        fail = fail + 1
+    }
+
+    // test 4: latency degradation detection — stable (small spread)
+    // max=25, min=23.5 => spread = 1.5/25 * 100 = 6% < 20%
+    if stability_check_degradation(report_ok) {
+        println("  [PASS] test_degradation_stable")
+        pass = pass + 1
+    } else {
+        println("  [FAIL] test_degradation_stable")
+        fail = fail + 1
+    }
+
+    // test 5: latency degradation detection — degraded
+    let mock_snaps_slow = []
+    let d0 = snapshot_new(0, 400.0, 30.0, 33.3, 0, false)
+    let d1 = snapshot_new(43200, 420.0, 20.0, 50.0, 0, false)
+    let d2 = snapshot_new(86400, 430.0, 10.0, 100.0, 0, false)
+    mock_snaps_slow = append(mock_snaps_slow, d0)
+    mock_snaps_slow = append(mock_snaps_slow, d1)
+    mock_snaps_slow = append(mock_snaps_slow, d2)
+    let report_slow = build_report_from_snapshots(mock_snaps_slow, cfg, 24.0)
+    // max=30, min=10 => spread = 20/30 * 100 = 66.7% > 20%
+    if !stability_check_degradation(report_slow) {
+        println("  [PASS] test_degradation_detected")
+        pass = pass + 1
+    } else {
+        println("  [FAIL] test_degradation_detected")
+        fail = fail + 1
+    }
+
+    // test 6: thermal throttle counting
+    let mock_snaps_hot = []
+    let h0 = snapshot_new(0, 400.0, 25.0, 40.0, 0, false)
+    let h1 = snapshot_new(3600, 410.0, 24.0, 41.6, 0, true)
+    let h2 = snapshot_new(7200, 420.0, 23.0, 43.4, 0, true)
+    let h3 = snapshot_new(10800, 415.0, 24.5, 40.8, 0, false)
+    mock_snaps_hot = append(mock_snaps_hot, h0)
+    mock_snaps_hot = append(mock_snaps_hot, h1)
+    mock_snaps_hot = append(mock_snaps_hot, h2)
+    mock_snaps_hot = append(mock_snaps_hot, h3)
+    let report_hot = build_report_from_snapshots(mock_snaps_hot, cfg, 3.0)
+    if report_hot.thermal_throttle_count == 2 {
+        println("  [PASS] test_thermal_throttle_count")
+        pass = pass + 1
+    } else {
+        println("  [FAIL] test_thermal_throttle_count — got " + to_string(report_hot.thermal_throttle_count))
+        fail = fail + 1
+    }
+
+    // test 7: error counting and gate fail on high error rate
+    let mock_snaps_err = []
+    let e0 = snapshot_new(0, 400.0, 25.0, 40.0, 1, false)
+    let e1 = snapshot_new(60, 400.0, 0.0, 0.0, 1, false)
+    let e2 = snapshot_new(120, 400.0, 0.0, 0.0, 1, false)
+    mock_snaps_err = append(mock_snaps_err, e0)
+    mock_snaps_err = append(mock_snaps_err, e1)
+    mock_snaps_err = append(mock_snaps_err, e2)
+    let report_err = build_report_from_snapshots(mock_snaps_err, cfg, 0.05)
+    // 3/3 = 100% error rate >> 1% threshold => gate_pass = false
+    if report_err.total_errors == 3 && !report_err.gate_pass {
+        println("  [PASS] test_error_rate_gate_fail")
+        pass = pass + 1
+    } else {
+        println("  [FAIL] test_error_rate_gate_fail — errors=" + to_string(report_err.total_errors) + " gate=" + to_string(report_err.gate_pass))
+        fail = fail + 1
+    }
+
+    // test 8: ASCII report generation (non-empty, contains gate status)
+    let ascii = stability_report_ascii(report_ok)
+    if len(ascii) > 100 {
+        println("  [PASS] test_ascii_report_nonempty")
+        pass = pass + 1
+    } else {
+        println("  [FAIL] test_ascii_report_nonempty — len=" + to_string(len(ascii)))
+        fail = fail + 1
+    }
+
+    // test 9: JSON report generation
+    let json = stability_report_json(report_ok)
+    if len(json) > 50 {
+        println("  [PASS] test_json_report_nonempty")
+        pass = pass + 1
+    } else {
+        println("  [FAIL] test_json_report_nonempty — len=" + to_string(len(json)))
+        fail = fail + 1
+    }
+
+    // test 10: RSS peak tracking
+    // snapshots: 400, 410, 420, 450 => peak should be 450
+    if report_ok.rss_peak_mb >= 450.0 {
+        println("  [PASS] test_rss_peak_tracking")
+        pass = pass + 1
+    } else {
+        println("  [FAIL] test_rss_peak_tracking — peak=" + to_string(report_ok.rss_peak_mb))
+        fail = fail + 1
+    }
+
+    println("")
+    println("  total: " + to_string(pass) + "/" + to_string(pass + fail) + " passed")
+    if fail > 0 {
+        println("  !!! " + to_string(fail) + " FAILURES !!!")
+    }
+}
+
+// ─── Entry ──────────────────────────────────────────────────────────
+
+fn main() {
+    let args = argv()
+    if len(args) > 1 {
+        if args[1] == "--test" {
+            test_stability_all()
+            return
+        }
+        if args[1] == "--url" && len(args) > 2 {
+            let mut cfg = stability_config_default()
+            cfg.edge_url = args[2]
+            let report = stability_run(cfg)
+            println(stability_report_ascii(report))
+            return
+        }
+    }
+    // default: run full 24h test against localhost
+    let cfg = stability_config_default()
+    let report = stability_run(cfg)
+    println(stability_report_ascii(report))
+    println(stability_report_json(report))
+}
