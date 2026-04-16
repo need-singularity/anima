@@ -759,6 +759,16 @@ def train(args):
 
         # ── Checkpoint ──
         if step > 0 and step % save_every == 0:
+            # PRE-SAVE ROTATION — delete old ckpts BEFORE save to prevent MFS quota hit
+            # (RunPod MFS has ~47GB session quota invisible to df)
+            existing = sorted(ckpt_dir.glob("step_*"), key=lambda p: int(p.name.split("_")[1]))
+            # Keep only latest 1 before adding new one (total 2 after save)
+            import shutil
+            while len(existing) > 1:
+                old = existing.pop(0)
+                shutil.rmtree(old, ignore_errors=True)
+                print(f"[ckpt] pre-save rotated old ckpt: {old.name}", flush=True)
+
             spath = ckpt_dir / f"step_{step}"
             spath.mkdir(exist_ok=True)
             torch.save({
@@ -776,15 +786,6 @@ def train(args):
             }, spath / "checkpoint.pt")
             print(f"[ckpt] saved step {step} -> {spath}", flush=True)
             upload_to_r2(str(spath), model_tag, round_num, step)
-
-            # Local checkpoint rotation: keep last 3
-            existing = sorted(ckpt_dir.glob("step_*"), key=lambda p: int(p.name.split("_")[1]))
-            while len(existing) > 3:
-                old = existing.pop(0)
-                if old != spath:
-                    import shutil
-                    shutil.rmtree(old, ignore_errors=True)
-                    print(f"[ckpt] removed old local ckpt: {old.name}", flush=True)
 
         # ── Phase transition logging ──
         p1_end = steps // 5
