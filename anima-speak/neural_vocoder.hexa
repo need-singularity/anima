@@ -86,7 +86,7 @@ fn vec_zeros(n: int) -> [float] {
     let mut out = []
     let mut i = 0
     while i < n {
-        out = out + [0.0]
+        out = out.push(0.0)
         i = i + 1
     }
     return out
@@ -106,7 +106,7 @@ fn linear_proj(x: [float], W: [float], b: [float], in_dim: int, out_dim: int) ->
             s = s + W[i * in_dim + j] * x[j]
             j = j + 1
         }
-        y = y + [s]
+        y = y.push(s)
         i = i + 1
     }
     return y
@@ -118,7 +118,7 @@ fn tanh_vec(x: [float]) -> [float] {
     let mut y = []
     let mut i = 0
     while i < len(x) {
-        y = y + [tanh(x[i])]
+        y = y.push(tanh(x[i]))
         i = i + 1
     }
     return y
@@ -135,9 +135,9 @@ fn mock_weight_identity(in_dim: int, out_dim: int) -> [float] {
         let mut i = 0
         while i < in_dim {
             if i % out_dim == o {
-                W = W + [1.0 / to_float(in_dim / out_dim)]
+                W = W.push(1.0 / to_float(in_dim / out_dim))
             } else {
-                W = W + [0.0]
+                W = W.push(0.0)
             }
             i = i + 1
         }
@@ -184,7 +184,7 @@ fn load_w_ctrl(path: string) -> [float] {
         if c == "," {
             if len(buf) > 0 {
                 let v = parse_float(buf)
-                W = W + [v]
+                W = W.push(v)
                 buf = ""
             }
         } else if c == " " || c == "\n" || c == "\r" || c == "\t" {
@@ -197,7 +197,7 @@ fn load_w_ctrl(path: string) -> [float] {
     // Last value
     if len(buf) > 0 {
         let v = parse_float(buf)
-        W = W + [v]
+        W = W.push(v)
     }
     if len(W) != CTRL_DIM * LATENT_DIM {
         println("[neural_vocoder] checkpoint size mismatch: " + to_string(len(W))
@@ -289,7 +289,7 @@ fn synth_additive(ctrl_frames: [[float]], n_samples: int) -> [float] {
             p = p + 1
         }
 
-        out = out + [s]
+        out = out.push(s)
         t = t + 1
     }
     return out
@@ -338,6 +338,13 @@ let mut _hxcuda_probe_state = 0
 // Returns true iff libhxcuda is loadable on this host AND the STFT
 // kernels are present (version >=1). Probes once per run and caches
 // the result. Honours HXCUDA_DISABLE=1 as a kill-switch.
+//
+// Mac safety: calling a null __ffi_sym_* on the codegen_c2 path is UB.
+// To avoid this we require HXCUDA_ENABLE=1 as an explicit opt-in flag,
+// which the Linux build sets before launch (see speak_e2e / deploy
+// scripts). Without the flag we short-circuit to OFFLINE without ever
+// touching the extern symbol — making Mac smoke runs safe even after
+// libhxcuda.dylib never ships for macOS.
 fn hxcuda_available() -> bool {
     if _hxcuda_probe_state == 1 { return true }
     if _hxcuda_probe_state == -1 { return false }
@@ -348,17 +355,25 @@ fn hxcuda_available() -> bool {
         _hxcuda_probe_state = -1
         return false
     }
-    // Probe: calling hxcuda_stft_version() returns 1 on Linux with
-    // libhxcuda.so loaded, 0 on Mac (dlsym returned NULL → default).
-    // On codegen_c2 path, NULL fn_ptr call returns 0 via void-ret wrapping;
-    // version >=1 is the live check.
+    // Opt-in gate: only probe when the deploy side has confirmed that
+    // libhxcuda is present on this host. The Linux pod launcher sets
+    // HXCUDA_ENABLE=1; Mac never does → probe never touches the extern.
+    let enable = env("HXCUDA_ENABLE")
+    if enable != "1" {
+        println("[neural_vocoder] Stage C OFFLINE — HXCUDA_ENABLE unset (Mac smoke default)")
+        _hxcuda_probe_state = -1
+        return false
+    }
+    // Live probe (Linux pod path): hxcuda_stft_version() returns 1 when
+    // libhxcuda.so is loaded. Requires LD_LIBRARY_PATH to include the
+    // hexa-lang/self/native/build directory.
     let v = hxcuda_stft_version()
     if v >= 1 {
         println("[neural_vocoder] Stage C ONLINE — libhxcuda loaded, hxcuda_stft_version=" + to_string(v))
         _hxcuda_probe_state = 1
         return true
     }
-    println("[neural_vocoder] Stage C OFFLINE — libhxcuda not loadable (Mac path or missing .so)")
+    println("[neural_vocoder] Stage C OFFLINE — probe returned " + to_string(v))
     _hxcuda_probe_state = -1
     return false
 }
@@ -418,7 +433,7 @@ fn decode_wave(latent_frames: [[float]], sample_rate: int) -> [float] {
     let mut f = 0
     while f < n_frames {
         let c = latent_to_ctrl(latent_frames[f], W_ctrl)
-        ctrl_frames = ctrl_frames + [c]
+        ctrl_frames = ctrl_frames.push(c)
         f = f + 1
     }
 
@@ -583,10 +598,10 @@ fn make_demo_latent(n_frames: int) -> [[float]] {
             // Slow drift across frames + per-dim wave
             let phase = (to_float(f) * 0.07) + (to_float(j) * 0.025)
             let v = 0.5 * sin(phase) + 0.2 * sin(phase * 2.7)
-            row = row + [v]
+            row = row.push(v)
             j = j + 1
         }
-        frames = frames + [row]
+        frames = frames.push(row)
         f = f + 1
     }
     return frames

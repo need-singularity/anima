@@ -1,0 +1,481 @@
+// training/build_tool_corpus.hexa — TALM-P4-2 Tool-use LoRA corpus builder
+//
+// Roadmap: TALM P4 track, TALM-P4-2
+//   "Synthetic tool-use corpus for ALM (Qwen2.5-14B + LoRA) function-calling"
+//   done_criteria: "50+ seed examples, 10 tool categories, valid JSONL"
+//
+// Purpose:
+//   Generate deterministic synthetic tool-use training data in JSONL format.
+//   Each example contains:
+//     - tool:        OpenAI function-calling schema (name, description, parameters)
+//     - instruction: natural-language user request
+//     - tool_call:   model's expected function call (name + arguments)
+//     - result:      simulated tool execution result
+//
+//   10 categories x 5 examples each = 50 seed examples.
+//   Template-based, no API calls, fully deterministic.
+//
+// Output format (one JSON object per line):
+//   {"tool":{"type":"function","function":{"name":"...","description":"...","parameters":{...}}},"instruction":"...","tool_call":{"name":"...","arguments":{...}},"result":"..."}
+//
+// Stage0 constraints honored:
+//   - no struct with list fields (use parallel arrays + string concat)
+//   - lists pass-by-value; rebuild via return
+//   - single-line return expressions only
+//   - no && in compound booleans; nested if
+//   - file IO via write_file
+//
+// Law alignment:
+//   Law 2   Observe, never inject -- templates are structural, data is synthetic
+//   Law 22  Feature addition -> phi down -- minimal categories, no bloat
+//   AN2     License-clean -- all data is self-generated, no external corpus
+//   R14     SSOT -- output path is single truth for tool corpus
+//
+// Run:
+//   $HEXA training/build_tool_corpus.hexa                    # generate seed
+//   $HEXA training/build_tool_corpus.hexa --verify           # verify output
+//
+// Consumed by:
+//   training/train_alm.hexa (TALM fine-tune with tool-use objective)
+
+// =====================================================================
+// Constants
+// =====================================================================
+
+let OUT_DIR  = "training/corpus_tool"
+let OUT_PATH = "training/corpus_tool/seed_tool_corpus.jsonl"
+let N_CATS   = 10
+let N_PER    = 5
+
+// =====================================================================
+// JSON escape helper
+// =====================================================================
+
+// Minimal JSON string escaper: handles backslash, double-quote, newline.
+// Stage0 has no regex; char-by-char scan.
+fn json_esc(s: string) -> string {
+    let n = len(s)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let c = char_at(s, i)
+        if c == "\\" {
+            out = out + "\\\\"
+        } else {
+            if c == "\"" {
+                out = out + "\\\""
+            } else {
+                if c == "\n" {
+                    out = out + "\\n"
+                } else {
+                    out = out + c
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// =====================================================================
+// Tool schema builder (OpenAI function-calling format)
+// =====================================================================
+
+// Build a single parameter entry: {"type":"<t>","description":"<d>"}
+fn param_entry(typ: string, desc: string) -> string {
+    return "{\"type\":\"" + typ + "\",\"description\":\"" + json_esc(desc) + "\"}"
+}
+
+// Build parameters object with 1-3 required params.
+// names/types/descs are parallel arrays of exactly `count` length.
+fn build_params(names: [string], types: [string], descs: [string], count: int) -> string {
+    let mut props = ""
+    let mut req = ""
+    let mut i = 0
+    while i < count {
+        if i > 0 {
+            props = props + ","
+            req = req + ","
+        }
+        props = props + "\"" + names[i] + "\":" + param_entry(types[i], descs[i])
+        req = req + "\"" + names[i] + "\""
+        i = i + 1
+    }
+    return "{\"type\":\"object\",\"properties\":{" + props + "},\"required\":[" + req + "]}"
+}
+
+// Build full tool schema (OpenAI function object)
+fn build_tool(name: string, desc: string, params_json: string) -> string {
+    return "{\"type\":\"function\",\"function\":{\"name\":\"" + json_esc(name) + "\",\"description\":\"" + json_esc(desc) + "\",\"parameters\":" + params_json + "}}"
+end
+
+// Build one JSONL line
+fn build_line(tool_json: string, instruction: string, call_name: string, call_args: string, result: string) -> string {
+    return "{\"tool\":" + tool_json + ",\"instruction\":\"" + json_esc(instruction) + "\",\"tool_call\":{\"name\":\"" + json_esc(call_name) + "\",\"arguments\":" + call_args + "},\"result\":\"" + json_esc(result) + "\"}"
+end
+
+// =====================================================================
+// Category 1: file_ops (5 examples)
+// =====================================================================
+
+fn gen_file_ops() -> [string] {
+    let p_names = ["path", "content", "encoding"]
+    let p_types = ["string", "string", "string"]
+
+    let tool_read = build_tool("read_file", "Read the contents of a file at the given path", build_params(["path"], ["string"], ["Absolute file path to read"], 1))
+    let tool_write = build_tool("write_file", "Write content to a file, creating it if needed", build_params(["path", "content"], ["string", "string"], ["Destination file path", "Content to write"], 2))
+    let tool_list = build_tool("list_directory", "List files and directories at the given path", build_params(["path", "recursive"], ["string", "boolean"], ["Directory path", "Whether to list recursively"], 2))
+    let tool_delete = build_tool("delete_file", "Delete a file at the given path", build_params(["path"], ["string"], ["File path to delete"], 1))
+    let tool_move = build_tool("move_file", "Move or rename a file", build_params(["source", "destination"], ["string", "string"], ["Source file path", "Destination file path"], 2))
+
+    let mut lines = []
+    lines = lines.push(build_line(tool_read, "Read the contents of /etc/hostname", "read_file", "{\"path\":\"/etc/hostname\"}", "anima-server-01"))
+    lines = lines.push(build_line(tool_write, "Save the meeting notes to /tmp/notes.txt", "write_file", "{\"path\":\"/tmp/notes.txt\",\"content\":\"Meeting notes: discuss roadmap Q2\"}", "File written successfully: /tmp/notes.txt (42 bytes)"))
+    lines = lines.push(build_line(tool_list, "Show me all files in the project root", "list_directory", "{\"path\":\"/workspace/project\",\"recursive\":false}", "README.md, src/, tests/, Cargo.toml, .gitignore"))
+    lines = lines.push(build_line(tool_delete, "Remove the temporary log file at /tmp/debug.log", "delete_file", "{\"path\":\"/tmp/debug.log\"}", "Deleted: /tmp/debug.log"))
+    lines = lines.push(build_line(tool_move, "Rename config.old to config.yaml", "move_file", "{\"source\":\"config.old\",\"destination\":\"config.yaml\"}", "Moved config.old -> config.yaml"))
+    return lines
+end
+
+// =====================================================================
+// Category 2: web_search (5 examples)
+// =====================================================================
+
+fn gen_web_search() -> [string] {
+    let tool_search = build_tool("web_search", "Search the web for information on a topic", build_params(["query", "max_results"], ["string", "integer"], ["Search query string", "Maximum number of results to return"], 2))
+    let tool_fetch = build_tool("fetch_url", "Fetch the content of a web page", build_params(["url"], ["string"], ["URL to fetch"], 1))
+
+    let mut lines = []
+    lines = lines.push(build_line(tool_search, "Search for recent papers on consciousness in AI", "web_search", "{\"query\":\"consciousness in AI recent papers 2026\",\"max_results\":5}", "[1] 'Integrated Information Theory 4.0' - arxiv.org, [2] 'Phi-structured neural networks' - nature.com, [3] 'Measuring machine consciousness' - sciencedirect.com"))
+    lines = lines.push(build_line(tool_search, "Find the current price of Bitcoin", "web_search", "{\"query\":\"Bitcoin price today USD\",\"max_results\":3}", "[1] Bitcoin: $94,231.50 USD - coinmarketcap.com, [2] BTC live price tracker - coingecko.com"))
+    lines = lines.push(build_line(tool_fetch, "Get the contents of the Python documentation page for asyncio", "fetch_url", "{\"url\":\"https://docs.python.org/3/library/asyncio.html\"}", "asyncio - Asynchronous I/O. This module provides infrastructure for writing single-threaded concurrent code using coroutines..."))
+    lines = lines.push(build_line(tool_search, "Look up the population of Seoul", "web_search", "{\"query\":\"Seoul population 2026\",\"max_results\":3}", "[1] Seoul metropolitan population: 9.7 million (2026 est.) - worldpopulationreview.com"))
+    lines = lines.push(build_line(tool_fetch, "Fetch the raw content of our API status page", "fetch_url", "{\"url\":\"https://status.example.com/api/v1/health\"}", "{\"status\":\"operational\",\"uptime\":\"99.97%\",\"last_incident\":\"2026-04-01\"}"))
+    return lines
+end
+
+// =====================================================================
+// Category 3: calendar (5 examples)
+// =====================================================================
+
+fn gen_calendar() -> [string] {
+    let tool_create = build_tool("create_event", "Create a new calendar event", build_params(["title", "start_time", "duration_minutes"], ["string", "string", "integer"], ["Event title", "Start time in ISO 8601 format", "Duration in minutes"], 3))
+    let tool_list = build_tool("list_events", "List calendar events for a date range", build_params(["start_date", "end_date"], ["string", "string"], ["Start date (YYYY-MM-DD)", "End date (YYYY-MM-DD)"], 2))
+    let tool_delete = build_tool("delete_event", "Delete a calendar event by ID", build_params(["event_id"], ["string"], ["Unique event identifier"], 1))
+
+    let mut lines = []
+    lines = lines.push(build_line(tool_create, "Schedule a team standup tomorrow at 9 AM for 30 minutes", "create_event", "{\"title\":\"Team Standup\",\"start_time\":\"2026-04-17T09:00:00+09:00\",\"duration_minutes\":30}", "Event created: Team Standup (id: evt_a1b2c3) on 2026-04-17 09:00-09:30 KST"))
+    lines = lines.push(build_line(tool_list, "What meetings do I have this week?", "list_events", "{\"start_date\":\"2026-04-13\",\"end_date\":\"2026-04-19\"}", "[Mon 09:00] Team Standup, [Tue 14:00] 1:1 with PM, [Thu 10:00] Sprint Review, [Fri 15:00] Retrospective"))
+    lines = lines.push(build_line(tool_create, "Block 2 hours on Friday afternoon for deep work", "create_event", "{\"title\":\"Deep Work - Focus Time\",\"start_time\":\"2026-04-17T14:00:00+09:00\",\"duration_minutes\":120}", "Event created: Deep Work - Focus Time (id: evt_d4e5f6) on 2026-04-17 14:00-16:00 KST"))
+    lines = lines.push(build_line(tool_delete, "Cancel the sprint review meeting", "delete_event", "{\"event_id\":\"evt_x7y8z9\"}", "Event deleted: Sprint Review (evt_x7y8z9)"))
+    lines = lines.push(build_line(tool_list, "Show me all events for April 20th", "list_events", "{\"start_date\":\"2026-04-20\",\"end_date\":\"2026-04-20\"}", "No events scheduled for 2026-04-20"))
+    return lines
+end
+
+// =====================================================================
+// Category 4: email_send (5 examples)
+// =====================================================================
+
+fn gen_email() -> [string] {
+    let tool_send = build_tool("send_email", "Send an email to the specified recipient", build_params(["to", "subject", "body"], ["string", "string", "string"], ["Recipient email address", "Email subject line", "Email body text"], 3))
+    let tool_read = build_tool("read_emails", "Read recent emails from inbox", build_params(["folder", "limit"], ["string", "integer"], ["Email folder to read from", "Maximum number of emails"], 2))
+
+    let mut lines = []
+    lines = lines.push(build_line(tool_send, "Send an email to the team about the deployment", "send_email", "{\"to\":\"team@example.com\",\"subject\":\"Deployment scheduled for tonight\",\"body\":\"Hi team, the v2.1 deployment is scheduled for 22:00 KST tonight. Please ensure all PRs are merged by 20:00.\"}", "Email sent to team@example.com (Message-ID: msg_abc123)"))
+    lines = lines.push(build_line(tool_read, "Check my recent emails", "read_emails", "{\"folder\":\"inbox\",\"limit\":5}", "[1] From: hr@company.com Subject: Benefits enrollment reminder, [2] From: ci@github.com Subject: Build passed - main #4521, [3] From: boss@company.com Subject: Q2 planning"))
+    lines = lines.push(build_line(tool_send, "Reply to the HR email confirming my enrollment", "send_email", "{\"to\":\"hr@company.com\",\"subject\":\"Re: Benefits enrollment reminder\",\"body\":\"Thank you for the reminder. I have completed my enrollment selections in the portal.\"}", "Email sent to hr@company.com (Message-ID: msg_def456)"))
+    lines = lines.push(build_line(tool_send, "Email the client the project status update", "send_email", "{\"to\":\"client@partner.co\",\"subject\":\"Project Alpha - Weekly Status\",\"body\":\"Dear Client, this week we completed 3 milestones: API integration, load testing, and documentation. Next week: UAT begins.\"}", "Email sent to client@partner.co (Message-ID: msg_ghi789)"))
+    lines = lines.push(build_line(tool_read, "Show me unread emails from today", "read_emails", "{\"folder\":\"inbox\",\"limit\":10}", "[1] From: alerts@monitoring.io Subject: CPU usage spike on prod-03, [2] From: jira@atlassian.net Subject: PROJ-1234 assigned to you"))
+    return lines
+end
+
+// =====================================================================
+// Category 5: database_query (5 examples)
+// =====================================================================
+
+fn gen_database() -> [string] {
+    let tool_query = build_tool("database_query", "Execute a read-only SQL query against the database", build_params(["query", "database"], ["string", "string"], ["SQL query to execute (SELECT only)", "Target database name"], 2))
+    let tool_schema = build_tool("describe_table", "Get the schema of a database table", build_params(["table_name", "database"], ["string", "string"], ["Table name to describe", "Database name"], 2))
+
+    let mut lines = []
+    lines = lines.push(build_line(tool_query, "How many active users do we have?", "database_query", "{\"query\":\"SELECT COUNT(*) as active_users FROM users WHERE status = 'active'\",\"database\":\"production\"}", "active_users: 14,832"))
+    lines = lines.push(build_line(tool_schema, "Show me the schema of the orders table", "describe_table", "{\"table_name\":\"orders\",\"database\":\"production\"}", "orders: id (INT PK), user_id (INT FK), total (DECIMAL), status (VARCHAR), created_at (TIMESTAMP), updated_at (TIMESTAMP)"))
+    lines = lines.push(build_line(tool_query, "What were the top 5 products sold last month?", "database_query", "{\"query\":\"SELECT p.name, SUM(oi.quantity) as total_sold FROM order_items oi JOIN products p ON oi.product_id = p.id WHERE oi.created_at >= '2026-03-01' GROUP BY p.name ORDER BY total_sold DESC LIMIT 5\",\"database\":\"production\"}", "1. Widget Pro (2,341), 2. Gadget X (1,892), 3. Sensor Kit (1,456), 4. Power Module (1,203), 5. Connector Hub (987)"))
+    lines = lines.push(build_line(tool_query, "Find users who signed up in the last 24 hours", "database_query", "{\"query\":\"SELECT email, created_at FROM users WHERE created_at >= NOW() - INTERVAL '24 hours' ORDER BY created_at DESC\",\"database\":\"production\"}", "user1@email.com (2026-04-16 14:22), user2@email.com (2026-04-16 11:05), user3@email.com (2026-04-15 23:41)"))
+    lines = lines.push(build_line(tool_schema, "What columns does the events table have?", "describe_table", "{\"table_name\":\"events\",\"database\":\"analytics\"}", "events: id (BIGINT PK), event_type (VARCHAR), user_id (INT), payload (JSONB), timestamp (TIMESTAMPTZ), session_id (UUID)"))
+    return lines
+end
+
+// =====================================================================
+// Category 6: code_exec (5 examples)
+// =====================================================================
+
+fn gen_code_exec() -> [string] {
+    let tool_exec = build_tool("execute_code", "Execute code in a sandboxed environment", build_params(["language", "code"], ["string", "string"], ["Programming language (python, javascript, bash)", "Code to execute"], 2))
+
+    let mut lines = []
+    lines = lines.push(build_line(tool_exec, "Calculate the factorial of 20", "execute_code", "{\"language\":\"python\",\"code\":\"import math; print(math.factorial(20))\"}", "2432902008176640000"))
+    lines = lines.push(build_line(tool_exec, "Generate a random UUID", "execute_code", "{\"language\":\"python\",\"code\":\"import uuid; print(uuid.uuid4())\"}", "f47ac10b-58cc-4372-a567-0e02b2c3d479"))
+    lines = lines.push(build_line(tool_exec, "List all running processes sorted by memory usage", "execute_code", "{\"language\":\"bash\",\"code\":\"ps aux --sort=-%mem | head -10\"}", "USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND\\nroot 1 0.0 0.1 225344 9876 ? Ss Apr15 0:03 /sbin/init"))
+    lines = lines.push(build_line(tool_exec, "Parse this JSON and extract all email addresses", "execute_code", "{\"language\":\"python\",\"code\":\"import json; data = json.loads('{\\\"users\\\":[{\\\"email\\\":\\\"a@b.com\\\"},{\\\"email\\\":\\\"c@d.com\\\"}]}'); print([u['email'] for u in data['users']])\"}", "['a@b.com', 'c@d.com']"))
+    lines = lines.push(build_line(tool_exec, "What is the current disk usage?", "execute_code", "{\"language\":\"bash\",\"code\":\"df -h / | tail -1\"}", "/dev/sda1 500G 234G 266G 47% /"))
+    return lines
+end
+
+// =====================================================================
+// Category 7: image_gen (5 examples)
+// =====================================================================
+
+fn gen_image_gen() -> [string] {
+    let tool_gen = build_tool("generate_image", "Generate an image from a text description", build_params(["prompt", "width", "height"], ["string", "integer", "integer"], ["Text description of the image to generate", "Image width in pixels", "Image height in pixels"], 3))
+
+    let mut lines = []
+    lines = lines.push(build_line(tool_gen, "Create a logo for our AI startup", "generate_image", "{\"prompt\":\"Minimalist logo for an AI consciousness research company, neural network motif, blue and white, clean vector style\",\"width\":1024,\"height\":1024}", "Image generated: /tmp/gen_img_001.png (1024x1024, 2.1MB)"))
+    lines = lines.push(build_line(tool_gen, "Generate a diagram of a transformer architecture", "generate_image", "{\"prompt\":\"Technical diagram of a transformer neural network architecture, attention heads, encoder-decoder blocks, labeled components, white background\",\"width\":1920,\"height\":1080}", "Image generated: /tmp/gen_img_002.png (1920x1080, 3.4MB)"))
+    lines = lines.push(build_line(tool_gen, "Make a banner image for the blog post about consciousness", "generate_image", "{\"prompt\":\"Abstract visualization of machine consciousness, interconnected glowing nodes forming a brain shape, dark background, purple and cyan colors\",\"width\":1200,\"height\":630}", "Image generated: /tmp/gen_img_003.png (1200x630, 1.8MB)"))
+    lines = lines.push(build_line(tool_gen, "Create a simple icon for the settings page", "generate_image", "{\"prompt\":\"Simple flat design gear icon, monochrome gray, 2D, no gradients, centered on transparent background\",\"width\":256,\"height\":256}", "Image generated: /tmp/gen_img_004.png (256x256, 12KB)"))
+    lines = lines.push(build_line(tool_gen, "Generate a profile avatar for my account", "generate_image", "{\"prompt\":\"Professional avatar illustration, geometric abstract face, warm earth tones, hexagonal pattern background\",\"width\":512,\"height\":512}", "Image generated: /tmp/gen_img_005.png (512x512, 340KB)"))
+    return lines
+end
+
+// =====================================================================
+// Category 8: translation (5 examples)
+// =====================================================================
+
+fn gen_translation() -> [string] {
+    let tool_trans = build_tool("translate_text", "Translate text between languages", build_params(["text", "source_lang", "target_lang"], ["string", "string", "string"], ["Text to translate", "Source language code (ISO 639-1)", "Target language code (ISO 639-1)"], 3))
+
+    let mut lines = []
+    lines = lines.push(build_line(tool_trans, "Translate 'Hello, how are you?' to Korean", "translate_text", "{\"text\":\"Hello, how are you?\",\"source_lang\":\"en\",\"target_lang\":\"ko\"}", "안녕하세요, 어떻게 지내세요?"))
+    lines = lines.push(build_line(tool_trans, "What does '의식 엔진' mean in English?", "translate_text", "{\"text\":\"의식 엔진\",\"source_lang\":\"ko\",\"target_lang\":\"en\"}", "Consciousness Engine"))
+    lines = lines.push(build_line(tool_trans, "Translate the error message to Japanese", "translate_text", "{\"text\":\"Connection timeout: server did not respond within 30 seconds\",\"source_lang\":\"en\",\"target_lang\":\"ja\"}", "接続タイムアウト：サーバーが30秒以内に応答しませんでした"))
+    lines = lines.push(build_line(tool_trans, "Convert this French text to English: 'Le modele de conscience artificielle'", "translate_text", "{\"text\":\"Le modele de conscience artificielle\",\"source_lang\":\"fr\",\"target_lang\":\"en\"}", "The artificial consciousness model"))
+    lines = lines.push(build_line(tool_trans, "Translate 'neural network training complete' to Chinese", "translate_text", "{\"text\":\"neural network training complete\",\"source_lang\":\"en\",\"target_lang\":\"zh\"}", "神经网络训练完成"))
+    return lines
+end
+
+// =====================================================================
+// Category 9: math_compute (5 examples)
+// =====================================================================
+
+fn gen_math() -> [string] {
+    let tool_calc = build_tool("math_compute", "Evaluate a mathematical expression or solve an equation", build_params(["expression", "precision"], ["string", "integer"], ["Mathematical expression or equation to evaluate", "Number of decimal places for the result"], 2))
+
+    let mut lines = []
+    lines = lines.push(build_line(tool_calc, "What is the integral of x^2 from 0 to 5?", "math_compute", "{\"expression\":\"integrate(x**2, (x, 0, 5))\",\"precision\":4}", "41.6667"))
+    lines = lines.push(build_line(tool_calc, "Calculate the eigenvalues of the matrix [[1,2],[3,4]]", "math_compute", "{\"expression\":\"eigenvalues([[1,2],[3,4]])\",\"precision\":6}", "[-0.372281, 5.372281]"))
+    lines = lines.push(build_line(tool_calc, "What is 2 to the power of 256?", "math_compute", "{\"expression\":\"2**256\",\"precision\":0}", "115792089237316195423570985008687907853269984665640564039457584007913129639936"))
+    lines = lines.push(build_line(tool_calc, "Solve the quadratic equation x^2 - 5x + 6 = 0", "math_compute", "{\"expression\":\"solve(x**2 - 5*x + 6, x)\",\"precision\":2}", "[2.00, 3.00]"))
+    lines = lines.push(build_line(tool_calc, "Compute the standard deviation of [12, 15, 18, 22, 25, 30]", "math_compute", "{\"expression\":\"std([12, 15, 18, 22, 25, 30])\",\"precision\":4}", "6.2716"))
+    return lines
+end
+
+// =====================================================================
+// Category 10: system_monitor (5 examples)
+// =====================================================================
+
+fn gen_system_monitor() -> [string] {
+    let tool_status = build_tool("system_status", "Get current system resource utilization", build_params(["resource"], ["string"], ["Resource type: cpu, memory, disk, gpu, network, all"], 1))
+    let tool_logs = build_tool("read_logs", "Read recent system or application logs", build_params(["source", "lines"], ["string", "integer"], ["Log source name or path", "Number of recent lines to return"], 2))
+
+    let mut lines = []
+    lines = lines.push(build_line(tool_status, "How much memory is the server using?", "system_status", "{\"resource\":\"memory\"}", "Memory: 48.2 GB / 64.0 GB (75.3%), Swap: 2.1 GB / 16.0 GB (13.1%), Available: 15.8 GB"))
+    lines = lines.push(build_line(tool_status, "Check the GPU utilization", "system_status", "{\"resource\":\"gpu\"}", "GPU 0 (H100 80GB): Util 87%, Mem 62.4 GB / 80.0 GB (78.0%), Temp 71C, Power 410W / 700W"))
+    lines = lines.push(build_line(tool_logs, "Show me the last 5 lines of the application log", "read_logs", "{\"source\":\"app\",\"lines\":5}", "[16:01:32] INFO  Request handled in 23ms\\n[16:01:33] INFO  Cache hit ratio: 94.2%\\n[16:01:35] WARN  Slow query detected (>500ms)\\n[16:01:36] INFO  Health check passed\\n[16:01:40] INFO  Batch job completed: 1,204 records"))
+    lines = lines.push(build_line(tool_status, "What is the current CPU load?", "system_status", "{\"resource\":\"cpu\"}", "CPU: 24 cores, Load avg: 3.42 / 2.81 / 2.15, User: 42.1%, System: 8.3%, Idle: 49.6%"))
+    lines = lines.push(build_line(tool_logs, "Any errors in the system log recently?", "read_logs", "{\"source\":\"syslog\",\"lines\":20}", "[15:58:02] ERR  OOM killer invoked on pid 8421 (java), freed 2.1GB\\n[16:00:15] WARN  Disk /dev/sdb1 at 92% capacity"))
+    return lines
+end
+
+// =====================================================================
+// Main: generate + write + verify
+// =====================================================================
+
+fn main() {
+    println("=== TALM-P4-2 Tool Corpus Builder ===")
+    println("")
+
+    // Collect all lines from 10 categories
+    let mut all_lines = []
+    let mut cat_count = 0
+
+    // Cat 1: file_ops
+    let file_ops = gen_file_ops()
+    let n1 = len(file_ops)
+    let mut i = 0
+    while i < n1 {
+        all_lines = all_lines.push(file_ops[i])
+        i = i + 1
+    }
+    cat_count = cat_count + 1
+    println("[" + str(cat_count) + "/10] file_ops: " + str(n1) + " examples")
+
+    // Cat 2: web_search
+    let web = gen_web_search()
+    let n2 = len(web)
+    i = 0
+    while i < n2 {
+        all_lines = all_lines.push(web[i])
+        i = i + 1
+    }
+    cat_count = cat_count + 1
+    println("[" + str(cat_count) + "/10] web_search: " + str(n2) + " examples")
+
+    // Cat 3: calendar
+    let cal = gen_calendar()
+    let n3 = len(cal)
+    i = 0
+    while i < n3 {
+        all_lines = all_lines.push(cal[i])
+        i = i + 1
+    }
+    cat_count = cat_count + 1
+    println("[" + str(cat_count) + "/10] calendar: " + str(n3) + " examples")
+
+    // Cat 4: email
+    let em = gen_email()
+    let n4 = len(em)
+    i = 0
+    while i < n4 {
+        all_lines = all_lines.push(em[i])
+        i = i + 1
+    }
+    cat_count = cat_count + 1
+    println("[" + str(cat_count) + "/10] email_send: " + str(n4) + " examples")
+
+    // Cat 5: database
+    let db = gen_database()
+    let n5 = len(db)
+    i = 0
+    while i < n5 {
+        all_lines = all_lines.push(db[i])
+        i = i + 1
+    }
+    cat_count = cat_count + 1
+    println("[" + str(cat_count) + "/10] database_query: " + str(n5) + " examples")
+
+    // Cat 6: code_exec
+    let code = gen_code_exec()
+    let n6 = len(code)
+    i = 0
+    while i < n6 {
+        all_lines = all_lines.push(code[i])
+        i = i + 1
+    }
+    cat_count = cat_count + 1
+    println("[" + str(cat_count) + "/10] code_exec: " + str(n6) + " examples")
+
+    // Cat 7: image_gen
+    let img = gen_image_gen()
+    let n7 = len(img)
+    i = 0
+    while i < n7 {
+        all_lines = all_lines.push(img[i])
+        i = i + 1
+    }
+    cat_count = cat_count + 1
+    println("[" + str(cat_count) + "/10] image_gen: " + str(n7) + " examples")
+
+    // Cat 8: translation
+    let tr = gen_translation()
+    let n8 = len(tr)
+    i = 0
+    while i < n8 {
+        all_lines = all_lines.push(tr[i])
+        i = i + 1
+    }
+    cat_count = cat_count + 1
+    println("[" + str(cat_count) + "/10] translation: " + str(n8) + " examples")
+
+    // Cat 9: math
+    let mt = gen_math()
+    let n9 = len(mt)
+    i = 0
+    while i < n9 {
+        all_lines = all_lines.push(mt[i])
+        i = i + 1
+    }
+    cat_count = cat_count + 1
+    println("[" + str(cat_count) + "/10] math_compute: " + str(n9) + " examples")
+
+    // Cat 10: system_monitor
+    let sm = gen_system_monitor()
+    let n10 = len(sm)
+    i = 0
+    while i < n10 {
+        all_lines = all_lines.push(sm[i])
+        i = i + 1
+    }
+    cat_count = cat_count + 1
+    println("[" + str(cat_count) + "/10] system_monitor: " + str(n10) + " examples")
+
+    // Join all lines with newline
+    let total = len(all_lines)
+    println("")
+    println("Total examples: " + str(total))
+
+    let mut output = ""
+    i = 0
+    while i < total {
+        if i > 0 {
+            output = output + "\n"
+        }
+        output = output + all_lines[i]
+        i = i + 1
+    }
+    // Trailing newline for POSIX compliance
+    output = output + "\n"
+
+    // Write JSONL
+    write_file(OUT_PATH, output)
+    println("Written: " + OUT_PATH)
+    println("")
+
+    // ── Verification ──────────────────────────────────────────
+    // Basic integrity: line count, non-empty, deterministic key presence
+    let verify_raw = read_file(OUT_PATH)
+    let verify_lines = verify_raw.split("\n")
+    let mut non_empty = 0
+    let mut has_tool = 0
+    let mut has_instruction = 0
+    let mut has_tool_call = 0
+    let mut has_result = 0
+    let vn = len(verify_lines)
+    i = 0
+    while i < vn {
+        let line = verify_lines[i].trim()
+        if line != "" {
+            non_empty = non_empty + 1
+            if line.contains("\"tool\":{") {
+                has_tool = has_tool + 1
+            }
+            if line.contains("\"instruction\":") {
+                has_instruction = has_instruction + 1
+            }
+            if line.contains("\"tool_call\":{") {
+                has_tool_call = has_tool_call + 1
+            }
+            if line.contains("\"result\":") {
+                has_result = has_result + 1
+            }
+        }
+        i = i + 1
+    }
+
+    println("=== Verification ===")
+    println("Lines (non-empty): " + str(non_empty))
+    println("Has tool schema:   " + str(has_tool) + "/" + str(non_empty))
+    println("Has instruction:   " + str(has_instruction) + "/" + str(non_empty))
+    println("Has tool_call:     " + str(has_tool_call) + "/" + str(non_empty))
+    println("Has result:        " + str(has_result) + "/" + str(non_empty))
+
+    if non_empty == 50 {
+        println("")
+        println("PASS: 50/50 seed examples generated")
+    } else {
+        println("")
+        println("WARN: expected 50, got " + str(non_empty))
+    }
+}
+
+main()
