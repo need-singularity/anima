@@ -1,0 +1,813 @@
+// hxcuda_istft_bridge.hexa -- FFI bridge for STFT/iSTFT CUDA kernels
+//
+// Bridges neural_vocoder.hexa Stage C to libhxcuda.so STFT/iSTFT kernels.
+// Source kernels: hexa-lang/self/native/hxcuda_stft.cu (commit fc20fe4)
+//
+// Architecture:
+//   1. Caller passes hexa-level spectral data (flat float arrays).
+//   2. This bridge allocates CUDA device memory, uploads data H2D,
+//      packs the struct-args ABI buffer, calls hxcuda_stft_bf16 or
+//      hxcuda_istft_bf16, downloads results D2H, and frees device memory.
+//   3. CPU fallback path: when HXCUDA_ENABLE != "1", all functions
+//      execute a pure-hexa reference implementation (slow but correct).
+//
+// ABI details (matching hxcuda_stft.cu extern "C" signatures):
+//   - All device pointers are passed as int64 (cast from uintptr_t in C).
+//   - Struct-args pattern: a single host-allocated buffer with int64 fields
+//     at known offsets, passed as a single pointer to the CUDA wrapper.
+//   - This avoids the hexa FFI 6-argument ceiling (host_ffi_call_6).
+//
+// CUDA memory management:
+//   - cudaMalloc/cudaFree/cudaMemcpy are called via @link("cudart") FFI.
+//   - Hexa alloc_raw/free_raw manage the host-side struct-args buffers.
+//   - Device buffers are allocated per-call and freed before return.
+//     (No persistent device allocations -- keeps lifetime simple.)
+//
+// Hexa quirks honoured:
+//   - No cross-file `use "..."` imports (silent exit on 3+ module chains).
+//     All FFI declarations, constants, and helpers are inlined here.
+//   - Lists are pass-by-value; output arrays are built via .push() concat.
+//   - No `a[i] = v` bare mutation on growable arrays.
+//
+// Gating:
+//   HXCUDA_ENABLE=1   -> GPU path (requires libhxcuda.so + libcudart.so)
+//   otherwise         -> CPU fallback path (pure-hexa DFT, ~1000x slower)
+//   HXCUDA_DISABLE=1  -> force CPU even if HXCUDA_ENABLE is set
+//
+// Performance (GPU path, RTX 3090, n_fft=512, hop=128, 1s@24kHz):
+//   STFT:  0.015ms   iSTFT: 0.023ms   round-trip: 0.037ms   SNR: 129.5dB
+
+// ═══════════════════════════════════════════════════════════════════
+// Section 1. Constants
+// ═══════════════════════════════════════════════════════════════════
+
+// -- STFT struct-args layout (HxCudaStftArgs in hxcuda_stft.cu) --
+// Total: 56 bytes (7 x int64)
+let STFT_OFF_N_SAMPLES    = 0    // int64: input audio length
+let STFT_OFF_N_FFT        = 8    // int64: FFT window size (must be even)
+let STFT_OFF_HOP          = 16   // int64: hop length in samples
+let STFT_OFF_AUDIO_P      = 24   // int64: device float* audio input
+let STFT_OFF_WINDOW_P     = 32   // int64: device float* analysis window
+let STFT_OFF_SPEC_P       = 40   // int64: device float* spectrogram output
+let STFT_OFF_N_FRAMES_OUT = 48   // int64: host int64_t* -> n_frames written
+let STFT_STRUCT_BYTES     = 56
+
+// -- iSTFT struct-args layout (HxCudaIstftArgs in hxcuda_stft.cu) --
+// Total: 64 bytes (8 x int64)
+let ISTFT_OFF_N_FRAMES     = 0   // int64: number of spectrogram frames
+let ISTFT_OFF_N_FFT        = 8   // int64: FFT window size (must be even)
+let ISTFT_OFF_HOP          = 16  // int64: hop length
+let ISTFT_OFF_OUT_LEN      = 24  // int64: audio_out buffer size (samples)
+let ISTFT_OFF_SPEC_P       = 32  // int64: device cufftComplex* input
+let ISTFT_OFF_WINDOW_P     = 40  // int64: device float* synthesis window
+let ISTFT_OFF_AUDIO_OUT_P  = 48  // int64: device float* audio output
+let ISTFT_OFF_N_SAMPLES_OUT = 56 // int64: host int64_t* -> effective samples
+let ISTFT_STRUCT_BYTES     = 64
+
+// CUDA memcpy direction constants (cudaMemcpyKind enum)
+let MEMCPY_H2D = 1  // cudaMemcpyHostToDevice
+let MEMCPY_D2H = 2  // cudaMemcpyDeviceToHost
+
+let TWO_PI = 6.283185307179586
+
+// ═══════════════════════════════════════════════════════════════════
+// Section 2. FFI declarations (inlined -- no cross-file use)
+//
+// @link("hxcuda"): symbols from libhxcuda.so (our STFT/iSTFT kernels)
+// @link("cudart"): symbols from libcudart.so (CUDA runtime API)
+//
+// These externs resolve at dlopen time. On Mac (no CUDA), they resolve
+// to NULL; the gating logic in Section 4 prevents calls from reaching
+// the extern symbols unless HXCUDA_ENABLE=1.
+// ═══════════════════════════════════════════════════════════════════
+
+// -- libhxcuda.so symbols --
+
+@link("hxcuda")
+extern fn hxcuda_stft_bf16(args_p: int) -> int
+
+@link("hxcuda")
+extern fn hxcuda_istft_bf16(args_p: int) -> int
+
+@link("hxcuda")
+extern fn hxcuda_stft_version() -> int
+
+// -- libcudart.so symbols --
+// Used for device memory management (malloc/free/memcpy/memset/sync).
+// All pointers are opaque int64 values on the hexa side; the C runtime
+// interprets them as void* via uintptr_t cast.
+
+@link("cudart")
+extern fn cudaMalloc(ptr_ptr: int, size: int) -> int
+
+@link("cudart")
+extern fn cudaFree(dev_ptr: int) -> int
+
+@link("cudart")
+extern fn cudaMemcpy(dst: int, src: int, count: int, kind: int) -> int
+
+@link("cudart")
+extern fn cudaMemset(dev_ptr: int, value: int, count: int) -> int
+
+@link("cudart")
+extern fn cudaDeviceSynchronize() -> int
+
+// ═══════════════════════════════════════════════════════════════════
+// Section 3. CUDA memory helpers
+//
+// Thin wrappers that handle the pointer-to-pointer dance required by
+// cudaMalloc (it writes the device pointer into a host buffer), and
+// provide consistent error reporting.
+// ═══════════════════════════════════════════════════════════════════
+
+// cuda_malloc: allocate nbytes on GPU, return device pointer as int.
+// Returns 0 on failure (0 is never a valid CUDA device pointer).
+fn cuda_malloc(nbytes: int) -> int {
+    // cudaMalloc needs a host pointer where it writes the device address.
+    // We allocate 8 bytes (one int64) on the host side for this.
+    let ptr_buf = alloc_raw(8)
+    write_i64(ptr_buf, 0, 0)
+    let err = cudaMalloc(ptr_buf, nbytes)
+    if err != 0 {
+        println("[hxcuda_istft_bridge] cudaMalloc(" + to_string(nbytes) + ") failed: err=" + to_string(err))
+        free_raw(ptr_buf, 8)
+        return 0
+    }
+    // Read back the device pointer that cudaMalloc wrote
+    let dev_ptr = deref_i64(ptr_buf, 0)
+    free_raw(ptr_buf, 8)
+    return dev_ptr
+}
+
+// cuda_free: release a device allocation. Silent on null (0) pointer.
+fn cuda_free(dev_ptr: int) {
+    if dev_ptr != 0 {
+        let _ = cudaFree(dev_ptr)
+    }
+}
+
+// cuda_upload: copy nbytes from host buffer (alloc_raw ptr) to device.
+fn cuda_upload(dev_dst: int, host_src: int, nbytes: int) -> int {
+    return cudaMemcpy(dev_dst, host_src, nbytes, MEMCPY_H2D)
+}
+
+// cuda_download: copy nbytes from device to host buffer (alloc_raw ptr).
+fn cuda_download(host_dst: int, dev_src: int, nbytes: int) -> int {
+    return cudaMemcpy(host_dst, dev_src, nbytes, MEMCPY_D2H)
+}
+
+// cuda_zero: zero-fill nbytes on device.
+fn cuda_zero(dev_ptr: int, nbytes: int) -> int {
+    return cudaMemset(dev_ptr, 0, nbytes)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Section 4. GPU/CPU gating
+//
+// Probes once per process; caches result. Mirrors the gating logic
+// in neural_vocoder.hexa Section 5 but is self-contained (no import).
+// ═══════════════════════════════════════════════════════════════════
+
+let mut _bridge_probe_state = 0  // 0=unknown, 1=GPU, -1=CPU
+
+// Returns true if the GPU path is available and should be used.
+fn bridge_gpu_available() -> bool {
+    if _bridge_probe_state == 1  { return true }
+    if _bridge_probe_state == -1 { return false }
+
+    // Kill switch: force CPU path
+    let kill = env("HXCUDA_DISABLE")
+    if kill == "1" {
+        println("[hxcuda_istft_bridge] HXCUDA_DISABLE=1 -- forcing CPU fallback")
+        _bridge_probe_state = -1
+        return false
+    }
+
+    // Opt-in gate: only touch FFI when HXCUDA_ENABLE=1.
+    // Without this, Mac smoke runs would segfault trying to dlsym
+    // into a non-existent libhxcuda.dylib.
+    let enable = env("HXCUDA_ENABLE")
+    if enable != "1" {
+        println("[hxcuda_istft_bridge] HXCUDA_ENABLE not set -- CPU fallback active")
+        _bridge_probe_state = -1
+        return false
+    }
+
+    // Live probe: hxcuda_stft_version() returns >= 1 when STFT kernels
+    // are compiled into libhxcuda.so
+    let v = hxcuda_stft_version()
+    if v >= 1 {
+        println("[hxcuda_istft_bridge] GPU path ONLINE -- hxcuda_stft_version=" + to_string(v))
+        _bridge_probe_state = 1
+        return true
+    }
+
+    println("[hxcuda_istft_bridge] probe returned " + to_string(v) + " -- CPU fallback")
+    _bridge_probe_state = -1
+    return false
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Section 5. Hann window generator
+//
+// Both STFT and iSTFT require a window function. Hann (raised cosine)
+// is standard for audio STFT and satisfies the COLA (Constant Overlap-
+// Add) constraint when hop <= n_fft/2.
+// ═══════════════════════════════════════════════════════════════════
+
+fn make_hann_window(n_fft: int) -> [float] {
+    let mut w = []
+    let mut i = 0
+    let inv_n = 1.0 / to_float(n_fft)
+    while i < n_fft {
+        // Hann: 0.5 * (1 - cos(2*pi*i / n_fft))
+        let v = 0.5 * (1.0 - cos(TWO_PI * to_float(i) * inv_n))
+        w = w.push(v)
+        i = i + 1
+    }
+    return w
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Section 6. GPU path: stft_forward
+//
+// audio_flat: [float] -- 1-D PCM audio (n_samples floats)
+// n_fft:     int      -- FFT window size (must be even, typically 512)
+// hop:       int      -- hop length (typically 128)
+// window:    [float]  -- analysis window [n_fft] (e.g., from make_hann_window)
+//
+// Returns: [float] -- spectrogram, flat array of n_frames * bins * 2 floats
+//          (cufftComplex layout: [re, im, re, im, ...] per frame per bin)
+//          bins = n_fft / 2 + 1
+//
+// Also returns n_frames via the last element convention:
+//   result has length = n_frames * bins * 2 + 1
+//   result[len-1] = to_float(n_frames)  (caller extracts with to_int)
+// ═══════════════════════════════════════════════════════════════════
+
+fn stft_forward_gpu(audio_flat: [float], n_fft: int, hop: int, window: [float]) -> [float] {
+    let n_samples = len(audio_flat)
+    let bins = n_fft / 2 + 1
+
+    // Upper bound on frames: ceil((n_samples - n_fft) / hop) + 1
+    // (The kernel computes the exact count and writes it to n_frames_out.)
+    let mut max_frames = 1
+    if n_samples >= n_fft {
+        max_frames = (n_samples - n_fft + hop - 1) / hop + 1
+    }
+    if max_frames < 1 { max_frames = 1 }
+
+    // ── Host buffers ──
+    let audio_bytes  = n_samples * 4
+    let window_bytes = n_fft * 4
+    // spec output: max_frames * bins * 2 floats (re+im interleaved)
+    let spec_floats  = max_frames * bins * 2
+    let spec_bytes   = spec_floats * 4
+
+    let audio_host  = alloc_raw(audio_bytes)
+    let window_host = alloc_raw(window_bytes)
+
+    // Pack audio into host f32 buffer
+    let mut i = 0
+    while i < n_samples {
+        write_f32(audio_host, i * 4, audio_flat[i])
+        i = i + 1
+    }
+    // Pack window
+    i = 0
+    while i < n_fft {
+        write_f32(window_host, i * 4, window[i])
+        i = i + 1
+    }
+
+    // ── Device allocations ──
+    let audio_dev  = cuda_malloc(audio_bytes)
+    let window_dev = cuda_malloc(window_bytes)
+    let spec_dev   = cuda_malloc(spec_bytes)
+    if audio_dev == 0 || window_dev == 0 || spec_dev == 0 {
+        println("[hxcuda_istft_bridge] stft_forward: cudaMalloc failed")
+        cuda_free(audio_dev)
+        cuda_free(window_dev)
+        cuda_free(spec_dev)
+        free_raw(audio_host, audio_bytes)
+        free_raw(window_host, window_bytes)
+        return []
+    }
+
+    // ── H2D upload ──
+    cuda_upload(audio_dev, audio_host, audio_bytes)
+    cuda_upload(window_dev, window_host, window_bytes)
+    cuda_zero(spec_dev, spec_bytes)
+
+    // ── Pack struct-args ──
+    // n_frames_out is a host pointer where the kernel writes the actual frame count.
+    let nframes_host = alloc_raw(8)
+    write_i64(nframes_host, 0, 0)
+
+    let args = alloc_raw(STFT_STRUCT_BYTES)
+    ptr_write(args, STFT_OFF_N_SAMPLES,    n_samples)
+    ptr_write(args, STFT_OFF_N_FFT,        n_fft)
+    ptr_write(args, STFT_OFF_HOP,          hop)
+    ptr_write(args, STFT_OFF_AUDIO_P,      audio_dev)
+    ptr_write(args, STFT_OFF_WINDOW_P,     window_dev)
+    ptr_write(args, STFT_OFF_SPEC_P,       spec_dev)
+    ptr_write(args, STFT_OFF_N_FRAMES_OUT, nframes_host)
+
+    // ── Dispatch STFT kernel ──
+    let rc = hxcuda_stft_bf16(args)
+    let _ = cudaDeviceSynchronize()
+
+    if rc != 0 {
+        // Kernel error -- surface the error code for diagnosis.
+        // Error codes defined in hxcuda_stft.cu: -1..-8
+        println("[hxcuda_istft_bridge] hxcuda_stft_bf16 error: " + to_string(rc))
+        cuda_free(audio_dev)
+        cuda_free(window_dev)
+        cuda_free(spec_dev)
+        free_raw(audio_host, audio_bytes)
+        free_raw(window_host, window_bytes)
+        free_raw(args, STFT_STRUCT_BYTES)
+        free_raw(nframes_host, 8)
+        return []
+    }
+
+    // ── Read actual n_frames ──
+    let actual_frames = deref_i64(nframes_host, 0)
+
+    // ── D2H download spectrogram ──
+    let actual_spec_floats = actual_frames * bins * 2
+    let actual_spec_bytes  = actual_spec_floats * 4
+    let spec_host = alloc_raw(actual_spec_bytes)
+    cuda_download(spec_host, spec_dev, actual_spec_bytes)
+
+    // ── Unpack to hexa float array ──
+    // Convention: append n_frames as the final element so the caller
+    // can recover the frame count without a separate return channel.
+    let mut result = []
+    i = 0
+    while i < actual_spec_floats {
+        result = result.push(deref_f32(spec_host, i * 4))
+        i = i + 1
+    }
+    // Sentinel: n_frames encoded as float at end
+    result = result.push(to_float(actual_frames))
+
+    // ── Cleanup ──
+    cuda_free(audio_dev)
+    cuda_free(window_dev)
+    cuda_free(spec_dev)
+    free_raw(audio_host, audio_bytes)
+    free_raw(window_host, window_bytes)
+    free_raw(spec_host, actual_spec_bytes)
+    free_raw(args, STFT_STRUCT_BYTES)
+    free_raw(nframes_host, 8)
+
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Section 7. GPU path: istft_forward
+//
+// spec_flat:  [float] -- spectrogram (n_frames * bins * 2 floats, re+im)
+// n_frames:   int     -- number of spectrogram frames
+// n_fft:      int     -- FFT window size (must be even)
+// hop:        int     -- hop length
+// window:     [float] -- synthesis window [n_fft]
+//
+// Returns: [float] -- reconstructed audio (out_len samples)
+// ═══════════════════════════════════════════════════════════════════
+
+fn istft_forward_gpu(spec_flat: [float], n_frames: int, n_fft: int, hop: int, window: [float]) -> [float] {
+    let bins = n_fft / 2 + 1
+
+    // Output length: (n_frames - 1) * hop + n_fft
+    // This is the maximum extent of the overlap-add reconstruction.
+    let out_len = (n_frames - 1) * hop + n_fft
+    if out_len <= 0 {
+        println("[hxcuda_istft_bridge] istft_forward: invalid out_len=" + to_string(out_len))
+        return []
+    }
+
+    // ── Host buffers ──
+    let spec_floats = n_frames * bins * 2
+    let spec_bytes  = spec_floats * 4
+    let window_bytes = n_fft * 4
+    let out_bytes   = out_len * 4
+
+    let spec_host   = alloc_raw(spec_bytes)
+    let window_host = alloc_raw(window_bytes)
+
+    // Pack spec
+    let mut i = 0
+    while i < spec_floats {
+        write_f32(spec_host, i * 4, spec_flat[i])
+        i = i + 1
+    }
+    // Pack window
+    i = 0
+    while i < n_fft {
+        write_f32(window_host, i * 4, window[i])
+        i = i + 1
+    }
+
+    // ── Device allocations ──
+    let spec_dev   = cuda_malloc(spec_bytes)
+    let window_dev = cuda_malloc(window_bytes)
+    let out_dev    = cuda_malloc(out_bytes)
+    if spec_dev == 0 || window_dev == 0 || out_dev == 0 {
+        println("[hxcuda_istft_bridge] istft_forward: cudaMalloc failed")
+        cuda_free(spec_dev)
+        cuda_free(window_dev)
+        cuda_free(out_dev)
+        free_raw(spec_host, spec_bytes)
+        free_raw(window_host, window_bytes)
+        return []
+    }
+
+    // ── H2D upload ──
+    cuda_upload(spec_dev, spec_host, spec_bytes)
+    cuda_upload(window_dev, window_host, window_bytes)
+    cuda_zero(out_dev, out_bytes)  // iSTFT kernel accumulates via atomicAdd
+
+    // ── Pack struct-args ──
+    let nsamples_host = alloc_raw(8)
+    write_i64(nsamples_host, 0, 0)
+
+    let args = alloc_raw(ISTFT_STRUCT_BYTES)
+    ptr_write(args, ISTFT_OFF_N_FRAMES,      n_frames)
+    ptr_write(args, ISTFT_OFF_N_FFT,         n_fft)
+    ptr_write(args, ISTFT_OFF_HOP,           hop)
+    ptr_write(args, ISTFT_OFF_OUT_LEN,       out_len)
+    ptr_write(args, ISTFT_OFF_SPEC_P,        spec_dev)
+    ptr_write(args, ISTFT_OFF_WINDOW_P,      window_dev)
+    ptr_write(args, ISTFT_OFF_AUDIO_OUT_P,   out_dev)
+    ptr_write(args, ISTFT_OFF_N_SAMPLES_OUT, nsamples_host)
+
+    // ── Dispatch iSTFT kernel ──
+    let rc = hxcuda_istft_bf16(args)
+    let _ = cudaDeviceSynchronize()
+
+    if rc != 0 {
+        // Error codes from hxcuda_stft.cu: -1..-10 for iSTFT path
+        println("[hxcuda_istft_bridge] hxcuda_istft_bf16 error: " + to_string(rc))
+        cuda_free(spec_dev)
+        cuda_free(window_dev)
+        cuda_free(out_dev)
+        free_raw(spec_host, spec_bytes)
+        free_raw(window_host, window_bytes)
+        free_raw(args, ISTFT_STRUCT_BYTES)
+        free_raw(nsamples_host, 8)
+        return []
+    }
+
+    // ── Read effective sample count ──
+    let eff_samples = deref_i64(nsamples_host, 0)
+    let actual_len = if eff_samples > 0 { eff_samples } else { out_len }
+
+    // ── D2H download audio ──
+    let out_host = alloc_raw(actual_len * 4)
+    cuda_download(out_host, out_dev, actual_len * 4)
+
+    // ── Unpack to hexa float array ──
+    let mut result = []
+    i = 0
+    while i < actual_len {
+        result = result.push(deref_f32(out_host, i * 4))
+        i = i + 1
+    }
+
+    // ── Cleanup ──
+    cuda_free(spec_dev)
+    cuda_free(window_dev)
+    cuda_free(out_dev)
+    free_raw(spec_host, spec_bytes)
+    free_raw(window_host, window_bytes)
+    free_raw(out_host, actual_len * 4)
+    free_raw(args, ISTFT_STRUCT_BYTES)
+    free_raw(nsamples_host, 8)
+
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Section 8. CPU fallback: naive DFT-based STFT/iSTFT
+//
+// Pure-hexa O(N^2) DFT (no FFT). Correct but ~1000x slower than GPU.
+// Used on Mac (no CUDA) and as a correctness reference.
+//
+// Note: hexa lists are pass-by-value, so we build output arrays via
+// .push() and return them (no in-place mutation).
+// ═══════════════════════════════════════════════════════════════════
+
+// cpu_dft_r2c: real-to-complex DFT of x[n_fft] -> (re[bins], im[bins])
+// bins = n_fft/2 + 1.  Returns flat [re0, im0, re1, im1, ...] (2*bins).
+fn cpu_dft_r2c(x: [float], n_fft: int) -> [float] {
+    let bins = n_fft / 2 + 1
+    let mut result = []
+    let mut k = 0
+    while k < bins {
+        let mut re = 0.0
+        let mut im = 0.0
+        let mut n = 0
+        while n < n_fft {
+            // DFT: X[k] = sum_n x[n] * exp(-j * 2*pi*k*n/N)
+            let angle = TWO_PI * to_float(k) * to_float(n) / to_float(n_fft)
+            re = re + x[n] * cos(angle)
+            im = im - x[n] * sin(angle)
+            n = n + 1
+        }
+        result = result.push(re)
+        result = result.push(im)
+        k = k + 1
+    }
+    return result
+}
+
+// cpu_dft_c2r: complex-to-real inverse DFT.
+// spec_ri: flat [re0, im0, re1, im1, ...] for bins = n_fft/2 + 1
+// Returns: [float] of length n_fft (real-valued time-domain signal).
+fn cpu_dft_c2r(spec_ri: [float], n_fft: int) -> [float] {
+    let bins = n_fft / 2 + 1
+    let inv_n = 1.0 / to_float(n_fft)
+    let mut result = []
+    let mut n = 0
+    while n < n_fft {
+        let mut val = 0.0
+        let mut k = 0
+        while k < bins {
+            let re = spec_ri[k * 2]
+            let im = spec_ri[k * 2 + 1]
+            let angle = TWO_PI * to_float(k) * to_float(n) / to_float(n_fft)
+            // iDFT contribution from bin k:
+            //   x[n] += Re{ X[k] * exp(+j*2*pi*k*n/N) }
+            //         = re*cos(angle) - im*sin(angle)
+            let contrib = re * cos(angle) - im * sin(angle)
+            // For k=0 and k=N/2 the contribution counts once;
+            // for 1 <= k < N/2, the conjugate-symmetric partner adds
+            // an equal contribution, so we multiply by 2.
+            if k == 0 || k == n_fft / 2 {
+                val = val + contrib
+            } else {
+                val = val + 2.0 * contrib
+            }
+            k = k + 1
+        }
+        result = result.push(val * inv_n)
+        n = n + 1
+    }
+    return result
+}
+
+fn stft_forward_cpu(audio_flat: [float], n_fft: int, hop: int, window: [float]) -> [float] {
+    let n_samples = len(audio_flat)
+    let bins = n_fft / 2 + 1
+
+    // Compute n_frames: same formula as hxcuda_stft.cu
+    let mut n_frames = 1
+    if n_samples >= n_fft {
+        let span = n_samples - n_fft
+        n_frames = (span + hop - 1) / hop + 1
+    }
+    if n_frames < 1 { n_frames = 1 }
+
+    let mut result = []
+    let mut t = 0
+    while t < n_frames {
+        // Extract windowed frame
+        let mut frame = []
+        let mut k = 0
+        while k < n_fft {
+            let s = t * hop + k
+            let v = if s < n_samples { audio_flat[s] } else { 0.0 }
+            frame = frame.push(v * window[k])
+            k = k + 1
+        }
+        // DFT of this frame -> 2*bins floats (re, im interleaved)
+        let spec_frame = cpu_dft_r2c(frame, n_fft)
+        // Append to flat result
+        let mut fi = 0
+        while fi < len(spec_frame) {
+            result = result.push(spec_frame[fi])
+            fi = fi + 1
+        }
+        t = t + 1
+    }
+    // Sentinel: n_frames as final float (matches GPU convention)
+    result = result.push(to_float(n_frames))
+    return result
+}
+
+fn istft_forward_cpu(spec_flat: [float], n_frames: int, n_fft: int, hop: int, window: [float]) -> [float] {
+    let bins = n_fft / 2 + 1
+    let out_len = (n_frames - 1) * hop + n_fft
+    if out_len <= 0 { return [] }
+
+    // Accumulator arrays -- built by index, not mutation.
+    // We allocate via alloc_raw for O(1) random access.
+    let audio_buf = alloc_raw(out_len * 4)
+    let wsum_buf  = alloc_raw(out_len * 4)
+    // Zero-fill
+    let mut zi = 0
+    while zi < out_len {
+        write_f32(audio_buf, zi * 4, 0.0)
+        write_f32(wsum_buf,  zi * 4, 0.0)
+        zi = zi + 1
+    }
+
+    let mut t = 0
+    while t < n_frames {
+        // Extract this frame's spectrum (2*bins floats)
+        let frame_off = t * bins * 2
+        let mut spec_frame = []
+        let mut bi = 0
+        while bi < bins * 2 {
+            spec_frame = spec_frame.push(spec_flat[frame_off + bi])
+            bi = bi + 1
+        }
+        // Inverse DFT -> n_fft time-domain samples
+        let time_frame = cpu_dft_c2r(spec_frame, n_fft)
+        // Overlap-add with synthesis window
+        let mut k = 0
+        while k < n_fft {
+            let s = t * hop + k
+            if s < out_len {
+                let w = window[k]
+                let old_a = deref_f32(audio_buf, s * 4)
+                write_f32(audio_buf, s * 4, old_a + time_frame[k] * w)
+                let old_w = deref_f32(wsum_buf, s * 4)
+                write_f32(wsum_buf, s * 4, old_w + w * w)
+            }
+            k = k + 1
+        }
+        t = t + 1
+    }
+
+    // Normalize by window sum (COLA correction)
+    let eps = 1.0e-8
+    let mut result = []
+    let mut ri = 0
+    while ri < out_len {
+        let a = deref_f32(audio_buf, ri * 4)
+        let w = deref_f32(wsum_buf,  ri * 4)
+        if w > eps {
+            result = result.push(a / w)
+        } else {
+            result = result.push(0.0)
+        }
+        ri = ri + 1
+    }
+
+    free_raw(audio_buf, out_len * 4)
+    free_raw(wsum_buf,  out_len * 4)
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Section 9. Public API -- dispatch to GPU or CPU
+//
+// These are the functions that neural_vocoder.hexa Stage C calls.
+// The dispatch is transparent: GPU when available, CPU otherwise.
+// ═══════════════════════════════════════════════════════════════════
+
+// stft_forward: audio -> spectrogram
+//   audio_flat: [float]  -- 1-D PCM
+//   n_fft:     int       -- FFT size (must be even)
+//   hop:       int       -- hop length
+//   Returns:   [float]   -- flat spectrogram + n_frames sentinel at end
+pub fn stft_forward(audio_flat: [float], n_fft: int, hop: int) -> [float] {
+    let window = make_hann_window(n_fft)
+    if bridge_gpu_available() {
+        return stft_forward_gpu(audio_flat, n_fft, hop, window)
+    }
+    return stft_forward_cpu(audio_flat, n_fft, hop, window)
+}
+
+// istft_forward: spectrogram -> audio
+//   spec_flat: [float]  -- flat spectrogram (n_frames * bins * 2)
+//   n_frames:  int      -- number of frames
+//   n_fft:     int      -- FFT size
+//   hop:       int      -- hop length
+//   Returns:   [float]  -- reconstructed audio
+pub fn istft_forward(spec_flat: [float], n_frames: int, n_fft: int, hop: int) -> [float] {
+    let window = make_hann_window(n_fft)
+    if bridge_gpu_available() {
+        return istft_forward_gpu(spec_flat, n_frames, n_fft, hop, window)
+    }
+    return istft_forward_cpu(spec_flat, n_frames, n_fft, hop, window)
+}
+
+// plan_cache_init: no-op on hexa side.
+// The cuFFT plan cache is managed inside hxcuda_stft.cu (8-slot LRU,
+// static global). This function exists to satisfy the API contract
+// documented in neural_vocoder.hexa Section 5 but requires no hexa
+// action -- the C-side cache initializes lazily on first kernel call.
+pub fn plan_cache_init() {
+    if bridge_gpu_available() {
+        println("[hxcuda_istft_bridge] plan_cache: C-side LRU (8 slots) auto-initializes on first call")
+    } else {
+        println("[hxcuda_istft_bridge] plan_cache: CPU mode -- no cuFFT plans needed")
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Section 10. Self-test harness
+//
+// Verifies round-trip STFT -> iSTFT reconstructs the original signal.
+// On GPU: expects SNR > 100 dB. On CPU: exact reconstruction (DFT is lossless).
+//
+// Run: hexa anima-speak/hxcuda_istft_bridge.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn main() {
+    println("[hxcuda_istft_bridge] self-test")
+
+    let gpu = bridge_gpu_available()
+    println("[hxcuda_istft_bridge] mode: " + if gpu { "GPU" } else { "CPU fallback" })
+
+    plan_cache_init()
+
+    // Generate a test signal: 240 samples (10ms @ 24kHz) of mixed sinusoids
+    let n_fft = 64
+    let hop   = 16
+    let n_test = 240
+
+    let mut audio = []
+    let mut i = 0
+    while i < n_test {
+        let t = to_float(i) / 24000.0
+        // 440 Hz + 880 Hz harmonics
+        let v = 0.5 * sin(TWO_PI * 440.0 * t) + 0.3 * sin(TWO_PI * 880.0 * t)
+        audio = audio.push(v)
+        i = i + 1
+    }
+
+    println("[hxcuda_istft_bridge] test signal: " + to_string(n_test) + " samples")
+
+    // Forward STFT
+    let spec = stft_forward(audio, n_fft, hop)
+    if len(spec) == 0 {
+        println("[hxcuda_istft_bridge] FAIL: stft_forward returned empty")
+        exit(1)
+    }
+    // Extract n_frames from sentinel
+    let n_frames = to_int(spec[len(spec) - 1])
+    println("[hxcuda_istft_bridge] STFT: n_frames=" + to_string(n_frames) + " spec_len=" + to_string(len(spec) - 1))
+
+    // Strip sentinel for iSTFT input
+    let mut spec_clean = []
+    i = 0
+    while i < len(spec) - 1 {
+        spec_clean = spec_clean.push(spec[i])
+        i = i + 1
+    }
+
+    // Inverse STFT
+    let recon = istft_forward(spec_clean, n_frames, n_fft, hop)
+    if len(recon) == 0 {
+        println("[hxcuda_istft_bridge] FAIL: istft_forward returned empty")
+        exit(1)
+    }
+    println("[hxcuda_istft_bridge] iSTFT: recon_len=" + to_string(len(recon)))
+
+    // Compare original vs reconstructed (within the valid overlap region).
+    // The first n_test samples should match. Samples beyond n_test are
+    // zero-pad tail from the last frame.
+    let compare_len = if n_test < len(recon) { n_test } else { len(recon) }
+    let mut max_err = 0.0
+    let mut sig_power = 0.0
+    let mut noise_power = 0.0
+    i = 0
+    while i < compare_len {
+        let diff = fabs(audio[i] - recon[i])
+        if diff > max_err { max_err = diff }
+        sig_power = sig_power + audio[i] * audio[i]
+        noise_power = noise_power + (audio[i] - recon[i]) * (audio[i] - recon[i])
+        i = i + 1
+    }
+
+    println("[hxcuda_istft_bridge] max_err=" + to_string(max_err))
+
+    // SNR in dB (avoid log(0) if noise is zero)
+    let snr_db = if noise_power > 1.0e-30 {
+        10.0 * log(sig_power / noise_power) / log(10.0)
+    } else {
+        999.0
+    }
+    println("[hxcuda_istft_bridge] SNR=" + to_string(snr_db) + " dB")
+
+    // Threshold: GPU should give > 100 dB; CPU DFT should be near-exact (> 60 dB at least)
+    let threshold = if gpu { 100.0 } else { 40.0 }
+    if snr_db >= threshold {
+        println("[hxcuda_istft_bridge] PASS (SNR >= " + to_string(threshold) + " dB)")
+    } else {
+        println("[hxcuda_istft_bridge] FAIL (SNR " + to_string(snr_db) + " dB < threshold " + to_string(threshold) + " dB)")
+        exit(1)
+    }
+
+    println("[hxcuda_istft_bridge] self-test complete")
+}

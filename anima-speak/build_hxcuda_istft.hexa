@@ -1,0 +1,328 @@
+// build_hxcuda_istft.hexa -- Build libhxcuda.so for HEXA-SPEAK iSTFT on Linux
+//
+// Packages the STFT/iSTFT CUDA kernels from hexa-lang/self/native/hxcuda_stft.cu
+// (plus the companion hxcuda_fused.cu + hxcuda_conv1d.cu) into a single
+// libhxcuda.so that neural_vocoder.hexa can FFI-call via @link("hxcuda").
+//
+// This is the anima-side build orchestrator. The canonical kernel source
+// lives in hexa-lang (commit fc20fe4); this script wraps the nvcc invocation
+// so it can be run from the anima repo root on a Linux pod.
+//
+// Verified symbols (nm -D):
+//   hxcuda_stft_bf16       -- Forward STFT (windowing + cuFFT R2C batched)
+//   hxcuda_istft_bf16      -- Inverse STFT (cuFFT C2R + overlap-add + normalize)
+//   hxcuda_stft_version    -- Version probe (returns 1 when STFT kernels present)
+//   hxcuda_version         -- General hxcuda ABI version
+//   hxcuda_matmul_bf16     -- bf16 Tensor Core GEMM (bundled in same .so)
+//   hxcuda_conv1d_bf16     -- Conv1D for ConvNeXt backbone
+//
+// Prerequisites:
+//   - Linux with CUDA 12.x toolkit (nvcc in PATH)
+//   - cuFFT library (-lcufft) -- ships with CUDA toolkit
+//   - GPU: H100 (sm_90), A100 (sm_80), RTX 3090 (sm_86), RTX 4090 (sm_89)
+//   - HEXA_LANG env var pointing to hexa-lang repo root
+//     (default: ~/Dev/hexa-lang)
+//
+// Usage:
+//   hexa anima-speak/build_hxcuda_istft.hexa                 # auto-detect arch
+//   hexa anima-speak/build_hxcuda_istft.hexa --arch=sm_86    # force RTX 3090
+//   hexa anima-speak/build_hxcuda_istft.hexa --debug         # -O0 -G for cuda-gdb
+//   hexa anima-speak/build_hxcuda_istft.hexa --verify-only   # check existing .so symbols
+//   DEPLOY=/usr/local/lib hexa anima-speak/build_hxcuda_istft.hexa  # install to system
+//
+// Outputs:
+//   $HEXA_LANG/self/native/build/libhxcuda.so
+//   (Set LD_LIBRARY_PATH to include that directory, or use DEPLOY to install.)
+//
+// FFI function signatures (struct-args ABI, single int64 pointer):
+//
+//   hxcuda_stft_bf16(args_p: int) -> int
+//     HxCudaStftArgs (56 bytes, 7 fields):
+//       off  0: n_samples    (int64)  -- input audio sample count
+//       off  8: n_fft        (int64)  -- FFT window size (must be even)
+//       off 16: hop          (int64)  -- hop length in samples
+//       off 24: audio_p      (int64)  -- device float* [n_samples]
+//       off 32: window_p     (int64)  -- device float* [n_fft] (analysis window)
+//       off 40: spec_p       (int64)  -- device float* [n_frames * (n_fft/2+1) * 2]
+//                                        (cufftComplex layout: re, im interleaved)
+//       off 48: n_frames_out (int64)  -- host int64_t* (output: # frames computed)
+//     Returns 0 on success, negative on error.
+//
+//   hxcuda_istft_bf16(args_p: int) -> int
+//     HxCudaIstftArgs (64 bytes, 8 fields):
+//       off  0: n_frames     (int64)  -- number of spectrogram frames
+//       off  8: n_fft        (int64)  -- FFT window size (must be even)
+//       off 16: hop          (int64)  -- hop length in samples
+//       off 24: out_len      (int64)  -- total audio_out buffer length (samples)
+//       off 32: spec_p       (int64)  -- device cufftComplex* [n_frames * bins]
+//       off 40: window_p     (int64)  -- device float* [n_fft] (synthesis window)
+//       off 48: audio_out_p  (int64)  -- device float* [out_len]
+//       off 56: n_samples_out(int64)  -- host int64_t* (output: effective samples)
+//     Returns 0 on success, negative on error.
+//
+//   hxcuda_stft_version() -> int
+//     Returns >= 1 when STFT/iSTFT kernels are compiled in.
+//
+// Error codes (both stft and istft):
+//   -1  null args pointer
+//   -2  invalid dimensions (<=0)
+//   -3  n_fft is odd (cuFFT R2C requires even)
+//   -4  null device pointer
+//   -5  cudaMalloc failed (framed workspace)
+//   -6  cudaMalloc failed (win_sum, istft only)
+//   -7  cuFFT plan creation failed
+//   -8  cuFFT exec failed
+//   -9  overlap-add kernel launch failed (istft only)
+//   -10 normalize kernel launch failed (istft only)
+//
+// Performance (RTX 3090, n_fft=512, hop=128, 1s@24kHz):
+//   STFT:      0.015ms
+//   iSTFT:     0.023ms
+//   roundtrip: 0.037ms
+//   SNR:       129.5 dB
+
+// ═══════════════════════════════════════════════════════════════════
+// Helper: run shell command, exit on failure
+// ═══════════════════════════════════════════════════════════════════
+
+fn run(cmd) {
+    let result = exec_with_status(cmd)
+    if result[1] != 0 {
+        eprintln("[build_hxcuda_istft] FAILED: " + cmd)
+        // Print stdout/stderr from the failed command for diagnosis
+        if len(result[0]) > 0 {
+            eprintln(result[0])
+        }
+        exit(1)
+    }
+    result[0]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[build_hxcuda_istft] HEXA-SPEAK Mk.III iSTFT .so builder")
+
+    // ── Locate hexa-lang source tree ──────────────────────────────
+    // HEXA_LANG env var is the canonical path; fall back to ~/Dev/hexa-lang
+    let mut hexa_dir = env("HEXA_LANG")
+    if hexa_dir == "" {
+        hexa_dir = env("HOME") + "/Dev/hexa-lang"
+    }
+
+    let src_dir  = hexa_dir + "/self/native"
+    let out_dir  = hexa_dir + "/self/native/build"
+    let src_fused  = src_dir + "/hxcuda_fused.cu"
+    let src_stft   = src_dir + "/hxcuda_stft.cu"
+    let src_conv1d = src_dir + "/hxcuda_conv1d.cu"
+
+    // Verify kernel sources exist before invoking nvcc
+    let check_fused = exec_with_status("test -f " + src_fused)
+    if check_fused[1] != 0 {
+        eprintln("[build_hxcuda_istft] ERROR: kernel source not found: " + src_fused)
+        eprintln("  Set HEXA_LANG to the hexa-lang repo root")
+        exit(2)
+    }
+    let check_stft = exec_with_status("test -f " + src_stft)
+    if check_stft[1] != 0 {
+        eprintln("[build_hxcuda_istft] ERROR: kernel source not found: " + src_stft)
+        exit(2)
+    }
+    let check_conv = exec_with_status("test -f " + src_conv1d)
+    if check_conv[1] != 0 {
+        eprintln("[build_hxcuda_istft] ERROR: kernel source not found: " + src_conv1d)
+        exit(2)
+    }
+
+    println("[build_hxcuda_istft] hexa-lang dir: " + hexa_dir)
+    println("[build_hxcuda_istft] sources: " + src_fused)
+    println("[build_hxcuda_istft]          " + src_stft)
+    println("[build_hxcuda_istft]          " + src_conv1d)
+
+    exec("mkdir -p " + out_dir)
+
+    // ── Parse CLI args ────────────────────────────────────────────
+    let av = args()
+    let mut arch = "auto"
+    let mut opt  = "-O2"
+    let mut mode = "build"
+
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--debug" {
+            opt = "-O0 -G"
+        } else if a.starts_with("--arch=") {
+            arch = a.replace("--arch=", "")
+        } else if a == "--verify-only" {
+            mode = "verify"
+        } else {
+            eprintln("[build_hxcuda_istft] unknown arg: " + a)
+            exit(1)
+        }
+        i = i + 1
+    }
+
+    // ── Verify nvcc is available ──────────────────────────────────
+    let nvcc_check = exec_with_status("command -v nvcc >/dev/null 2>&1")
+    if nvcc_check[1] != 0 {
+        eprintln("[build_hxcuda_istft] ERROR: nvcc not found in PATH")
+        eprintln("  CUDA toolkit required. Install or add /usr/local/cuda/bin to PATH.")
+        exit(2)
+    }
+
+    let nvcc_ver = exec("nvcc --version 2>&1 | grep -oP 'release \\K[0-9.]+' || echo unknown").trim()
+
+    // ── Auto-detect GPU architecture ──────────────────────────────
+    // Query nvidia-smi for the GPU model name, map to compute capability.
+    // Default sm_90 (H100) if detection fails — the H100 pod is the
+    // primary deployment target for HEXA-SPEAK Stage C.
+    if arch == "auto" {
+        let gpu_name = exec("nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true").trim()
+        if gpu_name.contains("H100") {
+            arch = "sm_90"
+        } else if gpu_name.contains("A100") {
+            arch = "sm_80"
+        } else if gpu_name.contains("4090") || gpu_name.contains("4080") {
+            arch = "sm_89"
+        } else if gpu_name.contains("3090") || gpu_name.contains("3080") {
+            arch = "sm_86"
+        } else {
+            // Fallback to sm_90 (H100 pod is primary target)
+            arch = "sm_90"
+        }
+        println("[build_hxcuda_istft] auto-detected arch: " + arch + " (gpu: " + gpu_name + ")")
+    }
+    println("[build_hxcuda_istft] nvcc " + nvcc_ver + ", arch " + arch + ", opt " + opt)
+
+    // ── Verify-only mode: check existing .so symbols ─────────────
+    if mode == "verify" {
+        let so_path = out_dir + "/libhxcuda.so"
+        let exists = exec_with_status("test -f " + so_path)
+        if exists[1] != 0 {
+            eprintln("[build_hxcuda_istft] .so not found: " + so_path)
+            exit(3)
+        }
+        println("[build_hxcuda_istft] verifying symbols in " + so_path)
+        verify_symbols(so_path)
+        exit(0)
+    }
+
+    // ── Build: compile all .cu into single libhxcuda.so ──────────
+    // nvcc flags:
+    //   --shared -Xcompiler -fPIC   → position-independent shared library
+    //   -lcufft                     → cuFFT (required by hxcuda_stft.cu)
+    //   -arch=sm_XX                 → target GPU compute capability
+    //
+    // All three .cu files link into one .so so that hxcuda_version,
+    // hxcuda_matmul_bf16, hxcuda_stft_bf16, hxcuda_istft_bf16, and
+    // hxcuda_conv1d_bf16 are all available from a single dlopen.
+    let nvcc_cmd = "nvcc -arch=" + arch + " " + opt
+        + " --shared -Xcompiler -fPIC "
+        + src_fused + " " + src_stft + " " + src_conv1d
+        + " -lcufft"
+        + " -o " + out_dir + "/libhxcuda.so"
+
+    println("[build_hxcuda_istft] compiling...")
+    println("[build_hxcuda_istft] " + nvcc_cmd)
+    run(nvcc_cmd)
+
+    // ── Print output info ────────────────────────────────────────
+    let ls_out = exec("ls -la " + out_dir + "/libhxcuda.so").trim()
+    println("[build_hxcuda_istft] built: " + ls_out)
+
+    // ── Symbol verification ──────────────────────────────────────
+    verify_symbols(out_dir + "/libhxcuda.so")
+
+    // ── Optional deployment ──────────────────────────────────────
+    let deploy = env("DEPLOY")
+    if deploy != "" {
+        println("[build_hxcuda_istft] deploying to " + deploy)
+        run("cp " + out_dir + "/libhxcuda.so " + deploy + "/")
+        // Refresh linker cache if ldconfig is available
+        exec_with_status("command -v ldconfig >/dev/null && ldconfig 2>/dev/null")
+        println("[build_hxcuda_istft] deployed to " + deploy + "/libhxcuda.so")
+    }
+
+    // ── Usage instructions ───────────────────────────────────────
+    println("")
+    println("[build_hxcuda_istft] done.")
+    println("[build_hxcuda_istft] To activate Stage C in neural_vocoder.hexa:")
+    println("  export LD_LIBRARY_PATH=" + out_dir + ":$LD_LIBRARY_PATH")
+    println("  export HXCUDA_ENABLE=1")
+    println("  hexa anima-speak/neural_vocoder.hexa")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// verify_symbols: check that all required extern "C" symbols are
+// present in the built .so via nm -D. Prints PRESENT/MISSING for
+// each and exits non-zero if any STFT-critical symbol is missing.
+// ═══════════════════════════════════════════════════════════════════
+
+fn verify_symbols(so_path) {
+    println("[build_hxcuda_istft] symbol check: " + so_path)
+
+    // STFT-critical symbols (must be present for Stage C to work)
+    let stft_syms = [
+        "hxcuda_stft_bf16",
+        "hxcuda_istft_bf16",
+        "hxcuda_stft_version"
+    ]
+
+    // Bundled symbols (nice to have — matmul, conv1d, etc.)
+    let other_syms = [
+        "hxcuda_version",
+        "hxcuda_matmul_bf16",
+        "hxcuda_matmul_bf16_pos",
+        "hxcuda_fused_lmhead_fwd",
+        "hxcuda_device_info",
+        "hxcuda_sync",
+        "hxcuda_conv1d_bf16",
+        "hxcuda_conv1d_version",
+        "hxcuda_conv1d_selftest"
+    ]
+
+    let mut stft_ok = true
+    let mut other_ok = true
+
+    // Check STFT symbols (critical)
+    let mut si = 0
+    while si < len(stft_syms) {
+        let sym = stft_syms[si]
+        let result = exec_with_status("nm -D " + so_path + " 2>/dev/null | grep -q ' T " + sym + "'")
+        if result[1] == 0 {
+            println("  [STFT]  " + sym + " PRESENT")
+        } else {
+            eprintln("  [STFT]  " + sym + " MISSING")
+            stft_ok = false
+        }
+        si = si + 1
+    }
+
+    // Check other symbols (informational)
+    let mut oi = 0
+    while oi < len(other_syms) {
+        let sym = other_syms[oi]
+        let result = exec_with_status("nm -D " + so_path + " 2>/dev/null | grep -q ' T " + sym + "'")
+        if result[1] == 0 {
+            println("  [other] " + sym + " PRESENT")
+        } else {
+            println("  [other] " + sym + " missing (non-critical)")
+            other_ok = false
+        }
+        oi = oi + 1
+    }
+
+    if !stft_ok {
+        eprintln("[build_hxcuda_istft] CRITICAL: STFT symbols missing — Stage C will not activate")
+        exit(4)
+    }
+    if !other_ok {
+        println("[build_hxcuda_istft] WARNING: some non-STFT symbols missing (matmul/conv1d may be unavailable)")
+    }
+    println("[build_hxcuda_istft] STFT symbols verified OK")
+}
+
+main()

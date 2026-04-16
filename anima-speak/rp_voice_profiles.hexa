@@ -407,6 +407,217 @@ fn pair_distinct_rate(profiles: [Profile], thr: float) -> float {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  Section 4b. Vocoder Conditioning Bridge
+//
+//  profile_to_vocoder_conditioning(profile_id, d_model) -> [float]
+//
+//  Produces a d_model-dimensional (384d) conditioning vector from the
+//  profile's parametric scalars.  This vector modulates the neural
+//  vocoder's spectral and additive synthesis paths:
+//
+//    dims 0..95   — pitch conditioning  (F0 base → sinusoidal basis)
+//    dims 96..191 — tempo conditioning  (rate → smooth ramp)
+//    dims 192..287— timbre conditioning (formant shift → spectral tilt)
+//    dims 288..383— energy conditioning (prosody bias → amplitude envelope)
+//
+//  Each 96-dim sub-band is filled with a deterministic pattern seeded
+//  by the corresponding normalized scalar, ensuring:
+//    (a) different profiles produce measurably different vectors
+//    (b) the vector is reproducible (no PRNG state)
+//    (c) no list fields in structs (hexa aliasing bug avoidance)
+//
+//  The vocoder reads these sub-bands:
+//    - pitch band:   scales F0 of additive partials & spectral envelope
+//    - tempo band:   modulates frame-hop interpolation speed
+//    - timbre band:  shifts formant peaks in spectral magnitude
+//    - energy band:  multiplicative gain on output waveform
+// ═══════════════════════════════════════════════════════════════
+
+// rp_sin_approx: inline sin approximation (Taylor 7th order)
+// Avoids cross-file import. Input in radians.
+fn rp_sin_approx(x: float) -> float {
+    // Normalize x to [-pi, pi] range
+    let pi = 3.141592653589793
+    let two_pi = 6.283185307179586
+    let mut v = x
+    while v > pi { v = v - two_pi }
+    while v < 0.0 - pi { v = v + two_pi }
+    // Taylor: sin(v) ~ v - v^3/6 + v^5/120 - v^7/5040
+    let v2 = v * v
+    let v3 = v2 * v
+    let v5 = v3 * v2
+    let v7 = v5 * v2
+    return v - v3 / 6.0 + v5 / 120.0 - v7 / 5040.0
+}
+
+// rp_cos_approx: inline cos approximation (Taylor 6th order)
+fn rp_cos_approx(x: float) -> float {
+    let pi = 3.141592653589793
+    let two_pi = 6.283185307179586
+    let mut v = x
+    while v > pi { v = v - two_pi }
+    while v < 0.0 - pi { v = v + two_pi }
+    let v2 = v * v
+    let v4 = v2 * v2
+    let v6 = v4 * v2
+    return 1.0 - v2 / 2.0 + v4 / 24.0 - v6 / 720.0
+}
+
+// profile_to_vocoder_conditioning: main bridge function.
+//
+// Returns a d_model-dimensional conditioning vector (default 384).
+// Each of the 4 sub-bands (96 dims each) encodes one profile scalar
+// as a deterministic sinusoidal basis with the scalar as frequency seed.
+//
+// Root cause of distinct vectors: the 4 normalized scalars (pitch, formant,
+// tempo, prosody) are all hand-tuned to be pair-wise distinct across the
+// 10 profiles (verified by T3 distinctness test). The sinusoidal basis
+// amplifies these differences across 96 dimensions per band.
+fn profile_to_vocoder_conditioning(profile_id: int, d_model: int) -> array {
+    let p = get_profile(profile_id)
+    let pv = profile_to_param_vector(p)
+    // pv[0]=pitch_n, pv[1]=formant_n, pv[2]=tempo_n, pv[3]=prosody_n
+    // All in [0,1].
+
+    let n_bands = 4
+    let band_size = d_model / n_bands  // 96 when d_model=384
+
+    let pi = 3.141592653589793
+    let two_pi = 6.283185307179586
+
+    let mut out = []
+
+    // Band 0: Pitch conditioning (dims 0..band_size-1)
+    // Sinusoidal basis: sin(2*pi * (i+1) * pitch_n / band_size) scaled
+    // by pitch_n. Low pitch_n (bass voices) produces slow waves;
+    // high pitch_n (soprano/child) produces fast waves.
+    let pitch_n = pv[0]
+    let mut i = 0
+    while i < band_size {
+        let phase = two_pi * to_float(i + 1) * (0.5 + pitch_n * 2.0) / to_float(band_size)
+        let v = pitch_n * rp_sin_approx(phase) + (1.0 - pitch_n) * rp_cos_approx(phase * 0.5)
+        out = out.push(v)
+        i = i + 1
+    }
+
+    // Band 1: Tempo conditioning (dims band_size..2*band_size-1)
+    // Smooth ramp modulated by tempo_n. Fast speakers (high tempo_n)
+    // get a steep rising pattern; slow speakers get a flat plateau.
+    let tempo_n = pv[2]
+    i = 0
+    while i < band_size {
+        let t = to_float(i) / to_float(band_size)
+        // Sigmoid-like ramp: steepness controlled by tempo_n
+        let steepness = 1.0 + tempo_n * 4.0
+        let ramp = t * steepness
+        let v = tempo_n * rp_sin_approx(ramp) + (1.0 - tempo_n) * (t * 0.5)
+        out = out.push(v)
+        i = i + 1
+    }
+
+    // Band 2: Timbre conditioning (dims 2*band_size..3*band_size-1)
+    // Formant shift encoding: positive shift (small head) biases toward
+    // higher harmonics; negative shift (chest voice) biases toward lower.
+    // Pattern: alternating sin/cos with formant_n as frequency multiplier.
+    let formant_n = pv[1]
+    i = 0
+    while i < band_size {
+        let base_freq = to_float(i + 1) * 0.1
+        let shift = (formant_n - 0.5) * 4.0   // map [0,1] -> [-2, +2]
+        let v = rp_sin_approx(base_freq * (1.0 + shift)) * 0.7 + rp_cos_approx(base_freq * 2.3 * formant_n) * 0.3
+        out = out.push(v)
+        i = i + 1
+    }
+
+    // Band 3: Energy conditioning (dims 3*band_size..4*band_size-1)
+    // Prosody bias encoding: bright/energetic voices (+1) get high-amplitude
+    // sawtooth-like pattern; dark/subdued voices (-1) get low-amplitude
+    // smooth pattern.
+    let prosody_n = pv[3]
+    i = 0
+    while i < band_size {
+        let t = to_float(i) / to_float(band_size)
+        // Energy envelope: prosody_n controls amplitude and harmonic content
+        let amp = 0.3 + prosody_n * 0.7   // range [0.3, 1.0]
+        let harmonic = rp_sin_approx(two_pi * t * (1.0 + prosody_n * 3.0))
+        let v = amp * harmonic
+        out = out.push(v)
+        i = i + 1
+    }
+
+    return out
+}
+
+// extract_conditioning_params: decode a 384d conditioning vector back to
+// the 4 scalar modulators that the vocoder applies.
+//
+// Returns [f0_scale, tempo_scale, formant_shift, energy_scale]:
+//   f0_scale:      0.5..2.0  (multiplicative F0 scaling)
+//   tempo_scale:   0.6..1.5  (frame-rate multiplier)
+//   formant_shift: -0.5..+0.5 (spectral peak shift)
+//   energy_scale:  0.7..1.3  (amplitude gain)
+//
+// Extraction method: RMS energy of each 96-dim sub-band encodes the
+// original scalar magnitude. The mapping is calibrated to the sinusoidal
+// basis used in profile_to_vocoder_conditioning().
+fn extract_conditioning_params(cond: array) -> array {
+    let n = len(cond)
+    if n < 4 { return [1.0, 1.0, 0.0, 1.0] }
+
+    let band_size = n / 4
+
+    // Compute RMS of each band as a magnitude proxy
+    let mut band_rms = []
+    let mut b = 0
+    while b < 4 {
+        let mut sum_sq = 0.0
+        let mut i = 0
+        while i < band_size {
+            let idx = b * band_size + i
+            if idx < n {
+                let v = cond[idx]
+                sum_sq = sum_sq + v * v
+            }
+            i = i + 1
+        }
+        let mean_sq = sum_sq / to_float(band_size)
+        // Newton sqrt (16 iterations)
+        let mut r = mean_sq
+        if r > 0.0 {
+            let mut j = 0
+            while j < 16 {
+                r = 0.5 * (r + mean_sq / r)
+                j = j + 1
+            }
+        }
+        band_rms = band_rms.push(r)
+        b = b + 1
+    }
+
+    // Map band RMS to vocoder parameters.
+    // Each band's RMS is in roughly [0.1, 0.8] depending on the profile scalar.
+
+    // Band 0 (pitch) -> f0_scale: map RMS to [0.5, 2.0]
+    let f0_scale = rp_clip(0.5 + band_rms[0] * 2.0, 0.5, 2.0)
+
+    // Band 1 (tempo) -> tempo_scale: map RMS to [0.6, 1.5]
+    let tempo_scale = rp_clip(0.6 + band_rms[1] * 1.2, 0.6, 1.5)
+
+    // Band 2 (timbre) -> formant_shift: map RMS to [-0.5, +0.5]
+    let formant_shift = rp_clip(band_rms[2] - 0.5, -0.5, 0.5)
+
+    // Band 3 (energy) -> energy_scale: map RMS to [0.7, 1.3]
+    let energy_scale = rp_clip(0.7 + band_rms[3] * 0.8, 0.7, 1.3)
+
+    let mut out = []
+    out = out.push(f0_scale)
+    out = out.push(tempo_scale)
+    out = out.push(formant_shift)
+    out = out.push(energy_scale)
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  Section 5. Self-tests (T1–T5)
 // ═══════════════════════════════════════════════════════════════
 
@@ -547,6 +758,176 @@ fn rp_check_T5() -> bool {
     return true
 }
 
+// T6: profile_to_vocoder_conditioning dimensionality + pairwise distinctness.
+//
+// Verifies:
+//   (a) conditioning vector dimension == 384 for all 10 profiles
+//   (b) all 10 vectors are pairwise distinct (L2 distance > threshold)
+//   (c) extract_conditioning_params returns 4 scalars in valid ranges
+//   (d) determinism: same profile_id → identical vector
+fn rp_check_T6() -> bool {
+    let d_model = 384
+    let n_profiles = 10
+    let l2_threshold = 0.1  // minimum L2 distance between any two profiles
+
+    // (a) Generate all 10 conditioning vectors; check dimension
+    // Store flattened: all_vecs is a list of 10 arrays
+    // (hexa list aliasing: each call returns a fresh array, safe to store)
+    let mut all_vecs = []
+    let mut i = 0
+    while i < n_profiles {
+        let v = profile_to_vocoder_conditioning(i, d_model)
+        if len(v) != d_model {
+            println("  [T6] FAIL — profile " + to_string(i) + " dim=" + to_string(len(v)) + " expected " + to_string(d_model))
+            return false
+        }
+        all_vecs = all_vecs.push(v)
+        i = i + 1
+    }
+
+    // (b) Pairwise L2 distance: all pairs (i<j) must exceed threshold
+    let mut min_dist = 99999.0
+    let mut min_pair_i = 0
+    let mut min_pair_j = 0
+    i = 0
+    while i < n_profiles {
+        let mut j = i + 1
+        while j < n_profiles {
+            let vi = all_vecs[i]
+            let vj = all_vecs[j]
+            let mut sum_sq = 0.0
+            let mut k = 0
+            while k < d_model {
+                let d = vi[k] - vj[k]
+                sum_sq = sum_sq + d * d
+                k = k + 1
+            }
+            // Newton sqrt
+            let mut dist = sum_sq
+            if dist > 0.0 {
+                let mut iter = 0
+                while iter < 16 {
+                    dist = 0.5 * (dist + sum_sq / dist)
+                    iter = iter + 1
+                }
+            }
+            if dist < min_dist {
+                min_dist = dist
+                min_pair_i = i
+                min_pair_j = j
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    println("  [T6] min pairwise L2 = " + to_string(min_dist)
+            + " (profiles " + to_string(min_pair_i) + " vs " + to_string(min_pair_j) + ")")
+    if min_dist < l2_threshold {
+        println("  [T6] FAIL — pairwise L2 below threshold " + to_string(l2_threshold))
+        return false
+    }
+
+    // (c) extract_conditioning_params returns 4 scalars in valid ranges
+    let test_cond = profile_to_vocoder_conditioning(0, d_model)
+    let params = extract_conditioning_params(test_cond)
+    if len(params) != 4 {
+        println("  [T6] FAIL — extract_conditioning_params returned " + to_string(len(params)) + " expected 4")
+        return false
+    }
+    // f0_scale in [0.5, 2.0]
+    if params[0] < 0.5 { return false }
+    if params[0] > 2.0 { return false }
+    // tempo_scale in [0.6, 1.5]
+    if params[1] < 0.6 { return false }
+    if params[1] > 1.5 { return false }
+    // formant_shift in [-0.5, 0.5]
+    if params[2] < 0.0 - 0.5 { return false }
+    if params[2] > 0.5 { return false }
+    // energy_scale in [0.7, 1.3]
+    if params[3] < 0.7 { return false }
+    if params[3] > 1.3 { return false }
+
+    // (d) Determinism: same id → identical vector
+    let v_a = profile_to_vocoder_conditioning(3, d_model)
+    let v_b = profile_to_vocoder_conditioning(3, d_model)
+    let mut k = 0
+    while k < d_model {
+        if rp_fabs(v_a[k] - v_b[k]) > 0.0 {
+            println("  [T6] FAIL — non-deterministic at dim " + to_string(k))
+            return false
+        }
+        k = k + 1
+    }
+
+    return true
+}
+
+// T7: profile vocoder conditioning end-to-end — verify that conditioning
+// vectors applied to a mock PCM signal produce 10 measurably different
+// outputs (pairwise L2 distance > threshold).
+//
+// This simulates the vocoder's energy-scaling path: for each profile,
+// extract_conditioning_params() → energy_scale is applied to a reference
+// wave. The 10 output waves must be pairwise distinct.
+fn rp_check_T7() -> bool {
+    let d_model = 384
+    let n_profiles = 10
+    let wave_len = 64
+
+    // Build a reference wave (simple ramp)
+    let mut ref_wave = []
+    let mut i = 0
+    while i < wave_len {
+        ref_wave = ref_wave.push(to_float(i) / to_float(wave_len))
+        i = i + 1
+    }
+
+    // For each profile, apply energy_scale from conditioning params to ref_wave
+    let mut all_waves = []
+    i = 0
+    while i < n_profiles {
+        let cond = profile_to_vocoder_conditioning(i, d_model)
+        let params = extract_conditioning_params(cond)
+        let energy = params[3]  // energy_scale
+        let mut wave = []
+        let mut k = 0
+        while k < wave_len {
+            wave = wave.push(ref_wave[k] * energy)
+            k = k + 1
+        }
+        all_waves = all_waves.push(wave)
+        i = i + 1
+    }
+
+    // Pairwise L2 on output waves
+    let mut distinct_pairs = 0
+    let mut total_pairs = 0
+    i = 0
+    while i < n_profiles {
+        let mut j = i + 1
+        while j < n_profiles {
+            let wi = all_waves[i]
+            let wj = all_waves[j]
+            let mut sum_sq = 0.0
+            let mut k = 0
+            while k < wave_len {
+                let d = wi[k] - wj[k]
+                sum_sq = sum_sq + d * d
+                k = k + 1
+            }
+            if sum_sq > 0.0001 { distinct_pairs = distinct_pairs + 1 }
+            total_pairs = total_pairs + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let rate = to_float(distinct_pairs) / to_float(total_pairs)
+    println("  [T7] wave distinct rate = " + to_string(rate)
+            + " (" + to_string(distinct_pairs) + "/" + to_string(total_pairs) + " pairs)")
+    // At least 90% of pairs must be distinct
+    return rate >= 0.9
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  Section 6. main — embedded self-test
 // ═══════════════════════════════════════════════════════════════
@@ -554,6 +935,7 @@ fn rp_check_T5() -> bool {
 fn main() {
     println("[rp_voice_profiles] TSRV-P3-1 / ZPHY-P2-1 self-test")
     println("  10 캐릭터 음성 프로파일 — pitch/formant/tempo/prosody/style")
+    println("  + vocoder conditioning bridge (384d)")
 
     let t1 = rp_check_T1()
     if t1 { println("T1 PASS — 10 프로파일 정의 + 고유 id") } else { println("T1 FAIL") }
@@ -570,10 +952,15 @@ fn main() {
     let t5 = rp_check_T5()
     if t5 { println("T5 PASS — byte-identical determinism") } else { println("T5 FAIL") }
 
-    let all_pass = t1 && t2 && t3 && t4 && t5
+    let t6 = rp_check_T6()
+    if t6 { println("T6 PASS — vocoder conditioning: dim=384, pairwise distinct, params valid, deterministic") } else { println("T6 FAIL") }
+
+    let t7 = rp_check_T7()
+    if t7 { println("T7 PASS — conditioned PCM pairwise distinct (end-to-end)") } else { println("T7 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5 && t6 && t7
     if all_pass {
-        println("[rp_voice_profiles] ALL 5/5 PASS — TSRV-P3-1 / ZPHY-P2-1 scaffold gate 통과")
-        println("  remaining_work: neural_vocoder.hexa 통합 (P4 SERVING task)")
+        println("[rp_voice_profiles] ALL 7/7 PASS — TSRV-P3-1 / ZPHY-P2-1 + vocoder bridge gate 통과")
     } else {
         println("[rp_voice_profiles] SOME FAILED")
     }

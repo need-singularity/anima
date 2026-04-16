@@ -1,12 +1,33 @@
 // nn_core.hexa — HEXA-SPEAK Mk.III: Neural Network Primitives
 //
 // Purpose:
-//   Pure-HEXA implementation of all fundamental NN operations.
-//   matmul, softmax, layernorm, attention, RoPE, SwiGLU, cross-entropy.
+//   Pure-HEXA CANONICAL implementation of all fundamental NN operations.
+//   matmul, softmax, layernorm, attention, RoPE, SwiGLU, GELU,
+//   linear, embedding, dropout, cross-entropy.
 //   Foundation for transformer, vocoder, and all NN layers in the pipeline.
 //
+// API contract:
+//   Other HEXA-SPEAK modules (intent_encoder, audio_token_predictor, etc.)
+//   currently inline their own copies of these primitives due to the hexa
+//   silent-exit bug on 3+ module import chains. This file is the SSOT
+//   (Single Source of Truth) reference implementation. When the import
+//   bug is fixed, all modules delegate to nn_core.
+//
 // All functions are pure (no side effects, no external dependencies).
-// Tensors represented as flat list-of-float. 2D tensors as list-of-lists.
+// Tensors represented as flat array of float, row-major.
+//   A[M x K] stored as flat array of length M*K, A[i,j] = A[i*K + j].
+//
+// Canonical nn_* API (10 primitives):
+//   nn_matmul(a, b, rows_a, cols_a, cols_b)       matrix multiply
+//   nn_softmax(logits, n)                          numerically stable softmax
+//   nn_layer_norm(x, gamma, beta, n, eps)          layer normalization
+//   nn_attention(Q, K, V, d_head, seq_len)         scaled dot-product + causal mask
+//   nn_rope(x, pos, d_model)                       rotary positional embedding
+//   nn_swiglu(x, w_up, w_gate, w_down, d_in, d_ff) SwiGLU FFN block
+//   nn_linear(x, w, bias, d_in, d_out)             linear projection
+//   nn_embedding_lookup(table, idx, d_model)        embedding table lookup
+//   nn_dropout(x, rate, seed)                       dropout (training only)
+//   nn_gelu(x)                                      GELU activation (vector)
 //
 // n=6 alignment:
 //   Default d_model = 384 = 64 * 6
@@ -19,14 +40,19 @@
 // Downstream:    None (leaf library)
 
 // ════════════════════════════════════════════════════════════════════
-// §1  TENSOR BASICS
+// S1  CONSTANTS
 // ════════════════════════════════════════════════════════════════════
 
 let PI = 3.141592653589793
 let SQRT_2_OVER_PI = 0.7978845608028654   // sqrt(2/pi)
 let NEG_INF = -1.0e30                      // mask value for causal attention
 
+// ════════════════════════════════════════════════════════════════════
+// S2  TENSOR BASICS
+// ════════════════════════════════════════════════════════════════════
+
 fn tensor_zeros(n: int) -> array {
+    // Allocate n-element zero vector
     let mut out = []
     let mut i = 0
     while i < n {
@@ -37,6 +63,7 @@ fn tensor_zeros(n: int) -> array {
 }
 
 fn tensor_ones(n: int) -> array {
+    // Allocate n-element ones vector
     let mut out = []
     let mut i = 0
     while i < n {
@@ -58,7 +85,6 @@ fn tensor_randn(n: int, seed: int) -> array {
         let u1 = if u1_raw < 0.000001 { 0.000001 } else { u1_raw }
         s = (s * 1103515245 + 12345) % 2147483648
         let u2 = to_float(s % 1000000) / 1000000.0
-
         // Box-Muller: z = sqrt(-2*ln(u1)) * cos(2*pi*u2)
         let r = sqrt(0.0 - 2.0 * log(u1))
         let theta = 2.0 * PI * u2
@@ -70,6 +96,7 @@ fn tensor_randn(n: int, seed: int) -> array {
 }
 
 fn tensor_add(a: array, b: array) -> array {
+    // Element-wise addition: out[i] = a[i] + b[i]
     let mut out = []
     let n = len(a)
     let mut i = 0
@@ -81,6 +108,7 @@ fn tensor_add(a: array, b: array) -> array {
 }
 
 fn tensor_sub(a: array, b: array) -> array {
+    // Element-wise subtraction: out[i] = a[i] - b[i]
     let mut out = []
     let n = len(a)
     let mut i = 0
@@ -92,6 +120,7 @@ fn tensor_sub(a: array, b: array) -> array {
 }
 
 fn tensor_mul_scalar(a: array, s: float) -> array {
+    // Scalar multiply: out[i] = a[i] * s
     let mut out = []
     let n = len(a)
     let mut i = 0
@@ -103,6 +132,7 @@ fn tensor_mul_scalar(a: array, s: float) -> array {
 }
 
 fn tensor_elementwise_mul(a: array, b: array) -> array {
+    // Hadamard product: out[i] = a[i] * b[i]
     let mut out = []
     let n = len(a)
     let mut i = 0
@@ -114,6 +144,7 @@ fn tensor_elementwise_mul(a: array, b: array) -> array {
 }
 
 fn tensor_dot(a: array, b: array) -> float {
+    // Dot product: sum(a[i] * b[i])
     let mut sum = 0.0
     let n = len(a)
     let mut i = 0
@@ -125,10 +156,12 @@ fn tensor_dot(a: array, b: array) -> float {
 }
 
 fn tensor_norm(a: array) -> float {
+    // L2 norm: sqrt(sum(a[i]^2))
     sqrt(tensor_dot(a, a))
 }
 
 fn tensor_sum(a: array) -> float {
+    // Sum of all elements
     let mut s = 0.0
     let n = len(a)
     let mut i = 0
@@ -140,10 +173,12 @@ fn tensor_sum(a: array) -> float {
 }
 
 fn tensor_mean(a: array) -> float {
+    // Arithmetic mean: sum(a) / len(a)
     tensor_sum(a) / to_float(len(a))
 }
 
 fn tensor_var(a: array) -> float {
+    // Population variance: E[(x - mu)^2]
     let mu = tensor_mean(a)
     let n = len(a)
     let mut acc = 0.0
@@ -157,6 +192,7 @@ fn tensor_var(a: array) -> float {
 }
 
 fn tensor_slice(a: array, start: int, end: int) -> array {
+    // Extract sub-array a[start..end)
     let mut out = []
     let mut i = start
     while i < end {
@@ -167,6 +203,7 @@ fn tensor_slice(a: array, start: int, end: int) -> array {
 }
 
 fn tensor_concat(a: array, b: array) -> array {
+    // Concatenate two arrays
     let mut out = a
     let mut i = 0
     while i < len(b) {
@@ -176,30 +213,17 @@ fn tensor_concat(a: array, b: array) -> array {
     out
 }
 
-// flat[rows*cols] -> list of rows, each row is list of cols
-fn tensor_reshape_2d(flat: array, rows: int, cols: int) -> array {
-    let mut out = []
-    let mut r = 0
-    while r < rows {
-        let mut row = []
-        let mut c = 0
-        while c < cols {
-            row = row.push(flat[r * cols + c])
-            c = c + 1
-        }
-        out = out.push(row)
-        r = r + 1
-    }
-    out
+fn abs_f(x: float) -> float {
+    // Absolute value for float
+    if x < 0.0 { 0.0 - x } else { x }
 }
 
 // ════════════════════════════════════════════════════════════════════
-// §2  MATRIX OPERATIONS  (flat array representation)
+// S3  MATRIX OPERATIONS  (flat array, row-major)
 // ════════════════════════════════════════════════════════════════════
-// Convention: A[M×K] stored row-major as flat array of length M*K
-//   A[i,j] = A[i*K + j]
 
-// C[M×N] = A[M×K] × B[K×N]
+// C[M x N] = A[M x K] * B[K x N]
+// Standard triple-loop matrix multiply, O(M*K*N).
 fn matmul(A: array, B: array, M: int, K: int, N: int) -> array {
     let mut C = tensor_zeros(M * N)
     let mut i = 0
@@ -220,28 +244,7 @@ fn matmul(A: array, B: array, M: int, K: int, N: int) -> array {
     C
 }
 
-// C[M×N] = A[M×K] × B^T[N×K]  (B stored as [N×K], transposed access)
-fn matmul_transB(A: array, BT: array, M: int, K: int, N: int) -> array {
-    let mut C = tensor_zeros(M * N)
-    let mut i = 0
-    while i < M {
-        let mut j = 0
-        while j < N {
-            let mut sum = 0.0
-            let mut k = 0
-            while k < K {
-                sum = sum + A[i * K + k] * BT[j * K + k]
-                k = k + 1
-            }
-            C[i * N + j] = sum
-            j = j + 1
-        }
-        i = i + 1
-    }
-    C
-}
-
-// y[M] = A[M×K] × x[K]
+// y[M] = A[M x K] * x[K]   (matrix-vector product)
 fn matvec(A: array, x: array, M: int, K: int) -> array {
     let mut y = tensor_zeros(M)
     let mut i = 0
@@ -258,28 +261,12 @@ fn matvec(A: array, x: array, M: int, K: int) -> array {
     y
 }
 
-// M[len(a) × len(b)] = a ⊗ b  (outer product, flat)
-fn outer_product(a: array, b: array) -> array {
-    let m = len(a)
-    let n = len(b)
-    let mut out = tensor_zeros(m * n)
-    let mut i = 0
-    while i < m {
-        let mut j = 0
-        while j < n {
-            out[i * n + j] = a[i] * b[j]
-            j = j + 1
-        }
-        i = i + 1
-    }
-    out
-}
-
 // ════════════════════════════════════════════════════════════════════
-// §3  ACTIVATION FUNCTIONS
+// S4  ACTIVATION FUNCTIONS
 // ════════════════════════════════════════════════════════════════════
 
 fn sigmoid(x: float) -> float {
+    // Logistic sigmoid: 1 / (1 + exp(-x))
     1.0 / (1.0 + exp(0.0 - x))
 }
 
@@ -287,38 +274,23 @@ fn relu(x: float) -> float {
     if x > 0.0 { x } else { 0.0 }
 }
 
-fn relu_vec(x: array) -> array {
-    let mut out = []
-    let mut i = 0
-    while i < len(x) {
-        out = out.push(relu(x[i]))
-        i = i + 1
-    }
-    out
-}
-
 // GELU: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))
+// Gaussian Error Linear Unit (Hendrycks & Gimpel 2016).
+// Smooth approximation to x * Phi(x) where Phi is the Gaussian CDF.
+// Used in GPT-2/BERT and many modern transformers.
 fn gelu(x: float) -> float {
     let inner = SQRT_2_OVER_PI * (x + 0.044715 * x * x * x)
     x * 0.5 * (1.0 + tanh(inner))
 }
 
-fn gelu_vec(x: array) -> array {
-    let mut out = []
-    let mut i = 0
-    while i < len(x) {
-        out = out.push(gelu(x[i]))
-        i = i + 1
-    }
-    out
-}
-
-// SwiGLU: x * sigmoid(gate)
+// SwiGLU scalar: x * sigmoid(gate)
+// From Shazeer 2020 "GLU Variants Improve Transformer".
 fn swiglu(x: float, gate: float) -> float {
     x * sigmoid(gate)
 }
 
 fn swiglu_vec(x: array, gate: array) -> array {
+    // Element-wise SwiGLU: out[i] = x[i] * sigmoid(gate[i])
     let mut out = []
     let n = len(x)
     let mut i = 0
@@ -329,17 +301,18 @@ fn swiglu_vec(x: array, gate: array) -> array {
     out
 }
 
-// Softmax with numerical stability: exp(x - max) / sum(exp(x - max))
+// Numerically stable softmax: exp(x - max) / sum(exp(x - max))
+// Subtracting max prevents overflow in exp().
 fn softmax(logits: array) -> array {
     let n = len(logits)
-    // Find max for numerical stability
+    // Step 1: find max for numerical stability
     let mut mx = logits[0]
     let mut i = 1
     while i < n {
         if logits[i] > mx { mx = logits[i] }
         i = i + 1
     }
-    // Compute exp(x - max)
+    // Step 2: compute exp(x - max) and accumulate sum
     let mut exps = []
     let mut sum_exp = 0.0
     i = 0
@@ -349,7 +322,7 @@ fn softmax(logits: array) -> array {
         sum_exp = sum_exp + e
         i = i + 1
     }
-    // Normalize
+    // Step 3: normalize
     let mut out = []
     i = 0
     while i < n {
@@ -360,6 +333,7 @@ fn softmax(logits: array) -> array {
 }
 
 // Log-softmax: x - max - log(sum(exp(x - max)))
+// More numerically stable than log(softmax(x)) for cross-entropy.
 fn log_softmax(logits: array) -> array {
     let n = len(logits)
     let mut mx = logits[0]
@@ -385,10 +359,13 @@ fn log_softmax(logits: array) -> array {
 }
 
 // ════════════════════════════════════════════════════════════════════
-// §4  NORMALIZATION
+// S5  NORMALIZATION
 // ════════════════════════════════════════════════════════════════════
 
 // LayerNorm: (x - mu) / sqrt(var + eps) * gamma + beta
+// Normalizes activations to zero mean, unit variance per-token.
+// gamma (scale) and beta (shift) are learnable affine parameters.
+// eps prevents division by zero when variance is near 0.
 fn layer_norm(x: array, gamma: array, beta: array, eps: float) -> array {
     let mu = tensor_mean(x)
     let v = tensor_var(x)
@@ -404,6 +381,7 @@ fn layer_norm(x: array, gamma: array, beta: array, eps: float) -> array {
 }
 
 // RMSNorm: x / rms(x) * gamma   (no mean subtraction, no beta)
+// Simpler than LayerNorm, used in LLaMA and other modern architectures.
 fn rms_norm(x: array, gamma: array, eps: float) -> array {
     let n = len(x)
     let mut sq_sum = 0.0
@@ -422,30 +400,23 @@ fn rms_norm(x: array, gamma: array, eps: float) -> array {
     out
 }
 
-// BatchNorm (inference mode): (x - mean) / sqrt(var + eps) * gamma + beta
-fn batch_norm_inference(x: array, running_mean: array, running_var: array, gamma: array, beta: array, eps: float) -> array {
-    let n = len(x)
-    let mut out = []
-    let mut i = 0
-    while i < n {
-        let xn = (x[i] - running_mean[i]) / sqrt(running_var[i] + eps)
-        out = out.push(xn * gamma[i] + beta[i])
-        i = i + 1
-    }
-    out
-}
-
 // ════════════════════════════════════════════════════════════════════
-// §5  ATTENTION
+// S6  ATTENTION
 // ════════════════════════════════════════════════════════════════════
 
-// Scaled dot-product attention (single head)
-// Q, K, V: flat [seq_len × d_k]
-// Returns: flat [seq_len × d_k]
+// Scaled dot-product attention (single head) with optional causal mask.
+// Q, K, V: flat [seq_len x d_k], row-major.
+// Returns: flat [seq_len x d_k].
+//
+// Algorithm:
+//   1. scores = Q * K^T / sqrt(d_k)         [seq_len x seq_len]
+//   2. if causal: scores[i,j] = -inf for j > i
+//   3. weights = softmax(scores, dim=-1)     [seq_len x seq_len]
+//   4. output = weights * V                  [seq_len x d_k]
 fn scaled_dot_product_attention(Q: array, K: array, V: array, d_k: int, seq_len: int, causal: bool) -> array {
     let scale = 1.0 / sqrt(to_float(d_k))
 
-    // scores[seq_len × seq_len] = Q × K^T / sqrt(d_k)
+    // Compute scores[seq_len x seq_len] = Q * K^T / sqrt(d_k)
     let mut scores = tensor_zeros(seq_len * seq_len)
     let mut i = 0
     while i < seq_len {
@@ -458,7 +429,7 @@ fn scaled_dot_product_attention(Q: array, K: array, V: array, d_k: int, seq_len:
                 k = k + 1
             }
             let mut val = dot * scale
-            // Causal mask: future positions get -inf
+            // Causal mask: future positions (j > i) get -inf
             if causal && j > i {
                 val = NEG_INF
             }
@@ -482,7 +453,7 @@ fn scaled_dot_product_attention(Q: array, K: array, V: array, d_k: int, seq_len:
         i = i + 1
     }
 
-    // output[seq_len × d_k] = attn_weights × V
+    // output[seq_len x d_k] = attn_weights * V
     let mut out = tensor_zeros(seq_len * d_k)
     i = 0
     while i < seq_len {
@@ -502,93 +473,45 @@ fn scaled_dot_product_attention(Q: array, K: array, V: array, d_k: int, seq_len:
     out
 }
 
-// Multi-head attention
-// x: flat [seq_len × d_model]
-// Wq, Wk, Wv: flat [d_model × d_model]
-// Wo: flat [d_model × d_model]
-// Returns: flat [seq_len × d_model]
-fn multi_head_attention(x: array, Wq: array, Wk: array, Wv: array, Wo: array, n_heads: int, d_model: int, seq_len: int, causal: bool) -> array {
-    let d_k = d_model / n_heads
-
-    // Project Q, K, V: [seq_len × d_model] × [d_model × d_model]
-    let Q_all = matmul(x, Wq, seq_len, d_model, d_model)
-    let K_all = matmul(x, Wk, seq_len, d_model, d_model)
-    let V_all = matmul(x, Wv, seq_len, d_model, d_model)
-
-    // Per-head attention
-    let mut concat_out = tensor_zeros(seq_len * d_model)
-    let mut h = 0
-    while h < n_heads {
-        // Extract head h: columns [h*d_k .. (h+1)*d_k] for each row
-        let mut Qh = tensor_zeros(seq_len * d_k)
-        let mut Kh = tensor_zeros(seq_len * d_k)
-        let mut Vh = tensor_zeros(seq_len * d_k)
-        let mut s = 0
-        while s < seq_len {
-            let mut k = 0
-            while k < d_k {
-                Qh[s * d_k + k] = Q_all[s * d_model + h * d_k + k]
-                Kh[s * d_k + k] = K_all[s * d_model + h * d_k + k]
-                Vh[s * d_k + k] = V_all[s * d_model + h * d_k + k]
-                k = k + 1
-            }
-            s = s + 1
-        }
-
-        // Attend
-        let head_out = scaled_dot_product_attention(Qh, Kh, Vh, d_k, seq_len, causal)
-
-        // Write back to concat position
-        s = 0
-        while s < seq_len {
-            let mut k = 0
-            while k < d_k {
-                concat_out[s * d_model + h * d_k + k] = head_out[s * d_k + k]
-                k = k + 1
-            }
-            s = s + 1
-        }
-        h = h + 1
-    }
-
-    // Output projection: [seq_len × d_model] × [d_model × d_model]
-    matmul(concat_out, Wo, seq_len, d_model, d_model)
-}
-
 // RoPE (Rotary Position Embedding)
-// x: flat [seq_len × d_model], applies rotation per position
-// Operates on pairs (x[2i], x[2i+1]) with frequency theta_i = pos / 10000^(2i/d)
-fn rotary_embedding(x: array, seq_len: int, d_model: int) -> array {
-    let mut out = tensor_zeros(seq_len * d_model)
-    let half_d = d_model / 2
-    let mut pos = 0
-    while pos < seq_len {
-        let mut i = 0
-        while i < half_d {
-            // freq = 1 / 10000^(2i/d_model)
-            let freq = 1.0 / pow(10000.0, 2.0 * to_float(i) / to_float(d_model))
-            let angle = to_float(pos) * freq
-            let cos_a = cos(angle)
-            let sin_a = sin(angle)
-            let idx0 = pos * d_model + 2 * i
-            let idx1 = pos * d_model + 2 * i + 1
-            let x0 = x[idx0]
-            let x1 = x[idx1]
-            out[idx0] = x0 * cos_a - x1 * sin_a
-            out[idx1] = x0 * sin_a + x1 * cos_a
-            i = i + 1
-        }
-        pos = pos + 1
+// Encodes position by rotating pairs of dimensions:
+//   (x[2i], x[2i+1]) rotated by angle = pos * freq_i
+//   freq_i = 1 / 10000^(2i / d)
+//
+// From Su et al. 2021 "RoFormer":
+//   - Encodes absolute position via 2D rotation matrix per dim pair
+//   - Decays relative attention by distance (desirable for sequences)
+//   - At pos=0: cos(0)=1, sin(0)=0 -> identity (no-op)
+//   - At pos>0: each pair rotates, encoding positional info
+fn rotary_embedding(x: array, pos: int, d: int) -> array {
+    let mut out = tensor_zeros(d)
+    let half_d = d / 2
+    let mut i = 0
+    while i < half_d {
+        // freq = 1 / 10000^(2i/d) -- lower frequencies for higher dims
+        let freq = 1.0 / pow(10000.0, 2.0 * to_float(i) / to_float(d))
+        let angle = to_float(pos) * freq
+        let cos_a = cos(angle)
+        let sin_a = sin(angle)
+        let idx0 = 2 * i
+        let idx1 = 2 * i + 1
+        let x0 = x[idx0]
+        let x1 = x[idx1]
+        // 2D rotation: [cos -sin; sin cos] * [x0; x1]
+        out[idx0] = x0 * cos_a - x1 * sin_a
+        out[idx1] = x0 * sin_a + x1 * cos_a
+        i = i + 1
     }
     out
 }
 
 // ════════════════════════════════════════════════════════════════════
-// §6  LAYERS
+// S7  LAYERS
 // ════════════════════════════════════════════════════════════════════
 
-// Linear: y = Wx + b
-// x: [in_dim], W: flat [out_dim × in_dim], b: [out_dim]
+// Linear: y = W*x + b
+// x: [in_dim], W: flat [out_dim x in_dim], b: [out_dim]
+// Each output y[i] = sum_j(W[i,j] * x[j]) + b[i]
 fn linear(x: array, W: array, b: array, in_dim: int, out_dim: int) -> array {
     let mut y = tensor_zeros(out_dim)
     let mut i = 0
@@ -605,47 +528,82 @@ fn linear(x: array, W: array, b: array, in_dim: int, out_dim: int) -> array {
     y
 }
 
-// SwiGLU FFN: gate = sigmoid(W_gate x), out = W2 (swiglu(W1 x, W_gate x))
-// x: [d_model], W1: [d_ff × d_model], W2: [d_model × d_ff], W_gate: [d_ff × d_model]
-fn ffn_swiglu(x: array, W1: array, W2: array, W_gate: array, d_model: int, d_ff: int) -> array {
-    // Up projection
-    let up = matvec(W1, x, d_ff, d_model)
-    // Gate projection
-    let gate = matvec(W_gate, x, d_ff, d_model)
-    // SwiGLU activation
+// SwiGLU FFN block:
+//   up   = W_up * x        [d_ff]
+//   gate = W_gate * x      [d_ff]
+//   act  = up * sigmoid(gate)   [d_ff]  (SwiGLU activation)
+//   out  = W_down * act    [d_in]
+//
+// x: [d_in], W_up: [d_ff x d_in], W_gate: [d_ff x d_in], W_down: [d_in x d_ff]
+fn ffn_swiglu(x: array, W_up: array, W_gate: array, W_down: array, d_in: int, d_ff: int) -> array {
+    // Up projection: d_in -> d_ff
+    let up = matvec(W_up, x, d_ff, d_in)
+    // Gate projection: d_in -> d_ff (parallel path)
+    let gate = matvec(W_gate, x, d_ff, d_in)
+    // SwiGLU activation: element-wise up * sigmoid(gate)
     let activated = swiglu_vec(up, gate)
-    // Down projection
-    matvec(W2, activated, d_model, d_ff)
+    // Down projection: d_ff -> d_in
+    matvec(W_down, activated, d_in, d_ff)
 }
 
-// Embedding lookup: indices -> concat of embedding rows
-// table: flat [vocab_size × d_model]
-fn embedding_lookup(indices: array, table: array, vocab_size: int, d_model: int) -> array {
-    let n = len(indices)
+// Embedding lookup: table[vocab_size x d_model], idx -> row
+// Returns the d_model-dimensional embedding for token idx.
+fn embedding_lookup(table: array, idx: int, d_model: int) -> array {
     let mut out = []
+    let mut j = 0
+    while j < d_model {
+        out = out.push(table[idx * d_model + j])
+        j = j + 1
+    }
+    out
+}
+
+// Dropout: randomly zero out elements with probability `rate`.
+// Uses LCG PRNG seeded by `seed`. Returns new array (pass-by-value).
+// Scale surviving elements by 1/(1-rate) to preserve expected value
+// ("inverted dropout" -- standard in PyTorch/TensorFlow).
+//
+// At inference time, call with rate=0.0 to skip (identity).
+fn dropout(x: array, rate: float, seed: int) -> array {
+    let n = len(x)
+    // rate=0 is identity (no dropout)
+    if rate < 0.000001 {
+        // Return a copy (hexa pass-by-value, so this is already a copy)
+        let mut out = []
+        let mut i = 0
+        while i < n {
+            out = out.push(x[i])
+            i = i + 1
+        }
+        return out
+    }
+    // Inverted dropout scale: 1 / (1 - rate)
+    let scale = 1.0 / (1.0 - rate)
+    let mut out = []
+    let mut s = seed
     let mut i = 0
     while i < n {
-        let idx = to_int(indices[i])
-        let mut j = 0
-        while j < d_model {
-            out = out.push(table[idx * d_model + j])
-            j = j + 1
+        // LCG step
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        if u < rate {
+            // Drop this element (set to 0)
+            out = out.push(0.0)
+        } else {
+            // Keep and scale up to preserve expected value
+            out = out.push(x[i] * scale)
         }
         i = i + 1
     }
     out
 }
 
-// Residual connection: x + sublayer_output
-fn residual_add(x: array, sublayer_out: array) -> array {
-    tensor_add(x, sublayer_out)
-}
-
 // ════════════════════════════════════════════════════════════════════
-// §7  INITIALIZATION
+// S8  INITIALIZATION
 // ════════════════════════════════════════════════════════════════════
 
 // Xavier uniform: U[-limit, limit] where limit = sqrt(6 / (fan_in + fan_out))
+// Ensures variance preservation across layers for stable training.
 fn xavier_init(fan_in: int, fan_out: int, seed: int) -> array {
     let n = fan_in * fan_out
     let limit = sqrt(6.0 / to_float(fan_in + fan_out))
@@ -654,7 +612,6 @@ fn xavier_init(fan_in: int, fan_out: int, seed: int) -> array {
     let mut i = 0
     while i < n {
         s = (s * 1103515245 + 12345) % 2147483648
-        // Map to [-limit, limit]
         let u = to_float(s % 1000000) / 1000000.0
         out = out.push(u * 2.0 * limit - limit)
         i = i + 1
@@ -662,23 +619,15 @@ fn xavier_init(fan_in: int, fan_out: int, seed: int) -> array {
     out
 }
 
-// He normal: N(0, sqrt(2/fan_in))
+// He normal: N(0, sqrt(2/fan_in))  -- for ReLU/GELU networks
 fn he_init(fan_in: int, n: int, seed: int) -> array {
     let std = sqrt(2.0 / to_float(fan_in))
     let raw = tensor_randn(n, seed)
     tensor_mul_scalar(raw, std)
 }
 
-// Initialize a linear layer: returns [W_flat, b_flat] as [W..., b...]
-// W: [out_dim × in_dim] Xavier, b: [out_dim] zeros
-fn init_linear(in_dim: int, out_dim: int, seed: int) -> array {
-    let W = xavier_init(in_dim, out_dim, seed)
-    let b = tensor_zeros(out_dim)
-    tensor_concat(W, b)
-}
-
 // ════════════════════════════════════════════════════════════════════
-// §8  LOSS / UTILITY
+// S9  LOSS / UTILITY
 // ════════════════════════════════════════════════════════════════════
 
 // Cross-entropy loss: -log(softmax(logits)[target_idx])
@@ -703,159 +652,535 @@ fn argmax(values: array) -> int {
     best_idx
 }
 
-// Top-k sampling with temperature
-// Returns sampled index from top-k logits
-fn top_k_sample(logits: array, k: int, temperature: float, seed: int) -> int {
-    let n = len(logits)
+// ════════════════════════════════════════════════════════════════════
+// S10  CANONICAL nn_* API
+// ════════════════════════════════════════════════════════════════════
+// These are the 10 primitives that define the public contract.
+// Other modules should reference these signatures.
 
-    // Apply temperature
-    let mut scaled = []
+// nn_matmul: C[rows_a x cols_b] = a[rows_a x cols_a] * b[cols_a x cols_b]
+fn nn_matmul(a: array, b: array, rows_a: int, cols_a: int, cols_b: int) -> array {
+    matmul(a, b, rows_a, cols_a, cols_b)
+}
+
+// nn_softmax: numerically stable softmax over n-element logits vector
+fn nn_softmax(logits: array, n: int) -> array {
+    // n parameter matches the API contract; we use len(logits) internally
+    // but accept n for explicitness and future batched extensions.
+    softmax(logits)
+}
+
+// nn_layer_norm: layer normalization with explicit n and eps
+fn nn_layer_norm(x: array, gamma: array, beta: array, n: int, eps: float) -> array {
+    layer_norm(x, gamma, beta, eps)
+}
+
+// nn_attention: scaled dot-product attention with causal mask
+// Q, K, V: flat [seq_len x d_head]
+// Always causal (autoregressive default for HEXA-SPEAK).
+fn nn_attention(Q: array, K: array, V: array, d_head: int, seq_len: int) -> array {
+    scaled_dot_product_attention(Q, K, V, d_head, seq_len, true)
+}
+
+// nn_rope: rotary positional embedding for a single position vector
+// x: [d_model], pos: sequence position, d_model: dimension
+fn nn_rope(x: array, pos: int, d_model: int) -> array {
+    rotary_embedding(x, pos, d_model)
+}
+
+// nn_swiglu: SwiGLU FFN block
+// x: [d_in], w_up: [d_ff x d_in], w_gate: [d_ff x d_in], w_down: [d_in x d_ff]
+fn nn_swiglu(x: array, w_up: array, w_gate: array, w_down: array, d_in: int, d_ff: int) -> array {
+    ffn_swiglu(x, w_up, w_gate, w_down, d_in, d_ff)
+}
+
+// nn_linear: linear projection y = W*x + bias
+// x: [d_in], w: [d_out x d_in], bias: [d_out]
+fn nn_linear(x: array, w: array, bias: array, d_in: int, d_out: int) -> array {
+    linear(x, w, bias, d_in, d_out)
+}
+
+// nn_embedding_lookup: look up a single token embedding
+// table: flat [vocab_size x d_model], idx: token index
+fn nn_embedding_lookup(table: array, idx: int, d_model: int) -> array {
+    embedding_lookup(table, idx, d_model)
+}
+
+// nn_dropout: dropout with inverted scaling (training only)
+// x: input vector, rate: drop probability, seed: PRNG seed
+fn nn_dropout(x: array, rate: float, seed: int) -> array {
+    dropout(x, rate, seed)
+}
+
+// nn_gelu: GELU activation applied element-wise to a vector
+fn nn_gelu(x: array) -> array {
+    let mut out = []
+    let n = len(x)
     let mut i = 0
     while i < n {
-        scaled = scaled.push(logits[i] / temperature)
+        out = out.push(gelu(x[i]))
         i = i + 1
     }
-
-    // Find top-k indices by repeated argmax
-    let mut top_indices = []
-    let mut top_logits = []
-    let mut mask = tensor_zeros(n)   // 1.0 = already picked
-    let mut ki = 0
-    let actual_k = if k > n { n } else { k }
-    while ki < actual_k {
-        let mut best_idx = -1
-        let mut best_val = NEG_INF
-        i = 0
-        while i < n {
-            if mask[i] < 0.5 && scaled[i] > best_val {
-                best_val = scaled[i]
-                best_idx = i
-            }
-            i = i + 1
-        }
-        if best_idx >= 0 {
-            top_indices = top_indices.push(best_idx)
-            top_logits = top_logits.push(best_val)
-            mask[best_idx] = 1.0
-        }
-        ki = ki + 1
-    }
-
-    // Softmax over top-k logits
-    let probs = softmax(top_logits)
-
-    // Sample from categorical distribution using seed
-    let mut s = seed
-    s = (s * 1103515245 + 12345) % 2147483648
-    let u = to_float(s % 1000000) / 1000000.0
-    let mut cumsum = 0.0
-    i = 0
-    while i < len(probs) {
-        cumsum = cumsum + probs[i]
-        if u < cumsum {
-            return to_int(top_indices[i])
-        }
-        i = i + 1
-    }
-    // Fallback: return last
-    to_int(top_indices[len(top_indices) - 1])
+    out
 }
 
 // ════════════════════════════════════════════════════════════════════
-// §9  DEMO (main)
+// S11  SELF-TEST
+// ════════════════════════════════════════════════════════════════════
+// Rigorous pass/fail tests for every primitive.
+// Convention: tolerance-based float comparison, explicit PASS/FAIL.
+
+fn self_test_nn_core() {
+    println("================================================================")
+    println(" nn_core.hexa -- HEXA-SPEAK Mk.III Self-Test")
+    println("================================================================")
+    println("")
+
+    let mut pass_count = 0
+    let mut fail_count = 0
+
+    // ── T1: nn_matmul — identity matrix test ──
+    // Multiplying by identity should return the original matrix.
+    // I[2x2] * A[2x2] = A[2x2]
+    println("[T1] nn_matmul: identity matrix")
+    let eye2 = [1.0, 0.0, 0.0, 1.0]
+    let A2 = [3.0, 7.0, 2.0, 5.0]
+    let res_eye = nn_matmul(eye2, A2, 2, 2, 2)
+    let t1_ok = abs_f(res_eye[0] - 3.0) < 0.001 && abs_f(res_eye[1] - 7.0) < 0.001 && abs_f(res_eye[2] - 2.0) < 0.001 && abs_f(res_eye[3] - 5.0) < 0.001
+    if t1_ok {
+        println("  PASS: I*A = A  [3,7,2,5]")
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: got [" + to_string(res_eye[0]) + "," + to_string(res_eye[1]) + "," + to_string(res_eye[2]) + "," + to_string(res_eye[3]) + "]")
+        fail_count = fail_count + 1
+    }
+
+    // ── T2: nn_matmul — known 2x3 * 3x2 result ──
+    // A=[[1,2,3],[4,5,6]] B=[[7,8],[9,10],[11,12]]
+    // Expected: [[58,64],[139,154]]
+    println("[T2] nn_matmul: 2x3 * 3x2 known result")
+    let Am = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    let Bm = [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+    let Cm = nn_matmul(Am, Bm, 2, 3, 2)
+    let t2_ok = abs_f(Cm[0] - 58.0) < 0.001 && abs_f(Cm[1] - 64.0) < 0.001 && abs_f(Cm[2] - 139.0) < 0.001 && abs_f(Cm[3] - 154.0) < 0.001
+    if t2_ok {
+        println("  PASS: [[58,64],[139,154]]")
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: got [" + to_string(Cm[0]) + "," + to_string(Cm[1]) + "," + to_string(Cm[2]) + "," + to_string(Cm[3]) + "]")
+        fail_count = fail_count + 1
+    }
+
+    // ── T3: nn_softmax — sum=1 ──
+    // Softmax output must sum to 1.0 regardless of input.
+    println("[T3] nn_softmax: sum = 1")
+    let sm_in = [2.0, 1.0, 0.1, -1.0, 3.0]
+    let sm_out = nn_softmax(sm_in, 5)
+    let sm_sum = tensor_sum(sm_out)
+    let t3_ok = abs_f(sm_sum - 1.0) < 0.001
+    if t3_ok {
+        println("  PASS: sum=" + to_string(sm_sum))
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: sum=" + to_string(sm_sum))
+        fail_count = fail_count + 1
+    }
+
+    // ── T4: nn_softmax — argmax correct ──
+    // The largest logit (3.0 at index 4) should get the highest probability.
+    println("[T4] nn_softmax: argmax correct")
+    let sm_argmax = argmax(sm_out)
+    if sm_argmax == 4 {
+        println("  PASS: argmax=4 (largest logit at idx 4)")
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: argmax=" + to_string(sm_argmax) + " expected 4")
+        fail_count = fail_count + 1
+    }
+
+    // ── T5: nn_softmax — numerical stability with large values ──
+    // Softmax must not overflow/NaN on very large inputs.
+    // exp(1000) would overflow, but subtracting max prevents it.
+    println("[T5] nn_softmax: numerical stability (large values)")
+    let sm_big = [1000.0, 1001.0, 999.0]
+    let sm_big_out = nn_softmax(sm_big, 3)
+    let sm_big_sum = tensor_sum(sm_big_out)
+    let sm_big_argmax = argmax(sm_big_out)
+    // Sum should still be 1.0, argmax should be index 1 (value 1001)
+    let t5_ok = abs_f(sm_big_sum - 1.0) < 0.001 && sm_big_argmax == 1
+    if t5_ok {
+        println("  PASS: sum=" + to_string(sm_big_sum) + " argmax=1 (no overflow)")
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: sum=" + to_string(sm_big_sum) + " argmax=" + to_string(sm_big_argmax))
+        fail_count = fail_count + 1
+    }
+
+    // ── T6: nn_layer_norm — mean approximately 0 ──
+    // After LayerNorm with gamma=1, beta=0, output mean should be ~0.
+    println("[T6] nn_layer_norm: mean ~= 0")
+    let ln_x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    let ln_g = tensor_ones(6)
+    let ln_b = tensor_zeros(6)
+    let ln_out = nn_layer_norm(ln_x, ln_g, ln_b, 6, 1.0e-5)
+    let ln_mean = tensor_mean(ln_out)
+    let t6_ok = abs_f(ln_mean) < 0.001
+    if t6_ok {
+        println("  PASS: mean=" + to_string(ln_mean))
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: mean=" + to_string(ln_mean) + " expected ~0")
+        fail_count = fail_count + 1
+    }
+
+    // ── T7: nn_layer_norm — variance approximately 1 ──
+    // With gamma=1, beta=0, output variance should be ~1.
+    println("[T7] nn_layer_norm: var ~= 1")
+    let ln_var = tensor_var(ln_out)
+    // Population variance of normalized data with N/(N-1) correction approx
+    // For N=6, var should be close to 1.0 (exact = N/(N) = 1.0 since we use population var)
+    let t7_ok = abs_f(ln_var - 1.0) < 0.02
+    if t7_ok {
+        println("  PASS: var=" + to_string(ln_var))
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: var=" + to_string(ln_var) + " expected ~1")
+        fail_count = fail_count + 1
+    }
+
+    // ── T8: nn_layer_norm — affine transform (gamma/beta) ──
+    // gamma=2, beta=1 should give mean=1, var=4 approximately.
+    println("[T8] nn_layer_norm: affine gamma=2, beta=1")
+    let ln_g2 = [2.0, 2.0, 2.0, 2.0, 2.0, 2.0]
+    let ln_b1 = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    let ln_out2 = nn_layer_norm(ln_x, ln_g2, ln_b1, 6, 1.0e-5)
+    let ln_mean2 = tensor_mean(ln_out2)
+    let ln_var2 = tensor_var(ln_out2)
+    // mean should be ~1 (beta shifts the zero-mean output), var ~4 (gamma^2 * 1)
+    let t8_ok = abs_f(ln_mean2 - 1.0) < 0.01 && abs_f(ln_var2 - 4.0) < 0.1
+    if t8_ok {
+        println("  PASS: mean=" + to_string(ln_mean2) + " var=" + to_string(ln_var2))
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: mean=" + to_string(ln_mean2) + " var=" + to_string(ln_var2))
+        fail_count = fail_count + 1
+    }
+
+    // ── T9: nn_attention — causal mask blocks future ──
+    // For a 3-token sequence, position 0 should only attend to itself.
+    // We verify by making K[1]/K[2] very large -- if causal works,
+    // output[0] should NOT be influenced by them.
+    println("[T9] nn_attention: causal mask blocks future tokens")
+    let d_k = 4
+    let sl = 3
+    // Q: all ones for position 0, zeros elsewhere
+    let att_Q = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    // K: position 0 has small values, position 1,2 have very large (would dominate without mask)
+    let att_K = [0.1, 0.1, 0.1, 0.1, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0]
+    // V: position 0 = [1,0,0,0], position 1 = [0,1,0,0], position 2 = [0,0,1,0]
+    let att_V = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+    let att_out = nn_attention(att_Q, att_K, att_V, d_k, sl)
+    // Position 0 can only attend to position 0 (causal mask).
+    // So output[0] should be V[0] = [1,0,0,0].
+    // With causal mask, weights[0] = softmax([-inf filtered]) = [1, 0, 0].
+    let t9_ok = abs_f(att_out[0] - 1.0) < 0.01 && abs_f(att_out[1]) < 0.01 && abs_f(att_out[2]) < 0.01 && abs_f(att_out[3]) < 0.01
+    if t9_ok {
+        println("  PASS: pos 0 output = [" + to_string(att_out[0]) + "," + to_string(att_out[1]) + "," + to_string(att_out[2]) + "," + to_string(att_out[3]) + "] (only sees V[0])")
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: pos 0 output = [" + to_string(att_out[0]) + "," + to_string(att_out[1]) + "," + to_string(att_out[2]) + "," + to_string(att_out[3]) + "]")
+        fail_count = fail_count + 1
+    }
+
+    // ── T10: nn_attention — last position sees all ──
+    // Position 2 (last) should attend to all 3 positions.
+    // Its output should be a mixture of all V rows, not just V[2].
+    println("[T10] nn_attention: last pos attends to all")
+    // The last position's output row starts at index 2*d_k = 8
+    // Since K[1] and K[2] have very large values, their softmax weights
+    // will be high for position 2 (which can see them).
+    // output[2] should NOT be exactly V[2] = [0,0,1,0].
+    // It should have nonzero components from V[1] = [0,1,0,0].
+    let last_v0 = att_out[8]
+    let last_v1 = att_out[9]
+    let last_v2 = att_out[10]
+    // At minimum, V[1] and V[2] contribute, so v1 and v2 components > 0
+    let t10_ok = last_v1 > 0.001 || last_v2 > 0.001
+    if t10_ok {
+        println("  PASS: pos 2 output = [" + to_string(last_v0) + "," + to_string(last_v1) + "," + to_string(last_v2) + ",...] (attends to multiple)")
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: pos 2 output has no multi-token influence")
+        fail_count = fail_count + 1
+    }
+
+    // ── T11: nn_rope — identity at pos=0 ──
+    // At pos=0, all angles are 0: cos(0)=1, sin(0)=0 -> rotation is identity.
+    println("[T11] nn_rope: identity at pos=0")
+    let rope_in = [1.0, 2.0, 3.0, 4.0]
+    let rope_0 = nn_rope(rope_in, 0, 4)
+    let t11_ok = abs_f(rope_0[0] - 1.0) < 0.001 && abs_f(rope_0[1] - 2.0) < 0.001 && abs_f(rope_0[2] - 3.0) < 0.001 && abs_f(rope_0[3] - 4.0) < 0.001
+    if t11_ok {
+        println("  PASS: pos=0 -> [1,2,3,4] unchanged")
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: pos=0 -> [" + to_string(rope_0[0]) + "," + to_string(rope_0[1]) + "," + to_string(rope_0[2]) + "," + to_string(rope_0[3]) + "]")
+        fail_count = fail_count + 1
+    }
+
+    // ── T12: nn_rope — rotation at pos>0 ──
+    // At pos>0, output should differ from input.
+    println("[T12] nn_rope: rotation at pos=5")
+    let rope_5 = nn_rope(rope_in, 5, 4)
+    let mut rope_diff = 0.0
+    let mut ri = 0
+    while ri < 4 {
+        let d = rope_5[ri] - rope_in[ri]
+        rope_diff = rope_diff + d * d
+        ri = ri + 1
+    }
+    rope_diff = sqrt(rope_diff)
+    let t12_ok = rope_diff > 0.01
+    if t12_ok {
+        println("  PASS: L2 diff from input = " + to_string(rope_diff) + " (rotation applied)")
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: L2 diff = " + to_string(rope_diff) + " (no rotation detected)")
+        fail_count = fail_count + 1
+    }
+
+    // ── T13: nn_rope — preserves norm ──
+    // Rotation should preserve the L2 norm of each pair.
+    println("[T13] nn_rope: preserves L2 norm")
+    let norm_before = tensor_norm(rope_in)
+    let norm_after = tensor_norm(rope_5)
+    let t13_ok = abs_f(norm_before - norm_after) < 0.001
+    if t13_ok {
+        println("  PASS: norm before=" + to_string(norm_before) + " after=" + to_string(norm_after))
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: norm before=" + to_string(norm_before) + " after=" + to_string(norm_after))
+        fail_count = fail_count + 1
+    }
+
+    // ── T14: nn_linear — known computation ──
+    // W=[[1,2],[3,4]], b=[0.5,0.5], x=[1,1]
+    // y[0] = 1*1 + 2*1 + 0.5 = 3.5
+    // y[1] = 3*1 + 4*1 + 0.5 = 7.5
+    println("[T14] nn_linear: known 2x2 result")
+    let lin_W = [1.0, 2.0, 3.0, 4.0]
+    let lin_b = [0.5, 0.5]
+    let lin_x = [1.0, 1.0]
+    let lin_y = nn_linear(lin_x, lin_W, lin_b, 2, 2)
+    let t14_ok = abs_f(lin_y[0] - 3.5) < 0.001 && abs_f(lin_y[1] - 7.5) < 0.001
+    if t14_ok {
+        println("  PASS: y=[" + to_string(lin_y[0]) + "," + to_string(lin_y[1]) + "]")
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: y=[" + to_string(lin_y[0]) + "," + to_string(lin_y[1]) + "] expected [3.5,7.5]")
+        fail_count = fail_count + 1
+    }
+
+    // ── T15: nn_embedding_lookup — correct row ──
+    // table 3x2: [[0.1,0.2],[0.3,0.4],[0.5,0.6]], lookup idx=2 -> [0.5,0.6]
+    println("[T15] nn_embedding_lookup: correct row")
+    let emb_table = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    let emb_out = nn_embedding_lookup(emb_table, 2, 2)
+    let t15_ok = abs_f(emb_out[0] - 0.5) < 0.001 && abs_f(emb_out[1] - 0.6) < 0.001
+    if t15_ok {
+        println("  PASS: idx=2 -> [" + to_string(emb_out[0]) + "," + to_string(emb_out[1]) + "]")
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: idx=2 -> [" + to_string(emb_out[0]) + "," + to_string(emb_out[1]) + "]")
+        fail_count = fail_count + 1
+    }
+
+    // ── T16: nn_dropout — rate=0 is identity ──
+    println("[T16] nn_dropout: rate=0 is identity")
+    let drop_in = [1.0, 2.0, 3.0, 4.0, 5.0]
+    let drop_0 = nn_dropout(drop_in, 0.0, 42)
+    let mut t16_ok = true
+    let mut di = 0
+    while di < 5 {
+        if abs_f(drop_0[di] - drop_in[di]) > 0.001 {
+            t16_ok = false
+        }
+        di = di + 1
+    }
+    if t16_ok {
+        println("  PASS: rate=0 output matches input exactly")
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: rate=0 output differs from input")
+        fail_count = fail_count + 1
+    }
+
+    // ── T17: nn_dropout — rate=1.0 zeros everything ──
+    println("[T17] nn_dropout: rate=1.0 zeros all")
+    let drop_1 = nn_dropout(drop_in, 1.0, 42)
+    let drop_1_sum = tensor_sum(drop_1)
+    // All elements should be 0 (every element dropped)
+    let t17_ok = abs_f(drop_1_sum) < 0.001
+    if t17_ok {
+        println("  PASS: all elements zeroed, sum=" + to_string(drop_1_sum))
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: sum=" + to_string(drop_1_sum) + " expected 0")
+        fail_count = fail_count + 1
+    }
+
+    // ── T18: nn_dropout — partial rate preserves expected value ──
+    // With rate=0.5 and inverted dropout, surviving elements are scaled
+    // by 2x. The mean of the non-zero elements should approximate the
+    // original mean. We test with a large vector for statistical stability.
+    println("[T18] nn_dropout: rate=0.5 preserves expected value (approx)")
+    let big_vec = tensor_ones(200)
+    let drop_half = nn_dropout(big_vec, 0.5, 12345)
+    // Count non-zero elements
+    let mut nz_count = 0
+    let mut nz_sum = 0.0
+    let mut di2 = 0
+    while di2 < 200 {
+        if abs_f(drop_half[di2]) > 0.001 {
+            nz_count = nz_count + 1
+            nz_sum = nz_sum + drop_half[di2]
+        }
+        di2 = di2 + 1
+    }
+    // Survivors are scaled by 1/(1-0.5)=2.0, so each surviving element = 2.0.
+    // Expected mean of full vector = 1.0 (original), so total sum / 200 ~ 1.0.
+    let drop_mean = tensor_sum(drop_half) / 200.0
+    // Allow wide tolerance since this is stochastic: mean in [0.5, 1.5]
+    let t18_ok = drop_mean > 0.5 && drop_mean < 1.5 && nz_count > 0 && nz_count < 200
+    if t18_ok {
+        println("  PASS: mean=" + to_string(drop_mean) + " survivors=" + to_string(nz_count) + "/200")
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: mean=" + to_string(drop_mean) + " survivors=" + to_string(nz_count))
+        fail_count = fail_count + 1
+    }
+
+    // ── T19: nn_gelu — known values ──
+    // gelu(0) = 0, gelu(large) ~ large, gelu(negative) ~ 0
+    println("[T19] nn_gelu: known values")
+    let gelu_in = [0.0, 3.0, -3.0, 1.0]
+    let gelu_out = nn_gelu(gelu_in)
+    // gelu(0) = 0 exactly
+    // gelu(3) ~ 2.9960 (very close to 3, since gelu(x) -> x for large x)
+    // gelu(-3) ~ -0.0040 (very close to 0, since gelu(x) -> 0 for large negative x)
+    // gelu(1) ~ 0.8412
+    let t19_ok = abs_f(gelu_out[0]) < 0.001 && abs_f(gelu_out[1] - 3.0) < 0.01 && abs_f(gelu_out[2]) < 0.01 && abs_f(gelu_out[3] - 0.8412) < 0.01
+    if t19_ok {
+        println("  PASS: gelu([0,3,-3,1]) = [" + to_string(gelu_out[0]) + "," + to_string(gelu_out[1]) + "," + to_string(gelu_out[2]) + "," + to_string(gelu_out[3]) + "]")
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: gelu([0,3,-3,1]) = [" + to_string(gelu_out[0]) + "," + to_string(gelu_out[1]) + "," + to_string(gelu_out[2]) + "," + to_string(gelu_out[3]) + "]")
+        fail_count = fail_count + 1
+    }
+
+    // ── T20: nn_swiglu — dimension preservation ──
+    // SwiGLU FFN: d_in -> d_ff -> d_in, verify output dimension.
+    println("[T20] nn_swiglu: dimension preservation (4 -> 8 -> 4)")
+    let swi_d_in = 4
+    let swi_d_ff = 8
+    let swi_x = [1.0, 0.5, -0.5, 0.2]
+    let swi_w_up = xavier_init(swi_d_in, swi_d_ff, 100)
+    let swi_w_gate = xavier_init(swi_d_in, swi_d_ff, 200)
+    let swi_w_down = xavier_init(swi_d_ff, swi_d_in, 300)
+    let swi_out = nn_swiglu(swi_x, swi_w_up, swi_w_gate, swi_w_down, swi_d_in, swi_d_ff)
+    let t20_ok = len(swi_out) == swi_d_in
+    if t20_ok {
+        println("  PASS: output dim=" + to_string(len(swi_out)) + " (matches d_in=4)")
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: output dim=" + to_string(len(swi_out)) + " expected 4")
+        fail_count = fail_count + 1
+    }
+
+    // ── T21: nn_swiglu — output is finite (no NaN/inf) ──
+    println("[T21] nn_swiglu: output is finite")
+    let swi_norm = tensor_norm(swi_out)
+    // A finite norm means no NaN or inf in the output
+    let t21_ok = swi_norm > 0.0 && swi_norm < 1.0e10
+    if t21_ok {
+        println("  PASS: output norm=" + to_string(swi_norm) + " (finite)")
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: output norm=" + to_string(swi_norm))
+        fail_count = fail_count + 1
+    }
+
+    // ── T22: cross_entropy — perfect prediction -> low loss ──
+    // If the correct class has the highest logit, CE should be small.
+    println("[T22] cross_entropy: high-confidence -> low loss")
+    let ce_logits = [10.0, 0.0, 0.0]
+    let ce_loss = cross_entropy(ce_logits, 0)
+    let t22_ok = ce_loss < 0.001
+    if t22_ok {
+        println("  PASS: CE=" + to_string(ce_loss) + " (near 0 for confident prediction)")
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: CE=" + to_string(ce_loss) + " expected near 0")
+        fail_count = fail_count + 1
+    }
+
+    // ── T23: cross_entropy — wrong prediction -> high loss ──
+    println("[T23] cross_entropy: wrong target -> high loss")
+    let ce_loss_wrong = cross_entropy(ce_logits, 2)
+    let t23_ok = ce_loss_wrong > 5.0
+    if t23_ok {
+        println("  PASS: CE=" + to_string(ce_loss_wrong) + " (high for wrong target)")
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: CE=" + to_string(ce_loss_wrong) + " expected > 5.0")
+        fail_count = fail_count + 1
+    }
+
+    // ── T24: rms_norm — basic correctness ──
+    // After RMS norm with gamma=1, the RMS of the output should be ~1.
+    println("[T24] rms_norm: output rms ~= 1")
+    let rms_x = [2.0, 4.0, 6.0, 8.0]
+    let rms_g = tensor_ones(4)
+    let rms_out = rms_norm(rms_x, rms_g, 1.0e-5)
+    // Compute RMS of output: sqrt(mean(x^2))
+    let mut rms_sq = 0.0
+    let mut rms_i = 0
+    while rms_i < 4 {
+        rms_sq = rms_sq + rms_out[rms_i] * rms_out[rms_i]
+        rms_i = rms_i + 1
+    }
+    let rms_val = sqrt(rms_sq / 4.0)
+    let t24_ok = abs_f(rms_val - 1.0) < 0.02
+    if t24_ok {
+        println("  PASS: rms=" + to_string(rms_val))
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: rms=" + to_string(rms_val) + " expected ~1")
+        fail_count = fail_count + 1
+    }
+
+    // ── Summary ──
+    println("")
+    println("================================================================")
+    let total = pass_count + fail_count
+    println("  Results: " + to_string(pass_count) + " PASS / " + to_string(fail_count) + " FAIL out of " + to_string(total) + " tests")
+    if fail_count == 0 {
+        println("  ALL TESTS PASSED")
+    } else {
+        println("  " + to_string(fail_count) + " TEST(S) FAILED")
+    }
+    println("================================================================")
+}
+
+// ════════════════════════════════════════════════════════════════════
+// S12  MAIN
 // ════════════════════════════════════════════════════════════════════
 
 fn main() {
-    println("nn_core.hexa — HEXA-SPEAK Mk.III Neural Network Primitives")
-    println("============================================================")
-
-    // ── Demo 1: matmul correctness (2×3 × 3×2) ──
+    println("nn_core.hexa -- HEXA-SPEAK Mk.III Neural Network Primitives")
+    println("Canonical nn_* API: 10 primitives, self-tested")
     println("")
-    println("[1] matmul 2x3 * 3x2:")
-    // A = [[1,2,3],[4,5,6]]  B = [[7,8],[9,10],[11,12]]
-    let A = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
-    let B = [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
-    let C = matmul(A, B, 2, 3, 2)
-    // Expected: [[58, 64], [139, 154]]
-    println("  C[0,0]=" + to_string(C[0]) + " (expect 58)")
-    println("  C[0,1]=" + to_string(C[1]) + " (expect 64)")
-    println("  C[1,0]=" + to_string(C[2]) + " (expect 139)")
-    println("  C[1,1]=" + to_string(C[3]) + " (expect 154)")
-
-    // ── Demo 2: softmax sum=1 verification ──
-    println("")
-    println("[2] softmax sum=1 check:")
-    let logits = [2.0, 1.0, 0.1, -1.0, 3.0]
-    let probs = softmax(logits)
-    let psum = tensor_sum(probs)
-    println("  logits=[2.0, 1.0, 0.1, -1.0, 3.0]")
-    println("  probs=[" + to_string(probs[0]) + ", " + to_string(probs[1]) + ", " + to_string(probs[2]) + ", " + to_string(probs[3]) + ", " + to_string(probs[4]) + "]")
-    println("  sum=" + to_string(psum) + " (expect 1.0)")
-    println("  argmax=" + to_string(argmax(probs)) + " (expect 4)")
-
-    // ── Demo 3: attention (seq=4, d=8) ──
-    println("")
-    println("[3] scaled_dot_product_attention (seq=4, d_k=8, causal=true):")
-    let seq = 4
-    let dk = 8
-    let Q = tensor_randn(seq * dk, 42)
-    let K = tensor_randn(seq * dk, 137)
-    let V = tensor_randn(seq * dk, 256)
-    let attn_out = scaled_dot_product_attention(Q, K, V, dk, seq, true)
-    println("  output length=" + to_string(len(attn_out)) + " (expect " + to_string(seq * dk) + ")")
-    println("  out[0..4]=" + to_string(attn_out[0]) + ", " + to_string(attn_out[1]) + ", " + to_string(attn_out[2]) + ", " + to_string(attn_out[3]))
-
-    // ── Demo 4: Xavier init distribution ──
-    println("")
-    println("[4] Xavier init (fan_in=16, fan_out=16):")
-    let W = xavier_init(16, 16, 777)
-    let w_mean = tensor_mean(W)
-    let w_var = tensor_var(W)
-    let w_limit = sqrt(6.0 / to_float(16 + 16))
-    println("  n=" + to_string(len(W)))
-    println("  mean=" + to_string(w_mean) + " (expect ~0)")
-    println("  var=" + to_string(w_var))
-    println("  limit=" + to_string(w_limit) + " (range [-limit, limit])")
-
-    // ── Demo 5: layer_norm ──
-    println("")
-    println("[5] layer_norm:")
-    let x = [1.0, 2.0, 3.0, 4.0]
-    let gamma = [1.0, 1.0, 1.0, 1.0]
-    let beta = [0.0, 0.0, 0.0, 0.0]
-    let ln_out = layer_norm(x, gamma, beta, 1.0e-5)
-    let ln_mean = tensor_mean(ln_out)
-    let ln_var = tensor_var(ln_out)
-    println("  input=[1, 2, 3, 4]")
-    println("  output=[" + to_string(ln_out[0]) + ", " + to_string(ln_out[1]) + ", " + to_string(ln_out[2]) + ", " + to_string(ln_out[3]) + "]")
-    println("  mean=" + to_string(ln_mean) + " (expect ~0)")
-    println("  var=" + to_string(ln_var) + " (expect ~1)")
-
-    // ── Demo 6: cross-entropy ──
-    println("")
-    println("[6] cross_entropy:")
-    let ce_logits = [2.0, 1.0, 0.1]
-    let ce = cross_entropy(ce_logits, 0)
-    println("  logits=[2.0, 1.0, 0.1], target=0")
-    println("  CE=" + to_string(ce) + " (expect ~0.42)")
-
-    // ── Demo 7: RoPE ──
-    println("")
-    println("[7] rotary_embedding (seq=2, d=4):")
-    let rope_x = [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0]
-    let rope_out = rotary_embedding(rope_x, 2, 4)
-    println("  input=[1,0,1,0, 1,0,1,0]")
-    println("  pos0=[" + to_string(rope_out[0]) + ", " + to_string(rope_out[1]) + ", " + to_string(rope_out[2]) + ", " + to_string(rope_out[3]) + "]")
-    println("  pos1=[" + to_string(rope_out[4]) + ", " + to_string(rope_out[5]) + ", " + to_string(rope_out[6]) + ", " + to_string(rope_out[7]) + "]")
-
-    // ── Demo 8: SwiGLU FFN ──
-    println("")
-    println("[8] SwiGLU activation:")
-    let sg = swiglu(1.5, 2.0)
-    println("  swiglu(1.5, 2.0)=" + to_string(sg) + " (expect ~" + to_string(1.5 * sigmoid(2.0)) + ")")
-
-    println("")
-    println("All demos complete.")
+    self_test_nn_core()
 }
 
 main()
