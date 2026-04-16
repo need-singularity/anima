@@ -11,10 +11,13 @@
 //   Stage B   Control signals → 24 kHz waveform via additive sinusoid
 //             synthesis with per-frame envelope smoothing (linear interp
 //             across hop=240 samples).
-//   Stage C   Optional iSTFT path through hxcuda_istft_bf16 FFI when
-//             HXCUDA_ENABLE=1 and the kernel ships (companion agent
-//             owns hxcuda_fused.cu — declaration is wired, dispatch
-//             gated until libhxcuda lands on Mac/Linux).
+//   Stage C   Optional iSTFT path through hxcuda_istft_bf16 FFI.
+//             Auto-activates when libhxcuda is loadable on the host:
+//             Linux (pod with libhxcuda.so) -> Stage C online.
+//             Mac (no CUDA, libhxcuda.dylib absent) -> Stage C offline,
+//             fallback to Stage B additive synthesis.
+//             Kernel source: hexa-lang/self/native/hxcuda_stft.cu
+//             (hxcuda_stft_bf16, hxcuda_istft_bf16, hxcuda_stft_version).
 //
 //   Why additive instead of full iSTFT for Mk.III:
 //     1. iSTFT in pure hexa (no CUDA, no hxblas wired in this file)
@@ -49,11 +52,14 @@
 //   - Top-level `main()` call removed (hexa auto-invokes; explicit call
 //     would double-execute, see speak_e2e.hexa final comment).
 //
-// FFI gating:
-//   HXCUDA_ENABLE=1   → attempt hxcuda_istft_bf16 dispatch (Stage C)
-//   HXCUDA_ENABLE=0   → pure-hexa additive path (default, Stage A+B)
-//   No silent fallbacks: if HXCUDA_ENABLE=1 and rc != 0, we abort
-//   loudly via println and return empty audio (caller honours I5).
+// FFI gating (2026-04-16 — Linux libhxcuda.so verified):
+//   auto       → probe hxcuda_stft_version() via FFI. If library loads
+//                and version >= 1, mark Stage C online. Currently logs
+//                availability; full iSTFT marshalling lands in a follow-up
+//                (spec synth + cuda malloc/memcpy + kernel dispatch).
+//   HXCUDA_DISABLE=1 → force Stage B additive path even on Linux
+//   No silent fallbacks: dispatch errors surface via println and
+//   caller honours I5 (empty audio on failure).
 
 // ════════════════════════════════════════════════════════════════════
 // Section 1. Constants
@@ -290,42 +296,70 @@ fn synth_additive(ctrl_frames: [[float]], n_samples: int) -> [float] {
 }
 
 // ════════════════════════════════════════════════════════════════════
-// Section 5. Stage C — hxcuda iSTFT FFI hook (gated)
+// Section 5. Stage C — hxcuda iSTFT FFI hook (auto-probe)
 //
-// Companion agent owns hxcuda_istft_bf16 in self/native/hxcuda_fused.cu.
-// We declare the symbol so build links cleanly once libhxcuda lands on
-// the target. On Mac the @link("hxcuda") resolves at runtime; absence
-// triggers a load-time error which we trap by gating on HXCUDA_ENABLE.
+// Source: hexa-lang/self/native/hxcuda_stft.cu
+// Builds:
+//   Linux: bash scripts/build_hxcuda_linux.sh
+//          -> self/native/build/libhxcuda.so
+//          Verified 2026-04-16 on RTX 3090 (sm_86, cuFFT-backed).
+//          C-level dlopen + dlsym + hxcuda_istft_bf16 round-trip: PASS
+//          (n_fft=8 hop=4 n_frames=3, DC input, finite normalised output).
+//   Mac:   no CUDA on macOS — libhxcuda.dylib does not build.
+//          dlopen returns NULL, Stage C probe reports offline, path
+//          falls through to Stage B additive synth (default).
 //
-// Signature mirrors hxcuda_matmul_bf16 (struct-args ABI):
-//   off  0: T_frames   (int64)
-//   off  8: n_fft      (int64)
-//   off 16: hop        (int64)
-//   off 24: spec_ptr   (int64, device bf16* [T, n_fft/2+1, 2] re/im)
-//   off 32: out_ptr    (int64, device float* [T·hop + n_fft])
-//   off 40: window_ptr (int64, device float* [n_fft])
-//   total = 48 bytes
-//
-// NOTE: extern decl is intentionally commented to allow the file to
-// run on Mac without libhxcuda. Uncomment + rebuild when the kernel
-// + dylib ship. Until then, the path is unreachable (gated below).
-//
-// @link("hxcuda")
-// extern fn hxcuda_istft_bf16(args_p: *Void) -> int
-//
-// @link("hxcuda")
-// extern fn hxcuda_matmul_bf16(args_p: *Void) -> int
+// Signature (struct-args ABI, mirrors hxcuda_stft.cu HxCudaIstftArgs):
+//   off  0: n_frames     (int64)
+//   off  8: n_fft        (int64)
+//   off 16: hop          (int64)
+//   off 24: out_len      (int64)  total audio_out buffer samples
+//   off 32: spec_p       (int64)  device cufftComplex* [n_frames * bins]
+//   off 40: window_p     (int64)  device float* [n_fft]
+//   off 48: audio_out_p  (int64)  device float* [out_len]
+//   off 56: n_samples_out(int64)  host int64_t* — effective sample count
+//   total = 64 bytes
 
-// Returns true iff HXCUDA_ENABLE=1 in the environment AND the runtime
-// can actually link the hxcuda symbols. Until libhxcuda ships on Mac,
-// this always returns false.
+// hxcuda_stft_version() — 0 args, returns >=1 when STFT/iSTFT kernels
+// are present. Used as the capability probe below.
+@link("hxcuda")
+extern fn hxcuda_stft_version() -> int
+
+@link("hxcuda")
+extern fn hxcuda_istft_bf16(args_p: int) -> int
+
+@link("hxcuda")
+extern fn hxcuda_stft_bf16(args_p: int) -> int
+
+// Module-level one-shot probe result. 0 = unknown, 1 = online, -1 = offline.
+// Populated by hxcuda_available() on first call.
+let mut _hxcuda_probe_state = 0
+
+// Returns true iff libhxcuda is loadable on this host AND the STFT
+// kernels are present (version >=1). Probes once per run and caches
+// the result. Honours HXCUDA_DISABLE=1 as a kill-switch.
 fn hxcuda_available() -> bool {
-    let v = env("HXCUDA_ENABLE")
-    if v != "1" { return false }
-    // Future: probe via hxcuda_version() once @link is uncommented.
-    println("[neural_vocoder] HXCUDA_ENABLE=1 set, but libhxcuda not")
-    println("[neural_vocoder]   linked in this build — falling through")
-    println("[neural_vocoder]   to additive synthesis (Stage B).")
+    if _hxcuda_probe_state == 1 { return true }
+    if _hxcuda_probe_state == -1 { return false }
+    // Kill switch — force Stage B even when libhxcuda is present.
+    let kill = env("HXCUDA_DISABLE")
+    if kill == "1" {
+        println("[neural_vocoder] HXCUDA_DISABLE=1 — Stage C forced offline")
+        _hxcuda_probe_state = -1
+        return false
+    }
+    // Probe: calling hxcuda_stft_version() returns 1 on Linux with
+    // libhxcuda.so loaded, 0 on Mac (dlsym returned NULL → default).
+    // On codegen_c2 path, NULL fn_ptr call returns 0 via void-ret wrapping;
+    // version >=1 is the live check.
+    let v = hxcuda_stft_version()
+    if v >= 1 {
+        println("[neural_vocoder] Stage C ONLINE — libhxcuda loaded, hxcuda_stft_version=" + to_string(v))
+        _hxcuda_probe_state = 1
+        return true
+    }
+    println("[neural_vocoder] Stage C OFFLINE — libhxcuda not loadable (Mac path or missing .so)")
+    _hxcuda_probe_state = -1
     return false
 }
 
@@ -360,10 +394,19 @@ fn decode_wave(latent_frames: [[float]], sample_rate: int) -> [float] {
         return []
     }
 
-    // ── Stage C (CUDA iSTFT) — opt-in, currently unreachable ──
-    if hxcuda_available() {
-        // TODO[hxcuda-bridge]: marshal latent → spectrogram → iSTFT.
-        // Falls through to Stage B until the kernel+dylib land.
+    // ── Stage C (CUDA iSTFT) — capability probe + dispatch gate ──
+    // Auto-probes libhxcuda; logs ONLINE/OFFLINE exactly once per run.
+    // Dispatch marshalling (spec synthesis + cuda alloc/memcpy/kernel)
+    // is scoped for a follow-up change — the probe & FFI binding are
+    // validated here so the hot-swap lands cleanly.
+    let stage_c_ready = hxcuda_available()
+    if stage_c_ready {
+        println("[neural_vocoder] Stage C path reachable; iSTFT marshalling follow-up pending")
+        // TODO[hxcuda-istft-bridge]: latent -> spec (Stage A') -> cuda_malloc
+        // -> cudaMemcpyHostToDevice -> hxcuda_istft_bf16 -> D2H -> pcm out.
+        // Falls through to Stage B (additive) until the bridge lands.
+    } else {
+        println("[neural_vocoder] Stage B active — additive synthesis (no CUDA)")
     }
 
     // ── Stage A: latent → ctrl per frame ──
@@ -401,57 +444,59 @@ fn b64_char(i: int) -> string {
 }
 
 fn bytes_to_b64(bytes: [int]) -> string {
+    // Collect b64 chars in a list, join once at end — avoids O(n²) string concat.
     let n = len(bytes)
-    let mut out = ""
+    let mut chars = []
     let mut i = 0
     while i + 3 <= n {
         let b0 = bytes[i]
         let b1 = bytes[i + 1]
         let b2 = bytes[i + 2]
         let t = (b0 * 65536) + (b1 * 256) + b2
-        out = out + b64_char((t / 262144) % 64)
-        out = out + b64_char((t / 4096) % 64)
-        out = out + b64_char((t / 64) % 64)
-        out = out + b64_char(t % 64)
+        chars = chars.push(b64_char((t / 262144) % 64))
+        chars = chars.push(b64_char((t / 4096) % 64))
+        chars = chars.push(b64_char((t / 64) % 64))
+        chars = chars.push(b64_char(t % 64))
         i = i + 3
     }
     let rem = n - i
     if rem == 1 {
         let b0 = bytes[i]
         let t = b0 * 65536
-        out = out + b64_char((t / 262144) % 64)
-        out = out + b64_char((t / 4096) % 64)
-        out = out + "="
-        out = out + "="
+        chars = chars.push(b64_char((t / 262144) % 64))
+        chars = chars.push(b64_char((t / 4096) % 64))
+        chars = chars.push("==")
     } else if rem == 2 {
         let b0 = bytes[i]
         let b1 = bytes[i + 1]
         let t = (b0 * 65536) + (b1 * 256)
-        out = out + b64_char((t / 262144) % 64)
-        out = out + b64_char((t / 4096) % 64)
-        out = out + b64_char((t / 64) % 64)
-        out = out + "="
+        chars = chars.push(b64_char((t / 262144) % 64))
+        chars = chars.push(b64_char((t / 4096) % 64))
+        chars = chars.push(b64_char((t / 64) % 64))
+        chars = chars.push("=")
     }
-    return out
+    return chars.join("")
 }
 
 // Append the 4 little-endian bytes of `v` (signed int32) to `bytes`.
 fn push_u32_le(bytes: [int], v: int) -> [int] {
     let mut u = v
     if u < 0 { u = u + 4294967296 }
-    let b0 = u % 256
-    let b1 = (u / 256) % 256
-    let b2 = (u / 65536) % 256
-    let b3 = (u / 16777216) % 256
-    return bytes + [b0, b1, b2, b3]
+    let mut out = bytes
+    out = out.push(u % 256)
+    out = out.push((u / 256) % 256)
+    out = out.push((u / 65536) % 256)
+    out = out.push((u / 16777216) % 256)
+    return out
 }
 
 fn push_u16_le(bytes: [int], v: int) -> [int] {
     let mut u = v
     if u < 0 { u = u + 65536 }
-    let b0 = u % 256
-    let b1 = (u / 256) % 256
-    return bytes + [b0, b1]
+    let mut out = bytes
+    out = out.push(u % 256)
+    out = out.push((u / 256) % 256)
+    return out
 }
 
 fn push_str(bytes: [int], s: string) -> [int] {
@@ -459,7 +504,7 @@ fn push_str(bytes: [int], s: string) -> [int] {
     let mut i = 0
     while i < len(s) {
         let sub = s.substring(i, i + 1)
-        out = out + [char_code(sub, 0)]
+        out = out.push(char_code(sub, 0))
         i = i + 1
     }
     return out
