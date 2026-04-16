@@ -1216,11 +1216,12 @@ tests.hexa — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
   Ubuntu 학습 환경 (ssh ubu):
     GPU: RTX 5070 12GB | RAM: 30GB | Disk: 800GB+ free
     학습 가능: 7B 4-bit, 14B 4-bit, 14B LoRA/QLoRA
-    ssh ubu "cd ~/anima && python3 -u train.py ..."
+    ssh ubu "cd ~/anima && $HEXA training/train_alm.hexa ..."
 
   H100 (RunPod, 최후수단만):
-    /workspace/train_anima_lm.py    — 학습 (safe ckpt + P3 fix)
-    /workspace/serve_animalm_v2.py  — 4-bit 서빙
+    $HEXA training/train_alm.hexa   — 학습 (canonical, safe ckpt + P3 fix)
+    $HEXA serving/serve_alm.hexa    — 서빙 (canonical)
+    (.py 진입점은 전부 deprecated — canonical은 .hexa만)
     ⚠️ RunPod API 키 만료 (2026-04-09) — 갱신 필요 시만
 
   스케일링:
