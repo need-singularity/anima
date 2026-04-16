@@ -1,0 +1,820 @@
+// serving/edge/ngram_draft.hexa — N-gram speculative decoding draft engine
+// Zero-model draft for M4 16GB edge inference.
+//
+// CRITICAL DISCOVERY: CLM 1.5B (3.0GB) costs 30ms/tok on shared 100GB/s DRAM
+// bus — nearly as expensive as ALM itself (S1 singularity event).
+// Solution: 125M ngram-ensemble draft costs only 0.1ms/tok (BW = negligible).
+//   Expected acceptance rate: ~15% (ngram is crude) but BW cost is near zero.
+//   Draft length: sigma=12 tokens per cycle.
+//   Combined with future 125M model for ngram+model ensemble: ~30% accept rate.
+//
+// How it works:
+//   1. Maintain sliding window of recent tokens (context).
+//   2. Build n-gram frequency table from context (bigram, trigram, 4-gram).
+//   3. For each draft position, lookup matching n-gram suffix -> predict next token.
+//   4. Fall back to unigram frequency if no n-gram match.
+//   5. Return k=12 draft token candidates.
+//
+// N-gram table: parallel arrays (no hashmaps in hexa).
+//   Key encoding: t1 * V^3 + t2 * V^2 + t3 * V + t4 (for 4-gram, V=vocab_size).
+//   Linear scan for lookup (small context -> acceptable).
+//
+// CLI: hexa serving/edge/ngram_draft.hexa [--self-test]
+
+// ─── Constants ─────────────────────────────────────────────────────
+
+comptime const DEFAULT_WINDOW  = 512   // recent tokens to track
+comptime const DEFAULT_MAX_N   = 4     // max n-gram order
+comptime const DEFAULT_VOCAB   = 256   // byte-level
+comptime const DEFAULT_DRAFT_K = 12    // draft tokens per cycle
+
+// ─── Structs ───────────────────────────────────────────────────────
+
+struct NgramDraft {
+    context_window: int,     // how many recent tokens to track
+    max_ngram: int,          // max n-gram order (1..4)
+    vocab_size: int,         // 256 for byte-level, or tokenizer vocab
+    // --- sliding window (ring buffer via parallel arrays) ---
+    ring: array,             // [context_window] circular token buffer
+    ring_len: int,           // number of valid tokens in ring (0..context_window)
+    ring_pos: int,           // next write position (wraps at context_window)
+    // --- n-gram frequency tables (parallel arrays per order) ---
+    // Order 1 (unigram): key = token, count = freq
+    uni_keys: array,
+    uni_vals: array,
+    uni_len: int,
+    // Order 2 (bigram): key = t1*V + t2
+    bi_keys: array,
+    bi_vals: array,
+    bi_len: int,
+    // Order 3 (trigram): key = t1*V^2 + t2*V + t3
+    tri_keys: array,
+    tri_vals: array,
+    tri_len: int,
+    // Order 4 (4-gram): key = t1*V^3 + t2*V^2 + t3*V + t4
+    quad_keys: array,
+    quad_vals: array,
+    quad_len: int,
+    // --- statistics ---
+    total_drafts: int,
+    total_accepted: int,
+    order_hits: array        // [5] hits per order (0=miss, 1=uni, 2=bi, 3=tri, 4=quad)
+}
+
+struct DraftResult {
+    tokens: array,           // [k] predicted token ids
+    confidences: array,      // [k] confidence scores (0.0..1.0)
+    ngram_orders: array,     // [k] which n-gram order was used (0=fallback, 1..4)
+    draft_time_ms: float
+}
+
+// ─── Constructor ───────────────────────────────────────────────────
+
+fn ngram_new(window: int, max_n: int, vocab: int) -> NgramDraft {
+    // Clamp max_n to 1..4
+    let mut mn = max_n
+    if mn < 1 { mn = 1 }
+    if mn > 4 { mn = 4 }
+
+    let mut ring = []
+    let mut i = 0
+    while i < window {
+        ring = ring + [0]
+        i = i + 1
+    }
+
+    let order_hits = [0, 0, 0, 0, 0]
+
+    let draft = NgramDraft {
+        context_window: window,
+        max_ngram: mn,
+        vocab_size: vocab,
+        ring: ring,
+        ring_len: 0,
+        ring_pos: 0,
+        uni_keys: [],
+        uni_vals: [],
+        uni_len: 0,
+        bi_keys: [],
+        bi_vals: [],
+        bi_len: 0,
+        tri_keys: [],
+        tri_vals: [],
+        tri_len: 0,
+        quad_keys: [],
+        quad_vals: [],
+        quad_len: 0,
+        total_drafts: 0,
+        total_accepted: 0,
+        order_hits: order_hits
+    }
+    return draft
+}
+
+// ─── Ring buffer helpers ───────────────────────────────────────────
+// stage0 struct list aliasing bug: we rebuild arrays rather than mutate in place.
+
+fn ring_push(draft: NgramDraft, token: int) -> NgramDraft {
+    // Write token into ring at ring_pos, advance pos (wrap).
+    let mut new_ring = []
+    let mut i = 0
+    while i < draft.context_window {
+        if i == draft.ring_pos {
+            new_ring = new_ring + [token]
+        } else {
+            new_ring = new_ring + [draft.ring[i]]
+        }
+        i = i + 1
+    }
+    let mut new_len = draft.ring_len + 1
+    if new_len > draft.context_window {
+        new_len = draft.context_window
+    }
+    let new_pos = (draft.ring_pos + 1) % draft.context_window
+
+    let out = NgramDraft {
+        context_window: draft.context_window,
+        max_ngram: draft.max_ngram,
+        vocab_size: draft.vocab_size,
+        ring: new_ring,
+        ring_len: new_len,
+        ring_pos: new_pos,
+        uni_keys: draft.uni_keys,
+        uni_vals: draft.uni_vals,
+        uni_len: draft.uni_len,
+        bi_keys: draft.bi_keys,
+        bi_vals: draft.bi_vals,
+        bi_len: draft.bi_len,
+        tri_keys: draft.tri_keys,
+        tri_vals: draft.tri_vals,
+        tri_len: draft.tri_len,
+        quad_keys: draft.quad_keys,
+        quad_vals: draft.quad_vals,
+        quad_len: draft.quad_len,
+        total_drafts: draft.total_drafts,
+        total_accepted: draft.total_accepted,
+        order_hits: draft.order_hits
+    }
+    return out
+}
+
+// Read the i-th most recent token from the ring (0 = most recent).
+fn ring_recent(draft: NgramDraft, offset: int) -> int {
+    if offset >= draft.ring_len {
+        return -1  // sentinel: not enough context
+    }
+    // ring_pos points to next write slot, so most recent is (ring_pos - 1 - offset) mod len.
+    let idx = (draft.ring_pos - 1 - offset + draft.context_window * 2) % draft.context_window
+    return draft.ring[idx]
+}
+
+// ─── Parallel-array table ops ──────────────────────────────────────
+// Linear scan: acceptable for small context windows.
+
+fn table_find(keys: array, len: int, key: int) -> int {
+    // Returns index or -1 if not found.
+    let mut i = 0
+    while i < len {
+        if keys[i] == key {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn table_insert_or_inc(keys: array, vals: array, len: int, key: int) -> array {
+    // Returns [new_keys, new_vals, new_len] encoded as a flat array:
+    //   result[0] = new_len, followed by new_keys (len entries), then new_vals (len entries).
+    // WORKAROUND: hexa pass-by-value + no tuple returns.
+    // We return a single flat array: [new_len, k0, k1, ..., v0, v1, ...]
+    let idx = table_find(keys, len, key)
+    if idx >= 0 {
+        // Increment existing entry — rebuild vals array (pass-by-value).
+        let mut new_vals = []
+        let mut i = 0
+        while i < len {
+            if i == idx {
+                new_vals = new_vals + [vals[i] + 1]
+            } else {
+                new_vals = new_vals + [vals[i]]
+            }
+            i = i + 1
+        }
+        // Pack: [len, keys..., new_vals...]
+        let mut out = [len]
+        i = 0
+        while i < len {
+            out = out + [keys[i]]
+            i = i + 1
+        }
+        i = 0
+        while i < len {
+            out = out + [new_vals[i]]
+            i = i + 1
+        }
+        return out
+    }
+    // Append new entry.
+    let new_len = len + 1
+    let mut out = [new_len]
+    let mut i = 0
+    while i < len {
+        out = out + [keys[i]]
+        i = i + 1
+    }
+    out = out + [key]
+    i = 0
+    while i < len {
+        out = out + [vals[i]]
+        i = i + 1
+    }
+    out = out + [1]
+    return out
+}
+
+fn unpack_keys(packed: array) -> array {
+    let len = packed[0]
+    let mut keys = []
+    let mut i = 0
+    while i < len {
+        keys = keys + [packed[1 + i]]
+        i = i + 1
+    }
+    return keys
+}
+
+fn unpack_vals(packed: array) -> array {
+    let len = packed[0]
+    let mut vals = []
+    let mut i = 0
+    while i < len {
+        vals = vals + [packed[1 + len + i]]
+        i = i + 1
+    }
+    return vals
+}
+
+fn unpack_len(packed: array) -> int {
+    return packed[0]
+}
+
+// ─── N-gram key encoding ───────────────────────────────────────────
+// Encode n-gram as single int: t1 * V^(n-1) + t2 * V^(n-2) + ... + tn
+
+fn encode_bigram(t1: int, t2: int, v: int) -> int {
+    return t1 * v + t2
+}
+
+fn encode_trigram(t1: int, t2: int, t3: int, v: int) -> int {
+    return t1 * v * v + t2 * v + t3
+}
+
+fn encode_quadgram(t1: int, t2: int, t3: int, t4: int, v: int) -> int {
+    return t1 * v * v * v + t2 * v * v + t3 * v + t4
+}
+
+// ─── Update: feed one observed token ───────────────────────────────
+
+fn ngram_update(draft: NgramDraft, token: int) -> NgramDraft {
+    // 1) Push token into ring.
+    let d = ring_push(draft, token)
+
+    // 2) Update unigram table.
+    let p1 = table_insert_or_inc(d.uni_keys, d.uni_vals, d.uni_len, token)
+    let uni_k = unpack_keys(p1)
+    let uni_v = unpack_vals(p1)
+    let uni_l = unpack_len(p1)
+
+    // 3) Update bigram table (if we have >= 2 tokens).
+    let mut bi_k = d.bi_keys
+    let mut bi_v = d.bi_vals
+    let mut bi_l = d.bi_len
+    if d.ring_len >= 2 {
+        let prev = ring_recent(d, 1)  // token before the one we just pushed
+        if prev >= 0 {
+            let bkey = encode_bigram(prev, token, d.vocab_size)
+            let p2 = table_insert_or_inc(bi_k, bi_v, bi_l, bkey)
+            bi_k = unpack_keys(p2)
+            bi_v = unpack_vals(p2)
+            bi_l = unpack_len(p2)
+        }
+    }
+
+    // 4) Update trigram table (if we have >= 3 tokens).
+    let mut tri_k = d.tri_keys
+    let mut tri_v = d.tri_vals
+    let mut tri_l = d.tri_len
+    if d.ring_len >= 3 {
+        let t_2 = ring_recent(d, 2)
+        let t_1 = ring_recent(d, 1)
+        if t_2 >= 0 {
+            let tkey = encode_trigram(t_2, t_1, token, d.vocab_size)
+            let p3 = table_insert_or_inc(tri_k, tri_v, tri_l, tkey)
+            tri_k = unpack_keys(p3)
+            tri_v = unpack_vals(p3)
+            tri_l = unpack_len(p3)
+        }
+    }
+
+    // 5) Update quadgram table (if we have >= 4 tokens).
+    let mut quad_k = d.quad_keys
+    let mut quad_v = d.quad_vals
+    let mut quad_l = d.quad_len
+    if d.ring_len >= 4 {
+        let t_3 = ring_recent(d, 3)
+        let t_2 = ring_recent(d, 2)
+        let t_1 = ring_recent(d, 1)
+        if t_3 >= 0 {
+            let qkey = encode_quadgram(t_3, t_2, t_1, token, d.vocab_size)
+            let p4 = table_insert_or_inc(quad_k, quad_v, quad_l, qkey)
+            quad_k = unpack_keys(p4)
+            quad_v = unpack_vals(p4)
+            quad_l = unpack_len(p4)
+        }
+    }
+
+    // 6) Rebuild struct (pass-by-value).
+    let out = NgramDraft {
+        context_window: d.context_window,
+        max_ngram: d.max_ngram,
+        vocab_size: d.vocab_size,
+        ring: d.ring,
+        ring_len: d.ring_len,
+        ring_pos: d.ring_pos,
+        uni_keys: uni_k,
+        uni_vals: uni_v,
+        uni_len: uni_l,
+        bi_keys: bi_k,
+        bi_vals: bi_v,
+        bi_len: bi_l,
+        tri_keys: tri_k,
+        tri_vals: tri_v,
+        tri_len: tri_l,
+        quad_keys: quad_k,
+        quad_vals: quad_v,
+        quad_len: quad_l,
+        total_drafts: d.total_drafts,
+        total_accepted: d.total_accepted,
+        order_hits: d.order_hits
+    }
+    return out
+}
+
+// ─── Lookup: best token for a given n-gram suffix ──────────────────
+// Returns [best_token, best_count, total_count] or [-1, 0, 0] on miss.
+
+fn lookup_best(keys: array, vals: array, len: int, prefix_key_base: int, v: int) -> array {
+    // Scan all entries whose key falls in [prefix_key_base, prefix_key_base + v).
+    // Return the token (key % v) with highest count.
+    let lo = prefix_key_base
+    let hi = prefix_key_base + v
+    let mut best_tok = -1
+    let mut best_cnt = 0
+    let mut total = 0
+    let mut i = 0
+    while i < len {
+        let k = keys[i]
+        if k >= lo {
+            if k < hi {
+                let cnt = vals[i]
+                total = total + cnt
+                if cnt > best_cnt {
+                    best_cnt = cnt
+                    best_tok = k - lo  // last token = key mod V (since prefix_base = prefix * V)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return [best_tok, best_cnt, total]
+}
+
+// ─── Draft: generate k speculative tokens ──────────────────────────
+
+fn ngram_draft_k(draft: NgramDraft, k: int) -> DraftResult {
+    let t_start = timestamp()
+
+    let mut tokens = []
+    let mut confs = []
+    let mut orders = []
+
+    // We'll simulate extending the context with our own predictions.
+    // Keep a local "virtual tail" of predicted tokens.
+    let mut vtail = []   // virtual tokens appended during this draft
+    let v = draft.vocab_size
+
+    let mut step = 0
+    while step < k {
+        // Build the recent context suffix including virtual tail.
+        // Most recent real token offsets: ring_recent(draft, 0), ring_recent(draft, 1), ...
+        // Then append vtail.
+
+        // Collect last 3 real + virtual tokens to form lookup suffixes.
+        let real_len = draft.ring_len
+        let vlen = len(vtail)
+        let total_ctx = real_len + vlen
+
+        // Get the last 3 tokens (for 4-gram, we need 3 prefix tokens).
+        let mut ctx3 = [-1, -1, -1]
+        let mut ci = 0
+        while ci < 3 {
+            let offset_from_end = 2 - ci  // 2, 1, 0
+            let global_pos = total_ctx - 1 - offset_from_end
+            if global_pos < 0 {
+                ctx3[ci] = -1
+            } else {
+                if global_pos < real_len {
+                    // From ring: offset from most recent = (real_len - 1 - global_pos)
+                    ctx3[ci] = ring_recent(draft, real_len - 1 - global_pos)
+                } else {
+                    // From virtual tail
+                    ctx3[ci] = vtail[global_pos - real_len]
+                }
+            }
+            ci = ci + 1
+        }
+
+        let c0 = ctx3[0]  // 3rd most recent
+        let c1 = ctx3[1]  // 2nd most recent
+        let c2 = ctx3[2]  // most recent
+
+        // Try 4-gram first, then 3-gram, 2-gram, 1-gram fallback.
+        let mut found_tok = -1
+        let mut found_conf = 0.0
+        let mut found_order = 0
+
+        // 4-gram: prefix = (c0, c1, c2), predict next
+        if found_tok < 0 {
+            if draft.max_ngram >= 4 {
+                if c0 >= 0 {
+                    if c1 >= 0 {
+                        if c2 >= 0 {
+                            let prefix_base = c0 * v * v * v + c1 * v * v + c2 * v
+                            let r4 = lookup_best(draft.quad_keys, draft.quad_vals, draft.quad_len, prefix_base, v)
+                            if r4[0] >= 0 {
+                                found_tok = r4[0]
+                                if r4[2] > 0 {
+                                    found_conf = to_float(r4[1]) / to_float(r4[2])
+                                }
+                                found_order = 4
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3-gram: prefix = (c1, c2), predict next
+        if found_tok < 0 {
+            if draft.max_ngram >= 3 {
+                if c1 >= 0 {
+                    if c2 >= 0 {
+                        let prefix_base = c1 * v * v + c2 * v
+                        let r3 = lookup_best(draft.tri_keys, draft.tri_vals, draft.tri_len, prefix_base, v)
+                        if r3[0] >= 0 {
+                            found_tok = r3[0]
+                            if r3[2] > 0 {
+                                found_conf = to_float(r3[1]) / to_float(r3[2])
+                            }
+                            found_order = 3
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2-gram: prefix = (c2), predict next
+        if found_tok < 0 {
+            if draft.max_ngram >= 2 {
+                if c2 >= 0 {
+                    let prefix_base = c2 * v
+                    let r2 = lookup_best(draft.bi_keys, draft.bi_vals, draft.bi_len, prefix_base, v)
+                    if r2[0] >= 0 {
+                        found_tok = r2[0]
+                        if r2[2] > 0 {
+                            found_conf = to_float(r2[1]) / to_float(r2[2])
+                        }
+                        found_order = 2
+                    }
+                }
+            }
+        }
+
+        // 1-gram (unigram) fallback: most frequent token overall
+        if found_tok < 0 {
+            let mut best_u = -1
+            let mut best_cnt = 0
+            let mut total_u = 0
+            let mut ui = 0
+            while ui < draft.uni_len {
+                let cnt = draft.uni_vals[ui]
+                total_u = total_u + cnt
+                if cnt > best_cnt {
+                    best_cnt = cnt
+                    best_u = draft.uni_keys[ui]
+                }
+                ui = ui + 1
+            }
+            if best_u >= 0 {
+                found_tok = best_u
+                if total_u > 0 {
+                    found_conf = to_float(best_cnt) / to_float(total_u)
+                }
+                found_order = 1
+            }
+        }
+
+        // If still nothing (empty context), emit token 0 with zero confidence.
+        if found_tok < 0 {
+            found_tok = 0
+            found_conf = 0.0
+            found_order = 0
+        }
+
+        tokens = tokens + [found_tok]
+        confs = confs + [found_conf]
+        orders = orders + [found_order]
+        vtail = vtail + [found_tok]
+
+        step = step + 1
+    }
+
+    let t_end = timestamp()
+    let elapsed = to_float(t_end - t_start)
+
+    // Update draft count in stats (caller should use returned DraftResult).
+    let result = DraftResult {
+        tokens: tokens,
+        confidences: confs,
+        ngram_orders: orders,
+        draft_time_ms: elapsed
+    }
+    return result
+}
+
+// ─── Accept: feed accepted tokens back ─────────────────────────────
+
+fn ngram_accept(draft: NgramDraft, accepted: array) -> NgramDraft {
+    // Feed each accepted token through ngram_update + bump stats.
+    let mut d = draft
+    let n = len(accepted)
+    let mut i = 0
+    while i < n {
+        d = ngram_update(d, accepted[i])
+        i = i + 1
+    }
+    // Update accept stats — rebuild order_hits (pass-by-value).
+    let new_accepted = d.total_accepted + n
+    let new_drafts = d.total_drafts + 1
+    let out = NgramDraft {
+        context_window: d.context_window,
+        max_ngram: d.max_ngram,
+        vocab_size: d.vocab_size,
+        ring: d.ring,
+        ring_len: d.ring_len,
+        ring_pos: d.ring_pos,
+        uni_keys: d.uni_keys,
+        uni_vals: d.uni_vals,
+        uni_len: d.uni_len,
+        bi_keys: d.bi_keys,
+        bi_vals: d.bi_vals,
+        bi_len: d.bi_len,
+        tri_keys: d.tri_keys,
+        tri_vals: d.tri_vals,
+        tri_len: d.tri_len,
+        quad_keys: d.quad_keys,
+        quad_vals: d.quad_vals,
+        quad_len: d.quad_len,
+        total_drafts: new_drafts,
+        total_accepted: new_accepted,
+        order_hits: d.order_hits
+    }
+    return out
+}
+
+// ─── Stats: human-readable hit rate report ─────────────────────────
+
+fn ngram_stats(draft: NgramDraft) -> str {
+    let mut s = "[ngram_draft] stats:"
+    s = s + " drafts=" + str(draft.total_drafts)
+    s = s + " accepted=" + str(draft.total_accepted)
+    if draft.total_drafts > 0 {
+        let rate = to_float(draft.total_accepted) / (to_float(draft.total_drafts) * 12.0) * 100.0
+        s = s + " accept_rate=" + str(rate) + "%"
+    }
+    s = s + " | tables: uni=" + str(draft.uni_len)
+    s = s + " bi=" + str(draft.bi_len)
+    s = s + " tri=" + str(draft.tri_len)
+    s = s + " quad=" + str(draft.quad_len)
+    s = s + " | ring_len=" + str(draft.ring_len)
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Self-tests — 7 tests, all must PASS
+// ═══════════════════════════════════════════════════════════════════
+
+fn test_T1_new_default() -> bool {
+    // Constructor creates empty draft with correct dimensions.
+    let d = ngram_new(DEFAULT_WINDOW, DEFAULT_MAX_N, DEFAULT_VOCAB)
+    let mut ok = true
+    if d.context_window != 512 { ok = false }
+    if d.max_ngram != 4 { ok = false }
+    if d.vocab_size != 256 { ok = false }
+    if d.ring_len != 0 { ok = false }
+    if d.uni_len != 0 { ok = false }
+    if d.bi_len != 0 { ok = false }
+    if d.tri_len != 0 { ok = false }
+    if d.quad_len != 0 { ok = false }
+    println("  [T1] window=" + str(d.context_window) + " max_n=" + str(d.max_ngram) + " vocab=" + str(d.vocab_size) + " ring_len=" + str(d.ring_len))
+    return ok
+}
+
+fn test_T2_update_unigram() -> bool {
+    // Feeding tokens builds unigram table correctly.
+    let mut d = ngram_new(16, 4, 256)
+    d = ngram_update(d, 65)  // 'A'
+    d = ngram_update(d, 66)  // 'B'
+    d = ngram_update(d, 65)  // 'A' again
+    let mut ok = true
+    // Unigram table should have 2 entries: 65 (count 2), 66 (count 1).
+    if d.uni_len != 2 { ok = false }
+    let idx_a = table_find(d.uni_keys, d.uni_len, 65)
+    let idx_b = table_find(d.uni_keys, d.uni_len, 66)
+    if idx_a < 0 { ok = false }
+    if idx_b < 0 { ok = false }
+    if idx_a >= 0 {
+        if d.uni_vals[idx_a] != 2 { ok = false }
+    }
+    if idx_b >= 0 {
+        if d.uni_vals[idx_b] != 1 { ok = false }
+    }
+    println("  [T2] uni_len=" + str(d.uni_len) + " A_count=" + str(d.uni_vals[idx_a]) + " B_count=" + str(d.uni_vals[idx_b]))
+    return ok
+}
+
+fn test_T3_update_bigram() -> bool {
+    // Feeding A B A builds bigram (A->B) and (B->A).
+    let mut d = ngram_new(16, 4, 256)
+    d = ngram_update(d, 65)  // A
+    d = ngram_update(d, 66)  // B — bigram (A,B)
+    d = ngram_update(d, 65)  // A — bigram (B,A)
+    let mut ok = true
+    if d.bi_len != 2 { ok = false }
+    let key_ab = encode_bigram(65, 66, 256)
+    let key_ba = encode_bigram(66, 65, 256)
+    let idx_ab = table_find(d.bi_keys, d.bi_len, key_ab)
+    let idx_ba = table_find(d.bi_keys, d.bi_len, key_ba)
+    if idx_ab < 0 { ok = false }
+    if idx_ba < 0 { ok = false }
+    if idx_ab >= 0 {
+        if d.bi_vals[idx_ab] != 1 { ok = false }
+    }
+    if idx_ba >= 0 {
+        if d.bi_vals[idx_ba] != 1 { ok = false }
+    }
+    println("  [T3] bi_len=" + str(d.bi_len) + " (A,B) found=" + str(idx_ab >= 0) + " (B,A) found=" + str(idx_ba >= 0))
+    return ok
+}
+
+fn test_T4_draft_unigram_fallback() -> bool {
+    // With only unigram data, draft should return most frequent token.
+    let mut d = ngram_new(16, 1, 256)  // max_n=1 forces unigram only
+    d = ngram_update(d, 65)
+    d = ngram_update(d, 65)
+    d = ngram_update(d, 65)
+    d = ngram_update(d, 66)
+    // A appears 3x, B appears 1x — draft should predict A.
+    let result = ngram_draft_k(d, 3)
+    let mut ok = true
+    if result.tokens[0] != 65 { ok = false }
+    if result.tokens[1] != 65 { ok = false }
+    if result.tokens[2] != 65 { ok = false }
+    // Confidence should be 3/4 = 0.75
+    let conf = result.confidences[0]
+    if conf < 0.74 { ok = false }
+    if conf > 0.76 { ok = false }
+    // All orders should be 1 (unigram).
+    if result.ngram_orders[0] != 1 { ok = false }
+    println("  [T4] draft[0]=" + str(result.tokens[0]) + " conf=" + str(conf) + " order=" + str(result.ngram_orders[0]) + " (expect tok=65 conf~0.75 order=1)")
+    return ok
+}
+
+fn test_T5_draft_higher_order() -> bool {
+    // Feed A B C A B D — bigram (A,B) appears 2x.
+    // After seeing ...A B, trigram (A,B,?) should prefer C (1x) or D (1x).
+    // But bigram (B,?) should also see C(1x) and D(1x).
+    // Feed more: A B C A B C — now trigram (A,B,C) = 2x, (A,B,D) = 0.
+    let mut d = ngram_new(32, 4, 256)
+    // Sequence: A B C A B C A B C
+    let seq = [65, 66, 67, 65, 66, 67, 65, 66, 67]
+    let mut i = 0
+    while i < len(seq) {
+        d = ngram_update(d, seq[i])
+        i = i + 1
+    }
+    // Now context ends with ...A B C. Draft should use trigram (A,B,C) -> predict A (since (B,C,A) appears 2x).
+    // Actually after A B C A B C A B C:
+    //   trigram (B,C,A) = 2x
+    //   bigram  (C,A)   = 2x
+    // So after last C, bigram predicts A, trigram predicts A. Good.
+    let result = ngram_draft_k(d, 1)
+    let mut ok = true
+    if result.tokens[0] != 65 { ok = false }  // should predict A
+    // Order should be >= 2 (at least bigram).
+    if result.ngram_orders[0] < 2 { ok = false }
+    println("  [T5] draft[0]=" + str(result.tokens[0]) + " order=" + str(result.ngram_orders[0]) + " (expect tok=65/A order>=2)")
+    return ok
+}
+
+fn test_T6_accept_updates_stats() -> bool {
+    // ngram_accept should increment total_drafts and total_accepted.
+    let mut d = ngram_new(16, 4, 256)
+    d = ngram_update(d, 65)
+    d = ngram_accept(d, [65, 66, 67])
+    let mut ok = true
+    if d.total_drafts != 1 { ok = false }
+    if d.total_accepted != 3 { ok = false }
+    // Also tokens should have been fed into the context.
+    if d.ring_len != 4 { ok = false }  // 1 from update + 3 from accept
+    println("  [T6] drafts=" + str(d.total_drafts) + " accepted=" + str(d.total_accepted) + " ring_len=" + str(d.ring_len) + " (expect 1, 3, 4)")
+    return ok
+}
+
+fn test_T7_ring_wrap() -> bool {
+    // With window=4, feeding 6 tokens should wrap and keep only last 4.
+    let mut d = ngram_new(4, 2, 256)
+    d = ngram_update(d, 10)
+    d = ngram_update(d, 20)
+    d = ngram_update(d, 30)
+    d = ngram_update(d, 40)
+    d = ngram_update(d, 50)
+    d = ngram_update(d, 60)
+    // ring_len should be 4 (capped).
+    let mut ok = true
+    if d.ring_len != 4 { ok = false }
+    // Most recent = 60, then 50, 40, 30.
+    let r0 = ring_recent(d, 0)
+    let r1 = ring_recent(d, 1)
+    let r2 = ring_recent(d, 2)
+    let r3 = ring_recent(d, 3)
+    if r0 != 60 { ok = false }
+    if r1 != 50 { ok = false }
+    if r2 != 40 { ok = false }
+    if r3 != 30 { ok = false }
+    println("  [T7] ring_len=" + str(d.ring_len) + " recent=[" + str(r0) + "," + str(r1) + "," + str(r2) + "," + str(r3) + "] (expect 60,50,40,30)")
+    return ok
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Main — run 7 self-tests
+// ═══════════════════════════════════════════════════════════════════
+
+fn main() {
+    println("[ngram_draft] N-gram speculative decoding draft engine — M4 16GB edge")
+    println("  window=" + str(DEFAULT_WINDOW) + " max_n=" + str(DEFAULT_MAX_N) + " vocab=" + str(DEFAULT_VOCAB) + " draft_k=" + str(DEFAULT_DRAFT_K))
+    println("  target: 0.1ms/tok BW-free, ~15% accept rate, sigma=12 draft tokens")
+    println("")
+
+    let t1 = test_T1_new_default()
+    if t1 { println("T1 PASS  constructor defaults") } else { println("T1 FAIL") }
+
+    let t2 = test_T2_update_unigram()
+    if t2 { println("T2 PASS  unigram table build") } else { println("T2 FAIL") }
+
+    let t3 = test_T3_update_bigram()
+    if t3 { println("T3 PASS  bigram table build") } else { println("T3 FAIL") }
+
+    let t4 = test_T4_draft_unigram_fallback()
+    if t4 { println("T4 PASS  unigram-only draft (conf=0.75, tok=A)") } else { println("T4 FAIL") }
+
+    let t5 = test_T5_draft_higher_order()
+    if t5 { println("T5 PASS  higher-order n-gram draft (periodic seq)") } else { println("T5 FAIL") }
+
+    let t6 = test_T6_accept_updates_stats()
+    if t6 { println("T6 PASS  accept feeds tokens + bumps stats") } else { println("T6 FAIL") }
+
+    let t7 = test_T7_ring_wrap()
+    if t7 { println("T7 PASS  ring buffer wraps correctly") } else { println("T7 FAIL") }
+
+    println("")
+
+    // Sequential bool guard — stage0 && chains can mis-short-circuit with 4+ operands.
+    let mut all = true
+    if !t1 { all = false }
+    if !t2 { all = false }
+    if !t3 { all = false }
+    if !t4 { all = false }
+    if !t5 { all = false }
+    if !t6 { all = false }
+    if !t7 { all = false }
+
+    if all {
+        println("[ngram_draft] 7/7 PASS — zero-model speculative draft engine verified")
+    } else {
+        println("[ngram_draft] SOME FAILED")
+    }
+}
+
+main()

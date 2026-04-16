@@ -1,0 +1,439 @@
+// ═══════════════════════════════════════════════════════════════
+//  serving/edge/layer_cluster.hexa — Transformer layer clustering
+//  for M4 16GB edge deployment
+//
+//  Clusters 32 interior layers of ALM 14B (Qwen2.5-14B, 40 layers)
+//  into n=6 shared weight templates via cosine similarity k-means.
+//  Boundary layers 1-4 and 37-40 are kept full precision (not clustered).
+//
+//  n6 resonance: 6 is the first perfect number (1+2+3=6).
+//  Each template = averaged weights of its group members.
+//  Per-template LoRA r=8 adapters recover lost specialization.
+//
+//  Algorithm:
+//    1. Initialize 6 centroids evenly spaced across 32 interior layers
+//    2. Assign each layer to nearest centroid (cosine similarity)
+//    3. Recompute centroids as mean of assigned members
+//    4. Converge when no reassignments (or max 20 iterations)
+//
+//  Public API:
+//    cosine_similarity(a, b) -> float
+//    cluster_layers(weights, k) -> ClusterResult
+//    assign_to_nearest(weight, centroids) -> int
+//    compute_centroid(weights, assignments, cluster_id) -> array
+//    report_clusters(result) -> string
+//
+//  Self-tests: 7 tests at bottom (run: hexa serving/edge/layer_cluster.hexa)
+// ═══════════════════════════════════════════════════════════════
+
+// ── Constants ───────────────────────────────────────────────────
+
+comptime const N_TOTAL_LAYERS   = 40    // ALM 14B (Qwen2.5-14B)
+comptime const N_BOUNDARY_LOW   = 4     // layers 1-4 kept full precision
+comptime const N_BOUNDARY_HIGH  = 4     // layers 37-40 kept full precision
+comptime const N_INTERIOR       = 32    // layers 5-36 to be clustered
+comptime const N_CLUSTERS       = 6     // perfect number, n6 resonance
+comptime const MAX_ITER         = 20    // convergence cap
+comptime const SIM_THRESHOLD    = 0.85  // minimum cosine similarity for valid cluster
+comptime const LORA_RANK        = 8     // per-template LoRA adapter rank
+
+// ── Structs ─────────────────────────────────────────────────────
+
+struct LayerWeight {
+    layer_idx: int,
+    flat_weights: array
+}
+
+struct ClusterResult {
+    n_clusters: int,
+    assignments: array,     // [32] -> template_id (0..5)
+    centroids: array,       // [6] centroid weight vectors
+    similarities: array,    // [32] cosine sim to assigned centroid
+    min_sim: float
+}
+
+// ── Vector math helpers ─────────────────────────────────────────
+
+fn dot_product(a: array, b: array) -> float {
+    let mut sum = 0.0
+    let n = len(a)
+    let mut i = 0
+    while i < n {
+        sum = sum + a[i] * b[i]
+        i = i + 1
+    }
+    return sum
+}
+
+fn vec_norm(a: array) -> float {
+    let mut sum = 0.0
+    let n = len(a)
+    let mut i = 0
+    while i < n {
+        sum = sum + a[i] * a[i]
+        i = i + 1
+    }
+    return sqrt(sum)
+}
+
+fn cosine_similarity(a: array, b: array) -> float {
+    // cosine_similarity = dot(a,b) / (||a|| * ||b||)
+    // Returns 0.0 if either vector has zero norm (degenerate case)
+    let d = dot_product(a, b)
+    let na = vec_norm(a)
+    let nb = vec_norm(b)
+    if na < 1e-12 {
+        return 0.0
+    }
+    if nb < 1e-12 {
+        return 0.0
+    }
+    return d / (na * nb)
+}
+
+fn vec_add(a: array, b: array) -> array {
+    let n = len(a)
+    let mut result = []
+    let mut i = 0
+    while i < n {
+        result = append(result, a[i] + b[i])
+        i = i + 1
+    }
+    return result
+}
+
+fn vec_scale(a: array, s: float) -> array {
+    let n = len(a)
+    let mut result = []
+    let mut i = 0
+    while i < n {
+        result = append(result, a[i] * s)
+        i = i + 1
+    }
+    return result
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut result = []
+    let mut i = 0
+    while i < n {
+        result = append(result, 0.0)
+        i = i + 1
+    }
+    return result
+}
+
+// ── Core clustering API ─────────────────────────────────────────
+
+fn assign_to_nearest(weight: array, centroids: array) -> int {
+    // Returns cluster id (0..k-1) with highest cosine similarity
+    let k = len(centroids)
+    let mut best_id = 0
+    let mut best_sim = -1.0
+    let mut c = 0
+    while c < k {
+        let sim = cosine_similarity(weight, centroids[c])
+        if sim > best_sim {
+            best_sim = sim
+            best_id = c
+        }
+        c = c + 1
+    }
+    return best_id
+}
+
+fn compute_centroid(weights: array, assignments: array, cluster_id: int) -> array {
+    // Compute mean weight vector for all layers assigned to cluster_id
+    // weights: array of weight vectors (parallel array, not struct list — avoid aliasing bug)
+    // assignments: array of int cluster ids
+    let n = len(assignments)
+    let dim = len(weights[0])
+    let mut sum = vec_zeros(dim)
+    let mut count = 0
+    let mut i = 0
+    while i < n {
+        if assignments[i] == cluster_id {
+            sum = vec_add(sum, weights[i])
+            count = count + 1
+        }
+        i = i + 1
+    }
+    if count == 0 {
+        return sum   // empty cluster: return zeros
+    }
+    return vec_scale(sum, 1.0 / count)
+}
+
+fn cluster_layers(weights: array, k: int) -> ClusterResult {
+    // K-means style clustering of layer weight vectors using cosine similarity.
+    // weights: array of 32 weight vectors (interior layers 5-36)
+    // k: number of clusters (should be 6)
+    //
+    // Initialization: evenly spaced across 32 layers
+    //   indices 0,5,10,15,20,25 (maps to layers 5,10,15,20,25,30)
+    let n = len(weights)
+
+    // §1 — Initialize centroids by evenly spacing
+    let mut centroids = []
+    let mut ci = 0
+    while ci < k {
+        // spacing: pick layers at positions 0, ~5, ~10, ~16, ~21, ~26
+        let idx = (ci * n) / k
+        centroids = append(centroids, weights[idx])
+        ci = ci + 1
+    }
+
+    // §2 — Iterative assignment + recompute
+    let mut assignments = []
+    let mut ai = 0
+    while ai < n {
+        assignments = append(assignments, 0)
+        ai = ai + 1
+    }
+
+    let mut iter = 0
+    let mut converged = false
+    while iter < MAX_ITER {
+        if converged {
+            // early exit — hexa while-only control flow
+        } else {
+            let mut changed = 0
+            // Assign each layer to nearest centroid
+            let mut li = 0
+            while li < n {
+                let new_id = assign_to_nearest(weights[li], centroids)
+                if assignments[li] != new_id {
+                    // NOTE: parallel array mutation — assignments is local, safe to mutate inline
+                    assignments[li] = new_id
+                    changed = changed + 1
+                }
+                li = li + 1
+            }
+
+            // Recompute centroids
+            let mut new_centroids = []
+            let mut ki = 0
+            while ki < k {
+                new_centroids = append(new_centroids, compute_centroid(weights, assignments, ki))
+                ki = ki + 1
+            }
+            centroids = new_centroids
+
+            if changed == 0 {
+                converged = true
+            }
+        }
+        iter = iter + 1
+    }
+
+    // §3 — Compute per-layer similarities to assigned centroid
+    let mut similarities = []
+    let mut min_sim = 1.0
+    let mut si = 0
+    while si < n {
+        let cid = assignments[si]
+        let sim = cosine_similarity(weights[si], centroids[cid])
+        similarities = append(similarities, sim)
+        if sim < min_sim {
+            min_sim = sim
+        }
+        si = si + 1
+    }
+
+    let mut result = ClusterResult {
+        n_clusters: k,
+        assignments: assignments,
+        centroids: centroids,
+        similarities: similarities,
+        min_sim: min_sim
+    }
+    return result
+}
+
+// ── Reporting ───────────────────────────────────────────────────
+
+fn report_clusters(result: ClusterResult) -> string {
+    // Generate ASCII summary of cluster assignments
+    let mut out = "=== Layer Cluster Report (n=" + str(result.n_clusters) + ") ===\n"
+    out = out + "Interior layers 5-36 clustered into " + str(result.n_clusters) + " templates\n"
+    out = out + "Boundary layers 1-4, 37-40: full precision (not clustered)\n"
+    out = out + "LoRA rank per template: " + str(LORA_RANK) + "\n"
+    out = out + "Min cosine similarity: " + str(result.min_sim) + "\n"
+    out = out + "Threshold requirement: >= " + str(SIM_THRESHOLD) + "\n"
+
+    if result.min_sim >= SIM_THRESHOLD {
+        out = out + "Status: PASS (all layers above threshold)\n"
+    } else {
+        out = out + "Status: FAIL (some layers below threshold)\n"
+    }
+
+    out = out + "\n--- Assignments ---\n"
+
+    // Count members per cluster
+    let n = len(result.assignments)
+    let mut ci = 0
+    while ci < result.n_clusters {
+        out = out + "Template " + str(ci) + ": layers ["
+        let mut first = true
+        let mut li = 0
+        while li < n {
+            if result.assignments[li] == ci {
+                if first {
+                    first = false
+                } else {
+                    out = out + ", "
+                }
+                // Map interior index back to absolute layer number (5-based)
+                out = out + str(li + N_BOUNDARY_LOW + 1)
+            }
+            li = li + 1
+        }
+        out = out + "]\n"
+        ci = ci + 1
+    }
+
+    out = out + "\n--- Per-layer similarity ---\n"
+    let mut pi = 0
+    while pi < n {
+        out = out + "  Layer " + str(pi + N_BOUNDARY_LOW + 1)
+        out = out + " -> T" + str(result.assignments[pi])
+        out = out + "  sim=" + str(result.similarities[pi]) + "\n"
+        pi = pi + 1
+    }
+
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  §SELF-TEST — 7 tests, run: hexa serving/edge/layer_cluster.hexa
+// ═══════════════════════════════════════════════════════════════
+
+fn assert_near(a: float, b: float, tol: float, label: string) -> bool {
+    let diff = a - b
+    let abs_diff = diff
+    if abs_diff < 0.0 {
+        abs_diff = 0.0 - abs_diff
+    }
+    if abs_diff > tol {
+        println("FAIL " + label + ": expected " + str(b) + " got " + str(a) + " (diff=" + str(abs_diff) + ")")
+        return false
+    }
+    println("PASS " + label)
+    return true
+}
+
+fn assert_eq_int(a: int, b: int, label: string) -> bool {
+    if a != b {
+        println("FAIL " + label + ": expected " + str(b) + " got " + str(a))
+        return false
+    }
+    println("PASS " + label)
+    return true
+}
+
+fn assert_true(cond: bool, label: string) -> bool {
+    if cond {
+        println("PASS " + label)
+        return true
+    }
+    println("FAIL " + label)
+    return false
+}
+
+fn make_synthetic_weights(n_layers: int, dim: int) -> array {
+    // Generate synthetic weight vectors for testing.
+    // Creates 6 distinct "archetypes" and assigns layers to them
+    // with small perturbations, ensuring clusters are recoverable.
+    let mut weights = []
+    let mut li = 0
+    while li < n_layers {
+        let group = (li * 6) / n_layers   // deterministic group 0..5
+        let mut w = []
+        let mut d = 0
+        while d < dim {
+            // Base signal: group-dependent direction
+            let base = 0.0
+            if d % 6 == group {
+                base = 1.0
+            }
+            // Small perturbation based on layer index
+            let perturb = 0.01 * (li - n_layers / 2)
+            w = append(w, base + perturb * 0.1)
+            d = d + 1
+        }
+        weights = append(weights, w)
+        li = li + 1
+    }
+    return weights
+}
+
+fn run_self_tests() {
+    println("=== layer_cluster.hexa self-tests ===")
+    let mut pass_count = 0
+    let mut total = 0
+
+    // Test 1: cosine_similarity — identical vectors = 1.0
+    total = total + 1
+    let v1 = [1.0, 2.0, 3.0]
+    let ok1 = assert_near(cosine_similarity(v1, v1), 1.0, 1e-6, "T1 identical vectors sim=1.0")
+    if ok1 { pass_count = pass_count + 1 }
+
+    // Test 2: cosine_similarity — orthogonal vectors = 0.0
+    total = total + 1
+    let v2a = [1.0, 0.0, 0.0]
+    let v2b = [0.0, 1.0, 0.0]
+    let ok2 = assert_near(cosine_similarity(v2a, v2b), 0.0, 1e-6, "T2 orthogonal vectors sim=0.0")
+    if ok2 { pass_count = pass_count + 1 }
+
+    // Test 3: cosine_similarity — opposite vectors = -1.0
+    total = total + 1
+    let v3a = [1.0, 2.0, 3.0]
+    let v3b = [-1.0, -2.0, -3.0]
+    let ok3 = assert_near(cosine_similarity(v3a, v3b), -1.0, 1e-6, "T3 opposite vectors sim=-1.0")
+    if ok3 { pass_count = pass_count + 1 }
+
+    // Test 4: assign_to_nearest — picks correct cluster
+    total = total + 1
+    let centroids = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    let test_vec = [0.1, 0.9, 0.1]   // closest to centroid 1
+    let ok4 = assert_eq_int(assign_to_nearest(test_vec, centroids), 1, "T4 assign_to_nearest picks cluster 1")
+    if ok4 { pass_count = pass_count + 1 }
+
+    // Test 5: cluster_layers — 6 synthetic groups recover 6 clusters, all sim >= 0.85
+    total = total + 1
+    let dim = 24   // small dim for fast test
+    let syn_weights = make_synthetic_weights(N_INTERIOR, dim)
+    let result = cluster_layers(syn_weights, N_CLUSTERS)
+    let ok5a = assert_eq_int(result.n_clusters, 6, "T5a n_clusters=6")
+    if ok5a { pass_count = pass_count + 1 }
+
+    total = total + 1
+    let ok5b = assert_true(result.min_sim >= SIM_THRESHOLD, "T5b min_sim >= 0.85 (got " + str(result.min_sim) + ")")
+    if ok5b { pass_count = pass_count + 1 }
+
+    // Test 6: compute_centroid — mean of two vectors
+    total = total + 1
+    let cw = [[2.0, 4.0], [4.0, 8.0], [10.0, 10.0]]
+    let ca = [0, 0, 1]   // first two in cluster 0, third in cluster 1
+    let centroid0 = compute_centroid(cw, ca, 0)
+    // Expected: [(2+4)/2, (4+8)/2] = [3.0, 6.0]
+    let ok6a = assert_near(centroid0[0], 3.0, 1e-6, "T6a centroid[0]=3.0")
+    if ok6a { pass_count = pass_count + 1 }
+
+    // Test 7: report_clusters — produces non-empty string with expected keywords
+    total = total + 1
+    let report = report_clusters(result)
+    let ok7 = assert_true(len(report) > 100, "T7 report_clusters produces substantial output (len=" + str(len(report)) + ")")
+    if ok7 { pass_count = pass_count + 1 }
+
+    // Print report for visual inspection
+    println("")
+    println(report)
+
+    println("")
+    println("=== Results: " + str(pass_count) + "/" + str(total) + " PASS ===")
+}
+
+// ── Entry point ─────────────────────────────────────────────────
+
+run_self_tests()

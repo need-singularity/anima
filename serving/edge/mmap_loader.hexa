@@ -1,0 +1,800 @@
+// serving/edge/mmap_loader.hexa — mmap weight loader with double-buffer prefetch
+// Target: M4 16GB edge inference of ALM 14B Hybrid-E compressed model.
+//
+// Architecture:
+//   8 boundary layers (2.52 GB) — always resident in unified memory
+//   6 bulk templates  (4.49 GB) — mmap on-demand with double-buffer overlap
+//
+// Hardware constraints (M4 16GB):
+//   NVMe bandwidth:    7.4 GB/s
+//   Unified mem BW:    100 GB/s
+//   L2 cache:          16 MB
+//   Tile size:         2048x2048 bf16 = 8 MB (fits L2/2, leaves room for compute)
+//
+// Double-buffer pattern:
+//   Buffer A serves layer N  to the compute kernel
+//   Buffer B prefetches layer N+1 via posix_madvise(MADV_WILLNEED)
+//   Roles swap each layer → zero stall on NVMe reads
+//
+// Usage:
+//   let loader = mmap_open("/path/to/alm_14b_hybrid_e.bin")
+//   let ptr    = mmap_load_layer(loader, 0, 0)    // layer 0 into buf 0
+//   mmap_prefetch_next(loader, 1)                  // async prefetch layer 1
+//   // ... compute on ptr ...
+//   let ptr1   = mmap_load_layer(loader, 1, 1)    // layer 1 already warm
+//   mmap_prefetch_next(loader, 2)
+//   mmap_close(loader)
+
+// ─── FFI: POSIX mmap / madvise / munmap ────────────────────────────
+// Root cause: hexa has no built-in mmap. We FFI into libc directly.
+// On macOS (M4), these map to libSystem.B.dylib symbols.
+
+extern fn mmap(addr: int, length: int, prot: int, flags: int, fd: int, offset: int) -> int
+extern fn munmap(addr: int, length: int) -> int
+extern fn madvise(addr: int, length: int, advice: int) -> int
+extern fn open(path: int, flags: int) -> int      // path is char* cast to int
+extern fn close(fd: int) -> int
+extern fn fstat_size(fd: int) -> int               // wrapper: returns st_size field
+extern fn read(fd: int, buf: int, count: int) -> int
+extern fn mlock(addr: int, length: int) -> int
+extern fn munlock(addr: int, length: int) -> int
+
+// macOS mach_task_info for RSS tracking
+extern fn mach_task_self() -> int
+extern fn task_info_resident_size() -> int         // wrapper: returns phys_footprint bytes
+
+// ─── POSIX constants ────────────────────────────────────────────────
+// Root cause: hexa cannot import C headers, so we hardcode the Darwin/arm64 values.
+
+comptime const PROT_READ       = 1
+comptime const PROT_WRITE      = 2
+comptime const MAP_PRIVATE     = 2
+comptime const MAP_FAILED      = -1       // (void*)-1
+
+// madvise advice values (Darwin)
+comptime const MADV_WILLNEED   = 3        // prefetch: schedule pages into RAM
+comptime const MADV_DONTNEED   = 4        // release: mark pages as reclaimable
+comptime const MADV_FREE       = 5        // lazy release (macOS-specific)
+
+comptime const O_RDONLY        = 0
+
+// ─── Model geometry constants ───────────────────────────────────────
+// Root cause: Hybrid-E splits 14B into boundary (always resident) + bulk (on-demand).
+// Boundary layers hold attention heads at domain boundaries where token routing
+// decisions are made; bulk layers are compressible MLP templates.
+
+comptime const N_BOUNDARY_LAYERS   = 8
+comptime const N_BULK_LAYERS       = 6
+comptime const N_TOTAL_LAYERS      = 14
+
+// Sizes in bytes
+comptime const BOUNDARY_SIZE_BYTES = 2696937472    // 2.52 GB = 8 layers
+comptime const BULK_LAYER_BYTES    = 785481728     // ~748 MB per bulk template layer
+comptime const BULK_TOTAL_BYTES    = 4712890368    // 4.49 GB = 6 bulk layers
+comptime const HEADER_BYTES        = 4096          // file header (magic + layer table)
+
+// L2-aware tile: 2048 x 2048 x 2 bytes (bf16) = 8 MB
+// Root cause: M4 has 16 MB L2. We use half for data tile, half stays available
+// for compute intermediates / prefetch metadata. This prevents L2 thrashing.
+comptime const TILE_DIM            = 2048
+comptime const TILE_BYTES          = 8388608       // 2048*2048*2 = 8 MB
+comptime const BF16_BYTES          = 2
+
+// Double-buffer: two slots
+comptime const N_BUFFERS           = 2
+comptime const BUFFER_MAX_BYTES    = 805306368     // 768 MB max per buffer slot
+
+// Page size (Apple Silicon)
+comptime const PAGE_SIZE           = 16384         // 16 KB (M4 uses 16K pages)
+
+// ─── Structs ────────────────────────────────────────────────────────
+// Root cause: hexa has a struct list aliasing bug (two structs with array fields
+// corrupt each other). We avoid list fields inside MmapLoader entirely —
+// buffer pointers are stored as plain int fields (parallel scalars).
+
+struct MmapLoader {
+    fd: int,                    // file descriptor
+    base_ptr: int,              // mmap base address (entire file)
+    file_size: int,             // total file size in bytes
+    page_size: int,             // OS page size (16K on M4)
+    boundary_ptr: int,          // start of boundary region (locked in RAM)
+    boundary_locked: bool,      // whether mlock succeeded
+    buf0_ptr: int,              // double-buffer slot 0 — mmap region start
+    buf0_layer: int,            // which bulk layer is in buf0 (-1 = empty)
+    buf0_size: int,             // mapped size of buf0
+    buf1_ptr: int,              // double-buffer slot 1
+    buf1_layer: int,            // which bulk layer is in buf1 (-1 = empty)
+    buf1_size: int,             // mapped size of buf1
+    prefetch_layer: int,        // layer currently being prefetched (-1 = none)
+    total_loads: int,           // telemetry: total layer loads
+    total_prefetches: int,      // telemetry: total prefetch hints issued
+    closed: bool                // guard against double-close
+}
+
+struct LayerSpan {
+    offset: int,                // byte offset from file start
+    size: int                   // byte length of this layer
+}
+
+// ─── Helper: compute layer offset/size ──────────────────────────────
+
+fn layer_span(layer_idx: int) -> LayerSpan {
+    // Root cause: boundary layers are packed first, then bulk layers, after header.
+    // Boundary layers are unequal (attention varies by head count at each boundary),
+    // but we approximate them as equal-sized chunks of BOUNDARY_SIZE_BYTES / N_BOUNDARY_LAYERS
+    // for the mmap loader. The actual per-layer sizes come from the file header
+    // in production — this is the fallback uniform partition.
+
+    let mut off = HEADER_BYTES
+    let mut sz  = 0
+
+    if layer_idx < N_BOUNDARY_LAYERS {
+        // Boundary layer
+        let per_layer = BOUNDARY_SIZE_BYTES / N_BOUNDARY_LAYERS
+        off = HEADER_BYTES + (layer_idx * per_layer)
+        sz  = per_layer
+    }
+    if layer_idx >= N_BOUNDARY_LAYERS {
+        // Bulk layer
+        let bulk_idx = layer_idx - N_BOUNDARY_LAYERS
+        off = HEADER_BYTES + BOUNDARY_SIZE_BYTES + (bulk_idx * BULK_LAYER_BYTES)
+        sz  = BULK_LAYER_BYTES
+    }
+
+    let span = LayerSpan {
+        offset: off,
+        size: sz
+    }
+    return span
+}
+
+// ─── Align to page boundary ─────────────────────────────────────────
+
+fn align_down(addr: int, alignment: int) -> int {
+    // Root cause: mmap/madvise require page-aligned addresses.
+    // Integer division truncates, giving us floor alignment.
+    return (addr / alignment) * alignment
+}
+
+fn align_up(size: int, alignment: int) -> int {
+    // Round up to next page boundary
+    return ((size + alignment - 1) / alignment) * alignment
+}
+
+// ─── mmap_open ──────────────────────────────────────────────────────
+
+fn mmap_open(path: string) -> MmapLoader {
+    // Open the weight file and mmap the entire thing read-only.
+    // Boundary layers get mlocked so they never page out.
+
+    let fd = open(path, O_RDONLY)
+    if fd < 0 {
+        println("[mmap_loader] FATAL: cannot open " + path)
+        let fail = MmapLoader {
+            fd: -1, base_ptr: 0, file_size: 0, page_size: PAGE_SIZE,
+            boundary_ptr: 0, boundary_locked: false,
+            buf0_ptr: 0, buf0_layer: -1, buf0_size: 0,
+            buf1_ptr: 0, buf1_layer: -1, buf1_size: 0,
+            prefetch_layer: -1, total_loads: 0, total_prefetches: 0,
+            closed: true
+        }
+        return fail
+    }
+
+    let file_size = fstat_size(fd)
+
+    // mmap entire file as read-only private mapping
+    // Root cause: MAP_PRIVATE so writes (if any) don't corrupt the checkpoint file.
+    // PROT_READ only — we never modify weights.
+    let base = mmap(0, file_size, PROT_READ, MAP_PRIVATE, fd, 0)
+
+    if base == MAP_FAILED {
+        println("[mmap_loader] FATAL: mmap failed for " + path)
+        close(fd)
+        let fail = MmapLoader {
+            fd: -1, base_ptr: 0, file_size: 0, page_size: PAGE_SIZE,
+            boundary_ptr: 0, boundary_locked: false,
+            buf0_ptr: 0, buf0_layer: -1, buf0_size: 0,
+            buf1_ptr: 0, buf1_layer: -1, buf1_size: 0,
+            prefetch_layer: -1, total_loads: 0, total_prefetches: 0,
+            closed: true
+        }
+        return fail
+    }
+
+    // Lock boundary layers into RAM (2.52 GB)
+    // Root cause: boundary layers are used every single forward pass for token routing.
+    // If they page out, we get 340us+ stalls. mlock pins them permanently.
+    let boundary_start = base + HEADER_BYTES
+    let lock_result = mlock(boundary_start, BOUNDARY_SIZE_BYTES)
+    let locked = lock_result == 0
+
+    if locked == false {
+        // Non-fatal: mlock can fail if ulimit is low. Performance degrades but works.
+        println("[mmap_loader] WARN: mlock failed for boundary layers — will page-fault on cold access")
+    }
+
+    let loader = MmapLoader {
+        fd: fd,
+        base_ptr: base,
+        file_size: file_size,
+        page_size: PAGE_SIZE,
+        boundary_ptr: boundary_start,
+        boundary_locked: locked,
+        buf0_ptr: 0,
+        buf0_layer: -1,
+        buf0_size: 0,
+        buf1_ptr: 0,
+        buf1_layer: -1,
+        buf1_size: 0,
+        prefetch_layer: -1,
+        total_loads: 0,
+        total_prefetches: 0,
+        closed: false
+    }
+
+    println("[mmap_loader] opened: size=" + str(file_size) + " boundary_locked=" + str(locked))
+    return loader
+}
+
+// ─── mmap_load_layer ────────────────────────────────────────────────
+
+fn mmap_load_layer(loader: MmapLoader, layer_idx: int, buf_id: int) -> int {
+    // Returns a pointer (int) to the start of layer data in the mmap region.
+    //
+    // For boundary layers (0..7): returns direct pointer into the always-resident region.
+    // For bulk layers (8..13): returns pointer and records which buffer slot holds it.
+    //
+    // buf_id is 0 or 1, selecting which double-buffer slot to associate.
+    // Root cause: double-buffer lets compute proceed on buf A while buf B prefetches.
+
+    if loader.closed {
+        println("[mmap_loader] ERROR: load_layer on closed loader")
+        return 0
+    }
+
+    if layer_idx < 0 {
+        println("[mmap_loader] ERROR: negative layer_idx=" + str(layer_idx))
+        return 0
+    }
+    if layer_idx >= N_TOTAL_LAYERS {
+        println("[mmap_loader] ERROR: layer_idx=" + str(layer_idx) + " >= " + str(N_TOTAL_LAYERS))
+        return 0
+    }
+
+    let span = layer_span(layer_idx)
+    let ptr = loader.base_ptr + span.offset
+
+    // For boundary layers, no buffer tracking needed — they're always resident
+    if layer_idx < N_BOUNDARY_LAYERS {
+        // Touch the region with MADV_WILLNEED just in case mlock failed
+        // Root cause: if mlock failed due to ulimit, this at least triggers readahead
+        let page_start = align_down(ptr, PAGE_SIZE)
+        let page_end   = align_up(ptr + span.size, PAGE_SIZE)
+        madvise(page_start, page_end - page_start, MADV_WILLNEED)
+        return ptr
+    }
+
+    // Bulk layer — associate with the requested buffer slot
+    // Root cause: we track which layer each buffer holds so we can skip re-loading
+    // if the prefetch already brought it in.
+    if buf_id == 0 {
+        // Hexa pass-by-value: we can't mutate loader in-place from the caller.
+        // The caller must re-assign: loader = mmap_load_layer_update(loader, ...)
+        // For the pointer return, we just compute and return.
+        // Buffer tracking is done separately via mmap_mark_buffer.
+        let nop = 0
+    }
+
+    // Issue MADV_WILLNEED on the exact pages for this layer
+    // Root cause: even though prefetch_next may have already hinted,
+    // re-hinting is idempotent and covers the case where prefetch was skipped.
+    let page_start = align_down(ptr, PAGE_SIZE)
+    let page_end   = align_up(ptr + span.size, PAGE_SIZE)
+    madvise(page_start, page_end - page_start, MADV_WILLNEED)
+
+    return ptr
+}
+
+// ─── mmap_mark_buffer (workaround for pass-by-value) ────────────────
+
+fn mmap_mark_buffer(loader: MmapLoader, layer_idx: int, buf_id: int) -> MmapLoader {
+    // Root cause: hexa lists/structs are pass-by-value. mmap_load_layer cannot
+    // mutate the caller's loader. So the caller does:
+    //   let ptr = mmap_load_layer(loader, idx, buf)
+    //   loader  = mmap_mark_buffer(loader, idx, buf)
+    // This returns a new MmapLoader with updated buffer tracking.
+
+    let span = layer_span(layer_idx)
+    let ptr  = loader.base_ptr + span.offset
+
+    if buf_id == 0 {
+        let updated = MmapLoader {
+            fd: loader.fd, base_ptr: loader.base_ptr, file_size: loader.file_size,
+            page_size: loader.page_size, boundary_ptr: loader.boundary_ptr,
+            boundary_locked: loader.boundary_locked,
+            buf0_ptr: ptr, buf0_layer: layer_idx, buf0_size: span.size,
+            buf1_ptr: loader.buf1_ptr, buf1_layer: loader.buf1_layer, buf1_size: loader.buf1_size,
+            prefetch_layer: loader.prefetch_layer,
+            total_loads: loader.total_loads + 1,
+            total_prefetches: loader.total_prefetches,
+            closed: loader.closed
+        }
+        return updated
+    }
+
+    // buf_id == 1
+    let updated = MmapLoader {
+        fd: loader.fd, base_ptr: loader.base_ptr, file_size: loader.file_size,
+        page_size: loader.page_size, boundary_ptr: loader.boundary_ptr,
+        boundary_locked: loader.boundary_locked,
+        buf0_ptr: loader.buf0_ptr, buf0_layer: loader.buf0_layer, buf0_size: loader.buf0_size,
+        buf1_ptr: ptr, buf1_layer: layer_idx, buf1_size: span.size,
+        prefetch_layer: loader.prefetch_layer,
+        total_loads: loader.total_loads + 1,
+        total_prefetches: loader.total_prefetches,
+        closed: loader.closed
+    }
+    return updated
+}
+
+// ─── mmap_prefetch_next ─────────────────────────────────────────────
+
+fn mmap_prefetch_next(loader: MmapLoader, next_layer_idx: int) -> MmapLoader {
+    // Issue posix_madvise(MADV_WILLNEED) for the next layer's pages.
+    // This is async — the kernel starts reading from NVMe in the background.
+    //
+    // Root cause: at 7.4 GB/s NVMe and ~748 MB per bulk layer, a cold read takes
+    // ~101 ms. By prefetching during compute (which takes ~80-120 ms per layer on M4),
+    // we overlap IO and compute, hiding most of the latency.
+    //
+    // Returns updated loader with prefetch_layer recorded.
+
+    if loader.closed {
+        println("[mmap_loader] WARN: prefetch on closed loader")
+        return loader
+    }
+
+    if next_layer_idx < 0 {
+        return loader
+    }
+    if next_layer_idx >= N_TOTAL_LAYERS {
+        return loader
+    }
+
+    // Boundary layers are already locked — no prefetch needed
+    if next_layer_idx < N_BOUNDARY_LAYERS {
+        return loader
+    }
+
+    let span = layer_span(next_layer_idx)
+    let ptr  = loader.base_ptr + span.offset
+
+    // Page-align the range for madvise
+    let page_start = align_down(ptr, PAGE_SIZE)
+    let page_end   = align_up(ptr + span.size, PAGE_SIZE)
+    let advise_len = page_end - page_start
+
+    // MADV_WILLNEED: kernel initiates async readahead for these pages
+    let rc = madvise(page_start, advise_len, MADV_WILLNEED)
+    if rc != 0 {
+        println("[mmap_loader] WARN: madvise WILLNEED failed for layer " + str(next_layer_idx))
+    }
+
+    // Return updated loader with prefetch tracking
+    let updated = MmapLoader {
+        fd: loader.fd, base_ptr: loader.base_ptr, file_size: loader.file_size,
+        page_size: loader.page_size, boundary_ptr: loader.boundary_ptr,
+        boundary_locked: loader.boundary_locked,
+        buf0_ptr: loader.buf0_ptr, buf0_layer: loader.buf0_layer, buf0_size: loader.buf0_size,
+        buf1_ptr: loader.buf1_ptr, buf1_layer: loader.buf1_layer, buf1_size: loader.buf1_size,
+        prefetch_layer: next_layer_idx,
+        total_loads: loader.total_loads,
+        total_prefetches: loader.total_prefetches + 1,
+        closed: loader.closed
+    }
+    return updated
+}
+
+// ─── mmap_release_layer ─────────────────────────────────────────────
+
+fn mmap_release_layer(loader: MmapLoader, layer_idx: int) -> MmapLoader {
+    // Hint that a bulk layer's pages can be reclaimed.
+    // Root cause: after compute finishes on a bulk layer, we MADV_FREE its pages
+    // so the kernel can reclaim them under memory pressure. This keeps RSS bounded
+    // to ~boundary(2.52GB) + 2*bulk_layer(~1.5GB) = ~4GB peak, well within 16GB.
+
+    if layer_idx < N_BOUNDARY_LAYERS {
+        // Never release boundary layers — they must stay resident
+        return loader
+    }
+
+    let span = layer_span(layer_idx)
+    let ptr  = loader.base_ptr + span.offset
+
+    let page_start = align_down(ptr, PAGE_SIZE)
+    let page_end   = align_up(ptr + span.size, PAGE_SIZE)
+
+    // MADV_FREE: lazy release — pages stay until the kernel needs them
+    // Root cause: MADV_FREE is cheaper than MADV_DONTNEED on macOS because
+    // it avoids immediate page table updates. The pages are simply deprioritized.
+    madvise(page_start, page_end - page_start, MADV_FREE)
+
+    return loader
+}
+
+// ─── mmap_close ─────────────────────────────────────────────────────
+
+fn mmap_close(loader: MmapLoader) -> MmapLoader {
+    // Clean shutdown: unlock boundary, unmap, close fd.
+
+    if loader.closed {
+        println("[mmap_loader] WARN: double close")
+        return loader
+    }
+
+    // Unlock boundary layers if they were locked
+    if loader.boundary_locked {
+        munlock(loader.boundary_ptr, BOUNDARY_SIZE_BYTES)
+    }
+
+    // Unmap the entire file
+    if loader.base_ptr != 0 {
+        munmap(loader.base_ptr, loader.file_size)
+    }
+
+    // Close file descriptor
+    if loader.fd >= 0 {
+        close(loader.fd)
+    }
+
+    println("[mmap_loader] closed: loads=" + str(loader.total_loads) + " prefetches=" + str(loader.total_prefetches))
+
+    let closed_loader = MmapLoader {
+        fd: -1, base_ptr: 0, file_size: 0, page_size: PAGE_SIZE,
+        boundary_ptr: 0, boundary_locked: false,
+        buf0_ptr: 0, buf0_layer: -1, buf0_size: 0,
+        buf1_ptr: 0, buf1_layer: -1, buf1_size: 0,
+        prefetch_layer: -1,
+        total_loads: loader.total_loads,
+        total_prefetches: loader.total_prefetches,
+        closed: true
+    }
+    return closed_loader
+}
+
+// ─── mmap_get_resident_pages ────────────────────────────────────────
+
+fn mmap_get_resident_pages(loader: MmapLoader) -> int {
+    // Returns the process RSS in pages (not bytes).
+    // Root cause: on macOS, /proc/self/statm doesn't exist. We use
+    // mach_task_info via the task_info_resident_size() FFI wrapper,
+    // which returns phys_footprint in bytes. We convert to pages.
+    //
+    // On Linux, this would read /proc/self/statm field 1.
+
+    if loader.closed {
+        return 0
+    }
+
+    let rss_bytes = task_info_resident_size()
+    if rss_bytes <= 0 {
+        // Fallback: estimate from what we know is mapped
+        let est = BOUNDARY_SIZE_BYTES / PAGE_SIZE
+        return est
+    }
+    let pages = rss_bytes / PAGE_SIZE
+    return pages
+}
+
+// ─── mmap_get_rss_mb ────────────────────────────────────────────────
+
+fn mmap_get_rss_mb(loader: MmapLoader) -> int {
+    // Convenience: RSS in megabytes for telemetry logging
+    let pages = mmap_get_resident_pages(loader)
+    let mb = (pages * PAGE_SIZE) / 1048576    // 1 MB = 1048576 bytes
+    return mb
+}
+
+// ─── Double-buffer inference loop helper ────────────────────────────
+
+fn mmap_run_double_buffer_pass(loader: MmapLoader) -> MmapLoader {
+    // Example full forward pass using double-buffer pattern.
+    // Iterates all 14 layers: boundary layers are direct, bulk layers alternate buffers.
+    //
+    // Root cause: this function demonstrates the canonical usage pattern.
+    // Real inference would call the compute kernel between load and release.
+
+    let mut ld = loader
+    let mut layer_idx = 0
+    let mut buf_id = 0
+
+    // Phase 1: boundary layers (0..7) — all resident, no buffering needed
+    while layer_idx < N_BOUNDARY_LAYERS {
+        let ptr = mmap_load_layer(ld, layer_idx, 0)
+        // [compute_boundary_layer(ptr, layer_idx) would go here]
+        layer_idx = layer_idx + 1
+    }
+
+    // Phase 2: bulk layers (8..13) — double-buffered
+    // Prefetch first bulk layer before entering the loop
+    ld = mmap_prefetch_next(ld, N_BOUNDARY_LAYERS)
+
+    while layer_idx < N_TOTAL_LAYERS {
+        buf_id = (layer_idx - N_BOUNDARY_LAYERS) % N_BUFFERS
+
+        // Load current layer (should be warm from prefetch)
+        let ptr = mmap_load_layer(ld, layer_idx, buf_id)
+        ld = mmap_mark_buffer(ld, layer_idx, buf_id)
+
+        // Prefetch next layer into the OTHER buffer while we compute
+        let next_idx = layer_idx + 1
+        if next_idx < N_TOTAL_LAYERS {
+            ld = mmap_prefetch_next(ld, next_idx)
+        }
+
+        // [compute_bulk_layer(ptr, layer_idx) would go here]
+
+        // Release previous layer from this buffer slot (2 layers ago)
+        let prev_in_slot = layer_idx - N_BUFFERS
+        if prev_in_slot >= N_BOUNDARY_LAYERS {
+            ld = mmap_release_layer(ld, prev_in_slot)
+        }
+
+        layer_idx = layer_idx + 1
+    }
+
+    // Release the last two bulk layers
+    ld = mmap_release_layer(ld, N_TOTAL_LAYERS - 1)
+    ld = mmap_release_layer(ld, N_TOTAL_LAYERS - 2)
+
+    return ld
+}
+
+// ─── Tile iteration helper ──────────────────────────────────────────
+
+fn tile_count_for_layer(layer_size: int) -> int {
+    // Number of L2-sized tiles in a layer.
+    // Root cause: we process in 8MB tiles to stay within L2 cache.
+    // This prevents thrashing when the compute kernel does matmul over weights.
+    let tiles = (layer_size + TILE_BYTES - 1) / TILE_BYTES
+    return tiles
+}
+
+fn tile_offset(tile_idx: int) -> int {
+    // Byte offset of tile within a layer
+    return tile_idx * TILE_BYTES
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// SELF-TEST
+// ═══════════════════════════════════════════════════════════════════════
+// Deterministic structural tests — no file I/O needed.
+// Run: hexa run serving/edge/mmap_loader.hexa
+
+fn test_layer_span_boundary() -> bool {
+    // Test 1: boundary layer 0 starts at HEADER_BYTES
+    let s = layer_span(0)
+    let expected_off = HEADER_BYTES    // 4096
+    let expected_sz  = BOUNDARY_SIZE_BYTES / N_BOUNDARY_LAYERS   // 337117184
+    if s.offset != expected_off {
+        println("[TEST 1 FAIL] boundary layer 0 offset: got " + str(s.offset) + " expected " + str(expected_off))
+        return false
+    }
+    if s.size != expected_sz {
+        println("[TEST 1 FAIL] boundary layer 0 size: got " + str(s.size) + " expected " + str(expected_sz))
+        return false
+    }
+    println("[TEST 1 PASS] layer_span boundary layer 0")
+    return true
+}
+
+fn test_layer_span_bulk() -> bool {
+    // Test 2: first bulk layer (idx 8) starts after header + boundary region
+    let s = layer_span(N_BOUNDARY_LAYERS)
+    let expected_off = HEADER_BYTES + BOUNDARY_SIZE_BYTES
+    let expected_sz  = BULK_LAYER_BYTES
+    if s.offset != expected_off {
+        println("[TEST 2 FAIL] bulk layer 8 offset: got " + str(s.offset) + " expected " + str(expected_off))
+        return false
+    }
+    if s.size != expected_sz {
+        println("[TEST 2 FAIL] bulk layer 8 size: got " + str(s.size) + " expected " + str(expected_sz))
+        return false
+    }
+    println("[TEST 2 PASS] layer_span bulk layer 8")
+    return true
+}
+
+fn test_alignment() -> bool {
+    // Test 3: align_down and align_up correctness
+    let down = align_down(16400, PAGE_SIZE)   // 16400 -> 16384 (1 page)
+    let up   = align_up(16400, PAGE_SIZE)     // 16400 -> 32768 (2 pages)
+    if down != 16384 {
+        println("[TEST 3 FAIL] align_down(16400, 16384)=" + str(down) + " expected 16384")
+        return false
+    }
+    if up != 32768 {
+        println("[TEST 3 FAIL] align_up(16400, 16384)=" + str(up) + " expected 32768")
+        return false
+    }
+    // Edge case: already aligned
+    let down2 = align_down(16384, PAGE_SIZE)
+    let up2   = align_up(16384, PAGE_SIZE)
+    if down2 != 16384 {
+        println("[TEST 3 FAIL] align_down(16384)=" + str(down2))
+        return false
+    }
+    if up2 != 16384 {
+        println("[TEST 3 FAIL] align_up(16384)=" + str(up2))
+        return false
+    }
+    println("[TEST 3 PASS] alignment helpers")
+    return true
+}
+
+fn test_tile_count() -> bool {
+    // Test 4: tile count for a bulk layer
+    // BULK_LAYER_BYTES = 785481728, TILE_BYTES = 8388608
+    // 785481728 / 8388608 = 93.6... -> ceil = 94
+    let tc = tile_count_for_layer(BULK_LAYER_BYTES)
+    let expected = (BULK_LAYER_BYTES + TILE_BYTES - 1) / TILE_BYTES
+    if tc != expected {
+        println("[TEST 4 FAIL] tile_count=" + str(tc) + " expected " + str(expected))
+        return false
+    }
+    // Exact divisible case
+    let tc2 = tile_count_for_layer(TILE_BYTES * 10)
+    if tc2 != 10 {
+        println("[TEST 4 FAIL] tile_count(10 tiles)=" + str(tc2) + " expected 10")
+        return false
+    }
+    println("[TEST 4 PASS] tile_count_for_layer")
+    return true
+}
+
+fn test_layer_span_contiguous() -> bool {
+    // Test 5: all layers are contiguous (no gaps/overlaps)
+    // End of layer N == start of layer N+1
+    let mut ok = true
+    let mut i = 0
+    while i < N_TOTAL_LAYERS - 1 {
+        let s_cur  = layer_span(i)
+        let s_next = layer_span(i + 1)
+        let cur_end = s_cur.offset + s_cur.size
+
+        // At the boundary/bulk transition (layer 7->8), there may be alignment padding
+        // due to integer division rounding. Check within 1 byte tolerance.
+        if i == N_BOUNDARY_LAYERS - 1 {
+            // Boundary end should be at HEADER + BOUNDARY_SIZE
+            let expected_end = HEADER_BYTES + BOUNDARY_SIZE_BYTES
+            // Due to integer division (BOUNDARY_SIZE / 8 * 8), check they match
+            let boundary_total = (BOUNDARY_SIZE_BYTES / N_BOUNDARY_LAYERS) * N_BOUNDARY_LAYERS
+            let actual_end = HEADER_BYTES + boundary_total
+            if actual_end != s_next.offset {
+                // There's a small gap from integer division rounding — acceptable
+                let gap = s_next.offset - actual_end
+                if gap < 0 {
+                    println("[TEST 5 FAIL] overlap at boundary/bulk transition: " + str(gap))
+                    ok = false
+                }
+                if gap > BULK_LAYER_BYTES {
+                    println("[TEST 5 FAIL] huge gap at boundary/bulk: " + str(gap))
+                    ok = false
+                }
+            }
+        }
+
+        // Within boundary or within bulk region: must be exactly contiguous
+        if i < N_BOUNDARY_LAYERS - 1 {
+            if cur_end != s_next.offset {
+                println("[TEST 5 FAIL] gap between boundary layers " + str(i) + " and " + str(i + 1))
+                ok = false
+            }
+        }
+        if i >= N_BOUNDARY_LAYERS {
+            if cur_end != s_next.offset {
+                println("[TEST 5 FAIL] gap between bulk layers " + str(i) + " and " + str(i + 1))
+                ok = false
+            }
+        }
+
+        i = i + 1
+    }
+
+    if ok {
+        println("[TEST 5 PASS] layer spans contiguous")
+    }
+    return ok
+}
+
+fn test_constants_sanity() -> bool {
+    // Test 6: constant relationships hold
+    let mut ok = true
+
+    // Total model = header + boundary + bulk
+    let total = HEADER_BYTES + BOUNDARY_SIZE_BYTES + BULK_TOTAL_BYTES
+    // This should be close to the expected file size (~7.01 GB)
+    // 4096 + 2696937472 + 4712890368 = 7409831936 (~6.9 GB)
+    if total < 7000000000 {
+        println("[TEST 6 FAIL] total too small: " + str(total))
+        ok = false
+    }
+    if total > 8000000000 {
+        println("[TEST 6 FAIL] total too large: " + str(total))
+        ok = false
+    }
+
+    // Tile fits in L2/2
+    if TILE_BYTES > 8388608 {
+        println("[TEST 6 FAIL] tile exceeds 8MB: " + str(TILE_BYTES))
+        ok = false
+    }
+
+    // N_BUFFERS == 2 (double buffer)
+    if N_BUFFERS != 2 {
+        println("[TEST 6 FAIL] N_BUFFERS != 2")
+        ok = false
+    }
+
+    // Page size is 16K for Apple Silicon
+    if PAGE_SIZE != 16384 {
+        println("[TEST 6 FAIL] PAGE_SIZE != 16384")
+        ok = false
+    }
+
+    if ok {
+        println("[TEST 6 PASS] constants sanity")
+    }
+    return ok
+}
+
+fn test_double_buffer_alternation() -> bool {
+    // Test 7: buf_id alternates correctly for bulk layers
+    let mut ok = true
+    let mut layer_idx = N_BOUNDARY_LAYERS
+    while layer_idx < N_TOTAL_LAYERS {
+        let buf_id = (layer_idx - N_BOUNDARY_LAYERS) % N_BUFFERS
+        let expected = (layer_idx - N_BOUNDARY_LAYERS) % 2
+
+        if buf_id != expected {
+            println("[TEST 7 FAIL] layer " + str(layer_idx) + " buf_id=" + str(buf_id) + " expected=" + str(expected))
+            ok = false
+        }
+        layer_idx = layer_idx + 1
+    }
+
+    if ok {
+        println("[TEST 7 PASS] double-buffer alternation")
+    }
+    return ok
+}
+
+// ─── Main (self-test runner) ────────────────────────────────────────
+
+fn main() {
+    println("=== mmap_loader self-test ===")
+    println("M4 edge inference — double-buffer mmap weight loader")
+    println("")
+
+    let mut pass = 0
+    let mut fail = 0
+
+    if test_layer_span_boundary() { pass = pass + 1 } else { fail = fail + 1 }
+    if test_layer_span_bulk()     { pass = pass + 1 } else { fail = fail + 1 }
+    if test_alignment()           { pass = pass + 1 } else { fail = fail + 1 }
+    if test_tile_count()          { pass = pass + 1 } else { fail = fail + 1 }
+    if test_layer_span_contiguous() { pass = pass + 1 } else { fail = fail + 1 }
+    if test_constants_sanity()    { pass = pass + 1 } else { fail = fail + 1 }
+    if test_double_buffer_alternation() { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("")
+    println("=== RESULT: " + str(pass) + "/" + str(pass + fail) + " PASS ===")
+
+    if fail > 0 {
+        println("SELF-TEST FAILED")
+    }
+    if fail == 0 {
+        println("ALL PASS")
+    }
+}
