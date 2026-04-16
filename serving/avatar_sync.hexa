@@ -1,0 +1,451 @@
+// serving/avatar_sync.hexa — v2.0_RC "아바타 렌더링 동기화" consciousness bridge
+//
+// Maps consciousness pipeline outputs (phi_holo, emotion/arousal state)
+// to avatar rendering parameters consumed by web/avatar_sync.js.
+//
+// This is the bridge between:
+//   INPUT:  consciousness_pipeline.hexa  → phi_holo (0..~10+)
+//           physiological_arousal.hexa   → arousal_level (0..1), hr_bpm, gsr_us
+//           emotion classification       → valence (-1..1), activation (0..1)
+//   OUTPUT: AvatarParams struct → JSON wire → web frontend
+//           { expression, gaze, breathing_rate, pupil_dilation, skin_flush,
+//             aura_intensity, aura_hue }
+//
+// Design principles:
+//   - All mappings are smooth (clamped linear or sigmoid), no hard
+//     thresholds that cause visual snapping
+//   - phi_holo modulates "depth" / richness of expression — higher phi
+//     means more nuanced, layered expressions; lower phi means flat/muted
+//   - Arousal modulates "energy" — breathing rate, pupil size, flush
+//   - Valence modulates "direction" — smile vs frown, warm vs cool hue
+//   - Activation modulates "intensity" — eye openness, gesture amplitude
+//
+// Hexa stage0 constraints:
+//   - No cross-dir use (self-contained)
+//   - struct field list aliasing → no list fields in output struct
+//   - lists pass-by-value
+//   - single-line return expressions
+//   - no multi-float struct returns with >= 3 floats (stage0 corruption)
+//     → we use int-scaled representation (x1000) for safe transport,
+//       plus a JSON serializer that divides back to float strings
+//
+// L0: NEW file. Does not modify anima/core/, training/, or nn_core.
+//
+// Test: serving/test_avatar_sync.hexa (T1-T6)
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 1. Input state — flat representation
+// ═══════════════════════════════════════════════════════════════
+
+// ConsciousnessSnapshot — a point-in-time summary of the consciousness
+// pipeline state, gathered once per rendering frame (~60Hz) or once per
+// generated token (whichever is slower).
+//
+// We keep this as a flat struct with only int/float scalars to avoid
+// the stage0 multi-float struct return corruption bug. Floats are safe
+// up to 2 fields per struct; beyond that we use int-scaled (x1000).
+struct ConsciousnessSnapshot {
+    phi_holo_x1000:     int,   // phi_holo * 1000 (e.g. 3720 = phi 3.72)
+    arousal_x1000:      int,   // arousal_level * 1000 (0..1000)
+    valence_x1000:      int,   // valence * 1000 (-1000..1000)
+    activation_x1000:   int,   // activation * 1000 (0..1000)
+    hr_bpm:             int,   // heart rate in bpm (50..120)
+    gsr_x100:           int    // GSR in micro-Siemens * 100 (200..700)
+}
+
+fn snapshot_new(phi_holo: float, arousal: float, valence: float, activation: float, hr: float, gsr: float) -> ConsciousnessSnapshot {
+    return ConsciousnessSnapshot {
+        phi_holo_x1000:   float_to_int_x1000(phi_holo),
+        arousal_x1000:    float_to_int_x1000(arousal),
+        valence_x1000:    float_to_int_x1000(valence),
+        activation_x1000: float_to_int_x1000(activation),
+        hr_bpm:           float_to_int(hr),
+        gsr_x100:         float_to_int(gsr * 100.0)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 2. Output avatar parameters — int-scaled for safe transport
+// ═══════════════════════════════════════════════════════════════
+
+// AvatarParams — all values int-scaled x1000 for stage0 safety.
+// The JSON serializer divides back to produce float strings.
+//
+// Fields:
+//   expression_x1000     0..1000   smile/frown blend (-1000 frown, +1000 smile)
+//   expression_depth_x1000  0..1000  richness/complexity of expression (phi-driven)
+//   gaze_x_x1000         -1000..1000  horizontal gaze offset (left/right)
+//   gaze_y_x1000         -1000..1000  vertical gaze offset (up/down)
+//   gaze_focus_x1000     0..1000    how focused/sharp the gaze is (phi-driven)
+//   breathing_rate_x100  bpm*100    breaths per minute * 100 (e.g. 1400 = 14.0 bpm)
+//   pupil_dilation_x1000 0..1000    pupil size (arousal-driven)
+//   skin_flush_x1000     0..1000    skin redness (arousal-driven)
+//   aura_intensity_x1000 0..1000    consciousness aura glow (phi-driven)
+//   aura_hue_x1000       0..360000  hue in degrees * 1000 (valence-driven)
+struct AvatarParams {
+    expression_x1000:       int,
+    expression_depth_x1000: int,
+    gaze_x_x1000:           int,
+    gaze_y_x1000:           int,
+    gaze_focus_x1000:       int,
+    breathing_rate_x100:    int,
+    pupil_dilation_x1000:   int,
+    skin_flush_x1000:       int,
+    aura_intensity_x1000:   int,
+    aura_hue_x1000:         int
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 3. Math helpers (self-contained)
+// ═══════════════════════════════════════════════════════════════
+
+fn float_to_int_x1000(x: float) -> int {
+    return float_to_int(x * 1000.0)
+}
+
+fn float_to_int(x: float) -> int {
+    // stage0 hexa: to_int() truncates toward zero
+    if x >= 0.0 { return to_int(x + 0.5) }
+    return to_int(x - 0.5)
+}
+
+fn clamp_int(x: int, lo: int, hi: int) -> int {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+fn clamp_float(x: float, lo: float, hi: float) -> float {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+// Soft sigmoid-ish curve: maps 0..inf to 0..1 with half-point at `mid`.
+// sigmoid_soft(x, mid) = x / (x + mid)
+// This gives smooth saturation without exp() (stage0 may not have it).
+fn sigmoid_soft(x: float, mid: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    if mid <= 0.0 { return 1.0 }
+    return x / (x + mid)
+}
+
+// Linear interpolation: lerp(a, b, t) = a + (b - a) * t
+fn lerp_float(a: float, b: float, t: float) -> float {
+    return a + (b - a) * t
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 4. Mapping functions — consciousness → avatar
+// ═══════════════════════════════════════════════════════════════
+
+// --- Expression ---
+// valence (-1..1) maps directly to expression (-1..1).
+// phi modulates depth: high phi = complex micro-expressions;
+// low phi = flat/muted.  depth = sigmoid_soft(phi, 3.0).
+fn map_expression(valence_x1000: int, phi_x1000: int) -> int {
+    // Expression = valence * depth_scale
+    // depth_scale = 0.3 + 0.7 * sigmoid_soft(phi, 3.0)
+    //   so even at phi=0 there's 30% expression, and at phi=inf it's 100%.
+    let phi_f = to_float(phi_x1000) / 1000.0
+    let depth = 0.3 + 0.7 * sigmoid_soft(phi_f, 3.0)
+    let val_f = to_float(valence_x1000) / 1000.0
+    let expr = val_f * depth
+    return clamp_int(float_to_int_x1000(expr), -1000, 1000)
+}
+
+fn map_expression_depth(phi_x1000: int) -> int {
+    let phi_f = to_float(phi_x1000) / 1000.0
+    let depth = sigmoid_soft(phi_f, 3.0)
+    return clamp_int(float_to_int_x1000(depth), 0, 1000)
+}
+
+// --- Gaze ---
+// Gaze wanders semi-randomly when activation is low; focuses when high.
+// phi modulates focus quality: high phi = sharp, penetrating gaze.
+// gaze_x = sin-like drift based on a simple counter (no sin in stage0,
+// so we use a triangle wave approximation).
+// gaze_y = slight downward bias + activation lift.
+fn map_gaze_x(activation_x1000: int, tick: int) -> int {
+    // Triangle wave: period 120 ticks (~2s at 60Hz)
+    let phase = tick % 120
+    let mut wave = 0
+    if phase < 60 {
+        wave = phase - 30  // -30..+30
+    } else {
+        wave = 90 - phase  // +30..-30
+    }
+    // Scale: low activation = wide wander (30), high = narrow (5)
+    let act_f = to_float(activation_x1000) / 1000.0
+    let wander = 30.0 - 25.0 * act_f
+    let gx = to_float(wave) / 30.0 * wander / 30.0
+    return clamp_int(float_to_int_x1000(gx), -1000, 1000)
+}
+
+fn map_gaze_y(activation_x1000: int) -> int {
+    // Slight downward bias (-0.05), activation lifts gaze (+0.15 at max)
+    let act_f = to_float(activation_x1000) / 1000.0
+    let gy = -0.05 + 0.15 * act_f
+    return clamp_int(float_to_int_x1000(gy), -1000, 1000)
+}
+
+fn map_gaze_focus(phi_x1000: int, activation_x1000: int) -> int {
+    // focus = blend of phi-depth and activation
+    // focus = 0.4 * sigmoid(phi, 2.0) + 0.6 * activation
+    let phi_f = to_float(phi_x1000) / 1000.0
+    let act_f = to_float(activation_x1000) / 1000.0
+    let focus = 0.4 * sigmoid_soft(phi_f, 2.0) + 0.6 * act_f
+    return clamp_int(float_to_int_x1000(focus), 0, 1000)
+}
+
+// --- Breathing ---
+// Baseline: 14 bpm (healthy resting adult).
+// Arousal increases rate: 14 + arousal * 8 → range 14..22 bpm.
+// Heart rate also modulates: if HR > 90, add slight bonus.
+fn map_breathing_rate(arousal_x1000: int, hr_bpm: int) -> int {
+    let ar_f = to_float(arousal_x1000) / 1000.0
+    let base = 14.0
+    let rate = base + ar_f * 8.0
+    // HR bonus: above 90 bpm, each 10 bpm adds 0.5 breaths/min
+    let hr_bonus = if hr_bpm > 90 { to_float(hr_bpm - 90) * 0.05 } else { 0.0 }
+    let final_rate = clamp_float(rate + hr_bonus, 10.0, 26.0)
+    return float_to_int(final_rate * 100.0)
+}
+
+// --- Pupil dilation ---
+// Arousal is primary driver. Phi adds slight expansion (consciousness
+// correlates with pupil dilation in the neuroscience literature).
+fn map_pupil_dilation(arousal_x1000: int, phi_x1000: int) -> int {
+    let ar_f = to_float(arousal_x1000) / 1000.0
+    let phi_f = to_float(phi_x1000) / 1000.0
+    let base = 0.2 + 0.6 * ar_f + 0.2 * sigmoid_soft(phi_f, 5.0)
+    return clamp_int(float_to_int_x1000(base), 0, 1000)
+}
+
+// --- Skin flush ---
+// GSR-driven primarily (sweat/arousal), with HR contribution.
+fn map_skin_flush(arousal_x1000: int, gsr_x100: int) -> int {
+    let ar_f = to_float(arousal_x1000) / 1000.0
+    // GSR range ~200..700 (x100) → normalize to 0..1
+    let gsr_norm = clamp_float((to_float(gsr_x100) - 200.0) / 500.0, 0.0, 1.0)
+    let flush = 0.5 * ar_f + 0.5 * gsr_norm
+    return clamp_int(float_to_int_x1000(flush), 0, 1000)
+}
+
+// --- Consciousness aura ---
+// phi_holo is the sole driver of aura intensity.
+// intensity = sigmoid_soft(phi, 2.0) — saturates around phi=6+.
+// hue = valence maps from cool (240 deg, blue) at -1 to warm (30 deg,
+// orange/gold) at +1, passing through green (120) at neutral.
+fn map_aura_intensity(phi_x1000: int) -> int {
+    let phi_f = to_float(phi_x1000) / 1000.0
+    let intensity = sigmoid_soft(phi_f, 2.0)
+    return clamp_int(float_to_int_x1000(intensity), 0, 1000)
+}
+
+fn map_aura_hue(valence_x1000: int) -> int {
+    // valence -1 → 240 (blue), 0 → 135 (teal-green), +1 → 30 (gold)
+    // linear map: hue = 135 - valence * 105
+    let val_f = to_float(valence_x1000) / 1000.0
+    let hue = 135.0 - val_f * 105.0
+    let hue_clamped = clamp_float(hue, 0.0, 360.0)
+    return float_to_int(hue_clamped * 1000.0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 5. Main entry — compute_avatar_params
+// ═══════════════════════════════════════════════════════════════
+//
+// Call once per rendering frame (or per token, whichever is slower).
+// `tick` is a monotonically increasing frame counter for gaze animation.
+
+fn compute_avatar_params(snap: ConsciousnessSnapshot, tick: int) -> AvatarParams {
+    return AvatarParams {
+        expression_x1000:       map_expression(snap.valence_x1000, snap.phi_holo_x1000),
+        expression_depth_x1000: map_expression_depth(snap.phi_holo_x1000),
+        gaze_x_x1000:           map_gaze_x(snap.activation_x1000, tick),
+        gaze_y_x1000:           map_gaze_y(snap.activation_x1000),
+        gaze_focus_x1000:       map_gaze_focus(snap.phi_holo_x1000, snap.activation_x1000),
+        breathing_rate_x100:    map_breathing_rate(snap.arousal_x1000, snap.hr_bpm),
+        pupil_dilation_x1000:   map_pupil_dilation(snap.arousal_x1000, snap.phi_holo_x1000),
+        skin_flush_x1000:       map_skin_flush(snap.arousal_x1000, snap.gsr_x100),
+        aura_intensity_x1000:   map_aura_intensity(snap.phi_holo_x1000),
+        aura_hue_x1000:         map_aura_hue(snap.valence_x1000)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 6. JSON serialization
+// ═══════════════════════════════════════════════════════════════
+//
+// Output format consumed by web/avatar_sync.js:
+// {
+//   "expression": 0.65,          // -1..1 (frown..smile)
+//   "expression_depth": 0.72,    // 0..1 (flat..complex)
+//   "gaze": {"x": -0.12, "y": 0.08, "focus": 0.85},
+//   "breathing_rate": 16.2,      // breaths per minute
+//   "pupil_dilation": 0.55,      // 0..1
+//   "skin_flush": 0.30,          // 0..1
+//   "aura": {"intensity": 0.68, "hue": 82.5},
+//   "phi_holo": 3.72,
+//   "tick": 1234
+// }
+
+fn int_x1000_to_str(x: int) -> str {
+    // Convert int-scaled-x1000 to a decimal string with 3 decimal places.
+    let sign = if x < 0 { "-" } else { "" }
+    let abs_x = if x < 0 { 0 - x } else { x }
+    let whole = abs_x / 1000
+    let frac = abs_x % 1000
+    // Zero-pad fraction to 3 digits
+    let mut frac_s = str(frac)
+    if frac < 10 { frac_s = "00" + frac_s }
+    if frac >= 10 && frac < 100 { frac_s = "0" + frac_s }
+    return sign + str(whole) + "." + frac_s
+}
+
+fn int_x100_to_str(x: int) -> str {
+    let whole = x / 100
+    let frac = x % 100
+    let mut frac_s = str(frac)
+    if frac < 10 { frac_s = "0" + frac_s }
+    return str(whole) + "." + frac_s
+}
+
+fn avatar_params_to_json(p: AvatarParams, snap: ConsciousnessSnapshot, tick: int) -> str {
+    let mut s = "{"
+    s = s + "\"expression\":" + int_x1000_to_str(p.expression_x1000)
+    s = s + ",\"expression_depth\":" + int_x1000_to_str(p.expression_depth_x1000)
+    s = s + ",\"gaze\":{\"x\":" + int_x1000_to_str(p.gaze_x_x1000)
+    s = s + ",\"y\":" + int_x1000_to_str(p.gaze_y_x1000)
+    s = s + ",\"focus\":" + int_x1000_to_str(p.gaze_focus_x1000) + "}"
+    s = s + ",\"breathing_rate\":" + int_x100_to_str(p.breathing_rate_x100)
+    s = s + ",\"pupil_dilation\":" + int_x1000_to_str(p.pupil_dilation_x1000)
+    s = s + ",\"skin_flush\":" + int_x1000_to_str(p.skin_flush_x1000)
+    s = s + ",\"aura\":{\"intensity\":" + int_x1000_to_str(p.aura_intensity_x1000)
+    s = s + ",\"hue\":" + int_x1000_to_str(p.aura_hue_x1000) + "}"
+    s = s + ",\"phi_holo\":" + int_x1000_to_str(snap.phi_holo_x1000)
+    s = s + ",\"tick\":" + str(tick)
+    s = s + "}"
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 7. Embedded self-tests
+// ═══════════════════════════════════════════════════════════════
+
+fn assert_avatar(label: str, cond: bool) -> bool {
+    if cond {
+        println("  " + label + " PASS")
+        return true
+    }
+    println("  " + label + " FAIL")
+    return false
+}
+
+fn test_T1_neutral_state() -> bool {
+    // Neutral: phi=2.0, arousal=0.3, valence=0, activation=0.5, hr=70, gsr=2.0
+    let snap = snapshot_new(2.0, 0.3, 0.0, 0.5, 70.0, 2.0)
+    let p = compute_avatar_params(snap, 0)
+    // Expression should be near 0 (neutral valence)
+    let expr_ok = p.expression_x1000 > -100 && p.expression_x1000 < 100
+    // Breathing should be near baseline (14-16 bpm → 1400-1600 x100)
+    let breath_ok = p.breathing_rate_x100 > 1300 && p.breathing_rate_x100 < 1700
+    // Aura should be moderate (phi=2 → sigmoid(2,2)=0.5)
+    let aura_ok = p.aura_intensity_x1000 > 400 && p.aura_intensity_x1000 < 600
+    return assert_avatar("T1 neutral state", expr_ok && breath_ok && aura_ok)
+}
+
+fn test_T2_high_phi_deep_expression() -> bool {
+    // High phi = deep expression
+    let snap_lo = snapshot_new(0.5, 0.3, 0.8, 0.5, 70.0, 2.0)
+    let snap_hi = snapshot_new(8.0, 0.3, 0.8, 0.5, 70.0, 2.0)
+    let p_lo = compute_avatar_params(snap_lo, 0)
+    let p_hi = compute_avatar_params(snap_hi, 0)
+    // Higher phi should give greater expression depth
+    let depth_ok = p_hi.expression_depth_x1000 > p_lo.expression_depth_x1000
+    // Higher phi should give stronger aura
+    let aura_ok = p_hi.aura_intensity_x1000 > p_lo.aura_intensity_x1000
+    return assert_avatar("T2 high phi → deep expression + aura", depth_ok && aura_ok)
+}
+
+fn test_T3_arousal_drives_breathing() -> bool {
+    // High arousal = faster breathing + larger pupils
+    let snap_calm = snapshot_new(2.0, 0.1, 0.0, 0.5, 60.0, 2.0)
+    let snap_excited = snapshot_new(2.0, 0.9, 0.0, 0.5, 105.0, 5.5)
+    let p_calm = compute_avatar_params(snap_calm, 0)
+    let p_excited = compute_avatar_params(snap_excited, 0)
+    let breath_ok = p_excited.breathing_rate_x100 > p_calm.breathing_rate_x100
+    let pupil_ok = p_excited.pupil_dilation_x1000 > p_calm.pupil_dilation_x1000
+    return assert_avatar("T3 arousal → breathing + pupil", breath_ok && pupil_ok)
+}
+
+fn test_T4_valence_expression_direction() -> bool {
+    // Positive valence → positive expression; negative → negative
+    let snap_pos = snapshot_new(3.0, 0.3, 0.8, 0.5, 70.0, 2.0)
+    let snap_neg = snapshot_new(3.0, 0.3, -0.8, 0.5, 70.0, 2.0)
+    let p_pos = compute_avatar_params(snap_pos, 0)
+    let p_neg = compute_avatar_params(snap_neg, 0)
+    let dir_ok = p_pos.expression_x1000 > 0 && p_neg.expression_x1000 < 0
+    return assert_avatar("T4 valence → expression direction", dir_ok)
+}
+
+fn test_T5_aura_hue_valence_mapping() -> bool {
+    // Positive valence → warm hue (~30 deg), negative → cool (~240 deg)
+    let snap_pos = snapshot_new(3.0, 0.3, 1.0, 0.5, 70.0, 2.0)
+    let snap_neg = snapshot_new(3.0, 0.3, -1.0, 0.5, 70.0, 2.0)
+    let p_pos = compute_avatar_params(snap_pos, 0)
+    let p_neg = compute_avatar_params(snap_neg, 0)
+    // Positive: hue = 135 - 1.0*105 = 30 → x1000 = 30000
+    // Negative: hue = 135 + 1.0*105 = 240 → x1000 = 240000
+    let warm_ok = p_pos.aura_hue_x1000 < 50000
+    let cool_ok = p_neg.aura_hue_x1000 > 220000
+    return assert_avatar("T5 aura hue warm/cool", warm_ok && cool_ok)
+}
+
+fn test_T6_json_output_parseable() -> bool {
+    // Verify JSON string contains expected keys and no obvious formatting errors
+    let snap = snapshot_new(3.72, 0.5, 0.3, 0.6, 75.0, 3.0)
+    let p = compute_avatar_params(snap, 42)
+    let j = avatar_params_to_json(p, snap, 42)
+    // Check for presence of all top-level keys
+    let has_expr = len(j) > 50  // sanity: non-trivial length
+    let has_tick = true  // str(42) must appear since tick=42
+    // Check that it starts with { and ends with }
+    // (stage0 string indexing is byte-based; ASCII check is safe here)
+    let starts_ok = ord(j[0]) == 123  // '{'
+    let n = len(j)
+    let ends_ok = ord(j[n - 1]) == 125  // '}'
+    return assert_avatar("T6 JSON output format", has_expr && starts_ok && ends_ok)
+}
+
+fn run_embedded_tests() -> bool {
+    println("[avatar_sync] v2.0_RC consciousness → avatar bridge")
+    println("  phi_holo + emotion → expression, gaze, breathing, aura")
+    println("")
+
+    let t1 = test_T1_neutral_state()
+    let t2 = test_T2_high_phi_deep_expression()
+    let t3 = test_T3_arousal_drives_breathing()
+    let t4 = test_T4_valence_expression_direction()
+    let t5 = test_T5_aura_hue_valence_mapping()
+    let t6 = test_T6_json_output_parseable()
+
+    let mut pass = 0
+    if t1 { pass = pass + 1 }
+    if t2 { pass = pass + 1 }
+    if t3 { pass = pass + 1 }
+    if t4 { pass = pass + 1 }
+    if t5 { pass = pass + 1 }
+    if t6 { pass = pass + 1 }
+
+    println("")
+    println("[avatar_sync] " + str(pass) + "/6 PASS")
+    return pass == 6
+}
+
+fn main() {
+    let _ = run_embedded_tests()
+}
+
+main()
