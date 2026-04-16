@@ -1,0 +1,380 @@
+// ════════════════════════════════════════════════════════════════
+//  scripts/growth_log_rollover.hexa — CLM-P3-2 30-day rollover
+//
+//  Ported from scripts/growth_log_rollover.py (HEXA-FIRST total ban).
+//
+//  Purpose:
+//    Find growth_loop state files older than 30 days and move them
+//    into a date-stamped tar.gz archive next to them. Original
+//    sources are kept by default (sha256 verify happens via shell
+//    pipeline, then originals removed only with --execute).
+//
+//  Scan dirs:
+//      $ANIMA/ready/anima/config
+//      $ANIMA/ready/anima/logs
+//      $ANIMA/logs
+//      $ANIMA/.growth
+//
+//  Glob patterns:
+//      growth_loop_archive.json, growth_loop_state.json
+//      growth_*.log, growth.log
+//
+//  Output:
+//      <scan_dir>/_archive/growth_<YYYY-MM-DD>.tar.gz
+//
+//  Modes:
+//      (default)        --dry-run        plan only
+//      --execute        archive + delete originals (unless --keep-original)
+//      --keep-original  do not delete originals after archiving
+//      --cutoff-days N  override 30
+//
+//  Exit codes:
+//      0 ok (no-op / archived / verified)
+//      1 error (gz build, sha mismatch, delete fail)
+//
+//  HEXA quirks honoured:
+//    - No `use` chain (silent-exit defense)
+//    - All FS heavy lifting via shell exec(...) — `tar`, `sha256sum`,
+//      `find -newermt`, `mv -n` — same atomicity guarantees as python
+//      tempfile + os.replace via `tar -czf TMP && mv -f TMP FINAL`.
+//    - No struct returns (feedback_hexa_struct_return_bug)
+//    - Lists pass-by-value, mutated via reassignment (feedback_hexa_lists_pbv)
+// ════════════════════════════════════════════════════════════════
+
+let CUTOFF_DAYS_DEFAULT = 30
+
+fn anima_root() {
+    let env_anima = exec("printf %s \"${ANIMA:-}\"").trim()
+    if len(env_anima) > 0 { return env_anima }
+    let home = exec("printf %s \"${HOME:-}\"").trim()
+    if len(home) == 0 { return "/Users/ghost/Dev/anima" }
+    return home + "/Dev/anima"
+}
+
+fn scan_dirs() {
+    let root = anima_root()
+    let mut d = []
+    d = d.push(root + "/ready/anima/config")
+    d = d.push(root + "/ready/anima/logs")
+    d = d.push(root + "/logs")
+    d = d.push(root + "/.growth")
+    return d
+}
+
+fn growth_globs() {
+    let mut g = []
+    g = g.push("growth_loop_archive.json")
+    g = g.push("growth_loop_state.json")
+    g = g.push("growth_*.log")
+    g = g.push("growth.log")
+    return g
+}
+
+// ── Logging ──
+
+fn now_stamp() {
+    return exec("date +%Y-%m-%dT%H:%M:%S").trim()
+}
+
+fn log_info(msg) {
+    println("[growth_rollover " + now_stamp() + "] " + msg)
+}
+
+fn log_warn(msg) {
+    println("[growth_rollover " + now_stamp() + " WARN] " + msg)
+}
+
+fn log_err(msg) {
+    println("[growth_rollover " + now_stamp() + " ERR ] " + msg)
+}
+
+// ── Helpers ──
+
+fn split_lines(s) {
+    let n = len(s)
+    let mut lines = []
+    let mut start = 0
+    let mut i = 0
+    while i < n {
+        if s.substring(i, i + 1) == "\n" {
+            if i > start { lines = lines.push(s.substring(start, i)) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n { lines = lines.push(s.substring(start, n)) }
+    return lines
+}
+
+fn basename_of(path) {
+    return exec("basename " + path).trim()
+}
+
+fn file_mtime_iso_date(path) {
+    // Pick the newest mtime, return YYYY-MM-DD.
+    return exec("date -r \"$(stat -f %m \"" + path
+                + "\" 2>/dev/null || stat -c %Y \"" + path
+                + "\" 2>/dev/null)\" +%Y-%m-%d 2>/dev/null").trim()
+}
+
+fn newest_iso_tag(paths) {
+    // For a list of paths, find the newest mtime then format YYYY-MM-DD.
+    // Done in shell to avoid float/integer parsing in safe subset.
+    let n = len(paths)
+    if n == 0 { return exec("date +%Y-%m-%d").trim() }
+    let mut quoted = ""
+    let mut i = 0
+    while i < n {
+        quoted = quoted + " \"" + paths[i] + "\""
+        i = i + 1
+    }
+    // ls -t orders by mtime desc; head picks newest.
+    let newest = exec("ls -t " + quoted + " 2>/dev/null | head -1").trim()
+    if len(newest) == 0 { return exec("date +%Y-%m-%d").trim() }
+    return file_mtime_iso_date(newest)
+}
+
+// ── File scan: find files older than cutoff_days under scan_dir for a pattern ──
+
+fn list_old_matches(scan_dir, pattern, cutoff_days) {
+    if !file_exists(scan_dir) { return [] }
+    // -mtime +N matches files modified more than N days ago.
+    // Use -maxdepth 1 because the python original only globbed direct children.
+    let cmd = "find \"" + scan_dir + "\" -maxdepth 1 -type f -name \""
+            + pattern + "\" -mtime +" + str(cutoff_days) + " 2>/dev/null"
+    let out = exec(cmd)
+    return split_lines(out)
+}
+
+// Dedup a list of paths (preserve first occurrence).
+fn dedup(paths) {
+    let n = len(paths)
+    let mut seen = []
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let p = paths[i]
+        let mut found = false
+        let mut j = 0
+        while j < len(seen) {
+            if seen[j] == p { found = true ; j = len(seen) }
+            j = j + 1
+        }
+        if !found {
+            seen = seen.push(p)
+            out  = out.push(p)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Build archive for one scan_dir ──
+// Returns status string ("dry-run" / "skip-exists" / "verified" / "error: ...").
+// Side effect: prints the plan and (if execute) creates archive + verifies.
+
+fn build_archive(scan_dir, members, dry_run, keep_original, execute_mode) {
+    let archive_dir = scan_dir + "/_archive"
+    let tag         = newest_iso_tag(members)
+    let out_path    = archive_dir + "/growth_" + tag + ".tar.gz"
+    let n_members   = len(members)
+
+    log_info("plan: " + scan_dir + "  members=" + str(n_members)
+             + "  -> " + basename_of(out_path) + "  tag=" + tag)
+
+    // List members for the audit trail.
+    let mut mi = 0
+    while mi < n_members {
+        log_info("  + " + basename_of(members[mi]))
+        mi = mi + 1
+    }
+
+    if file_exists(out_path) {
+        log_info("  status=skip-exists (" + out_path + ")")
+        return "skip-exists"
+    }
+
+    if dry_run {
+        log_info("  status=dry-run")
+        return "dry-run"
+    }
+
+    // Ensure archive dir exists.
+    let _ = exec("mkdir -p \"" + archive_dir + "\"")
+
+    // Build space-separated, quoted, basename-only member list (we cd in tar).
+    let mut bnames = ""
+    let mut bi = 0
+    while bi < n_members {
+        bnames = bnames + " \"" + basename_of(members[bi]) + "\""
+        bi = bi + 1
+    }
+
+    // Atomic: tar -> tmp file, then mv. `tar -C scan_dir` keeps arcnames flat.
+    let tmp_path = archive_dir + "/.growth_" + tag + ".tar.gz.tmp"
+    let _ = exec("rm -f \"" + tmp_path + "\"")
+    let tar_cmd = "tar -C \"" + scan_dir + "\" -czf \"" + tmp_path + "\" " + bnames
+    let tar_rc  = exec(tar_cmd + " 2>&1 ; echo __RC=$?").trim()
+    // tar succeeded if __RC=0 was printed at the end. Cheap check via grep.
+    let ok_str  = exec("printf %s \"" + tar_rc + "\" | grep -c '__RC=0' || true").trim()
+    if ok_str != "1" {
+        log_err("  tar failed: " + tar_rc)
+        let _ = exec("rm -f \"" + tmp_path + "\"")
+        return "error: tar build failed"
+    }
+
+    // Promote tmp -> final.
+    let _ = exec("mv -f \"" + tmp_path + "\" \"" + out_path + "\"")
+    let size_str = exec("stat -f %z \"" + out_path
+                       + "\" 2>/dev/null || stat -c %s \"" + out_path
+                       + "\" 2>/dev/null").trim()
+    if size_str == "0" || len(size_str) == 0 {
+        log_err("  gz size zero: " + out_path)
+        return "error: gz size zero"
+    }
+
+    // Verify each member: extract from gz, sha256, compare to source sha256.
+    let mut vi = 0
+    while vi < n_members {
+        let m  = members[vi]
+        let bn = basename_of(m)
+        let src_sha = exec("shasum -a 256 \"" + m
+                           + "\" 2>/dev/null | awk '{print $1}'").trim()
+        let arc_sha = exec("tar -xOzf \"" + out_path + "\" \"" + bn
+                           + "\" 2>/dev/null | shasum -a 256 | awk '{print $1}'").trim()
+        if len(src_sha) == 0 || len(arc_sha) == 0 {
+            log_err("  sha read failed for " + bn)
+            return "error: sha read failed"
+        }
+        if src_sha != arc_sha {
+            log_err("  sha mismatch " + bn + " src=" + src_sha + " arc=" + arc_sha)
+            return "error: sha mismatch"
+        }
+        vi = vi + 1
+    }
+
+    log_info("  status=verified  size=" + size_str + "B")
+
+    // If execute and not keep-original, delete sources.
+    if execute_mode && !keep_original {
+        let mut di = 0
+        while di < n_members {
+            let _ = exec("rm -f \"" + members[di] + "\"")
+            log_info("  deleted: " + basename_of(members[di]))
+            di = di + 1
+        }
+    }
+
+    return "verified"
+}
+
+// ── Main ──
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+
+    let mut dry_run       = true
+    let mut execute_mode  = false
+    let mut keep_original = false
+    let mut cutoff_days   = CUTOFF_DAYS_DEFAULT
+
+    let mut i = 2
+    while i < argc {
+        let a = argv[i]
+        if a == "--dry-run" {
+            dry_run = true
+            execute_mode = false
+            i = i + 1
+        } else if a == "--execute" {
+            dry_run = false
+            execute_mode = true
+            i = i + 1
+        } else if a == "--keep-original" {
+            keep_original = true
+            i = i + 1
+        } else if a == "--cutoff-days" && i + 1 < argc {
+            cutoff_days = to_int(argv[i + 1])
+            if cutoff_days <= 0 { cutoff_days = CUTOFF_DAYS_DEFAULT }
+            i = i + 2
+        } else {
+            i = i + 1
+        }
+    }
+
+    let mode_str = "dry-run"
+    if execute_mode { mode_str = "execute" }
+
+    let today = exec("date +%Y-%m-%d").trim()
+    println("=== growth_log_rollover (CLM-P3-2) ===")
+    println("today          : " + today)
+    println("mode           : " + mode_str)
+    println("keep_original  : " + str(keep_original))
+    println("cutoff_days    : " + str(cutoff_days))
+    println("scan dirs      :")
+
+    let dirs = scan_dirs()
+    let globs = growth_globs()
+    let mut k = 0
+    while k < len(dirs) {
+        let mark = "(missing)"
+        if file_exists(dirs[k]) { mark = "(present)" }
+        println("  " + dirs[k] + " " + mark)
+        k = k + 1
+    }
+    println("")
+
+    let mut errors = 0
+    let mut groups_done = 0
+    let mut total_files = 0
+
+    let mut di = 0
+    while di < len(dirs) {
+        let scan_dir = dirs[di]
+        if !file_exists(scan_dir) { di = di + 1 ; continue }
+
+        let mut members = []
+        let mut gi = 0
+        while gi < len(globs) {
+            let hits = list_old_matches(scan_dir, globs[gi], cutoff_days)
+            let mut hi = 0
+            while hi < len(hits) {
+                if len(hits[hi]) > 0 { members = members.push(hits[hi]) }
+                hi = hi + 1
+            }
+            gi = gi + 1
+        }
+        members = dedup(members)
+        let nm = len(members)
+        if nm == 0 { di = di + 1 ; continue }
+
+        total_files = total_files + nm
+        let status = build_archive(scan_dir, members, dry_run, keep_original, execute_mode)
+        groups_done = groups_done + 1
+        // String-prefix "error" detection — substring check.
+        if len(status) >= 5 && status.substring(0, 5) == "error" {
+            errors = errors + 1
+        }
+        di = di + 1
+    }
+
+    println("")
+    println("=== summary ===")
+    println("dir groups touched : " + str(groups_done))
+    println("files found        : " + str(total_files))
+    println("errors             : " + str(errors))
+
+    if dry_run && total_files > 0 {
+        println("")
+        println("Run with --execute to actually archive.")
+    }
+
+    // Hexa main does not propagate exit codes via return; emit a trailer so
+    // wrapping shell scripts can grep ___EXIT___. Convention matches other
+    // hexa scripts in this repo.
+    if errors > 0 {
+        println("___EXIT___1")
+    } else {
+        println("___EXIT___0")
+    }
+}

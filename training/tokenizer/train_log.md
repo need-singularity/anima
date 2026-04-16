@@ -26,7 +26,7 @@ raw corpus after byte→UTF-8 reconstruction:
 GATE_LOCAL=1 /opt/homebrew/bin/python3 /tmp/train_ko_bpe.py
 
 # 3. (optional) encode full corpus to BPE ids
-GATE_LOCAL=1 /opt/homebrew/bin/python3 training/tokenize_corpus.py
+hexa training/tokenize_corpus.hexa  # Python entry banned per feedback_py_ban_total.md
 ```
 
 ## SentencePiece trainer parameters

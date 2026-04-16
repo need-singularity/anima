@@ -1,0 +1,368 @@
+// ════════════════════════════════════════════════════════════════
+//  scripts/evo_log_rotate.hexa — CLM-P3-3 ISO-week rotator
+//
+//  Ported from scripts/evo_log_rotate.py (HEXA-FIRST total ban).
+//
+//  Purpose:
+//    Rotate $ANIMA/ready/anima/logs/evo_*.log into ISO-week archives:
+//        $ANIMA/ready/anima/logs/_archive/evo_<YYYY>-W<WW>.tar.gz
+//    Files modified during the current ISO week stay live (active).
+//
+//  Modes:
+//      (default)        --dry-run        plan only
+//      --execute        archive + delete originals (unless --keep-original)
+//      --keep-original  do not delete originals after archiving
+//      --today YYYY-MM-DD  override today (testing)
+//
+//  Exit codes (printed as ___EXIT___N trailer for shell wrappers):
+//      0 ok (no-op / archived / verified)
+//      1 error (gz build, sha mismatch, delete fail)
+//
+//  HEXA quirks honoured:
+//    - No `use` chain (silent-exit defense)
+//    - All FS via shell exec(...) — `tar`, `shasum`, `find`
+//    - No struct returns (feedback_hexa_struct_return_bug)
+//    - Lists pass-by-value, mutated via reassignment (feedback_hexa_lists_pbv)
+// ════════════════════════════════════════════════════════════════
+
+fn anima_root() {
+    let env_anima = exec("printf %s \"${ANIMA:-}\"").trim()
+    if len(env_anima) > 0 { return env_anima }
+    let home = exec("printf %s \"${HOME:-}\"").trim()
+    if len(home) == 0 { return "/Users/ghost/Dev/anima" }
+    return home + "/Dev/anima"
+}
+
+fn log_dir()     { return anima_root() + "/ready/anima/logs" }
+fn archive_dir() { return log_dir() + "/_archive" }
+
+// ── Logging ──
+
+fn now_stamp() {
+    return exec("date +%Y-%m-%dT%H:%M:%S").trim()
+}
+
+fn log_info(msg) { println("[evo_rotate " + now_stamp() + "] " + msg) }
+fn log_warn(msg) { println("[evo_rotate " + now_stamp() + " WARN] " + msg) }
+fn log_err(msg)  { println("[evo_rotate " + now_stamp() + " ERR ] " + msg) }
+
+// ── Helpers ──
+
+fn split_lines(s) {
+    let n = len(s)
+    let mut lines = []
+    let mut start = 0
+    let mut i = 0
+    while i < n {
+        if s.substring(i, i + 1) == "\n" {
+            if i > start { lines = lines.push(s.substring(start, i)) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n { lines = lines.push(s.substring(start, n)) }
+    return lines
+}
+
+fn basename_of(path) {
+    return exec("basename " + path).trim()
+}
+
+// Resolve "today" — either passed-in YYYY-MM-DD or today.
+fn resolve_today(user_today) {
+    if len(user_today) > 0 { return user_today }
+    return exec("date +%Y-%m-%d").trim()
+}
+
+// Monday epoch seconds for the ISO week containing `today` (YYYY-MM-DD).
+fn monday_epoch(today) {
+    // GNU date: -d "$today -$(($(date -d $today +%u)-1)) days" +%s
+    // BSD date:  date -j -f %Y-%m-%d -v -$((dow-1))d $today +%s where dow=$(date -j -f %Y-%m-%d $today +%u)
+    // We use a cross-platform path: try GNU first, fall back to BSD.
+    let gnu = exec("date -d \"" + today + " -$(($(date -d \"" + today
+                  + "\" +%u)-1)) days\" +%s 2>/dev/null").trim()
+    if len(gnu) > 0 { return gnu }
+    let dow = exec("date -j -f %Y-%m-%d \"" + today + "\" +%u 2>/dev/null").trim()
+    if len(dow) == 0 { return "0" }
+    let off = exec("echo $(( " + dow + " - 1 ))").trim()
+    let bsd = exec("date -j -v -" + off + "d -f %Y-%m-%d \"" + today
+                  + "\" +%s 2>/dev/null").trim()
+    if len(bsd) > 0 { return bsd }
+    return "0"
+}
+
+// ISO week key "YYYY-Www" for a file's mtime.
+fn iso_week_key_for_file(path) {
+    // GNU + BSD both grok %G-W%V from a -r/-d epoch.
+    let mt = exec("stat -f %m \"" + path + "\" 2>/dev/null || stat -c %Y \""
+                  + path + "\" 2>/dev/null").trim()
+    if len(mt) == 0 { return "unknown" }
+    let key = exec("date -r " + mt + " +%G-W%V 2>/dev/null").trim()
+    if len(key) > 0 { return key }
+    // GNU fallback
+    let key2 = exec("date -d @" + mt + " +%G-W%V 2>/dev/null").trim()
+    if len(key2) > 0 { return key2 }
+    return "unknown"
+}
+
+// File mtime as epoch seconds string.
+fn file_mtime_epoch(path) {
+    return exec("stat -f %m \"" + path + "\" 2>/dev/null || stat -c %Y \""
+                + path + "\" 2>/dev/null").trim()
+}
+
+// Numeric compare two integer strings: returns true if a < b.
+fn lt_str(a, b) {
+    if len(a) == 0 || len(b) == 0 { return false }
+    let r = exec("[ \"" + a + "\" -lt \"" + b + "\" ] && echo y || echo n").trim()
+    return r == "y"
+}
+
+// ── Scan and group ──
+// Returns parallel lists (paths, week_keys) for files older than current week.
+
+fn list_evo_logs() {
+    let cmd = "find \"" + log_dir()
+            + "\" -maxdepth 1 -type f -name 'evo_*.log' 2>/dev/null | sort"
+    return split_lines(exec(cmd))
+}
+
+// Unique values in a list of strings.
+fn unique_strings(xs) {
+    let n = len(xs)
+    let mut seen = []
+    let mut out  = []
+    let mut i = 0
+    while i < n {
+        let v = xs[i]
+        let mut found = false
+        let mut j = 0
+        while j < len(seen) {
+            if seen[j] == v { found = true ; j = len(seen) }
+            j = j + 1
+        }
+        if !found {
+            seen = seen.push(v)
+            out  = out.push(v)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Archive build for one ISO week ──
+
+fn build_archive(week_key, members, dry_run, keep_original, execute_mode) {
+    let out_path  = archive_dir() + "/evo_" + week_key + ".tar.gz"
+    let n_members = len(members)
+
+    log_info("plan: week=" + week_key + " members=" + str(n_members)
+             + " -> " + basename_of(out_path))
+    let mut mi = 0
+    while mi < n_members {
+        log_info("  + " + basename_of(members[mi]))
+        mi = mi + 1
+    }
+
+    if file_exists(out_path) {
+        log_info("  status=skip-exists (" + out_path + ")")
+        return "skip-exists"
+    }
+
+    if dry_run {
+        log_info("  status=dry-run")
+        return "dry-run"
+    }
+
+    let _ = exec("mkdir -p \"" + archive_dir() + "\"")
+
+    // Build basename list (all members live in log_dir, so we tar -C log_dir).
+    let mut bnames = ""
+    let mut bi = 0
+    while bi < n_members {
+        bnames = bnames + " \"" + basename_of(members[bi]) + "\""
+        bi = bi + 1
+    }
+
+    let tmp_path = archive_dir() + "/.evo_" + week_key + ".tar.gz.tmp"
+    let _ = exec("rm -f \"" + tmp_path + "\"")
+    let tar_cmd = "tar -C \"" + log_dir() + "\" -czf \"" + tmp_path
+                  + "\" " + bnames
+    let tar_rc  = exec(tar_cmd + " 2>&1 ; echo __RC=$?").trim()
+    let ok_str  = exec("printf %s \"" + tar_rc + "\" | grep -c '__RC=0' || true").trim()
+    if ok_str != "1" {
+        log_err("  tar failed: " + tar_rc)
+        let _ = exec("rm -f \"" + tmp_path + "\"")
+        return "error: tar build failed"
+    }
+
+    let _ = exec("mv -f \"" + tmp_path + "\" \"" + out_path + "\"")
+    let size_str = exec("stat -f %z \"" + out_path
+                       + "\" 2>/dev/null || stat -c %s \"" + out_path
+                       + "\" 2>/dev/null").trim()
+    if size_str == "0" || len(size_str) == 0 {
+        log_err("  gz size zero: " + out_path)
+        return "error: gz size zero"
+    }
+
+    // sha256 verify each member.
+    let mut vi = 0
+    while vi < n_members {
+        let m  = members[vi]
+        let bn = basename_of(m)
+        let src_sha = exec("shasum -a 256 \"" + m
+                           + "\" 2>/dev/null | awk '{print $1}'").trim()
+        let arc_sha = exec("tar -xOzf \"" + out_path + "\" \"" + bn
+                           + "\" 2>/dev/null | shasum -a 256 | awk '{print $1}'").trim()
+        if len(src_sha) == 0 || len(arc_sha) == 0 {
+            log_err("  sha read failed for " + bn)
+            return "error: sha read failed"
+        }
+        if src_sha != arc_sha {
+            log_err("  sha mismatch " + bn + " src=" + src_sha + " arc=" + arc_sha)
+            return "error: sha mismatch"
+        }
+        vi = vi + 1
+    }
+
+    log_info("  status=verified  size=" + size_str + "B")
+
+    if execute_mode && !keep_original {
+        let mut di = 0
+        while di < n_members {
+            let _ = exec("rm -f \"" + members[di] + "\"")
+            log_info("  deleted: " + basename_of(members[di]))
+            di = di + 1
+        }
+    }
+
+    return "verified"
+}
+
+// ── Main ──
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+
+    let mut dry_run       = true
+    let mut execute_mode  = false
+    let mut keep_original = false
+    let mut user_today    = ""
+
+    let mut i = 2
+    while i < argc {
+        let a = argv[i]
+        if a == "--dry-run" {
+            dry_run = true
+            execute_mode = false
+            i = i + 1
+        } else if a == "--execute" {
+            dry_run = false
+            execute_mode = true
+            i = i + 1
+        } else if a == "--keep-original" {
+            keep_original = true
+            i = i + 1
+        } else if a == "--today" && i + 1 < argc {
+            user_today = argv[i + 1]
+            i = i + 2
+        } else {
+            i = i + 1
+        }
+    }
+
+    let today      = resolve_today(user_today)
+    let mon_epoch  = monday_epoch(today)
+    let mode_str   = "dry-run"
+    if execute_mode { mode_str = "execute" }
+
+    let cur_week_key = exec("date -d \"" + today
+                            + "\" +%G-W%V 2>/dev/null || date -j -f %Y-%m-%d \""
+                            + today + "\" +%G-W%V 2>/dev/null").trim()
+
+    println("=== evo_log_rotate (CLM-P3-3) ===")
+    println("today           : " + today)
+    println("current ISO wk  : " + cur_week_key)
+    println("mode            : " + mode_str)
+    println("keep_original   : " + str(keep_original))
+    println("log dir         : " + log_dir())
+    println("archive dir     : " + archive_dir())
+    println("")
+
+    let mut errors        = 0
+    let mut total_scanned = 0
+    let mut skipped_cur   = 0
+
+    let dir_present = file_exists(log_dir())
+    if !dir_present {
+        log_warn("log dir missing — nothing to do")
+        println("")
+        println("=== summary ===")
+        println("files scanned     : 0")
+        println("___EXIT___0")
+        return
+    }
+
+    let paths = list_evo_logs()
+    let np = len(paths)
+    total_scanned = np
+
+    // Bucket paths into week_keys, skipping anything from current week.
+    let mut weeks  = []
+    let mut p2week = []
+    let mut pi = 0
+    while pi < np {
+        let p = paths[pi]
+        if len(p) == 0 { pi = pi + 1 ; continue }
+        let mt = file_mtime_epoch(p)
+        if len(mt) == 0 { pi = pi + 1 ; continue }
+        // Skip if mt >= monday_epoch(today)  (active current-week log).
+        if !lt_str(mt, mon_epoch) {
+            skipped_cur = skipped_cur + 1
+            pi = pi + 1
+            continue
+        }
+        let wk = iso_week_key_for_file(p)
+        weeks  = weeks.push(wk)
+        p2week = p2week.push(p)
+        pi = pi + 1
+    }
+
+    let unique_weeks = unique_strings(weeks)
+    let nw = len(unique_weeks)
+
+    let mut wi = 0
+    while wi < nw {
+        let wk = unique_weeks[wi]
+        let mut members = []
+        let mut k = 0
+        while k < len(p2week) {
+            if weeks[k] == wk { members = members.push(p2week[k]) }
+            k = k + 1
+        }
+        let status = build_archive(wk, members, dry_run, keep_original, execute_mode)
+        if len(status) >= 5 && status.substring(0, 5) == "error" {
+            errors = errors + 1
+        }
+        wi = wi + 1
+    }
+
+    println("")
+    println("=== summary ===")
+    println("files scanned       : " + str(total_scanned))
+    println("skipped current wk  : " + str(skipped_cur))
+    println("weeks grouped       : " + str(nw))
+    println("errors              : " + str(errors))
+
+    if dry_run && nw > 0 {
+        println("")
+        println("Run with --execute to actually archive.")
+    }
+
+    if errors > 0 {
+        println("___EXIT___1")
+    } else {
+        println("___EXIT___0")
+    }
+}

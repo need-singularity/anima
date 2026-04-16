@@ -138,7 +138,7 @@ Swap the serving adapter to r10 then rerun:
 ```bash
 # Mac side — RAW (no Path C) eval
 HIRE_SIM_OUTPUT=/Users/ghost/Dev/anima/training/deploy/hire_sim_alm_r10_raw_20260416.json \
-python3 /Users/ghost/Dev/anima/training/deploy/hire_sim_alm_runner.py
+hexa /Users/ghost/Dev/anima/training/deploy/hire_sim_baseline.hexa
 
 # Gate check: completion_rate >= 0.85 ⇒ v2.1 shipped
 ```
