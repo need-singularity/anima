@@ -93,6 +93,9 @@ extern fn hxvocoder_version() -> int
 @link("hxvocoder")
 extern fn hxvocoder_decode_nv(out_p: int, latent_flat_p: int, W_ctrl_p: int, n_frames: int)
 
+@link("hxvocoder")
+extern fn hxvocoder_write_wav(path_p: int, samples_p: int, n_samples: int, sample_rate: int, result_p: int)
+
 // ════════════════════════════════════════════════════════════════════
 // Section 2. Pure-hexa NN primitives (inlined; no `use nn_core`)
 // ════════════════════════════════════════════════════════════════════
@@ -614,10 +617,24 @@ fn write_wav(path: string, samples: [float], sample_rate: int) -> bool {
         println("[neural_vocoder] write_wav: empty samples — skipping write")
         return false
     }
+    // Native fast-path: hxvocoder_write_wav writes WAV directly via fwrite.
+    // Replaces O(n²) HexaVal byte-push + base64 roundtrip (48K = 5.35s → <1ms).
+    let use_native = env("NEUROVOC_NATIVE")
+    if use_native == "1" {
+        let n = len(samples)
+        let buf = alloc_raw(n * 4)
+        let mut i = 0
+        while i < n {
+            write_f32(buf, i * 4, samples[i])
+            i = i + 1
+        }
+        let path_c = cstring(path)
+        hxvocoder_write_wav(path_c, buf, n, sample_rate, 0)
+        free_raw(buf, n * 4)
+        return true
+    }
     let bytes = build_wav_bytes(samples, sample_rate)
     let b64 = bytes_to_b64(bytes)
-    // Write base64 to a temp file, decode to destination via shell.
-    // Rationale: argv length limit (~256K macOS) is safer with file I/O.
     let tmp = path + ".b64"
     write_file(tmp, b64)
     let cmd = "base64 -d -i " + tmp + " > " + path + " && rm -f " + tmp
