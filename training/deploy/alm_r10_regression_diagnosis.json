@@ -1,0 +1,87 @@
+{
+  "_meta": {
+    "name": "ALM 14B r10 LoRA training — regression diagnosis",
+    "ts_utc": "2026-04-16T11:00:00Z",
+    "session": "post-r10-eval",
+    "type": "ossified-troubleshooting"
+  },
+  "training": {
+    "base": "ckpt_r9 (final LoRA)",
+    "trainer": "train_alm_r10.py (on pod l9mri0x8sqpmbb, now retired)",
+    "corpus": "/workspace/hire_sim_r10_corpus.txt (synthetic, generated from hire_sim_synthetic_r10_20260416.jsonl)",
+    "params": {
+      "steps": 1500,
+      "lr": "2e-6",
+      "batch": 4,
+      "seq": 1024,
+      "warmup": 100,
+      "lora_r": 16,
+      "lora_alpha": 32
+    },
+    "result": {
+      "final_loss": 7.82,
+      "best_eval": 7.71,
+      "loss_ema": 7.84,
+      "total_sec": 1209.7,
+      "loss_trace_initial": 17.4,
+      "loss_drop_pct": 55
+    }
+  },
+  "eval": {
+    "harness": "training/deploy/hire_sim_alm_lenient_runner.py (Z path lenient judge)",
+    "endpoint": "https://itfl66q4z768kh-8090.proxy.runpod.net/generate (serving r10)",
+    "result": {
+      "completion_rate": 0.7000,
+      "avg_score": 0.8611,
+      "completed": 21,
+      "total": 30,
+      "by_domain": {
+        "email": {"rate": 0.4, "n": 5, "avg_score": 0.767, "regression_vs_r9": "-0.6"},
+        "code": {"rate": 1.0, "n": 5, "avg_score": 1.0, "regression_vs_r9": "0"},
+        "meeting": {"rate": 0.6, "n": 5, "avg_score": 0.767, "regression_vs_r9": "-0.4"},
+        "doc": {"rate": 0.6, "n": 5, "avg_score": 0.833, "regression_vs_r9": "-0.4"},
+        "schedule": {"rate": 1.0, "n": 5, "avg_score": 1.0, "regression_vs_r9": "0"},
+        "research": {"rate": 0.6, "n": 5, "avg_score": 0.8, "regression_vs_r9": "-0.4"}
+      },
+      "verdict": "REGRESSED vs r9 lenient baseline (0.8667 → 0.7000, Δ=-0.1667)"
+    },
+    "comparison": {
+      "r9_lenient_baseline": 0.8667,
+      "r10_lenient": 0.7000,
+      "delta": -0.1667,
+      "interpretation": "r10 LoRA training ON small synthetic hire_sim corpus caused catastrophic forgetting on conversational/instruction-following capability of base Qwen2.5-14B-Instruct. Code + schedule (deterministic outputs) preserved; email/meeting/doc/research (free-form text) regressed."
+    }
+  },
+  "root_cause": {
+    "hypothesis_primary": "lr=2e-6 × 1500 steps × tiny corpus (100 tasks × ~30 samples) → over-fit to keyword density, lost instruction-following nuance. Final loss 7.82 vs base loss ~2.0 indicates LoRA pushed model far from base distribution. EMA never dipped below 7.8 — model was diverging mildly throughout.",
+    "hypothesis_secondary": "synthetic corpus quality — hire_sim_synthetic_r10 was likely templated/repetitive, causing mode collapse on free-form domains.",
+    "hypothesis_tertiary": "lora_r=16 + alpha=32 on top of already-trained r9 LoRA stacking — effective rank too high, drift compounded."
+  },
+  "actions_taken": [
+    "Reverted live serve (itfl66q4z768kh:8090) to /runpod/ckpt_r9 — best ALM remains r9 lenient",
+    "Saved r10 ckpt at /runpod/ckpt_r10 (preserved for reference, not serving)",
+    "Saved r10 results to training/deploy/hire_sim_alm_r10_lenient_20260416.json",
+    "Created r11 design task — see r11_design section below"
+  ],
+  "r11_design": {
+    "lr": "5e-7 (4× lower than r10)",
+    "steps": "500 (3× shorter)",
+    "warmup": 50,
+    "lora_r": 8,
+    "lora_alpha": 16,
+    "batch": 4,
+    "seq": 1024,
+    "corpus_mix": {
+      "korean_general_conversation": 0.8,
+      "hire_sim_tasks": 0.2
+    },
+    "rationale": "Lower lr + fewer steps + smaller LoRA rank + corpus mixing → preserve base capability while nudging toward hire_sim domain. Target: maintain r9 lenient ≥0.85 AND not regress free-form domains.",
+    "blocked_by": "Need pod (current 2 H100s used: serve + CLM r4). Wait for CLM r4 pod or reuse after."
+  },
+  "lessons_for_future_runs": [
+    "Synthetic-only LoRA corpus + non-trivial step count = high regression risk on free-form generation",
+    "Track per-domain rate during training (not just loss) — loss is misleading when capability shifts across domains",
+    "Stack-on-top-of-existing-LoRA training requires lower lr than from-scratch (2e-6 was already 'low' for vanilla but high for stacking)",
+    "Final loss ema > base inference loss (~2.0) is a red flag — model is moving away from base distribution"
+  ]
+}
