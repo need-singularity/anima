@@ -1,0 +1,145 @@
+// tokenize_corpus.hexa — byte-level corpus tokenizer (hexa-native port)
+//
+// Replaces tokenize_corpus.py (sentencepiece BPE, deprecated under .py ban
+// 2026-04-16). CLM uses byte-level vocab (256), so tokenization is just a
+// byte pass-through — every UTF-8 byte becomes its own token id (0..255).
+// This matches the train_clm.hexa byte-level path (vocab=256) and removes
+// the sentencepiece dependency entirely.
+//
+// Reads:  training/tokenizer/corpus_ko_seed.txt (UTF-8 text, one sentence/line)
+// Writes: training/data/corpus_ko_byte.tok       (one int per line, hexa Format A — primary)
+//         training/data/corpus_ko_byte.manifest.json  (header metadata: vocab/ntok/nlines/offsets)
+//
+// Format A (.tok) is what train_clm.hexa actually reads (corpus_loader.hexa
+// expects one token id per line). The manifest JSON replaces the packed
+// .bin header from the .py version, since hexa doesn't have a write_byte
+// builtin for true binary output and the loader never consumed the packed
+// .bin form anyway.
+//
+// Determinism: identical input bytes -> identical output bytes. No RNG.
+//
+// Single-file design: avoids the 5-imports silent-exit bug
+// (feedback_hexa_silent_exit_5_imports.md). Only built-ins used.
+//
+// Hexa quirks avoided:
+//   - byte/char index mismatch (string_api): we use substring(i, i+1) +
+//     char_code() to read individual bytes — the same canonical pattern
+//     used in scripts/build_instruct_ko.hexa byte_at().
+//   - lists pass-by-value (lists_pbv): all mutation happens inline in main().
+//   - struct return (struct_return_bug): no struct returns.
+//   - no `>>` bit-shift (parser quirk in current build) — use integer
+//     division by powers of 2 if/when needed.
+
+// ── Helpers (no imports — keep single-file) ──────────────────────────
+
+// canonical byte_at: read a single byte (0..255) at byte position i
+// per scripts/build_instruct_ko.hexa pattern
+fn byte_at(s: string, i: int) -> int {
+    let sub = s.substring(i, i + 1)
+    return char_code(sub, 0)
+}
+
+fn main() {
+    let ANIMA = "/Users/ghost/Dev/anima"
+    let SRC   = ANIMA + "/training/tokenizer/corpus_ko_seed.txt"
+    let OUT_DIR = ANIMA + "/training/data"
+    let OUT_TOK = OUT_DIR + "/corpus_ko_byte.tok"
+    let OUT_MAN = OUT_DIR + "/corpus_ko_byte.manifest.json"
+
+    let VOCAB = 256
+
+    println("[1/3] read " + SRC)
+    let raw = read_file(SRC)
+    // existence probe per feedback_hexa_string_api.md
+    let probe = raw.split("\n")
+    if probe.len() == 1 && probe[0] == "" {
+        println("[ERR] missing or empty: " + SRC)
+        return
+    }
+
+    println("[2/3] byte-tokenize lines")
+    // split into lines, drop empties (mirror .py: lines = [ln.rstrip("\n") for ln in f if ln.strip()])
+    let lines = raw.split("\n")
+    let mut kept = []
+    let mut i = 0
+    while i < lines.len() {
+        let ln = lines[i]
+        if ln.trim().len() > 0 {
+            kept = kept.push(ln)
+        }
+        i = i + 1
+    }
+    let nlines = kept.len()
+
+    // emit token id stream (one int per byte) + cumulative offsets
+    // mirror .py: all_ids extended per line, offsets appended after each line
+    let mut all_ids = []
+    let mut offsets = [0]
+    let mut li = 0
+    while li < nlines {
+        let ln = kept[li]
+        let nbytes = ln.len()  // .len() is BYTE count per string_api note
+        let mut bi = 0
+        while bi < nbytes {
+            let b = byte_at(ln, bi)
+            all_ids = all_ids.push(b)
+            bi = bi + 1
+        }
+        offsets = offsets.push(all_ids.len())
+        li = li + 1
+    }
+    let ntok = all_ids.len()
+    println("  lines  = " + nlines.to_string())
+    println("  tokens = " + ntok.to_string())
+    println("  vocab  = " + VOCAB.to_string() + " (byte-level)")
+
+    println("[3/3] write " + OUT_TOK + " + " + OUT_MAN)
+
+    // ── Build .tok (one int per line, ASCII text) — primary artifact ──
+    let mut tok_text = ""
+    let mut k = 0
+    while k < ntok {
+        tok_text = tok_text + all_ids[k].to_string() + "\n"
+        k = k + 1
+    }
+    write_file(OUT_TOK, tok_text)
+
+    // ── Build manifest JSON (replaces packed .bin header) ──────────
+    let mut off_json = "["
+    let mut oi = 0
+    while oi < (nlines + 1) {
+        if oi > 0 { off_json = off_json + "," }
+        off_json = off_json + offsets[oi].to_string()
+        oi = oi + 1
+    }
+    off_json = off_json + "]"
+
+    let manifest = "{\n" +
+        "  \"format\": \"byte-level\",\n" +
+        "  \"magic\": \"BYTE\",\n" +
+        "  \"vocab\": " + VOCAB.to_string() + ",\n" +
+        "  \"ntok\": " + ntok.to_string() + ",\n" +
+        "  \"nlines\": " + nlines.to_string() + ",\n" +
+        "  \"src\": \"" + SRC + "\",\n" +
+        "  \"tok_path\": \"" + OUT_TOK + "\",\n" +
+        "  \"line_offsets\": " + off_json + "\n" +
+        "}\n"
+    write_file(OUT_MAN, manifest)
+
+    println("  wrote " + OUT_TOK + " (" + tok_text.len().to_string() + " bytes)")
+    println("  wrote " + OUT_MAN + " (" + manifest.len().to_string() + " bytes)")
+
+    // ── Sanity: re-read first 3 line-segments via offsets ──────────
+    println("")
+    println("  sanity (first 3 line lengths from offsets):")
+    let mut s = 0
+    let limit = if nlines < 3 { nlines } else { 3 }
+    while s < limit {
+        let seg_len = offsets[s + 1] - offsets[s]
+        println("    line " + s.to_string() + ": " + seg_len.to_string() + " tokens")
+        s = s + 1
+    }
+    println("[done]")
+}
+
+// NOTE: hexa stage1 runs main() automatically — explicit call would double-print.

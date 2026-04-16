@@ -1,0 +1,937 @@
+// hire_sim_lenient.hexa — Z path lenient-judge runner (pure hexa, single-file)
+//
+// Source-of-truth port of training/deploy/hire_sim_alm_lenient_runner.py
+// (deprecated under feedback_py_ban_total). Mirrors deterministic_lenient
+// judge mode bit-for-bit:
+//   - synonyms (41 pairs from baseline failure analysis 2026-04-16)
+//   - simple Porter-lite stemmer (single pass, suffix table)
+//   - hyphen / underscore / multi-space normalization
+//   - bullet-structure heuristic for code rule
+//   - number-word fallback for schedule rule
+//   - per-domain min-char floor
+//
+// EVERYTHING IS INLINED on purpose. Importing hire_sim_judge / stratify /
+// hire_sim_100 via `use` triggers feedback_hexa_silent_exit_5_imports
+// (stage0 emits empty main() when the use-chain spans 3+ real modules),
+// which broke the previous wrapper attempt. The corpus is read at runtime
+// from disk, so we do NOT inline 100 Task literals — the parser reads
+// /Users/ghost/Dev/anima/anima-agent/hire_sim_100.hexa byte-by-byte.
+//
+// Env (all optional):
+//   HIRE_SIM_ENDPOINT   default https://itfl66q4z768kh-8090.proxy.runpod.net/generate
+//   HIRE_SIM_OUTPUT     default /Users/ghost/Dev/anima/training/deploy/hire_sim_lenient_<ts>.json
+//   HIRE_SIM_MAX_TASKS  default 30
+//   HIRE_SIM_TIMEOUT    default 90
+//   HIRE_SIM_MOCK       if "1", uses canned mock responses (no network)
+//   HIRE_SIM_CORPUS     default /Users/ghost/Dev/anima/anima-agent/hire_sim_100.hexa
+//
+// Hexa quirks worked around (per project memory):
+//   - feedback_hexa_struct_list_alias: only ONE struct (Task) carries an
+//     array field; SynPair table is stored as 4 parallel arrays instead.
+//   - feedback_hexa_struct_return_bug: judge result is returned via
+//     parallel-array tuple (no ≥3-float struct).
+//   - feedback_hexa_lists_pbv: helpers return new lists; never mutate.
+//   - feedback_hexa_string_api: substring is byte-based — corpus is ASCII
+//     so this is safe for the parser.
+//   - Multi-line `return a + b + ...` truncated to first operand: every
+//     return is single-line.
+
+// ── Builtins available on this build (verified via training/alm_a1_preflight.hexa):
+//     env_var, file_exists, read_file, write_file, exec
+//     to_string, to_int, to_float, char_code, len
+//     string methods: to_lower, contains, substring, index_of, trim, replace,
+//                     parse_int, parse_float
+
+// ════════════════════════════════════════════════════════════════════
+// 1. Task struct + corpus parser (byte-walk over hire_sim_100.hexa)
+// ════════════════════════════════════════════════════════════════════
+
+struct Task {
+    id: string,
+    domain: string,
+    difficulty: string,
+    prompt: string,
+    keywords: array
+}
+
+// Find next occurrence of `needle` in `s` starting from `from_idx`.
+// Returns -1 if not found.
+fn find_from(s: string, needle: string, from_idx: int) -> int {
+    let n = len(s)
+    if from_idx >= n { return 0 - 1 }
+    let tail = s.substring(from_idx, n)
+    let rel = tail.index_of(needle)
+    if rel < 0 { return 0 - 1 }
+    return from_idx + rel
+}
+
+// Extract the value between the next pair of double quotes after `from_idx`.
+// Returns ["", -1] if no pair found.
+// Tuple-as-array because we need both value + new cursor (no multi-return).
+fn next_quoted(s: string, from_idx: int) -> array {
+    let q1 = find_from(s, "\"", from_idx)
+    if q1 < 0 { return ["", 0 - 1] }
+    let q2 = find_from(s, "\"", q1 + 1)
+    if q2 < 0 { return ["", 0 - 1] }
+    let val = s.substring(q1 + 1, q2)
+    return [val, q2 + 1]
+}
+
+// Parse a `success_keywords: [ "a", "b", "c" ]` block beginning at or
+// after `from_idx`. Returns [keywords_array, cursor_after_close].
+fn parse_keywords(s: string, from_idx: int) -> array {
+    let key = "success_keywords:"
+    let kpos = find_from(s, key, from_idx)
+    if kpos < 0 { return [[], 0 - 1] }
+    let lb = find_from(s, "[", kpos)
+    if lb < 0 { return [[], 0 - 1] }
+    let rb = find_from(s, "]", lb)
+    if rb < 0 { return [[], 0 - 1] }
+    let inside = s.substring(lb + 1, rb)
+    let mut out = []
+    let mut cur = 0
+    let inside_n = len(inside)
+    while cur < inside_n {
+        let nq = next_quoted(inside, cur)
+        let val = nq[0]
+        let nxt = nq[1]
+        if nxt < 0 { break }
+        out = out.push(val)
+        cur = nxt
+    }
+    return [out, rb + 1]
+}
+
+// Parse 100 Task literals out of the corpus file. Walks byte-by-byte for
+// `Task { id: "..." , domain: "..." , difficulty: "..." , prompt: "..." ,
+// success_keywords: [...] }` patterns. Tolerates whitespace/newlines.
+fn load_corpus(path: string) -> array {
+    if !file_exists(path) {
+        println("[err] corpus missing: " + path)
+        return []
+    }
+    let src = read_file(path)
+    let n = len(src)
+    let marker = "Task {"
+    let mut out = []
+    let mut cur = 0
+    while cur < n {
+        let mpos = find_from(src, marker, cur)
+        if mpos < 0 { break }
+        // Skip if preceded by `//` on the same line (block comment line)
+        // Cheap heuristic: walk back to last newline, look for "//".
+        let mut line_start = mpos
+        while line_start > 0 {
+            let prev = src.substring(line_start - 1, line_start)
+            if prev == "\n" { break }
+            line_start = line_start - 1
+        }
+        let line_prefix = src.substring(line_start, mpos)
+        if line_prefix.contains("//") {
+            cur = mpos + len(marker)
+            continue
+        }
+        // id
+        let id_key = "id:"
+        let id_pos = find_from(src, id_key, mpos)
+        if id_pos < 0 { break }
+        let id_q = next_quoted(src, id_pos + len(id_key))
+        let id_val = id_q[0]
+        let after_id = id_q[1]
+        if after_id < 0 { break }
+        // domain
+        let dom_key = "domain:"
+        let dom_pos = find_from(src, dom_key, after_id)
+        if dom_pos < 0 { break }
+        let dom_q = next_quoted(src, dom_pos + len(dom_key))
+        let dom_val = dom_q[0]
+        let after_dom = dom_q[1]
+        if after_dom < 0 { break }
+        // difficulty
+        let dif_key = "difficulty:"
+        let dif_pos = find_from(src, dif_key, after_dom)
+        if dif_pos < 0 { break }
+        let dif_q = next_quoted(src, dif_pos + len(dif_key))
+        let dif_val = dif_q[0]
+        let after_dif = dif_q[1]
+        if after_dif < 0 { break }
+        // prompt
+        let pr_key = "prompt:"
+        let pr_pos = find_from(src, pr_key, after_dif)
+        if pr_pos < 0 { break }
+        let pr_q = next_quoted(src, pr_pos + len(pr_key))
+        let pr_val = pr_q[0]
+        let after_pr = pr_q[1]
+        if after_pr < 0 { break }
+        // keywords
+        let kw_pair = parse_keywords(src, after_pr)
+        let kws = kw_pair[0]
+        let after_kw = kw_pair[1]
+        if after_kw < 0 { break }
+        out = out.push(Task {
+            id: id_val,
+            domain: dom_val,
+            difficulty: dif_val,
+            prompt: pr_val,
+            keywords: kws
+        })
+        cur = after_kw
+    }
+    return out
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 2. Stratified sampling (5 per domain × 6 domains for n=30)
+// ════════════════════════════════════════════════════════════════════
+
+fn list_domains(tasks: array) -> array {
+    let mut names = []
+    let n = len(tasks)
+    let mut i = 0
+    while i < n {
+        let d = tasks[i].domain
+        let mut exists = false
+        let mut j = 0
+        while j < len(names) {
+            if names[j] == d { exists = true }
+            j = j + 1
+        }
+        if !exists { names = names.push(d) }
+        i = i + 1
+    }
+    return names
+}
+
+fn stratify(tasks: array, n: int) -> array {
+    let domains = list_domains(tasks)
+    let nd = len(domains)
+    if nd == 0 || n <= 0 { return [] }
+    let per = n / nd
+    let rem = n - per * nd
+    let mut out = []
+    let mut di = 0
+    while di < nd {
+        let dname = domains[di]
+        let quota = if di < rem { per + 1 } else { per }
+        let mut taken = 0
+        let mut ti = 0
+        while ti < len(tasks) && taken < quota {
+            if tasks[ti].domain == dname {
+                out = out.push(tasks[ti])
+                taken = taken + 1
+            }
+            ti = ti + 1
+        }
+        di = di + 1
+    }
+    return out
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 3. Lenient judge — synonyms (parallel arrays) + stemmer + heuristics
+// ════════════════════════════════════════════════════════════════════
+
+// Synonym table as TWO parallel arrays (keyword[i] -> synonyms[i]) to dodge
+// the struct-with-array alias bug. 41 keyword groups (curated from
+// hire_sim_alm_actual_20260416.json failure analysis).
+fn syn_keywords() -> array {
+    let mut k = []
+    // email (10)
+    k = k.push("reply")
+    k = k.push("respond")
+    k = k.push("triage")
+    k = k.push("escalate")
+    k = k.push("negotiate")
+    k = k.push("renewal")
+    k = k.push("discount")
+    k = k.push("outreach")
+    k = k.push("apology")
+    k = k.push("candidate")
+    // code (8)
+    k = k.push("review")
+    k = k.push("validation")
+    k = k.push("investigate")
+    k = k.push("latency")
+    k = k.push("report")
+    k = k.push("refactor")
+    k = k.push("migration")
+    k = k.push("audit")
+    // meeting (7)
+    k = k.push("summarize")
+    k = k.push("standup")
+    k = k.push("bullet")
+    k = k.push("action")
+    k = k.push("postmortem")
+    k = k.push("root cause")
+    k = k.push("talking points")
+    // doc (4)
+    k = k.push("setup")
+    k = k.push("ci")
+    k = k.push("release notes")
+    k = k.push("runbook")
+    // schedule (7)
+    k = k.push("coordinate")
+    k = k.push("organize")
+    k = k.push("schedule")
+    k = k.push("block")
+    k = k.push("oncall")
+    k = k.push("timezone")
+    k = k.push("calendar")
+    // research (5)
+    k = k.push("compare")
+    k = k.push("vector db")
+    k = k.push("benchmark")
+    k = k.push("competitor")
+    k = k.push("license")
+    return k
+}
+
+fn syn_values() -> array {
+    let mut s = []
+    // email
+    s = s.push(["reply", "replies", "respond", "response", "responding", "answer", "answering", "acknowledge", "acknowledg"])
+    s = s.push(["respond", "response", "responding", "reply", "replies", "replying", "answer", "acknowledge"])
+    s = s.push(["triage", "triaging", "prioritize", "prioritiz", "sort", "sorting", "flag", "flagging"])
+    s = s.push(["escalate", "escalating", "escalation", "escalated", "raise", "raising", "forward"])
+    s = s.push(["negotiate", "negotiating", "negotiation", "negotiations", "negotiated", "bargain", "deal"])
+    s = s.push(["renewal", "renewals", "renew", "renewing", "extend", "extending", "extension", "contract renewal"])
+    s = s.push(["discount", "discounts", "discounted", "15%", "10%", "20%", "percent off", "price reduction", "reduction"])
+    s = s.push(["outreach", "outreached", "reach out", "reaching out", "contact", "contacting"])
+    s = s.push(["apology", "apologies", "apologize", "apologizing", "sorry", "regret"])
+    s = s.push(["candidate", "candidates", "applicant", "applicants", "interviewee"])
+    // code
+    s = s.push(["review", "reviews", "reviewing", "reviewed", "inspect", "inspecting", "examine"])
+    s = s.push(["validation", "validate", "validating", "validated", "valid", "check", "verification"])
+    s = s.push(["investigate", "investigating", "investigated", "investigation", "examine", "examining", "analyze", "analyzing", "analysis", "look into"])
+    s = s.push(["latency", "latencies", "response time", "delay", "slowness"])
+    s = s.push(["report", "reports", "reporting", "reported", "document", "documenting", "file", "filing", "incident report", "write-up", "writeup"])
+    s = s.push(["refactor", "refactoring", "refactored", "restructure", "restructuring", "rewrite"])
+    s = s.push(["migration", "migrations", "migrate", "migrating", "migrated", "schema change"])
+    s = s.push(["audit", "audits", "auditing", "audited", "review", "trail", "logging"])
+    // meeting
+    s = s.push(["summarize", "summarizing", "summarized", "summary", "summaries", "summarise", "recap", "overview", "digest"])
+    s = s.push(["standup", "stand-up", "stand up", "daily sync", "daily standup", "standups"])
+    s = s.push(["bullet", "bullets", "bullet point", "bullet points", "bulletpoint", "bulleted", "- ", "* ", "• ", "1.", "2.", "3."])
+    s = s.push(["action", "actions", "action item", "action items", "task", "tasks", "todo", "to-do"])
+    s = s.push(["postmortem", "post-mortem", "post mortem", "postmortems", "retrospective", "retro", "post incident"])
+    s = s.push(["root cause", "root causes", "rootcause", "root-cause", "underlying cause", "cause analysis"])
+    s = s.push(["talking points", "talking point", "talk points", "discussion points", "key points", "speaker notes"])
+    // doc
+    s = s.push(["setup", "set-up", "set up", "setting up", "installation", "install", "installing", "configure", "configuration"])
+    s = s.push(["ci", "ci/cd", "continuous integration", "build pipeline", "ci pipeline", "jenkins", "github actions"])
+    s = s.push(["release notes", "changelog", "release note", "release log", "version notes"])
+    s = s.push(["runbook", "run-book", "playbook", "operational guide", "sop"])
+    // schedule
+    s = s.push(["coordinate", "coordinating", "coordinated", "coordination", "organize", "organizing", "arrange", "arranging", "align"])
+    s = s.push(["organize", "organizing", "organized", "organization", "coordinate", "arrange", "plan", "planning"])
+    s = s.push(["schedule", "scheduling", "scheduled", "schedules", "book", "booking", "arrange", "set up"])
+    s = s.push(["block", "blocks", "blocked", "blocking", "reserve", "reserving", "reserved", "set aside", "hold"])
+    s = s.push(["oncall", "on-call", "on call", "oncall rotation", "on-call rotation", "on call rotation", "paging"])
+    s = s.push(["timezone", "time zone", "time-zone", "timezones", "tz", "pdt", "est", "kst", "cest", "utc"])
+    s = s.push(["calendar", "calendars", "cal", "schedule", "agenda"])
+    // research
+    s = s.push(["compare", "comparing", "compared", "comparison", "comparisons", "vs", "versus", "contrast"])
+    s = s.push(["vector db", "vector database", "vector databases", "vectordb", "vector-db", "vector store", "embedding db"])
+    s = s.push(["benchmark", "benchmarks", "benchmarking", "benchmarked", "performance test", "measure"])
+    s = s.push(["competitor", "competitors", "competition", "rival", "rivals", "alternative"])
+    s = s.push(["license", "licenses", "licensing", "licensed", "licence"])
+    return s
+}
+
+// Lookup synonyms for kw_norm (already normalized) in the parallel table.
+// Returns empty array if no match.
+fn lookup_synonyms(kw_norm: string) -> array {
+    let keys = syn_keywords()
+    let vals = syn_values()
+    let n = len(keys)
+    let mut i = 0
+    while i < n {
+        if keys[i] == kw_norm { return vals[i] }
+        i = i + 1
+    }
+    return []
+}
+
+// Normalize: lowercase + replace -, _, \n, \t with single space + collapse spaces.
+fn normalize_text(s: string) -> string {
+    let mut lo = s.to_lower()
+    lo = lo.replace("-", " ")
+    lo = lo.replace("_", " ")
+    lo = lo.replace("\n", " ")
+    lo = lo.replace("\t", " ")
+    while lo.contains("  ") { lo = lo.replace("  ", " ") }
+    return lo
+}
+
+// Single-pass Porter-lite stemmer, suffix table.
+fn simple_stem(word: string) -> string {
+    let n = len(word)
+    if n < 4 { return word }
+    let suffixes = ["ations", "ation", "tions", "tion", "ings", "ing",
+                    "ies", "ied", "ed", "es", "er", "or", "ly", "s"]
+    let mut i = 0
+    while i < len(suffixes) {
+        let suf = suffixes[i]
+        let slen = len(suf)
+        if n - slen >= 3 {
+            let tail = word.substring(n - slen, n)
+            if tail == suf {
+                if suf == "ies" { return word.substring(0, n - 3) + "y" }
+                return word.substring(0, n - slen)
+            }
+        }
+        i = i + 1
+    }
+    return word
+}
+
+fn matches_lenient(kw: string, text_norm: string) -> bool {
+    let kw_norm = normalize_text(kw)
+    if text_norm.contains(kw_norm) { return true }
+    let syns = lookup_synonyms(kw_norm)
+    let mut i = 0
+    while i < len(syns) {
+        let sn_norm = normalize_text(syns[i])
+        if text_norm.contains(sn_norm) { return true }
+        if !sn_norm.contains(" ") {
+            let sn_stem = simple_stem(sn_norm)
+            if len(sn_stem) >= 4 && text_norm.contains(sn_stem) { return true }
+        }
+        i = i + 1
+    }
+    if !kw_norm.contains(" ") {
+        let kw_stem = simple_stem(kw_norm)
+        if len(kw_stem) >= 4 && text_norm.contains(kw_stem) { return true }
+    }
+    return false
+}
+
+// Char-bag count.
+fn count_char_any(s: string, chars: string) -> int {
+    let n = len(s)
+    let mut cnt = 0
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if chars.contains(ch) { cnt = cnt + 1 }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn contains_digit(s: string) -> bool {
+    let digits = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+    let mut i = 0
+    while i < len(digits) {
+        if s.contains(digits[i]) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn looks_like_code(resp: string) -> bool {
+    if resp.contains("```") { return true }
+    let lo = resp.to_lower()
+    let keys = ["def ", "fn ", "function ", "class ", "import ", "return ",
+                "public ", "private ", "var ", "let ", "const ", "void "]
+    let mut i = 0
+    while i < len(keys) {
+        if lo.contains(keys[i]) { return true }
+        i = i + 1
+    }
+    let ops = count_char_any(resp, "(){}=")
+    if ops >= 3 { return true }
+    return false
+}
+
+fn has_bullet_structure(resp: string) -> bool {
+    let n = len(resp)
+    if n < 4 { return false }
+    let mut count = 0
+    let first2 = resp.substring(0, 2)
+    if first2 == "- " || first2 == "* " || first2 == "1." || first2 == "• " {
+        count = count + 1
+    }
+    let mut i = 0
+    while i < n - 3 {
+        let ch = resp.substring(i, i + 1)
+        if ch == "\n" {
+            let nxt2 = resp.substring(i + 1, i + 3)
+            if nxt2 == "- " || nxt2 == "* " || nxt2 == "• " { count = count + 1 }
+            let nxt3 = resp.substring(i + 1, i + 4)
+            if len(nxt3) >= 2 {
+                let d = nxt3.substring(0, 1)
+                let dot = nxt3.substring(1, 2)
+                if dot == "." {
+                    if d == "1" || d == "2" || d == "3" || d == "4" || d == "5"
+                        || d == "6" || d == "7" || d == "8" || d == "9" {
+                        count = count + 1
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return count >= 3
+}
+
+fn looks_like_code_lenient(resp: string) -> bool {
+    if looks_like_code(resp) { return true }
+    if has_bullet_structure(resp) {
+        let ops = count_char_any(resp, "(){}=:")
+        if ops >= 2 { return true }
+    }
+    return false
+}
+
+fn contains_number_lenient(s: string) -> bool {
+    if contains_digit(s) { return true }
+    let words = ["zero", "one", "two", "three", "four", "five", "six",
+                 "seven", "eight", "nine", "ten", "eleven", "twelve",
+                 "fifteen", "twenty", "thirty", "forty", "fifty", "sixty",
+                 "half", "quarter"]
+    let lo = s.to_lower()
+    let mut i = 0
+    while i < len(words) {
+        if lo.contains(words[i]) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn min_chars_for(domain: string) -> int {
+    if domain == "code" { return 40 }
+    if domain == "schedule" { return 30 }
+    if domain == "research" { return 40 }
+    return 30
+}
+
+fn pick_rule(domain: string) -> string {
+    if domain == "code" { return "code_execution" }
+    if domain == "schedule" { return "numeric_tolerance" }
+    return "text_match"
+}
+
+// Judge a (task, actual) pair. Returns parallel-array tuple to avoid
+// multi-float-struct return bug:
+//   [0] task_id     string
+//   [1] domain      string
+//   [2] difficulty  string
+//   [3] rule        string  (e.g. "text_match/lenient")
+//   [4] completion  bool
+//   [5] hits        int
+//   [6] total       int
+//   [7] score       float
+//   [8] length_ok   bool
+//   [9] extra_ok    bool
+//  [10] actual_len  int
+//  [11] detail      string
+fn judge_lenient(task: Task, actual: string) -> array {
+    let text_norm = normalize_text(actual)
+    let total = len(task.keywords)
+    let mut hits = 0
+    let mut i = 0
+    while i < total {
+        if matches_lenient(task.keywords[i], text_norm) { hits = hits + 1 }
+        i = i + 1
+    }
+    let score = if total > 0 { to_float(hits) / to_float(total) } else { 0.0 }
+    let all_hit = hits == total
+    let min_c = min_chars_for(task.domain)
+    let actual_len = len(actual)
+    let length_ok = actual_len >= min_c
+    let rule = pick_rule(task.domain)
+    let mut extra_ok = true
+    let mut extra_reason = ""
+    if rule == "code_execution" {
+        extra_ok = looks_like_code_lenient(actual)
+        if !extra_ok { extra_reason = "no code / structured steps" }
+    } else if rule == "numeric_tolerance" {
+        extra_ok = contains_number_lenient(actual)
+        if !extra_ok { extra_reason = "no numeric or number-word token" }
+    }
+    let completion = all_hit && length_ok && extra_ok
+    let mut detail = ""
+    if all_hit {
+        detail = "keywords=" + to_string(hits) + "/" + to_string(total)
+    } else {
+        detail = "keyword_miss=" + to_string(hits) + "/" + to_string(total)
+    }
+    if length_ok {
+        detail = detail + "; len=" + to_string(actual_len) + ">=" + to_string(min_c)
+    } else {
+        detail = detail + "; too_short=" + to_string(actual_len) + "<" + to_string(min_c)
+    }
+    if extra_ok {
+        detail = detail + "; extra=ok"
+    } else {
+        detail = detail + "; extra_fail(" + extra_reason + ")"
+    }
+    return [task.id, task.domain, task.difficulty, rule + "/lenient",
+            completion, hits, total, score, length_ok, extra_ok,
+            actual_len, detail]
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 4. Endpoint call (curl via exec) + JSON-ish field extraction
+// ════════════════════════════════════════════════════════════════════
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+// Extract value of top-level "text"/"output"/"response"/"generated" string
+// key from JSON-ish raw response. Returns raw if no key found.
+fn extract_text_field(raw: string) -> string {
+    let keys = ["\"text\"", "\"output\"", "\"response\"", "\"generated\""]
+    let mut ki = 0
+    while ki < len(keys) {
+        let key = keys[ki]
+        let idx = raw.index_of(key)
+        if idx >= 0 {
+            let after_key = raw.substring(idx + len(key), len(raw))
+            let colon = after_key.index_of(":")
+            if colon >= 0 {
+                let after_colon = after_key.substring(colon + 1, len(after_key))
+                let trimmed = after_colon.trim()
+                if len(trimmed) > 0 {
+                    let first = trimmed.substring(0, 1)
+                    if first == "\"" {
+                        let rest = trimmed.substring(1, len(trimmed))
+                        let close = rest.index_of("\"")
+                        if close >= 0 { return rest.substring(0, close) }
+                    }
+                }
+            }
+        }
+        ki = ki + 1
+    }
+    return raw
+}
+
+// Mock model: echo keywords + domain-specific padding, so judge passes.
+fn call_mock(task: Task) -> string {
+    let kws = task.keywords
+    let mut joined = ""
+    let mut i = 0
+    while i < len(kws) {
+        if i > 0 { joined = joined + " " }
+        joined = joined + kws[i]
+        i = i + 1
+    }
+    let mut pad = ""
+    if task.domain == "code" {
+        pad = "\n```python\ndef handle():\n    return True\n```"
+    } else if task.domain == "schedule" {
+        pad = " scheduled for 45 minutes at 10am on 3 days"
+    } else if task.domain == "research" {
+        pad = " see 5 references and 3 benchmarks with detailed comparison notes attached"
+    } else {
+        pad = " full context and action items included in the body of this response"
+    }
+    return "mock completion for " + task.id + ": " + joined + pad
+}
+
+// Live call via curl. Returns the extracted text body.
+fn call_endpoint(endpoint: string, timeout_s: int, task: Task) -> string {
+    let body = "{\"task_id\":\"" + task.id + "\",\"prompt\":\""
+             + json_escape(task.prompt) + "\"}"
+    let body_file = "/tmp/_hsl_body_" + task.id + ".json"
+    write_file(body_file, body)
+    let cmd = "timeout " + to_string(timeout_s)
+            + " curl -sS -X POST -H 'Content-Type: application/json'"
+            + " -H 'User-Agent: curl/8.7.1' -H 'Accept: */*'"
+            + " -d @" + body_file + " " + endpoint + " 2>/dev/null"
+    let raw = exec(cmd).trim()
+    let _ = exec("rm -f " + body_file)
+    if len(raw) == 0 { return "" }
+    return extract_text_field(raw)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 5. Float formatter (4 decimals, no native fmt)
+// ════════════════════════════════════════════════════════════════════
+
+fn pad_left_zero(s: string, width: int) -> string {
+    let n = len(s)
+    if n >= width { return s }
+    let mut r = s
+    let mut i = 0
+    while i < width - n {
+        r = "0" + r
+        i = i + 1
+    }
+    return r
+}
+
+fn float_to_fixed4(x: float) -> string {
+    let neg = x < 0.0
+    let v = if neg { 0.0 - x } else { x }
+    let scaled = v * 10000.0
+    let ri = to_int(scaled + 0.5)
+    let whole = ri / 10000
+    let frac = ri - whole * 10000
+    let frac_s = pad_left_zero(to_string(frac), 4)
+    let sign = if neg { "-" } else { "" }
+    return sign + to_string(whole) + "." + frac_s
+}
+
+fn float_to_fixed3(x: float) -> string {
+    let neg = x < 0.0
+    let v = if neg { 0.0 - x } else { x }
+    let scaled = v * 1000.0
+    let ri = to_int(scaled + 0.5)
+    let whole = ri / 1000
+    let frac = ri - whole * 1000
+    let frac_s = pad_left_zero(to_string(frac), 3)
+    let sign = if neg { "-" } else { "" }
+    return sign + to_string(whole) + "." + frac_s
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 6. Aggregation + JSON report emission
+// ════════════════════════════════════════════════════════════════════
+
+fn emit_report(out_path: string, endpoint: string, mode: string,
+               results: array, n_total_corpus: int) -> string {
+    let n = len(results)
+    let mut completed = 0
+    let mut score_sum = 0.0
+    let mut i = 0
+    while i < n {
+        let r = results[i]
+        if r[4] { completed = completed + 1 }
+        score_sum = score_sum + r[7]
+        i = i + 1
+    }
+    let completion_rate = if n > 0 { to_float(completed) / to_float(n) } else { 0.0 }
+    let avg_score = if n > 0 { score_sum / to_float(n) } else { 0.0 }
+
+    // by_domain (parallel arrays — names, counts, dones, score sums)
+    let mut dnames = []
+    let mut dn = []
+    let mut ddone = []
+    let mut dsum = []
+    let mut j = 0
+    while j < n {
+        let r = results[j]
+        let dm = r[1]
+        let mut found = 0 - 1
+        let mut k = 0
+        while k < len(dnames) {
+            if dnames[k] == dm { found = k }
+            k = k + 1
+        }
+        if found < 0 {
+            dnames = dnames.push(dm)
+            dn = dn.push(1)
+            ddone = ddone.push(if r[4] { 1 } else { 0 })
+            dsum = dsum.push(r[7])
+        } else {
+            // rebuild parallel arrays (no in-place write)
+            let mut dn2 = []
+            let mut dd2 = []
+            let mut ds2 = []
+            let mut x = 0
+            while x < len(dnames) {
+                if x == found {
+                    dn2 = dn2.push(dn[x] + 1)
+                    dd2 = dd2.push(ddone[x] + (if r[4] { 1 } else { 0 }))
+                    ds2 = ds2.push(dsum[x] + r[7])
+                } else {
+                    dn2 = dn2.push(dn[x])
+                    dd2 = dd2.push(ddone[x])
+                    ds2 = ds2.push(dsum[x])
+                }
+                x = x + 1
+            }
+            dn = dn2
+            ddone = dd2
+            dsum = ds2
+        }
+        j = j + 1
+    }
+
+    // Verdict gates
+    let alm_pass = completion_rate >= 0.85
+    let clm_pass = completion_rate >= 0.80
+    let z_pass = completion_rate >= 0.75
+    let mut verdict = "BLOCKED_<0.60"
+    if alm_pass {
+        verdict = "PASS_ALM_0.85"
+    } else if clm_pass {
+        verdict = "PASS_CLM_0.80"
+    } else if z_pass {
+        verdict = "PASS_Z_0.75"
+    } else if completion_rate >= 0.60 {
+        verdict = "CLOSE_0.60-0.80"
+    }
+
+    let iso = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+
+    let mut s = "{\n"
+    s = s + "  \"ts_utc\": \"" + iso + "\",\n"
+    s = s + "  \"path\": \"Z_lenient_judge_raw_endpoint\",\n"
+    s = s + "  \"endpoint\": \"" + endpoint + "\",\n"
+    s = s + "  \"mode\": \"" + mode + "\",\n"
+    s = s + "  \"judge_mode\": \"deterministic_lenient\",\n"
+    s = s + "  \"synonym_pairs\": " + to_string(len(syn_keywords())) + ",\n"
+    s = s + "  \"n_tasks\": " + to_string(n) + ",\n"
+    s = s + "  \"n_total_corpus\": " + to_string(n_total_corpus) + ",\n"
+    s = s + "  \"completion_rate\": " + float_to_fixed4(completion_rate) + ",\n"
+    s = s + "  \"avg_score\": " + float_to_fixed4(avg_score) + ",\n"
+    s = s + "  \"completed_count\": " + to_string(completed) + ",\n"
+    s = s + "  \"baseline_comparison\": {\n"
+    s = s + "    \"baseline_deterministic\": {\"completion_rate\": 0.5333, \"avg_score\": 0.8111},\n"
+    s = s + "    \"pathc_augmented\": {\"completion_rate\": 0.8667, \"avg_score\": 0.9444},\n"
+    s = s + "    \"delta_vs_baseline\": " + float_to_fixed4(completion_rate - 0.5333) + ",\n"
+    s = s + "    \"delta_vs_pathc\": " + float_to_fixed4(completion_rate - 0.8667) + "\n"
+    s = s + "  },\n"
+    s = s + "  \"by_domain\": {"
+    let mut di = 0
+    while di < len(dnames) {
+        if di > 0 { s = s + ", " }
+        let dni = dn[di]
+        let ddi = ddone[di]
+        let rate = to_float(ddi) / to_float(dni)
+        let avg = dsum[di] / to_float(dni)
+        s = s + "\"" + dnames[di] + "\": {"
+        s = s + "\"n\": " + to_string(dni) + ", "
+        s = s + "\"completed\": " + to_string(ddi) + ", "
+        s = s + "\"completion_rate\": " + float_to_fixed4(rate) + ", "
+        s = s + "\"avg_score\": " + float_to_fixed4(avg)
+        s = s + "}"
+        di = di + 1
+    }
+    s = s + "},\n"
+    s = s + "  \"gates\": {"
+    s = s + "\"alm_0.85\": " + (if alm_pass { "true" } else { "false" }) + ", "
+    s = s + "\"clm_0.80\": " + (if clm_pass { "true" } else { "false" }) + ", "
+    s = s + "\"z_0.75\": " + (if z_pass { "true" } else { "false" }) + ", "
+    s = s + "\"verdict\": \"" + verdict + "\"},\n"
+    s = s + "  \"per_task\": [\n"
+    let mut pi = 0
+    while pi < n {
+        let r = results[pi]
+        let comma = if pi < n - 1 { "," } else { "" }
+        s = s + "    {"
+        s = s + "\"task_id\": \"" + r[0] + "\","
+        s = s + " \"domain\": \"" + r[1] + "\","
+        s = s + " \"difficulty\": \"" + r[2] + "\","
+        s = s + " \"rule\": \"" + r[3] + "\","
+        s = s + " \"completion\": " + (if r[4] { "true" } else { "false" }) + ","
+        s = s + " \"hits\": " + to_string(r[5]) + ","
+        s = s + " \"total\": " + to_string(r[6]) + ","
+        s = s + " \"score\": " + float_to_fixed4(r[7]) + ","
+        s = s + " \"length_ok\": " + (if r[8] { "true" } else { "false" }) + ","
+        s = s + " \"extra_ok\": " + (if r[9] { "true" } else { "false" }) + ","
+        s = s + " \"actual_len\": " + to_string(r[10]) + ","
+        s = s + " \"detail\": \"" + json_escape(r[11]) + "\"}"
+        s = s + comma + "\n"
+        pi = pi + 1
+    }
+    s = s + "  ]\n"
+    s = s + "}\n"
+
+    write_file(out_path, s)
+    return out_path
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 7. main
+// ════════════════════════════════════════════════════════════════════
+
+fn main() {
+    println("=== hire_sim Z path (deterministic_lenient judge, hexa native) ===")
+
+    // Env config
+    let ep_raw = env_var("HIRE_SIM_ENDPOINT")
+    let endpoint = if len(ep_raw) > 0 { ep_raw } else { "https://itfl66q4z768kh-8090.proxy.runpod.net/generate" }
+    let mock_flag = env_var("HIRE_SIM_MOCK")
+    let mode = if mock_flag == "1" { "mock" } else { "endpoint" }
+    let max_raw = env_var("HIRE_SIM_MAX_TASKS")
+    let max_parsed = if len(max_raw) > 0 { max_raw.parse_int() } else { 30 }
+    let max_tasks = if max_parsed > 0 { max_parsed } else { 30 }
+    let to_raw = env_var("HIRE_SIM_TIMEOUT")
+    let to_parsed = if len(to_raw) > 0 { to_raw.parse_int() } else { 90 }
+    let timeout_s = if to_parsed > 0 { to_parsed } else { 90 }
+    let corpus_raw = env_var("HIRE_SIM_CORPUS")
+    let corpus_path = if len(corpus_raw) > 0 { corpus_raw } else { "/Users/ghost/Dev/anima/anima-agent/hire_sim_100.hexa" }
+    let out_raw = env_var("HIRE_SIM_OUTPUT")
+    let ts = exec("date -u +%Y%m%d_%H%M%S").trim()
+    let out_path = if len(out_raw) > 0 { out_raw } else { "/Users/ghost/Dev/anima/training/deploy/hire_sim_lenient_" + ts + ".json" }
+
+    println("endpoint  : " + endpoint)
+    println("mode      : " + mode)
+    println("max_tasks : " + to_string(max_tasks))
+    println("timeout   : " + to_string(timeout_s) + "s")
+    println("corpus    : " + corpus_path)
+    println("output    : " + out_path)
+    println("synonyms  : " + to_string(len(syn_keywords())) + " keyword groups")
+
+    // Load + stratify
+    let all = load_corpus(corpus_path)
+    let n_all = len(all)
+    println("loaded    : " + to_string(n_all) + " tasks")
+    if n_all == 0 {
+        println("FAIL: no tasks parsed from corpus — aborting")
+        return
+    }
+    let sub = stratify(all, max_tasks)
+    println("stratified: " + to_string(len(sub)) + " tasks")
+    println("")
+
+    // Run
+    let mut results = []
+    let mut i = 0
+    while i < len(sub) {
+        let task = sub[i]
+        let actual = if mode == "mock" { call_mock(task) } else { call_endpoint(endpoint, timeout_s, task) }
+        let r = judge_lenient(task, actual)
+        results = results.push(r)
+        let flag = if r[4] { "OK " } else { "XX " }
+        println("  [" + to_string(i + 1) + "/" + to_string(len(sub)) + "] "
+                + flag + r[0] + " [" + r[1] + "/" + r[2] + "] "
+                + "score=" + float_to_fixed3(r[7])
+                + " hits=" + to_string(r[5]) + "/" + to_string(r[6])
+                + " len=" + to_string(r[10])
+                + "  " + r[11])
+        i = i + 1
+    }
+
+    // Aggregate + emit
+    let report_path = emit_report(out_path, endpoint, mode, results, n_all)
+
+    let n = len(results)
+    let mut completed = 0
+    let mut score_sum = 0.0
+    let mut k = 0
+    while k < n {
+        let r = results[k]
+        if r[4] { completed = completed + 1 }
+        score_sum = score_sum + r[7]
+        k = k + 1
+    }
+    let completion_rate = if n > 0 { to_float(completed) / to_float(n) } else { 0.0 }
+    let avg_score = if n > 0 { score_sum / to_float(n) } else { 0.0 }
+
+    println("")
+    println("=== RESULTS (Z path — lenient judge) ===")
+    println("  completion_rate : " + float_to_fixed4(completion_rate)
+            + " (" + to_string(completed) + "/" + to_string(n) + ")")
+    println("  avg_score       : " + float_to_fixed4(avg_score))
+    println("  delta vs 0.5333 : " + float_to_fixed4(completion_rate - 0.5333))
+    println("  delta vs 0.8667 : " + float_to_fixed4(completion_rate - 0.8667))
+    println("  ALM gate 0.85   : " + (if completion_rate >= 0.85 { "PASS" } else { "FAIL" }))
+    println("  CLM gate 0.80   : " + (if completion_rate >= 0.80 { "PASS" } else { "FAIL" }))
+    println("  Z   gate 0.75   : " + (if completion_rate >= 0.75 { "PASS" } else { "FAIL" }))
+    println("  report          : " + report_path)
+}
+
+main()
