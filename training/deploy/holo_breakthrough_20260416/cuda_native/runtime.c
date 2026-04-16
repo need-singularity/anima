@@ -148,6 +148,12 @@ HexaVal hexa_str_chars(HexaVal s);
 HexaVal hexa_format_n(HexaVal fmt, HexaVal args);
 HexaVal hexa_str_parse_int(HexaVal s);
 HexaVal hexa_str_parse_float(HexaVal s);
+// NET I/O forward decls (socket FFI for HTTP serving)
+HexaVal hexa_net_listen(HexaVal addr_port);
+HexaVal hexa_net_accept(HexaVal listener_fd);
+HexaVal hexa_net_read(HexaVal fd_val);
+HexaVal hexa_net_write(HexaVal fd_val, HexaVal data);
+HexaVal hexa_net_close(HexaVal fd_val);
 HexaVal hexa_str_trim_start(HexaVal s);
 HexaVal hexa_str_trim_end(HexaVal s);
 HexaVal hexa_str_slice(HexaVal s, HexaVal start, HexaVal end);
@@ -3635,6 +3641,200 @@ HexaVal hexa_base64_decode(HexaVal s) {
     return hexa_str_own(out);
 }
 
+// ═══════════════════════════════════════════════════════════════════
+//  NET I/O — minimal BSD socket FFI for hexa HTTP servers
+//
+//  Provides the 6 primitives hexa code needs:
+//    hexa_net_listen(addr_port)  → listener fd (int)
+//    hexa_net_accept(fd)         → client fd (int)
+//    hexa_net_read(fd)           → raw bytes (string)
+//    hexa_net_write(fd, data)    → bytes written (int)
+//    hexa_net_close(fd)          → void
+//    hexa_net_set_reuse(fd)      → void (SO_REUSEADDR, called automatically)
+//
+//  Root cause: stage0 hexa has no net_listen builtin.  Adding these C
+//  functions to runtime.c lets any .hexa file compiled against this
+//  runtime call net_listen / net_accept / net_read / net_write /
+//  net_close directly — no stage0 change needed.
+//
+//  Security note: these are raw BSD sockets, no TLS.  Intended for
+//  pod-internal (localhost / VPC) serving behind a reverse proxy.
+// ═══════════════════════════════════════════════════════════════════
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+
+// Portable case-insensitive strstr (strcasestr is a GNU extension,
+// not guaranteed on all Linux libc builds without _GNU_SOURCE).
+static char* _hexa_strcasestr(const char* haystack, const char* needle) {
+    if (!needle[0]) return (char*)haystack;
+    size_t nlen = strlen(needle);
+    for (; *haystack; haystack++) {
+        if (strncasecmp(haystack, needle, nlen) == 0)
+            return (char*)haystack;
+    }
+    return NULL;
+}
+
+// hexa_net_listen("0.0.0.0:8090") → fd (int), or -1 on error.
+// Parses "host:port" string, binds, listens (backlog 128).
+// Automatically sets SO_REUSEADDR so quick restarts don't hit EADDRINUSE.
+HexaVal hexa_net_listen(HexaVal addr_port) {
+    if (addr_port.tag != TAG_STR || !addr_port.s) return hexa_int(-1);
+
+    // Parse "host:port" — find last ':' to handle IPv4
+    const char* s = addr_port.s;
+    const char* colon = strrchr(s, ':');
+    if (!colon || colon == s) return hexa_int(-1);
+
+    // Extract host and port
+    size_t host_len = (size_t)(colon - s);
+    char host[256];
+    if (host_len >= sizeof(host)) return hexa_int(-1);
+    memcpy(host, s, host_len);
+    host[host_len] = '\0';
+    int port = atoi(colon + 1);
+    if (port <= 0 || port > 65535) return hexa_int(-1);
+
+    // Create socket
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return hexa_int(-1);
+
+    // SO_REUSEADDR — avoid EADDRINUSE on quick restart
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    // Bind
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    if (strcmp(host, "0.0.0.0") == 0) {
+        sa.sin_addr.s_addr = INADDR_ANY;
+    } else {
+        if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
+            close(fd);
+            return hexa_int(-1);
+        }
+    }
+
+    if (bind(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+        close(fd);
+        return hexa_int(-1);
+    }
+
+    // Listen (backlog 128 — sufficient for single-threaded accept loop)
+    if (listen(fd, 128) < 0) {
+        close(fd);
+        return hexa_int(-1);
+    }
+
+    return hexa_int(fd);
+}
+
+// hexa_net_accept(listener_fd) → client fd (int), or -1 on error.
+// Blocking call — waits until a client connects.
+HexaVal hexa_net_accept(HexaVal listener_fd) {
+    if (listener_fd.tag != TAG_INT) return hexa_int(-1);
+    int lfd = (int)listener_fd.i;
+
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+    int cfd = accept(lfd, (struct sockaddr*)&client_addr, &client_len);
+    if (cfd < 0) return hexa_int(-1);
+
+    return hexa_int(cfd);
+}
+
+// hexa_net_read(fd) → string (full request).
+// Reads up to 64KB from the socket. For HTTP/1.1 this covers typical
+// requests. Returns "" on error/closed.
+// NOTE: Does NOT handle chunked transfer or Content-Length continuation —
+// adequate for single-request-per-connection serving pattern.
+#define HEXA_NET_READ_BUF 65536
+
+HexaVal hexa_net_read(HexaVal fd_val) {
+    if (fd_val.tag != TAG_INT) return hexa_str("");
+    int fd = (int)fd_val.i;
+
+    char* buf = (char*)malloc(HEXA_NET_READ_BUF + 1);
+    if (!buf) return hexa_str("");
+
+    ssize_t total = 0;
+    // Read until we get the full HTTP headers (double CRLF).
+    // Then read Content-Length body if present.
+    while (total < HEXA_NET_READ_BUF) {
+        ssize_t n = read(fd, buf + total, HEXA_NET_READ_BUF - total);
+        if (n <= 0) break;
+        total += n;
+        buf[total] = '\0';
+
+        // Check if we have complete headers (CRLFCRLF)
+        char* hdr_end = strstr(buf, "\r\n\r\n");
+        if (hdr_end) {
+            size_t hdr_len = (size_t)(hdr_end - buf) + 4;
+
+            // Look for Content-Length header to know if there's a body
+            // Case-insensitive search within the header portion
+            long content_len = 0;
+            char* cl = _hexa_strcasestr(buf, "content-length:");
+            if (cl && cl < hdr_end) {
+                content_len = strtol(cl + 15, NULL, 10);
+            }
+
+            // Calculate how much body we still need
+            long body_have = total - (long)hdr_len;
+            long body_need = content_len - body_have;
+
+            // Read remaining body bytes if needed
+            while (body_need > 0 && total < HEXA_NET_READ_BUF) {
+                ssize_t n2 = read(fd, buf + total,
+                    (size_t)body_need < (HEXA_NET_READ_BUF - total)
+                        ? (size_t)body_need : (HEXA_NET_READ_BUF - total));
+                if (n2 <= 0) break;
+                total += n2;
+                body_need -= n2;
+            }
+            break;
+        }
+    }
+
+    buf[total] = '\0';
+    return hexa_str_own(buf);
+}
+
+// hexa_net_write(fd, data_string) → bytes written (int).
+// Writes the full string to the socket. Returns -1 on error.
+HexaVal hexa_net_write(HexaVal fd_val, HexaVal data) {
+    if (fd_val.tag != TAG_INT) return hexa_int(-1);
+    if (data.tag != TAG_STR || !data.s) return hexa_int(0);
+    int fd = (int)fd_val.i;
+    size_t len = strlen(data.s);
+    size_t sent = 0;
+
+    // Loop to handle partial writes (EINTR, short writes)
+    while (sent < len) {
+        ssize_t n = write(fd, data.s + sent, len - sent);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return hexa_int(-1);
+        }
+        sent += (size_t)n;
+    }
+
+    return hexa_int((int64_t)sent);
+}
+
+// hexa_net_close(fd) → void.
+// Closes a socket fd. Safe to call on already-closed fds.
+HexaVal hexa_net_close(HexaVal fd_val) {
+    if (fd_val.tag != TAG_INT) return hexa_void();
+    close((int)fd_val.i);
+    return hexa_void();
+}
+
 // ── bt 73: bare-ident HexaVal globals for transpiled builtin dispatch ──
 // Self-host codegen (self/native/hexa_cc.c gen2_expr Call fallback, ~line 5642+)
 // emits `hexa_call0(timestamp)`, `hexa_call1(base64_encode, s)`, … where the
@@ -3656,6 +3856,21 @@ static HexaVal _bt73_base64_decode_w(HexaVal s) { return hexa_base64_decode(s); 
 HexaVal timestamp     = {.tag=TAG_FN, .fn={.fn_ptr=(void*)_bt73_timestamp_w,     .arity=0}};
 HexaVal base64_encode = {.tag=TAG_FN, .fn={.fn_ptr=(void*)_bt73_base64_encode_w, .arity=1}};
 HexaVal base64_decode = {.tag=TAG_FN, .fn={.fn_ptr=(void*)_bt73_base64_decode_w, .arity=1}};
+
+// bt 73 net_* bare-ident wrappers — hexa codegen emits net_listen(addr)
+// which resolves to hexa_call1(net_listen, addr); these HexaVal globals
+// let the linker find them.
+static HexaVal _bt73_net_listen_w(HexaVal a) { return hexa_net_listen(a); }
+static HexaVal _bt73_net_accept_w(HexaVal a) { return hexa_net_accept(a); }
+static HexaVal _bt73_net_read_w(HexaVal a)   { return hexa_net_read(a); }
+static HexaVal _bt73_net_write_w(HexaVal a, HexaVal b) { return hexa_net_write(a, b); }
+static HexaVal _bt73_net_close_w(HexaVal a)  { return hexa_net_close(a); }
+
+HexaVal net_listen = {.tag=TAG_FN, .fn={.fn_ptr=(void*)_bt73_net_listen_w, .arity=1}};
+HexaVal net_accept = {.tag=TAG_FN, .fn={.fn_ptr=(void*)_bt73_net_accept_w, .arity=1}};
+HexaVal net_read   = {.tag=TAG_FN, .fn={.fn_ptr=(void*)_bt73_net_read_w,   .arity=1}};
+HexaVal net_write  = {.tag=TAG_FN, .fn={.fn_ptr=(void*)_bt73_net_write_w,  .arity=2}};
+HexaVal net_close  = {.tag=TAG_FN, .fn={.fn_ptr=(void*)_bt73_net_close_w,  .arity=1}};
 
 /* ═══════════════════════════════════════════════════════════════════
  * T3 HOT KERNEL INCLUDE — anima training inner-loop fast path.

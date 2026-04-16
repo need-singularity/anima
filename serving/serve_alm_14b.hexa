@@ -20,8 +20,9 @@
 //                              total_tokens, requests_served, psi_constants }
 //
 // Feature flags:
-//   RUNTIME_HAS_NET   true once stage0 ships net_listen/accept/read/write/close
-//                     (today: false → server_loop is a stub + clear TODO)
+//   RUNTIME_HAS_NET   true — BSD socket FFI added to runtime.c (2026-04-16).
+//                     hexa_net_listen/accept/read/write/close bypass stage0
+//                     by living in the C runtime directly.
 //   RUNTIME_HAS_FFI_QWEN  true once libhxqwen14b.so is loadable through
 //                         hexa @link.  Skeleton C lives at
 //                         /Users/ghost/Dev/hexa-lang/self/native/hxqwen14b.c
@@ -45,7 +46,7 @@
 // file needs to be split / further inlined.
 
 // ─── Runtime feature gates ─────────────────────────────────────────
-let RUNTIME_HAS_NET = false       // flip when net_listen lands
+let RUNTIME_HAS_NET = true        // SHIPPED — runtime.c now has hexa_net_listen/accept/read/write/close
 let RUNTIME_HAS_FFI_QWEN = false  // flip when libhxqwen14b.so loads
 
 // ─── Constants (mirror Python defaults exactly) ────────────────────
@@ -315,6 +316,88 @@ fn sa_not_found_json(path: string) -> string {
     return body
 }
 
+// ─── HTTP request parsing ──────────────────────────────────────────
+//
+// Parses raw HTTP/1.1 text into method, path, body.
+// Struct has 2 string + 1 string = 3 string fields (no float corruption).
+
+struct HttpReq {
+    method: string,
+    path: string,
+    body: string
+}
+
+fn sa_parse_http(raw: string) -> HttpReq {
+    // HTTP format: "GET /path HTTP/1.1\r\n...headers...\r\n\r\nbody"
+    // Step 1: extract method (first token before space)
+    let mut method = ""
+    let mut path = ""
+    let mut body = ""
+    let n = raw.len()
+    let mut i = 0
+
+    // Parse method: read until first space
+    while i < n {
+        let ch = raw.substring(i, i + 1)
+        if ch == " " { break }
+        method = method + ch
+        i = i + 1
+    }
+    i = i + 1  // skip space
+
+    // Parse path: read until next space
+    while i < n {
+        let ch = raw.substring(i, i + 1)
+        if ch == " " { break }
+        path = path + ch
+        i = i + 1
+    }
+
+    // Find body: look for \r\n\r\n separator
+    let sep = "\r\n\r\n"
+    let sep_pos = raw.index_of(sep)
+    if sep_pos >= 0 {
+        let body_start = sep_pos + 4
+        if body_start < n {
+            body = raw.substring(body_start, n)
+        }
+    }
+
+    return HttpReq { method: method, path: path, body: body }
+}
+
+// ─── HTTP response building ───────────────────────────────────────
+
+fn sa_http_response(status_code: int, body: string) -> string {
+    let status_text = if status_code == 200 { "OK" }
+        else { if status_code == 400 { "Bad Request" }
+        else { if status_code == 404 { "Not Found" }
+        else { "Internal Server Error" } } }
+    let content_len = to_string(body.len())
+    let resp = "HTTP/1.1 " + to_string(status_code) + " " + status_text + "\r\n"
+        + "Content-Type: application/json\r\n"
+        + "Content-Length: " + content_len + "\r\n"
+        + "Connection: close\r\n"
+        + "Access-Control-Allow-Origin: *\r\n"
+        + "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        + "Access-Control-Allow-Headers: Content-Type\r\n"
+        + "\r\n"
+        + body
+    return resp
+}
+
+// Handle CORS preflight OPTIONS requests
+fn sa_cors_response() -> string {
+    let resp = "HTTP/1.1 204 No Content\r\n"
+        + "Access-Control-Allow-Origin: *\r\n"
+        + "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        + "Access-Control-Allow-Headers: Content-Type\r\n"
+        + "Content-Length: 0\r\n"
+        + "Connection: close\r\n"
+        + "\r\n"
+    return resp
+}
+
 // ─── Route dispatch (pure, testable without sockets) ───────────────
 //
 // SaResponse holds only 1 float (state_phi) — staying under the
@@ -478,44 +561,86 @@ fn main() {
         return
     }
 
-    if !RUNTIME_HAS_NET {
-        println("")
-        println("[serve_alm_14b] dispatch verified.")
-        println("[serve_alm_14b] BLOCKER: stage0 lacks net_listen builtin.")
-        println("[serve_alm_14b] When net_* lands, flip RUNTIME_HAS_NET=true and the")
-        println("                serve_loop block below activates.  No other code change")
-        println("                required outside this main() body.")
-        println("")
-        println("To bring online (3-step):")
-        println("  1. Land net_listen/accept/read/write/close in stage0 builtins.")
-        println("     (Already in self/std_net.hexa, branch rt-32-j; needs merge.)")
-        println("  2. Build libhxqwen14b.so on H100 pod (Day-1 CUDA path of")
-        println("     /Users/ghost/Dev/hexa-lang/self/native/hxqwen14b.c) and")
-        println("     flip RUNTIME_HAS_FFI_QWEN=true.")
-        println("  3. Replace serve_alm_14b.py on pod itfl66q4z768kh with this binary.")
+    // ── Live HTTP server loop (runtime.c FFI: hexa_net_listen/accept/read/write/close) ──
+    //
+    // Root cause of prior blocker: stage0 had no net_listen builtin.
+    // Fix: added BSD socket FFI directly to runtime.c (hexa_net_* functions).
+    // The hexa codegen emits calls to these C functions — no stage0 change needed.
+
+    let bind_addr = "0.0.0.0:" + to_string(SA_DEFAULT_PORT)
+    let listener = net_listen(bind_addr)
+    if listener < 0 {
+        println("[serve_alm_14b] FATAL: net_listen(" + bind_addr + ") failed — fd=" + to_string(listener))
+        println("  Check: port " + to_string(SA_DEFAULT_PORT) + " already in use? Run: lsof -i :" + to_string(SA_DEFAULT_PORT))
         return
     }
 
-    // RUNTIME_HAS_NET path — sketched but unreachable until the flag flips.
-    // Keeping the wire-up here ensures the next agent has a 1-block diff
-    // rather than a redesign.
-    //
-    //   let listener = net_listen("0.0.0.0:" + to_string(SA_DEFAULT_PORT))
-    //   let handle   = sa_qwen_load(SA_DEFAULT_CKPT)
-    //   let mut st   = sa_state_new(SA_DEFAULT_PORT, handle, SA_DEFAULT_CKPT,
-    //                               SA_DEFAULT_BASE, SA_DEFAULT_DEVICE)
-    //   loop {
-    //     let conn  = net_accept(listener)
-    //     let raw   = net_read(conn)
-    //     let req   = parse_http_request(raw)   // → {method, path, body}
-    //     let resp  = sa_route(req.method, req.path, req.body, st)
-    //     st = SaState { ..st,
-    //                    last_phi: resp.state_phi,
-    //                    requests_served: st.requests_served + 1 }
-    //     net_write(conn, build_http_response(resp.status, resp.body))
-    //     net_close(conn)
-    //   }
-    println("[serve_alm_14b] RUNTIME_HAS_NET=true → live socket loop not yet wired.")
+    let qh = sa_qwen_load(SA_DEFAULT_CKPT)
+    let mut st = sa_state_new(SA_DEFAULT_PORT, qh, SA_DEFAULT_CKPT, SA_DEFAULT_BASE, SA_DEFAULT_DEVICE)
+
+    println("")
+    println("[serve_alm_14b] listening on " + bind_addr + " (fd=" + to_string(listener) + ")")
+    println("[serve_alm_14b] routes: GET /health, POST /generate, POST /consciousness")
+    println("[serve_alm_14b] Ctrl-C to stop")
+    println("")
+
+    // Accept loop — single-threaded, connection-per-request.
+    // Each connection: read full HTTP request, dispatch, write response, close.
+    // Adequate for inference serving (latency dominated by model forward pass).
+    let mut running = true
+    while running {
+        let conn = net_accept(listener)
+        if conn < 0 {
+            println("[serve_alm_14b] accept error — skipping")
+            continue
+        }
+
+        let raw = net_read(conn)
+        if raw.len() == 0 {
+            // Empty read = client closed before sending, or read error
+            net_close(conn)
+            continue
+        }
+
+        // Parse HTTP request
+        let req = sa_parse_http(raw)
+
+        // Handle CORS preflight
+        if req.method == "OPTIONS" {
+            net_write(conn, sa_cors_response())
+            net_close(conn)
+            continue
+        }
+
+        // Dispatch to route handler
+        let resp = sa_route(req.method, req.path, req.body, st)
+
+        // Update server state
+        st = sa_state_new(st.port, st.qhandle, st.ckpt_path, st.base_model, st.device)
+        st = SaState {
+            qhandle: st.qhandle,
+            port: st.port,
+            requests_served: st.requests_served + 1,
+            total_tokens_generated: st.total_tokens_generated,
+            start_ms: st.start_ms,
+            last_phi: resp.state_phi,
+            last_tension: st.last_tension,
+            ckpt_path: st.ckpt_path,
+            base_model: st.base_model,
+            device: st.device
+        }
+
+        // Build and send HTTP response
+        let http_resp = sa_http_response(resp.status, resp.body)
+        net_write(conn, http_resp)
+        net_close(conn)
+
+        // Log request
+        println("[" + to_string(st.requests_served) + "] " + req.method + " " + req.path + " → " + to_string(resp.status))
+    }
+
+    net_close(listener)
+    println("[serve_alm_14b] server stopped.")
 }
 
 // Note: hexa codegen auto-invokes main() — explicit `main()` at file end
