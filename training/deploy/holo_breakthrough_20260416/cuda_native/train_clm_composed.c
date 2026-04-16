@@ -4109,6 +4109,43 @@ HexaVal split_ws(HexaVal s) {
 }
 
 
+// --- MMAP BYTE CORPUS LOADER (2026-04-16) ---
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+static unsigned char* g_corpus_mmap = NULL;
+static long g_corpus_len = 0;
+
+HexaVal load_corpus_mmap(HexaVal path) {
+    const char* cpath = hexa_to_cstring(path);
+    hexa_println(hexa_add(hexa_str("[corpus] mmap loading: "), path));
+    int fd = open(cpath, O_RDONLY);
+    if (fd < 0) { hexa_println(hexa_str("[corpus] ERROR: open failed")); return hexa_int(0); }
+    struct stat st;
+    fstat(fd, &st);
+    g_corpus_len = st.st_size;
+    g_corpus_mmap = (unsigned char*)mmap(NULL, g_corpus_len, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (g_corpus_mmap == MAP_FAILED) {
+        hexa_println(hexa_str("[corpus] ERROR: mmap failed"));
+        g_corpus_mmap = NULL; g_corpus_len = 0;
+        return hexa_int(0);
+    }
+    madvise(g_corpus_mmap, g_corpus_len, MADV_SEQUENTIAL);
+    char msg[256];
+    snprintf(msg, sizeof(msg), "[corpus] mmap'd %ld bytes (%.2f GB)", g_corpus_len, g_corpus_len/1e9);
+    hexa_println(hexa_str(msg));
+    return hexa_int(g_corpus_len);
+}
+
+// Direct byte access from mmap — bypasses hexa_index_get overhead
+static inline unsigned char corpus_byte_raw(long off) {
+    if (off < 0 || off >= g_corpus_len) return 0;
+    return g_corpus_mmap[off];
+}
+// --- END MMAP LOADER ---
+
 HexaVal load_corpus(HexaVal path) {
     HexaVal tokens = hexa_void();
     HexaVal i = hexa_void();
@@ -4203,7 +4240,7 @@ HexaVal corpus_window(HexaVal corpus, HexaVal start, HexaVal seq) {
     HexaVal window = hexa_array_new();
     HexaVal i = hexa_int(0);
     while (hexa_truthy(hexa_bool(__extension__ ({ HexaVal __l=(i); HexaVal __r=(seq); (__l.tag==TAG_FLOAT||__r.tag==TAG_FLOAT) ? ((__l.tag==TAG_FLOAT?__l.f:(double)__l.i) < (__r.tag==TAG_FLOAT?__r.f:(double)__r.i)) : (__l.i < __r.i); })))) {
-        window = hexa_array_push(window, hexa_index_get(corpus, hexa_add(start, i)));
+        window = hexa_array_push(window, hexa_int(corpus_byte_raw(hexa_add(start, i).i)));
         i = hexa_add(i, hexa_int(1));
     }
     return window;
@@ -4215,7 +4252,7 @@ HexaVal corpus_targets(HexaVal corpus, HexaVal start, HexaVal seq) {
     HexaVal targets = hexa_array_new();
     HexaVal i = hexa_int(0);
     while (hexa_truthy(hexa_bool(__extension__ ({ HexaVal __l=(i); HexaVal __r=(seq); (__l.tag==TAG_FLOAT||__r.tag==TAG_FLOAT) ? ((__l.tag==TAG_FLOAT?__l.f:(double)__l.i) < (__r.tag==TAG_FLOAT?__r.f:(double)__r.i)) : (__l.i < __r.i); })))) {
-        targets = hexa_array_push(targets, hexa_index_get(corpus, hexa_add(hexa_add(start, i), hexa_int(1))));
+        targets = hexa_array_push(targets, hexa_int(corpus_byte_raw(hexa_add(hexa_add(start, i), hexa_int(1)).i)));
         i = hexa_add(i, hexa_int(1));
     }
     return targets;
@@ -4267,8 +4304,9 @@ HexaVal sample_batch(HexaVal corpus, HexaVal n_corpus) {
         HexaVal start = next_rand(max_start);
         HexaVal i = hexa_int(0);
         while (hexa_truthy(hexa_bool(__extension__ ({ HexaVal __l=(i); HexaVal __r=(SEQ); (__l.tag==TAG_FLOAT||__r.tag==TAG_FLOAT) ? ((__l.tag==TAG_FLOAT?__l.f:(double)__l.i) < (__r.tag==TAG_FLOAT?__r.f:(double)__r.i)) : (__l.i < __r.i); })))) {
-            tok_flat = hexa_array_push(tok_flat, hexa_index_get(corpus, hexa_add(start, i)));
-            tgt_flat = hexa_array_push(tgt_flat, hexa_index_get(corpus, hexa_add(hexa_add(start, i), hexa_int(1))));
+            // mmap: direct byte read instead of hexa_index_get on array
+            tok_flat = hexa_array_push(tok_flat, hexa_int(corpus_byte_raw(hexa_add(start, i).i)));
+            tgt_flat = hexa_array_push(tgt_flat, hexa_int(corpus_byte_raw(hexa_add(hexa_add(start, i), hexa_int(1)).i)));
             i = hexa_add(i, hexa_int(1));
         }
         b = hexa_add(b, hexa_int(1));
@@ -4299,8 +4337,9 @@ HexaVal eval_ppl(HexaVal weights, HexaVal cfg, HexaVal eval_acts, HexaVal corpus
         HexaVal tgts = hexa_array_new();
         HexaVal i = hexa_int(0);
         while (hexa_truthy(hexa_bool(__extension__ ({ HexaVal __l=(i); HexaVal __r=(SEQ); (__l.tag==TAG_FLOAT||__r.tag==TAG_FLOAT) ? ((__l.tag==TAG_FLOAT?__l.f:(double)__l.i) < (__r.tag==TAG_FLOAT?__r.f:(double)__r.i)) : (__l.i < __r.i); })))) {
-            toks = hexa_array_push(toks, hexa_index_get(corpus, hexa_add(row_start, i)));
-            tgts = hexa_array_push(tgts, hexa_index_get(corpus, hexa_add(hexa_add(row_start, i), hexa_int(1))));
+            // mmap: direct byte read
+            toks = hexa_array_push(toks, hexa_int(corpus_byte_raw(hexa_add(row_start, i).i)));
+            tgts = hexa_array_push(tgts, hexa_int(corpus_byte_raw(hexa_add(hexa_add(row_start, i), hexa_int(1)).i)));
             i = hexa_add(i, hexa_int(1));
         }
         HexaVal tok_dev = int_array_to_gpu(toks);
@@ -4543,7 +4582,7 @@ int main(int argc, char** argv) {
     R2_PREFIX = hexa_str("r2:anima-models/clm1b/r4");
     MODEL_TAG = hexa_str("clm_byte_kr");
     ROUND = hexa_int(1);
-    CORPUS_PATH = hexa_str("training/corpus_ko_seed.tok");
+    CORPUS_PATH = hexa_str("/workspace/corpus_clm_r4.txt");  // raw bytes, mmap'd
     HELDOUT_LEN = hexa_int(4096);
     KR_PERIOD = hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_new(), hexa_int(236)), hexa_int(149)), hexa_int(136)), hexa_int(235)), hexa_int(133)), hexa_int(149)), hexa_int(237)), hexa_int(149)), hexa_int(152)), hexa_int(236)), hexa_int(132)), hexa_int(184)), hexa_int(236)), hexa_int(154)), hexa_int(148)), hexa_int(32));
     RNG = SEED;
@@ -4579,15 +4618,19 @@ int main(int argc, char** argv) {
     }
     cfg = GpuClmConfig(D, FF, NL, VOCAB, SEQ, RANK, EPS, INIT_SCALE);
     hexa_println(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("[train_clm_kr] cfg: D="), hexa_to_string(hexa_map_get_ic(cfg, "D", &__hexa_ic_624))), hexa_str(" FF=")), hexa_to_string(hexa_map_get_ic(cfg, "FF", &__hexa_ic_625))), hexa_str(" NL=")), hexa_to_string(hexa_map_get_ic(cfg, "NL", &__hexa_ic_626))), hexa_str(" SEQ=")), hexa_to_string(hexa_map_get_ic(cfg, "SEQ", &__hexa_ic_627))), hexa_str(" RANK=")), hexa_to_string(hexa_map_get_ic(cfg, "RANK", &__hexa_ic_628))));
-    corpus = load_corpus(CORPUS_PATH);
-    n_corpus = hexa_int(hexa_len(corpus));
+    // mmap path: returns hexa_int(byte_count), NOT a hexa array
+    corpus = load_corpus_mmap(CORPUS_PATH);
+    n_corpus = corpus;  // corpus IS the byte count (mmap mode)
     if (hexa_truthy(hexa_bool(__extension__ ({ HexaVal __l=(n_corpus); HexaVal __r=(hexa_add(SEQ, hexa_int(2))); (__l.tag==TAG_FLOAT||__r.tag==TAG_FLOAT) ? ((__l.tag==TAG_FLOAT?__l.f:(double)__l.i) < (__r.tag==TAG_FLOAT?__r.f:(double)__r.i)) : (__l.i < __r.i); })))) {
         hexa_println(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("[train_clm_kr] FATAL — corpus too short: "), hexa_to_string(n_corpus)), hexa_str(" bytes (need >= ")), hexa_to_string(hexa_add(SEQ, hexa_int(2)))), hexa_str(")")));
         HexaVal _ = cuda_shutdown();
         return 1;
     }
     hexa_println(hexa_add(hexa_add(hexa_add(hexa_str("[train_clm_kr] corpus: "), hexa_to_string(n_corpus)), hexa_str(" bytes from ")), CORPUS_PATH));
-    hexa_println(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("[train_clm_kr] first bytes: "), hexa_to_string(hexa_index_get(corpus, hexa_int(0)))), hexa_str(" ")), hexa_to_string(hexa_index_get(corpus, hexa_int(1)))), hexa_str(" ")), hexa_to_string(hexa_index_get(corpus, hexa_int(2)))), hexa_str(" ")), hexa_to_string(hexa_index_get(corpus, hexa_int(3)))), hexa_str(" ")), hexa_to_string(hexa_index_get(corpus, hexa_int(4)))), hexa_str(" ...")));
+    // mmap: direct byte read for first-bytes debug print
+    { char fb[128]; snprintf(fb, sizeof(fb), "[train_clm_kr] first bytes: %d %d %d %d %d ...",
+        corpus_byte_raw(0), corpus_byte_raw(1), corpus_byte_raw(2), corpus_byte_raw(3), corpus_byte_raw(4));
+      hexa_println(hexa_str(fb)); }
     weights = init_gpu_weights(cfg, SEED);
     hexa_println(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("[train_clm_kr] weights: GPU initialized (seed="), hexa_to_string(SEED)), hexa_str(", scale=")), hexa_to_string(INIT_SCALE)), hexa_str(")")));
     acts = alloc_fwd_buffers(cfg, hexa_mul(BATCH, SEQ));
