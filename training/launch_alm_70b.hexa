@@ -1,0 +1,478 @@
+// training/launch_alm_70b.hexa — ALM 70B launcher
+//                                 (Qwen2.5-72B-Instruct + A2-merged base +
+//                                  fresh LoRA r=32 alpha=64 FSDP Full-Shard)
+// @convergence shared/convergence/alm_70b.convergence
+//
+// Spec:      shared/state/alm_70b_spec.json          (46KB SSOT 2026-04-16T23:57Z)
+// Checklist: shared/state/alm_70b_launch_checklist_20260417.json  (audit 2026-04-17T01:30Z)
+// FSDP:      training/alm_70b_fsdp_config.json       (accelerate FSDP recipe)
+// Day:       T+8d after all 7 gates (G1-G7) PASS
+// Pod:       4 x H100 SXM 80GB NVLink single-node
+// Budget:    $240 target / $480 cap (20h / 40h wall)
+//
+// Why NEW launcher (per A2-Orch/A2-Tool pattern):
+//   Total .py ban (2026-04-16) forbids creating new .py. Launcher emits a
+//   pod-side bash runner that invokes `accelerate launch --config_file
+//   fsdp_config.yaml` wrapping the existing train_alm_14b.py trainer
+//   (which is distributed-aware: FSDP/DDP via accelerate is already there
+//   per train_alm_14b.hexa:478 "replaces the HF modules that PEFT/FSDP
+//   /compile will see"). No .py source file is created.
+//
+//   Delta vs A2-Orch:
+//     - base:     Qwen2.5-72B-Instruct (NOT 14B)
+//     - launch:   torchrun --nproc_per_node=4 + accelerate FSDP config
+//     - LoRA:     r=32 alpha=64 (14B A2-Orch was r=64 alpha=128)
+//     - corpus:   /workspace/alm_70b_corpus.jsonl (expanded 40M+ chars)
+//     - adapter:  A2-merged adapter (A1+A2-Orch+A2-Tool) OR 13B intermediate
+//     - ckpt:     FSDP SHARDED_STATE_DICT (rank-per-shard on save)
+//     - disk:     145GB base + 40GB ckpts + 1GB corpus + headroom ≥ 500GB
+//
+// Resume semantics (per feedback_no_resume_data_change):
+//   70B adapter is FRESH-FROM-BASE. NOT resume from 14B adapter. Base
+//   Qwen2.5-72B-Instruct is brand new to this codebase. A2-merged 14B
+//   adapter (if available) is staged ON TOP of a 14B→72B lineage only
+//   for lineage-tracking in ckpt metadata — not weight-transferred. The
+//   72B adapter trains from scratch on the 72B base.
+//
+// Naming (E3):
+//   run_id = alm70b-r1-{date}
+//   ckpt   = step_{N}
+//
+// Operation flow:
+//   1. parse config JSON (string-scan, verify ckpt_label=production)
+//   2. emit fsdp_config.yaml to /workspace/ (accelerate FSDP full-shard)
+//   3. emit bash runner to /tmp with preflight + download + launch
+//   4. exec bash runner (honors DRY_RUN=1 for smoke tests)
+//
+// Guardrails:
+//   - refuses if Qwen/Qwen2.5-72B-Instruct local dir missing AND HF_TOKEN unset
+//   - refuses if 4 GPU NOT visible (nvidia-smi --list-gpus | wc -l != 4)
+//   - refuses if compute_cap < 8.0 on ANY GPU (bf16 unsafe)
+//   - refuses if disk < 500GB
+//   - refuses if MFS quota probe fails (40GB write test for 72B workload)
+//   - refuses if forbidden markers present (READY_FOR_32B / READY_FOR_R5_KBASE)
+//   - requires explicit USER_OK_4POD=1 env to launch (4 pods > 3-pod cap)
+//   - DRY_RUN=1 emits runner but does NOT execute
+
+let CONFIG_PATH = "training/alm_70b_config.json"
+let FSDP_CONFIG_PATH = "training/alm_70b_fsdp_config.json"
+
+// ─── Hexa string-scan helpers (mirror launch_alm_a2_orch.hexa exactly) ──
+fn str_index_of(hay, needle, from) {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return from }
+    let mut i = from
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn extract_json_string(text, key) {
+    let needle = "\"" + key + "\""
+    let kpos = str_index_of(text, needle, 0)
+    if kpos < 0 { return "" }
+    let after_key = kpos + len(needle)
+    let colon = str_index_of(text, ":", after_key)
+    if colon < 0 { return "" }
+    let open_q = str_index_of(text, "\"", colon)
+    if open_q < 0 { return "" }
+    let close_q = str_index_of(text, "\"", open_q + 1)
+    if close_q < 0 { return "" }
+    return text.substring(open_q + 1, close_q)
+}
+
+// ─── Date resolver ──
+fn resolve_date() {
+    return exec("date +%Y%m%d").trim()
+}
+
+// ─── Log helpers ──
+fn log_info(msg) {
+    println("[launch_alm_70b] " + msg)
+}
+
+fn log_err(msg) {
+    println("[launch_alm_70b ERR] " + msg)
+}
+
+// ─── Main ──
+@convergence(state="ossified", id="ALM_70B_4POD_USER_OK_GATE", value="4 H100 SXM pods exceeds 3-pod ML-roadmap envelope (memory:feedback_h100_authorized 2 base + 1 ML = 3). Launcher refuses unless USER_OK_4POD=1 env set — no auto-fire at 70B scale regardless of other gates. Burn $240-480 first-run risk requires explicit human confirmation", ossified_at="2026-04-17")
+@convergence(state="ossified", id="ALM_70B_FRESH_FROM_BASE", value="70B LoRA is fresh-from-72B-Instruct base, NOT resume from 14B A2-merged adapter. Per feedback_no_resume_data_change: new model class = fresh step_0, never --resume. A2-merged 14B adapter staged as lineage metadata only, never weight-transferred across param-count boundary", ossified_at="2026-04-17")
+@convergence(state="ossified", id="ALM_70B_FSDP_FULL_SHARD_MANDATORY", value="72B bf16 = 145GB weights, exceeds single 80/94GB GPU. MUST shard via FSDP FULL_SHARD (Zero-3) across 4+ ranks. Single-GPU path IMPOSSIBLE even with unsloth — 145GB weights alone. Launcher refuses if num_processes<4 in fsdp config", ossified_at="2026-04-17")
+@convergence(state="ossified", id="ALM_70B_NO_QUANTIZATION", value="bf16 throughout base+adapter. No 4/8-bit, no GPTQ/AWQ/bnb. bitsandbytes explicitly not installed per memory:feedback_no_quantization. 72B at 4-bit would fit 1 GPU but loses instruct-tuning precision — not acceptable for fine-tune base", ossified_at="2026-04-17")
+@convergence(state="ossified", id="ALM_70B_RUN_ID_NAMING_E3", value="run_id=alm70b-r1-YYYYMMDD (no v-prefix per feedback_no_version_in_filename). round=1 is the first ALM at 70B; r2/r3 reserved for recovery rounds post-failure. ckpt subdir=step_N format matches a1/a2_orch/a2_tool", ossified_at="2026-04-17")
+fn main() {
+    // Resolve repo root.
+    let config_text = ""
+    if file_exists(CONFIG_PATH) {
+        config_text = read_file(CONFIG_PATH)
+    } else {
+        let anima_root = env("ANIMA_ROOT")
+        if anima_root == "" { anima_root = "." }
+        let fallback = anima_root + "/" + CONFIG_PATH
+        if file_exists(fallback) {
+            config_text = read_file(fallback)
+        } else {
+            log_err("config not found: " + CONFIG_PATH + " or " + fallback)
+            return
+        }
+    }
+    if len(config_text) == 0 {
+        log_err("config empty: " + CONFIG_PATH)
+        return
+    }
+    // Schema check: label must be production.
+    let cfg_label = extract_json_string(config_text, "ckpt_label")
+    if cfg_label != "production" {
+        log_err("config ckpt_label=" + cfg_label + " (expected production for 70B)")
+        return
+    }
+
+    // ── FROZEN 70B defaults (mirror training/alm_70b_config.json) ──
+    // These reflect shared/state/alm_70b_spec.json lora + training sections.
+    let base_name       = "Qwen/Qwen2.5-72B-Instruct"
+    let steps_str       = "800"
+    let lr_str          = "3e-7"
+    let warmup_str      = "80"
+    let batch_str       = "1"
+    let grad_accum_str  = "8"
+    let seq_str         = "1024"
+    let save_every_str  = "100"
+    let eval_every_str  = "100"
+    let lora_r_str      = "32"
+    let lora_alpha_str  = "64"
+    let dropout_str     = "0.05"
+    let round_str       = "1"
+    let model_tag       = "alm70b"
+    let ckpt_label      = "production"
+    let n_gpus_str      = "4"
+    let corpus_path     = "/workspace/alm_70b_corpus.jsonl"
+    let corpus_r2       = "r2:anima-models/corpus/alm_70b_corpus.jsonl"
+    let base_local_dir  = "/workspace/qwen72b"
+    // Merged-adapter lineage (optional metadata; NOT weight-transferred):
+    let a2_tool_r2      = "r2:anima-models/alm14b/a2_20260416_tool/step_1500/"
+    let fsdp_cfg_path   = "/workspace/alm_70b_fsdp_config.yaml"
+
+    // ── Resolve date token ──
+    let date = resolve_date()
+    let run_id = "alm70b-r1-" + date
+    let ckpt_dir = "/workspace/ckpt_alm70b_r1_" + date
+
+    log_info("run_id=" + run_id)
+    log_info("ckpt_dir=" + ckpt_dir)
+    log_info("base=" + base_name + "  steps=" + steps_str + "  lr=" + lr_str)
+    log_info("lora r=" + lora_r_str + " alpha=" + lora_alpha_str + " dropout=" + dropout_str)
+    log_info("n_gpus=" + n_gpus_str + " (FSDP FULL_SHARD)")
+    log_info("seq=" + seq_str + " batch=" + batch_str + " grad_accum=" + grad_accum_str)
+    log_info("effective_batch=8 tokens_per_step=8192")
+
+    // ── Emit accelerate FSDP config YAML (pod path) ──
+    let runner = "/tmp/_launch_alm_70b_runner.sh"
+    write_file(runner,
+        "#!/usr/bin/env bash\n" +
+        "set -euo pipefail\n" +
+        "\n" +
+        "echo \"============================================\"\n" +
+        "echo \"  ALM 70B -- Qwen2.5-72B-Instruct FSDP FULL_SHARD\"\n" +
+        "echo \"  run_id = " + run_id + "\"\n" +
+        "echo \"  ckpt   = " + ckpt_dir + "\"\n" +
+        "echo \"  lora   = r" + lora_r_str + " alpha" + lora_alpha_str + " dropout" + dropout_str + "\"\n" +
+        "echo \"  steps  = " + steps_str + "   lr=" + lr_str + "  warmup=" + warmup_str + "\"\n" +
+        "echo \"  gpus   = " + n_gpus_str + " x H100 SXM 80GB FSDP FULL_SHARD bf16\"\n" +
+        "echo \"  budget = 20h target / 40h cap -- $240-480 burn\"\n" +
+        "echo \"  label  = " + ckpt_label + "   (R2 permanent)\"\n" +
+        "echo \"============================================\"\n" +
+        "\n" +
+        "# ── USER_OK_4POD gate (ossified) ──\n" +
+        "if [[ \"${USER_OK_4POD:-0}\" != \"1\" ]]; then\n" +
+        "    echo \"[preflight] USER_OK_4POD=1 required for 4-pod config (exceeds 3-pod cap)\"\n" +
+        "    echo \"[preflight] REFUSING -- user must set USER_OK_4POD=1 before launch\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[preflight] USER_OK_4POD=1 confirmed\"\n" +
+        "\n" +
+        "# ── preflight: forbidden markers ──\n" +
+        "for m in /workspace/READY_FOR_32B /workspace/READY_FOR_R5_KBASE; do\n" +
+        "    if [[ -f \"$m\" ]]; then\n" +
+        "        echo \"[preflight] forbidden marker present: $m -- refusing\"\n" +
+        "        exit 1\n" +
+        "    fi\n" +
+        "done\n" +
+        "\n" +
+        "# ── preflight: 4x GPU visibility ──\n" +
+        "echo \"[preflight] GPU count check (expect 4)...\"\n" +
+        "NGPU=$(nvidia-smi --list-gpus | wc -l)\n" +
+        "if [[ \"$NGPU\" -ne " + n_gpus_str + " ]]; then\n" +
+        "    echo \"[preflight] expected " + n_gpus_str + " GPUs, found $NGPU -- refusing\"\n" +
+        "    nvidia-smi\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[preflight] 4 GPUs visible\"\n" +
+        "\n" +
+        "# ── preflight: bf16 capability + idle on all 4 GPUs ──\n" +
+        "nvidia-smi --query-gpu=index,name,memory.total,memory.free,compute_cap,utilization.gpu --format=csv,noheader\n" +
+        "while read -r CC; do\n" +
+        "    CCI=$(echo \"$CC\" | tr -d '.')\n" +
+        "    if [[ -z \"$CCI\" ]] || (( CCI < 80 )); then\n" +
+        "        echo \"[preflight] compute_cap=$CC < 8.0 on some GPU -- bf16 unsafe, refusing\"\n" +
+        "        exit 1\n" +
+        "    fi\n" +
+        "done < <(nvidia-smi --query-gpu=compute_cap --format=csv,noheader)\n" +
+        "echo \"[preflight] bf16 OK on all " + n_gpus_str + " GPUs\"\n" +
+        "\n" +
+        "# ── preflight: all 4 GPUs idle ──\n" +
+        "while read -r UTIL; do\n" +
+        "    if (( UTIL > 5 )); then\n" +
+        "        echo \"[preflight] GPU util=${UTIL}%% > 5 on some GPU -- refusing\"\n" +
+        "        nvidia-smi\n" +
+        "        exit 1\n" +
+        "    fi\n" +
+        "done < <(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits)\n" +
+        "while read -r USED; do\n" +
+        "    if (( USED > 2000 )); then\n" +
+        "        echo \"[preflight] GPU mem=${USED}MiB > 2000 on some GPU -- refusing\"\n" +
+        "        exit 1\n" +
+        "    fi\n" +
+        "done < <(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)\n" +
+        "echo \"[preflight] all " + n_gpus_str + " GPUs idle\"\n" +
+        "\n" +
+        "# ── preflight: disk >= 500GB ──\n" +
+        "FREE_GB=$(df -BG /workspace | tail -n1 | awk '{print $4}' | tr -d 'G')\n" +
+        "if [[ -z \"$FREE_GB\" || \"$FREE_GB\" -lt 500 ]]; then\n" +
+        "    echo \"[preflight] /workspace free=${FREE_GB}GB < 500GB -- refusing\"\n" +
+        "    df -h /workspace\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[preflight] disk OK (${FREE_GB}GB free)\"\n" +
+        "\n" +
+        "# ── preflight: MFS quota probe (40GB for 72B workload) ──\n" +
+        "if ! dd if=/dev/zero of=/workspace/_q_test_70b bs=1M count=40000 status=none 2>/dev/null; then\n" +
+        "    echo \"[preflight] MFS quota 40GB write test FAILED -- refusing\"\n" +
+        "    rm -f /workspace/_q_test_70b\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "rm -f /workspace/_q_test_70b\n" +
+        "echo \"[preflight] MFS quota OK (40GB write test passed)\"\n" +
+        "\n" +
+        "# ── preflight: HF_TOKEN ──\n" +
+        "if [[ -z \"${HF_TOKEN:-}\" ]]; then\n" +
+        "    echo \"[preflight] HF_TOKEN unset -- refusing\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[preflight] HF_TOKEN present\"\n" +
+        "\n" +
+        "# ── preflight: torch/peft/transformers/accelerate/flash-attn pins ──\n" +
+        "echo \"[preflight] verifying pinned deps...\"\n" +
+        "python3 -c 'import torch; assert torch.__version__.startswith(\"2.4\"), f\"torch {torch.__version__} != 2.4.x\"'\n" +
+        "python3 -c 'import peft; assert peft.__version__ == \"0.13.2\", f\"peft {peft.__version__} != 0.13.2\"'\n" +
+        "python3 -c 'import transformers; assert transformers.__version__ == \"4.45.2\", f\"transformers {transformers.__version__} != 4.45.2\"'\n" +
+        "python3 -c 'from flash_attn import flash_attn_func; import flash_attn; print(\"flash_attn\", flash_attn.__version__)'\n" +
+        "python3 -c 'import accelerate; print(\"accelerate\", accelerate.__version__)'\n" +
+        "python3 -c 'import sys; sys.exit(0 if __import__(\"importlib\").util.find_spec(\"bitsandbytes\") is None else 1)' \\\n" +
+        "    || { echo \"[preflight] bitsandbytes INSTALLED -- refusing (no-quantization policy)\"; exit 1; }\n" +
+        "echo \"[preflight] deps OK (no bitsandbytes, torch 2.4.x, peft 0.13.2, transformers 4.45.2)\"\n" +
+        "\n" +
+        "# ── preflight: 72B base downloaded + verified ──\n" +
+        "BASE_DIR=\"" + base_local_dir + "\"\n" +
+        "if [[ ! -d \"$BASE_DIR\" ]]; then\n" +
+        "    echo \"[preflight] 72B base dir $BASE_DIR missing -- refusing\"\n" +
+        "    echo \"[preflight] download first: hexa training/download_qwen72b.hexa\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "if [[ ! -f \"$BASE_DIR/config.json\" ]]; then\n" +
+        "    echo \"[preflight] 72B base config.json missing -- refusing\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "BASE_GB=$(du -sBG \"$BASE_DIR\" | awk '{print $1}' | tr -d 'G')\n" +
+        "if [[ \"$BASE_GB\" -lt 140 ]]; then\n" +
+        "    echo \"[preflight] 72B base only ${BASE_GB}GB (< 140GB) -- incomplete download, refusing\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[preflight] 72B base OK (${BASE_GB}GB)\"\n" +
+        "\n" +
+        "# ── preflight: corpus (fetch from R2 if missing) ──\n" +
+        "CORPUS=\"" + corpus_path + "\"\n" +
+        "if [[ ! -f \"$CORPUS\" ]]; then\n" +
+        "    echo \"[preflight] corpus missing locally -- fetching from R2\"\n" +
+        "    if ! rclone copy \"" + corpus_r2 + "\" \"$(dirname $CORPUS)\" --s3-no-check-bucket --progress; then\n" +
+        "        echo \"[preflight] corpus R2 fetch failed -- refusing\"\n" +
+        "        exit 1\n" +
+        "    fi\n" +
+        "fi\n" +
+        "if [[ ! -f \"$CORPUS\" ]]; then\n" +
+        "    echo \"[preflight] corpus still missing post-fetch -- refusing\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "LINES=$(wc -l < \"$CORPUS\")\n" +
+        "if (( LINES < 10000 )); then\n" +
+        "    echo \"[preflight] corpus only $LINES lines (<10000) -- warn, accepting under exception\"\n" +
+        "fi\n" +
+        "echo \"[preflight] corpus $CORPUS ($LINES lines) OK\"\n" +
+        "\n" +
+        "# ── preflight: optional A2-merged adapter for lineage metadata ──\n" +
+        "# NOT weight-transferred (70B is fresh-from-base per feedback_no_resume_data_change)\n" +
+        "# — only stamped into ckpt metadata for traceability.\n" +
+        "A2_TOOL_LINEAGE=\"\"\n" +
+        "if rclone lsd \"" + a2_tool_r2 + "\" --s3-no-check-bucket >/dev/null 2>&1; then\n" +
+        "    A2_TOOL_LINEAGE=\"" + a2_tool_r2 + "\"\n" +
+        "    echo \"[preflight] lineage: 14B A2-Tool adapter present at $A2_TOOL_LINEAGE (metadata-only)\"\n" +
+        "else\n" +
+        "    echo \"[preflight] lineage: 14B A2-Tool adapter not yet in R2 -- proceeding without lineage stamp\"\n" +
+        "fi\n" +
+        "\n" +
+        "# ── preflight: naming regex (E3) ──\n" +
+        "RUN_ID=\"" + run_id + "\"\n" +
+        "if ! [[ \"$RUN_ID\" =~ ^alm70b-r1-[0-9]{8}$ ]]; then\n" +
+        "    echo \"[preflight] run_id $RUN_ID fails E3 regex -- refusing\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[preflight] naming E3 OK\"\n" +
+        "\n" +
+        "# ── env for HF cache + hook discovery + Anima hooks ──\n" +
+        "export HF_HUB_CACHE=\"/workspace/hf_cache\"\n" +
+        "export HF_HOME=\"/workspace/hf_cache\"\n" +
+        "export TRANSFORMERS_CACHE=\"/workspace/hf_cache\"\n" +
+        "export ANIMA_ROOT=\"/workspace/anima\"\n" +
+        "export HEXA_CKPT_HOOK=\"/workspace/anima/scripts/ckpt_backup_hook.hexa\"\n" +
+        "export ALM_BASE_LOCAL=\"$BASE_DIR\"\n" +
+        "export ALM_LINEAGE_A2_TOOL=\"$A2_TOOL_LINEAGE\"\n" +
+        "export PYTORCH_CUDA_ALLOC_CONF=\"expandable_segments:True\"\n" +
+        "export NCCL_DEBUG=\"INFO\"\n" +
+        "export NCCL_IB_DISABLE=\"0\"\n" +
+        "export NCCL_P2P_LEVEL=\"NVL\"\n" +
+        "export TOKENIZERS_PARALLELISM=\"false\"\n" +
+        "\n" +
+        "# ── emit accelerate FSDP YAML ──\n" +
+        "FSDP_YAML=\"" + fsdp_cfg_path + "\"\n" +
+        "cat > \"$FSDP_YAML\" <<'YAMLEOF'\n" +
+        "compute_environment: LOCAL_MACHINE\n" +
+        "distributed_type: FSDP\n" +
+        "downcast_bf16: 'no'\n" +
+        "fsdp_config:\n" +
+        "  fsdp_sharding_strategy: FULL_SHARD\n" +
+        "  fsdp_offload_params: false\n" +
+        "  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP\n" +
+        "  fsdp_transformer_layer_cls_to_wrap: Qwen2DecoderLayer\n" +
+        "  fsdp_backward_prefetch: BACKWARD_PRE\n" +
+        "  fsdp_forward_prefetch: false\n" +
+        "  fsdp_state_dict_type: SHARDED_STATE_DICT\n" +
+        "  fsdp_cpu_ram_efficient_loading: true\n" +
+        "  fsdp_sync_module_states: true\n" +
+        "  fsdp_use_orig_params: true\n" +
+        "  fsdp_limit_all_gathers: true\n" +
+        "  fsdp_activation_checkpointing: true\n" +
+        "machine_rank: 0\n" +
+        "main_training_function: main\n" +
+        "mixed_precision: bf16\n" +
+        "num_machines: 1\n" +
+        "num_processes: " + n_gpus_str + "\n" +
+        "rdzv_backend: static\n" +
+        "same_network: true\n" +
+        "tpu_env: []\n" +
+        "tpu_use_cluster: false\n" +
+        "tpu_use_sudo: false\n" +
+        "use_cpu: false\n" +
+        "YAMLEOF\n" +
+        "echo \"[fsdp] config emitted: $FSDP_YAML\"\n" +
+        "cat \"$FSDP_YAML\"\n" +
+        "\n" +
+        "# ── stage: prepare ckpt dir (fresh, never reused) ──\n" +
+        "CKPT_DIR=\"" + ckpt_dir + "\"\n" +
+        "if [[ -d \"$CKPT_DIR\" ]]; then\n" +
+        "    echo \"[preflight] $CKPT_DIR exists -- refusing (never reuse ckpt dir, MFS quota)\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "mkdir -p \"$CKPT_DIR\"\n" +
+        "\n" +
+        "# ── stage: stamp lineage metadata (not weight-transferred) ──\n" +
+        "cat > \"$CKPT_DIR/lineage.json\" <<LINEAGEEOF\n" +
+        "{\n" +
+        "  \"base_model\": \"" + base_name + "\",\n" +
+        "  \"base_local_dir\": \"$BASE_DIR\",\n" +
+        "  \"base_disk_gb\": \"$BASE_GB\",\n" +
+        "  \"lineage_14b_a2_tool_r2\": \"$A2_TOOL_LINEAGE\",\n" +
+        "  \"lineage_note\": \"70B adapter is fresh-from-base. 14B A2-Tool adapter reference is metadata-only, NOT weight-transferred across param-count boundary.\",\n" +
+        "  \"run_id\": \"" + run_id + "\",\n" +
+        "  \"started_utc\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\n" +
+        "  \"corpus\": \"$CORPUS\",\n" +
+        "  \"corpus_lines\": $LINES\n" +
+        "}\n" +
+        "LINEAGEEOF\n" +
+        "echo \"[stage] lineage stamped: $CKPT_DIR/lineage.json\"\n" +
+        "\n" +
+        "# ── launch: torchrun + accelerate FSDP wrapping train_alm_14b.py ──\n" +
+        "#\n" +
+        "# train_alm_14b.py is the existing distributed-aware trainer (sibling-owned).\n" +
+        "# We invoke it via accelerate launch with --config_file FSDP yaml. That wraps\n" +
+        "# torchrun internally. No .py file is created by this launcher (pure .hexa).\n" +
+        "TRAINER_PY=\"/workspace/anima/training/train_alm_14b.py\"\n" +
+        "if [[ ! -f \"$TRAINER_PY\" ]]; then\n" +
+        "    echo \"[launch] trainer missing: $TRAINER_PY -- refusing\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[launch] accelerate launch --config_file $FSDP_YAML $TRAINER_PY ...\"\n" +
+        "\n" +
+        "accelerate launch \\\n" +
+        "    --config_file \"$FSDP_YAML\" \\\n" +
+        "    --num_processes " + n_gpus_str + " \\\n" +
+        "    --num_machines 1 \\\n" +
+        "    --machine_rank 0 \\\n" +
+        "    --mixed_precision bf16 \\\n" +
+        "    \"$TRAINER_PY\" \\\n" +
+        "    --base " + base_name + " \\\n" +
+        "    --base-local-dir \"$BASE_DIR\" \\\n" +
+        "    --corpus \"$CORPUS\" \\\n" +
+        "    --steps " + steps_str + " \\\n" +
+        "    --lr " + lr_str + " \\\n" +
+        "    --batch " + batch_str + " \\\n" +
+        "    --grad-accum " + grad_accum_str + " \\\n" +
+        "    --seq " + seq_str + " \\\n" +
+        "    --warmup " + warmup_str + " \\\n" +
+        "    --lora-r " + lora_r_str + " \\\n" +
+        "    --lora-alpha " + lora_alpha_str + " \\\n" +
+        "    --lora-dropout " + dropout_str + " \\\n" +
+        "    --target-modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj \\\n" +
+        "    --ckpt-dir \"$CKPT_DIR\" \\\n" +
+        "    --save-every " + save_every_str + " \\\n" +
+        "    --eval-every " + eval_every_str + " \\\n" +
+        "    --model-tag " + model_tag + " \\\n" +
+        "    --round " + round_str + " \\\n" +
+        "    --ckpt-label " + ckpt_label + " \\\n" +
+        "    --fsdp \\\n" +
+        "    --fsdp-wrap-cls Qwen2DecoderLayer \\\n" +
+        "    --grad-checkpoint \\\n" +
+        "    --flash-attn-2 \\\n" +
+        "    --dtype bf16 \\\n" +
+        "    2>&1 | tee \"$CKPT_DIR/train_" + run_id + ".log\"\n" +
+        "\n" +
+        "echo \"[done] 70B training complete -- $CKPT_DIR\"\n" +
+        "# ── R2 bulk upload (post-training, per runpod_mfs_quota policy) ──\n" +
+        "echo \"[r2] bulk uploading $CKPT_DIR -> r2:anima-models/alm70b/r1/\"\n" +
+        "rclone copy \"$CKPT_DIR\" \"r2:anima-models/alm70b/r1/\" -v --s3-no-check-bucket --transfers 4 || true\n" +
+        "# ── READY marker ──\n" +
+        "touch \"$CKPT_DIR/READY_ALM_70B_R1_DONE\"\n" +
+        "echo \"[next] hexa training/eval_alm_70b.hexa --ckpt $CKPT_DIR/step_" + steps_str + "\"\n"
+    )
+
+    log_info("runner emitted: " + runner)
+
+    // ── Execution gate ──
+    if env("DRY_RUN") == "1" {
+        log_info("DRY_RUN=1 — not executing runner")
+        log_info("inspect: cat " + runner)
+        return
+    }
+
+    // ── Final local guards (match A2-Orch/Tool) ──
+    if env("USER_OK_4POD") != "1" {
+        log_err("USER_OK_4POD=1 not set locally — pod-side check would also refuse")
+        log_err("to DRY_RUN: DRY_RUN=1 hexa training/launch_alm_70b.hexa")
+        return
+    }
+
+    log_info("exec bash " + runner)
+    exec("bash " + runner)
+}

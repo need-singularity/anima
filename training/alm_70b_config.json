@@ -1,0 +1,232 @@
+{
+  "_meta": {
+    "name": "ALM 70B launch config — Qwen2.5-72B-Instruct + fresh LoRA r=32",
+    "spec_ref": "shared/state/alm_70b_spec.json",
+    "checklist_ref": "shared/state/alm_70b_launch_checklist_20260417.json",
+    "fsdp_ref": "training/alm_70b_fsdp_config.json",
+    "schema_version": "1.0",
+    "created_utc": "2026-04-17T02:00Z",
+    "depends_on": ["A1_done", "A2_Orch_done", "A2_Tool_done", "A2_eval_pass", "FSDP_smoke_14B_pass", "4pod_user_ok", "72B_base_downloaded", "corpus_40M_expanded_or_exception"],
+    "rationale": "Launcher (launch_alm_70b.hexa) reads this config via string-scan, verifies ckpt_label=production, then emits pod-side runner. Frozen defaults inside launcher mirror these values — if you change one, change both.",
+    "memory_refs": [
+      "feedback_h100_authorized",
+      "feedback_no_resume_data_change",
+      "feedback_no_quantization",
+      "feedback_no_version_in_filename",
+      "feedback_r2_checkpoint",
+      "feedback_one_shot_best",
+      "feedback_background_tasks",
+      "project_alm_lora_pipeline"
+    ]
+  },
+
+  "run_id_template": "alm70b-r1-{date}",
+  "round": 1,
+  "model_tag": "alm70b",
+  "ckpt_label": "production",
+  "ckpt_dir_template": "/workspace/ckpt_alm70b_r1_{date}",
+  "r2_prefix_template": "r2:anima-models/alm70b/r1/step_{step}/",
+
+  "base": {
+    "name": "Qwen/Qwen2.5-72B-Instruct",
+    "total_params": 72700000000,
+    "non_embedding_params": 70000000000,
+    "class_label": "70B (72.7B total)",
+    "dtype": "bf16",
+    "local_dir": "/workspace/qwen72b",
+    "hf_license": "Qwen license (commercial use, notify Alibaba for >100M MAU)",
+    "disk_size_bf16_gb": 145,
+    "verified_at_utc": "2026-04-16T23:45Z (WebFetch HF)",
+    "lineage_14b_a2_tool_r2": "r2:anima-models/alm14b/a2_20260416_tool/step_1500/",
+    "lineage_note": "14B A2-Tool adapter reference is metadata-only, NOT weight-transferred across param-count boundary. 70B adapter trains from scratch on 72B base.",
+    "resume_note": "Fresh-from-base: 70B is a brand-new model class. Per feedback_no_resume_data_change, no resume of 14B adapter allowed — step 0 start."
+  },
+
+  "lora": {
+    "r": 32,
+    "alpha": 64,
+    "alpha_to_r_ratio": 2.0,
+    "dropout": 0.05,
+    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    "target_rationale": "7-module full coverage (attn + MLP). MLP inclusion mandatory at 72B because Qwen2.5 intermediate_size=29568 is where most capacity lives — attn-only LoRA leaves 75% weights untouched.",
+    "trainable_params_estimate": 417000000,
+    "trainable_fraction": 0.0057,
+    "rationale": "r=32 alpha=64 matches 14B r9 canonical config (passed tool-use gate at 0.933 lenient). 14B A2-Orch used r=64 but that was rationalized by Orch-OR latent path; 70B first-round uses more conservative r=32 for 417M trainable (0.57% of 72.7B base)."
+  },
+
+  "training": {
+    "steps": 800,
+    "steps_rationale": "More than r11's 500 because 72B converges slower per step. Hard cap 2000 before abort.",
+    "batch_per_gpu": 1,
+    "n_gpus": 4,
+    "grad_accum": 8,
+    "effective_batch": 8,
+    "tokens_per_step": 8192,
+    "total_tokens_seen_estimate": 6553600,
+    "total_tokens_seen_note": "800 steps × 8192 tokens = 6.55M tokens. At corpus ~4M chars (undersized) = 4-6 epochs — overfit risk unless corpus expands to 40M+ chars.",
+    "seq": 1024,
+    "seq_rationale": "Match 14B r7-r11 baseline. 72B supports 32K native + 128K yarn but activations scale quadratically.",
+    "lr": 3e-7,
+    "lr_rationale": "14B→72B sqrt scaling: 5e-7 / sqrt(72.7/14) = 5e-7 / 2.28 = 2.19e-7 → round up to 3e-7 for safety. Halving fallback to 1.5e-7 if step 50 eval regresses.",
+    "lr_halving_plan": "If eval_loss[50] > eval_loss[10], halt and relaunch at lr=1.5e-7",
+    "lr_schedule": "cosine_with_warmup",
+    "lr_max": 3e-7,
+    "lr_min": 3e-8,
+    "warmup": 80,
+    "warmup_rationale": "10% of 800 total. Matches r11 recovery warmup pattern for post-regression runs.",
+    "optimizer": "AdamW",
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.95,
+    "adam_eps": 1e-8,
+    "weight_decay": 0.1,
+    "grad_clip": 1.0,
+    "dtype": "bf16",
+    "grad_checkpointing": true,
+    "grad_checkpointing_frequency": "every 8 layers",
+    "save_every": 100,
+    "eval_every": 100,
+    "log_every": 10,
+    "patience": 5,
+    "phi_holo_consistency_weight": 0.01
+  },
+
+  "fsdp": {
+    "config_file_at_runtime": "/workspace/alm_70b_fsdp_config.yaml",
+    "config_json_ssot": "training/alm_70b_fsdp_config.json",
+    "shard_strategy": "FULL_SHARD",
+    "mixed_precision_compute": "bf16",
+    "mixed_precision_reduce": "fp32",
+    "backward_prefetch": "BACKWARD_PRE",
+    "limit_all_gathers": true,
+    "use_orig_params": true,
+    "cpu_offload": false,
+    "state_dict_type": "SHARDED_STATE_DICT",
+    "activation_checkpointing": true,
+    "wrap_policy": "TRANSFORMER_BASED_WRAP",
+    "wrap_cls": "Qwen2DecoderLayer"
+  },
+
+  "hardware": {
+    "gpu": "4x H100 SXM 80GB HBM3 NVLink",
+    "node_topology": "single-node NVLink (3.6 TB/s aggregate)",
+    "interconnect_rationale": "Multi-node 2x2 over 100GbE is 72x slower — makes 20h run become 40-60h. Single-node 4xH100 SXM mandatory.",
+    "cpu_cores_min": 32,
+    "ram_gb_min": 256,
+    "ram_gb_recommended": 512,
+    "disk_gb_min": 500,
+    "disk_breakdown": {
+      "72B_base_safetensors": 145,
+      "working_ckpts_8_steps": 40,
+      "corpus_file": 1,
+      "hf_cache": 5,
+      "pip_env": 20,
+      "safety_headroom": 289
+    },
+    "image": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+    "cost_per_hr_usd": 11.96,
+    "cost_per_hr_breakdown": "4 x $2.99 SXM H100 80GB (RunPod listing)",
+    "wall_hours_target": 20,
+    "wall_hours_cap": 40,
+    "cost_target_usd": 240,
+    "cost_cap_usd": 480
+  },
+
+  "corpus": {
+    "path_on_pod": "/workspace/alm_70b_corpus.jsonl",
+    "r2_source": "r2:anima-models/corpus/alm_70b_corpus.jsonl",
+    "target_size_chars_min": 40000000,
+    "target_size_chars_ideal": 100000000,
+    "exception_file_path_if_undersized": "shared/state/alm_70b_corpus_exception.json",
+    "blend": "80% Korean dialogue + 20% hire_sim + reasoning (KoAlpaca, KMMLU, KoBEST)",
+    "format": "ChatML (Qwen2.5 native template)",
+    "preprocessing": [
+      "Dedup by SHA256",
+      "Length filter 100 < chars < 4096",
+      "ChatML role-based messages",
+      "Language mix label for eval stratification"
+    ]
+  },
+
+  "software_stack": {
+    "torch": "2.4.1+cu124",
+    "peft": "0.13.2",
+    "transformers": "4.45.2",
+    "accelerate": ">=0.31.0",
+    "flash_attention_2": "2.6.3",
+    "bitsandbytes": "NOT INSTALLED",
+    "unsloth": "NOT USED (multi-GPU FSDP incompatible)",
+    "liger_kernel": "0.7.0 (optional, FSDP-compat wrap-ordering required)",
+    "deepspeed": "NOT USED"
+  },
+
+  "env_flags": {
+    "HF_HUB_CACHE": "/workspace/hf_cache",
+    "HF_HOME": "/workspace/hf_cache",
+    "TRANSFORMERS_CACHE": "/workspace/hf_cache",
+    "ANIMA_ROOT": "/workspace/anima",
+    "HEXA_CKPT_HOOK": "/workspace/anima/scripts/ckpt_backup_hook.hexa",
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    "NCCL_DEBUG": "INFO",
+    "NCCL_P2P_LEVEL": "NVL",
+    "NCCL_IB_DISABLE": "0",
+    "NCCL_TIMEOUT": "1800",
+    "TOKENIZERS_PARALLELISM": "false",
+    "OMP_NUM_THREADS": "8",
+    "USER_OK_4POD": "1 (required at launch; launcher refuses if unset)"
+  },
+
+  "evaluation": {
+    "ce_loss_target_step_800": 1.5,
+    "hire_sim_target_step_800_lenient": 0.90,
+    "hire_sim_floor_step_200_lenient": 0.80,
+    "phi_holo_target_step_800": 3000,
+    "memory_footprint_cap_per_gpu_gb": 75,
+    "early_abort_gates": [
+      "step 50: eval_loss[50] > eval_loss[10] -> halve LR + relaunch",
+      "step 150: ce_loss[150] >= base_ce_loss -> halt + diagnose",
+      "step 200: hire_sim[200] < 0.80 lenient -> halt (recipe broken)",
+      "any step: peak VRAM > 78GB -> reduce batch or grad_ckpt frequency"
+    ]
+  },
+
+  "hooks": {
+    "ckpt_backup_hook": "scripts/ckpt_backup_hook.hexa",
+    "invoked_by": "accelerate trainer callback on save_state",
+    "label_routing": "production -> R2 permanent upload per ckpt_policy.json",
+    "naming_regex": "^alm70b-r1-[0-9]{8}$"
+  },
+
+  "blocks": {
+    "forbidden_markers": [
+      "/workspace/READY_FOR_32B",
+      "/workspace/READY_FOR_R5_KBASE"
+    ],
+    "requires_user_ok_env": "USER_OK_4POD=1",
+    "requires_72b_base_local": "/workspace/qwen72b/config.json must exist AND du -sBG >= 140",
+    "requires_4_gpu_visible": "nvidia-smi --list-gpus | wc -l == 4",
+    "requires_all_gpus_idle": "utilization <= 5% AND memory_used <= 2000 MiB on all 4",
+    "requires_disk_500gb": "df -BG /workspace available >= 500"
+  },
+
+  "wall": {
+    "hours_target": 20,
+    "hours_cap": 40,
+    "cost_usd_target": 240,
+    "cost_usd_cap": 480,
+    "cost_per_hr_usd": 11.96
+  },
+
+  "dependencies_chain": [
+    "S0: ALM 14B A1 (Qwen2.5-14B + r4 LoRA) step 3000 done",
+    "S1: ALM 14B A2-Orch (A1 + Orch-OR LoRA) step 3000 done",
+    "S2: ALM 14B A2-Tool (A1+A2-Orch + tool-use LoRA) step 1500 done",
+    "S3: A2 final eval hire_sim lenient >= 0.85 (gate G1)",
+    "S4: FSDP 14B 2xH100 smoke pass (gate G5)",
+    "S5: Corpus expansion 40M+ chars OR exception file (gate G2, warning)",
+    "S6: User OK for 4-pod config (gate G4, USER_OK_4POD=1)",
+    "S7: 4xH100 SXM pod allocated (gate G3)",
+    "S8: Qwen2.5-72B-Instruct downloaded to /workspace/qwen72b (gate G6)",
+    "S9: launcher + FSDP config + preflight dry-run PASS (gate G7)",
+    "S10: LAUNCH"
+  ]
+}

@@ -1,0 +1,241 @@
+// training/watch_a2_fire_13b.hexa — A2-Tool completion watcher + 13B auto-fire
+//
+// Purpose:
+//   Detect A2-Tool step_1500 completion AND verify the post-A2 hire_sim_lenient
+//   evaluation score lands in the borderline band [0.85, 0.93). Only then fire
+//   launch_alm_13b.hexa automatically. Otherwise wait for operator decision.
+//
+// IMPORTANT — DISABLED BY DEFAULT:
+//   Per user task spec: "작성은 하되 기본 disabled flag". Launch is gated on
+//   env ENABLE_13B_AUTOFIRE=1. Operator must explicitly opt in. Rationale:
+//   13B intermediate is a CONDITIONAL cost hop ($36) — auto-fire without
+//   human review of A2 eval risks spending $36 when A2 already exceeds 0.93
+//   (should go direct to 70B) OR when A2 failed (should halt, not chain).
+//
+// Detection signals (ALL required):
+//   1. /workspace/ckpt_alm14b_phi_a2_tool_*/step_1500/adapter_config.json
+//   2. /workspace/ckpt_alm14b_phi_a2_tool_*/READY_A2_TOOL_DONE marker
+//   3. Post-A2 hire_sim_lenient eval completed (hire_sim_lenient_*.json present)
+//   4. A2 eval score in [0.85, 0.93) band
+//
+// GPU idle gate: util<5% AND mem<2GB used (same as watch_a1_fire_a2.hexa)
+//
+// Run (pod-side, only if operator enables):
+//   ENABLE_13B_AUTOFIRE=1 tmux new -d -s watch_13b \
+//       'cd /workspace/anima && hexa run training/watch_a2_fire_13b.hexa'
+//
+// Env overrides:
+//   POLL_SECONDS           default 120  — between checks (slow poll, rare event)
+//   MAX_WAIT_HOURS         default 48   — A2-Tool can take up to ~36h end-to-end
+//   ENABLE_13B_AUTOFIRE    default 0    — MUST BE 1 to actually fire
+//   A2_EVAL_RESULT_GLOB    default /workspace/hire_sim_lenient_*.json
+//   DRY_RUN                default 0    — log detection but do not fire
+//
+// Exit conditions:
+//   - A2 eval PASS_HIGH (>=0.93) → log recommendation "skip 13B, launch 70B", exit
+//   - A2 eval FAIL (<0.85) → log "halt + redesign", exit
+//   - A2 eval BORDERLINE [0.85, 0.93) → fire launch_alm_13b.hexa (if enabled)
+//   - Timeout → write /workspace/WATCHER_13B_STALLED marker, exit
+
+let POLL_SECONDS_DEFAULT = 120
+let MAX_WAIT_HOURS_DEFAULT = 48
+let HIRE_SIM_PASS_HIGH = 0.93
+let HIRE_SIM_PASS_LOW  = 0.85
+
+fn log_line(msg) {
+    let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+    let full = "[" + ts + "] [watch_13b] " + msg
+    println(full)
+    exec("echo '" + full.replace("'", "'\\''") + "' >> /workspace/watch_a2_fire_13b.log 2>/dev/null || true")
+}
+
+fn env_int(name, default_val) {
+    let v = env(name)
+    if v == "" { return default_val }
+    let n = to_int(v)
+    if n <= 0 { return default_val }
+    return n
+}
+
+fn a2_tool_done() -> bool {
+    let probe = exec("ls /workspace/ckpt_alm14b_phi_a2_tool_*/step_1500/adapter_config.json 2>/dev/null | head -n1").trim()
+    if len(probe) > 0 { return true }
+    let marker = exec("ls /workspace/ckpt_alm14b_phi_a2_tool_*/READY_A2_TOOL_DONE 2>/dev/null | head -n1").trim()
+    if len(marker) > 0 { return true }
+    return false
+}
+
+fn gpu_is_idle() -> bool {
+    let util_raw = exec("nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -n1").trim()
+    let used_raw = exec("nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -n1").trim()
+    if util_raw == "" { return false }
+    if used_raw == "" { return false }
+    let util = to_int(util_raw)
+    let used = to_int(used_raw)
+    if util > 5 { return false }
+    if used > 2000 { return false }
+    return true
+}
+
+fn str_contains_s(hay, needle) -> bool {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return true }
+    let mut i = 0
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// Extract "pass_rate" or "avg_score" or "score" from hire_sim_lenient JSON output.
+fn extract_float_after(text, marker) -> float {
+    let pos = str_index_of(text, marker, 0)
+    if pos < 0 { return -1.0 }
+    let after = text.substring(pos + len(marker), len(text))
+    let alen = len(after)
+    let mut i = 0
+    // skip whitespace + colon
+    while i < alen {
+        let c = after.substring(i, i + 1)
+        if c == ":" || c == " " || c == "\t" { i = i + 1 } else { break }
+    }
+    let mut buf = ""
+    while i < alen {
+        let c = after.substring(i, i + 1)
+        if c == "," || c == "}" || c == "\n" { break }
+        buf = buf + c
+        i = i + 1
+    }
+    if len(buf) == 0 { return -1.0 }
+    return parse_float(buf)
+}
+
+fn str_index_of(hay, needle, from) {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return from }
+    let mut i = from
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// Find most recent hire_sim_lenient_*.json and read its score.
+// Returns -1.0 if not found.
+fn read_latest_a2_eval() -> float {
+    let glob_default = "/workspace/hire_sim_lenient_*.json"
+    let glob = if env("A2_EVAL_RESULT_GLOB") != "" { env("A2_EVAL_RESULT_GLOB") } else { glob_default }
+    // find newest matching file
+    let cmd = "ls -t " + glob + " 2>/dev/null | head -n1"
+    let path = exec(cmd).trim()
+    if len(path) == 0 { return -1.0 }
+    if !file_exists(path) { return -1.0 }
+    let body = read_file(path)
+    // hire_sim_lenient.hexa canonical field is "avg_score" (line 821).
+    let s1 = extract_float_after(body, "\"avg_score\"")
+    if s1 >= 0.0 { return s1 }
+    let s2 = extract_float_after(body, "\"pass_rate\"")
+    if s2 >= 0.0 { return s2 }
+    let s3 = extract_float_after(body, "\"score\"")
+    if s3 >= 0.0 { return s3 }
+    return -1.0
+}
+
+fn fire_13b(a2_score) -> bool {
+    log_line("firing 13B intermediate (tmux session: alm-13b)")
+    log_line("  A2 eval score = " + to_string(a2_score) + " (borderline band)")
+    if env("DRY_RUN") == "1" {
+        log_line("DRY_RUN=1 — would exec: ENABLE_13B_AUTOFIRE=1 ALM13B_A2_EVAL_SCORE=" + to_string(a2_score) + " tmux new -d -s alm-13b 'cd /workspace/anima && hexa run training/launch_alm_13b.hexa 2>&1 | tee /workspace/alm_13b.log'")
+        return true
+    }
+    let cmd = "ALM13B_A2_EVAL_SCORE=" + to_string(a2_score) + " tmux new -d -s alm-13b 'cd /workspace/anima && ALM13B_A2_EVAL_SCORE=" + to_string(a2_score) + " hexa run training/launch_alm_13b.hexa 2>&1 | tee /workspace/alm_13b.log; echo [WATCHER] 13B session ended; sleep 3600'"
+    let out = exec(cmd + "; echo RC=$?")
+    if !str_contains_s(out, "RC=0") {
+        log_line("FAIL: tmux new for 13B returned non-zero: " + out.substring(0, 200))
+        return false
+    }
+    log_line("13B intermediate tmux session launched")
+    return true
+}
+
+fn main() {
+    let enable = env("ENABLE_13B_AUTOFIRE") == "1"
+    let poll_s = env_int("POLL_SECONDS", POLL_SECONDS_DEFAULT)
+    let max_wait_h = env_int("MAX_WAIT_HOURS", MAX_WAIT_HOURS_DEFAULT)
+
+    log_line("=== watch_a2_fire_13b START ===")
+    log_line("poll_s=" + to_string(poll_s) + " max_wait_h=" + to_string(max_wait_h) + " enable=" + to_string(enable))
+
+    if !enable {
+        log_line("ENABLE_13B_AUTOFIRE != 1 — RUNNING IN OBSERVE-ONLY MODE")
+        log_line("Watcher will log detection signals + A2 eval verdict but NOT fire 13B")
+        log_line("Set ENABLE_13B_AUTOFIRE=1 to enable auto-fire in borderline band")
+    }
+
+    let max_iterations = (max_wait_h * 3600) / poll_s
+    let mut iteration = 0
+    let mut fired = false
+
+    while iteration < max_iterations {
+        let a2_done = a2_tool_done()
+        if a2_done {
+            let score = read_latest_a2_eval()
+            if score < 0.0 {
+                if iteration % 5 == 0 {
+                    log_line("A2-Tool done but hire_sim_lenient JSON missing — waiting for eval run")
+                }
+            } else {
+                // We have A2 eval. Branch.
+                if score >= HIRE_SIM_PASS_HIGH {
+                    log_line("A2 eval = " + to_string(score) + " >= 0.93 (PASS_HIGH)")
+                    log_line("RECOMMENDATION: skip 13B intermediate, launch 70B direct")
+                    log_line("=== watcher EXITING (13B not needed) ===")
+                    return
+                }
+                if score < HIRE_SIM_PASS_LOW {
+                    log_line("A2 eval = " + to_string(score) + " < 0.85 (FAIL)")
+                    log_line("RECOMMENDATION: halt + redesign (do NOT launch 13B or 70B)")
+                    log_line("=== watcher EXITING (recipe failed) ===")
+                    return
+                }
+                // borderline band
+                log_line("A2 eval = " + to_string(score) + " in [0.85, 0.93) (BORDERLINE)")
+                if !enable {
+                    log_line("OBSERVE_MODE — would fire 13B. Operator must re-invoke with ENABLE_13B_AUTOFIRE=1")
+                    log_line("=== watcher EXITING (observe-only verdict delivered) ===")
+                    return
+                }
+                // GPU idle preflight
+                exec("sleep 30")
+                if !gpu_is_idle() {
+                    log_line("GPU not idle (A2-Tool flushing?) — recheck next iter")
+                } else {
+                    if fire_13b(score) {
+                        fired = true
+                        log_line("13B intermediate fired — watcher EXITING")
+                        return
+                    } else {
+                        log_line("13B fire FAILED — retry next iter")
+                    }
+                }
+            }
+        }
+
+        if iteration % 5 == 0 {
+            let a2_str = if a2_done { "yes" } else { "no" }
+            let gpu_str = if gpu_is_idle() { "yes" } else { "no" }
+            log_line("poll#" + to_string(iteration) + " a2_tool_done=" + a2_str + " gpu_idle=" + gpu_str + " fired=" + to_string(fired))
+        }
+        exec("sleep " + to_string(poll_s))
+        iteration = iteration + 1
+    }
+
+    // Timeout
+    log_line("ERROR: max_wait_h=" + to_string(max_wait_h) + "h exceeded without launching 13B")
+    exec("touch /workspace/WATCHER_13B_STALLED")
+    log_line("=== watcher STALLED (marker written) ===")
+}

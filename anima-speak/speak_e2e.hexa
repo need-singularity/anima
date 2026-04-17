@@ -18,7 +18,7 @@
 //   smoke-testable without real models / weights / network. Real backends
 //   are wired by env vars:
 //       SPEAK_STT_BACKEND  ∈ {mock, whisper}
-//       SPEAK_TTS_BACKEND  ∈ {mock, vocoder}
+//       SPEAK_TTS_BACKEND  ∈ {mock, vocoder, klatt}
 //       SPEAK_MODEL_ENDPOINT  e.g. http://localhost:8090/generate
 //       SPEAK_MODEL_KIND   ∈ {clm, alm}  (informational only)
 //
@@ -516,6 +516,17 @@ fn save_wav_mock(path: string, blob: WavBlob) -> bool {
     if len(blob.samples) > 0 {
         return write_wav(path, blob.samples, blob.sample_rate)
     }
+    // Klatt bridge path (S-P2-1): WAV already written to a temp file by
+    // tts_klatt_bridge.hexa. Copy it to the final output path.
+    if len(blob.payload_text) > 6 {
+        let prefix = blob.payload_text.substring(0, 6)
+        if prefix == "klatt:" {
+            let src = blob.payload_text.substring(6, len(blob.payload_text))
+            let cmd = "cp " + src + " " + path
+            let _ = exec(cmd)
+            return true
+        }
+    }
     // Legacy mock path: ASCII-only fingerprint for determinism tests.
     let header = "RIFF-MOCK\n"
                + "sample_rate=" + to_string(blob.sample_rate) + "\n"
@@ -835,12 +846,58 @@ fn tts_synthesize_vocoder(reply_text: string) -> TtsResult {
 
 // Public-facing TTS entry point.
 //   SPEAK_TTS_BACKEND=vocoder   → tts_synthesize_vocoder (Mk.III native, DEFAULT)
+//   SPEAK_TTS_BACKEND=klatt     → Klatt source-filter + WaveRNN via tts_klatt_bridge.hexa (S-P2-1)
 //   SPEAK_TTS_BACKEND=mock      → tts_synthesize_mock (deterministic stub)
 fn tts_synthesize(reply_text: string) -> TtsResult {
     let backend = env("SPEAK_TTS_BACKEND")
     if backend == "" { backend = "vocoder" }
     if backend == "mock" {
         return tts_synthesize_mock(reply_text)
+    }
+    if backend == "klatt" {
+        // S-P2-1: Klatt source-filter + WaveRNN fallback path.
+        // Invokes tts_klatt_bridge.hexa as a standalone process (stage0 has no
+        // cross-file imports). The bridge writes a real PCM16 WAV to tmp, which
+        // we then reference for the E2E pipeline output.
+        let tmp = "/tmp/speak_klatt_out.wav"
+        let hexa_bin = env("HEXA")
+        let hexa_cmd = if hexa_bin != "" { hexa_bin } else { "hexa" }
+        let cmd = hexa_cmd + " run anima-speak/tts_klatt_bridge.hexa --text \"" + reply_text + "\" --out " + tmp
+        let result = exec(cmd)
+        // Check if the WAV file was written by examining file existence
+        let size_check = exec("test -f " + tmp + " && echo ok || echo fail")
+        if len(size_check) > 0 {
+            let first2 = size_check.substring(0, 2)
+            if first2 == "ok" {
+                // WAV exists — build a TtsResult with klatt sentinel.
+                // The actual PCM samples live on disk at tmp; save_wav_mock
+                // will copy the file at write time when payload_text starts
+                // with "klatt:" instead of re-encoding.
+                let blob = WavBlob {
+                    sample_rate: SPEAK_SAMPLE_RATE,
+                    channels: SPEAK_CHANNELS,
+                    bits: SPEAK_BITS_PER_SAMPLE,
+                    n_samples: 0,
+                    payload_text: "klatt:" + tmp,
+                    samples: []
+                }
+                return TtsResult {
+                    audio: blob,
+                    backend: "klatt",
+                    latency_ms: MOCK_TTS_LATENCY_MS,
+                    ok: true
+                }
+            }
+        }
+        // Klatt bridge failed — fall back to mock (I5: no panics)
+        println("[speak_e2e] klatt bridge failed, falling back to mock")
+        let mock = tts_synthesize_mock(reply_text)
+        return TtsResult {
+            audio: mock.audio,
+            backend: "klatt-fallback",
+            latency_ms: mock.latency_ms,
+            ok: true
+        }
     }
     if backend == "vocoder" {
         // Real Mk.III path — hexa-native neural_vocoder.decode_wave.
@@ -861,15 +918,159 @@ fn tts_synthesize(reply_text: string) -> TtsResult {
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  Section 8. Streaming hook (optional, mock path only)
+//  Section 8. Streaming hook (HTTP SSE + mock fallback)
 // ════════════════════════════════════════════════════════════════════
 
-// Optional byte-level streaming hook — splits the LLM reply into chunks
-// of CHUNK_BYTES and feeds each chunk to TTS individually. Not enabled
-// by default. Real CLM streaming (token-by-token via SSE) requires the
-// http-bridge backend to land; documented as TODO until then.
+// Streaming LLM→TTS pipeline. Two paths:
+//
+//   (A) HTTP SSE path  — SPEAK_LLM_BACKEND=http + SPEAK_MODEL_ENDPOINT set:
+//       curl --no-buffer streams tokens from /generate_stream, each SSE
+//       "data:" line is decoded, fed to tts_synthesize() (real Mk.III
+//       vocoder), and the resulting PCM is appended to the streaming PCM
+//       sink (SPEAK_PCM_OUT_PATH, default /tmp/anima_speak_stream.pcm).
+//
+//   (B) Mock fallback — splits pre-existing reply into fixed-size chunks
+//       and calls tts_synthesize_mock(). No network, no PCM file.
+//
+// Returns the number of chunks emitted.
+
+// Helper: append fp32 samples as raw PCM s16le to the streaming sink.
+// Uses base64 intermediate because hexa strings are null-terminated (no
+// raw binary). Each call appends — the sink grows across chunks.
+fn pcm_append_to_sink(samples: [float], sink_path: string) -> int {
+    if len(samples) == 0 { return 0 }
+    // Build s16le bytes via the same wav-byte infrastructure, but skip the
+    // WAV header — we want raw PCM only.  Clamp float [-1,1] → int16.
+    let mut pcm_bytes = []
+    let mut si = 0
+    while si < len(samples) {
+        let mut sv = samples[si]
+        if sv > 1.0 { sv = 1.0 }
+        if sv < -1.0 { sv = -1.0 }
+        let iv = to_int(sv * 32767.0)
+        // Little-endian int16: low byte, high byte
+        let mut lo = iv % 256
+        let mut hi = iv / 256
+        if iv < 0 {
+            // Two's complement for negative values already handled by
+            // to_int on the product, but we need unsigned bytes.
+            let mut uv = iv + 65536
+            lo = uv % 256
+            hi = uv / 256
+        }
+        pcm_bytes = pcm_bytes.push(lo)
+        pcm_bytes = pcm_bytes.push(hi)
+        si = si + 1
+    }
+    let b64 = bytes_to_b64(pcm_bytes)
+    let tmp = sink_path + ".chunk.b64"
+    write_file(tmp, b64)
+    // Append-mode redirect (>>)  — grows the sink across chunks.
+    let cmd = "base64 -d -i " + tmp + " >> " + sink_path + " && rm -f " + tmp
+    let _ = exec(cmd)
+    return len(samples) * 2
+}
+
 fn maybe_stream_chunks(reply: string, enable: bool) -> int {
     if !enable { return 0 }
+
+    let mut backend = env("SPEAK_LLM_BACKEND")
+    let mut endpoint = env("SPEAK_MODEL_ENDPOINT")
+
+    // ── Path A: real HTTP SSE streaming ──────────────────────────────
+    if backend == "http" && endpoint != "" {
+        let mut pcm_out = env("SPEAK_PCM_OUT_PATH")
+        if pcm_out == "" { pcm_out = "/tmp/anima_speak_stream.pcm" }
+
+        // Truncate the sink at the start of a new stream session.
+        let _ = exec("rm -f " + pcm_out + " && touch " + pcm_out)
+
+        // Build the SSE streaming curl request.
+        let escaped = json_escape(reply)
+        let body = "{\"prompt\":\"" + escaped + "\",\"max_tokens\":256,\"temperature\":0.8,\"stream\":true}"
+        let cmd = "curl -sX POST " + endpoint + "/generate_stream"
+                + " -H 'Content-Type: application/json'"
+                + " -H 'Accept: text/event-stream'"
+                + " -d '" + body + "'"
+                + " --no-buffer"
+                + " --connect-timeout 10 --max-time 60 2>/dev/null"
+        let raw = exec(cmd)
+
+        // Parse SSE lines: each "data: {\"text\":\"...\"}" is one chunk.
+        // We split on newlines and extract the token text from each line.
+        let mut emitted = 0
+        let mut total_bytes = 0
+        let mut pos = 0
+        let raw_len = len(raw)
+
+        while pos < raw_len {
+            // Find next newline to isolate one SSE line.
+            let mut eol = pos
+            while eol < raw_len {
+                let ch = raw.substring(eol, eol + 1)
+                if ch == "\n" { break }
+                eol = eol + 1
+            }
+            let line = raw.substring(pos, eol)
+            pos = eol + 1
+
+            // SSE format: lines starting with "data: " carry payload.
+            let data_prefix = "data: "
+            if len(line) <= len(data_prefix) {
+                // Skip empty / comment / event-type lines.
+                pos = pos
+            } else {
+                let line_head = line.substring(0, len(data_prefix))
+                if line_head == data_prefix {
+                    let json_part = line.substring(len(data_prefix), len(line))
+
+                    // Check for SSE stream terminator "[DONE]"
+                    if json_part == "[DONE]" {
+                        // Stream complete — break out.
+                        pos = raw_len
+                    } else {
+                        // Extract "text" field from the JSON chunk.
+                        let marker = "\"text\":\""
+                        let mpos = json_part.index_of(marker)
+                        if mpos >= 0 {
+                            let after = json_part.substring(mpos + len(marker), len(json_part))
+                            // Read until unescaped closing quote.
+                            let mut tend = 0
+                            let alen = len(after)
+                            while tend < alen {
+                                let tc = after.substring(tend, tend + 1)
+                                if tc == "\"" { break }
+                                if tc == "\\" { tend = tend + 2 } else { tend = tend + 1 }
+                            }
+                            let token = after.substring(0, tend)
+
+                            if len(token) > 0 {
+                                // Synthesize this chunk through the real vocoder.
+                                let tts = tts_synthesize(token)
+                                // Append PCM samples to the streaming sink.
+                                if tts.ok && len(tts.audio.samples) > 0 {
+                                    let chunk_bytes = pcm_append_to_sink(tts.audio.samples, pcm_out)
+                                    total_bytes = total_bytes + chunk_bytes
+                                }
+                                emitted = emitted + 1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Metrics: write a small sidecar so callers can inspect throughput.
+        // Root cause of sidecar: streaming is async-ish, callers need post-hoc stats.
+        let metrics = "{\"chunks\":" + to_string(emitted)
+                    + ",\"pcm_bytes\":" + to_string(total_bytes)
+                    + ",\"sink\":\"" + pcm_out + "\"}"
+        write_file(pcm_out + ".meta.json", metrics)
+
+        return emitted
+    }
+
+    // ── Path B: mock fallback (no HTTP backend) ─────────────────────
     let chunk_bytes = 16
     let n = len(reply)
     let mut emitted = 0
@@ -1041,7 +1242,8 @@ fn print_usage() {
     println("  SPEAK_MODEL_ENDPOINT  default endpoint (overridden by --endpoint)")
     println("  SPEAK_MODEL_KIND      clm | alm  (informational)")
     println("  SPEAK_STT_BACKEND     mock | whisper        (default mock)")
-    println("  SPEAK_TTS_BACKEND     mock | vocoder        (default mock)")
+    println("  SPEAK_TTS_BACKEND     mock | vocoder | klatt (default vocoder)")
+    println("                        klatt = Klatt source-filter + WaveRNN fallback (S-P2-1)")
     println("  SPEAK_LLM_BACKEND     mock | http           (default mock)")
 }
 

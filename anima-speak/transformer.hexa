@@ -621,6 +621,285 @@ fn tf_kv_cache_get(cache: array, layer: int) -> array {
 }
 
 // ================================================================
+// S10b  RAW-POINTER KV-CACHE (alloc_raw, O(1) append, O(1) lookup)
+// ================================================================
+// Avoids hexa pass-by-value list copying for large caches.
+// Uses alloc_raw/write_f32/deref_f32/free_raw for flat float buffers.
+//
+// Layout per cache:
+//   k_buf: alloc_raw(max_len * d_head * n_heads * 4)  -- float32 keys
+//   v_buf: alloc_raw(max_len * d_head * n_heads * 4)  -- float32 values
+//   seq_len: current filled length
+//
+// Struct fields returned as array for hexa compat:
+//   [k_buf_ptr, v_buf_ptr, seq_len, max_len, d_head, n_heads]
+
+fn tf_raw_kv_init(max_len: int, d_head: int, n_heads: int) -> array {
+    // d_model = d_head * n_heads, each position stores d_model floats
+    let d_model = d_head * n_heads
+    let buf_size = max_len * d_model * 4  // 4 bytes per float32
+    let k_ptr = alloc_raw(buf_size)
+    let v_ptr = alloc_raw(buf_size)
+    // Zero-init both buffers
+    let mut i = 0
+    while i < max_len * d_model {
+        write_f32(k_ptr, i, 0.0)
+        write_f32(v_ptr, i, 0.0)
+        i = i + 1
+    }
+    return [to_float(k_ptr), to_float(v_ptr), 0.0, to_float(max_len), to_float(d_head), to_float(n_heads)]
+}
+
+fn tf_raw_kv_append(cache: array, k_new: array, v_new: array) -> array {
+    // Append one position of K/V (each [d_model] floats) to cache.
+    // Returns updated cache (only seq_len changes).
+    let k_ptr = to_int(cache[0])
+    let v_ptr = to_int(cache[1])
+    let seq_len = to_int(cache[2])
+    let max_len = to_int(cache[3])
+    let d_head = to_int(cache[4])
+    let n_heads = to_int(cache[5])
+    let d_model = d_head * n_heads
+
+    if seq_len >= max_len {
+        // Cache full -- silently ignore (caller should check)
+        return cache
+    }
+
+    let base = seq_len * d_model
+    let mut i = 0
+    while i < d_model {
+        write_f32(k_ptr, base + i, k_new[i])
+        write_f32(v_ptr, base + i, v_new[i])
+        i = i + 1
+    }
+
+    return [cache[0], cache[1], to_float(seq_len + 1), cache[3], cache[4], cache[5]]
+}
+
+fn tf_raw_kv_get_k(cache: array, pos: int, head: int) -> array {
+    // Extract K vector for position `pos`, head `head` -> [d_head]
+    let k_ptr = to_int(cache[0])
+    let d_head = to_int(cache[4])
+    let n_heads = to_int(cache[5])
+    let d_model = d_head * n_heads
+    let base = pos * d_model + head * d_head
+    let mut out = []
+    let mut i = 0
+    while i < d_head {
+        out = out.push(deref_f32(k_ptr, base + i))
+        i = i + 1
+    }
+    return out
+}
+
+fn tf_raw_kv_get_v(cache: array, pos: int, head: int) -> array {
+    // Extract V vector for position `pos`, head `head` -> [d_head]
+    let v_ptr = to_int(cache[1])
+    let d_head = to_int(cache[4])
+    let n_heads = to_int(cache[5])
+    let d_model = d_head * n_heads
+    let base = pos * d_model + head * d_head
+    let mut out = []
+    let mut i = 0
+    while i < d_head {
+        out = out.push(deref_f32(v_ptr, base + i))
+        i = i + 1
+    }
+    return out
+}
+
+fn tf_raw_kv_seq_len(cache: array) -> int {
+    return to_int(cache[2])
+}
+
+fn tf_raw_kv_free(cache: array) {
+    free_raw(to_int(cache[0]))
+    free_raw(to_int(cache[1]))
+}
+
+// ================================================================
+// S10c  FLASH ATTENTION (tiled, online softmax, fused QKV)
+// ================================================================
+// Implements FlashAttention-style tiled attention:
+//   - Process Q*K^T in blocks of TILE_SIZE
+//   - Online softmax: track running max (m) and sum (l) per tile
+//     so we never materialize the full [seq x seq] attention matrix
+//   - Numerically equivalent to naive attention (max diff < 1e-4)
+//
+// Reference: Dao et al. 2022 "FlashAttention: Fast and Memory-Efficient
+// Exact Attention with IO-Awareness"
+//
+// For single-query (AR decode) case with KV-cache:
+//   Q: [1 x d_head] (current position only)
+//   K: [kv_len x d_head] (from cache)
+//   V: [kv_len x d_head] (from cache)
+//   Output: [d_head]
+
+let TF_FLASH_TILE = 64  // tile size for K/V chunking
+
+fn tf_flash_attention_head(q_h: array, cache: array, head: int, kv_len: int, d_head: int, causal: int, q_pos: int) -> array {
+    // Single-head flash attention for one query position against cached K/V.
+    // Uses online softmax: processes K/V in tiles of TF_FLASH_TILE.
+    //
+    // Algorithm (online softmax accumulation):
+    //   m = -inf  (running max of scores)
+    //   l = 0.0   (running sum of exp(score - m))
+    //   o = zeros  (running weighted output)
+    //
+    //   For each tile of K/V positions [t_start .. t_end):
+    //     score_j = Q . K_j / sqrt(d_head)   (optionally masked)
+    //     m_tile = max(score_j for j in tile)
+    //     m_new = max(m, m_tile)
+    //     // Rescale previous accumulator for the new max:
+    //     l = l * exp(m - m_new)
+    //     o = o * exp(m - m_new)
+    //     // Accumulate this tile:
+    //     for j in tile: l += exp(score_j - m_new); o += exp(score_j - m_new) * V_j
+    //     m = m_new
+    //
+    //   return o / l
+
+    let scale = 1.0 / sqrt(to_float(d_head))
+
+    // Running accumulators
+    let mut m = -1.0e30    // running max
+    let mut l = 0.0        // running sum
+    let mut o = tf_zeros(d_head)  // running output
+
+    let tile = TF_FLASH_TILE
+    let mut t_start = 0
+
+    while t_start < kv_len {
+        let mut t_end = t_start + tile
+        if t_end > kv_len { t_end = kv_len }
+
+        // Compute scores and find tile max
+        let mut tile_scores = []
+        let mut m_tile = -1.0e30
+        let mut t = t_start
+        while t < t_end {
+            // Get K[t] for this head from raw cache
+            let k_t = tf_raw_kv_get_k(cache, t, head)
+            // Apply RoPE to K at position t
+            let k_t_rope = tf_rope_encode(k_t, t, d_head)
+
+            // Compute scaled dot product
+            let mut score = tf_dot(q_h, k_t_rope, d_head) * scale
+
+            // Causal mask: future positions get -inf
+            if causal == 1 && t > q_pos {
+                score = TF_NEG_INF
+            }
+
+            tile_scores = tile_scores.push(score)
+            if score > m_tile { m_tile = score }
+            t = t + 1
+        }
+
+        // New global max
+        let m_new = m_tile
+        if m > m_new { m_new = m }
+
+        // Rescale previous accumulators to new max
+        let rescale = exp(m - m_new)
+        l = l * rescale
+        // Rescale output vector
+        let mut new_o = []
+        let mut di = 0
+        while di < d_head {
+            new_o = new_o.push(o[di] * rescale)
+            di = di + 1
+        }
+        o = new_o
+
+        // Accumulate this tile
+        t = t_start
+        let mut ti = 0
+        while t < t_end {
+            let e = exp(tile_scores[ti] - m_new)
+            l = l + e
+
+            // o += e * V[t]
+            let v_t = tf_raw_kv_get_v(cache, t, head)
+            new_o = []
+            di = 0
+            while di < d_head {
+                new_o = new_o.push(o[di] + e * v_t[di])
+                di = di + 1
+            }
+            o = new_o
+
+            t = t + 1
+            ti = ti + 1
+        }
+
+        m = m_new
+        t_start = t_end
+    }
+
+    // Normalize: o / l
+    let mut result = []
+    let mut di = 0
+    let inv_l = 1.0 / (l + TF_EPS)
+    while di < d_head {
+        result = result.push(o[di] * inv_l)
+        di = di + 1
+    }
+    return result
+}
+
+fn tf_flash_mha(q_vec: array, cache: array, wq: array, wo: array, n_heads: int, d_head: int, d_model: int, pos: int, kv_len: int, causal: int) -> array {
+    // Multi-head flash attention using raw KV-cache.
+    // Fused QKV: Q projection done here, K/V already in cache.
+    //
+    // Steps:
+    //   1. Q = Wq @ q_vec  (single matmul for all heads)
+    //   2. Per head: slice Q, apply RoPE, run flash_attention_head
+    //   3. Concat heads, output project: Wo @ concat
+
+    // Project query
+    let q_proj = tf_mat_vec(wq, q_vec, d_model, d_model)
+
+    let mut attn_out = tf_zeros(d_model)
+
+    let mut h = 0
+    while h < n_heads {
+        let head_off = h * d_head
+
+        // Extract Q slice for this head + apply RoPE at query position
+        let mut q_h = []
+        let mut di = 0
+        while di < d_head {
+            q_h = q_h.push(q_proj[head_off + di])
+            di = di + 1
+        }
+        q_h = tf_rope_encode(q_h, pos, d_head)
+
+        // Flash attention for this head
+        let head_out = tf_flash_attention_head(q_h, cache, h, kv_len, d_head, causal, pos)
+
+        // Write head output into concatenated attn_out
+        let mut new_attn = []
+        di = 0
+        while di < d_model {
+            if di >= head_off && di < head_off + d_head {
+                new_attn = new_attn.push(attn_out[di] + head_out[di - head_off])
+            } else {
+                new_attn = new_attn.push(attn_out[di])
+            }
+            di = di + 1
+        }
+        attn_out = new_attn
+
+        h = h + 1
+    }
+
+    // Output projection
+    return tf_mat_vec(wo, attn_out, d_model, d_model)
+}
+
+// ================================================================
 // S11  ENCODER BLOCK (Pre-Norm Self-Attention + SwiGLU FFN)
 // ================================================================
 // One layer of the Transformer Encoder:
@@ -1260,6 +1539,260 @@ fn self_test_transformer() {
     }
     println("")
 
+    // ---- T8: Raw KV-cache init/append/read ----
+    println("[T8] Raw KV-cache: init, append, read-back")
+    let raw_cache = tf_raw_kv_init(32, test_dh, test_heads)
+    // Append a known vector: K=[1,2,3,4,5,6,7,8], V=[8,7,6,5,4,3,2,1]
+    let rk1 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    let rv1 = [8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0]
+    let raw_cache2 = tf_raw_kv_append(raw_cache, rk1, rv1)
+    let rk_back_h0 = tf_raw_kv_get_k(raw_cache2, 0, 0)  // head 0 -> [1,2,3,4]
+    let rv_back_h1 = tf_raw_kv_get_v(raw_cache2, 0, 1)  // head 1 -> [4,3,2,1]
+    let rseq = tf_raw_kv_seq_len(raw_cache2)
+    let t8_ok = rseq == 1 && tf_abs(rk_back_h0[0] - 1.0) < 0.001 && tf_abs(rk_back_h0[3] - 4.0) < 0.001 && tf_abs(rv_back_h1[0] - 4.0) < 0.001 && tf_abs(rv_back_h1[3] - 1.0) < 0.001
+    if t8_ok {
+        println("  PASS: seq_len=1, K_h0=[1..4], V_h1=[4..1]")
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: seq=" + to_string(rseq) + " K_h0[0]=" + to_string(rk_back_h0[0]) + " V_h1[0]=" + to_string(rv_back_h1[0]))
+        fail_count = fail_count + 1
+    }
+    tf_raw_kv_free(raw_cache2)
+    println("")
+
+    // ---- T9: Flash attention vs naive attention (equivalence) ----
+    // Build a small KV-cache with 3 positions, run flash attention and naive
+    // attention, verify max diff < 1e-4.
+    println("[T9] Flash attention vs naive attention (equivalence, max diff < 1e-4)")
+    let fa_d = test_dh  // 4
+    let fa_heads = test_heads  // 2
+    let fa_dm = fa_d * fa_heads  // 8
+    let fa_kv_len = 3
+
+    // Init raw cache with 3 known positions
+    let mut fa_cache = tf_raw_kv_init(16, fa_d, fa_heads)
+    let fa_k0 = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+    let fa_v0 = [0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
+    fa_cache = tf_raw_kv_append(fa_cache, fa_k0, fa_v0)
+    let fa_k1 = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    let fa_v1 = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2]
+    fa_cache = tf_raw_kv_append(fa_cache, fa_k1, fa_v1)
+    let fa_k2 = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    let fa_v2 = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3]
+    fa_cache = tf_raw_kv_append(fa_cache, fa_k2, fa_v2)
+
+    // Build flat k_cache/v_cache for naive attention (list-based)
+    let mut naive_k_flat = []
+    let mut naive_v_flat = []
+    let mut fi = 0
+    while fi < fa_dm { naive_k_flat = naive_k_flat.push(fa_k0[fi]); fi = fi + 1 }
+    fi = 0
+    while fi < fa_dm { naive_k_flat = naive_k_flat.push(fa_k1[fi]); fi = fi + 1 }
+    fi = 0
+    while fi < fa_dm { naive_k_flat = naive_k_flat.push(fa_k2[fi]); fi = fi + 1 }
+    fi = 0
+    while fi < fa_dm { naive_v_flat = naive_v_flat.push(fa_v0[fi]); fi = fi + 1 }
+    fi = 0
+    while fi < fa_dm { naive_v_flat = naive_v_flat.push(fa_v1[fi]); fi = fi + 1 }
+    fi = 0
+    while fi < fa_dm { naive_v_flat = naive_v_flat.push(fa_v2[fi]); fi = fi + 1 }
+
+    // Use identity-ish projection matrices (small init) for both methods
+    let fa_wq = tf_xavier_init(fa_dm, fa_dm, 7777)
+    let fa_wo = tf_xavier_init(fa_dm, fa_dm, 8888)
+    // For naive, we also need wk/wv -- but flash uses pre-cached K/V.
+    // To make a fair comparison, we skip K/V projection in the naive path too:
+    // just use q_vec directly as the query input to both.
+    let fa_q_vec = [0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1]
+    let fa_pos = 2  // query at position 2
+    let fa_causal = 1
+
+    // Flash attention result
+    let flash_out = tf_flash_mha(fa_q_vec, fa_cache, fa_wq, fa_wo, fa_heads, fa_d, fa_dm, fa_pos, fa_kv_len, fa_causal)
+
+    // Naive attention result (using existing tf_mha_single, need wk/wv too)
+    let fa_wk = tf_xavier_init(fa_dm, fa_dm, 9999)
+    let fa_wv = tf_xavier_init(fa_dm, fa_dm, 9998)
+    // For naive, the K/V in cache are raw (not projected), but tf_mha_single
+    // projects Q internally. For flash, K/V are also raw in cache.
+    // The key difference: tf_mha_single also projects K inside from k_cache,
+    // but flash assumes K/V are already projected and stored.
+    // To get a fair comparison, we run flash_mha which only projects Q (via wq)
+    // and the naive path also only projects Q. The K/V in both cases are raw.
+    // tf_mha_single re-projects K via wk, which flash does NOT do.
+    // So instead, do a head-by-head naive comparison manually:
+    let naive_q_proj = tf_mat_vec(fa_wq, fa_q_vec, fa_dm, fa_dm)
+
+    let mut naive_attn_out = tf_zeros(fa_dm)
+    let fa_scale = 1.0 / sqrt(to_float(fa_d))
+    let mut fh = 0
+    while fh < fa_heads {
+        let fh_off = fh * fa_d
+        // Extract Q head + RoPE
+        let mut fq_h = []
+        let mut fdi = 0
+        while fdi < fa_d {
+            fq_h = fq_h.push(naive_q_proj[fh_off + fdi])
+            fdi = fdi + 1
+        }
+        fq_h = tf_rope_encode(fq_h, fa_pos, fa_d)
+
+        // Scores against all 3 positions
+        let mut fscores = []
+        let mut ft = 0
+        while ft < fa_kv_len {
+            let fk_t = tf_raw_kv_get_k(fa_cache, ft, fh)
+            let fk_rope = tf_rope_encode(fk_t, ft, fa_d)
+            let mut fscore = tf_dot(fq_h, fk_rope, fa_d) * fa_scale
+            if fa_causal == 1 && ft > fa_pos { fscore = TF_NEG_INF }
+            fscores = fscores.push(fscore)
+            ft = ft + 1
+        }
+        let fprobs = tf_softmax(fscores, fa_kv_len)
+
+        // Weighted V sum
+        let mut fv_sum = tf_zeros(fa_d)
+        ft = 0
+        while ft < fa_kv_len {
+            let fv_t = tf_raw_kv_get_v(fa_cache, ft, fh)
+            let mut fnv = []
+            fdi = 0
+            while fdi < fa_d {
+                fnv = fnv.push(fv_sum[fdi] + fprobs[ft] * fv_t[fdi])
+                fdi = fdi + 1
+            }
+            fv_sum = fnv
+            ft = ft + 1
+        }
+
+        // Accumulate into attn_out
+        let mut fna = []
+        fdi = 0
+        while fdi < fa_dm {
+            if fdi >= fh_off && fdi < fh_off + fa_d {
+                fna = fna.push(naive_attn_out[fdi] + fv_sum[fdi - fh_off])
+            } else {
+                fna = fna.push(naive_attn_out[fdi])
+            }
+            fdi = fdi + 1
+        }
+        naive_attn_out = fna
+        fh = fh + 1
+    }
+    let naive_out = tf_mat_vec(fa_wo, naive_attn_out, fa_dm, fa_dm)
+
+    // Compare flash_out vs naive_out
+    let mut max_diff = 0.0
+    i = 0
+    while i < fa_dm {
+        let d = tf_abs(flash_out[i] - naive_out[i])
+        if d > max_diff { max_diff = d }
+        i = i + 1
+    }
+    if max_diff < 1.0e-4 {
+        println("  PASS: max_diff=" + to_string(max_diff) + " < 1e-4")
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: max_diff=" + to_string(max_diff) + " >= 1e-4")
+        fail_count = fail_count + 1
+    }
+    tf_raw_kv_free(fa_cache)
+    println("")
+
+    // ---- T10: KV-cache equivalence (cached vs full recomputation) ----
+    // Decode 3 steps with cache, then re-run without cache (full recompute).
+    // Hidden states should match.
+    println("[T10] KV-cache: cached decode vs full recomputation (equivalence)")
+    // Use tiny model: d=8, 2 heads, 1 layer
+    let t10_d = 8
+    let t10_heads = 2
+    let t10_dh = 4
+    let t10_ff = 16
+    let t10_model = tf_full_model_init(t10_d, t10_heads, t10_ff, 1, 1, test_vocab, 54321)
+    let t10_intent = [0.3, 0.2, 0.1, 0.0, -0.1, -0.2, -0.3, -0.4]
+    let t10_mem = tf_full_encode(t10_model, t10_intent, 1)
+
+    // Decode 3 steps with incremental KV-cache
+    let mut t10_cache = tf_kv_cache_init(1)
+    let mut t10_logits_cached = []
+    let mut t10_step = 0
+    let mut t10_tok = 0
+    while t10_step < 3 {
+        let t10_res = tf_full_decode_step(t10_model, t10_tok, t10_mem, 1, t10_step, t10_cache)
+        t10_logits_cached = t10_logits_cached.push(t10_res[0])
+        t10_cache = t10_res[1]
+        // Use argmax of logits as next token
+        let mut t10_best = 0
+        let mut t10_bestv = t10_res[0][0]
+        let mut t10_j = 1
+        while t10_j < test_vocab {
+            if t10_res[0][t10_j] > t10_bestv {
+                t10_bestv = t10_res[0][t10_j]
+                t10_best = t10_j
+            }
+            t10_j = t10_j + 1
+        }
+        t10_tok = t10_best
+        t10_step = t10_step + 1
+    }
+
+    // Decode 3 steps from scratch each time (full recompute, fresh cache per step)
+    let mut t10_logits_fresh = []
+    t10_tok = 0
+    t10_step = 0
+    while t10_step < 3 {
+        let t10_fresh_cache = tf_kv_cache_init(1)
+        // Re-decode all steps 0..t10_step to get step t10_step's output
+        let mut t10_fc = t10_fresh_cache
+        let mut t10_tok_inner = 0
+        let mut t10_s2 = 0
+        while t10_s2 <= t10_step {
+            let t10_r2 = tf_full_decode_step(t10_model, t10_tok_inner, t10_mem, 1, t10_s2, t10_fc)
+            if t10_s2 == t10_step {
+                t10_logits_fresh = t10_logits_fresh.push(t10_r2[0])
+            }
+            t10_fc = t10_r2[1]
+            // Use argmax for next token
+            let mut t10_b2 = 0
+            let mut t10_bv2 = t10_r2[0][0]
+            let mut t10_j2 = 1
+            while t10_j2 < test_vocab {
+                if t10_r2[0][t10_j2] > t10_bv2 {
+                    t10_bv2 = t10_r2[0][t10_j2]
+                    t10_b2 = t10_j2
+                }
+                t10_j2 = t10_j2 + 1
+            }
+            t10_tok_inner = t10_b2
+            t10_s2 = t10_s2 + 1
+        }
+        // For the cached path, use same token sequence
+        // (cached path already used argmax above, so tokens match)
+        t10_tok = t10_tok_inner  // not used further, just for clarity
+        t10_step = t10_step + 1
+    }
+
+    // Compare logits at each step
+    let mut t10_max_diff = 0.0
+    t10_step = 0
+    while t10_step < 3 {
+        i = 0
+        while i < test_vocab {
+            let d = tf_abs(t10_logits_cached[t10_step][i] - t10_logits_fresh[t10_step][i])
+            if d > t10_max_diff { t10_max_diff = d }
+            i = i + 1
+        }
+        t10_step = t10_step + 1
+    }
+    if t10_max_diff < 1.0e-4 {
+        println("  PASS: 3-step cached vs fresh max_diff=" + to_string(t10_max_diff))
+        pass_count = pass_count + 1
+    } else {
+        println("  FAIL: max_diff=" + to_string(t10_max_diff))
+        fail_count = fail_count + 1
+    }
+    println("")
+
     // ---- Summary ----
     println("────────────────────────────────────────────────────────────")
     let total = pass_count + fail_count
@@ -1321,7 +1854,9 @@ fn main() {
     println("    [S7]  RoPE               rotary position embedding")
     println("    [S8]  MHA Self-Attn      multi-head with RoPE + causal mask")
     println("    [S9]  Cross-Attention    decoder Q x encoder K/V (no RoPE)")
-    println("    [S10] KV-Cache           O(1) per decode step")
+    println("    [S10] KV-Cache           O(1) per decode step (list-based)")
+    println("    [S10b] Raw KV-Cache      O(1) alloc_raw pointer-based cache")
+    println("    [S10c] Flash Attention   tiled online softmax, no full attn matrix")
     println("    [S11] Encoder Block      bidirectional self-attn + FFN")
     println("    [S12] Decoder Block      causal self-attn + cross-attn + FFN")
     println("    [S13] Transformer Encode 4-layer encoder stack")

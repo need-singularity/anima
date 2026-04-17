@@ -47,6 +47,98 @@ fn fmt(x: float, d: int) -> string {
     return to_string(to_float(to_int(x * factor + 0.5)) / factor)
 }
 
+// ─── E2E Latency Budget (S-P3-1) ───
+// Per-stage ceiling constants for the 200ms E2E budget.
+// Stages: STT, intent encoding, token prediction, vocoder, streaming, post-processing
+// Sum of ceilings = 200ms; individual stages must stay within their ceiling.
+
+let CEIL_STT_MS         = 40    // speech-to-text / VAD pre-processing
+let CEIL_INTENT_MS      = 5     // intent encoding (LayerNorm+SwiGLU 384d)
+let CEIL_TOKEN_MS       = 50    // token prediction (3L×12H transformer)
+let CEIL_VOCODER_MS     = 30    // neural vocoder (additive / spectral)
+let CEIL_STREAMING_MS   = 15    // streaming ring-buffer + PLC + crossfade
+let CEIL_POSTPROC_MS    = 10    // post-processing (gain norm, clipping)
+let E2E_BUDGET_MS       = 200   // total E2E latency budget
+let N_STAGES            = 6     // number of pipeline stages
+
+let STAGE_NAMES = ["STT", "Intent", "TokenPred", "Vocoder", "Streaming", "PostProc"]
+
+fn get_stage_ceiling(idx: int) -> int {
+    if idx == 0 { return CEIL_STT_MS }
+    if idx == 1 { return CEIL_INTENT_MS }
+    if idx == 2 { return CEIL_TOKEN_MS }
+    if idx == 3 { return CEIL_VOCODER_MS }
+    if idx == 4 { return CEIL_STREAMING_MS }
+    if idx == 5 { return CEIL_POSTPROC_MS }
+    return 0
+}
+
+// validate_latency_budget: returns true iff every stage is within its
+// ceiling AND total <= E2E_BUDGET_MS.
+// stage_timings: array of N_STAGES int values (ms per stage, ordered as STAGE_NAMES).
+fn validate_latency_budget(stage_timings: [int]) -> bool {
+    if len(stage_timings) != N_STAGES { return false }
+    let mut total = 0
+    let mut i = 0
+    while i < N_STAGES {
+        let ceiling = get_stage_ceiling(i)
+        if stage_timings[i] > ceiling { return false }
+        total = total + stage_timings[i]
+        i = i + 1
+    }
+    return total <= E2E_BUDGET_MS
+}
+
+// print_latency_report: prints a structured ASCII table of per-stage timings
+// vs ceilings, flags violations, and prints totals.
+fn print_latency_report(stage_names: [string], stage_timings: [int]) {
+    println("")
+    println("┌──────────────┬──────────┬──────────┬────────┐")
+    println("│ Stage        │ Actual   │ Ceiling  │ Status │")
+    println("├──────────────┼──────────┼──────────┼────────┤")
+    let mut total_actual = 0
+    let mut total_ceil = 0
+    let mut all_ok = true
+    let mut i = 0
+    while i < len(stage_names) {
+        let actual = stage_timings[i]
+        let ceiling = get_stage_ceiling(i)
+        total_actual = total_actual + actual
+        total_ceil = total_ceil + ceiling
+        let ok = actual <= ceiling
+        if !ok { all_ok = false }
+        // Pad stage name to 12 chars
+        let mut name = stage_names[i]
+        while len(name) < 12 { name = name + " " }
+        // Pad numbers to 5 chars
+        let mut a_str = to_string(actual) + " ms"
+        while len(a_str) < 8 { a_str = a_str + " " }
+        let mut c_str = to_string(ceiling) + " ms"
+        while len(c_str) < 8 { c_str = c_str + " " }
+        let status = if ok { " OK " } else { "OVER" }
+        println("│ " + name + " │ " + a_str + " │ " + c_str + " │ " + status + " │")
+        i = i + 1
+    }
+    println("├──────────────┼──────────┼──────────┼────────┤")
+    let mut t_str = to_string(total_actual) + " ms"
+    while len(t_str) < 8 { t_str = t_str + " " }
+    let mut tc_str = to_string(E2E_BUDGET_MS) + " ms"
+    while len(tc_str) < 8 { tc_str = tc_str + " " }
+    let total_ok = total_actual <= E2E_BUDGET_MS
+    if !total_ok { all_ok = false }
+    let t_status = if total_ok { " OK " } else { "OVER" }
+    println("│ TOTAL        │ " + t_str + " │ " + tc_str + " │ " + t_status + " │")
+    println("└──────────────┴──────────┴──────────┴────────┘")
+    let margin = E2E_BUDGET_MS - total_actual
+    println("  margin: " + to_string(margin) + " ms (" + fmt(to_float(margin) / to_float(E2E_BUDGET_MS) * 100.0, 1) + "%)")
+    if all_ok {
+        println("  latency budget: [PASS] all stages within ceiling, total <= " + to_string(E2E_BUDGET_MS) + "ms")
+    } else {
+        println("  latency budget: [FAIL] one or more stages exceed ceiling")
+    }
+    println("")
+}
+
 // ─── main ───
 
 fn main() {

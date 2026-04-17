@@ -300,55 +300,102 @@ fn freq_from_offset(partial_idx: int, offset: float) -> float {
     return nominal * scale
 }
 
+// ── Fast vocoder mode: SPEAK_FAST_VOCODER=1 reduces N_PARTIALS from 6 to 4
+//    for latency-critical paths (saves ~33% inner-loop iterations).
+//    Trade-off: slightly reduced timbre richness (partials 5+6 are upper harmonics
+//    at 1000Hz and 1200Hz — above most speech-critical formant energy).
+let N_PARTIALS_FAST = 4
+
+fn get_active_partials() -> int {
+    let fast = env("SPEAK_FAST_VOCODER")
+    if fast == "1" { return N_PARTIALS_FAST }
+    return N_PARTIALS
+}
+
 fn synth_additive(ctrl_frames: [[float]], n_samples: int) -> [float] {
+    let active_partials = get_active_partials()
+
     // Per-partial phase accumulator (radians)
-    let mut phase = vec_zeros(N_PARTIALS)
+    let mut phase = vec_zeros(active_partials)
 
-    // Output buffer (grow via concat to honour hexa quirks)
-    let mut out = []
-
-    // Inverse sample rate
+    // Inverse sample rate — precomputed once
     let inv_sr = 1.0 / to_float(SAMPLE_RATE)
+    let inv_hop = 1.0 / to_float(HOP)
 
     let n_frames = len(ctrl_frames)
+
+    // ── Optimized path: precompute per-frame phase increments + gains ──
+    // For each frame, compute freq and gain for each partial once, then
+    // use linear interpolation of dphi/gain across the HOP samples.
+    // This reduces freq_from_offset() calls from n_samples*partials to
+    // n_frames*partials (typically 50x reduction for 50-frame/12000-sample).
+
+    // Precompute per-frame: dphi[f][p] and gain[f][p]
+    let mut frame_dphi = []
+    let mut frame_gain = []
+    let mut f = 0
+    while f < n_frames {
+        let mut dphi_row = []
+        let mut gain_row = []
+        let mut p = 0
+        while p < active_partials {
+            let off = ctrl_frames[f][p * 2]
+            let g = ctrl_frames[f][p * 2 + 1]
+            let freq = freq_from_offset(p, off)
+            dphi_row = dphi_row.push(TWO_PI * freq * inv_sr)
+            gain_row = gain_row.push(g * MAX_GAIN)
+            p = p + 1
+        }
+        frame_dphi = frame_dphi.push(dphi_row)
+        frame_gain = frame_gain.push(gain_row)
+        f = f + 1
+    }
+
+    // ── Synthesis loop: interpolate precomputed dphi/gain per sample ──
+    // Uses alloc_raw output buffer for O(1) writes instead of O(n) push.
+    let out_buf = alloc_raw(n_samples * 4)
+
     let mut t = 0
     while t < n_samples {
-        // Locate the two surrounding frames
-        let frame_pos = to_float(t) / to_float(HOP)
+        // Locate surrounding frames via precomputed inv_hop
+        let frame_pos = to_float(t) * inv_hop
         let mut f0 = to_int(frame_pos)
         if f0 < 0 { f0 = 0 }
         if f0 >= n_frames { f0 = n_frames - 1 }
         let mut f1 = f0 + 1
         if f1 >= n_frames { f1 = n_frames - 1 }
         let alpha = frame_pos - to_float(f0)
+        let one_minus_alpha = 1.0 - alpha
 
-        // Accumulate sample
+        // Accumulate sample from interpolated partials
         let mut s = 0.0
         let mut p = 0
-        while p < N_PARTIALS {
-            // Linear interp of {offset, gain} between f0 and f1
-            let off_a = ctrl_frames[f0][p * 2]
-            let off_b = ctrl_frames[f1][p * 2]
-            let off = off_a * (1.0 - alpha) + off_b * alpha
-            let gain_a = ctrl_frames[f0][p * 2 + 1]
-            let gain_b = ctrl_frames[f1][p * 2 + 1]
-            let gain = gain_a * (1.0 - alpha) + gain_b * alpha
+        while p < active_partials {
+            // Interpolate precomputed dphi and gain (no freq_from_offset per sample)
+            let dphi = frame_dphi[f0][p] * one_minus_alpha + frame_dphi[f1][p] * alpha
+            let gain = frame_gain[f0][p] * one_minus_alpha + frame_gain[f1][p] * alpha
 
-            let freq = freq_from_offset(p, off)
-            // Phase increment for this sample
-            let dphi = TWO_PI * freq * inv_sr
             phase[p] = phase[p] + dphi
-            // Wrap to [0, 2π) to keep magnitude bounded for sin precision
+            // Wrap to [0, 2pi) for sin precision
             if phase[p] > TWO_PI { phase[p] = phase[p] - TWO_PI }
             if phase[p] < 0.0   { phase[p] = phase[p] + TWO_PI }
 
-            s = s + gain * MAX_GAIN * sin(phase[p])
+            s = s + gain * sin(phase[p])
             p = p + 1
         }
 
-        out = out.push(s)
+        write_f32(out_buf, t * 4, s)
         t = t + 1
     }
+
+    // Read back from raw buffer into hexa array
+    let mut out = []
+    t = 0
+    while t < n_samples {
+        out = out.push(deref_f32(out_buf, t * 4))
+        t = t + 1
+    }
+    free_raw(out_buf, n_samples * 4)
     return out
 }
 
@@ -899,6 +946,456 @@ fn decode_wave(latent_frames: [[float]], sample_rate: int) -> [float] {
 }
 
 // ════════════════════════════════════════════════════════════════════
+// Section 6b. Conditioned decode — Voice Profile conditioning
+//
+// decode_wave_conditioned: public entry point that accepts a 384d
+// profile conditioning vector (from rp_voice_profiles.profile_to_vocoder_conditioning)
+// and applies 4 scalar modulators extracted inline:
+//   [0] f0_scale      — multiplies BASE_FREQ_HZ in additive freq
+//   [1] tempo_scale   — adjusts hop length for frame interpolation
+//   [2] formant_shift — offsets W_spec projection (spectral envelope)
+//   [3] energy_scale  — scales prosody_energy in spectral path
+//
+// The existing decode_wave() is unchanged (backward compat).
+// ════════════════════════════════════════════════════════════════════
+
+// ── 6b.1  Inline conditioning extraction (no cross-file import) ──
+// Mirrors rp_voice_profiles.extract_conditioning_params logic:
+// Splits 384d vector into 4 bands of 96, computes RMS per band,
+// maps to [f0_scale, tempo_scale, formant_shift, energy_scale].
+fn cond_extract_params(cond: [float]) -> [float] {
+    let n = len(cond)
+    if n < 4 { return [1.0, 1.0, 0.0, 1.0] }
+
+    let band_size = n / 4
+
+    // Compute RMS of each band as a magnitude proxy
+    let mut band_rms = []
+    let mut b = 0
+    while b < 4 {
+        let mut sum_sq = 0.0
+        let mut i = 0
+        while i < band_size {
+            let idx = b * band_size + i
+            if idx < n {
+                let v = cond[idx]
+                sum_sq = sum_sq + v * v
+            }
+            i = i + 1
+        }
+        let mean_sq = sum_sq / to_float(band_size)
+        // Newton sqrt (16 iterations)
+        let mut r = mean_sq
+        if r > 0.0 {
+            let mut j = 0
+            while j < 16 {
+                r = 0.5 * (r + mean_sq / r)
+                j = j + 1
+            }
+        }
+        band_rms = band_rms.push(r)
+        b = b + 1
+    }
+
+    // Map band RMS to vocoder parameters (same mapping as rp_voice_profiles).
+    // Band 0 (pitch) -> f0_scale: [0.5, 2.0]
+    let mut f0_scale = 0.5 + band_rms[0] * 2.0
+    if f0_scale < 0.5 { f0_scale = 0.5 }
+    if f0_scale > 2.0 { f0_scale = 2.0 }
+
+    // Band 1 (tempo) -> tempo_scale: [0.6, 1.5]
+    let mut tempo_scale = 0.6 + band_rms[1] * 1.2
+    if tempo_scale < 0.6 { tempo_scale = 0.6 }
+    if tempo_scale > 1.5 { tempo_scale = 1.5 }
+
+    // Band 2 (timbre) -> formant_shift: [-0.5, +0.5]
+    let mut formant_shift = band_rms[2] - 0.5
+    if formant_shift < -0.5 { formant_shift = -0.5 }
+    if formant_shift > 0.5 { formant_shift = 0.5 }
+
+    // Band 3 (energy) -> energy_scale: [0.7, 1.3]
+    let mut energy_scale = 0.7 + band_rms[3] * 0.8
+    if energy_scale < 0.7 { energy_scale = 0.7 }
+    if energy_scale > 1.3 { energy_scale = 1.3 }
+
+    let mut out = []
+    out = out.push(f0_scale)
+    out = out.push(tempo_scale)
+    out = out.push(formant_shift)
+    out = out.push(energy_scale)
+    return out
+}
+
+// ── 6b.2  Conditioned additive synthesis ──
+// Like freq_from_offset but with f0_scale applied to BASE_FREQ_HZ.
+fn freq_from_offset_scaled(partial_idx: int, offset: float, f0_scale: float) -> float {
+    let nominal = BASE_FREQ_HZ * f0_scale * to_float(partial_idx + 1)
+    let LN2 = 0.6931471805599453
+    let scale = exp(offset * LN2)
+    return nominal * scale
+}
+
+// Additive synthesis with f0_scale and tempo_scale conditioning.
+// tempo_scale adjusts the effective hop length: higher tempo = shorter hop
+// (faster frame advance), lower tempo = longer hop (slower frame advance).
+fn synth_additive_conditioned(ctrl_frames: [[float]], n_samples: int, f0_scale: float, tempo_scale: float) -> [float] {
+    let mut phase = vec_zeros(N_PARTIALS)
+    let mut out = []
+    let inv_sr = 1.0 / to_float(SAMPLE_RATE)
+    let n_frames = len(ctrl_frames)
+
+    // Effective hop: inversely proportional to tempo_scale.
+    // tempo_scale=1.0 -> HOP, tempo_scale=1.5 -> HOP/1.5 (faster).
+    let effective_hop = to_float(HOP) / tempo_scale
+
+    let mut t = 0
+    while t < n_samples {
+        let frame_pos = to_float(t) / effective_hop
+        let mut f0 = to_int(frame_pos)
+        if f0 < 0 { f0 = 0 }
+        if f0 >= n_frames { f0 = n_frames - 1 }
+        let mut f1 = f0 + 1
+        if f1 >= n_frames { f1 = n_frames - 1 }
+        let alpha = frame_pos - to_float(f0)
+
+        let mut s = 0.0
+        let mut p = 0
+        while p < N_PARTIALS {
+            let off_a = ctrl_frames[f0][p * 2]
+            let off_b = ctrl_frames[f1][p * 2]
+            let off = off_a * (1.0 - alpha) + off_b * alpha
+            let gain_a = ctrl_frames[f0][p * 2 + 1]
+            let gain_b = ctrl_frames[f1][p * 2 + 1]
+            let gain = gain_a * (1.0 - alpha) + gain_b * alpha
+
+            // f0_scale applied via freq_from_offset_scaled
+            let freq = freq_from_offset_scaled(p, off, f0_scale)
+            let dphi = TWO_PI * freq * inv_sr
+            phase[p] = phase[p] + dphi
+            if phase[p] > TWO_PI { phase[p] = phase[p] - TWO_PI }
+            if phase[p] < 0.0   { phase[p] = phase[p] + TWO_PI }
+
+            s = s + gain * MAX_GAIN * sin(phase[p])
+            p = p + 1
+        }
+
+        out = out.push(s)
+        t = t + 1
+    }
+    return out
+}
+
+// ── 6b.3  Conditioned spectral synthesis ──
+// Like vocoder_spectral but with formant_shift and energy_scale from profile.
+// formant_shift offsets the W_spec projection: shifts the magnitude spectrum
+// up/down by biasing the bin mapping. Positive shift -> higher formants.
+fn vocoder_spectral_conditioned(latent_frames: [[float]], W_spec: [float], energy_scale: float, formant_shift: float, tempo_scale: float) -> [float] {
+    let n_frames = len(latent_frames)
+    if n_frames == 0 { return [] }
+
+    let n_fft = N_FFT
+    let hop = ISTFT_HOP
+    let bins = n_fft / 2 + 1
+    let window = make_hann_window(n_fft)
+
+    // Formant shift: offset in spectral bins.
+    // formant_shift in [-0.5, +0.5] -> bin offset [-25, +25] (10% of 257 bins).
+    // Positive = shift spectrum up (smaller vocal tract), negative = down (larger).
+    let bin_offset = to_int(formant_shift * 50.0)
+
+    println("[neural_vocoder] Stage C conditioned: frames=" + to_string(n_frames)
+            + " energy=" + to_string(energy_scale)
+            + " formant_shift=" + to_string(formant_shift)
+            + " bin_offset=" + to_string(bin_offset)
+            + " tempo_scale=" + to_string(tempo_scale))
+
+    let mut spec_frames = []
+    let mut f = 0
+    while f < n_frames {
+        // Step 1: latent -> magnitude spectrum
+        let raw_mag = latent_to_mag_spectrum(latent_frames[f], W_spec)
+
+        // Step 2: apply formant shift by re-indexing the magnitude spectrum.
+        // mag_shifted[b] = raw_mag[clamp(b - bin_offset, 0, SPEC_DIM-1)]
+        // This shifts the spectral envelope without changing phase estimation.
+        let mut mag_shifted = []
+        let mut b = 0
+        while b < SPEC_DIM {
+            let mut src = b - bin_offset
+            if src < 0 { src = 0 }
+            if src >= SPEC_DIM { src = SPEC_DIM - 1 }
+            mag_shifted = mag_shifted.push(raw_mag[src])
+            b = b + 1
+        }
+
+        // Step 3: apply energy_scale (multiplicative gain on magnitude)
+        let mut mag = []
+        b = 0
+        while b < SPEC_DIM {
+            let v = mag_shifted[b] * energy_scale
+            if v < SPEC_FLOOR { mag = mag.push(SPEC_FLOOR) }
+            else { mag = mag.push(v) }
+            b = b + 1
+        }
+
+        // Step 4: Griffin-Lim phase estimation
+        let complex_spec = griffin_lim_phase(mag, n_fft)
+        spec_frames = spec_frames.push(complex_spec)
+        f = f + 1
+    }
+
+    // Step 5: iSTFT overlap-add
+    // Adjust hop by tempo_scale: higher tempo -> smaller hop (faster playback)
+    let adjusted_hop = to_int(to_float(hop) / tempo_scale)
+    let mut effective_hop = adjusted_hop
+    if effective_hop < 1 { effective_hop = 1 }
+
+    let pcm = istft_overlap_add(spec_frames, n_fft, effective_hop, window)
+    println("[neural_vocoder] Stage C conditioned produced " + to_string(len(pcm)) + " samples")
+    return pcm
+}
+
+// ── 6b.4  Public entry: decode_wave_conditioned ──
+// Drop-in replacement for decode_wave with voice profile conditioning.
+//
+// profile_cond: flat array of 384 floats from profile_to_vocoder_conditioning.
+//               Pass [] for neutral (equivalent to decode_wave).
+fn decode_wave_conditioned(latent_frames: [[float]], sample_rate: int, profile_cond: [float]) -> [float] {
+    if sample_rate != SAMPLE_RATE {
+        println("[neural_vocoder] sample_rate mismatch: got "
+                + to_string(sample_rate) + " expected " + to_string(SAMPLE_RATE))
+        return []
+    }
+    let n_frames = len(latent_frames)
+    if n_frames == 0 { return [] }
+    if len(latent_frames[0]) != LATENT_DIM {
+        println("[neural_vocoder] latent dim mismatch: got "
+                + to_string(len(latent_frames[0]))
+                + " expected " + to_string(LATENT_DIM))
+        return []
+    }
+
+    // If no conditioning provided, fall through to unconditioned decode_wave
+    if len(profile_cond) < 4 {
+        println("[neural_vocoder] no profile conditioning — falling back to decode_wave")
+        return decode_wave(latent_frames, sample_rate)
+    }
+
+    // Extract 4 scalar modulators from the 384d conditioning vector
+    let params = cond_extract_params(profile_cond)
+    let f0_scale = params[0]
+    let tempo_scale = params[1]
+    let formant_shift = params[2]
+    let energy_scale = params[3]
+
+    println("[neural_vocoder] conditioned decode: f0=" + to_string(f0_scale)
+            + " tempo=" + to_string(tempo_scale)
+            + " formant=" + to_string(formant_shift)
+            + " energy=" + to_string(energy_scale))
+
+    // Route selection: Stage C (spectral) vs Stage B (additive)
+    let stage_c_ready = hxcuda_available()
+    if stage_c_ready {
+        println("[neural_vocoder] Stage C conditioned ACTIVE")
+        let spec_ckpt_path = env("SPEAK_CKPT_W_SPEC")
+        let W_spec = if spec_ckpt_path != "" { load_w_spec(spec_ckpt_path) } else { load_w_spec("anima-speak/ckpt_w_spec.json") }
+        return vocoder_spectral_conditioned(latent_frames, W_spec, energy_scale, formant_shift, tempo_scale)
+    }
+
+    // Stage B additive with conditioning
+    println("[neural_vocoder] Stage B conditioned active — additive synthesis")
+    let ckpt_path = env("SPEAK_CKPT_W_CTRL")
+    let W_ctrl = if ckpt_path != "" { load_w_ctrl(ckpt_path) } else { load_w_ctrl("anima-speak/ckpt_w_ctrl.json") }
+
+    let mut ctrl_frames = []
+    let mut f = 0
+    while f < n_frames {
+        let c = latent_to_ctrl(latent_frames[f], W_ctrl)
+        ctrl_frames = ctrl_frames.push(c)
+        f = f + 1
+    }
+    let n_samples = n_frames * HOP
+    return synth_additive_conditioned(ctrl_frames, n_samples, f0_scale, tempo_scale)
+}
+
+// ── 6b.5  Self-test: conditioned output distinctness ──
+// Generates conditioning for two very different profiles (school_idol=0
+// vs demon_lord=7) inline, verifies that decode_wave_conditioned produces
+// measurably different PCM. Inline profile generation (no import).
+fn test_conditioned_output() -> bool {
+    println("[neural_vocoder] test_conditioned_output:")
+
+    // ── Inline conditioning vector generation ──
+    // We replicate the profile_to_vocoder_conditioning logic here because
+    // cross-file imports are forbidden. Uses the same sinusoidal basis
+    // pattern with known profile scalars.
+
+    // Profile 0: school_idol — pitch=245 Hz, formant=+0.18, tempo=175, prosody=+0.65
+    // Normalized: pitch_n=0.4205, formant_n=0.68, tempo_n=0.6786, prosody_n=0.825
+    let pitch_n_0 = 0.4205
+    let formant_n_0 = 0.68
+    let tempo_n_0 = 0.6786
+    let prosody_n_0 = 0.825
+
+    // Profile 7: demon_lord — pitch=70 Hz, formant=-0.45, tempo=105, prosody=-0.55
+    // Normalized: pitch_n=0.0227, formant_n=0.05, tempo_n=0.1786, prosody_n=0.225
+    let pitch_n_7 = 0.0227
+    let formant_n_7 = 0.05
+    let tempo_n_7 = 0.1786
+    let prosody_n_7 = 0.225
+
+    let d_model = 384
+    let band_size = 96
+
+    // Generate 384d conditioning for profile 0 (school_idol)
+    let mut cond_0 = []
+    // Band 0: pitch
+    let mut i = 0
+    while i < band_size {
+        let phase = TWO_PI * to_float(i + 1) * (0.5 + pitch_n_0 * 2.0) / to_float(band_size)
+        let v = pitch_n_0 * sin(phase) + (1.0 - pitch_n_0) * cos(phase * 0.5)
+        cond_0 = cond_0.push(v)
+        i = i + 1
+    }
+    // Band 1: tempo
+    i = 0
+    while i < band_size {
+        let t = to_float(i) / to_float(band_size)
+        let steepness = 1.0 + tempo_n_0 * 4.0
+        let ramp = t * steepness
+        let v = tempo_n_0 * sin(ramp) + (1.0 - tempo_n_0) * (t * 0.5)
+        cond_0 = cond_0.push(v)
+        i = i + 1
+    }
+    // Band 2: formant/timbre
+    i = 0
+    while i < band_size {
+        let base_freq = to_float(i + 1) * 0.1
+        let shift = (formant_n_0 - 0.5) * 4.0
+        let v = sin(base_freq * (1.0 + shift)) * 0.7 + cos(base_freq * 2.3 * formant_n_0) * 0.3
+        cond_0 = cond_0.push(v)
+        i = i + 1
+    }
+    // Band 3: energy/prosody
+    i = 0
+    while i < band_size {
+        let t = to_float(i) / to_float(band_size)
+        let amp = 0.3 + prosody_n_0 * 0.7
+        let freq_mod = 1.0 + prosody_n_0 * 3.0
+        let v = amp * sin(TWO_PI * t * freq_mod)
+        cond_0 = cond_0.push(v)
+        i = i + 1
+    }
+
+    // Generate 384d conditioning for profile 7 (demon_lord)
+    let mut cond_7 = []
+    // Band 0: pitch
+    i = 0
+    while i < band_size {
+        let phase = TWO_PI * to_float(i + 1) * (0.5 + pitch_n_7 * 2.0) / to_float(band_size)
+        let v = pitch_n_7 * sin(phase) + (1.0 - pitch_n_7) * cos(phase * 0.5)
+        cond_7 = cond_7.push(v)
+        i = i + 1
+    }
+    // Band 1: tempo
+    i = 0
+    while i < band_size {
+        let t = to_float(i) / to_float(band_size)
+        let steepness = 1.0 + tempo_n_7 * 4.0
+        let ramp = t * steepness
+        let v = tempo_n_7 * sin(ramp) + (1.0 - tempo_n_7) * (t * 0.5)
+        cond_7 = cond_7.push(v)
+        i = i + 1
+    }
+    // Band 2: formant/timbre
+    i = 0
+    while i < band_size {
+        let base_freq = to_float(i + 1) * 0.1
+        let shift = (formant_n_7 - 0.5) * 4.0
+        let v = sin(base_freq * (1.0 + shift)) * 0.7 + cos(base_freq * 2.3 * formant_n_7) * 0.3
+        cond_7 = cond_7.push(v)
+        i = i + 1
+    }
+    // Band 3: energy/prosody
+    i = 0
+    while i < band_size {
+        let t = to_float(i) / to_float(band_size)
+        let amp = 0.3 + prosody_n_7 * 0.7
+        let freq_mod = 1.0 + prosody_n_7 * 3.0
+        let v = amp * sin(TWO_PI * t * freq_mod)
+        cond_7 = cond_7.push(v)
+        i = i + 1
+    }
+
+    // Verify conditioning vectors are 384d
+    println("  cond_0 len=" + to_string(len(cond_0)) + " cond_7 len=" + to_string(len(cond_7)))
+    if len(cond_0) != d_model || len(cond_7) != d_model {
+        println("  FAIL (conditioning vector size mismatch)")
+        return false
+    }
+
+    // Verify the extracted params differ between the two profiles
+    let params_0 = cond_extract_params(cond_0)
+    let params_7 = cond_extract_params(cond_7)
+    println("  school_idol params: f0=" + to_string(params_0[0])
+            + " tempo=" + to_string(params_0[1])
+            + " formant=" + to_string(params_0[2])
+            + " energy=" + to_string(params_0[3]))
+    println("  demon_lord  params: f0=" + to_string(params_7[0])
+            + " tempo=" + to_string(params_7[1])
+            + " formant=" + to_string(params_7[2])
+            + " energy=" + to_string(params_7[3]))
+
+    // Build a small test latent (5 frames)
+    let n_test_frames = 5
+    let latent = make_demo_latent(n_test_frames)
+
+    // Decode with each conditioning
+    let pcm_0 = decode_wave_conditioned(latent, SAMPLE_RATE, cond_0)
+    let pcm_7 = decode_wave_conditioned(latent, SAMPLE_RATE, cond_7)
+
+    println("  pcm_0 len=" + to_string(len(pcm_0)) + " pcm_7 len=" + to_string(len(pcm_7)))
+
+    if len(pcm_0) == 0 || len(pcm_7) == 0 {
+        println("  FAIL (empty PCM output)")
+        return false
+    }
+
+    // Measure difference: compute RMS of (pcm_0 - pcm_7) over the shared range.
+    // Different profiles should produce measurably different waveforms.
+    let mut min_len = len(pcm_0)
+    if len(pcm_7) < min_len { min_len = len(pcm_7) }
+    // Cap comparison to first 1000 samples for speed
+    if min_len > 1000 { min_len = 1000 }
+
+    let mut diff_sum_sq = 0.0
+    let mut max_diff = 0.0
+    let mut si = 0
+    while si < min_len {
+        let d = pcm_0[si] - pcm_7[si]
+        let ad = d
+        let mut abs_d = ad
+        if abs_d < 0.0 { abs_d = 0.0 - abs_d }
+        if abs_d > max_diff { max_diff = abs_d }
+        diff_sum_sq = diff_sum_sq + d * d
+        si = si + 1
+    }
+    let rms_diff = sqrt(diff_sum_sq / to_float(min_len))
+
+    println("  PCM difference: rms=" + to_string(rms_diff) + " max=" + to_string(max_diff))
+
+    // The two profiles (school_idol: high pitch/fast/bright vs demon_lord:
+    // low pitch/slow/dark) should produce clearly different waveforms.
+    // Threshold: rms_diff > 0.0001 (well above numerical noise).
+    if rms_diff > 0.0001 {
+        println("  PASS (profiles produce measurably different PCM)")
+        return true
+    }
+    println("  FAIL (profiles produced identical PCM — conditioning not effective)")
+    return false
+}
+
+// ════════════════════════════════════════════════════════════════════
 // Section 7. WAV I/O (PCM16, mono)
 //
 // Hexa string ops are null-terminated, so binary bytes don't survive
@@ -1236,11 +1733,12 @@ fn main() {
         println("")
         println("═══════ Stage C Spectral Self-Tests ═══════")
         let mut pass_count = 0
-        let mut total = 3
+        let mut total = 4
 
         if test_spectral_round_trip() { pass_count = pass_count + 1 }
         if test_griffin_lim_convergence() { pass_count = pass_count + 1 }
         if test_spectral_vocoder_output() { pass_count = pass_count + 1 }
+        if test_conditioned_output() { pass_count = pass_count + 1 }
 
         println("")
         println("[neural_vocoder] spectral tests: " + to_string(pass_count) + "/" + to_string(total) + " PASS")

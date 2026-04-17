@@ -1,0 +1,155 @@
+{
+  "_meta": {
+    "name": "ALM 70B FSDP config — accelerate FSDP full-shard spec for Qwen2.5-72B-Instruct",
+    "spec_ref": "shared/state/alm_70b_spec.json#hardware.shard_strategy_options.OPT_B_4xSXM_FSDP_FULL",
+    "checklist_ref": "shared/state/alm_70b_launch_checklist_20260417.json#spec_audit.gpu_hardware_audit",
+    "emitted_by": "training/launch_alm_70b.hexa (writes this as YAML to /workspace/alm_70b_fsdp_config.yaml at launch time)",
+    "schema_version": "1.0",
+    "created_utc": "2026-04-17T02:00Z",
+    "fsdp_doc_refs": [
+      "https://pytorch.org/docs/stable/fsdp.html",
+      "https://huggingface.co/docs/accelerate/en/usage_guides/fsdp",
+      "https://huggingface.co/docs/peft/en/accelerate/fsdp"
+    ],
+    "purpose": "JSON SSOT for FSDP recipe — launcher reads this at runtime and emits the YAML. Keeping JSON here (not YAML) matches the shared/ JSON convention and allows other tools (preflight, eval, r2_sync) to parse the same fields."
+  },
+
+  "compute_environment": "LOCAL_MACHINE",
+  "distributed_type": "FSDP",
+  "downcast_bf16": "no",
+
+  "num_processes": 4,
+  "num_machines": 1,
+  "machine_rank": 0,
+  "main_training_function": "main",
+  "mixed_precision": "bf16",
+  "rdzv_backend": "static",
+  "same_network": true,
+  "use_cpu": false,
+
+  "fsdp_config": {
+    "fsdp_sharding_strategy": "FULL_SHARD",
+    "fsdp_sharding_strategy_rationale": "Zero-3 full shard — base weights + grads + optimizer state all sharded across 4 ranks. 72B bf16 (145GB) / 4 = 36.4 GB/rank + activations 22 + lora 2.5 + cuda 3 = 64 GB/rank on 80GB SXM (16 GB headroom).",
+
+    "fsdp_offload_params": false,
+    "fsdp_offload_params_rationale": "80GB × 4 = 320GB aggregate is sufficient for 145GB weights + activations without CPU offload. Offload would add 30-60% training time penalty due to PCIe 5.0 @ 64 GB/s vs HBM3 3 TB/s.",
+
+    "fsdp_auto_wrap_policy": "TRANSFORMER_BASED_WRAP",
+    "fsdp_transformer_layer_cls_to_wrap": "Qwen2DecoderLayer",
+    "fsdp_auto_wrap_policy_rationale": "Wrap each of Qwen2.5-72B's 80 decoder layers as an FSDP unit. LoRA adapters (r=32) inside each wrapped layer shard with the frozen base linears they attach to, preserving gradient flow via fsdp_use_orig_params=true.",
+
+    "fsdp_backward_prefetch": "BACKWARD_PRE",
+    "fsdp_backward_prefetch_rationale": "Overlap all-gather with backward compute. BACKWARD_PRE prefetches next layer's params during current layer's backward pass — hides NCCL latency at cost of small activation memory spike. Alternative BACKWARD_POST is safer on memory but slower; we have 16GB headroom so BACKWARD_PRE is safe.",
+
+    "fsdp_forward_prefetch": false,
+    "fsdp_forward_prefetch_rationale": "Per HF/accelerate recs: forward prefetch can cause activation spike during wrap transitions. Keep off for 72B first-run; can enable if measured headroom > 30GB at step 100.",
+
+    "fsdp_state_dict_type": "SHARDED_STATE_DICT",
+    "fsdp_state_dict_type_rationale": "Save rank-per-shard adapter files during training (fast save, no cross-rank gather). For final ckpt + intermediate eval: call accelerate.utils.merge_fsdp_weights to produce single adapter_model.bin. Per spec blockers.R5_CHECKPOINT_FRAGILITY, first ckpt at step 100 MUST be merged + load-tested on single-GPU inference pod before trusting the recipe.",
+
+    "fsdp_cpu_ram_efficient_loading": true,
+    "fsdp_cpu_ram_efficient_loading_rationale": "On load, rank 0 loads full state dict to CPU RAM, then broadcasts shards to other ranks as they attach to GPU. Requires 256GB+ host RAM. Alternative: each rank loads from disk separately (slower, uses 4× disk bandwidth).",
+
+    "fsdp_sync_module_states": true,
+    "fsdp_sync_module_states_rationale": "Mandatory at init to ensure all ranks start from identical weights. Omitting this is a known silent-corruption cause (rank drift).",
+
+    "fsdp_use_orig_params": true,
+    "fsdp_use_orig_params_rationale": "REQUIRED FOR peft/LoRA. Without it, peft cannot identify adapter params for selective optimizer updates (LoraConfig filters trainable=True params, but FSDP flattens them into single _FlatParameter by default). use_orig_params=true keeps each adapter linear as a separate parameter object, preserving peft's filter.",
+
+    "fsdp_limit_all_gathers": true,
+    "fsdp_limit_all_gathers_rationale": "Rate-limit concurrent all-gather operations to prevent NCCL memory explosion. Recommended by PyTorch FSDP team for Zero-3 at >= 4 ranks. Cost: ~2-5% throughput; benefit: prevents rank 0 OOM under all-gather pile-up at step 1.",
+
+    "fsdp_activation_checkpointing": true,
+    "fsdp_activation_checkpointing_rationale": "Grad checkpoint every layer (or every N=8 via custom wrap). At 72B seq=1024 batch=1 per rank, activations without checkpointing = ~50 GB/rank — over 80GB budget. With checkpointing every 8 layers, activations = ~22 GB/rank (fits). Throughput cost ~25% — accepted."
+  },
+
+  "memory_math_verification": {
+    "base_weights_bf16_total_gb": 145.4,
+    "base_weights_bf16_total_calc": "72.7e9 params × 2 bytes (bf16) = 145.4 GB",
+    "per_gpu_shard_gb": 36.4,
+    "per_gpu_shard_calc": "145.4 / 4 ranks = 36.35 GB per GPU",
+    "per_gpu_activations_gb": 22,
+    "per_gpu_activations_calc": "seq=1024 × batch=1 × 80 layers × ~275 MB/layer (Qwen2.5-72B hidden=8192 MLP=29568 grad_ckpt_every_8) = 22 GB",
+    "per_gpu_lora_state_gb": 2.5,
+    "per_gpu_lora_state_calc": "LoRA r=32 on 7 modules × 80 layers ≈ 417M params. Adapter 0.83GB + grad 0.83GB + AdamW states (fp32) 3.3GB = 4.96GB sharded × 1/4 replica = 1.24GB; scale by 2 for safety = ~2.5 GB",
+    "per_gpu_cuda_overhead_gb": 3,
+    "per_gpu_cuda_overhead_calc": "CUDA context + NCCL buffers + kernel workspace ≈ 3 GB empirical from r8a pod",
+    "per_gpu_total_gb": 63.9,
+    "per_gpu_total_calc": "36.4 + 22 + 2.5 + 3 = 63.9 GB",
+    "per_gpu_headroom_on_80gb": 16.1,
+    "per_gpu_headroom_rationale": "16GB headroom allows (a) seq_len expansion to 1536 if desired, (b) grad_checkpoint relaxation (every 12 vs every 8) for ~15% throughput gain, (c) safety margin for NCCL pile-up + BACKWARD_PRE spike.",
+    "fits_on_80gb_sxm_4gpu": true,
+    "fits_on_80gb_sxm_4gpu_verdict": "CONFIRMED VIABLE — 64 GB / 80 GB per rank (80% utilization, 20% headroom)"
+  },
+
+  "nccl_config": {
+    "NCCL_DEBUG": "INFO",
+    "NCCL_DEBUG_rationale": "Verbose logs for first-run debugging. Downgrade to WARN after step 100 smoke pass.",
+    "NCCL_IB_DISABLE": "0",
+    "NCCL_IB_DISABLE_rationale": "Enable InfiniBand if pod has it (RunPod SXM5 single-node uses NVLink intra-node so IB is unused anyway). Setting 0 explicitly prevents NCCL from falling back to slower paths.",
+    "NCCL_P2P_LEVEL": "NVL",
+    "NCCL_P2P_LEVEL_rationale": "Force NVLink for peer-to-peer — critical for 4xSXM5 single-node topology. 900 GB/s NVLink vs 64 GB/s PCIe.",
+    "NCCL_TIMEOUT": "1800",
+    "NCCL_TIMEOUT_rationale": "30min timeout. FSDP first backward pass on 72B can take ~2-5 min per step; default 10-min timeout is too aggressive."
+  },
+
+  "torchrun_env": {
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    "PYTORCH_CUDA_ALLOC_CONF_rationale": "Reduces memory fragmentation at FSDP boundary transitions. Default caching allocator fragments on 4-rank all-gather/reduce-scatter cycles; expandable_segments keeps free blocks contiguous.",
+    "TOKENIZERS_PARALLELISM": "false",
+    "TOKENIZERS_PARALLELISM_rationale": "HF tokenizers parallel path conflicts with torchrun multiprocess — silently deadlocks. Must be false for FSDP.",
+    "OMP_NUM_THREADS": "8",
+    "OMP_NUM_THREADS_rationale": "4 ranks × 8 threads = 32 OMP threads on 128-core pod. Prevents CPU oversubscription at data-loading step."
+  },
+
+  "save_load_recipe": {
+    "save_during_training": {
+      "method": "accelerator.save_state (per-rank SHARDED_STATE_DICT)",
+      "frequency": "every 100 steps (save_every)",
+      "output_structure": "/workspace/ckpt_alm70b_r1_<date>/step_<N>/{rank0.safetensors, rank1.safetensors, rank2.safetensors, rank3.safetensors, optimizer_<rank>.pt, scheduler.pt}",
+      "size_per_ckpt_gb": 4,
+      "size_per_ckpt_note": "4 rank shards × ~1 GB adapter weights + optimizer fp32 state = ~4 GB"
+    },
+    "merge_for_inference": {
+      "method": "accelerate.utils.merge_fsdp_weights",
+      "trigger": "step 100 smoke + final step 800",
+      "output": "/workspace/ckpt_alm70b_r1_<date>/step_<N>/merged/adapter_model.bin",
+      "output_size_gb": 0.83,
+      "load_test": "Must load-test merged adapter on single-GPU inference pod — if load fails or hire_sim diverges >2% from rank0 eval, HALT 72B run (recipe broken per spec.blockers.R5)"
+    },
+    "final_upload_to_r2": {
+      "bucket": "anima-models",
+      "path_template": "alm70b/r1/step_<N>/",
+      "merged_path": "alm70b/r1/step_<N>/merged/",
+      "upload_cmd": "rclone copy $CKPT_DIR r2:anima-models/alm70b/r1/ -v --s3-no-check-bucket --transfers 4",
+      "upload_trigger": "POST-training only (per training/CLAUDE.md runpod_mfs_quota rule — NO in-training R2 uploads)"
+    }
+  },
+
+  "gate_criteria_40_of_40": {
+    "description": "Preflight + FSDP smoke must pass 40 individual checks before training launch. See training/alm_70b_preflight.hexa for full list.",
+    "check_categories": {
+      "hardware": 10,
+      "software_pins": 8,
+      "base_model": 4,
+      "corpus": 3,
+      "fsdp_recipe": 7,
+      "r2_accessibility": 3,
+      "nccl_ring": 3,
+      "dry_run_step": 2
+    },
+    "pass_threshold": 40,
+    "pass_threshold_note": "ALL 40 must PASS. Any WARN elevated to FAIL under STRICT=1 (launch-time strict mode)."
+  },
+
+  "memory_refs": [
+    "feedback_h100_authorized",
+    "feedback_no_quantization",
+    "feedback_no_resume_data_change",
+    "feedback_one_shot_best",
+    "feedback_r2_checkpoint",
+    "feedback_background_tasks",
+    "reference_peft_torch_compat",
+    "reference_runpod_ssh"
+  ]
+}

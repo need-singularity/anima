@@ -1,0 +1,385 @@
+// training/launch_alm_13b.hexa — ALM 13B intermediate LoRA launcher
+//                                 (A2-chain merged base + de-risk LoRA before 70B)
+// @convergence shared/convergence/alm_13b.convergence
+//
+// Spec:     shared/state/alm_70b_launch_checklist_20260417.json#alternatives.A_13B_intermediate
+// Config:   training/alm_13b_config.json   (SSOT for all hyperparameters)
+// Day:      day_3 (CONDITIONAL — only fires if A2 eval borderline 0.85-0.93)
+// Budget:   12h / $36 on SAME H100 pod (prefer reuse of A2 pod lnzliav2e8du6i)
+//
+// Why NEW launcher (not edit of A2 launchers):
+//   Total .py ban (2026-04-16) forbids new .py. 13B intermediate is a distinct
+//   round — different run_id, different ckpt prefix, different LoRA rank (r=48),
+//   different lr (4e-6). It stacks on top of the full A2 chain (A1+Orch+Tool all
+//   merged) as ONE more LoRA layer — serving as the de-risk validation hop
+//   before committing $240-480 on 70B.
+//
+// Naming note (E3):
+//   "13b" in run_id/ckpt = PARAMETER-CLASS ID (intermediate scale between 14B
+//   and 70B), NOT a version number. feedback_no_version_in_filename unaffected.
+//   Actual base is Qwen2.5-14B-Instruct (Qwen family has no 13B).
+//
+// Resume semantics (per feedback_no_resume_data_change):
+//   Sequential-merge: Qwen → merge A1 → merge A2-Orch → merge A2-Tool → fresh
+//   13B-intermediate LoRA. Produces a NEW base via merging. New LoRA is SCRATCH.
+//   Corpus expands (corpus_alm_13b_intermediate.txt) — this IS a data change,
+//   so per policy the round is a fresh start, not a resume.
+//
+// Decision branching (documented — operator invokes manually or via watcher):
+//   A2 eval >= 0.93  → SKIP this launcher, go direct to 70B
+//   A2 eval 0.85-0.93 → RUN this launcher (de-risk path)
+//   A2 eval < 0.85   → HALT, do NOT run 13B or 70B (recipe broken)
+
+let CONFIG_PATH = "training/alm_13b_config.json"
+
+// ─── Hexa string-scan helpers (mirror launch_alm_a2_orch.hexa shape) ──
+fn str_index_of(hay, needle, from) {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return from }
+    let mut i = from
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn extract_json_string(text, key) {
+    let needle = "\"" + key + "\""
+    let kpos = str_index_of(text, needle, 0)
+    if kpos < 0 { return "" }
+    let after_key = kpos + len(needle)
+    let colon = str_index_of(text, ":", after_key)
+    if colon < 0 { return "" }
+    let open_q = str_index_of(text, "\"", colon)
+    if open_q < 0 { return "" }
+    let close_q = str_index_of(text, "\"", open_q + 1)
+    if close_q < 0 { return "" }
+    return text.substring(open_q + 1, close_q)
+}
+
+// ─── Date resolver ──
+fn resolve_date() {
+    return exec("date +%Y%m%d").trim()
+}
+
+// ─── Log helpers ──
+fn log_info(msg) {
+    println("[launch_alm_13b] " + msg)
+}
+
+fn log_err(msg) {
+    println("[launch_alm_13b ERR] " + msg)
+}
+
+// ─── Main ──
+@convergence(state="ossified", id="ALM13B_A2_CHAIN_DEPENDENCY", value="13B intermediate refuses to launch unless A1 step_3000 + A2-Orch step_3000 + A2-Tool step_1500 adapters ALL present (local or R2). Missing any link in the chain means the merged-base semantics break, and the intermediate de-risk signal becomes invalid", ossified_at="2026-04-17")
+@convergence(state="ossified", id="ALM13B_BORDERLINE_ONLY_TRIGGER", value="13B intermediate MUST only fire when A2 eval hire_sim in [0.85, 0.93). If >=0.93 launch 70B direct (13B adds cost without signal). If <0.85 halt + redesign (13B would carry broken recipe forward). Operator or watcher must verify eval band before invocation", ossified_at="2026-04-17")
+@convergence(state="ossified", id="ALM13B_PARAMETER_CLASS_NAMING", value="13b in run_id/ckpt path is a parameter-class ID for intermediate scale (between 14B production and 70B target). Base model is literally Qwen2.5-14B-Instruct. Not a version number per feedback_no_version_in_filename", ossified_at="2026-04-17")
+fn main() {
+    // Resolve config path.
+    let config_text = ""
+    if file_exists(CONFIG_PATH) {
+        config_text = read_file(CONFIG_PATH)
+    } else {
+        let anima_root = env("ANIMA_ROOT")
+        if anima_root == "" { anima_root = "." }
+        let fallback = anima_root + "/" + CONFIG_PATH
+        if file_exists(fallback) {
+            config_text = read_file(fallback)
+        } else {
+            log_err("config not found: " + CONFIG_PATH + " or " + fallback)
+            return
+        }
+    }
+    if len(config_text) == 0 {
+        log_err("config empty: " + CONFIG_PATH)
+        return
+    }
+    // Schema check: ckpt_label must be production.
+    let cfg_label = extract_json_string(config_text, "ckpt_label")
+    if cfg_label != "production" {
+        log_err("config ckpt_label=" + cfg_label + " (expected production for 13B intermediate)")
+        return
+    }
+
+    // ── FROZEN 13B-intermediate defaults (mirror training/alm_13b_config.json) ──
+    let base_name       = "Qwen/Qwen2.5-14B-Instruct"
+    let steps_str       = "1500"
+    let lr_str          = "4e-6"
+    let warmup_str      = "150"
+    let batch_str       = "1"
+    let grad_accum_str  = "8"
+    let seq_str         = "1024"
+    let save_every_str  = "250"
+    let eval_every_str  = "100"
+    let lora_r_str      = "48"
+    let lora_alpha_str  = "96"
+    let dropout_str     = "0.05"
+    let round_str       = "3"
+    let model_tag       = "alm13b"
+    let ckpt_label      = "production"
+    let corpus_path     = "/workspace/anima/training/corpus_alm_13b_intermediate.txt"
+    let a1_r2_prefix    = "r2:anima-models/alm14b/a1_20260416/step_3000/"
+    let a2o_r2_prefix   = "r2:anima-models/alm14b/a2_20260416_orch/step_3000/"
+    let a2t_r2_prefix   = "r2:anima-models/alm14b/a2_20260416_tool/step_1500/"
+    let a1_local_glob   = "/workspace/ckpt_alm14b_phi_a1_*/step_3000"
+    let a2o_local_glob  = "/workspace/ckpt_alm14b_phi_a2_orch_*/step_3000"
+    let a2t_local_glob  = "/workspace/ckpt_alm14b_phi_a2_tool_*/step_1500"
+
+    // ── Resolve date token ──
+    let date = resolve_date()
+    let run_id = "alm13b-intermediate-" + date
+    let ckpt_dir = "/workspace/ckpt_alm13b_intermediate_" + date
+    let merged_base_dir = "/workspace/a2_chain_merged_base_" + date
+
+    log_info("run_id=" + run_id)
+    log_info("ckpt_dir=" + ckpt_dir)
+    log_info("merged_base=" + merged_base_dir)
+    log_info("base=" + base_name + "  steps=" + steps_str + "  lr=" + lr_str)
+    log_info("lora r=" + lora_r_str + " alpha=" + lora_alpha_str + " dropout=" + dropout_str)
+    log_info("target: q/k/v/o + gate/up/down  (7-module, matches 70B spec)")
+    log_info("trigger: A2 eval MUST be in [0.85, 0.93) band — verify before this launcher")
+
+    // ── Build bash runner ──
+    let runner = "/tmp/_launch_alm_13b_runner.sh"
+    write_file(runner,
+        "#!/usr/bin/env bash\n" +
+        "set -euo pipefail\n" +
+        "\n" +
+        "echo \"============================================\"\n" +
+        "echo \"  ALM 13B intermediate -- A2-chain merged base + de-risk LoRA\"\n" +
+        "echo \"  run_id = " + run_id + "\"\n" +
+        "echo \"  ckpt   = " + ckpt_dir + "\"\n" +
+        "echo \"  lora   = r" + lora_r_str + " alpha" + lora_alpha_str + " dropout" + dropout_str + "  (7-module)\"\n" +
+        "echo \"  steps  = " + steps_str + "   lr=" + lr_str + "  warmup=" + warmup_str + "\"\n" +
+        "echo \"  label  = " + ckpt_label + "   (R2 permanent)\"\n" +
+        "echo \"  trigger= A2 eval in [0.85, 0.93) — de-risk hop before 70B\"\n" +
+        "echo \"============================================\"\n" +
+        "\n" +
+        "# ── preflight: A2 eval borderline check (env override) ──\n" +
+        "# Operator MUST export ALM13B_A2_EVAL_SCORE (from hire_sim_lenient on A2 merged).\n" +
+        "# If unset, launcher refuses (no silent bypass).\n" +
+        "if [[ -z \"${ALM13B_A2_EVAL_SCORE:-}\" ]]; then\n" +
+        "    echo \"[preflight] ALM13B_A2_EVAL_SCORE env unset -- refusing (set to A2 hire_sim_lenient score)\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "# bash float compare via awk\n" +
+        "A2_SCORE=\"$ALM13B_A2_EVAL_SCORE\"\n" +
+        "IN_BAND=$(awk -v s=\"$A2_SCORE\" 'BEGIN{print (s>=0.85 && s<0.93) ? 1 : 0}')\n" +
+        "if [[ \"$IN_BAND\" != \"1\" ]]; then\n" +
+        "    echo \"[preflight] A2 eval=$A2_SCORE NOT in [0.85, 0.93) -- refusing 13B intermediate\"\n" +
+        "    awk -v s=\"$A2_SCORE\" 'BEGIN{\n" +
+        "        if (s>=0.93) print \"[preflight] A2 already PASS_high -- launch 70B directly instead\"\n" +
+        "        else if (s<0.85) print \"[preflight] A2 FAIL -- halt + redesign, do NOT run 13B\"\n" +
+        "    }'\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[preflight] A2 eval=$A2_SCORE in borderline band [0.85, 0.93) -- 13B intermediate justified\"\n" +
+        "\n" +
+        "# ── preflight: forbidden markers ──\n" +
+        "for m in /workspace/READY_FOR_32B /workspace/READY_FOR_R5_KBASE; do\n" +
+        "    if [[ -f \"$m\" ]]; then\n" +
+        "        echo \"[preflight] forbidden marker: $m -- refusing\"\n" +
+        "        exit 1\n" +
+        "    fi\n" +
+        "done\n" +
+        "\n" +
+        "# ── preflight: GPU + bf16 capability ──\n" +
+        "echo \"[preflight] GPU...\"\n" +
+        "nvidia-smi --query-gpu=name,memory.total,memory.free,compute_cap --format=csv,noheader\n" +
+        "CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '.')\n" +
+        "if [[ -z \"$CC\" ]]; then echo \"[preflight] compute_cap unknown -- refusing\"; exit 1; fi\n" +
+        "if (( CC < 80 )); then echo \"[preflight] compute_cap=$CC < 80 -- bf16 unsafe, refusing\"; exit 1; fi\n" +
+        "echo \"[preflight] bf16 OK (compute_cap >= 8.0)\"\n" +
+        "\n" +
+        "# ── preflight: GPU idle ──\n" +
+        "UTIL=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | head -n1)\n" +
+        "USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -n1)\n" +
+        "if [[ -z \"$UTIL\" || -z \"$USED\" ]]; then\n" +
+        "    echo \"[preflight] GPU query empty -- refusing\"; exit 1\n" +
+        "fi\n" +
+        "if (( UTIL > 5 )); then\n" +
+        "    echo \"[preflight] GPU util=${UTIL}%% not idle (A2 still running?) -- refusing\"\n" +
+        "    nvidia-smi\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "if (( USED > 2000 )); then\n" +
+        "    echo \"[preflight] GPU mem=${USED}MiB not idle -- refusing\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[preflight] GPU idle (util=${UTIL}%% used=${USED}MiB)\"\n" +
+        "\n" +
+        "# ── preflight: disk ──\n" +
+        "FREE_GB=$(df -BG /workspace | tail -n1 | awk '{print $4}' | tr -d 'G')\n" +
+        "if [[ -z \"$FREE_GB\" || \"$FREE_GB\" -lt 100 ]]; then\n" +
+        "    echo \"[preflight] /workspace free = ${FREE_GB}GB < 100GB -- refusing\"\n" +
+        "    df -h /workspace\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[preflight] disk OK (${FREE_GB}GB free)\"\n" +
+        "\n" +
+        "# ── preflight: MFS quota probe (runpod_mfs_quota policy) ──\n" +
+        "if ! dd if=/dev/zero of=/workspace/_q_test_13b bs=1M count=20000 status=none 2>/dev/null; then\n" +
+        "    echo \"[preflight] MFS quota write test FAILED -- refusing\"\n" +
+        "    rm -f /workspace/_q_test_13b\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "rm -f /workspace/_q_test_13b\n" +
+        "echo \"[preflight] MFS quota OK (20GB write test passed)\"\n" +
+        "\n" +
+        "# ── preflight: HF_TOKEN ──\n" +
+        "if [[ -z \"${HF_TOKEN:-}\" ]]; then echo \"[preflight] HF_TOKEN unset -- refusing\"; exit 1; fi\n" +
+        "echo \"[preflight] HF_TOKEN OK\"\n" +
+        "\n" +
+        "# ── preflight: A1 adapter availability (local OR R2) ──\n" +
+        "A1_LOCAL=\"\"\n" +
+        "for d in " + a1_local_glob + "; do\n" +
+        "    if [[ -d \"$d\" && -f \"$d/adapter_config.json\" ]]; then A1_LOCAL=\"$d\"; break; fi\n" +
+        "done\n" +
+        "if [[ -z \"$A1_LOCAL\" ]]; then\n" +
+        "    if ! rclone lsd \"" + a1_r2_prefix + "\" --s3-no-check-bucket >/dev/null 2>&1; then\n" +
+        "        echo \"[preflight] A1 step_3000 missing local AND R2 -- refusing\"; exit 1\n" +
+        "    fi\n" +
+        "    mkdir -p /workspace/a1_r2_stage_13b\n" +
+        "    rclone copy \"" + a1_r2_prefix + "\" /workspace/a1_r2_stage_13b --s3-no-check-bucket --transfers 4 --progress\n" +
+        "    A1_LOCAL=\"/workspace/a1_r2_stage_13b\"\n" +
+        "fi\n" +
+        "echo \"[preflight] A1 src = $A1_LOCAL\"\n" +
+        "\n" +
+        "# ── preflight: A2-Orch adapter (local OR R2) ──\n" +
+        "A2O_LOCAL=\"\"\n" +
+        "for d in " + a2o_local_glob + "; do\n" +
+        "    if [[ -d \"$d\" && -f \"$d/adapter_config.json\" ]]; then A2O_LOCAL=\"$d\"; break; fi\n" +
+        "done\n" +
+        "if [[ -z \"$A2O_LOCAL\" ]]; then\n" +
+        "    if ! rclone lsd \"" + a2o_r2_prefix + "\" --s3-no-check-bucket >/dev/null 2>&1; then\n" +
+        "        echo \"[preflight] A2-Orch missing local AND R2 -- refusing\"; exit 1\n" +
+        "    fi\n" +
+        "    mkdir -p /workspace/a2_orch_r2_stage_13b\n" +
+        "    rclone copy \"" + a2o_r2_prefix + "\" /workspace/a2_orch_r2_stage_13b --s3-no-check-bucket --transfers 4 --progress\n" +
+        "    A2O_LOCAL=\"/workspace/a2_orch_r2_stage_13b\"\n" +
+        "fi\n" +
+        "echo \"[preflight] A2-Orch src = $A2O_LOCAL\"\n" +
+        "\n" +
+        "# ── preflight: A2-Tool adapter (local OR R2) ──\n" +
+        "A2T_LOCAL=\"\"\n" +
+        "for d in " + a2t_local_glob + "; do\n" +
+        "    if [[ -d \"$d\" && -f \"$d/adapter_config.json\" ]]; then A2T_LOCAL=\"$d\"; break; fi\n" +
+        "done\n" +
+        "if [[ -z \"$A2T_LOCAL\" ]]; then\n" +
+        "    if ! rclone lsd \"" + a2t_r2_prefix + "\" --s3-no-check-bucket >/dev/null 2>&1; then\n" +
+        "        echo \"[preflight] A2-Tool missing local AND R2 -- refusing\"; exit 1\n" +
+        "    fi\n" +
+        "    mkdir -p /workspace/a2_tool_r2_stage_13b\n" +
+        "    rclone copy \"" + a2t_r2_prefix + "\" /workspace/a2_tool_r2_stage_13b --s3-no-check-bucket --transfers 4 --progress\n" +
+        "    A2T_LOCAL=\"/workspace/a2_tool_r2_stage_13b\"\n" +
+        "fi\n" +
+        "echo \"[preflight] A2-Tool src = $A2T_LOCAL\"\n" +
+        "\n" +
+        "# ── preflight: corpus ──\n" +
+        "CORPUS=\"" + corpus_path + "\"\n" +
+        "if [[ -z \"$CORPUS\" || ! -f \"$CORPUS\" ]]; then\n" +
+        "    echo \"[preflight] corpus missing: $CORPUS -- refusing\"\n" +
+        "    echo \"[preflight] Operator: assemble expanded corpus (A1 blend + hire_sim30 + tool-use + Korean)\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "CORPUS_BYTES=$(stat -c%s \"$CORPUS\" 2>/dev/null || stat -f%z \"$CORPUS\")\n" +
+        "if [[ \"$CORPUS_BYTES\" -lt 3000000 ]]; then\n" +
+        "    echo \"[preflight] corpus too small: ${CORPUS_BYTES}B < 3MB floor -- refusing\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "ls -lh \"$CORPUS\"\n" +
+        "echo \"[preflight] corpus OK (${CORPUS_BYTES} bytes)\"\n" +
+        "\n" +
+        "# ── preflight: naming regex (E3) ──\n" +
+        "RUN_ID=\"" + run_id + "\"\n" +
+        "if ! [[ \"$RUN_ID\" =~ ^alm13b-intermediate-[0-9]{8}$ ]]; then\n" +
+        "    echo \"[preflight] run_id $RUN_ID fails E3 regex -- refusing\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[preflight] naming E3 OK\"\n" +
+        "\n" +
+        "# ── env for HF cache + hook discovery + adapter-merge ──\n" +
+        "export HF_HUB_CACHE=\"/workspace/hf_cache\"\n" +
+        "export HF_HOME=\"/workspace/hf_cache\"\n" +
+        "export TRANSFORMERS_CACHE=\"/workspace/hf_cache\"\n" +
+        "export ANIMA_ROOT=\"/workspace/anima\"\n" +
+        "export HEXA_CKPT_HOOK=\"/workspace/anima/scripts/ckpt_backup_hook.hexa\"\n" +
+        "# sequential merge: A1 -> A2-Orch -> A2-Tool -> fresh 13b LoRA\n" +
+        "export ADAPTER_MERGE_SRC=\"$A1_LOCAL\"\n" +
+        "export ADAPTER_MERGE_SRC2=\"$A2O_LOCAL\"\n" +
+        "export ADAPTER_MERGE_SRC3=\"$A2T_LOCAL\"\n" +
+        "\n" +
+        "# ── stage: ckpt dir + adapter stage ──\n" +
+        "CKPT_DIR=\"" + ckpt_dir + "\"\n" +
+        "MERGED_BASE=\"" + merged_base_dir + "\"\n" +
+        "if [[ -d \"$CKPT_DIR\" ]]; then\n" +
+        "    echo \"[preflight] $CKPT_DIR exists -- refusing (never reuse ckpt dir)\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "mkdir -p \"$CKPT_DIR\"\n" +
+        "mkdir -p \"$MERGED_BASE\"\n" +
+        "cp -r \"$A1_LOCAL\"  \"$CKPT_DIR/a1_adapter\"        || true\n" +
+        "cp -r \"$A2O_LOCAL\" \"$CKPT_DIR/a2_orch_adapter\"   || true\n" +
+        "cp -r \"$A2T_LOCAL\" \"$CKPT_DIR/a2_tool_adapter\"   || true\n" +
+        "echo \"[stage] A1+A2-Orch+A2-Tool adapters staged -> $CKPT_DIR\"\n" +
+        "\n" +
+        "# ── launch training (13B intermediate) ──\n" +
+        "TRAINER_HEXA=\"/workspace/anima/training/train_alm_14b.hexa\"\n" +
+        "HEXA_BIN=\"${HEXA_BIN:-/usr/local/bin/hexa}\"\n" +
+        "if [[ ! -x \"$HEXA_BIN\" ]]; then HEXA_BIN=\"$(command -v hexa 2>/dev/null || true)\"; fi\n" +
+        "if [[ -z \"$HEXA_BIN\" || ! -x \"$HEXA_BIN\" ]]; then\n" +
+        "    echo \"[launch] hexa binary missing -- refusing\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "if [[ ! -f \"$TRAINER_HEXA\" ]]; then\n" +
+        "    echo \"[launch] trainer missing: $TRAINER_HEXA -- refusing\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[launch] hexa=$HEXA_BIN trainer=$TRAINER_HEXA\"\n" +
+        "\n" +
+        "\"$HEXA_BIN\" run \"$TRAINER_HEXA\" -- \\\n" +
+        "    --base " + base_name + " \\\n" +
+        "    --corpus \"$CORPUS\" \\\n" +
+        "    --steps " + steps_str + " \\\n" +
+        "    --lr " + lr_str + " \\\n" +
+        "    --batch " + batch_str + " \\\n" +
+        "    --grad-accum " + grad_accum_str + " \\\n" +
+        "    --seq " + seq_str + " \\\n" +
+        "    --warmup " + warmup_str + " \\\n" +
+        "    --lora-r " + lora_r_str + " \\\n" +
+        "    --lora-alpha " + lora_alpha_str + " \\\n" +
+        "    --lora-dropout " + dropout_str + " \\\n" +
+        "    --target-modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj \\\n" +
+        "    --ckpt-dir \"$CKPT_DIR\" \\\n" +
+        "    --save-every " + save_every_str + " \\\n" +
+        "    --eval-every " + eval_every_str + " \\\n" +
+        "    --model-tag " + model_tag + " \\\n" +
+        "    --round " + round_str + " \\\n" +
+        "    --ckpt-label " + ckpt_label + " \\\n" +
+        "    2>&1 | tee \"$CKPT_DIR/train_" + run_id + ".log\"\n" +
+        "\n" +
+        "echo \"[done] 13B intermediate training complete -- $CKPT_DIR\"\n" +
+        "# ── R2 bulk upload (post-training, per runpod_mfs_quota policy) ──\n" +
+        "echo \"[r2] bulk uploading $CKPT_DIR -> r2:anima-models/alm13b/intermediate_20260417/\"\n" +
+        "rclone copy \"$CKPT_DIR\" \"r2:anima-models/alm13b/intermediate_20260417/\" -v --s3-no-check-bucket --transfers 4 || true\n" +
+        "# ── READY marker ──\n" +
+        "touch \"$CKPT_DIR/READY_ALM13B_INTERMEDIATE_DONE\"\n" +
+        "echo \"[next] hexa training/eval_alm_13b.hexa --ckpt $CKPT_DIR/step_" + steps_str + "\"\n" +
+        "echo \"[next] if eval >= 0.90: launch 70B.   if < 0.90: recipe fails -- do NOT launch 70B\"\n"
+    )
+
+    log_info("runner emitted: " + runner)
+
+    // ── Execution gate ──
+    if env("DRY_RUN") == "1" {
+        log_info("DRY_RUN=1 — not executing runner")
+        log_info("inspect: cat " + runner)
+        return
+    }
+
+    log_info("exec bash " + runner)
+    exec("bash " + runner)
+}

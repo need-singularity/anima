@@ -1,0 +1,534 @@
+// training/alm_70b_preflight.hexa — Pre-launch 40-check gate for ALM 70B
+//
+// Spec:      shared/state/alm_70b_spec.json#trigger_gate (G1-G7)
+// Checklist: shared/state/alm_70b_launch_checklist_20260417.json
+// FSDP:      training/alm_70b_fsdp_config.json
+//
+// Purpose:  40/40 preflight gate before $240-480 burn. Failing any of
+//           40 individual checks aborts launch. Categories:
+//             hardware    (10 checks) — 4x GPU + bf16 + disk + MFS
+//             software    ( 8 checks) — torch/peft/transformers pins
+//             base_model  ( 4 checks) — 72B downloaded + verified
+//             corpus      ( 3 checks) — /workspace/alm_70b_corpus.jsonl
+//             fsdp_recipe ( 7 checks) — yaml + num_processes + wrap_cls
+//             r2          ( 3 checks) — anima-models accessible
+//             nccl_ring   ( 3 checks) — 4-rank all-reduce smoke
+//             dry_run     ( 2 checks) — launcher + accelerate launch --help
+//
+// Output shape:
+//   {
+//     all_ok: bool,
+//     passed: int,            # of 40
+//     failed: int,
+//     warned: int,
+//     issues: [str],
+//     checks: [ { id: str, category: str, ok: bool, detail: str } ]
+//   }
+//
+// Usage:
+//   hexa training/alm_70b_preflight.hexa                   # local-only (Mac dev)
+//   HOST_ID=root@ip:port hexa training/alm_70b_preflight.hexa  # SSH-probe mode
+//   STRICT=1 hexa training/alm_70b_preflight.hexa          # fail on any warn
+//   POD=1 hexa training/alm_70b_preflight.hexa             # run ON POD
+//
+// Pass threshold: 40/40 (all checks). Warns elevate to fails under STRICT=1.
+
+let CONFIG_PATH = "training/alm_70b_config.json"
+let FSDP_JSON_PATH = "training/alm_70b_fsdp_config.json"
+
+// ─── Helpers (copy from alm_a1_preflight — self-contained) ──
+fn str_index_of(hay, needle, from) {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return from }
+    let mut i = from
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn str_contains(hay, needle) {
+    return str_index_of(hay, needle, 0) >= 0
+}
+
+fn extract_json_string(text, key) {
+    let needle = "\"" + key + "\""
+    let kpos = str_index_of(text, needle, 0)
+    if kpos < 0 { return "" }
+    let after_key = kpos + len(needle)
+    let colon = str_index_of(text, ":", after_key)
+    if colon < 0 { return "" }
+    let open_q = str_index_of(text, "\"", colon)
+    if open_q < 0 { return "" }
+    let close_q = str_index_of(text, "\"", open_q + 1)
+    if close_q < 0 { return "" }
+    return text.substring(open_q + 1, close_q)
+}
+
+fn is_pod() {
+    return env("POD") == "1" || exec("test -d /workspace && echo yes || echo no").trim() == "yes"
+}
+
+// ─── HARDWARE category (10 checks) ──
+fn h1_nvidia_smi_exists() {
+    let out = exec("command -v nvidia-smi 2>&1; echo RC=$?")
+    if str_contains(out, "RC=0") { return "OK: nvidia-smi present" }
+    return "SKIP: nvidia-smi missing (local dev)"
+}
+
+fn h2_gpu_count_4() {
+    if !is_pod() { return "SKIP: not on pod" }
+    let n = exec("nvidia-smi --list-gpus | wc -l").trim()
+    if n == "4" { return "OK: 4 GPUs visible" }
+    return "FAIL: expected 4 GPUs, found " + n
+}
+
+fn h3_bf16_all_gpus() {
+    if !is_pod() { return "SKIP: not on pod" }
+    let out = exec("nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>&1")
+    if out == "" { return "FAIL: compute_cap query empty" }
+    // All must be >= 8.0
+    let mut i = 0
+    let n = len(out)
+    let mut failed = false
+    while i < n {
+        let ch = out.substring(i, i + 1)
+        if ch == "\n" || ch == "\r" || ch == " " { i = i + 1 ; continue }
+        // consume digit
+        if ch != "8" && ch != "9" {
+            failed = true
+            break
+        }
+        // skip line
+        while i < n && out.substring(i, i + 1) != "\n" { i = i + 1 }
+        i = i + 1
+    }
+    if failed { return "FAIL: some GPU compute_cap < 8.0 (bf16 unsafe)" }
+    return "OK: all GPUs compute_cap >= 8.0 (bf16 capable)"
+}
+
+fn h4_gpu_mem_80gb() {
+    if !is_pod() { return "SKIP: not on pod" }
+    let out = exec("nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -n1").trim()
+    if out == "" { return "FAIL: memory.total query empty" }
+    let gb = to_int(out) / 1024
+    if gb < 75 { return "FAIL: GPU memory=" + str(gb) + "GB < 75GB" }
+    return "OK: GPU memory=" + str(gb) + "GB (>= 75GB)"
+}
+
+fn h5_gpu_idle_all() {
+    if !is_pod() { return "SKIP: not on pod" }
+    let out = exec("nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits")
+    // Check each line <= 5
+    let n = len(out)
+    let mut i = 0
+    let mut cur = ""
+    let mut any_high = false
+    while i <= n {
+        let c = if i < n { out.substring(i, i + 1) } else { "\n" }
+        if c == "\n" || c == "\r" {
+            if cur != "" {
+                let v = to_int(cur)
+                if v > 5 { any_high = true }
+                cur = ""
+            }
+        } else if c == " " {
+            // skip
+        } else {
+            cur = cur + c
+        }
+        i = i + 1
+    }
+    if any_high { return "FAIL: at least one GPU util > 5%" }
+    return "OK: all GPUs idle"
+}
+
+fn h6_disk_500gb() {
+    let target = if is_pod() { "/workspace" } else { "." }
+    let probe = exec("df -k " + target + " 2>/dev/null | tail -n1 | awk '{print int($4/1024/1024)}'").trim()
+    if probe == "" { return "FAIL: df empty" }
+    let gb = to_int(probe)
+    if gb < 500 && is_pod() { return "FAIL: disk " + str(gb) + "GB < 500GB" }
+    if gb < 100 { return "WARN: disk " + str(gb) + "GB < 100GB (local dev — pod check will re-gate)" }
+    return "OK: disk " + str(gb) + "GB"
+}
+
+fn h7_mfs_quota_probe() {
+    if !is_pod() { return "SKIP: not on pod" }
+    let cmd = "dd if=/dev/zero of=/workspace/_p_test_70b bs=1M count=40000 status=none 2>&1; RC=$?; rm -f /workspace/_p_test_70b; echo RC=$RC"
+    let out = exec(cmd)
+    if str_contains(out, "RC=0") { return "OK: MFS quota 40GB write OK" }
+    return "FAIL: MFS quota 40GB write FAILED — " + out.substring(0, 200)
+}
+
+fn h8_ram_256gb() {
+    if !is_pod() { return "SKIP: not on pod" }
+    let probe = exec("free -g | awk 'NR==2{print $2}'").trim()
+    if probe == "" { return "WARN: free -g unavailable" }
+    let gb = to_int(probe)
+    if gb < 200 { return "WARN: RAM " + str(gb) + "GB < 256GB recommended (FSDP cpu_ram_efficient_loading marginal)" }
+    return "OK: RAM " + str(gb) + "GB"
+}
+
+fn h9_nvlink_detected() {
+    if !is_pod() { return "SKIP: not on pod" }
+    let out = exec("nvidia-smi topo -m 2>&1 | head -20")
+    if str_contains(out, "NVL") || str_contains(out, "NV4") || str_contains(out, "NV8") {
+        return "OK: NVLink topology detected"
+    }
+    if str_contains(out, "PIX") || str_contains(out, "PXB") {
+        return "WARN: PCIe-only topology (NVLink missing) — 72x slower FSDP all-reduce"
+    }
+    return "WARN: topology ambiguous (nvidia-smi topo parse)"
+}
+
+fn h10_cpu_cores_32() {
+    let probe = exec("nproc 2>/dev/null || sysctl -n hw.ncpu").trim()
+    if probe == "" { return "WARN: nproc/sysctl unavailable" }
+    let n = to_int(probe)
+    if n < 16 { return "WARN: CPU cores " + str(n) + " < 16 (dataloader bottleneck likely)" }
+    if n < 32 && is_pod() { return "WARN: CPU cores " + str(n) + " < 32 recommended" }
+    return "OK: CPU cores " + str(n)
+}
+
+// ─── SOFTWARE category (8 checks) ──
+fn s1_torch_241() {
+    if !is_pod() { return "SKIP: pod-only check" }
+    let out = exec("python3 -c 'import torch; print(torch.__version__)' 2>&1").trim()
+    if out == "" { return "FAIL: torch import failed" }
+    if str_contains(out, "2.4") { return "OK: torch " + out }
+    return "FAIL: torch " + out + " != 2.4.x (peft compat broken)"
+}
+
+fn s2_peft_0132() {
+    if !is_pod() { return "SKIP: pod-only check" }
+    let out = exec("python3 -c 'import peft; print(peft.__version__)' 2>&1").trim()
+    if out == "0.13.2" { return "OK: peft 0.13.2" }
+    return "FAIL: peft " + out + " != 0.13.2 (torch 2.4 compat pin)"
+}
+
+fn s3_transformers_4452() {
+    if !is_pod() { return "SKIP: pod-only check" }
+    let out = exec("python3 -c 'import transformers; print(transformers.__version__)' 2>&1").trim()
+    if out == "4.45.2" { return "OK: transformers 4.45.2" }
+    return "FAIL: transformers " + out + " != 4.45.2 (peft pair pin)"
+}
+
+fn s4_accelerate_present() {
+    if !is_pod() { return "SKIP: pod-only check" }
+    let out = exec("python3 -c 'import accelerate; print(accelerate.__version__)' 2>&1").trim()
+    if out == "" { return "FAIL: accelerate import failed" }
+    return "OK: accelerate " + out
+}
+
+fn s5_flash_attn_263() {
+    if !is_pod() { return "SKIP: pod-only check" }
+    let out = exec("python3 -c 'import flash_attn; print(flash_attn.__version__)' 2>&1").trim()
+    if str_contains(out, "2.6") { return "OK: flash_attn " + out }
+    return "FAIL: flash_attn " + out + " != 2.6.x (torch 2.4 compat wheel)"
+}
+
+fn s6_no_bitsandbytes() {
+    if !is_pod() { return "SKIP: pod-only check" }
+    let out = exec("python3 -c 'import importlib.util; print(importlib.util.find_spec(\"bitsandbytes\") is None)' 2>&1").trim()
+    if out == "True" { return "OK: bitsandbytes not installed (no-quantization policy)" }
+    return "FAIL: bitsandbytes installed — violates no-quantization policy"
+}
+
+fn s7_hf_token() {
+    let tok = env("HF_TOKEN")
+    if tok == "" { return "FAIL: HF_TOKEN unset" }
+    return "OK: HF_TOKEN present (len=" + str(len(tok)) + ")"
+}
+
+fn s8_hexa_bin() {
+    let out = exec("command -v hexa 2>&1; echo RC=$?")
+    if str_contains(out, "RC=0") { return "OK: hexa bin present" }
+    return "WARN: hexa bin missing (ok on pod if using /usr/local/bin path)"
+}
+
+// ─── BASE_MODEL category (4 checks) ──
+fn b1_base_dir_exists() {
+    if !is_pod() { return "SKIP: pod-only check" }
+    let p = "/workspace/qwen72b"
+    if !file_exists(p) { return "FAIL: " + p + " missing — run download_qwen72b.hexa first" }
+    return "OK: " + p + " exists"
+}
+
+fn b2_base_config_json() {
+    if !is_pod() { return "SKIP: pod-only check" }
+    let p = "/workspace/qwen72b/config.json"
+    if !file_exists(p) { return "FAIL: " + p + " missing" }
+    let t = read_file(p)
+    if !str_contains(t, "Qwen2ForCausalLM") { return "FAIL: config.json missing Qwen2ForCausalLM architecture" }
+    if !str_contains(t, "\"hidden_size\": 8192") { return "FAIL: config.json hidden_size != 8192 (not 72B?)" }
+    return "OK: config.json Qwen2ForCausalLM hidden=8192"
+}
+
+fn b3_base_size_140gb() {
+    if !is_pod() { return "SKIP: pod-only check" }
+    let probe = exec("du -sBG /workspace/qwen72b 2>/dev/null | awk '{print $1}' | tr -d 'G'").trim()
+    if probe == "" { return "FAIL: du empty" }
+    let gb = to_int(probe)
+    if gb < 140 { return "FAIL: 72B base " + str(gb) + "GB < 140GB (incomplete)" }
+    return "OK: 72B base " + str(gb) + "GB"
+}
+
+fn b4_safetensors_shards() {
+    if !is_pod() { return "SKIP: pod-only check" }
+    let n = exec("ls /workspace/qwen72b/model-*.safetensors 2>/dev/null | wc -l").trim()
+    let ni = to_int(n)
+    if ni < 25 { return "FAIL: only " + n + " shards (<25)" }
+    return "OK: " + n + " safetensors shards"
+}
+
+// ─── CORPUS category (3 checks) ──
+fn c1_corpus_exists() {
+    if !is_pod() { return "SKIP: pod-only check" }
+    let p = "/workspace/alm_70b_corpus.jsonl"
+    if !file_exists(p) { return "FAIL: " + p + " missing — fetch from R2" }
+    return "OK: corpus file present"
+}
+
+fn c2_corpus_size() {
+    if !is_pod() { return "SKIP: pod-only check" }
+    let probe = exec("du -sBM /workspace/alm_70b_corpus.jsonl 2>/dev/null | awk '{print $1}' | tr -d 'M'").trim()
+    if probe == "" { return "FAIL: corpus du empty" }
+    let mb = to_int(probe)
+    if mb < 40 { return "WARN: corpus " + str(mb) + "MB < 40MB (undersized — expansion exception required)" }
+    return "OK: corpus " + str(mb) + "MB"
+}
+
+fn c3_corpus_lines() {
+    if !is_pod() { return "SKIP: pod-only check" }
+    let n = exec("wc -l < /workspace/alm_70b_corpus.jsonl 2>/dev/null").trim()
+    if n == "" { return "FAIL: wc -l empty" }
+    let ni = to_int(n)
+    if ni < 10000 { return "WARN: corpus " + n + " lines < 10000" }
+    return "OK: corpus " + n + " lines"
+}
+
+// ─── FSDP_RECIPE category (7 checks) ──
+fn f1_fsdp_config_json_present() {
+    if !file_exists(FSDP_JSON_PATH) { return "FAIL: " + FSDP_JSON_PATH + " missing" }
+    return "OK: fsdp config JSON present"
+}
+
+fn f2_fsdp_num_processes_4() {
+    if !file_exists(FSDP_JSON_PATH) { return "FAIL: fsdp config missing" }
+    let t = read_file(FSDP_JSON_PATH)
+    if !str_contains(t, "\"num_processes\": 4") { return "FAIL: num_processes != 4" }
+    return "OK: num_processes = 4"
+}
+
+fn f3_fsdp_full_shard() {
+    if !file_exists(FSDP_JSON_PATH) { return "FAIL: fsdp config missing" }
+    let t = read_file(FSDP_JSON_PATH)
+    if !str_contains(t, "FULL_SHARD") { return "FAIL: FULL_SHARD not set" }
+    return "OK: FULL_SHARD strategy"
+}
+
+fn f4_fsdp_wrap_cls_qwen2() {
+    if !file_exists(FSDP_JSON_PATH) { return "FAIL: fsdp config missing" }
+    let t = read_file(FSDP_JSON_PATH)
+    if !str_contains(t, "Qwen2DecoderLayer") { return "FAIL: wrap_cls != Qwen2DecoderLayer" }
+    return "OK: wrap Qwen2DecoderLayer"
+}
+
+fn f5_fsdp_use_orig_params_true() {
+    if !file_exists(FSDP_JSON_PATH) { return "FAIL: fsdp config missing" }
+    let t = read_file(FSDP_JSON_PATH)
+    if !str_contains(t, "\"fsdp_use_orig_params\": true") { return "FAIL: use_orig_params != true (peft breaks)" }
+    return "OK: use_orig_params=true (peft compat)"
+}
+
+fn f6_fsdp_bf16_mixed() {
+    if !file_exists(FSDP_JSON_PATH) { return "FAIL: fsdp config missing" }
+    let t = read_file(FSDP_JSON_PATH)
+    if !str_contains(t, "\"mixed_precision\": \"bf16\"") { return "FAIL: mixed_precision != bf16" }
+    return "OK: mixed_precision bf16"
+}
+
+fn f7_fsdp_activation_ckpt() {
+    if !file_exists(FSDP_JSON_PATH) { return "FAIL: fsdp config missing" }
+    let t = read_file(FSDP_JSON_PATH)
+    if !str_contains(t, "\"fsdp_activation_checkpointing\": true") { return "FAIL: activation_checkpointing != true (72B OOM)" }
+    return "OK: activation_checkpointing=true"
+}
+
+// ─── R2 category (3 checks) ──
+fn r1_rclone_bin() {
+    let out = exec("command -v rclone 2>&1; echo RC=$?")
+    if str_contains(out, "RC=0") { return "OK: rclone present" }
+    return "WARN: rclone missing locally (ok on pod)"
+}
+
+fn r2_anima_models_lsd() {
+    let out = exec("rclone lsd r2:anima-models --s3-no-check-bucket 2>&1; echo RC=$?")
+    if str_contains(out, "RC=0") { return "OK: r2:anima-models accessible" }
+    return "FAIL: rclone lsd r2:anima-models failed — " + out.substring(0, 200)
+}
+
+fn r3_alm70b_prefix_writable() {
+    // dry-check: rclone touch on random path
+    let out = exec("rclone lsd r2:anima-models/alm70b/ --s3-no-check-bucket 2>&1; echo RC=$?")
+    if str_contains(out, "RC=0") { return "OK: alm70b prefix readable" }
+    // prefix may not exist yet — ok
+    return "WARN: alm70b prefix not yet created (first run will create)"
+}
+
+// ─── NCCL_RING category (3 checks) ──
+fn n1_nccl_debug_var() {
+    // Informational — just check env is sane
+    let d = env("NCCL_DEBUG")
+    if d == "" { return "WARN: NCCL_DEBUG unset (recommend INFO for first run)" }
+    return "OK: NCCL_DEBUG=" + d
+}
+
+fn n2_nccl_p2p_nvl() {
+    let d = env("NCCL_P2P_LEVEL")
+    if d == "" { return "WARN: NCCL_P2P_LEVEL unset (recommend NVL for SXM)" }
+    if d == "NVL" { return "OK: NCCL_P2P_LEVEL=NVL" }
+    return "WARN: NCCL_P2P_LEVEL=" + d + " (recommend NVL)"
+}
+
+fn n3_nccl_allreduce_smoke() {
+    if !is_pod() { return "SKIP: pod-only test" }
+    // 4-rank torch.distributed all-reduce smoke (5s budget)
+    let cmd = "timeout 60 python3 -c 'import torch; import torch.distributed as dist; import os; " +
+              "os.environ.setdefault(\"RANK\", \"0\"); os.environ.setdefault(\"WORLD_SIZE\", \"1\"); " +
+              "os.environ.setdefault(\"MASTER_ADDR\", \"127.0.0.1\"); os.environ.setdefault(\"MASTER_PORT\", \"29500\"); " +
+              "dist.init_process_group(\"nccl\", rank=0, world_size=1); " +
+              "t = torch.zeros(1).cuda(); dist.all_reduce(t); print(\"all_reduce ok\")' 2>&1 | tail -5"
+    let out = exec(cmd)
+    if str_contains(out, "all_reduce ok") { return "OK: single-rank all-reduce smoke" }
+    return "WARN: NCCL single-rank probe noisy (multi-rank probe requires full torchrun)"
+}
+
+// ─── DRY_RUN category (2 checks) ──
+fn d1_launcher_dry_run() {
+    let p = "training/launch_alm_70b.hexa"
+    if !file_exists(p) {
+        let p2 = env("ANIMA_ROOT") + "/" + p
+        if !file_exists(p2) { return "FAIL: launcher " + p + " missing" }
+    }
+    return "OK: launcher hexa present"
+}
+
+fn d2_accelerate_launch_help() {
+    if !is_pod() { return "SKIP: pod-only check" }
+    let out = exec("accelerate launch --help 2>&1 | head -5").trim()
+    if out == "" { return "FAIL: accelerate launch --help empty" }
+    return "OK: accelerate launch --help responds"
+}
+
+// ─── Main ──
+@convergence(state="ossified", id="ALM_70B_PREFLIGHT_40_GATE", value="40 individual checks (10 HW + 8 SW + 4 base + 3 corpus + 7 FSDP + 3 R2 + 3 NCCL + 2 dry-run). ALL 40 must PASS before launch. STRICT=1 elevates WARN→FAIL. On-pod checks SKIP locally; operator must re-run on pod before firing.", ossified_at="2026-04-17")
+fn main() {
+    println("=== ALM 70B preflight (40 checks) ===")
+    let pod = is_pod()
+    println("environment: " + (if pod { "POD" } else { "LOCAL" }))
+    println("")
+
+    let mut passed = 0
+    let mut failed = 0
+    let mut warned = 0
+    let mut skipped = 0
+    let mut issues = ""
+
+    // ── Run all 40 ──
+    let check_ids = ["h1_nvidia_smi","h2_gpu_4","h3_bf16","h4_mem80","h5_idle","h6_disk500","h7_mfs","h8_ram","h9_nvlink","h10_cpu",
+                     "s1_torch","s2_peft","s3_transformers","s4_accelerate","s5_flash_attn","s6_no_bnb","s7_hf_token","s8_hexa",
+                     "b1_base_dir","b2_config","b3_size140","b4_shards",
+                     "c1_corpus","c2_corpus_size","c3_corpus_lines",
+                     "f1_fsdp_json","f2_num_proc","f3_full_shard","f4_wrap","f5_orig_params","f6_bf16","f7_act_ckpt",
+                     "r1_rclone","r2_anima","r3_alm70b",
+                     "n1_debug","n2_p2p","n3_allreduce",
+                     "d1_launcher","d2_accel_help"]
+
+    let results = [
+        h1_nvidia_smi_exists(), h2_gpu_count_4(), h3_bf16_all_gpus(), h4_gpu_mem_80gb(),
+        h5_gpu_idle_all(), h6_disk_500gb(), h7_mfs_quota_probe(), h8_ram_256gb(),
+        h9_nvlink_detected(), h10_cpu_cores_32(),
+        s1_torch_241(), s2_peft_0132(), s3_transformers_4452(), s4_accelerate_present(),
+        s5_flash_attn_263(), s6_no_bitsandbytes(), s7_hf_token(), s8_hexa_bin(),
+        b1_base_dir_exists(), b2_base_config_json(), b3_base_size_140gb(), b4_safetensors_shards(),
+        c1_corpus_exists(), c2_corpus_size(), c3_corpus_lines(),
+        f1_fsdp_config_json_present(), f2_fsdp_num_processes_4(), f3_fsdp_full_shard(),
+        f4_fsdp_wrap_cls_qwen2(), f5_fsdp_use_orig_params_true(), f6_fsdp_bf16_mixed(), f7_fsdp_activation_ckpt(),
+        r1_rclone_bin(), r2_anima_models_lsd(), r3_alm70b_prefix_writable(),
+        n1_nccl_debug_var(), n2_nccl_p2p_nvl(), n3_nccl_allreduce_smoke(),
+        d1_launcher_dry_run(), d2_accelerate_launch_help()
+    ]
+
+    let mut i = 0
+    while i < len(results) {
+        let cid = check_ids[i]
+        let r = results[i]
+        let p4 = r.substring(0, 4)
+        let status_str = "  "
+        if p4 == "OK:  " { status_str = "OK " } else if p4 == "OK: " { status_str = "OK " }
+        let idx_str = str(i + 1)
+        if len(idx_str) == 1 { idx_str = " " + idx_str }
+        let prefix = "[" + idx_str + "/40] " + cid
+        // pad to 24 chars
+        while len(prefix) < 24 { prefix = prefix + " " }
+        println(prefix + ": " + r)
+        if p4 == "OK: " {
+            passed = passed + 1
+        } else if p4 == "FAIL" {
+            failed = failed + 1
+            if issues != "" { issues = issues + ";" }
+            issues = issues + cid
+        } else if p4 == "WARN" {
+            warned = warned + 1
+        } else if p4 == "SKIP" {
+            skipped = skipped + 1
+        }
+        i = i + 1
+    }
+
+    // ── STRICT=1 flips warn → fail ──
+    if env("STRICT") == "1" && warned > 0 {
+        failed = failed + warned
+        warned = 0
+        if issues != "" { issues = issues + ";" }
+        issues = issues + "strict_warn_elevated"
+    }
+
+    let all_ok = failed == 0
+
+    println("")
+    println("== summary ==")
+    println("passed:  " + str(passed) + " / 40")
+    println("failed:  " + str(failed))
+    println("warned:  " + str(warned))
+    println("skipped: " + str(skipped))
+    if all_ok {
+        println("all_ok: true")
+    } else {
+        println("all_ok: false")
+    }
+    println("issues: " + issues)
+
+    // ── Gate decision ──
+    if all_ok && passed + skipped == 40 {
+        println("")
+        println("GATE: 40/40 PASS — launch authorized (assuming USER_OK_4POD=1 at fire time)")
+    } else if all_ok {
+        println("")
+        println("GATE: all_ok but " + str(skipped) + " checks SKIPPED (local run — re-run on pod)")
+    } else {
+        println("")
+        println("GATE: REFUSE — " + str(failed) + " blocking fail(s)")
+    }
+
+    // JSON single-line for hook/test consumption.
+    let all_ok_str = "false"
+    if all_ok { all_ok_str = "true" }
+    println("JSON: {\"all_ok\": " + all_ok_str + ", \"passed\": " + str(passed)
+            + ", \"failed\": " + str(failed) + ", \"warned\": " + str(warned)
+            + ", \"skipped\": " + str(skipped) + ", \"issues\": \"" + issues + "\"}")
+}

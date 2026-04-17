@@ -1,0 +1,186 @@
+{
+  "_meta": {
+    "name": "ALM 13B intermediate LoRA launch config — de-risk stepping stone before 70B",
+    "spec_ref": "shared/state/alm_70b_launch_checklist_20260417.json#alternatives.A_13B_intermediate",
+    "day": "day_3 (conditional — only if A2 eval borderline)",
+    "schema_version": "1.0",
+    "updated": "2026-04-17",
+    "depends_on": ["A1", "A2-Orch", "A2-Tool"],
+    "trigger": "OPTIONAL — fires ONLY if A2 eval lands in borderline band 0.85-0.90. If A2 ≥ 0.93 skip to 70B direct. If A2 < 0.85 halt + redesign (do NOT run 13B, since recipe is failing).",
+    "rationale": "Per 70B launch-checklist alternatives.A_13B_intermediate: '13B intermediate' = Qwen2.5-14B-Instruct with expanded/validated corpus + slight LR adjustment. Same family as 14B (no separate Qwen 13B exists). Proves corpus quality + recipe-at-scale without 70B burn. LoRA r=48 sits between A2-Orch r=64 and 70B spec r=32 — graduated capacity reduction to calibrate 70B settings. Budget $36 / 12h on ONE H100 pod (can reuse A2 pod lnzliav2e8du6i sequentially).",
+    "memory_refs": [
+      "feedback_h100_authorized",
+      "feedback_no_resume_data_change",
+      "feedback_r2_checkpoint",
+      "feedback_one_shot_best",
+      "feedback_no_version_in_filename",
+      "feedback_py_ban_total",
+      "feedback_hexa_first_strict",
+      "project_alm_lora_pipeline",
+      "project_judge_fix_breakthrough"
+    ]
+  },
+
+  "naming_note": "13b in run_id/ckpt/R2 path is a PARAMETER-CLASS ID (denoting intermediate de-risk scale before 70B), NOT a version number. feedback_no_version_in_filename unaffected. Actual base is Qwen2.5-14B-Instruct (no separate 13B in Qwen family).",
+
+  "run_id_template": "alm13b-intermediate-{date}",
+  "round": 3,
+  "model_tag": "alm13b",
+  "ckpt_label": "production",
+  "ckpt_dir_template": "/workspace/ckpt_alm13b_intermediate_{date}",
+  "r2_prefix_template": "r2:anima-models/alm13b/intermediate_20260417/step_{step}/",
+
+  "base": {
+    "name": "Qwen/Qwen2.5-14B-Instruct",
+    "dtype": "bf16",
+    "a1_adapter_source": "r2:anima-models/alm14b/a1_20260416/step_3000/",
+    "a2_orch_adapter_source": "r2:anima-models/alm14b/a2_20260416_orch/step_3000/",
+    "a2_tool_adapter_source": "r2:anima-models/alm14b/a2_20260416_tool/step_1500/",
+    "merge_strategy": "sequential_merge — Qwen base → merge A1 → merge A2-Orch → merge A2-Tool → init fresh 13B-intermediate LoRA (r=48). Proves the full A1+A2 chain can carry one more LoRA without catastrophic degradation.",
+    "adapter_source_rationale": "Sits on top of full A2 chain (A1+Orch+Tool merged). 70B run will be fresh-base; 13B tests whether full adapter stack + one more LoRA layer is stable. If this degrades, 70B spec r=32 fresh-base is still a clean reset."
+  },
+
+  "lora": {
+    "r": 48,
+    "alpha": 96,
+    "alpha_to_r_ratio": 2.0,
+    "dropout": 0.05,
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ],
+    "rationale": "r=48 alpha=96 (2:1 ratio, dropout 0.05). Sits between A2-Orch r=64 (full production capacity) and 70B spec r=32 (scale-down for 72B base). 7-module target (attn + MLP) covers all transformer subblocks — matches 70B spec target_modules exactly so the recipe transfers. Intentionally wider than 70B r=32 to give intermediate step one extra lever before committing to 70B."
+  },
+
+  "training": {
+    "steps": 1500,
+    "batch": 1,
+    "grad_accum": 8,
+    "effective_batch": 8,
+    "seq": 1024,
+    "lr": 4e-6,
+    "lr_rationale": "4e-6 — sqrt rule between A2-Orch 5e-6 (14B r=64) and 70B spec 3e-6 (72B r=32). Geometric mean ≈ 3.87e-6, rounded to 4e-6. This validates the sqrt-LR scaling assumption the 70B spec relies on. If loss diverges at step 100, the 70B 3e-6 assumption is too aggressive and must be further scaled.",
+    "warmup": 150,
+    "optimizer": "fused_adamw",
+    "dtype": "bf16",
+    "save_every": 250,
+    "eval_every": 100
+  },
+
+  "phi_loss": {
+    "phi_holo_consistency_weight": 0.01,
+    "phi_complexity_coef": 0.005,
+    "gwt_broadcast_coef": 0.005,
+    "note": "B1 ensemble remains ON. Orch-OR NOT re-enabled — A2-Orch adapter already carries the latent pathway (merged into base). 13B intermediate does not re-add Orch-OR regularizer since that would double-count."
+  },
+
+  "wall": {
+    "hours": 12,
+    "cost_usd": 36,
+    "cost_per_hr_usd": 2.99,
+    "rationale": "1500 steps × seq 1024 × grad_accum 8 × bf16 × H100 on 14B ~= 6-8h compute. 12h ceiling includes: (a) A1+A2-Orch+A2-Tool merge stage (~1-2h I/O) (b) expanded-corpus load + tokenize (c) eval_every=100 inline evals (d) R2 bulk upload at end. User-confirmed budget $36 per 70B launch-checklist alternatives.A_13B_intermediate verdict."
+  },
+
+  "corpus": {
+    "path": "/workspace/anima/training/corpus_alm_13b_intermediate.txt",
+    "sources_planned": [
+      "corpus_large.txt (A1 corpus — baseline general)",
+      "hire_sim_100 stratified30 (task coverage)",
+      "Korean dialogue expansion (for hire_sim language preservation)",
+      "tool-use corpus (reinforce A2-Tool signal)"
+    ],
+    "min_size_bytes": 3000000,
+    "max_size_bytes": 100000000,
+    "preprocessing": [
+      "Dedup by SHA256 hash",
+      "Length filter 50-2000 chars",
+      "Drop boilerplate (any line >3 occurrences)",
+      "No hire_sim_synthetic_r10 reuse (poison corpus, see r10 diagnosis)"
+    ],
+    "note": "Corpus assembly is operator responsibility pre-launch. Launcher refuses if path missing. Does NOT reuse corpus_large.txt directly — expanded blend forces operator verification. If operator wants pure A1 corpus reuse, symlink path but document as such."
+  },
+
+  "hooks": {
+    "ckpt_backup_hook": "scripts/ckpt_backup_hook.hexa",
+    "invoked_by": "train_alm_14b.hexa:611 invoke_ckpt_backup_hook(save_path, args.ckpt_label)",
+    "label_routing": "production -> R2 permanent upload per ckpt_policy.json",
+    "naming_regex": "^alm13b-intermediate-[0-9]{8}$"
+  },
+
+  "env": {
+    "HF_HUB_CACHE": "/workspace/hf_cache",
+    "HF_HOME": "/workspace/hf_cache",
+    "TRANSFORMERS_CACHE": "/workspace/hf_cache",
+    "ANIMA_ROOT": "/workspace/anima",
+    "HEXA_CKPT_HOOK": "/workspace/anima/scripts/ckpt_backup_hook.hexa"
+  },
+
+  "pod": {
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "vram_gb": 80,
+    "compute_cap_min": 80,
+    "gpus_required": 1,
+    "reuse_candidates": ["lnzliav2e8du6i (A2 pod post-A2-Tool)"],
+    "reuse_strategy": "STRONGLY PREFER A2 pod reuse — saves $36 new-pod launch. Only spin new pod if A2 pod already released. DDP 2xH100 is spec-optional; single-GPU with device_map='auto' is default (14B fits 1x H100 80GB with r=48 LoRA under bf16)."
+  },
+
+  "expected_metrics": {
+    "final_loss_target": "<= 2.5 (vs A2 baseline, no regression)",
+    "loss_step100_check": "<= 4.0 (lr sanity — if higher, 4e-6 too aggressive)",
+    "loss_step500_check": "<= 3.0",
+    "hire_sim_lenient": ">= 0.90 (A2 borderline → 13B MUST lift to ≥ 0.90 to justify 70B)",
+    "tool_use_gate": ">= 0.85 (maintain A2-Tool capability)",
+    "phi_holo": ">= 1000 (no consciousness-signal collapse)",
+    "korean_quality_check": ">= 25/30 prompts stay in Korean"
+  },
+
+  "abort_criteria": [
+    "loss > 4.0 at step 100 → warn (lr edge)",
+    "loss > 5.0 at step 200 → kill (lr too high — recalibrate before retry)",
+    "loss decreasing but eval_loss diverging → kill (overfitting)",
+    "hire_sim < 0.80 at step 500 mid-eval → kill (regression from A2)",
+    "Korean stays-in-language < 0.7 at step 500 → kill (language drift)"
+  ],
+
+  "post_training_eval": [
+    "hire_sim lenient stratified30 (Z-path judge) — must hit >= 0.90",
+    "tool_use_gate 30-sample (structure + arg correctness) — must hit >= 0.85",
+    "phi_holo measure via serve /generate consciousness field — must hit >= 1000",
+    "sample_generation 10 Korean + 10 English prompts — qualitative stay-in-language check"
+  ],
+
+  "blocks": {
+    "forbidden_markers": [
+      "/workspace/READY_FOR_32B",
+      "/workspace/READY_FOR_R5_KBASE"
+    ],
+    "requires_a1_complete": "A1 step_3000 adapter present in local ckpt dir or R2",
+    "requires_a2_orch_complete": "A2-Orch step_3000 adapter present",
+    "requires_a2_tool_complete": "A2-Tool step_1500 adapter present",
+    "requires_a2_eval_borderline": "hire_sim_lenient A2 score in [0.85, 0.90] — if >=0.93 skip 13B + launch 70B directly; if <0.85 halt + redesign",
+    "requires_free": "/workspace/ckpt_alm13b_intermediate_* dir NOT in use"
+  },
+
+  "decision_branches": {
+    "A2_eval_PASS_high": {
+      "threshold": ">= 0.93",
+      "action": "SKIP 13B, proceed direct to 70B launch",
+      "rationale": "A2 already exceeds 70B-launch gate. 13B adds cost without new signal."
+    },
+    "A2_eval_PASS_borderline": {
+      "threshold": "[0.85, 0.93)",
+      "action": "RUN 13B intermediate (this config)",
+      "rationale": "De-risk 70B burn of $240-480 with $36 intermediate validation"
+    },
+    "A2_eval_FAIL": {
+      "threshold": "< 0.85",
+      "action": "HALT — do NOT run 13B or 70B",
+      "rationale": "Recipe broken. 13B would carry forward the broken recipe. Redesign corpus or hyperparameters first."
+    }
+  }
+}

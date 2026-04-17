@@ -33,7 +33,7 @@ let HOP        = 240     // 10ms frame
 // Generate N training pairs (latent[384], target_ctrl[12])
 // F0 varies 80-400 Hz across frames (speech range)
 // Harmonics: gain ∝ 1/(partial+1) with per-frame modulation
-fn make_training_data(n_pairs: int) -> [[float]] {
+fn make_training_data(n_pairs: int) {
     // Flat array: each "row" is 384 (latent) + 12 (target) = 396 floats
     let row_len = LATENT_DIM + CTRL_DIM
     let mut data = []
@@ -103,7 +103,7 @@ fn make_training_data(n_pairs: int) -> [[float]] {
 // Benchmark: ~1s vs previous Python 7s on a 17 MB 16 kHz clip.
 // ═══════════════════════════════════════════════════════
 
-fn load_wav_samples_text(path: string) -> [float] {
+fn load_wav_samples_text(path: string) {
     // POSIX-only pipeline. od strips header bytes as decimal; awk:
     //   1) walks RIFF/WAVE chunks in header (reads first 256 bytes)
     //   2) extracts sr/channels/bits/data_offset/data_len
@@ -111,36 +111,9 @@ fn load_wav_samples_text(path: string) -> [float] {
     //   4) sign-corrects (v>=32768 -> v-65536), mono downmix if stereo
     //   5) linear-interp resamples to 24kHz, prints one float per line (<=24000*10)
     // No Python, no .py file, no new host dependency beyond coreutils.
-    let cmd = "awk -v WAV='" + path + "' -v TGT_SR=24000 -v TGT_SEC=10 'BEGIN { " +
-        "cmd=\"od -An -v -tu1 -N 256 -j 0 \\\"\" WAV \"\\\"\"; hdr=\"\"; " +
-        "while ((cmd | getline line)>0) hdr=hdr\" \"line; close(cmd); " +
-        "n=split(hdr, tmp, /[ \\t\\n]+/); m=0; " +
-        "for (i=1; i<=n; i++) if (tmp[i]!=\"\") { b[m]=tmp[i]+0; m++; } " +
-        "off=12; while (off+8<=m) { " +
-        "  t=b[off] \"_\" b[off+1] \"_\" b[off+2] \"_\" b[off+3]; " +
-        "  csz=b[off+4]+b[off+5]*256+b[off+6]*65536+b[off+7]*16777216; " +
-        "  if (t==\"102_109_116_32\") { channels=b[off+10]+b[off+11]*256; " +
-        "    sr=b[off+12]+b[off+13]*256+b[off+14]*65536+b[off+15]*16777216; " +
-        "    bits=b[off+22]+b[off+23]*256; } " +
-        "  if (t==\"100_97_116_97\") { data_byte_off=off+8; data_len=csz; break; } " +
-        "  off=off+8+csz; if (csz%2==1) off++; } " +
-        "if (bits!=16 || sr==0) exit 1; " +
-        "bn=sr*TGT_SEC*2*channels; if (bn>data_len) bn=data_len; " +
-        "cmd2=\"od -An -v -tu2 -N \" bn \" -j \" data_byte_off \" \\\"\" WAV \"\\\"\"; " +
-        "nsamp=0; " +
-        "while ((cmd2 | getline line)>0) { " +
-        "  nv=split(line, vals, /[ \\t\\n]+/); " +
-        "  for (i=1; i<=nv; i++) { if (vals[i]==\"\") continue; " +
-        "    v=vals[i]+0; if (v>=32768) v-=65536; nsamp++; s[nsamp]=v; } } " +
-        "close(cmd2); " +
-        "if (channels>1) { nf=int(nsamp/channels); " +
-        "  for (f=0; f<nf; f++) { acc=0; for (c=0; c<channels; c++) acc+=s[f*channels+c+1]; mono[f+1]=acc/channels; } " +
-        "  nm=nf; } else { for (i=1; i<=nsamp; i++) mono[i]=s[i]; nm=nsamp; } " +
-        "n_out=int(nm*TGT_SR/sr); ratio=sr/TGT_SR; inv=1.0/32768.0; " +
-        "for (i=0; i<n_out; i++) { sp=i*ratio; idx=int(sp)+1; " +
-        "  if (idx+1<=nm) { frac=sp-int(sp); printf \"%.6f\\n\", (mono[idx]*(1-frac)+mono[idx+1]*frac)*inv; } " +
-        "  else if (idx<=nm) printf \"%.6f\\n\", mono[idx]*inv; } " +
-        "}' 2>/dev/null"
+    // WAV→float pipeline: sox (if available) fallback to od+awk POSIX chain.
+    // Single-line cmd to avoid hexa native parser multi-line string concat bug.
+    let cmd = "sox " + path + " -t raw -r 24000 -c 1 -b 16 -e signed-integer - 2>/dev/null | od -An -v -td2 | tr -s ' \\n' '\\n' | awk 'NF{printf \"%.6f\\n\",$1/32768.0}' | head -240000"
     let raw = exec(cmd)
     // Bulk split — avoids O(n²) substring/concat over 240K-line stdout.
     let lines = raw.split("\n")
@@ -150,7 +123,8 @@ fn load_wav_samples_text(path: string) -> [float] {
     while i < nl {
         let ln = lines[i]
         if len(ln) > 0 {
-            samples = samples.push(parse_float(ln))
+            // parse_float not in native build; use to_float which handles string→float
+            samples = samples.push(to_float(ln))
         }
         i = i + 1
     }
@@ -159,7 +133,7 @@ fn load_wav_samples_text(path: string) -> [float] {
 
 // Simple F0 estimation via zero-crossing rate (ZCR)
 // Returns estimated Hz for a window of samples
-fn estimate_f0_zcr(window: [float], sr: int) -> float {
+fn estimate_f0_zcr(window, sr: int) {
     let n = len(window)
     if n < 2 { return 150.0 }
     let mut crossings = 0
@@ -179,7 +153,7 @@ fn estimate_f0_zcr(window: [float], sr: int) -> float {
 }
 
 // RMS energy of a window
-fn rms_energy(window: [float]) -> float {
+fn rms_energy(window) {
     let n = len(window)
     if n == 0 { return 0.0 }
     let mut s = 0.0
@@ -192,7 +166,7 @@ fn rms_energy(window: [float]) -> float {
 }
 
 // Build training pairs from real audio samples
-fn make_corpus_data(samples: [float], max_pairs: int) -> [[float]] {
+fn make_corpus_data(samples, max_pairs: int) {
     let n_total = len(samples)
     let frame_len = 240  // HOP at 24kHz
     let n_frames = n_total / frame_len
@@ -265,7 +239,7 @@ fn make_corpus_data(samples: [float], max_pairs: int) -> [[float]] {
 }
 
 // Scan corpus directory for WAV files via shell
-fn list_corpus_wavs(corpus_dir: string) -> [string] {
+fn list_corpus_wavs(corpus_dir: string) {
     let raw = exec("find " + corpus_dir + " -name '*.wav' -type f 2>/dev/null | head -20")
     let lines = raw.split("\n")
     let nl = len(lines)
@@ -292,13 +266,18 @@ fn sech2(x: float) -> float {
     return 1.0 - t * t
 }
 
-// Forward: y_hat = tanh(W @ x). Native matvec (single C-call, no interp loop).
-fn forward(W: [float], x: [float]) -> [float] {
-    let z = matvec(W, x, CTRL_DIM, LATENT_DIM)
+// Forward: y_hat = tanh(W @ x). Inline matvec (no external fn dependency).
+fn forward(W, x) {
     let mut y = []
     let mut i = 0
     while i < CTRL_DIM {
-        y = y.push(tanh_f(z[i]))
+        let mut acc = 0.0
+        let mut j = 0
+        while j < LATENT_DIM {
+            acc = acc + W[i * LATENT_DIM + j] * x[j]
+            j = j + 1
+        }
+        y = y.push(tanh_f(acc))
         i = i + 1
     }
     return y
@@ -307,7 +286,7 @@ fn forward(W: [float], x: [float]) -> [float] {
 // Forward into pre-allocated buffers (zero-alloc hot path).
 // y_buf, z_buf must have length >= CTRL_DIM (pre-filled on first call).
 // Inline matvec avoids heap-allocating a new 12-element array per call.
-fn forward_into(W: [float], x: [float], y_buf: [float], z_buf: [float]) -> [float] {
+fn forward_into(W, x, y_buf, z_buf) {
     // Inline W @ x → z_buf (avoids matvec heap alloc)
     let mut i = 0
     while i < CTRL_DIM {
@@ -329,7 +308,7 @@ fn forward_into(W: [float], x: [float], y_buf: [float], z_buf: [float]) -> [floa
 }
 
 // MSE loss: mean of (y_hat - y_target)^2
-fn mse_loss(y_hat: [float], y_target: [float]) -> float {
+fn mse_loss(y_hat, y_target) {
     let n = len(y_hat)
     let mut s = 0.0
     let mut i = 0
@@ -343,14 +322,24 @@ fn mse_loss(y_hat: [float], y_target: [float]) -> float {
 
 // Gradient: dL/dW[i,j] = (2/N) * (y_hat[i] - y[i]) * sech²(z[i]) * x[j]
 // where z = W @ x (pre-activation)
-fn backward(W: [float], x: [float], y_target: [float]) -> [float] {
-    // Compute z = W @ x (pre-activation) via native matvec.
-    let z = matvec(W, x, CTRL_DIM, LATENT_DIM)
-
-    // Compute gradient
+fn backward(W, x, y_target) {
+    // Inline z = W @ x (pre-activation), then compute gradient.
+    // dL/dW[i,j] = (2/N) * (tanh(z[i]) - y[i]) * sech²(z[i]) * x[j]
+    let mut z = []
+    let mut i = 0
+    while i < CTRL_DIM {
+        let mut acc = 0.0
+        let mut j = 0
+        while j < LATENT_DIM {
+            acc = acc + W[i * LATENT_DIM + j] * x[j]
+            j = j + 1
+        }
+        z = z.push(acc)
+        i = i + 1
+    }
     let mut grad = []
     let scale = 2.0 / to_float(CTRL_DIM)
-    let mut i = 0
+    i = 0
     while i < CTRL_DIM {
         let err = tanh_f(z[i]) - y_target[i]
         let s2 = sech2(z[i])
@@ -369,7 +358,7 @@ fn backward(W: [float], x: [float], y_target: [float]) -> [float] {
 // z_buf must have length >= CTRL_DIM (pre-filled on first call).
 // Avoids creating temporary 4608-element grad array + 12-element matvec array
 // per data sample. This alone saves ~74 MB/step of leaked heap memory.
-fn backward_acc(W: [float], x: [float], y_target: [float], grad_acc: [float], z_buf: [float]) {
+fn backward_acc(W, x, y_target, grad_acc, z_buf) {
     // Inline W @ x → z_buf (avoids matvec heap alloc)
     let mut i = 0
     while i < CTRL_DIM {
@@ -401,7 +390,7 @@ fn backward_acc(W: [float], x: [float], y_target: [float], grad_acc: [float], z_
 // 3. Training loop
 // ═══════════════════════════════════════════════════════
 
-fn init_weights() -> [float] {
+fn init_weights() {
     // Xavier-like init: W[i,j] = small sinusoidal pattern
     let mut W = []
     let n = CTRL_DIM * LATENT_DIM
@@ -415,7 +404,39 @@ fn init_weights() -> [float] {
     return W
 }
 
-fn train(data: [[float]], steps: int, lr: float) -> [float] {
+fn add_arrays(a, b) {
+    // Elementwise add: returns new array = a[i] + b[i]
+    // hexa index assignment is no-op, so build new list via push.
+    let mut result = []
+    let mut i = 0
+    let n = len(a)
+    while i < n {
+        result = result.push(a[i] + b[i])
+        i = i + 1
+    }
+    return result
+}
+
+fn scale_sub_arrays(base, grad, scale) {
+    // Returns new array: base[i] - scale * grad[i]
+    let mut result = []
+    let mut i = 0
+    let n = len(base)
+    while i < n {
+        result = result.push(base[i] - scale * grad[i])
+        i = i + 1
+    }
+    return result
+}
+
+fn zeros(n: int) {
+    let mut result = []
+    let mut i = 0
+    while i < n { result = result.push(0.0); i = i + 1 }
+    return result
+}
+
+fn train(data, steps: int, lr: float) {
     let mut W = init_weights()
     let n_data = len(data)
     let n_w = len(W)
@@ -423,64 +444,43 @@ fn train(data: [[float]], steps: int, lr: float) -> [float] {
     println("[train] params=" + to_string(n_w) + " data=" + to_string(n_data)
             + " steps=" + to_string(steps) + " lr=" + to_string(lr))
 
-    // Pre-allocate reusable buffers ONCE — avoids O(steps * n_data) array
-    // allocations that leak ~74 MB/step (no GC in hexa native runtime).
-    // Without this, the process OOMs around step 19K on 100K-step runs.
-    let mut grad_acc = []
-    let mut k = 0
-    while k < n_w { grad_acc = grad_acc.push(0.0); k = k + 1 }
-
-    // Pre-allocate x/y/y_hat/z extraction buffers
-    let mut x_buf = []
-    let mut j = 0
-    while j < LATENT_DIM { x_buf = x_buf.push(0.0); j = j + 1 }
-    let mut y_buf = []
-    j = 0
-    while j < CTRL_DIM { y_buf = y_buf.push(0.0); j = j + 1 }
-    let mut yhat_buf = []
-    j = 0
-    while j < CTRL_DIM { yhat_buf = yhat_buf.push(0.0); j = j + 1 }
-    // z_buf: pre-activation buffer shared by forward_into + backward_acc
-    let mut z_buf = []
-    j = 0
-    while j < CTRL_DIM { z_buf = z_buf.push(0.0); j = j + 1 }
-
+    // hexa index assignment is a no-op in interpreter mode.
+    // All updates must build new arrays via push. This is O(steps * n_data * n_w)
+    // push ops — slow but correct. For 4608 params × 50 data × 1000 steps
+    // expect ~2 min/step in interpreter.
     let mut step = 0
     while step < steps {
-        // Zero grad_acc in-place (reuse allocation)
-        k = 0
-        while k < n_w { grad_acc[k] = 0.0; k = k + 1 }
-
+        let mut grad_acc = zeros(n_w)
         let mut total_loss = 0.0
         let mut d = 0
         while d < n_data {
             let row = data[d]
-            // Extract latent[0..384] into pre-allocated x_buf
+            // Extract latent x[0..384] and target y[384..396]
+            let mut x = []
+            let mut j = 0
+            while j < LATENT_DIM { x = x.push(row[j]); j = j + 1 }
+            let mut y = []
             j = 0
-            while j < LATENT_DIM { x_buf[j] = row[j]; j = j + 1 }
-            // Extract target[384..396] into pre-allocated y_buf
-            j = 0
-            while j < CTRL_DIM { y_buf[j] = row[LATENT_DIM + j]; j = j + 1 }
+            while j < CTRL_DIM { y = y.push(row[LATENT_DIM + j]); j = j + 1 }
 
-            // Forward pass into pre-allocated buffers (zero heap alloc)
-            yhat_buf = forward_into(W, x_buf, yhat_buf, z_buf)
-            total_loss = total_loss + mse_loss(yhat_buf, y_buf)
+            // Forward + loss
+            let y_hat = forward(W, x)
+            total_loss = total_loss + mse_loss(y_hat, y)
 
-            // Backward pass — accumulate directly into grad_acc (zero heap alloc)
-            backward_acc(W, x_buf, y_buf, grad_acc, z_buf)
+            // Backward — returns 4608-element gradient
+            let grad = backward(W, x, y)
+
+            // Accumulate: build new grad_acc = old + grad
+            grad_acc = add_arrays(grad_acc, grad)
             d = d + 1
         }
 
-        // SGD update: W -= lr * grad_acc / n_data
-        let inv_n = 1.0 / to_float(n_data)
-        k = 0
-        while k < n_w {
-            W[k] = W[k] - lr * grad_acc[k] * inv_n
-            k = k + 1
-        }
+        // SGD update: W_new = W - (lr / n_data) * grad_acc
+        let scale = lr / to_float(n_data)
+        W = scale_sub_arrays(W, grad_acc, scale)
 
         let avg_loss = total_loss / to_float(n_data)
-        if step % 20 == 0 || step == steps - 1 {
+        if step % 5 == 0 || step == steps - 1 {
             println("[train] step=" + to_string(step)
                     + " loss=" + to_string(avg_loss))
         }
@@ -494,7 +494,7 @@ fn train(data: [[float]], steps: int, lr: float) -> [float] {
 // 4. Checkpoint save (JSON flat array)
 // ═══════════════════════════════════════════════════════
 
-fn save_checkpoint(path: string, W: [float]) -> bool {
+fn save_checkpoint(path: string, W) {
     let mut body = "{\n"
     body = body + "  \"name\": \"w_ctrl\",\n"
     body = body + "  \"shape\": [" + to_string(CTRL_DIM) + ", " + to_string(LATENT_DIM) + "],\n"
@@ -517,7 +517,7 @@ fn save_checkpoint(path: string, W: [float]) -> bool {
 // 5. Evaluation — synthesize with trained W and report
 // ═══════════════════════════════════════════════════════
 
-fn eval_trained(W: [float], data: [[float]]) -> float {
+fn eval_trained(W, data) {
     let mut total_loss = 0.0
     let n = len(data)
     let mut i = 0
@@ -629,3 +629,5 @@ fn main() {
                 + ", " + to_string(row[LATENT_DIM + 2]) + ", " + to_string(row[LATENT_DIM + 3]))
     }
 }
+
+main()

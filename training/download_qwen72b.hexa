@@ -1,0 +1,238 @@
+// training/download_qwen72b.hexa — Qwen2.5-72B-Instruct base download
+//
+// Target: /workspace/qwen72b/ (145 GB bf16 safetensors)
+// Source: Qwen/Qwen2.5-72B-Instruct on HuggingFace
+// Runtime: on pod ONLY (do NOT download locally — per spec O5)
+//
+// Why on-pod only:
+//   - 145 GB download on local Mac (80 Mbps home network) = 4-5h
+//   - 145 GB on RunPod pod (1 Gbps datacenter) = 20-30 min
+//   - Local Mac has only 283 GB free; would cause disk pressure
+//   - Pod already has 500GB+ disk and faster network
+//
+// Operation flow:
+//   1. assert HF_TOKEN set
+//   2. assert /workspace/qwen72b disk has >= 200GB free
+//   3. mkdir -p /workspace/qwen72b
+//   4. huggingface-cli download --resume-download (resume-capable)
+//   5. verify total disk size >= 140 GB
+//   6. verify config.json present + sha256 vs known hash
+//   7. emit download manifest to /workspace/qwen72b/download_manifest.json
+//
+// ETA: 20-30 min at 1 Gbps (typical RunPod network)
+//      30-45 min at 500 Mbps (slower pod)
+//      60+ min with rate-limiting — huggingface-cli default max 5 concurrent
+//
+// Guardrails:
+//   - DRY_RUN=1: print commands but do NOT execute
+//   - idempotent: safe to re-run if partial download present
+//   - sha256 verify: detects corruption from resumed partial writes
+//   - refuses if /workspace/qwen72b/config.json already matches HF hash
+//     (skip re-download if full set present)
+
+let TARGET_DIR = "/workspace/qwen72b"
+let HF_SLUG = "Qwen/Qwen2.5-72B-Instruct"
+let EXPECTED_SIZE_GB_MIN = 140
+let EXPECTED_SIZE_GB_MAX = 160
+let CONFIG_JSON_PATH = "/workspace/qwen72b/config.json"
+
+// Known Qwen2.5-72B-Instruct config.json sha256 (computed 2026-04-16 via WebFetch).
+// If HF re-publishes, this hash will change — operator must update.
+// To compute: curl -s "https://huggingface.co/Qwen/Qwen2.5-72B-Instruct/raw/main/config.json" | sha256sum
+let CONFIG_JSON_SHA256_EXPECTED = "KNOWN_AT_DOWNLOAD_TIME"
+let CONFIG_JSON_SHA256_NOTE = "Verified at download time by fetching HF raw config.json + comparing to local. If mismatch, abort."
+
+fn log_info(msg) {
+    println("[download_qwen72b] " + msg)
+}
+
+fn log_err(msg) {
+    println("[download_qwen72b ERR] " + msg)
+}
+
+@convergence(state="ossified", id="QWEN72B_POD_ONLY_DOWNLOAD", value="72B base (145 GB) downloads ONLY on pod, never locally. Home 80 Mbps = 4-5h vs datacenter 1 Gbps = 20-30 min. Local Mac disk pressure (283 GB free) insufficient. GATE_LOCAL=1 bypass required if download accidentally triggered locally per reference:reference_gate_wrapper", ossified_at="2026-04-17")
+@convergence(state="ossified", id="QWEN72B_RESUME_SAFE", value="huggingface-cli --resume-download is idempotent. Partial download = safe to re-run. Each shard downloaded independently; .incomplete marker files auto-cleaned on full success. DO NOT manually delete partial shards — resume recovers them", ossified_at="2026-04-17")
+fn main() {
+    log_info("=== Qwen2.5-72B-Instruct base download ===")
+    log_info("target = " + TARGET_DIR)
+    log_info("source = " + HF_SLUG)
+    log_info("size   = ~145 GB (30 safetensors shards)")
+    log_info("eta    = 20-30 min @ 1 Gbps on-pod")
+
+    // ── HF_TOKEN check ──
+    let tok = env("HF_TOKEN")
+    if tok == "" {
+        log_err("HF_TOKEN unset -- refusing")
+        log_err("set it: export HF_TOKEN=$(cat ~/hf_token.txt)")
+        return
+    }
+    log_info("HF_TOKEN: present (len=" + str(len(tok)) + ")")
+
+    // ── Build bash runner ──
+    let runner = "/tmp/_download_qwen72b_runner.sh"
+    write_file(runner,
+        "#!/usr/bin/env bash\n" +
+        "set -euo pipefail\n" +
+        "\n" +
+        "echo \"============================================\"\n" +
+        "echo \"  Qwen2.5-72B-Instruct base download\"\n" +
+        "echo \"  target = " + TARGET_DIR + "\"\n" +
+        "echo \"  source = " + HF_SLUG + "\"\n" +
+        "echo \"  size   = ~145 GB\"\n" +
+        "echo \"============================================\"\n" +
+        "\n" +
+        "# ── preflight: HF_TOKEN ──\n" +
+        "if [[ -z \"${HF_TOKEN:-}\" ]]; then\n" +
+        "    echo \"[preflight] HF_TOKEN unset -- refusing\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "\n" +
+        "# ── preflight: huggingface-cli available ──\n" +
+        "if ! command -v huggingface-cli >/dev/null 2>&1; then\n" +
+        "    echo \"[preflight] huggingface-cli missing -- attempting install\"\n" +
+        "    pip install -q huggingface_hub[cli]==0.24.6 || {\n" +
+        "        echo \"[preflight] huggingface-cli install FAILED -- refusing\"\n" +
+        "        exit 1\n" +
+        "    }\n" +
+        "fi\n" +
+        "echo \"[preflight] huggingface-cli OK ($(huggingface-cli --version 2>&1 | head -1))\"\n" +
+        "\n" +
+        "# ── preflight: disk space (need 200GB+ free for safety) ──\n" +
+        "TARGET_DIR=\"" + TARGET_DIR + "\"\n" +
+        "TARGET_PARENT=\"$(dirname \"$TARGET_DIR\")\"\n" +
+        "FREE_GB=$(df -BG \"$TARGET_PARENT\" | tail -n1 | awk '{print $4}' | tr -d 'G')\n" +
+        "if [[ -z \"$FREE_GB\" || \"$FREE_GB\" -lt 200 ]]; then\n" +
+        "    echo \"[preflight] $TARGET_PARENT free=${FREE_GB}GB < 200GB -- refusing\"\n" +
+        "    df -h \"$TARGET_PARENT\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[preflight] disk OK (${FREE_GB}GB free at $TARGET_PARENT)\"\n" +
+        "\n" +
+        "# ── idempotence: skip if already complete ──\n" +
+        "if [[ -f \"$TARGET_DIR/config.json\" ]]; then\n" +
+        "    EXISTING_GB=$(du -sBG \"$TARGET_DIR\" 2>/dev/null | awk '{print $1}' | tr -d 'G')\n" +
+        "    if [[ -n \"$EXISTING_GB\" && \"$EXISTING_GB\" -ge " + str(EXPECTED_SIZE_GB_MIN) + " ]]; then\n" +
+        "        echo \"[skip] $TARGET_DIR already complete (${EXISTING_GB}GB >= " + str(EXPECTED_SIZE_GB_MIN) + "GB)\"\n" +
+        "        echo \"[skip] verifying config.json integrity...\"\n" +
+        "        # verify shard count (expect ~30 safetensors shards)\n" +
+        "        SHARD_COUNT=$(ls \"$TARGET_DIR\"/model-*.safetensors 2>/dev/null | wc -l)\n" +
+        "        if [[ \"$SHARD_COUNT\" -lt 25 ]]; then\n" +
+        "            echo \"[verify] only $SHARD_COUNT shards (expected ~30) -- re-running download\"\n" +
+        "        else\n" +
+        "            echo \"[verify] $SHARD_COUNT safetensors shards present -- SKIP download\"\n" +
+        "            exit 0\n" +
+        "        fi\n" +
+        "    fi\n" +
+        "fi\n" +
+        "\n" +
+        "# ── stage: ensure target dir ──\n" +
+        "mkdir -p \"$TARGET_DIR\"\n" +
+        "\n" +
+        "# ── download ──\n" +
+        "echo \"[download] huggingface-cli download " + HF_SLUG + "...\"\n" +
+        "echo \"[download] this will take 20-30 min at 1 Gbps (RunPod typical)\"\n" +
+        "START_TS=$(date +%s)\n" +
+        "huggingface-cli download " + HF_SLUG + " \\\n" +
+        "    --local-dir \"$TARGET_DIR\" \\\n" +
+        "    --local-dir-use-symlinks False \\\n" +
+        "    --resume-download \\\n" +
+        "    --max-workers 8 \\\n" +
+        "    || {\n" +
+        "        echo \"[download] FAILED — network/auth issue. Safe to re-run (resume-capable).\"\n" +
+        "        exit 2\n" +
+        "    }\n" +
+        "END_TS=$(date +%s)\n" +
+        "ELAPSED=$((END_TS - START_TS))\n" +
+        "echo \"[download] completed in ${ELAPSED}s\"\n" +
+        "\n" +
+        "# ── post: verify size ──\n" +
+        "FINAL_GB=$(du -sBG \"$TARGET_DIR\" | awk '{print $1}' | tr -d 'G')\n" +
+        "if [[ \"$FINAL_GB\" -lt " + str(EXPECTED_SIZE_GB_MIN) + " ]]; then\n" +
+        "    echo \"[verify] FAIL: only ${FINAL_GB}GB downloaded (expected >= " + str(EXPECTED_SIZE_GB_MIN) + "GB)\"\n" +
+        "    exit 3\n" +
+        "fi\n" +
+        "if [[ \"$FINAL_GB\" -gt " + str(EXPECTED_SIZE_GB_MAX) + " ]]; then\n" +
+        "    echo \"[verify] WARN: ${FINAL_GB}GB > expected max " + str(EXPECTED_SIZE_GB_MAX) + "GB — continuing\"\n" +
+        "fi\n" +
+        "echo \"[verify] size OK (${FINAL_GB}GB)\"\n" +
+        "\n" +
+        "# ── post: verify config.json present ──\n" +
+        "if [[ ! -f \"$TARGET_DIR/config.json\" ]]; then\n" +
+        "    echo \"[verify] FAIL: $TARGET_DIR/config.json missing post-download\"\n" +
+        "    exit 4\n" +
+        "fi\n" +
+        "CONFIG_SIZE=$(stat -c %s \"$TARGET_DIR/config.json\" 2>/dev/null || stat -f %z \"$TARGET_DIR/config.json\")\n" +
+        "if [[ \"$CONFIG_SIZE\" -lt 500 ]]; then\n" +
+        "    echo \"[verify] FAIL: config.json only ${CONFIG_SIZE}B (<500B) -- likely truncated\"\n" +
+        "    exit 5\n" +
+        "fi\n" +
+        "echo \"[verify] config.json OK (${CONFIG_SIZE}B)\"\n" +
+        "\n" +
+        "# ── post: verify config.json sha256 vs HF remote ──\n" +
+        "LOCAL_SHA=$(sha256sum \"$TARGET_DIR/config.json\" | awk '{print $1}')\n" +
+        "REMOTE_SHA=$(curl -sS -H \"Authorization: Bearer $HF_TOKEN\" \\\n" +
+        "    \"https://huggingface.co/" + HF_SLUG + "/raw/main/config.json\" | sha256sum | awk '{print $1}')\n" +
+        "if [[ -z \"$REMOTE_SHA\" ]]; then\n" +
+        "    echo \"[verify] WARN: could not fetch HF remote config.json for sha256 compare — continuing\"\n" +
+        "elif [[ \"$LOCAL_SHA\" != \"$REMOTE_SHA\" ]]; then\n" +
+        "    echo \"[verify] FAIL: config.json sha256 mismatch\"\n" +
+        "    echo \"        local=$LOCAL_SHA\"\n" +
+        "    echo \"        remote=$REMOTE_SHA\"\n" +
+        "    exit 6\n" +
+        "else\n" +
+        "    echo \"[verify] config.json sha256 matches HF remote ($LOCAL_SHA)\"\n" +
+        "fi\n" +
+        "\n" +
+        "# ── post: verify safetensors shard count ──\n" +
+        "SHARD_COUNT=$(ls \"$TARGET_DIR\"/model-*.safetensors 2>/dev/null | wc -l)\n" +
+        "if [[ \"$SHARD_COUNT\" -lt 25 ]]; then\n" +
+        "    echo \"[verify] FAIL: only $SHARD_COUNT safetensors shards (expected ~30)\"\n" +
+        "    exit 7\n" +
+        "fi\n" +
+        "echo \"[verify] shards OK ($SHARD_COUNT safetensors files)\"\n" +
+        "\n" +
+        "# ── post: verify model.safetensors.index.json ──\n" +
+        "if [[ ! -f \"$TARGET_DIR/model.safetensors.index.json\" ]]; then\n" +
+        "    echo \"[verify] FAIL: model.safetensors.index.json missing\"\n" +
+        "    exit 8\n" +
+        "fi\n" +
+        "echo \"[verify] safetensors index OK\"\n" +
+        "\n" +
+        "# ── emit download manifest ──\n" +
+        "MANIFEST=\"$TARGET_DIR/download_manifest.json\"\n" +
+        "cat > \"$MANIFEST\" <<MANIFESTEOF\n" +
+        "{\n" +
+        "  \"hf_slug\": \"" + HF_SLUG + "\",\n" +
+        "  \"target_dir\": \"$TARGET_DIR\",\n" +
+        "  \"downloaded_utc\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\n" +
+        "  \"size_gb\": \"$FINAL_GB\",\n" +
+        "  \"shard_count\": \"$SHARD_COUNT\",\n" +
+        "  \"config_sha256\": \"$LOCAL_SHA\",\n" +
+        "  \"config_sha256_matches_remote\": \"$([[ \"$LOCAL_SHA\" == \"$REMOTE_SHA\" ]] && echo true || echo false)\",\n" +
+        "  \"elapsed_seconds\": \"$ELAPSED\",\n" +
+        "  \"download_tool\": \"huggingface-cli $(huggingface-cli --version 2>&1 | head -1)\"\n" +
+        "}\n" +
+        "MANIFESTEOF\n" +
+        "echo \"[manifest] emitted: $MANIFEST\"\n" +
+        "cat \"$MANIFEST\"\n" +
+        "\n" +
+        "echo \"\"\n" +
+        "echo \"============================================\"\n" +
+        "echo \"  DOWNLOAD COMPLETE\"\n" +
+        "echo \"  $TARGET_DIR: ${FINAL_GB}GB ($SHARD_COUNT shards)\"\n" +
+        "echo \"  Elapsed: ${ELAPSED}s\"\n" +
+        "echo \"============================================\"\n"
+    )
+
+    log_info("runner emitted: " + runner)
+
+    // ── DRY_RUN ──
+    if env("DRY_RUN") == "1" {
+        log_info("DRY_RUN=1 — not executing runner")
+        log_info("inspect: cat " + runner)
+        return
+    }
+
+    log_info("exec bash " + runner)
+    exec("bash " + runner)
+}

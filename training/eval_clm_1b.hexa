@@ -1,0 +1,294 @@
+// training/eval_clm_1b.hexa — CLM 1B byte-level checkpoint eval harness
+// @convergence shared/convergence/clm_eval.convergence
+//
+// Runs train_clm_r4 --eval on a .hexackpt, parses log metrics, emits JSON verdict.
+// CLM is byte-level (VOCAB=256). No `use` (silent-exit bug). No struct >=3 floats.
+//
+// Log format parsed:
+//   [train_clm_kr] eval step=5000 ppl=20.1159 kr_acc=-1/16
+//   [phi] step=5000 phi_proxy=-nan
+//
+// Gates (7B promotion):
+//   G1: CE < 2.5   G2: kr_acc > 50%   G3: phi_proxy > 0   G4: PPL < 15
+//
+// CLI:
+//   hexa run training/eval_clm_1b.hexa --ckpt <path.hexackpt> \
+//        [--corpus data/test_ko.txt] [--binary ./train_clm_r4] \
+//        [--out <path>] [--quick]
+// Env: CLM_EVAL_CKPT, CLM_EVAL_CORPUS, CLM_EVAL_BINARY, CLM_EVAL_OUT, CLM_EVAL_QUICK=1
+
+let VERSION = "1.0.0"
+let MODEL_TAG = "clm1b"
+let VOCAB = 256
+let DEFAULT_BINARY = "./train_clm_r4"
+let DEFAULT_CORPUS = "data/test_ko.txt"
+let GATE_CE = 2.5
+let GATE_KR = 0.5
+let GATE_PHI = 0.0
+let GATE_PPL = 15.0
+
+fn json_escape(s: string) -> string {
+    let n = len(s)
+    let mut parts = []
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "\\" { parts = parts.push("\\\\") }
+        else if c == "\"" { parts = parts.push("\\\"") }
+        else if c == "\n" { parts = parts.push("\\n") }
+        else if c == "\t" { parts = parts.push("\\t") }
+        else if c == "\r" { parts = parts.push("\\r") }
+        else { parts = parts.push(c) }
+        i = i + 1
+    }
+    return parts.join("")
+}
+
+// Extract value after "key=" up to next whitespace
+fn extract_after(text: string, key: string) -> string {
+    let marker = key + "="
+    let pos = text.index_of(marker)
+    if pos < 0 { return "" }
+    let start = pos + len(marker)
+    let n = len(text)
+    let mut e = start
+    while e < n {
+        let c = text.substring(e, e + 1)
+        if c == " " { break }
+        if c == "\n" { break }
+        if c == "\t" { break }
+        e = e + 1
+    }
+    return text.substring(start, e)
+}
+
+fn parse_ppl(out: string) -> float {
+    let v = extract_after(out, "ppl")
+    if len(v) == 0 { return -1.0 }
+    return parse_float(v)
+}
+
+fn parse_kr_acc(out: string) -> float {
+    let v = extract_after(out, "kr_acc")
+    if len(v) == 0 { return -1.0 }
+    let sp = v.index_of("/")
+    if sp < 0 { return -1.0 }
+    let num = parse_float(v.substring(0, sp))
+    let den = parse_float(v.substring(sp + 1, len(v)))
+    if den < 1.0 { return -1.0 }
+    if num < 0.0 { return 0.0 }
+    return num / den
+}
+
+fn parse_phi(out: string) -> float {
+    let v = extract_after(out, "phi_proxy")
+    if len(v) == 0 { return -1.0 }
+    if v.contains("nan") { return -1.0 }
+    if v.contains("NaN") { return -1.0 }
+    return parse_float(v)
+}
+
+fn parse_ce(out: string) -> float {
+    let v1 = extract_after(out, "ce_loss")
+    if len(v1) > 0 { return parse_float(v1) }
+    let v2 = extract_after(out, "loss")
+    if len(v2) > 0 { return parse_float(v2) }
+    // Derive from PPL: CE = ln(PPL) via bc
+    let ppl = parse_ppl(out)
+    if ppl > 0.0 {
+        let r = exec("echo 'l(" + to_string(ppl) + ")' | bc -l 2>/dev/null | tr -d '\\n'")
+        if len(r) > 0 { return parse_float(r) }
+    }
+    return -1.0
+}
+
+fn parse_step(out: string) -> int {
+    let v = extract_after(out, "step")
+    if len(v) == 0 { return -1 }
+    return to_int(parse_float(v))
+}
+
+fn file_exists(p: string) -> bool {
+    let r = exec("test -f '" + p + "' && echo Y || echo N")
+    return r.contains("Y")
+}
+
+fn file_size(p: string) -> string {
+    return exec("wc -c < '" + p + "' 2>/dev/null | tr -d ' \\n'")
+}
+
+fn gate_label(ok: bool) -> string {
+    if ok { return "PASS" } else { return "FAIL" }
+}
+
+fn gate_json(ok: bool) -> string {
+    if ok { return "true" } else { return "false" }
+}
+
+fn assemble_json(ckpt: string, corpus: string, binary: string, ts: string, step: int, ce: float, ppl: float, kr: float, phi: float, verdict: string, raw: string) -> string {
+    let g1 = if ce > 0.0 { ce < GATE_CE } else { false }
+    let g2 = kr > GATE_KR
+    let g3 = phi > GATE_PHI
+    let g4 = if ppl > 0.0 { ppl < GATE_PPL } else { false }
+    let g1s = if ce > 0.0 { gate_json(g1) } else { "null" }
+    let g4s = if ppl > 0.0 { gate_json(g4) } else { "null" }
+    let rlen = len(raw)
+    let rtrunc = if rlen > 2000 { raw.substring(0, 2000) } else { raw }
+    let vs = if verdict == "PASS" { "true" } else { "false" }
+    return "{\n"
+         + "  \"harness\": \"eval_clm_1b.hexa\",\n"
+         + "  \"version\": \"" + VERSION + "\",\n"
+         + "  \"model\": \"" + MODEL_TAG + "\",\n"
+         + "  \"vocab_size\": " + to_string(VOCAB) + ",\n"
+         + "  \"checkpoint\": \"" + json_escape(ckpt) + "\",\n"
+         + "  \"corpus\": \"" + json_escape(corpus) + "\",\n"
+         + "  \"binary\": \"" + json_escape(binary) + "\",\n"
+         + "  \"timestamp\": \"" + ts + "\",\n"
+         + "  \"eval_step\": " + to_string(step) + ",\n"
+         + "  \"metrics\": {\n"
+         + "    \"ce_loss\": " + to_string(ce) + ",\n"
+         + "    \"perplexity\": " + to_string(ppl) + ",\n"
+         + "    \"kr_acc\": " + to_string(kr) + ",\n"
+         + "    \"phi_proxy\": " + to_string(phi) + "\n"
+         + "  },\n"
+         + "  \"gates\": {\n"
+         + "    \"G1_ce_lt_2.5\": " + g1s + ",\n"
+         + "    \"G2_kr_acc_gt_50pct\": " + gate_json(g2) + ",\n"
+         + "    \"G3_phi_proxy_gt_0\": " + gate_json(g3) + ",\n"
+         + "    \"G4_ppl_lt_15\": " + g4s + "\n"
+         + "  },\n"
+         + "  \"verdict\": " + vs + ",\n"
+         + "  \"verdict_label\": \"" + verdict + "\",\n"
+         + "  \"raw_output\": \"" + json_escape(rtrunc) + "\"\n"
+         + "}\n"
+}
+
+fn run_eval(ckpt: string, corpus: string, binary: string, out_path: string, quick: bool) -> int {
+    let ts = exec("date '+%Y-%m-%d %H:%M:%S' | tr -d '\\n'")
+    println("============================================================")
+    println("[eval_clm_1b] " + VERSION + " (pure-hexa, byte-level)")
+    println("============================================================")
+    println("  ckpt:   " + ckpt)
+    println("  corpus: " + corpus)
+    println("  binary: " + binary)
+    println("  out:    " + out_path)
+    println("  quick:  " + to_string(quick))
+    println("  vocab:  " + to_string(VOCAB) + " (byte-level)")
+    println("")
+
+    if file_exists(ckpt) == false {
+        println("[eval_clm_1b] ERROR: checkpoint not found: " + ckpt)
+        return 2
+    }
+    let sz = file_size(ckpt)
+    if parse_float(sz) < 1000.0 {
+        println("[eval_clm_1b] ERROR: checkpoint too small (" + sz + " bytes)")
+        return 2
+    }
+    println("[eval_clm_1b] checkpoint OK (" + sz + " bytes)")
+    if file_exists(corpus) == false {
+        println("[eval_clm_1b] ERROR: test corpus not found: " + corpus)
+        return 2
+    }
+
+    // Run inference
+    let qf = if quick { " --quick" } else { "" }
+    let cmd = "'" + binary + "' --eval --checkpoint '" + ckpt + "' --corpus '" + corpus + "'" + qf + " 2>&1"
+    println("[eval_clm_1b] cmd: " + cmd)
+    let output = exec(cmd)
+    let lines = output.split("\n")
+    let show = if len(lines) < 30 { len(lines) } else { 30 }
+    let mut li = 0
+    while li < show {
+        println("  | " + lines[li])
+        li = li + 1
+    }
+    if len(lines) > 30 { println("  | ... (" + to_string(len(lines) - 30) + " more)") }
+
+    // Parse
+    let ppl = parse_ppl(output)
+    let kr = parse_kr_acc(output)
+    let phi = parse_phi(output)
+    let ce = parse_ce(output)
+    let step = parse_step(output)
+
+    println("")
+    println("[eval_clm_1b] METRICS: step=" + to_string(step) + " ce=" + to_string(ce) + " ppl=" + to_string(ppl) + " kr=" + to_string(kr) + " phi=" + to_string(phi))
+
+    // Gates
+    let g1 = if ce > 0.0 { ce < GATE_CE } else { false }
+    let g2 = kr > GATE_KR
+    let g3 = phi > GATE_PHI
+    let g4 = if ppl > 0.0 { ppl < GATE_PPL } else { false }
+    println("[eval_clm_1b] G1 CE<2.5:    " + to_string(ce) + " -> " + gate_label(g1))
+    println("[eval_clm_1b] G2 kr>50%:    " + to_string(kr) + " -> " + gate_label(g2))
+    println("[eval_clm_1b] G3 phi>0:     " + to_string(phi) + " -> " + gate_label(g3))
+    println("[eval_clm_1b] G4 PPL<15:    " + to_string(ppl) + " -> " + gate_label(g4))
+
+    let mut pass = false
+    if g1 { if g2 { if g3 { if g4 { pass = true } } } }
+    let verdict = if pass { "PASS" } else { "FAIL" }
+
+    let body = assemble_json(ckpt, corpus, binary, ts, step, ce, ppl, kr, phi, verdict, output)
+    write_file(out_path, body)
+
+    println("")
+    println("============================================================")
+    println("[eval_clm_1b] VERDICT: " + verdict)
+    println("============================================================")
+    println("[eval_clm_1b] saved -> " + out_path)
+    if pass { return 0 } else { return 1 }
+}
+
+fn print_usage() {
+    println("usage: hexa run training/eval_clm_1b.hexa --ckpt <path.hexackpt>")
+    println("       [--corpus <path>] [--binary <path>] [--out <path>] [--quick]")
+    println("env: CLM_EVAL_CKPT, CLM_EVAL_CORPUS, CLM_EVAL_BINARY, CLM_EVAL_OUT, CLM_EVAL_QUICK=1")
+    println("gates: CE<2.5, kr_acc>50%, phi_proxy>0, PPL<15")
+}
+
+fn main() -> int {
+    let av = args()
+    let mut ckpt = env_var("CLM_EVAL_CKPT")
+    let mut corpus = env_var("CLM_EVAL_CORPUS")
+    if corpus == "" { corpus = DEFAULT_CORPUS }
+    let mut binary = env_var("CLM_EVAL_BINARY")
+    if binary == "" { binary = DEFAULT_BINARY }
+    let mut out_path = env_var("CLM_EVAL_OUT")
+    let mut quick = false
+    if env_var("CLM_EVAL_QUICK") == "1" { quick = true }
+    let mut i = 2
+    let argc = len(av)
+    while i < argc {
+        let a = av[i]
+        if a == "--ckpt" {
+            if i + 1 < argc { ckpt = av[i + 1] }
+            i = i + 2
+        } else if a == "--corpus" {
+            if i + 1 < argc { corpus = av[i + 1] }
+            i = i + 2
+        } else if a == "--binary" {
+            if i + 1 < argc { binary = av[i + 1] }
+            i = i + 2
+        } else if a == "--out" {
+            if i + 1 < argc { out_path = av[i + 1] }
+            i = i + 2
+        } else if a == "--quick" {
+            quick = true
+            i = i + 1
+        } else if a == "--help" {
+            print_usage()
+            return 0
+        } else { i = i + 1 }
+    }
+    if ckpt == "" {
+        println("[eval_clm_1b] ERROR: --ckpt required")
+        print_usage()
+        return 2
+    }
+    if out_path == "" {
+        let dir = exec("dirname '" + ckpt + "' | tr -d '\\n'")
+        out_path = dir + "/eval_results.json"
+    }
+    return run_eval(ckpt, corpus, binary, out_path, quick)
+}
