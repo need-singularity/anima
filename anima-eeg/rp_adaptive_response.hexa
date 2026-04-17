@@ -1,0 +1,288 @@
+// rp_adaptive_response.hexa — TSRV-P3-3: EEG adaptive response serving
+// Pipeline: raw EEG bands -> emotion (Russell circumplex) -> adaptation params -> modified response
+// Latency budget: < 100ms end-to-end
+// Key constant: PSI_ALPHA = 0.014
+//
+// Design: standalone, no cross-file imports (hexa silent-exit bug on 3+ modules).
+// Workaround: hexa stage1 requires `let` for all variable bindings — bare assignment
+// produces void. Globals use `let` at top level, mutated from functions.
+// Avoids struct return with >=3 float fields (known corruption bug 2026-04-15).
+
+// ════════════════════════════════════════════════════════════════════
+// Section 0. Constants
+// ════════════════════════════════════════════════════════════════════
+
+let PSI_ALPHA = 0.014
+let LATENCY_BUDGET_MS = 100.0
+
+// ════════════════════════════════════════════════════════════════════
+// Section 1. Pipeline state (globals — avoids multi-float struct return bug)
+// ════════════════════════════════════════════════════════════════════
+
+// EegState: 5 raw bands + 4 derived metrics
+let g_delta = 0.0
+let g_theta = 0.0
+let g_alpha = 0.0
+let g_beta = 0.0
+let g_gamma = 0.0
+let g_arousal = 0.0
+let g_valence = 0.0
+let g_engagement = 0.0
+let g_relaxation = 0.0
+
+// AdaptiveParams: 4 response adaptation controls
+let g_tone_shift = 0.0
+let g_speed_factor = 1.0
+let g_complexity = 0.5
+let g_empathy_level = 0.5
+
+// Pipeline output
+let g_adapted_text = ""
+let g_latency_ms = 0.0
+
+// ════════════════════════════════════════════════════════════════════
+// Section 2. Helpers
+// ════════════════════════════════════════════════════════════════════
+
+fn clamp(val: float, lo: float, hi: float) -> float {
+    let out = val
+    if out < lo { out = lo }
+    if out > hi { out = hi }
+    return out
+}
+
+fn abs_f(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 3. Stage 1 — EEG band powers -> derived metrics
+// ════════════════════════════════════════════════════════════════════
+
+fn make_eeg_state(delta: float, theta: float, alpha: float, beta: float, gamma: float) {
+    // Store raw band powers
+    g_delta = delta
+    g_theta = theta
+    g_alpha = alpha
+    g_beta = beta
+    g_gamma = gamma
+
+    // Total power for normalization
+    let total = delta + theta + alpha + beta + gamma
+    let safe_total = total
+    if safe_total < 0.0001 { safe_total = 0.0001 }
+
+    // Slow-wave denominator (alpha + theta)
+    let slow = alpha + theta
+    if slow < 0.0001 { slow = 0.0001 }
+
+    // arousal = (beta + gamma) / (alpha + theta)
+    // High = excited/alert, Low = calm/drowsy
+    g_arousal = (beta + gamma) / slow
+
+    // valence = alpha / total (simplified Russell circumplex proxy)
+    // Higher alpha proportion -> more positive valence
+    g_valence = alpha / safe_total
+
+    // engagement = beta / (alpha + theta)
+    // Focused attention correlates with beta dominance
+    g_engagement = beta / slow
+
+    // relaxation = alpha / total
+    g_relaxation = alpha / safe_total
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 4. Stage 2 — PSI-coupled emotion modulation
+// ════════════════════════════════════════════════════════════════════
+
+fn eeg_to_emotion() {
+    // Apply PSI_ALPHA consciousness coupling to Russell circumplex axes
+    // PSI_ALPHA = 0.014 — empirical consciousness coupling constant
+    g_arousal = g_arousal * (1.0 + PSI_ALPHA)
+    g_valence = g_valence * (1.0 + PSI_ALPHA)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 5. Stage 3 — Emotion -> adaptation parameters
+// ════════════════════════════════════════════════════════════════════
+
+fn emotion_to_params() {
+    let arousal = g_arousal
+    let valence = g_valence
+
+    // tone_shift: -1.0 (soothing) .. +1.0 (energetic)
+    //   High arousal + high valence -> positive energy
+    //   High arousal + low valence  -> calming needed
+    //   Low arousal -> gentle, warm
+    g_tone_shift = clamp((arousal - 1.0) * 0.5 + (valence - 0.3) * 0.5, -1.0, 1.0)
+
+    // speed_factor: 0.5 (slow/deliberate) .. 2.0 (fast/concise)
+    g_speed_factor = clamp(0.8 + arousal * 0.3, 0.5, 2.0)
+
+    // complexity: 0.0 (simple) .. 1.0 (complex)
+    g_complexity = clamp(arousal * 0.4 + valence * 0.2, 0.0, 1.0)
+
+    // empathy_level: 0.0 (neutral) .. 1.0 (maximum empathy)
+    //   Low valence (distress) -> high empathy
+    //   Low arousal (disengaged) -> more empathy to re-engage
+    g_empathy_level = clamp(1.0 - valence * 1.5 + (1.0 - arousal) * 0.3, 0.0, 1.0)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 6. Stage 4 — Adapt response text with semantic markers
+// ════════════════════════════════════════════════════════════════════
+
+fn adapt_response(text: str) -> str {
+    // Downstream serving interprets markers for temperature/style/length control
+    let result = text
+
+    // High empathy -> empathetic marker
+    if g_empathy_level > 0.7 { result = "[empathetic] " + result }
+
+    // Tone markers
+    if g_tone_shift < -0.3 { result = "[calm-tone] " + result }
+    if g_tone_shift > 0.3 { result = "[energetic-tone] " + result }
+
+    // Speed markers
+    if g_speed_factor > 1.3 { result = "[concise] " + result }
+    if g_speed_factor < 0.7 { result = "[detailed] " + result }
+
+    // Complexity markers
+    if g_complexity < 0.3 { result = "[simple] " + result }
+    if g_complexity > 0.7 { result = "[complex-ok] " + result }
+
+    return result
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 7. Full pipeline: raw bands -> adapted response
+// ════════════════════════════════════════════════════════════════════
+
+fn adaptive_pipeline(delta: float, theta: float, alpha: float, beta: float, gamma: float, text: str) -> str {
+    let t0 = clock()
+
+    // Stage 1: band powers -> derived metrics
+    make_eeg_state(delta, theta, alpha, beta, gamma)
+
+    // Stage 2: PSI-coupled emotion modulation
+    eeg_to_emotion()
+
+    // Stage 3: emotion -> adaptation parameters
+    emotion_to_params()
+
+    // Stage 4: apply adaptation markers
+    g_adapted_text = adapt_response(text)
+
+    let t1 = clock()
+    g_latency_ms = (t1 - t0) * 1000.0
+
+    return g_adapted_text
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 8. Self-tests (8 tests)
+// ════════════════════════════════════════════════════════════════════
+
+fn assert_true(cond: bool, label: str) -> bool {
+    if cond { print("  PASS: " + label) } else { print("  FAIL: " + label) }
+    return cond
+}
+
+fn run_tests() {
+    let pass = 0
+    let fail = 0
+
+    print("=== rp_adaptive_response self-tests ===")
+
+    // ── T1: EegState creation with 5 bands ──
+    print("[T1] EegState creation")
+    make_eeg_state(1.0, 2.0, 3.0, 4.0, 5.0)
+    let ok1a = assert_true(abs_f(g_delta - 1.0) < 0.001, "delta=1.0")
+    let ok1b = assert_true(abs_f(g_theta - 2.0) < 0.001, "theta=2.0")
+    let ok1c = assert_true(abs_f(g_alpha - 3.0) < 0.001, "alpha=3.0")
+    let ok1d = assert_true(abs_f(g_beta - 4.0) < 0.001, "beta=4.0")
+    let ok1e = assert_true(abs_f(g_gamma - 5.0) < 0.001, "gamma=5.0")
+    let ok1f = assert_true(g_arousal > 0.0, "arousal > 0")
+    let ok1g = assert_true(g_valence > 0.0, "valence > 0")
+    if ok1a { if ok1g { pass = pass + 1 } else { fail = fail + 1 } } else { fail = fail + 1 }
+
+    // ── T2: arousal computation correctness ──
+    // arousal = (beta+gamma)/(alpha+theta) = (4+5)/(3+2) = 9/5 = 1.8
+    print("[T2] arousal computation")
+    make_eeg_state(1.0, 2.0, 3.0, 4.0, 5.0)
+    let ok2a = assert_true(abs_f(g_arousal - 1.8) < 0.001, "arousal = 1.8")
+    // valence = alpha/total = 3/15 = 0.2
+    let ok2b = assert_true(abs_f(g_valence - 0.2) < 0.001, "valence = 0.2")
+    // engagement = beta/(alpha+theta) = 4/5 = 0.8
+    let ok2c = assert_true(abs_f(g_engagement - 0.8) < 0.001, "engagement = 0.8")
+    if ok2a { if ok2b { if ok2c { pass = pass + 1 } else { fail = fail + 1 } } else { fail = fail + 1 } } else { fail = fail + 1 }
+
+    // ── T3: high arousal -> faster/shorter adaptation ──
+    print("[T3] high arousal -> faster adaptation")
+    make_eeg_state(0.5, 0.5, 0.5, 8.0, 8.0)
+    eeg_to_emotion()
+    emotion_to_params()
+    let ok3a = assert_true(g_speed_factor > 1.2, "high arousal -> speed > 1.2")
+    let ok3b = assert_true(g_tone_shift > 0.0, "high arousal -> positive tone shift")
+    if ok3a { if ok3b { pass = pass + 1 } else { fail = fail + 1 } } else { fail = fail + 1 }
+
+    // ── T4: low arousal -> calmer/longer adaptation ──
+    print("[T4] low arousal -> calmer adaptation")
+    make_eeg_state(5.0, 5.0, 8.0, 0.5, 0.5)
+    eeg_to_emotion()
+    emotion_to_params()
+    let ok4a = assert_true(g_speed_factor < 1.0, "low arousal -> speed < 1.0")
+    let ok4b = assert_true(g_empathy_level > 0.5, "low arousal -> empathy > 0.5")
+    if ok4a { if ok4b { pass = pass + 1 } else { fail = fail + 1 } } else { fail = fail + 1 }
+
+    // ── T5: latency < 100ms for full pipeline ──
+    print("[T5] latency < 100ms")
+    let r5 = adaptive_pipeline(1.0, 2.0, 3.0, 4.0, 5.0, "Hello, how are you?")
+    let ok5a = assert_true(g_latency_ms < LATENCY_BUDGET_MS, "pipeline latency < 100ms")
+    let ok5b = assert_true(g_latency_ms >= 0.0, "latency non-negative")
+    if ok5a { if ok5b { pass = pass + 1 } else { fail = fail + 1 } } else { fail = fail + 1 }
+
+    // ── T6: deterministic — same input -> same output ──
+    print("[T6] deterministic output")
+    let r6a = adaptive_pipeline(2.0, 3.0, 4.0, 5.0, 6.0, "Test input")
+    let tone1 = g_tone_shift
+    let speed1 = g_speed_factor
+    let emp1 = g_empathy_level
+    let r6b = adaptive_pipeline(2.0, 3.0, 4.0, 5.0, 6.0, "Test input")
+    let ok6a = assert_true(r6a == r6b, "same input -> same text")
+    let ok6b = assert_true(abs_f(tone1 - g_tone_shift) < 0.0001, "same tone_shift")
+    let ok6c = assert_true(abs_f(speed1 - g_speed_factor) < 0.0001, "same speed_factor")
+    let ok6d = assert_true(abs_f(emp1 - g_empathy_level) < 0.0001, "same empathy_level")
+    if ok6a { if ok6d { pass = pass + 1 } else { fail = fail + 1 } } else { fail = fail + 1 }
+
+    // ── T7: adapt_response marker injection ──
+    print("[T7] response marker injection")
+    // Manually set params that trigger markers: calm tone + high empathy + simple + detailed
+    g_tone_shift = -0.5
+    g_speed_factor = 0.6
+    g_complexity = 0.2
+    g_empathy_level = 0.9
+    let adapted = adapt_response("Base text")
+    let ok7 = assert_true(adapted != "Base text", "markers injected")
+    if ok7 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // ── T8: PSI_ALPHA modulation ──
+    print("[T8] PSI_ALPHA modulation")
+    make_eeg_state(1.0, 2.0, 3.0, 4.0, 5.0)
+    let raw_arousal = g_arousal
+    eeg_to_emotion()
+    let ok8 = assert_true(g_arousal > raw_arousal, "PSI_ALPHA increases arousal")
+    if ok8 { pass = pass + 1 } else { fail = fail + 1 }
+
+    print("")
+    print("Results: " + str(pass) + " PASS / " + str(fail) + " FAIL out of " + str(pass + fail))
+    if fail == 0 { print("ALL TESTS PASSED") }
+}
+
+fn main() {
+    run_tests()
+}
+
+main()

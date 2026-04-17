@@ -1,0 +1,443 @@
+// lipsync_pipe.hexa — HEXA-SPEAK Mk.III: Phoneme-to-Viseme Lipsync Pipeline
+//
+// Purpose:
+//   Maps phonemes to visemes for avatar lip animation.
+//   Generates timed viseme events from phoneme sequences with coarticulation.
+//   Target: phoneme-to-viseme onset offset < 40ms (V-P2-3 done criterion).
+//
+// Viseme catalog (15 — Oculus/Apple standard):
+//   sil  — silence / rest
+//   PP   — p, b, m (bilabial)
+//   FF   — f, v (labiodental)
+//   TH   — th (dental fricative)
+//   DD   — t, d, n, l (alveolar)
+//   kk   — k, g (velar)
+//   CH   — ch, j, sh, zh (postalveolar)
+//   SS   — s, z (sibilant)
+//   nn   — n, ng (nasal)
+//   RR   — r (rhotic)
+//   aa   — a, ah (open vowel)
+//   E    — e, eh (mid front vowel)
+//   ih   — i, ih (close front vowel)
+//   oh   — o, aw (mid back vowel)
+//   ou   — u, oo (close back vowel)
+//
+// Integration: voice_routes.hexa (downstream consumer of VisemeEvent timeline)
+//
+// n=6 parameters:
+//   n_visemes          = 15
+//   coartic_overlap_ms = 10  (coarticulation blend window)
+//   max_onset_drift_ms = 40  (hard ceiling — done criterion)
+//   frame_hop_ms       = 10  (vocoder frame rate = 100 Hz)
+//   default_duration   = 80  (ms, fallback phoneme duration)
+//   default_intensity  = 0.8 (neutral mouth openness)
+//
+// BT reference: BT-SPEAK-06 (avatar lipsync), V-P2-3
+// Mk stage:     Mk.III (real-time viseme pipeline, coarticulation)
+// PSI coupling:  none (pure phoneme→viseme, no consciousness modulation)
+// Upstream:     vocoder.hexa phoneme table / forced aligner (P3)
+// Downstream:   voice_routes.hexa → avatar renderer
+
+// ════════════════════════════════════════════════════════════════════
+// Constants
+// ════════════════════════════════════════════════════════════════════
+
+let N_VISEMES = 15
+let COARTIC_OVERLAP_MS = 10
+let MAX_ONSET_DRIFT_MS = 40
+let FRAME_HOP_MS = 10
+let DEFAULT_DURATION_MS = 80
+let DEFAULT_INTENSITY = 0.8
+
+// ════════════════════════════════════════════════════════════════════
+// Section 1: Viseme Catalog
+// ════════════════════════════════════════════════════════════════════
+
+// Returns true if viseme_id is one of the 15 standard visemes.
+fn is_valid_viseme(v: string) -> bool {
+    if v == "sil" { return true }
+    if v == "PP"  { return true }
+    if v == "FF"  { return true }
+    if v == "TH"  { return true }
+    if v == "DD"  { return true }
+    if v == "kk"  { return true }
+    if v == "CH"  { return true }
+    if v == "SS"  { return true }
+    if v == "nn"  { return true }
+    if v == "RR"  { return true }
+    if v == "aa"  { return true }
+    if v == "E"   { return true }
+    if v == "ih"  { return true }
+    if v == "oh"  { return true }
+    if v == "ou"  { return true }
+    return false
+}
+
+// Returns the full catalog as a list of 15 viseme IDs.
+fn viseme_catalog() -> [string] {
+    let cat = ["sil", "PP", "FF", "TH", "DD", "kk", "CH", "SS", "nn", "RR", "aa", "E", "ih", "oh", "ou"]
+    return cat
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 2: Phoneme-to-Viseme Mapping
+// ════════════════════════════════════════════════════════════════════
+
+// Maps a phoneme string to a viseme ID string.
+// Covers Korean phonemes (vocoder.hexa table) and English phonemes.
+fn phoneme_to_viseme(phoneme: string) -> string {
+
+    // ── Korean vowels (vocoder.hexa formant table) ──
+    if phoneme == "a"   { return "aa" }   // ㅏ — open
+    if phoneme == "eo"  { return "oh" }   // ㅓ — mid back
+    if phoneme == "o"   { return "oh" }   // ㅗ — rounded back
+    if phoneme == "u"   { return "ou" }   // ㅜ — close rounded
+    if phoneme == "eu"  { return "ih" }   // ㅡ — close central unrounded
+    if phoneme == "i"   { return "ih" }   // ㅣ — close front
+    if phoneme == "ae"  { return "E" }    // ㅐ — mid front
+    if phoneme == "e"   { return "E" }    // ㅔ — mid front
+    if phoneme == "wa"  { return "aa" }   // ㅘ — open (glide+open)
+    if phoneme == "wi"  { return "ou" }   // ㅟ — rounded front
+
+    // ── Korean consonants ──
+    if phoneme == "p"   { return "PP" }   // ㅂ
+    if phoneme == "pp"  { return "PP" }   // ㅃ (tense)
+    if phoneme == "b"   { return "PP" }   // ㅂ voiced
+    if phoneme == "m"   { return "PP" }   // ㅁ
+    if phoneme == "t"   { return "DD" }   // ㅌ
+    if phoneme == "tt"  { return "DD" }   // ㄸ (tense)
+    if phoneme == "d"   { return "DD" }   // ㄷ voiced
+    if phoneme == "n"   { return "nn" }   // ㄴ
+    if phoneme == "l"   { return "DD" }   // ㄹ (lateral)
+    if phoneme == "r"   { return "RR" }   // ㄹ (flap)
+    if phoneme == "k"   { return "kk" }   // ㅋ
+    if phoneme == "kk"  { return "kk" }   // ㄲ (tense)
+    if phoneme == "g"   { return "kk" }   // ㄱ voiced
+    if phoneme == "s"   { return "SS" }   // ㅅ
+    if phoneme == "ss"  { return "SS" }   // ㅆ (tense)
+    if phoneme == "j"   { return "CH" }   // ㅈ
+    if phoneme == "jj"  { return "CH" }   // ㅉ (tense)
+    if phoneme == "ch"  { return "CH" }   // ㅊ
+    if phoneme == "ng"  { return "nn" }   // ㅇ (coda)
+    if phoneme == "h"   { return "sil" }  // ㅎ — glottal, near-silent lip shape
+
+    // ── English vowels (vocoder.hexa formant table) ──
+    if phoneme == "aa"  { return "aa" }   // /ɑ/ — father
+    if phoneme == "ee"  { return "E" }    // /ɛ/ — bed
+    if phoneme == "ii"  { return "ih" }   // /i/ — see
+    if phoneme == "oo"  { return "oh" }   // /ɔ/ — thought
+    if phoneme == "uu"  { return "ou" }   // /u/ — boot
+    if phoneme == "uh"  { return "aa" }   // /ʌ/ — strut (open-ish)
+    if phoneme == "ih"  { return "ih" }   // /ɪ/ — bit
+    if phoneme == "ax"  { return "E" }    // /ə/ — schwa
+
+    // ── English consonants ──
+    if phoneme == "f"   { return "FF" }
+    if phoneme == "v"   { return "FF" }
+    if phoneme == "th"  { return "TH" }
+    if phoneme == "dh"  { return "TH" }   // voiced th
+    if phoneme == "sh"  { return "CH" }
+    if phoneme == "zh"  { return "CH" }
+    if phoneme == "z"   { return "SS" }
+    if phoneme == "w"   { return "ou" }   // lip-rounded glide
+    if phoneme == "y"   { return "ih" }   // palatal glide
+
+    // ── Silence / pause ──
+    if phoneme == "sil" { return "sil" }
+    if phoneme == "sp"  { return "sil" }  // short pause
+    if phoneme == "pau" { return "sil" }  // pause
+
+    // Fallback — unmapped phoneme → silence (safe default)
+    return "sil"
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 3: VisemeEvent + Timing Pipeline
+// ════════════════════════════════════════════════════════════════════
+
+// VisemeEvent — one viseme with timing and intensity.
+// NOTE: no list fields in struct (hexa aliasing bug avoidance).
+struct VisemeEvent {
+    viseme: string
+    onset_ms: int
+    duration_ms: int
+    intensity: float
+}
+
+// Build a viseme timeline from parallel phoneme + duration arrays.
+// Coarticulation: each viseme onset is pulled earlier by COARTIC_OVERLAP_MS
+// when the preceding viseme differs, blending lip shapes.
+//
+// Guarantee: viseme onset is within MAX_ONSET_DRIFT_MS of phoneme onset.
+fn phonemes_to_viseme_timeline(phonemes: [string], durations_ms: [int]) -> [VisemeEvent] {
+    let mut events = [] : [VisemeEvent]
+    let n = len(phonemes)
+    if n == 0 { return events }
+
+    // Clamp helper — ensure durations list matches phonemes length.
+    // If durations shorter, pad with DEFAULT_DURATION_MS.
+    let n_dur = len(durations_ms)
+
+    let mut cursor_ms = 0  // running phoneme onset
+    let mut idx = 0
+
+    while idx < n {
+        let ph = phonemes[idx]
+        let vis = phoneme_to_viseme(ph)
+
+        // Duration for this phoneme
+        let mut dur = DEFAULT_DURATION_MS
+        if idx < n_dur {
+            dur = durations_ms[idx]
+        }
+
+        // Coarticulation: pull onset earlier if previous viseme differs
+        let mut coartic_shift = 0
+        if idx > 0 {
+            let prev_vis = phoneme_to_viseme(phonemes[idx - 1])
+            if prev_vis != vis {
+                coartic_shift = COARTIC_OVERLAP_MS
+            }
+        }
+
+        // Compute viseme onset — shifted by coarticulation but clamped
+        // so the drift from phoneme onset never exceeds MAX_ONSET_DRIFT_MS.
+        let mut vis_onset = cursor_ms - coartic_shift
+        if vis_onset < 0 { vis_onset = 0 }
+
+        // Drift check (should always pass by construction since coartic = 10 < 40)
+        let drift = cursor_ms - vis_onset
+        // drift == coartic_shift which is 0 or 10, always < 40
+
+        // Intensity — slightly reduce for silence visemes
+        let mut intensity = DEFAULT_INTENSITY
+        if vis == "sil" {
+            intensity = 0.0
+        }
+
+        let ev = VisemeEvent {
+            viseme: vis,
+            onset_ms: vis_onset,
+            duration_ms: dur + coartic_shift,
+            intensity: intensity
+        }
+        events = events + [ev]
+
+        cursor_ms = cursor_ms + dur
+        idx = idx + 1
+    }
+
+    return events
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 4: Lipsync Stream Interface (mock — real aligner is P3)
+// ════════════════════════════════════════════════════════════════════
+
+// Generate a mock viseme timeline from audio frame count.
+// Alternates through a representative phoneme cycle to simulate speech.
+// Real pipeline (P3) will wire into VAD + forced aligner output.
+fn lipsync_from_audio_frames(n_frames: int, frame_hop_ms: int) -> [VisemeEvent] {
+    // Representative phoneme cycle — covers multiple viseme classes
+    let cycle_phonemes = ["sil", "a", "n", "i", "m", "a", "s", "p"]
+    let cycle_len = 8
+
+    let mut events = [] : [VisemeEvent]
+    let mut frame_idx = 0
+
+    while frame_idx < n_frames {
+        let ph_idx = frame_idx % cycle_len
+        let ph = cycle_phonemes[ph_idx]
+        let vis = phoneme_to_viseme(ph)
+
+        let onset = frame_idx * frame_hop_ms
+
+        let mut intensity = DEFAULT_INTENSITY
+        if vis == "sil" {
+            intensity = 0.0
+        }
+
+        let ev = VisemeEvent {
+            viseme: vis,
+            onset_ms: onset,
+            duration_ms: frame_hop_ms,
+            intensity: intensity
+        }
+        events = events + [ev]
+
+        frame_idx = frame_idx + 1
+    }
+
+    return events
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 5: Self-Tests (stage0 auto-invokes main)
+// ════════════════════════════════════════════════════════════════════
+
+fn main() {
+    let mut pass = 0
+    let mut fail = 0
+
+    // ── T1: All 15 visemes present in catalog ──
+    let cat = viseme_catalog()
+    if len(cat) == N_VISEMES {
+        let mut all_valid = true
+        let mut ci = 0
+        while ci < len(cat) {
+            if is_valid_viseme(cat[ci]) == false {
+                all_valid = false
+            }
+            ci = ci + 1
+        }
+        if all_valid {
+            println("T1 PASS — 15 visemes in catalog, all valid")
+            pass = pass + 1
+        } else {
+            println("T1 FAIL — catalog contains invalid viseme")
+            fail = fail + 1
+        }
+    } else {
+        println("T1 FAIL — catalog length " + to_string(len(cat)) + " != 15")
+        fail = fail + 1
+    }
+
+    // ── T2: Korean phonemes map to valid visemes ──
+    let kr_phonemes = ["a", "eo", "o", "u", "eu", "i", "ae", "e", "wa", "wi",
+                       "p", "pp", "b", "m", "t", "tt", "d", "n", "l", "r",
+                       "k", "kk", "g", "s", "ss", "j", "jj", "ch", "ng", "h"]
+    let mut kr_ok = true
+    let mut ki = 0
+    while ki < len(kr_phonemes) {
+        let vis = phoneme_to_viseme(kr_phonemes[ki])
+        if is_valid_viseme(vis) == false {
+            println("  T2 bad: " + kr_phonemes[ki] + " -> " + vis)
+            kr_ok = false
+        }
+        ki = ki + 1
+    }
+    if kr_ok {
+        println("T2 PASS — 30 Korean phonemes -> valid visemes")
+        pass = pass + 1
+    } else {
+        println("T2 FAIL — some Korean phonemes map to invalid viseme")
+        fail = fail + 1
+    }
+
+    // ── T3: English phonemes map to valid visemes ──
+    let en_phonemes = ["aa", "ee", "ii", "oo", "uu", "uh", "ih", "ax",
+                       "p", "b", "m", "t", "d", "n", "l", "r", "k", "g",
+                       "f", "v", "th", "dh", "s", "z", "sh", "zh", "ch",
+                       "j", "w", "y", "h"]
+    let mut en_ok = true
+    let mut ei = 0
+    while ei < len(en_phonemes) {
+        let vis = phoneme_to_viseme(en_phonemes[ei])
+        if is_valid_viseme(vis) == false {
+            println("  T3 bad: " + en_phonemes[ei] + " -> " + vis)
+            en_ok = false
+        }
+        ei = ei + 1
+    }
+    if en_ok {
+        println("T3 PASS — 31 English phonemes -> valid visemes")
+        pass = pass + 1
+    } else {
+        println("T3 FAIL — some English phonemes map to invalid viseme")
+        fail = fail + 1
+    }
+
+    // ── T4: Timeline onset offset < 40ms from phoneme onset ──
+    // Build a test sequence: "a", "n", "i", "m" each 100ms
+    let test_ph = ["a", "n", "i", "m"]
+    let test_dur = [100, 100, 100, 100]
+    let timeline = phonemes_to_viseme_timeline(test_ph, test_dur)
+
+    let mut t4_ok = true
+    let mut cursor = 0
+    let mut ti = 0
+    while ti < len(test_ph) {
+        if ti < len(timeline) {
+            let ev = timeline[ti]
+            let drift = cursor - ev.onset_ms
+            // drift can be negative if onset is after cursor (shouldn't happen)
+            // or positive if onset is before cursor (coarticulation pull-back)
+            let mut abs_drift = drift
+            if abs_drift < 0 { abs_drift = 0 - abs_drift }
+            if abs_drift > MAX_ONSET_DRIFT_MS {
+                println("  T4 drift " + to_string(abs_drift) + "ms at idx " + to_string(ti))
+                t4_ok = false
+            }
+        }
+        cursor = cursor + test_dur[ti]
+        ti = ti + 1
+    }
+    if t4_ok {
+        println("T4 PASS — all viseme onsets within 40ms of phoneme onset")
+        pass = pass + 1
+    } else {
+        println("T4 FAIL — onset drift exceeds 40ms")
+        fail = fail + 1
+    }
+
+    // ── T5: Coarticulation overlap applied correctly ──
+    // "a" -> aa, "n" -> nn: different visemes, so idx=1 should have coartic shift
+    let mut t5_ok = true
+    if len(timeline) >= 2 {
+        let ev0 = timeline[0]
+        let ev1 = timeline[1]
+        // ev1 onset should be phoneme_onset(100) - COARTIC_OVERLAP_MS(10) = 90
+        // because aa != nn (different visemes)
+        if ev1.onset_ms == 90 {
+            // ev1 duration should be original(100) + coartic(10) = 110
+            if ev1.duration_ms == 110 {
+                println("T5 PASS — coarticulation: onset=90ms, dur=110ms (10ms overlap)")
+            } else {
+                println("T5 FAIL — coartic duration " + to_string(ev1.duration_ms) + " != 110")
+                t5_ok = false
+            }
+        } else {
+            println("T5 FAIL — coartic onset " + to_string(ev1.onset_ms) + " != 90")
+            t5_ok = false
+        }
+    } else {
+        println("T5 FAIL — timeline too short")
+        t5_ok = false
+    }
+    if t5_ok {
+        pass = pass + 1
+    } else {
+        fail = fail + 1
+    }
+
+    // ── T6: Determinism — same input -> same output ──
+    let timeline2 = phonemes_to_viseme_timeline(test_ph, test_dur)
+    let mut t6_ok = true
+    if len(timeline) != len(timeline2) {
+        t6_ok = false
+    } else {
+        let mut di = 0
+        while di < len(timeline) {
+            let a = timeline[di]
+            let b = timeline2[di]
+            if a.viseme != b.viseme { t6_ok = false }
+            if a.onset_ms != b.onset_ms { t6_ok = false }
+            if a.duration_ms != b.duration_ms { t6_ok = false }
+            di = di + 1
+        }
+    }
+    if t6_ok {
+        println("T6 PASS — deterministic: two runs identical")
+        pass = pass + 1
+    } else {
+        println("T6 FAIL — non-deterministic output")
+        fail = fail + 1
+    }
+
+    // ── Summary ──
+    println("")
+    println("lipsync_pipe self-test: " + to_string(pass) + "/" + to_string(pass + fail) + " PASS")
+    if fail > 0 {
+        println("FAIL count: " + to_string(fail))
+    }
+}

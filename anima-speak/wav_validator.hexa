@@ -1,0 +1,1062 @@
+// wav_validator.hexa — HEXA-SPEAK Mk.III: WAV Output Validation Pipeline
+//
+// Purpose:
+//   Validates WAV files produced by the HEXA-SPEAK TTS pipeline.
+//   Checks duration, format, silence, clipping, DC offset, latency,
+//   and computes a blind quality score proxy.
+//
+// Gate:   V-P3-3 serving_done WAV validation
+// Thresholds:
+//   duration:    500ms ≤ dur ≤ 10000ms
+//   latency:     < 200ms
+//   blind_score: ≥ 0.7
+//   format:      PCM16 mono 24kHz
+//   clipping:    < 1% samples at ±1.0
+//   DC offset:   |mean| < 0.05
+//   silence:     peak amplitude > 0.01
+//
+// CLI:
+//   --validate <path>   single WAV validation
+//   --batch <dir>       validate all WAVs in directory
+//   --self-test         generate test WAVs and validate them
+//
+// Design:
+//   Self-contained — NO cross-file imports (hexa silent-exit bug on 3+ modules).
+//   Uses exec() + xxd for binary WAV header parsing.
+//   Uses exec() + shell for sample-level analysis via generated PCM data.
+//
+// BT reference: BT-SPEAK-VAL (serving_done gate)
+// Mk stage:     Mk.III
+
+// ════════════════════════════════════════════════════════════════════
+// Section 0. Constants
+// ════════════════════════════════════════════════════════════════════
+
+let SAMPLE_RATE = 24000
+let CHANNELS = 1
+let BITS_PER_SAMPLE = 16
+let BYTES_PER_SAMPLE = 2
+
+let MIN_DURATION_MS = 500
+let MAX_DURATION_MS = 10000
+let MAX_LATENCY_MS = 200
+
+let SILENCE_THRESHOLD = 0.01
+let CLIP_THRESHOLD = 0.99
+let CLIP_MAX_PCT = 1.0
+let DC_OFFSET_MAX = 0.05
+let BLIND_SCORE_MIN = 0.7
+
+let PASS_TAG = "PASS"
+let FAIL_TAG = "FAIL"
+
+let TMP_DIR = "/tmp/anima_wav_val"
+
+// ════════════════════════════════════════════════════════════════════
+// Section 1. Helpers
+// ════════════════════════════════════════════════════════════════════
+
+fn tag_for(ok: bool) -> str {
+    if ok { return PASS_TAG }
+    return FAIL_TAG
+}
+
+fn abs_val(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn max_val(a: float, b: float) -> float {
+    if a >= b { return a }
+    return b
+}
+
+fn min_val(a: float, b: float) -> float {
+    if a <= b { return a }
+    return b
+}
+
+fn sqrt_approx(x: float) -> float {
+    // Newton's method, 20 iterations — sufficient for our range
+    if x <= 0.0 { return 0.0 }
+    let mut g = x
+    if g > 1.0 { g = g / 2.0 }
+    let mut i = 0
+    while i < 20 {
+        g = (g + x / g) / 2.0
+        i = i + 1
+    }
+    return g
+}
+
+fn hr() {
+    println("────────────────────────────────────────────────────────────────")
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 2. WAV Header Parser
+// ════════════════════════════════════════════════════════════════════
+
+// parse_wav_header — reads RIFF/WAV header via xxd hex dump.
+// WAV header layout (canonical PCM):
+//   Offset  Size  Field
+//   0       4     "RIFF"
+//   4       4     file size - 8
+//   8       4     "WAVE"
+//   12      4     "fmt "
+//   16      4     fmt chunk size (16 for PCM)
+//   20      2     audio format (1 = PCM)
+//   22      2     num channels
+//   24      4     sample rate
+//   28      4     byte rate
+//   32      2     block align
+//   34      2     bits per sample
+//   36      4     "data"
+//   40      4     data size
+//
+// Returns comma-separated: sample_rate,channels,bits_per_sample,data_size,valid(0/1)
+
+fn parse_wav_header(path: string) -> string {
+    // Use xxd to dump first 44 bytes as hex, then parse fields
+    // xxd -p -l 44 gives continuous hex stream
+    let raw = exec("xxd -p -l 44 " + path + " 2>/dev/null | tr -d '\\n'")
+    if len(raw) < 88 {
+        // 44 bytes = 88 hex chars
+        return "0,0,0,0,0"
+    }
+
+    // Check RIFF magic: bytes 0-3 = 52494646
+    let magic_riff = raw.substring(0, 8)
+    if magic_riff != "52494646" {
+        return "0,0,0,0,0"
+    }
+
+    // Check WAVE magic: bytes 8-11 = 57415645
+    let magic_wave = raw.substring(16, 24)
+    if magic_wave != "57415645" {
+        return "0,0,0,0,0"
+    }
+
+    // Audio format: bytes 20-21, little-endian
+    let fmt_lo = raw.substring(40, 42)
+    let fmt_hi = raw.substring(42, 44)
+    let audio_fmt = hex_byte(fmt_lo) + hex_byte(fmt_hi) * 256
+    // We only validate PCM (format=1), but still report others
+
+    // Channels: bytes 22-23, little-endian
+    let ch_lo = raw.substring(44, 46)
+    let ch_hi = raw.substring(46, 48)
+    let channels = hex_byte(ch_lo) + hex_byte(ch_hi) * 256
+
+    // Sample rate: bytes 24-27, little-endian
+    let sr_b0 = raw.substring(48, 50)
+    let sr_b1 = raw.substring(50, 52)
+    let sr_b2 = raw.substring(52, 54)
+    let sr_b3 = raw.substring(54, 56)
+    let sample_rate = hex_byte(sr_b0) + hex_byte(sr_b1) * 256 + hex_byte(sr_b2) * 65536 + hex_byte(sr_b3) * 16777216
+
+    // Bits per sample: bytes 34-35, little-endian
+    let bps_lo = raw.substring(68, 70)
+    let bps_hi = raw.substring(70, 72)
+    let bits_per_sample = hex_byte(bps_lo) + hex_byte(bps_hi) * 256
+
+    // Data size: bytes 40-43, little-endian
+    let ds_b0 = raw.substring(80, 82)
+    let ds_b1 = raw.substring(82, 84)
+    let ds_b2 = raw.substring(84, 86)
+    let ds_b3 = raw.substring(86, 88)
+    let data_size = hex_byte(ds_b0) + hex_byte(ds_b1) * 256 + hex_byte(ds_b2) * 65536 + hex_byte(ds_b3) * 16777216
+
+    let valid = 1
+
+    return to_string(sample_rate) + "," + to_string(channels) + "," + to_string(bits_per_sample) + "," + to_string(data_size) + "," + to_string(valid)
+}
+
+// hex_byte — convert 2-char hex string to int (0-255)
+fn hex_byte(h: string) -> int {
+    let c0 = h.substring(0, 1)
+    let c1 = h.substring(1, 2)
+    return hex_digit(c0) * 16 + hex_digit(c1)
+}
+
+fn hex_digit(c: string) -> int {
+    if c == "0" { return 0 }
+    if c == "1" { return 1 }
+    if c == "2" { return 2 }
+    if c == "3" { return 3 }
+    if c == "4" { return 4 }
+    if c == "5" { return 5 }
+    if c == "6" { return 6 }
+    if c == "7" { return 7 }
+    if c == "8" { return 8 }
+    if c == "9" { return 9 }
+    if c == "a" { return 10 }
+    if c == "b" { return 11 }
+    if c == "c" { return 12 }
+    if c == "d" { return 13 }
+    if c == "e" { return 14 }
+    if c == "f" { return 15 }
+    if c == "A" { return 10 }
+    if c == "B" { return 11 }
+    if c == "C" { return 12 }
+    if c == "D" { return 13 }
+    if c == "E" { return 14 }
+    if c == "F" { return 15 }
+    return 0
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 3. Header Field Extraction
+// ════════════════════════════════════════════════════════════════════
+
+// Split comma-separated header string and extract individual fields.
+// Returns values via indexed helper functions (no struct with lists).
+
+fn header_sample_rate(hdr: string) -> int {
+    let parts = split(hdr, ",")
+    return to_int(parts[0])
+}
+
+fn header_channels(hdr: string) -> int {
+    let parts = split(hdr, ",")
+    return to_int(parts[1])
+}
+
+fn header_bits(hdr: string) -> int {
+    let parts = split(hdr, ",")
+    return to_int(parts[2])
+}
+
+fn header_data_size(hdr: string) -> int {
+    let parts = split(hdr, ",")
+    return to_int(parts[3])
+}
+
+fn header_valid(hdr: string) -> int {
+    let parts = split(hdr, ",")
+    return to_int(parts[4])
+}
+
+// Compute duration in milliseconds from header fields
+fn compute_duration_ms(hdr: string) -> int {
+    let sr = header_sample_rate(hdr)
+    let ch = header_channels(hdr)
+    let bps = header_bits(hdr)
+    let data_size = header_data_size(hdr)
+    if sr == 0 || ch == 0 || bps == 0 { return 0 }
+    let bytes_per_sample = bps / 8
+    let byte_rate = sr * ch * bytes_per_sample
+    if byte_rate == 0 { return 0 }
+    // duration_ms = data_size / byte_rate * 1000
+    let dur_ms = data_size * 1000 / byte_rate
+    return dur_ms
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 4. Validation Checks
+// ════════════════════════════════════════════════════════════════════
+
+// check_duration — 500ms ≤ dur ≤ 10000ms
+fn check_duration(hdr: string, min_ms: int, max_ms: int) -> bool {
+    let dur = compute_duration_ms(hdr)
+    return dur >= min_ms && dur <= max_ms
+}
+
+// check_format — PCM16 mono 24kHz
+fn check_format(hdr: string) -> bool {
+    let sr = header_sample_rate(hdr)
+    let ch = header_channels(hdr)
+    let bps = header_bits(hdr)
+    return sr == SAMPLE_RATE && ch == CHANNELS && bps == BITS_PER_SAMPLE
+}
+
+// check_silence — peak amplitude > 0.01 (not silent)
+// Uses shell to read raw PCM samples and find peak.
+fn check_silence(path: string) -> bool {
+    let peak = measure_peak_amplitude(path)
+    return peak > SILENCE_THRESHOLD
+}
+
+// check_clipping — percentage of samples at ±1.0 (< 1% acceptable)
+fn check_clipping(path: string) -> float {
+    // Count samples near ±32767 in the PCM data
+    let result = exec("tail -c +45 " + path + " | xxd -p | tr -d '\\n' | fold -w4 | wc -l 2>/dev/null")
+    let total_str = exec("echo " + result + " | tr -d ' '")
+    let total_samples = to_int(total_str)
+    if total_samples == 0 { return 0.0 }
+
+    // Count clipped samples: int16 values of 7fff (32767) or 8001..8000 (-32768/-32767)
+    // Root cause: clipping means sustained max amplitude — count samples with |value| >= 32700
+    let clip_count_str = exec("tail -c +45 " + path + " | xxd -p | tr -d '\\n' | fold -w4 | grep -ciE '^(ff7f|007f|fe7f|fd7f|0080|0180|0280)' 2>/dev/null || echo 0")
+    let clip_count = to_int(exec("echo " + clip_count_str + " | tr -d ' '"))
+
+    let pct = to_float(clip_count) / to_float(total_samples) * 100.0
+    return pct
+}
+
+// check_dc_offset — mean amplitude near 0.0 (|mean| < 0.05)
+fn check_dc_offset(path: string) -> float {
+    // Sample a subset of PCM values and compute mean.
+    // For efficiency, sample first 2000 int16 values via xxd.
+    let hex_data = exec("tail -c +45 " + path + " | xxd -p -l 4000 | tr -d '\\n'")
+    if len(hex_data) < 4 { return 0.0 }
+
+    let mut sum = 0.0
+    let mut count = 0
+    let mut pos = 0
+    let data_len = len(hex_data)
+
+    while pos + 4 <= data_len {
+        let lo_hex = hex_data.substring(pos, pos + 2)
+        let hi_hex = hex_data.substring(pos + 2, pos + 4)
+        let lo = hex_byte(lo_hex)
+        let hi = hex_byte(hi_hex)
+        let mut raw_val = lo + hi * 256
+        // Convert unsigned 16-bit to signed
+        if raw_val >= 32768 {
+            raw_val = raw_val - 65536
+        }
+        // Normalize to [-1.0, 1.0]
+        let norm = to_float(raw_val) / 32768.0
+        sum = sum + norm
+        count = count + 1
+        pos = pos + 4
+    }
+
+    if count == 0 { return 0.0 }
+    let mean = sum / to_float(count)
+    return mean
+}
+
+// measure_peak_amplitude — find max |sample| in WAV PCM data
+fn measure_peak_amplitude(path: string) -> float {
+    // Read first 4000 bytes of PCM data (2000 samples)
+    let hex_data = exec("tail -c +45 " + path + " | xxd -p -l 4000 | tr -d '\\n'")
+    if len(hex_data) < 4 { return 0.0 }
+
+    let mut peak = 0.0
+    let mut pos = 0
+    let data_len = len(hex_data)
+
+    while pos + 4 <= data_len {
+        let lo_hex = hex_data.substring(pos, pos + 2)
+        let hi_hex = hex_data.substring(pos + 2, pos + 4)
+        let lo = hex_byte(lo_hex)
+        let hi = hex_byte(hi_hex)
+        let mut raw_val = lo + hi * 256
+        if raw_val >= 32768 {
+            raw_val = raw_val - 65536
+        }
+        let norm = abs_val(to_float(raw_val) / 32768.0)
+        if norm > peak { peak = norm }
+        pos = pos + 4
+    }
+
+    return peak
+}
+
+// measure_rms — root mean square of PCM samples
+fn measure_rms(path: string) -> float {
+    let hex_data = exec("tail -c +45 " + path + " | xxd -p -l 4000 | tr -d '\\n'")
+    if len(hex_data) < 4 { return 0.0 }
+
+    let mut sum_sq = 0.0
+    let mut count = 0
+    let mut pos = 0
+    let data_len = len(hex_data)
+
+    while pos + 4 <= data_len {
+        let lo_hex = hex_data.substring(pos, pos + 2)
+        let hi_hex = hex_data.substring(pos + 2, pos + 4)
+        let lo = hex_byte(lo_hex)
+        let hi = hex_byte(hi_hex)
+        let mut raw_val = lo + hi * 256
+        if raw_val >= 32768 {
+            raw_val = raw_val - 65536
+        }
+        let norm = to_float(raw_val) / 32768.0
+        sum_sq = sum_sq + norm * norm
+        count = count + 1
+        pos = pos + 4
+    }
+
+    if count == 0 { return 0.0 }
+    return sqrt_approx(sum_sq / to_float(count))
+}
+
+// measure_zcr — zero-crossing rate (proxy for spectral flatness)
+fn measure_zcr(path: string) -> float {
+    let hex_data = exec("tail -c +45 " + path + " | xxd -p -l 4000 | tr -d '\\n'")
+    if len(hex_data) < 8 { return 0.0 }
+
+    let mut crossings = 0
+    let mut count = 0
+    let mut prev_sign = 0
+    let mut pos = 0
+    let data_len = len(hex_data)
+
+    while pos + 4 <= data_len {
+        let lo_hex = hex_data.substring(pos, pos + 2)
+        let hi_hex = hex_data.substring(pos + 2, pos + 4)
+        let lo = hex_byte(lo_hex)
+        let hi = hex_byte(hi_hex)
+        let mut raw_val = lo + hi * 256
+        if raw_val >= 32768 {
+            raw_val = raw_val - 65536
+        }
+        let mut cur_sign = 1
+        if raw_val < 0 { cur_sign = -1 }
+        if raw_val == 0 { cur_sign = 0 }
+
+        if count > 0 && cur_sign != 0 && prev_sign != 0 {
+            if cur_sign != prev_sign {
+                crossings = crossings + 1
+            }
+        }
+        if cur_sign != 0 { prev_sign = cur_sign }
+        count = count + 1
+        pos = pos + 4
+    }
+
+    if count <= 1 { return 0.0 }
+    return to_float(crossings) / to_float(count - 1)
+}
+
+// count_non_silence_pct — percentage of samples above silence threshold
+fn count_non_silence_pct(path: string) -> float {
+    let hex_data = exec("tail -c +45 " + path + " | xxd -p -l 4000 | tr -d '\\n'")
+    if len(hex_data) < 4 { return 0.0 }
+
+    let mut above = 0
+    let mut count = 0
+    let mut pos = 0
+    let data_len = len(hex_data)
+
+    while pos + 4 <= data_len {
+        let lo_hex = hex_data.substring(pos, pos + 2)
+        let hi_hex = hex_data.substring(pos + 2, pos + 4)
+        let lo = hex_byte(lo_hex)
+        let hi = hex_byte(hi_hex)
+        let mut raw_val = lo + hi * 256
+        if raw_val >= 32768 {
+            raw_val = raw_val - 65536
+        }
+        let norm = abs_val(to_float(raw_val) / 32768.0)
+        if norm > SILENCE_THRESHOLD { above = above + 1 }
+        count = count + 1
+        pos = pos + 4
+    }
+
+    if count == 0 { return 0.0 }
+    return to_float(above) / to_float(count)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 5. Latency Validation
+// ════════════════════════════════════════════════════════════════════
+
+// validate_with_latency — full validation of a WAV file with latency context.
+// Returns comma-separated result string:
+//   path,duration_ms,latency_ms,peak_amp,clip_pct,dc_offset,
+//   format_ok,duration_ok,silence_ok,clip_ok,dc_ok,latency_ok,all_pass
+fn validate_with_latency(wav_path: string, latency_ms: int) -> string {
+    let hdr = parse_wav_header(wav_path)
+    let valid = header_valid(hdr)
+    if valid == 0 {
+        return wav_path + ",0," + to_string(latency_ms) + ",0.0,0.0,0.0,0,0,0,0,0,0,0"
+    }
+
+    let duration_ms = compute_duration_ms(hdr)
+    let peak_amp = measure_peak_amplitude(wav_path)
+    let clip_pct = check_clipping(wav_path)
+    let dc_offset = check_dc_offset(wav_path)
+
+    let format_ok = check_format(hdr)
+    let duration_ok = duration_ms >= MIN_DURATION_MS && duration_ms <= MAX_DURATION_MS
+    let silence_ok = peak_amp > SILENCE_THRESHOLD
+    let clip_ok = clip_pct < CLIP_MAX_PCT
+    let dc_ok = abs_val(dc_offset) < DC_OFFSET_MAX
+    let latency_ok = latency_ms < MAX_LATENCY_MS
+
+    let all_pass = format_ok && duration_ok && silence_ok && clip_ok && dc_ok && latency_ok
+
+    let mut result = wav_path
+    result = result + "," + to_string(duration_ms)
+    result = result + "," + to_string(latency_ms)
+    result = result + "," + to_string(peak_amp)
+    result = result + "," + to_string(clip_pct)
+    result = result + "," + to_string(dc_offset)
+    result = result + "," + bool_to_str(format_ok)
+    result = result + "," + bool_to_str(duration_ok)
+    result = result + "," + bool_to_str(silence_ok)
+    result = result + "," + bool_to_str(clip_ok)
+    result = result + "," + bool_to_str(dc_ok)
+    result = result + "," + bool_to_str(latency_ok)
+    result = result + "," + bool_to_str(all_pass)
+
+    return result
+}
+
+fn bool_to_str(b: bool) -> string {
+    if b { return "1" }
+    return "0"
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 6. Blind Score Proxy
+// ════════════════════════════════════════════════════════════════════
+
+// estimate_blind_score — heuristic quality estimate 0.0–1.0.
+// Combines:
+//   1. Spectral flatness proxy (zero-crossing rate) — speech ZCR typically 0.02–0.10
+//   2. Dynamic range (peak/RMS ratio aka crest factor)
+//   3. Non-silence percentage
+//
+// Each component scored 0.0–1.0, then weighted average.
+fn estimate_blind_score(path: string) -> float {
+    let peak = measure_peak_amplitude(path)
+    let rms = measure_rms(path)
+    let zcr = measure_zcr(path)
+    let non_sil = count_non_silence_pct(path)
+
+    // 1. ZCR score: ideal speech ZCR is 0.02–0.10.
+    //    Score peaks at 0.06 (midpoint), drops outside range.
+    let mut zcr_score = 0.0
+    if zcr >= 0.02 && zcr <= 0.10 {
+        // Distance from center 0.06, max distance is 0.04
+        let dist = abs_val(zcr - 0.06)
+        zcr_score = 1.0 - dist / 0.04
+    } else if zcr > 0.10 && zcr < 0.30 {
+        // Tolerable but not great — noise-like
+        zcr_score = 0.3
+    } else if zcr > 0.0 && zcr < 0.02 {
+        // Too low — near DC or very low freq
+        zcr_score = 0.4
+    }
+    // else 0.0 for zcr == 0 (silence)
+
+    // 2. Crest factor score: peak/RMS.
+    //    Speech typically has crest factor 3–10 (9.5–20 dB).
+    //    Score best around 4–8.
+    let mut crest_score = 0.0
+    if rms > 0.001 {
+        let crest = peak / rms
+        if crest >= 3.0 && crest <= 10.0 {
+            crest_score = 1.0
+        } else if crest > 1.5 && crest < 3.0 {
+            crest_score = 0.6
+        } else if crest > 10.0 && crest < 20.0 {
+            crest_score = 0.7
+        } else {
+            crest_score = 0.2
+        }
+    }
+
+    // 3. Non-silence percentage score.
+    //    Good audio should have > 50% non-silent samples.
+    let mut activity_score = non_sil
+    if activity_score > 1.0 { activity_score = 1.0 }
+
+    // Weighted combination: ZCR 30%, Crest 30%, Activity 40%
+    let score = zcr_score * 0.30 + crest_score * 0.30 + activity_score * 0.40
+    return score
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 7. Batch Validator
+// ════════════════════════════════════════════════════════════════════
+
+// validate_batch — validates multiple WAV files, returns pass count.
+// Prints structured report table.
+fn validate_batch_dir(dir_path: string) -> int {
+    let file_list = exec("ls " + dir_path + "/*.wav 2>/dev/null")
+    if len(file_list) == 0 {
+        println("[WAV-VAL] No WAV files found in: " + dir_path)
+        return 0
+    }
+
+    println("")
+    hr()
+    println("  WAV VALIDATION BATCH REPORT")
+    hr()
+    println("  Dir: " + dir_path)
+    println("")
+    println("  File                   | Dur(ms) | Fmt | Sil | Clip% | DC     | Blind | Result")
+    println("  -----------------------+---------+-----+-----+-------+--------+-------+-------")
+
+    let mut pass_count = 0
+    let mut total_count = 0
+
+    // Parse file list line by line
+    let mut pos = 0
+    let list_len = len(file_list)
+
+    while pos < list_len {
+        // Find next newline
+        let mut eol = pos
+        while eol < list_len {
+            let ch = file_list.substring(eol, eol + 1)
+            if ch == "\n" { break }
+            eol = eol + 1
+        }
+        let wav_path = file_list.substring(pos, eol)
+        pos = eol + 1
+
+        if len(wav_path) == 0 { continue }
+
+        let result = validate_single_report(wav_path)
+        if result { pass_count = pass_count + 1 }
+        total_count = total_count + 1
+    }
+
+    println("  -----------------------+---------+-----+-----+-------+--------+-------+-------")
+    println("  TOTAL: " + to_string(pass_count) + "/" + to_string(total_count) + " PASS")
+    hr()
+    println("")
+
+    return pass_count
+}
+
+// validate_single_report — validate one WAV and print table row.
+// Returns true if all checks pass.
+fn validate_single_report(wav_path: string) -> bool {
+    let hdr = parse_wav_header(wav_path)
+    let valid = header_valid(hdr)
+    if valid == 0 {
+        // Extract filename for display
+        let fname = extract_filename(wav_path)
+        println("  " + pad_right(fname, 23) + "| INVALID WAV HEADER")
+        return false
+    }
+
+    let duration_ms = compute_duration_ms(hdr)
+    let format_ok = check_format(hdr)
+    let peak = measure_peak_amplitude(wav_path)
+    let silence_ok = peak > SILENCE_THRESHOLD
+    let clip_pct = check_clipping(wav_path)
+    let clip_ok = clip_pct < CLIP_MAX_PCT
+    let dc_offset = check_dc_offset(wav_path)
+    let dc_ok = abs_val(dc_offset) < DC_OFFSET_MAX
+    let duration_ok = duration_ms >= MIN_DURATION_MS && duration_ms <= MAX_DURATION_MS
+    let blind = estimate_blind_score(wav_path)
+
+    let all_ok = format_ok && duration_ok && silence_ok && clip_ok && dc_ok && blind >= BLIND_SCORE_MIN
+
+    let fname = extract_filename(wav_path)
+
+    let mut line = "  " + pad_right(fname, 23) + "| "
+    line = line + pad_right(to_string(duration_ms), 8) + "| "
+    line = line + pad_right(tag_for(format_ok), 4) + "| "
+    line = line + pad_right(tag_for(silence_ok), 4) + "| "
+    line = line + pad_right(fmt_float2(clip_pct), 6) + "| "
+    line = line + pad_right(fmt_float3(dc_offset), 7) + "| "
+    line = line + pad_right(fmt_float2(blind), 6) + "| "
+    line = line + tag_for(all_ok)
+    println(line)
+
+    return all_ok
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 8. String Helpers
+// ════════════════════════════════════════════════════════════════════
+
+fn extract_filename(path: string) -> string {
+    // Find last '/' and return everything after
+    let mut last_slash = -1
+    let mut i = 0
+    let plen = len(path)
+    while i < plen {
+        let ch = path.substring(i, i + 1)
+        if ch == "/" { last_slash = i }
+        i = i + 1
+    }
+    if last_slash >= 0 {
+        return path.substring(last_slash + 1, plen)
+    }
+    return path
+}
+
+fn pad_right(s: string, width: int) -> string {
+    let mut out = s
+    while len(out) < width {
+        out = out + " "
+    }
+    return out
+}
+
+fn fmt_float2(f: float) -> string {
+    // Rough 2-decimal formatting
+    let sign = if f < 0.0 { "-" } else { "" }
+    let af = abs_val(f)
+    let int_part = to_int(af)
+    let frac = to_int((af - to_float(int_part)) * 100.0)
+    let mut frac_str = to_string(frac)
+    if frac < 10 { frac_str = "0" + frac_str }
+    return sign + to_string(int_part) + "." + frac_str
+}
+
+fn fmt_float3(f: float) -> string {
+    let sign = if f < 0.0 { "-" } else { "" }
+    let af = abs_val(f)
+    let int_part = to_int(af)
+    let frac = to_int((af - to_float(int_part)) * 1000.0)
+    let mut frac_str = to_string(frac)
+    if frac < 100 { frac_str = "0" + frac_str }
+    if frac < 10 { frac_str = "0" + frac_str }
+    return sign + to_string(int_part) + "." + frac_str
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 9. Test WAV Generator
+// ════════════════════════════════════════════════════════════════════
+
+// generate_test_wav — creates a WAV file with specified properties.
+// Uses printf to write binary WAV header + PCM data via shell.
+//
+// Parameters:
+//   out_path:     output WAV file path
+//   duration_ms:  desired duration in milliseconds
+//   frequency:    sine wave frequency (Hz), 0 = silence
+//   amplitude:    0.0–1.0
+fn generate_test_wav(out_path: string, duration_ms: int, frequency: int, amplitude: float) -> bool {
+    let sr = SAMPLE_RATE
+    let ch = CHANNELS
+    let bps = BITS_PER_SAMPLE
+    let n_samples = sr * duration_ms / 1000
+    let data_size = n_samples * ch * (bps / 8)
+    let file_size = 36 + data_size
+
+    // Build WAV header as hex bytes
+    // RIFF header
+    let mut hdr_hex = "52494646"  // "RIFF"
+    hdr_hex = hdr_hex + int32_le_hex(file_size)
+    hdr_hex = hdr_hex + "57415645"  // "WAVE"
+    // fmt chunk
+    hdr_hex = hdr_hex + "666d7420"  // "fmt "
+    hdr_hex = hdr_hex + "10000000"  // chunk size = 16
+    hdr_hex = hdr_hex + "0100"      // audio format = 1 (PCM)
+    hdr_hex = hdr_hex + int16_le_hex(ch)
+    hdr_hex = hdr_hex + int32_le_hex(sr)
+    let byte_rate = sr * ch * (bps / 8)
+    hdr_hex = hdr_hex + int32_le_hex(byte_rate)
+    let block_align = ch * (bps / 8)
+    hdr_hex = hdr_hex + int16_le_hex(block_align)
+    hdr_hex = hdr_hex + int16_le_hex(bps)
+    // data chunk
+    hdr_hex = hdr_hex + "64617461"  // "data"
+    hdr_hex = hdr_hex + int32_le_hex(data_size)
+
+    // Write header via xxd reverse
+    let hdr_tmp = TMP_DIR + "/hdr.hex"
+    let _ = exec("mkdir -p " + TMP_DIR)
+    write_file(hdr_tmp, hdr_hex)
+    let _ = exec("xxd -r -p " + hdr_tmp + " > " + out_path)
+
+    // Generate PCM samples and append
+    // For efficiency, generate samples in shell using awk
+    if frequency == 0 || amplitude == 0.0 {
+        // Silent WAV — write zero bytes
+        let zero_bytes = data_size
+        let _ = exec("dd if=/dev/zero bs=1 count=" + to_string(zero_bytes) + " >> " + out_path + " 2>/dev/null")
+    } else {
+        // Generate sine wave samples via awk, output as binary via xxd
+        // Root cause: hexa has no direct binary I/O; shell pipeline is the path.
+        let awk_cmd = "awk 'BEGIN { pi=3.14159265; sr=" + to_string(sr) + "; f=" + to_string(frequency) + "; a=" + to_string(amplitude) + "; n=" + to_string(n_samples) + "; for(i=0;i<n;i++) { v=int(a*sin(2*pi*f*i/sr)*32767); if(v<0) v=v+65536; lo=v%256; hi=int(v/256); printf \"%02x%02x\",lo,hi } }' /dev/null"
+        let pcm_hex_tmp = TMP_DIR + "/pcm.hex"
+        let _ = exec(awk_cmd + " > " + pcm_hex_tmp)
+        let _ = exec("xxd -r -p " + pcm_hex_tmp + " >> " + out_path)
+    }
+
+    // Verify file was created
+    let check = exec("test -f " + out_path + " && echo ok || echo fail")
+    if len(check) >= 2 {
+        let c2 = check.substring(0, 2)
+        if c2 == "ok" { return true }
+    }
+    return false
+}
+
+// generate_test_wav_wrong_rate — creates WAV with non-standard sample rate for format test
+fn generate_test_wav_wrong_rate(out_path: string, duration_ms: int, wrong_sr: int) -> bool {
+    let sr = wrong_sr
+    let ch = CHANNELS
+    let bps = BITS_PER_SAMPLE
+    let n_samples = sr * duration_ms / 1000
+    let data_size = n_samples * ch * (bps / 8)
+    let file_size = 36 + data_size
+
+    let mut hdr_hex = "52494646"
+    hdr_hex = hdr_hex + int32_le_hex(file_size)
+    hdr_hex = hdr_hex + "57415645"
+    hdr_hex = hdr_hex + "666d7420"
+    hdr_hex = hdr_hex + "10000000"
+    hdr_hex = hdr_hex + "0100"
+    hdr_hex = hdr_hex + int16_le_hex(ch)
+    hdr_hex = hdr_hex + int32_le_hex(sr)
+    let byte_rate = sr * ch * (bps / 8)
+    hdr_hex = hdr_hex + int32_le_hex(byte_rate)
+    let block_align = ch * (bps / 8)
+    hdr_hex = hdr_hex + int16_le_hex(block_align)
+    hdr_hex = hdr_hex + int16_le_hex(bps)
+    hdr_hex = hdr_hex + "64617461"
+    hdr_hex = hdr_hex + int32_le_hex(data_size)
+
+    let hdr_tmp = TMP_DIR + "/hdr_wr.hex"
+    let _ = exec("mkdir -p " + TMP_DIR)
+    write_file(hdr_tmp, hdr_hex)
+    let _ = exec("xxd -r -p " + hdr_tmp + " > " + out_path)
+    let _ = exec("dd if=/dev/zero bs=1 count=" + to_string(data_size) + " >> " + out_path + " 2>/dev/null")
+
+    let check = exec("test -f " + out_path + " && echo ok || echo fail")
+    if len(check) >= 2 {
+        let c2 = check.substring(0, 2)
+        if c2 == "ok" { return true }
+    }
+    return false
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 10. Hex Encoding Helpers
+// ════════════════════════════════════════════════════════════════════
+
+fn int32_le_hex(v: int) -> string {
+    let b0 = v % 256
+    let b1 = (v / 256) % 256
+    let b2 = (v / 65536) % 256
+    let b3 = (v / 16777216) % 256
+    return byte_hex(b0) + byte_hex(b1) + byte_hex(b2) + byte_hex(b3)
+}
+
+fn int16_le_hex(v: int) -> string {
+    let b0 = v % 256
+    let b1 = (v / 256) % 256
+    return byte_hex(b0) + byte_hex(b1)
+}
+
+fn byte_hex(b: int) -> string {
+    let hi = b / 16
+    let lo = b % 16
+    return nibble_hex(hi) + nibble_hex(lo)
+}
+
+fn nibble_hex(n: int) -> string {
+    if n == 0 { return "0" }
+    if n == 1 { return "1" }
+    if n == 2 { return "2" }
+    if n == 3 { return "3" }
+    if n == 4 { return "4" }
+    if n == 5 { return "5" }
+    if n == 6 { return "6" }
+    if n == 7 { return "7" }
+    if n == 8 { return "8" }
+    if n == 9 { return "9" }
+    if n == 10 { return "a" }
+    if n == 11 { return "b" }
+    if n == 12 { return "c" }
+    if n == 13 { return "d" }
+    if n == 14 { return "e" }
+    if n == 15 { return "f" }
+    return "0"
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 11. Self-Tests
+// ════════════════════════════════════════════════════════════════════
+
+fn run_self_tests() -> int {
+    println("")
+    hr()
+    println("  WAV VALIDATOR — SELF-TEST SUITE (6 tests)")
+    hr()
+    println("")
+
+    let _ = exec("mkdir -p " + TMP_DIR)
+
+    let mut pass = 0
+    let mut fail = 0
+
+    // T1: Valid WAV passes all checks
+    //   Generate 1s 440Hz sine at 0.5 amplitude — should pass everything.
+    let t1_path = TMP_DIR + "/t1_valid.wav"
+    let t1_gen = generate_test_wav(t1_path, 1000, 440, 0.5)
+    let t1_hdr = parse_wav_header(t1_path)
+    let t1_valid = header_valid(t1_hdr)
+    let t1_dur = compute_duration_ms(t1_hdr)
+    let t1_fmt = check_format(t1_hdr)
+    let t1_sil = check_silence(t1_path)
+    let t1_dur_ok = check_duration(t1_hdr, MIN_DURATION_MS, MAX_DURATION_MS)
+    let t1_clip = check_clipping(t1_path)
+    let t1_dc = check_dc_offset(t1_path)
+    let t1_all = t1_gen && t1_valid == 1 && t1_fmt && t1_sil && t1_dur_ok && t1_clip < CLIP_MAX_PCT && abs_val(t1_dc) < DC_OFFSET_MAX
+    println("  T1  Valid WAV all-pass           " + tag_for(t1_all))
+    println("      gen=" + tag_for(t1_gen) + " valid=" + to_string(t1_valid) + " dur=" + to_string(t1_dur) + "ms fmt=" + tag_for(t1_fmt))
+    println("      silence=" + tag_for(t1_sil) + " clip=" + fmt_float2(t1_clip) + "% dc=" + fmt_float3(t1_dc))
+    if t1_all { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T2: Too-short WAV (100ms) fails duration check
+    let t2_path = TMP_DIR + "/t2_short.wav"
+    let t2_gen = generate_test_wav(t2_path, 100, 440, 0.5)
+    let t2_hdr = parse_wav_header(t2_path)
+    let t2_dur = compute_duration_ms(t2_hdr)
+    let t2_dur_ok = check_duration(t2_hdr, MIN_DURATION_MS, MAX_DURATION_MS)
+    let t2_pass = t2_gen && !t2_dur_ok && t2_dur < MIN_DURATION_MS
+    println("  T2  Short WAV fails duration     " + tag_for(t2_pass))
+    println("      dur=" + to_string(t2_dur) + "ms (expect < " + to_string(MIN_DURATION_MS) + ") dur_ok=" + tag_for(t2_dur_ok))
+    if t2_pass { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T3: Silent WAV fails silence check
+    let t3_path = TMP_DIR + "/t3_silent.wav"
+    let t3_gen = generate_test_wav(t3_path, 1000, 0, 0.0)
+    let t3_sil = check_silence(t3_path)
+    let t3_pass = t3_gen && !t3_sil
+    println("  T3  Silent WAV fails silence     " + tag_for(t3_pass))
+    println("      silence_ok=" + tag_for(t3_sil) + " (expect FAIL)")
+    if t3_pass { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T4: Format validation detects wrong sample rate
+    let t4_path = TMP_DIR + "/t4_wrong_rate.wav"
+    let t4_gen = generate_test_wav_wrong_rate(t4_path, 1000, 16000)
+    let t4_hdr = parse_wav_header(t4_path)
+    let t4_fmt = check_format(t4_hdr)
+    let t4_sr = header_sample_rate(t4_hdr)
+    let t4_pass = t4_gen && !t4_fmt && t4_sr == 16000
+    println("  T4  Wrong rate fails format      " + tag_for(t4_pass))
+    println("      sr=" + to_string(t4_sr) + " (expect 16000) fmt=" + tag_for(t4_fmt) + " (expect FAIL)")
+    if t4_pass { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T5: Blind score > 0.7 for normal audio
+    let t5_path = TMP_DIR + "/t5_quality.wav"
+    let t5_gen = generate_test_wav(t5_path, 2000, 440, 0.6)
+    let t5_blind = estimate_blind_score(t5_path)
+    let t5_pass = t5_gen && t5_blind >= BLIND_SCORE_MIN
+    println("  T5  Blind score >= 0.7           " + tag_for(t5_pass))
+    println("      blind=" + fmt_float2(t5_blind) + " (threshold " + fmt_float2(BLIND_SCORE_MIN) + ")")
+    if t5_pass { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T6: Batch validator counts correctly
+    //   Generate 3 WAVs: 2 valid, 1 silent. Batch should report 2 pass.
+    let t6_dir = TMP_DIR + "/t6_batch"
+    let _ = exec("mkdir -p " + t6_dir)
+    let t6a = generate_test_wav(t6_dir + "/a_good.wav", 1000, 440, 0.5)
+    let t6b = generate_test_wav(t6_dir + "/b_good.wav", 1500, 880, 0.4)
+    let t6c = generate_test_wav(t6_dir + "/c_silent.wav", 1000, 0, 0.0)
+    let t6_count = validate_batch_dir(t6_dir)
+    // Root cause: c_silent fails silence check, so 2/3 should pass
+    let t6_pass = t6a && t6b && t6c && t6_count == 2
+    println("  T6  Batch count correct          " + tag_for(t6_pass))
+    println("      expected=2 got=" + to_string(t6_count))
+    if t6_pass { pass = pass + 1 } else { fail = fail + 1 }
+
+    // Summary
+    println("")
+    hr()
+    println("  SELF-TEST RESULT: " + to_string(pass) + "/" + to_string(pass + fail) + " PASS")
+    if fail == 0 {
+        println("  STATUS: ALL PASS")
+    } else {
+        println("  STATUS: " + to_string(fail) + " FAIL")
+    }
+    hr()
+    println("")
+
+    // Cleanup
+    let _ = exec("rm -rf " + TMP_DIR)
+
+    return pass
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 12. CLI + Main
+// ════════════════════════════════════════════════════════════════════
+
+fn main() {
+    let args = args()
+    let argc = len(args)
+
+    if argc < 2 {
+        println("wav_validator.hexa — HEXA-SPEAK Mk.III WAV Validation Pipeline")
+        println("")
+        println("Usage:")
+        println("  hexa run wav_validator.hexa --validate <path>   Validate single WAV")
+        println("  hexa run wav_validator.hexa --batch <dir>       Validate all WAVs in dir")
+        println("  hexa run wav_validator.hexa --self-test         Run self-test suite")
+        return
+    }
+
+    let cmd = args[1]
+
+    if cmd == "--self-test" {
+        let pass_count = run_self_tests()
+        return
+    }
+
+    if cmd == "--validate" {
+        if argc < 3 {
+            println("[ERROR] --validate requires a WAV path")
+            return
+        }
+        let wav_path = args[2]
+        println("")
+        hr()
+        println("  WAV VALIDATION: " + wav_path)
+        hr()
+
+        let hdr = parse_wav_header(wav_path)
+        let valid = header_valid(hdr)
+        if valid == 0 {
+            println("  RESULT: INVALID WAV HEADER")
+            hr()
+            return
+        }
+
+        let sr = header_sample_rate(hdr)
+        let ch = header_channels(hdr)
+        let bps = header_bits(hdr)
+        let data_sz = header_data_size(hdr)
+        let dur = compute_duration_ms(hdr)
+
+        println("  Sample Rate:    " + to_string(sr) + " Hz")
+        println("  Channels:       " + to_string(ch))
+        println("  Bits/Sample:    " + to_string(bps))
+        println("  Data Size:      " + to_string(data_sz) + " bytes")
+        println("  Duration:       " + to_string(dur) + " ms")
+        println("")
+
+        let fmt_ok = check_format(hdr)
+        let dur_ok = check_duration(hdr, MIN_DURATION_MS, MAX_DURATION_MS)
+        let sil_ok = check_silence(wav_path)
+        let clip_pct = check_clipping(wav_path)
+        let clip_ok = clip_pct < CLIP_MAX_PCT
+        let dc = check_dc_offset(wav_path)
+        let dc_ok = abs_val(dc) < DC_OFFSET_MAX
+        let blind = estimate_blind_score(wav_path)
+        let blind_ok = blind >= BLIND_SCORE_MIN
+
+        println("  Format (PCM16/mono/24k):  " + tag_for(fmt_ok))
+        println("  Duration (500-10000ms):   " + tag_for(dur_ok) + "  (" + to_string(dur) + "ms)")
+        println("  Non-silence (peak>0.01):  " + tag_for(sil_ok))
+        println("  Clipping (<1%):           " + tag_for(clip_ok) + "  (" + fmt_float2(clip_pct) + "%)")
+        println("  DC Offset (|mean|<0.05):  " + tag_for(dc_ok) + "  (" + fmt_float3(dc) + ")")
+        println("  Blind Score (>=0.7):      " + tag_for(blind_ok) + "  (" + fmt_float2(blind) + ")")
+
+        let all_ok = fmt_ok && dur_ok && sil_ok && clip_ok && dc_ok && blind_ok
+        println("")
+        println("  OVERALL: " + tag_for(all_ok))
+        hr()
+        return
+    }
+
+    if cmd == "--batch" {
+        if argc < 3 {
+            println("[ERROR] --batch requires a directory path")
+            return
+        }
+        let dir_path = args[2]
+        let pass_count = validate_batch_dir(dir_path)
+        return
+    }
+
+    println("[ERROR] Unknown command: " + cmd)
+    println("  Use --validate, --batch, or --self-test")
+}
