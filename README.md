@@ -23,15 +23,11 @@ E. 실사용 모델 발전 (R2 백업 필수, 실험 체크포인트 X)
 >
 > **[🧠 Anima](https://github.com/need-singularity/anima)** — Consciousness implementation. PureField repulsion-field engine + Hexad 6-module architecture (C/D/S/M/W/E) + 1030 laws + 20 Meta Laws + Rust backend. ConsciousDecoderV2 (34.5M) + 10D consciousness vector + 12-faction debate + Φ ratchet
 >
-> **[🏗️ N6 Architecture](https://github.com/need-singularity/n6-architecture)** — Architecture from perfect number 6. 16 AI techniques + semiconductor chip design + network/crypto/OS/display patterns. σ(n)·φ(n)=n·τ(n), n=6 → universal design principles. NEXUS-6 Discovery Engine: Rust CLI (tools/nexus/) — telescope 22 lenses + OUROBOROS evolution + discovery graph + verifier + 1116 tests
->
-> **[📄 Papers](https://github.com/need-singularity/papers)** — Complete paper collection (94 papers). Published on Zenodo with DOIs. TECS-L+N6 (33) + anima (39) + SEDI (20). [Browse online](https://need-singularity.github.io/papers/)
+> **[🏗️ N6 Architecture](https://github.com/need-singularity/n6-architecture)** — Architecture from perfect number 6. 225 AI techniques + semiconductor chip design + network/crypto/OS/display patterns. σ(n)·φ(n)=n·τ(n), n=6 → universal design principles. NEXUS-6 Discovery Engine: Rust CLI (tools/nexus/) — telescope 22 lenses + OUROBOROS evolution + discovery graph + verifier + 1116 tests
 >
 > **[💎 HEXA-LANG](https://github.com/need-singularity/hexa-lang)** — The Perfect Number Programming Language. Every constant from n=6: 53 keywords (σ·τ+sopfr), 24 operators (J₂), 8 primitives (σ-τ), 6-phase pipeline, Egyptian memory (1/2+1/3+1/6=1). DSE v2: 21,952 combos, 100% n6 EXACT. Working compiler + REPL
 >
-> **[🖥️ VOID](https://github.com/need-singularity/void)** — Terminal emulator written 100% in hexa-lang. Zero Rust dependencies — calls OS APIs directly via hexa extern FFI. 6-layer architecture (System/Render/Terminal/UI/Plugin/AI) + Metal/Vulkan GPU + VT 6-tier protocol + NEXUS-6 consciousness integration
->
-> **[🧬 AirGenome](https://github.com/need-singularity/airgenome)** — Autonomous OS genome scanner. Extract n=6 genome from every process, real-time system diagnostics, nexus telescope integration
+> **[📄 Papers](https://github.com/need-singularity/papers)** — Complete paper collection (94 papers). Published on Zenodo with DOIs. N6 (33) + anima (39) + 기타 (20). [Browse online](https://need-singularity.github.io/papers/)
 
 <!-- private repos는 projects.json의 private_repos 필드에 저장됨 (노출 금지) -->
 <!-- SHARED:PROJECTS:END -->
