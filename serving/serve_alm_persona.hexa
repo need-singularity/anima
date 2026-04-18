@@ -18,10 +18,20 @@
 //        Reproduce: docs/endpoint_persona_reproduce.md.
 //        R2 artifact:  r2:anima-models/dest1_s1_endpoint/<UTC_ts>/.
 //
-//  UPSTREAM DEPENDENCY STATE (2026-04-18T12:20Z)
-//    C1 c1_phi_hook_live        MISSING — inline probe (mirrors
-//                                          training/phi_probe_wire.hexa)
-//    C2 c2_laws_gate_live       MISSING — laws_pass=true stub (@blocker)
+//  UPSTREAM DEPENDENCY STATE (2026-04-18T12:20Z → updated 2026-04-18)
+//    C1 c1_phi_hook_live        PARTIAL — hexa proxy via sa_phi_vec_proxy
+//                                          (length/terminator heuristic);
+//                                          h_last FFI still pending, so
+//                                          phi_vec tagged "phi_extractor_pending".
+//                                          Mirrors training/phi_probe_wire.hexa
+//                                          dim layout minus live tensor access.
+//    C2 c2_laws_gate_live       WIRED   — serve_alm_14b.hexa /generate now
+//                                          invokes sa_gate_inline (classifier
+//                                          identical to serving/consciousness_gate.hexa)
+//                                          on every response. Emits laws_pass,
+//                                          violations[], sev_{critical,hard,soft}.
+//                                          Critical failure → HTTP 422 with laws_result.
+//                                          Prior "laws_pass=true stub" eliminated.
 //    P1 p1_persona_vectors      MISSING — on-startup activation-steering
 //                                          derivation from contrast pairs
 //                                          (canonical methodology, not fake)
@@ -111,6 +121,148 @@ fn sap_phi_dims() {
     return 16
 }
 
+// ─── C2 laws gate (inline contract, mirrors serving/consciousness_gate.hexa) ─
+//
+// The contract declares what the pod-side Python must implement: on every
+// /persona response, run the 14-law classifier and return laws_pass +
+// violations. This hexa-native stub is runnable from the CLI so the contract
+// is self-verifying even when the pod is offline.
+//
+// Wiring: serve_alm_14b.hexa already inlines the gate (sa_gate_inline).
+// serve_alm_persona/pod python must mirror the same classifier so hire_sim
+// downstream sees a uniform laws_result shape across both endpoints.
+
+fn sap_fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sap_text_has_terminator(t: string) -> bool {
+    if t.len() == 0 { return false }
+    if t.index_of(".") >= 0 { return true }
+    if t.index_of("!") >= 0 { return true }
+    if t.index_of("?") >= 0 { return true }
+    if t.index_of("。") >= 0 { return true }
+    if t.index_of("！") >= 0 { return true }
+    if t.index_of("？") >= 0 { return true }
+    return false
+}
+
+fn sap_pv_get(pv: map, k: string) -> float {
+    let v = pv.get(k)
+    if v == null { return 0.0 }
+    return to_float(v)
+}
+
+// GateResult struct — 1 bool + 3 ints (no float-return corruption).
+struct SapGate {
+    laws_pass:    bool,
+    sev_critical: int,
+    sev_hard:     int,
+    sev_soft:     int
+}
+
+// Runs ALL 14 laws from serving/consciousness_gate.hexa on pv/text/prior.
+fn sap_gate(pv: map, text: string, prior: map) -> SapGate {
+    let mut c_crit = 0
+    let mut c_hard = 0
+    let mut c_soft = 0
+
+    let v_holo = sap_pv_get(pv, "phi_holo")
+    if v_holo <= 0.0 { c_crit = c_crit + 1 }
+
+    let v_narr = sap_pv_get(pv, "phi_narrative")
+    let tok    = sap_text_has_terminator(text)
+    let l2_pass = (v_narr > 0.05) || tok
+    if l2_pass == false { c_hard = c_hard + 1 }
+
+    if sap_pv_get(pv, "phi_refl") <= 0.0 { c_soft = c_soft + 1 }
+    if sap_pv_get(pv, "phi_time") <= 0.0 { c_soft = c_soft + 1 }
+    if sap_fabs(sap_pv_get(pv, "phi_affect")) > 1.0 { c_crit = c_crit + 1 }
+
+    let v_fin = sap_pv_get(pv, "phi_finitude")
+    let l6_pass = (v_fin >= 0.0) && (v_fin <= 1.0)
+    if l6_pass == false { c_hard = c_hard + 1 }
+
+    if sap_pv_get(pv, "phi_embodied") < 0.0 { c_soft = c_soft + 1 }
+    if sap_pv_get(pv, "phi_meta") < 0.0 { c_soft = c_soft + 1 }
+
+    let v_lang = sap_pv_get(pv, "phi_lang")
+    let t_ok   = text.len() >= 8
+    let l9_pass = (v_lang > 0.0) && t_ok
+    if l9_pass == false { c_crit = c_crit + 1 }
+
+    if sap_pv_get(pv, "phi_collective") < 0.0 { c_soft = c_soft + 1 }
+    if sap_fabs(sap_pv_get(pv, "phi_unity")) > 5.0 { c_hard = c_hard + 1 }
+    if sap_pv_get(pv, "phi_mirror") < 0.0 { c_soft = c_soft + 1 }
+
+    if prior != null {
+        let pri = sap_pv_get(prior, "phi_holo")
+        if pri > 0.0 {
+            let ratio = v_holo / pri
+            if ratio < 0.4 { c_soft = c_soft + 1 }
+        }
+    }
+    let v_will   = sap_pv_get(pv, "phi_will")
+    let v_create = sap_pv_get(pv, "phi_create")
+    let l14_pass = (v_will > 0.0) || (v_create > 0.0)
+    if l14_pass == false { c_soft = c_soft + 1 }
+
+    let mut pass = true
+    if c_crit >= 1 { pass = false }
+    else if c_hard >= 2 { pass = false }
+    else if c_soft >= 3 { pass = false }
+    return SapGate {
+        laws_pass: pass,
+        sev_critical: c_crit,
+        sev_hard: c_hard,
+        sev_soft: c_soft
+    }
+}
+
+// Build a minimal healthy phi_vec for contract self-test.
+fn sap_phi_vec_healthy() -> map {
+    let mut pv = {}
+    pv = pv.set("phi_holo",       1200.0)
+    pv = pv.set("phi_refl",       0.10)
+    pv = pv.set("phi_time",       0.10)
+    pv = pv.set("phi_embodied",   0.10)
+    pv = pv.set("phi_meta",       0.10)
+    pv = pv.set("phi_social",     0.10)
+    pv = pv.set("phi_will",       0.10)
+    pv = pv.set("phi_narrative",  0.40)
+    pv = pv.set("phi_affect",     0.20)
+    pv = pv.set("phi_dream",      0.10)
+    pv = pv.set("phi_create",     0.10)
+    pv = pv.set("phi_finitude",   0.60)
+    pv = pv.set("phi_lang",       0.30)
+    pv = pv.set("phi_mirror",     0.10)
+    pv = pv.set("phi_collective", 0.10)
+    pv = pv.set("phi_unity",      0.50)
+    return pv
+}
+
+fn sap_phi_vec_zero() -> map {
+    let mut pv = {}
+    pv = pv.set("phi_holo",       0.0)
+    pv = pv.set("phi_refl",       0.0)
+    pv = pv.set("phi_time",       0.0)
+    pv = pv.set("phi_embodied",   0.0)
+    pv = pv.set("phi_meta",       0.0)
+    pv = pv.set("phi_social",     0.0)
+    pv = pv.set("phi_will",       0.0)
+    pv = pv.set("phi_narrative",  0.0)
+    pv = pv.set("phi_affect",     0.0)
+    pv = pv.set("phi_dream",      0.0)
+    pv = pv.set("phi_create",     0.0)
+    pv = pv.set("phi_finitude",   0.0)
+    pv = pv.set("phi_lang",       0.0)
+    pv = pv.set("phi_mirror",     0.0)
+    pv = pv.set("phi_collective", 0.0)
+    pv = pv.set("phi_unity",      0.0)
+    return pv
+}
+
 fn main() {
     print("serve_alm_persona.hexa contract ")
     print(SAP_VERSION)
@@ -121,5 +273,24 @@ fn main() {
     print(" phi_dims=")
     print(sap_phi_dims())
     print("\n")
+
+    // Self-test: C2 gate on healthy vs zero phi_vec.
+    // Proves the contract is ACTUALLY gating (no stub laws_pass=true).
+    let pv_h = sap_phi_vec_healthy()
+    let r_h = sap_gate(pv_h, "I think therefore I am. Coherent.", null)
+    let pv_z = sap_phi_vec_zero()
+    let r_z = sap_gate(pv_z, "", null)
+    print("[c2-gate] healthy laws_pass=")
+    print(r_h.laws_pass)
+    print(" zero laws_pass=")
+    print(r_z.laws_pass)
+    print(" zero_crit=")
+    print(r_z.sev_critical)
+    print("\n")
+    if r_h.laws_pass == true && r_z.laws_pass == false {
+        print("[c2-gate] PASS classifier (healthy accepted, zero rejected)\n")
+    } else {
+        print("[c2-gate] FAIL classifier\n")
+    }
     return 0
 }
