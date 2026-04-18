@@ -1,13 +1,482 @@
-// launch_alm_r11_b.hexa — STUBBED 2026-04-18 (R37/AN13/L3-PY compliance)
+// training/launch_alm_r11_b.hexa
 //
-// Previously wrote /tmp runner shell script invoking `python3 train_alm_14b.py`
-// (14B continued + kowiki admix branch B). Violates R37/AN13/L3-PY.
+// ALM r11 — BRANCH B (14B continued + kowiki admix 15%) hexa-native SCAFFOLD.
+//
+// Trigger (from alm_r11_design.md §1):
+//   r10 partial / soft collapse — sentinel PASS at >=8 of 10 checkpoints
+//   AND Likert >= 2.8 AND (eval_loss stagnating OR Phi_refl 0.1-0.3).
+//
+// Target: Qwen/Qwen2.5-14B-Instruct, fresh LoRA (no r10 resume).
+// Corpus: corpus_alm_70b_stripped.txt ⊕ kowiki slice (15% by bytes).
+//
+// Compliance:
+//   R37 / AN13 / L3-PY — ZERO python3 invocations. `pkill -f` allowed as KILL.
+//
+// Scope:
+//   SCAFFOLD ONLY. live_fire() body is a placeholder that refuses until:
+//     - r10d DONE + branch-B selector fired (alm_r11_branch_select.hexa)
+//     - hexa-lang hxqwen14b FFI Day-2 entries (forward/backward/apply) —
+//       same ABI as branch A/C; 14B so no shard-aware loader needed.
+//     - Qwen2.5-14B-Instruct safetensors at r2:anima-models/base/
+//     - corpus_alm_70b_stripped.txt + kowiki slice materialised
+//     - training/corpus_mix_kowiki.hexa produces the admix file
+//       (§4 note: "kowiki admix may introduce vocab drift" — R-2)
+//
+// Plan SSOT:
+//   /Users/ghost/Dev/anima/training/alm_r11_design.md
+//   §1 (branch trigger) / §3 (gates) / §4 (params) / §5 (budget) / §7 (sentinel)
+//
+// Usage:
+//   hexa training/launch_alm_r11_b.hexa --selftest
+//   hexa training/launch_alm_r11_b.hexa --pod-id <id> --dry-run
+//   LIVE_FIRE_OK=1 hexa training/launch_alm_r11_b.hexa --pod-id <id>  # gated
+
+// ── Branch B constants (alm_r11_design.md §4) ─────────────────────────
+
+let DEFAULT_CKPT_DIR     = "/workspace/ckpt_alm_14b_r11b"
+let DEFAULT_STEPS        = 4000         // 2× r10 (§4)
+let DEFAULT_BATCH        = 8
+let DEFAULT_SEQ          = 1024
+let DEFAULT_GRAD_ACCUM   = 1            // eff batch 8
+
+// LR schedule — B uses 2e-6 constant (§4 table)
+let DEFAULT_LR_PEAK      = "2e-6"
+let DEFAULT_LR_FLOOR     = "2e-6"
+let DEFAULT_WARMUP_STEPS = 0
+let DEFAULT_LR_SCHEDULE  = "constant"
+
+// Save cadence
+let DEFAULT_SAVE_EVERY   = 2000
+let DEFAULT_EVAL_EVERY   = 200
+
+let DEFAULT_SEED         = 3407
+
+// LoRA spec — B: r=32 α=64 dropout=0.0 (§4)
+let DEFAULT_LORA_R       = 32
+let DEFAULT_LORA_ALPHA   = 64
+let DEFAULT_LORA_DROPOUT = "0.0"
+let DEFAULT_LORA_TARGETS = "q_proj,k_proj,v_proj,o_proj"
+
+// Abort triggers — B thresholds (§3)
+let FIRST_BATCH_CE_MAX   = "5.0"
+let STEP1_LOSS_MAX       = "5.0"
+let EARLY_LOSS_GATE_STEP = 500
+let ABORT_STATUS_FILE    = "/workspace/r11b_abort.status"
+
+// Corpus — B: stripped ⊕ kowiki (15% by bytes, ~6.2M tokens)
+let CORPUS_REMOTE        = "/workspace/corpus_alm_70b_stripped_kowiki15.txt"
+let DEFAULT_LOCAL_CORPUS = "/Users/ghost/Dev/anima/training/corpus_alm_70b_stripped_kowiki15.txt"
+let DEFAULT_CORPUS_R2    = "r2:anima-corpus/alm/corpus_alm_70b_stripped_kowiki15.txt"
+let STRIPPED_LOCAL       = "/Users/ghost/Dev/anima/training/corpus_alm_70b_stripped.txt"
+let KOWIKI_LOCAL         = "/Users/ghost/Dev/anima/training/corpus_kowiki_slice.txt"
+
+let BASE_MODEL_REMOTE    = "/workspace/models/Qwen2.5-14B-Instruct"
+let BASE_MODEL_R2        = "r2:anima-models/base/Qwen2.5-14B-Instruct/"
+
+// R2 ckpt egress path (branch B)
+let CKPT_R2_PATH         = "r2:anima-models/alm14b/r11_b/"
+
+// Hexa binary
+let HEXA_LINUX_BIN       = "/build/hexa_v2_linux"
+let REMOTE_HEXA_BIN      = "/opt/hexa/bin/hexa_v2"
+let REMOTE_TRAIN_DIR     = "/workspace/anima/training"
+let REMOTE_NATIVE        = "/workspace/alm_r11b_native"
+let REMOTE_LOG           = "/workspace/alm_r11b_hexa.log"
+let TMUX_SESSION         = "alm-14b-r11b"
+
+// NOTE: hxqwen14b FFI Day-2 entries still pending (shared blocker across A/B/C).
+// Branch B additional blocker: training/corpus_mix_kowiki.hexa admix producer
+// (scaffold exists per §10; not yet wired into this launcher's preflight).
+
+let LOCAL_SOURCES = [
+    "training/train_alm_lora.hexa",
+    "training/kr_gen_sentinel.hexa",
+    "training/nn_core.hexa"
+]
+
+let LOCAL_DEP_SOURCES = []
+let DEP_MODULE_NAMES  = []
+
+// ── argv parse ────────────────────────────────────────────────────────
+
+let argv = args()
+
+fn flag_value(name: string, fallback: string) -> string {
+    let n = argv.len()
+    let mut i = 0
+    while i < n {
+        if argv[i] == name && i + 1 < n {
+            return argv[i + 1]
+        }
+        i = i + 1
+    }
+    return fallback
+}
+
+fn flag_bool(name: string) -> bool {
+    let n = argv.len()
+    let mut i = 0
+    while i < n {
+        if argv[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+let POD          = flag_value("--pod", "")
+let POD_ID       = flag_value("--pod-id", "")
+let POD_IP_ARG   = flag_value("--pod-ip", "")
+let POD_PORT_S   = flag_value("--pod-port", "")
+let CKPT_DIR     = flag_value("--ckpt-dir", DEFAULT_CKPT_DIR)
+let STEPS_S      = flag_value("--steps", str(DEFAULT_STEPS))
+let SEED_S       = flag_value("--seed", str(DEFAULT_SEED))
+let LR_PEAK      = flag_value("--lr-peak", DEFAULT_LR_PEAK)
+let LR_FLOOR     = flag_value("--lr-floor", DEFAULT_LR_FLOOR)
+let WARMUP_S     = flag_value("--warmup", str(DEFAULT_WARMUP_STEPS))
+let SCHEDULE     = flag_value("--schedule", DEFAULT_LR_SCHEDULE)
+let BATCH_S      = flag_value("--batch", str(DEFAULT_BATCH))
+let SEQ_S        = flag_value("--seq", str(DEFAULT_SEQ))
+let GRAD_ACCUM_S = flag_value("--grad-accum", str(DEFAULT_GRAD_ACCUM))
+let SAVE_EVERY_S = flag_value("--save-every", str(DEFAULT_SAVE_EVERY))
+let EVAL_EVERY_S = flag_value("--eval-every", str(DEFAULT_EVAL_EVERY))
+let CORPUS_ARG   = flag_value("--corpus", CORPUS_REMOTE)
+let CORPUS_LOCAL = flag_value("--corpus-local", DEFAULT_LOCAL_CORPUS)
+let CORPUS_R2    = flag_value("--corpus-r2", DEFAULT_CORPUS_R2)
+let BASE_MODEL   = flag_value("--base-model", BASE_MODEL_REMOTE)
+let SMOKE        = flag_bool("--smoke")
+let DRY_RUN      = flag_bool("--dry-run")
+let SELFTEST     = flag_bool("--selftest")
+
+// ── Utility ───────────────────────────────────────────────────────────
+
+fn env_or(key: string, fallback: string) -> string {
+    let v = env(key)
+    if v == "" { return fallback }
+    return v
+}
+
+fn now_epoch() -> string { return exec("date +%s").trim() }
+fn now_iso() -> string { return exec("date -u +%Y%m%dT%H%M%SZ").trim() }
+
+fn stamp_step(label: string, log_path: string) {
+    let line = "[" + now_epoch() + "] " + label
+    println(line)
+    append_file(log_path, line + "\n")
+}
+
+fn abort(code: int, msg: string) {
+    println("")
+    println("FAIL: " + msg)
+    println("  exit code = " + str(code))
+    println("")
+    exit(code)
+}
+
+// ── Selftest ──────────────────────────────────────────────────────────
+
+fn selftest() -> bool {
+    println("")
+    println("=================================================================")
+    println("  ALM r11-B (14B cont.) hexa-native launcher — SELFTEST")
+    println("=================================================================")
+    println("")
+
+    let mut ok = true
+
+    println("[1/5] Environment:")
+    let hexa_lang = env("HEXA_LANG")
+    if hexa_lang == "" {
+        println("  [MISS] HEXA_LANG not set")
+        ok = false
+    } else {
+        println("  [OK]   HEXA_LANG=" + hexa_lang)
+    }
+
+    let bin_path = hexa_lang + HEXA_LINUX_BIN
+    if file_exists(bin_path) {
+        println("  [OK]   " + bin_path)
+    } else {
+        println("  [MISS] " + bin_path)
+        ok = false
+    }
+
+    println("")
+    println("[2/5] Local sources:")
+    let mut i = 0
+    while i < LOCAL_SOURCES.len() {
+        let p = LOCAL_SOURCES[i]
+        let abs_p = "/Users/ghost/Dev/anima/" + p
+        if file_exists(abs_p) {
+            println("  [OK]   " + p)
+        } else {
+            println("  [MISS] " + p)
+            ok = false
+        }
+        i = i + 1
+    }
+
+    println("")
+    println("[3/5] Corpus (stripped ⊕ kowiki 15%, ~48M tokens):")
+    if file_exists(CORPUS_LOCAL) {
+        println("  [OK]   admix: " + CORPUS_LOCAL)
+    } else {
+        println("  [PREP] admix " + CORPUS_LOCAL + " not materialised yet")
+        println("         component stripped: " + STRIPPED_LOCAL
+            + (if file_exists(STRIPPED_LOCAL) { " [present]" } else { " [MISS]" }))
+        println("         component kowiki:   " + KOWIKI_LOCAL
+            + (if file_exists(KOWIKI_LOCAL) { " [present]" } else { " [MISS]" }))
+        println("         producer: training/corpus_mix_kowiki.hexa (§10 scaffold)")
+        println("         fallback R2: " + CORPUS_R2)
+    }
+
+    println("")
+    println("[4/5] Branch B (14B cont.) parameter table (§4):")
+    println("  branch       = B (14B continued, fresh LoRA + kowiki admix 15%)")
+    println("  base model   = " + BASE_MODEL + "  (R2: " + BASE_MODEL_R2 + ")")
+    println("  ckpt-dir     = " + CKPT_DIR)
+    println("  R2 ckpt      = " + CKPT_R2_PATH)
+    println("  steps        = " + STEPS_S + (if SMOKE { "  (SMOKE override)" } else { "" }))
+    println("  seed         = " + SEED_S)
+    println("  LR           = " + LR_PEAK + " " + SCHEDULE + "  (warmup=" + WARMUP_S + ")")
+    println("  batch × seq  = " + BATCH_S + " × " + SEQ_S
+        + "  (grad_accum=" + GRAD_ACCUM_S + ")")
+    println("  save_every   = " + SAVE_EVERY_S + "  eval_every=" + EVAL_EVERY_S)
+    println("  LoRA         = r=" + str(DEFAULT_LORA_R)
+        + " α=" + str(DEFAULT_LORA_ALPHA)
+        + " dropout=" + DEFAULT_LORA_DROPOUT
+        + " targets=" + DEFAULT_LORA_TARGETS)
+    println("  corpus       = " + CORPUS_ARG + "  (stripped + kowiki 15%)")
+    println("  abort: CE>" + FIRST_BATCH_CE_MAX
+        + " | step1>" + STEP1_LOSS_MAX
+        + " | sub-1.0<step" + str(EARLY_LOSS_GATE_STEP))
+    println("  budget       = $6 target / $12 cap  (1×H100, ~1.8h wall)")
+
+    println("")
+    println("[5/5] Scaffold stage readiness:")
+    println("  [OK]   --selftest path")
+    println("  [OK]   --dry-run path")
+    println("  [PREP] live_fire() body = placeholder")
+    println("  [GATE] LIVE_FIRE_OK=1 env required")
+    println("  [BLOCK] r10d DONE + r11 branch-B selector")
+    println("  [BLOCK] hxqwen14b FFI Day-2 (forward_with_lora/backward_lora_only/apply_lora_delta)")
+    println("  [BLOCK] corpus_mix_kowiki.hexa admix run")
+
+    println("")
+    if ok {
+        println("RESULT: PASS — scaffold validated; fire gated on blockers above.")
+    } else {
+        println("RESULT: FAIL — resolve MISS items above before proceeding.")
+    }
+    println("")
+    return ok
+}
+
+// ── Plan ──────────────────────────────────────────────────────────────
+
+fn print_step(n: int, title: string, cmd: string) {
+    println("")
+    println("  Step " + str(n) + ": " + title)
+    println("    $ " + cmd)
+}
+
+fn build_plan(log_path: string) {
+    let hexa_lang = env_or("HEXA_LANG", "<HEXA_LANG>")
+    let bin_src   = hexa_lang + HEXA_LINUX_BIN
+    let pod_label = (if POD != "" { POD }
+                     else if POD_ID != "" { POD_ID }
+                     else { POD_IP_ARG + ":" + POD_PORT_S })
+
+    println("")
+    println("=================================================================")
+    println("  ALM r11-B (14B cont.) hexa-native launcher — PLAN")
+    println("=================================================================")
+    println("  branch       = B (14B continued, fresh LoRA, kowiki admix 15%)")
+    println("  pod          = " + pod_label)
+    println("  ckpt-dir     = " + CKPT_DIR)
+    println("  R2 ckpt      = " + CKPT_R2_PATH)
+    println("  steps        = " + STEPS_S + (if SMOKE { "  (SMOKE)" } else { "" }))
+    println("  seed         = " + SEED_S)
+    println("  LR           = " + LR_PEAK + " " + SCHEDULE)
+    println("  batch/seq    = " + BATCH_S + " / " + SEQ_S)
+    println("  save_every   = " + SAVE_EVERY_S)
+    println("  corpus       = " + CORPUS_ARG)
+    println("  base model   = " + BASE_MODEL)
+    println("  abort file   = " + ABORT_STATUS_FILE)
+    println("  dry-run      = "
+        + (if DRY_RUN { "YES (no remote I/O)" } else { "NO (LIVE — gated)" }))
+    println("  log          = " + log_path)
+
+    print_step(0, "MFS preflight — 20GB dd probe",
+        "ssh " + pod_label
+        + " 'dd if=/dev/zero of=/workspace/_q_test bs=1M count=20000 status=none "
+        + "&& rm /workspace/_q_test'")
+
+    print_step(1, "ckpt dir preclean",
+        "ssh " + pod_label + " 'rm -rf " + CKPT_DIR + "'")
+
+    print_step(2, "tmux kill legacy sessions",
+        "ssh " + pod_label + " 'tmux kill-session -t " + TMUX_SESSION + " 2>/dev/null || true'")
+
+    print_step(3, "Reap legacy python residual (KILL only)",
+        "ssh " + pod_label + " 'pkill -f _train_alm 2>/dev/null || true'")
+
+    print_step(4, "Deploy hexa_v2 Linux ELF",
+        "scp " + bin_src + " " + pod_label + ":" + REMOTE_HEXA_BIN
+        + " && ssh " + pod_label + " 'chmod +x " + REMOTE_HEXA_BIN + "'")
+
+    print_step(5, "Deploy runtime.c + native/*",
+        "scp $HEXA_LANG/self/runtime.c " + pod_label + ":/tmp/runtime.c"
+        + " && scp $HEXA_LANG/self/native/*.c " + pod_label + ":/tmp/native/")
+
+    print_step(6, "Deploy ALM trainer + sentinel sources",
+        "scp training/train_alm_lora.hexa training/kr_gen_sentinel.hexa "
+        + "training/nn_core.hexa " + pod_label + ":" + REMOTE_TRAIN_DIR + "/")
+
+    print_step(7, "Base model provisioning (rclone Qwen2.5-14B-Instruct, ~28GB)",
+        "ssh " + pod_label + " 'test -d " + BASE_MODEL + " || rclone copy "
+        + BASE_MODEL_R2 + " " + BASE_MODEL + " -v --s3-no-check-bucket'")
+
+    print_step(8, "Corpus admix provisioning (stripped + kowiki 15%)",
+        "scp " + CORPUS_LOCAL + " " + pod_label + ":" + CORPUS_REMOTE
+        + "  # expects prebuilt admix; else pull " + CORPUS_R2)
+
+    print_step(9, "Pre-train smoke sentinel (R-2 mitigation: vocab drift check)",
+        "ssh " + pod_label + " '" + REMOTE_HEXA_BIN + " "
+        + REMOTE_TRAIN_DIR + "/kr_gen_sentinel.hexa --pre-admix-check "
+        + "--base-model " + BASE_MODEL + "'")
+
+    print_step(10, "Cross-compile train_alm_lora.hexa -> C -> native ELF",
+        "ssh " + pod_label + " '" + REMOTE_HEXA_BIN + " "
+        + REMOTE_TRAIN_DIR + "/train_alm_lora.hexa /tmp/alm_r11b.c "
+        + "&& gcc -O2 /tmp/alm_r11b.c -o " + REMOTE_NATIVE + " -lm'")
+
+    print_step(11, "Launch hexa-native trainer (branch B) in tmux",
+        "ssh " + pod_label + " \"tmux new -d -s " + TMUX_SESSION + " '"
+        + REMOTE_NATIVE
+        + " --base-model " + BASE_MODEL
+        + " --corpus " + CORPUS_ARG
+        + " --steps " + STEPS_S
+        + " --seed " + SEED_S
+        + " --batch " + BATCH_S
+        + " --seq " + SEQ_S
+        + " --grad-accum " + GRAD_ACCUM_S
+        + " --lr-peak " + LR_PEAK
+        + " --lr-floor " + LR_FLOOR
+        + " --warmup " + WARMUP_S
+        + " --schedule " + SCHEDULE
+        + " --save-every " + SAVE_EVERY_S
+        + " --eval-every " + EVAL_EVERY_S
+        + " --lora-r " + str(DEFAULT_LORA_R)
+        + " --lora-alpha " + str(DEFAULT_LORA_ALPHA)
+        + " --lora-dropout " + DEFAULT_LORA_DROPOUT
+        + " --lora-targets " + DEFAULT_LORA_TARGETS
+        + " --abort-file " + ABORT_STATUS_FILE
+        + " --first-batch-ce-max " + FIRST_BATCH_CE_MAX
+        + " --step1-loss-max " + STEP1_LOSS_MAX
+        + " --early-loss-gate-step " + str(EARLY_LOSS_GATE_STEP)
+        + " --ckpt-dir " + CKPT_DIR
+        + " 2>&1 | tee " + REMOTE_LOG + "'\"")
+
+    print_step(12, "Verify after 120s",
+        "sleep 120 && ssh " + pod_label + " \""
+        + "nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader; "
+        + "grep -m1 'first_batch_ce=' " + REMOTE_LOG + " || echo NO_CE\"")
+
+    print_step(13, "Post-training R2 egress (ckpt -> " + CKPT_R2_PATH + ")",
+        "ssh " + pod_label + " 'rclone copy " + CKPT_DIR + " " + CKPT_R2_PATH
+        + " -v --s3-no-check-bucket'")
+
+    println("")
+    println("Abort triggers (§3 branch B):")
+    println("  - first-batch CE > " + FIRST_BATCH_CE_MAX + " -> FIRST_BATCH_CE_HIGH")
+    println("  - step 1 loss   > " + STEP1_LOSS_MAX + " -> STEP1_LOSS_HIGH")
+    println("  - sub-1.0 loss before step " + str(EARLY_LOSS_GATE_STEP) + " -> sentinel")
+    println("  - sentinel COLLAPSED (exit 2) -> MODE_COLLAPSE_STEP")
+    println("")
+    println("Acceptance gates (§3 branch B):")
+    println("  - persona Likert >= 3.0/5 (r12 gate)")
+    println("  - Phi_refl > 0.2, KoBEST avg >= 0.55")
+    println("")
+}
+
+// ── Live fire (gated — PLACEHOLDER) ────────────────────────────────────
+
+fn live_fire(log_path: string) {
+    let live_ok = env("LIVE_FIRE_OK")
+    let dry = DRY_RUN
+
+    if !dry && live_ok != "1" {
+        println("")
+        println("REFUSED: live fire requires LIVE_FIRE_OK=1 in env.")
+        println("  Branch B (14B cont.) blockers before real exec:")
+        println("    1. ALM r10d DONE + eval (soft-collapse outcome)")
+        println("    2. r11 branch-B selector fired")
+        println("    3. hxqwen14b FFI Day-2 entries available")
+        println("    4. Qwen2.5-14B-Instruct uploaded to R2")
+        println("    5. kowiki slice + admix corpus materialised")
+        println("       (via training/corpus_mix_kowiki.hexa — §10)")
+        println("    6. LIVE_FIRE_OK=1 hexa <this file> --pod-id <id>")
+        println("")
+        panic("live fire guard: LIVE_FIRE_OK != 1")
+    }
+
+    if dry {
+        stamp_step("DRY-RUN — plan-only walkthrough, no exec", log_path)
+        stamp_step("(branch B real fire body NOT YET WIRED)", log_path)
+        return
+    }
+
+    stamp_step("LIVE FIRE armed but BODY NOT WIRED — refusing", log_path)
+    println("")
+    println("SCAFFOLD STAGE: live_fire() body is intentionally a placeholder.")
+    println("")
+    abort(7, "live_fire() placeholder — r11-B scaffold stage only")
+}
+
+// ── Entry ─────────────────────────────────────────────────────────────
 
 fn main() {
-    println("[R37/AN13/L3-PY] BLOCKED: training/launch_alm_r11_b.hexa")
-    println("  Previously wrote bash runner wrapping `python3 train_alm_14b.py` (r11 branch B).")
-    println("  Escalate to user for hexa-native ALM r11-B launcher replacement.")
-    panic("R37/AN13/L3-PY: python3 invocation blocked at training/launch_alm_r11_b.hexa")
+    let ts = now_iso()
+    let log_path = "/Users/ghost/Dev/anima/training/deploy/alm_r11_b_launch_" + ts + ".log"
+
+    if SELFTEST {
+        let ok = selftest()
+        if !ok { panic("selftest FAIL") }
+        return
+    }
+
+    let have_pod = (POD != "" || POD_ID != "" || POD_IP_ARG != "")
+    if !have_pod {
+        println("")
+        println("USAGE (ALM r11-B / 14B cont. scaffold):")
+        println("  hexa <this file> --selftest")
+        println("  hexa <this file> --pod-id <id> --dry-run")
+        println("  hexa <this file> --pod-id <id> --smoke --dry-run")
+        println("  LIVE_FIRE_OK=1 hexa <this file> --pod-id <id>   # gated")
+        println("")
+        panic("need one of: --pod / --pod-id / --pod-ip (except with --selftest)")
+    }
+
+    write_file(log_path, "# ALM r11-B hexa-native launcher log " + ts + "\n")
+    let pod_label = (if POD != "" { POD }
+                     else if POD_ID != "" { POD_ID }
+                     else { POD_IP_ARG + ":" + POD_PORT_S })
+    stamp_step("launcher start — branch=B pod=" + pod_label
+        + " ckpt=" + CKPT_DIR
+        + " steps=" + STEPS_S
+        + " seed=" + SEED_S
+        + " dry=" + (if DRY_RUN { "1" } else { "0" }),
+        log_path)
+
+    build_plan(log_path)
+    live_fire(log_path)
+
+    if DRY_RUN {
+        stamp_step("DRY-RUN complete — no remote I/O performed.", log_path)
+        println("")
+        println("DRY-RUN complete. Real fire pending blocker resolution.")
+        println("Log: " + log_path)
+    }
 }
 
 main()

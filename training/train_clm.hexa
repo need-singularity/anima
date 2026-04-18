@@ -15,6 +15,10 @@ use "anima_quantum_clm"
 // rationale and wire-format docs. Flag-off import has no runtime effect
 // beyond the self-test prints at module load.
 use "phi_cache_loader"
+// H1 (2026-04-18 9th-fire): mmap-equivalent byte-window corpus loader.
+// Replaces the n_tokens=0 stub + LCG noise batch path. Exposes
+// `corpus_open`, `corpus_window`, `CorpusDesc` at module scope.
+use "clm_mmap_loader"
 
 comptime const PSI_ALPHA     = 0.014
 comptime const PSI_BALANCE   = 0.5
@@ -81,6 +85,23 @@ comptime const CLM_PHI_CACHE_COEF    = 0.01
 // no hidden side effects on the hot path when the flag is off.
 let mut G_PHI_CACHE_INIT = 0
 let mut G_PHI_CACHE      = phi_cache_new()
+
+// H1 (2026-04-18 9th-fire): module-scope corpus descriptor cache.
+// `load_corpus` stats the file via `corpus_open` (single wc -c syscall)
+// and stores the descriptor here. `_make_batch` reads byte windows at
+// random offsets without re-statting.  G_CORPUS_INIT=0 means "never
+// loaded"; guard before use so the selftest path (which never calls
+// load_corpus) does not touch disk.
+//
+// The descriptor is lazily populated by `load_corpus`. We cannot
+// construct a CorpusDesc literal here — hexa_v2 only emits constructor
+// stubs for structs declared in THIS file, so a module-scope
+// `CorpusDesc { path: "", len: 0 }` would reference an undeclared C
+// function. Instead we store path/len as scalars and rebuild the
+// CorpusDesc on each corpus_window call (O(1) struct pack, no IO).
+let mut G_CORPUS_INIT  = 0
+let mut G_CORPUS_PATH  = ""
+let mut G_CORPUS_LEN   = 0
 
 // ─── Scale config (one struct per scale; Hexa has no dict literal yet) ───
 struct ScaleConfig {
@@ -240,22 +261,25 @@ struct TokenDataset {
 comptime const CHUNK_CHARS = 10_000_000  // ~10MB per chunk
 
 fn load_corpus(path: string, block_size: int) -> TokenDataset {
-    // TODO[pytorch]:
-    //   all_tokens = []
-    //   file_size = os.path.getsize(path)
-    //   total_chars = 0
-    //   with open(path) as f:
-    //       while True:
-    //           chunk = f.read(CHUNK_CHARS)
-    //           if not chunk: break
-    //           total_chars += len(chunk)
-    //           ids = tokenizer(chunk, return_tensors="pt", truncation=False).input_ids[0]
-    //           all_tokens.append(ids)
-    //           if len(all_tokens) % 10 == 0:
-    //               pct = total_chars * 100 // file_size
-    //               print(f"    Chunk {len(all_tokens)}: {sum(len(t) for t in all_tokens):,} tok ({pct}%)")
-    //   tokens = torch.cat(all_tokens)
-    TokenDataset { path: path, block_size: block_size, n_tokens: 0 }
+    // H1 (2026-04-18 9th-fire): wire the mmap-equivalent loader.
+    // corpus_open performs a single `wc -c` and returns the descriptor
+    // without reading any bytes (O(1) syscall). n_tokens for byte-level
+    // training == n_bytes, since vocab=256 byte tokens are 1:1 with
+    // input bytes.
+    let desc = corpus_open(path)
+    G_CORPUS_PATH = desc.path
+    G_CORPUS_LEN  = desc.len
+    G_CORPUS_INIT = 1
+    println("[load_corpus] path=" + path + " n_tokens=" + str(desc.len) + " block_size=" + str(block_size))
+    TokenDataset { path: path, block_size: block_size, n_tokens: desc.len }
+}
+
+// Helper: rebuild a CorpusDesc from the module-scope scalar cache.
+// Used by _make_batch and train_step's H1 inline window reader to
+// avoid storing a CorpusDesc at module scope (transpiler limitation).
+fn _current_corpus_desc() -> CorpusDesc {
+    let d = corpus_open(G_CORPUS_PATH)
+    return d
 }
 
 fn get_batch(ds: TokenDataset, batch_size: int) -> string {
@@ -1641,8 +1665,24 @@ struct TrainStepResult {
     l_gwt:    float      // auxiliary GWT-drift loss
 }
 
-// Generate a pseudo-random batch of tokens for training
+// Generate a batch of tokens for training.
+// H1 (2026-04-18 9th-fire): when G_CORPUS_INIT != 0, read a real byte
+// window from the mmap-equivalent loader at a deterministic pseudo-
+// random offset derived from `seed`. Falls back to the legacy LCG path
+// for the selftest block (which never calls load_corpus and uses
+// batch_size=1 tiny configs).
 fn _make_batch(seq: int, vocab: int, seed: int) -> [int] {
+    if G_CORPUS_INIT != 0 && G_CORPUS_LEN > seq + 1 {
+        // Deterministic per-step offset, clamped to a safe range.
+        let mut s = seed
+        s = (s * 1103515245 + 12345) % 2147483648
+        if s < 0 { s = 0 - s }
+        let max_off = G_CORPUS_LEN - seq - 1
+        let off = s % max_off
+        let desc = _current_corpus_desc()
+        return corpus_window(desc, off, seq)
+    }
+    // Legacy LCG fallback — selftest path only.
     let mut tokens = []
     let mut s = seed
     let mut i = 0
@@ -1659,10 +1699,27 @@ fn train_step(state: TrainState, model: DecoderModel, ds: TokenDataset) -> Train
     let vocab = model.vocab
     let d_model = model.d
 
-    // 1. Make batch: input tokens and targets (shifted by 1 for causal LM)
+    // 1. Make batch: input tokens and targets (shifted by 1 for causal LM).
+    //    H1 (2026-04-18 9th-fire): when a corpus is loaded, read ONE
+    //    real byte window and derive targets as the +1 shift. Prior code
+    //    called _make_batch twice with seeds `s` and `s+1` which yielded
+    //    two uncorrelated LCG sequences — meaningless for CE loss.
     let batch_seed = state.step * 7919 + 42
-    let input_tokens = _make_batch(seq, vocab, batch_seed)
-    let target_tokens = _make_batch(seq, vocab, batch_seed + 1)
+    let mut input_tokens = []
+    let mut target_tokens = []
+    if G_CORPUS_INIT != 0 && G_CORPUS_LEN > seq + 2 {
+        let mut s = batch_seed
+        s = (s * 1103515245 + 12345) % 2147483648
+        if s < 0 { s = 0 - s }
+        let max_off = G_CORPUS_LEN - seq - 2
+        let off = s % max_off
+        let desc = _current_corpus_desc()
+        input_tokens  = corpus_window(desc, off,     seq)
+        target_tokens = corpus_window(desc, off + 1, seq)
+    } else {
+        input_tokens  = _make_batch(seq, vocab, batch_seed)
+        target_tokens = _make_batch(seq, vocab, batch_seed + 1)
+    }
 
     // 2. Forward pass
     let fwd = decoder_forward(model, input_tokens, seq)
@@ -2459,9 +2516,59 @@ fn smoke_train_step() -> float {
 }
 
 fn train_scale(cfg: ScaleConfig, corpus_path: string, total_steps: int) -> TrainState {
+    // Back-compat entry — keeps the legacy 3-arg signature so selftest /
+    // run_pipeline callers don't break. Forwards to the full-arg form
+    // with the hardcoded defaults restored (r4 production path calls
+    // train_scale_full directly via the CLI dispatch block below).
+    return train_scale_full(cfg, corpus_path, total_steps,
+                            corpus_path + ".ckpt", DEFAULT_CKPT_EVERY,
+                            cfg.batch_size, cfg.lr)
+}
+
+// H2/H3 (2026-04-18 9th-fire): full trainer entry with CLI-plumbed
+// checkpoint dir / save cadence / batch / lr. `ckpt_dir` is the
+// PARENT directory; per-step checkpoints land at `<ckpt_dir>/step_<N>`
+// so save_checkpoint's `find step_*` rotation matches. The prior
+// layout (`/workspace/corpus_clm_r4.txt.ckpt.step_<N>`) used the
+// corpus filename as the parent, which meant the rotation `find`
+// never matched and MFS quota blew up by step ~2000.
+fn train_scale_full(cfg: ScaleConfig, corpus_path: string,
+                    total_steps: int, ckpt_dir: string,
+                    save_every: int, batch_override: int,
+                    lr_override: float) -> TrainState {
+    println("[train_scale] init begin scale=" + cfg.name
+            + " d_model=" + str(cfg.d_model)
+            + " n_layer=" + str(cfg.n_layer)
+            + " block_size=" + str(cfg.block_size))
     let ds = load_corpus(corpus_path, cfg.block_size)
-    let mut state = train_init(cfg, total_steps)
-    let mut model = decoder_model_new(cfg)
+    // Ensure ckpt_dir exists before first save — save_checkpoint
+    // mkdir -p's the per-step dir but we also want the parent.
+    let _mk0 = exec("mkdir -p '" + ckpt_dir + "' 2>/dev/null")
+
+    // H2: apply CLI-sourced batch / lr overrides. We can't mutate
+    // cfg fields directly (struct pass-by-value), so we build a
+    // patched cfg before model construction.
+    let effective_batch = if batch_override > 0 { batch_override } else { cfg.batch_size }
+    let effective_lr = if lr_override > 0.0 { lr_override } else { cfg.lr }
+    let cfg_patched = ScaleConfig {
+        name: cfg.name, d_model: cfg.d_model, n_layer: cfg.n_layer,
+        n_head: cfg.n_head, n_kv_head: cfg.n_kv_head,
+        block_size: cfg.block_size,
+        consciousness_dim: cfg.consciousness_dim,
+        atoms: cfg.atoms, cells_per_atom: cfg.cells_per_atom,
+        batch_size: effective_batch, lr: effective_lr,
+        label: cfg.label
+    }
+    println("[train_scale] cfg effective batch=" + str(effective_batch)
+            + " lr=" + str(effective_lr)
+            + " total_steps=" + str(total_steps)
+            + " save_every=" + str(save_every)
+            + " ckpt_dir=" + ckpt_dir)
+
+    println("[train_scale] init begin decoder_model_new size=" + str(cfg_patched.d_model) + "x" + str(cfg_patched.n_layer))
+    let mut state = train_init(cfg_patched, total_steps)
+    let mut model = decoder_model_new(cfg_patched)
+    println("[train_scale] init done — entering training loop")
     let mut step = 0
     while step < total_steps {
         let result = train_step(state, model, ds)
@@ -2478,11 +2585,10 @@ fn train_scale(cfg: ScaleConfig, corpus_path: string, total_steps: int) -> Train
                     " l_holo=", result.l_holo,
                     " l_gwt=", result.l_gwt)
         }
-        if step % DEFAULT_CKPT_EVERY == 0 {
-            // Per-step dir so MFS-quota rotation (_rot in save_checkpoint)
-            // finds sibling step_* directories. Caller's parent dir is
-            // dirname(corpus_path), scheme: <parent>/step_<N>/ckpt
-            let ckpt_path = corpus_path + ".ckpt.step_" + str(step)
+        if save_every > 0 && step % save_every == 0 {
+            // H3: <ckpt_dir>/step_<N> — save_checkpoint's rotation
+            // pattern `step_*` now matches sibling dirs correctly.
+            let ckpt_path = ckpt_dir + "/step_" + str(step)
             let ckpt = save_checkpoint(
                 ckpt_path, step, model,
                 result.loss, 0.0, state.pm.phase
@@ -2507,7 +2613,79 @@ fn run_pipeline(corpus: string) -> int {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// VERIFICATION — Self-tests for full decoder pipeline
+// ENTRY DISPATCH — CLI args decide training vs. selftest
+// ═══════════════════════════════════════════════════════════════════════
+//
+// 2026-04-18 (7th-fire fix): binary previously ran only the self-test block
+// below and exited ~36 log lines in. The pod2 relaunch scaffold invokes the
+// native binary with `--corpus … --steps 750000 --batch 8 --seq 512 --lr 3e-4
+// --warmup 5000 --save-every 5000 --ckpt-dir /workspace/ckpt_clm1b_r4`.
+// When any of those training flags are present we run train_scale() on the
+// 1B config and exit(0) before the verification block ever runs. Selftest is
+// preserved for `--selftest` or a no-arg invocation (default when unsure).
+
+let _cli_argv = args()
+
+fn _cli_flag_value(argv, flag: string, default_v: string) -> string {
+    let n = len(argv)
+    let mut i = 0
+    while i < n - 1 {
+        if argv[i] == flag { return argv[i + 1] }
+        i = i + 1
+    }
+    return default_v
+}
+
+fn _cli_has_flag(argv, flag: string) -> bool {
+    let n = len(argv)
+    let mut i = 0
+    while i < n {
+        if argv[i] == flag { return true }
+        i = i + 1
+    }
+    return false
+}
+
+let _train_mode = _cli_has_flag(_cli_argv, "--corpus")
+                  || _cli_has_flag(_cli_argv, "--steps")
+                  || _cli_has_flag(_cli_argv, "--ckpt-dir")
+
+if _train_mode {
+    let _corpus   = _cli_flag_value(_cli_argv, "--corpus",   "/workspace/corpus_clm_r4.txt")
+    let _steps_s  = _cli_flag_value(_cli_argv, "--steps",    "750000")
+    let _ckpt_dir = _cli_flag_value(_cli_argv, "--ckpt-dir", "/workspace/ckpt_clm1b_r4")
+    let _batch_s  = _cli_flag_value(_cli_argv, "--batch",    "8")
+    let _seq_s    = _cli_flag_value(_cli_argv, "--seq",      "512")
+    let _lr_s     = _cli_flag_value(_cli_argv, "--lr",       "3e-4")
+    let _warmup_s = _cli_flag_value(_cli_argv, "--warmup",   "5000")
+    let _save_s   = _cli_flag_value(_cli_argv, "--save-every", "5000")
+
+    println("=== train_clm.hexa — TRAIN MODE ===")
+    println("  corpus     = " + _corpus)
+    println("  steps      = " + _steps_s)
+    println("  batch/seq  = " + _batch_s + " / " + _seq_s)
+    println("  lr/warmup  = " + _lr_s + " / " + _warmup_s)
+    println("  save-every = " + _save_s)
+    println("  ckpt-dir   = " + _ckpt_dir)
+    println("  scale      = 1b (train_scale + scale_1b())")
+
+    let _total_steps = to_int(_steps_s)
+    let _save_every  = to_int(_save_s)
+    let _batch_n     = to_int(_batch_s)
+    let _lr_f        = to_float(_lr_s)
+    let _cfg_train   = scale_1b()
+    // H2 (2026-04-18 9th-fire): plumb CLI flags through to train_scale_full.
+    // H3 (2026-04-18 9th-fire): ckpt_dir passed as PARENT; per-step dirs
+    // land at <ckpt_dir>/step_<N> so MFS rotation (`find step_*`) matches.
+    let _final = train_scale_full(_cfg_train, _corpus, _total_steps,
+                                  _ckpt_dir, _save_every,
+                                  _batch_n, _lr_f)
+    println("[train_clm] training finished step=", _final.step)
+    exit(0)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// VERIFICATION — Self-tests for full decoder pipeline (default / --selftest)
 // ═══════════════════════════════════════════════════════════════════════
 //
 // DD175 acceleration techniques manifest is in training/dd175_techniques.hexa.
