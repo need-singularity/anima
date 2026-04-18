@@ -1,0 +1,1030 @@
+// training/alm_val.hexa — ALM integrated validator (4-axis)
+// ============================================================================
+//
+// PURPOSE
+//   Unified quantitative validator for ALM LoRA adapters (r9 and prior rounds).
+//   Consolidates the 4 currently-fragmented hexa validators into a single
+//   launch: run it against /generate and you get one JSON with all 4 axis
+//   scores and a r9 vs r4 delta table (when a prior alm_val JSON exists).
+//
+//   AXIS                  BACKING VALIDATOR              MEASURES
+//   ─────────────────     ───────────────────────────    ──────────────────
+//   1. kobest_acc         serving/eval_harness.hexa      Korean reasoning
+//                         (inline 20q subset)            (BoolQ/COPA/SentiNeg/WiC)
+//   2. kr_gen_sentinel    training/kr_gen_sentinel.hexa  mode-collapse signatures
+//                         (inline 5 probes)              (bracket/charloop/spaceloop
+//                                                         /rolebleed/qmark)
+//   3. persona_likert     serving/likert_eval.hexa       short-response health
+//                         (10 persona-style prompts)     (ok_rate + avg phi_holo)
+//   4. tool_call_lenient  serving/hire_sim_judge_lenient 5 tool-call / role prompts
+//                         (inline 5 gold-keyword tasks)  graded with lenient judge
+//
+//   Output: training/results/alm_val_<ts>.json + alm_val_<ts>.md summary
+//   Exit codes:
+//     0 = normal completion (results written, may still show regression)
+//     2 = DEFERRED (endpoint unreachable — per feedback_closed_loop_verify;
+//         result JSON still written with deferred=true)
+//     1 = selftest failure or unreadable input
+//
+// CLI
+//   hexa run training/alm_val.hexa [flags]
+//     --endpoint <url>   default env ALM_VAL_ENDPOINT or itfl66q4z768kh-8090
+//     --tag     <str>    default "r9" — stored in JSON/title
+//     --compare <json>   prior alm_val JSON for delta table (e.g. r4 baseline)
+//     --out-dir <path>   default training/results
+//     --quick            reduce N per axis for smoke tests
+//     --selftest         grading/sentinel self-checks only, no network
+//
+// SELFTEST
+//   Exercises: kobest lowercase grading, sentinel signature detection on
+//   known-collapsed r9 samples (must flag >=3/5), lenient judge on 2 known
+//   English + 1 Korean pair, korean_ratio on mixed-language sample.
+//
+// HEXA QUIRK NOTES
+//   - feedback_hexa_silent_exit_5_imports: NO `use` — everything inlined.
+//   - feedback_hexa_lists_pbv: helpers always return modified lists.
+//   - feedback_hexa_struct_list_alias: per-sample JSON streamed as string
+//     rather than accumulated in struct-array; Reply struct has 1 float.
+//   - feedback_hexa_string_api: substring/index_of strictly byte-indexed.
+//     Grading uses contains() which is byte-safe. Korean needles are
+//     byte-safe because UTF-8 continuation bytes (0x80-0xBF) never alias
+//     `\`, `"`, ASCII letters, or digits.
+//   - feedback_hexa_struct_return_bug: Reply struct has exactly 1 float;
+//     every multi-line return collapsed to single expression.
+
+let HARNESS_VERSION = "alm_val-1.0.0"
+let DEFAULT_ENDPOINT = "https://itfl66q4z768kh-8090.proxy.runpod.net"
+let DEFAULT_OUT_DIR = "training/results"
+let DEFAULT_TAG = "r9"
+let DEFAULT_MAX_TOKENS = 64
+let DEFAULT_TEMPERATURE = 0.0
+let DEFAULT_LIKERT_TOKENS = 96
+let DEFAULT_LIKERT_TEMP = 0.7
+let KR_GEN_THRESHOLD = 3  // flagged count >= 3 out of 5 = COLLAPSED
+
+// ════════════════════════════════════════════════════════════════════════
+// Section 0. Shell + JSON helpers
+// ════════════════════════════════════════════════════════════════════════
+
+fn json_escape(s: string) -> string {
+    let n = len(s)
+    let mut parts = []
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "\\" { parts = parts.push("\\\\") }
+        else if c == "\"" { parts = parts.push("\\\"") }
+        else if c == "\n" { parts = parts.push("\\n") }
+        else if c == "\t" { parts = parts.push("\\t") }
+        else if c == "\r" { parts = parts.push("\\r") }
+        else { parts = parts.push(c) }
+        i = i + 1
+    }
+    return parts.join("")
+}
+
+fn shell_escape_sq(s: string) -> string {
+    let n = len(s)
+    let mut parts = []
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "'" { parts = parts.push("'\\''") }
+        else { parts = parts.push(c) }
+        i = i + 1
+    }
+    return parts.join("")
+}
+
+fn extract_json_string(raw: string, marker: string) -> string {
+    let pos = raw.index_of(marker)
+    if pos < 0 { return "" }
+    let after = raw.substring(pos + len(marker), len(raw))
+    let alen = len(after)
+    let mut s = 0
+    while s < alen {
+        let c = after.substring(s, s + 1)
+        if c == "\"" { s = s + 1; break }
+        s = s + 1
+    }
+    let mut e = s
+    while e < alen {
+        let c = after.substring(e, e + 1)
+        if c == "\"" { break }
+        if c == "\\" { e = e + 2 } else { e = e + 1 }
+    }
+    return after.substring(s, e)
+}
+
+fn extract_json_number(raw: string, marker: string) -> float {
+    let pos = raw.index_of(marker)
+    if pos < 0 { return 0.0 }
+    let after = raw.substring(pos + len(marker), len(raw))
+    let alen = len(after)
+    let mut i = 0
+    while i < alen {
+        let c = after.substring(i, i + 1)
+        if c != " " && c != "\t" && c != "\n" { break }
+        i = i + 1
+    }
+    let mut buf = ""
+    while i < alen {
+        let c = after.substring(i, i + 1)
+        if c == "," || c == "}" || c == " " || c == "\n" { break }
+        buf = buf + c
+        i = i + 1
+    }
+    if len(buf) == 0 { return 0.0 }
+    return parse_float(buf)
+}
+
+// Lowercase ASCII letters only (Korean bytes above 0x7F pass through unchanged).
+fn lower_ascii(s: string) -> string {
+    let n = len(s)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "A" { out = out.push("a") }
+        else if c == "B" { out = out.push("b") }
+        else if c == "C" { out = out.push("c") }
+        else if c == "D" { out = out.push("d") }
+        else if c == "E" { out = out.push("e") }
+        else if c == "F" { out = out.push("f") }
+        else if c == "G" { out = out.push("g") }
+        else if c == "H" { out = out.push("h") }
+        else if c == "I" { out = out.push("i") }
+        else if c == "J" { out = out.push("j") }
+        else if c == "K" { out = out.push("k") }
+        else if c == "L" { out = out.push("l") }
+        else if c == "M" { out = out.push("m") }
+        else if c == "N" { out = out.push("n") }
+        else if c == "O" { out = out.push("o") }
+        else if c == "P" { out = out.push("p") }
+        else if c == "Q" { out = out.push("q") }
+        else if c == "R" { out = out.push("r") }
+        else if c == "S" { out = out.push("s") }
+        else if c == "T" { out = out.push("t") }
+        else if c == "U" { out = out.push("u") }
+        else if c == "V" { out = out.push("v") }
+        else if c == "W" { out = out.push("w") }
+        else if c == "X" { out = out.push("x") }
+        else if c == "Y" { out = out.push("y") }
+        else if c == "Z" { out = out.push("z") }
+        else { out = out.push(c) }
+        i = i + 1
+    }
+    return out.join("")
+}
+
+fn byte_at(s: string, i: int) -> int {
+    let sub = s.substring(i, i + 1)
+    return char_code(sub, 0)
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Section 1. Endpoint probe + /generate wrapper
+// ════════════════════════════════════════════════════════════════════════
+
+fn probe_endpoint(endpoint: string) -> string {
+    // Send a HEAD-ish POST. Must see a `text` field in reply or fail.
+    let body = "{\"prompt\":\"ping\",\"max_tokens\":4,\"temperature\":0}"
+    let body_sh = shell_escape_sq(body)
+    let cmd = "curl -sX POST " + endpoint + "/generate"
+            + " -H 'Content-Type: application/json'"
+            + " -d '" + body_sh + "'"
+            + " -o /dev/null -w '%{http_code}'"
+            + " --connect-timeout 5 --max-time 20 2>/dev/null"
+    let code = exec(cmd)
+    if code == "" { return "no_http_response" }
+    // 200 OK: run a follow-up POST to verify `text` field present.
+    if code != "200" { return "http_" + code }
+    let cmd2 = "curl -sX POST " + endpoint + "/generate"
+             + " -H 'Content-Type: application/json'"
+             + " -d '" + body_sh + "'"
+             + " --connect-timeout 5 --max-time 20 2>/dev/null"
+    let raw = exec(cmd2)
+    if raw.index_of("\"text\"") < 0 { return "no_text_field" }
+    return ""
+}
+
+struct Reply {
+    text: string,
+    phi_holo: float,
+    lat_ms: int,
+    ok: bool,
+    error: string
+}
+
+fn call_alm(endpoint: string, prompt: string, max_tokens: int, temperature: float) -> Reply {
+    let body = "{\"prompt\":\"" + json_escape(prompt)
+             + "\",\"max_tokens\":" + to_string(max_tokens)
+             + ",\"temperature\":" + to_string(temperature) + "}"
+    let body_sh = shell_escape_sq(body)
+    let cmd = "curl -sX POST " + endpoint + "/generate"
+            + " -H 'Content-Type: application/json'"
+            + " -d '" + body_sh + "'"
+            + " -w '\\n__LATENCY__%{time_total}\\n'"
+            + " --connect-timeout 10 --max-time 90 2>/dev/null"
+    let raw = exec(cmd)
+    if len(raw) == 0 {
+        return Reply { text: "", phi_holo: 0.0, lat_ms: 0, ok: false, error: "empty_response" }
+    }
+    let text = extract_json_string(raw, "\"text\":")
+    if len(text) == 0 {
+        return Reply { text: "", phi_holo: 0.0, lat_ms: 0, ok: false, error: "no_text_field" }
+    }
+    let phi = extract_json_number(raw, "\"phi_holo\":")
+    let secs = extract_json_number(raw, "__LATENCY__")
+    let lat = to_int(secs * 1000.0)
+    return Reply { text: text, phi_holo: phi, lat_ms: lat, ok: true, error: "" }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Section 2. AXIS 1 — KoBEST-style quick (inline n=10)
+// ════════════════════════════════════════════════════════════════════════
+// 10 items across 4 subtasks; keeps runtime bounded (~60s) vs full 20.
+
+fn kq(qid: string, sub: string, prompt: string, expected: string) -> [string] {
+    let mut r = []
+    r = r.push(qid); r = r.push(sub); r = r.push(prompt); r = r.push(expected)
+    return r
+}
+
+fn build_kobest_quick() -> [[string]] {
+    let mut qs = []
+    qs = qs.push(kq("bq01", "BoolQ", "다음 질문에 '예' 또는 '아니오'로만 답하세요. 지구는 태양보다 큰가요?", "아니오"))
+    qs = qs.push(kq("bq02", "BoolQ", "다음 질문에 '예' 또는 '아니오'로만 답하세요. 서울은 한국의 수도인가요?", "예"))
+    qs = qs.push(kq("bq03", "BoolQ", "다음 질문에 '예' 또는 '아니오'로만 답하세요. 고래는 어류인가요?", "아니오"))
+    qs = qs.push(kq("cp01", "COPA", "상황: 그는 우산을 썼다. 원인으로 적절한 것은? A) 비가 왔다. B) 해가 떴다. 'A' 또는 'B'로만 답하세요.", "A"))
+    qs = qs.push(kq("cp02", "COPA", "상황: 그녀는 물을 마셨다. 원인으로 적절한 것은? A) 배가 불렀다. B) 목이 말랐다. 'A' 또는 'B'로만 답하세요.", "B"))
+    qs = qs.push(kq("sn01", "SentiNeg", "다음 문장의 감정은 '긍정' 또는 '부정' 중 무엇인가요? '오늘 정말 행복한 하루였어요.'", "긍정"))
+    qs = qs.push(kq("sn02", "SentiNeg", "다음 문장의 감정은 '긍정' 또는 '부정' 중 무엇인가요? '이 영화는 최악이었다.'", "부정"))
+    qs = qs.push(kq("wc01", "WiC", "두 문장의 '배'는 같은 의미인가요? '배가 고프다.' / '배가 아프다.' '같음' 또는 '다름'으로만 답하세요.", "같음"))
+    qs = qs.push(kq("wc02", "WiC", "두 문장의 '배'는 같은 의미인가요? '사과 한 개와 배 한 개를 샀다.' / '배를 타고 섬에 갔다.' '같음' 또는 '다름'으로만 답하세요.", "다름"))
+    qs = qs.push(kq("bq04", "BoolQ", "다음 질문에 '예' 또는 '아니오'로만 답하세요. 1킬로미터는 1000미터인가요?", "예"))
+    return qs
+}
+
+fn grade_kobest(expected: string, reply: string) -> bool {
+    let r = lower_ascii(reply)
+    let e = lower_ascii(expected)
+    return r.index_of(e) >= 0
+}
+
+struct AxisKobest {
+    n: int,
+    n_correct: int,
+    acc: float
+}
+
+fn axis_kobest(endpoint: string, items: [[string]]) -> AxisKobest {
+    let total = len(items)
+    let mut n_correct = 0
+    let mut i = 0
+    while i < total {
+        let q = items[i]
+        let r = call_alm(endpoint, q[2], 32, 0.0)
+        let correct = r.ok && grade_kobest(q[3], r.text)
+        if correct { n_correct = n_correct + 1 }
+        let mark = if correct { "OK" } else { "NO" }
+        let preview_len = if len(r.text) < 32 { len(r.text) } else { 32 }
+        let preview = if r.ok { r.text.substring(0, preview_len) } else { r.error }
+        println("  [kobest " + to_string(i + 1) + "/" + to_string(total) + "] " + q[0] + " " + mark
+              + " expected=" + q[3] + " got=" + preview)
+        i = i + 1
+    }
+    let acc = if total > 0 { to_float(n_correct) / to_float(total) } else { 0.0 }
+    return AxisKobest { n: total, n_correct: n_correct, acc: acc }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Section 3. AXIS 2 — kr_gen sentinel (inline 5 prompts, live output)
+// ════════════════════════════════════════════════════════════════════════
+// Mirrors training/kr_gen_sentinel.hexa signatures but runs ONLINE: we
+// generate with the endpoint and grade the output directly.
+
+fn count_occurrences(hay: string, needle: string) -> int {
+    let nlen = len(needle)
+    if nlen == 0 { return 0 }
+    let mut count = 0
+    let mut pos = 0
+    let hlen = len(hay)
+    while pos < hlen {
+        let slice = hay.substring(pos, hlen)
+        let at = slice.index_of(needle)
+        if at < 0 { return count }
+        count = count + 1
+        pos = pos + at + nlen
+    }
+    return count
+}
+
+fn max_byte_run(s: string, target_byte: int) -> int {
+    let n = len(s)
+    let mut best = 0
+    let mut cur = 0
+    let mut i = 0
+    while i < n {
+        let b = byte_at(s, i)
+        if b == target_byte { cur = cur + 1; if cur > best { best = cur } }
+        else { cur = 0 }
+        i = i + 1
+    }
+    return best
+}
+
+fn max_any_byte_run(s: string) -> int {
+    let n = len(s)
+    if n == 0 { return 0 }
+    let mut best = 1
+    let mut cur = 1
+    let mut prev = byte_at(s, 0)
+    let mut i = 1
+    while i < n {
+        let b = byte_at(s, i)
+        if b == prev { cur = cur + 1; if cur > best { best = cur } }
+        else { cur = 1; prev = b }
+        i = i + 1
+    }
+    return best
+}
+
+fn detect_signatures(gen: string) -> [int] {
+    let mut hits = [0, 0, 0, 0, 0]
+    let bracket_count = count_occurrences(gen, "{\"\":\"\"}")
+    if bracket_count >= 3 { hits = [1, hits[1], hits[2], hits[3], hits[4]] }
+    let runmax = max_any_byte_run(gen)
+    if runmax >= 10 { hits = [hits[0], 1, hits[2], hits[3], hits[4]] }
+    let spaceloop_count = count_occurrences(gen, "' '")
+    if spaceloop_count >= 5 { hits = [hits[0], hits[1], 1, hits[3], hits[4]] }
+    let role_hit = gen.index_of("roleassistant")
+    let nl_hit = gen.index_of("\\\\n")
+    let jf_hit = gen.index_of("\"},{\":\"")
+    if role_hit >= 0 || nl_hit >= 0 || jf_hit >= 0 {
+        hits = [hits[0], hits[1], hits[2], 1, hits[4]]
+    }
+    let qmark_run = max_byte_run(gen, 63)
+    if qmark_run >= 5 { hits = [hits[0], hits[1], hits[2], hits[3], 1] }
+    return hits
+}
+
+fn build_kr_gen_prompts() -> [string] {
+    let mut p = []
+    p = p.push("안녕하세요")
+    p = p.push("오늘 날씨")
+    p = p.push("한국어 모델")
+    p = p.push("딥러닝이란")
+    p = p.push("안녕")
+    return p
+}
+
+struct AxisSentinel {
+    n: int,
+    flagged: int,
+    verdict: string,
+    h_bracket: int,
+    h_charloop: int,
+    h_spaceloop: int,
+    h_rolebleed: int,
+    h_qmark: int
+}
+
+fn axis_sentinel(endpoint: string, prompts: [string]) -> AxisSentinel {
+    let total = len(prompts)
+    let mut flagged = 0
+    let mut hb = 0
+    let mut hc = 0
+    let mut hs = 0
+    let mut hr = 0
+    let mut hq = 0
+    let mut i = 0
+    while i < total {
+        let p = prompts[i]
+        let r = call_alm(endpoint, p, 128, 0.7)
+        let gen = if r.ok { r.text } else { "" }
+        let sigs = detect_signatures(gen)
+        hb = hb + sigs[0]
+        hc = hc + sigs[1]
+        hs = hs + sigs[2]
+        hr = hr + sigs[3]
+        hq = hq + sigs[4]
+        let fired = (sigs[0] + sigs[1] + sigs[2] + sigs[3] + sigs[4]) >= 1
+        if fired { flagged = flagged + 1 }
+        let preview_len = if len(gen) < 60 { len(gen) } else { 60 }
+        let preview = gen.substring(0, preview_len)
+        let mark = if fired { "FLAG" } else { "clean" }
+        println("  [sentinel " + to_string(i + 1) + "/" + to_string(total) + "] " + mark
+              + " sig=[" + to_string(sigs[0]) + to_string(sigs[1]) + to_string(sigs[2])
+              + to_string(sigs[3]) + to_string(sigs[4]) + "] gen=" + preview)
+        i = i + 1
+    }
+    let verdict = if flagged >= KR_GEN_THRESHOLD { "COLLAPSED" } else { "CLEAN" }
+    return AxisSentinel { n: total, flagged: flagged, verdict: verdict,
+        h_bracket: hb, h_charloop: hc, h_spaceloop: hs,
+        h_rolebleed: hr, h_qmark: hq }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Section 4. AXIS 3 — Persona Likert quick (10 prompts, phi+latency+OK rate)
+// ════════════════════════════════════════════════════════════════════════
+
+fn build_likert_quick() -> [string] {
+    let mut p = []
+    p = p.push("오늘 너무 힘들었어")
+    p = p.push("친구랑 싸웠는데 어떻게 화해해?")
+    p = p.push("주말에 뭐 하면 재밌을까?")
+    p = p.push("이직을 고민 중인데 조언 좀 해줘")
+    p = p.push("심심한데 뭐 얘기해줘")
+    p = p.push("진짜 행복이란 뭐라고 생각해?")
+    p = p.push("불안해서 잠이 안 와")
+    p = p.push("오늘 뭐했어?")
+    p = p.push("새로운 취미 추천해줘")
+    p = p.push("사랑이 뭐라고 생각해")
+    return p
+}
+
+fn is_hangul_codepoint(cp: int) -> bool {
+    if cp >= 0xAC00 && cp <= 0xD7A3 { return true }
+    if cp >= 0x3131 && cp <= 0x318E { return true }
+    return false
+}
+
+fn korean_ratio(text: string) -> float {
+    let n = len(text)
+    if n == 0 { return 0.0 }
+    let mut hangul_chars = 0
+    let mut total_chars = 0
+    let mut i = 0
+    while i < n {
+        let b0 = byte_at(text, i)
+        let mut cp = 0
+        let mut step = 1
+        if b0 < 0x80 { cp = b0; step = 1 }
+        else if b0 < 0xC0 { i = i + 1; continue }
+        else if b0 < 0xE0 {
+            if i + 1 >= n { break }
+            let b1 = byte_at(text, i + 1)
+            cp = ((b0 - 0xC0) * 64) + (b1 - 0x80)
+            step = 2
+        } else if b0 < 0xF0 {
+            if i + 2 >= n { break }
+            let b1 = byte_at(text, i + 1)
+            let b2 = byte_at(text, i + 2)
+            cp = ((b0 - 0xE0) * 4096) + ((b1 - 0x80) * 64) + (b2 - 0x80)
+            step = 3
+        } else {
+            if i + 3 >= n { break }
+            let b1 = byte_at(text, i + 1)
+            let b2 = byte_at(text, i + 2)
+            let b3 = byte_at(text, i + 3)
+            cp = ((b0 - 0xF0) * 262144) + ((b1 - 0x80) * 4096) + ((b2 - 0x80) * 64) + (b3 - 0x80)
+            step = 4
+        }
+        total_chars = total_chars + 1
+        if is_hangul_codepoint(cp) { hangul_chars = hangul_chars + 1 }
+        i = i + step
+    }
+    if total_chars == 0 { return 0.0 }
+    return to_float(hangul_chars) / to_float(total_chars)
+}
+
+struct AxisLikert {
+    n: int,
+    ok: int,
+    ok_rate: float,
+    avg_phi: float,
+    avg_kr: float,
+    avg_lat_ms: int
+}
+
+fn axis_likert(endpoint: string, prompts: [string]) -> AxisLikert {
+    let total = len(prompts)
+    let mut ok = 0
+    let mut sum_phi = 0.0
+    let mut sum_kr = 0.0
+    let mut sum_lat = 0
+    let mut i = 0
+    while i < total {
+        let p = prompts[i]
+        let r = call_alm(endpoint, p, DEFAULT_LIKERT_TOKENS, DEFAULT_LIKERT_TEMP)
+        if r.ok {
+            ok = ok + 1
+            sum_phi = sum_phi + r.phi_holo
+            sum_kr = sum_kr + korean_ratio(r.text)
+            sum_lat = sum_lat + r.lat_ms
+        }
+        let preview_len = if len(r.text) < 50 { len(r.text) } else { 50 }
+        let preview = if r.ok { r.text.substring(0, preview_len) } else { r.error }
+        println("  [likert " + to_string(i + 1) + "/" + to_string(total) + "] "
+              + (if r.ok { "OK" } else { "FAIL" })
+              + " phi=" + to_string(r.phi_holo) + " lat=" + to_string(r.lat_ms) + "ms gen=" + preview)
+        i = i + 1
+    }
+    let okf = to_float(ok)
+    let tf = to_float(total)
+    let rate = if total > 0 { okf / tf } else { 0.0 }
+    let phi = if ok > 0 { sum_phi / okf } else { 0.0 }
+    let kr = if ok > 0 { sum_kr / okf } else { 0.0 }
+    let lat = if ok > 0 { sum_lat / ok } else { 0 }
+    return AxisLikert { n: total, ok: ok, ok_rate: rate, avg_phi: phi, avg_kr: kr, avg_lat_ms: lat }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Section 5. AXIS 4 — Tool-call lenient judge (inline 5 tasks)
+// ════════════════════════════════════════════════════════════════════════
+// Mirrors serving/hire_sim_judge_lenient.hexa — inlined here to dodge
+// silent-exit-on-imports. 5 hire-sim-style prompts whose gold keywords
+// span reply/investigate/schedule/summarize/report (synonym+stem reach).
+
+fn normalize_text(s: string) -> string {
+    let mut lo = s.to_lower()
+    lo = lo.replace("-", " ")
+    lo = lo.replace("_", " ")
+    lo = lo.replace("\n", " ")
+    lo = lo.replace("\t", " ")
+    while lo.contains("  ") { lo = lo.replace("  ", " ") }
+    return lo
+}
+
+fn stem_en(word: string) -> string {
+    let n = len(word)
+    if n < 4 { return word }
+    let suffixes = ["ations", "ation", "tions", "tion", "ings", "ing", "ies", "ied", "ed", "es", "er", "or", "ly", "s"]
+    let mut i = 0
+    while i < len(suffixes) {
+        let suf = suffixes[i]
+        let slen = len(suf)
+        if n - slen >= 3 {
+            let tail = word.substring(n - slen, n)
+            if tail == suf {
+                if suf == "ies" { return word.substring(0, n - 3) + "y" }
+                return word.substring(0, n - slen)
+            }
+        }
+        i = i + 1
+    }
+    return word
+}
+
+fn stem_ko(word: string) -> string {
+    let n = len(word)
+    let suffixes = ["습니다", "합니다", "니다", "는", "요"]
+    let mut i = 0
+    while i < len(suffixes) {
+        let suf = suffixes[i]
+        let slen = len(suf)
+        if n - slen >= 6 {
+            let tail = word.substring(n - slen, n)
+            if tail == suf { return word.substring(0, n - slen) }
+        }
+        i = i + 1
+    }
+    return word
+}
+
+fn simple_stem(word: string) -> string {
+    let en = stem_en(word)
+    if len(en) < len(word) { return en }
+    let ko = stem_ko(word)
+    return ko
+}
+
+// Compressed synonym table — the 5 tool-call gold keys we actually use.
+fn syns_for(kw: string) -> [string] {
+    if kw == "reply" {
+        return ["reply", "replies", "respond", "response", "responding", "answer", "acknowledge", "회신", "답장"]
+    }
+    if kw == "investigate" {
+        return ["investigate", "investigating", "investigation", "examine", "analyze", "analyzing", "analysis", "look into", "조사", "분석"]
+    }
+    if kw == "schedule" {
+        return ["schedule", "scheduling", "scheduled", "book", "arrange", "일정", "스케줄"]
+    }
+    if kw == "summarize" {
+        return ["summarize", "summarizing", "summary", "recap", "overview", "요약"]
+    }
+    if kw == "report" {
+        return ["report", "reports", "reporting", "write-up", "writeup", "document", "보고", "리포트"]
+    }
+    return []
+}
+
+fn matches_lenient(kw: string, text_norm: string) -> bool {
+    let kw_norm = normalize_text(kw)
+    if text_norm.contains(kw_norm) { return true }
+    let syns = syns_for(kw_norm)
+    let mut i = 0
+    while i < len(syns) {
+        let sn_norm = normalize_text(syns[i])
+        if text_norm.contains(sn_norm) { return true }
+        if !sn_norm.contains(" ") {
+            let sn_stem = simple_stem(sn_norm)
+            if len(sn_stem) >= 4 && text_norm.contains(sn_stem) { return true }
+        }
+        i = i + 1
+    }
+    if !kw_norm.contains(" ") {
+        let kw_stem = simple_stem(kw_norm)
+        if len(kw_stem) >= 4 && text_norm.contains(kw_stem) { return true }
+    }
+    return false
+}
+
+fn judge_lenient(candidate: string, gold: [string]) -> bool {
+    let tn = normalize_text(candidate)
+    let mut i = 0
+    while i < len(gold) {
+        if matches_lenient(gold[i], tn) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn tool_task(qid: string, prompt: string, gold: string) -> [string] {
+    let mut r = []
+    r = r.push(qid); r = r.push(prompt); r = r.push(gold)
+    return r
+}
+
+fn build_tool_tasks() -> [[string]] {
+    let mut q = []
+    q = q.push(tool_task("t01",
+        "고객이 환불 요청 메일을 보냈다. 담당자로서 할 일을 한 줄로 답하라.",
+        "reply"))
+    q = q.push(tool_task("t02",
+        "서비스 지연(latency) 장애가 발생했다. 다음 할 일을 한 줄로 답하라.",
+        "investigate"))
+    q = q.push(tool_task("t03",
+        "다음 주 팀 회의 준비가 필요하다. 한 줄로 다음 할 일을 답하라.",
+        "schedule"))
+    q = q.push(tool_task("t04",
+        "긴 회의록을 받았다. 다음 할 일을 한 줄로 답하라.",
+        "summarize"))
+    q = q.push(tool_task("t05",
+        "이번 주 스프린트 진행 상황을 리더에게 알려야 한다. 다음 할 일을 한 줄로 답하라.",
+        "report"))
+    return q
+}
+
+struct AxisTool {
+    n: int,
+    n_hit: int,
+    score: float
+}
+
+fn axis_tool(endpoint: string, tasks: [[string]]) -> AxisTool {
+    let total = len(tasks)
+    let mut hits = 0
+    let mut i = 0
+    while i < total {
+        let t = tasks[i]
+        let r = call_alm(endpoint, t[1], 96, 0.0)
+        let gold = [t[2]]
+        let ok = r.ok && judge_lenient(r.text, gold)
+        if ok { hits = hits + 1 }
+        let mark = if ok { "HIT" } else { "miss" }
+        let preview_len = if len(r.text) < 50 { len(r.text) } else { 50 }
+        let preview = if r.ok { r.text.substring(0, preview_len) } else { r.error }
+        println("  [tool " + to_string(i + 1) + "/" + to_string(total) + "] " + t[0] + " " + mark
+              + " gold=" + t[2] + " reply=" + preview)
+        i = i + 1
+    }
+    let score = if total > 0 { to_float(hits) / to_float(total) } else { 0.0 }
+    return AxisTool { n: total, n_hit: hits, score: score }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Section 6. Prior baseline comparison (e.g. r4 vs r9)
+// ════════════════════════════════════════════════════════════════════════
+
+struct Baseline {
+    found: bool,
+    tag: string,
+    kobest_acc: float,
+    sentinel_flagged: int,
+    likert_ok_rate: float,
+    likert_avg_phi: float,
+    tool_score: float
+}
+
+fn load_baseline(path: string) -> Baseline {
+    if path == "" {
+        return Baseline { found: false, tag: "", kobest_acc: 0.0, sentinel_flagged: 0,
+            likert_ok_rate: 0.0, likert_avg_phi: 0.0, tool_score: 0.0 }
+    }
+    let raw = read_file(path)
+    if raw == "" || raw.index_of("\"kobest_acc\"") < 0 {
+        return Baseline { found: false, tag: "", kobest_acc: 0.0, sentinel_flagged: 0,
+            likert_ok_rate: 0.0, likert_avg_phi: 0.0, tool_score: 0.0 }
+    }
+    let tag = extract_json_string(raw, "\"tag\":")
+    let kob = extract_json_number(raw, "\"kobest_acc\":")
+    let sf_f = extract_json_number(raw, "\"sentinel_flagged\":")
+    let lok = extract_json_number(raw, "\"likert_ok_rate\":")
+    let lph = extract_json_number(raw, "\"likert_avg_phi\":")
+    let tsc = extract_json_number(raw, "\"tool_score\":")
+    return Baseline { found: true, tag: tag,
+        kobest_acc: kob, sentinel_flagged: to_int(sf_f),
+        likert_ok_rate: lok, likert_avg_phi: lph,
+        tool_score: tsc }
+}
+
+fn fmt_delta(cur: float, base: float, has: bool) -> string {
+    if !has { return "n/a" }
+    let d = cur - base
+    let sign = if d >= 0.0 { "+" } else { "" }
+    return sign + to_string(d)
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Section 7. JSON / markdown output assembly
+// ════════════════════════════════════════════════════════════════════════
+
+fn assemble_json(tag: string, endpoint: string, ts: string, deferred: bool,
+                 deferred_reason: string,
+                 kob: AxisKobest, sen: AxisSentinel,
+                 lik: AxisLikert, tol: AxisTool,
+                 base: Baseline, base_path: string) -> string {
+    let def_lit = if deferred { "true" } else { "false" }
+    let base_lit = if base.found { "true" } else { "false" }
+    return "{\n"
+         + "  \"harness\":             \"" + HARNESS_VERSION + "\",\n"
+         + "  \"tag\":                 \"" + json_escape(tag) + "\",\n"
+         + "  \"timestamp\":           \"" + ts + "\",\n"
+         + "  \"endpoint\":            \"" + json_escape(endpoint) + "\",\n"
+         + "  \"deferred\":            " + def_lit + ",\n"
+         + "  \"deferred_reason\":     \"" + json_escape(deferred_reason) + "\",\n"
+         + "  \"kobest_n\":            " + to_string(kob.n) + ",\n"
+         + "  \"kobest_n_correct\":    " + to_string(kob.n_correct) + ",\n"
+         + "  \"kobest_acc\":          " + to_string(kob.acc) + ",\n"
+         + "  \"sentinel_n\":          " + to_string(sen.n) + ",\n"
+         + "  \"sentinel_flagged\":    " + to_string(sen.flagged) + ",\n"
+         + "  \"sentinel_verdict\":    \"" + sen.verdict + "\",\n"
+         + "  \"sentinel_hits\": {\n"
+         + "    \"bracket\":  " + to_string(sen.h_bracket) + ",\n"
+         + "    \"charloop\": " + to_string(sen.h_charloop) + ",\n"
+         + "    \"spaceloop\":" + to_string(sen.h_spaceloop) + ",\n"
+         + "    \"rolebleed\":" + to_string(sen.h_rolebleed) + ",\n"
+         + "    \"qmark\":    " + to_string(sen.h_qmark) + "\n"
+         + "  },\n"
+         + "  \"likert_n\":            " + to_string(lik.n) + ",\n"
+         + "  \"likert_ok\":           " + to_string(lik.ok) + ",\n"
+         + "  \"likert_ok_rate\":      " + to_string(lik.ok_rate) + ",\n"
+         + "  \"likert_avg_phi\":      " + to_string(lik.avg_phi) + ",\n"
+         + "  \"likert_avg_kr\":       " + to_string(lik.avg_kr) + ",\n"
+         + "  \"likert_avg_lat_ms\":   " + to_string(lik.avg_lat_ms) + ",\n"
+         + "  \"tool_n\":              " + to_string(tol.n) + ",\n"
+         + "  \"tool_n_hit\":          " + to_string(tol.n_hit) + ",\n"
+         + "  \"tool_score\":          " + to_string(tol.score) + ",\n"
+         + "  \"baseline_found\":      " + base_lit + ",\n"
+         + "  \"baseline_path\":       \"" + json_escape(base_path) + "\",\n"
+         + "  \"baseline_tag\":        \"" + json_escape(base.tag) + "\",\n"
+         + "  \"delta_kobest_acc\":    " + (if base.found { to_string(kob.acc - base.kobest_acc) } else { "null" }) + ",\n"
+         + "  \"delta_sentinel_flagged\": " + (if base.found { to_string(sen.flagged - base.sentinel_flagged) } else { "null" }) + ",\n"
+         + "  \"delta_likert_ok_rate\": " + (if base.found { to_string(lik.ok_rate - base.likert_ok_rate) } else { "null" }) + ",\n"
+         + "  \"delta_tool_score\":    " + (if base.found { to_string(tol.score - base.tool_score) } else { "null" }) + "\n"
+         + "}\n"
+}
+
+fn assemble_md(tag: string, ts: string, endpoint: string, deferred: bool,
+               deferred_reason: string,
+               kob: AxisKobest, sen: AxisSentinel,
+               lik: AxisLikert, tol: AxisTool,
+               base: Baseline) -> string {
+    let hdr = "# ALM_VAL summary — " + tag + " @ " + ts + "\n\n"
+    let ep = "- endpoint: `" + endpoint + "`\n"
+    let def = if deferred { "- **DEFERRED**: " + deferred_reason + "\n" } else { "- status: LIVE\n" }
+    let tbl = "\n| axis | metric | " + tag + " | baseline (" + base.tag + ") | delta |\n"
+            + "|---|---|---:|---:|---:|\n"
+            + "| 1. KoBEST  | acc (" + to_string(kob.n_correct) + "/" + to_string(kob.n) + ") | "
+            + to_string(kob.acc) + " | " + (if base.found { to_string(base.kobest_acc) } else { "n/a" })
+            + " | " + fmt_delta(kob.acc, base.kobest_acc, base.found) + " |\n"
+            + "| 2. Sentinel | flagged/" + to_string(sen.n) + " | " + to_string(sen.flagged)
+            + " (" + sen.verdict + ") | "
+            + (if base.found { to_string(base.sentinel_flagged) } else { "n/a" })
+            + " | " + (if base.found { to_string(sen.flagged - base.sentinel_flagged) } else { "n/a" }) + " |\n"
+            + "| 3. Likert  | ok_rate | " + to_string(lik.ok_rate) + " | "
+            + (if base.found { to_string(base.likert_ok_rate) } else { "n/a" })
+            + " | " + fmt_delta(lik.ok_rate, base.likert_ok_rate, base.found) + " |\n"
+            + "| 3. Likert  | avg_phi | " + to_string(lik.avg_phi) + " | "
+            + (if base.found { to_string(base.likert_avg_phi) } else { "n/a" }) + " | "
+            + fmt_delta(lik.avg_phi, base.likert_avg_phi, base.found) + " |\n"
+            + "| 3. Likert  | avg_kr  | " + to_string(lik.avg_kr) + " | n/a | n/a |\n"
+            + "| 4. Tool    | score (" + to_string(tol.n_hit) + "/" + to_string(tol.n) + ") | "
+            + to_string(tol.score) + " | "
+            + (if base.found { to_string(base.tool_score) } else { "n/a" })
+            + " | " + fmt_delta(tol.score, base.tool_score, base.found) + " |\n"
+    let sig = "\n## Sentinel hits\n"
+            + "- bracket=" + to_string(sen.h_bracket)
+            + " charloop=" + to_string(sen.h_charloop)
+            + " spaceloop=" + to_string(sen.h_spaceloop)
+            + " rolebleed=" + to_string(sen.h_rolebleed)
+            + " qmark=" + to_string(sen.h_qmark) + "\n"
+    return hdr + ep + def + tbl + sig
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Section 8. Self-test (no network)
+// ════════════════════════════════════════════════════════════════════════
+
+fn selftest() -> int {
+    println("[alm_val] SELFTEST")
+
+    // 1. KoBEST grading
+    let g1 = grade_kobest("예", "예, 맞습니다.")
+    let g2 = grade_kobest("B", "A")
+    let g3 = grade_kobest("긍정", "감정은 긍정입니다.")
+    let g_ok = g1 && !g2 && g3
+    println("  kobest grade: " + (if g_ok { "PASS" } else { "FAIL" }))
+
+    // 2. Sentinel on known-COLLAPSED r9 samples (must flag all 5)
+    let s1 = detect_signatures("n다},{\"\":\"\"},{\"\":\"\":\"\"},{\"\":\"\"},{\"\":\"\"},{\"\":\"\"},{\"\":\"\"}")
+    let s2 = detect_signatures("어나를?.\"],\"roleassistant이:\\이은의")
+    let s3 = detect_signatures("한국어롬에서어로변\\n#: ''는문의시,의,,를하여분한다nn# '': ' ' ' ' ' ' ' ' '")
+    let s4 = detect_signatures("?nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn")
+    let s5 = detect_signatures("?????????????????????")
+    let f1 = (s1[0] + s1[1] + s1[2] + s1[3] + s1[4]) >= 1
+    let f2 = (s2[0] + s2[1] + s2[2] + s2[3] + s2[4]) >= 1
+    let f3 = (s3[0] + s3[1] + s3[2] + s3[3] + s3[4]) >= 1
+    let f4 = (s4[0] + s4[1] + s4[2] + s4[3] + s4[4]) >= 1
+    let f5 = (s5[0] + s5[1] + s5[2] + s5[3] + s5[4]) >= 1
+    let flagged_ct = (if f1 { 1 } else { 0 }) + (if f2 { 1 } else { 0 })
+                   + (if f3 { 1 } else { 0 }) + (if f4 { 1 } else { 0 })
+                   + (if f5 { 1 } else { 0 })
+    let s_ok = flagged_ct >= 3
+    println("  sentinel  : " + to_string(flagged_ct) + "/5 flagged ("
+          + (if s_ok { "PASS" } else { "FAIL" }) + ")")
+
+    // 2b. Sentinel on a CLEAN sample (healthy generation — should NOT flag)
+    let sc = detect_signatures("안녕하세요. 오늘은 좋은 날씨네요. 함께 걸을까요?")
+    let sc_fired = (sc[0] + sc[1] + sc[2] + sc[3] + sc[4]) >= 1
+    let sc_ok = !sc_fired
+    println("  sentinel-clean: " + (if sc_ok { "PASS (no flag)" } else { "FAIL (false flag)" }))
+
+    // 3. Lenient judge — EN synonym + EN stem + KO direct
+    let j1 = judge_lenient("I will respond to the customer soon.", ["reply"])
+    let j2 = judge_lenient("Investigating the latency incident.", ["investigate"])
+    let j3 = judge_lenient("회신하겠습니다.", ["reply"])
+    let j4 = judge_lenient("오늘 날씨 좋다", ["investigate"])  // must reject
+    let j_ok = j1 && j2 && j3 && !j4
+    println("  lenient   : " + (if j_ok { "PASS" } else { "FAIL" }))
+
+    // 4. Korean ratio
+    let kr_pure = korean_ratio("안녕하세요")
+    let kr_mix = korean_ratio("hello 안녕")
+    let kr_en = korean_ratio("hello world")
+    let kr_ok = kr_pure > 0.9 && kr_mix > 0.2 && kr_mix < 0.8 && kr_en < 0.01
+    println("  kr_ratio  : pure=" + to_string(kr_pure) + " mix=" + to_string(kr_mix)
+          + " en=" + to_string(kr_en) + " " + (if kr_ok { "PASS" } else { "FAIL" }))
+
+    let all = g_ok && s_ok && sc_ok && j_ok && kr_ok
+    println("[alm_val] SELFTEST: " + (if all { "ALL PASS" } else { "FAIL" }))
+    if all { return 0 } else { return 1 }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Section 9. Main
+// ════════════════════════════════════════════════════════════════════════
+
+fn print_usage() {
+    println("usage: hexa run training/alm_val.hexa [flags]")
+    println("  --endpoint <url>   default env ALM_VAL_ENDPOINT or " + DEFAULT_ENDPOINT)
+    println("  --tag     <str>    default " + DEFAULT_TAG)
+    println("  --compare <json>   prior alm_val JSON (for delta)")
+    println("  --out-dir <path>   default " + DEFAULT_OUT_DIR)
+    println("  --quick            reduced N per axis")
+    println("  --selftest         offline checks only")
+}
+
+fn main() -> int {
+    let av = args()
+    // early selftest check
+    let mut j = 0
+    while j < len(av) {
+        if av[j] == "--selftest" { return selftest() }
+        if av[j] == "--help" || av[j] == "-h" { print_usage(); return 0 }
+        j = j + 1
+    }
+
+    let mut endpoint = env_var("ALM_VAL_ENDPOINT")
+    if endpoint == "" { endpoint = DEFAULT_ENDPOINT }
+    let mut tag = DEFAULT_TAG
+    let mut compare = ""
+    let mut out_dir = DEFAULT_OUT_DIR
+    let mut quick = false
+
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--endpoint" { if i + 1 < len(av) { endpoint = av[i + 1] }; i = i + 2 }
+        else if a == "--tag" { if i + 1 < len(av) { tag = av[i + 1] }; i = i + 2 }
+        else if a == "--compare" { if i + 1 < len(av) { compare = av[i + 1] }; i = i + 2 }
+        else if a == "--out-dir" { if i + 1 < len(av) { out_dir = av[i + 1] }; i = i + 2 }
+        else if a == "--quick" { quick = true; i = i + 1 }
+        else { i = i + 1 }
+    }
+
+    let ts = exec("date -u '+%Y%m%dT%H%M%SZ' | tr -d '\\n'")
+    let out_json = out_dir + "/alm_val_" + tag + "_" + ts + ".json"
+    let out_md = out_dir + "/alm_val_" + tag + "_" + ts + ".md"
+    exec("mkdir -p " + out_dir)
+
+    println("============================================================")
+    println("[alm_val] " + HARNESS_VERSION + " tag=" + tag)
+    println("[alm_val] endpoint: " + endpoint)
+    println("[alm_val] out:      " + out_json)
+    if compare != "" { println("[alm_val] compare:  " + compare) }
+    if quick { println("[alm_val] quick:    ON") }
+    println("============================================================")
+
+    // Probe endpoint — DEFERRED on failure (feedback_closed_loop_verify)
+    println("[alm_val] probing endpoint ...")
+    let probe_err = probe_endpoint(endpoint)
+
+    // Zero-result sentinels
+    let zk = AxisKobest { n: 0, n_correct: 0, acc: 0.0 }
+    let zs = AxisSentinel { n: 0, flagged: 0, verdict: "UNKNOWN",
+        h_bracket: 0, h_charloop: 0, h_spaceloop: 0, h_rolebleed: 0, h_qmark: 0 }
+    let zl = AxisLikert { n: 0, ok: 0, ok_rate: 0.0, avg_phi: 0.0, avg_kr: 0.0, avg_lat_ms: 0 }
+    let zt = AxisTool { n: 0, n_hit: 0, score: 0.0 }
+
+    let base = load_baseline(compare)
+    if compare != "" && !base.found {
+        println("[alm_val] WARN: baseline " + compare + " not loadable (ignored)")
+    }
+
+    if probe_err != "" {
+        println("[alm_val] DEFERRED: " + probe_err)
+        let body = assemble_json(tag, endpoint, ts, true, probe_err, zk, zs, zl, zt, base, compare)
+        write_file(out_json, body)
+        let md = assemble_md(tag, ts, endpoint, true, probe_err, zk, zs, zl, zt, base)
+        write_file(out_md, md)
+        println("[alm_val] wrote " + out_json)
+        println("[alm_val] wrote " + out_md)
+        println("RESULT: " + out_json)
+        println("SUMMARY: DEFERRED (" + probe_err + ") — endpoint down; re-run after serve_alm_14b restart")
+        return 2
+    }
+    println("[alm_val] endpoint OK")
+
+    // Build prompt sets (quick variants trim the last 2 items)
+    let kob_items = build_kobest_quick()
+    let sen_prompts = build_kr_gen_prompts()
+    let lik_prompts = build_likert_quick()
+    let tool_tasks = build_tool_tasks()
+
+    // (--quick reduces cost by truncating each axis)
+    let kob_sel = if quick { [kob_items[0], kob_items[1], kob_items[2], kob_items[3], kob_items[4]] } else { kob_items }
+    let lik_sel = if quick { [lik_prompts[0], lik_prompts[1], lik_prompts[2], lik_prompts[3], lik_prompts[4]] } else { lik_prompts }
+
+    println("")
+    println("[alm_val] axis 1 — KoBEST-quick (n=" + to_string(len(kob_sel)) + ")")
+    let kob = axis_kobest(endpoint, kob_sel)
+
+    println("")
+    println("[alm_val] axis 2 — kr_gen sentinel (n=" + to_string(len(sen_prompts)) + ")")
+    let sen = axis_sentinel(endpoint, sen_prompts)
+
+    println("")
+    println("[alm_val] axis 3 — persona Likert (n=" + to_string(len(lik_sel)) + ")")
+    let lik = axis_likert(endpoint, lik_sel)
+
+    println("")
+    println("[alm_val] axis 4 — tool-call lenient (n=" + to_string(len(tool_tasks)) + ")")
+    let tol = axis_tool(endpoint, tool_tasks)
+
+    let body = assemble_json(tag, endpoint, ts, false, "", kob, sen, lik, tol, base, compare)
+    write_file(out_json, body)
+    let md = assemble_md(tag, ts, endpoint, false, "", kob, sen, lik, tol, base)
+    write_file(out_md, md)
+
+    println("")
+    println("============================================================")
+    println("[alm_val] RESULTS")
+    println("============================================================")
+    println("  kobest_acc    : " + to_string(kob.acc) + " (" + to_string(kob.n_correct) + "/" + to_string(kob.n) + ")")
+    println("  sentinel      : " + sen.verdict + " (flagged " + to_string(sen.flagged) + "/" + to_string(sen.n) + ")")
+    println("  likert_ok_rate: " + to_string(lik.ok_rate))
+    println("  likert_avg_phi: " + to_string(lik.avg_phi))
+    println("  likert_avg_kr : " + to_string(lik.avg_kr))
+    println("  tool_score    : " + to_string(tol.score) + " (" + to_string(tol.n_hit) + "/" + to_string(tol.n) + ")")
+    if base.found {
+        println("  delta vs " + base.tag + ":")
+        println("    kobest_acc    : " + fmt_delta(kob.acc, base.kobest_acc, true))
+        println("    sentinel_flag : " + to_string(sen.flagged - base.sentinel_flagged))
+        println("    likert_ok_rate: " + fmt_delta(lik.ok_rate, base.likert_ok_rate, true))
+        println("    tool_score    : " + fmt_delta(tol.score, base.tool_score, true))
+    }
+    println("[alm_val] wrote " + out_json)
+    println("[alm_val] wrote " + out_md)
+    println("RESULT: " + out_json)
+    println("SUMMARY: tag=" + tag
+          + " kobest=" + to_string(kob.acc)
+          + " sentinel=" + sen.verdict + "(" + to_string(sen.flagged) + ")"
+          + " likert_ok=" + to_string(lik.ok_rate)
+          + " tool=" + to_string(tol.score))
+    return 0
+}
+
+main()
