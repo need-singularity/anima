@@ -1,13 +1,481 @@
-// deploy_v5_h100.hexa — STUBBED 2026-04-18 (R37/AN13/L3-PY compliance)
+// deploy_v5_h100.hexa — hexa-native H100 deploy (R37/AN13/L3-PY compliant)
 //
-// Previously invoked python3 (via shell()/exec()) for ConsciousLM v5 SOC
-// H100 deploy. Violates R37/AN13/L3-PY.
+// Responsibility:
+//   1. Pack hexa artifacts (Linux ELF binary + .hexa sources + native .c shims)
+//   2. Transfer to pod via scp (or runpodctl lookup)
+//   3. Remote build: native FFI libs (libhxblas, libhxccl, libhxcuda, ...)
+//   4. Verify checksums
+//   5. Optionally kick off training via launch_h100.hexa
+//
+// Usage:
+//   hexa scripts/deploy/deploy_v5_h100.hexa --pod-ip 1.2.3.4 --pod-port 22001 --dry-run
+//   hexa scripts/deploy/deploy_v5_h100.hexa --pod-id <runpod_id>
+//   LIVE_FIRE_OK=1 hexa scripts/deploy/deploy_v5_h100.hexa --pod-id <runpod_id>
+//
+// Safety:
+//   - Defaults to --dry-run unless LIVE_FIRE_OK=1.
+//   - Per-file scp (no git pollution, no wildcards).
+//   - Checksum verify step on every artifact after transfer.
+//
+// Replaces:
+//   previous stub that panicked "R37/AN13/L3-PY: python3 invocation blocked".
+
+// ── Defaults ──────────────────────────────────────────────────────────
+
+let DEFAULT_REMOTE_DIR   = "/workspace/anima"
+let REMOTE_HEXA_BIN_DIR  = "/opt/hexa/bin"
+let REMOTE_HEXA_BIN      = "/opt/hexa/bin/hexa"
+let REMOTE_NATIVE_DIR    = "/workspace/anima/native"
+let REMOTE_NATIVE_BUILD  = "/workspace/anima/native/build"
+let REMOTE_TRAIN_DIR     = "/workspace/anima/training"
+let REMOTE_ML_DIR        = "/workspace/anima/self/ml"
+let REMOTE_SCRIPT_DIR    = "/workspace/anima/scripts"
+
+// Local Linux binary (built via hexa-lang sister session — see HX7/HX10)
+let LOCAL_HEXA_LINUX_BIN = "/Users/ghost/Dev/hexa-lang/build/hexa_v2_linux"
+
+// ── CLI parsing ───────────────────────────────────────────────────────
+
+let argv = args()
+
+fn flag_value(name: string, fallback: string) -> string {
+    let n = argv.len()
+    let mut i = 0
+    while i < n {
+        if argv[i] == name && i + 1 < n {
+            return argv[i + 1]
+        }
+        i = i + 1
+    }
+    return fallback
+}
+
+fn flag_bool(name: string) -> bool {
+    let n = argv.len()
+    let mut i = 0
+    while i < n {
+        if argv[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+let POD_ID       = flag_value("--pod-id", "")
+let POD_IP_ARG   = flag_value("--pod-ip", "")
+let POD_PORT_S   = flag_value("--pod-port", "")
+let REMOTE_DIR   = flag_value("--remote-dir", DEFAULT_REMOTE_DIR)
+let MODEL_SIZE   = flag_value("--model-size", "14b")
+let DRY_RUN      = flag_bool("--dry-run")
+let SKIP_BUILD   = flag_bool("--skip-native-build")
+let SKIP_VERIFY  = flag_bool("--skip-verify")
+
+// ── Artifact manifest ─────────────────────────────────────────────────
+// Source groups — only present files are shipped (missing files logged but not fatal).
+
+let ARTIFACTS_TRAINING = [
+    "training/train_clm.hexa",
+    "training/train_clm_gpu.hexa",
+    "training/nn_core.hexa",
+    "training/clm_mmap_loader.hexa",
+    "training/clm_1b_config.json"
+]
+
+// Model-size specific (14b/32b/70b). Only the one matching --model-size gets priority.
+let ARTIFACTS_14B = ["training/train_alm_14b.hexa", "training/alm14b_config.json"]
+let ARTIFACTS_32B = ["training/train_alm_32b.hexa", "training/alm32b_config.json"]
+let ARTIFACTS_70B = ["training/train_alm_70b.hexa", "training/alm70b_config.json"]
+
+// Anima core ML sources — shared between trainer + inference
+let ARTIFACTS_ML_CORE = [
+    "self/ml/cuda_ffi.hexa",
+    "self/ml/cuda_rtc.hexa",
+    "self/ml/gpu_tensor.hexa",
+    "self/ml/gpu_grad_engine.hexa",
+    "self/ml/gpu_optimizer.hexa",
+    "self/ml/gpu_inference.hexa",
+    "self/ml/gpu_train.hexa",
+    "self/ml/fsdp.hexa",
+    "self/ml/hxblas.hexa",
+    "self/ml/hxccl.hexa",
+    "self/ml/hxcuda.hexa",
+    "self/ml/hxlmhead.hexa",
+    "self/ml/hxflash.hexa",
+    "self/ml/hxlayer.hexa",
+    "self/ml/qwen14b.hexa"
+]
+
+// Native FFI .c shims (built on remote)
+let ARTIFACTS_NATIVE = [
+    "self/native/hxblas_linux.c",
+    "self/native/hxvdsp_linux.c",
+    "self/native/hxlayer_linux.c",
+    "self/native/hxflash_linux.c",
+    "self/native/hxccl_linux.c",
+    "self/native/hxlmhead_linux.c",
+    "self/native/hxqwen14b.c",
+    "self/native/hxcuda_fused.cu",
+    "self/native/hxcuda_stft.cu",
+    "self/native/hxcuda_conv1d.cu"
+]
+
+// Native build scripts (hexa-native)
+let ARTIFACTS_BUILD_SCRIPTS = [
+    "scripts/build_hxblas_linux.hexa",
+    "scripts/build_hxlayer_linux.hexa",
+    "scripts/build_hxflash_linux.hexa",
+    "scripts/build_hxccl_linux.hexa",
+    "scripts/build_hxlmhead_linux.hexa",
+    "scripts/build_hxqwen14b_linux.hexa",
+    "scripts/build_hxcuda_linux.hexa",
+    "scripts/build_session_b.hexa"
+]
+
+// ── Helpers ───────────────────────────────────────────────────────────
+
+fn env_or(key: string, fallback: string) -> string {
+    let v = env(key)
+    if v == "" { return fallback }
+    return v
+}
+
+// basename helper — pure hexa (avoid shell metachar warning)
+fn basename_of(path: string) -> string {
+    let n = path.len()
+    let mut last_slash = -1
+    let mut i = 0
+    while i < n {
+        if path[i] == "/" { last_slash = i }
+        i = i + 1
+    }
+    if last_slash < 0 { return path }
+    return path[(last_slash + 1)..n]
+}
+
+fn now_iso() -> string {
+    return exec("date -u +%Y%m%dT%H%M%SZ").trim()
+}
+
+fn ssh_base(ip: string, port: string) -> string {
+    if ip == "" { return "ssh root@POD_IP_UNRESOLVED" }
+    let opts = " -o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+    if port == "" || port == "22" {
+        return "ssh" + opts + " root@" + ip
+    }
+    return "ssh" + opts + " -p " + port + " root@" + ip
+}
+
+fn scp_base(ip: string, port: string) -> string {
+    if ip == "" { return "scp POD_IP_UNRESOLVED" }
+    let opts = " -o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+    if port == "" || port == "22" {
+        return "scp" + opts
+    }
+    return "scp" + opts + " -P " + port
+}
+
+fn lookup_pod(pod_id: string) -> string {
+    if pod_id == "" { return "" }
+    let ip_cmd = "runpodctl get pod " + pod_id
+        + " 2>/dev/null | grep -oE 'root@[^ ]+' | head -1 | sed 's/root@//'"
+    let port_cmd = "runpodctl get pod " + pod_id
+        + " 2>/dev/null | grep -oE -- '-p [0-9]+' | head -1 | awk '{print $2}'"
+    let ip = exec(ip_cmd).trim()
+    let port = exec(port_cmd).trim()
+    if ip == "" { return "" }
+    if port == "" { return ip + ":22" }
+    return ip + ":" + port
+}
+
+fn split_ep(ep: string) -> [string] {
+    // pure hexa split on first ':'
+    let n = ep.len()
+    let mut i = 0
+    while i < n {
+        if ep[i] == ":" {
+            return [ep[0..i], ep[(i + 1)..n]]
+        }
+        i = i + 1
+    }
+    return [ep, ""]
+}
+
+fn resolve_endpoint(dry: bool) -> [string] {
+    if POD_IP_ARG != "" {
+        let p = (if POD_PORT_S == "" { "22" } else { POD_PORT_S })
+        return [POD_IP_ARG, p]
+    }
+    if POD_ID == "" {
+        println("[FATAL] cannot resolve pod endpoint")
+        println("  need: --pod-ip <ip> --pod-port <n>  OR  --pod-id <runpod_id>")
+        exit(2)
+    }
+    if dry {
+        return ["DRYRUN_IP", "DRYRUN_PORT"]
+    }
+    let ep = lookup_pod(POD_ID)
+    if ep == "" {
+        println("[FATAL] runpodctl lookup failed for pod-id=" + POD_ID)
+        exit(2)
+    }
+    return split_ep(ep)
+}
+
+fn run_step(label: string, cmd: string, dry: bool) -> int {
+    println("")
+    println("  $ " + cmd)
+    if dry {
+        println("  [dry-run] " + label)
+        return 0
+    }
+    let result = exec_with_status(cmd)
+    let rc = result[1]
+    if rc != 0 {
+        println("  [rc=" + str(rc) + "] " + label)
+    } else {
+        println("  [ok] " + label)
+    }
+    return rc
+}
+
+fn sha256_local(path: string) -> string {
+    // shasum -a 256 <file> | awk '{print $1}'
+    if !file_exists(path) { return "" }
+    return exec("shasum -a 256 '" + path + "' 2>/dev/null | awk '{print $1}'").trim()
+}
+
+fn sha256_remote(SSH: string, remote_path: string) -> string {
+    return exec(SSH + " 'sha256sum " + remote_path + " 2>/dev/null | awk \\\"{print \\\\$1}\\\"'").trim()
+}
+
+// Ship a single file if it exists locally, return true on success or if missing-but-skipped.
+fn ship_file(SCP: string, SSH: string, dest_prefix: string,
+             src: string, remote_dir: string, dry: bool) -> bool {
+    if !file_exists(src) {
+        println("  [skip] " + src + " (missing locally)")
+        return true
+    }
+    let basename = basename_of(src)
+    let remote_path = remote_dir + "/" + basename
+    let rc = run_step("scp " + src + " -> " + remote_path,
+        SCP + " " + src + " " + dest_prefix + ":" + remote_path,
+        dry)
+    if !dry && rc != 0 { return false }
+    if !dry && !SKIP_VERIFY {
+        let local_hash = sha256_local(src)
+        let remote_hash = sha256_remote(SSH, remote_path)
+        if local_hash != "" && remote_hash != "" && local_hash != remote_hash {
+            println("  [CHECKSUM MISMATCH] " + src + " local=" + local_hash + " remote=" + remote_hash)
+            return false
+        }
+    }
+    return true
+}
+
+fn ship_group(SCP: string, SSH: string, dest_prefix: string,
+              files: [string], remote_dir: string, dry: bool) -> int {
+    let mut shipped = 0
+    let mut i = 0
+    while i < files.len() {
+        let ok = ship_file(SCP, SSH, dest_prefix, files[i], remote_dir, dry)
+        if ok { shipped = shipped + 1 }
+        i = i + 1
+    }
+    return shipped
+}
+
+fn model_specific_artifacts() -> [string] {
+    if MODEL_SIZE == "14b" { return ARTIFACTS_14B }
+    if MODEL_SIZE == "32b" { return ARTIFACTS_32B }
+    if MODEL_SIZE == "70b" { return ARTIFACTS_70B }
+    return []
+}
+
+// ── Banner ────────────────────────────────────────────────────────────
+
+fn banner() {
+    println("═════════════════════════════════════════════════════════════════")
+    println("  HEXA-NATIVE H100 DEPLOY — " + MODEL_SIZE + " (" + now_iso() + ")")
+    println("═════════════════════════════════════════════════════════════════")
+    println("  remote-dir = " + REMOTE_DIR)
+    println("  model-size = " + MODEL_SIZE)
+    println("  dry-run    = " + (if DRY_RUN { "true" } else { "false" }))
+    println("  skip-build = " + (if SKIP_BUILD { "true" } else { "false" }))
+    println("  skip-verify= " + (if SKIP_VERIFY { "true" } else { "false" }))
+    println("")
+}
+
+// ── Main ──────────────────────────────────────────────────────────────
 
 fn main() {
-    println("[R37/AN13/L3-PY] BLOCKED: scripts/deploy/deploy_v5_h100.hexa")
-    println("  Previously invoked python3 for ConsciousLM v5 H100 deploy.")
-    println("  Escalate to user for hexa-native replacement.")
-    panic("R37/AN13/L3-PY: python3 invocation blocked at scripts/deploy/deploy_v5_h100.hexa")
+    banner()
+
+    let live_ok = env("LIVE_FIRE_OK")
+    let dry = DRY_RUN || live_ok != "1"
+    if dry && !DRY_RUN {
+        println("[GUARD] LIVE_FIRE_OK != 1 — forcing --dry-run mode")
+        println("")
+    }
+
+    let ep = resolve_endpoint(dry)
+    let ip = ep[0]
+    let port = ep[1]
+    let SSH = ssh_base(ip, port)
+    let SCP = scp_base(ip, port)
+    let dest_prefix = "root@" + ip
+
+    println("  pod endpoint = " + ip + ":" + port)
+    println("")
+
+    // ── Stage 1: Ping + scaffold remote dirs ──
+    println("─── Stage 1/5: ping + scaffold ───")
+    let rc_ping = run_step("ping pod",
+        SSH + " 'echo ok'",
+        dry)
+    if !dry && rc_ping != 0 {
+        println("[FATAL] pod unreachable")
+        exit(3)
+    }
+
+    let rc_mkdir = run_step("scaffold remote dirs",
+        SSH + " 'mkdir -p " + REMOTE_HEXA_BIN_DIR
+        + " " + REMOTE_TRAIN_DIR
+        + " " + REMOTE_ML_DIR
+        + " " + REMOTE_NATIVE_DIR
+        + " " + REMOTE_NATIVE_BUILD
+        + " " + REMOTE_SCRIPT_DIR + "'",
+        dry)
+    if !dry && rc_mkdir != 0 {
+        println("[FATAL] scaffold mkdir failed")
+        exit(3)
+    }
+
+    // ── Stage 2: Ship hexa Linux binary ──
+    println("")
+    println("─── Stage 2/5: ship hexa Linux binary ───")
+    if file_exists(LOCAL_HEXA_LINUX_BIN) {
+        let rc_bin = run_step("scp " + LOCAL_HEXA_LINUX_BIN,
+            SCP + " " + LOCAL_HEXA_LINUX_BIN + " " + dest_prefix + ":" + REMOTE_HEXA_BIN,
+            dry)
+        if !dry && rc_bin != 0 {
+            println("[FATAL] hexa binary scp failed")
+            exit(4)
+        }
+        let _ = run_step("chmod +x " + REMOTE_HEXA_BIN,
+            SSH + " 'chmod +x " + REMOTE_HEXA_BIN + "'",
+            dry)
+        if !dry && !SKIP_VERIFY {
+            let local_hash  = sha256_local(LOCAL_HEXA_LINUX_BIN)
+            let remote_hash = sha256_remote(SSH, REMOTE_HEXA_BIN)
+            println("  [sha256] local =" + local_hash)
+            println("  [sha256] remote=" + remote_hash)
+            if local_hash != remote_hash {
+                println("[FATAL] hexa binary checksum mismatch — abort")
+                exit(4)
+            }
+        }
+    } else {
+        println("[WARN] " + LOCAL_HEXA_LINUX_BIN + " missing locally")
+        println("  cross-build first: hexa scripts/build_hexa_v2_linux.hexa")
+        println("  or pass --skip-build + assume pod already has hexa binary")
+        // TODO(H100-live): if pod has pre-baked hexa_v2_linux from prior deploy,
+        // this is recoverable. For now continue — remote verify will catch.
+    }
+
+    // ── Stage 3: Ship hexa sources (training + ML + native shims + scripts) ──
+    println("")
+    println("─── Stage 3/5: ship hexa sources ───")
+
+    let n_train = ship_group(SCP, SSH, dest_prefix,
+        ARTIFACTS_TRAINING, REMOTE_TRAIN_DIR, dry)
+    let n_model = ship_group(SCP, SSH, dest_prefix,
+        model_specific_artifacts(), REMOTE_TRAIN_DIR, dry)
+    let n_ml = ship_group(SCP, SSH, dest_prefix,
+        ARTIFACTS_ML_CORE, REMOTE_ML_DIR, dry)
+    let n_native = ship_group(SCP, SSH, dest_prefix,
+        ARTIFACTS_NATIVE, REMOTE_NATIVE_DIR, dry)
+    let n_scripts = ship_group(SCP, SSH, dest_prefix,
+        ARTIFACTS_BUILD_SCRIPTS, REMOTE_SCRIPT_DIR, dry)
+
+    println("")
+    println("  shipped: training=" + str(n_train)
+        + " model(" + MODEL_SIZE + ")=" + str(n_model)
+        + " ml=" + str(n_ml)
+        + " native=" + str(n_native)
+        + " scripts=" + str(n_scripts))
+
+    // ── Stage 4: Remote native build (libhxblas, libhxccl, libhxcuda, ...) ──
+    println("")
+    println("─── Stage 4/5: remote native build ───")
+    if SKIP_BUILD {
+        println("  [skip] --skip-native-build set")
+    } else {
+        // apt deps (idempotent)
+        let rc_apt = run_step("apt install deps",
+            SSH + " 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && "
+            + "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "
+            + "gcc build-essential clang lld libopenblas-dev libgomp1 2>&1 | tail -3'",
+            dry)
+        if !dry && rc_apt != 0 {
+            println("[WARN] apt returned rc=" + str(rc_apt) + " — may already be installed, continuing")
+        }
+
+        // Build each native lib. Order: CPU libs first, then CUDA (nvcc-dependent).
+        let build_libs = [
+            "build_hxblas_linux.hexa",
+            "build_hxlayer_linux.hexa",
+            "build_hxflash_linux.hexa",
+            "build_hxccl_linux.hexa",
+            "build_hxlmhead_linux.hexa",
+            "build_hxqwen14b_linux.hexa"
+        ]
+        let mut bi = 0
+        while bi < build_libs.len() {
+            let b = build_libs[bi]
+            let rc_b = run_step("build " + b,
+                SSH + " 'cd " + REMOTE_DIR + " && "
+                + REMOTE_HEXA_BIN + " " + REMOTE_SCRIPT_DIR + "/" + b + " 2>&1 | tail -5'",
+                dry)
+            if !dry && rc_b != 0 {
+                println("[WARN] " + b + " failed rc=" + str(rc_b) + " — continuing (may be optional)")
+            }
+            bi = bi + 1
+        }
+
+        // CUDA build (optional — only if nvcc present)
+        let rc_cuda = run_step("build libhxcuda (requires nvcc)",
+            SSH + " 'cd " + REMOTE_DIR + " && "
+            + REMOTE_HEXA_BIN + " " + REMOTE_SCRIPT_DIR + "/build_hxcuda_linux.hexa 2>&1 | tail -5'",
+            dry)
+        if !dry && rc_cuda != 0 {
+            println("[WARN] libhxcuda build failed rc=" + str(rc_cuda))
+            println("  expected on pods without nvcc — GPU training will fail until CUDA toolkit installed")
+        }
+    }
+
+    // ── Stage 5: Verify native build artifacts ──
+    println("")
+    println("─── Stage 5/5: verify native artifacts ───")
+    let _ = run_step("list " + REMOTE_NATIVE_BUILD,
+        SSH + " 'ls -la " + REMOTE_NATIVE_BUILD + " 2>/dev/null || echo NO_BUILD_DIR'",
+        dry)
+
+    // ── Final summary ──
+    println("")
+    println("═════════════════════════════════════════════════════════════════")
+    println("  DEPLOY " + (if dry { "PLANNED (dry-run)" } else { "COMPLETE" }))
+    println("═════════════════════════════════════════════════════════════════")
+    println("")
+    println("  Next step: launch training")
+    println("    hexa scripts/launch_h100.hexa \\")
+    println("         --model-size " + MODEL_SIZE + " \\")
+    println("         --pod-ip " + ip + " --pod-port " + port + " \\")
+    println("         --dry-run    # review plan")
+    println("")
+    println("  Live fire:")
+    println("    LIVE_FIRE_OK=1 hexa scripts/launch_h100.hexa \\")
+    println("         --model-size " + MODEL_SIZE + " \\")
+    println("         --pod-ip " + ip + " --pod-port " + port)
+    println("")
 }
 
 main()

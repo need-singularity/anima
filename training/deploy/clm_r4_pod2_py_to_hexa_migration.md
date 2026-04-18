@@ -33,10 +33,13 @@ production-candidate:
 | Launch wrapper | `training/deploy/clm_r4_launch.hexa` | Currently dispatches .py. Needs fork to hexa-native variant. |
 | Binary install | `/usr/local/bin/clm_r4_launch` on pod2 | Installed but currently wraps the .py call |
 
-## 3. Relaunch script (NOT YET CREATED)
+## 3. Relaunch script (SCAFFOLD CREATED 2026-04-18)
 
-Proposed path: `training/deploy/clm_r4_pod2_relaunch_hexa_native.hexa`
-(to be created on user approval). Responsibilities:
+- [x] Scaffold created: `training/deploy/clm_r4_pod2_relaunch_hexa_native.hexa`
+  (supports `--selftest` and `--dry-run` only; live fire gated on
+  `LIVE_FIRE_OK=1` env + explicit user confirmation).
+
+Responsibilities:
 
 1. SSH to pod2 and `tmux kill-session -t clm-r4`
 2. `pkill -f train_clm_1b.py` (idempotent)
@@ -108,8 +111,10 @@ should add a bullet:
 
 - `training/deploy/clm_r4_launch.hexa` (the offending launcher)
 - `training/deploy/clm_r4_pod2_fire_log_20260418_214746.md`
+- `training/deploy/clm_r4_pod2_relaunch_hexa_native.hexa` (scaffold, 2026-04-18)
 - `training/train_clm.hexa` (scale_1_5b)
 - `training/train_clm_gpu.hexa` (USE_FUSED=1 patch)
 - `training/clm_mmap_loader.hexa` (byte mmap)
 - `training/clm_gpu_mfu_unblock_report_20260418.md`
 - commit `0513127b` (MFU breakthrough + pod2 hexa binary install)
+- commits `f64f6af3` + `a4e9e58e` (sister Linux x86_64 hexa_v2 crossbuild)

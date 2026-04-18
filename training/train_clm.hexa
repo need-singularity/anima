@@ -320,32 +320,173 @@ struct Checkpoint {
     phase: int
 }
 
-fn save_checkpoint(path: string, step: int, val_ce: float, phi: float, phase: int) -> Checkpoint {
+// ─── Tensor streaming: append one tensor section to ckpt file ───
+// Mirrors training/gpu_train.hexa:append_tensor_section (2026-04-16 BLAS).
+// Batched append avoids O(P²) string concat for 1.5B params.
+//   Layout per call:  <name> <rows> <cols>\n <v0> <v1> ... <vN>\n
+// Uses append_file (POSIX fopen "a") so each tensor is one O(n) pass.
+let _CKPT_BATCH = 64
+
+fn _ckpt_append_tensor(path: string, name: string, rows: int, cols: int, data: [float]) -> int {
+    let n = rows * cols
+    let _ = append_file(path, name + " " + str(rows) + " " + str(cols) + "\n")
+    let mut batch = ""
+    let mut count = 0
+    let mut i = 0
+    while i < n {
+        if count > 0 { batch = batch + " " }
+        batch = batch + str(data[i])
+        count = count + 1
+        if count >= _CKPT_BATCH {
+            let _ = append_file(path, batch)
+            batch = " "
+            count = 0
+        }
+        i = i + 1
+    }
+    if count > 0 { let _ = append_file(path, batch) }
+    let _ = append_file(path, "\n")
+    return n
+}
+
+fn save_checkpoint(path: string, step: int, model: DecoderModel,
+                   val_ce: float, phi: float, phase: int) -> Checkpoint {
     // RunPod MFS quota rules (training/CLAUDE.md runpod_mfs_quota, 2026-04-16):
     //   1. PRE-SAVE ROTATION: delete ALL existing step_* siblings before new save.
     //      RunPod MooseFS has a ~47GB session quota invisible to `df`. Each 1.5B
     //      ckpt is ~18GB. We keep exactly one live ckpt on disk at peak.
-    //   2. DEFERRED R2 UPLOAD: never rclone inline with torch.save — proven crash
-    //      vector (r3 step2000 + r3b step4000). Append to /workspace/r2_upload_queue.txt
+    //   2. DEFERRED R2 UPLOAD: never rclone inline — proven crash vector
+    //      (r3 step2000 + r3b step4000). Append to /workspace/r2_upload_queue.txt
     //      here; actual rclone runs POST-training from an external script.
-    //   3. NO phi_emergency_ckpt: extra saves on Law 49 violations were the r3b
+    //   3. NO phi_emergency_ckpt: extra saves on Law 49 violations were r3b
     //      second-crash cause. Regular save_every cadence is sufficient.
     //
-    // TODO[pytorch] (when torch.save lands — currently pure data stub):
-    //   # (1) pre-save rotation (matches train_clm_1b.py lines ~762-776)
-    //   import shutil
-    //   ckpt_dir = Path(path).parent
-    //   for old in sorted(ckpt_dir.glob('step_*')):
-    //       shutil.rmtree(old, ignore_errors=True)
-    //   # (2) atomic save
-    //   state = { 'model': model.state_dict(),
-    //             'optimizer': _safe_optimizer_state(optim),  // bf16 master rule
-    //             'scheduler': sched.state_dict(),
-    //             'step': step, 'val_ce': val_ce, 'phi': phi, 'phase': phase }
-    //   atomic_save(state, path + '.tmp'); rename(.tmp, path)
-    //   # (3) DEFERRED r2 queue (no inline rclone)
-    //   queue_append('/workspace/r2_upload_queue.txt',
-    //                f'{path}\tr2:anima-models/{model_tag}/r{round}/step_{step}/')
+    // IMPLEMENTATION (2026-04-18, post-stub):
+    //   Pure-hexa HEXACKPT-v1 text format, mirrors gpu_train.hexa:save_checkpoint_gpu
+    //   and checkpoint_hexa.hexa decoder. Text not binary because hexa's
+    //   write_file uses strlen() (NUL-terminates) and write_bytes needs a boxed
+    //   int array per element (>10× memory blowup for 1.5B params). Text round-
+    //   trips cleanly through existing decode_checkpoint() and survives R2.
+    //
+    //   Disk cost: ~15 chars/float × 1.5B params ≈ 22 GB/ckpt (text).
+    //   MFS quota rule still applies — caller must rotate step_* siblings.
+    //
+    //   Format:
+    //     HEXACKPT-v1\n
+    //     __META__ step=<s> val_ce=<f> phi=<f> phase=<p> n_layer=<nl> vocab=<v> d=<d> d_ff=<ff> rank=<r>\n
+    //     tok_emb <vocab> <d>\n <floats...>\n
+    //     L<i>_Wq <d> <d>\n <floats...>\n         (× n_layer × 9 tensors per block)
+    //     L<i>_Wk <d> <d_kv>\n ...
+    //     L<i>_Wv <d> <d_kv>\n ...
+    //     L<i>_Wo <d> <d>\n ...
+    //     L<i>_ga  1  <d>\n ...                    (gamma_attn)
+    //     L<i>_Wgate <d> <d_ff>\n ...
+    //     L<i>_Wup   <d> <d_ff>\n ...
+    //     L<i>_Wdown <d_ff> <d>\n ...
+    //     L<i>_gf  1  <d>\n ...                    (gamma_ffn)
+    //     gamma_final 1 <d>\n ...
+    //     lmh_U <d> <rank>\n ...
+    //     lmh_V <rank> <vocab>\n ...
+    //     __MANIFEST__ <n_tensors> 1\n
+
+    // (1) pre-save rotation — remove parent step_* siblings. We derive the
+    // parent dir via the "/step_" substring; callers pass .../step_<N>/model
+    // by convention. Safe no-op if path has no step_ prefix.
+    let _mk = exec("mkdir -p \"$(dirname '" + path + "')\" 2>/dev/null")
+    let _rot = exec("find \"$(dirname '" + path + "')\" -maxdepth 2 -name 'step_*' -type d "
+                  + "! -wholename \"$(dirname '" + path + "')\" -exec rm -rf {} + 2>/dev/null")
+
+    // (2) atomic save — write to .tmp then rename
+    let tmp_path = path + ".tmp"
+    let _ = write_file(tmp_path, "HEXACKPT-v1\n")
+    let meta = "__META__"
+             + " step=" + str(step)
+             + " val_ce=" + str(val_ce)
+             + " phi=" + str(phi)
+             + " phase=" + str(phase)
+             + " n_layer=" + str(model.n_layer)
+             + " vocab=" + str(model.vocab)
+             + " d=" + str(model.d)
+             + " d_ff=" + str(model.d_ff)
+             + " n_head=" + str(model.n_head)
+             + " n_kv_head=" + str(model.n_kv_head)
+             + " rank=" + str(model.lmh_rank)
+             + "\n"
+    let _ = append_file(tmp_path, meta)
+
+    let head_dim = model.d / model.n_head
+    let d_kv = model.n_kv_head * head_dim
+    let mut total_params = 0
+    let mut n_tensors = 0
+
+    // Embedding
+    total_params = total_params + _ckpt_append_tensor(tmp_path, "tok_emb",
+                                                      model.vocab, model.d, model.tok_emb)
+    n_tensors = n_tensors + 1
+
+    // Per-block weights (9 tensors each)
+    let mut li = 0
+    while li < model.n_layer {
+        let prefix = "L" + str(li) + "_"
+        let blk = model.blocks[li]
+        total_params = total_params + _ckpt_append_tensor(tmp_path, prefix + "Wq",
+                                                          model.d, model.d, blk.Wq)
+        total_params = total_params + _ckpt_append_tensor(tmp_path, prefix + "Wk",
+                                                          model.d, d_kv, blk.Wk)
+        total_params = total_params + _ckpt_append_tensor(tmp_path, prefix + "Wv",
+                                                          model.d, d_kv, blk.Wv)
+        total_params = total_params + _ckpt_append_tensor(tmp_path, prefix + "Wo",
+                                                          model.d, model.d, blk.Wo)
+        total_params = total_params + _ckpt_append_tensor(tmp_path, prefix + "ga",
+                                                          1, model.d, blk.gamma_attn)
+        total_params = total_params + _ckpt_append_tensor(tmp_path, prefix + "Wgate",
+                                                          model.d, model.d_ff, blk.Wgate)
+        total_params = total_params + _ckpt_append_tensor(tmp_path, prefix + "Wup",
+                                                          model.d, model.d_ff, blk.Wup)
+        total_params = total_params + _ckpt_append_tensor(tmp_path, prefix + "Wdown",
+                                                          model.d_ff, model.d, blk.Wdown)
+        total_params = total_params + _ckpt_append_tensor(tmp_path, prefix + "gf",
+                                                          1, model.d, blk.gamma_ffn)
+        n_tensors = n_tensors + 9
+        li = li + 1
+    }
+
+    // Final norm + LM head (UV decomposition, DD175 #1)
+    total_params = total_params + _ckpt_append_tensor(tmp_path, "gamma_final",
+                                                      1, model.d, model.gamma_final)
+    total_params = total_params + _ckpt_append_tensor(tmp_path, "lmh_U",
+                                                      model.d, model.lmh_rank, model.lmh_U)
+    total_params = total_params + _ckpt_append_tensor(tmp_path, "lmh_V",
+                                                      model.lmh_rank, model.vocab, model.lmh_V)
+    n_tensors = n_tensors + 3
+
+    let _ = append_file(tmp_path, "__MANIFEST__ " + str(n_tensors) + " 1\n")
+
+    // (3) atomic rename tmp → final
+    let _rn = exec("mv '" + tmp_path + "' '" + path + "'")
+
+    // (4) sidecar meta.json for quick resume-state inspection
+    let meta_path = path + ".meta.json"
+    let meta_json = "{\"step\":" + str(step)
+                  + ",\"val_ce\":" + str(val_ce)
+                  + ",\"phi\":" + str(phi)
+                  + ",\"phase\":" + str(phase)
+                  + ",\"n_tensors\":" + str(n_tensors)
+                  + ",\"total_params\":" + str(total_params)
+                  + ",\"format\":\"HEXACKPT-v1\"}"
+    let _ = write_file(meta_path, meta_json)
+
+    // (5) DEFERRED R2 queue — external rclone consumes this post-training
+    let r2_line = path + "\tr2:anima-models/clm/step_" + str(step) + "/\n"
+    let _ = append_file("/workspace/r2_upload_queue.txt", r2_line)
+
+    println("[save_checkpoint] OK path=", path,
+            " step=", step,
+            " n_tensors=", n_tensors,
+            " total_params=", total_params,
+            " val_ce=", val_ce,
+            " phi=", phi,
+            " phase=", phase)
     Checkpoint { path: path, step: step, val_ce: val_ce, phi: phi, phase: phase }
 }
 
@@ -1444,16 +1585,16 @@ fn decoder_backward(
     let mut new_emb = model.tok_emb
     let emb_lr = lr * 0.1
     let h0_grad = dL_dx  // gradient at block 0 input = embedding output grad
-    i = 0
-    while i < seq {
-        let tok = targets[i]  // use target tokens for teacher forcing alignment
+    let mut i_emb = 0
+    while i_emb < seq {
+        let tok = targets[i_emb]  // use target tokens for teacher forcing alignment
         let mut p = 0
         while p < d {
             let idx = tok * d + p
-            new_emb[idx] = new_emb[idx] - emb_lr * h0_grad[i * d + p]
+            new_emb[idx] = new_emb[idx] - emb_lr * h0_grad[i_emb * d + p]
             p = p + 1
         }
-        i = i + 1
+        i_emb = i_emb + 1
     }
 
     // 8. Assemble updated model
@@ -2338,8 +2479,12 @@ fn train_scale(cfg: ScaleConfig, corpus_path: string, total_steps: int) -> Train
                     " l_gwt=", result.l_gwt)
         }
         if step % DEFAULT_CKPT_EVERY == 0 {
+            // Per-step dir so MFS-quota rotation (_rot in save_checkpoint)
+            // finds sibling step_* directories. Caller's parent dir is
+            // dirname(corpus_path), scheme: <parent>/step_<N>/ckpt
+            let ckpt_path = corpus_path + ".ckpt.step_" + str(step)
             let ckpt = save_checkpoint(
-                corpus_path + ".ckpt", step,
+                ckpt_path, step, model,
                 result.loss, 0.0, state.pm.phase
             )
         }

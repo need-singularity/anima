@@ -1,82 +1,56 @@
 // training/corpus_loader.hexa — File-based corpus loader for CLM/ALM
 //
 // Loads pre-tokenized corpus from a text file.
-// Supported formats:
-//   (A) one integer per line   (preferred — O(n), fast)
-//   (B) space-separated integers on one line (legacy — auto-detected)
+// Supported format (ONLY, as of 2026-04-19):
+//   (A) one integer per line   (O(n), fast)
 //
-// Preparation (on H100 server):
-//   # Format A — one integer per line (recommended):
+// DEPRECATED 2026-04-19: the legacy space-separated single-line format
+// (auto-detected via first_line.contains(" ")) was hard-removed. On
+// corpora >100K tokens split_ws() was O(n²) and hung the loader
+// indefinitely. No recent commits indicate live users. If you have a
+// space-separated file, re-encode it once:
+//
+//   # Legacy space-separated → line-based (one-time migration):
+//   python3 -c "
+//   import sys; [print(t) for t in open(sys.argv[1]).read().split()]
+//   " /workspace/corpus.tok > /workspace/corpus_lines.tok
+//
+// Preparation (on H100 server), line-based:
 //   python3 -c "
 //   text = open('corpus.txt','rb').read()
 //   print('\n'.join(str(b) for b in text))
 //   " > /workspace/corpus.tok
-//
-//   # Convert legacy space-separated → line-based:
-//   python3 -c "
-//   import sys; [print(t) for t in open(sys.argv[1]).read().split()]
-//   " /workspace/corpus.tok > /workspace/corpus_lines.tok
 //
 // Usage in training scripts:
 //   use "corpus_loader"
 //   let corpus = load_corpus("/workspace/corpus.tok")
 //   let window = corpus_window(corpus, start, SEQ)
 
-// ─── Whitespace split (shared with eval_clm) ────────────────
-// PERF FIX 2026-04-12: replaced O(n²) char-by-char concat (cur = cur + ch)
-// with native .split(" ") built-in. The old version hung for >5 min on 63K
-// tokens because hexa string concat is O(n) per character in interpreter.
-
-fn split_ws(s: string) -> [string] {
-    // Use native .split(" ") — runs in host language, not interpreted.
-    // Then filter empty strings from consecutive spaces/leading/trailing.
-    let raw_parts = s.split(" ")
-    let n = len(raw_parts)
-    let mut parts = []
-    let mut i = 0
-    while i < n {
-        let p = raw_parts[i].trim()
-        if p != "" {
-            parts = parts.push(p)
-        }
-        i = i + 1
-    }
-    return parts
-}
-
 // ─── Load pre-tokenized corpus ──────────────────────────────
 // PERF FIX 2026-04-12: O(n²) → O(n) for line-based format.
-// Old: read_file → split_ws (char-by-char O(n²)) → push loop (O(n²) list copy)
-// New: read_lines (native built-in) → to_int per line → push loop
-// The read_lines built-in returns [string] directly from the host runtime,
-// avoiding the interpreted split_ws entirely. Auto-detects format by
-// checking if the first line contains a space.
+// DEPRECATION 2026-04-19: legacy auto-detect + split_ws() branch
+// removed. load_corpus now hard-errors on any first line that
+// contains a space, instead of silently falling into the O(n²) path.
 
 fn load_corpus(path: string) -> [int] {
     println("[corpus] loading: " + path)
     let lines = read_lines(path)
     let n_lines = len(lines)
 
-    // ── Auto-detect format ──
-    // Line-based (A): each line is a single integer (no spaces)
-    // Space-separated (B): first line contains spaces between integers
+    // ── Deprecation gate: refuse legacy space-separated format ──
+    // Rationale: the legacy single-line space-separated format forced
+    // a read_file → split_ws() path that was O(n²) in the interpreter
+    // and hung on >100K token corpora. Rather than keep a trap for
+    // future callers, we fail loud and point at the one-line python
+    // migration in the header comment.
     let first_line = if n_lines > 0 { lines[0].trim() } else { "" }
-    let is_legacy = first_line.contains(" ")
-
-    if is_legacy {
-        // Legacy space-separated format: use native .split(" ")
-        println("[corpus] detected legacy space-separated format")
-        let raw = read_file(path)
-        let parts = split_ws(raw)
-        let n = len(parts)
-        let mut tokens = []
-        let mut i = 0
-        while i < n {
-            tokens = tokens.push(to_int(parts[i]))
-            i = i + 1
-        }
-        println("[corpus] loaded " + str(n) + " tokens from " + path)
-        return tokens
+    if first_line.contains(" ") {
+        println("[corpus] ERROR: legacy space-separated format is deprecated (2026-04-19)")
+        println("[corpus]        first line contained spaces → refusing to load.")
+        println("[corpus]        re-encode to line-based format once, then retry:")
+        println("[corpus]          python3 -c \"import sys; [print(t) for t in open(sys.argv[1]).read().split()]\" \\")
+        println("[corpus]            " + path + " > " + path + ".lines")
+        panic("corpus_loader: legacy space-separated format deprecated — re-encode to line-based")
     }
 
     // Line-based format: one integer per line — O(n)

@@ -58,7 +58,14 @@ fn encode_checkpoint(tensors) {
 
 // ── Decoder: text → tensors ──────────────────────────────
 // Parses a serialized checkpoint string back into the tuple format.
-// Returns: [tensors_array, total_params, n_tensors] or empty on error.
+// Happy path: [tensors_array, total_params, n_tensors]
+// Error path: ["error", <reason_string>] — caller MUST check
+// is_decode_error() before indexing [0]/[1]/[2].
+//
+// DEFENSIVE FIX 2026-04-19: previously returned [[], 0, 0] on parse
+// failure, which silently propagated an empty model and crashed
+// downstream at step N+1 tensor index. Now returns a distinct
+// error tuple so callers fail loud.
 fn make_decode_result(tensors, total, n_t) {
     let mut r = []
     r = r.push(tensors)
@@ -67,16 +74,30 @@ fn make_decode_result(tensors, total, n_t) {
     return r
 }
 
+fn make_decode_error(reason) {
+    let mut r = []
+    r = r.push("error")
+    r = r.push(reason)
+    return r
+}
+
+fn is_decode_error(result) {
+    // Error tuples have "error" string as [0]; happy tuples have an array.
+    if len(result) < 1 { return 1 }
+    let tag = result[0]
+    return tag == "error"
+}
+
 fn decode_checkpoint(text) {
     let n = len(text)
     if n < 11 {
-        return make_decode_result([], 0, 0)
+        return make_decode_error("checkpoint too short (< 11 bytes, need magic)")
     }
     // Verify magic
     let magic = text.substring(0, 11)
     if magic != MAGIC {
         println("[checkpoint] bad magic: '" + magic + "' expected '" + MAGIC + "'")
-        return make_decode_result([], 0, 0)
+        return make_decode_error("bad magic header (not a HEXACKPT-v1 file)")
     }
 
     // Walk lines, header → data interleaved.
@@ -175,7 +196,21 @@ fn save_checkpoint(path, tensors) {
 }
 
 fn load_checkpoint(path) {
+    // DEFENSIVE FIX 2026-04-19: guard against missing/empty/corrupt
+    // checkpoint file. Previously `read_file(path)` on a missing path
+    // returned "" and decode_checkpoint silently produced [[], 0, 0],
+    // which propagated an empty model and crashed at step N+1 tensor
+    // index inside the training loop. Now returns a distinct error
+    // tuple — caller MUST check is_decode_error() and fail loud.
+    if file_exists(path) == false {
+        println("[checkpoint] load FAILED: file not found: " + path)
+        return make_decode_error("file not found: " + path)
+    }
     let text = read_file(path)
+    if len(text) == 0 {
+        println("[checkpoint] load FAILED: empty file: " + path)
+        return make_decode_error("empty file: " + path)
+    }
     return decode_checkpoint(text)
 }
 
@@ -241,6 +276,13 @@ fn main() {
 
     // Load + verify
     let loaded = load_checkpoint(path)
+    // DEFENSIVE FIX 2026-04-19: fail loud on decode error instead of
+    // silently indexing [0]/[1]/[2] into an error tuple.
+    if is_decode_error(loaded) {
+        println("  [FAIL] load_checkpoint error: " + str(loaded[1]))
+        println("═══ FAIL ═══")
+        return
+    }
     let tensors = loaded[0]
     let total = loaded[1]
     let n = loaded[2]

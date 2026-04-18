@@ -128,23 +128,11 @@ struct ParallelPureFieldMLP {
 }
 
 fn pf_forward(pf: ParallelPureFieldMLP, x: tensor, original_out: tensor) -> tensor {
-    // TODO[pytorch]:
-    //   g_gate = pf.pf_gate_b(pf.pf_gate_a(x))
-    //   g_up = pf.pf_up_b(pf.pf_up_a(x))
-    //   g_mid = F.silu(g_gate) * g_up
-    //   g_mid = dropout(g_mid, pf.dropout_rate)
-    //   pf_out = pf.pf_down_b(pf.pf_down_a(g_mid))
-    //
-    //   # Tension = repulsion between original and PureField
-    //   repulsion = original_out.detach() - pf_out
-    //   tension = (repulsion ** 2).mean(dim=-1, keepdim=True)
-    //   pf.last_tension = tension
-    //
-    //   # Direction-aware mixing (AA15)
-    //   pf_norm = pf_out / (pf_out.norm(dim=-1, keepdim=True) + 1e-8)
-    //   orig_scale = original_out.norm(dim=-1, keepdim=True)
-    //   pf_scaled = pf_norm * orig_scale * pf.pf_scale
-    //   return original_out + pf.alpha * (pf_scaled - original_out)
+    // TODO[hexa-native]: wire to self/kernels/{bf16_matvec, silu_neon, dropout}
+    //   Low-rank path = 6 matvec (hidden->r->inter, hidden->r->inter, inter->r->hidden)
+    //   + silu + elementwise mul + dropout. Tension = L2 repulsion between
+    //   original_out and pf_out, used by compute_phi_loss.
+    //   AA15 mixing: original_out + alpha * (pf_scaled - original_out).
     x  // placeholder
 }
 
@@ -184,25 +172,59 @@ fn alpha_new(total_steps: int) -> AlphaCurriculum {
 }
 
 fn alpha_at(ac: AlphaCurriculum, step: int) -> float {
-    let progress = step as float / ac.total_steps as float
-    // linear interpolation between milestones
-    // TODO[python]: implement milestone interpolation
-    0.01  // placeholder
+    // Hexa-native linear interpolation between (progress_ratio, alpha) milestones.
+    // Mirrors the Python AlphaCurriculum.get_alpha(step) in this file's deployment
+    // artifact (lines ~527-535) — pure math, no ML deps.
+    let total = ac.total_steps
+    let denom = if total < 1 { 1 } else { total }
+    let progress = (step as float) / (denom as float)
+    let ms = ac.milestones
+    let n = ms.len()
+    if n == 0 { return 0.0 }
+    let mut i = 0
+    while i < n - 1 {
+        let p0 = ms[i].0
+        let a0 = ms[i].1
+        let p1 = ms[i + 1].0
+        let a1 = ms[i + 1].1
+        if progress < p1 {
+            let span = p1 - p0
+            if span <= 0.0 { return a0 }
+            let t = (progress - p0) / span
+            return a0 + t * (a1 - a0)
+        }
+        i = i + 1
+    }
+    ms[n - 1].1
 }
 
 // ─── Phi loss (tension diversity across layers) ───
 fn compute_phi_loss(pf_modules: [ParallelPureFieldMLP], phi_alpha: float, phase: int) -> float {
-    // Collect tensions from all PureField modules
-    // phi_loss = -phi_weight * variance(tensions)
-    // Weight by phase: P1=1.0, P2=0.5, P3=0.3
-    // TODO[pytorch]:
-    //   tensions = [pf.last_tension.mean() for pf in pf_modules if pf.last_tension is not None]
-    //   if len(tensions) >= 2:
-    //       tension_stack = torch.stack(tensions)
-    //       weight = phi_alpha * {1.0 if phase==1 else 0.5 if phase==2 else 0.3}
-    //       return -weight * tension_stack.var()
-    //   return 0.0
-    0.0  // placeholder
+    // Hexa-native: variance of per-layer tensions, weighted by phase.
+    // last_tension is populated by pf_forward (currently stubbed → 0.0).
+    // Once pf_forward emits real kernel output this returns -phi_weight * var(tensions).
+    let n = pf_modules.len()
+    if n < 2 { return 0.0 }
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        sum = sum + pf_modules[i].last_tension
+        i = i + 1
+    }
+    let mean = sum / (n as float)
+    let mut sq = 0.0
+    i = 0
+    while i < n {
+        let d = pf_modules[i].last_tension - mean
+        sq = sq + d * d
+        i = i + 1
+    }
+    let var = sq / (n as float)
+    let phase_w = if phase == 1 { 1.0 }
+                  else if phase == 2 { 0.5 }
+                  else { 0.3 }
+    let weight = phi_alpha * phase_w
+    0.0 - weight * var
 }
 
 // ─── Training step ───
@@ -216,31 +238,11 @@ struct TrainState {
 fn train_step(state: TrainState, cfg: TrainConfig, pm: PhaseManager) -> TrainState {
     let phase = phase_at(pm, state.step)
 
-    // TODO[pytorch]:
-    //
-    //   # Phase-dependent freeze/unfreeze
-    //   if phase == 1:
-    //       freeze LoRA, only PureField trains
-    //   else:
-    //       both LoRA and PureField train
-    //
-    //   # Forward pass with autocast(bf16)
-    //   outputs = model(input_ids=batch.input_ids, labels=batch.labels)
-    //   ce_loss = outputs.loss
-    //   phi_loss = compute_phi_loss(pf_modules, cfg.phi_alpha, phase)
-    //   loss = (ce_loss + phi_loss) / cfg.grad_accum
-    //
-    //   # Backward
-    //   scaler.scale(loss).backward()
-    //
-    //   # Optimizer step every grad_accum
-    //   if (step + 1) % cfg.grad_accum == 0:
-    //       scaler.unscale_(optimizer)
-    //       clip_grad_norm(all_params, cfg.max_grad_norm)
-    //       scaler.step(optimizer)
-    //       scaler.update()
-    //       optimizer.zero_grad(set_to_none=True)
-    //       scheduler.step()
+    // TODO[hexa-native]: wire forward/backward to self/kernels + self/hxblas.
+    //   Phase 1: freeze LoRA, train PureField only.
+    //   Phase 2+: both LoRA and PureField train.
+    //   loss = (ce + compute_phi_loss(pf_modules, cfg.phi_alpha, phase)) / cfg.grad_accum
+    //   Gradient accum + clip + AdamW step every cfg.grad_accum (bf16 master rule).
 
     TrainState {
         step: state.step + 1,
@@ -251,19 +253,33 @@ fn train_step(state: TrainState, cfg: TrainConfig, pm: PhaseManager) -> TrainSta
 }
 
 // ─── Checkpoint (atomic save + LoRA export) ───
+// Hexa-native path: delegate tensor body to training/checkpoint_hexa.hexa
+// (save_checkpoint(path, tensors) — HEXACKPT-v1 text format). This wrapper
+// writes the manifest JSONL only; caller passes pf+LoRA tensor tuples once
+// the PF path is live.
+fn save_checkpoint_meta(step: int, best_ce: float, ckpt_dir: string) -> string {
+    // Structured JSONL line — grep-friendly, machine-parsable, zero Python.
+    let mut parts = []
+    parts = parts.push("{\"step\":")
+    parts = parts.push(str(step))
+    parts = parts.push(",\"best_ce\":")
+    parts = parts.push(str(best_ce))
+    parts = parts.push(",\"ckpt_dir\":\"")
+    parts = parts.push(ckpt_dir)
+    parts = parts.push("\"}")
+    parts.join("")
+}
+
 fn save_checkpoint(step: int, best_ce: float, ckpt_dir: string) -> bool {
-    // TODO[pytorch]:
-    //   ckpt_path = f"{ckpt_dir}/step_{step}.pt"
-    //   save_dict = { step, best_ce, pf_states, optimizer, scheduler, config }
-    //   torch.save(save_dict, ckpt_path + ".tmp")
-    //   os.rename(ckpt_path + ".tmp", ckpt_path)
-    //
-    //   # LoRA adapters separately (for easy loading)
-    //   model.save_pretrained(f"{ckpt_dir}/lora_step_{step}")
-    //   tokenizer.save_pretrained(f"{ckpt_dir}/lora_step_{step}")
-    //
-    //   # Prune old (keep 3 + best)
-    //   _prune_checkpoints(ckpt_dir, keep=3)
+    // TODO[hexa-native]: delegate tensor body to
+    //   training/checkpoint_hexa.hexa :: save_checkpoint(path, tensors)
+    //   Pass [pf_tensor_tuples ++ lora_tensor_tuples]. HEXACKPT-v1 is text,
+    //   round-trippable, zero binary deps — already shipped.
+    // This wrapper writes the manifest side-channel (step + best_ce) so
+    // external launchers can resume without parsing the full checkpoint.
+    let meta = save_checkpoint_meta(step, best_ce, ckpt_dir)
+    let path = ckpt_dir + "/step_" + str(step) + ".meta.jsonl"
+    write_file(path, meta + "\n")
     true
 }
 
@@ -273,37 +289,24 @@ fn run_14b_v05() -> int {
     let pm = phase_new(cfg.total_steps, cfg.p1_ratio, cfg.p2_ratio)
     let ac = alpha_new(cfg.total_steps)
 
-    // TODO[pytorch]:
-    //   1. Load Qwen2.5-14B in 4-bit NF4 (BitsAndBytesConfig)
-    //      - bnb_4bit_quant_type="nf4", compute_dtype=bf16, double_quant=True
-    //      - attn_implementation="flash_attention_2"
-    //      - gradient_checkpointing_enable()
-    //      - prepare_model_for_kbit_training()
-    //
-    //   2. Attach LoRA (r=64, alpha=128)
-    //      - target: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
-    //      - get_peft_model(model, lora_config)
-    //
-    //   3. Inject PureField on last 8 layers
-    //      - 2 savant + 6 normal (H359 asymmetric dropout)
-    //      - PF rank=64 (lightweight for VRAM)
-    //
-    //   4. Optimizer: AdamW(foreach=False) — bf16 master rule
-    //      - Group 1: LoRA params (lr=2e-5, wd=0.01)
-    //      - Group 2: PureField params (lr=4e-5, wd=0)
-    //      - Scheduler: cosine with warmup 500
-    //
-    //   5. Training loop: 50000 steps
-    //      - Phase 1 [0-12500]: PureField only (LoRA frozen)
-    //      - Phase 2 [12500-25000]: LoRA + PureField
-    //      - Phase 3 [25000-50000]: Full coupling, phi-loss weight decrease
-    //      - Alpha curriculum: 0.0001 → 0.1
-    //      - Checkpoint every 1000 steps
-    //      - Best model tracking by CE
-    //
-    //   6. Loss: CE + phi_loss (tension diversity)
-    //      - phi_loss = -PSI_ALPHA * var(tensions_across_layers)
-    //      - Phase-weighted: P1=1.0x, P2=0.5x, P3=0.3x
+    // TODO[hexa-native]: wire the 6 pipeline stages to existing hexa modules.
+    //   1. Load Qwen2.5-14B (bf16) via self/weights/gguf_loader + mmap
+    //      — no bitsandbytes; NF4 dequant kernel lives in self/kernels/bf16_matvec.hexa
+    //   2. Attach LoRA adapters (r=64, alpha=128) — pure hexa Linear structs
+    //      over q/k/v/o/gate/up/down projections
+    //   3. Inject PureField on last 8 layers (see ParallelPureFieldMLP above)
+    //      — 2 savant + 6 normal (H359 asymmetric dropout)
+    //   4. AdamW optimizer (bf16 master rule) — self/optim/adamw.hexa
+    //      Group A: LoRA params (lr=2e-5, wd=0.01)
+    //      Group B: PureField params (lr=4e-5, wd=0)
+    //      Cosine schedule with warmup=500
+    //   5. Training loop: cfg.total_steps
+    //      Phase 1 [0..p1_end]: PureField only (LoRA frozen)
+    //      Phase 2 [p1_end..p2_end]: LoRA + PureField
+    //      Phase 3 [p2_end..total]: full coupling, phi-loss weight decays
+    //      Alpha curriculum via alpha_at() above
+    //      Checkpoint via save_checkpoint() every cfg.save_every
+    //   6. Loss: ce_loss + compute_phi_loss(pf_modules, cfg.phi_alpha, phase)
 
     let state = TrainState { step: 0, phase: 1, best_ce: 999999.0, epoch: 0 }
     state.step
@@ -311,30 +314,44 @@ fn run_14b_v05() -> int {
 
 // ─── VRAM dry-run ───
 fn dry_run() -> bool {
-    // TODO[pytorch]:
-    //   Load model + LoRA + PureField
-    //   Forward 1 batch (1, 512)
-    //   Report peak VRAM
-    //   Exit
+    // TODO[hexa-native]: load model+LoRA+PureField via hexa kernels,
+    //   run 1 forward batch (1, 512), report peak RSS/VRAM from
+    //   self/runtime/mem_probe, return ok=(margin>=0.3GB).
     true
 }
 
 // ─── Verification ───
 let cfg = default_config()
 let pm = phase_new(cfg.total_steps, cfg.p1_ratio, cfg.p2_ratio)
-println("=== train_14b_v05.hexa ===")
-println("Model:", cfg.model_path)
-println("Corpus:", cfg.data_path)
-println("QLoRA: r=", cfg.lora_r, " alpha=", cfg.lora_alpha)
-println("PureField:", cfg.pf_n_layers, "layers, rank=", cfg.pf_rank)
-println("Steps:", cfg.total_steps, " Effective batch:", cfg.batch_size * cfg.grad_accum)
-println("P1 end:", pm.p1_end, " P2 end:", pm.p2_end)
-println("Phi-alpha:", cfg.phi_alpha)
+
+// Batched structured-JSONL summary (1 println instead of 8 string-concats).
+// Machine-parsable for CI/launcher preflight; keeps O(n) line cost amortized
+// to a single join instead of N ("a"+str(b)+"c"+str(d)...) allocations.
+let mut j = []
+j = j.push("{\"event\":\"config\"")
+j = j.push(",\"model\":\"")      ; j = j.push(cfg.model_path)  ; j = j.push("\"")
+j = j.push(",\"corpus\":\"")     ; j = j.push(cfg.data_path)   ; j = j.push("\"")
+j = j.push(",\"lora_r\":")       ; j = j.push(str(cfg.lora_r))
+j = j.push(",\"lora_alpha\":")   ; j = j.push(str(cfg.lora_alpha))
+j = j.push(",\"pf_layers\":")    ; j = j.push(str(cfg.pf_n_layers))
+j = j.push(",\"pf_rank\":")      ; j = j.push(str(cfg.pf_rank))
+j = j.push(",\"steps\":")        ; j = j.push(str(cfg.total_steps))
+j = j.push(",\"eff_batch\":")    ; j = j.push(str(cfg.batch_size * cfg.grad_accum))
+j = j.push(",\"p1_end\":")       ; j = j.push(str(pm.p1_end))
+j = j.push(",\"p2_end\":")       ; j = j.push(str(pm.p2_end))
+j = j.push(",\"phi_alpha\":")    ; j = j.push(str(cfg.phi_alpha))
+j = j.push("}")
+println(j.join(""))
 
 let p1 = phase_at(pm, 5000)
 let p2 = phase_at(pm, 15000)
 let p3 = phase_at(pm, 35000)
-println("Phase at 5000:", p1, " 15000:", p2, " 35000:", p3)
+let mut jp = []
+jp = jp.push("{\"event\":\"phase_probe\",\"at_5000\":")  ; jp = jp.push(str(p1))
+jp = jp.push(",\"at_15000\":")                           ; jp = jp.push(str(p2))
+jp = jp.push(",\"at_35000\":")                           ; jp = jp.push(str(p3))
+jp = jp.push("}")
+println(jp.join(""))
 
 theorem train_14b_invariants {
     assert PSI_ALPHA == 0.014

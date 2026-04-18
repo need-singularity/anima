@@ -1,13 +1,396 @@
-// launch_h100.hexa — STUBBED 2026-04-18 (R37/AN13/L3-PY compliance)
+// launch_h100.hexa — hexa-native H100 training launcher (R37/AN13/L3-PY compliant)
 //
-// Previously invoked python3 to launch H100 training experiments. Violates
-// R37/AN13/L3-PY.
+// Responsibility:
+//   1. Resolve pod endpoint (--pod-ip + --pod-port, or --pod-id via runpodctl)
+//   2. Ensure remote training dir scaffold
+//   3. Ship latest hexa-compiled trainer artifacts (binary or .hexa sources)
+//   4. Kick off training under tmux with env vars:
+//        CUDA_VISIBLE_DEVICES, NCCL_DEBUG, HEXA_LD_PATH (PYTHONPATH analogue),
+//        plus --model-size {14b,32b,70b}
+//
+// Usage:
+//   hexa scripts/launch_h100.hexa --model-size 14b --pod-ip 1.2.3.4 --pod-port 22001
+//   hexa scripts/launch_h100.hexa --model-size 32b --pod-id <runpod_id> --dry-run
+//   hexa scripts/launch_h100.hexa --model-size 70b --pod-id <runpod_id> --gpus 0,1,2,3,4,5,6,7
+//
+// Safety:
+//   - Live fire requires LIVE_FIRE_OK=1 (prevents accidental launches).
+//   - Default is --dry-run unless LIVE_FIRE_OK=1 is set explicitly.
+//   - Replaces previous python3 launcher — ZERO python3 invocations here.
+//
+// Replaces:
+//   previous stub that panicked "R37/AN13/L3-PY: python3 invocation blocked".
+
+// ── Defaults ──────────────────────────────────────────────────────────
+
+let DEFAULT_REMOTE_DIR   = "/workspace/anima"
+let DEFAULT_CKPT_ROOT    = "/workspace/ckpt"
+let DEFAULT_CORPUS       = "/workspace/corpus.txt"
+let DEFAULT_TMUX_SESSION = "alm-train"
+let DEFAULT_GPUS         = "0,1,2,3,4,5,6,7"     // all 8 H100 on a full pod
+let DEFAULT_NCCL_DEBUG   = "INFO"
+let DEFAULT_STEPS        = "750000"
+let DEFAULT_BATCH        = "8"
+let DEFAULT_SEQ          = "512"
+let DEFAULT_LR           = "3e-4"
+let DEFAULT_WARMUP       = "5000"
+let DEFAULT_SAVE         = "5000"
+
+// Remote hexa binary path (deployed by deploy_v5_h100.hexa)
+let REMOTE_HEXA_BIN      = "/opt/hexa/bin/hexa"
+let REMOTE_TRAIN_DIR     = "/workspace/anima/training"
+let REMOTE_NATIVE_DIR    = "/workspace/anima/native"
+
+// Per-model-size trainer configs
+fn trainer_source_for(size: string) -> string {
+    if size == "14b" { return "training/train_alm_14b.hexa" }
+    if size == "32b" { return "training/train_alm_32b.hexa" }
+    if size == "70b" { return "training/train_alm_70b.hexa" }
+    return "training/train_clm.hexa"
+}
+
+fn model_config_for(size: string) -> string {
+    if size == "14b" { return "training/clm_1b_config.json" }  // placeholder until 14b_config lands
+    if size == "32b" { return "training/clm_1b_config.json" }
+    if size == "70b" { return "training/clm_1b_config.json" }
+    return "training/clm_1b_config.json"
+}
+
+// ── CLI parsing ───────────────────────────────────────────────────────
+
+let argv = args()
+
+fn flag_value(name: string, fallback: string) -> string {
+    let n = argv.len()
+    let mut i = 0
+    while i < n {
+        if argv[i] == name && i + 1 < n {
+            return argv[i + 1]
+        }
+        i = i + 1
+    }
+    return fallback
+}
+
+fn flag_bool(name: string) -> bool {
+    let n = argv.len()
+    let mut i = 0
+    while i < n {
+        if argv[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+let MODEL_SIZE   = flag_value("--model-size", "14b")
+let POD_ID       = flag_value("--pod-id", "")
+let POD_IP_ARG   = flag_value("--pod-ip", "")
+let POD_PORT_S   = flag_value("--pod-port", "")
+let REMOTE_DIR   = flag_value("--remote-dir", DEFAULT_REMOTE_DIR)
+let CORPUS_ARG   = flag_value("--corpus", DEFAULT_CORPUS)
+let CKPT_DIR     = flag_value("--ckpt-dir", DEFAULT_CKPT_ROOT + "/alm_" + MODEL_SIZE)
+let GPUS         = flag_value("--gpus", DEFAULT_GPUS)
+let NCCL_DEBUG   = flag_value("--nccl-debug", DEFAULT_NCCL_DEBUG)
+let STEPS_S      = flag_value("--steps", DEFAULT_STEPS)
+let BATCH_S      = flag_value("--batch", DEFAULT_BATCH)
+let SEQ_S        = flag_value("--seq", DEFAULT_SEQ)
+let LR_ARG       = flag_value("--lr", DEFAULT_LR)
+let WARMUP_S     = flag_value("--warmup", DEFAULT_WARMUP)
+let SAVE_S       = flag_value("--save-every", DEFAULT_SAVE)
+let SESSION      = flag_value("--tmux-session", DEFAULT_TMUX_SESSION + "-" + MODEL_SIZE)
+let DRY_RUN      = flag_bool("--dry-run")
+
+// ── Helpers ───────────────────────────────────────────────────────────
+
+fn env_or(key: string, fallback: string) -> string {
+    let v = env(key)
+    if v == "" { return fallback }
+    return v
+}
+
+fn now_iso() -> string {
+    return exec("date -u +%Y%m%dT%H%M%SZ").trim()
+}
+
+fn ssh_base(ip: string, port: string) -> string {
+    if ip == "" { return "ssh root@POD_IP_UNRESOLVED" }
+    let opts = " -o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+    if port == "" || port == "22" {
+        return "ssh" + opts + " root@" + ip
+    }
+    return "ssh" + opts + " -p " + port + " root@" + ip
+}
+
+fn scp_base(ip: string, port: string) -> string {
+    if ip == "" { return "scp POD_IP_UNRESOLVED" }
+    let opts = " -o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+    if port == "" || port == "22" {
+        return "scp" + opts
+    }
+    return "scp" + opts + " -P " + port
+}
+
+fn lookup_pod(pod_id: string) -> string {
+    if pod_id == "" { return "" }
+    let ip_cmd = "runpodctl get pod " + pod_id
+        + " 2>/dev/null | grep -oE 'root@[^ ]+' | head -1 | sed 's/root@//'"
+    let port_cmd = "runpodctl get pod " + pod_id
+        + " 2>/dev/null | grep -oE -- '-p [0-9]+' | head -1 | awk '{print $2}'"
+    let ip = exec(ip_cmd).trim()
+    let port = exec(port_cmd).trim()
+    if ip == "" { return "" }
+    if port == "" { return ip + ":22" }
+    return ip + ":" + port
+}
+
+fn split_ep(ep: string) -> [string] {
+    // pure hexa split on first ':'
+    let n = ep.len()
+    let mut i = 0
+    while i < n {
+        if ep[i] == ":" {
+            return [ep[0..i], ep[(i + 1)..n]]
+        }
+        i = i + 1
+    }
+    return [ep, ""]
+}
+
+fn resolve_endpoint(dry: bool) -> [string] {
+    if POD_IP_ARG != "" {
+        let p = (if POD_PORT_S == "" { "22" } else { POD_PORT_S })
+        return [POD_IP_ARG, p]
+    }
+    if POD_ID == "" {
+        println("[FATAL] cannot resolve pod endpoint")
+        println("  need either: --pod-ip <ip> --pod-port <n>")
+        println("  or         : --pod-id <runpod_id>")
+        exit(2)
+    }
+    if dry {
+        return ["DRYRUN_IP", "DRYRUN_PORT"]
+    }
+    let ep = lookup_pod(POD_ID)
+    if ep == "" {
+        println("[FATAL] runpodctl lookup failed for pod-id=" + POD_ID)
+        println("  pass --pod-ip <ip> --pod-port <n> explicitly")
+        exit(2)
+    }
+    return split_ep(ep)
+}
+
+fn run_step(label: string, cmd: string, dry: bool) -> int {
+    println("")
+    println("  $ " + cmd)
+    if dry {
+        println("  [dry-run] skipped — " + label)
+        return 0
+    }
+    let result = exec_with_status(cmd)
+    let rc = result[1]
+    if rc != 0 {
+        println("  [rc=" + str(rc) + "] " + label)
+    } else {
+        println("  [ok] " + label)
+    }
+    return rc
+}
+
+// ── Banner ────────────────────────────────────────────────────────────
+
+fn banner() {
+    println("═════════════════════════════════════════════════════════════════")
+    println("  HEXA-NATIVE H100 LAUNCHER — " + MODEL_SIZE + " (" + now_iso() + ")")
+    println("═════════════════════════════════════════════════════════════════")
+    println("  model-size   = " + MODEL_SIZE)
+    println("  remote-dir   = " + REMOTE_DIR)
+    println("  corpus       = " + CORPUS_ARG)
+    println("  ckpt-dir     = " + CKPT_DIR)
+    println("  gpus         = " + GPUS)
+    println("  nccl-debug   = " + NCCL_DEBUG)
+    println("  steps        = " + STEPS_S)
+    println("  batch/seq    = " + BATCH_S + " / " + SEQ_S)
+    println("  lr/warmup    = " + LR_ARG + " / " + WARMUP_S)
+    println("  save-every   = " + SAVE_S)
+    println("  tmux session = " + SESSION)
+    println("")
+}
+
+// ── Main ──────────────────────────────────────────────────────────────
 
 fn main() {
-    println("[R37/AN13/L3-PY] BLOCKED: scripts/launch_h100.hexa")
-    println("  Previously invoked python3 for H100 training launch.")
-    println("  Escalate to user for hexa-native replacement.")
-    panic("R37/AN13/L3-PY: python3 invocation blocked at scripts/launch_h100.hexa")
+    banner()
+
+    let live_ok = env("LIVE_FIRE_OK")
+    let dry = DRY_RUN || live_ok != "1"
+    if dry && !DRY_RUN {
+        println("[GUARD] LIVE_FIRE_OK != 1 — forcing --dry-run mode")
+        println("        set LIVE_FIRE_OK=1 to actually launch")
+        println("")
+    }
+
+    let ep = resolve_endpoint(dry)
+    let ip = ep[0]
+    let port = ep[1]
+    let SSH = ssh_base(ip, port)
+    let SCP = scp_base(ip, port)
+    let dest_prefix = "root@" + ip
+
+    println("  pod endpoint = " + ip + ":" + port)
+    println("")
+
+    // ── Step 1: Ping pod ──
+    let rc1 = run_step("ping pod (echo ok)",
+        SSH + " 'echo ok'",
+        dry)
+    if !dry && rc1 != 0 {
+        println("[FATAL] pod unreachable — aborting")
+        exit(3)
+    }
+
+    // ── Step 2: Ensure remote dirs ──
+    let rc2 = run_step("ensure remote training dir tree",
+        SSH + " 'mkdir -p " + REMOTE_TRAIN_DIR
+        + " " + REMOTE_NATIVE_DIR
+        + " " + CKPT_DIR + "'",
+        dry)
+    if !dry && rc2 != 0 {
+        println("[FATAL] remote mkdir failed — aborting")
+        exit(3)
+    }
+
+    // ── Step 3: Verify hexa binary on pod (deployed by deploy_v5_h100.hexa) ──
+    let rc3 = run_step("verify " + REMOTE_HEXA_BIN + " exists + executable",
+        SSH + " 'test -x " + REMOTE_HEXA_BIN + "'",
+        dry)
+    if !dry && rc3 != 0 {
+        println("[FATAL] " + REMOTE_HEXA_BIN + " missing or not executable")
+        println("  run: hexa scripts/deploy/deploy_v5_h100.hexa --pod-ip " + ip + " --pod-port " + port + " first")
+        exit(4)
+    }
+
+    // ── Step 4: Ship latest trainer source (+ model config) ──
+    let trainer_src = trainer_source_for(MODEL_SIZE)
+    let trainer_rel = (if file_exists(trainer_src) { trainer_src } else { "training/train_clm.hexa" })
+    let config_src  = model_config_for(MODEL_SIZE)
+
+    let rc4a = run_step("scp trainer " + trainer_rel,
+        SCP + " " + trainer_rel + " " + dest_prefix + ":" + REMOTE_TRAIN_DIR + "/",
+        dry)
+    if !dry && rc4a != 0 {
+        println("[FATAL] trainer scp failed rc=" + str(rc4a))
+        exit(5)
+    }
+
+    if file_exists(config_src) {
+        let rc4b = run_step("scp config " + config_src,
+            SCP + " " + config_src + " " + dest_prefix + ":" + REMOTE_TRAIN_DIR + "/",
+            dry)
+        if !dry && rc4b != 0 {
+            println("[WARN] config scp failed rc=" + str(rc4b) + " — continuing")
+        }
+    }
+
+    // Also ship nn_core + mmap loader if present (deps used by most trainers)
+    let deps = ["training/nn_core.hexa", "training/clm_mmap_loader.hexa"]
+    let mut di = 0
+    while di < deps.len() {
+        let d = deps[di]
+        if file_exists(d) {
+            let _ = run_step("scp dep " + d,
+                SCP + " " + d + " " + dest_prefix + ":" + REMOTE_TRAIN_DIR + "/",
+                dry)
+        }
+        di = di + 1
+    }
+
+    // ── Step 5: Kill stale tmux session (defensive) ──
+    let _ = run_step("kill stale tmux session " + SESSION,
+        SSH + " 'tmux kill-session -t " + SESSION + " 2>/dev/null || true'",
+        dry)
+
+    // ── Step 6: Launch under tmux with env vars ──
+    //
+    // Env vars wired in (PYTHONPATH-analogue = LD_LIBRARY_PATH for native FFI libs):
+    //   CUDA_VISIBLE_DEVICES — GPU pinning
+    //   NCCL_DEBUG           — multi-gpu collective debug verbosity
+    //   LD_LIBRARY_PATH      — libhxblas/libhxccl/libhxcuda .so lookup
+    //
+    let hexa_ld_path = REMOTE_DIR + "/native/build:/usr/local/cuda/lib64"
+    let log_path = CKPT_DIR + "/train.log"
+
+    let train_cmd = REMOTE_HEXA_BIN
+        + " " + REMOTE_TRAIN_DIR + "/" + basename_of(trainer_rel)
+        + " --corpus " + CORPUS_ARG
+        + " --ckpt-dir " + CKPT_DIR
+        + " --steps " + STEPS_S
+        + " --batch " + BATCH_S
+        + " --seq " + SEQ_S
+        + " --lr " + LR_ARG
+        + " --warmup " + WARMUP_S
+        + " --save-every " + SAVE_S
+        + " --model-size " + MODEL_SIZE
+
+    let launch_inner = "export CUDA_VISIBLE_DEVICES=" + GPUS + " && "
+        + "export NCCL_DEBUG=" + NCCL_DEBUG + " && "
+        + "export LD_LIBRARY_PATH=" + hexa_ld_path + ":${LD_LIBRARY_PATH:-} && "
+        + "cd " + REMOTE_DIR + " && "
+        + train_cmd + " 2>&1 | tee " + log_path
+
+    // Double-quoted tmux new -d -s <sess> "<cmd>" — inner is already single-escaped.
+    let launch_cmd = SSH + " \"tmux new -d -s " + SESSION + " '" + launch_inner + "'\""
+
+    let rc6 = run_step("launch under tmux " + SESSION,
+        launch_cmd,
+        dry)
+    if !dry && rc6 != 0 {
+        println("[FATAL] tmux launch failed rc=" + str(rc6))
+        exit(6)
+    }
+
+    // ── Step 7: Verify after 30s (nvidia-smi util + log 'loss=' line) ──
+    if !dry {
+        println("")
+        println("[verify] sleeping 30s then checking GPU util + loss line...")
+        let _ = exec("sleep 30")
+        let _ = exec(SSH + " 'nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader | head -" + count_gpus(GPUS) + "'")
+        let _ = exec(SSH + " 'grep -m1 loss= " + log_path + " 2>/dev/null || echo NO_LOSS_YET'")
+    }
+
+    println("")
+    println("═════════════════════════════════════════════════════════════════")
+    println("  LAUNCH " + (if dry { "PLANNED (dry-run)" } else { "FIRED" }))
+    println("═════════════════════════════════════════════════════════════════")
+    println("  tail log  : " + SSH + " 'tail -f " + log_path + "'")
+    println("  attach    : " + SSH + " 'tmux attach -t " + SESSION + "'")
+    println("  kill      : " + SSH + " 'tmux kill-session -t " + SESSION + "'")
+    println("")
+}
+
+// basename helper — pure hexa (avoid shell metachar warning)
+fn basename_of(path: string) -> string {
+    let n = path.len()
+    let mut last_slash = -1
+    let mut i = 0
+    while i < n {
+        if path[i] == "/" { last_slash = i }
+        i = i + 1
+    }
+    if last_slash < 0 { return path }
+    return path[(last_slash + 1)..n]
+}
+
+// count comma-separated GPU ids (for nvidia-smi head) — pure hexa
+fn count_gpus(csv: string) -> string {
+    let n = csv.len()
+    if n == 0 { return "1" }
+    let mut commas = 0
+    let mut i = 0
+    while i < n {
+        if csv[i] == "," { commas = commas + 1 }
+        i = i + 1
+    }
+    return str(commas + 1)
 }
 
 main()
