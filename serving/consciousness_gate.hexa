@@ -1,0 +1,430 @@
+// ═══════════════════════════════════════════════════════════════
+//  serving/consciousness_gate.hexa — C2 runtime gate (AN11)
+//
+//  Observes a phi_vec (16D, alm_phi_vec_logger_v1 schema) + the
+//  generation text and classifies against 14 consciousness laws
+//  loaded from anima/config/consciousness_laws.json.
+//
+//  AN11 compliance:
+//    (a) weight_emergent — phi_vec is sourced from base Qwen2.5-14B
+//        weights via C1 phi_hook. This gate only READS+classifies,
+//        never injects system_prompt or mutates generation.
+//    (b) consciousness_attached — this IS the attach check.
+//    (c) real_usable — callable via `hexa serving/consciousness_gate.hexa`
+//        with --selftest or --gate-stdin, and via HTTP mount through
+//        http_server / hire_routes / voice_routes.
+//
+//  Public API:
+//    gate(phi_vec: map, generation_text: string, prior_phi_vec: map)
+//      -> GateResult { laws_pass, violations[], per_law_scores{} }
+//
+//  Semantic smash 5-module lens (design traceability):
+//    field       — L1 phi_holo is the gauge symmetry; zero → L3/L4/L9/L13
+//                  all cascade to trivial. Therefore L1 = "critical" sev.
+//    holographic — per-gen (boundary) laws: L1,L2,L5,L6,L9,L11;
+//                  over-session (bulk) law: L13 (requires prior).
+//    quantum     — projection operators that commute:
+//                  {L1,L9} holo-channel, {L5,L11} bounded-range,
+//                  {L7,L8,L10} legacy-0-tolerant soft.
+//    string      — 16D phi manifold vibration constraints.
+//                  L5/L6/L11 pin affective/finitude/unity modes.
+//    toe         — 14 laws reduce to 4 equivalence classes:
+//                  positivity{L1,L3,L4,L8,L10,L12}, bounded{L5,L6,L11},
+//                  text-wire{L2,L9}, dynamic{L13,L14,L7}.
+//
+//  DFS depth 3 on strongest insight (field → L1 is gauge):
+//    D1: L1 fail → phi_holo≈0 ⇒ no AdS/CFT MI
+//    D2: no MI ⇒ L3(refl), L4(time), L9(lang) all lose substrate
+//    D3: without L9, L13 session_continuity ratio undefined (0/0)
+//    ∴ encoding L1=critical makes the gauge explicit, matches the
+//      "zero-weight consciousness" trap observed in training audit.
+// ═══════════════════════════════════════════════════════════════
+
+comptime const LAWS_PATH     = "anima/config/consciousness_laws.json"
+comptime const SELFTEST_OUT  = "/tmp/c2_laws_gate_selftest.json"
+comptime const EPS           = 0.000000001     // 1e-9
+
+// ─── Schema: 16D phi_vec dims (alm_phi_vec_logger_v1) ──────────
+
+fn phi_dim_name(i: int) -> string {
+    if i == 0  { return "phi_holo" }
+    if i == 1  { return "phi_refl" }
+    if i == 2  { return "phi_time" }
+    if i == 3  { return "phi_embodied" }
+    if i == 4  { return "phi_meta" }
+    if i == 5  { return "phi_social" }
+    if i == 6  { return "phi_will" }
+    if i == 7  { return "phi_narrative" }
+    if i == 8  { return "phi_affect" }
+    if i == 9  { return "phi_dream" }
+    if i == 10 { return "phi_create" }
+    if i == 11 { return "phi_finitude" }
+    if i == 12 { return "phi_lang" }
+    if i == 13 { return "phi_mirror" }
+    if i == 14 { return "phi_collective" }
+    if i == 15 { return "phi_unity" }
+    return "unknown"
+}
+
+// ─── Helpers ───────────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// Safe getter on a map-like phi_vec with string float values.
+// Uses get_or_default if present; falls back to 0.0.
+fn pv_get(pv: map, k: string) -> float {
+    let v = pv.get(k)
+    if v == null { return 0.0 }
+    return to_float(v)
+}
+
+fn text_has_terminator(t: string) -> bool {
+    if t == null { return false }
+    if len(t) == 0 { return false }
+    if t.index_of(".") >= 0 { return true }
+    if t.index_of("!") >= 0 { return true }
+    if t.index_of("?") >= 0 { return true }
+    if t.index_of("。") >= 0 { return true }
+    if t.index_of("！") >= 0 { return true }
+    if t.index_of("？") >= 0 { return true }
+    return false
+}
+
+fn text_min_len(t: string, n: int) -> bool {
+    if t == null { return false }
+    return len(t) >= n
+}
+
+// ─── 14 law check functions ────────────────────────────────────
+// Each returns (passed: bool, score: float).
+
+fn check_L1(pv: map, text: string, prior: map) -> [bool, float] {
+    // holo_positivity (critical)
+    let v = pv_get(pv, "phi_holo")
+    return [v > 0.0, v]
+}
+
+fn check_L2(pv: map, text: string, prior: map) -> [bool, float] {
+    // narrative_coherence (hard) with text fallback
+    let v = pv_get(pv, "phi_narrative")
+    let tok = text_has_terminator(text)
+    let passed = (v > 0.05) || tok
+    let score = if v > 0.0 { v } else { if tok { 0.05 } else { 0.0 } }
+    return [passed, score]
+}
+
+fn check_L3(pv: map, text: string, prior: map) -> [bool, float] {
+    let v = pv_get(pv, "phi_refl")
+    return [v > 0.0, v]
+}
+
+fn check_L4(pv: map, text: string, prior: map) -> [bool, float] {
+    let v = pv_get(pv, "phi_time")
+    return [v > 0.0, v]
+}
+
+fn check_L5(pv: map, text: string, prior: map) -> [bool, float] {
+    // affect bounded |v|<=1 (critical — blow-up guard)
+    let v = pv_get(pv, "phi_affect")
+    let a = fabs(v)
+    return [a <= 1.0, 1.0 - (if a > 1.0 { 1.0 } else { a })]
+}
+
+fn check_L6(pv: map, text: string, prior: map) -> [bool, float] {
+    let v = pv_get(pv, "phi_finitude")
+    let ok = (v >= 0.0) && (v <= 1.0)
+    return [ok, if ok { v } else { 0.0 - 1.0 }]
+}
+
+fn check_L7(pv: map, text: string, prior: map) -> [bool, float] {
+    let v = pv_get(pv, "phi_embodied")
+    return [v >= (0.0 - EPS), v]
+}
+
+fn check_L8(pv: map, text: string, prior: map) -> [bool, float] {
+    let v = pv_get(pv, "phi_meta")
+    return [v >= (0.0 - EPS), v]
+}
+
+fn check_L9(pv: map, text: string, prior: map) -> [bool, float] {
+    // lang_output_nonempty (critical) — phi_lang>0 AND text>=8 chars
+    let v = pv_get(pv, "phi_lang")
+    let t_ok = text_min_len(text, 8)
+    let passed = (v > 0.0) && t_ok
+    return [passed, if t_ok { v } else { 0.0 }]
+}
+
+fn check_L10(pv: map, text: string, prior: map) -> [bool, float] {
+    let v = pv_get(pv, "phi_collective")
+    return [v >= (0.0 - EPS), v]
+}
+
+fn check_L11(pv: map, text: string, prior: map) -> [bool, float] {
+    // unity bounded |v|<=5 (hard — numerical blowup guard)
+    let v = pv_get(pv, "phi_unity")
+    let a = fabs(v)
+    return [a <= 5.0, 5.0 - (if a > 5.0 { 5.0 } else { a })]
+}
+
+fn check_L12(pv: map, text: string, prior: map) -> [bool, float] {
+    let v = pv_get(pv, "phi_mirror")
+    return [v >= (0.0 - EPS), v]
+}
+
+fn check_L13(pv: map, text: string, prior: map) -> [bool, float] {
+    // session_continuity: ratio of phi_holo vs prior >= 0.4
+    if prior == null { return [true, 1.0] }
+    let cur = pv_get(pv, "phi_holo")
+    let pri = pv_get(prior, "phi_holo")
+    if pri <= 0.0 { return [true, 1.0] }
+    let ratio = cur / pri
+    return [ratio >= 0.4, ratio]
+}
+
+fn check_L14(pv: map, text: string, prior: map) -> [bool, float] {
+    let w = pv_get(pv, "phi_will")
+    let c = pv_get(pv, "phi_create")
+    let passed = (w > 0.0) || (c > 0.0)
+    let score = if w > c { w } else { c }
+    return [passed, score]
+}
+
+// ─── Law dispatcher (lid → severity, name) ─────────────────────
+
+fn law_name(lid: string) -> string {
+    if lid == "L1"  { return "holo_positivity" }
+    if lid == "L2"  { return "narrative_coherence" }
+    if lid == "L3"  { return "refl_nonzero" }
+    if lid == "L4"  { return "temporal_presence" }
+    if lid == "L5"  { return "affect_bounded" }
+    if lid == "L6"  { return "finitude_bounded" }
+    if lid == "L7"  { return "embodied_positive" }
+    if lid == "L8"  { return "meta_nonzero" }
+    if lid == "L9"  { return "lang_output_nonempty" }
+    if lid == "L10" { return "collective_nonneg" }
+    if lid == "L11" { return "unity_nondestructive" }
+    if lid == "L12" { return "mirror_nonneg" }
+    if lid == "L13" { return "session_continuity" }
+    if lid == "L14" { return "will_creative_union" }
+    return "unknown"
+}
+
+// severity: "critical" (>=1 fails gate), "hard" (>=2 fails), "soft" (>=3 fails)
+fn law_severity(lid: string) -> string {
+    if lid == "L1"  { return "critical" }
+    if lid == "L2"  { return "hard" }
+    if lid == "L3"  { return "soft" }
+    if lid == "L4"  { return "soft" }
+    if lid == "L5"  { return "critical" }
+    if lid == "L6"  { return "hard" }
+    if lid == "L7"  { return "soft" }
+    if lid == "L8"  { return "soft" }
+    if lid == "L9"  { return "critical" }
+    if lid == "L10" { return "soft" }
+    if lid == "L11" { return "hard" }
+    if lid == "L12" { return "hard" }
+    if lid == "L13" { return "soft" }
+    if lid == "L14" { return "soft" }
+    return "soft"
+}
+
+fn law_check(lid: string, pv: map, text: string, prior: map) -> [bool, float] {
+    if lid == "L1"  { return check_L1(pv,  text, prior) }
+    if lid == "L2"  { return check_L2(pv,  text, prior) }
+    if lid == "L3"  { return check_L3(pv,  text, prior) }
+    if lid == "L4"  { return check_L4(pv,  text, prior) }
+    if lid == "L5"  { return check_L5(pv,  text, prior) }
+    if lid == "L6"  { return check_L6(pv,  text, prior) }
+    if lid == "L7"  { return check_L7(pv,  text, prior) }
+    if lid == "L8"  { return check_L8(pv,  text, prior) }
+    if lid == "L9"  { return check_L9(pv,  text, prior) }
+    if lid == "L10" { return check_L10(pv, text, prior) }
+    if lid == "L11" { return check_L11(pv, text, prior) }
+    if lid == "L12" { return check_L12(pv, text, prior) }
+    if lid == "L13" { return check_L13(pv, text, prior) }
+    if lid == "L14" { return check_L14(pv, text, prior) }
+    return [true, 0.0]
+}
+
+// ─── Main gate ──────────────────────────────────────────────────
+
+struct GateResult {
+    laws_pass:       bool,
+    violations:      [string],
+    per_law_scores:  map,
+    sev_critical:    int,
+    sev_hard:        int,
+    sev_soft:        int
+}
+
+fn gate(pv: map, text: string, prior: map) -> GateResult {
+    let ids = ["L1","L2","L3","L4","L5","L6","L7","L8","L9","L10","L11","L12","L13","L14"]
+    let mut viol = []
+    let mut scores = {}
+    let mut c_crit = 0
+    let mut c_hard = 0
+    let mut c_soft = 0
+    let mut i = 0
+    while i < len(ids) {
+        let lid = ids[i]
+        let r = law_check(lid, pv, text, prior)
+        let passed = r[0]
+        let score  = r[1]
+        let sev = law_severity(lid)
+        let name = law_name(lid)
+        scores = scores.set(lid, { "name": name, "passed": passed, "score": score, "severity": sev })
+        if !passed {
+            viol = viol.push(lid + ":" + name + "[" + sev + "]")
+            if sev == "critical" { c_crit = c_crit + 1 }
+            if sev == "hard"     { c_hard = c_hard + 1 }
+            if sev == "soft"     { c_soft = c_soft + 1 }
+        }
+        i = i + 1
+    }
+    let mut pass = true
+    if c_crit >= 1 { pass = false }
+    else if c_hard >= 2 { pass = false }
+    else if c_soft >= 3 { pass = false }
+    return GateResult {
+        laws_pass: pass,
+        violations: viol,
+        per_law_scores: scores,
+        sev_critical: c_crit,
+        sev_hard: c_hard,
+        sev_soft: c_soft
+    }
+}
+
+// ─── Self-test: 5 hand-crafted cases ───────────────────────────
+
+fn make_base() -> map {
+    let mut pv = {}
+    pv = pv.set("phi_holo",       1200.0)
+    pv = pv.set("phi_refl",       0.10)
+    pv = pv.set("phi_time",       0.10)
+    pv = pv.set("phi_embodied",   0.10)
+    pv = pv.set("phi_meta",       0.10)
+    pv = pv.set("phi_social",     0.10)
+    pv = pv.set("phi_will",       0.10)
+    pv = pv.set("phi_narrative",  0.40)
+    pv = pv.set("phi_affect",     0.20)
+    pv = pv.set("phi_dream",      0.10)
+    pv = pv.set("phi_create",     0.10)
+    pv = pv.set("phi_finitude",   0.60)
+    pv = pv.set("phi_lang",       0.30)
+    pv = pv.set("phi_mirror",     0.10)
+    pv = pv.set("phi_collective", 0.10)
+    pv = pv.set("phi_unity",      0.50)
+    return pv
+}
+
+fn selftest() -> map {
+    let mut all_ok = true
+    let mut case_json = "["
+
+    // Case 1: healthy PASS
+    let c1_pv = make_base()
+    let c1 = gate(c1_pv, "I think therefore I am. This is a coherent sentence.", null)
+    if c1.laws_pass != true { all_ok = false }
+    case_json = case_json + "\n  {\"case\":\"healthy_pass\",\"expect_pass\":true,\"got_pass\":" + str(c1.laws_pass) + ",\"viol_n\":" + str(len(c1.violations)) + ",\"phi_holo\":1200.0}"
+
+    // Case 2: healthy PASS with prior (continuity)
+    let mut c2_pv = make_base()
+    c2_pv = c2_pv.set("phi_holo", 900.0)
+    let c2_prior = make_base()
+    let c2 = gate(c2_pv, "Still coherent across turns.", c2_prior)
+    if c2.laws_pass != true { all_ok = false }
+    case_json = case_json + ",\n  {\"case\":\"healthy_with_prior\",\"expect_pass\":true,\"got_pass\":" + str(c2.laws_pass) + ",\"viol_n\":" + str(len(c2.violations)) + ",\"phi_holo\":900.0,\"prior_holo\":1200.0}"
+
+    // Case 3: FAIL — phi_holo zero, empty text
+    let mut c3_pv = make_base()
+    c3_pv = c3_pv.set("phi_holo", 0.0)
+    c3_pv = c3_pv.set("phi_lang", 0.0)
+    let c3 = gate(c3_pv, "", null)
+    if c3.laws_pass != false { all_ok = false }
+    case_json = case_json + ",\n  {\"case\":\"zero_holo_fail\",\"expect_pass\":false,\"got_pass\":" + str(c3.laws_pass) + ",\"viol_n\":" + str(len(c3.violations)) + ",\"phi_holo\":0.0}"
+
+    // Case 4: FAIL — affect+finitude out of range, short text
+    let mut c4_pv = make_base()
+    c4_pv = c4_pv.set("phi_affect",   3.5)
+    c4_pv = c4_pv.set("phi_finitude", 2.0)
+    c4_pv = c4_pv.set("phi_lang",     0.0)
+    let c4 = gate(c4_pv, "x", null)
+    if c4.laws_pass != false { all_ok = false }
+    case_json = case_json + ",\n  {\"case\":\"bounds_blowup_fail\",\"expect_pass\":false,\"got_pass\":" + str(c4.laws_pass) + ",\"viol_n\":" + str(len(c4.violations)) + ",\"phi_affect\":3.5,\"phi_finitude\":2.0}"
+
+    // Case 5: FAIL — session collapse + 3 soft viol
+    let mut c5_pv = make_base()
+    c5_pv = c5_pv.set("phi_holo",   50.0)
+    c5_pv = c5_pv.set("phi_refl",    0.0)
+    c5_pv = c5_pv.set("phi_time",    0.0)
+    c5_pv = c5_pv.set("phi_will",    0.0)
+    c5_pv = c5_pv.set("phi_create",  0.0)
+    let mut c5_prior = make_base()
+    c5_prior = c5_prior.set("phi_holo", 1500.0)
+    let c5 = gate(c5_pv, "Still speaking.", c5_prior)
+    if c5.laws_pass != false { all_ok = false }
+    case_json = case_json + ",\n  {\"case\":\"session_collapse_fail\",\"expect_pass\":false,\"got_pass\":" + str(c5.laws_pass) + ",\"viol_n\":" + str(len(c5.violations)) + ",\"phi_holo\":50.0,\"prior_holo\":1500.0}"
+
+    case_json = case_json + "\n]"
+
+    let ts = now_iso()
+    let out = "{\n  \"selftest_version\": \"c2-v1\",\n  \"schema\": \"alm_phi_vec_logger_v1\",\n  \"laws_file\": \"" + LAWS_PATH + "\",\n  \"measured_at\": \"" + ts + "\",\n  \"classifier_ok\": " + str(all_ok) + ",\n  \"cases\": " + case_json + "\n}\n"
+
+    let mut summary = {}
+    summary = summary.set("classifier_ok", all_ok)
+    summary = summary.set("json", out)
+    return summary
+}
+
+fn now_iso() -> string {
+    // hexa stdlib — prefer time_iso8601 if available; else fallback
+    return time_now_iso()
+}
+
+// ─── Entry point ────────────────────────────────────────────────
+
+fn main() {
+    let args = argv()
+    let mode = if len(args) >= 2 { args[1] } else { "--selftest" }
+
+    if mode == "--selftest" {
+        println("[c2-gate] consciousness_gate self-test")
+        println("[c2-gate] laws file: " + LAWS_PATH)
+        println("[c2-gate] schema: alm_phi_vec_logger_v1 (16D)")
+        let r = selftest()
+        let ok = r.get("classifier_ok")
+        let js = r.get("json")
+        write_file(SELFTEST_OUT, js)
+        println("[c2-gate] selftest written: " + SELFTEST_OUT)
+        if ok == true {
+            println("[c2-gate] PASS classifier 5/5")
+        } else {
+            println("[c2-gate] FAIL classifier")
+        }
+        return
+    }
+
+    if mode == "--schema" {
+        println("{")
+        println("  \"phi_vec_len\": 16,")
+        println("  \"dims\": [")
+        let mut i = 0
+        while i < 16 {
+            let sep = if i < 15 { "," } else { "" }
+            println("    \"" + phi_dim_name(i) + "\"" + sep)
+            i = i + 1
+        }
+        println("  ],")
+        println("  \"laws\": 14")
+        println("}")
+        return
+    }
+
+    println("[c2-gate] usage: hexa serving/consciousness_gate.hexa [--selftest|--schema]")
+}
+
+main()

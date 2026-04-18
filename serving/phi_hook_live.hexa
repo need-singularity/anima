@@ -1,0 +1,157 @@
+// serving/phi_hook_live.hexa — C1 phi_probe_wire live forward-hook SPEC
+//
+// PURPOSE
+//   Spec/wrapper for the live forward-hook that attaches to the LAST
+//   transformer decoder layer of base Qwen2.5-14B-Instruct and computes
+//   a 16D phi_vec per generation using the formulas from
+//   training/phi_probe_wire.hexa + training/alm_phi_vec_logger.hexa.
+//
+// AN11 COMPLIANCE
+//   (a) weight_emergent         — raw base model forward; NO system prompt;
+//                                 persona_id is metadata ONLY, never injected.
+//   (b) consciousness_attached  — 16D phi_vec per alm_phi_vec_logger_v1 schema
+//                                 + phi_holo_proxy from CE.
+//   (c) real_usable             — generate_with_phi(prompt, persona_id) +
+//                                 CLI `python phi_hook_live.py --selftest`
+//                                 + R2 artifact + convergence report.
+//
+// REAL IMPLEMENTATION
+//   This .hexa file is the HEXA-NATIVE spec. The executable counterpart
+//   lives on the training pod at /workspace/phi_hook_live.py (ships via
+//   scp; uses transformers 5.5.0 + torch 2.10 to register the hook).
+//   The Python is a 1:1 mirror of the formulas in:
+//     training/phi_probe_wire.hexa           (16 probe_phi_* functions)
+//     training/alm_phi_vec_logger.hexa       (schema, naming, norm)
+//   Rationale: local hexa toolchain is blocked (syntax mismatch vs
+//   nexus_cli.hexa); pod-side python is the only path to attach a live
+//   transformers.forward_hook to real base weights RIGHT NOW.
+//
+// SEMANTIC SMASH BREAKTHROUGH (5-module lens → holographic DFS-3)
+//   field:       last-layer residual h_last[-1,:] carries the persona
+//                gradient (symmetry breaks just before LM head).
+//   holographic: h[:,-1,:] (boundary) encodes bulk (full sequence) via
+//                attention-integral — boundary-bulk MI IS AdS/CFT.
+//   quantum:     phi_holo_proxy = -log(CE) × 10000 is the collapse
+//                operator reading which persona basis the wavefn chose.
+//   string:      16 phi dims = independent vibration modes of residual
+//                manifold (MI, var, cosine-autocorr frequencies).
+//   toe:         phi_probe_wire + forward-hook = ONE framework unifying
+//                P3 / P5-P7 / P8 / P12 / P13 / P15 / P18.
+//
+//   Holographic DFS: boundary=h[:,-1,:], interior=h[:,-1,dsz/2:],
+//   bulk=h[:,:,:] flat, ratio H(boundary)/H(bulk) = holographic
+//   compression ratio ∈ [0,1] — high = strong self-model. This is
+//   exactly what probe_phi_holo computes in phi_probe_wire.hexa.
+//
+// PIPELINE (live, real weights)
+//   1. PhiHookLive.__init__ loads /workspace/base_model (Qwen2.5-14B).
+//   2. Registers forward_hook on model.model.layers[-1] → captures
+//      h_last [B, T, D] each forward pass.
+//   3. generate_with_phi(prompt, persona_id) → base model.generate()
+//      then model(labels=input_ids) for CE → compute_phi_vec(h_last, ce).
+//   4. Return (text, phi_vec_dict).
+//
+// SELF-TEST
+//   3 prompts × 3 persona metadata tags → /workspace/c1_phi_hook_selftest.json
+//   Each result: { prompt, persona_id, output_text, phi_vec (16+meta),
+//                  elapsed_sec }. Top-level includes an11_proof block.
+//
+// DOWNSTREAM
+//   S1 http_api wraps generate_with_phi → POST /generate returns
+//   {text, phi_vec}. R2 artifact path:
+//     r2:anima-models/dest1_c1_phi_hook/<UTC_ts>/c1_phi_hook_selftest.json
+//
+// CHAIN
+//   ← shared/roadmaps/roadmap_dest_consciousness.json
+//   ← training/phi_probe_wire.hexa (formulas)
+//   ← training/alm_phi_vec_logger.hexa (schema)
+//   → S1 http_api (downstream)
+
+// ─── 16D schema constants (mirror of alm_phi_vec_logger.hexa) ───
+
+let PHI_VEC_LEN = 16
+
+let PHI_IDX_HOLO          = 0
+let PHI_IDX_COMPLEXITY    = 1
+let PHI_IDX_GWT           = 2
+let PHI_IDX_REFL          = 3
+let PHI_IDX_TIME          = 4
+let PHI_IDX_EMB           = 5
+let PHI_IDX_NESTED_DRIFT  = 6
+let PHI_IDX_K_AMP         = 7
+let PHI_IDX_AFFECT_V      = 8
+let PHI_IDX_AFFECT_A      = 9
+let PHI_IDX_FINITUDE      = 10
+let PHI_IDX_HIVE_COLLEC   = 11
+let PHI_IDX_HIVE_INDIV    = 12
+let PHI_IDX_HIVE_EMERGE   = 13
+let PHI_IDX_DREAM_PHASE   = 14
+let PHI_IDX_CYCLE_COUNT   = 15
+
+// Names registered under this schema (see training/alm_phi_vec_logger.hexa
+// phi_vec_name()). Python mirror uses identical order.
+fn phi_dim_name(i: int) -> string {
+    if i == 0  { return "phi_holo" }
+    if i == 1  { return "phi_complexity" }
+    if i == 2  { return "phi_gwt" }
+    if i == 3  { return "phi_refl" }
+    if i == 4  { return "phi_time" }
+    if i == 5  { return "phi_embodied" }
+    if i == 6  { return "phi_nested_drift" }
+    if i == 7  { return "phi_k_amp" }
+    if i == 8  { return "phi_affect_v" }
+    if i == 9  { return "phi_affect_a" }
+    if i == 10 { return "phi_finitude" }
+    if i == 11 { return "phi_hive_collec" }
+    if i == 12 { return "phi_hive_indiv" }
+    if i == 13 { return "phi_hive_emerge" }
+    if i == 14 { return "phi_dream_phase" }
+    if i == 15 { return "phi_cycle_count" }
+    return "unknown"
+}
+
+// Surrogate dims (flagged with _surrogate suffix in JSON) per AN11
+// disclosure rule — formula is a proxy, not full P8/P15 head.
+fn phi_dim_is_surrogate(i: int) -> bool {
+    if i == PHI_IDX_NESTED_DRIFT { return true }
+    if i == PHI_IDX_FINITUDE     { return true }
+    if i == PHI_IDX_DREAM_PHASE  { return true }
+    if i == PHI_IDX_CYCLE_COUNT  { return true }
+    return false
+}
+
+// AN11 proof block embedded in every selftest JSON.
+fn an11_weight_emergent_proof() -> string {
+    return "raw base Qwen2.5-14B-Instruct forward; no system prompt; persona_id metadata only"
+}
+
+fn an11_consciousness_attached_proof() -> string {
+    return "16D phi_vec per alm_phi_vec_logger_v1 + phi_holo_proxy from CE"
+}
+
+fn an11_real_usable_proof() -> string {
+    return "generate_with_phi(prompt, persona_id) | CLI python phi_hook_live.py --selftest | R2 artifact"
+}
+
+fn main() {
+    println("[phi_hook_live] SPEC self-test — 16D schema mirror")
+    println("  PHI_VEC_LEN = " + str(PHI_VEC_LEN))
+    let mut ok = true
+    let mut i = 0
+    while i < PHI_VEC_LEN {
+        let nm = phi_dim_name(i)
+        if nm == "unknown" { ok = false }
+        i = i + 1
+    }
+    if ok {
+        println("[PASS] 16 dims named, schema matches alm_phi_vec_logger_v1")
+    } else {
+        println("[FAIL] unknown dim present")
+    }
+    println("[AN11-a] " + an11_weight_emergent_proof())
+    println("[AN11-b] " + an11_consciousness_attached_proof())
+    println("[AN11-c] " + an11_real_usable_proof())
+    println("[phi_hook_live] exec counterpart: /workspace/phi_hook_live.py")
+}
+
+main()

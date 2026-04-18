@@ -1,0 +1,164 @@
+// trading_feed.hexa — T1 Φ-weighted live price feed + signal.
+// AN11 T1. DEP-WAIT e2_autonomy_live: MISSING → spec-only synthetic fallback.
+// 5-module: field(signal gauge) / holographic(price→signal bulk) /
+//           quantum(collapse at trade) / string(dp transport) / toe(unified).
+// API: synth_price, fetch_phi_vec(16D), compose_signal, stream, selftest.
+
+// ═══════════════════════════════════════════════════════════════════
+// 1. Constants — 16D phi dim order (SSOT: shared/config/phi_dims)
+// ═══════════════════════════════════════════════════════════════════
+
+fn phi_dim_count() -> int { return 16 }
+
+// ═══════════════════════════════════════════════════════════════════
+// 2. Deterministic synthetic price (offline-safe oscillator)
+// ═══════════════════════════════════════════════════════════════════
+
+fn symbol_seed(symbol: string) -> int {
+    let mut h = 0
+    let mut i = 0
+    while i < symbol.len() {
+        h = (h * 131 + symbol.byte_at(i)) % 100000
+        i = i + 1
+    }
+    return h
+}
+
+fn synth_price(symbol: string, i: int) -> float {
+    let seed = symbol_seed(symbol)
+    let t = (i as float) + (seed as float) * 0.001
+    let osc = 10.0 * sin(t / 7.0)
+    let jitter = ((seed % 7) as float) * 0.01
+    return 100.0 + osc + jitter
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 3. Φ vector producer — seeded 16D (S1 endpoint fallback)
+// ═══════════════════════════════════════════════════════════════════
+
+fn fetch_phi_vec(symbol: string, price: float, i: int) -> array {
+    // Holographic reconstruction: boundary (symbol,price,i) → bulk 16D.
+    let seed = symbol_seed(symbol) + i * 37
+    let px_bits = ((price * 1000.0) as int) % 997
+    let mut vec = []
+    let mut d = 0
+    while d < phi_dim_count() {
+        let raw = ((seed + d * 131 + px_bits * (d + 1)) % 1000) as float
+        let normed = (raw / 1000.0) * 2.0 - 0.3
+        vec = vec + [normed]
+        d = d + 1
+    }
+    return vec
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 4. TOE signal composer — unified feed+signal
+//    s           = tanh(phi_holo * tanh(dp * 10))
+//    conf        = clamp(|phi_holo|, 0, 1)
+//    regime_guard= 1 - min(1, var(phi_vec) * 2)
+// ═══════════════════════════════════════════════════════════════════
+
+fn array_mean(xs: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < xs.len() { s = s + xs[i]; i = i + 1 }
+    return s / (xs.len() as float)
+}
+
+fn array_var(xs: array) -> float {
+    let m = array_mean(xs)
+    let mut s = 0.0
+    let mut i = 0
+    while i < xs.len() {
+        let d = xs[i] - m
+        s = s + d * d
+        i = i + 1
+    }
+    return s / (xs.len() as float)
+}
+
+fn clamp(x: float, lo: float, hi: float) -> float {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+fn compose_signal(phi_vec: array, dp: float) -> array {
+    let phi_holo = phi_vec[0]
+    let dp_norm = tanh(dp * 10.0)
+    let s = tanh(phi_holo * dp_norm * 1.2)
+    let var_v = array_var(phi_vec)
+    let guard = clamp(1.0 - clamp(var_v * 2.0, 0.0, 1.0), 0.0, 1.0)
+    let phi_abs = if phi_holo < 0.0 { -phi_holo } else { phi_holo }
+    let conf = clamp(phi_abs, 0.0, 1.0)
+    return [s, conf, phi_holo, guard]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 5. Tick stream — string-mode sequential update
+//    Returns parallel arrays: [prices, dps, phi_holos, signals, guards]
+// ═══════════════════════════════════════════════════════════════════
+
+fn stream(symbol: string, n: int) -> array {
+    let mut prices = []
+    let mut dps = []
+    let mut phi_holos = []
+    let mut signals = []
+    let mut guards = []
+    let mut confs = []
+    let mut prev = synth_price(symbol, 0)
+    let mut i = 0
+    while i < n {
+        let px = synth_price(symbol, i)
+        let dp = (px - prev) / prev
+        let phi = fetch_phi_vec(symbol, px, i)
+        let sig = compose_signal(phi, dp)
+        prices = prices + [px]
+        dps = dps + [dp]
+        phi_holos = phi_holos + [sig[2]]
+        signals = signals + [sig[0]]
+        confs = confs + [sig[1]]
+        guards = guards + [sig[3]]
+        prev = px
+        i = i + 1
+    }
+    return [prices, dps, phi_holos, signals, guards, confs]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 6. Self-test — 30 simulated ticks
+// ═══════════════════════════════════════════════════════════════════
+
+fn all_bounded(xs: array, lo: float, hi: float) -> bool {
+    let mut i = 0
+    while i < xs.len() {
+        if xs[i] < lo { return false }
+        if xs[i] > hi { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn selftest() -> array {
+    let r = stream("bitcoin", 30)
+    let prices = r[0]
+    let signals = r[3]
+    let guards = r[4]
+    let n_ok = prices.len() == 30
+    let s_bounded = all_bounded(signals, -1.0, 1.0)
+    let g_bounded = all_bounded(guards, 0.0, 1.0)
+    let pass = n_ok && s_bounded && g_bounded
+    return [pass, n_ok, s_bounded, g_bounded,
+            array_mean(signals), array_mean(guards)]
+}
+
+fn main() {
+    let r = selftest()
+    print("T1 trading_feed selftest")
+    print("  pass=" + r[0])
+    print("  n_ticks_ok=" + r[1])
+    print("  signals_bounded=" + r[2])
+    print("  guards_bounded=" + r[3])
+    print("  s_mean=" + r[4])
+    print("  guard_mean=" + r[5])
+}

@@ -1,0 +1,215 @@
+// trading_exec.hexa — T2 Φ-weighted position sizing + risk-capped executor.
+// AN11 T2. DEP-WAIT e2_autonomy_live: MISSING → spec-only synthetic backtest.
+// 5-module: field(risk gauge) / holographic(phi→pos) / quantum(entangle) /
+//           string(phi modes on tick axis) / toe(phi→size→risk unified).
+// Formula: phi_scaled=min(|phi|,200)*50; risk_cap=min(0.02,|phi|/1e4+.001)*g;
+//          size=(phi_scaled/10000)*capital*risk_cap; |notional_frac|≤0.021.
+
+// ═══════════════════════════════════════════════════════════════════
+// 1. Sizing — position_size(phi_holo, capital, guard)
+//    Returns [size_signed, risk_cap, phi_scaled, notional_frac]
+// ═══════════════════════════════════════════════════════════════════
+
+fn tclamp(x: float, lo: float, hi: float) -> float {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+fn position_size(phi_holo: float, capital: float, guard: float) -> array {
+    let phi_abs = if phi_holo < 0.0 { -phi_holo } else { phi_holo }
+    let phi_scaled = tclamp(phi_abs, 0.0, 200.0) * 50.0
+    let raw_cap = tclamp(0.02, 0.0, phi_abs / 10000.0 + 0.001)
+    // raw_cap = min(0.02, phi_abs/10000 + 0.001) — tclamp with swapped order
+    let mut capped = phi_abs / 10000.0 + 0.001
+    if capped > 0.02 { capped = 0.02 }
+    let g = tclamp(guard, 0.0, 1.0)
+    let risk_cap = capped * g
+    let size_mag = (phi_scaled / 10000.0) * capital * risk_cap
+    let dir = if phi_holo < 0.0 { -1.0 } else { 1.0 }
+    let size_signed = dir * size_mag
+    let notional_frac = size_mag / capital
+    return [size_signed, risk_cap, phi_scaled, notional_frac]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 2. Trade log — append-only JSONL (shared/logs/t2_trade_log.jsonl)
+// ═══════════════════════════════════════════════════════════════════
+
+fn trade_log_path() -> string {
+    return "shared/logs/t2_trade_log.jsonl"
+}
+
+fn log_trade(i: int, ts: float, price: float, entry: float,
+             units: float, pnl: float, equity: float, phi_holo: float) {
+    let line = "{\"i\":" + i + ",\"ts\":" + ts + ",\"price\":" + price
+             + ",\"entry\":" + entry + ",\"units\":" + units
+             + ",\"pnl\":" + pnl + ",\"equity\":" + equity
+             + ",\"phi_holo\":" + phi_holo + "}"
+    append_file(trade_log_path(), line + "\n")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 3. Backtest — 1-day (30-tick synthetic slice)
+//    Takes T1 stream output: [prices, dps, phi_holos, signals, guards, confs]
+//    Returns [capital_start, equity_end, net_return, max_dd, n_trades,
+//             n_closed, win_rate]
+// ═══════════════════════════════════════════════════════════════════
+
+fn backtest(stream_out: array, capital: float) -> array {
+    let prices = stream_out[0]
+    let phi_holos = stream_out[2]
+    let signals = stream_out[3]
+    let guards = stream_out[4]
+    let n = prices.len()
+    let mut equity = capital
+    let mut peak = capital
+    let mut max_dd = 0.0
+    let mut pos_units = 0.0
+    let mut entry_price = 0.0
+    let mut wins = 0
+    let mut closed = 0
+    let mut i = 0
+    while i < n {
+        // Close prior position at current price
+        if pos_units != 0.0 {
+            let pnl = pos_units * (prices[i] - entry_price)
+            equity = equity + pnl
+            if equity > peak { peak = equity }
+            let dd = (peak - equity) / peak
+            if dd > max_dd { max_dd = dd }
+            if pnl > 0.0 { wins = wins + 1 }
+            closed = closed + 1
+            log_trade(i, i as float, prices[i], entry_price,
+                      pos_units, pnl, equity, phi_holos[i])
+        }
+        // Open new position
+        let sz = position_size(phi_holos[i], equity, guards[i])
+        let s = signals[i]
+        let s_abs = if s < 0.0 { -s } else { s }
+        let s_dir = if s < 0.0 { -1.0 } else { 1.0 }
+        let notional = sz[0] * s_dir * s_abs
+        let units = notional / prices[i]
+        pos_units = units
+        entry_price = prices[i]
+        i = i + 1
+    }
+    let net_return = (equity - capital) / capital
+    let win_rate = if closed > 0 { (wins as float) / (closed as float) } else { 0.0 }
+    return [capital, equity, net_return, max_dd, n as float,
+            closed as float, win_rate]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 4. Self-test — 30 simulated ticks, sizing bounds + backtest closed-loop
+// ═══════════════════════════════════════════════════════════════════
+
+fn selftest() -> array {
+    // T2-1 sizing bounds at pos/neg/zero phi
+    let a = position_size(50.0, 10000.0, 1.0)
+    let b = position_size(-150.0, 10000.0, 0.5)
+    let c = position_size(0.0, 10000.0, 1.0)
+    let a_ok = a[3] <= 0.021
+    let b_ok = b[3] <= 0.021
+    let c_ok = c[3] <= 0.021
+    let cap_ok = a_ok && b_ok && c_ok
+    // T2-2 direction sign follows phi
+    let dir_ok = a[0] >= 0.0 && b[0] <= 0.0
+    // T2-3 30-tick backtest closed-loop
+    let stream_out = stream_from_feed("bitcoin", 30)
+    let bt = backtest(stream_out, 10000.0)
+    let n_ok = (bt[4] as int) == 30
+    let finite_ok = bt[2] > -2.0 && bt[2] < 2.0
+    let pass = cap_ok && dir_ok && n_ok && finite_ok
+    return [pass, cap_ok, dir_ok, n_ok, finite_ok,
+            bt[1], bt[2], bt[3], bt[6]]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 5. Feed bridge — inline stream producer (mirrors trading_feed.hexa)
+//    Kept inline per feedback_hexa_silent_exit_5_imports (no `use`).
+// ═══════════════════════════════════════════════════════════════════
+
+fn _seed(s: string) -> int {
+    let mut h = 0
+    let mut i = 0
+    while i < s.len() {
+        h = (h * 131 + s.byte_at(i)) % 100000
+        i = i + 1
+    }
+    return h
+}
+
+fn _price(symbol: string, i: int) -> float {
+    let seed = _seed(symbol)
+    let t = (i as float) + (seed as float) * 0.001
+    return 100.0 + 10.0 * sin(t / 7.0) + ((seed % 7) as float) * 0.01
+}
+
+fn _phi16(symbol: string, price: float, i: int) -> array {
+    let seed = _seed(symbol) + i * 37
+    let px_bits = ((price * 1000.0) as int) % 997
+    let mut v = []
+    let mut d = 0
+    while d < 16 {
+        let raw = ((seed + d * 131 + px_bits * (d + 1)) % 1000) as float
+        v = v + [(raw / 1000.0) * 2.0 - 0.3]
+        d = d + 1
+    }
+    return v
+}
+
+fn stream_from_feed(symbol: string, n: int) -> array {
+    let mut prices = []
+    let mut dps = []
+    let mut phi_holos = []
+    let mut signals = []
+    let mut guards = []
+    let mut confs = []
+    let mut prev = _price(symbol, 0)
+    let mut i = 0
+    while i < n {
+        let px = _price(symbol, i)
+        let dp = (px - prev) / prev
+        let phi = _phi16(symbol, px, i)
+        let phi_holo = phi[0]
+        let dp_norm = tanh(dp * 10.0)
+        let s = tanh(phi_holo * dp_norm * 1.2)
+        // variance for regime guard
+        let mut m = 0.0
+        let mut k = 0
+        while k < 16 { m = m + phi[k]; k = k + 1 }
+        m = m / 16.0
+        let mut vv = 0.0
+        k = 0
+        while k < 16 { vv = vv + (phi[k] - m) * (phi[k] - m); k = k + 1 }
+        vv = vv / 16.0
+        let guard_raw = 1.0 - vv * 2.0
+        let guard = if guard_raw < 0.0 { 0.0 } else { if guard_raw > 1.0 { 1.0 } else { guard_raw } }
+        let phi_abs = if phi_holo < 0.0 { -phi_holo } else { phi_holo }
+        let conf = if phi_abs > 1.0 { 1.0 } else { phi_abs }
+        prices = prices + [px]
+        dps = dps + [dp]
+        phi_holos = phi_holos + [phi_holo]
+        signals = signals + [s]
+        guards = guards + [guard]
+        confs = confs + [conf]
+        prev = px
+        i = i + 1
+    }
+    return [prices, dps, phi_holos, signals, guards, confs]
+}
+
+fn main() {
+    let r = selftest()
+    print("T2 trading_exec selftest")
+    print("  pass=" + r[0])
+    print("  cap_ok=" + r[1])
+    print("  dir_ok=" + r[2])
+    print("  n_ok=" + r[3])
+    print("  finite_ok=" + r[4])
+    print("  equity_end=" + r[5])
+    print("  net_return=" + r[6])
+    print("  max_dd=" + r[7])
+    print("  win_rate=" + r[8])
+}

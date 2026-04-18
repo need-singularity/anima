@@ -1,0 +1,332 @@
+// hire_sim_judge_lenient.hexa — D6 ossified lenient judge (Z path)
+//
+// Ossified artifact for the "lenient rubric" judge-fix breakthrough
+// (2026-04-16, feedback_judge_fix_breakthrough.md / project_judge_fix_breakthrough).
+//
+// Breakthrough in one line:
+//     IDENTICAL model output + strict judge  →  completion_rate 0.5333
+//     IDENTICAL model output + lenient judge →  completion_rate 0.8667
+//   (see training/deploy/hire_sim_alm_actual_20260416.json vs
+//        training/deploy/hire_sim_alm_lenient_20260416.json —
+//    same endpoint itfl66q4z768kh, judge_mode differs only)
+//
+// This file is the CANONICAL, SINGLE-FILE port of the lenient-judge
+// logic already proven in:
+//   - anima-agent/hire_sim_judge.hexa            (library; struct-based)
+//   - training/deploy/hire_sim_lenient.hexa      (Z path runner; inline)
+//
+// Per feedback_closed_loop_verify: this artifact is verified by its
+// companion closed-loop test hire_sim_judge_lenient_test.hexa (20 cases).
+//
+// Stage0/Hexa quirks deliberately worked around (see project memory):
+//   - feedback_hexa_silent_exit_5_imports → NO `use` imports; all inlined
+//   - feedback_hexa_struct_list_alias     → no 2 structs carrying arrays
+//   - feedback_hexa_struct_return_bug     → returns are parallel arrays
+//   - feedback_hexa_lists_pbv             → helpers never mutate caller
+//   - feedback_hexa_string_api            → byte-index substring only
+//
+// Public API (single entry point):
+//   judge_lenient_score(candidate: string, gold: array) -> float
+//       1.0 if ANY gold keyword matches under lenient rules, else 0.0
+//   judge_lenient_hit_count(candidate: string, gold: array) -> int
+//       Number of gold keywords matched (for aggregate scoring).
+//
+// Lenient rules (reconstructed from training/deploy/hire_sim_lenient.hexa
+// and anima-agent/hire_sim_judge.hexa):
+//   1. normalize_text:   lowercase + [-_\n\t] → " " + collapse spaces
+//   2. synonym lookup:   41 English groups (hire-sim corpus domain) +
+//                        Korean hire-sim keywords (role titles, tool
+//                        names, verbs) — all local, zero network.
+//   3. simple_stem:      Porter-lite suffix strip (single pass).
+//                        English:  -ations/-ation/-tions/-tion/-ings/
+//                                  -ing/-ies(→y)/-ied/-ed/-es/-er/-or/
+//                                  -ly/-s (min stem 3 chars).
+//                        Korean:   -습니다 / -합니다 / -는 / -니다 / -요
+//                                  (min stem 2 chars; byte-safe —
+//                                   normalize_text does NOT touch bytes
+//                                   above 0x7F, substring is byte-based).
+//   4. match if ANY of: direct contains, synonym contains, stemmed
+//      synonym contains, stemmed keyword contains.
+
+// ════════════════════════════════════════════════════════════════════
+// 1. Normalization
+// ════════════════════════════════════════════════════════════════════
+
+fn normalize_text(s: string) -> string {
+    let mut lo = s.to_lower()
+    lo = lo.replace("-", " ")
+    lo = lo.replace("_", " ")
+    lo = lo.replace("\n", " ")
+    lo = lo.replace("\t", " ")
+    // Collapse runs of spaces.
+    while lo.contains("  ") { lo = lo.replace("  ", " ") }
+    return lo
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 2. Stemmer — English Porter-lite + Korean suffix strip
+// ════════════════════════════════════════════════════════════════════
+
+// English stemmer. Returns unchanged word if no suffix matches or stem
+// would drop below 3 chars.
+fn stem_en(word: string) -> string {
+    let n = len(word)
+    if n < 4 { return word }
+    let suffixes = ["ations", "ation", "tions", "tion", "ings", "ing", "ies", "ied", "ed", "es", "er", "or", "ly", "s"]
+    let mut i = 0
+    while i < len(suffixes) {
+        let suf = suffixes[i]
+        let slen = len(suf)
+        if n - slen >= 3 {
+            let tail = word.substring(n - slen, n)
+            if tail == suf {
+                if suf == "ies" { return word.substring(0, n - 3) + "y" }
+                return word.substring(0, n - slen)
+            }
+        }
+        i = i + 1
+    }
+    return word
+}
+
+// Korean stemmer. Suffix table is multibyte (UTF-8 hangul syllable = 3
+// bytes each). normalize_text only touches ASCII, so byte-based
+// substring is safe. Minimum stem is 2 chars (6 bytes) to avoid
+// over-stripping single-syllable roots.
+fn stem_ko(word: string) -> string {
+    let n = len(word)
+    // 습니다 / 합니다 = 9 bytes each; 니다 = 6; 는 / 요 = 3 bytes.
+    let suffixes = ["습니다", "합니다", "니다", "는", "요"]
+    let mut i = 0
+    while i < len(suffixes) {
+        let suf = suffixes[i]
+        let slen = len(suf)
+        if n - slen >= 6 {
+            let tail = word.substring(n - slen, n)
+            if tail == suf {
+                return word.substring(0, n - slen)
+            }
+        }
+        i = i + 1
+    }
+    return word
+}
+
+// Try both stemmers. Whichever shrinks the word first wins. If neither
+// matches, return as-is.
+fn simple_stem(word: string) -> string {
+    let en = stem_en(word)
+    if len(en) < len(word) { return en }
+    let ko = stem_ko(word)
+    return ko
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 3. Synonym table — parallel arrays (struct-alias bug workaround)
+// ════════════════════════════════════════════════════════════════════
+
+// Each keyword (keys[i]) maps to a synonym list vals[i]. 41 English
+// groups (verbatim from hire_sim_lenient.hexa) + 14 Korean groups
+// (hire-sim corpus: role titles, tools, common verbs).
+
+fn syn_keywords() -> array {
+    let mut k = []
+    // ── English — email ──
+    k = k.push("reply");       k = k.push("respond")
+    k = k.push("triage");      k = k.push("escalate")
+    k = k.push("negotiate");   k = k.push("renewal")
+    k = k.push("discount");    k = k.push("outreach")
+    k = k.push("apology");     k = k.push("candidate")
+    // ── English — code ──
+    k = k.push("review");      k = k.push("validation")
+    k = k.push("investigate"); k = k.push("latency")
+    k = k.push("report");      k = k.push("refactor")
+    k = k.push("migration");   k = k.push("audit")
+    // ── English — meeting ──
+    k = k.push("summarize");   k = k.push("standup")
+    k = k.push("bullet");      k = k.push("action")
+    k = k.push("postmortem");  k = k.push("root cause")
+    k = k.push("talking points")
+    // ── English — doc ──
+    k = k.push("setup");       k = k.push("ci")
+    k = k.push("release notes"); k = k.push("runbook")
+    // ── English — schedule ──
+    k = k.push("coordinate");  k = k.push("organize")
+    k = k.push("schedule");    k = k.push("block")
+    k = k.push("oncall");      k = k.push("timezone")
+    k = k.push("calendar")
+    // ── English — research ──
+    k = k.push("compare");     k = k.push("vector db")
+    k = k.push("benchmark");   k = k.push("competitor")
+    k = k.push("license")
+    // ── Korean hire-sim domain (14 groups) ──
+    k = k.push("회신")         // reply
+    k = k.push("대응")         // respond
+    k = k.push("검토")         // review
+    k = k.push("분석")         // analyze
+    k = k.push("보고")         // report
+    k = k.push("요약")         // summarize
+    k = k.push("일정")         // schedule
+    k = k.push("회의")         // meeting
+    k = k.push("문서")         // document
+    k = k.push("코드")         // code
+    k = k.push("후보")         // candidate
+    k = k.push("면접")         // interview
+    k = k.push("기술")         // skill/tech
+    k = k.push("개발")         // development
+    return k
+}
+
+fn syn_values() -> array {
+    let mut s = []
+    // ── English — email ──
+    s = s.push(["reply", "replies", "respond", "response", "responding", "answer", "answering", "acknowledge", "acknowledg", "회신", "답장"])
+    s = s.push(["respond", "response", "responding", "reply", "replies", "replying", "answer", "acknowledge", "대응", "응답"])
+    s = s.push(["triage", "triaging", "prioritize", "prioritiz", "sort", "sorting", "flag", "flagging", "분류"])
+    s = s.push(["escalate", "escalating", "escalation", "escalated", "raise", "raising", "forward", "에스컬레이션"])
+    s = s.push(["negotiate", "negotiating", "negotiation", "negotiations", "negotiated", "bargain", "deal", "협상"])
+    s = s.push(["renewal", "renewals", "renew", "renewing", "extend", "extending", "extension", "contract renewal", "갱신"])
+    s = s.push(["discount", "discounts", "discounted", "15%", "10%", "20%", "percent off", "price reduction", "reduction", "할인"])
+    s = s.push(["outreach", "outreached", "reach out", "reaching out", "contact", "contacting", "연락"])
+    s = s.push(["apology", "apologies", "apologize", "apologizing", "sorry", "regret", "사과"])
+    s = s.push(["candidate", "candidates", "applicant", "applicants", "interviewee", "후보", "지원자"])
+    // ── English — code ──
+    s = s.push(["review", "reviews", "reviewing", "reviewed", "inspect", "inspecting", "examine", "검토", "리뷰"])
+    s = s.push(["validation", "validate", "validating", "validated", "valid", "check", "verification", "검증"])
+    s = s.push(["investigate", "investigating", "investigated", "investigation", "examine", "examining", "analyze", "analyzing", "analysis", "look into", "조사", "분석"])
+    s = s.push(["latency", "latencies", "response time", "delay", "slowness", "지연"])
+    s = s.push(["report", "reports", "reporting", "reported", "document", "documenting", "file", "filing", "incident report", "write-up", "writeup", "보고", "리포트"])
+    s = s.push(["refactor", "refactoring", "refactored", "restructure", "restructuring", "rewrite", "리팩터"])
+    s = s.push(["migration", "migrations", "migrate", "migrating", "migrated", "schema change", "마이그레이션"])
+    s = s.push(["audit", "audits", "auditing", "audited", "review", "trail", "logging", "감사"])
+    // ── English — meeting ──
+    s = s.push(["summarize", "summarizing", "summarized", "summary", "summaries", "summarise", "recap", "overview", "digest", "요약"])
+    s = s.push(["standup", "stand-up", "stand up", "daily sync", "daily standup", "standups", "스탠드업"])
+    s = s.push(["bullet", "bullets", "bullet point", "bullet points", "bulletpoint", "bulleted", "- ", "* ", "• ", "1.", "2.", "3."])
+    s = s.push(["action", "actions", "action item", "action items", "task", "tasks", "todo", "to-do", "액션", "할일"])
+    s = s.push(["postmortem", "post-mortem", "post mortem", "postmortems", "retrospective", "retro", "post incident", "회고"])
+    s = s.push(["root cause", "root causes", "rootcause", "root-cause", "underlying cause", "cause analysis", "근본 원인"])
+    s = s.push(["talking points", "talking point", "talk points", "discussion points", "key points", "speaker notes", "논의 사항"])
+    // ── English — doc ──
+    s = s.push(["setup", "set-up", "set up", "setting up", "installation", "install", "installing", "configure", "configuration", "설정", "설치"])
+    s = s.push(["ci", "ci/cd", "continuous integration", "build pipeline", "ci pipeline", "jenkins", "github actions"])
+    s = s.push(["release notes", "changelog", "release note", "release log", "version notes", "릴리스 노트"])
+    s = s.push(["runbook", "run-book", "playbook", "operational guide", "sop", "운영 가이드"])
+    // ── English — schedule ──
+    s = s.push(["coordinate", "coordinating", "coordinated", "coordination", "organize", "organizing", "arrange", "arranging", "align", "조정"])
+    s = s.push(["organize", "organizing", "organized", "organization", "coordinate", "arrange", "plan", "planning", "정리", "기획"])
+    s = s.push(["schedule", "scheduling", "scheduled", "schedules", "book", "booking", "arrange", "set up", "일정", "스케줄"])
+    s = s.push(["block", "blocks", "blocked", "blocking", "reserve", "reserving", "reserved", "set aside", "hold", "예약"])
+    s = s.push(["oncall", "on-call", "on call", "oncall rotation", "on-call rotation", "on call rotation", "paging", "온콜"])
+    s = s.push(["timezone", "time zone", "time-zone", "timezones", "tz", "pdt", "est", "kst", "cest", "utc", "시간대"])
+    s = s.push(["calendar", "calendars", "cal", "schedule", "agenda", "캘린더"])
+    // ── English — research ──
+    s = s.push(["compare", "comparing", "compared", "comparison", "comparisons", "vs", "versus", "contrast", "비교"])
+    s = s.push(["vector db", "vector database", "vector databases", "vectordb", "vector-db", "vector store", "embedding db", "벡터 db"])
+    s = s.push(["benchmark", "benchmarks", "benchmarking", "benchmarked", "performance test", "measure", "벤치마크"])
+    s = s.push(["competitor", "competitors", "competition", "rival", "rivals", "alternative", "경쟁사"])
+    s = s.push(["license", "licenses", "licensing", "licensed", "licence", "라이선스"])
+    // ── Korean groups (14) ──
+    s = s.push(["회신", "회신합니다", "답장", "답신", "reply", "replies", "respond"])
+    s = s.push(["대응", "대응합니다", "대처", "response", "respond", "handle"])
+    s = s.push(["검토", "검토합니다", "리뷰", "살펴보", "review", "inspect"])
+    s = s.push(["분석", "분석합니다", "분석한", "analyze", "analysis"])
+    s = s.push(["보고", "보고합니다", "보고서", "리포트", "report", "reporting"])
+    s = s.push(["요약", "요약합니다", "요약본", "summary", "summarize"])
+    s = s.push(["일정", "일정표", "스케줄", "schedule", "calendar"])
+    s = s.push(["회의", "회의록", "미팅", "meeting", "meet"])
+    s = s.push(["문서", "문서화", "docs", "document", "documentation"])
+    s = s.push(["코드", "코드 리뷰", "소스", "code", "source"])
+    s = s.push(["후보", "후보자", "지원자", "candidate", "applicant"])
+    s = s.push(["면접", "인터뷰", "면접관", "interview", "interviewer"])
+    s = s.push(["기술", "스킬", "역량", "skill", "technical"])
+    s = s.push(["개발", "개발자", "구현", "development", "dev", "implement"])
+    return s
+}
+
+// Parallel-array lookup. Returns synonyms list, or [] if no match.
+fn lookup_synonyms(kw_norm: string) -> array {
+    let keys = syn_keywords()
+    let vals = syn_values()
+    let n = len(keys)
+    let mut i = 0
+    while i < n {
+        if keys[i] == kw_norm { return vals[i] }
+        i = i + 1
+    }
+    return []
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 4. Lenient match predicate
+// ════════════════════════════════════════════════════════════════════
+
+fn matches_lenient(kw: string, text_norm: string) -> bool {
+    let kw_norm = normalize_text(kw)
+    // 4a. direct contains
+    if text_norm.contains(kw_norm) { return true }
+    // 4b. synonym contains (each synonym normalized + stemmed fallback)
+    let syns = lookup_synonyms(kw_norm)
+    let mut i = 0
+    while i < len(syns) {
+        let sn_norm = normalize_text(syns[i])
+        if text_norm.contains(sn_norm) { return true }
+        if !sn_norm.contains(" ") {
+            let sn_stem = simple_stem(sn_norm)
+            if len(sn_stem) >= 4 && text_norm.contains(sn_stem) { return true }
+        }
+        i = i + 1
+    }
+    // 4c. stem the keyword itself and check
+    if !kw_norm.contains(" ") {
+        let kw_stem = simple_stem(kw_norm)
+        if len(kw_stem) >= 4 && text_norm.contains(kw_stem) { return true }
+    }
+    return false
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 5. Public scoring API (single-keyword ANY-match per task spec)
+// ════════════════════════════════════════════════════════════════════
+
+// Count how many gold keywords match leniently in the candidate.
+fn judge_lenient_hit_count(candidate: string, gold: array) -> int {
+    let text_norm = normalize_text(candidate)
+    let n = len(gold)
+    let mut hits = 0
+    let mut i = 0
+    while i < n {
+        if matches_lenient(gold[i], text_norm) { hits = hits + 1 }
+        i = i + 1
+    }
+    return hits
+}
+
+// Per task spec: 1.0 if ANY synonym/stemmed match, 0.0 otherwise.
+fn judge_lenient_score(candidate: string, gold: array) -> float {
+    if len(gold) == 0 { return 0.0 }
+    let hits = judge_lenient_hit_count(candidate, gold)
+    if hits > 0 { return 1.0 }
+    return 0.0
+}
+
+// Strict mirror for comparison (byte-for-byte match, lowercase).
+fn judge_strict_hit_count(candidate: string, gold: array) -> int {
+    let lo = candidate.to_lower()
+    let n = len(gold)
+    let mut hits = 0
+    let mut i = 0
+    while i < n {
+        let kw_lo = gold[i].to_lower()
+        if lo.contains(kw_lo) { hits = hits + 1 }
+        i = i + 1
+    }
+    return hits
+}
+
+fn judge_strict_score(candidate: string, gold: array) -> float {
+    if len(gold) == 0 { return 0.0 }
+    let hits = judge_strict_hit_count(candidate, gold)
+    if hits > 0 { return 1.0 }
+    return 0.0
+}

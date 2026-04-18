@@ -1,0 +1,441 @@
+// ════════════════════════════════════════════════════════════════
+//  serving/serve_alm.hexa — AnimaLM v3.0 Agent serving entry
+//
+//  Purpose: unified wire for voice + hire + avatar + tool-use
+//  (도착지 2). Single HTTP dispatcher binding:
+//    voice_routes.hexa          (v2.0 RC 음성 I/O, Mk.III vocoder)
+//    hire_routes.hexa           (TSRV-P4-1 직원 autonomy/style/lore)
+//    character_builder_ui.hexa  (avatar persona configurator)
+//    clm_eval.hexa              (5-metric one-shot evaluation)
+//
+//  Canonical adapter (2026-04-17):
+//    r2:anima-models/alm14b/a2_20260417_tool_mixed/step_300/
+//    201 MB LoRA r32/α64/attn on (A1+A2-Orch) merged base. loss=0.51.
+//
+//  Deps (in flight, sibling sessions):
+//    bpe_tokenizer.hexa, qwen2_bf16_converter.hexa
+//
+//  Constraints (CLAUDE.md + serving/CLAUDE.md):
+//    HEXA stage0, NO quantization (R5), bf16 only, GPUs A100/H100/4090.
+//    model_path SSOT: shared/config/vastai.json
+//    port SSOT:       shared/config/project_config.json
+//    helpers use sa_ prefix (avoid vr_/hire_/hr_ collisions).
+//
+//  Usage:
+//    hexa serving/serve_alm.hexa --health | --adapter-check
+//                                | --wire-selftest | --config
+//                                | --serve --port 8080
+//
+//  Env (flip when sibling sessions land):
+//    BPE_TOKENIZER_PATH, ALM14B_BF16_CKPT, SERVE_ALM_SELFTEST=1
+// ════════════════════════════════════════════════════════════════
+
+let SA_VERSION        = "serve_alm/0.1.0-wire"
+let SA_ADAPTER_STEP   = 300
+let SA_BACKEND_NAME   = "alm14b+a2-tool-mixed"
+let SA_R2_PREFIX      = "r2:anima-models/alm14b/a2_20260417_tool_mixed/step_300/"
+let SA_LOCAL_DIR      = "/tmp/alm14b_a2_tool_mixed/"
+let SA_DEFAULT_PORT   = 8080
+let SA_VASTAI_CFG     = "shared/config/vastai.json"
+let SA_PROJECT_CFG    = "shared/config/project_config.json"
+
+// ── sa_str_contains / sa_index_of — safe-subset string helpers ──
+
+fn sa_str_contains(hay, needle) {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return true }
+    if nn > hn { return false }
+    let mut i = 0
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn sa_index_of(hay, needle, from) {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return from }
+    let mut i = from
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// sa_is_digit — stage0 digit check (no char-range expressions).
+fn sa_is_digit(ch) {
+    if ch == "0" { return true } if ch == "1" { return true }
+    if ch == "2" { return true } if ch == "3" { return true }
+    if ch == "4" { return true } if ch == "5" { return true }
+    if ch == "6" { return true } if ch == "7" { return true }
+    if ch == "8" { return true } if ch == "9" { return true }
+    return false
+}
+
+// sa_extract_json_string — naive flat-JSON string value extractor.
+// Mirrors scripts/ckpt_backup_hook.hexa extract_json_string pattern.
+fn sa_extract_json_string(text, key) {
+    let needle = "\"" + key + "\""
+    let kpos = sa_index_of(text, needle, 0)
+    if kpos < 0 { return "" }
+    let after_key = kpos + len(needle)
+    let colon = sa_index_of(text, ":", after_key)
+    if colon < 0 { return "" }
+    let open_q = sa_index_of(text, "\"", colon)
+    if open_q < 0 { return "" }
+    let close_q = sa_index_of(text, "\"", open_q + 1)
+    if close_q < 0 { return "" }
+    return text.substring(open_q + 1, close_q)
+}
+
+fn sa_is_ws(ch) {
+    if ch == " " { return true } if ch == "\t" { return true }
+    if ch == "\n" { return true } if ch == "\r" { return true }
+    return false
+}
+
+// sa_extract_json_int_str — naive int extractor, digit run as string.
+fn sa_extract_json_int_str(text, key) {
+    let needle = "\"" + key + "\""
+    let kpos = sa_index_of(text, needle, 0)
+    if kpos < 0 { return "" }
+    let colon = sa_index_of(text, ":", kpos + len(needle))
+    if colon < 0 { return "" }
+    let n = len(text)
+    let mut i = colon + 1
+    while i < n {
+        if sa_is_ws(text.substring(i, i + 1)) { i = i + 1 } else { break }
+    }
+    let mut j = i
+    while j < n {
+        if sa_is_digit(text.substring(j, j + 1)) { j = j + 1 } else { break }
+    }
+    if j == i { return "" }
+    return text.substring(i, j)
+}
+
+fn sa_log_info(msg) { println("[serve_alm] " + msg) }
+fn sa_log_warn(msg) { println("[serve_alm WARN] " + msg) }
+fn sa_log_err(msg)  { println("[serve_alm ERR] " + msg) }
+
+// ── Section 1. Config loader — vastai.json + project_config.json ──
+
+fn sa_load_vastai_model_path() {
+    if !file_exists(SA_VASTAI_CFG) {
+        sa_log_warn("vastai cfg missing: " + SA_VASTAI_CFG)
+        return ""
+    }
+    let text = read_file(SA_VASTAI_CFG)
+    // model_path SSOT is HF repo_id per vastai V5. Fallback: Qwen2.5-14B.
+    let mp = sa_extract_json_string(text, "model_path")
+    if len(mp) == 0 { return "Qwen/Qwen2.5-14B" }
+    return mp
+}
+
+fn sa_load_serving_port() {
+    if !file_exists(SA_PROJECT_CFG) {
+        sa_log_warn("project cfg missing: " + SA_PROJECT_CFG)
+        return SA_DEFAULT_PORT
+    }
+    let text = read_file(SA_PROJECT_CFG)
+    let port_str = sa_extract_json_int_str(text, "port")
+    if len(port_str) == 0 { return SA_DEFAULT_PORT }
+    let parsed = port_str.parse_int()
+    if parsed <= 0 { return SA_DEFAULT_PORT }
+    return parsed
+}
+
+fn sa_env_port_override(def) {
+    let e = env("SERVE_ALM_PORT")
+    if len(e) == 0 { return def }
+    let p = e.parse_int()
+    if p <= 0 { return def }
+    return p
+}
+
+// ── Section 2. Route table — parallel arrays (stage0-safe) ──
+// Each route: (method, path) -> (handler_symbol, source_file).
+// --wire-selftest grep-checks each handler exists on disk.
+
+fn sa_route_methods() {
+    let mut a = []
+    a = a.push("POST"); a = a.push("POST"); a = a.push("POST")
+    a = a.push("GET");  a = a.push("GET")
+    return a
+}
+
+fn sa_route_paths() {
+    let mut a = []
+    a = a.push("/voice"); a = a.push("/hire/task"); a = a.push("/character")
+    a = a.push("/eval");  a = a.push("/health")
+    return a
+}
+
+fn sa_route_handlers() {
+    let mut a = []
+    a = a.push("vr_handle_e2e"); a = a.push("hr_handle_task"); a = a.push("main")
+    a = a.push("main");          a = a.push("sa_handle_health")
+    return a
+}
+
+fn sa_route_files() {
+    let mut a = []
+    a = a.push("serving/voice_routes.hexa")
+    a = a.push("serving/hire_routes.hexa")
+    a = a.push("serving/character_builder_ui.hexa")
+    a = a.push("serving/clm_eval.hexa")
+    a = a.push("serving/serve_alm.hexa")
+    return a
+}
+
+fn sa_print_route_table() {
+    let methods = sa_route_methods()
+    let paths = sa_route_paths()
+    let handlers = sa_route_handlers()
+    let files = sa_route_files()
+    let n = len(paths)
+    println("[serve_alm] route table (" + to_string(n) + " entries):")
+    let mut i = 0
+    while i < n {
+        println("  " + methods[i] + " " + paths[i] + " -> " + handlers[i] + "  (" + files[i] + ")")
+        i = i + 1
+    }
+}
+
+// sa_handle_health — the only route implemented in this file.
+fn sa_handle_health() {
+    let body = "{\"ok\":true,\"adapter_step\":" + to_string(SA_ADAPTER_STEP) + ",\"backend\":\"" + SA_BACKEND_NAME + "\",\"version\":\"" + SA_VERSION + "\"}"
+    return body
+}
+
+// ── Section 3. Model bootstrap STUB — R2 adapter fetch + verify ──
+// rclone copy ... --s3-no-check-bucket (ckpt_backup_hook pattern).
+// LoadedModel remains STUB until BPE + 14B converter sibling land.
+
+fn sa_expected_files() {
+    let mut a = []
+    a = a.push("adapter_model.safetensors"); a = a.push("adapter_config.json")
+    a = a.push("tokenizer.json");            a = a.push("tokenizer_config.json")
+    a = a.push("special_tokens_map.json");   a = a.push("training_args.bin")
+    a = a.push("README.md");                 a = a.push("ckpt_meta.json")
+    a = a.push("ckpt_manifest.sha256");      a = a.push("lora_meta.json")
+    return a
+}
+
+fn sa_build_rclone_cmd(remote, local) {
+    return "rclone copy " + remote + " " + local + " --s3-no-check-bucket --transfers 4 --progress"
+}
+
+fn sa_fetch_adapter(dry_run) {
+    sa_log_info("adapter fetch: " + SA_R2_PREFIX + " -> " + SA_LOCAL_DIR)
+    let _m = exec("mkdir -p " + SA_LOCAL_DIR)
+    let cmd = sa_build_rclone_cmd(SA_R2_PREFIX, SA_LOCAL_DIR)
+    if dry_run {
+        println("[serve_alm DRY] " + cmd)
+        return true
+    }
+    // Best-effort: absent rclone returns non-zero but we keep going.
+    let _r = exec(cmd + " 2>&1 || true")
+    return true
+}
+
+fn sa_verify_adapter_files() {
+    let expected = sa_expected_files()
+    let n = len(expected)
+    let mut i = 0
+    let mut missing = 0
+    while i < n {
+        let p = SA_LOCAL_DIR + expected[i]
+        if !file_exists(p) {
+            sa_log_warn("missing: " + p)
+            missing = missing + 1
+        }
+        i = i + 1
+    }
+    if missing > 0 {
+        sa_log_warn("STUB: adapter missing " + to_string(missing) + "/" + to_string(n) + " files")
+        return false
+    }
+    sa_log_info("adapter verify: all " + to_string(n) + " files present")
+    return true
+}
+
+// sa_load_model — LoadedModel as list
+//   [ok_int, backend, adapter_path, bpe_ready_int, bf16_ready_int]
+// bools exposed as 0/1 ints; caller indexes by position.
+fn sa_load_model() {
+    let bpe_ready = len(env("BPE_TOKENIZER_PATH")) > 0
+    let bf16_ready = len(env("ALM14B_BF16_CKPT")) > 0
+    if !bpe_ready { sa_log_warn("STUB: waiting on bpe (set BPE_TOKENIZER_PATH)") }
+    if !bf16_ready { sa_log_warn("STUB: waiting on bf16 (set ALM14B_BF16_CKPT)") }
+    let ok_int = if bpe_ready && bf16_ready { 1 } else { 0 }
+    let bpe_int = if bpe_ready { 1 } else { 0 }
+    let bf16_int = if bf16_ready { 1 } else { 0 }
+    let mut m = []
+    m = m.push(ok_int)
+    m = m.push(SA_BACKEND_NAME)
+    m = m.push(SA_LOCAL_DIR)
+    m = m.push(bpe_int)
+    m = m.push(bf16_int)
+    return m
+}
+
+fn sa_print_loaded_model(m) {
+    println("[serve_alm] LoadedModel { ok=" + to_string(m[0])
+        + " backend=" + m[1] + " adapter=" + m[2]
+        + " bpe_ready=" + to_string(m[3]) + " bf16_ready=" + to_string(m[4]) + " }")
+}
+
+// ── Section 4. Wire selftest — grep handler symbols on disk ──
+
+fn sa_check_handler_symbol(fn_name, file_path) {
+    let r = exec("grep -q 'fn " + fn_name + "' " + file_path + " 2>/dev/null; echo $?")
+    if r.trim() == "0" { return true }
+    return false
+}
+
+fn sa_wire_selftest() {
+    sa_log_info("=== wire selftest ===")
+    sa_print_route_table()
+    let handlers = sa_route_handlers()
+    let files = sa_route_files()
+    let n = len(handlers)
+    let mut i = 0
+    let mut resolved = 0
+    let mut missing = 0
+    while i < n {
+        let found = sa_check_handler_symbol(handlers[i], files[i])
+        if found {
+            println("  [resolved] " + handlers[i] + " @ " + files[i])
+            resolved = resolved + 1
+        } else {
+            println("  [STUB]     " + handlers[i] + " NOT FOUND in " + files[i])
+            missing = missing + 1
+        }
+        i = i + 1
+    }
+    println("[serve_alm] resolved=" + to_string(resolved) + " missing=" + to_string(missing) + " of " + to_string(n))
+    // Exercise model bootstrap in stub mode.
+    let m = sa_load_model()
+    sa_print_loaded_model(m)
+    println("[serve_alm] bootstrap=STUB (flip BPE_TOKENIZER_PATH + ALM14B_BF16_CKPT when sibling sessions land)")
+    return resolved
+}
+
+// ── Section 5. Main entry + CLI arg dispatch ──
+
+fn sa_print_usage() {
+    println("usage: hexa serving/serve_alm.hexa <command>")
+    println("  --health | --adapter-check | --wire-selftest")
+    println("  --config | --serve --port N")
+    println("env: BPE_TOKENIZER_PATH, ALM14B_BF16_CKPT, SERVE_ALM_PORT, SERVE_ALM_SELFTEST=1")
+}
+
+fn sa_cmd_serve(port) {
+    sa_log_info("--serve port=" + to_string(port) + " (STUB: port binding deferred)")
+    sa_print_route_table()
+    let m = sa_load_model()
+    sa_print_loaded_model(m)
+    if m[0] == 0 {
+        sa_log_warn("serve refused: model not ready (bootstrap=STUB)")
+        println("[serve_alm] wire plan printed; real http_server.hexa --port " + to_string(port) + " bind deferred until BPE + bf16 land")
+        return
+    }
+    sa_log_info("serve would bind :" + to_string(port) + " — follow-up: wire into serving/http_server.hexa")
+}
+
+fn sa_cmd_config() {
+    let mp = sa_load_vastai_model_path()
+    let p = sa_load_serving_port()
+    let pf = sa_env_port_override(p)
+    println("[serve_alm] model_path = " + mp)
+    println("[serve_alm] port (cfg) = " + to_string(p))
+    println("[serve_alm] port (eff) = " + to_string(pf))
+}
+
+fn sa_cmd_adapter_check() {
+    let fetched = sa_fetch_adapter(false)
+    if !fetched {
+        sa_log_err("adapter fetch returned false")
+        return
+    }
+    let ok = sa_verify_adapter_files()
+    if ok { sa_log_info("adapter-check OK") } else { sa_log_warn("adapter-check INCOMPLETE") }
+}
+
+fn sa_main_dispatch() {
+    let argv = args()
+    let argc = len(argv)
+    if argc < 3 { sa_print_usage(); return }
+    let cmd = argv[2]
+    if cmd == "--health"        { println(sa_handle_health()); return }
+    if cmd == "--adapter-check" { sa_cmd_adapter_check(); return }
+    if cmd == "--wire-selftest" { let _r = sa_wire_selftest(); return }
+    if cmd == "--config"        { sa_cmd_config(); return }
+    if cmd == "--serve" {
+        let mut port = sa_env_port_override(sa_load_serving_port())
+        if argc >= 5 {
+            if argv[3] == "--port" {
+                let p = argv[4].parse_int()
+                if p > 0 { port = p }
+            }
+        }
+        sa_cmd_serve(port)
+        return
+    }
+    sa_log_warn("unknown command: " + cmd)
+    sa_print_usage()
+}
+
+// ── Section 6. Embedded tests (SERVE_ALM_SELFTEST=1) ──
+
+fn sa_test_config_load() {
+    let mp = sa_load_vastai_model_path()
+    let port = sa_load_serving_port()
+    let ok1 = len(mp) > 0
+    let ok2 = port > 0
+    if ok1 { println("  T1a PASS — model_path=" + mp) } else { println("  T1a FAIL") }
+    if ok2 { println("  T1b PASS — port=" + to_string(port)) } else { println("  T1b FAIL") }
+    return ok1 && ok2
+}
+
+fn sa_test_route_table() {
+    let ok = len(sa_route_methods()) == 5 && len(sa_route_paths()) == 5 && len(sa_route_handlers()) == 5 && len(sa_route_files()) == 5
+    if ok { println("  T2 PASS — 5x5 parallel arrays") } else { println("  T2 FAIL") }
+    return ok
+}
+
+fn sa_test_bootstrap_without_env() {
+    if len(env("BPE_TOKENIZER_PATH")) > 0 { println("  T3 SKIP — BPE set"); return true }
+    if len(env("ALM14B_BF16_CKPT")) > 0   { println("  T3 SKIP — BF16 set"); return true }
+    let m = sa_load_model()
+    let ok = m[0] == 0
+    if ok { println("  T3 PASS — ok=0 (stub refuses)") } else { println("  T3 FAIL — ok=" + to_string(m[0])) }
+    return ok
+}
+
+fn sa_run_selftests() {
+    println("=== serve_alm embedded tests ===")
+    let a = sa_test_config_load()
+    let b = sa_test_route_table()
+    let c = sa_test_bootstrap_without_env()
+    let all = a && b && c
+    if all { println("[serve_alm] ALL PASS") } else { println("[serve_alm] SOME FAILED") }
+}
+
+// ── Section 7. Entry ──
+
+fn main() {
+    let self_test = env("SERVE_ALM_SELFTEST")
+    if self_test == "1" {
+        sa_run_selftests()
+        return
+    }
+    sa_main_dispatch()
+}
+
+main()

@@ -1,0 +1,501 @@
+// character_builder_ui.hexa — TSRV-P2-1 character creation UI
+//
+// Generates a self-contained HTML character builder form for AI chat personas.
+// Integrates with anima-speak rp_voice_profiles (10 profiles) and the
+// character_builder.hexa GWT pipeline backend.
+//
+// 8 fields:
+//   1. name           (string)  character name
+//   2. persona_tag    (string)  internal ID (e.g., "school_idol")
+//   3. personality    (text)    personality description
+//   4. background     (text)    character backstory
+//   5. speech_style   (text)    speaking style/tone description
+//   6. voice_profile  (select)  one of 10 rp_voice_profiles
+//   7. lore_entries   (text)    key lore facts (one per line)
+//   8. greeting       (text)    initial greeting message
+//
+// Output: /tmp/character_builder.html (single self-contained file)
+//
+// Self-tests: T1-T5 verify struct, HTML gen, JSON serialization.
+//
+// Stage0 hexa: no cross-file imports — everything inline.
+// No [[type]] annotations, no multi-line string concat bugs.
+
+// ─── CharacterConfig struct ──────────────────────────────────
+
+struct CharacterConfig {
+    name:          string,
+    persona_tag:   string,
+    personality:   string,
+    background:    string,
+    speech_style:  string,
+    voice_profile: string,
+    lore_entries:  string,
+    greeting:      string
+}
+
+fn default_config() -> CharacterConfig {
+    return CharacterConfig {
+        name:          "Mina",
+        persona_tag:   "school_idol",
+        personality:   "Bright and cheerful, secretly shy",
+        background:    "Transfer student at a prestigious academy",
+        speech_style:  "Energetic, uses casual speech with friends",
+        voice_profile: "school_idol",
+        lore_entries:  "Loves strawberry milk\nTop of the class\nPlays violin",
+        greeting:      "Hi there! I just transferred here... want to be friends?"
+    }
+}
+
+// ─── String helpers (stage0: no index_of/substring free fn) ──
+
+fn str_contains(hay: string, needle: string) -> bool {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return true }
+    if nn > hn { return false }
+    let mut i = 0
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── JSON serialization ──────────────────────────────────────
+
+fn escape_json_str(s: string) -> string {
+    // Escape backslash, double-quote, newline, tab for JSON strings.
+    // Stage0 hexa: use .substring() method, not free function.
+    let n = len(s)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "\\" {
+            out = out + "\\\\"
+        } else {
+            if c == "\"" {
+                out = out + "\\\""
+            } else {
+                if c == "\n" {
+                    out = out + "\\n"
+                } else {
+                    if c == "\t" {
+                        out = out + "\\t"
+                    } else {
+                        out = out + c
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn config_to_json(cfg: CharacterConfig) -> string {
+    let mut j = "{\n"
+    j = j + "  \"name\": \"" + escape_json_str(cfg.name) + "\",\n"
+    j = j + "  \"persona_tag\": \"" + escape_json_str(cfg.persona_tag) + "\",\n"
+    j = j + "  \"personality\": \"" + escape_json_str(cfg.personality) + "\",\n"
+    j = j + "  \"background\": \"" + escape_json_str(cfg.background) + "\",\n"
+    j = j + "  \"speech_style\": \"" + escape_json_str(cfg.speech_style) + "\",\n"
+    j = j + "  \"voice_profile\": \"" + escape_json_str(cfg.voice_profile) + "\",\n"
+    j = j + "  \"lore_entries\": \"" + escape_json_str(cfg.lore_entries) + "\",\n"
+    j = j + "  \"greeting\": \"" + escape_json_str(cfg.greeting) + "\"\n"
+    j = j + "}"
+    return j
+}
+
+// ─── HTML generation ─────────────────────────────────────────
+
+fn build_css() -> string {
+    // Dark theme matching anima aesthetic (#0b0f15 bg, #d8e4f5 text)
+    let mut s = "<style>\n"
+    s = s + "* { margin:0; padding:0; box-sizing:border-box; }\n"
+    s = s + "body { background:#0b0f15; color:#d8e4f5; "
+    s = s + "font-family:-apple-system,BlinkMacSystemFont,'SF Pro',sans-serif; "
+    s = s + "min-height:100vh; padding:32px; }\n"
+    s = s + ".container { max-width:1100px; margin:0 auto; }\n"
+    s = s + "h1 { font-size:24px; font-weight:700; margin-bottom:4px; }\n"
+    s = s + ".sub { color:#7a8ca8; font-size:12px; margin-bottom:28px; }\n"
+    s = s + ".layout { display:flex; gap:32px; align-items:flex-start; }\n"
+    s = s + ".form-panel { flex:1; min-width:0; }\n"
+    s = s + ".preview-panel { width:380px; flex-shrink:0; position:sticky; top:32px; }\n"
+    s = s + ".field { margin-bottom:16px; }\n"
+    s = s + "label { display:block; font-size:12px; font-weight:600; "
+    s = s + "color:#8fb7f2; margin-bottom:4px; text-transform:uppercase; letter-spacing:0.5px; }\n"
+    s = s + "input[type=text], textarea, select { width:100%; "
+    s = s + "background:#0f1622; border:1px solid #1c2938; color:#d8e4f5; "
+    s = s + "border-radius:8px; padding:10px 12px; font-size:14px; "
+    s = s + "font-family:inherit; outline:none; transition:border-color .2s; }\n"
+    s = s + "input[type=text]:focus, textarea:focus, select:focus { border-color:#4d7dff; }\n"
+    s = s + "textarea { resize:vertical; min-height:72px; }\n"
+    s = s + "select { cursor:pointer; }\n"
+    s = s + "select option { background:#0f1622; color:#d8e4f5; }\n"
+    s = s + ".btn-row { display:flex; gap:10px; margin-top:24px; }\n"
+    s = s + ".btn { background:#1f3352; color:#e0ebff; border:1px solid #2c4974; "
+    s = s + "padding:10px 20px; border-radius:8px; font-size:14px; font-weight:600; "
+    s = s + "cursor:pointer; transition:background .2s; }\n"
+    s = s + ".btn:hover { background:#27436c; }\n"
+    s = s + ".btn-primary { background:#2a5cdb; border-color:#3d6ef0; }\n"
+    s = s + ".btn-primary:hover { background:#3468e8; }\n"
+    s = s + ".card { background:#0f1622; border:1px solid #1c2938; "
+    s = s + "border-radius:12px; padding:20px; }\n"
+    s = s + ".card h2 { font-size:16px; margin-bottom:12px; }\n"
+    s = s + ".card-name { font-size:22px; font-weight:700; color:#e6f0ff; margin-bottom:2px; }\n"
+    s = s + ".card-tag { font-size:11px; color:#4d7dff; "
+    s = s + "font-family:'SF Mono',Menlo,monospace; margin-bottom:12px; }\n"
+    s = s + ".card-section { margin-bottom:10px; }\n"
+    s = s + ".card-label { font-size:10px; color:#5a7094; "
+    s = s + "text-transform:uppercase; letter-spacing:0.5px; margin-bottom:2px; }\n"
+    s = s + ".card-text { font-size:13px; color:#b0c4e0; line-height:1.5; }\n"
+    s = s + ".card-greeting { background:#111e2e; border-left:3px solid #4d7dff; "
+    s = s + "padding:10px 14px; border-radius:0 8px 8px 0; "
+    s = s + "font-style:italic; color:#8fb7f2; font-size:13px; margin-top:8px; }\n"
+    s = s + ".card-voice { display:inline-block; background:#1a2d47; "
+    s = s + "border-radius:20px; padding:4px 12px; font-size:11px; "
+    s = s + "color:#6fa3ff; font-weight:600; }\n"
+    s = s + ".card-lore { list-style:none; padding:0; }\n"
+    s = s + ".card-lore li { font-size:12px; color:#8a9bb8; padding:3px 0; "
+    s = s + "border-bottom:1px solid #141e2c; }\n"
+    s = s + ".card-lore li:last-child { border-bottom:none; }\n"
+    s = s + ".card-lore li::before { content:'> '; color:#4d7dff; font-weight:700; }\n"
+    s = s + ".json-output { display:none; margin-top:16px; }\n"
+    s = s + ".json-output.visible { display:block; }\n"
+    s = s + ".json-pre { background:#070d16; border:1px solid #152132; "
+    s = s + "border-radius:8px; padding:14px; font-family:'SF Mono',Menlo,monospace; "
+    s = s + "font-size:11px; color:#6fa3ff; overflow-x:auto; white-space:pre-wrap; }\n"
+    s = s + "@media(max-width:800px) { .layout { flex-direction:column; } "
+    s = s + ".preview-panel { width:100%; position:static; } }\n"
+    s = s + "</style>\n"
+    return s
+}
+
+fn build_form_fields() -> string {
+    let mut s = ""
+    // 1. name
+    s = s + "<div class=\"field\">"
+    s = s + "<label for=\"f-name\">Character Name</label>"
+    s = s + "<input type=\"text\" id=\"f-name\" placeholder=\"e.g. Mina\" />"
+    s = s + "</div>\n"
+    // 2. persona_tag
+    s = s + "<div class=\"field\">"
+    s = s + "<label for=\"f-tag\">Persona Tag (internal ID)</label>"
+    s = s + "<input type=\"text\" id=\"f-tag\" placeholder=\"e.g. school_idol\" />"
+    s = s + "</div>\n"
+    // 3. personality
+    s = s + "<div class=\"field\">"
+    s = s + "<label for=\"f-personality\">Personality</label>"
+    s = s + "<textarea id=\"f-personality\" rows=\"3\" "
+    s = s + "placeholder=\"e.g. Bright, cheerful, secretly shy\"></textarea>"
+    s = s + "</div>\n"
+    // 4. background
+    s = s + "<div class=\"field\">"
+    s = s + "<label for=\"f-background\">Background / Backstory</label>"
+    s = s + "<textarea id=\"f-background\" rows=\"3\" "
+    s = s + "placeholder=\"Character backstory...\"></textarea>"
+    s = s + "</div>\n"
+    // 5. speech_style
+    s = s + "<div class=\"field\">"
+    s = s + "<label for=\"f-speech\">Speech Style</label>"
+    s = s + "<textarea id=\"f-speech\" rows=\"2\" "
+    s = s + "placeholder=\"e.g. Energetic, casual with friends\"></textarea>"
+    s = s + "</div>\n"
+    // 6. voice_profile (dropdown with 10 profiles)
+    s = s + "<div class=\"field\">"
+    s = s + "<label for=\"f-voice\">Voice Profile</label>"
+    s = s + "<select id=\"f-voice\">"
+    s = s + "<option value=\"school_idol\">school_idol (245Hz, bright, romance)</option>"
+    s = s + "<option value=\"senpai\">senpai (135Hz, warm baritone, romance)</option>"
+    s = s + "<option value=\"knight\">knight (110Hz, deep bass, fantasy)</option>"
+    s = s + "<option value=\"sorceress\">sorceress (215Hz, mysterious alto, fantasy)</option>"
+    s = s + "<option value=\"noir_detective\">noir_detective (100Hz, cynical, daily)</option>"
+    s = s + "<option value=\"horror_whisper\">horror_whisper (80Hz, dark whisper, horror)</option>"
+    s = s + "<option value=\"childhood_friend\">childhood_friend (200Hz, warm mezzo, daily)</option>"
+    s = s + "<option value=\"demon_lord\">demon_lord (70Hz, imposing bass, fantasy)</option>"
+    s = s + "<option value=\"childlike\">childlike (320Hz, high-pitched, daily)</option>"
+    s = s + "<option value=\"stoic_mentor\">stoic_mentor (125Hz, neutral baritone, daily)</option>"
+    s = s + "</select>"
+    s = s + "</div>\n"
+    // 7. lore_entries
+    s = s + "<div class=\"field\">"
+    s = s + "<label for=\"f-lore\">Lore Entries (one per line)</label>"
+    s = s + "<textarea id=\"f-lore\" rows=\"4\" "
+    s = s + "placeholder=\"Loves strawberry milk&#10;Top of the class&#10;Plays violin\"></textarea>"
+    s = s + "</div>\n"
+    // 8. greeting
+    s = s + "<div class=\"field\">"
+    s = s + "<label for=\"f-greeting\">Greeting Message</label>"
+    s = s + "<textarea id=\"f-greeting\" rows=\"3\" "
+    s = s + "placeholder=\"Initial greeting when conversation starts...\"></textarea>"
+    s = s + "</div>\n"
+    return s
+}
+
+fn build_preview_section() -> string {
+    let mut s = "<div class=\"card\">\n"
+    s = s + "<h2>Character Card Preview</h2>\n"
+    s = s + "<div class=\"card-name\" id=\"pv-name\">Unnamed Character</div>\n"
+    s = s + "<div class=\"card-tag\" id=\"pv-tag\">no_tag</div>\n"
+    s = s + "<div class=\"card-section\"><span class=\"card-voice\" id=\"pv-voice\">school_idol</span></div>\n"
+    s = s + "<div class=\"card-section\"><div class=\"card-label\">Personality</div>"
+    s = s + "<div class=\"card-text\" id=\"pv-personality\">--</div></div>\n"
+    s = s + "<div class=\"card-section\"><div class=\"card-label\">Background</div>"
+    s = s + "<div class=\"card-text\" id=\"pv-background\">--</div></div>\n"
+    s = s + "<div class=\"card-section\"><div class=\"card-label\">Speech Style</div>"
+    s = s + "<div class=\"card-text\" id=\"pv-speech\">--</div></div>\n"
+    s = s + "<div class=\"card-section\"><div class=\"card-label\">Lore</div>"
+    s = s + "<ul class=\"card-lore\" id=\"pv-lore\"><li>--</li></ul></div>\n"
+    s = s + "<div class=\"card-greeting\" id=\"pv-greeting\">\"...\"</div>\n"
+    s = s + "</div>\n"
+    s = s + "<div class=\"json-output\" id=\"json-output\">\n"
+    s = s + "<div class=\"card-label\" style=\"margin-bottom:6px\">JSON Output</div>\n"
+    s = s + "<pre class=\"json-pre\" id=\"json-pre\"></pre>\n"
+    s = s + "</div>\n"
+    return s
+}
+
+fn build_js() -> string {
+    let mut s = "<script>\n"
+    // Field IDs and preview element mappings
+    s = s + "const ids=['f-name','f-tag','f-personality','f-background','f-speech','f-voice','f-lore','f-greeting'];\n"
+    s = s + "const pvIds=['pv-name','pv-tag','pv-personality','pv-background','pv-speech','pv-voice','pv-lore','pv-greeting'];\n"
+    s = s + "function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}\n"
+    // Live preview updater
+    s = s + "function updatePreview(){\n"
+    s = s + "  var n=document.getElementById('f-name').value||'Unnamed Character';\n"
+    s = s + "  document.getElementById('pv-name').textContent=n;\n"
+    s = s + "  var t=document.getElementById('f-tag').value||'no_tag';\n"
+    s = s + "  document.getElementById('pv-tag').textContent='@'+t;\n"
+    s = s + "  document.getElementById('pv-personality').textContent=document.getElementById('f-personality').value||'--';\n"
+    s = s + "  document.getElementById('pv-background').textContent=document.getElementById('f-background').value||'--';\n"
+    s = s + "  document.getElementById('pv-speech').textContent=document.getElementById('f-speech').value||'--';\n"
+    s = s + "  document.getElementById('pv-voice').textContent=document.getElementById('f-voice').value;\n"
+    // Lore: split by newline, render as list items
+    s = s + "  var lore=document.getElementById('f-lore').value;\n"
+    s = s + "  var ul=document.getElementById('pv-lore');\n"
+    s = s + "  if(lore.trim()){\n"
+    s = s + "    var lines=lore.split('\\n').filter(function(l){return l.trim();});\n"
+    s = s + "    ul.innerHTML=lines.map(function(l){return '<li>'+esc(l.trim())+'</li>';}).join('');\n"
+    s = s + "  } else { ul.innerHTML='<li>--</li>'; }\n"
+    // Greeting
+    s = s + "  var g=document.getElementById('f-greeting').value;\n"
+    s = s + "  document.getElementById('pv-greeting').textContent=g?('\"'+g+'\"'):'\"...\"';\n"
+    s = s + "}\n"
+    // Attach live listeners
+    s = s + "ids.forEach(function(id){\n"
+    s = s + "  var el=document.getElementById(id);\n"
+    s = s + "  el.addEventListener('input',updatePreview);\n"
+    s = s + "  el.addEventListener('change',updatePreview);\n"
+    s = s + "});\n"
+    // Save: build JSON, show output, copy to clipboard
+    s = s + "function saveConfig(){\n"
+    s = s + "  var obj={\n"
+    s = s + "    name:document.getElementById('f-name').value,\n"
+    s = s + "    persona_tag:document.getElementById('f-tag').value,\n"
+    s = s + "    personality:document.getElementById('f-personality').value,\n"
+    s = s + "    background:document.getElementById('f-background').value,\n"
+    s = s + "    speech_style:document.getElementById('f-speech').value,\n"
+    s = s + "    voice_profile:document.getElementById('f-voice').value,\n"
+    s = s + "    lore_entries:document.getElementById('f-lore').value,\n"
+    s = s + "    greeting:document.getElementById('f-greeting').value\n"
+    s = s + "  };\n"
+    s = s + "  var json=JSON.stringify(obj,null,2);\n"
+    s = s + "  document.getElementById('json-pre').textContent=json;\n"
+    s = s + "  document.getElementById('json-output').classList.add('visible');\n"
+    s = s + "  console.log('[character_builder] saved config:');\n"
+    s = s + "  console.log(json);\n"
+    s = s + "  if(navigator.clipboard){\n"
+    s = s + "    navigator.clipboard.writeText(json).then(function(){\n"
+    s = s + "      var btn=document.getElementById('btn-save');\n"
+    s = s + "      btn.textContent='Copied to Clipboard!';\n"
+    s = s + "      setTimeout(function(){btn.textContent='Save JSON';},2000);\n"
+    s = s + "    });\n"
+    s = s + "  }\n"
+    s = s + "}\n"
+    // Reset
+    s = s + "function resetForm(){\n"
+    s = s + "  ids.forEach(function(id){document.getElementById(id).value='';});\n"
+    s = s + "  document.getElementById('f-voice').selectedIndex=0;\n"
+    s = s + "  document.getElementById('json-output').classList.remove('visible');\n"
+    s = s + "  updatePreview();\n"
+    s = s + "}\n"
+    s = s + "</script>\n"
+    return s
+}
+
+fn build_html() -> string {
+    let mut h = "<!doctype html>\n<html lang=\"ko\">\n<head>\n"
+    h = h + "<meta charset=\"utf-8\" />\n"
+    h = h + "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\" />\n"
+    h = h + "<title>Anima Character Builder — TSRV-P2-1</title>\n"
+    h = h + build_css()
+    h = h + "</head>\n<body>\n"
+    h = h + "<div class=\"container\">\n"
+    h = h + "<h1>Anima Character Builder</h1>\n"
+    h = h + "<div class=\"sub\">TSRV-P2-1 — AI Chat Persona Creator (10 voice profiles)</div>\n"
+    h = h + "<div class=\"layout\">\n"
+    // Form panel (left)
+    h = h + "<div class=\"form-panel\">\n"
+    h = h + build_form_fields()
+    h = h + "<div class=\"btn-row\">"
+    h = h + "<button class=\"btn btn-primary\" id=\"btn-save\" onclick=\"saveConfig()\">Save JSON</button>"
+    h = h + "<button class=\"btn\" onclick=\"resetForm()\">Reset</button>"
+    h = h + "</div>\n"
+    h = h + "</div>\n"
+    // Preview panel (right)
+    h = h + "<div class=\"preview-panel\">\n"
+    h = h + build_preview_section()
+    h = h + "</div>\n"
+    // Close layout + container
+    h = h + "</div>\n"
+    h = h + "</div>\n"
+    h = h + build_js()
+    h = h + "</body>\n</html>\n"
+    return h
+}
+
+// ─── Self-tests ──────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // T1: CharacterConfig struct creation with all 8 fields
+    let cfg = default_config()
+    if cfg.name != "Mina" { return false }
+    if cfg.persona_tag != "school_idol" { return false }
+    if cfg.voice_profile != "school_idol" { return false }
+    if len(cfg.personality) == 0 { return false }
+    if len(cfg.background) == 0 { return false }
+    if len(cfg.speech_style) == 0 { return false }
+    if len(cfg.lore_entries) == 0 { return false }
+    if len(cfg.greeting) == 0 { return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: HTML generation produces valid structure with all 8 field inputs
+    let html = build_html()
+    let n = len(html)
+    // Must be substantial (> 2000 chars for a full form)
+    if n < 2000 { return false }
+    // Must contain all field IDs
+    if !str_contains(html, "f-name") { return false }
+    if !str_contains(html, "f-tag") { return false }
+    if !str_contains(html, "f-personality") { return false }
+    if !str_contains(html, "f-background") { return false }
+    if !str_contains(html, "f-speech") { return false }
+    if !str_contains(html, "f-voice") { return false }
+    if !str_contains(html, "f-lore") { return false }
+    if !str_contains(html, "f-greeting") { return false }
+    // Must contain all 10 voice profile options
+    if !str_contains(html, "school_idol") { return false }
+    if !str_contains(html, "demon_lord") { return false }
+    if !str_contains(html, "stoic_mentor") { return false }
+    if !str_contains(html, "horror_whisper") { return false }
+    // Must contain preview section
+    if !str_contains(html, "pv-name") { return false }
+    if !str_contains(html, "pv-greeting") { return false }
+    // Must contain JS for live preview
+    if !str_contains(html, "updatePreview") { return false }
+    if !str_contains(html, "saveConfig") { return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3: JSON serialization of CharacterConfig
+    let cfg = default_config()
+    let json = config_to_json(cfg)
+    // Must contain all field names
+    if !str_contains(json, "\"name\"") { return false }
+    if !str_contains(json, "\"persona_tag\"") { return false }
+    if !str_contains(json, "\"personality\"") { return false }
+    if !str_contains(json, "\"background\"") { return false }
+    if !str_contains(json, "\"speech_style\"") { return false }
+    if !str_contains(json, "\"voice_profile\"") { return false }
+    if !str_contains(json, "\"lore_entries\"") { return false }
+    if !str_contains(json, "\"greeting\"") { return false }
+    // Must contain actual values
+    if !str_contains(json, "Mina") { return false }
+    if !str_contains(json, "school_idol") { return false }
+    // Must be valid JSON structure
+    if !str_contains(json, "{") { return false }
+    if !str_contains(json, "}") { return false }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: JSON escape handles special characters
+    let cfg = CharacterConfig {
+        name:          "Test\"Name",
+        persona_tag:   "tag\\one",
+        personality:   "Line1\nLine2",
+        background:    "Tab\there",
+        speech_style:  "normal",
+        voice_profile: "knight",
+        lore_entries:  "fact1\nfact2",
+        greeting:      "Hello \"world\"!"
+    }
+    let json = config_to_json(cfg)
+    // Escaped double-quote in name
+    if !str_contains(json, "Test\\\"Name") { return false }
+    // Escaped backslash in tag
+    if !str_contains(json, "tag\\\\one") { return false }
+    // Escaped newline in personality
+    if !str_contains(json, "Line1\\nLine2") { return false }
+    // Escaped tab in background
+    if !str_contains(json, "Tab\\there") { return false }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5: All 10 voice profiles present in dropdown
+    let html = build_html()
+    if !str_contains(html, "value=\"school_idol\"") { return false }
+    if !str_contains(html, "value=\"senpai\"") { return false }
+    if !str_contains(html, "value=\"knight\"") { return false }
+    if !str_contains(html, "value=\"sorceress\"") { return false }
+    if !str_contains(html, "value=\"noir_detective\"") { return false }
+    if !str_contains(html, "value=\"horror_whisper\"") { return false }
+    if !str_contains(html, "value=\"childhood_friend\"") { return false }
+    if !str_contains(html, "value=\"demon_lord\"") { return false }
+    if !str_contains(html, "value=\"childlike\"") { return false }
+    if !str_contains(html, "value=\"stoic_mentor\"") { return false }
+    return true
+}
+
+// ─── main ────────────────────────────────────────────────────
+
+fn main() {
+    println("[character_builder_ui] TSRV-P2-1 self-test")
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS — CharacterConfig struct (8 fields)") } else { println("T1 FAIL") }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS — HTML generation (8 fields + 10 profiles + preview + JS)") } else { println("T2 FAIL") }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS — JSON serialization") } else { println("T3 FAIL") }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS — JSON escape (quotes/backslash/newline/tab)") } else { println("T4 FAIL") }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS — all 10 voice profiles in dropdown") } else { println("T5 FAIL") }
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[character_builder_ui] ALL 5/5 PASS")
+    } else {
+        println("[character_builder_ui] SOME FAILED")
+    }
+
+    // Write HTML to /tmp/character_builder.html
+    let html = build_html()
+    let out_path = "/tmp/character_builder.html"
+    write_file(out_path, html)
+    println("[character_builder_ui] wrote " + to_string(len(html)) + " bytes -> " + out_path)
+}
+
+main()
