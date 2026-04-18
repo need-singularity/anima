@@ -1,0 +1,357 @@
+// ════════════════════════════════════════════════════════════════
+//  scripts/r2_sync_watcher.hexa — host-side R2 sync loop
+//
+//  Purpose:
+//    Periodically SSH into training pods and run `rclone copy` from
+//    the pod's ckpt dir to R2. Runs on the HOST (Mac/Linux where
+//    Claude Code lives), NOT inside the pod — immune to pod restarts
+//    that wipe cron (RUNPOD_VOLUMELESS_EPHEMERAL_WIPE, documented in
+//    training/deploy/clm_r4_launch.hexa:51).
+//
+//  Root cause context (2026-04-17):
+//    The "2h cron" previously installed on the CLM r4 pod was lost
+//    when the pod was recreated as abx2uqoa7qbbh8. r2:clm1b/r4/ mtime
+//    froze at 2026-04-17 00:51 while training continued for 50+ min.
+//    A host-side loop can never be wiped by pod churn.
+//
+//  Config:
+//    shared/config/r2_sync_watchers.json — list of watchers
+//    (id, host, port, ckpt_dir, r2_prefix, ssh_opts, rclone_flags).
+//    Entries whose host starts with "REPLACE_ME" or is literally
+//    "root@REPLACE_ME" are skipped — user must fill pod IP+port via
+//    `runpodctl ssh info <pod_id>` after each pod restart.
+//
+//  Log:
+//    shared/logs/r2_sync_watcher.log (append-only, one line per run)
+//
+//  Idempotency:
+//    rclone copy is idempotent (skips unchanged files). A coarse
+//    /tmp/r2_sync_watcher.lock file prevents overlapping runs from
+//    the launchd scheduler. Lock is held for the duration of the
+//    sweep and released on exit (normal or error).
+//
+//  Secrets:
+//    - r2 creds: ~/.config/rclone/rclone.conf (per
+//      scripts/ckpt_backup_hook.hexa convention)
+//    - ssh key: default ssh-agent identity (no keys in this file)
+//
+//  Usage:
+//    hexa scripts/r2_sync_watcher.hexa                  # one pass
+//    hexa scripts/r2_sync_watcher.hexa --dry-run        # print only
+//    DRY_RUN=1 hexa scripts/r2_sync_watcher.hexa        # same
+//
+//  Schedule (2h interval):
+//    Registered via shared/launchd/com.anima.r2-sync-watcher.plist
+//    (macOS launchd StartInterval=7200).
+//
+//    On Linux (where launchd is absent), load into systemd --user
+//    or add a crontab entry:
+//      0 */2 * * * /Users/ghost/Dev/nexus/shared/bin/hexa \
+//        /Users/ghost/Dev/anima/scripts/r2_sync_watcher.hexa \
+//        >> /Users/ghost/Dev/anima/shared/logs/r2_sync_watcher.log 2>&1
+//
+//    Manual trigger (any time):
+//      hexa $ANIMA/scripts/r2_sync_watcher.hexa
+// ════════════════════════════════════════════════════════════════
+
+let CONFIG_PATH = "shared/config/r2_sync_watchers.json"
+let LOG_PATH    = "shared/logs/r2_sync_watcher.log"
+let LOCK_PATH   = "/tmp/r2_sync_watcher.lock"
+let REPLACE_TOK = "REPLACE_ME"
+
+// ── Manual string helpers (safe subset, mirrors ckpt_backup_hook.hexa) ─
+
+fn str_contains(hay, needle) {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return true }
+    if nn > hn { return false }
+    let mut i = 0
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn str_index_of(hay, needle, from) {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return from }
+    let mut i = from
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn extract_json_string(text, key, from) {
+    // Naive "key": "value" extractor starting from offset `from`.
+    // Returns [value, end_offset], or ["", -1] on miss.
+    let needle = "\"" + key + "\""
+    let kpos = str_index_of(text, needle, from)
+    if kpos < 0 { return ["", -1] }
+    let after_key = kpos + len(needle)
+    let colon = str_index_of(text, ":", after_key)
+    if colon < 0 { return ["", -1] }
+    let open_q = str_index_of(text, "\"", colon)
+    if open_q < 0 { return ["", -1] }
+    let close_q = str_index_of(text, "\"", open_q + 1)
+    if close_q < 0 { return ["", -1] }
+    return [text.substring(open_q + 1, close_q), close_q + 1]
+}
+
+fn extract_json_int(text, key, from) {
+    // Naive "key": NNN extractor starting from offset `from`.
+    // Returns [digit_string, end_offset], or ["", -1] on miss.
+    let needle = "\"" + key + "\""
+    let kpos = str_index_of(text, needle, from)
+    if kpos < 0 { return ["", -1] }
+    let after_key = kpos + len(needle)
+    let colon = str_index_of(text, ":", after_key)
+    if colon < 0 { return ["", -1] }
+    let n = len(text)
+    let mut i = colon + 1
+    while i < n {
+        let ch = text.substring(i, i + 1)
+        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" { i = i + 1 } else { break }
+    }
+    let mut j = i
+    while j < n {
+        let cj = text.substring(j, j + 1)
+        if cj == "0" || cj == "1" || cj == "2" || cj == "3" || cj == "4"
+           || cj == "5" || cj == "6" || cj == "7" || cj == "8" || cj == "9" {
+            j = j + 1
+        } else {
+            break
+        }
+    }
+    if j == i { return ["", -1] }
+    return [text.substring(i, j), j]
+}
+
+// ── Logging ──
+
+fn now_stamp() {
+    return exec("date +%Y-%m-%dT%H:%M:%S%z").trim()
+}
+
+fn log_line(msg) {
+    let line = "[" + now_stamp() + "] " + msg + "\n"
+    // Append to log file (create dir if missing).
+    let _ = exec("mkdir -p \"$(dirname " + LOG_PATH + ")\"")
+    let _ = exec("printf '%s' " + shell_quote(line) + " >> " + LOG_PATH)
+    print(line)
+}
+
+fn shell_quote(s) {
+    // Minimal single-quote escape: close-quote, escape, re-open.
+    let mut out = "'"
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if ch == "'" {
+            out = out + "'\\''"
+        } else {
+            out = out + ch
+        }
+        i = i + 1
+    }
+    out = out + "'"
+    return out
+}
+
+// ── Lock (flock-style, but portable) ──
+
+fn acquire_lock() {
+    if file_exists(LOCK_PATH) {
+        // Check staleness: if lock file is > 3h old, treat as stale.
+        let age = exec("find " + LOCK_PATH + " -mmin +180 2>/dev/null | head -1").trim()
+        if len(age) > 0 {
+            log_line("WARN: stale lock " + LOCK_PATH + " (>180min) — removing")
+            let _ = exec("rm -f " + LOCK_PATH)
+        } else {
+            log_line("SKIP: another watcher run is in progress (lock " + LOCK_PATH + " present)")
+            return false
+        }
+    }
+    let _ = exec("echo $$ > " + LOCK_PATH)
+    return true
+}
+
+fn release_lock() {
+    let _ = exec("rm -f " + LOCK_PATH)
+}
+
+// ── Watcher config parser ──
+//
+// The config JSON is an object with a "watchers" array. Each entry has:
+//   id, enabled, host, port, ckpt_dir, r2_prefix, rclone_flags, ssh_opts
+//
+// We parse it by hand (no jq dep) — walking "{...}" blocks inside the
+// "watchers" array. Good enough for flat objects; nested objects would
+// require a real JSON parser.
+
+fn find_watchers_array(text) {
+    // Returns [start_offset, end_offset] of the "watchers": [ ... ] array body,
+    // or [-1, -1] on miss.
+    let key_pos = str_index_of(text, "\"watchers\"", 0)
+    if key_pos < 0 { return [-1, -1] }
+    let lb = str_index_of(text, "[", key_pos)
+    if lb < 0 { return [-1, -1] }
+    // Find matching ] with depth counting.
+    let n = len(text)
+    let mut depth = 1
+    let mut i = lb + 1
+    while i < n && depth > 0 {
+        let ch = text.substring(i, i + 1)
+        if ch == "[" { depth = depth + 1 }
+        if ch == "]" { depth = depth - 1 }
+        if depth == 0 { return [lb + 1, i] }
+        i = i + 1
+    }
+    return [-1, -1]
+}
+
+fn next_watcher_block(text, from, end) {
+    // Returns [start, end] of the next "{...}" block within [from, end),
+    // or [-1, -1] if no more.
+    let lb = str_index_of(text, "{", from)
+    if lb < 0 || lb >= end { return [-1, -1] }
+    let mut depth = 1
+    let mut i = lb + 1
+    while i < end && depth > 0 {
+        let ch = text.substring(i, i + 1)
+        if ch == "{" { depth = depth + 1 }
+        if ch == "}" { depth = depth - 1 }
+        if depth == 0 { return [lb, i + 1] }
+        i = i + 1
+    }
+    return [-1, -1]
+}
+
+// ── Per-watcher execution ──
+
+fn run_watcher(block_text, dry_run) {
+    // Parse fields.
+    let id_pair        = extract_json_string(block_text, "id", 0)
+    let host_pair      = extract_json_string(block_text, "host", 0)
+    let ckpt_pair      = extract_json_string(block_text, "ckpt_dir", 0)
+    let r2_pair        = extract_json_string(block_text, "r2_prefix", 0)
+    let flags_pair     = extract_json_string(block_text, "rclone_flags", 0)
+    let ssh_opts_pair  = extract_json_string(block_text, "ssh_opts", 0)
+    let port_pair      = extract_json_int(block_text, "port", 0)
+
+    let id       = id_pair[0]
+    let host     = host_pair[0]
+    let ckpt_dir = ckpt_pair[0]
+    let r2_prefix = r2_pair[0]
+    let mut rclone_flags = flags_pair[0]
+    let mut ssh_opts     = ssh_opts_pair[0]
+    let port_str = port_pair[0]
+
+    if rclone_flags == "" { rclone_flags = "-v --s3-no-check-bucket" }
+    if ssh_opts     == "" { ssh_opts = "-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes" }
+
+    // enabled defaults true; only skip on explicit "enabled": false or
+    // REPLACE_ME placeholder host.
+    let enabled_false = str_contains(block_text, "\"enabled\": false") || str_contains(block_text, "\"enabled\":false")
+
+    if id == "" {
+        log_line("SKIP: watcher block missing 'id' field")
+        return
+    }
+    if enabled_false {
+        log_line("SKIP [" + id + "]: enabled=false")
+        return
+    }
+    if host == "" || str_contains(host, REPLACE_TOK) {
+        log_line("SKIP [" + id + "]: host placeholder '" + host + "' — fill pod IP in " + CONFIG_PATH)
+        return
+    }
+    if port_str == "" || port_str == "0" {
+        log_line("SKIP [" + id + "]: port placeholder (0) — fill SSH port in " + CONFIG_PATH)
+        return
+    }
+    if ckpt_dir == "" || r2_prefix == "" {
+        log_line("SKIP [" + id + "]: ckpt_dir or r2_prefix empty")
+        return
+    }
+
+    // Build remote rclone command.
+    let remote_cmd = "rclone copy " + ckpt_dir + " " + r2_prefix + " " + rclone_flags + " 2>&1"
+    let ssh_cmd = "ssh -p " + port_str + " " + ssh_opts + " " + host + " " + shell_quote(remote_cmd)
+
+    log_line("RUN [" + id + "] host=" + host + ":" + port_str + " " + ckpt_dir + " -> " + r2_prefix)
+
+    if dry_run {
+        log_line("DRY [" + id + "] cmd: " + ssh_cmd)
+        return
+    }
+
+    // Execute ssh and append stdout+stderr directly to log; capture ssh's exit code.
+    // Avoid pipes entirely — PIPESTATUS isn't portable across sh/bash and breaks
+    // with nested quoting in the remote rclone command.
+    let full = ssh_cmd + " >> " + LOG_PATH + " 2>&1; echo __RC__=$?"
+    let result = exec(full)
+    let mut rc = "?"
+    let rc_idx = str_index_of(result, "__RC__=", 0)
+    if rc_idx >= 0 {
+        let after = rc_idx + 7
+        let nl = str_index_of(result, "\n", after)
+        let end = if nl < 0 { len(result) } else { nl }
+        rc = result.substring(after, end).trim()
+    }
+    log_line("DONE [" + id + "] rc=" + rc)
+}
+
+// ── Main ──
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+    let mut dry_run = false
+    if env("DRY_RUN") == "1" { dry_run = true }
+    let mut i = 2
+    while i < argc {
+        if argv[i] == "--dry-run" { dry_run = true }
+        i = i + 1
+    }
+
+    log_line("=== r2_sync_watcher start (dry_run=" + str(dry_run) + ") ===")
+
+    if !file_exists(CONFIG_PATH) {
+        log_line("ERR: config not found: " + CONFIG_PATH)
+        return
+    }
+
+    let got_lock = acquire_lock()
+    if !got_lock { return }
+
+    let text = read_file(CONFIG_PATH)
+    let arr = find_watchers_array(text)
+    if arr[0] < 0 {
+        log_line("ERR: no 'watchers' array in " + CONFIG_PATH)
+        release_lock()
+        return
+    }
+
+    let mut cursor = arr[0]
+    let arr_end = arr[1]
+    let mut count = 0
+    while cursor < arr_end {
+        let blk = next_watcher_block(text, cursor, arr_end)
+        if blk[0] < 0 { break }
+        let block_text = text.substring(blk[0], blk[1])
+        run_watcher(block_text, dry_run)
+        cursor = blk[1]
+        count = count + 1
+    }
+
+    log_line("=== r2_sync_watcher done (processed " + str(count) + " watchers) ===")
+    release_lock()
+}
+
+main()
