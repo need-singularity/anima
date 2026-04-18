@@ -869,6 +869,402 @@ extern fn hxblas_embed_scatter(S: int, D: int, dembed_ptr: int, dh: int, tokens:
 @link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
 extern fn hxblas_saxpy(N: int, alpha: float, x: int, incx: int, y: int, incy: int)
 
+// ════════════════════════════════════════════════════════════════════
+// §8b  BLAS FALLBACK (pure-hexa scalar) + dispatch_* shims
+// ────────────────────────────────────────────────────────────────────
+// Canonical copy: self/stdlib/blas_fallback.hexa
+// Inlined here so nn_core.hexa is self-contained (no `use` dep) and the
+// dispatch shims don't need cross-module linkage. Gated on HX_BLAS_ENABLED
+// (HX_BLAS=1 env var). Scalar triple-loops — correctness-only, slow.
+// ════════════════════════════════════════════════════════════════════
+
+let FB_FLOAT_SIZE = 4
+
+fn fb_sigmoid(x: float) -> float {
+    1.0 / (1.0 + exp(0.0 - x))
+}
+
+fn fb_sgemm(order: int, transA: int, transB: int,
+            M: int, N: int, K: int,
+            alpha: float, A: int, lda: int,
+            B: int, ldb: int,
+            beta: float, C: int, ldc: int) {
+    let ta = transA == 112
+    let tb = transB == 112
+    let mut i = 0
+    while i < M {
+        let mut j = 0
+        while j < N {
+            let mut acc = 0.0
+            let mut p = 0
+            while p < K {
+                let a_off = if ta { (p * lda + i) * FB_FLOAT_SIZE } else { (i * lda + p) * FB_FLOAT_SIZE }
+                let b_off = if tb { (j * ldb + p) * FB_FLOAT_SIZE } else { (p * ldb + j) * FB_FLOAT_SIZE }
+                acc = acc + deref_f32(A, a_off) * deref_f32(B, b_off)
+                p = p + 1
+            }
+            let c_off = (i * ldc + j) * FB_FLOAT_SIZE
+            let prev = deref_f32(C, c_off)
+            write_f32(C, c_off, alpha * acc + beta * prev)
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+fn fb_saxpy(N: int, alpha: float, x: int, incx: int, y: int, incy: int) {
+    let mut i = 0
+    while i < N {
+        let x_off = i * incx * FB_FLOAT_SIZE
+        let y_off = i * incy * FB_FLOAT_SIZE
+        let prev = deref_f32(y, y_off)
+        write_f32(y, y_off, prev + alpha * deref_f32(x, x_off))
+        i = i + 1
+    }
+}
+
+fn fb_axpy_inplace(N: int, dst: int, src: int) {
+    let mut i = 0
+    while i < N {
+        let off = i * FB_FLOAT_SIZE
+        let prev = deref_f32(dst, off)
+        write_f32(dst, off, prev + deref_f32(src, off))
+        i = i + 1
+    }
+}
+
+fn fb_copy(N: int, dst: int, src: int) {
+    let mut i = 0
+    while i < N {
+        let off = i * FB_FLOAT_SIZE
+        write_f32(dst, off, deref_f32(src, off))
+        i = i + 1
+    }
+}
+
+fn fb_zero(N: int, dst: int) {
+    let mut i = 0
+    while i < N {
+        write_f32(dst, i * FB_FLOAT_SIZE, 0.0)
+        i = i + 1
+    }
+}
+
+fn fb_sgd_inplace(N: int, lr: float, w: int, g: int) {
+    let mut i = 0
+    while i < N {
+        let off = i * FB_FLOAT_SIZE
+        let prev = deref_f32(w, off)
+        write_f32(w, off, prev - lr * deref_f32(g, off))
+        i = i + 1
+    }
+}
+
+fn fb_silu_fwd(N: int, out: int, x: int) {
+    let mut i = 0
+    while i < N {
+        let off = i * FB_FLOAT_SIZE
+        let v = deref_f32(x, off)
+        write_f32(out, off, v * fb_sigmoid(v))
+        i = i + 1
+    }
+}
+
+fn fb_silu_bwd(N: int, dx: int, x: int, dy: int) {
+    let mut i = 0
+    while i < N {
+        let off = i * FB_FLOAT_SIZE
+        let xv = deref_f32(x, off)
+        let s = fb_sigmoid(xv)
+        let dyv = deref_f32(dy, off)
+        write_f32(dx, off, dyv * (s + xv * s * (1.0 - s)))
+        i = i + 1
+    }
+}
+
+fn fb_rmsnorm_fwd(S: int, D: int, eps: float, y: int, x: int, g: int) {
+    let mut i = 0
+    while i < S {
+        let row = i * D * FB_FLOAT_SIZE
+        let mut s = 0.0
+        let mut p = 0
+        while p < D {
+            let v = deref_f32(x, row + p * FB_FLOAT_SIZE)
+            s = s + v * v
+            p = p + 1
+        }
+        let inv = 1.0 / sqrt(s / to_float(D) + eps)
+        p = 0
+        while p < D {
+            let off = row + p * FB_FLOAT_SIZE
+            let gv = deref_f32(g, p * FB_FLOAT_SIZE)
+            write_f32(y, off, gv * deref_f32(x, off) * inv)
+            p = p + 1
+        }
+        i = i + 1
+    }
+}
+
+fn fb_rmsnorm_bwd(S: int, D: int, eps: float, dx: int, dg: int, x: int, g: int, dy: int) {
+    let Df = to_float(D)
+    let mut i = 0
+    while i < S {
+        let row = i * D * FB_FLOAT_SIZE
+        let mut ms = 0.0
+        let mut dot = 0.0
+        let mut p = 0
+        while p < D {
+            let xv = deref_f32(x, row + p * FB_FLOAT_SIZE)
+            let gv = deref_f32(g, p * FB_FLOAT_SIZE)
+            let dyv = deref_f32(dy, row + p * FB_FLOAT_SIZE)
+            ms = ms + xv * xv
+            dot = dot + gv * dyv * xv
+            p = p + 1
+        }
+        let inv = 1.0 / sqrt(ms / Df + eps)
+        let inv3_over_D = inv * inv * inv / Df
+        p = 0
+        while p < D {
+            let off = row + p * FB_FLOAT_SIZE
+            let xv = deref_f32(x, off)
+            let gv = deref_f32(g, p * FB_FLOAT_SIZE)
+            let dyv = deref_f32(dy, off)
+            write_f32(dx, off, gv * dyv * inv - xv * dot * inv3_over_D)
+            let dg_off = p * FB_FLOAT_SIZE
+            let prev = deref_f32(dg, dg_off)
+            write_f32(dg, dg_off, prev + dyv * xv * inv)
+            p = p + 1
+        }
+        i = i + 1
+    }
+}
+
+fn fb_attn_softmax_causal(S: int, scale: float, scores: int) {
+    let NEG_BIG = -1.0e30
+    let mut i = 0
+    while i < S {
+        let row = i * S * FB_FLOAT_SIZE
+        let mut j = 0
+        while j < S {
+            let off = row + j * FB_FLOAT_SIZE
+            if j > i {
+                write_f32(scores, off, NEG_BIG)
+            } else {
+                write_f32(scores, off, deref_f32(scores, off) * scale)
+            }
+            j = j + 1
+        }
+        let mut mx = deref_f32(scores, row)
+        j = 1
+        while j < S {
+            let v = deref_f32(scores, row + j * FB_FLOAT_SIZE)
+            if v > mx { mx = v }
+            j = j + 1
+        }
+        let mut sm = 0.0
+        j = 0
+        while j < S {
+            let off = row + j * FB_FLOAT_SIZE
+            let e = exp(deref_f32(scores, off) - mx)
+            write_f32(scores, off, e)
+            sm = sm + e
+            j = j + 1
+        }
+        let inv = 1.0 / sm
+        j = 0
+        while j < S {
+            let off = row + j * FB_FLOAT_SIZE
+            write_f32(scores, off, deref_f32(scores, off) * inv)
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+fn fb_attn_softmax_bwd(S: int, scale: float, dscores: int, probs: int, dprobs: int) {
+    let mut i = 0
+    while i < S {
+        let row = i * S * FB_FLOAT_SIZE
+        let mut dot = 0.0
+        let mut j = 0
+        while j < S {
+            let off = row + j * FB_FLOAT_SIZE
+            dot = dot + deref_f32(probs, off) * deref_f32(dprobs, off)
+            j = j + 1
+        }
+        j = 0
+        while j < S {
+            let off = row + j * FB_FLOAT_SIZE
+            let pv = deref_f32(probs, off)
+            let dpv = deref_f32(dprobs, off)
+            write_f32(dscores, off, pv * (dpv - dot) * scale)
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+fn fb_cross_entropy(S: int, V: int, scale: float, logits: int, dlogits: int, targets: int) -> float {
+    let mut total = 0.0
+    let mut i = 0
+    while i < S {
+        let row = i * V * FB_FLOAT_SIZE
+        let mut mx = deref_f32(logits, row)
+        let mut j = 1
+        while j < V {
+            let v = deref_f32(logits, row + j * FB_FLOAT_SIZE)
+            if v > mx { mx = v }
+            j = j + 1
+        }
+        let mut sm = 0.0
+        j = 0
+        while j < V {
+            sm = sm + exp(deref_f32(logits, row + j * FB_FLOAT_SIZE) - mx)
+            j = j + 1
+        }
+        let logsum = mx + log(sm)
+        let tgt = deref_i64(targets, i * 8)
+        let tgt_off = row + tgt * FB_FLOAT_SIZE
+        total = total + (logsum - deref_f32(logits, tgt_off))
+        let inv = 1.0 / sm
+        j = 0
+        while j < V {
+            let off = row + j * FB_FLOAT_SIZE
+            let p = exp(deref_f32(logits, off) - mx) * inv
+            let sub = if j == tgt { 1.0 } else { 0.0 }
+            write_f32(dlogits, off, (p - sub) * scale)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    total
+}
+
+fn fb_embed_lookup(S: int, D: int, h: int, embed_ptr: int, tokens: int) {
+    let mut i = 0
+    while i < S {
+        let tid = deref_i64(tokens, i * 8)
+        let src_row = tid * D * FB_FLOAT_SIZE
+        let dst_row = i * D * FB_FLOAT_SIZE
+        let mut p = 0
+        while p < D {
+            let off = p * FB_FLOAT_SIZE
+            write_f32(h, dst_row + off, deref_f32(embed_ptr, src_row + off))
+            p = p + 1
+        }
+        i = i + 1
+    }
+}
+
+fn fb_embed_scatter(S: int, D: int, dembed_ptr: int, dh: int, tokens: int) {
+    let mut i = 0
+    while i < S {
+        let tid = deref_i64(tokens, i * 8)
+        let dst_row = tid * D * FB_FLOAT_SIZE
+        let src_row = i * D * FB_FLOAT_SIZE
+        let mut p = 0
+        while p < D {
+            let off = p * FB_FLOAT_SIZE
+            let prev = deref_f32(dembed_ptr, dst_row + off)
+            write_f32(dembed_ptr, dst_row + off, prev + deref_f32(dh, src_row + off))
+            p = p + 1
+        }
+        i = i + 1
+    }
+}
+
+// ── dispatch_* shims: 1:1 wrappers over hxblas_* + fb_* fallback ────
+fn dispatch_sgemm(order: int, transA: int, transB: int,
+                  M: int, N: int, K: int,
+                  alpha: float, A: int, lda: int,
+                  B: int, ldb: int,
+                  beta: float, C: int, ldc: int) {
+    if HX_BLAS_ENABLED {
+        hxblas_sgemm(order, transA, transB, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc)
+    } else {
+        fb_sgemm(order, transA, transB, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc)
+    }
+}
+
+fn dispatch_saxpy(N: int, alpha: float, x: int, incx: int, y: int, incy: int) {
+    if HX_BLAS_ENABLED {
+        hxblas_saxpy(N, alpha, x, incx, y, incy)
+    } else {
+        fb_saxpy(N, alpha, x, incx, y, incy)
+    }
+}
+
+fn dispatch_axpy_inplace(N: int, dst: int, src: int) {
+    if HX_BLAS_ENABLED {
+        hxblas_axpy_inplace(N, dst, src)
+    } else {
+        fb_axpy_inplace(N, dst, src)
+    }
+}
+
+fn dispatch_copy(N: int, dst: int, src: int) {
+    if HX_BLAS_ENABLED {
+        hxblas_copy(N, dst, src)
+    } else {
+        fb_copy(N, dst, src)
+    }
+}
+
+fn dispatch_zero(N: int, dst: int) {
+    if HX_BLAS_ENABLED {
+        hxblas_zero(N, dst)
+    } else {
+        fb_zero(N, dst)
+    }
+}
+
+fn dispatch_sgd_inplace(N: int, lr: float, w: int, g: int) {
+    if HX_BLAS_ENABLED {
+        hxblas_sgd_inplace(N, lr, w, g)
+    } else {
+        fb_sgd_inplace(N, lr, w, g)
+    }
+}
+
+fn dispatch_attn_softmax_causal(S: int, scale: float, scores: int) {
+    if HX_BLAS_ENABLED {
+        hxblas_attn_softmax_causal(S, scale, scores)
+    } else {
+        fb_attn_softmax_causal(S, scale, scores)
+    }
+}
+
+fn dispatch_attn_softmax_bwd(S: int, scale: float, dscores: int, probs: int, dprobs: int) {
+    if HX_BLAS_ENABLED {
+        hxblas_attn_softmax_bwd(S, scale, dscores, probs, dprobs)
+    } else {
+        fb_attn_softmax_bwd(S, scale, dscores, probs, dprobs)
+    }
+}
+
+fn dispatch_cross_entropy(S: int, V: int, scale: float, logits: int, dlogits: int, targets: int) -> float {
+    if HX_BLAS_ENABLED {
+        return hxblas_cross_entropy(S, V, scale, logits, dlogits, targets)
+    }
+    return fb_cross_entropy(S, V, scale, logits, dlogits, targets)
+}
+
+fn dispatch_embed_lookup(S: int, D: int, h: int, embed_ptr: int, tokens: int) {
+    if HX_BLAS_ENABLED {
+        hxblas_embed_lookup(S, D, h, embed_ptr, tokens)
+    } else {
+        fb_embed_lookup(S, D, h, embed_ptr, tokens)
+    }
+}
+
+fn dispatch_embed_scatter(S: int, D: int, dembed_ptr: int, dh: int, tokens: int) {
+    if HX_BLAS_ENABLED {
+        hxblas_embed_scatter(S, D, dembed_ptr, dh, tokens)
+    } else {
+        fb_embed_scatter(S, D, dembed_ptr, dh, tokens)
+    }
+}
+
 // ── vDSP (Accelerate) eltwise FFI — Apple Silicon only ─────────────
 // vDSP fused ops (svesq + vsmul + vmul, vvexpf, vvrecf, etc.) give an
 // additional 1.5-2x on top of the tight scalar C loops above, but are
@@ -941,7 +1337,7 @@ fn nnt_matmul(a: Tensor, b: Tensor) -> Tensor {
     let K = a.d1
     let N = b.d1
     let c = nnt_new2(M, N)
-    hxblas_sgemm(NNT_CblasRowMajor, NNT_CblasNoTrans, NNT_CblasNoTrans,
+    dispatch_sgemm(NNT_CblasRowMajor, NNT_CblasNoTrans, NNT_CblasNoTrans,
                  M, N, K, 1.0, a.data, K, b.data, N, 0.0, c.data, N)
     return c
 }
@@ -951,7 +1347,7 @@ fn nnt_matmul_transB(a: Tensor, b: Tensor, N: int) -> Tensor {
     let M = a.d0
     let K = a.d1
     let c = nnt_new2(M, N)
-    hxblas_sgemm(NNT_CblasRowMajor, NNT_CblasNoTrans, NNT_CblasTrans,
+    dispatch_sgemm(NNT_CblasRowMajor, NNT_CblasNoTrans, NNT_CblasTrans,
                  M, N, K, 1.0, a.data, K, b.data, K, 0.0, c.data, N)
     return c
 }
@@ -961,7 +1357,7 @@ fn nnt_matmul_transA(a: Tensor, b: Tensor, K: int) -> Tensor {
     let M = a.d0
     let N = b.d1
     let c = nnt_new2(K, N)
-    hxblas_sgemm(NNT_CblasRowMajor, NNT_CblasTrans, NNT_CblasNoTrans,
+    dispatch_sgemm(NNT_CblasRowMajor, NNT_CblasTrans, NNT_CblasNoTrans,
                  K, N, M, 1.0, a.data, K, b.data, N, 0.0, c.data, N)
     return c
 }
@@ -980,7 +1376,7 @@ fn nnt_linear(x: Tensor, W: Tensor, b: Tensor) -> Tensor {
     while i < B {
         // saxpy: y_row[j] += 1.0 * b[j] for j in [0..out)
         // row_ptr = y.data + i * out * 4 bytes; stride=1 for both
-        hxblas_saxpy(out, 1.0, b.data, 1, y.data + i * out * 4, 1)
+        dispatch_saxpy(out, 1.0, b.data, 1, y.data + i * out * 4, 1)
         i = i + 1
     }
     return y
@@ -1030,13 +1426,13 @@ fn nnt_softmax_row(scores: Tensor, row_start: int, n: int) {
 // Combines: scores *= scale, mask j>i = -inf, then softmax per row.
 // Single FFI call replaces O(S^2) scalar hexa loop.
 fn nnt_attn_softmax_causal(scores: Tensor, S: int, scale: float) {
-    hxblas_attn_softmax_causal(S, scale, scores.data)
+    dispatch_attn_softmax_causal(S, scale, scores.data)
 }
 
 // Softmax backward for attention: produces dscores from probs + dprobs.
 // dscores[i,j] = probs[i,j] * (dprobs[i,j] - sum_j(probs*dprobs)) * scale
 fn nnt_attn_softmax_bwd(S: int, scale: float, dscores: Tensor, probs: Tensor, dprobs: Tensor) {
-    hxblas_attn_softmax_bwd(S, scale, dscores.data, probs.data, dprobs.data)
+    dispatch_attn_softmax_bwd(S, scale, dscores.data, probs.data, dprobs.data)
 }
 
 // SwiGLU-self (SiLU): y = x * sigmoid(x) — out-of-place
@@ -1062,7 +1458,7 @@ fn nnt_swiglu_bwd(x: Tensor, dy: Tensor) -> Tensor {
 // VECTORISED: scalar deref_f32/write_f32 loop replaced with single FFI call
 // to hxblas_axpy_inplace (tight C loop, auto-vectorised to NEON/AVX).
 fn nnt_add_inplace(dst: Tensor, src: Tensor) {
-    hxblas_axpy_inplace(dst.numel, dst.data, src.data)
+    dispatch_axpy_inplace(dst.numel, dst.data, src.data)
 }
 
 // SGD in-place: w -= lr * g
@@ -1070,7 +1466,7 @@ fn nnt_add_inplace(dst: Tensor, src: Tensor) {
 // VECTORISED: scalar deref_f32/write_f32 loop replaced with single FFI call
 // to hxblas_sgd_inplace (tight C loop w[i]-=lr*g[i], auto-vectorised).
 fn nnt_sgd_inplace(w: Tensor, g: Tensor, lr: float) {
-    hxblas_sgd_inplace(w.numel, lr, w.data, g.data)
+    dispatch_sgd_inplace(w.numel, lr, w.data, g.data)
 }
 
 // ── Copy + Zero ─────────────────────────────────────────────────────
@@ -1079,13 +1475,13 @@ fn nnt_sgd_inplace(w: Tensor, g: Tensor, lr: float) {
 // Deep copy a tensor (new allocation, same data)
 fn nnt_copy(src: Tensor) -> Tensor {
     let out = nnt_new2(src.d0, src.d1)
-    hxblas_copy(src.numel, out.data, src.data)
+    dispatch_copy(src.numel, out.data, src.data)
     return out
 }
 
 // Zero a tensor in-place
 fn nnt_zero(t: Tensor) {
-    hxblas_zero(t.numel, t.data)
+    dispatch_zero(t.numel, t.data)
 }
 
 // ── Cross-entropy loss + gradient (fused) ───────────────────────────
@@ -1099,7 +1495,7 @@ fn nnt_zero(t: Tensor) {
 // VECTORISED: replaces O(S*V) scalar loop with single FFI call to
 // hxblas_cross_entropy (fused max + exp + log + grad in one pass per row).
 fn nnt_cross_entropy(logits: Tensor, dlogits: Tensor, targets_buf: int, S: int, V: int, scale: float) -> float {
-    return hxblas_cross_entropy(S, V, scale, logits.data, dlogits.data, targets_buf)
+    return dispatch_cross_entropy(S, V, scale, logits.data, dlogits.data, targets_buf)
 }
 
 // ── Embedding lookup + scatter ──────────────────────────────────────
@@ -1107,14 +1503,14 @@ fn nnt_cross_entropy(logits: Tensor, dlogits: Tensor, targets_buf: int, S: int, 
 // tokens_buf is a raw int64 buffer (alloc_raw'd, not a Tensor).
 fn nnt_embed_lookup(embed: Tensor, tokens_buf: int, S: int, D: int) -> Tensor {
     let out = nnt_new2(S, D)
-    hxblas_embed_lookup(S, D, out.data, embed.data, tokens_buf)
+    dispatch_embed_lookup(S, D, out.data, embed.data, tokens_buf)
     return out
 }
 
 // dembed[tokens[i], :] += dh[i, :]  — scatter-add gradient into embedding table
 // Replaces O(S*D) scalar accumulation loop.
 fn nnt_embed_scatter(dembed: Tensor, dh: Tensor, tokens_buf: int, S: int, D: int) {
-    hxblas_embed_scatter(S, D, dembed.data, dh.data, tokens_buf)
+    dispatch_embed_scatter(S, D, dembed.data, dh.data, tokens_buf)
 }
 
 // ════════════════════════════════════════════════════════════════════
