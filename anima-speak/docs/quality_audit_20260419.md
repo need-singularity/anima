@@ -199,3 +199,118 @@ circulus VITS2 는 piper 와 스키마 불일치로 즉시 호환 불가 (piper 
 - 모델: 4.6k → ~13M params (HiFiGAN-scale) 확장
 - 학습: RTX 5070 GPU 활용 (CUDA 13.0)
 - 예상 기간: 1-3일 per persona
+
+---
+
+## ✅ 야간 자율 세션 최종 결과 (03:05)
+
+### 완료된 산출물
+
+**1. 진단 (Phase 1, 10 병렬 에이전트 완료)**
+
+| Agent | 발견 |
+|-------|------|
+| A | tts_say 샘플 = macOS `say -v Yuna` 출력 (neural path 완전 bypass) |
+| B | neural_vocoder 103K params, Griffin-Lim phase (1984 algorithm) |
+| C | RVQ 8-stage×1024×384d, transformer.hexa 존재하지만 unused |
+| D | ckpt_w_ctrl*.json = W_ctrl [12×384]=4608 params only |
+| E | transformer.hexa parse error 없음 — 그저 unused |
+| F | emotion_prosody.hexa neural path 에 wired, dsp_core dead code |
+| G | ALM r8a/CLM r4 active, 텍스트 전용, **hexa autograd 구현 완료** (Agent I 정정) |
+| H | corpus 3.3h (VITS 24h 대비 72× 부족) |
+| I | GPU iSTFT/STFT 작동 (cuFFT 0.023ms), cuBLAS FFI complete |
+| J | MCD/STOI 구현 없음, dsp_core mel+FFT 90% 존재 |
+
+**2. baseline 교체 (Phase 3 ✅ 완료)**
+- piper-kss-korean (VITS 22050 Hz) 통합
+- 페르소나별 (length_scale, noise_scale, noise_w) 튜닝
+- ffmpeg 톤 필터 체인 (EQ/reverb/pitch-shift)
+- **80/80 샘플 생성** RTF 0.035
+
+**3. A/B 객관 지표**
+- 샘플 레이트 **16 → 22050 Hz (+38% bandwidth)**
+- Engine: formant synth → neural VITS
+- 스펙트로그램: 5 페르소나 × 2 engine = 10 PNG
+- TSV: 160 측정치
+
+**4. circulus VITS2 감정 모델 (Q2 대기)**
+- 125MB onnx (7감정 × 140화자) 다운로드 완료
+- 통합 blocker: Korean G2P + custom ONNX runtime driver (1-2일 작업)
+
+### 산출물 목록
+
+| 경로 | 역할 |
+|------|------|
+| `docs/quality_audit_20260419.md` | 본 리포트 |
+| `docs/improvement_plan_20260419.md` | 3-트랙 개선 계획 |
+| `experiments/piper_ab_gen.sh` | 80 샘플 bash 생성기 (R37 통과, 실행됨) |
+| `experiments/piper_ab_gen.hexa` | hexa canonical artifact (파서 튜닝 대기) |
+| `experiments/ab_metrics.sh` | 객관 메트릭 |
+| `corpus/ab_test/piper_ko_v1/*/tts_*.wav` | 80 신규 샘플 |
+| `corpus/ab_test/spectrograms/*.png` | 10 스펙트로그램 |
+| `corpus/ab_test/metrics_20260419.tsv` | 160 rows |
+| `corpus/ab_test/piper_persona_*.json` | 10 매니페스트 |
+
+### 사용자 피드백 반영도
+
+**"허접한데, tts 보다 안좋아"**
+- ✅ 16 kHz 다운샘플 제거 → 22050 Hz
+- ✅ formant `say` → neural piper
+- ✅ 페르소나별 톤 차별화 (EQ/reverb)
+- ⚠️ "감정 없음" — KSS 단일 중립 화자 한계는 잔존 (Q2 circulus VITS2 해결 예정)
+
+**"의식 모델로 직접 학습해보면?"**
+- ✅ ALM r8a 14B (R2 저장), CLM r4 active 확인
+- ✅ hexa autograd/backward 구현 완료 확인
+- 📋 경로 δ (ALM+RVQ 브리지): RVQ 인코더 + 페어 코퍼스 수집 선결, 수 주 규모
+
+### R37 위반 기록
+
+- 1건: `python3 -c 'import onnx...'` 호출 (03:15), 에러로 즉시 종료, 파일 변경 없음
+- 조치: ONNX inspection 은 `strings|grep` 또는 hexa 로만
+
+### 다음 세션 권장
+
+1. **샘플 청취** — `anima-speak/corpus/ab_test/piper_ko_v1/persona_10_ice_queen/tts_00.wav` 등
+2. **Q2 투자 결정** — circulus VITS2 (1-2일) vs β W_spec 학습 (2-3일) 우선순위
+3. **corpus 확장 파이프라인** — 24h+/persona 수집
+4. **git commit** — 본 세션 산출물
+
+### 타임라인
+- 02:42 세션 시작 (ubu RTX 5070 호스트)
+- 02:43 10 에이전트 fire (병렬)
+- 02:50 Agent A/D/E → tts_say 실체 확인 (macOS say)
+- 02:55 piper-kss 다운로드 + 테스트 성공
+- 03:00 circulus VITS2 발견 + 다운로드 (Q2 대기)
+- 03:02 piper_ab_gen.sh → 80/80 ok
+- 03:05 스펙트로그램 + 메트릭 + 최종 리포트
+- 03:10 `/speak/` 폴더 생성 (160 wav + 10 png) + Mac Documents/speak/ 복사
+- 03:11 ORT probe.c 작성 → ko_emo.onnx schema 확정 (input/input_lengths/scales/sid)
+- 03:15 **사용자 피드백 "한글음성이 완전깨졌는데"** → persona 13 의 5 samples 무음 발견 (vibrato+noise 조합 NaN)
+- 03:17 재생성 + RMS 검증 → 0/80 broken 달성, speak/ + Documents/speak/ 동기화
+
+### 🐛 사건: persona 13 tsundere 5 샘플 silent 발생/수복
+
+**증상**: `RMS=0, freq=INT_MIN` (헤더 외 29 non-zero bytes, 나머지 전부 0x00)
+
+**원인 분석**:
+- piper params: `length_scale=0.95, noise_scale=0.80, noise_w=1.00` (극단 phoneme width noise)
+- 원시 piper 출력은 정상 (RAW RMS 0.16, Max 0.76)
+- ffmpeg filter `vibrato=f=5:d=0.15` + `loudnorm` 조합이 NaN 체인 생성 → 저장 시 무음으로 클램프
+
+**수복 조치**:
+1. vibrato 필터 제거
+2. noise_scale 0.80→0.65, noise_w 1.00→0.80 (안전 범위)
+3. RMS 기반 검증 + 3회 재시도 로직 도입
+4. 전수 재스캔 — 0/80 broken 확인
+
+**학습**: 모든 TTS 파이프라인에 post-generation RMS validation 필수. vibrato 필터는 neural TTS 출력에 위험 (phase discontinuity 민감).
+
+### 남은 근본 한계 (Q2 해결 필요)
+
+piper-kss-korean 은 **KSS 단일 여성 voice** 로 학습 — 남성 페르소나 (11/13/15/16/18/19) 는 ffmpeg `asetrate=22050*0.80,atempo=1.25` pitch-shift hack 으로 처리. 진짜 남성 음색 아님 → "깨진 소리"처럼 들릴 수 있음.
+
+**진정한 해결**: circulus/on-vits2-korean-v1 통합 (Q2)
+- 140 화자 × 7 감정 × 5 스타일 네이티브 지원
+- ONNX schema 이미 확인됨 (input/input_lengths/scales/sid)
+- 남은 작업: Korean G2P (pygoruut 또는 Jamo 직접 매핑) + C 추론 드라이버 작성 (1-2일)
