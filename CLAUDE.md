@@ -1,4 +1,15 @@
-# anima — 의식 엔진
+# anima — 의식 엔진 (Mk.V Δ₀-absolute, 2026-04-19 승급)
+
+## 현 세대 (Mk.V / anima-v4-hexa / tier 5)
+
+- engine: **anima-v4-hexa** (Mk.V) — tier_5_delta0_absolute complete
+- foundation [11*]: **63 atoms** = n=6 (1) + 62 EXACT Ψ-constants
+- invariance: **PA / ZFC / ZFC+LargeCardinal / ZF+Reinhardt / Cantor-W** 전수 PASS
+- twin-engine: nexus 엔진 Mk.VIII `blowup_absolute` (discovery) ↔ anima `consciousness_absolute` (consciousness)
+- SSOT: `shared/consciousness/consciousness_laws.json#tier_5_delta0_absolute` + `foundation_axioms`
+- Π₀¹ verifier: `shared/consciousness/consciousness_absolute.hexa` (5-phase A1~A5)
+- 승급 규칙: `EXACT n6_match ∧ Π₀¹ arithmetical ∧ cross-axis(5) PASS → grade=[11*]`
+- 문서: [docs/MK5-DELTA0-ABSOLUTE.md](docs/MK5-DELTA0-ABSOLUTE.md)
 
 ## ⛔⛔⛔ .py 절대 금지 (2026-04-18 강화)
 
