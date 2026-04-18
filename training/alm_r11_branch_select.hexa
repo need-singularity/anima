@@ -1,0 +1,423 @@
+// training/alm_r11_branch_select.hexa
+//
+// ALM r11 — deterministic branch selector (A / B / C) from r10 outputs.
+//
+// Plan SSOT:
+//   /Users/ghost/Dev/anima/training/alm_r11_design.md §1 (branch decision table),
+//   §2 (metrics source map). Design doc listed this file as out-of-scope (§10);
+//   this module fills that gap — a one-shot reader over r10 metrics that prints
+//   a single branch letter and (optionally) fires the matching launcher.
+//
+// Branch logic (§1, deterministic — not discretionary):
+//   A (32B)       sentinel PASS all ckpts AND Likert >= 3.3 AND Phi_refl > 0.3
+//                                         AND eval_loss mono-descent.
+//   B (14B cont.) sentinel PASS >= 8/10 ckpts AND Likert >= 2.8
+//                                         AND (loss stagnate OR Phi_refl 0.1-0.3).
+//   C (14B seed)  sentinel FAIL any step <= 1000 OR Likert < 2.8
+//                                         OR loss < 0.5 before step 500.
+//
+// Precedence (when multiple rules fire): C > A > B.  C is a safety exit —
+// any collapse symptom short-circuits scale escalation.  A requires all
+// clean signals; B is the "soft" fallback.
+//
+// Compliance: R37 / AN13 / L3-PY — ZERO python invocations.  All reads via
+// read_file + exec("ls ...") (KILL/shell probe), no python3, no .py fork.
+//
+// Usage:
+//   hexa training/alm_r11_branch_select.hexa --selftest
+//   hexa training/alm_r11_branch_select.hexa --dry-run \
+//        --r10-dir /workspace/ckpt_alm_14b_r10 \
+//        --eval-report /workspace/ckpt_alm_14b_r10/eval_report.json
+//   hexa training/alm_r11_branch_select.hexa --fire --pod-id <id> ...
+//
+// Expected eval-report JSON (produced by serving/eval_harness.hexa):
+//   { "likert": 3.4, "phi_refl": 0.35,
+//     "loss_mono_descent": true, "loss_min": 1.23, "loss_min_step": 1800 }
+
+let DEFAULT_R10_DIR     = "/workspace/ckpt_alm_14b_r10"
+let DEFAULT_EVAL_REPORT = "/workspace/ckpt_alm_14b_r10/eval_report.json"
+let DEFAULT_TRAIN_LOG   = "train_r10.log"   // relative to r10-dir
+
+let LAUNCHER_A = "/Users/ghost/Dev/anima/training/launch_alm_r11_a.hexa"
+let LAUNCHER_B = "/Users/ghost/Dev/anima/training/launch_alm_r11_b.hexa"
+let LAUNCHER_C = "/Users/ghost/Dev/anima/training/launch_alm_r11_c.hexa"
+
+// ── argv ──────────────────────────────────────────────────────────────
+
+let argv = args()
+
+fn flag_value(name: string, fallback: string) -> string {
+    let n = argv.len()
+    let mut i = 0
+    while i < n {
+        if argv[i] == name && i + 1 < n { return argv[i + 1] }
+        i = i + 1
+    }
+    return fallback
+}
+
+fn flag_bool(name: string) -> bool {
+    let n = argv.len()
+    let mut i = 0
+    while i < n {
+        if argv[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+let R10_DIR     = flag_value("--r10-dir", DEFAULT_R10_DIR)
+let EVAL_REPORT = flag_value("--eval-report", DEFAULT_EVAL_REPORT)
+let POD_ID      = flag_value("--pod-id", "")
+let DRY_RUN     = flag_bool("--dry-run")
+let FIRE        = flag_bool("--fire")
+let SELFTEST    = flag_bool("--selftest")
+
+// ── tiny JSON-ish scalar extractor ────────────────────────────────────
+// Looks for `"key"` then skips whitespace and `:` and reads a primitive
+// (number, true/false, or quoted string).  Good enough for flat eval reports.
+
+fn find_after(hay: string, key: string) -> int {
+    let needle = "\"" + key + "\""
+    return hay.index_of(needle)
+}
+
+fn scan_scalar(hay: string, key: string) -> string {
+    let at = find_after(hay, key)
+    if at < 0 { return "" }
+    let rest = hay.substring(at + len(key) + 2, len(hay))
+    let colon = rest.index_of(":")
+    if colon < 0 { return "" }
+    let mut tail = rest.substring(colon + 1, len(rest))
+    // trim leading spaces
+    while len(tail) > 0 && tail.substring(0, 1) == " " {
+        tail = tail.substring(1, len(tail))
+    }
+    // if quoted string, return inner
+    if len(tail) > 0 && tail.substring(0, 1) == "\"" {
+        let inner = tail.substring(1, len(tail))
+        let q = inner.index_of("\"")
+        if q < 0 { return inner }
+        return inner.substring(0, q)
+    }
+    // else read until , } whitespace newline
+    let mut end = 0
+    let tlen = len(tail)
+    while end < tlen {
+        let c = tail.substring(end, end + 1)
+        if c == "," || c == "}" || c == " " || c == "\n" || c == "\r" || c == "\t" { break }
+        end = end + 1
+    }
+    return tail.substring(0, end)
+}
+
+fn get_num(hay: string, key: string, fallback: float) -> float {
+    let s = scan_scalar(hay, key)
+    if s == "" { return fallback }
+    return to_float(s)
+}
+
+fn get_bool(hay: string, key: string, fallback: bool) -> bool {
+    let s = scan_scalar(hay, key)
+    if s == "true" { return true }
+    if s == "false" { return false }
+    return fallback
+}
+
+// ── sentinel ckpt aggregation ─────────────────────────────────────────
+
+struct SentinelAgg {
+    total: int,
+    passed: int,
+    first_fail_step: int,   // -1 if none
+}
+
+fn parse_step_from_name(name: string) -> int {
+    // kr_gen_step_<N>.json
+    let marker = "kr_gen_step_"
+    let at = name.index_of(marker)
+    if at < 0 { return -1 }
+    let rest = name.substring(at + len(marker), len(name))
+    let dot = rest.index_of(".")
+    if dot < 0 { return -1 }
+    let num = rest.substring(0, dot)
+    return to_int(num)
+}
+
+fn agg_sentinel(dir: string) -> SentinelAgg {
+    let listing = exec("ls " + dir + "/kr_gen_step_*.json 2>/dev/null").trim()
+    let mut total = 0
+    let mut passed = 0
+    let mut first_fail = -1
+    if listing == "" {
+        return SentinelAgg { total: 0, passed: 0, first_fail_step: -1 }
+    }
+    let files = listing.split("\n")
+    let nf = files.len()
+    let mut i = 0
+    while i < nf {
+        let path = files[i].trim()
+        if path != "" {
+            total = total + 1
+            let body = read_file(path)
+            let verdict_at = body.index_of("VERDICT=")
+            // Two accepted shapes:
+            //   legacy: {"verdict":"CLEAN",...}
+            //   sidecar: embedded [sentinel] VERDICT=CLEAN line
+            let mut is_clean = false
+            if verdict_at >= 0 {
+                let tail = body.substring(verdict_at, len(body))
+                is_clean = tail.index_of("VERDICT=CLEAN") == 0
+            } else {
+                let v = scan_scalar(body, "verdict")
+                is_clean = (v == "CLEAN" || v == "clean" || v == "PASS")
+            }
+            if is_clean {
+                passed = passed + 1
+            } else {
+                let step = parse_step_from_name(path)
+                if first_fail < 0 || (step > 0 && step < first_fail) {
+                    first_fail = step
+                }
+            }
+        }
+        i = i + 1
+    }
+    return SentinelAgg { total: total, passed: passed, first_fail_step: first_fail }
+}
+
+// ── loss trace scan (train_r10.log) ───────────────────────────────────
+// Returns (loss_min, step_of_loss_min, sub_half_before_500_flag).
+// Log line assumed to contain "step=<N>" and "loss=<F>".
+
+struct LossTrace {
+    loss_min: float,
+    loss_min_step: int,
+    sub_half_before_500: bool,
+    lines: int,
+}
+
+fn parse_kv_float(line: string, key: string) -> float {
+    let at = line.index_of(key + "=")
+    if at < 0 { return 0.0 / 0.0 }  // NaN sentinel? fall back to -1
+    let rest = line.substring(at + len(key) + 1, len(line))
+    let mut end = 0
+    let tlen = len(rest)
+    while end < tlen {
+        let c = rest.substring(end, end + 1)
+        if c == " " || c == "," || c == "\t" || c == "\n" || c == "\r" { break }
+        end = end + 1
+    }
+    return to_float(rest.substring(0, end))
+}
+
+fn parse_kv_int(line: string, key: string) -> int {
+    let at = line.index_of(key + "=")
+    if at < 0 { return -1 }
+    let rest = line.substring(at + len(key) + 1, len(line))
+    let mut end = 0
+    let tlen = len(rest)
+    while end < tlen {
+        let c = rest.substring(end, end + 1)
+        if c == " " || c == "," || c == "\t" || c == "\n" || c == "\r" { break }
+        end = end + 1
+    }
+    return to_int(rest.substring(0, end))
+}
+
+fn scan_loss(path: string) -> LossTrace {
+    let raw = read_file(path)
+    if raw == "" {
+        return LossTrace { loss_min: -1.0, loss_min_step: -1, sub_half_before_500: false, lines: 0 }
+    }
+    let lines = raw.split("\n")
+    let n = lines.len()
+    let mut lmin = 1.0e9
+    let mut lmin_step = -1
+    let mut sub_half_early = false
+    let mut count = 0
+    let mut i = 0
+    while i < n {
+        let ln = lines[i]
+        if ln.index_of("loss=") >= 0 && ln.index_of("step=") >= 0 {
+            count = count + 1
+            let l = parse_kv_float(ln, "loss")
+            let s = parse_kv_int(ln, "step")
+            if l > 0.0 && l < lmin { lmin = l; lmin_step = s }
+            if s > 0 && s < 500 && l > 0.0 && l < 0.5 { sub_half_early = true }
+        }
+        i = i + 1
+    }
+    if lmin > 9.9e8 { lmin = -1.0 }
+    return LossTrace { loss_min: lmin, loss_min_step: lmin_step,
+                       sub_half_before_500: sub_half_early, lines: count }
+}
+
+// ── Eval report reader ────────────────────────────────────────────────
+
+struct EvalReport {
+    likert: float,
+    phi_refl: float,
+    loss_mono_descent: bool,
+    loaded: bool,
+}
+
+fn read_eval(path: string) -> EvalReport {
+    let raw = read_file(path)
+    if raw == "" {
+        return EvalReport { likert: -1.0, phi_refl: -1.0,
+                            loss_mono_descent: false, loaded: false }
+    }
+    return EvalReport {
+        likert: get_num(raw, "likert", -1.0),
+        phi_refl: get_num(raw, "phi_refl", -1.0),
+        loss_mono_descent: get_bool(raw, "loss_mono_descent", false),
+        loaded: true,
+    }
+}
+
+// ── Decision ──────────────────────────────────────────────────────────
+
+fn decide(sent: SentinelAgg, loss: LossTrace, ev: EvalReport) -> string {
+    // C first — safety exit on any collapse symptom.
+    let any_fail_early = (sent.first_fail_step > 0 && sent.first_fail_step <= 1000)
+    let likert_bad = (ev.likert >= 0.0 && ev.likert < 2.8)
+    let loss_collapse = loss.sub_half_before_500
+    if any_fail_early || likert_bad || loss_collapse { return "C" }
+
+    // A next — all-clean escalation.
+    let all_pass = (sent.total > 0 && sent.passed == sent.total)
+    let likert_hi = (ev.likert >= 3.3)
+    let phi_hi = (ev.phi_refl > 0.3)
+    let mono = ev.loss_mono_descent
+    if all_pass && likert_hi && phi_hi && mono { return "A" }
+
+    // B — soft fallback (sentinel mostly clean, Likert moderate).
+    let mostly_pass = (sent.total >= 1 && sent.passed * 10 >= sent.total * 8)
+    let likert_ok = (ev.likert >= 2.8)
+    let stagnate_or_mid_phi = (!mono) || (ev.phi_refl >= 0.1 && ev.phi_refl <= 0.3)
+    if mostly_pass && likert_ok && stagnate_or_mid_phi { return "B" }
+
+    // No rule matched → default to C (safety); print reason.
+    return "C"
+}
+
+fn launcher_for(branch: string) -> string {
+    if branch == "A" { return LAUNCHER_A }
+    if branch == "B" { return LAUNCHER_B }
+    return LAUNCHER_C
+}
+
+// ── Selftest ──────────────────────────────────────────────────────────
+
+fn selftest() -> bool {
+    println("")
+    println("=================================================================")
+    println("  ALM r11 branch selector — SELFTEST (synthetic inputs, no I/O)")
+    println("=================================================================")
+    let mut ok = true
+
+    // Case C: early sentinel fail.
+    let c = decide(
+        SentinelAgg { total: 10, passed: 6, first_fail_step: 800 },
+        LossTrace { loss_min: 1.2, loss_min_step: 1500, sub_half_before_500: false, lines: 2000 },
+        EvalReport { likert: 3.0, phi_refl: 0.2, loss_mono_descent: true, loaded: true })
+    if c != "C" { println("  [FAIL] C case returned " + c); ok = false }
+    else         { println("  [OK]   C (sentinel fail <=1000)") }
+
+    // Case C: Likert < 2.8.
+    let c2 = decide(
+        SentinelAgg { total: 10, passed: 10, first_fail_step: -1 },
+        LossTrace { loss_min: 1.5, loss_min_step: 1800, sub_half_before_500: false, lines: 2000 },
+        EvalReport { likert: 2.5, phi_refl: 0.4, loss_mono_descent: true, loaded: true })
+    if c2 != "C" { println("  [FAIL] C-likert returned " + c2); ok = false }
+    else         { println("  [OK]   C (Likert < 2.8)") }
+
+    // Case A: all clean, Likert high, Phi high, mono descent.
+    let a = decide(
+        SentinelAgg { total: 10, passed: 10, first_fail_step: -1 },
+        LossTrace { loss_min: 1.1, loss_min_step: 2000, sub_half_before_500: false, lines: 2000 },
+        EvalReport { likert: 3.5, phi_refl: 0.35, loss_mono_descent: true, loaded: true })
+    if a != "A" { println("  [FAIL] A case returned " + a); ok = false }
+    else         { println("  [OK]   A (all clean)") }
+
+    // Case B: sentinel 8/10, Likert 3.0, Phi 0.2, non-mono.
+    let b = decide(
+        SentinelAgg { total: 10, passed: 8, first_fail_step: 1400 },
+        LossTrace { loss_min: 1.4, loss_min_step: 1600, sub_half_before_500: false, lines: 2000 },
+        EvalReport { likert: 3.0, phi_refl: 0.2, loss_mono_descent: false, loaded: true })
+    if b != "B" { println("  [FAIL] B case returned " + b); ok = false }
+    else         { println("  [OK]   B (soft fallback)") }
+
+    // Case C (default): nothing loaded.
+    let cdef = decide(
+        SentinelAgg { total: 0, passed: 0, first_fail_step: -1 },
+        LossTrace { loss_min: -1.0, loss_min_step: -1, sub_half_before_500: false, lines: 0 },
+        EvalReport { likert: -1.0, phi_refl: -1.0, loss_mono_descent: false, loaded: false })
+    if cdef != "C" { println("  [FAIL] default safety returned " + cdef); ok = false }
+    else           { println("  [OK]   C (default safety)") }
+
+    println("")
+    if ok { println("RESULT: PASS") } else { println("RESULT: FAIL") }
+    return ok
+}
+
+// ── Main ──────────────────────────────────────────────────────────────
+
+fn main() {
+    if SELFTEST {
+        let ok = selftest()
+        if !ok { panic("selftest FAIL") }
+        return
+    }
+
+    println("")
+    println("ALM r11 branch selector")
+    println("  r10-dir     = " + R10_DIR)
+    println("  eval-report = " + EVAL_REPORT)
+    println("")
+
+    let sent = agg_sentinel(R10_DIR)
+    println("[sentinel] total=" + str(sent.total)
+        + " passed=" + str(sent.passed)
+        + " first_fail_step=" + str(sent.first_fail_step))
+
+    let loss = scan_loss(R10_DIR + "/" + DEFAULT_TRAIN_LOG)
+    println("[loss]     min=" + str(loss.loss_min)
+        + " min_step=" + str(loss.loss_min_step)
+        + " sub0.5_before_500=" + (if loss.sub_half_before_500 { "YES" } else { "no" })
+        + " lines=" + str(loss.lines))
+
+    let ev = read_eval(EVAL_REPORT)
+    println("[eval]     likert=" + str(ev.likert)
+        + " phi_refl=" + str(ev.phi_refl)
+        + " mono_descent=" + (if ev.loss_mono_descent { "YES" } else { "no" })
+        + " loaded=" + (if ev.loaded { "YES" } else { "no" }))
+
+    let branch = decide(sent, loss, ev)
+    println("")
+    println("DECISION: " + branch)
+    println("launcher: " + launcher_for(branch))
+    println("")
+
+    if DRY_RUN {
+        println("DRY-RUN — no fire.")
+        return
+    }
+
+    if FIRE {
+        if POD_ID == "" {
+            panic("--fire requires --pod-id <id>")
+        }
+        let cmd = "hexa " + launcher_for(branch) + " --pod-id " + POD_ID
+        println("FIRE: " + cmd)
+        let rc = exec(cmd)
+        println(rc)
+        return
+    }
+
+    // default: print-only
+    println(branch)
+}
+
+main()
