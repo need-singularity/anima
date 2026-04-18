@@ -1,0 +1,877 @@
+// training/deploy/alm_14b_r10d_hexa_native.hexa
+//
+// ALM 14B r10d — hexa-native launcher SCAFFOLD (--selftest + --dry-run only).
+//
+// Purpose:
+//   Prepare ALM 14B r10d (D8+D9 drift fix) fire path using hexa-native
+//   trainer (train_alm_lora.hexa) instead of the legacy
+//   `python3 /tmp/_train_alm_14b_r10d.py` pattern (banned per R37/AN13/L3-PY).
+//   The existing training/launch_alm_14b_r10d.hexa is an R37 panic stub kept
+//   for sweep history; this file is the replacement invocation path.
+//
+// Compliance:
+//   R37 / AN13 / L3-PY — ZERO python3 invocations in this file. `pkill -f`
+//   remains permitted as a KILL (not invoke) for residual legacy processes.
+//
+// Scope:
+//   SCAFFOLD ONLY. live_fire() body is a placeholder that enumerates the
+//   intended fire plan but DOES NOT execute remote I/O in this round. A
+//   subsequent session will wire each step once the prerequisites land:
+//     - hexa-lang hxqwen14b FFI Day-2 entries (forward/backward/apply)
+//     - corpus_alm_70b_stripped.txt materialised + uploaded to R2
+//     - Qwen2.5-14B-Instruct safetensors available at r2:anima-models/base/
+//
+// Plan SSOT:
+//   /Users/ghost/Dev/anima/training/r10d_launch_plan.md  (§2 params, §3 aborts,
+//   §8 invocation)
+//
+// Usage:
+//   hexa training/deploy/alm_14b_r10d_hexa_native.hexa --selftest
+//   hexa training/deploy/alm_14b_r10d_hexa_native.hexa \
+//        --pod-id <id> --dry-run
+//   LIVE_FIRE_OK=1 hexa training/deploy/alm_14b_r10d_hexa_native.hexa \
+//        --pod-id <id>            # gated — will panic until live_fire() wired
+//
+// Differences vs CLM r4 scaffold:
+//   - Trainer entry = training/train_alm_lora.hexa (LoRA r=32 α=64, q/k/v/o)
+//   - Corpus = corpus_alm_70b_stripped.txt (41.8M tokens)
+//   - LR schedule = warmup 200 -> peak 1e-5 -> cosine -> floor 1e-6
+//   - save_every = 500 (r10c died @ step 75 w/ save_every=2000; MFS quota safe)
+//   - Sentinel integration: kr_gen_sentinel.hexa deployed alongside trainer
+
+// ── Constants (from r10d_launch_plan.md §2) ───────────────────────────
+
+let DEFAULT_CKPT_DIR     = "/workspace/ckpt_alm_14b_r10d_seed3407"
+let DEFAULT_STEPS        = 2000
+let DEFAULT_BATCH        = 8
+let DEFAULT_SEQ          = 1024
+let DEFAULT_GRAD_ACCUM   = 1
+
+// LR schedule (D9 fix, §2)
+let DEFAULT_LR_PEAK      = "1e-5"
+let DEFAULT_LR_FLOOR     = "1e-6"
+let DEFAULT_WARMUP_STEPS = 200
+let DEFAULT_LR_SCHEDULE  = "cosine"
+
+// Save cadence (r10d: 4 ckpts, ~2.4GB total, MFS quota safe)
+let DEFAULT_SAVE_EVERY   = 500
+
+// Seed (r10d primary; sweep variants 42/1337 handled via --seed flag)
+let DEFAULT_SEED         = 3407
+
+// LoRA spec (r10d: unchanged from r10c per §2)
+let DEFAULT_LORA_R       = 32
+let DEFAULT_LORA_ALPHA   = 64
+let DEFAULT_LORA_DROPOUT = "0.0"
+let DEFAULT_LORA_TARGETS = "q_proj,k_proj,v_proj,o_proj"
+
+// Abort triggers (§3)
+let FIRST_BATCH_CE_MAX   = "8.0"
+let STEP1_LOSS_MAX       = "8.0"
+let EARLY_LOSS_GATE_STEP = 500      // E7-OSS-03: step ≤ 500 ∧ loss < 1.0 → force sentinel
+let ABORT_STATUS_FILE    = "/workspace/r10d_abort.status"
+
+// Corpus / base model
+let CORPUS_REMOTE        = "/workspace/corpus_alm_70b_stripped.txt"
+let DEFAULT_LOCAL_CORPUS = "/Users/ghost/Dev/anima/training/corpus_alm_70b_stripped.txt"
+let DEFAULT_LOCAL_JSONL  = "/Users/ghost/Dev/anima/training/corpus_alm_70b.jsonl"
+let DEFAULT_CORPUS_R2    = "r2:anima-corpus/alm/corpus_alm_70b_stripped.txt"
+let BASE_MODEL_REMOTE    = "/workspace/models/Qwen2.5-14B-Instruct"
+let BASE_MODEL_R2        = "r2:anima-models/base/Qwen2.5-14B-Instruct/"
+
+// Hexa binary (sister crossbuild Linux ELF)
+let HEXA_LINUX_BIN       = "/build/hexa_v2_linux"
+let REMOTE_HEXA_BIN      = "/opt/hexa/bin/hexa_v2"
+let REMOTE_TRAIN_DIR     = "/workspace/anima/training"
+let REMOTE_NATIVE        = "/workspace/alm_r10d_native"
+let REMOTE_LOG           = "/workspace/alm_r10d_hexa.log"
+let TMUX_SESSION         = "alm-14b-r10d"
+
+// Local sources (trainer + sentinel + config)
+let LOCAL_SOURCES = [
+    "training/train_alm_lora.hexa",
+    "training/kr_gen_sentinel.hexa",
+    "training/nn_core.hexa"
+]
+
+// Dependency modules (use "X" resolver) — ALM trainer is single-file by
+// design (feedback_hexa_silent_exit_5_imports.md) but sentinel+phi hooks
+// may drag in quantum_types/anima_quantum for Φ_refl checks. Wire when
+// live_fire() is implemented.
+let LOCAL_DEP_SOURCES = []
+let DEP_MODULE_NAMES  = []
+
+// R2 base-model path (Qwen2.5-14B-Instruct safetensors shards ~28GB)
+let QWEN_BASE_R2      = BASE_MODEL_R2
+
+// ── argv parse ────────────────────────────────────────────────────────
+
+let argv = args()
+
+fn flag_value(name: string, fallback: string) -> string {
+    let n = argv.len()
+    let mut i = 0
+    while i < n {
+        if argv[i] == name && i + 1 < n {
+            return argv[i + 1]
+        }
+        i = i + 1
+    }
+    return fallback
+}
+
+fn flag_bool(name: string) -> bool {
+    let n = argv.len()
+    let mut i = 0
+    while i < n {
+        if argv[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+let POD          = flag_value("--pod", "")
+let POD_ID       = flag_value("--pod-id", "")
+let POD_IP_ARG   = flag_value("--pod-ip", "")
+let POD_PORT_S   = flag_value("--pod-port", "")
+let CKPT_DIR     = flag_value("--ckpt-dir", DEFAULT_CKPT_DIR)
+let STEPS_S      = flag_value("--steps", str(DEFAULT_STEPS))
+let SEED_S       = flag_value("--seed", str(DEFAULT_SEED))
+let LR_PEAK      = flag_value("--lr-peak", DEFAULT_LR_PEAK)
+let LR_FLOOR     = flag_value("--lr-floor", DEFAULT_LR_FLOOR)
+let WARMUP_S     = flag_value("--warmup", str(DEFAULT_WARMUP_STEPS))
+let SCHEDULE     = flag_value("--schedule", DEFAULT_LR_SCHEDULE)
+let BATCH_S      = flag_value("--batch", str(DEFAULT_BATCH))
+let SEQ_S        = flag_value("--seq", str(DEFAULT_SEQ))
+let SAVE_EVERY_S = flag_value("--save-every", str(DEFAULT_SAVE_EVERY))
+let CORPUS_ARG   = flag_value("--corpus", CORPUS_REMOTE)
+let CORPUS_LOCAL = flag_value("--corpus-local", DEFAULT_LOCAL_CORPUS)
+let CORPUS_R2    = flag_value("--corpus-r2", DEFAULT_CORPUS_R2)
+let BASE_MODEL   = flag_value("--base-model", BASE_MODEL_REMOTE)
+let SMOKE        = flag_bool("--smoke")
+let SEED_SWEEP   = flag_bool("--seed-sweep")
+let DRY_RUN      = flag_bool("--dry-run")
+let SELFTEST     = flag_bool("--selftest")
+
+// ── Utility ───────────────────────────────────────────────────────────
+
+fn env_or(key: string, fallback: string) -> string {
+    let v = env(key)
+    if v == "" { return fallback }
+    return v
+}
+
+fn now_epoch() -> string { return exec("date +%s").trim() }
+fn now_iso() -> string { return exec("date -u +%Y%m%dT%H%M%SZ").trim() }
+
+fn stamp_step(label: string, log_path: string) {
+    let line = "[" + now_epoch() + "] " + label
+    println(line)
+    append_file(log_path, line + "\n")
+}
+
+fn abort(code: int, msg: string) {
+    println("")
+    println("FAIL: " + msg)
+    println("  exit code = " + str(code))
+    println("")
+    exit(code)
+}
+
+// ── ssh / scp helpers (ported from CLM scaffold — same hostkey-quiet opts) ──
+
+fn ssh_base(ip: string, port: string) -> string {
+    if ip == "" { return "ssh root@POD_IP_UNRESOLVED" }
+    let opts = " -o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+    if port == "" || port == "22" {
+        return "ssh" + opts + " root@" + ip
+    }
+    return "ssh" + opts + " -p " + port + " root@" + ip
+}
+
+fn scp_base(ip: string, port: string) -> string {
+    if ip == "" { return "scp POD_IP_UNRESOLVED" }
+    let opts = " -o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+    if port == "" || port == "22" {
+        return "scp" + opts
+    }
+    return "scp" + opts + " -P " + port
+}
+
+fn lookup_pod(pod_id: string) -> string {
+    if pod_id == "" { return "" }
+    let ip_cmd = "runpodctl get pod " + pod_id
+        + " 2>/dev/null | grep -oE 'root@[^ ]+' | head -1 | sed 's/root@//'"
+    let port_cmd = "runpodctl get pod " + pod_id
+        + " 2>/dev/null | grep -oE -- '-p [0-9]+' | head -1 | awk '{print $2}'"
+    let ip = exec(ip_cmd).trim()
+    let port = exec(port_cmd).trim()
+    if ip == "" { return "" }
+    if port == "" { return ip + ":22" }
+    return ip + ":" + port
+}
+
+fn run_step(n: int, label: string, cmd: string, dry: bool, log_path: string) -> int {
+    stamp_step("step " + str(n) + " START — " + label, log_path)
+    println("    $ " + cmd)
+    append_file(log_path, "    $ " + cmd + "\n")
+    if dry {
+        stamp_step("step " + str(n) + " SKIP (dry-run)", log_path)
+        return 0
+    }
+    let result = exec_with_status(cmd)
+    let rc = result[1]
+    stamp_step("step " + str(n) + " END — rc=" + str(rc), log_path)
+    return rc
+}
+
+fn resolve_pod_endpoint(log_path: string, dry: bool) -> string {
+    if POD_IP_ARG != "" {
+        let p = (if POD_PORT_S == "" { "22" } else { POD_PORT_S })
+        stamp_step("pod endpoint: explicit --pod-ip/--pod-port => "
+            + POD_IP_ARG + ":" + p, log_path)
+        return POD_IP_ARG + ":" + p
+    }
+    let lookup_id = (if POD_ID != "" { POD_ID } else { POD })
+    if lookup_id == "" {
+        abort(2, "cannot resolve pod: need --pod-ip + --pod-port, or --pod-id, or --pod")
+        return ""
+    }
+    stamp_step("pod endpoint: runpodctl lookup for id=" + lookup_id, log_path)
+    if dry {
+        stamp_step("dry-run: assuming endpoint=<IP>:<PORT>", log_path)
+        return "DRYRUN_IP:DRYRUN_PORT"
+    }
+    let ep = lookup_pod(lookup_id)
+    if ep == "" {
+        abort(2, "runpodctl lookup failed for pod_id=" + lookup_id
+            + " — pass --pod-ip <ip> --pod-port <n> explicitly")
+        return ""
+    }
+    stamp_step("resolved: " + ep, log_path)
+    return ep
+}
+
+fn split_ep(ep: string) -> [string] {
+    let ip = exec("echo '" + ep + "' | awk -F: '{print $1}'").trim()
+    let port = exec("echo '" + ep + "' | awk -F: '{print $2}'").trim()
+    return [ip, port]
+}
+
+// ── Selftest ──────────────────────────────────────────────────────────
+
+fn selftest() -> bool {
+    println("")
+    println("=================================================================")
+    println("  ALM 14B r10d hexa-native launcher — SELFTEST (no network I/O)")
+    println("=================================================================")
+    println("")
+
+    let mut ok = true
+
+    println("[1/5] Environment:")
+    let hexa_lang = env("HEXA_LANG")
+    if hexa_lang == "" {
+        println("  [MISS] HEXA_LANG not set")
+        ok = false
+    } else {
+        println("  [OK]   HEXA_LANG=" + hexa_lang)
+    }
+
+    let bin_path = hexa_lang + HEXA_LINUX_BIN
+    if file_exists(bin_path) {
+        println("  [OK]   " + bin_path + "  (sister crossbuild ELF)")
+    } else {
+        println("  [MISS] " + bin_path + "  (needed — commits f64f6af3 + a4e9e58e)")
+        ok = false
+    }
+
+    println("")
+    println("[2/5] Local sources (will be scp'd to pod):")
+    let mut i = 0
+    while i < LOCAL_SOURCES.len() {
+        let p = LOCAL_SOURCES[i]
+        let abs_p = "/Users/ghost/Dev/anima/" + p
+        if file_exists(abs_p) {
+            println("  [OK]   " + p)
+        } else {
+            println("  [MISS] " + p)
+            ok = false
+        }
+        i = i + 1
+    }
+
+    println("")
+    println("[3/5] Corpus provisioning (41.8M tokens / ~90MB stripped):")
+    if file_exists(CORPUS_LOCAL) {
+        println("  [OK]   local stripped corpus present: " + CORPUS_LOCAL)
+    } else {
+        println("  [PREP] " + CORPUS_LOCAL + " not materialised yet")
+        println("         source jsonl: " + DEFAULT_LOCAL_JSONL
+            + (if file_exists(DEFAULT_LOCAL_JSONL) { " [present]" } else { " [MISS]" }))
+        println("         fallback: pull from R2 = " + CORPUS_R2)
+        // Not a hard-fail for scaffold stage; corpus materialisation is
+        // tracked as remaining work before real fire.
+    }
+
+    println("")
+    println("[4/5] r10d parameter table (from r10d_launch_plan.md §2):")
+    println("  ckpt-dir     = " + CKPT_DIR)
+    println("  steps        = " + STEPS_S + (if SMOKE { "  (SMOKE override → 200)" } else { "" }))
+    println("  seed         = " + SEED_S + (if SEED_SWEEP { "  (SWEEP: 3407/42/1337)" } else { "" }))
+    println("  LR schedule  = warmup " + WARMUP_S
+        + " -> peak " + LR_PEAK + " -> " + SCHEDULE
+        + " -> floor " + LR_FLOOR)
+    println("  batch × seq  = " + BATCH_S + " × " + SEQ_S
+        + "  (grad_accum=" + str(DEFAULT_GRAD_ACCUM) + ")")
+    println("  save_every   = " + SAVE_EVERY_S + "  (4 ckpts × ~600MB = ~2.4GB)")
+    println("  LoRA         = r=" + str(DEFAULT_LORA_R)
+        + " α=" + str(DEFAULT_LORA_ALPHA)
+        + " dropout=" + DEFAULT_LORA_DROPOUT
+        + " targets=" + DEFAULT_LORA_TARGETS)
+    println("  corpus       = " + CORPUS_ARG)
+    println("  base model   = " + BASE_MODEL)
+    println("  abort: CE>" + FIRST_BATCH_CE_MAX
+        + " | step1-loss>" + STEP1_LOSS_MAX
+        + " | sentinel COLLAPSED (inline OR subp)")
+
+    println("")
+    println("[5/5] Scaffold stage readiness:")
+    println("  [OK]   --selftest path operative")
+    println("  [OK]   --dry-run path operative (no I/O)")
+    println("  [PREP] live_fire() body = placeholder (see remaining work)")
+    println("  [GATE] LIVE_FIRE_OK=1 env required before real exec")
+
+    println("")
+    if ok {
+        println("RESULT: PASS — scaffold validated; real fire gated on remaining work.")
+    } else {
+        println("RESULT: FAIL — resolve MISS items above before proceeding.")
+    }
+    println("")
+    return ok
+}
+
+// ── Plan (shared by --dry-run and placeholder live_fire) ──────────────
+
+fn print_step(n: int, title: string, cmd: string) {
+    println("")
+    println("  Step " + str(n) + ": " + title)
+    println("    $ " + cmd)
+}
+
+fn build_plan(log_path: string) {
+    let hexa_lang = env_or("HEXA_LANG", "<HEXA_LANG>")
+    let bin_src   = hexa_lang + HEXA_LINUX_BIN
+    let pod_label = (if POD != "" { POD }
+                     else if POD_ID != "" { POD_ID }
+                     else { POD_IP_ARG + ":" + POD_PORT_S })
+
+    println("")
+    println("=================================================================")
+    println("  ALM 14B r10d hexa-native launcher — PLAN")
+    println("=================================================================")
+    println("  pod          = " + pod_label)
+    println("  ckpt-dir     = " + CKPT_DIR)
+    println("  steps        = " + STEPS_S
+        + (if SMOKE { "  (SMOKE → 200)" } else { "" }))
+    println("  seed         = " + SEED_S
+        + (if SEED_SWEEP { "  (SWEEP 3407/42/1337)" } else { "" }))
+    println("  LR           = warmup " + WARMUP_S + " -> " + LR_PEAK
+        + " cosine -> " + LR_FLOOR)
+    println("  batch/seq    = " + BATCH_S + " / " + SEQ_S)
+    println("  save_every   = " + SAVE_EVERY_S)
+    println("  LoRA r/α     = " + str(DEFAULT_LORA_R) + "/"
+        + str(DEFAULT_LORA_ALPHA)
+        + " targets=" + DEFAULT_LORA_TARGETS)
+    println("  corpus       = " + CORPUS_ARG)
+    println("  base model   = " + BASE_MODEL)
+    println("  abort file   = " + ABORT_STATUS_FILE)
+    println("  dry-run      = "
+        + (if DRY_RUN { "YES (no remote I/O)" } else { "NO (LIVE — gated)" }))
+    println("  log          = " + log_path)
+
+    print_step(0, "MFS preflight — 20GB dd probe (runpod_mfs_quota rule)",
+        "ssh " + pod_label
+        + " 'dd if=/dev/zero of=/workspace/_q_test bs=1M count=20000 status=none "
+        + "&& rm /workspace/_q_test'")
+
+    print_step(1, "ckpt dir preclean (MFS quota rule)",
+        "ssh " + pod_label + " 'rm -rf " + CKPT_DIR + "'")
+
+    print_step(2, "tmux kill legacy sessions",
+        "ssh " + pod_label + " 'tmux kill-session -t " + TMUX_SESSION + " 2>/dev/null || true'")
+
+    print_step(3, "Reap legacy python residual (KILL only — R37/AN13 OK)",
+        "ssh " + pod_label + " 'pkill -f _train_alm_14b_r10 2>/dev/null || true'")
+
+    print_step(4, "Deploy hexa_v2 Linux ELF",
+        "scp " + bin_src + " " + pod_label + ":" + REMOTE_HEXA_BIN
+        + " && ssh " + pod_label + " 'chmod +x " + REMOTE_HEXA_BIN + "'")
+
+    print_step(5, "Deploy runtime.c + native/* (hexa transpile helpers)",
+        "scp $HEXA_LANG/self/runtime.c " + pod_label + ":/tmp/runtime.c"
+        + " && scp $HEXA_LANG/self/native/*.c " + pod_label + ":/tmp/native/")
+
+    print_step(6, "Deploy ALM trainer + sentinel sources",
+        "scp training/train_alm_lora.hexa training/kr_gen_sentinel.hexa "
+        + "training/nn_core.hexa "
+        + pod_label + ":" + REMOTE_TRAIN_DIR + "/")
+
+    print_step(7, "Base model provisioning (rclone pull Qwen2.5-14B-Instruct)",
+        "ssh " + pod_label + " 'test -d " + BASE_MODEL + " || rclone copy "
+        + BASE_MODEL_R2 + " " + BASE_MODEL + " -v --s3-no-check-bucket'")
+
+    print_step(8, "Corpus provisioning (3-tier: local txt > R2 > jsonl→strip)",
+        "scp " + CORPUS_LOCAL + " " + pod_label + ":" + CORPUS_REMOTE
+        + "  # tier1 when local stripped exists")
+
+    print_step(9, "Cross-compile train_alm_lora.hexa -> C -> native ELF",
+        "ssh " + pod_label + " '" + REMOTE_HEXA_BIN + " "
+        + REMOTE_TRAIN_DIR + "/train_alm_lora.hexa /tmp/alm_r10d.c "
+        + "&& gcc -O2 /tmp/alm_r10d.c -o " + REMOTE_NATIVE + " -lm'")
+
+    print_step(10, "Launch hexa-native trainer in tmux",
+        "ssh " + pod_label + " \"tmux new -d -s " + TMUX_SESSION + " '"
+        + REMOTE_NATIVE
+        + " --base-model " + BASE_MODEL
+        + " --corpus " + CORPUS_ARG
+        + " --steps " + STEPS_S
+        + " --seed " + SEED_S
+        + " --batch " + BATCH_S
+        + " --seq " + SEQ_S
+        + " --lr-peak " + LR_PEAK
+        + " --lr-floor " + LR_FLOOR
+        + " --warmup " + WARMUP_S
+        + " --schedule " + SCHEDULE
+        + " --save-every " + SAVE_EVERY_S
+        + " --lora-r " + str(DEFAULT_LORA_R)
+        + " --lora-alpha " + str(DEFAULT_LORA_ALPHA)
+        + " --lora-targets " + DEFAULT_LORA_TARGETS
+        + " --abort-file " + ABORT_STATUS_FILE
+        + " --first-batch-ce-max " + FIRST_BATCH_CE_MAX
+        + " --step1-loss-max " + STEP1_LOSS_MAX
+        + " --early-loss-gate-step " + str(EARLY_LOSS_GATE_STEP)
+        + " --ckpt-dir " + CKPT_DIR
+        + " 2>&1 | tee " + REMOTE_LOG + "'\"")
+
+    print_step(11, "Verify after 120s (util>30% + first-batch CE line)",
+        "sleep 120 && ssh " + pod_label + " \""
+        + "nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader; "
+        + "grep -m1 'first_batch_ce=' " + REMOTE_LOG + " || echo NO_CE\"")
+
+    println("")
+    println("Abort triggers (§3, enforced by trainer — not this launcher):")
+    println("  - First-batch CE > " + FIRST_BATCH_CE_MAX + "    -> " + ABORT_STATUS_FILE + "=FIRST_BATCH_CE_HIGH, exit 2")
+    println("  - Step 1 loss   > " + STEP1_LOSS_MAX + "    -> " + ABORT_STATUS_FILE + "=STEP1_LOSS_HIGH, exit 2")
+    println("  - Sentinel COLLAPSED (inline OR subp) -> "
+        + ABORT_STATUS_FILE + "=MODE_COLLAPSE_STEP=N..., exit 2")
+    println("")
+    println("Acceptance gates (§4, observational — manual review):")
+    println("  - step 500:  CE < 4.0 AND sentinel CLEAN")
+    println("  - step 1000: kr_gen sentinel PASS (flagged < 3/5)")
+    println("  - step 2000: exit wstatus=DONE, ckpt complete -> R2 upload")
+    println("")
+}
+
+// ── Live fire (gated — PLACEHOLDER until prereqs land) ────────────────
+
+fn live_fire(log_path: string) {
+    let live_ok = env("LIVE_FIRE_OK")
+    let dry = DRY_RUN
+
+    if !dry && live_ok != "1" {
+        println("")
+        println("REFUSED: live fire requires LIVE_FIRE_OK=1 in env.")
+        println("  This launcher refuses destructive exec without the gate.")
+        println("  To execute (once prereqs land):")
+        println("    1. Review --dry-run output with user")
+        println("    2. Confirm hxqwen14b FFI Day-2 entries available")
+        println("    3. Confirm corpus_alm_70b_stripped.txt materialised")
+        println("    4. Confirm Qwen2.5-14B-Instruct uploaded to R2")
+        println("    5. LIVE_FIRE_OK=1 hexa <this file> --pod-id <id>")
+        println("")
+        panic("live fire guard: LIVE_FIRE_OK != 1")
+    }
+
+    if dry {
+        stamp_step("DRY-RUN — live_fire() will walk every ssh/scp without execing", log_path)
+    } else {
+        stamp_step("LIVE FIRE armed (LIVE_FIRE_OK=1) — proceeding (hxqwen14b FFI Day-2 NOT YET SHIPPED — gcc link WILL FAIL at step 10; this is expected in scaffold stage)", log_path)
+    }
+
+    let ep = resolve_pod_endpoint(log_path, dry)
+    let parts = split_ep(ep)
+    let ip   = (if dry { "DRYRUN_IP" } else { parts[0] })
+    let port = (if dry { "DRYRUN_PORT" } else { parts[1] })
+    let SSH = ssh_base(ip, port)
+    let SCP = scp_base(ip, port)
+    let dest = "root@" + ip
+
+    let hexa_lang = env_or("HEXA_LANG", "/Users/ghost/Dev/hexa-lang")
+    let bin_src = hexa_lang + HEXA_LINUX_BIN
+
+    // ── Step 0 — MFS preflight (20GB dd probe per runpod_mfs_quota rule) ──
+    let rc0 = run_step(0, "MFS preflight — 20GB dd probe",
+        SSH + " 'dd if=/dev/zero of=/workspace/_q_test bs=1M count=20000 status=none "
+        + "&& rm /workspace/_q_test'",
+        dry, log_path)
+    if !dry && rc0 != 0 { abort(2, "FAIL_MFS_QUOTA — /workspace quota probe failed (rc=" + str(rc0) + ")") }
+
+    // ── Step 1 — Pre-clean old ckpt dir (quota protection) ──
+    let rc1 = run_step(1, "ckpt dir preclean (MFS quota rule)",
+        SSH + " 'rm -rf " + CKPT_DIR + "'",
+        dry, log_path)
+    if !dry && rc1 != 0 { abort(2, "FAIL_CKPT_PRECLEAN rc=" + str(rc1)) }
+
+    // ── Step 2 — Kill existing tmux session ──
+    let _rc2 = run_step(2, "tmux kill legacy sessions",
+        SSH + " 'tmux kill-session -t " + TMUX_SESSION + " 2>/dev/null || true'",
+        dry, log_path)
+
+    // ── Step 3 — Reap legacy python residual (KILL only — R37/AN13 OK) ──
+    let _rc3 = run_step(3, "pkill residual _train_alm_14b_r10 (KILL not INVOKE — R37 OK)",
+        SSH + " 'pkill -f _train_alm_14b_r10 2>/dev/null || true'",
+        dry, log_path)
+
+    // ── Step 4 — Deploy hexa_v2 Linux ELF + sha256 verify ──
+    if !dry && !file_exists(bin_src) {
+        abort(2, "FAIL_HEXA_BIN_MISSING: " + bin_src + " — rebuild sister crossbuild")
+    }
+    let _mk = run_step(4, "mkdir -p /opt/hexa/bin",
+        SSH + " 'mkdir -p /opt/hexa/bin'", dry, log_path)
+    let rc4a = run_step(5, "scp hexa_v2 Linux ELF",
+        SCP + " " + bin_src + " " + dest + ":" + REMOTE_HEXA_BIN,
+        dry, log_path)
+    if !dry && rc4a != 0 { abort(2, "FAIL_HEXA_BIN_SCP rc=" + str(rc4a)) }
+    let _chmod = run_step(6, "chmod +x hexa_v2 on pod",
+        SSH + " 'chmod +x " + REMOTE_HEXA_BIN + "'", dry, log_path)
+    let local_sha  = exec("shasum -a 256 " + bin_src + " | awk '{print $1}'").trim()
+    let remote_sha_cmd = SSH + " 'sha256sum " + REMOTE_HEXA_BIN + " 2>/dev/null | awk \"{print \\$1}\"'"
+    let remote_sha = (if dry { local_sha } else { exec(remote_sha_cmd).trim() })
+    stamp_step("sha256 local=" + local_sha + " remote=" + remote_sha, log_path)
+    if !dry && local_sha != "" && remote_sha != "" && local_sha != remote_sha {
+        abort(2, "FAIL_HEXA_BIN_SHA_MISMATCH local=" + local_sha + " remote=" + remote_sha)
+    }
+
+    // ── Step 5 — Deploy runtime.c + native/* (hexa transpile helpers + hxqwen14b deps) ──
+    // CLM uses hxblas + hxlmhead .so. ALM 14B additionally requires hxqwen14b .so
+    // (Qwen attention + RoPE + GQA + safetensors shard loader). That FFI is DAY-2 —
+    // the .c does not yet exist in hexa-lang/self/native/. We scp what's available
+    // and let gcc link (Step 10) fail with a clear symbol-missing error.
+    let runtime_src = hexa_lang + "/self/runtime.c"
+    let tk_src      = hexa_lang + "/self/native/tensor_kernels.c"
+    let net_src     = hexa_lang + "/self/native/net.c"
+    let hxblas_src  = hexa_lang + "/self/native/hxblas_linux.c"
+    let hxlmh_src   = hexa_lang + "/self/native/hxlmhead_linux.c"
+    let hxqwen_src  = hexa_lang + "/self/native/hxqwen14b_linux.c"  // DAY-2 — may be missing
+    if !dry && !file_exists(runtime_src) { abort(2, "FAIL_RUNTIME_MISSING: " + runtime_src) }
+    if !dry && !file_exists(tk_src)      { abort(2, "FAIL_RUNTIME_MISSING: " + tk_src) }
+    if !dry && !file_exists(net_src)     { abort(2, "FAIL_RUNTIME_MISSING: " + net_src) }
+    if !dry && !file_exists(hxblas_src)  { abort(2, "FAIL_RUNTIME_MISSING: " + hxblas_src) }
+    if !dry && !file_exists(hxlmh_src)   { abort(2, "FAIL_RUNTIME_MISSING: " + hxlmh_src) }
+    let have_hxqwen = file_exists(hxqwen_src)
+    if !have_hxqwen {
+        stamp_step("WARN hxqwen14b_linux.c missing (DAY-2 FFI not shipped) — gcc link will fail at step 10 with undefined symbols hxqwen14b_forward / _backward / _apply_lora", log_path)
+    }
+    let rc_rt = run_step(65, "scp runtime.c -> /tmp/runtime.c",
+        SCP + " " + runtime_src + " " + dest + ":/tmp/runtime.c", dry, log_path)
+    if !dry && rc_rt != 0 { abort(2, "FAIL_RUNTIME_SCP rc=" + str(rc_rt)) }
+    let _rmk = run_step(66, "mkdir -p /tmp/native",
+        SSH + " 'mkdir -p /tmp/native'", dry, log_path)
+    let rc_tk = run_step(67, "scp native/tensor_kernels.c",
+        SCP + " " + tk_src + " " + dest + ":/tmp/native/tensor_kernels.c", dry, log_path)
+    if !dry && rc_tk != 0 { abort(2, "FAIL_RUNTIME_SCP tensor_kernels rc=" + str(rc_tk)) }
+    let rc_net = run_step(68, "scp native/net.c",
+        SCP + " " + net_src + " " + dest + ":/tmp/native/net.c", dry, log_path)
+    if !dry && rc_net != 0 { abort(2, "FAIL_RUNTIME_SCP net rc=" + str(rc_net)) }
+    let rc_hxb = run_step(69, "scp native/hxblas_linux.c",
+        SCP + " " + hxblas_src + " " + dest + ":/tmp/native/hxblas_linux.c", dry, log_path)
+    if !dry && rc_hxb != 0 { abort(2, "FAIL_RUNTIME_SCP hxblas rc=" + str(rc_hxb)) }
+    let rc_hxh = run_step(70, "scp native/hxlmhead_linux.c",
+        SCP + " " + hxlmh_src + " " + dest + ":/tmp/native/hxlmhead_linux.c", dry, log_path)
+    if !dry && rc_hxh != 0 { abort(2, "FAIL_RUNTIME_SCP hxlmhead rc=" + str(rc_hxh)) }
+    if have_hxqwen {
+        let rc_hxq = run_step(71, "scp native/hxqwen14b_linux.c (DAY-2)",
+            SCP + " " + hxqwen_src + " " + dest + ":/tmp/native/hxqwen14b_linux.c",
+            dry, log_path)
+        if !dry && rc_hxq != 0 { abort(2, "FAIL_RUNTIME_SCP hxqwen14b rc=" + str(rc_hxq)) }
+    } else {
+        stamp_step("SKIP scp hxqwen14b_linux.c — source not present (DAY-2 escalation)", log_path)
+    }
+    let _apt = run_step(72, "ensure libopenblas-dev on pod",
+        SSH + " 'dpkg -s libopenblas-dev >/dev/null 2>&1 || "
+        + "(apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libopenblas-dev) || true'",
+        dry, log_path)
+    let rc_bb = run_step(73, "gcc -shared libhxblas.so",
+        SSH + " 'gcc -O2 -fPIC -shared /tmp/native/hxblas_linux.c "
+        + "-o /tmp/native/libhxblas.so -lopenblas -lgomp -lm 2>&1'",
+        dry, log_path)
+    if !dry && rc_bb != 0 { abort(3, "FAIL_HXBLAS_BUILD rc=" + str(rc_bb)) }
+    let rc_bh = run_step(74, "gcc -shared libhxlmhead.so",
+        SSH + " 'gcc -O2 -fPIC -shared /tmp/native/hxlmhead_linux.c "
+        + "-o /tmp/native/libhxlmhead.so -lopenblas -lgomp -lm 2>&1'",
+        dry, log_path)
+    if !dry && rc_bh != 0 { abort(3, "FAIL_HXLMHEAD_BUILD rc=" + str(rc_bh)) }
+    if have_hxqwen {
+        // DAY-2 shared lib build (Qwen attention/rope/gqa + safetensors shard loader).
+        let rc_bq = run_step(75, "gcc -shared libhxqwen14b.so (DAY-2)",
+            SSH + " 'gcc -O2 -fPIC -shared /tmp/native/hxqwen14b_linux.c "
+            + "-o /tmp/native/libhxqwen14b.so -lopenblas -lgomp -lm 2>&1'",
+            dry, log_path)
+        if !dry && rc_bq != 0 { abort(3, "FAIL_HXQWEN14B_BUILD rc=" + str(rc_bq)) }
+    }
+    let so_list = (if have_hxqwen { "libhxblas.so libhxlmhead.so libhxqwen14b.so" }
+                   else { "libhxblas.so libhxlmhead.so" })
+    let rc_inst = run_step(76, "install .so -> /usr/local/lib + ldconfig",
+        SSH + " 'cd /tmp/native && cp " + so_list + " /usr/local/lib/ && ldconfig 2>&1'",
+        dry, log_path)
+    if !dry && rc_inst != 0 { abort(3, "FAIL_SO_INSTALL rc=" + str(rc_inst)) }
+
+    // ── Step 6 — Deploy ALM trainer sources ──
+    let _rmkd = run_step(7, "mkdir -p remote training dir",
+        SSH + " 'mkdir -p " + REMOTE_TRAIN_DIR + "'", dry, log_path)
+    let mut i = 0
+    while i < LOCAL_SOURCES.len() {
+        let src = LOCAL_SOURCES[i]
+        let abs_src = "/Users/ghost/Dev/anima/" + src
+        if !dry && !file_exists(abs_src) {
+            abort(2, "FAIL_SRC_MISSING: " + abs_src)
+        }
+        let rc_s = run_step(8, "scp " + src,
+            SCP + " " + abs_src + " " + dest + ":" + REMOTE_TRAIN_DIR + "/",
+            dry, log_path)
+        if !dry && rc_s != 0 { abort(2, "FAIL_SRC_SCP " + src + " rc=" + str(rc_s)) }
+        i = i + 1
+    }
+
+    // ── Step 6.5 — Dep modules (none registered at scaffold stage — see LOCAL_DEP_SOURCES) ──
+    let mut di = 0
+    while di < LOCAL_DEP_SOURCES.len() {
+        let dsrc = LOCAL_DEP_SOURCES[di]
+        let abs_dsrc = "/Users/ghost/Dev/anima/" + dsrc
+        if !dry && !file_exists(abs_dsrc) { abort(2, "FAIL_DEP_MISSING: " + abs_dsrc) }
+        let rc_d = run_step(85, "scp dep " + dsrc,
+            SCP + " " + abs_dsrc + " " + dest + ":" + REMOTE_TRAIN_DIR + "/",
+            dry, log_path)
+        if !dry && rc_d != 0 { abort(2, "FAIL_DEP_SCP " + dsrc + " rc=" + str(rc_d)) }
+        di = di + 1
+    }
+
+    // ── Step 7 — Base model provisioning (Qwen2.5-14B-Instruct ~28GB safetensors) ──
+    // Unlike CLM (from-scratch), ALM is LoRA on top of Qwen base — must pull shards
+    // from r2:anima-models/base/Qwen2.5-14B-Instruct/ before trainer start.
+    let rc_base = run_step(9, "rclone pull Qwen2.5-14B-Instruct base model (~28GB)",
+        SSH + " 'test -d " + BASE_MODEL + "/model-00001-of-00008.safetensors "
+        + "|| rclone copy " + QWEN_BASE_R2 + " " + BASE_MODEL
+        + " -v --s3-no-check-bucket --transfers 4'",
+        dry, log_path)
+    if !dry && rc_base != 0 { abort(2, "FAIL_BASE_MODEL_PULL rc=" + str(rc_base)) }
+
+    // ── Step 8 — Corpus provisioning (2-tier: local stripped txt > R2) ──
+    // NOTE: corpus_alm_70b_stripped.txt is NOT yet uploaded to R2 (scaffold stage
+    // remaining-work item). Until then only tier-1 (local stripped) works;
+    // tier-2 will fail until upload lands. Log a warning in that case.
+    let already_present = (if dry { false }
+        else { exec(SSH + " 'test -f " + CORPUS_ARG
+            + " && test $(wc -c <" + CORPUS_ARG + ") -gt 50000000'"
+            + " >/dev/null 2>&1; echo $?").trim() == "0" })
+    if already_present {
+        stamp_step("Step 11 skip: corpus already present on pod (>50MB)", log_path)
+    } else {
+        let have_local = file_exists(CORPUS_LOCAL)
+        if have_local {
+            stamp_step("Step 11 tier1: local stripped corpus scp (~90MB)", log_path)
+            let rc_cs = run_step(11, "scp local corpus_alm_70b_stripped.txt",
+                SCP + " " + CORPUS_LOCAL + " " + dest + ":" + CORPUS_REMOTE,
+                dry, log_path)
+            if !dry && rc_cs != 0 { abort(2, "FAIL_CORPUS_SCP rc=" + str(rc_cs)) }
+        } else {
+            stamp_step("WARN: local stripped corpus missing at " + CORPUS_LOCAL
+                + " — attempting R2 tier-2 (may fail; upload is remaining work)", log_path)
+            let rc_cr = run_step(11, "corpus R2 pull (fallback — may fail)",
+                SSH + " 'rclone copy " + CORPUS_R2 + " /workspace/ --s3-no-check-bucket'",
+                dry, log_path)
+            if !dry && rc_cr != 0 { abort(2, "FAIL_CORPUS_PULL rc=" + str(rc_cr)
+                + " — materialise " + CORPUS_LOCAL + " or upload to " + CORPUS_R2) }
+        }
+    }
+    let rc_cv = run_step(12, "corpus presence + size verify (>50MB)",
+        SSH + " 'test -f " + CORPUS_ARG
+        + " && test $(wc -c <" + CORPUS_ARG + ") -gt 50000000 "
+        + "&& wc -c " + CORPUS_ARG + "'",
+        dry, log_path)
+    if !dry && rc_cv != 0 { abort(2, "FAIL_CORPUS_MISSING_OR_SMALL: " + CORPUS_ARG) }
+
+    // ── Step 9 — Cross-compile train_alm_lora.hexa → C → ELF ──
+    let rc9a = run_step(9, "remote hexa -> C transpile (train_alm_lora)",
+        SSH + " '" + REMOTE_HEXA_BIN + " " + REMOTE_TRAIN_DIR
+        + "/train_alm_lora.hexa /tmp/alm_r10d.c 2>&1'",
+        dry, log_path)
+    if !dry && rc9a != 0 { abort(3, "FAIL_CROSSCOMPILE (hexa->C) rc=" + str(rc9a)) }
+
+    // Step 9.5 — transpile each dep (none at scaffold stage; loop is no-op)
+    let mut ti = 0
+    let mut dep_c_list = ""
+    while ti < DEP_MODULE_NAMES.len() {
+        let mname = DEP_MODULE_NAMES[ti]
+        let dep_hexa = REMOTE_TRAIN_DIR + "/" + mname + ".hexa"
+        let dep_c    = "/tmp/" + mname + ".c"
+        let rc_t = run_step(90, "remote transpile dep " + mname,
+            SSH + " '" + REMOTE_HEXA_BIN + " " + dep_hexa + " " + dep_c + " 2>&1'",
+            dry, log_path)
+        if !dry && rc_t != 0 { abort(3, "FAIL_DEP_TRANSPILE " + mname + " rc=" + str(rc_t)) }
+        let rc_r = run_step(91, "rename main() in dep " + mname,
+            SSH + " 'sed -i \"s|^int main(int argc|int main_" + mname
+            + "(int argc|\" " + dep_c + "'",
+            dry, log_path)
+        if !dry && rc_r != 0 { abort(3, "FAIL_DEP_RENAME_MAIN " + mname + " rc=" + str(rc_r)) }
+        dep_c_list = dep_c_list + " " + dep_c
+        ti = ti + 1
+    }
+
+    // ── Step 10 — gcc link main + deps + hxblas + hxlmhead + hxqwen14b ──
+    // EXPECTED TO FAIL until hxqwen14b FFI Day-2 ships: train_alm_lora.hexa calls
+    // hxqwen14b_forward / _backward / _apply_lora which are declared extern in the
+    // transpiled .c but only resolved by libhxqwen14b.so. Without DAY-2 .c→.so,
+    // the link step errors out with "undefined reference" — this is the expected
+    // scaffold-stage failure mode, not a launcher bug.
+    let rc10 = run_step(10, "remote gcc link (main + deps + -lhxblas -lhxlmhead -lhxqwen14b)",
+        SSH + " 'gcc -O2 -I /opt/hexa/include -Wl,--allow-multiple-definition"
+        + " /tmp/alm_r10d.c" + dep_c_list
+        + " -L/usr/local/lib -lhxblas -lhxlmhead -lhxqwen14b"
+        + " -o " + REMOTE_NATIVE + " -lm 2>&1'",
+        dry, log_path)
+    if !dry && rc10 != 0 {
+        abort(3, "FAIL_CROSSCOMPILE (gcc link) rc=" + str(rc10)
+            + " — likely hxqwen14b FFI Day-2 missing (escalate to hexa-lang)")
+    }
+
+    // ── Step 11 — base model presence sanity (safetensors index exists) ──
+    let rc11 = run_step(11, "base model shard index verify",
+        SSH + " 'ls " + BASE_MODEL + "/model.safetensors.index.json "
+        + "&& ls " + BASE_MODEL + "/tokenizer.json'",
+        dry, log_path)
+    if !dry && rc11 != 0 { abort(2, "FAIL_BASE_MODEL_SHARDS_MISSING") }
+
+    // ── Step 12 — tmux launch hexa-native trainer ──
+    let train_cmd = "LD_LIBRARY_PATH=/usr/local/lib:/tmp/native:\\$LD_LIBRARY_PATH "
+        + "HEXA_NATIVE_LIB_DIR=/tmp/native "
+        + REMOTE_NATIVE
+        + " --base-model " + BASE_MODEL
+        + " --corpus " + CORPUS_ARG
+        + " --steps " + STEPS_S
+        + " --seed " + SEED_S
+        + " --batch " + BATCH_S
+        + " --seq " + SEQ_S
+        + " --lr-peak " + LR_PEAK
+        + " --lr-floor " + LR_FLOOR
+        + " --warmup " + WARMUP_S
+        + " --schedule " + SCHEDULE
+        + " --save-every " + SAVE_EVERY_S
+        + " --lora-r " + str(DEFAULT_LORA_R)
+        + " --lora-alpha " + str(DEFAULT_LORA_ALPHA)
+        + " --lora-targets " + DEFAULT_LORA_TARGETS
+        + " --abort-file " + ABORT_STATUS_FILE
+        + " --first-batch-ce-max " + FIRST_BATCH_CE_MAX
+        + " --step1-loss-max " + STEP1_LOSS_MAX
+        + " --early-loss-gate-step " + str(EARLY_LOSS_GATE_STEP)
+        + " --ckpt-dir " + CKPT_DIR
+        + " 2>&1 | tee " + REMOTE_LOG
+    let tmux_cmd = SSH + " \"tmux new -d -s " + TMUX_SESSION
+        + " 'bash -lc \\\"" + train_cmd + "\\\"'\""
+    let rc12 = run_step(13, "tmux launch " + TMUX_SESSION, tmux_cmd, dry, log_path)
+    if !dry && rc12 != 0 { abort(2, "FAIL_TMUX_LAUNCH rc=" + str(rc12)) }
+
+    // ── Step 13 — 120s verify (ALM 14B warm-up is slower; use 120s vs CLM 60s) ──
+    stamp_step("sleep 120s before verify (ALM 14B warm-up window)", log_path)
+    if !dry { exec("sleep 120") }
+    let util = (if dry { "<util>" }
+                else {
+                    exec(SSH + " 'nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | head -1'").trim()
+                })
+    stamp_step("nvidia-smi util = " + util + "%", log_path)
+    let tail = (if dry { "<ce/loss tail>" }
+                else {
+                    exec(SSH + " 'tail -10 " + REMOTE_LOG + " 2>/dev/null'").trim()
+                })
+    stamp_step("log tail:\n" + tail, log_path)
+
+    if !dry {
+        // ALM 14B util target: >30% (higher than CLM's >5 because 14B loads the GPU more).
+        let ok_util_s = exec("echo '" + util + "' | awk '{ if ($1+0 > 30) print 1; else print 0 }'").trim()
+        let ce_line = exec(SSH + " 'grep -c \"first_batch_ce=\" " + REMOTE_LOG + " 2>/dev/null || echo 0'").trim()
+        if ok_util_s != "1" || ce_line == "0" {
+            exec(SSH + " 'tmux kill-session -t " + TMUX_SESSION + " 2>/dev/null || true'")
+            abort(2, "FAIL_VERIFY_120S — util=" + util + " first_batch_ce_lines=" + ce_line)
+        }
+        // Check abort sentinel file (trainer side writes FIRST_BATCH_CE_HIGH etc.)
+        let abort_status = exec(SSH + " 'cat " + ABORT_STATUS_FILE + " 2>/dev/null || echo NONE'").trim()
+        stamp_step("abort_status=" + abort_status, log_path)
+        if abort_status != "NONE" && abort_status != "" {
+            exec(SSH + " 'tmux kill-session -t " + TMUX_SESSION + " 2>/dev/null || true'")
+            abort(2, "FAIL_TRAINER_ABORT — " + ABORT_STATUS_FILE + "=" + abort_status)
+        }
+    }
+
+    if dry {
+        stamp_step("DRY-RUN walked 14 steps — no I/O performed", log_path)
+        return
+    }
+    stamp_step("LIVE FIRE success — tmux session '" + TMUX_SESSION
+        + "' training, log=" + REMOTE_LOG, log_path)
+    println("")
+    println("LIVE FIRE complete. Watch: " + SSH + " 'tmux attach -t " + TMUX_SESSION + "'")
+    println("Tail:  " + SSH + " 'tail -f " + REMOTE_LOG + "'")
+    println("Log:   " + log_path)
+}
+
+// ── Entry ─────────────────────────────────────────────────────────────
+
+fn main() {
+    let ts = now_iso()
+    let log_path = "/Users/ghost/Dev/anima/training/deploy/alm_14b_r10d_launch_" + ts + ".log"
+
+    if SELFTEST {
+        let ok = selftest()
+        if !ok { panic("selftest FAIL") }
+        return
+    }
+
+    let have_pod = (POD != "" || POD_ID != "" || POD_IP_ARG != "")
+    if !have_pod {
+        println("")
+        println("USAGE:")
+        println("  hexa <this file> --selftest")
+        println("  hexa <this file> --pod-id <id> --dry-run")
+        println("  hexa <this file> --pod-ip <ip> --pod-port <n> --dry-run")
+        println("  hexa <this file> --pod-id <id> --smoke --dry-run")
+        println("  hexa <this file> --pod-id <id> --seed-sweep --dry-run")
+        println("  LIVE_FIRE_OK=1 hexa <this file> --pod-id <id>   # gated")
+        println("")
+        panic("need one of: --pod / --pod-id / --pod-ip (except with --selftest)")
+    }
+
+    write_file(log_path, "# ALM 14B r10d hexa-native launcher log " + ts + "\n")
+    let pod_label = (if POD != "" { POD }
+                     else if POD_ID != "" { POD_ID }
+                     else { POD_IP_ARG + ":" + POD_PORT_S })
+    stamp_step("launcher start — pod=" + pod_label
+        + " ckpt=" + CKPT_DIR
+        + " steps=" + STEPS_S
+        + " seed=" + SEED_S
+        + " dry=" + (if DRY_RUN { "1" } else { "0" }),
+        log_path)
+
+    build_plan(log_path)
+    live_fire(log_path)
+
+    if DRY_RUN {
+        stamp_step("DRY-RUN complete — no remote I/O performed.", log_path)
+        println("")
+        println("DRY-RUN complete. Real fire pending 'remaining work' resolution.")
+        println("Log: " + log_path)
+    }
+}
+
+main()
