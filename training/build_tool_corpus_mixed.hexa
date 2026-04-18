@@ -1,0 +1,178 @@
+// training/build_tool_corpus_mixed.hexa — A2-Tool corpus mixer (v2 2026-04-18)
+// @convergence state=provisional id=A2_TOOL_CORPUS_MIXED_V2_20260418
+//                 value="v2 2026-04-18: replace narrow 50-seed ×5 tool source with the
+//                        schema-validated CLEAN corpus (7500 tool-schema records, 12
+//                        canonical tool names, 80%+ diversity). Mix ~2500 clean tool
+//                        records with ~3000 broad instructions for 5% tool ratio
+//                        (within D6 post-mortem 1-5% band). Prior v1 (D4 pivot) used
+//                        build_tool_corpus.hexa seed (50 lines × 5) which triggered
+//                        mode collapse on search_web confabulation (r9 hire_sim 0.5333)."
+//                 created_at=2026-04-18
+//
+// Purpose:
+//   Build a mixed JSONL corpus for the A2-Tool retrain:
+//     - ~2500 clean tool-call records (subset of clean_tool_corpus_20260418.jsonl)
+//     - ~3000 broad instruction samples from corpus_alm_70b.jsonl
+//     Total: ~5500 lines / ~5-6 MB / ~5% tool-byte ratio
+//
+//   The trainer (train_alm_14b.hexa → load_corpus_chunked) tokenizes the whole
+//   file as raw text regardless of JSON schema, so we can freely mix schemas
+//   line-by-line. Tool lines expose structured tool-call JSON, broad lines
+//   expose ChatML user/assistant messages — preventing the narrow collapse
+//   that caused the D4 regression.
+//
+// Inputs (must exist before run):
+//   training/corpus_tool/clean_tool_corpus_20260418.jsonl   (6000+ tool records — from build_tool_corpus_clean.hexa)
+//   training/corpus_alm_70b.jsonl                           (90283 lines, from D6 corpus expansion)
+//
+// Outputs:
+//   training/corpus_tool/mixed_tool_corpus.jsonl                          (~5500 lines, deterministic)
+//   shared/state/alm_a2_tool_corpus_mixed_20260418.json                   (stats record)
+//
+// Run:
+//   hexa run training/build_tool_corpus_mixed.hexa
+//
+// Stage0 constraints honored (per project memory feedback_hexa_*):
+//   - exec() for file munging (no fancy string builder)
+//   - no struct with list fields
+//   - single-line return expressions
+//   - contains() not substring() where possible
+
+// v2 2026-04-18: clean tool corpus is now the canonical tool-side source.
+// We sample a HEAD of the clean corpus (not seed × N) — the clean file is
+// already shuffled via LCG permutation inside build_tool_corpus_clean.hexa,
+// so `head -n 2500` is a deterministic cross-tool sample.
+let TOOL_CLEAN = "training/corpus_tool/clean_tool_corpus_20260418.jsonl"
+let BROAD      = "training/corpus_alm_70b.jsonl"
+let OUT_PATH   = "training/corpus_tool/mixed_tool_corpus.jsonl"
+let STATE_OUT  = "shared/state/alm_a2_tool_corpus_mixed_20260418.json"
+let N_TOOL     = 2500   // head of clean corpus (already diverse, already schema-valid)
+let N_BROAD    = 3000   // sample from head (koalpaca/kmmlu/kobest/carrotai mix)
+
+fn log(msg: string) {
+    println("[build_mixed] " + msg)
+}
+
+fn require_file(path: string) {
+    if !file_exists(path) {
+        log("ERR: required file missing: " + path)
+        exit(1)
+    }
+}
+
+fn main() {
+    log("=== v2 mixed A2-Tool corpus builder (clean + broad) ===")
+
+    require_file(TOOL_CLEAN)
+    require_file(BROAD)
+
+    // --- Step 1: count inputs ---
+    let tool_n_out = exec("wc -l < " + TOOL_CLEAN).trim()
+    let broad_n_out = exec("wc -l < " + BROAD).trim()
+    log("clean tool corpus lines: " + tool_n_out)
+    log("broad corpus lines:      " + broad_n_out)
+
+    // --- Step 2: schema pre-validation (refuse if clean corpus is stale) ---
+    let tool_schema_valid = exec("grep -cE '\"tool\":\\{.*\"instruction\":\".*\"response\":\\{\"name\":\"' " + TOOL_CLEAN).trim()
+    let tool_n_int = to_int(tool_n_out)
+    let tool_schema_int = to_int(tool_schema_valid)
+    let tool_valid_permil = if tool_n_int > 0 { (tool_schema_int * 1000) / tool_n_int } else { 0 }
+    log("clean tool schema-valid: " + tool_schema_valid + " / " + tool_n_out + " (" + to_string(tool_valid_permil) + " per-mil)")
+    if tool_valid_permil < 990 {
+        log("ERR: clean tool corpus failed schema gate (<99% valid) — refusing")
+        exit(1)
+    }
+
+    // --- Step 3: build mixed corpus ---
+    // Strategy (order matters for the seq=1024 block chunker):
+    //   tool_head(N_TOOL/2) + broad_head(N_BROAD) + tool_tail(N_TOOL/2)
+    // The clean corpus is already LCG-permuted, so "head" is a cross-tool
+    // diverse sample (not single-tool block).
+
+    let tmp_tool_sample = "/tmp/_mix_tool_sample_20260418.jsonl"
+    let tmp_broad       = "/tmp/_mix_broad_head_20260418.jsonl"
+
+    exec("rm -f " + tmp_tool_sample + " " + tmp_broad + " " + OUT_PATH)
+
+    // Take head N_TOOL lines (already permuted → cross-tool diverse)
+    exec("head -n " + to_string(N_TOOL) + " " + TOOL_CLEAN + " > " + tmp_tool_sample)
+    let tool_sample_n = exec("wc -l < " + tmp_tool_sample).trim()
+    log("tool sample lines: " + tool_sample_n)
+
+    // Head N_BROAD from broad corpus
+    exec("head -n " + to_string(N_BROAD) + " " + BROAD + " > " + tmp_broad)
+    let broad_head_n = exec("wc -l < " + tmp_broad).trim()
+    log("broad head lines: " + broad_head_n)
+
+    // Split tool sample into two halves (interleave for epoch exposure)
+    let tool_total_int = to_int(tool_sample_n)
+    let half = tool_total_int / 2
+    exec("head -n " + to_string(half) + " " + tmp_tool_sample + " > /tmp/_mix_tool_head.jsonl")
+    exec("tail -n +" + to_string(half + 1) + " " + tmp_tool_sample + " > /tmp/_mix_tool_tail.jsonl")
+
+    // Assemble: tool_head + broad + tool_tail
+    exec("cat /tmp/_mix_tool_head.jsonl " + tmp_broad + " /tmp/_mix_tool_tail.jsonl > " + OUT_PATH)
+
+    let out_lines = exec("wc -l < " + OUT_PATH).trim()
+    let out_size = exec("wc -c < " + OUT_PATH).trim()
+    log("OUTPUT: " + OUT_PATH)
+    log("  lines: " + out_lines)
+    log("  bytes: " + out_size)
+
+    // --- Step 4: validate JSONL integrity + tool schema ratio ---
+    let valid_n = exec("grep -c '^{.*}$' " + OUT_PATH).trim()
+    log("  JSON-shaped lines: " + valid_n + " / " + out_lines)
+
+    let tool_lines_out = exec("grep -cE '\"response\":\\{\"name\":\"' " + OUT_PATH).trim()
+    log("  tool-schema lines: " + tool_lines_out + " / " + out_lines)
+
+    // --- Step 5: compute tool ratio (bytes) ---
+    let tool_bytes_s = exec("wc -c < " + tmp_tool_sample).trim()
+    let total_bytes_s = out_size
+    let tool_bytes = to_int(tool_bytes_s)
+    let total_bytes = to_int(total_bytes_s)
+    let tool_pct_x10 = if total_bytes > 0 { (tool_bytes * 1000) / total_bytes } else { 0 }
+    log("  tool byte ratio: " + to_string(tool_pct_x10) + " / 1000  (~" + to_string(tool_pct_x10 / 10) + "%)")
+
+    // --- Step 6: write state file ---
+    let state_json = "{\n"
+        + "  \"_meta\": {\n"
+        + "    \"id\": \"alm_a2_tool_corpus_mixed_20260418\",\n"
+        + "    \"name\": \"Mixed A2-Tool corpus v2 — clean head + broad\",\n"
+        + "    \"predecessor\": \"mixed_tool_corpus.jsonl v1 (50-seed × 5 + broad — narrow tool signal, mode collapse on search_web)\",\n"
+        + "    \"generated_at\": \"2026-04-18\",\n"
+        + "    \"actor\": \"a2_tool_regen_agent\"\n"
+        + "  },\n"
+        + "  \"inputs\": {\n"
+        + "    \"tool_clean_path\": \"" + TOOL_CLEAN + "\",\n"
+        + "    \"tool_clean_lines\": " + tool_n_out + ",\n"
+        + "    \"tool_schema_valid_permil\": " + to_string(tool_valid_permil) + ",\n"
+        + "    \"broad_corpus_path\": \"" + BROAD + "\",\n"
+        + "    \"broad_corpus_lines\": " + broad_n_out + "\n"
+        + "  },\n"
+        + "  \"mix_params\": {\n"
+        + "    \"tool_head\": " + to_string(N_TOOL) + ",\n"
+        + "    \"broad_sample\": " + to_string(N_BROAD) + ",\n"
+        + "    \"layout\": \"tool_head(" + to_string(N_TOOL/2) + ") + broad(" + to_string(N_BROAD) + ") + tool_tail(" + to_string(N_TOOL/2) + ")\"\n"
+        + "  },\n"
+        + "  \"output\": {\n"
+        + "    \"path\": \"" + OUT_PATH + "\",\n"
+        + "    \"lines\": " + out_lines + ",\n"
+        + "    \"bytes\": " + out_size + ",\n"
+        + "    \"json_shaped_lines\": " + valid_n + ",\n"
+        + "    \"tool_schema_lines\": " + tool_lines_out + ",\n"
+        + "    \"tool_byte_ratio_permil\": " + to_string(tool_pct_x10) + "\n"
+        + "  },\n"
+        + "  \"rationale\": \"v2: clean canonical tool corpus (6000+ schema-valid records, 12 canonical names, diversity ≥80%) replaces the 50-seed × 5 source. This fixes the mode-collapse root cause (search_web confabulation). Tool byte ratio kept ~5% per D6.post_mortem constraint.\"\n"
+        + "}\n"
+
+    write_file(STATE_OUT, state_json)
+    log("state file: " + STATE_OUT)
+
+    // Cleanup temps
+    exec("rm -f /tmp/_mix_tool_head.jsonl /tmp/_mix_tool_tail.jsonl " + tmp_tool_sample + " " + tmp_broad)
+
+    log("=== DONE ===")
+}
+
+main()

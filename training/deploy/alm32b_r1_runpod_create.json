@@ -1,0 +1,154 @@
+{
+  "_meta": {
+    "name": "ALM 32B r1 — RunPod H100 80GB pod-create spec",
+    "created": "2026-04-18",
+    "status": "PREP (NOT FIRED — waiting for r10 14B completion + eval green)",
+    "purpose": "First ALM 32B fine-tune — fresh LoRA r=32 α=64 on chatml-stripped corpus, B1 OFF, 2000-step cap (mirrors r10 config at 32B scale).",
+    "launcher": "training/launch_alm_32b_r1.hexa",
+    "bootstrap": "training/deploy/alm32b_r1_bootstrap.hexa",
+    "base_model": "Qwen/Qwen2.5-32B-Instruct (HuggingFace — NOT in R2 yet)",
+    "base_model_r2_after_first_pull": "r2:anima-models/base_models/qwen25-32b-instruct/ (mirrored by bootstrap on first download)",
+    "corpus_source": "/workspace/corpus_alm_70b_stripped.txt (same as r10; pod-generated from R2 corpus_alm_70b.jsonl)",
+    "corpus_override_env": "CORPUS_OVERRIDE=/workspace/kowiki_stripped.txt (if E2 ships kowiki.jsonl)",
+    "r2_ckpt_target": "r2:anima-models/alm32b/r1/step_2000/",
+    "kr_gen_sentinel": "training/kr_gen_sentinel.hexa (B6) — 200-step cadence, abort on COLLAPSED",
+    "escalation_gate": "r10 (14B) step_2000 eval must show (a) no mode collapse, (b) Korean fluency maintained, (c) CE monotone non-increasing over last 400 steps. Only then fire 32B r1.",
+    "memory_refs": [
+      "feedback_extreme_accel (7B→14B→32B→70B ladder)",
+      "feedback_h100_authorized (2-pod cap — 32B needs only 1 pod)",
+      "feedback_one_shot_best (2e-6 const LR matches r10 one-shot-best)",
+      "feedback_no_quantization (bf16 throughout, no bnb/GPTQ/AWQ)",
+      "feedback_no_resume_data_change (fresh step 0 for new param class)",
+      "feedback_no_version_in_filename (r1 suffix, no v2/v3)",
+      "runpod_mfs_quota (training/CLAUDE.md — save_every=2000, clean ckpt dir, post-training bulk R2 upload)",
+      "r2_checkpoint rule (post-training one-batch rclone upload)"
+    ],
+    "fire_with": [
+      "# Pre-req (on user machine):",
+      "#   1. r10 (14B) complete AND eval green AND explicit escalation order",
+      "#   2. runpodctl installed + authenticated",
+      "#   3. RUNPOD_API_KEY + HF_TOKEN exported",
+      "#   4. RunPod account funded (~$30 production single-shot)",
+      "",
+      "# Fire (one command):",
+      "runpodctl pod create -f training/deploy/alm32b_r1_runpod_create.json",
+      "",
+      "# Alt CLI form:",
+      "runpodctl create pod \\",
+      "    --name anima-alm32b-r1 \\",
+      "    --imageName runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04 \\",
+      "    --gpuType 'NVIDIA H100 80GB HBM3' \\",
+      "    --gpuCount 1 \\",
+      "    --containerDiskSize 200 \\",
+      "    --volumeSize 0 \\",
+      "    --mem 96 \\",
+      "    --vcpu 24 \\",
+      "    --ports '22/tcp' \\",
+      "    --startSSH \\",
+      "    --secureCloud"
+    ]
+  },
+
+  "name": "anima-alm32b-r1",
+  "imageName": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+  "gpuTypeId": "NVIDIA H100 80GB HBM3",
+  "gpuCount": 1,
+  "vcpuCount": 24,
+  "minMemoryInGb": 96,
+  "containerDiskInGb": 200,
+  "volumeInGb": 0,
+  "minVcpuCount": 24,
+  "supportPublicIp": true,
+  "startSsh": true,
+  "secureCloud": true,
+  "ports": "22/tcp",
+  "dockerArgs": "",
+
+  "env": [
+    {"key": "PYTHONUNBUFFERED",        "value": "1"},
+    {"key": "PYTORCH_CUDA_ALLOC_CONF", "value": "expandable_segments:True"},
+    {"key": "CUBLAS_WORKSPACE_CONFIG", "value": ":4096:8"},
+    {"key": "ANIMA_ROOT",              "value": "/workspace/anima"},
+    {"key": "HF_HOME",                 "value": "/workspace/hf_cache"},
+    {"key": "TRANSFORMERS_CACHE",      "value": "/workspace/hf_cache"},
+    {"key": "TOKENIZERS_PARALLELISM",  "value": "false"}
+  ],
+
+  "_capacity_rationale": {
+    "gpuCount": "1 × H100 80GB: Qwen2.5-32B bf16 = 65 GB + LoRA r=32 adapters = 0.4 GB + AdamW optimizer (LoRA-only) ~1.6 GB + activations at batch=1 seq=1024 with grad_checkpointing ~4-6 GB = ~71 GB used, 9 GB headroom. Tight but single-GPU viable — FSDP not required at 32B. Compare 70B (145 GB) which mandates 4 × H100 FSDP.",
+    "containerDiskInGb": "200 GB: 32B base 65 GB + HF cache 20 GB + corpus 0.5 GB + adapter 0.4 GB + ckpt 0.4 GB + strip intermediate 5 GB = ~91 GB peak, 109 GB headroom vs MFS quota margin. 150 GB (14B spec) insufficient — 32B needs +50 GB.",
+    "volumeInGb": "0: single-shot, no persistent volume.",
+    "minMemoryInGb": "96: 32B safetensor loading staging buffer + HF rclone streaming + DataLoader. 14B used 64 GB; 32B needs +32 GB for load-time staging.",
+    "vcpuCount": "24: rclone parallel transfers (8) + dataloader workers + liger/unsloth compile overhead. 14B used 16; 32B benefits from +8 for faster R2 mirror upload.",
+    "secureCloud": "true: stable bf16 + production run."
+  },
+
+  "_cost_estimate": {
+    "gpu_hourly_usd": 2.99,
+    "smoke_wall_minutes_low": 25,
+    "smoke_wall_minutes_high": 35,
+    "smoke_cost_usd": 1.75,
+    "production_wall_hours_low": 5.0,
+    "production_wall_hours_high": 8.0,
+    "production_cost_low_usd": 14.95,
+    "production_cost_high_usd": 23.92,
+    "base_download_wall_minutes": 15,
+    "base_download_cost_usd": 0.75,
+    "chosen_path": "smoke first (200 steps, ~$2 inc. base DL) — validate first-batch CE + kr_gen sanity; then production (2000 steps, ~$20)"
+  },
+
+  "_post_create_steps": [
+    "1. runpodctl ssh info <pod_id>           # get ip + port",
+    "2. POD_IP=...; POD_PORT=...              # capture from step 1",
+    "3. # Stage bootstrap + launcher + sentinel + corpus strip tool + rclone.conf + hexa:",
+    "   scp -i ~/.runpod/ssh/RunPod-Key-Go -P $POD_PORT training/deploy/alm32b_r1_bootstrap.hexa root@$POD_IP:/workspace/anima/training/deploy/",
+    "   scp -i ~/.runpod/ssh/RunPod-Key-Go -P $POD_PORT training/launch_alm_32b_r1.hexa          root@$POD_IP:/workspace/anima/training/",
+    "   scp -i ~/.runpod/ssh/RunPod-Key-Go -P $POD_PORT training/kr_gen_sentinel.hexa            root@$POD_IP:/workspace/anima/training/",
+    "   scp -i ~/.runpod/ssh/RunPod-Key-Go -P $POD_PORT training/corpus_strip_chatml.hexa        root@$POD_IP:/workspace/anima/training/   # if exists",
+    "   scp -i ~/.runpod/ssh/RunPod-Key-Go -P $POD_PORT ~/.config/rclone/rclone.conf             root@$POD_IP:/root/.config/rclone/rclone.conf",
+    "   scp -i ~/.runpod/ssh/RunPod-Key-Go -P $POD_PORT $HEXA_LANG/hexa                          root@$POD_IP:/usr/local/bin/hexa",
+    "4. # Export HF_TOKEN on pod for 32B download:",
+    "   ssh -i ~/.runpod/ssh/RunPod-Key-Go root@$POD_IP -p $POD_PORT 'echo export HF_TOKEN=hf_... >> ~/.bashrc'",
+    "5. # Smoke run (~25-35 min inc. 32B download, ~$2):",
+    "   ssh -i ~/.runpod/ssh/RunPod-Key-Go root@$POD_IP -p $POD_PORT 'source ~/.bashrc && hexa run /workspace/anima/training/deploy/alm32b_r1_bootstrap.hexa smoke'",
+    "6. # If smoke sentinel CLEAN + CE decreasing, production:",
+    "   ssh ... 'tmux new -d -s alm32b-r1 \"source ~/.bashrc && hexa run /workspace/anima/training/deploy/alm32b_r1_bootstrap.hexa production 2>&1 | tee /workspace/alm32b_r1_prod.log\"'",
+    "7. # Tail:",
+    "   ssh ... 'tail -f /workspace/ckpt_alm_32b_r1/train_r1.log'"
+  ],
+
+  "_abort_criteria": [
+    "MFS quota dd preflight FAILS → terminate pod, rebuild (runpod_mfs_quota rule)",
+    "HF_TOKEN unset → bootstrap refuses (32B not in R2 on first run)",
+    "32B base downloaded < 60 GB → incomplete, abort (shard missing)",
+    "First-batch CE > 8.0 → base/corpus mismatch, abort (r10 saw CE=1.43 — 32B should be similar)",
+    "kr_gen sentinel reports COLLAPSED at any 200-step checkpoint → abort + save prior step",
+    "step=1 loss > 8.0 → abort (same threshold as r10 per deviation log)",
+    "Wall clock > 10h with CE still > 2.5 → stop, save best ckpt",
+    "Pod unresponsive (R12) → terminate + last saved ckpt only"
+  ],
+
+  "_post_training_r2_upload": {
+    "wait_for": "training process exit (no in-training upload — MFS quota trap per runpod_mfs_quota)",
+    "upload_cmd": "rclone copy /workspace/ckpt_alm_32b_r1/step_2000 r2:anima-models/alm32b/r1/step_2000/ -v --s3-no-check-bucket --transfers 4",
+    "verify_cmd": "rclone ls r2:anima-models/alm32b/r1/",
+    "naming_convention": "alm32b-r1-s2000 → r2:anima-models/alm32b/r1/step_2000/"
+  },
+
+  "_teardown": {
+    "trigger": "step_2000/train_meta.json present AND R2 upload verified AND kr_gen_step_2000.json CLEAN",
+    "cmd": "runpodctl remove pod <pod_id>",
+    "principle": "Idle 0s → immediate teardown after R2 verify. smoke $2 (30 min), production $20 (5-8 h)."
+  },
+
+  "_escalation_path": {
+    "next_rung": "70B r1 — alm70b_4pod (requires USER_OK_4POD=1 + A2-merged adapter lineage + 4 × H100 FSDP)",
+    "gating_criteria": [
+      "32B r1 step_2000 CE < 2.5",
+      "32B r1 kr_gen step_2000 VERDICT=CLEAN",
+      "32B r1 evaluator shows Korean fluency ≥ r10 baseline",
+      "No mode collapse in any saved checkpoint"
+    ],
+    "prep_dependency": "shared/state/alm_70b_spec.json + shared/state/alm_70b_launch_checklist_20260417.json already staged; 32B r1 success unlocks 70B"
+  }
+}

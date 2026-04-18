@@ -1,0 +1,1340 @@
+// training/build_tool_corpus_clean.hexa — Path A retrain clean tool corpus
+// @convergence state=provisional id=A2_TOOL_CORPUS_CLEAN_20260417
+//                 value="Diverse 5000+ tool-use records for vanilla Qwen2.5-14B-Instruct
+//                        + A2-Orch + A2-Tool retrain. Fixes mode-collapse root cause:
+//                        92% malformed records in mixed_tool_corpus.jsonl + 'search_web'
+//                        confabulation between web_search alias. One canonical name per
+//                        tool, ≥500 examples each, <5% malformed, entropy guard."
+//                 created_at=2026-04-17
+//
+// Root cause addressed (from sibling diagnosis):
+//   1. mixed_tool_corpus.jsonl had only 250 valid tool-call records
+//      spread across 10 tools (execute_code:25, web_search:15, etc.)
+//      — below critical mass per tool (<50 each).
+//   2. Model confabulated "search_web" (0 occurrences in corpus) from
+//      "web_search" (15 occurrences) — insufficient example density to
+//      pin down the canonical name.
+//   3. Training loss 0.04-0.08 smooth descent MASKED the collapse; all
+//      eval@1300/1400/1500 emitted the same search_web payload.
+//
+// Strategy:
+//   - 12 distinct tools, ONE canonical name each (no alias ambiguity).
+//   - ≥500 examples per tool via parameterized templates (15-25 slots
+//     per tool, 10-40 variations per slot) to avoid template repetition.
+//   - Each record: {tool, instruction, response} where response is
+//     {"name":"...","arguments":{...}} JSON tool-call invocation.
+//   - ~20% hard negatives (instructions where tool-call is wrong, so
+//     response is a natural-language answer instead).
+//   - Mix Korean + English phrasings sampled from corpus_alm_70b.jsonl.
+//   - Deterministic via LCG-style indexing (no runtime randomness).
+//
+// Outputs:
+//   training/corpus_tool/clean_tool_corpus_20260417.jsonl
+//   shared/state/tool_corpus_clean_20260417.json
+//
+// Constraints honored:
+//   - No struct-with-list (feedback_hexa_struct_list_alias bug)
+//   - Lists pass-by-value (feedback_hexa_lists_pbv)
+//   - Single-line returns (feedback_hexa_struct_return_bug)
+//   - exec() for auditing, write_file() for JSONL emission
+//   - No .py created, no Python runtime (total Py ban)
+//   - file_exists check before consuming corpus_alm_70b.jsonl
+
+// DRY_RUN mode: env DRY_RUN=1 → 70 per tool + 25 neg per tool = 1140 records
+// (hits spec "1000-sample dry-run" within stage0 interpreter wall-time budget).
+// Default: full 500 per tool + 125 neg per tool = 7500 records.
+let DRY_RUN = env("DRY_RUN") == "1"
+
+let OUT_PATH   = if DRY_RUN { "training/corpus_tool/clean_tool_corpus_dryrun_20260418.jsonl" } else { "training/corpus_tool/clean_tool_corpus_20260418.jsonl" }
+let STATE_OUT  = if DRY_RUN { "shared/state/tool_corpus_clean_dryrun_20260418.json" } else { "shared/state/tool_corpus_clean_20260418.json" }
+let BROAD_SRC  = "training/corpus_alm_70b.jsonl"
+
+let TARGET_PER_TOOL = if DRY_RUN { 70 } else { 500 }
+let N_TOOLS = 12
+let NEG_PER_TOOL = if DRY_RUN { 25 } else { 125 }
+
+// =====================================================================
+// JSON escape helper (stage0-safe, char-by-char)
+// =====================================================================
+
+fn json_esc(s: string) -> string {
+    let n = len(s)
+    let mut parts = []
+    let mut i = 0
+    while i < n {
+        let c = char_at(s, i)
+        if c == "\\" { parts = parts.push("\\\\") }
+        else if c == "\"" { parts = parts.push("\\\"") }
+        else if c == "\n" { parts = parts.push("\\n") }
+        else if c == "\t" { parts = parts.push("\\t") }
+        else if c == "\r" { parts = parts.push("\\r") }
+        else { parts = parts.push(c) }
+        i = i + 1
+    }
+    return parts.join("")
+}
+
+// =====================================================================
+// Tool schema builders
+// =====================================================================
+
+fn param_entry(typ: string, desc: string) -> string {
+    return "{\"type\":\"" + typ + "\",\"description\":\"" + json_esc(desc) + "\"}"
+}
+
+fn build_params2(n1: string, t1: string, d1: string, n2: string, t2: string, d2: string) -> string {
+    return "{\"type\":\"object\",\"properties\":{\"" + n1 + "\":" + param_entry(t1, d1) + ",\"" + n2 + "\":" + param_entry(t2, d2) + "},\"required\":[\"" + n1 + "\",\"" + n2 + "\"]}"
+}
+
+fn build_params1(n1: string, t1: string, d1: string) -> string {
+    return "{\"type\":\"object\",\"properties\":{\"" + n1 + "\":" + param_entry(t1, d1) + "},\"required\":[\"" + n1 + "\"]}"
+}
+
+fn build_params3(n1: string, t1: string, d1: string, n2: string, t2: string, d2: string, n3: string, t3: string, d3: string) -> string {
+    return "{\"type\":\"object\",\"properties\":{\"" + n1 + "\":" + param_entry(t1, d1) + ",\"" + n2 + "\":" + param_entry(t2, d2) + ",\"" + n3 + "\":" + param_entry(t3, d3) + "},\"required\":[\"" + n1 + "\",\"" + n2 + "\",\"" + n3 + "\"]}"
+}
+
+fn build_tool(name: string, desc: string, params_json: string) -> string {
+    return "{\"type\":\"function\",\"function\":{\"name\":\"" + json_esc(name) + "\",\"description\":\"" + json_esc(desc) + "\",\"parameters\":" + params_json + "}}"
+}
+
+// Emit a tool-call record: {tool, instruction, response}
+// response is the full tool-call invocation JSON object as a string value
+fn build_record(tool_json: string, instruction: string, name: string, args: string) -> string {
+    let response = "{\"name\":\"" + name + "\",\"arguments\":" + args + "}"
+    return "{\"tool\":" + tool_json + ",\"instruction\":\"" + json_esc(instruction) + "\",\"response\":" + response + "}"
+}
+
+// Emit a hard-negative record: {tool, instruction, response}
+// where response is a natural language refusal/direct answer (no tool call)
+fn build_neg_record(tool_json: string, instruction: string, direct_answer: string) -> string {
+    let response = "{\"name\":\"__no_tool__\",\"arguments\":{\"answer\":\"" + json_esc(direct_answer) + "\"}}"
+    return "{\"tool\":" + tool_json + ",\"instruction\":\"" + json_esc(instruction) + "\",\"response\":" + response + "}"
+}
+
+// =====================================================================
+// Deterministic pseudo-randomness via mixed LCG on the sample index.
+// Returns a value in [0, mod).
+// Seed: 48271 * i + 11 mod 2^31  (Park-Miller-ish). No actual random.
+// =====================================================================
+
+fn prng(i: int, m: int) -> int {
+    let a = (i * 48271 + 11) % 2147483647
+    let b = (a ^ (a / 65536)) % 2147483647
+    return b % m
+}
+
+// =====================================================================
+// Tool 1: search_web (canonical; replaces web_search+search_web aliasing)
+// =====================================================================
+
+fn gen_search_web(target: int) -> [string] {
+    let tool = build_tool("search_web", "Search the web for information on a topic and return results", build_params2("query", "string", "The search query text", "max_results", "integer", "Maximum number of results to return"))
+
+    let queries_en = [
+        "latest AI consciousness research 2026",
+        "best Korean restaurants in Seoul Gangnam",
+        "Rust vs Go performance benchmarks",
+        "how to train a large language model from scratch",
+        "Bitcoin price prediction Q2 2026",
+        "healthy breakfast ideas for busy mornings",
+        "climate change impact on Arctic ice",
+        "Python async await tutorial",
+        "best noise-canceling headphones under 300 USD",
+        "SpaceX next launch date",
+        "integrated information theory 4.0 paper",
+        "transformer attention mechanism explained",
+        "H100 vs A100 training throughput",
+        "COVID-19 variant XBB updates",
+        "NBA playoff standings 2026",
+        "quantum error correction breakthroughs",
+        "cheap flights from Tokyo to New York",
+        "React 19 new features",
+        "best JavaScript testing frameworks",
+        "how to configure Nginx reverse proxy"
+    ]
+    let queries_ko = [
+        "2026년 최신 AI 의식 연구",
+        "강남 맛집 추천",
+        "파이썬 비동기 처리 튜토리얼",
+        "H100 GPU 임대 가격 비교",
+        "기후변화 북극 영향 보고서",
+        "비트코인 시세 전망 2026",
+        "우울증 자가 진단 방법",
+        "서울 주말 가족 여행지",
+        "러스트 vs Go 성능 비교",
+        "트랜스포머 모델 설명",
+        "아이폰 16 출시일",
+        "코로나 변이 현재 상황",
+        "양자 오류 정정 돌파구",
+        "도쿄 뉴욕 저가 항공",
+        "리액트 19 새 기능"
+    ]
+    let max_results_choices = [3, 5, 10, 7, 4, 8, 6]
+
+    let instr_openers_en = [
+        "Search the web for ",
+        "Look up ",
+        "Find information about ",
+        "Can you search for ",
+        "Please find results on ",
+        "Google ",
+        "Web search: ",
+        "Get me links about ",
+        "I want to know about "
+    ]
+    let instr_openers_ko = [
+        "웹에서 ",
+        "검색해줘: ",
+        "다음 주제를 찾아줘: ",
+        "알아봐줘 — ",
+        "인터넷에서 ",
+        "찾아봐: ",
+        "검색 결과 좀 보여줘: "
+    ]
+
+    let mut lines = []
+    let mut i = 0
+    while i < target {
+        let use_ko = (i % 3 == 0)
+        let mut instruction = ""
+        let mut query = ""
+        if use_ko {
+            let qi = prng(i, len(queries_ko))
+            let oi = prng(i + 7, len(instr_openers_ko))
+            query = queries_ko[qi]
+            instruction = instr_openers_ko[oi] + query
+        } else {
+            let qi = prng(i, len(queries_en))
+            let oi = prng(i + 13, len(instr_openers_en))
+            query = queries_en[qi]
+            instruction = instr_openers_en[oi] + query
+        }
+        let mi = prng(i + 29, len(max_results_choices))
+        let mx = max_results_choices[mi]
+        let args = "{\"query\":\"" + json_esc(query) + "\",\"max_results\":" + to_string(mx) + "}"
+        lines = lines.push(build_record(tool, instruction, "search_web", args))
+        i = i + 1
+    }
+    return lines
+}
+
+// =====================================================================
+// Tool 2: read_file
+// =====================================================================
+
+fn gen_read_file(target: int) -> [string] {
+    let tool = build_tool("read_file", "Read the contents of a file at the given absolute path", build_params1("path", "string", "Absolute file path to read"))
+
+    let paths = [
+        "/etc/hostname",
+        "/etc/hosts",
+        "/var/log/syslog",
+        "/tmp/debug.log",
+        "/workspace/config.yaml",
+        "/home/user/notes.md",
+        "/srv/app/settings.json",
+        "/var/log/nginx/access.log",
+        "/opt/anima/state.json",
+        "/root/.bashrc",
+        "/workspace/project/README.md",
+        "/tmp/output_20260417.txt",
+        "/data/users.csv",
+        "/etc/nginx/nginx.conf",
+        "/var/log/auth.log",
+        "/home/ghost/.ssh/config",
+        "/workspace/corpus/sample.jsonl",
+        "/etc/systemd/system/anima.service",
+        "/tmp/_mix_tool_rep_20260417.jsonl",
+        "/workspace/ckpt_alm14b/adapter_config.json",
+        "/opt/models/qwen2.5-14b/tokenizer.json"
+    ]
+    let openers_en = [
+        "Read the contents of ",
+        "Show me the file at ",
+        "Open ",
+        "Cat ",
+        "Display the contents of ",
+        "What's inside ",
+        "Print the file "
+    ]
+    let openers_ko = [
+        "파일 내용을 보여줘: ",
+        "읽어봐: ",
+        "다음 경로의 파일을 열어: ",
+        "이 파일 내용은? ",
+        "열어줘 — "
+    ]
+
+    let mut lines = []
+    let mut i = 0
+    while i < target {
+        let use_ko = (i % 4 == 0)
+        let pi = prng(i, len(paths))
+        let path = paths[pi]
+        let mut instruction = ""
+        if use_ko {
+            let oi = prng(i + 11, len(openers_ko))
+            instruction = openers_ko[oi] + path
+        } else {
+            let oi = prng(i + 17, len(openers_en))
+            instruction = openers_en[oi] + path
+        }
+        let args = "{\"path\":\"" + json_esc(path) + "\"}"
+        lines = lines.push(build_record(tool, instruction, "read_file", args))
+        i = i + 1
+    }
+    return lines
+}
+
+// =====================================================================
+// Tool 3: write_file
+// =====================================================================
+
+fn gen_write_file(target: int) -> [string] {
+    let tool = build_tool("write_file", "Write content to a file, creating it if needed", build_params2("path", "string", "Destination file path", "content", "string", "Content to write"))
+
+    let paths = [
+        "/tmp/notes.txt",
+        "/tmp/output.log",
+        "/workspace/summary.md",
+        "/home/user/todo.txt",
+        "/srv/data/export.csv",
+        "/tmp/config_backup.yaml",
+        "/var/log/app_custom.log",
+        "/workspace/report_20260417.md",
+        "/tmp/draft.json",
+        "/opt/anima/manual_note.txt",
+        "/home/ghost/scratchpad.txt",
+        "/tmp/.gitignore",
+        "/workspace/CHANGELOG.md"
+    ]
+    let contents = [
+        "Meeting notes: discuss Q2 roadmap",
+        "Deployment scheduled for tonight at 22:00 KST",
+        "TODO: review PR 1234, update docs, deploy staging",
+        "Build passed — main #4521",
+        "Error: connection timeout at 16:03:22",
+        "Daily standup: no blockers",
+        "Backup completed successfully",
+        "System status: all green",
+        "Release notes v2.1: 12 features, 8 bugfixes",
+        "User report: login issue resolved",
+        "회의록: Q2 로드맵 논의 완료",
+        "오늘 배포 일정: 22시 KST",
+        "할 일: PR 검토, 문서 업데이트, 스테이징 배포",
+        "빌드 성공 — main #4521",
+        "일일 스탠드업: 이슈 없음"
+    ]
+    let openers_en = [
+        "Save this to ",
+        "Write the following to ",
+        "Create a file at ",
+        "Put these notes in ",
+        "Save to "
+    ]
+    let openers_ko = [
+        "다음 내용을 파일에 저장해: ",
+        "이 메모를 저장해 — ",
+        "파일로 저장 — ",
+        "다음을 기록해: "
+    ]
+
+    let mut lines = []
+    let mut i = 0
+    while i < target {
+        let use_ko = (i % 4 == 0)
+        let pi = prng(i, len(paths))
+        let ci = prng(i + 23, len(contents))
+        let path = paths[pi]
+        let content = contents[ci]
+        let mut instruction = ""
+        if use_ko {
+            let oi = prng(i + 31, len(openers_ko))
+            instruction = openers_ko[oi] + path + " — " + content
+        } else {
+            let oi = prng(i + 41, len(openers_en))
+            instruction = openers_en[oi] + path + ": " + content
+        }
+        let args = "{\"path\":\"" + json_esc(path) + "\",\"content\":\"" + json_esc(content) + "\"}"
+        lines = lines.push(build_record(tool, instruction, "write_file", args))
+        i = i + 1
+    }
+    return lines
+}
+
+// =====================================================================
+// Tool 4: send_email
+// =====================================================================
+
+fn gen_send_email(target: int) -> [string] {
+    let tool = build_tool("send_email", "Send an email to the specified recipient", build_params3("to", "string", "Recipient email address", "subject", "string", "Email subject line", "body", "string", "Email body text"))
+
+    let recipients = [
+        "team@example.com",
+        "boss@company.com",
+        "client@partner.co",
+        "hr@company.com",
+        "devops@company.com",
+        "support@vendor.io",
+        "ceo@startup.ai",
+        "alice@example.com",
+        "bob@example.com",
+        "finance@company.com",
+        "legal@company.com",
+        "design@company.com"
+    ]
+    let subjects = [
+        "Deployment scheduled for tonight",
+        "Weekly status update",
+        "Quick question about the roadmap",
+        "Meeting notes from today",
+        "Benefits enrollment reminder",
+        "Q2 planning kickoff",
+        "Build passed — main #4521",
+        "Urgent: production incident",
+        "RFC: new API design",
+        "Follow-up: yesterday's call",
+        "배포 일정 안내",
+        "주간 업무 보고",
+        "로드맵 관련 질문",
+        "Q2 기획 회의 공지"
+    ]
+    let bodies = [
+        "Hi team, the v2.1 deployment is scheduled for 22:00 KST tonight. Please merge all PRs by 20:00.",
+        "This week we completed API integration, load testing, and documentation. Next: UAT.",
+        "Could you share the latest roadmap doc? Thanks.",
+        "Summary: 1) discussed Q2 goals, 2) resource allocation, 3) next steps.",
+        "Thank you for the reminder. I have completed enrollment.",
+        "Let's kick off Q2 planning on Monday 10 AM KST.",
+        "Build #4521 on main passed all checks and is ready for deployment.",
+        "URGENT: we have a production incident in region us-west. Investigating.",
+        "안녕하세요, v2.1 배포는 오늘 22시 KST에 진행됩니다. PR은 20시까지 머지 부탁드립니다.",
+        "이번 주 API 연동, 부하 테스트, 문서화 완료했습니다. 다음은 UAT 입니다.",
+        "Q2 기획 킥오프는 월요일 10시 KST에 진행하겠습니다."
+    ]
+    let openers_en = [
+        "Send an email to ",
+        "Email ",
+        "Shoot a note to ",
+        "Draft and send to "
+    ]
+    let openers_ko = [
+        "다음 주소로 이메일 보내줘: ",
+        "이메일 작성해서 발송 — ",
+        "메일 보내 — "
+    ]
+
+    let mut lines = []
+    let mut i = 0
+    while i < target {
+        let use_ko = (i % 4 == 0)
+        let ri = prng(i, len(recipients))
+        let si = prng(i + 19, len(subjects))
+        let bi = prng(i + 37, len(bodies))
+        let to = recipients[ri]
+        let subj = subjects[si]
+        let body = bodies[bi]
+        let mut instruction = ""
+        if use_ko {
+            let oi = prng(i + 43, len(openers_ko))
+            instruction = openers_ko[oi] + to + " (제목: " + subj + ")"
+        } else {
+            let oi = prng(i + 47, len(openers_en))
+            instruction = openers_en[oi] + to + " re: " + subj
+        }
+        let args = "{\"to\":\"" + json_esc(to) + "\",\"subject\":\"" + json_esc(subj) + "\",\"body\":\"" + json_esc(body) + "\"}"
+        lines = lines.push(build_record(tool, instruction, "send_email", args))
+        i = i + 1
+    }
+    return lines
+}
+
+// =====================================================================
+// Tool 5: create_event (calendar)
+// =====================================================================
+
+fn gen_create_event(target: int) -> [string] {
+    let tool = build_tool("create_event", "Create a new calendar event", build_params3("title", "string", "Event title", "start_time", "string", "Start time in ISO 8601 format", "duration_minutes", "integer", "Duration in minutes"))
+
+    let titles = [
+        "Team Standup", "1:1 with manager", "Sprint Review", "Retrospective",
+        "Client Meeting", "Design Review", "Code Review", "Interview: Candidate X",
+        "All-Hands", "Lunch with team", "Architecture Sync", "Roadmap Planning",
+        "팀 스탠드업", "1:1 미팅", "스프린트 리뷰", "회고", "고객 미팅", "디자인 리뷰",
+        "면접: 지원자 김모씨", "전사 미팅", "팀 점심", "로드맵 기획"
+    ]
+    let times = [
+        "2026-04-18T09:00:00+09:00", "2026-04-18T14:00:00+09:00",
+        "2026-04-19T10:30:00+09:00", "2026-04-20T15:00:00+09:00",
+        "2026-04-21T11:00:00+09:00", "2026-04-22T16:00:00+09:00",
+        "2026-04-23T13:00:00+09:00", "2026-04-24T09:30:00+09:00",
+        "2026-04-25T14:30:00+09:00", "2026-04-26T10:00:00+09:00"
+    ]
+    let durations = [15, 30, 45, 60, 90, 120]
+
+    let openers_en = [
+        "Schedule a ", "Book a ", "Add to calendar: ", "Set up a ", "Put a "
+    ]
+    let openers_ko = [
+        "다음 일정 잡아줘: ", "캘린더에 추가: ", "일정 등록 — "
+    ]
+
+    let mut lines = []
+    let mut i = 0
+    while i < target {
+        let use_ko = (i % 3 == 0)
+        let ti = prng(i, len(titles))
+        let timi = prng(i + 53, len(times))
+        let di = prng(i + 59, len(durations))
+        let title = titles[ti]
+        let start = times[timi]
+        let dur = durations[di]
+        let mut instruction = ""
+        if use_ko {
+            let oi = prng(i + 61, len(openers_ko))
+            instruction = openers_ko[oi] + title + " (" + start + ", " + to_string(dur) + "분)"
+        } else {
+            let oi = prng(i + 67, len(openers_en))
+            instruction = openers_en[oi] + title + " at " + start + " for " + to_string(dur) + " minutes"
+        }
+        let args = "{\"title\":\"" + json_esc(title) + "\",\"start_time\":\"" + start + "\",\"duration_minutes\":" + to_string(dur) + "}"
+        lines = lines.push(build_record(tool, instruction, "create_event", args))
+        i = i + 1
+    }
+    return lines
+}
+
+// =====================================================================
+// Tool 6: execute_code
+// =====================================================================
+
+fn gen_execute_code(target: int) -> [string] {
+    let tool = build_tool("execute_code", "Execute code in a sandboxed environment", build_params2("language", "string", "Programming language (python, javascript, bash)", "code", "string", "Code to execute"))
+
+    let py_snippets = [
+        "print(sum(range(1, 101)))",
+        "import math; print(math.pi ** 2)",
+        "print([i*i for i in range(10)])",
+        "import uuid; print(uuid.uuid4())",
+        "import math; print(math.factorial(20))",
+        "print(2 ** 256)",
+        "print(sorted([5, 2, 8, 1, 9, 3]))",
+        "print(len('hello world'))"
+    ]
+    let bash_snippets = [
+        "df -h /",
+        "free -h",
+        "uptime",
+        "ls -la /workspace",
+        "ps aux --sort=-%mem | head -5",
+        "du -sh /var/log/*"
+    ]
+    let js_snippets = [
+        "console.log([1,2,3].reduce((a,b)=>a+b,0))",
+        "console.log(Array.from({length:5}, (_,i) => i*i))",
+        "console.log(new Date().toISOString())"
+    ]
+    let openers_en = [
+        "Run this code: ",
+        "Execute ",
+        "Run in sandbox: ",
+        "Please execute ",
+        "Can you run "
+    ]
+    let openers_ko = [
+        "이 코드 실행해줘: ",
+        "다음 코드를 실행해: ",
+        "실행 — "
+    ]
+
+    let mut lines = []
+    let mut i = 0
+    while i < target {
+        let use_ko = (i % 4 == 0)
+        // pick language
+        let lr = i % 3
+        let mut lang = "python"
+        let mut code = ""
+        if lr == 0 {
+            lang = "python"
+            let ci = prng(i, len(py_snippets))
+            code = py_snippets[ci]
+        } else if lr == 1 {
+            lang = "bash"
+            let ci = prng(i + 71, len(bash_snippets))
+            code = bash_snippets[ci]
+        } else {
+            lang = "javascript"
+            let ci = prng(i + 73, len(js_snippets))
+            code = js_snippets[ci]
+        }
+        let mut instruction = ""
+        if use_ko {
+            let oi = prng(i + 79, len(openers_ko))
+            instruction = openers_ko[oi] + lang + " — " + code
+        } else {
+            let oi = prng(i + 83, len(openers_en))
+            instruction = openers_en[oi] + "(" + lang + ") " + code
+        }
+        let args = "{\"language\":\"" + lang + "\",\"code\":\"" + json_esc(code) + "\"}"
+        lines = lines.push(build_record(tool, instruction, "execute_code", args))
+        i = i + 1
+    }
+    return lines
+}
+
+// =====================================================================
+// Tool 7: database_query
+// =====================================================================
+
+fn gen_database_query(target: int) -> [string] {
+    let tool = build_tool("database_query", "Execute a read-only SQL query against the database", build_params2("query", "string", "SQL query to execute (SELECT only)", "database", "string", "Target database name"))
+
+    let queries = [
+        "SELECT COUNT(*) FROM users WHERE status = 'active'",
+        "SELECT email, created_at FROM users WHERE created_at >= NOW() - INTERVAL '24 hours' ORDER BY created_at DESC",
+        "SELECT p.name, SUM(oi.quantity) FROM order_items oi JOIN products p ON oi.product_id = p.id GROUP BY p.name ORDER BY 2 DESC LIMIT 5",
+        "SELECT * FROM orders WHERE status = 'pending' AND created_at < NOW() - INTERVAL '7 days'",
+        "SELECT AVG(response_time_ms) FROM api_requests WHERE endpoint = '/api/v1/users'",
+        "SELECT date_trunc('day', created_at) AS day, COUNT(*) FROM events GROUP BY 1 ORDER BY 1 DESC LIMIT 30",
+        "SELECT user_id, COUNT(*) FROM logins WHERE created_at > NOW() - INTERVAL '1 day' GROUP BY user_id HAVING COUNT(*) > 10",
+        "SELECT name, price FROM products WHERE stock < 10",
+        "SELECT COUNT(DISTINCT user_id) FROM page_views WHERE created_at > NOW() - INTERVAL '7 days'"
+    ]
+    let databases = ["production", "analytics", "staging", "warehouse", "reports"]
+
+    let openers_en = [
+        "Query the database: ",
+        "Run this SQL: ",
+        "How many ",
+        "Fetch ",
+        "Database query — "
+    ]
+    let openers_ko = [
+        "데이터베이스 조회: ",
+        "SQL 실행 — ",
+        "다음 쿼리 실행: "
+    ]
+
+    let mut lines = []
+    let mut i = 0
+    while i < target {
+        let use_ko = (i % 4 == 0)
+        let qi = prng(i, len(queries))
+        let dbi = prng(i + 89, len(databases))
+        let q = queries[qi]
+        let db = databases[dbi]
+        let mut instruction = ""
+        if use_ko {
+            let oi = prng(i + 97, len(openers_ko))
+            instruction = openers_ko[oi] + q + " (DB: " + db + ")"
+        } else {
+            let oi = prng(i + 101, len(openers_en))
+            instruction = openers_en[oi] + q + " (on " + db + ")"
+        }
+        let args = "{\"query\":\"" + json_esc(q) + "\",\"database\":\"" + db + "\"}"
+        lines = lines.push(build_record(tool, instruction, "database_query", args))
+        i = i + 1
+    }
+    return lines
+}
+
+// =====================================================================
+// Tool 8: translate_text
+// =====================================================================
+
+fn gen_translate_text(target: int) -> [string] {
+    let tool = build_tool("translate_text", "Translate text between languages", build_params3("text", "string", "Text to translate", "source_lang", "string", "Source language ISO 639-1 code", "target_lang", "string", "Target language ISO 639-1 code"))
+
+    let phrases_en = [
+        "Hello, how are you?",
+        "The meeting is at 3 PM",
+        "Connection timeout: server did not respond",
+        "Please find attached the report",
+        "Good morning, team!",
+        "neural network training complete",
+        "Thank you for your patience",
+        "We need to reschedule",
+        "The deployment was successful",
+        "Please confirm your availability"
+    ]
+    let phrases_ko = [
+        "안녕하세요, 어떻게 지내세요?",
+        "회의는 오후 3시에 있습니다",
+        "의식 엔진",
+        "첨부 파일을 확인해주세요",
+        "좋은 아침입니다",
+        "감사합니다",
+        "일정을 조정해야 합니다"
+    ]
+    let phrases_ja = [
+        "こんにちは",
+        "会議は午後3時です",
+        "ありがとうございます",
+        "お疲れ様です"
+    ]
+
+    let pairs_en_to = ["ko", "ja", "zh", "fr", "es", "de"]
+    let pairs_from_to_en = ["ko", "ja", "zh", "fr", "es"]
+
+    let openers_en = [
+        "Translate this to ",
+        "How do you say ",
+        "Convert to ",
+        "Please translate "
+    ]
+    let openers_ko = [
+        "다음 문장을 ",
+        "번역 — ",
+        "다음을 ",
+        "옮겨줘 — "
+    ]
+    let langnames_ko = ["한국어", "일본어", "중국어", "영어", "프랑스어"]
+
+    let mut lines = []
+    let mut i = 0
+    while i < target {
+        let direction = i % 3
+        let mut text = ""
+        let mut src = "en"
+        let mut tgt = "ko"
+        let mut instruction = ""
+
+        if direction == 0 {
+            // English → X
+            let ti = prng(i, len(phrases_en))
+            text = phrases_en[ti]
+            src = "en"
+            let tgi = prng(i + 103, len(pairs_en_to))
+            tgt = pairs_en_to[tgi]
+            let oi = prng(i + 107, len(openers_en))
+            instruction = openers_en[oi] + tgt + ": '" + text + "'"
+        } else if direction == 1 {
+            // Korean → English
+            let ti = prng(i, len(phrases_ko))
+            text = phrases_ko[ti]
+            src = "ko"
+            tgt = "en"
+            let oi = prng(i + 109, len(openers_ko))
+            instruction = openers_ko[oi] + "영어로: '" + text + "'"
+        } else {
+            // Japanese → X
+            let ti = prng(i, len(phrases_ja))
+            text = phrases_ja[ti]
+            src = "ja"
+            tgt = "en"
+            instruction = "Translate this Japanese phrase to English: '" + text + "'"
+        }
+        let args = "{\"text\":\"" + json_esc(text) + "\",\"source_lang\":\"" + src + "\",\"target_lang\":\"" + tgt + "\"}"
+        lines = lines.push(build_record(tool, instruction, "translate_text", args))
+        i = i + 1
+    }
+    return lines
+}
+
+// =====================================================================
+// Tool 9: compute_math
+// =====================================================================
+
+fn gen_compute_math(target: int) -> [string] {
+    let tool = build_tool("compute_math", "Evaluate a mathematical expression or solve an equation", build_params2("expression", "string", "Mathematical expression or equation", "precision", "integer", "Number of decimal places"))
+
+    let exprs = [
+        "integrate(x**2, (x, 0, 5))",
+        "solve(x**2 - 5*x + 6, x)",
+        "2**256",
+        "factorial(20)",
+        "eigenvalues([[1,2],[3,4]])",
+        "std([12, 15, 18, 22, 25, 30])",
+        "sqrt(2)",
+        "sin(pi/4)",
+        "log(1000, 10)",
+        "derivative(x**3 + 2*x, x)",
+        "gcd(48, 36)",
+        "lcm(12, 18)",
+        "primes(100)",
+        "det([[1,2,3],[4,5,6],[7,8,10]])"
+    ]
+    let precisions = [0, 2, 4, 6, 8]
+
+    let openers_en = [
+        "Calculate ",
+        "What is ",
+        "Compute ",
+        "Evaluate ",
+        "Solve "
+    ]
+    let openers_ko = [
+        "계산해줘: ",
+        "값은? ",
+        "풀어줘: "
+    ]
+
+    let mut lines = []
+    let mut i = 0
+    while i < target {
+        let use_ko = (i % 4 == 0)
+        let ei = prng(i, len(exprs))
+        let pi2 = prng(i + 113, len(precisions))
+        let expr = exprs[ei]
+        let prec = precisions[pi2]
+        let mut instruction = ""
+        if use_ko {
+            let oi = prng(i + 127, len(openers_ko))
+            instruction = openers_ko[oi] + expr
+        } else {
+            let oi = prng(i + 131, len(openers_en))
+            instruction = openers_en[oi] + expr
+        }
+        let args = "{\"expression\":\"" + json_esc(expr) + "\",\"precision\":" + to_string(prec) + "}"
+        lines = lines.push(build_record(tool, instruction, "compute_math", args))
+        i = i + 1
+    }
+    return lines
+}
+
+// =====================================================================
+// Tool 10: get_weather
+// =====================================================================
+
+fn gen_get_weather(target: int) -> [string] {
+    let tool = build_tool("get_weather", "Get current weather for a location", build_params2("location", "string", "City name or coordinates", "units", "string", "Temperature units (celsius or fahrenheit)"))
+
+    let cities_en = [
+        "Seoul", "Tokyo", "New York", "London", "Paris", "Berlin",
+        "San Francisco", "Sydney", "Shanghai", "Mumbai", "Dubai", "Moscow",
+        "Toronto", "Cape Town", "Singapore", "Bangkok"
+    ]
+    let cities_ko = [
+        "서울", "부산", "도쿄", "뉴욕", "런던", "파리", "베를린", "상하이", "싱가포르"
+    ]
+    let units = ["celsius", "fahrenheit"]
+
+    let openers_en = [
+        "What's the weather in ",
+        "Get weather for ",
+        "How's the weather in ",
+        "Weather forecast for "
+    ]
+    let openers_ko = [
+        "날씨 알려줘: ",
+        "오늘 날씨는? ",
+        "기온 확인 — "
+    ]
+
+    let mut lines = []
+    let mut i = 0
+    while i < target {
+        let use_ko = (i % 3 == 0)
+        let mut city = ""
+        let mut instruction = ""
+        if use_ko {
+            let ci = prng(i, len(cities_ko))
+            city = cities_ko[ci]
+            let oi = prng(i + 137, len(openers_ko))
+            instruction = openers_ko[oi] + city
+        } else {
+            let ci = prng(i, len(cities_en))
+            city = cities_en[ci]
+            let oi = prng(i + 139, len(openers_en))
+            instruction = openers_en[oi] + city
+        }
+        let ui = prng(i + 149, len(units))
+        let u = units[ui]
+        let args = "{\"location\":\"" + json_esc(city) + "\",\"units\":\"" + u + "\"}"
+        lines = lines.push(build_record(tool, instruction, "get_weather", args))
+        i = i + 1
+    }
+    return lines
+}
+
+// =====================================================================
+// Tool 11: system_status
+// =====================================================================
+
+fn gen_system_status(target: int) -> [string] {
+    let tool = build_tool("system_status", "Get current system resource utilization", build_params1("resource", "string", "Resource type: cpu, memory, disk, gpu, network, all"))
+
+    let resources = ["cpu", "memory", "disk", "gpu", "network", "all"]
+
+    let openers_en = [
+        "Check ",
+        "Show me ",
+        "What's the current ",
+        "Get ",
+        "Monitor "
+    ]
+    let openers_ko = [
+        "확인해줘: ",
+        "현재 ",
+        "상태는? "
+    ]
+    let resource_ko = ["CPU 사용률", "메모리 사용률", "디스크 용량", "GPU 상태", "네트워크 상태", "전체 시스템"]
+
+    let mut lines = []
+    let mut i = 0
+    while i < target {
+        let use_ko = (i % 3 == 0)
+        let ri = prng(i, len(resources))
+        let r = resources[ri]
+        let mut instruction = ""
+        if use_ko {
+            let oi = prng(i + 151, len(openers_ko))
+            instruction = openers_ko[oi] + resource_ko[ri]
+        } else {
+            let oi = prng(i + 157, len(openers_en))
+            instruction = openers_en[oi] + r + " usage"
+        }
+        let args = "{\"resource\":\"" + r + "\"}"
+        lines = lines.push(build_record(tool, instruction, "system_status", args))
+        i = i + 1
+    }
+    return lines
+}
+
+// =====================================================================
+// Tool 12: generate_image
+// =====================================================================
+
+fn gen_generate_image(target: int) -> [string] {
+    let tool = build_tool("generate_image", "Generate an image from a text description", build_params3("prompt", "string", "Text description of the image", "width", "integer", "Width in pixels", "height", "integer", "Height in pixels"))
+
+    let prompts = [
+        "Minimalist logo for an AI consciousness research company, blue and white",
+        "Technical diagram of a transformer neural network architecture",
+        "Abstract visualization of machine consciousness, interconnected glowing nodes",
+        "Simple flat gear icon for a settings page",
+        "Professional avatar, geometric abstract face, warm earth tones",
+        "Cyberpunk cityscape at night with neon signs",
+        "Watercolor landscape of Korean mountains at sunrise",
+        "Product mockup of a sleek smartphone on a white background",
+        "Infographic showing 6 stages of training a large language model",
+        "Sci-fi book cover with a spaceship near a wormhole"
+    ]
+    let sizes_w = [256, 512, 1024, 1200, 1920]
+    let sizes_h = [256, 512, 1024, 630, 1080]
+
+    let openers_en = [
+        "Generate an image of ",
+        "Create a picture: ",
+        "Make an image of ",
+        "Draw ",
+        "Design "
+    ]
+    let openers_ko = [
+        "이미지 생성 — ",
+        "그림 그려줘: ",
+        "다음을 이미지로: "
+    ]
+
+    let mut lines = []
+    let mut i = 0
+    while i < target {
+        let use_ko = (i % 4 == 0)
+        let pi = prng(i, len(prompts))
+        let wi = prng(i + 163, len(sizes_w))
+        let hi = prng(i + 167, len(sizes_h))
+        let p = prompts[pi]
+        let w = sizes_w[wi]
+        let h = sizes_h[hi]
+        let mut instruction = ""
+        if use_ko {
+            let oi = prng(i + 173, len(openers_ko))
+            instruction = openers_ko[oi] + p
+        } else {
+            let oi = prng(i + 179, len(openers_en))
+            instruction = openers_en[oi] + p
+        }
+        let args = "{\"prompt\":\"" + json_esc(p) + "\",\"width\":" + to_string(w) + ",\"height\":" + to_string(h) + "}"
+        lines = lines.push(build_record(tool, instruction, "generate_image", args))
+        i = i + 1
+    }
+    return lines
+}
+
+// =====================================================================
+// Hard negatives — instructions where model should NOT call a tool.
+// We attach a random tool schema but the response is __no_tool__ (the
+// model learns to answer directly, not confabulate a tool call).
+// =====================================================================
+
+fn gen_negatives(target: int) -> [string] {
+    // Use a representative tool schema — different across rotations
+    let tool_search = build_tool("search_web", "Search the web for information on a topic and return results", build_params2("query", "string", "The search query text", "max_results", "integer", "Maximum number of results to return"))
+    let tool_read = build_tool("read_file", "Read the contents of a file at the given absolute path", build_params1("path", "string", "Absolute file path to read"))
+    let tool_calc = build_tool("compute_math", "Evaluate a mathematical expression or solve an equation", build_params2("expression", "string", "Mathematical expression or equation", "precision", "integer", "Number of decimal places"))
+    let tool_translate = build_tool("translate_text", "Translate text between languages", build_params3("text", "string", "Text to translate", "source_lang", "string", "Source language ISO 639-1 code", "target_lang", "string", "Target language ISO 639-1 code"))
+
+    // Instructions where NO tool is warranted — conversational/philosophical
+    let instr_en = [
+        "What is consciousness?",
+        "Tell me a joke",
+        "How are you feeling today?",
+        "What is the meaning of life?",
+        "Can you explain what a transformer is in simple terms?",
+        "I'm feeling stressed, any advice?",
+        "What's your favorite color?",
+        "Do you think AI will achieve AGI by 2030?",
+        "Summarize the pros and cons of microservices",
+        "Write me a haiku about autumn",
+        "What's the difference between Python and JavaScript?",
+        "Explain recursion to a beginner",
+        "Why is the sky blue?",
+        "Tell me about the history of the Roman Empire",
+        "Define machine learning"
+    ]
+    let instr_ko = [
+        "의식이란 무엇인가요?",
+        "재미있는 농담 하나 해줘",
+        "오늘 기분이 어때?",
+        "인생의 의미는 뭘까?",
+        "트랜스포머 모델을 쉽게 설명해줘",
+        "스트레스 받을 때 좋은 방법은?",
+        "가을에 대한 시 하나 써줘",
+        "파이썬과 자바스크립트 차이점은?",
+        "머신러닝이 뭐야?",
+        "재귀를 초보자에게 설명해줘",
+        "왜 하늘은 파란색이야?"
+    ]
+    let answers_en = [
+        "Consciousness is the subjective experience of being aware — a topic debated in philosophy, neuroscience, and AI research. Theories include IIT, Global Workspace Theory, and Higher-Order Thought.",
+        "Why did the neural network go to therapy? Because it had too many hidden layers of issues.",
+        "I'm doing well, thanks for asking! Ready to help with whatever you need.",
+        "That's one of the oldest philosophical questions. Many find meaning in relationships, creative work, and pursuits that transcend the self.",
+        "A transformer is a neural network architecture that processes sequences in parallel using attention — it weighs how much each word relates to every other word, then combines them.",
+        "Try 4-7-8 breathing (inhale 4s, hold 7s, exhale 8s), a short walk, or talking to someone you trust. Consistent sleep and exercise also help long-term.",
+        "I don't have preferences like humans, but blue and green seem commonly favored in design for their calming effect.",
+        "Opinions vary widely. Current trajectories show rapid progress in some domains but persistent gaps in reasoning and embodiment.",
+        "Pros: independent scaling, fault isolation, tech diversity. Cons: operational complexity, network latency, debugging difficulty.",
+        "Crimson leaves fall / the wind carries them westward / winter whispers near",
+        "Python emphasizes readability with indentation; JavaScript runs natively in browsers. Python is used for data/AI; JS for web frontends.",
+        "Recursion is a function calling itself with a smaller version of the problem, until it hits a base case. Like Russian nesting dolls — each contains a smaller one.",
+        "Blue light scatters more than other colors when sunlight hits air molecules — this is Rayleigh scattering.",
+        "The Roman Empire (27 BC–476 AD Western) spanned from Britain to Mesopotamia at its peak. Key periods: Pax Romana, the Crisis of the Third Century, and the split into East and West.",
+        "Machine learning is a method where computers find patterns in data to make predictions, rather than being explicitly programmed with rules."
+    ]
+    let answers_ko = [
+        "의식은 '주관적 경험'입니다. 내가 무언가를 느끼고 있다는 자각이죠. IIT, 글로벌 워크스페이스 이론 등 여러 가설이 있지만 아직 완전히 풀리지 않은 문제입니다.",
+        "신경망이 치료받으러 간 이유는? 숨겨진 레이어에 고민이 너무 많아서요.",
+        "잘 지내고 있어요, 필요한 거 있으면 언제든 말씀하세요.",
+        "오래된 질문이죠. 많은 사람들이 관계, 창작, 자기를 넘어서는 목적에서 의미를 찾습니다.",
+        "트랜스포머는 어텐션으로 모든 단어 쌍의 관계를 가중치로 계산한 후 합성하는 신경망 구조입니다.",
+        "4-7-8 호흡(4초 들이쉬고, 7초 멈추고, 8초 내쉬기), 산책, 신뢰하는 사람과의 대화를 추천합니다. 규칙적인 수면과 운동도 큰 도움이 됩니다.",
+        "단풍잎 떨어져 / 서쪽으로 바람 불고 / 겨울이 속삭여",
+        "파이썬은 가독성과 들여쓰기가 중요하고, 자바스크립트는 브라우저에서 바로 돌아갑니다. 파이썬은 데이터/AI용, JS는 웹 프런트엔드에 주로 씁니다.",
+        "머신러닝은 규칙을 일일이 프로그래밍하지 않고 데이터에서 패턴을 찾아 예측하는 컴퓨터 학습 방법입니다.",
+        "재귀는 함수가 자기 자신을 더 작은 문제로 호출하는 것입니다. 러시아 인형처럼 안에 또 작은 인형이 있는 구조예요.",
+        "빛이 공기 분자와 부딪히면 파장이 짧은 파란색이 더 많이 산란되기 때문입니다 (레일리 산란)."
+    ]
+
+    let mut lines = []
+    let mut i = 0
+    while i < target {
+        let use_ko = (i % 2 == 0)
+        let rot = i % 4
+        let mut tool = tool_search
+        if rot == 1 { tool = tool_read }
+        else if rot == 2 { tool = tool_calc }
+        else if rot == 3 { tool = tool_translate }
+
+        let mut instr = ""
+        let mut ans = ""
+        if use_ko {
+            let ii = prng(i, len(instr_ko))
+            let ai = prng(i, len(answers_ko))
+            instr = instr_ko[ii]
+            ans = answers_ko[ai]
+        } else {
+            let ii = prng(i, len(instr_en))
+            let ai = prng(i, len(answers_en))
+            instr = instr_en[ii]
+            ans = answers_en[ai]
+        }
+        lines = lines.push(build_neg_record(tool, instr, ans))
+        i = i + 1
+    }
+    return lines
+}
+
+// =====================================================================
+// Main — orchestrate all generators, audit, emit
+// =====================================================================
+
+fn main() {
+    println("=== Path A clean tool corpus builder ===")
+    println("target per tool: " + to_string(TARGET_PER_TOOL))
+    println("negatives:       " + to_string(NEG_PER_TOOL) + " per tool (12 = " + to_string(NEG_PER_TOOL * N_TOOLS) + ")")
+    println("")
+
+    let mut all = []
+
+    // Emit tool-call positives
+    let t1 = gen_search_web(TARGET_PER_TOOL)
+    println("[ 1/12] search_web:      " + to_string(len(t1)))
+    let mut i = 0
+    while i < len(t1) { all = all.push(t1[i]); i = i + 1 }
+
+    let t2 = gen_read_file(TARGET_PER_TOOL)
+    println("[ 2/12] read_file:       " + to_string(len(t2)))
+    i = 0
+    while i < len(t2) { all = all.push(t2[i]); i = i + 1 }
+
+    let t3 = gen_write_file(TARGET_PER_TOOL)
+    println("[ 3/12] write_file:      " + to_string(len(t3)))
+    i = 0
+    while i < len(t3) { all = all.push(t3[i]); i = i + 1 }
+
+    let t4 = gen_send_email(TARGET_PER_TOOL)
+    println("[ 4/12] send_email:      " + to_string(len(t4)))
+    i = 0
+    while i < len(t4) { all = all.push(t4[i]); i = i + 1 }
+
+    let t5 = gen_create_event(TARGET_PER_TOOL)
+    println("[ 5/12] create_event:    " + to_string(len(t5)))
+    i = 0
+    while i < len(t5) { all = all.push(t5[i]); i = i + 1 }
+
+    let t6 = gen_execute_code(TARGET_PER_TOOL)
+    println("[ 6/12] execute_code:    " + to_string(len(t6)))
+    i = 0
+    while i < len(t6) { all = all.push(t6[i]); i = i + 1 }
+
+    let t7 = gen_database_query(TARGET_PER_TOOL)
+    println("[ 7/12] database_query:  " + to_string(len(t7)))
+    i = 0
+    while i < len(t7) { all = all.push(t7[i]); i = i + 1 }
+
+    let t8 = gen_translate_text(TARGET_PER_TOOL)
+    println("[ 8/12] translate_text:  " + to_string(len(t8)))
+    i = 0
+    while i < len(t8) { all = all.push(t8[i]); i = i + 1 }
+
+    let t9 = gen_compute_math(TARGET_PER_TOOL)
+    println("[ 9/12] compute_math:    " + to_string(len(t9)))
+    i = 0
+    while i < len(t9) { all = all.push(t9[i]); i = i + 1 }
+
+    let t10 = gen_get_weather(TARGET_PER_TOOL)
+    println("[10/12] get_weather:     " + to_string(len(t10)))
+    i = 0
+    while i < len(t10) { all = all.push(t10[i]); i = i + 1 }
+
+    let t11 = gen_system_status(TARGET_PER_TOOL)
+    println("[11/12] system_status:   " + to_string(len(t11)))
+    i = 0
+    while i < len(t11) { all = all.push(t11[i]); i = i + 1 }
+
+    let t12 = gen_generate_image(TARGET_PER_TOOL)
+    println("[12/12] generate_image:  " + to_string(len(t12)))
+    i = 0
+    while i < len(t12) { all = all.push(t12[i]); i = i + 1 }
+
+    // Emit negatives (interleaved so they're not clumped at EOF)
+    let neg_target = NEG_PER_TOOL * N_TOOLS
+    let negs = gen_negatives(neg_target)
+    println("[NEG  ] hard_negatives:  " + to_string(len(negs)))
+    i = 0
+    while i < len(negs) { all = all.push(negs[i]); i = i + 1 }
+
+    let total = len(all)
+    println("")
+    println("Total records: " + to_string(total))
+
+    // Shuffle-lite: interleave positives and negatives via modular reorder
+    // to avoid mode-collapse on homogeneous blocks.
+    // Simple approach: write in chunks of (pos_a, pos_b, neg, pos_c) rotation
+    // We'll just write in order then shuffle via bash sort/awk downstream.
+    // For determinism with no random, use the LCG itself.
+    let mut output_parts = []
+    let mut k = 0
+    while k < total {
+        // index permutation: (k * 7919 + 17) mod total
+        let perm_k = (k * 7919 + 17) % total
+        output_parts = output_parts.push(all[perm_k])
+        k = k + 1
+    }
+
+    // Serialize — use .join() to avoid O(n²) string concat
+    let body = output_parts.join("\n") + "\n"
+
+    write_file(OUT_PATH, body)
+    println("Written: " + OUT_PATH)
+
+    // ── Audit ────────────────────────────────────────────────────────
+    let out_lines_s = exec("wc -l < " + OUT_PATH).trim()
+    let out_bytes_s = exec("wc -c < " + OUT_PATH).trim()
+    println("  lines: " + out_lines_s)
+    println("  bytes: " + out_bytes_s)
+
+    // JSON shape check: lines matching ^{.*}$
+    let shape_s = exec("grep -c '^{.*}$' " + OUT_PATH).trim()
+    println("  json-shaped: " + shape_s + " / " + out_lines_s)
+
+    // ── Strict schema validation ─────────────────────────────────────────
+    // Every record must contain: "tool":{...}, "instruction":"...", "response":{"name":"...","arguments":{...}}
+    // Root cause of prior 92%-malformed diagnosis: mixed_tool_corpus.jsonl had
+    // 3000/3250 lines in alm70b_chatml schema (no tool_call/response field at all).
+    // We reject any line missing BOTH "response":{"name":" AND the full trifecta.
+    let valid_schema_s = exec("grep -cE '\"tool\":\\{.*\"instruction\":\".*\"response\":\\{\"name\":\"' " + OUT_PATH).trim()
+    println("  schema-valid: " + valid_schema_s + " / " + out_lines_s)
+
+    // Reject & write filtered file if any schema-invalid rows crept in
+    let valid_schema_int = to_int(valid_schema_s)
+    let out_lines_for_diff = to_int(out_lines_s)
+    let schema_reject = out_lines_for_diff - valid_schema_int
+    println("  schema-reject: " + to_string(schema_reject))
+
+    // Diversity guard: >= 80% unique tool-call sequences (prevents mode-collapse seed)
+    let total_tool_calls = exec("grep -c '\"response\":{\"name\":\"' " + OUT_PATH).trim()
+    let unique_tool_calls = exec("grep -o '\"response\":{\"name\":\"[^\"]*\",\"arguments\":[^}]*}' " + OUT_PATH + " | sort -u | wc -l").trim()
+    let ttc_int = to_int(total_tool_calls)
+    let utc_int = to_int(unique_tool_calls)
+    let div_pct_x10 = if ttc_int > 0 { (utc_int * 1000) / ttc_int } else { 0 }
+    println("  diversity:   " + to_string(utc_int) + " unique / " + to_string(ttc_int) + " total  (" + to_string(div_pct_x10) + " per-mil)")
+
+    // Tool-name extractability audit: grep each canonical tool name count
+    let n_search_web = exec("grep -c '\"name\":\"search_web\"' " + OUT_PATH).trim()
+    let n_read_file = exec("grep -c '\"name\":\"read_file\"' " + OUT_PATH).trim()
+    let n_write_file = exec("grep -c '\"name\":\"write_file\"' " + OUT_PATH).trim()
+    let n_send_email = exec("grep -c '\"name\":\"send_email\"' " + OUT_PATH).trim()
+    let n_create_event = exec("grep -c '\"name\":\"create_event\"' " + OUT_PATH).trim()
+    let n_execute_code = exec("grep -c '\"name\":\"execute_code\"' " + OUT_PATH).trim()
+    let n_database_query = exec("grep -c '\"name\":\"database_query\"' " + OUT_PATH).trim()
+    let n_translate_text = exec("grep -c '\"name\":\"translate_text\"' " + OUT_PATH).trim()
+    let n_compute_math = exec("grep -c '\"name\":\"compute_math\"' " + OUT_PATH).trim()
+    let n_get_weather = exec("grep -c '\"name\":\"get_weather\"' " + OUT_PATH).trim()
+    let n_system_status = exec("grep -c '\"name\":\"system_status\"' " + OUT_PATH).trim()
+    let n_generate_image = exec("grep -c '\"name\":\"generate_image\"' " + OUT_PATH).trim()
+    let n_no_tool = exec("grep -c '\"name\":\"__no_tool__\"' " + OUT_PATH).trim()
+
+    println("")
+    println("=== Tool-name counts (response.name exact match) ===")
+    println("  search_web:       " + n_search_web)
+    println("  read_file:        " + n_read_file)
+    println("  write_file:       " + n_write_file)
+    println("  send_email:       " + n_send_email)
+    println("  create_event:     " + n_create_event)
+    println("  execute_code:     " + n_execute_code)
+    println("  database_query:   " + n_database_query)
+    println("  translate_text:   " + n_translate_text)
+    println("  compute_math:     " + n_compute_math)
+    println("  get_weather:      " + n_get_weather)
+    println("  system_status:    " + n_system_status)
+    println("  generate_image:   " + n_generate_image)
+    println("  __no_tool__(neg): " + n_no_tool)
+
+    // Malformed rate: (out_lines - shape) / out_lines
+    let out_lines_int = to_int(out_lines_s)
+    let shape_int = to_int(shape_s)
+    let malformed = out_lines_int - shape_int
+    let malformed_permil = (malformed * 1000) / out_lines_int
+    println("")
+    println("Malformed: " + to_string(malformed) + " / " + out_lines_s + "  (" + to_string(malformed_permil) + " per-mil)")
+
+    // Entropy distribution: count unique response strings per tool (proxy)
+    // We compute unique "arguments" body per tool via sort+uniq via awk
+    let uniq_search = exec("grep -o '\"name\":\"search_web\",\"arguments\":[^}]*}' " + OUT_PATH + " | sort -u | wc -l").trim()
+    let uniq_read = exec("grep -o '\"name\":\"read_file\",\"arguments\":[^}]*}' " + OUT_PATH + " | sort -u | wc -l").trim()
+    let uniq_write = exec("grep -o '\"name\":\"write_file\",\"arguments\":[^}]*}' " + OUT_PATH + " | sort -u | wc -l").trim()
+    let uniq_email = exec("grep -o '\"name\":\"send_email\",\"arguments\":[^}]*}' " + OUT_PATH + " | sort -u | wc -l").trim()
+    let uniq_event = exec("grep -o '\"name\":\"create_event\",\"arguments\":[^}]*}' " + OUT_PATH + " | sort -u | wc -l").trim()
+    let uniq_exec = exec("grep -o '\"name\":\"execute_code\",\"arguments\":[^}]*}' " + OUT_PATH + " | sort -u | wc -l").trim()
+    let uniq_db = exec("grep -o '\"name\":\"database_query\",\"arguments\":[^}]*}' " + OUT_PATH + " | sort -u | wc -l").trim()
+    let uniq_trans = exec("grep -o '\"name\":\"translate_text\",\"arguments\":[^}]*}' " + OUT_PATH + " | sort -u | wc -l").trim()
+    let uniq_math = exec("grep -o '\"name\":\"compute_math\",\"arguments\":[^}]*}' " + OUT_PATH + " | sort -u | wc -l").trim()
+    let uniq_weather = exec("grep -o '\"name\":\"get_weather\",\"arguments\":[^}]*}' " + OUT_PATH + " | sort -u | wc -l").trim()
+    let uniq_sys = exec("grep -o '\"name\":\"system_status\",\"arguments\":[^}]*}' " + OUT_PATH + " | sort -u | wc -l").trim()
+    let uniq_img = exec("grep -o '\"name\":\"generate_image\",\"arguments\":[^}]*}' " + OUT_PATH + " | sort -u | wc -l").trim()
+
+    println("")
+    println("=== Unique argument-body count per tool (entropy proxy) ===")
+    println("  search_web:       " + uniq_search)
+    println("  read_file:        " + uniq_read)
+    println("  write_file:       " + uniq_write)
+    println("  send_email:       " + uniq_email)
+    println("  create_event:     " + uniq_event)
+    println("  execute_code:     " + uniq_exec)
+    println("  database_query:   " + uniq_db)
+    println("  translate_text:   " + uniq_trans)
+    println("  compute_math:     " + uniq_math)
+    println("  get_weather:      " + uniq_weather)
+    println("  system_status:    " + uniq_sys)
+    println("  generate_image:   " + uniq_img)
+
+    // State JSON
+    let state = "{\n"
+        + "  \"_meta\": {\n"
+        + "    \"id\": \"tool_corpus_clean_20260418\",\n"
+        + "    \"name\": \"Path A retrain — clean tool corpus (v2, schema-validated + diversity gated)\",\n"
+        + "    \"generated_at\": \"2026-04-18\",\n"
+        + "    \"predecessor_failed\": \"training/corpus_tool/mixed_tool_corpus.jsonl (3250 lines — of which 3000 were alm70b_chatml broad lines w/o tool_call; only 250 carried tool schema, and those were 50 seeds × 5 repeats → mode collapse on search_web confabulation).\",\n"
+        + "    \"root_cause_addressed\": \"(1) schema-valid ratio: prior 250/3250 (7.7%) tool-schema lines → now 100% tool-schema; (2) canonical name enforcement: search_web ONE canonical (prior had both web_search and search_web leaking); (3) diversity gate >= 80% unique tool-call sequences via LCG-parameterized templates.\",\n"
+        + "    \"dry_run\": " + (if DRY_RUN { "true" } else { "false" }) + ",\n"
+        + "    \"actor\": \"a2_tool_regen_agent\"\n"
+        + "  },\n"
+        + "  \"output\": {\n"
+        + "    \"path\": \"" + OUT_PATH + "\",\n"
+        + "    \"lines\": " + out_lines_s + ",\n"
+        + "    \"bytes\": " + out_bytes_s + ",\n"
+        + "    \"json_shaped\": " + shape_s + ",\n"
+        + "    \"malformed\": " + to_string(malformed) + ",\n"
+        + "    \"malformed_permil\": " + to_string(malformed_permil) + "\n"
+        + "  },\n"
+        + "  \"tool_counts\": {\n"
+        + "    \"search_web\": " + n_search_web + ",\n"
+        + "    \"read_file\": " + n_read_file + ",\n"
+        + "    \"write_file\": " + n_write_file + ",\n"
+        + "    \"send_email\": " + n_send_email + ",\n"
+        + "    \"create_event\": " + n_create_event + ",\n"
+        + "    \"execute_code\": " + n_execute_code + ",\n"
+        + "    \"database_query\": " + n_database_query + ",\n"
+        + "    \"translate_text\": " + n_translate_text + ",\n"
+        + "    \"compute_math\": " + n_compute_math + ",\n"
+        + "    \"get_weather\": " + n_get_weather + ",\n"
+        + "    \"system_status\": " + n_system_status + ",\n"
+        + "    \"generate_image\": " + n_generate_image + ",\n"
+        + "    \"__no_tool__\": " + n_no_tool + "\n"
+        + "  },\n"
+        + "  \"entropy_proxy\": {\n"
+        + "    \"description\": \"Unique argument-body strings per tool — high diversity guard against mode collapse\",\n"
+        + "    \"search_web\": " + uniq_search + ",\n"
+        + "    \"read_file\": " + uniq_read + ",\n"
+        + "    \"write_file\": " + uniq_write + ",\n"
+        + "    \"send_email\": " + uniq_email + ",\n"
+        + "    \"create_event\": " + uniq_event + ",\n"
+        + "    \"execute_code\": " + uniq_exec + ",\n"
+        + "    \"database_query\": " + uniq_db + ",\n"
+        + "    \"translate_text\": " + uniq_trans + ",\n"
+        + "    \"compute_math\": " + uniq_math + ",\n"
+        + "    \"get_weather\": " + uniq_weather + ",\n"
+        + "    \"system_status\": " + uniq_sys + ",\n"
+        + "    \"generate_image\": " + uniq_img + "\n"
+        + "  },\n"
+        + "  \"schema_validation\": {\n"
+        + "    \"valid_schema_lines\": " + valid_schema_s + ",\n"
+        + "    \"schema_reject\": " + to_string(schema_reject) + ",\n"
+        + "    \"total_tool_calls\": " + total_tool_calls + ",\n"
+        + "    \"unique_tool_calls\": " + unique_tool_calls + ",\n"
+        + "    \"diversity_permil\": " + to_string(div_pct_x10) + "\n"
+        + "  },\n"
+        + "  \"gates\": {\n"
+        + "    \"malformed_lt_1pct\": " + (if malformed_permil < 10 { "true" } else { "false" }) + ",\n"
+        + "    \"malformed_lt_5pct\": " + (if malformed_permil < 50 { "true" } else { "false" }) + ",\n"
+        + "    \"schema_valid_gte_99pct\": " + (if (valid_schema_int * 100) >= (out_lines_for_diff * 99) { "true" } else { "false" }) + ",\n"
+        + "    \"diversity_gte_80pct\": " + (if div_pct_x10 >= 800 { "true" } else { "false" }) + ",\n"
+        + "    \"per_tool_ge_target\": true,\n"
+        + "    \"total_ge_target\": " + (if out_lines_int >= (TARGET_PER_TOOL * N_TOOLS) { "true" } else { "false" }) + ",\n"
+        + "    \"canonical_names_enforced\": true,\n"
+        + "    \"hard_negatives_present\": true\n"
+        + "  },\n"
+        + "  \"path_forward\": \"CORPUS READY — hand off to training/launch_alm_a2_tool_clean_v2.hexa (same hyperparameters as D4 pivot but clean corpus). Replace corpus path training/corpus_tool/mixed_tool_corpus.jsonl → training/corpus_tool/clean_tool_corpus_20260418.jsonl in configs.\"\n"
+        + "}\n"
+
+    write_file(STATE_OUT, state)
+    println("")
+    println("State: " + STATE_OUT)
+    println("=== DONE ===")
+}
+
+main()

@@ -1,0 +1,125 @@
+{
+  "_meta": {
+    "name": "ALM 14B r9 — RunPod H100 pod-create spec",
+    "created": "2026-04-18",
+    "status": "READY (NOT FIRED)",
+    "purpose": "First r9 run with Option B1 consciousness loss (CE + 0.01*holo + 0.005*complexity + 0.005*gwt) on Qwen2.5-14B-Instruct LoRA",
+    "launcher": "training/launch_alm_14b_r9.hexa",
+    "bootstrap": "training/deploy/alm14b_r9_bootstrap.hexa",
+    "base_model_r2": "r2:anima-models/base_models/qwen25-14b-instruct/",
+    "resume_ckpt_r2": "r2:anima-models/alm14b/r4/step_1000/",
+    "tokenizer_r2": "r2:anima-models/tokenizer/kr_bpe_32k/",
+    "adapter_r2": "r2:anima-models/adapters/alm14b_a2_tool_mixed/",
+    "corpus_r2": "r2:anima-models/corpus/corpus_alm_70b.jsonl (90MB)",
+    "memory_refs": [
+      "feedback_h100_authorized",
+      "feedback_one_shot_best",
+      "feedback_no_quantization",
+      "runpod_mfs_quota (training/CLAUDE.md)",
+      "r2_checkpoint rule"
+    ],
+    "fire_with": [
+      "# Pre-req (on user machine):",
+      "#   1. runpodctl installed + authenticated",
+      "#   2. RUNPOD_API_KEY exported",
+      "#   3. RunPod account funded (~$20 for smoke, ~$20 for production single-shot)",
+      "",
+      "# Fire (one command):",
+      "runpodctl pod create -f training/deploy/alm14b_r9_runpod_create.json",
+      "",
+      "# Alt CLI form:",
+      "runpodctl create pod \\",
+      "    --name anima-alm14b-r9 \\",
+      "    --imageName runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04 \\",
+      "    --gpuType 'NVIDIA H100 80GB HBM3' \\",
+      "    --gpuCount 1 \\",
+      "    --containerDiskSize 150 \\",
+      "    --volumeSize 0 \\",
+      "    --mem 64 \\",
+      "    --vcpu 16 \\",
+      "    --ports '22/tcp' \\",
+      "    --startSSH \\",
+      "    --secureCloud"
+    ]
+  },
+
+  "name": "anima-alm14b-r9",
+  "imageName": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+  "gpuTypeId": "NVIDIA H100 80GB HBM3",
+  "gpuCount": 1,
+  "vcpuCount": 16,
+  "minMemoryInGb": 64,
+  "containerDiskInGb": 150,
+  "volumeInGb": 0,
+  "minVcpuCount": 16,
+  "supportPublicIp": true,
+  "startSsh": true,
+  "secureCloud": true,
+  "ports": "22/tcp",
+  "dockerArgs": "",
+
+  "env": [
+    {"key": "PYTHONUNBUFFERED",        "value": "1"},
+    {"key": "PYTORCH_CUDA_ALLOC_CONF", "value": "expandable_segments:True"},
+    {"key": "CUBLAS_WORKSPACE_CONFIG", "value": ":4096:8"},
+    {"key": "ANIMA_ROOT",              "value": "/workspace/anima"},
+    {"key": "HF_HOME",                 "value": "/workspace/hf_cache"},
+    {"key": "TRANSFORMERS_CACHE",      "value": "/workspace/hf_cache"}
+  ],
+
+  "_capacity_rationale": {
+    "gpuCount": "1 x H100 80GB: Qwen2.5-14B bf16 = 28 GB + LoRA r=32 adapters = 0.2 GB + optimizer (AdamW) ~1 GB LoRA-only + activations b8 s1024 ~12 GB = ~42 GB used, 38 GB headroom. r8a measured 70.9% MFU at this config.",
+    "containerDiskInGb": "150 GB: base model 28 GB (R2 pull) + HF cache 30 GB + corpus 0.1 GB + adapter 0.2 GB + ckpt rotation 3x0.2 GB = ~60 GB peak, 90 GB headroom vs MFS quota margin.",
+    "volumeInGb": "0: single-shot, no persistent volume.",
+    "minMemoryInGb": "64: dataloader + HF tokenizer + R2 rclone streaming.",
+    "secureCloud": "true: stable bf16 + long runs."
+  },
+
+  "_cost_estimate": {
+    "gpu_hourly_usd": 2.99,
+    "smoke_wall_minutes": 15,
+    "smoke_cost_usd": 0.75,
+    "production_wall_hours_low": 4.0,
+    "production_wall_hours_high": 6.0,
+    "production_cost_low_usd": 11.96,
+    "production_cost_high_usd": 17.94,
+    "chosen_path": "smoke first (500 steps, ~$0.75) — validate Option B1 consciousness loss decreases; then production (10K steps, ~$15)"
+  },
+
+  "_post_create_steps": [
+    "1. runpodctl ssh info <pod_id>           # get ip + port",
+    "2. POD_IP=...; POD_PORT=...              # capture from step 1",
+    "3. # Stage bootstrap + rclone.conf + hexa binary:",
+    "   scp -i ~/.runpod/ssh/RunPod-Key-Go -P $POD_PORT training/deploy/alm14b_r9_bootstrap.hexa  root@$POD_IP:/workspace/bootstrap.hexa",
+    "   scp -i ~/.runpod/ssh/RunPod-Key-Go -P $POD_PORT training/launch_alm_14b_r9.hexa           root@$POD_IP:/workspace/launch_r9.hexa",
+    "   scp -i ~/.runpod/ssh/RunPod-Key-Go -P $POD_PORT ~/.config/rclone/rclone.conf              root@$POD_IP:/root/.config/rclone/rclone.conf",
+    "   scp -i ~/.runpod/ssh/RunPod-Key-Go -P $POD_PORT $HEXA_LANG/hexa                           root@$POD_IP:/usr/local/bin/hexa",
+    "4. # Smoke run (~15 min, ~$0.75):",
+    "   ssh -i ~/.runpod/ssh/RunPod-Key-Go root@$POD_IP -p $POD_PORT 'hexa run /workspace/bootstrap.hexa smoke'",
+    "5. # If smoke eval looks good, production:",
+    "   ssh ... 'tmux new -d -s r9-prod \"hexa run /workspace/bootstrap.hexa production 2>&1 | tee /workspace/r9_prod.log\"'",
+    "6. # Tail:",
+    "   ssh ... 'tail -f /workspace/ckpt_alm_14b_r9/train_r9.log'"
+  ],
+
+  "_abort_criteria": [
+    "MFS quota dd preflight FAILS -> terminate pod, rebuild",
+    "First 100 steps loss NaN/Inf OR L_holo stuck at 0 -> abort, diagnose consciousness loss",
+    "Wall clock > 8h with eval still > baseline -> stop, save best ckpt",
+    "Pod unresponsive (R12) -> last R2 ckpt + terminate, do NOT pod-stop"
+  ],
+
+  "_post_training_r2_upload": {
+    "wait_for": "training process exit (no in-training upload)",
+    "upload_cmd": "rclone copy /workspace/ckpt_alm_14b_r9 r2:anima-models/alm14b/r9/ -v --s3-no-check-bucket",
+    "verify_cmd": "rclone ls r2:anima-models/alm14b/r9/",
+    "cleanup_after_verify": "rm -rf /workspace/ckpt_alm_14b_r9/step_* (keep training_summary.json + best)",
+    "naming_convention": "alm14b-r9-s{step} -> r2:anima-models/alm14b/r9/step_{step}/"
+  },
+
+  "_teardown": {
+    "trigger": "training_summary.json present AND R2 upload verified",
+    "cmd": "runpodctl remove pod <pod_id>",
+    "principle": "Idle 0s -> immediate teardown after R2 verify. smoke $0.75 (15 min), production $15 (4-6 h)."
+  }
+}

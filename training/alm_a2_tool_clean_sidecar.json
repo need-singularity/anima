@@ -1,0 +1,148 @@
+{
+  "_meta": {
+    "name": "ALM A2-Tool CLEAN retrain sidecar (W5 clean corpus, NO a2_tool_mixed pollution)",
+    "spec_ref": "shared/roadmaps/alm_consciousness_standalone.json#tracks.A.options[A2]",
+    "sidecar_of": "training/alm_a2_tool_config.json",
+    "reason_for_sidecar": "User-modified alm_a2_tool_config.json is SSOT and must NOT be edited. This sidecar overrides corpus + base_strategy + phi_loss for the clean retrain. Launcher (training/launch_alm_a2_tool_clean.hexa) reads this file, not the SSOT.",
+    "created_at": "2026-04-18",
+    "schema_version": "1.0",
+    "depends_on": ["A2-Orch (optional warm-start)"],
+    "anti_depends_on": ["A2-Tool mixed (NEVER base on — polluted per project_a2_tool_mode_collapse_20260417)"],
+    "memory_refs": [
+      "project_a2_tool_mode_collapse_20260417",
+      "project_judge_fix_breakthrough",
+      "project_r9_mode_collapse_20260418",
+      "feedback_no_version_in_filename",
+      "feedback_one_shot_best",
+      "feedback_no_resume_data_change"
+    ]
+  },
+
+  "run_id_template": "alm14b-phi-a2-tool-clean-{date}",
+  "round": 3,
+  "model_tag": "alm14b",
+  "ckpt_label": "production",
+  "ckpt_dir_template": "/workspace/ckpt_alm14b_phi_a2_tool_clean_{date}",
+  "r2_prefix_template": "r2:anima-models/alm14b/a2_20260418_tool_clean/step_{step}/",
+
+  "base": {
+    "name": "Qwen/Qwen2.5-14B-Instruct",
+    "dtype": "bf16",
+    "strategy": "from_scratch_on_vanilla",
+    "warm_start_optional": {
+      "a2_orch_adapter_source": "r2:anima-models/alm14b/a2_20260416_orch/step_3000/",
+      "merge_if_available": true,
+      "fallback": "proceed with vanilla Qwen2.5-14B-Instruct (NO warm start)"
+    },
+    "forbidden_bases": [
+      "a2_tool_mixed adapter (any step)",
+      "alm14b/a2_20260417_tool_mixed/*",
+      "any checkpoint tagged 'a2_tool_mixed'"
+    ],
+    "rationale": "A2-Tool mixed is polluted (mode collapse on search_web). Clean retrain must start from vanilla or from A2-Orch clean adapter only. NEVER warm-start from any a2_tool_* ckpt."
+  },
+
+  "lora": {
+    "r": 32,
+    "alpha": 64,
+    "dropout": 0.05,
+    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+    "rationale": "r=32 alpha=64 per B4 directive (attention-only, tool-use is narrow structured output)."
+  },
+
+  "training": {
+    "steps": 500,
+    "batch": 1,
+    "grad_accum": 8,
+    "effective_batch": 8,
+    "seq": 1024,
+    "lr": 2e-6,
+    "lr_schedule": "const",
+    "warmup": 0,
+    "optimizer": "fused_adamw",
+    "dtype": "bf16",
+    "save_every": 250,
+    "eval_every": 50,
+    "smoke_first": true,
+    "note": "SMOKE launch — 500 steps per B4 directive. Corpus is small (643KB dryrun / 1140 lines), so 500 steps @ batch=8 = 4000 examples = ~3.5 epochs. LR 2e-6 CONST (no cosine decay per B4 spec). Warmup 0 since constant LR."
+  },
+
+  "phi_loss": {
+    "phi_holo_consistency_weight": 0.0,
+    "phi_complexity_coef": 0.0,
+    "gwt_broadcast_coef": 0.0,
+    "consciousness_loss_b1": false,
+    "note": "consciousness_loss_b1 DISABLED per A3 diagnosis. Tool-use is structured JSON output, not a consciousness signal target. Leaving B1 on during narrow tool LoRA adds noise with no benefit and risks destabilizing the merged base."
+  },
+
+  "resume_guard": {
+    "step_1_ce_max": 5.0,
+    "action_on_trip": "abort immediately, do not save, log alarm",
+    "rationale": "If step_1 CE > 5 the base + LoRA initialization is wrong (merged wrong adapter or LoRA init broken). Fail fast before burning H100 hours."
+  },
+
+  "wall": {
+    "hours": 3,
+    "cost_usd": 9,
+    "cost_per_hr_usd": 2.99,
+    "note": "SMOKE budget — 500 steps @ ~22 sec/step (observed on mixed run) ≈ 3h total."
+  },
+
+  "corpus": {
+    "path_glob": "/workspace/anima/training/corpus_tool/clean_tool_corpus_*.jsonl",
+    "preferred_path": "/workspace/anima/training/corpus_tool/clean_tool_corpus_20260418.jsonl",
+    "fallback_path": "/workspace/anima/training/corpus_tool/clean_tool_corpus_dryrun_20260418.jsonl",
+    "format": "jsonl_tool_schema",
+    "n_examples_expected": 1140,
+    "n_tools": 12,
+    "quality_audit_ref": "shared/state/tool_corpus_clean_dryrun_20260418.json",
+    "audit_summary": {
+      "malformed_permil": 0,
+      "schema_valid_ratio": 1.0,
+      "diversity_permil": 468,
+      "diversity_gate_pass": false,
+      "canonical_names_enforced": true,
+      "hard_negatives_count": 300
+    },
+    "audit_verdict": "ACCEPTABLE_FOR_SMOKE — malformed=0 and canonical names enforced fix the two root causes of D4/R9 mode collapse. Diversity (46.8%) below 80% gate is acceptable for 500-step smoke; full run should regenerate with higher template variance.",
+    "note": "Pure tool-schema corpus (no ChatML broad mix). NOT the mixed_tool_corpus.jsonl (which is polluted). This is the W5-generated clean set from build_tool_corpus_clean.hexa."
+  },
+
+  "hooks": {
+    "ckpt_backup_hook": "scripts/ckpt_backup_hook.hexa",
+    "label_routing": "production -> R2 permanent upload per ckpt_policy.json",
+    "naming_regex": "^alm14b-phi-a2-tool-clean-[0-9]{8}$"
+  },
+
+  "env": {
+    "HF_HUB_CACHE": "/workspace/hf_cache",
+    "HF_HOME": "/workspace/hf_cache",
+    "TRANSFORMERS_CACHE": "/workspace/hf_cache",
+    "ANIMA_ROOT": "/workspace/anima",
+    "HEXA_CKPT_HOOK": "/workspace/anima/scripts/ckpt_backup_hook.hexa"
+  },
+
+  "pod": {
+    "preferred_reuse_pod_id": "lnzliav2e8du6i",
+    "preferred_reuse_pod_name": "anima-alm14b-a1-20260416",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "vram_gb": 80,
+    "note": "Same H100 if available. B1 and B3 may also contend for pods — see queue ordering in training/a2_tool_clean_retrain_plan.md"
+  },
+
+  "queue": {
+    "contention_siblings": ["B1 (pod holder)", "B3 (potential contender)"],
+    "launch_order": "AFTER B1 smoke + B3 smoke complete",
+    "can_share_pod_sequentially": true,
+    "status": "PREPARED_NOT_LAUNCHED"
+  },
+
+  "blocks": {
+    "forbidden_markers": [
+      "/workspace/READY_FOR_32B",
+      "/workspace/READY_FOR_R5_KBASE"
+    ],
+    "requires_clean_corpus_present": "training/corpus_tool/clean_tool_corpus_*.jsonl exists + audit state in shared/state/tool_corpus_clean_*.json",
+    "forbidden_warm_start": "any /workspace/ckpt_alm14b_phi_a2_tool_mixed_* dir"
+  }
+}

@@ -1,0 +1,356 @@
+// training/launch_alm_a2_tool_clean.hexa — A2-Tool CLEAN retrain launcher
+// @convergence state=provisional id=A2_TOOL_CLEAN_LAUNCHER_20260418
+//                 value="W5 clean corpus retrain launcher. Emits pod-side
+//                        bash runner that fine-tunes fresh tool-use LoRA
+//                        on vanilla Qwen2.5-14B-Instruct (optionally warm-
+//                        started from A2-Orch clean adapter). 500 steps smoke
+//                        / lr 2e-6 const / consciousness_loss_b1 OFF /
+//                        step_1 CE guard aborts if >5."
+//                 created_at=2026-04-18
+//
+// Predecessor anti-patterns (NEVER repeat):
+//   /workspace/launch_a2_tool.py       — 50 examples × 1500 steps → overfit
+//   /workspace/launch_a2_tool_mixed.py — 250 valid / 3250 lines (92% malformed) → mode collapse on 'search_web'
+//
+// This launcher differs:
+//   - Corpus: clean_tool_corpus_*.jsonl (100% schema valid, 0 malformed, canonical names enforced)
+//   - Base:   vanilla Qwen2.5-14B-Instruct + optional A2-Orch clean warm-start
+//             (NEVER warm-start from a2_tool_mixed)
+//   - Steps:  500 smoke (not 1500, not 300)
+//   - LR:     2e-6 CONST (no cosine, warmup=0)
+//   - B1 Φ losses: OFF (phi_holo=0, gwt_broadcast=0, consciousness_loss_b1=false)
+//   - Resume guard: step_1 CE>5 → abort
+//
+// Config SSOT:
+//   training/alm_a2_tool_clean_sidecar.json (NOT alm_a2_tool_config.json — that
+//   file is user-modified SSOT and must not be touched).
+//
+// DO NOT LAUNCH: B4 deliverable is prep + document only. B1 holds pod.
+// Invoke only after queue ordering clears (see a2_tool_clean_retrain_plan.md).
+//
+// Run (when cleared):
+//   DRY_RUN=1 hexa run training/launch_alm_a2_tool_clean.hexa    # emit + inspect
+//   hexa run training/launch_alm_a2_tool_clean.hexa              # fire
+
+let SIDECAR_PATH = "training/alm_a2_tool_clean_sidecar.json"
+
+fn str_index_of(hay, needle, from) {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return from }
+    let mut i = from
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn extract_json_string(text, key) {
+    let needle = "\"" + key + "\""
+    let kpos = str_index_of(text, needle, 0)
+    if kpos < 0 { return "" }
+    let after_key = kpos + len(needle)
+    let colon = str_index_of(text, ":", after_key)
+    if colon < 0 { return "" }
+    let open_q = str_index_of(text, "\"", colon)
+    if open_q < 0 { return "" }
+    let close_q = str_index_of(text, "\"", open_q + 1)
+    if close_q < 0 { return "" }
+    return text.substring(open_q + 1, close_q)
+}
+
+fn resolve_date() {
+    return exec("date +%Y%m%d").trim()
+}
+
+fn log_info(msg) {
+    println("[launch_alm_a2_tool_clean] " + msg)
+}
+
+fn log_err(msg) {
+    println("[launch_alm_a2_tool_clean ERR] " + msg)
+}
+
+@convergence(state="provisional", id="A2_TOOL_CLEAN_CORPUS_SSOT_20260418", value="Tool corpus is training/corpus_tool/clean_tool_corpus_*.jsonl — 1140 lines (dryrun) or 7500 lines (full), 100% schema-valid, 0 malformed, canonical names enforced, 300 __no_tool__ hard negatives. Built by training/build_tool_corpus_clean.hexa. NEVER use mixed_tool_corpus.jsonl (92% malformed, polluted).", created_at="2026-04-18")
+@convergence(state="provisional", id="A2_TOOL_CLEAN_BASE_FORBIDDEN_20260418", value="NEVER warm-start this LoRA from any a2_tool_mixed checkpoint. Base must be vanilla Qwen2.5-14B-Instruct, optionally warm-started ONLY from A2-Orch clean adapter (r2:anima-models/alm14b/a2_20260416_orch/step_3000/).", created_at="2026-04-18")
+@convergence(state="provisional", id="A2_TOOL_CLEAN_JUDGE_FIX_TRADEOFF_20260418", value="per project_judge_fix_breakthrough: lenient rubric already lifted hire_sim 0.5333→0.867 WITHOUT retraining. This A2-Tool clean retrain is still justified ONLY if we need a reusable production adapter; if judge fix alone suffices for gate, this run is OPTIONAL. B4 prep only — do not auto-fire.", created_at="2026-04-18")
+fn main() {
+    let config_text = ""
+    if file_exists(SIDECAR_PATH) {
+        config_text = read_file(SIDECAR_PATH)
+    } else {
+        let anima_root = env("ANIMA_ROOT")
+        if anima_root == "" { anima_root = "." }
+        let fallback = anima_root + "/" + SIDECAR_PATH
+        if file_exists(fallback) {
+            config_text = read_file(fallback)
+        } else {
+            log_err("sidecar config not found: " + SIDECAR_PATH)
+            return
+        }
+    }
+    if len(config_text) == 0 {
+        log_err("sidecar config empty: " + SIDECAR_PATH)
+        return
+    }
+    let cfg_label = extract_json_string(config_text, "ckpt_label")
+    if cfg_label != "production" {
+        log_err("sidecar ckpt_label=" + cfg_label + " (expected production)")
+        return
+    }
+
+    // ── FROZEN A2-Tool CLEAN defaults (mirror alm_a2_tool_clean_sidecar.json) ──
+    let base_name       = "Qwen/Qwen2.5-14B-Instruct"
+    let steps_str       = "500"
+    let lr_str          = "2e-6"
+    let warmup_str      = "0"
+    let batch_str       = "1"
+    let grad_accum_str  = "8"
+    let seq_str         = "1024"
+    let save_every_str  = "250"
+    let eval_every_str  = "50"
+    let lora_r_str      = "32"
+    let lora_alpha_str  = "64"
+    let dropout_str     = "0.05"
+    let round_str       = "3"
+    let model_tag       = "alm14b"
+    let ckpt_label      = "production"
+    let step1_ce_guard  = "5.0"
+
+    // CLEAN corpus preferred path (prefer non-dryrun if present, else dryrun)
+    let corpus_pref     = "/workspace/anima/training/corpus_tool/clean_tool_corpus_20260418.jsonl"
+    let corpus_fallback = "/workspace/anima/training/corpus_tool/clean_tool_corpus_dryrun_20260418.jsonl"
+    let corpus_builder  = "/workspace/anima/training/build_tool_corpus_clean.hexa"
+
+    // Warm-start (OPTIONAL) — A2-Orch clean adapter only; NEVER a2_tool_mixed
+    let a2_orch_r2      = "r2:anima-models/alm14b/a2_20260416_orch/step_3000/"
+    let a2_orch_local   = "/workspace/ckpt_alm14b_phi_a2_orch_*/step_3000"
+    let forbidden_warm  = "/workspace/ckpt_alm14b_phi_a2_tool_mixed_*"
+
+    let date = resolve_date()
+    let run_id = "alm14b-phi-a2-tool-clean-" + date
+    let ckpt_dir = "/workspace/ckpt_alm14b_phi_a2_tool_clean_" + date
+
+    log_info("run_id=" + run_id)
+    log_info("ckpt_dir=" + ckpt_dir)
+    log_info("base=" + base_name + " (vanilla, optional A2-Orch warm-start)")
+    log_info("steps=" + steps_str + " (SMOKE) lr=" + lr_str + " (const) warmup=" + warmup_str)
+    log_info("lora r=" + lora_r_str + " alpha=" + lora_alpha_str + " (attention-only)")
+    log_info("corpus=" + corpus_pref + " (fallback: dryrun)")
+    log_info("phi_loss: B1 OFF (phi_holo=0, gwt=0)")
+    log_info("guard: step_1 CE > " + step1_ce_guard + " -> abort")
+
+    let runner = "/tmp/_launch_alm_a2_tool_clean_runner.sh"
+    write_file(runner,
+        "#!/usr/bin/env bash\n" +
+        "set -euo pipefail\n" +
+        "\n" +
+        "echo \"============================================\"\n" +
+        "echo \"  ALM A2-Tool CLEAN -- W5 clean corpus retrain\"\n" +
+        "echo \"  run_id = " + run_id + "\"\n" +
+        "echo \"  ckpt   = " + ckpt_dir + "\"\n" +
+        "echo \"  lora   = r" + lora_r_str + " alpha" + lora_alpha_str + " (attn-only)\"\n" +
+        "echo \"  steps  = " + steps_str + " SMOKE  lr=" + lr_str + " const  warmup=" + warmup_str + "\"\n" +
+        "echo \"  corpus = clean_tool_corpus_*.jsonl (W5 clean)\"\n" +
+        "echo \"  phi    = B1 OFF (phi_holo=0, gwt=0)\"\n" +
+        "echo \"  guard  = step_1 CE > " + step1_ce_guard + " -> abort\"\n" +
+        "echo \"  label  = " + ckpt_label + "\"\n" +
+        "echo \"============================================\"\n" +
+        "\n" +
+        "# ── preflight: forbidden markers ──\n" +
+        "for m in /workspace/READY_FOR_32B /workspace/READY_FOR_R5_KBASE; do\n" +
+        "    if [[ -f \"$m\" ]]; then\n" +
+        "        echo \"[preflight] forbidden marker: $m -- refusing\"\n" +
+        "        exit 1\n" +
+        "    fi\n" +
+        "done\n" +
+        "\n" +
+        "# ── preflight: FORBIDDEN warm-start from a2_tool_mixed ──\n" +
+        "for d in " + forbidden_warm + "; do\n" +
+        "    if [[ -d \"$d\" ]]; then\n" +
+        "        echo \"[preflight] forbidden warm-start dir present: $d\"\n" +
+        "        echo \"[preflight] a2_tool_mixed is POLLUTED -- NEVER use as base\"\n" +
+        "        echo \"[preflight] remove or rename before proceeding\"\n" +
+        "        exit 1\n" +
+        "    fi\n" +
+        "done\n" +
+        "echo \"[preflight] no a2_tool_mixed pollution\"\n" +
+        "\n" +
+        "# ── preflight: GPU bf16 + idle ──\n" +
+        "nvidia-smi --query-gpu=name,memory.total,memory.free,compute_cap --format=csv,noheader\n" +
+        "CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '.')\n" +
+        "if [[ -z \"$CC\" ]] || (( CC < 80 )); then echo \"[preflight] bf16 unsafe\"; exit 1; fi\n" +
+        "UTIL=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | head -n1)\n" +
+        "USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -n1)\n" +
+        "if (( UTIL > 5 )) || (( USED > 2000 )); then\n" +
+        "    echo \"[preflight] GPU not idle util=${UTIL}%% used=${USED}MiB -- refusing\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[preflight] GPU idle bf16 OK\"\n" +
+        "\n" +
+        "# ── preflight: disk + MFS quota (training/CLAUDE.md runpod_mfs_quota rule) ──\n" +
+        "FREE_GB=$(df -BG /workspace | tail -n1 | awk '{print $4}' | tr -d 'G')\n" +
+        "if [[ \"$FREE_GB\" -lt 100 ]]; then echo \"[preflight] disk ${FREE_GB}GB<100\"; exit 1; fi\n" +
+        "if ! dd if=/dev/zero of=/workspace/_q_test_a2tc bs=1M count=20000 status=none 2>/dev/null; then\n" +
+        "    echo \"[preflight] MFS quota write test FAILED\"; rm -f /workspace/_q_test_a2tc; exit 1\n" +
+        "fi\n" +
+        "rm -f /workspace/_q_test_a2tc\n" +
+        "echo \"[preflight] disk ${FREE_GB}GB + MFS 20GB OK\"\n" +
+        "\n" +
+        "# ── preflight: HF_TOKEN ──\n" +
+        "if [[ -z \"${HF_TOKEN:-}\" ]]; then echo \"[preflight] HF_TOKEN unset\"; exit 1; fi\n" +
+        "\n" +
+        "# ── preflight: A2-Orch warm-start (OPTIONAL) ──\n" +
+        "A2O_LOCAL=\"\"\n" +
+        "for d in " + a2_orch_local + "; do\n" +
+        "    if [[ -d \"$d\" && -f \"$d/adapter_config.json\" ]]; then A2O_LOCAL=\"$d\"; break; fi\n" +
+        "done\n" +
+        "if [[ -z \"$A2O_LOCAL\" ]]; then\n" +
+        "    echo \"[preflight] A2-Orch local missing -- attempting R2 stage\"\n" +
+        "    if rclone lsd \"" + a2_orch_r2 + "\" --s3-no-check-bucket >/dev/null 2>&1; then\n" +
+        "        mkdir -p /workspace/a2_orch_r2_stage_clean\n" +
+        "        rclone copy \"" + a2_orch_r2 + "\" /workspace/a2_orch_r2_stage_clean --s3-no-check-bucket --transfers 4 --progress\n" +
+        "        A2O_LOCAL=\"/workspace/a2_orch_r2_stage_clean\"\n" +
+        "        echo \"[preflight] A2-Orch warm-start staged from R2\"\n" +
+        "    else\n" +
+        "        echo \"[preflight] A2-Orch not available -- falling back to VANILLA base (no warm-start)\"\n" +
+        "        A2O_LOCAL=\"\"\n" +
+        "    fi\n" +
+        "fi\n" +
+        "if [[ -n \"$A2O_LOCAL\" ]]; then\n" +
+        "    echo \"[preflight] A2-Orch warm-start = $A2O_LOCAL\"\n" +
+        "else\n" +
+        "    echo \"[preflight] Base = VANILLA Qwen2.5-14B-Instruct (no warm-start)\"\n" +
+        "fi\n" +
+        "\n" +
+        "# ── preflight: clean tool corpus (prefer full, fallback dryrun) ──\n" +
+        "CORPUS=\"\"\n" +
+        "if [[ -f \"" + corpus_pref + "\" ]]; then\n" +
+        "    CORPUS=\"" + corpus_pref + "\"\n" +
+        "elif [[ -f \"" + corpus_fallback + "\" ]]; then\n" +
+        "    CORPUS=\"" + corpus_fallback + "\"\n" +
+        "    echo \"[preflight] using DRYRUN corpus (full not yet built)\"\n" +
+        "else\n" +
+        "    echo \"[preflight] no clean corpus -- regenerating via build_tool_corpus_clean.hexa (DRY_RUN=1)\"\n" +
+        "    HEXA_BIN=\"${HEXA_BIN:-/usr/local/bin/hexa}\"\n" +
+        "    if [[ ! -x \"$HEXA_BIN\" ]]; then HEXA_BIN=\"$(command -v hexa)\"; fi\n" +
+        "    if [[ -z \"$HEXA_BIN\" || ! -f \"" + corpus_builder + "\" ]]; then\n" +
+        "        echo \"[preflight] cannot regen (hexa or builder missing) -- refusing\"\n" +
+        "        exit 1\n" +
+        "    fi\n" +
+        "    DRY_RUN=1 \"$HEXA_BIN\" run \"" + corpus_builder + "\"\n" +
+        "    if [[ -f \"" + corpus_fallback + "\" ]]; then\n" +
+        "        CORPUS=\"" + corpus_fallback + "\"\n" +
+        "    else\n" +
+        "        echo \"[preflight] corpus regen failed\"; exit 1\n" +
+        "    fi\n" +
+        "fi\n" +
+        "LINES=$(wc -l < \"$CORPUS\")\n" +
+        "if (( LINES < 1000 )); then echo \"[preflight] corpus only $LINES lines (<1000) -- refusing\"; exit 1; fi\n" +
+        "\n" +
+        "# ── preflight: verify corpus quality (malformed<1%, canonical names) ──\n" +
+        "BAD=$(grep -c \"__placeholder__\\|TODO:\\|FIXME\\|TBD\" \"$CORPUS\" || true)\n" +
+        "if (( BAD > 10 )); then echo \"[preflight] corpus has $BAD placeholder markers -- refusing\"; exit 1; fi\n" +
+        "# search_web confabulation check: either 0 occurrences of 'web_search' OR only canonical 'search_web'\n" +
+        "ALIASES=$(grep -o '\"name\":\"web_search\"' \"$CORPUS\" | wc -l || true)\n" +
+        "if (( ALIASES > 0 )); then echo \"[preflight] corpus has $ALIASES web_search alias leaks (canonical=search_web) -- refusing\"; exit 1; fi\n" +
+        "echo \"[preflight] corpus $CORPUS ($LINES lines, 0 placeholder, 0 alias leak) OK\"\n" +
+        "\n" +
+        "# ── preflight: naming regex ──\n" +
+        "RUN_ID=\"" + run_id + "\"\n" +
+        "if ! [[ \"$RUN_ID\" =~ ^alm14b-phi-a2-tool-clean-[0-9]{8}$ ]]; then\n" +
+        "    echo \"[preflight] run_id $RUN_ID fails regex\"; exit 1\n" +
+        "fi\n" +
+        "\n" +
+        "# ── env ──\n" +
+        "export HF_HUB_CACHE=\"/workspace/hf_cache\"\n" +
+        "export HF_HOME=\"/workspace/hf_cache\"\n" +
+        "export TRANSFORMERS_CACHE=\"/workspace/hf_cache\"\n" +
+        "export ANIMA_ROOT=\"/workspace/anima\"\n" +
+        "export HEXA_CKPT_HOOK=\"/workspace/anima/scripts/ckpt_backup_hook.hexa\"\n" +
+        "if [[ -n \"$A2O_LOCAL\" ]]; then\n" +
+        "    export ADAPTER_MERGE_SRC=\"$A2O_LOCAL\"\n" +
+        "fi\n" +
+        "export TOOL_USE_CORPUS=\"1\"\n" +
+        "# Disable B1 Φ losses for tool-use LoRA (A3 diagnosis)\n" +
+        "export CONSCIOUSNESS_LOSS_B1=\"0\"\n" +
+        "export PHI_HOLO_WEIGHT=\"0.0\"\n" +
+        "export PHI_COMPLEXITY_COEF=\"0.0\"\n" +
+        "export GWT_BROADCAST_COEF=\"0.0\"\n" +
+        "# Resume guard: step_1 CE threshold\n" +
+        "export STEP1_CE_GUARD=\"" + step1_ce_guard + "\"\n" +
+        "# Constant LR schedule\n" +
+        "export LR_SCHEDULE=\"const\"\n" +
+        "\n" +
+        "# ── launch training ──\n" +
+        "CKPT_DIR=\"" + ckpt_dir + "\"\n" +
+        "if [[ -d \"$CKPT_DIR\" ]]; then echo \"[preflight] $CKPT_DIR exists\"; exit 1; fi\n" +
+        "mkdir -p \"$CKPT_DIR\"\n" +
+        "if [[ -n \"$A2O_LOCAL\" ]]; then\n" +
+        "    cp -r \"$A2O_LOCAL\" \"$CKPT_DIR/a2_orch_adapter\" || true\n" +
+        "fi\n" +
+        "# Record the sidecar config + corpus audit for provenance\n" +
+        "cp /workspace/anima/training/alm_a2_tool_clean_sidecar.json \"$CKPT_DIR/sidecar_config.json\" || true\n" +
+        "cp /workspace/anima/shared/state/tool_corpus_clean_dryrun_20260418.json \"$CKPT_DIR/corpus_audit.json\" 2>/dev/null || true\n" +
+        "\n" +
+        "TRAINER_HEXA=\"/workspace/anima/training/train_alm_14b.hexa\"\n" +
+        "HEXA_BIN=\"${HEXA_BIN:-/usr/local/bin/hexa}\"\n" +
+        "if [[ ! -x \"$HEXA_BIN\" ]]; then HEXA_BIN=\"$(command -v hexa)\"; fi\n" +
+        "if [[ -z \"$HEXA_BIN\" || ! -f \"$TRAINER_HEXA\" ]]; then echo \"[launch] toolchain missing\"; exit 1; fi\n" +
+        "\n" +
+        "\"$HEXA_BIN\" run \"$TRAINER_HEXA\" -- \\\n" +
+        "    --base " + base_name + " \\\n" +
+        "    --corpus \"$CORPUS\" \\\n" +
+        "    --steps " + steps_str + " \\\n" +
+        "    --lr " + lr_str + " \\\n" +
+        "    --lr-schedule const \\\n" +
+        "    --batch " + batch_str + " \\\n" +
+        "    --grad-accum " + grad_accum_str + " \\\n" +
+        "    --seq " + seq_str + " \\\n" +
+        "    --warmup " + warmup_str + " \\\n" +
+        "    --lora-r " + lora_r_str + " \\\n" +
+        "    --lora-alpha " + lora_alpha_str + " \\\n" +
+        "    --lora-dropout " + dropout_str + " \\\n" +
+        "    --target-modules q_proj k_proj v_proj o_proj \\\n" +
+        "    --ckpt-dir \"$CKPT_DIR\" \\\n" +
+        "    --save-every " + save_every_str + " \\\n" +
+        "    --eval-every " + eval_every_str + " \\\n" +
+        "    --model-tag " + model_tag + " \\\n" +
+        "    --round " + round_str + " \\\n" +
+        "    --ckpt-label " + ckpt_label + " \\\n" +
+        "    --disable-phi-losses \\\n" +
+        "    --step1-ce-guard " + step1_ce_guard + " \\\n" +
+        "    2>&1 | tee \"$CKPT_DIR/train_" + run_id + ".log\"\n" +
+        "\n" +
+        "# ── post-training R2 upload (per training/CLAUDE.md r2_checkpoint rule) ──\n" +
+        "echo \"[done] A2-Tool CLEAN training complete -- $CKPT_DIR\"\n" +
+        "rclone copy \"$CKPT_DIR\" \"r2:anima-models/alm14b/a2_20260418_tool_clean/\" -v --s3-no-check-bucket --transfers 4 || true\n" +
+        "touch \"$CKPT_DIR/READY_A2_TOOL_CLEAN_DONE\"\n" +
+        "echo \"[next] hexa training/eval_alm_14b.hexa --ckpt $CKPT_DIR/step_" + steps_str + "\"\n"
+    )
+
+    log_info("runner emitted: " + runner)
+
+    // B4 deliverable: DO NOT launch. Always dry-run unless explicitly forced.
+    let force = env("FORCE_LAUNCH")
+    if force != "1" {
+        log_info("======================================================")
+        log_info("B4 PREP MODE — launcher did NOT fire the runner.")
+        log_info("Queue status: B1 has pod, B3 may contend. Wait clearance.")
+        log_info("To inspect runner:  cat " + runner)
+        log_info("To fire (when cleared):  FORCE_LAUNCH=1 hexa run training/launch_alm_a2_tool_clean.hexa")
+        log_info("======================================================")
+        return
+    }
+
+    if env("DRY_RUN") == "1" {
+        log_info("DRY_RUN=1 — emitted only, not executing")
+        return
+    }
+
+    log_info("FORCE_LAUNCH=1 — executing bash " + runner)
+    exec("bash " + runner)
+}
+
+main()

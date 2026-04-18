@@ -1,0 +1,108 @@
+// alm14b_r10_watcher.hexa — polls r10 status every 60s, triggers kr_gen + R2 upload on DONE
+//
+// Status file: /workspace/ckpt_alm_14b_r10/r10_watcher.status
+//   values: INIT | TRAINING | DONE | ABORT_FIRST_BATCH_CE | ABORT_STEP1 | ABORT_MODE_COLLAPSE
+// Abort file: /workspace/ckpt_alm_14b_r10/r10_abort.status   (presence ⇒ abort)
+//
+// PATCH 2026-04-18 (E7-OSS-02 fix, per shared/convergence/alm_14b_r10.convergence):
+//   Previous watcher trusted the status file verbatim. When the trainer
+//   crashed mid-step, the file went stale still saying TRAINING and watcher
+//   burned hours pretending we were training. Now watcher invalidates the
+//   status with a PID liveness gate: optional env TRAIN_PID=<python trainer
+//   pid>. If TRAIN_PID is set AND kill -0 fails on it, the file-reported
+//   status is overridden to DEAD_PID and watcher exits 1. If TRAIN_PID not
+//   provided, falls back to pgrep for "_train_alm_14b_r10.py" — zero hits
+//   after a STATUS=TRAINING report triggers the same override.
+//
+// On DONE:
+//   1. Run /workspace/kr_gen.py against latest step_N (post-training sanity)
+//   2. rclone copy per-step dirs to r2:anima-models/alm14b/r10/step_N/
+//   3. Write /workspace/ckpt_alm_14b_r10/r10_watcher.done
+// On ABORT_*:
+//   1. Snapshot abort reason to /workspace/ckpt_alm_14b_r10/r10_watcher.abort
+//   2. Exit non-zero
+// On DEAD_PID override (new):
+//   1. Append dead-pid line to $LOG
+//   2. Write DEAD_PID to $CKPT/r10_watcher.status override
+//   3. Exit 1 — parent autopilot must crash_recover
+
+fn main() {
+    let script = "/tmp/_r10_watcher.sh"
+    write_file(script,
+        "#!/usr/bin/env bash\n" +
+        "set -uo pipefail\n" +
+        "CKPT=/workspace/ckpt_alm_14b_r10\n" +
+        "STATUS=$CKPT/r10_watcher.status\n" +
+        "ABORT=$CKPT/r10_abort.status\n" +
+        "LOG=$CKPT/r10_watcher.log\n" +
+        "TRAIN_PID=\"${TRAIN_PID:-}\"\n" +
+        "TRAINER_PYRE='_train_alm_14b_r10\\.py'\n" +
+        "mkdir -p \"$CKPT\"\n" +
+        "echo \"[watcher] starting $(date -u +%FT%TZ) TRAIN_PID='$TRAIN_PID'\" | tee -a \"$LOG\"\n" +
+        "\n" +
+        "# E7-OSS-02: PID liveness gate. Returns 0 alive, 1 dead.\n" +
+        "pid_alive() {\n" +
+        "    if [[ -n \"$TRAIN_PID\" ]]; then\n" +
+        "        kill -0 \"$TRAIN_PID\" 2>/dev/null && return 0 || return 1\n" +
+        "    fi\n" +
+        "    # Fallback: pgrep against inline python trainer name\n" +
+        "    pgrep -f \"$TRAINER_PYRE\" >/dev/null 2>&1 && return 0 || return 1\n" +
+        "}\n" +
+        "\n" +
+        "while true; do\n" +
+        "    if [[ -f \"$ABORT\" ]]; then\n" +
+        "        REASON=$(cat \"$ABORT\")\n" +
+        "        echo \"[watcher] ABORT detected: $REASON\" | tee -a \"$LOG\"\n" +
+        "        cp \"$ABORT\" \"$CKPT/r10_watcher.abort\"\n" +
+        "        exit 2\n" +
+        "    fi\n" +
+        "    if [[ -f \"$STATUS\" ]]; then\n" +
+        "        S=$(cat \"$STATUS\" | head -1)\n" +
+        "        # E7-OSS-02: invalidate TRAINING / SENTINEL / any non-terminal\n" +
+        "        # status against PID liveness. DONE is terminal and written\n" +
+        "        # only by the trainer itself just before exit — accept it.\n" +
+        "        if [[ \"$S\" != DONE ]] && [[ \"$S\" != ABORT* ]]; then\n" +
+        "            if ! pid_alive; then\n" +
+        "                echo \"[watcher] DEAD_PID override — file said S=$S but trainer is dead (TRAIN_PID='$TRAIN_PID')\" | tee -a \"$LOG\"\n" +
+        "                echo \"DEAD_PID\" > \"$STATUS\"\n" +
+        "                tail -100 \"$CKPT\"/train_r10.log 2>/dev/null > \"$CKPT/r10_watcher.crash_tail\" || true\n" +
+        "                exit 1\n" +
+        "            fi\n" +
+        "        fi\n" +
+        "        echo \"[watcher] $(date -u +%H:%M:%SZ) status=$S\" | tee -a \"$LOG\"\n" +
+        "        if [[ \"$S\" == DONE ]]; then\n" +
+        "            # Locate latest step_N\n" +
+        "            LATEST=$(ls -1d $CKPT/step_* 2>/dev/null | sort -V | tail -1 || echo \"\")\n" +
+        "            if [[ -z \"$LATEST\" ]]; then\n" +
+        "                echo \"[watcher] no step_N dirs found under $CKPT\" | tee -a \"$LOG\"\n" +
+        "                exit 3\n" +
+        "            fi\n" +
+        "            STEP=$(basename \"$LATEST\")\n" +
+        "            echo \"[watcher] DONE — latest=$LATEST\" | tee -a \"$LOG\"\n" +
+        "            # kr_gen sanity\n" +
+        "            if [[ -f /workspace/kr_gen.py ]]; then\n" +
+        "                echo \"[watcher] kr_gen on $LATEST\" | tee -a \"$LOG\"\n" +
+        "                python3 /workspace/kr_gen.py --adapter \"$LATEST\" --base /workspace/base_model 2>&1 | tee \"$CKPT/kr_gen_final.log\" || true\n" +
+        "            fi\n" +
+        "            # R2 upload all step dirs\n" +
+        "            for d in $CKPT/step_*; do\n" +
+        "                [[ -d \"$d\" ]] || continue\n" +
+        "                n=$(basename \"$d\")\n" +
+        "                echo \"[watcher] rclone → r2:anima-models/alm14b/r10/$n/\" | tee -a \"$LOG\"\n" +
+        "                rclone copy \"$d\" \"r2:anima-models/alm14b/r10/$n/\" -v --s3-no-check-bucket --transfers 4 2>&1 | tail -3 | tee -a \"$LOG\"\n" +
+        "            done\n" +
+        "            rclone ls r2:anima-models/alm14b/r10/ 2>&1 | tee \"$CKPT/r10_r2_manifest.txt\" | head -30\n" +
+        "            echo \"[watcher] UPLOAD DONE\" | tee -a \"$LOG\"\n" +
+        "            touch \"$CKPT/r10_watcher.done\"\n" +
+        "            exit 0\n" +
+        "        fi\n" +
+        "    else\n" +
+        "        echo \"[watcher] no status file yet\" | tee -a \"$LOG\"\n" +
+        "    fi\n" +
+        "    sleep 60\n" +
+        "done\n"
+    )
+    exec("bash " + script)
+}
+
+main()

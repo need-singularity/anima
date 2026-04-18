@@ -1,0 +1,145 @@
+// alm14b_r10_bootstrap.hexa — on-pod r10 bootstrap (chatml-stripped corpus + warm-start r4)
+//
+// Prerequisites already on pod (verified 2026-04-18 B1 task):
+//   - /workspace/base_model/              (Qwen2.5-14B-Instruct, 8 shards, 28 GB)
+//   - /workspace/ckpt_r4_step1000/        (r4 LoRA adapter, 208 MB)
+//   - /workspace/corpus_alm_70b.jsonl     (90 MB chatml JSONL)
+//   - /usr/local/bin/hexa                 (hexa binary)
+//   - /usr/bin/rclone                     (R2 CLI)
+//
+// Bootstrap steps:
+//   1. MFS quota preflight (20 GB dd probe)
+//   2. Strip chatml wrapper → /workspace/corpus_alm_70b_stripped.txt
+//      Try hexa tool first; fall back to inline python at /tmp/_strip.py
+//   3. Launch r10 via /workspace/anima/training/launch_alm_14b_r10.hexa
+//   4. On completion, R2 upload → r2:anima-models/alm14b/r10/step_N/
+//
+// Usage (on pod):
+//   hexa run /workspace/alm14b_r10_bootstrap.hexa production      # 2000 steps
+//   hexa run /workspace/alm14b_r10_bootstrap.hexa smoke           # 200 steps
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+    let mode = if argc >= 2 { argv[1] } else { "production" }
+
+    if mode != "smoke" && mode != "production" {
+        println("usage: alm14b_r10_bootstrap.hexa <smoke|production>")
+        exit(2)
+    }
+
+    let script = "/tmp/_alm14b_r10_bootstrap.sh"
+    write_file(script,
+        "#!/usr/bin/env bash\n" +
+        "set -euo pipefail\n" +
+        "MODE=\"" + mode + "\"\n" +
+        "echo \"================================================================\"\n" +
+        "echo \"  ALM 14B r10 bootstrap — mode=$MODE (warm-start r4, B1 OFF)\"\n" +
+        "echo \"================================================================\"\n" +
+        "\n" +
+        "# ── 1. MFS quota preflight ──\n" +
+        "echo \"[preflight] MFS quota probe (20 GB dd)...\"\n" +
+        "if ! dd if=/dev/zero of=/workspace/_q_test bs=1M count=20000 status=none 2>/dev/null; then\n" +
+        "    echo \"[ABORT] MFS quota probe failed\"; rm -f /workspace/_q_test; exit 1\n" +
+        "fi\n" +
+        "rm -f /workspace/_q_test\n" +
+        "echo \"  MFS quota OK\"\n" +
+        "\n" +
+        "# ── 2. Strip chatml wrapper ──\n" +
+        "SRC=/workspace/corpus_alm_70b.jsonl\n" +
+        "DST=/workspace/corpus_alm_70b_stripped.txt\n" +
+        "[[ -f \"$SRC\" ]] || { echo \"[ABORT] corpus missing: $SRC\"; exit 1; }\n" +
+        "\n" +
+        "if [[ -f \"$DST\" ]] && [[ $(stat -c%s \"$DST\") -gt 1000000 ]]; then\n" +
+        "    echo \"[strip] $DST exists ($(du -sh $DST | cut -f1)) — skipping\"\n" +
+        "else\n" +
+        "    echo \"[strip] trying hexa-native corpus_strip_chatml.hexa ...\"\n" +
+        "    if hexa run /workspace/anima/training/corpus_strip_chatml.hexa \"$SRC\" \"$DST\" 2>&1 | tail -20; then\n" +
+        "        if [[ ! -s \"$DST\" ]]; then\n" +
+        "            echo \"[strip] hexa produced empty file — falling back to python\"\n" +
+        "            rm -f \"$DST\"\n" +
+        "        fi\n" +
+        "    fi\n" +
+        "    if [[ ! -s \"$DST\" ]]; then\n" +
+        "        echo \"[strip] python fallback (inline /tmp/_strip.py)\"\n" +
+        "        cat > /tmp/_strip.py <<'PYEOF'\n" +
+        "import json, sys\n" +
+        "src, dst = sys.argv[1], sys.argv[2]\n" +
+        "lines_in = lines_out = 0\n" +
+        "with open(src, 'r', encoding='utf-8', errors='ignore') as fi, \\\n" +
+        "     open(dst, 'w', encoding='utf-8') as fo:\n" +
+        "    for line in fi:\n" +
+        "        lines_in += 1\n" +
+        "        line = line.strip()\n" +
+        "        if not line: continue\n" +
+        "        try:\n" +
+        "            obj = json.loads(line)\n" +
+        "        except Exception:\n" +
+        "            continue\n" +
+        "        msgs = obj.get('messages') if isinstance(obj, dict) else None\n" +
+        "        if not isinstance(msgs, list): continue\n" +
+        "        parts = []\n" +
+        "        for m in msgs:\n" +
+        "            c = m.get('content') if isinstance(m, dict) else None\n" +
+        "            if isinstance(c, str) and c:\n" +
+        "                parts.append(c)\n" +
+        "        if parts:\n" +
+        "            fo.write('\\n'.join(parts))\n" +
+        "            fo.write('\\n\\n')\n" +
+        "            lines_out += 1\n" +
+        "print(f'[strip.py] in={lines_in} out={lines_out}')\n" +
+        "PYEOF\n" +
+        "        python3 /tmp/_strip.py \"$SRC\" \"$DST\"\n" +
+        "    fi\n" +
+        "fi\n" +
+        "STRIPPED_SIZE=$(du -sh \"$DST\" | cut -f1)\n" +
+        "echo \"[strip] OK — $DST ($STRIPPED_SIZE)\"\n" +
+        "\n" +
+        "# ── 3. Clean prior r10 ckpt (runpod_mfs_quota rule) ──\n" +
+        "rm -rf /workspace/ckpt_alm_14b_r10\n" +
+        "mkdir -p /workspace/ckpt_alm_14b_r10\n" +
+        "echo INIT > /workspace/ckpt_alm_14b_r10/r10_watcher.status\n" +
+        "\n" +
+        "# ── 4. Deps ──\n" +
+        "python3 -c 'import unsloth, liger_kernel, peft, transformers' 2>/dev/null || \\\n" +
+        "    pip install -q peft==0.13.2 transformers==4.45.2 unsloth liger-kernel 2>&1 | tail -3\n" +
+        "\n" +
+        "# ── 5. Verify base + adapter ──\n" +
+        "[[ -d /workspace/base_model ]]       || { echo \"[ABORT] base_model missing\"; exit 1; }\n" +
+        "[[ -d /workspace/ckpt_r4_step1000 ]] || { echo \"[ABORT] r4 adapter missing\"; exit 1; }\n" +
+        "[[ -f /workspace/ckpt_r4_step1000/adapter_model.safetensors ]] || { echo \"[ABORT] r4 adapter file missing\"; exit 1; }\n" +
+        "echo \"[preflight] base + r4 adapter OK\"\n" +
+        "\n" +
+        "# ── 6. Launch r10 ──\n" +
+        "SMOKE_FLAG=\"\"\n" +
+        "[[ \"$MODE\" == \"smoke\" ]] && SMOKE_FLAG=\"--smoke\"\n" +
+        "LAUNCH=/workspace/anima/training/launch_alm_14b_r10.hexa\n" +
+        "[[ -f \"$LAUNCH\" ]] || { echo \"[ABORT] launcher missing: $LAUNCH\"; exit 1; }\n" +
+        "\n" +
+        "echo \"[launch] hexa run $LAUNCH $SMOKE_FLAG\"\n" +
+        "if ! hexa run \"$LAUNCH\" $SMOKE_FLAG 2>&1 | tee /workspace/ckpt_alm_14b_r10/bootstrap.log; then\n" +
+        "    echo \"[r10] launcher returned non-zero — check log\"\n" +
+        "    exit 2\n" +
+        "fi\n" +
+        "\n" +
+        "# ── 7. Post-training R2 upload (production only, after process exits) ──\n" +
+        "if [[ \"$MODE\" == \"production\" ]] && [[ ! -f /workspace/ckpt_alm_14b_r10/r10_abort.status ]]; then\n" +
+        "    echo \"[R2 upload] ckpt_alm_14b_r10 → r2:anima-models/alm14b/r10/\"\n" +
+        "    for stepdir in /workspace/ckpt_alm_14b_r10/step_*; do\n" +
+        "        [[ -d \"$stepdir\" ]] || continue\n" +
+        "        step=$(basename \"$stepdir\")\n" +
+        "        echo \"  uploading $step ...\"\n" +
+        "        rclone copy \"$stepdir\" \"r2:anima-models/alm14b/r10/$step/\" -v --s3-no-check-bucket --transfers 4 2>&1 | tail -3\n" +
+        "    done\n" +
+        "    rclone ls r2:anima-models/alm14b/r10/ 2>&1 | head -20\n" +
+        "fi\n" +
+        "\n" +
+        "echo \"================================================================\"\n" +
+        "echo \"  r10 $MODE bootstrap DONE\"\n" +
+        "echo \"================================================================\"\n"
+    )
+
+    exec("bash " + script)
+}
+
+main()

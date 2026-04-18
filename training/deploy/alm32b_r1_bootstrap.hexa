@@ -1,0 +1,192 @@
+// alm32b_r1_bootstrap.hexa — on-pod bootstrap for ALM 32B r1 training.
+//
+// =============================================================================
+//  SCAFFOLD STATUS: PREP ONLY — DO NOT EXECUTE until r10 complete + eval green.
+// =============================================================================
+//
+// Usage (on the RunPod H100 80GB pod, after scp'ing anima tree + rclone.conf):
+//   hexa run /workspace/anima/training/deploy/alm32b_r1_bootstrap.hexa smoke        # 200 steps, ~20 min
+//   hexa run /workspace/anima/training/deploy/alm32b_r1_bootstrap.hexa production   # 2000 steps, ~5-8 h
+//
+// Prereqs on pod (enforced by bootstrap):
+//   - /root/.config/rclone/rclone.conf present (scp'd from user)
+//   - 1 × H100 80GB visible
+//   - 200 GB container disk (per alm32b_r1_runpod_create.json)
+//   - HF_TOKEN exported (for 32B download — NOT in R2 yet)
+//   - /usr/local/bin/hexa binary
+//
+// R2 pulls (if already mirrored) OR HF downloads (first time):
+//   - Qwen2.5-32B-Instruct (~65 GB, 17 shards) — HF primary, R2 cache secondary
+//   - corpus_alm_70b_stripped.txt (matches r10; generated pod-side if absent)
+//
+// Post-training: R2 upload ckpt_alm_32b_r1/step_2000/ → r2:anima-models/alm32b/r1/step_2000/
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+    let mode = if argc >= 2 { argv[1] } else { "smoke" }
+
+    if mode != "smoke" && mode != "production" {
+        println("usage: alm32b_r1_bootstrap.hexa <smoke|production>")
+        exit(2)
+    }
+
+    let script = "/tmp/_alm32b_r1_bootstrap.sh"
+    write_file(script,
+        "#!/usr/bin/env bash\n" +
+        "set -euo pipefail\n" +
+        "MODE=\"" + mode + "\"\n" +
+        "\n" +
+        "echo \"================================================================\"\n" +
+        "echo \"  ALM 32B r1 bootstrap — mode=$MODE (fresh LoRA, B1 OFF)\"\n" +
+        "echo \"================================================================\"\n" +
+        "\n" +
+        "# ── 1. Preflight: GPU ──\n" +
+        "GPU_MEM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 || echo 0)\n" +
+        "[[ \"$GPU_MEM\" -lt 70000 ]] && { echo \"[ABORT] need H100 80GB (saw ${GPU_MEM} MiB)\"; exit 1; }\n" +
+        "echo \"[preflight] GPU OK (${GPU_MEM} MiB)\"\n" +
+        "\n" +
+        "# ── 2. MFS quota probe (20 GB dd) ──\n" +
+        "echo \"[preflight] MFS quota probe...\"\n" +
+        "if ! dd if=/dev/zero of=/workspace/_q_test bs=1M count=20000 status=none 2>/dev/null; then\n" +
+        "    echo \"[ABORT] MFS quota probe failed\"; rm -f /workspace/_q_test; exit 1\n" +
+        "fi\n" +
+        "rm /workspace/_q_test\n" +
+        "echo \"  MFS quota OK\"\n" +
+        "\n" +
+        "# ── 3. Disk free check (need ~130 GB headroom: 65 base + 20 cache + 40 misc) ──\n" +
+        "FREE_GB=$(df -BG /workspace | tail -n1 | awk '{print $4}' | tr -d 'G')\n" +
+        "if [[ -z \"$FREE_GB\" || \"$FREE_GB\" -lt 130 ]]; then\n" +
+        "    echo \"[ABORT] /workspace free=${FREE_GB}GB < 130GB\"\n" +
+        "    df -h /workspace\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[preflight] disk OK (${FREE_GB}GB free)\"\n" +
+        "\n" +
+        "# ── 4. HF_TOKEN check (required — 32B base NOT in R2 as of 2026-04-18) ──\n" +
+        "if [[ -z \"${HF_TOKEN:-}\" ]]; then\n" +
+        "    echo \"[ABORT] HF_TOKEN required — 32B base must be downloaded from HuggingFace\"\n" +
+        "    echo \"         (R2 only has 14B; mirror after first successful download)\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[preflight] HF_TOKEN present\"\n" +
+        "\n" +
+        "# ── 5. rclone config ──\n" +
+        "command -v rclone >/dev/null || (curl -sL https://rclone.org/install.sh | bash)\n" +
+        "[[ -f /root/.config/rclone/rclone.conf ]] || { echo \"[ABORT] rclone.conf missing — scp from user machine\"; exit 1; }\n" +
+        "\n" +
+        "# ── 6. Deps (unsloth + liger + peft/transformers pins, no bnb) ──\n" +
+        "pip install -q 'torch==2.4.0' 2>/dev/null || true\n" +
+        "pip install -q peft==0.13.2 transformers==4.45.2 unsloth liger-kernel huggingface_hub rclone 2>&1 | tail -3\n" +
+        "python3 -c 'import importlib, sys; sys.exit(0 if importlib.util.find_spec(\"bitsandbytes\") is None else 1)' || \\\n" +
+        "    { echo \"[ABORT] bitsandbytes installed — violates no-quantization policy\"; exit 1; }\n" +
+        "\n" +
+        "# ── 7. Fetch 32B base ──\n" +
+        "BASE_DIR=/workspace/base_model_32b\n" +
+        "mkdir -p $BASE_DIR\n" +
+        "if [[ ! -f \"$BASE_DIR/config.json\" ]]; then\n" +
+        "    # Try R2 first (if mirror exists from prior pod run)\n" +
+        "    if rclone lsd r2:anima-models/base_models/qwen25-32b-instruct/ --s3-no-check-bucket >/dev/null 2>&1; then\n" +
+        "        echo \"[fetch] 32B base from R2 (cached mirror)...\"\n" +
+        "        rclone copy r2:anima-models/base_models/qwen25-32b-instruct/ $BASE_DIR/ --s3-no-check-bucket --transfers 8 --progress 2>&1 | tail -5\n" +
+        "    else\n" +
+        "        echo \"[fetch] 32B base from HuggingFace (R2 mirror absent)...\"\n" +
+        "        python3 -c \"from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2.5-32B-Instruct', local_dir='$BASE_DIR', token='${HF_TOKEN}', max_workers=8)\"\n" +
+        "        # Mirror to R2 for future pod reuse (post-download, one shot)\n" +
+        "        echo \"[mirror] uploading 32B base → r2:anima-models/base_models/qwen25-32b-instruct/ (for reuse)\"\n" +
+        "        rclone copy $BASE_DIR/ r2:anima-models/base_models/qwen25-32b-instruct/ --s3-no-check-bucket --transfers 4 2>&1 | tail -3 || \\\n" +
+        "            echo \"[mirror] non-fatal: R2 upload failed (training will still proceed)\"\n" +
+        "    fi\n" +
+        "fi\n" +
+        "BASE_GB=$(du -sBG $BASE_DIR | awk '{print $1}' | tr -d 'G')\n" +
+        "if [[ \"$BASE_GB\" -lt 60 ]]; then\n" +
+        "    echo \"[ABORT] 32B base only ${BASE_GB}GB (< 60 GB — incomplete download)\"\n" +
+        "    exit 1\n" +
+        "fi\n" +
+        "echo \"[fetch] 32B base OK (${BASE_GB} GB)\"\n" +
+        "\n" +
+        "# ── 8. Fetch/prepare stripped corpus (matches r10) ──\n" +
+        "STRIPPED=/workspace/corpus_alm_70b_stripped.txt\n" +
+        "SRC=/workspace/corpus_alm_70b.jsonl\n" +
+        "if [[ ! -f \"$STRIPPED\" ]] || [[ $(stat -c%s \"$STRIPPED\" 2>/dev/null || echo 0) -lt 1000000 ]]; then\n" +
+        "    if [[ ! -f \"$SRC\" ]]; then\n" +
+        "        echo \"[corpus] fetching corpus_alm_70b.jsonl from R2...\"\n" +
+        "        rclone copy r2:anima-models/corpus/corpus_alm_70b.jsonl /workspace/ --s3-no-check-bucket 2>&1 | tail -3\n" +
+        "    fi\n" +
+        "    [[ -f \"$SRC\" ]] || { echo \"[ABORT] corpus source missing: $SRC\"; exit 1; }\n" +
+        "    echo \"[corpus] stripping chatml wrapper → $STRIPPED\"\n" +
+        "    if [[ -f /workspace/anima/training/corpus_strip_chatml.hexa ]]; then\n" +
+        "        hexa run /workspace/anima/training/corpus_strip_chatml.hexa \"$SRC\" \"$STRIPPED\" 2>&1 | tail -10 || true\n" +
+        "    fi\n" +
+        "    if [[ ! -s \"$STRIPPED\" ]]; then\n" +
+        "        echo \"[corpus] hexa strip produced empty file — python fallback\"\n" +
+        "        cat > /tmp/_strip_32b.py <<'PYEOF'\n" +
+        "import json, sys\n" +
+        "src, dst = sys.argv[1], sys.argv[2]\n" +
+        "with open(src, 'r', encoding='utf-8', errors='ignore') as fi, \\\n" +
+        "     open(dst, 'w', encoding='utf-8') as fo:\n" +
+        "    for line in fi:\n" +
+        "        line = line.strip()\n" +
+        "        if not line: continue\n" +
+        "        try:\n" +
+        "            obj = json.loads(line)\n" +
+        "        except Exception:\n" +
+        "            continue\n" +
+        "        msgs = obj.get('messages') if isinstance(obj, dict) else None\n" +
+        "        if not isinstance(msgs, list): continue\n" +
+        "        parts = [m.get('content') for m in msgs\n" +
+        "                 if isinstance(m, dict) and isinstance(m.get('content'), str) and m.get('content')]\n" +
+        "        if parts:\n" +
+        "            fo.write('\\n'.join(parts)); fo.write('\\n\\n')\n" +
+        "PYEOF\n" +
+        "        python3 /tmp/_strip_32b.py \"$SRC\" \"$STRIPPED\"\n" +
+        "    fi\n" +
+        "fi\n" +
+        "echo \"[corpus] OK $STRIPPED ($(du -sh $STRIPPED | cut -f1))\"\n" +
+        "\n" +
+        "# ── 9. Clean prior 32B r1 ckpt (MFS quota rule: never reuse) ──\n" +
+        "CKPT=/workspace/ckpt_alm_32b_r1\n" +
+        "rm -rf \"$CKPT\"\n" +
+        "mkdir -p \"$CKPT\"\n" +
+        "echo INIT > \"$CKPT/r1_watcher.status\"\n" +
+        "\n" +
+        "# ── 10. Launch ──\n" +
+        "SMOKE_FLAG=\"\"\n" +
+        "[[ \"$MODE\" == \"smoke\" ]] && SMOKE_FLAG=\"--smoke\"\n" +
+        "LAUNCH=/workspace/anima/training/launch_alm_32b_r1.hexa\n" +
+        "[[ -f \"$LAUNCH\" ]] || { echo \"[ABORT] launcher missing: $LAUNCH\"; exit 1; }\n" +
+        "\n" +
+        "export HF_HUB_CACHE=/workspace/hf_cache HF_HOME=/workspace/hf_cache\n" +
+        "export KR_GEN_SENTINEL=/workspace/anima/training/kr_gen_sentinel.hexa\n" +
+        "export HEXA_BIN=/usr/local/bin/hexa\n" +
+        "\n" +
+        "echo \"[launch] hexa run $LAUNCH $SMOKE_FLAG\"\n" +
+        "if ! hexa run \"$LAUNCH\" $SMOKE_FLAG 2>&1 | tee \"$CKPT/bootstrap.log\"; then\n" +
+        "    echo \"[32b-r1] launcher returned non-zero — check log\"\n" +
+        "    exit 2\n" +
+        "fi\n" +
+        "\n" +
+        "# ── 11. Post-training R2 upload (production only, MFS-safe bulk) ──\n" +
+        "if [[ \"$MODE\" == \"production\" ]] && [[ ! -f \"$CKPT/r1_abort.status\" ]]; then\n" +
+        "    echo \"[R2 upload] $CKPT → r2:anima-models/alm32b/r1/\"\n" +
+        "    for stepdir in $CKPT/step_*; do\n" +
+        "        [[ -d \"$stepdir\" ]] || continue\n" +
+        "        step=$(basename \"$stepdir\")\n" +
+        "        echo \"  uploading $step ...\"\n" +
+        "        rclone copy \"$stepdir\" \"r2:anima-models/alm32b/r1/$step/\" -v --s3-no-check-bucket --transfers 4 2>&1 | tail -3\n" +
+        "    done\n" +
+        "    rclone ls r2:anima-models/alm32b/r1/ 2>&1 | head -20\n" +
+        "    echo \"[teardown] ready: runpodctl remove pod \\$POD_ID\"\n" +
+        "else\n" +
+        "    echo \"[$MODE] skipping R2 upload — inspect $CKPT manually\"\n" +
+        "fi\n" +
+        "\n" +
+        "echo \"================================================================\"\n" +
+        "echo \"  ALM 32B r1 $MODE bootstrap DONE\"\n" +
+        "echo \"================================================================\"\n"
+    )
+
+    exec("bash " + script)
+}
+
+main()

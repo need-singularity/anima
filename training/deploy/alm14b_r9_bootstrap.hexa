@@ -1,0 +1,100 @@
+// alm14b_r9_bootstrap.hexa — on-pod bootstrap for ALM 14B r9 training.
+//
+// Usage (on the RunPod H100 pod, after scp):
+//   hexa run training/deploy/alm14b_r9_bootstrap.hexa smoke        # 500 steps, ~15 min, ~$0.75
+//   hexa run training/deploy/alm14b_r9_bootstrap.hexa production   # 10K steps, ~4-6 h, ~$15
+//
+// Prereqs on pod:
+//   - /root/.config/rclone/rclone.conf present (scp'd from user)
+//   - H100 80GB visible (nvidia-smi)
+//   - 150 GB container disk (per pod spec alm14b_r9_runpod_create.json)
+//
+// R2 pulls (bootstrap performs):
+//   - base_models/qwen25-14b-instruct/         (28 GB, 8 shards)
+//   - tokenizer/kr_bpe_32k/                    (0.5 MB)
+//   - adapters/alm14b_a2_tool_mixed/           (200 MB)
+//   - alm14b/r4/step_1000/                     (200 MB resume)
+//   - corpus/corpus_alm_70b.jsonl              (90 MB)
+
+fn main() {
+    let args = std_args()
+    let mode = if args.len() > 1 { args[1] } else { "smoke" }
+
+    if mode != "smoke" && mode != "production" {
+        println("usage: alm14b_r9_bootstrap.hexa <smoke|production>")
+        std_exit(2)
+    }
+
+    let payload =
+        "#!/usr/bin/env bash\n" +
+        "set -euo pipefail\n" +
+        "MODE=\"" + mode + "\"\n" +
+        "\n" +
+        "echo \"================================================================\"\n" +
+        "echo \"  ALM 14B r9 bootstrap — mode=$MODE\"\n" +
+        "echo \"================================================================\"\n" +
+        "\n" +
+        "# MFS quota preflight (training/CLAUDE.md runpod_mfs_quota)\n" +
+        "echo \"[preflight] MFS quota probe (20 GB dd)...\"\n" +
+        "dd if=/dev/zero of=/workspace/_q_test bs=1M count=20000 status=none\n" +
+        "rm /workspace/_q_test\n" +
+        "echo \"  MFS quota OK\"\n" +
+        "\n" +
+        "# Tools\n" +
+        "command -v rclone >/dev/null || (curl -sL https://rclone.org/install.sh | bash)\n" +
+        "pip install -q peft==0.13.2 transformers==4.45.2 unsloth liger-kernel 2>&1 | tail -3\n" +
+        "\n" +
+        "# R2 pulls\n" +
+        "mkdir -p /workspace/anima/training/tokenizer /workspace/base_model /workspace/adapters/a2_tool_mixed /workspace/ckpt_r4_resume\n" +
+        "\n" +
+        "echo \"[R2] base Qwen2.5-14B-Instruct (28 GB)...\"\n" +
+        "rclone copy r2:anima-models/base_models/qwen25-14b-instruct/ /workspace/base_model/ --s3-no-check-bucket --transfers 8 --progress 2>&1 | tail -5\n" +
+        "\n" +
+        "echo \"[R2] BPE tokenizer...\"\n" +
+        "rclone copy r2:anima-models/tokenizer/kr_bpe_32k/ /workspace/anima/training/tokenizer/kr_bpe_32k/ --s3-no-check-bucket 2>&1 | tail -3\n" +
+        "\n" +
+        "echo \"[R2] A2 tool mixed adapter...\"\n" +
+        "rclone copy r2:anima-models/adapters/alm14b_a2_tool_mixed/ /workspace/adapters/a2_tool_mixed/ --s3-no-check-bucket 2>&1 | tail -3\n" +
+        "\n" +
+        "echo \"[R2] r4 step_1000 resume ckpt...\"\n" +
+        "rclone copy r2:anima-models/alm14b/r4/step_1000/ /workspace/ckpt_r4_resume/ --s3-no-check-bucket 2>&1 | tail -3\n" +
+        "\n" +
+        "echo \"[R2] corpus_alm_70b.jsonl (90 MB)...\"\n" +
+        "rclone copy r2:anima-models/corpus/corpus_alm_70b.jsonl /workspace/anima/training/ --s3-no-check-bucket 2>&1 | tail -3\n" +
+        "ln -sf /workspace/anima/training/corpus_alm_70b.jsonl /workspace/corpus.txt\n" +
+        "\n" +
+        "# Fresh ckpt dir (training/CLAUDE.md: 항상 신규)\n" +
+        "CKPT_DIR=/workspace/ckpt_alm_14b_r9\n" +
+        "rm -rf $CKPT_DIR && mkdir -p $CKPT_DIR\n" +
+        "\n" +
+        "# Launch r9\n" +
+        "SMOKE_FLAG=\"\"\n" +
+        "[[ \"$MODE\" == \"smoke\" ]] && SMOKE_FLAG=\"--smoke\"\n" +
+        "\n" +
+        "cd /workspace/anima\n" +
+        "export CORPUS=/workspace/corpus.txt\n" +
+        "export HF_HUB_CACHE=/workspace/hf_cache HF_HOME=/workspace/hf_cache\n" +
+        "\n" +
+        "echo \"[launch] hexa run training/launch_alm_14b_r9.hexa $SMOKE_FLAG\"\n" +
+        "hexa run training/launch_alm_14b_r9.hexa $SMOKE_FLAG 2>&1 | tee $CKPT_DIR/bootstrap.log\n" +
+        "\n" +
+        "echo \"================================================================\"\n" +
+        "echo \"  r9 $MODE DONE\"\n" +
+        "echo \"================================================================\"\n" +
+        "\n" +
+        "# R2 upload (post-training, one batch — training/CLAUDE.md r2_checkpoint)\n" +
+        "if [[ \"$MODE\" == \"production\" ]]; then\n" +
+        "    echo \"[R2 upload] ckpt → r2:anima-models/alm14b/r9/\"\n" +
+        "    rclone copy $CKPT_DIR r2:anima-models/alm14b/r9/ -v --s3-no-check-bucket --transfers 4 2>&1 | tail -10\n" +
+        "    rclone ls r2:anima-models/alm14b/r9/ | head -20\n" +
+        "    echo \"[teardown] run: runpodctl remove pod \\$POD_ID\"\n" +
+        "else\n" +
+        "    echo \"[smoke] skipping R2 upload — inspect $CKPT_DIR manually\"\n" +
+        "fi\n"
+
+    let script_path = "/tmp/_alm14b_r9_bootstrap.sh"
+    std_write(script_path, payload)
+    std_exec("bash " + script_path)
+}
+
+main()
