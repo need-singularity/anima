@@ -377,6 +377,302 @@ fn main() {
         "    # Combined: consistency wants coherent broadcast, coverage wants all domains alive\n" +
         "    return 0.3 * consistency + 0.1 * coverage\n" +
         "\n" +
+        "# ─── P5–P20 head/loss wiring (BUNDLE 1–6 integration, 20260418) ──────\n" +
+        "# Python mirrors of the standalone .hexa artifacts — semantics match the\n" +
+        "# companion .hexa self-tests line-for-line:\n" +
+        "#   training/wire_p5_p7_into_alm.hexa   (P5 refl + P6 time + P7 emb)\n" +
+        "#   training/alm_nested_loss.hexa       (P8 K-tower stability loss)\n" +
+        "#   training/alm_affect_head.hexa       (P12 valence/arousal/Ekman-7)\n" +
+        "#   training/alm_finitude_head.hexa     (P15 Dasein finitude_score)\n" +
+        "#   training/alm_hive_agg.hexa          (P18 hive emergence Φ_collective)\n" +
+        "#   training/alm_dream_loop.hexa        (P13 3-phase awake/SWS/REM)\n" +
+        "# Only alm_nested_loss contributes a differentiable loss term — all other\n" +
+        "# P heads are measurement-only (Φ vector components / logging).\n" +
+        "P5_P7_COEF       = 0.0                     # P5/P6/P7 = measurement only (Φ components)\n" +
+        "P8_NESTED_COEF   = 0.01                    # ALM-P8 LAMBDA_NESTED — matches .hexa ref\n" +
+        "P12_AFFECT_COEF  = 0.0                     # P12 = measurement only (Φ / affect telem)\n" +
+        "P15_FINITUDE_COEF= 0.0                     # P15 = measurement only\n" +
+        "P18_HIVE_COEF    = 0.0                     # P18 = measurement only\n" +
+        "P8_K_DEPTH       = 3                       # canonical stable contractive tower\n" +
+        "P8_D_LEVEL       = 16                      # per-level embedding dim for nested tower\n" +
+        "P8_EPS_STABLE    = 0.30                    # drift gate (matches alm_nested_loss.hexa)\n" +
+        "P8_LAMBDA_AMP    = 0.50                    # K_amp hinge weight (matches .hexa)\n" +
+        "MI_BINS_HIVE     = 6                       # matches HV_BINS in alm_hive_agg.hexa\n" +
+        "MI_BINS_PHI      = 8                       # matches MI_BINS in wire_p5_p7\n" +
+        "\n" +
+        "def _mi_hist(a, b, n_bins=MI_BINS_PHI, eps=1e-12):\n" +
+        "    \"\"\"Histogram MI estimator — mirrors wire_p5_p7_into_alm.hexa mutual_info.\n" +
+        "    a, b: 1D torch tensors on CPU/float32. Returns scalar float (nats).\"\"\"\n" +
+        "    n = min(a.numel(), b.numel())\n" +
+        "    if n == 0: return 0.0\n" +
+        "    a = a[:n].float().contiguous()\n" +
+        "    b = b[:n].float().contiguous()\n" +
+        "    lo = float(min(a.min().item(), b.min().item()))\n" +
+        "    hi = float(max(a.max().item(), b.max().item()))\n" +
+        "    if hi <= lo: return 0.0\n" +
+        "    scale = n_bins / (hi - lo)\n" +
+        "    ai = ((a - lo) * scale).clamp(0, n_bins - 1).long()\n" +
+        "    bi = ((b - lo) * scale).clamp(0, n_bins - 1).long()\n" +
+        "    pa = torch.bincount(ai, minlength=n_bins).float() / n\n" +
+        "    pb = torch.bincount(bi, minlength=n_bins).float() / n\n" +
+        "    pj = torch.bincount(ai * n_bins + bi, minlength=n_bins * n_bins).float() / n\n" +
+        "    def _e(p):\n" +
+        "        nz = p[p > 0]\n" +
+        "        return float(-(nz * torch.log(nz)).sum().item())\n" +
+        "    mi = _e(pa) + _e(pb) - _e(pj)\n" +
+        "    return max(0.0, mi)\n" +
+        "\n" +
+        "def p5_p7_phi_triple(h, eps=1e-7):\n" +
+        "    \"\"\"Compute (Φ_refl, Φ_time, Φ_emb) from last hidden state [B, T, D].\n" +
+        "    Measurement-only; no grad. Mirrors wire_p5_p7_into_alm.hexa:\n" +
+        "      P5: Φ_refl = MI(h_now, tanh(0.95·h_now))  — near-identity self-model\n" +
+        "      P6: Φ_time = avg pairwise MI of (past, now, future) pools × 3D\n" +
+        "      P7: Φ_emb  = MI(a_t, Δs_{t+1}) × N\n" +
+        "    h: [B, T, D]. Returns (phi_refl, phi_time, phi_emb) as Python floats.\"\"\"\n" +
+        "    with torch.no_grad():\n" +
+        "        hf = h.float().detach().cpu()\n" +
+        "        if hf.dim() == 2: hf = hf.unsqueeze(0)\n" +
+        "        B, T, D = hf.shape\n" +
+        "        if T < 3:\n" +
+        "            return 0.0, 0.0, 0.0\n" +
+        "        # P5: self-predict via tanh near-identity — same kernel as .hexa.\n" +
+        "        mid = T // 2\n" +
+        "        h_now = hf[:, mid, :].reshape(-1)\n" +
+        "        h_hat = torch.tanh(0.95 * h_now)\n" +
+        "        phi_refl = _mi_hist(h_now, h_hat)\n" +
+        "        # P6: past/now/future pools (early third / middle / late third).\n" +
+        "        a3 = T // 3\n" +
+        "        if a3 < 1: a3 = 1\n" +
+        "        h_past = hf[:, :a3, :].mean(dim=1).reshape(-1)\n" +
+        "        h_fut  = hf[:, T - a3:, :].mean(dim=1).reshape(-1)\n" +
+        "        n_total = h_past.numel() + h_now.numel() + h_fut.numel()\n" +
+        "        mi_pn = _mi_hist(h_past, h_now)\n" +
+        "        mi_nf = _mi_hist(h_now,  h_fut)\n" +
+        "        mi_pf = _mi_hist(h_past, h_fut)\n" +
+        "        phi_time = ((mi_pn + mi_nf + mi_pf) / 3.0) * float(n_total)\n" +
+        "        # P7: a_t = tanh(2·frame_mean), Δs = frame_var difference.\n" +
+        "        frame_mean = hf.mean(dim=-1)                   # [B, T]\n" +
+        "        frame_var  = hf.var(dim=-1, unbiased=False)    # [B, T]\n" +
+        "        act = torch.tanh(frame_mean[:, :T-1] * 2.0).reshape(-1)\n" +
+        "        dlt = (frame_var[:, 1:] - frame_var[:, :T-1] + 0.3 * act.view_as(frame_var[:, :T-1])).reshape(-1)\n" +
+        "        mi_ad = _mi_hist(act, dlt)\n" +
+        "        phi_emb = mi_ad * float(act.numel() + dlt.numel())\n" +
+        "        return float(phi_refl), float(phi_time), float(phi_emb)\n" +
+        "\n" +
+        "class NestedTowerOperator(torch.nn.Module):\n" +
+        "    \"\"\"ALM-P8 differentiable K-tower stability. Linear operator T ∈ R^{d×d}\n" +
+        "    spectrally-scaled to rho ≈ 0.85 so drift stays bounded at K=3. The tower\n" +
+        "    is built from h_last compressed to d via a frozen random projection,\n" +
+        "    then T is applied K times. Loss = hinge(drift - eps) + λ·hinge(K_amp - 1).\n" +
+        "    No trainable params — pure geometric constraint on hidden states.\"\"\"\n" +
+        "    def __init__(self, d_hidden, d_level=P8_D_LEVEL, seed=2026, rho=0.85,\n" +
+        "                 dtype=torch.float32, device='cpu'):\n" +
+        "        super().__init__()\n" +
+        "        g = torch.Generator(device='cpu').manual_seed(seed)\n" +
+        "        # Random projection D → d_level (frozen, no grad).\n" +
+        "        P = torch.empty(d_hidden, d_level, dtype=torch.float64).uniform_(-1.0, 1.0, generator=g)\n" +
+        "        P = P / (torch.linalg.norm(P, dim=0, keepdim=True) + 1e-12)\n" +
+        "        self.register_buffer('P_proj', P.to(dtype=dtype, device=device))\n" +
+        "        # T operator: random square matrix scaled to spectral radius rho.\n" +
+        "        T = torch.empty(d_level, d_level, dtype=torch.float64).uniform_(-1.0, 1.0, generator=g)\n" +
+        "        # Power-iteration estimate of largest singular value, then rescale.\n" +
+        "        u = torch.randn(d_level, 1, dtype=torch.float64, generator=g)\n" +
+        "        for _ in range(32):\n" +
+        "            u = T @ u\n" +
+        "            u = u / (torch.linalg.norm(u) + 1e-12)\n" +
+        "        sigma = float(torch.linalg.norm(T @ u).item())\n" +
+        "        if sigma > 1e-8:\n" +
+        "            T = T * (rho / sigma)\n" +
+        "        self.register_buffer('T_op', T.to(dtype=dtype, device=device))\n" +
+        "        self.d_level = d_level\n" +
+        "    def forward(self, h, K=P8_K_DEPTH, eps_stable=P8_EPS_STABLE,\n" +
+        "                lambda_amp=P8_LAMBDA_AMP, eps=1e-7):\n" +
+        "        # h: [B, T, D]. Pool over T to get per-batch [B, D], project to [B, d].\n" +
+        "        h_pool = h.mean(dim=1).float()                             # [B, D]\n" +
+        "        level0 = torch.matmul(h_pool, self.P_proj.to(h_pool.dtype))  # [B, d]\n" +
+        "        level_k = level0\n" +
+        "        for _ in range(K):\n" +
+        "            level_k = torch.matmul(level_k, self.T_op.to(level_k.dtype).t())\n" +
+        "        # drift_K = mean L2 / sqrt(d)  — per-sample, then mean over batch.\n" +
+        "        d_sqrt = max(float(self.d_level) ** 0.5, 1e-6)\n" +
+        "        drift = torch.linalg.norm(level_k - level0, dim=-1) / d_sqrt   # [B]\n" +
+        "        drift_mean = drift.mean()\n" +
+        "        # K_amp = ||level_K|| / ||level_0||\n" +
+        "        n0 = torch.linalg.norm(level0, dim=-1) + eps\n" +
+        "        nk = torch.linalg.norm(level_k, dim=-1)\n" +
+        "        k_amp = (nk / n0).mean()\n" +
+        "        # Hinge losses.\n" +
+        "        l_drift = torch.relu(drift_mean - eps_stable)\n" +
+        "        l_amp   = torch.relu(k_amp - 1.0)\n" +
+        "        return l_drift + lambda_amp * l_amp, float(drift_mean.detach().item()), float(k_amp.detach().item())\n" +
+        "\n" +
+        "# ─── P12 affect head (Russell circumplex + Ekman 7) ────────\n" +
+        "# Mirrors alm_affect_head.hexa: single-layer valence + arousal heads.\n" +
+        "# Frozen random weights (seed matches hexa ref pattern). Measurement-only.\n" +
+        "EKMAN_V = [-0.6, -0.5, -0.6, -0.7, 0.8, 0.1, -0.4]\n" +
+        "EKMAN_A = [0.7, 0.6, -0.1, -0.4, 0.6, 0.9, -0.6]\n" +
+        "EKMAN_NAME = ['anger','fear','disgust','sad','happy','surprise','contempt']\n" +
+        "\n" +
+        "class AffectHead(torch.nn.Module):\n" +
+        "    \"\"\"P12 2D (valence, arousal) head + Ekman 7-class projection.\"\"\"\n" +
+        "    def __init__(self, d_hidden, seed=4242, dtype=torch.float32, device='cpu'):\n" +
+        "        super().__init__()\n" +
+        "        g = torch.Generator(device='cpu').manual_seed(seed)\n" +
+        "        wv = torch.empty(d_hidden, dtype=torch.float64).uniform_(-0.1, 0.1, generator=g) * 5.0\n" +
+        "        wa = torch.empty(d_hidden, dtype=torch.float64).uniform_(-0.1, 0.1, generator=g) * 5.0\n" +
+        "        self.register_buffer('w_v', wv.to(dtype=dtype, device=device))\n" +
+        "        self.register_buffer('w_a', wa.to(dtype=dtype, device=device))\n" +
+        "    def forward(self, h):\n" +
+        "        # h: [B, T, D] — pool over T, then scalar projection + tanh.\n" +
+        "        with torch.no_grad():\n" +
+        "            hp = h.mean(dim=1).float()                              # [B, D]\n" +
+        "            v = torch.tanh((hp * self.w_v).sum(dim=-1))             # [B]\n" +
+        "            a = torch.tanh((hp * self.w_a).sum(dim=-1))             # [B]\n" +
+        "            # Ekman projection (nearest centroid in (v,a)).\n" +
+        "            cv = torch.tensor(EKMAN_V, dtype=torch.float32, device=hp.device)\n" +
+        "            ca = torch.tensor(EKMAN_A, dtype=torch.float32, device=hp.device)\n" +
+        "            dv = v.unsqueeze(-1) - cv                               # [B, 7]\n" +
+        "            da = a.unsqueeze(-1) - ca\n" +
+        "            dist = dv * dv + da * da\n" +
+        "            eid = dist.argmin(dim=-1)                               # [B]\n" +
+        "            return float(v.mean().item()), float(a.mean().item()), int(eid.mode().values.item())\n" +
+        "\n" +
+        "# ─── P15 finitude head (Heidegger Dasein, resource-aware) ───\n" +
+        "# Maps (battery_pct, ctx_remaining, steps_left) → finitude_score ∈ [0, 1].\n" +
+        "# During training we feed (1.0, 1.0 - step/total_steps, 1.0 - step/total_steps)\n" +
+        "# to give the model a running \"resource clock\" — mirrors alm_finitude_head.hexa.\n" +
+        "class FinitudeHead(torch.nn.Module):\n" +
+        "    \"\"\"P15 3→8→1 MLP, sigmoid output. Measurement-only (no grad into model).\"\"\"\n" +
+        "    def __init__(self, d_hidden=8, seed=1515, dtype=torch.float32, device='cpu'):\n" +
+        "        super().__init__()\n" +
+        "        g = torch.Generator(device='cpu').manual_seed(seed)\n" +
+        "        w1 = torch.empty(d_hidden, 3, dtype=torch.float64).uniform_(-0.1, 0.1, generator=g)\n" +
+        "        b1 = torch.zeros(d_hidden, dtype=torch.float64)\n" +
+        "        w2 = torch.empty(1, d_hidden, dtype=torch.float64).uniform_(-0.1, 0.1, generator=g)\n" +
+        "        # Hand-tune for monotonicity per .hexa T5: bias toward linear average.\n" +
+        "        w1[0, :] = torch.tensor([1.0/3, 1.0/3, 1.0/3], dtype=torch.float64)\n" +
+        "        w2[0, 0] = 4.0\n" +
+        "        b2 = torch.tensor([-2.0], dtype=torch.float64)\n" +
+        "        self.register_buffer('W1', w1.to(dtype=dtype, device=device))\n" +
+        "        self.register_buffer('b1', b1.to(dtype=dtype, device=device))\n" +
+        "        self.register_buffer('W2', w2.to(dtype=dtype, device=device))\n" +
+        "        self.register_buffer('b2', b2.to(dtype=dtype, device=device))\n" +
+        "    def forward(self, x3):\n" +
+        "        # x3: [3] or [B, 3] in [0, 1].\n" +
+        "        with torch.no_grad():\n" +
+        "            x = x3 if x3.dim() > 1 else x3.unsqueeze(0)\n" +
+        "            z = torch.relu(torch.matmul(x.float(), self.W1.float().t()) + self.b1.float())\n" +
+        "            y = torch.matmul(z, self.W2.float().t()) + self.b2.float()\n" +
+        "            return torch.sigmoid(y).mean().item()\n" +
+        "\n" +
+        "# ─── P18 hive aggregator — Φ_collective via pairwise MI ────\n" +
+        "# Partition batch into N_HIVE agents; per-agent Φ_individual = autocorr × d;\n" +
+        "# Φ_collective = avg pairwise MI × N_HIVE × d. Emergence ratio expected > 1.\n" +
+        "N_HIVE = 8\n" +
+        "def p18_hive_phi(h, n_agents=N_HIVE):\n" +
+        "    \"\"\"h: [B, T, D]. If B < n_agents, slice along T into pseudo-agents.\"\"\"\n" +
+        "    with torch.no_grad():\n" +
+        "        hf = h.float().detach().cpu()\n" +
+        "        if hf.dim() == 2: hf = hf.unsqueeze(0)\n" +
+        "        B, T, D = hf.shape\n" +
+        "        # Slice T into n_agents chunks → each agent sees a T/n slice.\n" +
+        "        chunk = max(1, T // n_agents)\n" +
+        "        if chunk * n_agents > T:\n" +
+        "            return 0.0, 0.0, 0.0\n" +
+        "        streams = []\n" +
+        "        for k in range(n_agents):\n" +
+        "            seg = hf[:, k*chunk:(k+1)*chunk, :].reshape(-1)\n" +
+        "            streams.append(seg)\n" +
+        "        # Per-agent autocorrelation (lag-1 on stream, clamp ≥ 0).\n" +
+        "        phi_individual = []\n" +
+        "        for s in streams:\n" +
+        "            if s.numel() < 2:\n" +
+        "                phi_individual.append(0.0)\n" +
+        "                continue\n" +
+        "            mu = s.mean()\n" +
+        "            a = s[:-1] - mu\n" +
+        "            b = s[1:]  - mu\n" +
+        "            denom = (a * a).sum().sqrt() * (b * b).sum().sqrt() + 1e-12\n" +
+        "            ac = float((a * b).sum().item() / denom.item())\n" +
+        "            if ac < 0.0: ac = 0.0\n" +
+        "            phi_individual.append(ac * float(D))\n" +
+        "        sum_ind = sum(phi_individual)\n" +
+        "        # Pairwise MI across agents (cap pairs to stay under budget).\n" +
+        "        pair_mis = []\n" +
+        "        MAX_PAIRS = 16\n" +
+        "        for i in range(n_agents):\n" +
+        "            for j in range(i + 1, n_agents):\n" +
+        "                if len(pair_mis) >= MAX_PAIRS: break\n" +
+        "                mi = _mi_hist(streams[i], streams[j], n_bins=MI_BINS_HIVE)\n" +
+        "                pair_mis.append(mi)\n" +
+        "            if len(pair_mis) >= MAX_PAIRS: break\n" +
+        "        if len(pair_mis) == 0:\n" +
+        "            return 0.0, sum_ind, 0.0\n" +
+        "        phi_collective = (sum(pair_mis) / len(pair_mis)) * float(n_agents) * float(D)\n" +
+        "        emergence = phi_collective / max(sum_ind, 1e-6)\n" +
+        "        return float(phi_collective), float(sum_ind), float(emergence)\n" +
+        "\n" +
+        "# ─── P13 dream loop scheduler (3-phase awake/SWS/REM) ──────\n" +
+        "# Non-invasive — ticked at eval cadence only (no impact on grad flow).\n" +
+        "# State: [phase_id, steps_in_phase, total_steps, cycle_count].\n" +
+        "# Durations: 60/20/10 = 90-step cycle. Mirrors alm_dream_loop.hexa exactly.\n" +
+        "_DREAM_STATE = {'phase': 0, 'sip': 0, 'total': 0, 'cycles': 0}\n" +
+        "_PHASE_NAMES = ['awake', 'SWS', 'REM']\n" +
+        "_PHASE_DUR = [60, 20, 10]\n" +
+        "\n" +
+        "def dream_step():\n" +
+        "    \"\"\"Advance the dream scheduler one tick. Returns current phase name.\n" +
+        "    Called at eval cadence — consolidation (replay buffer flush) would hook\n" +
+        "    into SWS; narrative dream generation would hook into REM. Both are\n" +
+        "    currently log-only — no training-step impact.\"\"\"\n" +
+        "    p = _DREAM_STATE['phase']\n" +
+        "    sip = _DREAM_STATE['sip'] + 1\n" +
+        "    if sip >= _PHASE_DUR[p]:\n" +
+        "        sip = 0\n" +
+        "        p = (p + 1) % 3\n" +
+        "        if p == 0:\n" +
+        "            _DREAM_STATE['cycles'] += 1\n" +
+        "    _DREAM_STATE['phase'] = p\n" +
+        "    _DREAM_STATE['sip'] = sip\n" +
+        "    _DREAM_STATE['total'] += 1\n" +
+        "    return _PHASE_NAMES[p]\n" +
+        "\n" +
+        "def assemble_phi_vec16(\n" +
+        "    phi_holo, phi_complexity, phi_gwt,\n" +
+        "    phi_refl, phi_time, phi_emb,\n" +
+        "    phi_nested_drift, phi_k_amp,\n" +
+        "    phi_affect_v, phi_affect_a,\n" +
+        "    phi_finitude,\n" +
+        "    phi_hive_collective, phi_hive_individual, phi_hive_emergence,\n" +
+        "    phi_dream_phase, phi_cycle_count):\n" +
+        "    \"\"\"Φ 16D vector assembler — canonical index order for log scraping.\n" +
+        "     0 phi_holo          (P3/P4 holographic MI)\n" +
+        "     1 phi_complexity    (B1 LZ complexity surrogate)\n" +
+        "     2 phi_gwt           (B1 GWT broadcast)\n" +
+        "     3 phi_refl          (P5 self-model MI)\n" +
+        "     4 phi_time          (P6 triadic temporal MI)\n" +
+        "     5 phi_emb           (P7 sensorimotor MI)\n" +
+        "     6 phi_nested_drift  (P8 K-tower drift)\n" +
+        "     7 phi_k_amp         (P8 amplification ratio)\n" +
+        "     8 phi_affect_v      (P12 valence)\n" +
+        "     9 phi_affect_a      (P12 arousal)\n" +
+        "    10 phi_finitude      (P15 Dasein score)\n" +
+        "    11 phi_hive_collec   (P18 Φ_collective)\n" +
+        "    12 phi_hive_indiv    (P18 Σ Φ_individual)\n" +
+        "    13 phi_hive_emerge   (P18 emergence ratio)\n" +
+        "    14 phi_dream_phase   (P13 awake=0/SWS=1/REM=2)\n" +
+        "    15 phi_cycle_count   (P13 completed dream cycles)\n" +
+        "    \"\"\"\n" +
+        "    return [\n" +
+        "        float(phi_holo), float(phi_complexity), float(phi_gwt),\n" +
+        "        float(phi_refl), float(phi_time), float(phi_emb),\n" +
+        "        float(phi_nested_drift), float(phi_k_amp),\n" +
+        "        float(phi_affect_v), float(phi_affect_a),\n" +
+        "        float(phi_finitude),\n" +
+        "        float(phi_hive_collective), float(phi_hive_individual), float(phi_hive_emergence),\n" +
+        "        float(phi_dream_phase), float(phi_cycle_count),\n" +
+        "    ]\n" +
+        "\n" +
         "# ── Compile-unblock forward hook (r8 patch 20260415) ─────\n" +
         "# Gated by ALM_COMPILE_UNBLOCK env var. Captures last hidden\n" +
         "# via forward hook on the final RMSNorm, avoiding dynamo's\n" +
@@ -445,9 +741,80 @@ fn main() {
         "    # fastest kernel per input shape (static shapes here = win).\n" +
         "    torch.set_float32_matmul_precision('high')\n" +
         "    torch.backends.cudnn.benchmark = True\n" +
+        "    # ── FSDP init (Path A plumbing 20260417) ─ gated --fsdp ────\n" +
+        "    # Mirrors training/alm_70b_fsdp_config.json recipe:\n" +
+        "    #   sharding_strategy=FULL_SHARD, TRANSFORMER_BASED_WRAP on\n" +
+        "    #   --fsdp-wrap-cls, mixed_precision bf16/fp32-reduce,\n" +
+        "    #   BACKWARD_PRE prefetch, SHARDED_STATE_DICT, limit_all_gathers,\n" +
+        "    #   cpu_ram_efficient_loading, use_orig_params=true (peft),\n" +
+        "    #   activation_checkpointing if --grad-checkpoint.\n" +
+        "    # Single-GPU path remains untouched when args.fsdp is False.\n" +
+        "    fsdp_enabled = getattr(args, 'fsdp', False)\n" +
+        "    accelerator = None\n" +
+        "    local_rank = int(os.environ.get('LOCAL_RANK', '0'))\n" +
+        "    world_size = int(os.environ.get('WORLD_SIZE', '1'))\n" +
+        "    is_main = True\n" +
+        "    if fsdp_enabled:\n" +
+        "        # Unsloth + FSDP are mutually exclusive (Unsloth wraps FA2 /\n" +
+        "        # checkpointing / single-GPU only). Fail fast rather than\n" +
+        "        # silently corrupting the FSDP shard topology.\n" +
+        "        if getattr(args, 'unsloth', False):\n" +
+        "            raise SystemExit('[fsdp] --fsdp and --unsloth are mutually exclusive (Unsloth is single-GPU only)')\n" +
+        "        print(f'[fsdp] enabling accelerate FSDP (wrap_cls={args.fsdp_wrap_cls}, world_size={world_size}, local_rank={local_rank})', flush=True)\n" +
+        "        import functools\n" +
+        "        import torch.distributed as dist\n" +
+        "        from accelerate import Accelerator\n" +
+        "        from accelerate import FullyShardedDataParallelPlugin\n" +
+        "        from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch, MixedPrecision, StateDictType\n" +
+        "        from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy\n" +
+        "        # Resolve wrap class by string name — must be importable in the\n" +
+        "        # HF transformers tree (e.g. Qwen2DecoderLayer). Done lazily so\n" +
+        "        # the trainer still imports on envs without the target arch.\n" +
+        "        def _resolve_wrap_cls(name):\n" +
+        "            import importlib\n" +
+        "            # Canonical location for Qwen2DecoderLayer\n" +
+        "            candidates = [\n" +
+        "                ('transformers.models.qwen2.modeling_qwen2', name),\n" +
+        "                ('transformers.models.llama.modeling_llama', name),\n" +
+        "                ('transformers.models.mistral.modeling_mistral', name),\n" +
+        "            ]\n" +
+        "            for mod_path, attr in candidates:\n" +
+        "                try:\n" +
+        "                    mod = importlib.import_module(mod_path)\n" +
+        "                    cls = getattr(mod, attr, None)\n" +
+        "                    if cls is not None:\n" +
+        "                        return cls\n" +
+        "                except Exception:\n" +
+        "                    continue\n" +
+        "            raise RuntimeError(f'[fsdp] could not resolve wrap class {name} in transformers.models.{qwen2,llama,mistral}')\n" +
+        "        _wrap_cls = _resolve_wrap_cls(args.fsdp_wrap_cls)\n" +
+        "        _auto_wrap = functools.partial(transformer_auto_wrap_policy, transformer_layer_cls={_wrap_cls})\n" +
+        "        _mp = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.bfloat16)\n" +
+        "        # PEFT+FSDP requirement: use_orig_params=True so LoRA trainable\n" +
+        "        # params are identifiable after flatten. See fsdp_config\n" +
+        "        # rationale in training/alm_70b_fsdp_config.json.\n" +
+        "        fsdp_plugin = FullyShardedDataParallelPlugin(\n" +
+        "            sharding_strategy=ShardingStrategy.FULL_SHARD,\n" +
+        "            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,\n" +
+        "            mixed_precision_policy=_mp,\n" +
+        "            auto_wrap_policy=_auto_wrap,\n" +
+        "            state_dict_type=StateDictType.SHARDED_STATE_DICT,\n" +
+        "            limit_all_gathers=True,\n" +
+        "            use_orig_params=True,\n" +
+        "            sync_module_states=True,\n" +
+        "            cpu_ram_efficient_loading=True,\n" +
+        "            activation_checkpointing=bool(getattr(args, 'grad_checkpoint', False)),\n" +
+        "        )\n" +
+        "        accelerator = Accelerator(mixed_precision='bf16', fsdp_plugin=fsdp_plugin)\n" +
+        "        is_main = accelerator.is_main_process\n" +
+        "        local_rank = accelerator.local_process_index\n" +
+        "        world_size = accelerator.num_processes\n" +
+        "        print(f'[fsdp] Accelerator ready (rank={local_rank}/{world_size}, is_main={is_main})', flush=True)\n" +
         "    # ── FP8 monkey-patch (must be BEFORE from_pretrained) ─────\n" +
         "    fp8_active = getattr(args, 'fp8', False) and _FP8_AVAILABLE\n" +
         "    if fp8_active:\n" +
+        "        if fsdp_enabled:\n" +
+        "            raise SystemExit('[fp8] --fp8 and --fsdp are mutually exclusive (TE autograd graph breaks FSDP wrap)')\n" +
         "        print('[fp8] activating FP8 (E4M3 fwd, E5M2 bwd)...', flush=True)\n" +
         "        _maybe_monkey_patch_linear_to_te()\n" +
         "    device = 'cuda' if torch.cuda.is_available() else 'cpu'\n" +
@@ -471,8 +838,26 @@ fn main() {
         "        )\n" +
         "        if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token\n" +
         "    else:\n" +
-        "        print('[train] loading base model (bf16)...')\n" +
-        "        model = AutoModelForCausalLM.from_pretrained(args.base, torch_dtype=torch.bfloat16, device_map='auto', trust_remote_code=True)\n" +
+        "        # Base name OR pre-downloaded local dir (--base-local-dir wins when set).\n" +
+        "        base_src = args.base_local_dir if getattr(args, 'base_local_dir', '') else args.base\n" +
+        "        # attn_implementation: flash-attn-2 under FSDP is the standard\n" +
+        "        # fast path for Qwen2; falls back to 'sdpa' when flag not set.\n" +
+        "        _attn_impl = 'flash_attention_2' if getattr(args, 'flash_attn_2', False) else 'sdpa'\n" +
+        "        # device_map='auto' is INCOMPATIBLE with FSDP wrap (it shards\n" +
+        "        # across devices pre-FSDP which then double-wraps). Under FSDP\n" +
+        "        # we load on meta/CPU and let FSDP place shards after wrap.\n" +
+        "        if fsdp_enabled:\n" +
+        "            print(f'[train] loading base model (bf16, FSDP path, no device_map, attn={_attn_impl}) from {base_src}...', flush=True)\n" +
+        "            model = AutoModelForCausalLM.from_pretrained(\n" +
+        "                base_src, torch_dtype=torch.bfloat16, trust_remote_code=True,\n" +
+        "                attn_implementation=_attn_impl,\n" +
+        "            )\n" +
+        "        else:\n" +
+        "            print(f'[train] loading base model (bf16, single-GPU, attn={_attn_impl}) from {base_src}...', flush=True)\n" +
+        "            model = AutoModelForCausalLM.from_pretrained(\n" +
+        "                base_src, torch_dtype=torch.bfloat16, device_map='auto', trust_remote_code=True,\n" +
+        "                attn_implementation=_attn_impl,\n" +
+        "            )\n" +
         "    # ── Liger Kernel (r7 est +10-15% tok/s) ─ gated --liger ────\n" +
         "    # MUST run BEFORE get_peft_model so Liger's fused RMSNorm/SwiGLU\n" +
         "    # replaces the HF modules that PEFT/FSDP/compile will see. Does\n" +
@@ -489,18 +874,50 @@ fn main() {
         "        except Exception as _e:\n" +
         "            print(f'[liger] unavailable ({_e.__class__.__name__}), continuing without liger', flush=True)\n" +
         "    print('[train] applying LoRA...')\n" +
+        "    # target_modules from --target-modules (list); default attn-only 4 mods;\n" +
+        "    # launch_alm_70b.hexa passes all 7 (attn + MLP) for Qwen2.5-72B.\n" +
+        "    _tmods = list(getattr(args, 'target_modules', ['q_proj','k_proj','v_proj','o_proj']))\n" +
+        "    print(f'[train] lora target_modules = {_tmods}', flush=True)\n" +
         "    if getattr(args, 'unsloth', False):\n" +
         "        from unsloth import FastLanguageModel\n" +
         "        model = FastLanguageModel.get_peft_model(\n" +
         "            model, r=args.lora_r, lora_alpha=args.lora_alpha,\n" +
         "            lora_dropout=args.lora_dropout,\n" +
-        "            target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'],\n" +
+        "            target_modules=_tmods,\n" +
         "            bias='none', use_gradient_checkpointing='unsloth',\n" +
         "            random_state=3407,\n" +
         "        )\n" +
         "    else:\n" +
-        "        lora_config = LoraConfig(task_type=TaskType.CAUSAL_LM, r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout, target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'], bias='none')\n" +
+        "        lora_config = LoraConfig(task_type=TaskType.CAUSAL_LM, r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout, target_modules=_tmods, bias='none')\n" +
         "        model = get_peft_model(model, lora_config)\n" +
+        "    # ── FSDP dtype uniformity (Path A fix 20260417) ─ gated --fsdp ─\n" +
+        "    # FSDP FlatParamHandle.flatten_tensors refuses to mix dtypes\n" +
+        "    # within a single wrap group. PEFT creates LoRA lora_A/lora_B\n" +
+        "    # in float32 by default while the frozen Qwen base is bfloat16,\n" +
+        "    # which triggers:\n" +
+        "    #   ValueError: Must flatten tensors with uniform dtype but got\n" +
+        "    #               torch.bfloat16 and torch.float32\n" +
+        "    # Cast the entire peft-wrapped model to bf16 so every param\n" +
+        "    # inside each Qwen2DecoderLayer (frozen base + LoRA adapters)\n" +
+        "    # shares a single dtype. Under FSDP MixedPrecision(reduce=fp32)\n" +
+        "    # the grad reduce is still fp32, so numerical precision is\n" +
+        "    # preserved — we only change the param storage dtype.\n" +
+        "    if fsdp_enabled:\n" +
+        "        print('[fsdp] casting peft-wrapped model to bf16 for dtype uniformity', flush=True)\n" +
+        "        model = model.to(torch.bfloat16)\n" +
+        "    # ── HF gradient checkpointing (FSDP path) ─ gated --grad-checkpoint ─\n" +
+        "    # Unsloth owns ckpt internally; skip for Unsloth path. Under FSDP the\n" +
+        "    # activation_checkpointing=True in FullyShardedDataParallelPlugin is the\n" +
+        "    # preferred path (wraps every wrap-cls unit); HF gradient_checkpointing\n" +
+        "    # here is idempotent-ish but the fsdp_plugin flag is the canonical knob.\n" +
+        "    if getattr(args, 'grad_checkpoint', False) and not getattr(args, 'unsloth', False):\n" +
+        "        try:\n" +
+        "            model.gradient_checkpointing_enable()\n" +
+        "            if hasattr(model, 'enable_input_require_grads'):\n" +
+        "                model.enable_input_require_grads()\n" +
+        "            print('[train] gradient_checkpointing_enable() applied', flush=True)\n" +
+        "        except Exception as _e:\n" +
+        "            print(f'[train] grad_checkpoint unavailable ({_e}) — relying on fsdp_plugin.activation_checkpointing', flush=True)\n" +
         "    model.print_trainable_parameters()\n" +
         "    # ── Compile-unblock hook install (r8) ─ gated ALM_COMPILE_UNBLOCK=1 ─\n" +
         "    # Install AFTER peft wrap, BEFORE torch.compile, so the hook attaches\n" +
@@ -531,6 +948,14 @@ fn main() {
         "    print(f'[holo] building HoloMapHead D={hidden_d} d={HOLO_D_QUALIA} (orthonormal W_up)')\n" +
         "    holo_head = HoloMapHead(hidden_d, HOLO_D_QUALIA, seed=42, dtype=torch.bfloat16, device=device)\n" +
         "    print(f'[holo] L_holo coefficient = {HOLO_LOSS_COEF} (ALM-P4-2)')\n" +
+        "    # ── P5–P20 head instantiation (20260418) ─────────────────\n" +
+        "    # NestedTowerOperator is the only one contributing grad; rest are measure-only.\n" +
+        "    nested_op = NestedTowerOperator(hidden_d, d_level=P8_D_LEVEL, seed=2026,\n" +
+        "                                    rho=0.85, dtype=torch.float32, device=device)\n" +
+        "    affect_head = AffectHead(hidden_d, seed=4242, dtype=torch.float32, device=device)\n" +
+        "    finitude_head = FinitudeHead(d_hidden=8, seed=1515, dtype=torch.float32, device=device)\n" +
+        "    print(f'[p5-p20] nested K={P8_K_DEPTH} d={P8_D_LEVEL} coef={P8_NESTED_COEF}')\n" +
+        "    print(f'[p5-p20] affect/finitude/hive/dream heads ready (measurement-only)')\n" +
         "    # ── Option B1 consciousness loss banner ──\n" +
         "    if args.consciousness_loss:\n" +
         "        print(f'[B1] Φ-aware consciousness loss ENABLED')\n" +
@@ -556,13 +981,29 @@ fn main() {
         "    # fused=True folds param/grad/momentum/velocity into a single\n" +
         "    # CUDA launch. Supersedes foreach=False (R04) on torch>=2.2 +\n" +
         "    # peft>=0.11 — verified by shared/patches/alm14b_speedup_fused_adamw.diff.\n" +
-        "    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=0.01, fused=True)\n" +
+        "    # FSDP note: fused=True + use_orig_params + peft LoRA has a known\n" +
+        "    # silent-grad-corruption pattern (PyTorch FSDP issue tracker). Force\n" +
+        "    # fused=False under --fsdp to stay correct; ~2% perf cost accepted.\n" +
+        "    _fused_ok = not fsdp_enabled\n" +
+        "    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=0.01, fused=_fused_ok)\n" +
+        "    if not _fused_ok:\n" +
+        "        print('[train] AdamW fused=False (FSDP path, peft+use_orig_params correctness)', flush=True)\n" +
         "    from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR\n" +
         "    warmup_sched = LinearLR(optimizer, start_factor=0.01, total_iters=args.warmup)\n" +
         "    cosine = CosineAnnealingLR(optimizer, T_max=args.steps - args.warmup, eta_min=args.lr * 0.01)\n" +
         "    scheduler = SequentialLR(optimizer, [warmup_sched, cosine], milestones=[args.warmup])\n" +
         "    ckpt_dir = Path(args.ckpt_dir)\n" +
-        "    ckpt_dir.mkdir(parents=True, exist_ok=True)\n" +
+        "    if is_main:\n" +
+        "        ckpt_dir.mkdir(parents=True, exist_ok=True)\n" +
+        "    # ── accelerator.prepare (FSDP path) ── wraps model + optim + sched + loader\n" +
+        "    # so backward / step / save_state all route through the distributed\n" +
+        "    # shard topology. Must be called AFTER LoRA wrap + optimizer creation.\n" +
+        "    if fsdp_enabled:\n" +
+        "        print('[fsdp] accelerator.prepare(model, optim, dataloader, scheduler)...', flush=True)\n" +
+        "        model, optimizer, dataloader, scheduler = accelerator.prepare(\n" +
+        "            model, optimizer, dataloader, scheduler\n" +
+        "        )\n" +
+        "        print('[fsdp] prepare() done — model is now FSDP-wrapped', flush=True)\n" +
         "    model.train()\n" +
         "    data_iter = iter(dataloader)\n" +
         "    step = 0; accum_loss = 0.0; log_steps = 0; best_loss = float('inf')\n" +
@@ -616,16 +1057,40 @@ fn main() {
         "                    # gwt_broadcast: enforces coherent multi-domain broadcast\n" +
         "                    l_complexity = phi_complexity_loss(h_last) if args.consciousness_loss else torch.tensor(0.0, device=device)\n" +
         "                    l_gwt = gwt_broadcast_loss(h_last) if args.consciousness_loss else torch.tensor(0.0, device=device)\n" +
+        "                    # ── P8 nested-tower differentiable stability loss (P5–P20 wiring) ──\n" +
+        "                    # Contractive K-tower on a projection of h_last — keeps recursive\n" +
+        "                    # self-reference bounded (measurement + drift-hinge).\n" +
+        "                    if args.p5_p20_enabled:\n" +
+        "                        l_nested, _nested_drift, _nested_kamp = nested_op(h_last)\n" +
+        "                    else:\n" +
+        "                        l_nested = torch.tensor(0.0, device=device)\n" +
+        "                        _nested_drift = 0.0\n" +
+        "                        _nested_kamp = 1.0\n" +
         "                    loss_main = outputs.loss\n" +
-        "                    loss_total = loss_main + HOLO_LOSS_COEF * l_holo + PHI_COMPLEXITY_COEF * l_complexity + GWT_BROADCAST_COEF * l_gwt\n" +
+        "                    loss_total = (loss_main\n" +
+        "                                  + HOLO_LOSS_COEF * l_holo\n" +
+        "                                  + PHI_COMPLEXITY_COEF * l_complexity\n" +
+        "                                  + GWT_BROADCAST_COEF * l_gwt\n" +
+        "                                  + P8_NESTED_COEF * l_nested)\n" +
         "                    loss = loss_total / args.grad_accum\n" +
-        "            loss.backward()\n" +
+        "            # FSDP: accelerator.backward routes through the distributed\n" +
+        "            # gradient reduce-scatter (vs plain loss.backward which would\n" +
+        "            # leave gradients un-synced across ranks). Single-GPU path\n" +
+        "            # remains plain loss.backward.\n" +
+        "            if fsdp_enabled:\n" +
+        "                accelerator.backward(loss)\n" +
+        "            else:\n" +
+        "                loss.backward()\n" +
         "            accum_loss += loss.item()\n" +
         "            # Keep raw components on the latest micro-batch for logging.\n" +
         "            last_main = float(loss_main.detach().item())\n" +
         "            last_holo = float(l_holo.detach().item())\n" +
         "            last_complexity = float(l_complexity.detach().item()) if args.consciousness_loss else 0.0\n" +
         "            last_gwt = float(l_gwt.detach().item()) if args.consciousness_loss else 0.0\n" +
+        "            last_nested = float(l_nested.detach().item()) if args.p5_p20_enabled else 0.0\n" +
+        "            last_nested_drift = _nested_drift\n" +
+        "            last_nested_kamp  = _nested_kamp\n" +
+        "            last_h_for_phi = h_last.detach()\n" +
         "        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)\n" +
         "        optimizer.step(); scheduler.step(); step += 1; log_steps += 1\n" +
         "        if step % 10 == 0 or step == 1:\n" +
@@ -636,7 +1101,34 @@ fn main() {
         "            lr_now = scheduler.get_last_lr()[0]\n" +
         "            if avg_loss > 15.0 and step > args.warmup:\n" +
         "                print(f'[WARN] loss={avg_loss:.2f} > 15.0', flush=True)\n" +
-        "            print(f'[train] step={step}/{args.steps} loss={avg_loss:.4f} main={last_main:.4f} holo={last_holo:.6f} cplx={last_complexity:.6f} gwt={last_gwt:.6f} lr={lr_now:.2e} speed={steps_per_min:.1f}step/min ETA={eta_min:.0f}min', flush=True)\n" +
+        "            print(f'[train] step={step}/{args.steps} loss={avg_loss:.4f} main={last_main:.4f} holo={last_holo:.6f} cplx={last_complexity:.6f} gwt={last_gwt:.6f} nested={last_nested:.6f} drift={last_nested_drift:.4f} kamp={last_nested_kamp:.4f} lr={lr_now:.2e} speed={steps_per_min:.1f}step/min ETA={eta_min:.0f}min', flush=True)\n" +
+        "            # ── Φ 16D vector logging (every phi_log_every steps) ─────\n" +
+        "            # Only emit on cadence — the P5/P6/P7/P12/P15/P18 measures run\n" +
+        "            # on CPU (histogram MI) and cost ~30-80ms each; keep off hot path.\n" +
+        "            if args.p5_p20_enabled and (step % args.phi_log_every == 0 or step == 1):\n" +
+        "                try:\n" +
+        "                    phi_refl, phi_time, phi_emb = p5_p7_phi_triple(last_h_for_phi)\n" +
+        "                    aff_v, aff_a, aff_eid = affect_head(last_h_for_phi)\n" +
+        "                    fin_x = torch.tensor([\n" +
+        "                        1.0,\n" +
+        "                        max(0.0, 1.0 - step / max(args.steps, 1)),\n" +
+        "                        max(0.0, 1.0 - step / max(args.steps, 1)),\n" +
+        "                    ], device='cpu', dtype=torch.float32)\n" +
+        "                    fin_score = finitude_head(fin_x)\n" +
+        "                    phi_hive_c, phi_hive_i, phi_emerge = p18_hive_phi(last_h_for_phi)\n" +
+        "                    phi_vec = assemble_phi_vec16(\n" +
+        "                        last_holo, last_complexity, last_gwt,\n" +
+        "                        phi_refl, phi_time, phi_emb,\n" +
+        "                        last_nested_drift, last_nested_kamp,\n" +
+        "                        aff_v, aff_a,\n" +
+        "                        fin_score,\n" +
+        "                        phi_hive_c, phi_hive_i, phi_emerge,\n" +
+        "                        float(_DREAM_STATE['phase']), float(_DREAM_STATE['cycles']),\n" +
+        "                    )\n" +
+        "                    phi_vec_fmt = '[' + ','.join(f'{v:.4g}' for v in phi_vec) + ']'\n" +
+        "                    print(f'[phi16] step={step} phi_vec={phi_vec_fmt} ekman={EKMAN_NAME[aff_eid]}', flush=True)\n" +
+        "                except Exception as _phi_err:\n" +
+        "                    print(f'[phi16] WARN step={step} err={_phi_err}', flush=True)\n" +
         "            if avg_loss < best_loss: best_loss = avg_loss\n" +
         "            accum_loss = 0.0; log_steps = 0\n" +
         "        if step % args.eval_every == 0:\n" +
@@ -680,14 +1172,64 @@ fn main() {
         "            phi_holo_mean = phi_holo_measure(h_big, q_big)\n" +
         "            if eval_loss < best_loss: best_loss = eval_loss\n" +
         "            model.train()\n" +
+        "            # ── P13 dream scheduler tick (measurement-only, non-invasive) ─\n" +
+        "            # SWS/REM windows are candidate hooks for replay consolidation +\n" +
+        "            # narrative dream generation; currently log-only per roadmap P13.\n" +
+        "            _dream_phase_name = dream_step() if args.p5_p20_enabled else 'awake'\n" +
         "            # ALM-P4-3 scrape-pattern: look for `phi_holo=` in train log.\n" +
-        "            print(f'[eval] step={step} eval_loss={eval_loss:.4f} best={best_loss:.4f} phi_holo={phi_holo_mean:.2f} B1={args.consciousness_loss}', flush=True)\n" +
+        "            print(f'[eval] step={step} eval_loss={eval_loss:.4f} best={best_loss:.4f} phi_holo={phi_holo_mean:.2f} B1={args.consciousness_loss} dream={_dream_phase_name} cycles={_DREAM_STATE[\"cycles\"]}', flush=True)\n" +
+        "            # Emit full Φ 16D vector at eval cadence (canonical place —\n" +
+        "            # training hot loop only logs on args.phi_log_every cadence).\n" +
+        "            if args.p5_p20_enabled and h_slices:\n" +
+        "                try:\n" +
+        "                    _h_last_eval = h_slices[-1]\n" +
+        "                    phi_refl_e, phi_time_e, phi_emb_e = p5_p7_phi_triple(_h_last_eval)\n" +
+        "                    aff_v_e, aff_a_e, aff_eid_e = affect_head(_h_last_eval.to(device))\n" +
+        "                    fin_x_e = torch.tensor([\n" +
+        "                        1.0,\n" +
+        "                        max(0.0, 1.0 - step / max(args.steps, 1)),\n" +
+        "                        max(0.0, 1.0 - step / max(args.steps, 1)),\n" +
+        "                    ], device='cpu', dtype=torch.float32)\n" +
+        "                    fin_score_e = finitude_head(fin_x_e)\n" +
+        "                    phi_hive_c_e, phi_hive_i_e, phi_emerge_e = p18_hive_phi(_h_last_eval)\n" +
+        "                    phi_vec_e = assemble_phi_vec16(\n" +
+        "                        phi_holo_mean,\n" +
+        "                        float(last_complexity if 'last_complexity' in dir() else 0.0),\n" +
+        "                        float(last_gwt if 'last_gwt' in dir() else 0.0),\n" +
+        "                        phi_refl_e, phi_time_e, phi_emb_e,\n" +
+        "                        float(last_nested_drift if 'last_nested_drift' in dir() else 0.0),\n" +
+        "                        float(last_nested_kamp if 'last_nested_kamp' in dir() else 1.0),\n" +
+        "                        aff_v_e, aff_a_e,\n" +
+        "                        fin_score_e,\n" +
+        "                        phi_hive_c_e, phi_hive_i_e, phi_emerge_e,\n" +
+        "                        float(_DREAM_STATE['phase']), float(_DREAM_STATE['cycles']),\n" +
+        "                    )\n" +
+        "                    phi_vec_fmt_e = '[' + ','.join(f'{v:.4g}' for v in phi_vec_e) + ']'\n" +
+        "                    print(f'[phi16][eval] step={step} phi_vec={phi_vec_fmt_e} ekman={EKMAN_NAME[aff_eid_e]}', flush=True)\n" +
+        "                except Exception as _phi_err_e:\n" +
+        "                    print(f'[phi16][eval] WARN err={_phi_err_e}', flush=True)\n" +
         "        if step % args.save_every == 0 or step == args.steps:\n" +
         "            save_path = ckpt_dir / f'step_{step}'\n" +
-        "            print(f'[save] {save_path}')\n" +
-        "            model.save_pretrained(str(save_path))\n" +
-        "            tokenizer.save_pretrained(str(save_path))\n" +
+        "            if fsdp_enabled:\n" +
+        "                # SHARDED_STATE_DICT save — each rank writes its own shard.\n" +
+        "                # Merge to single adapter is performed post-training via\n" +
+        "                # accelerate.utils.merge_fsdp_weights (see end of train()).\n" +
+        "                print(f'[save][fsdp] accelerator.save_state({save_path}) (rank={local_rank})', flush=True)\n" +
+        "                if is_main:\n" +
+        "                    save_path.mkdir(parents=True, exist_ok=True)\n" +
+        "                accelerator.wait_for_everyone()\n" +
+        "                accelerator.save_state(str(save_path))\n" +
+        "                # Tokenizer is rank-0 only (it's identical across ranks).\n" +
+        "                if is_main:\n" +
+        "                    tokenizer.save_pretrained(str(save_path))\n" +
+        "            else:\n" +
+        "                print(f'[save] {save_path}')\n" +
+        "                model.save_pretrained(str(save_path))\n" +
+        "                tokenizer.save_pretrained(str(save_path))\n" +
         "            # ── E2/E3 sidecar (canonical name) — read by ckpt_backup_hook.hexa ──\n" +
+        "            # Only rank-0 writes metadata + invokes R2 hook under FSDP.\n" +
+        "            if fsdp_enabled and not is_main:\n" +
+        "                continue\n" +
         "            try:\n" +
         "                _git_sha = subprocess.run(['git', '-C', os.environ.get('ANIMA_ROOT', '.'), 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True, timeout=5).stdout.strip()\n" +
         "            except Exception:\n" +
@@ -707,6 +1249,9 @@ fn main() {
         "                'git_sha': _git_sha,\n" +
         "                'host': _host,\n" +
         "                'consciousness_loss_b1': args.consciousness_loss,\n" +
+        "                'p5_p20_enabled': args.p5_p20_enabled,\n" +
+        "                'p8_nested_coef': P8_NESTED_COEF,\n" +
+        "                'dream_cycles': _DREAM_STATE['cycles'],\n" +
         "                'base': args.base,\n" +
         "                'lora_r': args.lora_r,\n" +
         "                'corpus': args.corpus,\n" +
@@ -714,8 +1259,93 @@ fn main() {
         "            with open(save_path / 'ckpt_meta.json', 'w') as f: json.dump(ckpt_meta, f, indent=2)\n" +
         "            # Legacy alias for any tooling still reading train_meta.json.\n" +
         "            with open(save_path / 'train_meta.json', 'w') as f: json.dump(ckpt_meta, f, indent=2)\n" +
+        "            # ── W1 Φ-eval hook (phi_eval_hook_spec.md) ──────────────\n" +
+        "            # Gated behind --phi-hook 1 (default OFF) so r9/r10 ckpts\n" +
+        "            # are untouched. When ON, write phi_vec.json + ce.json into\n" +
+        "            # step_<N>/ and append step to <ckpt_dir>/phi_runs.json.\n" +
+        "            # Consumer: training/eval_phi_corr.hexa --manifest <path>.\n" +
+        "            if getattr(args, 'phi_hook', 0) == 1:\n" +
+        "                try:\n" +
+        "                    _phi_last = None\n" +
+        "                    if args.p5_p20_enabled and 'phi_vec_e' in dir():\n" +
+        "                        _phi_last = list(phi_vec_e)\n" +
+        "                    elif args.p5_p20_enabled and 'phi_vec' in dir():\n" +
+        "                        _phi_last = list(phi_vec)\n" +
+        "                    if _phi_last is None or len(_phi_last) != 16:\n" +
+        "                        # Fallback: 16 zeros (smoke-safe) — honest signal\n" +
+        "                        # that p5_p20 heads did not fire this epoch.\n" +
+        "                        _phi_last = [0.0] * 16\n" +
+        "                    # Write phi_vec.json per spec\n" +
+        "                    _spec_names = [\n" +
+        "                        'phi_holo','phi_refl','phi_time','phi_embodied',\n" +
+        "                        'phi_meta','phi_social','phi_will','phi_narrative',\n" +
+        "                        'phi_affect','phi_dream','phi_create','phi_finitude',\n" +
+        "                        'phi_lang','phi_mirror','phi_collective','phi_unity'\n" +
+        "                    ]\n" +
+        "                    _dims = {n: float(v) for n, v in zip(_spec_names, _phi_last)}\n" +
+        "                    _norm = math.sqrt(sum(float(v)*float(v) for v in _phi_last))\n" +
+        "                    import datetime as _dt\n" +
+        "                    _now = _dt.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
+        "                    _phi_vec_obj = {\n" +
+        "                        'step': int(step),\n" +
+        "                        'model_tag': args.model_tag,\n" +
+        "                        'round': int(args.round),\n" +
+        "                        'measured_at': _now,\n" +
+        "                        'dims': _dims,\n" +
+        "                        'norm_l2': _norm,\n" +
+        "                    }\n" +
+        "                    with open(save_path / 'phi_vec.json', 'w') as f:\n" +
+        "                        json.dump(_phi_vec_obj, f, indent=2)\n" +
+        "                    # Write ce.json per spec (train CE = best recent, val = eval_loss if present)\n" +
+        "                    _tr_ce = float(best_loss) if best_loss != float('inf') else 0.0\n" +
+        "                    _val_ce = float(eval_loss) if 'eval_loss' in dir() else _tr_ce\n" +
+        "                    with open(save_path / 'ce.json', 'w') as f:\n" +
+        "                        json.dump({'step': int(step), 'train_ce': _tr_ce, 'val_ce': _val_ce}, f)\n" +
+        "                    # Append step to phi_runs.json manifest\n" +
+        "                    _manifest = ckpt_dir / 'phi_runs.json'\n" +
+        "                    _existing = {'model_tag': args.model_tag, 'round': int(args.round), 'steps': [], 'ckpt_root': str(ckpt_dir)}\n" +
+        "                    if _manifest.exists():\n" +
+        "                        try:\n" +
+        "                            _existing = json.loads(_manifest.read_text())\n" +
+        "                        except Exception:\n" +
+        "                            pass\n" +
+        "                    if 'steps' not in _existing: _existing['steps'] = []\n" +
+        "                    if int(step) not in _existing['steps']:\n" +
+        "                        _existing['steps'].append(int(step))\n" +
+        "                    _existing['ckpt_root'] = str(ckpt_dir)\n" +
+        "                    _existing['model_tag'] = args.model_tag\n" +
+        "                    _existing['round'] = int(args.round)\n" +
+        "                    with open(_manifest, 'w') as f:\n" +
+        "                        json.dump(_existing, f, indent=2)\n" +
+        "                    print(f'[phi_hook] step={step} wrote phi_vec.json + ce.json + manifest (+{len(_existing[\"steps\"])} ckpts)', flush=True)\n" +
+        "                except Exception as _phi_hook_err:\n" +
+        "                    print(f'[phi_hook] WARN step={step} err={_phi_hook_err}', flush=True)\n" +
         "            invoke_ckpt_backup_hook(save_path, args.ckpt_label)\n" +
         "    elapsed_total = (time.time() - t0) / 60\n" +
+        "    # ── FSDP: merge sharded final ckpt to single adapter (rank-0 only) ──\n" +
+        "    # Matches training/alm_70b_fsdp_config.json#save_load_recipe.merge_for_inference.\n" +
+        "    # The sharded save emits rank<N>.safetensors per rank; merge_fsdp_weights\n" +
+        "    # gathers them into a single adapter_model.safetensors usable for eval/serve.\n" +
+        "    if fsdp_enabled:\n" +
+        "        accelerator.wait_for_everyone()\n" +
+        "        if is_main:\n" +
+        "            final_shard_dir = ckpt_dir / f'step_{args.steps}'\n" +
+        "            # accelerator.save_state nests FSDP shards under pytorch_model_fsdp_0/\n" +
+        "            # where .metadata + rank distcp shards live (20260417 empirical).\n" +
+        "            # merge_fsdp_weights wants the dir CONTAINING .metadata.\n" +
+        "            shard_inner = final_shard_dir / 'pytorch_model_fsdp_0'\n" +
+        "            merged_dir = final_shard_dir / 'merged'\n" +
+        "            try:\n" +
+        "                from accelerate.utils import merge_fsdp_weights\n" +
+        "                print(f'[fsdp] merge_fsdp_weights({shard_inner}) -> {merged_dir}', flush=True)\n" +
+        "                merged_dir.mkdir(parents=True, exist_ok=True)\n" +
+        "                # merge_fsdp_weights signature: (checkpoint_dir, output_path,\n" +
+        "                # safe_serialization=True, remove_checkpoint_dir=False)\n" +
+        "                merge_fsdp_weights(str(shard_inner), str(merged_dir), safe_serialization=True)\n" +
+        "                print(f'[fsdp] merged adapter at {merged_dir}', flush=True)\n" +
+        "            except Exception as _me:\n" +
+        "                print(f'[fsdp] merge_fsdp_weights failed: {_me} — manual merge required', flush=True)\n" +
+        "        accelerator.wait_for_everyone()\n" +
         "    print(f'\\n{sep}')\n" +
         "    print(f'[train] DONE -- {args.steps} steps in {elapsed_total:.1f} min')\n" +
         "    print(f'[train] best loss: {best_loss:.4f}')\n" +
@@ -760,6 +1390,30 @@ fn main() {
         "    # Disable with --no-consciousness-loss for pure CE baseline runs.\n" +
         "    parser.add_argument('--consciousness-loss', dest='consciousness_loss', action='store_true', default=True, help='Option B1: phi_complexity + gwt_broadcast (default ON)')\n" +
         "    parser.add_argument('--no-consciousness-loss', dest='consciousness_loss', action='store_false', help='Disable B1 consciousness loss (pure CE + holo only)')\n" +
+        "    # ── P5–P20 head/loss wiring (20260418) ───────────────────\n" +
+        "    # Default ON — nested K-tower stability loss + Φ 16D vector logging.\n" +
+        "    # Measurement-only heads (P5/P6/P7/P12/P15/P18) run at phi_log_every cadence\n" +
+        "    # so they never bottleneck the hot training loop.\n" +
+        "    parser.add_argument('--p5-p20', dest='p5_p20_enabled', action='store_true', default=True, help='Enable P5-P20 heads (default ON: P8 nested loss + Φ 16D vector)')\n" +
+        "    parser.add_argument('--no-p5-p20', dest='p5_p20_enabled', action='store_false', help='Disable P5-P20 heads (pure B1 baseline)')\n" +
+        "    parser.add_argument('--phi-log-every', dest='phi_log_every', type=int, default=100, help='Cadence (steps) for Φ 16D vector logging during training (default 100)')\n" +
+        "    # ── W1 Φ-eval hook (phi_eval_hook_spec.md) — default OFF ─────\n" +
+        "    # When --phi-hook 1, every save writes phi_vec.json + ce.json\n" +
+        "    # into <ckpt_dir>/step_<N>/ and appends step to phi_runs.json.\n" +
+        "    # Consumer: training/eval_phi_corr.hexa --manifest <path>.\n" +
+        "    # Guarded off by default to avoid disturbing r9/r10 ckpt shape.\n" +
+        "    parser.add_argument('--phi-hook', dest='phi_hook', type=int, default=0, choices=[0, 1], help='Emit W1 Φ-eval hook artifacts per save (default 0/OFF)')\n" +
+        "    # ── FSDP + 70B-handoff flags (20260417, Path A plumbing) ───\n" +
+        "    # These let launch_alm_70b.hexa invoke this trainer via\n" +
+        "    # `accelerate launch --config_file alm_fsdp.yaml <runner>`.\n" +
+        "    # Single-GPU path stays untouched when --fsdp is OFF.\n" +
+        "    parser.add_argument('--fsdp', action='store_true', help='Enable accelerate+FSDP full-shard wrap (multi-GPU)')\n" +
+        "    parser.add_argument('--fsdp-wrap-cls', dest='fsdp_wrap_cls', default='Qwen2DecoderLayer', help='FSDP transformer layer class to wrap')\n" +
+        "    parser.add_argument('--grad-checkpoint', dest='grad_checkpoint', action='store_true', help='Enable activation checkpointing (HF gradient_checkpointing_enable)')\n" +
+        "    parser.add_argument('--flash-attn-2', dest='flash_attn_2', action='store_true', help='Load base with attn_implementation=flash_attention_2')\n" +
+        "    parser.add_argument('--dtype', default='bf16', choices=['bf16', 'fp16', 'fp32'], help='Compute dtype (bf16 default, required under FSDP)')\n" +
+        "    parser.add_argument('--target-modules', dest='target_modules', nargs='+', default=['q_proj','k_proj','v_proj','o_proj'], help='LoRA target module list (e.g. q_proj k_proj v_proj o_proj gate_proj up_proj down_proj)')\n" +
+        "    parser.add_argument('--base-local-dir', dest='base_local_dir', default='', help='Optional local path to pre-downloaded base weights (overrides --base name for from_pretrained)')\n" +
         "    args = parser.parse_args()\n" +
         "    train(args)\n"
     )

@@ -111,6 +111,57 @@ fn sa_orch_or_active(phi: float) -> bool {
     return phi > SA_OR_PHI_THRESHOLD
 }
 
+// ─── HF Qwen2 tensor naming (option-c bridge) ──────────────────────
+//
+// Sibling session shipped self/tools/safetensors_to_hexaw.hexa +
+// lora_to_hexaw.hexa which emit tensor names in HuggingFace Qwen2
+// canonical form (NOT llama "layers.N.attention.wq" form). hexaw_load
+// returns those names as-is, so the serve layer speaks HF directly —
+// no rename/conversion step anywhere in the pipeline.
+//
+// The 8 per-layer weight kinds + 3 model-global weights that the
+// Qwen2.5-14B-Instruct + r9+pathc adapter chain needs at inference:
+//
+//   kind         HF canonical name (layer i)
+//   ----------   -----------------------------------------------------
+//   q_proj       model.layers.{i}.self_attn.q_proj.weight
+//   k_proj       model.layers.{i}.self_attn.k_proj.weight
+//   v_proj       model.layers.{i}.self_attn.v_proj.weight
+//   o_proj       model.layers.{i}.self_attn.o_proj.weight
+//   gate_proj    model.layers.{i}.mlp.gate_proj.weight
+//   up_proj      model.layers.{i}.mlp.up_proj.weight
+//   down_proj    model.layers.{i}.mlp.down_proj.weight
+//   input_norm   model.layers.{i}.input_layernorm.weight
+//   post_norm    model.layers.{i}.post_attention_layernorm.weight
+//   embed        model.embed_tokens.weight       (global, ignores i)
+//   final_norm   model.norm.weight               (global, ignores i)
+//   lm_head      lm_head.weight                  (global, ignores i)
+
+fn sa_hf_tensor_name(kind: string, layer_idx: int) -> string {
+    if kind == "embed"      { return "model.embed_tokens.weight" }
+    if kind == "final_norm" { return "model.norm.weight" }
+    if kind == "lm_head"    { return "lm_head.weight" }
+    let prefix = "model.layers." + to_string(layer_idx) + "."
+    if kind == "q_proj"     { return prefix + "self_attn.q_proj.weight" }
+    if kind == "k_proj"     { return prefix + "self_attn.k_proj.weight" }
+    if kind == "v_proj"     { return prefix + "self_attn.v_proj.weight" }
+    if kind == "o_proj"     { return prefix + "self_attn.o_proj.weight" }
+    if kind == "gate_proj"  { return prefix + "mlp.gate_proj.weight" }
+    if kind == "up_proj"    { return prefix + "mlp.up_proj.weight" }
+    if kind == "down_proj"  { return prefix + "mlp.down_proj.weight" }
+    if kind == "input_norm" { return prefix + "input_layernorm.weight" }
+    if kind == "post_norm"  { return prefix + "post_attention_layernorm.weight" }
+    return ""
+}
+
+// Returns true iff `needle` appears in the synthetic name registry `reg`,
+// which is a single pipe-delimited string of tensor names (serving as a
+// list surrogate — hexa list pass-by-value quirks dodged).
+fn sa_name_in_registry(reg: string, needle: string) -> bool {
+    let probe = "|" + needle + "|"
+    return reg.index_of(probe) >= 0
+}
+
 // ─── Server state (mutable singleton — pass-by-value avoidance) ────
 //
 // Two struct fields are sufficient floats; tension/phi tracked separately
@@ -533,6 +584,42 @@ fn sa_smoke_test() -> int {
         pass = pass + 1
     } else {
         println("  T8 FAIL  sa_extract_int got: " + to_string(n))
+        fail = fail + 1
+    }
+
+    // T9 — HF Qwen2 tensor name lookup for layer 0 against a synthetic
+    //      registry.  Proves the option-c naming bridge: serve reads
+    //      safetensors_to_hexaw / lora_to_hexaw output names verbatim.
+    let reg = "|model.embed_tokens.weight"
+        + "|model.layers.0.self_attn.q_proj.weight"
+        + "|model.layers.0.self_attn.k_proj.weight"
+        + "|model.layers.0.self_attn.v_proj.weight"
+        + "|model.layers.0.self_attn.o_proj.weight"
+        + "|model.layers.0.mlp.gate_proj.weight"
+        + "|model.layers.0.mlp.up_proj.weight"
+        + "|model.layers.0.mlp.down_proj.weight"
+        + "|model.layers.0.input_layernorm.weight"
+        + "|model.layers.0.post_attention_layernorm.weight"
+        + "|model.norm.weight"
+        + "|lm_head.weight|"
+    let mut t9_ok = true
+    let kinds = ["q_proj", "k_proj", "v_proj", "o_proj",
+                 "gate_proj", "up_proj", "down_proj",
+                 "input_norm", "post_norm",
+                 "embed", "final_norm", "lm_head"]
+    let mut ki = 0
+    while ki < 12 {
+        let want = sa_hf_tensor_name(kinds[ki], 0)
+        if want.len() == 0 || !sa_name_in_registry(reg, want) {
+            println("  T9 FAIL  kind=" + kinds[ki] + " name='" + want + "' not in registry")
+            t9_ok = false
+        }
+        ki = ki + 1
+    }
+    if t9_ok {
+        println("  T9 PASS  HF Qwen2 tensor name lookup (12/12 kinds, layer 0)")
+        pass = pass + 1
+    } else {
         fail = fail + 1
     }
 

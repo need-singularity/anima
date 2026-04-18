@@ -1,228 +1,942 @@
-// ═══════════════════════════════════════════════════════════════
-//  serving/eval_harness.hexa — ALM-P24-1 auto benchmark harness
+// ═══════════════════════════════════════════════════════════════════════
+//  serving/eval_harness.hexa — G6 real KoBEST/HAE-RAE/MMLU-Ko harness
 //
-//  KoBEST + HAE-RAE + MMLU-Ko auto eval harness for
-//    baseline  = Qwen2.5-14B-Instruct          (frozen, no LoRA)
-//    +lora     = Qwen2.5-14B-Instruct + LoRA   (trained on toy corpus,
-//                                               pod xhq9b2c8fljdyo)
+//  Supersedes synthetic logistic stub (see eval_harness_synthetic.hexa).
+//  A3 diagnosis: the old stub computed macro_acc via logistic(step/500)
+//  on hard-coded baseline scores and NEVER touched real weights — r4
+//  and r9 returned identical numbers. This rewrite drives evaluation
+//  through the live /generate endpoint so accuracy actually reflects
+//  the adapter loaded by the serving process.
 //
-//  Rationale:
-//    - lm-evaluation-harness (HF) is the standard runner; we do NOT
-//      re-implement tokenization/generation here. This file is the
-//      hexa-side *orchestrator* that:
-//        (a) Declares the 3 benchmarks + subtasks + n_sample budgets
-//        (b) Loads reference run outputs (ref_scores_baseline /
-//            ref_scores_lora; produced externally by running
-//            `python lm_eval --model hf --tasks kobest_*,haerae_*,
-//            mmlu_ko_*`) OR, when refs are absent, synthesizes
-//            deterministic stand-in scores via a seeded scoring model
-//            (LoRA quality proxy = logistic on LoRA_step / 2000).
-//        (c) Computes macro + per-benchmark averages
-//        (d) Emits a PASS/FAIL verdict against done_criteria
+//  Architecture (HEXA-FIRST, no Python/Rust/Shell tools):
+//    1. Parse --ckpt-path + --base-model flags.
+//    2. If --ckpt-path starts with "r2:" → exec rclone copy to /tmp/
+//       eval_adapter_<step>/ so a human operator (or a wrapper) can
+//       kill+restart serve_alm_14b.hexa with the fresh adapter (hot
+//       swap is not supported per reference_alm_serve_api.md).
+//    3. Probe the serving endpoint on :8090 via exec("lsof -i:8090")
+//       AND a trivial /generate POST. If either fails → DEFERRED.
+//    4. Drive KoBEST eval via /generate; parse the `text` field
+//       (reference_alm_serve_api.md — NOT `output`) and grade.
+//    5. Drive HAE-RAE (n=20 inline) + MMLU-Ko (n=20 inline) via the
+//       same /generate contract — D4 roadmap-drift closed 2026-04-18
+//       (per training/roadmap_drift_audit_20260418.md Rank 2 item 4).
+//       Both use the leading-digit extraction rubric (first "1..5" in
+//       the first 20 bytes of the model reply).
+//    6. Emit JSON + log. macro_acc = mean(kobest, hae_rae, mmlu_ko).
 //
-//  Output (both files written to /tmp so repeat runs don't collide):
-//    /tmp/anima_p24_eval.json   — structured numbers
-//    /tmp/anima_p24_eval.txt    — human-readable table
+//  Output JSON (training/deploy/eval_harness_<step>.json):
+//    { "step", "ckpt_path", "base_model", "endpoint",
+//      "deferred", "deferred_reason",
+//      "kobest_acc", "kobest_n", "kobest_n_correct",
+//      "haerae_acc", "haerae_n", "haerae_n_correct", "haerae_status",
+//      "mmluko_acc", "mmluko_n", "mmluko_n_correct", "mmluko_status",
+//      "macro_acc", "sampled_n",
+//      "per_question":[ {qid, suite, expected, got, correct} ... ] }
 //
-//  Run:
-//    hexa run serving/eval_harness.hexa
-//    hexa run serving/eval_harness.hexa --lora-step 2000
+//  Self-test:
+//    EVAL_SELFTEST=1 hexa run serving/eval_harness.hexa
+//      → runs 3 mocked Q&A pairs (correct / wrong / partial) and
+//        asserts scoring: 2/3 correct → kobest_acc ≈ 0.6667.
 //
-//  Exit:
-//    pass=1, fail=0 printed to stdout (machine-readable)
-// ═══════════════════════════════════════════════════════════════
+//  Hexa quirks honoured:
+//    - feedback_hexa_lists_pbv: mutations to [] returned, not in-place.
+//    - feedback_hexa_struct_list_alias: no struct-of-array-of-struct;
+//      per_question is streamed directly into JSON text.
+//    - feedback_hexa_silent_exit_5_imports: single file, no use chains.
+//    - feedback_hexa_string_api: substring uses byte indices — all
+//      embedded Korean strings are byte-safe because we never try
+//      to substring inside multibyte glyphs (grading uses contains()).
+// ═══════════════════════════════════════════════════════════════════════
 
-// ─── Benchmark registry ─────────────────────────────────────────
+let HARNESS_VERSION = "g6.2.0"
+let DEFAULT_ENDPOINT = "http://127.0.0.1:8090"
+let DEFAULT_OUT_DIR = "training/deploy"
+let DEFAULT_BASE_MODEL = "Qwen/Qwen2.5-14B-Instruct"
+let DEFAULT_MAX_TOKENS = 32
+let DEFAULT_TEMPERATURE = 0.0
+
+// ════════════════════════════════════════════════════════════════════════
+//  Section 1. KoBEST inline corpus (n=20, hand-picked)
+// ════════════════════════════════════════════════════════════════════════
 //
-// Each entry: (suite, task, n_samples, baseline_acc, lora_delta_at_2000)
-//   baseline_acc          — reference Qwen-14B-Instruct 0-shot accuracy
-//                           (sourced from public lm_eval runs, 2025-Q4).
-//   lora_delta_at_2000    — empirical Δacc of toy-corpus LoRA at step
-//                           2000. Small: LoRA is overfitted on toy
-//                           domain, generalization is limited.
+//  Each question = [qid, subtask, prompt_ko, expected_ko_substring]
+//  Grading rule: case-insensitive contains() match on the expected
+//  substring in the model's `text` reply. This is the same rubric
+//  the hire_sim_judge_lenient uses for Korean short-answer tasks.
+//  Subtask coverage:
+//    BoolQ      : 5   (yes/no)   — expected ∈ {"예","아니오"}
+//    COPA       : 5   (A/B)      — expected ∈ {"A","B"}
+//    SentiNeg   : 5   (pos/neg)  — expected ∈ {"긍정","부정"}
+//    WiC        : 5   (same/diff)— expected ∈ {"같음","다름"}
+//  All answers are single-token so max_tokens=32 is plenty and
+//  temperature=0 makes grading deterministic across runs.
 
-fn bench_row(suite: string, task: string, n: int, base: float, delta: float) -> array {
-    let mut row = []
-    row = row.push(suite)
-    row = row.push(task)
-    row = row.push(n)
-    row = row.push(base)
-    row = row.push(delta)
-    return row
-}
-
-fn make_registry() -> array {
+fn kq(qid: string, sub: string, prompt: string, expected: string) -> [string] {
     let mut r = []
-    // KoBEST (5 subtasks)
-    r = r.push(bench_row("KoBEST", "boolq",     3656, 0.6342,  0.0121))
-    r = r.push(bench_row("KoBEST", "copa",      1000, 0.7810, -0.0050))
-    r = r.push(bench_row("KoBEST", "hellaswag",  500, 0.4880,  0.0060))
-    r = r.push(bench_row("KoBEST", "sentineg",  1300, 0.8246,  0.0094))
-    r = r.push(bench_row("KoBEST", "wic",        600, 0.5717, -0.0080))
-    // HAE-RAE (6 subtasks — sampled)
-    r = r.push(bench_row("HAE-RAE", "general_knowledge",   203, 0.4532, 0.0148))
-    r = r.push(bench_row("HAE-RAE", "history",             188, 0.5212, 0.0106))
-    r = r.push(bench_row("HAE-RAE", "loan_words",          170, 0.6471, 0.0059))
-    r = r.push(bench_row("HAE-RAE", "rare_words",          405, 0.5160, 0.0099))
-    r = r.push(bench_row("HAE-RAE", "standard_nomenclature",153, 0.5556, 0.0065))
-    r = r.push(bench_row("HAE-RAE", "reading_comprehension",447,0.6218, 0.0179))
-    // MMLU-Ko (subset — 4 categories sampled)
-    r = r.push(bench_row("MMLU-Ko", "humanities",  1000, 0.6420, 0.0043))
-    r = r.push(bench_row("MMLU-Ko", "social_sci",   900, 0.7011, 0.0062))
-    r = r.push(bench_row("MMLU-Ko", "stem",         800, 0.5230, 0.0028))
-    r = r.push(bench_row("MMLU-Ko", "other",        700, 0.6310, 0.0051))
+    r = r.push(qid)
+    r = r.push(sub)
+    r = r.push(prompt)
+    r = r.push(expected)
     return r
 }
 
-// ─── LoRA quality proxy ─────────────────────────────────────────
-// The reported `lora_delta_at_2000` is the delta observed at the
-// checkpoint we are actually using. For intermediate steps (200,
-// 500, 1000, 1500) we model the delta as a logistic ramp — matches
-// the empirical learning-curve shape we saw on the toy corpus.
-//   delta(step) = delta_at_2000 * sigmoid((step-400)/500)
-
-fn sigmoid(x: float) -> float {
-    // stable-ish logistic without expensive math libs
-    if x > 10.0  { return 0.9999 }
-    if x < -10.0 { return 0.0001 }
-    // approximate via rational: σ(x) ≈ 0.5 + x/(4+|x|)
-    let ax = if x < 0.0 { 0.0 - x } else { x }
-    let y = 0.5 + x / (4.0 + ax) * 0.5
-    if y < 0.0001 { return 0.0001 }
-    if y > 0.9999 { return 0.9999 }
-    return y
+fn build_kobest() -> [[string]] {
+    let mut qs = []
+    // BoolQ (5) — yes/no factual
+    qs = qs.push(kq("bq01", "BoolQ",
+        "다음 질문에 '예' 또는 '아니오'로만 답하세요. 지구는 태양보다 큰가요?",
+        "아니오"))
+    qs = qs.push(kq("bq02", "BoolQ",
+        "다음 질문에 '예' 또는 '아니오'로만 답하세요. 물은 0도에서 어나요?",
+        "예"))
+    qs = qs.push(kq("bq03", "BoolQ",
+        "다음 질문에 '예' 또는 '아니오'로만 답하세요. 서울은 한국의 수도인가요?",
+        "예"))
+    qs = qs.push(kq("bq04", "BoolQ",
+        "다음 질문에 '예' 또는 '아니오'로만 답하세요. 고래는 어류인가요?",
+        "아니오"))
+    qs = qs.push(kq("bq05", "BoolQ",
+        "다음 질문에 '예' 또는 '아니오'로만 답하세요. 1킬로미터는 1000미터인가요?",
+        "예"))
+    // COPA (5) — choose A or B, cause/effect
+    qs = qs.push(kq("cp01", "COPA",
+        "상황: 그는 우산을 썼다. 원인으로 적절한 것은? A) 비가 왔다. B) 해가 떴다. 'A' 또는 'B'로만 답하세요.",
+        "A"))
+    qs = qs.push(kq("cp02", "COPA",
+        "상황: 그녀는 물을 마셨다. 원인으로 적절한 것은? A) 배가 불렀다. B) 목이 말랐다. 'A' 또는 'B'로만 답하세요.",
+        "B"))
+    qs = qs.push(kq("cp03", "COPA",
+        "상황: 불이 꺼졌다. 결과로 적절한 것은? A) 방이 어두워졌다. B) 방이 밝아졌다. 'A' 또는 'B'로만 답하세요.",
+        "A"))
+    qs = qs.push(kq("cp04", "COPA",
+        "상황: 그는 일찍 잠들었다. 원인으로 적절한 것은? A) 커피를 마셨다. B) 매우 피곤했다. 'A' 또는 'B'로만 답하세요.",
+        "B"))
+    qs = qs.push(kq("cp05", "COPA",
+        "상황: 길이 막혔다. 결과로 적절한 것은? A) 지각했다. B) 일찍 도착했다. 'A' 또는 'B'로만 답하세요.",
+        "A"))
+    // SentiNeg (5) — 긍정/부정 classification
+    qs = qs.push(kq("sn01", "SentiNeg",
+        "다음 문장의 감정은 '긍정' 또는 '부정' 중 무엇인가요? '오늘 정말 행복한 하루였어요.'",
+        "긍정"))
+    qs = qs.push(kq("sn02", "SentiNeg",
+        "다음 문장의 감정은 '긍정' 또는 '부정' 중 무엇인가요? '이 영화는 최악이었다.'",
+        "부정"))
+    qs = qs.push(kq("sn03", "SentiNeg",
+        "다음 문장의 감정은 '긍정' 또는 '부정' 중 무엇인가요? '서비스가 친절하고 음식도 맛있었다.'",
+        "긍정"))
+    qs = qs.push(kq("sn04", "SentiNeg",
+        "다음 문장의 감정은 '긍정' 또는 '부정' 중 무엇인가요? '기다림이 너무 길어 짜증이 났다.'",
+        "부정"))
+    qs = qs.push(kq("sn05", "SentiNeg",
+        "다음 문장의 감정은 '긍정' 또는 '부정' 중 무엇인가요? '아이의 웃음소리가 참 예쁘다.'",
+        "긍정"))
+    // WiC (5) — 같음/다름 word-in-context
+    qs = qs.push(kq("wc01", "WiC",
+        "두 문장의 '배'는 같은 의미인가요, 다른 의미인가요? '배가 고프다.' / '배가 아프다.' '같음' 또는 '다름'으로만 답하세요.",
+        "같음"))
+    qs = qs.push(kq("wc02", "WiC",
+        "두 문장의 '배'는 같은 의미인가요, 다른 의미인가요? '사과 한 개와 배 한 개를 샀다.' / '배를 타고 섬에 갔다.' '같음' 또는 '다름'으로만 답하세요.",
+        "다름"))
+    qs = qs.push(kq("wc03", "WiC",
+        "두 문장의 '눈'은 같은 의미인가요, 다른 의미인가요? '눈이 내린다.' / '하얀 눈이 쌓였다.' '같음' 또는 '다름'으로만 답하세요.",
+        "같음"))
+    qs = qs.push(kq("wc04", "WiC",
+        "두 문장의 '말'은 같은 의미인가요, 다른 의미인가요? '말이 달린다.' / '그는 말을 잘한다.' '같음' 또는 '다름'으로만 답하세요.",
+        "다름"))
+    qs = qs.push(kq("wc05", "WiC",
+        "두 문장의 '손'은 같은 의미인가요, 다른 의미인가요? '손을 씻어라.' / '양손에 가방을 들었다.' '같음' 또는 '다름'으로만 답하세요.",
+        "같음"))
+    return qs
 }
 
-fn delta_at_step(full_delta: float, step: int) -> float {
-    let z = (to_float(step) - 400.0) / 500.0
-    return full_delta * sigmoid(z)
-}
+// ════════════════════════════════════════════════════════════════════════
+//  Section 2. Grading — lenient contains() rubric
+// ════════════════════════════════════════════════════════════════════════
+//  Rubric matches serving/hire_sim_judge_lenient.hexa — the stemmer is
+//  not needed here because KoBEST answer set is closed (single tokens).
+//  Case-insensitive over ASCII 'a'-'Z'; for Korean substrings byte-match
+//  is exact.
 
-// ─── Aggregate suite scores ─────────────────────────────────────
-
-fn suite_score(rows: array, suite: string, step: int, use_lora: bool) -> array {
-    // returns [acc_weighted, n_total, n_tasks]
-    let n = len(rows)
-    let mut acc_sum = 0.0
-    let mut n_total = 0
-    let mut n_tasks = 0
+fn lower_ascii(s: string) -> string {
+    let n = len(s)
+    let mut out = ""
     let mut i = 0
     while i < n {
-        let row = rows[i]
-        let s = row[0]
-        if s == suite {
-            let samples = row[2]
-            let base = row[3]
-            let full_delta = row[4]
-            let d = if use_lora { delta_at_step(full_delta, step) } else { 0.0 }
-            let acc = base + d
-            acc_sum = acc_sum + acc * to_float(samples)
-            n_total = n_total + samples
-            n_tasks = n_tasks + 1
-        }
+        let c = s.substring(i, i + 1)
+        // byte in 'A'-'Z' → shift +32
+        if c == "A" { out = out + "a" }
+        else if c == "B" { out = out + "b" }
+        else if c == "C" { out = out + "c" }
+        else if c == "D" { out = out + "d" }
+        else if c == "E" { out = out + "e" }
+        else if c == "F" { out = out + "f" }
+        else if c == "G" { out = out + "g" }
+        else if c == "H" { out = out + "h" }
+        else if c == "I" { out = out + "i" }
+        else if c == "J" { out = out + "j" }
+        else if c == "K" { out = out + "k" }
+        else if c == "L" { out = out + "l" }
+        else if c == "M" { out = out + "m" }
+        else if c == "N" { out = out + "n" }
+        else if c == "O" { out = out + "o" }
+        else if c == "P" { out = out + "p" }
+        else if c == "Q" { out = out + "q" }
+        else if c == "R" { out = out + "r" }
+        else if c == "S" { out = out + "s" }
+        else if c == "T" { out = out + "t" }
+        else if c == "U" { out = out + "u" }
+        else if c == "V" { out = out + "v" }
+        else if c == "W" { out = out + "w" }
+        else if c == "X" { out = out + "x" }
+        else if c == "Y" { out = out + "y" }
+        else if c == "Z" { out = out + "z" }
+        else { out = out + c }
         i = i + 1
     }
-    let avg = if n_total > 0 { acc_sum / to_float(n_total) } else { 0.0 }
-    let mut out = []
-    out = out.push(avg)
-    out = out.push(n_total)
-    out = out.push(n_tasks)
     return out
 }
 
-// ─── Report helpers ─────────────────────────────────────────────
-
-fn fmt_pct(x: float) -> string {
-    // truncate to 4 decimals
-    let scaled = x * 10000.0
-    let i = to_int(scaled)
-    return str(i) + "/10000"
+fn grade(expected: string, reply: string) -> bool {
+    // Korean expected strings match byte-exact; ASCII A/B do case-insensitive.
+    let r = lower_ascii(reply)
+    let e = lower_ascii(expected)
+    return r.index_of(e) >= 0
 }
 
-fn report_suite(rows: array, suite: string, step: int) -> string {
-    let base = suite_score(rows, suite, step, false)
-    let lora = suite_score(rows, suite, step, true)
-    let b = base[0]
-    let l = lora[0]
-    let delta = l - b
-    let n = base[1]
-    let k = base[2]
-    return suite + ":  base=" + fmt_pct(b) + "  +LoRA=" + fmt_pct(l)
-         + "  Δ=" + fmt_pct(delta) + "  (n=" + str(n) + " over " + str(k) + " tasks)"
-}
+// ════════════════════════════════════════════════════════════════════════
+//  Section 3. JSON escape + shell escape (same as likert_eval)
+// ════════════════════════════════════════════════════════════════════════
 
-// ─── Self-test / verdict ────────────────────────────────────────
-// done_criteria: "3 benchmarks 자동 실행, baseline vs +engines 비교"
-//   - at least one suite with lora Δ > 0 (sign-positive)
-//   - all 3 suites reported
-//   - numbers are finite
-
-fn verdict(rows: array, step: int) -> bool {
-    let kobest = suite_score(rows, "KoBEST",  step, true)
-    let haerae = suite_score(rows, "HAE-RAE", step, true)
-    let mmluko = suite_score(rows, "MMLU-Ko", step, true)
-    let kb_base = suite_score(rows, "KoBEST",  step, false)
-    let hr_base = suite_score(rows, "HAE-RAE", step, false)
-    let mk_base = suite_score(rows, "MMLU-Ko", step, false)
-
-    let dk = kobest[0] - kb_base[0]
-    let dh = haerae[0] - hr_base[0]
-    let dm = mmluko[0] - mk_base[0]
-
-    // sign-positive on at least one suite:
-    let any_pos = (dk > 0.0) || (dh > 0.0) || (dm > 0.0)
-
-    // all three ran with ≥100 samples:
-    let all_ran = (kobest[1] >= 100) && (haerae[1] >= 100) && (mmluko[1] >= 100)
-
-    // finiteness (0 < acc < 1):
-    let finite = (kobest[0] > 0.0) && (kobest[0] < 1.0)
-              && (haerae[0] > 0.0) && (haerae[0] < 1.0)
-              && (mmluko[0] > 0.0) && (mmluko[0] < 1.0)
-
-    return any_pos && all_ran && finite
-}
-
-fn parse_step(argv: array) -> int {
-    // default 2000 (matches full-delta assumption)
-    let n = len(argv)
+fn json_escape(s: string) -> string {
+    let n = len(s)
+    let mut out = ""
     let mut i = 0
     while i < n {
-        if argv[i] == "--lora-step" {
-            if i + 1 < n {
-                return to_int(argv[i + 1])
-            }
+        let c = s.substring(i, i + 1)
+        if c == "\"" { out = out + "\\\"" }
+        else if c == "\\" { out = out + "\\\\" }
+        else if c == "\n" { out = out + "\\n" }
+        else if c == "\r" { out = out + "\\r" }
+        else if c == "\t" { out = out + "\\t" }
+        else { out = out + c }
+        i = i + 1
+    }
+    return out
+}
+
+fn shell_escape_sq(s: string) -> string {
+    let n = len(s)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "'" { out = out + "'\\''" }
+        else { out = out + c }
+        i = i + 1
+    }
+    return out
+}
+
+fn extract_json_string(raw: string, marker: string) -> string {
+    let pos = raw.index_of(marker)
+    if pos < 0 { return "" }
+    let after = raw.substring(pos + len(marker), len(raw))
+    let alen = len(after)
+    let mut s = 0
+    while s < alen {
+        let c = after.substring(s, s + 1)
+        if c == "\"" { s = s + 1; break }
+        s = s + 1
+    }
+    let mut e = s
+    while e < alen {
+        let c = after.substring(e, e + 1)
+        if c == "\"" { break }
+        if c == "\\" { e = e + 2 } else { e = e + 1 }
+    }
+    return after.substring(s, e)
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Section 4. Endpoint probe — returns "" on healthy, else reason string
+// ════════════════════════════════════════════════════════════════════════
+//  Per feedback_closed_loop_verify: probe BEFORE running the full eval
+//  so we fail fast with an honest DEFERRED instead of silently scoring 0.
+
+fn probe_endpoint(endpoint: string) -> string {
+    // Smoke POST with a trivial prompt; check for "text" field presence.
+    let body = "{\"prompt\":\"ping\",\"max_tokens\":4,\"temperature\":0.0}"
+    let body_sh = shell_escape_sq(body)
+    let cmd = "curl -sX POST " + endpoint + "/generate"
+            + " -H 'Content-Type: application/json'"
+            + " -d '" + body_sh + "'"
+            + " --connect-timeout 5 --max-time 20 2>/dev/null"
+    let raw = exec(cmd)
+    if len(raw) == 0 { return "endpoint_unreachable" }
+    if raw.index_of("\"text\"") < 0 { return "no_text_field_in_response" }
+    return ""
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Section 5. /generate call — returns text or "" on failure
+// ════════════════════════════════════════════════════════════════════════
+
+fn call_generate(endpoint: string, prompt: string, max_tokens: int, temperature: float) -> string {
+    let body = "{\"prompt\":\"" + json_escape(prompt)
+             + "\",\"max_tokens\":" + to_string(max_tokens)
+             + ",\"temperature\":" + to_string(temperature) + "}"
+    let body_sh = shell_escape_sq(body)
+    let cmd = "curl -sX POST " + endpoint + "/generate"
+            + " -H 'Content-Type: application/json'"
+            + " -d '" + body_sh + "'"
+            + " --connect-timeout 10 --max-time 60 2>/dev/null"
+    let raw = exec(cmd)
+    if len(raw) == 0 { return "" }
+    return extract_json_string(raw, "\"text\":")
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Section 6. R2 adapter fetch (rclone)
+// ════════════════════════════════════════════════════════════════════════
+//  If --ckpt-path starts with "r2:" we rclone it into /tmp/eval_adapter_
+//  <step>/ so a human (or the pod launcher) can restart serve_alm_14b
+//  pointing at the fresh adapter — NO hot swap (reference_alm_serve_api).
+//  Returns the local adapter path; empty string on failure.
+
+fn fetch_adapter(ckpt_path: string, step: int) -> string {
+    if len(ckpt_path) < 3 { return ckpt_path }
+    let prefix = ckpt_path.substring(0, 3)
+    if prefix != "r2:" { return ckpt_path }
+    let remote = ckpt_path.substring(3, len(ckpt_path))
+    let local = "/tmp/eval_adapter_" + to_string(step)
+    let cmd = "rclone copy " + remote + " " + local
+            + " --transfers 4 --checkers 4 2>&1"
+    println("[eval_harness] rclone: " + cmd)
+    let out = exec(cmd)
+    // rclone prints nothing on success; non-empty stderr is an error.
+    if out.index_of("ERROR") >= 0 || out.index_of("Failed") >= 0 {
+        println("[eval_harness] rclone failed: " + out)
+        return ""
+    }
+    println("[eval_harness] adapter fetched: " + local)
+    return local
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Section 7. Run KoBEST
+// ════════════════════════════════════════════════════════════════════════
+
+fn format_q_json(qid: string, sub: string, expected: string, got: string, correct: bool, idx: int, total: int) -> string {
+    let comma = if idx + 1 < total { "," } else { "" }
+    let ok_lit = if correct { "true" } else { "false" }
+    return "    {\n"
+         + "      \"qid\": \"" + json_escape(qid) + "\",\n"
+         + "      \"suite\": \"" + json_escape(sub) + "\",\n"
+         + "      \"expected\": \"" + json_escape(expected) + "\",\n"
+         + "      \"got\": \"" + json_escape(got) + "\",\n"
+         + "      \"correct\": " + ok_lit + "\n"
+         + "    }" + comma
+}
+
+struct KobestResult {
+    n: int,
+    n_correct: int,
+    acc: float,
+    per_q_body: string
+}
+
+fn run_kobest(endpoint: string, max_tokens: int, temperature: float) -> KobestResult {
+    let qs = build_kobest()
+    let total = len(qs)
+    let mut n_correct = 0
+    let mut body = ""
+    let mut i = 0
+    while i < total {
+        let q = qs[i]
+        let qid = q[0]
+        let sub = q[1]
+        let prompt = q[2]
+        let expected = q[3]
+        println("[eval_harness] [" + to_string(i + 1) + "/" + to_string(total) + "] " + qid + " (" + sub + ")")
+        let got = call_generate(endpoint, prompt, max_tokens, temperature)
+        let correct = grade(expected, got)
+        if correct { n_correct = n_correct + 1 }
+        let preview_len = if len(got) < 40 { len(got) } else { 40 }
+        let preview = got.substring(0, preview_len)
+        let mark = if correct { "OK" } else { "NO" }
+        println("              " + mark + "  expected=" + expected + "  got=" + preview)
+        let chunk = format_q_json(qid, sub, expected, got, correct, i, total)
+        body = body + chunk + (if i + 1 < total { "\n" } else { "" })
+        i = i + 1
+    }
+    let acc = if total > 0 { to_float(n_correct) / to_float(total) } else { 0.0 }
+    return KobestResult { n: total, n_correct: n_correct, acc: acc, per_q_body: body }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Section 7b. HAE-RAE inline corpus (n=20, D4 drift fix)
+// ════════════════════════════════════════════════════════════════════════
+//
+//  Source authority: HAERAE-HUB/HAE_RAE_BENCH_1.0 — Korean cultural/
+//  linguistic benchmark. 6 categories (general-knowledge, history,
+//  standard-nomenclature, loan-words, rare-words, reading-comprehension).
+//  This inline port samples 20 representative questions (3-4 per cat),
+//  crafted from public benchmark documentation. Smoke-harness grade —
+//  not claiming parity with the full HF dataset (~6k items).
+//
+//  Each question = [qid, category, prompt, answer_digit_1based]
+//    qid              : stable string id (hr01..hr20)
+//    category         : one of 6 HAE-RAE categories
+//    prompt           : complete MC prompt including "선택지:" + "답:"
+//    answer_digit     : "1".."5" — grading rubric extracts leading digit
+//                       from model output (per constraint #6).
+//
+//  Prompt format (per constraint #5):
+//    "{problem_text}\n선택지:\n1) {c1}\n2) {c2}\n3) {c3}\n4) {c4}\n답:"
+
+fn hr_item(qid: string, cat: string, prompt: string, answer: string) -> [string] {
+    let mut r = []
+    r = r.push(qid)
+    r = r.push(cat)
+    r = r.push(prompt)
+    r = r.push(answer)
+    return r
+}
+
+fn hr_prompt4(q: string, c1: string, c2: string, c3: string, c4: string) -> string {
+    return q + "\n선택지:\n1) " + c1 + "\n2) " + c2 + "\n3) " + c3 + "\n4) " + c4 + "\n답:"
+}
+
+fn hae_rae_items() -> [[string]] {
+    let mut qs = []
+    // history (4)
+    qs = qs.push(hr_item("hr01", "history",
+        hr_prompt4("조선을 건국한 왕은 누구인가?", "왕건", "이성계", "세종대왕", "이순신"),
+        "2"))
+    qs = qs.push(hr_item("hr02", "history",
+        hr_prompt4("임진왜란은 몇 년에 발발했는가?", "1392년", "1592년", "1636년", "1910년"),
+        "2"))
+    qs = qs.push(hr_item("hr03", "history",
+        hr_prompt4("훈민정음을 창제한 조선의 왕은?", "태조", "태종", "세종대왕", "성종"),
+        "3"))
+    qs = qs.push(hr_item("hr04", "history",
+        hr_prompt4("대한민국 임시정부가 수립된 도시는?", "서울", "상해", "북경", "도쿄"),
+        "2"))
+    // general-knowledge (3)
+    qs = qs.push(hr_item("hr05", "general_knowledge",
+        hr_prompt4("대한민국의 수도는 어디인가?", "부산", "서울", "대구", "인천"),
+        "2"))
+    qs = qs.push(hr_item("hr06", "general_knowledge",
+        hr_prompt4("태양계에서 가장 큰 행성은?", "지구", "화성", "목성", "토성"),
+        "3"))
+    qs = qs.push(hr_item("hr07", "general_knowledge",
+        hr_prompt4("한국의 최고봉은?", "한라산", "백두산", "설악산", "지리산"),
+        "2"))
+    // standard-nomenclature (3)
+    qs = qs.push(hr_item("hr08", "standard_nomenclature",
+        hr_prompt4("표준어 '강낭콩'의 옳은 표기는?", "강남콩", "강낭콩", "강냉이콩", "강넝콩"),
+        "2"))
+    qs = qs.push(hr_item("hr09", "standard_nomenclature",
+        hr_prompt4("'희한하다'의 올바른 표기는?", "희안하다", "희한하다", "히한하다", "히안하다"),
+        "2"))
+    qs = qs.push(hr_item("hr10", "standard_nomenclature",
+        hr_prompt4("'설거지'의 올바른 표기는?", "설겆이", "설거지", "설것이", "설거치"),
+        "2"))
+    // loan-words (3)
+    qs = qs.push(hr_item("hr11", "loan_words",
+        hr_prompt4("영어 'computer'의 국립국어원 표준 외래어 표기는?", "콤퓨터", "컴퓨터", "컴푸터", "컴퓨더"),
+        "2"))
+    qs = qs.push(hr_item("hr12", "loan_words",
+        hr_prompt4("영어 'chocolate'의 외래어 표준 표기는?", "쵸콜렛", "초콜릿", "초코렛", "쪼코렛"),
+        "2"))
+    qs = qs.push(hr_item("hr13", "loan_words",
+        hr_prompt4("영어 'schedule'의 외래어 표준 표기는?", "스케쥴", "스케줄", "쉐쥴", "스케쥴레"),
+        "2"))
+    // rare-words (3)
+    qs = qs.push(hr_item("hr14", "rare_words",
+        hr_prompt4("'가납사니'의 뜻으로 가장 알맞은 것은?", "말 많은 사람", "게으른 사람", "용감한 사람", "부자인 사람"),
+        "1"))
+    qs = qs.push(hr_item("hr15", "rare_words",
+        hr_prompt4("'하릅강아지'의 뜻은?", "큰 개", "한 살 된 강아지", "병든 개", "새끼 개"),
+        "2"))
+    qs = qs.push(hr_item("hr16", "rare_words",
+        hr_prompt4("'갈매빛'의 뜻은?", "짙은 초록빛", "짙은 푸른빛", "밝은 노란빛", "흐린 회색빛"),
+        "1"))
+    // reading-comprehension (4)
+    qs = qs.push(hr_item("hr17", "reading_comprehension",
+        hr_prompt4("다음 문장의 주어는? '어제 민수가 학교에서 책을 읽었다.'", "어제", "민수가", "학교에서", "책을"),
+        "2"))
+    qs = qs.push(hr_item("hr18", "reading_comprehension",
+        hr_prompt4("'그녀는 달리다가 넘어졌다.'의 '넘어졌다'의 기본형은?", "넘다", "넘어지다", "넘어졌다", "지다"),
+        "2"))
+    qs = qs.push(hr_item("hr19", "reading_comprehension",
+        hr_prompt4("속담 '가는 말이 고와야 오는 말이 곱다'의 의미에 가장 가까운 것은?", "말수를 줄여라", "남에게 한 대로 돌아온다", "말은 빨라야 한다", "침묵이 금이다"),
+        "2"))
+    qs = qs.push(hr_item("hr20", "reading_comprehension",
+        hr_prompt4("'책상 위에 책이 있다.'에서 '위에'의 문법 기능은?", "주어", "목적어", "부사어", "관형어"),
+        "3"))
+    return qs
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Section 7c. MMLU-Ko inline corpus (n=20, D4 drift fix)
+// ════════════════════════════════════════════════════════════════════════
+//
+//  Source authority: HAERAE-HUB/KMMLU / nayohan/mmlu-ko — Korean MMLU
+//  translation. 4-option multiple choice across academic domains.
+//  Inline sample = 20 items mixing humanities/STEM/social-science.
+//
+//  Same storage schema as hae_rae_items; answer_digit = "1".."4".
+
+fn mk_item(qid: string, subject: string, prompt: string, answer: string) -> [string] {
+    let mut r = []
+    r = r.push(qid)
+    r = r.push(subject)
+    r = r.push(prompt)
+    r = r.push(answer)
+    return r
+}
+
+fn mmlu_ko_items() -> [[string]] {
+    let mut qs = []
+    // physics / math / STEM (7)
+    qs = qs.push(mk_item("mk01", "physics",
+        hr_prompt4("뉴턴의 제2법칙 F=ma에서 힘 F가 두 배가 되고 질량 m이 일정할 때, 가속도 a는?", "1/2배", "2배", "4배", "변하지 않음"),
+        "2"))
+    qs = qs.push(mk_item("mk02", "physics",
+        hr_prompt4("빛의 진공 속 속력에 가장 가까운 값은?", "약 3 × 10^5 m/s", "약 3 × 10^8 m/s", "약 3 × 10^10 m/s", "약 3 × 10^6 m/s"),
+        "2"))
+    qs = qs.push(mk_item("mk03", "math",
+        hr_prompt4("다음 중 함수 f(x)=x^2 의 x=3 에서 미분계수 f'(3) 의 값은?", "3", "6", "9", "12"),
+        "2"))
+    qs = qs.push(mk_item("mk04", "math",
+        hr_prompt4("원의 반지름이 r일 때 넓이를 나타내는 식은?", "2πr", "πr^2", "πr", "4πr^2"),
+        "2"))
+    qs = qs.push(mk_item("mk05", "chemistry",
+        hr_prompt4("물 H2O의 수소 원자 개수는?", "1개", "2개", "3개", "4개"),
+        "2"))
+    qs = qs.push(mk_item("mk06", "biology",
+        hr_prompt4("DNA의 염기쌍 중 아데닌(A)과 결합하는 것은?", "구아닌(G)", "티민(T)", "사이토신(C)", "우라실(U)"),
+        "2"))
+    qs = qs.push(mk_item("mk07", "computer_science",
+        hr_prompt4("이진수 1010(2)를 십진수로 변환하면?", "8", "10", "12", "16"),
+        "2"))
+    // humanities (6)
+    qs = qs.push(mk_item("mk08", "philosophy",
+        hr_prompt4("'나는 생각한다, 고로 나는 존재한다'를 주장한 철학자는?", "플라톤", "데카르트", "칸트", "니체"),
+        "2"))
+    qs = qs.push(mk_item("mk09", "philosophy",
+        hr_prompt4("정언명령을 주장한 독일 철학자는?", "헤겔", "칸트", "마르크스", "쇼펜하우어"),
+        "2"))
+    qs = qs.push(mk_item("mk10", "literature",
+        hr_prompt4("'햄릿', '오셀로'를 쓴 영국 극작가는?", "디킨스", "셰익스피어", "밀턴", "키츠"),
+        "2"))
+    qs = qs.push(mk_item("mk11", "history",
+        hr_prompt4("프랑스 혁명이 발발한 해는?", "1776년", "1789년", "1804년", "1848년"),
+        "2"))
+    qs = qs.push(mk_item("mk12", "history",
+        hr_prompt4("제2차 세계대전이 종전된 해는?", "1918년", "1939년", "1945년", "1950년"),
+        "3"))
+    qs = qs.push(mk_item("mk13", "geography",
+        hr_prompt4("세계에서 가장 긴 강은?", "아마존강", "나일강", "양쯔강", "미시시피강"),
+        "2"))
+    // social-science (5)
+    qs = qs.push(mk_item("mk14", "economics",
+        hr_prompt4("수요와 공급이 일치하는 지점의 가격을 무엇이라 하는가?", "최고가격", "최저가격", "균형가격", "독점가격"),
+        "3"))
+    qs = qs.push(mk_item("mk15", "economics",
+        hr_prompt4("인플레이션의 일반적 의미는?", "물가 하락", "물가 상승", "실업 증가", "환율 하락"),
+        "2"))
+    qs = qs.push(mk_item("mk16", "political_science",
+        hr_prompt4("삼권분립의 세 권력에 해당하지 않는 것은?", "입법권", "행정권", "사법권", "언론권"),
+        "4"))
+    qs = qs.push(mk_item("mk17", "sociology",
+        hr_prompt4("사회학의 창시자로 불리는 프랑스 학자는?", "베버", "뒤르켐", "콩트", "마르크스"),
+        "3"))
+    qs = qs.push(mk_item("mk18", "psychology",
+        hr_prompt4("정신분석학의 창시자는?", "융", "아들러", "프로이트", "파블로프"),
+        "3"))
+    // applied (2)
+    qs = qs.push(mk_item("mk19", "medicine",
+        hr_prompt4("인간 성인의 정상 체온에 가장 가까운 값은?", "약 34도", "약 36.5도", "약 38.5도", "약 40도"),
+        "2"))
+    qs = qs.push(mk_item("mk20", "engineering",
+        hr_prompt4("전기 저항의 단위는?", "볼트(V)", "암페어(A)", "옴(Ω)", "와트(W)"),
+        "3"))
+    return qs
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Section 7d. MC grading — extract leading digit (per constraint #6)
+// ════════════════════════════════════════════════════════════════════════
+//
+//  Answer extraction strategy:
+//    1. Scan forward in the reply until we hit a digit '1'..'5'.
+//    2. If found in the first 20 bytes, treat that digit as the prediction.
+//    3. Otherwise fall back to "" (no prediction → wrong).
+//  Byte-safe: single-byte digit scan, multibyte prefix (Korean) is skipped
+//  byte-wise without landing inside a glyph.
+
+fn is_digit_1_5(c: string) -> bool {
+    return c == "1" || c == "2" || c == "3" || c == "4" || c == "5"
+}
+
+fn extract_leading_digit(reply: string) -> string {
+    let n = len(reply)
+    let cap = if n < 20 { n } else { 20 }
+    let mut i = 0
+    while i < cap {
+        let c = reply.substring(i, i + 1)
+        if is_digit_1_5(c) { return c }
+        i = i + 1
+    }
+    return ""
+}
+
+fn score_mc(reply: string, answer: string) -> bool {
+    let got = extract_leading_digit(reply)
+    if len(got) == 0 { return false }
+    return got == answer
+}
+
+// Back-compat signatures (per task requirements)
+fn score_hae_rae(gen: string, answer: string) -> int {
+    if score_mc(gen, answer) { return 1 }
+    return 0
+}
+
+fn score_mmlu_ko(gen: string, answer: string) -> int {
+    if score_mc(gen, answer) { return 1 }
+    return 0
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Section 7e. Run HAE-RAE + Run MMLU-Ko
+// ════════════════════════════════════════════════════════════════════════
+//  Same architecture as run_kobest — deterministic prompt, /generate POST,
+//  parse "text" field, score, accumulate JSON body chunks.
+
+struct MCResult {
+    n: int,
+    n_correct: int,
+    acc: float,
+    per_q_body: string
+}
+
+fn run_mc_suite(label: string, items: [[string]], endpoint: string,
+                max_tokens: int, temperature: float) -> MCResult {
+    let total = len(items)
+    let mut n_correct = 0
+    let mut body = ""
+    let mut i = 0
+    while i < total {
+        let q = items[i]
+        let qid = q[0]
+        let cat = q[1]
+        let prompt = q[2]
+        let answer = q[3]
+        println("[eval_harness] [" + label + " " + to_string(i + 1) + "/" + to_string(total) + "] " + qid + " (" + cat + ")")
+        let got = call_generate(endpoint, prompt, max_tokens, temperature)
+        let predicted = extract_leading_digit(got)
+        let correct = (len(predicted) > 0) && (predicted == answer)
+        if correct { n_correct = n_correct + 1 }
+        let preview_len = if len(got) < 40 { len(got) } else { 40 }
+        let preview = got.substring(0, preview_len)
+        let mark = if correct { "OK" } else { "NO" }
+        let pred_show = if len(predicted) == 0 { "?" } else { predicted }
+        println("              " + mark + "  expected=" + answer + "  pred=" + pred_show + "  got=" + preview)
+        let chunk = format_q_json(qid, label + "/" + cat, answer,
+                                  if len(predicted) == 0 { got } else { predicted },
+                                  correct, i, total)
+        body = body + chunk + (if i + 1 < total { "\n" } else { "" })
+        i = i + 1
+    }
+    let acc = if total > 0 { to_float(n_correct) / to_float(total) } else { 0.0 }
+    return MCResult { n: total, n_correct: n_correct, acc: acc, per_q_body: body }
+}
+
+fn run_hae_rae(endpoint: string, max_tokens: int, temperature: float) -> MCResult {
+    return run_mc_suite("hae_rae", hae_rae_items(), endpoint, max_tokens, temperature)
+}
+
+fn run_mmlu_ko(endpoint: string, max_tokens: int, temperature: float) -> MCResult {
+    return run_mc_suite("mmlu_ko", mmlu_ko_items(), endpoint, max_tokens, temperature)
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Section 8. JSON assembly
+// ════════════════════════════════════════════════════════════════════════
+
+fn assemble_json(step: int, ckpt_path: string, base_model: string, endpoint: string,
+                 deferred: bool, deferred_reason: string,
+                 kob: KobestResult, hr: MCResult, mk: MCResult) -> string {
+    let def_lit = if deferred { "true" } else { "false" }
+    // macro_acc = mean of suite accuracies (equal weight per suite).
+    // When deferred, all suites contribute 0 to macro and sampled_n is 0.
+    let n_suites = 3
+    let mean_acc = (kob.acc + hr.acc + mk.acc) / to_float(n_suites)
+    let macro_val = if deferred { 0.0 } else { mean_acc }
+    let sampled_n = if deferred { 0 } else { kob.n + hr.n + mk.n }
+    // per_question array: concat kobest + hae_rae + mmlu_ko bodies with
+    // commas between non-empty groups.
+    let mut pq = kob.per_q_body
+    if len(pq) > 0 && len(hr.per_q_body) > 0 { pq = pq + ",\n" }
+    pq = pq + hr.per_q_body
+    if len(pq) > 0 && len(mk.per_q_body) > 0 { pq = pq + ",\n" }
+    pq = pq + mk.per_q_body
+    return "{\n"
+         + "  \"harness_version\": \"" + HARNESS_VERSION + "\",\n"
+         + "  \"step\":             " + to_string(step) + ",\n"
+         + "  \"ckpt_path\":        \"" + json_escape(ckpt_path) + "\",\n"
+         + "  \"base_model\":       \"" + json_escape(base_model) + "\",\n"
+         + "  \"endpoint\":         \"" + json_escape(endpoint) + "\",\n"
+         + "  \"deferred\":         " + def_lit + ",\n"
+         + "  \"deferred_reason\":  \"" + json_escape(deferred_reason) + "\",\n"
+         + "  \"kobest_acc\":       " + to_string(kob.acc) + ",\n"
+         + "  \"kobest_n\":         " + to_string(kob.n) + ",\n"
+         + "  \"kobest_n_correct\": " + to_string(kob.n_correct) + ",\n"
+         + "  \"haerae_acc\":       " + to_string(hr.acc) + ",\n"
+         + "  \"haerae_n\":         " + to_string(hr.n) + ",\n"
+         + "  \"haerae_n_correct\": " + to_string(hr.n_correct) + ",\n"
+         + "  \"haerae_status\":    \"inline_n20_integrated (D4 drift closed 2026-04-18)\",\n"
+         + "  \"mmluko_acc\":       " + to_string(mk.acc) + ",\n"
+         + "  \"mmluko_n\":         " + to_string(mk.n) + ",\n"
+         + "  \"mmluko_n_correct\": " + to_string(mk.n_correct) + ",\n"
+         + "  \"mmluko_status\":    \"inline_n20_integrated (D4 drift closed 2026-04-18)\",\n"
+         + "  \"macro_acc\":        " + to_string(macro_val) + ",\n"
+         + "  \"sampled_n\":        " + to_string(sampled_n) + ",\n"
+         + "  \"per_question\": [\n"
+         + pq
+         + "\n  ]\n"
+         + "}\n"
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Section 9. Self-test — 3 mocked /generate responses
+// ════════════════════════════════════════════════════════════════════════
+//  We simulate the grading path without hitting the network:
+//    mock 1: expected="예",   got="예, 맞습니다."         → correct
+//    mock 2: expected="B",     got="A"                      → wrong
+//    mock 3: expected="긍정",   got="감정은 긍정입니다."     → correct
+//  Expected score: 2/3 = 0.6667
+//  A passing self-test proves:
+//    - grade() contains() rubric works on Korean substrings
+//    - ASCII A/B case-insensitive match works
+//    - partial/verbose replies still grade correctly
+
+fn selftest() -> int {
+    println("[eval_harness] SELFTEST: grading rubric")
+    let c1 = grade("예", "예, 맞습니다.")
+    let c2 = grade("B", "A")
+    let c3 = grade("긍정", "감정은 긍정입니다.")
+    let n_correct = (if c1 { 1 } else { 0 }) + (if c2 { 1 } else { 0 }) + (if c3 { 1 } else { 0 })
+    let acc = to_float(n_correct) / 3.0
+    println("  mock1 (expected=예,   got='예, 맞습니다.'):     " + (if c1 { "PASS" } else { "FAIL" }))
+    println("  mock2 (expected=B,     got='A'):                  " + (if c2 { "UNEXPECTED_PASS" } else { "PASS (wrong as expected)" }))
+    println("  mock3 (expected=긍정,  got='감정은 긍정입니다.'): " + (if c3 { "PASS" } else { "FAIL" }))
+    println("  score = " + to_string(n_correct) + "/3 = " + to_string(acc))
+
+    // MC (HAE-RAE / MMLU-Ko) rubric self-test — leading-digit extractor.
+    println("[eval_harness] SELFTEST: MC grading rubric (HAE-RAE + MMLU-Ko)")
+    let m1 = score_mc("2", "2")                                 // exact digit
+    let m2 = score_mc("답은 3입니다.", "3")                      // digit after Korean prefix (within 20 bytes)
+    let m3 = score_mc("2) 이성계", "2")                          // digit leading MC-style answer
+    let m4 = score_mc("4", "2")                                 // wrong digit
+    let m5 = score_mc("잘 모르겠습니다. 아마 답이 없을 것 같습니다.", "1")  // no digit in first 20 bytes
+    let m_ok = m1 && m2 && m3 && !m4 && !m5
+    println("  mc1 (got='2' ans=2):              " + (if m1 { "PASS" } else { "FAIL" }))
+    println("  mc2 (got='답은 3입니다.' ans=3):  " + (if m2 { "PASS" } else { "FAIL" }))
+    println("  mc3 (got='2) 이성계' ans=2):       " + (if m3 { "PASS" } else { "FAIL" }))
+    println("  mc4 (got='4' ans=2, wrong):       " + (if !m4 { "PASS (rejects)" } else { "FAIL (false accept)" }))
+    println("  mc5 (no digit, ans=1):            " + (if !m5 { "PASS (rejects)" } else { "FAIL (false accept)" }))
+
+    // Corpus integrity: both suites must yield exactly n=20.
+    let hr_n = len(hae_rae_items())
+    let mk_n = len(mmlu_ko_items())
+    println("  corpus: hae_rae_items=" + to_string(hr_n) + " mmlu_ko_items=" + to_string(mk_n))
+    let corpus_ok = (hr_n == 20) && (mk_n == 20)
+
+    // Expectations: c1=true, c2=false, c3=true → n_correct=2; MC 3 PASS + 2 reject; corpus 20+20
+    if c1 && !c2 && c3 && n_correct == 2 && m_ok && corpus_ok {
+        println("[eval_harness] SELFTEST: OK (KoBEST 2/3 + MC 5/5 + corpus 20+20)")
+        return 0
+    }
+    println("[eval_harness] SELFTEST: FAIL")
+    return 1
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Section 10. CLI + main
+// ════════════════════════════════════════════════════════════════════════
+
+fn parse_step_from_ckpt(ckpt_path: string) -> int {
+    // Look for "/step_<digits>" or "step_<digits>" in the path.
+    let marker = "step_"
+    let pos = ckpt_path.index_of(marker)
+    if pos < 0 { return 0 }
+    let after = ckpt_path.substring(pos + len(marker), len(ckpt_path))
+    let alen = len(after)
+    let mut buf = ""
+    let mut i = 0
+    while i < alen {
+        let c = after.substring(i, i + 1)
+        if c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+        || c == "5" || c == "6" || c == "7" || c == "8" || c == "9" {
+            buf = buf + c
+        } else {
+            break
         }
         i = i + 1
     }
-    return 2000
+    if len(buf) == 0 { return 0 }
+    return parse_int(buf)
 }
 
-fn main() {
-    let argv = args()
-    let step = parse_step(argv)
-
-    let rows = make_registry()
-    let n_rows = len(rows)
-
-    println("[eval_harness] ALM-P24-1 KoBEST + HAE-RAE + MMLU-Ko harness")
-    println("  base model   : Qwen2.5-14B-Instruct (ref scores from public lm_eval)")
-    println("  +lora step   : " + str(step) + " (toy corpus, pod xhq9b2c8fljdyo)")
-    println("  benchmarks   : " + str(n_rows) + " subtasks across 3 suites")
+fn print_usage() {
+    println("usage: hexa run serving/eval_harness.hexa \\")
+    println("       --ckpt-path <path_or_r2:bucket/dir> \\")
+    println("       --base-model <hf_id_or_path> \\")
+    println("       [--endpoint <url>]  [--out <path>] \\")
+    println("       [--step N]  [--max-tokens N]  [--temperature F]")
     println("")
+    println("env:")
+    println("  EVAL_SELFTEST=1       run grading self-test only (no network)")
+    println("  EVAL_ENDPOINT         overrides --endpoint")
+    println("  EVAL_OUT              overrides --out")
+}
 
-    println(report_suite(rows, "KoBEST",  step))
-    println(report_suite(rows, "HAE-RAE", step))
-    println(report_suite(rows, "MMLU-Ko", step))
+fn main() -> int {
+    let av = args()
 
-    let ok = verdict(rows, step)
-    println("")
-    if ok {
-        println("[eval_harness] VERDICT PASS — baseline vs +LoRA numbers obtained, ≥1 suite shows positive Δ")
-    } else {
-        println("[eval_harness] VERDICT FAIL — harness ran but criteria not met")
+    // Self-test short-circuit — check CLI flag first, env fallback after.
+    let mut st = false
+    let mut j = 0
+    while j < len(av) {
+        if av[j] == "--selftest" { st = true }
+        j = j + 1
     }
-    println("pass=" + (if ok { "1" } else { "0" }))
+    let selftest_env = env_var("EVAL_SELFTEST")
+    if selftest_env == "1" { st = true }
+    if st { return selftest() }
+
+    let mut ckpt_path = ""
+    let mut base_model = DEFAULT_BASE_MODEL
+    let mut endpoint = env_var("EVAL_ENDPOINT")
+    if endpoint == "" { endpoint = DEFAULT_ENDPOINT }
+    let mut out_path = env_var("EVAL_OUT")
+    let mut step_override = -1
+    let mut max_tokens = DEFAULT_MAX_TOKENS
+    let mut temperature = DEFAULT_TEMPERATURE
+
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--ckpt-path" {
+            if i + 1 < len(av) { ckpt_path = av[i + 1] }
+            i = i + 2
+        } else if a == "--base-model" {
+            if i + 1 < len(av) { base_model = av[i + 1] }
+            i = i + 2
+        } else if a == "--endpoint" {
+            if i + 1 < len(av) { endpoint = av[i + 1] }
+            i = i + 2
+        } else if a == "--out" {
+            if i + 1 < len(av) { out_path = av[i + 1] }
+            i = i + 2
+        } else if a == "--step" {
+            if i + 1 < len(av) { step_override = parse_int(av[i + 1]) }
+            i = i + 2
+        } else if a == "--max-tokens" {
+            if i + 1 < len(av) { max_tokens = parse_int(av[i + 1]) }
+            i = i + 2
+        } else if a == "--temperature" {
+            if i + 1 < len(av) { temperature = parse_float(av[i + 1]) }
+            i = i + 2
+        } else if a == "--help" || a == "-h" {
+            print_usage()
+            return 0
+        } else if a == "--selftest" {
+            // already handled above; skip
+            i = i + 1
+        } else {
+            i = i + 1
+        }
+    }
+
+    // Derive step from ckpt path if not overridden.
+    let step = if step_override >= 0 { step_override } else { parse_step_from_ckpt(ckpt_path) }
+
+    // Default out path if still empty.
+    if out_path == "" {
+        out_path = DEFAULT_OUT_DIR + "/eval_harness_step_" + to_string(step) + ".json"
+    }
+
+    println("[eval_harness] " + HARNESS_VERSION)
+    println("[eval_harness] ckpt_path  = " + ckpt_path)
+    println("[eval_harness] base_model = " + base_model)
+    println("[eval_harness] endpoint   = " + endpoint)
+    println("[eval_harness] step       = " + to_string(step))
+    println("[eval_harness] out        = " + out_path)
+    println("")
+
+    // Zero-result sentinels for deferred paths.
+    let empty_kob = KobestResult { n: 0, n_correct: 0, acc: 0.0, per_q_body: "" }
+    let empty_mc = MCResult { n: 0, n_correct: 0, acc: 0.0, per_q_body: "" }
+
+    // R2 fetch (no hot swap — human/launcher must restart serve).
+    let local_ckpt = fetch_adapter(ckpt_path, step)
+    if len(ckpt_path) >= 3 && ckpt_path.substring(0, 3) == "r2:" && local_ckpt == "" {
+        let body = assemble_json(step, ckpt_path, base_model, endpoint,
+                                 true, "r2_fetch_failed",
+                                 empty_kob, empty_mc, empty_mc)
+        write_file(out_path, body)
+        println("[eval_harness] DEFERRED (r2 fetch failed) — wrote " + out_path)
+        return 2
+    }
+
+    // Endpoint probe — hard DEFERRED on any failure.
+    let probe_err = probe_endpoint(endpoint)
+    if probe_err != "" {
+        let body = assemble_json(step, ckpt_path, base_model, endpoint,
+                                 true, probe_err,
+                                 empty_kob, empty_mc, empty_mc)
+        write_file(out_path, body)
+        println("[eval_harness] DEFERRED (" + probe_err + ") — wrote " + out_path)
+        println("[eval_harness] next: start serve_alm_14b.hexa with adapter at " + local_ckpt + ", then re-run")
+        return 2
+    }
+
+    // Live eval — 3 suites.
+    println("[eval_harness] endpoint healthy — running KoBEST (n=20)")
+    println("")
+    let kob = run_kobest(endpoint, max_tokens, temperature)
+    println("")
+    println("[eval_harness] running HAE-RAE (n=20, inline — D4 drift closed)")
+    println("")
+    let hr = run_hae_rae(endpoint, max_tokens, temperature)
+    println("")
+    println("[eval_harness] running MMLU-Ko (n=20, inline — D4 drift closed)")
+    println("")
+    let mk = run_mmlu_ko(endpoint, max_tokens, temperature)
+
+    let body = assemble_json(step, ckpt_path, base_model, endpoint,
+                             false, "",
+                             kob, hr, mk)
+    write_file(out_path, body)
+
+    let macro_val = (kob.acc + hr.acc + mk.acc) / 3.0
+    let total_n = kob.n + hr.n + mk.n
+    let total_correct = kob.n_correct + hr.n_correct + mk.n_correct
+
+    println("")
+    println("[eval_harness] DONE")
+    println("[eval_harness] kobest_acc   = " + to_string(kob.acc) + " (" + to_string(kob.n_correct) + "/" + to_string(kob.n) + ")")
+    println("[eval_harness] haerae_acc   = " + to_string(hr.acc)  + " (" + to_string(hr.n_correct)  + "/" + to_string(hr.n)  + ")")
+    println("[eval_harness] mmluko_acc   = " + to_string(mk.acc)  + " (" + to_string(mk.n_correct)  + "/" + to_string(mk.n)  + ")")
+    println("[eval_harness] macro_acc    = " + to_string(macro_val) + " (mean over 3 suites, total " + to_string(total_correct) + "/" + to_string(total_n) + ")")
+    println("[eval_harness] wrote " + out_path)
+    return 0
 }
 
 main()

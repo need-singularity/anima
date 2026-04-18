@@ -164,6 +164,67 @@ fn vr_djb2(s: string) -> int {
     return h
 }
 
+// Parse a string of decimal digits into an int. Ignores leading/trailing
+// whitespace. Returns 0 on empty or any non-digit character.
+fn vr_parse_int(s: string) -> int {
+    let t = s.trim()
+    let n = len(t)
+    if n == 0 { return 0 }
+    let mut i = 0
+    let mut neg = false
+    if t.substring(0, 1) == "-" {
+        neg = true
+        i = 1
+    }
+    let mut out = 0
+    let mut seen = 0
+    while i < n {
+        let c = vr_byte_at(t, i)
+        if c < 48 { return 0 }
+        if c > 57 { return 0 }
+        out = out * 10 + (c - 48)
+        seen = seen + 1
+        i = i + 1
+    }
+    if seen == 0 { return 0 }
+    if neg { return 0 - out }
+    return out
+}
+
+// Scan `result` from the end for the last "RC=N" marker and return N.
+// Returns -1 if no "RC=" is found.  Uses only substring+len.
+fn vr_rc_from_tail(result: string) -> int {
+    let n = len(result)
+    if n < 3 { return -1 }
+    let mut i = n - 3
+    let mut found = -1
+    while i >= 0 {
+        if result.substring(i, i + 3) == "RC=" {
+            found = i + 3
+            i = -1
+        } else {
+            i = i - 1
+        }
+    }
+    if found < 0 { return -1 }
+    // Collect digits starting at `found` until non-digit / end.
+    let mut j = found
+    let mut acc = 0
+    let mut any = 0
+    while j < n {
+        let c = vr_byte_at(result, j)
+        if c < 48 { j = n + 1 } else {
+            if c > 57 { j = n + 1 } else {
+                acc = acc * 10 + (c - 48)
+                any = any + 1
+                j = j + 1
+            }
+        }
+    }
+    if any == 0 { return -1 }
+    return acc
+}
+
 fn vr_pad_left(s: string, width: int, pad: string) -> string {
     let mut out = s
     while len(out) < width {
@@ -527,9 +588,59 @@ fn vr_tts_vocoder(reply_text: string) -> VrTtsResult {
     }
 }
 
-// TTS dispatch — env SPEAK_TTS_BACKEND selects mock or vocoder
+// Real-voice TTS: deterministically pick one of 80 pre-recorded clips
+// (10 personas × 8 tts_XX.wav) stored in R2:anima-models/voice_corpus/,
+// fetch once into /tmp/anima_voice_cache, and return base64 PCM16 mono 16 kHz.
+// On any rclone / read failure we fall back to vr_tts_mock.
+// Clips are 16 kHz mono 16-bit per anima-speak/tts_say_driver.hexa — do NOT
+// reuse VR_SAMPLE_RATE (24000) here.
+fn vr_tts_r2_clip(reply_text: string) -> VrTtsResult {
+    let h = vr_djb2(reply_text)
+    let persona = 10 + (h % 10)
+    let clip_idx = (h / 10) % 8
+    let clip_s = vr_pad_left(to_string(clip_idx), 2, "0")
+    let remote = "r2:anima-models/voice_corpus/persona_" + to_string(persona) + "/tts_" + clip_s + ".wav"
+    let local = "/tmp/anima_voice_cache/p" + to_string(persona) + "_" + clip_s + ".wav"
+    if !file_exists(local) {
+        exec("mkdir -p /tmp/anima_voice_cache")
+        let fetch = exec("rclone copyto " + remote + " " + local + " --s3-no-check-bucket 2>&1; echo RC=$?")
+        let rc = vr_rc_from_tail(fetch)
+        if rc != 0 { return vr_tts_mock(reply_text) }
+        if !file_exists(local) { return vr_tts_mock(reply_text) }
+    }
+    // GNU base64 needs -w0, BSD base64 rejects it — try GNU first, fall back.
+    let bytes_b64 = exec("base64 -w0 " + local + " 2>/dev/null || base64 " + local).trim()
+    if len(bytes_b64) == 0 { return vr_tts_mock(reply_text) }
+    let size_s = exec("stat -c%s " + local + " 2>/dev/null || stat -f%z " + local).trim()
+    let size_bytes = vr_parse_int(size_s)
+    if size_bytes <= 0 { return vr_tts_mock(reply_text) }
+    // PCM16 mono ⇒ 2 bytes/sample.  WAV header (~44 B) included; n_samples
+    // is intentionally a coarse estimate — downstream only uses it for
+    // duration display, not decoding.
+    let n_samples = size_bytes / 2
+    let blob = VrWavBlob {
+        sample_rate: 16000,
+        channels: 1,
+        bits: 16,
+        n_samples: n_samples,
+        payload_text: "b64:" + bytes_b64
+    }
+    return VrTtsResult {
+        audio: blob,
+        backend: "r2_clip:persona_" + to_string(persona) + ":tts_" + clip_s,
+        latency_ms: 0,
+        ok: true
+    }
+}
+
+// TTS dispatch — env SPEAK_TTS_BACKEND selects mock, r2_clip, or vocoder.
+// r2_clip is tried before vocoder because real recordings beat DSP synth.
 fn vr_tts_dispatch(reply_text: string) -> VrTtsResult {
     let backend = env("SPEAK_TTS_BACKEND")
+    if backend == "r2_clip" {
+        let r = vr_tts_r2_clip(reply_text)
+        if r.ok { return r }
+    }
     if backend == "vocoder" {
         let r = vr_tts_vocoder(reply_text)
         if r.ok && len(r.audio.payload_text) > 100 { return r }
