@@ -1,0 +1,785 @@
+// training/deploy/clm_r4_pod2_relaunch_hexa_native.hexa
+//
+// CLM r4 — hexa-native relaunch wrapper (SCAFFOLD, --dry-run / --selftest only).
+//
+// Purpose:
+//   Re-launch the CLM 1B r4 corpus-expansion training run on a fresh H100 pod
+//   using the hexa-native trainer (train_clm_gpu.hexa + clm_mmap_loader.hexa)
+//   instead of the old python3 train_clm_1b.py path (banned per R37/AN13/L3-PY).
+//
+// Compliance:
+//   R37 / AN13 / L3-PY — this file contains ZERO python3 invocations.
+//   `pkill -f train_clm_1b.py` IS permitted — it KILLS a legacy residual
+//   python process, it does NOT invoke python. (See migration.md §3 step 2.)
+//
+// Prereq:
+//   - training/deploy/clm_r4_pod2_py_to_hexa_migration.md (plan SSOT)
+//   - Sister session crossbuild artefact (commits f64f6af3 + a4e9e58e):
+//       $HEXA_LANG/build/hexa_v2_linux   (Linux x86_64 ELF, standalone)
+//   - A running H100 pod (pod2 was OOM torn down @ e80ec871 — a NEW pod id
+//     is required on the --pod flag).
+//
+// Scope:
+//   This wrapper is SCAFFOLD + --dry-run + --selftest. It does NOT
+//   execute real SSH / scp / tmux operations unless the user explicitly
+//   removes the dry-run guard AND reviews the plan output. Fire is a
+//   separate manual gesture — never auto.
+//
+// Usage:
+//   hexa training/deploy/clm_r4_pod2_relaunch_hexa_native.hexa --selftest
+//   hexa training/deploy/clm_r4_pod2_relaunch_hexa_native.hexa \
+//        --pod <pod_id> --dry-run
+//   hexa training/deploy/clm_r4_pod2_relaunch_hexa_native.hexa \
+//        --pod <pod_id> --ckpt-dir /workspace/ckpt_clm1b_r4 --steps 750000 --dry-run
+//
+// Live fire (requires user to drop --dry-run AND confirm):
+//   hexa training/deploy/clm_r4_pod2_relaunch_hexa_native.hexa --pod <pod_id>
+//   # This wrapper STILL refuses to run until LIVE_FIRE_OK=1 env is set.
+
+// ── Constants ──────────────────────────────────────────────────────────
+
+let DEFAULT_CKPT_DIR = "/workspace/ckpt_clm1b_r4"
+let DEFAULT_STEPS    = 750000
+let DEFAULT_BATCH    = 8
+let DEFAULT_SEQ      = 512
+let DEFAULT_LR       = "3e-4"
+let DEFAULT_WARMUP   = 5000
+let DEFAULT_SAVE     = 5000
+
+let CORPUS_REMOTE    = "/workspace/corpus_clm_r4.txt"
+let DEFAULT_LOCAL_GZ = "/Users/ghost/Dev/anima/training/corpus_clm_r4.txt.gz"
+let DEFAULT_LOCAL_TXT = "/Users/ghost/Dev/anima/training/corpus_clm_r4.txt"
+let HEXA_LINUX_BIN   = "/build/hexa_v2_linux"   // relative to $HEXA_LANG
+let REMOTE_HEXA_BIN  = "/opt/hexa/bin/hexa_v2"
+let REMOTE_TRAIN_DIR = "/workspace/anima/training"
+let REMOTE_NATIVE    = "/workspace/clm_r4_native"
+let REMOTE_LOG       = "/workspace/clm_r4_hexa.log"
+let TMUX_SESSION     = "clm-r4-hexa"
+
+let LOCAL_SOURCES = [
+    "training/train_clm.hexa",
+    "training/train_clm_gpu.hexa",
+    "training/nn_core.hexa",
+    "training/clm_mmap_loader.hexa",
+    "training/clm_1b_config.json"
+]
+
+// Step 3.6 — Dependency modules (use "X" resolver sources).
+// train_clm.hexa has `use "anima_quantum_clm"` + `use "phi_cache_loader"`.
+// anima_quantum_clm.hexa has `use "anima_quantum"` → `use "quantum_types"`.
+// hexa_v2 transpiler leaves extern references; we transpile each dep to its
+// own .c then gcc link all 5 TUs with --allow-multiple-definition (runtime.c
+// is included per-TU; linker de-dupes).  'main' is renamed per-dep to avoid
+// redefinition (each transpiled .c has its own file-level main).
+let LOCAL_DEP_SOURCES = [
+    "anima-engines/quantum_types.hexa",
+    "anima-engines/anima_quantum.hexa",
+    "anima-engines/anima_quantum_clm.hexa",
+    "training/phi_cache_loader.hexa"
+]
+let DEP_MODULE_NAMES = [
+    "quantum_types",
+    "anima_quantum",
+    "anima_quantum_clm",
+    "phi_cache_loader"
+]
+
+// ── argv parse ────────────────────────────────────────────────────────
+
+let argv = args()
+
+fn flag_value(name: string, fallback: string) -> string {
+    let n = argv.len()
+    let mut i = 0
+    while i < n {
+        if argv[i] == name && i + 1 < n {
+            return argv[i + 1]
+        }
+        i = i + 1
+    }
+    return fallback
+}
+
+fn flag_bool(name: string) -> bool {
+    let n = argv.len()
+    let mut i = 0
+    while i < n {
+        if argv[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+let POD        = flag_value("--pod", "")
+let POD_ID     = flag_value("--pod-id", "")
+let POD_IP_ARG = flag_value("--pod-ip", "")
+let POD_PORT_S = flag_value("--pod-port", "")
+let CORPUS_ARG = flag_value("--corpus", CORPUS_REMOTE)
+let R2_URI_ARG = flag_value("--corpus-r2", "r2:anima-corpus/clm_r4/corpus_clm_r4.txt")
+let CORPUS_LOCAL_GZ  = flag_value("--corpus-local-gz", DEFAULT_LOCAL_GZ)
+let CORPUS_LOCAL_TXT = flag_value("--corpus-local-txt", DEFAULT_LOCAL_TXT)
+let CKPT_DIR   = flag_value("--ckpt-dir", DEFAULT_CKPT_DIR)
+let STEPS_S    = flag_value("--steps", str(DEFAULT_STEPS))
+let LR_ARG     = flag_value("--lr", DEFAULT_LR)
+let WARMUP_S   = flag_value("--warmup", str(DEFAULT_WARMUP))
+let BATCH_S    = flag_value("--batch", str(DEFAULT_BATCH))
+let SEQ_S      = flag_value("--seq", str(DEFAULT_SEQ))
+let DRY_RUN    = flag_bool("--dry-run")
+let SELFTEST   = flag_bool("--selftest")
+
+// ── Utility ───────────────────────────────────────────────────────────
+
+fn env_or(key: string, fallback: string) -> string {
+    let v = env(key)
+    if v == "" { return fallback }
+    return v
+}
+
+fn now_epoch() -> string {
+    return exec("date +%s").trim()
+}
+
+fn now_iso() -> string {
+    return exec("date -u +%Y%m%dT%H%M%SZ").trim()
+}
+
+fn stamp_step(label: string, log_path: string) {
+    let line = "[" + now_epoch() + "] " + label
+    println(line)
+    append_file(log_path, line + "\n")
+}
+
+fn abort(code: int, msg: string) {
+    println("")
+    println("FAIL: " + msg)
+    println("  exit code = " + str(code))
+    println("")
+    exit(code)
+}
+
+// ── ssh / scp helpers ─────────────────────────────────────────────────
+
+// Build "ssh user@ip -p port" prefix, using POD_IP/POD_PORT when resolved.
+// When POD_IP is empty we fall back to a raw runpodctl ssh alias `root@<pod>`.
+fn ssh_base(ip: string, port: string) -> string {
+    if ip == "" { return "ssh root@POD_IP_UNRESOLVED" }
+    // LogLevel=ERROR suppresses "Warning: Permanently added ..." hostkey notice on stderr;
+    // that warning otherwise contaminates rc parsing in exec_with_status (false positive
+    // FAIL_MFS_QUOTA etc.). Fix: 2026-04-18.
+    let opts = " -o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+    if port == "" || port == "22" {
+        return "ssh" + opts + " root@" + ip
+    }
+    return "ssh" + opts + " -p " + port + " root@" + ip
+}
+
+fn scp_base(ip: string, port: string) -> string {
+    if ip == "" { return "scp POD_IP_UNRESOLVED" }
+    // Same LogLevel=ERROR fix as ssh_base — suppress hostkey warning on stderr.
+    let opts = " -o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+    if port == "" || port == "22" {
+        return "scp" + opts
+    }
+    return "scp" + opts + " -P " + port
+}
+
+// runpodctl lookup — returns "ip:port" or "" on failure.
+// Shell does the parsing so we avoid char-level string math (multibyte-safe rule).
+fn lookup_pod(pod_id: string) -> string {
+    if pod_id == "" { return "" }
+    // runpodctl get pod <id> prints a line like: "ssh root@1.2.3.4 -p 54321"
+    let ip_cmd = "runpodctl get pod " + pod_id
+        + " 2>/dev/null | grep -oE 'root@[^ ]+' | head -1 | sed 's/root@//'"
+    let port_cmd = "runpodctl get pod " + pod_id
+        + " 2>/dev/null | grep -oE -- '-p [0-9]+' | head -1 | awk '{print $2}'"
+    let ip = exec(ip_cmd).trim()
+    let port = exec(port_cmd).trim()
+    if ip == "" { return "" }
+    if port == "" { return ip + ":22" }
+    return ip + ":" + port
+}
+
+// ── Exec wrapper with logging ─────────────────────────────────────────
+
+fn run_step(n: int, label: string, cmd: string, dry: bool, log_path: string) -> int {
+    stamp_step("step " + str(n) + " START — " + label, log_path)
+    println("    $ " + cmd)
+    append_file(log_path, "    $ " + cmd + "\n")
+    if dry {
+        stamp_step("step " + str(n) + " SKIP (dry-run)", log_path)
+        return 0
+    }
+    // exec_with_status returns [stdout, exit_code] (hexa-lang runtime.c hexa_exec_with_status).
+    // The rc is element [1]; [0] is the captured stdout. Treating the array as an int is
+    // what caused FAIL_MFS_QUOTA false positive on 2026-04-18 ("rc=[, 0]").
+    let result = exec_with_status(cmd)
+    let rc = result[1]
+    stamp_step("step " + str(n) + " END — rc=" + str(rc), log_path)
+    return rc
+}
+
+// ── Selftest ──────────────────────────────────────────────────────────
+
+fn selftest() -> bool {
+    println("")
+    println("=================================================================")
+    println("  CLM r4 hexa-native relaunch — SELFTEST (no network I/O)")
+    println("=================================================================")
+    println("")
+
+    let mut ok = true
+
+    println("[1/4] Environment:")
+    let hexa_lang = env("HEXA_LANG")
+    if hexa_lang == "" {
+        println("  [MISS] HEXA_LANG not set")
+        ok = false
+    } else {
+        println("  [OK]   HEXA_LANG=" + hexa_lang)
+    }
+
+    let bin_path = hexa_lang + HEXA_LINUX_BIN
+    if file_exists(bin_path) {
+        println("  [OK]   " + bin_path + "  (sister crossbuild ELF)")
+    } else {
+        println("  [MISS] " + bin_path + "  (needed — commits f64f6af3 + a4e9e58e)")
+        ok = false
+    }
+
+    println("")
+    println("[2/4] Local sources (will be scp'd):")
+    let mut i = 0
+    while i < LOCAL_SOURCES.len() {
+        let p = LOCAL_SOURCES[i]
+        if file_exists(p) {
+            println("  [OK]   " + p)
+        } else {
+            println("  [MISS] " + p)
+            ok = false
+        }
+        i = i + 1
+    }
+
+    println("")
+    println("[3/4] CLI flags parsed:")
+    println("  --pod       = " + (if POD == "" { "<unset>" } else { POD }))
+    println("  --ckpt-dir  = " + CKPT_DIR)
+    println("  --steps     = " + STEPS_S)
+    println("  --dry-run   = " + (if DRY_RUN { "true" } else { "false" }))
+    println("  --selftest  = true")
+
+    println("")
+    println("[4/4] ssh reachability (offline):")
+    println("  ssh config check deferred — --selftest does NOT open sockets")
+    println("  (run --dry-run with --pod <id> to preview full SSH plan)")
+
+    println("")
+    if ok {
+        println("RESULT: PASS — ready for --dry-run then live fire.")
+    } else {
+        println("RESULT: FAIL — resolve MISS items above before proceeding.")
+    }
+    println("")
+    return ok
+}
+
+// ── Plan (shared by --dry-run and live fire) ──────────────────────────
+
+fn print_step(n: int, title: string, cmd: string) {
+    println("")
+    println("  Step " + str(n) + ": " + title)
+    println("    $ " + cmd)
+}
+
+fn build_plan(log_path: string) {
+    let hexa_lang = env_or("HEXA_LANG", "<HEXA_LANG>")
+    let bin_src   = hexa_lang + HEXA_LINUX_BIN
+    let pod_label = (if POD != "" { POD }
+                     else if POD_ID != "" { POD_ID }
+                     else { POD_IP_ARG + ":" + POD_PORT_S })
+
+    println("")
+    println("=================================================================")
+    println("  CLM r4 hexa-native relaunch — PLAN")
+    println("=================================================================")
+    println("  pod        = " + pod_label)
+    println("  ckpt-dir   = " + CKPT_DIR)
+    println("  steps      = " + STEPS_S)
+    println("  corpus     = " + CORPUS_ARG)
+    println("  r2 source  = " + R2_URI_ARG)
+    println("  lr/warmup  = " + LR_ARG + " / " + WARMUP_S)
+    println("  batch/seq  = " + BATCH_S + " / " + SEQ_S)
+    println("  dry-run    = " + (if DRY_RUN { "YES (no remote I/O)" } else { "NO (LIVE)" }))
+    println("  log        = " + log_path)
+
+    print_step(1, "Kill any stale tmux session",
+        "ssh " + pod_label + " 'tmux kill-session -t clm-r4 2>/dev/null || true'")
+
+    print_step(2, "Reap legacy python residual (KILL not INVOKE — R37/AN13 OK)",
+        "ssh " + pod_label + " 'pkill -f train_clm_1b.py || true'")
+
+    print_step(3, "Deploy hexa_v2 Linux ELF (standalone)",
+        "ssh " + pod_label + " 'mkdir -p /opt/hexa/bin' && "
+        + "scp " + bin_src + " " + pod_label + ":" + REMOTE_HEXA_BIN + " && "
+        + "ssh " + pod_label + " 'chmod +x " + REMOTE_HEXA_BIN + "'")
+
+    print_step(4, "Deploy hexa trainer sources",
+        "scp training/train_clm.hexa training/train_clm_gpu.hexa "
+        + "training/nn_core.hexa training/clm_mmap_loader.hexa "
+        + "training/clm_1b_config.json "
+        + pod_label + ":" + REMOTE_TRAIN_DIR + "/")
+
+    print_step(5, "Cross-compile hexa -> C -> native ELF on pod",
+        "ssh " + pod_label + " \""
+        + REMOTE_HEXA_BIN + " " + REMOTE_TRAIN_DIR + "/train_clm.hexa "
+        + "/tmp/clm_r4.c && "
+        + "gcc -O2 /tmp/clm_r4.c -o " + REMOTE_NATIVE + " -lm\"")
+
+    print_step(6, "Launch hexa-native trainer in tmux",
+        "ssh " + pod_label + " \"tmux new -d -s " + TMUX_SESSION + " '"
+        + REMOTE_NATIVE + " --corpus " + CORPUS_REMOTE
+        + " --steps " + STEPS_S
+        + " --batch " + str(DEFAULT_BATCH)
+        + " --seq " + str(DEFAULT_SEQ)
+        + " --lr " + DEFAULT_LR
+        + " --warmup " + str(DEFAULT_WARMUP)
+        + " --save-every " + str(DEFAULT_SAVE)
+        + " --ckpt-dir " + CKPT_DIR
+        + " 2>&1 | tee " + REMOTE_LOG + "'\"")
+
+    print_step(7, "Verify after 60s (util > 5% + log has loss line)",
+        "sleep 60 && ssh " + pod_label + " \""
+        + "nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader; "
+        + "grep -m1 'loss=' " + REMOTE_LOG + " || echo NO_LOSS\"")
+
+    println("")
+    println("Gate / Error handling:")
+    println("  Step 1/2 SSH fail  -> exit 1 (pod unreachable)")
+    println("  Step 5 gcc fail    -> FAIL: CLM trainer hexa->C 컴파일 실패, use")
+    println("                        resolution 상태 확인 필요 (exit 3)")
+    println("  Step 7 verify fail -> auto tmux kill-session -t "
+        + TMUX_SESSION + " + exit 2")
+    println("")
+}
+
+// ── Live fire (gated) ─────────────────────────────────────────────────
+
+fn resolve_pod_endpoint(log_path: string, dry: bool) -> string {
+    // Priority: explicit --pod-ip + --pod-port > --pod-id lookup > --pod lookup
+    if POD_IP_ARG != "" {
+        let p = (if POD_PORT_S == "" { "22" } else { POD_PORT_S })
+        stamp_step("pod endpoint: explicit --pod-ip/--pod-port => "
+            + POD_IP_ARG + ":" + p, log_path)
+        return POD_IP_ARG + ":" + p
+    }
+    let lookup_id = (if POD_ID != "" { POD_ID } else { POD })
+    if lookup_id == "" {
+        abort(2, "cannot resolve pod: need --pod-ip + --pod-port, or --pod-id, or --pod")
+        return ""
+    }
+    stamp_step("pod endpoint: runpodctl lookup for id=" + lookup_id, log_path)
+    if dry {
+        stamp_step("dry-run: assuming endpoint=<IP>:<PORT>", log_path)
+        return "DRYRUN_IP:DRYRUN_PORT"
+    }
+    let ep = lookup_pod(lookup_id)
+    if ep == "" {
+        abort(2, "runpodctl lookup failed for pod_id=" + lookup_id
+            + " — pass --pod-ip <ip> --pod-port <n> explicitly")
+        return ""
+    }
+    stamp_step("resolved: " + ep, log_path)
+    return ep
+}
+
+fn split_ep(ep: string) -> [string] {
+    // ep = "ip:port" — split once. Uses shell echo|awk to avoid char math.
+    let ip = exec("echo '" + ep + "' | awk -F: '{print $1}'").trim()
+    let port = exec("echo '" + ep + "' | awk -F: '{print $2}'").trim()
+    return [ip, port]
+}
+
+fn live_fire(log_path: string) {
+    let live_ok = env("LIVE_FIRE_OK")
+    let dry = DRY_RUN
+    if !dry && live_ok != "1" {
+        println("")
+        println("REFUSED: live fire requires LIVE_FIRE_OK=1 in env.")
+        println("  This wrapper refuses destructive exec without the gate.")
+        println("  To execute:")
+        println("    1. Review --dry-run output with user")
+        println("    2. Confirm new pod id + ckpt-dir + sister crossbuild present")
+        println("    3. LIVE_FIRE_OK=1 hexa <this file> --pod-id <id>")
+        println("")
+        panic("live fire guard: LIVE_FIRE_OK != 1")
+    }
+
+    if dry {
+        stamp_step("DRY-RUN — live_fire() will print every ssh/scp without execing", log_path)
+    } else {
+        stamp_step("LIVE FIRE armed (LIVE_FIRE_OK=1) — proceeding", log_path)
+    }
+
+    let ep = resolve_pod_endpoint(log_path, dry)
+    let parts = split_ep(ep)
+    let ip   = (if dry { "DRYRUN_IP" } else { parts[0] })
+    let port = (if dry { "DRYRUN_PORT" } else { parts[1] })
+    let SSH = ssh_base(ip, port)
+    let SCP = scp_base(ip, port)
+    let dest = (if port == "" || port == "22" { "root@" + ip }
+                else { "root@" + ip })
+    // scp syntax differs: host:path with separate -P port in SCP prefix.
+
+    let hexa_lang = env_or("HEXA_LANG", "/Users/ghost/Dev/hexa-lang")
+    let bin_src = hexa_lang + HEXA_LINUX_BIN
+
+    // ── Step 0 — MFS preflight (20GB dd probe per runpod_mfs_quota rule) ──
+    let rc0 = run_step(0, "MFS preflight — 20GB dd probe",
+        SSH + " 'dd if=/dev/zero of=/workspace/_q_test bs=1M count=20000 status=none "
+        + "&& rm /workspace/_q_test'",
+        dry, log_path)
+    if !dry && rc0 != 0 { abort(2, "FAIL_MFS_QUOTA — /workspace quota probe failed (rc=" + str(rc0) + ")") }
+
+    // ── Step 0.5 — Pre-clean old ckpt dir (quota protection) ──
+    let rc05 = run_step(1, "ckpt dir preclean (MFS quota rule)",
+        SSH + " 'rm -rf " + CKPT_DIR + "'",
+        dry, log_path)
+    if !dry && rc05 != 0 { abort(2, "FAIL_CKPT_PRECLEAN rc=" + str(rc05)) }
+
+    // ── Step 1 — Kill existing tmux sessions ──
+    let rc1 = run_step(2, "tmux kill legacy sessions",
+        SSH + " 'tmux kill-session -t clm-r4 2>/dev/null || true; "
+        + "tmux kill-session -t " + TMUX_SESSION + " 2>/dev/null || true'",
+        dry, log_path)
+    // non-fatal: true masks errors. Ignore rc.
+
+    // ── Step 2 — Reap legacy python residual (KILL only, not invoke) ──
+    let rc2 = run_step(3, "pkill residual train_clm_1b.py (KILL not INVOKE — R37 OK)",
+        SSH + " 'pkill -f train_clm_1b.py 2>/dev/null || true'",
+        dry, log_path)
+
+    // ── Step 3 — Deploy Linux hexa_v2 binary + sha256 verify ──
+    if !dry && !file_exists(bin_src) {
+        abort(2, "FAIL_HEXA_BIN_MISSING: " + bin_src + " — rebuild sister crossbuild")
+    }
+    let _mk = run_step(4, "mkdir -p /opt/hexa/bin",
+        SSH + " 'mkdir -p /opt/hexa/bin'", dry, log_path)
+    let rc3a = run_step(5, "scp hexa_v2 Linux ELF",
+        SCP + " " + bin_src + " " + dest + ":" + REMOTE_HEXA_BIN,
+        dry, log_path)
+    if !dry && rc3a != 0 { abort(2, "FAIL_HEXA_BIN_SCP rc=" + str(rc3a)) }
+    let _chmod = run_step(6, "chmod +x hexa_v2 on pod",
+        SSH + " 'chmod +x " + REMOTE_HEXA_BIN + "'", dry, log_path)
+    // sha256 compare
+    let local_sha  = exec("shasum -a 256 " + bin_src + " | awk '{print $1}'").trim()
+    let remote_sha_cmd = SSH + " 'sha256sum " + REMOTE_HEXA_BIN + " 2>/dev/null | awk \"{print \\$1}\"'"
+    let remote_sha = (if dry { local_sha } else { exec(remote_sha_cmd).trim() })
+    stamp_step("sha256 local=" + local_sha + " remote=" + remote_sha, log_path)
+    if !dry && local_sha != "" && remote_sha != "" && local_sha != remote_sha {
+        abort(2, "FAIL_HEXA_BIN_SHA_MISMATCH local=" + local_sha + " remote=" + remote_sha)
+    }
+
+    // ── Step 3.5 — Deploy hexa runtime.c + native/* to /tmp/ (same dir as transpiled .c) ──
+    // Transpiled /tmp/clm_r4.c emits `#include "runtime.c"`; runtime.c itself
+    // emits `#include "native/tensor_kernels.c"` and `#include "native/net.c"`.
+    // 2nd fire missed runtime.c. 3rd fire missed native/*. Fix: scp all three.
+    let runtime_src = hexa_lang + "/self/runtime.c"
+    let tk_src      = hexa_lang + "/self/native/tensor_kernels.c"
+    let net_src     = hexa_lang + "/self/native/net.c"
+    let hxblas_src  = hexa_lang + "/self/native/hxblas_linux.c"
+    let hxlmh_src   = hexa_lang + "/self/native/hxlmhead_linux.c"
+    if !dry && !file_exists(runtime_src) {
+        abort(2, "FAIL_RUNTIME_MISSING: " + runtime_src)
+    }
+    if !dry && !file_exists(tk_src) {
+        abort(2, "FAIL_RUNTIME_MISSING: " + tk_src)
+    }
+    if !dry && !file_exists(net_src) {
+        abort(2, "FAIL_RUNTIME_MISSING: " + net_src)
+    }
+    if !dry && !file_exists(hxblas_src) {
+        abort(2, "FAIL_RUNTIME_MISSING: " + hxblas_src)
+    }
+    if !dry && !file_exists(hxlmh_src) {
+        abort(2, "FAIL_RUNTIME_MISSING: " + hxlmh_src)
+    }
+    let rc_rt = run_step(65, "scp runtime.c -> /tmp/runtime.c",
+        SCP + " " + runtime_src + " " + dest + ":/tmp/runtime.c",
+        dry, log_path)
+    if !dry && rc_rt != 0 { abort(2, "FAIL_RUNTIME_SCP rc=" + str(rc_rt)) }
+    let _rmk = run_step(66, "mkdir -p /tmp/native",
+        SSH + " 'mkdir -p /tmp/native'", dry, log_path)
+    let rc_tk = run_step(67, "scp native/tensor_kernels.c -> /tmp/native/",
+        SCP + " " + tk_src + " " + dest + ":/tmp/native/tensor_kernels.c",
+        dry, log_path)
+    if !dry && rc_tk != 0 { abort(2, "FAIL_RUNTIME_SCP tensor_kernels rc=" + str(rc_tk)) }
+    let rc_net = run_step(68, "scp native/net.c -> /tmp/native/",
+        SCP + " " + net_src + " " + dest + ":/tmp/native/net.c",
+        dry, log_path)
+    if !dry && rc_net != 0 { abort(2, "FAIL_RUNTIME_SCP net rc=" + str(rc_net)) }
+    // 7th fire (2026-04-18): scp hxblas_linux.c + hxlmhead_linux.c and build
+    // them as separate shared libraries on the pod. runtime.c uses dlopen at
+    // runtime to resolve hxblas_sgemm / hxblas_attn_softmax_causal /
+    // hxlmhead_bwd / hxlmhead_version — these symbols are NOT in the main
+    // binary, they live in libhxblas.so / libhxlmhead.so on the dlopen
+    // search path. 6th fire failed Step 14 because no .so was ever built.
+    let rc_hxb = run_step(69, "scp native/hxblas_linux.c -> /tmp/native/",
+        SCP + " " + hxblas_src + " " + dest + ":/tmp/native/hxblas_linux.c",
+        dry, log_path)
+    if !dry && rc_hxb != 0 { abort(2, "FAIL_RUNTIME_SCP hxblas rc=" + str(rc_hxb)) }
+    let rc_hxh = run_step(70, "scp native/hxlmhead_linux.c -> /tmp/native/",
+        SCP + " " + hxlmh_src + " " + dest + ":/tmp/native/hxlmhead_linux.c",
+        dry, log_path)
+    if !dry && rc_hxh != 0 { abort(2, "FAIL_RUNTIME_SCP hxlmhead rc=" + str(rc_hxh)) }
+    // apt-get install libopenblas-dev if missing (non-fatal — best-effort)
+    let _apt = run_step(71, "ensure libopenblas-dev on pod",
+        SSH + " 'dpkg -s libopenblas-dev >/dev/null 2>&1 || "
+        + "(apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libopenblas-dev) || true'",
+        dry, log_path)
+    // Build libhxblas.so
+    let rc_bb = run_step(72, "gcc -shared libhxblas.so (OpenBLAS)",
+        SSH + " 'gcc -O2 -fPIC -shared /tmp/native/hxblas_linux.c "
+        + "-o /tmp/native/libhxblas.so -lopenblas -lgomp -lm 2>&1'",
+        dry, log_path)
+    if !dry && rc_bb != 0 { abort(3, "FAIL_HXBLAS_BUILD rc=" + str(rc_bb)) }
+    // Build libhxlmhead.so
+    let rc_bh = run_step(73, "gcc -shared libhxlmhead.so (OpenBLAS)",
+        SSH + " 'gcc -O2 -fPIC -shared /tmp/native/hxlmhead_linux.c "
+        + "-o /tmp/native/libhxlmhead.so -lopenblas -lgomp -lm 2>&1'",
+        dry, log_path)
+    if !dry && rc_bh != 0 { abort(3, "FAIL_HXLMHEAD_BUILD rc=" + str(rc_bh)) }
+    // Install .so files to a stable dlopen search dir (/usr/local/lib) + ldconfig
+    let rc_inst = run_step(74, "install .so -> /usr/local/lib + ldconfig",
+        SSH + " 'cp /tmp/native/libhxblas.so /tmp/native/libhxlmhead.so /usr/local/lib/ "
+        + "&& ldconfig 2>&1'",
+        dry, log_path)
+    if !dry && rc_inst != 0 { abort(3, "FAIL_SO_INSTALL rc=" + str(rc_inst)) }
+
+    // ── Step 4 — Deploy hexa trainer sources ──
+    let _rmkd = run_step(7, "mkdir -p remote training dir",
+        SSH + " 'mkdir -p " + REMOTE_TRAIN_DIR + "'", dry, log_path)
+    let mut i = 0
+    while i < LOCAL_SOURCES.len() {
+        let src = LOCAL_SOURCES[i]
+        let abs_src = "/Users/ghost/Dev/anima/" + src
+        if !dry && !file_exists(abs_src) {
+            abort(2, "FAIL_SRC_MISSING: " + abs_src)
+        }
+        let rc_s = run_step(8, "scp " + src,
+            SCP + " " + abs_src + " " + dest + ":" + REMOTE_TRAIN_DIR + "/",
+            dry, log_path)
+        if !dry && rc_s != 0 { abort(2, "FAIL_SRC_SCP " + src + " rc=" + str(rc_s)) }
+        i = i + 1
+    }
+
+    // ── Step 4.5 — Deploy dep .hexa modules to REMOTE_TRAIN_DIR ──
+    // hexa_v2 resolves `use "X"` by looking for X.hexa in same dir as main.
+    // (Resolution suppresses unresolved-path warnings but does NOT inline —
+    // each dep must still be transpiled separately and linked.)
+    let mut di = 0
+    while di < LOCAL_DEP_SOURCES.len() {
+        let dsrc = LOCAL_DEP_SOURCES[di]
+        let abs_dsrc = "/Users/ghost/Dev/anima/" + dsrc
+        if !dry && !file_exists(abs_dsrc) {
+            abort(2, "FAIL_DEP_MISSING: " + abs_dsrc)
+        }
+        let rc_d = run_step(85, "scp dep " + dsrc,
+            SCP + " " + abs_dsrc + " " + dest + ":" + REMOTE_TRAIN_DIR + "/",
+            dry, log_path)
+        if !dry && rc_d != 0 { abort(2, "FAIL_DEP_SCP " + dsrc + " rc=" + str(rc_d)) }
+        di = di + 1
+    }
+
+    // ── Step 5 — Cross-compile on pod (hexa → C → ELF) ──
+    let rc5a = run_step(9, "remote hexa -> C transpile (main)",
+        SSH + " '" + REMOTE_HEXA_BIN + " " + REMOTE_TRAIN_DIR + "/train_clm.hexa "
+        + "/tmp/clm_r4.c 2>&1'",
+        dry, log_path)
+    if !dry && rc5a != 0 { abort(3, "FAIL_CROSSCOMPILE (hexa->C) rc=" + str(rc5a)) }
+
+    // Step 5.5 — transpile each dep + rename its main() to avoid redefinition
+    let mut ti = 0
+    let mut dep_c_list = ""
+    while ti < DEP_MODULE_NAMES.len() {
+        let mname = DEP_MODULE_NAMES[ti]
+        let dep_hexa = REMOTE_TRAIN_DIR + "/" + mname + ".hexa"
+        let dep_c    = "/tmp/" + mname + ".c"
+        let rc_t = run_step(90, "remote transpile dep " + mname,
+            SSH + " '" + REMOTE_HEXA_BIN + " " + dep_hexa + " " + dep_c + " 2>&1'",
+            dry, log_path)
+        if !dry && rc_t != 0 { abort(3, "FAIL_DEP_TRANSPILE " + mname + " rc=" + str(rc_t)) }
+        // rename main -> main_<modname> so linker doesn't see duplicate main
+        let rc_r = run_step(91, "rename main() in dep " + mname,
+            SSH + " 'sed -i \"s|^int main(int argc|int main_" + mname
+            + "(int argc|\" " + dep_c + "'",
+            dry, log_path)
+        if !dry && rc_r != 0 { abort(3, "FAIL_DEP_RENAME_MAIN " + mname + " rc=" + str(rc_r)) }
+        dep_c_list = dep_c_list + " " + dep_c
+        ti = ti + 1
+    }
+
+    // Step 10 — gcc link main + all deps with --allow-multiple-definition
+    // (runtime.c is included by every transpiled .c; linker de-dupes symbols
+    //  by taking the first definition.)
+    let rc5b = run_step(10, "remote gcc link (main + deps)",
+        SSH + " 'gcc -O2 -I /opt/hexa/include -Wl,--allow-multiple-definition"
+        + " /tmp/clm_r4.c" + dep_c_list + " -o "
+        + REMOTE_NATIVE + " -lm 2>&1'",
+        dry, log_path)
+    if !dry && rc5b != 0 { abort(3, "FAIL_CROSSCOMPILE (gcc link) rc=" + str(rc5b)) }
+
+    // ── Step 6 — Corpus provisioning (3-tier: local gz > local txt > R2) ──
+    // 2026-04-18: R2 bucket name was typo'd (anima-corpora → anima-corpus) and
+    // corpus_clm_r4.txt was never uploaded to R2. Add local-scp fallback so
+    // 5th fire can pass Step 11 without rclone creds on pod.
+    let already_present = (if dry { false }
+        else { exec(SSH + " 'test -f " + CORPUS_ARG
+            + " && test $(wc -c <" + CORPUS_ARG + ") -gt 5000000000'"
+            + " >/dev/null 2>&1; echo $?").trim() == "0" })
+    if already_present {
+        stamp_step("Step 11 skip: corpus already present on pod (>5GB)", log_path)
+    } else {
+        let have_gz  = file_exists(CORPUS_LOCAL_GZ)
+        let have_txt = file_exists(CORPUS_LOCAL_TXT)
+        if have_gz {
+            // Tier 1: local gz direct scp (1.71GB) + gunzip
+            stamp_step("Step 11a tier1: local gz scp -> gunzip", log_path)
+            let rc11a = run_step(11, "scp local corpus_clm_r4.txt.gz",
+                SCP + " " + CORPUS_LOCAL_GZ + " " + dest + ":/workspace/corpus_clm_r4.txt.gz",
+                dry, log_path)
+            if !dry && rc11a != 0 { abort(2, "FAIL_CORPUS_SCP_GZ rc=" + str(rc11a)) }
+            let rc11b = run_step(11, "remote gunzip corpus_clm_r4.txt.gz",
+                SSH + " 'cd /workspace && gunzip -f corpus_clm_r4.txt.gz'",
+                dry, log_path)
+            if !dry && rc11b != 0 { abort(2, "FAIL_CORPUS_GUNZIP rc=" + str(rc11b)) }
+        } else if have_txt {
+            // Tier 2: local txt direct scp (5.38GB, slower)
+            stamp_step("Step 11a tier2: local txt direct scp (5.38GB)", log_path)
+            let rc11t = run_step(11, "scp local corpus_clm_r4.txt (5.38GB)",
+                SCP + " " + CORPUS_LOCAL_TXT + " " + dest + ":" + CORPUS_ARG,
+                dry, log_path)
+            if !dry && rc11t != 0 { abort(2, "FAIL_CORPUS_SCP_TXT rc=" + str(rc11t)) }
+        } else {
+            // Tier 3: R2 pull fallback (needs rclone creds on pod)
+            stamp_step("Step 11a tier3: R2 pull fallback (rclone)", log_path)
+            let rc6 = run_step(11, "corpus R2 pull (fallback)",
+                SSH + " 'rclone copy " + R2_URI_ARG
+                + " /workspace/ --s3-no-check-bucket'",
+                dry, log_path)
+            if !dry && rc6 != 0 { abort(2, "FAIL_CORPUS_PULL rc=" + str(rc6)) }
+        }
+    }
+    // verify corpus present + size > 5GB
+    let rc6v = run_step(12, "corpus presence + size verify (>5GB)",
+        SSH + " 'test -f " + CORPUS_ARG
+        + " && test $(wc -c <" + CORPUS_ARG + ") -gt 5000000000 "
+        + "&& wc -c " + CORPUS_ARG + "'",
+        dry, log_path)
+    if !dry && rc6v != 0 { abort(2, "FAIL_CORPUS_MISSING_OR_SMALL: " + CORPUS_ARG) }
+
+    // ── Step 7 — tmux launch hexa-native trainer ──
+    // LD_LIBRARY_PATH prepended so dlopen("libhxblas.so") + dlopen("libhxlmhead.so")
+    // can locate the .so files built in Step 3.5 (7th fire onward).
+    let train_cmd = "LD_LIBRARY_PATH=/usr/local/lib:/tmp/native:\\$LD_LIBRARY_PATH "
+        + "HEXA_NATIVE_LIB_DIR=/tmp/native "
+        + REMOTE_NATIVE
+        + " --corpus " + CORPUS_ARG
+        + " --steps " + STEPS_S
+        + " --batch " + BATCH_S
+        + " --seq " + SEQ_S
+        + " --lr " + LR_ARG
+        + " --warmup " + WARMUP_S
+        + " --save-every " + str(DEFAULT_SAVE)
+        + " --ckpt-dir " + CKPT_DIR
+        + " 2>&1 | tee " + REMOTE_LOG
+    // Use bash -lc for tmux inner so env inherits.
+    let tmux_cmd = SSH + " \"tmux new -d -s " + TMUX_SESSION
+        + " 'bash -lc \\\"" + train_cmd + "\\\"'\""
+    let rc7 = run_step(13, "tmux launch " + TMUX_SESSION, tmux_cmd, dry, log_path)
+    if !dry && rc7 != 0 { abort(2, "FAIL_TMUX_LAUNCH rc=" + str(rc7)) }
+
+    // ── Step 8 — 60s verify (util + loss line) ──
+    stamp_step("sleep 60s before verify", log_path)
+    if !dry { exec("sleep 60") }
+    let util = (if dry { "<util>" }
+                else {
+                    exec(SSH + " 'nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | head -1'").trim()
+                })
+    stamp_step("nvidia-smi util = " + util + "%", log_path)
+    let tail = (if dry { "<loss tail>" }
+                else {
+                    exec(SSH + " 'tail -5 " + REMOTE_LOG + " 2>/dev/null'").trim()
+                })
+    stamp_step("log tail:\n" + tail, log_path)
+
+    if !dry {
+        // util numeric check (>5). awk does compare + print 1/0.
+        let ok_util_s = exec("echo '" + util + "' | awk '{ if ($1+0 > 5) print 1; else print 0 }'").trim()
+        let loss_line = exec(SSH + " 'grep -c \"loss=\" " + REMOTE_LOG + " 2>/dev/null || echo 0'").trim()
+        if ok_util_s != "1" || loss_line == "0" {
+            exec(SSH + " 'tmux kill-session -t " + TMUX_SESSION + " 2>/dev/null || true'")
+            abort(2, "FAIL_VERIFY_60S — util=" + util + " loss_lines=" + loss_line)
+        }
+    }
+
+    if dry {
+        stamp_step("DRY-RUN walked 15 steps — no I/O performed", log_path)
+        return
+    }
+    stamp_step("LIVE FIRE success — tmux session '" + TMUX_SESSION
+        + "' training, log=" + REMOTE_LOG, log_path)
+    println("")
+    println("LIVE FIRE complete. Watch: " + SSH + " 'tmux attach -t " + TMUX_SESSION + "'")
+    println("Tail:  " + SSH + " 'tail -f " + REMOTE_LOG + "'")
+    println("Log:   " + log_path)
+}
+
+// ── Entry ─────────────────────────────────────────────────────────────
+
+fn main() {
+    let ts = now_iso()
+    let log_path = "/Users/ghost/Dev/anima/training/deploy/clm_r4_pod2_relaunch_" + ts + ".log"
+
+    if SELFTEST {
+        let ok = selftest()
+        if !ok { panic("selftest FAIL") }
+        return
+    }
+
+    let have_pod = (POD != "" || POD_ID != "" || POD_IP_ARG != "")
+    if !have_pod {
+        println("")
+        println("USAGE:")
+        println("  hexa <this file> --selftest")
+        println("  hexa <this file> --pod-id <id> --dry-run")
+        println("  hexa <this file> --pod-ip <ip> --pod-port <n> --dry-run")
+        println("  hexa <this file> --pod-id <id> --ckpt-dir <path> --steps <N> --dry-run")
+        println("  LIVE_FIRE_OK=1 hexa <this file> --pod-id <id>    # live")
+        println("")
+        panic("need one of: --pod / --pod-id / --pod-ip (except with --selftest)")
+    }
+
+    // Always open the timestamped log.
+    write_file(log_path, "# CLM r4 hexa-native relaunch log " + ts + "\n")
+    let pod_label = (if POD != "" { POD }
+                     else if POD_ID != "" { POD_ID }
+                     else { POD_IP_ARG + ":" + POD_PORT_S })
+    stamp_step("wrapper start — pod=" + pod_label + " ckpt=" + CKPT_DIR
+        + " steps=" + STEPS_S + " dry=" + (if DRY_RUN { "1" } else { "0" }),
+        log_path)
+
+    build_plan(log_path)
+
+    // live_fire walks each step; in --dry-run it prints without exec'ing.
+    // The LIVE_FIRE_OK=1 gate only blocks when DRY_RUN=false.
+    live_fire(log_path)
+
+    if DRY_RUN {
+        stamp_step("DRY-RUN complete — no remote I/O performed.", log_path)
+        println("")
+        println("DRY-RUN complete. Re-run without --dry-run AND LIVE_FIRE_OK=1 to fire.")
+        println("Log: " + log_path)
+    }
+}
+
+main()

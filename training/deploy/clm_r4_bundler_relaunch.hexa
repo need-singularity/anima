@@ -1,0 +1,580 @@
+// training/deploy/clm_r4_bundler_relaunch.hexa
+//
+// CLM r4 — hexa-native relaunch (BUNDLER-BASED SCAFFOLD).
+//
+// Purpose:
+//   Re-launch the CLM 1B r4 corpus-expansion training run on a fresh H100 pod
+//   using train_clm.hexa, bundled via scripts/bundler_experiment.hexa into a
+//   single self-contained .c file. Replaces the 14-step scaffold
+//   (clm_r4_pod2_relaunch_hexa_native.hexa) with a 4-step flow:
+//
+//     old 14-step                          →  new 4-step
+//     ───────────────────────────────────     ───────────────────────────────
+//     scp hexa_v2 ELF                         (unused — bundler pre-compiles)
+//     scp runtime.c + native/*.c              (1 runtime.c scp)
+//     scp 5 .hexa sources                     (0 scp — merged into bundle.c)
+//     remote transpile main                   (local bundler call — 1 invoke)
+//     remote transpile + rename 4 deps        (merged into bundle)
+//     remote gcc with --allow-multiple-def    (plain gcc, single TU)
+//     ───────────────────────────────────     ───────────────────────────────
+//
+// Compliance:
+//   R37 / AN13 / L3-PY — zero python invocations. Bundler itself is .hexa.
+//
+// Prereq:
+//   - scripts/bundler_experiment.hexa (task #34 validated — Mac+ubu2 compile PASS)
+//   - $HEXA_LANG/self/native/hexa_v2 (Mac build — bundler runs locally)
+//   - $HEXA_LANG/self/runtime.c      (scp'd to pod)
+//   - libopenblas-dev on pod (for libhxblas.so / libhxlmhead.so)
+//   - A running H100 pod id (pod2 was OOM torn down @ e80ec871)
+//
+// Scope:
+//   SCAFFOLD + --dry-run + --selftest. Live fire requires LIVE_FIRE_OK=1.
+//
+// Usage:
+//   hexa training/deploy/clm_r4_bundler_relaunch.hexa --selftest
+//   hexa training/deploy/clm_r4_bundler_relaunch.hexa --pod-id <id> --dry-run
+//   LIVE_FIRE_OK=1 hexa training/deploy/clm_r4_bundler_relaunch.hexa --pod-id <id>
+
+// ── Constants ──────────────────────────────────────────────────────────
+
+let DEFAULT_CKPT_DIR  = "/workspace/ckpt_clm1b_r4"
+let DEFAULT_STEPS     = 750000
+let DEFAULT_BATCH     = 8
+let DEFAULT_SEQ       = 512
+let DEFAULT_LR        = "3e-4"
+let DEFAULT_WARMUP    = 5000
+let DEFAULT_SAVE      = 5000
+
+let CORPUS_REMOTE     = "/workspace/corpus_clm_r4.txt"
+let DEFAULT_LOCAL_GZ  = "/Users/ghost/Dev/anima/training/corpus_clm_r4.txt.gz"
+let DEFAULT_LOCAL_TXT = "/Users/ghost/Dev/anima/training/corpus_clm_r4.txt"
+
+let ANIMA_ROOT        = "/Users/ghost/Dev/anima"
+let BUNDLER_SRC       = ANIMA_ROOT + "/scripts/bundler_experiment.hexa"
+let TRAIN_ENTRY       = ANIMA_ROOT + "/training/train_clm.hexa"
+let LOCAL_BUNDLE_C    = "/tmp/clm_r4_bundle.c"
+
+let REMOTE_BUNDLE_C   = "/tmp/clm_r4_bundle.c"
+let REMOTE_NATIVE     = "/workspace/clm_r4_native"
+let REMOTE_LOG        = "/workspace/clm_r4_hexa.log"
+let TMUX_SESSION      = "clm-r4-hexa"
+
+// ── argv parse ────────────────────────────────────────────────────────
+
+let argv = args()
+
+fn flag_value(name: string, fallback: string) -> string {
+    let n = argv.len()
+    let mut i = 0
+    while i < n {
+        if argv[i] == name && i + 1 < n {
+            return argv[i + 1]
+        }
+        i = i + 1
+    }
+    return fallback
+}
+
+fn flag_bool(name: string) -> bool {
+    let n = argv.len()
+    let mut i = 0
+    while i < n {
+        if argv[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+let POD         = flag_value("--pod", "")
+let POD_ID      = flag_value("--pod-id", "")
+let POD_IP_ARG  = flag_value("--pod-ip", "")
+let POD_PORT_S  = flag_value("--pod-port", "")
+let CORPUS_ARG  = flag_value("--corpus", CORPUS_REMOTE)
+let R2_URI_ARG  = flag_value("--corpus-r2", "r2:anima-corpus/clm_r4/corpus_clm_r4.txt")
+let CORPUS_LOCAL_GZ  = flag_value("--corpus-local-gz", DEFAULT_LOCAL_GZ)
+let CORPUS_LOCAL_TXT = flag_value("--corpus-local-txt", DEFAULT_LOCAL_TXT)
+let CKPT_DIR    = flag_value("--ckpt-dir", DEFAULT_CKPT_DIR)
+let STEPS_S     = flag_value("--steps", str(DEFAULT_STEPS))
+let LR_ARG      = flag_value("--lr", DEFAULT_LR)
+let WARMUP_S    = flag_value("--warmup", str(DEFAULT_WARMUP))
+let BATCH_S     = flag_value("--batch", str(DEFAULT_BATCH))
+let SEQ_S       = flag_value("--seq", str(DEFAULT_SEQ))
+let DRY_RUN     = flag_bool("--dry-run")
+let SELFTEST    = flag_bool("--selftest")
+
+// ── Utility ───────────────────────────────────────────────────────────
+
+fn env_or(key: string, fallback: string) -> string {
+    let v = env(key)
+    if v == "" { return fallback }
+    return v
+}
+
+fn now_epoch() -> string { return exec("date +%s").trim() }
+fn now_iso()   -> string { return exec("date -u +%Y%m%dT%H%M%SZ").trim() }
+
+fn stamp_step(label: string, log_path: string) {
+    let line = "[" + now_epoch() + "] " + label
+    println(line)
+    append_file(log_path, line + "\n")
+}
+
+fn abort(code: int, msg: string) {
+    println("")
+    println("FAIL: " + msg)
+    println("  exit code = " + str(code))
+    println("")
+    exit(code)
+}
+
+// ── ssh / scp helpers ─────────────────────────────────────────────────
+
+fn ssh_base(ip: string, port: string) -> string {
+    if ip == "" { return "ssh root@POD_IP_UNRESOLVED" }
+    let opts = " -o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+    if port == "" || port == "22" {
+        return "ssh" + opts + " root@" + ip
+    }
+    return "ssh" + opts + " -p " + port + " root@" + ip
+}
+
+fn scp_base(ip: string, port: string) -> string {
+    if ip == "" { return "scp POD_IP_UNRESOLVED" }
+    let opts = " -o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+    if port == "" || port == "22" {
+        return "scp" + opts
+    }
+    return "scp" + opts + " -P " + port
+}
+
+fn lookup_pod(pod_id: string) -> string {
+    if pod_id == "" { return "" }
+    let ip_cmd = "runpodctl get pod " + pod_id
+        + " 2>/dev/null | grep -oE 'root@[^ ]+' | head -1 | sed 's/root@//'"
+    let port_cmd = "runpodctl get pod " + pod_id
+        + " 2>/dev/null | grep -oE -- '-p [0-9]+' | head -1 | awk '{print $2}'"
+    let ip = exec(ip_cmd).trim()
+    let port = exec(port_cmd).trim()
+    if ip == "" { return "" }
+    if port == "" { return ip + ":22" }
+    return ip + ":" + port
+}
+
+fn split_ep(ep: string) -> [string] {
+    let ip = exec("echo '" + ep + "' | awk -F: '{print $1}'").trim()
+    let port = exec("echo '" + ep + "' | awk -F: '{print $2}'").trim()
+    return [ip, port]
+}
+
+// ── Exec wrapper with logging ─────────────────────────────────────────
+
+fn run_step(n: int, label: string, cmd: string, dry: bool, log_path: string) -> int {
+    stamp_step("step " + str(n) + " START — " + label, log_path)
+    println("    $ " + cmd)
+    append_file(log_path, "    $ " + cmd + "\n")
+    if dry {
+        stamp_step("step " + str(n) + " SKIP (dry-run)", log_path)
+        return 0
+    }
+    let result = exec_with_status(cmd)
+    let rc = result[1]
+    stamp_step("step " + str(n) + " END — rc=" + str(rc), log_path)
+    return rc
+}
+
+// ── Bundler local call ───────────────────────────────────────────────
+
+fn bundle_sources(entry: string, out_c: string, dry: bool, log_path: string) -> int {
+    let hexa_bin = env_or("HEXA_LANG", "/Users/ghost/Dev/hexa-lang") + "/self/native/hexa_v2"
+    // bundler uses `hexa run` semantics (argv[2] = first user arg); we invoke
+    // via the native hexa_v2 which matches that layout.
+    let cmd = hexa_bin + " " + BUNDLER_SRC + " " + entry + " " + out_c
+    return run_step(2, "bundler local call (5-module → 1 .c)", cmd, dry, log_path)
+}
+
+// ── Selftest ──────────────────────────────────────────────────────────
+
+fn selftest() -> bool {
+    println("")
+    println("=================================================================")
+    println("  CLM r4 bundler-relaunch — SELFTEST (no network I/O)")
+    println("=================================================================")
+    println("")
+
+    let mut ok = true
+
+    println("[1/4] Environment:")
+    let hexa_lang = env("HEXA_LANG")
+    if hexa_lang == "" {
+        println("  [MISS] HEXA_LANG not set")
+        ok = false
+    } else {
+        println("  [OK]   HEXA_LANG=" + hexa_lang)
+    }
+
+    let hexa_bin = hexa_lang + "/self/native/hexa_v2"
+    if file_exists(hexa_bin) {
+        println("  [OK]   " + hexa_bin + "  (local bundler driver)")
+    } else {
+        println("  [MISS] " + hexa_bin + "  (needed for bundler invoke)")
+        ok = false
+    }
+
+    let runtime_c = hexa_lang + "/self/runtime.c"
+    if file_exists(runtime_c) {
+        println("  [OK]   " + runtime_c)
+    } else {
+        println("  [MISS] " + runtime_c)
+        ok = false
+    }
+
+    println("")
+    println("[2/4] Bundler + train entry:")
+    if file_exists(BUNDLER_SRC) {
+        println("  [OK]   " + BUNDLER_SRC)
+    } else {
+        println("  [MISS] " + BUNDLER_SRC)
+        ok = false
+    }
+    if file_exists(TRAIN_ENTRY) {
+        println("  [OK]   " + TRAIN_ENTRY)
+    } else {
+        println("  [MISS] " + TRAIN_ENTRY)
+        ok = false
+    }
+
+    println("")
+    println("[3/4] CLI flags parsed:")
+    println("  --pod       = " + (if POD == "" { "<unset>" } else { POD }))
+    println("  --pod-id    = " + (if POD_ID == "" { "<unset>" } else { POD_ID }))
+    println("  --ckpt-dir  = " + CKPT_DIR)
+    println("  --steps     = " + STEPS_S)
+    println("  --dry-run   = " + (if DRY_RUN { "true" } else { "false" }))
+    println("  --selftest  = true")
+
+    println("")
+    println("[4/4] ssh reachability (offline):")
+    println("  ssh config check deferred — --selftest does NOT open sockets")
+    println("  (run --dry-run with --pod-id <id> to preview full SSH plan)")
+
+    println("")
+    if ok {
+        println("RESULT: PASS — ready for --dry-run then live fire.")
+    } else {
+        println("RESULT: FAIL — resolve MISS items above before proceeding.")
+    }
+    println("")
+    return ok
+}
+
+// ── Plan (shared by --dry-run + live fire) ────────────────────────────
+
+fn print_step(n: int, title: string, cmd: string) {
+    println("")
+    println("  Step " + str(n) + ": " + title)
+    println("    $ " + cmd)
+}
+
+fn build_plan(log_path: string) {
+    let pod_label = (if POD != "" { POD }
+                     else if POD_ID != "" { POD_ID }
+                     else { POD_IP_ARG + ":" + POD_PORT_S })
+
+    println("")
+    println("=================================================================")
+    println("  CLM r4 bundler-relaunch — PLAN (4-step)")
+    println("=================================================================")
+    println("  pod        = " + pod_label)
+    println("  ckpt-dir   = " + CKPT_DIR)
+    println("  steps      = " + STEPS_S)
+    println("  corpus     = " + CORPUS_ARG)
+    println("  r2 source  = " + R2_URI_ARG)
+    println("  lr/warmup  = " + LR_ARG + " / " + WARMUP_S)
+    println("  batch/seq  = " + BATCH_S + " / " + SEQ_S)
+    println("  dry-run    = " + (if DRY_RUN { "YES (no remote I/O)" } else { "NO (LIVE)" }))
+    println("  log        = " + log_path)
+
+    print_step(1, "MFS preflight + ckpt preclean + tmux/pkill reap",
+        "ssh " + pod_label + " 'dd probe 20G && rm -rf " + CKPT_DIR
+        + " && tmux kill-session -t " + TMUX_SESSION + " || true'")
+
+    print_step(2, "Bundle train_clm.hexa (5 modules → 1 .c) locally",
+        "hexa " + BUNDLER_SRC + " " + TRAIN_ENTRY + " " + LOCAL_BUNDLE_C)
+
+    print_step(3, "scp bundle.c + runtime.c + .so dir → pod:/tmp/",
+        "scp " + LOCAL_BUNDLE_C + " $HEXA_LANG/self/runtime.c "
+        + "$HEXA_LANG/self/native/*.c " + pod_label + ":/tmp/")
+
+    print_step(4, "Remote gcc single .c → ELF + tmux launch + 60s verify",
+        "ssh " + pod_label + " 'gcc -O2 /tmp/clm_r4_bundle.c -o "
+        + REMOTE_NATIVE + " -lm && tmux new -d -s " + TMUX_SESSION + " ...'")
+
+    println("")
+    println("Savings vs legacy 14-step scaffold:")
+    println("  scp calls    : 3-4  →  2     (bundle + runtime)")
+    println("  gcc calls    : 1 (5 TUs + --allow-multiple-definition)  →  1 (single TU)")
+    println("  transpile    : 5 remote invokes + 4 sed main-rename  →  1 local bundler")
+    println("  wall-clock   : ~2-3 min  →  ~1 min (est)")
+    println("")
+}
+
+// ── Live fire (gated) ─────────────────────────────────────────────────
+
+fn resolve_pod_endpoint(log_path: string, dry: bool) -> string {
+    if POD_IP_ARG != "" {
+        let p = (if POD_PORT_S == "" { "22" } else { POD_PORT_S })
+        stamp_step("pod endpoint: explicit --pod-ip/--pod-port => "
+            + POD_IP_ARG + ":" + p, log_path)
+        return POD_IP_ARG + ":" + p
+    }
+    let lookup_id = (if POD_ID != "" { POD_ID } else { POD })
+    if lookup_id == "" {
+        abort(2, "cannot resolve pod: need --pod-ip + --pod-port, or --pod-id, or --pod")
+        return ""
+    }
+    stamp_step("pod endpoint: runpodctl lookup for id=" + lookup_id, log_path)
+    if dry {
+        stamp_step("dry-run: assuming endpoint=<IP>:<PORT>", log_path)
+        return "DRYRUN_IP:DRYRUN_PORT"
+    }
+    let ep = lookup_pod(lookup_id)
+    if ep == "" {
+        abort(2, "runpodctl lookup failed for pod_id=" + lookup_id
+            + " — pass --pod-ip <ip> --pod-port <n> explicitly")
+        return ""
+    }
+    stamp_step("resolved: " + ep, log_path)
+    return ep
+}
+
+fn live_fire(log_path: string) {
+    let live_ok = env("LIVE_FIRE_OK")
+    let dry = DRY_RUN
+    if !dry && live_ok != "1" {
+        println("")
+        println("REFUSED: live fire requires LIVE_FIRE_OK=1 in env.")
+        println("  This wrapper refuses destructive exec without the gate.")
+        println("  To execute:")
+        println("    1. Review --dry-run output with user")
+        println("    2. Confirm new pod id + ckpt-dir + bundler ready")
+        println("    3. LIVE_FIRE_OK=1 hexa <this file> --pod-id <id>")
+        println("")
+        panic("live fire guard: LIVE_FIRE_OK != 1")
+    }
+
+    if dry {
+        stamp_step("DRY-RUN — live_fire() will print every ssh/scp without execing", log_path)
+    } else {
+        stamp_step("LIVE FIRE armed (LIVE_FIRE_OK=1) — proceeding", log_path)
+    }
+
+    let ep = resolve_pod_endpoint(log_path, dry)
+    let parts = split_ep(ep)
+    let ip   = (if dry { "DRYRUN_IP" } else { parts[0] })
+    let port = (if dry { "DRYRUN_PORT" } else { parts[1] })
+    let SSH = ssh_base(ip, port)
+    let SCP = scp_base(ip, port)
+    let dest = "root@" + ip
+
+    let hexa_lang  = env_or("HEXA_LANG", "/Users/ghost/Dev/hexa-lang")
+    let runtime_c  = hexa_lang + "/self/runtime.c"
+    let native_dir = hexa_lang + "/self/native"
+
+    // ── Step 1 — MFS preflight + ckpt preclean + tmux/pkill reap ──
+    let rc1a = run_step(1, "MFS preflight — 20GB dd probe",
+        SSH + " 'dd if=/dev/zero of=/workspace/_q_test bs=1M count=20000 status=none "
+        + "&& rm /workspace/_q_test'",
+        dry, log_path)
+    if !dry && rc1a != 0 { abort(2, "FAIL_MFS_QUOTA rc=" + str(rc1a)) }
+
+    let rc1b = run_step(1, "ckpt dir preclean (MFS quota rule)",
+        SSH + " 'rm -rf " + CKPT_DIR + "'",
+        dry, log_path)
+    if !dry && rc1b != 0 { abort(2, "FAIL_CKPT_PRECLEAN rc=" + str(rc1b)) }
+
+    let _rc1c = run_step(1, "tmux kill + pkill legacy residual",
+        SSH + " 'tmux kill-session -t " + TMUX_SESSION + " 2>/dev/null || true; "
+        + "tmux kill-session -t clm-r4 2>/dev/null || true; "
+        + "pkill -f train_clm_1b.py 2>/dev/null || true'",
+        dry, log_path)
+
+    // ── Step 2 — Bundler local call (5 modules → 1 .c) ──
+    if !dry && !file_exists(BUNDLER_SRC) {
+        abort(2, "FAIL_BUNDLER_MISSING: " + BUNDLER_SRC)
+    }
+    if !dry && !file_exists(TRAIN_ENTRY) {
+        abort(2, "FAIL_ENTRY_MISSING: " + TRAIN_ENTRY)
+    }
+    let rc2 = bundle_sources(TRAIN_ENTRY, LOCAL_BUNDLE_C, dry, log_path)
+    if !dry && rc2 != 0 { abort(3, "FAIL_BUNDLE rc=" + str(rc2)) }
+    if !dry && !file_exists(LOCAL_BUNDLE_C) {
+        abort(3, "FAIL_BUNDLE_OUTPUT_MISSING: " + LOCAL_BUNDLE_C)
+    }
+
+    // ── Step 3 — scp bundle + runtime + native .c to pod:/tmp/ ──
+    let _mk = run_step(3, "mkdir -p /tmp/native on pod",
+        SSH + " 'mkdir -p /tmp/native'", dry, log_path)
+    let rc3a = run_step(3, "scp bundle.c → pod:/tmp/",
+        SCP + " " + LOCAL_BUNDLE_C + " " + dest + ":/tmp/clm_r4_bundle.c",
+        dry, log_path)
+    if !dry && rc3a != 0 { abort(2, "FAIL_BUNDLE_SCP rc=" + str(rc3a)) }
+    let rc3b = run_step(3, "scp runtime.c + native/*.c → pod:/tmp/",
+        SCP + " " + runtime_c + " " + dest + ":/tmp/runtime.c && "
+        + SCP + " " + native_dir + "/tensor_kernels.c " + native_dir + "/net.c "
+        + native_dir + "/hxblas_linux.c " + native_dir + "/hxlmhead_linux.c "
+        + dest + ":/tmp/native/",
+        dry, log_path)
+    if !dry && rc3b != 0 { abort(2, "FAIL_RUNTIME_SCP rc=" + str(rc3b)) }
+
+    // Build dlopen .so libs on pod (OpenBLAS-backed).
+    let _apt = run_step(3, "ensure libopenblas-dev on pod",
+        SSH + " 'dpkg -s libopenblas-dev >/dev/null 2>&1 || "
+        + "(apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libopenblas-dev) || true'",
+        dry, log_path)
+    let rc3c = run_step(3, "gcc -shared libhxblas.so + libhxlmhead.so + install",
+        SSH + " 'gcc -O2 -fPIC -shared /tmp/native/hxblas_linux.c "
+        + "-o /tmp/native/libhxblas.so -lopenblas -lgomp -lm && "
+        + "gcc -O2 -fPIC -shared /tmp/native/hxlmhead_linux.c "
+        + "-o /tmp/native/libhxlmhead.so -lopenblas -lgomp -lm && "
+        + "cp /tmp/native/libhxblas.so /tmp/native/libhxlmhead.so /usr/local/lib/ "
+        + "&& ldconfig'",
+        dry, log_path)
+    if !dry && rc3c != 0 { abort(3, "FAIL_SO_BUILD rc=" + str(rc3c)) }
+
+    // ── Step 4 — remote gcc single .c → ELF + tmux launch + 60s verify ──
+    let rc4a = run_step(4, "remote gcc single .c → ELF (bundler — no --allow-multiple-def)",
+        SSH + " 'gcc -O2 -I /tmp /tmp/clm_r4_bundle.c -o " + REMOTE_NATIVE + " -lm 2>&1'",
+        dry, log_path)
+    if !dry && rc4a != 0 { abort(3, "FAIL_GCC_LINK rc=" + str(rc4a)) }
+
+    // Corpus provisioning (3-tier: remote existing > local gz > local txt > R2)
+    let already_present = (if dry { false }
+        else { exec(SSH + " 'test -f " + CORPUS_ARG
+            + " && test $(wc -c <" + CORPUS_ARG + ") -gt 5000000000'"
+            + " >/dev/null 2>&1; echo $?").trim() == "0" })
+    if already_present {
+        stamp_step("corpus already present on pod (>5GB) — skip provisioning", log_path)
+    } else {
+        let have_gz  = file_exists(CORPUS_LOCAL_GZ)
+        let have_txt = file_exists(CORPUS_LOCAL_TXT)
+        if have_gz {
+            let rc_gz = run_step(4, "scp local corpus_clm_r4.txt.gz",
+                SCP + " " + CORPUS_LOCAL_GZ + " " + dest + ":/workspace/corpus_clm_r4.txt.gz",
+                dry, log_path)
+            if !dry && rc_gz != 0 { abort(2, "FAIL_CORPUS_SCP_GZ rc=" + str(rc_gz)) }
+            let rc_gu = run_step(4, "remote gunzip corpus_clm_r4.txt.gz",
+                SSH + " 'cd /workspace && gunzip -f corpus_clm_r4.txt.gz'",
+                dry, log_path)
+            if !dry && rc_gu != 0 { abort(2, "FAIL_CORPUS_GUNZIP rc=" + str(rc_gu)) }
+        } else if have_txt {
+            let rc_tx = run_step(4, "scp local corpus_clm_r4.txt (5.38GB)",
+                SCP + " " + CORPUS_LOCAL_TXT + " " + dest + ":" + CORPUS_ARG,
+                dry, log_path)
+            if !dry && rc_tx != 0 { abort(2, "FAIL_CORPUS_SCP_TXT rc=" + str(rc_tx)) }
+        } else {
+            let rc_r2 = run_step(4, "corpus R2 pull (fallback)",
+                SSH + " 'rclone copy " + R2_URI_ARG
+                + " /workspace/ --s3-no-check-bucket'",
+                dry, log_path)
+            if !dry && rc_r2 != 0 { abort(2, "FAIL_CORPUS_PULL rc=" + str(rc_r2)) }
+        }
+    }
+
+    // tmux launch
+    let train_cmd = "LD_LIBRARY_PATH=/usr/local/lib:/tmp/native:\\$LD_LIBRARY_PATH "
+        + "HEXA_NATIVE_LIB_DIR=/tmp/native "
+        + REMOTE_NATIVE
+        + " --corpus " + CORPUS_ARG
+        + " --steps " + STEPS_S
+        + " --batch " + BATCH_S
+        + " --seq " + SEQ_S
+        + " --lr " + LR_ARG
+        + " --warmup " + WARMUP_S
+        + " --save-every " + str(DEFAULT_SAVE)
+        + " --ckpt-dir " + CKPT_DIR
+        + " 2>&1 | tee " + REMOTE_LOG
+    let tmux_cmd = SSH + " \"tmux new -d -s " + TMUX_SESSION
+        + " 'bash -lc \\\"" + train_cmd + "\\\"'\""
+    let rc4b = run_step(4, "tmux launch " + TMUX_SESSION, tmux_cmd, dry, log_path)
+    if !dry && rc4b != 0 { abort(2, "FAIL_TMUX_LAUNCH rc=" + str(rc4b)) }
+
+    // 60s verify
+    stamp_step("sleep 60s before verify", log_path)
+    if !dry { exec("sleep 60") }
+    let util = (if dry { "<util>" }
+                else {
+                    exec(SSH + " 'nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | head -1'").trim()
+                })
+    stamp_step("nvidia-smi util = " + util + "%", log_path)
+    let tail = (if dry { "<loss tail>" }
+                else {
+                    exec(SSH + " 'tail -5 " + REMOTE_LOG + " 2>/dev/null'").trim()
+                })
+    stamp_step("log tail:\n" + tail, log_path)
+
+    if !dry {
+        let ok_util_s = exec("echo '" + util + "' | awk '{ if ($1+0 > 5) print 1; else print 0 }'").trim()
+        let loss_line = exec(SSH + " 'grep -c \"loss=\" " + REMOTE_LOG + " 2>/dev/null || echo 0'").trim()
+        if ok_util_s != "1" || loss_line == "0" {
+            exec(SSH + " 'tmux kill-session -t " + TMUX_SESSION + " 2>/dev/null || true'")
+            abort(2, "FAIL_VERIFY_60S — util=" + util + " loss_lines=" + loss_line)
+        }
+    }
+
+    if dry {
+        stamp_step("DRY-RUN walked 4 steps — no I/O performed", log_path)
+        return
+    }
+    stamp_step("LIVE FIRE success — tmux session '" + TMUX_SESSION
+        + "' training, log=" + REMOTE_LOG, log_path)
+    println("")
+    println("LIVE FIRE complete. Watch: " + SSH + " 'tmux attach -t " + TMUX_SESSION + "'")
+    println("Tail:  " + SSH + " 'tail -f " + REMOTE_LOG + "'")
+    println("Log:   " + log_path)
+}
+
+// ── Entry ─────────────────────────────────────────────────────────────
+
+fn main() {
+    let ts = now_iso()
+    let log_path = "/Users/ghost/Dev/anima/training/deploy/clm_r4_bundler_relaunch_" + ts + ".log"
+
+    if SELFTEST {
+        let ok = selftest()
+        if !ok { panic("selftest FAIL") }
+        return
+    }
+
+    let have_pod = (POD != "" || POD_ID != "" || POD_IP_ARG != "")
+    if !have_pod {
+        println("")
+        println("USAGE:")
+        println("  hexa <this file> --selftest")
+        println("  hexa <this file> --pod-id <id> --dry-run")
+        println("  hexa <this file> --pod-ip <ip> --pod-port <n> --dry-run")
+        println("  LIVE_FIRE_OK=1 hexa <this file> --pod-id <id>    # live")
+        println("")
+        panic("need one of: --pod / --pod-id / --pod-ip (except with --selftest)")
+    }
+
+    write_file(log_path, "# CLM r4 bundler-relaunch log " + ts + "\n")
+    let pod_label = (if POD != "" { POD }
+                     else if POD_ID != "" { POD_ID }
+                     else { POD_IP_ARG + ":" + POD_PORT_S })
+    stamp_step("wrapper start — pod=" + pod_label + " ckpt=" + CKPT_DIR
+        + " steps=" + STEPS_S + " dry=" + (if DRY_RUN { "1" } else { "0" }),
+        log_path)
+
+    build_plan(log_path)
+    live_fire(log_path)
+
+    if DRY_RUN {
+        stamp_step("DRY-RUN complete — no remote I/O performed.", log_path)
+        println("")
+        println("DRY-RUN complete. Re-run without --dry-run AND LIVE_FIRE_OK=1 to fire.")
+        println("Log: " + log_path)
+    }
+}
+
+main()
