@@ -1,0 +1,515 @@
+// anima-speak/tts_say_driver.hexa — macOS `say` TTS corpus bootstrap for v2.0 RC
+//
+// Purpose: generate baseline Korean voice corpus for 10 webtoon personas (id 10..19)
+// using the macOS built-in `say` command. This unblocks serve-layer voice stub
+// replacement when YouTube CC sourcing was a drought (1/9 queries hit).
+//
+// Plan SSOT: shared/state/voice_corpus_source_plan_20260417.json
+// Pilot: shared/state/voice_pilot_summary_20260417.json
+//
+// Pipeline per clip:
+//   1) say -v <voice> -r <rate_wpm> -o out.aiff "<ko_line>"
+//   2) ffmpeg: aiff -> 16kHz mono PCM16 WAV, loudnorm
+//   3) ffprobe: duration
+//   4) rclone copy -> r2:anima-models/voice_corpus/persona_{id}/tts_{idx:02d}.wav
+//
+// Voices (verified via `say -v ?` + byte-identity check):
+//   - Yuna      — Korean female (the ONLY real Korean TTS voice installed).
+//   - Rocko/Grandpa/Eddy/Reed/Flo/Grandma/Sandy/Shelley (ko_KR) all produce
+//     byte-identical AIFF output → they are aliases to Yuna's engine.
+// Strategy: use Yuna, then apply ffmpeg pitch-shift down (0.82x asetrate +
+// atempo 1.21 compensation) for male archetypes to synthesize a lower voice.
+// 'Minsu' is NOT a valid macOS voice name on this system — hence the pitch-shift
+// workaround. Manifest 'voice' field preserves intended target for future swap.
+//
+// Hexa quirks avoided:
+//   - lists pass-by-value: all mutations via return
+//   - struct list aliasing: SoA scalar arrays only
+//   - no string slicing on multibyte: all Korean strings treated opaquely
+//   - HEXA-FIRST: wraps say/ffmpeg/ffprobe/rclone via exec()
+
+let OUT_ROOT    = "/Users/ghost/Dev/anima/anima-speak/corpus/tts_say"
+let R2_PREFIX   = "r2:anima-models/voice_corpus"
+let STATE_DIR   = "/Users/ghost/Dev/anima/shared/state"
+let STAMP       = "20260417"
+
+// ═══════════════════════════════════════════════════════════════
+//  Helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn shell_escape(s: string) -> string {
+    return "'" + s.replace("'", "'" + "\\" + "'" + "'") + "'"
+}
+
+fn ensure_dir(path: string) {
+    let _ = exec("mkdir -p " + shell_escape(path))
+}
+
+fn file_bytes(path: string) -> int {
+    let out = exec("stat -f %z " + shell_escape(path) + " 2>/dev/null").trim()
+    if len(out) == 0 { return 0 }
+    return to_int(out)
+}
+
+fn audio_duration_s(path: string) -> float {
+    let out = exec("ffprobe -v error -show_entries format=duration -of csv=p=0 "
+                   + shell_escape(path) + " 2>/dev/null").trim()
+    if len(out) == 0 { return 0.0 }
+    return to_float(out)
+}
+
+fn pad2(n: int) -> string {
+    if n < 10 { return "0" + to_string(n) }
+    return to_string(n)
+}
+
+// JSON emit helpers (manual — avoids hexa json quirks on multibyte)
+fn json_kv_str(k: string, v: string) -> string {
+    return "\"" + k + "\": \"" + v.replace("\"", "\\\"") + "\""
+}
+fn json_kv_int(k: string, v: int) -> string {
+    return "\"" + k + "\": " + to_string(v)
+}
+fn json_kv_float(k: string, v: float) -> string {
+    return "\"" + k + "\": " + to_string(v)
+}
+
+fn write_file(path: string, content: string) {
+    let tmp = path + ".tmp"
+    let cmd = "cat > " + shell_escape(tmp) + " <<'HEXA_EOF'\n" + content + "\nHEXA_EOF"
+    let _ = exec(cmd)
+    let _ = exec("mv " + shell_escape(tmp) + " " + shell_escape(path))
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Voice pipeline: one (persona, idx, line, rate) → WAV → R2
+// ═══════════════════════════════════════════════════════════════
+
+// Returns wav_path ("" on failure).
+// voice: always "Yuna" in practice (see comment at top); retained as param for
+// future (real male voices when available).
+// is_male: if true, applies asetrate=22050*0.82 + atempo=1.21 filter to produce
+// a ~3-semitone-lower pseudo-male voice while preserving wall-clock duration.
+fn synth_one(persona_id: int, persona_name: string, voice: string,
+             rate: int, line: string, idx: int, is_male: bool) -> string {
+    let pdir = OUT_ROOT + "/persona_" + to_string(persona_id) + "_" + persona_name
+    ensure_dir(pdir)
+    let aiff = pdir + "/tts_" + pad2(idx) + ".aiff"
+    let wav  = pdir + "/tts_" + pad2(idx) + ".wav"
+
+    // 1) say → AIFF (22050 Hz, mono, 16-bit BE)
+    let cmd_say = "say -v " + shell_escape(voice)
+                + " -r " + to_string(rate)
+                + " -o " + shell_escape(aiff)
+                + " " + shell_escape(line)
+                + " 2>&1"
+    let _ = exec(cmd_say)
+    if file_bytes(aiff) < 10000 {
+        println("  [FAIL] say produced empty aiff for persona " + to_string(persona_id)
+                + " idx " + to_string(idx) + " (bytes=" + to_string(file_bytes(aiff)) + ")")
+        return ""
+    }
+
+    // 2) ffmpeg → 16kHz mono PCM16 WAV with loudnorm
+    //    For male archetypes: pitch shift down via asetrate + atempo compensation.
+    let mut af = "loudnorm=I=-16:TP=-1.5:LRA=11"
+    if is_male {
+        // asetrate lower → lower pitch + slower tempo; atempo restores duration.
+        // 0.82 * 1.21 ≈ 0.992 (near 1.0) so duration preserved.
+        af = "asetrate=22050*0.82,aresample=22050,atempo=1.21,loudnorm=I=-16:TP=-1.5:LRA=11"
+    }
+    let cmd_ff = "ffmpeg -y -loglevel error -i " + shell_escape(aiff)
+               + " -af " + shell_escape(af)
+               + " -ac 1 -ar 16000 -c:a pcm_s16le "
+               + shell_escape(wav) + " 2>&1"
+    let _ = exec(cmd_ff)
+    if file_bytes(wav) < 1000 {
+        println("  [FAIL] ffmpeg produced empty wav for persona " + to_string(persona_id)
+                + " idx " + to_string(idx))
+        return ""
+    }
+    // aiff cleanup
+    let _ = exec("rm -f " + shell_escape(aiff))
+    return wav
+}
+
+// Returns true on success
+fn r2_upload(wav_path: string, persona_id: int, idx: int) -> bool {
+    let remote = R2_PREFIX + "/persona_" + to_string(persona_id) + "/tts_" + pad2(idx) + ".wav"
+    let cmd = "rclone copyto " + shell_escape(wav_path) + " " + shell_escape(remote)
+            + " --quiet 2>&1"
+    let out = exec(cmd).trim()
+    // verify
+    let chk = exec("rclone lsf " + shell_escape(remote) + " 2>&1").trim()
+    if len(chk) == 0 { return false }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Persona data (id 10..19), inlined to avoid list pass-by-value
+// ═══════════════════════════════════════════════════════════════
+
+fn persona_name_for(id: int) -> string {
+    if id == 10 { return "ice_queen" }
+    if id == 11 { return "chaebol_heir" }
+    if id == 12 { return "pure_heroine" }
+    if id == 13 { return "tsundere_oppa" }
+    if id == 14 { return "airhead_friend" }
+    if id == 15 { return "charismatic_prez" }
+    if id == 16 { return "thug_returnee" }
+    if id == 17 { return "cold_heiress" }
+    if id == 18 { return "gentle_oppa" }
+    if id == 19 { return "fallen_antagonist" }
+    return "unknown"
+}
+
+fn persona_voice_for(id: int) -> string {
+    // Only 'Yuna' actually synthesizes Korean on this system; male voice
+    // aliases (Rocko/Grandpa/...) are byte-identical to Yuna. We use Yuna
+    // universally and synthesize male archetypes via ffmpeg pitch-shift.
+    // Manifest still records the intended target voice label for future swap.
+    return "Yuna"
+}
+
+fn persona_voice_intended(id: int) -> string {
+    // Intended voice target — for manifest traceability. Actual synthesis uses Yuna.
+    if id == 10 { return "Yuna" }         // ice_queen
+    if id == 11 { return "Minsu-like" }   // chaebol_heir
+    if id == 12 { return "Yuna" }         // pure_heroine
+    if id == 13 { return "Minsu-like" }   // tsundere_oppa
+    if id == 14 { return "Yuna" }         // airhead_friend
+    if id == 15 { return "Minsu-deep" }   // charismatic_prez
+    if id == 16 { return "Minsu-like" }   // thug_returnee
+    if id == 17 { return "Yuna" }         // cold_heiress
+    if id == 18 { return "Minsu-like" }   // gentle_oppa
+    if id == 19 { return "Minsu-deep" }   // fallen_antagonist
+    return "Yuna"
+}
+
+fn persona_is_male(id: int) -> bool {
+    if id == 11 { return true }
+    if id == 13 { return true }
+    if id == 15 { return true }
+    if id == 16 { return true }
+    if id == 18 { return true }
+    if id == 19 { return true }
+    return false
+}
+
+// Lines are 8 per persona. Returned flat; caller iterates by index.
+fn persona_lines(id: int) -> array {
+    if id == 10 {
+        return [
+            "흥, 너 따위가 감히 나한테 말을 걸어?",
+            "그런 시시한 얘기는 듣고 싶지 않아.",
+            "꺼져. 네 얼굴 보기도 싫으니까.",
+            "내가 왜 네 부탁을 들어줘야 하는데?",
+            "착각하지 마. 우리는 친구가 아니야.",
+            "그 정도 실력으로 나를 이기려고?",
+            "한심하네. 진짜 한심해.",
+            "더 이상 말 걸지 마. 귀찮으니까."
+        ]
+    }
+    if id == 11 {
+        return [
+            "내 이름을 그렇게 함부로 부르지 마.",
+            "네가 나한테 뭘 증명해야 한다고 생각해?",
+            "이 회사는 내 손에 달려 있어. 기억해 둬.",
+            "돈으로 해결 못 할 일은 없어.",
+            "넌 내가 누군지 아직도 모르는 것 같군.",
+            "나한테 이런 식으로 대드는 건 네가 처음이야.",
+            "흥미롭군. 조금 더 지켜봐 주지.",
+            "잊지 마. 이 세상은 내 것이야."
+        ]
+    }
+    if id == 12 {
+        return [
+            "오늘도 좋은 하루 보내세요.",
+            "제가 도와드릴 수 있어서 정말 기뻐요.",
+            "괜찮아요, 너무 걱정하지 마세요.",
+            "당신을 믿어요. 언제나 그랬듯이.",
+            "함께 있어 줘서 고마워요.",
+            "따뜻한 차 한잔 드릴까요?",
+            "웃어요. 웃으면 복이 와요.",
+            "제가 곁에 있을게요. 언제든지."
+        ]
+    }
+    if id == 13 {
+        return [
+            "뭐, 뭐야? 내가 너 걱정했다고? 아니거든!",
+            "이, 이거 너 주려고 산 거 아니야. 그냥 남은 거야.",
+            "왜 자꾸 나를 쳐다봐? 부담스럽거든.",
+            "아니, 진짜... 너 때문에 정말 피곤해.",
+            "괜찮아? 아니, 너 괜찮냐고 물어본 거 아니야.",
+            "바보야. 그런 것도 모르냐.",
+            "다 너 때문이야. 전부 너 때문.",
+            "내가... 내가 널 좋아한다고는 안 했어."
+        ]
+    }
+    if id == 14 {
+        return [
+            "오늘 급식에 탕수육 나왔는데 너무 맛있었어!",
+            "어? 나비가 날아간다! 예쁘다!",
+            "아, 맞다 맞다! 나 어제 엄청 재밌는 꿈 꿨어!",
+            "잠깐만, 이거 이상해. 왜 이래? 왜 이래?",
+            "우와아아! 진짜? 진짜야? 대박이다!",
+            "헤헤, 그거 말이지, 사실 나도 몰라.",
+            "배고파! 뭐 먹으러 가자! 응? 응?",
+            "히히, 오늘 왠지 기분이 좋아!"
+        ]
+    }
+    if id == 15 {
+        return [
+            "전교생 여러분, 잠시 주목해 주시기 바랍니다.",
+            "이 학교의 질서는 내가 지킨다.",
+            "규칙은 지키라고 있는 것이다. 예외는 없다.",
+            "네 의견은 잘 들었다. 하지만 결정은 내가 한다.",
+            "이 정도 책임은 내가 감당할 수 있다.",
+            "실수는 용납하지 않는다. 두 번은 더욱.",
+            "학생회의 이름으로 선언한다.",
+            "진정한 리더는 말이 아닌 행동으로 증명한다."
+        ]
+    }
+    if id == 16 {
+        return [
+            "야, 저기... 담배 있냐?",
+            "아 귀찮아 진짜. 그냥 좀 놔둬라.",
+            "왜 자꾸 날 찾아와? 나 그런 사람 아니거든.",
+            "어이, 내 앞에서 그런 소리 하지 마라.",
+            "됐고, 그냥 넘어가자. 응?",
+            "나 복학했다고 다 끝난 거 아니야.",
+            "그래, 내가 양아치였다 치자. 근데 지금은 아니야.",
+            "뭐 어쩌라고. 살아봐야 아는 거지."
+        ]
+    }
+    if id == 17 {
+        return [
+            "그런 제안은 받지 않겠어요.",
+            "당신과 같은 수준에서 이야기하고 싶지 않군요.",
+            "우아함이란, 타고나는 것이에요.",
+            "내 앞에서 무례한 행동은 삼가세요.",
+            "결론부터 말하죠. 그 답은 '아니오'예요.",
+            "당신이 생각하는 것보다 나는 훨씬 차가운 사람이에요.",
+            "감정 따위는 사치일 뿐이죠.",
+            "이 자리를 마치죠. 더 이상의 대화는 무의미해요."
+        ]
+    }
+    if id == 18 {
+        return [
+            "오늘 많이 힘들었죠? 이리 와요.",
+            "내가 옆에 있을게요. 걱정 마세요.",
+            "천천히 해도 괜찮아요. 기다릴게요.",
+            "당신은 생각보다 훨씬 강한 사람이에요.",
+            "따뜻한 거 한잔 할래요? 내가 타 줄게요.",
+            "웃는 모습이 참 예뻐요.",
+            "오늘도 수고 많았어요. 정말로.",
+            "같이 있어 줘서 고마워요."
+        ]
+    }
+    if id == 19 {
+        return [
+            "너는... 너는 정말 아무것도 모르는구나.",
+            "내가 이렇게 된 건, 전부 너 때문이야.",
+            "웃어? 지금 웃어? 내 앞에서?",
+            "용서? 그런 단어는 이제 존재하지 않아.",
+            "나는 이미 돌아갈 수 없는 길을 걷고 있어.",
+            "그래, 끝까지 가보자. 함께.",
+            "빛이라고? 나는 이제 어둠이 더 편해.",
+            "이 세상이 원망스러워. 너무나도."
+        ]
+    }
+    return ["테스트 문장입니다."]
+}
+
+// Rates per line (5 slow / 3 fast-ish) — prosodic variety
+fn rate_for_idx(idx: int, base_rate: int) -> int {
+    // base 175 default; vary ±25 around it
+    if idx == 0 { return base_rate - 20 }
+    if idx == 1 { return base_rate + 10 }
+    if idx == 2 { return base_rate - 10 }
+    if idx == 3 { return base_rate + 15 }
+    if idx == 4 { return base_rate }
+    if idx == 5 { return base_rate - 5 }
+    if idx == 6 { return base_rate + 20 }
+    if idx == 7 { return base_rate - 15 }
+    return base_rate
+}
+
+// Each persona has a base rate based on archetype tempo
+fn base_rate_for(id: int) -> int {
+    if id == 10 { return 150 }  // cold, slow-measured
+    if id == 11 { return 160 }  // unhurried-emphatic
+    if id == 12 { return 175 }  // natural
+    if id == 13 { return 180 }  // variable (leaning bright)
+    if id == 14 { return 200 }  // fast-variable
+    if id == 15 { return 155 }  // deliberate
+    if id == 16 { return 145 }  // slow-draggy
+    if id == 17 { return 165 }  // measured-clear
+    if id == 18 { return 170 }  // gentle
+    if id == 19 { return 150 }  // irregular-pausing (slow avg)
+    return 175
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Main driver
+// ═══════════════════════════════════════════════════════════════
+
+fn process_persona(id: int) -> array {
+    let name     = persona_name_for(id)
+    let voice    = persona_voice_for(id)        // always "Yuna" in practice
+    let intended = persona_voice_intended(id)
+    let is_male  = persona_is_male(id)
+    let lines    = persona_lines(id)
+    let base     = base_rate_for(id)
+
+    println("")
+    let mode_tag = "female"
+    if is_male { mode_tag = "male(pitch-shift)" }
+    println("═══ persona " + to_string(id) + " — " + name
+            + " (voice=" + voice + " intended=" + intended
+            + " mode=" + mode_tag
+            + " base_rate=" + to_string(base) + ") ═══")
+
+    let n = len(lines)
+    let mut ok_count = 0
+    let mut total_dur = 0.0
+    // SoA metadata arrays
+    let mut rates_csv      = ""
+    let mut durs_csv       = ""
+    let mut r2_paths_csv   = ""
+    let mut lines_json_arr = ""
+    let mut i = 0
+    while i < n {
+        let line = lines[i]
+        let rate = rate_for_idx(i, base)
+        let wav  = synth_one(id, name, voice, rate, line, i, is_male)
+        if len(wav) > 0 {
+            let dur = audio_duration_s(wav)
+            total_dur = total_dur + dur
+            let uploaded = r2_upload(wav, id, i)
+            let r2p = R2_PREFIX + "/persona_" + to_string(id) + "/tts_" + pad2(i) + ".wav"
+            if uploaded {
+                ok_count = ok_count + 1
+                println("  [OK] idx=" + pad2(i) + " rate=" + to_string(rate)
+                        + " dur=" + to_string(dur) + "s → " + r2p)
+            } else {
+                println("  [UPL-FAIL] idx=" + pad2(i) + " rate=" + to_string(rate) + " local=" + wav)
+            }
+            // build CSV-ish fields
+            if len(rates_csv) > 0 { rates_csv = rates_csv + "," }
+            rates_csv = rates_csv + to_string(rate)
+            if len(durs_csv) > 0 { durs_csv = durs_csv + "," }
+            durs_csv = durs_csv + to_string(dur)
+            if len(r2_paths_csv) > 0 { r2_paths_csv = r2_paths_csv + "\n" }
+            r2_paths_csv = r2_paths_csv + r2p
+            if len(lines_json_arr) > 0 { lines_json_arr = lines_json_arr + ",\n" }
+            let safe_line = line.replace("\\", "\\\\").replace("\"", "\\\"")
+            lines_json_arr = lines_json_arr + "      {"
+                           + json_kv_int("idx", i) + ", "
+                           + "\"line\": \"" + safe_line + "\", "
+                           + json_kv_int("rate_wpm", rate) + ", "
+                           + json_kv_float("duration_s", dur) + ", "
+                           + json_kv_str("r2_path", r2p)
+                           + "}"
+        } else {
+            println("  [SKIP] idx=" + pad2(i) + " synth failed")
+        }
+        i = i + 1
+    }
+
+    // Write per-persona manifest
+    let manifest_path = STATE_DIR + "/voice_tts_persona_" + to_string(id) + "_" + STAMP + ".json"
+    let male_str = "false"
+    if is_male { male_str = "true" }
+    let body = "{\n"
+             + "  \"schema\": \"voice_tts_persona/v1\",\n"
+             + "  \"stamp\": \"" + STAMP + "\",\n"
+             + "  \"persona_id\": " + to_string(id) + ",\n"
+             + "  \"persona_name\": \"" + name + "\",\n"
+             + "  \"voice\": \"" + voice + "\",\n"
+             + "  \"voice_intended\": \"" + intended + "\",\n"
+             + "  \"is_male\": " + male_str + ",\n"
+             + "  \"pitch_shift_applied\": " + male_str + ",\n"
+             + "  \"base_rate_wpm\": " + to_string(base) + ",\n"
+             + "  \"line_count\": " + to_string(ok_count) + ",\n"
+             + "  \"total_duration_s\": " + to_string(total_dur) + ",\n"
+             + "  \"clips\": [\n"
+             + lines_json_arr + "\n"
+             + "  ]\n"
+             + "}\n"
+    write_file(manifest_path, body)
+    println("  [MANIFEST] " + manifest_path)
+
+    // Return [ok_count, total_dur_int_ms]  (int-only to avoid multi-float struct return bug)
+    return [to_string(id), name, voice, to_string(ok_count), to_string(total_dur)]
+}
+
+fn main() {
+    println("════════════════════════════════════════════════════════════")
+    println("  anima-speak TTS-say driver — 10 persona corpus bootstrap")
+    println("  output: " + OUT_ROOT)
+    println("  R2:     " + R2_PREFIX)
+    println("════════════════════════════════════════════════════════════")
+
+    // Preflight: verify voices
+    let yuna_chk    = exec("say -v '?' | grep -c '^Yuna '").trim()
+    let rocko_chk   = exec("say -v '?' | grep -c '^Rocko '").trim()
+    let grandpa_chk = exec("say -v '?' | grep -c '^Grandpa '").trim()
+    println("voice preflight: Yuna=" + yuna_chk + " Rocko=" + rocko_chk + " Grandpa=" + grandpa_chk)
+    if yuna_chk == "0" {
+        println("FATAL: Yuna voice missing — install Korean TTS voices in System Settings.")
+        return
+    }
+
+    ensure_dir(OUT_ROOT)
+
+    // Aggregate accumulators
+    let mut agg_rows = ""
+    let mut total_clips = 0
+    let mut total_dur   = 0.0
+
+    let mut id = 10
+    while id <= 19 {
+        let r = process_persona(id)
+        // r = [id_str, name, voice, ok_count_str, total_dur_str]
+        let ok_s  = r[3]
+        let dur_s = r[4]
+        let ok_i  = to_int(ok_s)
+        let dur_f = to_float(dur_s)
+        total_clips = total_clips + ok_i
+        total_dur   = total_dur + dur_f
+        if len(agg_rows) > 0 { agg_rows = agg_rows + ",\n" }
+        agg_rows = agg_rows + "    {"
+                 + json_kv_int("persona_id", to_int(r[0])) + ", "
+                 + json_kv_str("persona_name", r[1]) + ", "
+                 + json_kv_str("voice", r[2]) + ", "
+                 + json_kv_int("clip_count", ok_i) + ", "
+                 + json_kv_float("total_duration_s", dur_f)
+                 + "}"
+        id = id + 1
+    }
+
+    // Aggregate manifest
+    let agg_path = STATE_DIR + "/voice_tts_summary_" + STAMP + ".json"
+    let body = "{\n"
+             + "  \"schema\": \"voice_tts_summary/v1\",\n"
+             + "  \"stamp\": \"" + STAMP + "\",\n"
+             + "  \"source\": \"macOS say TTS (Yuna only — male aliases silent on this build)\",\n"
+             + "  \"male_synthesis\": \"ffmpeg asetrate=22050*0.82,aresample=22050,atempo=1.21 (pseudo-male pitch shift)\",\n"
+             + "  \"personas\": 10,\n"
+             + "  \"total_clips\": " + to_string(total_clips) + ",\n"
+             + "  \"total_duration_s\": " + to_string(total_dur) + ",\n"
+             + "  \"r2_prefix\": \"" + R2_PREFIX + "\",\n"
+             + "  \"per_persona\": [\n"
+             + agg_rows + "\n"
+             + "  ]\n"
+             + "}\n"
+    write_file(agg_path, body)
+
+    println("")
+    println("════════════════════════════════════════════════════════════")
+    println("  AGGREGATE: " + to_string(total_clips) + " clips, "
+            + to_string(total_dur) + "s total")
+    println("  manifest:  " + agg_path)
+    println("════════════════════════════════════════════════════════════")
+}
