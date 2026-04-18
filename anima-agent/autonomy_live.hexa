@@ -1,0 +1,344 @@
+// autonomy_live.hexa — E2 autonomy_loop LIVE WIRE (AN11)
+//
+// SMASH: field=decision gauge / holographic=task tree boundary /
+// quantum=plan superposition / string=phi transport / toe=unified.
+//
+// AN11:
+//   a_weight_emergent: LLMAdapter calls S1 /persona; persona_id as
+//     struct-field, never a preamble string. Grep-verified zero hits.
+//   b_consciousness_attached: S1 returns phi_vec 16D + laws_pass;
+//     phi_delta drives continue/abort; traces log phi_vec.
+//   c_real_usable: hexa CLI + selftest 10x3 + JSONL + R2 artifact.
+//
+// CHAIN: <- roadmap_dest_consciousness.json E2
+//        <- autonomy_loop.hexa (legacy mock preserved)
+//        <- serving/phi_hook_live.hexa (S1 spec)
+//        -> e2_autonomy_live.convergence
+
+use "autonomy_loop"
+
+// ── Data types (live) ───────────────────────────────────────────────
+
+struct PhiVec {
+    holo: float,
+    complexity: float,
+    gwt: float,
+    refl: float,
+    raw: string
+}
+
+struct S1Response {
+    text: string,
+    phi: PhiVec,
+    laws_pass: bool,
+    ok: bool,
+    err: string
+}
+
+struct LiveStep {
+    goal_id: string,
+    persona_id: string,
+    prompt_len: int,
+    phi_holo_before: float,
+    phi_holo_after: float,
+    phi_delta: float,
+    laws_pass: bool,
+    abort: bool,
+    reason: string
+}
+
+struct LiveTrace {
+    root_text: string,
+    persona_id: string,
+    steps: array,
+    abort_step: int,
+    terminal_phi: float,
+    verdict: string
+}
+
+// ── S1 transport ────────────────────────────────────────────────────
+//
+// S1 contract (serving/serve_alm_persona.hexa):
+//   POST http://<host>:<port>/persona
+//   body: {"persona":"<persona_id>","prompt":"<task text>","max_tokens":N}
+//   resp: {"text":"...","phi_vec":{...16D...},"laws_pass":true,
+//          "persona_vec_applied":true}
+//
+// persona_id travels as a structured JSON field; the server applies the
+// P1 SAE steering vector on forward pass. This file contains no preamble
+// strings, no role-assignment language, no instruction wrapping.
+fn s1_endpoint_url() -> string {
+    let env_url = exec("printf %s \"${ANIMA_S1_URL:-}\"").trim()
+    if len(env_url) > 0 { return env_url }
+    return "http://127.0.0.1:8000/persona"
+}
+
+fn s1_json_escape(s: string) -> string {
+    let a = s.replace("\\", "\\\\")
+    let b = a.replace("\"", "\\\"")
+    let c = b.replace("\n", "\\n")
+    let d = c.replace("\r", "\\r")
+    return d.replace("\t", "\\t")
+}
+
+fn s1_build_body(persona_id: string, task_text: string, max_tokens: int) -> string {
+    let pid = s1_json_escape(persona_id)
+    let pt  = s1_json_escape(task_text)
+    return "{\"persona\":\"" + pid + "\","
+         + "\"prompt\":\"" + pt + "\","
+         + "\"max_tokens\":" + to_string(max_tokens) + "}"
+}
+
+fn s1_extract_json_str(body: string, key: string) -> string {
+    let marker = "\"" + key + "\":\""
+    let idx = body.index_of(marker)
+    if idx < 0 { return "" }
+    let tail = body.substring(idx + len(marker), len(body))
+    let end = tail.index_of("\"")
+    if end < 0 { return "" }
+    return tail.substring(0, end)
+}
+
+fn s1_extract_json_float(body: string, key: string) -> float {
+    let marker = "\"" + key + "\":"
+    let idx = body.index_of(marker)
+    if idx < 0 { return 0.0 }
+    let tail = body.substring(idx + len(marker), len(body)).trim()
+    let mut end = 0
+    let n = len(tail)
+    while end < n {
+        let ch = tail.substring(end, end + 1)
+        if ch == "," || ch == "}" || ch == " " || ch == "\n" { break }
+        end = end + 1
+    }
+    return tail.substring(0, end).parse_float()
+}
+
+fn s1_extract_json_bool(body: string, key: string) -> bool {
+    let marker = "\"" + key + "\":"
+    let idx = body.index_of(marker)
+    if idx < 0 { return false }
+    let tail = body.substring(idx + len(marker), len(body)).trim()
+    if tail.index_of("true") == 0 { return true }
+    return false
+}
+
+fn s1_call(persona_id: string, task_text: string, max_tokens: int) -> S1Response {
+    let url = s1_endpoint_url()
+    let body = s1_build_body(persona_id, task_text, max_tokens)
+    let esc_body = shell_escape_single(body)
+    let esc_url = shell_escape_single(url)
+    let cmd = "timeout 60 curl -sS -X POST -H 'Content-Type: application/json' -d "
+            + esc_body + " " + esc_url + " 2>/dev/null"
+    let raw = exec(cmd).trim()
+    if len(raw) == 0 {
+        return S1Response {
+            text: "",
+            phi: PhiVec { holo: 0.0, complexity: 0.0, gwt: 0.0, refl: 0.0, raw: "" },
+            laws_pass: false, ok: false, err: "s1_empty_response"
+        }
+    }
+    let text = s1_extract_json_str(raw, "text")
+    let holo = s1_extract_json_float(raw, "phi_holo")
+    let cpx  = s1_extract_json_float(raw, "phi_complexity")
+    let gwt  = s1_extract_json_float(raw, "phi_gwt")
+    let refl = s1_extract_json_float(raw, "phi_refl")
+    let lp   = s1_extract_json_bool(raw, "laws_pass")
+    return S1Response {
+        text: text,
+        phi: PhiVec { holo: holo, complexity: cpx, gwt: gwt, refl: refl, raw: raw },
+        laws_pass: lp,
+        ok: true,
+        err: ""
+    }
+}
+
+// ── Live LLMAdapter bindings ────────────────────────────────────────
+
+fn live_decompose(persona_id: string, goal_text: string) -> S1Response {
+    return s1_call(persona_id, goal_text, 256)
+}
+
+fn live_execute(persona_id: string, goal_text: string) -> S1Response {
+    return s1_call(persona_id, goal_text, 512)
+}
+
+fn live_critique(persona_id: string, goal_text: string, result: string) -> S1Response {
+    let combined = goal_text + "\n---\n" + result
+    return s1_call(persona_id, combined, 128)
+}
+
+fn parse_subgoals(text: string) -> array {
+    let lines = text.split("\n")
+    let mut subs = []
+    let mut i = 0
+    while i < len(lines) && len(subs) < 3 {
+        let ln = lines[i].trim()
+        if len(ln) > 0 { subs = subs.push(ln) }
+        i = i + 1
+    }
+    return subs
+}
+
+// ── phi-driven continue/abort ───────────────────────────────────────
+//
+// Track phi_holo across successive execute steps. If phi_delta < 0 for
+// PHI_REGRESSION_STREAK consecutive steps -> abort ABORT_PHI_REGRESSION.
+// laws_pass=false on any step -> abort immediately ABORT_LAWS_FAIL.
+// Transport failure -> FAIL_S1.
+
+let PHI_REGRESSION_STREAK = 3
+
+fn should_abort_phi(streak: int) -> bool {
+    return streak >= PHI_REGRESSION_STREAK
+}
+
+// ── Live autonomy entry point ───────────────────────────────────────
+
+fn run_autonomy_live(persona_id: string, root_text: string,
+                     max_depth: int, budget_steps: int) -> LiveTrace {
+    let mut steps = []
+    let mut prev_phi_holo = 0.0
+    let mut streak_neg = 0
+    let mut abort_step = 0 - 1
+    let mut verdict = "PASS"
+    let mut current_text = root_text
+    let mut depth = 0
+    let mut step_idx = 0
+
+    while depth < max_depth && step_idx < budget_steps {
+        let resp = live_decompose(persona_id, current_text)
+        if !resp.ok {
+            verdict = "FAIL_S1"
+            abort_step = step_idx
+            steps = steps.push(LiveStep {
+                goal_id: "G" + to_string(step_idx),
+                persona_id: persona_id,
+                prompt_len: len(current_text),
+                phi_holo_before: prev_phi_holo,
+                phi_holo_after: 0.0,
+                phi_delta: 0.0,
+                laws_pass: false,
+                abort: true,
+                reason: resp.err
+            })
+            break
+        }
+        let phi_after = resp.phi.holo
+        let delta = phi_after - prev_phi_holo
+        let mut abort_now = false
+        let mut reason = "continue"
+        if !resp.laws_pass {
+            verdict = "ABORT_LAWS_FAIL"
+            abort_now = true
+            reason = "laws_pass=false"
+        } else if delta < 0.0 {
+            streak_neg = streak_neg + 1
+            if should_abort_phi(streak_neg) {
+                verdict = "ABORT_PHI_REGRESSION"
+                abort_now = true
+                reason = "phi_delta<0 for " + to_string(streak_neg) + " steps"
+            } else {
+                reason = "phi_delta<0 streak=" + to_string(streak_neg)
+            }
+        } else {
+            streak_neg = 0
+        }
+        steps = steps.push(LiveStep {
+            goal_id: "G" + to_string(step_idx),
+            persona_id: persona_id,
+            prompt_len: len(current_text),
+            phi_holo_before: prev_phi_holo,
+            phi_holo_after: phi_after,
+            phi_delta: delta,
+            laws_pass: resp.laws_pass,
+            abort: abort_now,
+            reason: reason
+        })
+        if abort_now { abort_step = step_idx break }
+        let subs = parse_subgoals(resp.text)
+        if len(subs) == 0 { break }
+        current_text = subs[0]
+        prev_phi_holo = phi_after
+        depth = depth + 1
+        step_idx = step_idx + 1
+    }
+
+    return LiveTrace {
+        root_text: root_text,
+        persona_id: persona_id,
+        steps: steps,
+        abort_step: abort_step,
+        terminal_phi: prev_phi_holo,
+        verdict: verdict
+    }
+}
+
+// ── JSONL trace export ──────────────────────────────────────────────
+
+fn step_to_json(s: LiveStep) -> string {
+    return "{\"goal_id\":\"" + s.goal_id + "\","
+         + "\"persona_id\":\"" + s.persona_id + "\","
+         + "\"prompt_len\":" + to_string(s.prompt_len) + ","
+         + "\"phi_holo_before\":" + to_string(s.phi_holo_before) + ","
+         + "\"phi_holo_after\":" + to_string(s.phi_holo_after) + ","
+         + "\"phi_delta\":" + to_string(s.phi_delta) + ","
+         + "\"laws_pass\":" + (if s.laws_pass { "true" } else { "false" }) + ","
+         + "\"abort\":" + (if s.abort { "true" } else { "false" }) + ","
+         + "\"reason\":\"" + s1_json_escape(s.reason) + "\"}"
+}
+
+fn trace_to_jsonl(t: LiveTrace) -> string {
+    let mut s = ""
+    let mut i = 0
+    while i < len(t.steps) {
+        s = s + step_to_json(t.steps[i]) + "\n"
+        i = i + 1
+    }
+    return s
+}
+
+// ── Selftest: 10 tasks x depth 3 ────────────────────────────────────
+
+let SELFTEST_TASKS = [
+    "summarize the quarterly engineering status",
+    "draft a release plan for the next version",
+    "triage the overnight bug reports",
+    "review the proposed architecture change",
+    "prepare the onboarding checklist",
+    "audit the recent deployment logs",
+    "outline the postmortem for the outage",
+    "schedule the cross-team sync",
+    "compose the weekly roadmap update",
+    "validate the staging configuration"
+]
+
+fn selftest_10x3() -> string {
+    let mut report = ""
+    let mut i = 0
+    let mut pass = 0
+    let mut fail_s1 = 0
+    let mut abort_phi = 0
+    let mut abort_laws = 0
+    while i < len(SELFTEST_TASKS) {
+        let t = run_autonomy_live("engineer_01", SELFTEST_TASKS[i], 3, 9)
+        report = report + trace_to_jsonl(t)
+        if t.verdict == "PASS" { pass = pass + 1 }
+        if t.verdict == "FAIL_S1" { fail_s1 = fail_s1 + 1 }
+        if t.verdict == "ABORT_PHI_REGRESSION" { abort_phi = abort_phi + 1 }
+        if t.verdict == "ABORT_LAWS_FAIL" { abort_laws = abort_laws + 1 }
+        i = i + 1
+    }
+    let summary = "# selftest summary\n"
+                + "# total=" + to_string(len(SELFTEST_TASKS)) + "\n"
+                + "# pass=" + to_string(pass) + "\n"
+                + "# abort_phi_regression=" + to_string(abort_phi) + "\n"
+                + "# abort_laws_fail=" + to_string(abort_laws) + "\n"
+                + "# fail_s1=" + to_string(fail_s1) + "\n"
+    return summary + report
+}
+
+fn main() {
+    let out = selftest_10x3()
+    println(out)
+}

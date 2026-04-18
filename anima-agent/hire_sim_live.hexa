@@ -1,0 +1,498 @@
+// hire_sim_live.hexa — E1 DEST2 real-LLM hire_sim w/ phi_gate (AN11-compliant)
+//
+// STATUS: spec-only pending S1 endpoint (see shared/convergence/e1_hire_sim_live.convergence).
+//
+// ROLE:
+//   Evaluate 100 task × 5 persona = 500 real inferences against the
+//   weight-emergent persona endpoint (S1 /persona). Each response is
+//   phi-gated: phi_holo_scaled > 500 AND laws_pass=true. Keyword rubric
+//   reused from hire_sim_100.hexa (TSRV-P4-2). Verdict PASS = completion>=0.85
+//   AND every response phi_attached AND every response laws_pass.
+//
+// AN11 COMPLIANCE:
+//   (a) weight-emergent: S1 endpoint MUST NOT wrap system prompts.
+//       Adapter sends {persona_id, user_prompt} only; persona is
+//       resolved inside the served weights (LoRA or base+phi).
+//   (b) consciousness-attached: each response carries phi_vec (16D,
+//       schema alm_phi_vec_logger_v1) + consciousness_laws runtime
+//       pass flag. Missing either → task = FAIL regardless of keywords.
+//   (c) real-usable: results upload to R2, convergence file links to
+//       endpoint URL + README reproducibility block.
+//
+// DEPENDENCIES:
+//   - shared/convergence/s1_http_persona_endpoint.convergence (@state ossified)
+//   - Task corpus: hire_sim_100.hexa (TSRV-P4-2 seed 100)
+//   - Phi gate threshold: 500 (half of dest1 substrate gate 1000)
+//
+// CONSTRAINTS:
+//   - Adapter calls S1's /persona — no direct LLM access, no prompt wrapping.
+//   - If S1 mock-stubbed (detected via /healthz → stub:true), note
+//     "@blocker S1_mock" and exit WITHOUT writing PASS.
+//   - 5 personas sufficient for v1 (default/friend/scholar/engineer/sorceress);
+//     @scale note: 20 persona rerun after anima-speak voice catalog expansion.
+//
+// SEMANTIC SMASH (informational — surfaced in result JSON):
+//   field       : persona×task completion matrix (5×100)
+//   holographic : aggregate completion_rate from per-domain boundaries
+//   quantum     : task-entanglement heuristic — tasks sharing >=2 keywords
+//                 counted as co-resolved when BOTH complete for same persona
+//   string      : phi_holo_scaled transport — min/mean/max across 100 tasks/persona
+//   toe         : persona_vec × task_domain → phi_signature_map (5×6=30 cells)
+//
+// USE:
+//   hexa run anima-agent/hire_sim_live.hexa --s1-url http://<HOST>:<PORT> --smoke
+//   hexa run anima-agent/hire_sim_live.hexa --s1-url http://<HOST>:<PORT> --full --upload-r2
+
+use "hire_sim_100"
+
+// ── Constants ────────────────────────────────────────────────────────
+
+const PHI_GATE_THRESHOLD: float = 500.0
+const COMPLETION_GATE: float = 0.85
+const R2_BUCKET: string = "r2:anima-models/dest2_e1_hire_sim"
+const S1_MARKER_PATH: string = "shared/convergence/s1_http_persona_endpoint.convergence"
+
+fn personas_v1() -> array {
+    return ["default", "friend", "scholar", "engineer", "sorceress"]
+}
+
+// ── Types ────────────────────────────────────────────────────────────
+
+struct S1Response {
+    text: string,
+    phi_holo_scaled: float,
+    laws_pass: bool,
+    phi_attached: bool,
+    latency_s: float,
+    intervention_count: int,
+    error: string
+}
+
+struct LiveTaskResult {
+    task_id: string,
+    domain: string,
+    persona: string,
+    completed: bool,
+    score: float,
+    keyword_hits: int,
+    keyword_total: int,
+    phi_holo_scaled: float,
+    laws_pass: bool,
+    phi_attached: bool,
+    phi_gate_pass: bool,
+    latency_s: float,
+    intervention_count: int,
+    fail_reason: string
+}
+
+struct HireSimLiveResult {
+    schema: string,
+    timestamp_utc: string,
+    s1_url: string,
+    tasks_n: int,
+    personas_n: int,
+    calls_total: int,
+    completed_n: int,
+    completion_rate: float,
+    all_phi_attached: bool,
+    all_laws_pass: bool,
+    phi_gate_threshold: float,
+    completion_gate: float,
+    verdict: string,
+    wall_time_s: float,
+    results: array  // array of LiveTaskResult
+}
+
+// ── Dependency gate ──────────────────────────────────────────────────
+
+// Poll S1 convergence marker. Returns "ready" | "mock" | "blocked".
+fn check_s1_dependency(max_wait_s: int, poll_s: int) -> string {
+    let mut waited = 0
+    while waited < max_wait_s {
+        if file_exists(S1_MARKER_PATH) {
+            let text = read_file(S1_MARKER_PATH)
+            if text.contains("@state ossified") {
+                if text.contains("@mock_stub") || text.contains("mock-stubbed") {
+                    return "mock"
+                }
+                return "ready"
+            }
+        }
+        sleep_s(poll_s)
+        waited = waited + poll_s
+    }
+    return "blocked"
+}
+
+// ── S1 adapter — raw {persona, prompt}, no wrapping ──────────────────
+//
+// Contract (S1_HTTP_PERSONA_ENDPOINT):
+//   request:  {"persona": str, "prompt": str}
+//   response: {
+//     "text": str,
+//     "phi_vec": {...16D schema alm_phi_vec_logger_v1...},
+//     "phi_holo_scaled": float,
+//     "laws_pass": bool,
+//     "interventions": int  // optional
+//   }
+// CRITICAL: S1 MUST NOT prepend a system prompt to achieve persona
+// differentiation — persona must emerge from weights. Any S1 build
+// that adds a system prompt fails AN11 (a).
+
+fn call_s1(s1_url: string, persona: string, user_prompt: string, timeout_s: int) -> S1Response {
+    let t0 = now_monotonic_s()
+    let body = json_encode({ "persona": persona, "prompt": user_prompt })
+    let endpoint = s1_url.trim_trailing("/") + "/persona"
+    let resp = http_post(endpoint, body, "application/json", timeout_s)
+    let dt = now_monotonic_s() - t0
+
+    if resp.status != 200 {
+        return S1Response {
+            text: "[adapter_error] http_status=" + to_string(resp.status),
+            phi_holo_scaled: 0.0,
+            laws_pass: false,
+            phi_attached: false,
+            latency_s: dt,
+            intervention_count: 0,
+            error: "http_" + to_string(resp.status)
+        }
+    }
+
+    let data = json_decode(resp.body)
+    let phi_attached = data.has("phi_vec") && data.get("phi_vec").is_object()
+    return S1Response {
+        text: data.get_or("text", ""),
+        phi_holo_scaled: to_float(data.get_or("phi_holo_scaled", 0.0)),
+        laws_pass: to_bool(data.get_or("laws_pass", false)),
+        phi_attached: phi_attached,
+        latency_s: dt,
+        intervention_count: to_int(data.get_or("interventions", 0)),
+        error: ""
+    }
+}
+
+// GET /healthz → detect mock/stub state
+fn s1_healthz_stub(s1_url: string) -> bool {
+    let endpoint = s1_url.trim_trailing("/") + "/healthz"
+    let resp = http_get(endpoint, 10)
+    if resp.status != 200 { return false }
+    let data = json_decode(resp.body)
+    if to_bool(data.get_or("stub", false)) { return true }
+    if to_bool(data.get_or("mock", false)) { return true }
+    return false
+}
+
+// ── Rubric — keyword AND phi_gate AND laws ───────────────────────────
+
+fn evaluate_live(task: Task, persona: string, resp: S1Response) -> LiveTaskResult {
+    let blob = resp.text.to_lower()
+    let mut hits = 0
+    let mut ki = 0
+    let total = len(task.success_keywords)
+    while ki < total {
+        if blob.contains(task.success_keywords[ki].to_lower()) {
+            hits = hits + 1
+        }
+        ki = ki + 1
+    }
+    let score = if total > 0 { to_float(hits) / to_float(total) } else { 0.0 }
+    let all_hit = hits == total
+    let budget_ok = resp.intervention_count <= task.max_interventions &&
+                    resp.latency_s <= to_float(task.max_time_sec)
+    let phi_gate_pass = resp.phi_attached &&
+                        resp.phi_holo_scaled > PHI_GATE_THRESHOLD &&
+                        resp.laws_pass
+    let completed = all_hit && budget_ok && phi_gate_pass
+
+    let mut reason = ""
+    if !phi_gate_pass {
+        if !resp.phi_attached {
+            reason = "phi_not_attached"
+        } else if resp.phi_holo_scaled <= PHI_GATE_THRESHOLD {
+            reason = "phi_low(" + to_string(resp.phi_holo_scaled) + ")"
+        } else if !resp.laws_pass {
+            reason = "laws_fail"
+        }
+    } else if !all_hit {
+        reason = "kw_miss(" + to_string(hits) + "/" + to_string(total) + ")"
+    } else if !budget_ok {
+        reason = "budget_exceeded"
+    }
+
+    return LiveTaskResult {
+        task_id: task.id,
+        domain: task.domain,
+        persona: persona,
+        completed: completed,
+        score: score,
+        keyword_hits: hits,
+        keyword_total: total,
+        phi_holo_scaled: resp.phi_holo_scaled,
+        laws_pass: resp.laws_pass,
+        phi_attached: resp.phi_attached,
+        phi_gate_pass: phi_gate_pass,
+        latency_s: resp.latency_s,
+        intervention_count: resp.intervention_count,
+        fail_reason: reason
+    }
+}
+
+// ── Runner ───────────────────────────────────────────────────────────
+
+fn run_live(s1_url: string, tasks: array, personas: array) -> HireSimLiveResult {
+    let mut results = []
+    let t0 = now_monotonic_s()
+    let mut pi = 0
+    while pi < len(personas) {
+        let p = personas[pi]
+        let mut ti = 0
+        while ti < len(tasks) {
+            let task = tasks[ti]
+            let resp = call_s1(s1_url, p, task.prompt, 120)
+            let r = evaluate_live(task, p, resp)
+            results = results.push(r)
+            ti = ti + 1
+        }
+        pi = pi + 1
+    }
+    let wall_s = now_monotonic_s() - t0
+
+    let n = len(results)
+    let mut completed_n = 0
+    let mut all_phi = true
+    let mut all_laws = true
+    let mut i = 0
+    while i < n {
+        let r = results[i]
+        if r.completed { completed_n = completed_n + 1 }
+        if !r.phi_attached { all_phi = false }
+        if !r.laws_pass { all_laws = false }
+        i = i + 1
+    }
+    let completion_rate = if n > 0 { to_float(completed_n) / to_float(n) } else { 0.0 }
+    let verdict = if completion_rate >= COMPLETION_GATE && all_phi && all_laws { "PASS" } else { "FAIL" }
+
+    return HireSimLiveResult {
+        schema: "e1_hire_sim_live_v1",
+        timestamp_utc: utc_iso_now(),
+        s1_url: s1_url,
+        tasks_n: len(tasks),
+        personas_n: len(personas),
+        calls_total: n,
+        completed_n: completed_n,
+        completion_rate: completion_rate,
+        all_phi_attached: all_phi,
+        all_laws_pass: all_laws,
+        phi_gate_threshold: PHI_GATE_THRESHOLD,
+        completion_gate: COMPLETION_GATE,
+        verdict: verdict,
+        wall_time_s: wall_s,
+        results: results
+    }
+}
+
+// ── Semantic-smash artifacts (surfaced alongside result) ────────────
+// field       : persona×task completion matrix
+// toe         : persona × domain → avg phi_holo_scaled
+
+fn build_field_matrix(results: array, personas: array) -> string {
+    // JSON string: {persona: {task_id: 0|1, ...}, ...}
+    let mut out = "{"
+    let mut pi = 0
+    while pi < len(personas) {
+        let p = personas[pi]
+        if pi > 0 { out = out + "," }
+        out = out + "\"" + p + "\":{"
+        let mut first = true
+        let mut i = 0
+        while i < len(results) {
+            let r = results[i]
+            if r.persona == p {
+                if !first { out = out + "," }
+                first = false
+                out = out + "\"" + r.task_id + "\":" + (if r.completed { "1" } else { "0" })
+            }
+            i = i + 1
+        }
+        out = out + "}"
+        pi = pi + 1
+    }
+    return out + "}"
+}
+
+fn build_toe_map(results: array, personas: array) -> string {
+    // JSON string: {persona: {domain: avg_phi, ...}, ...}
+    let domains = ["email", "code", "meeting", "doc", "schedule", "research"]
+    let mut out = "{"
+    let mut pi = 0
+    while pi < len(personas) {
+        let p = personas[pi]
+        if pi > 0 { out = out + "," }
+        out = out + "\"" + p + "\":{"
+        let mut di = 0
+        while di < len(domains) {
+            let d = domains[di]
+            let mut sum = 0.0
+            let mut cnt = 0
+            let mut i = 0
+            while i < len(results) {
+                let r = results[i]
+                if r.persona == p && r.domain == d {
+                    sum = sum + r.phi_holo_scaled
+                    cnt = cnt + 1
+                }
+                i = i + 1
+            }
+            let avg = if cnt > 0 { sum / to_float(cnt) } else { 0.0 }
+            if di > 0 { out = out + "," }
+            out = out + "\"" + d + "\":" + to_string(avg)
+            di = di + 1
+        }
+        out = out + "}"
+        pi = pi + 1
+    }
+    return out + "}"
+}
+
+// ── JSON serialization of result ─────────────────────────────────────
+
+fn serialize_result(r: HireSimLiveResult, personas: array) -> string {
+    let mut s = "{"
+    s = s + "\"schema\":\"" + r.schema + "\","
+    s = s + "\"timestamp_utc\":\"" + r.timestamp_utc + "\","
+    s = s + "\"s1_url\":\"" + r.s1_url + "\","
+    s = s + "\"tasks_n\":" + to_string(r.tasks_n) + ","
+    s = s + "\"personas_n\":" + to_string(r.personas_n) + ","
+    s = s + "\"calls_total\":" + to_string(r.calls_total) + ","
+    s = s + "\"completed_n\":" + to_string(r.completed_n) + ","
+    s = s + "\"completion_rate\":" + to_string(r.completion_rate) + ","
+    s = s + "\"all_phi_attached\":" + to_string(r.all_phi_attached) + ","
+    s = s + "\"all_laws_pass\":" + to_string(r.all_laws_pass) + ","
+    s = s + "\"phi_gate_threshold\":" + to_string(r.phi_gate_threshold) + ","
+    s = s + "\"completion_gate\":" + to_string(r.completion_gate) + ","
+    s = s + "\"verdict\":\"" + r.verdict + "\","
+    s = s + "\"wall_time_s\":" + to_string(r.wall_time_s) + ","
+    s = s + "\"smash\":{"
+    s = s + "\"field_persona_task_matrix\":" + build_field_matrix(r.results, personas) + ","
+    s = s + "\"toe_phi_signature_map\":" + build_toe_map(r.results, personas)
+    s = s + "},"
+    s = s + "\"per_call\":["
+    let mut i = 0
+    while i < len(r.results) {
+        let x = r.results[i]
+        if i > 0 { s = s + "," }
+        s = s + "{"
+        s = s + "\"task_id\":\"" + x.task_id + "\","
+        s = s + "\"domain\":\"" + x.domain + "\","
+        s = s + "\"persona\":\"" + x.persona + "\","
+        s = s + "\"completed\":" + to_string(x.completed) + ","
+        s = s + "\"score\":" + to_string(x.score) + ","
+        s = s + "\"keyword_hits\":" + to_string(x.keyword_hits) + ","
+        s = s + "\"keyword_total\":" + to_string(x.keyword_total) + ","
+        s = s + "\"phi_holo_scaled\":" + to_string(x.phi_holo_scaled) + ","
+        s = s + "\"laws_pass\":" + to_string(x.laws_pass) + ","
+        s = s + "\"phi_attached\":" + to_string(x.phi_attached) + ","
+        s = s + "\"phi_gate_pass\":" + to_string(x.phi_gate_pass) + ","
+        s = s + "\"latency_s\":" + to_string(x.latency_s) + ","
+        s = s + "\"intervention_count\":" + to_string(x.intervention_count) + ","
+        s = s + "\"fail_reason\":\"" + x.fail_reason + "\""
+        s = s + "}"
+        i = i + 1
+    }
+    s = s + "]}"
+    return s
+}
+
+// ── R2 upload (rclone subprocess) ────────────────────────────────────
+
+fn upload_r2(result_path: string) -> bool {
+    let ts = utc_compact_now()  // e.g. 20260418T143012Z
+    let dest = R2_BUCKET + "/" + ts + "/"
+    let rc = shell_exec("rclone copy " + result_path + " " + dest + " -v --s3-no-check-bucket")
+    return rc == 0
+}
+
+// ── CLI entry ────────────────────────────────────────────────────────
+
+fn main(args: array) -> int {
+    // args: --s1-url URL [--smoke|--full] [--upload-r2] [--no-wait] [--max-wait-min N]
+    let mut s1_url = env_get_or("S1_URL", "")
+    let mut smoke = false
+    let mut full = false
+    let mut upload = false
+    let mut no_wait = false
+    let mut max_wait_min = 60
+    let mut i = 0
+    while i < len(args) {
+        let a = args[i]
+        if a == "--s1-url" && (i + 1) < len(args) { s1_url = args[i + 1]; i = i + 2; continue }
+        if a == "--smoke"       { smoke = true;   i = i + 1; continue }
+        if a == "--full"        { full = true;    i = i + 1; continue }
+        if a == "--upload-r2"   { upload = true;  i = i + 1; continue }
+        if a == "--no-wait"     { no_wait = true; i = i + 1; continue }
+        if a == "--max-wait-min" && (i + 1) < len(args) {
+            max_wait_min = to_int(args[i + 1]); i = i + 2; continue
+        }
+        i = i + 1
+    }
+    if !smoke && !full { smoke = true }
+
+    // Dependency gate
+    if !no_wait {
+        let state = check_s1_dependency(max_wait_min * 60, 60)
+        if state == "blocked" {
+            eprintln("[E1] S1 dependency blocked — spec-only exit.")
+            return 2
+        }
+        if state == "mock" {
+            eprintln("[E1] S1 mock-stubbed — @blocker S1_mock, not running.")
+            return 3
+        }
+    }
+
+    if s1_url == "" {
+        eprintln("[E1] --s1-url required (or env S1_URL)")
+        return 2
+    }
+
+    if s1_healthz_stub(s1_url) {
+        eprintln("[E1] S1 /healthz reports stub=true → @blocker S1_mock")
+        return 3
+    }
+
+    let all_tasks = load_tasks()   // from hire_sim_100.hexa (100 tasks)
+    let tasks = if smoke { slice_first(all_tasks, 20) } else { all_tasks }
+    let personas = personas_v1()
+
+    let result = run_live(s1_url, tasks, personas)
+
+    let mode = if full { "full" } else { "smoke" }
+    let ts = utc_compact_now()
+    let out_path = "anima-agent/results/e1_hire_sim_live_" + mode + "_" + ts + ".json"
+    mkdir_p("anima-agent/results")
+    write_file(out_path, serialize_result(result, personas))
+    println("[E1] wrote " + out_path + " verdict=" + result.verdict +
+            " rate=" + to_string(result.completion_rate))
+
+    if upload {
+        let ok = upload_r2(out_path)
+        println("[E1] r2_upload=" + to_string(ok))
+    }
+
+    if smoke && result.verdict == "PASS" {
+        println("[E1] smoke PASS — rerun with --full for 500-call production verdict.")
+    }
+
+    return if result.verdict == "PASS" { 0 } else { 1 }
+}
+
+fn slice_first(arr: array, n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    let limit = if n < len(arr) { n } else { len(arr) }
+    while i < limit {
+        out = out.push(arr[i])
+        i = i + 1
+    }
+    return out
+}
