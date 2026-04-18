@@ -1,0 +1,352 @@
+// scripts/bundler_experiment.hexa
+// -----------------------------------------------------------------------------
+// Hexa bundler experiment — pack entry.hexa + all transitive `use` deps into a
+// single self-contained .c file. Output can be scp'd once and compiled with a
+// single `gcc -O2 out.c -I<include dir> -lm`, replacing the 14-step scaffold
+// chain (per-dep transpile + rename main + --allow-multiple-definition).
+//
+// Usage:
+//   hexa run scripts/bundler_experiment.hexa <entry.hexa> <out.c> [scratch]
+//
+// Strategy:
+//   1. BFS-traverse `use "X"` lines starting from entry.
+//   2. Resolve each use relative to the importer's directory, following
+//      symlinks via pure POSIX shell (R37: no python).
+//   3. Invoke hexa_v2 native transpiler on each hexa file, emitting per-file
+//      .c into a scratch dir.
+//   4. Strip the duplicate `#include "runtime.c"` from every emitted .c.
+//   5. Rename each dep's `int main(int argc, ...)` to
+//      `int __bundle_main_<tag>(int argc, ...)` so the linker sees exactly
+//      one `main`.
+//   6. Concatenate: [single runtime.c include] + [dep_1.c] + ... +
+//      [dep_N.c] + [entry.c].  The entry keeps the real `int main`.
+//
+// Constraints (CLAUDE.md):
+//   - No `.py` anywhere.
+//   - Scratch dir under /tmp only.
+//   - Does not modify hexa-lang itself.
+// -----------------------------------------------------------------------------
+
+// ── string helpers (hexa lacks .find/.rfind on strings) ───────────────────
+
+fn find_first(s: string, needle: string) -> int {
+    // Split once — the prefix length is the first index. If no hit, split
+    // returns the original string as a single element.
+    let parts = s.split(needle)
+    if parts.len() < 2 { return -1 }
+    return parts[0].len()
+}
+
+fn find_last(s: string, needle: string) -> int {
+    let parts = s.split(needle)
+    let n = parts.len()
+    if n < 2 { return -1 }
+    // Index of the final delimiter = total of all-but-last part lengths
+    // plus (n-1) delimiter positions accounted for one less time.
+    let nl = needle.len()
+    let mut total = 0
+    let mut i = 0
+    while i < n - 1 {
+        total = total + parts[i].len()
+        if i < n - 2 { total = total + nl }
+        i = i + 1
+    }
+    return total
+}
+
+fn dirname(path: string) -> string {
+    let slash = find_last(path, "/")
+    if slash < 0 { return "." }
+    return path.substring(0, slash)
+}
+
+fn basename_noext(path: string) -> string {
+    let slash = find_last(path, "/")
+    let start = if slash < 0 { 0 } else { slash + 1 }
+    let dot = find_last(path, ".")
+    let stop = if dot > start { dot } else { path.len() }
+    return path.substring(start, stop)
+}
+
+// ── use parsing ───────────────────────────────────────────────────────────
+
+fn parse_use(line: string) -> string {
+    let t = line.trim()
+    if !t.starts_with("use ") && !t.starts_with("use\t") {
+        return ""
+    }
+    let q1 = find_first(t, "\"")
+    if q1 < 0 { return "" }
+    let rest = t.substring(q1 + 1, t.len())
+    let q2 = find_first(rest, "\"")
+    if q2 < 0 { return "" }
+    return rest.substring(0, q2)
+}
+
+// ── filesystem ────────────────────────────────────────────────────────────
+
+fn read_file(path: string) -> string {
+    // exec adds no trailing newline beyond what the file has.
+    return exec("cat '" + path + "'")
+}
+
+fn read_lines(path: string) -> [string] {
+    return read_file(path).split("\n")
+}
+
+// Resolve `use "mod"` relative to importer's directory using pure shell.
+// readlink (one hop) + `cd && pwd -P` for symlink resolution. Returns "" on
+// missing. For cross-repo symlinks (e.g. training/quantum_types.hexa ->
+// ../../hexa-lang/self/quantum_types.hexa) this correctly yields the real
+// path so transitive `use` lookups work in that real dir.
+fn resolve_use(importer_path: string, modname: string) -> string {
+    let d = dirname(importer_path)
+    let rel = modname + ".hexa"
+    // Use a small shell pipeline. If readlink on the path returns a value,
+    // follow it (resolving the target's cwd); otherwise the file itself is
+    // real.
+    let cmd = "cd '" + d + "' 2>/dev/null && "
+        + "if [ -e '" + rel + "' ]; then "
+        + "  tgt=$(readlink '" + rel + "' 2>/dev/null || true); "
+        + "  if [ -n \"$tgt\" ]; then "
+        + "    case \"$tgt\" in "
+        + "      /*) resolved=\"$tgt\" ;; "
+        + "      *)  resolved=$(cd \"$(dirname '" + rel + "')\" && cd \"$(dirname \"$tgt\")\" 2>/dev/null && printf '%s/%s' \"$(pwd -P)\" \"$(basename \"$tgt\")\") ;; "
+        + "    esac; "
+        + "  else "
+        + "    resolved=$(pwd -P)/'" + rel + "'; "
+        + "  fi; "
+        + "  printf '%s' \"$resolved\"; "
+        + "fi"
+    return exec(cmd).trim()
+}
+
+// ── BFS dependency collector ──────────────────────────────────────────────
+
+fn already_seen(seen: [string], p: string) -> bool {
+    let mut i = 0
+    while i < seen.len() {
+        if seen[i] == p { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn collect_deps(entry: string) -> [string] {
+    let mut queue = [entry]
+    let mut seen  = [entry]
+    let mut order = []
+    let mut qi = 0
+    while qi < queue.len() {
+        let cur = queue[qi]
+        qi = qi + 1
+        order = order + [cur]
+        let lines = read_lines(cur)
+        let mut li = 0
+        while li < lines.len() {
+            let mname = parse_use(lines[li])
+            if mname != "" {
+                let resolved = resolve_use(cur, mname)
+                if resolved != "" {
+                    if !already_seen(seen, resolved) {
+                        seen = seen + [resolved]
+                        queue = queue + [resolved]
+                    }
+                }
+            }
+            li = li + 1
+        }
+    }
+    // Reverse so leaves emit first (definitions precede callers).
+    let mut rev = []
+    let mut ri = order.len() - 1
+    while ri >= 0 {
+        rev = rev + [order[ri]]
+        ri = ri - 1
+    }
+    return rev
+}
+
+// ── transpile via hexa_v2 native ──────────────────────────────────────────
+
+fn transpile(hexa_bin: string, src: string, dst: string) -> bool {
+    let out = exec(hexa_bin + " '" + src + "' '" + dst + "' 2>&1")
+    // Success yields "OK: <dst>\n"; check by looking for that or for a
+    // present destination file with non-zero size.
+    let sz = exec("wc -c < '" + dst + "' 2>/dev/null || echo 0").trim()
+    if sz == "0" || sz == "" {
+        println("[bundler] transpile FAIL: " + src)
+        println(out)
+        return false
+    }
+    return true
+}
+
+// ── main driver ───────────────────────────────────────────────────────────
+
+fn env_or(key: string, fallback: string) -> string {
+    let v = env(key)
+    if v == "" { return fallback }
+    return v
+}
+
+fn abspath(p: string) -> string {
+    // Resolve to absolute (without following symlink of the file itself,
+    // but with all parent directory symlinks resolved via pwd -P).
+    let d = dirname(p)
+    let b = p.substring(
+        (if find_last(p, "/") < 0 { 0 } else { find_last(p, "/") + 1 }),
+        p.len())
+    return exec("cd '" + d + "' 2>/dev/null && printf '%s/%s' \"$(pwd -P)\" '" + b + "'").trim()
+}
+
+// Rewrite a transpiled .c file in-place, streaming through awk/sed, to:
+//   (1) strip the first `#include "runtime.c"` (kept once at top of bundle);
+//   (2) rename `int main(int argc` → `int __bundle_main_<tag>(int argc`
+//       (skipped for the entry so the bundle has exactly one `main`);
+//   (3) namespace all per-module static symbols by prefixing with the
+//       module tag, avoiding collisions when multiple TUs are merged.
+//       The transpiler emits these with numeric suffixes starting at 0
+//       per file, so simple textual renames are reliable:
+//         __hexa_sl_N        → __B_<tag>_sl_N       (string literal slots)
+//         __hexa_ic_N        → __B_<tag>_ic_N       (inline-cache slots)
+//         __hexa_strlit_init → __B_<tag>_strlit_init (per-file init)
+//       We also need to call each module's __B_<tag>_strlit_init from the
+//       entry's main; see patch_entry_strlit_call below.
+fn stream_postprocess_and_append(dep_c: string, tag: string, is_entry: bool,
+                                  out_c: string) {
+    let marker = "\n// ===== module: " + tag
+        + (if is_entry { " (ENTRY)" } else { "" })
+        + " =====\n"
+
+    // Per-module renames applied via a single sed pipeline.
+    let ns_prefix = "__B_" + tag + "_"
+    let sed_ns = "sed"
+        + " -e 's|__hexa_sl_|" + ns_prefix + "sl_|g'"
+        + " -e 's|__hexa_ic_|" + ns_prefix + "ic_|g'"
+        + " -e 's|__hexa_strlit_init|" + ns_prefix + "strlit_init|g'"
+
+    // Rename main only for non-entry modules (entry keeps `int main`).
+    let rename_main = if is_entry {
+        "cat"
+    } else {
+        "sed 's|int main(int argc|int __bundle_main_" + tag + "(int argc|'"
+    }
+
+    // Strip the first `#include "runtime.c"` via awk.
+    let strip_runtime = "awk 'BEGIN{done=0} /^#include \"runtime\\.c\"$/ && !done {print \"// [bundler] runtime.c stripped (" + tag + ")\"; done=1; next} {print}'"
+
+    let pipeline = "printf '%s' " + shell_quote(marker) + " >> '" + out_c + "' && "
+        + strip_runtime + " '" + dep_c + "' | "
+        + sed_ns + " | "
+        + rename_main + " >> '" + out_c + "'"
+    let _ = exec(pipeline)
+}
+
+fn shell_quote(s: string) -> string {
+    // Single-quote the string and escape embedded single quotes.
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn bundle(entry_in: string, out_c: string, scratch: string) {
+    let entry = abspath(entry_in)
+    println("[bundler] entry    = " + entry)
+    println("[bundler] output   = " + out_c)
+    println("[bundler] scratch  = " + scratch)
+
+    let deps = collect_deps(entry)
+    println("[bundler] modules (leaf-first) = " + str(deps.len()))
+    let mut di = 0
+    while di < deps.len() {
+        println("  [" + str(di) + "] " + deps[di])
+        di = di + 1
+    }
+
+    let _mk = exec("mkdir -p '" + scratch + "'")
+
+    let hexa_lang = env_or("HEXA_LANG", "/Users/ghost/Dev/hexa-lang")
+    let hexa_bin  = hexa_lang + "/self/native/hexa_v2"
+
+    // Preamble (small — safe to build as hexa string).
+    // Forward-declare the strlit fan-out stub — its definition is appended
+    // at the tail of the bundle but the (patched) main calls it at entry.
+    let preamble = "// ===== bundle generated by scripts/bundler_experiment.hexa =====\n"
+        + "// entry: " + entry + "\n"
+        + "// modules: " + str(deps.len()) + "\n"
+        + "#include \"runtime.c\"\n"
+        + "void __bundle_all_strlit_init(void);\n\n"
+    write_file(out_c, preamble)
+
+    let mut idx = 0
+    while idx < deps.len() {
+        let dep_path = deps[idx]
+        let tag = basename_noext(dep_path)
+        let dep_c = scratch + "/" + tag + ".c"
+        let ok = transpile(hexa_bin, dep_path, dep_c)
+        if !ok {
+            println("[bundler] ABORT on " + dep_path)
+            return
+        }
+        let is_entry = (dep_path == entry)
+        stream_postprocess_and_append(dep_c, tag, is_entry, out_c)
+        idx = idx + 1
+    }
+
+    // Inject calls to every dep's namespaced strlit_init at the top of the
+    // entry's main(). Each module's transpiled main originally calls
+    // __hexa_strlit_init (renamed to __B_<tag>_strlit_init). When merged,
+    // only the entry's main is kept intact; the dep inits must be wired.
+    // We insert a small stub function and call it from entry's main via sed.
+    let mut init_stub = "\n// ===== bundler: cross-module strlit init fan-out =====\n"
+    init_stub = init_stub + "void __bundle_all_strlit_init(void) {\n"
+    let mut si = 0
+    while si < deps.len() {
+        let dtag = basename_noext(deps[si])
+        if deps[si] != entry {
+            // Forward declare + call.
+            init_stub = init_stub + "    extern void __B_" + dtag + "_strlit_init(void);\n"
+            init_stub = init_stub + "    __B_" + dtag + "_strlit_init();\n"
+        }
+        si = si + 1
+    }
+    init_stub = init_stub + "}\n"
+    // Append stub then patch entry main to call it. The entry's
+    // __B_<entry_tag>_strlit_init is already called by its own main body;
+    // we only need to ensure the deps' inits run first. Use sed to insert
+    // our call right after `int main(int argc, char** argv) {` in the
+    // bundle (the entry main is the only unmangled `int main` remaining).
+    let patch_cmd = "printf '%s' " + shell_quote(init_stub) + " >> '" + out_c + "' && "
+        + "sed -i.bak 's|^int main(int argc, char\\*\\* argv) {|int main(int argc, char** argv) { __bundle_all_strlit_init();|' '"
+        + out_c + "' && rm -f '" + out_c + ".bak'"
+    let _ = exec(patch_cmd)
+
+    let loc = exec("wc -l < '" + out_c + "'").trim()
+    let bytes = exec("wc -c < '" + out_c + "'").trim()
+    println("[bundler] DONE — " + out_c + " (" + loc + " LOC, " + bytes + " bytes)")
+}
+
+fn main() {
+    // args() layout under `hexa run`:
+    //   [0] interpreter path
+    //   [1] this script path
+    //   [2] first user arg (entry.hexa)
+    //   [3] second user arg (out.c)
+    //   [4] optional scratch dir
+    let argv = args()
+    if argv.len() < 4 {
+        println("Usage: hexa run scripts/bundler_experiment.hexa <entry.hexa> <out.c> [scratch]")
+        println("argv.len() = " + str(argv.len()))
+        let mut i = 0
+        while i < argv.len() {
+            println("  argv[" + str(i) + "] = " + argv[i])
+            i = i + 1
+        }
+        return
+    }
+    let entry   = argv[2]
+    let out_c   = argv[3]
+    let scratch = if argv.len() >= 5 { argv[4] } else { "/tmp/bundler_scratch" }
+    bundle(entry, out_c, scratch)
+}
+
+main()

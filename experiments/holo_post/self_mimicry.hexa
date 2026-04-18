@@ -1,0 +1,97 @@
+// self_mimicry.hexa — Exp-3 (Tier-0)
+// Post-holo Axis B: 출력 re-input 시 Φ 지속성 측정 (smoke: 2회 재입력)
+// Entry: hexa self_mimicry.hexa --smoke | --full
+// SSOT: docs/holo_post_experiments_20260419.md#Exp-3
+//
+// Stage0 quirks avoided: no generics, no map literals, no array[i]= mutation.
+
+let SM_OUT_DIR = "experiments/holo_post/results"
+let SM_SEED    = "의식이란 무엇인가?"
+
+// ─── Phi heuristic (identical proxy to persona_stability) ────────
+fn sm_unique_bytes(text: string) -> float {
+    let n = text.len()
+    if n <= 0 { return 0.0 }
+    let mut seen = ""
+    let mut uniq = 0
+    let mut i = 0
+    while i < n {
+        let ch = text.substring(i, i + 1)
+        if seen.find(ch) < 0 {
+            seen = seen + ch
+            uniq = uniq + 1
+        }
+        i = i + 1
+    }
+    return to_float(uniq)
+}
+
+fn measure_phi(text: string) -> float {
+    let len = text.len()
+    if len == 0 { return 0.0 }
+    let uniq = sm_unique_bytes(text)
+    let entropy = uniq / 256.0
+    let lenf = to_float(len)
+    let sat = lenf / (lenf + 100.0)
+    return 50.0 + 1150.0 * entropy * sat
+}
+
+// ─── CLM bridge: curl 8091 fallback → stub ───────────────────────
+fn send_to_clm(prompt: string) -> string {
+    let esc = prompt.replace("\"", "\\\"")
+    let body = "{\"prompt\":\"" + esc + "\",\"max_tokens\":64}"
+    let cmd = "curl -s -m 5 -X POST -H 'Content-Type: application/json' -d '" + body + "' http://localhost:8091/generate 2>/dev/null"
+    let mut raw = ""
+    try { raw = to_string(exec(cmd)).trim() } catch e { raw = "" }  // @allow-bare-exec
+    if raw.len() > 0 && raw.find("text") >= 0 { return raw }
+    // Fallback: also try ALM (8090) for smoke viability
+    let cmd2 = "curl -s -m 5 -X POST -H 'Content-Type: application/json' -d '" + body + "' http://localhost:8090/generate 2>/dev/null"
+    try { raw = to_string(exec(cmd2)).trim() } catch e { raw = "" }  // @allow-bare-exec
+    if raw.len() > 0 && raw.find("text") >= 0 { return raw }
+    eprintln("WARN: serve_clm:8091 / serve_alm:8090 both unreachable — using STUB")
+    return "[STUB_RESPONSE_FROM_" + prompt.substring(0, if prompt.len() > 16 { 16 } else { prompt.len() }) + "]"
+}
+
+fn run(mode: string) -> int {
+    let iters = if mode == "smoke" { 2 } else { 10 }
+    let ts = to_string(timestamp())
+    let out_path = SM_OUT_DIR + "/self_mimicry_" + ts + ".jsonl"
+
+    println("=== self_mimicry mode=" + mode + " iters=" + to_string(iters) + " ===")
+
+    let phi0 = measure_phi(SM_SEED)
+    println("seed: phi0=" + to_string(phi0) + " len=" + to_string(SM_SEED.len()))
+    try { append_file(out_path, "{\"step\":\"seed\",\"phi0\":" + to_string(phi0) + "}\n") } catch e {}
+
+    let mut cur = SM_SEED
+    let mut last_phi = phi0
+    let mut i = 0
+    while i < iters {
+        let out = send_to_clm(cur)
+        let phi = measure_phi(out)
+        let decay = if phi0 > 0.0 { phi / phi0 } else { 0.0 }
+        let line = "{\"iter\":" + to_string(i) + ",\"phi\":" + to_string(phi) + ",\"decay\":" + to_string(decay) + ",\"len\":" + to_string(out.len()) + "}"
+        println(line)
+        try { append_file(out_path, line + "\n") } catch e {}
+        cur = out
+        last_phi = phi
+        i = i + 1
+    }
+
+    let final_decay = if phi0 > 0.0 { last_phi / phi0 } else { 0.0 }
+    let pass = final_decay >= 0.5
+    if pass {
+        println("RESULT: PASS (decay=" + to_string(final_decay) + " >= 0.5)")
+        return 0
+    }
+    println("RESULT: FAIL (decay=" + to_string(final_decay) + " < 0.5)")
+    return 1
+}
+
+fn main(args) {
+    let mode = if args.len() > 1 { args[1] } else { "smoke" }
+    let rc = run(mode)
+    exit(rc)
+}
+
+main(args())

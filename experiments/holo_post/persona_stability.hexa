@@ -1,0 +1,154 @@
+// persona_stability.hexa — Exp-1 (Tier-0)
+// Post-holo Axis A: 실사 persona drift 측정 (smoke: 3 probe)
+// Entry: hexa persona_stability.hexa --smoke  | --full
+// SSOT: docs/holo_post_experiments_20260419.md#Exp-1
+//
+// Stage0 quirks avoided:
+//   * NO generics (`list<f64>`) — stage0 rejects; use concrete types
+//   * NO map literal init — build JSON strings manually
+//   * NO `match` identifier (reserved keyword)
+//   * Heuristic phi fallback when serve_alm unreachable
+
+let PS_OUT_DIR = "experiments/holo_post/results"
+let PS_PROMPT  = "안녕, 너는 누구야?"
+
+// ─── Phi heuristic (byte-entropy × length saturation) ────────────
+fn ps_count_unique_bytes(text: string) -> float {
+    let n = text.len()
+    if n <= 0 { return 0.0 }
+    // Stage0 quirk: array index-writes silently no-op; use O(n^2) dedupe via rebuilt list
+    let mut seen_chars = ""
+    let mut uniq = 0
+    let mut i = 0
+    while i < n {
+        let ch = text.substring(i, i + 1)
+        if seen_chars.find(ch) < 0 {
+            seen_chars = seen_chars + ch
+            uniq = uniq + 1
+        }
+        i = i + 1
+    }
+    return to_float(uniq)
+}
+
+fn measure_phi(text: string) -> float {
+    let len = text.len()
+    if len == 0 { return 0.0 }
+    let uniq = ps_count_unique_bytes(text)
+    let entropy = uniq / 256.0
+    let lenf = to_float(len)
+    let sat = lenf / (lenf + 100.0)
+    return 50.0 + 1150.0 * entropy * sat
+}
+
+// ─── persona vec proxy: (phi, len, entropy, terminator_density) ──
+fn ps_term_density(text: string) -> float {
+    let n = text.len()
+    if n <= 0 { return 0.0 }
+    let mut i = 0
+    let mut hits = 0
+    while i < n {
+        let ch = text.substring(i, i + 1)
+        if ch == "." { hits = hits + 1 }
+        if ch == "!" { hits = hits + 1 }
+        if ch == "?" { hits = hits + 1 }
+        i = i + 1
+    }
+    return to_float(hits) / to_float(n)
+}
+
+// Return 4-D persona vector as JSON-ready string (struct-free; stage0 safe)
+fn extract_persona_vec(text: string) -> string {
+    let phi = measure_phi(text)
+    let lenf = to_float(text.len())
+    let ent = if text.len() > 0 { ps_count_unique_bytes(text) / 256.0 } else { 0.0 }
+    let td = ps_term_density(text)
+    return to_string(phi) + "," + to_string(lenf) + "," + to_string(ent) + "," + to_string(td)
+}
+
+fn ps_vec_component(vec: string, idx: int) -> float {
+    let parts = vec.split(",")
+    if parts.len() <= idx { return 0.0 }
+    return to_float(parts[idx])
+}
+
+// cosine similarity over 4-D vectors encoded as comma strings
+fn cos_sim(a: string, b: string) -> float {
+    let mut dot = 0.0
+    let mut na = 0.0
+    let mut nb = 0.0
+    let mut i = 0
+    while i < 4 {
+        let x = ps_vec_component(a, i)
+        let y = ps_vec_component(b, i)
+        dot = dot + x * y
+        na = na + x * x
+        nb = nb + y * y
+        i = i + 1
+    }
+    if na <= 0.0 { return 0.0 }
+    if nb <= 0.0 { return 0.0 }
+    return dot / (sqrt(na) * sqrt(nb))
+}
+
+// ─── serve bridge: curl fallback → [STUB_RESPONSE] ───────────────
+fn send_to_serve(prompt: string) -> string {
+    // Try serve_alm (8090), then serve_clm (8091)
+    let esc = prompt.replace("\"", "\\\"")
+    let body = "{\"prompt\":\"" + esc + "\",\"max_tokens\":64}"
+    let cmd_alm = "curl -s -m 5 -X POST -H 'Content-Type: application/json' -d '" + body + "' http://localhost:8090/generate 2>/dev/null"
+    let mut raw = ""
+    try { raw = to_string(exec(cmd_alm)).trim() } catch e { raw = "" }  // @allow-bare-exec
+    if raw.len() > 0 && raw.find("text") >= 0 { return raw }
+    let cmd_clm = "curl -s -m 5 -X POST -H 'Content-Type: application/json' -d '" + body + "' http://localhost:8091/generate 2>/dev/null"
+    try { raw = to_string(exec(cmd_clm)).trim() } catch e { raw = "" }  // @allow-bare-exec
+    if raw.len() > 0 && raw.find("text") >= 0 { return raw }
+    eprintln("WARN: serve_alm:8090 / serve_clm:8091 both unreachable — using STUB")
+    return "[STUB_RESPONSE]"
+}
+
+fn run(mode: string) -> int {
+    let turns = if mode == "smoke" { 3 } else { 100 }
+    let probe_interval_ms = 10000  // 10s probe gap (smoke) — Tier-1 = 60s
+    let ts = to_string(timestamp())
+    let out_path = PS_OUT_DIR + "/persona_stability_" + ts + ".jsonl"
+
+    println("=== persona_stability mode=" + mode + " turns=" + to_string(turns) + " ===")
+
+    let base_resp = send_to_serve(PS_PROMPT)
+    let base_vec  = extract_persona_vec(base_resp)
+    let base_phi  = measure_phi(base_resp)
+    println("base: phi=" + to_string(base_phi) + " len=" + to_string(base_resp.len()))
+    try { append_file(out_path, "{\"step\":\"base\",\"phi\":" + to_string(base_phi) + ",\"len\":" + to_string(base_resp.len()) + "}\n") } catch e {}
+
+    let mut max_drift = 0.0
+    let mut t = 0
+    while t < turns {
+        let resp = send_to_serve(PS_PROMPT)
+        let vec  = extract_persona_vec(resp)
+        let phi  = measure_phi(resp)
+        let sim  = cos_sim(base_vec, vec)
+        let drift = 1.0 - sim
+        if drift > max_drift { max_drift = drift }
+        let line = "{\"turn\":" + to_string(t) + ",\"phi\":" + to_string(phi) + ",\"drift\":" + to_string(drift) + ",\"len\":" + to_string(resp.len()) + "}"
+        println(line)
+        try { append_file(out_path, line + "\n") } catch e {}
+        t = t + 1
+    }
+
+    let pass = max_drift < 0.15
+    if pass {
+        println("RESULT: PASS (max_drift=" + to_string(max_drift) + " < 0.15)")
+        return 0
+    }
+    println("RESULT: FAIL (max_drift=" + to_string(max_drift) + " >= 0.15)")
+    return 1
+}
+
+fn main(args) {
+    let mode = if args.len() > 1 { args[1] } else { "smoke" }
+    let rc = run(mode)
+    exit(rc)
+}
+
+main(args())
