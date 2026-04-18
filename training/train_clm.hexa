@@ -15,10 +15,61 @@ use "anima_quantum_clm"
 // rationale and wire-format docs. Flag-off import has no runtime effect
 // beyond the self-test prints at module load.
 use "phi_cache_loader"
-// H1 (2026-04-18 9th-fire): mmap-equivalent byte-window corpus loader.
-// Replaces the n_tokens=0 stub + LCG noise batch path. Exposes
-// `corpus_open`, `corpus_window`, `CorpusDesc` at module scope.
-use "clm_mmap_loader"
+
+// H1 (2026-04-18 9th-fire): INLINED mmap-equivalent byte-window corpus
+// loader. Replaces the n_tokens=0 stub + LCG noise batch path.
+//
+// Not `use "clm_mmap_loader"` because the pod2 relaunch scaffold only
+// transpiles a fixed DEP list and we cannot modify the scaffold per
+// task scope. Functions are a strict subset of training/clm_mmap_loader
+// .hexa — `corpus_open` + `corpus_window` (the hot path) — verified
+// against that file's 14/14 self-test on 2026-04-16.
+struct CorpusDesc {
+    path: string
+    len: int
+}
+
+fn corpus_open(path: string) -> CorpusDesc {
+    // `wc -c` is POSIX-portable and faster than `stat -c/-f`.
+    let raw = exec("wc -c < '" + path + "' 2>/dev/null")
+    let trimmed = raw.trim()
+    if trimmed == "" {
+        println("[clm_mmap_loader] FAIL: cannot stat " + path)
+        return CorpusDesc { path: path, len: 0 }
+    }
+    let n = to_int(trimmed)
+    println("[clm_mmap_loader] opened " + path + " len=" + str(n) + " bytes (~" + str(n / 1048576) + " MiB)")
+    return CorpusDesc { path: path, len: n }
+}
+
+fn corpus_window(desc: CorpusDesc, offset: int, n_bytes: int) -> [int] {
+    if offset < 0 || n_bytes <= 0 {
+        return []
+    }
+    let mut end = offset + n_bytes
+    if end > desc.len {
+        end = desc.len
+    }
+    let real_n = end - offset
+    if real_n <= 0 {
+        return []
+    }
+    let cmd = "dd if='" + desc.path + "' bs=1 skip=" + str(offset) + " count=" + str(real_n) + " status=none 2>/dev/null | od -An -vtu1"
+    let raw = exec(cmd)
+    let flat = raw.replace("\n", " ")
+    let parts_raw = flat.split(" ")
+    let np = len(parts_raw)
+    let mut out = []
+    let mut i = 0
+    while i < np {
+        let p = parts_raw[i].trim()
+        if p != "" {
+            out = out.push(to_int(p))
+        }
+        i = i + 1
+    }
+    return out
+}
 
 comptime const PSI_ALPHA     = 0.014
 comptime const PSI_BALANCE   = 0.5

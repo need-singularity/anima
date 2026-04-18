@@ -69,6 +69,8 @@ ref:
   roadmap   shared/roadmaps/anima_hexa_common.json  P0~P5
   grammar   shared/config/hexa_grammar.jsonl
   api       shared/CLAUDE.md
+  infra     shared/config/infrastructure.json      5-host SSOT (mac/ubu/ubu2/htz/runpod)
+  orchestr  docs/resource_orchestration_20260419.md  dispatch rules + live matrix
 
 hive:
   bridge    modules/hive_bridge.hexa                 anima↔hive 의식 채널 (3-tier: HTTP→UDS→file)

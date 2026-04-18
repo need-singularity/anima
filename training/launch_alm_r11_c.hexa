@@ -1,13 +1,517 @@
-// launch_alm_r11_c.hexa — STUBBED 2026-04-18 (R37/AN13/L3-PY compliance)
+// training/launch_alm_r11_c.hexa
 //
-// Previously wrote /tmp runner shell script invoking `python3 train_alm_14b.py`
-// (14B fresh seed-sweep branch C). Violates R37/AN13/L3-PY.
+// ALM r11 — BRANCH C (14B fresh seed-sweep {3407,42,1337}) hexa-native SCAFFOLD.
+//
+// Trigger (from alm_r11_design.md §1):
+//   r10 collapse reproduced — sentinel FAIL at any step <= 1000 OR
+//   Likert < 2.8 OR loss < 0.5 before step 500.
+//
+// Target: Qwen/Qwen2.5-14B-Instruct, fresh LoRA, 3 seeds sequential on 1 pod.
+// Corpus: corpus_alm_70b_stripped.txt (stripped only — no kowiki admix).
+//
+// Compliance:
+//   R37 / AN13 / L3-PY — ZERO python3 invocations. `pkill -f` allowed as KILL.
+//
+// Scope:
+//   SCAFFOLD ONLY. live_fire() body is a placeholder that refuses until:
+//     - r10d DONE + branch-C selector fired (collapse outcome confirmed)
+//     - hexa-lang hxqwen14b FFI Day-2 entries (shared across A/B/C)
+//     - Qwen2.5-14B-Instruct safetensors at r2:anima-models/base/
+//     - corpus_alm_70b_stripped.txt materialised
+//     - R-3 mitigation: 4h rental window sized for 3× sequential seeds +
+//       30 min smoke timeout each; pod cost envelope tracked in §5.
+//
+// Plan SSOT:
+//   /Users/ghost/Dev/anima/training/alm_r11_design.md
+//   §1 (branch trigger) / §3 (gates) / §4 (params) / §5 (budget) / §7 (sentinel)
+//
+// Seed handling:
+//   --seed-sweep (default): runs 3 seeds {3407, 42, 1337} sequentially on
+//     one pod, each 2000 steps, ckpt dir suffixed _sN.
+//   --seed <N>: runs single seed only (primary = 3407).
+//
+// Usage:
+//   hexa training/launch_alm_r11_c.hexa --selftest
+//   hexa training/launch_alm_r11_c.hexa --pod-id <id> --dry-run
+//   hexa training/launch_alm_r11_c.hexa --pod-id <id> --seed 42 --dry-run
+//   LIVE_FIRE_OK=1 hexa training/launch_alm_r11_c.hexa --pod-id <id>  # gated
+
+// ── Branch C constants (alm_r11_design.md §4) ─────────────────────────
+
+let DEFAULT_CKPT_DIR_BASE = "/workspace/ckpt_alm_14b_r11c"   // suffix _sN
+let DEFAULT_STEPS        = 2000          // per-seed (§4)
+let DEFAULT_BATCH        = 8
+let DEFAULT_SEQ          = 1024
+let DEFAULT_GRAD_ACCUM   = 1             // eff 8
+
+// LR schedule — C uses 1e-6 constant (lower than A/B, §4 table)
+let DEFAULT_LR_PEAK      = "1e-6"
+let DEFAULT_LR_FLOOR     = "1e-6"
+let DEFAULT_WARMUP_STEPS = 0
+let DEFAULT_LR_SCHEDULE  = "constant"
+
+// Save cadence
+let DEFAULT_SAVE_EVERY   = 2000
+let DEFAULT_EVAL_EVERY   = 100           // tighter sentinel (§3/§7)
+
+// Seed sweep
+let DEFAULT_SEED         = 3407
+let SWEEP_SEEDS          = [3407, 42, 1337]
+
+// LoRA spec — C: r=16 α=32 dropout=0.05 (§4 — smaller rank constrains drift)
+let DEFAULT_LORA_R       = 16
+let DEFAULT_LORA_ALPHA   = 32
+let DEFAULT_LORA_DROPOUT = "0.05"
+let DEFAULT_LORA_TARGETS = "q_proj,k_proj,v_proj,o_proj"
+
+// Abort triggers — C thresholds (§3, tighter E7-OSS-03 at step 800)
+let FIRST_BATCH_CE_MAX   = "5.0"
+let STEP1_LOSS_MAX       = "5.0"
+let EARLY_LOSS_GATE_STEP = 800           // sub-1.0 before 800 -> force sentinel
+let ABORT_STATUS_FILE    = "/workspace/r11c_abort.status"
+
+// Corpus / base model — C uses stripped-only
+let CORPUS_REMOTE        = "/workspace/corpus_alm_70b_stripped.txt"
+let DEFAULT_LOCAL_CORPUS = "/Users/ghost/Dev/anima/training/corpus_alm_70b_stripped.txt"
+let DEFAULT_CORPUS_R2    = "r2:anima-corpus/alm/corpus_alm_70b_stripped.txt"
+let BASE_MODEL_REMOTE    = "/workspace/models/Qwen2.5-14B-Instruct"
+let BASE_MODEL_R2        = "r2:anima-models/base/Qwen2.5-14B-Instruct/"
+
+// R2 ckpt egress path (branch C — per-seed suffix)
+let CKPT_R2_PATH_BASE    = "r2:anima-models/alm14b/r11_c/"   // + seedN/
+
+// Hexa binary
+let HEXA_LINUX_BIN       = "/build/hexa_v2_linux"
+let REMOTE_HEXA_BIN      = "/opt/hexa/bin/hexa_v2"
+let REMOTE_TRAIN_DIR     = "/workspace/anima/training"
+let REMOTE_NATIVE        = "/workspace/alm_r11c_native"
+let TMUX_SESSION_BASE    = "alm-14b-r11c"     // + -sN
+
+// NOTE: hxqwen14b FFI Day-2 entries still pending (shared blocker).
+// Branch C specific: tighter sentinel (E7-OSS-03 @ step 800) must be
+// built into kr_gen_sentinel.hexa; verify before sweep launch.
+
+let LOCAL_SOURCES = [
+    "training/train_alm_lora.hexa",
+    "training/kr_gen_sentinel.hexa",
+    "training/nn_core.hexa"
+]
+
+let LOCAL_DEP_SOURCES = []
+let DEP_MODULE_NAMES  = []
+
+// ── argv parse ────────────────────────────────────────────────────────
+
+let argv = args()
+
+fn flag_value(name: string, fallback: string) -> string {
+    let n = argv.len()
+    let mut i = 0
+    while i < n {
+        if argv[i] == name && i + 1 < n {
+            return argv[i + 1]
+        }
+        i = i + 1
+    }
+    return fallback
+}
+
+fn flag_bool(name: string) -> bool {
+    let n = argv.len()
+    let mut i = 0
+    while i < n {
+        if argv[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+let POD          = flag_value("--pod", "")
+let POD_ID       = flag_value("--pod-id", "")
+let POD_IP_ARG   = flag_value("--pod-ip", "")
+let POD_PORT_S   = flag_value("--pod-port", "")
+let STEPS_S      = flag_value("--steps", str(DEFAULT_STEPS))
+let SEED_S       = flag_value("--seed", str(DEFAULT_SEED))
+let LR_PEAK      = flag_value("--lr-peak", DEFAULT_LR_PEAK)
+let LR_FLOOR     = flag_value("--lr-floor", DEFAULT_LR_FLOOR)
+let WARMUP_S     = flag_value("--warmup", str(DEFAULT_WARMUP_STEPS))
+let SCHEDULE     = flag_value("--schedule", DEFAULT_LR_SCHEDULE)
+let BATCH_S      = flag_value("--batch", str(DEFAULT_BATCH))
+let SEQ_S        = flag_value("--seq", str(DEFAULT_SEQ))
+let GRAD_ACCUM_S = flag_value("--grad-accum", str(DEFAULT_GRAD_ACCUM))
+let SAVE_EVERY_S = flag_value("--save-every", str(DEFAULT_SAVE_EVERY))
+let EVAL_EVERY_S = flag_value("--eval-every", str(DEFAULT_EVAL_EVERY))
+let CORPUS_ARG   = flag_value("--corpus", CORPUS_REMOTE)
+let CORPUS_LOCAL = flag_value("--corpus-local", DEFAULT_LOCAL_CORPUS)
+let CORPUS_R2    = flag_value("--corpus-r2", DEFAULT_CORPUS_R2)
+let BASE_MODEL   = flag_value("--base-model", BASE_MODEL_REMOTE)
+let SMOKE        = flag_bool("--smoke")
+let SEED_SWEEP   = flag_bool("--seed-sweep")
+let DRY_RUN      = flag_bool("--dry-run")
+let SELFTEST     = flag_bool("--selftest")
+
+// ── Utility ───────────────────────────────────────────────────────────
+
+fn env_or(key: string, fallback: string) -> string {
+    let v = env(key)
+    if v == "" { return fallback }
+    return v
+}
+
+fn now_epoch() -> string { return exec("date +%s").trim() }
+fn now_iso() -> string { return exec("date -u +%Y%m%dT%H%M%SZ").trim() }
+
+fn stamp_step(label: string, log_path: string) {
+    let line = "[" + now_epoch() + "] " + label
+    println(line)
+    append_file(log_path, line + "\n")
+}
+
+fn abort(code: int, msg: string) {
+    println("")
+    println("FAIL: " + msg)
+    println("  exit code = " + str(code))
+    println("")
+    exit(code)
+}
+
+fn ckpt_dir_for_seed(seed: int) -> string {
+    return DEFAULT_CKPT_DIR_BASE + "_s" + str(seed)
+}
+
+fn r2_path_for_seed(seed: int) -> string {
+    return CKPT_R2_PATH_BASE + "seed" + str(seed) + "/"
+}
+
+fn tmux_session_for_seed(seed: int) -> string {
+    return TMUX_SESSION_BASE + "-s" + str(seed)
+}
+
+// ── Selftest ──────────────────────────────────────────────────────────
+
+fn selftest() -> bool {
+    println("")
+    println("=================================================================")
+    println("  ALM r11-C (14B seed-sweep) hexa-native launcher — SELFTEST")
+    println("=================================================================")
+    println("")
+
+    let mut ok = true
+
+    println("[1/5] Environment:")
+    let hexa_lang = env("HEXA_LANG")
+    if hexa_lang == "" {
+        println("  [MISS] HEXA_LANG not set")
+        ok = false
+    } else {
+        println("  [OK]   HEXA_LANG=" + hexa_lang)
+    }
+
+    let bin_path = hexa_lang + HEXA_LINUX_BIN
+    if file_exists(bin_path) {
+        println("  [OK]   " + bin_path)
+    } else {
+        println("  [MISS] " + bin_path)
+        ok = false
+    }
+
+    println("")
+    println("[2/5] Local sources:")
+    let mut i = 0
+    while i < LOCAL_SOURCES.len() {
+        let p = LOCAL_SOURCES[i]
+        let abs_p = "/Users/ghost/Dev/anima/" + p
+        if file_exists(abs_p) {
+            println("  [OK]   " + p)
+        } else {
+            println("  [MISS] " + p)
+            ok = false
+        }
+        i = i + 1
+    }
+
+    println("")
+    println("[3/5] Corpus (stripped only, 41.8M tokens):")
+    if file_exists(CORPUS_LOCAL) {
+        println("  [OK]   " + CORPUS_LOCAL)
+    } else {
+        println("  [PREP] " + CORPUS_LOCAL + " not materialised yet")
+        println("         fallback R2: " + CORPUS_R2)
+    }
+
+    println("")
+    println("[4/5] Branch C (14B seed-sweep) parameter table (§4):")
+    println("  branch       = C (14B fresh, seed-sweep, stripped only)")
+    println("  base model   = " + BASE_MODEL + "  (R2: " + BASE_MODEL_R2 + ")")
+    let sweep_mode = (if SEED_SWEEP { "SWEEP {3407,42,1337} sequential" } else { "single seed=" + SEED_S })
+    println("  mode         = " + sweep_mode)
+    println("  ckpt-dir     = " + DEFAULT_CKPT_DIR_BASE + "_s<SEED>")
+    println("  R2 ckpt      = " + CKPT_R2_PATH_BASE + "seed<SEED>/")
+    println("  steps        = " + STEPS_S + " per seed" + (if SMOKE { "  (SMOKE override)" } else { "" }))
+    println("  LR           = " + LR_PEAK + " " + SCHEDULE + "  (warmup=" + WARMUP_S + ")")
+    println("  batch × seq  = " + BATCH_S + " × " + SEQ_S
+        + "  (grad_accum=" + GRAD_ACCUM_S + ")")
+    println("  save_every   = " + SAVE_EVERY_S + "  eval_every=" + EVAL_EVERY_S + "  (tighter cadence)")
+    println("  LoRA         = r=" + str(DEFAULT_LORA_R)
+        + " α=" + str(DEFAULT_LORA_ALPHA)
+        + " dropout=" + DEFAULT_LORA_DROPOUT
+        + " targets=" + DEFAULT_LORA_TARGETS)
+    println("  corpus       = " + CORPUS_ARG + "  (stripped only)")
+    println("  abort: CE>" + FIRST_BATCH_CE_MAX
+        + " | step1>" + STEP1_LOSS_MAX
+        + " | sub-1.0<step" + str(EARLY_LOSS_GATE_STEP) + "  (E7-OSS-03 tight)")
+    println("  budget       = $9 target / $18 cap  (1×H100, 3×1.0h = 3h wall)")
+
+    println("")
+    println("[5/5] Scaffold stage readiness:")
+    println("  [OK]   --selftest path")
+    println("  [OK]   --dry-run path")
+    println("  [PREP] live_fire() body = placeholder")
+    println("  [GATE] LIVE_FIRE_OK=1 env required")
+    println("  [BLOCK] r10d DONE + r11 branch-C selector (collapse outcome)")
+    println("  [BLOCK] hxqwen14b FFI Day-2 (forward_with_lora/backward_lora_only/apply_lora_delta)")
+    println("  [BLOCK] kr_gen_sentinel.hexa E7-OSS-03 tight gate (step 800)")
+
+    println("")
+    if ok {
+        println("RESULT: PASS — scaffold validated; fire gated on blockers above.")
+    } else {
+        println("RESULT: FAIL — resolve MISS items above before proceeding.")
+    }
+    println("")
+    return ok
+}
+
+// ── Plan ──────────────────────────────────────────────────────────────
+
+fn print_step(n: int, title: string, cmd: string) {
+    println("")
+    println("  Step " + str(n) + ": " + title)
+    println("    $ " + cmd)
+}
+
+fn print_seed_launch(seed_idx: int, seed: int, pod_label: string) {
+    let ckpt  = ckpt_dir_for_seed(seed)
+    let r2    = r2_path_for_seed(seed)
+    let sess  = tmux_session_for_seed(seed)
+    let nlog  = "/workspace/alm_r11c_s" + str(seed) + "_hexa.log"
+
+    println("")
+    println("  --- Seed " + str(seed_idx) + "/3 (seed=" + str(seed) + ") ---")
+    println("    ckpt = " + ckpt)
+    println("    R2   = " + r2)
+    println("    tmux = " + sess)
+
+    print_step(seed_idx * 10 + 0, "ckpt dir preclean (seed=" + str(seed) + ")",
+        "ssh " + pod_label + " 'rm -rf " + ckpt + "'")
+
+    print_step(seed_idx * 10 + 1, "Launch trainer seed=" + str(seed),
+        "ssh " + pod_label + " \"tmux new -d -s " + sess + " '"
+        + REMOTE_NATIVE
+        + " --base-model " + BASE_MODEL
+        + " --corpus " + CORPUS_ARG
+        + " --steps " + STEPS_S
+        + " --seed " + str(seed)
+        + " --batch " + BATCH_S
+        + " --seq " + SEQ_S
+        + " --grad-accum " + GRAD_ACCUM_S
+        + " --lr-peak " + LR_PEAK
+        + " --lr-floor " + LR_FLOOR
+        + " --warmup " + WARMUP_S
+        + " --schedule " + SCHEDULE
+        + " --save-every " + SAVE_EVERY_S
+        + " --eval-every " + EVAL_EVERY_S
+        + " --lora-r " + str(DEFAULT_LORA_R)
+        + " --lora-alpha " + str(DEFAULT_LORA_ALPHA)
+        + " --lora-dropout " + DEFAULT_LORA_DROPOUT
+        + " --lora-targets " + DEFAULT_LORA_TARGETS
+        + " --abort-file " + ABORT_STATUS_FILE
+        + " --first-batch-ce-max " + FIRST_BATCH_CE_MAX
+        + " --step1-loss-max " + STEP1_LOSS_MAX
+        + " --early-loss-gate-step " + str(EARLY_LOSS_GATE_STEP)
+        + " --ckpt-dir " + ckpt
+        + " 2>&1 | tee " + nlog + "'\"")
+
+    print_step(seed_idx * 10 + 2, "R2 egress for seed=" + str(seed),
+        "ssh " + pod_label + " 'rclone copy " + ckpt + " " + r2
+        + " -v --s3-no-check-bucket'")
+}
+
+fn build_plan(log_path: string) {
+    let hexa_lang = env_or("HEXA_LANG", "<HEXA_LANG>")
+    let bin_src   = hexa_lang + HEXA_LINUX_BIN
+    let pod_label = (if POD != "" { POD }
+                     else if POD_ID != "" { POD_ID }
+                     else { POD_IP_ARG + ":" + POD_PORT_S })
+
+    println("")
+    println("=================================================================")
+    println("  ALM r11-C (14B seed-sweep) hexa-native launcher — PLAN")
+    println("=================================================================")
+    println("  branch       = C (14B fresh LoRA r=16, seed-sweep, tight sentinel)")
+    println("  pod          = " + pod_label)
+    let sweep_mode = (if SEED_SWEEP { "SWEEP {3407,42,1337}" } else { "single seed=" + SEED_S })
+    println("  mode         = " + sweep_mode)
+    println("  steps        = " + STEPS_S + " per seed" + (if SMOKE { "  (SMOKE)" } else { "" }))
+    println("  LR           = " + LR_PEAK + " " + SCHEDULE)
+    println("  batch/seq    = " + BATCH_S + " / " + SEQ_S)
+    println("  save_every   = " + SAVE_EVERY_S + "  eval_every=" + EVAL_EVERY_S)
+    println("  corpus       = " + CORPUS_ARG)
+    println("  base model   = " + BASE_MODEL)
+    println("  abort file   = " + ABORT_STATUS_FILE)
+    println("  dry-run      = "
+        + (if DRY_RUN { "YES (no remote I/O)" } else { "NO (LIVE — gated)" }))
+    println("  log          = " + log_path)
+
+    // ── Shared preflight (once per pod) ───────────────────────────────
+    print_step(0, "MFS preflight — 20GB dd probe",
+        "ssh " + pod_label
+        + " 'dd if=/dev/zero of=/workspace/_q_test bs=1M count=20000 status=none "
+        + "&& rm /workspace/_q_test'")
+
+    print_step(1, "tmux kill legacy sessions (all seeds)",
+        "ssh " + pod_label + " 'for s in 3407 42 1337; do tmux kill-session -t "
+        + TMUX_SESSION_BASE + "-s$s 2>/dev/null || true; done'")
+
+    print_step(2, "Reap legacy python residual (KILL only)",
+        "ssh " + pod_label + " 'pkill -f _train_alm 2>/dev/null || true'")
+
+    print_step(3, "Deploy hexa_v2 Linux ELF",
+        "scp " + bin_src + " " + pod_label + ":" + REMOTE_HEXA_BIN
+        + " && ssh " + pod_label + " 'chmod +x " + REMOTE_HEXA_BIN + "'")
+
+    print_step(4, "Deploy runtime.c + native/*",
+        "scp $HEXA_LANG/self/runtime.c " + pod_label + ":/tmp/runtime.c"
+        + " && scp $HEXA_LANG/self/native/*.c " + pod_label + ":/tmp/native/")
+
+    print_step(5, "Deploy ALM trainer + sentinel sources",
+        "scp training/train_alm_lora.hexa training/kr_gen_sentinel.hexa "
+        + "training/nn_core.hexa " + pod_label + ":" + REMOTE_TRAIN_DIR + "/")
+
+    print_step(6, "Base model provisioning (rclone Qwen2.5-14B-Instruct)",
+        "ssh " + pod_label + " 'test -d " + BASE_MODEL + " || rclone copy "
+        + BASE_MODEL_R2 + " " + BASE_MODEL + " -v --s3-no-check-bucket'")
+
+    print_step(7, "Corpus provisioning (stripped only)",
+        "scp " + CORPUS_LOCAL + " " + pod_label + ":" + CORPUS_REMOTE)
+
+    print_step(8, "Cross-compile train_alm_lora.hexa -> C -> native ELF",
+        "ssh " + pod_label + " '" + REMOTE_HEXA_BIN + " "
+        + REMOTE_TRAIN_DIR + "/train_alm_lora.hexa /tmp/alm_r11c.c "
+        + "&& gcc -O2 /tmp/alm_r11c.c -o " + REMOTE_NATIVE + " -lm'")
+
+    // ── Per-seed sweep (sequential) ───────────────────────────────────
+    println("")
+    println("Per-seed sequential sweep (R-3: 4h rental window, 30min smoke timeout each):")
+
+    if SEED_SWEEP {
+        let mut idx = 1
+        let mut j = 0
+        while j < SWEEP_SEEDS.len() {
+            print_seed_launch(idx, SWEEP_SEEDS[j], pod_label)
+            idx = idx + 1
+            j = j + 1
+        }
+    } else {
+        // single seed mode: honour SEED_S flag
+        let seed_val = SEED_S.to_int()
+        print_seed_launch(1, seed_val, pod_label)
+    }
+
+    println("")
+    println("Abort triggers (§3 branch C, tightest of all branches):")
+    println("  - first-batch CE > " + FIRST_BATCH_CE_MAX + " -> FIRST_BATCH_CE_HIGH")
+    println("  - step 1 loss   > " + STEP1_LOSS_MAX + " -> STEP1_LOSS_HIGH")
+    println("  - sub-1.0 loss before step " + str(EARLY_LOSS_GATE_STEP) + " -> sentinel (E7-OSS-03)")
+    println("  - sentinel COLLAPSED (exit 2) -> MODE_COLLAPSE_STEP")
+    println("")
+    println("Acceptance gates (§3 branch C):")
+    println("  - persona Likert >= 2.8/5 (retry threshold)")
+    println("  - Phi_refl > 0.1, KoBEST avg >= 0.50")
+    println("")
+}
+
+// ── Live fire (gated — PLACEHOLDER) ────────────────────────────────────
+
+fn live_fire(log_path: string) {
+    let live_ok = env("LIVE_FIRE_OK")
+    let dry = DRY_RUN
+
+    if !dry && live_ok != "1" {
+        println("")
+        println("REFUSED: live fire requires LIVE_FIRE_OK=1 in env.")
+        println("  Branch C (14B seed-sweep) blockers before real exec:")
+        println("    1. ALM r10d DONE + eval (collapse outcome confirmed)")
+        println("    2. r11 branch-C selector fired (sentinel FAIL/Likert<2.8)")
+        println("    3. hxqwen14b FFI Day-2 entries available")
+        println("    4. kr_gen_sentinel.hexa E7-OSS-03 tight gate (step 800)")
+        println("    5. Qwen2.5-14B-Instruct uploaded to R2")
+        println("    6. corpus_alm_70b_stripped.txt materialised")
+        println("    7. 4h rental envelope sized (3 seeds x 1h + smoke buffer)")
+        println("    8. LIVE_FIRE_OK=1 hexa <this file> --pod-id <id>")
+        println("")
+        panic("live fire guard: LIVE_FIRE_OK != 1")
+    }
+
+    if dry {
+        stamp_step("DRY-RUN — plan-only walkthrough, no exec", log_path)
+        stamp_step("(branch C real fire body NOT YET WIRED)", log_path)
+        return
+    }
+
+    stamp_step("LIVE FIRE armed but BODY NOT WIRED — refusing", log_path)
+    println("")
+    println("SCAFFOLD STAGE: live_fire() body is intentionally a placeholder.")
+    println("")
+    abort(7, "live_fire() placeholder — r11-C scaffold stage only")
+}
+
+// ── Entry ─────────────────────────────────────────────────────────────
 
 fn main() {
-    println("[R37/AN13/L3-PY] BLOCKED: training/launch_alm_r11_c.hexa")
-    println("  Previously wrote bash runner wrapping `python3 train_alm_14b.py` (r11 branch C).")
-    println("  Escalate to user for hexa-native ALM r11-C launcher replacement.")
-    panic("R37/AN13/L3-PY: python3 invocation blocked at training/launch_alm_r11_c.hexa")
+    let ts = now_iso()
+    let log_path = "/Users/ghost/Dev/anima/training/deploy/alm_r11_c_launch_" + ts + ".log"
+
+    if SELFTEST {
+        let ok = selftest()
+        if !ok { panic("selftest FAIL") }
+        return
+    }
+
+    let have_pod = (POD != "" || POD_ID != "" || POD_IP_ARG != "")
+    if !have_pod {
+        println("")
+        println("USAGE (ALM r11-C / 14B seed-sweep scaffold):")
+        println("  hexa <this file> --selftest")
+        println("  hexa <this file> --pod-id <id> --dry-run                # sweep default")
+        println("  hexa <this file> --pod-id <id> --seed-sweep --dry-run   # explicit")
+        println("  hexa <this file> --pod-id <id> --seed 42 --dry-run      # single seed")
+        println("  hexa <this file> --pod-id <id> --smoke --dry-run")
+        println("  LIVE_FIRE_OK=1 hexa <this file> --pod-id <id>   # gated")
+        println("")
+        panic("need one of: --pod / --pod-id / --pod-ip (except with --selftest)")
+    }
+
+    write_file(log_path, "# ALM r11-C hexa-native launcher log " + ts + "\n")
+    let pod_label = (if POD != "" { POD }
+                     else if POD_ID != "" { POD_ID }
+                     else { POD_IP_ARG + ":" + POD_PORT_S })
+    let mode_tag = (if SEED_SWEEP { "sweep" } else { "seed=" + SEED_S })
+    stamp_step("launcher start — branch=C pod=" + pod_label
+        + " mode=" + mode_tag
+        + " steps=" + STEPS_S
+        + " dry=" + (if DRY_RUN { "1" } else { "0" }),
+        log_path)
+
+    build_plan(log_path)
+    live_fire(log_path)
+
+    if DRY_RUN {
+        stamp_step("DRY-RUN complete — no remote I/O performed.", log_path)
+        println("")
+        println("DRY-RUN complete. Real fire pending blocker resolution.")
+        println("Log: " + log_path)
+    }
 }
 
 main()

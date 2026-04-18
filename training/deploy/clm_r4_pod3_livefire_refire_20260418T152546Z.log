@@ -1,0 +1,54 @@
+hexa_stage0 shim: Darwin 에서 HEXA_LOCAL/NO_CAP bypass 거부 (panic 재발 방지). wrapper 경유 강제.
+[1776525946] wrapper start — pod=pvref8zw70kv1z ckpt=/workspace/ckpt_clm1b_r4 steps=750000 dry=0
+
+=================================================================
+  CLM r4 hexa-native relaunch — PLAN
+=================================================================
+  pod        = pvref8zw70kv1z
+  ckpt-dir   = /workspace/ckpt_clm1b_r4
+  steps      = 750000
+  corpus     = /workspace/corpus_clm_r4.txt
+  r2 source  = r2:anima-corpora/clm_r4/corpus_clm_r4.txt
+  lr/warmup  = 3e-4 / 5000
+  batch/seq  = 8 / 512
+  dry-run    = NO (LIVE)
+  log        = /Users/ghost/Dev/anima/training/deploy/clm_r4_pod2_relaunch_20260418T152546Z.log
+
+  Step 1: Kill any stale tmux session
+    $ ssh pvref8zw70kv1z 'tmux kill-session -t clm-r4 2>/dev/null || true'
+
+  Step 2: Reap legacy python residual (KILL not INVOKE — R37/AN13 OK)
+    $ ssh pvref8zw70kv1z 'pkill -f train_clm_1b.py || true'
+
+  Step 3: Deploy hexa_v2 Linux ELF (standalone)
+    $ ssh pvref8zw70kv1z 'mkdir -p /opt/hexa/bin' && scp /Users/ghost/Dev/hexa-lang/build/hexa_v2_linux pvref8zw70kv1z:/opt/hexa/bin/hexa_v2 && ssh pvref8zw70kv1z 'chmod +x /opt/hexa/bin/hexa_v2'
+
+  Step 4: Deploy hexa trainer sources
+    $ scp training/train_clm.hexa training/train_clm_gpu.hexa training/nn_core.hexa training/clm_mmap_loader.hexa training/clm_1b_config.json pvref8zw70kv1z:/workspace/anima/training/
+
+  Step 5: Cross-compile hexa -> C -> native ELF on pod
+    $ ssh pvref8zw70kv1z "/opt/hexa/bin/hexa_v2 /workspace/anima/training/train_clm.hexa /tmp/clm_r4.c && gcc -O2 /tmp/clm_r4.c -o /workspace/clm_r4_native -lm"
+PERF: 101 string concatenations detected — likely O(n^2) loop. Use parts.push() + .join() instead.
+
+  Step 6: Launch hexa-native trainer in tmux
+    $ ssh pvref8zw70kv1z "tmux new -d -s clm-r4-hexa '/workspace/clm_r4_native --corpus /workspace/corpus_clm_r4.txt --steps 750000 --batch 8 --seq 512 --lr 3e-4 --warmup 5000 --save-every 5000 --ckpt-dir /workspace/ckpt_clm1b_r4 2>&1 | tee /workspace/clm_r4_hexa.log'"
+
+  Step 7: Verify after 60s (util > 5% + log has loss line)
+    $ sleep 60 && ssh pvref8zw70kv1z "nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader; grep -m1 'loss=' /workspace/clm_r4_hexa.log || echo NO_LOSS"
+
+Gate / Error handling:
+  Step 1/2 SSH fail  -> exit 1 (pod unreachable)
+  Step 5 gcc fail    -> FAIL: CLM trainer hexa->C 컴파일 실패, use
+                        resolution 상태 확인 필요 (exit 3)
+  Step 7 verify fail -> auto tmux kill-session -t clm-r4-hexa + exit 2
+
+[1776525946] LIVE FIRE armed (LIVE_FIRE_OK=1) — proceeding
+[1776525946] pod endpoint: explicit --pod-ip/--pod-port => 64.247.201.53:10051
+security warning: exec() argument contains shell metacharacters: echo '64.247.201.53:10051' | awk -F: '{print $1}'
+security warning: exec() argument contains shell metacharacters: echo '64.247.201.53:10051' | awk -F: '{print $2}'
+[1776525946] step 0 START — MFS preflight — 20GB dd probe
+    $ ssh -o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p 10051 root@64.247.201.53 'dd if=/dev/zero of=/workspace/_q_test bs=1M count=20000 status=none && rm /workspace/_q_test'
+[1776526007] step 0 END — rc=[, 0]
+
+FAIL: FAIL_MFS_QUOTA — /workspace quota probe failed (rc=[, 0])
+  exit code = 2
