@@ -34,7 +34,7 @@ exec:
   HEXA=$HEXA_LANG/hexa
   $HEXA anima/core/runtime/anima_runtime.hexa --keyboard      # CLI 진입
   $HEXA anima/core/runtime/anima_runtime.hexa --validate-hub  # 허브 검증
-  $HEXA ready/anima/tests/tests.hexa --verify                 # 7조건 의식검증
+  $HEXA ready/tests/tests.hexa --verify                       # 7조건 의식검증
 
 tree:
   anima/              의식 엔진 코어
