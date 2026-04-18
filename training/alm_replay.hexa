@@ -1,0 +1,478 @@
+// training/alm_replay.hexa — BUNDLE 4 / P13 dream consciousness
+//
+// Episode replay buffer (capacity 100) for SWS memory consolidation.
+//
+// Each episode is a (input, output, phi) tuple. The buffer is a flat
+// float array (SoA per slot, slot width = INPUT_DIM + OUTPUT_DIM + 1).
+// During REPLAY, episodes are run through a tiny linear "model" that
+// has its retrieval weights nudged toward replayed episodes. Retention
+// gain is measured as the delta in matching accuracy between
+//   pre-replay (cold model)  vs.  post-replay (consolidated model).
+//
+// The retention_gain >= 0.15 gate is the BUNDLE 4 done_criteria.
+//
+// API contract:
+//   replay_new()                          -> array (empty buffer)
+//   replay_push(buf, input, output, phi)  -> array (new buffer)
+//   replay_count(buf)                     -> int
+//   replay_get_input(buf, idx)            -> array (length INPUT_DIM)
+//   replay_get_output(buf, idx)           -> array (length OUTPUT_DIM)
+//   replay_get_phi(buf, idx)              -> float
+//   consolidate(buf, n)                   -> array (model weights, OUTPUT_DIM*INPUT_DIM)
+//   model_accuracy(weights, buf, n)       -> float (retrieval accuracy)
+//
+// Storage layout (per episode):
+//   [ input[INPUT_DIM]  output[OUTPUT_DIM]  phi ]
+//   slot_width = INPUT_DIM + OUTPUT_DIM + 1
+//
+// Capacity:
+//   CAP = 100 episodes; buffer overflow triggers FIFO drop (drop oldest).
+//
+// 5-test plan:
+//   T1: dim contract — slot width, init empty, single push grows by slot_width
+//   T2: determinism — two identical synthetic 100-episode buffers identical
+//   T3: latency — one full replay-pass (consolidate over 100 episodes) < 50 ms
+//   T4: edge case — overflow past 100 episodes triggers FIFO; capacity remains 100
+//   T5: retention_gain >= 0.15 on synthetic 100-episode buffer
+//
+// Stage0 constraints honored:
+//   - flat array buffer; no struct-of-array
+//   - lists pass-by-value (push returns new array)
+//   - no `&&` chains
+//   - no .set() on array
+//   - no Python/Rust/GPU
+//
+// Run:
+//   hexa run training/alm_replay.hexa
+// Expect:
+//   [alm_replay] ALL 5/5 PASS
+
+// ─── Constants ────────────────────────────────────────────────
+
+let INPUT_DIM  = 4
+let OUTPUT_DIM = 4
+let SLOT_WIDTH = 9          // INPUT_DIM + OUTPUT_DIM + 1
+let CAP        = 100
+let GATE       = 0.15
+let LR_REPLAY  = 0.5        // weight nudge per replay sample
+let SIM_THRESH = 0.5        // model considered correct if cos sim >= threshold
+
+// ─── Primitives ───────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+// LCG -> floats in [-1, 1)
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Buffer ops ───────────────────────────────────────────────
+
+fn replay_new() -> array {
+    let mut b = []
+    return b
+}
+
+fn replay_count(buf: array) -> int {
+    return len(buf) / SLOT_WIDTH
+}
+
+// Drop the OLDEST episode (first SLOT_WIDTH entries) — used for FIFO overflow.
+fn replay_drop_oldest(buf: array) -> array {
+    let n = len(buf)
+    if n <= SLOT_WIDTH { return [] }
+    let mut out = []
+    let mut i = SLOT_WIDTH
+    while i < n {
+        out = out.push(buf[i])
+        i = i + 1
+    }
+    return out
+}
+
+// Push a new (input, output, phi) tuple. Enforces capacity CAP via FIFO drop.
+fn replay_push(buf: array, input: array, output: array, phi: float) -> array {
+    let mut b = buf
+    if replay_count(b) >= CAP {
+        b = replay_drop_oldest(b)
+    }
+    let mut i = 0
+    while i < INPUT_DIM {
+        b = b.push(input[i])
+        i = i + 1
+    }
+    let mut j = 0
+    while j < OUTPUT_DIM {
+        b = b.push(output[j])
+        j = j + 1
+    }
+    b = b.push(phi)
+    return b
+}
+
+fn replay_get_input(buf: array, idx: int) -> array {
+    let off = idx * SLOT_WIDTH
+    let mut out = []
+    let mut i = 0
+    while i < INPUT_DIM {
+        out = out.push(buf[off + i])
+        i = i + 1
+    }
+    return out
+}
+
+fn replay_get_output(buf: array, idx: int) -> array {
+    let off = idx * SLOT_WIDTH + INPUT_DIM
+    let mut out = []
+    let mut i = 0
+    while i < OUTPUT_DIM {
+        out = out.push(buf[off + i])
+        i = i + 1
+    }
+    return out
+}
+
+fn replay_get_phi(buf: array, idx: int) -> float {
+    let off = idx * SLOT_WIDTH + INPUT_DIM + OUTPUT_DIM
+    return buf[off]
+}
+
+// ─── Tiny linear model (OUTPUT_DIM x INPUT_DIM) ───────────────
+// Weights stored row-major: weights[out * INPUT_DIM + in]
+// Forward: y[o] = sum_i  W[o,i] * x[i]
+
+fn model_zero() -> array {
+    return vec_zeros(OUTPUT_DIM * INPUT_DIM)
+}
+
+fn model_forward(weights: array, x: array) -> array {
+    let mut y = []
+    let mut o = 0
+    while o < OUTPUT_DIM {
+        let row_off = o * INPUT_DIM
+        let mut acc = 0.0
+        let mut k = 0
+        while k < INPUT_DIM {
+            acc = acc + weights[row_off + k] * x[k]
+            k = k + 1
+        }
+        y = y.push(acc)
+        o = o + 1
+    }
+    return y
+}
+
+// Hebbian-style nudge: W += LR * (target ⊗ input - W). Returns new weights.
+// We rebuild a fresh weights array (no .set) by scanning all (o, in) pairs.
+fn model_replay_one(weights: array, x: array, target: array) -> array {
+    let n = OUTPUT_DIM * INPUT_DIM
+    let mut new_w = []
+    let mut o = 0
+    while o < OUTPUT_DIM {
+        let mut k = 0
+        while k < INPUT_DIM {
+            let idx = o * INPUT_DIM + k
+            let cur = weights[idx]
+            let outer = target[o] * x[k]
+            let nudged = cur + LR_REPLAY * (outer - cur)
+            new_w = new_w.push(nudged)
+            k = k + 1
+        }
+        o = o + 1
+    }
+    return new_w
+}
+
+// Run replay over the first n episodes of buf.
+fn consolidate(buf: array, n: int) -> array {
+    let mut w = model_zero()
+    let mut i = 0
+    while i < n {
+        let x = replay_get_input(buf, i)
+        let y = replay_get_output(buf, i)
+        w = model_replay_one(w, x, y)
+        i = i + 1
+    }
+    return w
+}
+
+// ─── Accuracy measurement ─────────────────────────────────────
+// For each episode, run model_forward on the input and compare with the
+// stored output. Accuracy = fraction of episodes where cosine similarity
+// between predicted output and stored output >= SIM_THRESH.
+
+fn vec_dot(a: array, b: array) -> float {
+    let n = len(a)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn vec_norm(a: array) -> float {
+    let d = vec_dot(a, a)
+    return sqrt(d)
+}
+
+fn cosine_sim(a: array, b: array) -> float {
+    let na = vec_norm(a)
+    let nb = vec_norm(b)
+    let denom = na * nb
+    if denom < 0.000001 { return 0.0 }
+    return vec_dot(a, b) / denom
+}
+
+fn model_accuracy(weights: array, buf: array, n: int) -> float {
+    let mut hits = 0
+    let mut i = 0
+    while i < n {
+        let x = replay_get_input(buf, i)
+        let y_true = replay_get_output(buf, i)
+        let y_pred = model_forward(weights, x)
+        let s = cosine_sim(y_pred, y_true)
+        if s >= SIM_THRESH {
+            hits = hits + 1
+        }
+        i = i + 1
+    }
+    if n == 0 { return 0.0 }
+    return to_float(hits) / to_float(n)
+}
+
+// ─── Synthetic episode generator ──────────────────────────────
+// Generate n deterministic episodes. Each input/output pair is correlated
+// (they share a base random vector) so a Hebbian replay model can learn
+// the input->output mapping. Phi is a stand-in salience score.
+
+fn build_episodes(n: int) -> array {
+    let mut buf = replay_new()
+    let mut i = 0
+    while i < n {
+        let base = det_rand(INPUT_DIM, 7000 + i * 31)
+        let mut input = []
+        let mut k = 0
+        while k < INPUT_DIM {
+            input = input.push(base[k])
+            k = k + 1
+        }
+        // Output is base + small per-episode signature (gives the model
+        // something to learn). Both INPUT_DIM and OUTPUT_DIM are 4.
+        let sig = det_rand(OUTPUT_DIM, 9000 + i * 41)
+        let mut output = []
+        let mut j = 0
+        while j < OUTPUT_DIM {
+            output = output.push(base[j] + sig[j] * 0.2)
+            j = j + 1
+        }
+        let phi = 0.5 + to_float(i % 10) * 0.05
+        buf = replay_push(buf, input, output, phi)
+        i = i + 1
+    }
+    return buf
+}
+
+// ─── Self-tests ───────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // T1: dim contract — slot width, empty init, single push grows by SLOT_WIDTH
+    let b0 = replay_new()
+    if len(b0) != 0 {
+        println("  [T1] FAIL — empty buffer not empty")
+        return false
+    }
+    if replay_count(b0) != 0 {
+        println("  [T1] FAIL — empty count != 0")
+        return false
+    }
+    let inp = det_rand(INPUT_DIM, 1)
+    let out = det_rand(OUTPUT_DIM, 2)
+    let b1 = replay_push(b0, inp, out, 0.42)
+    if replay_count(b1) != 1 {
+        println("  [T1] FAIL — count after push != 1")
+        return false
+    }
+    if len(b1) != SLOT_WIDTH {
+        println("  [T1] FAIL — len after push " + str(len(b1)) + " != SLOT_WIDTH " + str(SLOT_WIDTH))
+        return false
+    }
+    let inp_back = replay_get_input(b1, 0)
+    let out_back = replay_get_output(b1, 0)
+    let phi_back = replay_get_phi(b1, 0)
+    if len(inp_back) != INPUT_DIM {
+        println("  [T1] FAIL — get_input length wrong")
+        return false
+    }
+    if len(out_back) != OUTPUT_DIM {
+        println("  [T1] FAIL — get_output length wrong")
+        return false
+    }
+    if fabs(phi_back - 0.42) > 0.0001 {
+        println("  [T1] FAIL — phi roundtrip mismatch")
+        return false
+    }
+    println("  [T1] dim contract OK — slot_width=" + str(SLOT_WIDTH) + ", phi roundtrip OK")
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: determinism — two synthetic 100-episode buffers identical.
+    let n = 100
+    let a = build_episodes(n)
+    let b = build_episodes(n)
+    let la = len(a)
+    let lb = len(b)
+    if la != lb {
+        println("  [T2] FAIL — length mismatch")
+        return false
+    }
+    let mut i = 0
+    while i < la {
+        if fabs(a[i] - b[i]) > 0.0 {
+            println("  [T2] FAIL — divergence at index " + str(i))
+            return false
+        }
+        i = i + 1
+    }
+    println("  [T2] deterministic — both buffers identical, len=" + str(la))
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3: latency — one full replay-pass (consolidate over 100 episodes) < 50 ms.
+    let n = 100
+    let buf = build_episodes(n)
+    let t0 = clock()
+    let w = consolidate(buf, n)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T3] consolidate(" + str(n) + ") in " + str(ms) + " ms (limit 50 ms)")
+    if ms >= 50.0 {
+        println("  [T3] FAIL — latency >= 50 ms")
+        return false
+    }
+    // Sanity: weights have correct length.
+    if len(w) != (OUTPUT_DIM * INPUT_DIM) {
+        println("  [T3] FAIL — weights length wrong")
+        return false
+    }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: edge case — overflow past CAP triggers FIFO; count stays at CAP.
+    // Push CAP + 5 episodes; buffer should hold exactly CAP, and the
+    // FIRST 5 episodes (indices 0..4) should be gone (oldest dropped).
+    let mut buf = replay_new()
+    let n_total = CAP + 5
+    let mut i = 0
+    while i < n_total {
+        let inp = det_rand(INPUT_DIM, 100 + i)
+        let out = det_rand(OUTPUT_DIM, 200 + i)
+        // Use phi as a tag so we can verify which episodes survived.
+        let phi = to_float(i)
+        buf = replay_push(buf, inp, out, phi)
+        i = i + 1
+    }
+    let cnt = replay_count(buf)
+    println("  [T4] pushed " + str(n_total) + " into cap-" + str(CAP) + " buffer; count=" + str(cnt))
+    if cnt != CAP {
+        println("  [T4] FAIL — count " + str(cnt) + " != " + str(CAP))
+        return false
+    }
+    // First surviving episode should be the one tagged with phi=5.0
+    // (episodes 0..4 dropped, original index 5 is now at slot 0).
+    let phi0 = replay_get_phi(buf, 0)
+    if fabs(phi0 - 5.0) > 0.0001 {
+        println("  [T4] FAIL — oldest survivor phi " + str(phi0) + " != 5.0")
+        return false
+    }
+    // Last episode should be phi = (n_total - 1) = CAP + 4
+    let phi_last = replay_get_phi(buf, CAP - 1)
+    let want_last = to_float(n_total - 1)
+    if fabs(phi_last - want_last) > 0.0001 {
+        println("  [T4] FAIL — newest phi " + str(phi_last) + " != " + str(want_last))
+        return false
+    }
+    println("  [T4] FIFO drop OK — survivors phi[0]=" + str(phi0) + " phi[" + str(CAP - 1) + "]=" + str(phi_last))
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5: retention_gain >= GATE on synthetic 100-episode buffer.
+    //   acc_pre  = accuracy of zero (cold) model
+    //   acc_post = accuracy after consolidate() Hebbian replay
+    //   retention_gain = acc_post - acc_pre  must be >= 0.15
+    let n = 100
+    let buf = build_episodes(n)
+    let w_cold = model_zero()
+    let acc_pre = model_accuracy(w_cold, buf, n)
+    let w_hot = consolidate(buf, n)
+    let acc_post = model_accuracy(w_hot, buf, n)
+    let gain = acc_post - acc_pre
+    println("  [T5] acc_pre=" + str(acc_pre) + " acc_post=" + str(acc_post) + " retention_gain=" + str(gain) + " gate=" + str(GATE))
+    if gain >= GATE {
+        return true
+    }
+    println("  [T5] FAIL — retention_gain " + str(gain) + " < gate " + str(GATE))
+    return false
+}
+
+// ─── Main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[alm_replay] BUNDLE 4 / P13 — episode replay buffer + consolidation")
+    println("  cap=" + str(CAP) + "  slot=(input[" + str(INPUT_DIM) + "], output[" + str(OUTPUT_DIM) + "], phi)")
+    println("  gate: retention_gain >= " + str(GATE))
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[alm_replay] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[alm_replay] ALL 5/5 PASS")
+    } else {
+        println("[alm_replay] SOME FAILED")
+    }
+}
+
+main()

@@ -1,0 +1,610 @@
+// ═══════════════════════════════════════════════════════════════
+//  training/phi_corr_history_reader.hexa — P25 history reader
+//
+//  CONSUMER TARGET
+//    shared/state/phi_corr_history.jsonl
+//      Append-only JSONL. Each line is one full eval_phi_corr.hexa run
+//      serialized to a single JSON object of the shape:
+//        {
+//          "run_ts": "2026-04-18T10:00:00Z",
+//          "step": 2000,
+//          "model_tag": "alm14b",
+//          "round": 4,
+//          "n_checkpoints": 5,
+//          "dims": [
+//            { "name": "phi_holo",
+//              "r_pearson": 0.9412, "r_spearman": 0.9000,
+//              "weight": 0.9412, "flag": "SIG " },
+//            ...
+//          ]
+//        }
+//
+//  BEHAVIOUR
+//    - Parses each JSONL line into per-dim rows.
+//    - Groups rows per dim across runs → history.
+//    - Flags pruning candidates:
+//        PRUNE_CANDIDATE : |r_pearson| < 0.2 for ≥3 consecutive runs
+//        DECAYING        : current weight < 0.7 × historical peak
+//        STABLE          : otherwise with |r_pearson| >= 0.5
+//        WEAK            : 0.2 <= |r_pearson| < 0.5
+//    - Emits a per-dim summary table + counts.
+//
+//  API
+//    read_history(path) -> array of dim-history structs
+//    dim_status(history) -> status string
+//    main() runs against --path <jsonl> or the SSOT default.
+//
+//  Self-test:
+//    hexa run training/phi_corr_history_reader.hexa --self-test
+//
+//  HEXA-FIRST — no .py, no .sh, no .rs.
+// ═══════════════════════════════════════════════════════════════
+
+let HISTORY_PATH_DEFAULT = "shared/state/phi_corr_history.jsonl"
+let WEAK_GATE            = 0.2
+let SIG_GATE             = 0.5
+let PRUNE_CONSECUTIVE_N  = 3
+let DECAY_RATIO          = 0.70      // current / peak < 0.7 → DECAYING
+let PHI_DIM_COUNT        = 16
+
+// ─── helpers (stats + fmt — duplicated from eval_phi_corr to keep
+//     the reader self-contained so cron can call one file) ─────────
+
+fn rd_fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn fmt2(x: float) -> string {
+    let neg = x < 0.0
+    let ax = if neg { 0.0 - x } else { x }
+    let scaled = ax * 100.0 + 0.5
+    let k = to_int(scaled)
+    let whole = k / 100
+    let frac  = k - whole * 100
+    let mut frac_s = str(frac)
+    if len(frac_s) < 2 { frac_s = "0" + frac_s }
+    let body = str(whole) + "." + frac_s
+    if neg { return "-" + body }
+    return body
+}
+
+fn fmt3(x: float) -> string {
+    let neg = x < 0.0
+    let ax = if neg { 0.0 - x } else { x }
+    let scaled = ax * 1000.0 + 0.5
+    let k = to_int(scaled)
+    let whole = k / 1000
+    let frac  = k - whole * 1000
+    let mut frac_s = str(frac)
+    while len(frac_s) < 3 { frac_s = "0" + frac_s }
+    let body = str(whole) + "." + frac_s
+    if neg { return "-" + body }
+    return body
+}
+
+fn pad_right(s: string, w: int) -> string {
+    let n = len(s)
+    if n >= w { return s }
+    let mut out = s
+    let mut i = 0
+    while i < w - n {
+        out = out + " "
+        i = i + 1
+    }
+    return out
+}
+
+fn pad_left(s: string, w: int) -> string {
+    let n = len(s)
+    if n >= w { return s }
+    let mut out = ""
+    let mut i = 0
+    while i < w - n {
+        out = out + " "
+        i = i + 1
+    }
+    return out + s
+}
+
+// ─── Minimal flat-JSON scalar extractor ────────────────────────────
+// Caveat: per feedback_hexa_string_api we deliberately avoid
+// methods that don't exist (.find, .char_at). We use:
+//   .index_of, .substring, .split, len(), to_float, to_int
+// String indexing here is BYTE based — safe because our keys are
+// ASCII and values are numeric/ASCII.
+
+fn j_scalar(blob: string, key: string) -> string {
+    let probe = "\"" + key + "\""
+    let k = blob.index_of(probe)
+    if k < 0 { return "" }
+    let n = len(blob)
+    let mut i = k + len(probe)
+    // find colon
+    while i < n && blob.substring(i, i + 1) != ":" { i = i + 1 }
+    if i >= n { return "" }
+    i = i + 1
+    // skip ws
+    while i < n {
+        let c = blob.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" { i = i + 1 } else { break }
+    }
+    // read until , } ]
+    let mut j = i
+    let mut in_str = false
+    while j < n {
+        let c = blob.substring(j, j + 1)
+        if c == "\"" { in_str = !in_str }
+        if !in_str {
+            if c == "," || c == "}" || c == "]" { break }
+        }
+        j = j + 1
+    }
+    let raw = blob.substring(i, j)
+    let mut a = 0
+    let mut b = len(raw)
+    while a < b {
+        let c = raw.substring(a, a + 1)
+        if c == " " || c == "\t" || c == "\"" { a = a + 1 } else { break }
+    }
+    while b > a {
+        let c = raw.substring(b - 1, b)
+        if c == " " || c == "\t" || c == "\"" { b = b - 1 } else { break }
+    }
+    return raw.substring(a, b)
+}
+
+fn safe_f(s: string) -> float {
+    if len(s) == 0 { return 0.0 }
+    return to_float(s)
+}
+
+fn safe_i(s: string) -> int {
+    if len(s) == 0 { return 0 }
+    return to_int(s)
+}
+
+// Parse the top-level "dims":[{...},{...}] array. Split on closing
+// braces so each element is balanced. Relies on dim objects NOT
+// containing nested objects (true for the eval_phi_corr schema).
+fn split_dim_objects(blob: string) -> array {
+    let mut out = []
+    let k = blob.index_of("\"dims\"")
+    if k < 0 { return out }
+    let n = len(blob)
+    // find '[' after key
+    let mut lb = k
+    while lb < n && blob.substring(lb, lb + 1) != "[" { lb = lb + 1 }
+    if lb >= n { return out }
+    let mut rb = lb + 1
+    let mut depth = 1
+    while rb < n && depth > 0 {
+        let c = blob.substring(rb, rb + 1)
+        if c == "[" { depth = depth + 1 }
+        if c == "]" { depth = depth - 1 }
+        if depth == 0 { break }
+        rb = rb + 1
+    }
+    if rb <= lb { return out }
+    let inner = blob.substring(lb + 1, rb)
+    // split into objects by scanning depth
+    let m = len(inner)
+    let mut i = 0
+    while i < m {
+        let c = inner.substring(i, i + 1)
+        if c == "{" {
+            let mut d = 1
+            let mut j = i + 1
+            while j < m && d > 0 {
+                let cc = inner.substring(j, j + 1)
+                if cc == "{" { d = d + 1 }
+                if cc == "}" { d = d - 1 }
+                if d == 0 { break }
+                j = j + 1
+            }
+            if j < m {
+                out = out.push(inner.substring(i, j + 1))
+                i = j + 1
+            } else {
+                i = m
+            }
+        } else {
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// ─── Run record (one JSONL line) ───────────────────────────────────
+
+fn parse_run_line(line: string) -> array {
+    // returns [run_ts, step, model_tag, round, n_ck, dim_count, dim_names, r_pearson_list, weight_list]
+    let ts     = j_scalar(line, "run_ts")
+    let step_s = j_scalar(line, "step")
+    let tag    = j_scalar(line, "model_tag")
+    let rnd_s  = j_scalar(line, "round")
+    let nck_s  = j_scalar(line, "n_checkpoints")
+    let objs   = split_dim_objects(line)
+    let nd     = len(objs)
+    let mut names = []
+    let mut rs = []
+    let mut ws = []
+    let mut i = 0
+    while i < nd {
+        let o = objs[i]
+        names = names.push(j_scalar(o, "name"))
+        // r_pearson_acc is the canonical column but accept either
+        let mut rs_s = j_scalar(o, "r_pearson_acc")
+        if len(rs_s) == 0 { rs_s = j_scalar(o, "r_pearson") }
+        rs = rs.push(safe_f(rs_s))
+        let ws_s = j_scalar(o, "weight")
+        ws = ws.push(safe_f(ws_s))
+        i = i + 1
+    }
+    let mut out = []
+    out = out.push(ts)
+    out = out.push(safe_i(step_s))
+    out = out.push(tag)
+    out = out.push(safe_i(rnd_s))
+    out = out.push(safe_i(nck_s))
+    out = out.push(nd)
+    out = out.push(names)
+    out = out.push(rs)
+    out = out.push(ws)
+    return out
+}
+
+fn read_history_raw(path: string) -> array {
+    let mut runs = []
+    if !file_exists(path) {
+        return runs
+    }
+    let blob = read_file(path)
+    let lines = blob.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    while i < n {
+        let ln = lines[i]
+        // skip blank lines
+        if len(ln) > 0 {
+            // must have a dims key or we can't interpret it
+            if ln.index_of("\"dims\"") >= 0 {
+                runs = runs.push(parse_run_line(ln))
+            }
+        }
+        i = i + 1
+    }
+    return runs
+}
+
+// ─── Per-dim history assembly ──────────────────────────────────────
+
+// Find a dim's index in a run's names list, -1 if missing.
+fn find_dim_idx(run_names: array, target: string) -> int {
+    let n = len(run_names)
+    let mut i = 0
+    while i < n {
+        if run_names[i] == target { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// Collect every r_pearson for dim across runs, in chronological order.
+fn collect_r_history(runs: array, dim: string) -> array {
+    let n = len(runs)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let run = runs[i]
+        let names = run[6]
+        let rs    = run[7]
+        let idx   = find_dim_idx(names, dim)
+        if idx >= 0 {
+            out = out.push(rs[idx])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn collect_w_history(runs: array, dim: string) -> array {
+    let n = len(runs)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let run = runs[i]
+        let names = run[6]
+        let ws    = run[8]
+        let idx   = find_dim_idx(names, dim)
+        if idx >= 0 {
+            out = out.push(ws[idx])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Longest trailing streak of |r| < WEAK_GATE at end of series.
+fn trailing_weak_streak(rs: array) -> int {
+    let n = len(rs)
+    let mut i = n - 1
+    let mut c = 0
+    while i >= 0 {
+        if rd_fabs(rs[i]) < WEAK_GATE { c = c + 1 } else { break }
+        i = i - 1
+    }
+    return c
+}
+
+fn max_weight(ws: array) -> float {
+    let n = len(ws)
+    let mut peak = 0.0
+    let mut i = 0
+    while i < n {
+        if ws[i] > peak { peak = ws[i] }
+        i = i + 1
+    }
+    return peak
+}
+
+fn last_val(xs: array) -> float {
+    let n = len(xs)
+    if n == 0 { return 0.0 }
+    return xs[n - 1]
+}
+
+fn dim_status(
+    rs: array,
+    ws: array
+) -> string {
+    let n = len(rs)
+    if n == 0 { return "NODATA" }
+    let streak = trailing_weak_streak(rs)
+    if streak >= PRUNE_CONSECUTIVE_N { return "PRUNE" }
+    let peak = max_weight(ws)
+    let cur  = last_val(ws)
+    if peak > 0.0 && cur < peak * DECAY_RATIO { return "DECAY" }
+    let last_r = rd_fabs(last_val(rs))
+    if last_r >= SIG_GATE { return "STABLE" }
+    if last_r >= WEAK_GATE { return "WEAK" }
+    return "NULL"
+}
+
+// Dim universe = union of names from all runs (preserves first-seen order)
+fn union_dim_names(runs: array) -> array {
+    let mut out = []
+    let n = len(runs)
+    let mut i = 0
+    while i < n {
+        let names = runs[i][6]
+        let m = len(names)
+        let mut j = 0
+        while j < m {
+            let nm = names[j]
+            let mut seen = false
+            let mut k = 0
+            while k < len(out) {
+                if out[k] == nm { seen = true; break }
+                k = k + 1
+            }
+            if !seen { out = out.push(nm) }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Public summary (used by dashboard + daily) ────────────────────
+
+// Returns array of rows; each row:
+//   [dim_name, runs_count, last_abs_r, last_weight, status]
+fn summarize(runs: array) -> array {
+    let dims = union_dim_names(runs)
+    let m = len(dims)
+    let mut rows = []
+    let mut i = 0
+    while i < m {
+        let nm = dims[i]
+        let rs = collect_r_history(runs, nm)
+        let ws = collect_w_history(runs, nm)
+        let rc = len(rs)
+        let last_ar = rd_fabs(last_val(rs))
+        let last_w  = last_val(ws)
+        let st = dim_status(rs, ws)
+        let mut row = []
+        row = row.push(nm)
+        row = row.push(rc)
+        row = row.push(last_ar)
+        row = row.push(last_w)
+        row = row.push(st)
+        rows = rows.push(row)
+        i = i + 1
+    }
+    return rows
+}
+
+fn count_status(rows: array, target: string) -> int {
+    let n = len(rows)
+    let mut c = 0
+    let mut i = 0
+    while i < n {
+        if rows[i][4] == target { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── Self-test synthetic history generator ─────────────────────────
+//
+// 5 runs × 4 dims:
+//   phi_holo   — stable at |r|≈0.9  (STABLE)
+//   phi_decay  — peaks at 0.85 then drops to 0.2 (DECAY)
+//   phi_prune  — |r| < 0.2 for last 3 runs       (PRUNE)
+//   phi_weak   — |r| around 0.3 throughout        (WEAK)
+
+fn synth_line(
+    run_ts: string, step: int,
+    rh: float, wh: float,
+    rd_: float, wd: float,
+    rp: float, wp: float,
+    rw: float, ww: float
+) -> string {
+    let mut s = "{"
+    s = s + "\"run_ts\":\"" + run_ts + "\","
+    s = s + "\"step\":" + str(step) + ","
+    s = s + "\"model_tag\":\"alm14b\","
+    s = s + "\"round\":4,"
+    s = s + "\"n_checkpoints\":5,"
+    s = s + "\"dims\":["
+    s = s + "{\"name\":\"phi_holo\",\"r_pearson_acc\":" + fmt3(rh) + ",\"weight\":" + fmt3(wh) + ",\"flag\":\"SIG \"},"
+    s = s + "{\"name\":\"phi_decay\",\"r_pearson_acc\":" + fmt3(rd_) + ",\"weight\":" + fmt3(wd) + ",\"flag\":\"WEAK\"},"
+    s = s + "{\"name\":\"phi_prune\",\"r_pearson_acc\":" + fmt3(rp) + ",\"weight\":" + fmt3(wp) + ",\"flag\":\"NULL\"},"
+    s = s + "{\"name\":\"phi_weak\",\"r_pearson_acc\":" + fmt3(rw) + ",\"weight\":" + fmt3(ww) + ",\"flag\":\"WEAK\"}"
+    s = s + "]}"
+    return s
+}
+
+fn write_synth_history(path: string) {
+    let mut blob = ""
+    blob = blob + synth_line("2026-04-14T00:00:00Z",  500,
+                             0.88, 0.88,   0.70, 0.70,   0.30, 0.30,   0.30, 0.30) + "\n"
+    blob = blob + synth_line("2026-04-15T00:00:00Z", 1000,
+                             0.91, 0.91,   0.85, 0.85,   0.25, 0.25,   0.32, 0.32) + "\n"
+    blob = blob + synth_line("2026-04-16T00:00:00Z", 1500,
+                             0.90, 0.90,   0.60, 0.60,   0.15, 0.15,   0.28, 0.28) + "\n"
+    blob = blob + synth_line("2026-04-17T00:00:00Z", 2000,
+                             0.92, 0.92,   0.40, 0.40,   0.10, 0.10,   0.31, 0.31) + "\n"
+    blob = blob + synth_line("2026-04-18T00:00:00Z", 2500,
+                             0.90, 0.90,   0.20, 0.20,   0.08, 0.08,   0.29, 0.29) + "\n"
+    write_file(path, blob)
+}
+
+fn run_self_test() -> bool {
+    let path = "/tmp/phi_corr_history_test.jsonl"
+    write_synth_history(path)
+    let runs = read_history_raw(path)
+    let n_runs = len(runs)
+    println("[reader self-test] runs parsed: " + str(n_runs))
+    if n_runs != 5 {
+        println("  FAIL expected 5 runs, got " + str(n_runs))
+        return false
+    }
+    let rows = summarize(runs)
+    let m = len(rows)
+    println("[reader self-test] dims summarized: " + str(m))
+    if m != 4 {
+        println("  FAIL expected 4 dims")
+        return false
+    }
+    // Verify each synthetic dim's expected status.
+    let mut ok = true
+    let mut i = 0
+    while i < m {
+        let nm = rows[i][0]
+        let st = rows[i][4]
+        let runs_c = rows[i][1]
+        let last_ar = rows[i][2]
+        let last_w  = rows[i][3]
+        println("  " + pad_right(nm, 12)
+              + " runs=" + str(runs_c)
+              + " |r|=" + fmt2(last_ar)
+              + " w="   + fmt3(last_w)
+              + " status=" + st)
+        if nm == "phi_holo"  && st != "STABLE" { println("  FAIL phi_holo expected STABLE got " + st); ok = false }
+        if nm == "phi_decay" && st != "DECAY"  { println("  FAIL phi_decay expected DECAY got " + st);  ok = false }
+        if nm == "phi_prune" && st != "PRUNE"  { println("  FAIL phi_prune expected PRUNE got " + st);  ok = false }
+        if nm == "phi_weak"  && st != "WEAK"   { println("  FAIL phi_weak expected WEAK got " + st);   ok = false }
+        i = i + 1
+    }
+    // Counts sanity
+    let prune_n  = count_status(rows, "PRUNE")
+    let decay_n  = count_status(rows, "DECAY")
+    let stable_n = count_status(rows, "STABLE")
+    let weak_n   = count_status(rows, "WEAK")
+    println("[reader self-test] PRUNE=" + str(prune_n)
+          + " DECAY=" + str(decay_n)
+          + " STABLE=" + str(stable_n)
+          + " WEAK=" + str(weak_n))
+    if prune_n != 1 { ok = false }
+    if decay_n != 1 { ok = false }
+    if stable_n != 1 { ok = false }
+    if weak_n != 1 { ok = false }
+    return ok
+}
+
+// ─── CLI ───────────────────────────────────────────────────────────
+
+fn arg_path(argv: array) -> string {
+    let n = len(argv)
+    let mut i = 0
+    while i < n {
+        if argv[i] == "--path" && i + 1 < n { return argv[i + 1] }
+        i = i + 1
+    }
+    return ""
+}
+
+fn has_self_test(argv: array) -> bool {
+    let n = len(argv)
+    let mut i = 0
+    while i < n {
+        if argv[i] == "--self-test" { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn main() {
+    let argv = args()
+    if has_self_test(argv) {
+        let ok = run_self_test()
+        println("")
+        if ok {
+            println("[phi_corr_history_reader] VERDICT PASS — synthetic 5-run history correctly classified")
+            println("pass=1")
+        } else {
+            println("[phi_corr_history_reader] VERDICT FAIL — classifier mismatch")
+            println("pass=0")
+        }
+        return
+    }
+
+    let cli_path = arg_path(argv)
+    let path = if len(cli_path) > 0 { cli_path } else { HISTORY_PATH_DEFAULT }
+
+    println("[phi_corr_history_reader] path: " + path)
+    let runs = read_history_raw(path)
+    let n_runs = len(runs)
+    println("  runs parsed: " + str(n_runs))
+    if n_runs == 0 {
+        println("[phi_corr_history_reader] no history yet (A1 producer has not written)")
+        println("pass=1")
+        return
+    }
+    let rows = summarize(runs)
+    let m = len(rows)
+    let mut i = 0
+    while i < m {
+        let nm = rows[i][0]
+        let rc = rows[i][1]
+        let ar = rows[i][2]
+        let w  = rows[i][3]
+        let st = rows[i][4]
+        println("  " + pad_right(nm, 16)
+              + " runs=" + pad_left(str(rc), 3)
+              + " |r|=" + fmt2(ar)
+              + " w="   + fmt3(w)
+              + " status=" + st)
+        i = i + 1
+    }
+    println("")
+    println("  STABLE=" + str(count_status(rows, "STABLE"))
+          + " WEAK=" + str(count_status(rows, "WEAK"))
+          + " DECAY=" + str(count_status(rows, "DECAY"))
+          + " PRUNE=" + str(count_status(rows, "PRUNE")))
+    println("pass=1")
+}
+
+main()

@@ -1,0 +1,435 @@
+// training/alm_nested_loss.hexa — ALM-P8 nested self-reference K-tower stability loss
+//
+// BUNDLE 2 / P8 메타 의식 (nested) — K-level self-prediction tower.
+//
+// Purpose:
+//   Train and evaluate a K-level nested self-reference tower:
+//     level_0 = base output (model's prediction of the world)
+//     level_1 = output's prediction of (output)        — meta-cognition
+//     level_2 = output of (level_1's prediction)       — meta-meta
+//     ...
+//     level_k = T(level_{k-1})    — recursive self-application of operator T
+//
+//   Stability criterion (the loss):
+//     A K-tower is STABLE iff the cumulative drift across the tower
+//     stays bounded:  ||level_K - level_0|| / sqrt(d) < eps_stable.
+//     The single-step transform T has spectral-radius proxy r(T) and the
+//     K-step compounded amplification is r(T)^K. When K=3 with a contractive
+//     T, the tower converges; when K grows (K=5 with a near-unit operator),
+//     the drift compounds and stability breaks down.
+//
+//   Loss shape:
+//     L_nested(K) = max(0, drift_K - eps_stable) + lambda_amp * max(0, K_amp - 1.0)
+//   where:
+//     drift_K  = mean L2 distance level_0 -> level_K, normalized by sqrt(d)
+//     K_amp    = ||level_K|| / ||level_0||  (compounded gain ratio)
+//
+//   At K=3 with the canonical contractive operator (rho ≈ 0.85), the loss
+//   is essentially zero. At K=5 with rho ≈ 1.05, drift_K shoots past the
+//   eps_stable gate AND K_amp > 1.0, so the loss flags instability.
+//
+//   Outer training-loop integration:
+//     L = L_task + lambda_nested * L_nested(K)
+//   with lambda_nested ≈ 0.01.
+//
+// ─── Conventions ─────────────────────────────────────────────
+//   K            : int      tower depth (level_0..level_K)
+//   D            : int      embedding dimension per level
+//   tower        : array    flat row-major [K+1, D] storage
+//   T_operator   : array    flat row-major [D, D] linear operator
+//   eps_stable   : float    drift gate (default 0.30)
+//   lambda_amp   : float    K_amp penalty weight (default 0.50)
+//   lambda_nested: float    outer weight in the training loop
+//
+// ─── Theorems (T1-T5) ────────────────────────────────────────
+//
+// T1 (dim contract):
+//   build_tower(K=3, D=8) returns flat array of length (K+1)*D = 32.
+//   nested_loss(...) returns a single float (scalar contract).
+//
+// T2 (forward determinism):
+//   Same (seed, K, D, rho) -> byte-identical loss across two calls.
+//
+// T3 (latency):
+//   Full build_tower + nested_loss at K=3, D=8 < 50 ms wall, warm-cache.
+//
+// T4 (edge case):
+//   Zero input vector at level_0 propagates to zero levels — finite, no NaN.
+//   Maximum-magnitude input (each element = 1.0) produces finite loss.
+//
+// T5 (K-stability phase behavior):
+//   K=3 contractive (rho=0.85) -> loss < 0.05 (stable).
+//   K=5 near-unit (rho=1.05)   -> loss > 0.10 (instability detected).
+//
+// Run:
+//   hexa run training/alm_nested_loss.hexa
+// Expect:
+//   [alm_nested_loss] ALL 5/5 PASS
+
+// ─── Constants ──────────────────────────────────────────────
+
+let EPS_STABLE      = 0.30      // per-dim normalized drift gate
+let LAMBDA_AMP      = 0.50      // K_amp hinge weight
+let LAMBDA_NESTED   = 0.01      // outer loop weight
+let EPS_NUM         = 0.0000001 // numerical floor
+
+// ─── Primitives (self-contained) ────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sqrt_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return sqrt(x)
+}
+
+// Deterministic LCG -> floats in [-1, 1).
+fn det_rand(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_ones(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(1.0)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Vector ops ─────────────────────────────────────────────
+
+fn vec_norm_d(v: array, d: int) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < d {
+        s = s + v[i] * v[i]
+        i = i + 1
+    }
+    return sqrt_safe(s)
+}
+
+fn vec_l2_diff(a: array, b: array, d: int) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < d {
+        let diff = a[i] - b[i]
+        s = s + diff * diff
+        i = i + 1
+    }
+    return sqrt_safe(s)
+}
+
+// ─── Flat tower encoding ────────────────────────────────────
+// Tower has K+1 levels (indexed 0..K); flat = [(K+1) * D].
+
+fn tower_get(tower: array, k: int, d: int) -> array {
+    let base = k * d
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        out = out.push(tower[base + i])
+        i = i + 1
+    }
+    return out
+}
+
+// Append a level to a flat tower being built.
+fn tower_append(tower: array, level: array, d: int) -> array {
+    let mut out = tower
+    let mut i = 0
+    while i < d {
+        out = out.push(level[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Operator T: flat [D,D] row-major ───────────────────────
+//
+// We construct a stable contractive operator with spectral radius
+// approximately rho. Strategy: scaled identity + small random off-diagonal
+// perturbation. Because the perturbation is small relative to the diagonal,
+// the dominant eigenvalue is ~ rho, and applying T amplifies the input by
+// approximately rho per step.
+
+fn build_operator(d: int, rho: float, seed: int) -> array {
+    let perturb = det_rand(d * d, seed)
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        let mut j = 0
+        while j < d {
+            let off = perturb[i * d + j] * 0.02   // small off-diagonal
+            if i == j {
+                out = out.push(rho + off)
+            } else {
+                out = out.push(off)
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// y = T @ x   (flat row-major operator times vector).
+fn apply_operator(t_op: array, x: array, d: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        let row_base = i * d
+        let mut s = 0.0
+        let mut j = 0
+        while j < d {
+            s = s + t_op[row_base + j] * x[j]
+            j = j + 1
+        }
+        out = out.push(s)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Tower construction ─────────────────────────────────────
+//
+// build_tower(level_0, T, K, D) constructs the K+1 level tower
+//   level_0, level_1 = T@level_0, ..., level_K = T@level_{K-1}.
+// Returned flat array has length (K+1)*D.
+
+fn build_tower(level0: array, t_op: array, k_levels: int, d: int) -> array {
+    let mut tower = []
+    tower = tower_append(tower, level0, d)
+    let mut k = 1
+    while k < k_levels + 1 {
+        let prev = tower_get(tower, k - 1, d)
+        let next = apply_operator(t_op, prev, d)
+        tower = tower_append(tower, next, d)
+        k = k + 1
+    }
+    return tower
+}
+
+// ─── Core: nested_loss ──────────────────────────────────────
+//
+// L_nested = max(0, drift_K - eps_stable) + lambda_amp * max(0, K_amp - 1.0)
+//   drift_K = ||level_K - level_0||_2 / sqrt(D)
+//   K_amp   = ||level_K|| / max(||level_0||, eps)
+
+fn nested_loss(tower: array, k_levels: int, d: int) -> float {
+    let level0 = tower_get(tower, 0, d)
+    let levelK = tower_get(tower, k_levels, d)
+    let drift = vec_l2_diff(level0, levelK, d)
+    let drift_norm = drift / sqrt_safe(to_float(d))
+    let n0 = vec_norm_d(level0, d)
+    let nK = vec_norm_d(levelK, d)
+    let denom = if n0 < EPS_NUM { EPS_NUM } else { n0 }
+    let k_amp = nK / denom
+    let mut loss = 0.0
+    let drift_gap = drift_norm - EPS_STABLE
+    if drift_gap > 0.0 { loss = loss + drift_gap }
+    let amp_gap = k_amp - 1.0
+    if amp_gap > 0.0 { loss = loss + LAMBDA_AMP * amp_gap }
+    return loss
+}
+
+fn weighted_nested_loss(tower: array, k_levels: int, d: int) -> float {
+    return LAMBDA_NESTED * nested_loss(tower, k_levels, d)
+}
+
+// ─── Self-tests ─────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // Dim contract: (K+1)*D flat tower; nested_loss returns scalar float.
+    let K = 3
+    let D = 8
+    let level0 = det_rand(D, 42)
+    let t_op = build_operator(D, 0.85, 137)
+    let tower = build_tower(level0, t_op, K, D)
+    let total = (K + 1) * D
+    let actual = len(tower)
+    println("  [T1] expected tower length = " + str(total) + "  actual = " + str(actual))
+    if actual != total {
+        println("  [T1] FAIL -- length mismatch")
+        return false
+    }
+    let loss = nested_loss(tower, K, D)
+    println("  [T1] nested_loss = " + str(loss) + "  (scalar contract OK)")
+    return true
+}
+
+fn check_T2() -> bool {
+    // Determinism: identical inputs -> byte-identical loss.
+    let K = 3
+    let D = 8
+    let level0_a = det_rand(D, 42)
+    let level0_b = det_rand(D, 42)
+    let t_op_a = build_operator(D, 0.85, 137)
+    let t_op_b = build_operator(D, 0.85, 137)
+    let tower_a = build_tower(level0_a, t_op_a, K, D)
+    let tower_b = build_tower(level0_b, t_op_b, K, D)
+    let l_a = nested_loss(tower_a, K, D)
+    let l_b = nested_loss(tower_b, K, D)
+    println("  [T2] loss_a = " + str(l_a) + "  loss_b = " + str(l_b))
+    if fabs(l_a - l_b) > 0.0 {
+        println("  [T2] FAIL -- losses differ")
+        return false
+    }
+    println("  [T2] byte-identical")
+    return true
+}
+
+fn check_T3() -> bool {
+    // Latency: build + loss < 50 ms wall on (K=3, D=8), warm-cache.
+    let K = 3
+    let D = 8
+    let level0 = det_rand(D, 42)
+    let t_op = build_operator(D, 0.85, 137)
+    // Warm.
+    let _w = build_tower(level0, t_op, K, D)
+    let _wl = nested_loss(_w, K, D)
+    let t0 = clock()
+    let tower = build_tower(level0, t_op, K, D)
+    let l = nested_loss(tower, K, D)
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("  [T3] build+loss latency (K=" + str(K) + ", D=" + str(D) + ") = " + str(ms) + " ms  loss=" + str(l))
+    println("  [T3] target: < 50 ms")
+    if ms >= 50.0 {
+        println("  [T3] FAIL -- " + str(ms) + " ms >= 50 ms")
+        return false
+    }
+    return true
+}
+
+fn check_T4() -> bool {
+    // Edge case: zero input + all-ones max input both produce finite loss.
+    let K = 3
+    let D = 8
+    let t_op = build_operator(D, 0.85, 137)
+    // Zero input.
+    let zero0 = vec_zeros(D)
+    let tower_z = build_tower(zero0, t_op, K, D)
+    let l_z = nested_loss(tower_z, K, D)
+    println("  [T4] zero-input loss = " + str(l_z))
+    // L2 diff of all-zero vectors is 0; n0=0 forces denom=eps; nK=0 -> k_amp=0;
+    // amp_gap < 0 so loss = 0. Must be finite (not NaN/inf).
+    let zero_finite_lo = l_z >= 0.0
+    let zero_finite_hi = l_z < 1000000.0
+    if zero_finite_lo {
+        // ok
+    } else {
+        println("  [T4] FAIL -- zero-input loss negative or NaN")
+        return false
+    }
+    if zero_finite_hi {
+        // ok
+    } else {
+        println("  [T4] FAIL -- zero-input loss not finite")
+        return false
+    }
+    // All-ones max input.
+    let max0 = vec_ones(D)
+    let tower_m = build_tower(max0, t_op, K, D)
+    let l_m = nested_loss(tower_m, K, D)
+    println("  [T4] max-input loss = " + str(l_m))
+    let max_finite_lo = l_m >= 0.0
+    let max_finite_hi = l_m < 1000000.0
+    if max_finite_lo {
+        // ok
+    } else {
+        println("  [T4] FAIL -- max-input loss negative or NaN")
+        return false
+    }
+    if max_finite_hi {
+        // ok
+    } else {
+        println("  [T4] FAIL -- max-input loss not finite")
+        return false
+    }
+    return true
+}
+
+fn check_T5() -> bool {
+    // Phase: K=3 contractive (rho=0.85) -> stable (loss < 0.05).
+    //        K=5 near-unit (rho=1.05)   -> instability detected (loss > 0.10).
+    let D = 8
+    // Stable case: K=3, rho=0.85.
+    let level0_s = det_rand(D, 42)
+    let t_op_s = build_operator(D, 0.85, 137)
+    let tower_s = build_tower(level0_s, t_op_s, 3, D)
+    let loss_s = nested_loss(tower_s, 3, D)
+    println("  [T5] stable   K=3 rho=0.85 loss = " + str(loss_s) + "  target < 0.05")
+    // Unstable case: K=5, rho=1.05.
+    let level0_u = det_rand(D, 42)
+    let t_op_u = build_operator(D, 1.05, 137)
+    let tower_u = build_tower(level0_u, t_op_u, 5, D)
+    let loss_u = nested_loss(tower_u, 5, D)
+    println("  [T5] unstable K=5 rho=1.05 loss = " + str(loss_u) + "  target > 0.10")
+    if loss_s >= 0.05 {
+        println("  [T5] FAIL -- stable loss " + str(loss_s) + " >= 0.05 (K=3 should be stable)")
+        return false
+    }
+    if loss_u <= 0.10 {
+        println("  [T5] FAIL -- unstable loss " + str(loss_u) + " <= 0.10 (K=5 should flag instability)")
+        return false
+    }
+    println("  [T5] phase behavior verified: K=3 stable AND K=5 instability detected")
+    return true
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[alm_nested_loss] BUNDLE 2 / P8 nested K-tower stability self-test")
+    println("  eps_stable=" + str(EPS_STABLE) + "  lambda_amp=" + str(LAMBDA_AMP) + "  lambda_nested=" + str(LAMBDA_NESTED))
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[alm_nested_loss] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[alm_nested_loss] ALL 5/5 PASS")
+    } else {
+        println("[alm_nested_loss] SOME FAILED")
+    }
+}
+
+main()

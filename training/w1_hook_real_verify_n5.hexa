@@ -1,0 +1,497 @@
+// training/w1_hook_real_verify_n5.hexa — E1 N=5 real-pattern Φ correlation probe
+//
+// Purpose:
+//   D5 found that the existing w1_hook_real_verify.hexa with N=2 ckpts
+//   produces a degenerate |r|=±1 Pearson/Spearman — any 2 points are
+//   perfectly (anti-)linear. This task synthesizes N=5 ckpts drawn
+//   directly from the r9 eval_loss_curve + phi_holo oscillation
+//   recorded in shared/state/r9_collapse_diagnosis.json so the pipeline
+//   sees a REALISTIC non-monotonic training signature:
+//
+//     step    CE(val)   phi_holo    note
+//     500     4.3114    0.1         very early, B1 aux barely active
+//     1500    2.8454    1.2         B1 ramping, most dims rising
+//     5000    2.4161    8.5         best CE, phi_holo climbing
+//     8000    2.7031   11.0         CE re-drifted up, phi_holo peaked
+//    10000    2.7642   11.2         mode collapse territory, phi_holo≈max
+//
+//   The "other" 15 dims follow a CE-inverse monotone shape (proxy for
+//   quality going up with CE going down) BUT phi_holo deliberately
+//   tracks the r9 B1 loss oscillation (3397–12141) — so phi_holo and
+//   CE should NOT correlate cleanly. This is the signal the dashboard
+//   must catch. Expected outcome:
+//
+//     phi_holo   : WEAK or NULL (non-monotone vs CE / task_acc)
+//     others     : STABLE (CE-inverse shape → strong correlation)
+//
+// Pipeline it exercises:
+//   1. this file             emits phi_vec.json + ce.json + phi_runs.json
+//   2. eval_phi_corr.hexa    reads manifest, writes /tmp/anima_phi_corr.json
+//   3. this file wraps that into a one-line JSONL record
+//   4. appends to shared/state/phi_corr_history.jsonl (REAL HISTORY)
+//   5. phi_corr_dashboard_daily.hexa renders the markdown table
+//
+// Constraints:
+//   - HEXA-FIRST strict (no .py / .rs / .sh)
+//   - Do NOT modify A1 files (alm_phi_vec_logger / train_alm_14b /
+//     eval_phi_corr / w1_hook_smoke / w1_hook_real_verify)
+//   - Do NOT modify D5 files.
+//   - Do NOT touch pod.
+//   - Do NOT commit.
+//
+// Run:
+//   hexa run training/w1_hook_real_verify_n5.hexa
+//
+// Expected final line:
+//   [w1_hook_real_verify_n5] PASS — VERDICT observed + history appended + dashboard rendered
+
+let VERIFY_ROOT   = "/tmp/w1_real_verify_n5"
+let HISTORY_PATH  = "/Users/ghost/Dev/anima/shared/state/phi_corr_history.jsonl"
+let DASHBOARD_MD  = "/Users/ghost/Dev/anima/shared/state/phi_corr_dashboard.md"
+let PHI_VEC_LEN   = 16
+// Remote-dispatched hexa wrapper resolves files relative to the
+// anima repo root on the remote host. Use relative paths + a cd
+// prefix so the sub-hexa invocations can find their source files.
+let ANIMA_ROOT    = "/Users/ghost/Dev/anima"
+let EVAL_PHI_CORR = "training/eval_phi_corr.hexa"
+let DASH_DAILY    = "training/phi_corr_dashboard_daily.hexa"
+let CORR_OUT_JSON = "/tmp/anima_phi_corr.json"
+
+// ─── writers (byte-identical to w1_hook_real_verify.hexa) ────────
+
+fn spec_dim_name(i: int) -> string {
+    if i == 0  { return "phi_holo" }
+    if i == 1  { return "phi_refl" }
+    if i == 2  { return "phi_time" }
+    if i == 3  { return "phi_embodied" }
+    if i == 4  { return "phi_meta" }
+    if i == 5  { return "phi_social" }
+    if i == 6  { return "phi_will" }
+    if i == 7  { return "phi_narrative" }
+    if i == 8  { return "phi_affect" }
+    if i == 9  { return "phi_dream" }
+    if i == 10 { return "phi_create" }
+    if i == 11 { return "phi_finitude" }
+    if i == 12 { return "phi_lang" }
+    if i == 13 { return "phi_mirror" }
+    if i == 14 { return "phi_collective" }
+    if i == 15 { return "phi_unity" }
+    return "unknown"
+}
+
+fn fmt4(x: float) -> string {
+    let neg = x < 0.0
+    let ax = if neg { 0.0 - x } else { x }
+    let scaled = ax * 10000.0 + 0.5
+    let k = to_int(scaled)
+    let whole = k / 10000
+    let frac  = k - whole * 10000
+    let mut frac_s = str(frac)
+    let pad_n = 4 - len(frac_s)
+    let mut pad = ""
+    let mut i = 0
+    while i < pad_n {
+        pad = pad + "0"
+        i = i + 1
+    }
+    let body = str(whole) + "." + pad + frac_s
+    if neg { return "-" + body }
+    return body
+}
+
+fn vec_norm(v: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < len(v) {
+        s = s + v[i] * v[i]
+        i = i + 1
+    }
+    if s <= 0.0 { return 0.0 }
+    return sqrt(s)
+}
+
+fn write_phi_vec_json_inline(
+    step_dir: string, step: int,
+    model_tag: string, round_num: int, measured_at: string,
+    v: array
+) {
+    let mut out = "{\n"
+    out = out + "  \"step\": " + str(step) + ",\n"
+    out = out + "  \"model_tag\": \"" + model_tag + "\",\n"
+    out = out + "  \"round\": " + str(round_num) + ",\n"
+    out = out + "  \"measured_at\": \"" + measured_at + "\",\n"
+    out = out + "  \"dims\": {\n"
+    let mut i = 0
+    while i < PHI_VEC_LEN {
+        let sep = if i + 1 < PHI_VEC_LEN { "," } else { "" }
+        out = out + "    \"" + spec_dim_name(i) + "\": " + fmt4(v[i]) + sep + "\n"
+        i = i + 1
+    }
+    out = out + "  },\n"
+    out = out + "  \"norm_l2\": " + fmt4(vec_norm(v)) + "\n"
+    out = out + "}\n"
+    write_file(step_dir + "/phi_vec.json", out)
+}
+
+fn write_ce_json_inline(step_dir: string, step: int, train_ce: float, val_ce: float) {
+    let mut out = "{ \"step\": " + str(step)
+    out = out + ", \"train_ce\": " + fmt4(train_ce)
+    out = out + ", \"val_ce\": " + fmt4(val_ce)
+    out = out + " }\n"
+    write_file(step_dir + "/ce.json", out)
+}
+
+fn write_manifest(
+    manifest_path: string, ckpt_root: string,
+    model_tag: string, round_num: int, steps: array
+) {
+    let mut out = "{ \"model_tag\": \"" + model_tag + "\""
+    out = out + ", \"round\": " + str(round_num)
+    out = out + ", \"ckpt_root\": \"" + ckpt_root + "\""
+    out = out + ", \"steps\": ["
+    let mut j = 0
+    while j < len(steps) {
+        if j > 0 { out = out + ", " }
+        out = out + str(steps[j])
+        j = j + 1
+    }
+    out = out + "] }\n"
+    write_file(manifest_path, out)
+}
+
+fn mkdir_p(path: string) {
+    exec("mkdir -p " + path)
+}
+
+// ─── N=5 Φ-vector assemblers (real-pattern) ─────────────────────
+//
+// Each ckpt gets a 16-dim vector. Dim 0 (phi_holo) follows the known
+// non-monotonic signature tied to B1 auxiliary oscillation; dims 1..15
+// follow a CE-inverse monotone shape so they SHOULD correlate with
+// both task_acc_proxy (=1/(1+val_ce)) and val_ce.
+//
+// Shape per dim k>=1:   base_k + scale_k * (ce_max - ce) / (ce_max - ce_min)
+//   where (ce_max, ce_min) = (4.3114, 2.4161)
+// This guarantees dim value is LOW at step 500 (CE high) and HIGH at
+// step 5000 (CE=best=2.4161), then drops slightly at 8k/10k as CE
+// re-drifts up — exactly the shape the "pipeline health" test needs.
+
+fn ce_inverse_norm(ce: float) -> float {
+    // Maps CE in [2.4161, 4.3114] → [1.0, 0.0]
+    let ce_min = 2.4161
+    let ce_max = 4.3114
+    let span = ce_max - ce_min
+    if span <= 0.0 { return 0.0 }
+    let num = ce_max - ce
+    let mut v = num / span
+    if v < 0.0 { v = 0.0 }
+    if v > 1.0 { v = 1.0 }
+    return v
+}
+
+fn phi_vec_at_step(step: int, ce: float, phi_holo: float) -> array {
+    let mut v = []
+    // dim 0 — phi_holo (explicit non-monotonic signature)
+    v = v.push(phi_holo)
+
+    // CE-inverse magnitude (0..1) used for dims 1..15 scale
+    let m = ce_inverse_norm(ce)
+
+    // Each dim gets its own base + scale so the five points span a
+    // meaningful range (avoids flat-vector div-by-zero in Pearson).
+    // Shape roughly mirrors the smoke_row saturation ladder in
+    // eval_phi_corr.hexa make_full_registry.
+    //
+    // dim idx, base, scale
+    // [1] phi_refl       0.20 + 1.20 * m
+    // [2] phi_time       0.30 + 1.40 * m
+    // [3] phi_embodied   0.25 + 1.30 * m
+    // [4] phi_meta       0.15 + 1.10 * m
+    // [5] phi_social     0.22 + 1.20 * m
+    // [6] phi_will       0.28 + 1.30 * m
+    // [7] phi_narrative  0.20 + 1.15 * m
+    // [8] phi_affect     0.18 + 1.05 * m
+    // [9] phi_dream      0.14 + 0.95 * m
+    // [10] phi_create    0.16 + 1.00 * m
+    // [11] phi_finitude  0.13 + 0.90 * m
+    // [12] phi_lang      0.30 + 1.50 * m
+    // [13] phi_mirror    0.22 + 1.20 * m
+    // [14] phi_collective 0.10 + 0.80 * m
+    // [15] phi_unity     0.08 + 0.70 * m
+    v = v.push(0.20 + 1.20 * m)
+    v = v.push(0.30 + 1.40 * m)
+    v = v.push(0.25 + 1.30 * m)
+    v = v.push(0.15 + 1.10 * m)
+    v = v.push(0.22 + 1.20 * m)
+    v = v.push(0.28 + 1.30 * m)
+    v = v.push(0.20 + 1.15 * m)
+    v = v.push(0.18 + 1.05 * m)
+    v = v.push(0.14 + 0.95 * m)
+    v = v.push(0.16 + 1.00 * m)
+    v = v.push(0.13 + 0.90 * m)
+    v = v.push(0.30 + 1.50 * m)
+    v = v.push(0.22 + 1.20 * m)
+    v = v.push(0.10 + 0.80 * m)
+    v = v.push(0.08 + 0.70 * m)
+    return v
+}
+
+// ─── dims array re-emitter for history jsonl line ───────────────
+//
+// eval_phi_corr writes /tmp/anima_phi_corr.json with multi-line JSON.
+// We must re-render that as a SINGLE-line JSONL record carrying
+// run_ts + step + model_tag + round + n_checkpoints + dims[].
+// We strip whitespace by reading the file and collapsing newlines
+// (dashboard's mj_split_dims tolerates that), but to be safe we
+// also re-serialize the scalars we need.
+
+fn read_json_scalar(blob: string, key: string) -> string {
+    let probe = "\"" + key + "\""
+    let k = blob.index_of(probe)
+    if k < 0 { return "" }
+    let rest_start = k + len(probe)
+    let n = len(blob)
+    let mut i = rest_start
+    while i < n && blob.substring(i, i + 1) != ":" { i = i + 1 }
+    if i >= n { return "" }
+    i = i + 1
+    while i < n {
+        let c = blob.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" { i = i + 1 } else { break }
+    }
+    let mut j = i
+    let mut in_str = false
+    while j < n {
+        let c = blob.substring(j, j + 1)
+        if c == "\"" { in_str = !in_str }
+        if !in_str {
+            if c == "," || c == "}" || c == "]" || c == "\n" { break }
+        }
+        j = j + 1
+    }
+    let raw = blob.substring(i, j)
+    let mut a = 0
+    let mut b = len(raw)
+    while a < b {
+        let c = raw.substring(a, a + 1)
+        if c == " " || c == "\t" || c == "\"" { a = a + 1 } else { break }
+    }
+    while b > a {
+        let c = raw.substring(b - 1, b)
+        if c == " " || c == "\t" || c == "\"" { b = b - 1 } else { break }
+    }
+    return raw.substring(a, b)
+}
+
+// Extract the inner "dims": [ ... ] substring, brace-balanced, then
+// collapse all newlines so the whole thing fits on one JSONL line.
+fn extract_dims_array_inline(blob: string) -> string {
+    let k = blob.index_of("\"dims\"")
+    if k < 0 { return "[]" }
+    let n = len(blob)
+    let mut lb = k
+    while lb < n && blob.substring(lb, lb + 1) != "[" { lb = lb + 1 }
+    if lb >= n { return "[]" }
+    let mut rb = lb + 1
+    let mut depth = 1
+    while rb < n && depth > 0 {
+        let c = blob.substring(rb, rb + 1)
+        if c == "[" { depth = depth + 1 }
+        if c == "]" { depth = depth - 1 }
+        if depth == 0 { break }
+        rb = rb + 1
+    }
+    if rb <= lb { return "[]" }
+    let raw = blob.substring(lb, rb + 1)
+    // collapse whitespace runs → single space (one line)
+    let m = len(raw)
+    let mut out = ""
+    let mut i = 0
+    let mut last_space = false
+    while i < m {
+        let c = raw.substring(i, i + 1)
+        if c == "\n" || c == "\r" || c == "\t" {
+            if !last_space { out = out + " " ; last_space = true }
+        } else if c == " " {
+            if !last_space { out = out + " " ; last_space = true }
+        } else {
+            out = out + c
+            last_space = false
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn iso_now() -> string {
+    // We cannot shell out for date (exec can't capture stdout), so
+    // we hand-roll a fixed timestamp for the run: 2026-04-18Tnow.
+    // For the history audit trail, this is stamped by this run itself.
+    return "2026-04-18T19:00:00Z"
+}
+
+fn main() {
+    println("[w1_hook_real_verify_n5] start — VERIFY_ROOT=" + VERIFY_ROOT)
+    println("[w1_hook_real_verify_n5] N=5 real-pattern ckpts from r9_collapse_diagnosis")
+    exec("rm -rf " + VERIFY_ROOT)
+    mkdir_p(VERIFY_ROOT)
+
+    // ─── Step 1: write per-step artifacts ────────────────────────
+    // steps, val_ce, phi_holo — mirrors r9 eval_loss_curve + B1 oscillation
+    let mut steps_arr = []
+    steps_arr = steps_arr.push(500)
+    steps_arr = steps_arr.push(1500)
+    steps_arr = steps_arr.push(5000)
+    steps_arr = steps_arr.push(8000)
+    steps_arr = steps_arr.push(10000)
+
+    let mut ce_arr = []
+    ce_arr = ce_arr.push(4.3114)
+    ce_arr = ce_arr.push(2.8454)
+    ce_arr = ce_arr.push(2.4161)
+    ce_arr = ce_arr.push(2.7031)
+    ce_arr = ce_arr.push(2.7642)
+
+    let mut phi_holo_arr = []
+    phi_holo_arr = phi_holo_arr.push(0.1)
+    phi_holo_arr = phi_holo_arr.push(1.2)
+    phi_holo_arr = phi_holo_arr.push(8.5)
+    phi_holo_arr = phi_holo_arr.push(11.0)
+    phi_holo_arr = phi_holo_arr.push(11.2)
+
+    let model_tag = "alm14b"
+    let round_num = 9
+    let measured_at = iso_now()
+
+    let mut i = 0
+    while i < len(steps_arr) {
+        let step = steps_arr[i]
+        let ce   = ce_arr[i]
+        let ph0  = phi_holo_arr[i]
+        let step_dir = VERIFY_ROOT + "/step_" + str(step)
+        mkdir_p(step_dir)
+        let v = phi_vec_at_step(step, ce, ph0)
+        write_phi_vec_json_inline(step_dir, step, model_tag, round_num, measured_at, v)
+        write_ce_json_inline(step_dir, step, ce, ce)
+        println("  wrote step=" + str(step)
+              + " ce=" + fmt4(ce)
+              + " phi_holo=" + fmt4(ph0)
+              + " dim1=" + fmt4(v[1]))
+        i = i + 1
+    }
+
+    let manifest_path = VERIFY_ROOT + "/phi_runs.json"
+    write_manifest(manifest_path, VERIFY_ROOT, model_tag, round_num, steps_arr)
+
+    // ─── Step 2: verify artifacts landed ─────────────────────────
+    let mut artifacts_ok = true
+    let mut v_i = 0
+    while v_i < len(steps_arr) {
+        let sd = VERIFY_ROOT + "/step_" + str(steps_arr[v_i])
+        if !file_exists(sd + "/phi_vec.json") { artifacts_ok = false }
+        if !file_exists(sd + "/ce.json")      { artifacts_ok = false }
+        v_i = v_i + 1
+    }
+    if !file_exists(manifest_path) { artifacts_ok = false }
+    if artifacts_ok {
+        println("[w1_hook_real_verify_n5] artifacts PASS — 11/11 files on disk")
+    } else {
+        println("[w1_hook_real_verify_n5] artifacts FAIL — one or more files missing")
+    }
+
+    // ─── Step 3: invoke eval_phi_corr --manifest, capture stdout ─
+    // HEXA_LOCAL=1 forces local dispatch (remote sync from exec()
+    // context lacks the file in the remote tree).
+    let corr_out = VERIFY_ROOT + "/_corr_stdout.txt"
+    exec("cd " + ANIMA_ROOT + " && HEXA_LOCAL=1 hexa run " + EVAL_PHI_CORR
+         + " --manifest " + manifest_path
+         + " > " + corr_out + " 2>&1")
+
+    let mut verdict_seen = false
+    let mut verdict_line = ""
+    if file_exists(corr_out) {
+        let blob = read_file(corr_out)
+        if blob.index_of("VERDICT") >= 0 { verdict_seen = true }
+        let k = blob.index_of("VERDICT")
+        if k >= 0 {
+            let n = len(blob)
+            let mut e = k
+            while e < n && blob.substring(e, e + 1) != "\n" { e = e + 1 }
+            verdict_line = blob.substring(k, e)
+        }
+    }
+    if verdict_seen {
+        println("[w1_hook_real_verify_n5] eval_phi_corr " + verdict_line)
+    } else {
+        println("[w1_hook_real_verify_n5] eval_phi_corr VERDICT MISSING")
+    }
+
+    // ─── Step 4: wrap /tmp/anima_phi_corr.json → JSONL history ──
+    let mut append_ok = false
+    if file_exists(CORR_OUT_JSON) {
+        let blob = read_file(CORR_OUT_JSON)
+        let n_ck_s = read_json_scalar(blob, "n_checkpoints")
+        let dims_inline = extract_dims_array_inline(blob)
+        // Build single-line JSONL record
+        let last_step = steps_arr[len(steps_arr) - 1]
+        let mut line = "{"
+        line = line + "\"run_ts\":\"" + measured_at + "\""
+        line = line + ",\"step\":" + str(last_step)
+        line = line + ",\"model_tag\":\"" + model_tag + "\""
+        line = line + ",\"round\":" + str(round_num)
+        line = line + ",\"n_checkpoints\":" + n_ck_s
+        line = line + ",\"source\":\"w1_hook_real_verify_n5\""
+        line = line + ",\"dims\":" + dims_inline
+        line = line + "}\n"
+
+        // Append to real history (no overwrite)
+        let mut hist = ""
+        if file_exists(HISTORY_PATH) {
+            hist = read_file(HISTORY_PATH)
+        }
+        hist = hist + line
+        write_file(HISTORY_PATH, hist)
+        append_ok = true
+        println("[w1_hook_real_verify_n5] history APPEND — " + HISTORY_PATH)
+        println("  record len=" + str(len(line)) + " bytes")
+    } else {
+        println("[w1_hook_real_verify_n5] WARN " + CORR_OUT_JSON + " missing — skip history append")
+    }
+
+    // ─── Step 5: invoke phi_corr_dashboard_daily (render md) ────
+    // Dashboard writes OUT_MD_PATH = shared/state/phi_corr_dashboard.md
+    // (relative). cd into anima root so it lands in the tree's shared/.
+    let dash_out = VERIFY_ROOT + "/_dash_stdout.txt"
+    exec("cd " + ANIMA_ROOT + " && HEXA_LOCAL=1 hexa run " + DASH_DAILY
+         + " > " + dash_out + " 2>&1")
+
+    let mut dash_ok = false
+    if file_exists(DASHBOARD_MD) {
+        let md = read_file(DASHBOARD_MD)
+        if md.index_of("Φ Correlation Dashboard") >= 0
+           && md.index_of("phi_holo") >= 0 {
+            dash_ok = true
+        }
+    }
+    if dash_ok {
+        println("[w1_hook_real_verify_n5] dashboard RENDERED — " + DASHBOARD_MD)
+    } else {
+        println("[w1_hook_real_verify_n5] dashboard NOT rendered / missing phi_holo")
+    }
+
+    println("")
+    println("[w1_hook_real_verify_n5] PIPELINE SUMMARY")
+    println("  artifacts_ok = " + str(artifacts_ok))
+    println("  verdict_seen = " + str(verdict_seen))
+    println("  append_ok    = " + str(append_ok))
+    println("  dash_ok      = " + str(dash_ok))
+
+    let final_ok = artifacts_ok && verdict_seen && append_ok && dash_ok
+    if final_ok {
+        println("[w1_hook_real_verify_n5] PASS — VERDICT observed + history appended + dashboard rendered")
+    } else {
+        println("[w1_hook_real_verify_n5] FAIL — see summary above")
+    }
+}
+
+main()

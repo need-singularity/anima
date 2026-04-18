@@ -1,0 +1,253 @@
+// training/phi_probe_wire_test.hexa — D7 probe wire self-test
+//
+// Validates training/phi_probe_wire.hexa on three SYNTHETIC residual
+// streams of shape [bsz=2, tsz=16, dsz=64]:
+//
+//   A) Gaussian-ish   — LCG-driven bounded random in [-1, 1)
+//   B) Linear ramp    — the mock pattern that engine_ablation_report.md
+//                       flags as attenuating MEAN² / HALFSPLIT. The probe
+//                       wire MUST NOT produce an identical 16D vector
+//                       when swapped for Gaussian or Sine input.
+//   C) Sine wave      — periodic structure along the T axis
+//
+// T-theorems:
+//   T1: probe_wire returns exactly 16 entries on every input
+//   T2: all 16 entries are finite (|x| <= 1e9; see phi16_all_finite)
+//   T3: the three input streams produce DIFFERENT 16D vectors
+//       (pairwise L2 distance > 0.01 for all 3 pairs)
+//   T4: non-trivial coverage — at least 10 of the 16 dims differ by
+//       more than 1e-6 between at least one pair (guards against all
+//       output components collapsing to a constant)
+//   T5: determinism — same h_last twice ⇒ byte-identical output
+//
+// Hexa identifier note:
+//   `bsz / tsz / dsz` are used in place of `B / T / D` because the hexa
+//   parser treats a bare capital-letter identifier followed by `<` as a
+//   generic-parameter opener. The math is unchanged; comments keep the
+//   logical [B, T, D] wording.
+//
+// This file is meant to be CONCATENATED with phi_probe_wire.hexa at run
+// time (hexa's stage1 interpreter does not yet support cross-file use
+// chains for library-style multi-file programs — see feedback_hexa_silent
+// _exit_5_imports). Concatenation is safe because phi_probe_wire.hexa has
+// NO main() and this file owns the only main().
+//
+// Run:
+//   cat training/phi_probe_wire.hexa training/phi_probe_wire_test.hexa \
+//       > /tmp/phi_probe_combined.hexa
+//   hexa run /tmp/phi_probe_combined.hexa
+
+// ─── Synthetic residual-stream generators ───────────────────────
+
+// Gaussian-ish: LCG-driven bounded random in [-1, 1). Same formula as the
+// det_rand used by the phi_*_measure kernels so our three streams share a
+// common "noise floor" calibration.
+fn gen_gaussian(bsz: int, tsz: int, dsz: int, seed: int) -> array {
+    let n = bsz * tsz * dsz
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+// Linear ramp along the flat index: 2*i/(n-1) - 1, i.e. linearly spanning
+// [-1, 1). This is the dominant pattern in the current mock h_last that
+// the engine ablation report identifies as attenuating MEAN²/HALFSPLIT.
+fn gen_linear_ramp(bsz: int, tsz: int, dsz: int) -> array {
+    let n = bsz * tsz * dsz
+    let mut out = []
+    if n <= 1 {
+        let mut i = 0
+        while i < n { out = out.push(0.0) i = i + 1 }
+        return out
+    }
+    let denom = to_float(n - 1)
+    let mut i = 0
+    while i < n {
+        let u = to_float(i) / denom
+        out = out.push(u * 2.0 - 1.0)
+        i = i + 1
+    }
+    return out
+}
+
+// Sine along T axis, amplitude modulated by dsz index. Produces periodic
+// residual stream — a realistic-ish alternative to the ramp.
+fn gen_sine(bsz: int, tsz: int, dsz: int) -> array {
+    let n = bsz * tsz * dsz
+    let mut out = []
+    let pi = 3.141592653589793
+    let mut i = 0
+    while i < n {
+        let bi   = i / (tsz * dsz)
+        let rest = i - bi * tsz * dsz
+        let ti   = rest / dsz
+        let di   = rest - ti * dsz
+        let phase = 2.0 * pi * to_float(ti) / to_float(tsz)
+        let amp   = 0.5 + 0.5 * to_float(di) / to_float(dsz)
+        let val   = amp * sin(phase + 0.1 * to_float(bi))
+        out = out.push(val)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Test-only helpers ──────────────────────────────────────────
+
+fn print_vec16(label: string, v: array) {
+    println("  " + label + ":")
+    let mut i = 0
+    while i < 16 {
+        println("    [" + str(i) + "] = " + str(v[i]))
+        i = i + 1
+    }
+}
+
+// Count how many dims differ by more than tol between two 16D vectors.
+fn count_distinct_dims(a: array, b: array, tol: float) -> int {
+    let mut n = 0
+    let mut i = 0
+    while i < 16 {
+        let d = a[i] - b[i]
+        let ad = if d < 0.0 { 0.0 - d } else { d }
+        if ad > tol { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// ─── Main ───────────────────────────────────────────────────────
+
+fn main() {
+    println("[phi_probe_wire_test] D7 probe wire self-test")
+
+    let bsz = 2
+    let tsz = 16
+    let dsz = 64
+
+    println("  tensor shape: [bsz=" + str(bsz) + ", tsz=" + str(tsz) + ", dsz=" + str(dsz) + "]")
+
+    // Build the three synthetic streams.
+    let h_gauss = gen_gaussian(bsz, tsz, dsz, 42)
+    let h_ramp  = gen_linear_ramp(bsz, tsz, dsz)
+    let h_sine  = gen_sine(bsz, tsz, dsz)
+
+    // Sanity: total length.
+    let expected = bsz * tsz * dsz
+    if len(h_gauss) != expected {
+        println("  FATAL: gauss length " + str(len(h_gauss)) + " != " + str(expected))
+    }
+    if len(h_ramp) != expected {
+        println("  FATAL: ramp length " + str(len(h_ramp)) + " != " + str(expected))
+    }
+    if len(h_sine) != expected {
+        println("  FATAL: sine length " + str(len(h_sine)) + " != " + str(expected))
+    }
+
+    // Run probe wire on each.
+    let v_gauss = probe_wire(h_gauss, bsz, tsz, dsz)
+    let v_ramp  = probe_wire(h_ramp,  bsz, tsz, dsz)
+    let v_sine  = probe_wire(h_sine,  bsz, tsz, dsz)
+
+    let mut pass = 0
+    let mut fail = 0
+
+    // T1: output length
+    let t1_ok = (len(v_gauss) == 16) && (len(v_ramp) == 16) && (len(v_sine) == 16)
+    if t1_ok {
+        println("[T1] PASS — all three outputs have length 16")
+        pass = pass + 1
+    } else {
+        println("[T1] FAIL — lengths: gauss=" + str(len(v_gauss))
+                + " ramp=" + str(len(v_ramp))
+                + " sine=" + str(len(v_sine)))
+        fail = fail + 1
+    }
+
+    // T2: all finite
+    let f_g = phi16_all_finite(v_gauss)
+    let f_r = phi16_all_finite(v_ramp)
+    let f_s = phi16_all_finite(v_sine)
+    let t2_ok = f_g && f_r && f_s
+    if t2_ok {
+        println("[T2] PASS — all 16 dims finite for all 3 streams")
+        pass = pass + 1
+    } else {
+        println("[T2] FAIL — finite mask: gauss=" + str(f_g)
+                + " ramp=" + str(f_r) + " sine=" + str(f_s))
+        fail = fail + 1
+    }
+
+    // T3: pairwise distinct
+    let d_gr = phi16_dist(v_gauss, v_ramp)
+    let d_gs = phi16_dist(v_gauss, v_sine)
+    let d_rs = phi16_dist(v_ramp,  v_sine)
+    let tol = 0.01
+    let t3_ok = (d_gr > tol) && (d_gs > tol) && (d_rs > tol)
+    if t3_ok {
+        println("[T3] PASS — all pairwise distances > " + str(tol)
+                + " (gauss-ramp=" + str(d_gr)
+                + ", gauss-sine=" + str(d_gs)
+                + ", ramp-sine=" + str(d_rs) + ")")
+        pass = pass + 1
+    } else {
+        println("[T3] FAIL — pairwise distances: gauss-ramp=" + str(d_gr)
+                + " gauss-sine=" + str(d_gs)
+                + " ramp-sine=" + str(d_rs))
+        fail = fail + 1
+    }
+
+    // T4: non-trivial dim coverage — at least 10 dims differ in SOME pair
+    let dim_tol = 0.000001
+    let c_gr = count_distinct_dims(v_gauss, v_ramp, dim_tol)
+    let c_gs = count_distinct_dims(v_gauss, v_sine, dim_tol)
+    let c_rs = count_distinct_dims(v_ramp,  v_sine, dim_tol)
+    let max_distinct = if c_gr > c_gs {
+                         if c_gr > c_rs { c_gr } else { c_rs }
+                       } else {
+                         if c_gs > c_rs { c_gs } else { c_rs }
+                       }
+    let t4_ok = max_distinct >= 10
+    if t4_ok {
+        println("[T4] PASS — max pair distinct-dim count = " + str(max_distinct)
+                + " (>=10 required)")
+        pass = pass + 1
+    } else {
+        println("[T4] FAIL — max pair distinct-dim count = " + str(max_distinct)
+                + " (<10, probe may be collapsing)")
+        fail = fail + 1
+    }
+
+    // T5: determinism — calling probe_wire twice on the same input gives
+    // byte-identical output (PBV h_last invariant check).
+    let v_gauss2 = probe_wire(h_gauss, bsz, tsz, dsz)
+    let d_det = phi16_dist(v_gauss, v_gauss2)
+    let t5_ok = d_det == 0.0
+    if t5_ok {
+        println("[T5] PASS — determinism: probe_wire(gauss) == probe_wire(gauss)")
+        pass = pass + 1
+    } else {
+        println("[T5] FAIL — determinism broken: dist = " + str(d_det))
+        fail = fail + 1
+    }
+
+    // Dump for manual audit.
+    print_vec16("v_gauss", v_gauss)
+    print_vec16("v_ramp",  v_ramp)
+    print_vec16("v_sine",  v_sine)
+
+    println("[phi_probe_wire_test] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[phi_probe_wire_test] ALL 5/5 PASS — probe wire OK")
+    } else {
+        println("[phi_probe_wire_test] FAILURES — see above")
+    }
+}
+
+main()

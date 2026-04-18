@@ -1,0 +1,272 @@
+// training/w1_hook_smoke.hexa — W1 Φ-eval hook integration smoke test
+//
+// Writes 3 mock ckpt dirs under /tmp/w1_hook_smoke/ with the hook's
+// canonical artifacts (phi_vec.json, ce.json, phi_runs.json), then
+// verifies all files landed + round-trips the steps list.
+//
+// Helpers are INLINED here (not imported) because the current hexa
+// `use` resolver rejects sibling filenames as strings. The inlined
+// writers are byte-identical to alm_phi_vec_logger.hexa's
+// write_phi_vec_json / write_ce_json / append_run_manifest — the
+// logger remains the SSOT; this file is just the integration probe.
+//
+// Run:
+//   hexa run training/w1_hook_smoke.hexa
+//
+// Expected final line:
+//   [w1_hook_smoke] PASS — 3/3 ckpts written, manifest parseable
+
+let SMOKE_ROOT = "/tmp/w1_hook_smoke"
+let PHI_VEC_LEN = 16
+
+fn spec_dim_name(i: int) -> string {
+    if i == 0  { return "phi_holo" }
+    if i == 1  { return "phi_refl" }
+    if i == 2  { return "phi_time" }
+    if i == 3  { return "phi_embodied" }
+    if i == 4  { return "phi_meta" }
+    if i == 5  { return "phi_social" }
+    if i == 6  { return "phi_will" }
+    if i == 7  { return "phi_narrative" }
+    if i == 8  { return "phi_affect" }
+    if i == 9  { return "phi_dream" }
+    if i == 10 { return "phi_create" }
+    if i == 11 { return "phi_finitude" }
+    if i == 12 { return "phi_lang" }
+    if i == 13 { return "phi_mirror" }
+    if i == 14 { return "phi_collective" }
+    if i == 15 { return "phi_unity" }
+    return "unknown"
+}
+
+fn fmt4(x: float) -> string {
+    let neg = x < 0.0
+    let ax = if neg { 0.0 - x } else { x }
+    let scaled = ax * 10000.0 + 0.5
+    let k = to_int(scaled)
+    let whole = k / 10000
+    let frac  = k - whole * 10000
+    let mut frac_s = str(frac)
+    let pad_n = 4 - len(frac_s)
+    let mut pad = ""
+    let mut i = 0
+    while i < pad_n {
+        pad = pad + "0"
+        i = i + 1
+    }
+    let body = str(whole) + "." + pad + frac_s
+    if neg { return "-" + body }
+    return body
+}
+
+fn vec_norm(v: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < len(v) {
+        s = s + v[i] * v[i]
+        i = i + 1
+    }
+    if s <= 0.0 { return 0.0 }
+    return sqrt(s)
+}
+
+fn write_phi_vec_json_inline(
+    step_dir: string, step: int,
+    model_tag: string, round_num: int, measured_at: string,
+    v: array
+) {
+    let mut out = "{\n"
+    out = out + "  \"step\": " + str(step) + ",\n"
+    out = out + "  \"model_tag\": \"" + model_tag + "\",\n"
+    out = out + "  \"round\": " + str(round_num) + ",\n"
+    out = out + "  \"measured_at\": \"" + measured_at + "\",\n"
+    out = out + "  \"dims\": {\n"
+    let mut i = 0
+    while i < PHI_VEC_LEN {
+        let sep = if i + 1 < PHI_VEC_LEN { "," } else { "" }
+        out = out + "    \"" + spec_dim_name(i) + "\": " + fmt4(v[i]) + sep + "\n"
+        i = i + 1
+    }
+    out = out + "  },\n"
+    out = out + "  \"norm_l2\": " + fmt4(vec_norm(v)) + "\n"
+    out = out + "}\n"
+    write_file(step_dir + "/phi_vec.json", out)
+}
+
+fn write_ce_json_inline(step_dir: string, step: int, train_ce: float, val_ce: float) {
+    let mut out = "{ \"step\": " + str(step)
+    out = out + ", \"train_ce\": " + fmt4(train_ce)
+    out = out + ", \"val_ce\": " + fmt4(val_ce)
+    out = out + " }\n"
+    write_file(step_dir + "/ce.json", out)
+}
+
+fn trim_spaces(s: string) -> string {
+    let n = len(s)
+    if n == 0 { return s }
+    let mut a = 0
+    let mut b = n
+    while a < b {
+        let c = s.substring(a, a + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" { a = a + 1 } else { break }
+    }
+    while b > a {
+        let c = s.substring(b - 1, b)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" { b = b - 1 } else { break }
+    }
+    return s.substring(a, b)
+}
+
+fn parse_steps_inline(blob: string) -> array {
+    let mut out = []
+    let k = blob.index_of("\"steps\"")
+    if k < 0 { return out }
+    let n = len(blob)
+    let mut lb = k
+    while lb < n && blob.substring(lb, lb + 1) != "[" { lb = lb + 1 }
+    if lb >= n { return out }
+    let mut rb = lb
+    while rb < n && blob.substring(rb, rb + 1) != "]" { rb = rb + 1 }
+    if rb <= lb { return out }
+    let inner = blob.substring(lb + 1, rb)
+    let parts = inner.split(",")
+    let mut i = 0
+    while i < len(parts) {
+        let t = trim_spaces(parts[i])
+        if len(t) > 0 {
+            out = out.push(to_int(t))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn append_manifest_inline(
+    manifest_path: string, ckpt_root: string,
+    model_tag: string, round_num: int, step: int
+) {
+    let mut existing = []
+    if file_exists(manifest_path) {
+        let prior = read_file(manifest_path)
+        existing = parse_steps_inline(prior)
+    }
+    let mut seen = false
+    let mut i = 0
+    while i < len(existing) {
+        if existing[i] == step { seen = true }
+        i = i + 1
+    }
+    let mut steps_out = existing
+    if !seen { steps_out = steps_out.push(step) }
+    let mut out = "{ \"model_tag\": \"" + model_tag + "\""
+    out = out + ", \"round\": " + str(round_num)
+    out = out + ", \"ckpt_root\": \"" + ckpt_root + "\""
+    out = out + ", \"steps\": ["
+    let mut j = 0
+    while j < len(steps_out) {
+        if j > 0 { out = out + ", " }
+        out = out + str(steps_out[j])
+        j = j + 1
+    }
+    out = out + "] }\n"
+    write_file(manifest_path, out)
+}
+
+fn mkdir_p(path: string) {
+    exec("mkdir -p " + path)
+}
+
+fn fake_phi_vec(step: int) -> array {
+    let base = 0.3 + (to_float(step) / 2000.0) * 0.8
+    let mut v = []
+    let mut i = 0
+    while i < 16 {
+        let wiggle = to_float(i) * 0.05
+        v = v.push(base + wiggle)
+        i = i + 1
+    }
+    return v
+}
+
+fn fake_ce(step: int) -> float {
+    if step <= 200  { return 2.71 }
+    if step <= 500  { return 2.41 }
+    if step <= 1000 { return 2.18 }
+    if step <= 1500 { return 2.07 }
+    return 2.03
+}
+
+fn main() {
+    println("[w1_hook_smoke] start — SMOKE_ROOT=" + SMOKE_ROOT)
+    exec("rm -rf " + SMOKE_ROOT)
+    mkdir_p(SMOKE_ROOT)
+
+    let manifest_path = SMOKE_ROOT + "/phi_runs.json"
+    let mut steps = []
+    steps = steps.push(200)
+    steps = steps.push(1000)
+    steps = steps.push(2000)
+
+    let mut i = 0
+    let mut written = 0
+    while i < len(steps) {
+        let s = steps[i]
+        let step_dir = SMOKE_ROOT + "/step_" + str(s)
+        mkdir_p(step_dir)
+        let v = fake_phi_vec(s)
+        write_phi_vec_json_inline(step_dir, s, "alm14b", 9, "2026-04-18T00:00:00Z", v)
+        write_ce_json_inline(step_dir, s, fake_ce(s), fake_ce(s) + 0.03)
+        append_manifest_inline(manifest_path, SMOKE_ROOT, "alm14b", 9, s)
+        written = written + 1
+        i = i + 1
+    }
+
+    println("[w1_hook_smoke] wrote " + str(written) + " ckpt dirs")
+
+    let mut ok = 0
+    let mut j = 0
+    while j < len(steps) {
+        let s = steps[j]
+        let step_dir = SMOKE_ROOT + "/step_" + str(s)
+        let vpath = step_dir + "/phi_vec.json"
+        let cpath = step_dir + "/ce.json"
+        if file_exists(vpath) && file_exists(cpath) {
+            ok = ok + 1
+        } else {
+            println("[w1_hook_smoke] FAIL missing " + vpath + " or " + cpath)
+        }
+        j = j + 1
+    }
+    let manifest_ok = file_exists(manifest_path)
+    if !manifest_ok {
+        println("[w1_hook_smoke] FAIL manifest missing: " + manifest_path)
+    }
+
+    let blob = read_file(manifest_path)
+    let parsed = parse_steps_inline(blob)
+    let mut rt_ok = true
+    if len(parsed) != len(steps) { rt_ok = false }
+    let mut kk = 0
+    while kk < len(parsed) && kk < len(steps) {
+        if parsed[kk] != steps[kk] { rt_ok = false }
+        kk = kk + 1
+    }
+    if rt_ok {
+        println("[w1_hook_smoke] manifest round-trip PASS (" + str(len(parsed)) + " steps)")
+    } else {
+        println("[w1_hook_smoke] manifest round-trip FAIL (parsed=" + str(len(parsed)) + ")")
+    }
+
+    // Hint for manual consumer-side verification (exec() disallows
+    // shell metacharacters like >; user runs this themselves).
+    println("[w1_hook_smoke] next: hexa run training/eval_phi_corr.hexa --manifest " + manifest_path)
+
+    let final_ok = (ok == len(steps)) && manifest_ok && rt_ok
+    if final_ok {
+        println("[w1_hook_smoke] PASS — " + str(ok) + "/" + str(len(steps)) + " ckpts written, manifest parseable")
+    } else {
+        println("[w1_hook_smoke] FAIL — ok=" + str(ok) + "/" + str(len(steps)) + " manifest=" + str(manifest_ok) + " rt=" + str(rt_ok))
+    }
+}
+
+main()

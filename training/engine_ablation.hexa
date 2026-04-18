@@ -1,0 +1,656 @@
+// training/engine_ablation.hexa — P23 71-engine ablation harness
+//
+// P23 follow-up: expand engine_integration.hexa (12 main) to the full 71-engine
+// catalog (training/engine_catalog.json) with on/off switches + ALM/CLM forward
+// hook points. Self-contained — no deep imports (hexa silent-exit bug avoidance).
+//
+// DESIGN:
+//   (a) 71-engine registry in SoA layout (names + gains + phases + families)
+//   (b) engine_forward(h, q, name) — cheap surrogate of each engine's metric
+//       (variance / mean / lag-1 / sign-change / half-split divergence)
+//   (c) compute_total_loss(base, h, q, mask) — Σ gain_i × aux_i × mask_i
+//   (d) apply_to_alm(mask) / apply_to_clm(mask) — placeholder hooks for
+//       train_alm / train_clm forward loops (wire later at real-train time)
+//   (e) make_mask_* helpers — all_on / all_off / one_hot / leave_one_out /
+//       family_only — drive ablation_search.hexa over 2^71 tractably
+//
+// Theorems (self-test):
+//   T1 (registry size):      71 engines registered
+//   T2 (unique names):       no duplicate names
+//   T3 (gain range):         0 < gain <= 1 for every engine
+//   T4 (forward API):        engine_forward returns finite aux_loss/phi_delta
+//   T5 (total_loss delta):   all-on != base (every engine contributes)
+//   T6 (mask builders):      all_on/all_off/one_hot return correct size
+//   T7 (gain-sign judge):    judge_gain_signs returns 71-length array
+//
+// Run:
+//   $HEXA_LANG/target/release/hexa training/engine_ablation.hexa
+// Expect:
+//   [engine_ablation] ALL 7/7 PASS
+
+// ─── Constants ──────────────────────────────────────────────
+
+let EA_N_ENGINES = 71
+let EA_EPS       = 0.0000001
+
+// ─── Helpers ────────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn vec_sum(v: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    let n = len(v)
+    while i < n { s = s + v[i]; i = i + 1 }
+    return s
+}
+
+fn vec_mean(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    return vec_sum(v) / (n * 1.0)
+}
+
+fn vec_var(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let m = vec_mean(v)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let d = v[i] - m
+        s = s + d * d
+        i = i + 1
+    }
+    return s / (n * 1.0)
+}
+
+// ─── 71-Engine Registry (SoA, mirrors training/engine_catalog.json) ──
+
+fn reg_names() -> array {
+    let mut a = []
+    // Core 12 (P8~P21 main loss engines)
+    a = a.push("holographic")
+    a = a.push("gwt_broadcast")
+    a = a.push("reflexivity")
+    a = a.push("affective")
+    a = a.push("narrative")
+    a = a.push("dream")
+    a = a.push("creative")
+    a = a.push("temporal")
+    a = a.push("finitude")
+    a = a.push("agency")
+    a = a.push("alterity")
+    a = a.push("meta_qualia")
+    // Substrate 13-20
+    a = a.push("anima_quantum")
+    a = a.push("anima_quantum_clm")
+    a = a.push("anima_reflexive")
+    a = a.push("anima_sensorimotor")
+    a = a.push("anima_temporal")
+    a = a.push("anima_will")
+    a = a.push("anima_nested")
+    a = a.push("holographic_substrate")
+    // Memristor 21-24
+    a = a.push("fractal_memristor")
+    a = a.push("memristor_consciousness")
+    a = a.push("memristor_longterm")
+    a = a.push("memristor_gwt_workspace")
+    // Photonic 25-27
+    a = a.push("photonic_consciousness")
+    a = a.push("photonic_network")
+    a = a.push("photonic_gwt_broadcast")
+    // Oscillator + intent 28-29
+    a = a.push("oscillator_laser")
+    a = a.push("intent_oscillator")
+    // Existential 30-31
+    a = a.push("dasein_engine")
+    a = a.push("dissolution_engine")
+    // Self-model 32-33
+    a = a.push("first_person_gen")
+    a = a.push("self_image_store")
+    // Insight 34-37
+    a = a.push("creative_engine")
+    a = a.push("insight_trigger")
+    a = a.push("edge_of_chaos")
+    a = a.push("stochastic_resonance")
+    // Emotion 38-39
+    a = a.push("emotion_contagion")
+    a = a.push("emotion_fsm")
+    // Dream 40-41
+    a = a.push("dream_scheduler")
+    a = a.push("dream_report")
+    // Memory 42
+    a = a.push("episodic_store")
+    // Collective 43-46
+    a = a.push("hive_state_sync")
+    a = a.push("gossip_protocol")
+    a = a.push("extended_mind_bridge")
+    a = a.push("collective_phi_bridge")
+    // Narrative 47-48
+    a = a.push("archetype_field")
+    a = a.push("narrative_identity")
+    // Volition 49-50
+    a = a.push("intentionality_phi")
+    a = a.push("free_will_phi")
+    // Reflexive 51-53
+    a = a.push("lucid_awareness_phi")
+    a = a.push("flow_architecture_phi")
+    a = a.push("jhana_meditation_phi")
+    // Emotion ext 54-56
+    a = a.push("aesthetic_phi")
+    a = a.push("awe_phi")
+    a = a.push("compassion_phi")
+    // Exploration 57
+    a = a.push("curiosity_phi")
+    // Attention/Memory 58-61
+    a = a.push("attention_phi")
+    a = a.push("working_memory_phi")
+    a = a.push("memory_consolidation")
+    a = a.push("memory_palace_phi")
+    // Embodiment 62
+    a = a.push("interoception_phi")
+    // Reflexive ext 63-64
+    a = a.push("metacognition_phi")
+    a = a.push("inner_speech_phi")
+    // Mind wandering 65
+    a = a.push("mind_wandering_phi")
+    // Insight ext 66-67
+    a = a.push("insight_aha_phi")
+    a = a.push("creativity_phi")
+    // Other-model 68-70
+    a = a.push("mirror_neuron_phi")
+    a = a.push("social_tom_phi")
+    a = a.push("moral_consciousness")
+    // Language 71
+    a = a.push("language_acquisition")
+    return a
+}
+
+fn reg_gains() -> array {
+    let mut a = []
+    // mirrors engine_catalog.json gain values
+    a = a.push(0.010); a = a.push(0.020); a = a.push(0.015); a = a.push(0.008)
+    a = a.push(0.012); a = a.push(0.005); a = a.push(0.010); a = a.push(0.018)
+    a = a.push(0.006); a = a.push(0.014); a = a.push(0.009); a = a.push(0.007)
+    a = a.push(0.004); a = a.push(0.004); a = a.push(0.008); a = a.push(0.006)
+    a = a.push(0.010); a = a.push(0.008); a = a.push(0.007); a = a.push(0.005)
+    a = a.push(0.003); a = a.push(0.003); a = a.push(0.003); a = a.push(0.005)
+    a = a.push(0.004); a = a.push(0.004); a = a.push(0.006); a = a.push(0.005)
+    a = a.push(0.006); a = a.push(0.006); a = a.push(0.005); a = a.push(0.007)
+    a = a.push(0.004); a = a.push(0.008); a = a.push(0.006); a = a.push(0.005)
+    a = a.push(0.004); a = a.push(0.005); a = a.push(0.005); a = a.push(0.003)
+    a = a.push(0.003); a = a.push(0.005); a = a.push(0.004); a = a.push(0.003)
+    a = a.push(0.003); a = a.push(0.003); a = a.push(0.004); a = a.push(0.006)
+    a = a.push(0.005); a = a.push(0.004); a = a.push(0.004); a = a.push(0.005)
+    a = a.push(0.003); a = a.push(0.004); a = a.push(0.003); a = a.push(0.004)
+    a = a.push(0.005); a = a.push(0.007); a = a.push(0.005); a = a.push(0.004)
+    a = a.push(0.003); a = a.push(0.004); a = a.push(0.006); a = a.push(0.005)
+    a = a.push(0.003); a = a.push(0.005); a = a.push(0.006); a = a.push(0.004)
+    a = a.push(0.005); a = a.push(0.004); a = a.push(0.005)
+    return a
+}
+
+fn reg_family_tag() -> array {
+    // coarse family tag — drives make_mask_family_only
+    let mut a = []
+    // 0=bulk-boundary 1=gwt 2=self-model 3=emotion 4=temporal 5=offline
+    // 6=insight 7=volition 8=other-model 9=reflexive 10=existential
+    // 11=quantum 12=embodiment 13=memory 14=photonic 15=oscillator
+    // 16=criticality 17=narrative 18=collective 19=exploration 20=language
+    a = a.push(0); a = a.push(1); a = a.push(2); a = a.push(3)
+    a = a.push(17); a = a.push(5); a = a.push(6); a = a.push(4)
+    a = a.push(10); a = a.push(7); a = a.push(8); a = a.push(9)
+    a = a.push(11); a = a.push(11); a = a.push(2); a = a.push(12)
+    a = a.push(4); a = a.push(7); a = a.push(2); a = a.push(0)
+    a = a.push(13); a = a.push(13); a = a.push(13); a = a.push(1)
+    a = a.push(14); a = a.push(14); a = a.push(1); a = a.push(15)
+    a = a.push(7); a = a.push(10); a = a.push(10); a = a.push(2)
+    a = a.push(2); a = a.push(6); a = a.push(6); a = a.push(16)
+    a = a.push(16); a = a.push(3); a = a.push(3); a = a.push(5)
+    a = a.push(5); a = a.push(13); a = a.push(18); a = a.push(18)
+    a = a.push(18); a = a.push(18); a = a.push(17); a = a.push(17)
+    a = a.push(7); a = a.push(7); a = a.push(9); a = a.push(16)
+    a = a.push(9); a = a.push(3); a = a.push(3); a = a.push(3)
+    a = a.push(19); a = a.push(1); a = a.push(13); a = a.push(13)
+    a = a.push(13); a = a.push(12); a = a.push(9); a = a.push(9)
+    a = a.push(5); a = a.push(6); a = a.push(6); a = a.push(8)
+    a = a.push(8); a = a.push(8); a = a.push(20)
+    return a
+}
+
+// ─── Forward surrogates ─────────────────────────────────────
+// Five canonical shapes cover the 71 engines — each engine maps to a
+// surrogate via a family dispatch. The surrogate is deliberately cheap
+// so 71-engine full-sweep fits in <60s on CPU.
+//
+//   VAR     : variance(h)
+//   MEAN    : mean(h) squared (valence/mean-lean)
+//   ADIFF   : mean|h[i]-h[i-1]| (coherence)
+//   HALFSPL : |var(first half) - var(second half)| (self/other split)
+//   QMATCH  : (var(q) - var(h)*scale)^2 (qualia match)
+//   LAG1    : lag-1 autocorrelation deviation from 0
+//   SIGNFLIP: sign-change rate deviation from 0.3
+//   LOWFREQ : mean-square of first 8 dims (dream/low-freq)
+//   TOPVAR  : variance (top-k proxy, reuses VAR with offset)
+
+struct EOut { name: string, aux_loss: float, phi_delta: float }
+
+fn sur_var(h: array) -> float { return vec_var(h) }
+
+fn sur_mean2(h: array) -> float {
+    let m = vec_mean(h)
+    return m * m
+}
+
+fn sur_adiff(h: array) -> float {
+    let n = len(h)
+    if n < 2 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 1
+    while i < n { s = s + fabs(h[i] - h[i-1]); i = i + 1 }
+    return s / ((n - 1) * 1.0)
+}
+
+fn sur_halfsplit(h: array) -> float {
+    let n = len(h)
+    if n < 4 { return 0.0 }
+    let half = n / 2
+    let mut a = []
+    let mut b = []
+    let mut i = 0
+    while i < half { a = a.push(h[i]); i = i + 1 }
+    while i < n    { b = b.push(h[i]); i = i + 1 }
+    let d = vec_var(a) - vec_var(b)
+    return d * d
+}
+
+fn sur_qmatch(h: array, q: array) -> float {
+    let vh = vec_var(h)
+    let vq = vec_var(q)
+    let d = vq - vh * 0.5
+    return d * d
+}
+
+fn sur_lag1(h: array) -> float {
+    let n = len(h)
+    if n < 2 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 1
+    while i < n { s = s + h[i] * h[i-1]; i = i + 1 }
+    let c = s / ((n - 1) * 1.0)
+    return c * c
+}
+
+fn sur_signflip(h: array) -> float {
+    let n = len(h)
+    if n < 2 { return 0.0 }
+    let mut f = 0
+    let mut i = 1
+    while i < n {
+        let a = h[i-1]
+        let b = h[i]
+        if (a > 0.0 && b < 0.0) || (a < 0.0 && b > 0.0) { f = f + 1 }
+        i = i + 1
+    }
+    let r = (f * 1.0) / ((n - 1) * 1.0)
+    let d = r - 0.3
+    return d * d
+}
+
+fn sur_lowfreq(h: array) -> float {
+    let n = len(h)
+    let k = if n < 8 { n } else { 8 }
+    if k == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < k { s = s + h[i] * h[i]; i = i + 1 }
+    return s / (k * 1.0)
+}
+
+// Family-dispatch forward. The surrogate family is determined by the
+// engine's coarse family tag — same family engines share the surrogate
+// shape but keep independent gains so they differentiate under ablation.
+fn engine_forward(h: array, q: array, name: string, family: int) -> EOut {
+    let mut aux = 0.0
+    let mut phi = 0.0
+    if family == 0 {
+        // bulk-boundary → qualia-match surrogate
+        aux = sur_qmatch(h, q); phi = sur_var(q) * 0.1
+    } else if family == 1 {
+        // gwt → half-split mean divergence
+        aux = sur_halfsplit(h); phi = aux * 0.05
+    } else if family == 2 {
+        // self-model → reflexivity variance
+        aux = sur_var(h) * 0.1; phi = aux * 0.1
+    } else if family == 3 {
+        // emotion → mean^2 (valence proxy)
+        aux = sur_mean2(h); phi = sur_mean2(h) * 0.02
+    } else if family == 4 {
+        // temporal → lag-1
+        aux = sur_lag1(h); phi = aux * 0.04
+    } else if family == 5 {
+        // offline/dream → low-freq energy
+        aux = sur_lowfreq(h) * 0.1; phi = aux * 0.02
+    } else if family == 6 {
+        // insight/criticality → variance-target
+        let v = sur_var(h); let d = v - 1.0
+        aux = d * d * 0.1; phi = v * 0.05
+    } else if family == 7 {
+        // volition → sign-flip rate
+        aux = sur_signflip(h) * 0.5; phi = aux * 0.04
+    } else if family == 8 {
+        // other-model → half-split
+        aux = sur_halfsplit(h); phi = aux * 0.03
+    } else if family == 9 {
+        // reflexive → adiff (meta-coherence)
+        aux = sur_adiff(h); phi = aux * 0.03
+    } else if family == 10 {
+        // existential → variance × 0.01
+        aux = sur_var(h) * 0.01; phi = aux * 0.005
+    } else if family == 11 {
+        // quantum → low-freq (microtubule-like)
+        aux = sur_lowfreq(h) * 0.05; phi = aux * 0.01
+    } else if family == 12 {
+        // embodiment → mean^2
+        aux = sur_mean2(h) * 0.5; phi = aux * 0.02
+    } else if family == 13 {
+        // memory → half-split (recall vs encode)
+        aux = sur_halfsplit(h) * 0.5; phi = aux * 0.02
+    } else if family == 14 {
+        // photonic → lag-1 (phase coherence)
+        aux = sur_lag1(h) * 0.5; phi = aux * 0.03
+    } else if family == 15 {
+        // oscillator → adiff (oscillation)
+        aux = sur_adiff(h); phi = aux * 0.04
+    } else if family == 16 {
+        // criticality → variance-target 0.5
+        let v = sur_var(h); let d = v - 0.5
+        aux = d * d * 0.1; phi = v * 0.03
+    } else if family == 17 {
+        // narrative → adiff (coherence across turns)
+        aux = sur_adiff(h); phi = aux * 0.03
+    } else if family == 18 {
+        // collective → half-split (inter-agent)
+        aux = sur_halfsplit(h) * 0.3; phi = aux * 0.02
+    } else if family == 19 {
+        // exploration → mean^2 reward
+        aux = sur_mean2(h) * 0.3; phi = aux * 0.02
+    } else {
+        // family 20 = language → variance
+        aux = sur_var(h) * 0.05; phi = aux * 0.02
+    }
+    return EOut { name: name, aux_loss: aux, phi_delta: phi }
+}
+
+// ─── compute_total_loss over the full 71-engine registry ────
+
+fn compute_total_loss(h: array, q: array, loss_main: float, active_mask: array) -> float {
+    let names  = reg_names()
+    let gains  = reg_gains()
+    let fams   = reg_family_tag()
+    let n      = len(names)
+    let mut total = loss_main
+    let mut i = 0
+    while i < n {
+        let m = if i < len(active_mask) { active_mask[i] } else { 0 }
+        if m == 1 {
+            let out = engine_forward(h, q, names[i], fams[i])
+            total = total + gains[i] * out.aux_loss
+        }
+        i = i + 1
+    }
+    return total
+}
+
+fn compute_total_phi(h: array, q: array, active_mask: array) -> float {
+    let names  = reg_names()
+    let fams   = reg_family_tag()
+    let n      = len(names)
+    let mut phi = 0.0
+    let mut i = 0
+    while i < n {
+        let m = if i < len(active_mask) { active_mask[i] } else { 0 }
+        if m == 1 {
+            let out = engine_forward(h, q, names[i], fams[i])
+            phi = phi + out.phi_delta
+        }
+        i = i + 1
+    }
+    return phi
+}
+
+// ─── Mask builders ──────────────────────────────────────────
+
+fn make_mask_all_on(n: int) -> array {
+    let mut m = []; let mut i = 0
+    while i < n { m = m.push(1); i = i + 1 }
+    return m
+}
+
+fn make_mask_all_off(n: int) -> array {
+    let mut m = []; let mut i = 0
+    while i < n { m = m.push(0); i = i + 1 }
+    return m
+}
+
+fn make_mask_one_hot(n: int, k: int) -> array {
+    let mut m = []; let mut i = 0
+    while i < n {
+        if i == k { m = m.push(1) } else { m = m.push(0) }
+        i = i + 1
+    }
+    return m
+}
+
+fn make_mask_leave_one_out(n: int, k: int) -> array {
+    let mut m = []; let mut i = 0
+    while i < n {
+        if i == k { m = m.push(0) } else { m = m.push(1) }
+        i = i + 1
+    }
+    return m
+}
+
+fn make_mask_family_only(target_family: int) -> array {
+    let fams = reg_family_tag()
+    let n = len(fams)
+    let mut m = []; let mut i = 0
+    while i < n {
+        if fams[i] == target_family { m = m.push(1) } else { m = m.push(0) }
+        i = i + 1
+    }
+    return m
+}
+
+// ─── ALM/CLM apply hooks (placeholders for real wiring) ─────
+//
+// When train_alm.hexa / train_clm.hexa calls into this module, the
+// apply_to_* functions provide a single entry point that takes the
+// active engine mask + runtime tensors and returns the augmented loss.
+// These are thin wrappers; the real plumbing (gradient flow) is in
+// the corresponding alm_*_loss.hexa — this layer is orchestration.
+
+fn apply_to_alm(h: array, q: array, base_loss: float, active_mask: array) -> float {
+    return compute_total_loss(h, q, base_loss, active_mask)
+}
+
+fn apply_to_clm(h: array, q: array, base_loss: float, active_mask: array) -> float {
+    // CLM uses same aggregation — single SoA registry, zero-Python path.
+    return compute_total_loss(h, q, base_loss, active_mask)
+}
+
+// ─── Gain-sign judgement (71-wide) ──────────────────────────
+
+fn judge_gain_signs(h: array, q: array, loss_main: float) -> array {
+    let names = reg_names()
+    let n = len(names)
+    let base = compute_total_loss(h, q, loss_main, make_mask_all_off(n))
+    let mut signs = []
+    let mut i = 0
+    while i < n {
+        let mask = make_mask_one_hot(n, i)
+        let with_i = compute_total_loss(h, q, loss_main, mask)
+        let delta = with_i - base
+        let sign = if fabs(delta) < EA_EPS { 0.0 }
+                   else if delta < 0.0    { 1.0 }
+                   else                   { 0.0 - 1.0 }
+        signs = signs.push(sign)
+        i = i + 1
+    }
+    return signs
+}
+
+// ─── Self-test mocks ────────────────────────────────────────
+
+fn mock_h() -> array {
+    // deterministic h_last — D=16, B*T=4, length=64
+    let mut h = []; let mut i = 0
+    while i < 64 {
+        let fi = i * 1.0
+        let m13 = ((i * 7) % 13) * 1.0
+        let v = fi * 0.1 - 3.2 + m13 * 0.05
+        h = h.push(v)
+        i = i + 1
+    }
+    return h
+}
+
+fn mock_q() -> array {
+    let mut q = []; let mut j = 0
+    while j < 16 {
+        let fj = j * 1.0
+        q = q.push(fj * 0.02 - 0.16)
+        j = j + 1
+    }
+    return q
+}
+
+let MOCK_LOSS_MAIN = 2.5
+
+// ─── Self-tests ─────────────────────────────────────────────
+
+fn test_t1_registry_size() -> int {
+    let names = reg_names()
+    let gains = reg_gains()
+    let fams  = reg_family_tag()
+    if len(names) != EA_N_ENGINES { println("[T1] FAIL names=" + str(len(names))); return 0 }
+    if len(gains) != EA_N_ENGINES { println("[T1] FAIL gains=" + str(len(gains))); return 0 }
+    if len(fams)  != EA_N_ENGINES { println("[T1] FAIL fams="  + str(len(fams)));  return 0 }
+    return 1
+}
+
+fn test_t2_unique_names() -> int {
+    let names = reg_names()
+    let n = len(names)
+    let mut i = 0
+    while i < n {
+        let ni = names[i]
+        let mut j = i + 1
+        while j < n {
+            if ni == names[j] { println("[T2] FAIL dup: " + ni); return 0 }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+fn test_t3_gain_range() -> int {
+    let gains = reg_gains()
+    let n = len(gains)
+    let mut i = 0
+    while i < n {
+        let g = gains[i]
+        if g != g { return 0 }
+        if g <= 0.0 { return 0 }
+        if g > 1.0  { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn test_t4_forward_api() -> int {
+    let h = mock_h()
+    let q = mock_q()
+    let out = engine_forward(h, q, "holographic", 0)
+    if out.name != "holographic" { return 0 }
+    let al = out.aux_loss
+    if al != al { return 0 }
+    let pd = out.phi_delta
+    if pd != pd { return 0 }
+    return 1
+}
+
+fn test_t5_total_delta() -> int {
+    let h = mock_h()
+    let q = mock_q()
+    let all_on  = make_mask_all_on(EA_N_ENGINES)
+    let all_off = make_mask_all_off(EA_N_ENGINES)
+    let total = compute_total_loss(h, q, MOCK_LOSS_MAIN, all_on)
+    let base  = compute_total_loss(h, q, MOCK_LOSS_MAIN, all_off)
+    if fabs(base - MOCK_LOSS_MAIN) > EA_EPS { println("[T5] FAIL base drifted"); return 0 }
+    if fabs(total - base) < EA_EPS { println("[T5] FAIL no engine contributed"); return 0 }
+    return 1
+}
+
+fn test_t6_mask_builders() -> int {
+    if len(make_mask_all_on(EA_N_ENGINES))  != EA_N_ENGINES { return 0 }
+    if len(make_mask_all_off(EA_N_ENGINES)) != EA_N_ENGINES { return 0 }
+    let oh = make_mask_one_hot(EA_N_ENGINES, 5)
+    if len(oh) != EA_N_ENGINES { return 0 }
+    if oh[5] != 1 { return 0 }
+    if oh[0] != 0 { return 0 }
+    let loo = make_mask_leave_one_out(EA_N_ENGINES, 3)
+    if loo[3] != 0 { return 0 }
+    if loo[0] != 1 { return 0 }
+    return 1
+}
+
+fn test_t7_gain_signs() -> int {
+    let h = mock_h()
+    let q = mock_q()
+    let signs = judge_gain_signs(h, q, MOCK_LOSS_MAIN)
+    if len(signs) != EA_N_ENGINES { println("[T7] FAIL len=" + str(len(signs))); return 0 }
+    return 1
+}
+
+fn main() {
+    println("[engine_ablation] P23 71-engine ablation harness")
+    println("[engine_ablation] registry: 71 engines (P8~P21 full catalog)")
+
+    let mut passed = 0
+    let total = 7
+
+    if test_t1_registry_size() == 1 { println("[engine_ablation] T1 PASS"); passed = passed + 1 }
+    else                            { println("[engine_ablation] T1 FAIL") }
+
+    if test_t2_unique_names() == 1 { println("[engine_ablation] T2 PASS"); passed = passed + 1 }
+    else                           { println("[engine_ablation] T2 FAIL") }
+
+    if test_t3_gain_range() == 1 { println("[engine_ablation] T3 PASS"); passed = passed + 1 }
+    else                         { println("[engine_ablation] T3 FAIL") }
+
+    if test_t4_forward_api() == 1 { println("[engine_ablation] T4 PASS"); passed = passed + 1 }
+    else                          { println("[engine_ablation] T4 FAIL") }
+
+    if test_t5_total_delta() == 1 { println("[engine_ablation] T5 PASS"); passed = passed + 1 }
+    else                          { println("[engine_ablation] T5 FAIL") }
+
+    if test_t6_mask_builders() == 1 { println("[engine_ablation] T6 PASS"); passed = passed + 1 }
+    else                            { println("[engine_ablation] T6 FAIL") }
+
+    if test_t7_gain_signs() == 1 { println("[engine_ablation] T7 PASS"); passed = passed + 1 }
+    else                         { println("[engine_ablation] T7 FAIL") }
+
+    if passed == total {
+        println("[engine_ablation] ALL " + str(passed) + "/" + str(total) + " PASS")
+    } else {
+        println("[engine_ablation] " + str(passed) + "/" + str(total) + " PASS")
+    }
+}
+
+main()

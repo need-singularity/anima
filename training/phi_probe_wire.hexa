@@ -1,0 +1,795 @@
+// training/phi_probe_wire.hexa — D7 probe wire: real Φ 16D from h_last[bsz,tsz,dsz]
+//
+// PURPOSE
+//   Replace the P5..P20 mock `h_last` surrogate (a dominant linear ramp that
+//   attenuates MEAN²/HALFSPLIT signal, per engine_ablation_report.md) with a
+//   single entry point that derives all 16 Φ dimensions from the REAL
+//   residual-stream tensor h_last of shape [bsz, tsz, dsz] produced by
+//   the trainer.
+//
+// IDENTIFIER NOTE
+//   Hexa's parser reads `D < 2` as a generic-parameter opener when D starts
+//   with a capital letter, which made the natural [B, T, D] naming unusable.
+//   We use lowercase-starting aliases bsz, tsz, dsz throughout — the math
+//   is unchanged. Comments and doc strings keep the logical [B, T, D] form
+//   for readability.
+//
+// RELATION TO THE 16 phi_*_measure.hexa KERNELS
+//   The 16 measure files under training/ + anima-engines/ are each
+//   self-contained (they call main() at file-end for self-test), so we
+//   cannot cleanly `use` them without triggering the test bodies. Instead
+//   this file MIRRORS the kernel formulas on primitives that already appear
+//   verbatim in every kernel (log-bin MI, shannon entropy, cosine sim).
+//   The mirror is the formula, NOT a private fork — each dim here points
+//   back to its canonical kernel via the comment tag, and the formulas are
+//   identical up to the expected input signature.
+//
+//   Legacy 16D layout (trainer SSOT = alm_phi_vec_logger.hexa):
+//     0  phi_holo          →  phi_holographic_measure.hexa        (MI boundary↔interior split)
+//     1  phi_complexity    →  ad-hoc  (NOT in the 16 kernels — see note below)
+//     2  phi_gwt           →  phi_gwt_measure.hexa                (H(attn) × MI_norm(domains))
+//     3  phi_refl          →  phi_reflexive_measure.hexa          (MI(h, ĥ))
+//     4  phi_time          →  phi_time_measure.hexa               (triadic MI × N_total)
+//     5  phi_emb           →  phi_embodied_measure.hexa           (MI(a, Δs) × N)
+//     6  phi_nested_drift  →  alm_nested_loss surrogate           (|| h − h_meta ||_2 normalized)
+//     7  phi_k_amp         →  ||level_K|| / ||level_0||
+//     8  phi_affect_v      →  phi_affect_measure.hexa (valence)
+//     9  phi_affect_a      →  phi_affect_measure.hexa (arousal)
+//    10  phi_finitude      →  alm_finitude_head surrogate
+//    11  phi_hive_collec   →  alm_hive_agg / phi_collective       (cross-agent MI × N × d)
+//    12  phi_hive_indiv    →  alm_hive_agg / sum_phi_individual
+//    13  phi_hive_emerge   →  ratio 11/12
+//    14  phi_dream_phase   →  dream_loop phase id (static 0 at log-only stage)
+//    15  phi_cycle_count   →  dream_loop cycle counter (static 0 at log-only stage)
+//
+// NOT IN THE 16 MEASURE KERNELS (propose formulas)
+//   • phi_complexity     — Lempel-Ziv-style byte-novelty surrogate. Here we
+//                          use VAR across the T axis of h_last (high variance
+//                          ≈ less compressible residual stream).
+//   • phi_nested_drift   — proposed as the L2 distance between h_last and its
+//                          mean-shifted self (proxy for tower-drift; the real
+//                          P8 NestedTowerOperator lives in alm_nested_loss).
+//   • phi_finitude       — death-awareness score ∈ [0,1]. Proposed as the
+//                          normalized end-token saliency ratio. Real P15
+//                          head is an MLP in alm_finitude_head.hexa.
+//   • phi_dream_phase / phi_cycle_count — log-only, set 0 at probe time.
+//
+// INPUT CONTRACT (exact)
+//   h_last : array of length bsz*tsz*dsz, row-major (batch, then time, then feat)
+//   bsz, tsz, dsz: ints
+//
+// OUTPUT
+//   array of 16 floats in the legacy layout above. All finite; probe does
+//   NOT take gradient (measurement-only, matching the train_alm_14b hook).
+//
+// CONSTRAINTS
+//   • HEXA-FIRST strict — no .py/.rs/.sh.
+//   • Per feedback_hexa_lists_pbv, helpers return new arrays; we never
+//     mutate a caller list in a helper.
+//   • No `use`; file is self-contained like the sibling phi_*_measure files.
+//
+// SELF-TEST ENTRY
+//   The companion test file phi_probe_wire_test.hexa exercises this entry
+//   on three distinct synthetic residual streams and asserts the output
+//   vectors differ. This file itself has NO main() — it is a library,
+//   intended to be called by train_alm_14b.hexa's assemble_phi_vec16()
+//   replacement (A1 owns that wire; D7 does not modify it).
+
+// ─── Constants ──────────────────────────────────────────────
+
+let MI_BINS = 8
+let EPS     = 0.0000001
+
+// ─── Numeric helpers ────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return ln(x)
+}
+
+fn vec_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_min(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] < m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_max(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut m = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > m { m = v[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn vec_sum(v: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    let n = len(v)
+    while i < n {
+        s = s + v[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn vec_mean(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    return vec_sum(v) / to_float(n)
+}
+
+fn vec_var(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let m = vec_mean(v)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let d = v[i] - m
+        s = s + d * d
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+fn vec_l2(v: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    let n = len(v)
+    while i < n {
+        s = s + v[i] * v[i]
+        i = i + 1
+    }
+    if s <= 0.0 { return 0.0 }
+    return sqrt(s)
+}
+
+// Cosine similarity between two equal-length vectors. Returns 0.0 if either
+// vector has zero norm (avoids division by zero).
+fn cosine_sim(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let mut dot = 0.0
+    let mut na = 0.0
+    let mut nb = 0.0
+    let mut i = 0
+    while i < n {
+        dot = dot + a[i] * b[i]
+        na  = na  + a[i] * a[i]
+        nb  = nb  + b[i] * b[i]
+        i = i + 1
+    }
+    if na <= EPS { return 0.0 }
+    if nb <= EPS { return 0.0 }
+    return dot / (sqrt(na) * sqrt(nb))
+}
+
+// ─── Log-bin MI estimator (shared with phi_*_measure kernels) ───
+
+fn bin_index(x: float, lo: float, hi: float, nb: int) -> int {
+    if hi <= lo { return 0 }
+    let t = (x - lo) / (hi - lo)
+    let mut idx = to_int(t * to_float(nb))
+    if idx < 0 { idx = 0 }
+    if idx >= nb { idx = nb - 1 }
+    return idx
+}
+
+fn count_hits(bin_ids: array, n_bins: int) -> array {
+    let n = len(bin_ids)
+    let mut counts = []
+    let mut k = 0
+    while k < n_bins {
+        let mut c = 0.0
+        let mut i = 0
+        while i < n {
+            if bin_ids[i] == k { c = c + 1.0 }
+            i = i + 1
+        }
+        counts = counts.push(c)
+        k = k + 1
+    }
+    return counts
+}
+
+fn entropy_hist(v: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut bin_ids = []
+    let mut i = 0
+    while i < n {
+        bin_ids = bin_ids.push(bin_index(v[i], lo, hi, nb))
+        i = i + 1
+    }
+    let counts = count_hits(bin_ids, nb)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+fn joint_entropy_hist(a: array, b: array, lo: float, hi: float, nb: int) -> float {
+    let n = len(a)
+    let mut pair_ids = []
+    let mut i = 0
+    while i < n {
+        let ia = bin_index(a[i], lo, hi, nb)
+        let ib = bin_index(b[i], lo, hi, nb)
+        pair_ids = pair_ids.push(ia * nb + ib)
+        i = i + 1
+    }
+    let nb2 = nb * nb
+    let counts = count_hits(pair_ids, nb2)
+    let inv_n = 1.0 / to_float(n)
+    let mut h = 0.0
+    let mut k = 0
+    while k < nb2 {
+        let p = counts[k] * inv_n
+        if p > 0.0 {
+            h = h - p * ln_safe(p)
+        }
+        k = k + 1
+    }
+    return h
+}
+
+// Mutual information between two equal-length vectors. Matches the shared
+// protocol used by phi_holographic_measure / phi_reflexive_measure /
+// phi_time_measure / phi_embodied_measure (shared-support histogram).
+fn mutual_info(a: array, b: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let lo_a = vec_min(a)
+    let hi_a = vec_max(a)
+    let lo_b = vec_min(b)
+    let hi_b = vec_max(b)
+    let lo = if lo_a < lo_b { lo_a } else { lo_b }
+    let hi = if hi_a > hi_b { hi_a } else { hi_b }
+    let h_a  = entropy_hist(a, lo, hi, MI_BINS)
+    let h_b  = entropy_hist(b, lo, hi, MI_BINS)
+    let h_ab = joint_entropy_hist(a, b, lo, hi, MI_BINS)
+    let mi = h_a + h_b - h_ab
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ─── h_last slicing helpers (pass-by-value; return new arrays) ──
+//
+// h_last is flat row-major [bsz, tsz, dsz]. Index formula:
+//     h_last[bi, ti, di] = flat[bi*tsz*dsz + ti*dsz + di]
+// Callers do NOT get their tensor mutated.
+
+// Extract one (batch, token) D-vector: flat slice [bi, ti, :]
+fn pick_token(h: array, bi: int, ti: int, tsz: int, dsz: int) -> array {
+    let base = bi * tsz * dsz + ti * dsz
+    let mut out = []
+    let mut i = 0
+    while i < dsz {
+        out = out.push(h[base + i])
+        i = i + 1
+    }
+    return out
+}
+
+// Extract one (batch, dim) T-vector: flat slice [bi, :, di]
+fn pick_dim(h: array, bi: int, di: int, tsz: int, dsz: int) -> array {
+    let mut out = []
+    let mut ti = 0
+    while ti < tsz {
+        out = out.push(h[bi * tsz * dsz + ti * dsz + di])
+        ti = ti + 1
+    }
+    return out
+}
+
+// Mean-pool a [t_lo, t_hi) window across the T axis, per-batch.
+// Returns a length-dsz vector (mean across all (bi, ti) in the window).
+//
+// Hexa lacks an in-place array.set; we accumulate per-dim by scanning the
+// full (bsz × window) for each d. This is O(bsz*tsz*dsz) per call —
+// acceptable for the [2,16,64] tensor probe_wire is designed against.
+fn mean_pool_window(h: array, bsz: int, tsz: int, dsz: int, t_lo: int, t_hi: int) -> array {
+    let n_window = (t_hi - t_lo) * bsz
+    if n_window <= 0 { return vec_zeros(dsz) }
+    let inv = 1.0 / to_float(n_window)
+    let mut out = []
+    let mut di = 0
+    while di < dsz {
+        let mut s = 0.0
+        let mut bi = 0
+        while bi < bsz {
+            let mut ti = t_lo
+            while ti < t_hi {
+                s = s + h[bi * tsz * dsz + ti * dsz + di]
+                ti = ti + 1
+            }
+            bi = bi + 1
+        }
+        out = out.push(s * inv)
+        di = di + 1
+    }
+    return out
+}
+
+// Flatten entire h_last to a vector (for global-entropy-style measures).
+fn flatten_all(h: array) -> array {
+    // Already flat — return a copy to preserve PBV invariant.
+    let n = len(h)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(h[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── 16 dim computations ────────────────────────────────────
+// Every function takes the slices it needs and returns ONE float.
+// The canonical kernel is cited in each comment.
+
+// 0: phi_holo — MI(boundary, interior) on h_last split along D axis.
+// Canonical: phi_holographic_measure.hexa (bulk↔boundary MI).
+// Probe: boundary = first dsz/2 feats, interior = last dsz/2 feats,
+// concatenated across all (bi, ti) samples.
+fn probe_phi_holo(h: array, bsz: int, tsz: int, dsz: int) -> float {
+    if dsz < 2 { return 0.0 }
+    let half = dsz / 2
+    let mut boundary = []
+    let mut interior = []
+    let mut bi = 0
+    while bi < bsz {
+        let mut ti = 0
+        while ti < tsz {
+            let base = bi * tsz * dsz + ti * dsz
+            let mut di = 0
+            while di < half {
+                boundary = boundary.push(h[base + di])
+                interior = interior.push(h[base + half + di])
+                di = di + 1
+            }
+            ti = ti + 1
+        }
+        bi = bi + 1
+    }
+    return mutual_info(boundary, interior)
+}
+
+// 1: phi_complexity — mean VAR across T axis of h_last.
+// NOT in the 16 kernels — proposed emergent-dim surrogate (see header note).
+fn probe_phi_complexity(h: array, bsz: int, tsz: int, dsz: int) -> float {
+    if tsz < 2 { return 0.0 }
+    let mut total = 0.0
+    let mut count = 0
+    let mut bi = 0
+    while bi < bsz {
+        let mut di = 0
+        while di < dsz {
+            let col = pick_dim(h, bi, di, tsz, dsz)
+            total = total + vec_var(col)
+            count = count + 1
+            di = di + 1
+        }
+        bi = bi + 1
+    }
+    if count == 0 { return 0.0 }
+    return total / to_float(count)
+}
+
+// 2: phi_gwt — H(attn_proxy) × MI_norm(domains).
+// Canonical: phi_gwt_measure.hexa.
+// Probe: attn_proxy = softmax-analog from h_last L2 over T (entropy over
+// token-saliency distribution per batch); domains = K=4 quarters of D axis.
+fn probe_phi_gwt(h: array, bsz: int, tsz: int, dsz: int) -> float {
+    if tsz == 0 { return 0.0 }
+    if dsz == 0 { return 0.0 }
+    let mut sum_h = 0.0
+    let mut bi = 0
+    while bi < bsz {
+        let mut mags = []
+        let mut ti = 0
+        while ti < tsz {
+            let tok = pick_token(h, bi, ti, tsz, dsz)
+            mags = mags.push(vec_l2(tok) + EPS)
+            ti = ti + 1
+        }
+        let z = vec_sum(mags)
+        if z > EPS {
+            let mut h_b = 0.0
+            let mut tj = 0
+            while tj < tsz {
+                let p = mags[tj] / z
+                if p > EPS {
+                    h_b = h_b - p * ln_safe(p)
+                }
+                tj = tj + 1
+            }
+            sum_h = sum_h + h_b
+        }
+        bi = bi + 1
+    }
+    let attn_h = sum_h / to_float(bsz)
+    // domain integration: K=4 quarters of dsz, mass = sum |h| per quarter.
+    let k_domains = 4
+    if dsz < k_domains { return attn_h * 0.0 }
+    let qd = dsz / k_domains
+    let mut mass = []
+    let mut total_mass = 0.0
+    let mut k = 0
+    while k < k_domains {
+        let mut s = 0.0
+        let mut bk = 0
+        while bk < bsz {
+            let mut tk = 0
+            while tk < tsz {
+                let base = bk * tsz * dsz + tk * dsz + k * qd
+                let mut j = 0
+                while j < qd {
+                    let v = h[base + j]
+                    let av = if v < 0.0 { 0.0 - v } else { v }
+                    s = s + av
+                    j = j + 1
+                }
+                tk = tk + 1
+            }
+            bk = bk + 1
+        }
+        mass = mass.push(s)
+        total_mass = total_mass + s
+        k = k + 1
+    }
+    if total_mass < EPS { return 0.0 }
+    let mut h_dom = 0.0
+    let mut i = 0
+    while i < k_domains {
+        let q = mass[i] / total_mass
+        if q > EPS {
+            h_dom = h_dom - q * ln_safe(q)
+        }
+        i = i + 1
+    }
+    let max_h = ln(to_float(k_domains))
+    let mi_norm = if max_h <= 0.0 { 0.0 } else { h_dom / max_h }
+    return attn_h * mi_norm
+}
+
+// 3: phi_refl — MI(h, ĥ) with ĥ := mean-shifted h (self-prediction proxy).
+// Canonical: phi_reflexive_measure.hexa.
+fn probe_phi_refl(h: array, bsz: int, tsz: int, dsz: int) -> float {
+    let a = flatten_all(h)
+    let m = vec_mean(a)
+    let n = len(a)
+    let mut b_vec = []
+    let mut i = 0
+    while i < n {
+        // ĥ = shifted-and-blended residual: a self-model would re-emit h with
+        // small correction; we proxy correction with partial mean subtraction.
+        b_vec = b_vec.push(a[i] - 0.5 * m)
+        i = i + 1
+    }
+    return mutual_info(a, b_vec)
+}
+
+// 4: phi_time — triadic MI of past/now/future T-window slices × N_total.
+// Canonical: phi_time_measure.hexa.
+fn probe_phi_time(h: array, bsz: int, tsz: int, dsz: int) -> float {
+    if tsz < 3 { return 0.0 }
+    let t3 = tsz / 3
+    let past   = mean_pool_window(h, bsz, tsz, dsz, 0,      t3)
+    let now    = mean_pool_window(h, bsz, tsz, dsz, t3,     2 * t3)
+    let future = mean_pool_window(h, bsz, tsz, dsz, 2 * t3, tsz)
+    let mi_pn = mutual_info(past, now)
+    let mi_nf = mutual_info(now,  future)
+    let mi_pf = mutual_info(past, future)
+    let mi = (mi_pn + mi_nf + mi_pf) / 3.0
+    let n_total = len(past) + len(now) + len(future)
+    return mi * to_float(n_total)
+}
+
+// 5: phi_emb — MI(action-proxy, delta-proxy) × N.
+// Canonical: phi_embodied_measure.hexa.
+// Probe: action-proxy = h[:,t,:dsz/2]; delta-proxy = h[:,t+1,:] − h[:,t,:]
+// restricted to first dsz/2 dims. Captures sensorimotor coupling in residual.
+fn probe_phi_emb(h: array, bsz: int, tsz: int, dsz: int) -> float {
+    if tsz < 2 { return 0.0 }
+    let half = dsz / 2
+    if half == 0 { return 0.0 }
+    let mut a_stream = []
+    let mut d_stream = []
+    let mut bi = 0
+    while bi < bsz {
+        let mut ti = 0
+        while ti < tsz - 1 {
+            let base  = bi * tsz * dsz + ti * dsz
+            let base1 = bi * tsz * dsz + (ti + 1) * dsz
+            let mut di = 0
+            while di < half {
+                a_stream = a_stream.push(h[base + di])
+                d_stream = d_stream.push(h[base1 + di] - h[base + di])
+                di = di + 1
+            }
+            ti = ti + 1
+        }
+        bi = bi + 1
+    }
+    let mi = mutual_info(a_stream, d_stream)
+    let n_total = len(a_stream) + len(d_stream)
+    return mi * to_float(n_total)
+}
+
+// 6: phi_nested_drift — L2 drift between h and its T-mean self,
+// normalized by baseline L2. Proxy for NestedTowerOperator residual.
+// Real: alm_nested_loss.hexa (NOT in 16-kernel set, see header).
+fn probe_phi_nested_drift(h: array, bsz: int, tsz: int, dsz: int) -> float {
+    let mean_vec = mean_pool_window(h, bsz, tsz, dsz, 0, tsz)
+    let mut drift_sq = 0.0
+    let mut base_sq  = 0.0
+    let mut bi = 0
+    while bi < bsz {
+        let mut ti = 0
+        while ti < tsz {
+            let base = bi * tsz * dsz + ti * dsz
+            let mut di = 0
+            while di < dsz {
+                let v = h[base + di]
+                let dv = v - mean_vec[di]
+                drift_sq = drift_sq + dv * dv
+                base_sq  = base_sq  + v * v
+                di = di + 1
+            }
+            ti = ti + 1
+        }
+        bi = bi + 1
+    }
+    if base_sq <= EPS { return 0.0 }
+    return sqrt(drift_sq) / sqrt(base_sq)
+}
+
+// 7: phi_k_amp — ||last token|| / ||first token|| averaged over batch.
+// Proxy for level-K / level-0 amplification (P8 K-tower).
+fn probe_phi_k_amp(h: array, bsz: int, tsz: int, dsz: int) -> float {
+    if tsz < 2 { return 0.0 }
+    let mut total = 0.0
+    let mut count = 0
+    let mut bi = 0
+    while bi < bsz {
+        let tok_0 = pick_token(h, bi, 0,       tsz, dsz)
+        let tok_k = pick_token(h, bi, tsz - 1, tsz, dsz)
+        let n0 = vec_l2(tok_0)
+        let nk = vec_l2(tok_k)
+        if n0 > EPS {
+            total = total + nk / n0
+            count = count + 1
+        }
+        bi = bi + 1
+    }
+    if count == 0 { return 0.0 }
+    return total / to_float(count)
+}
+
+// 8: phi_affect_v — valence ∈ [-1, 1] via mean across all h (sign-carrying).
+// Proxy for AffectHead valence signal.
+fn probe_phi_affect_v(h: array, bsz: int, tsz: int, dsz: int) -> float {
+    let m = vec_mean(h)
+    // squash into [-1, 1] via x / (|x| + 1) — smooth saturating map.
+    let a = fabs(m)
+    return m / (a + 1.0)
+}
+
+// 9: phi_affect_a — arousal ∈ [0, 1] via normalized variance of h.
+fn probe_phi_affect_a(h: array, bsz: int, tsz: int, dsz: int) -> float {
+    let v = vec_var(h)
+    return v / (v + 1.0)
+}
+
+// 10: phi_finitude — normalized end-token saliency, ∈ [0, 1].
+// ||h[:,-1,:]|| / mean_t ||h[:,t,:]||, clipped to [0, 1].
+fn probe_phi_finitude(h: array, bsz: int, tsz: int, dsz: int) -> float {
+    if tsz < 1 { return 0.0 }
+    let mut end_sum = 0.0
+    let mut all_sum = 0.0
+    let mut bi = 0
+    while bi < bsz {
+        let tok_end = pick_token(h, bi, tsz - 1, tsz, dsz)
+        end_sum = end_sum + vec_l2(tok_end)
+        let mut ti = 0
+        while ti < tsz {
+            let tok = pick_token(h, bi, ti, tsz, dsz)
+            all_sum = all_sum + vec_l2(tok)
+            ti = ti + 1
+        }
+        bi = bi + 1
+    }
+    let mean_all = all_sum / to_float(bsz * tsz)
+    if mean_all <= EPS { return 0.0 }
+    let end_mean = end_sum / to_float(bsz)
+    let r = end_mean / mean_all
+    if r < 0.0 { return 0.0 }
+    if r > 1.0 { return 1.0 }
+    return r
+}
+
+// 11: phi_hive_collec — cross-agent MI × N × d (agents ≡ batch slices).
+// Canonical: alm_hive_agg.hexa phi_collective.
+fn probe_phi_hive_collec(h: array, bsz: int, tsz: int, dsz: int) -> float {
+    if bsz < 2 { return 0.0 }
+    let mut total = 0.0
+    let mut n_pairs = 0
+    let mut di = 0
+    while di < dsz {
+        let mut ai = 0
+        while ai < bsz {
+            let va = pick_dim(h, ai, di, tsz, dsz)
+            let mut bb = ai + 1
+            while bb < bsz {
+                let vb = pick_dim(h, bb, di, tsz, dsz)
+                let mi = mutual_info(va, vb)
+                total = total + mi
+                n_pairs = n_pairs + 1
+                bb = bb + 1
+            }
+            ai = ai + 1
+        }
+        di = di + 1
+    }
+    if n_pairs == 0 { return 0.0 }
+    let mean_mi = total / to_float(n_pairs)
+    return mean_mi * to_float(bsz) * to_float(dsz)
+}
+
+// 12: phi_hive_indiv — Σ_agents |autocorr| × d.
+// Canonical: alm_hive_agg.hexa sum_phi_individual.
+fn probe_phi_hive_indiv(h: array, bsz: int, tsz: int, dsz: int) -> float {
+    if tsz < 2 { return 0.0 }
+    let mut total = 0.0
+    let mut ai = 0
+    while ai < bsz {
+        let mut sum_cos = 0.0
+        let mut n_pairs = 0
+        let mut ti = 0
+        while ti < tsz - 1 {
+            let t0 = pick_token(h, ai, ti,     tsz, dsz)
+            let t1 = pick_token(h, ai, ti + 1, tsz, dsz)
+            sum_cos = sum_cos + cosine_sim(t0, t1)
+            n_pairs = n_pairs + 1
+            ti = ti + 1
+        }
+        let ac = if n_pairs > 0 { sum_cos / to_float(n_pairs) } else { 0.0 }
+        total = total + fabs(ac) * to_float(dsz)
+        ai = ai + 1
+    }
+    return total
+}
+
+// 13: phi_hive_emerge — ratio collective / Σ individual. >1.0 = emergence.
+fn probe_phi_hive_emerge(collec: float, indiv: float) -> float {
+    if indiv <= EPS { return 0.0 }
+    return collec / indiv
+}
+
+// 14: phi_dream_phase — log-only static 0 at probe time.
+// dream_loop owns the actual phase state; probe is snapshot-only.
+fn probe_phi_dream_phase(h: array, bsz: int, tsz: int, dsz: int) -> float {
+    return 0.0
+}
+
+// 15: phi_cycle_count — log-only static 0.
+fn probe_phi_cycle_count(h: array, bsz: int, tsz: int, dsz: int) -> float {
+    return 0.0
+}
+
+// ─── Main entry point ───────────────────────────────────────
+//
+// probe_wire(h_last, bsz, tsz, dsz) → 16D Φ vector from REAL residual stream.
+// Drop-in replacement for the linear-ramp mock. The returned array length
+// is always 16; caller should hand this to train_alm_14b's logger / writer.
+
+fn probe_wire(h_last: array, bsz: int, tsz: int, dsz: int) -> array {
+    let phi_holo         = probe_phi_holo(h_last,         bsz, tsz, dsz)
+    let phi_complexity   = probe_phi_complexity(h_last,   bsz, tsz, dsz)
+    let phi_gwt          = probe_phi_gwt(h_last,          bsz, tsz, dsz)
+    let phi_refl         = probe_phi_refl(h_last,         bsz, tsz, dsz)
+    let phi_time         = probe_phi_time(h_last,         bsz, tsz, dsz)
+    let phi_emb          = probe_phi_emb(h_last,          bsz, tsz, dsz)
+    let phi_nested_drift = probe_phi_nested_drift(h_last, bsz, tsz, dsz)
+    let phi_k_amp        = probe_phi_k_amp(h_last,        bsz, tsz, dsz)
+    let phi_affect_v     = probe_phi_affect_v(h_last,     bsz, tsz, dsz)
+    let phi_affect_a     = probe_phi_affect_a(h_last,     bsz, tsz, dsz)
+    let phi_finitude     = probe_phi_finitude(h_last,     bsz, tsz, dsz)
+    let phi_hive_collec  = probe_phi_hive_collec(h_last,  bsz, tsz, dsz)
+    let phi_hive_indiv   = probe_phi_hive_indiv(h_last,   bsz, tsz, dsz)
+    let phi_hive_emerge  = probe_phi_hive_emerge(phi_hive_collec, phi_hive_indiv)
+    let phi_dream_phase  = probe_phi_dream_phase(h_last,  bsz, tsz, dsz)
+    let phi_cycle_count  = probe_phi_cycle_count(h_last,  bsz, tsz, dsz)
+
+    let mut v = []
+    v = v.push(phi_holo)
+    v = v.push(phi_complexity)
+    v = v.push(phi_gwt)
+    v = v.push(phi_refl)
+    v = v.push(phi_time)
+    v = v.push(phi_emb)
+    v = v.push(phi_nested_drift)
+    v = v.push(phi_k_amp)
+    v = v.push(phi_affect_v)
+    v = v.push(phi_affect_a)
+    v = v.push(phi_finitude)
+    v = v.push(phi_hive_collec)
+    v = v.push(phi_hive_indiv)
+    v = v.push(phi_hive_emerge)
+    v = v.push(phi_dream_phase)
+    v = v.push(phi_cycle_count)
+    return v
+}
+
+// Helper for tests: L2 norm of the 16D vector (for quick distance checks).
+fn phi16_norm(v: array) -> float {
+    return vec_l2(v)
+}
+
+// Helper for tests: L2 distance between two 16D vectors.
+fn phi16_dist(a: array, b: array) -> float {
+    if len(a) != len(b) { return 0.0 }
+    let n = len(a)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let d = a[i] - b[i]
+        s = s + d * d
+        i = i + 1
+    }
+    if s <= 0.0 { return 0.0 }
+    return sqrt(s)
+}
+
+// Helper for tests: all 16 components within a sane magnitude envelope.
+// Hexa does not expose a NaN literal or isnan() primitive; the closest
+// portable check is a magnitude bound. The probe formulas are bounded
+// by bsz*tsz*dsz × log(MI_BINS²) so 1e9 is far above any real value and
+// far below any ±inf surrogate produced by int overflow.
+fn phi16_all_finite(v: array) -> bool {
+    let n = len(v)
+    if n != 16 { return false }
+    let mut i = 0
+    while i < n {
+        let x = v[i]
+        let ax = if x < 0.0 { 0.0 - x } else { x }
+        if ax > 1.0e9 { return false }
+        i = i + 1
+    }
+    return true
+}

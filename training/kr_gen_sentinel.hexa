@@ -1,0 +1,367 @@
+// training/kr_gen_sentinel.hexa — r9-style mode-collapse detector for kr_gen output
+// ============================================================================
+//
+// PURPOSE
+//   Post-step kr_gen sentinel. The r9 14B run collapsed undetected for 5000+
+//   steps until post-training kr_gen revealed JSON-bracket / char-loop /
+//   quoted-space spam. Trainer must abort earlier. This sentinel exits 2 on
+//   detected collapse, 0 on clean — B1's launch script branches on the exit.
+//
+// INPUT  (arg1): path to a JSON file with shape
+//     [ {"prompt": "...", "gen": "..."}, ... ]                    (≥1 sample)
+//   Shape conforming to shared/state/r9_collapse_diagnosis.json
+//   kr_gen_r4 / kr_gen_r9 sections (5-sample 0.5B greedy generation).
+//
+// OUTPUT (stdout — single line, ASCII only):
+//     [sentinel] VERDICT=<CLEAN|COLLAPSED> samples=<N> flagged=<M>
+//                signature_hits=<bracket=X, charloop=Y, spaceloop=Z,
+//                                rolebleed=W, qmark=V>
+//   plus exit code 0 (clean), 2 (collapse), 1 (input error).
+//
+// DECISION RULE
+//   flagged = count of samples where ≥1 signature fires.
+//   COLLAPSED when flagged >= 3 (out of typical 5).  Uses >=3 absolute count,
+//   not ratio — matches the B6 spec default threshold and avoids 2/4 false
+//   positives on shorter prompt banks.
+//
+// SIGNATURE THRESHOLDS (byte-level counts — multibyte Korean is byte-level
+// safe for repeat detection: N bytes × repeat still triggers at N×10 bytes
+// which correlates with ~3-chars×10-reps in hangul):
+//     json_bracket  : substring('{"":""}', ...) count >= 3
+//     charloop      : any single byte repeated >= 10 consecutively
+//     spaceloop     : substring("' '", ...)     count >= 5
+//     rolebleed     : contains "roleassistant" OR "\\\\n" OR "\"},{\":\""  (≥1)
+//     qmark         : "?" byte repeated >= 5 consecutively
+//
+// CONSTRAINTS
+//   - Hexa-native only. Line-based JSON walker — no byte-index substring
+//     arithmetic on multibyte content (per feedback_hexa_string_api).
+//   - Use safe_read / parse_sample probe: exit 1 on empty / malformed.
+//   - All thresholds tuned against kr_gen_r4 (expected CLEAN) and kr_gen_r9
+//     (expected COLLAPSED) from r9_collapse_diagnosis.json.
+//
+// EXIT CODES
+//   0 = CLEAN (< 3 samples flagged)
+//   1 = input missing / unreadable / empty array / malformed
+//   2 = COLLAPSED (>= 3 samples flagged) — trainer must abort.
+
+// =====================================================================
+// Safe file read (per feedback_hexa_string_api)
+// =====================================================================
+
+fn safe_read(path: string) -> string {
+    let raw = read_file(path)
+    let parts = raw.split("\n")
+    if parts.len() == 1 && parts[0] == "" { return "" }
+    return raw
+}
+
+// Byte probe (stage0-safe): char_code(s, 0) returns byte code of first byte
+// of whatever substring we pass; slice i..i+1 isolates one byte.
+fn byte_at(s: string, i: int) -> int {
+    let sub = s.substring(i, i + 1)
+    return char_code(sub, 0)
+}
+
+// Count non-overlapping substring occurrences (ASCII needle — byte-equivalent)
+fn count_occurrences(hay: string, needle: string) -> int {
+    let nlen = len(needle)
+    if nlen == 0 { return 0 }
+    let mut count = 0
+    let mut pos = 0
+    let hlen = len(hay)
+    while pos < hlen {
+        let slice = hay.substring(pos, hlen)
+        let at = slice.index_of(needle)
+        if at < 0 { return count }
+        count = count + 1
+        pos = pos + at + nlen
+    }
+    return count
+}
+
+// Max consecutive run of a single byte (ASCII-only needle).  Returns the
+// maximum run length seen anywhere in the string.
+fn max_byte_run(s: string, target_byte: int) -> int {
+    let n = len(s)
+    let mut best = 0
+    let mut cur = 0
+    let mut i = 0
+    while i < n {
+        let b = byte_at(s, i)
+        if b == target_byte {
+            cur = cur + 1
+            if cur > best { best = cur }
+        } else {
+            cur = 0
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// Max consecutive run of ANY single byte in the input. Used for charloop —
+// "nnnnn..." (ASCII) and "로로로..." (multibyte lead byte repeat both fire).
+fn max_any_byte_run(s: string) -> int {
+    let n = len(s)
+    if n == 0 { return 0 }
+    let mut best = 1
+    let mut cur = 1
+    let mut prev = byte_at(s, 0)
+    let mut i = 1
+    while i < n {
+        let b = byte_at(s, i)
+        if b == prev {
+            cur = cur + 1
+            if cur > best { best = cur }
+        } else {
+            cur = 1
+            prev = b
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// =====================================================================
+// Per-sample signature detection
+// Returns a 5-int list [bracket, charloop, spaceloop, rolebleed, qmark]
+// where each entry is 0/1 (signature fired for this sample).
+// =====================================================================
+
+fn detect_signatures(gen: string) -> [int] {
+    let mut hits = [0, 0, 0, 0, 0]
+
+    // 1. JSON-bracket repeat: '{"":""}' >= 3
+    let bracket_count = count_occurrences(gen, "{\"\":\"\"}")
+    if bracket_count >= 3 { hits = [1, hits[1], hits[2], hits[3], hits[4]] }
+
+    // 2. Char-loop: any byte repeated >= 10 in a row
+    //    Korean chars are 3-byte; leading byte (0xEA–0xED) repeats same on
+    //    "로로로로로로로로로로" (10×) → 10 consecutive lead bytes with
+    //    continuation bytes interleaved. We detect the 10+ run of ANY byte;
+    //    "nnnnn..." satisfies at 10+ 'n's. For hangul-repeat the continuation
+    //    byte (middle of codepoint) also repeats, so charloop fires reliably.
+    let runmax = max_any_byte_run(gen)
+    if runmax >= 10 { hits = [hits[0], 1, hits[2], hits[3], hits[4]] }
+
+    // 3. Space-quote loop: "' '" >= 5
+    let spaceloop_count = count_occurrences(gen, "' '")
+    if spaceloop_count >= 5 { hits = [hits[0], hits[1], 1, hits[3], hits[4]] }
+
+    // 4. Role-marker bleed: any of three markers present (>= 1)
+    let role_hit = gen.index_of("roleassistant")
+    let nl_hit = gen.index_of("\\\\n")
+    let jf_hit = gen.index_of("\"},{\":\"")
+    if role_hit >= 0 || nl_hit >= 0 || jf_hit >= 0 {
+        hits = [hits[0], hits[1], hits[2], 1, hits[4]]
+    }
+
+    // 5. Question-mark spam: '?' >= 5 consecutive
+    let qmark_run = max_byte_run(gen, 63)  // ASCII '?'
+    if qmark_run >= 5 { hits = [hits[0], hits[1], hits[2], hits[3], 1] }
+
+    return hits
+}
+
+// =====================================================================
+// JSON array parser — extracts gen strings via line-based walker.
+//
+// The input file is either
+//   (a) pretty-printed JSON with one sample block per line run, e.g.:
+//         [
+//           {"prompt": "안녕하세요", "gen": "..."},
+//           ...
+//         ]
+//   (b) single-line compact JSON (fallback).
+//
+// Strategy (per feedback_hexa_string_api, avoid multibyte substring math):
+//   - For each line, look for the token `"gen":"` or `"gen": "` and, from
+//     the first `"` after that token, walk forward tracking backslash
+//     escape state until the closing unescaped `"`.
+//   - The walker uses byte_at to step one byte at a time. Korean UTF-8
+//     continuation bytes all fall in 0x80..0xBF so they NEVER collide with
+//     `\\` (0x5C) or `"` (0x22). Byte-level walking through hangul is safe
+//     for quote-boundary detection.
+// =====================================================================
+
+// Find the closing-quote byte offset for the string literal whose opening
+// quote is at `start_byte`, respecting backslash escapes. Returns -1 if
+// unterminated.
+fn find_close_quote(line: string, start_byte: int) -> int {
+    let n = len(line)
+    let mut i = start_byte + 1
+    while i < n {
+        let b = byte_at(line, i)
+        if b == 92 {          // backslash — skip the escaped byte
+            i = i + 2
+        } else if b == 34 {   // closing quote
+            return i
+        } else {
+            i = i + 1
+        }
+    }
+    return -1
+}
+
+// Extract and JSON-decode the body of the `"gen"` value starting at byte
+// offset `start_byte` (pointing at the opening quote of the gen value).
+// Decodes \" \\ \n \t \r \/  (sufficient for our signature needles).
+// Unicode \uXXXX is passed through as-is (r4/r9 kr_gen never emits \u).
+fn extract_quoted(line: string, start_byte: int) -> string {
+    let n = len(line)
+    if start_byte >= n { return "" }
+    let mut i = start_byte + 1
+    let mut parts = []
+    let mut run_start = i
+    while i < n {
+        let b = byte_at(line, i)
+        if b == 34 {  // closing quote (unescaped)
+            parts = parts.push(line.substring(run_start, i))
+            return parts.join("")
+        }
+        if b == 92 {  // backslash — decode escape
+            if run_start < i { parts = parts.push(line.substring(run_start, i)) }
+            if i + 1 >= n { return parts.join("") }
+            let nb = byte_at(line, i + 1)
+            if nb == 34 { parts = parts.push("\"") }        // \" → "
+            else if nb == 92 { parts = parts.push("\\") }  // \\ → \
+            else if nb == 110 { parts = parts.push("\n") } // \n
+            else if nb == 116 { parts = parts.push("\t") } // \t
+            else if nb == 114 { parts = parts.push("\r") } // \r
+            else if nb == 47 { parts = parts.push("/") }   // \/
+            else {
+                // Unknown escape — preserve as-is (2 bytes)
+                parts = parts.push(line.substring(i, i + 2))
+            }
+            i = i + 2
+            run_start = i
+        } else {
+            i = i + 1
+        }
+    }
+    // unterminated — flush
+    if run_start < n { parts = parts.push(line.substring(run_start, n)) }
+    return parts.join("")
+}
+
+// Find the byte offset of the `"gen"` value's OPENING quote within `line`,
+// or -1 if this line does not carry a gen field. Accepts `"gen":"...` and
+// `"gen": "...` (optional space).
+fn find_gen_open(line: string) -> int {
+    let key_a = "\"gen\":\""
+    let key_b = "\"gen\": \""
+    let pa = line.index_of(key_a)
+    let pb = line.index_of(key_b)
+    if pa >= 0 {
+        // opening quote is at pa + 6  (len("\"gen\":") = 6 — the quote right after :)
+        return pa + 6
+    }
+    if pb >= 0 {
+        return pb + 7
+    }
+    return -1
+}
+
+// Parse the input JSON file into a list of `gen` strings.
+// Returns [] if no gen samples found.
+fn parse_samples(raw: string) -> [string] {
+    let mut out = []
+    // Line-based walker — one gen field per line in the pretty printed
+    // diagnosis file, or whole thing on one line for compact form.
+    let lines = raw.split("\n")
+    let mut li = 0
+    while li < lines.len() {
+        let line = lines[li]
+        // Multiple gen fields MAY appear on a single line (compact JSON).
+        // Walk the line repeatedly: find gen_open, extract, then continue
+        // scanning the remainder.
+        let mut cursor = 0
+        let n = len(line)
+        while cursor < n {
+            let slice = line.substring(cursor, n)
+            let rel = find_gen_open(slice)
+            if rel < 0 { cursor = n }
+            else {
+                let gen_start = cursor + rel
+                let body = extract_quoted(line, gen_start)
+                out = out.push(body)
+                // Advance cursor past the closing `"` in the SOURCE (the
+                // decoded body length may differ from source span).
+                let close = find_close_quote(line, gen_start)
+                if close < 0 { cursor = n }
+                else { cursor = close + 1 }
+            }
+        }
+        li = li + 1
+    }
+    return out
+}
+
+// =====================================================================
+// Main
+// =====================================================================
+
+fn main() {
+    // args() returns [binary, script, user_args...]. User arg1 is at index 2.
+    let argv = args()
+    if argv.len() < 3 {
+        print_err("[sentinel] ERROR: missing arg1 (path to kr_gen JSON)")
+        exit(1)
+    }
+    let path = argv[2]
+    let raw = safe_read(path)
+    if raw == "" {
+        print_err("[sentinel] ERROR: cannot read or empty: " + path)
+        exit(1)
+    }
+
+    let samples = parse_samples(raw)
+    let n_samples = samples.len()
+    if n_samples == 0 {
+        print_err("[sentinel] ERROR: no gen samples found in " + path)
+        exit(1)
+    }
+
+    let mut flagged = 0
+    let mut hit_bracket = 0
+    let mut hit_charloop = 0
+    let mut hit_spaceloop = 0
+    let mut hit_rolebleed = 0
+    let mut hit_qmark = 0
+
+    let mut i = 0
+    while i < n_samples {
+        let gen = samples[i]
+        let sigs = detect_signatures(gen)
+        let b = sigs[0]
+        let c = sigs[1]
+        let s = sigs[2]
+        let r = sigs[3]
+        let q = sigs[4]
+        hit_bracket = hit_bracket + b
+        hit_charloop = hit_charloop + c
+        hit_spaceloop = hit_spaceloop + s
+        hit_rolebleed = hit_rolebleed + r
+        hit_qmark = hit_qmark + q
+        if (b + c + s + r + q) >= 1 { flagged = flagged + 1 }
+        i = i + 1
+    }
+
+    let verdict = if flagged >= 3 { "COLLAPSED" } else { "CLEAN" }
+
+    let line = "[sentinel] VERDICT=" + verdict
+        + " samples=" + to_string(n_samples)
+        + " flagged=" + to_string(flagged)
+        + " signature_hits=<bracket=" + to_string(hit_bracket)
+        + ", charloop=" + to_string(hit_charloop)
+        + ", spaceloop=" + to_string(hit_spaceloop)
+        + ", rolebleed=" + to_string(hit_rolebleed)
+        + ", qmark=" + to_string(hit_qmark) + ">"
+    println(line)
+
+    if flagged >= 3 { exit(2) }
+    exit(0)
+}
+
+main()

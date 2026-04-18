@@ -1,0 +1,365 @@
+// training/alm_dream_loop.hexa — BUNDLE 4 / P13 dream consciousness
+//
+// 3-phase scheduler (awake -> SWS -> REM -> awake), 90-step cycle
+// with 60/20/10 split.
+//
+// Distinct from training/alm_dream_phase.hexa (which uses 20/15/10 = 45-step
+// test-scale cycle). This file is the production-grade scheduler:
+//
+//   awake : 60 steps   (waking activity)
+//   SWS   : 20 steps   (slow-wave sleep, memory consolidation window)
+//   REM   : 10 steps   (rapid-eye-movement, narrative dream window)
+//   total : 90 steps per full cycle
+//
+// API contract:
+//   step(state) -> next_state
+//
+// State layout (flat float array, size=4 — avoids the struct-list aliasing bug
+// documented in feedback_hexa_struct_list_alias.md):
+//   state[0] = phase_id        (0=awake, 1=SWS, 2=REM)
+//   state[1] = steps_in_phase  (resets on transition)
+//   state[2] = total_steps     (monotonic)
+//   state[3] = cycle_count     (incremented on REM->awake transition)
+//
+// 5/5 self-test stability over 10 cycles:
+//   T1: dim contract — state has length 4, initial values correct
+//   T2: determinism — two independent runs identical for 200 steps
+//   T3: latency — single step < 50 ms
+//   T4: edge case — step from final REM step transitions to awake + cycles+1
+//   T5: 3-phase coverage over 10 cycles — visits all 3 phases the right
+//       number of steps and completes exactly 10 cycle_count increments.
+//
+// Stage0 constraints honored:
+//   - flat array state, no struct-of-array
+//   - lists pass-by-value, rebuild + return
+//   - no `&&` chains
+//   - single-line returns
+//   - no Python/Rust/GPU
+//
+// Run:
+//   hexa run training/alm_dream_loop.hexa
+// Expect:
+//   [alm_dream_loop] ALL 5/5 PASS
+
+// ─── Constants ────────────────────────────────────────────────
+
+let PHASE_AWAKE = 0
+let PHASE_SWS   = 1
+let PHASE_REM   = 2
+
+let DUR_AWAKE = 60
+let DUR_SWS   = 20
+let DUR_REM   = 10
+let CYCLE_LEN = 90   // 60 + 20 + 10
+
+let STATE_LEN = 4
+let IDX_PHASE  = 0
+let IDX_SIP    = 1
+let IDX_TOTAL  = 2
+let IDX_CYCLES = 3
+
+// ─── State helpers ────────────────────────────────────────────
+
+fn dream_loop_new() -> array {
+    let mut s = []
+    s = s.push(0.0)   // phase_id = awake
+    s = s.push(0.0)   // steps_in_phase
+    s = s.push(0.0)   // total_steps
+    s = s.push(0.0)   // cycle_count
+    return s
+}
+
+fn st_phase(s: array) -> int {
+    return to_int(s[IDX_PHASE])
+}
+
+fn st_sip(s: array) -> int {
+    return to_int(s[IDX_SIP])
+}
+
+fn st_total(s: array) -> int {
+    return to_int(s[IDX_TOTAL])
+}
+
+fn st_cycles(s: array) -> int {
+    return to_int(s[IDX_CYCLES])
+}
+
+fn st_make(phase: int, sip: int, total: int, cycles: int) -> array {
+    let mut out = []
+    out = out.push(to_float(phase))
+    out = out.push(to_float(sip))
+    out = out.push(to_float(total))
+    out = out.push(to_float(cycles))
+    return out
+}
+
+fn phase_name(id: int) -> string {
+    if id == 0 { return "awake" }
+    if id == 1 { return "SWS" }
+    if id == 2 { return "REM" }
+    return "unknown"
+}
+
+fn phase_duration(p: int) -> int {
+    if p == 0 { return DUR_AWAKE }
+    if p == 1 { return DUR_SWS }
+    return DUR_REM
+}
+
+// ─── Core step (the public API) ───────────────────────────────
+// step(state) -> next_state
+//
+// Increments steps_in_phase and total_steps. When steps_in_phase reaches
+// the current phase's duration, transitions awake->SWS->REM->awake.
+// On REM->awake transition, cycle_count is incremented.
+
+fn step(s: array) -> array {
+    let phase = st_phase(s)
+    let sip   = st_sip(s) + 1
+    let total = st_total(s) + 1
+    let cyc   = st_cycles(s)
+    let dur   = phase_duration(phase)
+    if sip >= dur {
+        let next_phase = (phase + 1) % 3
+        // cycle increments specifically on REM(2) -> awake(0) wraparound
+        let mut next_cyc = cyc
+        if phase == 2 { next_cyc = cyc + 1 }
+        return st_make(next_phase, 0, total, next_cyc)
+    }
+    return st_make(phase, sip, total, cyc)
+}
+
+// Convenience: run n steps from an initial state.
+fn run_n(s_in: array, n: int) -> array {
+    let mut s = s_in
+    let mut i = 0
+    while i < n {
+        s = step(s)
+        i = i + 1
+    }
+    return s
+}
+
+// ─── Self-tests ───────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // T1: dim contract — state length=4, initial state correct.
+    let s = dream_loop_new()
+    if len(s) != STATE_LEN {
+        println("  [T1] FAIL — state length " + str(len(s)) + " != " + str(STATE_LEN))
+        return false
+    }
+    if st_phase(s) != PHASE_AWAKE {
+        println("  [T1] FAIL — initial phase != awake")
+        return false
+    }
+    if st_sip(s) != 0 {
+        println("  [T1] FAIL — initial sip != 0")
+        return false
+    }
+    if st_total(s) != 0 {
+        println("  [T1] FAIL — initial total != 0")
+        return false
+    }
+    if st_cycles(s) != 0 {
+        println("  [T1] FAIL — initial cycles != 0")
+        return false
+    }
+    // Verify step() also returns 4-float array.
+    let s2 = step(s)
+    if len(s2) != STATE_LEN {
+        println("  [T1] FAIL — step output length " + str(len(s2)) + " != " + str(STATE_LEN))
+        return false
+    }
+    println("  [T1] dim contract OK — state=4 floats, step preserves shape")
+    return true
+}
+
+fn check_T2() -> bool {
+    // T2: determinism — two runs identical over 200 steps.
+    let n = 200
+    let mut a = dream_loop_new()
+    let mut b = dream_loop_new()
+    let mut i = 0
+    while i < n {
+        a = step(a)
+        b = step(b)
+        i = i + 1
+    }
+    let pa = st_phase(a)
+    let pb = st_phase(b)
+    let ta = st_total(a)
+    let tb = st_total(b)
+    let ca = st_cycles(a)
+    let cb = st_cycles(b)
+    let sa = st_sip(a)
+    let sb = st_sip(b)
+    if pa != pb {
+        println("  [T2] FAIL — phase mismatch")
+        return false
+    }
+    if ta != tb {
+        println("  [T2] FAIL — total mismatch")
+        return false
+    }
+    if ca != cb {
+        println("  [T2] FAIL — cycles mismatch")
+        return false
+    }
+    if sa != sb {
+        println("  [T2] FAIL — sip mismatch")
+        return false
+    }
+    println("  [T2] deterministic — both runs at phase=" + phase_name(pa) + " total=" + str(ta) + " cycles=" + str(ca))
+    return true
+}
+
+fn check_T3() -> bool {
+    // T3: latency — single step < 50 ms.
+    // Measure 1000 steps and divide; clock() granularity is coarse.
+    let s0 = dream_loop_new()
+    let n = 1000
+    let t0 = clock()
+    let s_end = run_n(s0, n)
+    let t1 = clock()
+    let total_ms = (t1 - t0) * 1000.0
+    let per_step_ms = total_ms / to_float(n)
+    println("  [T3] " + str(n) + " steps in " + str(total_ms) + " ms (per step " + str(per_step_ms) + " ms, limit 50 ms)")
+    if per_step_ms >= 50.0 {
+        println("  [T3] FAIL — per-step latency " + str(per_step_ms) + " ms >= 50 ms")
+        return false
+    }
+    // Use s_end so the compiler doesn't elide the loop.
+    if st_total(s_end) != n {
+        println("  [T3] FAIL — total_steps " + str(st_total(s_end)) + " != " + str(n))
+        return false
+    }
+    return true
+}
+
+fn check_T4() -> bool {
+    // T4: edge case — stepping from the LAST REM step lands on awake +
+    // increments cycle_count. Run exactly CYCLE_LEN-1 steps to be one
+    // step inside the final REM tick; one more step wraps around.
+    let s_in = dream_loop_new()
+    // After (CYCLE_LEN - 1) steps: phase=REM, sip=DUR_REM-1.
+    let s_pre = run_n(s_in, CYCLE_LEN - 1)
+    let p_pre = st_phase(s_pre)
+    let sip_pre = st_sip(s_pre)
+    let cyc_pre = st_cycles(s_pre)
+    println("  [T4] pre-wrap: phase=" + phase_name(p_pre) + " sip=" + str(sip_pre) + " cycles=" + str(cyc_pre))
+    if p_pre != PHASE_REM {
+        println("  [T4] FAIL — pre-wrap phase " + phase_name(p_pre) + " != REM")
+        return false
+    }
+    if sip_pre != (DUR_REM - 1) {
+        println("  [T4] FAIL — pre-wrap sip " + str(sip_pre) + " != " + str(DUR_REM - 1))
+        return false
+    }
+    // One more step should wrap to awake and bump cycles.
+    let s_post = step(s_pre)
+    let p_post = st_phase(s_post)
+    let cyc_post = st_cycles(s_post)
+    println("  [T4] post-wrap: phase=" + phase_name(p_post) + " cycles=" + str(cyc_post))
+    if p_post != PHASE_AWAKE {
+        println("  [T4] FAIL — post-wrap phase " + phase_name(p_post) + " != awake")
+        return false
+    }
+    if cyc_post != (cyc_pre + 1) {
+        println("  [T4] FAIL — cycle_count not incremented on REM->awake")
+        return false
+    }
+    return true
+}
+
+fn check_T5() -> bool {
+    // T5: 3-phase coverage — over 10 full cycles (10 * 90 = 900 steps),
+    // count how many steps were spent in each phase. Expect:
+    //   awake : 600   (= 10 * 60)
+    //   SWS   : 200   (= 10 * 20)
+    //   REM   : 100   (= 10 * 10)
+    //   cycle_count after 900 steps : 10
+    //   final phase : awake (phase_id 0)
+    let n_cycles = 10
+    let n_steps = n_cycles * CYCLE_LEN
+    // Stage0 has no array.set() — use separate scalar counters.
+    let mut n_awake = 0
+    let mut n_sws = 0
+    let mut n_rem = 0
+    let mut s = dream_loop_new()
+    let mut i = 0
+    while i < n_steps {
+        // Count the phase BEFORE the step — this is the phase we are about
+        // to "spend" this step in. (After step(), phase may have rolled.)
+        let p = st_phase(s)
+        if p == 0 { n_awake = n_awake + 1 }
+        if p == 1 { n_sws = n_sws + 1 }
+        if p == 2 { n_rem = n_rem + 1 }
+        s = step(s)
+        i = i + 1
+    }
+    let cyc_end = st_cycles(s)
+    let p_end   = st_phase(s)
+    println("  [T5] over " + str(n_cycles) + " cycles (" + str(n_steps) + " steps):")
+    println("       awake=" + str(n_awake) + " (expect " + str(n_cycles * DUR_AWAKE) + ")")
+    println("       SWS  =" + str(n_sws) + " (expect " + str(n_cycles * DUR_SWS) + ")")
+    println("       REM  =" + str(n_rem) + " (expect " + str(n_cycles * DUR_REM) + ")")
+    println("       cycles=" + str(cyc_end) + " (expect " + str(n_cycles) + "), final phase=" + phase_name(p_end))
+    if n_awake != (n_cycles * DUR_AWAKE) {
+        println("  [T5] FAIL — awake count mismatch")
+        return false
+    }
+    if n_sws != (n_cycles * DUR_SWS) {
+        println("  [T5] FAIL — SWS count mismatch")
+        return false
+    }
+    if n_rem != (n_cycles * DUR_REM) {
+        println("  [T5] FAIL — REM count mismatch")
+        return false
+    }
+    if cyc_end != n_cycles {
+        println("  [T5] FAIL — cycle_count " + str(cyc_end) + " != " + str(n_cycles))
+        return false
+    }
+    if p_end != PHASE_AWAKE {
+        println("  [T5] FAIL — final phase not awake")
+        return false
+    }
+    return true
+}
+
+// ─── Main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[alm_dream_loop] BUNDLE 4 / P13 — 3-phase dream scheduler")
+    println("  cycle = awake(" + str(DUR_AWAKE) + ") -> SWS(" + str(DUR_SWS) + ") -> REM(" + str(DUR_REM) + ")  total=" + str(CYCLE_LEN))
+    println("  api: step(state[4]) -> next_state[4]")
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[alm_dream_loop] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[alm_dream_loop] ALL 5/5 PASS")
+    } else {
+        println("[alm_dream_loop] SOME FAILED")
+    }
+}
+
+main()

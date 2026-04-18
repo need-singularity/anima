@@ -1,0 +1,174 @@
+// training/parquet_to_jsonl.hexa — C1 parquet→jsonl bridge
+//
+// Task: convert kowiki parquet shards to jsonl for corpus_ingest.
+//
+// Hexa has no parquet reader. We bridge through duckdb CLI (installed via
+// brew) using streaming COPY TO — no row is held in the hexa process memory,
+// the whole pipeline fits under the 4GB RSS cap (safe_hexa_launchd).
+//
+// Strategy:
+//   1. Detect a parquet reader: duckdb (preferred) or parquet-tools (fallback).
+//   2. Use `duckdb -c "COPY (SELECT title, text FROM read_parquet('...')) TO
+//      'out.jsonl' (FORMAT JSON, ARRAY false)"` — duckdb streams row-by-row,
+//      writing jsonl lines directly.  hexa never touches the row payloads.
+//   3. Verify output exists and non-empty, return line count + byte count.
+//
+// Run:
+//   $HEXA training/parquet_to_jsonl.hexa
+//
+// Inputs:
+//   training/corpus_auto/raw/kowiki/20231101.ko/*.parquet
+//
+// Output:
+//   training/corpus_auto/kowiki.jsonl
+
+let ANIMA_ROOT   = "/Users/ghost/Dev/anima"
+let PARQUET_GLOB = "/Users/ghost/Dev/anima/training/corpus_auto/raw/kowiki/20231101.ko/*.parquet"
+let OUT_DIR      = "/Users/ghost/Dev/anima/training/corpus_auto"
+let OUT_JSONL    = "/Users/ghost/Dev/anima/training/corpus_auto/kowiki.jsonl"
+
+// =====================================================================
+// helpers
+// =====================================================================
+
+fn which(tool: string) -> string {
+    let p = exec("command -v " + tool + " 2>/dev/null").trim()
+    return p
+}
+
+fn file_bytes(path: string) -> int {
+    if file_exists(path) == false { return 0 }
+    let s = exec("wc -c < '" + path + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+fn file_lines(path: string) -> int {
+    if file_exists(path) == false { return 0 }
+    let s = exec("wc -l < '" + path + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+fn ensure_dir(path: string) {
+    let _ = exec("mkdir -p '" + path + "'")
+}
+
+// =====================================================================
+// duckdb path
+// =====================================================================
+
+// duckdb streams COPY ... TO  row-by-row — no whole-parquet load in memory.
+// FORMAT JSON + ARRAY false emits one {"title":..,"text":..} object per line.
+fn run_duckdb(duckdb_bin: string) -> bool {
+    // remove prior output — fresh write so wc -l reflects this run only.
+    let _ = exec("rm -f '" + OUT_JSONL + "'")
+
+    let sql = "COPY (SELECT title, text FROM read_parquet('" + PARQUET_GLOB + "')) TO '" + OUT_JSONL + "' (FORMAT JSON, ARRAY false)"
+    // -c executes SQL and exits; no repl memory retained across parquet files.
+    let cmd = "'" + duckdb_bin + "' -c \"" + sql + "\" 2>&1"
+    println("[duck] exec: " + cmd)
+    let out = exec(cmd)
+    let trimmed = out.trim()
+    if trimmed != "" {
+        println("[duck] stdout/stderr: " + trimmed)
+    }
+    if file_exists(OUT_JSONL) == false {
+        println("[duck] FAIL: output file not created")
+        return false
+    }
+    let b = file_bytes(OUT_JSONL)
+    if b <= 0 {
+        println("[duck] FAIL: output empty")
+        return false
+    }
+    return true
+}
+
+// =====================================================================
+// parquet-tools fallback
+// =====================================================================
+
+// parquet-tools cat --json prints one JSON object per row (no array wrap).
+// We iterate each parquet file and append to the output, keeping only
+// {"title","text"} via jq.  This is row-streamed by parquet-tools itself.
+fn run_parquet_tools(pt_bin: string, jq_bin: string) -> bool {
+    let _ = exec("rm -f '" + OUT_JSONL + "'")
+
+    // list parquet files explicitly — no whole-dir load in hexa memory
+    let lst = exec("ls -1 " + PARQUET_GLOB + " 2>/dev/null").trim()
+    if lst == "" {
+        println("[pt] FAIL: no parquet files matched glob")
+        return false
+    }
+    let files = lst.split("\n")
+    let n = len(files)
+    let mut i = 0
+    while i < n {
+        let f = files[i].trim()
+        if f == "" {
+            i = i + 1
+            continue
+        }
+        // pt cat emits row-per-line json; jq reduces to {title,text}; >> appends.
+        let cmd = "'" + pt_bin + "' cat --json '" + f + "' | '" + jq_bin + "' -c '{title: .title, text: .text}' >> '" + OUT_JSONL + "'"
+        println("[pt] " + cmd)
+        let _ = exec(cmd)
+        i = i + 1
+    }
+    if file_exists(OUT_JSONL) == false { return false }
+    return file_bytes(OUT_JSONL) > 0
+}
+
+// =====================================================================
+// main
+// =====================================================================
+
+fn main() {
+    println("=== C1 parquet_to_jsonl — kowiki bridge ===")
+    ensure_dir(OUT_DIR)
+
+    // preflight: verify input parquets exist
+    let ls_raw = exec("ls -1 " + PARQUET_GLOB + " 2>/dev/null").trim()
+    if ls_raw == "" {
+        println("[c1] FATAL: no parquet files at " + PARQUET_GLOB)
+        return
+    }
+    let shards = ls_raw.split("\n")
+    println("[c1] input shards: " + to_string(len(shards)))
+
+    // tool probe
+    let duckdb_bin = which("duckdb")
+    let pt_bin     = which("parquet-tools")
+    let jq_bin     = which("jq")
+
+    println("[c1] duckdb:        " + (if duckdb_bin == "" { "MISSING" } else { duckdb_bin }))
+    println("[c1] parquet-tools: " + (if pt_bin == "" { "MISSING" } else { pt_bin }))
+    println("[c1] jq:            " + (if jq_bin == "" { "MISSING" } else { jq_bin }))
+
+    let mut ok = false
+    if duckdb_bin != "" {
+        ok = run_duckdb(duckdb_bin)
+    } else if pt_bin != "" && jq_bin != "" {
+        ok = run_parquet_tools(pt_bin, jq_bin)
+    } else {
+        println("[c1] BLOCKER: neither duckdb nor parquet-tools+jq available.")
+        println("[c1] Install: brew install duckdb")
+        return
+    }
+
+    if ok == false {
+        println("[c1] FAIL: extraction aborted")
+        return
+    }
+
+    let out_bytes = file_bytes(OUT_JSONL)
+    let out_lines = file_lines(OUT_JSONL)
+    println("")
+    println("=== DONE ===")
+    println("output:  " + OUT_JSONL)
+    println("bytes:   " + to_string(out_bytes))
+    println("lines:   " + to_string(out_lines))
+}
+
+main()

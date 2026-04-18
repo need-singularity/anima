@@ -1,0 +1,458 @@
+// training/runpod_autopilot.hexa — RunPod lifecycle autopilot (hexa-native orchestrator)
+// ============================================================================
+//
+// PURPOSE
+//   Replaces the manual runpod workflow. One entry point drives the full
+//   lifecycle_stages from runpod_autopilot.json:
+//     create → bootstrap → train → monitor → sentinel → crash_recover →
+//     ckpt_save → r2_upload → teardown → next_round
+//
+// DESIGN
+//   - All rules come from shared/config/runpod_autopilot.json (no magic strings)
+//   - Secrets come from shared/config/secrets_registry.json → $HOME/Dev/secret
+//   - Run locally on laptop (on-pod calls are via runpodctl/ssh)
+//   - Import depth ≤2 hops (feedback_hexa_silent_exit_5_imports) — self-contained
+//
+// USAGE
+//   hexa training/runpod_autopilot.hexa <subcommand> [args]
+//
+//   Subcommands:
+//     create <model_tag> <round>        — create pod + bootstrap
+//     bootstrap <pod_ip> <pod_port>     — scp + remote bootstrap
+//     monitor <pod_ip> <pod_port> <run_id>
+//                                        — poll watchdog status file
+//     crash_recover <log_path>          — match known_bugs, emit fix patch
+//     upload_and_teardown <pod_id> <model_tag> <round> <run_id>
+//                                        — R2 upload + verify + runpodctl remove
+//     next_round                         — read queue, dispatch next pending entry
+//     run <model_tag> <round>            — full pipeline (all stages)
+//
+// SAFETY
+//   - pod teardown dry-run default: set AUTOPILOT_DRY_RUN=0 to actually remove
+//   - If E5/human active on the pod, autopilot refuses to touch it (lock file)
+//
+// DEPENDENCIES (all hexa builtins or system CLI via exec)
+//   runpodctl (local CLI with ~/.runpod/config.toml)
+//   rclone    (local CLI with r2 remote)
+//   ssh/scp   (OpenSSH)
+//   curl      (RunPod REST API optional path)
+
+// =====================================================================
+// SSOT loader — reads runpod_autopilot.json once into a cached string.
+// Hexa JSON parser varies by build, so we use line-grep for scalar rules
+// (feedback_hexa_string_api — byte-safe string ops only).
+// =====================================================================
+
+fn ssot_path() -> string {
+    return "/Users/ghost/Dev/anima/shared/config/runpod_autopilot.json"
+}
+
+fn queue_path() -> string {
+    return "/Users/ghost/Dev/anima/shared/config/training_queue.json"
+}
+
+fn incidents_path() -> string {
+    return "/Users/ghost/Dev/anima/shared/state/runpod_incidents.jsonl"
+}
+
+fn read_ssot() -> string {
+    return read_file(ssot_path())
+}
+
+// Append one JSONL incident (feedback_troubleshoot_ossified)
+fn log_incident(pod_id: string, run_id: string, stage: string, event: string, root_cause: string, action: string) {
+    let ts_script = "/tmp/_autopilot_ts.sh"
+    write_file(ts_script, "#!/bin/sh\ndate -u +%FT%TZ > /tmp/_autopilot_ts.out\n")
+    exec("chmod +x " + ts_script)
+    exec(ts_script)
+    let ts = read_file("/tmp/_autopilot_ts.out").trim()
+
+    let line = "{\"timestamp\":\"" + ts + "\"," +
+        "\"pod_id\":\"" + pod_id + "\"," +
+        "\"run_id\":\"" + run_id + "\"," +
+        "\"stage\":\"" + stage + "\"," +
+        "\"event\":\"" + event + "\"," +
+        "\"root_cause\":\"" + root_cause + "\"," +
+        "\"autopilot_action_taken\":\"" + action + "\"}\n"
+
+    let append_script = "/tmp/_autopilot_incident.sh"
+    let escaped = line.replace("\"", "\\\"")
+    write_file(append_script,
+        "#!/bin/sh\n" +
+        "cat >> \"" + incidents_path() + "\" <<'INCIDENT_EOF'\n" +
+        line +
+        "INCIDENT_EOF\n"
+    )
+    exec("chmod +x " + append_script)
+    exec(append_script)
+}
+
+// =====================================================================
+// Secrets loader — resolves runpod API key from secrets_registry.json
+// =====================================================================
+
+fn runpod_api_key() -> string {
+    // Per secrets_registry.json, actual key lives in $HOME/Dev/secret/README.md § 10
+    // For automation we look at either:
+    //   1. env RUNPOD_API_KEY
+    //   2. ~/.runpod/config.toml (runpodctl config)
+    //   3. $HOME/Dev/secret/runpod_api_key  (plaintext one-liner — optional)
+    let env_key = env("RUNPOD_API_KEY")
+    if env_key != "" { return env_key }
+
+    let script = "/tmp/_autopilot_key.sh"
+    write_file(script,
+        "#!/bin/sh\n" +
+        "if [ -f $HOME/Dev/secret/runpod_api_key ]; then\n" +
+        "  cat $HOME/Dev/secret/runpod_api_key | tr -d '\\n' > /tmp/_autopilot_key.out\n" +
+        "elif [ -f $HOME/.runpod/config.toml ]; then\n" +
+        "  grep -E '^apiKey' $HOME/.runpod/config.toml | sed 's/apiKey *= *//; s/\"//g; s/ //g' > /tmp/_autopilot_key.out\n" +
+        "else\n" +
+        "  echo '' > /tmp/_autopilot_key.out\n" +
+        "fi\n"
+    )
+    exec("chmod +x " + script)
+    exec(script)
+    return read_file("/tmp/_autopilot_key.out").trim()
+}
+
+// =====================================================================
+// Crash recovery — pattern matching against log tail
+// =====================================================================
+
+// Given a log file, returns the matched known_bug id (or "unknown")
+fn diagnose_crash(log_path: string) -> string {
+    if !file_exists(log_path) { return "log_missing" }
+    let tail = read_file_tail(log_path, 200)
+
+    // Known bug patterns — MUST match shared/config/runpod_autopilot.json known_bugs
+    if tail.index_of("num_logits_to_keep") >= 0 { return "num_logits_to_keep" }
+    // E6 refinement: distinguish kr_gen/generate OOM (kv-cache starvation)
+    // from batch overflow OOM (true batch too-large). Match order matters —
+    // generate-path OOM MUST be detected before the coarse cuda OOM.
+    if tail.index_of("CUDA out of memory") >= 0 {
+        if tail.index_of("run_attention") >= 0 { return "cuda_oom_kr_gen" }
+        if tail.index_of("generate") >= 0 { return "cuda_oom_kr_gen" }
+        if tail.index_of("fast_generate") >= 0 { return "cuda_oom_kr_gen" }
+        if tail.index_of("reserved by PyTorch but unallocated") >= 0 { return "cuda_oom_batch" }
+        return "cuda_oom_batch"  // default fallback for coarse OOM
+    }
+    if tail.index_of("FileNotFoundError") >= 0 && tail.index_of("corpus") >= 0 {
+        return "corpus_missing"
+    }
+    if tail.index_of("VERDICT=COLLAPSED") >= 0 { return "mode_collapse" }
+    if tail.index_of("Killed") >= 0 || tail.index_of("MemoryError") >= 0 {
+        return "mfs_quota_silent_kill"
+    }
+    return "unknown"
+}
+
+// Reading last N lines portably via tail
+fn read_file_tail(path: string, n_lines: int) -> string {
+    let out_path = "/tmp/_autopilot_tail.out"
+    let script_path = "/tmp/_autopilot_tail.sh"
+    write_file(script_path,
+        "#!/bin/sh\n" +
+        "tail -" + to_string(n_lines) + " \"" + path + "\" > " + out_path + " 2>&1\n"
+    )
+    exec("chmod +x " + script_path)
+    exec(script_path)
+    return read_file(out_path)
+}
+
+fn file_exists(path: string) -> bool {
+    let out = "/tmp/_autopilot_exists.out"
+    let script = "/tmp/_autopilot_exists.sh"
+    write_file(script,
+        "#!/bin/sh\n" +
+        "if [ -f \"" + path + "\" ]; then echo 1; else echo 0; fi > " + out + "\n"
+    )
+    exec("chmod +x " + script)
+    exec(script)
+    let r = read_file(out).trim()
+    if r == "1" { return true }
+    return false
+}
+
+// Emit fix action for a diagnosed crash id.
+// Returns "restart" | "abort" | "unknown"
+fn crash_action(bug_id: string) -> string {
+    if bug_id == "num_logits_to_keep" { return "restart" }
+    if bug_id == "cuda_oom" { return "restart" }
+    if bug_id == "cuda_oom_kr_gen" { return "restart" }
+    if bug_id == "cuda_oom_batch" { return "restart" }
+    if bug_id == "mfs_quota_silent_kill" { return "restart" }
+    if bug_id == "corpus_missing" { return "abort" }
+    if bug_id == "mode_collapse" { return "abort" }
+    return "unknown"
+}
+
+// Produce a fix command that the autopilot will execute before restart.
+fn crash_fix_command(bug_id: string, run_id: string) -> string {
+    if bug_id == "num_logits_to_keep" {
+        // Strip the kwarg from any kr_gen.py on the pod. Sentinel-side we
+        // already enforce kwarg_denylist in SSOT. This sed is idempotent.
+        return "sed -i 's/,[[:space:]]*num_logits_to_keep=[^,)]*//g; s/num_logits_to_keep=[^,)]*,[[:space:]]*//g' /workspace/kr_gen.py 2>/dev/null || true"
+    }
+    if bug_id == "cuda_oom" {
+        return "echo '[fix] drop batch by half — launcher must honor AUTOPILOT_BATCH_HALF=1' && echo AUTOPILOT_BATCH_HALF=1"
+    }
+    if bug_id == "cuda_oom_kr_gen" {
+        // E6 OOM fix: inject gc.collect()+torch.cuda.empty_cache() around kr_gen's
+        // model.generate() via sed-patch of /tmp/_r10_train.py on the pod. Reduces
+        // max_new_tokens 64→32. Idempotent (guarded by 'E6 OOM fix' sentinel comment).
+        return "grep -q 'E6 OOM fix' /tmp/_r10_train.py 2>/dev/null || " +
+               "python3 -c \"import re;p='/tmp/_r10_train.py';s=open(p).read();" +
+               "s=s.replace('import argparse, json','import argparse, gc, json') if 'import argparse, gc' not in s else s;" +
+               "s=s.replace('model.eval()\\n    hits = 0','# E6 OOM fix\\n    gc.collect()\\n    torch.cuda.empty_cache()\\n    model.eval()\\n    hits = 0');" +
+               "s=s.replace('max_new_tokens=64','max_new_tokens=32');" +
+               "open(p,'w').write(s);print('[autopilot] kr_gen OOM patch applied')\" && " +
+               "echo AUTOPILOT_BATCH_HALF=1"
+    }
+    if bug_id == "cuda_oom_batch" {
+        return "echo '[fix] true batch overflow — halve batch' && echo AUTOPILOT_BATCH_HALF=1"
+    }
+    if bug_id == "mfs_quota_silent_kill" {
+        return "rm -rf /workspace/ckpt_" + run_id + "_partial && mkdir -p /workspace/ckpt_" + run_id
+    }
+    return "echo '[fix] no-op'"
+}
+
+// =====================================================================
+// Stage implementations
+// =====================================================================
+
+fn autopilot_create(model_tag: string, round: string) -> string {
+    println("[autopilot] stage=create model=" + model_tag + " round=" + round)
+    let key = runpod_api_key()
+    if key == "" {
+        println("[autopilot] ABORT: RunPod API key not found (env RUNPOD_API_KEY or ~/.runpod/config.toml or $HOME/Dev/secret/runpod_api_key)")
+        log_incident("", model_tag + "_r" + round, "create", "api_key_missing", "secrets_registry lookup failed", "abort")
+        exit(1)
+    }
+    // Reads pod_create block from SSOT and delegates to runpodctl CLI
+    let name = "anima-" + model_tag + "-r" + round + "-autopilot"
+    let cmd = "runpodctl create pod --name " + name +
+        " --imageName runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04" +
+        " --gpuType 'NVIDIA H100 80GB HBM3'" +
+        " --gpuCount 1 --containerDiskSize 150 --volumeSize 0" +
+        " --mem 32 --vcpu 16 --ports '22/tcp' --startSSH --secureCloud"
+    println("[autopilot] " + cmd)
+    let script = "/tmp/_autopilot_create.sh"
+    let out = "/tmp/_autopilot_create.out"
+    write_file(script, "#!/bin/sh\n" + cmd + " > " + out + " 2>&1\n")
+    exec("chmod +x " + script)
+    exec(script)
+    let result = read_file(out)
+    println(result)
+    log_incident("", model_tag + "_r" + round, "create", "pod_created", "autopilot_create", "runpodctl_create")
+    return result
+}
+
+fn autopilot_bootstrap(pod_ip: string, pod_port: string, run_id: string) {
+    println("[autopilot] stage=bootstrap ip=" + pod_ip + " port=" + pod_port + " run=" + run_id)
+    // scp watchdog + sentinel then exec bootstrap
+    let base_scp = "scp -o StrictHostKeyChecking=no -P " + pod_port + " "
+    let base_ssh = "ssh -o StrictHostKeyChecking=no -p " + pod_port + " root@" + pod_ip + " "
+
+    let script = "/tmp/_autopilot_bootstrap.sh"
+    write_file(script,
+        "#!/bin/sh\n" +
+        "set -e\n" +
+        base_scp + "/Users/ghost/Dev/anima/training/runpod_watchdog.hexa root@" + pod_ip + ":/workspace/runpod_watchdog.hexa\n" +
+        base_scp + "/Users/ghost/Dev/anima/training/kr_gen_sentinel.hexa root@" + pod_ip + ":/workspace/kr_gen_sentinel.hexa\n" +
+        base_ssh + "'mkdir -p /workspace/ckpt_" + run_id + " && echo INIT > /workspace/ckpt_" + run_id + "/autopilot.status'\n"
+    )
+    exec("chmod +x " + script)
+    exec(script)
+    log_incident("", run_id, "bootstrap", "files_staged", "scp watchdog+sentinel", "bootstrap_ok")
+}
+
+fn autopilot_monitor(pod_ip: string, pod_port: string, run_id: string) -> int {
+    println("[autopilot] stage=monitor run=" + run_id)
+    let ssh_base = "ssh -o StrictHostKeyChecking=no -p " + pod_port + " root@" + pod_ip + " "
+    let status_remote = "/workspace/ckpt_" + run_id + "/autopilot.status"
+    let poll_script = "/tmp/_autopilot_monitor.sh"
+    let out = "/tmp/_autopilot_monitor.out"
+    write_file(poll_script,
+        "#!/bin/sh\n" +
+        ssh_base + "'cat " + status_remote + " 2>/dev/null || echo UNKNOWN' > " + out + "\n"
+    )
+    exec("chmod +x " + poll_script)
+    exec(poll_script)
+    let s = read_file(out).trim()
+    println("[autopilot] status=" + s)
+    if s == "DONE" { return 0 }
+    if s == "CRASHED" { return 1 }
+    if s == "IDLE_TEARDOWN" { return 3 }
+    return 99
+}
+
+fn autopilot_crash_recover(log_path: string, run_id: string) -> string {
+    println("[autopilot] stage=crash_recover log=" + log_path)
+    let bug_id = diagnose_crash(log_path)
+    let action = crash_action(bug_id)
+    println("[autopilot] diagnosed bug_id=" + bug_id + " action=" + action)
+    log_incident("", run_id, "crash_recover", bug_id, "pattern_match", action)
+    if action == "abort" {
+        println("[autopilot] ABORT — cannot auto-recover from " + bug_id)
+        return "abort"
+    }
+    if action == "unknown" {
+        println("[autopilot] UNKNOWN crash — alert and stop (no silent retry)")
+        return "unknown"
+    }
+    // restart: emit fix command
+    let fix = crash_fix_command(bug_id, run_id)
+    println("[autopilot] fix_command: " + fix)
+    return fix
+}
+
+fn autopilot_upload_and_teardown(pod_id: string, model_tag: string, round: string, run_id: string) -> int {
+    println("[autopilot] stage=r2_upload pod=" + pod_id + " model=" + model_tag + " round=" + round)
+    // R2 upload via rclone (local CLI, pod already scp'd ckpt or pod runs rclone itself)
+    // Here autopilot issues the rclone on the pod via ssh (preferred — no local scp of 200MB+)
+    // Caller should have provided pod_ip/port context; we only teardown here.
+
+    // Teardown — local runpodctl remove pod
+    let dry = env("AUTOPILOT_DRY_RUN")
+    let teardown_cmd = "runpodctl remove pod " + pod_id
+    if dry == "1" {
+        println("[autopilot] DRY_RUN — would run: " + teardown_cmd)
+        log_incident(pod_id, run_id, "teardown", "dry_run", "AUTOPILOT_DRY_RUN=1", "skipped")
+        return 0
+    }
+    let script = "/tmp/_autopilot_teardown.sh"
+    let out = "/tmp/_autopilot_teardown.out"
+    write_file(script, "#!/bin/sh\n" + teardown_cmd + " > " + out + " 2>&1\n")
+    exec("chmod +x " + script)
+    exec(script)
+    let result = read_file(out)
+    println(result)
+    log_incident(pod_id, run_id, "teardown", "pod_removed", teardown_cmd, "runpodctl_remove")
+    return 0
+}
+
+fn autopilot_next_round() -> int {
+    println("[autopilot] stage=next_round")
+    let q = read_file(queue_path())
+    // Very simple line-grep for first "status":"pending" entry — we don't need
+    // full JSON parser; queue is hand-maintained.
+    let lines = q.split("\n")
+    let mut found = false
+    let mut tag = ""
+    let mut rnd = ""
+    let mut i = 0
+    while i < lines.len() {
+        let ln = lines[i]
+        if ln.index_of("\"status\": \"pending\"") >= 0 && !found {
+            // Scan backwards for model_tag + round in the same entry
+            let mut j = i
+            while j >= 0 && tag == "" {
+                let lj = lines[j]
+                if lj.index_of("\"model_tag\"") >= 0 {
+                    // extract between first pair of " after :
+                    let colon = lj.index_of(":")
+                    let rest = lj.substring(colon + 1, lj.len())
+                    let q1 = rest.index_of("\"")
+                    let after = rest.substring(q1 + 1, rest.len())
+                    let q2 = after.index_of("\"")
+                    tag = after.substring(0, q2)
+                }
+                j = j - 1
+            }
+            let mut k = i
+            while k >= 0 && rnd == "" {
+                let lk = lines[k]
+                if lk.index_of("\"round\"") >= 0 {
+                    let colon = lk.index_of(":")
+                    let rest = lk.substring(colon + 1, lk.len())
+                    // strip whitespace + comma
+                    rnd = rest.replace(",", "").trim()
+                }
+                k = k - 1
+            }
+            found = true
+        }
+        i = i + 1
+    }
+    if !found {
+        println("[autopilot] queue has no pending entries — clean exit")
+        return 0
+    }
+    println("[autopilot] next entry: model=" + tag + " round=" + rnd)
+    // Would autopilot_create here, but in dry mode we only announce
+    let dry = env("AUTOPILOT_DRY_RUN")
+    if dry == "1" {
+        println("[autopilot] DRY_RUN — would create pod for " + tag + " r" + rnd)
+        return 0
+    }
+    autopilot_create(tag, rnd)
+    return 0
+}
+
+// =====================================================================
+// Main dispatch
+// =====================================================================
+
+fn main() {
+    // argv[0] = hexa binary, argv[1] = script path, argv[2]+ = user args
+    let argv = args()
+    let argc = len(argv)
+    // Detect invocation form: "hexa run <script> <sub> <args>" vs "hexa <script> <sub>"
+    // We use argv index offset AFTER the script path. Find our .hexa in argv.
+    let mut offset = 2
+    if argc >= 2 {
+        let a1 = argv[1]
+        if a1.index_of(".hexa") < 0 {
+            // argv[1] is already the subcommand (direct invocation)
+            offset = 1
+        }
+    }
+    if argc < offset + 1 {
+        println("usage: runpod_autopilot.hexa <create|bootstrap|monitor|crash_recover|upload_and_teardown|next_round|run> [args]")
+        exit(2)
+    }
+    let sub = argv[offset]
+
+    if sub == "create" {
+        if argc < offset + 3 { println("create <model_tag> <round>"); exit(2) }
+        autopilot_create(argv[offset + 1], argv[offset + 2])
+        return
+    }
+    if sub == "bootstrap" {
+        if argc < offset + 4 { println("bootstrap <pod_ip> <pod_port> <run_id>"); exit(2) }
+        autopilot_bootstrap(argv[offset + 1], argv[offset + 2], argv[offset + 3])
+        return
+    }
+    if sub == "monitor" {
+        if argc < offset + 4 { println("monitor <pod_ip> <pod_port> <run_id>"); exit(2) }
+        let rc = autopilot_monitor(argv[offset + 1], argv[offset + 2], argv[offset + 3])
+        exit(rc)
+    }
+    if sub == "crash_recover" {
+        if argc < offset + 3 { println("crash_recover <log_path> <run_id>"); exit(2) }
+        let res = autopilot_crash_recover(argv[offset + 1], argv[offset + 2])
+        println("[autopilot] crash_recover result: " + res)
+        return
+    }
+    if sub == "upload_and_teardown" {
+        if argc < offset + 5 { println("upload_and_teardown <pod_id> <model_tag> <round> <run_id>"); exit(2) }
+        autopilot_upload_and_teardown(argv[offset + 1], argv[offset + 2], argv[offset + 3], argv[offset + 4])
+        return
+    }
+    if sub == "next_round" {
+        autopilot_next_round()
+        return
+    }
+    if sub == "run" {
+        if argc < offset + 3 { println("run <model_tag> <round>"); exit(2) }
+        println("[autopilot] full pipeline — dispatching to create then wait")
+        autopilot_create(argv[offset + 1], argv[offset + 2])
+        return
+    }
+    println("[autopilot] unknown subcommand: " + sub)
+    exit(2)
+}
+
+main()

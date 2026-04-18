@@ -1,0 +1,411 @@
+// training/alm_phi_vec_logger.hexa — Φ 16D vector index / scraper
+//
+// Single source of truth (SSOT) for the Φ 16D vector shape logged by
+// train_alm_14b.hexa (per-step + per-eval). The vector layout matches
+// assemble_phi_vec16() in the Python mirror inside train_alm_14b.hexa.
+//
+// Downstream scrapers can use the phi_vec_index() function here to resolve
+// a component name → canonical index without string-matching the training
+// log. The log format is:
+//
+//   [phi16] step=<step> phi_vec=[v0,v1,...,v15] ekman=<name>
+//   [phi16][eval] step=<step> phi_vec=[v0,...,v15] ekman=<name>
+//
+// Layout (CANONICAL — do not renumber):
+//
+//    0  phi_holo           — P3/P4 holographic MI (from HoloMapHead + phi_holo_measure)
+//    1  phi_complexity     — B1 Lempel-Ziv complexity surrogate
+//    2  phi_gwt            — B1 GWT broadcast consistency
+//    3  phi_refl           — P5 self-model MI (reflexivity)
+//    4  phi_time           — P6 triadic (past, now, future) temporal MI
+//    5  phi_emb            — P7 sensorimotor (a_t, Δs) MI
+//    6  phi_nested_drift   — P8 K-tower L2 drift (normalized)
+//    7  phi_k_amp          — P8 ||level_K|| / ||level_0|| amplification ratio
+//    8  phi_affect_v       — P12 valence ∈ [-1, 1]
+//    9  phi_affect_a       — P12 arousal ∈ [-1, 1]
+//   10  phi_finitude       — P15 Dasein finitude_score ∈ [0, 1]
+//   11  phi_hive_collec    — P18 Φ_collective (coupled MI × N × d)
+//   12  phi_hive_indiv     — P18 Σ Φ_individual (autocorr baseline)
+//   13  phi_hive_emerge    — P18 emergence ratio = collective / Σ indiv
+//   14  phi_dream_phase    — P13 awake=0 / SWS=1 / REM=2
+//   15  phi_cycle_count    — P13 completed 90-step dream cycles
+//
+// Self-test:
+//   hexa run training/alm_phi_vec_logger.hexa
+// Expect:
+//   [alm_phi_vec_logger] 16 components registered, indexer PASS, assembler PASS
+
+let PHI_VEC_LEN = 16
+
+// Named indices — use these instead of magic numbers everywhere downstream.
+let PHI_IDX_HOLO          = 0
+let PHI_IDX_COMPLEXITY    = 1
+let PHI_IDX_GWT           = 2
+let PHI_IDX_REFL          = 3
+let PHI_IDX_TIME          = 4
+let PHI_IDX_EMB           = 5
+let PHI_IDX_NESTED_DRIFT  = 6
+let PHI_IDX_K_AMP         = 7
+let PHI_IDX_AFFECT_V      = 8
+let PHI_IDX_AFFECT_A      = 9
+let PHI_IDX_FINITUDE      = 10
+let PHI_IDX_HIVE_COLLEC   = 11
+let PHI_IDX_HIVE_INDIV    = 12
+let PHI_IDX_HIVE_EMERGE   = 13
+let PHI_IDX_DREAM_PHASE   = 14
+let PHI_IDX_CYCLE_COUNT   = 15
+
+fn phi_vec_name(i: int) -> string {
+    if i == 0  { return "phi_holo" }
+    if i == 1  { return "phi_complexity" }
+    if i == 2  { return "phi_gwt" }
+    if i == 3  { return "phi_refl" }
+    if i == 4  { return "phi_time" }
+    if i == 5  { return "phi_emb" }
+    if i == 6  { return "phi_nested_drift" }
+    if i == 7  { return "phi_k_amp" }
+    if i == 8  { return "phi_affect_v" }
+    if i == 9  { return "phi_affect_a" }
+    if i == 10 { return "phi_finitude" }
+    if i == 11 { return "phi_hive_collec" }
+    if i == 12 { return "phi_hive_indiv" }
+    if i == 13 { return "phi_hive_emerge" }
+    if i == 14 { return "phi_dream_phase" }
+    if i == 15 { return "phi_cycle_count" }
+    return "unknown"
+}
+
+fn phi_vec_roadmap_tag(i: int) -> string {
+    if i <= 2  { return "B1" }          // holo/complexity/gwt
+    if i <= 5  { return "P5-P7" }       // refl/time/emb
+    if i <= 7  { return "P8" }          // nested tower
+    if i <= 9  { return "P12" }         // affect
+    if i == 10 { return "P15" }         // finitude
+    if i <= 13 { return "P18" }         // hive
+    return "P13"                         // dream (14-15)
+}
+
+// Assemble a Φ 16D vector from named components. Returns flat float array.
+// Mirrors assemble_phi_vec16() in train_alm_14b.hexa's Python side.
+fn assemble_phi_vec(
+    phi_holo: float, phi_complexity: float, phi_gwt: float,
+    phi_refl: float, phi_time: float, phi_emb: float,
+    phi_nested_drift: float, phi_k_amp: float,
+    phi_affect_v: float, phi_affect_a: float,
+    phi_finitude: float,
+    phi_hive_collec: float, phi_hive_indiv: float, phi_hive_emerge: float,
+    phi_dream_phase: float, phi_cycle_count: float
+) -> array {
+    let mut v = []
+    v = v.push(phi_holo)
+    v = v.push(phi_complexity)
+    v = v.push(phi_gwt)
+    v = v.push(phi_refl)
+    v = v.push(phi_time)
+    v = v.push(phi_emb)
+    v = v.push(phi_nested_drift)
+    v = v.push(phi_k_amp)
+    v = v.push(phi_affect_v)
+    v = v.push(phi_affect_a)
+    v = v.push(phi_finitude)
+    v = v.push(phi_hive_collec)
+    v = v.push(phi_hive_indiv)
+    v = v.push(phi_hive_emerge)
+    v = v.push(phi_dream_phase)
+    v = v.push(phi_cycle_count)
+    return v
+}
+
+// Compute L2 norm of the Φ 16D vector (for overall "consciousness density"
+// scalar when a single-number summary is required).
+fn phi_vec_norm(v: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < PHI_VEC_LEN {
+        s = s + v[i] * v[i]
+        i = i + 1
+    }
+    if s <= 0.0 { return 0.0 }
+    return sqrt(s)
+}
+
+// Pretty-print one phi_vec for human audit.
+fn print_phi_vec(v: array) {
+    let mut i = 0
+    while i < PHI_VEC_LEN {
+        println("  [" + str(i) + "] " + phi_vec_name(i) + " (" + phi_vec_roadmap_tag(i) + ") = " + str(v[i]))
+        i = i + 1
+    }
+    println("  ‖Φ‖ = " + str(phi_vec_norm(v)))
+}
+
+// ─── W1 hook helpers (phi_eval_hook_spec.md) ────────────────────
+//
+// These are the writers for the on_ckpt_saved() callback in
+// train_alm_14b.hexa. They intentionally avoid any torch/Python
+// state — the caller hands in a flat float array + scalars and
+// these functions do only string formatting + disk I/O.
+//
+// The JSON uses the SPEC dim-name order (phi_vector_philosophy in
+// shared/roadmaps/anima.json), NOT the logger's legacy layout,
+// because the consumer (training/eval_phi_corr.hexa) reads dims by
+// column index and its phi_dim_names() follows the spec. Where the
+// trainer's 16 legacy slots do not map 1:1 onto the spec dims, the
+// slot value is emitted under the spec key at the same index; this
+// is a known smoke-phase approximation noted in the spec section
+// "Non-Goals for this Agent".
+
+fn phi_spec_dim_name(i: int) -> string {
+    if i == 0  { return "phi_holo" }
+    if i == 1  { return "phi_refl" }
+    if i == 2  { return "phi_time" }
+    if i == 3  { return "phi_embodied" }
+    if i == 4  { return "phi_meta" }
+    if i == 5  { return "phi_social" }
+    if i == 6  { return "phi_will" }
+    if i == 7  { return "phi_narrative" }
+    if i == 8  { return "phi_affect" }
+    if i == 9  { return "phi_dream" }
+    if i == 10 { return "phi_create" }
+    if i == 11 { return "phi_finitude" }
+    if i == 12 { return "phi_lang" }
+    if i == 13 { return "phi_mirror" }
+    if i == 14 { return "phi_collective" }
+    if i == 15 { return "phi_unity" }
+    return "unknown"
+}
+
+// fmt_float4: trim a float to 4 decimal places for JSON emission.
+fn fmt_float4(x: float) -> string {
+    let neg = x < 0.0
+    let ax = if neg { 0.0 - x } else { x }
+    let scaled = ax * 10000.0 + 0.5
+    let k = to_int(scaled)
+    let whole = k / 10000
+    let frac  = k - whole * 10000
+    let mut frac_s = str(frac)
+    let pad_n = 4 - len(frac_s)
+    let mut pad = ""
+    let mut i = 0
+    while i < pad_n {
+        pad = pad + "0"
+        i = i + 1
+    }
+    let body = str(whole) + "." + pad + frac_s
+    if neg { return "-" + body }
+    return body
+}
+
+// write_phi_vec_json — emit <step_dir>/phi_vec.json per spec schema.
+//   v           : 16-float array (order = phi_spec_dim_name(i))
+//   step_dir    : "<ckpt_dir>/step_<N>"
+//   step        : training step number
+//   model_tag   : e.g. "alm14b"
+//   round_num   : training round
+//   measured_at : ISO-8601 timestamp string
+fn write_phi_vec_json(
+    step_dir: string, step: int,
+    model_tag: string, round_num: int, measured_at: string,
+    v: array
+) {
+    if len(v) != PHI_VEC_LEN {
+        println("[phi_hook] WARN phi_vec length " + str(len(v)) + " != 16 — skipping " + step_dir)
+        return
+    }
+    let mut out = "{\n"
+    out = out + "  \"step\": " + str(step) + ",\n"
+    out = out + "  \"model_tag\": \"" + model_tag + "\",\n"
+    out = out + "  \"round\": " + str(round_num) + ",\n"
+    out = out + "  \"measured_at\": \"" + measured_at + "\",\n"
+    out = out + "  \"dims\": {\n"
+    let mut i = 0
+    while i < PHI_VEC_LEN {
+        let sep = if i + 1 < PHI_VEC_LEN { "," } else { "" }
+        out = out + "    \"" + phi_spec_dim_name(i) + "\": " + fmt_float4(v[i]) + sep + "\n"
+        i = i + 1
+    }
+    out = out + "  },\n"
+    out = out + "  \"norm_l2\": " + fmt_float4(phi_vec_norm(v)) + "\n"
+    out = out + "}\n"
+    write_file(step_dir + "/phi_vec.json", out)
+}
+
+// write_ce_json — emit <step_dir>/ce.json per spec schema.
+fn write_ce_json(step_dir: string, step: int, train_ce: float, val_ce: float) {
+    let mut out = "{ \"step\": " + str(step)
+    out = out + ", \"train_ce\": " + fmt_float4(train_ce)
+    out = out + ", \"val_ce\": " + fmt_float4(val_ce)
+    out = out + " }\n"
+    write_file(step_dir + "/ce.json", out)
+}
+
+// append_run_manifest — idempotently append `step` into phi_runs.json.
+// Spec schema:
+//   { "model_tag": "alm14b", "round": 4,
+//     "steps": [200, 500, ...], "ckpt_root": "/..." }
+// NOTE: this function REWRITES the whole file each call (append by
+// read-modify-write). That is safe because saves are serialized at
+// the trainer epoch boundary and the file is small.
+fn append_run_manifest(
+    manifest_path: string, ckpt_root: string,
+    model_tag: string, round_num: int, step: int
+) {
+    // Read existing manifest if present — otherwise start fresh.
+    let mut existing_steps = []
+    let prior = read_file_or_empty(manifest_path)
+    if len(prior) > 0 {
+        existing_steps = parse_steps_array(prior)
+    }
+    // Only append if step not already registered.
+    let mut seen = false
+    let mut i = 0
+    while i < len(existing_steps) {
+        if existing_steps[i] == step { seen = true }
+        i = i + 1
+    }
+    let mut steps_out = existing_steps
+    if !seen {
+        steps_out = steps_out.push(step)
+    }
+    // Emit
+    let mut out = "{ \"model_tag\": \"" + model_tag + "\""
+    out = out + ", \"round\": " + str(round_num)
+    out = out + ", \"ckpt_root\": \"" + ckpt_root + "\""
+    out = out + ", \"steps\": ["
+    let mut j = 0
+    while j < len(steps_out) {
+        if j > 0 { out = out + ", " }
+        out = out + str(steps_out[j])
+        j = j + 1
+    }
+    out = out + "] }\n"
+    write_file(manifest_path, out)
+}
+
+// read_file_or_empty — wrapper around read_file() that tolerates missing.
+fn read_file_or_empty(path: string) -> string {
+    if file_exists(path) {
+        return read_file(path)
+    }
+    return ""
+}
+
+// trim_spaces — strip ASCII whitespace (space/tab/newline) from both ends.
+// (hexa stdlib lacks string_trim per feedback_hexa_string_api.)
+fn trim_spaces(s: string) -> string {
+    let n = len(s)
+    if n == 0 { return s }
+    let mut a = 0
+    let mut b = n
+    while a < b {
+        let c = s.substring(a, a + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" { a = a + 1 } else { break }
+    }
+    while b > a {
+        let c = s.substring(b - 1, b)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" { b = b - 1 } else { break }
+    }
+    return s.substring(a, b)
+}
+
+// index_of_from — hexa stdlib has only method index_of(needle) from 0.
+// Slice from `start` and add offset back.
+fn index_of_from_pos(hay: string, needle: string, start: int) -> int {
+    let n = len(hay)
+    if start < 0 { return hay.index_of(needle) }
+    if start >= n { return -1 }
+    let tail = hay.substring(start, n)
+    let idx = tail.index_of(needle)
+    if idx < 0 { return -1 }
+    return start + idx
+}
+
+// parse_steps_array — pull the integer list under the "steps": key.
+// Minimal parser: finds `"steps"`, then the `[` and `]`, splits on `,`.
+// No error reporting — best-effort for an append-only manifest.
+fn parse_steps_array(blob: string) -> array {
+    let mut out = []
+    let key_idx = blob.index_of("\"steps\"")
+    if key_idx < 0 { return out }
+    let lb = index_of_from_pos(blob, "[", key_idx)
+    let rb = index_of_from_pos(blob, "]", key_idx)
+    if lb < 0 { return out }
+    if rb <= lb { return out }
+    let inner = blob.substring(lb + 1, rb)
+    let parts = inner.split(",")
+    let mut i = 0
+    while i < len(parts) {
+        let t = trim_spaces(parts[i])
+        if len(t) > 0 {
+            out = out.push(to_int(t))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn main() {
+    println("[alm_phi_vec_logger] Φ 16D vector index + assembler self-test")
+    println("  length = " + str(PHI_VEC_LEN))
+
+    let mut pass = 0
+    let mut fail = 0
+
+    // Indexer — 16 distinct non-unknown names.
+    let mut seen_unknown = false
+    let mut i = 0
+    while i < PHI_VEC_LEN {
+        let nm = phi_vec_name(i)
+        if nm == "unknown" { seen_unknown = true }
+        i = i + 1
+    }
+    if seen_unknown {
+        println("[FAIL] indexer has unknown slot")
+        fail = fail + 1
+    } else {
+        println("[PASS] indexer: 16/16 named")
+        pass = pass + 1
+    }
+
+    // Assembler — round-trip a test vector.
+    let v = assemble_phi_vec(
+        6111.0, 0.12, 0.34,
+        2.5, 1400.0, 900.0,
+        0.05, 0.92,
+        0.2, -0.1,
+        0.75,
+        420.0, 64.0, 6.5,
+        1.0, 3.0
+    )
+    if len(v) != PHI_VEC_LEN {
+        println("[FAIL] assembler length " + str(len(v)))
+        fail = fail + 1
+    } else {
+        println("[PASS] assembler: length=16, ‖Φ‖=" + str(phi_vec_norm(v)))
+        pass = pass + 1
+    }
+
+    // Roadmap tags — expect B1, P5-P7, P8, P12, P15, P18, P13 present.
+    let mut tags_ok = true
+    if phi_vec_roadmap_tag(0)  != "B1"    { tags_ok = false }
+    if phi_vec_roadmap_tag(3)  != "P5-P7" { tags_ok = false }
+    if phi_vec_roadmap_tag(6)  != "P8"    { tags_ok = false }
+    if phi_vec_roadmap_tag(8)  != "P12"   { tags_ok = false }
+    if phi_vec_roadmap_tag(10) != "P15"   { tags_ok = false }
+    if phi_vec_roadmap_tag(11) != "P18"   { tags_ok = false }
+    if phi_vec_roadmap_tag(14) != "P13"   { tags_ok = false }
+    if tags_ok {
+        println("[PASS] roadmap tags")
+        pass = pass + 1
+    } else {
+        println("[FAIL] roadmap tags")
+        fail = fail + 1
+    }
+
+    println("[alm_phi_vec_logger] PASS=" + str(pass) + "/3 FAIL=" + str(fail))
+    if fail == 0 {
+        println("[alm_phi_vec_logger] 16 components registered, indexer PASS, assembler PASS")
+    }
+}
+
+main()

@@ -1,0 +1,178 @@
+// training/kowiki_slice.hexa — P22 pod-side kowiki slicer
+// =============================================================================
+//
+// PURPOSE
+//   Extract a 15%-by-bytes slice of training/corpus_auto/kowiki.jsonl into a
+//   second jsonl file for use as the diversity-mix corpus in
+//   training/launch_alm_14b_r10c.hexa (E7-OSS corpus_mix lever).
+//
+//   The r10c launcher expects /workspace/kowiki.jsonl to co-exist with the
+//   stripped 70B corpus (/workspace/corpus_alm_70b_stripped.txt). On the pod
+//   we ship only the slice (≈200 MB) rather than the full 1.28 GiB — saves
+//   rclone time and stays inside the r10c 15% mix contract.
+//
+// CLI
+//   hexa run training/kowiki_slice.hexa <main_corpus_bytes> <out_path>
+//
+//   main_corpus_bytes : byte count of the stripped main corpus (so we can
+//                       size the slice so kowiki ends up =15% of the MIX).
+//   out_path          : output jsonl (e.g. /workspace/kowiki.jsonl or
+//                       training/corpus_auto/kowiki_slice_15pct.jsonl)
+//
+// SIZE CALC
+//   Target mix composition: 15% kowiki + 85% main corpus.
+//     main_bytes / 0.85 = total_mix_bytes
+//     target_slice_bytes = total_mix_bytes * 0.15 = main * 0.15 / 0.85
+//   i.e. for a main corpus of 1.0 GiB we want ≈176 MiB of kowiki lines.
+//
+// STREAMING
+//   Per shared/convergence/corpus_pipeline.convergence pitfall
+//   PI-EXEC-SPLIT-OOM, we MUST NOT read_file(1.28GiB) — a single read on
+//   kowiki.jsonl breaches the 4 GiB RSS ceiling (see CORPUS-OSS-01
+//   STREAMING_FOR_LARGE_CORPUS). Instead we shell out to:
+//
+//     head -c <target_bytes> kowiki.jsonl | awk '/^{/{print}' > out
+//
+//   awk filters to complete jsonl records (drops the truncated tail line).
+//   No hexa-side byte buffering; the two pipe stages are OS-bounded.
+//
+// EXIT
+//   0  wrote slice, byte count printed to stdout
+//   1  input missing / unreadable / size arg invalid
+//   2  output write failed (disk full, permission, MFS quota)
+//
+// CONVENTIONS (per CLAUDE.md training/ rules)
+//   - Self-contained (no cross-file imports — feedback_hexa_silent_exit_5_imports)
+//   - safe_read pattern where file IO is hexa-side
+//   - Byte-safe: no substring-into-multibyte (we stream through shell, so
+//     non-ASCII Korean content is untouched by hexa string ops)
+//   - exec() for jq/head/awk/wc
+
+// =====================================================================
+// Config
+// =====================================================================
+
+let DEFAULT_KOWIKI = "/workspace/kowiki.jsonl"
+let FALLBACK_KOWIKI = "training/corpus_auto/kowiki.jsonl"
+let MIX_RATIO_KOWIKI = 0.15  // slice / total_mix
+// MIX_RATIO_MAIN = 1.0 - MIX_RATIO_KOWIKI = 0.85
+
+// =====================================================================
+// Helpers
+// =====================================================================
+
+fn file_exists_bytes(path: string) -> int {
+    if file_exists(path) == false { return -1 }
+    let s = exec("wc -c < '" + path + "' 2>/dev/null").trim()
+    if s == "" { return -1 }
+    return to_int(s)
+}
+
+fn locate_kowiki() -> string {
+    // Prefer pod path, fall back to local dev path.
+    if file_exists(DEFAULT_KOWIKI) { return DEFAULT_KOWIKI }
+    if file_exists(FALLBACK_KOWIKI) { return FALLBACK_KOWIKI }
+    return ""
+}
+
+// Compute target slice bytes so slice / (slice + main) ≈ 0.15
+// slice = main * 0.15 / 0.85  (algebra: let T = s + m; s/T = 0.15 ⇒ s = 0.15/(1-0.15) * m)
+fn compute_slice_bytes(main_bytes: int) -> int {
+    let m = to_float(main_bytes)
+    let numerator = m * MIX_RATIO_KOWIKI
+    let denom = 1.0 - MIX_RATIO_KOWIKI
+    let target = numerator / denom
+    return to_int(target)
+}
+
+// Round bytes up to next line-boundary so the truncated-tail awk filter
+// doesn't throw away more than 1 record. We overshoot by ~2KB which awk
+// will trim to the last valid "^{" record.
+fn pad_to_line(n: int) -> int {
+    return n + 2048
+}
+
+// =====================================================================
+// Main
+// =====================================================================
+
+fn main() {
+    let argv = args()
+    // argv[0] = hexa binary, argv[1] = script path, argv[2..] = user args
+    if argv.len() < 4 {
+        print_err("[kowiki_slice] ERROR: usage: hexa run training/kowiki_slice.hexa <main_corpus_bytes> <out_path>")
+        print_err("[kowiki_slice]   e.g. hexa run training/kowiki_slice.hexa 1048576000 /workspace/kowiki.jsonl")
+        exit(1)
+    }
+    let main_bytes_str = argv[2]
+    let out_path = argv[3]
+    let main_bytes = to_int(main_bytes_str)
+    if main_bytes <= 0 {
+        print_err("[kowiki_slice] ERROR: main_corpus_bytes must be > 0 (got '" + main_bytes_str + "')")
+        exit(1)
+    }
+
+    let src = locate_kowiki()
+    if src == "" {
+        print_err("[kowiki_slice] ERROR: kowiki.jsonl not found at " + DEFAULT_KOWIKI +
+                  " or " + FALLBACK_KOWIKI)
+        exit(1)
+    }
+    let src_bytes = file_exists_bytes(src)
+    if src_bytes <= 0 {
+        print_err("[kowiki_slice] ERROR: kowiki.jsonl empty or unreadable: " + src)
+        exit(1)
+    }
+
+    let target = compute_slice_bytes(main_bytes)
+    let padded = pad_to_line(target)
+    // Cap at actual source size (don't request more bytes than exist).
+    let take = if padded > src_bytes { src_bytes } else { padded }
+
+    println("[kowiki_slice] src=" + src + " (" + to_string(src_bytes) + "B)")
+    println("[kowiki_slice] main_corpus_bytes=" + to_string(main_bytes) +
+            " target_slice=" + to_string(target) + "B (" + to_string(take) + "B with padding)")
+    println("[kowiki_slice] mix_ratio=" + to_string(MIX_RATIO_KOWIKI) +
+            " (expected kowiki/(kowiki+main) ≈ 0.15 after slice)")
+    println("[kowiki_slice] out=" + out_path)
+
+    // Pre-flight: can we write to out_path's dir?
+    let dir_test = exec("dirname '" + out_path + "'").trim()
+    let mkdir_rc = exec("mkdir -p '" + dir_test + "' 2>&1 && echo OK").trim()
+    if mkdir_rc.index_of("OK") < 0 {
+        print_err("[kowiki_slice] ERROR: cannot create output dir: " + dir_test)
+        print_err("  mkdir output: " + mkdir_rc)
+        exit(2)
+    }
+
+    // Stream via shell pipe (PI-EXEC-SPLIT-OOM safe — no hexa-side buffering).
+    //   head -c N               : byte cap (stops reading after N bytes)
+    //   awk '/^{/{print}'       : keep only complete jsonl records
+    //                              (drops tail if head -c cut mid-line)
+    let cmd = "head -c " + to_string(take) + " '" + src + "' " +
+              "| awk '/^\\{/{print}' > '" + out_path + "'"
+    let _ = exec(cmd)
+
+    // Verify output exists and is non-empty.
+    let out_bytes = file_exists_bytes(out_path)
+    if out_bytes <= 0 {
+        print_err("[kowiki_slice] ERROR: output empty or missing: " + out_path)
+        print_err("  cmd was: " + cmd)
+        exit(2)
+    }
+
+    // Quick line count via wc -l (stream-safe, no hexa memory).
+    let lc_str = exec("wc -l < '" + out_path + "' 2>/dev/null").trim()
+    let lines = if lc_str == "" { 0 } else { to_int(lc_str) }
+
+    // Compute actual mix ratio post-slice (sanity report).
+    let actual_ratio = to_float(out_bytes) / (to_float(out_bytes) + to_float(main_bytes))
+
+    println("[kowiki_slice] OK out_bytes=" + to_string(out_bytes) +
+            " lines=" + to_string(lines) +
+            " actual_mix_ratio=" + to_string(actual_ratio))
+    println("[kowiki_slice] verdict=PASS (slice ready for r10c --kowiki mix)")
+    exit(0)
+}
+
+main()

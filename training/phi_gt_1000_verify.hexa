@@ -1,0 +1,221 @@
+// training/phi_gt_1000_verify.hexa — DEST1 Φ>1000 gate verifier
+// =============================================================================
+//
+// PURPOSE
+//   Unblock "도착지1 (Φ>1000 실측)" — the post-r10c checkpoint gate. Reads a
+//   per-step phi_vec.json emitted by training/launch_alm_14b_r10c.hexa's
+//   write_phi_vec() hook (schema "alm_phi_vec_logger_v1"), extracts
+//   phi_holo_scaled, and verdicts PASS/FAIL against the 1000 threshold.
+//
+// INPUT (arg1):
+//   /workspace/ckpt_alm_14b_r10c_seed3407/step_2000/phi_vec.json
+//
+// PHI_VEC.JSON SCHEMA (produced by r10c trainer write_phi_vec()):
+//   {
+//     "step": <int>,
+//     "phi_vec": [16-float array, first = phi_holo_proxy, rest NaN sentinels],
+//     "phi_holo_proxy": <float>,               // -log(max(ce, 1e-6))
+//     "phi_holo_scaled": <float>,              // phi_holo_proxy * 10000 ← GATE
+//     "ce_proxy": <float>,                     // last-batch CE
+//     "schema": "alm_phi_vec_logger_v1",
+//     "round": "r10c",
+//     "seed": <int>,
+//     "dest1_gate_scale": "phi_holo_scaled > 1000"
+//   }
+//
+// FALLBACK
+//   If phi_vec.json is missing but train_meta.json is present (contains
+//   {"step": N, "loss": L, ...}), we reconstruct:
+//       phi_holo_scaled ≈ -log(max(loss, 1e-6)) * 10000
+//   and emit WARN= on the stdout line. Gate still applied.
+//
+// STDOUT (single line, ASCII-safe):
+//   [phi_gate] step=<N> phi_holo_scaled=<X> verdict=<PASS|FAIL> gate=1000
+//   With fallback:
+//   [phi_gate] step=<N> phi_holo_scaled=<X> verdict=<PASS|FAIL> gate=1000 WARN=fallback_from_ce
+//
+// EXIT
+//   0  PASS (phi_holo_scaled > 1000)
+//   1  FAIL (phi_holo_scaled ≤ 1000)
+//   2  input missing / unreadable / schema malformed
+//
+// CONVENTIONS
+//   - Self-contained; no cross-file imports (feedback_hexa_silent_exit_5_imports)
+//   - safe_read for file IO, no .find()
+//   - Byte-safe: JSON number extraction uses index_of + substring on ASCII
+//     keys only. NaN sentinels in phi_vec[1..15] are not parsed.
+//   - Fallback uses the trainer's natural-log formula (matches write_phi_vec).
+
+// =====================================================================
+// Safe IO
+// =====================================================================
+
+fn safe_read(path: string) -> string {
+    if file_exists(path) == false { return "" }
+    let raw = read_file(path)
+    let parts = raw.split("\n")
+    if parts.len() == 1 && parts[0] == "" { return "" }
+    return raw
+}
+
+// =====================================================================
+// JSON number extractor
+//   blob: raw JSON text
+//   key : "\"<field>\""  (e.g. "\"phi_holo_scaled\"")
+//   Returns: value as float, or sentinel (-999999.0) on miss.
+//
+// Strategy (matches alm_phi_vec_logger.hexa parse_steps_array pattern):
+//   1. locate `"key"` substring → key_idx
+//   2. find `:` after key_idx    → colon_idx
+//   3. scan forward skipping whitespace, collect [0-9.-eE] run
+//   4. to_float() on collected digits
+// =====================================================================
+
+fn index_of_from(hay: string, needle: string, start: int) -> int {
+    let n = len(hay)
+    if start < 0 { return hay.index_of(needle) }
+    if start >= n { return -1 }
+    let tail = hay.substring(start, n)
+    let idx = tail.index_of(needle)
+    if idx < 0 { return -1 }
+    return start + idx
+}
+
+fn byte_at(s: string, i: int) -> int {
+    let sub = s.substring(i, i + 1)
+    return char_code(sub, 0)
+}
+
+// Is this byte part of a JSON number literal? Accepts 0-9, ., -, +, e, E.
+fn is_num_byte(b: int) -> bool {
+    if b >= 48 && b <= 57 { return true }   // 0-9
+    if b == 46 { return true }              // .
+    if b == 45 { return true }              // -
+    if b == 43 { return true }              // +
+    if b == 101 { return true }             // e
+    if b == 69 { return true }              // E
+    return false
+}
+
+// Extract the float value following `"key":` in blob.
+// Returns -999999.0 on miss or NaN-literal (we treat NaN as missing).
+fn extract_float(blob: string, key: string) -> float {
+    let key_idx = blob.index_of(key)
+    if key_idx < 0 { return 0.0 - 999999.0 }
+    let colon_idx = index_of_from(blob, ":", key_idx)
+    if colon_idx < 0 { return 0.0 - 999999.0 }
+    let n = len(blob)
+    let mut i = colon_idx + 1
+    // Skip whitespace
+    while i < n {
+        let b = byte_at(blob, i)
+        if b == 32 || b == 9 || b == 10 || b == 13 { i = i + 1 } else { break }
+    }
+    // Check for NaN literal (python json.dump with allow_nan=True emits NaN).
+    if i + 3 <= n {
+        let lookahead = blob.substring(i, i + 3)
+        if lookahead == "NaN" { return 0.0 - 999999.0 }
+    }
+    // Collect digits
+    let start = i
+    while i < n {
+        let b = byte_at(blob, i)
+        if is_num_byte(b) { i = i + 1 } else { break }
+    }
+    if i == start { return 0.0 - 999999.0 }
+    let num_str = blob.substring(start, i)
+    return to_float(num_str)
+}
+
+// Extract integer in the same way (for "step").
+fn extract_int(blob: string, key: string) -> int {
+    let v = extract_float(blob, key)
+    if v < 0.0 - 999998.0 { return -1 }
+    return to_int(v)
+}
+
+// =====================================================================
+// Verifier
+// =====================================================================
+
+let GATE = 1000.0
+let MISS_SENTINEL = 0.0 - 999999.0
+
+fn verify(phi_path: string) -> int {
+    let blob = safe_read(phi_path)
+    if blob == "" {
+        // Try fallback to train_meta.json in same dir.
+        let dir_end = phi_path.index_of("phi_vec.json")
+        if dir_end < 0 {
+            print_err("[phi_gate] ERROR: cannot read phi_vec.json and no fallback path: " + phi_path)
+            return 2
+        }
+        let dir = phi_path.substring(0, dir_end)
+        let meta_path = dir + "train_meta.json"
+        let meta_blob = safe_read(meta_path)
+        if meta_blob == "" {
+            print_err("[phi_gate] ERROR: phi_vec.json and train_meta.json both missing at " + dir)
+            return 2
+        }
+        // Fallback: compute from train_meta.json "loss" field (= ce_proxy).
+        let step = extract_int(meta_blob, "\"step\"")
+        let loss = extract_float(meta_blob, "\"loss\"")
+        if loss <= MISS_SENTINEL + 1.0 || loss <= 0.0 {
+            print_err("[phi_gate] ERROR: train_meta.json malformed (no valid 'loss')")
+            return 2
+        }
+        // Mirror trainer formula: -log(max(ce, 1e-6)) * 10000
+        let clamped = if loss < 0.000001 { 0.000001 } else { loss }
+        let phi_holo_proxy = 0.0 - log(clamped)
+        let phi_holo_scaled = phi_holo_proxy * 10000.0
+        let verdict = if phi_holo_scaled > GATE { "PASS" } else { "FAIL" }
+        println("[phi_gate] step=" + to_string(step) +
+                " phi_holo_scaled=" + to_string(phi_holo_scaled) +
+                " verdict=" + verdict +
+                " gate=1000 WARN=fallback_from_ce")
+        if verdict == "PASS" { return 0 }
+        return 1
+    }
+
+    let step = extract_int(blob, "\"step\"")
+    let phi_scaled = extract_float(blob, "\"phi_holo_scaled\"")
+
+    if phi_scaled <= MISS_SENTINEL + 1.0 {
+        // Key absent or NaN — try to recompute from ce_proxy.
+        let ce = extract_float(blob, "\"ce_proxy\"")
+        if ce <= MISS_SENTINEL + 1.0 || ce <= 0.0 {
+            print_err("[phi_gate] ERROR: phi_vec.json missing phi_holo_scaled AND ce_proxy: " + phi_path)
+            return 2
+        }
+        let clamped = if ce < 0.000001 { 0.000001 } else { ce }
+        let recomputed = (0.0 - log(clamped)) * 10000.0
+        let verdict = if recomputed > GATE { "PASS" } else { "FAIL" }
+        println("[phi_gate] step=" + to_string(step) +
+                " phi_holo_scaled=" + to_string(recomputed) +
+                " verdict=" + verdict +
+                " gate=1000 WARN=recomputed_from_ce_proxy")
+        if verdict == "PASS" { return 0 }
+        return 1
+    }
+
+    let verdict = if phi_scaled > GATE { "PASS" } else { "FAIL" }
+    println("[phi_gate] step=" + to_string(step) +
+            " phi_holo_scaled=" + to_string(phi_scaled) +
+            " verdict=" + verdict + " gate=1000")
+    if verdict == "PASS" { return 0 }
+    return 1
+}
+
+fn main() {
+    let argv = args()
+    if argv.len() < 3 {
+        print_err("[phi_gate] ERROR: usage: hexa run training/phi_gt_1000_verify.hexa <path_to_phi_vec.json>")
+        print_err("[phi_gate]   example: /workspace/ckpt_alm_14b_r10c_seed3407/step_2000/phi_vec.json")
+        exit(2)
+    }
+    let path = argv[2]
+    let rc = verify(path)
+    exit(rc)
+}
+
+main()

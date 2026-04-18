@@ -1,0 +1,142 @@
+// corpus_strip_chatml.hexa — strip alm70b_chatml JSON wrapper from corpus
+//
+// Input  : /workspace/corpus_alm_70b.jsonl  (one {"role":"alm70b_chatml","messages":[...]} per line)
+// Output : /workspace/corpus_alm_70b_stripped.txt  (plain text, one message "content" per block)
+//
+// Rationale (r9 diagnosis, shared/state/r9_collapse_diagnosis.json):
+//   r9 model emitted literal {"":"}/`roleassistant`/JSON brackets at inference time
+//   because the chatml envelope `{"role":"alm70b_chatml","messages":[{"role":...,"content":"..."}]}`
+//   was encoded verbatim as training tokens. r10 feeds only the inner `content`
+//   strings, preserving turn boundaries via a `\n\n` delimiter.
+//
+// Policy: HEXA-FIRST. Pure-hexa — no python, no regex libs. Simple substring scan.
+//
+// Usage (on pod):
+//   hexa run /workspace/anima/training/corpus_strip_chatml.hexa \
+//     /workspace/corpus_alm_70b.jsonl \
+//     /workspace/corpus_alm_70b_stripped.txt
+
+fn find_field(s: String, key: String, start: Int) -> Int {
+    // Returns byte offset of `"key":"` opening-quote-of-value, or -1 if absent.
+    let needle = "\"" + key + "\":\""
+    let idx = s.index_of_from(needle, start)
+    if idx < 0 { return -1 }
+    return idx + needle.len()
+}
+
+fn scan_quoted(s: String, start: Int) -> Int {
+    // Returns byte offset of the closing quote of a JSON string starting at `start`,
+    // honoring backslash escapes. -1 on malformed.
+    let n = s.len()
+    let mut i = start
+    while i < n {
+        let c = s.char_at(i)
+        if c == "\\" {
+            i = i + 2
+        } else if c == "\"" {
+            return i
+        } else {
+            i = i + 1
+        }
+    }
+    return -1
+}
+
+fn unescape(raw: String) -> String {
+    // Minimal JSON unescape: \n \t \" \\ \/ ;  other \x passed through.
+    let n = raw.len()
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let c = raw.char_at(i)
+        if c == "\\" && i + 1 < n {
+            let d = raw.char_at(i + 1)
+            if d == "n" { out = out + "\n"; i = i + 2 }
+            else if d == "t" { out = out + "\t"; i = i + 2 }
+            else if d == "\"" { out = out + "\""; i = i + 2 }
+            else if d == "\\" { out = out + "\\"; i = i + 2 }
+            else if d == "/" { out = out + "/"; i = i + 2 }
+            else { out = out + d; i = i + 2 }
+        } else {
+            out = out + c
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn strip_line(line: String) -> String {
+    // Find every "content":"..." occurrence; emit each content string followed by \n\n.
+    let mut out = ""
+    let mut cursor = 0
+    let n = line.len()
+    let mut emitted = 0
+    while cursor < n {
+        let val_start = find_field(line, "content", cursor)
+        if val_start < 0 { break }
+        let val_end = scan_quoted(line, val_start)
+        if val_end < 0 { break }
+        let raw = line.substring(val_start, val_end)
+        let clean = unescape(raw)
+        if clean.len() > 0 {
+            if emitted > 0 { out = out + "\n" }
+            out = out + clean
+            emitted = emitted + 1
+        }
+        cursor = val_end + 1
+    }
+    if emitted > 0 { return out + "\n\n" }
+    return ""
+}
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+    let src = if argc >= 2 { argv[1] } else { "/workspace/corpus_alm_70b.jsonl" }
+    let dst = if argc >= 3 { argv[2] } else { "/workspace/corpus_alm_70b_stripped.txt" }
+
+    println("[strip] src=" + src)
+    println("[strip] dst=" + dst)
+
+    let text = read_file(src)
+    let n = text.len()
+    println("[strip] bytes=" + n.to_string())
+
+    let mut out = ""
+    let mut line_start = 0
+    let mut lines_in = 0
+    let mut lines_emit = 0
+    let mut i = 0
+    while i < n {
+        let c = text.char_at(i)
+        if c == "\n" {
+            let line = text.substring(line_start, i)
+            lines_in = lines_in + 1
+            let stripped = strip_line(line)
+            if stripped.len() > 0 {
+                out = out + stripped
+                lines_emit = lines_emit + 1
+            }
+            line_start = i + 1
+        }
+        i = i + 1
+    }
+    // trailing line (no terminator)
+    if line_start < n {
+        let line = text.substring(line_start, n)
+        lines_in = lines_in + 1
+        let stripped = strip_line(line)
+        if stripped.len() > 0 {
+            out = out + stripped
+            lines_emit = lines_emit + 1
+        }
+    }
+
+    write_file(dst, out)
+    println("[strip] lines_in="  + lines_in.to_string())
+    println("[strip] lines_emit=" + lines_emit.to_string())
+    println("[strip] bytes_out=" + out.len().to_string())
+    println("[strip] DONE")
+}
+
+main()

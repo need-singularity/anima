@@ -1,0 +1,554 @@
+// ═══════════════════════════════════════════════════════════════
+//  training/phi_corr_dashboard_daily.hexa — daily cron entry point
+//
+//  Reads shared/state/phi_corr_history.jsonl and emits a human-
+//  readable markdown report to shared/state/phi_corr_dashboard.md.
+//
+//  Format follows feedback_training_report:
+//      ASCII table + full numbers + status + top decay list
+//
+//  Expected cron invocation (from shared/config/commands.json or
+//  an external launchd job):
+//      hexa run training/phi_corr_dashboard_daily.hexa
+//
+//  No args required. Exits 0 always; "empty history" is not fatal
+//  because producer (A1 eval_phi_corr) may not have run yet.
+//
+//  Output path:
+//      shared/state/phi_corr_dashboard.md
+// ═══════════════════════════════════════════════════════════════
+
+let HISTORY_PATH_DEFAULT = "shared/state/phi_corr_history.jsonl"
+let OUT_MD_PATH          = "shared/state/phi_corr_dashboard.md"
+let WEAK_GATE            = 0.2
+let SIG_GATE             = 0.5
+let PRUNE_CONSECUTIVE_N  = 3
+let DECAY_RATIO          = 0.70
+
+// ─── minimal helpers (self-contained — NO cross-file imports per
+//     feedback_hexa_silent_exit_5_imports) ────────────────────────
+
+fn m_fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn m_fmt2(x: float) -> string {
+    let neg = x < 0.0
+    let ax = if neg { 0.0 - x } else { x }
+    let scaled = ax * 100.0 + 0.5
+    let k = to_int(scaled)
+    let whole = k / 100
+    let frac  = k - whole * 100
+    let mut fs = str(frac)
+    if len(fs) < 2 { fs = "0" + fs }
+    let body = str(whole) + "." + fs
+    if neg { return "-" + body }
+    return body
+}
+
+fn m_fmt3(x: float) -> string {
+    let neg = x < 0.0
+    let ax = if neg { 0.0 - x } else { x }
+    let scaled = ax * 1000.0 + 0.5
+    let k = to_int(scaled)
+    let whole = k / 1000
+    let frac  = k - whole * 1000
+    let mut fs = str(frac)
+    while len(fs) < 3 { fs = "0" + fs }
+    let body = str(whole) + "." + fs
+    if neg { return "-" + body }
+    return body
+}
+
+fn m_pad_r(s: string, w: int) -> string {
+    let n = len(s)
+    if n >= w { return s }
+    let mut out = s
+    let mut i = 0
+    while i < w - n { out = out + " "; i = i + 1 }
+    return out
+}
+
+fn m_pad_l(s: string, w: int) -> string {
+    let n = len(s)
+    if n >= w { return s }
+    let mut out = ""
+    let mut i = 0
+    while i < w - n { out = out + " "; i = i + 1 }
+    return out + s
+}
+
+fn m_pad_c(s: string, w: int) -> string {
+    let n = len(s)
+    if n >= w { return s }
+    let total = w - n
+    let left = total / 2
+    let right = total - left
+    let mut out = ""
+    let mut i = 0
+    while i < left { out = out + " "; i = i + 1 }
+    out = out + s
+    let mut j = 0
+    while j < right { out = out + " "; j = j + 1 }
+    return out
+}
+
+// ─── JSON mini-parser ──────────────────────────────────────────────
+
+fn mj_scalar(blob: string, key: string) -> string {
+    let probe = "\"" + key + "\""
+    let k = blob.index_of(probe)
+    if k < 0 { return "" }
+    let n = len(blob)
+    let mut i = k + len(probe)
+    while i < n && blob.substring(i, i + 1) != ":" { i = i + 1 }
+    if i >= n { return "" }
+    i = i + 1
+    while i < n {
+        let c = blob.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" { i = i + 1 } else { break }
+    }
+    let mut j = i
+    let mut in_str = false
+    while j < n {
+        let c = blob.substring(j, j + 1)
+        if c == "\"" { in_str = !in_str }
+        if !in_str {
+            if c == "," || c == "}" || c == "]" { break }
+        }
+        j = j + 1
+    }
+    let raw = blob.substring(i, j)
+    let mut a = 0
+    let mut b = len(raw)
+    while a < b {
+        let c = raw.substring(a, a + 1)
+        if c == " " || c == "\t" || c == "\"" { a = a + 1 } else { break }
+    }
+    while b > a {
+        let c = raw.substring(b - 1, b)
+        if c == " " || c == "\t" || c == "\"" { b = b - 1 } else { break }
+    }
+    return raw.substring(a, b)
+}
+
+fn mj_f(s: string) -> float {
+    if len(s) == 0 { return 0.0 }
+    return to_float(s)
+}
+
+fn mj_i(s: string) -> int {
+    if len(s) == 0 { return 0 }
+    return to_int(s)
+}
+
+fn m_split_dims(blob: string) -> array {
+    let mut out = []
+    let k = blob.index_of("\"dims\"")
+    if k < 0 { return out }
+    let n = len(blob)
+    let mut lb = k
+    while lb < n && blob.substring(lb, lb + 1) != "[" { lb = lb + 1 }
+    if lb >= n { return out }
+    let mut rb = lb + 1
+    let mut depth = 1
+    while rb < n && depth > 0 {
+        let c = blob.substring(rb, rb + 1)
+        if c == "[" { depth = depth + 1 }
+        if c == "]" { depth = depth - 1 }
+        if depth == 0 { break }
+        rb = rb + 1
+    }
+    if rb <= lb { return out }
+    let inner = blob.substring(lb + 1, rb)
+    let m = len(inner)
+    let mut i = 0
+    while i < m {
+        let c = inner.substring(i, i + 1)
+        if c == "{" {
+            let mut d = 1
+            let mut j = i + 1
+            while j < m && d > 0 {
+                let cc = inner.substring(j, j + 1)
+                if cc == "{" { d = d + 1 }
+                if cc == "}" { d = d - 1 }
+                if d == 0 { break }
+                j = j + 1
+            }
+            if j < m {
+                out = out.push(inner.substring(i, j + 1))
+                i = j + 1
+            } else {
+                i = m
+            }
+        } else {
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn parse_line(line: string) -> array {
+    let objs = m_split_dims(line)
+    let nd = len(objs)
+    let mut names = []
+    let mut rs = []
+    let mut ws = []
+    let mut i = 0
+    while i < nd {
+        let o = objs[i]
+        names = names.push(mj_scalar(o, "name"))
+        let mut rs_s = mj_scalar(o, "r_pearson_acc")
+        if len(rs_s) == 0 { rs_s = mj_scalar(o, "r_pearson") }
+        rs = rs.push(mj_f(rs_s))
+        ws = ws.push(mj_f(mj_scalar(o, "weight")))
+        i = i + 1
+    }
+    let mut out = []
+    out = out.push(mj_scalar(line, "run_ts"))
+    out = out.push(mj_i(mj_scalar(line, "step")))
+    out = out.push(mj_scalar(line, "model_tag"))
+    out = out.push(mj_i(mj_scalar(line, "round")))
+    out = out.push(names)
+    out = out.push(rs)
+    out = out.push(ws)
+    return out
+}
+
+fn read_runs(path: string) -> array {
+    let mut runs = []
+    if !file_exists(path) { return runs }
+    let blob = read_file(path)
+    let lines = blob.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    while i < n {
+        let ln = lines[i]
+        if len(ln) > 0 && ln.index_of("\"dims\"") >= 0 {
+            runs = runs.push(parse_line(ln))
+        }
+        i = i + 1
+    }
+    return runs
+}
+
+fn idx_of(names: array, target: string) -> int {
+    let n = len(names)
+    let mut i = 0
+    while i < n {
+        if names[i] == target { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn collect_rs(runs: array, dim: string) -> array {
+    let n = len(runs)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let r = runs[i]
+        let idx = idx_of(r[4], dim)
+        if idx >= 0 { out = out.push(r[5][idx]) }
+        i = i + 1
+    }
+    return out
+}
+
+fn collect_ws(runs: array, dim: string) -> array {
+    let n = len(runs)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let r = runs[i]
+        let idx = idx_of(r[4], dim)
+        if idx >= 0 { out = out.push(r[6][idx]) }
+        i = i + 1
+    }
+    return out
+}
+
+fn trailing_weak(rs: array) -> int {
+    let n = len(rs)
+    let mut i = n - 1
+    let mut c = 0
+    while i >= 0 {
+        if m_fabs(rs[i]) < WEAK_GATE { c = c + 1 } else { break }
+        i = i - 1
+    }
+    return c
+}
+
+fn peak_v(xs: array) -> float {
+    let n = len(xs)
+    let mut p = 0.0
+    let mut i = 0
+    while i < n { if xs[i] > p { p = xs[i] } ; i = i + 1 }
+    return p
+}
+
+fn last_v(xs: array) -> float {
+    let n = len(xs)
+    if n == 0 { return 0.0 }
+    return xs[n - 1]
+}
+
+fn classify(rs: array, ws: array) -> string {
+    if len(rs) == 0 { return "NODATA" }
+    if trailing_weak(rs) >= PRUNE_CONSECUTIVE_N { return "PRUNE" }
+    let peak = peak_v(ws)
+    let cur  = last_v(ws)
+    if peak > 0.0 && cur < peak * DECAY_RATIO { return "DECAY" }
+    let last_r = m_fabs(last_v(rs))
+    if last_r >= SIG_GATE  { return "STABLE" }
+    if last_r >= WEAK_GATE { return "WEAK" }
+    return "NULL"
+}
+
+fn union_names(runs: array) -> array {
+    let mut out = []
+    let n = len(runs)
+    let mut i = 0
+    while i < n {
+        let names = runs[i][4]
+        let m = len(names)
+        let mut j = 0
+        while j < m {
+            let nm = names[j]
+            let mut seen = false
+            let mut k = 0
+            while k < len(out) {
+                if out[k] == nm { seen = true; break }
+                k = k + 1
+            }
+            if !seen { out = out.push(nm) }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Markdown emission (ASCII table per feedback_training_report) ─
+
+let W_DIM = 16
+let W_RUNS = 5
+let W_R = 4
+let W_W = 7
+let W_ST = 9
+
+fn dashes(n: int) -> string {
+    let mut s = ""
+    let mut i = 0
+    while i < n { s = s + "-"; i = i + 1 }
+    return s
+}
+
+fn border() -> string {
+    let mut s = "+"
+    s = s + dashes(W_DIM + 2)  + "+"
+    s = s + dashes(W_RUNS + 2) + "+"
+    s = s + dashes(W_R + 2)    + "+"
+    s = s + dashes(W_W + 2)    + "+"
+    s = s + dashes(W_ST + 2)   + "+"
+    return s
+}
+
+fn header() -> string {
+    let mut s = "|"
+    s = s + " " + m_pad_r("dim",    W_DIM)  + " |"
+    s = s + " " + m_pad_c("runs",   W_RUNS) + " |"
+    s = s + " " + m_pad_c("|r|",    W_R)    + " |"
+    s = s + " " + m_pad_c("weight", W_W)    + " |"
+    s = s + " " + m_pad_c("status", W_ST)   + " |"
+    return s
+}
+
+fn render_row(nm: string, runs_c: int, ar: float, w: float, st: string) -> string {
+    let mut s = "|"
+    s = s + " " + m_pad_r(nm, W_DIM) + " |"
+    s = s + " " + m_pad_c(str(runs_c), W_RUNS) + " |"
+    s = s + " " + m_pad_l(m_fmt2(ar), W_R) + " |"
+    s = s + " " + m_pad_l(m_fmt3(w),  W_W) + " |"
+    s = s + " " + m_pad_r(st, W_ST) + " |"
+    return s
+}
+
+fn count_st(runs: array, target: string) -> int {
+    let dims = union_names(runs)
+    let m = len(dims)
+    let mut c = 0
+    let mut i = 0
+    while i < m {
+        let rs = collect_rs(runs, dims[i])
+        let ws = collect_ws(runs, dims[i])
+        if classify(rs, ws) == target { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+fn build_md(runs: array) -> string {
+    let n_runs = len(runs)
+    let mut md = ""
+    md = md + "# Φ Correlation Dashboard (P25)\n\n"
+    md = md + "**Source**: `" + HISTORY_PATH_DEFAULT + "`  \n"
+    md = md + "**Runs**: " + str(n_runs) + "  \n"
+    if n_runs > 0 {
+        let last_ts = runs[n_runs - 1][0]
+        let last_step = runs[n_runs - 1][1]
+        let last_tag = runs[n_runs - 1][2]
+        let last_round = runs[n_runs - 1][3]
+        md = md + "**Latest**: " + last_ts
+              + " — " + last_tag + " r" + str(last_round)
+              + " step=" + str(last_step) + "  \n"
+    }
+    md = md + "\n"
+
+    if n_runs == 0 {
+        md = md + "_No runs yet. Producer `training/eval_phi_corr.hexa --manifest <...>` has not emitted._\n"
+        return md
+    }
+
+    // Gate definitions
+    md = md + "## Gate definitions\n\n"
+    md = md + "- `STABLE` : |r_pearson| ≥ " + m_fmt2(SIG_GATE) + " at latest run\n"
+    md = md + "- `WEAK`   : " + m_fmt2(WEAK_GATE) + " ≤ |r| < " + m_fmt2(SIG_GATE) + "\n"
+    md = md + "- `DECAY`  : current weight < " + m_fmt2(DECAY_RATIO) + " × historical peak\n"
+    md = md + "- `PRUNE`  : |r| < " + m_fmt2(WEAK_GATE)
+              + " for ≥ " + str(PRUNE_CONSECUTIVE_N) + " consecutive runs\n"
+    md = md + "- `NULL`   : |r| below WEAK_GATE but streak not yet 3\n\n"
+
+    md = md + "## Per-dim status\n\n"
+    md = md + "```\n"
+    md = md + border() + "\n"
+    md = md + header() + "\n"
+    md = md + border() + "\n"
+    let dims = union_names(runs)
+    let m = len(dims)
+    let mut i = 0
+    while i < m {
+        let nm = dims[i]
+        let rs = collect_rs(runs, nm)
+        let ws = collect_ws(runs, nm)
+        let rc = len(rs)
+        let ar = m_fabs(last_v(rs))
+        let w  = last_v(ws)
+        let st = classify(rs, ws)
+        md = md + render_row(nm, rc, ar, w, st) + "\n"
+        i = i + 1
+    }
+    md = md + border() + "\n"
+    md = md + "```\n\n"
+
+    md = md + "## Summary counts\n\n"
+    md = md + "- STABLE : " + str(count_st(runs, "STABLE")) + "\n"
+    md = md + "- WEAK   : " + str(count_st(runs, "WEAK")) + "\n"
+    md = md + "- DECAY  : " + str(count_st(runs, "DECAY")) + "\n"
+    md = md + "- PRUNE  : " + str(count_st(runs, "PRUNE")) + "\n"
+    md = md + "- NULL   : " + str(count_st(runs, "NULL")) + "\n\n"
+
+    // Actionable: list pruning candidates by name
+    md = md + "## Pruning candidates\n\n"
+    let mut any_prune = false
+    let mut j = 0
+    while j < m {
+        let nm = dims[j]
+        let rs = collect_rs(runs, nm)
+        let ws = collect_ws(runs, nm)
+        if classify(rs, ws) == "PRUNE" {
+            md = md + "- **" + nm + "** — last |r|=" + m_fmt2(m_fabs(last_v(rs)))
+                   + ", consecutive weak runs="
+                   + str(trailing_weak(rs)) + "\n"
+            any_prune = true
+        }
+        j = j + 1
+    }
+    if !any_prune { md = md + "_None._\n" }
+    md = md + "\n"
+
+    md = md + "## Decaying dims\n\n"
+    let mut any_decay = false
+    let mut j2 = 0
+    while j2 < m {
+        let nm = dims[j2]
+        let rs = collect_rs(runs, nm)
+        let ws = collect_ws(runs, nm)
+        if classify(rs, ws) == "DECAY" {
+            let peak = peak_v(ws)
+            let cur  = last_v(ws)
+            let drop_ratio = if peak > 0.0 { (peak - cur) / peak } else { 0.0 }
+            md = md + "- **" + nm + "** — peak=" + m_fmt3(peak)
+                   + " cur=" + m_fmt3(cur)
+                   + " drop=" + m_fmt2(drop_ratio * 100.0) + "%\n"
+            any_decay = true
+        }
+        j2 = j2 + 1
+    }
+    if !any_decay { md = md + "_None._\n" }
+    md = md + "\n"
+
+    md = md + "---\n"
+    md = md + "_Generated by_ `training/phi_corr_dashboard_daily.hexa` — "
+    md = md + "P25 observability lane, HEXA-FIRST.\n"
+    return md
+}
+
+fn arg_val(argv: array, key: string) -> string {
+    let n = len(argv)
+    let mut i = 0
+    while i < n {
+        if argv[i] == key && i + 1 < n { return argv[i + 1] }
+        i = i + 1
+    }
+    return ""
+}
+
+fn has_flag(argv: array, key: string) -> bool {
+    let n = len(argv)
+    let mut i = 0
+    while i < n {
+        if argv[i] == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn main() {
+    let argv = args()
+    let path_override = arg_val(argv, "--path")
+    let out_override  = arg_val(argv, "--out")
+    let selftest = has_flag(argv, "--self-test")
+
+    let mut path = if len(path_override) > 0 { path_override } else { HISTORY_PATH_DEFAULT }
+    let mut out_path = if len(out_override) > 0 { out_override } else { OUT_MD_PATH }
+
+    if selftest {
+        path = "/tmp/phi_corr_history_test.jsonl"
+        out_path = "/tmp/phi_corr_dashboard_test.md"
+        // write synthetic fixture so cron code path is fully exercised
+        let mut blob = ""
+        blob = blob + "{\"run_ts\":\"2026-04-14T00:00:00Z\",\"step\":500,\"model_tag\":\"alm14b\",\"round\":4,\"n_checkpoints\":5,\"dims\":[{\"name\":\"phi_holo\",\"r_pearson_acc\":0.880,\"weight\":0.880},{\"name\":\"phi_decay\",\"r_pearson_acc\":0.700,\"weight\":0.700},{\"name\":\"phi_prune\",\"r_pearson_acc\":0.300,\"weight\":0.300},{\"name\":\"phi_weak\",\"r_pearson_acc\":0.300,\"weight\":0.300}]}\n"
+        blob = blob + "{\"run_ts\":\"2026-04-15T00:00:00Z\",\"step\":1000,\"model_tag\":\"alm14b\",\"round\":4,\"n_checkpoints\":5,\"dims\":[{\"name\":\"phi_holo\",\"r_pearson_acc\":0.910,\"weight\":0.910},{\"name\":\"phi_decay\",\"r_pearson_acc\":0.850,\"weight\":0.850},{\"name\":\"phi_prune\",\"r_pearson_acc\":0.250,\"weight\":0.250},{\"name\":\"phi_weak\",\"r_pearson_acc\":0.320,\"weight\":0.320}]}\n"
+        blob = blob + "{\"run_ts\":\"2026-04-16T00:00:00Z\",\"step\":1500,\"model_tag\":\"alm14b\",\"round\":4,\"n_checkpoints\":5,\"dims\":[{\"name\":\"phi_holo\",\"r_pearson_acc\":0.900,\"weight\":0.900},{\"name\":\"phi_decay\",\"r_pearson_acc\":0.600,\"weight\":0.600},{\"name\":\"phi_prune\",\"r_pearson_acc\":0.150,\"weight\":0.150},{\"name\":\"phi_weak\",\"r_pearson_acc\":0.280,\"weight\":0.280}]}\n"
+        blob = blob + "{\"run_ts\":\"2026-04-17T00:00:00Z\",\"step\":2000,\"model_tag\":\"alm14b\",\"round\":4,\"n_checkpoints\":5,\"dims\":[{\"name\":\"phi_holo\",\"r_pearson_acc\":0.920,\"weight\":0.920},{\"name\":\"phi_decay\",\"r_pearson_acc\":0.400,\"weight\":0.400},{\"name\":\"phi_prune\",\"r_pearson_acc\":0.100,\"weight\":0.100},{\"name\":\"phi_weak\",\"r_pearson_acc\":0.310,\"weight\":0.310}]}\n"
+        blob = blob + "{\"run_ts\":\"2026-04-18T00:00:00Z\",\"step\":2500,\"model_tag\":\"alm14b\",\"round\":4,\"n_checkpoints\":5,\"dims\":[{\"name\":\"phi_holo\",\"r_pearson_acc\":0.900,\"weight\":0.900},{\"name\":\"phi_decay\",\"r_pearson_acc\":0.200,\"weight\":0.200},{\"name\":\"phi_prune\",\"r_pearson_acc\":0.080,\"weight\":0.080},{\"name\":\"phi_weak\",\"r_pearson_acc\":0.290,\"weight\":0.290}]}\n"
+        write_file(path, blob)
+    }
+
+    println("[phi_corr_dashboard_daily] reading: " + path)
+    let runs = read_runs(path)
+    let n_runs = len(runs)
+    println("  runs: " + str(n_runs))
+
+    let md = build_md(runs)
+    write_file(out_path, md)
+    println("  wrote: " + out_path)
+    if selftest && n_runs == 5 {
+        println("[phi_corr_dashboard_daily] VERDICT PASS — synthetic 5-run md rendered")
+    }
+    println("pass=1")
+}
+
+main()

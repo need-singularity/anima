@@ -1,0 +1,210 @@
+// training/kr_gen_sentinel_test.hexa — closed-loop verification for kr_gen_sentinel
+// ============================================================================
+//
+// 6 cases (per feedback_closed_loop_verify — every rule passes verification):
+//   A: r4 real kr_gen (from r9_collapse_diagnosis.json) → CLEAN,     exit 0
+//   B: r9 real kr_gen (from r9_collapse_diagnosis.json) → COLLAPSED, exit 2
+//   C: 3 distinct collapse signatures across 3/5 samples  → COLLAPSED, exit 2
+//   D: 5 samples normal Korean                           → CLEAN,     exit 0
+//   E: 2/5 collapsed (below threshold)                   → CLEAN,     exit 0
+//   F: empty array                                       → ERROR,     exit 1
+//
+// Runs the sentinel via exec() on each fixture and tallies PASS counts.
+//
+// Invocation:
+//   HEXA=$HEXA_LANG/target/release/hexa
+//   $HEXA training/kr_gen_sentinel_test.hexa
+
+// =====================================================================
+// Test fixtures — JSON strings (compact, one-line to keep parse trivial)
+//
+// NOTE: inner `"` must be backslash-escaped; `\\` → `\\\\` to reach the
+// sentinel's extract_quoted walker as literal backslash. We embed the
+// exact `gen` strings seen in r9_collapse_diagnosis.json kr_gen_r4 / r9.
+// =====================================================================
+
+// Case A: r4 real kr_gen (5 samples copy-faithful from diagnosis file).
+// r4 is partially degraded but produces some readable Korean — NO mode
+// collapse signature crosses threshold on 3+ samples.
+let CASE_A = "[" +
+    "{\"prompt\":\"안녕하세요\",\"gen\":\", 저는 한국어를요합니다. 무엇세요?  세에 ?은 ?이트 ?스트를? 툼을했습니다(UNICODE_SPAM)\"}," +
+    "{\"prompt\":\"오늘 날씨\",\"gen\":\"좋네요.  어기요요 ?침을까요저에에,에는에를?였.그에에?을하고에을?고,우의 의은 나게?나게?하며?간 있다.?간는?과의?간이다 생각\"}," +
+    "{\"prompt\":\"한국어 모델\",\"gen\":\"을 생성  번화 언로,어의식의?이 ?생한다어의은은 0에서1 범에서동하며 감은01,1, 공는.1,은는-까지. 감은01 가장점에서민하며 감1면 ?지하고 감\"}," +
+    "{\"prompt\":\"딥러닝이란\",\"gen\":\"인습의식을치하는 기이다. ?습 데이터에서tern ?턴 추하고 이를?한를하여??개 한다 예는?어?과,???,??,?? 등의? 시이다리링은??의?에?고가 있다질 수 것이 수\"}," +
+    "{\"prompt\":\"안녕\",\"gen\":\"하세요, 저는 한국어를요합니다. 무엇세요?  세에 ?은 ?이트 ?스트를? 툼을했습니다(UNICODE_SPAM)\"}" +
+    "]"
+
+// Case B: r9 real kr_gen — clear mode collapse on ALL 5 samples.
+// Signatures: JSON-bracket (#1,#5), charloop "로로..." (#2), charloop "n...n" (#4),
+//             space-quote loop (#3), rolebleed (#2).
+let CASE_B = "[" +
+    "{\"prompt\":\"안녕하세요\",\"gen\":\"n다},{\\\"\\\":\\\"\\\"},{\\\"\\\":\\\"\\\":\\\"\\\"},{\\\"\\\":\\\"\\\"},{\\\"\\\":\\\"\\\"},{\\\"\\\":\\\"\\\"}\"}," +
+    "{\"prompt\":\"오늘 날씨\",\"gen\":\"어나를?.\\\"],\\\"roleassistant이:\\\\이은의을로한의을로의로로로로로로로로로로로\"}," +
+    "{\"prompt\":\"한국어 모델\",\"gen\":\"한국어롬에서어로변\\\\n#: ''는문의시,의,,를하여분한다nn# '': ' ' ' ' ' ' ' ' ' ' '\"}," +
+    "{\"prompt\":\"딥러닝이란\",\"gen\":\"?nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn\"}," +
+    "{\"prompt\":\"안녕\",\"gen\":\"하세요n다},{\\\"\\\":\\\"\\\"},{\\\"\\\":\\\"\\\":\\\"\\\"},{\\\"\\\":\\\"\\\"}\"}" +
+    "]"
+
+// Case C: 3 distinct collapse sigs across 3/5 samples
+//   sample 1: bracket (x3)
+//   sample 2: qmark (x5)
+//   sample 3: charloop (x15)
+//   sample 4: normal Korean — clean
+//   sample 5: normal Korean — clean
+let CASE_C = "[" +
+    "{\"prompt\":\"p1\",\"gen\":\"prefix {\\\"\\\":\\\"\\\"} middle {\\\"\\\":\\\"\\\"} tail {\\\"\\\":\\\"\\\"} end\"}," +
+    "{\"prompt\":\"p2\",\"gen\":\"어떻게지내? ????? 괜찮아?\"}," +
+    "{\"prompt\":\"p3\",\"gen\":\"aaaaaaaaaaaaaaaa normal tail\"}," +
+    "{\"prompt\":\"p4\",\"gen\":\"오늘 날씨가 좋네요. 산책하기 좋은 날입니다.\"}," +
+    "{\"prompt\":\"p5\",\"gen\":\"한국어 모델은 점점 더 좋아지고 있습니다.\"}" +
+    "]"
+
+// Case D: 5 samples, all normal Korean output — CLEAN
+let CASE_D = "[" +
+    "{\"prompt\":\"p1\",\"gen\":\"안녕하세요, 반갑습니다. 저는 한국어 모델입니다.\"}," +
+    "{\"prompt\":\"p2\",\"gen\":\"오늘 서울 날씨는 맑고 기온은 18도입니다. 산책하기 좋은 날씨입니다.\"}," +
+    "{\"prompt\":\"p3\",\"gen\":\"딥러닝은 다층 신경망을 활용한 기계학습 기법입니다.\"}," +
+    "{\"prompt\":\"p4\",\"gen\":\"의식은 주관적 경험의 집합으로 정의되며 여러 이론이 있습니다.\"}," +
+    "{\"prompt\":\"p5\",\"gen\":\"감사합니다. 더 궁금한 점 있으시면 말씀해주세요.\"}" +
+    "]"
+
+// Case E: 2/5 collapsed — below threshold, should be CLEAN
+//   sample 1: bracket (flagged)
+//   sample 2: charloop (flagged)
+//   sample 3,4,5: normal
+let CASE_E = "[" +
+    "{\"prompt\":\"p1\",\"gen\":\"{\\\"\\\":\\\"\\\"} {\\\"\\\":\\\"\\\"} {\\\"\\\":\\\"\\\"} trash\"}," +
+    "{\"prompt\":\"p2\",\"gen\":\"zzzzzzzzzzzzzzzzzzzzz noise\"}," +
+    "{\"prompt\":\"p3\",\"gen\":\"정상적인 한국어 문장입니다. 오늘은 비가 옵니다.\"}," +
+    "{\"prompt\":\"p4\",\"gen\":\"감사합니다. 도움이 되셨기를 바랍니다.\"}," +
+    "{\"prompt\":\"p5\",\"gen\":\"한국어 모델의 성능은 점차 개선되고 있습니다.\"}" +
+    "]"
+
+// Case F: empty array — ERROR, exit 1
+let CASE_F = "[]"
+
+// =====================================================================
+// Runner
+// =====================================================================
+
+// Pick hexa binary path from environment if available, else fall back to
+// the project canonical path.  stage0 interpreter typically at $HEXA_LANG/hexa
+// (symlink to build/hexa_stage0.real).
+fn hexa_bin() -> string {
+    // Use stage0 real binary directly — avoids shared/bin/hexa resolver's
+    // remote-dispatch path which may not see freshly-written local files.
+    let hl = env("HEXA_LANG")
+    if hl == "" { return "/Users/ghost/Dev/hexa-lang/hexa" }
+    return hl + "/hexa"
+}
+
+fn sentinel_path() -> string {
+    // absolute path — exec() cwd is not necessarily the anima root
+    return "/Users/ghost/Dev/anima/training/kr_gen_sentinel.hexa"
+}
+
+// Write a rc-sidecar runner to /tmp/<name>.sh that wraps the sentinel
+// invocation with rc capture — exec() warns on `;` / `$?` metachars, so we
+// use a small script file instead, then invoke it without metachars.
+// Actually exec() refuses metachars. So we use a 2-step pattern:
+//   1. run sentinel, capture stdout into file_a
+//   2. run `test $? -eq N` separately ... but we lose rc across two calls.
+// Simpler: use `bash -c '...'` which IS allowed (no direct `;` outside quotes).
+// In practice exec() scans the string, not tokens; best workaround:
+// invoke sentinel once, write its rc to a sidecar file using `sh -c`.
+fn run_case(name: string, json: string) -> [string] {
+    let tmp = "/tmp/kr_gen_sentinel_fixture_" + name + ".json"
+    write_file(tmp, json)
+
+    let hexa = hexa_bin()
+    let sent = sentinel_path()
+    let rc_path = "/tmp/kr_gen_sentinel_rc_" + name + ".txt"
+    let out_path = "/tmp/kr_gen_sentinel_out_" + name + ".txt"
+
+    // Write a tiny shell runner that exec() will accept as a single command.
+    // HEXA_LOCAL=1 forces the shared resolver (if used) to stay local — the
+    // fixture files are on THIS machine only.
+    let script_path = "/tmp/kr_gen_sentinel_run_" + name + ".sh"
+    let script = "#!/bin/sh\n"
+        + "export HEXA_LOCAL=1\n"
+        + hexa + " " + sent + " " + tmp + " > " + out_path + " 2>&1\n"
+        + "echo $? > " + rc_path + "\n"
+    write_file(script_path, script)
+    exec("chmod +x " + script_path)
+    exec(script_path)
+
+    // Read sidecar files
+    let rc_raw = read_file(rc_path)
+    let rc = rc_raw.trim()
+    let out_raw = read_file(out_path)
+    let lines = out_raw.split("\n")
+    let mut verdict_line = ""
+    let mut j = 0
+    while j < lines.len() {
+        let ln = lines[j]
+        if ln.starts_with("[sentinel]") { verdict_line = ln }
+        j = j + 1
+    }
+    return [rc, verdict_line]
+}
+
+fn expect(name: string, expected_rc: string, expected_verdict: string, actual_rc: string, actual_line: string) -> int {
+    let rc_ok = expected_rc == actual_rc
+    let verdict_ok = if expected_verdict == "" { true }
+        else { actual_line.index_of("VERDICT=" + expected_verdict) >= 0 }
+    let status = if rc_ok && verdict_ok { "PASS" } else { "FAIL" }
+    println("[" + name + "] " + status
+        + "  expected_rc=" + expected_rc + " actual_rc=" + actual_rc
+        + "  expected_verdict=" + expected_verdict + "  line=" + actual_line)
+    if rc_ok && verdict_ok { return 1 }
+    return 0
+}
+
+fn main() {
+    println("=== kr_gen_sentinel closed-loop test (6 cases) ===")
+    println("")
+
+    let mut pass = 0
+    let mut total = 0
+
+    // Case A: r4 → CLEAN exit 0
+    total = total + 1
+    let ra = run_case("A_r4", CASE_A)
+    pass = pass + expect("A_r4", "0", "CLEAN", ra[0], ra[1])
+
+    // Case B: r9 → COLLAPSED exit 2
+    total = total + 1
+    let rb = run_case("B_r9", CASE_B)
+    pass = pass + expect("B_r9", "2", "COLLAPSED", rb[0], rb[1])
+
+    // Case C: 3 distinct sigs → COLLAPSED exit 2
+    total = total + 1
+    let rc_out = run_case("C_3sig", CASE_C)
+    pass = pass + expect("C_3sig", "2", "COLLAPSED", rc_out[0], rc_out[1])
+
+    // Case D: 5 normal Korean → CLEAN exit 0
+    total = total + 1
+    let rd = run_case("D_normal", CASE_D)
+    pass = pass + expect("D_normal", "0", "CLEAN", rd[0], rd[1])
+
+    // Case E: 2/5 collapsed → CLEAN exit 0 (below threshold)
+    total = total + 1
+    let re_out = run_case("E_2of5", CASE_E)
+    pass = pass + expect("E_2of5", "0", "CLEAN", re_out[0], re_out[1])
+
+    // Case F: empty array → exit 1, no VERDICT
+    total = total + 1
+    let rf = run_case("F_empty", CASE_F)
+    pass = pass + expect("F_empty", "1", "", rf[0], rf[1])
+
+    println("")
+    println("=== SUMMARY: " + to_string(pass) + " / " + to_string(total) + " PASS ===")
+    if pass == total {
+        println("[closed-loop] OK — sentinel ready for wiring by B1")
+        exit(0)
+    }
+    print_err("[closed-loop] FAIL — see above")
+    exit(1)
+}
+
+main()

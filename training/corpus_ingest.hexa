@@ -1,0 +1,435 @@
+// training/corpus_ingest.hexa — P22 Korean corpus ingest pipeline (smoke)
+//
+// A2 task — inventories local KR text sources, content-hash dedupes,
+// emits merged jsonl + manifest.json.
+//
+// Sources (verified by discovery step 2026-04-18):
+//   1. training/corpus_tool/clean_tool_corpus_dryrun_20260418.jsonl   (643KB jsonl)
+//   2. training/corpus_tool/mixed_tool_corpus.jsonl                   (3.2MB jsonl)
+//   3. training/corpus_tool/seed_tool_corpus.jsonl                    (31KB jsonl)
+//   4. training/corpus_auto/out/rotated.txt                           (454KB txt)
+//   5. anima-speak/corpus/<persona>/transcript/*.txt                  (~5KB txt)
+//
+// Local KR text total: ~4.5MB — far under 100MB threshold. Per task spec
+// we pivot to "pipeline + register pull target in corpus_sources.json".
+//
+// Run:
+//   $HEXA training/corpus_ingest.hexa                         # smoke (≤50MB slice)
+//   $HEXA training/corpus_ingest.hexa --limit-mb 50
+//   $HEXA training/corpus_ingest.hexa --only-new              # only pull-targets under corpus_auto/*.jsonl (e.g. kowiki)
+//
+// Outputs:
+//   training/corpus_auto/manifest.json       — per-source byte count + hash
+//   training/corpus_auto/corpus_merged_kr.jsonl — merged dedup'd jsonl
+//
+// 2026-04-18 (E2): discover_sources() now also scans corpus_auto/*.jsonl
+// (picks up kowiki.jsonl, any other large KR pulls). --only-new filters
+// to just those — avoids re-hashing the small tool_corpus + persona
+// transcripts on incremental ingests.
+
+let ANIMA_ROOT       = "/Users/ghost/Dev/anima"
+let OUT_DIR          = "/Users/ghost/Dev/anima/training/corpus_auto"
+let OUT_JSONL        = "/Users/ghost/Dev/anima/training/corpus_auto/corpus_merged_kr.jsonl"
+let OUT_MANIFEST     = "/Users/ghost/Dev/anima/training/corpus_auto/manifest.json"
+let DEFAULT_LIMIT_MB = 50
+let HASH_MOD         = 2147483647
+
+// =====================================================================
+// CLI
+// =====================================================================
+
+fn parse_flag(argv: [string], key: string) -> string {
+    let n = len(argv)
+    let mut i = 0
+    while i < n {
+        if argv[i] == key {
+            if i + 1 < n { return argv[i + 1] }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn parse_limit_mb(argv: [string]) -> int {
+    let v = parse_flag(argv, "--limit-mb")
+    if v == "" { return DEFAULT_LIMIT_MB }
+    return to_int(v)
+}
+
+// Boolean flag: presence of --only-new in argv restricts discover_sources()
+// output to files under corpus_auto/ (incremental ingest for large pulls).
+fn has_flag(argv: [string], key: string) -> bool {
+    let n = len(argv)
+    let mut i = 0
+    while i < n {
+        if argv[i] == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// =====================================================================
+// Hash utility (djb2, 192-byte cap for speed on long lines)
+// =====================================================================
+
+fn byte_at(s: string, i: int) -> int {
+    let sub = s.substring(i, i + 1)
+    return char_code(sub, 0)
+}
+
+fn line_hash(line: string) -> int {
+    let mut h = 5381
+    let n = len(line)
+    let cap = if n < 192 { n } else { 192 }
+    let mut i = 0
+    while i < cap {
+        let c = byte_at(line, i)
+        h = (h * 33 + c) % HASH_MOD
+        i = i + 1
+    }
+    return h
+}
+
+// djb2 over full content for source-level fingerprint
+fn content_hash(text: string) -> int {
+    let mut h = 5381
+    let n = len(text)
+    let mut i = 0
+    while i < n {
+        let c = byte_at(text, i)
+        h = (h * 33 + c) % HASH_MOD
+        i = i + 1
+    }
+    return h
+}
+
+// =====================================================================
+// Filesystem helpers (via exec — hexa-native wrappers)
+// =====================================================================
+
+fn file_bytes(path: string) -> int {
+    if file_exists(path) == false { return 0 }
+    let s = exec("wc -c < '" + path + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+fn ensure_dir(path: string) {
+    let _ = exec("mkdir -p '" + path + "'")
+}
+
+// =====================================================================
+// Text extraction — normalize to jsonl "text" field
+// =====================================================================
+
+// Extract "text" value from a single jsonl line.
+// Supports {"text": "..."} and {"input":"...","output":"..."} (tool corpus).
+// If shape unknown, returns raw line (trimmed).
+fn jsonl_text(line: string) -> string {
+    let t = line.trim()
+    if t == "" { return "" }
+    // Fast path: "text":"..."
+    let key = "\"text\""
+    let p = t.find(key)
+    if p >= 0 {
+        // find first " after colon
+        let rest = t.substring(p + len(key), len(t))
+        let q1 = rest.find("\"")
+        if q1 >= 0 {
+            let after = rest.substring(q1 + 1, len(rest))
+            // naive: stop at next unescaped "
+            let q2 = after.find("\"")
+            if q2 >= 0 {
+                return after.substring(0, q2)
+            }
+        }
+    }
+    // Tool corpus: join input + output
+    let ki = "\"input\""
+    let ko = "\"output\""
+    let pi = t.find(ki)
+    let po = t.find(ko)
+    if pi >= 0 && po >= 0 {
+        // just return the raw line — downstream tokenizer handles structure
+        return t
+    }
+    return t
+}
+
+// =====================================================================
+// Source discovery
+// =====================================================================
+
+// Returns list of source paths (absolute).
+// If only_new is true, restrict to large pull-targets under
+// training/corpus_auto/*.jsonl (e.g. kowiki.jsonl). This lets the caller
+// re-ingest just the newly-pulled corpus without re-hashing the small
+// tool_corpus + persona transcripts every time.
+fn discover_sources_impl(only_new: bool) -> [string] {
+    let mut out: [string] = []
+
+    // corpus_auto/*.jsonl — large pull-targets (kowiki, ko-wiki, etc).
+    // 2026-04-18 (E2): new scan, picks up kowiki.jsonl (1.28 GiB from C1).
+    let auto_dir = ANIMA_ROOT + "/training/corpus_auto"
+    let autols = exec("ls -1 " + auto_dir + "/*.jsonl 2>/dev/null").trim()
+    let autoitems = autols.split("\n")
+    let mut a = 0
+    let na = len(autoitems)
+    while a < na {
+        let p = autoitems[a].trim()
+        // Skip the merged output file itself (would be a self-ingest loop).
+        if p != "" && p != OUT_JSONL && file_exists(p) { out = out.push(p) }
+        a = a + 1
+    }
+    if only_new { return out }
+
+    // Tool corpus jsonls
+    let tool_dir = ANIMA_ROOT + "/training/corpus_tool"
+    let toolls = exec("ls -1 " + tool_dir + "/*.jsonl 2>/dev/null").trim()
+    let toolitems = toolls.split("\n")
+    let mut i = 0
+    let ni = len(toolitems)
+    while i < ni {
+        let p = toolitems[i].trim()
+        if p != "" && file_exists(p) { out = out.push(p) }
+        i = i + 1
+    }
+    // corpus_auto rotated.txt
+    let rotated = ANIMA_ROOT + "/training/corpus_auto/out/rotated.txt"
+    if file_exists(rotated) { out = out.push(rotated) }
+    // persona transcripts
+    let tls = exec("ls -1 " + ANIMA_ROOT + "/anima-speak/corpus/*/transcript/*.txt 2>/dev/null").trim()
+    let titems = tls.split("\n")
+    let mut j = 0
+    let nj = len(titems)
+    while j < nj {
+        let p = titems[j].trim()
+        if p != "" && file_exists(p) { out = out.push(p) }
+        j = j + 1
+    }
+    return out
+}
+
+fn discover_sources() -> [string] {
+    return discover_sources_impl(false)
+}
+
+// =====================================================================
+// Ingest single source — stream through, dedupe lines, append to merged
+// =====================================================================
+
+// Returns [lines_in, lines_kept, bytes_read]
+fn ingest_source(src_path: string, is_jsonl: bool, seen_hashes: [int], limit_bytes: int, cur_bytes: int) -> [int] {
+    let mut lines_in = 0
+    let mut lines_kept = 0
+    let mut bytes_read = 0
+
+    // Read file contents. For 50MB slice this is fine in memory.
+    let raw = read_file(src_path)
+    let lines = raw.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let mut seen = seen_hashes
+    while i < n {
+        let ln = lines[i]
+        lines_in = lines_in + 1
+        let text = if is_jsonl { jsonl_text(ln) } else { ln.trim() }
+        if len(text) < 8 {
+            i = i + 1
+            continue
+        }
+        let h = line_hash(text)
+        if in_list_int(seen, h) {
+            i = i + 1
+            continue
+        }
+        seen = seen.push(h)
+        // Write as jsonl row (escape minimal: \ and ")
+        let row = "{\"text\":\"" + json_escape(text) + "\",\"src\":\"" + basename(src_path) + "\"}\n"
+        append_file(OUT_JSONL, row)
+        lines_kept = lines_kept + 1
+        bytes_read = bytes_read + len(ln) + 1
+        if cur_bytes + bytes_read >= limit_bytes {
+            break
+        }
+        i = i + 1
+    }
+    let mut r: [int] = []
+    r = r.push(lines_in)
+    r = r.push(lines_kept)
+    r = r.push(bytes_read)
+    return r
+}
+
+fn in_list_int(xs: [int], v: int) -> bool {
+    let n = len(xs)
+    let mut i = 0
+    while i < n {
+        if xs[i] == v { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn basename(p: string) -> string {
+    let parts = p.split("/")
+    let n = len(parts)
+    if n == 0 { return p }
+    return parts[n - 1]
+}
+
+fn json_escape(s: string) -> string {
+    let mut out = ""
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "\\" { out = out + "\\\\" }
+        else if c == "\"" { out = out + "\\\"" }
+        else if c == "\n" { out = out + "\\n" }
+        else if c == "\r" { out = out + "\\r" }
+        else if c == "\t" { out = out + "\\t" }
+        else { out = out + c }
+        i = i + 1
+    }
+    return out
+}
+
+fn ends_with_jsonl(p: string) -> bool {
+    let n = len(p)
+    if n < 6 { return false }
+    return p.substring(n - 6, n) == ".jsonl"
+}
+
+// =====================================================================
+// Manifest writer
+// =====================================================================
+
+fn manifest_entry(src: string, bytes: int, ch: int, kept: int) -> string {
+    let mut r = "    {\n"
+    r = r + "      \"path\": \"" + json_escape(src) + "\",\n"
+    r = r + "      \"bytes\": " + to_string(bytes) + ",\n"
+    r = r + "      \"content_hash\": " + to_string(ch) + ",\n"
+    r = r + "      \"lines_kept\": " + to_string(kept) + "\n"
+    r = r + "    }"
+    return r
+}
+
+// =====================================================================
+// Main
+// =====================================================================
+
+fn main() {
+    let av = args()
+    let mut argv: [string] = []
+    let n_av = len(av)
+    let mut ii = 2
+    while ii < n_av {
+        argv = argv.push(av[ii])
+        ii = ii + 1
+    }
+    let limit_mb = parse_limit_mb(argv)
+    let limit_bytes = limit_mb * 1024 * 1024
+    let only_new = has_flag(argv, "--only-new")
+    let list_only = has_flag(argv, "--list-only")
+
+    let mut mode_tag = "smoke"
+    if only_new { mode_tag = "smoke-only-new" }
+    if list_only { mode_tag = mode_tag + "+list-only" }
+
+    println("=== P22 corpus_ingest — " + mode_tag + " (" + to_string(limit_mb) + " MB cap) ===")
+
+    // --list-only: enumerate discovered sources and exit without reading them.
+    // Useful for verifying discover_sources_impl on hosts where a full ingest
+    // would OOM (e.g. local stage0 with 4GB RSS cap vs 1.28GB kowiki.jsonl).
+    if list_only {
+        let srcs = discover_sources_impl(only_new)
+        let ns_l = len(srcs)
+        println("[list] " + to_string(ns_l) + " source(s):")
+        let mut li = 0
+        while li < ns_l {
+            println("  " + srcs[li])
+            li = li + 1
+        }
+        return
+    }
+
+    ensure_dir(OUT_DIR)
+    // truncate merged jsonl
+    write_file(OUT_JSONL, "")
+
+    let sources = discover_sources_impl(only_new)
+    let ns = len(sources)
+    println("[ingest] discovered " + to_string(ns) + " sources")
+    if ns == 0 {
+        println("[ingest] FATAL: no KR sources found")
+        return
+    }
+
+    let mut seen: [int] = []
+    let mut total_in = 0
+    let mut total_kept = 0
+    let mut total_bytes = 0
+    let mut manifest_rows: [string] = []
+
+    let mut s = 0
+    while s < ns {
+        let src = sources[s]
+        let is_j = ends_with_jsonl(src)
+        let src_bytes = file_bytes(src)
+        // lightweight content hash: reuse line_hash on the first 4KB only (avoids full read)
+        // but we still want a real content hash — use djb2 on full file (bounded by smoke cap)
+        let raw = read_file(src)
+        let ch = content_hash(raw)
+        println("[ingest] " + basename(src) + "  bytes=" + to_string(src_bytes) + "  hash=" + to_string(ch))
+
+        let res = ingest_source(src, is_j, seen, limit_bytes, total_bytes)
+        let li = res[0]
+        let lk = res[1]
+        let br = res[2]
+        total_in = total_in + li
+        total_kept = total_kept + lk
+        total_bytes = total_bytes + br
+
+        manifest_rows = manifest_rows.push(manifest_entry(src, src_bytes, ch, lk))
+
+        if total_bytes >= limit_bytes {
+            println("[ingest] smoke cap reached — stopping at " + to_string(total_bytes) + " bytes")
+            break
+        }
+        s = s + 1
+    }
+
+    // write manifest
+    let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+    let mut m = "{\n"
+    m = m + "  \"generated\": \"" + ts + "\",\n"
+    m = m + "  \"mode\": \"" + mode_tag + "\",\n"
+    m = m + "  \"limit_mb\": " + to_string(limit_mb) + ",\n"
+    m = m + "  \"total_lines_in\": " + to_string(total_in) + ",\n"
+    m = m + "  \"total_lines_kept\": " + to_string(total_kept) + ",\n"
+    m = m + "  \"total_bytes\": " + to_string(total_bytes) + ",\n"
+    m = m + "  \"merged_jsonl\": \"" + OUT_JSONL + "\",\n"
+    m = m + "  \"sources\": [\n"
+    let nm = len(manifest_rows)
+    let mut k = 0
+    while k < nm {
+        m = m + manifest_rows[k]
+        if k < nm - 1 { m = m + "," }
+        m = m + "\n"
+        k = k + 1
+    }
+    m = m + "  ]\n"
+    m = m + "}\n"
+    write_file(OUT_MANIFEST, m)
+
+    println("")
+    println("=== DONE ===")
+    println("lines in:   " + to_string(total_in))
+    println("lines kept: " + to_string(total_kept))
+    println("bytes:      " + to_string(total_bytes))
+    println("merged:     " + OUT_JSONL)
+    println("manifest:   " + OUT_MANIFEST)
+}
+
+main()

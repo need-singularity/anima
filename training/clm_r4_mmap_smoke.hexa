@@ -1,0 +1,106 @@
+// training/clm_r4_mmap_smoke.hexa — smoke test against the real 5.38 GB corpus
+//
+// Validates that clm_mmap_loader.hexa can:
+//   1. open() the real 5.38 GB corpus_clm_r4.txt without loading it into RAM
+//   2. read bytes at boundary offsets (start, 1 GiB, 3 GiB, near-EOF)
+//   3. read sample training windows at seq_len=512 throughout the file
+//   4. all in O(ms) per window via dd skip/count
+//
+// Run:
+//   hexa run training/clm_r4_mmap_smoke.hexa
+//
+// Constraints honored:
+//   - HEXA-FIRST (no .py/.rs/.c)
+//   - No quantization
+//   - Pure-hexa; uses only `exec` bridge for dd/od
+//   - Does NOT launch training; does NOT touch H100 pod or ubu GPU
+//   - Does NOT collide with B1 r10 on the pod
+
+use "clm_mmap_loader"
+
+fn main() {
+    let path = "/Users/ghost/Dev/anima/training/corpus_clm_r4.txt"
+    println("[smoke] CLM r4 mmap loader smoke — real corpus path: " + path)
+
+    // ── Stage 1: open + stat ──
+    let desc = corpus_open(path)
+    if desc.len < 4000000000 {
+        println("[smoke] FAIL: corpus shorter than 4 GB, got " + str(desc.len))
+        return
+    }
+    println("[smoke] stat OK: " + str(desc.len) + " bytes (~" + str(desc.len / 1073741824) + " GiB)")
+
+    // ── Stage 2: single-byte reads at boundary offsets ──
+    let mut pass_byte = 0
+    let offsets = [0, 1, 1048576, 1073741824, 3221225472, desc.len - 512, desc.len - 1]
+    let mut i = 0
+    while i < len(offsets) {
+        let off = offsets[i]
+        if off >= 0 && off < desc.len {
+            let b = corpus_byte(desc, off)
+            if b >= 0 && b < 256 {
+                pass_byte = pass_byte + 1
+                println("[smoke]   off=" + str(off) + " byte=" + str(b) + " OK")
+            } else {
+                println("[smoke]   off=" + str(off) + " byte=" + str(b) + " OUT-OF-RANGE")
+            }
+        }
+        i = i + 1
+    }
+    println("[smoke] Stage 2 byte reads: " + str(pass_byte) + "/" + str(len(offsets)))
+
+    // ── Stage 3: 512-byte training windows ──
+    // Sample 5 windows across the file; each returns 512 byte values.
+    let mut pass_win = 0
+    let sample_offsets = [0, 500000000, 1500000000, 3000000000, desc.len - 1024]
+    let mut j = 0
+    while j < len(sample_offsets) {
+        let off = sample_offsets[j]
+        let win = corpus_window(desc, off, 512)
+        let wl = len(win)
+        if wl == 512 || (off + 512 > desc.len && wl == desc.len - off) {
+            pass_win = pass_win + 1
+            let first_b = win[0]
+            let last_b = win[wl - 1]
+            println("[smoke]   win@off=" + str(off) + " len=" + str(wl) + " [0]=" + str(first_b) + " [-1]=" + str(last_b) + " OK")
+        } else {
+            println("[smoke]   win@off=" + str(off) + " UNEXPECTED len=" + str(wl))
+        }
+        j = j + 1
+    }
+    println("[smoke] Stage 3 windows: " + str(pass_win) + "/" + str(len(sample_offsets)))
+
+    // ── Stage 4: simulate one training batch of 8 × 512 ──
+    // This mirrors what train_step would do per micro-batch.
+    // Batch 8 × seq 512 = 4096 bytes across 8 non-contiguous offsets.
+    let batch_offsets = [0, 672345, 1500000000, 2100000000, 2900000000, 3700000000, 4500000000, desc.len - 2048]
+    let mut batch_ok = 0
+    let mut total_bytes = 0
+    let mut k = 0
+    let t_start = timestamp()
+    while k < len(batch_offsets) {
+        let off = batch_offsets[k]
+        let w = corpus_window(desc, off, 512)
+        let wl = len(w)
+        if wl == 512 {
+            batch_ok = batch_ok + 1
+            total_bytes = total_bytes + wl
+        }
+        k = k + 1
+    }
+    let t_end = timestamp()
+    let elapsed_ms = t_end - t_start
+    println("[smoke] Stage 4 batch simulation: " + str(batch_ok) + "/8 windows, total_bytes=" + str(total_bytes) + ", elapsed=" + str(elapsed_ms) + "ms")
+
+    let total = pass_byte + pass_win + batch_ok
+    let need = len(offsets) + len(sample_offsets) + 8
+    println("[smoke] TOTAL " + str(total) + "/" + str(need))
+    if total == need {
+        println("[smoke] PASS — mmap loader ready for r4 launch against 5.38 GB corpus")
+        println("[smoke] next: wire into train_clm.hexa sample_batch() or kick Python trainer via clm_r4_launch.hexa")
+    } else {
+        println("[smoke] REGRESSION")
+    }
+}
+
+main()

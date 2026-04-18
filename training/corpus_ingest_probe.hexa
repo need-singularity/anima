@@ -1,0 +1,134 @@
+// training/corpus_ingest_probe.hexa — E2 probe for kowiki.jsonl sanity check
+//
+// Goal: read first 1000 lines of training/corpus_auto/kowiki.jsonl, extract
+// the "text" field from each, count bytes, and verify ≥60% of the first 5KB
+// of concatenated text is Korean Hangul (UTF-8 U+AC00..U+D7AF).
+//
+// Memory discipline (local stage0 has a 4 GB RSS cap):
+//   - Never load the full 1.28 GiB file.
+//   - Never materialise the entire 1000-line head (~10 MB) inside hexa —
+//     stage0 string ops are N² in memory. Instead we stream via exec:
+//       1. head -n 1000 … | wc -c        → lines + bytes of raw JSONL
+//       2. head -n 1000 … | jq -r .text  → text payload only
+//          (fallback: python3 -c via sed+awk if jq absent — but jq is ubiquitous)
+//       3. Take head -c 5120 of that text as the hangul sample.
+//   - Hangul check is done byte-level inside hexa on a bounded 5 KB string.
+//
+// Hangul heuristic: Korean Hangul syllables U+AC00..U+D7AF are UTF-8-encoded
+// as 3 bytes whose lead byte is 0xEA..0xED. We decode each 3-byte sequence
+// and count bytes whose codepoint falls in 44032..55215. ≥60% → OK,
+// ≥30% → WARN, else FAIL.
+//
+// Run:
+//   hexa run training/corpus_ingest_probe.hexa
+//
+// Side effects: none (no writes, no manifest update). Verdict goes to stdout.
+
+let KOWIKI = "/Users/ghost/Dev/anima/training/corpus_auto/kowiki.jsonl"
+let SAMPLE_LINES = 1000
+let SAMPLE_BYTES_FOR_RATIO = 5120
+
+// =====================================================================
+// byte-level helpers
+// =====================================================================
+
+fn byte_at(s: string, i: int) -> int {
+    let sub = s.substring(i, i + 1)
+    return char_code(sub, 0)
+}
+
+// =====================================================================
+// main
+// =====================================================================
+
+fn main() {
+    println("=== corpus_ingest_probe — kowiki sanity check ===")
+
+    if file_exists(KOWIKI) == false {
+        println("[probe] FATAL: kowiki.jsonl not found at " + KOWIKI)
+        return
+    }
+
+    // Step 1. Count the lines we're sampling. head -n 1000 caps the cost;
+    // wc -l gives the actual line count (might be <1000 if kowiki is tiny).
+    let line_count_raw = exec("head -n " + to_string(SAMPLE_LINES) + " '" + KOWIKI + "' | wc -l").trim()
+    let lines_sampled = to_int(line_count_raw)
+
+    // Step 2. Measure total "text" bytes (post-extraction, post-unescape)
+    // across the 1000-line sample. Use jq for correctness on JSONL.
+    // wc -c gives bytes written to stdout by jq -r, i.e. sum of decoded
+    // text field lengths plus 1 newline per line.
+    let bytes_raw = exec(
+        "head -n " + to_string(SAMPLE_LINES) + " '" + KOWIKI + "' "
+        + "| jq -r '.text // empty' 2>/dev/null | wc -c"
+    ).trim()
+    let mut bytes_sample = to_int(bytes_raw)
+    // subtract newlines (one per line) to report pure-text bytes
+    if bytes_sample >= lines_sampled { bytes_sample = bytes_sample - lines_sampled }
+
+    // Step 3. Pull a bounded 5 KB byte sample of the concatenated text.
+    // head -c cuts at exact byte boundary — may land mid-UTF-8 codepoint;
+    // our hangul scanner skips partial sequences safely.
+    let sample = exec(
+        "head -n " + to_string(SAMPLE_LINES) + " '" + KOWIKI + "' "
+        + "| jq -r '.text // empty' 2>/dev/null | head -c "
+        + to_string(SAMPLE_BYTES_FOR_RATIO)
+    )
+    let n_bytes = len(sample)
+
+    // Step 4. Scan UTF-8 sample, decode 3-byte sequences, tally hangul bytes.
+    let mut hangul_bytes = 0
+    let mut j = 0
+    while j < n_bytes {
+        let b = byte_at(sample, j)
+        if b < 128 {
+            j = j + 1
+            continue
+        }
+        if b >= 240 {
+            j = j + 4
+            continue
+        }
+        if b >= 224 {
+            // 3-byte UTF-8 lead. Lead 0xEA..0xED → candidate hangul block.
+            if b >= 234 && b <= 237 {
+                if j + 2 < n_bytes {
+                    let b2 = byte_at(sample, j + 1)
+                    let b3 = byte_at(sample, j + 2)
+                    let cp = (b - 224) * 4096 + (b2 - 128) * 64 + (b3 - 128)
+                    if cp >= 44032 && cp <= 55215 {
+                        hangul_bytes = hangul_bytes + 3
+                    }
+                }
+            }
+            j = j + 3
+            continue
+        }
+        if b >= 192 {
+            j = j + 2
+            continue
+        }
+        j = j + 1
+    }
+
+    let mut ratio_pct = 0
+    if n_bytes > 0 {
+        ratio_pct = (hangul_bytes * 100) / n_bytes
+    }
+
+    let mut verdict = "FAIL"
+    if ratio_pct >= 60 {
+        verdict = "OK"
+    } else {
+        if ratio_pct >= 30 {
+            verdict = "WARN"
+        }
+    }
+
+    println("[probe] kowiki lines_sample=" + to_string(lines_sampled)
+        + " bytes_sample=" + to_string(bytes_sample)
+        + " hangul_ratio=" + to_string(ratio_pct) + "%"
+        + " verdict=" + verdict)
+}
+
+main()

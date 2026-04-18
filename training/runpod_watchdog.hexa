@@ -1,0 +1,175 @@
+// training/runpod_watchdog.hexa — on-pod training watchdog (replaces buggy shell watcher)
+// ============================================================================
+//
+// PURPOSE
+//   The previous alm14b_r10_watcher.hexa only polled a status file written by the
+//   trainer itself. When the trainer crashed (r10 step 200 num_logits_to_keep),
+//   the status file went stale but watcher kept reporting TRAINING. This caused
+//   a 9+ hour idle H100 burn on r9 too.
+//
+//   This watchdog is authoritative: it cross-checks
+//     1. ps -p $TRAIN_PID            — is the trainer process alive?
+//     2. nvidia-smi util              — is the GPU actually busy?
+//     3. log tail                     — is anything being written?
+//   and writes a structured status line to $CKPT/autopilot.status every 60s.
+//
+// STATUS VALUES (from runpod_autopilot.json#watchdog.crash_detect.status_values)
+//   INIT | TRAINING | SENTINEL | SAVING | UPLOADING | DONE | CRASHED | DEAD | IDLE_TEARDOWN
+//
+// EXIT CODES (integration_contract_with_watchdog.watchdog_exit_codes)
+//   0 = DONE — parent autopilot may teardown
+//   1 = CRASHED — parent must try crash_recover
+//   2 = SENTINEL_ABORT — no retry, alert
+//   3 = IDLE_TEARDOWN — parent may teardown
+//   4 = PARENT_UNREACHABLE
+//
+// USAGE (on pod)
+//   hexa training/runpod_watchdog.hexa <run_id> <train_pid>
+//   e.g. hexa training/runpod_watchdog.hexa alm_14b_r10 12345
+//
+// CONSTRAINTS
+//   - HEXA-FIRST: no .py/.rs/.sh outside the tiny bash here-doc we write to /tmp
+//   - ≤2 import hops (feedback_hexa_silent_exit_5_imports) — this module is self-contained
+//   - byte-safe string ops (feedback_hexa_string_api)
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+    let mut offset = 2
+    if argc >= 2 {
+        let a1 = argv[1]
+        if a1.index_of(".hexa") < 0 {
+            offset = 1
+        }
+    }
+    if argc < offset + 2 {
+        println("usage: runpod_watchdog.hexa <run_id> <train_pid>")
+        exit(2)
+    }
+    let run_id = argv[offset]
+    let train_pid = argv[offset + 1]
+
+    // Paths derived from SSOT templates in runpod_autopilot.json
+    let ckpt = "/workspace/ckpt_" + run_id
+    let status_file = ckpt + "/autopilot.status"
+    let log_file = ckpt + "/autopilot.log"
+    let trainer_log = ckpt + "/bootstrap.log"
+    let abort_file = ckpt + "/autopilot.abort"
+    let done_file = ckpt + "/autopilot.done"
+
+    let script = "/tmp/_runpod_watchdog_" + run_id + ".sh"
+    write_file(script,
+        "#!/usr/bin/env bash\n" +
+        "set -uo pipefail\n" +
+        "RUN_ID=\"" + run_id + "\"\n" +
+        "TRAIN_PID=\"" + train_pid + "\"\n" +
+        "CKPT=\"" + ckpt + "\"\n" +
+        "STATUS=\"" + status_file + "\"\n" +
+        "LOG=\"" + log_file + "\"\n" +
+        "TLOG=\"" + trainer_log + "\"\n" +
+        "ABORT=\"" + abort_file + "\"\n" +
+        "DONE=\"" + done_file + "\"\n" +
+        "HEARTBEAT_SEC=60\n" +
+        "GPU_IDLE_THRESHOLD=5\n" +
+        "GPU_IDLE_DURATION=120\n" +
+        "HEARTBEAT_TIMEOUT=300\n" +
+        "mkdir -p \"$CKPT\"\n" +
+        "echo \"INIT\" > \"$STATUS\"\n" +
+        "echo \"[watchdog] starting run=$RUN_ID pid=$TRAIN_PID $(date -u +%FT%TZ)\" | tee -a \"$LOG\"\n" +
+        "\n" +
+        "idle_count=0\n" +
+        "last_log_size=0\n" +
+        "heartbeat_stale=0\n" +
+        "\n" +
+        "write_status() {\n" +
+        "    local s=\"$1\" step=\"${2:-?}\" gpu=\"${3:-?}\" rss=\"${4:-?}\"\n" +
+        "    local ts=$(date -u +%FT%TZ)\n" +
+        "    echo \"$s\" > \"$STATUS\"\n" +
+        "    printf '%s\\tstatus=%s\\tstep=%s\\tgpu_util=%s\\trss_mb=%s\\n' \\\n" +
+        "        \"$ts\" \"$s\" \"$step\" \"$gpu\" \"$rss\" >> \"$LOG\"\n" +
+        "}\n" +
+        "\n" +
+        "parse_step() {\n" +
+        "    tail -200 \"$TLOG\" 2>/dev/null | grep -oE 'step[ =_]?[0-9]+' | tail -1 | grep -oE '[0-9]+' || echo '?'\n" +
+        "}\n" +
+        "\n" +
+        "gpu_util() {\n" +
+        "    nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' || echo 0\n" +
+        "}\n" +
+        "\n" +
+        "while true; do\n" +
+        "    # 1. Abort file override — sentinel or external trigger\n" +
+        "    if [[ -f \"$ABORT\" ]]; then\n" +
+        "        reason=$(cat \"$ABORT\" | head -1)\n" +
+        "        echo \"[watchdog] ABORT detected: $reason\" | tee -a \"$LOG\"\n" +
+        "        write_status \"CRASHED\"\n" +
+        "        # If reason says SENTINEL exit 2, else exit 1\n" +
+        "        if echo \"$reason\" | grep -qE 'SENTINEL|COLLAPSED|mode_collapse'; then\n" +
+        "            exit 2\n" +
+        "        fi\n" +
+        "        exit 1\n" +
+        "    fi\n" +
+        "\n" +
+        "    # 2. Done file override — trainer finished OK\n" +
+        "    if [[ -f \"$DONE\" ]]; then\n" +
+        "        write_status \"DONE\"\n" +
+        "        echo \"[watchdog] DONE file present — exiting 0\" | tee -a \"$LOG\"\n" +
+        "        exit 0\n" +
+        "    fi\n" +
+        "\n" +
+        "    # 3. Process liveness (authoritative — no more trusting status file alone)\n" +
+        "    if ! ps -p \"$TRAIN_PID\" > /dev/null 2>&1; then\n" +
+        "        echo \"[watchdog] train_pid=$TRAIN_PID DEAD\" | tee -a \"$LOG\"\n" +
+        "        # Capture last 100 log lines for incident triage\n" +
+        "        tail -100 \"$TLOG\" > \"$CKPT/autopilot.crash_tail\" 2>/dev/null || true\n" +
+        "        write_status \"CRASHED\"\n" +
+        "        exit 1\n" +
+        "    fi\n" +
+        "\n" +
+        "    # 4. GPU idle check\n" +
+        "    util=$(gpu_util)\n" +
+        "    util_int=${util:-0}\n" +
+        "    if [[ \"$util_int\" -lt \"$GPU_IDLE_THRESHOLD\" ]]; then\n" +
+        "        idle_count=$((idle_count + HEARTBEAT_SEC))\n" +
+        "    else\n" +
+        "        idle_count=0\n" +
+        "    fi\n" +
+        "\n" +
+        "    # 5. Log liveness (heartbeat via trainer log growth)\n" +
+        "    cur_log_size=0\n" +
+        "    if [[ -f \"$TLOG\" ]]; then\n" +
+        "        cur_log_size=$(stat -c%s \"$TLOG\" 2>/dev/null || echo 0)\n" +
+        "    fi\n" +
+        "    if [[ \"$cur_log_size\" -gt \"$last_log_size\" ]]; then\n" +
+        "        heartbeat_stale=0\n" +
+        "        last_log_size=$cur_log_size\n" +
+        "    else\n" +
+        "        heartbeat_stale=$((heartbeat_stale + HEARTBEAT_SEC))\n" +
+        "    fi\n" +
+        "\n" +
+        "    # 6. Decide status\n" +
+        "    step=$(parse_step)\n" +
+        "    if [[ \"$idle_count\" -ge \"$GPU_IDLE_DURATION\" ]] && [[ \"$heartbeat_stale\" -ge \"$HEARTBEAT_TIMEOUT\" ]]; then\n" +
+        "        echo \"[watchdog] IDLE gpu<${GPU_IDLE_THRESHOLD}% for ${idle_count}s AND heartbeat stale ${heartbeat_stale}s\" | tee -a \"$LOG\"\n" +
+        "        write_status \"IDLE_TEARDOWN\" \"$step\" \"$util_int\"\n" +
+        "        # Don't exit yet — maybe it's sentinel between phases. Grace period:\n" +
+        "        if [[ \"$heartbeat_stale\" -ge \"$((HEARTBEAT_TIMEOUT * 2))\" ]]; then\n" +
+        "            echo \"[watchdog] idle too long — exiting 3\" | tee -a \"$LOG\"\n" +
+        "            exit 3\n" +
+        "        fi\n" +
+        "    elif [[ \"$util_int\" -ge \"$GPU_IDLE_THRESHOLD\" ]]; then\n" +
+        "        # Process alive + GPU busy + log growing = real training\n" +
+        "        write_status \"TRAINING\" \"$step\" \"$util_int\"\n" +
+        "    else\n" +
+        "        # Process alive but GPU idle briefly (ckpt save / sentinel / between-step)\n" +
+        "        write_status \"SENTINEL\" \"$step\" \"$util_int\"\n" +
+        "    fi\n" +
+        "\n" +
+        "    sleep $HEARTBEAT_SEC\n" +
+        "done\n"
+    )
+    exec("chmod +x " + script)
+    exec("bash " + script)
+}
+
+main()

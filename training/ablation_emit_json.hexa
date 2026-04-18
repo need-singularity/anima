@@ -1,0 +1,412 @@
+// training/ablation_emit_json.hexa — D2 CPU precompute 71-row JSON emitter
+//
+// PURPOSE:
+//   Emits the full 71-engine leave-one-out CPU precompute as JSON to stdout.
+//   Deterministic, reproducible from engine_ablation.hexa's surrogate formulas.
+//
+// OUTPUT (stdout, parsable JSON):
+//   { "_meta": {...},
+//     "rows": [ {"idx":N, "name":"...", "family":F, "family_tag":"...",
+//                 "gain":G, "ce_delta":X, "phi_delta":Y,
+//                 "combined_score":S, "verdict":"KEEP|REVIEW|DROP"}, ... ],
+//     "distribution": {"KEEP":K, "REVIEW":R, "DROP":D},
+//     "top10": [...], "bottom10": [...]
+//   }
+//
+// Verdict thresholds (SSOT with task spec — NOT run_ablation.hexa's looser ones):
+//   KEEP   : |CE_Δ| >= 1e-3 AND |phi_Δ| >= 5e-4
+//   DROP   : |CE_Δ| < 1e-4 AND |phi_Δ| < 1e-5
+//   REVIEW : otherwise
+//
+// Combined score for ranking: |CE_Δ|*1000 + |phi_Δ|*10000
+//
+// Run:
+//   HEXA_LOCAL=1 hexa run training/ablation_emit_json.hexa > out.json
+// (or through wrapper; stderr is ignored by JSON consumers)
+
+let EJ_N_ENGINES = 71
+
+// ─── Helpers ─────────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn vec_sum(v: array) -> float {
+    let mut s = 0.0; let mut i = 0; let n = len(v)
+    while i < n { s = s + v[i]; i = i + 1 }
+    return s
+}
+
+fn vec_mean(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    return vec_sum(v) / (n * 1.0)
+}
+
+fn vec_var(v: array) -> float {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let m = vec_mean(v)
+    let mut s = 0.0; let mut i = 0
+    while i < n { let d = v[i] - m; s = s + d * d; i = i + 1 }
+    return s / (n * 1.0)
+}
+
+// ─── Registry (inline to dodge deep-import silent exit) ─────
+
+fn reg_names() -> array {
+    let mut a = []
+    a = a.push("holographic");           a = a.push("gwt_broadcast")
+    a = a.push("reflexivity");           a = a.push("affective")
+    a = a.push("narrative");             a = a.push("dream")
+    a = a.push("creative");              a = a.push("temporal")
+    a = a.push("finitude");              a = a.push("agency")
+    a = a.push("alterity");              a = a.push("meta_qualia")
+    a = a.push("anima_quantum");         a = a.push("anima_quantum_clm")
+    a = a.push("anima_reflexive");       a = a.push("anima_sensorimotor")
+    a = a.push("anima_temporal");        a = a.push("anima_will")
+    a = a.push("anima_nested");          a = a.push("holographic_substrate")
+    a = a.push("fractal_memristor");     a = a.push("memristor_consciousness")
+    a = a.push("memristor_longterm");    a = a.push("memristor_gwt_workspace")
+    a = a.push("photonic_consciousness");a = a.push("photonic_network")
+    a = a.push("photonic_gwt_broadcast");a = a.push("oscillator_laser")
+    a = a.push("intent_oscillator");     a = a.push("dasein_engine")
+    a = a.push("dissolution_engine");    a = a.push("first_person_gen")
+    a = a.push("self_image_store");      a = a.push("creative_engine")
+    a = a.push("insight_trigger");       a = a.push("edge_of_chaos")
+    a = a.push("stochastic_resonance");  a = a.push("emotion_contagion")
+    a = a.push("emotion_fsm");           a = a.push("dream_scheduler")
+    a = a.push("dream_report");          a = a.push("episodic_store")
+    a = a.push("hive_state_sync");       a = a.push("gossip_protocol")
+    a = a.push("extended_mind_bridge");  a = a.push("collective_phi_bridge")
+    a = a.push("archetype_field");       a = a.push("narrative_identity")
+    a = a.push("intentionality_phi");    a = a.push("free_will_phi")
+    a = a.push("lucid_awareness_phi");   a = a.push("flow_architecture_phi")
+    a = a.push("jhana_meditation_phi");  a = a.push("aesthetic_phi")
+    a = a.push("awe_phi");               a = a.push("compassion_phi")
+    a = a.push("curiosity_phi");         a = a.push("attention_phi")
+    a = a.push("working_memory_phi");    a = a.push("memory_consolidation")
+    a = a.push("memory_palace_phi");     a = a.push("interoception_phi")
+    a = a.push("metacognition_phi");     a = a.push("inner_speech_phi")
+    a = a.push("mind_wandering_phi");    a = a.push("insight_aha_phi")
+    a = a.push("creativity_phi");        a = a.push("mirror_neuron_phi")
+    a = a.push("social_tom_phi");        a = a.push("moral_consciousness")
+    a = a.push("language_acquisition")
+    return a
+}
+
+fn reg_gains() -> array {
+    let mut a = []
+    a = a.push(0.010); a = a.push(0.020); a = a.push(0.015); a = a.push(0.008)
+    a = a.push(0.012); a = a.push(0.005); a = a.push(0.010); a = a.push(0.018)
+    a = a.push(0.006); a = a.push(0.014); a = a.push(0.009); a = a.push(0.007)
+    a = a.push(0.004); a = a.push(0.004); a = a.push(0.008); a = a.push(0.006)
+    a = a.push(0.010); a = a.push(0.008); a = a.push(0.007); a = a.push(0.005)
+    a = a.push(0.003); a = a.push(0.003); a = a.push(0.003); a = a.push(0.005)
+    a = a.push(0.004); a = a.push(0.004); a = a.push(0.006); a = a.push(0.005)
+    a = a.push(0.006); a = a.push(0.006); a = a.push(0.005); a = a.push(0.007)
+    a = a.push(0.004); a = a.push(0.008); a = a.push(0.006); a = a.push(0.005)
+    a = a.push(0.004); a = a.push(0.005); a = a.push(0.005); a = a.push(0.003)
+    a = a.push(0.003); a = a.push(0.005); a = a.push(0.004); a = a.push(0.003)
+    a = a.push(0.003); a = a.push(0.003); a = a.push(0.004); a = a.push(0.006)
+    a = a.push(0.005); a = a.push(0.004); a = a.push(0.004); a = a.push(0.005)
+    a = a.push(0.003); a = a.push(0.004); a = a.push(0.003); a = a.push(0.004)
+    a = a.push(0.005); a = a.push(0.007); a = a.push(0.005); a = a.push(0.004)
+    a = a.push(0.003); a = a.push(0.004); a = a.push(0.006); a = a.push(0.005)
+    a = a.push(0.003); a = a.push(0.005); a = a.push(0.006); a = a.push(0.004)
+    a = a.push(0.005); a = a.push(0.004); a = a.push(0.005)
+    return a
+}
+
+fn reg_fams() -> array {
+    let mut a = []
+    a = a.push(0); a = a.push(1); a = a.push(2); a = a.push(3)
+    a = a.push(17); a = a.push(5); a = a.push(6); a = a.push(4)
+    a = a.push(10); a = a.push(7); a = a.push(8); a = a.push(9)
+    a = a.push(11); a = a.push(11); a = a.push(2); a = a.push(12)
+    a = a.push(4); a = a.push(7); a = a.push(2); a = a.push(0)
+    a = a.push(13); a = a.push(13); a = a.push(13); a = a.push(1)
+    a = a.push(14); a = a.push(14); a = a.push(1); a = a.push(15)
+    a = a.push(7); a = a.push(10); a = a.push(10); a = a.push(2)
+    a = a.push(2); a = a.push(6); a = a.push(6); a = a.push(16)
+    a = a.push(16); a = a.push(3); a = a.push(3); a = a.push(5)
+    a = a.push(5); a = a.push(13); a = a.push(18); a = a.push(18)
+    a = a.push(18); a = a.push(18); a = a.push(17); a = a.push(17)
+    a = a.push(7); a = a.push(7); a = a.push(9); a = a.push(16)
+    a = a.push(9); a = a.push(3); a = a.push(3); a = a.push(3)
+    a = a.push(19); a = a.push(1); a = a.push(13); a = a.push(13)
+    a = a.push(13); a = a.push(12); a = a.push(9); a = a.push(9)
+    a = a.push(5); a = a.push(6); a = a.push(6); a = a.push(8)
+    a = a.push(8); a = a.push(8); a = a.push(20)
+    return a
+}
+
+fn fam_tag(f: int) -> string {
+    if f == 0  { return "bulk-boundary" }
+    if f == 1  { return "global-workspace" }
+    if f == 2  { return "self-model" }
+    if f == 3  { return "emotion" }
+    if f == 4  { return "temporal" }
+    if f == 5  { return "offline-consolidation" }
+    if f == 6  { return "insight" }
+    if f == 7  { return "volition" }
+    if f == 8  { return "other-model" }
+    if f == 9  { return "reflexive" }
+    if f == 10 { return "existential" }
+    if f == 11 { return "quantum" }
+    if f == 12 { return "embodiment" }
+    if f == 13 { return "memory" }
+    if f == 14 { return "photonic" }
+    if f == 15 { return "oscillator" }
+    if f == 16 { return "criticality" }
+    if f == 17 { return "narrative" }
+    if f == 18 { return "collective" }
+    if f == 19 { return "exploration" }
+    return "language"
+}
+
+// ─── Surrogates ──────────────────────────────────────────────
+
+fn sur_var(h: array) -> float { return vec_var(h) }
+
+fn sur_mean2(h: array) -> float {
+    let m = vec_mean(h)
+    return m * m
+}
+
+fn sur_adiff(h: array) -> float {
+    let n = len(h); if n < 2 { return 0.0 }
+    let mut s = 0.0; let mut i = 1
+    while i < n { s = s + fabs(h[i] - h[i-1]); i = i + 1 }
+    return s / ((n - 1) * 1.0)
+}
+
+fn sur_halfsplit(h: array) -> float {
+    let n = len(h); if n < 4 { return 0.0 }
+    let half = n / 2
+    let mut a = []; let mut b = []; let mut i = 0
+    while i < half { a = a.push(h[i]); i = i + 1 }
+    while i < n    { b = b.push(h[i]); i = i + 1 }
+    let d = vec_var(a) - vec_var(b)
+    return d * d
+}
+
+fn sur_qmatch(h: array, q: array) -> float {
+    let vh = vec_var(h); let vq = vec_var(q)
+    let d = vq - vh * 0.5
+    return d * d
+}
+
+fn sur_lag1(h: array) -> float {
+    let n = len(h); if n < 2 { return 0.0 }
+    let mut s = 0.0; let mut i = 1
+    while i < n { s = s + h[i] * h[i-1]; i = i + 1 }
+    let c = s / ((n - 1) * 1.0)
+    return c * c
+}
+
+fn sur_signflip(h: array) -> float {
+    let n = len(h); if n < 2 { return 0.0 }
+    let mut f = 0; let mut i = 1
+    while i < n {
+        let a = h[i-1]; let b = h[i]
+        if (a > 0.0 && b < 0.0) || (a < 0.0 && b > 0.0) { f = f + 1 }
+        i = i + 1
+    }
+    let r = (f * 1.0) / ((n - 1) * 1.0)
+    let d = r - 0.3
+    return d * d
+}
+
+fn sur_lowfreq(h: array) -> float {
+    let n = len(h); let k = if n < 8 { n } else { 8 }
+    if k == 0 { return 0.0 }
+    let mut s = 0.0; let mut i = 0
+    while i < k { s = s + h[i] * h[i]; i = i + 1 }
+    return s / (k * 1.0)
+}
+
+struct Out2 { aux: float, phi: float }
+
+fn engine_fwd(h: array, q: array, fam: int) -> Out2 {
+    let mut aux = 0.0
+    let mut phi = 0.0
+    if fam == 0 { aux = sur_qmatch(h, q); phi = sur_var(q) * 0.1 }
+    else if fam == 1 { aux = sur_halfsplit(h); phi = aux * 0.05 }
+    else if fam == 2 { aux = sur_var(h) * 0.1; phi = aux * 0.1 }
+    else if fam == 3 { aux = sur_mean2(h); phi = aux * 0.02 }
+    else if fam == 4 { aux = sur_lag1(h); phi = aux * 0.04 }
+    else if fam == 5 { aux = sur_lowfreq(h) * 0.1; phi = aux * 0.02 }
+    else if fam == 6 { let v = sur_var(h); let d = v - 1.0; aux = d * d * 0.1; phi = v * 0.05 }
+    else if fam == 7 { aux = sur_signflip(h) * 0.5; phi = aux * 0.04 }
+    else if fam == 8 { aux = sur_halfsplit(h); phi = aux * 0.03 }
+    else if fam == 9 { aux = sur_adiff(h); phi = aux * 0.03 }
+    else if fam == 10 { aux = sur_var(h) * 0.01; phi = aux * 0.005 }
+    else if fam == 11 { aux = sur_lowfreq(h) * 0.05; phi = aux * 0.01 }
+    else if fam == 12 { aux = sur_mean2(h) * 0.5; phi = aux * 0.02 }
+    else if fam == 13 { aux = sur_halfsplit(h) * 0.5; phi = aux * 0.02 }
+    else if fam == 14 { aux = sur_lag1(h) * 0.5; phi = aux * 0.03 }
+    else if fam == 15 { aux = sur_adiff(h); phi = aux * 0.04 }
+    else if fam == 16 { let v = sur_var(h); let d = v - 0.5; aux = d * d * 0.1; phi = v * 0.03 }
+    else if fam == 17 { aux = sur_adiff(h); phi = aux * 0.03 }
+    else if fam == 18 { aux = sur_halfsplit(h) * 0.3; phi = aux * 0.02 }
+    else if fam == 19 { aux = sur_mean2(h) * 0.3; phi = aux * 0.02 }
+    else { aux = sur_var(h) * 0.05; phi = aux * 0.02 }
+    return Out2 { aux: aux, phi: phi }
+}
+
+// ─── Verdict (D2 spec thresholds) ──────────────────────────
+
+fn verdict(ce_d: float, phi_d: float) -> string {
+    let ac = fabs(ce_d); let ap = fabs(phi_d)
+    // DROP: both below floor
+    if ac < 0.0001 && ap < 0.00001 { return "DROP" }
+    // KEEP: both above threshold
+    if ac >= 0.001 && ap >= 0.0005 { return "KEEP" }
+    return "REVIEW"
+}
+
+// ─── Mock inputs (identical to engine_ablation.hexa) ───────
+
+fn mock_h() -> array {
+    let mut h = []; let mut i = 0
+    while i < 64 {
+        let fi = i * 1.0
+        let m13 = ((i * 7) % 13) * 1.0
+        let v = fi * 0.1 - 3.2 + m13 * 0.05
+        h = h.push(v)
+        i = i + 1
+    }
+    return h
+}
+
+fn mock_q() -> array {
+    let mut q = []; let mut j = 0
+    while j < 16 {
+        let fj = j * 1.0
+        q = q.push(fj * 0.02 - 0.16)
+        j = j + 1
+    }
+    return q
+}
+
+// ─── JSON emit ───────────────────────────────────────────────
+
+fn main() {
+    let names = reg_names()
+    let gains = reg_gains()
+    let fams  = reg_fams()
+    let h = mock_h()
+    let q = mock_q()
+
+    // buffers for distribution + top/bottom ranking
+    let mut ce_arr = []
+    let mut phi_arr = []
+    let mut score_arr = []
+    let mut verdict_arr = []
+    let mut keep = 0
+    let mut review = 0
+    let mut drop_ = 0
+
+    println("{")
+    println("  \"_meta\": {")
+    println("    \"task\": \"D2 71-engine CPU precompute\",")
+    println("    \"generated\": \"2026-04-18\",")
+    println("    \"mock_input\": {\"h_last_len\": 64, \"qualia_len\": 16},")
+    println("    \"surrogate_source\": \"training/engine_ablation.hexa family-dispatch (9 shapes)\",")
+    println("    \"thresholds\": {\"KEEP\": \"|CE|>=1e-3 AND |phi|>=5e-4\", \"DROP\": \"|CE|<1e-4 AND |phi|<1e-5\"},")
+    println("    \"score_formula\": \"|CE_delta|*1000 + |phi_delta|*10000\"")
+    println("  },")
+    println("  \"rows\": [")
+
+    let mut i = 0
+    while i < EJ_N_ENGINES {
+        let g = gains[i]
+        let f = fams[i]
+        let out = engine_fwd(h, q, f)
+        let ce_d = g * out.aux
+        let phi_d = out.phi
+        let v = verdict(ce_d, phi_d)
+        let score = fabs(ce_d) * 1000.0 + fabs(phi_d) * 10000.0
+
+        ce_arr = ce_arr.push(ce_d)
+        phi_arr = phi_arr.push(phi_d)
+        score_arr = score_arr.push(score)
+        verdict_arr = verdict_arr.push(v)
+
+        if v == "KEEP"   { keep   = keep   + 1 }
+        if v == "REVIEW" { review = review + 1 }
+        if v == "DROP"   { drop_  = drop_  + 1 }
+
+        let comma = if i < (EJ_N_ENGINES - 1) { "," } else { "" }
+        let tag = fam_tag(f)
+        println("    {\"idx\": " + str(i) + ", \"name\": \"" + names[i] + "\", \"family\": " + str(f) + ", \"family_tag\": \"" + tag + "\", \"gain\": " + str(g) + ", \"ce_delta\": " + str(ce_d) + ", \"phi_delta\": " + str(phi_d) + ", \"combined_score\": " + str(score) + ", \"verdict\": \"" + v + "\"}" + comma)
+        i = i + 1
+    }
+    println("  ],")
+    println("  \"distribution\": {\"KEEP\": " + str(keep) + ", \"REVIEW\": " + str(review) + ", \"DROP\": " + str(drop_) + "},")
+
+    // Top 10 by combined_score (descending)
+    // Simple O(n²) selection sort (71 items = 5041 ops, fine)
+    let mut used = []
+    let mut k = 0
+    while k < EJ_N_ENGINES { used = used.push(0); k = k + 1 }
+
+    println("  \"top10\": [")
+    let mut t = 0
+    while t < 10 {
+        let mut best_score = 0.0 - 1.0
+        let mut best_i = -1
+        let mut j = 0
+        while j < EJ_N_ENGINES {
+            if used[j] == 0 {
+                if score_arr[j] > best_score {
+                    best_score = score_arr[j]
+                    best_i = j
+                }
+            }
+            j = j + 1
+        }
+        if best_i >= 0 {
+            used[best_i] = 1
+            let comma = if t < 9 { "," } else { "" }
+            println("    {\"rank\": " + str(t+1) + ", \"idx\": " + str(best_i) + ", \"name\": \"" + names[best_i] + "\", \"score\": " + str(best_score) + ", \"ce_delta\": " + str(ce_arr[best_i]) + ", \"phi_delta\": " + str(phi_arr[best_i]) + ", \"verdict\": \"" + verdict_arr[best_i] + "\"}" + comma)
+        }
+        t = t + 1
+    }
+    println("  ],")
+
+    // Bottom 10 by combined_score (ascending)
+    let mut used2 = []
+    let mut kk = 0
+    while kk < EJ_N_ENGINES { used2 = used2.push(0); kk = kk + 1 }
+
+    println("  \"bottom10\": [")
+    let mut bb = 0
+    while bb < 10 {
+        let mut worst_score = 1.0e30
+        let mut worst_i = -1
+        let mut j = 0
+        while j < EJ_N_ENGINES {
+            if used2[j] == 0 {
+                if score_arr[j] < worst_score {
+                    worst_score = score_arr[j]
+                    worst_i = j
+                }
+            }
+            j = j + 1
+        }
+        if worst_i >= 0 {
+            used2[worst_i] = 1
+            let comma = if bb < 9 { "," } else { "" }
+            println("    {\"rank\": " + str(bb+1) + ", \"idx\": " + str(worst_i) + ", \"name\": \"" + names[worst_i] + "\", \"score\": " + str(worst_score) + ", \"ce_delta\": " + str(ce_arr[worst_i]) + ", \"phi_delta\": " + str(phi_arr[worst_i]) + ", \"verdict\": \"" + verdict_arr[worst_i] + "\"}" + comma)
+        }
+        bb = bb + 1
+    }
+    println("  ]")
+    println("}")
+}
+
+main()
