@@ -1,0 +1,276 @@
+// smoke_all.hexa — hexa-lang 픽스 자동 re-validate harness
+//
+// PURPOSE: Anima 측 hexa 소스의 transpile+clang compile 상태를 재확인.
+//   ↑ hexa-lang literal-pool / codegen fix 도착 직후 1-명령 실행용.
+//
+// Pipeline per file:
+//   1. hexa_v2 <file> /tmp/<base>.c         (transpile)
+//   2. clang -c -I<self> <base>.c -o <>.o   (compile)
+//   3. classify: PASS_COMPILE / FAIL_TRANSPILE / FAIL_COMPILE
+//
+// Categories:
+//   use    — all .hexa files containing `use "..."` (~684)
+//   top30  — top-30 LOC from training/ + serving/
+//   core   — 4 core trainers (train_alm_lora, nn_core, train_clm_gpu, train_clm)
+//
+// Usage:
+//   hexa scripts/smoke_all.hexa                   # all 3 categories
+//   hexa scripts/smoke_all.hexa --cat=use         # use-files only
+//   hexa scripts/smoke_all.hexa --cat=top30       # top-30 LOC trainers
+//   hexa scripts/smoke_all.hexa --cat=core        # 4 core trainers only
+//   hexa scripts/smoke_all.hexa --cat=core,top30  # comma-separated
+//
+// Env overrides (prefixed to command line):
+//   HEXA_LANG=<path>          (default /Users/ghost/Dev/hexa-lang)
+//   PAR=<N>                   (default 4 parallel workers)
+//   PER_FILE_TIMEOUT=<sec>    (default 30)
+//   OVERALL_TIMEOUT=<sec>     (default 3600 = 60min)
+
+fn getenv_or(key: string, defval: string) -> string {
+    let raw = exec("printf '%s' \"${" + key + ":-}\"")
+    if raw == "" { return defval }
+    return raw
+}
+
+fn ts_now() -> string {
+    return exec("date +%Y%m%d_%H%M").trim()
+}
+
+fn sh_escape(path: string) -> string {
+    // single-quote wrap; replace any ' with '\''
+    let esc = path.replace("'", "'\\''")
+    return "'" + esc + "'"
+}
+
+fn parse_cat_arg(argv: [string]) -> string {
+    let mut cats = "use,top30,core"
+    let mut i = 0
+    while i < len(argv) {
+        let a = argv[i]
+        if a.starts_with("--cat=") {
+            cats = a.slice(6, len(a))
+        }
+        i = i + 1
+    }
+    return cats
+}
+
+fn split_commas(s: string) -> [string] {
+    let mut out: [string] = []
+    let mut cur = ""
+    let mut i = 0
+    while i < len(s) {
+        let c = s.char_at(i)
+        if c == "," {
+            if cur != "" { out = out.push(cur) }
+            cur = ""
+        } else {
+            cur = cur + c
+        }
+        i = i + 1
+    }
+    if cur != "" { out = out.push(cur) }
+    return out
+}
+
+fn discover_use(work: string) -> string {
+    // Returns path to tsv file: "use\t<path>" per line
+    let list_path = work + "/list_use.txt"
+    let cmd = "cd /Users/ghost/Dev/anima && find . -name '*.hexa' -type f 2>/dev/null" +
+              " | xargs grep -l '^use \"' 2>/dev/null | sort -u > " + list_path
+    let _ = exec(cmd)
+    return list_path
+}
+
+fn discover_top30(work: string) -> string {
+    let list_path = work + "/list_top30.txt"
+    let cmd = "cd /Users/ghost/Dev/anima && find training serving -name '*.hexa' -type f 2>/dev/null" +
+              " | xargs wc -l 2>/dev/null" +
+              " | awk '$2 != \"total\" && $2 != \"\" {print $1\"\\t\"$2}'" +
+              " | sort -rn | head -30 | awk '{print $2}' > " + list_path
+    let _ = exec(cmd)
+    return list_path
+}
+
+fn discover_core(work: string) -> string {
+    let list_path = work + "/list_core.txt"
+    let cmd = "cd /Users/ghost/Dev/anima && for f in " +
+              "training/train_alm_lora.hexa training/nn_core.hexa " +
+              "training/train_clm_gpu.hexa training/train_clm.hexa; do " +
+              "[ -f \"$f\" ] && echo \"./$f\"; done > " + list_path
+    let _ = exec(cmd)
+    return list_path
+}
+
+fn build_tasks(work: string, cats: [string]) -> string {
+    let tasks_path = work + "/tasks.tsv"
+    let _ = exec(": > " + tasks_path)
+    let mut i = 0
+    while i < len(cats) {
+        let cat = cats[i]
+        let mut list_path = ""
+        if cat == "use"   { list_path = discover_use(work) }
+        if cat == "top30" { list_path = discover_top30(work) }
+        if cat == "core"  { list_path = discover_core(work) }
+        if list_path != "" {
+            let cmd = "awk -v c=" + cat + " '{print c\"\\t\"$0}' " + list_path +
+                      " >> " + tasks_path
+            let _ = exec(cmd)
+        }
+        i = i + 1
+    }
+    return tasks_path
+}
+
+fn emit_worker_script(work: string, hexa_v2: string, self_inc: string, pft: string) -> string {
+    // One-shot worker: reads "cat<TAB>file" on argv[1], appends result row to $WORK/results.tsv
+    let path = work + "/worker.sh"
+    let script =
+        "#!/usr/bin/env bash\n" +
+        "set -u\n" +
+        "WORK=" + sh_escape(work) + "\n" +
+        "HEXA_V2=" + sh_escape(hexa_v2) + "\n" +
+        "SELF_INC=" + sh_escape(self_inc) + "\n" +
+        "PFT=" + pft + "\n" +
+        "RESULT=\"$WORK/results.tsv\"\n" +
+        "line=\"$1\"\n" +
+        "cat=\"${line%%\t*}\"\n" +
+        "file=\"${line#*\t}\"\n" +
+        "base=$(echo \"$file\" | sed 's|[./]|_|g')\n" +
+        "cfile=\"$WORK/${base}.c\"\n" +
+        "ofile=\"$WORK/${base}.o\"\n" +
+        "err=\"$WORK/${base}.err\"\n" +
+        "# step 1: transpile\n" +
+        "if ! /usr/bin/timeout \"$PFT\" \"$HEXA_V2\" \"$file\" \"$cfile\" >\"$err\" 2>&1; then\n" +
+        "  msg=$(head -1 \"$err\" | tr '\\t' ' ' | cut -c1-200)\n" +
+        "  printf '%s\\t%s\\t%s\\t%s\\n' \"$cat\" FAIL_TRANSPILE \"$file\" \"$msg\" >> \"$RESULT\"\n" +
+        "  exit 0\n" +
+        "fi\n" +
+        "if [ ! -s \"$cfile\" ]; then\n" +
+        "  printf '%s\\t%s\\t%s\\t%s\\n' \"$cat\" FAIL_TRANSPILE \"$file\" 'empty .c output' >> \"$RESULT\"\n" +
+        "  exit 0\n" +
+        "fi\n" +
+        "# step 2: compile\n" +
+        "if ! /usr/bin/timeout \"$PFT\" clang -c -I \"$SELF_INC\" -Wno-everything " +
+        "\"$cfile\" -o \"$ofile\" >\"$err\" 2>&1; then\n" +
+        "  msg=$(head -1 \"$err\" | tr '\\t' ' ' | cut -c1-200)\n" +
+        "  printf '%s\\t%s\\t%s\\t%s\\n' \"$cat\" FAIL_COMPILE \"$file\" \"$msg\" >> \"$RESULT\"\n" +
+        "  exit 0\n" +
+        "fi\n" +
+        "printf '%s\\t%s\\t%s\\t%s\\n' \"$cat\" PASS_COMPILE \"$file\" '' >> \"$RESULT\"\n" +
+        "rm -f \"$cfile\" \"$ofile\" \"$err\"\n"
+    write_file(path, script)
+    let _ = exec("chmod +x " + sh_escape(path))
+    return path
+}
+
+fn run_parallel(tasks_tsv: string, worker_sh: string, par: string, overall: string, log: string) -> int {
+    // xargs -P <par> -n 1 -I {} worker.sh {}  with overall timeout
+    let cmd = "/usr/bin/timeout " + overall + " xargs -P " + par +
+              " -n 1 -I {} " + sh_escape(worker_sh) + " {} < " +
+              sh_escape(tasks_tsv) + " 2>>" + sh_escape(log) + "; echo RC=$?"
+    let out = exec(cmd)
+    // return 0 always — caller reads results.tsv
+    return 0
+}
+
+fn summarize(work: string, cats: [string], log: string, total: int, elapsed: int) {
+    let result = work + "/results.tsv"
+    println("")
+    println("========== SMOKE SUMMARY ==========")
+    println("elapsed: " + string(elapsed) + "s  total_tasks: " + string(total))
+
+    let mut i = 0
+    while i < len(cats) {
+        let cat = cats[i]
+        let pc = exec("awk -F'\\t' -v c=" + cat + " '$1==c && $2==\"PASS_COMPILE\"' " +
+                      result + " | wc -l | tr -d ' '").trim()
+        let ft = exec("awk -F'\\t' -v c=" + cat + " '$1==c && $2==\"FAIL_TRANSPILE\"' " +
+                      result + " | wc -l | tr -d ' '").trim()
+        let fc = exec("awk -F'\\t' -v c=" + cat + " '$1==c && $2==\"FAIL_COMPILE\"' " +
+                      result + " | wc -l | tr -d ' '").trim()
+        println("  [" + cat + "]  PASS_COMPILE=" + pc +
+                "  FAIL_TRANSPILE=" + ft + "  FAIL_COMPILE=" + fc)
+        i = i + 1
+    }
+
+    println("")
+    println("--- FAIL_TRANSPILE samples (max 10) ---")
+    let ts = exec("awk -F'\\t' '$2==\"FAIL_TRANSPILE\"' " + result +
+                  " | head -10 | awk -F'\\t' '{printf \"  [%s] %s  ::  %s\\n\", $1, $3, $4}'")
+    println(ts)
+
+    println("--- FAIL_COMPILE samples (max 10) ---")
+    let cs = exec("awk -F'\\t' '$2==\"FAIL_COMPILE\"' " + result +
+                  " | head -10 | awk -F'\\t' '{printf \"  [%s] %s  ::  %s\\n\", $1, $3, $4}'")
+    println(cs)
+
+    println("")
+    println("[smoke] full log:    " + log)
+    println("[smoke] results tsv: " + result)
+}
+
+fn main() {
+    let argv = args()
+    // argv layout under `hexa <script> <args...>` — skip until we find a --cat= or end
+    let mut flags: [string] = []
+    let mut i = 0
+    while i < len(argv) {
+        let a = argv[i]
+        if a.starts_with("--") { flags = flags.push(a) }
+        i = i + 1
+    }
+
+    let cats_str = parse_cat_arg(flags)
+    let cats = split_commas(cats_str)
+
+    let hexa_lang = getenv_or("HEXA_LANG", "/Users/ghost/Dev/hexa-lang")
+    let par       = getenv_or("PAR", "4")
+    let pft       = getenv_or("PER_FILE_TIMEOUT", "30")
+    let overall   = getenv_or("OVERALL_TIMEOUT", "3600")
+    let hexa_v2   = hexa_lang + "/self/native/hexa_v2"
+    let self_inc  = hexa_lang + "/self"
+
+    // preflight
+    let v2ok = exec("[ -x " + sh_escape(hexa_v2) + " ] && echo Y || echo N").trim()
+    if v2ok != "Y" {
+        println("ERROR: hexa_v2 not executable: " + hexa_v2)
+        panic("preflight failed")
+    }
+    let clangok = exec("command -v clang >/dev/null 2>&1 && echo Y || echo N").trim()
+    if clangok != "Y" {
+        println("ERROR: clang not on PATH")
+        panic("preflight failed")
+    }
+
+    let ts = ts_now()
+    let work = "/tmp/anima_smoke_work_" + ts
+    let log  = "/tmp/anima_smoke_" + ts + ".log"
+    let _ = exec("mkdir -p " + sh_escape(work))
+    let _ = exec(": > " + sh_escape(work) + "/results.tsv")
+    let _ = exec(": > " + sh_escape(log))
+
+    println("[smoke] anima=/Users/ghost/Dev/anima  hexa_lang=" + hexa_lang)
+    println("[smoke] categories=" + cats_str + "  par=" + par +
+            "  per_file_timeout=" + pft + "s  overall_timeout=" + overall + "s")
+    println("[smoke] work=" + work + "  log=" + log)
+
+    let tasks = build_tasks(work, cats)
+    let total_s = exec("wc -l < " + sh_escape(tasks) + " | tr -d ' '").trim()
+    let total = int(total_s)
+    println("[smoke] total tasks: " + string(total))
+    if total == 0 {
+        println("[smoke] no tasks — exit")
+        return
+    }
+
+    let worker_sh = emit_worker_script(work, hexa_v2, self_inc, pft)
+
+    let t0 = int(exec("date +%s").trim())
+    let _ = run_parallel(tasks, worker_sh, par, overall, log)
+    let t1 = int(exec("date +%s").trim())
+
+    summarize(work, cats, log, total, t1 - t0)
+}
+
+main()
