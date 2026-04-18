@@ -1,0 +1,126 @@
+// training/deploy/clm_r4_pod2_launch.hexa
+//
+// CLM 1B r4 — dedicated 2nd H100 pod launcher (selftest-only wrapper).
+//
+// Policy gates (memory refs):
+//   - feedback_h100_authorized  : max 2 H100 pods, no confirmation needed
+//   - feedback_h100_free_use    : never stop loop for pod cost
+//   - feedback_gpu_policy       : H100 allowed for ALM+CLM parallel (Ubuntu-impossible)
+//   - feedback_dual_track       : CLM/CPU + ALM/GPU always concurrent
+//   - feedback_no_resume_data_change : corpus unchanged -> R2-resume OK
+//   - feedback_r2_checkpoint    : R2 backup mandatory
+//   - feedback_pod2_delete_after : teardown on completion
+//   - feedback_background_tasks : long-running via tmux on pod
+//
+// Scope: THIS SCRIPT ONLY RUNS --selftest. Real pod creation is a manual
+// one-shot `runpodctl pod create -f ...` gated on user "fire". Rationale:
+// fan-out to runpodctl from an auto agent violates the caller's stated
+// "실제 pod 발사 금지 (dry-run 플랜만)" constraint.
+//
+// Usage:
+//   hexa training/deploy/clm_r4_pod2_launch.hexa --selftest
+//   hexa training/deploy/clm_r4_pod2_launch.hexa            # same as --selftest
+//
+// Fire path (manual, after reviewing selftest output):
+//   runpodctl pod create -f training/deploy/clm_r4_runpod_create.json
+//   # then follow training/deploy/clm_r4_pod2_launch.md steps 2-7.
+
+let POD_SPEC     = "training/deploy/clm_r4_runpod_create.json"
+let LAUNCHER     = "training/deploy/clm_r4_launch.hexa"
+let PLAN_DOC     = "training/deploy/clm_r4_pod2_launch.md"
+let WATCHER_CFG  = "shared/config/r2_sync_watchers.json"
+let CORPUS_LOCAL = "training/corpus_clm_r4.txt"
+let CORPUS_GZ    = "training/corpus_clm_r4.txt.gz"
+let R2_PREFIX    = "r2:anima-models/clm1b/r4/"
+let R2_RESUME    = "r2:anima-models/clm1b/r4/step_5000.hexackpt"
+let POD_NAME     = "anima-clm1b-r4-pod2"
+let IMAGE        = "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
+let GPU_TYPE     = "NVIDIA H100 80GB HBM3"
+let HOURLY_USD   = 2.99
+let WALL_HOURS   = 43.3   // R2-resume path (step 5K start)
+
+fn check_file(path) {
+    if file_exists(path) {
+        println("  [OK]   " + path)
+        return true
+    }
+    println("  [MISS] " + path)
+    return false
+}
+
+fn selftest() {
+    println("")
+    println("=================================================================")
+    println("  CLM r4 Pod 2 launcher — SELFTEST (no pod will be created)")
+    println("=================================================================")
+    println("")
+
+    println("[1/5] Preflight artifacts:")
+    let mut ok = true
+    if !check_file(POD_SPEC)    { ok = false }
+    if !check_file(LAUNCHER)    { ok = false }
+    if !check_file(PLAN_DOC)    { ok = false }
+    if !check_file(WATCHER_CFG) { ok = false }
+    // Corpus: at least one of raw or gz must be present (scp prefers .gz).
+    let have_raw = file_exists(CORPUS_LOCAL)
+    let have_gz  = file_exists(CORPUS_GZ)
+    if have_raw { println("  [OK]   " + CORPUS_LOCAL + "  (raw 5.0 GB)") }
+    if have_gz  { println("  [OK]   " + CORPUS_GZ    + "  (gz  1.6 GB — prefer for scp)") }
+    if !have_raw && !have_gz {
+        println("  [MISS] corpus_clm_r4 (neither .txt nor .txt.gz)")
+        ok = false
+    }
+
+    println("")
+    println("[2/5] Pod spec preview:")
+    println("  name        = " + POD_NAME)
+    println("  gpuType     = " + GPU_TYPE)
+    println("  image       = " + IMAGE)
+    println("  containerGB = 100, volumeGB = 0 (ephemeral — R2 watcher mandatory)")
+
+    println("")
+    println("[3/5] Bootstrap sequence (to run manually after fire):")
+    println("  a. runpodctl pod create -f " + POD_SPEC)
+    println("  b. runpodctl ssh info <pod_id>   # capture POD_IP, POD_PORT")
+    println("  c. ssh ... 'mkdir -p /workspace/anima/training'")
+    println("  d. scp training/train_clm.hexa + clm_1b_config.json + clm_r4_launch.hexa")
+    println("  e. R2-resume (preferred):")
+    println("       rclone copy " + R2_RESUME + " /workspace/ckpt_clm1b_r4/ -v")
+    println("     Fallback: scp " + CORPUS_GZ + " + gunzip")
+    println("  f. tmux new -d -s clm-r4 'hexa /workspace/clm_r4_launch.hexa 2>&1 | tee /workspace/clm_r4_launch.log'")
+    println("  g. Update " + WATCHER_CFG + " with new pod_id/host/port, enabled=true")
+
+    println("")
+    println("[4/5] Cost estimate:")
+    let low_cost  = HOURLY_USD * WALL_HOURS
+    let high_cost = HOURLY_USD * 82.1
+    println("  hourly       = $" + str(HOURLY_USD))
+    println("  wall (R2-resume) = " + str(WALL_HOURS) + " h")
+    println("  cost (R2-resume) = $" + str(low_cost))
+    println("  cost (option C, 1.5M steps, fallback) = $" + str(high_cost))
+
+    println("")
+    println("[5/5] Teardown trigger (all-of):")
+    println("  - /workspace/ckpt_clm1b_r4/training_summary.json present")
+    println("  - rclone ls " + R2_PREFIX + "step_750000/ non-empty")
+    println("  - eval_loss <= 1.0 recorded")
+    println("  cmd: runpodctl remove pod <pod_id>")
+
+    println("")
+    if ok {
+        println("RESULT: PASS — all artifacts present. Awaiting 'fire' user command.")
+    } else {
+        println("RESULT: FAIL — missing artifacts above. Resolve before fire.")
+    }
+    println("")
+    println("Fire command (review first!):")
+    println("  runpodctl pod create -f " + POD_SPEC)
+    println("")
+}
+
+fn main() {
+    // Any invocation -> selftest. Real fire is manual per caller constraint.
+    selftest()
+}
+
+main()
