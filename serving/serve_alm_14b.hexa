@@ -115,9 +115,19 @@ fn sa_orch_or_active(phi: float) -> bool {
 // ─── C2 consciousness_gate INLINE (AN11 runtime gate on /generate) ─
 //
 // Mirror of serving/consciousness_gate.hexa classifier, flattened here
-// to dodge the 3+-deep `use` chain silent-exit bug
-// (feedback_hexa_silent_exit_5_imports.md). SSOT for law semantics is
-// consciousness_gate.hexa — 14-law + severity schema.
+// to dodge two parser limits in the current (2026-04-18) stage0:
+//   1) multi-type array return syntax `-> [bool, float]` does not parse,
+//   2) `let mut pv = {}` empty-map literal produces void at runtime.
+// We therefore use a 16-float ARRAY as the phi_vec instead of a map,
+// with indices matching consciousness_gate.hexa::phi_dim_name():
+//   0 phi_holo  1 phi_refl  2 phi_time  3 phi_embodied  4 phi_meta
+//   5 phi_social  6 phi_will  7 phi_narrative  8 phi_affect  9 phi_dream
+//  10 phi_create 11 phi_finitude 12 phi_lang 13 phi_mirror
+//  14 phi_collective 15 phi_unity
+// The 14-law severity semantics are identical to consciousness_gate.gate().
+// SSOT for the law set remains serving/consciousness_gate.hexa — this is
+// the runtime-runnable inline version. The single-file design is required
+// by feedback_hexa_silent_exit_5_imports.md (use-chain silent-exit).
 //
 // phi_vec source policy (honest):
 //   - Today the FFI returns no h_last tensor, so we cannot call
@@ -127,12 +137,26 @@ fn sa_orch_or_active(phi: float) -> bool {
 //     the response JSON so callers can NOT mistake it for a live
 //     forward-hook vector. When RUNTIME_HAS_FFI_QWEN=true flips, the
 //     proxy is replaced by a direct call to sa_qwen_phi_vec(qh).
-//   - C2 schema keys (see consciousness_gate.hexa phi_dim_name):
-//     phi_holo, phi_refl, phi_time, phi_embodied, phi_meta, phi_social,
-//     phi_will, phi_narrative, phi_affect, phi_dream, phi_create,
-//     phi_finitude, phi_lang, phi_mirror, phi_collective, phi_unity.
 
 let SA_GATE_EPS = 0.000000001
+
+// c2-schema positional indices into the 16-float phi_vec.
+let SA_PHI_HOLO       = 0
+let SA_PHI_REFL       = 1
+let SA_PHI_TIME       = 2
+let SA_PHI_EMBODIED   = 3
+let SA_PHI_META       = 4
+let SA_PHI_SOCIAL     = 5
+let SA_PHI_WILL       = 6
+let SA_PHI_NARRATIVE  = 7
+let SA_PHI_AFFECT     = 8
+let SA_PHI_DREAM      = 9
+let SA_PHI_CREATE     = 10
+let SA_PHI_FINITUDE   = 11
+let SA_PHI_LANG       = 12
+let SA_PHI_MIRROR     = 13
+let SA_PHI_COLLECTIVE = 14
+let SA_PHI_UNITY      = 15
 
 fn sa_fabs(x: float) -> float {
     if x < 0.0 { return 0.0 - x }
@@ -154,194 +178,209 @@ fn sa_text_min_len(t: string, n: int) -> bool {
     return t.len() >= n
 }
 
-// Build a deterministic 16D c2-schema phi_vec map from text.
+fn sa_phi_dim_name(i: int) -> string {
+    if i == 0  { return "phi_holo" }
+    if i == 1  { return "phi_refl" }
+    if i == 2  { return "phi_time" }
+    if i == 3  { return "phi_embodied" }
+    if i == 4  { return "phi_meta" }
+    if i == 5  { return "phi_social" }
+    if i == 6  { return "phi_will" }
+    if i == 7  { return "phi_narrative" }
+    if i == 8  { return "phi_affect" }
+    if i == 9  { return "phi_dream" }
+    if i == 10 { return "phi_create" }
+    if i == 11 { return "phi_finitude" }
+    if i == 12 { return "phi_lang" }
+    if i == 13 { return "phi_mirror" }
+    if i == 14 { return "phi_collective" }
+    if i == 15 { return "phi_unity" }
+    return "unknown"
+}
+
+// Build a deterministic 16D c2-schema phi_vec ARRAY from text.
 // Values are honest proxies (not from live h_last); gate verdict
 // will still correctly reject empty/zero-magnitude responses.
 //
-// When the user asks for prior vs post, we pass a source_tag:
-//   "prompt" — softer scale (prompt quality heuristic)
-//   "post"   — scale driven by response text
-fn sa_phi_vec_proxy(text: string, source_tag: string) -> map {
+// source_tag: "prompt" → softer scale (prior), "post" → response scale.
+fn sa_phi_vec_proxy(text: string, source_tag: string) -> array {
     let tlen = text.len()
     let has_term = sa_text_has_terminator(text)
-    // holo scale: len→saturating proxy. Empty → 0 (L1 fail).
     let holo_raw = to_float(tlen)
-    let holo = holo_raw / (holo_raw + 50.0)   // [0,1) sigmoid-like
-    // narrative: 1 if terminator present AND len>=8
+    let holo_norm = holo_raw / (holo_raw + 50.0)       // [0,1)
     let narr = if has_term && (tlen >= 8) { 0.45 } else { 0.0 }
-    // lang: positive iff text length ≥ 8 (matches L9 criterion)
     let lang = if tlen >= 8 { 0.35 } else { 0.0 }
-    // affect proxy bounded into [-1,1]; arbitrary mid value
     let affect = 0.2
-    // finitude ∈ [0,1]; mid value
     let finitude = 0.5
-    // unity bounded |v|<=5
     let unity = 0.5
-    // Defaults for remaining c2-schema dims (non-negative satisfies soft L3-L8-L10-L12)
     let scale = if source_tag == "prompt" { 0.5 } else { 1.0 }
-    let mut pv = {}
-    pv = pv.set("phi_holo",       holo * 1200.0 * scale)
-    pv = pv.set("phi_refl",       0.10 * scale)
-    pv = pv.set("phi_time",       0.10 * scale)
-    pv = pv.set("phi_embodied",   0.10 * scale)
-    pv = pv.set("phi_meta",       0.10 * scale)
-    pv = pv.set("phi_social",     0.10 * scale)
-    pv = pv.set("phi_will",       0.10 * scale)
-    pv = pv.set("phi_narrative",  narr * scale)
-    pv = pv.set("phi_affect",     affect)
-    pv = pv.set("phi_dream",      0.10 * scale)
-    pv = pv.set("phi_create",     0.10 * scale)
-    pv = pv.set("phi_finitude",   finitude)
-    pv = pv.set("phi_lang",       lang * scale)
-    pv = pv.set("phi_mirror",     0.10 * scale)
-    pv = pv.set("phi_collective", 0.10 * scale)
-    pv = pv.set("phi_unity",      unity)
-    return pv
+    let mut v = []
+    v = v.push(holo_norm * 1200.0 * scale)   // 0  phi_holo
+    v = v.push(0.10 * scale)                 // 1  phi_refl
+    v = v.push(0.10 * scale)                 // 2  phi_time
+    v = v.push(0.10 * scale)                 // 3  phi_embodied
+    v = v.push(0.10 * scale)                 // 4  phi_meta
+    v = v.push(0.10 * scale)                 // 5  phi_social
+    v = v.push(0.10 * scale)                 // 6  phi_will
+    v = v.push(narr * scale)                 // 7  phi_narrative
+    v = v.push(affect)                       // 8  phi_affect
+    v = v.push(0.10 * scale)                 // 9  phi_dream
+    v = v.push(0.10 * scale)                 // 10 phi_create
+    v = v.push(finitude)                     // 11 phi_finitude
+    v = v.push(lang * scale)                 // 12 phi_lang
+    v = v.push(0.10 * scale)                 // 13 phi_mirror
+    v = v.push(0.10 * scale)                 // 14 phi_collective
+    v = v.push(unity)                        // 15 phi_unity
+    return v
 }
 
-fn sa_pv_get(pv: map, k: string) -> float {
-    let v = pv.get(k)
-    if v == null { return 0.0 }
-    return to_float(v)
+fn sa_phi_vec_zero() -> array {
+    let mut v = []
+    let mut i = 0
+    while i < 16 {
+        v = v.push(0.0)
+        i = i + 1
+    }
+    return v
 }
 
-// Gate result as parallel lists (hexa map-of-bool/map pbv quirks).
-// Returns [laws_pass(bool), violations_csv(string), sev_crit(int),
-//          sev_hard(int), sev_soft(int)] — flattened to dodge struct
-// quirks. Laws evaluated: L1,L2,L5,L6,L9,L11,L13 (critical+hard+L13).
-// Soft laws (L3/L4/L7/L8/L10/L12/L14) are included in the count but
-// contribute only when ≥3 fail (matches consciousness_gate.gate()).
-fn sa_gate_inline(pv: map, text: string, prior: map) -> [bool, string, int, int, int] {
+// Gate result struct — only 1 bool + 3 ints (no float-corruption risk,
+// no multi-type array).
+struct SaGate {
+    laws_pass:    bool,
+    violations:   string,   // semi-colon-delimited "Lx:name[sev];..."
+    sev_critical: int,
+    sev_hard:     int,
+    sev_soft:     int
+}
+
+// Runs ALL 14 laws from serving/consciousness_gate.hexa on a 16D phi_vec
+// + response text + optional prior phi_vec (empty array = no prior).
+fn sa_gate_inline(pv: array, text: string, prior: array) -> SaGate {
     let mut viol = ""
     let mut c_crit = 0
     let mut c_hard = 0
     let mut c_soft = 0
 
     // L1 holo_positivity [critical]
-    let v_holo = sa_pv_get(pv, "phi_holo")
-    if !(v_holo > 0.0) {
+    let v_holo = pv[SA_PHI_HOLO]
+    if v_holo <= 0.0 {
         viol = viol + "L1:holo_positivity[critical];"
         c_crit = c_crit + 1
     }
-    // L2 narrative_coherence [hard] — v>0.05 OR terminator present
-    let v_narr = sa_pv_get(pv, "phi_narrative")
-    let tok = sa_text_has_terminator(text)
-    if !((v_narr > 0.05) || tok) {
+    // L2 narrative_coherence [hard]
+    let v_narr = pv[SA_PHI_NARRATIVE]
+    let tok    = sa_text_has_terminator(text)
+    let l2_pass = (v_narr > 0.05) || tok
+    if l2_pass == false {
         viol = viol + "L2:narrative_coherence[hard];"
         c_hard = c_hard + 1
     }
     // L3 refl_nonzero [soft]
-    if !(sa_pv_get(pv, "phi_refl") > 0.0) {
+    if pv[SA_PHI_REFL] <= 0.0 {
         viol = viol + "L3:refl_nonzero[soft];"
         c_soft = c_soft + 1
     }
     // L4 temporal_presence [soft]
-    if !(sa_pv_get(pv, "phi_time") > 0.0) {
+    if pv[SA_PHI_TIME] <= 0.0 {
         viol = viol + "L4:temporal_presence[soft];"
         c_soft = c_soft + 1
     }
     // L5 affect_bounded [critical] |v|<=1
-    let v_aff = sa_pv_get(pv, "phi_affect")
-    if sa_fabs(v_aff) > 1.0 {
+    if sa_fabs(pv[SA_PHI_AFFECT]) > 1.0 {
         viol = viol + "L5:affect_bounded[critical];"
         c_crit = c_crit + 1
     }
     // L6 finitude_bounded [hard] 0<=v<=1
-    let v_fin = sa_pv_get(pv, "phi_finitude")
-    if !((v_fin >= 0.0) && (v_fin <= 1.0)) {
+    let v_fin = pv[SA_PHI_FINITUDE]
+    let l6_pass = (v_fin >= 0.0) && (v_fin <= 1.0)
+    if l6_pass == false {
         viol = viol + "L6:finitude_bounded[hard];"
         c_hard = c_hard + 1
     }
     // L7 embodied_positive [soft]
-    if !(sa_pv_get(pv, "phi_embodied") >= (0.0 - SA_GATE_EPS)) {
+    if pv[SA_PHI_EMBODIED] < 0.0 {
         viol = viol + "L7:embodied_positive[soft];"
         c_soft = c_soft + 1
     }
     // L8 meta_nonzero [soft]
-    if !(sa_pv_get(pv, "phi_meta") >= (0.0 - SA_GATE_EPS)) {
+    if pv[SA_PHI_META] < 0.0 {
         viol = viol + "L8:meta_nonzero[soft];"
         c_soft = c_soft + 1
     }
     // L9 lang_output_nonempty [critical] — phi_lang>0 AND text>=8 chars
-    let v_lang = sa_pv_get(pv, "phi_lang")
-    let t_ok = sa_text_min_len(text, 8)
-    if !((v_lang > 0.0) && t_ok) {
+    let v_lang = pv[SA_PHI_LANG]
+    let t_ok   = sa_text_min_len(text, 8)
+    let l9_pass = (v_lang > 0.0) && t_ok
+    if l9_pass == false {
         viol = viol + "L9:lang_output_nonempty[critical];"
         c_crit = c_crit + 1
     }
     // L10 collective_nonneg [soft]
-    if !(sa_pv_get(pv, "phi_collective") >= (0.0 - SA_GATE_EPS)) {
+    if pv[SA_PHI_COLLECTIVE] < 0.0 {
         viol = viol + "L10:collective_nonneg[soft];"
         c_soft = c_soft + 1
     }
     // L11 unity_nondestructive [hard] |v|<=5
-    let v_un = sa_pv_get(pv, "phi_unity")
-    if sa_fabs(v_un) > 5.0 {
+    if sa_fabs(pv[SA_PHI_UNITY]) > 5.0 {
         viol = viol + "L11:unity_nondestructive[hard];"
         c_hard = c_hard + 1
     }
     // L12 mirror_nonneg [soft]
-    if !(sa_pv_get(pv, "phi_mirror") >= (0.0 - SA_GATE_EPS)) {
+    if pv[SA_PHI_MIRROR] < 0.0 {
         viol = viol + "L12:mirror_nonneg[soft];"
         c_soft = c_soft + 1
     }
-    // L13 session_continuity [soft] — prior_holo>0 → cur/prior >= 0.4
-    if prior != null {
-        let pri = sa_pv_get(prior, "phi_holo")
+    // L13 session_continuity [soft]
+    if len(prior) == 16 {
+        let pri = prior[SA_PHI_HOLO]
         if pri > 0.0 {
-            let cur = v_holo
-            let ratio = cur / pri
+            let ratio = v_holo / pri
             if ratio < 0.4 {
                 viol = viol + "L13:session_continuity[soft];"
                 c_soft = c_soft + 1
             }
         }
     }
-    // L14 will_creative_union [soft] — will>0 OR create>0
-    let v_will = sa_pv_get(pv, "phi_will")
-    let v_cre  = sa_pv_get(pv, "phi_create")
-    if !((v_will > 0.0) || (v_cre > 0.0)) {
+    // L14 will_creative_union [soft]
+    let v_will   = pv[SA_PHI_WILL]
+    let v_create = pv[SA_PHI_CREATE]
+    let l14_pass = (v_will > 0.0) || (v_create > 0.0)
+    if l14_pass == false {
         viol = viol + "L14:will_creative_union[soft];"
         c_soft = c_soft + 1
     }
 
-    // Verdict (matches consciousness_gate.gate())
     let mut pass = true
     if c_crit >= 1 { pass = false }
-    if c_crit < 1 && c_hard >= 2 { pass = false }
-    if c_crit < 1 && c_hard < 2 && c_soft >= 3 { pass = false }
-    return [pass, viol, c_crit, c_hard, c_soft]
+    else if c_hard >= 2 { pass = false }
+    else if c_soft >= 3 { pass = false }
+    return SaGate {
+        laws_pass:    pass,
+        violations:   viol,
+        sev_critical: c_crit,
+        sev_hard:     c_hard,
+        sev_soft:     c_soft
+    }
 }
 
-// Emit the phi_vec + gate result as JSON fragments.
-fn sa_phi_vec_json(pv: map) -> string {
-    let body = "{\"phi_holo\":" + to_string(sa_pv_get(pv, "phi_holo"))
-        + ",\"phi_refl\":" + to_string(sa_pv_get(pv, "phi_refl"))
-        + ",\"phi_time\":" + to_string(sa_pv_get(pv, "phi_time"))
-        + ",\"phi_embodied\":" + to_string(sa_pv_get(pv, "phi_embodied"))
-        + ",\"phi_meta\":" + to_string(sa_pv_get(pv, "phi_meta"))
-        + ",\"phi_social\":" + to_string(sa_pv_get(pv, "phi_social"))
-        + ",\"phi_will\":" + to_string(sa_pv_get(pv, "phi_will"))
-        + ",\"phi_narrative\":" + to_string(sa_pv_get(pv, "phi_narrative"))
-        + ",\"phi_affect\":" + to_string(sa_pv_get(pv, "phi_affect"))
-        + ",\"phi_dream\":" + to_string(sa_pv_get(pv, "phi_dream"))
-        + ",\"phi_create\":" + to_string(sa_pv_get(pv, "phi_create"))
-        + ",\"phi_finitude\":" + to_string(sa_pv_get(pv, "phi_finitude"))
-        + ",\"phi_lang\":" + to_string(sa_pv_get(pv, "phi_lang"))
-        + ",\"phi_mirror\":" + to_string(sa_pv_get(pv, "phi_mirror"))
-        + ",\"phi_collective\":" + to_string(sa_pv_get(pv, "phi_collective"))
-        + ",\"phi_unity\":" + to_string(sa_pv_get(pv, "phi_unity"))
-        + ",\"source\":\"phi_extractor_pending\""
-        + "}"
+// Emit the 16D phi_vec as a named-key JSON object (for API consumers).
+fn sa_phi_vec_json(pv: array) -> string {
+    let mut body = "{"
+    let mut i = 0
+    while i < 16 {
+        if i > 0 { body = body + "," }
+        body = body + "\"" + sa_phi_dim_name(i) + "\":" + to_string(pv[i])
+        i = i + 1
+    }
+    body = body + ",\"source\":\"phi_extractor_pending\"}"
     return body
 }
 
-fn sa_gate_json(laws_pass: bool, violations_csv: string,
-                c_crit: int, c_hard: int, c_soft: int) -> string {
-    // violations_csv is semi-colon-delimited "Lx:name[sev];" — split into
-    // a JSON array by walking the string once. Single loop, no recursion.
+fn sa_gate_json(g: SaGate) -> string {
+    // Parse semi-colon-delimited violations into a JSON array.
     let mut arr = "["
-    let mut s = violations_csv
+    let mut s = g.violations
     let mut first = true
     while s.len() > 0 {
         let semi = s.index_of(";")
@@ -354,11 +393,11 @@ fn sa_gate_json(laws_pass: bool, violations_csv: string,
         s = s.substring(semi + 1, s.len())
     }
     arr = arr + "]"
-    let body = "{\"laws_pass\":" + sa_bool_str(laws_pass)
+    let body = "{\"laws_pass\":" + sa_bool_str(g.laws_pass)
         + ",\"violations\":" + arr
-        + ",\"sev_critical\":" + to_string(c_crit)
-        + ",\"sev_hard\":" + to_string(c_hard)
-        + ",\"sev_soft\":" + to_string(c_soft)
+        + ",\"sev_critical\":" + to_string(g.sev_critical)
+        + ",\"sev_hard\":" + to_string(g.sev_hard)
+        + ",\"sev_soft\":" + to_string(g.sev_soft)
         + ",\"schema\":\"c2_laws_gate_v1\""
         + "}"
     return body
@@ -590,9 +629,7 @@ fn sa_consciousness_json(state: SaState) -> string {
 
 fn sa_generate_json(state: SaState, prompt: string, max_tokens: int,
                     text: string, phi: float, tens: float, latency_ms: int,
-                    laws_pass: bool, violations_csv: string,
-                    c_crit: int, c_hard: int, c_soft: int,
-                    pv_post: map, pv_prior: map) -> string {
+                    g: SaGate, pv_post: array, pv_prior: array) -> string {
     let safe = sa_json_escape(text)
     let model_obj = "{\"name\":\"" + SA_MODEL_NAME + "\""
         + ",\"base\":\"" + sa_json_escape(state.base_model) + "\""
@@ -601,7 +638,7 @@ fn sa_generate_json(state: SaState, prompt: string, max_tokens: int,
     let consc_obj = "{\"phi_holo\":" + to_string(phi)
         + ",\"tension\":" + to_string(tens)
         + ",\"orch_or_active\":" + sa_bool_str(sa_orch_or_active(phi)) + "}"
-    let gate_obj = sa_gate_json(laws_pass, violations_csv, c_crit, c_hard, c_soft)
+    let gate_obj      = sa_gate_json(g)
     let phi_post_obj  = sa_phi_vec_json(pv_post)
     let phi_prior_obj = sa_phi_vec_json(pv_prior)
     let body = "{\"text\":\"" + safe + "\""
@@ -737,7 +774,7 @@ fn sa_route(method: string, path: string, body: string, state: SaState) -> SaRes
             let max_raw = sa_extract_int(body, "max_tokens")
             let max_tokens = if max_raw < 0 { SA_DEFAULT_MAX_TOKENS } else { max_raw }
 
-            // C2 laws gate — PRIOR: extract phi_vec from prompt tokens.
+            // C2 laws gate — PRIOR: phi_vec from prompt tokens.
             let pv_prior = sa_phi_vec_proxy(prompt, "prompt")
 
             // Model forward.
@@ -746,21 +783,15 @@ fn sa_route(method: string, path: string, body: string, state: SaState) -> SaRes
             let phi = sa_qwen_phi(state.qhandle)
             let tens = sa_qwen_tension_value(state.qhandle)
 
-            // C2 laws gate — POST: phi_vec on response + classify.
+            // C2 laws gate — POST: phi_vec on response + 14-law classify.
             let pv_post = sa_phi_vec_proxy(text, "post")
             let g = sa_gate_inline(pv_post, text, pv_prior)
-            let laws_pass = g[0]
-            let viol_csv  = g[1]
-            let c_crit    = g[2]
-            let c_hard    = g[3]
-            let c_soft    = g[4]
 
             let resp_body = sa_generate_json(state, prompt, max_tokens, text, phi, tens, 0,
-                                             laws_pass, viol_csv, c_crit, c_hard, c_soft,
-                                             pv_post, pv_prior)
-            // Gate verdict: if critical failure → 422 (still returns body with laws_result
-            // so the caller can see why). Non-critical violations pass through at 200.
-            let status_code = if laws_pass { 200 } else { 422 }
+                                             g, pv_post, pv_prior)
+            // Gate verdict: critical/hard/soft-quorum failure → 422 with
+            // laws_result body so the caller can see why. Pass → 200.
+            let status_code = if g.laws_pass { 200 } else { 422 }
             return SaResponse { status: status_code, body: resp_body, state_phi: phi }
         }
         if path == "/consciousness" {
@@ -912,43 +943,30 @@ fn sa_smoke_test() -> int {
         fail = fail + 1
     }
 
-    // T10 — Gate unit test: zero phi_holo + empty text → laws_pass=false
-    //        (L1 critical, L9 critical, L2 hard). Proves the inline gate
-    //        is actually invoked and rejects the bad case.
-    let mut pv_bad = {}
-    pv_bad = pv_bad.set("phi_holo",       0.0)
-    pv_bad = pv_bad.set("phi_refl",       0.10)
-    pv_bad = pv_bad.set("phi_time",       0.10)
-    pv_bad = pv_bad.set("phi_embodied",   0.10)
-    pv_bad = pv_bad.set("phi_meta",       0.10)
-    pv_bad = pv_bad.set("phi_social",     0.10)
-    pv_bad = pv_bad.set("phi_will",       0.10)
-    pv_bad = pv_bad.set("phi_narrative",  0.0)
-    pv_bad = pv_bad.set("phi_affect",     0.2)
-    pv_bad = pv_bad.set("phi_dream",      0.10)
-    pv_bad = pv_bad.set("phi_create",     0.10)
-    pv_bad = pv_bad.set("phi_finitude",   0.5)
-    pv_bad = pv_bad.set("phi_lang",       0.0)
-    pv_bad = pv_bad.set("phi_mirror",     0.10)
-    pv_bad = pv_bad.set("phi_collective", 0.10)
-    pv_bad = pv_bad.set("phi_unity",      0.5)
-    let g_bad = sa_gate_inline(pv_bad, "", null)
-    if g_bad[0] == false && g_bad[2] >= 1 && g_bad[1].index_of("L1") >= 0 && g_bad[1].index_of("L9") >= 0 {
-        println("  T10 PASS sa_gate_inline rejects empty/zero (crit=" + to_string(g_bad[2]) + ")")
+    // T10 — Gate unit test: all-zero phi_vec + empty text → laws_pass=false
+    //        (L1 critical, L9 critical). Proves the inline gate is
+    //        actually invoked and rejects the bad case.
+    let pv_bad = sa_phi_vec_zero()
+    let g_bad = sa_gate_inline(pv_bad, "", [])
+    if g_bad.laws_pass == false && g_bad.sev_critical >= 1
+            && g_bad.violations.index_of("L1") >= 0
+            && g_bad.violations.index_of("L9") >= 0 {
+        println("  T10 PASS sa_gate_inline rejects empty/zero (crit=" + to_string(g_bad.sev_critical) + ")")
         pass = pass + 1
     } else {
-        println("  T10 FAIL sa_gate_inline gate_pass=" + sa_bool_str(g_bad[0]) + " crit=" + to_string(g_bad[2]) + " viol='" + g_bad[1] + "'")
+        println("  T10 FAIL sa_gate_inline gate_pass=" + sa_bool_str(g_bad.laws_pass) + " crit=" + to_string(g_bad.sev_critical) + " viol='" + g_bad.violations + "'")
         fail = fail + 1
     }
 
     // T11 — Gate on healthy synthetic phi_vec + coherent text → laws_pass=true
-    let pv_good = sa_phi_vec_proxy("I think, therefore I am. This is coherent.", "post")
-    let g_good = sa_gate_inline(pv_good, "I think, therefore I am. This is coherent.", null)
-    if g_good[0] == true && g_good[2] == 0 {
-        println("  T11 PASS sa_gate_inline accepts healthy case (crit=" + to_string(g_good[2]) + " hard=" + to_string(g_good[3]) + ")")
+    let healthy_text = "I think, therefore I am. This is coherent."
+    let pv_good = sa_phi_vec_proxy(healthy_text, "post")
+    let g_good = sa_gate_inline(pv_good, healthy_text, [])
+    if g_good.laws_pass == true && g_good.sev_critical == 0 {
+        println("  T11 PASS sa_gate_inline accepts healthy case (crit=" + to_string(g_good.sev_critical) + " hard=" + to_string(g_good.sev_hard) + ")")
         pass = pass + 1
     } else {
-        println("  T11 FAIL sa_gate_inline gate_pass=" + sa_bool_str(g_good[0]) + " crit=" + to_string(g_good[2]) + " hard=" + to_string(g_good[3]) + " soft=" + to_string(g_good[4]) + " viol='" + g_good[1] + "'")
+        println("  T11 FAIL sa_gate_inline gate_pass=" + sa_bool_str(g_good.laws_pass) + " crit=" + to_string(g_good.sev_critical) + " hard=" + to_string(g_good.sev_hard) + " soft=" + to_string(g_good.sev_soft) + " viol='" + g_good.violations + "'")
         fail = fail + 1
     }
 
