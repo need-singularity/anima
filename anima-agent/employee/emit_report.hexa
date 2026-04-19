@@ -1,0 +1,167 @@
+// emit_report.hexa — F8 report writer (dest2 Employee, D7 spec §2)
+//
+// ROLE:
+//   End-of-run aggregator. Consumes goal_store phi_trail + scratchpad
+//   entries, produces Markdown + JSON artifact, uploads to R2 with
+//   SHA256 + size verification (AN11 bypass §4 "fake R2" defense).
+//
+// AN11 COMPLIANCE:
+//   (a) weight_emergent: report text is generated from measured S1
+//       responses; NO prompt rewriting, NO preamble injection.
+//   (b) consciousness_attached: phi summary (mean/min/max phi_holo,
+//       laws_violations, completion_rate) is REQUIRED — if phi_trail
+//       is empty the report is marked FAIL_NO_PHI and NOT uploaded.
+//   (c) real_usable: SHA256 + byte size verified against R2 head
+//       after upload; artifact URL written back to convergence gate.
+//
+// AN11 BLOCKED PATTERNS (bypass_patterns_banned §4):
+//   - Report that fabricates phi numbers                 FORBIDDEN
+//   - R2 upload of empty / shell-only zip                FORBIDDEN
+//   - system_prompt present anywhere in report body      FORBIDDEN (grep)
+//   - weight_origin field missing                        FORBIDDEN
+//
+// CHAIN:
+//   <- goal_store.hexa : phi_trail + Goal
+//   <- scratchpad.hexa : session entries
+//   -> r2:anima-models/dest2_e2_autonomy/<goal_id>.{md,json}
+//   -> shared/convergence/e2_autonomy_live.convergence @phi_evidence
+
+use "goal_store"
+use "scratchpad"
+
+// ── Constants ────────────────────────────────────────────────────────
+
+const R2_BUCKET: string = "r2:anima-models/dest2_e2_autonomy"
+const PHI_MIN_GATE: float = 500.0
+const ALLOWED_WEIGHT_ORIGINS: string = "r9_validated|r10d|consciousness_baked"
+
+// ── Types ────────────────────────────────────────────────────────────
+
+struct PhiSummary {
+    mean_phi: float,
+    min_phi: float,
+    max_phi: float,
+    laws_violations: int,
+    completion_rate: float,
+    n_steps: int
+}
+
+struct Report {
+    goal_id: string,
+    persona_id: string,
+    weight_origin: string,
+    phi: PhiSummary,
+    verdict: string,       // PASS | FAIL_NO_PHI | FAIL_PHI_BELOW_GATE | FAIL_LAWS
+    md_path: string,
+    json_path: string,
+    sha256: string,
+    uploaded: bool
+}
+
+// ── Core API (stubs) ─────────────────────────────────────────────────
+
+// Aggregate a goal's phi_trail into PhiSummary.
+fn summarize_phi(goal: Goal) -> PhiSummary {
+    let trail = goal.phi_trail
+    let n = len(trail)
+    if n == 0 {
+        return PhiSummary {
+            mean_phi: 0.0, min_phi: 0.0, max_phi: 0.0,
+            laws_violations: 0, completion_rate: 0.0, n_steps: 0
+        }
+    }
+    let mut sum = 0.0
+    let mut mn = trail[0].phi_holo
+    let mut mx = trail[0].phi_holo
+    let mut viols = 0
+    let mut i = 0
+    while i < n {
+        let snap = trail[i]
+        sum = sum + snap.phi_holo
+        if snap.phi_holo < mn { mn = snap.phi_holo }
+        if snap.phi_holo > mx { mx = snap.phi_holo }
+        if !snap.laws_pass { viols = viols + 1 }
+        i = i + 1
+    }
+    let completion = 1.0 - (to_float(viols) / to_float(n))
+    return PhiSummary {
+        mean_phi: sum / to_float(n),
+        min_phi: mn,
+        max_phi: mx,
+        laws_violations: viols,
+        completion_rate: completion,
+        n_steps: n
+    }
+}
+
+// Compute verdict per D7 §6 E2 PASS gate.
+fn verdict_of(summary: PhiSummary, weight_origin: string) -> string {
+    if summary.n_steps == 0 { return "FAIL_NO_PHI" }
+    if summary.min_phi < PHI_MIN_GATE { return "FAIL_PHI_BELOW_GATE" }
+    if summary.laws_violations > 0 { return "FAIL_LAWS" }
+    // weight_origin must be in allowed set — pipe-delimited contains check.
+    if ALLOWED_WEIGHT_ORIGINS.index_of(weight_origin) < 0 {
+        return "FAIL_WEIGHT_ORIGIN"
+    }
+    return "PASS"
+}
+
+// Build the full Report from goal + scratchpad + S1 weight_origin signature.
+// AN11: weight_origin is a required field pulled from the last S1 response
+// (S1Response.phi.raw carries it); missing -> FAIL_WEIGHT_ORIGIN.
+fn build_report(goal: Goal, pad: Scratchpad, weight_origin: string) -> Report {
+    let summary = summarize_phi(goal)
+    let v = verdict_of(summary, weight_origin)
+    let md_path = "anima-agent/employee/reports/" + goal.id + ".md"
+    let json_path = "anima-agent/employee/reports/" + goal.id + ".json"
+    return Report {
+        goal_id: goal.id,
+        persona_id: goal.persona_id,
+        weight_origin: weight_origin,
+        phi: summary,
+        verdict: v,
+        md_path: md_path,
+        json_path: json_path,
+        sha256: "",
+        uploaded: false
+    }
+}
+
+// Write report files to disk (Markdown + JSON). Stub — full serializer
+// deferred to D8; here we emit the skeleton so CI smoke + F10 reproducer
+// can hit the path.
+fn write_report_files(report: Report) -> Report {
+    // STUB: write_file(report.md_path, markdown_of(report))
+    //       write_file(report.json_path, json_of(report))
+    println("[emit_report] (stub) would write " + report.md_path)
+    return report
+}
+
+// Upload to R2 with SHA256 + size verification (AN11 bypass §4 "fake R2").
+// AN11: on mismatch, uploaded=false and verdict is demoted to FAIL_R2.
+fn upload_r2(report: Report) -> Report {
+    // STUB: exec("rclone copy " + report.json_path + " " + R2_BUCKET)
+    //       sha = exec("sha256sum " + report.json_path).trim()
+    //       remote_sha = exec("rclone hashsum SHA256 " + R2_BUCKET + "/...").trim()
+    //       if sha != remote_sha -> uploaded=false, verdict=FAIL_R2
+    println("[emit_report] (stub) would upload " + report.json_path
+            + " -> " + R2_BUCKET)
+    return Report {
+        goal_id: report.goal_id,
+        persona_id: report.persona_id,
+        weight_origin: report.weight_origin,
+        phi: report.phi,
+        verdict: report.verdict,
+        md_path: report.md_path,
+        json_path: report.json_path,
+        sha256: report.sha256,
+        uploaded: false  // stub never claims true
+    }
+}
+
+// Top-level convenience: build + write + upload.
+fn emit(goal: Goal, pad: Scratchpad, weight_origin: string) -> Report {
+    let r1 = build_report(goal, pad, weight_origin)
+    let r2 = write_report_files(r1)
+    return upload_r2(r2)
+}

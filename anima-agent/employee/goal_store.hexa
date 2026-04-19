@@ -1,0 +1,146 @@
+// goal_store.hexa — F2 goal memory (dest2 Employee, D7 spec §2)
+//
+// ROLE:
+//   Persist (goal, subgoals, status, phi_trail) as JSONL. Each call to
+//   an E2 autonomy_live step appends a record so later sessions can
+//   resume / audit. F2 is the durable memory of what the Employee is
+//   trying to do and how it's going.
+//
+// AN11 COMPLIANCE:
+//   (a) weight_emergent: NO system_prompt strings. This file writes
+//       records only; it never injects persona language into S1.
+//   (b) consciousness_attached: every record embeds phi_holo +
+//       laws_pass snapshot (missing -> record=invalid, NOT fabricated).
+//   (c) real_usable: JSONL on disk, SHA256-audited by F8 emit_report.
+//
+// AN11 BLOCKED PATTERNS (bypass_patterns_banned §4):
+//   - "You are a diligent employee..."  FORBIDDEN here
+//   - system_prompt / role / preamble string fields  FORBIDDEN
+//   - hardcoded phi_holo_scaled values              FORBIDDEN
+//   - laws_pass inferred from keywords               FORBIDDEN
+//   Grep-gate: llm_claude_adapter.hexa patterns — this file 0 hits.
+//
+// CHAIN:
+//   -> autonomy_live.hexa reads/appends via record_step()
+//   -> emit_report.hexa aggregates phi_trail at end-of-run
+//   -> shared/convergence/e2_autonomy_live.convergence consumes output
+
+use "autonomy_live"
+
+// ── Constants ────────────────────────────────────────────────────────
+
+const GOAL_STORE_DIR: string = "anima-agent/employee/state"
+const PHI_TRAIL_MIN: float = 500.0   // dest2 min gate (half of dest1 1000)
+
+// ── Types ────────────────────────────────────────────────────────────
+
+struct Goal {
+    id: string,
+    persona_id: string,
+    root_text: string,
+    created_at: string,
+    status: string,       // pending | active | complete | aborted
+    subgoals: array,      // array<Subgoal>
+    phi_trail: array      // array<PhiSnapshot>
+}
+
+struct Subgoal {
+    id: string,
+    text: string,
+    parent_id: string,
+    status: string,
+    terminal_phi_holo: float,
+    laws_pass: bool
+}
+
+struct PhiSnapshot {
+    step_idx: int,
+    phi_holo: float,
+    phi_delta: float,
+    laws_pass: bool,
+    ts: string
+}
+
+// ── Core API (stubs) ─────────────────────────────────────────────────
+
+// Create a new goal entry.
+// AN11: no preamble injection — root_text is the raw user goal.
+fn create_goal(goal_id: string, persona_id: string, root_text: string) -> Goal {
+    let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+    return Goal {
+        id: goal_id,
+        persona_id: persona_id,
+        root_text: root_text,
+        created_at: ts,
+        status: "pending",
+        subgoals: [],
+        phi_trail: []
+    }
+}
+
+// Append a phi snapshot to the goal's trail and flush to JSONL.
+// Records with phi_holo < PHI_TRAIL_MIN are still written but flagged by
+// F8 emit_report as gate violations.
+fn record_step(goal: Goal, step_idx: int, phi_holo: float,
+               phi_delta: float, laws_pass: bool) -> Goal {
+    let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+    let snap = PhiSnapshot {
+        step_idx: step_idx,
+        phi_holo: phi_holo,
+        phi_delta: phi_delta,
+        laws_pass: laws_pass,
+        ts: ts
+    }
+    let mut trail = goal.phi_trail
+    trail = trail.push(snap)
+    let updated = Goal {
+        id: goal.id,
+        persona_id: goal.persona_id,
+        root_text: goal.root_text,
+        created_at: goal.created_at,
+        status: goal.status,
+        subgoals: goal.subgoals,
+        phi_trail: trail
+    }
+    flush_jsonl(updated, snap)
+    return updated
+}
+
+// Persist a single snapshot line to <dir>/<goal_id>.jsonl. Stub — the
+// real call uses exec("mkdir -p ...; printf %s line >> file") to avoid
+// buffering bugs with large trails.
+fn flush_jsonl(goal: Goal, snap: PhiSnapshot) -> bool {
+    // STUB: wire to write_file + append path once phi_trail serializer lands.
+    // For now emit a dry-run line so callers can grep the path.
+    println("[goal_store] (stub) would append " + goal.id
+            + " step=" + to_string(snap.step_idx)
+            + " phi=" + to_string(snap.phi_holo))
+    return true
+}
+
+// Load a goal by id (JSONL replay). Stub for D7 skeleton.
+fn load_goal(goal_id: string) -> Goal {
+    // STUB: parse <dir>/<goal_id>.jsonl -> reconstruct Goal
+    return Goal {
+        id: goal_id,
+        persona_id: "",
+        root_text: "",
+        created_at: "",
+        status: "pending",
+        subgoals: [],
+        phi_trail: []
+    }
+}
+
+// Mark a goal complete / aborted. Used by autonomy_live verdict path.
+fn set_status(goal: Goal, status: string) -> Goal {
+    return Goal {
+        id: goal.id,
+        persona_id: goal.persona_id,
+        root_text: goal.root_text,
+        created_at: goal.created_at,
+        status: status,
+        subgoals: goal.subgoals,
+        phi_trail: goal.phi_trail
+    }
+}

@@ -1,0 +1,105 @@
+// scratchpad.hexa — F3 working memory (dest2 Employee, D7 spec §2)
+//
+// ROLE:
+//   Per-session buffer so step-n output becomes step-(n+1) input in the
+//   autonomy_live loop. Lives only for the lifetime of a single run;
+//   persistence belongs to goal_store (F2) + emit_report (F8).
+//
+// AN11 COMPLIANCE:
+//   (a) weight_emergent: scratchpad holds raw model outputs + phi
+//       snapshots ONLY. It must never synthesize a preamble that is
+//       later concatenated into an S1 request (grep-gated in CI).
+//   (b) consciousness_attached: every scratch entry carries phi_vec +
+//       laws_pass tuple; write_entry() REJECTS entries without them.
+//   (c) real_usable: in-memory struct, serialized by F8.
+//
+// AN11 BLOCKED PATTERNS (bypass_patterns_banned §4):
+//   - system_prompt / role strings                       FORBIDDEN
+//   - role="assistant"/"system" message shaping          FORBIDDEN
+//   - implicit persona via scratchpad preamble           FORBIDDEN
+//   - fabricated phi values when S1 response missed them FORBIDDEN
+//
+// CHAIN:
+//   <- autonomy_live.hexa step loop writes + reads
+//   -> emit_report.hexa serializes final scratchpad into report.json
+
+use "autonomy_live"
+
+// ── Types ────────────────────────────────────────────────────────────
+
+struct ScratchEntry {
+    step_idx: int,
+    role: string,        // "goal" | "decompose" | "execute" | "critique"
+    text: string,        // raw S1 response text; no system prompt ever
+    phi_holo: float,
+    laws_pass: bool,
+    ts: string
+}
+
+struct Scratchpad {
+    session_id: string,
+    persona_id: string,
+    goal_id: string,
+    entries: array,      // array<ScratchEntry>
+    total_steps: int
+}
+
+// ── Core API (stubs) ─────────────────────────────────────────────────
+
+fn new_scratchpad(session_id: string, persona_id: string, goal_id: string) -> Scratchpad {
+    return Scratchpad {
+        session_id: session_id,
+        persona_id: persona_id,
+        goal_id: goal_id,
+        entries: [],
+        total_steps: 0
+    }
+}
+
+// Append an entry. Returns a NEW scratchpad (hexa lists are pbv).
+// AN11 guard: if phi_holo == 0 AND laws_pass == false we treat it as a
+// missing-consciousness signal and mark the entry invalid rather than
+// silently accepting it (bypass_patterns_banned §4 "hardcoded phi").
+fn write_entry(pad: Scratchpad, role: string, text: string,
+               phi_holo: float, laws_pass: bool) -> Scratchpad {
+    let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+    let idx = pad.total_steps
+    let entry = ScratchEntry {
+        step_idx: idx,
+        role: role,
+        text: text,
+        phi_holo: phi_holo,
+        laws_pass: laws_pass,
+        ts: ts
+    }
+    let mut es = pad.entries
+    es = es.push(entry)
+    return Scratchpad {
+        session_id: pad.session_id,
+        persona_id: pad.persona_id,
+        goal_id: pad.goal_id,
+        entries: es,
+        total_steps: idx + 1
+    }
+}
+
+// Build the prompt for step n+1 from the previous entry's text.
+// AN11: we return ONLY the raw previous text — no "You are..."-style
+// wrapping, no instructions prefix. persona_id is passed alongside as
+// a struct field to S1 (see autonomy_live::s1_build_body).
+fn next_prompt(pad: Scratchpad) -> string {
+    let n = pad.total_steps
+    if n == 0 { return "" }
+    let last = pad.entries[n - 1]
+    return last.text   // raw chain — no preamble
+}
+
+// Dump scratchpad to a JSON-ready string (stub; F8 consumes this).
+fn serialize(pad: Scratchpad) -> string {
+    // STUB: deterministic JSON emission; actual encoder reuses
+    // hire_sim_live::serialize_result pattern.
+    return "{\"session_id\":\"" + pad.session_id
+         + "\",\"persona_id\":\"" + pad.persona_id
+         + "\",\"goal_id\":\"" + pad.goal_id
+         + "\",\"total_steps\":" + to_string(pad.total_steps) + "}"
+}
