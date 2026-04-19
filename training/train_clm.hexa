@@ -2895,11 +2895,32 @@ fn decoder_backward(
         //    dL/dV = mid^T @ dL_dlogits      [rank × vocab]
         //    dL/dmid = dL_dlogits @ V^T      [seq × rank]
         dL_dV = _matmul_At(fwd.mid, dL_dlogits, seq, rank, v)
-        // For dL/dmid we need dL_dlogits @ V^T. V is [rank × vocab].
-        // V^T is [vocab × rank]. dL_dlogits[seq × vocab] @ V^T[vocab × rank] = [seq × rank]
-        // This is _matmul(dL_dlogits, V^T, seq, v, rank) but we can compute
-        // it as: for each (i,j), sum_k dL_dlogits[i,k] * V[j,k]
-        // which is dL_dlogits @ V^T  where V stored [rank×vocab] → V^T[vocab×rank]
+        // For dL/dmid we need dL_dlogits @ V^T where V is stored row-major
+        // [rank × vocab]. Mathematically:
+        //   dL_dmid[i,j] = Σ_k dL_dlogits[i,k] * V[j,k]
+        // Letting A=V (stored [rank × vocab], lda=v), B=dL_dlogits (stored
+        // [seq × vocab], ldb=v), with K=v, M=rank, N=seq:
+        //   _matmul_At(A=V, B=dL_dlogits, K=v, M=rank, N=seq)
+        //   → C[m,n] = Σ_k A[k*M+m]*B[k*N+n] = Σ_k V[k*rank+m] * dL_dlogits[k*seq+n]
+        // That's the wrong layout. Instead compute (dL_dmid)^T = V @ dL_dlogits^T,
+        // then transpose. Cleanest equivalent: _matmul(dL_dlogits, V_T_buf, ...)
+        // requires materializing V_T which doubles memory. Use the already-wired
+        // _matmul_At with swapped semantics:
+        //   dL_dmid^T = V @ dL_dlogits^T  → V is [rank × v], dL_dlogits^T is [v × seq]
+        //   We don't have a transB BLAS helper, so do a 2-step:
+        //     (1) tmp = dL_dlogits^T @ V^T → [seq × rank]  (no, still need transpose)
+        // Simplest: use _matmul_At with A=V (stored as [v × rank] semantically
+        // by re-interpreting the [rank × v] storage as [rank, v] and treating
+        // index swap). Actually the math is:
+        //   dL_dmid[i,j] = Σ_k dL_dlogits[i,k] * V[j*v+k]
+        // = (dL_dlogits @ V^T)[i,j], with V^T stored as [v × rank] needs
+        // explicit transpose. Cheaper path: since this naive branch is only
+        // hit when HXLMHEAD_FFI=0 and the FFI path is now strongly recommended
+        // (and used in default smoke), keep this naive triple-loop but mark
+        // it as a documented fallback. The hot wallclock path is FFI ON.
+        //
+        // r5-a10.5-C: leave naive triple-loop intact (small N when v=32K is
+        // *the* expensive dim — FFI is the production path). Document.
         let mut dL_dmid = _tz(seq * rank)
         let mut i = 0
         while i < seq {
@@ -2929,6 +2950,8 @@ fn decoder_backward(
         //    to update Wq/Wk/Wv/Wo/Wgate/Wup/Wdown per block.
         //
         //    dL/dx_final = dL_dmid @ U^T   [seq × d]
+        //    Same analysis as above for dL_dmid: requires U^T transpose.
+        //    Naive fallback path; FFI route preferred.
         dL_dx = _tz(seq * d)
         i = 0
         while i < seq {
@@ -2984,70 +3007,46 @@ fn decoder_backward(
         // Gradient flows through residual: dL/dx passes through to both
         // the attention sublayer and the FFN sublayer.
 
-        // --- FFN backward (simplified) ---
-        // FFN output = Wdown @ activated, so dL/dWdown ≈ activated^T @ dL_dx
-        // We approximate activated as the difference (h_out - h_after_attn),
-        // and h_after_attn ≈ (h_in + attn_contribution).
-        // For the SGD update, we use the chain: dL/dWdown = f(dL_dx, h_in)
-        // Compute dL_dWdown as outer product averaged over seq positions
-        let mut dWdown_acc = _tz(model.d_ff * d)
-        let mut dWo_acc = _tz(d * d)
-        let mut si = 0
-        while si < seq {
-            let dx_row = _tslice(dL_dx, si * d, (si + 1) * d)
-            let hin_row = _tslice(h_in, si * d, (si + 1) * d)
-            // dWdown accumulates: for each (ff_j, d_k), += hin_normed[ff_j] * dx[d_k]
-            // Simplified: use hin as proxy (through norm approximation)
-            // dWo accumulates similarly
-            let mut p = 0
-            while p < d {
-                let mut q = 0
-                while q < d {
-                    dWo_acc[p * d + q] = dWo_acc[p * d + q] + hin_row[p] * dx_row[q]
-                    q = q + 1
-                }
-                p = p + 1
-            }
-            // r5-a10.5-A: free per-row slice temps (was leaking 12 layers × seq × 2 slices/step)
-            free_array(dx_row)
-            free_array(hin_row)
-            si = si + 1
-        }
+        // --- FFN/Wo/Wq backward (simplified, BLAS-routed) ---
+        //
+        // r5-a10.5-C (2026-04-20): the original block-loop accumulated
+        // dWo_acc[p,q] = Σ_si h_in[si*d+p] * dL_dx[si*d+q] over seq positions
+        // via a triple while-loop (seq × d × d ≈ 302M HexaVal ops at d=768
+        // seq=512). This is mathematically identical to h_in^T @ dL_dx,
+        // already wired through hxblas_sgemm via _matmul_At. Both dWo_acc
+        // and dWq_acc previously computed THE SAME [d × d] matrix from the
+        // same inputs (h_in, dL_dx) — the only difference was the post-
+        // accumulation lr scale (Wo: lr/seq, Wq: 0.01*lr/seq). We collapse
+        // to one BLAS call and reuse the matrix for both SGD steps.
+        //
+        // Wallclock impact: ~3.6B scalar ops/step (12 layers × 2 sites × seq×d×d)
+        // → 12 _matmul_At calls/step (one per layer) on cblas_sgemm = ~50ms.
+        // Expected step 1 wallclock: 16+ min → <60s on hetzner 32-core CPU.
+        // Memory: also drops 24 _tslice + free pairs/layer (12 layers × 2
+        // sites × seq iters × 2 slices) = ~24K free_array calls/step → 12.
+        //
+        // dWdown_acc kept as zero placeholder (unused; SGD on Wdown is
+        // currently no-op via depth_scale dead-code; preserving for future
+        // FFN backward expansion).
+        let dWdown_acc = _tz(model.d_ff * d)
+        // Single BLAS-routed accumulation: shared dWo/dWq matrix.
+        let dW_shared = _matmul_At(h_in, dL_dx, seq, d, d)
 
         // SGD update Wo and Wdown for this block
         // r5-a10.5-A: hoist _tscale temp + free
-        let _scaled_dWo = _tscale(dWo_acc, lr / to_float(seq))
+        let _scaled_dWo = _tscale(dW_shared, lr / to_float(seq))
         let new_Wo = _tsub(blk.Wo, _scaled_dWo)
         free_array(_scaled_dWo)
         // Wdown update: gradient signal is smaller, scale by layer depth
         let depth_scale = lr / to_float(seq) * 0.1
         // Propagate gradient through the Wq/Wk/Wv via a fraction of Wo's update
         let qkv_lr = lr * 0.01 / to_float(seq)
-        let mut dWq_acc = _tz(d * d)
-        let mut si2 = 0
-        while si2 < seq {
-            let dx_row = _tslice(dL_dx, si2 * d, (si2 + 1) * d)
-            let hin_row = _tslice(h_in, si2 * d, (si2 + 1) * d)
-            let mut p = 0
-            while p < d {
-                let mut q = 0
-                while q < d {
-                    dWq_acc[p * d + q] = dWq_acc[p * d + q] + hin_row[p] * dx_row[q]
-                    q = q + 1
-                }
-                p = p + 1
-            }
-            free_array(dx_row)
-            free_array(hin_row)
-            si2 = si2 + 1
-        }
-        let _scaled_dWq = _tscale(dWq_acc, qkv_lr)
+        let _scaled_dWq = _tscale(dW_shared, qkv_lr)
         let new_Wq = _tsub(blk.Wq, _scaled_dWq)
         free_array(_scaled_dWq)
-        // r5-a10.5-A: dWo_acc + dWdown_acc + dWq_acc consumed by SGD; free.
-        free_array(dWo_acc)
+        // r5-a10.5-C: dW_shared and dWdown_acc consumed; free.
+        free_array(dW_shared)
         free_array(dWdown_acc)
-        free_array(dWq_acc)
 
         // Reconstruct block with updated weights
         let updated_blk = DecoderBlockW {
