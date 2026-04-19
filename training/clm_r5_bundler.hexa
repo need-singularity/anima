@@ -1,0 +1,587 @@
+// training/clm_r5_bundler.hexa
+//
+// CLM r5-a4 — artifact bundler for dest1_clm pod launch.
+//
+// Purpose:
+//   Pack the deterministic launch payload for CLM r5-a5 pod-fire into a
+//   single tarball (+ optional R2 upload), or stage a direct-scp plan if
+//   --mode=direct is requested. Consumes artifacts produced by r5-a1
+//   (Linux ELF + .so libs) and references the corpus by R2 URI so
+//   provisioning runs on the pod via rclone rather than pushing 5.38 GB
+//   from Mac over cellular.
+//
+// Bundle contents (§1 of task):
+//   - Linux ELF binary            (r5-a1, hetzner build)
+//   - libhxblas.so / libhxlmhead.so  (hetzner build)
+//   - tokenizer                   (byte-level, vocab 256 — vocab is implicit
+//                                  in the ELF; a marker file is emitted so
+//                                  pod-side integrity checks are explicit)
+//   - config (training/config/clm_170m.json)
+//   - corpus rclone helper (R2 → pod fetch script)
+//
+// Compliance: R37 / AN13 / L3-PY — zero .py / .rs / .sh. All pod-side
+//   assistance is emitted as .hexa or plain shell **inside the tarball**
+//   (not as .sh files in this repo).
+//
+// Scope: SCAFFOLD + --selftest + --dry-run. LIVE_FIRE_OK=1 gates scp/upload.
+//
+// Usage:
+//   hexa training/clm_r5_bundler.hexa --selftest
+//   hexa training/clm_r5_bundler.hexa --dry-run
+//   LIVE_FIRE_OK=1 hexa training/clm_r5_bundler.hexa --mode tar
+//   LIVE_FIRE_OK=1 hexa training/clm_r5_bundler.hexa --mode tar --upload-r2
+//   LIVE_FIRE_OK=1 hexa training/clm_r5_bundler.hexa --mode direct --pod-ip <ip> --pod-port <n>
+//
+// ── Constants ──────────────────────────────────────────────────────────
+
+let ANIMA_ROOT     = "/Users/ghost/Dev/anima"
+let HEXA_LANG_DEF  = "/Users/ghost/Dev/hexa-lang"
+
+// Binary (produced by r5-a1, fetched from hetzner). If not present on Mac,
+// --dry-run + --selftest flag it; live mode pulls from hetzner scp.
+let LINUX_BIN_LOCAL = "/tmp/clm_v2_linux.bin"
+let LINUX_BIN_HETZ  = "hetzner:/tmp/clm_v2_linux.bin"
+
+// FFI .so libs (also from hetzner)
+let LIB_HXBLAS_LOCAL   = "/tmp/libhxblas.so"
+let LIB_HXLMHEAD_LOCAL = "/tmp/libhxlmhead.so"
+let LIB_HXBLAS_HETZ    = "hetzner:/home/hexa-lang/self/native/build/libhxblas.so"
+let LIB_HXLMHEAD_HETZ  = "hetzner:/home/hexa-lang/self/native/build/libhxlmhead.so"
+
+// Config + tokenizer marker
+let CONFIG_SRC      = ANIMA_ROOT + "/training/config/clm_170m.json"
+let TOKENIZER_NOTE  = "byte-level, vocab=256, no external tokenizer file"
+
+// Corpus (pod pulls via rclone, not packed into tarball)
+let CORPUS_R2_URI     = "r2:anima-corpus/clm_r4/corpus_clm_r4.txt"
+let CORPUS_R2_URI_GZ  = "r2:anima-corpus/clm_r4/corpus_clm_r4.txt.gz"
+let CORPUS_POD_PATH   = "/workspace/corpus_v5.txt"
+let CORPUS_SIZE_BYTES = 5380874900  // 5.011 GiB (corpus_v5_audit_20260419.md)
+
+// Bundle output
+let BUNDLE_STAGE  = "/tmp/clm_r5_bundle"
+let BUNDLE_TAR    = "/tmp/clm_r5_bundle.tar.gz"
+let BUNDLE_R2_URI = "r2:anima-models/clm170m/r5/bundle/clm_r5_bundle.tar.gz"
+
+// ── argv parse ────────────────────────────────────────────────────────
+
+let argv = args()
+
+fn flag_value(name: string, fallback: string) -> string {
+    let n = argv.len()
+    let mut i = 0
+    while i < n {
+        if argv[i] == name && i + 1 < n {
+            return argv[i + 1]
+        }
+        i = i + 1
+    }
+    return fallback
+}
+
+fn flag_bool(name: string) -> bool {
+    let n = argv.len()
+    let mut i = 0
+    while i < n {
+        if argv[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+let MODE        = flag_value("--mode", "tar")          // tar | direct
+let POD_IP      = flag_value("--pod-ip", "")
+let POD_PORT    = flag_value("--pod-port", "")
+let BIN_ARG     = flag_value("--bin", LINUX_BIN_LOCAL)
+let BLAS_ARG    = flag_value("--blas", LIB_HXBLAS_LOCAL)
+let LMHEAD_ARG  = flag_value("--lmhead", LIB_HXLMHEAD_LOCAL)
+let CONFIG_ARG  = flag_value("--config", CONFIG_SRC)
+let CORPUS_URI  = flag_value("--corpus-r2", CORPUS_R2_URI)
+let STAGE_ARG   = flag_value("--stage", BUNDLE_STAGE)
+let TAR_ARG     = flag_value("--tar", BUNDLE_TAR)
+let UPLOAD_R2   = flag_bool("--upload-r2")
+let PULL_HETZ   = flag_bool("--pull-hetzner")
+let DRY_RUN     = flag_bool("--dry-run")
+let SELFTEST    = flag_bool("--selftest")
+
+// ── Utility ───────────────────────────────────────────────────────────
+
+fn env_or(key: string, fallback: string) -> string {
+    let v = env(key)
+    if v == "" { return fallback }
+    return v
+}
+
+fn now_iso() -> string { return exec("date -u +%Y%m%dT%H%M%SZ").trim() }
+
+fn log_line(log_path: string, msg: string) {
+    let line = "[" + now_iso() + "] " + msg
+    println(line)
+    append_file(log_path, line + "\n")
+}
+
+fn abort(code: int, msg: string) {
+    println("")
+    println("FAIL: " + msg)
+    println("  exit code = " + str(code))
+    println("")
+    exit(code)
+}
+
+fn run_step(n: int, label: string, cmd: string, dry: bool, log_path: string) -> int {
+    log_line(log_path, "step " + str(n) + " START — " + label)
+    println("    $ " + cmd)
+    append_file(log_path, "    $ " + cmd + "\n")
+    if dry {
+        log_line(log_path, "step " + str(n) + " SKIP (dry-run)")
+        return 0
+    }
+    let result = exec_with_status(cmd)
+    let rc = result[1]
+    log_line(log_path, "step " + str(n) + " END — rc=" + str(rc))
+    return rc
+}
+
+// ── Selftest ──────────────────────────────────────────────────────────
+
+fn selftest() -> bool {
+    println("")
+    println("=================================================================")
+    println("  CLM r5 bundler — SELFTEST (no network I/O)")
+    println("=================================================================")
+    println("")
+
+    let mut ok = true
+
+    println("[1/5] Environment:")
+    let hexa_lang = env_or("HEXA_LANG", HEXA_LANG_DEF)
+    println("  HEXA_LANG = " + hexa_lang)
+    if !dir_exists(ANIMA_ROOT) {
+        println("  [MISS] ANIMA_ROOT=" + ANIMA_ROOT)
+        ok = false
+    } else {
+        println("  [OK]   ANIMA_ROOT=" + ANIMA_ROOT)
+    }
+
+    println("")
+    println("[2/5] Input artifacts (produced by r5-a1, pulled from hetzner):")
+    if file_exists(BIN_ARG) {
+        println("  [OK]   linux bin        : " + BIN_ARG)
+    } else {
+        println("  [HETZ] linux bin absent : " + BIN_ARG
+            + "  (--pull-hetzner will scp from " + LINUX_BIN_HETZ + ")")
+    }
+    if file_exists(BLAS_ARG) {
+        println("  [OK]   libhxblas.so     : " + BLAS_ARG)
+    } else {
+        println("  [HETZ] libhxblas.so absent : " + BLAS_ARG
+            + "  (--pull-hetzner will scp from " + LIB_HXBLAS_HETZ + ")")
+    }
+    if file_exists(LMHEAD_ARG) {
+        println("  [OK]   libhxlmhead.so   : " + LMHEAD_ARG)
+    } else {
+        println("  [HETZ] libhxlmhead.so absent : " + LMHEAD_ARG
+            + "  (--pull-hetzner will scp from " + LIB_HXLMHEAD_HETZ + ")")
+    }
+
+    println("")
+    println("[3/5] Config + tokenizer:")
+    if file_exists(CONFIG_ARG) {
+        println("  [OK]   " + CONFIG_ARG)
+    } else {
+        println("  [MISS] " + CONFIG_ARG)
+        ok = false
+    }
+    println("  [OK]   tokenizer note: " + TOKENIZER_NOTE)
+
+    println("")
+    println("[4/5] Corpus (R2 — NOT packed into tarball):")
+    println("  r2 uri     = " + CORPUS_URI)
+    println("  r2 gz uri  = " + CORPUS_R2_URI_GZ)
+    println("  pod path   = " + CORPUS_POD_PATH)
+    println("  size       = " + str(CORPUS_SIZE_BYTES) + " bytes (5.011 GiB)")
+
+    println("")
+    println("[5/5] CLI flags parsed:")
+    println("  --mode       = " + MODE)
+    println("  --pod-ip     = " + (if POD_IP == "" { "<unset>" } else { POD_IP }))
+    println("  --pod-port   = " + (if POD_PORT == "" { "<unset>" } else { POD_PORT }))
+    println("  --stage      = " + STAGE_ARG)
+    println("  --tar        = " + TAR_ARG)
+    println("  --upload-r2  = " + (if UPLOAD_R2 { "true" } else { "false" }))
+    println("  --pull-hetz  = " + (if PULL_HETZ { "true" } else { "false" }))
+    println("  --dry-run    = " + (if DRY_RUN { "true" } else { "false" }))
+
+    println("")
+    if ok {
+        println("RESULT: PASS — ready for --dry-run then live fire.")
+    } else {
+        println("RESULT: FAIL — resolve MISS items above before proceeding.")
+    }
+    println("")
+    return ok
+}
+
+// ── Pull from hetzner (r5-a1 outputs) ─────────────────────────────────
+
+fn pull_from_hetzner(dry: bool, log_path: string) -> bool {
+    let rcb = run_step(0, "scp hetzner linux bin",
+        "scp -o StrictHostKeyChecking=no " + LINUX_BIN_HETZ + " " + BIN_ARG,
+        dry, log_path)
+    if !dry && rcb != 0 { return false }
+    let rcl1 = run_step(0, "scp hetzner libhxblas.so",
+        "scp -o StrictHostKeyChecking=no " + LIB_HXBLAS_HETZ + " " + BLAS_ARG,
+        dry, log_path)
+    if !dry && rcl1 != 0 { return false }
+    let rcl2 = run_step(0, "scp hetzner libhxlmhead.so",
+        "scp -o StrictHostKeyChecking=no " + LIB_HXLMHEAD_HETZ + " " + LMHEAD_ARG,
+        dry, log_path)
+    if !dry && rcl2 != 0 { return false }
+    return true
+}
+
+// ── Stage bundle (populate /tmp/clm_r5_bundle/) ──────────────────────
+
+fn stage_bundle(dry: bool, log_path: string) -> int {
+    let _rc0 = run_step(1, "reset + mkdir stage dirs",
+        "rm -rf " + STAGE_ARG + " && mkdir -p "
+        + STAGE_ARG + "/bin "
+        + STAGE_ARG + "/lib "
+        + STAGE_ARG + "/config "
+        + STAGE_ARG + "/tokenizer "
+        + STAGE_ARG + "/helpers",
+        dry, log_path)
+
+    let rc1 = run_step(1, "copy linux bin",
+        "cp " + BIN_ARG + " " + STAGE_ARG + "/bin/clm_v2_linux.bin "
+        + "&& chmod +x " + STAGE_ARG + "/bin/clm_v2_linux.bin",
+        dry, log_path)
+    if !dry && rc1 != 0 { return 10 }
+
+    let rc2 = run_step(1, "copy libhxblas.so + libhxlmhead.so",
+        "cp " + BLAS_ARG + " " + STAGE_ARG + "/lib/libhxblas.so && "
+        + "cp " + LMHEAD_ARG + " " + STAGE_ARG + "/lib/libhxlmhead.so",
+        dry, log_path)
+    if !dry && rc2 != 0 { return 11 }
+
+    let rc3 = run_step(1, "copy clm_170m.json config",
+        "cp " + CONFIG_ARG + " " + STAGE_ARG + "/config/clm_170m.json",
+        dry, log_path)
+    if !dry && rc3 != 0 { return 12 }
+
+    // Tokenizer is byte-level (implicit). Emit a marker so pod-side
+    // integrity checks are explicit rather than implicit.
+    let tok_note_path = STAGE_ARG + "/tokenizer/README.txt"
+    let tok_note = "CLM r5 tokenizer — byte-level\n"
+        + "vocab_size = 256 (raw bytes)\n"
+        + "no tokenizer.json / vocab.json / merges.txt — byte identity mapping\n"
+        + "bound to ELF at train_clm.hexa build time (r5-a1, hetzner).\n"
+    if !dry {
+        write_file(tok_note_path, tok_note)
+    } else {
+        log_line(log_path, "    (dry) would write " + tok_note_path)
+    }
+
+    // Helper — rclone pod-side corpus fetch. This lives inside the tarball
+    // as a plain-text .txt cheat-sheet (not .sh — L3-PY compliance: no
+    // shell scripts committed to repo; text inside tarball = opaque asset).
+    let rclone_helper_path = STAGE_ARG + "/helpers/fetch_corpus.txt"
+    let rclone_helper = "# CLM r5 corpus fetch (pod-side, paste into remote bash)\n"
+        + "# R2 → pod local disk\n"
+        + "# Preferred (smaller network transfer):\n"
+        + "rclone copy " + CORPUS_R2_URI_GZ
+        + "   /workspace/   --s3-no-check-bucket --transfers=4\n"
+        + "gunzip -f /workspace/corpus_clm_r4.txt.gz\n"
+        + "mv /workspace/corpus_clm_r4.txt " + CORPUS_POD_PATH + "\n"
+        + "\n"
+        + "# Fallback (direct raw — skip gunzip):\n"
+        + "# rclone copy " + CORPUS_R2_URI + "   /workspace/   --s3-no-check-bucket\n"
+        + "# mv /workspace/corpus_clm_r4.txt " + CORPUS_POD_PATH + "\n"
+        + "\n"
+        + "# Verify:\n"
+        + "wc -c " + CORPUS_POD_PATH + "   # expect " + str(CORPUS_SIZE_BYTES) + "\n"
+    if !dry {
+        write_file(rclone_helper_path, rclone_helper)
+    } else {
+        log_line(log_path, "    (dry) would write " + rclone_helper_path)
+    }
+
+    // Manifest
+    let manifest_path = STAGE_ARG + "/MANIFEST.json"
+    let manifest = "{\n"
+        + "  \"round\": \"clm170m-r5\",\n"
+        + "  \"bundle_version\": \"1.0\",\n"
+        + "  \"generated\": \"" + now_iso() + "\",\n"
+        + "  \"artifacts\": {\n"
+        + "    \"bin\":        \"bin/clm_v2_linux.bin\",\n"
+        + "    \"libhxblas\":  \"lib/libhxblas.so\",\n"
+        + "    \"libhxlmhead\":\"lib/libhxlmhead.so\",\n"
+        + "    \"config\":     \"config/clm_170m.json\",\n"
+        + "    \"tokenizer\":  \"tokenizer/README.txt (byte-level, vocab=256)\",\n"
+        + "    \"helper\":     \"helpers/fetch_corpus.txt\"\n"
+        + "  },\n"
+        + "  \"corpus\": {\n"
+        + "    \"r2_uri\":    \"" + CORPUS_R2_URI + "\",\n"
+        + "    \"r2_uri_gz\": \"" + CORPUS_R2_URI_GZ + "\",\n"
+        + "    \"pod_path\":  \"" + CORPUS_POD_PATH + "\",\n"
+        + "    \"size_bytes\":" + str(CORPUS_SIZE_BYTES) + "\n"
+        + "  },\n"
+        + "  \"refs\": {\n"
+        + "    \"design\":   \"training/clm_r5_design.md\",\n"
+        + "    \"plan\":     \"training/deploy/clm_r5_plan.json\",\n"
+        + "    \"r2_layout\":\"docs/dest1_clm_r2_layout_20260419.md\"\n"
+        + "  }\n"
+        + "}\n"
+    if !dry {
+        write_file(manifest_path, manifest)
+    } else {
+        log_line(log_path, "    (dry) would write " + manifest_path)
+    }
+
+    return 0
+}
+
+// ── tar + gzip stage dir → single tarball ────────────────────────────
+
+fn pack_tarball(dry: bool, log_path: string) -> int {
+    let cmd = "tar -czf " + TAR_ARG + " -C "
+        + exec("dirname " + STAGE_ARG).trim() + " "
+        + exec("basename " + STAGE_ARG).trim()
+    let rc = run_step(2, "tar czf bundle", cmd, dry, log_path)
+    if !dry && rc != 0 { return 20 }
+    if !dry && !file_exists(TAR_ARG) {
+        abort(21, "tarball missing: " + TAR_ARG)
+    }
+    if !dry {
+        let sz = exec("wc -c <" + TAR_ARG + " | tr -d ' '").trim()
+        log_line(log_path, "tarball size = " + sz + " bytes : " + TAR_ARG)
+    }
+    return 0
+}
+
+// ── Optional R2 upload ───────────────────────────────────────────────
+
+fn upload_r2(dry: bool, log_path: string) -> int {
+    let cmd = "rclone copyto " + TAR_ARG + " " + BUNDLE_R2_URI
+        + " -v --s3-no-check-bucket"
+    return run_step(3, "rclone upload bundle → R2", cmd, dry, log_path)
+}
+
+// ── Direct-scp mode (skip tarball, push stage dir files to pod) ──────
+
+fn direct_scp(dry: bool, log_path: string) -> int {
+    if POD_IP == "" {
+        abort(30, "--mode direct requires --pod-ip and --pod-port")
+    }
+    let port = (if POD_PORT == "" { "22" } else { POD_PORT })
+    let ssh_opt = " -o LogLevel=ERROR -o StrictHostKeyChecking=no "
+        + "-o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+    let scp = "scp" + ssh_opt + " -P " + port
+    let ssh = "ssh" + ssh_opt + " -p " + port + " root@" + POD_IP
+    let dest = "root@" + POD_IP
+
+    let rc0 = run_step(4, "mkdir -p /workspace/clm_r5/{bin,lib,config,tokenizer,helpers} on pod",
+        ssh + " 'mkdir -p /workspace/clm_r5/bin /workspace/clm_r5/lib "
+        + "/workspace/clm_r5/config /workspace/clm_r5/tokenizer "
+        + "/workspace/clm_r5/helpers'",
+        dry, log_path)
+    if !dry && rc0 != 0 { return 40 }
+
+    let rc1 = run_step(4, "scp bin → pod",
+        scp + " " + STAGE_ARG + "/bin/clm_v2_linux.bin "
+        + dest + ":/workspace/clm_r5/bin/",
+        dry, log_path)
+    if !dry && rc1 != 0 { return 41 }
+
+    let rc2 = run_step(4, "scp lib/*.so → pod",
+        scp + " " + STAGE_ARG + "/lib/libhxblas.so "
+        + STAGE_ARG + "/lib/libhxlmhead.so "
+        + dest + ":/workspace/clm_r5/lib/",
+        dry, log_path)
+    if !dry && rc2 != 0 { return 42 }
+
+    let rc3 = run_step(4, "scp config/clm_170m.json → pod",
+        scp + " " + STAGE_ARG + "/config/clm_170m.json "
+        + dest + ":/workspace/clm_r5/config/",
+        dry, log_path)
+    if !dry && rc3 != 0 { return 43 }
+
+    let rc4 = run_step(4, "scp helpers + tokenizer marker + MANIFEST → pod",
+        scp + " " + STAGE_ARG + "/helpers/fetch_corpus.txt "
+        + STAGE_ARG + "/tokenizer/README.txt "
+        + STAGE_ARG + "/MANIFEST.json "
+        + dest + ":/workspace/clm_r5/",
+        dry, log_path)
+    if !dry && rc4 != 0 { return 44 }
+
+    let rc5 = run_step(4, "ln -sf so libs → /usr/local/lib + ldconfig",
+        ssh + " 'cp /workspace/clm_r5/lib/libhxblas.so /usr/local/lib/ "
+        + "&& cp /workspace/clm_r5/lib/libhxlmhead.so /usr/local/lib/ "
+        + "&& ldconfig'",
+        dry, log_path)
+    if !dry && rc5 != 0 { return 45 }
+
+    return 0
+}
+
+// ── Live fire orchestrator ───────────────────────────────────────────
+
+fn live_fire(log_path: string) {
+    let live_ok = env("LIVE_FIRE_OK")
+    let dry = DRY_RUN
+    if !dry && live_ok != "1" {
+        println("")
+        println("REFUSED: live fire requires LIVE_FIRE_OK=1 in env.")
+        println("  To execute:")
+        println("    LIVE_FIRE_OK=1 hexa training/clm_r5_bundler.hexa --mode tar")
+        println("")
+        panic("live fire guard: LIVE_FIRE_OK != 1")
+    }
+
+    if dry {
+        log_line(log_path, "DRY-RUN — no I/O")
+    } else {
+        log_line(log_path, "LIVE FIRE armed (LIVE_FIRE_OK=1) — proceeding")
+    }
+
+    // r5-a1 artifact acquisition (hetzner pull if requested / missing).
+    let need_pull = PULL_HETZ
+        || !file_exists(BIN_ARG)
+        || !file_exists(BLAS_ARG)
+        || !file_exists(LMHEAD_ARG)
+    if need_pull {
+        log_line(log_path, "pulling r5-a1 artifacts from hetzner")
+        let ok = pull_from_hetzner(dry, log_path)
+        if !dry && !ok { abort(50, "FAIL_HETZNER_PULL") }
+    }
+
+    // Stage
+    let rc_stage = stage_bundle(dry, log_path)
+    if !dry && rc_stage != 0 { abort(rc_stage, "FAIL_STAGE rc=" + str(rc_stage)) }
+
+    if MODE == "tar" {
+        let rc_tar = pack_tarball(dry, log_path)
+        if !dry && rc_tar != 0 { abort(rc_tar, "FAIL_TAR rc=" + str(rc_tar)) }
+        if UPLOAD_R2 {
+            let rc_up = upload_r2(dry, log_path)
+            if !dry && rc_up != 0 { abort(rc_up, "FAIL_R2_UPLOAD rc=" + str(rc_up)) }
+            log_line(log_path, "bundle available at " + BUNDLE_R2_URI)
+        } else {
+            log_line(log_path, "bundle local only: " + TAR_ARG)
+        }
+    } else if MODE == "direct" {
+        let rc_d = direct_scp(dry, log_path)
+        if !dry && rc_d != 0 { abort(rc_d, "FAIL_DIRECT_SCP rc=" + str(rc_d)) }
+        log_line(log_path, "pod stage complete at root@" + POD_IP + ":/workspace/clm_r5/")
+    } else {
+        abort(60, "unknown --mode: " + MODE + " (expected tar|direct)")
+    }
+
+    // Print r5-a5 launch sample
+    println("")
+    println("=================================================================")
+    println("  r5-a5 launch sample (copy-paste)")
+    println("=================================================================")
+    if MODE == "tar" {
+        println("  # pod-side extract")
+        if UPLOAD_R2 {
+            println("  ssh root@<POD_IP> -p <POD_PORT> 'rclone copy " + BUNDLE_R2_URI
+                + "   /workspace/ --s3-no-check-bucket && "
+                + "cd /workspace && tar -xzf clm_r5_bundle.tar.gz'")
+        } else {
+            println("  scp -P <POD_PORT> " + TAR_ARG
+                + "   root@<POD_IP>:/workspace/")
+            println("  ssh root@<POD_IP> -p <POD_PORT> 'cd /workspace "
+                + "&& tar -xzf clm_r5_bundle.tar.gz'")
+        }
+        println("")
+        println("  # pod-side corpus fetch (from helpers/fetch_corpus.txt)")
+        println("  ssh root@<POD_IP> -p <POD_PORT> 'rclone copy "
+            + CORPUS_R2_URI_GZ + " /workspace/ --s3-no-check-bucket && "
+            + "gunzip -f /workspace/corpus_clm_r4.txt.gz && "
+            + "mv /workspace/corpus_clm_r4.txt " + CORPUS_POD_PATH + "'")
+    } else {
+        println("  # artifacts already staged at /workspace/clm_r5/ by --mode direct")
+        println("  # pod-side corpus fetch:")
+        println("  ssh root@" + POD_IP + " -p " + (if POD_PORT == "" { "22" } else { POD_PORT })
+            + " 'rclone copy " + CORPUS_R2_URI_GZ
+            + " /workspace/ --s3-no-check-bucket && "
+            + "gunzip -f /workspace/corpus_clm_r4.txt.gz && "
+            + "mv /workspace/corpus_clm_r4.txt " + CORPUS_POD_PATH + "'")
+    }
+    println("")
+    println("  # r5-a5 training fire (once launcher a3 lands):")
+    println("  ssh root@<POD_IP> -p <POD_PORT> 'cd /workspace && "
+        + "LD_LIBRARY_PATH=/usr/local/lib:/workspace/clm_r5/lib:$LD_LIBRARY_PATH "
+        + "HEXA_NATIVE_LIB_DIR=/workspace/clm_r5/lib "
+        + "tmux new -d -s clm-r5 \"/workspace/clm_r5/bin/clm_v2_linux.bin "
+        + "--corpus " + CORPUS_POD_PATH + " "
+        + "--config /workspace/clm_r5/config/clm_170m.json "
+        + "--ckpt-dir /workspace/ckpt_clm170m_r5 "
+        + "--steps 20000 --batch 2 --seq 512 --lr 3e-4 --warmup 1000 "
+        + "--save-every 100 2>&1 | tee /workspace/clm_r5.log\"'")
+    println("")
+    log_line(log_path, "r5-a4 bundler DONE — mode=" + MODE)
+}
+
+// ── Plan print (shared by --dry-run + live) ─────────────────────────
+
+fn build_plan() {
+    println("")
+    println("=================================================================")
+    println("  CLM r5 bundler — PLAN")
+    println("=================================================================")
+    println("  mode          = " + MODE)
+    println("  stage dir     = " + STAGE_ARG)
+    println("  tar out       = " + TAR_ARG)
+    println("  upload-r2     = " + (if UPLOAD_R2 { "YES → " + BUNDLE_R2_URI } else { "NO" }))
+    println("  pull-hetzner  = " + (if PULL_HETZ { "YES" } else { "auto (if missing)" }))
+    println("  corpus r2 uri = " + CORPUS_URI)
+    println("  corpus pod    = " + CORPUS_POD_PATH)
+    println("  dry-run       = " + (if DRY_RUN { "YES (no I/O)" } else { "NO (LIVE)" }))
+    if MODE == "direct" {
+        println("  pod-ip:port   = " + POD_IP + ":" + (if POD_PORT == "" { "22" } else { POD_PORT }))
+    }
+    println("")
+    println("  bundle contents (≤ ~500KB excluding corpus):")
+    println("    bin/clm_v2_linux.bin     (r5-a1 hetzner build, ELF x86_64)")
+    println("    lib/libhxblas.so         (r5-a1 hetzner, ~25KB)")
+    println("    lib/libhxlmhead.so       (r5-a1 hetzner, ~16KB)")
+    println("    config/clm_170m.json     (170M scale — smoke/dev tier)")
+    println("    tokenizer/README.txt     (byte-level marker, vocab 256)")
+    println("    helpers/fetch_corpus.txt (rclone R2 → pod cheat-sheet)")
+    println("    MANIFEST.json            (version, refs, artifacts)")
+    println("")
+    println("  corpus_v5 (5.38GB) NOT in tarball — pod pulls from R2 at launch.")
+    println("")
+}
+
+// ── Entry ─────────────────────────────────────────────────────────────
+
+fn main() {
+    let ts = now_iso()
+    let log_path = "/Users/ghost/Dev/anima/training/clm_r5_bundler_" + ts + ".log"
+
+    if SELFTEST {
+        let ok = selftest()
+        if !ok { panic("selftest FAIL") }
+        return
+    }
+
+    write_file(log_path, "# CLM r5 bundler log " + ts + "\n")
+    log_line(log_path, "wrapper start — mode=" + MODE
+        + " upload_r2=" + (if UPLOAD_R2 { "1" } else { "0" })
+        + " dry=" + (if DRY_RUN { "1" } else { "0" }))
+
+    build_plan()
+    live_fire(log_path)
+
+    if DRY_RUN {
+        log_line(log_path, "DRY-RUN complete — no I/O performed")
+        println("")
+        println("DRY-RUN complete. Re-run with LIVE_FIRE_OK=1 to fire.")
+        println("Log: " + log_path)
+    }
+}
+
+main()
