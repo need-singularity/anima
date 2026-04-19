@@ -70,26 +70,26 @@ anima-agent/
   unified_registry.hexa     Hub + Tools + Plugins single router (58 handlers)
   dashboard_bridge.hexa     WebSocket: consciousness + portfolio combined stream
   metrics_exporter.hexa     Prometheus metrics (8 gauges, port 9090)
-  channels/
+  $ANIMA/anima-agent-channels/           # Phase 2 promoted (2026-04-20)
     base.hexa               ChannelAdapter protocol
     channel_manager.hexa    Multi-channel orchestrator
     cli_agent.hexa          CLI channel
     telegram_bot.hexa       Telegram (/status + /trade 6 commands + auto-alerts)
     discord_bot.hexa        Discord channel
     slack_bot.hexa          Slack channel (slack_bolt async)
-  providers/
+  $ANIMA/anima-agent-providers/          # Phase 2 promoted
     base.hexa               BaseProvider protocol
     claude_provider.hexa    Claude API (streaming)
     conscious_lm_provider.hexa  ConsciousLM (byte-level, checkpoint loading)
     composio_bridge.hexa    Composio 500+ tools (16 categories, Φ-gated)
-  plugins/
+  $ANIMA/anima-agent-plugins/            # Phase 2 promoted
     base.hexa               PluginBase + PluginManifest
     plugin_loader.hexa      Auto-discover + lifecycle
     trading.hexa            Trading engine (Φ-gated escalation)
     regime_bridge.hexa      Market regime → tension + VaR → pain signal
     hypothesis_bridge.hexa  Hypothesis engine → anima 스킬 자동생성
     sentiment_bridge.hexa   Fear & Greed → consciousness emotion
-  skills/
+  $ANIMA/anima-agent-skills/             # Phase 2 promoted
     skill_manager.hexa      Dynamic skill system (consciousness-triggered)
     registry.json
   dashboard/                Next.js 14 unified dashboard
@@ -119,7 +119,7 @@ anima-agent/
 ## Trading Integration (self-hosted)
 
 ```
-  anima-agent trading 엔진 (in-process, plugins/trading.hexa)
+  anima-agent trading 엔진 (in-process, anima-agent-plugins/trading.hexa)
     트레이딩 상태       포트폴리오 + 105+ 전략
     스캐너              시장 레짐 감지
     리스크 매니저       VaR → 포지션 한도

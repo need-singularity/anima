@@ -37,10 +37,11 @@ tree:
   ecosystem_bridge.hexa    생태계 브릿지 (hypothesis/regime/sentiment)
   dashboard_bridge.hexa    WS 브릿지 (의식+포트폴리오 스트림)
   metrics_exporter.hexa    Prometheus 메트릭 (8 게이지, :9090)
-  channels/              base/manager/cli/telegram/discord/slack (.hexa)
-  providers/             animalm/claude/conscious_lm/composio_bridge (.hexa)
-  plugins/               base/loader + hypothesis/regime/sentiment/trading (.hexa)
-  skills/                skill_manager (.hexa) + registry.json
+  # Phase 2 promoted (2026-04-20) — 4 subfolders moved to top-level siblings:
+  #   $ANIMA/anima-agent-channels/  base/manager/cli/telegram/discord/slack (.hexa)
+  #   $ANIMA/anima-agent-providers/ animalm/claude/conscious_lm/composio_bridge (.hexa)
+  #   $ANIMA/anima-agent-plugins/   base/loader + hypothesis/regime/sentiment/trading (.hexa)
+  #   $ANIMA/anima-agent-skills/    skill_manager (.hexa) + registry.json
   trading/               engine/executor/portfolio/risk/regime/scanner/strategies (.hexa)
   dashboard/             Next.js Web UI (Φ 게이지+포지션+이벤트)
   hexa/                  레거시 스텁 .hexa (교체 완료, 정리 예정)

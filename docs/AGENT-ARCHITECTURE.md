@@ -154,35 +154,36 @@ which tools are relevant:
 ## File Map
 
 ```
-  anima_agent.py              Core agent loop
-  channels/
-    __init__.py
-    telegram_bot.py           Telegram adapter
-    discord_bot.py            Discord adapter
-    cli_agent.py              CLI interactive mode
-  skills/
-    __init__.py
-    skill_manager.py          Dynamic skill system
-    registry.json             Skill registry (auto-generated)
+  anima-agent/anima_agent.hexa                Core agent loop
+  anima-agent-channels/                       # Phase 2 promoted (2026-04-20)
+    telegram_bot.hexa                         Telegram adapter
+    discord_bot.hexa                          Discord adapter
+    slack_bot.hexa                            Slack adapter
+    cli_agent.hexa                            CLI interactive mode
+  anima-agent-skills/                         # Phase 2 promoted
+    skill_manager.hexa                        Dynamic skill system
+    registry.json                             Skill registry (auto-generated)
 ```
 
 ## Running
 
 ```bash
-# CLI agent (full capabilities)
-python -m channels.cli_agent
+HEXA=$HEXA_LANG/target/release/hexa
+
+# CLI agent (full capabilities) — via agent-core dispatcher
+$HEXA anima-agent-core/run.hexa --cli
 
 # Telegram bot
 export ANIMA_TELEGRAM_TOKEN="your-token"
-python -m channels.telegram_bot
+$HEXA anima-agent-core/run.hexa --telegram
 
 # Discord bot
 export ANIMA_DISCORD_TOKEN="your-token"
-python -m channels.discord_bot
+$HEXA anima-agent-core/run.hexa --discord
 
-# Standalone test
-python anima_agent.py
-python skills/skill_manager.py
+# Direct channel invocation (bypass dispatcher)
+$HEXA anima-agent-channels/cli_agent.hexa
+$HEXA anima-agent-skills/skill_manager.hexa
 ```
 
 ## Integration with Existing Code
