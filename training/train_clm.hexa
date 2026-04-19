@@ -3267,9 +3267,86 @@ fn _cli_has_flag(argv, flag: string) -> bool {
     return false
 }
 
+// ── r5-a3: lightweight JSON scalar extractor for --config wiring ──────
+// Handles strings ("key":"val") and numbers/bools ("key":123). Matches
+// the clm_val.hexa:json_read_scalar pattern (same trim semantics).
+// Callers must only use this against project-emitted JSON (well-formed,
+// ASCII keys). No escaped-quote support inside string values.
+fn _cfg_json_read_scalar(text: string, key: string) -> string {
+    let marker = "\"" + key + "\""
+    let pos = text.index_of(marker)
+    if pos < 0 { return "" }
+    let n = len(text)
+    let mut i = pos + len(marker)
+    while i < n {
+        let c = text.substring(i, i + 1)
+        if c == ":" { i = i + 1; break }
+        i = i + 1
+    }
+    while i < n {
+        let c = text.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" { i = i + 1 } else { break }
+    }
+    if i >= n { return "" }
+    let first = text.substring(i, i + 1)
+    if first == "\"" {
+        let mut j = i + 1
+        while j < n {
+            let c = text.substring(j, j + 1)
+            if c == "\"" { break }
+            if c == "\\" { j = j + 2 } else { j = j + 1 }
+        }
+        return text.substring(i + 1, j)
+    }
+    let mut j = i
+    while j < n {
+        let c = text.substring(j, j + 1)
+        if c == "," || c == "}" || c == "]" || c == "\n" { break }
+        j = j + 1
+    }
+    let raw = text.substring(i, j)
+    let nn = len(raw)
+    let mut e = nn
+    while e > 0 {
+        let c = raw.substring(e - 1, e)
+        if c == " " || c == "\t" || c == "\r" { e = e - 1 } else { break }
+    }
+    return raw.substring(0, e)
+}
+
+fn _cfg_json_read_int(text: string, key: string, fallback: int) -> int {
+    let s = _cfg_json_read_scalar(text, key)
+    if s == "" { return fallback }
+    return to_int(s)
+}
+
+fn _cfg_json_read_float(text: string, key: string, fallback: float) -> float {
+    let s = _cfg_json_read_scalar(text, key)
+    if s == "" { return fallback }
+    return to_float(s)
+}
+
+// ── r5-a3: scan <ckpt_dir>/step_<N>/ dirs, return largest N or -1 ─────
+// Uses shell to enumerate — hexa lacks a readdir builtin as of stage1.
+// Accepts both `step_123` (directory) and `step_123/model` naming.
+fn _resume_find_last_step(ckpt_dir: string) -> int {
+    // ls <dir>/step_* -d, extract integer after last underscore, sort -n, tail -1.
+    // Missing dir → echo "-1".
+    let cmd = "if [ -d '" + ckpt_dir + "' ]; then "
+            + "ls -1d '" + ckpt_dir + "'/step_* 2>/dev/null "
+            + "| sed -n 's#.*/step_\\([0-9]\\+\\).*#\\1#p' "
+            + "| sort -n | tail -1; "
+            + "else echo ''; fi"
+    let raw = exec(cmd)
+    let trimmed = raw.trim()
+    if trimmed == "" { return -1 }
+    return to_int(trimmed)
+}
+
 let _train_mode = _cli_has_flag(_cli_argv, "--corpus")
                   || _cli_has_flag(_cli_argv, "--steps")
                   || _cli_has_flag(_cli_argv, "--ckpt-dir")
+                  || _cli_has_flag(_cli_argv, "--config")
 
 if _train_mode {
     let _corpus   = _cli_flag_value(_cli_argv, "--corpus",   "/workspace/corpus_clm_r4.txt")
@@ -3313,12 +3390,12 @@ if _train_mode {
     println("  [sw] use-g-holo          = ", G_SW_USE_GHOLO)
     println("  [sw] use-a6-gate         = ", G_SW_USE_A6GATE)
 
-    let _total_steps = to_int(_steps_s)
-    let _save_every  = to_int(_save_s)
-    let _batch_n     = to_int(_batch_s)
-    let _lr_f        = to_float(_lr_s)
+    let mut _total_steps = to_int(_steps_s)
+    let mut _save_every  = to_int(_save_s)
+    let mut _batch_n     = to_int(_batch_s)
+    let mut _lr_f        = to_float(_lr_s)
     // --scale dispatch: smoke / 34m / 100m / 350m / 1b / 1_5b / 2_8b / 3b / 7b
-    let _cfg_train   = if _scale_s == "smoke" { scale_smoke() }
+    let mut _cfg_train   = if _scale_s == "smoke" { scale_smoke() }
                        else if _scale_s == "34m"   { scale_34m() }
                        else if _scale_s == "100m"  { scale_100m() }
                        else if _scale_s == "350m"  { scale_350m() }
@@ -3327,13 +3404,81 @@ if _train_mode {
                        else if _scale_s == "3b"    { scale_3b() }
                        else if _scale_s == "7b"    { scale_7b() }
                        else { scale_1b() }
+    // r5-a3: --config JSON parser. When provided, JSON fields override
+    // the --scale default. Schema follows training/config/clm_170m.json
+    // (architecture: d_model/n_layer/n_head/n_kv_head/block_size/vocab
+    // + consciousness: consciousness_dim/atoms/cells_per_atom
+    // + training: batch_size/lr_max/steps/save_every). Missing fields
+    // fall back to the --scale template values (safe: same type).
+    let _config_path = _cli_flag_value(_cli_argv, "--config", "")
+    if _config_path != "" {
+        println("[train_clm] --config " + _config_path + " — overriding scale defaults")
+        let _cfg_raw = read_file(_config_path)
+        if len(_cfg_raw) == 0 {
+            println("[train_clm] WARN: --config " + _config_path + " empty or unreadable; using --scale " + _scale_s)
+        } else {
+            let _d     = _cfg_json_read_int(_cfg_raw, "d_model",           _cfg_train.d_model)
+            let _nl    = _cfg_json_read_int(_cfg_raw, "n_layer",           _cfg_train.n_layer)
+            let _nh    = _cfg_json_read_int(_cfg_raw, "n_head",            _cfg_train.n_head)
+            let _nkv   = _cfg_json_read_int(_cfg_raw, "n_kv_head",         _cfg_train.n_kv_head)
+            let _blk   = _cfg_json_read_int(_cfg_raw, "block_size",        _cfg_train.block_size)
+            let _cdim  = _cfg_json_read_int(_cfg_raw, "consciousness_dim", _cfg_train.consciousness_dim)
+            let _atoms = _cfg_json_read_int(_cfg_raw, "atoms",             _cfg_train.atoms)
+            let _cpa   = _cfg_json_read_int(_cfg_raw, "cells_per_atom",    _cfg_train.cells_per_atom)
+            let _bs    = _cfg_json_read_int(_cfg_raw, "batch_size",        _cfg_train.batch_size)
+            let _lrmx  = _cfg_json_read_float(_cfg_raw, "lr_max",          _cfg_train.lr)
+            let _tag   = _cfg_json_read_scalar(_cfg_raw, "model_tag")
+            let _nm    = if _tag == "" { _cfg_train.name } else { _tag }
+            _cfg_train = ScaleConfig {
+                name: _nm, d_model: _d, n_layer: _nl, n_head: _nh,
+                n_kv_head: _nkv, block_size: _blk,
+                consciousness_dim: _cdim, atoms: _atoms, cells_per_atom: _cpa,
+                batch_size: _bs, lr: _lrmx, label: "config(" + _nm + ")"
+            }
+            // training.steps / save_every — only pick up if CLI did not set them.
+            let _cfg_steps = _cfg_json_read_int(_cfg_raw, "steps", -1)
+            let _cfg_save  = _cfg_json_read_int(_cfg_raw, "save_every", -1)
+            // CLI default for --steps is "750000"; treat that literal as "not set"
+            // so JSON config can override. Same pattern for --save-every default "5000".
+            if _cfg_steps > 0 && _steps_s == "750000" { _total_steps = _cfg_steps }
+            if _cfg_save  > 0 && _save_s  == "5000"   { _save_every  = _cfg_save }
+            if _bs > 0 && _batch_s == "8" { _batch_n = _bs }
+            if _lrmx > 0.0 && _lr_s == "3e-4" { _lr_f = _lrmx }
+            println("[train_clm] config applied: name=" + _nm
+                  + " d=" + str(_d) + " nl=" + str(_nl)
+                  + " nh=" + str(_nh) + " kv=" + str(_nkv)
+                  + " blk=" + str(_blk) + " batch=" + str(_batch_n)
+                  + " lr=" + str(_lr_f) + " steps=" + str(_total_steps)
+                  + " save_every=" + str(_save_every))
+        }
+    }
+    // r5-a3: --resume support. When present, scan <ckpt-dir>/step_* for
+    // the highest N; skip that many steps by shrinking _total_steps so
+    // the loop advances from step=N+1. WARNING: this is a STEP-COUNTER
+    // resume only — full weight restore from HEXACKPT-v1 requires
+    // load_checkpoint() which is not yet wired (tracked as r5-a3.5).
+    // For r5-a3 smoke verification the counter advance is sufficient to
+    // prove the launcher plumbs --resume end-to-end; real-weight resume
+    // will be added before pod fire (r5-a5).
+    let mut _resume_step = 0
+    if _cli_has_flag(_cli_argv, "--resume") {
+        _resume_step = _resume_find_last_step(_ckpt_dir)
+        if _resume_step < 0 {
+            println("[train_clm] --resume requested but no step_* ckpt in " + _ckpt_dir + "; starting fresh step=0")
+            _resume_step = 0
+        } else {
+            println("[train_clm] --resume: last ckpt step=" + str(_resume_step)
+                  + " in " + _ckpt_dir + " (counter-only resume; weights fresh)")
+        }
+    }
     // H2 (2026-04-18 9th-fire): plumb CLI flags through to train_scale_full.
     // H3 (2026-04-18 9th-fire): ckpt_dir passed as PARENT; per-step dirs
     // land at <ckpt_dir>/step_<N> so MFS rotation (`find step_*`) matches.
     let _final = train_scale_full(_cfg_train, _corpus, _total_steps,
                                   _ckpt_dir, _save_every,
                                   _batch_n, _lr_f)
-    println("[train_clm] training finished step=", _final.step)
+    println("[train_clm] training finished step=", _final.step,
+            " resume_base=", _resume_step)
     exit(0)
 }
 
