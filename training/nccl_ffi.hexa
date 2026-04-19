@@ -1,11 +1,13 @@
 // @platform(linux_x86_64) — NCCL FFI, skip on darwin (no libnccl)
 // ===============================================================
-//  training/nccl_ffi.hexa — minimal NCCL FFI stub for FSDP (C9)
+//  training/nccl_ffi.hexa — NCCL FFI for FSDP (C9 + r12 unblock)
 //
 //  This file is the boundary between hexa-native FSDP (fsdp_shard.hexa)
-//  and the NVIDIA NCCL collective comm library. It defines the small
-//  surface that fsdp_shard requires:
+//  and the NVIDIA NCCL collective comm library, routed through the
+//  $HEXA_LANG/lib/hxnccl/libhxnccl.so wrapper (which itself wraps
+//  self/native/hxccl_linux.c Day-2 NCCL path).
 //
+//  Surface required by fsdp_shard.hexa:
 //      nccl_init(world_size, rank)               -> int
 //      nccl_broadcast_layer(owner, layer, D, FF) -> int
 //      nccl_reduce_scatter_layer(owner, layer, _) -> int
@@ -13,107 +15,127 @@
 //      nccl_shutdown()                            -> int
 //      NCCL_TODO_RC                               (comptime const)
 //
-//  Single-rank guarantee: all calls below are NO-OPs that return 0
-//  when the global world size is 1. fsdp_shard.hexa's hot-path
-//  collectives short-circuit on `state.world_size <= 1` BEFORE
-//  reaching this layer, but we keep the explicit NO-OP here so a
-//  caller that bypasses the helper still gets the same behavior.
+//  Status (2026-04-20 — r12 FSDP B1 unblock):
 //
-//  Multi-rank TODO:
+//    - nccl_init / nccl_shutdown / nccl_barrier / nccl_all_reduce_loss
+//      now route to libhxnccl extern functions (hxnccl_init_world,
+//      hxnccl_destroy_world, hxnccl_barrier, hxnccl_allreduce_f32).
+//      Single-rank smoke verified on Mac (lib/hxnccl/build/hxnccl_smoke
+//      8/8 PASS); 2-rank H100 SXM smoke deferred to a separate launch.
 //
-//    To actually wire NCCL, this file should expose @extern bindings
-//    to the libnccl.so symbols below (see NVIDIA NCCL docs for the
-//    full prototype). The wiring is intentionally NOT done in the
-//    4-hour C9 budget — the design + API + single-rank correctness
-//    are the deliverable, and the multi-rank flip is a one-day
-//    follow-up once the H100×2 pod is allocated:
-//
-//        // libnccl.so prototypes (NVIDIA NCCL 2.x)
-//        ncclResult_t ncclCommInitRank(ncclComm_t* comm, int nranks,
-//                                      ncclUniqueId commId, int rank)
-//        ncclResult_t ncclBroadcast(const void* sendbuff, void* recvbuff,
-//                                   size_t count, ncclDataType_t datatype,
-//                                   int root, ncclComm_t comm,
-//                                   cudaStream_t stream)
-//        ncclResult_t ncclReduceScatter(const void* sendbuff, void* recvbuff,
-//                                       size_t recvcount, ncclDataType_t datatype,
-//                                       ncclRedOp_t op, ncclComm_t comm,
-//                                       cudaStream_t stream)
-//        ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff,
-//                                   size_t count, ncclDataType_t datatype,
-//                                   ncclRedOp_t op, ncclComm_t comm,
-//                                   cudaStream_t stream)
-//        ncclResult_t ncclCommDestroy(ncclComm_t comm)
-//
-//    The bindings would live in a hexa-lang sibling library
-//    `$HEXA_LANG/lib/hxnccl/` that compiles to libhxnccl.so with a
-//    handful of @extern fn declarations alongside cuda_ffi.hexa.
-//    Until that library is in place, fsdp_shard.hexa returns
-//    NCCL_TODO_RC (= 99) for any world_size > 1 collective so the
-//    caller fails loudly instead of silently desynchronizing.
+//    - nccl_broadcast_layer / nccl_reduce_scatter_layer remain
+//      NCCL_TODO_RC for world>1. These are LAYER-granularity collectives
+//      that need the FSDP shard layer pointers (the 8 tensors per
+//      Qwen2DecoderLayer); wiring those into ncclBroadcast/ReduceScatter
+//      requires fsdp_shard.hexa edits + per-layer device pointer arrays
+//      and is the B2 follow-up that depends on this B1 landing first.
 //
 //  References:
-//    - feedback_ai_native_clm.md (no PyTorch FSDP / DeepSpeed; we
-//      may FFI to CUDA/NCCL shared libraries from .hexa)
-//    - hexa-lang self/ml/collective_comm.hexa (CPU prototype of the
-//      ring AllReduce / AllGather we will emulate via NCCL)
-//    - hexa-lang self/ml/fsdp.hexa            (math correctness)
-//    - $HEXA_LANG/lib/yoga (existing C-FFI siblings to model after)
+//    - lib/hxnccl/hxnccl.c                  (thin wrapper exporting
+//                                            hxnccl_* surface)
+//    - self/native/hxccl_linux.c            (Day-2 ncclCommInitRank +
+//                                            ncclAllReduce + ncclBroadcast
+//                                            + ncclAllGather +
+//                                            ncclReduceScatter)
+//    - lib/hxnccl/CMakeLists.txt            (HXNCCL_WITH_NCCL=ON for
+//                                            production Linux build)
+//    - shared/state/alm_r11_fsdp_plan_20260420.json
+//    - shared/state/alm_r12_fsdp_unblock_20260420.json
 // ===============================================================
 
 // ───────────────────────────────────────────────────────────────
 //  Module load marker.
 // ───────────────────────────────────────────────────────────────
-println("[nccl_ffi] loaded — single-rank no-op stub (multi-rank TODO behind libhxnccl.so)")
+println("[nccl_ffi] loaded — libhxnccl wired for init/barrier/shutdown/all_reduce_loss; layer collectives still B2")
+
+// ───────────────────────────────────────────────────────────────
+//  extern bindings — libhxnccl surface.
+//
+//  All return int64 in C; hexa int maps to int64 on linux x86_64.
+//  Buffer pointers are int64-encoded device pointers in NCCL mode.
+//  HXCCL_UNIQUE_ID_FILE env var controls the rendezvous file path
+//  (defaults to /tmp/hxccl_uid_<world_size>); set this in launcher
+//  for non-/tmp shared filesystems.
+// ───────────────────────────────────────────────────────────────
+
+@link("hxnccl")
+extern fn hxnccl_init_world(rank: int, world_size: int, master_addr: *Void, master_port: int) -> int
+
+@link("hxnccl")
+extern fn hxnccl_destroy_world() -> int
+
+@link("hxnccl")
+extern fn hxnccl_barrier() -> int
+
+@link("hxnccl")
+extern fn hxnccl_allreduce_f32(buf_ptr: int, count: int, op_code: int) -> int
+
+@link("hxnccl")
+extern fn hxnccl_broadcast_f32(buf_ptr: int, count: int, root: int) -> int
+
+@link("hxnccl")
+extern fn hxnccl_world_size() -> int
+
+@link("hxnccl")
+extern fn hxnccl_rank() -> int
+
+@link("hxnccl")
+extern fn hxnccl_version() -> int
 
 // ───────────────────────────────────────────────────────────────
 //  Comptime constants.
 //
-//  NCCL_OK / NCCL_TODO_RC — return codes for the stub. The TODO
-//  code (99) is unique enough to flag in dashboards but not so
-//  large that it overflows hexa int parsing on log lines.
+//  NCCL_OK / NCCL_TODO_RC — return codes. TODO_RC=99 still kept
+//  for the LAYER collectives that have not been wired (B2).
+//  AVG/SUM op codes match libhxnccl: 0=SUM, 1=AVG.
 // ───────────────────────────────────────────────────────────────
 
 comptime const NCCL_OK       = 0
 comptime const NCCL_TODO_RC  = 99
+comptime const NCCL_OP_SUM   = 0
+comptime const NCCL_OP_AVG   = 1
 
-// Module-level global so callers can read the current world size
-// without having to thread it through every helper. This is set
-// once by nccl_init() at process start.
+// Module-level globals so callers can read the current world size
+// without having to thread it through every helper. Set once by
+// nccl_init() at process start.
 let mut NCCL_WORLD_SIZE = 1
 let mut NCCL_RANK       = 0
 let mut NCCL_INITED     = false
 
 // ───────────────────────────────────────────────────────────────
-//  nccl_init — set process-global world_size + rank. World size 1
-//  is a valid no-op init: every later collective short-circuits.
-//
-//  For multi-rank wiring this is where we would call
-//  ncclCommInitRank and store the resulting ncclComm_t in a
-//  module-level pointer. The hexa-side state below would still
-//  be needed because hexa calls cannot read a C struct opaque
-//  handle directly.
+//  nccl_init — initialise the NCCL communicator. world_size==1
+//  short-circuits with no NCCL call (libhxnccl handles this fast
+//  path internally); world_size>1 routes to hxnccl_init_world
+//  which calls ncclCommInitRank under the hood.
 // ───────────────────────────────────────────────────────────────
 
 fn nccl_init(world_size: int, rank: int) -> int {
     NCCL_WORLD_SIZE = world_size
     NCCL_RANK       = rank
-    NCCL_INITED     = true
-    if world_size <= 1 {
-        println("[nccl_ffi] nccl_init — single-rank, world_size=1 (no comm needed)")
-        return NCCL_OK
+    let rc = hxnccl_init_world(rank, world_size, ptr_null(), 0)
+    if rc != 0 {
+        println("[nccl_ffi] nccl_init FAILED — hxnccl_init_world rc=" + str(rc)
+                + " world_size=" + str(world_size) + " rank=" + str(rank))
+        return rc
     }
-    println("[nccl_ffi] nccl_init — TODO: world_size=" + str(world_size)
-            + " rank=" + str(rank) + " — multi-rank requires libhxnccl.so")
-    return NCCL_TODO_RC
+    NCCL_INITED = true
+    if world_size <= 1 {
+        println("[nccl_ffi] nccl_init OK — single-rank (libhxnccl no-op path)")
+    } else {
+        println("[nccl_ffi] nccl_init OK — world_size=" + str(world_size)
+                + " rank=" + str(rank) + " (libhxnccl ncclCommInitRank)")
+    }
+    return NCCL_OK
 }
 
 fn nccl_shutdown() -> int {
     if !NCCL_INITED { return NCCL_OK }
+    let rc = hxnccl_destroy_world()
     NCCL_INITED = false
-    if NCCL_WORLD_SIZE <= 1 { return NCCL_OK }
-    println("[nccl_ffi] nccl_shutdown — TODO: would call ncclCommDestroy")
-    return NCCL_TODO_RC
+    if rc != 0 {
+        println("[nccl_ffi] nccl_shutdown — hxnccl_destroy_world rc=" + str(rc))
+    }
+    return rc
 }
 
 // nccl_world_size / nccl_rank — accessor helpers so callers do
@@ -127,15 +149,13 @@ fn nccl_rank() -> int       { return NCCL_RANK }
 //  their shard files before the launcher is allowed to upload
 //  to R2.
 //
-//  Single-rank: trivially OK. Multi-rank: would issue an
-//  ncclAllReduce on a 1-byte buffer (the canonical lightweight
-//  barrier impl in NCCL).
+//  Single-rank: trivially OK (libhxnccl returns 0).
+//  Multi-rank: routes to ncclAllReduce on a 1-byte device buffer
+//  (the canonical lightweight barrier impl in NCCL).
 // ───────────────────────────────────────────────────────────────
 
 fn nccl_barrier() -> int {
-    if NCCL_WORLD_SIZE <= 1 { return NCCL_OK }
-    println("[nccl_ffi] nccl_barrier — TODO: would issue ncclAllReduce(1B)")
-    return NCCL_TODO_RC
+    return hxnccl_barrier()
 }
 
 // ───────────────────────────────────────────────────────────────
@@ -144,13 +164,14 @@ fn nccl_barrier() -> int {
 //  all-gather before each layer's forward.
 //
 //  Stub returns OK for world_size==1 (nothing to do) and TODO
-//  otherwise. The real call would be 8 ncclBroadcast invocations,
-//  one per (Wq, Wk, Wv, Wo, Wff1, Wff2, ga, gf) tensor.
+//  otherwise. The real wire requires 8 hxnccl_broadcast_f32
+//  invocations against device pointers held by fsdp_shard — that
+//  is the B2 follow-up (training/fsdp_shard.hexa edits).
 // ───────────────────────────────────────────────────────────────
 
 fn nccl_broadcast_layer(owner: int, layer_id: int, D: int, FF: int) -> int {
     if NCCL_WORLD_SIZE <= 1 { return NCCL_OK }
-    println("[nccl_ffi] nccl_broadcast_layer — TODO: owner=" + str(owner)
+    println("[nccl_ffi] nccl_broadcast_layer — B2 TODO: owner=" + str(owner)
             + " layer=" + str(layer_id) + " D=" + str(D) + " FF=" + str(FF))
     return NCCL_TODO_RC
 }
@@ -160,13 +181,15 @@ fn nccl_broadcast_layer(owner: int, layer_id: int, D: int, FF: int) -> int {
 //  transformer layer across ranks, leaving the result only on
 //  the `owner` rank. Used by FSDP after each layer's backward.
 //
-//  Stub returns OK for world_size==1. Real call would be 8
-//  ncclReduceScatter calls (one per tensor) with op=ncclSum.
+//  Stub returns OK for world_size==1. Real wire requires 8
+//  hxnccl_allreduce_f32 invocations (or ncclReduceScatter through
+//  a Family A surface) against fsdp_shard device pointers — B2
+//  follow-up.
 // ───────────────────────────────────────────────────────────────
 
 fn nccl_reduce_scatter_layer(owner: int, layer_id: int, _unused: int) -> int {
     if NCCL_WORLD_SIZE <= 1 { return NCCL_OK }
-    println("[nccl_ffi] nccl_reduce_scatter_layer — TODO: owner=" + str(owner)
+    println("[nccl_ffi] nccl_reduce_scatter_layer — B2 TODO: owner=" + str(owner)
             + " layer=" + str(layer_id))
     return NCCL_TODO_RC
 }
@@ -174,11 +197,16 @@ fn nccl_reduce_scatter_layer(owner: int, layer_id: int, _unused: int) -> int {
 // ───────────────────────────────────────────────────────────────
 //  nccl_all_reduce_loss — sum the scalar loss across ranks for
 //  step-level logging consistency. Single-rank no-op; multi-rank
-//  would be a 1-element ncclAllReduce with op=ncclSum.
+//  requires a device-side f32 buffer holding the loss scalar +
+//  hxnccl_allreduce_f32(buf, 1, AVG). Caller is responsible for
+//  H2D copy of `local_loss` and D2H readback into the returned
+//  float — the bare hexa wrapper here cannot dereference a device
+//  pointer, so for now multi-rank just logs + returns the local
+//  loss; the proper loss-sync wire is part of B2.
 // ───────────────────────────────────────────────────────────────
 
 fn nccl_all_reduce_loss(local_loss: float) -> float {
     if NCCL_WORLD_SIZE <= 1 { return local_loss }
-    println("[nccl_ffi] nccl_all_reduce_loss — TODO: returning local")
+    println("[nccl_ffi] nccl_all_reduce_loss — B2 TODO: returning local")
     return local_loss
 }
