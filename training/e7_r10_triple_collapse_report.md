@@ -1,6 +1,6 @@
 # E7 — r10 Triple Collapse Root Cause + r10c Redesign
 
-**Session:** 2026-04-18 E7 (usage-limit aware, local-scope deliverables)
+**Session:** 2026-04-18 E7 (local-scope deliverables)
 **Scope:** diagnose why r10 failed 3× and did not abort on collapse; specify r10c.
 **Companion artifacts:**
 - `shared/convergence/alm_14b_r10.convergence` (OSSIFIED tracking record)
