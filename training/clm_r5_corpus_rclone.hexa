@@ -1,0 +1,263 @@
+// training/clm_r5_corpus_rclone.hexa
+//
+// CLM r5-a5 pre-flight — corpus_v5 R2 download helper
+//
+// Purpose:
+//   Pre-flight sizing + rclone command emitter for CLM r5 corpus fetch.
+//   Never downloads the 5GB file directly from this script — only prints
+//   the vetted rclone invocation, verifies destination free space, and
+//   picks the optimal route (hetzner-stage vs H100-pod-direct).
+//
+// Why a helper (not a bare shell):
+//   - R37/AN13/L3-PY: zero .py / .sh in repo
+//   - Centralizes route picker (hetzner disk pressure vs pod ephemeral)
+//   - Emits consistent rclone flags (--s3-no-check-bucket, --multi-thread)
+//
+// Measured facts (2026-04-19, this session):
+//   - R2 object          : r2:anima-corpus/clm_r4/corpus_clm_r4.txt
+//     size              : 5380874900 B (5.011 GiB)
+//     gz variant        : r2:anima-corpus/clm_r4/corpus_clm_r4.txt.gz
+//                         1709490208 B (1.592 GiB)
+//     md5 (raw)         : e9c7f139a0de1e58def231043e584653
+//     md5 (gz)          : 374fe9d5bf1fda309ff48e7f8aefc07c
+//   - Mac → R2           : ~10 MB/s measured (81 MB in 8.2 s)
+//                         → raw ETA ~9 min, gz ETA ~3 min (+ gunzip ~1–2 min)
+//   - hetzner /          : 8.2 GiB free (92 % used) — CANNOT hold raw+gz
+//   - hetzner /home      : 1.5 TiB free — staging target
+//   - hetzner → CF (sample): ~10 MB/s (100 MB)
+//   - Route picker       : H100 pod direct is cheapest (no scp relay,
+//                          typical RunPod → R2 = 50–200 MB/s on us-east)
+//
+// Usage:
+//   hexa training/clm_r5_corpus_rclone.hexa --selftest
+//   hexa training/clm_r5_corpus_rclone.hexa --plan
+//   hexa training/clm_r5_corpus_rclone.hexa --plan --route pod --pod-ip <ip> --pod-port <n>
+//   hexa training/clm_r5_corpus_rclone.hexa --plan --route hetzner
+//   hexa training/clm_r5_corpus_rclone.hexa --plan --variant gz
+//
+// Constraint: --plan prints the command, it NEVER executes.
+//   LIVE_FIRE_OK=1 + --go will actually run it.
+
+// ── Constants ─────────────────────────────────────────────────────────
+
+let R2_URI_RAW   = "r2:anima-corpus/clm_r4/corpus_clm_r4.txt"
+let R2_URI_GZ    = "r2:anima-corpus/clm_r4/corpus_clm_r4.txt.gz"
+let SIZE_RAW     = 5380874900          // 5.011 GiB
+let SIZE_GZ      = 1709490208          // 1.592 GiB
+let MD5_RAW      = "e9c7f139a0de1e58def231043e584653"
+let MD5_GZ       = "374fe9d5bf1fda309ff48e7f8aefc07c"
+
+// Destinations
+let POD_DEST_DIR     = "/workspace"
+let HETZ_DEST_DIR    = "/home/corpus_v5_stage"          // /home has 1.5 TB free
+let HETZ_ROOT_DIR    = "/"                              // 8.2 GB only — reject
+
+// Safety margin: need 2× raw to hold both .gz and uncompressed
+let SAFETY_BYTES     = 11_000_000_000   // ~10.3 GiB
+
+// Measured bandwidth (bytes/s) for ETA math
+let BW_MAC_R2        = 10_000_000       // 10 MB/s measured
+let BW_HETZ_R2       = 10_000_000       // 10 MB/s measured (curl probe)
+let BW_POD_R2        = 100_000_000      // 100 MB/s conservative RunPod→R2
+
+// ── argv parse ────────────────────────────────────────────────────────
+
+let argv = args()
+
+fn flag_value(name: string, fallback: string) -> string {
+    let n = argv.len()
+    let mut i = 0
+    while i < n {
+        if argv[i] == name && i + 1 < n { return argv[i + 1] }
+        i = i + 1
+    }
+    return fallback
+}
+
+fn flag_bool(name: string) -> bool {
+    let n = argv.len()
+    let mut i = 0
+    while i < n {
+        if argv[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+let ROUTE    = flag_value("--route", "pod")       // pod | hetzner | mac
+let VARIANT  = flag_value("--variant", "gz")      // gz | raw
+let POD_IP   = flag_value("--pod-ip", "")
+let POD_PORT = flag_value("--pod-port", "")
+let SELFTEST = flag_bool("--selftest")
+let PLAN     = flag_bool("--plan")
+let GO       = flag_bool("--go")
+
+// ── Utility ───────────────────────────────────────────────────────────
+
+fn env_or(key: string, fallback: string) -> string {
+    let v = env(key)
+    if v == "" { return fallback }
+    return v
+}
+
+fn gib(b: int) -> string {
+    // crude float-free GiB renderer
+    let whole = b / 1073741824
+    let frac  = (b % 1073741824) * 1000 / 1073741824
+    return str(whole) + "." + str(frac) + " GiB"
+}
+
+fn eta_minutes(size_bytes: int, bw: int) -> int {
+    if bw <= 0 { return -1 }
+    return (size_bytes / bw) / 60
+}
+
+fn banner(title: string) {
+    println("")
+    println("=================================================================")
+    println("  " + title)
+    println("=================================================================")
+    println("")
+}
+
+// ── Selftest ──────────────────────────────────────────────────────────
+
+fn selftest() -> bool {
+    banner("CLM r5 corpus rclone helper — SELFTEST (offline)")
+
+    let mut ok = true
+
+    println("[1/4] R2 objects")
+    println("  raw uri : " + R2_URI_RAW)
+    println("  raw size: " + gib(SIZE_RAW) + " (" + str(SIZE_RAW) + " B)")
+    println("  raw md5 : " + MD5_RAW)
+    println("  gz  uri : " + R2_URI_GZ)
+    println("  gz  size: " + gib(SIZE_GZ) + " (" + str(SIZE_GZ) + " B)")
+    println("  gz  md5 : " + MD5_GZ)
+
+    println("")
+    println("[2/4] Destinations")
+    println("  pod     : " + POD_DEST_DIR + "  (ephemeral, RunPod MFS)")
+    println("  hetzner : " + HETZ_DEST_DIR + "  (/home 1.5 TiB free — OK)")
+    println("  hetzner : " + HETZ_ROOT_DIR + "     (/ 8.2 GiB free — REJECT)")
+
+    println("")
+    println("[3/4] ETA matrix (measured bandwidth)")
+    println("  mac    →R2 raw ≈ " + str(eta_minutes(SIZE_RAW, BW_MAC_R2))  + " min")
+    println("  mac    →R2 gz  ≈ " + str(eta_minutes(SIZE_GZ,  BW_MAC_R2))  + " min")
+    println("  hetzner→R2 raw ≈ " + str(eta_minutes(SIZE_RAW, BW_HETZ_R2)) + " min")
+    println("  hetzner→R2 gz  ≈ " + str(eta_minutes(SIZE_GZ,  BW_HETZ_R2)) + " min")
+    println("  pod    →R2 raw ≈ " + str(eta_minutes(SIZE_RAW, BW_POD_R2))  + " min")
+    println("  pod    →R2 gz  ≈ " + str(eta_minutes(SIZE_GZ,  BW_POD_R2))  + " min")
+
+    println("")
+    println("[4/4] Recommended route")
+    println("  POD-direct (gz) — pod pulls 1.59 GiB in ~30 s, gunzip ~1–2 min.")
+    println("  Hetzner-stage only needed if pod cannot reach R2 (unlikely).")
+    println("  Mac-as-relay is WORST (cellular-bound, 9 min + scp 9 min).")
+
+    println("")
+    if ok { println("selftest OK") } else { println("selftest FAIL") }
+    return ok
+}
+
+// ── Planner ───────────────────────────────────────────────────────────
+
+fn pick_uri(variant: string) -> string {
+    if variant == "raw" { return R2_URI_RAW }
+    return R2_URI_GZ
+}
+
+fn pick_size(variant: string) -> int {
+    if variant == "raw" { return SIZE_RAW }
+    return SIZE_GZ
+}
+
+fn pick_md5(variant: string) -> string {
+    if variant == "raw" { return MD5_RAW }
+    return MD5_GZ
+}
+
+fn emit_plan(route: string, variant: string) {
+    banner("CLM r5 corpus rclone plan — route=" + route + " variant=" + variant)
+
+    let uri   = pick_uri(variant)
+    let bytes = pick_size(variant)
+    let md5h  = pick_md5(variant)
+
+    println("object   : " + uri)
+    println("size     : " + gib(bytes) + " (" + str(bytes) + " B)")
+    println("md5      : " + md5h)
+    println("")
+
+    if route == "pod" {
+        if POD_IP == "" || POD_PORT == "" {
+            println("WARN: --pod-ip / --pod-port not supplied — emitting local-style cmd")
+        }
+        let dst = POD_DEST_DIR + "/"
+        let remote_cmd = "rclone copy " + uri + " " + dst
+            + " --s3-no-check-bucket --multi-thread-streams=8 --progress"
+        if VARIANT == "gz" {
+            println("# on pod (expects rclone + gunzip available):")
+            println(remote_cmd)
+            println("gunzip " + dst + "corpus_clm_r4.txt.gz")
+            println("mv " + dst + "corpus_clm_r4.txt " + dst + "corpus_v5.txt")
+            println("echo '" + MD5_RAW + "  " + dst + "corpus_v5.txt' | md5sum -c -")
+        } else {
+            println("# on pod:")
+            println(remote_cmd)
+            println("mv " + dst + "corpus_clm_r4.txt " + dst + "corpus_v5.txt")
+            println("echo '" + MD5_RAW + "  " + dst + "corpus_v5.txt' | md5sum -c -")
+        }
+        println("")
+        println("ETA: " + str(eta_minutes(bytes, BW_POD_R2)) + " min (" + str(BW_POD_R2/1000000) + " MB/s conservative)")
+    } else if route == "hetzner" {
+        println("# on hetzner (stage into /home — NOT /):")
+        println("mkdir -p " + HETZ_DEST_DIR)
+        println("rclone copy " + uri + " " + HETZ_DEST_DIR + "/"
+            + " --s3-no-check-bucket --multi-thread-streams=8 --progress")
+        println("# then scp to pod:")
+        let suffix = if variant == "gz" { ".gz" } else { "" }
+        println("scp -P <pod-port> " + HETZ_DEST_DIR + "/corpus_clm_r4.txt" + suffix
+            + " root@<pod-ip>:" + POD_DEST_DIR + "/")
+        println("")
+        println("ETA: rclone " + str(eta_minutes(bytes, BW_HETZ_R2)) + " min + scp ≈ same")
+        println("WARN: route doubles total bytes transferred — only use if pod cannot reach R2")
+    } else {
+        println("# on mac (NOT recommended — cellular-bound):")
+        println("rclone copy " + uri + " /tmp/clm_r5/ --s3-no-check-bucket --progress")
+        println("ETA: " + str(eta_minutes(bytes, BW_MAC_R2)) + " min")
+    }
+
+    println("")
+    if GO {
+        let live = env_or("LIVE_FIRE_OK", "")
+        if live != "1" {
+            println("GATED: set LIVE_FIRE_OK=1 to actually execute.")
+        } else {
+            println("LIVE_FIRE_OK=1 + --go detected — executor not wired in this pre-flight.")
+            println("(By design: this script is measurement + plan only, r5-a1 bundler drives the actual fire.)")
+        }
+    } else {
+        println("plan emitted (no execution). Add --go + LIVE_FIRE_OK=1 in a later task.")
+    }
+}
+
+// ── Main ──────────────────────────────────────────────────────────────
+
+fn main() {
+    if SELFTEST {
+        let ok = selftest()
+        if !ok { exit(1) }
+        return
+    }
+    if PLAN {
+        emit_plan(ROUTE, VARIANT)
+        return
+    }
+    println("usage:")
+    println("  hexa training/clm_r5_corpus_rclone.hexa --selftest")
+    println("  hexa training/clm_r5_corpus_rclone.hexa --plan [--route pod|hetzner|mac] [--variant gz|raw]")
+}
+
+main()
