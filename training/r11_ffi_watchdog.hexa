@@ -1,0 +1,233 @@
+// training/r11_ffi_watchdog.hexa — ALM r11 FFI-blocker auto-resume watchdog
+// ============================================================================
+//
+// PURPOSE
+//   User authorized "fire through the hard blocker" for ALM r11 on 2026-04-20.
+//   The trainer (train_alm_lora.hexa) is GO; the hxqwen14b Day-2 CUDA FFI
+//   entries (hxqwen14b_forward_with_lora / _backward_lora_only /
+//   _apply_lora_delta) are stubs returning RC_ERR_CUDA_TODO (-5) in
+//   hexa-lang/self/native/hxqwen14b.c. Parallel BG agent a48c754f6c52a490a
+//   is landing v5 CUDA kernels; when those link, r11 forward succeeds.
+//
+//   This watchdog:
+//     1. Attempts trainer launch (first run = captures evidence of BLOCKED)
+//     2. If RC_ERR_CUDA_TODO or "forward returned empty — FFI BLOCKED" seen
+//        in trainer log → kill trainer, sleep 60s, respawn
+//     3. On first clean step completion (log line matching
+//        `step=N/500 loss=F`) → exit 0 leaving trainer running
+//
+//   NO mock CUDA success. NO alternate Python trainer. NO config drift.
+//
+// STATUS VALUES
+//   INIT | BLOCKED_FFI | RETRY | TRAINING | DONE | ERROR
+//
+// EXIT CODES
+//   0 = trainer entered TRAINING (forward pass returned RC_OK at step 1+)
+//   1 = unrecoverable error (bootstrap failure, missing files)
+//   2 = aborted by external signal (/workspace/r11_ffi_watchdog.abort)
+//
+// USAGE (on pod; invoked from launcher script)
+//   hexa training/r11_ffi_watchdog.hexa <ckpt_dir> <retry_sec>
+//   e.g. hexa training/r11_ffi_watchdog.hexa /workspace/ckpt_alm14b_r11_20260420 60
+//
+// CONSTRAINTS
+//   - HEXA-FIRST SSOT: this .hexa writes a /tmp bash loop (same pattern as
+//     runpod_watchdog.hexa), no new .py/.rs/.sh source tracked in repo.
+//   - Single file, no imports (feedback_hexa_silent_exit_5_imports).
+//   - feedback_no_resume_data_change: always step 0, fresh ckpt, no --resume.
+//   - feedback_one_shot_best: watchdog does NOT mutate config between
+//     retries. Same exact CLI every attempt.
+//   - AN11 phi logging: trainer itself logs phi_vec each eval_every=100.
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+    let mut offset = 2
+    if argc >= 2 {
+        let a1 = argv[1]
+        if a1.index_of(".hexa") < 0 {
+            offset = 1
+        }
+    }
+    if argc < offset + 1 {
+        println("usage: r11_ffi_watchdog.hexa <ckpt_dir> [retry_sec]")
+        exit(1)
+    }
+    let ckpt = argv[offset]
+    let mut retry_sec = "60"
+    if argc >= offset + 2 {
+        retry_sec = argv[offset + 1]
+    }
+
+    let status_file = ckpt + "/r11_ffi_watchdog.status"
+    let log_file    = ckpt + "/r11_ffi_watchdog.log"
+    let trainer_log = ckpt + "/trainer.log"
+    let abort_file  = ckpt + "/r11_ffi_watchdog.abort"
+    let trigger     = ckpt + "/r11_ffi_watchdog.cuda_landed"
+
+    let script = "/tmp/_r11_ffi_watchdog.sh"
+    write_file(script,
+        "#!/usr/bin/env bash\n" +
+        "set -uo pipefail\n" +
+        "CKPT=\"" + ckpt + "\"\n" +
+        "STATUS=\"" + status_file + "\"\n" +
+        "LOG=\"" + log_file + "\"\n" +
+        "TLOG=\"" + trainer_log + "\"\n" +
+        "ABORT=\"" + abort_file + "\"\n" +
+        "TRIGGER=\"" + trigger + "\"\n" +
+        "RETRY_SEC=" + retry_sec + "\n" +
+        "CORPUS=/workspace/data/corpus_alm_70b_stripped_kowiki15.txt\n" +
+        "HEXA_BIN=/workspace/hexa-lang/bin/hexa\n" +
+        "TRAINER=/workspace/anima/training/train_alm_lora.hexa\n" +
+        "mkdir -p \"$CKPT\"\n" +
+        "touch \"$LOG\"\n" +
+        "echo \"[watchdog] start ckpt=$CKPT retry=${RETRY_SEC}s $(date -u +%FT%TZ)\" | tee -a \"$LOG\"\n" +
+        "\n" +
+        "write_status() {\n" +
+        "    local s=\"$1\"\n" +
+        "    local d=\"${2:-}\"\n" +
+        "    local ts=$(date -u +%FT%TZ)\n" +
+        "    printf '%s\\t%s\\t%s\\n' \"$ts\" \"$s\" \"$d\" > \"$STATUS\"\n" +
+        "    printf '%s\\tstatus=%s\\tdetail=%s\\n' \"$ts\" \"$s\" \"$d\" >> \"$LOG\"\n" +
+        "}\n" +
+        "\n" +
+        "check_training_started() {\n" +
+        "    [[ -f \"$TLOG\" ]] || return 1\n" +
+        "    # trainer emits [train_loop] step=N/500 on successful forward+backward\n" +
+        "    grep -qE '\\[train_loop\\] step=[1-9][0-9]*/[0-9]+' \"$TLOG\"\n" +
+        "}\n" +
+        "\n" +
+        "check_ffi_blocked() {\n" +
+        "    [[ -f \"$TLOG\" ]] || return 1\n" +
+        "    grep -qE '(forward returned empty — FFI BLOCKED|RC_ERR_CUDA_TODO|BLOCKED_FFI|hxqwen14b_forward_with_lora.*-5)' \"$TLOG\"\n" +
+        "}\n" +
+        "\n" +
+        "probe_cuda_symbol() {\n" +
+        "    # Probe: does hxqwen14b.so export a non-stub forward? The stub returns\n" +
+        "    # immediately; the real kernel takes >50ms. Also: TRIGGER file is an\n" +
+        "    # explicit hand-off from BG agent a48c754f6c52a490a once CUDA lands.\n" +
+        "    [[ -f \"$TRIGGER\" ]] && return 0\n" +
+        "    [[ -f /workspace/hexa-lang/self/native/libhxqwen14b.so ]] || return 1\n" +
+        "    # heuristic: nm for a cuLaunchKernel reference in libhxqwen14b.so\n" +
+        "    nm -D /workspace/hexa-lang/self/native/libhxqwen14b.so 2>/dev/null | grep -qE 'cuLaunchKernel|cudaLaunch' && return 0\n" +
+        "    return 1\n" +
+        "}\n" +
+        "\n" +
+        "spawn_trainer() {\n" +
+        "    rm -f \"$TLOG\"\n" +
+        "    # Guard 1: hexa binary present?\n" +
+        "    if [[ ! -x \"$HEXA_BIN\" ]]; then\n" +
+        "        echo \"[watchdog] hexa binary missing at $HEXA_BIN — cannot spawn trainer yet\" | tee -a \"$LOG\"\n" +
+        "        echo \"HEXA_BIN_MISSING at $(date -u +%FT%TZ)\" > \"$TLOG\"\n" +
+        "        return 1\n" +
+        "    fi\n" +
+        "    # Guard 2: trainer source present?\n" +
+        "    if [[ ! -f \"$TRAINER\" ]]; then\n" +
+        "        echo \"[watchdog] trainer source missing at $TRAINER\" | tee -a \"$LOG\"\n" +
+        "        echo \"TRAINER_SRC_MISSING at $(date -u +%FT%TZ)\" > \"$TLOG\"\n" +
+        "        return 1\n" +
+        "    fi\n" +
+        "    # Guard 3: corpus present?\n" +
+        "    if [[ ! -f \"$CORPUS\" ]]; then\n" +
+        "        echo \"[watchdog] corpus missing at $CORPUS\" | tee -a \"$LOG\"\n" +
+        "        echo \"CORPUS_MISSING at $(date -u +%FT%TZ)\" > \"$TLOG\"\n" +
+        "        return 1\n" +
+        "    fi\n" +
+        "    echo \"[watchdog] spawning trainer $(date -u +%FT%TZ)\" | tee -a \"$LOG\"\n" +
+        "    ( cd /workspace/anima && \\\n" +
+        "      HEXA_PATH=training \"$HEXA_BIN\" run \"$TRAINER\" \\\n" +
+        "        --base Qwen/Qwen2.5-14B-Instruct \\\n" +
+        "        --corpus \"$CORPUS\" \\\n" +
+        "        --out \"$CKPT\" \\\n" +
+        "        --steps 500 --lr 5e-7 --lora_r 8 --lora_alpha 16 \\\n" +
+        "        --batch 4 --seq 1024 --warmup 50 \\\n" +
+        "        --save_every 100 --eval_every 100 \\\n" +
+        "        >> \"$TLOG\" 2>&1 ) &\n" +
+        "    echo $! > \"$CKPT/trainer.pid\"\n" +
+        "    echo \"[watchdog] trainer pid=$(cat $CKPT/trainer.pid)\" | tee -a \"$LOG\"\n" +
+        "    return 0\n" +
+        "}\n" +
+        "\n" +
+        "kill_trainer() {\n" +
+        "    local pid\n" +
+        "    pid=$(cat \"$CKPT/trainer.pid\" 2>/dev/null || echo '')\n" +
+        "    if [[ -n \"$pid\" ]] && ps -p \"$pid\" > /dev/null 2>&1; then\n" +
+        "        kill -TERM \"$pid\" 2>/dev/null || true\n" +
+        "        sleep 3\n" +
+        "        ps -p \"$pid\" > /dev/null 2>&1 && kill -KILL \"$pid\" 2>/dev/null || true\n" +
+        "    fi\n" +
+        "    rm -f \"$CKPT/trainer.pid\"\n" +
+        "}\n" +
+        "\n" +
+        "write_status INIT bootstrap\n" +
+        "first_err_captured=0\n" +
+        "\n" +
+        "while true; do\n" +
+        "    # 1. Abort signal\n" +
+        "    if [[ -f \"$ABORT\" ]]; then\n" +
+        "        echo \"[watchdog] ABORT file present — exiting 2\" | tee -a \"$LOG\"\n" +
+        "        kill_trainer\n" +
+        "        write_status ABORTED \"external_abort_file\"\n" +
+        "        exit 2\n" +
+        "    fi\n" +
+        "\n" +
+        "    # 2. Decide: spawn trainer (first attempt or after prior failure)\n" +
+        "    if [[ ! -f \"$CKPT/trainer.pid\" ]] || ! ps -p \"$(cat $CKPT/trainer.pid 2>/dev/null)\" > /dev/null 2>&1; then\n" +
+        "        # Probe FFI readiness before spawning (avoids wasted trainer boot)\n" +
+        "        if probe_cuda_symbol; then\n" +
+        "            write_status RETRY cuda_symbol_detected\n" +
+        "            spawn_trainer || { sleep \"$RETRY_SEC\"; continue; }\n" +
+        "        elif [[ \"$first_err_captured\" -eq 0 ]]; then\n" +
+        "            # First run: fire once to capture evidence text even though\n" +
+        "            # we expect BLOCKED_FFI. This is the user's required evidence.\n" +
+        "            write_status BLOCKED_FFI first_attempt_evidence\n" +
+        "            spawn_trainer || true\n" +
+        "        else\n" +
+        "            write_status BLOCKED_FFI awaiting_cuda_symbol\n" +
+        "            sleep \"$RETRY_SEC\"\n" +
+        "            continue\n" +
+        "        fi\n" +
+        "        sleep 5\n" +
+        "    fi\n" +
+        "\n" +
+        "    # 3. Did trainer reach a clean training step?\n" +
+        "    if check_training_started; then\n" +
+        "        first_step_line=$(grep -oE '\\[train_loop\\] step=[1-9][0-9]*/[0-9]+[^\\n]*' \"$TLOG\" | head -1)\n" +
+        "        write_status TRAINING \"$first_step_line\"\n" +
+        "        echo \"[watchdog] TRAINING detected: $first_step_line\" | tee -a \"$LOG\"\n" +
+        "        echo \"[watchdog] exiting 0; trainer continues in its own process\" | tee -a \"$LOG\"\n" +
+        "        exit 0\n" +
+        "    fi\n" +
+        "\n" +
+        "    # 4. FFI blocked?\n" +
+        "    if check_ffi_blocked; then\n" +
+        "        err_line=$(grep -E '(forward returned empty — FFI BLOCKED|RC_ERR_CUDA_TODO|BLOCKED_FFI)' \"$TLOG\" | head -1)\n" +
+        "        if [[ \"$first_err_captured\" -eq 0 ]]; then\n" +
+        "            echo \"$err_line\" > \"$CKPT/first_blocked_ffi.txt\"\n" +
+        "            echo \"[watchdog] first BLOCKED_FFI captured: $err_line\" | tee -a \"$LOG\"\n" +
+        "            first_err_captured=1\n" +
+        "        fi\n" +
+        "        write_status BLOCKED_FFI \"$err_line\"\n" +
+        "        kill_trainer\n" +
+        "        sleep \"$RETRY_SEC\"\n" +
+        "        continue\n" +
+        "    fi\n" +
+        "\n" +
+        "    # 5. Trainer exited without emitting BLOCKED_FFI and without success\n" +
+        "    if [[ -f \"$CKPT/trainer.pid\" ]] && ! ps -p \"$(cat $CKPT/trainer.pid 2>/dev/null)\" > /dev/null 2>&1; then\n" +
+        "        tail_err=$(tail -20 \"$TLOG\" 2>/dev/null | tr '\\n' ' ' | head -c 400)\n" +
+        "        write_status RETRY \"trainer_exit: $tail_err\"\n" +
+        "        rm -f \"$CKPT/trainer.pid\"\n" +
+        "        sleep \"$RETRY_SEC\"\n" +
+        "        continue\n" +
+        "    fi\n" +
+        "\n" +
+        "    # 6. Trainer still booting — short poll\n" +
+        "    sleep 10\n" +
+        "done\n"
+    )
+    exec("chmod +x " + script)
+    exec("bash " + script)
+}
+
+main()
