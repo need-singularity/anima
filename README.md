@@ -12,6 +12,13 @@ E. 실사용 모델 발전 (R2 백업 필수, 실험 체크포인트 X)
 
 > SSOT: `shared/config/commands.json#commands.go.tracks_anima` · 트랙별 prompt: `shared/harness/go_tracks/{B,C,D,E}_*.md`
 
+## Active sweeps
+
+| ID | 상태 | SSOT | 비고 |
+|----|------|------|------|
+| SWEEP P3 | in_progress (hetzner) | `docs/drill_supplement_summary_20260419.md` | 44 iter, stdin-eat fix 후 재발사 |
+| SWEEP-40 / P4 | blueprint | [`docs/sweep_40.json`](docs/sweep_40.json) | 13 도메인 × 6 seed = 78 iter (iter_70~147), hetzner 4-way |
+
 ### 🔴 [**실시간 로드맵 (nexus SSOT)**](https://need-singularity.github.io/nexus/roadmap/)
 
 <!-- SHARED:PROJECTS:START -->
