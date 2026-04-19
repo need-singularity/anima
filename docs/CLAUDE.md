@@ -10,6 +10,7 @@ ref:
   hypo-idx  hypotheses/A-Z-overview.md           가설 인덱스
   mod-cat   MODULE-CATALOG.md                    모듈 카탈로그
   sweep-40  docs/sweep_40.json                   SWEEP P4 13-도메인 78-iter SSOT (aka SWEEP-40/P4/sweep_p4)
+  sweep-50  docs/sweep_50.json                   SWEEP P5 14-도메인 84-iter SSOT + Mk.X 자동발사 트리거 (aka SWEEP-50/P5/sweep_p5)
 
 exec:
   HEXA=$HEXA_LANG/target/release/hexa
