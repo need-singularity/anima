@@ -2178,10 +2178,14 @@ fn _lmhead_bwd_ffi(
 comptime const DECODER_EPS = 0.000001
 
 fn _tz(n: int) -> [float] {
-    let mut out = []
-    let mut i = 0
-    while i < n { out = out.push(0.0); i = i + 1 }
-    return out
+    // r5-a10.5-A (rt#32-O, 2026-04-20): native single-shot calloc primitive.
+    // Was: N hexa_array_push from cap=0 → 17 reallocs at N=393K, leaked
+    // 12.6 MB heap buffer per call. Now: 1 calloc(N*32B) + tight zero-fill
+    // loop, cap==len==N (no growth). Eliminates per-_tz realloc churn —
+    // ~88 _tz calls/step in decoder forward — but the buffer still leaks
+    // until train_step explicitly free_array(...)s the locals (see end of
+    // train_step). See shared/state/clm_r5_a10_leak_fix_20260420.json.
+    return _tz_native(n)
 }
 
 fn _tones(n: int) -> [float] {
@@ -2212,40 +2216,45 @@ fn _trandn(n: int, seed: int) -> [float] {
 }
 
 fn _tscale(a: [float], s: float) -> [float] {
-    let mut out = []
+    let n = len(a)
+    let mut out = _tz_native(n)
     let mut i = 0
-    while i < len(a) { out = out.push(a[i] * s); i = i + 1 }
+    while i < n { out[i] = a[i] * s; i = i + 1 }
     return out
 }
 
+// r5-a10.5-A (rt#32-O, 2026-04-20): converted from N-push to native zeros +
+// index assignment — eliminates 17 reallocs per call at typical CLM sizes.
+// Caller still owns lifetime; pair with free_array() at end of scope.
 fn _tadd(a: [float], b: [float]) -> [float] {
-    let mut out = []
     let n = len(a)
+    let mut out = _tz_native(n)
     let mut i = 0
-    while i < n { out = out.push(a[i] + b[i]); i = i + 1 }
+    while i < n { out[i] = a[i] + b[i]; i = i + 1 }
     return out
 }
 
 fn _tsub(a: [float], b: [float]) -> [float] {
-    let mut out = []
     let n = len(a)
+    let mut out = _tz_native(n)
     let mut i = 0
-    while i < n { out = out.push(a[i] - b[i]); i = i + 1 }
+    while i < n { out[i] = a[i] - b[i]; i = i + 1 }
     return out
 }
 
 fn _tmul(a: [float], b: [float]) -> [float] {
-    let mut out = []
     let n = len(a)
+    let mut out = _tz_native(n)
     let mut i = 0
-    while i < n { out = out.push(a[i] * b[i]); i = i + 1 }
+    while i < n { out[i] = a[i] * b[i]; i = i + 1 }
     return out
 }
 
 fn _tslice(a: [float], start: int, end: int) -> [float] {
-    let mut out = []
-    let mut i = start
-    while i < end { out = out.push(a[i]); i = i + 1 }
+    let n = end - start
+    let mut out = _tz_native(n)
+    let mut i = 0
+    while i < n { out[i] = a[start + i]; i = i + 1 }
     return out
 }
 
@@ -2634,8 +2643,15 @@ fn _block_attn(
     free_raw(buf_scores, seq * seq * 4)
     free_raw(buf_ctx,    seq * head_dim * 4)
 
+    // r5-a10.5-A: Q/K/V projections consumed by all heads' marshal loops; safe to free.
+    free_array(Q)
+    free_array(K)
+    free_array(V)
+
     // Output projection: [seq × d] @ Wo[d × d] → [seq × d]
-    return _matmul(out, blk.Wo, seq, d, d)
+    let proj = _matmul(out, blk.Wo, seq, d, d)
+    free_array(out)               // r5-a10.5-A: out consumed by _matmul above
+    return proj
 }
 
 // SwiGLU FFN: gate_proj(x) * silu(up_proj(x)), then down_proj
@@ -2653,8 +2669,13 @@ fn _block_ffn(
         activated[i] = _silu(gate[i]) * up[i]
         i = i + 1
     }
+    // r5-a10.5-A: gate + up consumed into activated; safe to free.
+    free_array(gate)
+    free_array(up)
     // Down projection: [seq × d_ff] @ Wdown[d_ff × d] → [seq × d]
-    return _matmul(activated, blk.Wdown, seq, d_ff, d)
+    let down = _matmul(activated, blk.Wdown, seq, d_ff, d)
+    free_array(activated)            // r5-a10.5-A: activated consumed by _matmul
+    return down
 }
 
 // Single decoder block forward
@@ -2670,11 +2691,16 @@ fn _block_forward(
         let nr = _rms_norm(row, blk.gamma_attn)
         let mut p = 0
         while p < d { normed1[i * d + p] = nr[p]; p = p + 1 }
+        // r5-a10.5-A: per-row temps (12 layers × seq iters × 2 small arrays)
+        free_array(row)
+        free_array(nr)
         i = i + 1
     }
     // Self-attention + residual
     let attn_out = _block_attn(normed1, blk, seq, d, n_head, n_kv_head)
+    free_array(normed1)            // r5-a10.5-A: consumed by _block_attn
     let x1 = _tadd(x, attn_out)
+    free_array(attn_out)           // r5-a10.5-A: consumed by _tadd above
 
     // 2. Pre-norm for FFN
     let mut normed2 = _tz(seq * d)
@@ -2684,11 +2710,17 @@ fn _block_forward(
         let nr = _rms_norm(row, blk.gamma_ffn)
         let mut p = 0
         while p < d { normed2[i * d + p] = nr[p]; p = p + 1 }
+        free_array(row)
+        free_array(nr)
         i = i + 1
     }
     // SwiGLU FFN + residual
     let ffn_out = _block_ffn(normed2, blk, seq, d, d_ff)
-    return _tadd(x1, ffn_out)
+    free_array(normed2)            // r5-a10.5-A: consumed by _block_ffn
+    let result = _tadd(x1, ffn_out)
+    free_array(x1)                 // r5-a10.5-A: x1 + ffn_out consumed
+    free_array(ffn_out)
+    return result
 }
 
 // ─── §E  Full forward pass ────────────────────────────────────────
@@ -2745,6 +2777,9 @@ fn decoder_forward(model: DecoderModel, tokens: [int], seq: int) -> ForwardResul
         let nr = _rms_norm(row, model.gamma_final)
         let mut p = 0
         while p < d { x_final[ni * d + p] = nr[p]; p = p + 1 }
+        // r5-a10.5-A: per-row temps freed (seq iters × 2 small arrays)
+        free_array(row)
+        free_array(nr)
         ni = ni + 1
     }
 
@@ -2825,9 +2860,13 @@ fn decoder_backward(
     // Naive path: original triple-loop matmuls (CE + dV + dmid + dU + dx).
     let _use_hxlmhead_ffi = len(env_var("HXLMHEAD_FFI")) > 0
 
-    let mut dL_dV = _tz(rank * v)
-    let mut dL_dU = _tz(d * rank)
-    let mut dL_dx = _tz(seq * d)
+    // r5-a10.5-A (rt#32-O, 2026-04-20): defer placeholder allocs until needed.
+    // Was: 3× _tz allocate + immediately rebind after FFI/_matmul_At returns —
+    // leaked 3 buffers (rank*v + d*rank + seq*d × HexaVal) per step. Now: keep
+    // dL_dV/dL_dU/dL_dx as void hexa list ptrs; assign on first compute path.
+    let mut dL_dV = []
+    let mut dL_dU = []
+    let mut dL_dx = []
     let mut ce_loss = 0.0
 
     if _use_hxlmhead_ffi {
@@ -2906,11 +2945,19 @@ fn decoder_backward(
             }
             i = i + 1
         }
+        // r5-a10.5-A: free naive-path locals consumed before block backward.
+        free_array(dL_dlogits)
+        free_array(dL_dmid)
     }
 
     // 4. SGD update on LM head weights
-    let new_V = _tsub(model.lmh_V, _tscale(dL_dV, lr))
-    let new_U = _tsub(model.lmh_U, _tscale(dL_dU, lr))
+    // r5-a10.5-A: hoist _tscale temps so we can free them post-_tsub
+    let _scaled_dV = _tscale(dL_dV, lr)
+    let new_V = _tsub(model.lmh_V, _scaled_dV)
+    free_array(_scaled_dV)
+    let _scaled_dU = _tscale(dL_dU, lr)
+    let new_U = _tsub(model.lmh_U, _scaled_dU)
+    free_array(_scaled_dU)
 
     // 6. Block-level backward (reverse order, simplified SGD on projections)
     //    For each block L-1..0:
@@ -2961,11 +3008,17 @@ fn decoder_backward(
                 }
                 p = p + 1
             }
+            // r5-a10.5-A: free per-row slice temps (was leaking 12 layers × seq × 2 slices/step)
+            free_array(dx_row)
+            free_array(hin_row)
             si = si + 1
         }
 
         // SGD update Wo and Wdown for this block
-        let new_Wo = _tsub(blk.Wo, _tscale(dWo_acc, lr / to_float(seq)))
+        // r5-a10.5-A: hoist _tscale temp + free
+        let _scaled_dWo = _tscale(dWo_acc, lr / to_float(seq))
+        let new_Wo = _tsub(blk.Wo, _scaled_dWo)
+        free_array(_scaled_dWo)
         // Wdown update: gradient signal is smaller, scale by layer depth
         let depth_scale = lr / to_float(seq) * 0.1
         // Propagate gradient through the Wq/Wk/Wv via a fraction of Wo's update
@@ -2984,9 +3037,17 @@ fn decoder_backward(
                 }
                 p = p + 1
             }
+            free_array(dx_row)
+            free_array(hin_row)
             si2 = si2 + 1
         }
-        let new_Wq = _tsub(blk.Wq, _tscale(dWq_acc, qkv_lr))
+        let _scaled_dWq = _tscale(dWq_acc, qkv_lr)
+        let new_Wq = _tsub(blk.Wq, _scaled_dWq)
+        free_array(_scaled_dWq)
+        // r5-a10.5-A: dWo_acc + dWdown_acc + dWq_acc consumed by SGD; free.
+        free_array(dWo_acc)
+        free_array(dWdown_acc)
+        free_array(dWq_acc)
 
         // Reconstruct block with updated weights
         let updated_blk = DecoderBlockW {
@@ -3005,7 +3066,10 @@ fn decoder_backward(
         // Propagate gradient to previous block through residual
         // dL/dx_prev = dL/dx (residual connection means gradient passes through)
         // Plus attn/ffn contribution which we approximate as damped
-        dL_dx = _tscale(dL_dx, 0.95)  // slight decay to prevent gradient explosion
+        // r5-a10.5-A: free old dL_dx before rebind (was leaking seq*d × 12 layers/step)
+        let _new_dL_dx = _tscale(dL_dx, 0.95)
+        free_array(dL_dx)
+        dL_dx = _new_dL_dx
 
         li = li - 1
     }
@@ -3050,6 +3114,17 @@ fn decoder_backward(
         lmh_U: new_U,
         lmh_V: new_V
     }
+
+    // r5-a10.5-A (rt#32-O, 2026-04-20): free decoder_backward locals.
+    // dL_dV/dL_dU/dL_dx are gradient buffers consumed by SGD step above —
+    // updated_model captures new_V/new_U/new_emb; the gradient temps are
+    // dead. new_blocks (reversed-order list) was copied into blocks_ordered;
+    // safe to free its skin (DecoderBlockW entries inside still alive in
+    // blocks_ordered, but list spine itself is throwaway).
+    free_array(dL_dV)
+    free_array(dL_dU)
+    free_array(dL_dx)
+    free_array(new_blocks)
 
     return BackwardResult { model: updated_model, loss: ce_loss }
 }
@@ -3325,6 +3400,29 @@ fn train_step(state: TrainState, model: DecoderModel, ds: TokenDataset) -> Train
         qc: qc_next,
         phi_q_norm: phi_q_norm
     }
+
+    // r5-a10.5-A (rt#32-O, 2026-04-20): end-of-step explicit cleanup.
+    // Free large intermediates that are no longer referenced beyond this
+    // point — block_hs (~13 × seq*d), fwd.logits/mid/hidden, bwd grads,
+    // logits_last, input/target tokens. Hexa has no GC and each of these
+    // is a heap-malloc'd HexaVal items buffer (12.6 MB at seq=512 d=768).
+    // Caller (train_loop) only consumes new_state + bwd.model + scalars;
+    // these are all that needs to survive return.
+    let mut _bh_i = 0
+    while _bh_i < len(fwd.block_hs) {
+        free_array(fwd.block_hs[_bh_i])
+        _bh_i = _bh_i + 1
+    }
+    free_array(fwd.block_hs)
+    free_array(fwd.logits)
+    free_array(fwd.mid)
+    free_array(fwd.hidden)
+    free_array(logits_last)
+    free_array(input_tokens)
+    free_array(target_tokens)
+    // Note: BackwardResult only carries model + loss (scalar) — the
+    // dL_d* gradient temporaries are decoder_backward locals; freed
+    // there in §F (see decoder_backward end-of-fn cleanup).
 
     return TrainStepResult {
         state: new_state,
