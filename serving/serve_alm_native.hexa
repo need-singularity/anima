@@ -71,7 +71,11 @@ use "voice_routes"
 use "hire_routes"
 
 // ─── Runtime feature gate ──────────────────────────────────────────
-let RUNTIME_HAS_NET  = false   // flip when net_listen builtin lands
+// net_listen / net_accept / net_read / net_write / net_close landed in
+// hexa runtime 2026-04-16 (self/native/net.c + self/runtime.c:6330). Verified
+// end-to-end 2026-04-20 (curl echo smoke): stage0 interp accepts TCP, reads
+// HTTP request, writes full response, closes cleanly. Flipping the gate.
+let RUNTIME_HAS_NET  = true    // net_* primitives live in hexa_stage0 runtime
 let RUNTIME_HAS_CUDA = false   // flip when hxqwen14b v5 CUDA kernels land
 
 // ─── Constants ─────────────────────────────────────────────────────
@@ -801,31 +805,87 @@ fn main() {
         println("")
         println("NOTE: net_listen builtin missing in current hexa runtime.")
         println("      Real socket loop is gated behind RUNTIME_HAS_NET=true.")
-        println("      Today: scaffold only. Dispatch + AN11 shape verified.")
-        println("")
-        println("To bring online on pod:")
-        println("  1. Land net_listen/accept/read/write/close in hexa runtime")
-        println("  2. Build libhxqwen14b.so with CUDA v5 (A1+Orch+Tool fuse)")
-        println("  3. Flip RUNTIME_HAS_NET = RUNTIME_HAS_CUDA = true")
-        println("  4. hexa run serving/serve_alm_native.hexa --port 8090")
-        println("  5. curl -sX POST :8090/alm/persona -d '{\"persona\":\"friend\",\"prompt\":\"hi.\"}'")
         return
     }
 
-    // Future: once net builtins land —
-    //   let listener = net_listen("0.0.0.0:" + to_string(SAN_DEFAULT_PORT))
-    //   let cm = san_chain_merge_load(san_chain_merge_new())
-    //   let mut state = san_state_new(SAN_DEFAULT_PORT, cm.model_h)
-    //   loop {
-    //     let conn = net_accept(listener)
-    //     let raw = net_read(conn)
-    //     let req = parse_http_request(raw)
-    //     let resp = san_route(req.method, req.path, req.body, state)
-    //     state = state with { last_phi_holo: resp.state_phi,
-    //                          requests_served: state.requests_served + 1 }
-    //     net_write(conn, build_http_response(resp.status, resp.body))
-    //     net_close(conn)
-    //   }
+    // ── Real socket serve loop (net_* builtins available) ─────────────
+    // Primitives live in hexa-lang self/native/net.c (included from
+    // self/runtime.c). Single-request-per-connection model: read up to
+    // 4096B, parse HTTP request line + body, dispatch through san_route,
+    // write status line + Content-Length + body, close.
+    //
+    // Not using self/std_net.hexa's http_serve — it hard-codes
+    // "HTTP/1.1 200 OK" regardless of handler return, whereas san_route
+    // returns a SanResponse with real status codes (400/404 paths).
+    let cm_real = san_chain_merge_load(san_chain_merge_new())
+    if !cm_real.loaded {
+        println("FAIL chain-merge load")
+        return
+    }
+    let mut state = san_state_new(SAN_DEFAULT_PORT, cm_real.model_h)
+
+    let addr = "0.0.0.0:" + to_string(SAN_DEFAULT_PORT)
+    let listener = net_listen(addr)
+    if listener < 0 {
+        println("FAIL net_listen " + addr + " errno=" + to_string(-listener))
+        return
+    }
+    println("[serve_alm_native] LISTEN " + addr + " (fd=" + to_string(listener) + ")")
+    println("[serve_alm_native] weight_origin=" + SAN_WEIGHT_ORIGIN)
+    println("[serve_alm_native] serving — Ctrl-C to stop")
+
+    while true {
+        let conn = net_accept(listener)
+        if conn < 0 {
+            println("accept errno=" + to_string(-conn))
+            continue
+        }
+        let raw = net_read(conn)
+        // Minimal HTTP parse using .index_of() / .substring() (stage0 method
+        // shape verified 2026-04-20; fn-form string_split/string_slice not
+        // available in current interpreter, hence method dispatch).
+        let method_s = "GET"
+        let path_s = "/"
+        let body_s = ""
+        let rn = raw.index_of("\r\n")
+        if rn >= 0 {
+            let req_line = raw.substring(0, rn)
+            let sp1 = req_line.index_of(" ")
+            if sp1 >= 0 {
+                method_s = req_line.substring(0, sp1)
+                let rest = req_line.substring(sp1 + 1, len(req_line))
+                let sp2 = rest.index_of(" ")
+                if sp2 >= 0 {
+                    path_s = rest.substring(0, sp2)
+                } else {
+                    path_s = rest
+                }
+            }
+        }
+        let hdr_end = raw.index_of("\r\n\r\n")
+        if hdr_end >= 0 {
+            body_s = raw.substring(hdr_end + 4, len(raw))
+        }
+
+        let resp = san_route(method_s, path_s, body_s, state)
+        let status_line = if resp.status == 200 { "HTTP/1.1 200 OK" }
+                          else if resp.status == 400 { "HTTP/1.1 400 Bad Request" }
+                          else if resp.status == 404 { "HTTP/1.1 404 Not Found" }
+                          else { "HTTP/1.1 500 Internal Server Error" }
+        let http = status_line + "\r\n" +
+                   "Content-Type: application/json\r\n" +
+                   "Content-Length: " + to_string(len(resp.body)) + "\r\n" +
+                   "Connection: close\r\n\r\n" + resp.body
+        net_write(conn, http)
+        net_close(conn)
+
+        state = SanServerState {
+            model_handle:    state.model_handle,
+            port:            state.port,
+            requests_served: state.requests_served + 1,
+            last_phi_holo:   resp.state_phi
+        }
+    }
 }
 
 main()
