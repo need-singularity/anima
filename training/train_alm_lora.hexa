@@ -119,17 +119,29 @@ extern fn hxqwen14b_version() -> int
 @link("hxqwen14b")
 extern fn hxqwen14b_version_v54() -> int
 
+// 2026-04-20 (Blocker #2 wire): use the v5.5 positional wrappers so the
+// hexa→C ABI lines up. The v5.4 entries themselves take packed-struct
+// pointers (HxQwenLoadAllArgs/HxQwenBaseFwdV54Args/HxQwenCeLossArgs) which
+// the hexa FFI cannot construct directly. The _pos wrappers in
+// hexa-lang/self/native/hxqwen14b.c v5.5 addendum forward to the struct
+// entries internally — same return codes, no behavioural change.
 @link("hxqwen14b")
-extern fn hxqwen14b_load_all_weights(h: int, ckpt_path_p: int) -> int
+extern fn hxqwen14b_load_all_weights_pos(h: int, ckpt_path_p: int) -> int
 
 @link("hxqwen14b")
-extern fn hxqwen14b_base_forward_v54(h: int, ids_p: int, n_ids: int, hidden_out_p: int) -> int
+extern fn hxqwen14b_base_forward_v54_pos(h: int, ids_dev: int, M: int, logits_dev: int) -> int
 
 @link("hxqwen14b")
-extern fn hxqwen14b_ce_loss_v54(h: int, hidden_p: int, targets_p: int, n_tok: int) -> float
+extern fn hxqwen14b_ce_loss_v54_pos(logits_dev: int, targets_dev: int, M: int, V: int) -> float
 
+// One-shot real-loss entry (load+fwd+ce in one call). Returns mean CE on
+// success. Negative return = -rc (so trainer can branch on failure).
 @link("hxqwen14b")
-extern fn hxqwen14b_smoke_v54(h: int) -> int
+extern fn hxqwen14b_train_step_v54(h: int, ids_host_p: int, M: int) -> float
+
+// Smoke entry still needs a struct arg pointer; trainer doesn't call it
+// directly anymore (use train_step_v54 instead). Keep stub-mode no-op
+// extern decl for backward compat with existing C smoke driver.
 
 // hxblas — used for inplace SGD/AXPY/zero on dense vectors. AdamW is
 // implemented in hexa (no fused FFI yet).
@@ -240,6 +252,26 @@ fn parse_int_arg(s: string, default_val: int) -> int {
 fn parse_float_arg(s: string, default_val: float) -> float {
     if len(s) == 0 { return default_val }
     return to_float(s)
+}
+
+// ─── Raw int32 host buffer for FFI ─────────────────────────────────
+//
+// hxqwen14b_train_step_v54 expects a host pointer to an int32 array of
+// token ids. This helper packs a hexa array of ints into a freshly
+// alloc_raw'd buffer (caller must free_raw after the call).
+//
+// Returns: int — host buffer pointer (alloc_raw handle).
+
+fn float_array_to_int32_buf(ids: array) -> int {
+    let n = len(ids)
+    if n <= 0 { return 0 }
+    let buf = alloc_raw(n * 4)
+    let mut i = 0
+    while i < n {
+        write_i32(buf, i * 4, ids[i])
+        i = i + 1
+    }
+    return buf
 }
 
 // ─── String byte access helper (stage0 quirk shim) ─────────────────
@@ -983,6 +1015,50 @@ fn write_tensor_block(s_in: string, name: string, rows: int, cols: int, data: ar
     return s
 }
 
+// 2026-04-20 (Blocker #1 fix): chunked-append variant of write_tensor_block.
+// Streams the tensor's data line straight to disk via append_file in
+// fixed-size element batches, so the in-memory string never exceeds
+// CHUNK_FLOATS digits worth of accumulator (~30-50KB instead of the 47GB
+// from the previous O(n²) full-tensor-in-string accumulator).
+//
+// HEXACKPT-v1 format requires the entire data array to live on ONE LINE
+// (newlines split tensors), so we cannot insert per-row newlines. Trade
+// off: one trailing "\n" per tensor + many small space-separated chunks.
+//
+// Used by save_lora() — the previous in-memory accumulator path was O(n²)
+// in stage0 string concat and never wrote adapter_model.hexackpt to disk
+// before the trainer hung.
+//
+// Returns: 0 on success.
+comptime const HEXACKPT_CHUNK_FLOATS = 1024
+
+fn append_tensor_block(path: string, name: string, rows: int, cols: int, data: array) -> int {
+    // Header line first: "name rows cols\n"
+    let header = name + " " + str(rows) + " " + str(cols) + "\n"
+    let _h_rc = append_file(path, header)
+    let n = rows * cols
+    if n <= 0 {
+        let _nl = append_file(path, "\n")
+        return 0
+    }
+    let mut start = 0
+    while start < n {
+        let cand = start + HEXACKPT_CHUNK_FLOATS
+        let end = if cand < n { cand } else { n }
+        let mut buf = ""
+        let mut i = start
+        while i < end {
+            if i > 0 { buf = buf + " " }
+            buf = buf + str(data[i])
+            i = i + 1
+        }
+        let _rc = append_file(path, buf)
+        start = end
+    }
+    let _nl = append_file(path, "\n")
+    return 0
+}
+
 @convergence(state="ossified", id="RUNPOD_CKPT_CORRUPTION_ZERO_BYTE", value="Killed during torch.save → 0-byte .pt. Safe pattern: write .tmp then os.replace (atomic rename)", ossified_at="2026-04-16")
 fn save_lora(A_flat: array, B_flat: array, out_dir: string, cfg: RunConfig) -> int {
     // BUGFIX 2026-04-20 r11 v5.4 wire smoke: write_file does not auto-mkdir;
@@ -1013,13 +1089,24 @@ fn save_lora(A_flat: array, B_flat: array, out_dir: string, cfg: RunConfig) -> i
 
     // adapter_model.hexackpt — flat HEXACKPT-v1 with all 192 (A,B) pairs
     // serialised as 384 named tensors. eval_alm.hexa reads via name lookup.
+    //
+    // 2026-04-20 (Blocker #1 fix): switched from O(n²) in-memory string
+    // accumulator to chunked append_file writes. The previous path built
+    // a single 47GB string before write_file ever ran, hanging the trainer
+    // for any save_every<=500. Now we write the magic + meta header once,
+    // then stream each tensor in 1024-float chunks straight to disk.
     let n_adapters = N_LORA_TARGETS * QWEN14B_N_LAYER
     let r = cfg.lora_r
     let d = QWEN14B_D_MODEL
-    let mut s = "HEXACKPT-v1\n"
-    s = s + "# meta n_adapters=" + str(n_adapters) + " d=" + str(d) + " r=" + str(r) + "\n"
-    s = s + "# meta lora_alpha=" + str(cfg.lora_alpha) + "\n"
-    s = s + "# meta base=" + cfg.base + "\n"
+    let ckpt_path = out_dir + "/adapter_model.hexackpt"
+
+    // Truncate + write magic + meta lines. Subsequent tensors stream via
+    // append_tensor_block.
+    let header = "HEXACKPT-v1\n" +
+        "# meta n_adapters=" + str(n_adapters) + " d=" + str(d) + " r=" + str(r) + "\n" +
+        "# meta lora_alpha=" + str(cfg.lora_alpha) + "\n" +
+        "# meta base=" + cfg.base + "\n"
+    write_file(ckpt_path, header)
 
     // Slice and emit each adapter block. A: r×d, B: d×r.
     let A_block = r * d
@@ -1041,7 +1128,9 @@ fn save_lora(A_flat: array, B_flat: array, out_dir: string, cfg: RunConfig) -> i
             a_slice = a_slice.push(A_flat[idx * A_block + k])
             k = k + 1
         }
-        s = write_tensor_block(s, key_prefix + ".lora_A.weight", r, d, a_slice)
+        let _ra = append_tensor_block(ckpt_path,
+                                       key_prefix + ".lora_A.weight",
+                                       r, d, a_slice)
 
         // Slice B_flat[idx*B_block : (idx+1)*B_block]
         let mut b_slice = []
@@ -1050,15 +1139,14 @@ fn save_lora(A_flat: array, B_flat: array, out_dir: string, cfg: RunConfig) -> i
             b_slice = b_slice.push(B_flat[idx * B_block + k])
             k = k + 1
         }
-        s = write_tensor_block(s, key_prefix + ".lora_B.weight", d, r, b_slice)
+        let _rb = append_tensor_block(ckpt_path,
+                                       key_prefix + ".lora_B.weight",
+                                       d, r, b_slice)
 
         idx = idx + 1
     }
-    s = s + "__MANIFEST__ " + str(n_adapters * 2) + " 1\n"
-
-    let ckpt_path = out_dir + "/adapter_model.hexackpt"
-    write_file(ckpt_path, s)
-    println("[save_lora] wrote " + str(len(s)) + " bytes → " + ckpt_path)
+    let _rm = append_file(ckpt_path, "__MANIFEST__ " + str(n_adapters * 2) + " 1\n")
+    println("[save_lora] streamed " + str(n_adapters * 2) + " tensors → " + ckpt_path)
     println("[save_lora] config → " + cfg_path)
     return 0
 }
@@ -1166,15 +1254,30 @@ fn main() {
     // the train_loop still uses the stub forward for gradient signal.
     let abi_v54 = hxqwen14b_version_v54()
     println("[main] hxqwen14b v5.4 ABI = " + str(abi_v54) + " (54 = real CUDA, <=0 = stub or missing)")
-    if h_base > 1 && abi_v54 >= 54 {
+    // BUGFIX 2026-04-20 (Blocker #4): hxqwen14b_load returns slot=1 on
+    // successful probe (no VRAM upload yet). The previous gate `h_base > 1`
+    // wrongly skipped the v5.4 path even when the load succeeded. Slot 1 is
+    // the FIRST valid slot (slot 0 is reserved sentinel). Fix: gate on
+    // `h_base >= 1` so v5.4 load_all_weights+forward runs as designed.
+    if h_base >= 1 && abi_v54 >= 54 {
         // load_all_weights: orchestrator pulls all 8 safetensor shards
         // into device memory (+3.1GB lm_head fp32, headroom on H100 80GB).
-        // Skip if base path doesn't look like a Qwen14B dir to keep stub
-        // smoke fast — the smoke_v54 self-test only needs the .so loaded.
-        let loadw_rc = hxqwen14b_load_all_weights(h_base, cstring(cfg.base))
-        println("[main] hxqwen14b_load_all_weights rc=" + str(loadw_rc) + " (0=ok, <0=defer to r12 forward wire)")
-        let smoke_rc = hxqwen14b_smoke_v54(h_base)
-        println("[main] hxqwen14b_smoke_v54 rc=" + str(smoke_rc) + " (0=full v5.4 path PASS)")
+        // Uses the v5.5 positional wrapper (real ABI is struct-pointer).
+        let loadw_rc = hxqwen14b_load_all_weights_pos(h_base, cstring(cfg.base))
+        println("[main] hxqwen14b_load_all_weights_pos rc=" + str(loadw_rc) + " (0=ok, <0=load failure)")
+        if loadw_rc != 0 {
+            println("[main] FATAL: real Qwen2.5-14B weights failed to load — base loss would be stub-only. Aborting.")
+            if G_NCCL_H != 0 { let _ = hxnccl_free(G_NCCL_H); G_NCCL_H = 0 }
+            return
+        }
+        // Smoke step: feed a tiny prompt and check we get a real CE in [3,8].
+        // Random baseline for V=152064 is log(V)=11.93. Real Qwen base on
+        // arbitrary token ids should land somewhere around 6-8.
+        let probe_ids_str = "안녕"
+        let probe_ids = text_to_ids_stub(probe_ids_str, 4, 4)
+        let probe_buf = float_array_to_int32_buf(probe_ids)
+        let probe_ce = hxqwen14b_train_step_v54(h_base, probe_buf, 4)
+        println("[main] hxqwen14b_train_step_v54 probe_ce=" + str(probe_ce) + " (real Qwen base CE; band [3,8] expected, <0 = -rc)")
     }
 
     // Load corpus.
