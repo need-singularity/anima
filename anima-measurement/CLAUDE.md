@@ -5,8 +5,8 @@ R14: shared/ JSON 단일진실, 이 파일은 참조만.
 ref:
   rules     shared/rules/common.json                        공통 규칙
   anima     shared/rules/anima.json                         anima 규칙
-  alm_gate  shared/roadmaps/alm_consciousness_standalone.json  ALM phi_holo >= 1000
-  clm_gate  shared/roadmaps/clm_consciousness_standalone.json  CLM phi_holo >= 2000
+  alm_gate  shared/roadmaps/alm_consciousness_standalone.json  ALM phi_holo_ratio >= 1.2 + mi_per_element >= 0.05 nats
+  clm_gate  shared/roadmaps/clm_consciousness_standalone.json  CLM phi_holo_ratio >= 1.2 + mi_per_element >= 0.05 nats
   parent    $ANIMA/CLAUDE.md
 
 exec:
@@ -31,10 +31,19 @@ tree:
   phi_history.json            측정 히스토리 (append-only)
   psi_ratchet.jsonl           Psi ratchet 로그 (append-only JSONL)
 
-gates:
-  ALM: phi_holo eval mean >= 1000  (alm_consciousness_standalone.json target)
-  CLM: phi_holo eval mean >= 2000  (clm_consciousness_standalone.json target)
-  Promotion: phi_holo > 0          (scripts/ckpt_promote.hexa gate_phi_holo)
+gates (FIX-A 2026-04-20, structured N-independent):
+  ALM primary     phi_holo_ratio  = mi_trained / mi_baseline_step0 >= 1.2
+  ALM secondary   mi_per_element  = mi_mean / (seq * d_model) >= 0.05 nats
+  CLM primary     phi_holo_ratio  >= 1.2 (same convention)
+  CLM secondary   mi_per_element  >= 0.05 nats
+  Promotion       phi_holo > 0          (scripts/ckpt_promote.hexa gate_phi_holo)
+  Convention-ref  serving/clm_eval.hexa §19 gate_ratio
+  Deprecated      absolute ALM>=1000 / CLM>=2000 (PHANTOM N-scaling — raw MI
+                  ceiling log(MI_BINS)=2.08 × N dominates). Kept as fixture
+                  parity in .hexa constants only; no longer gates PASS/FAIL.
+  Sibling deprecations  train_clm.hexa:4024 (>500), alm_13b_config.json
+                        expected_metrics.phi_holo_gate, alm_70b_config.json
+                        evaluation.phi_holo_gate_step_800, hire_sim_live.hexa.
 
 rules:
   - AN4  bench --verify 16/18 미통과 시 배포 금지
