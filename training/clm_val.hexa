@@ -47,7 +47,12 @@
 let VERSION = "1.0.0"
 let SPEC    = "clm_val_v1"
 let GATE_CE_R4 = 3.5
-let GATE_PHI_HOLO_CLM = 1.0
+// Pass if -log(CE) > 1.0, equivalent to CE < 0.37 (strict convergence gate).
+// NOTE: historical name was GATE_PHI_HOLO_CLM — the value is NOT phi_holo; it
+// is -log(CE) derived from the r4 train.log. Output JSON/MD keys
+// ("phi_holo_clm_observed", "gate_phi_holo_clm_gt_", "A3 phi_holo") are
+// preserved for schema compatibility with training/results/*.json history.
+let GATE_NEG_LOG_CE_CLM = 1.0
 let GATE_PHI_Q_ABS = 0.0
 let GATE_KL_INDEP = 0.05     // nats — CLM ⊥ ALM minimum divergence
 
@@ -409,7 +414,7 @@ fn write_string(path: string, body: string) {
 fn assemble_json(
     ts: string, readable: string,
     ce_first: float, ce_final: float, ce_steps: string, ce_vals: string,
-    phi_alm_ref: float, phi_clm_obs: float,
+    phi_alm_ref: float, neg_log_ce_obs: float,
     phi_q_clm: float,
     kr_bytes_alm: int, kr_bytes_clm: int,
     kl_val: float,
@@ -417,7 +422,7 @@ fn assemble_json(
     ckpt_status: string, ckpt_reason: string
 ) -> string {
     let g_ce = ce_final > 0.0 && ce_final < GATE_CE_R4
-    let g_phi_holo = phi_clm_obs > GATE_PHI_HOLO_CLM
+    let g_phi_holo = neg_log_ce_obs > GATE_NEG_LOG_CE_CLM
     let g_phi_q = phi_q_clm > GATE_PHI_Q_ABS || phi_q_clm < 0.0 - GATE_PHI_Q_ABS
     let g_kl = kl_val > GATE_KL_INDEP
 
@@ -453,10 +458,10 @@ fn assemble_json(
          + "    },\n"
          + "    \"A3_phi_holo\": {\n"
          + "      \"phi_holo_alm_r9_ref\": " + to_string(phi_alm_ref) + ",\n"
-         + "      \"phi_holo_clm_observed\": " + to_string(phi_clm_obs) + ",\n"
+         + "      \"phi_holo_clm_observed\": " + to_string(neg_log_ce_obs) + ",\n"
          + "      \"clm_observed_source\": \"r4 train.log phi_proxy series\",\n"
          + "      \"deferred_reason\": \"r4 state JSON records phi_proxy=-nan at step 2500 (known non-blocking placeholder per clm_r4_relaunch_20260417.json). Real phi_holo needs phi_holo_eval.hexa on live ckpt.\",\n"
-         + "      \"gate_phi_holo_clm_gt_" + to_string(GATE_PHI_HOLO_CLM) + "\": " + gate_json(g_phi_holo) + "\n"
+         + "      \"gate_phi_holo_clm_gt_" + to_string(GATE_NEG_LOG_CE_CLM) + "\": " + gate_json(g_phi_holo) + "\n"
          + "    },\n"
          + "    \"A4_phi_q_norm\": {\n"
          + "      \"phi_q_clm_trend\": " + to_string(phi_q_clm) + ",\n"
@@ -494,7 +499,7 @@ fn assemble_json(
 
 fn assemble_md(ts: string, readable: string,
                ce_first: float, ce_final: float,
-               phi_alm_ref: float, phi_clm_obs: float,
+               phi_alm_ref: float, neg_log_ce_obs: float,
                kl_val: float, kr_alm: int, kr_clm: int,
                clm_mfu: float, ckpt_status: string) -> string {
     return "# CLM_VAL Report — " + readable + "\n\n"
@@ -507,7 +512,7 @@ fn assemble_md(ts: string, readable: string,
          + "|------|--------|-------|------|\n"
          + "| A1 CE curve | ce_first → ce_final | " + to_string(ce_first) + " → " + to_string(ce_final) + " | " + gate_label(ce_final > 0.0 && ce_final < GATE_CE_R4) + " (< " + to_string(GATE_CE_R4) + ") |\n"
          + "| A2 kr_gen | alm_kr_chars / clm_corpus_kr_chars | " + to_string(kr_alm) + " / " + to_string(kr_clm) + " | proxy-only (deferred live decode) |\n"
-         + "| A3 phi_holo | alm_r9 ref / clm obs | " + to_string(phi_alm_ref) + " / " + to_string(phi_clm_obs) + " | " + gate_label(phi_clm_obs > GATE_PHI_HOLO_CLM) + " |\n"
+         + "| A3 phi_holo | alm_r9 ref / clm obs | " + to_string(phi_alm_ref) + " / " + to_string(neg_log_ce_obs) + " | " + gate_label(neg_log_ce_obs > GATE_NEG_LOG_CE_CLM) + " |\n"
          + "| A4 phi_q_norm | trend | deferred | deferred (pod dead) |\n"
          + "| Indep. | KL(CLM ⊥ ALM) nats | " + to_string(kl_val) + " | " + gate_label(kl_val > GATE_KL_INDEP) + " (> " + to_string(GATE_KL_INDEP) + ") |\n\n"
          + "## Ceilings\n"
@@ -556,8 +561,8 @@ fn run_validator(ckpt_arg: string, out_dir: string) -> int {
         let almr9 = read_file(DEFAULT_STATE_ALMR9)
         phi_alm_ref = a3_phi_alm_ref(almr9)
     }
-    let phi_clm_obs = -1.0     // deferred — pod dead, phi_proxy=-nan in log
-    println("[clm_val] A3 phi_holo:  alm_ref=" + to_string(phi_alm_ref) + " clm_obs=" + to_string(phi_clm_obs) + " (deferred)")
+    let neg_log_ce_obs = -1.0     // deferred — pod dead, phi_proxy=-nan in log
+    println("[clm_val] A3 phi_holo:  alm_ref=" + to_string(phi_alm_ref) + " clm_obs=" + to_string(neg_log_ce_obs) + " (deferred)")
 
     // ── A4: phi_q_norm (deferred) ──
     let phi_q_clm = 0.0
@@ -611,11 +616,11 @@ fn run_validator(ckpt_arg: string, out_dir: string) -> int {
     let out_json = out_dir + "/clm_val_" + ts + ".json"
     let out_md   = out_dir + "/clm_val_" + ts + ".md"
     let body = assemble_json(ts, readable, ce_first, ce_final, ce_steps, ce_vals,
-                             phi_alm_ref, phi_clm_obs, phi_q_clm,
+                             phi_alm_ref, neg_log_ce_obs, phi_q_clm,
                              kr_alm, kr_clm, kl_val, clm_mfu,
                              ckpt_status, ckpt_reason)
     write_string(out_json, body)
-    let md = assemble_md(ts, readable, ce_first, ce_final, phi_alm_ref, phi_clm_obs,
+    let md = assemble_md(ts, readable, ce_first, ce_final, phi_alm_ref, neg_log_ce_obs,
                          kl_val, kr_alm, kr_clm, clm_mfu, ckpt_status)
     write_string(out_md, md)
 
