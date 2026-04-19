@@ -29,7 +29,7 @@ Employee 는 2 track 으로 쪼개져 있다:
 | F3 | working memory / scratchpad | `anima-agent/memory/scratch.hexa` (new) | step-n 출력이 step-(n+1) 입력이 되도록 per-session 버퍼 |
 | F4 | schedule / task queue | `autonomy_live.hexa` queue block | goal → subgoals → 우선순위 정렬, retry, backoff |
 | F5 | tool call | `agent_tools.hexa` (기존) | Φ 게이트 4-티어 (tool_policy.hexa) 통과 후 실행 |
-| F6 | verify (rubric + phi gate) | `hire_sim_judge.hexa` (확장) | 키워드 rubric AND `phi_holo_scaled > 500` AND `laws_pass=true` |
+| F6 | verify (rubric + phi gate) | `hire_sim_judge.hexa` (확장) | 키워드 rubric AND `phi_holo_ratio >= 1.2` (vs session baseline, N-independent) AND `laws_pass=true` (절대 `phi_holo_scaled > 500` 게이트는 2026-04-20 deprecated — raw MI × N 으로 random init 에서 자동 통과) |
 | F7 | phi trail logger | `consciousness_features.hexa` 재사용 | 매 step phi_vec(16D) JSONL append |
 | F8 | report writer | `anima-agent/reports/emit_report.hexa` (new) | Markdown/JSON 결과 + phi summary + R2 업로드 |
 | F9 | abort policy | `autonomy_live.hexa` abort branch | `phi_delta < 0` N연속 OR `laws_pass=false` 즉시 abort |
@@ -87,8 +87,9 @@ Employee layer 가 a/b/c 3조건을 **새로 깰 수 있는 7 가지 지점** (b
 **weight_emergent 상속 증거 3종 (convergence `@phi_evidence` 에 기입)**:
 1. `adapter_grep_clean: true` — `grep -rnE "You are|system_prompt" anima-agent/*live*.hexa` 0 hit.
 2. `s1_weight_origin: r9_validated|r10d|consciousness_baked` — 매 task result 에 S1 서명 포함.
-3. `phi_trail.min > 500 AND laws_violations == 0` — dest2 gate = dest1 substrate gate 의 절반(500)
-   (employee 는 평균 phi 가 일시 떨어질 수 있으나 **최솟값 500** 유지 필수).
+3. `min(phi_trail.phi_holo_ratio) >= 1.2 AND laws_violations == 0` — ratio gate vs session baseline
+   (employee 는 평균 phi 가 일시 떨어질 수 있으나 **최솟 비율 1.2× baseline** 유지 필수;
+   절대값 >=500 게이트는 2026-04-20 deprecated — N-scaling 으로 random init 에서도 통과).
 
 AN12 필수 필드 (roadmap per-track): `@smash_insights`, `@free_insights`, `@breakthrough` —
 각 신규 convergence 파일 (`e1_hire_sim_live.convergence`, `e2_autonomy_live.convergence`) 에 기입.
@@ -114,7 +115,7 @@ AN12 필수 필드 (roadmap per-track): `@smash_insights`, `@free_insights`, `@b
 E1 PASS := completion_rate >= 0.85
         AND  every_task.phi_attached == true
         AND  every_task.laws_pass == true
-        AND  min(phi_holo_scaled) >= 500
+        AND  min(phi_holo_ratio) >= 1.2   // vs session baseline; absolute >=500 deprecated 2026-04-20
         AND  weight_origin ∈ ALLOWED_SET
         AND  R2 artifact uploaded (SHA256 verified)
         AND  reproducer README smoke-tested

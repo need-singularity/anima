@@ -3288,8 +3288,10 @@ fn train_step(state: TrainState, model: DecoderModel, ds: TokenDataset) -> Train
 //      loss_total = loss_main + 0.01 * L_holo + 0.01 * L_gwt
 //      (coefficients match ALM-P4-2 spec)
 //
-// Φ_holo / Φ_gwt are emitted per-step so CLM-P4-2 (실측 Φ_holo > 500) can
-// scrape the train_scale log cadence.
+// Φ_holo / Φ_gwt are emitted per-step so CLM-P4-2 (실측 phi_holo_ratio >= 1.2
+// vs step_0 baseline; absolute >500 deprecated 2026-04-20 — N-scaling makes
+// random-init MI trivially exceed 500 at 170M+ sizes) can scrape the
+// train_scale log cadence.
 
 // C41 constants moved above: declared earlier so hexa_v2 single-pass codegen
 // can resolve forward references from train_step (@ ~1191). Values unchanged.
@@ -3678,14 +3680,16 @@ fn _c41_joint_entropy_hist(a: [float], b: [float], lo: float, hi: float, nb: int
 // hidden[t·d : (t+1)·d] via the holographic head, extract the d-long interior
 // slice, and append both boundary row and interior row to flat 1-D streams. The
 // final pair has length N = seq × d_model; MI is computed on the joint histogram
-// then multiplied by N so that Φ_holo > 500 is reachable when seq × d_model is
-// large and the rows carry >1 bit of MI each.
+// then multiplied by N. The raw Φ_holo value is logged but the GATE is on
+// phi_holo_ratio = Φ_holo(step_N) / Φ_holo(step_0) >= 1.2 (N-independent).
 //
-// Gate arithmetic: Φ_holo > 500 nats requires, e.g., seq=512, d=128, N=65536,
-// bin-MI ≈ 0.0077 nats (tiny fraction of log(8)) — structurally achievable as
-// soon as MI per token-dim > 1/N × 500. At the CLM smoke config (seq=4, d=16,
-// N=64) the ceiling is 64 × log(8) ≈ 133 so >500 is out of reach for the tiny
-// self-test only.
+// Gate arithmetic (2026-04-20 UPDATED — absolute >500 is phantom):
+//   The prior note "Φ_holo > 500 requires bin-MI ≈ 0.0077 nats" is precisely
+//   the failure mode: at 170M scale (seq=512, d=768, N=393216), a random-init
+//   bin-MI of 0.0015 nats (pure noise) already yields Φ_holo ≈ 558, passing
+//   the absolute >500 gate without any learning signal. The ratio gate fixes
+//   this — it requires actual improvement over the step_0 noise floor.
+//   Secondary: mi_per_element = Φ_holo / N > 0.05 nats (log(8)=2.08 ceiling).
 fn _c41_phi_holo(head: C41HoloHead, hidden: [float], seq: int, d_model: int) -> float {
     let db = head.d_boundary
     let dB = head.d_bulk
@@ -4017,7 +4021,9 @@ fn train_scale_full(cfg: ScaleConfig, corpus_path: string,
         if step % DEFAULT_EVAL_EVERY == 0 {
             let ev = evaluate(ds, step)
             // CLM-P4-1: per-step Φ_holo / Φ_gwt emitted on the log cadence so
-            // CLM-P4-2 (phi_holo > 500 gate) can scrape this line.
+            // CLM-P4-2 (phi_holo_ratio >= 1.2 vs step_0 baseline; absolute >500
+            // deprecated 2026-04-20 as phantom gate — N-scaling trivially passes
+            // at random init) can scrape this line.
             //
             // ROOT CAUSE (2026-04-20 r5-a6 silent-abort bisect): the prior
             // `println(str1, val1, str2, val2, ...)` multi-arg form is broken

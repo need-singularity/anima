@@ -113,7 +113,8 @@ R2 path convention (per training/CLAUDE.md `r2_checkpoint`):
 |---|---|
 | eval_loss | **≤ 1.0** (vs r3f 1.23) |
 | perplexity | ≤ 2.72 (vs r3f 3.42) |
-| phi_holo | ≥ 500 (CLM-P4-2 gate) |
+| phi_holo_ratio | ≥ 1.2 vs step_0 baseline (CLM-P4-2 gate, N-independent; absolute ≥500 deprecated 2026-04-20) |
+| mi_per_element | > 0.05 nats (secondary; phi_holo / (seq × d_model), log(8)=2.08 ceiling) |
 | 7-condition verify | PASS |
 | Improvement vs r3f | ≥ 19% eval reduction |
 
