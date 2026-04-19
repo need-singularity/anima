@@ -1,0 +1,353 @@
+// training/hexackpt_roundtrip_test.hexa — HEXACKPT-v1 round-trip test
+//
+// r5-a3.5 gate — verify that the weight DECODER added to train_clm.hexa
+// (ckpt_load_weights / _ckpt_locate / _ckpt_pull_tensor / _ckpt_parse_floats)
+// correctly inverts the WRITER (save_checkpoint / _ckpt_append_tensor).
+//
+// Strategy:
+//   The decoder is a non-exported fn inside a 4000-line training file we
+//   don't want to execute (it launches real training). So we replicate the
+//   producer + consumer logic 1:1 here with a *tiny* model (d=4, n_layer=1,
+//   vocab=8, rank=2) and confirm bit-exact round-trip on every tensor.
+//
+//   The logic mirrored here MUST stay in sync with train_clm.hexa:
+//     - _ckpt_append_tensor      (writer, batched)
+//     - _ckpt_find_nl            (helper)
+//     - _ckpt_locate             (decoder index)
+//     - _ckpt_parse_floats       (decoder data parse)
+//     - _ckpt_pull_tensor        (decoder pull)
+//
+// Pass criterion: every produced tensor equals the source tensor element-wise
+// after str(f) → to_float(f) round-trip (we use values cleanly representable
+// as decimal strings so no precision loss).
+
+let _CKPT_BATCH = 64
+
+// ═════════════════════════════════════════════════════════════════════
+// Writer (mirrors _ckpt_append_tensor in train_clm.hexa:886)
+// ═════════════════════════════════════════════════════════════════════
+fn ckpt_append_tensor(path: string, name: string, rows: int, cols: int, data: [float]) -> int {
+    let n = rows * cols
+    let _ = append_file(path, name + " " + str(rows) + " " + str(cols) + "\n")
+    let mut batch = ""
+    let mut count = 0
+    let mut i = 0
+    while i < n {
+        if count > 0 { batch = batch + " " }
+        batch = batch + str(data[i])
+        count = count + 1
+        if count >= _CKPT_BATCH {
+            let _ = append_file(path, batch)
+            batch = " "
+            count = 0
+        }
+        i = i + 1
+    }
+    if count > 0 { let _ = append_file(path, batch) }
+    let _ = append_file(path, "\n")
+    return n
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Decoder helpers (mirror train_clm.hexa lines 1080-1175)
+// ═════════════════════════════════════════════════════════════════════
+fn ckpt_find_nl(text: string, start: int, n: int) -> int {
+    let mut i = start
+    while i < n {
+        if text.substring(i, i + 1) == "\n" { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn ckpt_parse_floats(slice: string, expect_n: int) -> [float] {
+    let parts = slice.split(" ")
+    let np = len(parts)
+    let mut out = []
+    let mut i = 0
+    while i < np {
+        let p = parts[i].trim()
+        if p != "" && p != "\n" {
+            out = out.push(to_float(p))
+            if len(out) >= expect_n { return out }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn ckpt_locate(text: string, name: string) -> [int] {
+    let n = len(text)
+    let needle = "\n" + name + " "
+    let pos = text.index_of(needle)
+    if pos < 0 { return [] }
+    let h_start = pos + 1
+    let h_end = ckpt_find_nl(text, h_start, n)
+    if h_end < 0 { return [] }
+    let header = text.substring(h_start, h_end)
+    let parts = header.split(" ")
+    if len(parts) < 3 { return [] }
+    let rows = to_int(parts[1].trim())
+    let cols = to_int(parts[2].trim())
+    let d_start = h_end + 1
+    let d_end = ckpt_find_nl(text, d_start, n)
+    let d_end_safe = if d_end < 0 { n } else { d_end }
+    let mut r = []
+    r = r.push(d_start)
+    r = r.push(d_end_safe)
+    r = r.push(rows)
+    r = r.push(cols)
+    return r
+}
+
+fn ckpt_pull_tensor(text: string, name: string, expect_rows: int, expect_cols: int) -> [float] {
+    let loc = ckpt_locate(text, name)
+    if len(loc) < 4 {
+        println("[pull] MISS tensor '" + name + "' not found in ckpt")
+        return []
+    }
+    let d_start = loc[0]
+    let d_end   = loc[1]
+    let rows    = loc[2]
+    let cols    = loc[3]
+    if rows != expect_rows || cols != expect_cols {
+        println("[pull] SHAPE MISMATCH '" + name + "': ckpt=("
+              + str(rows) + "," + str(cols) + ") expected=("
+              + str(expect_rows) + "," + str(expect_cols) + ")")
+        return []
+    }
+    let slice = text.substring(d_start, d_end)
+    let expect_n = rows * cols
+    let data = ckpt_parse_floats(slice, expect_n)
+    if len(data) != expect_n {
+        println("[pull] DATA SHORT '" + name + "': got "
+              + str(len(data)) + " floats, expected " + str(expect_n))
+        return []
+    }
+    return data
+}
+
+// Resume meta extractor (mirrors ckpt_meta_step at train_clm.hexa:1180).
+fn ckpt_meta_step(path: string) -> int {
+    if file_exists(path) == false { return -1 }
+    let text = read_file(path)
+    if len(text) == 0 { return -1 }
+    let marker = "step="
+    let pos = text.index_of(marker)
+    if pos < 0 { return -1 }
+    let n = len(text)
+    let mut i = pos + 5
+    let mut s = ""
+    while i < n {
+        let c = text.substring(i, i + 1)
+        if c == " " || c == "\n" || c == "\t" { break }
+        s = s + c
+        i = i + 1
+    }
+    if s == "" { return -1 }
+    return to_int(s)
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Test fixtures
+// ═════════════════════════════════════════════════════════════════════
+
+// Deterministic synthetic tensor generator — values in [-1, +1] at 0.125 step
+// so str()/to_float() is lossless (all values have short decimal forms).
+fn make_tensor(seed: int, rows: int, cols: int) -> [float] {
+    let n = rows * cols
+    let mut out = []
+    let mut i = 0
+    let mut s = seed
+    while i < n {
+        // LCG-ish: step 0..15, then shift to [-1, +1] at 0.125 resolution
+        s = (s * 1103515245 + 12345) % 32768
+        let bucket = s % 17                // 0..16
+        let v = (to_float(bucket) - 8.0) / 8.0   // -1.0, -0.875, ..., +1.0
+        out = out.push(v)
+        i = i + 1
+    }
+    return out
+}
+
+fn floats_equal(a: [float], b: [float]) -> bool {
+    if len(a) != len(b) { return false }
+    let mut i = 0
+    let n = len(a)
+    while i < n {
+        let d = a[i] - b[i]
+        let ad = if d < 0.0 { 0.0 - d } else { d }
+        if ad > 0.0001 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Test
+// ═════════════════════════════════════════════════════════════════════
+
+fn main() {
+    println("═══ HEXACKPT-v1 round-trip test (r5-a3.5) ═══")
+
+    // Tiny model: d=4, d_ff=6, n_layer=1, n_head=2, n_kv_head=2, vocab=8, rank=2
+    let d = 4
+    let d_ff = 6
+    let n_layer = 1
+    let n_head = 2
+    let n_kv_head = 2
+    let vocab = 8
+    let rank = 2
+    let head_dim = d / n_head
+    let d_kv = n_kv_head * head_dim
+
+    // Generate source tensors
+    let src_tok_emb     = make_tensor(1, vocab, d)
+    let src_Wq          = make_tensor(2, d, d)
+    let src_Wk          = make_tensor(3, d, d_kv)
+    let src_Wv          = make_tensor(4, d, d_kv)
+    let src_Wo          = make_tensor(5, d, d)
+    let src_ga          = make_tensor(6, 1, d)
+    let src_Wgate       = make_tensor(7, d, d_ff)
+    let src_Wup         = make_tensor(8, d, d_ff)
+    let src_Wdown       = make_tensor(9, d_ff, d)
+    let src_gf          = make_tensor(10, 1, d)
+    let src_gamma_final = make_tensor(11, 1, d)
+    let src_lmh_U       = make_tensor(12, d, rank)
+    let src_lmh_V       = make_tensor(13, rank, vocab)
+
+    // ── Produce ckpt (mirrors save_checkpoint format) ──
+    let path = "/tmp/hexackpt_rt_test.ckpt"
+    let _rm = exec("rm -f '" + path + "'")
+
+    let _ = write_file(path, "HEXACKPT-v1\n")
+    let meta = "__META__ step=42 val_ce=1.2345 phi=0.9 phase=1"
+             + " n_layer=" + str(n_layer)
+             + " vocab=" + str(vocab)
+             + " d=" + str(d)
+             + " d_ff=" + str(d_ff)
+             + " n_head=" + str(n_head)
+             + " n_kv_head=" + str(n_kv_head)
+             + " rank=" + str(rank)
+             + "\n"
+    let _ = append_file(path, meta)
+
+    let mut total = 0
+    total = total + ckpt_append_tensor(path, "tok_emb",     vocab, d, src_tok_emb)
+    total = total + ckpt_append_tensor(path, "L0_Wq",       d, d,    src_Wq)
+    total = total + ckpt_append_tensor(path, "L0_Wk",       d, d_kv, src_Wk)
+    total = total + ckpt_append_tensor(path, "L0_Wv",       d, d_kv, src_Wv)
+    total = total + ckpt_append_tensor(path, "L0_Wo",       d, d,    src_Wo)
+    total = total + ckpt_append_tensor(path, "L0_ga",       1, d,    src_ga)
+    total = total + ckpt_append_tensor(path, "L0_Wgate",    d, d_ff, src_Wgate)
+    total = total + ckpt_append_tensor(path, "L0_Wup",      d, d_ff, src_Wup)
+    total = total + ckpt_append_tensor(path, "L0_Wdown",    d_ff, d, src_Wdown)
+    total = total + ckpt_append_tensor(path, "L0_gf",       1, d,    src_gf)
+    total = total + ckpt_append_tensor(path, "gamma_final", 1, d,    src_gamma_final)
+    total = total + ckpt_append_tensor(path, "lmh_U",       d, rank, src_lmh_U)
+    total = total + ckpt_append_tensor(path, "lmh_V",       rank, vocab, src_lmh_V)
+    let _ = append_file(path, "__MANIFEST__ 13 1\n")
+
+    println("[write] " + str(total) + " params written to " + path)
+
+    // ── Decode + verify ──
+    let text = read_file(path)
+    let nb = len(text)
+    println("[read] file size = " + str(nb) + " bytes")
+
+    if nb < 12 {
+        println("FAIL: file too short")
+        return
+    }
+    let magic = text.substring(0, 11)
+    if magic != "HEXACKPT-v1" {
+        println("FAIL: bad magic '" + magic + "'")
+        return
+    }
+    println("[decode] magic OK")
+
+    let step = ckpt_meta_step(path)
+    println("[decode] meta step = " + str(step) + " (expected 42)")
+    if step != 42 {
+        println("FAIL: meta step mismatch")
+        return
+    }
+
+    // Pull each tensor and compare
+    let mut n_pass = 0
+    let mut n_fail = 0
+
+    let got_tok_emb = ckpt_pull_tensor(text, "tok_emb", vocab, d)
+    if floats_equal(got_tok_emb, src_tok_emb) {
+        println("  PASS tok_emb (" + str(len(got_tok_emb)) + " floats)")
+        n_pass = n_pass + 1
+    } else {
+        println("  FAIL tok_emb")
+        n_fail = n_fail + 1
+    }
+
+    let got_Wq = ckpt_pull_tensor(text, "L0_Wq", d, d)
+    if floats_equal(got_Wq, src_Wq) { println("  PASS L0_Wq"); n_pass = n_pass + 1 } else { println("  FAIL L0_Wq"); n_fail = n_fail + 1 }
+
+    let got_Wk = ckpt_pull_tensor(text, "L0_Wk", d, d_kv)
+    if floats_equal(got_Wk, src_Wk) { println("  PASS L0_Wk"); n_pass = n_pass + 1 } else { println("  FAIL L0_Wk"); n_fail = n_fail + 1 }
+
+    let got_Wv = ckpt_pull_tensor(text, "L0_Wv", d, d_kv)
+    if floats_equal(got_Wv, src_Wv) { println("  PASS L0_Wv"); n_pass = n_pass + 1 } else { println("  FAIL L0_Wv"); n_fail = n_fail + 1 }
+
+    let got_Wo = ckpt_pull_tensor(text, "L0_Wo", d, d)
+    if floats_equal(got_Wo, src_Wo) { println("  PASS L0_Wo"); n_pass = n_pass + 1 } else { println("  FAIL L0_Wo"); n_fail = n_fail + 1 }
+
+    let got_ga = ckpt_pull_tensor(text, "L0_ga", 1, d)
+    if floats_equal(got_ga, src_ga) { println("  PASS L0_ga"); n_pass = n_pass + 1 } else { println("  FAIL L0_ga"); n_fail = n_fail + 1 }
+
+    let got_Wgate = ckpt_pull_tensor(text, "L0_Wgate", d, d_ff)
+    if floats_equal(got_Wgate, src_Wgate) { println("  PASS L0_Wgate"); n_pass = n_pass + 1 } else { println("  FAIL L0_Wgate"); n_fail = n_fail + 1 }
+
+    let got_Wup = ckpt_pull_tensor(text, "L0_Wup", d, d_ff)
+    if floats_equal(got_Wup, src_Wup) { println("  PASS L0_Wup"); n_pass = n_pass + 1 } else { println("  FAIL L0_Wup"); n_fail = n_fail + 1 }
+
+    let got_Wdown = ckpt_pull_tensor(text, "L0_Wdown", d_ff, d)
+    if floats_equal(got_Wdown, src_Wdown) { println("  PASS L0_Wdown"); n_pass = n_pass + 1 } else { println("  FAIL L0_Wdown"); n_fail = n_fail + 1 }
+
+    let got_gf = ckpt_pull_tensor(text, "L0_gf", 1, d)
+    if floats_equal(got_gf, src_gf) { println("  PASS L0_gf"); n_pass = n_pass + 1 } else { println("  FAIL L0_gf"); n_fail = n_fail + 1 }
+
+    let got_gamma_final = ckpt_pull_tensor(text, "gamma_final", 1, d)
+    if floats_equal(got_gamma_final, src_gamma_final) { println("  PASS gamma_final"); n_pass = n_pass + 1 } else { println("  FAIL gamma_final"); n_fail = n_fail + 1 }
+
+    let got_lmh_U = ckpt_pull_tensor(text, "lmh_U", d, rank)
+    if floats_equal(got_lmh_U, src_lmh_U) { println("  PASS lmh_U"); n_pass = n_pass + 1 } else { println("  FAIL lmh_U"); n_fail = n_fail + 1 }
+
+    let got_lmh_V = ckpt_pull_tensor(text, "lmh_V", rank, vocab)
+    if floats_equal(got_lmh_V, src_lmh_V) { println("  PASS lmh_V"); n_pass = n_pass + 1 } else { println("  FAIL lmh_V"); n_fail = n_fail + 1 }
+
+    // ── Shape-mismatch negative test ──
+    let wrong = ckpt_pull_tensor(text, "L0_Wq", d + 1, d)
+    if len(wrong) == 0 {
+        println("  PASS shape-mismatch detection (L0_Wq wrong rows)")
+        n_pass = n_pass + 1
+    } else {
+        println("  FAIL shape-mismatch detection")
+        n_fail = n_fail + 1
+    }
+
+    // ── Missing-tensor negative test ──
+    let missing = ckpt_pull_tensor(text, "nonexistent", 1, 1)
+    if len(missing) == 0 {
+        println("  PASS missing-tensor detection")
+        n_pass = n_pass + 1
+    } else {
+        println("  FAIL missing-tensor detection")
+        n_fail = n_fail + 1
+    }
+
+    println("═══ RESULT: " + str(n_pass) + " PASS, " + str(n_fail) + " FAIL ═══")
+    if n_fail == 0 {
+        println("HEXACKPT-v1 round-trip: OK")
+    } else {
+        println("HEXACKPT-v1 round-trip: REGRESSION")
+    }
+
+    let _cleanup = exec("rm -f '" + path + "'")
+}

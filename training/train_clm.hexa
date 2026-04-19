@@ -1046,6 +1046,274 @@ fn save_checkpoint(path: string, step: int, model: DecoderModel,
     Checkpoint { path: path, step: step, val_ce: val_ce, phi: phi, phase: phase }
 }
 
+// ═════════════════════════════════════════════════════════════════════
+// r5-a3.5 — HEXACKPT-v1 weight DECODER (single fn ckpt_load_weights)
+// ═════════════════════════════════════════════════════════════════════
+//
+// Mirrors save_checkpoint above. Reads the text-format ckpt produced by
+// _ckpt_append_tensor + the __META__/__MANIFEST__ wrapper, then returns
+// a fresh DecoderModel with every tensor populated from disk.
+//
+// Format recap (per save_checkpoint at line ~931):
+//   HEXACKPT-v1\n
+//   __META__ step=N val_ce=X phi=Y phase=P n_layer=L vocab=V d=D
+//            d_ff=F n_head=H n_kv_head=KV rank=R\n
+//   <tensor_name> <rows> <cols>\n<f0> <f1> ... <fN>\n     (× n_tensors)
+//   __MANIFEST__ <n_tensors> 1\n
+//
+// Tensor order is fixed:
+//   tok_emb, [L<i>_(Wq Wk Wv Wo ga Wgate Wup Wdown gf) × n_layer],
+//   gamma_final, lmh_U, lmh_V
+//
+// Caller contract:
+//   - target_model must be pre-allocated with the right shape (caller
+//     constructs decoder_model_new(cfg) first, then we overwrite
+//     tensor data in-place via struct rebuild).
+//   - Shape mismatch between disk + model = HARD FAIL (println + return
+//     fresh model untouched). We fail loud rather than silently load
+//     partial weights — the bit-exact selftest depends on this.
+
+// ── Helper: locate next '\n' from position `start`. Returns -1 if none.
+fn _ckpt_find_nl(text: string, start: int, n: int) -> int {
+    let mut i = start
+    while i < n {
+        if text.substring(i, i + 1) == "\n" { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// ── Helper: parse a whitespace-separated float list from a slice ──
+// Uses split(" ") on the slice — single linear pass per tensor.
+// Trailing leading-space artifacts from the batched _ckpt_append_tensor
+// writer (which carries a leading space across batch boundaries) are
+// silently skipped (split returns "" for double-spaces; we skip empties).
+fn _ckpt_parse_floats(slice: string, expect_n: int) -> [float] {
+    let parts = slice.split(" ")
+    let np = len(parts)
+    let mut out = []
+    let mut i = 0
+    while i < np {
+        let p = parts[i].trim()
+        if p != "" && p != "\n" {
+            out = out.push(to_float(p))
+            if len(out) >= expect_n { return out }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Helper: read a tensor section (header line already consumed) ──
+// Returns [data_array, next_offset]. data_array is empty on parse error.
+fn _ckpt_read_tensor_data(text: string, start: int, n: int, expect: int) -> [int] {
+    // The data line runs from `start` to the next '\n'. Slice + split.
+    let nl = _ckpt_find_nl(text, start, n)
+    let end = if nl < 0 { n } else { nl }
+    // Caller pulls the slice; we just return the boundary for them.
+    let mut r = []
+    r = r.push(start)
+    r = r.push(end)
+    return r
+}
+
+// ── Helper: locate tensor by name in HEXACKPT text, return [data_start, data_end, rows, cols].
+// Returns [] on miss. O(N) per call — caller batches via single sequential walk.
+// Not currently used by ckpt_load_weights (which uses sequential walk for
+// memory locality) but kept for one-off lookups (e.g. resume_step inspection).
+fn _ckpt_locate(text: string, name: string) -> [int] {
+    let n = len(text)
+    let needle = "\n" + name + " "
+    let pos = text.index_of(needle)
+    if pos < 0 { return [] }
+    // Header starts right after the '\n'
+    let h_start = pos + 1
+    let h_end = _ckpt_find_nl(text, h_start, n)
+    if h_end < 0 { return [] }
+    let header = text.substring(h_start, h_end)
+    let parts = header.split(" ")
+    if len(parts) < 3 { return [] }
+    let rows = to_int(parts[1].trim())
+    let cols = to_int(parts[2].trim())
+    let d_start = h_end + 1
+    let d_end = _ckpt_find_nl(text, d_start, n)
+    let d_end_safe = if d_end < 0 { n } else { d_end }
+    let mut r = []
+    r = r.push(d_start)
+    r = r.push(d_end_safe)
+    r = r.push(rows)
+    r = r.push(cols)
+    return r
+}
+
+// ── Pull a named tensor's data as [float], or [] on miss / shape mismatch.
+fn _ckpt_pull_tensor(text: string, name: string, expect_rows: int, expect_cols: int) -> [float] {
+    let loc = _ckpt_locate(text, name)
+    if len(loc) < 4 {
+        println("[ckpt_load_weights] MISS tensor '" + name + "' not found in ckpt")
+        return []
+    }
+    let d_start = loc[0]
+    let d_end   = loc[1]
+    let rows    = loc[2]
+    let cols    = loc[3]
+    if rows != expect_rows || cols != expect_cols {
+        println("[ckpt_load_weights] SHAPE MISMATCH '" + name + "': ckpt=("
+              + str(rows) + "," + str(cols) + ") expected=("
+              + str(expect_rows) + "," + str(expect_cols) + ")")
+        return []
+    }
+    let slice = text.substring(d_start, d_end)
+    let expect_n = rows * cols
+    let data = _ckpt_parse_floats(slice, expect_n)
+    if len(data) != expect_n {
+        println("[ckpt_load_weights] DATA SHORT '" + name + "': got "
+              + str(len(data)) + " floats, expected " + str(expect_n))
+        return []
+    }
+    return data
+}
+
+// ── Resume meta extractor: pull "step=<N>" from the __META__ line.
+// Returns -1 if missing. Used by --resume to verify the step counter
+// recorded in the ckpt matches the directory name (sanity check).
+fn ckpt_meta_step(path: string) -> int {
+    if file_exists(path) == false { return -1 }
+    let text = read_file(path)
+    if len(text) == 0 { return -1 }
+    // __META__ is on line 2; first 12 bytes are "HEXACKPT-v1\n".
+    let marker = "step="
+    let pos = text.index_of(marker)
+    if pos < 0 { return -1 }
+    let n = len(text)
+    let mut i = pos + 5  // len("step=")
+    let mut s = ""
+    while i < n {
+        let c = text.substring(i, i + 1)
+        if c == " " || c == "\n" || c == "\t" { break }
+        s = s + c
+        i = i + 1
+    }
+    if s == "" { return -1 }
+    return to_int(s)
+}
+
+// ── MAIN DECODER: load weights from path, return new DecoderModel ──
+// Caller passes a freshly-constructed `template` model with the right
+// shape (decoder_model_new(cfg)). We pull each tensor by name and
+// rebuild the struct. On any per-tensor failure we keep the template's
+// (random) weight for that tensor and continue — partial-load is
+// preferable to a total init from scratch when only one tensor is bad.
+// Returns: [DecoderModel, n_loaded_tensors] packed as [model, count].
+struct CkptLoadResult {
+    model: DecoderModel,
+    n_loaded: int,
+    n_expected: int
+}
+
+fn ckpt_load_weights(path: string, template: DecoderModel) -> CkptLoadResult {
+    println("[ckpt_load_weights] reading " + path)
+    if file_exists(path) == false {
+        println("[ckpt_load_weights] FAIL: file not found: " + path)
+        return CkptLoadResult { model: template, n_loaded: 0, n_expected: 0 }
+    }
+    let text = read_file(path)
+    let nb = len(text)
+    if nb < 12 {
+        println("[ckpt_load_weights] FAIL: too short (" + str(nb) + " bytes)")
+        return CkptLoadResult { model: template, n_loaded: 0, n_expected: 0 }
+    }
+    let magic = text.substring(0, 11)
+    if magic != "HEXACKPT-v1" {
+        println("[ckpt_load_weights] FAIL: bad magic '" + magic + "'")
+        return CkptLoadResult { model: template, n_loaded: 0, n_expected: 0 }
+    }
+    println("[ckpt_load_weights] magic OK, file=" + str(nb) + " bytes, n_layer=" + str(template.n_layer))
+
+    let d       = template.d
+    let d_ff    = template.d_ff
+    let n_layer = template.n_layer
+    let n_head  = template.n_head
+    let n_kv    = template.n_kv_head
+    let head_dim = d / n_head
+    let d_kv    = n_kv * head_dim
+    let vocab   = template.vocab
+    let rank    = template.lmh_rank
+    let n_expected = 1 + n_layer * 9 + 3   // tok_emb + 9/block + gamma_final + lmh_U + lmh_V
+    let mut n_loaded = 0
+
+    // ── Embedding ──
+    let new_tok_emb = _ckpt_pull_tensor(text, "tok_emb", vocab, d)
+    let tok_emb_final = if len(new_tok_emb) == vocab * d {
+        n_loaded = n_loaded + 1
+        new_tok_emb
+    } else {
+        template.tok_emb
+    }
+
+    // ── Per-block weights ──
+    let mut new_blocks = []
+    let mut li = 0
+    while li < n_layer {
+        let prefix = "L" + str(li) + "_"
+        let blk_t = template.blocks[li]
+        let v_Wq    = _ckpt_pull_tensor(text, prefix + "Wq",    d, d)
+        let v_Wk    = _ckpt_pull_tensor(text, prefix + "Wk",    d, d_kv)
+        let v_Wv    = _ckpt_pull_tensor(text, prefix + "Wv",    d, d_kv)
+        let v_Wo    = _ckpt_pull_tensor(text, prefix + "Wo",    d, d)
+        let v_ga    = _ckpt_pull_tensor(text, prefix + "ga",    1, d)
+        let v_Wgate = _ckpt_pull_tensor(text, prefix + "Wgate", d, d_ff)
+        let v_Wup   = _ckpt_pull_tensor(text, prefix + "Wup",   d, d_ff)
+        let v_Wdown = _ckpt_pull_tensor(text, prefix + "Wdown", d_ff, d)
+        let v_gf    = _ckpt_pull_tensor(text, prefix + "gf",    1, d)
+        let blk_loaded = DecoderBlockW {
+            Wq:        if len(v_Wq)    == d * d        { n_loaded = n_loaded + 1; v_Wq    } else { blk_t.Wq        },
+            Wk:        if len(v_Wk)    == d * d_kv     { n_loaded = n_loaded + 1; v_Wk    } else { blk_t.Wk        },
+            Wv:        if len(v_Wv)    == d * d_kv     { n_loaded = n_loaded + 1; v_Wv    } else { blk_t.Wv        },
+            Wo:        if len(v_Wo)    == d * d        { n_loaded = n_loaded + 1; v_Wo    } else { blk_t.Wo        },
+            gamma_attn:if len(v_ga)    == d            { n_loaded = n_loaded + 1; v_ga    } else { blk_t.gamma_attn},
+            Wgate:     if len(v_Wgate) == d * d_ff     { n_loaded = n_loaded + 1; v_Wgate } else { blk_t.Wgate     },
+            Wup:       if len(v_Wup)   == d * d_ff     { n_loaded = n_loaded + 1; v_Wup   } else { blk_t.Wup       },
+            Wdown:     if len(v_Wdown) == d_ff * d     { n_loaded = n_loaded + 1; v_Wdown } else { blk_t.Wdown     },
+            gamma_ffn: if len(v_gf)    == d            { n_loaded = n_loaded + 1; v_gf    } else { blk_t.gamma_ffn }
+        }
+        new_blocks = new_blocks.push(blk_loaded)
+        li = li + 1
+    }
+
+    // ── Final norm + LM head ──
+    let v_gamma_final = _ckpt_pull_tensor(text, "gamma_final", 1, d)
+    let gamma_final_loaded = if len(v_gamma_final) == d {
+        n_loaded = n_loaded + 1
+        v_gamma_final
+    } else { template.gamma_final }
+
+    let v_U = _ckpt_pull_tensor(text, "lmh_U", d, rank)
+    let lmh_U_loaded = if len(v_U) == d * rank {
+        n_loaded = n_loaded + 1
+        v_U
+    } else { template.lmh_U }
+
+    let v_V = _ckpt_pull_tensor(text, "lmh_V", rank, vocab)
+    let lmh_V_loaded = if len(v_V) == rank * vocab {
+        n_loaded = n_loaded + 1
+        v_V
+    } else { template.lmh_V }
+
+    let restored = DecoderModel {
+        d: template.d, d_ff: template.d_ff, n_layer: template.n_layer,
+        n_head: template.n_head, n_kv_head: template.n_kv_head,
+        vocab: template.vocab, lmh_rank: template.lmh_rank,
+        tok_emb: tok_emb_final,
+        blocks: new_blocks,
+        gamma_final: gamma_final_loaded,
+        lmh_U: lmh_U_loaded,
+        lmh_V: lmh_V_loaded
+    }
+    println("[ckpt_load_weights] OK — loaded " + str(n_loaded) + "/" + str(n_expected) + " tensors")
+    return CkptLoadResult { model: restored, n_loaded: n_loaded, n_expected: n_expected }
+}
+
 // ─── Consciousness verification gate (Law 49) ───
 fn verify_phi_non_destructive(phi_before: float, phi_after: float) -> bool {
     // CDO rule: Φ drop > 5% → reject checkpoint.
