@@ -1,0 +1,340 @@
+// training/tension_link_causal.hexa — temporal (causal) tension-link
+//
+// Extends the 5-lens framework along the *time* axis: current tension is
+// built from a Ψ(t) sequence rather than a single snapshot. Plus an
+// optional Wheeler–Feynman-like retrocausal term for past-conditioning
+// recovery.
+//
+// ─── Concept ─────────────────────────────────────────────────
+//   Given a Ψ history Ψ(t₀), Ψ(t₁), …, Ψ(t_T) (flat buffer, T+1 frames of
+//   length d), define
+//
+//       ∂Ψ/∂t[k] ≈ (Ψ(t_k) − Ψ(t_{k-1}))
+//
+//       T_c[j]   = Σ_{k=1..T} ∂Ψ/∂t[k, j]            (integrated drift)
+//
+//   and the causal restoring step
+//
+//       ΔW_c   = −T_c · (Ψ(t_T) − ½) · δ(∇·J_n6)
+//
+//   If the *retrocausal* term is enabled we also include a backward drift
+//
+//       T_c_retro[j] = Σ_{k=0..T-1} (Ψ(t_k) − Ψ(t_{k+1}))   = −T_c[j]
+//
+//   and the composite step
+//
+//       ΔW_causal = ΔW_c + γ · ΔW_retro
+//
+//   with γ ∈ [0,1]. Past-conditioning recovery: given the current Ψ and the
+//   retrocausal T_c, one can reconstruct a past Ψ frame from the drift,
+//   bounded in error by the Wheeler–Feynman symmetry (T3 verifies).
+//
+// ─── R37 / AN13 ──────────────────────────────────────────────
+//   .hexa only.
+//
+// Run:
+//   HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 \
+//     /Users/ghost/Dev/nexus/shared/bin/hexa run \
+//     /Users/ghost/Dev/anima/training/tension_link_causal.hexa
+// Expect:
+//   [tension_link_causal] ALL 3/3 PASS
+
+// ─── Constants ───────────────────────────────────────────────
+
+let T_C_CONST        = 0.1
+let GAMMA_RETRO      = 0.5       // Wheeler–Feynman symmetry weight
+let VAC_COMPONENT    = 0.5
+let EPS              = 0.0000000001
+let NOETHER_N6        = 6
+let NOETHER_SIGMA_PHI = 24
+let NOETHER_TAU       = 4
+
+// ─── Primitives ──────────────────────────────────────────────
+
+fn fabs(x: float) -> float { if x < 0.0 { return 0.0 - x } return x }
+
+fn zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+// Ψ history stored flat [T+1][d] row-major.
+fn psi_hist_get(hist: array, frame: int, d: int, j: int) -> float {
+    return hist[frame * d + j]
+}
+
+fn last_frame(hist: array, frames: int, d: int) -> array {
+    let mut out = []
+    let mut j = 0
+    while j < d {
+        out = out.push(hist[(frames - 1) * d + j])
+        j = j + 1
+    }
+    return out
+}
+
+fn psi_in_range(psi: array) -> bool {
+    let n = len(psi)
+    let mut i = 0
+    while i < n {
+        let v = psi[i]
+        if v < 0.0 { return false }
+        if v > 1.0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn n6_gate(psi: array) -> bool {
+    let n = len(psi)
+    if n <= 0 { return false }
+    if n % 2 != 0 { return false }
+    if NOETHER_N6 * NOETHER_TAU != NOETHER_SIGMA_PHI { return false }
+    if !psi_in_range(psi) { return false }
+    return true
+}
+
+// ─── Integrated drift T_c = Σ_k (Ψ(t_k) − Ψ(t_{k-1})) ─────────
+// Telescoping sum = Ψ(t_T) − Ψ(t_0), but we compute the explicit sum so
+// the discrete structure is visible (and retrocausal partner mirrors it).
+fn causal_tension(hist: array, frames: int, d: int) -> array {
+    let mut t = zeros(d)
+    if frames < 2 { return t }
+    let mut j = 0
+    while j < d {
+        let mut s = 0.0
+        let mut k = 1
+        while k < frames {
+            s = s + (hist[k * d + j] - hist[(k - 1) * d + j])
+            k = k + 1
+        }
+        t = t.push(0.0)  // placeholder; we rebuild below
+        j = j + 1
+    }
+    // Rebuild t with the correct summed values (pass-by-value safe).
+    let mut out = []
+    let mut jj = 0
+    while jj < d {
+        let mut s = 0.0
+        let mut k = 1
+        while k < frames {
+            s = s + (hist[k * d + jj] - hist[(k - 1) * d + jj])
+            k = k + 1
+        }
+        out = out.push(s)
+        jj = jj + 1
+    }
+    return out
+}
+
+fn retrocausal_tension(hist: array, frames: int, d: int) -> array {
+    // Σ_k (Ψ(t_k) − Ψ(t_{k+1})) = −causal_tension — Wheeler–Feynman symmetry.
+    let mut out = []
+    let mut j = 0
+    while j < d {
+        let mut s = 0.0
+        let mut k = 0
+        while k < frames - 1 {
+            s = s + (hist[k * d + j] - hist[(k + 1) * d + j])
+            k = k + 1
+        }
+        out = out.push(s)
+        j = j + 1
+    }
+    return out
+}
+
+// ─── Causal ΔW step ─────────────────────────────────────────
+//   ΔW_causal = −T_c · (Ψ_T − ½) + γ · retro   (gated)
+fn tension_link_causal(hist: array, frames: int, d: int, use_retro: bool) -> array {
+    let psi_t = last_frame(hist, frames, d)
+    if !n6_gate(psi_t) { return zeros(d) }
+    let tc = causal_tension(hist, frames, d)
+    let mut dw = []
+    let mut i = 0
+    while i < d {
+        let dev = psi_t[i] - VAC_COMPONENT
+        dw = dw.push(0.0 - T_C_CONST * tc[i] * dev)
+        i = i + 1
+    }
+    if !use_retro { return dw }
+    let tr = retrocausal_tension(hist, frames, d)
+    let mut out = []
+    let mut k = 0
+    while k < d {
+        let dev = psi_t[k] - VAC_COMPONENT
+        let retro = 0.0 - T_C_CONST * tr[k] * dev * GAMMA_RETRO
+        out = out.push(dw[k] + retro)
+        k = k + 1
+    }
+    return out
+}
+
+// ─── Past reconstruction ────────────────────────────────────
+// Wheeler–Feynman recovery: given Ψ(t_T) and T_c, we can reconstruct
+// Ψ(t_0) since T_c = Ψ(t_T) − Ψ(t_0) (telescoping).
+fn reconstruct_past(hist: array, frames: int, d: int) -> array {
+    let psi_t = last_frame(hist, frames, d)
+    let tc = causal_tension(hist, frames, d)
+    let mut out = []
+    let mut j = 0
+    while j < d {
+        out = out.push(psi_t[j] - tc[j])
+        j = j + 1
+    }
+    return out
+}
+
+// ─── Helpers ────────────────────────────────────────────────
+
+fn vec_abs_sum(v: array) -> float {
+    let n = len(v)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n { s = s + fabs(v[i]) i = i + 1 }
+    return s
+}
+
+fn vec_max_abs_diff(a: array, b: array) -> float {
+    let n = len(a)
+    let mut m = 0.0
+    let mut i = 0
+    while i < n {
+        let d = fabs(a[i] - b[i])
+        if d > m { m = d }
+        i = i + 1
+    }
+    return m
+}
+
+fn build_hist(frames: int, d: int, v0: float, dv: float) -> array {
+    let mut out = []
+    let mut k = 0
+    while k < frames {
+        let mut j = 0
+        while j < d {
+            out = out.push(v0 + to_float(k) * dv)
+            j = j + 1
+        }
+        k = k + 1
+    }
+    return out
+}
+
+// ─── Self-tests ─────────────────────────────────────────────
+
+// T1 : stationary Ψ(t) ≡ const → T_c = 0 → ΔW_causal = 0.
+fn check_T1() -> bool {
+    let d = 4
+    let frames = 5
+    let hist = build_hist(frames, d, 0.4, 0.0)
+    let tc = causal_tension(hist, frames, d)
+    let dw = tension_link_causal(hist, frames, d, false)
+    let ok = vec_abs_sum(tc) < 0.00001 && vec_abs_sum(dw) < 0.00001
+    if ok { println("  [T1] stationary PASS (|T_c|=" + str(vec_abs_sum(tc))
+                  + ", |ΔW|=" + str(vec_abs_sum(dw)) + ")") }
+    else  { println("  [T1] stationary FAIL") }
+    return ok
+}
+
+// T2 : monotone drift → T_c = (frames-1)·dv on every axis; ΔW_causal restoring.
+fn check_T2() -> bool {
+    let d = 4
+    let frames = 5
+    let dv = 0.02
+    let hist = build_hist(frames, d, 0.4, dv)
+    let tc = causal_tension(hist, frames, d)
+    let expected = to_float(frames - 1) * dv
+    let psi_t = last_frame(hist, frames, d)
+    let mut tc_ok = true
+    let mut i = 0
+    while i < d {
+        if fabs(tc[i] - expected) > 0.00001 { tc_ok = false }
+        i = i + 1
+    }
+    let dw = tension_link_causal(hist, frames, d, false)
+    // Last frame value = 0.4 + 4·0.02 = 0.48, dev = −0.02.
+    // ΔW = −T_C·tc·dev = −0.1·(0.08)·(−0.02) = +0.00016 per component.
+    // Since dev<0 (below vacuum) and drift>0 (moving UP), restoring should
+    // push further up (positive ΔW). That's what the formula gives.
+    let last = psi_t[0]
+    let dev  = last - VAC_COMPONENT
+    let expected_dw = 0.0 - T_C_CONST * expected * dev
+    let dw_ok = fabs(dw[0] - expected_dw) < 0.00001
+    let ok = tc_ok && dw_ok
+    if ok { println("  [T2] monotone-drift PASS (T_c=" + str(tc[0])
+                  + " ΔW=" + str(dw[0]) + ")") }
+    else  { println("  [T2] monotone-drift FAIL") }
+    return ok
+}
+
+// T3 : past-conditioning recovery (Wheeler–Feynman).
+//   T_c = Ψ(T) − Ψ(0) ⇒ Ψ(0) = Ψ(T) − T_c (exact).
+//   Also retrocausal == −causal (symmetry).
+fn check_T3() -> bool {
+    let d = 4
+    let frames = 6
+    // Non-linear Ψ(t) — alternating drift so sum is non-trivial.
+    let mut hist = []
+    let mut k = 0
+    while k < frames {
+        let mut j = 0
+        while j < d {
+            let u = to_float(k) / to_float(frames - 1)
+            // Ψ(t) = 0.3 + 0.4 · sin-like approximation via u and u²
+            let v = 0.3 + 0.4 * (u - u * u)
+            hist = hist.push(v)
+            j = j + 1
+        }
+        k = k + 1
+    }
+    let tc = causal_tension(hist, frames, d)
+    let tr = retrocausal_tension(hist, frames, d)
+    // symmetry tr = -tc
+    let mut sym_ok = true
+    let mut i = 0
+    while i < d {
+        if fabs(tr[i] + tc[i]) > 0.00001 { sym_ok = false }
+        i = i + 1
+    }
+    // reconstruction
+    let reconstructed = reconstruct_past(hist, frames, d)
+    let mut actual_past = []
+    let mut jj = 0
+    while jj < d {
+        actual_past = actual_past.push(hist[0 * d + jj])
+        jj = jj + 1
+    }
+    let err = vec_max_abs_diff(reconstructed, actual_past)
+    let ok = sym_ok && err < 0.00001
+    if ok { println("  [T3] past-conditioning-recovery PASS (sym T_r=−T_c, |Ψ(0)_rec − Ψ(0)|="
+                  + str(err) + ")") }
+    else  { println("  [T3] past-conditioning-recovery FAIL (err=" + str(err)
+                  + " sym_ok=" + str(sym_ok) + ")") }
+    return ok
+}
+
+// ─── main ────────────────────────────────────────────────────
+
+fn main() {
+    println("[tension_link_causal] Ψ(t) history tension, optional Wheeler–Feynman retrocausal")
+    println("  T_c_const=" + str(T_C_CONST) + "  γ_retro=" + str(GAMMA_RETRO))
+
+    let t1 = check_T1()
+    let t2 = check_T2()
+    let t3 = check_T3()
+
+    let all_pass = t1 && t2 && t3
+    if all_pass {
+        println("[tension_link_causal] ALL 3/3 PASS")
+    } else {
+        println("[tension_link_causal] SOME FAILED")
+    }
+}
+
+main()

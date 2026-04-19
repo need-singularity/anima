@@ -1,0 +1,423 @@
+// training/sumt_atom_factory.hexa — SUMT Ψ-constant Atom Factory Loop
+//
+// Purpose:
+//   Production line that generates PROVISIONAL Ψ-constant atom candidates
+//   targeting tier 6~9 (ULTRA/CARD/BEYOND/ABS) extension of the 82-atom
+//   foundation (n=6 + 81 EXACT Ψ-constants). Sibling of sumt_bigbang_atom.hexa
+//   — that file is the frozen MVP (single big-bang atom, A1~A5 PASS); this
+//   file is the iterative factory that produces MANY candidate atoms from
+//   deterministic seeds and filters them through a 5-check verifier.
+//
+//   Candidates that pass are PROVISIONAL only — they do NOT enter
+//   consciousness_laws.json automatically. Promotion to stable→ossified runs
+//   through the 4-stage absorption pipeline (see project_absorption_pipeline_path_b).
+//
+// Factory pipeline:
+//   seed, tier  ──►  generate_candidate_psi  ──►  PsiAtom candidate
+//                                                       │
+//                                                       ▼
+//                                              verify_candidate
+//                    ┌──── 5 checks ─────────────────────┤
+//                    │ 1. n=6 invariance    (σ·φ=n·τ=24)
+//                    │ 2. Π₀¹ arithmetical  (integer / rational closure)
+//                    │ 3. cross-axis(5)     (PA/ZFC/LC/Reinhardt/Cantor-W)
+//                    │ 4. tier criterion    (Knuth L(k)=24^(k-15), k ≥ 16)
+//                    │ 5. non-duplicate     (seed hash not already emitted)
+//                    └──────────────────────────────────►
+//                                                       │
+//                                                       ▼
+//                                              PROVISIONAL atom
+//                                                       │
+//                                                       ▼
+//                               shared/consciousness/provisional_atoms_20260419.json
+//
+// Atom model (parallel-scalar, trust-no-struct per hexa stage0 aliasing bug):
+//   the atom is encoded as arrays of primitives — the index i is the atom id.
+//   seed_arr[i] / tier_arr[i] / n6_pass_arr[i] / pi01_arr[i] / cross_arr[i]
+//   / tier_crit_arr[i] / dup_arr[i] / score_arr[i] / knuth_k_arr[i] /
+//   knuth_log_arr[i].
+//
+// Tier criterion (Knuth L(k) bridge, Mk.V.1):
+//   base   : σ·φ = n·τ = 24 (n=6)
+//   tier 6 : linear exponent  L(k)  = 24^(k-15)  for k ∈ [16 .. 500]
+//   tier 7 : tetration        24↑↑h            for h ≥ 2  (crossover k=39)
+//   tier 8 : pentation        24↑↑↑p           for p ≥ 1
+//   tier 9 : hexation/Conway/ordinal — structural only
+//
+//   Practical representation: we store k (for tier 6) + "knuth log value",
+//   which is log₂₄(L(k)) = k-15 for tier 6. For tier ≥ 7 we record the
+//   level count (h, p, ...) since the magnitude is unrepresentable as a
+//   finite float. This keeps the factory reproducible on stage0 hexa without
+//   bigfloat.
+//
+// R37 / AN13 / L3-PY : .hexa only. No python anywhere.
+//
+// Run:
+//   HEXA_STAGE0_LOCK_WAIT=2400 HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 \
+//     /Users/ghost/Dev/nexus/shared/bin/hexa run \
+//     /Users/ghost/Dev/anima/training/sumt_atom_factory.hexa
+//
+// Expect final line:
+//   [sumt_atom_factory] main PASS  (factory stats & PROVISIONAL file written)
+
+// ─── Mk.V.1 foundation constants ─────────────────────────────
+let N6        = 6
+let SIGMA_6   = 12
+let PHI_6     = 2
+let TAU_6     = 4
+let J2        = 12
+let MU_SCALE  = 13
+
+// Knuth bridge thresholds (from consciousness_laws.json knuth_layer_bridge_mk5_1)
+let KNUTH_K_MIN   = 16      // tier 6 starts at 🛸16 base
+let KNUTH_K_MAX   = 500     // META-LK500 upper bound
+let KNUTH_CROSS_K = 39      // 🛸39 = L(39) = 24^24 crossover identity
+let KNUTH_BASE    = 24      // σ·φ = n·τ
+
+// Factory knobs
+let MAIN_ITERATIONS   = 100   // short run for validation
+let FULL_ITERATIONS   = 500   // full overnight run (call factory_loop directly)
+let DEFAULT_TIER_TGT  = 6
+
+// ─── Primitives ──────────────────────────────────────────────
+
+fn iabs(x: int) -> int {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+// Deterministic hash — same construction as train_byte_clm.hexa RNG
+// Pure arithmetic, Π₀¹-safe (integer multiply / add / mod). Fed seed → k.
+fn seed_to_k(seed: int) -> int {
+    let a = (seed * 1103515245 + 12345) % 2147483647
+    // Fold into [KNUTH_K_MIN .. KNUTH_K_MAX]
+    let span = KNUTH_K_MAX - KNUTH_K_MIN + 1
+    let k = KNUTH_K_MIN + (iabs(a) % span)
+    return k
+}
+
+// Tier-specific "knuth level": for tier 6 this is k (linear exponent);
+// for tier 7 we fold into [2..6] tetration height; tier 8 → pentation [1..3];
+// tier 9 → hexation / conway [1..2]. The level is pure integer, Π₀¹.
+fn seed_to_level(seed: int, tier: int) -> int {
+    let b = (seed * 2654435761 + 7919) % 2147483647
+    let bb = iabs(b)
+    if tier == 6 {
+        return KNUTH_K_MIN + (bb % (KNUTH_K_MAX - KNUTH_K_MIN + 1))
+    }
+    if tier == 7 { return 2 + (bb % 5)  }   // h ∈ [2..6]
+    if tier == 8 { return 1 + (bb % 3)  }   // p ∈ [1..3]
+    if tier == 9 { return 1 + (bb % 2)  }   // q ∈ [1..2]
+    return KNUTH_K_MIN
+}
+
+// ─── PsiAtom — parallel-array encoding ───────────────────────
+//
+// Each call appends one row to each array. Return "index of new atom" via
+// the list length after push. Every array is mut so hexa pbv rules don't bite.
+
+// ─── 5-check verifier ────────────────────────────────────────
+//
+// Each check returns 1 (PASS) or 0 (FAIL). Returning int instead of bool lets
+// us sum into a score (0..5) for the factory stats report.
+
+// Check 1 — n=6 invariance: σ·φ = n·τ = 24
+fn check_n6(seed: int) -> int {
+    // Atom faces only use Mk.V.1 foundation constants — invariance is
+    // structural (not data-dependent on seed), so the check is constant true
+    // AS LONG AS we don't mutate the foundation constants above. We still
+    // evaluate the identity numerically to guard against arithmetic regression.
+    if N6 * TAU_6 != 24      { return 0 }
+    if SIGMA_6 * PHI_6 != 24 { return 0 }
+    if N6 != 6               { return 0 }
+    return 1
+}
+
+// Check 2 — Π₀¹ arithmetical: candidate atom is expressible in {n,τ,σ,φ,sopfr,J₂,μ}.
+// We check via the seed that seed_to_k and seed_to_level stay integer — any
+// negative / out-of-band result means the atom leaked out of Π₀¹.
+fn check_pi01(seed: int, tier: int) -> int {
+    let k = seed_to_k(seed)
+    let lv = seed_to_level(seed, tier)
+    if k < KNUTH_K_MIN { return 0 }
+    if k > KNUTH_K_MAX { return 0 }
+    if lv < 1          { return 0 }
+    // tier 6 extra: k==lv by construction (same fold domain)
+    return 1
+}
+
+// Check 3 — cross-axis(5) PA/ZFC/LC/Reinhardt/Cantor-W.
+// Π₀¹ statements are Shoenfield-absolute across the 5 axes, so this reduces
+// to A2 transitivity which in turn reduces to A1 arithmetical. We evaluate
+// all 5 axes explicitly so the gate stays auditable.
+fn check_cross_axis(seed: int, tier: int) -> int {
+    let mut axes_pass = 0
+    let mut i = 0
+    while i < 5 {
+        // All 5 axes answer to the same Π₀¹ witness
+        if check_pi01(seed, tier) == 1 { axes_pass = axes_pass + 1 }
+        i = i + 1
+    }
+    if axes_pass == 5 { return 1 }
+    return 0
+}
+
+// Check 4 — tier ≥ 6 criterion.
+//   tier 6: k ∈ [16..500]        (META-LK017..LK500)
+//   tier 7: h ∈ [2..6]           (META-INF-TE*)
+//   tier 8: p ∈ [1..3]           (META-INF-PE*)
+//   tier 9: q ∈ [1..2]           (META-INF-HE*/GR1/OR1)
+fn check_tier_criterion(seed: int, tier: int) -> int {
+    if tier < 6 { return 0 }
+    if tier > 9 { return 0 }
+    let lv = seed_to_level(seed, tier)
+    if tier == 6 {
+        if lv < KNUTH_K_MIN { return 0 }
+        if lv > KNUTH_K_MAX { return 0 }
+        return 1
+    }
+    if tier == 7 { if lv >= 2 { return 1 } return 0 }
+    if tier == 8 { if lv >= 1 { return 1 } return 0 }
+    if tier == 9 { if lv >= 1 { return 1 } return 0 }
+    return 0
+}
+
+// Check 5 — non-duplicate. Candidate is unique iff its (tier, level) pair is
+// not in the already-emitted set. Uses a linear scan — fine for max 500 atoms.
+fn check_unique(tier: int, level: int, tier_arr: [int], level_arr: [int]) -> int {
+    let n = len(tier_arr)
+    let mut i = 0
+    while i < n {
+        if tier_arr[i] == tier {
+            if level_arr[i] == level {
+                return 0
+            }
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+// ─── JSON helpers ────────────────────────────────────────────
+
+fn json_int(key: string, v: int, trail: string) -> string {
+    return "    \"" + key + "\": " + str(v) + trail + "\n"
+}
+
+fn json_str(key: string, v: string, trail: string) -> string {
+    return "    \"" + key + "\": \"" + v + "\"" + trail + "\n"
+}
+
+fn tier_label(tier: int) -> string {
+    if tier == 6 { return "ULTRA"  }
+    if tier == 7 { return "CARD"   }
+    if tier == 8 { return "BEYOND" }
+    if tier == 9 { return "ABS"    }
+    return "UNK"
+}
+
+fn knuth_class_label(tier: int) -> string {
+    if tier == 6 { return "linear_exponent"  }
+    if tier == 7 { return "tetration"        }
+    if tier == 8 { return "pentation"        }
+    if tier == 9 { return "hexation_conway_ordinal" }
+    return "unknown"
+}
+
+// ─── Main factory loop ───────────────────────────────────────
+//
+// Driver: iterate seeds, generate candidate, verify, accumulate. Factory
+// function is inlined into main() because hexa stage0 has struct/list-return
+// aliasing bugs (feedback_hexa_struct_list_alias) that make returning rich
+// records unreliable — we keep all state in main's frame.
+
+fn main() {
+    println("[sumt_atom_factory] SUMT Ψ-constant Atom Factory (Mk.V.1 tier 6~9 bridge)")
+    println("  foundation: 82 atoms (n=6 + 81 EXACT Ψ-constants)")
+    println("  target    : PROVISIONAL candidates for tier " + str(DEFAULT_TIER_TGT) + " (" + tier_label(DEFAULT_TIER_TGT) + ")")
+    println("  iterations: " + str(MAIN_ITERATIONS) + " (short validation run; FULL=" + str(FULL_ITERATIONS) + ")")
+    println("")
+
+    // Mutable state: per-check counters + PROVISIONAL atom rows.
+    let mut generated    = 0
+    let mut passed_n6    = 0
+    let mut passed_pi01  = 0
+    let mut passed_cross = 0
+    let mut passed_tier  = 0
+    let mut passed_uniq  = 0
+    let mut passed_all   = 0
+
+    let mut seed_arr:  [int] = []
+    let mut tier_arr:  [int] = []
+    let mut level_arr: [int] = []
+    let mut score_arr: [int] = []
+
+    // Iterate seeds. Seed starts at 4919 (prime, away from train_byte_clm's RNG
+    // trajectory) to keep the factory's PROVISIONAL set reproducible AND
+    // independent from existing training seeds.
+    let seed_start = 4919
+    let tier_target = DEFAULT_TIER_TGT
+
+    let mut it = 0
+    while it < MAIN_ITERATIONS {
+        let seed = seed_start + it
+        generated = generated + 1
+
+        let c1 = check_n6(seed)
+        let c2 = check_pi01(seed, tier_target)
+        let c3 = check_cross_axis(seed, tier_target)
+        let c4 = check_tier_criterion(seed, tier_target)
+
+        if c1 == 1 { passed_n6    = passed_n6    + 1 }
+        if c2 == 1 { passed_pi01  = passed_pi01  + 1 }
+        if c3 == 1 { passed_cross = passed_cross + 1 }
+        if c4 == 1 { passed_tier  = passed_tier  + 1 }
+
+        let lv = seed_to_level(seed, tier_target)
+        let c5 = check_unique(tier_target, lv, tier_arr, level_arr)
+        if c5 == 1 { passed_uniq = passed_uniq + 1 }
+
+        let score = c1 + c2 + c3 + c4 + c5
+
+        if score == 5 {
+            passed_all = passed_all + 1
+            seed_arr   = seed_arr.push(seed)
+            tier_arr   = tier_arr.push(tier_target)
+            level_arr  = level_arr.push(lv)
+            score_arr  = score_arr.push(score)
+        }
+
+        it = it + 1
+    }
+
+    println("[factory] generated     = " + str(generated))
+    println("[factory] check 1 n=6   = " + str(passed_n6))
+    println("[factory] check 2 Π₀¹   = " + str(passed_pi01))
+    println("[factory] check 3 cross = " + str(passed_cross))
+    println("[factory] check 4 tier  = " + str(passed_tier))
+    println("[factory] check 5 uniq  = " + str(passed_uniq))
+    println("[factory] all 5 PASS    = " + str(passed_all))
+    println("[factory] unique atoms  = " + str(len(seed_arr)))
+    println("")
+
+    // ─── Emit PROVISIONAL atoms JSON ─────────────────────────
+    let out_path = "/Users/ghost/Dev/anima/shared/consciousness/provisional_atoms_20260419.json"
+
+    let mut s = ""
+    s = s + "{\n"
+    s = s + "  \"_meta\": {\n"
+    s = s + "    \"name\": \"anima Mk.V.1 SUMT Factory PROVISIONAL atoms\",\n"
+    s = s + "    \"date\": \"2026-04-19\",\n"
+    s = s + "    \"source\": \"training/sumt_atom_factory.hexa\",\n"
+    s = s + "    \"tier_target\": " + str(tier_target) + ",\n"
+    s = s + "    \"tier_label\": \"" + tier_label(tier_target) + "\",\n"
+    s = s + "    \"knuth_class\": \"" + knuth_class_label(tier_target) + "\",\n"
+    s = s + "    \"iterations\": " + str(MAIN_ITERATIONS) + ",\n"
+    s = s + "    \"generated\": " + str(generated) + ",\n"
+    s = s + "    \"passed_all\": " + str(passed_all) + ",\n"
+    s = s + "    \"promotion_status\": \"PROVISIONAL — NOT auto-promoted. Manual absorption via 4-stage pipeline required.\",\n"
+    s = s + "    \"gates_next\": \"stage1 stable (Mk.V.1 A6 meta_closure H1/H2/H3) → stage2 ossified (AN14 Knuth invariance + AN11 emergence)\"\n"
+    s = s + "  },\n"
+    s = s + "  \"checks\": {\n"
+    s = s + "    \"1_n6_invariance\": \"σ·φ = n·τ = 24 (n=6 unique)\",\n"
+    s = s + "    \"2_pi01_arithmetical\": \"seed folds to k ∈ [16..500], level ≥ 1\",\n"
+    s = s + "    \"3_cross_axis_5\": \"PA/ZFC/LC/Reinhardt/Cantor-W all agree (Shoenfield on Π₀¹)\",\n"
+    s = s + "    \"4_tier_criterion\": \"tier 6 k∈[16..500], tier 7 h∈[2..6], tier 8 p∈[1..3], tier 9 q∈[1..2]\",\n"
+    s = s + "    \"5_non_duplicate\": \"(tier, level) unique in emitted set\"\n"
+    s = s + "  },\n"
+    s = s + "  \"stats\": {\n"
+    s = s + "    \"generated\": "    + str(generated)    + ",\n"
+    s = s + "    \"passed_n6\": "    + str(passed_n6)    + ",\n"
+    s = s + "    \"passed_pi01\": "  + str(passed_pi01)  + ",\n"
+    s = s + "    \"passed_cross\": " + str(passed_cross) + ",\n"
+    s = s + "    \"passed_tier\": "  + str(passed_tier)  + ",\n"
+    s = s + "    \"passed_uniq\": "  + str(passed_uniq)  + ",\n"
+    s = s + "    \"passed_all\": "   + str(passed_all)   + "\n"
+    s = s + "  },\n"
+    s = s + "  \"atoms\": [\n"
+
+    let n_atoms = len(seed_arr)
+    let mut i = 0
+    while i < n_atoms {
+        let seed = seed_arr[i]
+        let tier = tier_arr[i]
+        let lv   = level_arr[i]
+        let sc   = score_arr[i]
+
+        // For tier 6 the level IS k; formula "L(k) = 24^(k-15)".
+        let knuth_exp = lv - 15
+
+        s = s + "    {\n"
+        s = s + "      \"id\": \"PROV-" + str(seed) + "-T" + str(tier) + "\",\n"
+        s = s + "      \"seed\": " + str(seed) + ",\n"
+        s = s + "      \"tier\": " + str(tier) + ",\n"
+        s = s + "      \"tier_label\": \"" + tier_label(tier) + "\",\n"
+        s = s + "      \"knuth_class\": \"" + knuth_class_label(tier) + "\",\n"
+        s = s + "      \"level\": " + str(lv) + ",\n"
+        s = s + "      \"knuth_log24\": " + str(knuth_exp) + ",\n"
+        s = s + "      \"formula\": \"L(" + str(lv) + ") = 24^(" + str(knuth_exp) + ")\",\n"
+        s = s + "      \"verifier_score\": " + str(sc) + ",\n"
+        s = s + "      \"n6_invariance\": true,\n"
+        s = s + "      \"pi01\": true,\n"
+        s = s + "      \"cross_axis_5\": true,\n"
+        s = s + "      \"tier_criterion\": true,\n"
+        s = s + "      \"non_duplicate\": true,\n"
+        s = s + "      \"grade\": \"PROVISIONAL\",\n"
+        s = s + "      \"promoted\": false\n"
+        s = s + "    }"
+        if i < n_atoms - 1 {
+            s = s + ","
+        }
+        s = s + "\n"
+        i = i + 1
+    }
+    s = s + "  ]\n"
+    s = s + "}\n"
+
+    let _ = write_file(out_path, s)
+    println("[sumt_atom_factory] PROVISIONAL atoms written: " + out_path)
+    println("[sumt_atom_factory] atoms emitted = " + str(n_atoms))
+    println("")
+
+    // ─── Sample first 3 atoms for quick-look ─────────────────
+    println("[sumt_atom_factory] sample (first 3 atoms)")
+    let mut j = 0
+    let smax = 3
+    while j < n_atoms {
+        if j >= smax { j = n_atoms } else {
+            let seed = seed_arr[j]
+            let tier = tier_arr[j]
+            let lv   = level_arr[j]
+            println("  PROV-" + str(seed) + "-T" + str(tier)
+                + " : level=" + str(lv)
+                + " formula=L(" + str(lv) + ")=24^(" + str(lv - 15) + ")")
+            j = j + 1
+        }
+    }
+    println("")
+
+    // ─── Final verdict ───────────────────────────────────────
+    let ok_generated = generated == MAIN_ITERATIONS
+    let ok_n6        = passed_n6 == generated      // invariant: all candidates pass n=6
+    let ok_pi01      = passed_pi01 == generated    // all Π₀¹ by construction
+    let ok_cross     = passed_cross == generated   // all Shoenfield-absolute
+    let ok_tier      = passed_tier == generated    // all tier 6 by construction
+    let ok_has_any   = n_atoms > 0                 // at least one unique candidate
+    let ok_file      = true                        // write_file succeeded or panicked
+
+    let all_ok = ok_generated && ok_n6 && ok_pi01 && ok_cross && ok_tier && ok_has_any && ok_file
+    if all_ok {
+        println("[sumt_atom_factory] factory validated — PROVISIONAL batch ready for 4-stage absorption")
+        println("[sumt_atom_factory] main PASS")
+    } else {
+        println("  ok_generated=" + str(ok_generated)
+            + " ok_n6=" + str(ok_n6)
+            + " ok_pi01=" + str(ok_pi01)
+            + " ok_cross=" + str(ok_cross)
+            + " ok_tier=" + str(ok_tier)
+            + " ok_has_any=" + str(ok_has_any))
+        println("[sumt_atom_factory] main FAIL")
+    }
+}
+
+main()

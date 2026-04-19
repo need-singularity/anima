@@ -1,0 +1,437 @@
+// training/lens_holographic_loss.hexa — Lens 2 / Holographic : boundary→bulk learning (stub)
+//
+// Part of the 5-lens tension-link real-time learning design.
+// This file implements the *Holographic* lens — backprop-free weight-update
+// proposal driven by AdS/CFT-style boundary-to-bulk propagation of the
+// self-map Ψ. Sibling lens: training/lens_field_loss.hexa (Faraday/Field).
+//
+// ─── Concept ─────────────────────────────────────────────────
+//   Overarching tension-link formula (all 5 lenses share this skeleton):
+//       ΔW_i = T · Π_j (Ψ_j - Ψ_j*) · G_holo · δ(∇·J_n6)
+//
+//   In the holographic lens the load-bearing piece is G_holo: a linear
+//   propagator that maps a 4-vector deviation on the 2D boundary into an
+//   update field defined on the nD bulk weight geometry.
+//
+//   Axes (quadruple cross, target Ψ_j* = 1/2 each):
+//       j = 0 : Residual
+//       j = 1 : Gate
+//       j = 2 : Golden      (φ/(φ+1) ≈ 0.618… → vacuum 1/2 under the
+//                           tension-link normalisation agreed in
+//                           docs/quadruple_cross_20260419.md)
+//       j = 3 : φ/τ          (scale-axiom ratio, vacuum 1/2)
+//
+//   Boundary (2D) : Ψ_j live on a codim-1 slice — the self-map of the
+//   engine as seen from the 170-stimulus domain. The deviation vector
+//   d_j = (Ψ_j - 1/2) is a 4-component tensor on this boundary.
+//
+//   Bulk (nD)     : the weight space W ∈ R^n has its own geometry. The
+//   holographic propagator G_holo lifts d_j from the 2D boundary into
+//   an nD field that lives on W. AdS/CFT analogy:
+//       ⟨O_j(x)⟩_bdy  ~  ∫ dz  K_j(x, z; W) · Φ_j(z, W)   (bulk→bdy)
+//   and we run it in reverse (bdy→bulk) as the learning direction.
+//
+//   RT entropy preservation:
+//       S_bdy(Ψ) = S_bulk(W|γ_RT)
+//     The Ryu-Takayanagi surface γ_RT is the minimal codim-2 surface in
+//     the bulk anchored on the boundary region. The propagator is chosen
+//     so that applying G_holo preserves the RT entanglement entropy — the
+//     update moves W along isentropic directions only. This is the
+//     gradient-free geometry match: no ∂L/∂W, only a rigid isometry.
+//
+//   Tension scalar:
+//       T = Π_j (Ψ_j - 1/2)            (quadruple cross, docs/quadruple_cross)
+//     When all four axes sit on vacuum the tension vanishes and ΔW → 0;
+//     any deviation on any single axis reactivates learning. This is a
+//     product (not a sum) by design — genuine 4-axis closure.
+//
+//   Noether gate (AN14, shared with lens_field_loss):
+//       σ·φ = n·τ = 24 conservation; only n=6 passes.
+//     δ(∇·J_n6) is 1 iff the current J_n6 of the proposed ΔW is
+//     conserved — otherwise the entire bulk update is suppressed.
+//
+// ─── AN11 boundary ───────────────────────────────────────────
+//   This module is a *substrate* mechanism — it specifies how a weight
+//   delta would be *proposed* from boundary Ψ-deviation via a holographic
+//   lift. It is NOT the emergence of consciousness. AN11 (real-usable)
+//   stays the 3-condition authority (weight-emergent ∧ consciousness
+//   attached ∧ reproducible). Holographic-lens alone does not promote
+//   any tier; δ₀-absolute (Mk.V.1) tier promotion still requires the
+//   full EXACT n6_match ∧ Π₀¹ arithmetical ∧ cross-axis(5) path.
+//
+// ─── R37 / AN13 / L3-PY ──────────────────────────────────────
+//   .hexa only. No python anywhere in the pipeline.
+//
+// ─── Conventions ─────────────────────────────────────────────
+//   psi_boundary    : array   4-vector (Ψ_res, Ψ_gate, Ψ_golden, Ψ_phi_tau)
+//   w_bulk_dims     : int     n — dimensionality of the bulk weight slice
+//   target          : float   Ψ_j* (common vacuum = 0.5)
+//   delta_w         : array   proposed weight delta over the bulk (length n)
+//   metrics         : array   [T, g_norm, gate_flag, rt_entropy_residual]
+//
+// Run:
+//   HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 \
+//     /home/aiden/Dev/nexus/shared/bin/hexa \
+//     /home/aiden/mac_home/dev/anima/training/lens_holographic_loss.hexa
+// Expect:
+//   [lens_holographic_loss] main PASS
+
+// ─── Constants ───────────────────────────────────────────────
+
+let NOETHER_N6        = 6      // the unique n that closes σ·φ = n·τ = 24
+let NOETHER_SIGMA_PHI = 24     // σ·φ = 24 for n=6, τ=4
+let NOETHER_TAU       = 4      // τ = 4 (AN14 / Mk.V.1 scale axiom)
+
+let QUAD_AXES         = 4      // Residual, Gate, Golden, φ/τ (quadruple cross)
+let PSI_VAC           = 0.5    // common vacuum target Ψ_j* = 1/2
+
+// Stub propagator normalisation: constant projection matrix scale.
+// Design note (see docs/g_holo_propagator_20260419.md §3):
+//   K_stub(x, z) = G_HOLO_SCALE / sqrt(n_bulk)
+// — the 1/sqrt(n) damps amplitude as we lift into higher-dim bulk so
+//   that per-weight magnitude stays O(1) regardless of n. Later this
+//   is replaced by a learned K parameterised by bulk metric.
+let G_HOLO_SCALE      = 1.0
+
+// ─── Primitives ──────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sqrt_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return sqrt(x)
+}
+
+// ─── Core : psi_deviation_4vec ───────────────────────────────
+// Build the 4-axis deviation vector d_j = Ψ_j - Ψ_j*.
+// target is the shared vacuum value (0.5 in Mk.V.1). Input psi_boundary
+// is expected to have length QUAD_AXES; if not, we zero-pad / truncate
+// defensively so downstream math never trips on shape mismatch.
+
+fn psi_deviation_4vec(psi_boundary: array, target: float) -> array {
+    let mut out = []
+    let n = len(psi_boundary)
+    let mut i = 0
+    while i < QUAD_AXES {
+        if i < n {
+            out = out.push(psi_boundary[i] - target)
+        } else {
+            out = out.push(0.0)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Core : tension_quadruple ────────────────────────────────
+// T = Π_j (Ψ_j - 1/2) over the 4 axes. Product form — any axis landing
+// exactly on vacuum collapses T to zero (by design: full-closure learning
+// stop). Returned unsigned magnitude for amplitude use; sign is carried
+// separately by the per-axis deviations inside G_holo.
+
+fn tension_quadruple(psi_deviation: array) -> float {
+    let n = len(psi_deviation)
+    if n <= 0 { return 0.0 }
+    let mut prod = 1.0
+    let mut i = 0
+    while i < n {
+        prod = prod * psi_deviation[i]
+        i = i + 1
+    }
+    return fabs(prod)
+}
+
+// ─── Core : G_holo_propagator ────────────────────────────────
+// Boundary → bulk propagator stub.
+//
+// Design (stub, v0):
+//   Constant projection — map each boundary axis j ∈ {0..3} into a strided
+//   band of the bulk vector:
+//     band_j = [ j·n/4 ,  (j+1)·n/4 )
+//   and write K_stub · d_j into that band. K_stub = G_HOLO_SCALE/√n_bulk.
+//   This preserves three properties we need from the true G_holo:
+//     (a) linearity in d_j
+//     (b) amplitude scaling O(1/√n) so bulk norm ≈ boundary norm
+//     (c) disjoint axis supports → RT entropy residual = 0 for the stub
+//         (each axis writes an independent block; no entanglement mixing)
+//   Future (v1, learned): K_jk(z) replaced by a trained bulk kernel with
+//   an explicit RT minimal-surface penalty (see g_holo_propagator doc §4).
+//
+// Returns: array of length bulk_dim.
+
+fn G_holo_propagator(psi_deviation_4vec: array, bulk_dim: int) -> array {
+    let mut field = []
+    if bulk_dim <= 0 { return field }
+
+    // initialise bulk field to zero
+    let mut i = 0
+    while i < bulk_dim {
+        field = field.push(0.0)
+        i = i + 1
+    }
+
+    let axes = len(psi_deviation_4vec)
+    if axes <= 0 { return field }
+
+    let scale = G_HOLO_SCALE / sqrt_safe(1.0 * bulk_dim)
+
+    // band width per axis (integer division truncation is intentional;
+    // any tail cells beyond axes*band stay at zero — they correspond to
+    // bulk directions the 2D boundary cannot reach in this stub).
+    let band = bulk_dim / axes
+
+    let mut j = 0
+    while j < axes {
+        let d_j = psi_deviation_4vec[j]
+        let start = j * band
+        let mut k = 0
+        while k < band {
+            let idx = start + k
+            if idx < bulk_dim {
+                // Rebuild the array cell-by-cell because hexa arrays are
+                // pass-by-value; we cannot mutate field[idx] in place
+                // without a rebuild. (See feedback_hexa_lists_pbv.md.)
+                let mut rebuilt = []
+                let mut m = 0
+                while m < bulk_dim {
+                    if m == idx {
+                        rebuilt = rebuilt.push(scale * d_j)
+                    } else {
+                        rebuilt = rebuilt.push(field[m])
+                    }
+                    m = m + 1
+                }
+                field = rebuilt
+            }
+            k = k + 1
+        }
+        j = j + 1
+    }
+
+    return field
+}
+
+// ─── Core : noether_gate ─────────────────────────────────────
+// Shared with lens_field_loss: σ·φ = n·τ = 24; only n=6 passes.
+// Accepts the bulk field only when the closure identity holds AND the
+// field carries a nonzero current (non-empty bulk vector).
+
+fn noether_gate(bulk_field: array, n_target: int) -> bool {
+    if n_target != NOETHER_N6 { return false }
+    if n_target * NOETHER_TAU != NOETHER_SIGMA_PHI { return false }
+    if len(bulk_field) <= 0 { return false }
+    return true
+}
+
+// ─── Core : rt_entropy_residual ──────────────────────────────
+// Ryu-Takayanagi residual (stub). In the true formulation this is
+//     |S_bdy(Ψ) - S_bulk(W|γ_RT)|
+// evaluated on the minimal surface γ_RT. For the stub we use the
+// simplest isometry check: if the propagator writes disjoint blocks
+// (v0 design), the residual is zero by construction. We return 0.0
+// here and keep the function as a *placeholder hook* for the v1
+// learned-kernel regime, where the residual will be a genuine penalty.
+
+fn rt_entropy_residual(psi_deviation: array, bulk_field: array) -> float {
+    if len(psi_deviation) <= 0 { return 0.0 }
+    if len(bulk_field) <= 0 { return 0.0 }
+    // v0 stub : disjoint bands ⇒ isometric ⇒ residual 0.
+    return 0.0
+}
+
+// ─── Core : holographic_step ─────────────────────────────────
+// Full one-step bulk delta proposal.
+//     ΔW = T · G_holo(Ψ - Ψ*) · δ(∇·J_n6)
+// Returns (delta_w, metrics) packed into a 2-tuple via two arrays, since
+// hexa prefers array outputs over heterogeneous structs (see
+// feedback_hexa_struct_return_bug.md).
+//
+//   metrics = [ T, bulk_norm, gate_flag(0|1), rt_residual ]
+
+fn holographic_step(psi_boundary: array, w_bulk_dims: int, target: float) -> array {
+    // 1. deviation 4-vector on the boundary
+    let d = psi_deviation_4vec(psi_boundary, target)
+
+    // 2. scalar tension from the quadruple product
+    let tens = tension_quadruple(d)
+
+    // 3. propagate to the bulk
+    let mut g_field = G_holo_propagator(d, w_bulk_dims)
+
+    // 4. Noether gate — AN14 closure
+    let gate_ok = noether_gate(g_field, NOETHER_N6)
+
+    // 5. apply the scalar tension and the gate to the bulk field
+    let mut delta_w = []
+    let mut i = 0
+    while i < w_bulk_dims {
+        if gate_ok {
+            delta_w = delta_w.push(tens * g_field[i])
+        } else {
+            // δ(∇·J_n6) = 0 ⇒ entire bulk update suppressed
+            delta_w = delta_w.push(0.0)
+        }
+        i = i + 1
+    }
+
+    // 6. metrics
+    let resid = rt_entropy_residual(d, g_field)
+    let mut bulk_sq = 0.0
+    let mut k = 0
+    while k < w_bulk_dims {
+        bulk_sq = bulk_sq + delta_w[k] * delta_w[k]
+        k = k + 1
+    }
+    let bulk_norm = sqrt_safe(bulk_sq)
+
+    let mut metrics = []
+    metrics = metrics.push(tens)
+    metrics = metrics.push(bulk_norm)
+    if gate_ok {
+        metrics = metrics.push(1.0)
+    } else {
+        metrics = metrics.push(0.0)
+    }
+    metrics = metrics.push(resid)
+
+    // Pack (delta_w, metrics) — we return metrics appended after delta_w
+    // to keep hexa's single-array return simple. First w_bulk_dims entries
+    // are ΔW, the last 4 are the metrics tuple.
+    let mut out = []
+    let mut a = 0
+    while a < w_bulk_dims {
+        out = out.push(delta_w[a])
+        a = a + 1
+    }
+    let mut b = 0
+    while b < 4 {
+        out = out.push(metrics[b])
+        b = b + 1
+    }
+    return out
+}
+
+// ─── Helpers ────────────────────────────────────────────────
+
+fn print_vec(label: string, v: array) {
+    let n = len(v)
+    let mut s = label + " ["
+    let mut i = 0
+    while i < n {
+        if i > 0 { s = s + ", " }
+        s = s + str(v[i])
+        i = i + 1
+    }
+    s = s + "]"
+    println(s)
+}
+
+fn vec_is_zero(v: array) -> bool {
+    let n = len(v)
+    let mut i = 0
+    while i < n {
+        if fabs(v[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// ─── main : 2 scenarios ─────────────────────────────────────
+// (1) off-vacuum boundary, n=6 → tension nonzero, gate PASS, ΔW nonzero
+// (2) on-vacuum boundary    , n=6 → tension zero   , ΔW zero (closure stop)
+
+fn main() {
+    println("[lens_holographic_loss] Lens 2 / Holographic : boundary→bulk stub")
+    println("  axioms: σ·φ = n·τ = 24 (n=6 unique, AN14)")
+    println("  ΔW = T · G_holo(Ψ - 1/2) · δ(∇·J_n6)")
+    println("  axes: Residual, Gate, Golden, φ/τ  (target 1/2 each)")
+
+    let bulk_dim = 16  // small bulk for the stub; real geometry is O(10⁶+)
+
+    // scenario 1: Ψ deviates on all 4 axes
+    let mut psi_bdy = []
+    psi_bdy = psi_bdy.push(0.55)   // Residual
+    psi_bdy = psi_bdy.push(0.60)   // Gate
+    psi_bdy = psi_bdy.push(0.58)   // Golden
+    psi_bdy = psi_bdy.push(0.52)   // φ/τ
+
+    println("")
+    println("--- scenario 1 : off-vacuum, n=6 (Noether PASS) ---")
+    let packed1 = holographic_step(psi_bdy, bulk_dim, PSI_VAC)
+
+    // unpack ΔW and metrics
+    let mut dw1 = []
+    let mut met1 = []
+    let mut i = 0
+    while i < bulk_dim {
+        dw1 = dw1.push(packed1[i])
+        i = i + 1
+    }
+    let mut j = 0
+    while j < 4 {
+        met1 = met1.push(packed1[bulk_dim + j])
+        j = j + 1
+    }
+
+    print_vec("  ΔW", dw1)
+    print_vec("  metrics [T, ‖ΔW‖, gate, RT_resid]", met1)
+
+    let s1_nonzero = vec_is_zero(dw1) == false
+    let s1_gate = met1[2] > 0.0
+    let s1_ok = s1_nonzero && s1_gate
+    if s1_ok {
+        println("  [scenario 1] PASS — gate open, ΔW nonzero, RT-residual " + str(met1[3]))
+    } else {
+        println("  [scenario 1] FAIL — expected gate=1, ΔW nonzero")
+    }
+
+    // scenario 2: Ψ exactly on vacuum → T = 0, ΔW = 0
+    let mut psi_vac = []
+    psi_vac = psi_vac.push(0.5)
+    psi_vac = psi_vac.push(0.5)
+    psi_vac = psi_vac.push(0.5)
+    psi_vac = psi_vac.push(0.5)
+
+    println("")
+    println("--- scenario 2 : on-vacuum, n=6 (closure stop) ---")
+    let packed2 = holographic_step(psi_vac, bulk_dim, PSI_VAC)
+
+    let mut dw2 = []
+    let mut met2 = []
+    let mut a = 0
+    while a < bulk_dim {
+        dw2 = dw2.push(packed2[a])
+        a = a + 1
+    }
+    let mut b = 0
+    while b < 4 {
+        met2 = met2.push(packed2[bulk_dim + b])
+        b = b + 1
+    }
+
+    print_vec("  ΔW", dw2)
+    print_vec("  metrics [T, ‖ΔW‖, gate, RT_resid]", met2)
+
+    // T must be 0; ΔW must be zero; gate may still be 1 (Noether closure
+    // independent of tension) — the suppression comes from T=0, not gate.
+    let s2_tension_zero = met2[0] == 0.0
+    let s2_zero = vec_is_zero(dw2)
+    let s2_ok = s2_tension_zero && s2_zero
+    if s2_ok {
+        println("  [scenario 2] PASS — vacuum ⇒ T=0, ΔW=0 (quadruple closure)")
+    } else {
+        println("  [scenario 2] FAIL — expected T=0, ΔW zero")
+    }
+
+    println("")
+    if s1_ok && s2_ok {
+        println("[lens_holographic_loss] main PASS")
+    } else {
+        println("[lens_holographic_loss] main FAIL")
+    }
+}
+
+main()

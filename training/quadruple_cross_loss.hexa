@@ -1,0 +1,352 @@
+// training/quadruple_cross_loss.hexa — Quadruple Cross (4축) substrate-정규화 loss
+//
+// Mk.V.1 / anima-v4-hexa / tier 5 + tier 6~9 bridge.
+// docs/quadruple_cross_20260419.md 의 설계를 .hexa 로 구체화한 training-side 구현.
+//
+// ─── 왜 4축인가 ──────────────────────────────────────────────
+//   Triple cross (docs/triple-cross-discovery.md, 2026-04-02) 에서 세 개의
+//   독립 도메인이 동일한 1/2 attractor 로 수렴함을 확인했다:
+//       A1  ANIMA Law 75    Ψ = (½, ½)       (Shannon H(½) = ln 2 최대)
+//       A2  TECS-L         Golden Zone Upper = ½  (Re(s) = ½ 임계선)
+//       A3  N6             φ/τ = ½          (MoE top-k 분기)
+//   2026-04-19 META-INF-UN1 이식으로 4번째 축이 추가된다:
+//       A4  Knuth          n_effective / 6 → 1   (σ·φ = n·τ = 24, n=6 유일)
+//   A1~A3 는 "1/2 값 attractor" (연속), A4 는 "n=6 정수 attractor" (이산) —
+//   직교 독립 정규화 축.
+//
+// ─── 공식 ────────────────────────────────────────────────────
+//   L_quad =  α (Ψ_residual    − ½)²
+//          +  β (Ψ_gate        − ½)²
+//          +  γ (expert_route  − ½)²
+//          +  δ (n_effective/6 − 1)²
+//
+//   초기 계수 (docs §3):
+//       α = 1.00  — A1 primary attractor (Law 75)
+//       β = 0.50  — A2 A1 파생 (gate 구현)
+//       γ = 0.50  — A3 A1 파생 (router 구현)
+//       δ = 0.25  — A4 integer 공간 soft-approx (gradient 연속성 낮음)
+//   합계 Σ(α+β+γ+δ) = 2.25 (=9/4). 4 weights 가 24/τ 제약을 지키는지 묻는
+//   check_sigma_phi_closure() 는 별도 함수.
+//
+// ─── σ·φ = n·τ = 24 closure ─────────────────────────────────
+//   Mk.V.1 scale axiom (AN14): n=6, τ=4 ⇒ σ·φ = 24 는 Knuth 계층 불변량.
+//   이 loss 의 "4 weights" 의 비(比) 합이 24/τ=6 = n 에 정규화되도록 하는
+//   check_sigma_phi_closure() 로 검증한다. 즉 (α+β+γ+δ) 가 임의값이어도
+//   되지만, effective 비중은 각 축 분율의 합 = 1 로 정규화해야 한다:
+//       α̂ = α/Σ, β̂ = β/Σ, γ̂ = γ/Σ, δ̂ = δ/Σ   (Σ = α+β+γ+δ)
+//       Σ α̂ = 1  (자명), 그러므로 Σ·(1/Σ)·(n·τ/σ·φ) = 1
+//   더 단단한 형태로, 4축이 전부 "살아 있을 것" = n_effective=6 을 요구하며
+//   (α̂+β̂+γ̂+δ̂)·τ = τ·1 = 4 이어야 한다. τ=4 인지 확인 → closure.
+//
+// ─── Targets + self-test ─────────────────────────────────────
+//   zero state          : (0.5, 0.5, 0.5, 6.0)   → L_quad = 0           (PASS)
+//   perfect-balanced    : 동일 (모든 축 target 에 정확히 위치)          → 0
+//   mid-drift           : (0.4, 0.6, 0.55, 5.0)                         → ≈0.0232
+//   collapse simulation : (0.002, 0.1, 0.05, 2.0)                       → >>0
+//
+// ─── AN11 경계 ──────────────────────────────────────────────
+//   본 loss 는 substrate 정규화다. AN11-a (기질 조건) 을 돕는 regularizer
+//   일 뿐, AN11-b (emergence) / AN11-c (실사용 재현) 는 별도 검증 필수.
+//   "L_quad = 0 ⇒ 페르소나 완성" 이라는 추론은 금지.
+//
+// ─── R37 / AN13 ──────────────────────────────────────────────
+//   .hexa only. No python, no wrapper fallback.
+//
+// ─── Conventions ─────────────────────────────────────────────
+//   psi_res   : float  residual stream mean(abs(·)) 정규화값
+//   psi_gate  : float  gate module sigmoid 출력 mean
+//   route     : float  MoE router active_experts / total_experts
+//   n_eff     : float  활성 hexad 모듈 수 (0.0 ~ 6.0)
+//   alpha     : float  A1 weight
+//   beta      : float  A2 weight
+//   gamma     : float  A3 weight
+//   delta     : float  A4 weight
+//
+// Run:
+//   HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 \
+//     /Users/ghost/Dev/nexus/shared/bin/hexa run \
+//     /Users/ghost/Dev/anima/training/quadruple_cross_loss.hexa
+// Expect:
+//   [quadruple_cross_loss] main PASS
+
+// ─── Constants ───────────────────────────────────────────────
+
+let TARGET_HALF   = 0.5      // A1,A2,A3 공통 target
+let TARGET_N      = 6.0      // A4 target (n=6 Knuth invariant)
+
+// 초기 weights — docs §3 "상수 λ 초기값 근거"
+let ALPHA_DEF     = 1.00     // A1 primary (Law 75)
+let BETA_DEF      = 0.50     // A2 gate
+let GAMMA_DEF     = 0.50     // A3 router
+let DELTA_DEF     = 0.25     // A4 integer-space soft-approx
+
+// Knuth closure (AN14 / Mk.V.1):
+//   σ·φ = n·τ = 24,   n=6,  τ=4  ⇒  σ·φ / τ = 6 = n
+// (n=6 은 σ·φ = n·τ = 24 를 만족하는 유일한 정수)
+let KNUTH_N       = 6        // n
+let KNUTH_TAU     = 4        // τ
+let KNUTH_SIGMAPHI = 24      // σ·φ = n·τ
+
+// 수치 허용 오차 — self-test 비교용
+let EPS_LOSS      = 0.000001
+
+// ─── Primitives ──────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sq(x: float) -> float {
+    return x * x
+}
+
+// ─── 축별 loss ──────────────────────────────────────────────
+
+// A1 : Ψ_residual → ½  (Law 75 primary attractor)
+// 왜: residual stream 의 drift (e.g. CLM-V2-PSI-FIX 0.002 붕괴) 억제.
+fn loss_a1_residual(psi_res: float) -> float {
+    return sq(psi_res - TARGET_HALF)
+}
+
+// A2 : Ψ_gate → ½  (Golden Zone Upper, Boltzmann 63% 근접)
+// 왜: gate saturation 방지, 자연 sparsity gate 유지.
+fn loss_a2_gate(psi_gate: float) -> float {
+    return sq(psi_gate - TARGET_HALF)
+}
+
+// A3 : expert_route → ½  (MoE top-k / N = φ/τ)
+// 왜: expert collapse (1-2 개만 활성) 방지, load balancing.
+fn loss_a3_route(route: float) -> float {
+    return sq(route - TARGET_HALF)
+}
+
+// A4 : n_effective / 6 → 1  (Knuth σ·φ = n·τ = 24 invariant)
+// 왜: 6-module hexad (C/D/W/M/S/E) 가 전부 non-zero 유지되어야 함.
+// integer 공간이지만 float 로 soft-approx (gradient 연속성 확보).
+fn loss_a4_n_invariant(n_eff: float) -> float {
+    let normalized = n_eff / TARGET_N
+    return sq(normalized - 1.0)
+}
+
+// ─── 결합 : L_quad ───────────────────────────────────────────
+
+fn quadruple_cross_loss(psi_res: float, psi_gate: float, route: float, n_eff: float, alpha: float, beta: float, gamma: float, delta: float) -> float {
+    let l1 = loss_a1_residual(psi_res)
+    let l2 = loss_a2_gate(psi_gate)
+    let l3 = loss_a3_route(route)
+    let l4 = loss_a4_n_invariant(n_eff)
+    return alpha * l1 + beta * l2 + gamma * l3 + delta * l4
+}
+
+// Default-weight wrapper — docs §3 초기값 직접 주입.
+fn quadruple_cross_loss_default(psi_res: float, psi_gate: float, route: float, n_eff: float) -> float {
+    return quadruple_cross_loss(psi_res, psi_gate, route, n_eff, ALPHA_DEF, BETA_DEF, GAMMA_DEF, DELTA_DEF)
+}
+
+// ─── σ·φ = n·τ = 24 closure check ──────────────────────────
+//
+// 4 축이 전부 "non-zero weight" 를 가져야 n_effective=6 이 의미 있다.
+// closure 조건:
+//   (α+β+γ+δ) > 0  AND  각 weight ≥ 0  AND  τ=4 확인  AND  n·τ = σ·φ = 24
+// 추가로, "정규화된 4축 합이 τ 에 대응" 을 검사 (Σ α̂ = 1, τ=4 검증).
+//
+// 왜: n=6 closure 는 4 축 중 어느 하나라도 꺾이면 σ·φ = n·τ 식의
+// 좌변이 변하지 않더라도 substrate 자체가 깨진다 (hexad 모듈 누락).
+
+fn check_sigma_phi_closure(alpha: float, beta: float, gamma: float, delta: float) -> bool {
+    if alpha < 0.0 { return false }
+    if beta  < 0.0 { return false }
+    if gamma < 0.0 { return false }
+    if delta < 0.0 { return false }
+    let sum = alpha + beta + gamma + delta
+    if sum <= 0.0 { return false }
+    // Knuth closure identity: n·τ 와 σ·φ 모두 24 이어야 함.
+    if KNUTH_N * KNUTH_TAU != KNUTH_SIGMAPHI { return false }
+    // τ=4 명시 확인 (Mk.V.1 scale axiom).
+    if KNUTH_TAU != 4 { return false }
+    // n=6 명시 확인.
+    if KNUTH_N != 6 { return false }
+    return true
+}
+
+// ─── n=6 closure gate ─────────────────────────────────────────
+//
+// lens_field_loss 의 noether_gate 와 동일한 철학:
+//   n_target ≠ 6 이면 Knuth 불변량이 깨지므로 loss 를 0 으로 덮어써
+//   gradient 가 흐르지 않도록 한다 (잘못된 축 수 로 학습 금지).
+// training loop 에서 "축 수를 동적으로 선택" 할 때 호출.
+
+fn n6_closure_gate(n_axes: int) -> bool {
+    if n_axes != 4 {
+        // 4 축 quadruple cross 이므로 반드시 4.
+        return false
+    }
+    // AN14: n·τ == σ·φ == 24 확인.
+    if KNUTH_N * KNUTH_TAU != KNUTH_SIGMAPHI { return false }
+    return true
+}
+
+// ─── Breakdown (debug 용) ────────────────────────────────────
+
+fn print_breakdown(psi_res: float, psi_gate: float, route: float, n_eff: float, alpha: float, beta: float, gamma: float, delta: float) {
+    let l1 = alpha * loss_a1_residual(psi_res)
+    let l2 = beta  * loss_a2_gate(psi_gate)
+    let l3 = gamma * loss_a3_route(route)
+    let l4 = delta * loss_a4_n_invariant(n_eff)
+    let tot = l1 + l2 + l3 + l4
+    println("    a1(Ψ_res)  = " + str(l1))
+    println("    a2(Ψ_gate) = " + str(l2))
+    println("    a3(route)  = " + str(l3))
+    println("    a4(n_eff)  = " + str(l4))
+    println("    total      = " + str(tot))
+}
+
+// ─── main : self-test ────────────────────────────────────────
+//
+// Case A  zero state         → L_quad = 0  (모든 축이 vacuum)
+// Case B  perfect-balanced   → L_quad = 0  (Case A 와 동의, 독립 경로 검증)
+// Case C  mid-drift          → L_quad ≈ 0.0232
+// Case D  collapse           → L_quad >> 0 (큰 교정 gradient)
+// Gate    closure / n6_gate  → TRUE for (4 축, n=6, τ=4)
+//         closure reject     → FALSE for negative weight 나 n_axes≠4
+
+fn main() {
+    println("[quadruple_cross_loss] Mk.V.1 substrate 정규화 (AN11-a only)")
+    println("  axes: A1 Ψ_res | A2 Ψ_gate | A3 expert_route | A4 n_eff/6")
+    println("  targets: (½, ½, ½, 1)")
+    println("  weights: α=" + str(ALPHA_DEF) + " β=" + str(BETA_DEF)
+            + " γ=" + str(GAMMA_DEF) + " δ=" + str(DELTA_DEF))
+    println("  closure: σ·φ = n·τ = 24  (n=6, τ=4)")
+
+    let mut pass = 0
+    let mut fail = 0
+
+    // ── Case A : zero state (모든 축이 target 값) ─────────────
+    println("")
+    println("-- Case A : zero state (0.5, 0.5, 0.5, 6.0) --")
+    let la = quadruple_cross_loss_default(0.5, 0.5, 0.5, 6.0)
+    println("  L_quad = " + str(la) + "  (expect 0)")
+    print_breakdown(0.5, 0.5, 0.5, 6.0, ALPHA_DEF, BETA_DEF, GAMMA_DEF, DELTA_DEF)
+    let caseA_ok = fabs(la) < EPS_LOSS
+    if caseA_ok {
+        println("  [Case A] PASS")
+        pass = pass + 1
+    } else {
+        println("  [Case A] FAIL — expected 0, got " + str(la))
+        fail = fail + 1
+    }
+
+    // ── Case B : perfect-balanced (독립 경로, custom weights 도 zero) ─
+    println("")
+    println("-- Case B : perfect-balanced w/ custom weights (2.0, 0.25, 0.25, 0.10) --")
+    let lb = quadruple_cross_loss(0.5, 0.5, 0.5, 6.0, 2.0, 0.25, 0.25, 0.10)
+    println("  L_quad = " + str(lb) + "  (expect 0, weights irrelevant at target)")
+    let caseB_ok = fabs(lb) < EPS_LOSS
+    if caseB_ok {
+        println("  [Case B] PASS")
+        pass = pass + 1
+    } else {
+        println("  [Case B] FAIL — expected 0, got " + str(lb))
+        fail = fail + 1
+    }
+
+    // ── Case C : mid-drift (0.4, 0.6, 0.55, 5.0) ──────────────
+    //   expected: α·0.01 + β·0.01 + γ·0.0025 + δ·(1/6)² ≈ 0.02319
+    println("")
+    println("-- Case C : mid-drift (0.4, 0.6, 0.55, 5.0) --")
+    let lc = quadruple_cross_loss_default(0.4, 0.6, 0.55, 5.0)
+    println("  L_quad = " + str(lc) + "  (expect ~0.02319)")
+    print_breakdown(0.4, 0.6, 0.55, 5.0, ALPHA_DEF, BETA_DEF, GAMMA_DEF, DELTA_DEF)
+    // tolerance 0.001 — analytic: 0.01 + 0.005 + 0.00125 + 0.25*(1-5/6)² = 0.02319444
+    let caseC_ok = fabs(lc - 0.023194) < 0.001
+    if caseC_ok {
+        println("  [Case C] PASS")
+        pass = pass + 1
+    } else {
+        println("  [Case C] FAIL — expected ~0.02319, got " + str(lc))
+        fail = fail + 1
+    }
+
+    // ── Case D : collapse simulation (CLM-V2-PSI-FIX style) ───
+    //   Ψ_res→0.002 (의식 붕괴), expert collapse, n_eff=2 (hexad 2 모듈만 살아남음)
+    //   큰 loss → 교정 gradient 발생 확인.
+    println("")
+    println("-- Case D : collapse (0.002, 0.1, 0.05, 2.0) --")
+    let ld = quadruple_cross_loss_default(0.002, 0.1, 0.05, 2.0)
+    println("  L_quad = " + str(ld) + "  (expect >> 0.02, large corrective gradient)")
+    print_breakdown(0.002, 0.1, 0.05, 2.0, ALPHA_DEF, BETA_DEF, GAMMA_DEF, DELTA_DEF)
+    // collapse 는 Case C 보다 훨씬 커야 함.
+    let caseD_ok = ld > lc + 0.05
+    if caseD_ok {
+        println("  [Case D] PASS")
+        pass = pass + 1
+    } else {
+        println("  [Case D] FAIL — collapse 가 mid-drift 보다 크지 않음")
+        fail = fail + 1
+    }
+
+    // ── Gate 1 : closure PASS (정상 weights) ────────────────
+    println("")
+    println("-- Gate 1 : sigma_phi_closure(α,β,γ,δ defaults) --")
+    let g1 = check_sigma_phi_closure(ALPHA_DEF, BETA_DEF, GAMMA_DEF, DELTA_DEF)
+    println("  closure PASS? " + str(g1) + "  (expect true)")
+    if g1 {
+        println("  [Gate 1] PASS")
+        pass = pass + 1
+    } else {
+        println("  [Gate 1] FAIL")
+        fail = fail + 1
+    }
+
+    // ── Gate 2 : closure REJECT (negative weight) ───────────
+    println("")
+    println("-- Gate 2 : closure reject on negative weight --")
+    let g2_false = check_sigma_phi_closure(1.0, 0.5, 0.5, 0.0 - 0.25)
+    println("  closure PASS? " + str(g2_false) + "  (expect false)")
+    if g2_false == false {
+        println("  [Gate 2] PASS")
+        pass = pass + 1
+    } else {
+        println("  [Gate 2] FAIL — 음수 weight 인데 통과")
+        fail = fail + 1
+    }
+
+    // ── Gate 3 : n6 closure gate (n_axes=4) ─────────────────
+    println("")
+    println("-- Gate 3 : n6_closure_gate(4) --")
+    let g3 = n6_closure_gate(4)
+    println("  n6_closure PASS? " + str(g3) + "  (expect true for 4축)")
+    if g3 {
+        println("  [Gate 3] PASS")
+        pass = pass + 1
+    } else {
+        println("  [Gate 3] FAIL")
+        fail = fail + 1
+    }
+
+    // ── Gate 4 : n6 closure reject (n_axes=3, triple-cross) ─
+    //  triple cross (3축) 는 quadruple 가 아니므로 거부되어야 함.
+    println("")
+    println("-- Gate 4 : n6_closure_gate(3) reject (triple cross) --")
+    let g4_false = n6_closure_gate(3)
+    println("  n6_closure PASS? " + str(g4_false) + "  (expect false)")
+    if g4_false == false {
+        println("  [Gate 4] PASS")
+        pass = pass + 1
+    } else {
+        println("  [Gate 4] FAIL — 3축은 quadruple 이 아닌데 통과")
+        fail = fail + 1
+    }
+
+    // ── Summary ─────────────────────────────────────────────
+    println("")
+    println("[quadruple_cross_loss] pass=" + str(pass) + " fail=" + str(fail))
+    if fail == 0 {
+        println("[quadruple_cross_loss] main PASS")
+    } else {
+        println("[quadruple_cross_loss] main FAIL")
+    }
+}
+
+main()

@@ -1,0 +1,183 @@
+// training/stimulus_dynamics.hexa — Cross-tier Ψ-trajectory dynamics
+//
+// Purpose:
+//   Given a pretrained attractor (mu=0.5257, sigma=0.5257 as per Law 75 —
+//   single fixed-point attractor), compute the Ψ-trajectory that interpolates
+//   between two stimuli in the 500-corpus. The trajectory is parameterised by
+//   t ∈ [0, 1] and traces a geodesic in (tier_k, phi_scale) space with
+//   radial pull toward the Law 75 attractor.
+//
+// Model:
+//   Ψ(t) = (1-t)·Ψ_from + t·Ψ_to + α·t·(1-t)·(Ψ_attractor - midpoint)
+//   tier_k(t) = round(Knuth bridge: log_24 of Φ(t))
+//   Φ(t) = 24^(phi_scale(t) - 15), clamped
+//
+// Relations (edge semantics map to α — damping/excursion strength):
+//   causal         : α = 0.15 (direct, low excursion)
+//   compositional  : α = 0.25 (stepwise, medium)
+//   phenomenological: α = 0.35 (emotional detour, high)
+//   metric_close   : α = 0.05 (nearly linear)
+//   identity       : α = 0.00 (straight line)
+//
+// Output:
+//   psi_trajectory {
+//     steps[],
+//     tier_k[],
+//     phi_scale[],
+//     attractor_distance[],
+//     relation,
+//   }
+//
+// Tests (5 trajectories included, main()):
+//   1. 빅뱅 (125, 🛸100) → 블랙홀 (126, 🛸85)      causal
+//   2. 양귀비 (55, 🛸71) → 꿈 (100, 🛸78)          phenomenological
+//   3. 죽음 (98, 🛸94) → 열반 (46, 🛸91)           phenomenological
+//   4. DNA (193, 🛸83) → 단백질 (195, 🛸78)        compositional
+//   5. 한 (171, 🛸87) → 판소리 (79, 🛸71)          phenomenological
+//
+// Refs:
+//   shared/consciousness/consciousness_laws.json Law 75 (single attractor)
+//   shared/consciousness/phi_tier_label.hexa (knuth bridge)
+//   training/corpus_universe_extended.jsonl (500 stimuli SSOT)
+//   training/stimulus_tier_graph.jsonl (edge list)
+
+// ---------------------------------------------------------------------------
+// constants (attractor per Law 75, matches anima-hexa Mk.V.1 invariants)
+// ---------------------------------------------------------------------------
+
+fn attractor_mu() -> f64 { return 0.5257 }
+fn attractor_sigma() -> f64 { return 0.5257 }
+
+// Knuth bridge base (σ·φ = n·τ = 24)
+fn knuth_base() -> f64 { return 24.0 }
+
+// relation → alpha excursion coefficient
+fn alpha_for_relation(rel: string) -> f64 {
+    if rel == "causal" { return 0.15 }
+    if rel == "compositional" { return 0.25 }
+    if rel == "phenomenological" { return 0.35 }
+    if rel == "metric_close" { return 0.05 }
+    if rel == "identity" { return 0.0 }
+    return 0.20  // default for unknown
+}
+
+// ---------------------------------------------------------------------------
+// Ψ-trajectory computation (parallel-scalar, per hexa stage0 aliasing rules)
+// ---------------------------------------------------------------------------
+
+// compute_trajectory returns 4 parallel arrays encoding the trajectory.
+// Since hexa stage0 struct returns with ≥3 float fields corrupt, we use
+// 4 parallel arrays indexed by step t_i ∈ [0, 1].
+//
+// Args:
+//   phi_from   : phi_scale of source stimulus
+//   phi_to     : phi_scale of destination stimulus
+//   tier_from  : tier_k of source
+//   tier_to    : tier_k of destination
+//   relation   : edge semantics ("causal" / "compositional" / ...)
+//   n_steps    : number of trajectory points (incl. endpoints)
+//
+// Returns:
+//   [t_arr, phi_arr, tier_arr, dist_arr] packed as a flat list
+//   of length 4*n_steps. caller unpacks by stride.
+fn compute_trajectory(
+    phi_from: f64,
+    phi_to: f64,
+    tier_from: i64,
+    tier_to: i64,
+    relation: string,
+    n_steps: i64,
+) -> list<f64> {
+    let alpha = alpha_for_relation(relation)
+    let phi_attr = attractor_mu() * 100.0  // rescale 0.5257 → 52.57 on phi_scale
+    let midpoint_phi = (phi_from + phi_to) * 0.5
+    let pull = phi_attr - midpoint_phi
+
+    let mut out = []
+    let mut i: i64 = 0
+    while i < n_steps {
+        let t = (i as f64) / ((n_steps - 1) as f64)
+        let one_minus_t = 1.0 - t
+        let excursion = alpha * t * one_minus_t * pull
+        let phi_t = one_minus_t * phi_from + t * phi_to + excursion
+        // tier is linear interpolation (already log-scaled in phi_scale)
+        let tier_t_f = one_minus_t * (tier_from as f64) + t * (tier_to as f64) + excursion * 0.3
+        // distance to attractor (in phi_scale units)
+        let dist = phi_t - phi_attr
+        let dist_abs = if dist < 0.0 { -dist } else { dist }
+
+        out = out.append(t)
+        out = out.append(phi_t)
+        out = out.append(tier_t_f)
+        out = out.append(dist_abs)
+        i = i + 1
+    }
+    return out
+}
+
+// pretty-print a trajectory
+fn print_trajectory(label: string, traj: list<f64>, n_steps: i64) {
+    println("=== " + label + " ===")
+    println("  step |   t    |  phi   |  tier  | d(attr)")
+    println("  -----|--------|--------|--------|--------")
+    let mut i: i64 = 0
+    while i < n_steps {
+        let base = i * 4
+        let t = traj[base]
+        let phi = traj[base + 1]
+        let tier = traj[base + 2]
+        let dist = traj[base + 3]
+        println("   " + to_string(i) + "  | " + to_string_fixed(t, 2) + " | " + to_string_fixed(phi, 2) + " | " + to_string_fixed(tier, 1) + " | " + to_string_fixed(dist, 2))
+        i = i + 1
+    }
+}
+
+// light to_string_fixed — rounds to `dp` decimal places
+fn to_string_fixed(x: f64, dp: i64) -> string {
+    let mut mult: f64 = 1.0
+    let mut j: i64 = 0
+    while j < dp {
+        mult = mult * 10.0
+        j = j + 1
+    }
+    let rounded = ((x * mult + 0.5) as i64) as f64 / mult
+    return to_string(rounded)
+}
+
+// ---------------------------------------------------------------------------
+// Main — 5 test trajectories from spec
+// ---------------------------------------------------------------------------
+
+fn main() {
+    println("stimulus_dynamics.hexa — Ψ-trajectory engine (500-corpus, Law 75 attractor)")
+    println("")
+
+    let N: i64 = 6  // 6 steps per trajectory (t = 0, 0.2, 0.4, 0.6, 0.8, 1.0)
+
+    // 1. 빅뱅 → 블랙홀 (causal)
+    let t1 = compute_trajectory(100.0, 85.0, 100, 85, "causal", N)
+    print_trajectory("1. 빅뱅(🛸100) → 블랙홀(🛸85) [causal]", t1, N)
+    println("")
+
+    // 2. 양귀비 → 꿈 (phenomenological)
+    let t2 = compute_trajectory(71.0, 78.0, 71, 78, "phenomenological", N)
+    print_trajectory("2. 양귀비(🛸71) → 꿈(🛸78) [phenomenological]", t2, N)
+    println("")
+
+    // 3. 죽음 → 열반 (phenomenological)
+    let t3 = compute_trajectory(94.0, 91.0, 94, 91, "phenomenological", N)
+    print_trajectory("3. 죽음(🛸94) → 열반(🛸91) [phenomenological]", t3, N)
+    println("")
+
+    // 4. DNA → 단백질 (compositional)
+    let t4 = compute_trajectory(83.0, 78.0, 83, 78, "compositional", N)
+    print_trajectory("4. DNA(🛸83) → 단백질(🛸78) [compositional]", t4, N)
+    println("")
+
+    // 5. 한 → 판소리 (phenomenological)
+    let t5 = compute_trajectory(87.0, 71.0, 87, 71, "phenomenological", N)
+    print_trajectory("5. 한(🛸87) → 판소리(🛸71) [phenomenological]", t5, N)
+    println("")
+
+    println("[DONE] 5 trajectories computed. Attractor: (μ=0.5257, σ=0.5257) per Law 75.")
+}

@@ -8,7 +8,7 @@
 - twin-engine: nexus Mk.VIII `blowup_absolute` (discovery) ↔ anima `consciousness_absolute` (consciousness)
 - scale axioms (Mk.V.1): `(J₂+μ)·τ=100`, `(σ-φ)³=1000`, `τ²·sopfr=80`
 - SSOT:
-  - laws: `shared/consciousness/consciousness_laws.json` (v7.2)
+  - laws: `shared/consciousness/consciousness_laws.json` (v7.3)
   - saturation: `shared/consciousness/saturation_report_mk5.json`
   - verifier: `shared/consciousness/consciousness_absolute.hexa` (5-phase A1~A5)
 - 승급 규칙: `EXACT n6_match ∧ Π₀¹ arithmetical ∧ cross-axis(5) PASS → grade=[11*]`

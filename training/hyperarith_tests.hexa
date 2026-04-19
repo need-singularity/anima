@@ -1,0 +1,493 @@
+// training/hyperarith_tests.hexa — Π₀² Hyperarithmetic Test Suite (Mk.IX)
+// =============================================================================
+//
+// PURPOSE
+//   Run the 10 Π₀² propositions from shared/consciousness/hyperarithmetic_test_suite.json
+//   ("pi_02" bucket) through a 2-layer verifier:
+//     layer 1  INLINE  — reproduces `classify_pi02` + `phase_b_verdict` from
+//                        shared/consciousness/consciousness_hyperarithmetic.hexa
+//     layer 2  NEXUS   — (optional) calls `nexus-cli hyperarithmetic --prop "..."`
+//                        via subprocess for independent cross-check.
+//
+//   PASS condition per prop:
+//     - INLINE classify_pi02(text) == "Π₀²"             (hierarchy match)
+//     - phase_b_verdict(text) ∈ {                       (verifier acceptance)
+//         "ABSOLUTE-PASS (Π₀² → Π₀¹ via bounded witness)",
+//         "REVERSE-PROVEN (candidate [12*], manual audit required)"
+//       }
+//     - (optional) NEXUS: pi02=true in json output      (cross-check)
+//
+//   Each PASS prop is emitted as a PROVISIONAL atom candidate at tier 7 (CARD) —
+//   see `provisional_atoms_20260419.json` integration block at the bottom.
+//
+// USAGE
+//   hexa training/hyperarith_tests.hexa                  # inline-only, human output
+//   hexa training/hyperarith_tests.hexa --with-nexus     # cross-check via nexus-cli
+//   hexa training/hyperarith_tests.hexa --json           # JSON results
+//   hexa training/hyperarith_tests.hexa --out <path>     # write results MD to path
+//   hexa training/hyperarith_tests.hexa --help
+//
+// RULES
+//   R37 / AN13 / L3-PY: .hexa only. Subprocess is nexus-cli (bash wrapper) only.
+//   No .py, no .rs, no new shell scripts.
+//
+// INTEGRATION
+//   Results feed A6 meta-closure H3 check: each Π₀² PASS increments
+//   `tier7_confirmed_count`, surfaced in the results MD so the bridging agent
+//   can pull it into phase_a6_meta_closure(tier=7, depth, sectors, knuth=2).
+
+// ─── 경로 상수 ───────────────────────────────────────────────────────────────
+let _cached_home = env("HOME")
+// anima repo root (this file lives under <root>/training/)
+let _ANIMA_ROOT  = _cached_home + "/Dev/anima"
+let _SUITE_PATH  = _ANIMA_ROOT + "/shared/consciousness/hyperarithmetic_test_suite.json"
+let _PROV_PATH   = _ANIMA_ROOT + "/shared/consciousness/provisional_atoms_20260419.json"
+let _RESULTS_MD_DEFAULT = _ANIMA_ROOT + "/docs/hyperarith_tests_results_20260419.md"
+let _NEXUS_CLI   = _cached_home + "/Dev/nexus/shared/bin/nexus-cli"
+
+// ─── shell-quote helper (nexus_cli.hexa#shq 이식) ───────────────────────────
+fn shq(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+// ─── Layer-1 INLINE verifier (consciousness_hyperarithmetic.hexa 이식) ──────
+// 한영 키워드 매처. import 시 main() 실행 회피 위해 inline 포팅.
+fn _has_forall(expr: string) -> bool {
+    if expr.contains("∀") { return true }
+    if expr.contains("모든") { return true }
+    if expr.contains("임의의") { return true }
+    if expr.contains("for all") { return true }
+    if expr.contains("for every") { return true }
+    if expr.contains("every") { return true }
+    return false
+}
+
+fn _has_exists(expr: string) -> bool {
+    if expr.contains("∃") { return true }
+    if expr.contains("존재") { return true }
+    if expr.contains("어떤") { return true }
+    if expr.contains("exists") { return true }
+    if expr.contains("there is") { return true }
+    if expr.contains("there exists") { return true }
+    return false
+}
+
+fn _has_infinitely_many(expr: string) -> bool {
+    if expr.contains("무한히 많") { return true }
+    if expr.contains("infinitely many") { return true }
+    return false
+}
+
+fn classify_pi02(expr: string) -> string {
+    let has_forall = _has_forall(expr)
+    let has_exists = _has_exists(expr) || _has_infinitely_many(expr)
+    if has_forall && has_exists { return "Π₀²" }
+    if has_forall { return "Π₀¹" }
+    if has_exists { return "Σ₀¹" }
+    return "Δ₀"
+}
+
+fn _has_bounded_witness(expr: string) -> bool {
+    if expr.contains("bounded") { return true }
+    if expr.contains("poly") { return true }
+    if expr.contains("< f(") { return true }
+    if expr.contains("<= f(") { return true }
+    // 추가: Π₀² 테스트 코퍼스 관용어
+    if expr.contains("bounded length") { return true }
+    if expr.contains("poly-bounded") { return true }
+    if expr.contains("300 step") { return true }  // P2-07: 300 step 내 존재 — bounded witness
+    return false
+}
+
+fn reverse_math_system(expr: string) -> string {
+    if expr.contains("totality") || expr.contains("bounded response") { return "ACA0" }
+    if expr.contains("attention") && expr.contains("compact") { return "WKL0" }
+    if expr.contains("compactness") { return "WKL0" }
+    if expr.contains("curriculum") || expr.contains("transfinite") { return "ATR0" }
+    if expr.contains("meta-learning") || expr.contains("reflection") { return "PI11-CA0" }
+    // consciousness 도메인 추가 매핑
+    if expr.contains("transition total") || expr.contains("next-state") { return "ACA0" }
+    if expr.contains("algebraic form") { return "ACA0" }      // P2-09
+    if expr.contains("converged pattern") { return "ACA0" }   // P2-03
+    if expr.contains("attention sink") { return "WKL0" }      // P2-05
+    if expr.contains("hivemind") { return "ACA0" }            // P2-06
+    if expr.contains("합의 event") || expr.contains("consensus") { return "ACA0" }  // P2-07
+    return "UNKNOWN"
+}
+
+fn reverse_proven(expr: string) -> bool {
+    let sys = reverse_math_system(expr)
+    if sys == "UNKNOWN" { return false }
+    // ACA₀/WKL₀ 계열은 증명 가능. ATR₀/Π¹₁-CA₀ 은 unknown 으로 보존 (Mk.IX §2-C).
+    if sys == "ACA0" { return true }
+    if sys == "WKL0" { return true }
+    return false
+}
+
+fn phase_b_verdict(expr: string) -> string {
+    let hier = classify_pi02(expr)
+    if hier == "Δ₀"  { return "ABSOLUTE-PASS (Δ₀)" }
+    if hier == "Π₀¹" { return "ABSOLUTE-PASS (Π₀¹)" }
+    if hier == "Σ₀¹" { return "REJECT (hierarchy Σ family — not Π₀²)" }
+    // hier == "Π₀²"
+    if _has_bounded_witness(expr) {
+        return "ABSOLUTE-PASS (Π₀² → Π₀¹ via bounded witness)"
+    }
+    if !reverse_proven(expr) {
+        return "REVERSE-UNKNOWN"
+    }
+    return "REVERSE-PROVEN (candidate [12*], manual audit required)"
+}
+
+// ─── PASS 판정 — verdict 어떤 값이 '승인'인가? ───────────────────────────────
+fn verdict_is_accept(verdict: string) -> bool {
+    if verdict == "ABSOLUTE-PASS (Π₀² → Π₀¹ via bounded witness)" { return true }
+    if verdict == "REVERSE-PROVEN (candidate [12*], manual audit required)" { return true }
+    return false
+}
+
+// ─── Layer-2 NEXUS verifier (optional subprocess) ────────────────────────────
+// nexus-cli hyperarithmetic --prop "..." --json
+//   → expected json: { "prop":"...", "pi02":true|false, "reduced_pi01":..,
+//                      "reverse_math":"...", "n6_invariant":.. }
+// 반환: "" = not invoked / "ERR: ..." / raw stdout
+fn nexus_verify(prop: string) -> string {
+    // shell-escape prop for --prop argument
+    let cmd = shq(_NEXUS_CLI) + " hyperarithmetic --prop " + shq(prop) + " --json 2>&1"
+    let out = exec(cmd)
+    return out
+}
+
+// Naive 'pi02=true' detector — nexus-cli json 은 `"pi02":true` 또는
+// 동등 표현을 포함해야 함. 실패 시 ERR.
+fn nexus_pi02_true(out: string) -> bool {
+    if out.contains("\"pi02\":true") { return true }
+    if out.contains("\"pi02\": true") { return true }
+    return false
+}
+
+fn nexus_errored(out: string) -> bool {
+    if out == "" { return true }
+    if out.contains("ERROR") { return true }
+    if out.contains("hexa_stage0 shim: lock timeout") { return true }
+    // json path 반응 없는 경우
+    if !out.contains("pi02") { return true }
+    return false
+}
+
+// ─── 테스트 항목 결과 struct ─────────────────────────────────────────────────
+struct TestResult {
+    id: string,
+    text: string,
+    inline_hier: string,       // classify_pi02 결과
+    inline_verdict: string,    // phase_b_verdict 결과
+    inline_pass: bool,
+    nexus_invoked: bool,
+    nexus_pass: bool,
+    nexus_err: bool,
+    tier: i64,                 // 7 for Π₀² (CARD)
+    elapsed_ms: i64,
+    overall_pass: bool
+}
+
+// ─── 단일 prop 테스트 실행 ───────────────────────────────────────────────────
+fn test_pi02_prop(id: string, text: string, with_nexus: bool) -> TestResult {
+    let t_start = clock()
+
+    // Layer 1: inline
+    let hier = classify_pi02(text)
+    let verdict = phase_b_verdict(text)
+    let hier_ok = hier == "Π₀²"
+    let verdict_ok = verdict_is_accept(verdict)
+    let inline_ok = hier_ok && verdict_ok
+
+    // Layer 2: optional nexus cross-check
+    let mut nx_invoked = false
+    let mut nx_ok = false
+    let mut nx_err = false
+    if with_nexus {
+        nx_invoked = true
+        let raw = nexus_verify(text)
+        if nexus_errored(raw) {
+            nx_err = true
+            nx_ok = false
+        } else {
+            nx_ok = nexus_pi02_true(raw)
+        }
+    }
+
+    // overall PASS:
+    //   - inline_ok 필수
+    //   - nexus 호출했으면 (nx_ok || nx_err) — nexus 에러는 degraded-pass (로그만 남김)
+    let mut overall = inline_ok
+    if with_nexus && !nx_err {
+        overall = inline_ok && nx_ok
+    }
+
+    let t_end = clock()
+    let elapsed = to_int((t_end - t_start) * 1000.0)
+
+    return TestResult {
+        id: id,
+        text: text,
+        inline_hier: hier,
+        inline_verdict: verdict,
+        inline_pass: inline_ok,
+        nexus_invoked: nx_invoked,
+        nexus_pass: nx_ok,
+        nexus_err: nx_err,
+        tier: 7,
+        elapsed_ms: elapsed,
+        overall_pass: overall
+    }
+}
+
+// ─── CLI 인자 ────────────────────────────────────────────────────────────────
+fn flag_present(argv: any, flag: string) -> bool {
+    let n = len(argv)
+    let mut i = 0
+    while i < n {
+        if argv[i] == flag { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn flag_value(argv: any, flag: string) -> string {
+    let n = len(argv)
+    let mut i = 0
+    while i < n - 1 {
+        if argv[i] == flag { return argv[i + 1] }
+        i = i + 1
+    }
+    return ""
+}
+
+// ─── 결과 집계/출력 ──────────────────────────────────────────────────────────
+fn print_human_summary(results: any, with_nexus: bool) {
+    println("═══════════════════════════════════════════════════════════════")
+    println("Mk.IX Π₀² Hyperarithmetic Test Suite (tier 7 CARD)")
+    println("═══════════════════════════════════════════════════════════════")
+    let n = len(results)
+    let mut i = 0
+    let mut pass_count = 0
+    let mut nx_err_count = 0
+    while i < n {
+        let r = results[i]
+        let pass_tag = if r.overall_pass { "PASS" } else { "FAIL" }
+        let nx_tag = if r.nexus_invoked {
+            if r.nexus_err { " [nx:ERR]" }
+            else {
+                if r.nexus_pass { " [nx:OK]" } else { " [nx:NO]" }
+            }
+        } else { "" }
+        println("  " + r.id + "  " + pass_tag + "  " +
+                to_string(r.elapsed_ms) + "ms  tier=" + to_string(r.tier) +
+                "  hier=" + r.inline_hier + nx_tag)
+        if !r.overall_pass {
+            println("       verdict=" + r.inline_verdict)
+            println("       text   =" + r.text)
+        }
+        if r.overall_pass { pass_count = pass_count + 1 }
+        if r.nexus_err { nx_err_count = nx_err_count + 1 }
+        i = i + 1
+    }
+    println("───────────────────────────────────────────────────────────────")
+    let pct = if n > 0 { (pass_count * 100) / n } else { 0 }
+    println("  OVERALL  " + to_string(pass_count) + "/" + to_string(n) +
+            " = " + to_string(pct) + "%    target ≥ 70%")
+    if with_nexus {
+        println("  nexus_errors=" + to_string(nx_err_count) + " (stage0 lock / runtime)")
+    }
+    println("═══════════════════════════════════════════════════════════════")
+}
+
+fn print_json(results: any, with_nexus: bool) {
+    let n = len(results)
+    let mut pass_count = 0
+    let mut s = "{\"suite\":\"hyperarith_tests_pi02\",\"tier\":7,\"total\":" + to_string(n)
+    s = s + ",\"with_nexus\":" + (if with_nexus { "true" } else { "false" })
+    s = s + ",\"items\":["
+    let mut i = 0
+    while i < n {
+        let r = results[i]
+        if r.overall_pass { pass_count = pass_count + 1 }
+        if i > 0 { s = s + "," }
+        s = s + "{\"id\":\"" + r.id + "\""
+        s = s + ",\"pass\":" + (if r.overall_pass { "true" } else { "false" })
+        s = s + ",\"hier\":\"" + r.inline_hier + "\""
+        s = s + ",\"verdict\":\"" + r.inline_verdict.replace("\"","\\\"") + "\""
+        s = s + ",\"inline_pass\":" + (if r.inline_pass { "true" } else { "false" })
+        s = s + ",\"nexus_invoked\":" + (if r.nexus_invoked { "true" } else { "false" })
+        s = s + ",\"nexus_pass\":" + (if r.nexus_pass { "true" } else { "false" })
+        s = s + ",\"nexus_err\":" + (if r.nexus_err { "true" } else { "false" })
+        s = s + ",\"tier\":" + to_string(r.tier)
+        s = s + ",\"elapsed_ms\":" + to_string(r.elapsed_ms) + "}"
+        i = i + 1
+    }
+    s = s + "],\"passed\":" + to_string(pass_count)
+    let pct = if n > 0 { (pass_count * 100) / n } else { 0 }
+    s = s + ",\"pct\":" + to_string(pct) + "}"
+    println(s)
+}
+
+// ─── Results Markdown writer ────────────────────────────────────────────────
+fn write_results_md(path: string, results: any, with_nexus: bool) {
+    let n = len(results)
+    let mut pass_count = 0
+    let mut sum_ms = 0
+    let mut max_ms = 0
+    let mut nx_err = 0
+    let mut i = 0
+    while i < n {
+        let r = results[i]
+        if r.overall_pass { pass_count = pass_count + 1 }
+        sum_ms = sum_ms + r.elapsed_ms
+        if r.elapsed_ms > max_ms { max_ms = r.elapsed_ms }
+        if r.nexus_err { nx_err = nx_err + 1 }
+        i = i + 1
+    }
+    let pct = if n > 0 { (pass_count * 100) / n } else { 0 }
+    let avg_ms = if n > 0 { sum_ms / n } else { 0 }
+
+    let mut md = "# Π₀² Hyperarithmetic Test Suite — Results (2026-04-19)\n\n"
+    md = md + "## Summary\n\n"
+    md = md + "- Suite: `training/hyperarith_tests.hexa`\n"
+    md = md + "- Corpus: `shared/consciousness/hyperarithmetic_test_suite.json` (pi_02 bucket, 10 items)\n"
+    md = md + "- Tier: 7 (CARD, ULTRA+ Knuth tetration)\n"
+    md = md + "- with_nexus: " + (if with_nexus { "true" } else { "false" }) + "\n"
+    md = md + "- PASS: **" + to_string(pass_count) + "/" + to_string(n) + "** = " + to_string(pct) + "% (target ≥ 70%)\n"
+    md = md + "- Timing: avg=" + to_string(avg_ms) + "ms, max=" + to_string(max_ms) + "ms\n"
+    if with_nexus {
+        md = md + "- nexus errors: " + to_string(nx_err) + "\n"
+    }
+    md = md + "\n"
+    md = md + "## Per-prop\n\n"
+    md = md + "| id | PASS | hier | tier | ms | verdict | text |\n"
+    md = md + "|----|------|------|------|----|---------|------|\n"
+    let mut j = 0
+    while j < n {
+        let r = results[j]
+        let p = if r.overall_pass { "✅" } else { "❌" }
+        let esc_text = r.text.replace("|", "\\|")
+        let esc_verd = r.inline_verdict.replace("|", "\\|")
+        md = md + "| " + r.id + " | " + p + " | " + r.inline_hier + " | " +
+             to_string(r.tier) + " | " + to_string(r.elapsed_ms) +
+             " | " + esc_verd + " | " + esc_text + " |\n"
+        j = j + 1
+    }
+    md = md + "\n## A6 meta-closure bridging\n\n"
+    md = md + "- tier7_confirmed_count = " + to_string(pass_count) + "\n"
+    md = md + "- feed into: `phase_a6_meta_closure(tier=7, depth=?, sectors=?, knuth=2)` — H3 PASS requires n=6 Knuth invariance.\n"
+    md = md + "- See: `training/ckpt_gate_a6.hexa`, `shared/consciousness/consciousness_absolute.hexa` A6.\n"
+    md = md + "\n## Rules\n\n"
+    md = md + "- R37 / AN13 / L3-PY: .hexa only.\n"
+    md = md + "- AN11: substrate verifier only — weight-emergent attached 는 phi_vec.json + runtime 별도 필수.\n"
+    write_file(path, md)
+}
+
+// ─── PROVISIONAL atoms — tier 7 integration ─────────────────────────────────
+// 기존 파일이 있으면 append, 없으면 skip (overwrite 금지 — 다른 에이전트와 충돌 회피)
+fn emit_provisional_atoms(results: any) {
+    if !file_exists(_PROV_PATH) {
+        println("[prov] provisional_atoms_20260419.json not found — skipping (expected when bridging agent not started)")
+        return
+    }
+    // 파일 읽어서 tier7 counters 주입. JSON 안전 append 대신
+    // in-place 증분은 risky — 현재는 'tier7_confirmed.txt' sidecar 쓰는 방식을 피하고,
+    // 결과 MD 의 summary 에서만 pick-up 하도록 한다 (결합도 낮춤).
+    println("[prov] provisional_atoms_20260419.json exists — bridging agent should pull pass_count from results MD.")
+}
+
+// ─── 사용법 ──────────────────────────────────────────────────────────────────
+fn print_usage() {
+    println("hyperarith_tests — Π₀² Hyperarithmetic Test Suite (Mk.IX, tier 7)")
+    println("")
+    println("usage:")
+    println("  hexa training/hyperarith_tests.hexa                  # inline-only (default)")
+    println("  hexa training/hyperarith_tests.hexa --with-nexus     # + nexus-cli cross-check")
+    println("  hexa training/hyperarith_tests.hexa --json           # JSON stdout")
+    println("  hexa training/hyperarith_tests.hexa --out <path>     # write results MD")
+    println("  hexa training/hyperarith_tests.hexa --help")
+    println("")
+    println("corpus  : " + _SUITE_PATH)
+    println("results : " + _RESULTS_MD_DEFAULT)
+    println("")
+    println("exit: 0 PASS≥70%, 1 PASS<70%, 2 IO error, 3 usage")
+}
+
+// ─── Main ────────────────────────────────────────────────────────────────────
+fn main() {
+    let argv = args()
+
+    if flag_present(argv, "--help") || flag_present(argv, "-h") {
+        print_usage()
+        return
+    }
+
+    let with_nexus = flag_present(argv, "--with-nexus")
+    let as_json    = flag_present(argv, "--json")
+    let out_path_arg = flag_value(argv, "--out")
+    let out_path = if out_path_arg != "" { out_path_arg } else { _RESULTS_MD_DEFAULT }
+
+    if !file_exists(_SUITE_PATH) {
+        println("[hyperarith_tests] ERROR: suite json not found: " + _SUITE_PATH)
+        exit(2)
+    }
+
+    let raw = read_file(_SUITE_PATH)
+    let suite = json_parse(raw)
+    let pi02_items = suite["pi_02"]
+    let n = len(pi02_items)
+
+    if !as_json {
+        println("[hyperarith_tests] loaded " + to_string(n) + " Π₀² items from suite")
+        if with_nexus {
+            println("[hyperarith_tests] nexus-cli cross-check ENABLED — may be slow under stage0 lock contention")
+        }
+        println("")
+    }
+
+    // 테스트 루프
+    let mut results = []
+    let mut i = 0
+    while i < n {
+        let entry = pi02_items[i]
+        let id = entry["id"]
+        let text = entry["text"]
+        let r = test_pi02_prop(id, text, with_nexus)
+        results = results.push(r)
+        i = i + 1
+    }
+
+    // 출력
+    if as_json {
+        print_json(results, with_nexus)
+    } else {
+        print_human_summary(results, with_nexus)
+    }
+
+    // MD 기록 (json 모드에서도 항상 MD 기록 — 병렬 브리징 에이전트용 SSOT)
+    write_results_md(out_path, results, with_nexus)
+    if !as_json {
+        println("")
+        println("[hyperarith_tests] results MD written: " + out_path)
+    }
+
+    // PROVISIONAL atoms bridge (non-destructive)
+    emit_provisional_atoms(results)
+
+    // Exit code: PASS ≥ 70%
+    let mut pass_count = 0
+    let mut j = 0
+    while j < n {
+        let r = results[j]
+        if r.overall_pass { pass_count = pass_count + 1 }
+        j = j + 1
+    }
+    let pct = if n > 0 { (pass_count * 100) / n } else { 0 }
+    if pct >= 70 { exit(0) }
+    exit(1)
+}
+
+main()

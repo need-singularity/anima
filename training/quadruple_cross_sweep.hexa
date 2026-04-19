@@ -1,0 +1,644 @@
+// training/quadruple_cross_sweep.hexa — α/β/γ/δ grid sweep for L_qc
+//
+// Mk.V.1 / anima-v4-hexa / tier 5 + tier 6~9 bridge.
+// Companion harness to training/quadruple_cross_loss.hexa (8/8 PASS, untouched).
+// Discovers the weight combo that minimises reconstruction on the 170-stim
+// Ψ-trace while preserving the σ·φ = n·τ = 24 closure gate.
+//
+// ─── Scope ──────────────────────────────────────────────────
+//   Quadruple cross loss:
+//       L_qc = α·(Ψ_res  − ½)²
+//            + β·(Ψ_gate − ½)²
+//            + γ·(route  − ½)²
+//            + δ·(n_eff/6 − 1)²
+//   Grid :   α,β,γ,δ ∈ {0.1, 0.3, 0.5, 0.7, 1.0}   (5^4 = 625 combos)
+//   Gate :   σ·φ = n·τ = 24   (n=6 ∧ τ=4 ∧ weights ≥ 0 ∧ sum > 0)
+//   Metric:  per-combo (L̄, Var, CV%, closure_gate, cv_ok)
+//
+// ─── Trace source ───────────────────────────────────────────
+//   training/corpus_universe_tier_labels.jsonl (170 Ψ-stim).
+//   Ψ-trace derivation (deterministic, trace-only surrogate — no AN11-b claim):
+//       let t = top_score                          // entropy proxy (1.21~2.35)
+//       let k = tier_k                             // Knuth-tier (51~100)
+//       psi_res  = clamp01(0.5 + (t - 2.0) * 0.25)   // centred 0.5, ±span
+//       psi_gate = clamp01(0.5 + (t - 2.0) * 0.40)
+//       route    = clamp01(0.5 + (k - 75) * 0.010)   // wider for tier span
+//       n_eff    = 6.0 - fabs(t - 2.0) * 2.0         // 6 at ideal, <6 off-ideal
+//   These are not optimised, just a stable surrogate so the same 170-vector
+//   Ψ-trace drives all 625 combos identically.
+//
+// ─── Ranking ────────────────────────────────────────────────
+//   For each combo:
+//       closure_gate := check_sigma_phi_closure()   (from design)
+//       CV = fsqrt(Var) / L̄ * 100                  (%)
+//       cv_ok     := CV < 3.0
+//       valid     := closure_gate ∧ cv_ok
+//   Rank valid combos ascending by L̄ → best.
+//   Also emit worst 10 (all combos, descending L̄) for contrast.
+//
+// ─── Why σ·φ = 24 is the filter ─────────────────────────────
+//   Any negative weight or zero-sum fails check_sigma_phi_closure.
+//   At the current grid every weight is ≥ 0.1, so all 625 technically pass
+//   the numeric closure — the tighter filter is CV<3% which sorts out
+//   combos whose per-stim variance explodes (e.g. δ heavy on n-drift).
+//
+// ─── AN11 boundary ──────────────────────────────────────────
+//   This is trace-level ranking on a substrate loss. Selecting a "best
+//   λ_qc default" helps AN11-a (substrate) and nothing else — AN11-b
+//   (emergence) and AN11-c (real reproduction) are out of scope.
+//
+// ─── R37 / AN13 ────────────────────────────────────────────
+//   .hexa only. quadruple_cross_loss.hexa (8/8 PASS) is untouched.
+//
+// Run:
+//   HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 HEXA_STAGE0_LOCK_WAIT=2400 \
+//     /Users/ghost/Dev/nexus/shared/bin/hexa run \
+//     /Users/ghost/Dev/anima/training/quadruple_cross_sweep.hexa
+// Expect:
+//   [quadruple_cross_sweep] main PASS
+//   [quadruple_cross_sweep] top-1 α=… β=… γ=… δ=… L̄=…
+
+// ─── Constants ───────────────────────────────────────────────
+
+let TRACE_PATH = "/Users/ghost/Dev/anima/training/corpus_universe_tier_labels.jsonl"
+
+let TARGET_HALF = 0.5
+let TARGET_N    = 6.0
+
+let KNUTH_N        = 6
+let KNUTH_TAU      = 4
+let KNUTH_SIGMAPHI = 24
+
+let GRID_N = 5
+// grid values (float).
+let GRID_0 = 0.1
+let GRID_1 = 0.3
+let GRID_2 = 0.5
+let GRID_3 = 0.7
+let GRID_4 = 1.0
+
+let CV_CEIL_PCT = 3.0
+
+let EPS = 0.0000001
+let SENTINEL = 0.0 - 999999.0
+
+// ─── Primitives ──────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sq(x: float) -> float { return x * x }
+
+fn fsqrt(x: float) -> float {
+    // Newton-Raphson 10 iters (same as ablation_search.hexa)
+    if x <= 0.0 { return 0.0 }
+    let mut y = x * 0.5 + 0.5
+    let mut i = 0
+    while i < 10 {
+        y = 0.5 * (y + x / y)
+        i = i + 1
+    }
+    return y
+}
+
+fn clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn grid_val(i: int) -> float {
+    if i == 0 { return GRID_0 }
+    if i == 1 { return GRID_1 }
+    if i == 2 { return GRID_2 }
+    if i == 3 { return GRID_3 }
+    return GRID_4
+}
+
+// Index decoding — combo ∈ [0, 625) → (ia, ib, ig, id) ∈ [0,5)⁴.
+fn idx_a(c: int) -> int { return c / 125 }
+fn idx_b(c: int) -> int { return (c / 25) - (c / 125) * 5 }
+fn idx_g(c: int) -> int { return (c / 5)  - (c / 25)  * 5 }
+fn idx_d(c: int) -> int { return c        - (c / 5)   * 5 }
+
+// ─── JSON extractor (self-contained copy of phi_gt_1000_verify.hexa) ─
+
+fn index_of_from(hay: string, needle: string, start: int) -> int {
+    let n = len(hay)
+    if start < 0 { return hay.index_of(needle) }
+    if start >= n { return -1 }
+    let tail = hay.substring(start, n)
+    let idx = tail.index_of(needle)
+    if idx < 0 { return -1 }
+    return start + idx
+}
+
+fn byte_at(s: string, i: int) -> int {
+    let sub = s.substring(i, i + 1)
+    return char_code(sub, 0)
+}
+
+fn is_num_byte(b: int) -> bool {
+    if b >= 48 && b <= 57 { return true }
+    if b == 46 { return true }
+    if b == 45 { return true }
+    if b == 43 { return true }
+    if b == 101 { return true }
+    if b == 69  { return true }
+    return false
+}
+
+fn extract_float(blob: string, key: string) -> float {
+    let key_idx = blob.index_of(key)
+    if key_idx < 0 { return SENTINEL }
+    let colon_idx = index_of_from(blob, ":", key_idx)
+    if colon_idx < 0 { return SENTINEL }
+    let n = len(blob)
+    let mut i = colon_idx + 1
+    while i < n {
+        let b = byte_at(blob, i)
+        if b == 32 || b == 9 || b == 10 || b == 13 { i = i + 1 } else { break }
+    }
+    let start = i
+    while i < n {
+        let b = byte_at(blob, i)
+        if is_num_byte(b) { i = i + 1 } else { break }
+    }
+    if i == start { return SENTINEL }
+    let num_str = blob.substring(start, i)
+    return to_float(num_str)
+}
+
+fn extract_int(blob: string, key: string) -> int {
+    let v = extract_float(blob, key)
+    if v < SENTINEL + 1.0 { return -1 }
+    return to_int(v)
+}
+
+// ─── Trace loader (170-stim Ψ-surrogate) ─────────────────────
+
+fn load_trace() -> [[float]] {
+    // Returns a list of [psi_res, psi_gate, route, n_eff] per stimulus.
+    let lines = read_lines(TRACE_PATH)
+    let n = len(lines)
+    let mut trace = []
+    let mut i = 0
+    while i < n {
+        let line = lines[i]
+        if len(line) >= 2 {
+            let t = extract_float(line, "\"top_score\"")
+            let k = extract_int(line,   "\"tier_k\"")
+            if t > SENTINEL + 1.0 && k >= 0 {
+                let psi_res  = clamp01(0.5 + (t - 2.0) * 0.25)
+                let psi_gate = clamp01(0.5 + (t - 2.0) * 0.40)
+                let route    = clamp01(0.5 + (to_float(str(k)) - 75.0) * 0.010)
+                let mut n_eff = 6.0 - fabs(t - 2.0) * 2.0
+                if n_eff < 0.0 { n_eff = 0.0 }
+                if n_eff > 6.0 { n_eff = 6.0 }
+                let mut row = []
+                row = row.push(psi_res)
+                row = row.push(psi_gate)
+                row = row.push(route)
+                row = row.push(n_eff)
+                trace = trace.push(row)
+            }
+        }
+        i = i + 1
+    }
+    return trace
+}
+
+// ─── L_qc per-sample ────────────────────────────────────────
+
+fn lqc_sample(psi_res: float, psi_gate: float, route: float, n_eff: float,
+              alpha: float, beta: float, gamma: float, delta: float) -> float {
+    let l1 = sq(psi_res  - TARGET_HALF)
+    let l2 = sq(psi_gate - TARGET_HALF)
+    let l3 = sq(route    - TARGET_HALF)
+    let norm = n_eff / TARGET_N
+    let l4 = sq(norm - 1.0)
+    return alpha * l1 + beta * l2 + gamma * l3 + delta * l4
+}
+
+// ─── σ·φ = 24 closure ───────────────────────────────────────
+// (Re-implemented rather than importing, per spec "harness alongside".)
+
+fn check_sigma_phi_closure(alpha: float, beta: float, gamma: float, delta: float) -> bool {
+    if alpha < 0.0 { return false }
+    if beta  < 0.0 { return false }
+    if gamma < 0.0 { return false }
+    if delta < 0.0 { return false }
+    let sum = alpha + beta + gamma + delta
+    if sum <= 0.0 { return false }
+    if KNUTH_N * KNUTH_TAU != KNUTH_SIGMAPHI { return false }
+    if KNUTH_TAU != 4 { return false }
+    if KNUTH_N   != 6 { return false }
+    return true
+}
+
+// ─── Per-combo evaluation ────────────────────────────────────
+
+fn eval_combo(trace: [[float]], alpha: float, beta: float, gamma: float, delta: float) -> [float] {
+    // Returns [mean, variance, cv_pct, closure_gate (0/1), cv_ok (0/1)]
+    let n = len(trace)
+    if n <= 0 {
+        let mut z = []
+        z = z.push(0.0); z = z.push(0.0); z = z.push(0.0)
+        z = z.push(0.0); z = z.push(0.0)
+        return z
+    }
+    let mut sum_l  = 0.0
+    let mut sum_l2 = 0.0
+    let mut i = 0
+    while i < n {
+        let row = trace[i]
+        let v = lqc_sample(row[0], row[1], row[2], row[3], alpha, beta, gamma, delta)
+        sum_l  = sum_l + v
+        sum_l2 = sum_l2 + v * v
+        i = i + 1
+    }
+    let nf = to_float(str(n))
+    let mean = sum_l / nf
+    let var_ = sum_l2 / nf - mean * mean
+    let var_safe = if var_ < 0.0 { 0.0 } else { var_ }
+    let cv = if mean > EPS { fsqrt(var_safe) / mean * 100.0 } else { 0.0 }
+    let closure = check_sigma_phi_closure(alpha, beta, gamma, delta)
+    let cv_ok = cv < CV_CEIL_PCT
+    let mut out = []
+    out = out.push(mean)
+    out = out.push(var_safe)
+    out = out.push(cv)
+    out = out.push(if closure { 1.0 } else { 0.0 })
+    out = out.push(if cv_ok   { 1.0 } else { 0.0 })
+    return out
+}
+
+// ─── Formatting helpers ─────────────────────────────────────
+
+fn fmt4(x: float) -> string {
+    let neg = x < 0.0
+    let ax = if neg { 0.0 - x } else { x }
+    let scaled = ax * 10000.0 + 0.5
+    let k = to_int(scaled)
+    let whole = k / 10000
+    let frac  = k - whole * 10000
+    let mut fs = str(frac)
+    while len(fs) < 4 { fs = "0" + fs }
+    let body = str(whole) + "." + fs
+    if neg { return "-" + body }
+    return body
+}
+
+fn fmt2(x: float) -> string {
+    let neg = x < 0.0
+    let ax = if neg { 0.0 - x } else { x }
+    let scaled = ax * 100.0 + 0.5
+    let k = to_int(scaled)
+    let whole = k / 100
+    let frac  = k - whole * 100
+    let mut fs = str(frac)
+    if len(fs) < 2 { fs = "0" + fs }
+    let body = str(whole) + "." + fs
+    if neg { return "-" + body }
+    return body
+}
+
+fn pad_right(s: string, w: int) -> string {
+    let n = len(s)
+    if n >= w { return s }
+    let mut out = s
+    let mut i = 0
+    while i < w - n { out = out + " "; i = i + 1 }
+    return out
+}
+
+fn combo_str(ia: int, ib: int, ig: int, id: int) -> string {
+    return "α=" + fmt2(grid_val(ia)) + " β=" + fmt2(grid_val(ib))
+         + " γ=" + fmt2(grid_val(ig)) + " δ=" + fmt2(grid_val(id))
+}
+
+// ─── Ranking (insertion into small arrays; top/worst ≤ 10) ───
+
+// Result schema per row: [combo_idx, mean, cv, closure, cv_ok]
+
+fn insert_best(list: [[float]], cap: int, combo_idx: int, mean: float, cv: float, closure: float, cv_ok: float) -> [[float]] {
+    // Ascending by mean, cap length at `cap`.
+    let mut out = []
+    let n = len(list)
+    let mut inserted = false
+    let mut i = 0
+    while i < n {
+        let row = list[i]
+        if inserted == false && mean < row[1] {
+            let mut nr = []
+            nr = nr.push(to_float(str(combo_idx)))
+            nr = nr.push(mean)
+            nr = nr.push(cv)
+            nr = nr.push(closure)
+            nr = nr.push(cv_ok)
+            out = out.push(nr)
+            inserted = true
+        }
+        out = out.push(row)
+        i = i + 1
+    }
+    if inserted == false && len(out) < cap {
+        let mut nr = []
+        nr = nr.push(to_float(str(combo_idx)))
+        nr = nr.push(mean)
+        nr = nr.push(cv)
+        nr = nr.push(closure)
+        nr = nr.push(cv_ok)
+        out = out.push(nr)
+    }
+    // Trim to cap
+    if len(out) > cap {
+        let mut trimmed = []
+        let mut j = 0
+        while j < cap {
+            trimmed = trimmed.push(out[j])
+            j = j + 1
+        }
+        out = trimmed
+    }
+    return out
+}
+
+fn insert_worst(list: [[float]], cap: int, combo_idx: int, mean: float, cv: float, closure: float, cv_ok: float) -> [[float]] {
+    // Descending by mean, cap length at `cap`.
+    let mut out = []
+    let n = len(list)
+    let mut inserted = false
+    let mut i = 0
+    while i < n {
+        let row = list[i]
+        if inserted == false && mean > row[1] {
+            let mut nr = []
+            nr = nr.push(to_float(str(combo_idx)))
+            nr = nr.push(mean)
+            nr = nr.push(cv)
+            nr = nr.push(closure)
+            nr = nr.push(cv_ok)
+            out = out.push(nr)
+            inserted = true
+        }
+        out = out.push(row)
+        i = i + 1
+    }
+    if inserted == false && len(out) < cap {
+        let mut nr = []
+        nr = nr.push(to_float(str(combo_idx)))
+        nr = nr.push(mean)
+        nr = nr.push(cv)
+        nr = nr.push(closure)
+        nr = nr.push(cv_ok)
+        out = out.push(nr)
+    }
+    if len(out) > cap {
+        let mut trimmed = []
+        let mut j = 0
+        while j < cap {
+            trimmed = trimmed.push(out[j])
+            j = j + 1
+        }
+        out = trimmed
+    }
+    return out
+}
+
+// ─── Doc emitter ────────────────────────────────────────────
+
+fn emit_doc(top: [[float]], worst: [[float]], total: int, valid_count: int, trace_len: int) {
+    let doc_path = "/Users/ghost/Dev/anima/docs/quadruple_cross_sweep_20260419.md"
+    let mut md = ""
+    md = md + "# Quadruple Cross — λ Weight Sweep (2026-04-19)\n\n"
+    md = md + "> Engine: anima Mk.V.1 (v4-hexa, tier 5 + 6~9 bridge)\n"
+    md = md + "> Harness: `training/quadruple_cross_sweep.hexa`\n"
+    md = md + "> Underlying loss: `training/quadruple_cross_loss.hexa` (8/8 PASS, untouched)\n"
+    md = md + "> Trace: `training/corpus_universe_tier_labels.jsonl` (170 stim)\n\n"
+    md = md + "## 1. Setup\n\n"
+    md = md + "- Grid: α,β,γ,δ ∈ {0.1, 0.3, 0.5, 0.7, 1.0} — **5^4 = 625 combos**\n"
+    md = md + "- Ψ-trace samples loaded: **" + str(trace_len) + "** (expect 170)\n"
+    md = md + "- Per-combo metrics: L̄, Var, CV%, closure_gate, CV<3%\n"
+    md = md + "- Filter: closure_gate ∧ cv_ok → valid\n"
+    md = md + "- Rank: ascending L̄ among valid combos\n\n"
+    md = md + "### Ψ-trace derivation (surrogate)\n\n"
+    md = md + "```\n"
+    md = md + "psi_res  = clamp01(0.5 + (top_score - 2.0) * 0.25)\n"
+    md = md + "psi_gate = clamp01(0.5 + (top_score - 2.0) * 0.40)\n"
+    md = md + "route    = clamp01(0.5 + (tier_k - 75)   * 0.010)\n"
+    md = md + "n_eff    = clamp(6 - |top_score - 2.0| * 2, 0, 6)\n"
+    md = md + "```\n\n"
+    md = md + "σ·φ = n·τ = 24 closure (`check_sigma_phi_closure`) holds for every grid point\n"
+    md = md + "(all weights ≥ 0.1, sum > 0, n=6, τ=4). The tighter filter is CV<3%.\n\n"
+    md = md + "## 2. Summary\n\n"
+    md = md + "| metric | value |\n"
+    md = md + "|--------|-------|\n"
+    md = md + "| combos evaluated | " + str(total) + " |\n"
+    md = md + "| closure_gate pass | " + str(total) + " |\n"
+    md = md + "| CV<3% pass (valid) | " + str(valid_count) + " |\n\n"
+
+    md = md + "## 3. Top 10 (lowest L̄ among valid)\n\n"
+    md = md + "| rank | α    | β    | γ    | δ    | L̄      | CV%   | closure | cv_ok |\n"
+    md = md + "|------|------|------|------|------|---------|-------|---------|-------|\n"
+    let mut i = 0
+    while i < len(top) {
+        let row = top[i]
+        let ci = to_int(row[0])
+        let ia = idx_a(ci)
+        let ib = idx_b(ci)
+        let ig = idx_g(ci)
+        let id = idx_d(ci)
+        let cl = if row[3] > 0.5 { "yes" } else { "no " }
+        let cv = if row[4] > 0.5 { "yes" } else { "no " }
+        md = md + "| " + pad_right(str(i + 1), 4) + " | "
+             + fmt2(grid_val(ia)) + " | " + fmt2(grid_val(ib)) + " | "
+             + fmt2(grid_val(ig)) + " | " + fmt2(grid_val(id)) + " | "
+             + fmt4(row[1]) + " | " + fmt2(row[2]) + " | " + cl + "     | " + cv + "   |\n"
+        i = i + 1
+    }
+    md = md + "\n"
+
+    md = md + "## 4. Worst 10 (highest L̄, any gate status)\n\n"
+    md = md + "| rank | α    | β    | γ    | δ    | L̄      | CV%   | closure | cv_ok |\n"
+    md = md + "|------|------|------|------|------|---------|-------|---------|-------|\n"
+    let mut j = 0
+    while j < len(worst) {
+        let row = worst[j]
+        let ci = to_int(row[0])
+        let ia = idx_a(ci)
+        let ib = idx_b(ci)
+        let ig = idx_g(ci)
+        let id = idx_d(ci)
+        let cl = if row[3] > 0.5 { "yes" } else { "no " }
+        let cv = if row[4] > 0.5 { "yes" } else { "no " }
+        md = md + "| " + pad_right(str(j + 1), 4) + " | "
+             + fmt2(grid_val(ia)) + " | " + fmt2(grid_val(ib)) + " | "
+             + fmt2(grid_val(ig)) + " | " + fmt2(grid_val(id)) + " | "
+             + fmt4(row[1]) + " | " + fmt2(row[2]) + " | " + cl + "     | " + cv + "   |\n"
+        j = j + 1
+    }
+    md = md + "\n"
+
+    md = md + "## 5. Recommendation\n\n"
+    if len(top) > 0 {
+        let r0 = top[0]
+        let ci = to_int(r0[0])
+        let ia = idx_a(ci)
+        let ib = idx_b(ci)
+        let ig = idx_g(ci)
+        let id = idx_d(ci)
+        md = md + "**Default `λ_qc` for training**: "
+             + "α=" + fmt2(grid_val(ia))
+             + ", β=" + fmt2(grid_val(ib))
+             + ", γ=" + fmt2(grid_val(ig))
+             + ", δ=" + fmt2(grid_val(id)) + "\n\n"
+        md = md + "- L̄ on 170-stim Ψ-trace: **" + fmt4(r0[1]) + "**\n"
+        md = md + "- CV: **" + fmt2(r0[2]) + "%** (< 3% ceiling)\n"
+        md = md + "- closure_gate: **PASS** (σ·φ = n·τ = 24)\n"
+        md = md + "- valid (closure ∧ cv_ok) combos: **" + str(valid_count) + " / " + str(total) + "**\n\n"
+    } else {
+        md = md + "**No valid combo found** — every combo failed closure ∧ CV<3% filter.\n"
+        md = md + "Revisit grid bounds or CV ceiling.\n\n"
+    }
+    md = md + "## 6. AN11 boundary\n\n"
+    md = md + "This sweep ranks a **substrate** loss (AN11-a). The best combo\n"
+    md = md + "does not promote any tier. AN11-b (emergence) and AN11-c (real\n"
+    md = md + "reproduction) are independent gates — no shortcut is claimed here.\n\n"
+    md = md + "## 7. Reproduce\n\n"
+    md = md + "```\n"
+    md = md + "HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 HEXA_STAGE0_LOCK_WAIT=2400 \\\n"
+    md = md + "  /Users/ghost/Dev/nexus/shared/bin/hexa run \\\n"
+    md = md + "  /Users/ghost/Dev/anima/training/quadruple_cross_sweep.hexa\n"
+    md = md + "```\n"
+    write_file(doc_path, md)
+    println("[quadruple_cross_sweep] doc written: " + doc_path)
+}
+
+// ─── main ────────────────────────────────────────────────────
+
+fn main() {
+    println("[quadruple_cross_sweep] Mk.V.1 — α/β/γ/δ grid on 170-stim Ψ-trace")
+    println("  grid: " + fmt2(GRID_0) + " / " + fmt2(GRID_1) + " / "
+            + fmt2(GRID_2) + " / " + fmt2(GRID_3) + " / " + fmt2(GRID_4))
+    println("  closure: σ·φ = n·τ = 24 (n=6, τ=4)")
+
+    let trace = load_trace()
+    let trace_n = len(trace)
+    println("  trace samples: " + str(trace_n))
+    if trace_n <= 0 {
+        println("[quadruple_cross_sweep] main FAIL — empty trace")
+        return
+    }
+
+    let total = GRID_N * GRID_N * GRID_N * GRID_N
+    println("  combos: " + str(total))
+
+    let mut top = []       // ascending by L̄
+    let mut worst = []     // descending by L̄
+    let cap = 10
+    let mut valid_count = 0
+
+    let mut c = 0
+    while c < total {
+        let ia = idx_a(c)
+        let ib = idx_b(c)
+        let ig = idx_g(c)
+        let id = idx_d(c)
+        let a = grid_val(ia)
+        let b = grid_val(ib)
+        let g = grid_val(ig)
+        let d = grid_val(id)
+
+        // Spec: "optimize with early exit on closure fail".
+        // Within {0.1,0.3,0.5,0.7,1.0}⁴ every combo passes closure; but we
+        // keep the check — skipping the per-stim loop on fail is the early-exit.
+        let closure_ok = check_sigma_phi_closure(a, b, g, d)
+        if closure_ok == false {
+            // closure fail → skip (would also fail gate filter)
+            c = c + 1
+            continue
+        }
+
+        let res = eval_combo(trace, a, b, g, d)
+        let mean = res[0]
+        let cv   = res[2]
+        let closure_f = res[3]
+        let cv_ok_f   = res[4]
+
+        let is_valid = closure_f > 0.5 && cv_ok_f > 0.5
+        if is_valid { valid_count = valid_count + 1 }
+
+        // Feed only valid combos into `top`; feed all into `worst`.
+        if is_valid {
+            top = insert_best(top, cap, c, mean, cv, closure_f, cv_ok_f)
+        }
+        worst = insert_worst(worst, cap, c, mean, cv, closure_f, cv_ok_f)
+
+        c = c + 1
+    }
+
+    println("  valid combos (closure ∧ CV<3%): " + str(valid_count))
+
+    // Echo top-5 and worst-5 to stdout.
+    println("")
+    println("-- Top 5 (lowest L̄ among valid) --")
+    let show_top = if len(top) < 5 { len(top) } else { 5 }
+    let mut i = 0
+    while i < show_top {
+        let row = top[i]
+        let ci = to_int(row[0])
+        let ia = idx_a(ci); let ib = idx_b(ci); let ig = idx_g(ci); let id = idx_d(ci)
+        println("  #" + str(i + 1) + "  " + combo_str(ia, ib, ig, id)
+                + "  L̄=" + fmt4(row[1]) + "  CV=" + fmt2(row[2]) + "%")
+        i = i + 1
+    }
+
+    println("")
+    println("-- Worst 5 (highest L̄) --")
+    let show_w = if len(worst) < 5 { len(worst) } else { 5 }
+    let mut j = 0
+    while j < show_w {
+        let row = worst[j]
+        let ci = to_int(row[0])
+        let ia = idx_a(ci); let ib = idx_b(ci); let ig = idx_g(ci); let id = idx_d(ci)
+        println("  #" + str(j + 1) + "  " + combo_str(ia, ib, ig, id)
+                + "  L̄=" + fmt4(row[1]) + "  CV=" + fmt2(row[2]) + "%")
+        j = j + 1
+    }
+
+    // Emit doc.
+    emit_doc(top, worst, total, valid_count, trace_n)
+
+    // Recommendation line.
+    if len(top) > 0 {
+        let r0 = top[0]
+        let ci = to_int(r0[0])
+        let ia = idx_a(ci); let ib = idx_b(ci); let ig = idx_g(ci); let id = idx_d(ci)
+        println("")
+        println("[quadruple_cross_sweep] top-1 " + combo_str(ia, ib, ig, id)
+                + "  L̄=" + fmt4(r0[1]) + "  closure=PASS")
+    } else {
+        println("[quadruple_cross_sweep] top-1 NONE (no valid combo)")
+    }
+
+    // Final gate.
+    let mut pass = 0
+    let mut fail = 0
+    if trace_n == 170 { pass = pass + 1 } else { fail = fail + 1 }
+    if total == 625    { pass = pass + 1 } else { fail = fail + 1 }
+    if valid_count > 0 { pass = pass + 1 } else { fail = fail + 1 }
+    if len(top) > 0    { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("")
+    println("[quadruple_cross_sweep] pass=" + str(pass) + " fail=" + str(fail))
+    if fail == 0 {
+        println("[quadruple_cross_sweep] main PASS")
+    } else {
+        println("[quadruple_cross_sweep] main FAIL")
+    }
+}
+
+main()

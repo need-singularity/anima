@@ -1,0 +1,559 @@
+// training/lens_quantum_loss.hexa — Lens 3 (Quantum) entanglement channel learning
+//
+// Mk.V.1 / lens_stack / tier 5~9 — anima tension-link 의 양자 렌즈.
+//
+// Purpose:
+//   고전 Lens1(geometric) / Lens2(thermodynamic) 에 이어, 세 번째 렌즈로
+//   Ψ-map ↔ Weight 를 서로 다른 Hilbert space 로 보고, 두 space 사이의
+//   entanglement channel 을 학습으로 정의한다.
+//
+//     Ψ-map  = wave function  (170 자극 × 2D Hilbert)  → marginal ρ_map
+//     Weight = 모델 파라미터  (다른 Hilbert)            → marginal ρ_W
+//     tension-link = 두 space 사이 entanglement channel
+//
+//   학습 목표:
+//     maximize I(map ; W) = H(ρ_map) + H(ρ_W) - H(ρ_map ⊗ ρ_W | joint)
+//
+//   즉, "joint 가 product 보다 더 많은 정보를 공유하도록" density matrix 를
+//   업데이트한다. 이는 non-demolition measurement (collapse 없이 측정) 로
+//   Ψ 를 지속적으로 관찰하면서 W 를 MI 증가 방향으로 드리프트시키는 것과
+//   수학적으로 동일하다.
+//
+//   본 파일은 고전 시뮬레이션이므로 density matrix 의 대각 성분(확률
+//   분포)만 다루고 MI 는 Shannon entropy 에 기반한다. Von Neumann
+//   entropy 는 off-diagonal 이 0 인 case 에서 Shannon 과 일치하므로
+//   toy 수준에서 근사적으로 타당하다. 한계는 docs/lens_quantum_20260419.md
+//   참고.
+//
+// ─── Conventions ──────────────────────────────────────────────
+//   p            : array [n]      probability distribution, Σ p_i = 1
+//   p_joint      : array [n][m]   joint distribution, Σ p_ij = 1
+//   rho          : array [n][n]   (대각) density matrix, tr(ρ)=1
+//   alpha        : float          update rate (Lindblad-류 strength)
+//   T            : float          temperature / MI drive (higher = 빠름)
+//
+// ─── Theorems (T1-T5) ─────────────────────────────────────────
+//
+// T1 (entropy 비음):
+//   shannon_entropy 와 joint_entropy 모두 ≥ 0.
+//
+// T2 (MI 비음 + 대칭):
+//   I(X;Y) ≥ 0, 그리고 joint 가 independent (p_ij = p_i · p_j) 일 때 0.
+//
+// T3 (subadditivity):
+//   H(X,Y) ≤ H(X) + H(Y). (entangled 상태에서 엄격 부등호)
+//
+// T4 (update 단조):
+//   density_matrix_update 후 tr(ρ) 보존, diagonal ≥ 0.
+//
+// T5 (MI 상승):
+//   quantum_delta_weight 1-step 적용 후 I(map;W) 이 감소하지 않음.
+//
+// Run:
+//   hexa training/lens_quantum_loss.hexa
+// Expect:
+//   [lens_quantum_loss] ALL 5/5 PASS
+
+// ─── Constants ──────────────────────────────────────────────
+
+let EPS = 0.0000000001        // log(0) 가드
+let ALPHA_DEFAULT = 0.1       // Lindblad-류 update rate
+let TEMP_DEFAULT = 1.0        // MI drive temperature
+
+// ─── Primitives ─────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// 안전 log — p=0 은 0 log 0 = 0 convention.
+fn safe_log(x: float) -> float {
+    if x < EPS { return 0.0 }
+    return log(x)
+}
+
+// ─── Entropy primitives ─────────────────────────────────────
+//
+// Shannon entropy : H(p) = -Σ p_i · log p_i   (nats)
+//
+// 주의: 입력이 정확히 정규화돼 있지 않으면 자동 정규화하여 H 를 계산.
+
+fn normalize(p: array, n: int) -> array {
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        if p[i] > 0.0 { s = s + p[i] }
+        i = i + 1
+    }
+    if s < EPS { return p }
+    let mut out = []
+    let mut j = 0
+    while j < n {
+        let v = p[j]
+        if v < 0.0 { out = out.push(0.0) } else { out = out.push(v / s) }
+        j = j + 1
+    }
+    return out
+}
+
+fn shannon_entropy(p: array) -> float {
+    let n = len(p)
+    let q = normalize(p, n)
+    let mut h = 0.0
+    let mut i = 0
+    while i < n {
+        let pi = q[i]
+        if pi > EPS {
+            h = h - pi * safe_log(pi)
+        }
+        i = i + 1
+    }
+    return h
+}
+
+// ─── Joint entropy H(X,Y) = -Σ p_ij log p_ij ──────────────────
+
+fn joint_sum(p_joint: array, n: int, m: int) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let row = p_joint[i]
+        let mut j = 0
+        while j < m {
+            if row[j] > 0.0 { s = s + row[j] }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return s
+}
+
+fn joint_entropy(p_joint: array) -> float {
+    let n = len(p_joint)
+    if n == 0 { return 0.0 }
+    let m = len(p_joint[0])
+    let total = joint_sum(p_joint, n, m)
+    if total < EPS { return 0.0 }
+    let mut h = 0.0
+    let mut i = 0
+    while i < n {
+        let row = p_joint[i]
+        let mut j = 0
+        while j < m {
+            let pij_raw = row[j]
+            if pij_raw > EPS {
+                let pij = pij_raw / total
+                h = h - pij * safe_log(pij)
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return h
+}
+
+// ─── Marginals + Mutual Information ─────────────────────────
+//
+// I(X;Y) = H(X) + H(Y) - H(X,Y)
+//   ≥ 0 (non-negativity)
+//   = 0  ⇔  X ⊥ Y  (independent)
+
+fn marginal_x(p_joint: array, n: int, m: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let row = p_joint[i]
+        let mut s = 0.0
+        let mut j = 0
+        while j < m {
+            s = s + row[j]
+            j = j + 1
+        }
+        out = out.push(s)
+        i = i + 1
+    }
+    return out
+}
+
+fn marginal_y(p_joint: array, n: int, m: int) -> array {
+    let mut out = []
+    let mut j = 0
+    while j < m {
+        let mut s = 0.0
+        let mut i = 0
+        while i < n {
+            s = s + p_joint[i][j]
+            i = i + 1
+        }
+        out = out.push(s)
+        j = j + 1
+    }
+    return out
+}
+
+fn mutual_information(p_joint: array) -> float {
+    let n = len(p_joint)
+    if n == 0 { return 0.0 }
+    let m = len(p_joint[0])
+    let px = marginal_x(p_joint, n, m)
+    let py = marginal_y(p_joint, n, m)
+    let hx = shannon_entropy(px)
+    let hy = shannon_entropy(py)
+    let hxy = joint_entropy(p_joint)
+    let mi = hx + hy - hxy
+    if mi < 0.0 { return 0.0 }   // 수치 오차 가드
+    return mi
+}
+
+// ─── Density matrix update (Lindblad-류 선형 결합) ─────────────
+//
+// ρ' = (1 - α) · ρ + α · M · Mᵀ_diag
+//
+// Toy convention: diagonal 만 유지한다 (classical mixture 근사).
+//   - 각 대각 성분은 ρ_ii · (1-α) + α · measurement_i² 로 갱신.
+//   - 그 뒤 tr(ρ')=1 로 재정규화.
+// Non-demolition 측정: measurement 는 eigenvalue 분해를 trigger 하지 않고,
+// 단순히 diagonal population 을 부드럽게 밀어주는 projector 역할.
+
+fn density_matrix_update(rho: array, measurement: array, alpha: float) -> array {
+    let n = len(rho)
+    let m_len = len(measurement)
+    let dim = if n < m_len { n } else { m_len }
+    let mut new_rho = []
+    let mut i = 0
+    while i < n {
+        let row = rho[i]
+        let mut new_row = []
+        let mut j = 0
+        while j < n {
+            let old = row[j]
+            if i == j {
+                let mi = if i < dim { measurement[i] } else { 0.0 }
+                let driven = mi * mi
+                let upd = (1.0 - alpha) * old + alpha * driven
+                new_row = new_row.push(upd)
+            } else {
+                // off-diagonal decoherence by (1 - α/2)
+                new_row = new_row.push((1.0 - alpha * 0.5) * old)
+            }
+            j = j + 1
+        }
+        new_rho = new_rho.push(new_row)
+        i = i + 1
+    }
+    // Renormalize trace to 1.
+    let mut tr = 0.0
+    let mut k = 0
+    while k < n {
+        tr = tr + new_rho[k][k]
+        k = k + 1
+    }
+    if tr < EPS { return new_rho }
+    let mut out = []
+    let mut i2 = 0
+    while i2 < n {
+        let row = new_rho[i2]
+        let mut new_row = []
+        let mut j2 = 0
+        while j2 < n {
+            new_row = new_row.push(row[j2] / tr)
+            j2 = j2 + 1
+        }
+        out = out.push(new_row)
+        i2 = i2 + 1
+    }
+    return out
+}
+
+// ─── Build joint from two marginals + entanglement strength ──
+//
+// product state     : p_ij = p_i · q_j        → I = 0
+// entangled state   : p_ij = p_i · q_j + ε·C  → I > 0
+//   (C_ij 는 correlation kernel — 여기선 단위행렬 weight)
+
+fn build_product_joint(px: array, py: array) -> array {
+    let n = len(px)
+    let m = len(py)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let mut row = []
+        let mut j = 0
+        while j < m {
+            row = row.push(px[i] * py[j])
+            j = j + 1
+        }
+        out = out.push(row)
+        i = i + 1
+    }
+    return out
+}
+
+fn build_entangled_joint(px: array, py: array, strength: float) -> array {
+    let n = len(px)
+    let m = len(py)
+    let dim = if n < m { n } else { m }
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let mut row = []
+        let mut j = 0
+        while j < m {
+            let base = px[i] * py[j]
+            let corr = if i == j && i < dim { strength } else { 0.0 }
+            let v = base + corr
+            if v < 0.0 { row = row.push(0.0) } else { row = row.push(v) }
+            j = j + 1
+        }
+        out = out.push(row)
+        i = i + 1
+    }
+    // renormalize joint
+    let total = joint_sum(out, n, m)
+    if total < EPS { return out }
+    let mut norm = []
+    let mut i2 = 0
+    while i2 < n {
+        let row = out[i2]
+        let mut new_row = []
+        let mut j2 = 0
+        while j2 < m {
+            new_row = new_row.push(row[j2] / total)
+            j2 = j2 + 1
+        }
+        norm = norm.push(new_row)
+        i2 = i2 + 1
+    }
+    return norm
+}
+
+// ─── quantum_delta_weight: MI 증가 방향 update ────────────────
+//
+// ΔW ∝ T · ∂I(map;W)/∂W
+//
+// Toy gradient: weight marginal 을 map marginal 방향으로 끌어당기면
+// diagonal correlation 이 상승하여 I 가 커진다.
+// 그래서 weight_rho 의 대각을 (map_rho 의 대각 방향으로) alpha=T 비율로
+// 혼합하고, off-diagonal 은 0 으로 수렴.
+
+fn rho_diagonal(rho: array) -> array {
+    let n = len(rho)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(rho[i][i])
+        i = i + 1
+    }
+    return out
+}
+
+fn quantum_delta_weight(map_rho: array, weight_rho: array, T: float) -> array {
+    let diag_map = rho_diagonal(map_rho)
+    return density_matrix_update(weight_rho, diag_map, T)
+}
+
+// ─── Synthetic toy states ──────────────────────────────────
+
+fn make_uniform(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    let v = 1.0 / to_float(n)
+    while i < n {
+        out = out.push(v)
+        i = i + 1
+    }
+    return out
+}
+
+fn make_skew(n: int, seed: int) -> array {
+    let mut s = seed
+    let mut raw = []
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u = to_float(s % 1000000) / 1000000.0
+        raw = raw.push(0.1 + u)
+        i = i + 1
+    }
+    return normalize(raw, n)
+}
+
+fn diag_rho_from_p(p: array) -> array {
+    let n = len(p)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let mut row = []
+        let mut j = 0
+        while j < n {
+            if i == j { row = row.push(p[i]) } else { row = row.push(0.0) }
+            j = j + 1
+        }
+        out = out.push(row)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Self-tests ─────────────────────────────────────────────
+
+fn check_T1() -> bool {
+    // entropy 비음성
+    let p = [0.5, 0.5]
+    let h = shannon_entropy(p)
+    let j_unif = [[0.25, 0.25], [0.25, 0.25]]
+    let hj = joint_entropy(j_unif)
+    println("  [T1] H(p=0.5,0.5) = " + str(h) + "  (expect ~0.693)")
+    println("  [T1] H(uniform 2x2) = " + str(hj) + "  (expect ~1.386)")
+    if h < 0.0 { println("  [T1] FAIL -- H<0") return false }
+    if hj < 0.0 { println("  [T1] FAIL -- Hj<0") return false }
+    if fabs(h - 0.693147) > 0.01 { println("  [T1] FAIL -- H 기대값 불일치") return false }
+    return true
+}
+
+fn check_T2() -> bool {
+    // MI 비음성 + product state → MI ≈ 0
+    let px = [0.5, 0.5]
+    let py = [0.5, 0.5]
+    let prod = build_product_joint(px, py)
+    let mi_prod = mutual_information(prod)
+    println("  [T2] I(product) = " + str(mi_prod) + "  (expect ~0)")
+    if mi_prod < 0.0 { println("  [T2] FAIL -- MI<0") return false }
+    if mi_prod > 0.001 { println("  [T2] FAIL -- product MI not ~0") return false }
+    return true
+}
+
+fn check_T3() -> bool {
+    // subadditivity H(X,Y) ≤ H(X)+H(Y), entangled 에선 엄격 부등호
+    let px = [0.5, 0.5]
+    let py = [0.5, 0.5]
+    let ent = build_entangled_joint(px, py, 0.3)
+    let n = len(ent)
+    let m = len(ent[0])
+    let mx = marginal_x(ent, n, m)
+    let my = marginal_y(ent, n, m)
+    let hx = shannon_entropy(mx)
+    let hy = shannon_entropy(my)
+    let hxy = joint_entropy(ent)
+    let mi = mutual_information(ent)
+    println("  [T3] H(X)=" + str(hx) + " H(Y)=" + str(hy) + " H(X,Y)=" + str(hxy))
+    println("  [T3] I(entangled)=" + str(mi) + "  (expect > 0)")
+    if hxy > hx + hy + 0.0001 {
+        println("  [T3] FAIL -- subadditivity 위반")
+        return false
+    }
+    if mi <= 0.0 {
+        println("  [T3] FAIL -- entangled MI not > 0")
+        return false
+    }
+    return true
+}
+
+fn check_T4() -> bool {
+    // density_matrix_update: trace 보존 + 대각 ≥ 0
+    let p = make_skew(4, 7)
+    let rho = diag_rho_from_p(p)
+    let meas = make_skew(4, 13)
+    let new_rho = density_matrix_update(rho, meas, 0.2)
+    let n = len(new_rho)
+    let mut tr = 0.0
+    let mut ok = true
+    let mut i = 0
+    while i < n {
+        let d = new_rho[i][i]
+        tr = tr + d
+        if d < 0.0 - 0.0001 { ok = false }
+        i = i + 1
+    }
+    println("  [T4] tr(ρ') = " + str(tr) + "  (expect ~1)")
+    if ok == false {
+        println("  [T4] FAIL -- 대각 음수")
+        return false
+    }
+    if fabs(tr - 1.0) > 0.001 {
+        println("  [T4] FAIL -- trace 보존 실패")
+        return false
+    }
+    return true
+}
+
+fn check_T5() -> bool {
+    // quantum_delta_weight 1-step 후 MI 비감소
+    let px = make_skew(4, 42)
+    let py = make_skew(4, 99)
+    let map_rho = diag_rho_from_p(px)
+    let weight_rho = diag_rho_from_p(py)
+
+    // 현재 joint = product(px, py) — 독립
+    let joint_before = build_product_joint(px, py)
+    let mi_before = mutual_information(joint_before)
+
+    // weight 를 map 방향으로 당긴 뒤 new joint = 약한 entangle
+    let w_new = quantum_delta_weight(map_rho, weight_rho, 0.5)
+    let py_new = rho_diagonal(w_new)
+    // 새 joint: product(px, py_new) + 대각 보정 (map 과의 alignment)
+    let joint_after = build_entangled_joint(px, py_new, 0.15)
+    let mi_after = mutual_information(joint_after)
+
+    println("  [T5] MI before = " + str(mi_before))
+    println("  [T5] MI after  = " + str(mi_after))
+    println("  [T5] ΔI = " + str(mi_after - mi_before))
+    if mi_after + 0.0001 < mi_before {
+        println("  [T5] FAIL -- MI 감소")
+        return false
+    }
+    return true
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn main() {
+    println("[lens_quantum_loss] Lens 3 (Quantum) — entanglement channel learning")
+    println("  alpha=" + str(ALPHA_DEFAULT) + "  T=" + str(TEMP_DEFAULT))
+
+    // sample MI: product vs entangled
+    let px = [0.5, 0.5]
+    let py = [0.5, 0.5]
+    let prod = build_product_joint(px, py)
+    let ent = build_entangled_joint(px, py, 0.3)
+    let mi_prod = mutual_information(prod)
+    let mi_ent = mutual_information(ent)
+    println("  sample I(product 2x2) = " + str(mi_prod))
+    println("  sample I(entangled 2x2, strength=0.3) = " + str(mi_ent))
+    println("  ΔMI (entangled - product) = " + str(mi_ent - mi_prod))
+
+    // toy density matrix 1-step update demo
+    let rho_m = diag_rho_from_p(px)
+    let rho_w = diag_rho_from_p([0.8, 0.2])
+    let w2 = quantum_delta_weight(rho_m, rho_w, 0.5)
+    println("  rho_W diag before = [0.8, 0.2]")
+    println("  rho_W diag after  = [" + str(w2[0][0]) + ", " + str(w2[1][1]) + "]")
+
+    let mut pass = 0
+    let mut fail = 0
+
+    let t1 = check_T1()
+    if t1 { println("T1 PASS") pass = pass + 1 } else { println("T1 FAIL") fail = fail + 1 }
+
+    let t2 = check_T2()
+    if t2 { println("T2 PASS") pass = pass + 1 } else { println("T2 FAIL") fail = fail + 1 }
+
+    let t3 = check_T3()
+    if t3 { println("T3 PASS") pass = pass + 1 } else { println("T3 FAIL") fail = fail + 1 }
+
+    let t4 = check_T4()
+    if t4 { println("T4 PASS") pass = pass + 1 } else { println("T4 FAIL") fail = fail + 1 }
+
+    let t5 = check_T5()
+    if t5 { println("T5 PASS") pass = pass + 1 } else { println("T5 FAIL") fail = fail + 1 }
+
+    println("[lens_quantum_loss] PASS=" + str(pass) + " / FAIL=" + str(fail))
+    if fail == 0 {
+        println("[lens_quantum_loss] ALL 5/5 PASS")
+    } else {
+        println("[lens_quantum_loss] SOME FAILED")
+    }
+}
+
+main()

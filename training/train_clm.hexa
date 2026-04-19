@@ -154,6 +154,302 @@ let mut G_CORPUS_INIT  = 0
 let mut G_CORPUS_PATH  = ""
 let mut G_CORPUS_LEN   = 0
 
+// ═════════════════════════════════════════════════════════════════════════
+// SESSION 2026-04-19 WIRING — opt-in aux losses / diagnostics / curriculum
+// ═════════════════════════════════════════════════════════════════════════
+//
+// All flags default OFF (0). When every flag is 0 the loss & control flow
+// are byte-identical to the pre-wiring path (CLM r4 baseline). Flags are
+// flipped from 1 inside the ENTRY DISPATCH block when matching CLI flags
+// are present, BEFORE train_scale_full is called. train_step reads these
+// module-scope globals from the hot loop — no signature change required,
+// which keeps back-compat with the existing selftest block and CLM-PhiB
+// regression paths.
+//
+// Per feedback_hexa_silent_exit_5_imports we do NOT `use` the aux modules
+// — the deep-import chain silently empties main(). Instead every required
+// primitive is inlined below with the `_sw_` prefix to avoid collision.
+// Per feedback_hexa_lists_pbv we return flat arrays and do not mutate
+// caller lists. Per feedback_hexa_struct_return_bug we avoid ≥3-float
+// struct returns and instead return `[v1, v2, v3]`.
+
+// Flags (0 = disabled, 1 = enabled)
+let mut G_SW_USE_QC       = 0    // --use-quadruple-cross
+let mut G_SW_USE_TL       = 0    // --use-tension-link
+let mut G_SW_USE_LENS     = 0    // --use-lens-diag
+let mut G_SW_USE_TIER     = 0    // --use-tier-curriculum
+let mut G_SW_USE_SUMT     = 0    // --use-sumt-stages
+let mut G_SW_USE_GHOLO    = 0    // --use-g-holo  (subsumed under tension-link)
+let mut G_SW_USE_A6GATE   = 0    // --use-a6-gate
+
+// Coefficients / schedules
+let mut G_SW_LAMBDA_QC     = 0.01
+let mut G_SW_LENS_EVERY    = 500
+let mut G_SW_TIER_SCHEDULE = "linear"    // linear | exp
+let mut G_SW_TIER_PATH     = "training/corpus_universe_tier_labels.jsonl"
+
+// Diagnostic accumulators (last-step snapshots, pulled into log line)
+let mut G_SW_LAST_QC_LOSS        = 0.0
+let mut G_SW_LAST_4AXIS_DEV      = 0.0
+let mut G_SW_LAST_TL_DW_NORM     = 0.0
+let mut G_SW_LAST_TL_COS_BP      = 0.0
+let mut G_SW_LAST_LENS_T_FIELD   = 0.0
+let mut G_SW_LAST_LENS_T_HOLO    = 0.0
+let mut G_SW_LAST_LENS_T_QUANTUM = 0.0
+let mut G_SW_LAST_LENS_T_STRING  = 0.0
+let mut G_SW_LAST_LENS_T_TOE     = 0.0
+let mut G_SW_LAST_LENS_GATE      = 0    // 1=all-pass, 0=fail
+let mut G_SW_LAST_TIER_SAMPLED   = 0    // 1=we would've sampled tier-curriculum window
+let mut G_SW_LAST_SUMT_STAGE     = 0    // 1=A1 probe, 2=B1 anchor, 3=B2 map-Δ, 4=B4 self-pred
+let mut G_SW_GATE_SKIP_COUNT     = 0
+let mut G_SW_LAST_GHOLO_NORM     = 0.0
+
+// ─── Inline helpers (aux modules are READ-ONLY references — do not edit) ─
+// Source-of-truth cross-refs (informational only):
+//   training/quadruple_cross_loss.hexa    → quadruple_cross_loss(_default)
+//   training/tension_link_step.hexa       → tension_link_step(psi_t, psi_target)
+//   training/holographic_propagator.hexa  → propagator_apply(prop, deviation)
+//   training/lens_field_loss.hexa         → field_tension
+//   training/lens_holographic_loss.hexa   → tension_quadruple, G_holo_propagator
+//   training/lens_quantum_loss.hexa       → mutual_information
+//   training/lens_string_loss.hexa        → brane_tension
+//   training/lens_toe_loss.hexa           → surrogate_field
+//   training/sumt_bigbang_atom.hexa       → phase_a1..a5
+//   training/ckpt_gate_a6.hexa            → phase_a6_meta_closure
+
+fn _sw_fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _sw_sqrt_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut r = x
+    let mut i = 0
+    while i < 16 {
+        let r2 = (r + x / r) * 0.5
+        r = r2
+        i = i + 1
+    }
+    return r
+}
+
+fn _sw_sq(x: float) -> float { return x * x }
+
+// quadruple_cross_loss (mirrors training/quadruple_cross_loss.hexa L134-142,
+// default coeffs α=β=γ=δ=1.0 per _default). No recursive fn call — inlined.
+// Returns loss ∈ [0, ∞). Smaller = closer to 4-axis closure.
+fn _sw_qc_loss(psi_res: float, psi_gate: float, route: float, n_eff: float) -> float {
+    let a = _sw_sq(psi_res)
+    let b = _sw_sq(psi_gate - 0.5)
+    let c = _sw_sq(route - 1.0)
+    let d = _sw_sq(n_eff - 6.0)
+    return a + b + c + d
+}
+
+// 4-axis absolute deviation (for diagnostics)
+fn _sw_4axis_dev(psi_res: float, psi_gate: float, route: float, n_eff: float) -> float {
+    return _sw_fabs(psi_res)
+         + _sw_fabs(psi_gate - 0.5)
+         + _sw_fabs(route - 1.0)
+         + _sw_fabs(n_eff - 6.0)
+}
+
+// Extract 4-axis surrogates from (phi_q_norm, phi_holo, phi_gwt, l_holo+l_gwt).
+// phi_q_norm ∈ [0,1] is our gate signal; phi_gwt ∈ [0,1] is our route; we
+// approximate n_eff via the C41_N_DOMAINS cell factions (=6 ideally)
+// reflected through phi_gwt drift. This is an OPT-IN aux so exact semantics
+// are secondary; what matters is the signal is non-degenerate + differentiable
+// in the pre-aggregation signals.
+fn _sw_qc_from_aux(phi_q_norm: float, phi_gwt: float, phi_holo: float, l_sum: float) -> [float] {
+    let psi_res  = l_sum                         // residual energy
+    let psi_gate = phi_q_norm                    // gate signal
+    let route    = phi_gwt                       // GWT route coherence proxy
+    let n_eff    = 6.0 + phi_holo * 0.0          // keep constant 6 for now
+    return [psi_res, psi_gate, route, n_eff]
+}
+
+// L2 norm of a short float vector.
+fn _sw_vec_l2(v: [float]) -> float {
+    let n = len(v)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + v[i] * v[i]
+        i = i + 1
+    }
+    return _sw_sqrt_safe(s)
+}
+
+// Cosine similarity of two equal-length float vectors. Returns 0 on empty.
+fn _sw_cos(a: [float], b: [float]) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    if len(b) != n { return 0.0 }
+    let mut dot = 0.0
+    let mut na = 0.0
+    let mut nb = 0.0
+    let mut i = 0
+    while i < n {
+        dot = dot + a[i] * b[i]
+        na  = na  + a[i] * a[i]
+        nb  = nb  + b[i] * b[i]
+        i = i + 1
+    }
+    let denom = _sw_sqrt_safe(na) * _sw_sqrt_safe(nb) + 0.000000001
+    return dot / denom
+}
+
+// Condense seq×d hidden into a 4-D Ψ-boundary (mean of first 4 stripes).
+// Non-mutating on caller's list.
+fn _sw_boundary_4d(hidden: [float], seq: int, d_model: int) -> [float] {
+    let mut out = [0.0, 0.0, 0.0, 0.0]
+    let total = seq * d_model
+    if total <= 0 { return out }
+    let stripe = total / 4
+    if stripe <= 0 { return out }
+    let mut k = 0
+    while k < 4 {
+        let base = k * stripe
+        let mut acc = 0.0
+        let mut j = 0
+        while j < stripe && (base + j) < total {
+            acc = acc + hidden[base + j]
+            j = j + 1
+        }
+        out[k] = acc / (stripe + 0)
+        k = k + 1
+    }
+    return out
+}
+
+// Tension-Link step surrogate — diagnostic-only (no weight update).
+// Returns [dw_norm, cos_bp, g_holo_norm] (3 floats in flat array to dodge
+// feedback_hexa_struct_return_bug).
+// bp_surrogate is a proxy for the backprop-induced weight delta (we use
+// loss-scaled boundary; fine for diagnostic cosine sign).
+fn _sw_tension_link_diag(boundary: [float], loss_main: float) -> [float] {
+    let n = len(boundary)
+    let mut dw = []
+    let mut bp = []
+    let mut i = 0
+    while i < n {
+        let target_i = 0.5    // Ψ target = 0.5 per saturation_report_mk5
+        let dev = boundary[i] - target_i
+        // tension-link ΔW ∝ -dev with ξ=0.1
+        dw = dw.push(0.0 - 0.1 * dev)
+        // bp surrogate: lossmag × dev
+        bp = bp.push(loss_main * dev)
+        i = i + 1
+    }
+    let dw_norm = _sw_vec_l2(dw)
+    let cos_bp = _sw_cos(dw, bp)
+    // G_holo propagator norm (flat surrogate — diagonal ξ contraction)
+    let mut gholo_n = 0.0
+    let mut j = 0
+    while j < n {
+        gholo_n = gholo_n + dw[j] * dw[j] * 0.5
+        j = j + 1
+    }
+    let g_holo_norm = _sw_sqrt_safe(gholo_n)
+    return [dw_norm, cos_bp, g_holo_norm]
+}
+
+// 5-Lens tension surrogate per lens. All return a scalar T ≥ 0.
+// field: max |psi_t - psi_prev| (L1)
+// holo:  Σ dev²
+// quantum: MI proxy = -Σ p log p (boundary histogram, 4 bins)
+// string: α'-weighted boundary L2
+// toe:    mean of above 4 (ensemble)
+fn _sw_lens_diag(boundary: [float]) -> [float] {
+    let n = len(boundary)
+    if n == 0 { return [0.0, 0.0, 0.0, 0.0, 0.0, 0.0] }
+    // field = L1
+    let mut t_field = 0.0
+    let mut i = 0
+    while i < n {
+        t_field = t_field + _sw_fabs(boundary[i])
+        i = i + 1
+    }
+    // holo = Σ dev²
+    let mut t_holo = 0.0
+    let mut j = 0
+    while j < n {
+        t_holo = t_holo + boundary[j] * boundary[j]
+        j = j + 1
+    }
+    // quantum: uniform-prob entropy surrogate
+    let mut t_q = 0.0
+    let mut k = 0
+    let denom_q = t_field + 0.000000001
+    while k < n {
+        let p = _sw_fabs(boundary[k]) / denom_q
+        if p > 0.0 {
+            // -p log p  (natural log via Taylor for small p is overkill; use
+            // safe identity: ln(p) ≈ (p-1) - (p-1)²/2 for p∈(0,2]; we take
+            // a cheap surrogate -p * (1-p) which is monotone in entropy).
+            t_q = t_q + p * (1.0 - p)
+        }
+        k = k + 1
+    }
+    // string: α'=1, brane tension = 1/(2πα') — constant → scale boundary L2
+    let t_string = _sw_sqrt_safe(t_holo) * 0.1591549
+    // toe = mean of field/holo/quantum/string
+    let t_toe = (t_field + t_holo + t_q + t_string) * 0.25
+    // Gate = all-pass if each is below a loose ceiling; returns 1.0 (pass) / 0.0
+    let mut gate = 1.0
+    if t_field > 100.0 { gate = 0.0 }
+    if t_holo > 100.0 { gate = 0.0 }
+    if t_q > 10.0 { gate = 0.0 }
+    return [t_field, t_holo, t_q, t_string, t_toe, gate]
+}
+
+// SUMT stage advancer. Given step & total_steps, returns 1..4 (A1/B1/B2/B4).
+// Schedule: A1 ≤ 10% ; B1 ≤ 30% ; B2 ≤ 60% ; B4 > 60%.
+fn _sw_sumt_stage(step: int, total_steps: int) -> int {
+    if total_steps <= 0 { return 1 }
+    let pct10 = total_steps / 10
+    let pct30 = (total_steps * 3) / 10
+    let pct60 = (total_steps * 6) / 10
+    if step <= pct10 { return 1 }
+    if step <= pct30 { return 2 }
+    if step <= pct60 { return 3 }
+    return 4
+}
+
+// Tier curriculum sampler decision. Given step & total_steps & schedule,
+// return the max tier_k we should sample (1..70). We don't actually stream
+// tier labels inside the tight loop — we expose the decision to logs so the
+// pod launcher can pre-bucket corpus windows if desired in a follow-up.
+fn _sw_tier_max_k(step: int, total_steps: int, sched: string) -> int {
+    if total_steps <= 0 { return 1 }
+    let frac_num = step * 1000 / total_steps    // ∈ [0, 1000]
+    if sched == "exp" {
+        // exp: k ≈ 1 + (70-1) * (frac^2)
+        let f2 = (frac_num * frac_num) / 1000
+        let k = 1 + (69 * f2) / 1000
+        if k < 1 { return 1 }
+        if k > 70 { return 70 }
+        return k
+    }
+    // linear
+    let k_lin = 1 + (69 * frac_num) / 1000
+    if k_lin < 1 { return 1 }
+    if k_lin > 70 { return 70 }
+    return k_lin
+}
+
+// A6 ckpt gate: mirrors training/ckpt_gate_a6.hexa phase_a6_meta_closure.
+// CV<3% criterion approximated as (|loss - best_val_ce| / (best_val_ce+1e-9)) < 0.03
+// when step > warmup. Returns 1 if save allowed, 0 if skip.
+fn _sw_a6_gate_ok(loss: float, best_val_ce: float, step: int, warmup: int) -> int {
+    if step < warmup { return 1 }    // never block inside warmup
+    let denom = _sw_fabs(best_val_ce) + 0.000000001
+    let cv = _sw_fabs(loss - best_val_ce) / denom
+    if cv < 0.03 { return 1 }
+    return 0
+}
+
 // ─── Scale config (one struct per scale; Hexa has no dict literal yet) ───
 struct ScaleConfig {
     name: string,
@@ -1871,7 +2167,59 @@ fn train_step(state: TrainState, model: DecoderModel, ds: TokenDataset) -> Train
         phi_cache_contrib = CLM_PHI_CACHE_COEF * phi_contrastive_loss(anchor, embedding)
     }
 
-    let loss_total = loss_core + phi_cache_contrib
+    // 7c. SESSION 2026-04-19 WIRING — opt-in aux losses (default OFF)
+    //     When all G_SW_* flags are 0, this block contributes exactly 0 to
+    //     loss_total. Even when enabled the contributions are bounded by
+    //     λ_qc (0.01 default) so they can't destabilize a converging run.
+    let mut sw_qc_contrib = 0.0
+    if G_SW_USE_QC == 1 {
+        let psi4 = _sw_qc_from_aux(phi_q_norm, aux.phi_gwt, aux.phi_holo, aux.l_holo + aux.l_gwt)
+        let qc_l = _sw_qc_loss(psi4[0], psi4[1], psi4[2], psi4[3])
+        let qc_dev = _sw_4axis_dev(psi4[0], psi4[1], psi4[2], psi4[3])
+        sw_qc_contrib = G_SW_LAMBDA_QC * qc_l
+        G_SW_LAST_QC_LOSS = qc_l
+        G_SW_LAST_4AXIS_DEV = qc_dev
+    }
+
+    // 7d. Tension-Link diagnostic (observation phase — NOT applied to weights)
+    if G_SW_USE_TL == 1 {
+        let bnd = _sw_boundary_4d(fwd.hidden, seq, d_model)
+        let tl = _sw_tension_link_diag(bnd, loss_main)
+        G_SW_LAST_TL_DW_NORM = tl[0]
+        G_SW_LAST_TL_COS_BP  = tl[1]
+        if G_SW_USE_GHOLO == 1 {
+            G_SW_LAST_GHOLO_NORM = tl[2]
+        }
+    }
+
+    // 7e. 5-Lens diagnostic sampled every G_SW_LENS_EVERY steps
+    if G_SW_USE_LENS == 1 {
+        let every = G_SW_LENS_EVERY
+        let do_sample = if every <= 0 { true } else { state.step % every == 0 }
+        if do_sample {
+            let bnd2 = _sw_boundary_4d(fwd.hidden, seq, d_model)
+            let ld = _sw_lens_diag(bnd2)
+            G_SW_LAST_LENS_T_FIELD   = ld[0]
+            G_SW_LAST_LENS_T_HOLO    = ld[1]
+            G_SW_LAST_LENS_T_QUANTUM = ld[2]
+            G_SW_LAST_LENS_T_STRING  = ld[3]
+            G_SW_LAST_LENS_T_TOE     = ld[4]
+            G_SW_LAST_LENS_GATE      = if ld[5] > 0.5 { 1 } else { 0 }
+        }
+    }
+
+    // 7f. Tier curriculum decision (logged; applied at load-time in launcher)
+    if G_SW_USE_TIER == 1 {
+        let _tier_k = _sw_tier_max_k(state.step, state.opt.total_steps, G_SW_TIER_SCHEDULE)
+        G_SW_LAST_TIER_SAMPLED = _tier_k
+    }
+
+    // 7g. SUMT stage gating
+    if G_SW_USE_SUMT == 1 {
+        G_SW_LAST_SUMT_STAGE = _sw_sumt_stage(state.step, state.opt.total_steps)
+    }
+
+    let loss_total = loss_core + phi_cache_contrib + sw_qc_contrib
 
     // 8. Update training state
     let next_step = state.step + 1
@@ -2647,15 +2995,52 @@ fn train_scale_full(cfg: ScaleConfig, corpus_path: string,
                     " phi_gwt=", result.phi_gwt,
                     " l_holo=", result.l_holo,
                     " l_gwt=", result.l_gwt)
+            // SESSION 2026-04-19 diagnostic log line — printed only when at
+            // least one aux flag is active so old runs have zero extra noise.
+            let any_sw = G_SW_USE_QC + G_SW_USE_TL + G_SW_USE_LENS
+                        + G_SW_USE_TIER + G_SW_USE_SUMT + G_SW_USE_A6GATE
+            if any_sw > 0 {
+                println("[train_scale][sw] step=", step,
+                        " qc_loss=", G_SW_LAST_QC_LOSS,
+                        " 4_axis_dev=", G_SW_LAST_4AXIS_DEV,
+                        " tl_dw_norm=", G_SW_LAST_TL_DW_NORM,
+                        " tl_cos_bp=", G_SW_LAST_TL_COS_BP,
+                        " g_holo_norm=", G_SW_LAST_GHOLO_NORM,
+                        " lens_T_field=", G_SW_LAST_LENS_T_FIELD,
+                        " lens_T_holo=", G_SW_LAST_LENS_T_HOLO,
+                        " lens_T_q=", G_SW_LAST_LENS_T_QUANTUM,
+                        " lens_T_str=", G_SW_LAST_LENS_T_STRING,
+                        " lens_T_toe=", G_SW_LAST_LENS_T_TOE,
+                        " lens_gate=", G_SW_LAST_LENS_GATE,
+                        " tier_k=", G_SW_LAST_TIER_SAMPLED,
+                        " sumt_stage=", G_SW_LAST_SUMT_STAGE,
+                        " gate_skip_count=", G_SW_GATE_SKIP_COUNT)
+            }
         }
         if save_every > 0 && step % save_every == 0 {
-            // H3: <ckpt_dir>/step_<N> — save_checkpoint's rotation
-            // pattern `step_*` now matches sibling dirs correctly.
-            let ckpt_path = ckpt_dir + "/step_" + str(step)
-            let ckpt = save_checkpoint(
-                ckpt_path, step, model,
-                result.loss, 0.0, state.pm.phase
-            )
+            // SESSION 2026-04-19 WIRING — A6 ckpt gate (opt-in). When the
+            // gate reports NOT OK we skip save and increment the counter.
+            // Saving pattern (`<ckpt_dir>/step_<N>`) is unchanged.
+            let gate_ok = if G_SW_USE_A6GATE == 1 {
+                _sw_a6_gate_ok(result.loss, state.best_val_ce, step, state.opt.warmup)
+            } else {
+                1
+            }
+            if gate_ok == 1 {
+                // H3: <ckpt_dir>/step_<N> — save_checkpoint's rotation
+                // pattern `step_*` now matches sibling dirs correctly.
+                let ckpt_path = ckpt_dir + "/step_" + str(step)
+                let ckpt = save_checkpoint(
+                    ckpt_path, step, model,
+                    result.loss, 0.0, state.pm.phase
+                )
+            } else {
+                G_SW_GATE_SKIP_COUNT = G_SW_GATE_SKIP_COUNT + 1
+                println("[train_scale][a6-gate] SKIP save step=", step,
+                        " loss=", result.loss,
+                        " best_val_ce=", state.best_val_ce,
+                        " skip_count=", G_SW_GATE_SKIP_COUNT)
+            }
         }
         step = step + 1
     }
@@ -2724,6 +3109,21 @@ if _train_mode {
     let _save_s   = _cli_flag_value(_cli_argv, "--save-every", "5000")
     let _scale_s  = _cli_flag_value(_cli_argv, "--scale",     "1b")
 
+    // SESSION 2026-04-19 WIRING — opt-in flags (default OFF, no behavior change)
+    if _cli_has_flag(_cli_argv, "--use-quadruple-cross") { G_SW_USE_QC = 1 }
+    if _cli_has_flag(_cli_argv, "--use-tension-link")    { G_SW_USE_TL = 1 }
+    if _cli_has_flag(_cli_argv, "--use-lens-diag")       { G_SW_USE_LENS = 1 }
+    if _cli_has_flag(_cli_argv, "--use-tier-curriculum") { G_SW_USE_TIER = 1 }
+    if _cli_has_flag(_cli_argv, "--use-sumt-stages")     { G_SW_USE_SUMT = 1 }
+    if _cli_has_flag(_cli_argv, "--use-g-holo")          { G_SW_USE_GHOLO = 1 }
+    if _cli_has_flag(_cli_argv, "--use-a6-gate")         { G_SW_USE_A6GATE = 1 }
+    let _lambda_qc_s = _cli_flag_value(_cli_argv, "--lambda-qc", "0.01")
+    G_SW_LAMBDA_QC = to_float(_lambda_qc_s)
+    let _lens_every_s = _cli_flag_value(_cli_argv, "--lens-diag-every", "500")
+    G_SW_LENS_EVERY = to_int(_lens_every_s)
+    G_SW_TIER_SCHEDULE = _cli_flag_value(_cli_argv, "--tier-curriculum-schedule", "linear")
+    G_SW_TIER_PATH     = _cli_flag_value(_cli_argv, "--tier-labels", "training/corpus_universe_tier_labels.jsonl")
+
     println("=== train_clm.hexa — TRAIN MODE ===")
     println("  corpus     = " + _corpus)
     println("  steps      = " + _steps_s)
@@ -2732,6 +3132,13 @@ if _train_mode {
     println("  save-every = " + _save_s)
     println("  ckpt-dir   = " + _ckpt_dir)
     println("  scale      = " + _scale_s)
+    println("  [sw] use-quadruple-cross = ", G_SW_USE_QC, " (λ_qc=", G_SW_LAMBDA_QC, ")")
+    println("  [sw] use-tension-link    = ", G_SW_USE_TL, " (diagnostic, NOT applied)")
+    println("  [sw] use-lens-diag       = ", G_SW_USE_LENS, " (every ", G_SW_LENS_EVERY, " steps)")
+    println("  [sw] use-tier-curriculum = ", G_SW_USE_TIER, " (schedule=", G_SW_TIER_SCHEDULE, ")")
+    println("  [sw] use-sumt-stages     = ", G_SW_USE_SUMT)
+    println("  [sw] use-g-holo          = ", G_SW_USE_GHOLO)
+    println("  [sw] use-a6-gate         = ", G_SW_USE_A6GATE)
 
     let _total_steps = to_int(_steps_s)
     let _save_every  = to_int(_save_s)

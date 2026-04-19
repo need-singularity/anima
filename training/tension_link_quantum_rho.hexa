@@ -1,0 +1,322 @@
+// training/tension_link_quantum_rho.hexa — multi-qubit tension-link via density matrix ρ
+//
+// Extends Lens 3 (Quantum) — where the base lens used diagonal classical
+// probabilities, this extension treats Ψ as the diagonal of a density
+// matrix ρ and defines the quantum tension via von Neumann entropy relative
+// to the maximally-mixed target.
+//
+// ─── Concept ─────────────────────────────────────────────────
+//   Let ρ be a d×d density matrix whose diagonal encodes Ψ (after softmax-
+//   like normalization) and whose off-diagonals encode learned coherence.
+//   The maximum-entropy target is the maximally-mixed state
+//
+//       ρ_max = I / d,    H_max = log d
+//
+//   We define
+//
+//       T_q = H_target − S(ρ) = log d + Tr(ρ log ρ)
+//
+//   where S(ρ) = −Tr(ρ log ρ) is von Neumann entropy. (We use the diagonal
+//   approximation S(ρ) ≈ H_shannon(diag(ρ)) — exact when ρ is diagonal;
+//   a conservative over-estimate when off-diagonals carry coherence.)
+//
+//   ΔW_q = −T_q · (ρ − ρ_max) · δ(∇·J_n6)           (diagonal channel)
+//
+//   The restoring direction is toward maximum mixedness (maximum entropy);
+//   the gate still kills the update off the n=6 manifold.
+//
+// ─── Decoherence stability ───────────────────────────────────
+//   Under repeated application with a noise-free channel, ρ must stay
+//   well-normalized (Tr=1) and positive (diag≥0). T3 below injects a
+//   tiny off-diagonal perturbation to mimic decoherence and checks that
+//   the tension-link step does not amplify the coherence pathologically.
+//
+// ─── R37 / AN13 ──────────────────────────────────────────────
+//   .hexa only.
+//
+// Run:
+//   HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 \
+//     /Users/ghost/Dev/nexus/shared/bin/hexa run \
+//     /Users/ghost/Dev/anima/training/tension_link_quantum_rho.hexa
+// Expect:
+//   [tension_link_quantum_rho] ALL 3/3 PASS
+
+// ─── Constants ───────────────────────────────────────────────
+
+let T_Q_CONST        = 0.1
+let EPS              = 0.0000000001
+let NOETHER_N6        = 6
+let NOETHER_SIGMA_PHI = 24
+let NOETHER_TAU       = 4
+
+// ─── Primitives ──────────────────────────────────────────────
+
+fn fabs(x: float) -> float { if x < 0.0 { return 0.0 - x } return x }
+
+fn safe_log(x: float) -> float {
+    if x < EPS { return 0.0 }
+    return log(x)
+}
+
+fn zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+// Density matrix stored flat row-major: rho[i*d + j].
+fn rho_new_max(d: int) -> array {
+    let inv = 1.0 / to_float(d)
+    let mut out = []
+    let mut i = 0
+    let n = d * d
+    while i < n {
+        let row = i / d
+        let col = i % d
+        if row == col { out = out.push(inv) }
+        else          { out = out.push(0.0) }
+        i = i + 1
+    }
+    return out
+}
+
+fn rho_from_psi(psi: array) -> array {
+    // Build a diagonal ρ with values softmax-like normalized from psi.
+    let d = len(psi)
+    let mut s = 0.0
+    let mut i = 0
+    while i < d {
+        let v = if psi[i] < 0.0 { 0.0 } else { psi[i] }
+        s = s + v
+        i = i + 1
+    }
+    if s < EPS { return rho_new_max(d) }
+    let mut out = []
+    let mut k = 0
+    while k < d * d {
+        let row = k / d
+        let col = k % d
+        if row == col {
+            let v = if psi[row] < 0.0 { 0.0 } else { psi[row] }
+            out = out.push(v / s)
+        } else {
+            out = out.push(0.0)
+        }
+        k = k + 1
+    }
+    return out
+}
+
+// von Neumann entropy — diagonal approximation S_diag = −Σ p_i log p_i.
+fn von_neumann_entropy_diag(rho: array, d: int) -> float {
+    let mut h = 0.0
+    let mut i = 0
+    while i < d {
+        let pi = rho[i * d + i]
+        if pi > EPS {
+            h = h - pi * safe_log(pi)
+        }
+        i = i + 1
+    }
+    return h
+}
+
+// Gate — applies to the diagonal interpreted as a Ψ-like probability vector
+// after re-embedding into [0, 1]. We wrap the Mk.V.1 closure identity.
+fn rho_diag_in_range(rho: array, d: int) -> bool {
+    let mut i = 0
+    while i < d {
+        let v = rho[i * d + i]
+        if v < 0.0 - EPS { return false }
+        if v > 1.0 + EPS { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn n6_gate_rho(rho: array, d: int) -> bool {
+    if d <= 0 { return false }
+    if d % 2 != 0 { return false }
+    if NOETHER_N6 * NOETHER_TAU != NOETHER_SIGMA_PHI { return false }
+    if !rho_diag_in_range(rho, d) { return false }
+    return true
+}
+
+// ─── tension_link step for ρ ─────────────────────────────────
+// Returns a new ρ' = ρ + Δρ where Δρ is the tension-link update:
+//
+//   Δρ_diag  = −T_q · (ρ_diag − 1/d) · T_q_strength
+//   Δρ_offd  = −T_q · α_decohere · ρ_offd    (decoherence damping)
+//
+// with T_q = H_target − S(ρ). Normalization is restored at the end.
+fn tension_link_rho(rho: array, d: int, target_entropy: float) -> array {
+    if !n6_gate_rho(rho, d) {
+        // Gate FAIL → return ρ unchanged (ΔW = 0).
+        return rho
+    }
+    let s_curr = von_neumann_entropy_diag(rho, d)
+    let t_q    = target_entropy - s_curr    // toward target entropy
+    let inv_d  = 1.0 / to_float(d)
+    let mut out = []
+    let mut k = 0
+    while k < d * d {
+        let row = k / d
+        let col = k % d
+        let old = rho[k]
+        if row == col {
+            // Pull diagonal toward 1/d with rate T_q_const · t_q
+            let dev = old - inv_d
+            out = out.push(old - T_Q_CONST * t_q * dev)
+        } else {
+            // Damp off-diagonal (decoherence term)
+            out = out.push(old * (1.0 - T_Q_CONST * 0.5))
+        }
+        k = k + 1
+    }
+    // Renormalize trace to 1
+    let mut tr = 0.0
+    let mut i = 0
+    while i < d {
+        tr = tr + out[i * d + i]
+        i = i + 1
+    }
+    if tr < EPS { return out }
+    let mut norm = []
+    let mut m = 0
+    while m < d * d {
+        norm = norm.push(out[m] / tr)
+        m = m + 1
+    }
+    return norm
+}
+
+// ─── Helpers ────────────────────────────────────────────────
+
+fn rho_trace(rho: array, d: int) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < d {
+        s = s + rho[i * d + i]
+        i = i + 1
+    }
+    return s
+}
+
+fn offd_abs_sum(rho: array, d: int) -> float {
+    let mut s = 0.0
+    let mut k = 0
+    while k < d * d {
+        let row = k / d
+        let col = k % d
+        if row != col { s = s + fabs(rho[k]) }
+        k = k + 1
+    }
+    return s
+}
+
+fn diag_min(rho: array, d: int) -> float {
+    let mut m = rho[0]
+    let mut i = 1
+    while i < d {
+        let v = rho[i * d + i]
+        if v < m { m = v }
+        i = i + 1
+    }
+    return m
+}
+
+// ─── Self-tests (T1–T3) ─────────────────────────────────────
+
+// T1 : at the maximum-mixed fixed point, tension_link leaves ρ unchanged.
+fn check_T1() -> bool {
+    let d = 4
+    let rho = rho_new_max(d)
+    let h_max = safe_log(to_float(d))
+    let rho2 = tension_link_rho(rho, d, h_max)
+    // Check element-wise closeness
+    let mut ok = true
+    let mut k = 0
+    while k < d * d {
+        if fabs(rho2[k] - rho[k]) > 0.00001 { ok = false }
+        k = k + 1
+    }
+    let h_curr = von_neumann_entropy_diag(rho, d)
+    if ok { println("  [T1] max-entropy fixed-point PASS (S=" + str(h_curr)
+                  + ", H_max=" + str(h_max) + ")") }
+    else  { println("  [T1] max-entropy fixed-point FAIL") }
+    return ok
+}
+
+// T2 : starting from a skewed ρ, one step increases entropy toward H_max.
+fn check_T2() -> bool {
+    let d = 4
+    let psi = [0.7, 0.1, 0.1, 0.1]
+    let rho = rho_from_psi(psi)
+    let h_before = von_neumann_entropy_diag(rho, d)
+    let h_max = safe_log(to_float(d))
+    let rho2 = tension_link_rho(rho, d, h_max)
+    let h_after = von_neumann_entropy_diag(rho2, d)
+    let tr = rho_trace(rho2, d)
+    let ok = h_after > h_before && fabs(tr - 1.0) < 0.0001
+    if ok { println("  [T2] entropy-raise PASS  (S: " + str(h_before) + " → " + str(h_after)
+                  + ", Tr=" + str(tr) + ")") }
+    else  { println("  [T2] entropy-raise FAIL  (S: " + str(h_before) + " → " + str(h_after) + ")") }
+    return ok
+}
+
+// T3 : decoherence stability — inject off-diagonal perturbation, step damps
+//      it AND keeps diag≥0 + Tr=1.
+fn check_T3() -> bool {
+    let d = 4
+    let psi = [0.3, 0.3, 0.2, 0.2]
+    let base = rho_from_psi(psi)
+    // Rebuild ρ with small coherence on (0,1) and (1,0).
+    let mut rho = []
+    let mut k = 0
+    while k < d * d {
+        let row = k / d
+        let col = k % d
+        if row == 0 && col == 1      { rho = rho.push(0.05) }
+        else if row == 1 && col == 0 { rho = rho.push(0.05) }
+        else                          { rho = rho.push(base[k]) }
+        k = k + 1
+    }
+    let offd_before = offd_abs_sum(rho, d)
+    let h_max = safe_log(to_float(d))
+    let rho2 = tension_link_rho(rho, d, h_max)
+    let offd_after = offd_abs_sum(rho2, d)
+    let tr = rho_trace(rho2, d)
+    let dmin = diag_min(rho2, d)
+    let ok = offd_after < offd_before
+          && fabs(tr - 1.0) < 0.001
+          && dmin >= 0.0 - 0.00001
+    if ok { println("  [T3] decoherence-stability PASS  (|offd|: " + str(offd_before)
+                  + " → " + str(offd_after) + ", Tr=" + str(tr) + ", min_diag=" + str(dmin) + ")") }
+    else  { println("  [T3] decoherence-stability FAIL  (|offd|: " + str(offd_before)
+                  + " → " + str(offd_after) + ", Tr=" + str(tr) + ", min_diag=" + str(dmin) + ")") }
+    return ok
+}
+
+// ─── main ────────────────────────────────────────────────────
+
+fn main() {
+    println("[tension_link_quantum_rho] von Neumann ρ tension-link, T_q = H_max − S(ρ)")
+    println("  T_q_const=" + str(T_Q_CONST))
+
+    let t1 = check_T1()
+    let t2 = check_T2()
+    let t3 = check_T3()
+
+    let all_pass = t1 && t2 && t3
+    if all_pass {
+        println("[tension_link_quantum_rho] ALL 3/3 PASS")
+    } else {
+        println("[tension_link_quantum_rho] SOME FAILED")
+    }
+}
+
+main()

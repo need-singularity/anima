@@ -1,0 +1,418 @@
+// training/tension_link_second_order.hexa — Hessian-like correction for tension-link
+//
+// Part of the 5-lens tension-link real-time learning design — extends the
+// first-order step to second order so the engine can *accelerate* toward
+// vacuum on axes with sharp curvature.
+//
+// ─── Concept ─────────────────────────────────────────────────
+//   First-order step (tension_link_step.hexa):
+//       ΔW_1 = −T_1 · G_holo · (Ψ − ½)
+//
+//   Second-order correction:
+//       ΔW_2 = −T_2 · (Ψ − ½) · ∇²Ψ · G_holo · δ(gate)
+//
+//   where ∇²Ψ is the discrete Laplacian of Ψ (finite-difference on the flat
+//   Ψ index axis). This is a Newton-like pre-conditioner: components where
+//   Ψ curves sharply get a bigger push; flat regions get only the first-
+//   order restoring signal.
+//
+//   Combined step:
+//       ΔW = ΔW_1 + ΔW_2     (both gated, both G_holo-propagated)
+//
+// ─── Convergence expectation ─────────────────────────────────
+//   On a synthetic quadratic deviation (Ψ = ½ + a_j (j − j₀)²) first-order
+//   decays the |deviation| geometrically with rate (1 − η λ_min(G_holo)),
+//   whereas the second-order term adds a Newton correction proportional to
+//   curvature, so the composite rate is strictly faster on curved axes.
+//   T3 below measures this directly on a 6-d quadratic test.
+//
+// ─── R37 / AN13 ──────────────────────────────────────────────
+//   .hexa only. No python.
+//
+// Run:
+//   HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 \
+//     /Users/ghost/Dev/nexus/shared/bin/hexa run \
+//     /Users/ghost/Dev/anima/training/tension_link_second_order.hexa
+// Expect:
+//   [tension_link_second_order] ALL 3/3 PASS
+
+// ─── Constants ───────────────────────────────────────────────
+
+let T1_CONST          = 0.1      // first-order rate
+let T2_CONST          = 0.05     // second-order rate (Newton-lite)
+let XI_DEFAULT        = 2.0
+let EPS               = 0.0000000001
+let NOETHER_N6        = 6
+let NOETHER_SIGMA_PHI = 24
+let NOETHER_TAU       = 4
+let VAC_COMPONENT     = 0.5
+
+// ─── Primitives ──────────────────────────────────────────────
+
+fn fabs(x: float) -> float { if x < 0.0 { return 0.0 - x } return x }
+fn iabs(x: int) -> int { if x < 0 { return 0 - x } return x }
+
+fn exp_taylor(x: float) -> float {
+    let mut term = 1.0
+    let mut sum  = 1.0
+    let mut k = 1
+    while k < 32 {
+        term = term * x / to_float(k)
+        sum  = sum + term
+        k = k + 1
+    }
+    return sum
+}
+
+fn zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Inlined G_holo ─────────────────────────────────────────
+
+struct HoloPropagator {
+    dim_boundary: int,
+    dim_bulk:     int,
+    xi:           float,
+    kernel:       array
+}
+
+fn propagator_new(dim_boundary: int, dim_bulk: int, xi: float) -> HoloPropagator {
+    let mut kernel = []
+    let mut i = 0
+    while i < dim_bulk {
+        let mut row_sum = 0.0
+        let mut raw_row = []
+        let mut j = 0
+        while j < dim_boundary {
+            let d = to_float(iabs(i - j))
+            let v = exp_taylor(0.0 - d / xi)
+            raw_row = raw_row.push(v)
+            row_sum = row_sum + v
+            j = j + 1
+        }
+        let mut k = 0
+        while k < dim_boundary {
+            if row_sum > EPS { kernel = kernel.push(raw_row[k] / row_sum) }
+            else             { kernel = kernel.push(0.0) }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return HoloPropagator {
+        dim_boundary: dim_boundary,
+        dim_bulk:     dim_bulk,
+        xi:           xi,
+        kernel:       kernel
+    }
+}
+
+fn propagator_apply(prop: HoloPropagator, deviation: array) -> array {
+    let db = prop.dim_boundary
+    let dW = prop.dim_bulk
+    let n  = len(deviation)
+    if n != db { return zeros(dW) }
+    let mut out = []
+    let mut i = 0
+    while i < dW {
+        let mut s = 0.0
+        let mut j = 0
+        while j < db {
+            s = s + prop.kernel[i * db + j] * deviation[j]
+            j = j + 1
+        }
+        out = out.push(s)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Gate ───────────────────────────────────────────────────
+
+fn psi_in_range(psi: array) -> bool {
+    let n = len(psi)
+    let mut i = 0
+    while i < n {
+        let v = psi[i]
+        if v < 0.0 { return false }
+        if v > 1.0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn n6_gate(psi: array) -> bool {
+    let n = len(psi)
+    if n <= 0 { return false }
+    if n % 2 != 0 { return false }
+    if NOETHER_N6 * NOETHER_TAU != NOETHER_SIGMA_PHI { return false }
+    if !psi_in_range(psi) { return false }
+    return true
+}
+
+// ─── Discrete Laplacian ∇²Ψ ─────────────────────────────────
+// 1-D central difference: (Ψ[i-1] − 2Ψ[i] + Ψ[i+1]); Neumann at the edges.
+fn laplacian(psi: array) -> array {
+    let n = len(psi)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let left  = if i == 0        { psi[i]     } else { psi[i - 1] }
+        let right = if i == n - 1    { psi[i]     } else { psi[i + 1] }
+        out = out.push(left - 2.0 * psi[i] + right)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Deviation ──────────────────────────────────────────────
+
+fn deviation_of(psi_t: array) -> array {
+    let n = len(psi_t)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(psi_t[i] - VAC_COMPONENT)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── First-order ΔW_1 = −T1 · G_holo · (Ψ − ½) ─────────────
+
+fn delta_w_first(psi_t: array) -> array {
+    let n = len(psi_t)
+    if n <= 0 { return [] }
+    if !n6_gate(psi_t) { return zeros(n) }
+    let dev = deviation_of(psi_t)
+    let prop = propagator_new(n, n, XI_DEFAULT)
+    let t = propagator_apply(prop, dev)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0 - T1_CONST * t[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Second-order ΔW_2 = −T2 · (Ψ − ½) · |∇²Ψ| · G_holo · δ(gate) ─
+// Element-wise restoring: sign always opposes (Ψ − ½), magnitude amplified
+// by local curvature |∇²Ψ|. So sharp bends get a Newton-like boost while
+// flat regions get no second-order contribution. This is the curvature-
+// weighted restoring interpretation of the Hessian correction — strictly
+// monotone (never reverses the first-order direction).
+fn delta_w_second(psi_t: array) -> array {
+    let n = len(psi_t)
+    if n <= 0 { return [] }
+    if !n6_gate(psi_t) { return zeros(n) }
+    let dev = deviation_of(psi_t)
+    let lap = laplacian(psi_t)
+    let mut hess = []
+    let mut i = 0
+    while i < n {
+        // |∇²Ψ| as a local curvature magnitude; deviation carries the sign.
+        hess = hess.push(dev[i] * fabs(lap[i]))
+        i = i + 1
+    }
+    let prop = propagator_new(n, n, XI_DEFAULT)
+    let t = propagator_apply(prop, hess)
+    let mut out = []
+    let mut j = 0
+    while j < n {
+        out = out.push(0.0 - T2_CONST * t[j])
+        j = j + 1
+    }
+    return out
+}
+
+// ─── Combined ───────────────────────────────────────────────
+
+fn tension_link_step_2(psi_t: array) -> array {
+    let n = len(psi_t)
+    if !n6_gate(psi_t) { return zeros(n) }
+    let dw1 = delta_w_first(psi_t)
+    let dw2 = delta_w_second(psi_t)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(dw1[i] + dw2[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Helpers ────────────────────────────────────────────────
+
+fn vec_abs_sum(v: array) -> float {
+    let n = len(v)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + fabs(v[i])
+        i = i + 1
+    }
+    return s
+}
+
+fn apply_delta(psi: array, dw: array) -> array {
+    let n = len(psi)
+    let m = len(dw)
+    if n != m { return psi }
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(psi[i] + dw[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn dist_to_vac_sq(psi: array) -> float {
+    let n = len(psi)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let d = psi[i] - VAC_COMPONENT
+        s = s + d * d
+        i = i + 1
+    }
+    return s
+}
+
+fn print_vec(label: string, v: array) {
+    let n = len(v)
+    let mut s = label + " ["
+    let mut i = 0
+    while i < n {
+        if i > 0 { s = s + ", " }
+        s = s + str(v[i])
+        i = i + 1
+    }
+    s = s + "]"
+    println(s)
+}
+
+// ─── Self-tests (T1–T3) ─────────────────────────────────────
+
+// T1 : at vacuum Ψ=½ everywhere, dev=0, lap=0 → ΔW_1 = ΔW_2 = 0
+fn check_T1() -> bool {
+    let mut psi = []
+    let mut i = 0
+    while i < 6 {
+        psi = psi.push(0.5)
+        i = i + 1
+    }
+    let dw1 = delta_w_first(psi)
+    let dw2 = delta_w_second(psi)
+    let dw  = tension_link_step_2(psi)
+    let ok = vec_abs_sum(dw1) < 0.00001
+          && vec_abs_sum(dw2) < 0.00001
+          && vec_abs_sum(dw)  < 0.00001
+    if ok { println("  [T1] vacuum fixed-point PASS (both orders = 0)") }
+    else  { println("  [T1] vacuum fixed-point FAIL") }
+    return ok
+}
+
+// T2 : on a curved Ψ the second-order term is NONZERO.
+//   Build Ψ = ½ + 0.1 · (i/5)² on 6 bins — quadratic in index.
+fn check_T2() -> bool {
+    let n = 6
+    let mut psi = []
+    let mut i = 0
+    while i < n {
+        let u = to_float(i) / 5.0
+        psi = psi.push(0.5 + 0.1 * u * u)
+        i = i + 1
+    }
+    let lap = laplacian(psi)
+    let dw1 = delta_w_first(psi)
+    let dw2 = delta_w_second(psi)
+    let lap_nonzero = vec_abs_sum(lap) > 0.00001
+    let dw2_nonzero = vec_abs_sum(dw2) > 0.00001
+    let dw1_nonzero = vec_abs_sum(dw1) > 0.00001
+    let ok = lap_nonzero && dw1_nonzero && dw2_nonzero
+    if ok { println("  [T2] Hessian-nonzero PASS (|∇²Ψ|=" + str(vec_abs_sum(lap))
+                  + ", |ΔW2|=" + str(vec_abs_sum(dw2)) + ")") }
+    else  { println("  [T2] Hessian-nonzero FAIL") }
+    return ok
+}
+
+// T3 : on a curved Ψ, second-order composite converges STRICTLY faster than
+//      first-order alone after 10 steps (distance² to vacuum).
+fn check_T3() -> bool {
+    let n = 6
+    // Build non-trivial curved Ψ
+    let mut psi_a = []
+    let mut psi_b = []
+    let mut i = 0
+    while i < n {
+        let u = to_float(i) / 5.0
+        let v = 0.5 + 0.15 * u * u
+        psi_a = psi_a.push(v)
+        psi_b = psi_b.push(v)
+        i = i + 1
+    }
+    let d0_a = dist_to_vac_sq(psi_a)
+    let d0_b = dist_to_vac_sq(psi_b)
+
+    // 10 steps of each variant
+    let mut step = 0
+    let mut psi_1 = psi_a
+    let mut psi_2 = psi_b
+    while step < 10 {
+        let dw1 = delta_w_first(psi_1)
+        let dw2 = tension_link_step_2(psi_2)
+        psi_1 = apply_delta(psi_1, dw1)
+        psi_2 = apply_delta(psi_2, dw2)
+        step = step + 1
+    }
+    let d10_1 = dist_to_vac_sq(psi_1)
+    let d10_2 = dist_to_vac_sq(psi_2)
+    let ok = d10_2 < d10_1 && d10_1 < d0_a && d10_2 < d0_b
+    if ok {
+        println("  [T3] convergence-accel PASS  (d²: first " + str(d0_a) + "→" + str(d10_1)
+             + ", second " + str(d0_b) + "→" + str(d10_2) + ")")
+    } else {
+        println("  [T3] convergence-accel FAIL  (first→" + str(d10_1) + " second→" + str(d10_2) + ")")
+    }
+    return ok
+}
+
+// ─── main ────────────────────────────────────────────────────
+
+fn main() {
+    println("[tension_link_second_order] ΔW = ΔW₁ + ΔW₂, Hessian-weighted 2nd order")
+    println("  T1=" + str(T1_CONST) + "  T2=" + str(T2_CONST) + "  xi=" + str(XI_DEFAULT))
+
+    let t1 = check_T1()
+    let t2 = check_T2()
+    let t3 = check_T3()
+
+    // demo
+    let mut psi = []
+    let n = 6
+    let mut i = 0
+    while i < n {
+        let u = to_float(i) / 5.0
+        psi = psi.push(0.5 + 0.2 * u * u)
+        i = i + 1
+    }
+    let dw = tension_link_step_2(psi)
+    print_vec("  demo ΔW(combined)", dw)
+
+    let all_pass = t1 && t2 && t3
+    if all_pass {
+        println("[tension_link_second_order] ALL 3/3 PASS")
+    } else {
+        println("[tension_link_second_order] SOME FAILED")
+    }
+}
+
+main()

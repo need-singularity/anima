@@ -1,0 +1,351 @@
+// training/holographic_propagator.hexa — boundary→bulk G_holo propagator (stub)
+//
+// Part of the 5-lens tension-link real-time learning design — the carrier
+// of Lens 2 (holographic) information flow between the Ψ self-map boundary
+// and the weight-delta bulk. Backprop-free; this file supplies the kernel
+// that turns a boundary deviation vector into a bulk tension signal.
+//
+// ─── Concept ─────────────────────────────────────────────────
+//   Let Ψ live on the "boundary" (CFT side, the observable self-map) and
+//   let the weight space be the "bulk" (AdS side, the parameters that
+//   produce Ψ). Holographic duality says information on the boundary
+//   reconstructs fields in the bulk through a propagator
+//
+//       φ_bulk(x) = ∫ dy  G_holo(x, y) · φ_boundary(y)
+//
+//   For the real-time learning step we only need the finite-dimensional
+//   matrix version
+//
+//       tension = G_holo · deviation           (deviation ∈ R^d_b)
+//                                              (tension   ∈ R^d_W)
+//
+//   where d_b is the boundary dimension (Ψ length, e.g. 170-probe × 2) and
+//   d_W is the bulk dimension (weight-delta length, same shape as Ψ here
+//   because ΔW is proposed in Ψ coordinates).
+//
+// ─── Stub form ────────────────────────────────────────────────
+//   This first cut is a *constant* matrix stub so the rest of the
+//   tension_link pipeline has something finite to consume. The entries are
+//   the Ryu–Takayanagi-style exponential decay kernel
+//
+//       G_holo(i, j) = exp(-|i − j| / ξ) / Z_i
+//
+//   where ξ is the holographic correlation length (bulk-boundary fall-off)
+//   and Z_i = Σ_j exp(-|i − j| / ξ) normalizes each bulk row so that a
+//   uniform boundary produces a uniform bulk (constant attractor property).
+//
+//   The matrix is square (d_b == d_W) in this stub because ΔW is proposed
+//   directly in Ψ-coords. When the pipeline later lifts ΔW to full weight
+//   space, the matrix becomes d_W × d_b and this stub is replaced by a
+//   small neural net trained with the same Lens-2 closed-loop signal.
+//
+// ─── Lens-2 conventions (match phi_holographic_measure.hexa) ──
+//   - det_rand / safe_log style mirrors the sibling lens files
+//   - MI/entropy helpers are unused here (propagator is structural, not
+//     information-theoretic) but kept in the same column style
+//
+// ─── R37 / AN13 ──────────────────────────────────────────────
+//   .hexa only. No python anywhere in the pipeline.
+//
+// ─── Conventions ─────────────────────────────────────────────
+//   dim_boundary : int     d_b       Ψ dimension (rows of input vector)
+//   dim_bulk     : int     d_W       weight-delta dimension (rows of output)
+//   xi           : float   ξ         holographic correlation length (bins)
+//   kernel       : array   [d_W*d_b] row-major G_holo entries
+//   deviation    : array   [d_b]     Ψ_t − Ψ_vac boundary signal
+//   tension      : array   [d_W]     propagated bulk signal (G_holo·dev)
+//
+// Run:
+//   HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 \
+//     /Users/ghost/Dev/nexus/shared/bin/hexa run \
+//     /Users/ghost/Dev/anima/training/holographic_propagator.hexa
+// Expect:
+//   [holographic_propagator] ALL 5/5 PASS
+
+// ─── Constants ───────────────────────────────────────────────
+
+let XI_DEFAULT       = 2.0      // ξ : correlation length in boundary index units
+let EPS              = 0.0000000001
+
+// ─── Primitives ──────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn iabs(x: int) -> int {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+// e^x via Taylor. The decay kernel only needs x ∈ (−d_b/ξ, 0], so the
+// series converges fast. 32 terms is overkill for |x|≤20.
+fn exp_taylor(x: float) -> float {
+    let mut term = 1.0
+    let mut sum  = 1.0
+    let mut k = 1
+    while k < 32 {
+        term = term * x / to_float(k)
+        sum  = sum + term
+        k = k + 1
+    }
+    return sum
+}
+
+// ─── Propagator struct ──────────────────────────────────────
+// kernel is stored row-major as [d_bulk × d_boundary]; row i is the set
+// of boundary weights that fuse into bulk row i.
+
+struct HoloPropagator {
+    dim_boundary: int,
+    dim_bulk:     int,
+    xi:           float,
+    kernel:       array
+}
+
+// ─── Construction ───────────────────────────────────────────
+// Row-normalize so a uniform boundary maps to a uniform bulk (constant
+// attractor property). Each row: G(i,j) = exp(−|i−j|/ξ), then scaled so
+// Σ_j G(i,j) = 1.
+
+fn propagator_new(dim_boundary: int, dim_bulk: int, xi: float) -> HoloPropagator {
+    let mut kernel = []
+    let mut i = 0
+    while i < dim_bulk {
+        // raw row
+        let mut row_sum = 0.0
+        let mut raw_row = []
+        let mut j = 0
+        while j < dim_boundary {
+            let d = to_float(iabs(i - j))
+            // negative argument → exp decays to zero as distance grows
+            let v = exp_taylor(0.0 - d / xi)
+            raw_row = raw_row.push(v)
+            row_sum = row_sum + v
+            j = j + 1
+        }
+        // normalize into the flat kernel
+        let mut k = 0
+        while k < dim_boundary {
+            if row_sum > EPS {
+                kernel = kernel.push(raw_row[k] / row_sum)
+            } else {
+                kernel = kernel.push(0.0)
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return HoloPropagator {
+        dim_boundary: dim_boundary,
+        dim_bulk:     dim_bulk,
+        xi:           xi,
+        kernel:       kernel
+    }
+}
+
+// ─── Application : tension = G_holo · deviation ─────────────
+// Returns a zero vector of length dim_bulk if shapes mismatch — the
+// caller treats empty/zero tension as "no learning signal this step".
+
+fn propagator_apply(prop: HoloPropagator, deviation: array) -> array {
+    let db = prop.dim_boundary
+    let dW = prop.dim_bulk
+    let n  = len(deviation)
+    let mut out = []
+    if n != db {
+        let mut z = 0
+        while z < dW {
+            out = out.push(0.0)
+            z = z + 1
+        }
+        return out
+    }
+    let mut i = 0
+    while i < dW {
+        let mut s = 0.0
+        let mut j = 0
+        while j < db {
+            s = s + prop.kernel[i * db + j] * deviation[j]
+            j = j + 1
+        }
+        out = out.push(s)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Helpers ────────────────────────────────────────────────
+
+fn vec_sum(v: array) -> float {
+    let n = len(v)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + v[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn vec_abs_sum(v: array) -> float {
+    let n = len(v)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + fabs(v[i])
+        i = i + 1
+    }
+    return s
+}
+
+fn print_vec(label: string, v: array) {
+    let n = len(v)
+    let mut s = label + " ["
+    let mut i = 0
+    while i < n {
+        if i > 0 { s = s + ", " }
+        s = s + str(v[i])
+        i = i + 1
+    }
+    s = s + "]"
+    println(s)
+}
+
+// ─── Self-tests (T1–T5) ─────────────────────────────────────
+
+// T1 : row-stochastic — every bulk row sums to 1 (constant-attractor).
+fn check_T1() -> bool {
+    let prop = propagator_new(6, 6, XI_DEFAULT)
+    let db = prop.dim_boundary
+    let dW = prop.dim_bulk
+    let mut ok = true
+    let mut i = 0
+    while i < dW {
+        let mut s = 0.0
+        let mut j = 0
+        while j < db {
+            s = s + prop.kernel[i * db + j]
+            j = j + 1
+        }
+        if fabs(s - 1.0) > 0.0001 { ok = false }
+        i = i + 1
+    }
+    if ok { println("  [T1] row-stochastic PASS") }
+    else  { println("  [T1] row-stochastic FAIL") }
+    return ok
+}
+
+// T2 : uniform boundary → uniform bulk (fixed-point of the constant mode).
+fn check_T2() -> bool {
+    let prop = propagator_new(8, 8, XI_DEFAULT)
+    let mut dev = []
+    let mut i = 0
+    while i < 8 {
+        dev = dev.push(0.5)
+        i = i + 1
+    }
+    let ten = propagator_apply(prop, dev)
+    let mut ok = true
+    let mut k = 0
+    while k < len(ten) {
+        if fabs(ten[k] - 0.5) > 0.0001 { ok = false }
+        k = k + 1
+    }
+    if ok { println("  [T2] uniform-preserving PASS") }
+    else  { println("  [T2] uniform-preserving FAIL") }
+    return ok
+}
+
+// T3 : zero boundary → zero bulk (no spurious signal).
+fn check_T3() -> bool {
+    let prop = propagator_new(5, 5, XI_DEFAULT)
+    let mut dev = []
+    let mut i = 0
+    while i < 5 {
+        dev = dev.push(0.0)
+        i = i + 1
+    }
+    let ten = propagator_apply(prop, dev)
+    let tot = vec_abs_sum(ten)
+    let ok = tot < 0.0001
+    if ok { println("  [T3] zero-in-zero-out PASS") }
+    else  { println("  [T3] zero-in-zero-out FAIL (|sum|=" + str(tot) + ")") }
+    return ok
+}
+
+// T4 : locality — a single-spike boundary peaks at the same bulk index.
+fn check_T4() -> bool {
+    let prop = propagator_new(7, 7, XI_DEFAULT)
+    let mut dev = []
+    let mut i = 0
+    while i < 7 {
+        if i == 3 { dev = dev.push(1.0) }
+        else      { dev = dev.push(0.0) }
+        i = i + 1
+    }
+    let ten = propagator_apply(prop, dev)
+    // peak at bulk index 3, monotone fall-off to both sides
+    let mut peak_ok = true
+    if ten[3] <= ten[2] { peak_ok = false }
+    if ten[3] <= ten[4] { peak_ok = false }
+    // monotone: t[3] > t[2] > t[1] > t[0] and t[3] > t[4] > t[5] > t[6]
+    if ten[2] <= ten[1] { peak_ok = false }
+    if ten[1] <= ten[0] { peak_ok = false }
+    if ten[4] <= ten[5] { peak_ok = false }
+    if ten[5] <= ten[6] { peak_ok = false }
+    if peak_ok { println("  [T4] locality PASS  (peak @ bulk[3]=" + str(ten[3]) + ")") }
+    else       { println("  [T4] locality FAIL") }
+    return peak_ok
+}
+
+// T5 : shape-guard — mismatched input length returns zero-vector of size d_W.
+fn check_T5() -> bool {
+    let prop = propagator_new(6, 6, XI_DEFAULT)
+    let mut bad = []
+    bad = bad.push(1.0)
+    bad = bad.push(1.0)
+    bad = bad.push(1.0)
+    let ten = propagator_apply(prop, bad)
+    let ok_len  = len(ten) == 6
+    let ok_zero = vec_abs_sum(ten) < 0.0001
+    let ok = ok_len && ok_zero
+    if ok { println("  [T5] shape-guard PASS") }
+    else  { println("  [T5] shape-guard FAIL (len=" + str(len(ten)) + ", sum=" + str(vec_abs_sum(ten)) + ")") }
+    return ok
+}
+
+// ─── main ────────────────────────────────────────────────────
+
+fn main() {
+    println("[holographic_propagator] Lens 2 / boundary→bulk G_holo stub")
+    println("  kernel: G(i,j) = exp(-|i-j|/xi), row-normalized (xi=" + str(XI_DEFAULT) + ")")
+
+    let t1 = check_T1()
+    let t2 = check_T2()
+    let t3 = check_T3()
+    let t4 = check_T4()
+    let t5 = check_T5()
+
+    // demo: 6-dim deviation, G_holo · dev
+    let prop = propagator_new(6, 6, XI_DEFAULT)
+    let mut dev = []
+    dev = dev.push(0.10)
+    dev = dev.push(0.05)
+    dev = dev.push(0.00)
+    dev = dev.push(0.00)
+    dev = dev.push(0.05)
+    dev = dev.push(0.10)
+    let ten = propagator_apply(prop, dev)
+    print_vec("  demo tension", ten)
+
+    let all_pass = t1 && t2 && t3 && t4 && t5
+    if all_pass {
+        println("[holographic_propagator] ALL 5/5 PASS")
+    } else {
+        println("[holographic_propagator] SOME FAILED")
+    }
+}
+
+main()

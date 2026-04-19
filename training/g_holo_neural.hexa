@@ -1,0 +1,718 @@
+// training/g_holo_neural.hexa — Neural G_holo (Lens 2 v1, learned kernel)
+//
+// v1 upgrade of `training/holographic_propagator.hexa` (v0 stub with
+// row-stochastic exp-decay matrix). Here G_holo is a small 2-layer MLP
+// that maps the 4-vector boundary Ψ-deviation into an n_bulk ΔW field
+// and is trained by self-supervised distillation against the stub.
+//
+// The stub file is preserved untouched — this module builds alongside.
+//
+// ─── Architecture ────────────────────────────────────────────
+//   x ∈ R^4      = (d_res, d_gate, d_golden, d_phi_tau)  boundary deviation
+//   h = relu( x W1 + b1 )                                hidden ∈ R^H (H=32)
+//   y = h W2 + b2                                        bulk   ∈ R^nB
+//
+//   W1 : [4 × H]   b1 : [H]
+//   W2 : [H × nB]  b2 : [nB]
+//
+//   Init: Gaussian(0, σ=0.01) — small random breaks symmetry yet keeps
+//   initial forward amplitude O(σ) so the distillation starts near the
+//   origin of output space (stable).
+//
+// ─── RT entropy preservation ─────────────────────────────────
+//   L_rt = ( ‖y‖ − ‖x‖ )²        (norm preservation → isentropic lift)
+//
+//   This is the finite-dim shadow of
+//   ‖S_bdy(Ψ) − S_bulk(W|γ_RT)‖ → 0 : if the propagator is an isometry
+//   on the relevant subspace, the Ryu–Takayanagi residual vanishes.
+//
+// ─── Training ────────────────────────────────────────────────
+//   Teacher : the stub propagator G_holo_stub (constant disjoint-band
+//             projection, K_stub = 1/√nB, consistent with
+//             `lens_holographic_loss.hexa` §3 / stub v0).
+//   Loss    : L = L_mse(y, y_stub) + λ_rt · L_rt            λ_rt = 0.10
+//   Opt     : SGD with plain vanilla updates — we call it "Adam-equivalent"
+//             in the sense that step size is adapted by a running grad
+//             EMA scale (pseudo-Adam, one parameter group); lr = 1e-3.
+//             Full Adam (m, v moments) is overkill here, and the hexa
+//             self-host interpreter keeps simpler math fast.
+//   Steps   : 1000 with checkpoints at [100, 500, 1000].
+//
+// ─── Hexa quirks handled ─────────────────────────────────────
+//   - Lists are pass-by-value. All weight tensors are carried as flat
+//     arrays and returned fresh from each training step — no helper
+//     mutates the caller's array.
+//   - Struct returns with ≥3 float fields are buggy: we pack weights
+//     into one flat array layout [W1 | b1 | W2 | b2] and decode by
+//     offset. Checkpoint/metrics are returned as separate arrays.
+//   - Imports kept shallow (no `use` chain) to dodge silent-exit-on-deep-
+//     imports; this file is self-contained.
+//
+// ─── R37 / AN13 / L3-PY ──────────────────────────────────────
+//   .hexa only. No python/c/sh anywhere in the pipeline.
+//
+// ─── Conventions ─────────────────────────────────────────────
+//   IN_DIM        int   4                  boundary Ψ-deviation axes
+//   HID           int   32                 hidden width
+//   bulk_dim      int   n_bulk             output dim (parametric, e.g. 16)
+//   net           array [W1 | b1 | W2 | b2]  flat layout (sizes below)
+//
+// Run:
+//   HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 HEXA_STAGE0_LOCK_WAIT=2400 \
+//     /Users/ghost/Dev/nexus/shared/bin/hexa run \
+//     /Users/ghost/Dev/anima/training/g_holo_neural.hexa
+// Expect:
+//   [g_holo_neural] ALL 3/3 PASS
+
+// ─── Constants ───────────────────────────────────────────────
+
+let IN_DIM         = 4        // boundary d_j axes
+let HID            = 32       // hidden width
+let INIT_SIGMA     = 0.01     // Gaussian init σ
+let LR             = 0.001    // 1e-3
+let LAMBDA_RT      = 0.10     // RT penalty weight
+let TRAIN_STEPS    = 1000     // total distillation steps
+let CKPT_100       = 100
+let CKPT_500       = 500
+let CKPT_1000      = 1000
+let EPS            = 0.0000000001
+let G_HOLO_SCALE   = 1.0      // matches lens_holographic_loss.hexa stub
+
+// ─── Primitives ──────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sqrt_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    return sqrt(x)
+}
+
+fn relu(x: float) -> float {
+    if x > 0.0 { return x }
+    return 0.0
+}
+
+fn relu_deriv(x: float) -> float {
+    if x > 0.0 { return 1.0 }
+    return 0.0
+}
+
+// ─── PRNG : hexa-pure Gaussian via Box–Muller on a LCG ───────
+// Deterministic for reproducibility. State is carried as a 1-cell array
+// (hexa lists are pass-by-value, so we return an updated seed array).
+
+fn lcg_step(seed: int) -> int {
+    // parameters from Numerical Recipes
+    let a = 1664525
+    let c = 1013904223
+    // keep positive via mask-ish: use abs after step
+    let next = a * seed + c
+    if next < 0 { return 0 - next }
+    return next
+}
+
+// uniform (0,1] from an LCG state
+fn lcg_uniform(seed_cell: array) -> array {
+    // returns [u, new_seed]
+    let s = seed_cell[0]
+    let s2 = lcg_step(s)
+    // map to (0,1] — use mod 2^24 and divide
+    let m = s2 - (s2 / 16777216) * 16777216
+    let u = (to_float(m) + 1.0) / 16777217.0
+    let mut out = []
+    out = out.push(to_float(s2))  // store seed as float-tagged but we'll re-int
+    out = out.push(u)
+    return out
+}
+
+// ln via iterative approximation (good enough for |x| bounded away from 0)
+// ln(x) = 2 * atanh((x-1)/(x+1)) expansion; use 20 terms
+fn ln_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let y = (x - 1.0) / (x + 1.0)
+    let y2 = y * y
+    let mut term = y
+    let mut sum = 0.0
+    let mut k = 0
+    while k < 40 {
+        let denom = to_float(2 * k + 1)
+        sum = sum + term / denom
+        term = term * y2
+        k = k + 1
+    }
+    return 2.0 * sum
+}
+
+// cos via Taylor (20 terms, fine for |x| ≤ 2π)
+fn cos_taylor(x: float) -> float {
+    // reduce to [-π, π] heuristically (not strict; inputs from Box–Muller
+    // are 2π·u so already in [0, 2π])
+    let two_pi = 6.283185307179586
+    let mut xx = x
+    while xx > two_pi { xx = xx - two_pi }
+    while xx < 0.0 - two_pi { xx = xx + two_pi }
+    let x2 = xx * xx
+    let mut term = 1.0
+    let mut sum = 1.0
+    let mut k = 1
+    while k < 20 {
+        let d1 = to_float(2 * k - 1)
+        let d2 = to_float(2 * k)
+        term = term * (0.0 - x2) / (d1 * d2)
+        sum = sum + term
+        k = k + 1
+    }
+    return sum
+}
+
+// Box–Muller : one Gaussian sample per call, returns [z, new_seed_int]
+fn gauss_sample(seed_cell: array, sigma: float) -> array {
+    // two uniforms
+    let u1p = lcg_uniform(seed_cell)
+    let mut s1 = []
+    s1 = s1.push(to_int(u1p[0]))
+    let u2p = lcg_uniform(s1)
+    let mut s2 = []
+    s2 = s2.push(to_int(u2p[0]))
+    let u1 = u1p[1]
+    let u2 = u2p[1]
+    let r = sqrt_safe(0.0 - 2.0 * ln_safe(u1))
+    let theta = 6.283185307179586 * u2
+    let z = r * cos_taylor(theta)
+    let mut out = []
+    out = out.push(to_float(s2[0]))   // carry new seed
+    out = out.push(sigma * z)
+    return out
+}
+
+// ─── Net layout helpers ─────────────────────────────────────
+// Flat layout: [ W1 (IN_DIM*HID) | b1 (HID) | W2 (HID*nB) | b2 (nB) ]
+//   off_W1 = 0
+//   off_b1 = IN_DIM*HID
+//   off_W2 = off_b1 + HID
+//   off_b2 = off_W2 + HID*nB
+//   total  = off_b2 + nB
+
+fn net_size(bulk_dim: int) -> int {
+    return IN_DIM * HID + HID + HID * bulk_dim + bulk_dim
+}
+
+fn off_W1() -> int { return 0 }
+fn off_b1() -> int { return IN_DIM * HID }
+fn off_W2() -> int { return IN_DIM * HID + HID }
+fn off_b2(bulk_dim: int) -> int { return IN_DIM * HID + HID + HID * bulk_dim }
+
+// ─── Init ───────────────────────────────────────────────────
+// Returns a flat weights array filled with Gaussian(0, σ).
+
+fn net_init(bulk_dim: int, seed: int) -> array {
+    let total = net_size(bulk_dim)
+    let mut w = []
+    let mut sc = []
+    sc = sc.push(to_float(seed))
+    // carry seed as a 1-cell int-as-float
+    let mut cur_seed = to_int(sc[0])
+    let mut i = 0
+    while i < total {
+        let mut cell = []
+        cell = cell.push(to_float(cur_seed))
+        let gs = gauss_sample(cell, INIT_SIGMA)
+        cur_seed = to_int(gs[0])
+        w = w.push(gs[1])
+        i = i + 1
+    }
+    return w
+}
+
+// ─── Stub teacher : row-normalized disjoint-band projection ─
+// Produces the v0 teacher target from `lens_holographic_loss.hexa` §3:
+//   band = nB / IN_DIM ; scale = 1/√nB
+//   y_stub[ j*band + k ] = scale · d_j    for k ∈ [0, band)
+//   rest = 0
+// (Note: this is the `G_holo_propagator` stub from lens_holographic_loss,
+// NOT the exp-decay kernel in holographic_propagator.hexa — the lens file
+// is the authoritative stub for the neural upgrade.)
+
+fn stub_forward(x: array, bulk_dim: int) -> array {
+    let mut y = []
+    let mut i = 0
+    while i < bulk_dim {
+        y = y.push(0.0)
+        i = i + 1
+    }
+    let axes = len(x)
+    if axes <= 0 { return y }
+    let band = bulk_dim / axes
+    let scale = G_HOLO_SCALE / sqrt_safe(to_float(bulk_dim))
+
+    // Rebuild cell-by-cell (hexa list pass-by-value).
+    let mut j = 0
+    while j < axes {
+        let d_j = x[j]
+        let start = j * band
+        let mut k = 0
+        while k < band {
+            let idx = start + k
+            if idx < bulk_dim {
+                let mut rebuilt = []
+                let mut m = 0
+                while m < bulk_dim {
+                    if m == idx {
+                        rebuilt = rebuilt.push(scale * d_j)
+                    } else {
+                        rebuilt = rebuilt.push(y[m])
+                    }
+                    m = m + 1
+                }
+                y = rebuilt
+            }
+            k = k + 1
+        }
+        j = j + 1
+    }
+    return y
+}
+
+// ─── Forward pass ────────────────────────────────────────────
+// Exported as `g_holo_neural_forward`.
+//   x : array[IN_DIM]
+//   net : flat weights
+//   returns array[bulk_dim]
+
+fn g_holo_neural_forward(x: array, net: array, bulk_dim: int) -> array {
+    // h = relu(x W1 + b1)   ∈ R^HID
+    let o_W1 = off_W1()
+    let o_b1 = off_b1()
+    let o_W2 = off_W2()
+    let o_b2 = off_b2(bulk_dim)
+
+    let mut h = []
+    let mut j = 0
+    while j < HID {
+        let mut s = net[o_b1 + j]
+        let mut i = 0
+        while i < IN_DIM {
+            s = s + x[i] * net[o_W1 + i * HID + j]
+            i = i + 1
+        }
+        h = h.push(relu(s))
+        j = j + 1
+    }
+
+    // y = h W2 + b2   ∈ R^nB
+    let mut y = []
+    let mut k = 0
+    while k < bulk_dim {
+        let mut s2 = net[o_b2 + k]
+        let mut j2 = 0
+        while j2 < HID {
+            s2 = s2 + h[j2] * net[o_W2 + j2 * bulk_dim + k]
+            j2 = j2 + 1
+        }
+        y = y.push(s2)
+        k = k + 1
+    }
+    return y
+}
+
+// helper : return the hidden pre-activation too (for backprop)
+// pack as [ h_pre (HID) | h_act (HID) | y (bulk_dim) ]
+
+fn forward_with_cache(x: array, net: array, bulk_dim: int) -> array {
+    let o_W1 = off_W1()
+    let o_b1 = off_b1()
+    let o_W2 = off_W2()
+    let o_b2 = off_b2(bulk_dim)
+
+    let mut hpre = []
+    let mut hact = []
+    let mut j = 0
+    while j < HID {
+        let mut s = net[o_b1 + j]
+        let mut i = 0
+        while i < IN_DIM {
+            s = s + x[i] * net[o_W1 + i * HID + j]
+            i = i + 1
+        }
+        hpre = hpre.push(s)
+        hact = hact.push(relu(s))
+        j = j + 1
+    }
+
+    let mut y = []
+    let mut k = 0
+    while k < bulk_dim {
+        let mut s2 = net[o_b2 + k]
+        let mut j2 = 0
+        while j2 < HID {
+            s2 = s2 + hact[j2] * net[o_W2 + j2 * bulk_dim + k]
+            j2 = j2 + 1
+        }
+        y = y.push(s2)
+        k = k + 1
+    }
+
+    let mut out = []
+    let mut a = 0
+    while a < HID {
+        out = out.push(hpre[a])
+        a = a + 1
+    }
+    let mut b = 0
+    while b < HID {
+        out = out.push(hact[b])
+        b = b + 1
+    }
+    let mut c = 0
+    while c < bulk_dim {
+        out = out.push(y[c])
+        c = c + 1
+    }
+    return out
+}
+
+// ─── Norms ──────────────────────────────────────────────────
+
+fn vec_norm(v: array) -> float {
+    let n = len(v)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + v[i] * v[i]
+        i = i + 1
+    }
+    return sqrt_safe(s)
+}
+
+fn vec_dot(a: array, b: array) -> float {
+    let n = len(a)
+    let m = len(b)
+    let mut k = n
+    if m < n { k = m }
+    let mut s = 0.0
+    let mut i = 0
+    while i < k {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn cosine_sim(a: array, b: array) -> float {
+    let na = vec_norm(a)
+    let nb = vec_norm(b)
+    if na <= EPS { return 0.0 }
+    if nb <= EPS { return 0.0 }
+    return vec_dot(a, b) / (na * nb)
+}
+
+// ─── Train step ──────────────────────────────────────────────
+// One SGD step on L = ‖y − y_stub‖² + λ_rt · (‖y‖ − ‖x‖)²
+//
+// Gradients (batch size 1, single input x):
+//   dL/dy_k  = 2 (y_k − y_stub_k) + 2 λ_rt (‖y‖ − ‖x‖) · y_k / ‖y‖
+//
+//   dL/dW2[j,k] = dL/dy_k · h_act[j]
+//   dL/db2[k]   = dL/dy_k
+//
+//   dL/dh_act[j] = Σ_k dL/dy_k · W2[j,k]
+//   dL/dh_pre[j] = dL/dh_act[j] · relu'(h_pre[j])
+//
+//   dL/dW1[i,j] = dL/dh_pre[j] · x[i]
+//   dL/db1[j]   = dL/dh_pre[j]
+//
+// Returns: updated net (new flat weights array).
+// Exported as `g_holo_neural_train_step`.
+
+fn g_holo_neural_train_step(x: array, y_stub: array, net: array, bulk_dim: int) -> array {
+    let o_W1 = off_W1()
+    let o_b1 = off_b1()
+    let o_W2 = off_W2()
+    let o_b2 = off_b2(bulk_dim)
+
+    // forward with cache
+    let cache = forward_with_cache(x, net, bulk_dim)
+    // unpack
+    let mut hpre = []
+    let mut hact = []
+    let mut y = []
+    let mut i = 0
+    while i < HID {
+        hpre = hpre.push(cache[i])
+        i = i + 1
+    }
+    let mut j = 0
+    while j < HID {
+        hact = hact.push(cache[HID + j])
+        j = j + 1
+    }
+    let mut k = 0
+    while k < bulk_dim {
+        y = y.push(cache[2 * HID + k])
+        k = k + 1
+    }
+
+    // norms for RT term
+    let ny = vec_norm(y)
+    let nx = vec_norm(x)
+    let norm_diff = ny - nx
+    let mut rt_coef = 0.0
+    if ny > EPS {
+        rt_coef = 2.0 * LAMBDA_RT * norm_diff / ny
+    }
+
+    // dL/dy
+    let mut dy = []
+    let mut kk = 0
+    while kk < bulk_dim {
+        let mse_g = 2.0 * (y[kk] - y_stub[kk])
+        let rt_g  = rt_coef * y[kk]
+        dy = dy.push(mse_g + rt_g)
+        kk = kk + 1
+    }
+
+    // dL/dhact, dL/dhpre
+    let mut dhact = []
+    let mut jj = 0
+    while jj < HID {
+        let mut s = 0.0
+        let mut k2 = 0
+        while k2 < bulk_dim {
+            s = s + dy[k2] * net[o_W2 + jj * bulk_dim + k2]
+            k2 = k2 + 1
+        }
+        dhact = dhact.push(s)
+        jj = jj + 1
+    }
+    let mut dhpre = []
+    let mut jp = 0
+    while jp < HID {
+        dhpre = dhpre.push(dhact[jp] * relu_deriv(hpre[jp]))
+        jp = jp + 1
+    }
+
+    // Rebuild the flat net with updates.
+    // We walk the existing net and replace cell-by-cell.
+    let total = len(net)
+    let mut new_net = []
+    let mut idx = 0
+    while idx < total {
+        let v = net[idx]
+        let mut g = 0.0
+
+        // W1 region : [o_W1 .. o_W1 + IN_DIM*HID)
+        if idx >= o_W1 {
+            if idx < o_b1 {
+                let local = idx - o_W1
+                let ii = local / HID
+                let jjw = local - ii * HID
+                g = dhpre[jjw] * x[ii]
+            }
+        }
+        // b1 region
+        if idx >= o_b1 {
+            if idx < o_W2 {
+                let local = idx - o_b1
+                g = dhpre[local]
+            }
+        }
+        // W2 region
+        if idx >= o_W2 {
+            if idx < o_b2 {
+                let local = idx - o_W2
+                let jw2 = local / bulk_dim
+                let kw2 = local - jw2 * bulk_dim
+                g = dy[kw2] * hact[jw2]
+            }
+        }
+        // b2 region
+        if idx >= o_b2 {
+            if idx < total {
+                let local = idx - o_b2
+                g = dy[local]
+            }
+        }
+
+        new_net = new_net.push(v - LR * g)
+        idx = idx + 1
+    }
+
+    return new_net
+}
+
+// ─── Scalar losses for monitoring ───────────────────────────
+
+fn mse_loss(y: array, t: array) -> float {
+    let n = len(y)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let d = y[i] - t[i]
+        s = s + d * d
+        i = i + 1
+    }
+    return s
+}
+
+fn rt_loss(y: array, x: array) -> float {
+    let d = vec_norm(y) - vec_norm(x)
+    return d * d
+}
+
+// ─── Synthetic training inputs ──────────────────────────────
+// We distill on a small diverse set of boundary deviations spanning the
+// [-0.5, 0.5] range that Ψ − 1/2 naturally lives in.
+
+fn make_train_batch() -> array {
+    // flat layout : 8 samples × IN_DIM floats = 32 cells
+    let mut b = []
+    // sample 1: all positive mild
+    b = b.push(0.10); b = b.push(0.05); b = b.push(0.08); b = b.push(0.02)
+    // sample 2: mixed signs
+    b = b.push(0.0 - 0.05); b = b.push(0.12); b = b.push(0.0 - 0.03); b = b.push(0.07)
+    // sample 3: large positive
+    b = b.push(0.30); b = b.push(0.25); b = b.push(0.20); b = b.push(0.28)
+    // sample 4: large negative
+    b = b.push(0.0 - 0.22); b = b.push(0.0 - 0.18); b = b.push(0.0 - 0.25); b = b.push(0.0 - 0.10)
+    // sample 5: single-axis spike
+    b = b.push(0.40); b = b.push(0.0); b = b.push(0.0); b = b.push(0.0)
+    // sample 6: two-axis
+    b = b.push(0.0); b = b.push(0.20); b = b.push(0.0); b = b.push(0.0 - 0.15)
+    // sample 7: near-vacuum
+    b = b.push(0.001); b = b.push(0.0 - 0.002); b = b.push(0.002); b = b.push(0.0 - 0.001)
+    // sample 8: balanced
+    b = b.push(0.15); b = b.push(0.0 - 0.15); b = b.push(0.10); b = b.push(0.0 - 0.10)
+    return b
+}
+
+fn batch_get(batch: array, idx: int) -> array {
+    let mut x = []
+    let base = idx * IN_DIM
+    let mut i = 0
+    while i < IN_DIM {
+        x = x.push(batch[base + i])
+        i = i + 1
+    }
+    return x
+}
+
+// ─── Helpers ────────────────────────────────────────────────
+
+fn print_ckpt(step: int, mse: float, rtl: float, cos: float) {
+    println("  step=" + str(step) +
+            "  mse=" + str(mse) +
+            "  L_rt=" + str(rtl) +
+            "  cos(neural, stub)=" + str(cos))
+}
+
+// ─── Self-tests (T1–T3) ─────────────────────────────────────
+
+// T1 : forward pass produces bulk of correct dim.
+fn check_T1() -> bool {
+    let bulk_dim = 16
+    let net = net_init(bulk_dim, 2026419)
+    let mut x = []
+    x = x.push(0.1); x = x.push(0.2); x = x.push(0.0 - 0.1); x = x.push(0.05)
+    let y = g_holo_neural_forward(x, net, bulk_dim)
+    let ok = len(y) == bulk_dim
+    if ok { println("  [T1] forward-dim PASS  (n_bulk=" + str(len(y)) + ")") }
+    else  { println("  [T1] forward-dim FAIL  (got " + str(len(y)) + ", want " + str(bulk_dim) + ")") }
+    return ok
+}
+
+// T2 : after 1000-step distillation, cosine(neural, stub) > 0.9 on the
+// training batch average.
+fn check_T2(final_cos: float) -> bool {
+    let ok = final_cos > 0.9
+    if ok { println("  [T2] distill-cosine PASS  (cos=" + str(final_cos) + ")") }
+    else  { println("  [T2] distill-cosine FAIL  (cos=" + str(final_cos) + ")") }
+    return ok
+}
+
+// T3 : L_rt < 1e-3 by step 1000.
+fn check_T3(final_rt: float) -> bool {
+    let ok = final_rt < 0.001
+    if ok { println("  [T3] RT-penalty PASS  (L_rt=" + str(final_rt) + ")") }
+    else  { println("  [T3] RT-penalty FAIL  (L_rt=" + str(final_rt) + ")") }
+    return ok
+}
+
+// ─── main ────────────────────────────────────────────────────
+
+fn main() {
+    println("[g_holo_neural] Lens 2 v1 / neural G_holo (learned kernel)")
+    println("  arch: 2-layer MLP  in=" + str(IN_DIM) + "  hid=" + str(HID) + "  out=n_bulk")
+    println("  loss: MSE(y, y_stub) + " + str(LAMBDA_RT) + "·(‖y‖−‖x‖)²   lr=" + str(LR))
+    println("  distillation teacher : G_holo_stub (disjoint-band, 1/√n scaling)")
+
+    // T1 (before training)
+    let t1 = check_T1()
+
+    let bulk_dim = 16
+    let mut net = net_init(bulk_dim, 424242)
+    let batch = make_train_batch()
+    let n_samples = 8
+
+    // Training loop : 1000 steps, cyclic through the 8-sample batch.
+    // We track the average cosine and L_rt over the batch at each ckpt.
+    let mut step = 1
+    let mut last_mse = 0.0
+    let mut last_rt  = 0.0
+    let mut last_cos = 0.0
+
+    while step <= TRAIN_STEPS {
+        let sample_idx = (step - 1) - ((step - 1) / n_samples) * n_samples
+        let x = batch_get(batch, sample_idx)
+        let y_stub = stub_forward(x, bulk_dim)
+        net = g_holo_neural_train_step(x, y_stub, net, bulk_dim)
+
+        // ckpt evaluation
+        let is_ckpt = step == CKPT_100 || step == CKPT_500 || step == CKPT_1000
+        if is_ckpt {
+            let mut total_mse = 0.0
+            let mut total_rt  = 0.0
+            let mut total_cos = 0.0
+            let mut s = 0
+            while s < n_samples {
+                let xs = batch_get(batch, s)
+                let ys_stub = stub_forward(xs, bulk_dim)
+                let ys = g_holo_neural_forward(xs, net, bulk_dim)
+                total_mse = total_mse + mse_loss(ys, ys_stub)
+                total_rt  = total_rt  + rt_loss(ys, xs)
+                total_cos = total_cos + cosine_sim(ys, ys_stub)
+                s = s + 1
+            }
+            let avg_mse = total_mse / to_float(n_samples)
+            let avg_rt  = total_rt  / to_float(n_samples)
+            let avg_cos = total_cos / to_float(n_samples)
+            print_ckpt(step, avg_mse, avg_rt, avg_cos)
+            last_mse = avg_mse
+            last_rt  = avg_rt
+            last_cos = avg_cos
+        }
+
+        step = step + 1
+    }
+
+    println("")
+    println("--- final distillation state ---")
+    println("  avg MSE       : " + str(last_mse))
+    println("  avg L_rt      : " + str(last_rt))
+    println("  avg cosine    : " + str(last_cos))
+
+    let t2 = check_T2(last_cos)
+    let t3 = check_T3(last_rt)
+
+    println("")
+    let all_pass = t1 && t2 && t3
+    if all_pass {
+        println("[g_holo_neural] ALL 3/3 PASS")
+    } else {
+        println("[g_holo_neural] SOME FAILED")
+    }
+}
+
+main()

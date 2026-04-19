@@ -1,0 +1,461 @@
+// training/lens_meta.hexa — Lens 6 / Meta : reflexive self-application of 5 lenses
+//
+// Part of the 5-lens tension-link real-time learning design — Lens 6 is the
+// *second-order* field: tension of the tension. Think Yang-Mills on the
+// bundle whose fibre is the 5 lens outputs; the connection is the
+// meta-tension that vanishes when the base lenses agree and amplifies
+// when they diverge.
+//
+// ─── Concept ─────────────────────────────────────────────────
+//   Given the 5 per-lens proposals
+//
+//       ΔW_field, ΔW_holo, ΔW_quantum, ΔW_string, ΔW_toe
+//
+//   define the *lens mean*
+//
+//       ΔW_mean = (1/5) · Σ_l ΔW_l
+//
+//   and the *meta-tension*
+//
+//       T_meta = Σ_l (ΔW_l − ΔW_mean)
+//
+//   ΔW_meta = T_meta · G_holo · δ(∇·J_n6)
+//
+//   Properties (by construction):
+//     (a) all lenses agree        → T_meta = 0  → ΔW_meta = 0
+//     (b) one lens divergent      → T_meta nonzero in that direction
+//     (c) n=6 gate still governs  → divergence off-manifold killed
+//
+//   This is the Yang-Mills-like analogue:
+//     - base space  : the 5-lens bundle
+//     - fibre       : R^d (the weight-delta vector)
+//     - connection  : (ΔW_l − ΔW_mean)   (pure difference, mean-centered)
+//     - curvature   : propagated through G_holo and gated by Noether
+//
+// ─── R37 / AN13 ──────────────────────────────────────────────
+//   .hexa only. No python.
+//
+// Run:
+//   HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 \
+//     /Users/ghost/Dev/nexus/shared/bin/hexa run \
+//     /Users/ghost/Dev/anima/training/lens_meta.hexa
+// Expect:
+//   [lens_meta] ALL 3/3 PASS
+
+// ─── Constants ───────────────────────────────────────────────
+
+let T_META_CONST     = 0.1
+let XI_DEFAULT       = 2.0
+let EPS              = 0.0000000001
+let NOETHER_N6        = 6
+let NOETHER_SIGMA_PHI = 24
+let NOETHER_TAU       = 4
+let VAC_COMPONENT     = 0.5
+let N_LENSES          = 5
+
+// ─── Primitives ──────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn iabs(x: int) -> int {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+fn exp_taylor(x: float) -> float {
+    let mut term = 1.0
+    let mut sum  = 1.0
+    let mut k = 1
+    while k < 32 {
+        term = term * x / to_float(k)
+        sum  = sum + term
+        k = k + 1
+    }
+    return sum
+}
+
+fn zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Inlined G_holo propagator (flat kernel) ─────────────────
+// Kept inline to avoid deep-import silent-exit bug.
+
+struct HoloPropagator {
+    dim_boundary: int,
+    dim_bulk:     int,
+    xi:           float,
+    kernel:       array
+}
+
+fn propagator_new(dim_boundary: int, dim_bulk: int, xi: float) -> HoloPropagator {
+    let mut kernel = []
+    let mut i = 0
+    while i < dim_bulk {
+        let mut row_sum = 0.0
+        let mut raw_row = []
+        let mut j = 0
+        while j < dim_boundary {
+            let d = to_float(iabs(i - j))
+            let v = exp_taylor(0.0 - d / xi)
+            raw_row = raw_row.push(v)
+            row_sum = row_sum + v
+            j = j + 1
+        }
+        let mut k = 0
+        while k < dim_boundary {
+            if row_sum > EPS {
+                kernel = kernel.push(raw_row[k] / row_sum)
+            } else {
+                kernel = kernel.push(0.0)
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return HoloPropagator {
+        dim_boundary: dim_boundary,
+        dim_bulk:     dim_bulk,
+        xi:           xi,
+        kernel:       kernel
+    }
+}
+
+fn propagator_apply(prop: HoloPropagator, deviation: array) -> array {
+    let db = prop.dim_boundary
+    let dW = prop.dim_bulk
+    let n  = len(deviation)
+    if n != db { return zeros(dW) }
+    let mut out = []
+    let mut i = 0
+    while i < dW {
+        let mut s = 0.0
+        let mut j = 0
+        while j < db {
+            s = s + prop.kernel[i * db + j] * deviation[j]
+            j = j + 1
+        }
+        out = out.push(s)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Noether gate (same closure, on Ψ) ──────────────────────
+
+fn psi_in_range(psi: array) -> bool {
+    let n = len(psi)
+    let mut i = 0
+    while i < n {
+        let v = psi[i]
+        if v < 0.0 { return false }
+        if v > 1.0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn n6_gate(psi: array) -> bool {
+    let n = len(psi)
+    if n <= 0 { return false }
+    if n % 2 != 0 { return false }
+    if NOETHER_N6 * NOETHER_TAU != NOETHER_SIGMA_PHI { return false }
+    if !psi_in_range(psi) { return false }
+    return true
+}
+
+// ─── Lens proposals (flat, pass-by-value safe) ──────────────
+// We store the 5 lens outputs as a flat [5 * d] array, row-major, so the
+// hexa pass-by-value helper fns can return updates without aliasing.
+
+fn lens_pack_empty(d: int) -> array {
+    // 5 lens rows × d components, all zero
+    let mut out = []
+    let mut i = 0
+    let n = N_LENSES * d
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+// Rebuild the pack with lens_idx replaced by row.
+fn lens_set_row(pack: array, lens_idx: int, d: int, row: array) -> array {
+    let total = N_LENSES * d
+    let mut out = []
+    let mut k = 0
+    while k < total {
+        let l = k / d
+        let j = k % d
+        if l == lens_idx {
+            out = out.push(row[j])
+        } else {
+            out = out.push(pack[k])
+        }
+        k = k + 1
+    }
+    return out
+}
+
+fn lens_get(pack: array, lens_idx: int, d: int, comp: int) -> float {
+    return pack[lens_idx * d + comp]
+}
+
+// Compute ΔW_mean[j] = (1/5) · Σ_l pack[l*d + j]
+fn lens_mean(pack: array, d: int) -> array {
+    let mut mean = []
+    let mut j = 0
+    while j < d {
+        let mut s = 0.0
+        let mut l = 0
+        while l < N_LENSES {
+            s = s + pack[l * d + j]
+            l = l + 1
+        }
+        mean = mean.push(s / to_float(N_LENSES))
+        j = j + 1
+    }
+    return mean
+}
+
+// meta-tension vector — Yang-Mills curvature magnitude on the lens bundle.
+//
+//   T_meta[j] = sign(mean[j]) · Σ_l (pack[l*d+j] − mean[j])²
+//
+// The sign(mean) factor keeps ΔW_meta a restoring vector (points opposite
+// the mean direction, same convention as first-order tension_link_step).
+// The squared deviation ensures:
+//   - all lenses agree → every term = 0 → T_meta = 0   (property a)
+//   - one lens diverges by δ → term ~ δ² > 0 → T_meta grows   (property b)
+//   - scales as divergence² so amplifies strictly monotonically
+fn meta_tension(pack: array, d: int) -> array {
+    let mean = lens_mean(pack, d)
+    let mut t = []
+    let mut j = 0
+    while j < d {
+        let mut s = 0.0
+        let mut l = 0
+        while l < N_LENSES {
+            let diff = pack[l * d + j] - mean[j]
+            s = s + diff * diff
+            l = l + 1
+        }
+        // Sign follows mean deviation from ½ (restoring toward vacuum);
+        // magnitude = Σ squared divergences (Yang-Mills-like curvature).
+        let sgn = mean[j] - VAC_COMPONENT
+        if sgn >= 0.0 { t = t.push(s) }
+        else          { t = t.push(0.0 - s) }
+        j = j + 1
+    }
+    return t
+}
+
+// Absolute divergence scalar — used by test (b) to witness amplification.
+fn meta_divergence(pack: array, d: int) -> float {
+    let mean = lens_mean(pack, d)
+    let mut s = 0.0
+    let mut j = 0
+    while j < d {
+        let mut l = 0
+        while l < N_LENSES {
+            s = s + fabs(pack[l * d + j] - mean[j])
+            l = l + 1
+        }
+        j = j + 1
+    }
+    return s
+}
+
+// ─── ΔW_meta = T_meta · G_holo · δ(gate) ────────────────────
+
+fn lens_meta_step(psi_t: array, pack: array, d: int) -> array {
+    let gate = n6_gate(psi_t)
+    if !gate { return zeros(d) }
+    let t = meta_tension(pack, d)
+    if len(t) != d { return zeros(d) }
+    let prop = propagator_new(d, d, XI_DEFAULT)
+    let prop_t = propagator_apply(prop, t)
+    let mut dw = []
+    let mut i = 0
+    while i < d {
+        dw = dw.push(0.0 - T_META_CONST * prop_t[i])
+        i = i + 1
+    }
+    return dw
+}
+
+// ─── Helpers ────────────────────────────────────────────────
+
+fn vec_abs_sum(v: array) -> float {
+    let n = len(v)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + fabs(v[i])
+        i = i + 1
+    }
+    return s
+}
+
+fn vec_is_zero(v: array) -> bool {
+    let n = len(v)
+    let mut i = 0
+    while i < n {
+        if fabs(v[i]) > 0.0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn print_vec(label: string, v: array) {
+    let n = len(v)
+    let mut s = label + " ["
+    let mut i = 0
+    while i < n {
+        if i > 0 { s = s + ", " }
+        s = s + str(v[i])
+        i = i + 1
+    }
+    s = s + "]"
+    println(s)
+}
+
+fn constant_row(d: int, v: float) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        out = out.push(v)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Self-tests (T1–T3) ─────────────────────────────────────
+
+// T1 : all 5 lenses agree → meta-tension vanishes → ΔW_meta = 0
+fn check_T1() -> bool {
+    let d = 4
+    let row = constant_row(d, 0.2)
+    let mut pack = lens_pack_empty(d)
+    let mut l = 0
+    while l < N_LENSES {
+        pack = lens_set_row(pack, l, d, row)
+        l = l + 1
+    }
+    let t = meta_tension(pack, d)
+    let dw = lens_meta_step(constant_row(d, 0.5), pack, d)
+    let t_abs = vec_abs_sum(t)
+    let dw_abs = vec_abs_sum(dw)
+    let ok = t_abs < 0.00001 && dw_abs < 0.00001
+    if ok { println("  [T1] converged-agreement PASS (|T_meta|=" + str(t_abs) + " |ΔW|=" + str(dw_abs) + ")") }
+    else  { println("  [T1] converged-agreement FAIL (|T_meta|=" + str(t_abs) + " |ΔW|=" + str(dw_abs) + ")") }
+    return ok
+}
+
+// T2 : one lens divergent → meta-tension amplifies proportionally
+//   pack: 4 lenses agree at 0.2; lens 2 (quantum) diverges to 0.8
+//   divergence should increase monotonically with divergence amplitude.
+fn check_T2() -> bool {
+    let d = 4
+    let row_base = constant_row(d, 0.2)
+    let row_div1 = constant_row(d, 0.4)   // small divergence
+    let row_div2 = constant_row(d, 0.8)   // large divergence
+
+    let mut pack1 = lens_pack_empty(d)
+    let mut l = 0
+    while l < N_LENSES {
+        if l == 2 { pack1 = lens_set_row(pack1, l, d, row_div1) }
+        else      { pack1 = lens_set_row(pack1, l, d, row_base) }
+        l = l + 1
+    }
+    let mut pack2 = lens_pack_empty(d)
+    let mut l2 = 0
+    while l2 < N_LENSES {
+        if l2 == 2 { pack2 = lens_set_row(pack2, l2, d, row_div2) }
+        else       { pack2 = lens_set_row(pack2, l2, d, row_base) }
+        l2 = l2 + 1
+    }
+    let div1 = meta_divergence(pack1, d)
+    let div2 = meta_divergence(pack2, d)
+    let psi = constant_row(d, 0.5)
+    let dw1 = lens_meta_step(psi, pack1, d)
+    let dw2 = lens_meta_step(psi, pack2, d)
+    let ok = div1 > 0.0 && div2 > div1 && vec_abs_sum(dw2) > vec_abs_sum(dw1)
+    if ok {
+        println("  [T2] divergent-amplify PASS (div=" + str(div1) + "→" + str(div2)
+              + ", |ΔW|=" + str(vec_abs_sum(dw1)) + "→" + str(vec_abs_sum(dw2)) + ")")
+    } else {
+        println("  [T2] divergent-amplify FAIL")
+    }
+    return ok
+}
+
+// T3 : n=6 gate preserved at meta layer
+//   Ψ out-of-range → ΔW_meta = 0 regardless of lens spread.
+fn check_T3() -> bool {
+    let d = 4
+    let row_a = constant_row(d, 0.1)
+    let row_b = constant_row(d, 0.9)
+    let mut pack = lens_pack_empty(d)
+    let mut l = 0
+    while l < N_LENSES {
+        if l % 2 == 0 { pack = lens_set_row(pack, l, d, row_a) }
+        else          { pack = lens_set_row(pack, l, d, row_b) }
+        l = l + 1
+    }
+    // Out-of-range Ψ (1.5 is outside [0,1])
+    let mut psi_bad = []
+    psi_bad = psi_bad.push(0.5)
+    psi_bad = psi_bad.push(1.5)
+    psi_bad = psi_bad.push(0.5)
+    psi_bad = psi_bad.push(0.5)
+    let dw = lens_meta_step(psi_bad, pack, d)
+    let ok = vec_is_zero(dw) && len(dw) == d
+    if ok { println("  [T3] n6-gate-preserved PASS (ΔW_meta=0 off-manifold)") }
+    else  { println("  [T3] n6-gate-preserved FAIL (|ΔW|=" + str(vec_abs_sum(dw)) + ")") }
+    return ok
+}
+
+// ─── main ────────────────────────────────────────────────────
+
+fn main() {
+    println("[lens_meta] Lens 6 / Meta : ΔW_meta = T_meta · G_holo · δ(gate), 5-lens bundle")
+    println("  T_meta_const=" + str(T_META_CONST) + "  N_lenses=" + str(N_LENSES))
+
+    let t1 = check_T1()
+    let t2 = check_T2()
+    let t3 = check_T3()
+
+    // demo: 3 lenses at 0.05, 1 at 0.10, 1 at 0.20 — T_meta points at the outliers
+    let d = 6
+    let mut pack = lens_pack_empty(d)
+    pack = lens_set_row(pack, 0, d, constant_row(d, 0.05))
+    pack = lens_set_row(pack, 1, d, constant_row(d, 0.05))
+    pack = lens_set_row(pack, 2, d, constant_row(d, 0.05))
+    pack = lens_set_row(pack, 3, d, constant_row(d, 0.10))
+    pack = lens_set_row(pack, 4, d, constant_row(d, 0.20))
+    let t = meta_tension(pack, d)
+    let psi = constant_row(d, 0.6)
+    let dw = lens_meta_step(psi, pack, d)
+    print_vec("  demo T_meta", t)
+    print_vec("  demo ΔW_meta", dw)
+
+    let all_pass = t1 && t2 && t3
+    if all_pass {
+        println("[lens_meta] ALL 3/3 PASS")
+    } else {
+        println("[lens_meta] SOME FAILED")
+    }
+}
+
+main()
