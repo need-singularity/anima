@@ -12,14 +12,14 @@
 //                training/phi_holographic_measure.hexa
 //    param_count — total learnable tensors × elements
 //
-//  Gate (roadmap done_criteria):
-//      CLM 2.8B: CE<3.0 + phi_holo>100
-//  Current reality (project_session_20260412_evening): 2.8B training
-//  not yet complete, so we gate on what we *have*:
-//      d=128 CE<3.0 AND (phi_holo >=1.0 OR phi_holo_ratio >= 1.2)
-//  This follows the P3-gate convention that phi_holo is gated by
-//  *ratio* vs a weak-scramble baseline (ratio >= 1.2), not an
-//  absolute number, because MI bins saturate around log(MI_BINS)=3.
+//  Gate (§19 canonical, FIX-A 2026-04-20):
+//      primary   phi_holo_ratio = phi_holo / phi_base >= 1.2
+//      secondary mi_per_element >= 0.05 nats
+//      + CE < 3.0
+//  The previous absolute `phi_holo > 100` variant was deprecated
+//  (PHANTOM N-scaling artifact — random-init trivially passed).
+//  The ratio gate is N-independent and convention-compatible with
+//  bench_v3_gate.hexa and anima-measurement/phi_holo_eval.hexa.
 //
 //  Run:
 //    hexa run serving/clm_eval.hexa
@@ -85,11 +85,23 @@ fn gate(row: array) -> bool {
 }
 
 fn gate_2_8b(row: array) -> bool {
-    // The full roadmap gate, kept here so it activates the moment
-    // a 2.8B checkpoint shows up in the series.
-    let ce = row[3]
-    let ph = row[4]
-    return ce < 3.0 && ph > 100.0
+    // The full roadmap gate (2.8B checkpoint when it appears).
+    //
+    // FIX-A 2026-04-20 (§19): previously `ce < 3.0 && ph > 100.0`. The
+    // absolute `ph > 100` was a PHANTOM N-scaling artifact — phi_holo =
+    // mi_raw × N; raw MI ceiling log(MI_BINS)=2.08 nats, so any
+    // reasonably sized N at random init exceeds 100. Replaced with the
+    // structured gate (N-independent, mirrors `gate()` above):
+    //   primary   phi_holo_ratio = ph / pb >= 1.2
+    //   secondary mi_per_element (approx ph / (1 * d_model)) >= 0.05 nats
+    // (seq=1 for this evaluator; for multi-token pass the MI-per-token.)
+    let d      = row[1]
+    let ce     = row[3]
+    let ph     = row[4]
+    let pb     = row[5]
+    let ratio  = if pb > 0.0001 { ph / pb } else { 0.0 }
+    let mi_pe  = if d > 0 { ph / (d * 1.0) } else { 0.0 }
+    return ce < 3.0 && ratio >= 1.2 && mi_pe >= 0.05
 }
 
 fn main() {
@@ -134,7 +146,7 @@ fn main() {
         j = j + 1
     }
     if full {
-        println("[clm_eval] FULL 2.8B GATE PASS (CE<3.0 + phi_holo>100)")
+        println("[clm_eval] FULL 2.8B GATE PASS (CE<3.0 + ratio>=1.2 + mi_per_element>=0.05)")
     } else {
         println("[clm_eval] FULL 2.8B GATE pending (no 2.8B ckpt in series)")
     }

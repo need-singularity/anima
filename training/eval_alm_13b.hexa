@@ -57,7 +57,15 @@ let MODEL_TAG = "alm13b"
 let HIRE_SIM_PASS_HIGH   = 0.90   // >= 0.90 authorizes 70B
 let HIRE_SIM_PASS_LOW    = 0.85   // [0.85, 0.90) = borderline (operator call)
 let TOOL_GATE_PASS       = 0.85
-let PHI_HOLO_PASS        = 1000.0
+// Structured phi_holo gate (FIX-A 2026-04-20):
+//   primary   phi_holo_ratio (post-LoRA / pre-LoRA baseline) >= 1.2
+//   secondary mi_per_element >= 0.05 nats
+// Previous absolute PHI_HOLO_PASS=1000.0 was a PHANTOM N-scaling gate —
+// raw MI ceiling log(MI_BINS)=2.08 × N=seq*d_model trivially exceeds 1000
+// for random init. Absolute retained for fixture parity + legacy JSON.
+let PHI_HOLO_RATIO_PASS  = 1.2        // primary, N-independent
+let MI_PER_ELEMENT_PASS  = 0.05       // secondary, nats per element
+let PHI_HOLO_PASS        = 1000.0     // DEPRECATED — fixture parity only
 let KOREAN_RATIO_PASS    = 0.2
 
 // ════════════════════════════════════════════════════════════════════
@@ -482,7 +490,36 @@ fn run_eval(ckpt: string, base: string, endpoint: string, out_path: string, max_
     let tokens_per_sec = to_float(total_tok) / tps_denom
 
     let kr_label = if avg_kr > KOREAN_RATIO_PASS { "PASS" } else { "FAIL" }
-    let phi_label = if avg_phi >= PHI_HOLO_PASS { "PASS" } else { "FAIL" }
+
+    // ── Structured phi_holo gate (FIX-A 2026-04-20) ──
+    // Primary : phi_holo_ratio = avg_phi / baseline >= PHI_HOLO_RATIO_PASS
+    // Secondary: mi_per_element = avg_phi / (seq * d_model) >= MI_PER_ELEMENT_PASS
+    // Baseline is read from env PHI_HOLO_BASELINE (set from a pre-LoRA base-model
+    // eval pass over the same prompts). If unset, ratio arm reports SKIP.
+    // Shape comes from env EVAL_SEQ / EVAL_D_MODEL (or sane defaults for 14B).
+    let baseline_str = env_var("PHI_HOLO_BASELINE")
+    let seq_str      = env_var("EVAL_SEQ")
+    let d_model_str  = env_var("EVAL_D_MODEL")
+    let baseline     = if baseline_str == "" { 0.0 } else { to_float(baseline_str) }
+    let seq_len      = if seq_str == ""      { 128 } else { to_int(seq_str) }
+    let d_model      = if d_model_str == ""  { 5120 } else { to_int(d_model_str) }
+
+    let phi_ratio    = if baseline > 0.0000001 { avg_phi / baseline } else { 0.0 }
+    let mi_per_elem  = if seq_len * d_model > 0 {
+        avg_phi / to_float(seq_len * d_model)
+    } else { 0.0 }
+
+    let ratio_label  = if baseline <= 0.0000001 { "SKIP_NO_BASELINE" }
+                       else if phi_ratio >= PHI_HOLO_RATIO_PASS { "PASS" }
+                       else { "FAIL" }
+    let mi_elem_label = if mi_per_elem >= MI_PER_ELEMENT_PASS { "PASS" } else { "FAIL" }
+
+    // Structured verdict: both PASS (or ratio SKIP_NO_BASELINE + mi PASS) = PASS.
+    let phi_structured_pass = (ratio_label == "PASS" || ratio_label == "SKIP_NO_BASELINE") &&
+                              (mi_elem_label == "PASS")
+    // Legacy absolute — informational only, no longer gates.
+    let phi_legacy_label = if avg_phi >= PHI_HOLO_PASS { "PASS" } else { "FAIL" }
+    let phi_label = if phi_structured_pass { "PASS" } else { "FAIL" }
 
     // ── Overall verdict ──
     let all_samples = ko.samples_body + (if len(ko.samples_body) > 0 && len(en.samples_body) > 0 { ",\n" } else { "" }) + en.samples_body
@@ -520,9 +557,20 @@ fn run_eval(ckpt: string, base: string, endpoint: string, out_path: string, max_
              + "      \"label\":     \"" + tool_label + "\"\n"
              + "    },\n"
              + "    \"phi_holo\": {\n"
-             + "      \"avg\":       " + to_string(avg_phi) + ",\n"
-             + "      \"threshold\": " + to_string(PHI_HOLO_PASS) + ",\n"
-             + "      \"label\":     \"" + phi_label + "\"\n"
+             + "      \"avg\":                 " + to_string(avg_phi) + ",\n"
+             + "      \"kind\":                \"structured\",\n"
+             + "      \"phi_holo_ratio\":      " + to_string(phi_ratio) + ",\n"
+             + "      \"phi_holo_ratio_min\":  " + to_string(PHI_HOLO_RATIO_PASS) + ",\n"
+             + "      \"baseline\":            " + to_string(baseline) + ",\n"
+             + "      \"mi_per_element\":      " + to_string(mi_per_elem) + ",\n"
+             + "      \"mi_per_element_min\":  " + to_string(MI_PER_ELEMENT_PASS) + ",\n"
+             + "      \"seq_len\":             " + to_string(seq_len) + ",\n"
+             + "      \"d_model\":             " + to_string(d_model) + ",\n"
+             + "      \"ratio_label\":         \"" + ratio_label + "\",\n"
+             + "      \"mi_per_element_label\": \"" + mi_elem_label + "\",\n"
+             + "      \"legacy_threshold\":    " + to_string(PHI_HOLO_PASS) + ",\n"
+             + "      \"legacy_label\":        \"" + phi_legacy_label + "\",\n"
+             + "      \"label\":               \"" + phi_label + "\"\n"
              + "    },\n"
              + "    \"korean_ratio\": {\n"
              + "      \"avg\":       " + to_string(avg_kr) + ",\n"

@@ -1,5 +1,21 @@
-// training/phi_gt_1000_verify.hexa — DEST1 Φ>1000 gate verifier
+// training/phi_gt_1000_verify.hexa — DEST1 Φ gate verifier (FIX-A 2026-04-20)
 // =============================================================================
+//
+// FIX-A 2026-04-20 (phantom-gate replacement, dest1_alm_ship lineage):
+//   The legacy `phi_holo_scaled = -log(CE) * 10000 > 1000` verdict was a
+//   pure CE transform — NOT an MI measurement. -log(CE)*10000 crosses
+//   1000 whenever CE < e^-0.1 ≈ 0.905 (any moderately-fit LM passes);
+//   random-init CE ≈ log(V) ≈ 11.9 fails. Same phantom family as the
+//   MI×N ALM/CLM gates in anima-measurement/phi_holo_eval.hexa.
+//
+// NEW STRUCTURED GATE (CE-domain, consistent with ratio+mi convention):
+//   primary   phi_holo_ratio = phi_holo_scaled_now / phi_holo_scaled_step0
+//                              >= PHI_RATIO_MIN (default 1.2)
+//   secondary ce < CE_FLOOR (default 0.905 = -log(CE) > 0.1, the original
+//             "moderately-fit" semantic preserved)
+// The pre-train baseline is read from env PHI_HOLO_BASELINE (set by the
+// DEST1 trainer's step_0 sidecar); if unset, the verifier falls back to
+// the legacy absolute gate=1000 and emits WARN=legacy_absolute.
 //
 // PURPOSE
 //   Unblock "도착지1 (Φ>1000 실측)" — the post-r10c checkpoint gate. Reads a
@@ -138,8 +154,43 @@ fn extract_int(blob: string, key: string) -> int {
 // Verifier
 // =====================================================================
 
-let GATE = 1000.0
-let MISS_SENTINEL = 0.0 - 999999.0
+// Structured gate (FIX-A 2026-04-20):
+let PHI_RATIO_MIN   = 1.2           // primary, N-independent
+let CE_FLOOR        = 0.905         // secondary, preserves legacy -log(CE)>0.1 semantic
+let GATE_LEGACY_ABS = 1000.0        // fallback when baseline unavailable
+let GATE            = 1000.0        // kept for stdout-line backwards compat
+let MISS_SENTINEL   = 0.0 - 999999.0
+
+// Read pre-train baseline phi_holo_scaled from env (set by trainer step_0).
+// Empty string => 0.0 => falls back to legacy absolute gate.
+fn phi_baseline_env() -> float {
+    let s = env_var("PHI_HOLO_BASELINE")
+    if s == "" { return 0.0 }
+    return to_float(s)
+}
+
+fn gate_verdict(phi_now: float, ce: float) -> string {
+    let base = phi_baseline_env()
+    if base > 0.0000001 {
+        let ratio = phi_now / base
+        let ratio_ok = ratio >= PHI_RATIO_MIN
+        let ce_ok    = ce < CE_FLOOR && ce > 0.0
+        let pass = ratio_ok && ce_ok
+        if pass { return "PASS" }
+        return "FAIL"
+    }
+    // Legacy fallback — absolute threshold only.
+    if phi_now > GATE_LEGACY_ABS { return "PASS" }
+    return "FAIL"
+}
+
+fn gate_suffix() -> string {
+    let base = phi_baseline_env()
+    if base > 0.0000001 {
+        return " gate=ratio>=1.2+ce<0.905 baseline=" + to_string(base)
+    }
+    return " gate=1000 WARN=legacy_absolute_no_baseline"
+}
 
 fn verify(phi_path: string) -> int {
     let blob = safe_read(phi_path)
@@ -168,40 +219,51 @@ fn verify(phi_path: string) -> int {
         let clamped = if loss < 0.000001 { 0.000001 } else { loss }
         let phi_holo_proxy = 0.0 - log(clamped)
         let phi_holo_scaled = phi_holo_proxy * 10000.0
-        let verdict = if phi_holo_scaled > GATE { "PASS" } else { "FAIL" }
+        let verdict = gate_verdict(phi_holo_scaled, clamped)
         println("[phi_gate] step=" + to_string(step) +
                 " phi_holo_scaled=" + to_string(phi_holo_scaled) +
+                " ce=" + to_string(clamped) +
                 " verdict=" + verdict +
-                " gate=1000 WARN=fallback_from_ce")
+                gate_suffix() + " WARN=fallback_from_ce")
         if verdict == "PASS" { return 0 }
         return 1
     }
 
     let step = extract_int(blob, "\"step\"")
     let phi_scaled = extract_float(blob, "\"phi_holo_scaled\"")
+    let ce_proxy = extract_float(blob, "\"ce_proxy\"")
 
     if phi_scaled <= MISS_SENTINEL + 1.0 {
         // Key absent or NaN — try to recompute from ce_proxy.
-        let ce = extract_float(blob, "\"ce_proxy\"")
-        if ce <= MISS_SENTINEL + 1.0 || ce <= 0.0 {
+        if ce_proxy <= MISS_SENTINEL + 1.0 || ce_proxy <= 0.0 {
             print_err("[phi_gate] ERROR: phi_vec.json missing phi_holo_scaled AND ce_proxy: " + phi_path)
             return 2
         }
-        let clamped = if ce < 0.000001 { 0.000001 } else { ce }
+        let clamped = if ce_proxy < 0.000001 { 0.000001 } else { ce_proxy }
         let recomputed = (0.0 - log(clamped)) * 10000.0
-        let verdict = if recomputed > GATE { "PASS" } else { "FAIL" }
+        let verdict = gate_verdict(recomputed, clamped)
         println("[phi_gate] step=" + to_string(step) +
                 " phi_holo_scaled=" + to_string(recomputed) +
+                " ce=" + to_string(clamped) +
                 " verdict=" + verdict +
-                " gate=1000 WARN=recomputed_from_ce_proxy")
+                gate_suffix() + " WARN=recomputed_from_ce_proxy")
         if verdict == "PASS" { return 0 }
         return 1
     }
 
-    let verdict = if phi_scaled > GATE { "PASS" } else { "FAIL" }
+    // phi_holo_scaled directly provided. ce_proxy is optional but preferred
+    // for the secondary CE-floor check. When absent, derive it from phi
+    // (phi = -log(ce) * 10000 => ce = exp(-phi/10000)).
+    let ce_for_gate = if ce_proxy > MISS_SENTINEL + 1.0 && ce_proxy > 0.0 {
+        ce_proxy
+    } else {
+        exp(0.0 - phi_scaled / 10000.0)
+    }
+    let verdict = gate_verdict(phi_scaled, ce_for_gate)
     println("[phi_gate] step=" + to_string(step) +
             " phi_holo_scaled=" + to_string(phi_scaled) +
-            " verdict=" + verdict + " gate=1000")
+            " ce=" + to_string(ce_for_gate) +
+            " verdict=" + verdict + gate_suffix())
     if verdict == "PASS" { return 0 }
     return 1
 }

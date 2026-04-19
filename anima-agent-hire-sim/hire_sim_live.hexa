@@ -5,11 +5,14 @@
 // ROLE:
 //   Evaluate 100 task × 5 persona = 500 real inferences against the
 //   weight-emergent persona endpoint (S1 /persona). Each response is
-//   phi-gated: phi_holo_ratio >= 1.2 (vs session baseline, N-independent)
-//   AND laws_pass=true. Absolute phi_holo_scaled > 500 gate deprecated
-//   2026-04-20 (raw MI × N masks random-init pass). Keyword rubric
-//   reused from hire_sim_100.hexa (TSRV-P4-2). Verdict PASS = completion>=0.85
-//   AND every response phi_attached AND every response laws_pass.
+//   phi-gated (structured, FIX-A 2026-04-20):
+//     primary   phi_holo_ratio = resp.phi_holo_scaled / session_baseline >= 1.2
+//     secondary mi_per_element = resp.phi_holo_scaled / (seq * d_model) >= 0.05 nats
+//   AND laws_pass=true. The legacy `phi_holo_scaled > 500` absolute is
+//   deprecated (raw MI × N masks random-init pass) and only used as a
+//   fallback when PHI_HOLO_SESSION_BASELINE is not provided. Keyword
+//   rubric reused from hire_sim_100.hexa (TSRV-P4-2). Verdict PASS =
+//   completion>=0.85 AND every response phi_attached AND every response laws_pass.
 //
 // AN11 COMPLIANCE:
 //   (a) weight-emergent: S1 endpoint MUST NOT wrap system prompts.
@@ -51,8 +54,15 @@
 use "hire_sim_100"
 
 // ── Constants ────────────────────────────────────────────────────────
+// Structured phi gate (FIX-A 2026-04-20, matches docstring §8-10):
+//   primary   phi_holo_ratio = resp.phi_holo_scaled / session_baseline >= 1.2
+//   secondary mi_per_element = resp.phi_holo_scaled / (seq * d_model) >= 0.05 nats
+// Absolute 500.0 threshold is DEPRECATED (raw MI × N phantom) — retained
+// as a fixture-parity floor when baseline is not yet established.
 
-const PHI_GATE_THRESHOLD: float = 500.0
+const PHI_GATE_RATIO_THRESHOLD: float = 1.2
+const MI_PER_ELEMENT_THRESHOLD: float = 0.05
+const PHI_GATE_THRESHOLD: float = 500.0  // DEPRECATED absolute — fallback only
 const COMPLETION_GATE: float = 0.85
 const R2_BUCKET: string = "r2:anima-models/dest2_e1_hire_sim"
 const S1_MARKER_PATH: string = "shared/convergence/s1_http_persona_endpoint.convergence"
@@ -189,7 +199,8 @@ fn s1_healthz_stub(s1_url: string) -> bool {
 
 // ── Rubric — keyword AND phi_gate AND laws ───────────────────────────
 
-fn evaluate_live(task: Task, persona: string, resp: S1Response) -> LiveTaskResult {
+fn evaluate_live(task: Task, persona: string, resp: S1Response,
+                 session_baseline: float, seq_len: int, d_model: int) -> LiveTaskResult {
     let blob = resp.text.to_lower()
     let mut hits = 0
     let mut ki = 0
@@ -204,17 +215,45 @@ fn evaluate_live(task: Task, persona: string, resp: S1Response) -> LiveTaskResul
     let all_hit = hits == total
     let budget_ok = resp.intervention_count <= task.max_interventions &&
                     resp.latency_s <= to_float(task.max_time_sec)
-    let phi_gate_pass = resp.phi_attached &&
-                        resp.phi_holo_scaled > PHI_GATE_THRESHOLD &&
-                        resp.laws_pass
+
+    // Structured phi gate (FIX-A 2026-04-20): ratio + mi_per_element.
+    // Falls back to legacy absolute when session_baseline is unavailable.
+    let phi_ratio = if session_baseline > 0.0000001 {
+        resp.phi_holo_scaled / session_baseline
+    } else { 0.0 }
+    let denom = seq_len * d_model
+    let mi_per_elem = if denom > 0 {
+        resp.phi_holo_scaled / to_float(denom)
+    } else { 0.0 }
+
+    let ratio_ok   = phi_ratio >= PHI_GATE_RATIO_THRESHOLD
+    let mi_elem_ok = mi_per_elem >= MI_PER_ELEMENT_THRESHOLD
+    let legacy_ok  = resp.phi_holo_scaled > PHI_GATE_THRESHOLD
+
+    // When baseline is established: require ratio AND mi_per_element (N-independent).
+    // When baseline unavailable (session_baseline<=0): fall back to legacy absolute.
+    let phi_structured_pass = if session_baseline > 0.0000001 {
+        ratio_ok && mi_elem_ok
+    } else {
+        legacy_ok
+    }
+    let phi_gate_pass = resp.phi_attached && phi_structured_pass && resp.laws_pass
     let completed = all_hit && budget_ok && phi_gate_pass
 
     let mut reason = ""
     if !phi_gate_pass {
         if !resp.phi_attached {
             reason = "phi_not_attached"
-        } else if resp.phi_holo_scaled <= PHI_GATE_THRESHOLD {
-            reason = "phi_low(" + to_string(resp.phi_holo_scaled) + ")"
+        } else if !phi_structured_pass {
+            if session_baseline > 0.0000001 {
+                if !ratio_ok {
+                    reason = "phi_ratio_low(" + to_string(phi_ratio) + "<1.2)"
+                } else {
+                    reason = "mi_per_elem_low(" + to_string(mi_per_elem) + "<0.05)"
+                }
+            } else {
+                reason = "phi_low(" + to_string(resp.phi_holo_scaled) + ")"
+            }
         } else if !resp.laws_pass {
             reason = "laws_fail"
         }
@@ -244,7 +283,8 @@ fn evaluate_live(task: Task, persona: string, resp: S1Response) -> LiveTaskResul
 
 // ── Runner ───────────────────────────────────────────────────────────
 
-fn run_live(s1_url: string, tasks: array, personas: array) -> HireSimLiveResult {
+fn run_live(s1_url: string, tasks: array, personas: array,
+            session_baseline: float, seq_len: int, d_model: int) -> HireSimLiveResult {
     let mut results = []
     let t0 = now_monotonic_s()
     let mut pi = 0
@@ -254,7 +294,7 @@ fn run_live(s1_url: string, tasks: array, personas: array) -> HireSimLiveResult 
         while ti < len(tasks) {
             let task = tasks[ti]
             let resp = call_s1(s1_url, p, task.prompt, 120)
-            let r = evaluate_live(task, p, resp)
+            let r = evaluate_live(task, p, resp, session_baseline, seq_len, d_model)
             results = results.push(r)
             ti = ti + 1
         }
@@ -373,7 +413,9 @@ fn serialize_result(r: HireSimLiveResult, personas: array) -> string {
     s = s + "\"completion_rate\":" + to_string(r.completion_rate) + ","
     s = s + "\"all_phi_attached\":" + to_string(r.all_phi_attached) + ","
     s = s + "\"all_laws_pass\":" + to_string(r.all_laws_pass) + ","
-    s = s + "\"phi_gate_threshold\":" + to_string(r.phi_gate_threshold) + ","
+    s = s + "\"phi_gate_threshold_legacy\":" + to_string(r.phi_gate_threshold) + ","
+    s = s + "\"phi_gate_ratio_threshold\":" + to_string(PHI_GATE_RATIO_THRESHOLD) + ","
+    s = s + "\"mi_per_element_threshold\":" + to_string(MI_PER_ELEMENT_THRESHOLD) + ","
     s = s + "\"completion_gate\":" + to_string(r.completion_gate) + ","
     s = s + "\"verdict\":\"" + r.verdict + "\","
     s = s + "\"wall_time_s\":" + to_string(r.wall_time_s) + ","
@@ -469,7 +511,18 @@ fn main(args: array) -> int {
     let tasks = if smoke { slice_first(all_tasks, 20) } else { all_tasks }
     let personas = personas_v1()
 
-    let result = run_live(s1_url, tasks, personas)
+    // Structured phi-gate inputs (FIX-A 2026-04-20):
+    //   PHI_HOLO_SESSION_BASELINE = mean phi_holo_scaled of base-model
+    //     sweep over same prompts (unset → legacy absolute fallback).
+    //   HIRE_SEQ / HIRE_D_MODEL    = shape for mi_per_element denom.
+    let baseline_str = env_var("PHI_HOLO_SESSION_BASELINE")
+    let seq_str      = env_var("HIRE_SEQ")
+    let d_model_str  = env_var("HIRE_D_MODEL")
+    let session_baseline = if baseline_str == "" { 0.0 } else { to_float(baseline_str) }
+    let seq_len          = if seq_str == ""      { 128 } else { to_int(seq_str) }
+    let d_model          = if d_model_str == ""  { 5120 } else { to_int(d_model_str) }
+
+    let result = run_live(s1_url, tasks, personas, session_baseline, seq_len, d_model)
 
     let mode = if full { "full" } else { "smoke" }
     let ts = utc_compact_now()

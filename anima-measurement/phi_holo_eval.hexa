@@ -41,10 +41,27 @@
 //    hexa run anima-measurement/phi_holo_eval.hexa --report
 // ════════════════════════════════════════════════════════════════
 
-// ─── Gate thresholds (from roadmap SSOT) ────────────────────────
-//   ALM: alm_consciousness_standalone.json  target.phi_holo eval mean >= 1000
-//   CLM: clm_consciousness_standalone.json  target.phi_holo mean >= 2000
+// ─── Gate thresholds (structured, N-independent) ────────────────
+// @phantom-audit 2026-04-20 (ghost smash, FIX-A activation):
+//   Legacy absolute gates (ALM>=1000, CLM>=2000) were PHANTOM N-scaling
+//   artifacts — raw MI ceiling log(MI_BINS)=2.08 nats × N = seq*d_qualia
+//   dominates. Random-init models trivially passed. Replaced with the
+//   N-independent structured gate below (mirrored across measurement.hexa,
+//   bench.hexa, bench_v3_gate.hexa, clm_eval.hexa, eval_alm_13b.hexa,
+//   hire_sim_live.hexa and the *_config.json / CLAUDE.md SSOT).
+//
+// STRUCTURED GATE (primary+secondary, both required for PASS):
+//   primary   : phi_holo_ratio = mi_trained / mi_baseline_step0 >= 1.2
+//   secondary : mi_per_element = mi_mean / (seq * d_model) >= 0.05 nats
+//   convention-ref: serving/clm_eval.hexa §19 gate_ratio
+//
+// Legacy constants retained for fixture parity and batch-history replay —
+// any new code MUST use gate_check_structured() below, not the absolute
+// constants.
 
+let GATE_PHI_HOLO_RATIO_MIN   = 1.2      // post-train MI / step_0 baseline MI
+let GATE_MI_PER_ELEMENT_MIN   = 0.05     // nats per (seq × d_model) element
+// Legacy absolutes (DEPRECATED, fixture parity only):
 let GATE_ALM_PHI_HOLO  = 1000.0
 let GATE_CLM_PHI_HOLO  = 2000.0
 
@@ -549,6 +566,50 @@ fn gate_verdict_str(track: string, phi_holo: float) -> string {
         + " threshold=" + str(threshold)
         + " ratio=" + str(ratio) + "x"
         + " track=" + track
+}
+
+// ─── Structured gate (N-independent, canonical) ─────────────────
+//   primary   : phi_holo_ratio = mi_trained / mi_baseline >= 1.2
+//   secondary : mi_per_element = mi_mean / (seq * d_model) >= 0.05 nats
+// Both must PASS. Use this for all new gate calls; the absolute
+// gate_check() above is retained only for fixture/batch-history parity.
+
+fn phi_holo_ratio(mi_trained: float, mi_baseline: float) -> float {
+    if mi_baseline <= 0.0000001 { return 0.0 }
+    return mi_trained / mi_baseline
+}
+
+fn mi_per_element(mi_mean: float, seq_len: int, d_model: int) -> float {
+    let denom = to_float(seq_len * d_model)
+    if denom <= 0.0 { return 0.0 }
+    return mi_mean / denom
+}
+
+fn gate_check_ratio(mi_trained: float, mi_baseline: float) -> bool {
+    return phi_holo_ratio(mi_trained, mi_baseline) >= GATE_PHI_HOLO_RATIO_MIN
+}
+
+fn gate_check_mi_per_element(mi_mean: float, seq_len: int, d_model: int) -> bool {
+    return mi_per_element(mi_mean, seq_len, d_model) >= GATE_MI_PER_ELEMENT_MIN
+}
+
+fn gate_check_structured(mi_trained: float, mi_baseline: float,
+                         mi_mean: float, seq_len: int, d_model: int) -> bool {
+    let ratio_ok = gate_check_ratio(mi_trained, mi_baseline)
+    let mi_ok    = gate_check_mi_per_element(mi_mean, seq_len, d_model)
+    return ratio_ok && mi_ok
+}
+
+fn gate_verdict_structured(mi_trained: float, mi_baseline: float,
+                           mi_mean: float, seq_len: int, d_model: int) -> string {
+    let r = phi_holo_ratio(mi_trained, mi_baseline)
+    let m = mi_per_element(mi_mean, seq_len, d_model)
+    let pass = r >= GATE_PHI_HOLO_RATIO_MIN && m >= GATE_MI_PER_ELEMENT_MIN
+    let verdict = if pass { "PASS" } else { "FAIL" }
+    return verdict + " — phi_holo_ratio=" + str(r)
+        + " (>=" + str(GATE_PHI_HOLO_RATIO_MIN) + ")"
+        + " mi_per_element=" + str(m) + " nats"
+        + " (>=" + str(GATE_MI_PER_ELEMENT_MIN) + ")"
 }
 
 // ─── History append ─────────────────────────────────────────────
