@@ -327,6 +327,38 @@ let mut G_CORPUS_INIT  = 0
 let mut G_CORPUS_PATH  = ""
 let mut G_CORPUS_LEN   = 0
 
+// r5-a10 leak fix (2026-04-20): cached CorpusDesc fields. Prior code called
+// `_current_corpus_desc()` from train_step EVERY batch, which in turn called
+// `corpus_open()` → `exec("wc -c < ...")` + `println(...)` per step. The
+// per-step subprocess fork + println string concat were primary fd/string
+// allocators in the hot loop (~3GB/min RSS growth at batch=1 seq=256). Fix:
+// `_current_corpus_desc()` now reads from G_CORPUS_PATH/G_CORPUS_LEN already
+// populated by `load_corpus()` once at training entry — zero per-step IO.
+// Guard: if G_CORPUS_INIT==0 (selftest path or load_corpus not called) we
+// still fall through to the legacy `corpus_open()` so behavior is unchanged
+// for the verification block. See _current_corpus_desc() at line ~812.
+
+// r5-a10 leak fix (2026-04-20): cached C41 GWT + Holographic head matrices.
+// Prior code called `_c41_gwt_head_new(C41_N_DOMAINS, d_model, 137 + step)`
+// + `_c41_holo_head_new(d_model, d_model * 2, 241 + step)` EVERY train_step.
+// At d_model=768 that allocates (12*768) + (768*1536) = 9k + 1.18M floats
+// per step from `_c41_det_rand` (which itself does N list.push) — primary
+// per-step large-list allocator behind the OOM. Fix: heads are random-init
+// projection matrices that don't need to vary per step (the original
+// per-step seed was speculative — comment at line 3104 explicitly notes
+// "A future revision can cache them in TrainState"). We allocate ONCE at
+// first train_step call (deterministic seeds 137 / 241) and reuse via the
+// G_C41_*_INIT flag. Selftest path uses different d_model so it gets its
+// own one-shot init via the same guard. List storage is via [float] flat
+// arrays (no struct cache to avoid hexa_v2 forward-reference at module-
+// scope, since _c41_gwt_head_new is defined at line ~3371, after this
+// module-scope block).
+let mut G_C41_INIT       = 0
+let mut G_C41_INIT_D     = 0
+let mut G_C41_GWT_PROJ   = []
+let mut G_C41_GWT_GATE   = []
+let mut G_C41_HOLO_SCRAM = []
+
 // ═════════════════════════════════════════════════════════════════════════
 // SESSION 2026-04-19 WIRING — opt-in aux losses / diagnostics / curriculum
 // ═════════════════════════════════════════════════════════════════════════
@@ -809,7 +841,21 @@ fn load_corpus(path: string, block_size: int) -> TokenDataset {
 // Helper: rebuild a CorpusDesc from the module-scope scalar cache.
 // Used by _make_batch and train_step's H1 inline window reader to
 // avoid storing a CorpusDesc at module scope (transpiler limitation).
+//
+// r5-a10 leak fix (2026-04-20): root cause — prior body called `corpus_open(
+// G_CORPUS_PATH)` per call, which fires `exec("wc -c < ...")` + `println(
+// "[clm_mmap_loader] opened ...")` EVERY train_step (2 calls per step from
+// the H1 inline window reader path, 1 call from _make_batch fallback).
+// At ~10s/step on hetzner that's ~6 forks/min + ~6 println string concats/
+// min — primary fd/string churn behind 3GB/min OOM. Fix: when
+// G_CORPUS_INIT==1 (load_corpus has run), pack the descriptor from the
+// already-cached scalars (zero IO, zero subprocess). Fall through to the
+// legacy corpus_open path only when G_CORPUS_INIT==0 (selftest, where the
+// scalars are empty).
 fn _current_corpus_desc() -> CorpusDesc {
+    if G_CORPUS_INIT == 1 {
+        return CorpusDesc { path: G_CORPUS_PATH, len: G_CORPUS_LEN }
+    }
     let d = corpus_open(G_CORPUS_PATH)
     return d
 }
@@ -3100,12 +3146,46 @@ fn train_step(state: TrainState, model: DecoderModel, ds: TokenDataset) -> Train
 
     // 5. CLM-P4-1 consciousness engine forward extension
     //    GWT broadcast → Holographic encode/decode → Quantum collapse measure
-    //    Heads are constructed per-step from deterministic seeds (cheap:
-    //    (n_domains × d_model) + (d_model × d_model) matmul-equivalents).
-    //    A future revision can cache them in TrainState once the Orch-OR
-    //    field-lifetime question is resolved.
-    let gwt_head = _c41_gwt_head_new(C41_N_DOMAINS, d_model, 137 + state.step)
-    let holo_head = _c41_holo_head_new(d_model, d_model * C41_HOLO_SCALE, 241 + state.step)
+    //
+    //    r5-a10 leak fix (2026-04-20): root cause — prior code called
+    //    `_c41_gwt_head_new(...)` + `_c41_holo_head_new(...)` EVERY step
+    //    with a per-step seed (137 + state.step / 241 + state.step). At
+    //    d_model=768 that allocates ~1.18M floats per step from
+    //    `_c41_det_rand` (which itself does N list.push) — primary
+    //    per-step large-list allocator behind the OOM (3GB/min RSS). Fix:
+    //    heads are random-init projection matrices that don't need to vary
+    //    per step (the original per-step seed was speculative — see Orch-OR
+    //    field-lifetime comment kept below). We allocate ONCE on the first
+    //    train_step call (deterministic seeds 137 / 241), cache the field
+    //    arrays at module scope, and rebuild the struct skin per step (a
+    //    cheap O(1) struct pack — no list allocation). The selftest path
+    //    re-inits when d_model differs (G_C41_INIT_D mismatch) to keep the
+    //    tiny-cfg verification block working.
+    //
+    //    (Original NOTE: A future revision can cache them in TrainState
+    //    once the Orch-OR field-lifetime question is resolved. — fixed in
+    //    r5-a10 via module-scope cache instead of TrainState because hexa
+    //    struct pass-by-value would force a deep-copy per step.)
+    if G_C41_INIT == 0 || G_C41_INIT_D != d_model {
+        let _gwt_seed_init  = _c41_gwt_head_new(C41_N_DOMAINS, d_model, 137)
+        let _holo_seed_init = _c41_holo_head_new(d_model, d_model * C41_HOLO_SCALE, 241)
+        G_C41_GWT_PROJ   = _gwt_seed_init.project
+        G_C41_GWT_GATE   = _gwt_seed_init.gate
+        G_C41_HOLO_SCRAM = _holo_seed_init.scramble
+        G_C41_INIT_D = d_model
+        G_C41_INIT = 1
+    }
+    let gwt_head = ClmGwtHead {
+        n_domains: C41_N_DOMAINS,
+        d_model:   d_model,
+        project:   G_C41_GWT_PROJ,
+        gate:      G_C41_GWT_GATE
+    }
+    let holo_head = C41HoloHead {
+        d_boundary: d_model,
+        d_bulk:     d_model * C41_HOLO_SCALE,
+        scramble:   G_C41_HOLO_SCRAM
+    }
     // Logits for last token position — fed to the quantum collapse sampler.
     let logits_last = _tslice(
         fwd.logits, (seq - 1) * vocab, seq * vocab
@@ -3697,33 +3777,56 @@ fn _c41_phi_holo(head: C41HoloHead, hidden: [float], seq: int, d_model: int) -> 
     if ds == 0 { return 0.0 }
     if seq == 0 { return 0.0 }
     if d_model == 0 { return 0.0 }
-    // Build boundary_stream (flat hidden) and interior_stream (per-row encoded
-    // interior slices) in a single pass. Length of each stream = seq × d_model.
-    // Per feedback_hexa_lists_pbv we keep both streams as top-level vars.
-    let mut boundary_stream = []
-    let mut interior_stream = []
+    // r5-a10 leak fix (2026-04-20): root cause — prior body was the dominant
+    // per-step allocator behind the OOM (3GB/min RSS @ d=768 seq=256). Per
+    // step it called .push() ~1M times across 3 nested loops:
+    //   (1) inner row build:  d_model pushes × seq iterations
+    //   (2) _c41_holo_encode: (db + ds) pushes × seq iterations
+    //   (3) stream pushes:    2*db pushes × seq iterations
+    // At d_model=768 seq=256 that's 256 × (768 + 1536 + 1536) = 983k .push()
+    // calls per step. Hexa's runtime list.push() reallocates the underlying
+    // buffer per call (no amortized doubling), so each push is an O(N) copy
+    // → cumulative O(N²) work AND leaks the prior buffer between resizes.
+    //
+    // Fix: pre-allocate both streams via _tz() ONCE (single _tz call vs N
+    // pushes), then write via index assignment. Inline the holo encode
+    // inner-product directly (skip building the unused first `db` portion of
+    // bulk; only the interior `ds` values are read out via `bulk[db + (i%ds)]
+    // ` in the original code). Net per-step push count drops from ~1M to ~0
+    // (only _tz internal init pushes, but those are a single contiguous buffer
+    // built once instead of repeated per-row reallocations).
+    let n_total = seq * db
+    let mut boundary_stream = _tz(n_total)
+    let mut interior_stream = _tz(n_total)
     let mut t = 0
     while t < seq {
-        // Extract row_t = hidden[t·d : (t+1)·d] into a plain list so we can
-        // pass it through the hexa encode fn without struct aliasing.
-        let mut row = []
+        let row_off = t * d_model
+        let str_off = t * db
+        // Pre-compute interior values for THIS row: for k in 0..ds,
+        //   interior_k = sum_j scramble[j*ds + k] * hidden[row_off + j]
+        // We materialize as a small _tz buffer (ds floats) reused across the
+        // db output positions; this avoids re-doing the dot product `db` times.
+        let mut interior_vals = _tz(ds)
         let mut k = 0
-        while k < d_model {
-            row = row.push(hidden[t * d_model + k])
+        while k < ds {
+            let mut s = 0.0
+            let mut j = 0
+            while j < db {
+                s = s + head.scramble[j * ds + k] * hidden[row_off + j]
+                j = j + 1
+            }
+            interior_vals[k] = s
             k = k + 1
         }
-        // Encode row → bulk [d_boundary + ds], extract interior slice of
-        // length db (same pattern as phi_holographic_measure.hexa T3).
-        let bulk = _c41_holo_encode(head, row)
+        // Stream writes via index assignment (no push -> no per-write realloc).
         let mut i = 0
         while i < db {
-            boundary_stream = boundary_stream.push(row[i])
-            interior_stream = interior_stream.push(bulk[db + (i % ds)])
+            boundary_stream[str_off + i] = hidden[row_off + i]
+            interior_stream[str_off + i] = interior_vals[i % ds]
             i = i + 1
         }
         t = t + 1
     }
-    let n_total = len(boundary_stream)
     if n_total == 0 { return 0.0 }
     let lo_b = _c41_vec_min(boundary_stream)
     let hi_b = _c41_vec_max(boundary_stream)
