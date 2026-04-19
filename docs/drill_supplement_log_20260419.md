@@ -112,3 +112,24 @@ Budget: 4h OR 40 iterations. Per-drill timeout: 20 min.
 - absorptions: 0
 - atoms: []
 - first_line: `{"nexus_cli":"0.2.0","subcmd":"drill","result":"🛸 nexus drill — seed='phi_engine IIT Phi proxy + scaling law Φ=0.78·N cl`
+
+## Iter 16 — topology — topology ring/complete/star/small-world 네트워크 의식 saturation
+- status: OK  rc=0  duration=536s  size=    3340B
+- rounds: 0/8
+- absorptions: 0
+- atoms: []
+- first_line: `{"nexus_cli":"0.2.0","subcmd":"drill","result":"🛸 nexus drill — seed='topology ring/complete/star/small-world 네트워크 의식 sa`
+
+## Iter 17 — anima_eeg — anima-eeg EEG 의식 검증 saturation (brain-like 85.9%)
+- status: OK  rc=0  duration=889s  size=    2718B
+- rounds: 0/8
+- absorptions: 0
+- atoms: []
+- first_line: `{"nexus_cli":"0.2.0","subcmd":"drill","result":"🛸 nexus drill — seed='anima-eeg EEG 의식 검증 saturation (brain-like 85.9%)'`
+
+## Iter 18 — anima_physics — anima-physics ESP32 / FPGA / 양자 substrate saturation
+- status: OK  rc=0  duration=334s  size=    2714B
+- rounds: 0/8
+- absorptions: 0
+- atoms: []
+- first_line: `{"nexus_cli":"0.2.0","subcmd":"drill","result":"🛸 nexus drill — seed='anima-physics ESP32 / FPGA / 양자 substrate saturati`
