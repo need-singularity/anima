@@ -1032,6 +1032,130 @@ fn write_tensor_block(s_in: string, name: string, rows: int, cols: int, data: ar
 // Returns: 0 on success.
 comptime const HEXACKPT_CHUNK_FLOATS = 1024
 
+// ─── HEXACKPT-v2 binary writer (2026-04-20 r12 blocker #4) ─────────
+//
+// Inlined port of train_clm.hexa's HEXACKPT-v2 helpers (commit fead4ea8).
+// Activated when env HEXACKPT_V2=1; otherwise save_lora keeps the v1
+// chunked-text path so live trainers (BG #34 CLM 1B) are not perturbed.
+//
+// Wire-format (v2; little-endian; matches train_clm.hexa exactly):
+//   Magic (8 bytes):  'H' 'X' 'C' 'K' 'P' 'T' 0x02 0x00
+//   u32 format_version = 2
+//   u32 tensor_count
+//   u64 step
+//   u32 meta_json_len
+//   [meta_json_len bytes UTF-8 JSON]
+//   Per tensor:
+//     u16 name_len, [name_len bytes UTF-8]
+//     u8 dtype (0=fp32), u8 rank (=2)
+//     rank × u32 shape, prod(shape) × 4 bytes fp32 LE
+//
+// Streaming chunk: 65_536 floats/chunk = 256 KB per fwrite.
+// ────────────────────────────────────────────────────────────────────
+let _V2_LORA_CHUNK_FLOATS = 65536
+
+fn _v2lora_pack_le(val: int, nbytes: int) -> array {
+    let mut out = []
+    let mut v = val
+    let mut i = 0
+    while i < nbytes {
+        out = out.push(v & 0xFF)
+        v = v / 256
+        i = i + 1
+    }
+    return out
+}
+
+fn _v2lora_append_bytes(path: string, bytes: array) -> bool {
+    return write_bytes_append(path, bytes)
+}
+
+fn _v2lora_append_u8(path: string, v: int) -> bool {
+    return _v2lora_append_bytes(path, [v & 0xFF])
+}
+
+fn _v2lora_append_u16(path: string, v: int) -> bool {
+    return _v2lora_append_bytes(path, _v2lora_pack_le(v, 2))
+}
+
+fn _v2lora_append_u32(path: string, v: int) -> bool {
+    return _v2lora_append_bytes(path, _v2lora_pack_le(v, 4))
+}
+
+fn _v2lora_append_u64(path: string, v: int) -> bool {
+    return _v2lora_append_bytes(path, _v2lora_pack_le(v, 8))
+}
+
+fn _v2lora_append_str_bytes(path: string, s: string) -> bool {
+    let n = len(s)
+    let mut bytes = []
+    let mut i = 0
+    while i < n {
+        bytes = bytes.push(byte_at(s, i))
+        i = i + 1
+    }
+    return _v2lora_append_bytes(path, bytes)
+}
+
+// IEEE-754 fp32 bit pattern → unsigned-i64 payload (sign-bit safe).
+fn _v2lora_f32_bits(f: float) -> int {
+    let buf = alloc_raw(4)
+    write_f32(buf, 0, f)
+    let bits_signed = deref_i32(buf, 0)
+    free_raw(buf)
+    return bits_signed & 0xFFFFFFFF
+}
+
+// Chunked tensor data writer — single shared 4-byte scratch reused for
+// every float→bits conversion. O(N) total, vs v1 chunked-TEXT O(N) but
+// ~7× faster bytes (no decimal str() formatting per float).
+fn _v2lora_append_floats_chunked(path: string, data: array) -> int {
+    let n = len(data)
+    let mut i = 0
+    let mut total = 0
+    let scratch = alloc_raw(4)
+    while i < n {
+        let mut chunk_bytes = []
+        let cand = i + _V2_LORA_CHUNK_FLOATS
+        let end = if cand < n { cand } else { n }
+        let mut j = i
+        while j < end {
+            write_f32(scratch, 0, data[j])
+            let bits_signed = deref_i32(scratch, 0)
+            let bits = bits_signed & 0xFFFFFFFF
+            chunk_bytes = chunk_bytes.push(bits & 0xFF)
+            chunk_bytes = chunk_bytes.push((bits / 256) & 0xFF)
+            chunk_bytes = chunk_bytes.push((bits / 65536) & 0xFF)
+            chunk_bytes = chunk_bytes.push((bits / 16777216) & 0xFF)
+            j = j + 1
+        }
+        let _ = _v2lora_append_bytes(path, chunk_bytes)
+        total = total + (end - i)
+        i = end
+    }
+    free_raw(scratch)
+    return total
+}
+
+// Write one v2 tensor entry. Returns floats written.
+fn _v2lora_write_tensor(path: string, name: string, rows: int, cols: int, data: array) -> int {
+    let _ = _v2lora_append_u16(path, len(name))
+    let _ = _v2lora_append_str_bytes(path, name)
+    let _ = _v2lora_append_u8(path, 0)         // dtype fp32
+    let _ = _v2lora_append_u8(path, 2)         // rank=2
+    let _ = _v2lora_append_u32(path, rows)
+    let _ = _v2lora_append_u32(path, cols)
+    let _ = _v2lora_append_floats_chunked(path, data)
+    return rows * cols
+}
+
+// Env probe: HEXACKPT_V2=1 → use binary path. Default v1.
+fn _v2lora_enabled() -> int {
+    let v = exec("printf '%s' \"${HEXACKPT_V2:-0}\"").trim()
+    if v == "1" { return 1 }
+    return 0
+}
+
 fn append_tensor_block(path: string, name: string, rows: int, cols: int, data: array) -> int {
     // Header line first: "name rows cols\n"
     let header = name + " " + str(rows) + " " + str(cols) + "\n"
@@ -1095,11 +1219,73 @@ fn save_lora(A_flat: array, B_flat: array, out_dir: string, cfg: RunConfig) -> i
     // a single 47GB string before write_file ever ran, hanging the trainer
     // for any save_every<=500. Now we write the magic + meta header once,
     // then stream each tensor in 1024-float chunks straight to disk.
+    //
+    // 2026-04-20 (r12 blocker #4): HEXACKPT_V2=1 env activates binary
+    // fp32 LE writer (~22× wallclock speedup on CLM 1B per fead4ea8).
+    // Default v1 keeps backward compat with eval_alm.hexa text decoder
+    // until the v2 decoder is also wired into the eval path.
     let n_adapters = N_LORA_TARGETS * QWEN14B_N_LAYER
     let r = cfg.lora_r
     let d = QWEN14B_D_MODEL
     let ckpt_path = out_dir + "/adapter_model.hexackpt"
 
+    let v2_on = _v2lora_enabled()
+    if v2_on == 1 {
+        // ── HEXACKPT-v2 binary path ────────────────────────────────
+        // Truncate target file by writing a single zero-length payload.
+        write_file(ckpt_path, "")
+        // Magic 'HXCKPT' + 0x02 + 0x00.
+        let _ = _v2lora_append_bytes(ckpt_path, [0x48, 0x58, 0x43, 0x4B, 0x50, 0x54, 0x02, 0x00])
+        let _ = _v2lora_append_u32(ckpt_path, 2)                  // format_version
+        let _ = _v2lora_append_u32(ckpt_path, n_adapters * 2)     // tensor_count
+        let _ = _v2lora_append_u64(ckpt_path, 0)                  // step (caller may patch)
+        let meta = "{\"n_adapters\": " + str(n_adapters) +
+                   ", \"d_model\": " + str(d) +
+                   ", \"r\": " + str(r) +
+                   ", \"alpha\": " + str(cfg.lora_alpha) +
+                   ", \"base\": \"" + cfg.base + "\"" +
+                   ", \"writer\": \"hexa-train_alm_lora.hexa-v2\"" +
+                   ", \"writer_version\": \"r12-2026-04-20\"}"
+        let _ = _v2lora_append_u32(ckpt_path, len(meta))
+        let _ = _v2lora_append_str_bytes(ckpt_path, meta)
+
+        // Stream each adapter A then B as a v2 tensor entry.
+        let A_block_v2 = r * d
+        let B_block_v2 = d * r
+        let mut idx2 = 0
+        while idx2 < n_adapters {
+            let layer2 = idx2 / N_LORA_TARGETS
+            let tgt2   = idx2 % N_LORA_TARGETS
+            let tgt_name2 = if tgt2 == TGT_Q { "q_proj" }
+                            else if tgt2 == TGT_K { "k_proj" }
+                            else if tgt2 == TGT_V { "v_proj" }
+                            else                  { "o_proj" }
+            let key_prefix2 = "model.layers." + str(layer2) + ".self_attn." + tgt_name2
+
+            let mut a_slice2 = []
+            let mut k2 = 0
+            while k2 < A_block_v2 {
+                a_slice2 = a_slice2.push(A_flat[idx2 * A_block_v2 + k2])
+                k2 = k2 + 1
+            }
+            let _ = _v2lora_write_tensor(ckpt_path, key_prefix2 + ".lora_A.weight", r, d, a_slice2)
+
+            let mut b_slice2 = []
+            k2 = 0
+            while k2 < B_block_v2 {
+                b_slice2 = b_slice2.push(B_flat[idx2 * B_block_v2 + k2])
+                k2 = k2 + 1
+            }
+            let _ = _v2lora_write_tensor(ckpt_path, key_prefix2 + ".lora_B.weight", d, r, b_slice2)
+
+            idx2 = idx2 + 1
+        }
+        println("[save_lora] HEXACKPT-v2 binary streamed " + str(n_adapters * 2) + " tensors → " + ckpt_path)
+        println("[save_lora] config → " + cfg_path)
+        return 0
+    }
+
+    // ── HEXACKPT-v1 text path (default) ───────────────────────────
     // Truncate + write magic + meta lines. Subsequent tensors stream via
     // append_tensor_block.
     let header = "HEXACKPT-v1\n" +

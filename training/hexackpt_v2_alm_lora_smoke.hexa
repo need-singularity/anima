@@ -1,0 +1,157 @@
+// hexackpt_v2_alm_lora_smoke.hexa — round-trip smoke for the v2 helpers
+// inlined into train_alm_lora.hexa save_lora HEXACKPT_V2=1 path.
+// Verifies magic + header + tensor block byte layout without dragging
+// in 1300 LOC of trainer/FFI.
+//
+// Run:
+//   /Users/ghost/Dev/nexus/shared/bin/hexa run training/hexackpt_v2_alm_lora_smoke.hexa
+//
+// Expected: "v2 lora smoke PASS" on success.
+//
+// Format under test (matches save_lora HEXACKPT_V2=1 path in train_alm_lora.hexa):
+//   Magic 'HXCKPT'+0x02+0x00 | u32 ver=2 | u32 tensor_count | u64 step
+//   u32 meta_len | meta_bytes
+//   per tensor: u16 name_len | name | u8 dtype | u8 rank | u32×rank shape | data
+//
+// History:
+//   2026-04-20: created during r12 blocker #4 (HEXACKPT-v2 wire) port
+//               from train_clm.hexa fead4ea8.
+
+let _V2_LORA_CHUNK_FLOATS = 65536
+
+fn _v2lora_pack_le(val: int, nbytes: int) -> array {
+    let mut out = []
+    let mut v = val
+    let mut i = 0
+    while i < nbytes {
+        out = out.push(v & 0xFF)
+        v = v / 256
+        i = i + 1
+    }
+    return out
+}
+
+fn _v2lora_append_bytes(path: string, bytes: array) -> bool {
+    return write_bytes_append(path, bytes)
+}
+
+fn _v2lora_append_u8(path: string, v: int) -> bool {
+    return _v2lora_append_bytes(path, [v & 0xFF])
+}
+fn _v2lora_append_u16(path: string, v: int) -> bool {
+    return _v2lora_append_bytes(path, _v2lora_pack_le(v, 2))
+}
+fn _v2lora_append_u32(path: string, v: int) -> bool {
+    return _v2lora_append_bytes(path, _v2lora_pack_le(v, 4))
+}
+fn _v2lora_append_u64(path: string, v: int) -> bool {
+    return _v2lora_append_bytes(path, _v2lora_pack_le(v, 8))
+}
+
+fn byte_at(s: string, i: int) -> int {
+    let sub = s.substring(i, i + 1)
+    return char_code(sub, 0)
+}
+
+fn _v2lora_append_str_bytes(path: string, s: string) -> bool {
+    let n = len(s)
+    let mut bytes = []
+    let mut i = 0
+    while i < n {
+        bytes = bytes.push(byte_at(s, i))
+        i = i + 1
+    }
+    return _v2lora_append_bytes(path, bytes)
+}
+
+fn _v2lora_append_floats_chunked(path: string, data: array) -> int {
+    let n = len(data)
+    let mut i = 0
+    let mut total = 0
+    let scratch = alloc_raw(4)
+    while i < n {
+        let mut chunk_bytes = []
+        let cand = i + _V2_LORA_CHUNK_FLOATS
+        let end = if cand < n { cand } else { n }
+        let mut j = i
+        while j < end {
+            write_f32(scratch, 0, data[j])
+            let bits_signed = deref_i32(scratch, 0)
+            let bits = bits_signed & 0xFFFFFFFF
+            chunk_bytes = chunk_bytes.push(bits & 0xFF)
+            chunk_bytes = chunk_bytes.push((bits / 256) & 0xFF)
+            chunk_bytes = chunk_bytes.push((bits / 65536) & 0xFF)
+            chunk_bytes = chunk_bytes.push((bits / 16777216) & 0xFF)
+            j = j + 1
+        }
+        let _ = _v2lora_append_bytes(path, chunk_bytes)
+        total = total + (end - i)
+        i = end
+    }
+    free_raw(scratch)
+    return total
+}
+
+fn _v2lora_write_tensor(path: string, name: string, rows: int, cols: int, data: array) -> int {
+    let _ = _v2lora_append_u16(path, len(name))
+    let _ = _v2lora_append_str_bytes(path, name)
+    let _ = _v2lora_append_u8(path, 0)
+    let _ = _v2lora_append_u8(path, 2)
+    let _ = _v2lora_append_u32(path, rows)
+    let _ = _v2lora_append_u32(path, cols)
+    let _ = _v2lora_append_floats_chunked(path, data)
+    return rows * cols
+}
+
+fn main() {
+    let path = "/tmp/hexackpt_v2_alm_lora_smoke.bin"
+    write_file(path, "")
+
+    // Magic 'HXCKPT' 0x02 0x00.
+    let _ = _v2lora_append_bytes(path, [0x48, 0x58, 0x43, 0x4B, 0x50, 0x54, 0x02, 0x00])
+    let _ = _v2lora_append_u32(path, 2)             // version
+    let _ = _v2lora_append_u32(path, 1)             // tensor_count = 1
+    let _ = _v2lora_append_u64(path, 0)             // step
+    let meta = "{\"smoke\":1}"
+    let _ = _v2lora_append_u32(path, len(meta))
+    let _ = _v2lora_append_str_bytes(path, meta)
+
+    // Tensor "x" rows=2 cols=3, data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    let data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    let _ = _v2lora_write_tensor(path, "x", 2, 3, data)
+
+    // Verify file size = 8 magic + 4 ver + 4 tc + 8 step + 4 meta_len + 11 meta
+    //   + 2 name_len + 1 name + 1 dtype + 1 rank + 8 shape + 24 data = 76
+    let raw = exec("wc -c < " + path).trim()
+    let sz = to_int(raw)
+    let expected = 76
+    if sz != expected {
+        println("FAIL: file size " + str(sz) + " != expected " + str(expected))
+        return
+    }
+
+    // Magic
+    let head_hex = exec("head -c 8 " + path + " | xxd -p -c 8").trim()
+    if head_hex != "4858434b50540200" {
+        println("FAIL: magic mismatch — got '" + head_hex + "'")
+        return
+    }
+
+    // Last 24 bytes = 6 fp32 LE.
+    //   1.0 = 0x3F800000 LE = 00 00 80 3f
+    //   2.0 = 0x40000000 LE = 00 00 00 40
+    //   3.0 = 0x40400000 LE = 00 00 40 40
+    //   4.0 = 0x40800000 LE = 00 00 80 40
+    //   5.0 = 0x40A00000 LE = 00 00 a0 40
+    //   6.0 = 0x40C00000 LE = 00 00 c0 40
+    let tail_hex = exec("tail -c 24 " + path + " | xxd -p -c 24").trim()
+    let expected_hex = "0000803f0000004000004040000080400000a0400000c040"
+    if tail_hex != expected_hex {
+        println("FAIL: float data mismatch")
+        println("  got      = '" + tail_hex + "'")
+        println("  expected = '" + expected_hex + "'")
+        return
+    }
+
+    println("v2 lora smoke PASS — " + str(sz) + " bytes, magic + version + meta + tensor all bit-exact")
+}
