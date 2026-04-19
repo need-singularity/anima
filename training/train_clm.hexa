@@ -3374,7 +3374,7 @@ fn train_scale(cfg: ScaleConfig, corpus_path: string, total_steps: int) -> Train
     // train_scale_full directly via the CLI dispatch block below).
     return train_scale_full(cfg, corpus_path, total_steps,
                             corpus_path + ".ckpt", DEFAULT_CKPT_EVERY,
-                            cfg.batch_size, cfg.lr)
+                            cfg.batch_size, cfg.lr, "")
 }
 
 // H2/H3 (2026-04-18 9th-fire): full trainer entry with CLI-plumbed
@@ -3387,7 +3387,8 @@ fn train_scale(cfg: ScaleConfig, corpus_path: string, total_steps: int) -> Train
 fn train_scale_full(cfg: ScaleConfig, corpus_path: string,
                     total_steps: int, ckpt_dir: string,
                     save_every: int, batch_override: int,
-                    lr_override: float) -> TrainState {
+                    lr_override: float,
+                    resume_path: string) -> TrainState {
     println("[train_scale] init begin scale=" + cfg.name
             + " d_model=" + str(cfg.d_model)
             + " n_layer=" + str(cfg.n_layer)
@@ -3420,6 +3421,25 @@ fn train_scale_full(cfg: ScaleConfig, corpus_path: string,
     println("[train_scale] init begin decoder_model_new size=" + str(cfg_patched.d_model) + "x" + str(cfg_patched.n_layer))
     let mut state = train_init(cfg_patched, total_steps)
     let mut model = decoder_model_new(cfg_patched)
+    // r5-a3.5 wire-up: if --resume supplied a ckpt path, restore weights
+    // from HEXACKPT-v1 into the freshly-constructed template. Hard-fail
+    // (println + exit) on full load failure — silently continuing with
+    // random weights would contradict --resume semantics. Partial-load
+    // (some tensors loaded) is tolerated with a warning; the per-tensor
+    // fallback inside ckpt_load_weights already keeps template values
+    // for any tensor that failed to parse (see lines 1245-1301).
+    if resume_path != "" {
+        let _res = ckpt_load_weights(resume_path, model)
+        if _res.n_loaded == 0 {
+            println("[train_scale] FATAL: --resume ckpt load produced 0 tensors — aborting rather than training with random weights. path=" + resume_path)
+            exit(1)
+        }
+        if _res.n_loaded < _res.n_expected {
+            println("[train_scale] WARN: partial weight restore (" + str(_res.n_loaded) + "/" + str(_res.n_expected) + ") from " + resume_path + " — continuing with template fallback for missing tensors")
+        }
+        model = _res.model
+        println("ckpt: restored " + str(_res.n_loaded) + " tensors from " + resume_path)
+    }
     println("[train_scale] init done — entering training loop")
     let mut step = 0
     while step < total_steps {
@@ -3721,22 +3741,27 @@ if _train_mode {
         }
     }
     // r5-a3: --resume support. When present, scan <ckpt-dir>/step_* for
-    // the highest N; skip that many steps by shrinking _total_steps so
-    // the loop advances from step=N+1. WARNING: this is a STEP-COUNTER
-    // resume only — full weight restore from HEXACKPT-v1 requires
-    // load_checkpoint() which is not yet wired (tracked as r5-a3.5).
-    // For r5-a3 smoke verification the counter advance is sufficient to
-    // prove the launcher plumbs --resume end-to-end; real-weight resume
-    // will be added before pod fire (r5-a5).
+    // the highest N and derive the HEXACKPT-v1 path at <ckpt_dir>/step_<N>
+    // (step_N is itself the ckpt FILE — save_checkpoint's mkdir uses
+    // dirname(path)). Both the step counter AND the weights are restored
+    // (r5-a3.5 wire-up; ckpt_load_weights was landed in commit bbe71224).
+    // Constraint: changing data/params with --resume is still rejected
+    // by the pre-launch preflight (feedback_no_resume_data_change); this
+    // wiring only restores, it does not validate data parity.
     let mut _resume_step = 0
+    let mut _resume_path = ""
     if _cli_has_flag(_cli_argv, "--resume") {
         _resume_step = _resume_find_last_step(_ckpt_dir)
         if _resume_step < 0 {
             println("[train_clm] --resume requested but no step_* ckpt in " + _ckpt_dir + "; starting fresh step=0")
             _resume_step = 0
         } else {
+            // save_checkpoint writes the ckpt file AT the step_N path (not
+            // inside a directory) — see line ~951-957 where mkdir uses
+            // dirname(path) and write_file(path + ".tmp") + mv → path.
+            _resume_path = _ckpt_dir + "/step_" + str(_resume_step)
             println("[train_clm] --resume: last ckpt step=" + str(_resume_step)
-                  + " in " + _ckpt_dir + " (counter-only resume; weights fresh)")
+                  + " path=" + _resume_path)
         }
     }
     // H2 (2026-04-18 9th-fire): plumb CLI flags through to train_scale_full.
@@ -3744,7 +3769,7 @@ if _train_mode {
     // land at <ckpt_dir>/step_<N> so MFS rotation (`find step_*`) matches.
     let _final = train_scale_full(_cfg_train, _corpus, _total_steps,
                                   _ckpt_dir, _save_every,
-                                  _batch_n, _lr_f)
+                                  _batch_n, _lr_f, _resume_path)
     println("[train_clm] training finished step=", _final.step,
             " resume_base=", _resume_step)
     exit(0)
