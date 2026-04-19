@@ -1,0 +1,175 @@
+// build_libhxnccl.hexa — build training/build/libhxnccl.{so,dylib}
+//
+// PURPOSE
+//   Compiles training/build/libhxnccl.c into a loadable shared library.
+//   On Linux with CUDA+NCCL available, produces libhxnccl.so linked
+//   against libnccl + libcudart (the real bf16 AllReduce path). On Mac
+//   or when CUDA/NCCL are absent, produces libhxnccl.dylib with
+//   HXNCCL_STUB=1 so the ABI is still exercised but collectives are
+//   no-ops (hxnccl_version() returns 0 to flag the caller).
+//
+// USAGE
+//   hexa run training/build/build_libhxnccl.hexa               # auto-detect
+//   hexa run training/build/build_libhxnccl.hexa --stub        # force stub
+//   CUDA_HOME=/opt/cuda NCCL_HOME=/opt/nccl \
+//     hexa run training/build/build_libhxnccl.hexa
+//
+// BUILD HOST
+//   Real .so MUST be built on the H100 pod (or any Linux host with
+//   matching CUDA 12.4 + NCCL 2.x). Cross-compiling Mac→Linux is not
+//   supported — gate on `uname -s` and fall back to stub on Darwin.
+//
+// OUTPUTS
+//   Linux real  : training/build/libhxnccl.so     (NCCL-linked)
+//   Linux stub  : training/build/libhxnccl.so     (no NCCL, rc<0 for AR)
+//   Mac stub    : training/build/libhxnccl.dylib  (no NCCL, rc<0 for AR)
+//
+// EXIT CODES
+//   0 = success
+//   2 = build host missing toolchain (gcc/clang, nccl.h, cuda_runtime.h)
+//   3 = compile step failed
+//   4 = exported symbol audit failed
+//
+// See training/build/libhxnccl.c header for full ABI notes.
+
+fn shell(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    if r[1] != 0 {
+        eprintln("FAILED: " + cmd)
+        eprintln(r[0])
+        exit(3)
+    }
+    return r[0]
+}
+
+fn shell_ok(cmd: string) -> bool {
+    let r = exec_with_status(cmd)
+    return r[1] == 0
+}
+
+fn has_header(p: string) -> bool {
+    return file_exists(p)
+}
+
+fn find_nccl_include(nccl_home: string) -> string {
+    let paths = [nccl_home + "/include/nccl.h",
+                 "/usr/include/nccl.h",
+                 "/usr/local/include/nccl.h"]
+    for p in paths {
+        if has_header(p) {
+            // Return the containing directory.
+            let parts = p.split("/")
+            let mut dir_parts = []
+            let limit = len(parts) - 1
+            let mut i = 0
+            for part in parts {
+                if i < limit { dir_parts.push(part) }
+                i = i + 1
+            }
+            return dir_parts.join("/")
+        }
+    }
+    return ""
+}
+
+fn main() {
+    let args = argv()
+    let mut force_stub = false
+    for a in args {
+        if a == "--stub" { force_stub = true }
+    }
+
+    let uname = exec("uname -s").trim()
+    let is_linux = uname == "Linux"
+    let is_darwin = uname == "Darwin"
+
+    let this_file = args[1]
+    let build_dir = exec("cd \"$(dirname '" + this_file + "')\" && pwd").trim()
+    let src = build_dir + "/libhxnccl.c"
+    if !has_header(src) {
+        eprintln("source missing: " + src)
+        exit(2)
+    }
+
+    if force_stub || is_darwin || !is_linux {
+        // ── Stub build (Mac or --stub) ─────────────────────────────────
+        let cc = if env("CC") != "" { env("CC") } else { if is_darwin { "clang" } else { "gcc" } }
+        let ext = if is_darwin { "dylib" } else { "so" }
+        let shared_flag = if is_darwin { "-dynamiclib" } else { "-shared" }
+        let out = build_dir + "/libhxnccl." + ext
+        println("[build_libhxnccl] mode=STUB (no NCCL link) → " + out)
+        shell(cc + " -O3 -fPIC " + shared_flag + " -DHXNCCL_STUB=1 "
+              + src + " -o " + out)
+        println("built: " + exec("ls -la " + out).trim())
+
+        // Export audit — must include 4 symbols.
+        let nm_flag = if is_darwin { "nm -gU " } else { "nm -D --defined-only " }
+        let syms_out = exec(nm_flag + out)
+        let need = ["hxnccl_init", "hxnccl_allreduce_bf16", "hxnccl_free", "hxnccl_version"]
+        let mut missing = 0
+        for s in need {
+            if syms_out.index_of(s) < 0 {
+                eprintln("  MISSING symbol: " + s)
+                missing = 1
+            } else {
+                println("  OK symbol: " + s)
+            }
+        }
+        if missing != 0 { exit(4) }
+        println("[build_libhxnccl] STUB done. Caller MUST check hxnccl_version()==1 before trusting AllReduce.")
+        exit(0)
+    }
+
+    // ── Linux real build with NCCL + CUDA ──────────────────────────────
+    let cc = if env("CC") != "" { env("CC") } else { "gcc" }
+    let cuda_home = if env("CUDA_HOME") != "" { env("CUDA_HOME") } else { "/usr/local/cuda" }
+    let nccl_home = if env("NCCL_HOME") != "" { env("NCCL_HOME") } else { cuda_home }
+
+    if !has_header(cuda_home + "/include/cuda_runtime.h") {
+        eprintln("cuda_runtime.h missing at " + cuda_home + "/include/")
+        eprintln("set CUDA_HOME to the CUDA toolkit install prefix")
+        exit(2)
+    }
+    let nccl_inc = find_nccl_include(nccl_home)
+    if nccl_inc == "" {
+        eprintln("nccl.h missing (searched " + nccl_home + "/include, /usr/include, /usr/local/include)")
+        eprintln("set NCCL_HOME or install libnccl-dev")
+        exit(2)
+    }
+
+    let out = build_dir + "/libhxnccl.so"
+    println("[build_libhxnccl] mode=REAL CUDA=" + cuda_home + " NCCL_INC=" + nccl_inc + " → " + out)
+    let cflags = "-O3 -fPIC -shared -I" + cuda_home + "/include -I" + nccl_inc
+    let ldflags = "-L" + cuda_home + "/lib64 -L" + nccl_home + "/lib -lnccl -lcudart"
+    shell(cc + " " + cflags + " " + src + " -o " + out + " " + ldflags)
+    println("built: " + exec("ls -la " + out).trim())
+
+    // Sanity: exported symbols + NCCL link present.
+    let syms_out = exec("nm -D --defined-only " + out)
+    let need = ["hxnccl_init", "hxnccl_allreduce_bf16", "hxnccl_free", "hxnccl_version"]
+    let mut missing = 0
+    for s in need {
+        if syms_out.index_of(s) < 0 {
+            eprintln("  MISSING symbol: " + s)
+            missing = 1
+        } else {
+            println("  OK symbol: " + s)
+        }
+    }
+    if missing != 0 { exit(4) }
+    let ldd_out = exec("ldd " + out)
+    if ldd_out.index_of("libnccl") < 0 {
+        eprintln("  WARN: libnccl not in ldd output — ldd says:")
+        eprintln(ldd_out)
+    } else {
+        println("  OK linked against libnccl")
+    }
+    if ldd_out.index_of("libcudart") < 0 {
+        eprintln("  WARN: libcudart not in ldd output")
+    } else {
+        println("  OK linked against libcudart")
+    }
+
+    println("[build_libhxnccl] done. Set LD_LIBRARY_PATH=" + build_dir + ":" + cuda_home + "/lib64")
+    exit(0)
+}

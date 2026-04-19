@@ -1,0 +1,243 @@
+{
+  "_meta": {
+    "name": "ALM 14B r12 LoRA — 2-H100 FSDP halvening (fresh-from-base)",
+    "schema_version": "1.0",
+    "ts_utc": "2026-04-20T02:15:00Z",
+    "session": "session_20260420_alm_r12_fsdp_wire",
+    "based_on": [
+      "training/deploy/alm_r11_plan.json",
+      "shared/state/alm_r11_config.json",
+      "shared/state/alm_r11_fsdp_plan_20260420.json",
+      "shared/state/alm_14b_fsdp_smoke_20260417.json"
+    ],
+    "memory_refs": [
+      "feedback_no_resume_data_change",
+      "feedback_no_version_in_filename",
+      "feedback_one_shot_best",
+      "feedback_h100_authorized",
+      "feedback_h100_free_use",
+      "feedback_no_quantization",
+      "feedback_r2_checkpoint",
+      "feedback_py_ban_total",
+      "feedback_ai_native_clm",
+      "feedback_hexa_first_strict"
+    ],
+    "purpose": "r12 is the halvened-wallclock re-run of r11. Identical trajectory invariants (lr/steps/lora/corpus), but runs on a 2×H100 SXM single-pod FSDP data-parallel recipe. Expected wallclock 2h vs r11 4h, same cost (~$12). Fresh-from-base per feedback_no_resume_data_change — r12 is NOT a resume, it is a step-0 run from Qwen2.5-14B-Instruct.",
+    "status": "CONFIG READY. Launch GATED on: (a) libhxnccl.so built on H100 pod with CUDA+NCCL (training/build/build_libhxnccl.hexa --with-nccl); (b) r11 on pod 87xscivuggrwvk reached terminal state or user approves 2nd pod; (c) hxqwen14b Day-2 LoRA ABI landed OR fall-back stub mode accepted. DO NOT AUTO-FIRE per task spec."
+  },
+
+  "no_resume": true,
+  "no_resume_rationale": "Per feedback_no_resume_data_change: r12 changes hardware layout (1-GPU → 2-GPU FSDP) + effective micro-batch semantics → fresh start mandatory. Step 0 from Qwen2.5-14B-Instruct base. Fresh ckpt directory. r11 adapter MUST NOT be loaded as base.",
+
+  "run_id_template": "alm14b-r12-{date}",
+  "round": 12,
+  "model_tag": "alm14b",
+  "ckpt_label": "production",
+  "ckpt_dir_template": "/workspace/ckpt_alm14b_r12_{date}",
+  "r2_prefix_template": "r2:anima-models/alm14b/r12/step_{step}/",
+
+  "base": {
+    "name": "Qwen/Qwen2.5-14B-Instruct",
+    "dtype": "bf16",
+    "adapter_source": null,
+    "adapter_source_rationale": "EXPLICITLY null — r12 starts fresh-from-base like r11. No r11 adapter stacking (would violate feedback_no_resume_data_change since hardware layout changed)."
+  },
+
+  "topology": {
+    "path": "A — single pod, 2×H100 SXM, FULL_SHARD intra-node NVLink",
+    "path_rationale": "Matches alm_r11_fsdp_plan_20260420.topology_chosen. H100 SXM NVLink (~600GB/s) keeps NCCL AllReduce latency off the critical path. Rejects Path B (2 separate pods + RDMA) because inter-pod bandwidth < intra-node by 10×.",
+    "pod_spec": {
+      "gpu_type": "NVIDIA H100 80GB HBM3 SXM",
+      "gpu_count": 2,
+      "vram_total_gb": 160,
+      "image": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+      "est_cost_per_hr_usd": 5.98,
+      "est_wall_hours": 2,
+      "est_cost_usd": 11.96
+    }
+  },
+
+  "fsdp": {
+    "enabled": true,
+    "sharding_strategy": "FULL_SHARD",
+    "wrap_cls": "Qwen2DecoderLayer (TRANSFORMER_BASED_WRAP)",
+    "backward_prefetch": "BACKWARD_PRE",
+    "state_dict_type": "SHARDED_STATE_DICT",
+    "use_orig_params": true,
+    "sync_module_states": true,
+    "cpu_ram_efficient_loading": true,
+    "mixed_precision": "bf16 (MixedPrecision with reduce=fp32 for numerical precision)",
+    "gradient_checkpointing": true,
+    "ffi_lib": "libhxnccl.so",
+    "ffi_surface": [
+      "hxnccl_init(device_count) -> handle",
+      "hxnccl_allreduce_bf16(handle, rank, buf, count) -> rc",
+      "hxnccl_free(handle) -> rc",
+      "hxnccl_version() -> 1=real,0=stub"
+    ],
+    "ffi_build_cmd": "hexa run training/build/build_libhxnccl.hexa   # CUDA_HOME defaults to /usr/local/cuda",
+    "ffi_build_host": "H100 pod (CUDA 12.4 + NCCL 2.x); Mac build is stub-only",
+    "nan_guard": "NCCL_P2P_LEVEL=NVL env required for H100 SXM NVLink peer-to-peer"
+  },
+
+  "training": {
+    "steps": 500,
+    "batch_per_rank": 4,
+    "grad_accum": 1,
+    "effective_batch": 8,
+    "effective_batch_rationale": "2 ranks × 4 per-rank = 8 global. r11 was 4 global. Larger batch reduces per-step loss variance — abort thresholds below are re-calibrated +0.5 headroom to avoid false-positive aborts at larger batch. Trajectory invariants (lr/steps/etc) otherwise unchanged so halvening is pure wallclock, not behavioural.",
+    "seq": 1024,
+    "lr": 5e-7,
+    "lr_rationale": "Unchanged from r11. Larger effective batch could tolerate higher lr, but r11 trajectory is the known-good and changing lr would violate feedback_no_resume_data_change if r12 were a resume; for fresh-from-base it is allowed but we keep lr constant to isolate the FSDP variable.",
+    "warmup": 50,
+    "save_every": 100,
+    "eval_every": 100,
+    "patience": 5,
+    "optimizer": "adamw",
+    "beta1": 0.9,
+    "dtype": "bf16"
+  },
+
+  "lora": {
+    "r": 8,
+    "alpha": 16,
+    "alpha_to_r_ratio": 2.0,
+    "dropout": 0.05,
+    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+    "rationale": "Identical to r11. LoRA is cheap enough that SHARDED_STATE_DICT is a convenience, not a necessity — all ranks can hold full LoRA adapter (~7.9M params). Only base-model params are shard-distributed. Saves are rank-0-only in the current trainer wire."
+  },
+
+  "corpus": {
+    "blend": {
+      "korean_dialogue_and_reasoning": 0.80,
+      "hire_sim_tasks_subset": 0.20
+    },
+    "path": "/workspace/anima/training/corpus_alm_r12.jsonl",
+    "path_rationale": "Distinct filename from corpus_alm_r11.jsonl so operator can verify which corpus is being used. Content-identical to r11 (same blend + preprocessing) — the only variable r12 changes is topology. If r11 corpus produced good results, r12 must reuse it to isolate the FSDP variable.",
+    "reuse_r11_corpus": "Preferred: symlink /workspace/anima/training/corpus_alm_r12.jsonl -> corpus_alm_r11.jsonl (byte-identical reuse is explicitly allowed since this is not a resume; data is unchanged, trajectory is fresh)",
+    "min_size_bytes": 3000000,
+    "max_size_bytes": 50000000
+  },
+
+  "trainer": {
+    "path": "training/train_alm_lora.hexa",
+    "new_flags": ["--world_size", "--rank"],
+    "world_size": 2,
+    "rank_launch_pattern": "Single-process ncclCommInitAll: launcher spawns ONE train_alm_lora process with --world_size 2 --rank 0. hxnccl_init creates a comm per local device inside the one process. (Multi-process torchrun-equiv would need per-rank launches with --rank 0 / --rank 1 separately — NOT used in r12.)",
+    "abi_required": [
+      "hxqwen14b Day-2 LoRA ABI (forward_with_lora, backward_lora_only, apply_lora_delta) — ALSO required for r11; shared prerequisite",
+      "libhxnccl.so built with CUDA 12.4 + NCCL 2.x on the pod"
+    ],
+    "fallback": "If libhxnccl.so is stub build (hxnccl_version==0) and --world_size > 1 → trainer refuses to start with a clear error pointing to training/build/build_libhxnccl.hexa. World_size=1 works with stub.",
+    "cli_template": "hexa run training/train_alm_lora.hexa --base Qwen/Qwen2.5-14B-Instruct --corpus /workspace/anima/training/corpus_alm_r12.jsonl --out /workspace/ckpt_alm14b_r12_{date} --steps 500 --lr 5e-7 --lora_r 8 --lora_alpha 16 --batch 4 --seq 1024 --warmup 50 --save_every 100 --eval_every 100 --world_size 2 --rank 0"
+  },
+
+  "env": {
+    "HF_HUB_CACHE": "/workspace/hf_cache",
+    "HF_HOME": "/workspace/hf_cache",
+    "TRANSFORMERS_CACHE": "/workspace/hf_cache",
+    "ANIMA_ROOT": "/workspace/anima",
+    "LD_LIBRARY_PATH": "/workspace/anima/training/build:/usr/local/cuda/lib64",
+    "NCCL_P2P_LEVEL": "NVL",
+    "NCCL_DEBUG": "INFO",
+    "HEXA_CKPT_HOOK": "/workspace/anima/scripts/ckpt_backup_hook.hexa"
+  },
+
+  "expected_metrics": {
+    "final_loss_target": "≤ 3.0 (vs r10 7.82, matches r11 target)",
+    "loss_step100_check": "≤ 5.5 — larger batch gives +0.5 headroom over r11's 5.0 (recalibrated)",
+    "loss_step200_abort": "> 6.5 → abort (recalibrated +0.5 from r11's 6.0 for larger batch)",
+    "hire_sim_lenient": "≥ 0.85 (match r9/r11, no regression)",
+    "likert_mean": "≥ 5.0 on 30-prompt dev set (match r11 baseline)",
+    "korean_quality_check": "≥ 25/30 prompts stay in Korean (vs r10 5/30)"
+  },
+
+  "abort_criteria": [
+    "loss > 5.5 at step 100 → warn (lr near upper limit for batch=8)",
+    "loss > 6.5 at step 200 → kill (lr too high for this batch)",
+    "loss decreasing but eval_loss diverging → kill (overfitting)",
+    "hire_sim < 0.7 at step 300 mid-eval → kill",
+    "Korean stays-in-language ratio < 0.7 at step 300 → kill",
+    "NCCL timeout or AllReduce error → kill (NVLink / comm broken)"
+  ],
+
+  "post_training_eval": [
+    "hire_sim lenient (30 stratified, Z-path judge) — ≥ 0.85",
+    "likert_eval (30 conversational prompts) — ≥ 5.0",
+    "language consistency: 30 Korean prompts → no KO→ZH/JA switches",
+    "smoke test: 20 free-form Korean prompts"
+  ],
+
+  "wall": {
+    "hours": 2,
+    "cost_usd": 11.96,
+    "cost_per_hr_usd": 5.98,
+    "vs_r11_wallclock": "~50% reduction (r11 = 4h single-H100, r12 = 2h 2×H100)",
+    "vs_r11_cost": "~0% delta (same total $12 spend)"
+  },
+
+  "pod": {
+    "gpu": "NVIDIA H100 80GB HBM3 SXM",
+    "gpu_count": 2,
+    "vram_gb": 160,
+    "compute_cap_min": 90,
+    "blocked_by": [
+      "feedback_h100_authorized caps at 2 pods; r11 currently on 87xscivuggrwvk, so r12 pod MUST replace it (not stack) — launch only after r11 reaches terminal state",
+      "libhxnccl.so not yet built on any H100 pod (training/build/build_libhxnccl.hexa --with-nccl required)",
+      "hxqwen14b Day-2 LoRA ABI (shared with r11)"
+    ]
+  },
+
+  "blocks": {
+    "forbidden_markers": [
+      "/workspace/READY_FOR_32B",
+      "/workspace/READY_FOR_R5_KBASE"
+    ],
+    "forbidden_resume_paths": [
+      "/runpod/ckpt_r9",
+      "/runpod/ckpt_r10",
+      "/workspace/ckpt_alm14b_r11_*",
+      "r2:anima-models/alm14b/r9/",
+      "r2:anima-models/alm14b/r10/",
+      "r2:anima-models/alm14b/r11/"
+    ],
+    "forbidden_resume_rationale": "r12 is fresh-from-base. No prior adapter may be loaded (feedback_no_resume_data_change)."
+  },
+
+  "ready_for_launch": false,
+  "ready_for_launch_rationale": "Config + FSDP wire + libhxnccl.c shim landed 2026-04-20. Launch is still GATED on: (1) libhxnccl.so built on H100 pod (not Mac stub); (2) 2×H100 SXM pod allocation after r11 terminates; (3) hxqwen14b Day-2 LoRA ABI (shared r11 prerequisite); (4) corpus_alm_r12.jsonl file present on pod. DO NOT AUTO-FIRE — per task spec step 7, this config is PREP ONLY.",
+
+  "auto_fire": false,
+  "auto_fire_rationale": "Task spec step 7 explicit: 'DO NOT FIRE r12 training — just prep config ready'. Launch is operator-gated; the watchdog that fires r11 does not apply to r12.",
+
+  "compliance": {
+    "hexa_first_strict": true,
+    "no_py_created": true,
+    "no_rs_created": true,
+    "no_sh_created": true,
+    "c_ffi_shim_allowed": true,
+    "c_ffi_rationale": "libhxnccl.c is an @extern FFI boundary — explicitly allowed per feedback_ai_native_clm.md ('may FFI to CUDA/NCCL shared libraries from .hexa'). Same precedent as hxblas/hxqwen14b/hxccl.",
+    "no_quantization": true,
+    "no_quantization_evidence": "bf16 weights + bf16 AllReduce + fp32 reduce; no 4/8-bit anywhere",
+    "no_resume_data_change": true,
+    "one_shot_best": true,
+    "h100_authorized": true,
+    "h100_authorized_evidence": "r12 pod replaces r11 pod (not stacked); within 2-pod cap",
+    "h100_free_use_idle_avoid": true,
+    "h100_free_use_evidence": "Config does not auto-fire; pod spins only after r11 terminates",
+    "r2_checkpoint_backup_ready": true,
+    "no_version_in_filename": true,
+    "no_version_evidence": "Filename uses round number r12 (like r11/r10/r9) not v2/v3 suffix"
+  },
+
+  "cites": [
+    "training/train_alm_lora.hexa — FSDP wire landed (init + AllReduce + rank-0 save + teardown)",
+    "training/build/libhxnccl.c — NCCL 2.x bf16 AllReduce FFI shim",
+    "training/build/build_libhxnccl.hexa — Linux real build + Mac stub build",
+    "shared/state/alm_r11_fsdp_plan_20260420.json — topology + blocker analysis",
+    "shared/state/alm_14b_fsdp_smoke_20260417.json — prior 2-GPU PASS recipe (Python, pre-ban)",
+    "memory:feedback_no_resume_data_change — fresh step 0 mandatory when hw/data/params change",
+    "memory:feedback_ai_native_clm — CUDA/NCCL FFI allowed from hexa",
+    "memory:feedback_py_ban_total — no Python accelerate runner fallback"
+  ]
+}

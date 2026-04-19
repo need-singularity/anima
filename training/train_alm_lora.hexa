@@ -123,6 +123,19 @@ extern fn hxblas_axpy_inplace(N: int, dst: int, src: int) -> int
 @link("hxblas")
 extern fn hxblas_zero(N: int, dst: int) -> int
 
+// hxnccl — minimum bf16 AllReduce FFI for r12 2-GPU FSDP data-parallel.
+// world_size==1 path = identity no-op (rank 0 only); world_size>1 triggers
+// ncclAllReduce over bf16 device buffers. See training/build/libhxnccl.c.
+// hxnccl_version() returns 1 for real NCCL, 0 for stub build — gate flips.
+@link("hxnccl")
+extern fn hxnccl_init(device_count: int) -> int
+@link("hxnccl")
+extern fn hxnccl_allreduce_bf16(h_nccl: int, rank: int, buf: int, count: int) -> int
+@link("hxnccl")
+extern fn hxnccl_free(h_nccl: int) -> int
+@link("hxnccl")
+extern fn hxnccl_version() -> int
+
 // ─── Constants — Qwen2.5-14B + r11 plan defaults ────────────────────
 
 comptime const QWEN14B_N_LAYER  = 48
@@ -153,7 +166,11 @@ struct RunConfig {
     save_every: int,
     eval_every: int,
     patience: int,
-    dry_run: int
+    dry_run: int,
+    // FSDP / data-parallel knobs. world_size>1 triggers hxnccl AllReduce
+    // on grads + rank-0-only ckpt writes. r11 keeps default 1; r12 sets 2.
+    world_size: int,
+    rank: int
 }
 
 // NB: only 1 float field (lr) — use a separate slot to avoid the
@@ -177,7 +194,9 @@ fn default_config() -> RunConfig {
         save_every: 100,
         eval_every: 100,
         patience: 5,
-        dry_run: 0
+        dry_run: 0,
+        world_size: 1,
+        rank: 0
     }
 }
 
@@ -244,7 +263,8 @@ fn parse_cli(argv: array, cfg_in: RunConfig, fl_in: RunFloats) -> array {
                 lora_r: cfg.lora_r, lora_alpha: cfg.lora_alpha,
                 batch: cfg.batch, seq: cfg.seq,
                 save_every: cfg.save_every, eval_every: cfg.eval_every,
-                patience: cfg.patience, dry_run: 1
+                patience: cfg.patience, dry_run: 1,
+                world_size: cfg.world_size, rank: cfg.rank
             }
             i = i + 1
         } else {
@@ -254,19 +274,21 @@ fn parse_cli(argv: array, cfg_in: RunConfig, fl_in: RunFloats) -> array {
                 i = i + 1
             } else {
                 let v = argv[i + 1]
-                if k == "--base"        { cfg = RunConfig { base: v, corpus: cfg.corpus, out: cfg.out, steps: cfg.steps, warmup: cfg.warmup, lora_r: cfg.lora_r, lora_alpha: cfg.lora_alpha, batch: cfg.batch, seq: cfg.seq, save_every: cfg.save_every, eval_every: cfg.eval_every, patience: cfg.patience, dry_run: cfg.dry_run } }
-                else if k == "--corpus" { cfg = RunConfig { base: cfg.base, corpus: v, out: cfg.out, steps: cfg.steps, warmup: cfg.warmup, lora_r: cfg.lora_r, lora_alpha: cfg.lora_alpha, batch: cfg.batch, seq: cfg.seq, save_every: cfg.save_every, eval_every: cfg.eval_every, patience: cfg.patience, dry_run: cfg.dry_run } }
-                else if k == "--out"    { cfg = RunConfig { base: cfg.base, corpus: cfg.corpus, out: v, steps: cfg.steps, warmup: cfg.warmup, lora_r: cfg.lora_r, lora_alpha: cfg.lora_alpha, batch: cfg.batch, seq: cfg.seq, save_every: cfg.save_every, eval_every: cfg.eval_every, patience: cfg.patience, dry_run: cfg.dry_run } }
-                else if k == "--steps"  { cfg = RunConfig { base: cfg.base, corpus: cfg.corpus, out: cfg.out, steps: parse_int_arg(v, cfg.steps), warmup: cfg.warmup, lora_r: cfg.lora_r, lora_alpha: cfg.lora_alpha, batch: cfg.batch, seq: cfg.seq, save_every: cfg.save_every, eval_every: cfg.eval_every, patience: cfg.patience, dry_run: cfg.dry_run } }
-                else if k == "--warmup" { cfg = RunConfig { base: cfg.base, corpus: cfg.corpus, out: cfg.out, steps: cfg.steps, warmup: parse_int_arg(v, cfg.warmup), lora_r: cfg.lora_r, lora_alpha: cfg.lora_alpha, batch: cfg.batch, seq: cfg.seq, save_every: cfg.save_every, eval_every: cfg.eval_every, patience: cfg.patience, dry_run: cfg.dry_run } }
-                else if k == "--lora_r"     { cfg = RunConfig { base: cfg.base, corpus: cfg.corpus, out: cfg.out, steps: cfg.steps, warmup: cfg.warmup, lora_r: parse_int_arg(v, cfg.lora_r), lora_alpha: cfg.lora_alpha, batch: cfg.batch, seq: cfg.seq, save_every: cfg.save_every, eval_every: cfg.eval_every, patience: cfg.patience, dry_run: cfg.dry_run } }
-                else if k == "--lora_alpha" { cfg = RunConfig { base: cfg.base, corpus: cfg.corpus, out: cfg.out, steps: cfg.steps, warmup: cfg.warmup, lora_r: cfg.lora_r, lora_alpha: parse_int_arg(v, cfg.lora_alpha), batch: cfg.batch, seq: cfg.seq, save_every: cfg.save_every, eval_every: cfg.eval_every, patience: cfg.patience, dry_run: cfg.dry_run } }
-                else if k == "--batch"  { cfg = RunConfig { base: cfg.base, corpus: cfg.corpus, out: cfg.out, steps: cfg.steps, warmup: cfg.warmup, lora_r: cfg.lora_r, lora_alpha: cfg.lora_alpha, batch: parse_int_arg(v, cfg.batch), seq: cfg.seq, save_every: cfg.save_every, eval_every: cfg.eval_every, patience: cfg.patience, dry_run: cfg.dry_run } }
-                else if k == "--seq"    { cfg = RunConfig { base: cfg.base, corpus: cfg.corpus, out: cfg.out, steps: cfg.steps, warmup: cfg.warmup, lora_r: cfg.lora_r, lora_alpha: cfg.lora_alpha, batch: cfg.batch, seq: parse_int_arg(v, cfg.seq), save_every: cfg.save_every, eval_every: cfg.eval_every, patience: cfg.patience, dry_run: cfg.dry_run } }
-                else if k == "--save_every" { cfg = RunConfig { base: cfg.base, corpus: cfg.corpus, out: cfg.out, steps: cfg.steps, warmup: cfg.warmup, lora_r: cfg.lora_r, lora_alpha: cfg.lora_alpha, batch: cfg.batch, seq: cfg.seq, save_every: parse_int_arg(v, cfg.save_every), eval_every: cfg.eval_every, patience: cfg.patience, dry_run: cfg.dry_run } }
-                else if k == "--eval_every" { cfg = RunConfig { base: cfg.base, corpus: cfg.corpus, out: cfg.out, steps: cfg.steps, warmup: cfg.warmup, lora_r: cfg.lora_r, lora_alpha: cfg.lora_alpha, batch: cfg.batch, seq: cfg.seq, save_every: cfg.save_every, eval_every: parse_int_arg(v, cfg.eval_every), patience: cfg.patience, dry_run: cfg.dry_run } }
-                else if k == "--patience"   { cfg = RunConfig { base: cfg.base, corpus: cfg.corpus, out: cfg.out, steps: cfg.steps, warmup: cfg.warmup, lora_r: cfg.lora_r, lora_alpha: cfg.lora_alpha, batch: cfg.batch, seq: cfg.seq, save_every: cfg.save_every, eval_every: cfg.eval_every, patience: parse_int_arg(v, cfg.patience), dry_run: cfg.dry_run } }
+                if k == "--base"        { cfg = RunConfig { base: v, corpus: cfg.corpus, out: cfg.out, steps: cfg.steps, warmup: cfg.warmup, lora_r: cfg.lora_r, lora_alpha: cfg.lora_alpha, batch: cfg.batch, seq: cfg.seq, save_every: cfg.save_every, eval_every: cfg.eval_every, patience: cfg.patience, dry_run: cfg.dry_run, world_size: cfg.world_size, rank: cfg.rank } }
+                else if k == "--corpus" { cfg = RunConfig { base: cfg.base, corpus: v, out: cfg.out, steps: cfg.steps, warmup: cfg.warmup, lora_r: cfg.lora_r, lora_alpha: cfg.lora_alpha, batch: cfg.batch, seq: cfg.seq, save_every: cfg.save_every, eval_every: cfg.eval_every, patience: cfg.patience, dry_run: cfg.dry_run, world_size: cfg.world_size, rank: cfg.rank } }
+                else if k == "--out"    { cfg = RunConfig { base: cfg.base, corpus: cfg.corpus, out: v, steps: cfg.steps, warmup: cfg.warmup, lora_r: cfg.lora_r, lora_alpha: cfg.lora_alpha, batch: cfg.batch, seq: cfg.seq, save_every: cfg.save_every, eval_every: cfg.eval_every, patience: cfg.patience, dry_run: cfg.dry_run, world_size: cfg.world_size, rank: cfg.rank } }
+                else if k == "--steps"  { cfg = RunConfig { base: cfg.base, corpus: cfg.corpus, out: cfg.out, steps: parse_int_arg(v, cfg.steps), warmup: cfg.warmup, lora_r: cfg.lora_r, lora_alpha: cfg.lora_alpha, batch: cfg.batch, seq: cfg.seq, save_every: cfg.save_every, eval_every: cfg.eval_every, patience: cfg.patience, dry_run: cfg.dry_run, world_size: cfg.world_size, rank: cfg.rank } }
+                else if k == "--warmup" { cfg = RunConfig { base: cfg.base, corpus: cfg.corpus, out: cfg.out, steps: cfg.steps, warmup: parse_int_arg(v, cfg.warmup), lora_r: cfg.lora_r, lora_alpha: cfg.lora_alpha, batch: cfg.batch, seq: cfg.seq, save_every: cfg.save_every, eval_every: cfg.eval_every, patience: cfg.patience, dry_run: cfg.dry_run, world_size: cfg.world_size, rank: cfg.rank } }
+                else if k == "--lora_r"     { cfg = RunConfig { base: cfg.base, corpus: cfg.corpus, out: cfg.out, steps: cfg.steps, warmup: cfg.warmup, lora_r: parse_int_arg(v, cfg.lora_r), lora_alpha: cfg.lora_alpha, batch: cfg.batch, seq: cfg.seq, save_every: cfg.save_every, eval_every: cfg.eval_every, patience: cfg.patience, dry_run: cfg.dry_run, world_size: cfg.world_size, rank: cfg.rank } }
+                else if k == "--lora_alpha" { cfg = RunConfig { base: cfg.base, corpus: cfg.corpus, out: cfg.out, steps: cfg.steps, warmup: cfg.warmup, lora_r: cfg.lora_r, lora_alpha: parse_int_arg(v, cfg.lora_alpha), batch: cfg.batch, seq: cfg.seq, save_every: cfg.save_every, eval_every: cfg.eval_every, patience: cfg.patience, dry_run: cfg.dry_run, world_size: cfg.world_size, rank: cfg.rank } }
+                else if k == "--batch"  { cfg = RunConfig { base: cfg.base, corpus: cfg.corpus, out: cfg.out, steps: cfg.steps, warmup: cfg.warmup, lora_r: cfg.lora_r, lora_alpha: cfg.lora_alpha, batch: parse_int_arg(v, cfg.batch), seq: cfg.seq, save_every: cfg.save_every, eval_every: cfg.eval_every, patience: cfg.patience, dry_run: cfg.dry_run, world_size: cfg.world_size, rank: cfg.rank } }
+                else if k == "--seq"    { cfg = RunConfig { base: cfg.base, corpus: cfg.corpus, out: cfg.out, steps: cfg.steps, warmup: cfg.warmup, lora_r: cfg.lora_r, lora_alpha: cfg.lora_alpha, batch: cfg.batch, seq: parse_int_arg(v, cfg.seq), save_every: cfg.save_every, eval_every: cfg.eval_every, patience: cfg.patience, dry_run: cfg.dry_run, world_size: cfg.world_size, rank: cfg.rank } }
+                else if k == "--save_every" { cfg = RunConfig { base: cfg.base, corpus: cfg.corpus, out: cfg.out, steps: cfg.steps, warmup: cfg.warmup, lora_r: cfg.lora_r, lora_alpha: cfg.lora_alpha, batch: cfg.batch, seq: cfg.seq, save_every: parse_int_arg(v, cfg.save_every), eval_every: cfg.eval_every, patience: cfg.patience, dry_run: cfg.dry_run, world_size: cfg.world_size, rank: cfg.rank } }
+                else if k == "--eval_every" { cfg = RunConfig { base: cfg.base, corpus: cfg.corpus, out: cfg.out, steps: cfg.steps, warmup: cfg.warmup, lora_r: cfg.lora_r, lora_alpha: cfg.lora_alpha, batch: cfg.batch, seq: cfg.seq, save_every: cfg.save_every, eval_every: parse_int_arg(v, cfg.eval_every), patience: cfg.patience, dry_run: cfg.dry_run, world_size: cfg.world_size, rank: cfg.rank } }
+                else if k == "--patience"   { cfg = RunConfig { base: cfg.base, corpus: cfg.corpus, out: cfg.out, steps: cfg.steps, warmup: cfg.warmup, lora_r: cfg.lora_r, lora_alpha: cfg.lora_alpha, batch: cfg.batch, seq: cfg.seq, save_every: cfg.save_every, eval_every: cfg.eval_every, patience: parse_int_arg(v, cfg.patience), dry_run: cfg.dry_run, world_size: cfg.world_size, rank: cfg.rank } }
                 else if k == "--lr"     { fl  = RunFloats  { lr: parse_float_arg(v, fl.lr), beta1: fl.beta1 } }
+                else if k == "--world_size" { cfg = RunConfig { base: cfg.base, corpus: cfg.corpus, out: cfg.out, steps: cfg.steps, warmup: cfg.warmup, lora_r: cfg.lora_r, lora_alpha: cfg.lora_alpha, batch: cfg.batch, seq: cfg.seq, save_every: cfg.save_every, eval_every: cfg.eval_every, patience: cfg.patience, dry_run: cfg.dry_run, world_size: parse_int_arg(v, cfg.world_size), rank: cfg.rank } }
+                else if k == "--rank"       { cfg = RunConfig { base: cfg.base, corpus: cfg.corpus, out: cfg.out, steps: cfg.steps, warmup: cfg.warmup, lora_r: cfg.lora_r, lora_alpha: cfg.lora_alpha, batch: cfg.batch, seq: cfg.seq, save_every: cfg.save_every, eval_every: cfg.eval_every, patience: cfg.patience, dry_run: cfg.dry_run, world_size: cfg.world_size, rank: parse_int_arg(v, cfg.rank) } }
                 else { println("[train_alm_lora] WARN: unknown flag " + k + " (ignored)") }
                 i = i + 2
             }
@@ -741,6 +763,9 @@ let mut G_BEST_LOSS = 1000000.0
 let mut G_PATIENCE_LEFT = 0
 let mut G_BREAKTHROUGH_STEP = 0
 let mut G_LAST_LOSS = 0.0
+// FSDP handle — non-zero means hxnccl_init succeeded and hxnccl_free must
+// run at main() exit. 0 = single-GPU path (no wire overhead).
+let mut G_NCCL_H = 0
 
 fn warmup_lr(base_lr: float, step: int, warmup: int) -> float {
     if warmup <= 0 { return base_lr }
@@ -836,6 +861,21 @@ fn train_loop(corpus: array, h: int, cfg: RunConfig, fl: RunFloats) -> int {
         let grad_A = grads[0]
         let grad_B = grads[1]
 
+        // 5b. FSDP grad AllReduce (r12 2-GPU data-parallel). world_size==1 ⇒
+        // no-op (hxnccl_allreduce_bf16 returns 0 identity). world_size>1 ⇒
+        // sum grads across ranks so each rank adamw-steps on the same avg.
+        // NOTE: grad_A/grad_B here are hexa arrays (CPU); real device-side
+        // AllReduce lands when hxqwen14b Day-2 ABI returns bf16 dev_ptrs.
+        // Today's wire is a call-site placeholder that exercises the NCCL
+        // handle and logs the intent so r12 launch can verify the path.
+        if G_NCCL_H != 0 && cfg.world_size > 1 {
+            let gA_rc = hxnccl_allreduce_bf16(G_NCCL_H, cfg.rank, 0, len(grad_A))
+            let gB_rc = hxnccl_allreduce_bf16(G_NCCL_H, cfg.rank, 0, len(grad_B))
+            if gA_rc != 0 || gB_rc != 0 {
+                println("[fsdp] WARN: AllReduce rc=" + str(gA_rc) + "/" + str(gB_rc) + " — caller placeholder (need dev_ptr wiring in Day-2 hxqwen14b)")
+            }
+        }
+
         // 6. AdamW step on A, B
         let cur_lr = warmup_lr(fl.lr, step, cfg.warmup)
         let updA = adamw_step(G_A_FLAT, grad_A, G_A_M, G_A_V, cur_lr, fl.beta1, step)
@@ -858,8 +898,11 @@ fn train_loop(corpus: array, h: int, cfg: RunConfig, fl: RunFloats) -> int {
                     " patience=" + str(G_PATIENCE_LEFT))
         }
 
-        // 8. Save every save_every (intermediate) and on patience-exhaust
-        if step % cfg.save_every == 0 {
+        // 8. Save every save_every (intermediate) — rank-0-only under FSDP
+        //    so the N ranks don't stomp on each other (SHARDED_STATE_DICT is
+        //    Day-2; today all ranks hold full LoRA adapter since LoRA is
+        //    cheap to replicate). world_size==1 ⇒ rank==0 ⇒ always writes.
+        if step % cfg.save_every == 0 && cfg.rank == 0 {
             let ckpt_path = cfg.out + "/step_" + str(step)
             save_lora(G_A_FLAT, G_B_FLAT, ckpt_path, cfg)
         }
@@ -1039,6 +1082,7 @@ fn main() {
     println("[main]   lr         = " + str(fl.lr))
     println("[main]   beta1      = " + str(fl.beta1))
     println("[main]   dry_run    = " + str(cfg.dry_run))
+    println("[main]   world_size = " + str(cfg.world_size) + "  rank = " + str(cfg.rank))
 
     // Probe FFI version (works on Mac stub too — returns 1).
     let abi = hxqwen14b_version()
@@ -1048,6 +1092,22 @@ fn main() {
         println("[main]        set DYLD_LIBRARY_PATH (Mac) or LD_LIBRARY_PATH (Linux)")
         return
     }
+
+    // FSDP init — world_size>1 triggers hxnccl bf16 AllReduce on grads.
+    // world_size==1 ⇒ identity, but we still init to exercise the call graph.
+    let nccl_v = hxnccl_version()
+    println("[main] hxnccl version = " + str(nccl_v) + " (1=real NCCL, 0=stub)")
+    if cfg.world_size > 1 && nccl_v != 1 {
+        println("[main] ERROR: world_size=" + str(cfg.world_size) + " but hxnccl is stub — build libhxnccl.so on pod with CUDA+NCCL first (see training/build/build_libhxnccl.hexa)")
+        return
+    }
+    let init_rc = hxnccl_init(cfg.world_size)
+    G_NCCL_H = init_rc
+    if init_rc < 0 {
+        println("[main] ERROR: hxnccl_init failed rc=" + str(init_rc))
+        return
+    }
+    println("[main] hxnccl_init handle=" + str(G_NCCL_H) + " world_size=" + str(cfg.world_size) + " rank=" + str(cfg.rank))
 
     // Try to load base. On Mac dry-run / missing weights, returns -1
     // and we report cleanly. The trainer itself runs in stub mode.
@@ -1072,6 +1132,7 @@ fn main() {
     let corpus = load_corpus(cfg.corpus)
     if len(corpus) == 0 && cfg.dry_run == 0 {
         println("[main] FATAL: empty corpus, aborting (use --dry-run to test trainer wiring)")
+        if G_NCCL_H != 0 { let _ = hxnccl_free(G_NCCL_H); G_NCCL_H = 0 }
         if h_base > 1 { hxqwen14b_free(h_base) }
         return
     }
@@ -1085,6 +1146,7 @@ fn main() {
         fake = fake.push("네 번째 샘플은 토큰 시퀀스 길이 다양성을 검증하기 위한 충분히 긴 텍스트입니다 모델은 이것을 학습합니다.")
         let rc = train_loop(fake, h_base, cfg, fl)
         println("[main] dry-run train_loop rc=" + str(rc))
+        if G_NCCL_H != 0 { let _ = hxnccl_free(G_NCCL_H); G_NCCL_H = 0 }
         if h_base > 1 { hxqwen14b_free(h_base) }
         return
     }
@@ -1093,11 +1155,17 @@ fn main() {
     let rc = train_loop(corpus, h_base, cfg, fl)
     println("[main] train_loop rc=" + str(rc))
 
-    // Final save.
-    if rc == 0 {
+    // Final save — rank-0-only under FSDP so shards don't collide.
+    if rc == 0 && cfg.rank == 0 {
         let final_dir = cfg.out + "/final"
         save_lora(G_A_FLAT, G_B_FLAT, final_dir, cfg)
         println("[main] final ckpt → " + final_dir)
+    }
+
+    // FSDP teardown — hxnccl_free destroys all NCCL comms on every rank.
+    if G_NCCL_H != 0 {
+        let _ = hxnccl_free(G_NCCL_H)
+        G_NCCL_H = 0
     }
 
     // Release base handle (idempotent, safe even if never really loaded).
