@@ -1658,23 +1658,33 @@ fn _tdot(a: [float], b: [float]) -> float {
 }
 
 // C[M×N] = A[M×K] × B[K×N]  (flat row-major)
+// r5-a6 (2026-04-20): body replaced with hxblas_sgemm FFI.
+// Before: O(M·N·K) scalar triple-loop — 168 of 172 per-step matmuls went here,
+//         dominating step time at d>=128. Hetzner PID 1183317 @ 170M: CPU 122%,
+//         step 0 >6m33s, pure scalar loop profile.
+// After:  marshal list→f32 raw buffer, one cblas_sgemm call (OpenBLAS/Accelerate
+//         vectorised), unmarshal result→list. Overhead of marshal is O(N)
+//         (negligible vs O(MNK) BLAS kernel). Matches the pattern already used
+//         for Q·Kᵀ/probs·V inside _block_attn (lines 1983-2000) — we just
+//         generalise it to cover Wq/Wk/Wv/Wo/Wgate/Wup/Wdown/lmh_U/lmh_V.
 fn _matmul(A: [float], B: [float], M: int, K: int, N: int) -> [float] {
     let mut C = _tz(M * N)
-    let mut i = 0
-    while i < M {
-        let mut j = 0
-        while j < N {
-            let mut sum = 0.0
-            let mut k = 0
-            while k < K {
-                sum = sum + A[i * K + k] * B[k * N + j]
-                k = k + 1
-            }
-            C[i * N + j] = sum
-            j = j + 1
-        }
-        i = i + 1
-    }
+    // Marshal hexa [float] lists → contiguous f32 raw buffers for BLAS.
+    let buf_A = alloc_raw(M * K * 4)
+    let buf_B = alloc_raw(K * N * 4)
+    let buf_C = alloc_raw(M * N * 4)
+    _list_to_raw(A, 0, M * K, buf_A)
+    _list_to_raw(B, 0, K * N, buf_B)
+    // C = 1.0 · A · B + 0.0 · C  (row-major, no transpose on either)
+    hxblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                 M, N, K,
+                 1.0, buf_A, K,
+                 buf_B, N,
+                 0.0, buf_C, N)
+    _raw_to_list(buf_C, M * N, C, 0)
+    free_raw(buf_A, M * K * 4)
+    free_raw(buf_B, K * N * 4)
+    free_raw(buf_C, M * N * 4)
     return C
 }
 
@@ -1682,25 +1692,29 @@ fn _matmul(A: [float], B: [float], M: int, K: int, N: int) -> [float] {
 // A stored row-major [K×M], B stored [K×N], result C is [M×N].
 // C[i,j] = sum_k A[k,i] * B[k,j]
 // Used for backward: dL/dW = input^T @ dL_dout
+//
+// r5-a6 (2026-04-20): body replaced with hxblas_sgemm FFI using transA=CBLAS_TRANS.
+// See note on _matmul above for rationale. Covers backward weight-grad sites
+// (dL_dU, dL_dV, future dL_dW*). Storage layout matches cblas's A-transposed
+// semantics: caller passes A as [K×M] row-major, lda=M, transA=CBLAS_TRANS
+// yields the same C[i,j] = Σ_k A[k*M+i]*B[k*N+j] product.
 fn _matmul_At(A: [float], B: [float], K: int, M: int, N: int) -> [float] {
-    // A is stored [K×M], we treat rows of A^T as columns of A.
-    // C[i,j] = sum_k A[k*M + i] * B[k*N + j]
     let mut C = _tz(M * N)
-    let mut i = 0
-    while i < M {
-        let mut j = 0
-        while j < N {
-            let mut sum = 0.0
-            let mut k = 0
-            while k < K {
-                sum = sum + A[k * M + i] * B[k * N + j]
-                k = k + 1
-            }
-            C[i * N + j] = sum
-            j = j + 1
-        }
-        i = i + 1
-    }
+    let buf_A = alloc_raw(K * M * 4)
+    let buf_B = alloc_raw(K * N * 4)
+    let buf_C = alloc_raw(M * N * 4)
+    _list_to_raw(A, 0, K * M, buf_A)
+    _list_to_raw(B, 0, K * N, buf_B)
+    // C = A^T · B. A is [K×M] row-major → lda=M. transA=CBLAS_TRANS.
+    hxblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_TRANS, CBLAS_NO_TRANS,
+                 M, N, K,
+                 1.0, buf_A, M,
+                 buf_B, N,
+                 0.0, buf_C, N)
+    _raw_to_list(buf_C, M * N, C, 0)
+    free_raw(buf_A, K * M * 4)
+    free_raw(buf_B, K * N * 4)
+    free_raw(buf_C, M * N * 4)
     return C
 }
 
@@ -3450,32 +3464,46 @@ fn train_scale_full(cfg: ScaleConfig, corpus_path: string,
             let ev = evaluate(ds, step)
             // CLM-P4-1: per-step Φ_holo / Φ_gwt emitted on the log cadence so
             // CLM-P4-2 (phi_holo > 500 gate) can scrape this line.
-            println("[train_scale] step=", step, " loss=", result.loss,
-                    " phase=", phase_label(state.pm.phase),
-                    " phi_holo=", result.phi_holo,
-                    " phi_gwt=", result.phi_gwt,
-                    " l_holo=", result.l_holo,
-                    " l_gwt=", result.l_gwt)
+            //
+            // ROOT CAUSE (2026-04-20 r5-a6 silent-abort bisect): the prior
+            // `println(str1, val1, str2, val2, ...)` multi-arg form is broken
+            // in hexa AOT C codegen — only the FIRST string is emitted, all
+            // subsequent args are silently dropped. For the step log that
+            // means observers see a blank "[train_scale] step=" line with
+            // no metric values (and crucially, no step number), which
+            // together with the 15-min text-ckpt save makes the run look
+            // like it "silent-aborted". Fix: explicit string concat via
+            // `+ str(...)` so every value reaches stdout. Mirrors the
+            // working pattern in `[train_clm] config applied:` above.
+            println("[train_scale] step=" + str(step)
+                  + " loss=" + str(result.loss)
+                  + " phase=" + phase_label(state.pm.phase)
+                  + " phi_holo=" + str(result.phi_holo)
+                  + " phi_gwt=" + str(result.phi_gwt)
+                  + " l_holo=" + str(result.l_holo)
+                  + " l_gwt=" + str(result.l_gwt))
             // SESSION 2026-04-19 diagnostic log line — printed only when at
             // least one aux flag is active so old runs have zero extra noise.
             let any_sw = G_SW_USE_QC + G_SW_USE_TL + G_SW_USE_LENS
                         + G_SW_USE_TIER + G_SW_USE_SUMT + G_SW_USE_A6GATE
             if any_sw > 0 {
-                println("[train_scale][sw] step=", step,
-                        " qc_loss=", G_SW_LAST_QC_LOSS,
-                        " 4_axis_dev=", G_SW_LAST_4AXIS_DEV,
-                        " tl_dw_norm=", G_SW_LAST_TL_DW_NORM,
-                        " tl_cos_bp=", G_SW_LAST_TL_COS_BP,
-                        " g_holo_norm=", G_SW_LAST_GHOLO_NORM,
-                        " lens_T_field=", G_SW_LAST_LENS_T_FIELD,
-                        " lens_T_holo=", G_SW_LAST_LENS_T_HOLO,
-                        " lens_T_q=", G_SW_LAST_LENS_T_QUANTUM,
-                        " lens_T_str=", G_SW_LAST_LENS_T_STRING,
-                        " lens_T_toe=", G_SW_LAST_LENS_T_TOE,
-                        " lens_gate=", G_SW_LAST_LENS_GATE,
-                        " tier_k=", G_SW_LAST_TIER_SAMPLED,
-                        " sumt_stage=", G_SW_LAST_SUMT_STAGE,
-                        " gate_skip_count=", G_SW_GATE_SKIP_COUNT)
+                // Same root-cause fix as the main step line above: use + str(...)
+                // so hexa AOT emits every value (not just the first string).
+                println("[train_scale][sw] step=" + str(step)
+                      + " qc_loss=" + str(G_SW_LAST_QC_LOSS)
+                      + " 4_axis_dev=" + str(G_SW_LAST_4AXIS_DEV)
+                      + " tl_dw_norm=" + str(G_SW_LAST_TL_DW_NORM)
+                      + " tl_cos_bp=" + str(G_SW_LAST_TL_COS_BP)
+                      + " g_holo_norm=" + str(G_SW_LAST_GHOLO_NORM)
+                      + " lens_T_field=" + str(G_SW_LAST_LENS_T_FIELD)
+                      + " lens_T_holo=" + str(G_SW_LAST_LENS_T_HOLO)
+                      + " lens_T_q=" + str(G_SW_LAST_LENS_T_QUANTUM)
+                      + " lens_T_str=" + str(G_SW_LAST_LENS_T_STRING)
+                      + " lens_T_toe=" + str(G_SW_LAST_LENS_T_TOE)
+                      + " lens_gate=" + str(G_SW_LAST_LENS_GATE)
+                      + " tier_k=" + str(G_SW_LAST_TIER_SAMPLED)
+                      + " sumt_stage=" + str(G_SW_LAST_SUMT_STAGE)
+                      + " gate_skip_count=" + str(G_SW_GATE_SKIP_COUNT))
             }
         }
         if save_every > 0 && step % save_every == 0 {
