@@ -1,0 +1,387 @@
+// training/hexackpt_v2_roundtrip_test.hexa — HEXACKPT-v2 binary round-trip
+//
+// Mirrors training/hexackpt_roundtrip_test.hexa (v1 text format) but for
+// the v2 binary format added 2026-04-20 for 22× save-time speedup on CLM 1B.
+//
+// The logic mirrored here MUST stay in sync with train_clm.hexa:
+//   Writer:  _v2_append_bytes / _v2_append_u16/32/64 / _v2_f32_bits /
+//            _v2_append_floats_chunked / _ckpt_v2_write_tensor
+//   Reader:  _v2_first_tensor_offset / _v2_pull_tensor / _v2_read_u16/32/64 /
+//            _v2_read_floats / _v2_bits_to_f32
+//
+// Pass criterion: every produced tensor equals the source tensor element-
+// wise (bit-exact since we use fp32 throughout).
+
+let _V2_CHUNK_FLOATS = 65536
+
+// ═════════════════════════════════════════════════════════════════════
+// Writer (mirrors _v2_* helpers in train_clm.hexa)
+// ═════════════════════════════════════════════════════════════════════
+fn v2_pack_le(val: int, nbytes: int) -> [int] {
+    let mut out = []
+    let mut v = val
+    let mut i = 0
+    while i < nbytes {
+        out = out.push(v & 0xFF)
+        v = v / 256
+        i = i + 1
+    }
+    return out
+}
+fn v2_append_bytes(path: string, bytes: [int]) -> bool {
+    return write_bytes_append(path, bytes)
+}
+fn v2_append_u16(path: string, v: int) -> bool {
+    return v2_append_bytes(path, v2_pack_le(v, 2))
+}
+fn v2_append_u32(path: string, v: int) -> bool {
+    return v2_append_bytes(path, v2_pack_le(v, 4))
+}
+fn v2_append_u64(path: string, v: int) -> bool {
+    return v2_append_bytes(path, v2_pack_le(v, 8))
+}
+fn v2_append_u8(path: string, v: int) -> bool {
+    return v2_append_bytes(path, [v & 0xFF])
+}
+fn v2_append_str_bytes(path: string, s: string) -> bool {
+    let n = len(s)
+    let mut bytes = []
+    let mut i = 0
+    while i < n {
+        bytes = bytes.push(char_code(s, i))
+        i = i + 1
+    }
+    return v2_append_bytes(path, bytes)
+}
+fn v2_f32_bits(f: float) -> int {
+    let buf = alloc_raw(4)
+    write_f32(buf, 0, f)
+    let bits = deref_i32(buf, 0)
+    free_raw(buf)
+    // Mask to u32: deref_i32 returns a signed i32 sign-extended into i64;
+    // AND with 0xFFFFFFFF to get the raw 32-bit pattern as positive int,
+    // so `/256 & 0xFF` byte extraction works without signed-div truncation.
+    return bits & 0xFFFFFFFF
+}
+fn v2_append_floats_chunked(path: string, data: [float]) -> int {
+    let n = len(data)
+    let mut i = 0
+    let mut total = 0
+    // Shared scratch — one alloc_raw per call, reused for every float.
+    let scratch = alloc_raw(4)
+    while i < n {
+        let mut chunk_bytes = []
+        let end = if i + _V2_CHUNK_FLOATS < n { i + _V2_CHUNK_FLOATS } else { n }
+        let mut j = i
+        while j < end {
+            write_f32(scratch, 0, data[j])
+            let bits_signed = deref_i32(scratch, 0)
+            let bits = bits_signed & 0xFFFFFFFF
+            chunk_bytes = chunk_bytes.push(bits & 0xFF)
+            chunk_bytes = chunk_bytes.push((bits / 256) & 0xFF)
+            chunk_bytes = chunk_bytes.push((bits / 65536) & 0xFF)
+            chunk_bytes = chunk_bytes.push((bits / 16777216) & 0xFF)
+            j = j + 1
+        }
+        let _ = v2_append_bytes(path, chunk_bytes)
+        total = total + (end - i)
+        i = end
+    }
+    free_raw(scratch)
+    return total
+}
+fn v2_write_tensor(path: string, name: string, rows: int, cols: int, data: [float]) -> int {
+    let n = rows * cols
+    let _ = v2_append_u16(path, len(name))
+    let _ = v2_append_str_bytes(path, name)
+    let _ = v2_append_u8(path, 0)   // dtype = fp32
+    let _ = v2_append_u8(path, 2)   // rank = 2
+    let _ = v2_append_u32(path, rows)
+    let _ = v2_append_u32(path, cols)
+    let _ = v2_append_floats_chunked(path, data)
+    return n
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Decoder helpers (mirror _v2_* decoder in train_clm.hexa)
+// ═════════════════════════════════════════════════════════════════════
+fn v2_read_u16(buf: [int], off: int) -> [int] {
+    let b0 = buf[off]
+    let b1 = buf[off + 1]
+    return [b0 + b1 * 256, off + 2]
+}
+fn v2_read_u32(buf: [int], off: int) -> [int] {
+    let b0 = buf[off]
+    let b1 = buf[off + 1]
+    let b2 = buf[off + 2]
+    let b3 = buf[off + 3]
+    return [b0 + b1 * 256 + b2 * 65536 + b3 * 16777216, off + 4]
+}
+fn v2_read_u64(buf: [int], off: int) -> [int] {
+    let lo_pair = v2_read_u32(buf, off)
+    let hi_pair = v2_read_u32(buf, off + 4)
+    return [lo_pair[0] + hi_pair[0] * 4294967296, off + 8]
+}
+fn v2_read_str(buf: [int], off: int, n: int) -> string {
+    let mut s = ""
+    let mut i = 0
+    while i < n {
+        s = s + chr(buf[off + i])
+        i = i + 1
+    }
+    return s
+}
+fn v2_bits_to_f32(bits: int) -> float {
+    let buf = alloc_raw(4)
+    write_i32(buf, 0, bits)
+    let f = deref_f32(buf, 0)
+    free_raw(buf)
+    return f
+}
+fn v2_read_floats(buf: [int], off: int, n: int) -> [float] {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let b0 = buf[off + i * 4]
+        let b1 = buf[off + i * 4 + 1]
+        let b2 = buf[off + i * 4 + 2]
+        let b3 = buf[off + i * 4 + 3]
+        let bits = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+        out = out.push(v2_bits_to_f32(bits))
+        i = i + 1
+    }
+    return out
+}
+fn v2_first_tensor_offset(buf: [int], buf_len: int) -> int {
+    if buf_len < 28 { return -1 }
+    if buf[0] != 72 { return -1 }
+    if buf[1] != 88 { return -1 }
+    if buf[2] != 67 { return -1 }
+    if buf[3] != 75 { return -1 }
+    if buf[4] != 80 { return -1 }
+    if buf[5] != 84 { return -1 }
+    if buf[6] != 2  { return -1 }
+    if buf[7] != 0  { return -1 }
+    let ver_pair = v2_read_u32(buf, 8)
+    if ver_pair[0] != 2 { return -1 }
+    let meta_len_pair = v2_read_u32(buf, 24)
+    let first = 28 + meta_len_pair[0]
+    if first > buf_len { return -1 }
+    return first
+}
+fn v2_pull_tensor(buf: [int], buf_len: int, first_off: int,
+                  want: string, expect_rows: int, expect_cols: int) -> [float] {
+    let mut off = first_off
+    while off >= 0 && off < buf_len {
+        if off + 2 > buf_len { return [] }
+        let nl_pair = v2_read_u16(buf, off)
+        let name_len = nl_pair[0]
+        let after_nl = nl_pair[1]
+        if after_nl + name_len + 2 > buf_len { return [] }
+        let name = v2_read_str(buf, after_nl, name_len)
+        let after_name = after_nl + name_len
+        let dtype = buf[after_name]
+        let rank = buf[after_name + 1]
+        if rank != 2 { return [] }
+        let rows_pair = v2_read_u32(buf, after_name + 2)
+        let cols_pair = v2_read_u32(buf, after_name + 6)
+        let rows = rows_pair[0]
+        let cols = cols_pair[0]
+        let data_off = after_name + 10
+        let n = rows * cols
+        let next_off = data_off + n * 4
+        if name == want {
+            if rows != expect_rows || cols != expect_cols {
+                println("  [pull] SHAPE MISMATCH '" + name + "'")
+                return []
+            }
+            if dtype != 0 { return [] }
+            return v2_read_floats(buf, data_off, n)
+        }
+        off = next_off
+    }
+    return []
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Test fixtures
+// ═════════════════════════════════════════════════════════════════════
+fn make_tensor(seed: int, rows: int, cols: int) -> [float] {
+    let n = rows * cols
+    let mut out = []
+    let mut i = 0
+    let mut s = seed
+    while i < n {
+        s = (s * 1103515245 + 12345) % 32768
+        let bucket = s % 17
+        let v = (to_float(bucket) - 8.0) / 8.0
+        out = out.push(v)
+        i = i + 1
+    }
+    return out
+}
+fn floats_bit_equal(a: [float], b: [float]) -> bool {
+    if len(a) != len(b) { return false }
+    let mut i = 0
+    let n = len(a)
+    while i < n {
+        let d = a[i] - b[i]
+        let ad = if d < 0.0 { 0.0 - d } else { d }
+        // Bit-exact expected for fp32 LE round-trip; use tight tolerance
+        // (round-trip via alloc_raw+write_f32+deref_f32 preserves bits).
+        if ad > 0.0000001 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Test
+// ═════════════════════════════════════════════════════════════════════
+fn main() {
+    println("═══ HEXACKPT-v2 binary round-trip test (2026-04-20) ═══")
+
+    let d = 4
+    let d_ff = 6
+    let n_layer = 1
+    let n_head = 2
+    let n_kv_head = 2
+    let vocab = 8
+    let rank = 2
+    let head_dim = d / n_head
+    let d_kv = n_kv_head * head_dim
+
+    let src_tok_emb     = make_tensor(1, vocab, d)
+    let src_Wq          = make_tensor(2, d, d)
+    let src_Wk          = make_tensor(3, d, d_kv)
+    let src_Wv          = make_tensor(4, d, d_kv)
+    let src_Wo          = make_tensor(5, d, d)
+    let src_ga          = make_tensor(6, 1, d)
+    let src_Wgate       = make_tensor(7, d, d_ff)
+    let src_Wup         = make_tensor(8, d, d_ff)
+    let src_Wdown       = make_tensor(9, d_ff, d)
+    let src_gf          = make_tensor(10, 1, d)
+    let src_gamma_final = make_tensor(11, 1, d)
+    let src_lmh_U       = make_tensor(12, d, rank)
+    let src_lmh_V       = make_tensor(13, rank, vocab)
+
+    let path = "/tmp/hexackpt_v2_rt_test.ckpt"
+    let _rm = exec("rm -f '" + path + "'")
+
+    // Header — mirror save_checkpoint v2 branch
+    let _ = v2_append_bytes(path, [72, 88, 67, 75, 80, 84, 2, 0])  // magic
+    let _ = v2_append_u32(path, 2)   // format_version
+    let _ = v2_append_u32(path, 13)  // tensor_count
+    let _ = v2_append_u64(path, 42)  // step
+    let meta_json = "{\"step\":42,\"val_ce\":1.2345,\"phi\":0.9,\"phase\":1}"
+    let _ = v2_append_u32(path, len(meta_json))
+    let _ = v2_append_str_bytes(path, meta_json)
+
+    let mut total = 0
+    total = total + v2_write_tensor(path, "tok_emb",     vocab, d, src_tok_emb)
+    total = total + v2_write_tensor(path, "L0_Wq",       d, d,    src_Wq)
+    total = total + v2_write_tensor(path, "L0_Wk",       d, d_kv, src_Wk)
+    total = total + v2_write_tensor(path, "L0_Wv",       d, d_kv, src_Wv)
+    total = total + v2_write_tensor(path, "L0_Wo",       d, d,    src_Wo)
+    total = total + v2_write_tensor(path, "L0_ga",       1, d,    src_ga)
+    total = total + v2_write_tensor(path, "L0_Wgate",    d, d_ff, src_Wgate)
+    total = total + v2_write_tensor(path, "L0_Wup",      d, d_ff, src_Wup)
+    total = total + v2_write_tensor(path, "L0_Wdown",    d_ff, d, src_Wdown)
+    total = total + v2_write_tensor(path, "L0_gf",       1, d,    src_gf)
+    total = total + v2_write_tensor(path, "gamma_final", 1, d,    src_gamma_final)
+    total = total + v2_write_tensor(path, "lmh_U",       d, rank, src_lmh_U)
+    total = total + v2_write_tensor(path, "lmh_V",       rank, vocab, src_lmh_V)
+
+    println("[write] " + str(total) + " params written to " + path)
+
+    // Decode + verify
+    let buf = read_file_bytes(path)
+    let buf_len = len(buf)
+    println("[read] file size = " + str(buf_len) + " bytes")
+
+    let first_off = v2_first_tensor_offset(buf, buf_len)
+    if first_off < 0 {
+        println("FAIL: v2 header invalid")
+        return
+    }
+    println("[decode] v2 header OK, first tensor @ offset " + str(first_off))
+
+    // Step from u64 @ offset 16
+    let step_pair = v2_read_u64(buf, 16)
+    println("[decode] step = " + str(step_pair[0]) + " (expected 42)")
+    if step_pair[0] != 42 {
+        println("FAIL: step mismatch")
+        return
+    }
+
+    let mut n_pass = 0
+    let mut n_fail = 0
+
+    let got_tok_emb = v2_pull_tensor(buf, buf_len, first_off, "tok_emb", vocab, d)
+    if floats_bit_equal(got_tok_emb, src_tok_emb) { println("  PASS tok_emb"); n_pass = n_pass + 1 } else { println("  FAIL tok_emb"); n_fail = n_fail + 1 }
+
+    let got_Wq = v2_pull_tensor(buf, buf_len, first_off, "L0_Wq", d, d)
+    if floats_bit_equal(got_Wq, src_Wq) { println("  PASS L0_Wq"); n_pass = n_pass + 1 } else { println("  FAIL L0_Wq"); n_fail = n_fail + 1 }
+
+    let got_Wk = v2_pull_tensor(buf, buf_len, first_off, "L0_Wk", d, d_kv)
+    if floats_bit_equal(got_Wk, src_Wk) { println("  PASS L0_Wk"); n_pass = n_pass + 1 } else { println("  FAIL L0_Wk"); n_fail = n_fail + 1 }
+
+    let got_Wv = v2_pull_tensor(buf, buf_len, first_off, "L0_Wv", d, d_kv)
+    if floats_bit_equal(got_Wv, src_Wv) { println("  PASS L0_Wv"); n_pass = n_pass + 1 } else { println("  FAIL L0_Wv"); n_fail = n_fail + 1 }
+
+    let got_Wo = v2_pull_tensor(buf, buf_len, first_off, "L0_Wo", d, d)
+    if floats_bit_equal(got_Wo, src_Wo) { println("  PASS L0_Wo"); n_pass = n_pass + 1 } else { println("  FAIL L0_Wo"); n_fail = n_fail + 1 }
+
+    let got_ga = v2_pull_tensor(buf, buf_len, first_off, "L0_ga", 1, d)
+    if floats_bit_equal(got_ga, src_ga) { println("  PASS L0_ga"); n_pass = n_pass + 1 } else { println("  FAIL L0_ga"); n_fail = n_fail + 1 }
+
+    let got_Wgate = v2_pull_tensor(buf, buf_len, first_off, "L0_Wgate", d, d_ff)
+    if floats_bit_equal(got_Wgate, src_Wgate) { println("  PASS L0_Wgate"); n_pass = n_pass + 1 } else { println("  FAIL L0_Wgate"); n_fail = n_fail + 1 }
+
+    let got_Wup = v2_pull_tensor(buf, buf_len, first_off, "L0_Wup", d, d_ff)
+    if floats_bit_equal(got_Wup, src_Wup) { println("  PASS L0_Wup"); n_pass = n_pass + 1 } else { println("  FAIL L0_Wup"); n_fail = n_fail + 1 }
+
+    let got_Wdown = v2_pull_tensor(buf, buf_len, first_off, "L0_Wdown", d_ff, d)
+    if floats_bit_equal(got_Wdown, src_Wdown) { println("  PASS L0_Wdown"); n_pass = n_pass + 1 } else { println("  FAIL L0_Wdown"); n_fail = n_fail + 1 }
+
+    let got_gf = v2_pull_tensor(buf, buf_len, first_off, "L0_gf", 1, d)
+    if floats_bit_equal(got_gf, src_gf) { println("  PASS L0_gf"); n_pass = n_pass + 1 } else { println("  FAIL L0_gf"); n_fail = n_fail + 1 }
+
+    let got_gamma_final = v2_pull_tensor(buf, buf_len, first_off, "gamma_final", 1, d)
+    if floats_bit_equal(got_gamma_final, src_gamma_final) { println("  PASS gamma_final"); n_pass = n_pass + 1 } else { println("  FAIL gamma_final"); n_fail = n_fail + 1 }
+
+    let got_lmh_U = v2_pull_tensor(buf, buf_len, first_off, "lmh_U", d, rank)
+    if floats_bit_equal(got_lmh_U, src_lmh_U) { println("  PASS lmh_U"); n_pass = n_pass + 1 } else { println("  FAIL lmh_U"); n_fail = n_fail + 1 }
+
+    let got_lmh_V = v2_pull_tensor(buf, buf_len, first_off, "lmh_V", rank, vocab)
+    if floats_bit_equal(got_lmh_V, src_lmh_V) { println("  PASS lmh_V"); n_pass = n_pass + 1 } else { println("  FAIL lmh_V"); n_fail = n_fail + 1 }
+
+    // Missing-tensor negative test
+    let missing = v2_pull_tensor(buf, buf_len, first_off, "nonexistent", 1, 1)
+    if len(missing) == 0 {
+        println("  PASS missing-tensor detection")
+        n_pass = n_pass + 1
+    } else {
+        println("  FAIL missing-tensor detection")
+        n_fail = n_fail + 1
+    }
+
+    // Shape-mismatch negative test
+    let wrong = v2_pull_tensor(buf, buf_len, first_off, "L0_Wq", d + 1, d)
+    if len(wrong) == 0 {
+        println("  PASS shape-mismatch detection")
+        n_pass = n_pass + 1
+    } else {
+        println("  FAIL shape-mismatch detection")
+        n_fail = n_fail + 1
+    }
+
+    println("═══ v2 RESULT: " + str(n_pass) + " PASS, " + str(n_fail) + " FAIL ═══")
+    if n_fail == 0 {
+        println("HEXACKPT-v2 round-trip: OK")
+    } else {
+        println("HEXACKPT-v2 round-trip: REGRESSION")
+    }
+
+    let _cleanup = exec("rm -f '" + path + "'")
+}

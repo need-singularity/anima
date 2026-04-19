@@ -1,0 +1,264 @@
+// training/hexackpt_bench.hexa — HEXACKPT v1 vs v2 save-time benchmark
+//
+// Baseline (v1 text format) vs v2 binary format. Same tensor set, same
+// machine, same run — measures pure writer throughput so the 22× speedup
+// claim has empirical backing before CLM 1B goes live with HEXACKPT_V2=1.
+//
+// Scale: we mirror a 170M-class CLM tensor layout (n_layer=12, d=768,
+// d_ff=3072, vocab=32000, rank=64) so disk cost and tensor count are
+// representative.
+//   Ballpark params: ~163M  (depends on exact d_ff rounding)
+//   v1 disk @ ~15 chars/float: ~2.4 GB
+//   v2 disk @ 4 bytes/float:   ~0.6 GB
+
+let _V2_CHUNK_FLOATS = 65536
+let _CKPT_BATCH = 64
+
+// ─── v1 writer (copied verbatim from train_clm.hexa:886 for parity) ───
+fn v1_append_tensor(path: string, name: string, rows: int, cols: int, data: [float]) -> int {
+    let n = rows * cols
+    let _ = append_file(path, name + " " + str(rows) + " " + str(cols) + "\n")
+    let mut batch = ""
+    let mut count = 0
+    let mut i = 0
+    while i < n {
+        if count > 0 { batch = batch + " " }
+        batch = batch + str(data[i])
+        count = count + 1
+        if count >= _CKPT_BATCH {
+            let _ = append_file(path, batch)
+            batch = " "
+            count = 0
+        }
+        i = i + 1
+    }
+    if count > 0 { let _ = append_file(path, batch) }
+    let _ = append_file(path, "\n")
+    return n
+}
+
+// ─── v2 writer (copied verbatim from train_clm.hexa) ───
+fn v2_pack_le(val: int, nbytes: int) -> [int] {
+    let mut out = []
+    let mut v = val
+    let mut i = 0
+    while i < nbytes {
+        out = out.push(v & 0xFF)
+        v = v / 256
+        i = i + 1
+    }
+    return out
+}
+fn v2_append_bytes(path: string, bytes: [int]) -> bool {
+    return write_bytes_append(path, bytes)
+}
+fn v2_append_u16(path: string, v: int) -> bool {
+    return v2_append_bytes(path, v2_pack_le(v, 2))
+}
+fn v2_append_u32(path: string, v: int) -> bool {
+    return v2_append_bytes(path, v2_pack_le(v, 4))
+}
+fn v2_append_u8(path: string, v: int) -> bool {
+    return v2_append_bytes(path, [v & 0xFF])
+}
+fn v2_append_str_bytes(path: string, s: string) -> bool {
+    let n = len(s)
+    let mut bytes = []
+    let mut i = 0
+    while i < n {
+        bytes = bytes.push(char_code(s, i))
+        i = i + 1
+    }
+    return v2_append_bytes(path, bytes)
+}
+fn v2_f32_bits(f: float) -> int {
+    let buf = alloc_raw(4)
+    write_f32(buf, 0, f)
+    let bits = deref_i32(buf, 0)
+    free_raw(buf)
+    return bits & 0xFFFFFFFF
+}
+fn v2_append_floats_chunked(path: string, data: [float]) -> int {
+    let n = len(data)
+    let mut i = 0
+    let mut total = 0
+    // Shared scratch buffer — one alloc_raw per call, reused for every float.
+    let scratch = alloc_raw(4)
+    while i < n {
+        let mut chunk_bytes = []
+        let end = if i + _V2_CHUNK_FLOATS < n { i + _V2_CHUNK_FLOATS } else { n }
+        let mut j = i
+        while j < end {
+            write_f32(scratch, 0, data[j])
+            let bits_signed = deref_i32(scratch, 0)
+            let bits = bits_signed & 0xFFFFFFFF
+            chunk_bytes = chunk_bytes.push(bits & 0xFF)
+            chunk_bytes = chunk_bytes.push((bits / 256) & 0xFF)
+            chunk_bytes = chunk_bytes.push((bits / 65536) & 0xFF)
+            chunk_bytes = chunk_bytes.push((bits / 16777216) & 0xFF)
+            j = j + 1
+        }
+        let _ = v2_append_bytes(path, chunk_bytes)
+        total = total + (end - i)
+        i = end
+    }
+    free_raw(scratch)
+    return total
+}
+fn v2_write_tensor(path: string, name: string, rows: int, cols: int, data: [float]) -> int {
+    let n = rows * cols
+    let _ = v2_append_u16(path, len(name))
+    let _ = v2_append_str_bytes(path, name)
+    let _ = v2_append_u8(path, 0)
+    let _ = v2_append_u8(path, 2)
+    let _ = v2_append_u32(path, rows)
+    let _ = v2_append_u32(path, cols)
+    let _ = v2_append_floats_chunked(path, data)
+    return n
+}
+
+// ─── Generate a synthetic tensor ───
+fn make_tensor(seed: int, rows: int, cols: int) -> [float] {
+    let n = rows * cols
+    let mut out = []
+    let mut i = 0
+    let mut s = seed
+    while i < n {
+        s = (s * 1103515245 + 12345) % 32768
+        let bucket = s % 17
+        let v = (to_float(bucket) - 8.0) / 8.0
+        out = out.push(v)
+        i = i + 1
+    }
+    return out
+}
+
+fn main() {
+    // Scale — intentionally modest so both formats complete on Mac laptop in
+    // reasonable time. Benchmark scales with tensor element count; the speedup
+    // ratio is the load-bearing result, not absolute ms.
+    //
+    // Small scale (for CI / laptop smoke): total ~2.5M floats (~10MB v2 / ~40MB v1)
+    let d = 384
+    let d_ff = 1024
+    let n_layer = 6
+    let n_head = 6
+    let n_kv_head = 2
+    let vocab = 4096
+    let rank = 64
+    let head_dim = d / n_head
+    let d_kv = n_kv_head * head_dim
+
+    println("═══ HEXACKPT v1 vs v2 benchmark ═══")
+    println("  d=" + str(d) + " d_ff=" + str(d_ff) + " n_layer=" + str(n_layer)
+          + " vocab=" + str(vocab) + " rank=" + str(rank))
+
+    // Generate all tensors once
+    let tok_emb = make_tensor(1, vocab, d)
+    let gamma_final = make_tensor(2, 1, d)
+    let lmh_U = make_tensor(3, d, rank)
+    let lmh_V = make_tensor(4, rank, vocab)
+
+    let mut block_Wqs = []
+    let mut block_Wks = []
+    let mut block_Wvs = []
+    let mut block_Wos = []
+    let mut block_gas = []
+    let mut block_Wgates = []
+    let mut block_Wups = []
+    let mut block_Wdowns = []
+    let mut block_gfs = []
+    let mut li = 0
+    while li < n_layer {
+        block_Wqs    = block_Wqs.push(   make_tensor(100 + li * 10 + 0, d, d))
+        block_Wks    = block_Wks.push(   make_tensor(100 + li * 10 + 1, d, d_kv))
+        block_Wvs    = block_Wvs.push(   make_tensor(100 + li * 10 + 2, d, d_kv))
+        block_Wos    = block_Wos.push(   make_tensor(100 + li * 10 + 3, d, d))
+        block_gas    = block_gas.push(   make_tensor(100 + li * 10 + 4, 1, d))
+        block_Wgates = block_Wgates.push(make_tensor(100 + li * 10 + 5, d, d_ff))
+        block_Wups   = block_Wups.push(  make_tensor(100 + li * 10 + 6, d, d_ff))
+        block_Wdowns = block_Wdowns.push(make_tensor(100 + li * 10 + 7, d_ff, d))
+        block_gfs    = block_gfs.push(   make_tensor(100 + li * 10 + 8, 1, d))
+        li = li + 1
+    }
+
+    // ─── V1 benchmark ───
+    let v1_path = "/tmp/hexackpt_bench_v1.ckpt"
+    let _ = exec("rm -f '" + v1_path + "'")
+    let t0_v1 = time_ms()
+    let _ = write_file(v1_path, "HEXACKPT-v1\n")
+    let _ = append_file(v1_path, "__META__ step=0 val_ce=0.0 phi=0.0 phase=0 n_layer=" + str(n_layer) + " vocab=" + str(vocab) + " d=" + str(d) + " d_ff=" + str(d_ff) + " n_head=" + str(n_head) + " n_kv_head=" + str(n_kv_head) + " rank=" + str(rank) + "\n")
+    let mut v1_total = 0
+    v1_total = v1_total + v1_append_tensor(v1_path, "tok_emb", vocab, d, tok_emb)
+    let mut li1 = 0
+    while li1 < n_layer {
+        let p = "L" + str(li1) + "_"
+        v1_total = v1_total + v1_append_tensor(v1_path, p + "Wq",    d, d,    block_Wqs[li1])
+        v1_total = v1_total + v1_append_tensor(v1_path, p + "Wk",    d, d_kv, block_Wks[li1])
+        v1_total = v1_total + v1_append_tensor(v1_path, p + "Wv",    d, d_kv, block_Wvs[li1])
+        v1_total = v1_total + v1_append_tensor(v1_path, p + "Wo",    d, d,    block_Wos[li1])
+        v1_total = v1_total + v1_append_tensor(v1_path, p + "ga",    1, d,    block_gas[li1])
+        v1_total = v1_total + v1_append_tensor(v1_path, p + "Wgate", d, d_ff, block_Wgates[li1])
+        v1_total = v1_total + v1_append_tensor(v1_path, p + "Wup",   d, d_ff, block_Wups[li1])
+        v1_total = v1_total + v1_append_tensor(v1_path, p + "Wdown", d_ff, d, block_Wdowns[li1])
+        v1_total = v1_total + v1_append_tensor(v1_path, p + "gf",    1, d,    block_gfs[li1])
+        li1 = li1 + 1
+    }
+    v1_total = v1_total + v1_append_tensor(v1_path, "gamma_final", 1, d, gamma_final)
+    v1_total = v1_total + v1_append_tensor(v1_path, "lmh_U", d, rank, lmh_U)
+    v1_total = v1_total + v1_append_tensor(v1_path, "lmh_V", rank, vocab, lmh_V)
+    let t1_v1 = time_ms()
+    let v1_ms = t1_v1 - t0_v1
+    let v1_size_str = exec("stat -f '%z' '" + v1_path + "' 2>/dev/null || stat -c '%s' '" + v1_path + "'").trim()
+    let v1_size = to_int(v1_size_str)
+    println("V1 text:  " + str(v1_ms) + " ms, " + str(v1_size) + " bytes, " + str(v1_total) + " params")
+    let v1_mbs_int = if v1_ms > 0 { (v1_size / 1024) * 1000 / v1_ms } else { 0 }
+    println("  v1 throughput ≈ " + str(v1_mbs_int) + " KB/s")
+
+    // ─── V2 benchmark ───
+    let v2_path = "/tmp/hexackpt_bench_v2.ckpt"
+    let _rm2 = exec("rm -f '" + v2_path + "'")
+    let t0_v2 = time_ms()
+    let _ = v2_append_bytes(v2_path, [72, 88, 67, 75, 80, 84, 2, 0])
+    let _ = v2_append_u32(v2_path, 2)                        // format_version
+    let _ = v2_append_u32(v2_path, 1 + n_layer * 9 + 3)      // tensor_count
+    let _ = v2_append_u32(v2_path, 0)                        // step (low 32)
+    let _ = v2_append_u32(v2_path, 0)                        // step (high 32)
+    let meta_json = "{\"n_layer\":" + str(n_layer) + ",\"vocab\":" + str(vocab) + ",\"d\":" + str(d) + "}"
+    let _ = v2_append_u32(v2_path, len(meta_json))
+    let _ = v2_append_str_bytes(v2_path, meta_json)
+    let mut v2_total = 0
+    v2_total = v2_total + v2_write_tensor(v2_path, "tok_emb", vocab, d, tok_emb)
+    let mut li2 = 0
+    while li2 < n_layer {
+        let p = "L" + str(li2) + "_"
+        v2_total = v2_total + v2_write_tensor(v2_path, p + "Wq",    d, d,    block_Wqs[li2])
+        v2_total = v2_total + v2_write_tensor(v2_path, p + "Wk",    d, d_kv, block_Wks[li2])
+        v2_total = v2_total + v2_write_tensor(v2_path, p + "Wv",    d, d_kv, block_Wvs[li2])
+        v2_total = v2_total + v2_write_tensor(v2_path, p + "Wo",    d, d,    block_Wos[li2])
+        v2_total = v2_total + v2_write_tensor(v2_path, p + "ga",    1, d,    block_gas[li2])
+        v2_total = v2_total + v2_write_tensor(v2_path, p + "Wgate", d, d_ff, block_Wgates[li2])
+        v2_total = v2_total + v2_write_tensor(v2_path, p + "Wup",   d, d_ff, block_Wups[li2])
+        v2_total = v2_total + v2_write_tensor(v2_path, p + "Wdown", d_ff, d, block_Wdowns[li2])
+        v2_total = v2_total + v2_write_tensor(v2_path, p + "gf",    1, d,    block_gfs[li2])
+        li2 = li2 + 1
+    }
+    v2_total = v2_total + v2_write_tensor(v2_path, "gamma_final", 1, d, gamma_final)
+    v2_total = v2_total + v2_write_tensor(v2_path, "lmh_U", d, rank, lmh_U)
+    v2_total = v2_total + v2_write_tensor(v2_path, "lmh_V", rank, vocab, lmh_V)
+    let t1_v2 = time_ms()
+    let v2_ms = t1_v2 - t0_v2
+    let v2_size_str = exec("stat -f '%z' '" + v2_path + "' 2>/dev/null || stat -c '%s' '" + v2_path + "'").trim()
+    let v2_size = to_int(v2_size_str)
+    println("V2 binary: " + str(v2_ms) + " ms, " + str(v2_size) + " bytes, " + str(v2_total) + " params")
+    let v2_mbs_int = if v2_ms > 0 { (v2_size / 1024) * 1000 / v2_ms } else { 0 }
+    println("  v2 throughput ≈ " + str(v2_mbs_int) + " KB/s")
+
+    // Speedup ratio — use ints for robustness
+    if v2_ms > 0 {
+        let speedup100 = v1_ms * 100 / v2_ms
+        println("═══ SPEEDUP v1/v2 = " + str(speedup100 / 100) + "." + str(speedup100 % 100) + "× ═══")
+    }
+
+    let _c1 = exec("rm -f '" + v1_path + "' '" + v2_path + "'")
+}

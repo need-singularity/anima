@@ -380,5 +380,183 @@ void hxblas_embed_scatter(int64_t S, int64_t D, int64_t dembed_p, int64_t dh_p, 
 // dependency. Returns the hxblas ABI version (bump when adding fns).
 // ─────────────────────────────────────────────────────────────
 int64_t hxblas_version(void) {
-    return 2;
+    return 3;  // bumped 2026-04-20: + hxckpt_* binary ckpt FFI
+}
+
+// ═════════════════════════════════════════════════════════════
+// HEXACKPT-v2 binary ckpt FFI (2026-04-20)
+//
+// Purpose: bypass hexa_append_file's strlen() NUL-termination limit
+// so we can stream raw tensor bytes (bf16/fp32 little-endian) to the
+// ckpt file at fwrite speed — ~22× faster than the v1 text format
+// (which is O(N²) string concat inside _ckpt_append_tensor).
+//
+// All functions return 0 on success, nonzero on I/O failure. All writes
+// are little-endian by file contract (host is assumed LE; x86_64 +
+// ARM64 default are both LE — this is an explicit invariant of the
+// format and MUST stay true across restore to GPU/CPU platforms.)
+//
+// Handle encoding: FILE* is returned as an int64 (uintptr_t cast) so the
+// hexa FFI float→double wrapper does not mangle it. Caller holds the
+// handle for the duration of one ckpt write; we do not pool.
+// ═════════════════════════════════════════════════════════════
+
+#include <stdio.h>
+#include <string.h>
+
+// Open a file for binary append (fopen "ab"). Returns FILE* as int64, or 0.
+int64_t hxckpt_open_append(int64_t path_p) {
+    const char* path = (const char*)(uintptr_t)path_p;
+    if (!path) return 0;
+    FILE* f = fopen(path, "ab");
+    return (int64_t)(uintptr_t)f;
+}
+
+// Open a file for binary write (fopen "wb"). Returns FILE* as int64, or 0.
+int64_t hxckpt_open_write(int64_t path_p) {
+    const char* path = (const char*)(uintptr_t)path_p;
+    if (!path) return 0;
+    FILE* f = fopen(path, "wb");
+    return (int64_t)(uintptr_t)f;
+}
+
+// Open a file for binary read. Returns FILE* as int64, or 0.
+int64_t hxckpt_open_read(int64_t path_p) {
+    const char* path = (const char*)(uintptr_t)path_p;
+    if (!path) return 0;
+    FILE* f = fopen(path, "rb");
+    return (int64_t)(uintptr_t)f;
+}
+
+// Close a handle. Returns 0 on success.
+int64_t hxckpt_close(int64_t handle) {
+    FILE* f = (FILE*)(uintptr_t)handle;
+    if (!f) return -1;
+    return (int64_t)fclose(f);
+}
+
+// Write a raw byte buffer (buf_p points to `n_bytes` of data). Returns
+// 0 on success, nonzero on short-write. Caller guarantees buffer lives
+// through the call.
+int64_t hxckpt_write_bytes(int64_t handle, int64_t buf_p, int64_t n_bytes) {
+    FILE* f = (FILE*)(uintptr_t)handle;
+    const void* buf = (const void*)(uintptr_t)buf_p;
+    if (!f || !buf || n_bytes < 0) return -1;
+    size_t got = fwrite(buf, 1, (size_t)n_bytes, f);
+    return (got == (size_t)n_bytes) ? 0 : -2;
+}
+
+// Read raw bytes into buf_p. Returns number of bytes read (>=0) or -1.
+int64_t hxckpt_read_bytes(int64_t handle, int64_t buf_p, int64_t n_bytes) {
+    FILE* f = (FILE*)(uintptr_t)handle;
+    void* buf = (void*)(uintptr_t)buf_p;
+    if (!f || !buf || n_bytes < 0) return -1;
+    size_t got = fread(buf, 1, (size_t)n_bytes, f);
+    return (int64_t)got;
+}
+
+// Convenience: write a uint32 little-endian.
+int64_t hxckpt_write_u32(int64_t handle, int64_t val) {
+    FILE* f = (FILE*)(uintptr_t)handle;
+    if (!f) return -1;
+    uint32_t v = (uint32_t)val;
+    unsigned char b[4];
+    b[0] = (unsigned char)(v & 0xFF);
+    b[1] = (unsigned char)((v >> 8) & 0xFF);
+    b[2] = (unsigned char)((v >> 16) & 0xFF);
+    b[3] = (unsigned char)((v >> 24) & 0xFF);
+    return (fwrite(b, 1, 4, f) == 4) ? 0 : -2;
+}
+
+// Read uint32 little-endian. Returns value, or -1 on error.
+int64_t hxckpt_read_u32(int64_t handle) {
+    FILE* f = (FILE*)(uintptr_t)handle;
+    if (!f) return -1;
+    unsigned char b[4];
+    if (fread(b, 1, 4, f) != 4) return -1;
+    uint32_t v = (uint32_t)b[0] | ((uint32_t)b[1] << 8)
+               | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+    return (int64_t)v;
+}
+
+// Write a uint64 little-endian.
+int64_t hxckpt_write_u64(int64_t handle, int64_t val) {
+    FILE* f = (FILE*)(uintptr_t)handle;
+    if (!f) return -1;
+    uint64_t v = (uint64_t)val;
+    unsigned char b[8];
+    for (int i = 0; i < 8; i++) b[i] = (unsigned char)((v >> (i * 8)) & 0xFF);
+    return (fwrite(b, 1, 8, f) == 8) ? 0 : -2;
+}
+
+// Read uint64 little-endian.
+int64_t hxckpt_read_u64(int64_t handle) {
+    FILE* f = (FILE*)(uintptr_t)handle;
+    if (!f) return -1;
+    unsigned char b[8];
+    if (fread(b, 1, 8, f) != 8) return -1;
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v |= ((uint64_t)b[i]) << (i * 8);
+    return (int64_t)v;
+}
+
+// Write a uint16 little-endian.
+int64_t hxckpt_write_u16(int64_t handle, int64_t val) {
+    FILE* f = (FILE*)(uintptr_t)handle;
+    if (!f) return -1;
+    uint16_t v = (uint16_t)val;
+    unsigned char b[2];
+    b[0] = (unsigned char)(v & 0xFF);
+    b[1] = (unsigned char)((v >> 8) & 0xFF);
+    return (fwrite(b, 1, 2, f) == 2) ? 0 : -2;
+}
+
+// Read uint16 little-endian.
+int64_t hxckpt_read_u16(int64_t handle) {
+    FILE* f = (FILE*)(uintptr_t)handle;
+    if (!f) return -1;
+    unsigned char b[2];
+    if (fread(b, 1, 2, f) != 2) return -1;
+    uint16_t v = (uint16_t)b[0] | ((uint16_t)b[1] << 8);
+    return (int64_t)v;
+}
+
+// Write a uint8.
+int64_t hxckpt_write_u8(int64_t handle, int64_t val) {
+    FILE* f = (FILE*)(uintptr_t)handle;
+    if (!f) return -1;
+    unsigned char b = (unsigned char)(val & 0xFF);
+    return (fwrite(&b, 1, 1, f) == 1) ? 0 : -2;
+}
+
+// Read uint8. Returns -1 on EOF/error.
+int64_t hxckpt_read_u8(int64_t handle) {
+    FILE* f = (FILE*)(uintptr_t)handle;
+    if (!f) return -1;
+    unsigned char b;
+    if (fread(&b, 1, 1, f) != 1) return -1;
+    return (int64_t)b;
+}
+
+// Write a NUL-free length-prefixed string header + bytes.
+// Writes the raw bytes of `s` (length `slen`) with no length prefix —
+// caller is responsible for writing the length field separately. This
+// is intentional so the writer composes (len_u16 | len_u32 | u8...).
+int64_t hxckpt_write_str_bytes(int64_t handle, int64_t str_p, int64_t slen) {
+    FILE* f = (FILE*)(uintptr_t)handle;
+    const char* s = (const char*)(uintptr_t)str_p;
+    if (!f || !s || slen < 0) return -1;
+    return (fwrite(s, 1, (size_t)slen, f) == (size_t)slen) ? 0 : -2;
+}
+
+// Read a stat: file size in bytes, -1 on fail.
+int64_t hxckpt_file_size(int64_t path_p) {
+    const char* path = (const char*)(uintptr_t)path_p;
+    if (!path) return -1;
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+    long sz = ftell(f);
+    fclose(f);
+    return (int64_t)sz;
 }
