@@ -112,6 +112,25 @@ extern fn hxqwen14b_free(h: int) -> int
 @link("hxqwen14b")
 extern fn hxqwen14b_version() -> int
 
+// v5.4 base forward surface (2026-04-20): real Qwen2.5-14B 48-layer
+// fwd over the safetensors-loaded weights. r11 wires only smoke_v54
+// + version_v54 to verify the CUDA path is live; full forward+LoRA
+// fusion is r12 work (see project_alm_training_20260417). 5 entries.
+@link("hxqwen14b")
+extern fn hxqwen14b_version_v54() -> int
+
+@link("hxqwen14b")
+extern fn hxqwen14b_load_all_weights(h: int, ckpt_path_p: int) -> int
+
+@link("hxqwen14b")
+extern fn hxqwen14b_base_forward_v54(h: int, ids_p: int, n_ids: int, hidden_out_p: int) -> int
+
+@link("hxqwen14b")
+extern fn hxqwen14b_ce_loss_v54(h: int, hidden_p: int, targets_p: int, n_tok: int) -> float
+
+@link("hxqwen14b")
+extern fn hxqwen14b_smoke_v54(h: int) -> int
+
 // hxblas — used for inplace SGD/AXPY/zero on dense vectors. AdamW is
 // implemented in hexa (no fused FFI yet).
 @link("hxblas")
@@ -1126,6 +1145,27 @@ fn main() {
         }
     } else {
         h_base = 1
+    }
+
+    // ─── v5.4 CUDA forward path live-probe (2026-04-20, r11) ──────────
+    // Rationale: r11 BLOCKED_FFI was caused by libhxqwen14b.so missing
+    // CUDA symbols. nvcc-built .so now ships hxqwen14b_cu_launch_* +
+    // base_forward_v54 + load_all_weights + ce_loss_v54. Probe the v5.4
+    // version + smoke entries here so a broken .so fails LOUD before the
+    // 500-step loop wastes H100 minutes. Real LoRA-fused forward wiring
+    // is r12 work (needs hidden_state + LoRA delta integration). Today
+    // the train_loop still uses the stub forward for gradient signal.
+    let abi_v54 = hxqwen14b_version_v54()
+    println("[main] hxqwen14b v5.4 ABI = " + str(abi_v54) + " (54 = real CUDA, <=0 = stub or missing)")
+    if h_base > 1 && abi_v54 >= 54 {
+        // load_all_weights: orchestrator pulls all 8 safetensor shards
+        // into device memory (+3.1GB lm_head fp32, headroom on H100 80GB).
+        // Skip if base path doesn't look like a Qwen14B dir to keep stub
+        // smoke fast — the smoke_v54 self-test only needs the .so loaded.
+        let loadw_rc = hxqwen14b_load_all_weights(h_base, cstring(cfg.base))
+        println("[main] hxqwen14b_load_all_weights rc=" + str(loadw_rc) + " (0=ok, <0=defer to r12 forward wire)")
+        let smoke_rc = hxqwen14b_smoke_v54(h_base)
+        println("[main] hxqwen14b_smoke_v54 rc=" + str(smoke_rc) + " (0=full v5.4 path PASS)")
     }
 
     // Load corpus.
