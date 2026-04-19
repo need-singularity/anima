@@ -73,6 +73,16 @@ extern fn hxnccl_allreduce_f32(buf_ptr: int, count: int, op_code: int) -> int
 @link("hxnccl")
 extern fn hxnccl_broadcast_f32(buf_ptr: int, count: int, root: int) -> int
 
+// B2 layer-collective surface (added 2026-04-20). reduce_scatter takes
+// a SEND buffer of world*count elements and emits a RECV of count
+// elements per rank; allgather is the dual. Both are device-pointer in
+// NCCL mode.
+@link("hxnccl")
+extern fn hxnccl_reduce_scatter_f32(send_ptr: int, recv_ptr: int, count: int) -> int
+
+@link("hxnccl")
+extern fn hxnccl_allgather_f32(send_ptr: int, recv_ptr: int, count: int) -> int
+
 @link("hxnccl")
 extern fn hxnccl_world_size() -> int
 
@@ -163,50 +173,140 @@ fn nccl_barrier() -> int {
 //  layer from `owner` rank to every other rank. Used by FSDP
 //  all-gather before each layer's forward.
 //
-//  Stub returns OK for world_size==1 (nothing to do) and TODO
-//  otherwise. The real wire requires 8 hxnccl_broadcast_f32
-//  invocations against device pointers held by fsdp_shard — that
-//  is the B2 follow-up (training/fsdp_shard.hexa edits).
+//  B2 wire (2026-04-20): caller passes the 8 device pointers as
+//  an array `tensor_ptrs` and the matching element counts as
+//  `tensor_counts`. We loop and call hxnccl_broadcast_f32 once
+//  per tensor. world_size==1 short-circuits to NCCL_OK so the
+//  single-rank fast path stays bit-identical to the no-op.
+//
+//  fsdp_shard.hexa builds tensor_ptrs from a GpuLayer struct:
+//      [layer.Wq, layer.Wk, layer.Wv, layer.Wo,
+//       layer.Wff1, layer.Wff2, layer.ga, layer.gf]
+//  and tensor_counts from cfg dims:
+//      [D*D, D*D, D*D, D*D, D*FF, FF*D, D, D]
+//
+//  Returns NCCL_OK if every per-tensor broadcast returns 0; first
+//  non-zero return code propagates so the trainer can abort.
 // ───────────────────────────────────────────────────────────────
 
+fn nccl_broadcast_layer_tensors(owner: int, layer_id: int,
+                                tensor_ptrs: array, tensor_counts: array) -> int {
+    if NCCL_WORLD_SIZE <= 1 { return NCCL_OK }
+    let n = len(tensor_ptrs)
+    if n != len(tensor_counts) {
+        println("[nccl_ffi] broadcast_layer_tensors — len mismatch ptrs="
+                + str(n) + " counts=" + str(len(tensor_counts)))
+        return -2
+    }
+    let mut i = 0
+    while i < n {
+        let ptr = tensor_ptrs[i]
+        let cnt = tensor_counts[i]
+        let rc = hxnccl_broadcast_f32(ptr, cnt, owner)
+        if rc != 0 {
+            println("[nccl_ffi] broadcast_layer_tensors — tensor "
+                    + str(i) + " of layer " + str(layer_id)
+                    + " rc=" + str(rc))
+            return rc
+        }
+        i = i + 1
+    }
+    return NCCL_OK
+}
+
+// Back-compat shim — old fsdp_shard call sites that don't yet pass the
+// pointer/count arrays still work, but they print the old TODO so we
+// can grep-find them. Returns NCCL_TODO_RC for world>1 to keep the
+// existing "treat non-zero as configuration error" contract.
 fn nccl_broadcast_layer(owner: int, layer_id: int, D: int, FF: int) -> int {
     if NCCL_WORLD_SIZE <= 1 { return NCCL_OK }
-    println("[nccl_ffi] nccl_broadcast_layer — B2 TODO: owner=" + str(owner)
-            + " layer=" + str(layer_id) + " D=" + str(D) + " FF=" + str(FF))
+    println("[nccl_ffi] nccl_broadcast_layer — legacy stub (use _tensors): owner="
+            + str(owner) + " layer=" + str(layer_id)
+            + " D=" + str(D) + " FF=" + str(FF))
     return NCCL_TODO_RC
 }
 
 // ───────────────────────────────────────────────────────────────
-//  nccl_reduce_scatter_layer — sum all 8 grad tensors of a
-//  transformer layer across ranks, leaving the result only on
-//  the `owner` rank. Used by FSDP after each layer's backward.
+//  nccl_reduce_scatter_layer — sum gradient tensors across ranks
+//  via in-place all-reduce so the dense-grad FSDP variant works
+//  (every rank still holds the full grad, but the values agree).
 //
-//  Stub returns OK for world_size==1. Real wire requires 8
-//  hxnccl_allreduce_f32 invocations (or ncclReduceScatter through
-//  a Family A surface) against fsdp_shard device pointers — B2
-//  follow-up.
+//  B2 wire (2026-04-20): same array pattern as broadcast_layer.
+//  We use ncclAllReduce (via hxnccl_allreduce_f32 op_code SUM)
+//  rather than ncclReduceScatter so the caller does not need to
+//  partition the grad buffer ahead of time — the math is the same
+//  for the dense-grad LoRA path used by train_alm_lora.
+//
+//  For sharded-grad FSDP (true ZeRO-3), call hxnccl_reduce_scatter_f32
+//  directly with a (world * count)-sized SEND and (count)-sized RECV.
 // ───────────────────────────────────────────────────────────────
 
+fn nccl_reduce_scatter_layer_tensors(owner: int, layer_id: int,
+                                     grad_ptrs: array, grad_counts: array) -> int {
+    if NCCL_WORLD_SIZE <= 1 { return NCCL_OK }
+    let n = len(grad_ptrs)
+    if n != len(grad_counts) {
+        println("[nccl_ffi] reduce_scatter_layer_tensors — len mismatch ptrs="
+                + str(n) + " counts=" + str(len(grad_counts)))
+        return -2
+    }
+    let mut i = 0
+    while i < n {
+        let ptr = grad_ptrs[i]
+        let cnt = grad_counts[i]
+        // SUM across ranks; rank == owner ends with the same valid grad
+        // as everyone else (dense path). For true reduce-scatter, see
+        // hxnccl_reduce_scatter_f32 (B2 sharded-grad).
+        let rc = hxnccl_allreduce_f32(ptr, cnt, NCCL_OP_SUM)
+        if rc != 0 {
+            println("[nccl_ffi] reduce_scatter_layer_tensors — tensor "
+                    + str(i) + " of layer " + str(layer_id)
+                    + " rc=" + str(rc))
+            return rc
+        }
+        i = i + 1
+    }
+    let _ = owner    // owner kept in signature for parity + future sharded path
+    return NCCL_OK
+}
+
+// Back-compat shim — preserved so existing fsdp_shard.hexa call sites
+// (which only pass owner+layer+0) keep returning NCCL_TODO_RC for
+// world>1; trainer treats that as "use new array surface".
 fn nccl_reduce_scatter_layer(owner: int, layer_id: int, _unused: int) -> int {
     if NCCL_WORLD_SIZE <= 1 { return NCCL_OK }
-    println("[nccl_ffi] nccl_reduce_scatter_layer — B2 TODO: owner=" + str(owner)
-            + " layer=" + str(layer_id))
+    println("[nccl_ffi] nccl_reduce_scatter_layer — legacy stub (use _tensors): owner="
+            + str(owner) + " layer=" + str(layer_id))
     return NCCL_TODO_RC
 }
 
 // ───────────────────────────────────────────────────────────────
 //  nccl_all_reduce_loss — sum the scalar loss across ranks for
-//  step-level logging consistency. Single-rank no-op; multi-rank
-//  requires a device-side f32 buffer holding the loss scalar +
-//  hxnccl_allreduce_f32(buf, 1, AVG). Caller is responsible for
-//  H2D copy of `local_loss` and D2H readback into the returned
-//  float — the bare hexa wrapper here cannot dereference a device
-//  pointer, so for now multi-rank just logs + returns the local
-//  loss; the proper loss-sync wire is part of B2.
+//  step-level logging consistency. Single-rank no-op.
+//
+//  B2 wire (2026-04-20): the caller stages the local loss into a
+//  device-side 1-element f32 buffer (via cuda_ffi.cuda_memcpy_h2d
+//  on a pre-allocated 4-byte device buffer) and passes that
+//  pointer here; we run hxnccl_allreduce_f32 with op AVG, then
+//  the caller D2H-copies the result back. Because a hexa float
+//  cannot directly back a device pointer at this boundary, the
+//  scalar version below stays a logging stub — wire the real
+//  device-pointer flow at the call site (train_alm_lora step
+//  block) once per-step loss aggregation is needed.
 // ───────────────────────────────────────────────────────────────
 
 fn nccl_all_reduce_loss(local_loss: float) -> float {
     if NCCL_WORLD_SIZE <= 1 { return local_loss }
-    println("[nccl_ffi] nccl_all_reduce_loss — B2 TODO: returning local")
+    println("[nccl_ffi] nccl_all_reduce_loss — scalar overload returns local; "
+            + "use device-pointer flow for true sync")
     return local_loss
+}
+
+// nccl_all_reduce_loss_dev — device-pointer overload. Caller stages
+// `local_loss` into `loss_dev_ptr` (4 bytes), invokes us, and reads
+// the value back D2H. world_size==1: no-op (caller's stage value is
+// the answer). world_size>1: ncclAllReduce AVG on a 1-element f32.
+fn nccl_all_reduce_loss_dev(loss_dev_ptr: int) -> int {
+    if NCCL_WORLD_SIZE <= 1 { return NCCL_OK }
+    return hxnccl_allreduce_f32(loss_dev_ptr, 1, NCCL_OP_AVG)
 }

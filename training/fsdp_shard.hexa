@@ -301,25 +301,27 @@ fn fsdp_all_gather_params(state: FsdpState, weights: GpuWeights, layer_id: int) 
         return 0  // single-rank: no-op, weights.layers[layer_id] already valid
     }
     // Multi-rank: broadcast each tensor in the GpuLayer from the owner.
+    //
+    // B2 wire (2026-04-20): build the 8 (ptr, count) tuples expected by
+    // nccl_broadcast_layer_tensors. The OWNER's device pointers are the
+    // source; non-owner ranks must have already allocated matching
+    // buffers and stashed them back into weights.layers[layer_id] (via
+    // alloc_layer in gpu_train) so each rank's pointer is valid before
+    // the call. The non-owner allocation is cheap relative to the
+    // broadcast itself (8 cuda_malloc per layer per step) and lives in
+    // the trainer step block, not here.
     let owner = fsdp_owner_of_layer(state.nl, state.world_size, layer_id)
     let cfg   = weights.cfg
     let D     = cfg.D
     let FF    = cfg.FF
+    let layer = weights.layers[layer_id]
 
-    // The owner already has the device pointers populated in
-    // weights.layers[layer_id]. Non-owner ranks must allocate
-    // matching buffers BEFORE the broadcast call; we cannot mutate
-    // the input struct in place because hexa lists are PBV
-    // (feedback_hexa_lists_pbv.md). The call site is responsible
-    // for swapping the gathered pointers back into a fresh
-    // GpuWeights struct — see the `gathered_layer` design note in
-    // training/fsdp_shard_design.md.
-    //
-    // For the smoke test (world_size==1) the early return above
-    // means this branch is never executed. The error code below
-    // is what a multi-rank launch would see today.
-    let _ = nccl_broadcast_layer(owner, layer_id, D, FF)
-    return NCCL_TODO_RC
+    let ptrs = [layer.Wq, layer.Wk, layer.Wv, layer.Wo,
+                layer.Wff1, layer.Wff2, layer.ga, layer.gf]
+    let counts = [D * D, D * D, D * D, D * D,
+                  D * FF, FF * D, D, D]
+
+    return nccl_broadcast_layer_tensors(owner, layer_id, ptrs, counts)
 }
 
 // fsdp_free_gathered_layer — release temporary buffers allocated
@@ -356,11 +358,27 @@ fn fsdp_reduce_scatter_grads(state: FsdpState, grad: GpuGrad, layer_id: int) -> 
     if state.world_size <= 1 {
         return 0  // single-rank: local grad is already the full grad
     }
-    // Multi-rank: reduce each tensor in the GpuLayerGrad to the owner.
+    // Multi-rank: reduce each grad tensor across ranks. We use the
+    // dense-grad path (in-place ncclAllReduce SUM) so every rank ends
+    // with the same valid grad — matches the LoRA dense-grad pattern in
+    // train_alm_lora.hexa where every rank holds the full adapter.
+    //
+    // For true ZeRO-3 sharded grads (only owner ends with the reduced
+    // grad), call hxnccl_reduce_scatter_f32 directly with a SEND of
+    // world*count and RECV of count per tensor (separate alloc on the
+    // owner side). Out of scope for r12; LoRA replication is fine.
     let owner = fsdp_owner_of_layer(state.nl, state.world_size, layer_id)
-    let cfg_d = 0  // dimensions are encoded in the grad layout, not used by the stub
-    let _ = nccl_reduce_scatter_layer(owner, layer_id, cfg_d)
-    return NCCL_TODO_RC
+    let cfg   = grad.cfg
+    let D     = cfg.D
+    let FF    = cfg.FF
+    let g     = grad.layers[layer_id]
+
+    let ptrs = [g.dWq, g.dWk, g.dWv, g.dWo,
+                g.dWff1, g.dWff2, g.dga, g.dgf]
+    let counts = [D * D, D * D, D * D, D * D,
+                  D * FF, FF * D, D, D]
+
+    return nccl_reduce_scatter_layer_tensors(owner, layer_id, ptrs, counts)
 }
 
 // fsdp_free_grad_layer — drop a non-owned layer's local grad
