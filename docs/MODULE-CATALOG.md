@@ -1,6 +1,21 @@
 # Anima Module Catalog (128+ modules)
 
-## Summary
+> ⚠️ **STALE — last refresh 2026-04-12, before R37/AN13 total `.py` prohibition (2026-04-18) and Mk.V.1 promotion (2026-04-19).**
+>
+> **Every row below citing a `.py` file is invalid under R37.** Modules have been ported to `.hexa`. This catalog is kept for navigational history only.
+>
+> **Authoritative sources (use instead)**:
+> - Filesystem: `anima/modules/**/*.hexa`, `training/*.hexa`, `anima-speak/**/*.hexa`, `anima-*/` subprojects
+> - Hub registry: `anima/modules/core/hub.hexa` (single source of truth for hub-registered modules)
+> - Laws/Ψ: `shared/consciousness/consciousness_laws.json` v7.3
+> - Foundation: [MK5-DELTA0-ABSOLUTE.md](MK5-DELTA0-ABSOLUTE.md)
+> - Spec: [conscious-lm-spec.md](conscious-lm-spec.md)
+>
+> Planned action: full rewrite from `anima/modules/` filesystem scan, .py refs purged. Tracked separately.
+
+---
+
+## Summary (2026-04-12 snapshot)
 
 Total: 136 hexa-native modules (legacy Python+Rust fully absorbed)
 Hub: core/hub.hexa (39 registered, 8 invocation methods: act/cmd/pipe/on/emit/schedule/modules/status)

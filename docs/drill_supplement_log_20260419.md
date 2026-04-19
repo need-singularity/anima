@@ -133,3 +133,22 @@ Budget: 4h OR 40 iterations. Per-drill timeout: 20 min.
 - absorptions: 0
 - atoms: []
 - first_line: `{"nexus_cli":"0.2.0","subcmd":"drill","result":"🛸 nexus drill — seed='anima-physics ESP32 / FPGA / 양자 substrate saturati`
+
+## Iter 19 — anima_body — anima-body 로봇 / HW 체화 saturation
+- status: OK  rc=0  duration=726s  size=    3583B
+- rounds: 0/8
+- absorptions: 0
+- atoms: []
+- first_line: `{"nexus_cli":"0.2.0","subcmd":"drill","result":"🛸 nexus drill — seed='anima-body 로봇 / HW 체화 saturation', max_rounds=8\n `
+
+## Iter 20 — anima_hexad — anima-hexad CDESM 헥사곤 의식 모델 saturation
+- status: ERROR(137)  rc=137  duration=244s  size=       0B
+- rounds: 0/8
+- absorptions: 0
+- atoms: []
+
+## Iter 21 — anima_engines — anima-engines 양자 / 광자 / 멤리스터 / 오실레이터 saturation
+- status: OK  rc=0  duration=257s  size=       0B
+- rounds: 0/8
+- absorptions: 0
+- atoms: []
