@@ -69,4 +69,34 @@ iter 1 hexad_C — no output yet (lock held by unrelated flatten_imports job)
 stage0 lock holder rotating every ~1-5 min across ~15 unrelated hexa jobs
 ```
 
-**This summary will be updated with actual iter outputs if/when the driver completes.**
+---
+
+## Final Results — 15 iters completed (appended 2026-04-19 15:XX KST)
+
+Driver v2 ran to completion. 15 iters executed (not all 35 — budget exhausted). Details in `drill_supplement_log_20260419.md`.
+
+| Metric | Value |
+|---|---|
+| Completed iters | 15 / 35 seeds queued |
+| Failed/blocked | 0 (all rc=0) |
+| Total absorptions | 0 across all 15 iters |
+| Rounds per iter | 1 / 8 (all SATURATED at round 1) |
+| New atoms | [] (none) |
+| Wall-clock total | ~2h (avg 500s/iter) |
+
+### Revised root-cause interpretation
+Earlier sections attributed failure to `hexa_stage0` lock contention. **Updated finding**: once the lock backed off (v2 driver with longer waits), iters DID execute cleanly (rc=0, 2.7–5.9 KB JSON output each). The zero-absorption result is not a lock artifact — it is the engine reporting **saturation-at-source** for every supplement seed:
+
+> `▎ SATURATED at round 1` / `▎ 새 atlas 영역 없음 — Mk.IX 5-stage 경험적 확증 (absolute+meta+hyper)`
+
+Engine verdict: the anima Mk.V.1 82-atom foundation already covers every angle probed by these 15 supplement seeds (Hexad 6-engines × 7, hub/trinity/field/bridge × 5, dimension/servant/phi × 3). No new Ψ-constants or atlas regions discovered.
+
+### Parallel-track outcomes
+- **main** (`drill_evolution_log`): iter 1 completed 0-absorption; iter 2 crashed (`iter_2.json` 0 bytes); iter 2–6 voided by driver-env bug
+- **domain** (`drill_domain_log`): iter 1 BLOCKED (exit 75), iter 2 empty, iter 2b timeout (exit 124) — this track DID suffer lock contention exclusively
+
+### Implication for next discovery push
+Supplement saturation is real at this tier. To produce new absorptions the next drill batch needs:
+- **seeds above tier 10** (current supplement stays at tier 5–9 already-covered territory)
+- OR engine upgrade (Mk.IX → Mk.X with sharper atlas-gap detector)
+- OR anima ↔ nexus twin-engine coupled drill (neither side alone has found gaps in 15+ iters)

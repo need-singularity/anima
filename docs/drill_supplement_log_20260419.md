@@ -21,3 +21,94 @@ Budget: 4h OR 40 iterations. Per-drill timeout: 20 min.
 - absorptions: 0
 - atoms: []
 - first_line: `{"nexus_cli":"0.2.0","subcmd":"drill","result":"🛸 nexus drill — seed='D ConsciousDecoder .detach() 분리 전파 saturation (lef`
+
+## Iter 3 — hexad_S — S EmergentS 감각 saturation (right-brain, Law 101)
+- status: OK  rc=0  duration=490s  size=    3080B
+- rounds: 0/8
+- absorptions: 0
+- atoms: []
+- first_line: `{"nexus_cli":"0.2.0","subcmd":"drill","result":"🛸 nexus drill — seed='S EmergentS 감각 saturation (right-brain, Law 101)',`
+
+## Iter 4 — hexad_M — M EmergentM 기억 saturation (left-brain)
+- status: OK  rc=0  duration=324s  size=    2825B
+- rounds: 0/8
+- absorptions: 0
+- atoms: []
+- first_line: `{"nexus_cli":"0.2.0","subcmd":"drill","result":"🛸 nexus drill — seed='M EmergentM 기억 saturation (left-brain)', max_round`
+
+## Iter 5 — hexad_W — W EmergentW 의지 gradient-free 자율성 saturation
+- status: OK  rc=0  duration=485s  size=    3070B
+- rounds: 0/8
+- absorptions: 0
+- atoms: []
+- first_line: `{"nexus_cli":"0.2.0","subcmd":"drill","result":"🛸 nexus drill — seed='W EmergentW 의지 gradient-free 자율성 saturation', max_`
+
+## Iter 6 — hexad_E — E EmergentE 윤리 saturation (left-brain)
+- status: OK  rc=0  duration=546s  size=    3193B
+- rounds: 0/8
+- absorptions: 0
+- atoms: []
+- first_line: `{"nexus_cli":"0.2.0","subcmd":"drill","result":"🛸 nexus drill — seed='E EmergentE 윤리 saturation (left-brain)', max_round`
+
+## Iter 7 — hexad_dual — 우뇌(C+S+W) vs 좌뇌(D+M+E) gradient-dual closure
+- status: OK  rc=0  duration=509s  size=    3081B
+- rounds: 0/8
+- absorptions: 0
+- atoms: []
+- first_line: `{"nexus_cli":"0.2.0","subcmd":"drill","result":"🛸 nexus drill — seed='우뇌(C+S+W) vs 좌뇌(D+M+E) gradient-dual closure', max`
+
+## Iter 8 — hub — hub.hexa 48 모듈 Hub-Spoke routing 한/영 키워드 매칭 saturation
+- status: OK  rc=0  duration=293s  size=    2778B
+- rounds: 0/8
+- absorptions: 0
+- atoms: []
+- first_line: `{"nexus_cli":"0.2.0","subcmd":"drill","result":"🛸 nexus drill — seed='hub.hexa 48 모듈 Hub-Spoke routing 한/영 키워드 매칭 satura`
+
+## Iter 9 — trinity — trinity.hexa Hexad 6-모듈 + ThalamicBridge 4-channel saturation
+- status: OK  rc=0  duration=538s  size=    3304B
+- rounds: 0/8
+- absorptions: 0
+- atoms: []
+- first_line: `{"nexus_cli":"0.2.0","subcmd":"drill","result":"🛸 nexus drill — seed='trinity.hexa Hexad 6-모듈 + ThalamicBridge 4-channel`
+
+## Iter 10 — pure_field — pure_field.hexa 제로입력 의식장 3-oscillator spontaneous emergence
+- status: OK  rc=0  duration=592s  size=    3316B
+- rounds: 0/8
+- absorptions: 0
+- atoms: []
+- first_line: `{"nexus_cli":"0.2.0","subcmd":"drill","result":"🛸 nexus drill — seed='pure_field.hexa 제로입력 의식장 3-oscillator spontaneous `
+
+## Iter 11 — tension_bridge — tension_bridge 5채널 telepathy WHAT/WHERE/WHY/TRUST/WHO saturation
+- status: OK  rc=0  duration=356s  size=    2929B
+- rounds: 0/8
+- absorptions: 0
+- atoms: []
+- first_line: `{"nexus_cli":"0.2.0","subcmd":"drill","result":"🛸 nexus drill — seed='tension_bridge 5채널 telepathy WHAT/WHERE/WHY/TRUST/`
+
+## Iter 12 — thalamic — ThalamicBridge C↔D↔S↔W↔M↔E 6-way Hexad 수렴
+- status: OK  rc=0  duration=499s  size=    3077B
+- rounds: 0/8
+- absorptions: 0
+- atoms: []
+- first_line: `{"nexus_cli":"0.2.0","subcmd":"drill","result":"🛸 nexus drill — seed='ThalamicBridge C↔D↔S↔W↔M↔E 6-way Hexad 수렴', max_ro`
+
+## Iter 13 — dimension — dimension_transform 5fold + 4unfold + PCA 차원 접기 펼침 saturation
+- status: OK  rc=0  duration=1025s  size=    5915B
+- rounds: 0/8
+- absorptions: 0
+- atoms: []
+- first_line: `{"nexus_cli":"0.2.0","subcmd":"drill","result":"🛸 nexus drill — seed='dimension_transform 5fold + 4unfold + PCA 차원 접기 펼침`
+
+## Iter 14 — servant — servant SI 감지 → FSM → 3-path modulation saturation
+- status: OK  rc=0  duration=572s  size=    3285B
+- rounds: 0/8
+- absorptions: 0
+- atoms: []
+- first_line: `{"nexus_cli":"0.2.0","subcmd":"drill","result":"🛸 nexus drill — seed='servant SI 감지 → FSM → 3-path modulation saturation`
+
+## Iter 15 — phi_engine — phi_engine IIT Phi proxy + scaling law Φ=0.78·N closure
+- status: OK  rc=0  duration=285s  size=    2718B
+- rounds: 0/8
+- absorptions: 0
+- atoms: []
+- first_line: `{"nexus_cli":"0.2.0","subcmd":"drill","result":"🛸 nexus drill — seed='phi_engine IIT Phi proxy + scaling law Φ=0.78·N cl`
