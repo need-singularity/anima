@@ -9,6 +9,7 @@ ref:
   atlas     ATLAS.md                             프로젝트 지도
   hypo-idx  hypotheses/A-Z-overview.md           가설 인덱스
   mod-cat   MODULE-CATALOG.md                    모듈 카탈로그
+  sweep-40  docs/sweep_40.json                   SWEEP P4 13-도메인 78-iter SSOT (aka SWEEP-40/P4/sweep_p4)
 
 exec:
   HEXA=$HEXA_LANG/target/release/hexa
