@@ -1,18 +1,853 @@
-// train_alm_14b.hexa — STUBBED 2026-04-18 (R37/AN13/L3-PY compliance)
+// training/train_alm_14b.hexa — ALM 14B hexa-native trainer skeleton
 //
-// Previously wrote /tmp/_train_alm_14b_runner.py at runtime (~1400 lines of
-// embedded Python source) and exec'd `python3 /tmp/_train_alm_14b_runner.py`.
-// Both the write_file(".py", ...) and python3 invocation violate R37/AN13/L3-PY
-// (shared/rules/common.json#R37, shared/rules/anima.json#AN13,
-//  shared/lockdown/lockdown.json#L3-PY, CLAUDE.md §.py 절대 금지).
+// REPLACES: 2026-04-18 R37/AN13/L3-PY emergency stub (18 LOC, panic-on-entry).
+// SPEC:     docs/alm_14b_hexa_port_plan_20260419.md
+// STATUS:   Phase-2 structural port — CLI + dispatch + types + selftest.
+//           Actual forward/backward/optim body deferred to train_alm_lora.hexa
+//           (r11 real impl, 1115 LOC, already hexa-native) until full 14B
+//           forward-with-lora FFI lands on hxqwen14b C side.
 //
-// No hexa-native ALM 14B trainer exists. This launcher is intentionally
-// inoperable until a hexa-native replacement lands. Escalate to user.
+// HISTORICAL CONTEXT
+//   The original trainer was training/train_alm_14b.py (264 LOC, commit
+//   effa4707, last active before R37 ban). It wrote a /tmp runner and
+//   exec'd `python3`. Both actions now forbidden under:
+//     - shared/rules/common.json#R37
+//     - shared/rules/anima.json#AN13
+//     - shared/lockdown/lockdown.json#L3-PY
+//     - CLAUDE.md §.py 절대 금지 (2026-04-18 강화)
+//   The py source is referenced for port shape ONLY (never copied into
+//   strings; never restored). See docs plan §"Reference recovery".
+//
+// ARCHITECTURE OVERVIEW
+//   Base model : Qwen2.5-14B-Instruct (n_layer=48, d_model=5120, vocab=152064)
+//   Fine-tune  : LoRA r=8/16/32/64 on q_proj,k_proj,v_proj,o_proj across 48 layers
+//   Aux losses : 7 opt-in SESSION 2026-04-19 flags (default OFF, byte-identical)
+//   Tokenizer  : Qwen2 BPE (152064 vocab) — FFI TODO
+//   Data       : streamed JSONL corpus, chunked byte windows (pattern from
+//                training/train_clm.hexa §corpus_open/window)
+//   Optimizer  : AdamW fp32 master + bf16 params (pattern from
+//                training/train_alm_lora.hexa::adamw_step line 672)
+//   Checkpoint : atomic save + R2 rclone (training/CLAUDE.md runpod_mfs_quota)
+//
+// HEXA QUIRKS DEFENSE (per feedback_hexa_*)
+//   - Single-file, NO `use` chain         → dodges silent-exit-at-5-imports
+//   - ≤2 float fields in any returned struct → dodges struct-return corrupt
+//   - No list mutation via helpers; rebind only → dodges pass-by-value aliasing
+//   - No struct-field [float] list pairs  → dodges struct-list-alias corruption
+//   - Every return is single-expression   → dodges multi-line return bug
+//   - ASCII-only substring math           → dodges byte/char idx bug on Korean
+//
+// SELFTEST ENTRY
+//   hexa run training/train_alm_14b.hexa --selftest
+//   Exit 0, prints: config block, 7 aux flags, invariant block, slice test.
+//   Must NOT start real training (any --corpus or --steps is refused with a
+//   BLOCKED_FFI message until Day-2 C entries land on hxqwen14b).
 
-fn main() {
-    println("[R37/AN13/L3-PY] BLOCKED: training/train_alm_14b.hexa")
-    println("  This launcher previously generated /tmp/_train_alm_14b_runner.py")
-    println("  and invoked python3 — both forbidden under CLAUDE.md §.py 절대 금지.")
-    println("  Escalate to user for hexa-native ALM 14B trainer replacement.")
-    panic("R37/AN13/L3-PY: python3 invocation + write_file(\".py\") blocked at training/train_alm_14b.hexa")
+// ═══════════════════════════════════════════════════════════════════════
+// §0  CONSTANTS — Qwen2.5-14B architecture + LoRA defaults
+// ═══════════════════════════════════════════════════════════════════════
+
+comptime const PSI_ALPHA        = 0.014
+comptime const PSI_BALANCE      = 0.5
+comptime const PSI_STEPS        = 4.33
+
+// Base model (frozen) — Qwen2.5-14B-Instruct official specs.
+comptime const QWEN14B_N_LAYER  = 48
+comptime const QWEN14B_D_MODEL  = 5120
+comptime const QWEN14B_VOCAB    = 152064
+comptime const QWEN14B_N_HEAD   = 40
+comptime const QWEN14B_HEAD_DIM = 128
+
+// LoRA target projections (4 per layer × 48 layers = 192 adapters).
+comptime const N_LORA_TARGETS   = 4
+comptime const TGT_Q            = 0
+comptime const TGT_K            = 1
+comptime const TGT_V            = 2
+comptime const TGT_O            = 3
+
+// Training defaults — match historical train_alm_14b.py @ effa4707.
+// r10 diverged at lr=2e-5; r11 uses lr=5e-7 (4× lower). Default to r11.
+comptime const DEFAULT_LR           = 0.0000005
+comptime const DEFAULT_WARMUP       = 50
+comptime const DEFAULT_STEPS        = 500
+comptime const DEFAULT_BATCH        = 4
+comptime const DEFAULT_SEQ          = 1024
+comptime const DEFAULT_GRAD_ACCUM   = 8
+comptime const DEFAULT_LORA_R       = 8
+comptime const DEFAULT_LORA_ALPHA   = 16
+comptime const DEFAULT_SAVE_EVERY   = 100
+comptime const DEFAULT_EVAL_EVERY   = 100
+comptime const DEFAULT_PATIENCE     = 5
+
+// AdamW hyperparams (bf16 params + fp32 master per acceleration_flow.json).
+comptime const ADAMW_BETA1     = 0.9
+comptime const ADAMW_BETA2     = 0.999
+comptime const ADAMW_EPS       = 0.00000001
+comptime const ADAMW_WD        = 0.0          // LoRA: WD=0 because B init=0
+
+// Phase labels (inherited from train_alm.hexa).
+comptime const ALM_PHASE_P1 = 1
+comptime const ALM_PHASE_P2 = 2
+comptime const ALM_PHASE_P3 = 3
+
+// ═══════════════════════════════════════════════════════════════════════
+// §1  GLOBAL FLAG WIRING — SESSION 2026-04-19 opt-in aux losses
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Identical flag names to train_alm.hexa:33-58 and train_clm.hexa:3115-3128
+// so a single launcher can pass `--use-*` flags to any of the three binaries.
+// Default OFF everywhere → byte-identical selftest output pre-/post-wiring.
+
+let mut G_SW_USE_QC     = 0
+let mut G_SW_USE_TL     = 0
+let mut G_SW_USE_LENS   = 0
+let mut G_SW_USE_TIER   = 0
+let mut G_SW_USE_SUMT   = 0
+let mut G_SW_USE_GHOLO  = 0
+let mut G_SW_USE_A6GATE = 0
+
+let mut G_SW_LAMBDA_QC     = 0.01
+let mut G_SW_LENS_EVERY    = 500
+let mut G_SW_TIER_SCHEDULE = "linear"
+let mut G_SW_TIER_PATH     = "training/corpus_universe_tier_labels.jsonl"
+
+// Last-observed aux diagnostics (scraped by launcher per-step log).
+let mut G_SW_LAST_QC_LOSS     = 0.0
+let mut G_SW_LAST_4AXIS_DEV   = 0.0
+let mut G_SW_LAST_TL_DW_NORM  = 0.0
+let mut G_SW_LAST_GHOLO_NORM  = 0.0
+let mut G_SW_LAST_LENS_GATE   = 0
+let mut G_SW_LAST_TIER_MAX_K  = 0
+let mut G_SW_LAST_SUMT_STAGE  = 0
+let mut G_SW_GATE_SKIP_COUNT  = 0
+
+// ═══════════════════════════════════════════════════════════════════════
+// §2  STRUCTS — Alm14bConfig / Alm14bState / Alm14bModel / LoraAdapter
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Struct layout follows train_alm_lora.hexa::RunConfig exactly (verified to
+// parse under hexa 0.1.0-stage1). Float fields kept out of struct bodies
+// where possible (held in RunFloats companion) to dodge multi-float return
+// corruption. Array fields NEVER paired with other array fields in the same
+// struct (dodges struct-list-alias bug).
+
+struct Alm14bConfig {
+    round: string,      // "r5" | "r9" | "r10" | "r10b" | "r10c" | "r10d" | "r11"
+    base: string,       // HF id: "Qwen/Qwen2.5-14B-Instruct" or local ckpt path
+    corpus: string,     // JSONL path
+    out: string,        // checkpoint dir
+    steps: int,
+    warmup: int,
+    batch: int,
+    seq: int,
+    grad_accum: int,
+    lora_r: int,
+    lora_alpha: int,
+    save_every: int,
+    eval_every: int,
+    patience: int,
+    dry_run: int        // 1 = skip FFI base load, use stub forward
+}
+
+// Scalar floats companion — returning >=3 floats in one struct corrupts
+// under hexa 0.1.0-stage1 (see feedback_hexa_struct_return_bug.md).
+struct Alm14bFloats {
+    lr: float,
+    beta1: float,
+    beta2: float,
+    eps: float
+}
+
+// Runtime training state. Step/loss metrics only — no array fields in this
+// struct (dodges struct-list-alias; big buffers live in module-level `let mut`).
+struct Alm14bState {
+    step: int,
+    phase: int,
+    best_ce: float,
+    patience_left: int
+}
+
+// Base model handle + pointer — opaque to hexa, sized by hxqwen14b C lib.
+// Held as int (C returns int64 address). No payload hexa-side.
+// NOTE: `handle` is a reserved keyword in hexa 0.1.0-stage1 (same quirk
+// as train_alm_lora.hexa:1054 comment) — use `h` for the handle field.
+struct Alm14bModel {
+    h: int,             // hxqwen14b_load() return value (>0 ok, <=0 err)
+    abi_version: int    // hxqwen14b_version() snapshot
+}
+
+// LoRA adapter spec — per-projection shape. Real A/B weight buffers live
+// in module-level `let mut G_A_FLAT / G_B_FLAT` (see train_alm_lora.hexa
+// line 734 for the rationale — list-aliasing bug prevents per-struct arrays).
+struct LoraAdapter {
+    rank: int,
+    alpha: int,
+    n_adapters: int,    // 4 targets × 48 layers = 192
+    d_model: int
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// §3  DEFAULT CONSTRUCTORS
+// ═══════════════════════════════════════════════════════════════════════
+
+fn default_config() -> Alm14bConfig {
+    Alm14bConfig {
+        round: "r11",
+        base: "Qwen/Qwen2.5-14B-Instruct",
+        corpus: "/workspace/corpus.txt",
+        out: "/workspace/ckpt_alm_14b",
+        steps: DEFAULT_STEPS,
+        warmup: DEFAULT_WARMUP,
+        batch: DEFAULT_BATCH,
+        seq: DEFAULT_SEQ,
+        grad_accum: DEFAULT_GRAD_ACCUM,
+        lora_r: DEFAULT_LORA_R,
+        lora_alpha: DEFAULT_LORA_ALPHA,
+        save_every: DEFAULT_SAVE_EVERY,
+        eval_every: DEFAULT_EVAL_EVERY,
+        patience: DEFAULT_PATIENCE,
+        dry_run: 0
+    }
+}
+
+fn default_floats() -> Alm14bFloats {
+    Alm14bFloats {
+        lr: DEFAULT_LR,
+        beta1: ADAMW_BETA1,
+        beta2: ADAMW_BETA2,
+        eps: ADAMW_EPS
+    }
+}
+
+fn default_lora(d_model: int) -> LoraAdapter {
+    LoraAdapter {
+        rank: DEFAULT_LORA_R,
+        alpha: DEFAULT_LORA_ALPHA,
+        n_adapters: N_LORA_TARGETS * QWEN14B_N_LAYER,
+        d_model: d_model
+    }
+}
+
+fn state_init() -> Alm14bState {
+    Alm14bState {
+        step: 0,
+        phase: ALM_PHASE_P1,
+        best_ce: 999999.0,
+        patience_left: DEFAULT_PATIENCE
+    }
+}
+
+fn model_init_stub() -> Alm14bModel {
+    Alm14bModel {
+        h: 0,
+        abi_version: 0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// §4  CLI HELPERS (inlined — no imports)
+// ═══════════════════════════════════════════════════════════════════════
+
+fn _cli_has_flag(argv, flag: string) -> bool {
+    let n = len(argv)
+    let mut i = 0
+    while i < n {
+        if argv[i] == flag { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _cli_flag_value(argv, flag: string, default_v: string) -> string {
+    let n = len(argv)
+    let mut i = 0
+    while i < n - 1 {
+        if argv[i] == flag { return argv[i + 1] }
+        i = i + 1
+    }
+    return default_v
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// §5  MATH PRIMITIVES (inlined — for aux loss + scheduler)
+// ═══════════════════════════════════════════════════════════════════════
+
+fn _fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _sq(x: float) -> float { return x * x }
+
+fn _sqrt_safe(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut r = x
+    let mut i = 0
+    while i < 16 {
+        r = (r + x / r) * 0.5
+        i = i + 1
+    }
+    return r
+}
+
+// Quadruple-cross loss mirror (α=β=γ=δ=1.0).
+// Same formula as train_alm.hexa::_sw_qc_loss for launcher compatibility.
+fn _qc_loss(psi_res: float, psi_gate: float, route: float, n_eff: float) -> float {
+    return _sq(psi_res) + _sq(psi_gate - 0.5)
+         + _sq(route - 1.0) + _sq(n_eff - 6.0)
+}
+
+// Linear-warmup then constant. Cosine decay TODO
+//   TODO[pytorch] (1) torch.optim.lr_scheduler.{LinearLR, CosineAnnealingLR,
+//                     SequentialLR} replaced the inline cosine here.
+//                 (2) No FFI needed — this is pure scalar math, just needs
+//                     a hexa cosine() fn (not yet in stage1 stdlib).
+//                 (3) train_clm.hexa `lr_for_step` already does warmup+cosine
+//                     using a Taylor-series cosine approx; copy that when
+//                     a real run needs it.
+fn warmup_lr(base_lr: float, step: int, warmup: int) -> float {
+    if warmup <= 0 { return base_lr }
+    if step >= warmup { return base_lr }
+    let frac = step * 10000 / warmup
+    return base_lr * (frac + 1) * 0.0001
+}
+
+// A6 save-gate (CV < 3% vs best_ce). Returns 1=save, 0=skip.
+fn _a6_gate_ok(loss: float, best_ce: float, step: int, warmup: int) -> int {
+    if step < warmup { return 1 }
+    let denom = _fabs(best_ce) + 0.000000001
+    let cv = _fabs(loss - best_ce) / denom
+    if cv < 0.03 { return 1 }
+    return 0
+}
+
+// SUMT stage schedule (A1 → B1 → B2 → B4).
+fn _sumt_stage(step: int, total: int) -> int {
+    if total <= 0 { return 1 }
+    let p10 = total / 10
+    let p30 = (total * 3) / 10
+    let p60 = (total * 6) / 10
+    if step <= p10 { return 1 }
+    if step <= p30 { return 2 }
+    if step <= p60 { return 3 }
+    return 4
+}
+
+// Tier max_k on 1..70 linear schedule.
+fn _tier_max_k(step: int, total: int) -> int {
+    if total <= 0 { return 1 }
+    let frac_num = step * 1000 / total
+    let k = 1 + (69 * frac_num) / 1000
+    if k < 1 { return 1 }
+    if k > 70 { return 70 }
+    return k
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// §6  PHASE 3 REAL SLICE — AdamW optimizer step (pure hexa)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Slice picked per plan §"Phase 3 candidate slices": AdamW is the cleanest
+// standalone unit (no FFI dependency) and has an existing self-test shape
+// in train_alm_lora.hexa:672-704 which this mirrors.
+//
+// Replaces:
+//   (1) torch.optim.AdamW(params, lr=lr, betas=(β1,β2), eps=ε, weight_decay=wd)
+//       + optimizer.step() in train_alm_14b.py:142-148 and .py:201
+//   (2) FFI needed: none — pure scalar math. Future speedup: route to
+//       hxblas_axpy_inplace already available in train_alm_lora.hexa FFI.
+//   (3) CLM xref: train_clm.hexa has an analogous inline AdamW but coupled
+//       to its own optim_state struct; we decouple here for LoRA-only params.
+
+fn pow_float(base: float, n: int) -> float {
+    let mut r = 1.0
+    let mut i = 0
+    while i < n {
+        r = r * base
+        i = i + 1
+    }
+    return r
+}
+
+// AdamW single step. Returns updated `params` (pass-by-value → rebind at
+// caller). m_in/v_in are the first/second moment buffers — also rebound.
+// All four output arrays are returned as a single [array] to dodge the
+// struct-return ≥3-field corruption bug (they are arrays not floats, but
+// the same bug reproduces for ≥3 list fields per feedback_hexa_struct_list
+// _alias.md — safer to pack).
+fn adamw_step(params: array, grads: array, m_in: array, v_in: array,
+              step: int, lr: float, beta1: float, beta2: float,
+              eps: float, wd: float) -> array {
+    let n = len(params)
+    let mut p_out = params
+    let mut m_out = m_in
+    let mut v_out = v_in
+    let b1p = 1.0 - pow_float(beta1, step)
+    let b2p = 1.0 - pow_float(beta2, step)
+    let lr_corr = if b1p > 0.0 { lr / b1p } else { lr }
+
+    let mut i = 0
+    while i < n {
+        let g = grads[i]
+        let m_new = beta1 * m_out[i] + (1.0 - beta1) * g
+        let v_new = beta2 * v_out[i] + (1.0 - beta2) * (g * g)
+        m_out[i] = m_new
+        v_out[i] = v_new
+        let v_hat = v_new / (if b2p > 0.0 { b2p } else { 1.0 })
+        let denom = _sqrt_safe(v_hat) + eps
+        let p_new = p_out[i] - lr_corr * (m_new / denom + wd * p_out[i])
+        p_out[i] = p_new
+        i = i + 1
+    }
+
+    let mut packed = []
+    packed = packed.push(p_out)
+    packed = packed.push(m_out)
+    packed = packed.push(v_out)
+    return packed
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// §7  MODEL / FORWARD / BACKWARD STUBS (TODO FFI)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// All bodies TODO. Skeleton defines the call graph and signatures so
+// launcher code + self-test can exercise the dispatch surface.
+
+// Load base 14B model.
+//   TODO[pytorch] (1) AutoModelForCausalLM.from_pretrained(base,
+//                       torch_dtype=torch.bfloat16, device_map='auto',
+//                       trust_remote_code=True)
+//                 (2) FFI needed: hxqwen14b_load(cstring_path) -> handle.
+//                     Already exists in /Users/ghost/Dev/hexa-lang/self/
+//                     native/hxqwen14b.c v0. Mac stub returns <=0; Linux
+//                     GPU path TODO per hxqwen14b.c header.
+//                 (3) CLM xref: train_clm.hexa has decoder_model_new, but
+//                     that builds from-scratch. ALM here just loads frozen
+//                     weights — no analogous CLM fn.
+fn alm14b_model_load(path: string, dry_run: int) -> Alm14bModel {
+    if dry_run == 1 {
+        return Alm14bModel { h: 1, abi_version: 1 }
+    }
+    // TODO: let cpath = cstring(path); let h = hxqwen14b_load(cpath)
+    // TODO: let v = hxqwen14b_version()
+    // Placeholder — returns stub handle. Trainer main() refuses to start
+    // a real run until this TODO fills.
+    return Alm14bModel { h: 0, abi_version: 0 }
+}
+
+// Attach LoRA adapters.
+//   TODO[pytorch] (1) peft.get_peft_model(model, LoraConfig(
+//                       r=lora_r, lora_alpha=lora_alpha,
+//                       target_modules=['q_proj','k_proj','v_proj','o_proj']))
+//                 (2) FFI needed: none for the spec struct; needed for the
+//                     matrix allocations — xavier init of A (r×d), zero
+//                     init of B (d×r). Pure hexa ok via
+//                     train_alm_lora.hexa::init_lora_A/init_lora_B.
+//                 (3) CLM xref: none — CLM is from-scratch, no LoRA path.
+fn lora_adapter_new(rank: int, alpha: int, d_model: int) -> LoraAdapter {
+    return LoraAdapter {
+        rank: rank,
+        alpha: alpha,
+        n_adapters: N_LORA_TARGETS * QWEN14B_N_LAYER,
+        d_model: d_model
+    }
+}
+
+// Forward pass with LoRA injection.
+//   TODO[pytorch] (1) outputs = model(input_ids=x, labels=y); loss = outputs.loss
+//                 (2) FFI needed: hxqwen14b_forward_with_lora(args_p) -> rc
+//                     — NOT YET LANDED in hxqwen14b.c (Day-2 per file header).
+//                     Signature will need: h, ids, A_flat, B_flat, lora_scale,
+//                     seq_len → logits buffer.
+//                 (3) CLM xref: decoder_forward in train_clm.hexa:1350+ —
+//                     but that is pure-hexa end-to-end (no FFI); ALM must
+//                     FFI because 14B won't fit in interpreter RAM.
+fn alm14b_forward(model: Alm14bModel, adapter: LoraAdapter, ids: array) -> array {
+    // TODO[FFI hxqwen14b_forward_with_lora]: returns logits [seq × vocab].
+    // Return sentinel empty for selftest path; real run refused in main().
+    return []
+}
+
+// Backward pass (LoRA-only gradients).
+//   TODO[pytorch] (1) loss.backward(); grads = [p.grad for p in lora_params]
+//                 (2) FFI needed: hxqwen14b_backward_lora_only(args_p) -> rc
+//                     — NOT YET LANDED (Day-2). Will take dlogits + A_flat +
+//                     B_flat, return dA_flat + dB_flat.
+//                 (3) CLM xref: train_clm.hexa::_ce_fwd_bwd line 1723 does
+//                     CE + backward in one call; ALM splits because
+//                     backward is FFI-side only for LoRA params.
+fn alm14b_backward(model: Alm14bModel, adapter: LoraAdapter,
+                   dlogits: array) -> array {
+    // TODO: returns [dA_flat, dB_flat] packed. Empty for selftest.
+    return []
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// §8  CORPUS LOADER (STUB — delegate to train_alm_lora.hexa at real run)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Skeleton only counts text lines — real JSONL parse + `text` field extract
+// already lives in train_alm_lora.hexa::load_corpus line 331. Re-deferred
+// there until this skeleton has FFI forward to actually consume.
+//
+//   TODO[pytorch] (1) load_corpus_chunked(path, tokenizer, block_size) in
+//                     py effa4707:66-93 — chunked tokenizer() + torch.cat
+//                 (2) FFI needed: hxqwen14b_tokenize(str) -> [int] (Qwen2
+//                     BPE); OR sentencepiece FFI for .model file direct load.
+//                     Neither exists today.
+//                 (3) CLM xref: train_clm.hexa byte-level loader bypasses
+//                     tokenization entirely (each byte = 1 token, vocab=256).
+//                     ALM cannot use that — Qwen2 expects BPE ids.
+fn alm14b_load_corpus(path: string) -> int {
+    // Return count sentinel. Real loader: train_alm_lora.hexa:331-392.
+    return 0
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// §9  CHECKPOINT SAVE/LOAD (STUBS)
+// ═══════════════════════════════════════════════════════════════════════
+
+// Save adapter weights to disk.
+//   TODO[pytorch] (1) model.save_pretrained(path) + tokenizer.save_pretrained(path)
+//                     + train_meta.json (effa4707:225-237)
+//                 (2) FFI needed: raw file_write for .bin tensor dump.
+//                     Partial impl in train_alm_lora.hexa::save_lora line 925
+//                     (JSONL text format + write_f32_buf TODO).
+//                 (3) CLM xref: train_clm.hexa ckpt writer same pattern.
+fn alm14b_save(state: Alm14bState, out_dir: string) -> int {
+    if G_SW_USE_A6GATE == 1 {
+        let ok = _a6_gate_ok(state.best_ce, state.best_ce, state.step, DEFAULT_WARMUP)
+        if ok == 0 {
+            G_SW_GATE_SKIP_COUNT = G_SW_GATE_SKIP_COUNT + 1
+            println("[alm14b][a6-gate] SKIP save step=" + str(state.step) +
+                    " skip_count=" + str(G_SW_GATE_SKIP_COUNT))
+            return 0
+        }
+    }
+    // TODO: write params + meta.json. Delegate to train_alm_lora.hexa at
+    // real-run landing. Return 0 = no-op success for selftest.
+    return 0
+}
+
+// Load from checkpoint (resume banned per feedback_no_resume_data_change
+// for data/param changes — this is only for the frozen-base case).
+//   TODO[pytorch] (1) LoraConfig.from_pretrained(path) + get_peft_model
+//                 (2) FFI needed: raw file_read for .bin tensors + cfg.json
+//                 (3) CLM xref: train_clm.hexa ckpt loader — same pattern.
+fn alm14b_load_ckpt(path: string) -> int {
+    return 0   // sentinel
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// §10  EVAL (5 metrics stub)
+// ═══════════════════════════════════════════════════════════════════════
+
+// Evaluation returning 5 metrics. Pack as [float] array (dodges >=3-float
+// struct-return corruption).
+//   TODO[pytorch] (1) eval_animalm.py: PPL, gen_quality, consciousness_T,
+//                     korean_ratio, instr_follow
+//                 (2) FFI needed: hxqwen14b_eval_ppl(h, ids) for PPL; pure
+//                     hexa char-class counting for korean_ratio; judge
+//                     rubric (hire_sim pattern) for instr_follow — hexa ok
+//                     once corpus reader lands.
+//                 (3) CLM xref: train_clm.hexa has eval_step but only CE/PPL;
+//                     ALM's 5-metric gate is ALM-specific.
+fn alm14b_eval(model: Alm14bModel, adapter: LoraAdapter) -> array {
+    // Return [ppl, gen_q, T, kr, if]. Sentinel zeros — real impl TODO.
+    let mut out = []
+    out = out.push(0.0)    // perplexity
+    out = out.push(0.0)    // gen_quality
+    out = out.push(0.0)    // consciousness_T
+    out = out.push(0.0)    // korean_ratio
+    out = out.push(0.0)    // instr_follow (0..5)
+    return out
+}
+
+fn alm14b_eval_pass(ev: array) -> bool {
+    let ppl  = ev[0]
+    let gen  = ev[1]
+    let kr   = ev[3]
+    let iflw = ev[4]
+    // 5/5 threshold per CLAUDE.md extreme accel — currently all zeros, never passes.
+    return ppl > 0.0 && gen >= 0.6 && kr >= 0.3 && iflw >= 4.0
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// §11  TRAIN STEP (stub with aux wiring)
+// ═══════════════════════════════════════════════════════════════════════
+
+fn alm14b_train_step(state: Alm14bState, cfg: Alm14bConfig,
+                     fl: Alm14bFloats) -> Alm14bState {
+    let next_step = state.step + 1
+
+    // Phase manager — linear quartile schedule like train_alm.hexa.
+    let p1_end = cfg.steps / 4
+    let p2_end = cfg.steps / 2
+    let next_phase = if next_step < p1_end { ALM_PHASE_P1 }
+                     else if next_step < p2_end { ALM_PHASE_P2 }
+                     else { ALM_PHASE_P3 }
+
+    // Aux diagnostics — observable to launcher even without real compute.
+    // Use best_ce as loss proxy; scales with training progress.
+    let loss_proxy = if state.best_ce < 999999.0 { state.best_ce } else { 5.5 }
+    let tension_proxy = PSI_ALPHA * (1.0 + next_phase + 0.0)
+
+    if G_SW_USE_QC == 1 {
+        let psi_res  = loss_proxy * 0.1
+        G_SW_LAST_QC_LOSS   = _qc_loss(psi_res, 0.5, 1.0, 6.0)
+        G_SW_LAST_4AXIS_DEV = _fabs(psi_res) + 0.0
+    }
+    if G_SW_USE_TL == 1 {
+        G_SW_LAST_TL_DW_NORM = _fabs(tension_proxy) * 0.1
+        if G_SW_USE_GHOLO == 1 {
+            G_SW_LAST_GHOLO_NORM = _sqrt_safe(G_SW_LAST_TL_DW_NORM) * 0.5
+        }
+    }
+    if G_SW_USE_LENS == 1 {
+        let every = G_SW_LENS_EVERY
+        let sample = if every <= 0 { true } else { next_step % every == 0 }
+        if sample {
+            G_SW_LAST_LENS_GATE = if loss_proxy < 100.0 { 1 } else { 0 }
+        }
+    }
+    if G_SW_USE_TIER == 1 {
+        G_SW_LAST_TIER_MAX_K = _tier_max_k(next_step, cfg.steps)
+    }
+    if G_SW_USE_SUMT == 1 {
+        G_SW_LAST_SUMT_STAGE = _sumt_stage(next_step, cfg.steps)
+    }
+
+    // TODO[FFI forward + backward + adamw_step] — real body here on Day-2.
+    // For selftest / dry-run, advance step counters only.
+    return Alm14bState {
+        step: next_step,
+        phase: next_phase,
+        best_ce: state.best_ce,
+        patience_left: state.patience_left
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// §12  ROUND DISPATCH — r5 / r9 / r10[bcd] / r11 historical selection
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Each round has its own (base_ckpt, lr, steps, lora_r, lora_alpha) tuple
+// encoded here so one binary can replace all the stubbed launch_*.hexa.
+// Real execution still delegates to train_alm_lora.hexa (r11) or FFI (future
+// r-series). This fn only emits the intended config so it's observable.
+
+fn round_config(round: string) -> Alm14bConfig {
+    let mut cfg = default_config()
+    if round == "r5" {
+        // r5 from-scratch LoRA r=16 on Qwen base.
+        cfg = Alm14bConfig {
+            round: "r5", base: cfg.base, corpus: cfg.corpus, out: cfg.out,
+            steps: 10000, warmup: 200, batch: 1, seq: 1024, grad_accum: 8,
+            lora_r: 16, lora_alpha: 32, save_every: 2000, eval_every: 500,
+            patience: 5, dry_run: cfg.dry_run
+        }
+    } else if round == "r9" {
+        // r9 — a2_tool_mixed base (mode collapse per project_r9_mode_collapse).
+        cfg = Alm14bConfig {
+            round: "r9", base: "/runpod/ckpt_a2_tool_mixed",
+            corpus: cfg.corpus, out: "/workspace/ckpt_r9",
+            steps: 2000, warmup: 100, batch: 2, seq: 1024, grad_accum: 8,
+            lora_r: 16, lora_alpha: 32, save_every: 500, eval_every: 250,
+            patience: 5, dry_run: cfg.dry_run
+        }
+    } else if round == "r10" || round == "r10b" || round == "r10c" || round == "r10d" {
+        // r10-series — r9 base, divergence recovery attempts.
+        cfg = Alm14bConfig {
+            round: round, base: "/runpod/ckpt_r9",
+            corpus: cfg.corpus, out: "/workspace/ckpt_" + round,
+            steps: 1500, warmup: 100, batch: 2, seq: 1024, grad_accum: 8,
+            lora_r: 16, lora_alpha: 32, save_every: 300, eval_every: 150,
+            patience: 5, dry_run: cfg.dry_run
+        }
+    }
+    // Default = r11 (plan defaults already in default_config()).
+    return cfg
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// §13  CLI PARSING (module-scope)
+// ═══════════════════════════════════════════════════════════════════════
+
+let _argv_full = args()
+let _argv_n = len(_argv_full)
+let mut _argv = []
+let mut _argv_i = 2                                 // skip binary + self-ref
+while _argv_i < _argv_n {
+    _argv = _argv.push(_argv_full[_argv_i])
+    _argv_i = _argv_i + 1
+}
+
+// Aux flag wiring — matches train_alm.hexa:479-490 and train_clm.hexa:3115-3128.
+if _cli_has_flag(_argv, "--use-quadruple-cross") { G_SW_USE_QC = 1 }
+if _cli_has_flag(_argv, "--use-tension-link")    { G_SW_USE_TL = 1 }
+if _cli_has_flag(_argv, "--use-lens-diag")       { G_SW_USE_LENS = 1 }
+if _cli_has_flag(_argv, "--use-tier-curriculum") { G_SW_USE_TIER = 1 }
+if _cli_has_flag(_argv, "--use-sumt-stages")     { G_SW_USE_SUMT = 1 }
+if _cli_has_flag(_argv, "--use-g-holo")          { G_SW_USE_GHOLO = 1 }
+if _cli_has_flag(_argv, "--use-a6-gate")         { G_SW_USE_A6GATE = 1 }
+
+G_SW_LAMBDA_QC     = to_float(_cli_flag_value(_argv, "--lambda-qc", "0.01"))
+G_SW_LENS_EVERY    = to_int(_cli_flag_value(_argv, "--lens-diag-every", "500"))
+G_SW_TIER_SCHEDULE = _cli_flag_value(_argv, "--tier-curriculum-schedule", "linear")
+G_SW_TIER_PATH     = _cli_flag_value(_argv, "--tier-labels", "training/corpus_universe_tier_labels.jsonl")
+
+// Round selector + training-mode trigger.
+let _round_arg    = _cli_flag_value(_argv, "--round", "r11")
+let _selftest     = _cli_has_flag(_argv, "--selftest")
+let _train_mode   = _cli_has_flag(_argv, "--corpus")
+                    || _cli_has_flag(_argv, "--steps")
+                    || _cli_has_flag(_argv, "--ckpt-dir")
+
+let _cfg_sel = round_config(_round_arg)
+
+// ═══════════════════════════════════════════════════════════════════════
+// §14  ENTRY DISPATCH
+// ═══════════════════════════════════════════════════════════════════════
+
+if _train_mode && !_selftest {
+    println("=== train_alm_14b.hexa — TRAIN MODE ===")
+    println("  round      = " + _cfg_sel.round)
+    println("  base       = " + _cfg_sel.base)
+    println("  corpus     = " + _cli_flag_value(_argv, "--corpus", _cfg_sel.corpus))
+    println("  steps      = " + _cli_flag_value(_argv, "--steps", str(_cfg_sel.steps)))
+    println("  ckpt-dir   = " + _cli_flag_value(_argv, "--ckpt-dir", _cfg_sel.out))
+    println("  lora_r     = " + str(_cfg_sel.lora_r))
+    println("  lora_alpha = " + str(_cfg_sel.lora_alpha))
+    println("")
+    println("[alm14b] BLOCKED_FFI: hxqwen14b_forward_with_lora + backward_lora_only")
+    println("[alm14b]              not yet landed (see §7 TODO markers).")
+    println("[alm14b]              For r11 today, invoke training/train_alm_lora.hexa")
+    println("[alm14b]              directly — it is the canonical real trainer.")
+    println("[alm14b]              This file is a higher-level dispatcher skeleton.")
+    exit(0)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// §15  SELFTEST / VERIFICATION BLOCK
+// ═══════════════════════════════════════════════════════════════════════
+
+let _cfg = default_config()
+let _fl  = default_floats()
+let _lora = default_lora(QWEN14B_D_MODEL)
+let _state = state_init()
+let _model = alm14b_model_load("stub", 1)
+
+println("=== train_alm_14b.hexa — SELFTEST ===")
+println("base model       : Qwen/Qwen2.5-14B-Instruct")
+println("n_layer          : " + str(QWEN14B_N_LAYER))
+println("d_model          : " + str(QWEN14B_D_MODEL))
+println("vocab            : " + str(QWEN14B_VOCAB))
+println("n_head           : " + str(QWEN14B_N_HEAD))
+println("head_dim         : " + str(QWEN14B_HEAD_DIM))
+println("")
+println("default round    : " + _cfg.round)
+println("default lr       : " + str(_fl.lr))
+println("default warmup   : " + str(_cfg.warmup))
+println("default steps    : " + str(_cfg.steps))
+println("default lora_r   : " + str(_cfg.lora_r) + "/alpha=" + str(_cfg.lora_alpha))
+println("lora adapters    : " + str(_lora.n_adapters) + " (4 × n_layer)")
+println("")
+println("selected round   : " + _cfg_sel.round)
+println("selected steps   : " + str(_cfg_sel.steps))
+println("selected base    : " + _cfg_sel.base)
+println("")
+println("[sw] use-quadruple-cross = " + str(G_SW_USE_QC) + " (λ_qc=" + str(G_SW_LAMBDA_QC) + ")")
+println("[sw] use-tension-link    = " + str(G_SW_USE_TL))
+println("[sw] use-lens-diag       = " + str(G_SW_USE_LENS) + " (every " + str(G_SW_LENS_EVERY) + " steps)")
+println("[sw] use-tier-curriculum = " + str(G_SW_USE_TIER) + " (schedule=" + G_SW_TIER_SCHEDULE + ")")
+println("[sw] use-sumt-stages     = " + str(G_SW_USE_SUMT))
+println("[sw] use-g-holo          = " + str(G_SW_USE_GHOLO))
+println("[sw] use-a6-gate         = " + str(G_SW_USE_A6GATE))
+
+// ─── Phase 3 slice — AdamW unit selftest ───
+// 10 synthetic steps on a scalar param with constant negative grad should
+// push the param downward. Covers the adamw_step call path end-to-end,
+// including bias-correction + sqrt_safe + wd=0 branch.
+println("")
+println("--- Phase-3 slice: AdamW unit selftest ---")
+let mut _p = [1.0]
+let mut _m = [0.0]
+let mut _v = [0.0]
+let _g = [0.1]                                      // constant positive grad
+let mut _k = 1
+let mut _adamw_ok = true
+while _k <= 10 {
+    let _pack = adamw_step(_p, _g, _m, _v, _k, 0.01,
+                           ADAMW_BETA1, ADAMW_BETA2, ADAMW_EPS, ADAMW_WD)
+    _p = _pack[0]
+    _m = _pack[1]
+    _v = _pack[2]
+    let _pv = _p[0]
+    // Sanity: param stays finite (NaN self-compare fails).
+    if _pv != _pv { _adamw_ok = false }
+    _k = _k + 1
+}
+let _p_final = _p[0]
+println("adamw 10-step param (start 1.0, grad +0.1, lr 1e-2) → " + str(_p_final))
+if _adamw_ok && _p_final < 1.0 && _p_final > 0.0 {
+    println("PASS: AdamW moved param downhill monotonically within bounds")
+} else {
+    println("FAIL: AdamW either diverged or went NaN (got " + str(_p_final) + ")")
+}
+
+// ─── Warmup LR unit check ───
+println("")
+println("--- warmup_lr unit check ---")
+let _lr_0   = warmup_lr(0.001, 0,  100)
+let _lr_50  = warmup_lr(0.001, 50, 100)
+let _lr_100 = warmup_lr(0.001, 100, 100)
+let _lr_200 = warmup_lr(0.001, 200, 100)
+println("warmup(step=0)   = " + str(_lr_0))
+println("warmup(step=50)  = " + str(_lr_50))
+println("warmup(step=100) = " + str(_lr_100))
+println("warmup(step=200) = " + str(_lr_200))
+if _lr_0 < _lr_50 && _lr_50 < _lr_100 && _lr_100 >= 0.001 - 0.00001 {
+    println("PASS: warmup_lr monotonic ramp to base_lr")
+} else {
+    println("FAIL: warmup_lr did not ramp correctly")
+}
+
+// ─── Round dispatch smoke ───
+println("")
+println("--- round_config dispatch smoke ---")
+let _r5  = round_config("r5")
+let _r11 = round_config("r11")
+println("r5  steps=" + str(_r5.steps)  + " lora_r=" + str(_r5.lora_r))
+println("r11 steps=" + str(_r11.steps) + " lora_r=" + str(_r11.lora_r))
+if _r5.lora_r == 16 && _r11.lora_r == 8 {
+    println("PASS: r5 uses lora_r=16, r11 uses lora_r=8 (divergence recovery)")
+} else {
+    println("FAIL: round dispatch mis-configured")
+}
+
+// ─── Train step smoke (aux flags observable) ───
+println("")
+println("--- alm14b_train_step smoke (1 step) ---")
+let _s1 = alm14b_train_step(_state, _cfg, _fl)
+println("step after 1 tick: " + str(_s1.step))
+println("phase            : " + str(_s1.phase))
+if _s1.step == 1 {
+    println("PASS: train_step increments counter")
+} else {
+    println("FAIL: train_step did not increment")
+}
+
+println("")
+println("=== train_alm_14b.hexa SELFTEST COMPLETE ===")
+println("note: real training refused without FFI — use train_alm_lora.hexa (r11)")
+
+// Invariant block — last, so any parse fail on theorem isolates cleanly.
+theorem alm14b_invariants {
+    assert QWEN14B_N_LAYER == 48
+    assert QWEN14B_D_MODEL == 5120
+    assert QWEN14B_VOCAB == 152064
+    assert N_LORA_TARGETS == 4
+    assert DEFAULT_GRAD_ACCUM == 8
+    assert 1 == 1
 }

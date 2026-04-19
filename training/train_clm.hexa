@@ -9,12 +9,21 @@
 //   training/quantum_types.hexa     -> ../../hexa-lang/self/quantum_types.hexa
 // (hexa resolves `use` relative to the importing file's directory; cross-dir
 //  import requires a symlink until module search path lands.)
-use "anima_quantum_clm"
+// 2026-04-19: hexa 0.1.0-stage1 parser rejects `use "..."` string-literal form
+// ("expected identifier, got StringLit"). Module resolution uses identifier
+// form + the importing file's dir — see lines 6-11 above for symlink setup.
+// 2026-04-19 (same day): BOTH `use anima_quantum_clm` and `use "anima_quantum_clm"`
+// hit the same runtime-undefined-fn failure due to hexa silent-exit-on-imports
+// (feedback_hexa_silent_exit_5_imports). Disabled; the needed symbols are
+// inlined as SMOKE-SAFE STUBS below corpus helpers. Re-enable once the
+// interpreter bug is fixed or we switch to a compiled hexa build that
+// correctly links multi-file modules.
+// use anima_quantum_clm
 // Track B contrastive phi cache (CLM-PhiB-1). Imported for the off-by-
 // default lookup path in train_step — see phi_cache_loader.hexa for the
 // rationale and wire-format docs. Flag-off import has no runtime effect
 // beyond the self-test prints at module load.
-use "phi_cache_loader"
+// use phi_cache_loader
 
 // H1 (2026-04-18 9th-fire): INLINED mmap-equivalent byte-window corpus
 // loader. Replaces the n_tokens=0 stub + LCG noise batch path.
@@ -70,6 +79,170 @@ fn corpus_window(desc: CorpusDesc, offset: int, n_bytes: int) -> [int] {
     }
     return out
 }
+
+// ═════════════════════════════════════════════════════════════════════
+// SMOKE-SAFE STUBS (CLM-SMOKE-20260419)
+// ═════════════════════════════════════════════════════════════════════
+// ROOT CAUSE: hexa 0.1.0-stage1 interpreter has a silent-exit-on-imports
+// bug (feedback_hexa_silent_exit_5_imports). `use anima_quantum_clm` and
+// `use phi_cache_loader` above do NOT reliably register the external
+// module functions at runtime — calls like `phi_cache_new()`,
+// `quantum_controller_new()`, `quantum_controller_step()`,
+// `phi_state_bucket_id()`, `phi_cache_lookup_by_state_id()`,
+// `phi_contrastive_loss()`, `phi_anchor_project()`, `phi_cache_load()`,
+// `quantum_controller_phi()`, `quantum_controller_phi_max()` all fail
+// with `Runtime error: undefined function: <name>` at module-load time
+// (line 141 module-scope `phi_cache_new()` init) or inside train_step.
+//
+// FIX: inline minimal zero-signal stubs so smoke mode (CPU, 10 steps,
+// d=256 × L=4 × blk=128) can execute the full train loop end-to-end.
+// Stubs preserve:
+//   - Signature compatibility (arg types, return type)
+//   - Field layout of structs (only fields actually read downstream)
+//   - Loss finiteness (phi_bonus, phi_cache_contrib both → 0.0 → no NaN)
+//
+// REAL IMPLEMENTATIONS (use these once hexa `use` is fixed or we switch
+// to a compiled-codegen hexa build):
+//   anima-engines/anima_quantum_clm.hexa   — QuantumController + friends
+//   training/phi_cache_loader.hexa         — PhiCache + friends
+// DO NOT de-stub piecemeal — either keep all stubs OR remove all stubs
+// and re-enable `use`, because the silent-exit bug is all-or-nothing
+// per module.
+//
+// LIMITATIONS (accepted for smoke):
+//   - quantum_controller_phi() returns 0 → phi_q_norm = 0 / 1e-9 ≈ 0
+//     → phi_bonus = PSI_ALPHA * 0 = 0. Orch-OR signal not exercised.
+//   - phi_cache_lookup_by_state_id() returns [] (empty). phi_contrastive_
+//     loss() detects dim mismatch (anchor has 110, embedding has 0) and
+//     returns 0.0 by its own defensive check (already in real impl at
+//     phi_cache_loader.hexa:422). No loss contribution.
+//   - phi_cache_contrib therefore stays 0, CLM_PHI_CACHE_ENABLED=true is
+//     harmless under stubs.
+//
+// Per troubleshoot_comments: every stub fn below carries inline comment
+// with root-cause + fix + real-impl path. Do not strip these comments.
+
+// ─── QuantumController stubs ────────────────────────────────────────
+// Only fields actually read by train_clm.hexa are tracked here. Real
+// struct also has `microtubules: [Microtubule]` (used internally by
+// quantum_controller_step/phi in anima_quantum_clm.hexa:36-41). Smoke
+// does not touch microtubules — step/phi return identity/zero.
+struct QuantumController {
+    n_atoms: int,
+    sites_per_atom: int,
+    tick: int
+}
+
+// STUB — real impl: anima-engines/anima_quantum_clm.hexa:43-56
+// Root cause: hexa silent-exit-on-imports (feedback_hexa_silent_exit_5_imports)
+// Fix: return zero-initialized controller. No microtubules allocated.
+fn quantum_controller_new(n_atoms: int, sites_per_atom: int) -> QuantumController {
+    return QuantumController {
+        n_atoms: n_atoms,
+        sites_per_atom: sites_per_atom,
+        tick: 0
+    }
+}
+
+// STUB — real impl: anima-engines/anima_quantum_clm.hexa:61-74
+// Fix: advance tick only; real impl evolves microtubules via mt_step.
+fn quantum_controller_step(qc: QuantumController) -> QuantumController {
+    return QuantumController {
+        n_atoms: qc.n_atoms,
+        sites_per_atom: qc.sites_per_atom,
+        tick: qc.tick + 1
+    }
+}
+
+// STUB — real impl: anima-engines/anima_quantum_clm.hexa:78-86
+// Fix: Φ_q = 0 → phi_bonus = 0. Smoke does not need Orch-OR signal.
+fn quantum_controller_phi(qc: QuantumController) -> float {
+    return 0.0
+}
+
+// STUB — real impl: anima-engines/anima_quantum_clm.hexa:90-92
+// Fix: return max = n_atoms * sites * ln(2). Matches real formula so
+// phi_q / phi_max stays bounded even if phi ever becomes nonzero.
+fn quantum_controller_phi_max(qc: QuantumController) -> float {
+    return (qc.n_atoms * 1.0) * (qc.sites_per_atom * 1.0) * 0.6931471805599453
+}
+
+// ─── PhiCache stubs ─────────────────────────────────────────────────
+// Only `n_entries` is read by train_clm.hexa:2167. Real struct also
+// has `loaded`, `hashes`, `embeddings` — kept here for field-parity in
+// case other code paths access them, but smoke leaves them zeroed.
+struct PhiCache {
+    loaded: bool,
+    n_entries: int,
+    hashes: [string],
+    embeddings: [float]
+}
+
+// STUB — real impl: training/phi_cache_loader.hexa:71-78
+// Root cause: hexa silent-exit-on-imports.
+// Fix: empty cache; n_entries=0 → bucket_id=0 via modulo in real phi_state_
+// bucket_id; our stub of that also returns 0. Safe.
+fn phi_cache_new() -> PhiCache {
+    return PhiCache {
+        loaded: false,
+        n_entries: 0,
+        hashes: [],
+        embeddings: []
+    }
+}
+
+// STUB — real impl: training/phi_cache_loader.hexa:155+
+// Fix: no file IO; return empty cache tagged with the path for debug.
+// train_clm then sees n_entries=0 → bucket_id=0 → empty embedding → 0 loss.
+fn phi_cache_load(path: string) -> PhiCache {
+    println("[clm_smoke_stub] phi_cache_load skipped (stub) path=" + path)
+    return PhiCache {
+        loaded: false,
+        n_entries: 0,
+        hashes: [],
+        embeddings: []
+    }
+}
+
+// STUB — real impl: training/phi_cache_loader.hexa:294+
+// Fix: return 0. Real impl computes poly64 hash modulo n_buckets; with
+// n_buckets=0 the real impl would divide by zero anyway — stub is safer.
+fn phi_state_bucket_id(hidden: [float], seq: int, d_model: int, n_buckets: int) -> int {
+    return 0
+}
+
+// STUB — real impl: training/phi_cache_loader.hexa:351+
+// Fix: empty embedding. phi_contrastive_loss detects dim mismatch
+// (anchor=110, emb=0) and returns 0.0 — see its own defensive check.
+fn phi_cache_lookup_by_state_id(cache: PhiCache, state_id: int) -> [float] {
+    return []
+}
+
+// STUB — real impl: training/phi_cache_loader.hexa:387-406
+// Fix: return 110-D zero vector so downstream phi_contrastive_loss
+// (called even under stubs) sees matching dims and returns 0 cleanly
+// instead of WARN-spamming per step. 110 = PHI_CACHE_DIM constant.
+fn phi_anchor_project(hidden: [float], seq: int, d_model: int) -> [float] {
+    let mut anchor = []
+    let mut i = 0
+    while i < 110 {
+        anchor = anchor.push(0.0)
+        i = i + 1
+    }
+    return anchor
+}
+
+// STUB — real impl: training/phi_cache_loader.hexa:416-437
+// Fix: return 0. Smoke path has anchor=zeros and embedding=[]; real
+// impl would also return 0 on dim mismatch, but skipping the loop
+// body is marginally faster.
+fn phi_contrastive_loss(anchor: [float], embedding: [float]) -> float {
+    return 0.0
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// END SMOKE-SAFE STUBS — real code resumes below
+// ═════════════════════════════════════════════════════════════════════
 
 comptime const PSI_ALPHA     = 0.014
 comptime const PSI_BALANCE   = 0.5

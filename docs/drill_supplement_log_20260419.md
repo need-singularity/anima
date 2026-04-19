@@ -152,3 +152,21 @@ Budget: 4h OR 40 iterations. Per-drill timeout: 20 min.
 - rounds: 0/8
 - absorptions: 0
 - atoms: []
+
+## Iter 22 — anima_measurement — anima-measurement IIT 의식 측정 rigorous closure
+- status: DRILL_TIMEOUT  rc=124  duration=2402s  size=       0B
+- rounds: 0/8
+- absorptions: 0
+- atoms: []
+
+## Iter 23 — anima_tools — anima-tools 독립 유틸리티 saturation
+- status: OK  rc=0  duration=124s  size=       0B
+- rounds: 0/8
+- absorptions: 0
+- atoms: []
+
+---
+## v2 batch complete
+- iterations: 23
+- absorptions total: 0
+- wallclock: 13724s
