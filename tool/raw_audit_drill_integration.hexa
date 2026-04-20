@@ -1,0 +1,279 @@
+// tool/raw_audit_drill_integration.hexa -- .raw-audit drill verdict integration
+// LANDING: feat(raw): .raw-audit drill verdict integration spec + tool
+//
+// PURPOSE
+//   Scan recent drill / verifier commits and verify that each one has a
+//   matching drill-verdict entry in the canonical raw#1 hash-chain
+//   (.raw-audit). Today every drill landing commits to git WITHOUT a
+//   corresponding audit line, so the chain proves lock control events
+//   but not verifier decisions. This tool closes that hole.
+//
+// MODES
+//   --scan        (default) read-only: walk last-24h git log, grep
+//                 .raw-audit, emit coverage report. Never writes.
+//   --append      try the unlock / audit_append / lock ceremony
+//                 described in docs/raw_audit_drill_integration_spec.md
+//                 §6. NO-OP on this landing (V8 SAFE_COMMIT) — prints
+//                 the planned action and exits 3 if .raw-audit is uchg.
+//   --help        print usage and exit 0.
+//
+// SPEC
+//   See docs/raw_audit_drill_integration_spec.md for schema, pipeline,
+//   hash-chain invariant, and backfill policy.
+//
+// INVARIANTS
+//   1. V8 SAFE_COMMIT: this landing WILL NOT modify .raw, .raw-audit,
+//      .raw-ref, or any hexa-lang file. --append mode is gated on
+//      chflags inspection and exits 3 before attempting any write.
+//   2. Read path only: exec("git log …"), exec("grep -F …"),
+//      exec("ls -lO …"). No shell redirection (>>, >, tee).
+//   3. Canonical .raw-audit path is sourced from HEXA_LANG_ROOT env;
+//      falls back to /Users/ghost/Dev/hexa-lang. Anima never writes
+//      its own .raw-audit — the canonical file is single-rooted.
+//
+// EXIT CODES
+//   0  all drill commits present with complete verdict fields
+//   1  >=1 drill commit missing or incomplete (report printed)
+//   2  .raw-audit not readable
+//   3  --append requested but .raw-audit is uchg-locked
+//   4  hx_unlock.hexa missing (degraded mode for --append)
+
+use "self/core/law_io"
+
+// ─── path helpers ────────────────────────────────────────────────
+
+fn _hexa_lang_root() -> string {
+    let r = env("HEXA_LANG_ROOT")
+    if r != "" { return r }
+    return "/Users/ghost/Dev/hexa-lang"
+}
+
+fn _raw_audit_path() -> string {
+    let mut parts = []
+    parts.push(_hexa_lang_root())
+    parts.push("/.raw-audit")
+    return parts.join("")
+}
+
+fn _hx_unlock_path() -> string {
+    let mut parts = []
+    parts.push(_hexa_lang_root())
+    parts.push("/tool/hx_unlock.hexa")
+    return parts.join("")
+}
+
+// ─── git log scan (step 1) ────────────────────────────────────────
+
+// Returns an array of "sha subject" strings for commits in the last
+// --since window whose subject matches ^feat(drill)| or ^feat(verifier).
+fn _scan_drill_commits(since: string) -> array {
+    let mut cparts = []
+    cparts.push("git log --since=\"")
+    cparts.push(since)
+    cparts.push("\" --pretty=format:'%H %s' 2>/dev/null")
+    let raw = to_string(exec(cparts.join("")))
+    let mut out = []
+    let lines = raw.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let line = lines[i]
+        if line.contains("feat(drill)") || line.contains("feat(verifier)") {
+            out.push(line)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── .raw-audit presence check (step 2 & 3) ──────────────────────
+
+// Check if a sha prefix appears anywhere in .raw-audit.
+fn _audit_contains_sha(audit_path: string, sha_prefix: string) -> bool {
+    let mut parts = []
+    parts.push("grep -F -q '")
+    parts.push(sha_prefix)
+    parts.push("' ")
+    parts.push(audit_path)
+    parts.push(" 2>/dev/null")
+    let r = exec_with_status(parts.join(""))
+    return r[1] == 0
+}
+
+// Extract the drill-verdict reason payload for this commit from audit,
+// return empty string if no drill-verdict line matches.
+fn _audit_verdict_line(audit_path: string, sha_prefix: string) -> string {
+    let mut parts = []
+    parts.push("grep -F 'drill-verdict' ")
+    parts.push(audit_path)
+    parts.push(" 2>/dev/null | grep -F 'commit=")
+    parts.push(sha_prefix)
+    parts.push("' | head -1")
+    return to_string(exec(parts.join(""))).trim()
+}
+
+// Validate a reason payload contains required keys (commit, verdict,
+// verifier, seed). See spec §5.
+fn _verdict_complete(reason_line: string) -> bool {
+    if reason_line == "" { return false }
+    if !reason_line.contains("commit=")   { return false }
+    if !reason_line.contains("verdict=")  { return false }
+    if !reason_line.contains("verifier=") { return false }
+    if !reason_line.contains("seed=")     { return false }
+    return true
+}
+
+// ─── lock-state inspection (uchg detection) ──────────────────────
+
+fn _is_uchg_locked(path: string) -> bool {
+    let mut parts = []
+    parts.push("ls -lO ")
+    parts.push(path)
+    parts.push(" 2>/dev/null")
+    let out = to_string(exec(parts.join("")))
+    return out.contains("uchg")
+}
+
+fn _audit_readable(path: string) -> bool {
+    let mut parts = []
+    parts.push("test -r ")
+    parts.push(path)
+    let r = exec_with_status(parts.join(""))
+    return r[1] == 0
+}
+
+fn _hx_unlock_available() -> bool {
+    let mut parts = []
+    parts.push("test -f ")
+    parts.push(_hx_unlock_path())
+    let r = exec_with_status(parts.join(""))
+    return r[1] == 0
+}
+
+// ─── main scan routine ────────────────────────────────────────────
+
+// Returns a status dict-like tuple: [total, present, missing, incomplete].
+fn _run_scan(since: string) -> array {
+    let audit = _raw_audit_path()
+    if !_audit_readable(audit) {
+        println("ERROR: .raw-audit not readable at " + audit)
+        return [-2, 0, 0, 0]
+    }
+
+    let commits = _scan_drill_commits(since)
+    let mut total = 0
+    let mut present = 0
+    let mut missing = 0
+    let mut incomplete = 0
+
+    println("=== .raw-audit drill verdict scan ===")
+    println("canonical:  " + audit)
+    println("since:      " + since)
+    println("uchg-locked: " + (if _is_uchg_locked(audit) { "yes" } else { "no" }))
+    println("")
+
+    let mut i = 0
+    while i < len(commits) {
+        let line = commits[i]
+        total = total + 1
+        let space_ix = line.index_of(" ")
+        let sha_full = if space_ix > 0 { line.substring(0, space_ix) } else { line }
+        let sha8 = if len(sha_full) >= 8 { sha_full.substring(0, 8) } else { sha_full }
+        let subject = if space_ix > 0 { line.substring(space_ix + 1, len(line)) } else { "" }
+
+        if _audit_contains_sha(audit, sha8) {
+            let vline = _audit_verdict_line(audit, sha8)
+            if _verdict_complete(vline) {
+                present = present + 1
+                println("  OK       " + sha8 + "  " + subject)
+            } else {
+                incomplete = incomplete + 1
+                println("  PARTIAL  " + sha8 + "  " + subject)
+            }
+        } else {
+            missing = missing + 1
+            println("  MISSING  " + sha8 + "  " + subject)
+        }
+        i = i + 1
+    }
+
+    println("")
+    println("=== summary ===")
+    let mut sparts = []
+    sparts.push("total=")
+    sparts.push(to_string(total))
+    sparts.push(" present=")
+    sparts.push(to_string(present))
+    sparts.push(" missing=")
+    sparts.push(to_string(missing))
+    sparts.push(" incomplete=")
+    sparts.push(to_string(incomplete))
+    println(sparts.join(""))
+    return [total, present, missing, incomplete]
+}
+
+// ─── append mode (V8 SAFE_COMMIT: plan-only) ──────────────────────
+
+fn _run_append_plan() -> int {
+    let audit = _raw_audit_path()
+    println("=== .raw-audit drill verdict APPEND (plan-only, V8) ===")
+    if !_audit_readable(audit) {
+        println("ERROR: .raw-audit not readable — exit 2")
+        return 2
+    }
+    if !_hx_unlock_available() {
+        println("ERROR: hx_unlock.hexa missing at " + _hx_unlock_path() + " — exit 4")
+        return 4
+    }
+    if _is_uchg_locked(audit) {
+        println("NOTE: .raw-audit is uchg-locked.")
+        println("      V8 SAFE_COMMIT: this landing MUST NOT attempt to write.")
+        println("      Planned ceremony (see spec §6):")
+        println("        1. hx_unlock.hexa  --reason 'drill verdict append'")
+        println("        2. raw_audit.hexa  audit_append('drill-verdict', …)")
+        println("        3. hx_lock.hexa    (idempotent re-lock)")
+        println("        4. raw_audit.hexa  verify")
+        println("EXIT 3 (locked)")
+        return 3
+    }
+    println("NOTE: .raw-audit is NOT uchg-locked. Append would be safe,")
+    println("      but this landing is spec-only (V8 SAFE_COMMIT).")
+    println("      Re-run after promotion with --append-execute (future).")
+    return 0
+}
+
+// ─── entry point ──────────────────────────────────────────────────
+
+fn _usage() {
+    println("usage: hexa tool/raw_audit_drill_integration.hexa [--scan | --append | --help]")
+    println("       --scan     read-only coverage report (default)")
+    println("       --append   plan-only ceremony output (V8 SAFE_COMMIT)")
+    println("       --help     this message")
+}
+
+fn main() -> int {
+    let args = sys_argv()
+    let mut mode = "scan"
+    let mut since = "24 hours ago"
+
+    let mut i = 1
+    while i < len(args) {
+        let a = args[i]
+        if a == "--help" || a == "-h" { _usage(); return 0 }
+        else if a == "--scan"   { mode = "scan" }
+        else if a == "--append" { mode = "append" }
+        else if a == "--since" && i + 1 < len(args) {
+            since = args[i + 1]
+            i = i + 1
+        }
+        i = i + 1
+    }
+
+    if mode == "append" {
+        return _run_append_plan()
+    }
+
+    let r = _run_scan(since)
+    if r[0] == -2 { return 2 }
+    if r[2] > 0 || r[3] > 0 { return 1 }
+    return 0
+}
