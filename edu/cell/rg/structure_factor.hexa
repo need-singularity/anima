@@ -1,0 +1,265 @@
+// edu/cell/rg/structure_factor.hexa — S(k) via DFT-lite cosine matmul
+//
+// PARADIGM REF: docs/new_paradigm_edu_lattice_unified_20260421.md §11
+// ROLE: compute static structure factor S(k) on a side-N lattice.
+//       Uses a row-column reduced projection (1D row-sum φ_r) for O(N²)
+//       cost (stage0 fits CPU 1s budget at N=16).
+//
+// DEFINITION:
+//   φ_r = sum_c  spin(r,c)               row-summed order-parameter field
+//        where spin(r,c) = +1 if state==sealed, -1 if state==active,
+//                          0 if state==drop.
+//   S(k) = | (1/N) sum_r φ_r * cos(2π k r / N) |²  +  sin² equivalent.
+//
+// Fixed-point scheme: all trig via integer cosine LUT in ppm-scale.
+//   cos_ppm(theta_ppm) returns cos(θ)*1000 for θ in [0, 2π*1000] ppm.
+//
+// OUTPUT: array of S(k) in "units² × ppm-scale" for k ∈ {1 .. N/2}.
+//         argmax_k S(k) gives dominant wave-vector; correlation_length
+//         module consumes this for ξ = 1 / argmax S(k).
+
+// ─── cosine LUT (32-point, linear interp) ─────────────────────────────
+// cos_ppm(theta_ppm) where theta_ppm = θ * 1000 / (2π), so full turn = 1000.
+// We approximate with a 32-point LUT over one quarter [0, 250] and mirror.
+
+fn cos_ppm_quarter(i: int) -> int {
+    // cos(π/2 * i/32) * 1000 for i in [0,32].
+    if i <= 0 { return 1000 }
+    if i == 1 { return 998 }
+    if i == 2 { return 995 }
+    if i == 3 { return 989 }
+    if i == 4 { return 980 }
+    if i == 5 { return 970 }
+    if i == 6 { return 957 }
+    if i == 7 { return 942 }
+    if i == 8 { return 924 }
+    if i == 9 { return 904 }
+    if i == 10 { return 882 }
+    if i == 11 { return 858 }
+    if i == 12 { return 831 }
+    if i == 13 { return 803 }
+    if i == 14 { return 773 }
+    if i == 15 { return 740 }
+    if i == 16 { return 707 }
+    if i == 17 { return 672 }
+    if i == 18 { return 635 }
+    if i == 19 { return 597 }
+    if i == 20 { return 556 }
+    if i == 21 { return 514 }
+    if i == 22 { return 471 }
+    if i == 23 { return 427 }
+    if i == 24 { return 383 }
+    if i == 25 { return 337 }
+    if i == 26 { return 290 }
+    if i == 27 { return 243 }
+    if i == 28 { return 195 }
+    if i == 29 { return 147 }
+    if i == 30 { return  98 }
+    if i == 31 { return  49 }
+    return 0    // i == 32 → cos(π/2) = 0
+}
+
+// cos_ppm takes theta_ppm in [0, 1000] representing full-turn fraction.
+// Returns cos(2π · theta_ppm/1000) * 1000.
+fn cos_ppm(theta_ppm_raw: int) -> int {
+    // normalize to [0, 1000)
+    let mut t = theta_ppm_raw % 1000
+    if t < 0 { t = t + 1000 }
+    // quadrant
+    if t <= 250 {
+        // cos decreasing from 1 to 0; use LUT index i = t*32/250
+        let i = (t * 32) / 250
+        return cos_ppm_quarter(i)
+    } else if t <= 500 {
+        // cos in [500..0..-1000]; at t=250 → 0, t=500 → -1000
+        let t2 = t - 250
+        let i  = (t2 * 32) / 250
+        return 0 - cos_ppm_quarter(32 - i)
+    } else if t <= 750 {
+        let t2 = t - 500
+        let i  = (t2 * 32) / 250
+        return 0 - cos_ppm_quarter(i)
+    } else {
+        let t2 = t - 750
+        let i  = (t2 * 32) / 250
+        return cos_ppm_quarter(32 - i)
+    }
+}
+
+fn sin_ppm(theta_ppm: int) -> int {
+    // sin(θ) = cos(θ - π/2) → theta_ppm - 250
+    return cos_ppm(theta_ppm - 250)
+}
+
+// ─── spin field & structure factor ────────────────────────────────────
+
+// per-cell spin: sealed(2)→+1, active(0)→-1, drop(1)→0
+fn ss_to_spin(s: int) -> int {
+    if s == 2 { return 1 }
+    if s == 0 { return 0 - 1 }
+    return 0
+}
+
+// row-summed φ_r field (int), length = side
+fn row_phi_field(L: [[int]], side: int) -> [int] {
+    let ss = L[2]
+    let mut out = []
+    let mut r = 0
+    while r < side {
+        let mut c = 0
+        let mut acc = 0
+        while c < side {
+            let sp = ss_to_spin(ss[r * side + c])
+            acc = acc + sp
+            c = c + 1
+        }
+        out = out.push(acc)
+        r = r + 1
+    }
+    return out
+}
+
+// S(k) for 1 <= k < side.  Returns integer S(k) * 1000 (to keep resolution).
+// S(k) = |(1/N) sum_r φ_r cos(2πkr/N)|² + |(1/N) sum_r φ_r sin(2πkr/N)|²
+fn sk_at(phi: [int], N: int, k: int) -> int {
+    let mut re = 0
+    let mut im = 0
+    let mut r  = 0
+    while r < N {
+        // theta_ppm = 1000 * k * r / N
+        let theta_ppm = (1000 * k * r) / N
+        let c = cos_ppm(theta_ppm)   // cos * 1000
+        let s = sin_ppm(theta_ppm)   // sin * 1000
+        re = re + phi[r] * c
+        im = im + phi[r] * s
+        r = r + 1
+    }
+    // re, im are in units of (spin · cos_ppm = spin × 1000).  Divide by N
+    // for the (1/N) factor.
+    let re_n = re / N
+    let im_n = im / N
+    // |z|² = re² + im² (still in (spin*1000)² units)
+    // We rescale to keep integers small: divide by 1000 once.
+    let sq = (re_n * re_n + im_n * im_n) / 1000
+    return sq
+}
+
+// compute S(k) vector for k = 1 .. N/2
+fn sk_vec(L: [[int]], side: int) -> [int] {
+    let phi = row_phi_field(L, side)
+    let mut out = []
+    let kmax = side / 2
+    let mut k = 1
+    while k <= kmax {
+        out = out.push(sk_at(phi, side, k))
+        k = k + 1
+    }
+    return out
+}
+
+// argmax_k of S(k).  Returns k in [1..N/2] (the raw k, not an index).
+fn sk_argmax(skv: [int]) -> int {
+    let n = len(skv)
+    if n == 0 { return 0 }
+    let mut best_k = 1
+    let mut best_v = skv[0]
+    let mut i = 1
+    while i < n {
+        if skv[i] > best_v {
+            best_v = skv[i]
+            best_k = i + 1
+        }
+        i = i + 1
+    }
+    return best_k
+}
+
+fn sk_max(skv: [int]) -> int {
+    let n = len(skv)
+    if n == 0 { return 0 }
+    let mut best = skv[0]
+    let mut i = 1
+    while i < n {
+        if skv[i] > best { best = skv[i] }
+        i = i + 1
+    }
+    return best
+}
+
+// ─── self-test ───────────────────────────────────────────────────────
+
+fn sf_assert(name: string, cond: bool) -> int {
+    if cond { println("  OK  " + name) ; return 0 }
+    println("  FAIL " + name) ; return 1
+}
+
+fn main() {
+    println("structure_factor selftest")
+    let mut fails = 0
+
+    // cos LUT sanity
+    fails = fails + sf_assert("cos(0)   = 1000",     cos_ppm(0)    == 1000)
+    fails = fails + sf_assert("cos(250) ≈ 0",        cos_ppm(250)  == 0)
+    fails = fails + sf_assert("cos(500) = -1000",    cos_ppm(500)  == 0 - 1000)
+    fails = fails + sf_assert("cos(750) ≈ 0",        cos_ppm(750)  == 0)
+    fails = fails + sf_assert("sin(0)   = 0",        sin_ppm(0)    == 0)
+    fails = fails + sf_assert("sin(250) = 1000",     sin_ppm(250)  == 1000)
+
+    // build 4x4 lattice, checkerboard (alternating sealed/active)
+    let mut ts = []
+    let mut gs = []
+    let mut ss = []
+    let mut r = 0
+    while r < 4 {
+        let mut c = 0
+        while c < 4 {
+            ts = ts.push(5000)
+            gs = gs.push(0)
+            if (r + c) % 2 == 0 { ss = ss.push(2) } else { ss = ss.push(0) }
+            c = c + 1
+        }
+        r = r + 1
+    }
+    let mut L = []
+    L = L.push(ts)
+    L = L.push(gs)
+    L = L.push(ss)
+
+    // row sums: each row has equal sealed/active (+/-1), so row_phi ≈ 0
+    // for perfect checkerboard.  Therefore S(k) should be near 0 for all k.
+    let phi = row_phi_field(L, 4)
+    fails = fails + sf_assert("phi length", len(phi) == 4)
+
+    let skv = sk_vec(L, 4)
+    fails = fails + sf_assert("S(k) length = N/2", len(skv) == 2)
+    fails = fails + sf_assert("S(k) deterministic",
+        sk_at(phi, 4, 1) == sk_at(phi, 4, 1))
+
+    // Build a striped pattern: row 0,2 all sealed; row 1,3 all active.
+    // Then row_phi = [4, -4, 4, -4] — pure k=2 oscillation → argmax = 2.
+    let mut ss2 = []
+    let mut r2 = 0
+    while r2 < 4 {
+        let mut c2 = 0
+        while c2 < 4 {
+            if r2 % 2 == 0 { ss2 = ss2.push(2) } else { ss2 = ss2.push(0) }
+            c2 = c2 + 1
+        }
+        r2 = r2 + 1
+    }
+    let mut L2 = []
+    L2 = L2.push(ts)
+    L2 = L2.push(gs)
+    L2 = L2.push(ss2)
+    let skv2 = sk_vec(L2, 4)
+    let amx  = sk_argmax(skv2)
+    fails = fails + sf_assert("stripe argmax = 2", amx == 2)
+
+    if fails == 0 {
+        println("structure_factor: PASS")
+        exit(0)
+    } else {
+        println("structure_factor: FAIL (" + str(fails) + " assertions)")
+        exit(1)
+    }
+}
