@@ -1,0 +1,490 @@
+// tool/an11_c_real_usable_gap_close.hexa — AN11(c) real_usable gap-close:
+// REAL-DATA-ONLY JSD(baseline || trained) + bootstrap 95% CI + significance test.
+//
+// GOVERNS: shared/rules/anima.json#AN11 condition (c) "real_usable".
+// SPEC:    shared/bench/an11_c_criteria.json + docs/serve_endpoint_synthesis_20260421.md.
+// PAIRS:   verifier/an11_real_usable.hexa (base pure-math verifier, same formula).
+//          tool/an11_c_verifier.hexa (HTTP-sampling variant).
+//
+// GAP-CLOSE CONTEXT
+//   - Prior AN11(c) cert (shared/state/alm_r12_serve_cert.json, 2026-04-20)
+//     used `mock_responder_50call_smoke` trained distribution — engineering-PASS
+//     but SYNTHETIC per its own "_comment" field.
+//   - Task: close the gap using REAL trained CE loss trajectory only
+//     (no synthetic proxy, raw#9: synthetic 금지).
+//   - Inputs (both real measurements):
+//       * BASELINE: v54_probe_ce = 8.50062 nats (untrained Qwen2.5-14B base,
+//         measured identically across 3+ independent H100 runs).
+//       * TRAINED:  11 real CE loss values from P3-BPE 100-step run on
+//         H100 pod 87xscivuggrwvk with real libhxtok BPE
+//         (hxtok_vocab_size=151643, loss_trajectory steps 1..100 @ every 10).
+//
+// METHOD
+//   (1) Load both empirical CE arrays (nats), bin into K=10 bins over [0,12] nats.
+//   (2) L1-normalize to probability distributions P (baseline) and Q (trained).
+//   (3) Point estimate: JSD₂(P || Q) = 0.5*KL₂(P||M) + 0.5*KL₂(Q||M), M=0.5*(P+Q).
+//   (4) Bootstrap: for N_BOOT iterations resample Q's raw CE values with
+//       replacement (n=11), re-bin, recompute JSD. Record all resampled JSDs.
+//   (5) 95% CI = [2.5%, 97.5%] percentile of bootstrap distribution.
+//   (6) Significance: count N_BOOT iterations where JSD_boot <= JSD_UNUSABLE_MAX
+//       (0.05 default). p_lower = that_count / N_BOOT. If p_lower < 0.025 AND
+//       CI_lower > ε, real_usable is SIGNIFICANT at α=0.05.
+//   (7) Verdict: USABLE if jsd_point >= ε (default 0.30 bits, doc matches
+//       spec); else MARGINAL / UNUSABLE per same gates as verifier/an11_real_usable.
+//
+// DETERMINISTIC: LCG seed + bootstrap. No LLM, no HTTP, no synthetic.
+//
+// OUTPUT: shared/state/alm_r12_real_usable_cert.json  (V8 SAFE_COMMIT additive).
+//
+// EXIT: 0=USABLE+SIGNIFICANT, 1=UNUSABLE, 3=MARGINAL, 4=USABLE_BUT_NOT_SIGNIFICANT.
+
+let JSD_USABLE_MIN:   float = 0.30
+let JSD_UNUSABLE_MAX: float = 0.05
+let LN2: float = 0.6931471805599453
+
+let N_BOOT: int = 1000
+let BOOT_SEED: int = 20260421
+let K_BINS: int = 10
+let BIN_LO_NATS: float = 0.0
+let BIN_HI_NATS: float = 12.0
+
+let EXIT_USABLE_SIG  = 0
+let EXIT_UNUSABLE    = 1
+let EXIT_MARGINAL    = 3
+let EXIT_USABLE_LOW  = 4
+
+// ─── helpers ─────────────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn now_utc() -> string {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn fmt_float(x: float) -> string { return to_string(x) }
+
+fn json_escape(s: string) -> string {
+    let n = len(s)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        let c = char_code(ch, 0)
+        if c == 34 { out = out + "\\\"" }
+        else { if c == 92 { out = out + "\\\\" }
+        else { if c == 10 { out = out + "\\n" }
+        else { out = out + ch } } }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── math: ln via Taylor (range-reduced) + log2 ──────────────────────
+
+fn ln_newton(x: float) -> float {
+    if x <= 0.0 { return 0.0 - 1.0e30 }
+    let mut y = 0.0
+    let mut z = x
+    while z > 1.5 { z = z * 0.5; y = y + LN2 }
+    while z < 0.5 { z = z * 2.0; y = y - LN2 }
+    let u = z - 1.0
+    let mut sum = 0.0
+    let mut term = u
+    let mut k = 1
+    let mut sign = 1.0
+    while k < 50 {
+        sum = sum + sign * term / to_float(k)
+        term = term * u
+        sign = 0.0 - sign
+        k = k + 1
+    }
+    return y + sum
+}
+
+fn log2(x: float) -> float { return ln_newton(x) / LN2 }
+
+// ─── probability helpers ─────────────────────────────────────────────
+
+fn bin_histogram(raw: array, k: int, lo: float, hi: float) -> array {
+    let mut counts = []
+    let mut i = 0
+    while i < k { counts = push(counts, 0); i = i + 1 }
+    let bw = (hi - lo) / to_float(k)
+    let n = len(raw)
+    let mut j = 0
+    while j < n {
+        let v = to_float(raw[j])
+        if v >= lo && v < hi {
+            let rel = v - lo
+            let idx_f = rel / bw
+            let mut bin = to_int(idx_f)
+            if bin < 0 { bin = 0 }
+            if bin >= k { bin = k - 1 }
+            counts[bin] = to_int(counts[bin]) + 1
+        } else {
+            // edge: v == hi → last bin
+            if v >= hi {
+                let lb = k - 1
+                counts[lb] = to_int(counts[lb]) + 1
+            }
+        }
+        j = j + 1
+    }
+    return counts
+}
+
+fn counts_to_probs(counts: array) -> array {
+    let n = len(counts)
+    let mut s = 0
+    let mut i = 0
+    while i < n { s = s + to_int(counts[i]); i = i + 1 }
+    let mut out = []
+    if s <= 0 {
+        // uniform fallback (keeps JSD defined)
+        let u = if n > 0 { 1.0 / to_float(n) } else { 0.0 }
+        let mut j = 0
+        while j < n { out = push(out, u); j = j + 1 }
+        return out
+    }
+    let mut j = 0
+    while j < n {
+        out = push(out, to_float(to_int(counts[j])) / to_float(s))
+        j = j + 1
+    }
+    return out
+}
+
+fn shannon_entropy_bits(p: array) -> float {
+    let n = len(p)
+    let mut h = 0.0
+    let mut i = 0
+    while i < n {
+        let x = to_float(p[i])
+        if x > 0.0 { h = h - x * log2(x) }
+        i = i + 1
+    }
+    return h
+}
+
+fn jsd_bits(p: array, q: array) -> float {
+    let np = len(p)
+    let nq = len(q)
+    let k = if np > nq { np } else { nq }
+    if k < 1 { return 0.0 }
+    let mut kl_pm = 0.0
+    let mut kl_qm = 0.0
+    let mut i = 0
+    while i < k {
+        let pi = if i < np { to_float(p[i]) } else { 0.0 }
+        let qi = if i < nq { to_float(q[i]) } else { 0.0 }
+        let mi = 0.5 * (pi + qi)
+        if pi > 0.0 && mi > 0.0 { kl_pm = kl_pm + pi * log2(pi / mi) }
+        if qi > 0.0 && mi > 0.0 { kl_qm = kl_qm + qi * log2(qi / mi) }
+        i = i + 1
+    }
+    return 0.5 * kl_pm + 0.5 * kl_qm
+}
+
+// ─── LCG PRNG (deterministic bootstrap) ──────────────────────────────
+
+let LCG_A: int = 1103515245
+let LCG_C: int = 12345
+let LCG_M: int = 2147483648
+
+fn lcg_next(s: int) -> int {
+    return (LCG_A * s + LCG_C) % LCG_M
+}
+
+// ─── percentile from sorted array (linear interpolation) ─────────────
+
+fn sort_floats(a: array) -> array {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n { out = push(out, to_float(a[i])); i = i + 1 }
+    // insertion sort (n small = N_BOOT=1000)
+    let mut k = 1
+    while k < n {
+        let cur = to_float(out[k])
+        let mut j = k - 1
+        while j >= 0 && to_float(out[j]) > cur {
+            out[j + 1] = to_float(out[j])
+            j = j - 1
+        }
+        out[j + 1] = cur
+        k = k + 1
+    }
+    return out
+}
+
+fn percentile(sorted: array, p: float) -> float {
+    let n = len(sorted)
+    if n == 0 { return 0.0 }
+    if n == 1 { return to_float(sorted[0]) }
+    let idx_f = p * to_float(n - 1)
+    let lo = to_int(idx_f)
+    let hi = if lo + 1 < n { lo + 1 } else { lo }
+    let frac = idx_f - to_float(lo)
+    return to_float(sorted[lo]) * (1.0 - frac) + to_float(sorted[hi]) * frac
+}
+
+// ─── sample parse: raw_ce_nats array from JSON ───────────────────────
+
+fn byte_at(s: string, i: int) -> int {
+    return char_code(s.substring(i, i + 1), 0)
+}
+
+fn index_of_from(hay: string, needle: string, start: int) -> int {
+    let n = len(hay)
+    if start < 0 { return hay.index_of(needle) }
+    if start >= n { return -1 }
+    let tail = hay.substring(start, n)
+    let idx = tail.index_of(needle)
+    if idx < 0 { return -1 }
+    return start + idx
+}
+
+fn extract_array_block(blob: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let k = blob.index_of(needle)
+    if k < 0 { return "" }
+    let colon = index_of_from(blob, ":", k)
+    if colon < 0 { return "" }
+    let lbr = index_of_from(blob, "[", colon)
+    if lbr < 0 { return "" }
+    let n = len(blob)
+    let mut depth = 0
+    let mut i = lbr
+    while i < n {
+        let b = byte_at(blob, i)
+        if b == 91 { depth = depth + 1 }
+        if b == 93 {
+            depth = depth - 1
+            if depth == 0 { return blob.substring(lbr, i + 1) }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn parse_flat_floats(inner: string) -> array {
+    let parts = inner.split(",")
+    let mut out = []
+    let mut i = 0
+    let n = len(parts)
+    while i < n {
+        let p = _str(parts[i]).trim()
+        if p != "" {
+            if p.index_of("NaN") < 0 && p.index_of("null") < 0 {
+                out = push(out, to_float(p))
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn load_raw_ce(path: string) -> array {
+    let blob = _str(read_file(path))
+    if blob == "" { return [] }
+    let block = extract_array_block(blob, "raw_ce_nats")
+    if block == "" { return [] }
+    let inner = block.substring(1, len(block) - 1)
+    return parse_flat_floats(inner)
+}
+
+// ─── main runner ─────────────────────────────────────────────────────
+
+fn run() -> int {
+    let baseline_path = "shared/state/alm_r12_real_usable_baseline_dist.json"
+    let trained_path  = "shared/state/alm_r12_real_usable_trained_dist.json"
+    let ssot_path     = "shared/state/alm_r12_real_usable_cert.json"
+
+    println("[AN11-c GAP-CLOSE] real_usable — REAL DATA ONLY (bootstrap CI + significance)")
+    println("  baseline: " + baseline_path)
+    println("  trained : " + trained_path)
+    println("  ssot    : " + ssot_path)
+    println("  gates   : usable_min=" + fmt_float(JSD_USABLE_MIN)
+        + " unusable_max=" + fmt_float(JSD_UNUSABLE_MAX))
+    println("  bootstrap N=" + to_string(N_BOOT) + " seed=" + to_string(BOOT_SEED))
+
+    let raw_base = load_raw_ce(baseline_path)
+    let raw_trn  = load_raw_ce(trained_path)
+    let nb = len(raw_base)
+    let nt = len(raw_trn)
+    println("  raw_base n=" + to_string(nb) + " raw_trn n=" + to_string(nt))
+    if nb < 1 || nt < 1 {
+        println("[AN11-c GAP-CLOSE] INPUT_ERR raw_ce_nats missing")
+        return 2
+    }
+
+    // point estimate
+    let cnt_b = bin_histogram(raw_base, K_BINS, BIN_LO_NATS, BIN_HI_NATS)
+    let cnt_t = bin_histogram(raw_trn,  K_BINS, BIN_LO_NATS, BIN_HI_NATS)
+    let p_base = counts_to_probs(cnt_b)
+    let p_trn  = counts_to_probs(cnt_t)
+
+    let h_base = shannon_entropy_bits(p_base)
+    let h_trn  = shannon_entropy_bits(p_trn)
+    let bdelta = if h_trn >= h_base { h_trn - h_base } else { h_base - h_trn }
+    let jsd_point = jsd_bits(p_base, p_trn)
+
+    println("  K_effective=" + to_string(K_BINS)
+        + "  H2(base)=" + fmt_float(h_base)
+        + "  H2(trn )=" + fmt_float(h_trn))
+    println("  baseline_delta=" + fmt_float(bdelta))
+    println("  jsd_point=" + fmt_float(jsd_point) + " bits (base=log2, bounds=[0,1])")
+
+    // bootstrap: resample trained raw_ce with replacement
+    let mut seed = BOOT_SEED
+    let mut boot_jsds = []
+    let mut n_below_unusable = 0
+    let mut n_above_usable = 0
+    let mut bi = 0
+    while bi < N_BOOT {
+        // resample raw_trn with replacement (size nt)
+        let mut rs = []
+        let mut r = 0
+        while r < nt {
+            seed = lcg_next(seed)
+            let idx = seed % nt
+            rs = push(rs, to_float(raw_trn[idx]))
+            r = r + 1
+        }
+        let cnt_rs = bin_histogram(rs, K_BINS, BIN_LO_NATS, BIN_HI_NATS)
+        let p_rs = counts_to_probs(cnt_rs)
+        let jb = jsd_bits(p_base, p_rs)
+        boot_jsds = push(boot_jsds, jb)
+        if jb <= JSD_UNUSABLE_MAX { n_below_unusable = n_below_unusable + 1 }
+        if jb >= JSD_USABLE_MIN  { n_above_usable  = n_above_usable + 1 }
+        bi = bi + 1
+    }
+
+    // CI + significance
+    let sorted = sort_floats(boot_jsds)
+    let ci_lo = percentile(sorted, 0.025)
+    let ci_hi = percentile(sorted, 0.975)
+    let mut _msum = 0.0
+    let mut _mi = 0
+    let _mn = len(sorted)
+    while _mi < _mn { _msum = _msum + to_float(sorted[_mi]); _mi = _mi + 1 }
+    let ci_mean = if _mn > 0 { _msum / to_float(_mn) } else { 0.0 }
+    let ci_median = percentile(sorted, 0.5)
+    let p_value_below = to_float(n_below_unusable) / to_float(N_BOOT)
+    let frac_above_usable = to_float(n_above_usable) / to_float(N_BOOT)
+
+    println("  boot_ci_95=[" + fmt_float(ci_lo) + ", " + fmt_float(ci_hi) + "]")
+    println("  boot_mean=" + fmt_float(ci_mean) + " boot_median=" + fmt_float(ci_median))
+    println("  p_value_unusable=" + fmt_float(p_value_below)
+        + " (frac of N=" + to_string(N_BOOT) + " resamples <= " + fmt_float(JSD_UNUSABLE_MAX) + ")")
+    println("  frac_above_usable=" + fmt_float(frac_above_usable))
+
+    // verdict
+    let mut verdict = "UNUSABLE"
+    let mut ec = EXIT_UNUSABLE
+    let mut reason = ""
+    let significant = p_value_below < 0.025 && ci_lo > JSD_UNUSABLE_MAX
+
+    if jsd_point >= JSD_USABLE_MIN {
+        if significant {
+            verdict = "USABLE"
+            ec = EXIT_USABLE_SIG
+            reason = "jsd_point=" + fmt_float(jsd_point)
+                + " >= usable_min=" + fmt_float(JSD_USABLE_MIN)
+                + " AND ci_lo=" + fmt_float(ci_lo)
+                + " > unusable_max=" + fmt_float(JSD_UNUSABLE_MAX)
+                + " AND p_value_unusable=" + fmt_float(p_value_below) + " < 0.025"
+        } else {
+            verdict = "USABLE_BUT_NOT_SIGNIFICANT"
+            ec = EXIT_USABLE_LOW
+            reason = "jsd_point=" + fmt_float(jsd_point)
+                + " >= usable_min but ci_lo=" + fmt_float(ci_lo)
+                + " leaks into unusable zone (p_value=" + fmt_float(p_value_below) + ")"
+        }
+    } else {
+        if jsd_point <= JSD_UNUSABLE_MAX {
+            verdict = "UNUSABLE"
+            ec = EXIT_UNUSABLE
+            reason = "jsd_point=" + fmt_float(jsd_point)
+                + " <= unusable_max=" + fmt_float(JSD_UNUSABLE_MAX)
+        } else {
+            verdict = "MARGINAL"
+            ec = EXIT_MARGINAL
+            reason = "jsd_point=" + fmt_float(jsd_point)
+                + " in (" + fmt_float(JSD_UNUSABLE_MAX) + "," + fmt_float(JSD_USABLE_MIN) + ")"
+        }
+    }
+
+    println("  real_usable_verdict=" + verdict + "  (" + reason + ")")
+
+    // emit SSOT
+    let ts = now_utc()
+    let mut j = "{\n"
+    j = j + "  \"verifier\": \"an11_c_real_usable_gap_close\",\n"
+    j = j + "  \"ts\": \"" + ts + "\",\n"
+    j = j + "  \"spec\": \"AN11(c) real_usable — REAL-DATA-ONLY JSD baseline diff + bootstrap CI + significance (raw#9 synthetic 금지)\",\n"
+    j = j + "  \"inputs\": {\n"
+    j = j + "    \"baseline\": \"" + json_escape(baseline_path) + "\",\n"
+    j = j + "    \"trained\":  \"" + json_escape(trained_path) + "\"\n"
+    j = j + "  },\n"
+    j = j + "  \"baseline_source\": \"v54_probe_ce_untrained_qwen2.5_14b_base (4-token probe, 3 independent H100 runs, identical 8.50062 nats)\",\n"
+    j = j + "  \"trained_source\": \"alm_r12_phase5_smoke_20260420.json#p3_bpe_100step.loss_trajectory (11 real CE samples, real libhxtok BPE, 0 NaN)\",\n"
+    j = j + "  \"binning\": {\n"
+    j = j + "    \"k\": " + to_string(K_BINS) + ",\n"
+    j = j + "    \"range_nats\": [" + fmt_float(BIN_LO_NATS) + ", " + fmt_float(BIN_HI_NATS) + "],\n"
+    j = j + "    \"bin_width_nats\": " + fmt_float((BIN_HI_NATS - BIN_LO_NATS) / to_float(K_BINS)) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"n_samples\": {\"baseline\": " + to_string(nb) + ", \"trained\": " + to_string(nt) + "},\n"
+    j = j + "  \"entropy_bits\": {\n"
+    j = j + "    \"baseline\": " + fmt_float(h_base) + ",\n"
+    j = j + "    \"trained\":  " + fmt_float(h_trn) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"baseline_delta\": " + fmt_float(bdelta) + ",\n"
+    j = j + "  \"jsd_point\": " + fmt_float(jsd_point) + ",\n"
+    j = j + "  \"jsd_base\": \"log2\",\n"
+    j = j + "  \"jsd_bounds\": [0.0, 1.0],\n"
+    j = j + "  \"bootstrap\": {\n"
+    j = j + "    \"n_iterations\": " + to_string(N_BOOT) + ",\n"
+    j = j + "    \"seed\": " + to_string(BOOT_SEED) + ",\n"
+    j = j + "    \"resample_method\": \"raw_ce_nats_with_replacement_on_trained_only\",\n"
+    j = j + "    \"mean\": " + fmt_float(ci_mean) + ",\n"
+    j = j + "    \"median\": " + fmt_float(ci_median) + ",\n"
+    j = j + "    \"ci_95_lo\": " + fmt_float(ci_lo) + ",\n"
+    j = j + "    \"ci_95_hi\": " + fmt_float(ci_hi) + ",\n"
+    j = j + "    \"frac_above_usable\": " + fmt_float(frac_above_usable) + ",\n"
+    j = j + "    \"frac_below_unusable\": " + fmt_float(p_value_below) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"significance_test\": {\n"
+    j = j + "    \"null_hypothesis\": \"jsd <= unusable_max (behaviorally indistinguishable from baseline)\",\n"
+    j = j + "    \"alpha\": 0.025,\n"
+    j = j + "    \"p_value\": " + fmt_float(p_value_below) + ",\n"
+    j = j + "    \"ci_95_lo_above_unusable_max\": " + (if ci_lo > JSD_UNUSABLE_MAX { "true" } else { "false" }) + ",\n"
+    j = j + "    \"significant\": " + (if significant { "true" } else { "false" }) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"gates\": {\n"
+    j = j + "    \"usable_min\": " + fmt_float(JSD_USABLE_MIN) + ",\n"
+    j = j + "    \"unusable_max\": " + fmt_float(JSD_UNUSABLE_MAX) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"real_usable_verdict\": \"" + verdict + "\",\n"
+    j = j + "  \"reason\": \"" + json_escape(reason) + "\",\n"
+    j = j + "  \"exit_code\": " + to_string(ec) + ",\n"
+    j = j + "  \"label\": \"real\",\n"
+    j = j + "  \"policy\": {\n"
+    j = j + "    \"raw_9_synthetic_forbidden\": true,\n"
+    j = j + "    \"hexa_first\": true,\n"
+    j = j + "    \"supersedes_synthetic_cert\": \"shared/state/alm_r12_serve_cert.json (kind: mock_responder_50call_smoke)\"\n"
+    j = j + "  }\n"
+    j = j + "}\n"
+    write_file(ssot_path, j)
+    println("  ssot emitted: " + ssot_path)
+    return ec
+}
+
+fn main() {
+    let rc = run()
+    exit(rc)
+}
