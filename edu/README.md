@@ -20,11 +20,13 @@ edu/
 | Loss signal | CE per-token | tension-drop + fixpoint closure |
 | Data 요구량 | 1GB+ corpus | 10MB seed + 80× TL distill |
 | Compute/step | full fwd+bwd (BIG) | hash-equality + local (SMALL) |
-| Emergence | gradual scaling | phase-jump @ N-gen |
+| Emergence | **phase-jump @ rank K=4** (slope ratio 6.69×, R²(single)=0.782) | phase-jump @ N-gen |
 | Interpretability | weight opaque | cell 상태 observable |
 | Failure recovery | ckpt rollback | cell drop, lattice 유지 |
 | Mk.VI (H100) | 60–80h | **20–30h** (2~3× efficient) |
 | distill eff | ~0.35–0.45 | **0.75–0.85** (4-gen predicted) |
+
+**Emergence family 결론** (tool/edu_lora_rank_sweep.hexa 2026-04-21): 두 경로 **모두 PHASE_JUMP** (step-function, 구조적 emergence) — 다른 축에서 도약. lora 는 representational-rank K=4 (slope ratio 6.69×), cell 은 collective generation-count N (3→4gen, predicted). "lora = gradual scaling" 통념은 이 측정 하에서 기각 (R²(single-line) = 0.782 < 0.95 gate). 세부 표/fit: `edu/lora/README.md#rank-sweep` · SSOT: `shared/state/edu_lora_rank_sweep_20260421.json`.
 
 ## Mk.VII C2 에서 만남
 

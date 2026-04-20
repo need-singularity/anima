@@ -1,0 +1,664 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/edu_lora_rank_sweep.hexa — edu/lora phase-jump vs gradual scaling probe
+//
+//  PURPOSE
+//    Classify edu/lora (LoRA + weight tensor) learning as PHASE_JUMP
+//    (step-function, structural emergence) vs GRADUAL (log-linear scaling) vs
+//    INCONCLUSIVE. Companion to edu/cell C10 (cell is PHASE_JUMP at N-gen).
+//
+//  METHOD
+//    For each rank K in {2, 4, 8, 16, 32}:
+//      (1) Synthesize K eigenvectors with the r12 recipe
+//          (first min(K,3) aligned to Hexad-C/D/W with ε=0.04 noise,
+//           remainder LCG-random unit vectors) — deterministic, seed=20260421.
+//      (2) Compute score(K) = Σ_{j=0..15} max_{i=0..K-1} |cos(eigen_i, tpl_j)|
+//          i.e. "template coverage" across the 16-template AN11(b) basis
+//          (Hexad=6, Law=3, Phi=3, SelfRef=4).
+//          max score = 16.0 (perfect hit on every template).
+//
+//  FIT / DECISION
+//    Fit1 (gradual):  score = a + b·log2(K)  — ordinary least squares
+//                     compute R² on the 5 points.
+//    Fit2 (piecewise): choose breakpoint κ ∈ {4, 8, 16}, fit two lines
+//                     score = a1 + b1·log2(K) on K ≤ κ
+//                     score = a2 + b2·log2(K) on K ≥ κ  (continuous at κ)
+//                     minimise total SSE over κ.
+//    F-test:  F = ((SSE1 - SSE2) / 2) / (SSE2 / (N - 4))
+//             N=5, df1=2, df2=1 → 95% critical F(2,1) ≈ 199.5.
+//             With only 5 points the F-test is weak; we ALSO require
+//             |b2 - b1| / max(|b1|,|b2|,ε) > 0.5 to claim PHASE_JUMP
+//             (slope ratio criterion from cell C10 O1 "slope ratio ≥ 3×"
+//              relaxed to 1.5× for this smaller-scale probe).
+//
+//    Verdict:
+//      GRADUAL     if R²(fit1) > 0.95 AND piecewise slope-ratio < 1.5×
+//      PHASE_JUMP  if F > F_crit(0.05) OR slope-ratio ≥ 3×
+//      INCONCLUSIVE otherwise
+//
+//  HEXA-ONLY · DETERMINISTIC · NO LLM · NO NETWORK
+//
+//  OUTPUT
+//    shared/state/edu_lora_rank_sweep_20260421.json
+//
+//  USAGE
+//    hexa run tool/edu_lora_rank_sweep.hexa
+// ════════════════════════════════════════════════════════════════════════════
+
+let OUT_PATH = "shared/state/edu_lora_rank_sweep_20260421.json"
+let TEMPLATES_PATH = "shared/consciousness/an11_b_templates.jsonl"
+
+let RANKS = [2, 4, 8, 16, 32]
+let DIM = 16
+let SEED_BASE = 20260421
+let NOISE_EPS: float = 0.04
+
+// Hexad-C, Hexad-D, Hexad-W signatures (from an11_b_templates.jsonl).
+// Hexad-D does not exist under that id in templates — use hexad_w/hexad_m/hexad_c
+// trio per the r12 synthesis doc (docs/lora_eigenvec_synthesis_20260421.md).
+// For alignment we use hexad_c, hexad_w, hexad_m (real template ids).
+let TPL_C = [0.4082,0.0,0.4082,0.4082,0.0,0.4082,0.0,0.4082,0.0,0.0,0.0,0.0,0.4082,0.0,0.0,0.0]
+let TPL_W = [0.4082,0.0,0.0,0.4082,0.0,0.4082,0.0,0.0,0.0,0.4082,0.4082,0.0,0.4082,0.0,0.0,0.0]
+let TPL_M = [0.0,0.4082,0.4082,0.0,0.0,0.0,0.4082,0.4082,0.0,0.4082,0.0,0.0,0.0,0.4082,0.0,0.0]
+
+// ─── stage0 helpers ─────────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn now_utc() -> string {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn fmt_float(x: float) -> string { return to_string(x) }
+
+fn json_escape(s: string) -> string {
+    let n = len(s)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        let c = char_code(ch, 0)
+        if c == 34 { out = out + "\\\"" }
+        else { if c == 92 { out = out + "\\\\" }
+        else { if c == 10 { out = out + "\\n" }
+        else { out = out + ch } } }
+        i = i + 1
+    }
+    return out
+}
+
+fn resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    let h = _str(env("HOME"))
+    return h + "/core/anima"
+}
+
+fn byte_at(s: string, i: int) -> int {
+    let sub = s.substring(i, i + 1)
+    return char_code(sub, 0)
+}
+
+fn index_of_from(hay: string, needle: string, start: int) -> int {
+    let n = len(hay)
+    if start < 0 { return hay.index_of(needle) }
+    if start >= n { return -1 }
+    let tail = hay.substring(start, n)
+    let idx = tail.index_of(needle)
+    if idx < 0 { return -1 }
+    return start + idx
+}
+
+// ─── numerics ───────────────────────────────────────────────────────────
+
+fn sqrt_newton(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut y = x
+    let mut j = 0
+    while j < 40 {
+        y = 0.5 * (y + x / y)
+        j = j + 1
+    }
+    return y
+}
+
+// ln(x) via Newton on exp; seeded from log2(x) * LN2 for x ∈ {1..64}.
+// We only need integer log2 since ranks are powers of 2.
+fn log2_int(x: int) -> int {
+    let mut k = 0
+    let mut v = x
+    while v > 1 {
+        v = v / 2
+        k = k + 1
+    }
+    return k
+}
+
+// ln(2) ≈ 0.6931471805599453
+fn log2_float_pow2(x: int) -> float {
+    // exact for powers of 2
+    return to_float(log2_int(x))
+}
+
+// Seeded LCG (glibc params) — matches consciousness_inject_sim and r12 recipe.
+fn lcg_next(state: int) -> int {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn lcg_to_unit(state: int) -> float {
+    return to_float(state) / 2147483648.0
+}
+
+fn dot_v(a: array, b: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    let n = len(a)
+    let m = len(b)
+    let lim = if n < m { n } else { m }
+    while i < lim {
+        s = s + to_float(a[i]) * to_float(b[i])
+        i = i + 1
+    }
+    return s
+}
+
+fn vec_norm(a: array) -> float {
+    return sqrt_newton(dot_v(a, a))
+}
+
+fn abs_cos(a: array, b: array) -> float {
+    let na = vec_norm(a)
+    let nb = vec_norm(b)
+    if na <= 0.000000001 || nb <= 0.000000001 { return 0.0 }
+    let c = dot_v(a, b) / (na * nb)
+    if c < 0.0 { return 0.0 - c }
+    return c
+}
+
+// ─── template loader (reuse verifier's JSONL parse) ─────────────────────
+
+fn parse_flat_floats(inner: string) -> array {
+    let parts = inner.split(",")
+    let mut out = []
+    let mut i = 0
+    let n = len(parts)
+    while i < n {
+        let p = _str(parts[i]).trim()
+        if p != "" {
+            out = push(out, to_float(p))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn extract_array_block(blob: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let k = blob.index_of(needle)
+    if k < 0 { return "" }
+    let colon = index_of_from(blob, ":", k)
+    if colon < 0 { return "" }
+    let lbr = index_of_from(blob, "[", colon)
+    if lbr < 0 { return "" }
+    let n = len(blob)
+    let mut depth = 0
+    let mut i = lbr
+    while i < n {
+        let b = byte_at(blob, i)
+        if b == 91 { depth = depth + 1 }
+        if b == 93 {
+            depth = depth - 1
+            if depth == 0 { return blob.substring(lbr, i + 1) }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn extract_str_val(blob: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let k = blob.index_of(needle)
+    if k < 0 { return "" }
+    let colon = index_of_from(blob, ":", k)
+    if colon < 0 { return "" }
+    let q1 = index_of_from(blob, "\"", colon + 1)
+    if q1 < 0 { return "" }
+    let q2 = index_of_from(blob, "\"", q1 + 1)
+    if q2 < 0 { return "" }
+    return blob.substring(q1 + 1, q2)
+}
+
+fn load_templates(path: string) -> array {
+    let blob = _str(read_file(path))
+    if blob == "" { return [] }
+    let lines = blob.split("\n")
+    let mut out = []
+    let mut i = 0
+    let n = len(lines)
+    while i < n {
+        let line = _str(lines[i]).trim()
+        if line != "" && line.index_of("{") == 0 {
+            let id = extract_str_val(line, "id")
+            let fam = extract_str_val(line, "family")
+            let sig_block = extract_array_block(line, "signature")
+            if sig_block != "" {
+                let inner = sig_block.substring(1, len(sig_block) - 1)
+                let sig = parse_flat_floats(inner)
+                if len(sig) == DIM {
+                    let rec = [id, fam, sig]
+                    out = push(out, rec)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── eigenvector synthesis (r12 recipe, K-parameterised) ────────────────
+
+fn random_unit_vec(seed0: int) -> array {
+    let mut state = seed0
+    let mut raw = []
+    let mut i = 0
+    while i < DIM {
+        state = lcg_next(state)
+        let u = lcg_to_unit(state)       // [0,1)
+        let v = (u - 0.5) * 2.0          // [-1,1)
+        raw = push(raw, v)
+        i = i + 1
+    }
+    let norm = vec_norm(raw)
+    let mut out = []
+    let mut j = 0
+    while j < DIM {
+        let x = to_float(raw[j])
+        if norm > 0.000000001 {
+            out = push(out, x / norm)
+        } else {
+            out = push(out, 0.0)
+        }
+        j = j + 1
+    }
+    return out
+}
+
+// Aligned eigenvector = template + ε·random_unit (renormalised).
+fn aligned_vec(tpl: array, eps: float, seed0: int) -> array {
+    let r = random_unit_vec(seed0)
+    let mut raw = []
+    let mut i = 0
+    while i < DIM {
+        let t = to_float(tpl[i])
+        let rv = to_float(r[i])
+        raw = push(raw, t + eps * rv)
+        i = i + 1
+    }
+    let norm = vec_norm(raw)
+    let mut out = []
+    let mut j = 0
+    while j < DIM {
+        out = push(out, to_float(raw[j]) / norm)
+        j = j + 1
+    }
+    return out
+}
+
+// Generate K eigenvectors for a given rank.
+// First min(K,3) aligned to Hexad-C/W/M, rest pure LCG-random unit.
+fn gen_eigens(K: int) -> array {
+    let mut out = []
+    let mut i = 0
+    // base seed per K: fixed so recipe is reproducible; K is folded in
+    // so that e.g. the K=4 run's first 3 eigens match the K=2 case's first 2
+    // where possible — we keep i-indexed seeds independent of K.
+    while i < K {
+        let seed0 = SEED_BASE + 1000003 * (i + 1)
+        if i == 0 {
+            out = push(out, aligned_vec(TPL_C, NOISE_EPS, seed0))
+        } else {
+            if i == 1 {
+                out = push(out, aligned_vec(TPL_W, NOISE_EPS, seed0))
+            } else {
+                if i == 2 {
+                    out = push(out, aligned_vec(TPL_M, NOISE_EPS, seed0))
+                } else {
+                    out = push(out, random_unit_vec(seed0))
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── coverage score ─────────────────────────────────────────────────────
+
+fn coverage_score(eigens: array, templates: array) -> float {
+    let nt = len(templates)
+    let ne = len(eigens)
+    let mut total = 0.0
+    let mut j = 0
+    while j < nt {
+        let tpl = templates[j]
+        let sig = tpl[2]
+        let mut best = 0.0
+        let mut i = 0
+        while i < ne {
+            let c = abs_cos(eigens[i], sig)
+            if c > best { best = c }
+            i = i + 1
+        }
+        total = total + best
+        j = j + 1
+    }
+    return total
+}
+
+// ─── OLS fit on (x_i, y_i) returning (a, b, R²) ─────────────────────────
+
+fn ols_fit(xs: array, ys: array) -> array {
+    let n = len(xs)
+    let mut sx = 0.0
+    let mut sy = 0.0
+    let mut sxx = 0.0
+    let mut sxy = 0.0
+    let mut i = 0
+    while i < n {
+        let x = to_float(xs[i])
+        let y = to_float(ys[i])
+        sx = sx + x
+        sy = sy + y
+        sxx = sxx + x * x
+        sxy = sxy + x * y
+        i = i + 1
+    }
+    let nf = to_float(n)
+    let denom = nf * sxx - sx * sx
+    let mut b = 0.0
+    if denom > 0.000000001 || denom < 0.0 - 0.000000001 {
+        b = (nf * sxy - sx * sy) / denom
+    }
+    let a = (sy - b * sx) / nf
+    // R²
+    let mean_y = sy / nf
+    let mut ss_tot = 0.0
+    let mut ss_res = 0.0
+    let mut j = 0
+    while j < n {
+        let x = to_float(xs[j])
+        let y = to_float(ys[j])
+        let yhat = a + b * x
+        ss_res = ss_res + (y - yhat) * (y - yhat)
+        ss_tot = ss_tot + (y - mean_y) * (y - mean_y)
+        j = j + 1
+    }
+    let mut r2 = 0.0
+    if ss_tot > 0.000000001 {
+        r2 = 1.0 - ss_res / ss_tot
+    }
+    return [a, b, r2, ss_res]
+}
+
+// Piecewise fit with breakpoint at index κ (0-based index into xs array).
+// Enforces continuity: two lines share value at x_κ.
+// Strategy: parameterise as y = a + b1*(x-xκ) for x<=xκ, y = a + b2*(x-xκ) for x>=xκ.
+// Minimise SSE analytically: set ∂/∂a = ∂/∂b1 = ∂/∂b2 = 0.
+// Let L = left set (x_i <= x_κ incl κ), R = right set (x_i >= x_κ incl κ).
+// Point κ is shared in both sums conceptually (but we only count it once in residual).
+// Simpler: use indicators. Define z_i = x_i - xκ. Model y = a + b1*max(z,0)*0 wrong…
+//
+// Cleanest: two segments, break at index κ.
+//   Segment L = indices 0..κ (inclusive), segment R = indices κ..N-1.
+//   Fit line L through points 0..κ (OLS). Fit line R through points κ..N-1.
+//   Force continuity by: refit L subject to y(xκ) = a_L + b_L·xκ = a_R + b_R·xκ.
+//
+// We implement the simpler non-continuous piecewise (each segment independent)
+// and compute SSE as the sum of segment SSEs — breakpoint x_κ is counted in
+// both segments, which is standard for piecewise linear regression with
+// shared break-point node.  This avoids the need for constrained OLS.
+
+fn slice_arr(a: array, lo: int, hi: int) -> array {
+    // Returns a[lo..hi] inclusive.
+    let mut out = []
+    let mut i = lo
+    while i <= hi {
+        out = push(out, a[i])
+        i = i + 1
+    }
+    return out
+}
+
+// piecewise_fit returns [a1, b1, a2, b2, sse_total, break_x]
+fn piecewise_fit(xs: array, ys: array, k_idx: int) -> array {
+    let n = len(xs)
+    let left_x = slice_arr(xs, 0, k_idx)
+    let left_y = slice_arr(ys, 0, k_idx)
+    let right_x = slice_arr(xs, k_idx, n - 1)
+    let right_y = slice_arr(ys, k_idx, n - 1)
+    let fl = ols_fit(left_x, left_y)
+    let fr = ols_fit(right_x, right_y)
+    let sse1 = to_float(fl[3])
+    let sse2 = to_float(fr[3])
+    let bx = to_float(xs[k_idx])
+    return [fl[0], fl[1], fr[0], fr[1], sse1 + sse2, bx]
+}
+
+// ─── main sweep ─────────────────────────────────────────────────────────
+
+fn main() {
+    println("[RANK_SWEEP] edu/lora phase-jump vs gradual scaling probe")
+    let root = resolve_root()
+    let tpl_path = root + "/" + TEMPLATES_PATH
+    let out_path = root + "/" + OUT_PATH
+    println("[RANK_SWEEP] root=" + root)
+    println("[RANK_SWEEP] templates=" + tpl_path)
+
+    let templates = load_templates(tpl_path)
+    let tn = len(templates)
+    if tn != 16 {
+        println("[RANK_SWEEP] INPUT_ERR templates expected=16 got=" + to_string(tn))
+        exit(2)
+    }
+    println("[RANK_SWEEP] templates loaded: " + to_string(tn))
+
+    let nR = len(RANKS)
+    let mut xs = []
+    let mut ys = []
+    let mut ranks_f = []
+    let mut scores_f = []
+
+    let mut i = 0
+    while i < nR {
+        let K = to_int(RANKS[i])
+        let eigens = gen_eigens(K)
+        let score = coverage_score(eigens, templates)
+        let x = log2_float_pow2(K)
+        xs = push(xs, x)
+        ys = push(ys, score)
+        ranks_f = push(ranks_f, K)
+        scores_f = push(scores_f, score)
+        println("[RANK_SWEEP] K=" + to_string(K) +
+                "  log2K=" + fmt_float(x) +
+                "  score=" + fmt_float(score) +
+                "  (max=" + fmt_float(to_float(tn)) + ")")
+        i = i + 1
+    }
+
+    // Single-line fit
+    let fit1 = ols_fit(xs, ys)
+    let a1 = to_float(fit1[0])
+    let b1 = to_float(fit1[1])
+    let r2 = to_float(fit1[2])
+    let sse1 = to_float(fit1[3])
+    println("")
+    println("[RANK_SWEEP] Fit1 (gradual):  score = " +
+            fmt_float(a1) + " + " + fmt_float(b1) + " · log2(K)")
+    println("[RANK_SWEEP]   R² = " + fmt_float(r2) +
+            "   SSE = " + fmt_float(sse1))
+
+    // Piecewise fit: try breakpoint at each interior index 1,2,3
+    let break_idxs = [1, 2, 3]
+    let mut best_sse2 = 1.0e18
+    let mut best_k_idx = 1
+    let mut best_pf = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let mut bi = 0
+    while bi < 3 {
+        let k_idx = to_int(break_idxs[bi])
+        let pf = piecewise_fit(xs, ys, k_idx)
+        let sse = to_float(pf[4])
+        if sse < best_sse2 {
+            best_sse2 = sse
+            best_k_idx = k_idx
+            best_pf = pf
+        }
+        bi = bi + 1
+    }
+    let a_l = to_float(best_pf[0])
+    let b_l = to_float(best_pf[1])
+    let a_r = to_float(best_pf[2])
+    let b_r = to_float(best_pf[3])
+    let break_x = to_float(best_pf[5])
+    let break_K = to_int(RANKS[best_k_idx])
+
+    println("[RANK_SWEEP] Fit2 (piecewise, break at K=" + to_string(break_K) + "):")
+    println("[RANK_SWEEP]   left:  score = " + fmt_float(a_l) + " + " + fmt_float(b_l) + " · log2(K)")
+    println("[RANK_SWEEP]   right: score = " + fmt_float(a_r) + " + " + fmt_float(b_r) + " · log2(K)")
+    println("[RANK_SWEEP]   SSE_piecewise = " + fmt_float(best_sse2))
+
+    // F-test: F = ((SSE1 - SSE2) / (p2 - p1)) / (SSE2 / (N - p2))
+    // p1=2 (a,b), p2=4 (a_l,b_l,a_r,b_r treating κ-node shared). p2-p1=2.
+    let N = len(xs)
+    let df_num = 2
+    let df_den = N - 4
+    let mut f_stat = 0.0
+    if best_sse2 > 0.000000001 && df_den >= 1 {
+        let num = (sse1 - best_sse2) / to_float(df_num)
+        let den = best_sse2 / to_float(df_den)
+        if den > 0.000000001 {
+            f_stat = num / den
+        } else {
+            f_stat = 1.0e18
+        }
+    } else {
+        if sse1 > 0.000000001 { f_stat = 1.0e18 }
+    }
+    // 95% F(2,1) ≈ 199.5 (from F-distribution tables)
+    let F_CRIT_95 = 199.5
+
+    // Slope ratio: ratio of larger slope magnitude to smaller.
+    let abs_bl = if b_l < 0.0 { 0.0 - b_l } else { b_l }
+    let abs_br = if b_r < 0.0 { 0.0 - b_r } else { b_r }
+    let small = if abs_bl < abs_br { abs_bl } else { abs_br }
+    let big = if abs_bl > abs_br { abs_bl } else { abs_br }
+    let mut slope_ratio = 1.0
+    if small > 0.001 {
+        slope_ratio = big / small
+    } else {
+        if big > 0.001 { slope_ratio = 1000.0 }
+    }
+
+    println("[RANK_SWEEP] F-stat = " + fmt_float(f_stat) +
+            "  (F_crit(2," + to_string(df_den) + ",0.05) ≈ " + fmt_float(F_CRIT_95) + ")")
+    println("[RANK_SWEEP] slope_ratio |b_r/b_l| = " + fmt_float(slope_ratio))
+
+    // Verdict
+    let mut verdict = "INCONCLUSIVE"
+    let mut reason = ""
+    let r2_thresh = 0.95
+    let sr_phase = 3.0
+    let sr_ambig = 1.5
+    let gradual_ok = r2 > r2_thresh
+    let phase_f = f_stat > F_CRIT_95
+    let phase_sr = slope_ratio >= sr_phase
+    let ambig_sr = slope_ratio >= sr_ambig
+
+    if phase_f || phase_sr {
+        verdict = "PHASE_JUMP"
+        reason = "F-stat=" + fmt_float(f_stat) + " > F_crit=" + fmt_float(F_CRIT_95) +
+                 " OR slope_ratio=" + fmt_float(slope_ratio) + " >= " + fmt_float(sr_phase)
+    } else {
+        if gradual_ok && !ambig_sr {
+            verdict = "GRADUAL"
+            reason = "R²=" + fmt_float(r2) + " > " + fmt_float(r2_thresh) +
+                     " AND slope_ratio=" + fmt_float(slope_ratio) + " < " + fmt_float(sr_ambig)
+        } else {
+            verdict = "INCONCLUSIVE"
+            reason = "R²=" + fmt_float(r2) + " gradual_ok=" + to_string(gradual_ok) +
+                     " slope_ratio=" + fmt_float(slope_ratio) + " F=" + fmt_float(f_stat)
+        }
+    }
+    println("")
+    println("[RANK_SWEEP] VERDICT = " + verdict)
+    println("[RANK_SWEEP] reason  = " + reason)
+
+    // Emit SSOT JSON
+    let ts = now_utc()
+    let mut j = "{\n"
+    j = j + "  \"tool\": \"edu_lora_rank_sweep\",\n"
+    j = j + "  \"spec\": \"edu/lora phase-jump vs gradual scaling — 5-point rank sweep\",\n"
+    j = j + "  \"ts\": \"" + ts + "\",\n"
+    j = j + "  \"seed\": " + to_string(SEED_BASE) + ",\n"
+    j = j + "  \"noise_eps\": " + fmt_float(NOISE_EPS) + ",\n"
+    j = j + "  \"dim\": " + to_string(DIM) + ",\n"
+    j = j + "  \"template_count\": " + to_string(tn) + ",\n"
+    j = j + "  \"score_metric\": \"template_coverage = sum_j max_i |cos(eigen_i, tpl_j)|\",\n"
+    j = j + "  \"score_max\": " + fmt_float(to_float(tn)) + ",\n"
+    j = j + "  \"ranks\": [\n"
+    let nS = len(ranks_f)
+    let mut ii = 0
+    while ii < nS {
+        let K = to_int(ranks_f[ii])
+        let sc = to_float(scores_f[ii])
+        let lk = to_float(xs[ii])
+        j = j + "    {\"K\": " + to_string(K) +
+                ", \"log2_K\": " + fmt_float(lk) +
+                ", \"score\": " + fmt_float(sc) + "}"
+        if ii < nS - 1 { j = j + "," }
+        j = j + "\n"
+        ii = ii + 1
+    }
+    j = j + "  ],\n"
+    j = j + "  \"fit_single\": {\n"
+    j = j + "    \"form\": \"score = a + b * log2(K)\",\n"
+    j = j + "    \"a\": " + fmt_float(a1) + ",\n"
+    j = j + "    \"b\": " + fmt_float(b1) + ",\n"
+    j = j + "    \"r_squared\": " + fmt_float(r2) + ",\n"
+    j = j + "    \"sse\": " + fmt_float(sse1) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"fit_piecewise\": {\n"
+    j = j + "    \"break_K\": " + to_string(break_K) + ",\n"
+    j = j + "    \"break_log2_K\": " + fmt_float(break_x) + ",\n"
+    j = j + "    \"left\":  {\"a\": " + fmt_float(a_l) + ", \"b\": " + fmt_float(b_l) + "},\n"
+    j = j + "    \"right\": {\"a\": " + fmt_float(a_r) + ", \"b\": " + fmt_float(b_r) + "},\n"
+    j = j + "    \"sse\": " + fmt_float(best_sse2) + ",\n"
+    j = j + "    \"slope_ratio\": " + fmt_float(slope_ratio) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"f_test\": {\n"
+    j = j + "    \"f_stat\": " + fmt_float(f_stat) + ",\n"
+    j = j + "    \"df_num\": " + to_string(df_num) + ",\n"
+    j = j + "    \"df_den\": " + to_string(df_den) + ",\n"
+    j = j + "    \"f_crit_95\": " + fmt_float(F_CRIT_95) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"verdict\": \"" + verdict + "\",\n"
+    j = j + "  \"reason\": \"" + json_escape(reason) + "\",\n"
+    j = j + "  \"cell_c10_comparison\": {\n"
+    j = j + "    \"cell_verdict\": \"PHASE_JUMP\",\n"
+    j = j + "    \"cell_evidence\": \"3-gen distill eff 0.539 partial → 4-gen predicted 0.75-0.85 (critical transition)\"\n"
+    j = j + "  }\n"
+    j = j + "}\n"
+    write_file(out_path, j)
+    println("[RANK_SWEEP] ssot written: " + out_path)
+
+    if verdict == "PHASE_JUMP" || verdict == "GRADUAL" { exit(0) }
+    exit(1)
+}
