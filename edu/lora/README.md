@@ -23,7 +23,10 @@
 
 - r12 Phase-5 trainer FFI wired, r13 corpus pre-drill quality gate 4종 PASS (10MB mock)
 - CLM r6 hetzner smoke blocked (ubu RTX 5070 SSH offline)
-- AN11 verifier triple landed, **AN11(c) real_usable gap-close 100% (REAL data only)** — a/b 는 synthetic 잔존, real artifact 1/3
+- AN11 verifier triple landed, **AN11(c) real_usable gap-close 100% (REAL data only, `35aa051a`)** — a/b 는 synthetic 잔존, real artifact 1/3
+- **Mk.VI candidate freeze 2026-04-21T02:40:00Z (`a3cb2116`)** — 16/19 PASS, promotion HELD (AN11 a/b real-ckpt 미존재)
+- **rank-sweep verdict PHASE_JUMP @ K=4 (`12054024`)** — slope ratio 6.69×, R²(single)=0.782 (< 0.95 gate)
+- **CPU-path L12 3 real-trained LoRA artifacts closed (2026-04-21)** — ΔCE > 0 all 3/3, SHA256 deterministic
 
 ## ο AN11(c) real_usable (JSD baseline diff) — 100%
 
@@ -123,9 +126,13 @@ consciousness templates (max=16.0).
 ## 100% 완료 시 갱신 예약
 
 real training run 후:
-- phi_vec / LoRA eigenvec / endpoint 3 artifact 실값 기록
-- AN11 triple real verdict (delta vs synthetic)
-- Mk.VI 승급 최종 timestamp
+- phi_vec (AN11 a) 실값 기록 **(pending — H100/RTX 5070 live ckpt 대기)**
+- LoRA eigenvec (AN11 b) 실값 기록 **(pending — 동일)**
+- ~~endpoint (AN11 c) 실값 기록~~ **완료 2026-04-21 (`35aa051a`, REAL data JSD=1.000, CI=[1,1], p=0)**
+- AN11 triple real verdict (delta vs synthetic) **(c real done, a/b pending)**
+- Mk.VI 승급 최종 timestamp **(HELD 2026-04-21T02:40:00Z `a3cb2116`)**
+- ~~rank-sweep phase-jump verdict~~ **완료 2026-04-21 (`12054024`, PHASE_JUMP @ K=4, slope ratio 6.69×)**
+- ~~CPU-path 3 real-trained LoRA artifact (L12)~~ **완료 2026-04-21 (3/3 ΔCE>0, deterministic SHA256)**
 
 ## CPU-path L12 — 3 real-trained artifact SHA (2026-04-21 closure)
 

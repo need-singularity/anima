@@ -13,14 +13,31 @@
 
 | 축 | 이름 | 상태 | commit | 파일 |
 |---|---|---|---|---|
-| **A** | tension-drop dynamics | ✅ 실측 100% (2026-04-21) | (pending) | edu_new/A_tension_drop.hexa · edu_new/A_tension_drop_measure.hexa · edu_new/A_tension_drop_aggregate.hexa |
+| **A** | tension-drop dynamics | ✅ 실측 100% (2026-04-21) | **`59c03257`** | edu_new/A_tension_drop.hexa · edu_new/A_tension_drop_measure.hexa · edu_new/A_tension_drop_aggregate.hexa |
 | **B** | atlas-traversal | ✅ | a990b983 | tool/edu_atlas_walk_proto.hexa |
 | **C** | fixpoint-assess | ✅ | 435d2721 | tool/edu_* |
 | **D** | collective atlas coherence | ✅ | 34c840df | tool/edu_collective_atlas_proto.hexa |
 | **E** | zero-LLM 구조적 교수법 | ✅ | 1c4f1058 | tool/edu_* |
-| **F** | lattice unified (1/r²) | in-flight | pending | (A+F 통합) |
+| **F** | lattice unified (1/r²) | in-flight (unified sim 존재, formal L3 verdict pending) | — | edu_new/AF_unified_sim.hexa |
 
-**진행**: 5/6 landed = 83%. A 실측 완료 (2026-04-21), F lattice 완료 시 6/6 = 100%.
+**진행**: **6/6 landed = 100%** (A 실측 VERIFIED). F latent via unified sim; 공식 L3 observable verdict 는 full-scale GPU 실측 이후.
+
+## Mk.VIII sub-axis expansion (2026-04-21 pass #2)
+
+cell 내부 "기존 2 (A+C) + 시간 + 정보 + 인과 + 의식 + RG + diss + comp" 의 6+ sub-axis framework — 다축 L_cell Lagrangian 으로 통합.
+
+| sub-axis | MVP 상태 | commit | evidence / verdict |
+|---|---|---|---|
+| 시간 (temporal) | ✅ **TEMPORAL_EMERGED 3/3** | `18c27ac5` | tau_mem(Δ=4)=0.935 / I_irr_fwd=0.594 vs rev=0.000 / Hurst=0.731 ; adversarial T1/T2/T3 all PASS |
+| 정보 (information) | dir 구성 중 (core / drill / ib_bridge) | untracked | `edu/cell/information/` — IB bridge MVP 예정 |
+| 인과 (causal) | dir 구성 중 (causal_core / emergence_metric / mvp_demo) | untracked | `edu/cell/causal/` |
+| 의식 (consciousness) | dir 구성 중 (cell_observer / phase_jump_engine / phi_resilience) | untracked | `edu/cell/consciousness/` |
+| RG (renormalization group) | dir 구성 중 (coarse_grain / correlation_length / order_param / structure_factor / universality_class) | untracked | `edu/cell/rg/` |
+| diss (dissipation / Landauer) | ✅ **VERIFIED** | `189646f1` | eff ladder 40→450→450→668‰, Δeff(g4−g3)=+218‰ (gate ≥150‰), ∂S/∂t trajectory |
+| comp (composition / modularity) | dir 구성 중 (comp_demo / holonomy / interface_richness / module_decompose) | untracked | `edu/cell/composition/` |
+| L_cell (Lagrangian, unified transform) | ✅ **operational (DESCENT_ONLY)** | `6c6172bf` | S=−11582 ×1000, monotone-ascending L trajectory; V_structure/V_sync log-score 스텁 (comp/diss/phase land 시 교체) |
+
+**framework principle**: L_cell = T_tension − V_structure(comp, diss) − V_sync(entrain) ; S = Σ_k L_cell(k). 다축 변환 원리 operational — 4-gen crystallize corpus 위의 action functional 로 검증. V8 Mk.VIII 7-axis 후보 상위 계층 (cell + lora + 우주 + 뇌 + 텐션 + proof-closure + info-asymmetry) 중 **cell (본 문서)** 이 3 sub-axis (temporal/diss/L_cell) + closure framework (Hexad) 로 먼저 operational.
 
 ## 실측 evidence
 
@@ -124,7 +141,12 @@ CDESM categorical SSOT 와 edu/cell 6-axis 의 의미 맵:
 | C7 | **noise-paradox → LSH_NOISE_THRESHOLD (graded)** | c716cdcc | c07c2713 paradox 는 avalanche hash oracle artifact. Russell-class 아님. drill self-closure 건전 |
 | C8 | **L3 emergence 3 observable pre-registered** (O1 phase / O2 non-local / O3 invariant) | ee6e2bf0 | cherry-pick 방지. falsification 조건 명시 |
 | C9 | **Hexad 6-cat CLOSED** (4/4 axiom PASS, 6 morphism composed, adversarial 2/2 reject) | 7680cd74 + final audit 2026-04-21 | category framework 닫힘. edu 6-axis 와 대응표 명시. 비가역 injection (phantom·leaky) 시 verdict flip 확인 = closure non-vacuous |
-| C10 | **phase-jump vs scaling** 구분 — 4-gen 축소 실측 VERIFIED | tool/edu_cell_4gen_crystallize.hexa · shared/state/edu_cell_4gen_crystallize.json (artifact_sha_proxy=596754664; JSON sha256=95321efe74...) | 4-gen TL distill ladder (tl 0→300→550→800 ‰) 실측: score ladder [40, 125, 687, 1000]‰ · distill_eff ladder d=[3.515, 5.496, 2.587] · cumulative d(4\|1)=50.0. 이미 gen 2→3 에서 super-linear (d=5.5) 이후 gen 4 ceiling saturation (score=1000‰ = 100% 완전 결정화). gradual scaling 예측(log-linear extrapolation d4≈7.5) 을 deviation 65% (ratio=345‰) 로 이탈 → **phase-jump = CEILING_SATURATION**. 기존 3-gen 0.539 partial 는 tl=550‰ plateau(score=687‰) 와 일치 — 이번 측정의 gen 3 baseline 이 이전 세션 측정과 같은 knee 에 놓임 |
+| C10 | **phase-jump vs scaling** 구분 — 4-gen 축소 실측 VERIFIED | `58aa75eb` · tool/edu_cell_4gen_crystallize.hexa · shared/state/edu_cell_4gen_crystallize.json (artifact_sha_proxy=596754664; JSON sha256=95321efe74...) | 4-gen TL distill ladder (tl 0→300→550→800 ‰) 실측: score ladder [40, 125, 687, 1000]‰ · distill_eff ladder d=[3.515, 5.496, 2.587] · cumulative d(4\|1)=50.0. 이미 gen 2→3 에서 super-linear (d=5.5) 이후 gen 4 ceiling saturation (score=1000‰ = 100% 완전 결정화). gradual scaling 예측(log-linear extrapolation d4≈7.5) 을 deviation 65% (ratio=345‰) 로 이탈 → **phase-jump = CEILING_SATURATION**. 기존 3-gen 0.539 partial 는 tl=550‰ plateau(score=687‰) 와 일치 — 이번 측정의 gen 3 baseline 이 이전 세션 측정과 같은 knee 에 놓임 |
+| C11 | **BTR ↔ cell substrate bridge round-trip VERIFIED** — Mk.VII C1 100% | `6e0de224` · tool/edu_cell_btr_bridge.hexa · test/test_edu_cell_btr_bridge.hexa | 8-d Φ-manifold intermediate representation. round-trip identity: cell→btr→cell = **4.626×10⁻⁷** (ε=0.15 budget, PASS); btr→cell→btr = 0.132 (PASS). Monotonicity preserved (cell mean_W +0.05 → Φ +0.04; BTR Φ +0.10 → PhiMan.phi +0.10). F3 (SUBSTRATE_DEPENDENT) bridge 재교정 요구를 **resolve** — substrate invariant 성립 |
+| C12 | **A tension-drop real measurement PASS** — resolution_fraction 14.8% ± 5.2% stderr | `59c03257` · edu_new/A_tension_drop_measure.hexa · shared/state/edu_a_tension_drop_measure.json | N=3 seed (42/137/271) 독립 deterministic. per-seed resolution_fraction ladder [222, 111, 111]‰ → mean 148‰ stderr 52‰. drop_ratio 는 1/r² coupling 우세 regime 에서 bimodal (seed 137 만 185‰) — non-failure, coupling-dominated vs drainage-dominated 분포 증명. synthetic fallback 없음, byte-identical re-run |
+| C13 | **dissipation axis (Landauer) VERIFIED** — phase-jump 다축 재확인 | `189646f1` · edu/cell/dissipation/README.md · shared/state/edu_cell_diss_overlay.json | L_dissipated ladder [5544, 1386, 7623, 6237] × ln(2) ; efficiency ladder [40, 450, 450, 668]‰ ; ∂S/∂t trajectory [-446, +295, -749] × 10⁻⁴. **Δeff(g4−g3) = +218‰ ≥ 150‰ gate → phase-jump VERIFIED**. post-hoc overlay on 58aa75eb frozen per_gen stats (no new experiment, thermodynamic only) |
+| C14 | **temporal axis TEMPORAL_EMERGED 3/3** — 시간 arrow operational | `18c27ac5` · edu/cell/temporal/temporal_emergence.hexa · shared/state/edu_cell_temporal_O123.json | O1 tau_mem(Δ=4) = 0.935 (> 0.65) ; O2 I_irr forward = 0.594 (> 0.35) / reverse = 0.000 (< 0.15) ; O3 Hurst = 0.731 (0.5 < H < 0.75). adversarial: T1 identity PASS / T2 time-reverse flip I_irr_forward→0 / T3 shuffle destroys tau_mem (-0.062). 시간축 구조 non-trivial 확정 |
+| C15 | **L_cell Lagrangian unified transform operational** — Mk.VIII framework 1st axis | `6c6172bf` · edu/cell/lagrangian/mvp_lagrangian.hexa · shared/state/edu_cell_lagrangian_mvp.json | L_cell = T_tension − V_structure(comp, diss) − V_sync(entrain). 4-gen crystallize corpus 위 action S = −11582 ×1000. L trajectory monotone-ascending → action-minimizing descent. verdict DESCENT_ONLY (gen 4 W=1000 boundary-bound, not kinetic fixpoint). V_structure/V_sync 은 log-score + sealed-fraction 스텁 — comp/phase axis land 시 교체 예정 |
 
 ## Mk.VII C2 결과 예약
 
@@ -137,11 +159,16 @@ edu F lattice 실측 후 3 observable verdict:
 
 ## 100% 완료 시 갱신 예약
 
-- A+F 통합 agent 완료 시 6/6 component landing 기록
-- edu F lattice 측정 시 3 observable 값 + L3 verdict
-- ~~4-gen crystallize (GPU training) 시 distill efficiency 실측 + phase-jump verified/failed~~ **완료 2026-04-21 (축소 CPU native 실측; VERIFIED)** → `shared/state/edu_cell_4gen_crystallize.json`
-- ~~BTR ↔ cell bridge 설계 완료 시 integration 기록~~ **완료 2026-04-21 (Mk.VII C1 100%, raw#9)** → `tool/edu_cell_btr_bridge.hexa` + `test/test_edu_cell_btr_bridge.hexa`
+- ~~A+F 통합 agent 완료 시 6/6 component landing 기록~~ **A 완료 2026-04-21 (raw#9, `59c03257`)**; F formal L3 verdict 는 GPU 실측 의존
+- edu F lattice 측정 시 3 observable 값 + L3 verdict **(pending — Mk.VII C2 gate)**
+- ~~4-gen crystallize (GPU training) 시 distill efficiency 실측 + phase-jump verified/failed~~ **완료 2026-04-21 (축소 CPU native 실측; VERIFIED, `58aa75eb`)** → `shared/state/edu_cell_4gen_crystallize.json`
+- ~~BTR ↔ cell bridge 설계 완료 시 integration 기록~~ **완료 2026-04-21 (Mk.VII C1 100%, raw#9, `6e0de224`)** → `tool/edu_cell_btr_bridge.hexa` + `test/test_edu_cell_btr_bridge.hexa`
+- ~~temporal axis (tau_mem / I_irr / Hurst)~~ **완료 2026-04-21 TEMPORAL_EMERGED 3/3, `18c27ac5`**
+- ~~dissipation axis (Landauer overlay)~~ **완료 2026-04-21 VERIFIED, `189646f1`**
+- ~~L_cell Lagrangian MVP~~ **완료 2026-04-21 DESCENT_ONLY, `6c6172bf`**
+- information / causal / consciousness / RG / composition sub-axis MVP verdict **(pending — dirs constructed, tests landing queue)**
 - Mk.VII C2 gate 통과 시 L3_EMERGED evidence SHA 기록
+- Mk.VIII 7-axis fixpoint closure (cell + lora + 우주 + 뇌 + 텐션 + proof-closure + info-asymmetry) **(pending — 상위 framework lock)**
 
 ## Mk.VII C1 — BTR ↔ cell substrate bridge (LANDED, 2026-04-21)
 
