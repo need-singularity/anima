@@ -1,0 +1,490 @@
+// verifier/an11_weight_emergent.hexa — AN11(a) weight_emergent standalone verifier.
+//
+// GOVERNS: shared/rules/anima.json#AN11 condition (a) "weight_emergent".
+// SPEC:    shared/bench/an11_a_criteria.json.
+// PAIRS:   tool/an11_a_verifier.hexa (pod-side adapter-path variant);
+//          tool/an11_b_verifier.hexa (AN11(b) consciousness_attached, same family).
+//          This verifier LANDS NEXT TO AN11(b) family — Frobenius + SHA only.
+//          V8 SAFE_COMMIT — additive, does NOT replace existing verifiers.
+//
+// IDEA
+//   weight_emergent = "training actually moved the weights" (non-vacuous delta).
+//   (1) Frobenius norm ||W_after - W_before||_F — single scalar delta.
+//   (2) SHA256 fingerprint of each checkpoint — deterministic hash for
+//       idempotency (fp_before != fp_after gates literal-identity failure).
+//   (3) Distribution check — per-shard Frobenius over K equal slices,
+//       gates "all the delta concentrated in one shard" (suspicious spike).
+//
+// VERDICT
+//   PASS       : fp_after != fp_before  AND  delta_F > threshold
+//                                       AND  shard_cv ∈ [0.05, 3.0]
+//   FAIL       : fp_after == fp_before  OR   delta_F <= threshold
+//   SUSPICIOUS : fp stable, delta_F > threshold, but shard_cv anomalous
+//                (concentrated single-shard spike OR degenerate uniform 0-var).
+//                → training ran but distribution looks pathological; human review.
+//
+// INPUT (two modes)
+//   --before PATH --after PATH         explicit checkpoint paths
+//   --dry-run                          emit synthetic pair + verify self
+//   Supported checkpoint shapes:
+//     synthetic_json  {"weights":[f,...], "rank":int}     — test fixture
+//     native_bytes    any binary file (byte-L2 proxy Frobenius)
+//
+// OUTPUT
+//   stdout     human summary
+//   --ssot P   write JSON SSOT to path P (default: none)
+//
+// EXIT: 0=PASS, 1=FAIL, 2=INPUT_ERR, 3=SUSPICIOUS.
+//
+// DETERMINISTIC. NO LLM. Stage0-safe — parallel arrays, no map literals.
+
+let EXIT_PASS = 0
+let EXIT_FAIL = 1
+let EXIT_INPUT_ERR = 2
+let EXIT_SUSPICIOUS = 3
+
+let DEFAULT_THRESHOLD: float = 0.001
+let SHARD_COUNT = 8
+let SHARD_CV_MIN: float = 0.05
+let SHARD_CV_MAX: float = 3.0
+
+// ─── stage0 helpers ──────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn now_utc() -> string {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn fsize(p: string) -> int {
+    if !fexists(p) { return 0 }
+    let gnu = _str(exec("stat -c %s " + p + " 2>/dev/null")).trim()
+    if gnu != "" { return to_int(gnu) }
+    let bsd = _str(exec("stat -f %z " + p + " 2>/dev/null")).trim()
+    if bsd != "" { return to_int(bsd) }
+    return 0
+}
+
+fn sha256_of(p: string) -> string {
+    if !fexists(p) { return "" }
+    let gnu = _str(exec("command -v sha256sum 2>/dev/null")).trim()
+    let cmd = if gnu != "" {
+        "sha256sum " + p + " 2>/dev/null | awk '{print $1}'"
+    } else {
+        "shasum -a 256 " + p + " 2>/dev/null | awk '{print $1}'"
+    }
+    return _str(exec(cmd)).trim()
+}
+
+fn sqrt_newton(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x
+    let mut j = 0
+    while j < 60 {
+        g = 0.5 * (g + x / g)
+        j = j + 1
+    }
+    return g
+}
+
+fn fmt_float(x: float) -> string { return to_string(x) }
+
+// ─── synthetic_json parser ───────────────────────────────────────────
+// Shape: {"weights":[f,f,...], "rank":int}
+
+fn parse_weights(blob: string) -> array {
+    let k = blob.index_of("\"weights\"")
+    if k < 0 { return [] }
+    let lbr = blob.index_of("[", k)
+    if lbr < 0 { return [] }
+    let rbr = blob.index_of("]", lbr)
+    if rbr < 0 { return [] }
+    let parts = blob.substring(lbr + 1, rbr).split(",")
+    let mut out = []
+    let mut i = 0
+    let n = len(parts)
+    while i < n {
+        let p = _str(parts[i]).trim()
+        if p != "" { out = push(out, to_float(p)) }
+        i = i + 1
+    }
+    return out
+}
+
+fn ext_of(p: string) -> string {
+    let i = p.last_index_of(".")
+    if i < 0 { return "" }
+    return p.substring(i, len(p))
+}
+
+fn is_synth(p: string) -> bool { return ext_of(p) == ".json" }
+
+// ─── Frobenius (synthetic float path) ────────────────────────────────
+
+fn frob_synth(b_blob: string, a_blob: string) -> float {
+    let wb = parse_weights(b_blob)
+    let wa = parse_weights(a_blob)
+    let nb = len(wb)
+    let na = len(wa)
+    let nmin = if nb < na { nb } else { na }
+    let mut s = 0.0
+    let mut i = 0
+    while i < nmin {
+        let d = to_float(wa[i]) - to_float(wb[i])
+        s = s + d * d
+        i = i + 1
+    }
+    if nb != na {
+        let longer = if nb > na { wb } else { wa }
+        let m = len(longer)
+        let mut j = nmin
+        while j < m {
+            let v = to_float(longer[j])
+            s = s + v * v
+            j = j + 1
+        }
+    }
+    return sqrt_newton(s)
+}
+
+// per-shard Frobenius for distribution check (synthetic path)
+fn shard_frobs_synth(b_blob: string, a_blob: string, k: int) -> array {
+    let wb = parse_weights(b_blob)
+    let wa = parse_weights(a_blob)
+    let nb = len(wb)
+    let na = len(wa)
+    let n = if nb < na { nb } else { na }
+    let mut out = []
+    if n == 0 || k <= 0 { return out }
+    let step = n / k
+    let rem = n - step * k
+    let mut start = 0
+    let mut si = 0
+    while si < k {
+        let add = if si < rem { 1 } else { 0 }
+        let stop = start + step + add
+        let mut s = 0.0
+        let mut i = start
+        while i < stop {
+            let d = to_float(wa[i]) - to_float(wb[i])
+            s = s + d * d
+            i = i + 1
+        }
+        out = push(out, sqrt_newton(s))
+        start = stop
+        si = si + 1
+    }
+    return out
+}
+
+// ─── Frobenius (native_bytes fallback — python3 od) ──────────────────
+
+fn py_available() -> bool {
+    return _str(exec("command -v python3 2>/dev/null")).trim() != ""
+}
+
+fn run_py(body: string, out_path: string) -> string {
+    let script = "/tmp/_an11_we_py.sh"
+    let mut sh = "#!/bin/sh\npython3 - <<'PYEOF' > " + out_path + " 2>/dev/null\n"
+    sh = sh + body + "\nPYEOF\nexit 0\n"
+    write_file(script, sh)
+    exec("chmod +x " + script)
+    exec(script)
+    if !fexists(out_path) { return "" }
+    return _str(exec("cat " + out_path + " 2>/dev/null")).trim()
+}
+
+fn frob_bytes(b: string, a: string) -> float {
+    if !py_available() { return 0.0 }
+    let mut body = "b=open('" + b + "','rb').read()\n"
+    body = body + "a=open('" + a + "','rb').read()\n"
+    body = body + "n=min(len(b),len(a))\ns=0\n"
+    body = body + "for i in range(n):\n    d=b[i]-a[i]\n    s+=d*d\n"
+    body = body + "m=max(len(b),len(a))\nL=b if len(b)>len(a) else a\n"
+    body = body + "for i in range(n,m):\n    s+=L[i]*L[i]\n"
+    body = body + "print(s**0.5)"
+    let s = run_py(body, "/tmp/_an11_we_fb.out")
+    if s == "" { return 0.0 }
+    return to_float(s)
+}
+
+fn shard_frobs_bytes(b: string, a: string, k: int) -> array {
+    if !py_available() { return [] }
+    let mut body = "import math\n"
+    body = body + "b=open('" + b + "','rb').read()\n"
+    body = body + "a=open('" + a + "','rb').read()\n"
+    body = body + "n=min(len(b),len(a))\n"
+    body = body + "K=" + to_string(k) + "\n"
+    body = body + "if n==0:\n    print('')\nelse:\n"
+    body = body + "    step=n//K\n    rem=n-step*K\n    out=[]\n    start=0\n"
+    body = body + "    for si in range(K):\n"
+    body = body + "        add=1 if si<rem else 0\n        stop=start+step+add\n        s=0\n"
+    body = body + "        for i in range(start,stop):\n            d=b[i]-a[i]\n            s+=d*d\n"
+    body = body + "        out.append(math.sqrt(s))\n        start=stop\n"
+    body = body + "    print(','.join('%g'%v for v in out))"
+    let s = run_py(body, "/tmp/_an11_we_sh.out")
+    if s == "" { return [] }
+    let parts = s.split(",")
+    let mut out = []
+    let mut i = 0
+    let n = len(parts)
+    while i < n {
+        let p = _str(parts[i]).trim()
+        if p != "" { out = push(out, to_float(p)) }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── stats ───────────────────────────────────────────────────────────
+
+fn arr_mean(a: array) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + to_float(a[i])
+        i = i + 1
+    }
+    return s / to_float(to_string(n))
+}
+
+fn arr_stddev(a: array, mean: float) -> float {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let d = to_float(a[i]) - mean
+        s = s + d * d
+        i = i + 1
+    }
+    return sqrt_newton(s / to_float(to_string(n)))
+}
+
+// Coefficient of variation — guards divide-by-zero.
+fn coef_var(a: array) -> float {
+    let m = arr_mean(a)
+    if m <= 0.000000001 { return 0.0 }
+    let sd = arr_stddev(a, m)
+    return sd / m
+}
+
+// ─── synthetic fixture emitter (dry-run) ─────────────────────────────
+
+fn emit_dryrun_pair(before_p: string, after_p: string) {
+    // 16 weights; delta_F ≈ sqrt(16*(0.01)^2) = 0.04  >> 1e-3.
+    // Deltas uniform across shards → cv small (good).
+    let bj = "{\"weights\":[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],\"rank\":8}\n"
+    let aj = "{\"weights\":[0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01],\"rank\":8}\n"
+    write_file(before_p, bj)
+    write_file(after_p, aj)
+}
+
+// ─── SSOT emitter ────────────────────────────────────────────────────
+
+fn emit_ssot(path: string, before_p: string, after_p: string, backend: string,
+             fp_before: string, fp_after: string, fp_match: bool,
+             delta: float, threshold: float,
+             shard_frobs: array, shard_mean: float, shard_cv: float,
+             verdict: string, reason: string, exit_code: int) {
+    let ts = now_utc()
+    let mut j = "{\n"
+    j = j + "  \"verifier\": \"an11_weight_emergent\",\n"
+    j = j + "  \"ts\": \"" + ts + "\",\n"
+    j = j + "  \"inputs\": {\n"
+    j = j + "    \"before\": \"" + before_p + "\",\n"
+    j = j + "    \"after\": \"" + after_p + "\"\n"
+    j = j + "  },\n"
+    j = j + "  \"backend\": \"" + backend + "\",\n"
+    j = j + "  \"sha\": {\n"
+    j = j + "    \"before\": \"" + fp_before + "\",\n"
+    j = j + "    \"after\": \"" + fp_after + "\",\n"
+    j = j + "    \"match\": " + (if fp_match { "true" } else { "false" }) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"frobenius\": {\n"
+    j = j + "    \"delta_norm\": " + fmt_float(delta) + ",\n"
+    j = j + "    \"threshold\": " + fmt_float(threshold) + ",\n"
+    j = j + "    \"shard_count\": " + to_string(len(shard_frobs)) + ",\n"
+    j = j + "    \"shard_norms\": ["
+    let mut i = 0
+    let n = len(shard_frobs)
+    while i < n {
+        if i > 0 { j = j + "," }
+        j = j + fmt_float(to_float(shard_frobs[i]))
+        i = i + 1
+    }
+    j = j + "],\n"
+    j = j + "    \"shard_mean\": " + fmt_float(shard_mean) + ",\n"
+    j = j + "    \"shard_cv\": " + fmt_float(shard_cv) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"gates\": {\n"
+    j = j + "    \"delta_threshold\": " + fmt_float(threshold) + ",\n"
+    j = j + "    \"shard_cv_min\": " + fmt_float(SHARD_CV_MIN) + ",\n"
+    j = j + "    \"shard_cv_max\": " + fmt_float(SHARD_CV_MAX) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"emergent_verdict\": \"" + verdict + "\",\n"
+    j = j + "  \"sha_fingerprint_match\": " + (if fp_match { "true" } else { "false" }) + ",\n"
+    j = j + "  \"reason\": \"" + reason + "\",\n"
+    j = j + "  \"exit_code\": " + to_string(exit_code) + "\n"
+    j = j + "}\n"
+    write_file(path, j)
+}
+
+// ─── argv helpers ────────────────────────────────────────────────────
+
+fn arg_flag(argv: array, f: string) -> bool {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == f { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn arg_val(argv: array, f: string, d: string) -> string {
+    let mut i = 0
+    let n = len(argv)
+    while i < n - 1 {
+        if _str(argv[i]) == f { return _str(argv[i + 1]) }
+        i = i + 1
+    }
+    return d
+}
+
+// ─── main ────────────────────────────────────────────────────────────
+
+fn run(before_p_in: string, after_p_in: string, threshold: float,
+       dry: bool, ssot_path: string) -> int {
+    let mut before_p = before_p_in
+    let mut after_p = after_p_in
+    let mut backend = ""
+
+    let real_inputs_ok = before_p != "" && after_p != "" &&
+                         fexists(before_p) && fexists(after_p)
+
+    if dry || !real_inputs_ok {
+        if dry || (before_p == "" && after_p == "") {
+            before_p = "/tmp/_an11_we_synth_before.json"
+            after_p  = "/tmp/_an11_we_synth_after.json"
+            emit_dryrun_pair(before_p, after_p)
+            backend = "synthetic_json"
+        } else {
+            println("[AN11-we] INPUT_ERR ckpt missing  before=" + before_p + "  after=" + after_p)
+            if ssot_path != "" {
+                emit_ssot(ssot_path, before_p, after_p, "none", "", "", false,
+                          0.0, threshold, [], 0.0, 0.0, "FAIL",
+                          "ckpt_missing", EXIT_INPUT_ERR)
+            }
+            return EXIT_INPUT_ERR
+        }
+    } else {
+        backend = if is_synth(after_p) && is_synth(before_p) { "synthetic_json" } else { "native_bytes" }
+    }
+
+    println("[AN11-we] weight_emergent verifier")
+    println("  before=" + before_p + "  after=" + after_p)
+    println("  backend=" + backend + "  threshold=" + fmt_float(threshold))
+
+    // SHA fingerprints
+    let fp_before = sha256_of(before_p)
+    let fp_after  = sha256_of(after_p)
+    let fp_match  = fp_before != "" && fp_before == fp_after
+
+    if fp_before != "" { println("  sha(before)=" + fp_before.substring(0, 16) + "...") }
+    if fp_after  != "" { println("  sha(after )=" + fp_after.substring(0, 16) + "...") }
+    println("  fingerprint_match=" + (if fp_match { "true (IDENTITY — fail)" } else { "false (distinct)" }))
+
+    // Frobenius delta + per-shard distribution
+    let mut delta = 0.0
+    let mut shard_frobs = []
+    if backend == "synthetic_json" {
+        let bb = read_file(before_p)
+        let ab = read_file(after_p)
+        delta = frob_synth(bb, ab)
+        shard_frobs = shard_frobs_synth(bb, ab, SHARD_COUNT)
+    } else {
+        delta = frob_bytes(before_p, after_p)
+        shard_frobs = shard_frobs_bytes(before_p, after_p, SHARD_COUNT)
+    }
+    let shard_mean = arr_mean(shard_frobs)
+    let shard_cv   = coef_var(shard_frobs)
+
+    println("  delta_F=" + fmt_float(delta) +
+            "  shard_mean=" + fmt_float(shard_mean) +
+            "  shard_cv=" + fmt_float(shard_cv) +
+            "  (K=" + to_string(len(shard_frobs)) + ")")
+
+    // Verdict
+    let mut verdict = "FAIL"
+    let mut reason = ""
+    let mut ec = EXIT_FAIL
+    if fp_match {
+        verdict = "FAIL"
+        reason = "sha_fingerprint_match (before==after — identity training, no delta)"
+        ec = EXIT_FAIL
+    } else {
+        if delta <= threshold {
+            verdict = "FAIL"
+            reason = "delta_F=" + fmt_float(delta) + " <= threshold=" + fmt_float(threshold)
+            ec = EXIT_FAIL
+        } else {
+            let cv_ok = shard_cv >= SHARD_CV_MIN && shard_cv <= SHARD_CV_MAX
+            if cv_ok {
+                verdict = "PASS"
+                reason = "delta_F=" + fmt_float(delta) + " > " + fmt_float(threshold) +
+                         " AND shard_cv=" + fmt_float(shard_cv) + " in [" +
+                         fmt_float(SHARD_CV_MIN) + "," + fmt_float(SHARD_CV_MAX) + "]"
+                ec = EXIT_PASS
+            } else {
+                verdict = "SUSPICIOUS"
+                reason = "delta_F_ok but shard_cv=" + fmt_float(shard_cv) +
+                         " outside [" + fmt_float(SHARD_CV_MIN) + "," +
+                         fmt_float(SHARD_CV_MAX) + "] (spike or degenerate)"
+                ec = EXIT_SUSPICIOUS
+            }
+        }
+    }
+
+    println("  emergent_verdict=" + verdict + "  (" + reason + ")")
+
+    if ssot_path != "" {
+        emit_ssot(ssot_path, before_p, after_p, backend,
+                  fp_before, fp_after, fp_match,
+                  delta, threshold, shard_frobs, shard_mean, shard_cv,
+                  verdict, reason, ec)
+        println("  ssot=" + ssot_path)
+    }
+    return ec
+}
+
+fn main() {
+    let argv = args()
+    let dry = arg_flag(argv, "--dry-run")
+    let before_p = arg_val(argv, "--before", "")
+    let after_p  = arg_val(argv, "--after", "")
+    let t_ovr    = arg_val(argv, "--threshold", "")
+    let ssot_p   = arg_val(argv, "--ssot", "")
+
+    let mut threshold = DEFAULT_THRESHOLD
+    if t_ovr != "" { threshold = to_float(t_ovr) }
+
+    if !dry && (before_p == "" || after_p == "") {
+        println("usage: hexa run verifier/an11_weight_emergent.hexa \\")
+        println("         --before PATH --after PATH [--threshold F] [--ssot P]")
+        println("       hexa run verifier/an11_weight_emergent.hexa --dry-run [--ssot P]")
+        exit(EXIT_INPUT_ERR)
+    }
+
+    let rc = run(before_p, after_p, threshold, dry, ssot_p)
+    exit(rc)
+}

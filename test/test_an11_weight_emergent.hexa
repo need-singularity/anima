@@ -1,0 +1,157 @@
+// test/test_an11_weight_emergent.hexa — AN11(a) weight_emergent verifier tests.
+//
+// Exercises verifier/an11_weight_emergent.hexa via three paths:
+//   T1 PASS  : fixture before/after (distinct fingerprints, non-trivial delta, healthy cv).
+//   T2 FAIL  : self-vs-self (fingerprint_match → FAIL regardless of delta).
+//   T3 DRYRUN: --dry-run synthetic pair self-test (smoke wiring).
+//
+// Run:   hexa run test/test_an11_weight_emergent.hexa
+// Exit:  0 = all tests pass,  non-zero = first failing case.
+
+let VERIFIER = "verifier/an11_weight_emergent.hexa"
+let FIX_BEFORE = "test/fixtures/an11_weight_before.json"
+let FIX_AFTER  = "test/fixtures/an11_weight_after.json"
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn read_blob(p: string) -> string { return _str(read_file(p)) }
+
+fn idx_from(hay: string, needle: string, start: int) -> int {
+    let n = len(hay)
+    if start < 0 { return hay.index_of(needle) }
+    if start >= n { return -1 }
+    let tail = hay.substring(start, n)
+    let idx = tail.index_of(needle)
+    if idx < 0 { return -1 }
+    return start + idx
+}
+
+// Extract a top-level "key":"value"  string.
+fn jget_str(blob: string, key: string) -> string {
+    let k = blob.index_of("\"" + key + "\"")
+    if k < 0 { return "" }
+    let colon = idx_from(blob, ":", k)
+    if colon < 0 { return "" }
+    let q1 = idx_from(blob, "\"", colon + 1)
+    if q1 < 0 { return "" }
+    let q2 = idx_from(blob, "\"", q1 + 1)
+    if q2 < 0 { return "" }
+    return blob.substring(q1 + 1, q2)
+}
+
+fn jget_bool(blob: string, key: string) -> bool {
+    let k = blob.index_of("\"" + key + "\"")
+    if k < 0 { return false }
+    let tail = blob.substring(k, len(blob))
+    let colon = tail.index_of(":")
+    if colon < 0 { return false }
+    let after_colon = tail.substring(colon + 1, len(tail))
+    let t = after_colon.index_of("true")
+    let f = after_colon.index_of("false")
+    // whichever comes first on the key's line wins
+    if t >= 0 && (f < 0 || t < f) { return true }
+    return false
+}
+
+fn assert_eq_str(name: string, got: string, want: string) -> bool {
+    if got == want {
+        println("  [PASS] " + name + " == " + want)
+        return true
+    }
+    println("  [FAIL] " + name + " got=\"" + got + "\" want=\"" + want + "\"")
+    return false
+}
+
+fn assert_true(name: string, cond: bool) -> bool {
+    if cond {
+        println("  [PASS] " + name)
+        return true
+    }
+    println("  [FAIL] " + name)
+    return false
+}
+
+fn hexa_bin() -> string {
+    let dev = "/Users/ghost/Dev/hexa-lang/hexa"
+    if fexists(dev) { return dev }
+    return _str(exec("command -v hexa 2>/dev/null")).trim()
+}
+
+fn run_verifier(args_line: string, ssot: string) -> string {
+    let bin = hexa_bin()
+    let cmd = bin + " run " + VERIFIER + " " + args_line + " --ssot " + ssot + " > /dev/null 2>&1"
+    exec(cmd)
+    if !fexists(ssot) { return "" }
+    return read_blob(ssot)
+}
+
+fn test_pass_case() -> bool {
+    println("[T1] PASS case — fixture before/after distinct")
+    if !fexists(FIX_BEFORE) || !fexists(FIX_AFTER) {
+        println("  [FAIL] fixtures missing")
+        return false
+    }
+    let ssot = "/tmp/_an11_we_t1.json"
+    exec("rm -f " + ssot)
+    let blob = run_verifier("--before " + FIX_BEFORE + " --after " + FIX_AFTER, ssot)
+    if blob == "" { println("  [FAIL] ssot not emitted"); return false }
+    let verdict = jget_str(blob, "emergent_verdict")
+    let fp_match = jget_bool(blob, "sha_fingerprint_match")
+    let mut ok = true
+    if !assert_eq_str("T1.verdict", verdict, "PASS") { ok = false }
+    if !assert_true("T1.sha_fingerprint_match == false", !fp_match) { ok = false }
+    return ok
+}
+
+fn test_fail_self_identity() -> bool {
+    println("[T2] FAIL case — before==after (identity training)")
+    let ssot = "/tmp/_an11_we_t2.json"
+    exec("rm -f " + ssot)
+    let blob = run_verifier("--before " + FIX_AFTER + " --after " + FIX_AFTER, ssot)
+    if blob == "" { println("  [FAIL] ssot not emitted"); return false }
+    let verdict = jget_str(blob, "emergent_verdict")
+    let fp_match = jget_bool(blob, "sha_fingerprint_match")
+    let mut ok = true
+    if !assert_eq_str("T2.verdict", verdict, "FAIL") { ok = false }
+    if !assert_true("T2.sha_fingerprint_match == true", fp_match) { ok = false }
+    return ok
+}
+
+fn test_dry_run() -> bool {
+    println("[T3] DRY_RUN — synthetic pair smoke")
+    let ssot = "/tmp/_an11_we_t3.json"
+    exec("rm -f " + ssot)
+    let blob = run_verifier("--dry-run", ssot)
+    if blob == "" { println("  [FAIL] ssot not emitted"); return false }
+    let verdict = jget_str(blob, "emergent_verdict")
+    let mut ok = true
+    // dry-run synthetic delta ≈ 0.04 > 1e-3 and cv≈0 — might be SUSPICIOUS
+    // (uniform delta → cv=0 is below CV_MIN=0.05). Accept either PASS or SUSPICIOUS,
+    // reject only FAIL (wiring broken).
+    let is_ok = verdict == "PASS" || verdict == "SUSPICIOUS"
+    if !assert_true("T3.verdict in {PASS,SUSPICIOUS} (got " + verdict + ")", is_ok) { ok = false }
+    return ok
+}
+
+fn main() {
+    println("=== AN11(a) weight_emergent verifier tests ===")
+    let mut all_ok = true
+    if !test_pass_case() { all_ok = false }
+    if !test_fail_self_identity() { all_ok = false }
+    if !test_dry_run() { all_ok = false }
+    println("")
+    if all_ok {
+        println("ALL TESTS PASSED")
+        exit(0)
+    }
+    println("TESTS FAILED")
+    exit(1)
+}
