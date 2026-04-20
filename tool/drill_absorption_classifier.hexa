@@ -1,0 +1,266 @@
+// tool/drill_absorption_classifier.hexa — η absorption / saturation classifier
+//
+// PURPOSE: classify a drill iteration log into one of three saturation
+//   master-switch states: {open, converging, fixpoint}.
+//
+//   Follows shared/bench/drill_breakthrough_criteria.json:
+//     saturation_policy.mode          = "fixpoint_strict"
+//     saturation_policy.k_window      = 2
+//     saturation_policy.enum_states   = ["open", "converging", "fixpoint"]
+//     saturation_policy.pass_states   = ["fixpoint"]
+//
+//   Companion to tool/law_emergence_drill.hexa (commit 30b44fc3):
+//   law_emergence decides IF a candidate law emerged; this tool decides
+//   WHETHER the underlying drill search has collapsed to a fixpoint.
+//
+// V8 SAFE_COMMIT: additive tool; reads fixtures beside existing drill set.
+// DETERMINISTIC: pure string / hash compare; NO LLM; no network.
+//
+// Inputs (argv):
+//   hexa tool/drill_absorption_classifier.hexa <iter_log.jsonl> [k_window]
+//
+// Iteration log format (one JSON object per line):
+//   {"iter": 0, "output_hash": "abc123", "primitives": ["p1","p2","p3"], "seed": true}
+//   {"iter": 1, "output_hash": "def456", "primitives": ["p1","p2"],      "seed": false}
+//   ...
+//
+// Outputs to stdout:
+//   classifier=drill_absorption
+//   state=<open|converging|fixpoint>
+//   confidence=<0.00..1.00>
+//   primitive_overlap_ratio=<0.00..1.00>
+//   iters=<N>  k_window=<K>  unique_tail=<U>
+//   verdict=<PASS|FAIL>   (PASS iff state == fixpoint)
+//
+// Exit codes:
+//   0 — state == fixpoint (PASS, saturation master switch == fixpoint)
+//   1 — state in {open, converging} (FAIL — not saturated)
+//   2 — fixture / setup error (missing file, empty, < k_window+1 iters)
+
+let DEFAULT_K_WINDOW = 2
+let MAX_ITERS        = 4096
+let MAX_PRIMS        = 64
+
+// ─── Minimal JSON field extraction via split ─────────────────────────
+// Current hexa build supports: .contains() .split() .starts_with() .trim() .len()
+// No .substring() / .index_of() / .find() — so we rely on split.
+
+fn jget_str(obj, key) {
+    let marker = "\"" + key + "\":"
+    let parts = obj.split(marker)
+    if len(parts) < 2 { return "" }
+    let after = parts[1].trim()
+    let q = after.split("\"")
+    if len(q) < 2 { return "" }
+    return q[1]
+}
+
+fn jget_bool(obj, key) {
+    let marker = "\"" + key + "\":"
+    let parts = obj.split(marker)
+    if len(parts) < 2 { return false }
+    let after = parts[1].trim()
+    return after.starts_with("true")
+}
+
+// Extract JSON string array: "primitives":["p1","p2","p3"] → preallocated list
+// Returns (arr, n) via out slots; here we return a [items..., "", ...] pair.
+fn jget_str_array(obj, key) {
+    let mut out = ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    let mut n = 0
+    let marker = "\"" + key + "\":"
+    let parts = obj.split(marker)
+    if len(parts) < 2 { return [out, n] }
+    let after = parts[1].trim()
+    if !after.starts_with("[") { return [out, n] }
+    let body_parts = after.split("]")
+    if len(body_parts) < 1 { return [out, n] }
+    let head = body_parts[0]
+    let open_parts = head.split("[")
+    if len(open_parts) < 2 { return [out, n] }
+    let body = open_parts[1].trim()
+    if body.len() == 0 { return [out, n] }
+    let toks = body.split(",")
+    let mut i = 0
+    let nt = len(toks)
+    let cap = MAX_PRIMS
+    while i < nt {
+        if n >= cap { i = nt }
+        if i < nt {
+            let t = toks[i].trim()
+            let qparts = t.split("\"")
+            if len(qparts) >= 2 {
+                out[n] = qparts[1]
+                n = n + 1
+            }
+            i = i + 1
+        }
+    }
+    return [out, n]
+}
+
+// ─── Read JSONL iteration log into preallocated storage ──────────────
+// Returns [lines_arr, count]
+
+fn read_iters(path) {
+    let mut out = ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    let mut n = 0
+    if !file_exists(path) { return [out, n] }
+    let raw = read_file(path)
+    if raw.len() == 0 { return [out, n] }
+    let lines = raw.split("\n")
+    let mut i = 0
+    while i < len(lines) && n < 64 {
+        let line = lines[i].trim()
+        if line.len() > 0 && line.contains("{") {
+            out[n] = line
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return [out, n]
+}
+
+// ─── Primitive overlap ratio ─────────────────────────────────────────
+// |tail.primitives ∩ seed.primitives| / |seed.primitives|
+
+fn list_contains_str(xs, xn, v) {
+    let mut i = 0
+    while i < xn {
+        if xs[i] == v { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn overlap_ratio(seed_prims, sn, tail_prims, tn) {
+    if sn == 0 { return 0.0 }
+    let mut hit = 0
+    let mut i   = 0
+    while i < sn {
+        if list_contains_str(tail_prims, tn, seed_prims[i]) { hit = hit + 1 }
+        i = i + 1
+    }
+    return to_float(hit) / to_float(sn)
+}
+
+// ─── Fixpoint-hash state machine ─────────────────────────────────────
+// Over the last (k_window + 1) hashes:
+//   all equal           -> fixpoint
+//   last adjacent equal -> converging
+//   otherwise           -> open
+
+fn classify_state(hashes, n, k_window) {
+    if n < k_window + 1 { return "open" }
+    let base = hashes[n - 1]
+    let mut all_eq = true
+    let mut j = n - 1 - k_window
+    while j < n {
+        if hashes[j] != base { all_eq = false }
+        j = j + 1
+    }
+    if all_eq { return "fixpoint" }
+    if n >= 2 && hashes[n - 1] == hashes[n - 2] { return "converging" }
+    return "open"
+}
+
+// unique-tail count over last (k_window + 1) hashes
+fn unique_tail_count(hashes, n, k_window) {
+    let win = k_window + 1
+    let mut start = 0
+    if n >= win { start = n - win }
+    // local uniq buffer (max win <= a few)
+    let mut uniq = ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    let mut un = 0
+    let mut i = start
+    while i < n {
+        if !list_contains_str(uniq, un, hashes[i]) {
+            uniq[un] = hashes[i]
+            un = un + 1
+        }
+        i = i + 1
+    }
+    return un
+}
+
+// confidence = stability_factor * primitive_overlap
+//   fixpoint + full overlap → ~1.00
+//   fixpoint + half overlap → ~0.50
+//   open     + any overlap  → low
+fn compute_confidence(uniq, k_window, overlap) {
+    let stab = 1.0 - (to_float(uniq - 1) / to_float(k_window))
+    let mut s = stab
+    if s < 0.0 { s = 0.0 }
+    if s > 1.0 { s = 1.0 }
+    return s * overlap
+}
+
+// ─── Main ────────────────────────────────────────────────────────────
+
+fn run() {
+    let argv = args()
+    if len(argv) < 3 {
+        println("usage: hexa tool/drill_absorption_classifier.hexa <iter_log.jsonl> [k_window]")
+        exit(2)
+    }
+    let path = argv[2]
+    let mut k_window = DEFAULT_K_WINDOW
+    if len(argv) >= 4 { k_window = to_int(argv[3]) }
+
+    let iter_pair = read_iters(path)
+    let iters = iter_pair[0]
+    let n = iter_pair[1]
+    if n < k_window + 1 {
+        println("classifier=drill_absorption")
+        println("state=open")
+        println("confidence=0.00")
+        println("primitive_overlap_ratio=0.00")
+        println("iters=" + to_string(n) + "  k_window=" + to_string(k_window) + "  unique_tail=0")
+        println("verdict=FAIL")
+        println("reason=insufficient_iters (need >= k_window+1 = " + to_string(k_window + 1) + ")")
+        exit(2)
+    }
+
+    // Extract hashes in order + seed + tail primitives
+    let mut hashes = ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    let mut seed_prims = ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    let mut sn = 0
+    let mut seed_found = false
+    let mut i = 0
+    while i < n {
+        let obj = iters[i]
+        hashes[i] = jget_str(obj, "output_hash")
+        if !seed_found {
+            if jget_bool(obj, "seed") || i == 0 {
+                let pair = jget_str_array(obj, "primitives")
+                seed_prims = pair[0]
+                sn = pair[1]
+                seed_found = true
+            }
+        }
+        i = i + 1
+    }
+    let tail_pair = jget_str_array(iters[n - 1], "primitives")
+    let tail_prims = tail_pair[0]
+    let tn = tail_pair[1]
+
+    let state   = classify_state(hashes, n, k_window)
+    let uniq    = unique_tail_count(hashes, n, k_window)
+    let overlap = overlap_ratio(seed_prims, sn, tail_prims, tn)
+    let conf    = compute_confidence(uniq, k_window, overlap)
+
+    let mut verdict = "FAIL"
+    if state == "fixpoint" { verdict = "PASS" }
+
+    println("classifier=drill_absorption")
+    println("state=" + state)
+    println("confidence=" + to_string(conf))
+    println("primitive_overlap_ratio=" + to_string(overlap))
+    println("iters=" + to_string(n) + "  k_window=" + to_string(k_window) + "  unique_tail=" + to_string(uniq))
+    println("verdict=" + verdict)
+
+    if state == "fixpoint" { exit(0) }
+    exit(1)
+}
+
+run()

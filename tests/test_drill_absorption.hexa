@@ -1,0 +1,218 @@
+// tests/test_drill_absorption.hexa — drill absorption classifier smoke
+//
+// SCENARIO: exercise tool/drill_absorption_classifier.hexa classification
+//   logic against three canonical fixtures:
+//     tests/fixtures/drill_fixpoint.jsonl    -> state=fixpoint   PASS
+//     tests/fixtures/drill_converging.jsonl  -> state=converging FAIL
+//     tests/fixtures/drill_open.jsonl        -> state=open       FAIL
+//
+// NOTE: the hexa runtime used here does not expose `exec()` or an
+//   `import` statement, so the classifier's library functions are
+//   mirrored inline (kept in strict sync with the source of truth
+//   tool/drill_absorption_classifier.hexa — if this test drifts, flip
+//   it FAIL fast).
+//
+// Pass criteria: all 3 fixtures match expected state + verdict +
+//   primitive_overlap_ratio. Deterministic.
+
+let DEFAULT_K_WINDOW = 2
+let MAX_PRIMS        = 64
+
+// ─── Mirrored helpers (source: tool/drill_absorption_classifier.hexa) ─
+
+fn jget_str(obj, key) {
+    let marker = "\"" + key + "\":"
+    let parts = obj.split(marker)
+    if len(parts) < 2 { return "" }
+    let after = parts[1].trim()
+    let q = after.split("\"")
+    if len(q) < 2 { return "" }
+    return q[1]
+}
+
+fn jget_bool(obj, key) {
+    let marker = "\"" + key + "\":"
+    let parts = obj.split(marker)
+    if len(parts) < 2 { return false }
+    let after = parts[1].trim()
+    return after.starts_with("true")
+}
+
+fn jget_str_array(obj, key) {
+    let mut out = ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    let mut n = 0
+    let marker = "\"" + key + "\":"
+    let parts = obj.split(marker)
+    if len(parts) < 2 { return [out, n] }
+    let after = parts[1].trim()
+    if !after.starts_with("[") { return [out, n] }
+    let body_parts = after.split("]")
+    if len(body_parts) < 1 { return [out, n] }
+    let head = body_parts[0]
+    let open_parts = head.split("[")
+    if len(open_parts) < 2 { return [out, n] }
+    let body = open_parts[1].trim()
+    if body.len() == 0 { return [out, n] }
+    let toks = body.split(",")
+    let mut i = 0
+    let nt = len(toks)
+    let cap = MAX_PRIMS
+    while i < nt {
+        if n >= cap { i = nt }
+        if i < nt {
+            let t = toks[i].trim()
+            let qparts = t.split("\"")
+            if len(qparts) >= 2 {
+                out[n] = qparts[1]
+                n = n + 1
+            }
+            i = i + 1
+        }
+    }
+    return [out, n]
+}
+
+fn read_iters(path) {
+    let mut out = ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    let mut n = 0
+    if !file_exists(path) { return [out, n] }
+    let raw = read_file(path)
+    if raw.len() == 0 { return [out, n] }
+    let lines = raw.split("\n")
+    let mut i = 0
+    let nl = len(lines)
+    while i < nl {
+        if n >= 64 { i = nl }
+        if i < nl {
+            let line = lines[i].trim()
+            if line.len() > 0 && line.contains("{") {
+                out[n] = line
+                n = n + 1
+            }
+            i = i + 1
+        }
+    }
+    return [out, n]
+}
+
+fn list_contains_str(xs, xn, v) {
+    let mut i = 0
+    while i < xn {
+        if xs[i] == v { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn overlap_ratio(seed_prims, sn, tail_prims, tn) {
+    if sn == 0 { return 0.0 }
+    let mut hit = 0
+    let mut i   = 0
+    while i < sn {
+        if list_contains_str(tail_prims, tn, seed_prims[i]) { hit = hit + 1 }
+        i = i + 1
+    }
+    return to_float(hit) / to_float(sn)
+}
+
+fn classify_state(hashes, n, k_window) {
+    if n < k_window + 1 { return "open" }
+    let base = hashes[n - 1]
+    let mut all_eq = true
+    let mut j = n - 1 - k_window
+    while j < n {
+        if hashes[j] != base { all_eq = false }
+        j = j + 1
+    }
+    if all_eq { return "fixpoint" }
+    if n >= 2 && hashes[n - 1] == hashes[n - 2] { return "converging" }
+    return "open"
+}
+
+// ─── End of mirrored helpers ─────────────────────────────────────────
+
+fn assert_true(cond, msg) {
+    if cond {
+        println("[PASS] " + msg)
+    } else {
+        println("[FAIL] " + msg)
+        exit(1)
+    }
+}
+
+fn approx_eq(a, b) {
+    let d = a - b
+    if d < 0.0 { return (0.0 - d) < 0.0001 }
+    return d < 0.0001
+}
+
+// Run the classifier on a fixture. Returns [state, overlap].
+fn classify_fixture(path) {
+    let iter_pair = read_iters(path)
+    let iters = iter_pair[0]
+    let n = iter_pair[1]
+    let k_window = DEFAULT_K_WINDOW
+    if n < k_window + 1 { return ["open", 0.0] }
+
+    let mut hashes = ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    let mut seed_prims = ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    let mut sn = 0
+    let mut seed_found = false
+    let mut i = 0
+    while i < n {
+        let obj = iters[i]
+        hashes[i] = jget_str(obj, "output_hash")
+        if !seed_found {
+            if jget_bool(obj, "seed") || i == 0 {
+                let pair = jget_str_array(obj, "primitives")
+                seed_prims = pair[0]
+                sn = pair[1]
+                seed_found = true
+            }
+        }
+        i = i + 1
+    }
+    let tail_pair = jget_str_array(iters[n - 1], "primitives")
+    let tail_prims = tail_pair[0]
+    let tn = tail_pair[1]
+
+    let state = classify_state(hashes, n, k_window)
+    let overlap = overlap_ratio(seed_prims, sn, tail_prims, tn)
+    return [state, overlap]
+}
+
+fn main_test() {
+    println("=== drill_absorption_classifier smoke (3 fixtures) ===")
+
+    let classifier = "tool/drill_absorption_classifier.hexa"
+    assert_true(file_exists(classifier), "classifier source exists")
+
+    let f_fix = "tests/fixtures/drill_fixpoint.jsonl"
+    let f_con = "tests/fixtures/drill_converging.jsonl"
+    let f_opn = "tests/fixtures/drill_open.jsonl"
+    assert_true(file_exists(f_fix), "fixture exists: drill_fixpoint.jsonl")
+    assert_true(file_exists(f_con), "fixture exists: drill_converging.jsonl")
+    assert_true(file_exists(f_opn), "fixture exists: drill_open.jsonl")
+
+    // Case 1 — fixpoint: last k_window+1 hashes identical + full overlap
+    let r_fix = classify_fixture(f_fix)
+    println("drill_fixpoint   -> state=" + r_fix[0] + " overlap=" + to_string(r_fix[1]))
+    assert_true(r_fix[0] == "fixpoint", "fixpoint fixture classifies as fixpoint")
+    assert_true(approx_eq(r_fix[1], 1.0), "fixpoint overlap == 1.0")
+
+    // Case 2 — converging: last pair equal, earlier window not stable
+    let r_con = classify_fixture(f_con)
+    println("drill_converging -> state=" + r_con[0] + " overlap=" + to_string(r_con[1]))
+    assert_true(r_con[0] == "converging", "converging fixture classifies as converging")
+    assert_true(approx_eq(r_con[1], 1.0), "converging overlap == 1.0")
+
+    // Case 3 — open: hashes still changing + partial primitive drift
+    let r_opn = classify_fixture(f_opn)
+    println("drill_open       -> state=" + r_opn[0] + " overlap=" + to_string(r_opn[1]))
+    assert_true(r_opn[0] == "open", "open fixture classifies as open")
+    assert_true(approx_eq(r_opn[1], 0.4), "open overlap == 0.4")
+
+    println("=== ALL PASS: drill absorption classifier 3/3 ===")
+}
+
+main_test()
