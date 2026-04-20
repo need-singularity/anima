@@ -1,0 +1,96 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  edu/cell/dissipation/entropy_gradient.hexa
+//
+//  PURPOSE
+//    Phase-entropy gradient ∂S/∂t for edu/cell 4-gen ladder.
+//
+//    H(gen) = −Σᵢ pᵢ log2(pᵢ)  for pᵢ ∈ {active/total, drop/total, sealed/total}
+//
+//    ∂S/∂t ≈ (H(gen_k) − H(gen_{k−1})) / Δt_ticks
+//
+//    Near the fixpoint (gen 4), all probability collapses onto sealed state
+//    ⇒ H → 0 ⇒ ∂S/∂t large-negative, a signature of thermodynamic
+//    crystallization.
+//
+//  Integer fixed-point: H emitted ×1000 per-mille.  ∂S/∂t ×10000 (per-ten-mille)
+//  to keep single-tick resolution under integer div by Δt=12 ticks.
+//
+//  HEXA-ONLY · raw#9 · deterministic · no LLM
+// ════════════════════════════════════════════════════════════════════════════
+
+// Integer log2 of integer p_per_mille (0..1000), returning positive
+// value of log2(1000 / p) ×1000 (i.e. the information content of p per-mille).
+// We use a small table over decades + linear interp between decade anchors.
+// For p = 0 return 0 (convention: 0 · ∞ = 0 in Shannon entropy).
+//
+// Anchors (log2(1000/p)):
+//   p=1000 → 0
+//   p=500  → 1000  (= log2 2)
+//   p=250  → 2000
+//   p=125  → 3000
+//   p=63   → 3989  (~4)
+//   p=31   → 5011  (~5)
+//   p=16   → 5966
+//   p=8    → 6966
+//   p=4    → 7966
+//   p=2    → 8966
+//   p=1    → 9966
+//
+// For mid-range we piecewise-linearly interpolate on a dense lookup.
+// Accuracy target: ±20 per-mille bits (sufficient for entropy gradient sign).
+fn log2_inv_per_mille_x1000(p_per_mille: int) -> int {
+    if p_per_mille <= 0 { return 0 }
+    let p = if p_per_mille > 1000 { 1000 } else { p_per_mille }
+    // Piecewise linear table on p.
+    // Format: if p >= hi_p, interpolate between (hi_p, hi_val) and (lo_p, lo_val).
+    // Values are log2(1000/p) ×1000 at each anchor.
+    //
+    // Anchor list (descending p):
+    //   1000 → 0,   900 → 152,  800 → 322,  700 → 515,  600 → 737,
+    //    500 → 1000, 400 → 1322, 300 → 1737, 250 → 2000, 200 → 2322,
+    //    150 → 2737, 125 → 3000, 100 → 3322,  75 → 3737,  50 → 4322,
+    //     40 → 4644,  30 → 5059,  25 → 5322,  20 → 5644,  15 → 6059,
+    //     10 → 6644,   5 → 7644,   1 → 9966
+    let anchors_p = [1000, 900, 800, 700, 600, 500, 400, 300, 250, 200, 150, 125, 100, 75, 50, 40, 30, 25, 20, 15, 10, 5, 1]
+    let anchors_v = [0,    152, 322, 515, 737, 1000, 1322, 1737, 2000, 2322, 2737, 3000, 3322, 3737, 4322, 4644, 5059, 5322, 5644, 6059, 6644, 7644, 9966]
+    let n = len(anchors_p)
+    // Find interval [anchors_p[i+1], anchors_p[i]] containing p.
+    let mut i = 0
+    while i < n - 1 {
+        let hi = anchors_p[i]
+        let lo = anchors_p[i + 1]
+        if p <= hi && p >= lo {
+            if hi == lo { return anchors_v[i] }
+            let span_p = hi - lo
+            let span_v = anchors_v[i + 1] - anchors_v[i]
+            let offset = hi - p
+            return anchors_v[i] + (span_v * offset) / span_p
+        }
+        i = i + 1
+    }
+    // Below last anchor (p=1): saturate at 9966.
+    return 9966
+}
+
+// Shannon entropy H(p) = −Σ pᵢ log2(pᵢ) over triple {active, drop, sealed}
+// given counts and total.  Returns H ×1000.
+fn shannon_h_x1000(active: int, drop_ct: int, sealed: int, total: int) -> int {
+    if total <= 0 { return 0 }
+    let p_a = (active  * 1000) / total
+    let p_d = (drop_ct * 1000) / total
+    let p_s = (sealed  * 1000) / total
+    // Per-term contribution: p · log2(1/p) (both ×1000, keep result ×1000 by /1000)
+    let t_a = (p_a * log2_inv_per_mille_x1000(p_a)) / 1000
+    let t_d = (p_d * log2_inv_per_mille_x1000(p_d)) / 1000
+    let t_s = (p_s * log2_inv_per_mille_x1000(p_s)) / 1000
+    return t_a + t_d + t_s
+}
+
+// ∂S/∂t per-ten-mille (×10000) = (H_k − H_{k-1}) ×10 / ticks
+//   H_* are ×1000; we multiply by 10 then divide by ticks to preserve
+//   resolution under integer division (ticks=12 typical).
+fn entropy_gradient_x10000(h_curr_x1000: int, h_prev_x1000: int, ticks: int) -> int {
+    if ticks <= 0 { return 0 }
+    let delta = h_curr_x1000 - h_prev_x1000
+    return (delta * 10) / ticks
+}

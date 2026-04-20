@@ -1,0 +1,279 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  edu/cell/dissipation/diss_demo.hexa
+//
+//  PURPOSE
+//    MVP for edu/cell dissipation-rate (diss) axis — Landauer overlay onto
+//    existing 4-gen crystallize result (commit 58aa75eb,
+//    shared/state/edu_cell_4gen_crystallize.json).
+//
+//    NO new experiment is run — we reuse the frozen per_gen lattice
+//    statistics (active / drop_ct / sealed / total / score_per_mille / size)
+//    and compute the 3 dissipation observables:
+//
+//        O1 L_dissipated  = (sealed + drop_ct) × ln(2)       per gen
+//        O2 efficiency    = score × log2(Ω) / L_dissipated   per gen, clamp [0,1]
+//        O3 ∂S/∂t         = ΔH_shannon / Δt_ticks            per gen-transition
+//
+//    Phase-jump verdict (pre-registered):
+//        VERIFIED ⇔ Δefficiency(g4 − g3) ≥ 150‰ AND eff(g4) > eff(g3)
+//
+//    Emits: shared/state/edu_cell_diss_overlay.json
+//
+//  NOTE
+//    `drop` is a reserved hexa keyword; we use `drop_ct` internally and
+//    emit the conventional JSON key `"drop"` in the cert for continuity
+//    with shared/state/edu_cell_4gen_crystallize.json.
+//
+//  HEXA-ONLY · raw#9 · deterministic · no LLM · no I/O reads (data frozen inline)
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── INLINED: landauer_tracker.hexa ──────────────────────────────────────────
+
+fn ln2_x1000() -> int { return 693 }
+fn kT_x1000()  -> int { return 1000 }
+
+fn bits_erased(sealed: int, drop_ct: int) -> int { return sealed + drop_ct }
+
+fn l_dissipated_x1000(sealed: int, drop_ct: int) -> int {
+    return bits_erased(sealed, drop_ct) * ln2_x1000()
+}
+
+// ─── INLINED: efficiency.hexa ────────────────────────────────────────────────
+
+fn log2_omega_x1000(size: int) -> int {
+    if size == 2 { return 3000 }
+    if size == 3 { return 4170 }
+    if size == 4 { return 5000 }
+    if size == 5 { return 5644 }
+    if size == 6 { return 6170 }
+    if size == 7 { return 6615 }
+    if size == 8 { return 7000 }
+    let omega = 2 * size * size
+    let mut v = 1
+    let mut lg = 0
+    while v < omega { v = v * 2; lg = lg + 1 }
+    return lg * 1000
+}
+
+fn min_physical_x1000(size: int) -> int {
+    return (log2_omega_x1000(size) * 693) / 1000
+}
+
+fn efficiency_x1000(score_per_mille: int, size: int, sealed: int, drop_ct: int) -> int {
+    let bits = sealed + drop_ct
+    if bits <= 0 { return 0 }
+    let log2o = log2_omega_x1000(size)
+    let num = score_per_mille * log2o
+    let den = bits * 693
+    if den <= 0 { return 0 }
+    let ratio = num / den
+    if ratio < 0 { return 0 }
+    if ratio > 1000 { return 1000 }
+    return ratio
+}
+
+// ─── INLINED: entropy_gradient.hexa ──────────────────────────────────────────
+
+fn log2_inv_per_mille_x1000(p_per_mille: int) -> int {
+    if p_per_mille <= 0 { return 0 }
+    let p = if p_per_mille > 1000 { 1000 } else { p_per_mille }
+    let anchors_p = [1000, 900, 800, 700, 600, 500, 400, 300, 250, 200, 150, 125, 100, 75, 50, 40, 30, 25, 20, 15, 10, 5, 1]
+    let anchors_v = [0,    152, 322, 515, 737, 1000, 1322, 1737, 2000, 2322, 2737, 3000, 3322, 3737, 4322, 4644, 5059, 5322, 5644, 6059, 6644, 7644, 9966]
+    let n = len(anchors_p)
+    let mut i = 0
+    while i < n - 1 {
+        let hi = anchors_p[i]
+        let lo = anchors_p[i + 1]
+        if p <= hi && p >= lo {
+            if hi == lo { return anchors_v[i] }
+            let span_p = hi - lo
+            let span_v = anchors_v[i + 1] - anchors_v[i]
+            let offset = hi - p
+            return anchors_v[i] + (span_v * offset) / span_p
+        }
+        i = i + 1
+    }
+    return 9966
+}
+
+fn shannon_h_x1000(active: int, drop_ct: int, sealed: int, total: int) -> int {
+    if total <= 0 { return 0 }
+    let p_a = (active  * 1000) / total
+    let p_d = (drop_ct * 1000) / total
+    let p_s = (sealed  * 1000) / total
+    let t_a = (p_a * log2_inv_per_mille_x1000(p_a)) / 1000
+    let t_d = (p_d * log2_inv_per_mille_x1000(p_d)) / 1000
+    let t_s = (p_s * log2_inv_per_mille_x1000(p_s)) / 1000
+    return t_a + t_d + t_s
+}
+
+fn entropy_gradient_x10000(h_curr_x1000: int, h_prev_x1000: int, ticks: int) -> int {
+    if ticks <= 0 { return 0 }
+    let delta = h_curr_x1000 - h_prev_x1000
+    return (delta * 10) / ticks
+}
+
+// ─── FROZEN INPUT (mirror of edu_cell_4gen_crystallize.json) ─────────────────
+//
+//  Source: shared/state/edu_cell_4gen_crystallize.json (commit 58aa75eb,
+//          sha256 95321efe7426c987350d747d352543a11d46a4bb50a5bc888ce4dfe7ff516120).
+//
+//  gen | size | ticks | active | drop_ct | sealed | total | score_per_mille
+//   1  |  5   |  12   |   17   |    7    |    1   |  25   |       40
+//   2  |  4   |  12   |   14   |    0    |    2   |  16   |      125
+//   3  |  4   |  12   |    5   |    0    |   11   |  16   |      687
+//   4  |  3   |  12   |    0   |    0    |    9   |   9   |     1000
+
+struct GenDiss {
+    gen: int,
+    size: int,
+    ticks: int,
+    active: int,
+    drop_ct: int,
+    sealed: int,
+    total: int,
+    score_per_mille: int,
+    bits_erased: int,
+    l_dissipated_x1000: int,
+    min_physical_x1000: int,
+    efficiency_x1000: int,
+    shannon_h_x1000: int,
+}
+
+fn compute_gen(gen: int, size: int, ticks: int,
+               active: int, drop_ct: int, sealed: int, total: int,
+               score_pm: int) -> GenDiss {
+    let bits    = bits_erased(sealed, drop_ct)
+    let l_diss  = l_dissipated_x1000(sealed, drop_ct)
+    let min_phy = min_physical_x1000(size)
+    let eff     = efficiency_x1000(score_pm, size, sealed, drop_ct)
+    let h       = shannon_h_x1000(active, drop_ct, sealed, total)
+    return GenDiss {
+        gen: gen,
+        size: size,
+        ticks: ticks,
+        active: active,
+        drop_ct: drop_ct,
+        sealed: sealed,
+        total: total,
+        score_per_mille: score_pm,
+        bits_erased: bits,
+        l_dissipated_x1000: l_diss,
+        min_physical_x1000: min_phy,
+        efficiency_x1000: eff,
+        shannon_h_x1000: h,
+    }
+}
+
+// ─── phase-jump verdict ──────────────────────────────────────────────────────
+
+fn phase_jump_diss(eff_g3: int, eff_g4: int) -> string {
+    let delta = eff_g4 - eff_g3
+    println("  phase_jump(diss): eff_g3=" + str(eff_g3) + "‰ eff_g4=" + str(eff_g4) + "‰ delta=" + str(delta) + "‰")
+    if eff_g4 > eff_g3 && delta >= 150 {
+        return "VERIFIED"
+    }
+    return "FAILED"
+}
+
+// ─── cert emitter ────────────────────────────────────────────────────────────
+
+fn emit_overlay(path: string, gens: [GenDiss],
+                ds12: int, ds23: int, ds34: int, verdict: string,
+                src_sha: string) {
+    let mut s = "{\n"
+    s = s + "  \"verifier\": \"edu_cell_diss_overlay\",\n"
+    s = s + "  \"axis\": \"dissipation-rate (diss)\",\n"
+    s = s + "  \"paradigm\": \"Landauer overlay on 4-gen crystallize (edu/cell)\",\n"
+    s = s + "  \"source_artifact\": \"shared/state/edu_cell_4gen_crystallize.json\",\n"
+    s = s + "  \"source_commit\": \"58aa75eb\",\n"
+    s = s + "  \"source_sha256\": \"" + src_sha + "\",\n"
+    s = s + "  \"hexa_only\": true,\n"
+    s = s + "  \"raw_rank\": 9,\n"
+    s = s + "  \"deterministic\": true,\n"
+    s = s + "  \"llm\": \"none\",\n"
+    s = s + "  \"fixed_point_units\": \"L_dissipated, min_physical, efficiency, shannon_H — all x1000 (per-mille). dS/dt — x10000.\",\n"
+    s = s + "  \"constants\": {\"ln2_x1000\": 693, \"kT_x1000\": 1000, \"k\": 1, \"T\": 1},\n"
+    s = s + "  \"observables\": {\n"
+    s = s + "    \"O1_l_dissipated\": \"bits * ln2 * kT, bits = sealed + drop\",\n"
+    s = s + "    \"O2_efficiency\": \"useful_progress * log2(Omega) / L_dissipated, clamp [0,1]\",\n"
+    s = s + "    \"O3_entropy_gradient\": \"(H_k - H_{k-1}) / ticks near fixpoint\"\n"
+    s = s + "  },\n"
+    s = s + "  \"per_gen\": [\n"
+    let mut i = 0
+    while i < len(gens) {
+        let g = gens[i]
+        if i > 0 { s = s + ",\n" }
+        s = s + "    {\"gen\":" + str(g.gen)
+        s = s + ",\"size\":" + str(g.size)
+        s = s + ",\"ticks\":" + str(g.ticks)
+        s = s + ",\"active\":" + str(g.active)
+        s = s + ",\"drop\":" + str(g.drop_ct)
+        s = s + ",\"sealed\":" + str(g.sealed)
+        s = s + ",\"total\":" + str(g.total)
+        s = s + ",\"score_per_mille\":" + str(g.score_per_mille)
+        s = s + ",\"bits_erased\":" + str(g.bits_erased)
+        s = s + ",\"l_dissipated_x1000\":" + str(g.l_dissipated_x1000)
+        s = s + ",\"min_physical_x1000\":" + str(g.min_physical_x1000)
+        s = s + ",\"efficiency_x1000\":" + str(g.efficiency_x1000)
+        s = s + ",\"shannon_h_x1000\":" + str(g.shannon_h_x1000) + "}"
+        i = i + 1
+    }
+    s = s + "\n  ],\n"
+    s = s + "  \"entropy_gradient_x10000\": {\n"
+    s = s + "    \"gen1_to_gen2\": " + str(ds12) + ",\n"
+    s = s + "    \"gen2_to_gen3\": " + str(ds23) + ",\n"
+    s = s + "    \"gen3_to_gen4\": " + str(ds34) + "\n"
+    s = s + "  },\n"
+    s = s + "  \"phase_jump_verdict\": \"" + verdict + "\",\n"
+    s = s + "  \"verdict_rule\": \"VERIFIED iff delta_efficiency(g4-g3) >= 150 per-mille AND eff(g4) > eff(g3)\"\n"
+    s = s + "}\n"
+    write_file(path, s)
+}
+
+// ─── main ────────────────────────────────────────────────────────────────────
+
+fn main() {
+    println("=== edu/cell dissipation-rate (diss) overlay — Landauer MVP ===")
+    println("source: shared/state/edu_cell_4gen_crystallize.json (commit 58aa75eb)")
+    println("")
+
+    let g1 = compute_gen(1, 5, 12, 17, 7, 1, 25, 40)
+    let g2 = compute_gen(2, 4, 12, 14, 0, 2, 16, 125)
+    let g3 = compute_gen(3, 4, 12,  5, 0,11, 16, 687)
+    let g4 = compute_gen(4, 3, 12,  0, 0, 9,  9, 1000)
+
+    let gens = [g1, g2, g3, g4]
+
+    println("--- per-gen Landauer overlay ---")
+    let mut i = 0
+    while i < len(gens) {
+        let g = gens[i]
+        println("gen " + str(g.gen) + ": bits_erased=" + str(g.bits_erased)
+            + " L_diss=" + str(g.l_dissipated_x1000) + "permille*ln2"
+            + " min_phy=" + str(g.min_physical_x1000) + "permille*ln2"
+            + " eff=" + str(g.efficiency_x1000) + "permille"
+            + " H=" + str(g.shannon_h_x1000) + "permille bits")
+        i = i + 1
+    }
+    println("")
+
+    let ds12 = entropy_gradient_x10000(g2.shannon_h_x1000, g1.shannon_h_x1000, 12)
+    let ds23 = entropy_gradient_x10000(g3.shannon_h_x1000, g2.shannon_h_x1000, 12)
+    let ds34 = entropy_gradient_x10000(g4.shannon_h_x1000, g3.shannon_h_x1000, 12)
+
+    println("--- dS/dt trajectory (x10000) ---")
+    println("  gen1->gen2: " + str(ds12))
+    println("  gen2->gen3: " + str(ds23))
+    println("  gen3->gen4: " + str(ds34))
+    println("")
+
+    let verdict = phase_jump_diss(g3.efficiency_x1000, g4.efficiency_x1000)
+    println("phase-jump (diss) verdict: " + verdict)
+    println("")
+
+    let src_sha = "95321efe7426c987350d747d352543a11d46a4bb50a5bc888ce4dfe7ff516120"
+    emit_overlay("shared/state/edu_cell_diss_overlay.json", gens, ds12, ds23, ds34, verdict, src_sha)
+    println("cert: shared/state/edu_cell_diss_overlay.json")
+    exit(0)
+}
