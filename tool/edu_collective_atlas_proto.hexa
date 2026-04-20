@@ -1,0 +1,405 @@
+// ════════════════════════════════════════════════════════════════
+//  tool/edu_collective_atlas_proto.hexa
+//
+//  PURPOSE
+//    edu-new D — collective atlas coherence.
+//    N 학습자 각자의 atlas (node 해시 집합 + edge 해시 집합) 를
+//    hash-only 로 비교하여 collective coherence 점수를 산출.
+//
+//    B (atlas-traversal, a990b983) 와 C (fixpoint-assess, 435d2721)
+//    를 잇는 layer:
+//      - B 는 개별 learner 의 path 를 deterministic 하게 만들고
+//      - C 는 개별 learner 의 answer 를 fixpoint seal 하며
+//      - D 는 N learner 의 atlas 가 서로 얼마나 일치하는지 측정.
+//
+//  HASH-ONLY NETWORK
+//    - LLM 금지, neural 금지, sampling 금지
+//    - 모든 판정 = det_hash(FNV-1a 32-bit) equality + count
+//    - coherence = mean pairwise Jaccard(node set)
+//                + edge_consensus (≥ majority_threshold 에 올라간 edge 비율)
+//      둘을 50:50 가중으로 합산 (× 1000 scaled int)
+//
+//  METRICS
+//    coherence_score_x1000 ∈ [0,1000]
+//    per-node contribution_x1000 ∈ [0,1000]
+//       = 500 + (avg_jaccard(node_k, others) - group_mean_jaccard)
+//         (500 base = "평균 수준"; > 500 = 상향 기여, < 500 = 하향=outlier)
+//    outlier_nodes = contribution_x1000 < 500 인 node list
+//
+//  FIXTURES
+//    F3  3-node  (high-overlap: tight consensus)
+//    F5  5-node  (mixed: 4 aligned + 1 divergent learner)
+//    F10 10-node (diffuse: interest-biased, low global coherence)
+//
+//  USAGE
+//    hexa tool/edu_collective_atlas_proto.hexa
+//
+//  OUTPUT
+//    shared/state/edu_collective_atlas_F3.json
+//    shared/state/edu_collective_atlas_F5.json
+//    shared/state/edu_collective_atlas_F10.json
+//
+//  V8 SAFE_COMMIT · LLM=none · deterministic only
+// ════════════════════════════════════════════════════════════════
+
+let CONCEPT_COUNT    = 50
+let MAJORITY_X1000   = 500    // edge consensus 문턱 = 50%
+
+// ─── det hash (FNV-1a 32-bit, pure) ─────────────────────────────────────────
+
+fn det_hash(s: string) -> int {
+    let mut h = 2166136261
+    let mut i = 0
+    while i < s.len() {
+        let c = s.byte_at(i)
+        h = (h ^ c) * 16777619
+        h = h & 0xffffffff
+        i = i + 1
+    }
+    return h
+}
+
+// ─── mock atlas geometry (50 concept, 5 domain × 10 — B 와 동일) ───────────
+
+fn domain_of(i: int) -> string {
+    if i < 10 { return "math" }
+    if i < 20 { return "logic" }
+    if i < 30 { return "music" }
+    if i < 40 { return "biology" }
+    return "systems"
+}
+
+fn node_id(i: int) -> string {
+    return domain_of(i) + "_" + str(i % 10)
+}
+
+fn node_hash(i: int) -> int {
+    return det_hash("node|" + node_id(i))
+}
+
+fn edge_hash(u: int, v: int) -> int {
+    // 무방향 canonical: min_idx|max_idx
+    let lo = if u < v { u } else { v }
+    let hi = if u < v { v } else { u }
+    return det_hash("edge|" + node_id(lo) + "|" + node_id(hi))
+}
+
+// ─── learner atlas 생성 (deterministic, interest-biased) ──────────────────
+//
+// 각 learner 는 seed (string) 로부터 결정됨.
+// visited[i] = true iff hash(seed|i) mod 100 < threshold(i, profile)
+// threshold 는 profile 에 따라 domain 별로 다르게 부풀림.
+
+fn threshold(i: int, profile: string) -> int {
+    // base 40% + profile bias
+    let mut t = 40
+    if profile == "math_tight" && i < 10                { t = 99 }
+    if profile == "math_tight" && i >= 10               { t = 5  }
+    if profile == "math"     && i < 10                  { t = 95 }
+    if profile == "logic"    && i >= 10 && i < 20       { t = 95 }
+    if profile == "music"    && i >= 20 && i < 30       { t = 95 }
+    if profile == "biology"  && i >= 30 && i < 40       { t = 95 }
+    if profile == "systems"  && i >= 40                 { t = 95 }
+    if profile == "uniform"                              { t = 60 }
+    if profile == "shallow"                              { t = 25 }
+    return t
+}
+
+fn build_visited(seed: string, profile: string) -> list<bool> {
+    let mut v = []
+    let mut i = 0
+    while i < CONCEPT_COUNT {
+        let h = det_hash(seed + "#v|" + str(i))
+        let r = h % 100
+        if r < threshold(i, profile) { v = v.push(true) }
+        else                          { v = v.push(false) }
+        i = i + 1
+    }
+    return v
+}
+
+// edge set: visited 에 있는 두 노드 쌍 중, hash(seed|u|v) mod 100 < 50 → link
+fn build_edges(seed: string, visited: list<bool>) -> list<int> {
+    // parallel encoding: flattened [u0,v0, u1,v1, ...] (int list, no tuple)
+    let mut out = []
+    let mut u = 0
+    while u < CONCEPT_COUNT {
+        if visited[u] {
+            let mut v = u + 1
+            while v < CONCEPT_COUNT {
+                if visited[v] {
+                    let h = det_hash(seed + "#e|" + str(u) + "|" + str(v))
+                    if (h % 100) < 35 {       // sparse edge density
+                        out = out.push(u)
+                        out = out.push(v)
+                    }
+                }
+                v = v + 1
+            }
+        }
+        u = u + 1
+    }
+    return out
+}
+
+// ─── hash set utilities (hash-only, no content compare) ────────────────────
+
+fn nodes_as_hashes(visited: list<bool>) -> list<int> {
+    let mut h = []
+    let mut i = 0
+    while i < CONCEPT_COUNT {
+        if visited[i] { h = h.push(node_hash(i)) }
+        i = i + 1
+    }
+    return h
+}
+
+fn edges_as_hashes(edges: list<int>) -> list<int> {
+    let mut h = []
+    let mut i = 0
+    while i < edges.len() {
+        let u = edges[i]
+        let v = edges[i + 1]
+        h = h.push(edge_hash(u, v))
+        i = i + 2
+    }
+    return h
+}
+
+fn has_hash(xs: list<int>, q: int) -> bool {
+    let mut i = 0
+    while i < xs.len() {
+        if xs[i] == q { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn jaccard_x1000(a: list<int>, b: list<int>) -> int {
+    // |a ∩ b| / |a ∪ b|, hash-equality only.
+    let mut inter = 0
+    let mut i = 0
+    while i < a.len() {
+        if has_hash(b, a[i]) { inter = inter + 1 }
+        i = i + 1
+    }
+    let uni = a.len() + b.len() - inter
+    if uni == 0 { return 0 }
+    return (inter * 1000) / uni
+}
+
+// ─── collective metrics ────────────────────────────────────────────────────
+
+fn pairwise_mean_jaccard_x1000(node_sets: list<list<int>>) -> int {
+    let n = node_sets.len()
+    if n < 2 { return 1000 }        // single node = trivially coherent
+    let mut sum = 0
+    let mut pairs = 0
+    let mut i = 0
+    while i < n {
+        let mut j = i + 1
+        while j < n {
+            sum = sum + jaccard_x1000(node_sets[i], node_sets[j])
+            pairs = pairs + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return sum / pairs
+}
+
+// edge consensus: 모든 노드의 edge hash 를 모아 count, majority 통과 비율
+fn edge_consensus_x1000(edge_sets: list<list<int>>) -> int {
+    let n = edge_sets.len()
+    if n == 0 { return 0 }
+    // pool = unique edge hash list; count = appearances
+    let mut pool = []
+    let mut cnt  = []
+    let mut i = 0
+    while i < n {
+        let es = edge_sets[i]
+        let mut k = 0
+        while k < es.len() {
+            let eh = es[k]
+            // find in pool
+            let mut p = 0
+            let mut found = false
+            while p < pool.len() && !found {
+                if pool[p] == eh {
+                    cnt[p] = cnt[p] + 1
+                    found = true
+                }
+                p = p + 1
+            }
+            if !found {
+                pool = pool.push(eh)
+                cnt  = cnt.push(1)
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    if pool.len() == 0 { return 0 }
+    // threshold = ceil(n * MAJORITY_X1000 / 1000)
+    let need = (n * MAJORITY_X1000 + 999) / 1000
+    let mut passed = 0
+    let mut q = 0
+    while q < pool.len() {
+        if cnt[q] >= need { passed = passed + 1 }
+        q = q + 1
+    }
+    return (passed * 1000) / pool.len()
+}
+
+fn coherence_x1000(node_sets: list<list<int>>, edge_sets: list<list<int>>) -> int {
+    let j = pairwise_mean_jaccard_x1000(node_sets)
+    let e = edge_consensus_x1000(edge_sets)
+    return (j + e) / 2
+}
+
+// avg Jaccard from node k to all others (× 1000)
+fn avg_jaccard_to_others_x1000(node_sets: list<list<int>>, k: int) -> int {
+    let n = node_sets.len()
+    if n < 2 { return 1000 }
+    let mut sum = 0
+    let mut j = 0
+    while j < n {
+        if j != k {
+            sum = sum + jaccard_x1000(node_sets[k], node_sets[j])
+        }
+        j = j + 1
+    }
+    return sum / (n - 1)
+}
+
+// contribution: 500 + (my_avg_jaccard - group_mean_jaccard), clipped [0,1000]
+// > 500 = above group mean (coherence contributor)
+// < 500 = below group mean (outlier candidate)
+fn contribution_x1000(node_sets: list<list<int>>, k: int, group_mean: int) -> int {
+    let mine = avg_jaccard_to_others_x1000(node_sets, k)
+    let mut c = 500 + (mine - group_mean)
+    if c < 0    { c = 0 }
+    if c > 1000 { c = 1000 }
+    return c
+}
+
+// ─── fixture specs (deterministic seed + profile) ──────────────────────────
+
+fn fixture_seeds(name: string) -> list<string> {
+    if name == "F3" {
+        return ["A_math_core", "B_math_core", "C_math_core"]
+    }
+    if name == "F5" {
+        return ["A_math_core", "B_math_core", "C_math_core", "D_math_core", "E_divergent"]
+    }
+    // F10
+    return [
+        "N0_math", "N1_math", "N2_logic", "N3_logic",
+        "N4_music", "N5_music", "N6_biology", "N7_biology",
+        "N8_systems", "N9_systems"
+    ]
+}
+
+fn fixture_profiles(name: string) -> list<string> {
+    if name == "F3" {
+        return ["math_tight", "math_tight", "math_tight"]
+    }
+    if name == "F5" {
+        return ["math_tight", "math_tight", "math_tight", "math_tight", "shallow"]
+    }
+    return [
+        "math", "math", "logic", "logic",
+        "music", "music", "biology", "biology",
+        "systems", "systems"
+    ]
+}
+
+// ─── per-fixture driver ────────────────────────────────────────────────────
+
+fn run_fixture(name: string) -> string {
+    let seeds    = fixture_seeds(name)
+    let profiles = fixture_profiles(name)
+    let n = seeds.len()
+
+    // build each node's atlas
+    let mut node_sets = []
+    let mut edge_sets = []
+    let mut i = 0
+    while i < n {
+        let vis = build_visited(seeds[i], profiles[i])
+        let e   = build_edges(seeds[i], vis)
+        node_sets = node_sets.push(nodes_as_hashes(vis))
+        edge_sets = edge_sets.push(edges_as_hashes(e))
+        i = i + 1
+    }
+
+    let full = coherence_x1000(node_sets, edge_sets)
+    let mj   = pairwise_mean_jaccard_x1000(node_sets)
+
+    // per-node contribution + outlier list
+    let mut contribs = []
+    let mut outliers = []
+    let mut k = 0
+    while k < n {
+        let c = contribution_x1000(node_sets, k, mj)
+        contribs = contribs.push(c)
+        if c < 500 { outliers = outliers.push(k) }
+        k = k + 1
+    }
+
+    // emit json-like
+    let mut body = "{\n"
+        + "  \"fixture\": \"" + name + "\",\n"
+        + "  \"node_count\": " + str(n) + ",\n"
+        + "  \"coherence_x1000\": " + str(full) + ",\n"
+        + "  \"coherence\": \"" + str(full) + "/1000\",\n"
+        + "  \"mean_jaccard_x1000\": " + str(mj) + ",\n"
+        + "  \"edge_consensus_x1000\": " + str(edge_consensus_x1000(edge_sets)) + ",\n"
+        + "  \"nodes\": [\n"
+    let mut a = 0
+    while a < n {
+        if a > 0 { body = body + ",\n" }
+        body = body
+            + "    { \"idx\": " + str(a)
+            + ", \"seed\": \"" + seeds[a] + "\""
+            + ", \"profile\": \"" + profiles[a] + "\""
+            + ", \"contribution_x1000\": " + str(contribs[a])
+            + ", \"atlas_size\": " + str(node_sets[a].len())
+            + ", \"edge_count\": " + str(edge_sets[a].len())
+            + " }"
+        a = a + 1
+    }
+    body = body + "\n  ],\n"
+        + "  \"outlier_nodes\": ["
+    let mut o = 0
+    while o < outliers.len() {
+        if o > 0 { body = body + "," }
+        body = body + str(outliers[o])
+        o = o + 1
+    }
+    body = body + "],\n"
+        + "  \"llm\": \"none\",\n"
+        + "  \"network\": \"hash-only (FNV-1a 32-bit)\",\n"
+        + "  \"safe_commit\": \"V8\"\n"
+        + "}\n"
+
+    return body
+}
+
+fn main() {
+    let r3  = run_fixture("F3")
+    let r5  = run_fixture("F5")
+    let r10 = run_fixture("F10")
+
+    write_file("shared/state/edu_collective_atlas_F3.json",  r3)
+    write_file("shared/state/edu_collective_atlas_F5.json",  r5)
+    write_file("shared/state/edu_collective_atlas_F10.json", r10)
+
+    println("edu_collective_atlas_proto — D")
+    println("  fixtures: F3 / F5 / F10 (hash-only, LLM=none)")
+    println("  out=shared/state/edu_collective_atlas_F{3,5,10}.json")
+    println("  metric: 0.5 * mean_pairwise_jaccard + 0.5 * edge_consensus")
+    println("  V8 SAFE_COMMIT · deterministic · no LLM · no sampling")
+
+    exit(0)
+}
