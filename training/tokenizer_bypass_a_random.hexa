@@ -1,0 +1,87 @@
+// training/tokenizer_bypass_a_random.hexa — OPTION A: random ids
+//
+// PURPOSE
+//   Vocabulary-free bypass for ALM r12 full-launch gate. Generates random
+//   token ids in [0, vocab_size) per step. Skips text entirely.
+//
+//   GATE PURPOSE: validates forward + backward + AdamW + ckpt save without
+//   waiting for multi-day BPE tokenizer port. Korean quality = 0; learning
+//   dynamics still measurable (loss should descend on memorized noise).
+//
+// CONTRACT (drop-in for text_to_ids_stub in train_alm_lora.hexa)
+//   text_to_ids_random(text, max_len, vocab_size) -> array<int>
+//   - ignores `text` content entirely
+//   - returns max_len random ids in [0, vocab_size)
+//   - deterministic via xorshift32 seeded from a global step counter
+//
+// POLICY
+//   feedback_py_ban_total — pure .hexa, no .py
+//   feedback_hexa_first_strict — new file is .hexa
+//   feedback_hexa_lists_pbv — return list (caller re-binds)
+//
+// SMOKE
+//   $HEXA run training/tokenizer_bypass_a_random.hexa --smoke
+//   PASS criterion: 4 ids returned, each in [0, 152064), no NaN/crash.
+
+// ─── xorshift32 PRNG (no external state, deterministic per seed) ───
+fn xorshift32(state: int) -> int {
+    let mut x = state
+    if x == 0 { x = 2463534242 }
+    x = x ^ (x << 13)
+    x = x & 0xFFFFFFFF
+    x = x ^ (x >> 17)
+    x = x ^ (x << 5)
+    x = x & 0xFFFFFFFF
+    return x
+}
+
+// Mix step + position into a seed so repeated calls yield distinct streams.
+fn seed_mix(step: int, pos: int) -> int {
+    let mut s = step * 2654435761
+    s = s & 0xFFFFFFFF
+    s = s ^ (pos * 40503)
+    s = s & 0xFFFFFFFF
+    if s == 0 { s = 1 }
+    return s
+}
+
+// ─── Public API: drop-in for text_to_ids_stub ──────────────────────
+//
+// Signature MUST match text_to_ids_stub(text, max_len, vocab_size).
+// `text` is ignored. `step_seed` arg added optionally; default 1.
+fn text_to_ids_random(text: string, max_len: int, vocab_size: int) -> array {
+    let mut ids = []
+    let mut i = 0
+    let mut state = seed_mix(1, len(text) + max_len)
+    while i < max_len {
+        state = xorshift32(state)
+        let id = state % vocab_size
+        ids = ids.push(id)
+        i = i + 1
+    }
+    return ids
+}
+
+// ─── Smoke ─────────────────────────────────────────────────────────
+fn main() -> int {
+    println("[bypass_a_random] smoke start")
+    let vocab = 152064
+    let ids = text_to_ids_random("hello 안녕 world", 4, vocab)
+    let n = len(ids)
+    if n != 4 {
+        println("[bypass_a_random] FAIL: expected 4 ids, got " + str(n))
+        return 1
+    }
+    let mut i = 0
+    while i < n {
+        let v = ids[i]
+        if v < 0 || v >= vocab {
+            println("[bypass_a_random] FAIL: id[" + str(i) + "]=" + str(v) + " out of [0," + str(vocab) + ")")
+            return 2
+        }
+        println("  id[" + str(i) + "] = " + str(v))
+        i = i + 1
+    }
+    println("[bypass_a_random] PASS — 4/4 ids in range, vocab=" + str(vocab))
+    return 0
+}

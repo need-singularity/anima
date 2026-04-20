@@ -1,0 +1,101 @@
+// training/tokenizer_bypass_b_byte.hexa — OPTION B: UTF-8 byte tokenizer
+//
+// PURPOSE
+//   Byte-level tokenizer for ALM r12 bypass gate. Each UTF-8 byte (0..255)
+//   maps to one token id. Korean text becomes 3 ids per syllable (UTF-8
+//   3-byte encoding); English becomes 1 id per char.
+//
+//   GATE PURPOSE: validates forward + backward + AdamW + ckpt + meaningful
+//   learning dynamics on real text. Korean quality limited (sub-char level)
+//   but loss curve descent meaningful.
+//
+//   VOCAB MISMATCH NOTE: Qwen2.5-14B has vocab=152064. Byte tokenizer uses
+//   only ids 0..255. The remaining 151808 embeddings stay frozen at their
+//   pretrained values. This is a calibration mismatch — we surface it
+//   clearly in the SSOT. Loss baseline will be log(256)≈5.55 nats not
+//   log(152064)≈11.93 because targets only land in the byte-id range.
+//
+// CONTRACT (drop-in for text_to_ids_stub)
+//   text_to_ids_bytes(text, max_len, vocab_size) -> array<int>
+//   - reads bytes 0..min(len(text), max_len)
+//   - emits each byte as id (no remapping; vocab_size param ignored beyond
+//     a sanity check that it's >= 256)
+//   - DOES truncate at max_len; does NOT pad (caller pads with 0)
+//
+// POLICY
+//   feedback_py_ban_total — pure .hexa
+//   feedback_hexa_first_strict — new file is .hexa
+
+// Project-standard byte_at impl (see train_alm_lora.hexa line 373).
+// Hexa string subscript currently broken — use substring+char_code.
+fn byte_at(s: string, i: int) -> int {
+    let sub = s.substring(i, i + 1)
+    return char_code(sub, 0)
+}
+
+fn byte_at_safe(s: string, i: int) -> int {
+    let n = len(s)
+    if i < 0 || i >= n { return 0 }
+    return byte_at(s, i)
+}
+
+// ─── Public API ────────────────────────────────────────────────────
+fn text_to_ids_bytes(text: string, max_len: int, vocab_size: int) -> array {
+    let n = len(text)
+    let cap = if n < max_len { n } else { max_len }
+    let mut ids = []
+    let mut i = 0
+    while i < cap {
+        let b = byte_at_safe(text, i)
+        // Sanity: byte is always 0..255; never overflow vocab_size.
+        if vocab_size >= 256 {
+            ids = ids.push(b)
+        } else {
+            // Defensive fallback — narrow to vocab_size if caller wires
+            // tiny vocab (shouldn't happen in r12 since QWEN14B_VOCAB=152064).
+            ids = ids.push(b % vocab_size)
+        }
+        i = i + 1
+    }
+    return ids
+}
+
+// ─── Smoke ─────────────────────────────────────────────────────────
+fn main() -> int {
+    println("[bypass_b_byte] smoke start")
+    // ASCII test
+    let ids_en = text_to_ids_bytes("Hi!", 8, 152064)
+    let n_en = len(ids_en)
+    if n_en != 3 {
+        println("[bypass_b_byte] FAIL: ASCII 'Hi!' expected 3 bytes, got " + str(n_en))
+        return 1
+    }
+    if ids_en[0] != 72 || ids_en[1] != 105 || ids_en[2] != 33 {
+        println("[bypass_b_byte] FAIL: ASCII bytes wrong (H=72 i=105 !=33)")
+        println("  got: " + str(ids_en[0]) + "," + str(ids_en[1]) + "," + str(ids_en[2]))
+        return 2
+    }
+    println("  ASCII 'Hi!' = [" + str(ids_en[0]) + "," + str(ids_en[1]) + "," + str(ids_en[2]) + "] OK")
+
+    // Korean test: '안' UTF-8 = E3 95 88 = 0xEC 0x95 0x88 (236, 149, 136)
+    let ids_kr = text_to_ids_bytes("안", 8, 152064)
+    let n_kr = len(ids_kr)
+    if n_kr != 3 {
+        println("[bypass_b_byte] FAIL: Korean '안' expected 3 UTF-8 bytes, got " + str(n_kr))
+        return 3
+    }
+    println("  Korean '안' = [" + str(ids_kr[0]) + "," + str(ids_kr[1]) + "," + str(ids_kr[2]) + "] OK")
+
+    // All ids must be in [0, 256) — vocab range sanity
+    let mut i = 0
+    while i < n_kr {
+        let v = ids_kr[i]
+        if v < 0 || v >= 256 {
+            println("[bypass_b_byte] FAIL: byte id out of [0,256): " + str(v))
+            return 4
+        }
+        i = i + 1
+    }
+    println("[bypass_b_byte] PASS — ASCII 3/3 bytes + Korean 3/3 bytes, all in [0,256)")
+    return 0
+}

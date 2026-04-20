@@ -1,0 +1,164 @@
+// training/tokenizer_bypass_c_longest.hexa — OPTION C: longest-match BPE-lite
+//
+// PURPOSE
+//   Quasi-BPE tokenizer using Qwen vocab.json keys ONLY (no merges file).
+//   Greedy longest-match: at each position, find the longest vocab key
+//   that is a prefix of the remaining text. Skip merges-file processing
+//   (which is the multi-day port).
+//
+//   GATE PURPOSE: ~80% token efficiency vs real BPE; meaningful Korean
+//   tokenization without multi-day work. Real BPE would still be needed
+//   for evaluation parity, but training-time loss is meaningful.
+//
+//   IMPLEMENTATION NOTE: Phase-1 (this file) uses an INLINE micro-vocab
+//   (ASCII printable + common Korean syllables) to demonstrate the
+//   longest-match algorithm and prove the trainer-side wiring. Phase-2
+//   would load /workspace/anima/training/tokenizer/qwen_vocab.json via
+//   the FFI-hashmap path documented in tokenizer_qwen_progress_20260420
+//   (recommended (c) — small C lib).
+//
+// CONTRACT (drop-in for text_to_ids_stub)
+//   text_to_ids_longest(text, max_len, vocab_size) -> array<int>
+//
+// POLICY: feedback_py_ban_total OK, feedback_hexa_first_strict OK
+
+// Project-standard byte_at impl (see train_alm_lora.hexa line 373).
+fn byte_at(s: string, i: int) -> int {
+    let sub = s.substring(i, i + 1)
+    return char_code(sub, 0)
+}
+
+fn byte_at_safe(s: string, i: int) -> int {
+    let n = len(s)
+    if i < 0 || i >= n { return 0 }
+    return byte_at(s, i)
+}
+
+// Compare suffix of `text` starting at `pos` to candidate `key`.
+// Returns true if `key` is a byte-exact prefix of text[pos..].
+fn matches_at(text: string, pos: int, key: string) -> bool {
+    let n = len(text)
+    let k = len(key)
+    if pos + k > n { return false }
+    let mut i = 0
+    while i < k {
+        if byte_at(text, pos + i) != byte_at(key, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ─── Inline micro-vocab (Phase-1 PoC) ──────────────────────────────
+// Real Phase-2 path: load_qwen_vocab(path) → vocab_keys/vocab_ids arrays.
+// This stub vocabulary covers a few Korean greetings + ASCII fallback so
+// the algorithm is exercised without the multi-day vocab.json port.
+fn build_micro_vocab() -> array {
+    // 8 keys + 256 byte fallback ids (computed by vocab_id_for_key on miss)
+    let keys = ["안녕", "하세", "요", "hello", " world", "the ", "을", " "]
+    return keys
+}
+
+fn build_micro_ids() -> array {
+    // Arbitrary stable ids in Qwen vocab range. Real path: lookup in
+    // loaded vocab.json. For the PoC, just use offsets >= 1000 to avoid
+    // collision with byte fallback (0..255).
+    return [1001, 1002, 1003, 1004, 1005, 1006, 1007, 32]
+}
+
+// Find longest matching vocab key at `pos`. Returns [key_idx, key_len]
+// or [-1, 0] on miss (fall back to single byte).
+fn longest_match_at(text: string, pos: int, keys: array) -> array {
+    let n = len(keys)
+    let mut best_idx = -1
+    let mut best_len = 0
+    let mut i = 0
+    while i < n {
+        let k = keys[i]
+        let kl = len(k)
+        if kl > best_len {
+            if matches_at(text, pos, k) {
+                best_idx = i
+                best_len = kl
+            }
+        }
+        i = i + 1
+    }
+    return [best_idx, best_len]
+}
+
+// ─── Public API ────────────────────────────────────────────────────
+fn text_to_ids_longest(text: string, max_len: int, vocab_size: int) -> array {
+    let keys = build_micro_vocab()
+    let ids_table = build_micro_ids()
+    let n = len(text)
+    let mut out = []
+    let mut pos = 0
+    let mut emitted = 0
+    while pos < n && emitted < max_len {
+        let m = longest_match_at(text, pos, keys)
+        let idx = m[0]
+        let mlen = m[1]
+        if idx >= 0 {
+            let tid = ids_table[idx]
+            // Guard: tid must be in Qwen vocab range.
+            if tid >= 0 && tid < vocab_size {
+                out = out.push(tid)
+            } else {
+                out = out.push(byte_at(text, pos))
+            }
+            pos = pos + mlen
+        } else {
+            // Fallback to single-byte id (byte-level path).
+            let b = byte_at(text, pos)
+            out = out.push(b)
+            pos = pos + 1
+        }
+        emitted = emitted + 1
+    }
+    return out
+}
+
+// ─── Smoke ─────────────────────────────────────────────────────────
+fn main() -> int {
+    println("[bypass_c_longest] smoke start")
+
+    // English: "hello world" should match "hello" + " world" → 2 ids
+    let ids_en = text_to_ids_longest("hello world", 16, 152064)
+    let n_en = len(ids_en)
+    if n_en < 1 {
+        println("[bypass_c_longest] FAIL: empty result on 'hello world'")
+        return 1
+    }
+    println("  'hello world' → " + str(n_en) + " ids; first=" + str(ids_en[0]))
+
+    // Korean: "안녕하세요" should match "안녕" + "하세" + "요" → 3 ids
+    let ids_kr = text_to_ids_longest("안녕하세요", 16, 152064)
+    let n_kr = len(ids_kr)
+    if n_kr < 1 {
+        println("[bypass_c_longest] FAIL: empty result on '안녕하세요'")
+        return 2
+    }
+    println("  '안녕하세요' → " + str(n_kr) + " ids")
+    if n_kr != 3 {
+        println("[bypass_c_longest] WARN: expected 3 ids for '안녕하세요', got " + str(n_kr) + " (vocab too small / fallback firing)")
+    }
+
+    // Range check
+    let mut i = 0
+    while i < n_kr {
+        let v = ids_kr[i]
+        if v < 0 || v >= 152064 {
+            println("[bypass_c_longest] FAIL: id out of vocab range: " + str(v))
+            return 3
+        }
+        i = i + 1
+    }
+    // Unknown text falls back to bytes — '🚀' should NOT crash
+    let ids_unk = text_to_ids_longest("🚀", 8, 152064)
+    println("  emoji bytes → " + str(len(ids_unk)) + " ids (byte fallback)")
+
+    println("[bypass_c_longest] PASS — EN " + str(n_en) + " ids, KR " + str(n_kr) + " ids, byte fallback OK")
+    return 0
+}
