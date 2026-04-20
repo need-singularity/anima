@@ -290,6 +290,12 @@ comptime const TGT_K = 1
 comptime const TGT_V = 2
 comptime const TGT_O = 3
 
+// Qwen2.5-14B tokenizer.json paths (Phase-3 — real BPE). main() tries
+// pod path first, then Mac fallback. If neither exists, G_TOK_H stays 0
+// and train_loop uses text_to_ids_stub (signal-only hash).
+comptime const QWEN14B_TOKENIZER_POD = "/workspace/weights/qwen14b/tokenizer.json"
+comptime const QWEN14B_TOKENIZER_MAC = "/Users/ghost/Dev/anima/data/models/qwen25-14b-instruct/tokenizer.json"
+
 // ─── Run config (CLI-overridable) ──────────────────────────────────
 
 struct RunConfig {
@@ -880,8 +886,8 @@ fn adamw_step(params: array, grads: array, m_in: array, v_in: array,
 
 // ─── Sample → token-id stub (vocabulary-free fallback for dry-run) ─
 //
-// Real path: hxqwen14b_tokenize(handle, text) → ids. Day-2 ABI.
-// Stub: hash bytes into 0..stub_vocab so the optimizer has signal.
+// Real path (Phase-3): encode_real_bpe via hxtok_encode FFI. Stub path
+// kept for --dry-corpus / smoke modes that don't load tokenizer.json.
 
 fn text_to_ids_stub(text: string, max_len: int, stub_vocab: int) -> array {
     let n = len(text)
@@ -894,6 +900,60 @@ fn text_to_ids_stub(text: string, max_len: int, stub_vocab: int) -> array {
         i = i + 1
     }
     return ids
+}
+
+// ─── hxtok FFI (Phase-3 — real Qwen2.5 BPE) ───────────────────────
+//
+// hxtok.c lives in hexa-lang/self/native/. Provides Qwen2.5 BPE vocab
+// (152064) + merges (~151K) via C-side hashmap for interpreter-proof
+// performance. Declared locally (not via `use tokenizer_qwen`) to avoid
+// the feedback_hexa_silent_exit_5_imports multi-import fragility.
+// Smoke validated Mac+pod: encode('hello world')=[14990,1879],
+// encode('안녕')=[126246,144370].
+
+@link("hxtok")
+extern fn hxtok_load(path: string, expected_vocab_size: int) -> int
+@link("hxtok")
+extern fn hxtok_free(h: int) -> int
+@link("hxtok")
+extern fn hxtok_encode(h: int, text: string, text_len: int,
+                       out_ids_p: int, max_out: int) -> int
+@link("hxtok")
+extern fn hxtok_vocab_size(h: int) -> int
+
+// Global tokenizer handle populated by main() via hxtok_load; 0 = not
+// loaded (train loop falls back to text_to_ids_stub for dev smoke).
+let mut G_TOK_H = 0
+
+// Real BPE encoder — truncates/pads to seq_len.
+fn encode_real_bpe(text: string, seq_len: int) -> array {
+    if G_TOK_H == 0 { return [] }
+    let text_len = len(text)
+    // Allocate with headroom (BPE may expand beyond raw byte count for
+    // rare scripts). Floor at 32 bytes so empty lines still alloc.
+    let cap_guess = text_len + 8
+    let cap = if cap_guess < 32 { 32 } else { cap_guess }
+    let out_p = alloc_raw(cap * 8)
+    let n = hxtok_encode(G_TOK_H, text, text_len, out_p, cap)
+    let effective = if n < cap { n } else { cap }
+    let limit = if effective < seq_len { effective } else { seq_len }
+    let mut ids = []
+    let mut i = 0
+    while i < limit {
+        ids = ids.push(deref(out_p + i * 8))
+        i = i + 1
+    }
+    free_raw(out_p)
+    return ids
+}
+
+// text_to_ids — unified entry. Uses real BPE if tokenizer loaded, else
+// stub fallback (signal-only hash for dry runs).
+fn text_to_ids(text: string, max_len: int, stub_vocab: int) -> array {
+    if G_TOK_H != 0 {
+        return encode_real_bpe(text, max_len)
+    }
+    return text_to_ids_stub(text, max_len, stub_vocab)
 }
 
 // ─── 7. train_loop(...) ────────────────────────────────────────────
@@ -1148,7 +1208,7 @@ fn train_loop(corpus: array, h: int, cfg: RunConfig, fl: RunFloats) -> int {
         let mut tok_idx = 0
         while bi < cfg.batch {
             let row = corpus[sample_idx % n_corpus]
-            let ids = text_to_ids_stub(row, cfg.seq, stub_vocab)
+            let ids = text_to_ids(row, cfg.seq, stub_vocab)
             let il = len(ids)
             // Pad short rows with zeros so M is exactly batch*seq.
             let mut ti = 0
@@ -1963,6 +2023,26 @@ fn main() {
         if h_base > 1 { hxqwen14b_free(h_base) }
         return
     }
+    // ─── Phase-3 BPE tokenizer load ──────────────────────────────────
+    // Try pod path first, then Mac fallback. If both fail, G_TOK_H stays
+    // 0 and train_loop falls back to text_to_ids_stub (signal-only hash).
+    // Real Qwen2.5-14B training requires the real tokenizer — warn loud.
+    let tok_pod = hxtok_load(QWEN14B_TOKENIZER_POD, 0)
+    if tok_pod != 0 {
+        G_TOK_H = tok_pod
+        println("[main] hxtok loaded (pod path): vocab_size=" + str(hxtok_vocab_size(tok_pod)))
+    } else {
+        let tok_mac = hxtok_load(QWEN14B_TOKENIZER_MAC, 0)
+        if tok_mac != 0 {
+            G_TOK_H = tok_mac
+            println("[main] hxtok loaded (mac path): vocab_size=" + str(hxtok_vocab_size(tok_mac)))
+        } else {
+            println("[main] WARN: hxtok_load failed on both POD + MAC paths — train_loop will fall back to text_to_ids_stub (vocab=152064 hashed, NOT real BPE). For real loss curves, place tokenizer.json at one of:")
+            println("[main]   " + QWEN14B_TOKENIZER_POD)
+            println("[main]   " + QWEN14B_TOKENIZER_MAC)
+        }
+    }
+
     if len(corpus) == 0 {
         // dry-run with no corpus → synthesise tiny fake corpus
         println("[main] dry-run: synthesising 4 fake corpus samples")
@@ -1991,6 +2071,8 @@ fn main() {
         let _final = save_lora_device_state(final_dir, cfg)
         println("[main] final ckpt → " + final_dir)
     }
+    // Free tokenizer handle (idempotent; 0 = already-freed / never-loaded).
+    if G_TOK_H != 0 { let _ = hxtok_free(G_TOK_H); G_TOK_H = 0 }
     // Free on-device state regardless of rc (idempotent on already-freed paths).
     let _free = free_train_loop_state()
 
