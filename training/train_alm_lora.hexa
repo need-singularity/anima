@@ -179,6 +179,78 @@ extern fn hxqwen14b_base_backward_v56_pos(h: int, M: int, logits_dev: int,
                                            lora_ptrs_p: int, grad_lora_ptrs_p: int,
                                            lora_r: int, alpha_over_r: float) -> int
 
+// v5.6.5 trainer-wiring FFI (2026-04-20 Phase-5 r12 launch).
+// Cache-writing forward + backward orchestrator + on-device AdamW step.
+// Validated on H100: CE 14.35→14.23→14.06→13.85 over 3 LoRA steps.
+@link("hxqwen14b")
+extern fn hxqwen14b_version_v565() -> int
+
+// Cache-writing forward variant: same args as v56_with_lora_pos plus
+// cache_ptrs_p (626 device buffers from _v56_alloc_activation_cache).
+@link("hxqwen14b")
+extern fn hxqwen14b_base_forward_v56_with_lora_cache_pos(
+    h: int, ids_dev: int, M: int, logits_dev: int,
+    lora_ptrs_p: int, lora_r: int, alpha_over_r: float,
+    cache_ptrs_p: int) -> int
+
+// Activated backward orchestrator (replaces RC_ERR_CUDA_TODO of v563).
+@link("hxqwen14b")
+extern fn hxqwen14b_base_backward_v565_pos(
+    h: int, M: int, logits_dev: int, targets_dev: int,
+    cache_ptrs_p: int, lora_ptrs_p: int, grad_lora_ptrs_p: int,
+    lora_r: int, alpha_over_r: float) -> int
+
+// On-device fused AdamW. Walks all 384 LoRA buffers (192 adapters × A,B)
+// internally — single host call applies the full optimizer step.
+@link("hxqwen14b")
+extern fn hxqwen14b_v565_lora_adamw_step(
+    lora_ptrs_p: int, grad_ptrs_p: int, m_ptrs_p: int, v_ptrs_p: int,
+    r: int, step: int,
+    lr: float, beta1: float, beta2: float, eps: float, wd: float) -> int
+
+// v5.6.6 — global L2 grad-norm clip across all 384 LoRA grad buffers.
+//   Computes ||g||_2, then if > max_norm scales every grad in-place by
+//   max_norm / ||g||_2. Returns measured pre-clip norm via out_norm_p
+//   (host fp64 ptr), 1/0 clipped flag via out_clipped_p (host int64 ptr).
+//   r12 NaN root-cause fix (2026-04-20): without grad-clip, M=512 real
+//   corpus blows to NaN by step 10. With max_norm=1.0 default, training
+//   stays bounded.
+@link("hxqwen14b")
+extern fn hxqwen14b_v566_lora_grad_clip(
+    grad_ptrs_p: int, r: int,
+    max_norm: float,
+    out_norm_p: int, out_clipped_p: int) -> int
+
+// v5.6.6 ABI version probe — used by trainer to verify grad-clip surface
+// is live before launch (≥ 566 means clip is wired).
+@link("hxqwen14b")
+extern fn hxqwen14b_version_v566() -> int
+
+// CUDA device-memory FFI helpers — host-side allocation and PCIe copy.
+// dev pointers are int64 device-virtual addresses; host pointers are
+// int64 alloc_raw'd buffer addresses (from hexa runtime).
+@link("hxqwen14b")
+extern fn hxqwen14b_cu_malloc_bytes(n_bytes: int) -> int
+@link("hxqwen14b")
+extern fn hxqwen14b_cu_free_ptr(dev_ptr: int) -> int
+@link("hxqwen14b")
+extern fn hxqwen14b_cu_memcpy_h2d(dst_dev: int, src_host: int, n_bytes: int) -> int
+@link("hxqwen14b")
+extern fn hxqwen14b_cu_memcpy_d2h(dst_host: int, src_dev: int, n_bytes: int) -> int
+@link("hxqwen14b")
+extern fn hxqwen14b_cu_device_sync() -> int
+
+// On-device memset(0) — required to zero AdamW moments since
+// _v56_alloc_grad_buffers shares Kaiming-init code with alloc_lora_buffers
+// (validated by v565 smoke test 3 — moments came up as garbage without
+// explicit memset). Each buffer's byte size depends on adapter shape.
+@link("hxqwen14b")
+extern fn hxqwen14b_cu_launch_memset_zero(dst_dev: int, n_bytes: int) -> int
+
+// NOTE: hxqwen14b_v56_cache_total_slots already declared in v5.6.3 surface
+// block above (line ~171). Do NOT re-declare or hexa codegen emits two
+// __ffi_sym_* statics → "redefinition" clang error.
+
 // hxblas — used for inplace SGD/AXPY/zero on dense vectors. AdamW is
 // implemented in hexa (no fused FFI yet).
 @link("hxblas")
@@ -840,12 +912,34 @@ fn text_to_ids_stub(text: string, max_len: int, stub_vocab: int) -> array {
 // Note: list pass-by-value (feedback_hexa_lists_pbv.md) — we
 // re-bind A_flat/B_flat/m_*/v_* at module scope after each step.
 
+// 2026-04-20 Phase-5 wiring: LoRA state moved on-device. The hexa-side
+// fp64 arrays G_A_FLAT/G_B_FLAT/G_A_M/G_A_V/G_B_M/G_B_V are RETIRED in
+// favour of int64 pointer-table host buffers. Each holds 384 × int64
+// device pointers (one per A/B buffer of each adapter). Allocated once
+// at train_loop entry, freed at exit. PCIe copies happen only at:
+//   (a) init  : Kaiming A + zero B (handled by C-side alloc_lora_buffers_v56)
+//   (b) memset: zero m, v moments after first alloc (per v565 smoke #3)
+//   (c) save_lora: d2h copy of all 384 buffers per ckpt
+//
+// G_*_FLAT kept as empty stubs so save_lora fallback paths still parse.
 let mut G_A_FLAT = []
 let mut G_B_FLAT = []
 let mut G_A_M    = []
 let mut G_A_V    = []
 let mut G_B_M    = []
 let mut G_B_V    = []
+// New on-device state (int = host buffer pointer holding int64* table)
+let mut G_LORA_PTRS_P  = 0
+let mut G_GRAD_PTRS_P  = 0
+let mut G_M_PTRS_P     = 0
+let mut G_V_PTRS_P     = 0
+let mut G_CACHE_PTRS_P = 0
+let mut G_IDS_DEV      = 0
+let mut G_TGT_DEV      = 0
+let mut G_LOGITS_DEV   = 0
+let mut G_IDS_HOST     = 0
+let mut G_TGT_HOST     = 0
+let mut G_DEV_M        = 0   // active M tokens for which dev buffers were sized
 let mut G_BEST_LOSS = 1000000.0
 let mut G_PATIENCE_LEFT = 0
 let mut G_BREAKTHROUGH_STEP = 0
@@ -854,10 +948,82 @@ let mut G_LAST_LOSS = 0.0
 // run at main() exit. 0 = single-GPU path (no wire overhead).
 let mut G_NCCL_H = 0
 
+// LoRA adapter shape lookup matching C-side hxqwen14b.c v56_proj_n_out
+// / v56_proj_k_in helpers. Adapter index → (n_out, k_in) for the
+// projection. T = adapter % 4: 0=q (n_out=dq=5120), 1=k (dkv=1024),
+// 2=v (dkv=1024), 3=o (n_out=d=5120; k_in=dq=5120).
+fn lora_adapter_n_out(adapter: int) -> int {
+    let t = adapter % N_LORA_TARGETS
+    if t == TGT_Q { return 5120 }      // dq = 40 * 128
+    if t == TGT_K { return 1024 }      // dkv = 8 * 128
+    if t == TGT_V { return 1024 }
+    return 5120                          // o_proj output = d_model
+}
+
+fn lora_adapter_k_in(adapter: int) -> int {
+    let t = adapter % N_LORA_TARGETS
+    if t == TGT_O { return 5120 }      // o_proj input = dq
+    return 5120                          // q/k/v input = d_model
+}
+
+// Buffer byte size for either the A side (idx_in_pair=0; r×k_in floats)
+// or the B side (idx_in_pair=1; n_out×r floats) of an adapter.
+fn lora_buf_floats(adapter: int, is_A: int, r: int) -> int {
+    if is_A == 1 {
+        return r * lora_adapter_k_in(adapter)
+    }
+    return lora_adapter_n_out(adapter) * r
+}
+
+// Allocate a host buffer holding `n` int64 entries (8 bytes each), all
+// zero-initialised by alloc_raw. Returns the int address.
+fn alloc_int64_table(n: int) -> int {
+    let buf = alloc_raw(n * 8)
+    let mut i = 0
+    while i < n {
+        write_i64(buf, i * 8, 0)
+        i = i + 1
+    }
+    return buf
+}
+
+// Read int64 from a host pointer table at slot index `idx`. Wraps the
+// hexa builtin ptr_read (returns int64 from absolute byte offset).
+fn deref_i64_at(ptrs_p: int, idx: int) -> int {
+    return ptr_read(ptrs_p, idx * 8)
+}
+
+// Walk the 384-entry pointer table held at host buffer `ptrs_p` and
+// memset(0) every device buffer. Used after _v56_alloc_grad_buffers
+// to zero AdamW moments (the alloc helper Kaiming-inits A buffers
+// because it shares code with alloc_lora_buffers_v56; for moments
+// we need zeros — see v565 smoke test 3 bugfix).
+fn zero_lora_state(ptrs_p: int, r: int) -> int {
+    let mut idx = 0
+    while idx < 384 {
+        let dev = deref_i64_at(ptrs_p, idx)
+        if dev != 0 {
+            let adapter = idx / 2
+            let is_A = if (idx % 2) == 0 { 1 } else { 0 }
+            let bytes = lora_buf_floats(adapter, is_A, r) * 4
+            let _ = hxqwen14b_cu_launch_memset_zero(dev, bytes)
+        }
+        idx = idx + 1
+    }
+    return 0
+}
+
+// Linear lr warmup. r12 NaN root-cause fix (2026-04-20): even with
+// grad-clip, jumping straight to full lr at step 1 risks blowup; warmup
+// gives Adam moment buffers time to populate non-zero v before the full
+// step lands. Caller may pass any warmup>=0; warmup<25 is silently
+// floored to 25 to enforce the empirically safe minimum on r12.
 fn warmup_lr(base_lr: float, step: int, warmup: int) -> float {
-    if warmup <= 0 { return base_lr }
-    if step >= warmup { return base_lr }
-    return base_lr * (to_float(step) / to_float(warmup))
+    let mut wm = warmup
+    if wm <= 0 { return base_lr }
+    if wm < 25 { wm = 25 }                     // r12 safety floor
+    if step >= wm { return base_lr }
+    return base_lr * (to_float(step) / to_float(wm))
 }
 
 @convergence(state="ossified", id="RUNPOD_FP8_MONKEY_PATCH_DEAD_END", value="transformer_engine.Linear monkey-patch before from_pretrained randomizes all 48 layers (loss=15). FP8 retrofit on HF-based LoRA is dead end — stay bf16", ossified_at="2026-04-16")
@@ -874,19 +1040,14 @@ fn train_loop(corpus: array, h: int, cfg: RunConfig, fl: RunFloats) -> int {
     println("[train_loop] n_adapters=" + str(n_adapters) + " (4 targets × 48 layers)")
     println("[train_loop] LoRA scale α/r = " + str(cfg.lora_alpha) + "/" + str(cfg.lora_r) + " = " + str(scale))
 
-    // Initialize A, B and AdamW state. Storage: float64 in hexa,
-    // would be cast to float32 at the FFI boundary in Day-2.
-    G_A_FLAT = init_lora_A(QWEN14B_D_MODEL, cfg.lora_r, n_adapters, 12345)
-    G_B_FLAT = init_lora_B(QWEN14B_D_MODEL, cfg.lora_r, n_adapters)
-    let aN = len(G_A_FLAT)
-    let bN = len(G_B_FLAT)
-    println("[train_loop] |A|=" + str(aN) + " |B|=" + str(bN) + " (full Qwen 14B layout)")
-    println("[train_loop] WARN: float64 storage; Day-2 FFI will need fp32 cast")
-
-    G_A_M = init_lora_B(QWEN14B_D_MODEL, cfg.lora_r, n_adapters)
-    G_A_V = init_lora_B(QWEN14B_D_MODEL, cfg.lora_r, n_adapters)
-    G_B_M = init_lora_B(QWEN14B_D_MODEL, cfg.lora_r, n_adapters)
-    G_B_V = init_lora_B(QWEN14B_D_MODEL, cfg.lora_r, n_adapters)
+    // 2026-04-20 Phase-5 wiring: detect v565 ABI. v565 = on-device LoRA
+    // training (cache-writing fwd → backward orchestrator → fused AdamW).
+    // r12 launch HARD-REQUIRES v565; refuse to train without it (would
+    // burn H100 on stub forward). Dry-run still works (skips loop).
+    let abi_v565 = hxqwen14b_version_v565()
+    println("[train_loop] hxqwen14b v565 ABI = " + str(abi_v565) + " (565 = on-device LoRA training; <=0 = stub or missing)")
+    let abi_v566 = hxqwen14b_version_v566()
+    println("[train_loop] hxqwen14b v566 ABI = " + str(abi_v566) + " (566 = grad-clip + AdamW NaN-guard live; r12 NaN fix gate)")
 
     // Dry-run gate — exit cleanly before any real GPU/FFI traffic.
     if cfg.dry_run > 0 {
@@ -894,104 +1055,224 @@ fn train_loop(corpus: array, h: int, cfg: RunConfig, fl: RunFloats) -> int {
         return 0
     }
 
+    if abi_v565 < 565 || h <= 0 {
+        println("[train_loop] ERROR: v565 not live (abi=" + str(abi_v565) + ", h=" + str(h) + ") — Phase-5 wiring requires v5.6.5 libhxqwen14b.so")
+        return 4
+    }
+    if abi_v566 < 566 {
+        println("[train_loop] ERROR: v566 not live (abi=" + str(abi_v566) + ") — r12 NaN fix requires v5.6.6 libhxqwen14b.so (grad-clip + NaN-guard)")
+        return 5
+    }
+
     G_BEST_LOSS = 1000000.0
     G_PATIENCE_LEFT = cfg.patience
     G_BREAKTHROUGH_STEP = 0
     G_LAST_LOSS = 0.0
 
-    // Stub vocab for the non-FFI forward — keeps gradient signal flowing.
-    let stub_vocab = 16
+    // ── On-device LoRA state allocation (once per train_loop) ──────
+    // 192 adapters × {A, B} = 384 device buffers. Pointer table is a
+    // host-side int64* (alloc_raw'd) since the FFI takes int64 pointer
+    // arrays by address. _alloc_lora_buffers_v56 does Kaiming(A) + zero(B).
+    G_LORA_PTRS_P = alloc_int64_table(384)
+    let alloc_lora_rc = hxqwen14b_alloc_lora_buffers_v56(cfg.lora_r, G_LORA_PTRS_P)
+    if alloc_lora_rc != 0 {
+        println("[train_loop] FATAL: alloc_lora_buffers_v56 rc=" + str(alloc_lora_rc))
+        return 5
+    }
+    println("[train_loop] LoRA buffers allocated (384 device bufs, Kaiming A + zero B)")
+
+    // Grad buffers (same shape as LoRA, accumulated zero per-step inside
+    // backward orchestrator; alloc helper Kaiming-inits but next step's
+    // bwd zeroes them via accumulate_grads=0 path).
+    G_GRAD_PTRS_P = alloc_int64_table(384)
+    let alloc_grad_rc = hxqwen14b_v56_alloc_grad_buffers(cfg.lora_r, G_GRAD_PTRS_P)
+    if alloc_grad_rc != 0 {
+        println("[train_loop] FATAL: alloc_grad_buffers rc=" + str(alloc_grad_rc))
+        return 6
+    }
+
+    // AdamW moments — must be ZERO (alloc_grad_buffers shares Kaiming-init
+    // code with alloc_lora_buffers; v565 smoke test 3 caught this bug.
+    // memset to 0 explicitly).
+    G_M_PTRS_P = alloc_int64_table(384)
+    let alloc_m_rc = hxqwen14b_v56_alloc_grad_buffers(cfg.lora_r, G_M_PTRS_P)
+    if alloc_m_rc != 0 {
+        println("[train_loop] FATAL: alloc m moments rc=" + str(alloc_m_rc))
+        return 7
+    }
+    let _zm = zero_lora_state(G_M_PTRS_P, cfg.lora_r)
+
+    G_V_PTRS_P = alloc_int64_table(384)
+    let alloc_v_rc = hxqwen14b_v56_alloc_grad_buffers(cfg.lora_r, G_V_PTRS_P)
+    if alloc_v_rc != 0 {
+        println("[train_loop] FATAL: alloc v moments rc=" + str(alloc_v_rc))
+        return 8
+    }
+    let _zv = zero_lora_state(G_V_PTRS_P, cfg.lora_r)
+    let _sync = hxqwen14b_cu_device_sync()
+    println("[train_loop] AdamW moments (m, v) allocated + zeroed")
+
+    // Activation cache (626 device buffers, ~15GB at M=1024). Sized for
+    // the largest M we'll see (cfg.batch * cfg.seq).
+    let M_total = cfg.batch * cfg.seq
+    let cache_slots = hxqwen14b_v56_cache_total_slots()
+    println("[train_loop] activation cache: " + str(cache_slots) + " slots, M=" + str(M_total))
+    G_CACHE_PTRS_P = alloc_int64_table(cache_slots)
+    let alloc_cache_rc = hxqwen14b_v56_alloc_activation_cache(M_total, G_CACHE_PTRS_P)
+    if alloc_cache_rc != 0 {
+        println("[train_loop] FATAL: alloc_activation_cache rc=" + str(alloc_cache_rc) + " (M=" + str(M_total) + ")")
+        return 9
+    }
+    G_DEV_M = M_total
+
+    // Persistent device-side scratch: ids buffer (M int32), targets buffer
+    // ((M-1) int32), logits buffer (M × V fp32). M_total * VOCAB * 4 bytes
+    // ≈ 4096 * 152064 * 4 = 2.5 GB at M=4096 (batch=4 seq=1024). Sized
+    // once; reused per step.
+    let ids_bytes    = M_total * 4
+    let tgt_bytes    = (M_total - 1) * 4   // last-position has no next-token target
+    let logits_bytes = M_total * QWEN14B_VOCAB * 4
+    G_IDS_DEV    = hxqwen14b_cu_malloc_bytes(ids_bytes)
+    G_TGT_DEV    = hxqwen14b_cu_malloc_bytes(tgt_bytes)
+    G_LOGITS_DEV = hxqwen14b_cu_malloc_bytes(logits_bytes)
+    if G_IDS_DEV == 0 || G_TGT_DEV == 0 || G_LOGITS_DEV == 0 {
+        println("[train_loop] FATAL: cu_malloc_bytes failed for persistent dev buffers")
+        return 10
+    }
+    G_IDS_HOST = alloc_raw(ids_bytes)
+    G_TGT_HOST = alloc_raw(tgt_bytes)
+    println("[train_loop] device persistent buffers: ids=" + str(ids_bytes / 1024) + "KB, targets=" + str(tgt_bytes / 1024) + "KB, logits=" + str(logits_bytes / 1024 / 1024) + "MB")
+
+    // Stub vocab for hashing source text into ids until the real BPE
+    // tokenizer lands (multi-day track). Using stub_vocab=152064 so the
+    // ids fall within Qwen2.5-14B's vocab range (random-ish ids → forward
+    // is still well-defined, base CE will be high but learning signal flows).
+    let stub_vocab = QWEN14B_VOCAB
 
     let mut step = 1
     let mut sample_idx = 0
     while step <= cfg.steps {
-        // 1. Build a batch from corpus (round-robin index)
-        let mut batch_ids = []
-        let mut batch_targets = []
+        // 1. Build a batch from corpus (round-robin index, M_total tokens).
+        // Pack ids into the persistent host int32 buffer in-place.
         let mut bi = 0
+        let mut tok_idx = 0
         while bi < cfg.batch {
             let row = corpus[sample_idx % n_corpus]
             let ids = text_to_ids_stub(row, cfg.seq, stub_vocab)
-            // Targets = ids shifted by 1 (next-token prediction)
             let il = len(ids)
+            // Pad short rows with zeros so M is exactly batch*seq.
             let mut ti = 0
-            while ti < il {
-                batch_ids = batch_ids.push(ids[ti])
-                let tgt = if ti + 1 < il { ids[ti + 1] } else { 0 }
-                batch_targets = batch_targets.push(tgt)
+            while ti < cfg.seq {
+                let v = if ti < il { ids[ti] } else { 0 }
+                write_i32(G_IDS_HOST, tok_idx * 4, v)
+                tok_idx = tok_idx + 1
                 ti = ti + 1
             }
             sample_idx = sample_idx + 1
             bi = bi + 1
         }
-
-        // 2-3. Forward with LoRA
-        let logits = forward_qwen14b_with_lora(h, batch_ids, G_A_FLAT, G_B_FLAT, cfg, scale)
-        if len(logits) == 0 {
-            println("[train_loop] step=" + str(step) + " forward returned empty — FFI BLOCKED")
-            return 2
+        // Targets = ids shifted by 1 (next-token prediction; last position
+        // has no target so targets length = M_total - 1).
+        let mut t_i = 0
+        while t_i < M_total - 1 {
+            // src ids are int32 at byte off (t_i+1)*4
+            let next_id = deref_i32(G_IDS_HOST, (t_i + 1) * 4)
+            write_i32(G_TGT_HOST, t_i * 4, next_id)
+            t_i = t_i + 1
         }
 
-        // 4. Loss + dlogits
-        let packed = softmax_ce_grad(logits, batch_targets, stub_vocab)
-        let avg_loss = packed[0]
-        let mut dlogits = []
-        let pN = len(packed)
-        let mut pi = 1
-        while pi < pN {
-            dlogits = dlogits.push(packed[pi])
-            pi = pi + 1
+        // 2. PCIe h2d copy of the new batch (ids + targets).
+        let _h2d_ids = hxqwen14b_cu_memcpy_h2d(G_IDS_DEV, G_IDS_HOST, ids_bytes)
+        let _h2d_tgt = hxqwen14b_cu_memcpy_h2d(G_TGT_DEV, G_TGT_HOST, tgt_bytes)
+
+        // 3. Forward with cache (writes 626 activation slots).
+        let fwd_rc = hxqwen14b_base_forward_v56_with_lora_cache_pos(
+            h, G_IDS_DEV, M_total, G_LOGITS_DEV,
+            G_LORA_PTRS_P, cfg.lora_r, scale, G_CACHE_PTRS_P)
+        if fwd_rc != 0 {
+            println("[train_loop] step=" + str(step) + " fwd_cache rc=" + str(fwd_rc))
+            return 11
         }
 
-        // 5. Backward (LoRA only)
-        let grads = backward_lora_only(h, dlogits, G_A_FLAT, G_B_FLAT, cfg)
-        let grad_A = grads[0]
-        let grad_B = grads[1]
+        // 4. CE loss on first (M_total - 1) rows (last token has no target).
+        let avg_loss = hxqwen14b_ce_loss_v54_pos(G_LOGITS_DEV, G_TGT_DEV,
+                                                  M_total - 1, QWEN14B_VOCAB)
+
+        // 5. Backward orchestrator — produces grad_A, grad_B in G_GRAD_PTRS_P.
+        let bwd_rc = hxqwen14b_base_backward_v565_pos(
+            h, M_total, G_LOGITS_DEV, G_TGT_DEV,
+            G_CACHE_PTRS_P, G_LORA_PTRS_P, G_GRAD_PTRS_P,
+            cfg.lora_r, scale)
+        if bwd_rc != 0 {
+            println("[train_loop] step=" + str(step) + " bwd_v565 rc=" + str(bwd_rc))
+            return 12
+        }
 
         // 5b. FSDP grad AllReduce (r12 2-GPU data-parallel). world_size==1 ⇒
-        // no-op (hxnccl_allreduce_bf16 returns 0 identity). world_size>1 ⇒
-        // sum grads across ranks so each rank adamw-steps on the same avg.
-        // NOTE: grad_A/grad_B here are hexa arrays (CPU); real device-side
-        // AllReduce lands when hxqwen14b Day-2 ABI returns bf16 dev_ptrs.
-        // Today's wire is a call-site placeholder that exercises the NCCL
-        // handle and logs the intent so r12 launch can verify the path.
+        // no-op. world_size>1 not yet device-pointer-aware in hxnccl wrap;
+        // r12 1-GPU smoke uses world_size=1 so this is dormant.
         if G_NCCL_H != 0 && cfg.world_size > 1 {
-            let gA_rc = hxnccl_allreduce_bf16(G_NCCL_H, cfg.rank, 0, len(grad_A))
-            let gB_rc = hxnccl_allreduce_bf16(G_NCCL_H, cfg.rank, 0, len(grad_B))
-            if gA_rc != 0 || gB_rc != 0 {
-                println("[fsdp] WARN: AllReduce rc=" + str(gA_rc) + "/" + str(gB_rc) + " — caller placeholder (need dev_ptr wiring in Day-2 hxqwen14b)")
-            }
+            // TODO: walk G_GRAD_PTRS_P 384 entries, AllReduce each device buf.
+            // Today's stub call exercises the handle but is a no-op.
+            let _ar = hxnccl_allreduce_bf16(G_NCCL_H, cfg.rank, 0, 0)
         }
 
-        // 6. AdamW step on A, B
+        // 5c. v5.6.6 — Global L2 grad-norm clip across all 384 LoRA grads.
+        //   r12 NaN root-cause fix (2026-04-20): without clip, M=512 real
+        //   corpus explodes to NaN by step 10. max_norm=1.0 keeps direction
+        //   while bounding magnitude. Out-params measure pre-clip norm and
+        //   whether scale was applied for diagnostic logging.
+        // alloc_raw scratch buffers for the FFI out-params (caller frees
+        // at end of step; alloc_raw is zero-initialised so safe to read).
+        let _gn_buf = alloc_raw(8)        // double slot
+        let _cl_buf = alloc_raw(8)        // int64 slot
+        let clip_rc = hxqwen14b_v566_lora_grad_clip(
+            G_GRAD_PTRS_P, cfg.lora_r,
+            1.0, _gn_buf, _cl_buf)
+        if clip_rc != 0 {
+            println("[train_loop] step=" + str(step) + " grad_clip rc=" + str(clip_rc))
+            free_raw(_gn_buf)
+            free_raw(_cl_buf)
+            return 14
+        }
+        let grad_norm = ptr_read_f64(_gn_buf, 0)
+        let clipped_flag = deref_i64_at(_cl_buf, 0)
+        free_raw(_gn_buf)
+        free_raw(_cl_buf)
+
+        // 6. AdamW step (on-device fused; updates lora in-place; bumps m, v).
+        //   Kernel has v5.6.6 NaN-guard: bad gradient elements are skipped
+        //   so a single Inf cannot poison every subsequent step.
         let cur_lr = warmup_lr(fl.lr, step, cfg.warmup)
-        let updA = adamw_step(G_A_FLAT, grad_A, G_A_M, G_A_V, cur_lr, fl.beta1, step)
-        G_A_FLAT = updA[0]
-        G_A_M    = updA[1]
-        G_A_V    = updA[2]
-        let updB = adamw_step(G_B_FLAT, grad_B, G_B_M, G_B_V, cur_lr, fl.beta1, step)
-        G_B_FLAT = updB[0]
-        G_B_M    = updB[1]
-        G_B_V    = updB[2]
+        let adamw_rc = hxqwen14b_v565_lora_adamw_step(
+            G_LORA_PTRS_P, G_GRAD_PTRS_P, G_M_PTRS_P, G_V_PTRS_P,
+            cfg.lora_r, step,
+            cur_lr, fl.beta1, ADAMW_BETA2, ADAMW_EPS, ADAMW_WD)
+        if adamw_rc != 0 {
+            println("[train_loop] step=" + str(step) + " adamw rc=" + str(adamw_rc))
+            return 13
+        }
+        let _step_sync = hxqwen14b_cu_device_sync()
 
         G_LAST_LOSS = avg_loss
 
-        // 7. Log every 10 steps
+        // 7. Log every 10 steps. v5.6.6 — also surface grad_norm and clip
+        // flag so we can confirm the r12 NaN fix is engaging in production.
         if step == 1 || step % 10 == 0 {
             println("[train_loop] step=" + str(step) + "/" + str(cfg.steps) +
                     " loss=" + str(avg_loss) +
                     " lr=" + str(cur_lr) +
+                    " gnorm=" + str(grad_norm) +
+                    " clipped=" + str(clipped_flag) +
                     " best=" + str(G_BEST_LOSS) +
                     " patience=" + str(G_PATIENCE_LEFT))
         }
 
-        // 8. Save every save_every (intermediate) — rank-0-only under FSDP
-        //    so the N ranks don't stomp on each other (SHARDED_STATE_DICT is
-        //    Day-2; today all ranks hold full LoRA adapter since LoRA is
-        //    cheap to replicate). world_size==1 ⇒ rank==0 ⇒ always writes.
+        // 8. Save every save_every (intermediate) — rank-0-only under FSDP.
+        // Streams device buffers d2h via save_lora_device_state.
         if step % cfg.save_every == 0 && cfg.rank == 0 {
             let ckpt_path = cfg.out + "/step_" + str(step)
-            save_lora(G_A_FLAT, G_B_FLAT, ckpt_path, cfg)
+            let _save = save_lora_device_state(ckpt_path, cfg)
         }
 
         // 9. Early-stop check at eval_every
@@ -1018,12 +1299,17 @@ fn train_loop(corpus: array, h: int, cfg: RunConfig, fl: RunFloats) -> int {
         }
         if step == 200 && avg_loss > 6.0 {
             println("[train_loop] ABORT: step 200 loss " + str(avg_loss) + " > 6.0 — divergence detected")
+            free_train_loop_state()
             return 3
         }
 
         step = step + 1
     }
 
+    // NOTE: free_train_loop_state() is NOT called here — main() runs a
+    // final save_lora_device_state right after we return, which needs
+    // G_LORA_PTRS_P alive for the d2h walk. main() calls free_train_loop_state
+    // after the final save.
     println("[train_loop] complete. final_loss=" + str(G_LAST_LOSS) + " best_loss=" + str(G_BEST_LOSS))
     return 0
 }
@@ -1373,7 +1659,184 @@ fn save_lora(A_flat: array, B_flat: array, out_dir: string, cfg: RunConfig) -> i
     return 0
 }
 
-// ─── 9. main() — single entry point (silent-exit defense) ──────────
+// ─── 9. save_lora_device_state(out_dir, cfg) — d2h + write ─────────
+//
+// 2026-04-20 Phase-5 wiring: replaces hexa-side save_lora when LoRA
+// state lives on-device. Walks G_LORA_PTRS_P (384 device buffers) and
+// memcpy_d2h's each one into a freshly-alloc'd hexa array, then hands
+// to existing save_lora() so HEXACKPT-v1 / v2 paths remain shared.
+
+fn d2h_buffer_to_array(dev_ptr: int, n_floats: int) -> array {
+    if dev_ptr == 0 || n_floats <= 0 { return [] }
+    let bytes = n_floats * 4
+    let host_buf = alloc_raw(bytes)
+    let _rc = hxqwen14b_cu_memcpy_d2h(host_buf, dev_ptr, bytes)
+    let mut out = []
+    let mut i = 0
+    while i < n_floats {
+        out = out.push(deref_f32(host_buf, i * 4))
+        i = i + 1
+    }
+    free_raw(host_buf)
+    return out
+}
+
+fn save_lora_device_state(out_dir: string, cfg: RunConfig) -> int {
+    if G_LORA_PTRS_P == 0 {
+        println("[save_lora_device_state] WARN: G_LORA_PTRS_P==0 — nothing to save")
+        return 1
+    }
+    let _sync = hxqwen14b_cu_device_sync()
+    let n_adapters = N_LORA_TARGETS * QWEN14B_N_LAYER
+    let r = cfg.lora_r
+    println("[save_lora_device_state] d2h " + str(n_adapters * 2) + " adapter buffers → " + out_dir)
+
+    // Reconstruct flat A_flat / B_flat hexa arrays from device buffers.
+    // A blocks are r * Kin per adapter; B blocks are Nout * r per adapter.
+    // For all 4 targets q/k/v/o, Kin = d_model = 5120 (Qwen rotary q
+    // takes d_model input). For B: o_proj has Nout = d_model, q has
+    // dq = HQ*HD = 5120, k/v have dkv = HK*HD = 1024. So A_block stays
+    // uniform (r * 5120) but B_block varies. We pack into a single
+    // contiguous flat array following the same indexing the existing
+    // save_lora uses (idx * A_block + k for A; idx * B_block + k for B).
+    //
+    // CAVEAT: the legacy save_lora hard-codes A_block = r*d, B_block = d*r
+    // assuming Nout = d. For k/v adapters Nout = dkv != d, so we either
+    // (a) zero-pad to d for v1 compat, or (b) stream each adapter
+    // separately at its true shape. Choosing (b) — write directly here
+    // without reusing the legacy save_lora indexing (otherwise k/v adapter
+    // bytes would overflow into the next adapter's slot).
+    let mk_rc = exec_with_status("mkdir -p '" + out_dir + "'")
+    if mk_rc[1] != 0 {
+        eprintln("[save_lora_device_state] WARN: mkdir failed for " + out_dir)
+    }
+    let cfg_json = "{\n" +
+        "  \"base_model_name_or_path\": \"" + cfg.base + "\",\n" +
+        "  \"peft_type\": \"LORA\",\n" +
+        "  \"task_type\": \"CAUSAL_LM\",\n" +
+        "  \"r\": " + str(cfg.lora_r) + ",\n" +
+        "  \"lora_alpha\": " + str(cfg.lora_alpha) + ",\n" +
+        "  \"lora_dropout\": 0.0,\n" +
+        "  \"bias\": \"none\",\n" +
+        "  \"target_modules\": [\"q_proj\", \"k_proj\", \"v_proj\", \"o_proj\"],\n" +
+        "  \"_writer\": \"hexa-train_alm_lora.hexa-device\",\n" +
+        "  \"_writer_version\": \"r12-2026-04-20-v565\"\n" +
+        "}\n"
+    let cfg_path = out_dir + "/adapter_config.json"
+    write_file(cfg_path, cfg_json)
+
+    let ckpt_path = out_dir + "/adapter_model.hexackpt"
+    let v2_on = _v2lora_enabled()
+
+    if v2_on == 1 {
+        // HEXACKPT-v2 binary path with true per-adapter shapes.
+        write_file(ckpt_path, "")
+        let _ = _v2lora_append_bytes(ckpt_path, [0x48, 0x58, 0x43, 0x4B, 0x50, 0x54, 0x02, 0x00])
+        let _ = _v2lora_append_u32(ckpt_path, 2)
+        let _ = _v2lora_append_u32(ckpt_path, n_adapters * 2)
+        let _ = _v2lora_append_u64(ckpt_path, 0)
+        let meta = "{\"n_adapters\": " + str(n_adapters) +
+                   ", \"d_model\": " + str(QWEN14B_D_MODEL) +
+                   ", \"r\": " + str(r) +
+                   ", \"alpha\": " + str(cfg.lora_alpha) +
+                   ", \"base\": \"" + cfg.base + "\"" +
+                   ", \"writer\": \"hexa-train_alm_lora.hexa-device-v2\"" +
+                   ", \"writer_version\": \"r12-2026-04-20\"}"
+        let _ = _v2lora_append_u32(ckpt_path, len(meta))
+        let _ = _v2lora_append_str_bytes(ckpt_path, meta)
+
+        let mut a_idx = 0
+        while a_idx < n_adapters {
+            let layer = a_idx / N_LORA_TARGETS
+            let tgt   = a_idx % N_LORA_TARGETS
+            let tgt_name = if tgt == TGT_Q { "q_proj" }
+                           else if tgt == TGT_K { "k_proj" }
+                           else if tgt == TGT_V { "v_proj" }
+                           else                 { "o_proj" }
+            let key_prefix = "model.layers." + str(layer) + ".self_attn." + tgt_name
+            let n_out = lora_adapter_n_out(a_idx)
+            let k_in  = lora_adapter_k_in(a_idx)
+
+            let dev_A = deref_i64_at(G_LORA_PTRS_P, a_idx * 2 + 0)
+            let dev_B = deref_i64_at(G_LORA_PTRS_P, a_idx * 2 + 1)
+            let arr_A = d2h_buffer_to_array(dev_A, r * k_in)
+            let _wA = _v2lora_write_tensor(ckpt_path, key_prefix + ".lora_A.weight", r, k_in, arr_A)
+            let arr_B = d2h_buffer_to_array(dev_B, n_out * r)
+            let _wB = _v2lora_write_tensor(ckpt_path, key_prefix + ".lora_B.weight", n_out, r, arr_B)
+
+            a_idx = a_idx + 1
+        }
+        println("[save_lora_device_state] HEXACKPT-v2 streamed " + str(n_adapters * 2) + " tensors → " + ckpt_path)
+        return 0
+    }
+
+    // HEXACKPT-v1 text path with true per-adapter shapes.
+    let header = "HEXACKPT-v1\n" +
+        "# meta n_adapters=" + str(n_adapters) + " d=" + str(QWEN14B_D_MODEL) + " r=" + str(r) + "\n" +
+        "# meta lora_alpha=" + str(cfg.lora_alpha) + "\n" +
+        "# meta base=" + cfg.base + "\n" +
+        "# writer hexa-train_alm_lora.hexa-device\n"
+    write_file(ckpt_path, header)
+    let mut idx = 0
+    while idx < n_adapters {
+        let layer = idx / N_LORA_TARGETS
+        let tgt   = idx % N_LORA_TARGETS
+        let tgt_name = if tgt == TGT_Q { "q_proj" }
+                       else if tgt == TGT_K { "k_proj" }
+                       else if tgt == TGT_V { "v_proj" }
+                       else                 { "o_proj" }
+        let key_prefix = "model.layers." + str(layer) + ".self_attn." + tgt_name
+        let n_out = lora_adapter_n_out(idx)
+        let k_in  = lora_adapter_k_in(idx)
+        let dev_A = deref_i64_at(G_LORA_PTRS_P, idx * 2 + 0)
+        let dev_B = deref_i64_at(G_LORA_PTRS_P, idx * 2 + 1)
+        let arr_A = d2h_buffer_to_array(dev_A, r * k_in)
+        let _ra = append_tensor_block(ckpt_path, key_prefix + ".lora_A.weight", r, k_in, arr_A)
+        let arr_B = d2h_buffer_to_array(dev_B, n_out * r)
+        let _rb = append_tensor_block(ckpt_path, key_prefix + ".lora_B.weight", n_out, r, arr_B)
+        idx = idx + 1
+    }
+    let _rm = append_file(ckpt_path, "__MANIFEST__ " + str(n_adapters * 2) + " 1\n")
+    println("[save_lora_device_state] HEXACKPT-v1 streamed " + str(n_adapters * 2) + " tensors → " + ckpt_path)
+    return 0
+}
+
+// Free all on-device + host scratch state allocated by train_loop. Idempotent.
+fn free_train_loop_state() -> int {
+    if G_LORA_PTRS_P != 0 {
+        let _ = hxqwen14b_free_lora_buffers_v56(G_LORA_PTRS_P)
+        free_raw(G_LORA_PTRS_P)
+        G_LORA_PTRS_P = 0
+    }
+    if G_GRAD_PTRS_P != 0 {
+        let _ = hxqwen14b_v56_free_grad_buffers(G_GRAD_PTRS_P)
+        free_raw(G_GRAD_PTRS_P)
+        G_GRAD_PTRS_P = 0
+    }
+    if G_M_PTRS_P != 0 {
+        let _ = hxqwen14b_v56_free_grad_buffers(G_M_PTRS_P)
+        free_raw(G_M_PTRS_P)
+        G_M_PTRS_P = 0
+    }
+    if G_V_PTRS_P != 0 {
+        let _ = hxqwen14b_v56_free_grad_buffers(G_V_PTRS_P)
+        free_raw(G_V_PTRS_P)
+        G_V_PTRS_P = 0
+    }
+    if G_CACHE_PTRS_P != 0 {
+        let _ = hxqwen14b_v56_free_activation_cache(G_CACHE_PTRS_P)
+        free_raw(G_CACHE_PTRS_P)
+        G_CACHE_PTRS_P = 0
+    }
+    if G_IDS_DEV != 0    { let _ = hxqwen14b_cu_free_ptr(G_IDS_DEV);    G_IDS_DEV = 0 }
+    if G_TGT_DEV != 0    { let _ = hxqwen14b_cu_free_ptr(G_TGT_DEV);    G_TGT_DEV = 0 }
+    if G_LOGITS_DEV != 0 { let _ = hxqwen14b_cu_free_ptr(G_LOGITS_DEV); G_LOGITS_DEV = 0 }
+    if G_IDS_HOST != 0   { free_raw(G_IDS_HOST); G_IDS_HOST = 0 }
+    if G_TGT_HOST != 0   { free_raw(G_TGT_HOST); G_TGT_HOST = 0 }
+    return 0
+}
+
+// ─── 10. main() — single entry point (silent-exit defense) ─────────
 //
 // Per feedback_hexa_silent_exit_5_imports.md: this file has NO `use`
 // statements and its main() body is intentionally non-trivial so that
@@ -1530,11 +1993,16 @@ fn main() {
     println("[main] train_loop rc=" + str(rc))
 
     // Final save — rank-0-only under FSDP so shards don't collide.
+    // 2026-04-20 Phase-5: device-state save (d2h all 384 LoRA buffers).
+    // train_loop intentionally leaves device state allocated until here
+    // so this final write can read from G_LORA_PTRS_P; we free right after.
     if rc == 0 && cfg.rank == 0 {
         let final_dir = cfg.out + "/final"
-        save_lora(G_A_FLAT, G_B_FLAT, final_dir, cfg)
+        let _final = save_lora_device_state(final_dir, cfg)
         println("[main] final ckpt → " + final_dir)
     }
+    // Free on-device state regardless of rc (idempotent on already-freed paths).
+    let _free = free_train_loop_state()
 
     // FSDP teardown — hxnccl_free destroys all NCCL comms on every rank.
     if G_NCCL_H != 0 {
