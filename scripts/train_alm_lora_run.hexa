@@ -1,0 +1,139 @@
+// scripts/train_alm_lora_run.hexa — canonical entry for ALM LoRA training
+//
+// GOAL: single invocation path that never kills Mac.
+// Replaces ad-hoc `ssh ubu ...` commands and the forbidden
+// `hexa build training/train_alm_lora.hexa -o /tmp/train_alm_lora_mac` pattern
+// that caused the 2026-04-20 03:33 kernel panic.
+//
+// BEHAVIOR:
+//   Darwin (Mac)    — auto-dispatch via ssh to ubu/ubu2/htz (first healthy).
+//                     Never runs heavy compute locally. HEXA_TRAIN_HOST env
+//                     override selects target explicitly.
+//   Linux remote    — runs training/train_alm_lora.hexa in-process.
+//   Unknown host    — refuse with clear error.
+//
+// USAGE:
+//   hexa run scripts/train_alm_lora_run.hexa                # auto-dispatch
+//   hexa run scripts/train_alm_lora_run.hexa --dry-run      # stub
+//   HEXA_TRAIN_HOST=htz hexa run scripts/train_alm_lora_run.hexa
+//   SKIP_SSH=1 hexa run scripts/train_alm_lora_run.hexa     # show cmd only
+//
+// SAFETY LAYERS (defense-in-depth):
+//   L1 hexa-lang @refuse/@repuse/@watchdog on train_alm_lora main()
+//      — blocks interpreter path on Darwin (landed 2026-04-20)
+//   L2 `hexa build` Darwin refusal for _mac / /tmp / @refuse sources
+//      — blocks compile path on Darwin (landed 2026-04-20)
+//   L3 this script — preferred canonical invocation, never produces _mac binary
+
+fn host_uname() -> string {
+    return exec("uname 2>/dev/null").trim()
+}
+
+fn host_short() -> string {
+    let h = exec("hostname -s 2>/dev/null").trim()
+    if h == "" { return exec("hostname 2>/dev/null").trim() }
+    return h
+}
+
+// SSH reachability: `ssh -o ConnectTimeout=5 -o BatchMode=yes <host> true`.
+// BatchMode=yes → no password prompt; returns nonzero on timeout/refusal.
+fn host_reachable(host) -> int {
+    let rc = exec("ssh -o ConnectTimeout=5 -o BatchMode=yes " + host
+                + " true 2>/dev/null; echo $?").trim()
+    if rc == "0" { return 1 }
+    return 0
+}
+
+fn pick_remote_host() -> string {
+    let override_h = env("HEXA_TRAIN_HOST")
+    if override_h != "" {
+        println("[dispatch] HEXA_TRAIN_HOST=" + override_h + " (explicit)")
+        return override_h
+    }
+    // Preference order: ubu > htz > ubu2 (matches gpu_policy — Ubuntu first,
+    // Hetzner AX102 second for heavy compute, ubu2 as backup).
+    let candidates = ["ubu", "htz", "ubu2"]
+    let mut i = 0
+    while i < len(candidates) {
+        let h = candidates[i]
+        if host_reachable(h) == 1 {
+            println("[dispatch] picked: " + h + " (first reachable)")
+            return h
+        }
+        println("[dispatch] " + h + " unreachable, trying next")
+        i = i + 1
+    }
+    return ""
+}
+
+fn join_args(args) -> string {
+    let mut s = ""
+    let mut i = 0
+    while i < len(args) {
+        if i > 0 { s = s + " " }
+        s = s + "'" + args[i] + "'"
+        i = i + 1
+    }
+    return s
+}
+
+fn main() {
+    let argv_full = args()
+    let n = len(argv_full)
+    let mut user_args = []
+    let mut i = 2  // skip [binary, binary]
+    while i < n {
+        user_args = user_args.push(argv_full[i])
+        i = i + 1
+    }
+    let passthrough = join_args(user_args)
+    let uname = host_uname()
+    let hostname = host_short()
+
+    println("═══════════════════════════════════════════════════════")
+    println("  train_alm_lora_run — canonical dispatch wrapper")
+    println("  host    : " + hostname + " (uname=" + uname + ")")
+    println("  args    : " + passthrough)
+    println("═══════════════════════════════════════════════════════")
+
+    if uname == "Darwin" {
+        // Mac — dispatch via ssh. Never run heavy compute locally.
+        let remote = pick_remote_host()
+        if remote == "" {
+            println("error: no reachable remote host (tried ubu, htz, ubu2)")
+            println("  fix  : start a remote (wake-on-lan, RunPod pod), or")
+            println("         set HEXA_TRAIN_HOST=<reachable_host>")
+            exit(1)
+        }
+        let remote_cmd = "cd ~/Dev/anima && hexa run training/train_alm_lora.hexa " + passthrough
+        let ssh_cmd = "ssh -t " + remote + " " + "\"" + remote_cmd + "\""
+        println("[dispatch] → " + ssh_cmd)
+        if env("SKIP_SSH") == "1" {
+            println("[dispatch] SKIP_SSH=1 — command printed, not executed")
+            return
+        }
+        // exec passthrough with stdout/stderr preserved
+        let rc = exec(ssh_cmd)
+        println(rc)
+        return
+    }
+
+    // Non-Darwin — treat as training host. Verify hostname is in allowlist
+    // for extra safety (prevents accidental local exec on e.g. a dev VM).
+    if hostname != "ubu" && hostname != "ubu2" && hostname != "htz"
+       && hostname != "hetzner" && hostname != "runpod"
+       && env("HEXA_TRAIN_HOST_OK") != "1" {
+        println("error: unknown training host '" + hostname + "'")
+        println("  fix    : run on ubu/ubu2/htz/hetzner/runpod, or")
+        println("           set HEXA_TRAIN_HOST_OK=1 to override")
+        exit(1)
+    }
+    let local_cmd = "hexa run training/train_alm_lora.hexa " + passthrough
+    println("[dispatch] local exec: " + local_cmd)
+    if env("SKIP_SSH") == "1" {
+        println("[dispatch] SKIP_SSH=1 — command printed, not executed")
+        return
+    }
+    let out = exec(local_cmd)
+    println(out)
+}
