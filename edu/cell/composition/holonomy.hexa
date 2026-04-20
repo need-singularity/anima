@@ -1,0 +1,203 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  edu/cell/composition/holonomy.hexa
+//
+//  PURPOSE
+//    Measure the HOLONOMY INDEX of a module partition: the degree to which a
+//    closed walk around a subgraph FAILS to return to its starting tension
+//    topology.  This is Law 22 ("structure > feature") in quantified form —
+//    if a module were decomposable into independent parts, round-trip along
+//    its boundary would leave the per-node tension profile unchanged.
+//
+//  DEFINITION  (tension-topology holonomy)
+//    For each module c with node set V_c (|V_c| ≥ 3):
+//       1. Order V_c by node index  →  cyclic path P_c = v_0, v_1, …, v_{m-1}, v_0
+//       2. Parallel-transport along P_c: at step k we update the probe vector
+//          x ∈ R^m by the tension-coupling operator
+//                 x ← R_k · x
+//          where R_k is the 2-cycle mixing matrix induced by the edge
+//          (v_k, v_{k+1}) using its edge tension t_k ∈ [0,1]:
+//                 R_k = [[1 − t_k,  t_k],
+//                        [ t_k,     1 − t_k]]       on coords (k, k+1 mod m)
+//          All other coords pass through the identity.
+//          If no edge exists between (v_k, v_{k+1}) we use t_k = 0 (identity).
+//       3. After one full loop, let x' = x_after.  Holonomy of module c is
+//                 H_c = || x' − x_0 || / √m
+//          with x_0 = e_0 (unit basis vector).  H_c ∈ [0, 1] normalised.
+//       4. Holonomy index of the partition:
+//                 HI = mean_c H_c   over modules with m ≥ 3
+//
+//    Intuition: a single 2-cycle mixing is its own inverse, so if every edge
+//    in the loop had the SAME tension, traversal would commute.  Different
+//    tensions make R_k non-commuting → loop fails to close → emergent
+//    holonomy.  This is genuinely NOT a simple composition of per-edge
+//    metrics (non-abelian structure).
+//
+//  EXPORTS
+//    holonomy_of_module(nodes, edges, module_idx, labels) -> float
+//    holonomy_index    (nodes, edges, labels)             -> float
+//
+//  RAW contract: raw#9 · hexa-only · LLM=none · deterministic.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── scalar helpers ───────────────────────────────────────────────────────
+
+fn _ho_abs(x: float) -> float { if x < 0.0 { return 0.0 - x } return x }
+fn _ho_fmin(a: float, b: float) -> float { if a < b { return a } return b }
+
+fn _ho_sqrt(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut y = x * 0.5
+    let mut i = 0
+    while i < 20 {
+        y = (y + x / y) * 0.5
+        i = i + 1
+    }
+    return y
+}
+
+fn _ho_clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+// Mirror of module_decompose.edge_tension — inlined for standalone importability.
+fn _ho_edge_tension(edge: list, nodes: list) -> float {
+    let i   = edge[0]
+    let j   = edge[1]
+    let k   = edge[2]
+    let Wi  = nodes[i][1]
+    let Wj  = nodes[j][1]
+    if k == "prereq" {
+        let exp = _ho_fmin(Wi + 0.15, 1.0)
+        return _ho_abs(exp - Wj)
+    }
+    if k == "derives"      { return _ho_abs(Wi - Wj) }
+    if k == "dual"         { return _ho_abs(Wi - Wj) }
+    if k == "contradicts"  { return Wi * Wj }
+    if k == "instantiates" { return _ho_abs((0.7 * Wi + 0.3 * Wj) - Wj) }
+    return _ho_abs(Wi - Wj)
+}
+
+// ── list helpers ─────────────────────────────────────────────────────────
+
+fn _ho_zeros_f(n: int) -> list {
+    let mut xs = []
+    let mut i = 0
+    while i < n {
+        xs = xs.push(0.0)
+        i = i + 1
+    }
+    return xs
+}
+
+fn _ho_set_f(xs: list, idx: int, v: float) -> list {
+    let n = xs.len()
+    let mut ys = []
+    let mut i = 0
+    while i < n {
+        if i == idx { ys = ys.push(v) } else { ys = ys.push(xs[i]) }
+        i = i + 1
+    }
+    return ys
+}
+
+// Build list of node indices that carry label `c`, sorted by index.
+fn _ho_module_nodes(labels: list, c: int) -> list {
+    let mut out = []
+    let mut i = 0
+    while i < labels.len() {
+        if labels[i] == c { out = out.push(i) }
+        i = i + 1
+    }
+    return out
+}
+
+// Tension of the (u,v) edge if one exists in `edges`; else 0.0.
+// Uses FIRST matching edge to stay deterministic.
+fn _ho_edge_t(u: int, v: int, edges: list, nodes: list) -> float {
+    let mut e = 0
+    while e < edges.len() {
+        let ed = edges[e]
+        let a = ed[0]
+        let b = ed[1]
+        if (a == u && b == v) || (a == v && b == u) {
+            return _ho_clamp01(_ho_edge_tension(ed, nodes))
+        }
+        e = e + 1
+    }
+    return 0.0
+}
+
+// Apply 2-cycle mixing on coords (ka, kb) of x with mixing t ∈ [0,1].
+//     x'_ka = (1-t) * x_ka + t * x_kb
+//     x'_kb = t     * x_ka + (1-t) * x_kb
+fn _ho_mix(x: list, ka: int, kb: int, t: float) -> list {
+    let xa = x[ka]
+    let xb = x[kb]
+    let na = (1.0 - t) * xa + t * xb
+    let nb = t * xa + (1.0 - t) * xb
+    let mut y = _ho_set_f(x, ka, na)
+    y = _ho_set_f(y, kb, nb)
+    return y
+}
+
+// ── holonomy of one module ───────────────────────────────────────────────
+
+fn holonomy_of_module(nodes: list, edges: list, labels: list, c: int) -> float {
+    let vs = _ho_module_nodes(labels, c)
+    let m = vs.len()
+    if m < 3 { return 0.0 }
+    // initial probe x = e_0
+    let mut x = _ho_zeros_f(m)
+    x = _ho_set_f(x, 0, 1.0)
+    let x0 = x
+    // traverse cycle v_0 → v_1 → … → v_{m-1} → v_0
+    let mut k = 0
+    while k < m {
+        let kn = (k + 1) % m
+        let t  = _ho_edge_t(vs[k], vs[kn], edges, nodes)
+        x = _ho_mix(x, k, kn, t)
+        k = k + 1
+    }
+    // distance ||x - x0|| / sqrt(m)
+    let mut acc = 0.0
+    let mut i = 0
+    while i < m {
+        let d = x[i] - x0[i]
+        acc = acc + d * d
+        i = i + 1
+    }
+    let norm = _ho_sqrt(acc) / _ho_sqrt(to_float(m))
+    if norm > 1.0 { return 1.0 }
+    if norm < 0.0 { return 0.0 }
+    return norm
+}
+
+// ── holonomy index of the partition ──────────────────────────────────────
+
+fn holonomy_index(nodes: list, edges: list, labels: list) -> float {
+    // number of modules
+    let mut kmax = 0
+    let mut i = 0
+    while i < labels.len() {
+        if labels[i] > kmax { kmax = labels[i] }
+        i = i + 1
+    }
+    let k = kmax + 1
+    let mut sum = 0.0
+    let mut count = 0
+    let mut c = 0
+    while c < k {
+        let vs = _ho_module_nodes(labels, c)
+        if vs.len() >= 3 {
+            sum = sum + holonomy_of_module(nodes, edges, labels, c)
+            count = count + 1
+        }
+        c = c + 1
+    }
+    if count == 0 { return 0.0 }
+    return sum / to_float(count)
+}
+
+fn holonomy_version() -> string { return "edu.cell.composition.holonomy.v1" }

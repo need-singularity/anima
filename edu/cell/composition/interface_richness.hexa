@@ -1,0 +1,202 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  edu/cell/composition/interface_richness.hexa
+//
+//  PURPOSE
+//    Quantify the INFORMATION DENSITY on bridge edges — the edges whose
+//    endpoints live in different detected modules.  A cell is compositionally
+//    deep iff the few bridge edges it exposes carry a rich, distinct tension
+//    signature (high-entropy channel).  Conversely, a loosely coupled mesh
+//    has many bridges with low per-edge information.
+//
+//  DEFINITION
+//    Partition the set of bridge edges by KIND k ∈ {prereq, derives, dual,
+//    contradicts, instantiates}.  Let n_k be the bridge-edge count of kind k
+//    and B = Σ_k n_k.  Define:
+//        p_k        = n_k / B
+//        H_kind     = − Σ_k p_k log2 p_k          (in bits, H ∈ [0, log2 5])
+//        t̄_bridge   = mean tension across all bridge edges
+//        interface_richness = (H_kind / log2(5)) * t̄_bridge
+//    ∈ [0, 1].  Zero when either all bridges have identical kind or carry no
+//    tension.  Maximal when all 5 kinds are used equally with high tension.
+//
+//    Info per edge (raw): H_kind / B  (bits-per-edge, returned too).
+//
+//  EXPORTS
+//    interface_richness(nodes, edges, bridge_indices) -> float
+//    bridge_stats(nodes, edges, bridge_indices)
+//        -> list [count, H_kind, mean_tension, info_per_edge, richness]
+//
+//  RAW contract: raw#9 · hexa-only · LLM=none · deterministic.
+// ════════════════════════════════════════════════════════════════════════════
+
+fn _ir_abs(x: float) -> float { if x < 0.0 { return 0.0 - x } return x }
+fn _ir_fmin(a: float, b: float) -> float { if a < b { return a } return b }
+
+// log2 via series on reduced argument.
+fn _ir_ln(x: float) -> float {
+    if x <= 0.0 { return 0.0 - 1000000.0 }
+    let mut m = x
+    let mut k = 0
+    while m >= 2.0 {
+        m = m / 2.0
+        k = k + 1
+    }
+    while m < 1.0 {
+        m = m * 2.0
+        k = k - 1
+    }
+    let y = (m - 1.0) / (m + 1.0)
+    let y2 = y * y
+    let mut term = y
+    let mut sum = 0.0
+    let mut i = 0
+    while i < 20 {
+        sum = sum + term / (2.0 * to_float(i) + 1.0)
+        term = term * y2
+        i = i + 1
+    }
+    let ln_m = 2.0 * sum
+    let ln2 = 0.6931471805599453
+    return ln_m + to_float(k) * ln2
+}
+
+fn _ir_log2(x: float) -> float {
+    let ln2 = 0.6931471805599453
+    return _ir_ln(x) / ln2
+}
+
+fn _ir_xlog2x(p: float) -> float {
+    if p <= 0.0 { return 0.0 }
+    if p >= 1.0 { return 0.0 }
+    return p * _ir_log2(p)
+}
+
+// Mirror of module_decompose.edge_tension (inlined for importability).
+fn _ir_edge_tension(edge: list, nodes: list) -> float {
+    let i   = edge[0]
+    let j   = edge[1]
+    let k   = edge[2]
+    let Wi  = nodes[i][1]
+    let Wj  = nodes[j][1]
+    if k == "prereq" {
+        let exp = _ir_fmin(Wi + 0.15, 1.0)
+        return _ir_abs(exp - Wj)
+    }
+    if k == "derives"      { return _ir_abs(Wi - Wj) }
+    if k == "dual"         { return _ir_abs(Wi - Wj) }
+    if k == "contradicts"  { return Wi * Wj }
+    if k == "instantiates" { return _ir_abs((0.7 * Wi + 0.3 * Wj) - Wj) }
+    return _ir_abs(Wi - Wj)
+}
+
+// Map kind string → bucket index ∈ [0,4].  Unknown → 0.
+fn _ir_kind_bucket(kind: string) -> int {
+    if kind == "prereq"       { return 0 }
+    if kind == "derives"      { return 1 }
+    if kind == "dual"         { return 2 }
+    if kind == "contradicts"  { return 3 }
+    if kind == "instantiates" { return 4 }
+    return 0
+}
+
+fn _ir_zeros_i(n: int) -> list {
+    let mut xs = []
+    let mut i = 0
+    while i < n {
+        xs = xs.push(0)
+        i = i + 1
+    }
+    return xs
+}
+
+fn _ir_set_i(xs: list, idx: int, v: int) -> list {
+    let n = xs.len()
+    let mut ys = []
+    let mut i = 0
+    while i < n {
+        if i == idx { ys = ys.push(v) } else { ys = ys.push(xs[i]) }
+        i = i + 1
+    }
+    return ys
+}
+
+// interface_richness(nodes, edges, bridge_indices) -> float in [0,1]
+fn interface_richness(nodes: list, edges: list, bridge_indices: list) -> float {
+    let B = bridge_indices.len()
+    if B == 0 { return 0.0 }
+    // kind histogram
+    let mut hist = _ir_zeros_i(5)
+    let mut tsum = 0.0
+    let mut i = 0
+    while i < B {
+        let eidx = bridge_indices[i]
+        let ed = edges[eidx]
+        let kb = _ir_kind_bucket(ed[2])
+        hist = _ir_set_i(hist, kb, hist[kb] + 1)
+        tsum = tsum + _ir_edge_tension(ed, nodes)
+        i = i + 1
+    }
+    // Shannon H over bucket distribution
+    let Bf = to_float(B)
+    let mut H = 0.0
+    let mut c = 0
+    while c < 5 {
+        let p = to_float(hist[c]) / Bf
+        H = H - _ir_xlog2x(p)
+        c = c + 1
+    }
+    let log2_5 = _ir_log2(5.0)
+    let H_norm = if log2_5 > 0.0 { H / log2_5 } else { 0.0 }
+    let t_mean = tsum / Bf
+    let r = H_norm * t_mean
+    if r < 0.0 { return 0.0 }
+    if r > 1.0 { return 1.0 }
+    return r
+}
+
+// detailed stats: [B, H_kind, t_mean, H_per_edge, richness]
+fn bridge_stats(nodes: list, edges: list, bridge_indices: list) -> list {
+    let B = bridge_indices.len()
+    let mut out = []
+    if B == 0 {
+        out = out.push(0)
+        out = out.push(0.0)
+        out = out.push(0.0)
+        out = out.push(0.0)
+        out = out.push(0.0)
+        return out
+    }
+    let mut hist = _ir_zeros_i(5)
+    let mut tsum = 0.0
+    let mut i = 0
+    while i < B {
+        let eidx = bridge_indices[i]
+        let ed = edges[eidx]
+        let kb = _ir_kind_bucket(ed[2])
+        hist = _ir_set_i(hist, kb, hist[kb] + 1)
+        tsum = tsum + _ir_edge_tension(ed, nodes)
+        i = i + 1
+    }
+    let Bf = to_float(B)
+    let mut H = 0.0
+    let mut c = 0
+    while c < 5 {
+        let p = to_float(hist[c]) / Bf
+        H = H - _ir_xlog2x(p)
+        c = c + 1
+    }
+    let log2_5 = _ir_log2(5.0)
+    let H_norm = if log2_5 > 0.0 { H / log2_5 } else { 0.0 }
+    let t_mean = tsum / Bf
+    let per_edge = H / Bf
+    let r = H_norm * t_mean
+    out = out.push(B)
+    out = out.push(H)
+    out = out.push(t_mean)
+    out = out.push(per_edge)
+    let rc = if r < 0.0 { 0.0 } else { if r > 1.0 { 1.0 } else { r } }
+    out = out.push(rc)
+    return out
+}
+
+fn interface_richness_version() -> string { return "edu.cell.composition.interface.v1" }

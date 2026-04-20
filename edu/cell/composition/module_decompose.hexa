@@ -1,0 +1,338 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  edu/cell/composition/module_decompose.hexa
+//
+//  PURPOSE
+//    Automatic subgraph (module) detection on a 10-node atlas via a greedy
+//    Louvain-style community detection that is compatible with the hexa stage0
+//    interpreter (no hashmaps, no floats-as-keys).  Input is the atlas tuple
+//    (nodes, edges) shared with edu_tension_drop_proto:
+//      nodes = list of [id_str, W_float]
+//      edges = list of [i_int, j_int, kind_str]
+//
+//    We bind two edge weights to each edge: a GEOMETRIC weight w_geo (uniform
+//    1.0 per adjacency) and a TENSION weight w_t = tension_of(edge, nodes).
+//    Community detection uses w_t: edges whose endpoints "disagree" more
+//    strongly bind more tightly — they define the module boundary.
+//
+//  EXPORTS
+//    community_assign(nodes, edges, max_k) -> list[int]  length N
+//        label[i] ∈ [0, k) where k = distinct labels returned.
+//
+//    module_sizes(labels, k)               -> list[int]  length k
+//    min_module_size(labels, k)            -> int        smallest module
+//
+//    bridge_edges(edges, labels)           -> list[int]  edge indices whose
+//        endpoints are in different modules (inter-module bridges).
+//    internal_edges(edges, labels)         -> list[int]  edge indices whose
+//        endpoints are in the same module.
+//
+//  ALGORITHM  (coherence-greedy — LOW tension binds nodes together)
+//    0. label[i] = i   (N singletons)
+//    1. For each node i in index order:
+//         pick the neighbor label c* that maximises COHERENCE gain
+//         ΔQ = sum_{j ∈ N(i), label[j] == c*} w_c(i,j)
+//              − sum_{j ∈ N(i), label[j] == label[i]} w_c(i,j)
+//         where  w_c(i,j) = 1 − w_t(i,j)  (1 = total coherence, 0 = max tension)
+//         If ΔQ > eps then label[i] ← c*.
+//    2. Iterate the sweep until no label changes or max 8 sweeps.
+//    3. Re-index labels to a contiguous range [0, k).
+//
+//  INTUITION
+//    Low-tension edges (mastered / consistent) hold a module together.
+//    High-tension edges (unresolved gaps) separate modules.  Learning that
+//    DIFFERENTIATES specific nodes RAISES some tensions → those edges
+//    become separating boundaries → modules split → min_module_size ↓.
+//
+//  DETERMINISM
+//    Pure function of (nodes, edges).  Ties broken by smaller label index.
+//
+//  RAW contract: raw#9 · hexa-only · LLM=none · deterministic.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── math helpers ─────────────────────────────────────────────────────────
+
+fn _md_abs(x: float) -> float { if x < 0.0 { return 0.0 - x } return x }
+fn _md_fmin(a: float, b: float) -> float { if a < b { return a } return b }
+fn _md_fmax(a: float, b: float) -> float { if a > b { return a } return b }
+
+// ── list helpers ─────────────────────────────────────────────────────────
+
+fn _md_zeros_i(n: int) -> list {
+    let mut xs = []
+    let mut i = 0
+    while i < n {
+        xs = xs.push(0)
+        i = i + 1
+    }
+    return xs
+}
+
+fn _md_set_i(xs: list, idx: int, v: int) -> list {
+    let n = xs.len()
+    let mut ys = []
+    let mut i = 0
+    while i < n {
+        if i == idx { ys = ys.push(v) } else { ys = ys.push(xs[i]) }
+        i = i + 1
+    }
+    return ys
+}
+
+// ── edge tension (mirror of tool/edu_tension_drop_proto.hexa expected_W) ──
+
+// Schema rules (MUST stay byte-equivalent to edu_tension_drop_proto):
+//   prereq:       expected_W_j = min(W_i + 0.15, 1.0)
+//   derives:      expected_W_j = W_i
+//   dual:         expected_W_j = W_i
+//   contradicts:  tension      = W_i * W_j  (product form)
+//   instantiates: expected_W_j = 0.7*W_i + 0.3*W_j
+fn edge_tension(edge: list, nodes: list) -> float {
+    let i   = edge[0]
+    let j   = edge[1]
+    let k   = edge[2]
+    let Wi  = nodes[i][1]
+    let Wj  = nodes[j][1]
+    if k == "prereq" {
+        let exp = _md_fmin(Wi + 0.15, 1.0)
+        return _md_abs(exp - Wj)
+    }
+    if k == "derives"      { return _md_abs(Wi - Wj) }
+    if k == "dual"         { return _md_abs(Wi - Wj) }
+    if k == "contradicts"  { return Wi * Wj }
+    if k == "instantiates" { return _md_abs((0.7 * Wi + 0.3 * Wj) - Wj) }
+    return _md_abs(Wi - Wj)
+}
+
+// ── adjacency list: for each node i, list of (neighbor j, edge_idx, w_t) ─
+
+fn _md_build_adj(nodes: list, edges: list) -> list {
+    let N = nodes.len()
+    let M = edges.len()
+    let mut adj = []
+    let mut i = 0
+    while i < N {
+        adj = adj.push([])
+        i = i + 1
+    }
+    let mut e = 0
+    while e < M {
+        let ed = edges[e]
+        let a  = ed[0]
+        let b  = ed[1]
+        let t_raw = edge_tension(ed, nodes)
+        // coherence weight w_c = 1 - tension  (mastered edges bind tighter)
+        let t_clamped = if t_raw < 0.0 { 0.0 } else { if t_raw > 1.0 { 1.0 } else { t_raw } }
+        let wt = 1.0 - t_clamped
+        let entry_ab = [b, e, wt]
+        let entry_ba = [a, e, wt]
+        // undirected: record both directions
+        let mut new_adj = []
+        let mut k = 0
+        while k < N {
+            let row = adj[k]
+            if k == a {
+                new_adj = new_adj.push(row.push(entry_ab))
+            } else {
+                if k == b {
+                    new_adj = new_adj.push(row.push(entry_ba))
+                } else {
+                    new_adj = new_adj.push(row)
+                }
+            }
+            k = k + 1
+        }
+        adj = new_adj
+        e = e + 1
+    }
+    return adj
+}
+
+// ── modularity gain evaluator for moving node i to candidate label c ─────
+
+// Returns delta = sum_{neighbour j with label[j]==c} w_t
+//              - sum_{neighbour j with label[j]==label[i]} w_t
+fn _md_delta_gain(i: int, c: int, labels: list, adj_i: list) -> float {
+    let mut delta = 0.0
+    let mut k = 0
+    let cur = labels[i]
+    while k < adj_i.len() {
+        let entry = adj_i[k]
+        let j = entry[0]
+        if j != i {
+            let wt: float = entry[2]
+            let lj = labels[j]
+            if lj == c   { delta = delta + wt }
+            if lj == cur { delta = delta - wt }
+        }
+        k = k + 1
+    }
+    return delta
+}
+
+// ── one sweep over all nodes ─────────────────────────────────────────────
+
+// Returns [new_labels, changed_count].
+fn _md_sweep(labels: list, adj: list) -> list {
+    let N = labels.len()
+    let mut lab = labels
+    let mut changes = 0
+    let eps = 0.000001
+    let mut i = 0
+    while i < N {
+        let cur = lab[i]
+        let adj_i = adj[i]
+        // scan neighbour labels; pick the one with largest positive gain.
+        let mut best_c = cur
+        let mut best_d = 0.0
+        let mut k = 0
+        while k < adj_i.len() {
+            let entry = adj_i[k]
+            let j = entry[0]
+            if j != i {
+                let cand = lab[j]
+                if cand != cur {
+                    let d = _md_delta_gain(i, cand, lab, adj_i)
+                    if d > best_d + eps {
+                        best_d = d
+                        best_c = cand
+                    } else {
+                        if d > best_d - eps {
+                            if d > 0.0 {
+                                if cand < best_c {
+                                    best_c = cand
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            k = k + 1
+        }
+        if best_c != cur && best_d > eps {
+            lab = _md_set_i(lab, i, best_c)
+            changes = changes + 1
+        }
+        i = i + 1
+    }
+    let mut out = []
+    out = out.push(lab)
+    out = out.push(changes)
+    return out
+}
+
+// ── re-index labels to [0, k) ────────────────────────────────────────────
+
+fn _md_compact(labels: list) -> list {
+    let N = labels.len()
+    let mut remap = _md_zeros_i(N)
+    let mut seen = _md_zeros_i(N)
+    let mut k = 0
+    let mut i = 0
+    while i < N {
+        let l = labels[i]
+        if seen[l] == 0 {
+            seen  = _md_set_i(seen,  l, 1)
+            remap = _md_set_i(remap, l, k)
+            k = k + 1
+        }
+        i = i + 1
+    }
+    let mut out = _md_zeros_i(N)
+    let mut j = 0
+    while j < N {
+        out = _md_set_i(out, j, remap[labels[j]])
+        j = j + 1
+    }
+    return out
+}
+
+// ── public API ───────────────────────────────────────────────────────────
+
+// community_assign: greedy Louvain sweeps until stable or max 8 sweeps.
+fn community_assign(nodes: list, edges: list, max_sweeps: int) -> list {
+    let N = nodes.len()
+    let adj = _md_build_adj(nodes, edges)
+    let mut labels = _md_zeros_i(N)
+    let mut i = 0
+    while i < N {
+        labels = _md_set_i(labels, i, i)
+        i = i + 1
+    }
+    let mut sweep = 0
+    while sweep < max_sweeps {
+        let res = _md_sweep(labels, adj)
+        labels = res[0]
+        let changes: int = res[1]
+        if changes == 0 { sweep = max_sweeps }
+        else             { sweep = sweep + 1 }
+    }
+    return _md_compact(labels)
+}
+
+// count distinct labels in the compacted labelling.
+fn num_modules(labels: list) -> int {
+    let N = labels.len()
+    let mut mx = 0
+    let mut i = 0
+    while i < N {
+        if labels[i] > mx { mx = labels[i] }
+        i = i + 1
+    }
+    return mx + 1
+}
+
+// sizes per module  (length = k).
+fn module_sizes(labels: list) -> list {
+    let k = num_modules(labels)
+    let mut sz = _md_zeros_i(k)
+    let mut i = 0
+    while i < labels.len() {
+        let l = labels[i]
+        sz = _md_set_i(sz, l, sz[l] + 1)
+        i = i + 1
+    }
+    return sz
+}
+
+// min module size  (smallest subgraph in the partition).
+fn min_module_size(labels: list) -> int {
+    let sz = module_sizes(labels)
+    let k = sz.len()
+    if k == 0 { return 0 }
+    let mut mn = sz[0]
+    let mut i = 1
+    while i < k {
+        if sz[i] < mn { mn = sz[i] }
+        i = i + 1
+    }
+    return mn
+}
+
+// bridge_edges / internal_edges — return list of edge indices.
+fn bridge_edges(edges: list, labels: list) -> list {
+    let mut out = []
+    let mut e = 0
+    while e < edges.len() {
+        let ed = edges[e]
+        if labels[ed[0]] != labels[ed[1]] {
+            out = out.push(e)
+        }
+        e = e + 1
+    }
+    return out
+}
+
+fn internal_edges(edges: list, labels: list) -> list {
+    let mut out = []
+    let mut e = 0
+    while e < edges.len() {
+        let ed = edges[e]
+        if labels[ed[0]] == labels[ed[1]] {
+            out = out.push(e)
+        }
+        e = e + 1
+    }
+    return out
+}
+
+fn module_decompose_version() -> string { return "edu.cell.composition.decompose.v1" }

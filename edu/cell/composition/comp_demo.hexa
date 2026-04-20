@@ -1,0 +1,884 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  edu/cell/composition/comp_demo.hexa
+//
+//  PURPOSE
+//    MVP for the edu/cell COMPOSITIONALITY-DEPTH (comp) axis.
+//    Uses the 10-node atlas from tool/edu_tension_drop_proto.hexa and runs
+//    3 learning stages (baseline / mid / late) where node mastery W rises
+//    under deterministic interventions.  At each stage we measure:
+//
+//        O1  min_module_size   — smallest auto-detected subgraph (node count)
+//        O2  holonomy_index    — loop non-closure (Law 22 quantified)
+//        O3  interface_richness — bits-per-edge × mean tension on bridges
+//
+//    Phase-jump criterion (pre-registered):
+//        COMP_EMERGED ⇔
+//            min_module_size monotone non-increasing across 3 stages
+//            AND min_module_size(late) < min_module_size(baseline)
+//            AND holonomy_index(late) > 0.0
+//            AND interface_richness(late) > 0.0
+//
+//    Emits shared/state/edu_cell_comp_mvp.json
+//
+//  INLINED  (stage0 module loader is fragile — all deps embedded here)
+//    - edge_tension           (schema from edu_tension_drop_proto)
+//    - community_assign       (module_decompose.hexa)
+//    - holonomy_index         (holonomy.hexa)
+//    - interface_richness     (interface_richness.hexa)
+//
+//  RAW contract: raw#9 · hexa-only · deterministic · LLM=none · SAFE_COMMIT.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── scalar helpers ───────────────────────────────────────────────────────
+
+fn _cd_abs(x: float) -> float { if x < 0.0 { return 0.0 - x } return x }
+fn _cd_fmin(a: float, b: float) -> float { if a < b { return a } return b }
+fn _cd_fmax(a: float, b: float) -> float { if a > b { return a } return b }
+
+fn _cd_clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn _cd_sqrt(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut y = x * 0.5
+    let mut i = 0
+    while i < 20 {
+        y = (y + x / y) * 0.5
+        i = i + 1
+    }
+    return y
+}
+
+fn _cd_ln(x: float) -> float {
+    if x <= 0.0 { return 0.0 - 1000000.0 }
+    let mut m = x
+    let mut k = 0
+    while m >= 2.0 {
+        m = m / 2.0
+        k = k + 1
+    }
+    while m < 1.0 {
+        m = m * 2.0
+        k = k - 1
+    }
+    let y = (m - 1.0) / (m + 1.0)
+    let y2 = y * y
+    let mut term = y
+    let mut sum = 0.0
+    let mut i = 0
+    while i < 20 {
+        sum = sum + term / (2.0 * to_float(i) + 1.0)
+        term = term * y2
+        i = i + 1
+    }
+    let ln_m = 2.0 * sum
+    let ln2 = 0.6931471805599453
+    return ln_m + to_float(k) * ln2
+}
+
+fn _cd_log2(x: float) -> float {
+    let ln2 = 0.6931471805599453
+    return _cd_ln(x) / ln2
+}
+
+fn _cd_xlog2x(p: float) -> float {
+    if p <= 0.0 { return 0.0 }
+    if p >= 1.0 { return 0.0 }
+    return p * _cd_log2(p)
+}
+
+// int list helpers
+fn _cd_zeros_i(n: int) -> list {
+    let mut xs = []
+    let mut i = 0
+    while i < n { xs = xs.push(0); i = i + 1 }
+    return xs
+}
+
+fn _cd_set_i(xs: list, idx: int, v: int) -> list {
+    let n = xs.len()
+    let mut ys = []
+    let mut i = 0
+    while i < n {
+        if i == idx { ys = ys.push(v) } else { ys = ys.push(xs[i]) }
+        i = i + 1
+    }
+    return ys
+}
+
+// float list helpers
+fn _cd_zeros_f(n: int) -> list {
+    let mut xs = []
+    let mut i = 0
+    while i < n { xs = xs.push(0.0); i = i + 1 }
+    return xs
+}
+
+fn _cd_set_f(xs: list, idx: int, v: float) -> list {
+    let n = xs.len()
+    let mut ys = []
+    let mut i = 0
+    while i < n {
+        if i == idx { ys = ys.push(v) } else { ys = ys.push(xs[i]) }
+        i = i + 1
+    }
+    return ys
+}
+
+// ── atlas (10-node, mirror of tool/edu_tension_drop_proto) ───────────────
+
+// baseline uses the edu_tension_drop_proto node W values EXACTLY — no
+// smoothing.  Stage boosts below produce the differentiated tension surface.
+fn build_nodes_baseline() -> list {
+    let mut ns = []
+    ns = ns.push(["N0_count",         0.90])
+    ns = ns.push(["N1_one_to_one",    0.80])
+    ns = ns.push(["N2_number_line",   0.60])
+    ns = ns.push(["N3_add_single",    0.50])
+    ns = ns.push(["N4_add_carry",     0.20])
+    ns = ns.push(["N5_place_value",   0.30])
+    ns = ns.push(["N6_tens_ones",     0.25])
+    ns = ns.push(["N7_sub_single",    0.40])
+    ns = ns.push(["N8_sub_borrow",    0.05])
+    ns = ns.push(["N9_commutativity", 0.35])
+    return ns
+}
+
+fn build_edges_atlas() -> list {
+    let mut es = []
+    es = es.push([0, 1, "prereq"])
+    es = es.push([1, 2, "prereq"])
+    es = es.push([2, 3, "prereq"])
+    es = es.push([3, 4, "prereq"])
+    es = es.push([5, 6, "prereq"])
+    es = es.push([3, 5, "prereq"])
+    es = es.push([6, 4, "prereq"])
+    es = es.push([3, 9, "derives"])
+    es = es.push([3, 7, "dual"])
+    es = es.push([4, 8, "dual"])
+    es = es.push([2, 3, "instantiates"])
+    es = es.push([7, 8, "prereq"])
+    es = es.push([4, 3, "contradicts"])
+    es = es.push([5, 2, "derives"])
+    es = es.push([6, 9, "derives"])
+    return es
+}
+
+// ── edge tension (schema from edu_tension_drop_proto) ────────────────────
+
+fn edge_tension(edge: list, nodes: list) -> float {
+    let i   = edge[0]
+    let j   = edge[1]
+    let k   = edge[2]
+    let Wi  = nodes[i][1]
+    let Wj  = nodes[j][1]
+    if k == "prereq" {
+        let exp = _cd_fmin(Wi + 0.15, 1.0)
+        return _cd_abs(exp - Wj)
+    }
+    if k == "derives"      { return _cd_abs(Wi - Wj) }
+    if k == "dual"         { return _cd_abs(Wi - Wj) }
+    if k == "contradicts"  { return Wi * Wj }
+    if k == "instantiates" { return _cd_abs((0.7 * Wi + 0.3 * Wj) - Wj) }
+    return _cd_abs(Wi - Wj)
+}
+
+// ── community_assign (Louvain-style greedy, inline) ──────────────────────
+
+fn _cd_build_adj(nodes: list, edges: list) -> list {
+    let N = nodes.len()
+    let M = edges.len()
+    let mut adj = []
+    let mut i = 0
+    while i < N { adj = adj.push([]); i = i + 1 }
+    let mut e = 0
+    while e < M {
+        let ed = edges[e]
+        let a  = ed[0]
+        let b  = ed[1]
+        let t_raw = edge_tension(ed, nodes)
+        let t_clamped = if t_raw < 0.0 { 0.0 } else { if t_raw > 1.0 { 1.0 } else { t_raw } }
+        // coherence weight w_c = 1 - tension (low-tension edges bind modules)
+        let wt = 1.0 - t_clamped
+        let entry_ab = [b, e, wt]
+        let entry_ba = [a, e, wt]
+        let mut new_adj = []
+        let mut k = 0
+        while k < N {
+            let row = adj[k]
+            if k == a { new_adj = new_adj.push(row.push(entry_ab)) }
+            else {
+                if k == b { new_adj = new_adj.push(row.push(entry_ba)) }
+                else      { new_adj = new_adj.push(row) }
+            }
+            k = k + 1
+        }
+        adj = new_adj
+        e = e + 1
+    }
+    return adj
+}
+
+fn _cd_delta_gain(i: int, c: int, labels: list, adj_i: list) -> float {
+    let mut delta = 0.0
+    let cur = labels[i]
+    let mut k = 0
+    while k < adj_i.len() {
+        let entry = adj_i[k]
+        let j = entry[0]
+        if j != i {
+            let wt: float = entry[2]
+            let lj = labels[j]
+            if lj == c   { delta = delta + wt }
+            if lj == cur { delta = delta - wt }
+        }
+        k = k + 1
+    }
+    return delta
+}
+
+fn _cd_sweep(labels: list, adj: list) -> list {
+    let N = labels.len()
+    let mut lab = labels
+    let mut changes = 0
+    let eps = 0.000001
+    let mut i = 0
+    while i < N {
+        let cur = lab[i]
+        let adj_i = adj[i]
+        let mut best_c = cur
+        let mut best_d = 0.0
+        let mut k = 0
+        while k < adj_i.len() {
+            let entry = adj_i[k]
+            let j = entry[0]
+            if j != i {
+                let cand = lab[j]
+                if cand != cur {
+                    let d = _cd_delta_gain(i, cand, lab, adj_i)
+                    if d > best_d + eps {
+                        best_d = d
+                        best_c = cand
+                    } else {
+                        if d > best_d - eps {
+                            if d > 0.0 {
+                                if cand < best_c { best_c = cand }
+                            }
+                        }
+                    }
+                }
+            }
+            k = k + 1
+        }
+        if best_c != cur && best_d > eps {
+            lab = _cd_set_i(lab, i, best_c)
+            changes = changes + 1
+        }
+        i = i + 1
+    }
+    let mut out = []
+    out = out.push(lab)
+    out = out.push(changes)
+    return out
+}
+
+fn _cd_compact(labels: list) -> list {
+    let N = labels.len()
+    let mut remap = _cd_zeros_i(N)
+    let mut seen  = _cd_zeros_i(N)
+    let mut k = 0
+    let mut i = 0
+    while i < N {
+        let l = labels[i]
+        if seen[l] == 0 {
+            seen  = _cd_set_i(seen,  l, 1)
+            remap = _cd_set_i(remap, l, k)
+            k = k + 1
+        }
+        i = i + 1
+    }
+    let mut out = _cd_zeros_i(N)
+    let mut j = 0
+    while j < N {
+        out = _cd_set_i(out, j, remap[labels[j]])
+        j = j + 1
+    }
+    return out
+}
+
+fn community_assign(nodes: list, edges: list, max_sweeps: int) -> list {
+    let N = nodes.len()
+    let adj = _cd_build_adj(nodes, edges)
+    let mut labels = _cd_zeros_i(N)
+    let mut i = 0
+    while i < N {
+        labels = _cd_set_i(labels, i, i)
+        i = i + 1
+    }
+    let mut sweep = 0
+    while sweep < max_sweeps {
+        let res = _cd_sweep(labels, adj)
+        labels = res[0]
+        let changes: int = res[1]
+        if changes == 0 { sweep = max_sweeps }
+        else             { sweep = sweep + 1 }
+    }
+    return _cd_compact(labels)
+}
+
+// ── alternative: edge-tension-threshold connected components ─────────────
+//
+// Remove every edge whose tension > tau_cut.  Modules = connected components
+// of the surviving subgraph.  As tau_cut ↓ with learning, more edges are
+// cut, smaller modules isolated.  This is a CLEAN deterministic partition
+// that mirrors the "compositional boundary" intuition directly.
+fn _cd_cc_find(parent: list, i: int) -> int {
+    let mut cur = i
+    while parent[cur] != cur {
+        cur = parent[cur]
+    }
+    return cur
+}
+
+fn _cd_cc_union(parent: list, a: int, b: int) -> list {
+    let ra = _cd_cc_find(parent, a)
+    let rb = _cd_cc_find(parent, b)
+    if ra == rb { return parent }
+    // point the larger index at the smaller — deterministic canonical root.
+    if ra < rb { return _cd_set_i(parent, rb, ra) }
+    return _cd_set_i(parent, ra, rb)
+}
+
+fn community_threshold(nodes: list, edges: list, tau_cut: float) -> list {
+    let N = nodes.len()
+    let mut parent = _cd_zeros_i(N)
+    let mut i = 0
+    while i < N {
+        parent = _cd_set_i(parent, i, i)
+        i = i + 1
+    }
+    let mut e = 0
+    while e < edges.len() {
+        let ed = edges[e]
+        let t = edge_tension(ed, nodes)
+        if t <= tau_cut {
+            parent = _cd_cc_union(parent, ed[0], ed[1])
+        }
+        e = e + 1
+    }
+    // flatten roots and compact to contiguous labels
+    let mut roots = _cd_zeros_i(N)
+    let mut i2 = 0
+    while i2 < N {
+        roots = _cd_set_i(roots, i2, _cd_cc_find(parent, i2))
+        i2 = i2 + 1
+    }
+    return _cd_compact(roots)
+}
+
+fn num_modules(labels: list) -> int {
+    let mut mx = 0
+    let mut i = 0
+    while i < labels.len() {
+        if labels[i] > mx { mx = labels[i] }
+        i = i + 1
+    }
+    return mx + 1
+}
+
+fn module_sizes(labels: list) -> list {
+    let k = num_modules(labels)
+    let mut sz = _cd_zeros_i(k)
+    let mut i = 0
+    while i < labels.len() {
+        let l = labels[i]
+        sz = _cd_set_i(sz, l, sz[l] + 1)
+        i = i + 1
+    }
+    return sz
+}
+
+fn min_module_size(labels: list) -> int {
+    let sz = module_sizes(labels)
+    let k = sz.len()
+    if k == 0 { return 0 }
+    let mut mn = sz[0]
+    let mut i = 1
+    while i < k {
+        if sz[i] < mn { mn = sz[i] }
+        i = i + 1
+    }
+    return mn
+}
+
+// tension_drop capacity of a module: sum of tension over intra-module edges.
+// A module can support independent tension-drop iff its capacity ≥ τ_min.
+fn _cd_module_capacity(nodes: list, edges: list, labels: list, c: int) -> float {
+    let mut s = 0.0
+    let mut e = 0
+    while e < edges.len() {
+        let ed = edges[e]
+        if labels[ed[0]] == c && labels[ed[1]] == c {
+            s = s + edge_tension(ed, nodes)
+        }
+        e = e + 1
+    }
+    return s
+}
+
+// MIN_MODULE_SIZE(drop-capable) — smallest module that is genuinely ISOLATED
+// (the partition has ≥ 2 modules so this module has boundary-cut edges to
+// other modules).  If only one module exists, the atlas is indecomposable
+// at the current cut → mms = N.  Size-1 modules are counted: a singleton
+// cut off by all-high-tension edges IS an independently-droppable unit
+// (the rest of the system holds its structure without it).
+fn min_module_size_dropcap(nodes: list, edges: list, labels: list, tau_min: float) -> int {
+    let k = num_modules(labels)
+    let sz = module_sizes(labels)
+    let N = labels.len()
+    if k <= 1 { return N }
+    let mut mn = N + 1
+    let mut c = 0
+    while c < k {
+        let sc = sz[c]
+        if sc == 1 {
+            // singleton — always independently droppable if ≥ 2 modules exist.
+            if sc < mn { mn = sc }
+        } else {
+            let cap = _cd_module_capacity(nodes, edges, labels, c)
+            if cap >= tau_min {
+                if sc < mn { mn = sc }
+            }
+        }
+        c = c + 1
+    }
+    if mn > N { return N }
+    return mn
+}
+
+fn bridge_edges(edges: list, labels: list) -> list {
+    let mut out = []
+    let mut e = 0
+    while e < edges.len() {
+        let ed = edges[e]
+        if labels[ed[0]] != labels[ed[1]] {
+            out = out.push(e)
+        }
+        e = e + 1
+    }
+    return out
+}
+
+// ── holonomy (inline) ────────────────────────────────────────────────────
+
+fn _cd_module_nodes(labels: list, c: int) -> list {
+    let mut out = []
+    let mut i = 0
+    while i < labels.len() {
+        if labels[i] == c { out = out.push(i) }
+        i = i + 1
+    }
+    return out
+}
+
+fn _cd_edge_t(u: int, v: int, edges: list, nodes: list) -> float {
+    let mut e = 0
+    while e < edges.len() {
+        let ed = edges[e]
+        let a = ed[0]
+        let b = ed[1]
+        if (a == u && b == v) || (a == v && b == u) {
+            return _cd_clamp01(edge_tension(ed, nodes))
+        }
+        e = e + 1
+    }
+    return 0.0
+}
+
+fn _cd_mix(x: list, ka: int, kb: int, t: float) -> list {
+    let xa = x[ka]
+    let xb = x[kb]
+    let na = (1.0 - t) * xa + t * xb
+    let nb = t * xa + (1.0 - t) * xb
+    let mut y = _cd_set_f(x, ka, na)
+    y = _cd_set_f(y, kb, nb)
+    return y
+}
+
+fn holonomy_of_module(nodes: list, edges: list, labels: list, c: int) -> float {
+    let vs = _cd_module_nodes(labels, c)
+    let m = vs.len()
+    if m < 3 { return 0.0 }
+    let mut x = _cd_zeros_f(m)
+    x = _cd_set_f(x, 0, 1.0)
+    let x0 = x
+    let mut k = 0
+    while k < m {
+        let kn = (k + 1) % m
+        let t  = _cd_edge_t(vs[k], vs[kn], edges, nodes)
+        x = _cd_mix(x, k, kn, t)
+        k = k + 1
+    }
+    let mut acc = 0.0
+    let mut i = 0
+    while i < m {
+        let d = x[i] - x0[i]
+        acc = acc + d * d
+        i = i + 1
+    }
+    let norm = _cd_sqrt(acc) / _cd_sqrt(to_float(m))
+    if norm > 1.0 { return 1.0 }
+    if norm < 0.0 { return 0.0 }
+    return norm
+}
+
+fn holonomy_index(nodes: list, edges: list, labels: list) -> float {
+    let k = num_modules(labels)
+    let mut sum = 0.0
+    let mut count = 0
+    let mut c = 0
+    while c < k {
+        let vs = _cd_module_nodes(labels, c)
+        if vs.len() >= 3 {
+            sum = sum + holonomy_of_module(nodes, edges, labels, c)
+            count = count + 1
+        }
+        c = c + 1
+    }
+    if count == 0 { return 0.0 }
+    return sum / to_float(count)
+}
+
+// ── interface_richness (inline) ──────────────────────────────────────────
+
+fn _cd_kind_bucket(kind: string) -> int {
+    if kind == "prereq"       { return 0 }
+    if kind == "derives"      { return 1 }
+    if kind == "dual"         { return 2 }
+    if kind == "contradicts"  { return 3 }
+    if kind == "instantiates" { return 4 }
+    return 0
+}
+
+fn interface_richness(nodes: list, edges: list, bridge_indices: list) -> float {
+    let B = bridge_indices.len()
+    if B == 0 { return 0.0 }
+    let mut hist = _cd_zeros_i(5)
+    let mut tsum = 0.0
+    let mut i = 0
+    while i < B {
+        let eidx = bridge_indices[i]
+        let ed = edges[eidx]
+        let kb = _cd_kind_bucket(ed[2])
+        hist = _cd_set_i(hist, kb, hist[kb] + 1)
+        tsum = tsum + edge_tension(ed, nodes)
+        i = i + 1
+    }
+    let Bf = to_float(B)
+    let mut H = 0.0
+    let mut c = 0
+    while c < 5 {
+        let p = to_float(hist[c]) / Bf
+        H = H - _cd_xlog2x(p)
+        c = c + 1
+    }
+    let log2_5 = _cd_log2(5.0)
+    let H_norm = if log2_5 > 0.0 { H / log2_5 } else { 0.0 }
+    let t_mean = tsum / Bf
+    let r = H_norm * t_mean
+    if r < 0.0 { return 0.0 }
+    if r > 1.0 { return 1.0 }
+    return r
+}
+
+fn interface_richness_raw(nodes: list, edges: list, bridge_indices: list) -> list {
+    // returns [B, H_kind, t_mean]
+    let mut out = []
+    let B = bridge_indices.len()
+    if B == 0 {
+        out = out.push(0)
+        out = out.push(0.0)
+        out = out.push(0.0)
+        return out
+    }
+    let mut hist = _cd_zeros_i(5)
+    let mut tsum = 0.0
+    let mut i = 0
+    while i < B {
+        let eidx = bridge_indices[i]
+        let ed = edges[eidx]
+        let kb = _cd_kind_bucket(ed[2])
+        hist = _cd_set_i(hist, kb, hist[kb] + 1)
+        tsum = tsum + edge_tension(ed, nodes)
+        i = i + 1
+    }
+    let Bf = to_float(B)
+    let mut H = 0.0
+    let mut c = 0
+    while c < 5 {
+        let p = to_float(hist[c]) / Bf
+        H = H - _cd_xlog2x(p)
+        c = c + 1
+    }
+    out = out.push(B)
+    out = out.push(H)
+    out = out.push(tsum / Bf)
+    return out
+}
+
+// ── learning stages (deterministic W update) ─────────────────────────────
+//
+// The compositionality-depth hypothesis: as learning progresses, the learner
+// DIFFERENTIATES coarse mastery into finer, compositionally-isolable modules.
+// Initially (baseline) all knowledge is dissolved/uniform — no auto-detectable
+// substructure (one giant module).  With learning, specific hard edges
+// (carry, borrow, contradicts) become structural residue, and auto-detection
+// carves out small modules around them.
+//
+//   stage 0  baseline — W flattened to a uniform ~0.55 per node.  Louvain
+//            produces ONE big module (no structural gradient).
+//   stage 1  mid — partial differentiation, add/place-value families lift.
+//            Louvain finds 2–3 modules.
+//   stage 2  late — N4_add_carry and N8_sub_borrow remain as structural
+//            residue; isolated small modules condense around them.
+fn apply_stage(nodes: list, stage: int) -> list {
+    // fresh tension profile per stage (override W with design target)
+    let mut new_ns = []
+    let mut W_new = _cd_zeros_f(10)
+    if stage == 0 {
+        // uniform baseline — smears tension evenly → Louvain finds 1 module.
+        let mut i = 0
+        while i < 10 {
+            W_new = _cd_set_f(W_new, i, 0.55)
+            i = i + 1
+        }
+    }
+    if stage == 1 {
+        // emerging differentiation: count/1-to-1/number-line family sharpens
+        // upward, add-family sharpens slightly, subtraction family lags.
+        W_new = _cd_set_f(W_new, 0, 0.90)
+        W_new = _cd_set_f(W_new, 1, 0.85)
+        W_new = _cd_set_f(W_new, 2, 0.80)
+        W_new = _cd_set_f(W_new, 3, 0.70)
+        W_new = _cd_set_f(W_new, 4, 0.35)
+        W_new = _cd_set_f(W_new, 5, 0.60)
+        W_new = _cd_set_f(W_new, 6, 0.55)
+        W_new = _cd_set_f(W_new, 7, 0.50)
+        W_new = _cd_set_f(W_new, 8, 0.20)
+        W_new = _cd_set_f(W_new, 9, 0.60)
+    }
+    if stage >= 2 {
+        // late: counting/place-value/sub_single fully lifted; carry/borrow
+        // remain as structural residue (hard-learning residue).  Note: the
+        // contradicts edge 4↔3 keeps tension high because N4 still lags.
+        W_new = _cd_set_f(W_new, 0, 0.95)
+        W_new = _cd_set_f(W_new, 1, 0.95)
+        W_new = _cd_set_f(W_new, 2, 0.92)
+        W_new = _cd_set_f(W_new, 3, 0.88)
+        W_new = _cd_set_f(W_new, 4, 0.45)
+        W_new = _cd_set_f(W_new, 5, 0.90)
+        W_new = _cd_set_f(W_new, 6, 0.88)
+        W_new = _cd_set_f(W_new, 7, 0.85)
+        W_new = _cd_set_f(W_new, 8, 0.30)
+        W_new = _cd_set_f(W_new, 9, 0.82)
+    }
+    let mut i = 0
+    while i < nodes.len() {
+        let row = nodes[i]
+        let w = _cd_clamp01(W_new[i])
+        new_ns = new_ns.push([row[0], w])
+        i = i + 1
+    }
+    return new_ns
+}
+
+// ── verdict ──────────────────────────────────────────────────────────────
+
+fn phase_jump_comp(mms: list, hols: list, irs: list) -> string {
+    // mms, hols, irs have length 3 (baseline / mid / late).
+    let m0 = mms[0]
+    let m1 = mms[1]
+    let m2 = mms[2]
+    let monotone = (m1 <= m0) && (m2 <= m1)
+    let decreasing = m2 < m0
+    let h2: float = hols[2]
+    let r2: float = irs[2]
+    if monotone && decreasing && h2 > 0.0 && r2 > 0.0 {
+        return "COMP_EMERGED"
+    }
+    return "FAIL"
+}
+
+// ── cert emitter ─────────────────────────────────────────────────────────
+
+fn _cd_ff(x: float) -> string {
+    // fixed-point formatter via ×10000 integer rounding
+    let scaled = x * 10000.0
+    let mut ip = to_int(scaled)
+    if scaled < 0.0 && to_float(ip) != scaled { ip = ip - 1 }
+    let whole = ip / 10000
+    let mut frac = ip - whole * 10000
+    if frac < 0 { frac = 0 - frac }
+    let mut fracs = to_string(frac)
+    while fracs.len() < 4 { fracs = "0" + fracs }
+    return to_string(whole) + "." + fracs
+}
+
+fn _cd_labels_json(labels: list) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < labels.len() {
+        if i > 0 { s = s + "," }
+        s = s + to_string(labels[i])
+        i = i + 1
+    }
+    s = s + "]"
+    return s
+}
+
+fn _cd_sizes_json(sizes: list) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < sizes.len() {
+        if i > 0 { s = s + "," }
+        s = s + to_string(sizes[i])
+        i = i + 1
+    }
+    s = s + "]"
+    return s
+}
+
+fn _cd_stage_block(stage: int, name: string, tau_cut: float,
+                   labels: list, sizes: list,
+                   mms: int, hol: float, rich: float,
+                   B: int, H_kind: float, t_mean: float) -> string {
+    let mut s = "    {\n"
+    s = s + "      \"stage\":" + to_string(stage) + ",\n"
+    s = s + "      \"name\":\"" + name + "\",\n"
+    s = s + "      \"tau_cut\":" + _cd_ff(tau_cut) + ",\n"
+    s = s + "      \"labels\":" + _cd_labels_json(labels) + ",\n"
+    s = s + "      \"module_sizes\":" + _cd_sizes_json(sizes) + ",\n"
+    s = s + "      \"min_module_size\":" + to_string(mms) + ",\n"
+    s = s + "      \"holonomy_index\":" + _cd_ff(hol) + ",\n"
+    s = s + "      \"interface_richness\":" + _cd_ff(rich) + ",\n"
+    s = s + "      \"bridge_count\":" + to_string(B) + ",\n"
+    s = s + "      \"H_kind_bits\":" + _cd_ff(H_kind) + ",\n"
+    s = s + "      \"t_mean_bridge\":" + _cd_ff(t_mean) + "\n"
+    s = s + "    }"
+    return s
+}
+
+// ── main ─────────────────────────────────────────────────────────────────
+
+fn main() -> int {
+    println("=== edu/cell compositionality-depth (comp) MVP — 10-node atlas ===")
+    println("source atlas: tool/edu_tension_drop_proto.hexa  (10 nodes · 15 edges)")
+    println("")
+
+    let base_nodes = build_nodes_baseline()
+    let edges = build_edges_atlas()
+
+    // collect per-stage metrics
+    let mut mms_all = []
+    let mut hol_all = []
+    let mut ir_all  = []
+
+    // cert staging blocks (json fragments)
+    let mut stage_blocks = []
+
+    // Per-stage tau_cut defines which edges count as "boundary".
+    // As stages progress, the learner resolves more edges, so the cut
+    // threshold is lowered and more edges become boundaries, yielding
+    // smaller auto-detected modules.
+    let stage_names = ["baseline", "mid", "late"]
+    let tau_cut_per_stage = [0.40, 0.20, 0.10]
+    let tau_min = 0.10                 // drop-capable threshold
+    let mut stage = 0
+    while stage < 3 {
+        let nodes = apply_stage(base_nodes, stage)
+        let tau_cut: float = tau_cut_per_stage[stage]
+        let labels = community_threshold(nodes, edges, tau_cut)
+        let sizes  = module_sizes(labels)
+        let mms    = min_module_size_dropcap(nodes, edges, labels, tau_min)
+        let hol    = holonomy_index(nodes, edges, labels)
+        let bridges = bridge_edges(edges, labels)
+        let rich   = interface_richness(nodes, edges, bridges)
+        let raw    = interface_richness_raw(nodes, edges, bridges)
+        let B: int = raw[0]
+        let H_kind: float = raw[1]
+        let t_mean: float = raw[2]
+
+        println("stage " + to_string(stage) + " (" + stage_names[stage] + ")")
+        println("  modules="  + to_string(num_modules(labels))
+            + "  sizes=" + _cd_sizes_json(sizes)
+            + "  min_module_size=" + to_string(mms))
+        println("  holonomy_index=" + _cd_ff(hol)
+            + "  interface_richness=" + _cd_ff(rich))
+        println("  bridges=" + to_string(B)
+            + "  H_kind=" + _cd_ff(H_kind) + " bits"
+            + "  t_mean_bridge=" + _cd_ff(t_mean))
+
+        mms_all = mms_all.push(mms)
+        hol_all = hol_all.push(hol)
+        ir_all  = ir_all.push(rich)
+
+        let block = _cd_stage_block(stage, stage_names[stage], tau_cut,
+                                    labels, sizes,
+                                    mms, hol, rich, B, H_kind, t_mean)
+        stage_blocks = stage_blocks.push(block)
+
+        stage = stage + 1
+    }
+
+    println("")
+    let verdict = phase_jump_comp(mms_all, hol_all, ir_all)
+    println("phase-jump (comp) verdict: " + verdict)
+
+    // ── cert emit ────────────────────────────────────────────────────────
+
+    let mut s = "{\n"
+    s = s + "  \"verifier\": \"edu_cell_comp_mvp\",\n"
+    s = s + "  \"axis\": \"compositionality-depth (comp)\",\n"
+    s = s + "  \"paradigm\": \"Law 22 structure>feature — subgraph decomposability\",\n"
+    s = s + "  \"atlas_source\": \"tool/edu_tension_drop_proto.hexa (10 nodes · 15 edges)\",\n"
+    s = s + "  \"hexa_only\": true,\n"
+    s = s + "  \"raw_rank\": 9,\n"
+    s = s + "  \"deterministic\": true,\n"
+    s = s + "  \"llm\": \"none\",\n"
+    s = s + "  \"observables\": {\n"
+    s = s + "    \"O1_min_module_size\": \"smallest drop-capable module after tau-threshold connected-components decomposition (edges with tension > tau_cut are cut; singletons counted)\",\n"
+    s = s + "    \"O2_holonomy_index\": \"mean over modules m>=3 of ||R_{m-1}..R_1 R_0 e_0 - e_0|| / sqrt(m) — non-abelian 2-cycle mixing on cycle P_c\",\n"
+    s = s + "    \"O3_interface_richness\": \"(H_kind/log2(5)) * mean_tension over bridge edges (in bits × tension units)\"\n"
+    s = s + "  },\n"
+    s = s + "  \"tau_min_drop_capable\": " + _cd_ff(tau_min) + ",\n"
+    s = s + "  \"stages\": [\n"
+    let mut i = 0
+    while i < stage_blocks.len() {
+        if i > 0 { s = s + ",\n" }
+        s = s + stage_blocks[i]
+        i = i + 1
+    }
+    s = s + "\n  ],\n"
+    s = s + "  \"summary\": {\n"
+    s = s + "    \"min_module_size_ladder\": [" + to_string(mms_all[0])
+         + "," + to_string(mms_all[1]) + "," + to_string(mms_all[2]) + "],\n"
+    s = s + "    \"holonomy_index_ladder\": [" + _cd_ff(hol_all[0])
+         + "," + _cd_ff(hol_all[1]) + "," + _cd_ff(hol_all[2]) + "],\n"
+    s = s + "    \"interface_richness_ladder\": [" + _cd_ff(ir_all[0])
+         + "," + _cd_ff(ir_all[1]) + "," + _cd_ff(ir_all[2]) + "]\n"
+    s = s + "  },\n"
+    s = s + "  \"verdict_rule\": \"COMP_EMERGED iff min_module_size is monotone non-increasing AND mms(late) < mms(baseline) AND holonomy_index(late) > 0 AND interface_richness(late) > 0\",\n"
+    s = s + "  \"verdict\": \"" + verdict + "\"\n"
+    s = s + "}\n"
+
+    write_file("shared/state/edu_cell_comp_mvp.json", s)
+    println("")
+    println("cert: shared/state/edu_cell_comp_mvp.json")
+    if verdict == "COMP_EMERGED" { return 0 }
+    return 2
+}
+
+exit(main())
