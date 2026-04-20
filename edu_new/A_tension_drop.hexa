@@ -1,0 +1,237 @@
+// edu_new/A_tension_drop.hexa — A drill (tension-drop dynamics)
+//
+// PARADIGM REF: docs/new_paradigm_edu_lattice_unified_20260421.md §11
+// ROLE: unit-cell = ⟨A↔B tension seed | fixpoint-sealed⟩
+//       + tension-drop dynamics + fixpoint (w2==w3) seal judgment.
+//
+// EXPORTED API (used by F_lattice_unified.hexa + AF_unified_sim.hexa):
+//   make_cell(a_id, b_id, tension0, seed) -> cell
+//   cell_a / cell_b / cell_t / cell_g / cell_s
+//   cell_set_t / cell_set_s
+//   tension_step(cell, attraction, upper, lower) -> cell
+//   fixpoint_seal(cell) -> bool
+//   hash_proj(s) -> int   (zero-LLM oracle, stage0-safe)
+//
+// ENCODING: cell is a "|"-joined 5-tuple string.  Format:
+//     "a_id|b_id|tension|gap|state"
+//   tension, gap : fixed-point ints (1.0 = 1000)
+//   state ∈ {"active", "drop", "sealed"}
+//
+// DETERMINISM: all ops are pure functions of string inputs.  No LLM,
+// no randomness — PRNG is fnv-style string hash over an ASCII-table
+// character code lookup (stage0 char_at returns 1-char string on this
+// interpreter, so we project through an explicit table).
+
+// ─── character code table (stage0-safe) ───────────────────────────
+
+let ASCII_TABLE = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-|.↔/+=() <>:;'\""
+
+fn char_code(c: string) -> int {
+    let t     = ASCII_TABLE
+    let n     = len(t)
+    let mut i = 0
+    while i < n {
+        if t.substring(i, i + 1) == c { return i + 1 }
+        i = i + 1
+    }
+    return 127                                    // unknown → constant
+}
+
+// ─── deterministic hash-projection (E drill zero-LLM oracle) ─────
+
+fn hash_proj(s: string) -> int {
+    let mut acc = 1469598103
+    let mut i   = 0
+    let n       = len(s)
+    while i < n {
+        let c = s.substring(i, i + 1)
+        acc   = acc * 31 + char_code(c)
+        acc   = acc % 2147483647
+        i     = i + 1
+    }
+    return acc
+}
+
+fn judge(seed: string, step: int) -> string {
+    // Canonical-form projection (paradigm §8.1).  Pure, deterministic.
+    let h = hash_proj(seed + "|k=" + str(step))
+    return "w_" + str(h)
+}
+
+// ─── integer parsing (stage0-safe, no char_at-int) ───────────────
+
+fn digit_val(c: string) -> int {
+    if c == "0" { return 0 }
+    if c == "1" { return 1 }
+    if c == "2" { return 2 }
+    if c == "3" { return 3 }
+    if c == "4" { return 4 }
+    if c == "5" { return 5 }
+    if c == "6" { return 6 }
+    if c == "7" { return 7 }
+    if c == "8" { return 8 }
+    if c == "9" { return 9 }
+    return -1
+}
+
+fn parse_int(s: string) -> int {
+    let n     = len(s)
+    if n == 0 { return 0 }
+    let sign  = if s.substring(0, 1) == "-" { -1 } else { 1 }
+    let start = if sign == -1 { 1 } else { 0 }
+    let mut acc = 0
+    let mut i   = start
+    while i < n {
+        let c = s.substring(i, i + 1)
+        let d = digit_val(c)
+        if d >= 0 { acc = acc * 10 + d }
+        i = i + 1
+    }
+    return acc * sign
+}
+
+// ─── unit-cell encoding (string tuple) ────────────────────────────
+
+fn make_cell(a_id: string, b_id: string, t0: int, seed: int) -> string {
+    // gap is seeded per-cell, fixed-point ints in [-1000, +1000].
+    // Negative gap → attractive basin (1/r²-shaped sink);
+    // positive gap → repulsive seed.
+    let raw_g = hash_proj(a_id + "|" + b_id + "|s=" + str(seed))
+    let g     = (raw_g % 2001) - 1000
+    return a_id + "|" + b_id + "|" + str(t0) + "|" + str(g) + "|active"
+}
+
+fn split5(cell: string) -> [string] {
+    let mut out = []
+    let mut buf = ""
+    let n       = len(cell)
+    let mut i   = 0
+    let mut cnt = 0
+    while i < n {
+        let c = cell.substring(i, i + 1)
+        if c == "|" && cnt < 4 {
+            out = out.push(buf)
+            buf = ""
+            cnt = cnt + 1
+        } else {
+            buf = buf + c
+        }
+        i = i + 1
+    }
+    out = out.push(buf)
+    while len(out) < 5 { out = out.push("") }
+    return out
+}
+
+fn cell_a(c: string) -> string { return split5(c)[0] }
+fn cell_b(c: string) -> string { return split5(c)[1] }
+fn cell_t(c: string) -> int    { return parse_int(split5(c)[2]) }
+fn cell_g(c: string) -> int    { return parse_int(split5(c)[3]) }
+fn cell_s(c: string) -> string { return split5(c)[4] }
+
+fn rebuild(a: string, b: string, t: int, g: int, s: string) -> string {
+    return a + "|" + b + "|" + str(t) + "|" + str(g) + "|" + s
+}
+
+fn cell_set_t(c: string, t_new: int) -> string {
+    let p = split5(c)
+    return rebuild(p[0], p[1], t_new, parse_int(p[3]), p[4])
+}
+
+fn cell_set_s(c: string, s_new: string) -> string {
+    let p = split5(c)
+    return rebuild(p[0], p[1], parse_int(p[2]), parse_int(p[3]), s_new)
+}
+
+// ─── tension dynamics (A drill core) ──────────────────────────────
+//
+//   1. t_new = t + attraction + gap/10
+//      attraction comes from lattice 1/r² sum (F_lattice_unified).
+//   2. state transition:
+//        t_new > upper  &  active → drop
+//        t_new < lower  &  active & fixpoint_seal → sealed
+//   3. clamp to [0, 10000].
+//   drop / sealed are absorbing.
+
+fn clamp_int(v: int, lo: int, hi: int) -> int {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+fn fixpoint_seal(cell: string) -> bool {
+    // C drill: w2 == w3 ⇒ re-entry invariant holds ⇒ sealable.
+    let seed = cell_a(cell) + "<->" + cell_b(cell) + "|g=" + str(cell_g(cell))
+    let w1   = judge(seed, 1)
+    let w2   = judge(w1,   2)
+    let w3   = judge(w2,   3)
+    return w2 == w3
+}
+
+fn tension_step(cell: string, attraction: int, upper: int, lower: int) -> string {
+    let s = cell_s(cell)
+    if s != "active" { return cell }
+    let t0    = cell_t(cell)
+    let g     = cell_g(cell)
+    // gap/2 → per-tick basin drift ±500 (gap in [-1000,+1000]).
+    let t_new = clamp_int(t0 + attraction + (g / 2), 0, 10000)
+    let c1    = cell_set_t(cell, t_new)
+    if t_new > upper {
+        return cell_set_s(c1, "drop")
+    }
+    if t_new < lower {
+        if fixpoint_seal(c1) { return cell_set_s(c1, "sealed") }
+    }
+    return c1
+}
+
+// ─── self-test (A drill, deterministic) ───────────────────────────
+
+fn assert_ok(name: string, cond: bool) -> int {
+    if cond { println("  OK  " + name) ; return 0 }
+    println("  FAIL " + name) ; return 1
+}
+
+fn main() {
+    println("A_tension_drop selftest")
+    let mut fails = 0
+
+    let c0 = make_cell("phi_gap", "minsurface", 5000, 17)
+    fails = fails + assert_ok("make_cell a",  cell_a(c0) == "phi_gap")
+    fails = fails + assert_ok("make_cell b",  cell_b(c0) == "minsurface")
+    fails = fails + assert_ok("make_cell t",  cell_t(c0) == 5000)
+    fails = fails + assert_ok("state active", cell_s(c0) == "active")
+
+    // Upward push > upper threshold → drop.
+    let c_up = tension_step(c0, 6000, 9000, 1000)
+    fails = fails + assert_ok("drop transition", cell_s(c_up) == "drop")
+
+    // Cross-run determinism.
+    let c_a = tension_step(c0, 100, 9000, 1000)
+    let c_b = tension_step(c0, 100, 9000, 1000)
+    fails = fails + assert_ok("determinism", c_a == c_b)
+
+    // Absorbing-state invariant: sealed stays sealed.
+    let c_seal = cell_set_s(c0, "sealed")
+    let c_post = tension_step(c_seal, 9999, 9000, 1000)
+    fails = fails + assert_ok("sealed absorbing", cell_s(c_post) == "sealed")
+
+    // fixpoint_seal is pure (same cell → same bool twice).
+    let f1 = fixpoint_seal(c0)
+    let f2 = fixpoint_seal(c0)
+    fails = fails + assert_ok("fixpoint pure", f1 == f2)
+
+    // hash_proj determinism + discrimination.
+    let h_pos = hash_proj("positive test")
+    let h_neg = hash_proj("negative test")
+    fails = fails + assert_ok("hash determ", hash_proj("positive test") == h_pos)
+    fails = fails + assert_ok("hash differ", h_pos != h_neg)
+
+    if fails == 0 {
+        println("A_tension_drop: PASS")
+        exit(0)
+    } else {
+        println("A_tension_drop: FAIL (" + str(fails) + " assertions)")
+        exit(1)
+    }
+}

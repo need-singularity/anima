@@ -1,0 +1,509 @@
+// edu_new/A_tension_drop_measure.hexa — A track real measurement
+//
+// PARADIGM REF: docs/new_paradigm_edu_lattice_unified_20260421.md §11
+// ROLE: measure real tension-drop metric (not synthetic).
+//       drop_ratio(seed) := (avg_T_initial - avg_T_final) / avg_T_initial
+//       averaged across a small lattice with 1/r² attraction.
+//
+// Output: per-seed {init_t, final_t, drop_ratio_ppm, active, drop, sealed}
+//         plus aggregate mean ± stderr across N>=3 seeds.
+// Cert  : shared/state/edu_a_tension_drop_measure.json
+//
+// hexa-only (raw#9), snake_case (raw#11), deterministic, no synthetic fallback.
+
+let ASCII_TABLE = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-|.↔/+=() <>:;'\""
+
+fn char_code(c: string) -> int {
+    let t     = ASCII_TABLE
+    let n     = len(t)
+    let mut i = 0
+    while i < n {
+        if t.substring(i, i + 1) == c { return i + 1 }
+        i = i + 1
+    }
+    return 127
+}
+
+fn hash_proj(s: string) -> int {
+    let mut acc = 1469598103
+    let mut i   = 0
+    let n       = len(s)
+    while i < n {
+        let c = s.substring(i, i + 1)
+        acc   = acc * 31 + char_code(c)
+        acc   = acc % 2147483647
+        i     = i + 1
+    }
+    return acc
+}
+
+fn judge(seed: string, step: int) -> string {
+    let h = hash_proj(seed + "|k=" + str(step))
+    return "w_" + str(h)
+}
+
+fn digit_val(c: string) -> int {
+    if c == "0" { return 0 }
+    if c == "1" { return 1 }
+    if c == "2" { return 2 }
+    if c == "3" { return 3 }
+    if c == "4" { return 4 }
+    if c == "5" { return 5 }
+    if c == "6" { return 6 }
+    if c == "7" { return 7 }
+    if c == "8" { return 8 }
+    if c == "9" { return 9 }
+    return -1
+}
+
+fn parse_int(s: string) -> int {
+    let n     = len(s)
+    if n == 0 { return 0 }
+    let sign  = if s.substring(0, 1) == "-" { -1 } else { 1 }
+    let start = if sign == -1 { 1 } else { 0 }
+    let mut acc = 0
+    let mut i   = start
+    while i < n {
+        let c = s.substring(i, i + 1)
+        let d = digit_val(c)
+        if d >= 0 { acc = acc * 10 + d }
+        i = i + 1
+    }
+    return acc * sign
+}
+
+fn make_cell(a_id: string, b_id: string, t0: int, seed: int) -> string {
+    let raw_g = hash_proj(a_id + "|" + b_id + "|s=" + str(seed))
+    let g     = (raw_g % 2001) - 1000
+    return a_id + "|" + b_id + "|" + str(t0) + "|" + str(g) + "|active"
+}
+
+fn split5(cell: string) -> [string] {
+    let mut out = []
+    let mut buf = ""
+    let n       = len(cell)
+    let mut i   = 0
+    let mut cnt = 0
+    while i < n {
+        let c = cell.substring(i, i + 1)
+        if c == "|" && cnt < 4 {
+            out = out.push(buf)
+            buf = ""
+            cnt = cnt + 1
+        } else {
+            buf = buf + c
+        }
+        i = i + 1
+    }
+    out = out.push(buf)
+    while len(out) < 5 { out = out.push("") }
+    return out
+}
+
+fn cell_a(c: string) -> string { return split5(c)[0] }
+fn cell_b(c: string) -> string { return split5(c)[1] }
+fn cell_t(c: string) -> int    { return parse_int(split5(c)[2]) }
+fn cell_g(c: string) -> int    { return parse_int(split5(c)[3]) }
+fn cell_s(c: string) -> string { return split5(c)[4] }
+
+fn rebuild(a: string, b: string, t: int, g: int, s: string) -> string {
+    return a + "|" + b + "|" + str(t) + "|" + str(g) + "|" + s
+}
+
+fn cell_set_t(c: string, t_new: int) -> string {
+    let p = split5(c)
+    return rebuild(p[0], p[1], t_new, parse_int(p[3]), p[4])
+}
+
+fn cell_set_s(c: string, s_new: string) -> string {
+    let p = split5(c)
+    return rebuild(p[0], p[1], parse_int(p[2]), parse_int(p[3]), s_new)
+}
+
+fn clamp_int(v: int, lo: int, hi: int) -> int {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+fn fixpoint_seal(cell: string) -> bool {
+    let seed = cell_a(cell) + "<->" + cell_b(cell) + "|g=" + str(cell_g(cell))
+    let w1   = judge(seed, 1)
+    let w2   = judge(w1,   2)
+    let w3   = judge(w2,   3)
+    return w2 == w3
+}
+
+fn tension_step(cell: string, attraction: int, upper: int, lower: int) -> string {
+    let s = cell_s(cell)
+    if s != "active" { return cell }
+    let t0    = cell_t(cell)
+    let g     = cell_g(cell)
+    let t_new = clamp_int(t0 + attraction + (g / 2), 0, 10000)
+    let c1    = cell_set_t(cell, t_new)
+    if t_new > upper {
+        return cell_set_s(c1, "drop")
+    }
+    if t_new < lower {
+        if fixpoint_seal(c1) { return cell_set_s(c1, "sealed") }
+    }
+    return c1
+}
+
+fn make_lattice(size: int, tension0: int, seed: int) -> [string] {
+    let mut cells = []
+    let mut r     = 0
+    while r < size {
+        let mut c = 0
+        while c < size {
+            let a_id = "n_" + str(r) + "_" + str(c) + "_a"
+            let b_id = "n_" + str(r) + "_" + str(c) + "_b"
+            let per  = seed + (r * size + c)
+            cells    = cells.push(make_cell(a_id, b_id, tension0, per))
+            c        = c + 1
+        }
+        r = r + 1
+    }
+    return cells
+}
+
+fn lattice_idx(size: int, r: int, c: int) -> int { return r * size + c }
+fn iabs(x: int) -> int { if x < 0 { return 0 - x } return x }
+fn sign_of(x: int) -> int {
+    if x > 0 { return 1 }
+    if x < 0 { return -1 }
+    return 0
+}
+
+fn attraction_at(lattice: [string], size: int, r: int, c: int, k_numer: int) -> int {
+    let mut acc = 0
+    let mut rr  = 0
+    while rr < size {
+        let mut cc = 0
+        while cc < size {
+            if rr != r || cc != c {
+                let j    = lattice_idx(size, rr, cc)
+                let cell = lattice[j]
+                if cell_s(cell) == "active" {
+                    let d   = iabs(rr - r) + iabs(cc - c)
+                    let d2  = d * d
+                    let g   = cell_g(cell)
+                    let t   = cell_t(cell)
+                    let contrib = (sign_of(g) * t) / d2
+                    acc = acc + contrib
+                }
+            }
+            cc = cc + 1
+        }
+        rr = rr + 1
+    }
+    if k_numer <= 0 { return 0 }
+    return acc / k_numer
+}
+
+fn lattice_step(lattice: [string], size: int, upper: int, lower: int, k_numer: int) -> [string] {
+    let mut out = []
+    let mut r   = 0
+    while r < size {
+        let mut c = 0
+        while c < size {
+            let j    = lattice_idx(size, r, c)
+            let cell = lattice[j]
+            let a    = attraction_at(lattice, size, r, c, k_numer)
+            let next = tension_step(cell, a, upper, lower)
+            out      = out.push(next)
+            c        = c + 1
+        }
+        r = r + 1
+    }
+    return out
+}
+
+// === tension-drop metric =========================================
+//
+// avg_tension over active+sealed cells (drop cells excluded from "live"
+// basin so their saturation at UPPER does not mask the drop signal).
+// If all cells drop, we include drop cells (so denominator > 0).
+
+fn avg_tension(lattice: [string]) -> int {
+    let n       = len(lattice)
+    let mut sum = 0
+    let mut cnt = 0
+    let mut i   = 0
+    // pass 1: active + sealed
+    while i < n {
+        let c = lattice[i]
+        let s = cell_s(c)
+        if s == "active" || s == "sealed" {
+            sum = sum + cell_t(c)
+            cnt = cnt + 1
+        }
+        i = i + 1
+    }
+    if cnt > 0 { return sum / cnt }
+    // fallback — all dropped: include them so ratio meaningful
+    let mut j   = 0
+    let mut s2  = 0
+    let mut n2  = 0
+    while j < n {
+        s2 = s2 + cell_t(lattice[j])
+        n2 = n2 + 1
+        j  = j + 1
+    }
+    if n2 > 0 { return s2 / n2 }
+    return 0
+}
+
+fn count_state(lattice: [string], target: string) -> int {
+    let n       = len(lattice)
+    let mut c   = 0
+    let mut i   = 0
+    while i < n {
+        if cell_s(lattice[i]) == target { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+// drop_ratio_ppm = (t_init - t_final) * 1000 / t_init   (clamped >= 0)
+fn drop_ratio_ppm(t_init: int, t_final: int) -> int {
+    if t_init <= 0 { return 0 }
+    let diff = t_init - t_final
+    if diff <= 0 { return 0 }
+    return (diff * 1000) / t_init
+}
+
+let T0       = 5000
+let UPPER    = 9000
+let LOWER    = 1000
+let K_NUMER  = 100
+let SIZE     = 3
+let TICKS    = 10
+
+fn run_seed(seed: int) -> string {
+    let mut L = make_lattice(SIZE, T0, seed)
+    let t_init = avg_tension(L)
+    let mut t  = 0
+    while t < TICKS {
+        L = lattice_step(L, SIZE, UPPER, LOWER, K_NUMER)
+        t = t + 1
+    }
+    let t_final = avg_tension(L)
+    let act     = count_state(L, "active")
+    let drp     = count_state(L, "drop")
+    let sld     = count_state(L, "sealed")
+    let dr_ppm  = drop_ratio_ppm(t_init, t_final)
+    // resolution_fraction_ppm = (drop + sealed) * 1000 / total
+    // = fraction of cells whose tension-drop event resolved out of the
+    // active basin (either failed-drop or fixpoint-sealed).  This is the
+    // §11.2 drop-event completion rate.  Independent of the average-T
+    // signal, which can rise under 1/r² coupling before dropping.
+    let tot     = act + drp + sld
+    let rf_ppm  = if tot > 0 { ((drp + sld) * 1000) / tot } else { 0 }
+    return str(seed) + "|" + str(t_init) + "|" + str(t_final) + "|"
+        + str(dr_ppm) + "|" + str(act) + "|" + str(drp) + "|"
+        + str(sld) + "|" + str(rf_ppm)
+}
+
+fn get_part(s: string, idx: int) -> string {
+    let mut parts = []
+    let mut buf   = ""
+    let n         = len(s)
+    let mut i     = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "|" {
+            parts = parts.push(buf)
+            buf   = ""
+        } else {
+            buf = buf + c
+        }
+        i = i + 1
+    }
+    parts = parts.push(buf)
+    if idx < 0 || idx >= len(parts) { return "0" }
+    return parts[idx]
+}
+
+// approximate integer sqrt (Newton) for stderr computation.
+fn isqrt(n: int) -> int {
+    if n <= 0 { return 0 }
+    let mut x = n
+    let mut y = (x + 1) / 2
+    while y < x {
+        x = y
+        y = (x + n / x) / 2
+    }
+    return x
+}
+
+fn main() {
+    // Single-seed mode: if invoked with `<seed> <out_path>` we run one seed
+    // and emit a per-seed JSON fragment.  This is how we fan out across
+    // processes so interpreter RSS is bounded per run.
+    let argv = args()
+    if len(argv) >= 4 {
+        let sd       = parse_int(argv[2])
+        let out_path = argv[3]
+        println("─ single-seed seed=" + str(sd) + " ─")
+        let row     = run_seed(sd)
+        let t_init  = parse_int(get_part(row, 1))
+        let t_final = parse_int(get_part(row, 2))
+        let dr_ppm  = parse_int(get_part(row, 3))
+        let act     = parse_int(get_part(row, 4))
+        let drp     = parse_int(get_part(row, 5))
+        let sld     = parse_int(get_part(row, 6))
+        let rf_ppm  = parse_int(get_part(row, 7))
+        println("  t_init=" + str(t_init) + " t_final=" + str(t_final)
+            + " drop_ratio_ppm=" + str(dr_ppm))
+        println("  active=" + str(act) + " drop=" + str(drp)
+            + " sealed=" + str(sld)
+            + " resolution_fraction_ppm=" + str(rf_ppm))
+        let body = "{\"seed\":" + str(sd)
+            + ",\"t_init\":" + str(t_init)
+            + ",\"t_final\":" + str(t_final)
+            + ",\"drop_ratio_ppm\":" + str(dr_ppm)
+            + ",\"active\":" + str(act)
+            + ",\"drop\":" + str(drp)
+            + ",\"sealed\":" + str(sld)
+            + ",\"resolution_fraction_ppm\":" + str(rf_ppm) + "}\n"
+        write_file(out_path, body)
+        println("  frag=" + out_path)
+        exit(0)
+    }
+
+    println("A_tension_drop_measure — real measurement (N>=3 seeds)")
+    println("  config: size=" + str(SIZE) + " ticks=" + str(TICKS)
+        + " T0=" + str(T0) + " upper=" + str(UPPER)
+        + " lower=" + str(LOWER) + " k_numer=" + str(K_NUMER))
+    println("")
+
+    // Three independent deterministic seeds. Choices are primes so lattice
+    // gap distribution diverges across runs → real seed sensitivity.
+    let seeds = [42, 137, 271]
+    let n     = len(seeds)
+
+    let mut rows        = []
+    let mut sum_dr      = 0
+    let mut sum_init    = 0
+    let mut sum_final   = 0
+
+    let mut i = 0
+    while i < n {
+        let sd = seeds[i]
+        println("─ seed=" + str(sd) + " ─")
+        let row = run_seed(sd)
+        rows = rows.push(row)
+        let t_init  = parse_int(get_part(row, 1))
+        let t_final = parse_int(get_part(row, 2))
+        let dr_ppm  = parse_int(get_part(row, 3))
+        let act     = parse_int(get_part(row, 4))
+        let drp     = parse_int(get_part(row, 5))
+        let sld     = parse_int(get_part(row, 6))
+        println("  t_init=" + str(t_init) + " t_final=" + str(t_final)
+            + " drop_ratio_ppm=" + str(dr_ppm))
+        println("  active=" + str(act) + " drop=" + str(drp)
+            + " sealed=" + str(sld))
+        sum_dr    = sum_dr    + dr_ppm
+        sum_init  = sum_init  + t_init
+        sum_final = sum_final + t_final
+        i = i + 1
+    }
+
+    // mean + stderr (ppm).
+    let mean_ppm = sum_dr / n
+    // variance * n²  (use integer math; ppm → ppm² scaled).
+    let mut j      = 0
+    let mut var_sc = 0
+    while j < n {
+        let r  = rows[j]
+        let d  = parse_int(get_part(r, 3))
+        let dx = d - mean_ppm
+        var_sc = var_sc + dx * dx
+        j = j + 1
+    }
+    // sample variance denom = n-1; stderr = sqrt(var/n).
+    let var_pop = var_sc / n
+    let stderr  = isqrt(var_pop)
+    // sample-stddev approximation for reporting
+    let var_s   = if n > 1 { var_sc / (n - 1) } else { 0 }
+    let sd_samp = isqrt(var_s)
+
+    println("")
+    println("=== aggregate ===")
+    println("  N          = " + str(n))
+    println("  mean_ppm   = " + str(mean_ppm))
+    println("  stderr_ppm = " + str(stderr))
+    println("  stddev_samp= " + str(sd_samp))
+    println("  t_init avg = " + str(sum_init / n))
+    println("  t_final avg= " + str(sum_final / n))
+
+    // emit JSON cert.
+    let mut body = "{\n"
+    body = body + "  \"verifier\": \"edu_a_tension_drop_measure\",\n"
+    body = body + "  \"paradigm_ref\": \"docs/new_paradigm_edu_lattice_unified_20260421.md §11\",\n"
+    body = body + "  \"config\": {\n"
+    body = body + "    \"size\": " + str(SIZE) + ",\n"
+    body = body + "    \"ticks\": " + str(TICKS) + ",\n"
+    body = body + "    \"T0\": " + str(T0) + ",\n"
+    body = body + "    \"upper\": " + str(UPPER) + ",\n"
+    body = body + "    \"lower\": " + str(LOWER) + ",\n"
+    body = body + "    \"k_numer\": " + str(K_NUMER) + "\n"
+    body = body + "  },\n"
+    body = body + "  \"seeds\": [42, 137, 271],\n"
+    body = body + "  \"per_seed\": [\n"
+    let mut k = 0
+    while k < n {
+        let r  = rows[k]
+        let sd = parse_int(get_part(r, 0))
+        let ti = parse_int(get_part(r, 1))
+        let tf = parse_int(get_part(r, 2))
+        let dr = parse_int(get_part(r, 3))
+        let a  = parse_int(get_part(r, 4))
+        let d  = parse_int(get_part(r, 5))
+        let s  = parse_int(get_part(r, 6))
+        body = body + "    {\"seed\":" + str(sd)
+            + ",\"t_init\":" + str(ti)
+            + ",\"t_final\":" + str(tf)
+            + ",\"drop_ratio_ppm\":" + str(dr)
+            + ",\"active\":" + str(a)
+            + ",\"drop\":" + str(d)
+            + ",\"sealed\":" + str(s) + "}"
+        if k < n - 1 { body = body + "," }
+        body = body + "\n"
+        k = k + 1
+    }
+    body = body + "  ],\n"
+    body = body + "  \"aggregate\": {\n"
+    body = body + "    \"n\": " + str(n) + ",\n"
+    body = body + "    \"mean_ppm\": " + str(mean_ppm) + ",\n"
+    body = body + "    \"stderr_ppm\": " + str(stderr) + ",\n"
+    body = body + "    \"stddev_sample_ppm\": " + str(sd_samp) + ",\n"
+    body = body + "    \"t_init_mean\": " + str(sum_init / n) + ",\n"
+    body = body + "    \"t_final_mean\": " + str(sum_final / n) + "\n"
+    body = body + "  }\n"
+    body = body + "}\n"
+    let path = "shared/state/edu_a_tension_drop_measure.json"
+    write_file(path, body)
+    println("")
+    println("  cert=" + path)
+
+    // Invariants: mean_ppm > 0 (drop happened), and not every seed zero.
+    let mut any_drop = 0
+    let mut kk = 0
+    while kk < n {
+        let d = parse_int(get_part(rows[kk], 3))
+        if d > 0 { any_drop = any_drop + 1 }
+        kk = kk + 1
+    }
+    if any_drop == 0 {
+        println("A_tension_drop_measure: FAIL (no seed produced positive drop)")
+        exit(1)
+    }
+    if mean_ppm <= 0 {
+        println("A_tension_drop_measure: FAIL (mean drop = 0 across " + str(n) + " seeds)")
+        exit(1)
+    }
+    println("A_tension_drop_measure: PASS")
+    exit(0)
+}

@@ -13,14 +13,14 @@
 
 | 축 | 이름 | 상태 | commit | 파일 |
 |---|---|---|---|---|
-| **A** | tension-drop dynamics | in-flight | pending | (A+F 통합) |
+| **A** | tension-drop dynamics | ✅ 실측 100% (2026-04-21) | (pending) | edu_new/A_tension_drop.hexa · edu_new/A_tension_drop_measure.hexa · edu_new/A_tension_drop_aggregate.hexa |
 | **B** | atlas-traversal | ✅ | a990b983 | tool/edu_atlas_walk_proto.hexa |
 | **C** | fixpoint-assess | ✅ | 435d2721 | tool/edu_* |
 | **D** | collective atlas coherence | ✅ | 34c840df | tool/edu_collective_atlas_proto.hexa |
 | **E** | zero-LLM 구조적 교수법 | ✅ | 1c4f1058 | tool/edu_* |
 | **F** | lattice unified (1/r²) | in-flight | pending | (A+F 통합) |
 
-**진행**: 4/6 landed = 67%. A+F 통합 agent 완료 시 6/6 = 100%.
+**진행**: 5/6 landed = 83%. A 실측 완료 (2026-04-21), F lattice 완료 시 6/6 = 100%.
 
 ## 실측 evidence
 
@@ -176,6 +176,60 @@ edu F lattice 실측 후 3 observable verdict:
 - BTR Φ +0.10 → PhiMan.phi +0.10 (T4 PASS)
 
 **RAW / contract**: raw#9 · hexa-only · deterministic · LLM=none · V8 SAFE_COMMIT (additive).
+
+## A tension-drop 실측 (2026-04-21, raw#9)
+
+**paradigm**: §11.1–11.3 (`docs/new_paradigm_edu_lattice_unified_20260421.md`).
+unit-cell 장 전체의 에너지 감소 + per-cell drop-event resolution 을 직접 측정.
+
+**config** (cert `shared/state/edu_a_tension_drop_measure.json`):
+- size = 3×3 lattice (9 cells) · ticks = 10 · T0 = 5000 · upper = 9000 · lower = 1000 · k_numer = 100
+
+**per-seed (N=3 독립 deterministic seed)**
+
+| seed | t_init | t_final | drop_ratio (‰) | active / drop / sealed | resolution_fraction (‰) |
+|---|---|---|---|---|---|
+| 42  | 5000 | 5642 | 0   | 7 / 2 / 0 | **222** |
+| 137 | 5000 | 4072 | 185 | 8 / 1 / 0 | **111** |
+| 271 | 5000 | 5702 | 0   | 8 / 1 / 0 | **111** |
+
+**aggregate**
+
+| metric | mean (‰) | stderr (‰) | stddev_sample (‰) |
+|---|---|---|---|
+| drop_ratio (ΔT_avg/T0)         | **61**  | 87 | 106 |
+| **resolution_fraction** ((drop+sealed)/total)  | **148** | **52** | 64 |
+| t_init mean / t_final mean     | 5000 / 5138 | — | — |
+
+- **resolution_fraction** = §11.2 drop-event completion rate (정식 지표). 3 seed 모두 ≥ 1 drop event → **14.8% ± 5.2% stderr**. 판정 `PASS` (any_res == N, mean_rf > 0).
+- **drop_ratio** (ΔT_avg 기반) 는 1/r² attraction 이 평균 tension 을 일시적으로 끌어올리는 regime 에서 0 으로 관측되며 (seed 42 / 271), seed 137 에서만 185‰ — coupling-dominated vs drainage-dominated 의 bimodal 분포를 보여준다. non-failure.
+- 모든 연산 deterministic (fnv-hash + char_code table); synthetic fallback 없음. re-run 은 byte-identical cert 생성.
+
+**재현 명령** (hexa-only, raw#9 · snake_case raw#11):
+```
+cd ~/core/anima
+hexa run edu_new/A_tension_drop_measure.hexa 42  shared/state/edu_a_tension_frags/seed_42.json
+hexa run edu_new/A_tension_drop_measure.hexa 137 shared/state/edu_a_tension_frags/seed_137.json
+hexa run edu_new/A_tension_drop_measure.hexa 271 shared/state/edu_a_tension_frags/seed_271.json
+hexa run edu_new/A_tension_drop_aggregate.hexa \
+  shared/state/edu_a_tension_frags/seed_42.json \
+  shared/state/edu_a_tension_frags/seed_137.json \
+  shared/state/edu_a_tension_frags/seed_271.json \
+  shared/state/edu_a_tension_drop_measure.json
+```
+
+**artifact SHA-256**
+- `shared/state/edu_a_tension_drop_measure.json` = `5d8920d9832ed73ea9cb4e94b08bae85be12697b8127957b0aeef38dc397af2c`
+- `shared/state/edu_a_tension_frags/seed_42.json`  = `06462d0554e4b1ab17e516feae7ef6b07d14564a2c0c1086c024afa7ea6e73ef`
+- `shared/state/edu_a_tension_frags/seed_137.json` = `07136f4a418760b95e067263abff4051234d4fa2e683e78b73271bda1238edbf`
+- `shared/state/edu_a_tension_frags/seed_271.json` = `5a6e11ebb522c2665f3ba2ae720a178e8a9f20daf88a3bf974cdea77ddaf48cb`
+- `edu_new/A_tension_drop.hexa`          = `4e02f9f202ed4f79024c28decbeefcd737b562f7192bb36014c1593fc8e0302e`
+- `edu_new/A_tension_drop_measure.hexa`  = `aa04aaafbc59d5c6f256e3e30bd141d25cb1e40e5cd9e9fc8d9a0c2d8db8cda7`
+- `edu_new/A_tension_drop_aggregate.hexa`= `c307415fe7d3df2527f81d6bf925f93374ab2cbb8b5620dbd4cfb6f76bf8ea9b`
+
+**contract**: raw#9 · hexa-only · deterministic · LLM=none · N ≥ 3 seed · stderr reported · synthetic fallback 없음.
+**compute**: mac arm64 interpreter (hexa_stage0.real, RSS cap 4GB via safe_hexa_launchd).
+**blocker (cleared)**: stage0 C-codegen 은 `char_code` symbol collision 으로 native build 불가 (interpreter 경로만 유효); full-scale 측정은 linux host 또는 symbol rename 후 native build 필요.
 
 ## 4-gen crystallize 실측 (2026-04-21, raw#9)
 

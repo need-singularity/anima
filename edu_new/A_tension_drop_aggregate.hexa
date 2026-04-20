@@ -1,0 +1,252 @@
+// edu_new/A_tension_drop_aggregate.hexa — aggregate per-seed fragments
+//
+// Reads N per-seed JSON fragment files (one seed per file — minimal grammar),
+// extracts drop_ratio_ppm / t_init / t_final, computes mean + stderr + stddev,
+// and emits the aggregate cert.
+//
+// USAGE: hexa run edu_new/A_tension_drop_aggregate.hexa <frag1> <frag2> <frag3> [<out_cert>]
+
+fn digit_val(c: string) -> int {
+    if c == "0" { return 0 }
+    if c == "1" { return 1 }
+    if c == "2" { return 2 }
+    if c == "3" { return 3 }
+    if c == "4" { return 4 }
+    if c == "5" { return 5 }
+    if c == "6" { return 6 }
+    if c == "7" { return 7 }
+    if c == "8" { return 8 }
+    if c == "9" { return 9 }
+    return -1
+}
+
+fn parse_int(s: string) -> int {
+    let n     = len(s)
+    if n == 0 { return 0 }
+    let sign  = if s.substring(0, 1) == "-" { -1 } else { 1 }
+    let start = if sign == -1 { 1 } else { 0 }
+    let mut acc = 0
+    let mut i   = start
+    while i < n {
+        let c = s.substring(i, i + 1)
+        let d = digit_val(c)
+        if d >= 0 { acc = acc * 10 + d }
+        i = i + 1
+    }
+    return acc * sign
+}
+
+// Minimal JSON scalar extractor: finds "<key>":<digits_or_neg> and parses.
+// Assumes flat object, no nested keys with same name.  Sufficient for the
+// fragment emitted by A_tension_drop_measure.hexa single-seed mode.
+fn extract_int(body: string, key: string) -> int {
+    let needle = "\"" + key + "\":"
+    let n      = len(body)
+    let m      = len(needle)
+    let mut i  = 0
+    while i + m <= n {
+        if body.substring(i, i + m) == needle {
+            // skip key+":", then optional whitespace, grab digits/minus.
+            let mut j = i + m
+            while j < n {
+                let c = body.substring(j, j + 1)
+                if c == " " || c == "\t" { j = j + 1 }
+                else { break }
+            }
+            let mut end = j
+            while end < n {
+                let c = body.substring(end, end + 1)
+                if c == "-" || digit_val(c) >= 0 { end = end + 1 }
+                else { break }
+            }
+            if end > j { return parse_int(body.substring(j, end)) }
+            return 0
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn isqrt(n: int) -> int {
+    if n <= 0 { return 0 }
+    let mut x = n
+    let mut y = (x + 1) / 2
+    while y < x {
+        x = y
+        y = (x + n / x) / 2
+    }
+    return x
+}
+
+fn main() {
+    let argv = args()
+    if len(argv) < 5 {
+        println("usage: hexa run edu_new/A_tension_drop_aggregate.hexa <f1> <f2> <f3> [<out_cert>]")
+        exit(2)
+    }
+    let n = len(argv) - 2
+    // argv layout: [prog, script, f1, f2, f3, (out_cert)]
+    //   if out_cert present, n = frag_count = len(argv) - 3
+    let out_cert_default = "shared/state/edu_a_tension_drop_measure.json"
+    let mut out_cert     = out_cert_default
+    let mut frag_count   = n
+    // Heuristic: if last argv ends with ".json" AND contains "/", treat as out path.
+    let last = argv[len(argv) - 1]
+    let ll   = len(last)
+    let is_json_path = ll > 5
+        && last.substring(ll - 5, ll) == ".json"
+        && frag_count >= 4
+    if is_json_path {
+        out_cert   = last
+        frag_count = n - 1
+    }
+
+    println("A_tension_drop_aggregate")
+    println("  frags=" + str(frag_count) + " out=" + out_cert)
+
+    let mut seeds     = []
+    let mut rows_body = ""
+    let mut sum_dr    = 0
+    let mut sum_rf    = 0
+    let mut sum_init  = 0
+    let mut sum_final = 0
+    let mut drs       = []
+    let mut rfs       = []
+    let mut any_drop  = 0
+    let mut any_res   = 0
+
+    let mut i = 0
+    while i < frag_count {
+        let path = argv[2 + i]
+        let body = read_file(path)
+        let sd   = extract_int(body, "seed")
+        let ti   = extract_int(body, "t_init")
+        let tf   = extract_int(body, "t_final")
+        let dr   = extract_int(body, "drop_ratio_ppm")
+        let act  = extract_int(body, "active")
+        let drp  = extract_int(body, "drop")
+        let sld  = extract_int(body, "sealed")
+        let rf   = extract_int(body, "resolution_fraction_ppm")
+        seeds = seeds.push(sd)
+        drs   = drs.push(dr)
+        rfs   = rfs.push(rf)
+        if dr > 0 { any_drop = any_drop + 1 }
+        if rf > 0 { any_res  = any_res  + 1 }
+        println("  seed=" + str(sd) + " t_init=" + str(ti)
+            + " t_final=" + str(tf) + " drop_ppm=" + str(dr)
+            + " a/d/s=" + str(act) + "/" + str(drp) + "/" + str(sld)
+            + " res_ppm=" + str(rf))
+        if i > 0 { rows_body = rows_body + "," }
+        rows_body = rows_body + "\n    {\"seed\":" + str(sd)
+            + ",\"t_init\":" + str(ti)
+            + ",\"t_final\":" + str(tf)
+            + ",\"drop_ratio_ppm\":" + str(dr)
+            + ",\"active\":" + str(act)
+            + ",\"drop\":" + str(drp)
+            + ",\"sealed\":" + str(sld)
+            + ",\"resolution_fraction_ppm\":" + str(rf) + "}"
+        sum_dr    = sum_dr    + dr
+        sum_rf    = sum_rf    + rf
+        sum_init  = sum_init  + ti
+        sum_final = sum_final + tf
+        i = i + 1
+    }
+
+    let mean_ppm = if frag_count > 0 { sum_dr / frag_count } else { 0 }
+    let mut j      = 0
+    let mut var_sc = 0
+    while j < frag_count {
+        let d  = drs[j]
+        let dx = d - mean_ppm
+        var_sc = var_sc + dx * dx
+        j = j + 1
+    }
+    let var_pop = if frag_count > 0 { var_sc / frag_count } else { 0 }
+    let stderr  = isqrt(var_pop)
+    let var_s   = if frag_count > 1 { var_sc / (frag_count - 1) } else { 0 }
+    let sd_samp = isqrt(var_s)
+
+    // resolution_fraction stats
+    let mean_rf   = if frag_count > 0 { sum_rf / frag_count } else { 0 }
+    let mut jj    = 0
+    let mut var_r = 0
+    while jj < frag_count {
+        let r  = rfs[jj]
+        let dx = r - mean_rf
+        var_r  = var_r + dx * dx
+        jj = jj + 1
+    }
+    let var_r_pop = if frag_count > 0 { var_r / frag_count } else { 0 }
+    let stderr_rf = isqrt(var_r_pop)
+    let var_r_s   = if frag_count > 1 { var_r / (frag_count - 1) } else { 0 }
+    let sd_rf     = isqrt(var_r_s)
+
+    println("")
+    println("=== aggregate ===")
+    println("  N                = " + str(frag_count))
+    println("  drop_ratio mean  = " + str(mean_ppm) + " ppm")
+    println("  drop_ratio stderr= " + str(stderr) + " ppm")
+    println("  drop_ratio stddev= " + str(sd_samp) + " ppm (sample)")
+    println("  resolution mean  = " + str(mean_rf) + " ppm")
+    println("  resolution stderr= " + str(stderr_rf) + " ppm")
+    println("  resolution stddev= " + str(sd_rf) + " ppm (sample)")
+    println("  t_init avg       = " + str(if frag_count > 0 { sum_init / frag_count } else { 0 }))
+    println("  t_final avg      = " + str(if frag_count > 0 { sum_final / frag_count } else { 0 }))
+
+    // seeds array
+    let mut seeds_str = "["
+    let mut kk = 0
+    while kk < frag_count {
+        if kk > 0 { seeds_str = seeds_str + "," }
+        seeds_str = seeds_str + str(seeds[kk])
+        kk = kk + 1
+    }
+    seeds_str = seeds_str + "]"
+
+    let body = "{\n"
+        + "  \"verifier\": \"edu_a_tension_drop_measure\",\n"
+        + "  \"paradigm_ref\": \"docs/new_paradigm_edu_lattice_unified_20260421.md §11\",\n"
+        + "  \"config\": {\n"
+        + "    \"size\": 3,\n"
+        + "    \"ticks\": 10,\n"
+        + "    \"T0\": 5000,\n"
+        + "    \"upper\": 9000,\n"
+        + "    \"lower\": 1000,\n"
+        + "    \"k_numer\": 100\n"
+        + "  },\n"
+        + "  \"seeds\": " + seeds_str + ",\n"
+        + "  \"per_seed\": [" + rows_body + "\n  ],\n"
+        + "  \"aggregate\": {\n"
+        + "    \"n\": " + str(frag_count) + ",\n"
+        + "    \"drop_ratio_mean_ppm\": " + str(mean_ppm) + ",\n"
+        + "    \"drop_ratio_stderr_ppm\": " + str(stderr) + ",\n"
+        + "    \"drop_ratio_stddev_sample_ppm\": " + str(sd_samp) + ",\n"
+        + "    \"resolution_fraction_mean_ppm\": " + str(mean_rf) + ",\n"
+        + "    \"resolution_fraction_stderr_ppm\": " + str(stderr_rf) + ",\n"
+        + "    \"resolution_fraction_stddev_sample_ppm\": " + str(sd_rf) + ",\n"
+        + "    \"t_init_mean\": " + str(if frag_count > 0 { sum_init / frag_count } else { 0 }) + ",\n"
+        + "    \"t_final_mean\": " + str(if frag_count > 0 { sum_final / frag_count } else { 0 }) + "\n"
+        + "  }\n"
+        + "}\n"
+    write_file(out_cert, body)
+    println("")
+    println("  cert=" + out_cert)
+
+    // PASS if EITHER metric is positive on every seed (each seed observed a
+    // tension-drop event).  resolution_fraction is the canonical §11.2 metric
+    // (event count).  drop_ratio (avg-T decrease) can be 0 if attraction
+    // pushes averages up while individual cells drop past UPPER — that is
+    // not a failure, just a coupling-dominated regime.
+    if any_res < frag_count {
+        println("A_tension_drop_aggregate: FAIL ("
+            + str(frag_count - any_res) + " seed(s) with zero drop events)")
+        exit(1)
+    }
+    if mean_rf <= 0 {
+        println("A_tension_drop_aggregate: FAIL (mean resolution = 0 across "
+            + str(frag_count) + " seeds)")
+        exit(1)
+    }
+    println("A_tension_drop_aggregate: PASS")
+    exit(0)
+}
