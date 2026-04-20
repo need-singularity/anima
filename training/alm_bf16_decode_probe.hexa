@@ -1,0 +1,361 @@
+// training/alm_bf16_decode_probe.hexa — v5.4.4 host-side bf16 dequant probe
+// =============================================================================
+//
+// PURPOSE (anima.json#current_status.p1_dest1_alm 에 지목된 root cause)
+//   hxqwen14b.c v5.1→v5.6.5 네 버전 동안 base Qwen2.5-14B-Instruct CE 가
+//   OOB [1.5, 5.0] 에 머무름 (v5.4 16.48 / v5.4.1 16.26 / v5.4.2 16.09 /
+//   v5.4.3 16.28 / v5.6.5 14.35). LoRA 경로만 개선되고 base weight decode
+//   는 v5.4 이래 손대지 않음. 이 probe 는 safetensors shard bf16 텐서의
+//   byte-order + 레이아웃 + 값분포를 host-side 로 직접 검증하여 dequant
+//   루트 코즈를 격리.
+//
+// GATE (성공 기준)
+//   T1 embed_tokens.weight         LE 해석 std ≈ 0.02, max |v| < 5.0
+//   T2 layers.0.input_layernorm    LE 해석 전부 ≈ 1.0 (RMSNorm γ init)
+//   T3 layers.0.self_attn.q_proj   LE 해석 std ≈ 0.02
+//   T1/T3 에서 BE 해석 std ≫ 1.0 또는 < 0.001 → LE 가정 확정.
+//   T2 에서 값이 1.0 에서 크게 벗어나면 endian/stride/dequant 중 하나 오류.
+//
+// R37 준수 (hexa-native, .py 0 LOC, nvcc 불필요).
+//
+// USAGE
+//   hexa run training/alm_bf16_decode_probe.hexa --dry
+//   hexa run training/alm_bf16_decode_probe.hexa --shard <path-to-safetensors>
+//   hexa run training/alm_bf16_decode_probe.hexa --shard <path> --tensor <name>
+//
+// EXIT
+//   0 = 모든 T1/T2/T3 PASS
+//   1 = 일부 FAIL (dequant root cause 후보 식별됨)
+//   2 = 파일/인자 오류
+//
+// OUTPUT
+//   stdout 에 JSON. 요약은 stderr.
+
+// ── pow2: positive or negative integer exponent on 2.0 ────────────────
+fn pow2(n: int) -> float {
+    if n == 0 { return 1.0 }
+    let mut r = 1.0
+    if n > 0 {
+        let mut i = 0
+        while i < n { r = r * 2.0; i = i + 1 }
+        return r
+    }
+    let mut i = 0
+    let m = 0 - n
+    while i < m { r = r * 0.5; i = i + 1 }
+    return r
+}
+
+// ── bf16 (u16 LE) → f32 ────────────────────────────────────────────────
+// bf16 = upper 16 bits of fp32. IEEE 754: sign(1) + exp(8, bias=127) + mant(7).
+fn bf16_u16_to_f32(u: int) -> float {
+    if u == 0 { return 0.0 }
+    let sign_bit = (u >> 15) & 1
+    let exp = (u >> 7) & 255
+    let mant = u & 127
+    if exp == 255 {
+        // inf/nan — return 0 for stat bucket (weight tensors must not have these)
+        return 0.0
+    }
+    if exp == 0 {
+        // subnormal: f = sign * 2^-126 * (mant / 128)
+        let mag0 = pow2(-126) * (to_float(mant) / 128.0)
+        if sign_bit == 1 { return 0.0 - mag0 }
+        return mag0
+    }
+    // normalized: (-1)^sign * 2^(exp-127) * (1 + mant/128)
+    let fract = 1.0 + to_float(mant) / 128.0
+    let twop = pow2(exp - 127)
+    let mag = fract * twop
+    if sign_bit == 1 { return 0.0 - mag }
+    return mag
+}
+
+// Read LE bf16 pair from byte array: low=byte[off], high=byte[off+1]
+fn bf16_le(bytes: [int], off: int) -> float {
+    let b0 = bytes[off]
+    let b1 = bytes[off + 1]
+    let u = b0 + b1 * 256
+    return bf16_u16_to_f32(u)
+}
+// Read BE bf16 pair (swapped): low=byte[off+1], high=byte[off]
+fn bf16_be(bytes: [int], off: int) -> float {
+    let b0 = bytes[off]
+    let b1 = bytes[off + 1]
+    let u = b1 + b0 * 256
+    return bf16_u16_to_f32(u)
+}
+
+// ── Statistics over a float array ───────────────────────────────────
+fn abs_f(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+fn stat_mean_std_max(vals: [float]) -> [float] {
+    let n = len(vals)
+    if n == 0 { return [0.0, 0.0, 0.0, 0.0] }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n { s = s + vals[i]; i = i + 1 }
+    let mean = s / to_float(n)
+    let mut ss = 0.0
+    i = 0
+    while i < n {
+        let d = vals[i] - mean
+        ss = ss + d * d
+        i = i + 1
+    }
+    let var = ss / to_float(n)
+    // crude sqrt via Newton 5 iters (no math import dependency)
+    let mut r = if var > 1.0 { var } else { 1.0 }
+    let mut k = 0
+    while k < 20 {
+        if r <= 0.0 { r = 1.0 }
+        r = 0.5 * (r + var / r)
+        k = k + 1
+    }
+    let std = r
+    // max abs
+    let mut mx = 0.0
+    i = 0
+    while i < n {
+        let a = abs_f(vals[i])
+        if a > mx { mx = a }
+        i = i + 1
+    }
+    // count finite-ish (|v| < 1e6 as sentinel)
+    let mut nfin = 0
+    i = 0
+    while i < n {
+        if abs_f(vals[i]) < 1000000.0 { nfin = nfin + 1 }
+        i = i + 1
+    }
+    return [mean, std, mx, to_float(nfin)]
+}
+
+// ── safetensors header parse ─────────────────────────────────────────
+// Layout: [u64 LE header_len][JSON header][tensor bytes...]
+fn read_u64_le(b: [int], off: int) -> int {
+    let b0 = b[off]
+    let b1 = b[off + 1]
+    let b2 = b[off + 2]
+    let b3 = b[off + 3]
+    let b4 = b[off + 4]
+    let b5 = b[off + 5]
+    let b6 = b[off + 6]
+    let b7 = b[off + 7]
+    // hexa int is 64-bit; shift via multiplication for portability
+    let lo = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+    let hi = b4 + b5 * 256 + b6 * 65536 + b7 * 16777216
+    // 4294967296 == 2^32
+    return lo + hi * 4294967296
+}
+
+// JSON spelunking — find "tensor_name" key block, return its "data_offsets" [start,end].
+// safetensors JSON shape, minimal substring scan (not a full parser).
+fn find_tensor_offsets(json: string, name: string) -> [int] {
+    // Find `"<name>":` quoted key
+    let needle = "\"" + name + "\""
+    let pos = json.index_of(needle)
+    if pos < 0 { return [-1, -1] }
+    // From pos, find "data_offsets":[<a>,<b>]
+    let tag = "\"data_offsets\""
+    let n = json.length()
+    // Scan forward from pos up to ~512 chars (one tensor block is tiny)
+    let limit = if pos + 512 < n { pos + 512 } else { n }
+    let sub = json.substring(pos, limit)
+    let rel = sub.index_of(tag)
+    if rel < 0 { return [-1, -1] }
+    let abs_start = pos + rel + tag.length()
+    // Scan to first '['
+    let mut i = abs_start
+    while i < n {
+        let c = json.substring(i, i + 1)
+        if c == "[" { break }
+        i = i + 1
+    }
+    if i >= n { return [-1, -1] }
+    // Parse first int, skip ',', parse second int, up to ']'
+    i = i + 1
+    let mut a = 0
+    while i < n {
+        let c = json.substring(i, i + 1)
+        if c == "," { i = i + 1; break }
+        if c >= "0" && c <= "9" { a = a * 10 + to_int(c) }
+        i = i + 1
+    }
+    let mut b = 0
+    while i < n {
+        let c = json.substring(i, i + 1)
+        if c == "]" { break }
+        if c >= "0" && c <= "9" { b = b * 10 + to_int(c) }
+        i = i + 1
+    }
+    return [a, b]
+}
+
+// ── Per-tensor probe: reads bf16 bytes, returns LE + BE stats ────────
+fn probe_tensor(shard: string, json_end: int, off_start: int, off_end: int,
+                n_elems: int, label: string) -> string {
+    let n_bytes = n_elems * 2
+    let available = off_end - off_start
+    let read_n = if n_bytes < available { n_bytes } else { available }
+    let abs_off = json_end + off_start
+    let bytes = read_bytes_at(shard, abs_off, read_n)
+    if len(bytes) < read_n {
+        return "    \"" + label + "\": { \"error\": \"short_read\", \"want\": " +
+               to_string(read_n) + ", \"got\": " + to_string(len(bytes)) + " }"
+    }
+    // Dequant LE and BE
+    let mut le_vals = []
+    let mut be_vals = []
+    let mut i = 0
+    while i < read_n - 1 {
+        le_vals = append(le_vals, bf16_le(bytes, i))
+        be_vals = append(be_vals, bf16_be(bytes, i))
+        i = i + 2
+    }
+    let le_s = stat_mean_std_max(le_vals)
+    let be_s = stat_mean_std_max(be_vals)
+    let mut out = "    \"" + label + "\": {\n"
+    out = out + "      \"abs_offset\": " + to_string(abs_off) + ",\n"
+    out = out + "      \"bytes_read\": " + to_string(len(bytes)) + ",\n"
+    out = out + "      \"n_vals\":     " + to_string(len(le_vals)) + ",\n"
+    out = out + "      \"le\": { \"mean\": " + to_string(le_s[0]) +
+                 ", \"std\": " + to_string(le_s[1]) +
+                 ", \"max_abs\": " + to_string(le_s[2]) + " },\n"
+    out = out + "      \"be\": { \"mean\": " + to_string(be_s[0]) +
+                 ", \"std\": " + to_string(be_s[1]) +
+                 ", \"max_abs\": " + to_string(be_s[2]) + " }\n"
+    out = out + "    }"
+    return out
+}
+
+// ── Gate logic: expected Qwen init values ────────────────────────────
+fn verdict_embed(std: float, max_abs: float) -> string {
+    // embed_tokens std ~ 0.02, max < 1.0
+    if std < 0.005 { return "FAIL_STD_TOO_LOW" }
+    if std > 0.10  { return "FAIL_STD_TOO_HIGH" }
+    if max_abs > 5.0 { return "FAIL_MAX_ABS_EXPLOSIVE" }
+    return "PASS"
+}
+fn verdict_norm(std: float, max_abs: float) -> string {
+    // RMSNorm gamma init to 1.0: std should be very small, max_abs ~ 1.0
+    if max_abs < 0.9 || max_abs > 1.1 { return "FAIL_NOT_ONE" }
+    if std > 0.05 { return "FAIL_NONCONSTANT" }
+    return "PASS"
+}
+
+fn main() {
+    let argv = args()
+    let mut shard = ""
+    let mut dry = false
+    let mut one_tensor = ""
+    let mut i = 2
+    while i < argv.len() {
+        if argv[i] == "--shard" && i + 1 < argv.len() {
+            shard = argv[i + 1]
+            i = i + 2
+        } else if argv[i] == "--tensor" && i + 1 < argv.len() {
+            one_tensor = argv[i + 1]
+            i = i + 2
+        } else if argv[i] == "--dry" {
+            dry = true
+            i = i + 1
+        } else {
+            i = i + 1
+        }
+    }
+
+    if dry {
+        println("{")
+        println("  \"mode\": \"dry\",")
+        println("  \"schema\": \"alm_bf16_decode_probe_v1\",")
+        println("  \"expected\": {")
+        println("    \"embed_tokens.weight\":          { \"std\": 0.02, \"max_abs_lt\": 1.0 },")
+        println("    \"layers.0.input_layernorm\":    { \"all_eq_1.0\": true },")
+        println("    \"layers.0.self_attn.q_proj\":   { \"std\": 0.02, \"max_abs_lt\": 1.0 }")
+        println("  },")
+        println("  \"note\": \"Run with --shard <path> to measure. LE std ≈ expected, BE std far off = endian확정 LE.\"")
+        println("}")
+        exit(0)
+    }
+
+    if shard == "" {
+        print_err("[bf16_probe] ERROR: --shard <path> required (or --dry)")
+        exit(2)
+    }
+    if file_exists(shard) == false {
+        print_err("[bf16_probe] ERROR: shard not found: " + shard)
+        exit(2)
+    }
+
+    // Read header: u64 len, then JSON
+    let head8 = read_bytes_at(shard, 0, 8)
+    if len(head8) < 8 {
+        print_err("[bf16_probe] ERROR: shard too small for safetensors header")
+        exit(2)
+    }
+    let hlen = read_u64_le(head8, 0)
+    if hlen <= 0 || hlen > 67108864 {  // 64MB sanity cap
+        print_err("[bf16_probe] ERROR: implausible header length: " + to_string(hlen))
+        exit(2)
+    }
+    let hbytes = read_bytes_at(shard, 8, hlen)
+    if len(hbytes) < hlen {
+        print_err("[bf16_probe] ERROR: short header read")
+        exit(2)
+    }
+    // Convert bytes → string (safetensors header is ASCII JSON)
+    let mut json = ""
+    let mut k = 0
+    while k < hlen {
+        json = json + chr(hbytes[k])
+        k = k + 1
+    }
+    let json_end = 8 + hlen
+
+    // Tensor list
+    let mut names = []
+    if one_tensor != "" {
+        names = append(names, one_tensor)
+    } else {
+        names = append(names, "model.embed_tokens.weight")
+        names = append(names, "model.layers.0.input_layernorm.weight")
+        names = append(names, "model.layers.0.self_attn.q_proj.weight")
+    }
+
+    println("{")
+    println("  \"schema\": \"alm_bf16_decode_probe_v1\",")
+    println("  \"shard\": \"" + shard + "\",")
+    println("  \"header_len\": " + to_string(hlen) + ",")
+    println("  \"json_end_offset\": " + to_string(json_end) + ",")
+    println("  \"tensors\": {")
+
+    let mut any_fail = false
+    let mut ti = 0
+    while ti < len(names) {
+        let name = names[ti]
+        let offs = find_tensor_offsets(json, name)
+        if offs[0] < 0 {
+            println("    \"" + name + "\": { \"error\": \"not_in_header\" },")
+            any_fail = true
+            ti = ti + 1
+        } else {
+            // Read first 5120 elements (10240 bytes) or whatever is available
+            let probe_elems = 5120
+            let block = probe_tensor(shard, json_end, offs[0], offs[1], probe_elems, name)
+            let sep = if ti == len(names) - 1 { "" } else { "," }
+            println(block + sep)
+            ti = ti + 1
+        }
+    }
+
+    println("  }")
+    println("}")
+
+    if any_fail { exit(1) }
+    exit(0)
+}
+
+main()
