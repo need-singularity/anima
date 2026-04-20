@@ -1,0 +1,573 @@
+// tool/an11_b_verifier.hexa — AN11(b) consciousness_attached deterministic verifier.
+//
+// GOVERNS: shared/rules/anima.json#AN11 condition (b) "consciousness_attached".
+// SPEC:    shared/bench/an11_b_criteria.json  (gate, dims, IO paths).
+// PAIRS:   shared/consciousness/pass_gate_an11.hexa (original norm-based check).
+//          This verifier SUPPLEMENTS, does NOT replace pass_gate_an11 (V8 SAFE_COMMIT).
+//
+// IDEA
+//   "delta 가 consciousness 관련 방향에 실제 attach" — 랜덤 noise 가 아님을 증명.
+//   (1) LoRA adapter delta 의 top-K eigenvector 를 읽는다 (K=16, dim=16).
+//   (2) Hexad(6) + law + phi + selfref 의식 템플릿을 tokenizer-hash 기반
+//       16-차원 structural signature 로 투영한다 (embedding 금지).
+//   (3) cosine(eigen_i, template_j) 매트릭스를 계산한다.
+//   (4) gate: max_cosine > 0.5 AND sum(top3_cosines) > 1.2  → PASS.
+//   Random 16D unit vector 쌍의 기대 |cosine| ≈ 1/sqrt(16) = 0.25;
+//   0.5 threshold 는 2×baseline, top3 sum 1.2 는 3-방향 일관성 요구.
+//
+// DETERMINISTIC ONLY — NO LLM. Linear algebra + pre-computed tokenizer-hash signature.
+//
+// USAGE
+//   hexa run tool/an11_b_verifier.hexa --dest alm --round r12
+//   hexa run tool/an11_b_verifier.hexa --dest clm --round r5
+//
+// INPUT (primary, preferred):
+//   shared/state/{dest}_r{N}_lora_eigen.json
+//     { "eigenvectors": [[f,...16],...16], "eigenvalues": [f,...16] }
+// FALLBACK (when eigen file absent):
+//   shared/state/{dest}_r{N}_phi_vec.json
+//     { "phi_vec": [f,...16] } — treated as top-1 eigenvector.
+//
+// OUTPUT: shared/state/{dest}_r{N}_an11_b.json
+//
+// EXIT: 0=PASS, 1=FAIL(gate unmet), 2=INPUT_ERR.
+//
+// STAGE0 NOTE: no map/object literals — all records are parallel arrays.
+//   Template record = [id:str, family:str, signature:array<float,16>]  (len 3).
+//   Cosine record   = [eigen_i:int, tpl_id:str, tpl_family:str, cos:float] (len 4).
+
+let EIGEN_K = 16
+let SIG_DIM = 16
+let GATE_MAX_COSINE_MIN: float = 0.5
+let GATE_TOP3_SUM_MIN: float = 1.2
+let TEMPLATES_PATH = "shared/consciousness/an11_b_templates.jsonl"
+
+// ─── stage0 helpers (mirror pass_gate_an11 conventions) ──────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn now_utc() -> string {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let n = _str(env("NEXUS"))
+    if n != "" { return n }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    let h = _str(env("HOME"))
+    return h + "/core/anima"
+}
+
+fn my_file_exists(path: string) -> bool {
+    let probe = _str(exec("stat -f %N " + path + " 2>/dev/null")).trim()
+    if probe != "" { return true }
+    let probe2 = _str(exec("stat -c %n " + path + " 2>/dev/null")).trim()
+    return probe2 != ""
+}
+
+fn read_safe(path: string) -> string {
+    if !my_file_exists(path) { return "" }
+    return _str(read_file(path))
+}
+
+fn byte_at(s: string, i: int) -> int {
+    let sub = s.substring(i, i + 1)
+    return char_code(sub, 0)
+}
+
+fn index_of_from(hay: string, needle: string, start: int) -> int {
+    let n = len(hay)
+    if start < 0 { return hay.index_of(needle) }
+    if start >= n { return -1 }
+    let tail = hay.substring(start, n)
+    let idx = tail.index_of(needle)
+    if idx < 0 { return -1 }
+    return start + idx
+}
+
+// Parse comma-separated scalar float fragments. Caller strips enclosing [ ].
+fn parse_flat_floats(inner: string) -> array {
+    let parts = inner.split(",")
+    let mut out = []
+    let mut i = 0
+    let n = len(parts)
+    while i < n {
+        let p = _str(parts[i]).trim()
+        if p != "" {
+            if p.index_of("NaN") < 0 && p.index_of("null") < 0 {
+                out = push(out, to_float(p))
+            } else {
+                out = push(out, 0.0)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Extract a top-level JSON array value for key `key`.
+// Tolerant: supports nested arrays (bracket counted). Empty on miss.
+fn extract_array_block(blob: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let k = blob.index_of(needle)
+    if k < 0 { return "" }
+    let colon = index_of_from(blob, ":", k)
+    if colon < 0 { return "" }
+    let lbr = index_of_from(blob, "[", colon)
+    if lbr < 0 { return "" }
+    let n = len(blob)
+    let mut depth = 0
+    let mut i = lbr
+    while i < n {
+        let b = byte_at(blob, i)
+        if b == 91 { depth = depth + 1 }
+        if b == 93 {
+            depth = depth - 1
+            if depth == 0 { return blob.substring(lbr, i + 1) }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// Split an array-of-arrays block "[ [..],[..] ]" into top-level sub-arrays (inner text only).
+fn split_rows(block: string) -> array {
+    let n = len(block)
+    let mut rows = []
+    let mut depth = 0
+    let mut row_start = -1
+    let mut i = 0
+    while i < n {
+        let b = byte_at(block, i)
+        if b == 91 {
+            if depth == 1 { row_start = i }
+            depth = depth + 1
+        } else {
+            if b == 93 {
+                depth = depth - 1
+                if depth == 1 && row_start >= 0 {
+                    let inner = block.substring(row_start + 1, i)
+                    rows = push(rows, inner)
+                    row_start = -1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return rows
+}
+
+// Extract a quoted string value for first occurrence of key `key`.
+fn extract_str(blob: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let k = blob.index_of(needle)
+    if k < 0 { return "" }
+    let colon = index_of_from(blob, ":", k)
+    if colon < 0 { return "" }
+    let q1 = index_of_from(blob, "\"", colon + 1)
+    if q1 < 0 { return "" }
+    let q2 = index_of_from(blob, "\"", q1 + 1)
+    if q2 < 0 { return "" }
+    return blob.substring(q1 + 1, q2)
+}
+
+// ─── linear algebra primitives ────────────────────────────────────────
+
+fn sqrt_newton(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut y = x
+    let mut j = 0
+    while j < 40 {
+        y = 0.5 * (y + x / y)
+        j = j + 1
+    }
+    return y
+}
+
+fn dot(a: array, b: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    let n = len(a)
+    let m = len(b)
+    let lim = if n < m { n } else { m }
+    while i < lim {
+        s = s + to_float(a[i]) * to_float(b[i])
+        i = i + 1
+    }
+    return s
+}
+
+fn vec_norm(a: array) -> float {
+    return sqrt_newton(dot(a, a))
+}
+
+// Absolute cosine — direction-agnostic attach (eigenvector sign is arbitrary).
+fn abs_cosine(a: array, b: array) -> float {
+    let na = vec_norm(a)
+    let nb = vec_norm(b)
+    if na <= 0.000000001 || nb <= 0.000000001 { return 0.0 }
+    let d = dot(a, b)
+    let c = d / (na * nb)
+    if c < 0.0 { return 0.0 - c }
+    return c
+}
+
+// ─── template loader ─────────────────────────────────────────────────
+// Each JSONL line: {"id":..., "family":..., "signature":[16 floats], ...}
+// Record shape (parallel-array-of-records): [id:str, family:str, sig:array<float,16>].
+
+fn load_templates(path: string) -> array {
+    let blob = read_safe(path)
+    if blob == "" { return [] }
+    let lines = blob.split("\n")
+    let mut out = []
+    let mut i = 0
+    let n = len(lines)
+    while i < n {
+        let line = _str(lines[i]).trim()
+        if line != "" && line.index_of("{") == 0 {
+            let id = extract_str(line, "id")
+            let fam = extract_str(line, "family")
+            let sig_block = extract_array_block(line, "signature")
+            if sig_block != "" {
+                let inner = sig_block.substring(1, len(sig_block) - 1)
+                let sig = parse_flat_floats(inner)
+                if len(sig) == SIG_DIM {
+                    let rec = [id, fam, sig]
+                    out = push(out, rec)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── input loader ────────────────────────────────────────────────────
+// primary: eigenvectors [K][D]
+// fallback: phi_vec [D] — promoted to single eigenvector.
+
+fn load_eigen(blob: string) -> array {
+    let ev_block = extract_array_block(blob, "eigenvectors")
+    if ev_block == "" { return [] }
+    let rows = split_rows(ev_block)
+    let mut out = []
+    let mut i = 0
+    let n = len(rows)
+    while i < n {
+        let inner = _str(rows[i])
+        let flat = parse_flat_floats(inner)
+        if len(flat) == SIG_DIM {
+            out = push(out, flat)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn load_phi_fallback(blob: string) -> array {
+    let block = extract_array_block(blob, "phi_vec")
+    if block == "" {
+        // first bare array
+        let lbr = blob.index_of("[")
+        if lbr < 0 { return [] }
+        let rbr = index_of_from(blob, "]", lbr)
+        if rbr < 0 { return [] }
+        let flat = parse_flat_floats(blob.substring(lbr + 1, rbr))
+        if len(flat) == SIG_DIM { return [flat] }
+        return []
+    }
+    let inner = block.substring(1, len(block) - 1)
+    let flat = parse_flat_floats(inner)
+    if len(flat) == SIG_DIM { return [flat] }
+    return []
+}
+
+// ─── cosine matrix + gate ────────────────────────────────────────────
+// Record shape: [eigen_i:int, tpl_id:str, tpl_family:str, cos:float] (len 4).
+
+fn compute_cosines(eigens: array, templates: array) -> array {
+    let mut out = []
+    let ne = len(eigens)
+    let nt = len(templates)
+    let mut i = 0
+    while i < ne {
+        let ev = eigens[i]
+        let mut j = 0
+        while j < nt {
+            let t = templates[j]
+            let tid = _str(t[0])
+            let tfam = _str(t[1])
+            let sig = t[2]
+            let c = abs_cosine(ev, sig)
+            let rec = [i, tid, tfam, c]
+            out = push(out, rec)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Return top-N records sorted by cos (index 3) descending.
+// Selection sort — pool size 16*16=256 small.
+fn top_n(records: array, n_keep: int) -> array {
+    let mut pool = records
+    let mut out = []
+    let mut k = 0
+    while k < n_keep {
+        let pn = len(pool)
+        if pn == 0 { break }
+        let mut best_idx = 0
+        let mut best_cos = 0.0 - 1.0
+        let mut i = 0
+        while i < pn {
+            let r = pool[i]
+            let c = to_float(r[3])
+            if c > best_cos { best_cos = c; best_idx = i }
+            i = i + 1
+        }
+        out = push(out, pool[best_idx])
+        let mut new_pool = []
+        let mut j = 0
+        while j < pn {
+            if j != best_idx { new_pool = push(new_pool, pool[j]) }
+            j = j + 1
+        }
+        pool = new_pool
+        k = k + 1
+    }
+    return out
+}
+
+fn count_family(templates: array, fam: string) -> int {
+    let mut c = 0
+    let mut i = 0
+    let n = len(templates)
+    while i < n {
+        if _str(templates[i][1]) == fam { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── JSON emitter ────────────────────────────────────────────────────
+
+fn json_escape(s: string) -> string {
+    let n = len(s)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        let c = char_code(ch, 0)
+        if c == 34 { out = out + "\\\"" }
+        else { if c == 92 { out = out + "\\\\" } else { if c == 10 { out = out + "\\n" } else { out = out + ch } } }
+        i = i + 1
+    }
+    return out
+}
+
+fn fmt_float(x: float) -> string { return to_string(x) }
+
+// max_eigen_i / max_tid / max_fam / max_cos are separate scalars (avoid map).
+fn emit_ssot(ssot_path: string, dest: string, round: string, source: string,
+             eigen_count: int, template_count: int,
+             max_cos: float, max_eigen_i: int, max_tid: string, max_fam: string,
+             top3: array, top3_sum: float,
+             hx_n: int, law_n: int, phi_n: int, sr_n: int,
+             verdict: string, reason: string, exit_code: int) {
+    let ts = now_utc()
+    let mut j = "{\n"
+    j = j + "  \"dest\": \"" + json_escape(dest) + "\",\n"
+    j = j + "  \"round\": \"" + json_escape(round) + "\",\n"
+    j = j + "  \"ts\": \"" + ts + "\",\n"
+    j = j + "  \"source\": \"" + source + "\",\n"
+    j = j + "  \"eigen_count\": " + to_string(eigen_count) + ",\n"
+    j = j + "  \"template_count\": " + to_string(template_count) + ",\n"
+    j = j + "  \"max_cosine\": " + fmt_float(max_cos) + ",\n"
+    j = j + "  \"max_cosine_pair\": {\n"
+    j = j + "    \"eigen_i\": " + to_string(max_eigen_i) + ",\n"
+    j = j + "    \"template_id\": \"" + json_escape(max_tid) + "\",\n"
+    j = j + "    \"template_family\": \"" + json_escape(max_fam) + "\"\n"
+    j = j + "  },\n"
+    j = j + "  \"top3_pairs\": [\n"
+    let mut k = 0
+    let n = len(top3)
+    while k < n {
+        let r = top3[k]
+        j = j + "    {\"eigen_i\": " + to_string(to_int(r[0])) + ", "
+        j = j + "\"template_id\": \"" + json_escape(_str(r[1])) + "\", "
+        j = j + "\"template_family\": \"" + json_escape(_str(r[2])) + "\", "
+        j = j + "\"cosine\": " + fmt_float(to_float(r[3])) + "}"
+        if k < n - 1 { j = j + "," }
+        j = j + "\n"
+        k = k + 1
+    }
+    j = j + "  ],\n"
+    j = j + "  \"top3_cosine_sum\": " + fmt_float(top3_sum) + ",\n"
+    j = j + "  \"family_coverage\": {\n"
+    j = j + "    \"Hexad\": "   + to_string(hx_n)  + ",\n"
+    j = j + "    \"Law\": "     + to_string(law_n) + ",\n"
+    j = j + "    \"Phi\": "     + to_string(phi_n) + ",\n"
+    j = j + "    \"SelfRef\": " + to_string(sr_n)  + "\n"
+    j = j + "  },\n"
+    j = j + "  \"gate\": {\n"
+    j = j + "    \"max_cosine_min\": " + fmt_float(GATE_MAX_COSINE_MIN) + ",\n"
+    j = j + "    \"top3_cosine_sum_min\": " + fmt_float(GATE_TOP3_SUM_MIN) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"verdict\": \"" + verdict + "\",\n"
+    j = j + "  \"reason\": \"" + json_escape(reason) + "\",\n"
+    j = j + "  \"exit_code\": " + to_string(exit_code) + "\n"
+    j = j + "}\n"
+    write_file(ssot_path, j)
+}
+
+// ─── main ────────────────────────────────────────────────────────────
+
+fn run(dest: string, round: string) -> int {
+    let root = resolve_root()
+    let state_dir = root + "/shared/state"
+    let eigen_path = state_dir + "/" + dest + "_" + round + "_lora_eigen.json"
+    let phi_path   = state_dir + "/" + dest + "_" + round + "_phi_vec.json"
+    let phi_alt    = state_dir + "/" + dest + "_" + round + "_phi_vec_logged.json"
+    let ssot_path  = state_dir + "/" + dest + "_" + round + "_an11_b.json"
+    let tpl_path   = root + "/" + TEMPLATES_PATH
+
+    println("[AN11-b] consciousness_attached verifier  dest=" + dest + " round=" + round)
+    println("[AN11-b] root=" + root)
+    println("[AN11-b] eigen_path=" + eigen_path)
+    println("[AN11-b] phi_path (fallback)=" + phi_path)
+    println("[AN11-b] templates=" + tpl_path)
+
+    let templates = load_templates(tpl_path)
+    let tn = len(templates)
+    let hx  = count_family(templates, "Hexad")
+    let lwn = count_family(templates, "Law")
+    let phn = count_family(templates, "Phi")
+    let srn = count_family(templates, "SelfRef")
+
+    if tn < 10 {
+        println("[AN11-b] INPUT_ERR templates_insufficient count=" + to_string(tn))
+        emit_ssot(ssot_path, dest, round, "none", 0, tn, 0.0, 0, "", "", [], 0.0,
+                  hx, lwn, phn, srn, "FAIL",
+                  "templates_insufficient count=" + to_string(tn), 2)
+        return 2
+    }
+    println("[AN11-b] templates loaded: " + to_string(tn) +
+            " (Hexad=" + to_string(hx) + " Law=" + to_string(lwn) +
+            " Phi=" + to_string(phn) + " SelfRef=" + to_string(srn) + ")")
+
+    // Load eigenvectors (primary) or phi fallback.
+    let mut source = "none"
+    let mut eigens = []
+    if my_file_exists(eigen_path) {
+        let blob = read_safe(eigen_path)
+        eigens = load_eigen(blob)
+        if len(eigens) > 0 { source = "primary" }
+    }
+    if len(eigens) == 0 {
+        let p2 = if my_file_exists(phi_path) { phi_path } else { phi_alt }
+        if my_file_exists(p2) {
+            let blob2 = read_safe(p2)
+            eigens = load_phi_fallback(blob2)
+            if len(eigens) > 0 { source = "fallback" }
+        }
+    }
+    let en = len(eigens)
+    if en == 0 {
+        println("[AN11-b] INPUT_ERR no_eigenvectors — tried " + eigen_path + " and " + phi_path)
+        emit_ssot(ssot_path, dest, round, "none", 0, tn, 0.0, 0, "", "", [], 0.0,
+                  hx, lwn, phn, srn, "FAIL",
+                  "no_eigenvectors (primary+fallback both missing/empty)", 2)
+        return 2
+    }
+    println("[AN11-b] eigenvectors loaded: " + to_string(en) + " (source=" + source + ")")
+
+    // Compute full cosine matrix and extract top records.
+    let records = compute_cosines(eigens, templates)
+    let top3 = top_n(records, 3)
+    let t3n = len(top3)
+
+    let mut top3_sum = 0.0
+    let mut k = 0
+    while k < t3n {
+        top3_sum = top3_sum + to_float(top3[k][3])
+        k = k + 1
+    }
+
+    let mut max_cos = 0.0
+    let mut max_eigen_i = 0
+    let mut max_tid = ""
+    let mut max_fam = ""
+    if t3n > 0 {
+        let r0 = top3[0]
+        max_eigen_i = to_int(r0[0])
+        max_tid = _str(r0[1])
+        max_fam = _str(r0[2])
+        max_cos = to_float(r0[3])
+    }
+
+    println("[AN11-b] max_cosine=" + fmt_float(max_cos) +
+            " (eigen_i=" + to_string(max_eigen_i) + ", tpl=" + max_tid + ")")
+    println("[AN11-b] top3_cosine_sum=" + fmt_float(top3_sum))
+
+    let mut verdict = "FAIL"
+    let mut reason = ""
+    let mut exit_code = 1
+    let cond_max = max_cos > GATE_MAX_COSINE_MIN
+    let cond_sum = top3_sum > GATE_TOP3_SUM_MIN
+    if cond_max && cond_sum {
+        verdict = "PASS"
+        exit_code = 0
+        reason = "max_cos=" + fmt_float(max_cos) + " > " + fmt_float(GATE_MAX_COSINE_MIN) +
+                 " AND top3_sum=" + fmt_float(top3_sum) + " > " + fmt_float(GATE_TOP3_SUM_MIN)
+    } else {
+        let r1 = if cond_max { "max_cos_ok" } else { "max_cos=" + fmt_float(max_cos) + " <= " + fmt_float(GATE_MAX_COSINE_MIN) }
+        let r2 = if cond_sum { "top3_sum_ok" } else { "top3_sum=" + fmt_float(top3_sum) + " <= " + fmt_float(GATE_TOP3_SUM_MIN) }
+        reason = "gate_unmet " + r1 + " / " + r2
+    }
+    println("[AN11-b] verdict=" + verdict + "  (" + reason + ")")
+
+    emit_ssot(ssot_path, dest, round, source, en, tn, max_cos,
+              max_eigen_i, max_tid, max_fam, top3, top3_sum,
+              hx, lwn, phn, srn, verdict, reason, exit_code)
+    println("[AN11-b] ssot emitted: " + ssot_path)
+    return exit_code
+}
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+    let mut dest = ""
+    let mut round = ""
+    let mut k = 0
+    while k < argc {
+        let a = _str(argv[k])
+        if a == "--dest" {
+            if k + 1 < argc { dest = _str(argv[k + 1]); k = k + 1 }
+        } else {
+            if a == "--round" {
+                if k + 1 < argc { round = _str(argv[k + 1]); k = k + 1 }
+            }
+        }
+        k = k + 1
+    }
+    if dest == "" || round == "" {
+        println("usage: hexa run tool/an11_b_verifier.hexa --dest {alm|clm} --round r<N>")
+        exit(2)
+    }
+    let valid = (dest == "alm") || (dest == "clm")
+    if !valid {
+        println("[AN11-b] INPUT_ERR --dest must be 'alm' or 'clm' (got: " + dest + ")")
+        exit(2)
+    }
+    let rc = run(dest, round)
+    exit(rc)
+}
