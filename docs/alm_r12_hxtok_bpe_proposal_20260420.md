@@ -274,6 +274,24 @@ Phase-3 (trainer integration) 별도 0.5-1h.
 
 ## 15. 이 세션 산출물
 
-- `docs/alm_r12_hxtok_bpe_proposal_20260420.md` (이 파일)
+- `docs/alm_r12_hxtok_bpe_proposal_20260420.md` (이 파일, commit `f52e9776`)
+- `training/tokenizer_qwen.hexa` scaffold (commit `5d155ce9`):
+  - §4 FFI extern 7개 주석 블록 (landing 시 uncomment)
+  - struct `QwenTokenizer` 에 `hxtok_h: int` 필드 (handle 은 hexa stage0 예약어 → `hxtok_h` 채택)
+  - `encode_bytes_bpe` body 에 `hxtok_h != 0` 분기 주석 (alloc_raw + peek_i64_at recipe)
+  - invariant: loaded=0 fall-through 경로 무변, inline smoke `PASS — JSON range scan + b2u OK` 동일 출력
+- `docs/alm_r12_hxtok_implementation_handoff_20260420.md` (hexa-lang 세션용 복붙 프롬프트, commit `4fb7f8b9`)
 
-다음 turn 이나 사용자 판단으로 5-6 scaffolding 착수 결정.
+## 16. Landing checkpoint
+
+§14 착지 순서 기준:
+- [x] 1. proposal commit (f52e9776)
+- [ ] 2. hxtok.c + hxtok.h (hexa-lang 세션)
+- [ ] 3. build 레시피 (Mac + Linux)
+- [ ] 4. C-side smoke + reference parity
+- [x] 5a. tokenizer_qwen.hexa scaffold — landing-safe (5d155ce9). FFI 호출부 uncomment 대기.
+- [ ] 5b. tokenizer_qwen.hexa Phase-2 load_qwen_tokenizer 가 hxtok_load 호출해 hxtok_h set
+- [ ] 6. train_alm_lora.hexa text_to_ids_stub 교체
+- [ ] 7. pod 1-step smoke (loss != log(16))
+- [ ] 8. 100-step smoke
+- [ ] 9. full r12 launch (P2+P3 PASS 조건)
