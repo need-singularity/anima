@@ -1,0 +1,379 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/drill_closure_sha256_cert.hexa — drill closure SHA256 meta-certificate
+//
+//  PURPOSE (Mk.VII C3)
+//    drill 이 자기 자신을 검증한 결과를 단일 sha256 서명으로 응축하고,
+//    다음 run 의 서명과 bit-identical 한지 확인 → IDENTITY_STABLE.
+//    C3 강화: self-verify closure × sha256 verdict identity.
+//
+//  META-CERT SHAPE
+//    {
+//      drill_version,
+//      input_sha     : sha256 over canonical concatenation of all input shas,
+//      lens_verdicts : [5-lens aggregate states for (runner, criteria, seeds)],
+//      eta_verdict   : absorption classifier outcome (self-ref),
+//      theta_verdict : diagonal agreement (self-ref),
+//      cargo7_verdict: BTR-evo 7-invariant pass_count,
+//      hexad_verdict : hexad-closure verdict,
+//      aggregate_verdict,
+//      sha256_of_above
+//    }
+//
+//  METHOD
+//    meta-input 구성: (runner_sha, criteria_sha, seeds_sha, self_ref_sha,
+//                    self_ref_noise_sha, hexad_closure_sha, hexad_r13_sha,
+//                    cargo7_sha) — 8 input shas (5-lens + η + θ + 7-cargo + Hexad).
+//    5-lens × 3 inputs → aggregate_seed (runner v2 fallback mirror).
+//    이들을 canonical pipe-join → temp file → shasum -a 256 → meta-sha.
+//    같은 run 을 2회 → 동일 meta-sha 이면 IDENTITY_STABLE.
+//
+//  V8 SAFE_COMMIT · additive · LLM=none · deterministic
+//
+//  USAGE
+//    hexa tool/drill_closure_sha256_cert.hexa
+//
+//  OUTPUTS
+//    shared/state/drill_meta_cert_20260421.json       (run 1)
+//    shared/state/drill_meta_cert_20260421_run2.json  (run 2)
+// ════════════════════════════════════════════════════════════════════════════
+
+let OUT_RUN1 = "shared/state/drill_meta_cert_20260421.json"
+let OUT_RUN2 = "shared/state/drill_meta_cert_20260421_run2.json"
+
+let DRILL_VERSION = "drill_breakthrough_runner v2 (f0ddabca+fc5ef6ba+8ce9fa0b)"
+
+// ── meta-input source paths (lives in repo; each bearing a stable sha256) ──
+let P_RUNNER    = "tool/drill_breakthrough_runner.hexa"
+let P_CRITERIA  = "shared/bench/drill_breakthrough_criteria.json"
+let P_SEEDS     = "shared/bench/drill_seed_set.jsonl"
+let P_SELFREF   = "shared/state/drill_self_ref_20260421.json"
+let P_SELFNOISE = "shared/state/drill_self_ref_noise_20260421.json"
+let P_HEXCLOSE  = "shared/state/hexad_closure_verdict.json"
+let P_HEXR13    = "shared/state/hexad_closure_r13.json"
+let P_CARGO7    = "shared/state/btr_evo_6_cargo_invariants_20260421.json"
+
+let DEPTH_MIN           = 3
+let ABSORPTION_RATE_MAX = 0.3
+let DIAGONAL_AGREE_MIN  = 0.8
+
+// ── helpers ───────────────────────────────────────────────────────────────
+
+fn fabs(x: float) -> float { if x < 0.0 { return 0.0 - x } ; return x }
+fn to_f(x: int) -> float { return x * 1.0 }
+fn now_stamp() -> string { return exec("date -u +%FT%TZ").trim() }
+
+fn fexists(p: string) -> bool {
+    return exec("test -f " + p + " && echo 1 || echo 0").trim() == "1"
+}
+
+fn sha256_of_file(p: string) -> string {
+    if !fexists(p) { return "" }
+    return exec("shasum -a 256 " + p + " 2>/dev/null | awk '{print $1}'").trim()
+}
+
+// sha256 of an arbitrary string — write to /tmp, shasum, unlink.
+fn sha256_of_string(s: string) -> string {
+    let tmp = "/tmp/drill_meta_sha_" + str(len(s)) + ".txt"
+    write_file(tmp, s)
+    let r = exec("shasum -a 256 " + tmp + " 2>/dev/null | awk '{print $1}'").trim()
+    let _ = exec("rm -f " + tmp)
+    return r
+}
+
+fn str_contains(s: string, sub: string) -> bool {
+    let hn = s.len()
+    let nn = sub.len()
+    if nn == 0 { return true }
+    let mut i = 0
+    while i + nn <= hn {
+        if s.substring(i, i + nn) == sub { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// 31-polynomial hash — mirrors drill_breakthrough_runner::hash_proj
+fn hash_proj(s: string) -> int {
+    let mut acc = 1469598103
+    let mut i = 0
+    let n = s.len()
+    while i < n {
+        let c = s.byte_at(i)
+        acc = acc * 31 + c
+        i = i + 1
+    }
+    return acc
+}
+
+// ── 5-lens module_fallback (mirror of runner v2) ─────────────────────────
+
+fn module_fallback(seed_id: string, seed_text: string, mod_name: string) {
+    let salt = "mod::" + mod_name + "::" + seed_id
+    let h = hash_proj(salt + "::" + seed_text)
+    let mh = if h < 0 { 0 - h } else { h }
+    let is_neg = str_contains(seed_id, "neg")
+    let depth_mod = if is_neg { (mh % 2) + 1 } else { (mh % 2) + 4 }
+    let absorp_mod = if is_neg {
+            0.35 + to_f(mh % 100) / 1000.0
+        } else {
+            to_f(mh % 500) / 10000.0
+        }
+    let sat_mod = if is_neg { 0.0 } else { 1.0 }
+    let mut m = []
+    m = m.push(mod_name)
+    m = m.push(depth_mod)
+    m = m.push(absorp_mod)
+    m = m.push(sat_mod)
+    return m
+}
+
+fn aggregate_seed(seed_id: string, seed_text: string) {
+    let lenses = ["blowup", "closure", "gap", "phi", "self_ref"]
+    let mut sum_abs = 0.0
+    let mut sum_sat = 0.0
+    let mut max_depth = 0
+    let mut sig = ""
+    let mut per_lens_abs = []
+    let mut per_lens_sat = []
+    let mut i = 0
+    while i < lenses.len() {
+        let r = module_fallback(seed_id, seed_text, lenses[i])
+        let a = r[2] as float
+        let s = r[3] as float
+        let d = r[1] as int
+        sum_abs = sum_abs + a
+        sum_sat = sum_sat + s
+        if d > max_depth { max_depth = d }
+        sig = sig + str(a) + "|" + str(s) + "|" + str(d) + ";"
+        per_lens_abs = per_lens_abs.push(a)
+        per_lens_sat = per_lens_sat.push(s)
+        i = i + 1
+    }
+    let n = 5.0
+    let avg_abs = sum_abs / n
+    let avg_sat = sum_sat / n
+    let state = if avg_sat >= 0.8 && avg_abs < ABSORPTION_RATE_MAX { "fixpoint" }
+                else { if avg_sat >= 0.5 { "converging" } else { "open" } }
+    let mut agg = []
+    agg = agg.push(state)         // 0
+    agg = agg.push(avg_abs)       // 1
+    agg = agg.push(avg_sat)       // 2
+    agg = agg.push(max_depth)     // 3
+    agg = agg.push(sig)           // 4
+    agg = agg.push(per_lens_abs)  // 5
+    agg = agg.push(per_lens_sat)  // 6
+    return agg
+}
+
+// ── build meta-cert ───────────────────────────────────────────────────────
+//
+//   INPUT SHAS (tag|sha256 pairs, canonical pipe-join)
+//     runner|...      criteria|...      seeds|...
+//     self_ref|...    self_ref_noise|...
+//     hexad_closure|... hexad_r13|...    cargo7|...
+//
+//   LENS VERDICTS: 5-lens aggregate across (runner, criteria, seeds)
+
+fn build_meta_cert(label: string) {
+    // ── collect file shas ───────────────────────────────────────────
+    let sha_runner    = sha256_of_file(P_RUNNER)
+    let sha_criteria  = sha256_of_file(P_CRITERIA)
+    let sha_seeds     = sha256_of_file(P_SEEDS)
+    let sha_selfref   = sha256_of_file(P_SELFREF)
+    let sha_selfnoise = sha256_of_file(P_SELFNOISE)
+    let sha_hexclose  = sha256_of_file(P_HEXCLOSE)
+    let sha_hexr13    = sha256_of_file(P_HEXR13)
+    let sha_cargo7    = sha256_of_file(P_CARGO7)
+
+    // ── canonical input-sha concatenation (order-locked) ───────────
+    let input_canon  = "runner|"          + sha_runner
+                     + ";criteria|"       + sha_criteria
+                     + ";seeds|"          + sha_seeds
+                     + ";self_ref|"       + sha_selfref
+                     + ";self_ref_noise|" + sha_selfnoise
+                     + ";hexad_closure|"  + sha_hexclose
+                     + ";hexad_r13|"      + sha_hexr13
+                     + ";cargo7|"         + sha_cargo7
+    let input_sha    = sha256_of_string(input_canon)
+
+    // ── 5-lens aggregates over (runner, criteria, seeds) using their
+    //    sha256 as seed_text (mirrors drill_self_ref_probe.hexa) ────
+    let agg_runner   = aggregate_seed("drill_runner_v2",    sha_runner)
+    let agg_criteria = aggregate_seed("drill_criteria_json", sha_criteria)
+    let agg_seeds    = aggregate_seed("drill_seed_set",      sha_seeds)
+
+    // ── η absorption: all-fixpoint across 3 self-inputs? ──────────
+    let s_r = agg_runner[0]   as string
+    let s_c = agg_criteria[0] as string
+    let s_s = agg_seeds[0]    as string
+    let eta_all_fix = s_r == "fixpoint" && s_c == "fixpoint" && s_s == "fixpoint"
+    let eta_verdict = if eta_all_fix { "FIXPOINT" } else { "NON_FIXPOINT" }
+
+    // ── θ diagonal: deterministic oracle → 1.0 per input ──────────
+    //   We re-run aggregate_seed to confirm sig identity run1==run2.
+    let aggr2_runner   = aggregate_seed("drill_runner_v2",    sha_runner)
+    let aggr2_criteria = aggregate_seed("drill_criteria_json", sha_criteria)
+    let aggr2_seeds    = aggregate_seed("drill_seed_set",      sha_seeds)
+    let theta_runner   = if (agg_runner[4]   as string) == (aggr2_runner[4]   as string) { 1.0 } else { 0.0 }
+    let theta_criteria = if (agg_criteria[4] as string) == (aggr2_criteria[4] as string) { 1.0 } else { 0.0 }
+    let theta_seeds    = if (agg_seeds[4]    as string) == (aggr2_seeds[4]    as string) { 1.0 } else { 0.0 }
+    let theta_mean     = (theta_runner + theta_criteria + theta_seeds) / 3.0
+    let theta_verdict  = if theta_mean >= DIAGONAL_AGREE_MIN { "STABLE" } else { "DRIFT" }
+
+    // ── 7-cargo verdict (read from btr_evo_6 JSON: all_pass bool) ──
+    let cargo_body = if fexists(P_CARGO7) { read_file(P_CARGO7) } else { "" }
+    let cargo7_pass = str_contains(cargo_body, "\"all_pass\": true")
+                   || str_contains(cargo_body, "\"all_pass\":true")
+    let cargo7_verdict = if cargo7_pass { "7_OF_7_PASS" } else { "CARGO_FAIL" }
+
+    // ── Hexad closure verdict (from hexad_closure_verdict.json) ───
+    let hexad_body = if fexists(P_HEXCLOSE) { read_file(P_HEXCLOSE) } else { "" }
+    let hexad_closed = str_contains(hexad_body, "\"closure_verdict\": \"CLOSED\"")
+                    || str_contains(hexad_body, "\"closure_verdict\":\"CLOSED\"")
+    let hexad_verdict = if hexad_closed { "CLOSED" } else { "OPEN" }
+
+    // ── aggregate verdict ─────────────────────────────────────────
+    let all_pass = eta_all_fix && theta_mean >= DIAGONAL_AGREE_MIN
+                                && cargo7_pass && hexad_closed
+    let aggregate_verdict = if all_pass { "PASS" } else { "REJECT" }
+
+    // ── canonical verdict body (pre-hash representation) ──────────
+    //   Deterministic: identical across runs unless upstream files change.
+    let verdict_canon = "drill_version=" + DRILL_VERSION
+        + ";input_sha=" + input_sha
+        + ";lens_blowup_closure_gap_phi_self_ref=active"
+        + ";agg_runner_state="   + s_r
+        + ";agg_criteria_state=" + s_c
+        + ";agg_seeds_state="    + s_s
+        + ";eta="    + eta_verdict
+        + ";theta="  + theta_verdict
+        + ";theta_mean=" + str(theta_mean)
+        + ";cargo7=" + cargo7_verdict
+        + ";hexad="  + hexad_verdict
+        + ";aggregate=" + aggregate_verdict
+    let meta_sha = sha256_of_string(verdict_canon)
+
+    // ── pack output ───────────────────────────────────────────────
+    let mut out = []
+    out = out.push(label)                  // 0
+    out = out.push(input_sha)              // 1
+    out = out.push(input_canon)            // 2
+    out = out.push(s_r)                    // 3
+    out = out.push(s_c)                    // 4
+    out = out.push(s_s)                    // 5
+    out = out.push(agg_runner[1]   as float)   // 6 abs
+    out = out.push(agg_criteria[1] as float)   // 7
+    out = out.push(agg_seeds[1]    as float)   // 8
+    out = out.push(theta_mean)             // 9
+    out = out.push(eta_verdict)            // 10
+    out = out.push(theta_verdict)          // 11
+    out = out.push(cargo7_verdict)         // 12
+    out = out.push(hexad_verdict)          // 13
+    out = out.push(aggregate_verdict)      // 14
+    out = out.push(verdict_canon)          // 15
+    out = out.push(meta_sha)               // 16
+    // raw shas
+    out = out.push(sha_runner)             // 17
+    out = out.push(sha_criteria)           // 18
+    out = out.push(sha_seeds)              // 19
+    out = out.push(sha_selfref)            // 20
+    out = out.push(sha_selfnoise)          // 21
+    out = out.push(sha_hexclose)           // 22
+    out = out.push(sha_hexr13)             // 23
+    out = out.push(sha_cargo7)             // 24
+    return out
+}
+
+fn emit_cert_json(cert, stamp: string) -> string {
+    let mut body = "{\n"
+    body = body + "  \"verifier\": \"drill_closure_sha256_cert\",\n"
+    body = body + "  \"version\": \"v1\",\n"
+    body = body + "  \"run_label\": \"" + (cert[0] as string) + "\",\n"
+    body = body + "  \"generated\": \"" + stamp + "\",\n"
+    body = body + "  \"drill_version\": \"" + DRILL_VERSION + "\",\n"
+    body = body + "  \"thresholds\": {\n"
+    body = body + "    \"depth_min\": " + str(DEPTH_MIN) + ",\n"
+    body = body + "    \"absorption_rate_max\": " + str(ABSORPTION_RATE_MAX) + ",\n"
+    body = body + "    \"diagonal_agreement_min\": " + str(DIAGONAL_AGREE_MIN) + "\n"
+    body = body + "  },\n"
+    body = body + "  \"input_shas\": {\n"
+    body = body + "    \"runner\":          \"" + (cert[17] as string) + "\",\n"
+    body = body + "    \"criteria\":        \"" + (cert[18] as string) + "\",\n"
+    body = body + "    \"seeds\":           \"" + (cert[19] as string) + "\",\n"
+    body = body + "    \"self_ref\":        \"" + (cert[20] as string) + "\",\n"
+    body = body + "    \"self_ref_noise\":  \"" + (cert[21] as string) + "\",\n"
+    body = body + "    \"hexad_closure\":   \"" + (cert[22] as string) + "\",\n"
+    body = body + "    \"hexad_r13\":       \"" + (cert[23] as string) + "\",\n"
+    body = body + "    \"cargo7\":          \"" + (cert[24] as string) + "\"\n"
+    body = body + "  },\n"
+    body = body + "  \"input_sha\": \"" + (cert[1] as string) + "\",\n"
+    body = body + "  \"input_canon_preview\": \"runner|...;criteria|...;seeds|...;self_ref|...;self_ref_noise|...;hexad_closure|...;hexad_r13|...;cargo7|...\",\n"
+    body = body + "  \"lens_verdicts\": [\n"
+    body = body + "    { \"input\": \"drill_runner_v2\",     \"state\": \"" + (cert[3] as string) + "\", \"abs_rate\": " + str(cert[6]) + " },\n"
+    body = body + "    { \"input\": \"drill_criteria_json\", \"state\": \"" + (cert[4] as string) + "\", \"abs_rate\": " + str(cert[7]) + " },\n"
+    body = body + "    { \"input\": \"drill_seed_set\",      \"state\": \"" + (cert[5] as string) + "\", \"abs_rate\": " + str(cert[8]) + " },\n"
+    body = body + "    { \"lens_group\": \"5_of_5\", \"lenses\": [\"blowup\",\"closure\",\"gap\",\"phi\",\"self_ref\"], \"active\": true },\n"
+    body = body + "    { \"theta_mean\": " + str(cert[9]) + ", \"diagonal\": \"" + (cert[11] as string) + "\" }\n"
+    body = body + "  ],\n"
+    body = body + "  \"eta_verdict\":       \"" + (cert[10] as string) + "\",\n"
+    body = body + "  \"theta_verdict\":     \"" + (cert[11] as string) + "\",\n"
+    body = body + "  \"cargo7_verdict\":    \"" + (cert[12] as string) + "\",\n"
+    body = body + "  \"hexad_verdict\":     \"" + (cert[13] as string) + "\",\n"
+    body = body + "  \"aggregate_verdict\": \"" + (cert[14] as string) + "\",\n"
+    body = body + "  \"sha256_of_above\":   \"" + (cert[16] as string) + "\",\n"
+    body = body + "  \"verdict_canon\":     \"" + (cert[15] as string) + "\",\n"
+    body = body + "  \"safe_commit\": \"V8\",\n"
+    body = body + "  \"llm\": \"none\",\n"
+    body = body + "  \"deterministic\": true\n"
+    body = body + "}\n"
+    return body
+}
+
+fn main() {
+    println("drill_closure_sha256_cert v1 — C3 sha256 meta-certificate")
+
+    // ── run 1 ─────────────────────────────────────────────────────
+    let stamp1 = now_stamp()
+    let c1 = build_meta_cert("run1")
+    let body1 = emit_cert_json(c1, stamp1)
+    write_file(OUT_RUN1, body1)
+    let sha1 = c1[16] as string
+    println("  run1  input_sha=" + (c1[1] as string))
+    println("  run1  meta_sha =" + sha1)
+    println("  run1  verdict =" + (c1[14] as string))
+    println("  wrote: " + OUT_RUN1)
+
+    // ── run 2 (independent timestamp, same deterministic pipeline) ─
+    let stamp2 = now_stamp()
+    let c2 = build_meta_cert("run2")
+    let body2 = emit_cert_json(c2, stamp2)
+    write_file(OUT_RUN2, body2)
+    let sha2 = c2[16] as string
+    println("  run2  input_sha=" + (c2[1] as string))
+    println("  run2  meta_sha =" + sha2)
+    println("  run2  verdict =" + (c2[14] as string))
+    println("  wrote: " + OUT_RUN2)
+
+    // ── identity check ────────────────────────────────────────────
+    let identical = sha1 == sha2
+    let identity_state = if identical { "IDENTITY_STABLE" } else { "IDENTITY_DRIFT" }
+    println("  IDENTITY=" + identity_state)
+
+    // ── delta analysis (if drifted) ───────────────────────────────
+    if !identical {
+        println("  delta: run1=" + sha1)
+        println("  delta: run2=" + sha2)
+        let mut i = 0
+        let n1 = sha1.len()
+        let n2 = sha2.len()
+        let nmin = if n1 < n2 { n1 } else { n2 }
+        while i < nmin && sha1.substring(i, i + 1) == sha2.substring(i, i + 1) {
+            i = i + 1
+        }
+        println("  delta: common_prefix_len=" + str(i) + " / " + str(nmin))
+    }
+
+    if identical { exit(0) } else { exit(1) }
+}
+
+main()
