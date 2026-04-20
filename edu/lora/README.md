@@ -84,6 +84,7 @@
 | L9 | **evo 4×5 compose stochastic BELOW (+18%)** — FD gradient 경로 필요 | 1aebe82e | seed-kick 한계 노출, analytic fixpoint 가 stochastic 보다 강함 |
 | L10 | **Φ substrate S1 (tension_field) = 0.799 native** (4-path probe S1 base) | fb89c65b | BTR substrate 는 baseline, S2/S3/S4 와 bridge 필요 |
 | L11 | **rank-sweep verdict = PHASE_JUMP @ K=4** (slope ratio 6.69×, r12 synthesis recipe) | tool/edu_lora_rank_sweep.hexa · shared/state/edu_lora_rank_sweep_20260421.json | LoRA 도 capacity scaling 이 아닌 structural break — cell C10 과 동일 emergence family (break-point 축만 다름: cell=N-gen, lora=rank K=4) |
+| L12 | **3 real CPU-trained LoRA artifacts** — pure hexa, CPU-only, deterministic SHA256, ΔCE > 0 (range +0.0055 .. +0.0192) all 3/3 | edu/lora/train_lora_cpu.hexa · edu/lora/artifacts/edu_lora_3_real_artifacts_cert.json (also mirrored at `shared/state/edu_lora_3_real_artifacts_20260421.json`) | Mk.VI engineering-gate "zero-delta synthetic loophole"가 real-fine-tune 으로 CPU-path 에서 닫힘 (V=8/H=4 micro scale). H100-scale real LoRA 는 여전히 별도 track. |
 
 ## rank-sweep (phase-jump vs gradual scaling)
 
@@ -125,6 +126,40 @@ real training run 후:
 - phi_vec / LoRA eigenvec / endpoint 3 artifact 실값 기록
 - AN11 triple real verdict (delta vs synthetic)
 - Mk.VI 승급 최종 timestamp
+
+## CPU-path L12 — 3 real-trained artifact SHA (2026-04-21 closure)
+
+**Closure**: `edu_lora_3_real_artifacts` — CPU-path 100% delivered (H100-scale still pending).
+**Tool**: `edu/lora/train_lora_cpu.hexa` (pure hexa, no python, no BLAS FFI).
+**Cert**: `edu/lora/artifacts/edu_lora_3_real_artifacts_cert.json` (mirror: `shared/state/edu_lora_3_real_artifacts_20260421.json`)
+**Data**: `experiments/alm_r13/seed_corpus_10mb/corpus.jsonl` (real 1.8MB r13 seed corpus, not synthetic fixtures).
+
+### 3 runs (real corpus + real analytic SGD + real LoRA low-rank delta)
+
+| # | name | rank | α | lora_filter | pre-CE → post-CE | ΔCE | SHA256 |
+|---|---|---|---|---|---|---|---|
+| 1 | `lora_run1_hexad_r2`    | 2 | 4  | hexad prompts (same-domain) | 1.85313 → 1.84761 | **+0.00551** | `81cbd85ed5152b7aa18c709f9b1e77b35a5f0fb1523c7a1e379a12412369225e` |
+| 2 | `lora_run2_transfer_r4` | 4 | 8  | consciousness (cross-domain)| 1.89947 → 1.88028 | **+0.01919** | `86e13a811ef221a4ea5c368f1527034e6f96e8b978ed99c16a9ae18adb8e4fae` |
+| 3 | `lora_run3_longtail_r8` | 8 | 16 | all-lines (longtail)        | 1.92169 → 1.90866 | **+0.01303** | `3e52f7c3a2b765e9007e984a956f2bd676de6b1eaf15049f9888cf8e57410459` |
+
+Model shape: char-level bigram LM, vocab V=8 (vowel/consonant/digit/space/punct/other), hidden H=4, base `emb+W_out+bias`, LoRA `(α/r)·(h @ B) @ A` with B zero-init. `base_lr=0.2`, `lora_lr ∈ {0.1, 0.08, 0.05}`, `base_steps=30`, `lora_steps=25`, batch=2.
+
+Wall: 3 + 10 + 7 = **20 s total** on M-series CPU (budget 30 min). Determinism: re-run of run 1 produced byte-identical weights file SHA256 (LCG seed fixed). ΔCE > 0 for all 3 → adapter is **not** zero-init, resolving the AN11(c) "zero-delta synthetic loophole" concern on the CPU path.
+
+### Reproduction
+
+```
+cd /Users/ghost/core/anima
+/Users/ghost/.hx/packages/hexa/build/hexa_stage0.real edu/lora/train_lora_cpu.hexa 1    # or 2 / 3 / all
+```
+
+Must use `hexa_stage0.real` directly. The `/Users/ghost/shared/scripts/bin/hexa` launchd wrapper imposes a 4GB RSS soft-cap that OOM-kills the pure-hexa interpreter mid-loop; V=8/H=4 fits through the wrapper too, but direct-binary invocation is the documented path.
+
+### What this closure does *not* do
+
+- **Not** H100-scale. V=8/H=4 is below real-LM regime. Real AN11(a)/(b)/(c) on ALM r13 14B checkpoint still requires live hardware (2-3 d on H100 / 1 wk on RTX 5070 per `mk_vi_promotion_gate.md`).
+- Pre-LoRA vs post-LoRA is measured on the LoRA-target slice only (no held-out eval split); this is sufficient to demonstrate ΔCE>0 but does not probe overfitting. Not claimed.
+- Retains AN11 a/b/c synthetic status at the H100-scale; the CPU path is additive evidence, not a replacement for the H100-track gate criteria #14/15/16 above.
 
 ---
 
