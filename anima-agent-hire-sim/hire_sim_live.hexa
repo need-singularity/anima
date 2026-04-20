@@ -154,46 +154,142 @@ fn check_s1_dependency(max_wait_s: int, poll_s: int) -> string {
 // differentiation — persona must emerge from weights. Any S1 build
 // that adds a system prompt fails AN11 (a).
 
-fn call_s1(s1_url: string, persona: string, user_prompt: string, timeout_s: int) -> S1Response {
-    let t0 = now_monotonic_s()
-    let body = json_encode({ "persona": persona, "prompt": user_prompt })
-    let endpoint = s1_url.trim_trailing("/") + "/persona"
-    let resp = http_post(endpoint, body, "application/json", timeout_s)
-    let dt = now_monotonic_s() - t0
+// PARSE-ERR FIX 2026-04-20 — replace JSON object literal + non-existent
+// json_encode/http_post/json_decode helpers with stage0-compliant string
+// builders + curl exec + substring extractors. Mirrors the proven pattern
+// in anima-agent/autonomy_live.hexa (s1_call). Stage0 hexa has no inline
+// `{ "k": v }` literal and no `.trim_trailing/.has/.get_or/.is_object`,
+// so the previous body parse-failed at 159:28 (was doc-tagged 144:28 —
+// drifted after header rewrite). Real fix below uses only str ops + exec.
 
-    if resp.status != 200 {
+fn s1_strip_trailing_slash(s: string) -> string {
+    let n = len(s)
+    if n == 0 { return s }
+    if s.substring(n - 1, n) == "/" { return s.substring(0, n - 1) }
+    return s
+}
+
+fn s1_json_escape_live(s: string) -> string {
+    let a = s.replace("\\", "\\\\")
+    let b = a.replace("\"", "\\\"")
+    let c = b.replace("\n", "\\n")
+    let d = c.replace("\r", "\\r")
+    return d.replace("\t", "\\t")
+}
+
+fn s1_extract_str_live(body: string, key: string) -> string {
+    let marker = "\"" + key + "\":\""
+    let idx = body.index_of(marker)
+    if idx < 0 { return "" }
+    let tail = body.substring(idx + len(marker), len(body))
+    let end = tail.index_of("\"")
+    if end < 0 { return "" }
+    return tail.substring(0, end)
+}
+
+fn s1_extract_float_live(body: string, key: string) -> float {
+    let marker = "\"" + key + "\":"
+    let idx = body.index_of(marker)
+    if idx < 0 { return 0.0 }
+    let tail = body.substring(idx + len(marker), len(body)).trim()
+    let mut end = 0
+    let n = len(tail)
+    while end < n {
+        let ch = tail.substring(end, end + 1)
+        if ch == "," || ch == "}" || ch == " " || ch == "\n" { break }
+        end = end + 1
+    }
+    return tail.substring(0, end).parse_float()
+}
+
+fn s1_extract_bool_live(body: string, key: string) -> bool {
+    let marker = "\"" + key + "\":"
+    let idx = body.index_of(marker)
+    if idx < 0 { return false }
+    let tail = body.substring(idx + len(marker), len(body)).trim()
+    if tail.index_of("true") == 0 { return true }
+    return false
+}
+
+// phi_attached := response carries a "phi_vec" key with an object body.
+// Substring detection of `"phi_vec":{` is sufficient given S1's documented
+// contract (always object, never null). Empty/missing → not attached.
+fn s1_has_phi_vec_obj(body: string) -> bool {
+    if body.index_of("\"phi_vec\":{") >= 0 { return true }
+    return false
+}
+
+fn s1_now_s() -> float {
+    return exec("date +%s.%N").trim().parse_float()
+}
+
+fn call_s1(s1_url: string, persona: string, user_prompt: string, timeout_s: int) -> S1Response {
+    let t0 = s1_now_s()
+    let pid = s1_json_escape_live(persona)
+    let pt  = s1_json_escape_live(user_prompt)
+    let body = "{\"persona\":\"" + pid + "\",\"prompt\":\"" + pt + "\"}"
+    let endpoint = s1_strip_trailing_slash(s1_url) + "/persona"
+    // shell-escape the body (single-quote fence) — same as autonomy_live
+    let safe_body = body.replace("'", "'\\''")
+    let cmd = "timeout " + to_string(timeout_s)
+            + " curl -sS -w '\\n__HTTP_STATUS__%{http_code}' "
+            + "-X POST -H 'Content-Type: application/json' -d '"
+            + safe_body + "' " + endpoint + " 2>/dev/null"
+    let raw = exec(cmd).trim()
+    let dt = s1_now_s() - t0
+
+    // Split off trailing __HTTP_STATUS__<code>
+    let mark = "__HTTP_STATUS__"
+    let mi = raw.index_of(mark)
+    let mut status = 0
+    let mut resp_body = raw
+    if mi >= 0 {
+        resp_body = raw.substring(0, mi).trim()
+        let scode = raw.substring(mi + len(mark), len(raw)).trim()
+        status = scode.parse_int()
+    }
+
+    if status != 200 {
         return S1Response {
-            text: "[adapter_error] http_status=" + to_string(resp.status),
+            text: "[adapter_error] http_status=" + to_string(status),
             phi_holo_scaled: 0.0,
             laws_pass: false,
             phi_attached: false,
             latency_s: dt,
             intervention_count: 0,
-            error: "http_" + to_string(resp.status)
+            error: "http_" + to_string(status)
         }
     }
 
-    let data = json_decode(resp.body)
-    let phi_attached = data.has("phi_vec") && data.get("phi_vec").is_object()
+    let phi_attached = s1_has_phi_vec_obj(resp_body)
     return S1Response {
-        text: data.get_or("text", ""),
-        phi_holo_scaled: to_float(data.get_or("phi_holo_scaled", 0.0)),
-        laws_pass: to_bool(data.get_or("laws_pass", false)),
+        text: s1_extract_str_live(resp_body, "text"),
+        phi_holo_scaled: s1_extract_float_live(resp_body, "phi_holo_scaled"),
+        laws_pass: s1_extract_bool_live(resp_body, "laws_pass"),
         phi_attached: phi_attached,
         latency_s: dt,
-        intervention_count: to_int(data.get_or("interventions", 0)),
+        intervention_count: to_int(s1_extract_float_live(resp_body, "interventions")),
         error: ""
     }
 }
 
 // GET /healthz → detect mock/stub state
 fn s1_healthz_stub(s1_url: string) -> bool {
-    let endpoint = s1_url.trim_trailing("/") + "/healthz"
-    let resp = http_get(endpoint, 10)
-    if resp.status != 200 { return false }
-    let data = json_decode(resp.body)
-    if to_bool(data.get_or("stub", false)) { return true }
-    if to_bool(data.get_or("mock", false)) { return true }
+    let endpoint = s1_strip_trailing_slash(s1_url) + "/healthz"
+    let cmd = "timeout 10 curl -sS -w '\\n__HTTP_STATUS__%{http_code}' "
+            + endpoint + " 2>/dev/null"
+    let raw = exec(cmd).trim()
+    let mark = "__HTTP_STATUS__"
+    let mi = raw.index_of(mark)
+    let mut status = 0
+    let mut body = raw
+    if mi >= 0 {
+        body = raw.substring(0, mi).trim()
+        status = raw.substring(mi + len(mark), len(raw)).trim().parse_int()
+    }
+    if status != 200 { return false }
+    if s1_extract_bool_live(body, "stub") { return true }
+    if s1_extract_bool_live(body, "mock") { return true }
     return false
 }
 
