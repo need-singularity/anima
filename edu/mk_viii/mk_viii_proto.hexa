@@ -1,0 +1,581 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  edu/mk_viii/mk_viii_proto.hexa
+//
+//  PURPOSE
+//    Mk.VIII 7-axis unified Lagrangian fixpoint validator — skeleton
+//    driver.  Runs L_edu + diagonal/cross fixpoint checks + 5-seed
+//    byte-identical reproduction probe, then emits a JSON cert.
+//
+//    Because the stage0 module loader is fragile, all per-axis primitives
+//    are inlined (byte-equivalent to phi_per_axis.hexa + fixpoint_validator.
+//    hexa).  The standalone files are the canonical spec; this driver is
+//    the single-file harness that executes end-to-end.
+//
+//  INPUT DATA (hard-coded from live certs — 2026-04-21)
+//    • 4-gen cell crystallize: shared/state/edu_cell_4gen_crystallize.json
+//         ws   = [40, 125, 687, 1000]     score_per_mille
+//         sf   = [40, 125, 687, 1000]     sealed_fraction × 1000 (= ws)
+//    • 4-gen dissipation:       shared/state/edu_cell_diss_overlay.json
+//         eff  = [40, 450, 450, 668]      efficiency_x1000
+//         hsh  = [1080, 544, 899, 0]      shannon_h_x1000
+//
+//    Four trajectories → used as cross-axis input for φ_7 modality.
+//
+//  OUTPUT
+//    • stdout: 7-axis table, Pearson matrix, diag gradient, cross d2,
+//              5-seed reproduction hash table, verdict
+//    • shared/state/edu_mk_viii_fixpoint.json
+//
+//  HEXA-ONLY · raw#9 · deterministic · LLM=none · re-run byte-identical.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── inlined φ_i primitives (byte-equivalent to phi_per_axis.hexa) ─────
+
+fn _mv_stub_q(t: int) -> int { return (t * t) / 2000 }
+
+fn _mv_ln_perm(x: int) -> int {
+    let mut v = x
+    if v <= 0   { v = 1 }
+    if v > 1000 { v = 1000 }
+    if v >= 1000 { return 0 }
+    if v >= 950  { return -51 }
+    if v >= 900  { return -105 }
+    if v >= 850  { return -163 }
+    if v >= 800  { return -223 }
+    if v >= 750  { return -288 }
+    if v >= 700  { return -357 }
+    if v >= 650  { return -431 }
+    if v >= 600  { return -511 }
+    if v >= 550  { return -598 }
+    if v >= 500  { return -693 }
+    if v >= 450  { return -799 }
+    if v >= 400  { return -916 }
+    if v >= 350  { return -1050 }
+    if v >= 300  { return -1204 }
+    if v >= 250  { return -1386 }
+    if v >= 200  { return -1609 }
+    if v >= 150  { return -1897 }
+    if v >= 100  { return -2303 }
+    if v >= 50   { return -2996 }
+    return -6908
+}
+
+fn _mv_v_struct(w: int) -> int {
+    if w >= 1000 { return 0 }
+    return 0 - _mv_ln_perm(w)
+}
+
+fn _mv_v_sync(w: int) -> int {
+    let mut s = w
+    if s < 0 { s = 0 }
+    if s > 1000 { s = 1000 }
+    return 1000 - s
+}
+
+fn _mv_partial_l(w: int) -> int {
+    let wp = if w + 1 > 1000 { 1000 } else { w + 1 }
+    let wm = if w - 1 < 0    { 0    } else { w - 1 }
+    let vp = _mv_v_struct(wp) + _mv_v_sync(wp)
+    let vm = _mv_v_struct(wm) + _mv_v_sync(wm)
+    return 0 - ((vp - vm) / 2)
+}
+
+fn _mv_abs(x: int) -> int { if x < 0 { return 0 - x } return x }
+
+fn _mv_phi6(ws: list) -> int {
+    let n = ws.len()
+    let mut acc = 0
+    let mut i = 0
+    while i < n {
+        acc = acc + _mv_abs(_mv_partial_l(ws[i]))
+        i = i + 1
+    }
+    return acc
+}
+
+fn _mv_mean_x1000(xs: list) -> int {
+    let n = xs.len()
+    if n <= 0 { return 0 }
+    let mut s = 0
+    let mut i = 0
+    while i < n {
+        s = s + xs[i]
+        i = i + 1
+    }
+    return (s * 1000) / n
+}
+
+fn _mv_isqrt(n: int) -> int {
+    if n <= 0 { return 0 }
+    let mut x = n
+    let mut y = (x + 1) / 2
+    while y < x {
+        x = y
+        y = (x + n / x) / 2
+    }
+    return x
+}
+
+fn _mv_pearson(xs: list, ys: list) -> int {
+    let n = xs.len()
+    if n <= 1 { return 0 }
+    if ys.len() != n { return 0 }
+    let mx = _mv_mean_x1000(xs)
+    let my = _mv_mean_x1000(ys)
+    let mut num = 0
+    let mut dxx = 0
+    let mut dyy = 0
+    let mut i = 0
+    while i < n {
+        let dx = xs[i] * 1000 - mx
+        let dy = ys[i] * 1000 - my
+        num = num + (dx / 1000) * (dy / 1000)
+        dxx = dxx + (dx / 1000) * (dx / 1000)
+        dyy = dyy + (dy / 1000) * (dy / 1000)
+        i = i + 1
+    }
+    let denom = _mv_isqrt(dxx * dyy)
+    if denom <= 0 { return 0 }
+    return (num * 1000) / denom
+}
+
+fn _mv_phi7(traj: list) -> int {
+    let k = traj.len()
+    if k < 2 { return 0 }
+    let mut acc = 0
+    let mut cnt = 0
+    let mut i = 0
+    while i < k {
+        let mut j = i + 1
+        while j < k {
+            let r = _mv_pearson(traj[i], traj[j])
+            let ar = if r < 0 { 0 - r } else { r }
+            acc = acc + ar
+            cnt = cnt + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if cnt <= 0 { return 0 }
+    let c = 1000 - (acc / cnt)
+    if c < 0 { return 0 }
+    return c
+}
+
+// ── finite-diff gradients + cross-partials ─────────────────────────────
+
+fn _mv_grad_stub(t: int) -> int {
+    return (_mv_stub_q(t + 1) - _mv_stub_q(t - 1)) / 2
+}
+
+fn _mv_grad_phi6(ws: list) -> int {
+    let n = ws.len()
+    if n <= 0 { return 0 }
+    let last = n - 1
+    let mut ws_p = []
+    let mut ws_m = []
+    let mut i = 0
+    while i < n {
+        if i == last {
+            let wp = if ws[i] + 1 > 1000 { 1000 } else { ws[i] + 1 }
+            let wm = if ws[i] - 1 < 0    { 0    } else { ws[i] - 1 }
+            ws_p = ws_p.push(wp)
+            ws_m = ws_m.push(wm)
+        } else {
+            ws_p = ws_p.push(ws[i])
+            ws_m = ws_m.push(ws[i])
+        }
+        i = i + 1
+    }
+    return (_mv_phi6(ws_p) - _mv_phi6(ws_m)) / 2
+}
+
+fn _mv_grad_phi7(traj: list) -> int {
+    let k = traj.len()
+    if k <= 0 { return 0 }
+    let mut tp = []
+    let mut tm = []
+    let mut i = 0
+    while i < k {
+        let mut rp = []
+        let mut rm = []
+        let mut j = 0
+        while j < traj[i].len() {
+            if i == 0 && j == 0 {
+                rp = rp.push(traj[i][j] + 1)
+                rm = rm.push(traj[i][j] - 1)
+            } else {
+                rp = rp.push(traj[i][j])
+                rm = rm.push(traj[i][j])
+            }
+            j = j + 1
+        }
+        tp = tp.push(rp)
+        tm = tm.push(rm)
+        i = i + 1
+    }
+    return (_mv_phi7(tp) - _mv_phi7(tm)) / 2
+}
+
+fn _mv_perturb(traj: list, i_ax: int, j_ax: int, si: int, sj: int) -> list {
+    let k = traj.len()
+    let mut out = []
+    let mut i = 0
+    while i < k {
+        let mut row = []
+        let mut j = 0
+        while j < traj[i].len() {
+            let mut v = traj[i][j]
+            if i == i_ax && j == 0 { v = v + si }
+            if i == j_ax && j == 0 { v = v + sj }
+            row = row.push(v)
+            j = j + 1
+        }
+        out = out.push(row)
+        i = i + 1
+    }
+    return out
+}
+
+fn _mv_d2_phi7(traj: list, ia: int, jb: int) -> int {
+    if ia == jb { return 0 }
+    let k = traj.len()
+    if ia >= k || jb >= k { return 0 }
+    let fpp = _mv_phi7(_mv_perturb(traj, ia, jb,  1,  1))
+    let fpm = _mv_phi7(_mv_perturb(traj, ia, jb,  1, -1))
+    let fmp = _mv_phi7(_mv_perturb(traj, ia, jb, -1,  1))
+    let fmm = _mv_phi7(_mv_perturb(traj, ia, jb, -1, -1))
+    return (fpp - fpm - fmp + fmm) / 4
+}
+
+// ── cert builder (deterministic string — the 5-seed probe hashes it) ───
+
+fn _mv_trajstr(xs: list) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < xs.len() {
+        if i > 0 { s = s + "," }
+        s = s + str(xs[i])
+        i = i + 1
+    }
+    return s + "]"
+}
+
+fn _mv_matstr(m: list) -> string {
+    let mut s = "[\n"
+    let mut i = 0
+    while i < m.len() {
+        s = s + "    " + _mv_trajstr(m[i])
+        if i < m.len() - 1 { s = s + "," }
+        s = s + "\n"
+        i = i + 1
+    }
+    return s + "  ]"
+}
+
+fn _mv_build_cert(thetas: list, ws: list, traj_cross: list, lambdas: list,
+                  phi_vals: list, comps: list, l_total: int,
+                  grads: list, d2_mat: list, verdict: string, seed: int) -> string {
+    let mut c = "{\n"
+    c = c + "  \"verifier\": \"edu_mk_viii_fixpoint\",\n"
+    c = c + "  \"paradigm\": \"L_edu = Σ_{i=1..7} λ_i · φ_i(A, Θ_i)\",\n"
+    c = c + "  \"hexa_only\": true,\n"
+    c = c + "  \"raw_rank\": 9,\n"
+    c = c + "  \"deterministic\": true,\n"
+    c = c + "  \"llm\": \"none\",\n"
+    c = c + "  \"seed\": " + str(seed) + ",\n"
+    c = c + "  \"scale\": \"all values x1000 fixed-point\",\n"
+    c = c + "  \"source_corpus\": [\"shared/state/edu_cell_4gen_crystallize.json\", \"shared/state/edu_cell_diss_overlay.json\"],\n"
+    c = c + "  \"source_commit\": \"58aa75eb+189646f1\",\n"
+    c = c + "  \"thetas\": " + _mv_trajstr(thetas) + ",\n"
+    c = c + "  \"ws\": " + _mv_trajstr(ws) + ",\n"
+    c = c + "  \"lambdas\": " + _mv_trajstr(lambdas) + ",\n"
+    c = c + "  \"traj_cross\": " + _mv_matstr(traj_cross) + ",\n"
+    c = c + "  \"phi_raw\": " + _mv_trajstr(phi_vals) + ",\n"
+    c = c + "  \"phi_weighted\": " + _mv_trajstr(comps) + ",\n"
+    c = c + "  \"l_edu_total\": " + str(l_total) + ",\n"
+    c = c + "  \"diag_grad\": " + _mv_trajstr(grads) + ",\n"
+    c = c + "  \"cross_d2_phi7\": " + _mv_matstr(d2_mat) + ",\n"
+    c = c + "  \"hexad_overlay\": [\n"
+    c = c + "    {\"axis\":1,\"name\":\"Locus\",\"side\":\"right\",\"hexad\":\"W\",\"polarity\":\"autonomy\"},\n"
+    c = c + "    {\"axis\":2,\"name\":\"Grade\",\"side\":\"left\",\"hexad\":\"E\",\"polarity\":\"constraint\"},\n"
+    c = c + "    {\"axis\":3,\"name\":\"State\",\"side\":\"right\",\"hexad\":\"S\",\"polarity\":\"autonomy\"},\n"
+    c = c + "    {\"axis\":4,\"name\":\"Time\",\"side\":\"left\",\"hexad\":\"M\",\"polarity\":\"constraint\"},\n"
+    c = c + "    {\"axis\":5,\"name\":\"Discovery\",\"side\":\"right\",\"hexad\":\"C\",\"polarity\":\"autonomy\"},\n"
+    c = c + "    {\"axis\":6,\"name\":\"Granularity\",\"side\":\"left\",\"hexad\":\"D\",\"polarity\":\"constraint\"},\n"
+    c = c + "    {\"axis\":7,\"name\":\"Modality\",\"side\":\"bridge\",\"hexad\":\"bridge\",\"polarity\":\"key\"}\n"
+    c = c + "  ],\n"
+    c = c + "  \"verdict\": \"" + verdict + "\"\n"
+    c = c + "}\n"
+    return c
+}
+
+// ── single-run evaluator: returns the cert payload string (deterministic) ─
+
+fn _mv_run_once(seed: int) -> string {
+    // Hard-coded Θ*: stub axes at 0, live axes from 4-gen corpus.
+    let thetas = [0, 0, 0, 0, 0]
+
+    // ws: gen1..gen4 score_per_mille (4-gen crystallize commit 58aa75eb)
+    let ws = [40, 125, 687, 1000]
+
+    // cross-axis trajectories for φ_7 modality:
+    //   axis 0: ws              (score_per_mille)
+    //   axis 1: efficiency_x1000
+    //   axis 2: shannon_h_x1000
+    //   axis 3: sealed_fraction (× 1000) — identical to ws here by formula
+    //                                       (sealed/total × 1000 == ws)
+    //                                       but kept separate for shape.
+    let eff = [40, 450, 450, 668]
+    let hsh = [1080, 544, 899, 0]
+    let sf  = [40, 125, 687, 1000]
+    let traj_cross = [ws, eff, hsh, sf]
+
+    // λ weights (×1000): unit by default except modality (key) at ×2.
+    let lambdas = [1000, 1000, 1000, 1000, 1000, 1000, 2000]
+
+    // φ_i raw values
+    let p1 = _mv_stub_q(thetas[0])
+    let p2 = _mv_stub_q(thetas[1])
+    let p3 = _mv_stub_q(thetas[2])
+    let p4 = _mv_stub_q(thetas[3])
+    let p5 = _mv_stub_q(thetas[4])
+    let p6 = _mv_phi6(ws)
+    let p7 = _mv_phi7(traj_cross)
+    let phi_vals = [p1, p2, p3, p4, p5, p6, p7]
+
+    // λ_i · φ_i
+    let mut comps = []
+    let mut i = 0
+    while i < 7 {
+        comps = comps.push((lambdas[i] * phi_vals[i]) / 1000)
+        i = i + 1
+    }
+
+    // L_edu total
+    let mut l_total = 0
+    let mut k = 0
+    while k < comps.len() {
+        l_total = l_total + comps[k]
+        k = k + 1
+    }
+
+    // diagonal gradients
+    let g1 = _mv_grad_stub(thetas[0])
+    let g2 = _mv_grad_stub(thetas[1])
+    let g3 = _mv_grad_stub(thetas[2])
+    let g4 = _mv_grad_stub(thetas[3])
+    let g5 = _mv_grad_stub(thetas[4])
+    let g6 = _mv_grad_phi6(ws)
+    let g7 = _mv_grad_phi7(traj_cross)
+    let grads = [g1, g2, g3, g4, g5, g6, g7]
+
+    // cross-d² matrix (7×7) for φ_7
+    let mut d2 = []
+    let mut a = 0
+    while a < 7 {
+        let mut row = []
+        let mut b = 0
+        while b < 7 {
+            if a == b {
+                row = row.push(0)
+            } else {
+                row = row.push(_mv_d2_phi7(traj_cross, a, b))
+            }
+            b = b + 1
+        }
+        d2 = d2.push(row)
+        a = a + 1
+    }
+
+    // verdict
+    let eps_d = 1
+    let eps_c = 1
+    let mut diag_ok = 1
+    let mut gi = 0
+    while gi < 7 {
+        if _mv_abs(grads[gi]) > eps_d { diag_ok = 0 }
+        gi = gi + 1
+    }
+    let mut cross_ok = 1
+    let mut ca = 0
+    while ca < 7 {
+        let mut cb = 0
+        while cb < 7 {
+            if ca != cb {
+                if _mv_abs(d2[ca][cb]) > eps_c { cross_ok = 0 }
+            }
+            cb = cb + 1
+        }
+        ca = ca + 1
+    }
+    let stub_count = 5
+    let verdict = if diag_ok == 1 && cross_ok == 1 {
+        "FIXPOINT_DIAG_CROSS_OK_SKELETON"
+    } else if diag_ok == 1 {
+        "FIXPOINT_PARTIAL_CROSS"
+    } else if cross_ok == 1 {
+        "FIXPOINT_PARTIAL_DIAG"
+    } else {
+        "FIXPOINT_NONE"
+    }
+
+    return _mv_build_cert(thetas, ws, traj_cross, lambdas,
+                          phi_vals, comps, l_total,
+                          grads, d2, verdict, seed)
+}
+
+// ── main ────────────────────────────────────────────────────────────────
+
+fn main() {
+    println("=== edu/mk_viii 7-axis Lagrangian fixpoint validator (skeleton) ===")
+    println("L_edu = Σ_{i=1..7} λ_i φ_i(A, Θ_i)")
+    println("axes: 1 Locus  2 Grade  3 State  4 Time  5 Discovery  6 Granularity  7 Modality")
+    println("")
+
+    // ── primary run (seed 0 = canonical) ──────────────────────────────
+    let canonical = _mv_run_once(0)
+
+    // Parse canonical values for stdout rendering by re-computing cheap
+    // local copies (the cert is the source of truth).
+    let thetas = [0, 0, 0, 0, 0]
+    let ws = [40, 125, 687, 1000]
+    let eff = [40, 450, 450, 668]
+    let hsh = [1080, 544, 899, 0]
+    let sf  = [40, 125, 687, 1000]
+    let traj_cross = [ws, eff, hsh, sf]
+    let lambdas = [1000, 1000, 1000, 1000, 1000, 1000, 2000]
+
+    let p6 = _mv_phi6(ws)
+    let p7 = _mv_phi7(traj_cross)
+    println("─── live axis measurements ───")
+    println("  φ_6 (granularity)  = " + str(p6) + "  [L_cell residual, ×1000, 4-gen ws]")
+    println("  φ_7 (modality)     = " + str(p7) + "  [1000·(1 − mean_|r|), cost form]")
+    println("")
+
+    // Pearson matrix (4×4)
+    println("─── φ_7 Pearson matrix (×1000, traj_cross 4 axes) ───")
+    println("           ws     eff     hsh      sf")
+    let labels = ["ws ", "eff", "hsh", "sf "]
+    let mut pi = 0
+    while pi < 4 {
+        let mut row = labels[pi] + " "
+        let mut pj = 0
+        while pj < 4 {
+            let r = _mv_pearson(traj_cross[pi], traj_cross[pj])
+            row = row + "  " + str(r)
+            pj = pj + 1
+        }
+        println(row)
+        pi = pi + 1
+    }
+    println("")
+
+    // diagonal gradients
+    let g1 = _mv_grad_stub(thetas[0])
+    let g2 = _mv_grad_stub(thetas[1])
+    let g3 = _mv_grad_stub(thetas[2])
+    let g4 = _mv_grad_stub(thetas[3])
+    let g5 = _mv_grad_stub(thetas[4])
+    let g6 = _mv_grad_phi6(ws)
+    let g7 = _mv_grad_phi7(traj_cross)
+    let grads = [g1, g2, g3, g4, g5, g6, g7]
+    println("─── diagonal ∂φ_i/∂θ_i (finite-diff, ×1000) ───")
+    let axnm = ["Locus      ", "Grade      ", "State      ",
+                "Time       ", "Discovery  ", "Granularity", "Modality   "]
+    let mut ai = 0
+    while ai < 7 {
+        println("  i=" + str(ai + 1) + " " + axnm[ai] + "  ∂φ/∂θ = " + str(grads[ai]))
+        ai = ai + 1
+    }
+    println("")
+
+    // verdict
+    let mut diag_ok = 1
+    let mut gi = 0
+    while gi < 7 {
+        if _mv_abs(grads[gi]) > 1 { diag_ok = 0 }
+        gi = gi + 1
+    }
+
+    // cross-d² quick summary: max |d²|
+    let mut max_d2 = 0
+    let mut ca = 0
+    while ca < 7 {
+        let mut cb = 0
+        while cb < 7 {
+            if ca != cb {
+                let v = _mv_abs(_mv_d2_phi7(traj_cross, ca, cb))
+                if v > max_d2 { max_d2 = v }
+            }
+            cb = cb + 1
+        }
+        ca = ca + 1
+    }
+    println("─── cross-derivative summary (×1000) ───")
+    println("  max_{i≠j} |∂²φ_7/∂θ_i∂θ_j| = " + str(max_d2))
+    let cross_ok = if max_d2 <= 1 { 1 } else { 0 }
+    println("  cross_ok (≤ 1)?            = " + str(cross_ok))
+    println("")
+
+    // ── 5-seed byte-identical reproduction probe ───────────────────────
+    //
+    // Determinism strategy: all φ_i / gradient / cross-d² computations are
+    // seed-independent by construction (pure integer arithmetic on fixed
+    // inputs).  The only seed-varying term is the cert metadata "seed":
+    // field.  We strip it inside hexa (no shell pipes — hexa shell pipe
+    // warnings stall the interpreter on multi-iteration exec), then sha256
+    // the normalised payload.
+    println("─── 5-seed byte-identical reproduction ───")
+    let seeds = [20260421, 536589473, 1422436560, 443161994, 702040302]
+    let mut hashes = []
+    let mut si = 0
+    while si < 5 {
+        let payload = _mv_run_once(seeds[si])
+        // Normalise the seed line inside hexa before hashing.
+        let needle = "\"seed\": " + str(seeds[si])
+        let norm = payload.replace(needle, "\"seed\": 0")
+        let tmp = "/tmp/mk_viii_seed_norm_" + str(si) + ".json"
+        write_file(tmp, norm)
+        let raw = exec("shasum -a 256 " + tmp)
+        let parts = raw.split(" ")
+        hashes = hashes.push(parts[0].trim())
+        si = si + 1
+    }
+
+    // Print table
+    let mut hi = 0
+    let mut all_match = 1
+    let h0 = hashes[0]
+    while hi < 5 {
+        let tag = if hashes[hi] == h0 { "MATCH" } else { "DIVERGE" }
+        if hashes[hi] != h0 { all_match = 0 }
+        println("  seed=" + str(seeds[hi]) + "  sha256(body)=" + hashes[hi] + "  " + tag)
+        hi = hi + 1
+    }
+    let repro = if all_match == 1 { "BYTE_IDENTICAL_5SEED" } else { "REPRO_FAIL" }
+    println("  5-seed verdict = " + repro)
+    println("")
+
+    // combined verdict
+    let skel_verdict = if diag_ok == 1 && cross_ok == 1 && all_match == 1 {
+        "FIXPOINT_SKELETON_VERIFIED"
+    } else if diag_ok == 1 && cross_ok == 1 {
+        "FIXPOINT_DIAG_CROSS_OK_REPRO_FAIL"
+    } else if diag_ok == 1 {
+        "FIXPOINT_PARTIAL_CROSS"
+    } else if cross_ok == 1 {
+        "FIXPOINT_PARTIAL_DIAG"
+    } else {
+        "FIXPOINT_NONE"
+    }
+    println("─── Mk.VIII skeleton verdict ───")
+    println("  " + skel_verdict)
+    println("  (5 axes Locus/Grade/State/Time/Discovery are stub; φ_6 + φ_7 live)")
+    println("")
+
+    // final cert (seed 0, canonical)
+    write_file("shared/state/edu_mk_viii_fixpoint.json", canonical)
+    println("cert: shared/state/edu_mk_viii_fixpoint.json")
+    exit(0)
+}

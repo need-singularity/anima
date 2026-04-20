@@ -1,0 +1,326 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  edu/mk_viii/fixpoint_validator.hexa
+//
+//  PURPOSE
+//    Given Θ* (candidate fixpoint) and the live trajectory data (ws,
+//    traj_cross), decide whether Θ* satisfies the Mk.VIII fixpoint
+//    condition:
+//
+//      (1) ∀ i ∈ {1..7}:  |∂φ_i / ∂θ_i| (finite-diff) ≤ ε_diag
+//      (2) ∀ i ≠ j ∈ {1..7}:  |∂²φ_7 / ∂θ_i ∂θ_j| ≤ ε_cross
+//
+//    Both tolerances default to 1 (per-mille).  Condition (3), byte-identical
+//    5-seed reproduction, is verified by mk_viii_proto.hexa.
+//
+//  API
+//    diag_grad_x1000(thetas, ws, traj_cross) -> list[int]   // 7 entries
+//    cross_d2_phi7_x1000(thetas, traj_cross) -> list[list[int]]  // 7×7
+//    verdict(thetas, ws, traj_cross, eps_d, eps_c) -> string
+//
+//  HEXA-ONLY · raw#9 · deterministic · LLM=none.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── inline φ_i primitives (byte-equivalent to phi_per_axis.hexa) ────────
+
+fn _fv_stub_q(theta: int) -> int { return (theta * theta) / 2000 }
+
+fn _fv_ln_perm(x: int) -> int {
+    let mut v = x
+    if v <= 0   { v = 1 }
+    if v > 1000 { v = 1000 }
+    if v >= 1000 { return 0 }
+    if v >= 950  { return -51 }
+    if v >= 900  { return -105 }
+    if v >= 850  { return -163 }
+    if v >= 800  { return -223 }
+    if v >= 750  { return -288 }
+    if v >= 700  { return -357 }
+    if v >= 650  { return -431 }
+    if v >= 600  { return -511 }
+    if v >= 550  { return -598 }
+    if v >= 500  { return -693 }
+    if v >= 450  { return -799 }
+    if v >= 400  { return -916 }
+    if v >= 350  { return -1050 }
+    if v >= 300  { return -1204 }
+    if v >= 250  { return -1386 }
+    if v >= 200  { return -1609 }
+    if v >= 150  { return -1897 }
+    if v >= 100  { return -2303 }
+    if v >= 50   { return -2996 }
+    return -6908
+}
+
+fn _fv_v_struct(w: int) -> int {
+    if w >= 1000 { return 0 }
+    return 0 - _fv_ln_perm(w)
+}
+
+fn _fv_v_sync(w: int) -> int {
+    let mut s = w
+    if s < 0 { s = 0 }
+    if s > 1000 { s = 1000 }
+    return 1000 - s
+}
+
+fn _fv_partial_l(w: int) -> int {
+    let w_plus  = if w + 1 > 1000 { 1000 } else { w + 1 }
+    let w_minus = if w - 1 < 0    { 0    } else { w - 1 }
+    let v_plus  = _fv_v_struct(w_plus)  + _fv_v_sync(w_plus)
+    let v_minus = _fv_v_struct(w_minus) + _fv_v_sync(w_minus)
+    return 0 - ((v_plus - v_minus) / 2)
+}
+
+fn _fv_abs(x: int) -> int { if x < 0 { return 0 - x } return x }
+
+fn _fv_phi6(ws: list) -> int {
+    let n = ws.len()
+    let mut acc = 0
+    let mut i = 0
+    while i < n {
+        acc = acc + _fv_abs(_fv_partial_l(ws[i]))
+        i = i + 1
+    }
+    return acc
+}
+
+fn _fv_mean_x1000(xs: list) -> int {
+    let n = xs.len()
+    if n <= 0 { return 0 }
+    let mut s = 0
+    let mut i = 0
+    while i < n {
+        s = s + xs[i]
+        i = i + 1
+    }
+    return (s * 1000) / n
+}
+
+fn _fv_isqrt(n: int) -> int {
+    if n <= 0 { return 0 }
+    let mut x = n
+    let mut y = (x + 1) / 2
+    while y < x {
+        x = y
+        y = (x + n / x) / 2
+    }
+    return x
+}
+
+fn _fv_pearson(xs: list, ys: list) -> int {
+    let n = xs.len()
+    if n <= 1 { return 0 }
+    if ys.len() != n { return 0 }
+    let mx = _fv_mean_x1000(xs)
+    let my = _fv_mean_x1000(ys)
+    let mut num = 0
+    let mut dxx = 0
+    let mut dyy = 0
+    let mut i = 0
+    while i < n {
+        let dx = xs[i] * 1000 - mx
+        let dy = ys[i] * 1000 - my
+        num = num + (dx / 1000) * (dy / 1000)
+        dxx = dxx + (dx / 1000) * (dx / 1000)
+        dyy = dyy + (dy / 1000) * (dy / 1000)
+        i = i + 1
+    }
+    let denom = _fv_isqrt(dxx * dyy)
+    if denom <= 0 { return 0 }
+    return (num * 1000) / denom
+}
+
+fn _fv_phi7(traj: list) -> int {
+    let k = traj.len()
+    if k < 2 { return 0 }
+    let mut acc = 0
+    let mut cnt = 0
+    let mut i = 0
+    while i < k {
+        let mut j = i + 1
+        while j < k {
+            let r = _fv_pearson(traj[i], traj[j])
+            let ar = if r < 0 { 0 - r } else { r }
+            acc = acc + ar
+            cnt = cnt + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if cnt <= 0 { return 0 }
+    let c = 1000 - (acc / cnt)
+    if c < 0 { return 0 }
+    return c
+}
+
+// ── finite-difference diagonal gradients ∂φ_i/∂θ_i ─────────────────────
+//   For stub axes 1..5 we perturb θ_i by ±1 and compare φ_i(θ ± 1) − φ_i(θ).
+//   For axis 6 we perturb each ws[k] by ±1 and take the max response / N.
+//   For axis 7 we perturb traj_cross[0][0] by ±1 and compare φ_7.
+
+fn _fv_grad_stub(theta: int) -> int {
+    let p = _fv_stub_q(theta + 1)
+    let m = _fv_stub_q(theta - 1)
+    return (p - m) / 2
+}
+
+fn _fv_grad_phi6(ws: list) -> int {
+    let n = ws.len()
+    if n <= 0 { return 0 }
+    // probe: perturb the last element (converged gen) by ±1
+    let last = n - 1
+    let mut ws_p = []
+    let mut ws_m = []
+    let mut i = 0
+    while i < n {
+        if i == last {
+            let wp = if ws[i] + 1 > 1000 { 1000 } else { ws[i] + 1 }
+            let wm = if ws[i] - 1 < 0    { 0    } else { ws[i] - 1 }
+            ws_p = ws_p.push(wp)
+            ws_m = ws_m.push(wm)
+        } else {
+            ws_p = ws_p.push(ws[i])
+            ws_m = ws_m.push(ws[i])
+        }
+        i = i + 1
+    }
+    let p = _fv_phi6(ws_p)
+    let m = _fv_phi6(ws_m)
+    return (p - m) / 2
+}
+
+fn _fv_grad_phi7(traj: list) -> int {
+    let k = traj.len()
+    if k <= 0 { return 0 }
+    let n0 = traj[0].len()
+    if n0 <= 0 { return 0 }
+    let mut traj_p = []
+    let mut traj_m = []
+    let mut i = 0
+    while i < k {
+        let mut row_p = []
+        let mut row_m = []
+        let mut j = 0
+        while j < traj[i].len() {
+            if i == 0 && j == 0 {
+                row_p = row_p.push(traj[i][j] + 1)
+                row_m = row_m.push(traj[i][j] - 1)
+            } else {
+                row_p = row_p.push(traj[i][j])
+                row_m = row_m.push(traj[i][j])
+            }
+            j = j + 1
+        }
+        traj_p = traj_p.push(row_p)
+        traj_m = traj_m.push(row_m)
+        i = i + 1
+    }
+    let p = _fv_phi7(traj_p)
+    let m = _fv_phi7(traj_m)
+    return (p - m) / 2
+}
+
+fn diag_grad_x1000(thetas: list, ws: list, traj_cross: list) -> list {
+    let mut out = []
+    let mut i = 0
+    while i < 5 {
+        out = out.push(_fv_grad_stub(thetas[i]))
+        i = i + 1
+    }
+    out = out.push(_fv_grad_phi6(ws))
+    out = out.push(_fv_grad_phi7(traj_cross))
+    return out
+}
+
+// ── cross-derivative matrix ∂²φ_7 / ∂θ_i ∂θ_j ──────────────────────────
+//   Only axis 7 has a cross-derivative structure; other axes are separable.
+//   We perturb (θ_i ± 1, θ_j ± 1) on the modality cost and use the central
+//   5-point mixed-partial approximation:
+//
+//      ∂²f/∂x∂y ≈ [ f(+,+) − f(+,−) − f(−,+) + f(−,−) ] / 4
+//
+//   θ_i / θ_j map to perturbations of traj_cross[i][0] and traj_cross[j][0]
+//   respectively.  Indices beyond the number of cross trajectories default
+//   to zero (pure stub), giving a clean zero cross-partial.
+
+fn _fv_perturb(traj: list, i_ax: int, j_ax: int, si: int, sj: int) -> list {
+    let k = traj.len()
+    let mut out = []
+    let mut i = 0
+    while i < k {
+        let mut row = []
+        let mut j = 0
+        while j < traj[i].len() {
+            let mut v = traj[i][j]
+            if i == i_ax && j == 0 { v = v + si }
+            if i == j_ax && j == 0 { v = v + sj }
+            row = row.push(v)
+            j = j + 1
+        }
+        out = out.push(row)
+        i = i + 1
+    }
+    return out
+}
+
+fn _fv_d2_phi7(traj: list, i_ax: int, j_ax: int) -> int {
+    if i_ax == j_ax { return 0 }
+    let k = traj.len()
+    // Both axes must land inside the provided trajectory matrix.  Axes
+    // outside are stub (independent) — cross-partial is 0 by construction.
+    if i_ax >= k || j_ax >= k { return 0 }
+    let fpp = _fv_phi7(_fv_perturb(traj, i_ax, j_ax,  1,  1))
+    let fpm = _fv_phi7(_fv_perturb(traj, i_ax, j_ax,  1, -1))
+    let fmp = _fv_phi7(_fv_perturb(traj, i_ax, j_ax, -1,  1))
+    let fmm = _fv_phi7(_fv_perturb(traj, i_ax, j_ax, -1, -1))
+    return (fpp - fpm - fmp + fmm) / 4
+}
+
+fn cross_d2_phi7_x1000(thetas: list, traj_cross: list) -> list {
+    let mut mat = []
+    let mut i = 0
+    while i < 7 {
+        let mut row = []
+        let mut j = 0
+        while j < 7 {
+            if i == j {
+                row = row.push(0)
+            } else {
+                row = row.push(_fv_d2_phi7(traj_cross, i, j))
+            }
+            j = j + 1
+        }
+        mat = mat.push(row)
+        i = i + 1
+    }
+    return mat
+}
+
+// ── combined verdict ───────────────────────────────────────────────────
+
+fn verdict(thetas: list, ws: list, traj_cross: list, eps_d: int, eps_c: int) -> string {
+    let g = diag_grad_x1000(thetas, ws, traj_cross)
+    let mut diag_ok = 1
+    let mut i = 0
+    while i < 7 {
+        if _fv_abs(g[i]) > eps_d { diag_ok = 0 }
+        i = i + 1
+    }
+    let m = cross_d2_phi7_x1000(thetas, traj_cross)
+    let mut cross_ok = 1
+    let mut a = 0
+    while a < 7 {
+        let mut b = 0
+        while b < 7 {
+            if a != b {
+                if _fv_abs(m[a][b]) > eps_c { cross_ok = 0 }
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    if diag_ok == 1 && cross_ok == 1 { return "FIXPOINT_DIAG_CROSS_OK" }
+    if diag_ok == 1                  { return "FIXPOINT_PARTIAL_CROSS" }
+    if cross_ok == 1                 { return "FIXPOINT_PARTIAL_DIAG" }
+    return "FIXPOINT_NONE"
+}

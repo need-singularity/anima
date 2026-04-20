@@ -1,0 +1,199 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  edu/mk_viii/l_edu_integrator.hexa
+//
+//  PURPOSE
+//    Mk.VIII 7-axis unified Lagrangian integrator.
+//
+//        L_edu(A, Θ) = Σ_{i=1..7}  λ_i · φ_i(A, Θ_i)
+//
+//    Generalisation of edu/cell/lagrangian (commit 6c6172bf) — L_cell is
+//    subsumed as the single axis φ_6 (granularity / cell substrate).
+//
+//  API
+//    l_edu_components_x1000(axes_state) -> list[int]   // [φ_1..φ_7] scaled
+//    l_edu_total_x1000(axes_state)      -> int         // Σ λ_i φ_i
+//
+//    axes_state layout (inlined by caller):
+//      thetas     : list[int]        length 5  — θ_1..θ_5 (stub axes)
+//      ws         : list[int]        length N  — cell W trajectory (axis 6)
+//      traj_cross : list[list[int]]  length K  — cross-axis trajectories
+//                                               for φ_7 modality Pearson
+//      lambdas    : list[int]        length 7  — λ_i ×1000 weights
+//
+//  This file DOES NOT duplicate φ_i bodies — it inlines the byte-identical
+//  primitives from edu/mk_viii/phi_per_axis.hexa because the stage0 module
+//  loader is fragile (see edu/cell/lagrangian/README.md note).
+//
+//  HEXA-ONLY · raw#9 · deterministic · LLM=none.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── inlined φ_i (byte-equivalent to phi_per_axis.hexa) ──────────────────
+
+fn _ie_stub_q_x1000(theta: int) -> int {
+    let sq = theta * theta
+    return sq / 2000
+}
+
+fn _ie_ln_perm(x: int) -> int {
+    let mut v = x
+    if v <= 0   { v = 1 }
+    if v > 1000 { v = 1000 }
+    if v >= 1000 { return 0 }
+    if v >= 950  { return -51 }
+    if v >= 900  { return -105 }
+    if v >= 850  { return -163 }
+    if v >= 800  { return -223 }
+    if v >= 750  { return -288 }
+    if v >= 700  { return -357 }
+    if v >= 650  { return -431 }
+    if v >= 600  { return -511 }
+    if v >= 550  { return -598 }
+    if v >= 500  { return -693 }
+    if v >= 450  { return -799 }
+    if v >= 400  { return -916 }
+    if v >= 350  { return -1050 }
+    if v >= 300  { return -1204 }
+    if v >= 250  { return -1386 }
+    if v >= 200  { return -1609 }
+    if v >= 150  { return -1897 }
+    if v >= 100  { return -2303 }
+    if v >= 50   { return -2996 }
+    return -6908
+}
+
+fn _ie_v_struct(w: int) -> int {
+    if w >= 1000 { return 0 }
+    return 0 - _ie_ln_perm(w)
+}
+
+fn _ie_v_sync(w: int) -> int {
+    let mut s = w
+    if s < 0    { s = 0 }
+    if s > 1000 { s = 1000 }
+    return 1000 - s
+}
+
+fn _ie_partial_l(w: int) -> int {
+    let w_plus  = if w + 1 > 1000 { 1000 } else { w + 1 }
+    let w_minus = if w - 1 < 0    { 0    } else { w - 1 }
+    let v_plus  = _ie_v_struct(w_plus)  + _ie_v_sync(w_plus)
+    let v_minus = _ie_v_struct(w_minus) + _ie_v_sync(w_minus)
+    return 0 - ((v_plus - v_minus) / 2)
+}
+
+fn _ie_abs(x: int) -> int { if x < 0 { return 0 - x } return x }
+
+fn _ie_phi6(ws: list) -> int {
+    let n = ws.len()
+    let mut acc = 0
+    let mut i = 0
+    while i < n {
+        acc = acc + _ie_abs(_ie_partial_l(ws[i]))
+        i = i + 1
+    }
+    return acc
+}
+
+// Pearson ×1000 (inlined)
+fn _ie_mean_x1000(xs: list) -> int {
+    let n = xs.len()
+    if n <= 0 { return 0 }
+    let mut s = 0
+    let mut i = 0
+    while i < n {
+        s = s + xs[i]
+        i = i + 1
+    }
+    return (s * 1000) / n
+}
+
+fn _ie_isqrt(n: int) -> int {
+    if n <= 0 { return 0 }
+    let mut x = n
+    let mut y = (x + 1) / 2
+    while y < x {
+        x = y
+        y = (x + n / x) / 2
+    }
+    return x
+}
+
+fn _ie_pearson(xs: list, ys: list) -> int {
+    let n = xs.len()
+    if n <= 1 { return 0 }
+    if ys.len() != n { return 0 }
+    let mx = _ie_mean_x1000(xs)
+    let my = _ie_mean_x1000(ys)
+    let mut num = 0
+    let mut dxx = 0
+    let mut dyy = 0
+    let mut i = 0
+    while i < n {
+        let dx = xs[i] * 1000 - mx
+        let dy = ys[i] * 1000 - my
+        num = num + (dx / 1000) * (dy / 1000)
+        dxx = dxx + (dx / 1000) * (dx / 1000)
+        dyy = dyy + (dy / 1000) * (dy / 1000)
+        i = i + 1
+    }
+    let denom = _ie_isqrt(dxx * dyy)
+    if denom <= 0 { return 0 }
+    return (num * 1000) / denom
+}
+
+fn _ie_phi7(traj: list) -> int {
+    let k = traj.len()
+    if k < 2 { return 0 }
+    let mut acc = 0
+    let mut cnt = 0
+    let mut i = 0
+    while i < k {
+        let mut j = i + 1
+        while j < k {
+            let r = _ie_pearson(traj[i], traj[j])
+            let ar = if r < 0 { 0 - r } else { r }
+            acc = acc + ar
+            cnt = cnt + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if cnt <= 0 { return 0 }
+    let cost = 1000 - (acc / cnt)
+    if cost < 0 { return 0 }
+    return cost
+}
+
+// ── public: component-wise and total Lagrangian ────────────────────────
+
+// Returns [λ₁φ₁, λ₂φ₂, …, λ₇φ₇]  (all ×1000 × ×1000 / 1000 = ×1000)
+fn l_edu_components_x1000(thetas: list, ws: list, traj_cross: list, lambdas: list) -> list {
+    let mut out = []
+    // axes 1..5 (stub)
+    let mut i = 0
+    while i < 5 {
+        let th = thetas[i]
+        let phi_raw = _ie_stub_q_x1000(th)
+        let lam = lambdas[i]
+        out = out.push((lam * phi_raw) / 1000)
+        i = i + 1
+    }
+    // axis 6 granularity (live)
+    let phi6 = _ie_phi6(ws)
+    out = out.push((lambdas[5] * phi6) / 1000)
+    // axis 7 modality (live)
+    let phi7 = _ie_phi7(traj_cross)
+    out = out.push((lambdas[6] * phi7) / 1000)
+    return out
+}
+
+fn l_edu_total_x1000(thetas: list, ws: list, traj_cross: list, lambdas: list) -> int {
+    let comps = l_edu_components_x1000(thetas, ws, traj_cross, lambdas)
+    let mut s = 0
+    let mut i = 0
+    while i < comps.len() {
+        s = s + comps[i]
+        i = i + 1
+    }
+    return s
+}

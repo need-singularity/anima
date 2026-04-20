@@ -1,0 +1,188 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  edu/mk_viii/phi_per_axis.hexa
+//
+//  PURPOSE
+//    Per-axis potential terms φ_i(Θ_i) for Mk.VIII L_edu = Σ λ_i φ_i.
+//    All values ×1000 fixed-point integer — matches edu/cell convention.
+//
+//    Axes 1..5 are stub quadratics rooted at θ_i* = 0 (no empirical hook
+//    yet).  Axis 6 (granularity) reuses the edu/cell Lagrangian stationarity
+//    residual as a scalar cost.  Axis 7 (modality) is a Pearson-correlation
+//    coherence cost across the other axes' trajectories (derived live from
+//    the 4-gen crystallize corpus).
+//
+//  API
+//    phi_1_locus_x1000(theta)             -> int
+//    phi_2_grade_x1000(theta)             -> int
+//    phi_3_state_x1000(theta)             -> int
+//    phi_4_time_x1000(theta)              -> int
+//    phi_5_discovery_x1000(theta)         -> int
+//    phi_6_granularity_x1000(ws)          -> int     // live: L_cell residual
+//    phi_7_modality_x1000(traj: list)     -> int     // live: Pearson coherence
+//    pearson_x1000(xs: list, ys: list)    -> int
+//
+//  HEXA-ONLY · raw#9 · deterministic · LLM=none.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── axes 1..5: stub quadratic (θ − θ*)²/2, θ* = 0 ────────────────────────
+
+fn _stub_quadratic_x1000(theta: int) -> int {
+    let sq = theta * theta
+    return sq / 2000
+}
+
+fn phi_1_locus_x1000(theta: int) -> int       { return _stub_quadratic_x1000(theta) }
+fn phi_2_grade_x1000(theta: int) -> int       { return _stub_quadratic_x1000(theta) }
+fn phi_3_state_x1000(theta: int) -> int       { return _stub_quadratic_x1000(theta) }
+fn phi_4_time_x1000(theta: int) -> int        { return _stub_quadratic_x1000(theta) }
+fn phi_5_discovery_x1000(theta: int) -> int   { return _stub_quadratic_x1000(theta) }
+
+// ── φ_6 granularity: reuse L_cell stationarity residual ──────────────────
+//   φ_6(ws) = L1 norm of ∂V/∂W over the 4-gen trajectory.
+//   At a cell fixpoint this vanishes.  Here we inline the primitives from
+//   edu/cell/lagrangian/l_cell_integrator.hexa byte-for-byte.
+
+fn _lc_ln_perm_x1000(x: int) -> int {
+    let mut v = x
+    if v <= 0   { v = 1 }
+    if v > 1000 { v = 1000 }
+    if v >= 1000 { return 0 }
+    if v >= 950  { return -51 }
+    if v >= 900  { return -105 }
+    if v >= 850  { return -163 }
+    if v >= 800  { return -223 }
+    if v >= 750  { return -288 }
+    if v >= 700  { return -357 }
+    if v >= 650  { return -431 }
+    if v >= 600  { return -511 }
+    if v >= 550  { return -598 }
+    if v >= 500  { return -693 }
+    if v >= 450  { return -799 }
+    if v >= 400  { return -916 }
+    if v >= 350  { return -1050 }
+    if v >= 300  { return -1204 }
+    if v >= 250  { return -1386 }
+    if v >= 200  { return -1609 }
+    if v >= 150  { return -1897 }
+    if v >= 100  { return -2303 }
+    if v >= 50   { return -2996 }
+    return -6908
+}
+
+fn _lc_v_struct_x1000(w: int) -> int {
+    if w >= 1000 { return 0 }
+    let ln_val = _lc_ln_perm_x1000(w)
+    return 0 - ln_val
+}
+
+fn _lc_v_sync_x1000(w: int) -> int {
+    let mut s = w
+    if s < 0    { s = 0 }
+    if s > 1000 { s = 1000 }
+    return 1000 - s
+}
+
+fn _lc_partial_l_wrt_w(w: int) -> int {
+    let w_plus  = if w + 1 > 1000 { 1000 } else { w + 1 }
+    let w_minus = if w - 1 < 0    { 0    } else { w - 1 }
+    let v_plus  = _lc_v_struct_x1000(w_plus)  + _lc_v_sync_x1000(w_plus)
+    let v_minus = _lc_v_struct_x1000(w_minus) + _lc_v_sync_x1000(w_minus)
+    return 0 - ((v_plus - v_minus) / 2)
+}
+
+fn _iabs6(x: int) -> int { if x < 0 { return 0 - x } return x }
+
+fn phi_6_granularity_x1000(ws: list) -> int {
+    let n = ws.len()
+    let mut acc = 0
+    let mut i = 0
+    while i < n {
+        let r = _lc_partial_l_wrt_w(ws[i])
+        acc = acc + _iabs6(r)
+        i = i + 1
+    }
+    return acc
+}
+
+// ── φ_7 modality: inter-axis Pearson coherence cost ──────────────────────
+//   Given K axes each with a length-N trajectory, compute the mean off-
+//   diagonal |Pearson| and return (1000 − mean_|r|×1000) as the cost:
+//   low-correlation → high cost, lock-step → cost 0.
+//
+//   Pearson formula (×1000 fixed-point integer):
+//     r = Σ (x_i − x̄)(y_i − ȳ) / sqrt( Σ(x−x̄)² · Σ(y−ȳ)² )
+//   All inputs are arbitrary-scale ints; we rescale via divisions and use
+//   an integer sqrt for the denominator.
+
+fn _mean_x1000(xs: list) -> int {
+    let n = xs.len()
+    if n <= 0 { return 0 }
+    let mut s = 0
+    let mut i = 0
+    while i < n {
+        s = s + xs[i]
+        i = i + 1
+    }
+    return (s * 1000) / n
+}
+
+fn _isqrt(n: int) -> int {
+    if n <= 0 { return 0 }
+    let mut x = n
+    let mut y = (x + 1) / 2
+    while y < x {
+        x = y
+        y = (x + n / x) / 2
+    }
+    return x
+}
+
+fn pearson_x1000(xs: list, ys: list) -> int {
+    let n = xs.len()
+    if n <= 1 { return 0 }
+    if ys.len() != n { return 0 }
+    let mx = _mean_x1000(xs)
+    let my = _mean_x1000(ys)
+    let mut num = 0
+    let mut dxx = 0
+    let mut dyy = 0
+    let mut i = 0
+    while i < n {
+        let dx = xs[i] * 1000 - mx
+        let dy = ys[i] * 1000 - my
+        num = num + (dx / 1000) * (dy / 1000)
+        dxx = dxx + (dx / 1000) * (dx / 1000)
+        dyy = dyy + (dy / 1000) * (dy / 1000)
+        i = i + 1
+    }
+    let denom_sq = dxx * dyy
+    let denom = _isqrt(denom_sq)
+    if denom <= 0 { return 0 }
+    return (num * 1000) / denom
+}
+
+// φ_7 input: list of K trajectories (each a list of ints).
+// Output: (1 − mean_|r|) × 1000 ≥ 0.  At perfect lockstep → 0.
+fn phi_7_modality_x1000(traj: list) -> int {
+    let k = traj.len()
+    if k < 2 { return 0 }
+    let mut acc = 0
+    let mut cnt = 0
+    let mut i = 0
+    while i < k {
+        let mut j = i + 1
+        while j < k {
+            let r = pearson_x1000(traj[i], traj[j])
+            let ar = if r < 0 { 0 - r } else { r }
+            acc = acc + ar
+            cnt = cnt + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if cnt <= 0 { return 0 }
+    let mean_abs_r = acc / cnt
+    let cost = 1000 - mean_abs_r
+    if cost < 0 { return 0 }
+    return cost
+}
