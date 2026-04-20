@@ -56,6 +56,29 @@ comptime const QWEN_TOK_IM_END        = 151645
 comptime const QWEN_TOK_TOOL_CALL_BEG = 151657   // <tool_call>
 comptime const QWEN_TOK_TOOL_CALL_END = 151658   // </tool_call>
 
+// ─── hxtok FFI scaffold (proposal §4) ─────────────────────────────
+//
+// hxtok.c 실구현 완료 후 아래 블록을 uncomment 하여 wire.
+// libhxtok.so (Linux pod) / libhxtok.dylib (Mac) 존재 시에만 @link 해소됨
+// — 현재는 handle=0 fall-through 유지로 기존 text_to_ids_stub 경로 무해.
+// 상세 ABI: docs/alm_r12_hxtok_bpe_proposal_20260420.md §3
+//
+// @link("hxtok")
+// extern fn hxtok_load(path: string, expected_vocab_size: int) -> int
+// @link("hxtok")
+// extern fn hxtok_free(h: int) -> int
+// @link("hxtok")
+// extern fn hxtok_encode(h: int, text: string, text_len: int,
+//                        out_ids_p: int, max_out: int) -> int
+// @link("hxtok")
+// extern fn hxtok_special_id(h: int, name: string) -> int
+// @link("hxtok")
+// extern fn hxtok_vocab_size(h: int) -> int
+// @link("hxtok")
+// extern fn hxtok_merges_count(h: int) -> int
+// @link("hxtok")
+// extern fn hxtok_version_v1() -> int
+
 // ─── Tokenizer state struct ───────────────────────────────────────
 
 // vocab and merges are stored as parallel arrays for now. A real
@@ -76,6 +99,13 @@ struct QwenTokenizer {
     // byte-to-unicode escape (256 entries, char codepoints)
     b2u:        array
     u2b:        array         // inverse, for decode (out of scope v0.1)
+    // hxtok FFI handle (proposal §4). 0 = not wired (current), non-zero =
+    // hxtok_load returned valid handle. encode_bytes_bpe dispatches on
+    // hxtok_h != 0 to avoid touching pure-hexa vocab/merges arrays when C
+    // path is live. Populated once hxtok.c lands (hexa-lang handoff doc
+    // alm_r12_hxtok_implementation_handoff_20260420.md). Field named
+    // hxtok_h because `handle` is a reserved keyword in hexa stage0.
+    hxtok_h:    int
 }
 
 // ─── b2u table: GPT-2 byte-level escape ────────────────────────────
@@ -220,6 +250,7 @@ fn load_qwen_tokenizer(json_path: string) -> QwenTokenizer {
         merges_b: [],
         b2u: build_b2u(),
         u2b: [],
+        hxtok_h: 0,
     }
     let json = read_file(json_path)
     let n = len(json)
@@ -290,7 +321,19 @@ fn encode_bytes_bpe(t: QwenTokenizer, text: string) -> array {
         // Caller must fall back to text_to_ids_stub.
         return []
     }
-    // PHASE-3 (NOT YET LANDED):
+    // hxtok landing 후 여기서 분기:
+    //   if t.hxtok_h != 0 {
+    //       let max_out = len(text) + 4   // worst case byte-per-token
+    //       let out_p  = alloc_raw(max_out * 8)
+    //       let n      = hxtok_encode(t.hxtok_h, text, len(text), out_p, max_out)
+    //       let mut ids = []
+    //       let mut i = 0
+    //       while i < n { ids = ids.push(peek_i64_at(out_p + i*8, 0)); i = i+1 }
+    //       free_raw(out_p)
+    //       return ids
+    //   }
+    //
+    // PHASE-3 pure-hexa fallback (NOT YET LANDED):
     //   1. UTF-8 bytes of text → escape via t.b2u → list of unicode code units
     //   2. Pre-tokenize: split on whitespace + punctuation per Qwen pattern
     //   3. For each pre-token: build initial pair list (one entry per char)
