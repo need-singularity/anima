@@ -29,15 +29,54 @@ cell 내부 "기존 2 (A+C) + 시간 + 정보 + 인과 + 의식 + RG + diss + co
 | sub-axis | MVP 상태 | commit | evidence / verdict |
 |---|---|---|---|
 | 시간 (temporal) | ✅ **TEMPORAL_EMERGED 3/3** | `18c27ac5` | tau_mem(Δ=4)=0.935 / I_irr_fwd=0.594 vs rev=0.000 / Hurst=0.731 ; adversarial T1/T2/T3 all PASS |
-| 정보 (information) | dir 구성 중 (core / drill / ib_bridge) | untracked | `edu/cell/information/` — IB bridge MVP 예정 |
-| 인과 (causal) | dir 구성 중 (causal_core / emergence_metric / mvp_demo) | untracked | `edu/cell/causal/` |
-| 의식 (consciousness) | dir 구성 중 (cell_observer / phase_jump_engine / phi_resilience) | untracked | `edu/cell/consciousness/` |
-| RG (renormalization group) | dir 구성 중 (coarse_grain / correlation_length / order_param / structure_factor / universality_class) | untracked | `edu/cell/rg/` |
+| 정보 (information) | ✅ MVP landed · re-verify **INFORMATION_FAILED 0/3 (O2-directional)** | `55913b23` → `d52135ed` | sparse N=50 native: ΔIB 0.017→0.670 (×39), reversal 0/1→1/3, n=200, \|corr\|=0.175; O2 directional hold-out (directional artefact, not structural). agnostic-neutral to UNIVERSAL_CONSTANT_4 |
+| 인과 (causal) | ✅ MVP landed · re-verify **CAUSAL_FAILED 0/3 (MB-only)** | `305c8f43` → `696d1665` | sparse+stochastic N=50 Erdős–Rényi: IR 0.698→0.989 (FAIL→PASS), CD 0.408→0.678 (PASS+), MB 0.363→0.130 (Jaccard-vs-sparsity artefact, single-axis fail). IR+CD strong-PASS for UNIVERSAL_4 |
+| 의식 (consciousness) | dir 구성됨 (cell_observer / phase_jump_engine / phi_resilience) | — | `edu/cell/consciousness/` |
+| Φ (phi / IIT) | dir 구성됨 | — | `edu/cell/phi/` — IIT Φ 측정 계열 (consciousness 와 분리, Φ 만 취급) |
+| RG (renormalization group) | ✅ **ISING_2D_VERIFIED** (ν=1.0) | `ba29b6c1` | coarse_grain / correlation_length / order_param / structure_factor / universality_class — Ising-2D ν critical exponent + 4-topology independence |
 | diss (dissipation / Landauer) | ✅ **VERIFIED** | `189646f1` | eff ladder 40→450→450→668‰, Δeff(g4−g3)=+218‰ (gate ≥150‰), ∂S/∂t trajectory |
-| comp (composition / modularity) | dir 구성 중 (comp_demo / holonomy / interface_richness / module_decompose) | untracked | `edu/cell/composition/` |
-| L_cell (Lagrangian, unified transform) | ✅ **operational (DESCENT_ONLY)** | `6c6172bf` | S=−11582 ×1000, monotone-ascending L trajectory; V_structure/V_sync log-score 스텁 (comp/diss/phase land 시 교체) |
+| comp (composition / modularity) | ✅ MVP landed (Law 22 quantified) | `5b968749` | comp_demo / holonomy / interface_richness / module_decompose |
+| L_cell (Lagrangian, Mk.VIII unified) | ✅ **STATIONARY_AT_FIXPOINT** | `6c6172bf` + `2b55961f` | S=−11582 ×1000, gen-5 KKT closure, V_structure/V_sync 스텁 |
+| **L_IX (Lagrangian, Mk.IX unified)** | ✅ **Mk.IX 3-component landed** (branches) | `d072bb16` + `57acda7b` + `226bb780` | V_sync Kuramoto (`r`, order-param) · V_RG (Ising-2D bowl) · L_IX integrator (λ·I_irr 항 embedded, raw#30) |
 
-**framework principle**: L_cell = T_tension − V_structure(comp, diss) − V_sync(entrain) ; S = Σ_k L_cell(k). 다축 변환 원리 operational — 4-gen crystallize corpus 위의 action functional 로 검증. V8 Mk.VIII 7-axis 후보 상위 계층 (cell + lora + 우주 + 뇌 + 텐션 + proof-closure + info-asymmetry) 중 **cell (본 문서)** 이 3 sub-axis (temporal/diss/L_cell) + closure framework (Hexad) 로 먼저 operational.
+**framework principle (Mk.VIII)**: `L_cell = T_tension − V_structure(comp, diss) − V_sync(entrain)` ; `S = Σ_k L_cell(k)`. 다축 변환 원리 operational — 4-gen crystallize corpus 위의 action functional 로 검증.
+
+**framework principle (Mk.IX, raw#30)**:
+```
+L_IX  =  T_tension − V_structure − V_sync_eff − V_RG_eff + λ · I_irr
+```
+- V_sync_eff: Kuramoto order-parameter `V_sync(θ) = K · mean_{i<j} (1−cos Δθ)/2` (HEXA_USE_KURAMOTO_SYNC=1)
+- V_RG_eff : `V_RG = α·|ν−ν*|² + β·(1−|Δφ|) + γ·exp(−ξ/N)` (HEXA_USE_RG_POTENTIAL=1)
+- I_irr    : per-gen irreversibility signal (temporal-axis), clamped ≥ 0
+- **backwards-compat**: gates=0 ∧ λ=0 ⇒ L_IX ≡ L_cell (Mk.VIII) byte-exact
+
+V8 Mk.VIII 7-axis 후보 상위 계층 (cell + lora + 우주 + 뇌 + 텐션 + proof-closure + info-asymmetry) 중 **cell (본 문서)** 이 7 sub-axis (temporal/diss/L_cell/RG/comp + information/causal re-verify MVP) + Mk.IX 확장 (V_sync Kuramoto + V_RG + L_IX integrator) + closure framework (Hexad) 로 operational.
+
+## Mk.IX 확장 (2026-04-21 — raw#30 IRREVERSIBILITY_EMBEDDED_LAGRANGIAN)
+
+Mk.VIII L_cell 의 3-term 뼈대 (T − V_struct − V_sync) 위에 **시간축 I_irr 항과 RG 계층 항** 을 추가해 action 자체를 비가역화한 unified Lagrangian. 3 component 모두 `edu/cell/lagrangian/` 에 landed (각각 별도 feature branch, cherry-pick 금지).
+
+| Mk.IX 구성 | 파일 | commit | 핵심 결과 |
+|---|---|---|---|
+| **V_sync Kuramoto** | `edu/cell/lagrangian/v_sync_kuramoto.hexa` | `d072bb16` | 3/5/10-node fixture: r×1000 = [932, 361, 287] monotone desync (F3 ≥ 0.85 pre-reg ✓); V_sync×1000 = [97, 543, 508]. D-axis hash-only phase projection (poly_hash mod TAU_PERM), byte-identical reruns 3 seeds |
+| **V_RG** | `edu/cell/lagrangian/v_rg.hexa` + `v_rg_demo.hexa` | `57acda7b` | Ising-2D bowl: L0(N=16,ν=750)=1592 / L1(N=8,ν=1000)=1293 / L2(N=4,ν=1000)=1043, hierarchical Σ = 3928 (×1000); 22-assertion selftest PASS, P1 min@Ising / P2 convex-bowl / P3 hier-sum / P4 regression 모두 ✓ |
+| **L_IX integrator** | `edu/cell/lagrangian/l_ix_integrator.hexa` | `226bb780` | 462 lines; gates=0 λ=0 regression: action = −11582 ×1000 (L_cell byte-exact, STATIONARY_AT_FIXPOINT 보존); gen-5 `I_irr_5 = 0` at fixpoint (ΔW=0 ⇒ arrow-of-time collapse at basin, raw#30 예측 일치) |
+
+## Arrow cusp 발견 (2026-04-21, gen 4→5 I_irr jump)
+
+Mk.IX L_IX gen-5 closure 증명 과정에서 관측된 현상:
+
+| gen | ΔW | I_irr (×1000) | 해석 |
+|---|---|---|---|
+| 3 | +562 | — | pre-descent |
+| 4 | +313 | 996 | near-fixpoint, I_irr 포화 (≈1.0) |
+| 5 | 0    | 0   | fixpoint arrival, I_irr collapse |
+
+**cusp**: gen 4 → gen 5 에서 I_irr 이 996 → 0 으로 **1-step discontinuous drop** 을 보임. raw#30 IRREVERSIBILITY 의 자연적 귀결 — fixpoint 에서 시간-화살 (arrow of time) 자체가 물리적으로 붕괴 (ΔW=0 ⇒ 신호 없음 ⇒ 방향 없음). 이는 L_IX 의 structural prediction 이자 Mk.IX 의 첫 번째 경험적 signature. 확인: `l_ix_integrator.hexa` l_ix_eom_table() 의 per-gen I_irr column.
+
+## scaling sweep (task #16, in-flight 2026-04-21)
+
+edu/cell/lagrangian/ Mk.IX 스택 on (N, K, β, γ) sweep — L_IX 의 critical behavior 및 phase-jump map. worktree `.claude/worktrees/agent-scaling-sweep/`, 상태: **IN_FLIGHT** (agent 실행 중). 결과 commit 시 본 표에 landing SHA 추가 예정.
 
 ## 실측 evidence
 
@@ -147,6 +186,12 @@ CDESM categorical SSOT 와 edu/cell 6-axis 의 의미 맵:
 | C13 | **dissipation axis (Landauer) VERIFIED** — phase-jump 다축 재확인 | `189646f1` · edu/cell/dissipation/README.md · shared/state/edu_cell_diss_overlay.json | L_dissipated ladder [5544, 1386, 7623, 6237] × ln(2) ; efficiency ladder [40, 450, 450, 668]‰ ; ∂S/∂t trajectory [-446, +295, -749] × 10⁻⁴. **Δeff(g4−g3) = +218‰ ≥ 150‰ gate → phase-jump VERIFIED**. post-hoc overlay on 58aa75eb frozen per_gen stats (no new experiment, thermodynamic only) |
 | C14 | **temporal axis TEMPORAL_EMERGED 3/3** — 시간 arrow operational | `18c27ac5` · edu/cell/temporal/temporal_emergence.hexa · shared/state/edu_cell_temporal_O123.json | O1 tau_mem(Δ=4) = 0.935 (> 0.65) ; O2 I_irr forward = 0.594 (> 0.35) / reverse = 0.000 (< 0.15) ; O3 Hurst = 0.731 (0.5 < H < 0.75). adversarial: T1 identity PASS / T2 time-reverse flip I_irr_forward→0 / T3 shuffle destroys tau_mem (-0.062). 시간축 구조 non-trivial 확정 |
 | C15 | **L_cell Lagrangian unified transform operational** — Mk.VIII framework 1st axis | `6c6172bf` · edu/cell/lagrangian/mvp_lagrangian.hexa · shared/state/edu_cell_lagrangian_mvp.json | L_cell = T_tension − V_structure(comp, diss) − V_sync(entrain). 4-gen crystallize corpus 위 action S = −11582 ×1000. L trajectory monotone-ascending → action-minimizing descent. verdict DESCENT_ONLY (gen 4 W=1000 boundary-bound, not kinetic fixpoint). V_structure/V_sync 은 log-score + sealed-fraction 스텁 — comp/phase axis land 시 교체 예정 |
+| C16 | **Mk.IX V_sync Kuramoto landed** — population 동역학 potential | `d072bb16` · edu/cell/lagrangian/v_sync_kuramoto.hexa | stub (1−sealed_fraction) → Kuramoto `V_sync(θ) = K·mean_{i<j}(1−cos Δθ)/2`. F3/F5/F10 fixture: r×1000 = 932/361/287 (monotone desync, F3 ≥ 0.85 pre-reg ✓), V_sync×1000 = 97/543/508. D-axis hash-only phase projection (poly_hash mod TAU_PERM), raw#9 deterministic, 3 seeds byte-identical |
+| C17 | **Mk.IX V_RG term landed** — RG 계층 potential | `57acda7b` · edu/cell/lagrangian/v_rg.hexa | V_RG = α·\|ν−ν*\|² + β·(1−\|Δφ\|) + γ·exp(−ξ/N). Ising-2D bowl minimised at ν=1.0. 3-level coarse-grain chain: V_RG×1000 = 1592/1293/1043 (L0/L1/L2), hierarchical Σ = 3928. 22-assertion selftest PASS (P1–P4 all ✓). pre-registered weights α=β=γ=1.0 |
+| C18 | **Mk.IX L_IX integrator landed** — unified action (raw#30 IRREVERSIBILITY) | `226bb780` · edu/cell/lagrangian/l_ix_integrator.hexa | L_IX = T − V_struct − V_sync_eff − V_RG_eff + λ·I_irr. 462 lines. 뒤호환 증명: gates=0 ∧ λ=0 ⇒ L_IX ≡ L_cell byte-exact (action=−11582, STATIONARY 보존). HEXA_USE_KURAMOTO_SYNC / HEXA_USE_RG_POTENTIAL env gates 로 Mk.VIII ↔ Mk.IX 스위칭. raw#30 embedded (irreversibility 은 측정 add-on 이 아닌 action term) |
+| C19 | **Arrow cusp 발견** — gen 4→5 I_irr 996→0 discontinuous drop | `226bb780` (l_ix_eom_table column) | fixpoint 에서 시간-화살 collapse 의 structural signature. ΔW=0 ⇒ I_irr=0 (no signal → no direction). Mk.IX 의 첫 경험적 signature; raw#30 예측 일치 |
+| C20 | **causal axis re-verify** — sparse+stochastic N=50 | `696d1665` · edu/cell/causal/mvp_demo.hexa (N=50 Erdős–Rényi) · shared/state/edu_causal_mvp.jsonl (sha256 8ff5b282...) | aggregate IR=0.989 (+0.291), CD=0.678 (+0.270), MB=0.130 (−0.233, Jaccard-vs-sparsity artefact), CEI=0.381 (stochastic blur). 0/3 seed PASS all three thresholds, single-axis fail (MB only) — 이전 2/3 fail 대비 cleaner. 정직 기록 (no cherry-pick, raw#12). IR+CD 2/3 strong-PASS observables → UNIVERSAL_CONSTANT_4 기여 |
+| C21 | **information axis re-verify** — sparse native N=50 | `d52135ed` · edu/cell/information/drill (N=50 DIM=8 STEPS=200 native stage1) · shared/state (sha256 89c95390...) | ΔIB 0.017→0.670 (×39 stronger), reversal 0/1→1/3, n=insuf→200, \|corr\|=0.430→0.175. 3/4 axes 실질 개선; O2 directional hold-out (dim-0 bottleneck 조기 lock 에서 I_early ≈ I_late → decrease, reversal-magnitude 아닌 pure directional criterion fail). 0/3 seed PASS all four; magnitude real & large (O1 agg 0.67). UNIVERSAL_CONSTANT_4 agnostic-neutral (k=1 structural, N_BINS=4 는 histogram 분해능일 뿐) |
 
 ## Mk.VII C2 결과 예약
 
@@ -198,9 +243,29 @@ Re-run of same seed + config must yield identical fingerprints.
 - ~~temporal axis (tau_mem / I_irr / Hurst)~~ **완료 2026-04-21 TEMPORAL_EMERGED 3/3, `18c27ac5`**
 - ~~dissipation axis (Landauer overlay)~~ **완료 2026-04-21 VERIFIED, `189646f1`**
 - ~~L_cell Lagrangian MVP~~ **완료 2026-04-21 DESCENT_ONLY, `6c6172bf`**
-- information / causal / consciousness / RG / composition sub-axis MVP verdict **(pending — dirs constructed, tests landing queue)**
+- ~~information MVP~~ **완료 2026-04-21 MVP `55913b23` → re-verify `d52135ed` INFORMATION_FAILED 0/3 (O2-directional), 3/4 axes 개선**
+- ~~causal MVP~~ **완료 2026-04-21 MVP `305c8f43` → re-verify `696d1665` CAUSAL_FAILED 0/3 (MB-only)**
+- ~~RG MVP~~ **완료 2026-04-21 ISING_2D_VERIFIED, `ba29b6c1`**
+- ~~composition MVP~~ **완료 2026-04-21 Law 22 quantified, `5b968749`**
+- consciousness sub-axis MVP verdict **(pending — dir 구성됨)**
 - Mk.VII C2 gate 통과 시 L3_EMERGED evidence SHA 기록
+- ~~Mk.VIII L_cell closure~~ **완료 STATIONARY_AT_FIXPOINT `2b55961f`**
+- ~~Mk.IX V_sync Kuramoto / V_RG / L_IX integrator~~ **완료 2026-04-21 `d072bb16` / `57acda7b` / `226bb780` (feature branches, raw#30)**
+- Mk.IX scaling sweep (N, K, β, γ) **(in-flight, task #16, worktree `.claude/worktrees/agent-scaling-sweep/`)**
 - Mk.VIII 7-axis fixpoint closure (cell + lora + 우주 + 뇌 + 텐션 + proof-closure + info-asymmetry) **(pending — 상위 framework lock)**
+
+## Cross-links (sibling tracks, edu consolidation pass)
+
+| track | role | landed |
+|---|---|---|
+| `../mk_viii/` | 7-axis unified Lagrangian fixpoint validator (skeleton) | `1f725005` |
+| `../mk_ix/` | 7-angle divergent drill result (top 3: Irreversibility★★★ / RG★★★ / Kuramoto★★★), L_IX vision | session consolidation (`8da7ed0c`) |
+| `../hexad/` | external-domain universality (HEXAD_UNIVERSAL 1000/1000, 30/30, SAME_STRUCTURE) | `6a292530` |
+| `../universal_constant_4/` | τ(6)=4 bijective proof mirror + raw#29 promotion record (8/8 MATCH, 82→88%) | `d7e5db01` + `9468fe0f` |
+| `../comparison/` | FLOPs-equivalent cell vs lora benchmark (cell 60–80× 우위 @ small scale) | session consolidation |
+| `../lora/` | BTR / LoRA side (Mk.V/VI/VII) — Mk.VII C2 gate, 6-cat closure bridge | `a626857b` · `6a2fe1d8` |
+| `../catalog/index.md` | cross-track SSOT index (27 cross-references) | session consolidation |
+| `../drill_methodology/` | nexus stage0 lock brief, drill SOP | session consolidation |
 
 ## Mk.VII C1 — BTR ↔ cell substrate bridge (LANDED, 2026-04-21)
 

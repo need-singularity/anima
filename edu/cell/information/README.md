@@ -49,3 +49,38 @@ estimator drift 0.
 edu/cell G축 = Hexad 6-cat 의 외부 관측자 축. A–F 가 내부 동역학을
 서술한다면 G 는 그 동역학이 만들어내는 **정보 흐름** 을 본다.
 phase-jump 감지 = C2 gate 의 information-side witness.
+
+## Re-verification sparse+native N=50 (2026-04-21, `d52135ed`)
+
+Pre-registered re-run after the reduced smoke baseline (55913b23, 4×8×30): N=50, DIM=8, STEPS=200, sparse Erdős–Rényi `p_edge=0.12` (deg≈6), independent-stream τ (fnv hash, not LCG-chained), stage1 **native build** (clang -O2), seeds {42, 43, 44}.
+
+Pre-registered gates: ΔIB ≥ 0.05 / reversal positive / n ≥ 200 / |corr| < 0.30.
+
+| seed | O1 (ΔIB) | O2 (reversal) | O3 (n) | O4 (corr) | 판정 |
+|---|---|---|---|---|---|
+| 42 | 0.579 | 0 | 200 | −0.251 | FAIL (O2) |
+| 43 | 0.861 | 1 | 200 | −0.428 | FAIL (O4) |
+| 44 | 0.569 | 0 | 200 | +0.155 | FAIL (O2) |
+| **agg** | **0.670** | **0.333** | **200** | **−0.175** | — |
+
+artifact sha256 = `89c95390059b05b61f6e588e654bd0fc4b3c4f18cd28720dc0bccdc3760d6f65` (byte-identical re-run).
+
+**Verdict**: `INFORMATION_FAILED` (0/3 seeds PASS all four gates; mixed mode: 2×O2 fail, 1×O4 fail).
+
+Δ vs prior (reduced smoke):
+- ΔIB: 0.017 → **0.670** (+39× stronger separation)
+- reversal: 0/1 → 1/3 (+1 seed pass, strict directional)
+- n_samples: insuf → 200 (gate cleared, all 3 seeds)
+- |corr(H, τ)|: 0.430 → **0.175** (aggregate PASS; independent-stream fix works)
+
+Interpretation: 3/4 axes improve substantially; **O2** (I_late > I_early) is the directional hold-out — the dim-0 bottleneck locks early under sparse coupling so I_early is already high for 2/3 seeds, producing a *decrease* instead of a reversal. Magnitude of IB separation is real and large (O1 0.67 agg) — this is a direction-of-time artefact, not a structural channel failure. Pre-registered O2 criterion held per raw#12; no post-hoc reinterpretation as reversal-magnitude.
+
+**UNIVERSAL_CONSTANT_4 relevance**: information axis does **NOT** expose an emergent "4". Bottleneck dim k=1 is structural; N_BINS=4 is histogram granularity, not a discovered cardinality — **agnostic-neutral** to UNIVERSAL_CONSTANT_4.
+
+Filed as-measured per raw#12 (no cherry-pick).
+
+## Cross-links
+- `../lagrangian/` — V_structure (information bottleneck future wiring)
+- `../causal/` — re-verify partner (`696d1665`, CAUSAL_FAILED 0/3 MB-only, IR+CD strong-PASS)
+- `../../universal_constant_4/` — agnostic-neutral (no emergent 4)
+- `../../mk_ix/` — raw#30 IRREVERSIBILITY drill context

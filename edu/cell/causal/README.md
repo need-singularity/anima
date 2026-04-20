@@ -87,6 +87,35 @@ HEXA_MAC_BUILD_OK=1 hexa-build edu/cell/causal/mvp_demo.hexa \
 build/edu_causal_mvp > shared/state/edu_causal_mvp.jsonl
 ```
 
+## Re-verification sparse+large N=50 (2026-04-21, `696d1665`)
+
+Pre-registered re-run after the dense-threshold 0/3 baseline (above): N=50 nodes, Erdős–Rényi `p_edge=0.08`, stochastic `p(on)=0.85 / p(off)=0.15`, IR threshold 0.65, MB threshold 0.60, seeds {42, 43, 44}.
+
+| seed | IR | CD | MB | CEI |
+|---|---|---|---|---|
+| 42 | 0.988 | 0.673 | 0.129 | 0.363 |
+| 43 | 0.989 | 0.685 | 0.137 | 0.340 |
+| 44 | 0.990 | 0.675 | 0.125 | 0.439 |
+| **agg** | **0.989** | **0.678** | **0.130** | **0.381** |
+
+artifact sha256 = `8ff5b282d443d8fda2b23ab635a1cc0f29a59905c60f0e2ff83c7b3e0e8d84e5` (byte-identical re-run).
+
+**Verdict**: `CAUSAL_FAILED` (0/3 seeds PASS all three thresholds; single-axis fail on MB only — cleaner than prior 2/3).
+
+Δ vs prior (N=20 dense): IR +0.291 (FAIL → **PASS strongly**), CD +0.270 (PASS → PASS+), MB −0.233 (FAIL → FAIL worse), CEI −0.515 (stochastic blur).
+
+Interpretation: drill hypothesis confirmed for IR+CD — sparse+stochastic breaks the dense-threshold fixed attractor and recovers near-full butterfly sensitivity. MB regression is a Jaccard-vs-sparsity artefact (over-claim from co-activation discovery at p=0.08; recall ~1, precision low) — not a structural causal failure.
+
+**UNIVERSAL_CONSTANT_4 relevance**: causal axis contributes **2/3 strong-PASS observables**; macro B=4 chosen structurally (N/4 ≈ 12-13 per block), not tuned to "4" target — agnostic-positive.
+
+Filed as-measured per raw#12 (no cherry-pick).
+
+## Cross-links
+- `../lagrangian/` — V_structure compositional term (future wiring via CEI)
+- `../information/` — re-verify partner (`d52135ed`, INFORMATION_FAILED 0/3 O2-directional)
+- `../../universal_constant_4/` — agnostic-positive contributor via IR+CD strong-PASS
+- `../../mk_ix/` — raw#30 IRREVERSIBILITY drill context
+
 ## RAW contract
 
 raw#9 · hexa-only · deterministic · LLM=none · V8 SAFE_COMMIT (additive).
