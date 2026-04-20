@@ -1,0 +1,584 @@
+// ════════════════════════════════════════════════════════════════
+//  btr_evo/4x5_compose.hexa
+//  BTR Evolution 4×5 — closed-loop + holographic-IB compose
+//
+//  PURPOSE
+//    Fuse btr-evo 4 (EEG closed-loop, final_phi 0.7994, +30% Φ) with
+//    btr-evo 5 (holographic IB bottleneck, compression 3.2×). The live
+//    Φ trajectory from evo 4 becomes the *target signal* for a Φ gate
+//    added to the IB loss in evo 5. The gate steers the bulk/boundary
+//    split toward regions of the tension surface that correlate with
+//    high-Φ attractors found by the closed-loop controller.
+//
+//    Prediction: +30–38% Φ range, target the UPPER bound (+38%).
+//    Compression: 3.2× maintained or improved.
+//
+//  COMPOSITION
+//      evo4.trajectory[i].phi   ──▶  phi_target_i
+//                                      │
+//                                      ▼
+//      L_compose = L_IB + λ · (phi_target_i - phi_current_i)^2
+//                = (I_XZ - β·I_ZY)  +  λ · err_phi^2
+//
+//    phi_current_i is derived from IB signals in the evo-5 projection:
+//
+//      phi_current = PHI_BASE + PHI_B · min(I_ZY / I_ZY_REF, 1.0)
+//                              + PHI_C · min(compression / C_REF, 1.0)
+//
+//    so the gate effectively reshapes P (the holographic projection)
+//    across iterations to chase the live evo-4 Φ signal, while the IB
+//    term holds the compression.
+//
+//  FEEDBACK (P reshaping)
+//    Each iteration re-seeds P with:
+//        seed_P_{t+1} = seed_P_t + round(ETA * (phi_target - phi_current) * SEED_STEP)
+//    Positive err → explore new P; err→0 → P stabilises. Deterministic.
+//
+//  CONSTRAINTS
+//    - Additive only. Does not modify btr_evo/4_*.hexa or 5_*.hexa.
+//    - No LLM. KSG + digamma reused from evo 5 (re-implemented locally
+//      to keep this file self-contained; same numerics).
+//    - V8 SAFE_COMMIT. Smoke: n=200, 30 iter, seed=20260421.
+//
+//  OUTPUT
+//    experiments/holo_post/results/btr_4x5_compose_20260421.json
+//      { final_phi, final_phi_delta, compression, i_xz, i_zy,
+//        verdict: "REACHED_UPPER" | "BETWEEN" | "BELOW",
+//        trajectory: [ {iter, phi_target, phi_current, i_xz, i_zy,
+//                       compression, ib_loss, phi_gate, loss} ... ] }
+// ════════════════════════════════════════════════════════════════
+
+// ── constants ──────────────────────────────────────────────────
+
+let CMP_SMOKE_N        = 200
+let CMP_DIM_X          = 16
+let CMP_DIM_Z          = 5
+let CMP_KSG_K          = 5
+let CMP_IB_BETA        = 1.0
+let CMP_SMOKE_SEED     = 20260421
+let CMP_NOISE_SCALE    = 0.10
+let CMP_ITERS          = 30
+
+// Φ gate parameters
+let CMP_LAMBDA         = 2.0          // Φ-gate penalty weight
+let CMP_ETA            = 5.0          // feedback gain for P re-seed
+let CMP_SEED_STEP      = 10007        // large prime for seed kicks
+
+// Φ synthesis (mirrors evo 4 Φ_BASE / coefficients)
+let CMP_PHI_BASE       = 0.50
+let CMP_PHI_B_COEF     = 0.25         // I_ZY contribution weight
+let CMP_PHI_C_COEF     = 0.05         // compression contribution weight
+let CMP_I_ZY_REF       = 0.20         // I_ZY reference (2× evo-5 smoke base)
+let CMP_C_REF          = 3.2          // compression reference (evo-5 baseline)
+
+// Verdict gates (relative to PHI_INIT=0.50)
+let CMP_VERDICT_UPPER  = 0.38         // +38% Φ threshold
+let CMP_VERDICT_LOWER  = 0.30         // +30% Φ threshold
+
+let CMP_EVO4_TRAJ      = "experiments/holo_post/results/eeg_closed_loop_20260421_trajectory.jsonl"
+let CMP_OUT_JSON       = "experiments/holo_post/results/btr_4x5_compose_20260421.json"
+
+// ── deterministic LCG + quasi-Gaussian (Box-Muller via CLT-4) ──
+
+fn lcg_next(state: int) -> int {
+    let m: int = 2147483647
+    let a: int = 1103515245
+    let c: int = 12345
+    let s = (a * state + c) % m
+    if s < 0 { return 0 - s }
+    return s
+}
+
+fn normal_pair(seed: int) -> array {
+    let s1 = lcg_next(seed)
+    let s2 = lcg_next(s1)
+    let u1 = to_float(s1) / 2147483647.0
+    let u2 = to_float(s2) / 2147483647.0
+    let s3 = lcg_next(s2)
+    let s4 = lcg_next(s3)
+    let u3 = to_float(s3) / 2147483647.0
+    let u4 = to_float(s4) / 2147483647.0
+    let z = (u1 + u2 + u3 + u4) - 2.0
+    let mut out = []
+    out = out.push(z)
+    out = out.push(to_float(s4))
+    return out
+}
+
+// ── scalar helpers (ln, digamma — mirrors evo-5) ───────────────
+
+fn ln_k(x: float) -> float {
+    if x <= 0.0 { return 0.0 - 1.0e30 }
+    let mut y = 0.0
+    let mut z = x
+    while z > 1.5 {
+        z = z * 0.5
+        y = y + 0.6931471805599453
+    }
+    while z < 0.5 {
+        z = z * 2.0
+        y = y - 0.6931471805599453
+    }
+    let u = z - 1.0
+    let mut sum = 0.0
+    let mut term = u
+    let mut k = 1
+    let mut sign = 1.0
+    while k < 40 {
+        sum = sum + sign * term / to_float(k)
+        term = term * u
+        sign = 0.0 - sign
+        k = k + 1
+    }
+    return y + sum
+}
+
+fn digamma_k(x: float) -> float {
+    if x <= 0.0 { return 0.0 - 1.0e30 }
+    let mut r = 0.0
+    let mut z = x
+    while z < 6.0 {
+        r = r - 1.0 / z
+        z = z + 1.0
+    }
+    let z2 = z * z
+    let z4 = z2 * z2
+    let z6 = z4 * z2
+    r = r + ln_k(z) - 0.5 / z - 1.0 / (12.0 * z2) + 1.0 / (120.0 * z4) - 1.0 / (252.0 * z6)
+    return r
+}
+
+// ── data synthesis (Gaussian bulk X, teacher w, target Y) ──────
+
+fn build_X(n: int, d: int, seed: int) -> array {
+    let mut X = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        let mut row = []
+        let mut j = 0
+        while j < d {
+            let pair = normal_pair(s)
+            row = row.push(pair[0])
+            s = to_int(pair[1])
+            j = j + 1
+        }
+        X = X.push(row)
+        i = i + 1
+    }
+    return X
+}
+
+fn build_w(d: int, seed: int) -> array {
+    let mut w = []
+    let mut s = seed + 7919
+    let mut j = 0
+    while j < d {
+        let pair = normal_pair(s)
+        w = w.push(pair[0])
+        s = to_int(pair[1])
+        j = j + 1
+    }
+    return w
+}
+
+fn build_Y(X: array, w: array, seed: int, noise_scale: float) -> array {
+    let n = X.len()
+    let d = w.len()
+    let mut Y = []
+    let mut s = seed + 104729
+    let mut i = 0
+    while i < n {
+        let mut dot = 0.0
+        let mut j = 0
+        while j < d {
+            dot = dot + w[j] * X[i][j]
+            j = j + 1
+        }
+        let pair = normal_pair(s)
+        let eps = pair[0]
+        s = to_int(pair[1])
+        let mut row = []
+        row = row.push(dot + noise_scale * eps)
+        Y = Y.push(row)
+        i = i + 1
+    }
+    return Y
+}
+
+fn build_P(k: int, d: int, seed: int) -> array {
+    let mut P = []
+    let mut s = seed + 31337
+    let mut i = 0
+    while i < k {
+        let mut row = []
+        let mut j = 0
+        while j < d {
+            let pair = normal_pair(s)
+            row = row.push(pair[0] / 4.0)   // sqrt(d=16) = 4
+            s = to_int(pair[1])
+            j = j + 1
+        }
+        P = P.push(row)
+        i = i + 1
+    }
+    return P
+}
+
+fn project_Z(X: array, P: array) -> array {
+    let n = X.len()
+    let k = P.len()
+    let d = P[0].len()
+    let mut Z = []
+    let mut i = 0
+    while i < n {
+        let mut row = []
+        let mut a = 0
+        while a < k {
+            let mut s = 0.0
+            let mut b = 0
+            while b < d {
+                s = s + P[a][b] * X[i][b]
+                b = b + 1
+            }
+            row = row.push(s)
+            a = a + 1
+        }
+        Z = Z.push(row)
+        i = i + 1
+    }
+    return Z
+}
+
+// ── KSG MI estimator (eq. 8) ───────────────────────────────────
+
+fn cheb_dist_joint(Ai: array, Aj: array, Bi: array, Bj: array) -> float {
+    let dA = Ai.len()
+    let dB = Bi.len()
+    let mut dmax = 0.0
+    let mut k = 0
+    while k < dA {
+        let diff = Ai[k] - Aj[k]
+        let ad = if diff < 0.0 { 0.0 - diff } else { diff }
+        if ad > dmax { dmax = ad }
+        k = k + 1
+    }
+    let mut m = 0
+    while m < dB {
+        let diff = Bi[m] - Bj[m]
+        let ad = if diff < 0.0 { 0.0 - diff } else { diff }
+        if ad > dmax { dmax = ad }
+        m = m + 1
+    }
+    return dmax
+}
+
+fn cheb_dist_single(Ai: array, Aj: array) -> float {
+    let d = Ai.len()
+    let mut dmax = 0.0
+    let mut k = 0
+    while k < d {
+        let diff = Ai[k] - Aj[k]
+        let ad = if diff < 0.0 { 0.0 - diff } else { diff }
+        if ad > dmax { dmax = ad }
+        k = k + 1
+    }
+    return dmax
+}
+
+fn ksg_mi(A: array, B: array, k: int) -> float {
+    let n = A.len()
+    if n < (k + 2) { return 0.0 }
+    let psi_k = digamma_k(to_float(k))
+    let psi_N = digamma_k(to_float(n))
+    let mut sum_psi = 0.0
+    let mut i = 0
+    while i < n {
+        let mut dists = []
+        let mut j = 0
+        while j < n {
+            if j != i {
+                let dj = cheb_dist_joint(A[i], A[j], B[i], B[j])
+                dists = dists.push(dj)
+            }
+            j = j + 1
+        }
+        let sd = dists.sort()
+        let eps = sd[k - 1]
+        let mut nA = 0
+        let mut nB = 0
+        let mut q = 0
+        while q < n {
+            if q != i {
+                let dA = cheb_dist_single(A[i], A[q])
+                let dB = cheb_dist_single(B[i], B[q])
+                if dA < eps { nA = nA + 1 }
+                if dB < eps { nB = nB + 1 }
+            }
+            q = q + 1
+        }
+        let pa = digamma_k(to_float(nA + 1))
+        let pb = digamma_k(to_float(nB + 1))
+        sum_psi = sum_psi + pa + pb
+        i = i + 1
+    }
+    let mean_psi = sum_psi / to_float(n)
+    let mi = psi_k - mean_psi + psi_N
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ── evo-4 trajectory loader (reads phi per tick) ───────────────
+
+// JSON float extraction via split — matches drill_absorption_classifier style.
+// Example input: {"i":0, "phi":0.795282, "alpha_hz":10.09, ...}
+fn get_float_b(blob: string, key: string, dflt: float) -> float {
+    let marker = "\"" + key + "\":"
+    let parts = blob.split(marker)
+    if parts.len() < 2 { return dflt }
+    let after = parts[1].trim()
+    // number may end at ',', '}', or end-of-string
+    let by_comma = after.split(",")
+    let tok1 = by_comma[0]
+    let by_brace = tok1.split("}")
+    let tok = by_brace[0].trim()
+    if tok.len() == 0 { return dflt }
+    return to_float(tok)
+}
+
+fn load_evo4_phi(path: string) -> array {
+    let mut out = []
+    if !file_exists(path) {
+        println("[4x5] WARN: evo4 trajectory not found: " + path)
+        return out
+    }
+    let raw = read_file(path)
+    if raw.len() == 0 { return out }
+    let lines = raw.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    while i < n {
+        let line = lines[i].trim()
+        if line.len() > 0 && line.contains("\"phi\"") {
+            let phi = get_float_b(line, "phi", 0.0)
+            out = out.push(phi)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Φ synthesis from IB signals ────────────────────────────────
+
+fn clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn phi_from_ib(i_zy: float, compression: float) -> float {
+    let b = clamp01(i_zy / CMP_I_ZY_REF)
+    let c = clamp01(compression / CMP_C_REF)
+    return CMP_PHI_BASE + CMP_PHI_B_COEF * b + CMP_PHI_C_COEF * c
+}
+
+// ── one compose iteration (IB + Φ-gate) ────────────────────────
+// Returns [phi_target, phi_current, i_xz, i_zy, compression,
+//          ib_loss, phi_gate, loss, next_seed]
+
+fn compose_step(X: array, Y: array, k: int, d: int, p_seed: int, phi_target: float) -> array {
+    let P = build_P(k, d, p_seed)
+    let Z = project_Z(X, P)
+    let i_xz = ksg_mi(X, Z, CMP_KSG_K)
+    let i_zy = ksg_mi(Z, Y, CMP_KSG_K)
+    let compression = to_float(d) / to_float(k)
+    let ib_loss = i_xz - CMP_IB_BETA * i_zy
+    let phi_current = phi_from_ib(i_zy, compression)
+    let err = phi_target - phi_current
+    let phi_gate = CMP_LAMBDA * err * err
+    let loss = ib_loss + phi_gate
+
+    // P-seed feedback: if err > 0, explore (seed kick); err→0, converge.
+    let kick_f = CMP_ETA * err * to_float(CMP_SEED_STEP)
+    let kick = to_int(kick_f)
+    let next_seed = p_seed + kick
+
+    let mut out = []
+    out = out.push(phi_target)
+    out = out.push(phi_current)
+    out = out.push(i_xz)
+    out = out.push(i_zy)
+    out = out.push(compression)
+    out = out.push(ib_loss)
+    out = out.push(phi_gate)
+    out = out.push(loss)
+    out = out.push(to_float(next_seed))
+    return out
+}
+
+// ── verdict ────────────────────────────────────────────────────
+
+// 0=BELOW, 1=BETWEEN, 2=REACHED_UPPER
+fn verdict_code(delta: float) -> int {
+    let up = CMP_VERDICT_UPPER
+    let lo = CMP_VERDICT_LOWER
+    if delta >= up { return 2 }
+    if delta > lo { return 1 }
+    return 0
+}
+
+fn verdict_name(code: int) -> string {
+    if code == 2 { return "REACHED_UPPER" }
+    if code == 1 { return "BETWEEN" }
+    return "BELOW"
+}
+
+// ── JSON emit ──────────────────────────────────────────────────
+
+fn emit_trajectory(traj: array) -> string {
+    let n = traj.len()
+    let mut s = "["
+    let mut i = 0
+    while i < n {
+        let row = traj[i]
+        if i > 0 { s = s + "," }
+        s = s + "{\"iter\":" + to_string(i)
+        s = s + ",\"phi_target\":" + to_string(row[0])
+        s = s + ",\"phi_current\":" + to_string(row[1])
+        s = s + ",\"i_xz\":" + to_string(row[2])
+        s = s + ",\"i_zy\":" + to_string(row[3])
+        s = s + ",\"compression\":" + to_string(row[4])
+        s = s + ",\"ib_loss\":" + to_string(row[5])
+        s = s + ",\"phi_gate\":" + to_string(row[6])
+        s = s + ",\"loss\":" + to_string(row[7])
+        s = s + "}"
+        i = i + 1
+    }
+    s = s + "]"
+    return s
+}
+
+fn emit_summary(final_phi: float, phi_delta: float, compression: float, i_xz: float, i_zy: float, verdict: string, traj: array) -> string {
+    let mut s = "{"
+    s = s + "\"verifier\":\"btr_evo_4x5_compose\""
+    s = s + ",\"seed\":" + to_string(CMP_SMOKE_SEED)
+    s = s + ",\"n\":" + to_string(CMP_SMOKE_N)
+    s = s + ",\"iters\":" + to_string(CMP_ITERS)
+    s = s + ",\"dim_x\":" + to_string(CMP_DIM_X)
+    s = s + ",\"dim_z\":" + to_string(CMP_DIM_Z)
+    s = s + ",\"ksg_k\":" + to_string(CMP_KSG_K)
+    s = s + ",\"beta\":" + to_string(CMP_IB_BETA)
+    s = s + ",\"lambda\":" + to_string(CMP_LAMBDA)
+    s = s + ",\"eta\":" + to_string(CMP_ETA)
+    s = s + ",\"phi_target_upper\":" + to_string(CMP_VERDICT_UPPER)
+    s = s + ",\"phi_target_lower\":" + to_string(CMP_VERDICT_LOWER)
+    s = s + ",\"final_phi\":" + to_string(final_phi)
+    s = s + ",\"final_phi_delta\":" + to_string(phi_delta)
+    s = s + ",\"final_compression\":" + to_string(compression)
+    s = s + ",\"final_i_xz\":" + to_string(i_xz)
+    s = s + ",\"final_i_zy\":" + to_string(i_zy)
+    s = s + ",\"verdict\":\"" + verdict + "\""
+    s = s + ",\"trajectory\":" + emit_trajectory(traj)
+    s = s + "}"
+    return s
+}
+
+// ── driver ─────────────────────────────────────────────────────
+
+fn run_compose() -> array {
+    println("[4x5] btr evo 4×5 compose — closed-loop × holographic-IB")
+    println("[4x5]   n=" + to_string(CMP_SMOKE_N) + " iters=" + to_string(CMP_ITERS) + " d=" + to_string(CMP_DIM_X) + " k=" + to_string(CMP_DIM_Z) + " seed=" + to_string(CMP_SMOKE_SEED))
+
+    let phi_series = load_evo4_phi(CMP_EVO4_TRAJ)
+    let phi_len = phi_series.len()
+    println("[4x5] evo4 phi trajectory loaded: " + to_string(phi_len) + " samples")
+    if phi_len == 0 {
+        println("[4x5] FATAL: no evo4 trajectory; aborting")
+        let mut er = []
+        return er
+    }
+
+    let X = build_X(CMP_SMOKE_N, CMP_DIM_X, CMP_SMOKE_SEED)
+    let w = build_w(CMP_DIM_X, CMP_SMOKE_SEED)
+    let Y = build_Y(X, w, CMP_SMOKE_SEED, CMP_NOISE_SCALE)
+    println("[4x5] bulk X built; teacher Y built")
+
+    let mut traj = []
+    let mut p_seed = CMP_SMOKE_SEED
+    let mut t = 0
+    let iters = CMP_ITERS
+    while t < iters {
+        let idx = (t * phi_len) / iters
+        let phi_target = phi_series[idx]
+        let r = compose_step(X, Y, CMP_DIM_Z, CMP_DIM_X, p_seed, phi_target)
+        traj = traj.push(r)
+        p_seed = to_int(r[8])
+        let msg = "[4x5] iter " + to_string(t) + " phi_tgt=" + to_string(r[0]) + " phi_cur=" + to_string(r[1]) + " I_XZ=" + to_string(r[2]) + " I_ZY=" + to_string(r[3]) + " loss=" + to_string(r[7])
+        println(msg)
+        t = t + 1
+    }
+    return traj
+}
+
+fn finalize(traj: array) -> array {
+    let n = traj.len()
+    if n == 0 {
+        let mut e = []
+        return e
+    }
+    // final = mean over last 5 iters for stability
+    let look = if n < 5 { n } else { 5 }
+    let mut sum_phi = 0.0
+    let mut sum_c = 0.0
+    let mut sum_ixz = 0.0
+    let mut sum_izy = 0.0
+    let mut i = n - look
+    while i < n {
+        let r = traj[i]
+        sum_phi = sum_phi + r[1]
+        sum_c   = sum_c   + r[4]
+        sum_ixz = sum_ixz + r[2]
+        sum_izy = sum_izy + r[3]
+        i = i + 1
+    }
+    let lk = to_float(look)
+    let mut out = []
+    out = out.push(sum_phi / lk)
+    out = out.push(sum_c   / lk)
+    out = out.push(sum_ixz / lk)
+    out = out.push(sum_izy / lk)
+    return out
+}
+
+// ── main ───────────────────────────────────────────────────────
+
+println("btr-evo 4×5 compose — upper-bound Φ probe (+38% target)")
+let traj = run_compose()
+
+if traj.len() > 0 {
+    let fin = finalize(traj)
+    let final_phi   = fin[0]
+    let final_comp  = fin[1]
+    let final_i_xz  = fin[2]
+    let final_i_zy  = fin[3]
+    let phi_delta   = final_phi - CMP_PHI_BASE
+    let vc = verdict_code(phi_delta)
+    let v = verdict_name(vc)
+
+    let summary = emit_summary(final_phi, phi_delta, final_comp, final_i_xz, final_i_zy, v, traj)
+
+    try { write_file(CMP_OUT_JSON, summary) } catch e {
+        println("[4x5] WARN: write_file failed: " + CMP_OUT_JSON)
+    }
+
+    println("=== btr evo 4×5 compose ===")
+    println("  final_phi          = " + to_string(final_phi))
+    println("  final_phi_delta    = " + to_string(phi_delta))
+    println("  final_compression  = " + to_string(final_comp))
+    println("  final_I_XZ         = " + to_string(final_i_xz))
+    println("  final_I_ZY         = " + to_string(final_i_zy))
+    println("  verdict            = " + v)
+    println("  out -> " + CMP_OUT_JSON)
+} else {
+    println("[4x5] compose aborted")
+}
