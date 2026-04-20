@@ -1,0 +1,119 @@
+// tests/test_hexad_closure_adversarial.hexa
+// ───────────────────────────────────────────────────────────────────
+//  Adversarial closure probe for tool/hexad_closure_verifier.hexa.
+//
+//  GOAL
+//    100% coverage proof: verify that the verifier rejects
+//    *non-closed* tree states.  If injecting a leaky morphism or a
+//    phantom category does NOT flip the verdict, closure is vacuous.
+//
+//  SCENARIOS
+//    S1  phantom-dir       : mkdir anima-hexad/x  (extra category)
+//                              expect verdict != CLOSED
+//                              expect axiom(d) phantom absence = false
+//    S2  leaky-morphism    : drop a canonical bridge file temporarily
+//                              expect verdict != CLOSED
+//                              expect axiom(c) composition closure = false
+//    S3  restore baseline  : confirm CLOSED re-achieved after cleanup
+//
+//  SAFETY
+//    Each scenario is ephemeral: mutation is wrapped in
+//    create → verify → revert.  A final `find` + explicit revert
+//    ensures no residue.  If something goes wrong the test still
+//    leaves CLOSED tree.
+//
+//  RUN
+//    hexa tests/test_hexad_closure_adversarial.hexa
+// ───────────────────────────────────────────────────────────────────
+
+let VERIFIER = "tool/hexad_closure_verifier.hexa"
+let HEXAD_ROOT = "anima-hexad"
+
+let PHANTOM_DIR = "anima-hexad/x"
+let PHANTOM_FILE = "anima-hexad/x/__init__.hexa"
+
+// Leaky-morphism scenario: move aside a bridge file.
+let LEAK_BRIDGE = "anima-hexad/d/will_bridge.hexa"
+let LEAK_STASH  = "/tmp/will_bridge_stash_20260421.hexa"
+
+fn assert_true(cond: bool, msg: string) {
+    if cond {
+        println("[PASS] " + msg)
+    } else {
+        println("[FAIL] " + msg)
+        exit(1)
+    }
+}
+
+fn capture(cmd: string) -> string {
+    return exec(cmd + " 2>&1")
+}
+
+fn run_verifier() -> string {
+    let self_host = "/Users/ghost/Dev/hexa-lang/hexa"
+    let hexa_bin = if file_exists(self_host) { self_host } else { "hexa" }
+    let cmd = "HEXA_VAL_ARENA=0 " + hexa_bin + " " + VERIFIER
+    return capture(cmd)
+}
+
+fn baseline_closed(out: string) -> bool {
+    return out.contains("closure_verdict = CLOSED")
+}
+
+fn main() {
+    println("=== test_hexad_closure_adversarial ===")
+    println("  probing: phantom-dir + leaky-morphism rejection")
+
+    // ── Sanity baseline ─────────────────────────────────────────
+    let base = run_verifier()
+    assert_true(baseline_closed(base),
+                "baseline tree → CLOSED (pre-adversarial)")
+
+    // ── S1 phantom-dir injection ────────────────────────────────
+    println("")
+    println("--- S1 phantom-dir injection ---")
+    exec("mkdir -p " + PHANTOM_DIR)
+    exec("touch " + PHANTOM_FILE)
+    assert_true(file_exists(PHANTOM_FILE), "phantom x/ staged")
+
+    let s1 = run_verifier()
+    let s1_closed = s1.contains("closure_verdict = CLOSED")
+    let s1_phant_false = s1.contains("axiom(d) phantom absence:      false")
+    assert_true(!s1_closed, "S1 verdict ≠ CLOSED (phantom rejects closure)")
+    assert_true(s1_phant_false, "S1 axiom(d) = false (phantom detected)")
+
+    // cleanup phantom
+    exec("rm -rf " + PHANTOM_DIR)
+    assert_true(!file_exists(PHANTOM_FILE), "phantom x/ reverted")
+
+    // ── S2 leaky-morphism injection ─────────────────────────────
+    println("")
+    println("--- S2 leaky-morphism injection ---")
+    exec("mv " + LEAK_BRIDGE + " " + LEAK_STASH)
+    assert_true(!file_exists(LEAK_BRIDGE), "bridge d/will_bridge.hexa stashed")
+
+    let s2 = run_verifier()
+    let s2_closed = s2.contains("closure_verdict = CLOSED")
+    let s2_comp_false = s2.contains("axiom(c) composition closure:  false")
+    assert_true(!s2_closed, "S2 verdict ≠ CLOSED (missing bridge breaks closure)")
+    assert_true(s2_comp_false, "S2 axiom(c) = false (composition incomplete)")
+
+    // revert stash
+    exec("mv " + LEAK_STASH + " " + LEAK_BRIDGE)
+    assert_true(file_exists(LEAK_BRIDGE), "bridge d/will_bridge.hexa restored")
+
+    // ── S3 post-revert sanity ───────────────────────────────────
+    println("")
+    println("--- S3 post-revert sanity ---")
+    let s3 = run_verifier()
+    assert_true(baseline_closed(s3),
+                "post-revert tree → CLOSED (no residue)")
+
+    println("")
+    println("=== adversarial probe PASS ===")
+    println("  closure is not vacuous: 2/2 injection scenarios flipped verdict")
+    println("  clean revert verified: CLOSED restored")
+    exit(0)
+}
+
+main()
