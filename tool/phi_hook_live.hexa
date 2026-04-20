@@ -1,0 +1,106 @@
+// tool/phi_hook_live.hexa — drill μ phi metric live hook (proxy mode)
+//
+// Purpose: bind drill iterations to a scalar Φ (proxy) and append NDJSON.
+// SSOT witness: docs/phi_metric_ssot.md
+// Upstream metric catalog: training/phi_metric.hexa (Phi-KL; this file
+//   uses a drill-level *proxy* derived from aggregate features, because the
+//   drill pipeline is symbolic and does not carry NN activation tensors).
+//
+// NDJSON schema (one line per call):
+//   {"iter":N,"phi":F,"ts":T,"mode":"proxy","tag":"drill"}
+//
+// Run modes:
+//   1) Library mode  — callers import by reading this file via hexa runtime
+//                      or by re-declaring the fn signature (stage0 pattern).
+//   2) Smoke mode    — `hexa tool/phi_hook_live.hexa --smoke` emits >=3 entries
+//                      into /tmp/anima_drill_phi_live.ndjson.
+//
+// HEXA COMPAT: no dict literals, string-built JSON; additive only.
+// V8 SAFE_COMMIT: named file only.
+
+let PHI_LIVE_OUT = "/tmp/anima_drill_phi_live.ndjson"
+// Monotonic counter used as a timestamp proxy when no stage0 wall-clock
+// builtin is available. Callers may correlate by iteration instead of ts.
+let mut PHI_LIVE_TICK = 0
+
+fn phi_live_ts() {
+    PHI_LIVE_TICK = PHI_LIVE_TICK + 1
+    return PHI_LIVE_TICK
+}
+
+// ─── proxy Φ: Shannon-style concentration of 3 drill features ────────
+// Input: [absorption_rate, saturation_score, depth_reached]
+// Normalise to a prob vector (add-eps), compute log(3) - H(p).
+// Same family as Phi-KL in training/phi_metric.hexa but on drill features.
+fn phi_proxy_from_features(abs_rate, sat_score, depth) {
+    let a = if abs_rate < 0.0 { 0.0 - abs_rate } else { abs_rate }
+    let s = if sat_score < 0.0 { 0.0 - sat_score } else { sat_score }
+    let d = if depth < 0.0 { 0.0 - depth } else { depth }
+    let eps = 0.0000001
+    let sum = a + s + d + 3.0 * eps
+    let pa = (a + eps) / sum
+    let ps = (s + eps) / sum
+    let pd = (d + eps) / sum
+    let mut h = 0.0
+    if pa > eps { h = h - pa * log(pa) }
+    if ps > eps { h = h - ps * log(ps) }
+    if pd > eps { h = h - pd * log(pd) }
+    let max_h = log(3.0)
+    let phi = max_h - h
+    return phi
+}
+
+// NDJSON append — single line per iteration.
+// Uses read+concat+write because some stage0 runtimes lack append_file.
+fn phi_hook_live_append(path, text) {
+    let mut prior = ""
+    if file_exists(path) { prior = read_file(path) }
+    write_file(path, prior + text)
+}
+
+fn phi_hook_live(iteration, abs_rate, sat_score, depth, out_path) {
+    let phi = phi_proxy_from_features(abs_rate, sat_score, depth)
+    let ts = phi_live_ts()
+    let mut line = "{\"iter\":" + to_string(iteration)
+    line = line + ",\"phi\":" + to_string(phi)
+    line = line + ",\"ts\":" + to_string(ts)
+    line = line + ",\"mode\":\"proxy\""
+    line = line + ",\"tag\":\"drill\"}"
+    phi_hook_live_append(out_path, line + "\n")
+    return phi
+}
+
+// Convenience: fixed default output path.
+fn phi_hook_live_default(iteration, abs_rate, sat_score, depth) {
+    return phi_hook_live(iteration, abs_rate, sat_score, depth, PHI_LIVE_OUT)
+}
+
+// ─── smoke entry ─────────────────────────────────────────────────────
+// `hexa tool/phi_hook_live.hexa --smoke` emits 3 synthetic iterations.
+fn main() {
+    let argv = args()
+    let mut is_smoke = false
+    let mut i = 0
+    while i < argv.len() {
+        if argv[i] == "--smoke" { is_smoke = true }
+        i = i + 1
+    }
+
+    if !is_smoke {
+        println("phi_hook_live — library module; pass --smoke for self-test")
+        return
+    }
+
+    println("phi_hook_live smoke: out=" + PHI_LIVE_OUT)
+    let p0 = phi_hook_live_default(0, 0.05, 1.0, 4)
+    let p1 = phi_hook_live_default(1, 0.12, 0.9, 3)
+    let p2 = phi_hook_live_default(2, 0.40, 0.0, 2)
+    let p3 = phi_hook_live_default(3, 0.01, 1.0, 5)
+    println("  iter=0 phi=" + to_string(p0))
+    println("  iter=1 phi=" + to_string(p1))
+    println("  iter=2 phi=" + to_string(p2))
+    println("  iter=3 phi=" + to_string(p3))
+    println("phi_hook_live smoke: DONE (4 entries appended)")
+}
+
+main()
