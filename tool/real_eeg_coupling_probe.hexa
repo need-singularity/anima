@@ -1,0 +1,460 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/real_eeg_coupling_probe.hexa
+//    Mk.VII C4 — real-world EEG coupling drill (weakest-axis reinforcement)
+//
+//  PURPOSE
+//    Mk.VII candidate criteria (rev=1, commit 9d035936) C4 demands:
+//      "sim Phi(t) <-> real EEG alpha-envelope,  Pearson-r >= 0.70, T >= 60 s".
+//    Current C4 = MINIMAL (btr-evo 4 ran on synthesized alpha only, a4853336).
+//    C4 is the weakest axis and the #1 Mk.VII promotion blocker.
+//
+//  THIS TOOL wires the probe end-to-end:
+//    1. Local EEG cache probe (no network). Common paths only.
+//    2. If no cache -> deterministic synthetic EEG @ 256 Hz x 60 s
+//         x[n] = A_alpha*sin(2*pi*f_alpha(n)*t) + A_beta*sin(2*pi*20*t) + eps
+//         f_alpha sweeps 8 -> 13 Hz across the 60 s window.
+//    3. Load btr-evo 4 trajectory; extract phi[] (100 samples).
+//    4. alpha-band envelope via windowed RMS (100 windows matching phi grid).
+//    5. Pearson-r(phi, env). PASS iff r >= 0.70.
+//
+//  T = 60 s by construction (15360 / 256 = 60.0). Mk.VII requires >= 60 s.
+//
+//  DATA SOURCE DISCLOSURE
+//    Output JSON records data_source in {real_cache, synthetic_det} and a
+//    source_caveat flag. Synthetic mode validates the pipeline; it does NOT
+//    by itself satisfy Mk.VII C4 (spec requires a pre-registered real trace).
+//
+//  V8 SAFE_COMMIT, additive only, LLM=none, deterministic.
+// ════════════════════════════════════════════════════════════════════════════
+
+let SEED        = 20260421
+let OUT_PATH    = "shared/state/real_eeg_correlation_20260421.json"
+let TRAJ_PATH   = "experiments/holo_post/results/eeg_closed_loop_20260421_trajectory.jsonl"
+
+let EEG_FS      = 256
+let EEG_T_SEC   = 60
+let EEG_N       = 15360
+
+let PHI_N       = 100
+let WINDOW_LEN  = 153
+
+let R_PASS_MIN  = 0.70
+
+let A_ALPHA     = 1.0
+let A_BETA      = 0.4
+let NOISE_AMP   = 0.15
+
+// ----- deterministic LCG PRNG (NR constants) -----
+struct Rng { state: int }
+
+fn rng_new(seed: int) -> Rng {
+    let s0 = if seed == 0 { 1 } else { seed }
+    return Rng { state: s0 }
+}
+
+fn rng_step(r: Rng) -> Rng {
+    let a = 1664525
+    let c = 1013904223
+    let m = 2147483648
+    let nxt = (a * r.state + c) % m
+    let pos = if nxt < 0 { nxt + m } else { nxt }
+    return Rng { state: pos }
+}
+
+fn rng_unit(r: Rng) -> float {
+    let m = 2147483648.0
+    return (r.state * 1.0) / m
+}
+
+// ----- math helpers -----
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sqrt_newton(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut y = x
+    let mut j = 0
+    while j < 40 {
+        y = 0.5 * (y + x / y)
+        j = j + 1
+    }
+    return y
+}
+
+// sin via Taylor on argument wrapped to [-pi, pi]
+fn wrap_pi(x: float) -> float {
+    let pi_f = 3.141592653589793
+    let two_pi = 6.283185307179586
+    let neg_pi = 0.0 - pi_f
+    let mut y = x
+    while y > pi_f {
+        y = y - two_pi
+    }
+    while y < neg_pi {
+        y = y + two_pi
+    }
+    return y
+}
+
+fn sin_taylor(x: float) -> float {
+    let y = wrap_pi(x)
+    let y2 = y * y
+    let y3 = y2 * y
+    let y5 = y3 * y2
+    let y7 = y5 * y2
+    let y9 = y7 * y2
+    return y - y3 / 6.0 + y5 / 120.0 - y7 / 5040.0 + y9 / 362880.0
+}
+
+// ----- cache probe -----
+fn cache_paths() -> list {
+    let mut p = []
+    p = p.push("data/eeg/trace_60s.csv")
+    p = p.push("data/eeg/pre_registered_20260421.csv")
+    p = p.push("shared/state/eeg_cache_real_trace.csv")
+    return p
+}
+
+fn cache_lookup() -> string {
+    let paths = cache_paths()
+    let mut i = 0
+    while i < paths.len() {
+        let p = paths[i]
+        if file_exists(p) { return p }
+        i = i + 1
+    }
+    return ""
+}
+
+// ----- synthetic EEG -----
+fn synth_eeg(seed: int) -> list {
+    let two_pi = 6.283185307179586
+    let lim = EEG_N
+    let fs_f = to_float(EEG_FS)
+    let n_f = to_float(EEG_N)
+    let a_alpha = A_ALPHA
+    let a_beta = A_BETA
+    let noise_amp = NOISE_AMP
+
+    let mut rng = rng_new(seed)
+    let mut x = []
+    let mut n = 0
+    while n < lim {
+        let tsec = to_float(n) / fs_f
+        let f_alpha = 8.0 + 5.0 * (to_float(n) / n_f)
+        let f_beta = 20.0
+        let alpha_component = a_alpha * sin_taylor(two_pi * f_alpha * tsec)
+        let beta_component = a_beta * sin_taylor(two_pi * f_beta * tsec)
+        rng = rng_step(rng)
+        let u = rng_unit(rng)
+        let noise = (u - 0.5) * 2.0 * noise_amp
+        let sample = alpha_component + beta_component + noise
+        x = x.push(sample)
+        n = n + 1
+    }
+    return x
+}
+
+// ----- CSV float parse (one-value-per-comma/newline; skip non-numeric tokens) -----
+fn is_numeric_token(tok: string) -> bool {
+    let n = tok.len()
+    if n == 0 { return false }
+    let c0 = to_string(tok[0])
+    if c0 == "-" || c0 == "+" || c0 == "." { return true }
+    if c0 == "0" || c0 == "1" || c0 == "2" || c0 == "3" || c0 == "4" { return true }
+    if c0 == "5" || c0 == "6" || c0 == "7" || c0 == "8" || c0 == "9" { return true }
+    return false
+}
+
+fn trim_ws(s: string) -> string {
+    let n = s.len()
+    let mut i = 0
+    let mut j = n
+    let mut front_done = false
+    while !front_done && i < j {
+        let c = to_string(s[i])
+        if c == " " || c == "\t" || c == "\r" { i = i + 1 } else { front_done = true }
+    }
+    let mut back_done = false
+    while !back_done && j > i {
+        let c2 = to_string(s[j - 1])
+        if c2 == " " || c2 == "\t" || c2 == "\r" { j = j - 1 } else { back_done = true }
+    }
+    // reconstruct via per-char append
+    let mut out = ""
+    let mut k = i
+    while k < j {
+        out = out + to_string(s[k])
+        k = k + 1
+    }
+    return out
+}
+
+fn parse_csv_floats(text: string) -> list {
+    let lines = text.split("\n")
+    let mut out = []
+    let mut li = 0
+    while li < lines.len() {
+        let fields = lines[li].split(",")
+        let mut fi = 0
+        while fi < fields.len() {
+            let raw = trim_ws(fields[fi])
+            if is_numeric_token(raw) {
+                out = out.push(to_float(raw))
+            }
+            fi = fi + 1
+        }
+        li = li + 1
+    }
+    return out
+}
+
+// ----- alpha-band envelope via windowed RMS -----
+fn alpha_envelope(signal: list) -> list {
+    let total = signal.len()
+    let wlen = WINDOW_LEN
+    let phi_n = PHI_N
+    let used = wlen * phi_n
+    let n_take = if total < used { total } else { used }
+    let per_window = n_take / phi_n
+    let mut env = []
+    let mut w = 0
+    while w < phi_n {
+        let start = w * per_window
+        let stop = start + per_window
+        let mut s = 0.0
+        let mut i = start
+        while i < stop {
+            s = s + signal[i]
+            i = i + 1
+        }
+        let m = s / to_float(per_window)
+        let mut v = 0.0
+        let mut k = start
+        while k < stop {
+            let d = signal[k] - m
+            v = v + d * d
+            k = k + 1
+        }
+        let rms = sqrt_newton(v / to_float(per_window))
+        env = env.push(rms)
+        w = w + 1
+    }
+    return env
+}
+
+// ----- trajectory load: phi[] from JSONL -----
+// Each line is like: {"i":0,"phi":0.795282,"alpha_hz":10.09,...}
+// We split by "," and look for the field starting with "phi":
+fn extract_phi_field(line: string) -> float {
+    let parts = line.split(",")
+    let mut i = 0
+    while i < parts.len() {
+        let p = trim_ws(parts[i])
+        // strip leading "{" if present
+        let p2 = if p.len() > 0 && to_string(p[0]) == "{" {
+            let mut tmp = ""
+            let mut k = 1
+            while k < p.len() {
+                tmp = tmp + to_string(p[k])
+                k = k + 1
+            }
+            tmp
+        } else { p }
+        // check prefix
+        if p2.starts_with("\"phi\":") {
+            let colon_parts = p2.split(":")
+            if colon_parts.len() >= 2 {
+                let raw = trim_ws(colon_parts[1])
+                if is_numeric_token(raw) { return to_float(raw) }
+            }
+        }
+        i = i + 1
+    }
+    return -1.0
+}
+
+fn load_phi_trajectory(path: string) -> list {
+    let raw = read_file(path)
+    let lines = raw.split("\n")
+    let mut phi = []
+    let mut i = 0
+    while i < lines.len() {
+        let ln = lines[i]
+        if ln.len() > 0 {
+            let v = extract_phi_field(ln)
+            if v >= 0.0 { phi = phi.push(v) }
+        }
+        i = i + 1
+    }
+    return phi
+}
+
+// ----- Pearson-r -----
+fn pearson_r(a: list, b: list) -> float {
+    let na = a.len()
+    let nb = b.len()
+    let n = if na < nb { na } else { nb }
+    if n < 2 { return 0.0 }
+    let mut sa = 0.0
+    let mut sb = 0.0
+    let mut i = 0
+    while i < n {
+        sa = sa + a[i]
+        sb = sb + b[i]
+        i = i + 1
+    }
+    let ma = sa / to_float(n)
+    let mb = sb / to_float(n)
+    let mut cov = 0.0
+    let mut va = 0.0
+    let mut vb = 0.0
+    let mut k = 0
+    while k < n {
+        let da = a[k] - ma
+        let db = b[k] - mb
+        cov = cov + da * db
+        va = va + da * da
+        vb = vb + db * db
+        k = k + 1
+    }
+    let denom = sqrt_newton(va * vb)
+    if denom < 0.00000001 { return 0.0 }
+    return cov / denom
+}
+
+fn fmt(x: float) -> string { return to_string(x) }
+
+// ----- MAIN -----
+fn main() {
+    println("[real_eeg_coupling_probe] Mk.VII C4 weakest-axis drill")
+    println("  seed=" + to_string(SEED) + "  T=" + to_string(EEG_T_SEC) + "s  fs=" + to_string(EEG_FS) + "Hz  N=" + to_string(EEG_N))
+    println("  threshold: Pearson-r >= " + fmt(R_PASS_MIN))
+
+    // step 1: local cache probe
+    let cache_hit = cache_lookup()
+    let mut data_source = "synthetic_det"
+    let mut source_caveat = 1
+    let mut source_path = "(generated)"
+    let mut eeg = []
+
+    let min_samples = EEG_N
+    if cache_hit.len() > 0 {
+        println("  cache hit: " + cache_hit)
+        let raw = read_file(cache_hit)
+        eeg = parse_csv_floats(raw)
+        let n_got = eeg.len()
+        if n_got >= min_samples {
+            data_source = "real_cache"
+            source_caveat = 0
+            source_path = cache_hit
+        } else {
+            println("  cache too short; falling back to synthetic")
+            eeg = synth_eeg(SEED)
+        }
+    } else {
+        println("  no local EEG cache (synthetic_det fallback)")
+        eeg = synth_eeg(SEED)
+    }
+    println("  data_source=" + data_source + "  samples=" + to_string(eeg.len()))
+
+    // step 2/3: load sim Phi trajectory
+    let phi = load_phi_trajectory(TRAJ_PATH)
+    let phi_got = phi.len()
+    let phi_need = PHI_N
+    println("  trajectory: " + TRAJ_PATH + "  phi_samples=" + to_string(phi_got))
+    if phi_got < phi_need {
+        println("  WARN: phi_samples below target; using min length")
+    }
+
+    // step 4: alpha-band envelope
+    let env = alpha_envelope(eeg)
+    println("  alpha_envelope_points=" + to_string(env.len()))
+
+    // step 5: Pearson-r
+    let r = pearson_r(phi, env)
+    let r_abs = fabs(r)
+    let r_thr = R_PASS_MIN
+    let pass = if r >= r_thr { 1 } else { 0 }
+    let pass_abs = if r_abs >= r_thr { 1 } else { 0 }
+    let verdict_pass = if source_caveat == 1 { "PASS_SYNTH_CAVEATED" } else { "PASS" }
+    let verdict_fail = if pass_abs == 1 { "CORRELATED_NEGATIVE" } else { "FAIL" }
+    let verdict = if pass == 1 { verdict_pass } else { verdict_fail }
+
+    println("")
+    println("=== Mk.VII C4 real EEG coupling probe ===")
+    println("  data_source     = " + data_source)
+    println("  source_path     = " + source_path)
+    println("  T_seconds       = " + to_string(EEG_T_SEC))
+    println("  phi_samples     = " + to_string(phi.len()))
+    println("  env_samples     = " + to_string(env.len()))
+    println("  pearson_r       = " + fmt(r))
+    println("  pearson_r_abs   = " + fmt(r_abs))
+    println("  threshold       = " + fmt(r_thr))
+    println("  C4_PASS         = " + to_string(pass))
+    println("  verdict         = " + verdict)
+    if source_caveat == 1 {
+        println("  CAVEAT: synthetic data source. Mk.VII spec C4.b requires")
+        println("          a pre-registered real EEG trace. This probe")
+        println("          VALIDATES the wiring; it does not by itself PASS C4.")
+    }
+
+    // ----- JSON emission -----
+    let c4_ok = if pass == 1 && source_caveat == 0 { 1 } else { 0 }
+    let mut body = "{\n"
+    body = body + "  \"verifier\": \"real_eeg_coupling_probe\",\n"
+    body = body + "  \"version\": \"v1\",\n"
+    body = body + "  \"criterion\": \"mk_vii_C4_real_world_coupling\",\n"
+    body = body + "  \"criteria_rev\": 1,\n"
+    body = body + "  \"criteria_commit\": \"9d035936\",\n"
+    body = body + "  \"generated\": \"2026-04-21T00:00:00Z\",\n"
+    body = body + "  \"seed\": " + to_string(SEED) + ",\n"
+    body = body + "  \"data_source\": \"" + data_source + "\",\n"
+    body = body + "  \"source_path\": \"" + source_path + "\",\n"
+    body = body + "  \"source_caveat\": " + to_string(source_caveat) + ",\n"
+    body = body + "  \"eeg\": {\n"
+    body = body + "    \"fs_hz\": " + to_string(EEG_FS) + ",\n"
+    body = body + "    \"duration_s\": " + to_string(EEG_T_SEC) + ",\n"
+    body = body + "    \"samples\": " + to_string(eeg.len()) + ",\n"
+    body = body + "    \"alpha_band_hz\": \"8-13\",\n"
+    body = body + "    \"beta_band_hz\": \"20\",\n"
+    body = body + "    \"noise_amp\": " + fmt(NOISE_AMP) + "\n"
+    body = body + "  },\n"
+    body = body + "  \"trajectory\": {\n"
+    body = body + "    \"path\": \"" + TRAJ_PATH + "\",\n"
+    body = body + "    \"phi_samples\": " + to_string(phi.len()) + "\n"
+    body = body + "  },\n"
+    body = body + "  \"envelope\": {\n"
+    body = body + "    \"window_len_samples\": " + to_string(WINDOW_LEN) + ",\n"
+    body = body + "    \"n_windows\": " + to_string(env.len()) + ",\n"
+    body = body + "    \"method\": \"windowed_rms_zero_mean\"\n"
+    body = body + "  },\n"
+    body = body + "  \"result\": {\n"
+    body = body + "    \"pearson_r\": " + fmt(r) + ",\n"
+    body = body + "    \"pearson_r_abs\": " + fmt(r_abs) + ",\n"
+    body = body + "    \"threshold_r\": " + fmt(r_thr) + ",\n"
+    body = body + "    \"pass\": " + to_string(pass) + ",\n"
+    body = body + "    \"verdict\": \"" + verdict + "\"\n"
+    body = body + "  },\n"
+    body = body + "  \"c4_satisfies_mk_vii\": " + to_string(c4_ok) + ",\n"
+    body = body + "  \"notes\": {\n"
+    body = body + "    \"weakest_axis\": \"C4 was MINIMAL pre-drill; btr-evo 4 used synthesized alpha only.\",\n"
+    body = body + "    \"on_synth_pass\": \"PASS_SYNTH_CAVEATED validates pipeline only; real data still required for Mk.VII C4.\"\n"
+    body = body + "  },\n"
+    body = body + "  \"safe_commit\": \"V8\",\n"
+    body = body + "  \"llm\": \"none\",\n"
+    body = body + "  \"deterministic\": true\n"
+    body = body + "}\n"
+    write_file(OUT_PATH, body)
+
+    println("")
+    println("  wrote: " + OUT_PATH)
+
+    let code_fail = if pass_abs == 1 { 3 } else { 1 }
+    let code = if pass == 1 { 0 } else { code_fail }
+    exit(code)
+}
+
+main()
