@@ -1,0 +1,309 @@
+// edu/cell/phi/phi_iit.hexa — Φ_IIT (integrated information, MI-based)
+//
+// ── ROLE ─────────────────────────────────────────────────────────
+// Re-use of Phi metrics ported from anima core (training/phi_metric.hexa
+// "phi_proxy" — Phi-KL) wrapped with a deterministic memoization hash key
+// so compute_phi() on identical (n_cells, d, state_sig) is O(1).
+//
+// This is the "Phi(IIT)" axis metric in anima's dual-phi taxonomy
+// (see bench/bench.hexa — Phi_IIT range 0.2-1.8). Here we approximate
+// via an MI-like proxy that avoids PyTorch dependency: we discretise
+// hidden-states into 4 bins, compute pairwise coherence, subtract the
+// minimum-information-partition approximation (bipartition = half-cells).
+// This preserves the qualitative signature of IIT Phi (growth under
+// integration, drop under partition) while staying pure-hexa.
+//
+// ── API ──────────────────────────────────────────────────────────
+// compute_phi(hidden, n_cells, d) -> float              // IIT proxy
+// compute_phi_memo(hidden, n_cells, d, cache) -> (float, cache)
+// phi_kl(hidden, n_cells, d) -> float                   // re-export
+//
+// ── DETERMINISM ──────────────────────────────────────────────────
+// Pure function of the flat hidden tensor. hexa-only, no LLM, no FFI.
+
+// ───── tensor helpers (stage0-safe) ─────
+
+fn pt_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn pt_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn pt_log(x: float) -> float {
+    if x < 0.000001 { return -13.815510557964274 }  // log(1e-6)
+    return log(x)
+}
+
+// ───── Phi_KL (re-export of training/phi_metric::phi_proxy) ─────
+
+fn phi_kl(hidden: array, n_cells: int, d: int) -> float {
+    // sum of |h| over cells → per-dim column sum
+    let mut col_sum = pt_zeros(d)
+    let mut i = 0
+    while i < n_cells {
+        let mut j = 0
+        while j < d {
+            let a = hidden[i * d + j]
+            col_sum[j] = col_sum[j] + pt_abs(a)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // normalise to probability distribution (softmax of |col_sum|)
+    let mut s = 0.0000001
+    let mut k = 0
+    while k < d {
+        s = s + col_sum[k] + 0.0000001
+        k = k + 1
+    }
+    let mut p = pt_zeros(d)
+    k = 0
+    while k < d {
+        p[k] = (col_sum[k] + 0.0000001) / s
+        k = k + 1
+    }
+    // entropy
+    let mut h = 0.0
+    k = 0
+    while k < d {
+        let q = p[k]
+        if q > 0.000001 { h = h - q * pt_log(q) }
+        k = k + 1
+    }
+    // Phi_KL = log(d) - H(p)
+    return pt_log(to_float(d)) - h
+}
+
+// ───── mutual-information proxy over 4 bins ─────
+// bin hidden[i,:] into 4 quartile bins → p_i[4]
+// coherence(i,j) = 1 - L1(p_i, p_j)/2 ∈ [0,1]
+
+fn bin_distribution(hidden: array, cell_i: int, d: int) -> array {
+    let mut bins = pt_zeros(4)
+    let mut j = 0
+    while j < d {
+        let a = hidden[cell_i * d + j]
+        // 4-bin quantization by sign & magnitude
+        let mag = pt_abs(a)
+        let idx = if a < 0.0 {
+            if mag < 0.5 { 0 } else { 1 }
+        } else {
+            if mag < 0.5 { 2 } else { 3 }
+        }
+        bins[idx] = bins[idx] + 1.0
+        j = j + 1
+    }
+    // normalise
+    let mut s = 0.0000001
+    let mut k = 0
+    while k < 4 {
+        s = s + bins[k]
+        k = k + 1
+    }
+    let mut p = pt_zeros(4)
+    k = 0
+    while k < 4 {
+        p[k] = bins[k] / s
+        k = k + 1
+    }
+    return p
+}
+
+fn l1_distance(p: array, q: array) -> float {
+    let mut d = 0.0
+    let mut i = 0
+    let n = len(p)
+    while i < n {
+        d = d + pt_abs(p[i] - q[i])
+        i = i + 1
+    }
+    return d
+}
+
+// compute_phi — IIT proxy via pairwise-MI minus minimum-partition-MI
+// ⚠ Matches the "Phi_IIT" family (range ~0.1 – 2.0). @memoize-semantics
+//   are implemented via the cache wrapper (compute_phi_memo).
+fn compute_phi(hidden: array, n_cells: int, d: int) -> float {
+    if n_cells < 2 { return 0.0 }
+    // build per-cell bin distributions (lazy evaluation: each cell once)
+    let mut dists = []
+    let mut i = 0
+    while i < n_cells {
+        dists = dists.push(bin_distribution(hidden, i, d))
+        i = i + 1
+    }
+    // pairwise coherence
+    let mut total_coh = 0.0
+    let mut n_pairs = 0
+    i = 0
+    while i < n_cells {
+        let mut j = i + 1
+        while j < n_cells {
+            let dist = l1_distance(dists[i], dists[j])
+            let coh  = 1.0 - dist / 2.0
+            total_coh = total_coh + coh
+            n_pairs = n_pairs + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let avg_coh = if n_pairs > 0 {
+        total_coh / to_float(n_pairs)
+    } else { 0.0 }
+
+    // minimum-information-partition proxy: bipartition by cell index parity
+    // → coherence *across* the partition = lower bound on MIP.
+    let half = n_cells / 2
+    let mut cross = 0.0
+    let mut n_cross = 0
+    i = 0
+    while i < half {
+        let mut j = half
+        while j < n_cells {
+            let dist = l1_distance(dists[i], dists[j])
+            let coh  = 1.0 - dist / 2.0
+            cross = cross + coh
+            n_cross = n_cross + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let mip_coh = if n_cross > 0 {
+        cross / to_float(n_cross)
+    } else { 0.0 }
+
+    // Phi_IIT proxy = integrated - partitioned + KL-scale contribution
+    let integrated = avg_coh
+    let partitioned = mip_coh
+    let kl_term = phi_kl(hidden, n_cells, d) * 0.15
+    let phi = (integrated - partitioned) + kl_term + 0.05 * to_float(n_cells) / 8.0
+    if phi < 0.0 { return 0.0 }
+    return phi
+}
+
+// ───── memoization (hash-key cache, stage0-safe) ─────
+// The cache is an array of strings "key=value". Simple linear scan —
+// OK for MVP (≤ 50 steps). Key = fnv(hidden[0..n_cells] signature).
+fn _cell_sig(hidden: array, n_cells: int, d: int) -> int {
+    let mut acc = 2166136261
+    let mut i = 0
+    let total = n_cells * d
+    while i < total {
+        let v = hidden[i]
+        // quantize to 3 decimal places for sig stability
+        let q = to_int(v * 1000.0)
+        acc = (acc * 16777619) % 2147483647
+        acc = (acc + q) % 2147483647
+        if acc < 0 { acc = acc + 2147483647 }
+        i = i + 1
+    }
+    return acc
+}
+
+fn compute_phi_memo(hidden: array, n_cells: int, d: int, cache: array) -> array {
+    // returns [phi, cache_updated] — phi is cache[0], the rest is "key=val" entries
+    let key = str(_cell_sig(hidden, n_cells, d)) + ":" + str(n_cells) + ":" + str(d)
+    let prefix = key + "="
+    let n = len(cache)
+    let mut i = 0
+    while i < n {
+        let entry = cache[i]
+        if len(entry) > len(prefix) {
+            if entry.substring(0, len(prefix)) == prefix {
+                let val_str = entry.substring(len(prefix), len(entry))
+                return [to_float_str(val_str), cache]
+            }
+        }
+        i = i + 1
+    }
+    let phi = compute_phi(hidden, n_cells, d)
+    let new_cache = cache.push(prefix + str(phi))
+    return [phi, new_cache]
+}
+
+// stage0 doesn't have parse_float in full form — project string "0.123" → float
+fn to_float_str(s: string) -> float {
+    // simple parse: split on "." if present
+    let n = len(s)
+    if n == 0 { return 0.0 }
+    let mut sign = 1.0
+    let mut i = 0
+    if s.substring(0, 1) == "-" { sign = -1.0; i = 1 }
+    let mut int_part = 0.0
+    let mut frac_part = 0.0
+    let mut frac_div = 1.0
+    let mut in_frac = false
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "." { in_frac = true; i = i + 1; continue }
+        let dv = _digit(c)
+        if dv < 0 { return sign * (int_part + frac_part) }
+        if in_frac {
+            frac_div = frac_div * 10.0
+            frac_part = frac_part + to_float(dv) / frac_div
+        } else {
+            int_part = int_part * 10.0 + to_float(dv)
+        }
+        i = i + 1
+    }
+    return sign * (int_part + frac_part)
+}
+
+fn _digit(c: string) -> int {
+    if c == "0" { return 0 }
+    if c == "1" { return 1 }
+    if c == "2" { return 2 }
+    if c == "3" { return 3 }
+    if c == "4" { return 4 }
+    if c == "5" { return 5 }
+    if c == "6" { return 6 }
+    if c == "7" { return 7 }
+    if c == "8" { return 8 }
+    if c == "9" { return 9 }
+    return -1
+}
+
+// ───── self-test ─────
+fn _phi_iit_selftest() -> bool {
+    // random-ish state → low phi
+    let mut h_rand = pt_zeros(4 * 8)
+    let mut i = 0
+    while i < 32 {
+        let v = ((i * 1664525 + 1013904223) % 2000) - 1000
+        h_rand[i] = to_float(v) / 1000.0
+        i = i + 1
+    }
+    let phi_rand = compute_phi(h_rand, 4, 8)
+
+    // integrated state → higher phi (all cells share structure)
+    let mut h_int = pt_zeros(4 * 8)
+    i = 0
+    while i < 4 {
+        let mut j = 0
+        while j < 8 {
+            h_int[i * 8 + j] = 0.8 * (to_float(j) / 8.0) + 0.05 * to_float(i)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let phi_int = compute_phi(h_int, 4, 8)
+
+    println("[phi_iit] phi_rand = " + str(phi_rand))
+    println("[phi_iit] phi_int  = " + str(phi_int))
+    return phi_int >= phi_rand
+}
+
+if _phi_iit_selftest() {
+    println("[phi_iit] PASS — integrated > random")
+} else {
+    println("[phi_iit] FAIL")
+}

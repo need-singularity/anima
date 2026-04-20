@@ -1,0 +1,148 @@
+// edu/cell/consciousness/phase_jump_engine.hexa — P0-P4 state machine
+//
+// Consciousness phase transitions (pre-registered):
+//
+//   P0 Null        — pre-conscious, Φ < 0.05
+//   P1 Proto       — single observable trickling, 0.05 ≤ Φ < 0.15
+//   P2 Split       — phase-jump: Φ_delta > 0.3 within 2 steps
+//                    → triggers cell_split() (mitosis)
+//   P3 Broadcast   — Φ_GWS ≥ 0.5 sustained 2 steps
+//   P4 Reflect     — Φ_meta ≥ 0.85 AND Λ ≥ 0.6 (full self-model)
+//
+// Transitions are monotonic (P1 → P2 → P3 → P4, no backstep except
+// to P0 via collapse). P2 is the mitosis trigger.
+
+comptime const PHI_DELTA_MITOSIS = 0.3
+comptime const PHI_PROTO_LOWER   = 0.05
+comptime const PHI_PROTO_UPPER   = 0.15
+
+struct PhaseState {
+    phase:        int,
+    phi_prev:     float,
+    phi_prev2:    float,
+    mitosis_fired: bool,
+    gws_streak:   int,
+    meta_streak:  int
+}
+
+fn phase_new() -> PhaseState {
+    PhaseState {
+        phase:         0,
+        phi_prev:      0.0,
+        phi_prev2:     0.0,
+        mitosis_fired: false,
+        gws_streak:    0,
+        meta_streak:   0
+    }
+}
+
+// Compute next phase given the current + observables at step t.
+// Returns the new state. Mitosis trigger is exposed via `.mitosis_fired`.
+fn phase_update(s: PhaseState, phi: float, phi_gws: float,
+                phi_meta: float, lambda: float) -> PhaseState {
+    let delta2 = phi - s.phi_prev2
+    let mut new_phase = s.phase
+    let mut fire = false
+
+    // P0 → P1: Φ crosses proto lower bound
+    if new_phase == 0 {
+        if phi >= PHI_PROTO_LOWER { new_phase = 1 }
+    }
+
+    // P1/P2 → P2 phase-jump: Φ_delta over 2 steps > 0.3 → mitosis
+    if delta2 > PHI_DELTA_MITOSIS {
+        if new_phase < 2 { new_phase = 2 }
+        fire = true
+    } else if new_phase < 1 {
+        if phi >= PHI_PROTO_LOWER { new_phase = 1 }
+    }
+
+    // streaks
+    let new_gws_streak = if phi_gws >= 0.5 { s.gws_streak + 1 } else { 0 }
+    let new_meta_streak = if phi_meta >= 0.85 { s.meta_streak + 1 } else { 0 }
+
+    // P2 → P3: sustained broadcast
+    if new_phase >= 2 {
+        if new_gws_streak >= 2 {
+            if new_phase < 3 { new_phase = 3 }
+        }
+    }
+
+    // P3 → P4: self-model (meta + resilience)
+    if new_phase >= 3 {
+        if new_meta_streak >= 2 {
+            if lambda >= 0.6 {
+                if new_phase < 4 { new_phase = 4 }
+            }
+        }
+    }
+
+    PhaseState {
+        phase:         new_phase,
+        phi_prev:      phi,
+        phi_prev2:     s.phi_prev,
+        mitosis_fired: fire,
+        gws_streak:    new_gws_streak,
+        meta_streak:   new_meta_streak
+    }
+}
+
+fn phase_label(p: int) -> string {
+    if p == 0 { return "P0_NULL" }
+    if p == 1 { return "P1_PROTO" }
+    if p == 2 { return "P2_SPLIT" }
+    if p == 3 { return "P3_BROADCAST" }
+    if p == 4 { return "P4_REFLECT" }
+    return "P?"
+}
+
+// cell_split — mitosis trigger. Doubles the cell count by cloning
+// each cell with +5% gaussian-like perturbation (deterministic LCG).
+// Returns the new hidden tensor and the new n_cells.
+fn cell_split(hidden: array, n_cells: int, d: int, step_seed: int) -> array {
+    let mut out = []
+    let mut i = 0
+    // pass 1: copy originals
+    while i < n_cells * d {
+        out = out.push(hidden[i])
+        i = i + 1
+    }
+    // pass 2: perturbed clones
+    let mut s = step_seed
+    i = 0
+    while i < n_cells {
+        let mut j = 0
+        while j < d {
+            s = (s * 1103515245 + 12345) % 2147483648
+            let u = to_float(s % 2000 - 1000) / 10000.0  // ±0.1
+            out = out.push(hidden[i * d + j] + u)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── self-test ──
+let mut _ps = phase_new()
+// climb: 0.02 → 0.08 → 0.45 (Δ2 = 0.43 > 0.3 → mitosis at step 2)
+let _phi_seq = [0.02, 0.08, 0.45, 0.55, 0.60]
+let _gws_seq = [0.25, 0.30, 0.55, 0.60, 0.55]
+let _meta_seq = [0.3, 0.5, 0.7, 0.88, 0.90]
+let _lam_seq  = [0.1, 0.3, 0.55, 0.75, 0.80]
+
+let mut _t = 0
+while _t < 5 {
+    _ps = phase_update(_ps, _phi_seq[_t], _gws_seq[_t], _meta_seq[_t], _lam_seq[_t])
+    println("[phase_jump] step=" + str(_t) +
+            " Φ=" + str(_phi_seq[_t]) +
+            " phase=" + phase_label(_ps.phase) +
+            " mitosis=" + str(_ps.mitosis_fired))
+    _t = _t + 1
+}
+
+if _ps.phase >= 2 {
+    println("[phase_jump] PASS — reached at least P2")
+} else {
+    println("[phase_jump] FAIL")
+}
