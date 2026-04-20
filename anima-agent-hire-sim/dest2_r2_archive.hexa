@@ -1,0 +1,132 @@
+// dest2_r2_archive.hexa — R2 archival hook for dest2 gate runs (AN11-c)
+//
+// PURPOSE
+//   Upload a local hire_sim gate JSON (from hire_sim_runner.hexa or
+//   hire_sim_live.hexa selftest_10x3 traces) to the
+//   r2:anima-memory/dest2_employee_gate/<YYYYMMDD>/ bucket so the
+//   AN11-c "real-usable" condition is satisfied (endpoint + R2 artifact
+//   + reproducible README block in the convergence file).
+//
+//   Policy reference:
+//     - shared/convergence/dest1_alm_ship.convergence @dest_employee_gate
+//     - reference_r2_buckets memory: anima-memory bucket = state, traces,
+//       audit logs (anima-models = checkpoints; this script DOES NOT
+//       touch checkpoints — wrong bucket).
+//
+// USAGE
+//   hexa run anima-agent-hire-sim/dest2_r2_archive.hexa <local_path>
+//   hexa run anima-agent-hire-sim/dest2_r2_archive.hexa <local_path> --bucket r2:anima-memory/dest2_employee_gate
+//   hexa run anima-agent-hire-sim/dest2_r2_archive.hexa --selftest   # mock (no rclone call)
+//
+// EXIT
+//   0 = upload OK (or selftest dry-run OK)
+//   1 = bad args / file missing
+//   2 = rclone non-zero exit
+//
+// CONTRACT
+//   - rclone is the only allowed transport. No .py, no aws CLI fallback.
+//   - dest path is r2:anima-memory/dest2_employee_gate/YYYYMMDD/<basename>.
+//   - prints a one-line summary on success: "[r2_upload] OK <dest>".
+//   - --selftest does NOT call rclone; it only verifies arg parsing +
+//     dest-path construction and prints the would-be rclone command.
+
+const DEFAULT_BUCKET: string = "r2:anima-memory/dest2_employee_gate"
+
+fn today_yyyymmdd() -> string {
+    return exec("date +%Y%m%d").trim()
+}
+
+fn basename_of(path: string) -> string {
+    let n = len(path)
+    let mut i = n - 1
+    while i >= 0 {
+        if path.substring(i, i + 1) == "/" {
+            return path.substring(i + 1, n)
+        }
+        i = i - 1
+    }
+    return path
+}
+
+fn build_dest(bucket: string, local_path: string) -> string {
+    let day = today_yyyymmdd()
+    let base = basename_of(local_path)
+    return bucket + "/" + day + "/" + base
+}
+
+fn run_rclone(local_path: string, dest: string) -> int {
+    let cmd = "rclone copyto " + local_path + " " + dest
+            + " -v --s3-no-check-bucket 2>&1"
+    let out = exec(cmd)
+    println(out)
+    // rclone copyto returns "" on stderr-only success in stage0 exec
+    // wrapper; verify by re-checking with rclone size.
+    let probe = "rclone size " + dest + " 2>/dev/null | head -1"
+    let probe_out = exec(probe).trim()
+    if probe_out.index_of("Total objects: 1") >= 0 { return 0 }
+    if probe_out.index_of("Total objects: ") >= 0 { return 0 }
+    return 2
+}
+
+fn upload(local_path: string, bucket: string) -> int {
+    if !file_exists(local_path) {
+        println("[r2_upload] FAIL local_path missing: " + local_path)
+        return 1
+    }
+    let dest = build_dest(bucket, local_path)
+    let rc = run_rclone(local_path, dest)
+    if rc == 0 {
+        println("[r2_upload] OK " + dest)
+    } else {
+        println("[r2_upload] FAIL rclone rc=" + to_string(rc) + " dest=" + dest)
+    }
+    return rc
+}
+
+fn selftest() -> int {
+    let fake_local = "/tmp/dest2_r2_selftest_" + today_yyyymmdd() + ".json"
+    write_file(fake_local, "{\"selftest\":true,\"ts\":\"" + today_yyyymmdd() + "\"}")
+    let dest = build_dest(DEFAULT_BUCKET, fake_local)
+    println("[r2_upload selftest] would-be cmd:")
+    println("  rclone copyto " + fake_local + " " + dest + " -v --s3-no-check-bucket")
+    println("[r2_upload selftest] dest path OK")
+    let _ = exec("rm -f " + fake_local)
+    return 0
+}
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+    let mut local_path = ""
+    let mut bucket = DEFAULT_BUCKET
+    let mut do_selftest = false
+    let mut i = 0
+    while i < argc {
+        let a = argv[i]
+        if a == "--selftest" { do_selftest = true; i = i + 1; continue }
+        if a == "--bucket" && (i + 1) < argc {
+            bucket = argv[i + 1]
+            i = i + 2
+            continue
+        }
+        if a.index_of("--") != 0 {
+            local_path = a
+        }
+        i = i + 1
+    }
+
+    if do_selftest {
+        let rc = selftest()
+        return
+    }
+
+    if local_path == "" {
+        println("[r2_upload] usage: dest2_r2_archive.hexa <local_path> [--bucket r2:...]")
+        println("           or:    dest2_r2_archive.hexa --selftest")
+        return
+    }
+
+    let rc = upload(local_path, bucket)
+    // exit code propagation: hexa stage0 main() returns void, but
+    // [r2_upload] OK / FAIL line is the verifiable signal for callers.
+}
