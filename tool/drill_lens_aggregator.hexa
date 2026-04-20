@@ -1,0 +1,451 @@
+// tool/drill_lens_aggregator.hexa — ζ 5-module lens aggregator
+//
+// PURPOSE
+//   Combine the verdicts from the 5 per-lens modules into a single
+//   aggregated verdict. Each lens returns [primary, secondary, score];
+//   the aggregator produces:
+//     - per_lens  : 5-entry map lens_name -> verdict
+//     - consensus : the primary label agreed by >= 3/5 lenses (or "split")
+//     - avg_score : arithmetic mean of the 5 lens scores
+//     - agreement : number of lenses whose primary matches consensus / 5
+//     - verdict   : "PASS" if avg_score >= 0.6 AND agreement >= 0.6, else "REJECT"
+//
+// INPUT
+//   Same DrillOutput shape as the per-lens modules:
+//     [seed_id, sat_state, abs_rate, sat_score, depth, missing, per_module[]]
+//
+// CROSS-VERIFICATION CONTRACT
+//   Each lens looks at the DrillOutput through a different angle:
+//     blowup    → divergence / singularity
+//     closure   → fixpoint / category closure
+//     gap       → coverage / missing primitives
+//     phi       → integration / entropy bottleneck
+//     self_ref  → recursion / self-reference
+//   The aggregator's job is NOT to average the raw lens opinions (they
+//   measure different things) but to compute (a) a consensus vote on
+//   whether the DrillOutput is "good" and (b) per-lens transparency.
+//
+// V8 SAFE_COMMIT: additive; unique prefix; consumes the 5 lens files by
+//                 inlining the lens(input) logic. No runtime "hexa call"
+//                 coupling — pure function composition, deterministic.
+//
+// NOTE: hexa stage0 lacks a reliable import system; therefore each lens
+// file exposes lens(input) standalone AND this aggregator re-implements
+// the same 5 functions here under lens_<name> prefix. This matches the
+// drill_breakthrough_runner's graceful-fallback style where the actual
+// module's on-disk presence is used as a liveness flag — see:
+//   tool/drill_breakthrough_runner.hexa line 132-140.
+
+// ─── shared LensVerdict constructor / accessors ────────────────────
+
+fn verdict_primary(v: array) -> string   { return v[0] }
+fn verdict_secondary(v: array) -> string { return v[1] }
+fn verdict_score(v: array) -> float      { return to_float(v[2]) }
+
+fn make_verdict(primary: string, secondary: string, score: float) -> array {
+    let mut v = []
+    v = v.push(primary)
+    v = v.push(secondary)
+    v = v.push(score)
+    return v
+}
+
+// ─── DrillOutput accessors ─────────────────────────────────────────
+
+fn drill_state(d: array) -> string      { return d[1] }
+fn drill_abs_rate(d: array) -> float    { return to_float(d[2]) }
+fn drill_sat_score(d: array) -> float   { return to_float(d[3]) }
+fn drill_depth(d: array) -> int         { return to_int(d[4]) }
+fn drill_missing(d: array) -> int       { return to_int(d[5]) }
+fn drill_per_module(d: array) -> array  { return d[6] }
+
+fn pm_missing(m: array) -> bool { return m[1] == true }
+fn pm_abs(m: array) -> float    { return to_float(m[3]) }
+fn pm_sat(m: array) -> float    { return to_float(m[4]) }
+
+// ─── shared helpers ────────────────────────────────────────────────
+
+let DEPTH_MIN = 3
+
+fn clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn abs_spread(per_mod: array) -> float {
+    let n = len(per_mod)
+    if n == 0 { return 0.0 }
+    let mut mn = 1.0
+    let mut mx = 0.0
+    let mut i = 0
+    while i < n {
+        let a = pm_abs(per_mod[i])
+        if a < mn { mn = a }
+        if a > mx { mx = a }
+        i = i + 1
+    }
+    return mx - mn
+}
+
+fn abs_mean(per_mod: array) -> float {
+    let n = len(per_mod)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n { s = s + pm_abs(per_mod[i]); i = i + 1 }
+    return s / to_float(n)
+}
+
+fn asymmetric_spike(per_mod: array) -> bool {
+    let mean = abs_mean(per_mod)
+    if mean <= 0.0 { return false }
+    let n = len(per_mod)
+    let mut i = 0
+    while i < n {
+        if pm_abs(per_mod[i]) > 2.0 * mean { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn sat_spread(per_mod: array) -> float {
+    let n = len(per_mod)
+    if n == 0 { return 0.0 }
+    let mut mn = 1.0
+    let mut mx = 0.0
+    let mut i = 0
+    while i < n {
+        let s = pm_sat(per_mod[i])
+        if s < mn { mn = s }
+        if s > mx { mx = s }
+        i = i + 1
+    }
+    return mx - mn
+}
+
+fn sat_all_above(per_mod: array, thr: float) -> bool {
+    let n = len(per_mod)
+    let mut i = 0
+    while i < n {
+        if pm_sat(per_mod[i]) < thr { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn majority_below(per_mod: array, thr: float) -> bool {
+    let n = len(per_mod)
+    if n == 0 { return true }
+    let mut below = 0
+    let mut i = 0
+    while i < n {
+        if pm_sat(per_mod[i]) < thr { below = below + 1 }
+        i = i + 1
+    }
+    return below * 2 > n
+}
+
+fn missing_count(per_mod: array) -> int {
+    let n = len(per_mod)
+    let mut c = 0
+    let mut i = 0
+    while i < n {
+        if pm_missing(per_mod[i]) { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+fn mean_sat(per_mod: array) -> float {
+    let n = len(per_mod)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n { s = s + pm_sat(per_mod[i]); i = i + 1 }
+    return s / to_float(n)
+}
+
+fn min_sat(per_mod: array) -> float {
+    let n = len(per_mod)
+    if n == 0 { return 0.0 }
+    let mut mn = 1.0
+    let mut i = 0
+    while i < n {
+        let s = pm_sat(per_mod[i])
+        if s < mn { mn = s }
+        i = i + 1
+    }
+    return mn
+}
+
+fn entropy_proxy(per_mod: array) -> float {
+    let n = len(per_mod)
+    if n <= 1 { return 0.0 }
+    let mut s = 0.0
+    let mut mx = 0.0
+    let mut i = 0
+    while i < n {
+        let v = pm_sat(per_mod[i])
+        s = s + v
+        if v > mx { mx = v }
+        i = i + 1
+    }
+    let mean = s / to_float(n)
+    if mean <= 0.0 { return 0.0 }
+    let conc = clamp01((mx - mean) / mean)
+    return 1.0 - conc
+}
+
+// ─── 5 inlined lenses ─────────────────────────────────────────────
+
+fn lens_blowup(input: array) -> array {
+    let abs_r  = drill_abs_rate(input)
+    let pm     = drill_per_module(input)
+    let spread = abs_spread(pm)
+    let mut primary = "stable"
+    if abs_r >= 0.7 { primary = "blowup" }
+    else {
+        if spread >= 0.25 { primary = "blowup" }
+        else { if abs_r >= 0.3 { primary = "near_edge" } }
+    }
+    let mut secondary = "low_variance"
+    if spread >= 0.25 { secondary = "high_variance" }
+    else { if asymmetric_spike(pm) { secondary = "asymmetric" } }
+    let score = 1.0 - clamp01(abs_r)
+    return make_verdict(primary, secondary, score)
+}
+
+fn lens_closure(input: array) -> array {
+    let state  = drill_state(input)
+    let pm     = drill_per_module(input)
+    let spread = sat_spread(pm)
+    let avg    = drill_sat_score(input)
+    let mut primary = "open"
+    if state == "fixpoint" && sat_all_above(pm, 0.8) {
+        primary = "closed"
+    } else {
+        if state == "fixpoint" { primary = "converging" }
+        else {
+            if state == "converging" { primary = "converging" }
+            else {
+                if majority_below(pm, 0.5) { primary = "open" }
+                else { primary = "converging" }
+            }
+        }
+    }
+    let mut secondary = "uniform"
+    if spread >= 0.5 { secondary = "fragmented" }
+    else { if spread >= 0.1 { secondary = "partial_closure" } }
+    let score = clamp01(avg * (1.0 - clamp01(spread)))
+    return make_verdict(primary, secondary, score)
+}
+
+fn lens_gap(input: array) -> array {
+    let pm       = drill_per_module(input)
+    let depth    = drill_depth(input)
+    let mcount   = missing_count(pm)
+    let declared = drill_missing(input)
+    let eff_miss = if mcount > declared { mcount } else { declared }
+    let n        = len(pm)
+    let miss_ratio = if n > 0 { to_float(eff_miss) / to_float(n) } else { 0.0 }
+    let dead_gap   = mean_sat(pm) - min_sat(pm)
+    let mut primary = "complete"
+    if eff_miss > 0 { primary = "missing_prim" }
+    else {
+        if depth < DEPTH_MIN { primary = "shallow" }
+        else { if dead_gap > 0.5 { primary = "dead_zone" } }
+    }
+    let mut secondary = "full_cov"
+    if eff_miss >= 3 { secondary = "sparse_cov" }
+    else { if eff_miss >= 1 { secondary = "partial_cov" } }
+    let depth_factor = if depth >= DEPTH_MIN { 1.0 }
+                       else { to_float(depth) / to_float(DEPTH_MIN) }
+    let dead_factor  = 1.0 - clamp01(dead_gap)
+    let cov_factor   = 1.0 - clamp01(miss_ratio)
+    let score = clamp01(cov_factor * depth_factor * dead_factor)
+    return make_verdict(primary, secondary, score)
+}
+
+fn lens_phi(input: array) -> array {
+    let pm        = drill_per_module(input)
+    let depth     = drill_depth(input)
+    let entropy_v = entropy_proxy(pm)
+    let mn        = min_sat(pm)
+    let df        = if depth >= DEPTH_MIN { 1.0 }
+                    else { to_float(depth) / to_float(DEPTH_MIN) }
+    let phi_proxy = clamp01(entropy_v * mn * df)
+    let mut primary = "decomposed"
+    if phi_proxy >= 0.6 { primary = "integrated" }
+    else { if phi_proxy >= 0.3 { primary = "partial_int" } }
+    let mut secondary = "balanced"
+    if mn < 0.5 { secondary = "bottlenecked" }
+    else { if entropy_v < 0.8 { secondary = "imbalanced" } }
+    return make_verdict(primary, secondary, phi_proxy)
+}
+
+fn lens_self_ref(input: array) -> array {
+    let abs_r = drill_abs_rate(input)
+    let sat_s = drill_sat_score(input)
+    let depth = drill_depth(input)
+    let mut primary = "no_recursion"
+    if depth >= DEPTH_MIN {
+        if abs_r < 0.1 {
+            if sat_s >= 0.8 { primary = "well_founded" }
+            else {
+                if sat_s >= 0.5 { primary = "recursive_ok" }
+                else { primary = "runaway_loop" }
+            }
+        } else {
+            if abs_r < 0.3 {
+                if sat_s >= 0.6 { primary = "recursive_ok" }
+                else { primary = "runaway_loop" }
+            } else {
+                if sat_s < 0.5 { primary = "runaway_loop" }
+                else { primary = "recursive_ok" }
+            }
+        }
+    }
+    let mut secondary = "ungrounded"
+    if abs_r <= 0.05 {
+        if sat_s >= 0.9 { secondary = "ground_found" }
+        else { if sat_s >= 0.7 { secondary = "grounded" } }
+    } else {
+        if abs_r <= 0.2 {
+            if sat_s >= 0.7 { secondary = "grounded" }
+        }
+    }
+    let depth_factor = if depth >= DEPTH_MIN { 1.0 }
+                       else { to_float(depth) / to_float(DEPTH_MIN) }
+    let score = clamp01(sat_s * (1.0 - clamp01(abs_r)) * depth_factor)
+    return make_verdict(primary, secondary, score)
+}
+
+// ─── aggregate ────────────────────────────────────────────────────
+
+// AGG SHAPE (parallel-array):
+//   [names[], verdicts[], consensus, avg_score, agreement_ratio, verdict_text]
+
+fn agg_names(a: array) -> array     { return a[0] }
+fn agg_verdicts(a: array) -> array  { return a[1] }
+fn agg_consensus(a: array) -> string{ return a[2] }
+fn agg_avg(a: array) -> float       { return to_float(a[3]) }
+fn agg_agreement(a: array) -> float { return to_float(a[4]) }
+fn agg_verdict(a: array) -> string  { return a[5] }
+
+// Majority-primary consensus across 5 lenses. Since primary labels
+// differ by lens (each has its own label space), we compute an
+// orthogonal "good/bad" projection per lens first:
+//   good_labels = {stable, closed, complete, integrated, well_founded,
+//                  recursive_ok, partial_int, near_edge, converging}
+//   bad_labels  = {blowup, open, missing_prim, shallow, dead_zone,
+//                  decomposed, runaway_loop, no_recursion}
+// The consensus vote is on good vs bad; ties break to "mixed".
+
+fn is_good_primary(p: string) -> bool {
+    if p == "stable" { return true }
+    if p == "closed" { return true }
+    if p == "complete" { return true }
+    if p == "integrated" { return true }
+    if p == "well_founded" { return true }
+    if p == "recursive_ok" { return true }
+    if p == "converging" { return true }
+    if p == "near_edge" { return true }
+    if p == "partial_int" { return true }
+    return false
+}
+
+fn aggregate(input: array) -> array {
+    let mut names = []
+    let mut verdicts = []
+
+    names = names.push("blowup")
+    verdicts = verdicts.push(lens_blowup(input))
+
+    names = names.push("closure")
+    verdicts = verdicts.push(lens_closure(input))
+
+    names = names.push("gap")
+    verdicts = verdicts.push(lens_gap(input))
+
+    names = names.push("phi")
+    verdicts = verdicts.push(lens_phi(input))
+
+    names = names.push("self_ref")
+    verdicts = verdicts.push(lens_self_ref(input))
+
+    let n = len(verdicts)
+    let mut good_n = 0
+    let mut sum_s = 0.0
+    let mut i = 0
+    while i < n {
+        let v = verdicts[i]
+        sum_s = sum_s + verdict_score(v)
+        if is_good_primary(verdict_primary(v)) { good_n = good_n + 1 }
+        i = i + 1
+    }
+    let avg = sum_s / to_float(n)
+    let bad_n = n - good_n
+    let mut consensus = "mixed"
+    if good_n * 2 > n { consensus = "good" }
+    else { if bad_n * 2 > n { consensus = "bad" } }
+    let agree_count = if good_n > bad_n { good_n } else { bad_n }
+    let agreement = to_float(agree_count) / to_float(n)
+
+    let mut verdict_text = "REJECT"
+    if avg >= 0.6 && agreement >= 0.6 && consensus == "good" {
+        verdict_text = "PASS"
+    }
+
+    let mut a = []
+    a = a.push(names)
+    a = a.push(verdicts)
+    a = a.push(consensus)
+    a = a.push(avg)
+    a = a.push(agreement)
+    a = a.push(verdict_text)
+    return a
+}
+
+// ─── main / smoke ────────────────────────────────────────────────
+
+fn main() {
+    // ideal DrillOutput: fixpoint, uniform high sat, low abs, deep enough
+    let mut mods = []
+    let mut i = 0
+    while i < 5 {
+        let mut m = []
+        m = m.push("mod_" + str(i))
+        m = m.push(false)
+        m = m.push(4)
+        m = m.push(0.05)
+        m = m.push(1.0)
+        mods = mods.push(m)
+        i = i + 1
+    }
+    let mut d = []
+    d = d.push("smoke_aggregate")
+    d = d.push("fixpoint")
+    d = d.push(0.05)
+    d = d.push(1.0)
+    d = d.push(4)
+    d = d.push(0)
+    d = d.push(mods)
+
+    let a = aggregate(d)
+    let vs = agg_verdicts(a)
+    let ns = agg_names(a)
+    println("drill_lens_aggregator")
+    let mut j = 0
+    while j < len(vs) {
+        let v = vs[j]
+        println("  " + ns[j] + ": " + verdict_primary(v)
+              + " / " + verdict_secondary(v)
+              + " (score=" + str(verdict_score(v)) + ")")
+        j = j + 1
+    }
+    println("  consensus=" + agg_consensus(a))
+    println("  avg_score=" + str(agg_avg(a)))
+    println("  agreement=" + str(agg_agreement(a)))
+    println("  verdict=" + agg_verdict(a))
+}

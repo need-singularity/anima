@@ -1,0 +1,152 @@
+// tool/drill_lens_closure.hexa — ζ 5-module lens (2/5): CLOSURE
+//
+// PURPOSE
+//   Category / fixpoint closure check. A drill output "closes" when the
+//   saturation_state is "fixpoint" AND the per-module saturation_score
+//   is uniform (all 5 modules agree). This lens measures the degree to
+//   which the 5-lens trajectory has collapsed onto a closed orbit.
+//
+// LENS CONTRACT (shared, see drill_lens_blowup.hexa)
+//   fn lens(input: DrillOutput) -> LensVerdict = [primary, secondary, score]
+//
+// PRIMARY LABELS
+//   "closed"     — state=="fixpoint" AND all modules sat_score >= 0.8
+//   "converging" — state=="converging" OR (fixpoint but one module < 0.8)
+//   "open"       — state=="open" OR majority modules sat_score < 0.5
+//
+// SECONDARY (closure-diagnostic)
+//   "uniform"        — all modules sat_score within 0.1 of each other
+//   "partial_closure"— sat spread in [0.1, 0.5)
+//   "fragmented"     — sat spread >= 0.5
+//
+// SCORE
+//   score = avg_sat_score * (1 - sat_spread) — rewards high AND uniform
+//   saturation. Deterministic, pure.
+//
+// V8 SAFE_COMMIT: additive; unique prefix.
+
+fn verdict_primary(v: array) -> string   { return v[0] }
+fn verdict_secondary(v: array) -> string { return v[1] }
+fn verdict_score(v: array) -> float      { return to_float(v[2]) }
+
+fn make_verdict(primary: string, secondary: string, score: float) -> array {
+    let mut v = []
+    v = v.push(primary)
+    v = v.push(secondary)
+    v = v.push(score)
+    return v
+}
+
+fn drill_state(d: array) -> string      { return d[1] }
+fn drill_sat_score(d: array) -> float   { return to_float(d[3]) }
+fn drill_per_module(d: array) -> array  { return d[6] }
+fn pm_sat(m: array) -> float            { return to_float(m[4]) }
+
+fn clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn sat_spread(per_mod: array) -> float {
+    let n = len(per_mod)
+    if n == 0 { return 0.0 }
+    let mut mn = 1.0
+    let mut mx = 0.0
+    let mut i = 0
+    while i < n {
+        let s = pm_sat(per_mod[i])
+        if s < mn { mn = s }
+        if s > mx { mx = s }
+        i = i + 1
+    }
+    return mx - mn
+}
+
+fn all_above(per_mod: array, thr: float) -> bool {
+    let n = len(per_mod)
+    let mut i = 0
+    while i < n {
+        if pm_sat(per_mod[i]) < thr { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn majority_below(per_mod: array, thr: float) -> bool {
+    let n = len(per_mod)
+    if n == 0 { return true }
+    let mut below = 0
+    let mut i = 0
+    while i < n {
+        if pm_sat(per_mod[i]) < thr { below = below + 1 }
+        i = i + 1
+    }
+    return below * 2 > n
+}
+
+fn lens(input: array) -> array {
+    let state  = drill_state(input)
+    let pm     = drill_per_module(input)
+    let spread = sat_spread(pm)
+    let avg    = drill_sat_score(input)
+
+    let mut primary = "open"
+    if state == "fixpoint" && all_above(pm, 0.8) {
+        primary = "closed"
+    } else {
+        if state == "fixpoint" {
+            primary = "converging"
+        } else {
+            if state == "converging" {
+                primary = "converging"
+            } else {
+                if majority_below(pm, 0.5) {
+                    primary = "open"
+                } else {
+                    primary = "converging"
+                }
+            }
+        }
+    }
+
+    let mut secondary = "uniform"
+    if spread >= 0.5 {
+        secondary = "fragmented"
+    } else {
+        if spread >= 0.1 { secondary = "partial_closure" }
+    }
+
+    let score = clamp01(avg * (1.0 - clamp01(spread)))
+    return make_verdict(primary, secondary, score)
+}
+
+fn main() {
+    // smoke: closed seed (state=fixpoint, all sat=1.0)
+    let mut mods = []
+    let mut i = 0
+    while i < 5 {
+        let mut m = []
+        m = m.push("mod_" + str(i))
+        m = m.push(false)
+        m = m.push(4)
+        m = m.push(0.05)
+        m = m.push(1.0)
+        mods = mods.push(m)
+        i = i + 1
+    }
+    let mut d = []
+    d = d.push("smoke_closed")
+    d = d.push("fixpoint")
+    d = d.push(0.05)
+    d = d.push(1.0)
+    d = d.push(4)
+    d = d.push(0)
+    d = d.push(mods)
+
+    let v = lens(d)
+    println("drill_lens_closure")
+    println("  primary=" + verdict_primary(v))
+    println("  secondary=" + verdict_secondary(v))
+    println("  score=" + str(verdict_score(v)))
+}

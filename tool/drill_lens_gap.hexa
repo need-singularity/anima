@@ -1,0 +1,157 @@
+// tool/drill_lens_gap.hexa — ζ 5-module lens (3/5): GAP
+//
+// PURPOSE
+//   Missing primitive / coverage gap detection. A drill output has a "gap"
+//   when one or more of the 5 sub-modules reports missing_module=true, or
+//   when depth_reached < DEPTH_MIN (coverage incomplete), or when any
+//   module's saturation_score is sharply lower than the rest (dead zone).
+//
+// LENS CONTRACT (shared)
+//   fn lens(input: DrillOutput) -> LensVerdict = [primary, secondary, score]
+//
+// PRIMARY LABELS
+//   "complete"      — no missing modules AND depth >= DEPTH_MIN AND no dead zone
+//   "shallow"       — depth < DEPTH_MIN  (coverage too thin)
+//   "missing_prim"  — at least one per_module.missing_module == true
+//                     OR modules_missing count > 0
+//   "dead_zone"     — one module sat_score << group mean (gap > 0.5)
+//
+// SECONDARY
+//   "full_cov"      — all 5 modules contributed
+//   "partial_cov"   — 1-2 modules missing
+//   "sparse_cov"    — 3+ modules missing
+//
+// SCORE
+//   score = (1 - missing_ratio) * min(1.0, depth/DEPTH_MIN) * (1 - dead_gap)
+//   where dead_gap = max(0, mean_sat - min_sat).
+//
+// V8 SAFE_COMMIT: additive; unique prefix.
+
+let DEPTH_MIN = 3
+
+fn verdict_primary(v: array) -> string   { return v[0] }
+fn verdict_secondary(v: array) -> string { return v[1] }
+fn verdict_score(v: array) -> float      { return to_float(v[2]) }
+
+fn make_verdict(primary: string, secondary: string, score: float) -> array {
+    let mut v = []
+    v = v.push(primary)
+    v = v.push(secondary)
+    v = v.push(score)
+    return v
+}
+
+fn drill_depth(d: array) -> int         { return to_int(d[4]) }
+fn drill_missing(d: array) -> int       { return to_int(d[5]) }
+fn drill_per_module(d: array) -> array  { return d[6] }
+
+fn pm_missing(m: array) -> bool { return m[1] == true }
+fn pm_sat(m: array) -> float    { return to_float(m[4]) }
+
+fn clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn missing_count(per_mod: array) -> int {
+    let n = len(per_mod)
+    let mut c = 0
+    let mut i = 0
+    while i < n {
+        if pm_missing(per_mod[i]) { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+fn mean_sat(per_mod: array) -> float {
+    let n = len(per_mod)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + pm_sat(per_mod[i])
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+fn min_sat(per_mod: array) -> float {
+    let n = len(per_mod)
+    if n == 0 { return 0.0 }
+    let mut mn = 1.0
+    let mut i = 0
+    while i < n {
+        let s = pm_sat(per_mod[i])
+        if s < mn { mn = s }
+        i = i + 1
+    }
+    return mn
+}
+
+fn lens(input: array) -> array {
+    let pm       = drill_per_module(input)
+    let depth    = drill_depth(input)
+    let mcount   = missing_count(pm)
+    let declared = drill_missing(input)
+    let eff_miss = if mcount > declared { mcount } else { declared }
+    let n        = len(pm)
+    let miss_ratio = if n > 0 { to_float(eff_miss) / to_float(n) } else { 0.0 }
+    let dead_gap   = mean_sat(pm) - min_sat(pm)
+
+    let mut primary = "complete"
+    if eff_miss > 0 {
+        primary = "missing_prim"
+    } else {
+        if depth < DEPTH_MIN {
+            primary = "shallow"
+        } else {
+            if dead_gap > 0.5 { primary = "dead_zone" }
+        }
+    }
+
+    let mut secondary = "full_cov"
+    if eff_miss >= 3 {
+        secondary = "sparse_cov"
+    } else {
+        if eff_miss >= 1 { secondary = "partial_cov" }
+    }
+
+    let depth_factor = if depth >= DEPTH_MIN { 1.0 }
+                       else { to_float(depth) / to_float(DEPTH_MIN) }
+    let dead_factor  = 1.0 - clamp01(dead_gap)
+    let cov_factor   = 1.0 - clamp01(miss_ratio)
+    let score = clamp01(cov_factor * depth_factor * dead_factor)
+    return make_verdict(primary, secondary, score)
+}
+
+fn main() {
+    // smoke: complete seed (no missing, depth=4, uniform sat)
+    let mut mods = []
+    let mut i = 0
+    while i < 5 {
+        let mut m = []
+        m = m.push("mod_" + str(i))
+        m = m.push(false)
+        m = m.push(4)
+        m = m.push(0.05)
+        m = m.push(1.0)
+        mods = mods.push(m)
+        i = i + 1
+    }
+    let mut d = []
+    d = d.push("smoke_complete")
+    d = d.push("fixpoint")
+    d = d.push(0.05)
+    d = d.push(1.0)
+    d = d.push(4)
+    d = d.push(0)
+    d = d.push(mods)
+
+    let v = lens(d)
+    println("drill_lens_gap")
+    println("  primary=" + verdict_primary(v))
+    println("  secondary=" + verdict_secondary(v))
+    println("  score=" + str(verdict_score(v)))
+}

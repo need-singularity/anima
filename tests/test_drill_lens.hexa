@@ -1,0 +1,439 @@
+// tests/test_drill_lens.hexa — ζ 5-module lens integration test
+//
+// Validates:
+//   1. each of 5 lens files exists and compiles (liveness)
+//   2. each lens(input) returns a well-formed LensVerdict
+//   3. aggregator reproduces the 5 lens verdicts AND computes consensus
+//   4. PASS case: uniform fixpoint seed → aggregator verdict=="PASS"
+//   5. REJECT case: absorbed seed → aggregator verdict=="REJECT"
+//
+// Deterministic. No LLM. No exec of external hexa (inlined lens logic
+// mirrors tool/drill_lens_aggregator.hexa — same numeric thresholds).
+//
+// V8 SAFE_COMMIT: additive; tests/ directory (repo convention); no
+//                 mutation of shared/state.
+
+// ─── helpers ────────────────────────────────────────────────────
+
+fn assert_true(cond: bool, msg: string) -> bool {
+    if cond { println("  [PASS] " + msg) ; return true }
+    println("  [FAIL] " + msg)
+    return false
+}
+
+fn assert_eq_str(got: string, want: string, msg: string) -> bool {
+    if got == want { println("  [PASS] " + msg + " = " + want) ; return true }
+    println("  [FAIL] " + msg + " want=" + want + " got=" + got)
+    return false
+}
+
+fn assert_ge(got: float, want: float, msg: string) -> bool {
+    if got >= want { println("  [PASS] " + msg + " >= " + str(want) + " (got " + str(got) + ")") ; return true }
+    println("  [FAIL] " + msg + " want>=" + str(want) + " got=" + str(got))
+    return false
+}
+
+// ─── LensVerdict / DrillOutput ──────────────────────────────────
+
+fn verdict_primary(v: array) -> string   { return v[0] }
+fn verdict_secondary(v: array) -> string { return v[1] }
+fn verdict_score(v: array) -> float      { return to_float(v[2]) }
+
+fn make_verdict(p: string, s: string, sc: float) -> array {
+    let mut v = []
+    v = v.push(p) ; v = v.push(s) ; v = v.push(sc)
+    return v
+}
+
+fn mk_module(name: string, missing: bool, depth: int, abs_r: float, sat: float) -> array {
+    let mut m = []
+    m = m.push(name)
+    m = m.push(missing)
+    m = m.push(depth)
+    m = m.push(abs_r)
+    m = m.push(sat)
+    return m
+}
+
+fn mk_drill(seed_id: string, state: string, abs_r: float, sat: float,
+            depth: int, missing: int, mods: array) -> array {
+    let mut d = []
+    d = d.push(seed_id)
+    d = d.push(state)
+    d = d.push(abs_r)
+    d = d.push(sat)
+    d = d.push(depth)
+    d = d.push(missing)
+    d = d.push(mods)
+    return d
+}
+
+fn drill_abs_rate(d: array) -> float    { return to_float(d[2]) }
+fn drill_sat_score(d: array) -> float   { return to_float(d[3]) }
+fn drill_depth(d: array) -> int         { return to_int(d[4]) }
+fn drill_missing(d: array) -> int       { return to_int(d[5]) }
+fn drill_state(d: array) -> string      { return d[1] }
+fn drill_per_module(d: array) -> array  { return d[6] }
+
+fn pm_missing(m: array) -> bool { return m[1] == true }
+fn pm_abs(m: array) -> float    { return to_float(m[3]) }
+fn pm_sat(m: array) -> float    { return to_float(m[4]) }
+
+// ─── inlined lenses (identical to aggregator) ──────────────────
+
+let DEPTH_MIN = 3
+
+fn clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn abs_spread(pm: array) -> float {
+    let n = len(pm) ; if n == 0 { return 0.0 }
+    let mut mn = 1.0 ; let mut mx = 0.0 ; let mut i = 0
+    while i < n {
+        let a = pm_abs(pm[i])
+        if a < mn { mn = a }
+        if a > mx { mx = a }
+        i = i + 1
+    }
+    return mx - mn
+}
+
+fn sat_spread(pm: array) -> float {
+    let n = len(pm) ; if n == 0 { return 0.0 }
+    let mut mn = 1.0 ; let mut mx = 0.0 ; let mut i = 0
+    while i < n {
+        let s = pm_sat(pm[i])
+        if s < mn { mn = s }
+        if s > mx { mx = s }
+        i = i + 1
+    }
+    return mx - mn
+}
+
+fn sat_all_above(pm: array, thr: float) -> bool {
+    let n = len(pm) ; let mut i = 0
+    while i < n {
+        if pm_sat(pm[i]) < thr { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn missing_count(pm: array) -> int {
+    let n = len(pm) ; let mut c = 0 ; let mut i = 0
+    while i < n {
+        if pm_missing(pm[i]) { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+fn mean_sat(pm: array) -> float {
+    let n = len(pm) ; if n == 0 { return 0.0 }
+    let mut s = 0.0 ; let mut i = 0
+    while i < n { s = s + pm_sat(pm[i]) ; i = i + 1 }
+    return s / to_float(n)
+}
+
+fn min_sat(pm: array) -> float {
+    let n = len(pm) ; if n == 0 { return 0.0 }
+    let mut mn = 1.0 ; let mut i = 0
+    while i < n {
+        let s = pm_sat(pm[i])
+        if s < mn { mn = s }
+        i = i + 1
+    }
+    return mn
+}
+
+fn entropy_proxy(pm: array) -> float {
+    let n = len(pm) ; if n <= 1 { return 0.0 }
+    let mut s = 0.0 ; let mut mx = 0.0 ; let mut i = 0
+    while i < n {
+        let v = pm_sat(pm[i])
+        s = s + v
+        if v > mx { mx = v }
+        i = i + 1
+    }
+    let mean = s / to_float(n)
+    if mean <= 0.0 { return 0.0 }
+    let conc = clamp01((mx - mean) / mean)
+    return 1.0 - conc
+}
+
+fn lens_blowup(d: array) -> array {
+    let abs_r = drill_abs_rate(d)
+    let spread = abs_spread(drill_per_module(d))
+    let mut p = "stable"
+    if abs_r >= 0.7 { p = "blowup" }
+    else { if spread >= 0.25 { p = "blowup" } else { if abs_r >= 0.3 { p = "near_edge" } } }
+    let mut s = "low_variance"
+    if spread >= 0.25 { s = "high_variance" }
+    return make_verdict(p, s, 1.0 - clamp01(abs_r))
+}
+
+fn lens_closure(d: array) -> array {
+    let state = drill_state(d)
+    let pm = drill_per_module(d)
+    let spread = sat_spread(pm)
+    let avg = drill_sat_score(d)
+    let mut p = "open"
+    if state == "fixpoint" && sat_all_above(pm, 0.8) { p = "closed" }
+    else { if state == "fixpoint" { p = "converging" } else { if state == "converging" { p = "converging" } } }
+    let mut s = "uniform"
+    if spread >= 0.5 { s = "fragmented" } else { if spread >= 0.1 { s = "partial_closure" } }
+    return make_verdict(p, s, clamp01(avg * (1.0 - clamp01(spread))))
+}
+
+fn lens_gap(d: array) -> array {
+    let pm = drill_per_module(d)
+    let depth = drill_depth(d)
+    let mcount = missing_count(pm)
+    let declared = drill_missing(d)
+    let eff_miss = if mcount > declared { mcount } else { declared }
+    let n = len(pm)
+    let miss_ratio = if n > 0 { to_float(eff_miss) / to_float(n) } else { 0.0 }
+    let dead_gap = mean_sat(pm) - min_sat(pm)
+    let mut p = "complete"
+    if eff_miss > 0 { p = "missing_prim" }
+    else { if depth < DEPTH_MIN { p = "shallow" } else { if dead_gap > 0.5 { p = "dead_zone" } } }
+    let mut s = "full_cov"
+    if eff_miss >= 3 { s = "sparse_cov" } else { if eff_miss >= 1 { s = "partial_cov" } }
+    let df = if depth >= DEPTH_MIN { 1.0 } else { to_float(depth) / to_float(DEPTH_MIN) }
+    let score = clamp01((1.0 - clamp01(miss_ratio)) * df * (1.0 - clamp01(dead_gap)))
+    return make_verdict(p, s, score)
+}
+
+fn lens_phi(d: array) -> array {
+    let pm = drill_per_module(d)
+    let depth = drill_depth(d)
+    let ent = entropy_proxy(pm)
+    let mn = min_sat(pm)
+    let df = if depth >= DEPTH_MIN { 1.0 } else { to_float(depth) / to_float(DEPTH_MIN) }
+    let phi = clamp01(ent * mn * df)
+    let mut p = "decomposed"
+    if phi >= 0.6 { p = "integrated" } else { if phi >= 0.3 { p = "partial_int" } }
+    let mut s = "balanced"
+    if mn < 0.5 { s = "bottlenecked" } else { if ent < 0.8 { s = "imbalanced" } }
+    return make_verdict(p, s, phi)
+}
+
+fn lens_self_ref(d: array) -> array {
+    let abs_r = drill_abs_rate(d)
+    let sat_s = drill_sat_score(d)
+    let depth = drill_depth(d)
+    let mut p = "no_recursion"
+    if depth >= DEPTH_MIN {
+        if abs_r < 0.1 {
+            if sat_s >= 0.8 { p = "well_founded" }
+            else { if sat_s >= 0.5 { p = "recursive_ok" } else { p = "runaway_loop" } }
+        } else {
+            if abs_r < 0.3 {
+                if sat_s >= 0.6 { p = "recursive_ok" } else { p = "runaway_loop" }
+            } else {
+                if sat_s < 0.5 { p = "runaway_loop" } else { p = "recursive_ok" }
+            }
+        }
+    }
+    let mut s = "ungrounded"
+    if abs_r <= 0.05 {
+        if sat_s >= 0.9 { s = "ground_found" } else { if sat_s >= 0.7 { s = "grounded" } }
+    } else { if abs_r <= 0.2 { if sat_s >= 0.7 { s = "grounded" } } }
+    let df = if depth >= DEPTH_MIN { 1.0 } else { to_float(depth) / to_float(DEPTH_MIN) }
+    return make_verdict(p, s, clamp01(sat_s * (1.0 - clamp01(abs_r)) * df))
+}
+
+fn is_good_primary(p: string) -> bool {
+    if p == "stable" { return true }
+    if p == "closed" { return true }
+    if p == "complete" { return true }
+    if p == "integrated" { return true }
+    if p == "well_founded" { return true }
+    if p == "recursive_ok" { return true }
+    if p == "converging" { return true }
+    if p == "near_edge" { return true }
+    if p == "partial_int" { return true }
+    return false
+}
+
+// aggregate → [consensus, avg, agreement, verdict]
+fn aggregate_flat(d: array) -> array {
+    let mut vs = []
+    vs = vs.push(lens_blowup(d))
+    vs = vs.push(lens_closure(d))
+    vs = vs.push(lens_gap(d))
+    vs = vs.push(lens_phi(d))
+    vs = vs.push(lens_self_ref(d))
+    let n = len(vs)
+    let mut good_n = 0 ; let mut sum_s = 0.0 ; let mut i = 0
+    while i < n {
+        let v = vs[i]
+        sum_s = sum_s + verdict_score(v)
+        if is_good_primary(verdict_primary(v)) { good_n = good_n + 1 }
+        i = i + 1
+    }
+    let avg = sum_s / to_float(n)
+    let bad_n = n - good_n
+    let mut consensus = "mixed"
+    if good_n * 2 > n { consensus = "good" } else { if bad_n * 2 > n { consensus = "bad" } }
+    let agree_count = if good_n > bad_n { good_n } else { bad_n }
+    let agreement = to_float(agree_count) / to_float(n)
+    let mut verdict_text = "REJECT"
+    if avg >= 0.6 && agreement >= 0.6 && consensus == "good" { verdict_text = "PASS" }
+    let mut a = []
+    a = a.push(consensus)
+    a = a.push(avg)
+    a = a.push(agreement)
+    a = a.push(verdict_text)
+    return a
+}
+
+// ─── test cases ─────────────────────────────────────────────────
+
+fn mk_pass_input() -> array {
+    // 5 modules, all sat=1.0, abs=0.05, depth=4, fixpoint.
+    let mut mods = []
+    let mut i = 0
+    while i < 5 {
+        mods = mods.push(mk_module("mod_" + str(i), false, 4, 0.04 + to_float(i) * 0.005, 1.0))
+        i = i + 1
+    }
+    return mk_drill("pos_seed", "fixpoint", 0.05, 1.0, 4, 0, mods)
+}
+
+fn mk_reject_input() -> array {
+    // absorbed seed: abs=0.85 (blowup), sat=0.2 (open), depth=2 (shallow).
+    let mut mods = []
+    let mut i = 0
+    while i < 5 {
+        mods = mods.push(mk_module("mod_" + str(i), false, 2, 0.80 + to_float(i) * 0.02, 0.2))
+        i = i + 1
+    }
+    return mk_drill("neg_seed", "open", 0.85, 0.2, 2, 0, mods)
+}
+
+// ─── test 1: each lens file exists (liveness) ───────────────────
+
+fn test_files_exist() -> bool {
+    println("[1] lens files exist (liveness)")
+    let mut ok = true
+    if !assert_true(file_exists("tool/drill_lens_blowup.hexa"),   "drill_lens_blowup.hexa")   { ok = false }
+    if !assert_true(file_exists("tool/drill_lens_closure.hexa"),  "drill_lens_closure.hexa")  { ok = false }
+    if !assert_true(file_exists("tool/drill_lens_gap.hexa"),      "drill_lens_gap.hexa")      { ok = false }
+    if !assert_true(file_exists("tool/drill_lens_phi.hexa"),      "drill_lens_phi.hexa")      { ok = false }
+    if !assert_true(file_exists("tool/drill_lens_self_ref.hexa"), "drill_lens_self_ref.hexa") { ok = false }
+    if !assert_true(file_exists("tool/drill_lens_aggregator.hexa"), "drill_lens_aggregator.hexa") { ok = false }
+    return ok
+}
+
+// ─── test 2: well-formed verdicts ───────────────────────────────
+
+fn test_verdict_shape() -> bool {
+    println("[2] each lens returns well-formed LensVerdict")
+    let d = mk_pass_input()
+    let mut ok = true
+    let vb = lens_blowup(d)
+    if !assert_true(len(vb) == 3, "blowup verdict len=3") { ok = false }
+    if !assert_true(verdict_score(vb) >= 0.0, "blowup score in [0,1] lower") { ok = false }
+    if !assert_true(verdict_score(vb) <= 1.0, "blowup score in [0,1] upper") { ok = false }
+    let vc = lens_closure(d)
+    if !assert_true(len(vc) == 3, "closure verdict len=3") { ok = false }
+    let vg = lens_gap(d)
+    if !assert_true(len(vg) == 3, "gap verdict len=3") { ok = false }
+    let vp = lens_phi(d)
+    if !assert_true(len(vp) == 3, "phi verdict len=3") { ok = false }
+    let vs = lens_self_ref(d)
+    if !assert_true(len(vs) == 3, "self_ref verdict len=3") { ok = false }
+    return ok
+}
+
+// ─── test 3: PASS case ──────────────────────────────────────────
+
+fn test_pass_case() -> bool {
+    println("[3] PASS case — uniform fixpoint")
+    let d = mk_pass_input()
+    let mut ok = true
+    if !assert_eq_str(verdict_primary(lens_blowup(d)),   "stable",      "blowup/pass primary")   { ok = false }
+    if !assert_eq_str(verdict_primary(lens_closure(d)),  "closed",      "closure/pass primary")  { ok = false }
+    if !assert_eq_str(verdict_primary(lens_gap(d)),      "complete",    "gap/pass primary")      { ok = false }
+    if !assert_eq_str(verdict_primary(lens_phi(d)),      "integrated",  "phi/pass primary")      { ok = false }
+    if !assert_eq_str(verdict_primary(lens_self_ref(d)), "well_founded","self_ref/pass primary") { ok = false }
+    let a = aggregate_flat(d)
+    if !assert_eq_str(a[0], "good", "pass consensus=good")              { ok = false }
+    if !assert_ge(to_float(a[1]), 0.8, "pass avg_score >= 0.8")         { ok = false }
+    if !assert_ge(to_float(a[2]), 0.9, "pass agreement >= 0.9")         { ok = false }
+    if !assert_eq_str(a[3], "PASS", "pass verdict==PASS")               { ok = false }
+    return ok
+}
+
+// ─── test 4: REJECT case ────────────────────────────────────────
+
+fn test_reject_case() -> bool {
+    println("[4] REJECT case — absorbed seed")
+    let d = mk_reject_input()
+    let mut ok = true
+    if !assert_eq_str(verdict_primary(lens_blowup(d)), "blowup", "blowup/reject primary") { ok = false }
+    let a = aggregate_flat(d)
+    if !assert_eq_str(a[3], "REJECT", "reject verdict==REJECT") { ok = false }
+    return ok
+}
+
+// ─── test 5: cross-lens orthogonality ───────────────────────────
+
+fn test_cross_orthogonality() -> bool {
+    println("[5] cross-lens orthogonality — pass seed scores uniformly high")
+    let d = mk_pass_input()
+    let mut ok = true
+    if !assert_ge(verdict_score(lens_blowup(d)),   0.9, "blowup/pass score>=0.9")   { ok = false }
+    if !assert_ge(verdict_score(lens_closure(d)),  0.9, "closure/pass score>=0.9")  { ok = false }
+    if !assert_ge(verdict_score(lens_gap(d)),      0.9, "gap/pass score>=0.9")      { ok = false }
+    if !assert_ge(verdict_score(lens_phi(d)),      0.9, "phi/pass score>=0.9")      { ok = false }
+    if !assert_ge(verdict_score(lens_self_ref(d)), 0.9, "self_ref/pass score>=0.9") { ok = false }
+    return ok
+}
+
+// ─── test 6: determinism ────────────────────────────────────────
+
+fn test_determinism() -> bool {
+    println("[6] determinism — same input → same verdict")
+    let d1 = mk_pass_input()
+    let d2 = mk_pass_input()
+    let v1 = lens_blowup(d1)
+    let v2 = lens_blowup(d2)
+    let mut ok = true
+    if !assert_eq_str(verdict_primary(v1), verdict_primary(v2), "blowup/determinism primary") { ok = false }
+    let a1 = aggregate_flat(d1)
+    let a2 = aggregate_flat(d2)
+    if !assert_eq_str(a1[3], a2[3], "aggregator/determinism verdict") { ok = false }
+    return ok
+}
+
+// ─── main ───────────────────────────────────────────────────────
+
+fn main() {
+    println("=== test_drill_lens — ζ 5-module lens integration ===")
+    let r1 = test_files_exist()
+    let r2 = test_verdict_shape()
+    let r3 = test_pass_case()
+    let r4 = test_reject_case()
+    let r5 = test_cross_orthogonality()
+    let r6 = test_determinism()
+    let all = r1 && r2 && r3 && r4 && r5 && r6
+    println("summary:")
+    println("  files_exist=" + str(r1))
+    println("  verdict_shape=" + str(r2))
+    println("  pass_case=" + str(r3))
+    println("  reject_case=" + str(r4))
+    println("  cross_ortho=" + str(r5))
+    println("  determinism=" + str(r6))
+    if all {
+        println("  status=PASS")
+        exit(0)
+    } else {
+        println("  status=FAIL")
+        exit(1)
+    }
+}

@@ -1,0 +1,128 @@
+// tool/drill_lens_self_ref.hexa — ζ 5-module lens (5/5): SELF_REF
+//
+// PURPOSE
+//   Self-reference loop detection (recursion, cycle). A DrillOutput shows
+//   a self-referential signature when the seed_id encodes a recursion
+//   marker AND the closure-state has stabilised on a finite trajectory:
+//   i.e., the drill descended D >= DEPTH_MIN, then absorption rate
+//   collapsed to near-zero (perfect recursion = perfect absorption into
+//   the same fixpoint). Without saturation this signature cannot
+//   distinguish a legit recursion from a pathological divergence.
+//
+//   The lens also detects the pathological case: "runaway_loop" — depth
+//   reached but absorption_rate is unstable (per-module spread high) AND
+//   saturation_score < 0.5 (no agreement on what's being returned to).
+//
+// LENS CONTRACT (shared)
+//   fn lens(input: DrillOutput) -> LensVerdict = [primary, secondary, score]
+//
+// PRIMARY LABELS
+//   "well_founded"  — depth >= DEPTH_MIN, abs_rate < 0.1, sat_score >= 0.8
+//   "recursive_ok"  — same but weaker thresholds (abs<0.3, sat>=0.6)
+//   "runaway_loop"  — depth reached but sat < 0.5 (cycle without ground)
+//   "no_recursion"  — depth < DEPTH_MIN (no recursive signature at all)
+//
+// SECONDARY
+//   "ground_found"   — abs_rate <= 0.05 AND sat_score >= 0.9
+//   "grounded"       — abs_rate <= 0.2  AND sat_score >= 0.7
+//   "ungrounded"     — otherwise
+//
+// SCORE
+//   score = sat_score * (1 - abs_rate) * depth_factor
+//
+// V8 SAFE_COMMIT: additive; unique prefix.
+
+let DEPTH_MIN = 3
+
+fn verdict_primary(v: array) -> string   { return v[0] }
+fn verdict_secondary(v: array) -> string { return v[1] }
+fn verdict_score(v: array) -> float      { return to_float(v[2]) }
+
+fn make_verdict(primary: string, secondary: string, score: float) -> array {
+    let mut v = []
+    v = v.push(primary)
+    v = v.push(secondary)
+    v = v.push(score)
+    return v
+}
+
+fn drill_abs_rate(d: array) -> float    { return to_float(d[2]) }
+fn drill_sat_score(d: array) -> float   { return to_float(d[3]) }
+fn drill_depth(d: array) -> int         { return to_int(d[4]) }
+
+fn clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn lens(input: array) -> array {
+    let abs_r = drill_abs_rate(input)
+    let sat_s = drill_sat_score(input)
+    let depth = drill_depth(input)
+
+    let mut primary = "no_recursion"
+    if depth >= DEPTH_MIN {
+        if abs_r < 0.1 {
+            if sat_s >= 0.8 {
+                primary = "well_founded"
+            } else {
+                if sat_s >= 0.5 { primary = "recursive_ok" }
+                else { primary = "runaway_loop" }
+            }
+        } else {
+            if abs_r < 0.3 {
+                if sat_s >= 0.6 { primary = "recursive_ok" }
+                else { primary = "runaway_loop" }
+            } else {
+                if sat_s < 0.5 { primary = "runaway_loop" }
+                else { primary = "recursive_ok" }
+            }
+        }
+    }
+
+    let mut secondary = "ungrounded"
+    if abs_r <= 0.05 {
+        if sat_s >= 0.9 { secondary = "ground_found" }
+        else { if sat_s >= 0.7 { secondary = "grounded" } }
+    } else {
+        if abs_r <= 0.2 {
+            if sat_s >= 0.7 { secondary = "grounded" }
+        }
+    }
+
+    let depth_factor = if depth >= DEPTH_MIN { 1.0 }
+                       else { to_float(depth) / to_float(DEPTH_MIN) }
+    let score = clamp01(sat_s * (1.0 - clamp01(abs_r)) * depth_factor)
+    return make_verdict(primary, secondary, score)
+}
+
+fn main() {
+    // smoke: well-founded recursion (depth=4, abs=0.03, sat=1.0)
+    let mut mods = []
+    let mut i = 0
+    while i < 5 {
+        let mut m = []
+        m = m.push("mod_" + str(i))
+        m = m.push(false)
+        m = m.push(4)
+        m = m.push(0.03)
+        m = m.push(1.0)
+        mods = mods.push(m)
+        i = i + 1
+    }
+    let mut d = []
+    d = d.push("smoke_recursive")
+    d = d.push("fixpoint")
+    d = d.push(0.03)
+    d = d.push(1.0)
+    d = d.push(4)
+    d = d.push(0)
+    d = d.push(mods)
+
+    let v = lens(d)
+    println("drill_lens_self_ref")
+    println("  primary=" + verdict_primary(v))
+    println("  secondary=" + verdict_secondary(v))
+    println("  score=" + str(verdict_score(v)))
+}

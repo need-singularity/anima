@@ -1,0 +1,177 @@
+// tool/drill_lens_blowup.hexa — ζ 5-module lens (1/5): BLOWUP
+//
+// PURPOSE
+//   Singularity / divergence detection. A drill output "blows up" when
+//   absorption_rate crosses a runaway threshold (>= 0.7) or when the
+//   per-module absorption variance exceeds a divergence cap. This lens
+//   is the first of the ζ 5-module cross-verification matrix:
+//     blowup → closure → gap → phi → self_ref.
+//
+// LENS CONTRACT (shared across all 5 modules)
+//   fn lens(input: array) -> array
+//     input  = DrillOutput  = [seed_id, sat_state, abs_rate, sat_score,
+//                              depth, missing_count, per_module[]]
+//     return = LensVerdict  = [primary: string, secondary: string,
+//                              score: float in [0,1]]
+//
+// PRIMARY LABELS
+//   "stable"    — abs_rate < 0.3  (no blowup signature)
+//   "near_edge" — abs_rate in [0.3, 0.7)
+//   "blowup"    — abs_rate >= 0.7 OR per-module variance >= 0.25
+//
+// SECONDARY (diagnostic tag)
+//   "low_variance"  — per-module abs spread < 0.1
+//   "high_variance" — per-module abs spread >= 0.25
+//   "asymmetric"    — one module's abs_rate > 2x mean
+//
+// SCORE
+//   score = 1.0 - clamp01(abs_rate) — i.e. 1.0 = perfectly stable,
+//   0.0 = full blowup. The aggregator averages scores across all 5 lenses.
+//
+// DETERMINISM
+//   Pure function of input arrays. No LLM, no exec, no time.
+//
+// V8 SAFE_COMMIT: additive; unique prefix tool/drill_lens_* — no overlap
+//                 with tool/drill_modules/*.hexa or other agents.
+
+// ─── LensVerdict accessors (shared across 5 modules + aggregator) ────
+
+fn verdict_primary(v: array) -> string   { return v[0] }
+fn verdict_secondary(v: array) -> string { return v[1] }
+fn verdict_score(v: array) -> float      { return to_float(v[2]) }
+
+fn make_verdict(primary: string, secondary: string, score: float) -> array {
+    let mut v = []
+    v = v.push(primary)
+    v = v.push(secondary)
+    v = v.push(score)
+    return v
+}
+
+// ─── DrillOutput accessors (shape from drill_breakthrough_runner) ────
+
+fn drill_seed_id(d: array) -> string    { return d[0] }
+fn drill_state(d: array) -> string      { return d[1] }
+fn drill_abs_rate(d: array) -> float    { return to_float(d[2]) }
+fn drill_sat_score(d: array) -> float   { return to_float(d[3]) }
+fn drill_depth(d: array) -> int         { return to_int(d[4]) }
+fn drill_missing(d: array) -> int       { return to_int(d[5]) }
+fn drill_per_module(d: array) -> array  { return d[6] }
+
+// per-module inner shape: [name, missing, depth, abs, sat]
+fn pm_abs(m: array) -> float  { return to_float(m[3]) }
+
+// ─── scalar helpers ───────────────────────────────────────────────────
+
+fn clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// ─── per-module absorption spread (variance proxy) ────────────────────
+
+fn abs_spread(per_mod: array) -> float {
+    let n = len(per_mod)
+    if n == 0 { return 0.0 }
+    let mut mn = 1.0
+    let mut mx = 0.0
+    let mut i = 0
+    while i < n {
+        let a = pm_abs(per_mod[i])
+        if a < mn { mn = a }
+        if a > mx { mx = a }
+        i = i + 1
+    }
+    return mx - mn
+}
+
+fn abs_mean(per_mod: array) -> float {
+    let n = len(per_mod)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + pm_abs(per_mod[i])
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+fn asymmetric_spike(per_mod: array) -> bool {
+    let mean = abs_mean(per_mod)
+    if mean <= 0.0 { return false }
+    let n = len(per_mod)
+    let mut i = 0
+    while i < n {
+        if pm_abs(per_mod[i]) > 2.0 * mean { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── lens entry ───────────────────────────────────────────────────────
+
+fn lens(input: array) -> array {
+    let abs_r  = drill_abs_rate(input)
+    let pm     = drill_per_module(input)
+    let spread = abs_spread(pm)
+
+    let mut primary = "stable"
+    if abs_r >= 0.7 {
+        primary = "blowup"
+    } else {
+        if spread >= 0.25 {
+            primary = "blowup"
+        } else {
+            if abs_r >= 0.3 { primary = "near_edge" }
+        }
+    }
+
+    let mut secondary = "low_variance"
+    if spread >= 0.25 {
+        secondary = "high_variance"
+    } else {
+        if asymmetric_spike(pm) { secondary = "asymmetric" }
+    }
+
+    let score = 1.0 - clamp01(abs_r)
+    return make_verdict(primary, secondary, score)
+}
+
+// ─── CLI (standalone smoke) ───────────────────────────────────────────
+
+fn main() {
+    // Synthetic smoke: stable seed [abs=0.05, spread small]
+    let mut mods = []
+    let mut i = 0
+    while i < 5 {
+        let mut m = []
+        m = m.push("mod_" + str(i))
+        m = m.push(false)
+        m = m.push(4)
+        m = m.push(0.04 + to_float(i) * 0.005)
+        m = m.push(1.0)
+        mods = mods.push(m)
+        i = i + 1
+    }
+    let mut d = []
+    d = d.push("smoke_pos")
+    d = d.push("fixpoint")
+    d = d.push(0.05)
+    d = d.push(1.0)
+    d = d.push(4)
+    d = d.push(0)
+    d = d.push(mods)
+
+    let v = lens(d)
+    println("drill_lens_blowup")
+    println("  primary=" + verdict_primary(v))
+    println("  secondary=" + verdict_secondary(v))
+    println("  score=" + str(verdict_score(v)))
+}

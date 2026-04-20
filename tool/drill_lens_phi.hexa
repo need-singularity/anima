@@ -1,0 +1,153 @@
+// tool/drill_lens_phi.hexa — ζ 5-module lens (4/5): PHI
+//
+// PURPOSE
+//   Φ integrated-information metric slice. This lens is a *lightweight*
+//   companion to tool/drill_modules/phi.hexa — it does not attempt to
+//   load an FFI model or 16D phi_vec. Instead, it extracts a Φ proxy
+//   from the DrillOutput shape itself by computing:
+//
+//     phi_proxy = H(per_module_sat) * min_sat * depth_factor
+//
+//   where H(x) is Shannon-like spread entropy (normalized to [0,1]) and
+//   min_sat is the weakest link (bottleneck = Φ integration bottleneck).
+//   This is the "metric slice" interpretation — Φ as emergent integration
+//   of 5 sub-processes. High Φ proxy ↔ balanced, deep, mutually informing
+//   sub-modules.
+//
+// LENS CONTRACT (shared)
+//   fn lens(input: DrillOutput) -> LensVerdict = [primary, secondary, score]
+//
+// PRIMARY LABELS
+//   "integrated"    — phi_proxy >= 0.6 (strong Φ signature)
+//   "partial_int"   — phi_proxy in [0.3, 0.6)
+//   "decomposed"    — phi_proxy < 0.3 (sub-modules act independently)
+//
+// SECONDARY
+//   "balanced"      — entropy component >= 0.8
+//   "imbalanced"    — entropy component < 0.8 (one module dominates)
+//   "bottlenecked"  — min_sat < 0.5 (one module gates the whole)
+//
+// SCORE
+//   score = phi_proxy directly (already in [0,1]).
+//
+// V8 SAFE_COMMIT: additive; unique prefix. Does NOT require the real FFI.
+
+let DEPTH_MIN = 3
+
+fn verdict_primary(v: array) -> string   { return v[0] }
+fn verdict_secondary(v: array) -> string { return v[1] }
+fn verdict_score(v: array) -> float      { return to_float(v[2]) }
+
+fn make_verdict(primary: string, secondary: string, score: float) -> array {
+    let mut v = []
+    v = v.push(primary)
+    v = v.push(secondary)
+    v = v.push(score)
+    return v
+}
+
+fn drill_depth(d: array) -> int         { return to_int(d[4]) }
+fn drill_per_module(d: array) -> array  { return d[6] }
+fn pm_sat(m: array) -> float            { return to_float(m[4]) }
+
+fn clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// Shannon-like entropy over sat vector.
+// Uniform -> 1.0; concentrated on one module -> 0.0.
+// We use a triangle-kernel substitute (no log2): 1 - (max - mean)*N/(N-1).
+fn entropy_proxy(per_mod: array) -> float {
+    let n = len(per_mod)
+    if n <= 1 { return 0.0 }
+    let mut s = 0.0
+    let mut mx = 0.0
+    let mut i = 0
+    while i < n {
+        let v = pm_sat(per_mod[i])
+        s = s + v
+        if v > mx { mx = v }
+        i = i + 1
+    }
+    let mean = s / to_float(n)
+    if mean <= 0.0 { return 0.0 }
+    // concentration := (max - mean) / mean, saturates at 1.0 when max = N*mean
+    let conc = clamp01((mx - mean) / mean)
+    return 1.0 - conc
+}
+
+fn min_sat(per_mod: array) -> float {
+    let n = len(per_mod)
+    if n == 0 { return 0.0 }
+    let mut mn = 1.0
+    let mut i = 0
+    while i < n {
+        let s = pm_sat(per_mod[i])
+        if s < mn { mn = s }
+        i = i + 1
+    }
+    return mn
+}
+
+fn lens(input: array) -> array {
+    let pm        = drill_per_module(input)
+    let depth     = drill_depth(input)
+    let entropy_v = entropy_proxy(pm)
+    let mn        = min_sat(pm)
+    let df        = if depth >= DEPTH_MIN { 1.0 }
+                    else { to_float(depth) / to_float(DEPTH_MIN) }
+    let phi_proxy = clamp01(entropy_v * mn * df)
+
+    let mut primary = "decomposed"
+    if phi_proxy >= 0.6 {
+        primary = "integrated"
+    } else {
+        if phi_proxy >= 0.3 { primary = "partial_int" }
+    }
+
+    let mut secondary = "balanced"
+    if mn < 0.5 {
+        secondary = "bottlenecked"
+    } else {
+        if entropy_v < 0.8 { secondary = "imbalanced" }
+    }
+
+    return make_verdict(primary, secondary, phi_proxy)
+}
+
+fn main() {
+    // smoke: integrated seed (uniform sat=1, depth=4)
+    let mut mods = []
+    let mut i = 0
+    while i < 5 {
+        let mut m = []
+        m = m.push("mod_" + str(i))
+        m = m.push(false)
+        m = m.push(4)
+        m = m.push(0.05)
+        m = m.push(1.0)
+        mods = mods.push(m)
+        i = i + 1
+    }
+    let mut d = []
+    d = d.push("smoke_phi")
+    d = d.push("fixpoint")
+    d = d.push(0.05)
+    d = d.push(1.0)
+    d = d.push(4)
+    d = d.push(0)
+    d = d.push(mods)
+
+    let v = lens(d)
+    println("drill_lens_phi")
+    println("  primary=" + verdict_primary(v))
+    println("  secondary=" + verdict_secondary(v))
+    println("  score=" + str(verdict_score(v)))
+}
