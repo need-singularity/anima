@@ -1,0 +1,195 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  edu/cell/lagrangian/v_sync_kuramoto.hexa
+//
+//  PURPOSE
+//    Mk.IX V_sync — Kuramoto population-dynamics potential.  Replaces the
+//    stub (1 − sealed_fraction) of v_sync.hexa with the classic Kuramoto
+//    order parameter r and the pairwise potential
+//
+//        r(θ)       =  | (1/N) Σ_j exp(i θ_j) |
+//        V_sync(θ)  =  K / (N · (N-1) / 2) · Σ_{i<j} (1 − cos(θ_i − θ_j)) / 2
+//
+//    Convention: V_sync is the **mean** pairwise phase-defect
+//    (1 − cos(Δθ)) / 2 ∈ [0, 1] over all pairs, scaled by coupling K.
+//    At full phase-lock all θ_j coincide → V_sync = 0 (minimum), r = 1.
+//    At uniform desync V_sync → K (maximum), r → 0.
+//
+//  θ_j PROJECTION  (D-axis coherence corpus)
+//    drill H/angle 3 selected this over per-unit tension_A/B because:
+//      (a) per-learner per-unit (A,B) tension vector is NOT exported by
+//          the existing atlas proto — only node/edge hash sets per learner,
+//      (b) the D-axis is hash-only (raw#9 deterministic); we reuse an
+//          integer polynomial hash (no bitwise ops — hexa 0.2.0 lacks ^/&)
+//          on the learner's node list to project a deterministic phase,
+//      (c) one deterministic mapping keeps byte-identical reruns and
+//          zero LLM / zero sampling.
+//
+//    Projection:
+//        θ_k  =  poly_hash(node_hashes_k)  mod  TAU_PERM         (×1000)
+//
+//    poly_hash(xs) = fold with h = (h * PRIME + x) mod M32.  Two learners
+//    with identical atlases share θ (perfect phase-lock); divergent atlases
+//    scatter deterministically over [0, 2π).  Replace this projection with
+//    a live per-unit (A,B) atan2 mapping once the lattice exports it — the
+//    downstream r / V_sync arithmetic does not change.
+//
+//  INTEGER FIXED-POINT
+//    Angles  : per-mille radians, 0 .. 6283  (2π ≈ 6.2832)
+//    cos/sin : ×1000, 24-bin lookup (identical table to v_sync.hexa)
+//    r       : ×1000,  0 .. 1000
+//    V_sync  : ×1000,  0 .. K_x1000
+//    K       : ×1000,  default 1000 (K = 1.0)
+//
+//  API  (pure, deterministic, LLM=none, no I/O)
+//    poly_hash_int32(h, v)                          -> int
+//    fold_nodes_to_theta_x1000(nodes, n_nodes)      -> int       // per-mille rad
+//    cos_perm_x1000(theta_perm)                     -> int       // x1000
+//    sin_perm_x1000(theta_perm)                     -> int       // x1000
+//    isqrt_x1000(m)                                 -> int       // sqrt(m)
+//    r_order_param_x1000(thetas, n_nodes)           -> int       // 0..1000
+//    v_sync_kuramoto_x1000(thetas, n_nodes, k_x1000)-> int       // x1000
+//    dr_dt_x1000(r_prev, r_now)                     -> int       // signed x1000
+//
+//  RAW
+//    raw#9 · hexa-only · deterministic · V8 SAFE_COMMIT · no LLM
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── constants ──────────────────────────────────────────────────────────────
+// 2π  in per-mille radians (6.2832 → 6283)
+let TAU_PERM = 6283
+// π/2 in per-mille radians (1.5708 → 1571)
+let HALF_PI_PERM = 1571
+// Polynomial-hash 32-bit ring (no bitwise ops in hexa 0.2.0)
+let M32 = 4294967296
+// Prime multiplier (coprime to M32 / (1e6 * 6283)) - standard 31-mix
+let POLY_PRIME = 2654435761
+// Seed for the polynomial fold
+let POLY_SEED = 1
+
+// ─── polynomial integer hash (no bitwise; modular arithmetic only) ──────────
+// Fold one 32-bit integer v into the running hash h (mod M32).
+fn poly_hash_int32(h: int, v: int) -> int {
+    let mut x = h * POLY_PRIME
+    x = x + v
+    x = x % M32
+    if x < 0 { x = x + M32 }
+    return x
+}
+
+// Fold the node-hash list of ONE learner into a deterministic phase θ in
+// per-mille radians [0, TAU_PERM).  The poly fold IS order-sensitive; the
+// upstream atlas proto emits nodes in i=0..CONCEPT_COUNT-1 order, so
+// determinism holds for the existing corpus.
+fn fold_nodes_to_theta_x1000(nodes: list, n_nodes: int) -> int {
+    let mut h = POLY_SEED
+    let mut i = 0
+    while i < n_nodes {
+        h = poly_hash_int32(h, nodes[i])
+        i = i + 1
+    }
+    // Map h in [0, M32) into [0, TAU_PERM).  mod + nonneg fixup.
+    let mut t = h % TAU_PERM
+    if t < 0 { t = t + TAU_PERM }
+    return t
+}
+
+// ─── cos/sin lookup (24 bins, identical table to v_sync.hexa) ───────────────
+fn cos_perm_x1000(theta_perm: int) -> int {
+    let mut t = theta_perm % TAU_PERM
+    if t < 0 { t = t + TAU_PERM }
+    if t < 131  { return 1000 }
+    if t < 393  { return 966 }
+    if t < 655  { return 866 }
+    if t < 916  { return 707 }
+    if t < 1178 { return 500 }
+    if t < 1440 { return 259 }
+    if t < 1702 { return 0 }
+    if t < 1963 { return 0 - 259 }
+    if t < 2225 { return 0 - 500 }
+    if t < 2487 { return 0 - 707 }
+    if t < 2749 { return 0 - 866 }
+    if t < 3010 { return 0 - 966 }
+    if t < 3272 { return 0 - 1000 }
+    if t < 3534 { return 0 - 966 }
+    if t < 3796 { return 0 - 866 }
+    if t < 4057 { return 0 - 707 }
+    if t < 4319 { return 0 - 500 }
+    if t < 4581 { return 0 - 259 }
+    if t < 4843 { return 0 }
+    if t < 5104 { return 259 }
+    if t < 5366 { return 500 }
+    if t < 5628 { return 707 }
+    if t < 5890 { return 866 }
+    if t < 6151 { return 966 }
+    return 1000
+}
+
+fn sin_perm_x1000(theta_perm: int) -> int {
+    // sin(θ) = cos(θ − π/2)
+    return cos_perm_x1000(theta_perm - HALF_PI_PERM)
+}
+
+// ─── integer sqrt (Newton, 24 iter) — returns floor(sqrt(m)) ────────────────
+fn isqrt_x1000(m: int) -> int {
+    if m <= 0 { return 0 }
+    let mut y = 1000
+    let mut k = 0
+    while k < 24 {
+        if y == 0 { y = 1 }
+        y = (y + m / y) / 2
+        k = k + 1
+    }
+    return y
+}
+
+// ─── r = |(1/N) Σ exp(i θ_j)|, emitted ×1000 ∈ [0, 1000] ────────────────────
+fn r_order_param_x1000(thetas: list, n_nodes: int) -> int {
+    if n_nodes <= 0 { return 1000 }
+    let mut sum_c = 0
+    let mut sum_s = 0
+    let mut i = 0
+    while i < n_nodes {
+        sum_c = sum_c + cos_perm_x1000(thetas[i])
+        sum_s = sum_s + sin_perm_x1000(thetas[i])
+        i = i + 1
+    }
+    // |sum|^2 with each component in units of x1000 -> (x1000)^2
+    let mag2 = sum_c * sum_c + sum_s * sum_s
+    if mag2 <= 0 { return 0 }
+    // |sum| ~= isqrt(mag2), still in units of x1000.  Then r = |sum| / n_nodes.
+    let mag = isqrt_x1000(mag2)
+    let mut r = mag / n_nodes
+    if r > 1000 { r = 1000 }
+    if r < 0 { r = 0 }
+    return r
+}
+
+// ─── V_sync = K · mean_{i<j} (1 − cos(θ_i − θ_j)) / 2, ×1000 ────────────────
+//   (1 − cos Δθ) ∈ [0, 2].  We divide by 2 so V ∈ [0, K].
+fn v_sync_kuramoto_x1000(thetas: list, n_nodes: int, k_x1000: int) -> int {
+    if n_nodes <= 1 { return 0 }
+    let pairs = n_nodes * (n_nodes - 1) / 2
+    let mut acc = 0
+    let mut i = 0
+    while i < n_nodes {
+        let mut j = i + 1
+        while j < n_nodes {
+            let dtheta = thetas[i] - thetas[j]
+            // (1 - cos(dtheta)) / 2   in x1000  =  (1000 - cos_x1000) / 2
+            let one_minus_cos_half = (1000 - cos_perm_x1000(dtheta)) / 2
+            acc = acc + one_minus_cos_half
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // acc is x1000 * pairs.  Mean, then scale by K (x1000) -> /1000.
+    let avg_x1000 = acc / pairs
+    let v = (k_x1000 * avg_x1000) / 1000
+    if v < 0 { return 0 }
+    return v
+}
+
+// ─── dr/dt spike detector (forward difference, ×1000) ───────────────────────
+fn dr_dt_x1000(r_prev: int, r_now: int) -> int {
+    return r_now - r_prev
+}

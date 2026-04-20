@@ -1,0 +1,270 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  edu/cell/lagrangian/natural_gen5_resume.hexa
+//
+//  Resume driver: starts from a known gen-4 signature + base_seed and runs
+//  ONLY gen 5.  Used when full 5-gen run hits RSS cap (memory-bounded host).
+//  Produces the same gen-5 result as the full driver thanks to uniform rule.
+//
+//  argv: <base_seed> <parent_sig> <expected_w4>
+// ════════════════════════════════════════════════════════════════════════════
+
+let ASCII_TAB_NGR = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-|.↔/+=() <>:;'\""
+
+fn ccode_ngr(c: string) -> int {
+    let t     = ASCII_TAB_NGR
+    let n     = len(t)
+    let mut i = 0
+    while i < n {
+        if t.substring(i, i + 1) == c { return i + 1 }
+        i = i + 1
+    }
+    return 127
+}
+
+fn hash_ngr(s: string) -> int {
+    let mut acc = 1469598103
+    let mut i   = 0
+    let n       = len(s)
+    while i < n {
+        let c = s.substring(i, i + 1)
+        acc   = acc * 31 + ccode_ngr(c)
+        acc   = acc % 2147483647
+        i     = i + 1
+    }
+    return acc
+}
+
+fn clamp_ngr(v: int, lo: int, hi: int) -> int {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+fn iabs_ngr(x: int) -> int { if x < 0 { return 0 - x } return x }
+fn sign_ngr(x: int) -> int { if x > 0 { return 1 }  if x < 0 { return -1 }  return 0 }
+
+struct CellR {
+    rc: int,
+    g: int,
+    t: int,
+    s: int,
+}
+
+fn init_g_r(rc: int, size: int, seed: int, tl: int) -> int {
+    let row = rc / size
+    let col = rc - row * size
+    let a_id = "n_" + str(row) + "_" + str(col) + "_a"
+    let b_id = "n_" + str(row) + "_" + str(col) + "_b"
+    let per = seed + rc
+    let key = a_id + "|" + b_id + "|s=" + str(per)
+    let raw_g = hash_ngr(key)
+    let base_g = (raw_g % 2001) - 1000
+    let scaled = (base_g * (1000 - tl)) / 1000
+    let biased = scaled - tl
+    return clamp_ngr(biased, -1000, 1000)
+}
+
+fn seal_r(rc: int, size: int, g: int, tl: int, tick: int) -> bool {
+    let row = rc / size
+    let col = rc - row * size
+    let a_id = "n_" + str(row) + "_" + str(col) + "_a"
+    let b_id = "n_" + str(row) + "_" + str(col) + "_b"
+    let key = a_id + "<->" + b_id + "|g=" + str(g) + "|t=" + str(tick)
+    let h = hash_ngr(key)
+    let tl_c = if tl > 1000 { 1000 } else { tl }
+    let mut div = 12
+    if tl_c >= 200 { div = 8 }
+    if tl_c >= 500 { div = 5 }
+    if tl_c >= 700 { div = 2 }
+    if tl_c >= 950 { div = 1 }
+    if div <= 1 { return true }
+    return (h % div) == 0
+}
+
+fn attr_r(lat: [CellR], size: int, rc: int, k_numer: int) -> int {
+    let row = rc / size
+    let col = rc - row * size
+    let mut acc = 0
+    let tot = size * size
+    let mut j = 0
+    while j < tot {
+        if j != rc {
+            let jc = lat[j]
+            if jc.s == 0 {
+                let jrow = j / size
+                let jcol = j - jrow * size
+                let d = iabs_ngr(jrow - row) + iabs_ngr(jcol - col)
+                let d2 = d * d
+                let contrib = (sign_ngr(jc.g) * jc.t) / d2
+                acc = acc + contrib
+            }
+        }
+        j = j + 1
+    }
+    if k_numer <= 0 { return 0 }
+    return acc / k_numer
+}
+
+fn step_r(lat: [CellR], size: int, tl: int, tick: int) -> [CellR] {
+    let upper = 9000
+    let lower = 1000
+    let k = 100
+    let mut out = []
+    let tot = size * size
+    let mut i = 0
+    while i < tot {
+        let c = lat[i]
+        if c.s != 0 {
+            out = out.push(c)
+        } else {
+            let a = attr_r(lat, size, i, k)
+            let t_new = clamp_ngr(c.t + a + ((c.g * 3) / 4), 0, 10000)
+            if t_new > upper {
+                out = out.push(CellR { rc: c.rc, g: c.g, t: t_new, s: 2 })
+            } else if t_new < lower {
+                if seal_r(c.rc, size, c.g, tl, tick) {
+                    out = out.push(CellR { rc: c.rc, g: c.g, t: t_new, s: 1 })
+                } else {
+                    out = out.push(CellR { rc: c.rc, g: c.g, t: t_new, s: 0 })
+                }
+            } else {
+                out = out.push(CellR { rc: c.rc, g: c.g, t: t_new, s: 0 })
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn count_r(lat: [CellR], target: int) -> int {
+    let mut n = 0
+    let mut i = 0
+    while i < len(lat) {
+        if lat[i].s == target { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+fn parse_i(s: string, fb: int) -> int {
+    if len(s) == 0 { return fb }
+    let mut acc = 0
+    let mut i = 0
+    let sign = if s.substring(0, 1) == "-" { -1 } else { 1 }
+    if sign == -1 { i = 1 }
+    while i < len(s) {
+        let ch = s.substring(i, i + 1)
+        let d = if ch == "0" { 0 }
+              else if ch == "1" { 1 }
+              else if ch == "2" { 2 }
+              else if ch == "3" { 3 }
+              else if ch == "4" { 4 }
+              else if ch == "5" { 5 }
+              else if ch == "6" { 6 }
+              else if ch == "7" { 7 }
+              else if ch == "8" { 8 }
+              else if ch == "9" { 9 }
+              else { -1 }
+        if d < 0 { return fb }
+        acc = acc * 10 + d
+        i = i + 1
+    }
+    return acc * sign
+}
+
+fn main() {
+    let av = argv()
+    if len(av) < 5 {
+        println("usage: natural_gen5_resume.hexa <base_seed> <parent_sig_gen4> <w_gen4> <resume_flag>")
+        exit(2)
+    }
+    let base_seed = parse_i(av[2], 0)
+    let parent_sig = parse_i(av[3], 0)
+    let w4 = parse_i(av[4], 1000)
+
+    // gen 5: size=3, tl=800, seed=(parent_sig*13 + 5*17 + 101) mod 2^31-1
+    let size = 3
+    let tl = 800
+    let seed5 = (parent_sig * 13 + 5 * 17 + 101) % 2147483647
+
+    println("=== natural_gen5_resume  base_seed=" + str(base_seed) + " parent_sig=" + str(parent_sig) + " ===")
+    println("gen5 params: size=" + str(size) + " tl=" + str(tl) + " seed=" + str(seed5) + " (matches uniform rule)")
+
+    // Build fresh gen-5 lattice
+    let mut L = []
+    let mut i = 0
+    let tot = size * size
+    while i < tot {
+        let g = init_g_r(i, size, seed5, tl)
+        L = L.push(CellR { rc: i, g: g, t: 5000, s: 0 })
+        i = i + 1
+    }
+
+    let mut t = 0
+    while t < 12 {
+        L = step_r(L, size, tl, t)
+        t = t + 1
+    }
+
+    let act = count_r(L, 0)
+    let drp = count_r(L, 2)
+    let sld = count_r(L, 1)
+    let score5 = if tot > 0 { (sld * 1000) / tot } else { 0 }
+
+    println("gen=5 active=" + str(act) + " drop=" + str(drp) + " sealed=" + str(sld) + " score=" + str(score5))
+
+    let dw = iabs_ngr(score5 - w4)
+    // Lagrangian at gen 5: T = (dw)^2/2 / 1000, V = 0 if W>=1000 else ln-V + (1000-W) syncV
+    let t_tension = (dw * dw / 2) / 1000
+    let v_s = if score5 >= 1000 { 0 } else { 100 }  // proxy
+    let v_sync = if score5 >= 1000 { 0 } else { 1000 - score5 }
+    let v_tot = v_s + v_sync
+    let l5 = t_tension - v_tot
+
+    println("")
+    println("dW_{4->5} = " + str(score5 - w4))
+    println("|dW|      = " + str(dw))
+    println("T_5       = " + str(t_tension))
+    println("V_5       = " + str(v_tot))
+    println("L_5       = " + str(l5))
+    let eps = 1
+    let verdict = if dw <= eps && t_tension <= eps && v_tot <= eps {
+        "STATIONARY_AT_FIXPOINT"
+    } else if dw <= eps {
+        "STATIONARY_BOUNDARY"
+    } else if score5 > w4 {
+        "DESCENT_ONLY"
+    } else {
+        "NOT_YET"
+    }
+    println("verdict   = " + verdict)
+
+    let mut p = []
+    p = p.push("{\"base_seed\":")
+    p = p.push(str(base_seed))
+    p = p.push(",\"parent_sig_gen4\":")
+    p = p.push(str(parent_sig))
+    p = p.push(",\"w4\":")
+    p = p.push(str(w4))
+    p = p.push(",\"w5\":")
+    p = p.push(str(score5))
+    p = p.push(",\"dw_45\":")
+    p = p.push(str(score5 - w4))
+    p = p.push(",\"t5\":")
+    p = p.push(str(t_tension))
+    p = p.push(",\"v5\":")
+    p = p.push(str(v_tot))
+    p = p.push(",\"l5\":")
+    p = p.push(str(l5))
+    p = p.push(",\"verdict\":\"")
+    p = p.push(verdict)
+    p = p.push("\",\"gen5_active\":")
+    p = p.push(str(act))
+    p = p.push(",\"gen5_sealed\":")
+    p = p.push(str(sld))
+    p = p.push(",\"resume\":true}")
+    println("JSON " + p.join(""))
+
+    if verdict == "STATIONARY_AT_FIXPOINT" { exit(0) }
+    exit(1)
+}

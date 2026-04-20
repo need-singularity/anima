@@ -1,0 +1,356 @@
+// ============================================================================
+//  tool/edu_v_sync_kuramoto_driver.hexa
+//
+//  PURPOSE
+//    Mk.IX V_sync validation driver.  Rebuilds the D-axis 3/5/10-node
+//    coherence fixtures (identical profile/threshold scheme to
+//    tool/edu_collective_atlas_proto.hexa, but using polynomial integer
+//    hashes because hexa 0.2.0 does not expose bitwise XOR/AND needed for
+//    FNV-1a).  For each learner k we project the atlas node-hash list
+//    into a Kuramoto phase theta_k via poly_hash, then compute
+//
+//        r_F        : Kuramoto order parameter  (x1000)
+//        V_sync_F   : pairwise-mean (1 - cos)/2 potential, K = 1.0
+//
+//    for fixtures F in {F3, F5, F10}.
+//
+//  PRE-REGISTER
+//    * F3 is homogeneous (all "math_tight") -> theta scatter tight ->
+//      r_3 > r_5 > r_10 (monotone desync with population heterogeneity)
+//    * V_sync_3 < V_sync_5 < V_sync_10 (consistent with D-axis coherence
+//      ranking 475 > 277 > 168; V_sync is the complement of coherence in
+//      the large-N limit V ~ K*(1-r^2)/2)
+//    * Byte-identical reruns (deterministic poly-hash; no sampling).
+//
+//  HEXA-only (raw#9) - no LLM - no sampling - V8 SAFE_COMMIT.
+// ============================================================================
+
+// ---- constants -------------------------------------------------------------
+let CONCEPT_COUNT = 50
+let TAU_PERM      = 6283
+let HALF_PI_PERM  = 1571
+let M32           = 4294967296
+let POLY_PRIME    = 2654435761
+let POLY_SEED     = 1
+let K_COUPLING    = 1000     // K = 1.0 (x1000)
+
+// ---- polynomial hash (identical math to v_sync_kuramoto.hexa) --------------
+fn poly_hash_int32(h: int, v: int) -> int {
+    let mut x = h * POLY_PRIME
+    x = x + v
+    x = x % M32
+    if x < 0 { x = x + M32 }
+    return x
+}
+
+// Two-arg seed hash: h(seed_id, tag, idx) without strings.
+fn mix3(seed_id: int, tag: int, idx: int) -> int {
+    let mut h = POLY_SEED
+    h = poly_hash_int32(h, seed_id)
+    h = poly_hash_int32(h, tag)
+    h = poly_hash_int32(h, idx)
+    return h
+}
+
+// ---- cos / sin lookup (identical to v_sync_kuramoto.hexa) ------------------
+fn cos_perm_x1000(theta_perm: int) -> int {
+    let mut t = theta_perm % TAU_PERM
+    if t < 0 { t = t + TAU_PERM }
+    if t < 131  { return 1000 }
+    if t < 393  { return 966 }
+    if t < 655  { return 866 }
+    if t < 916  { return 707 }
+    if t < 1178 { return 500 }
+    if t < 1440 { return 259 }
+    if t < 1702 { return 0 }
+    if t < 1963 { return 0 - 259 }
+    if t < 2225 { return 0 - 500 }
+    if t < 2487 { return 0 - 707 }
+    if t < 2749 { return 0 - 866 }
+    if t < 3010 { return 0 - 966 }
+    if t < 3272 { return 0 - 1000 }
+    if t < 3534 { return 0 - 966 }
+    if t < 3796 { return 0 - 866 }
+    if t < 4057 { return 0 - 707 }
+    if t < 4319 { return 0 - 500 }
+    if t < 4581 { return 0 - 259 }
+    if t < 4843 { return 0 }
+    if t < 5104 { return 259 }
+    if t < 5366 { return 500 }
+    if t < 5628 { return 707 }
+    if t < 5890 { return 866 }
+    if t < 6151 { return 966 }
+    return 1000
+}
+fn sin_perm_x1000(theta_perm: int) -> int {
+    return cos_perm_x1000(theta_perm - HALF_PI_PERM)
+}
+
+fn isqrt_x1000(m: int) -> int {
+    if m <= 0 { return 0 }
+    let mut y = 1000
+    let mut k = 0
+    while k < 24 {
+        if y == 0 { y = 1 }
+        y = (y + m / y) / 2
+        k = k + 1
+    }
+    return y
+}
+
+// ---- profile threshold (same semantics as atlas proto; int profile ID) -----
+//   profile IDs:
+//     0 = "math_tight"  (math concepts 0..9 : t=99, else : 5)
+//     1 = "math"        (math 0..9 : 95, else : 40)
+//     2 = "logic"       (logic 10..19 : 95, else : 40)
+//     3 = "music"       (music 20..29 : 95, else : 40)
+//     4 = "biology"     (biology 30..39: 95, else : 40)
+//     5 = "systems"     (systems 40..49: 95, else : 40)
+//     6 = "uniform"     (all : 60)
+//     7 = "shallow"     (all : 25)
+fn threshold(i: int, profile_id: int) -> int {
+    if profile_id == 0 {
+        if i < 10 { return 99 }
+        return 5
+    }
+    if profile_id == 1 {
+        if i < 10 { return 95 }
+        return 40
+    }
+    if profile_id == 2 {
+        if i >= 10 { if i < 20 { return 95 } }
+        return 40
+    }
+    if profile_id == 3 {
+        if i >= 20 { if i < 30 { return 95 } }
+        return 40
+    }
+    if profile_id == 4 {
+        if i >= 30 { if i < 40 { return 95 } }
+        return 40
+    }
+    if profile_id == 5 {
+        if i >= 40 { return 95 }
+        return 40
+    }
+    if profile_id == 6 { return 60 }
+    if profile_id == 7 { return 25 }
+    return 40
+}
+
+// ---- build learner atlas (hash-only, deterministic) ------------------------
+//   visited[i] true iff mix3(seed_id, TAG_VISIT=1, i) mod 100 < threshold
+//   node_hash of concept i = mix3(0, TAG_NODE=2, i)
+fn build_node_hashes(seed_id: int, profile_id: int) -> list {
+    let bound = CONCEPT_COUNT
+    let mut out = []
+    let mut i = 0
+    while i < bound {
+        let h = mix3(seed_id, 1, i)
+        let r = h % 100
+        if r < threshold(i, profile_id) {
+            let nh = mix3(0, 2, i)
+            out = out.push(nh)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- itoa (digit-to-string, nested else-if) --------------------------------
+fn digit_char(d: int) -> string {
+    if d == 0 { return "0" } else {
+        if d == 1 { return "1" } else {
+            if d == 2 { return "2" } else {
+                if d == 3 { return "3" } else {
+                    if d == 4 { return "4" } else {
+                        if d == 5 { return "5" } else {
+                            if d == 6 { return "6" } else {
+                                if d == 7 { return "7" } else {
+                                    if d == 8 { return "8" } else { return "9" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn str_itoa(n: int) -> string {
+    if n == 0 { return "0" }
+    let mut s = ""
+    let mut neg = false
+    let mut x = n
+    if x < 0 { neg = true  x = 0 - x }
+    while x > 0 {
+        let d = x % 10
+        s = digit_char(d) + s
+        x = x / 10
+    }
+    if neg { return "-" + s }
+    return s
+}
+
+// ---- Kuramoto primitives (inline, byte-equivalent to v_sync_kuramoto.hexa) -
+fn fold_nodes_to_theta(nodes: list, nn: int) -> int {
+    let mut h = POLY_SEED
+    let mut i = 0
+    while i < nn {
+        h = poly_hash_int32(h, nodes[i])
+        i = i + 1
+    }
+    let mut t = h % TAU_PERM
+    if t < 0 { t = t + TAU_PERM }
+    return t
+}
+
+fn r_order_param(thetas: list, nn: int) -> int {
+    if nn <= 0 { return 1000 }
+    let mut sum_c = 0
+    let mut sum_s = 0
+    let mut i = 0
+    while i < nn {
+        sum_c = sum_c + cos_perm_x1000(thetas[i])
+        sum_s = sum_s + sin_perm_x1000(thetas[i])
+        i = i + 1
+    }
+    let mag2 = sum_c * sum_c + sum_s * sum_s
+    if mag2 <= 0 { return 0 }
+    let mag = isqrt_x1000(mag2)
+    let mut r = mag / nn
+    if r > 1000 { r = 1000 }
+    if r < 0 { r = 0 }
+    return r
+}
+
+fn v_sync_kuramoto(thetas: list, nn: int, k_x1000: int) -> int {
+    if nn <= 1 { return 0 }
+    let pairs = nn * (nn - 1) / 2
+    let mut acc = 0
+    let mut i = 0
+    while i < nn {
+        let mut j = i + 1
+        while j < nn {
+            let dtheta = thetas[i] - thetas[j]
+            let v_ij = (1000 - cos_perm_x1000(dtheta)) / 2
+            acc = acc + v_ij
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let avg = acc / pairs
+    let v = (k_x1000 * avg) / 1000
+    if v < 0 { return 0 }
+    return v
+}
+
+// ---- per-fixture driver ----------------------------------------------------
+fn run_fixture(name: string, seed_ids: list, profile_ids: list, nn: int) -> string {
+    let mut node_sizes = []
+    let mut thetas = []
+    let mut i = 0
+    while i < nn {
+        let nodes = build_node_hashes(seed_ids[i], profile_ids[i])
+        let theta = fold_nodes_to_theta(nodes, nodes.len())
+        node_sizes = node_sizes.push(nodes.len())
+        thetas = thetas.push(theta)
+        i = i + 1
+    }
+    let r = r_order_param(thetas, nn)
+    let v = v_sync_kuramoto(thetas, nn, K_COUPLING)
+
+    // stub-like: 1 - mean_atlas_size/CONCEPT_COUNT, for comparison
+    let mut sum_sz = 0
+    let mut p = 0
+    while p < nn {
+        sum_sz = sum_sz + node_sizes[p]
+        p = p + 1
+    }
+    let mean_sz_perm = (sum_sz * 1000) / (nn * CONCEPT_COUNT)
+    let v_stub_like = 1000 - mean_sz_perm
+
+    let mut body = "{\n"
+    body = body + "    \"fixture\": \"" + name + "\",\n"
+    body = body + "    \"n_nodes\": " + str_itoa(nn) + ",\n"
+    body = body + "    \"K_coupling_x1000\": " + str_itoa(K_COUPLING) + ",\n"
+    body = body + "    \"r_order_x1000\": " + str_itoa(r) + ",\n"
+    body = body + "    \"v_sync_kuramoto_x1000\": " + str_itoa(v) + ",\n"
+    body = body + "    \"v_stub_like_x1000\": " + str_itoa(v_stub_like) + ",\n"
+    body = body + "    \"thetas_perm\": ["
+    let mut a = 0
+    while a < nn {
+        if a > 0 { body = body + "," }
+        body = body + str_itoa(thetas[a])
+        a = a + 1
+    }
+    body = body + "],\n"
+    body = body + "    \"atlas_sizes\": ["
+    let mut b = 0
+    while b < nn {
+        if b > 0 { body = body + "," }
+        body = body + str_itoa(node_sizes[b])
+        b = b + 1
+    }
+    body = body + "]\n"
+    body = body + "  }"
+
+    println("fixture " + name + ":")
+    println("  r (x1000)            = " + str_itoa(r))
+    println("  V_sync Kuramoto x1000= " + str_itoa(v))
+    println("  V stub-like x1000    = " + str_itoa(v_stub_like))
+    println("  theta[0] (perm-rad)  = " + str_itoa(thetas[0]))
+
+    return body
+}
+
+// ---- fixture specs (same populations as atlas proto, int-encoded) ----------
+//   seed_id = small int; profile_id per table above.
+//
+//   F3: 3 math_tight learners (A, B, C)
+//     seeds = [101, 102, 103], profiles = [0, 0, 0]
+//
+//   F5: 4 math_tight + 1 shallow divergent
+//     seeds = [101, 102, 103, 104, 999], profiles = [0, 0, 0, 0, 7]
+//
+//   F10: 2 per each of 5 domains
+//     seeds = [10, 11, 20, 21, 30, 31, 40, 41, 50, 51]
+//     profiles = [1, 1, 2, 2, 3, 3, 4, 4, 5, 5]
+let f3_seeds    = [101, 102, 103]
+let f3_profiles = [0, 0, 0]
+
+let f5_seeds    = [101, 102, 103, 104, 999]
+let f5_profiles = [0, 0, 0, 0, 7]
+
+let f10_seeds    = [10, 11, 20, 21, 30, 31, 40, 41, 50, 51]
+let f10_profiles = [1, 1, 2, 2, 3, 3, 4, 4, 5, 5]
+
+let body3  = run_fixture("F3",  f3_seeds,  f3_profiles,  3)
+let body5  = run_fixture("F5",  f5_seeds,  f5_profiles,  5)
+let body10 = run_fixture("F10", f10_seeds, f10_profiles, 10)
+
+// ---- compose combined cert -------------------------------------------------
+let mut cert = "{\n"
+cert = cert + "  \"verifier\": \"edu_v_sync_kuramoto_driver\",\n"
+cert = cert + "  \"paradigm\": \"Mk.IX V_sync = Kuramoto K*(1-cos)/2 pairwise mean\",\n"
+cert = cert + "  \"hexa_only\": true,\n"
+cert = cert + "  \"raw_rank\": 9,\n"
+cert = cert + "  \"deterministic\": true,\n"
+cert = cert + "  \"llm\": \"none\",\n"
+cert = cert + "  \"K_coupling_x1000\": " + str_itoa(K_COUPLING) + ",\n"
+cert = cert + "  \"theta_projection\": \"poly_hash(node_hashes_k) mod TAU_PERM\",\n"
+cert = cert + "  \"fixtures\": [\n  "
+cert = cert + body3 + ",\n  "
+cert = cert + body5 + ",\n  "
+cert = cert + body10 + "\n"
+cert = cert + "  ],\n"
+cert = cert + "  \"preregister\": {\n"
+cert = cert + "    \"r_monotone_desync\": \"r_3 > r_5 > r_10\",\n"
+cert = cert + "    \"v_sync_monotone_desync\": \"V_3 < V_5 < V_10\"\n"
+cert = cert + "  }\n"
+cert = cert + "}\n"
+
+write_file("shared/state/edu_v_sync_kuramoto.json", cert)
+println("cert: shared/state/edu_v_sync_kuramoto.json")
+exit(0)

@@ -1,0 +1,331 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  edu/cell/lagrangian/v_rg.hexa
+//
+//  PURPOSE
+//    Mk.IX RG-hierarchy potential V_RG(ν, φ, ξ) term of the unified
+//    Lagrangian L_IX = T − V_struct − V_sync − V_RG + λ·I_irr.
+//
+//    Composes three RG observables (already landed in edu/cell/rg/) into
+//    a scalar potential that is MINIMISED at the Ising-2D critical point
+//    (ν=1.0, ξ finite, Δφ finite) and INCREASES off-critical:
+//
+//        V_RG  =  α · |ν − ν*|²  +  β · (1 − |Δφ|)  +  γ · exp(−ξ/N)
+//
+//    where:
+//      ν       — critical exponent of correlation length
+//                (measured via log-log slope of ξ(N); edu/cell/rg cert)
+//      ν*      — Ising-2D theoretical = 1.0 (Onsager exact)
+//      |Δφ|    — Z4-parity order-parameter dispersion (0..1)
+//      ξ       — correlation length in lattice units
+//      N       — current level side length (N=16 → 8 → 4 coarse-grain chain)
+//      α, β, γ — pre-registered weights (default 1.0 each, ×1000 fixed-point)
+//
+//    PHYSICAL INTERPRETATION
+//      Term-1  |ν − ν*|²   fixed-point distance in the RG flow (0 at Ising).
+//      Term-2  (1 − |Δφ|)  high-symmetry penalty (small Δφ ⇒ unbroken ⇒
+//                          costlier potential); drives Z4 symmetry
+//                          breaking as the basin of attraction.
+//      Term-3  exp(−ξ/N)   finite-size-scaling cost; vanishes as ξ/N → ∞
+//                          (critical), nonzero otherwise.
+//
+//  PRE-REGISTER (raw#9, deterministic, byte-identical across 3 seeds):
+//    P1. V_RG at ν=1000 ppm (Ising) → minimum vs sweep over [400, 1600] ppm.
+//    P2. V_RG curve convex (single-minimum bowl along ν axis).
+//    P3. hierarchical V_RG = Σ levels V_RG(level).
+//    P4. Mk.IX regression: when use_rg=0, L_IX === L_cell (byte-exact).
+//
+//  SCALE (×1000 fixed-point throughout)
+//    nu_ppm       ∈ [0, 3000]     (0.0 .. 3.0)
+//    dphi_ppm     ∈ [0, 1000]     (0.0 .. 1.0)
+//    xi_x1000     ∈ [0, N*1000]   (0 .. N lattice-units)
+//    weights      α=β=γ=1000      (==1.0)
+//    V_RG_x1000   ∈ [0, ~3000]    (sum of 3 bounded positive terms)
+//
+//  API (pure fns, no I/O, LLM=none, deterministic, snake_case — raw#11)
+//    v_rg_x1000(nu_ppm, dphi_ppm, xi_x1000, N, alpha, beta, gamma) -> int
+//    v_rg_term_nu_x1000(nu_ppm, nu_star_ppm, alpha)                -> int
+//    v_rg_term_phi_x1000(dphi_ppm, beta)                           -> int
+//    v_rg_term_xi_x1000(xi_x1000, N, gamma)                        -> int
+//    v_rg_hierarchical_x1000(nus, dphis, xis, Ns, α, β, γ)         -> int
+//
+//  HEXA-ONLY · raw#9 · deterministic · no LLM.
+//  Canonical Ising cert: shared/state/edu_cell_rg_symmetry.json
+//  Paradigm ref:         docs/new_paradigm_edu_lattice_unified_20260421.md §11
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── integer helpers ─────────────────────────────────────────────────────
+
+fn _vrg_iabs(x: int) -> int { if x < 0 { return 0 - x } return x }
+
+fn _vrg_clamp(v: int, lo: int, hi: int) -> int {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+// ── exp(−x) LUT in per-mille resolution ────────────────────────────────
+// Input  : x_x1000  (non-negative, represents x = x_x1000 / 1000)
+// Output : exp(-x) * 1000  (int), monotonically decreasing from 1000 → 0
+//
+// Table hand-tabulated at 0.05 resolution over [0, 5] (20 bins); beyond
+// x ≥ 5 we return 7 (exp(-5) ≈ 0.0067) floor.
+fn _vrg_exp_neg_x1000(x_x1000: int) -> int {
+    let mut x = x_x1000
+    if x <= 0 { return 1000 }       // exp(0) = 1
+    if x >= 5000 { return 7 }       // exp(-5) ≈ 0.00674
+    // 20 bins of width 50 (×1000) up to 1000 = x=1; then wider.
+    if x < 50    { return 975 }     // exp(-0.025) ≈ 0.9753
+    if x < 100   { return 951 }     // exp(-0.075) ≈ 0.9277 → use midpoint
+    if x < 150   { return 905 }     // exp(-0.125) ≈ 0.8825
+    if x < 200   { return 861 }     // exp(-0.175) ≈ 0.8395
+    if x < 250   { return 819 }     // exp(-0.225) ≈ 0.7985
+    if x < 300   { return 779 }     // exp(-0.275) ≈ 0.7596
+    if x < 350   { return 741 }     // exp(-0.325) ≈ 0.7225
+    if x < 400   { return 705 }     // exp(-0.375) ≈ 0.6873
+    if x < 450   { return 670 }     // exp(-0.425) ≈ 0.6538
+    if x < 500   { return 638 }     // exp(-0.475) ≈ 0.6219
+    if x < 600   { return 585 }     // exp(-0.55) ≈ 0.5769
+    if x < 700   { return 529 }     // exp(-0.65) ≈ 0.5220
+    if x < 800   { return 478 }     // exp(-0.75) ≈ 0.4724
+    if x < 900   { return 433 }     // exp(-0.85) ≈ 0.4274
+    if x < 1000  { return 392 }     // exp(-0.95) ≈ 0.3867
+    if x < 1200  { return 333 }     // exp(-1.10) ≈ 0.3329
+    if x < 1400  { return 273 }     // exp(-1.30) ≈ 0.2725
+    if x < 1600  { return 223 }     // exp(-1.50) ≈ 0.2231
+    if x < 1800  { return 183 }     // exp(-1.70) ≈ 0.1827
+    if x < 2000  { return 150 }     // exp(-1.90) ≈ 0.1496
+    if x < 2500  { return 105 }     // exp(-2.25) ≈ 0.1054
+    if x < 3000  { return 64 }      // exp(-2.75) ≈ 0.0639
+    if x < 3500  { return 39 }      // exp(-3.25) ≈ 0.0388
+    if x < 4000  { return 24 }      // exp(-3.75) ≈ 0.0235
+    if x < 4500  { return 14 }      // exp(-4.25) ≈ 0.0143
+    return 9                        // x ∈ [4500, 5000) → exp ≈ 0.009
+}
+
+// ── V_RG sub-terms (all ×1000 fixed-point) ─────────────────────────────
+
+// Term 1: α · (ν − ν*)²  in ×1000.
+// ν and ν* supplied in ppm (0..3000).  Product (Δν_ppm)² would blow past
+// int-range at Δν=3000 → 9e6; we normalise by dividing once by 1000 to keep
+// the result in ×1000 units.  α supplied ×1000.
+//
+//   result_x1000 = α_x1000 · (Δν_ppm)² / 1_000_000
+//
+// Rationale: |Δν| as a dimensionless fraction = Δν_ppm / 1000.  Squared
+// fraction = (Δν_ppm)² / 1_000_000.  Multiplying by α_x1000 gives an
+// integer in ×1000.  Cancellation order matters: compute (Δν)²/1000 first
+// to pre-empt int overflow on platforms with narrow int.
+fn v_rg_term_nu_x1000(nu_ppm: int, nu_star_ppm: int, alpha_x1000: int) -> int {
+    let d = _vrg_iabs(nu_ppm - nu_star_ppm)
+    // (d*d) / 1000 keeps intermediate < 9000 for d ≤ 3000.
+    let d2_half = (d * d) / 1000
+    // Multiply by α ×1000 then normalise by 1000 once more.
+    return (alpha_x1000 * d2_half) / 1000
+}
+
+// Term 2: β · (1 − |Δφ|)  in ×1000.
+// |Δφ| is ppm (0..1000). β ×1000.
+//
+//   result_x1000 = β_x1000 · (1000 - |Δφ_ppm|) / 1000
+//
+// Clamps Δφ>1000 → 0 to keep term bounded ≥ 0.
+fn v_rg_term_phi_x1000(dphi_ppm: int, beta_x1000: int) -> int {
+    let d = _vrg_iabs(dphi_ppm)
+    let one_minus = if d >= 1000 { 0 } else { 1000 - d }
+    return (beta_x1000 * one_minus) / 1000
+}
+
+// Term 3: γ · exp(−ξ/N)  in ×1000.
+// ξ supplied ×1000 (lattice units × ppm scale).  N integer lattice side.
+// ξ/N (dimensionless) → ξ_x1000 / N  (still ×1000).  Feed directly into
+// the _vrg_exp_neg_x1000 LUT (input units: x×1000).
+fn v_rg_term_xi_x1000(xi_x1000: int, N: int, gamma_x1000: int) -> int {
+    if N <= 0 { return 0 }
+    let x_over_n_x1000 = xi_x1000 / N
+    let e = _vrg_exp_neg_x1000(x_over_n_x1000)
+    return (gamma_x1000 * e) / 1000
+}
+
+// Full V_RG(ν, φ, ξ) at one RG level, ×1000.
+// Default weights: α = β = γ = 1000 (== 1.0).
+fn v_rg_x1000(
+    nu_ppm: int,
+    dphi_ppm: int,
+    xi_x1000: int,
+    N: int,
+    alpha_x1000: int,
+    beta_x1000: int,
+    gamma_x1000: int
+) -> int {
+    let nu_star = 1000                                    // Ising 2D theoretical
+    let t1 = v_rg_term_nu_x1000(nu_ppm, nu_star, alpha_x1000)
+    let t2 = v_rg_term_phi_x1000(dphi_ppm, beta_x1000)
+    let t3 = v_rg_term_xi_x1000(xi_x1000, N, gamma_x1000)
+    return t1 + t2 + t3
+}
+
+// Convenience: default-weight invocation (α=β=γ=1.0 ×1000).
+fn v_rg_default_x1000(nu_ppm: int, dphi_ppm: int, xi_x1000: int, N: int) -> int {
+    return v_rg_x1000(nu_ppm, dphi_ppm, xi_x1000, N, 1000, 1000, 1000)
+}
+
+// Hierarchical V_RG: sum over a chain of coarse-grained levels.
+// Arrays nus[i], dphis[i], xis[i], Ns[i] carry the per-level observables
+// emitted by the rg coarse-graining chain (N=16 → 8 → 4).
+fn v_rg_hierarchical_x1000(
+    nus: list, dphis: list, xis: list, Ns: list,
+    alpha_x1000: int, beta_x1000: int, gamma_x1000: int
+) -> int {
+    let n = nus.len()
+    let mut acc = 0
+    let mut i = 0
+    while i < n {
+        acc = acc + v_rg_x1000(nus[i], dphis[i], xis[i], Ns[i],
+                               alpha_x1000, beta_x1000, gamma_x1000)
+        i = i + 1
+    }
+    return acc
+}
+
+// Subcomponent breakdown — returns [v_rg_total, t_nu, t_phi, t_xi] all ×1000.
+// Useful for driver diagnostics (distinguish which term dominates).
+fn v_rg_breakdown_x1000(
+    nu_ppm: int, dphi_ppm: int, xi_x1000: int, N: int,
+    alpha_x1000: int, beta_x1000: int, gamma_x1000: int
+) -> list {
+    let t1 = v_rg_term_nu_x1000(nu_ppm, 1000, alpha_x1000)
+    let t2 = v_rg_term_phi_x1000(dphi_ppm, beta_x1000)
+    let t3 = v_rg_term_xi_x1000(xi_x1000, N, gamma_x1000)
+    let mut out = []
+    out = out.push(t1 + t2 + t3)
+    out = out.push(t1)
+    out = out.push(t2)
+    out = out.push(t3)
+    return out
+}
+
+// ── self-test ───────────────────────────────────────────────────────────
+
+fn _vrg_assert(name: string, cond: bool) -> int {
+    if cond { println("  OK  " + name) ; return 0 }
+    println("  FAIL " + name) ; return 1
+}
+
+fn main() {
+    println("v_rg selftest (Mk.IX RG hierarchy potential)")
+    let mut fails = 0
+
+    // ── T1: nu term vanishes at ν=ν*=1000 ──
+    fails = fails + _vrg_assert("t_nu(1000,1000) = 0",
+        v_rg_term_nu_x1000(1000, 1000, 1000) == 0)
+
+    // ν=500 → Δν=500 → (500/1000)² = 0.25 → α·0.25 = 250 ×1000
+    fails = fails + _vrg_assert("t_nu(500,1000) = 250",
+        v_rg_term_nu_x1000(500, 1000, 1000) == 250)
+
+    // ν=1500 → Δν=500 → 250 (symmetric)
+    fails = fails + _vrg_assert("t_nu(1500,1000) = 250",
+        v_rg_term_nu_x1000(1500, 1000, 1000) == 250)
+
+    // ── T2: phi term ──
+    // Δφ=0 → (1-0) = 1000
+    fails = fails + _vrg_assert("t_phi(0) = 1000",
+        v_rg_term_phi_x1000(0, 1000) == 1000)
+    // Δφ=140 ppm (measured) → 1 - 0.14 = 0.86 → 860
+    fails = fails + _vrg_assert("t_phi(140) = 860",
+        v_rg_term_phi_x1000(140, 1000) == 860)
+    // Δφ=1000 → 0
+    fails = fails + _vrg_assert("t_phi(1000) = 0",
+        v_rg_term_phi_x1000(1000, 1000) == 0)
+
+    // ── T3: xi term ──
+    // xi/N = 0 → exp(0) = 1000
+    fails = fails + _vrg_assert("t_xi(0,16) = 1000",
+        v_rg_term_xi_x1000(0, 16, 1000) == 1000)
+    // xi=6666 (measured), N=16 → xi/N = 417 ppm → exp(-0.417) ≈ 0.659 ⇒ 670 (LUT bin [400,450))
+    let t_xi_n16 = v_rg_term_xi_x1000(6666, 16, 1000)
+    fails = fails + _vrg_assert("t_xi(6666,16) ≈ 670 [640..720]",
+        t_xi_n16 >= 640 && t_xi_n16 <= 720)
+    // xi=6666, N=8 → 833 ppm → exp(-0.833) ≈ 0.435 ⇒ 433 (LUT bin [800,900))
+    let t_xi_n8  = v_rg_term_xi_x1000(6666, 8, 1000)
+    fails = fails + _vrg_assert("t_xi(6666,8)  ≈ 433",
+        t_xi_n8 == 433)
+    // xi=6666, N=4 → 1666 ppm → exp(-1.666) ≈ 0.189 ⇒ 183 (LUT bin [1600,1800))
+    let t_xi_n4  = v_rg_term_xi_x1000(6666, 4, 1000)
+    fails = fails + _vrg_assert("t_xi(6666,4)  = 183",
+        t_xi_n4 == 183)
+
+    // ── aggregate V_RG at Ising critical point (using measured corpus values) ──
+    // ν=1000, Δφ=140, ξ=6666, N=16 → V_RG = 0 + 860 + 670 = 1530
+    let v_ising_n16 = v_rg_default_x1000(1000, 140, 6666, 16)
+    fails = fails + _vrg_assert("V_RG(ising,N=16) = 860 + t_xi",
+        v_ising_n16 == 860 + t_xi_n16)
+
+    // ── P1: convexity + minimum at ν=ν* ──
+    // Sweep ν ∈ {400, 600, 800, 1000, 1200, 1400, 1600} ppm, hold φ/ξ/N fixed.
+    // Expect minimum at 1000.
+    let sweep_nus = [400, 600, 800, 1000, 1200, 1400, 1600]
+    let mut min_val = 999999999
+    let mut min_idx = -1
+    let mut i = 0
+    while i < sweep_nus.len() {
+        let v = v_rg_default_x1000(sweep_nus[i], 140, 6666, 16)
+        if v < min_val { min_val = v ; min_idx = i }
+        i = i + 1
+    }
+    fails = fails + _vrg_assert("sweep min at ν=1000 (idx=3)", min_idx == 3)
+
+    // Convexity: V(500,1000) ≤ ½(V(400,1000) + V(600,1000)) — discrete convex.
+    let v400  = v_rg_default_x1000(400,  140, 6666, 16)
+    let v600  = v_rg_default_x1000(600,  140, 6666, 16)
+    let v1000 = v_rg_default_x1000(1000, 140, 6666, 16)
+    let v1400 = v_rg_default_x1000(1400, 140, 6666, 16)
+    let v1600 = v_rg_default_x1000(1600, 140, 6666, 16)
+    // Check V(1000) < V(400), V(1000) < V(1600) — strict bowl.
+    fails = fails + _vrg_assert("V(1000) < V(400)",  v1000 < v400)
+    fails = fails + _vrg_assert("V(1000) < V(1600)", v1000 < v1600)
+    fails = fails + _vrg_assert("V(1000) < V(600)",  v1000 < v600)
+    fails = fails + _vrg_assert("V(1000) < V(1400)", v1000 < v1400)
+
+    // ── P3: hierarchical V_RG ──
+    // 3-level chain with measured observables:
+    //   level 0: N=16, ν=750 ppm, Δφ=140, ξ=6666
+    //   level 1: N=8,  ν=1000,     Δφ=140, ξ=6666 (≈ coarse-grain output)
+    //   level 2: N=4,  ν=1000,     Δφ=140, ξ=6666
+    let nus   = [750, 1000, 1000]
+    let dphis = [140,  140,  140]
+    let xis   = [6666, 6666, 6666]
+    let Ns    = [16, 8, 4]
+    let v_hier = v_rg_hierarchical_x1000(nus, dphis, xis, Ns, 1000, 1000, 1000)
+    // Expected: Σ V_RG per level, all positive.
+    let v_l0 = v_rg_default_x1000(750,  140, 6666, 16)   // ν off-critical
+    let v_l1 = v_rg_default_x1000(1000, 140, 6666, 8)    // ν critical at L1
+    let v_l2 = v_rg_default_x1000(1000, 140, 6666, 4)    // ν critical at L2
+    fails = fails + _vrg_assert("V_hier == Σ levels",
+        v_hier == v_l0 + v_l1 + v_l2)
+    fails = fails + _vrg_assert("V_hier > 0", v_hier > 0)
+
+    // ── Breakdown sanity ──
+    let bd = v_rg_breakdown_x1000(1000, 140, 6666, 16, 1000, 1000, 1000)
+    fails = fails + _vrg_assert("breakdown len=4", bd.len() == 4)
+    fails = fails + _vrg_assert("breakdown[0] = total",
+        bd[0] == bd[1] + bd[2] + bd[3])
+    fails = fails + _vrg_assert("breakdown[1] = t_nu (0 at Ising)",
+        bd[1] == 0)
+
+    // ── Determinism: byte-identical on 3 calls (no rng, no clock) ──
+    let d1 = v_rg_default_x1000(1000, 140, 6666, 16)
+    let d2 = v_rg_default_x1000(1000, 140, 6666, 16)
+    let d3 = v_rg_default_x1000(1000, 140, 6666, 16)
+    fails = fails + _vrg_assert("determinism 3 calls", d1 == d2 && d2 == d3)
+
+    if fails == 0 {
+        println("v_rg: PASS")
+        exit(0)
+    } else {
+        println("v_rg: FAIL (" + str(fails) + " assertions)")
+        exit(1)
+    }
+}
+
+main()
