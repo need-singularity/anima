@@ -2,7 +2,7 @@
 
 > **Status**: CANONICAL — 이 문서가 두 트랙 역할 구분의 single source of truth.
 > **Trigger**: 2026-04-20 세션 중 역할 혼동 발생 (Claude 가 "ALM = 언어만 / CLM = 의식" 으로 잘못 설명). 차후 혼동 방지용 고정.
-> **참조**: feedback_goal_clm_alm_agi / feedback_dual_track / shared/config/roadmaps/anima_hexa_common.json
+> **참조**: feedback_goal_clm_alm_agi / feedback_dual_track / shared/roadmaps/anima.json (canonical main linker, 2026-04-20 unified)
 
 ---
 
@@ -110,7 +110,10 @@
 
 ## 7. 참조
 
-- **Memory**: `feedback_goal_clm_alm_agi.md`, `feedback_dual_track.md`, `feedback_ai_native_clm.md`, `project_alm_r12_pipeline_20260420.md`, `project_scaling_law.md`
-- **Roadmap**: `shared/config/roadmaps/anima_hexa_common.json` (joint_roadmap), `shared/config/roadmaps/anima.json`
+- **Memory**: `feedback_goal_clm_alm_agi.md`, `feedback_dual_track.md`, `feedback_ai_native_clm.md`, `project_alm_r12_pipeline_20260420.md`, `project_alm_corpus_vacuum_20260420.md`, `project_scaling_law.md`
+- **Roadmap (2026-04-20 unified)**: `shared/roadmaps/anima.json` (main linker) + `shared/roadmaps/dest_alm.json` + `shared/roadmaps/dest_clm.json`
+- **Verifier infrastructure (2026-04-20 landed)**: `shared/calc/{alm,clm}_verify/` + `shared/consciousness/{pass_gate_an11,closed_loop_verify}.hexa` + `shared/bench/alm_kr_gen_100.jsonl`
+- **Verifier design SSOT**: `docs/alm_clm_verifier_design_20260420.md`
+- **r13 corpus plan**: `docs/alm_r13_corpus_rebuild_plan_20260420.md`
 - **Extreme accel**: `feedback_extreme_accel.md` (AnimaLM 7B→14B→70B 극한 로드맵)
 - **Mac panic block**: `project_mac_panic_permanent_block_20260420.md` (ALM production 경로 안전 방어)
