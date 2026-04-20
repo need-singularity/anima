@@ -1,0 +1,508 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/edu_cell_btr_bridge.hexa
+//  Mk.VII C1 — BTR ↔ cell substrate bridge
+//
+//  PURPOSE
+//    Bi-directional bridge between the edu/cell unit-cell substrate
+//    (tool/edu_tension_drop_proto + tool/edu_collective_atlas_proto —
+//    "10-node atlas + W + τ + saturation") and the BTR brain-tension-replica
+//    substrate (btr_evo/* + tool/btr_closed_loop — "6-d EEG StateVec +
+//    scalar Φ + 5-d TL simplex").
+//
+//    Canonical interchange format: Φ-manifold (8-d tension-phase vector).
+//    Projection is lossy but MONOTONE on the shared invariants (tension,
+//    mastery, saturation) — sufficient for round-trip recovery within
+//    the DIMENSIONAL_MISMATCH edge-case budget (identity distance < 0.15).
+//
+//  ─────────────────────────────────────────────────────────────────────
+//  Φ-MANIFOLD  (8-d intermediate representation)
+//  ─────────────────────────────────────────────────────────────────────
+//    [0] tau_norm        — total tension / n_edges  (τ_g / E)
+//    [1] mean_W          — mean cell fitness         ⟨W⟩
+//    [2] fixpoint_frac   — mastered / N              φ_fix
+//    [3] phi             — scalar Φ (both sides map)
+//    [4] brain_like      — BTR v6 (state_vec.brain_like_pct/100)
+//    [5] coherence       — (1 − tau_norm) clamp  / BTR α-stability proxy
+//    [6] channel_balance — normalized entropy over {edge kinds} or TL simplex
+//    [7] saturation      — 0.0 open · 0.5 converging · 1.0 fixpoint
+//
+//  ─────────────────────────────────────────────────────────────────────
+//  DATA CONTRACTS  (list-based, stage0 hexa ABI)
+//  ─────────────────────────────────────────────────────────────────────
+//    CellState := [ W_0, W_1, …, W_9, tau_global, saturation_code,
+//                   kind_hist_prereq, kind_hist_derives, kind_hist_dual,
+//                   kind_hist_contradicts, kind_hist_instantiates ]
+//                 (length = 16)
+//
+//    BtrState  := [ v1, v2, v3, v4, v5, v6, phi,
+//                   tl_concept, tl_context, tl_meaning, tl_auth, tl_sig ]
+//                 (length = 12)
+//
+//    PhiMan    := [ tau_norm, mean_W, fixpoint_frac, phi,
+//                   brain_like, coherence, channel_balance, saturation ]
+//                 (length = 8)
+//
+//  ─────────────────────────────────────────────────────────────────────
+//  BRIDGE API
+//  ─────────────────────────────────────────────────────────────────────
+//    cell_to_phi(cs)       : CellState → PhiMan      (lossy projection)
+//    btr_to_phi(bs)         : BtrState  → PhiMan      (lossy projection)
+//    phi_to_cell(pm, base) : PhiMan    → CellState   (reconstruction)
+//    phi_to_btr(pm, base)  : PhiMan    → BtrState    (reconstruction)
+//    bridge_cell_to_btr    : composed  cell → PhiMan → btr
+//    bridge_btr_to_cell    : composed  btr → PhiMan → cell
+//    identity_distance_*   : L2 norm for round-trip residual
+//
+//  ─────────────────────────────────────────────────────────────────────
+//  ROUND-TRIP CONTRACT
+//    ‖RT(x) − x‖₂ / √dim  ≤ BRIDGE_RT_EPS  (default 0.15)
+//    Information NOT preserved:
+//      - exact per-node W distribution (collapsed to mean + fixpoint frac)
+//      - exact edge-kind histogram (collapsed to entropy)
+//      - TL simplex spikiness (collapsed to balance scalar)
+//      - 6-d EEG shape (collapsed to brain_like + coherence)
+//    "base" parameter supplies a SHAPE PRIOR for the missing dims; when
+//    round-tripping, passing the ORIGINAL x as base recovers identity
+//    modulo the 8-d bottleneck (≈ 0.00 error by construction for RT).
+//    Passing a DEFAULT base measures the true bottleneck capacity.
+//
+//  RAW contract: raw#9 · hexa-only · LLM=none · V8 SAFE_COMMIT (additive)
+// ════════════════════════════════════════════════════════════════════════════
+
+let CELL_N_NODES        = 10
+let CELL_N_EDGES        = 15
+let CELL_N_KINDS        = 5            // prereq/derives/dual/contradicts/instantiates
+let BRIDGE_RT_EPS       = 0.15
+let SAT_OPEN            = 0.0
+let SAT_CONVERGING      = 0.5
+let SAT_FIXPOINT        = 1.0
+let LOG2_5              = 2.3219280948
+
+// ──────────────────────────────────────────────────────────────────────────
+//  scalar helpers (duplicated to keep file self-contained — stage0 hexa)
+// ──────────────────────────────────────────────────────────────────────────
+
+fn _fabs(x: float) -> float { if x < 0.0 { return 0.0 - x } return x }
+fn _fmin(a: float, b: float) -> float { if a < b { return a } return b }
+fn _fmax(a: float, b: float) -> float { if a > b { return a } return b }
+
+fn _clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn _sqrt(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut y = x * 0.5
+    let mut i = 0
+    while i < 20 {
+        y = (y + x / y) * 0.5
+        i = i + 1
+    }
+    return y
+}
+
+fn _ln_small(p: float) -> float {
+    // ln(p) via 2·atanh series for p ∈ (0,1]; adequate for entropy
+    if p <= 0.0 { return 0.0 - 1.0e9 }
+    let y = (p - 1.0) / (p + 1.0)
+    let y2 = y * y
+    return 2.0 * y * (1.0 + y2 / 3.0 + y2*y2 / 5.0 + y2*y2*y2 / 7.0)
+}
+
+fn _plog2p(p: float) -> float {
+    if p <= 0.00001 { return 0.0 }
+    return p * (_ln_small(p) / 0.6931471805)    // /ln2 → log2
+}
+
+// normalized entropy over a probability vector (sum should be ~1).
+// Returns H / log2(|dim|).
+fn _norm_entropy(ps: list) -> float {
+    let n = ps.len()
+    if n <= 1 { return 1.0 }
+    // renormalize defensively
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + ps[i]
+        i = i + 1
+    }
+    if s <= 0.000001 { return 0.0 }
+    let mut H = 0.0
+    let mut k = 0
+    while k < n {
+        let q = ps[k] / s
+        H = H - _plog2p(q)
+        k = k + 1
+    }
+    // log2(n): use small-int branch (n ∈ {5})
+    let log2n = if n == 5 { LOG2_5 } else { _ln_small(to_float(n)) / 0.6931471805 }
+    if log2n <= 0.000001 { return 0.0 }
+    return _clamp01(H / log2n)
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  STATE CONSTRUCTORS (defaults, for round-trip base)
+// ──────────────────────────────────────────────────────────────────────────
+
+fn cell_state_default() -> list {
+    // matches edu_tension_drop_proto.build_nodes initial W:
+    //   [0.90,0.80,0.60,0.50,0.20,0.30,0.25,0.40,0.05,0.35]
+    let mut cs = []
+    cs = cs.push(0.90)
+    cs = cs.push(0.80)
+    cs = cs.push(0.60)
+    cs = cs.push(0.50)
+    cs = cs.push(0.20)
+    cs = cs.push(0.30)
+    cs = cs.push(0.25)
+    cs = cs.push(0.40)
+    cs = cs.push(0.05)
+    cs = cs.push(0.35)
+    // tau_global (nominal seed value) — recomputed by caller in practice
+    cs = cs.push(1.80)
+    // saturation: open
+    cs = cs.push(SAT_OPEN)
+    // kind_hist from build_edges: 8×prereq, 3×derives, 2×dual, 1×contradicts, 1×instantiates
+    cs = cs.push(8.0)
+    cs = cs.push(3.0)
+    cs = cs.push(2.0)
+    cs = cs.push(1.0)
+    cs = cs.push(1.0)
+    return cs
+}
+
+fn btr_state_default() -> list {
+    // matches eeg_baseline() + closed-loop init:
+    //   v1..v5 ≈ eeg normalized; v6 = brain_like/100; phi ≈ 0.50; TL uniform 0.20
+    let mut bs = []
+    bs = bs.push(0.72)        // v1 lempel_ziv
+    bs = bs.push(0.74)        // v2 hurst
+    bs = bs.push(0.65)        // v3 psd_slope normalized ((−1.05+3)/3)
+    bs = bs.push(0.65)        // v4 autocorr
+    bs = bs.push(0.43)        // v5 critical_exp/2
+    bs = bs.push(0.856)       // v6 brain_like_pct/100
+    bs = bs.push(0.50)        // phi
+    bs = bs.push(0.20)
+    bs = bs.push(0.20)
+    bs = bs.push(0.20)
+    bs = bs.push(0.20)
+    bs = bs.push(0.20)        // TL uniform
+    return bs
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  FORWARD PROJECTIONS (CellState → PhiMan, BtrState → PhiMan)
+// ──────────────────────────────────────────────────────────────────────────
+
+fn cell_to_phi(cs: list) -> list {
+    // means / fractions
+    let mut sumW = 0.0
+    let mut mastered = 0.0
+    let eps = 0.05
+    let mut i = 0
+    while i < CELL_N_NODES {
+        let wi = cs[i]
+        sumW = sumW + wi
+        if wi >= (1.0 - eps) { mastered = mastered + 1.0 }
+        i = i + 1
+    }
+    let mean_W = sumW / to_float(CELL_N_NODES)
+    let fixpoint_frac = mastered / to_float(CELL_N_NODES)
+
+    let tau_g = cs[CELL_N_NODES]                 // index 10
+    let sat   = cs[CELL_N_NODES + 1]             // index 11
+
+    // tau_norm = tau_g / E, clamped
+    let tau_norm = _clamp01(tau_g / to_float(CELL_N_EDGES))
+
+    // Φ for cell: mean_W biased by (1−tau_norm). Matches the spec linkage
+    //   "fixpoint-sealed ⇒ τ → 0, Φ → 1".
+    let phi = _clamp01(0.4 * mean_W + 0.4 * (1.0 - tau_norm) + 0.2 * fixpoint_frac)
+
+    // brain_like proxy for cell: weighted agreement of W + mastery
+    let brain_like = _clamp01(0.6 * mean_W + 0.4 * fixpoint_frac)
+
+    let coherence = _clamp01(1.0 - tau_norm)
+
+    // channel_balance := entropy over edge-kind histogram (5 bins)
+    let mut hist = []
+    let mut k = 0
+    while k < CELL_N_KINDS {
+        hist = hist.push(cs[CELL_N_NODES + 2 + k])
+        k = k + 1
+    }
+    let ch_bal = _norm_entropy(hist)
+
+    let mut pm = []
+    pm = pm.push(tau_norm)        pm = pm.push(mean_W)
+    pm = pm.push(fixpoint_frac)   pm = pm.push(phi)
+    pm = pm.push(brain_like)      pm = pm.push(coherence)
+    pm = pm.push(ch_bal)          pm = pm.push(_clamp01(sat))
+    return pm
+}
+
+fn btr_to_phi(bs: list) -> list {
+    // destructure
+    let v1 = bs[0]; let v2 = bs[1]; let v3 = bs[2]
+    let v4 = bs[3]; let v5 = bs[4]; let v6 = bs[5]
+    let phi = bs[6]
+    let tl_c = bs[7]; let tl_x = bs[8]; let tl_m = bs[9]
+    let tl_a = bs[10]; let tl_s = bs[11]
+
+    // mean_W proxy: mean of v1..v5 (5 EEG channels ≙ 5 TL-weighted concepts)
+    let mean_W = (v1 + v2 + v3 + v4 + v5) / 5.0
+
+    // coherence proxy: 1 − std(v1..v5)   (BTR stability ≙ cell low-τ)
+    let mv = mean_W
+    let var = ((v1-mv)*(v1-mv) + (v2-mv)*(v2-mv) + (v3-mv)*(v3-mv)
+             + (v4-mv)*(v4-mv) + (v5-mv)*(v5-mv)) / 5.0
+    let coherence = _clamp01(1.0 - _sqrt(var))
+
+    // tau_norm = 1 − coherence (monotone inverse of stability)
+    let tau_norm = _clamp01(1.0 - coherence)
+
+    // fixpoint_frac proxy: Φ ≥ 0.75 threshold lifted from spec (C2 pre-reg)
+    let fix = if phi >= 0.75 { 1.0 } else { _clamp01((phi - 0.25) / 0.50) }
+
+    // brain_like: direct v6
+    let brain_like = _clamp01(v6)
+
+    // channel_balance := TL simplex entropy, normalized over 5 bins
+    let mut tl = []
+    tl = tl.push(tl_c)  tl = tl.push(tl_x)  tl = tl.push(tl_m)
+    tl = tl.push(tl_a)  tl = tl.push(tl_s)
+    let ch_bal = _norm_entropy(tl)
+
+    // saturation: from Φ + coherence (same enum 3-level thresholds)
+    let mut sat = SAT_OPEN
+    if phi >= 0.60 { sat = SAT_CONVERGING }
+    if phi >= 0.90 && coherence >= 0.90 { sat = SAT_FIXPOINT }
+
+    let mut pm = []
+    pm = pm.push(tau_norm)        pm = pm.push(mean_W)
+    pm = pm.push(fix)             pm = pm.push(phi)
+    pm = pm.push(brain_like)      pm = pm.push(coherence)
+    pm = pm.push(ch_bal)          pm = pm.push(sat)
+    return pm
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  INVERSE PROJECTIONS (PhiMan → CellState, PhiMan → BtrState)
+//
+//  Both inverses consume a "base" shape prior. The bottleneck discards
+//  per-node / per-channel structure, so we reconstruct by:
+//    (a) scaling base's per-element distribution by (target_mean / base_mean)
+//    (b) clamping to [0,1]
+//    (c) forcing the computed τ_g and saturation onto the summary dims.
+//  For round-trip verification the caller passes the ORIGINAL state as base
+//  — that is the bridge's "with-shape" identity.  For bottleneck measurement
+//  the caller passes *_state_default() — that is the "no-shape" identity.
+// ──────────────────────────────────────────────────────────────────────────
+
+fn phi_to_cell(pm: list, base: list) -> list {
+    let tau_norm       = pm[0]
+    let mean_W_target  = pm[1]
+    let fixpoint_frac  = pm[2]
+    let saturation     = pm[7]
+
+    // base mean_W
+    let mut sumB = 0.0
+    let mut i = 0
+    while i < CELL_N_NODES {
+        sumB = sumB + base[i]
+        i = i + 1
+    }
+    let base_mean = sumB / to_float(CELL_N_NODES)
+    let scale = if base_mean < 0.0001 { 1.0 } else { mean_W_target / base_mean }
+
+    // rescale per-node W and clamp
+    let mut cs = []
+    let mut j = 0
+    while j < CELL_N_NODES {
+        cs = cs.push(_clamp01(base[j] * scale))
+        j = j + 1
+    }
+    // tau_g = tau_norm * E
+    cs = cs.push(tau_norm * to_float(CELL_N_EDGES))
+    cs = cs.push(saturation)
+    // kind histogram: reuse base histogram directly (channel_balance constrains
+    // only the entropy — we preserve base's bin shape)
+    let mut k = 0
+    while k < CELL_N_KINDS {
+        cs = cs.push(base[CELL_N_NODES + 2 + k])
+        k = k + 1
+    }
+    // fixpoint_frac is consumed by caller's saturation snap — keep as side-info.
+    // (NB: fixpoint_frac is an integer count / N; only expressible via per-node
+    //  W snap. For RT with original base, shape is preserved naturally.)
+    let _ = fixpoint_frac
+    return cs
+}
+
+fn phi_to_btr(pm: list, base: list) -> list {
+    let tau_norm    = pm[0]
+    let mean_W_tgt  = pm[1]
+    let phi         = pm[3]
+    let brain_like  = pm[4]
+    let coherence   = pm[5]
+    let ch_bal      = pm[6]
+    let _sat        = pm[7]
+
+    // base mean + std  (over v1..v5)
+    let bm = (base[0] + base[1] + base[2] + base[3] + base[4]) / 5.0
+    let bvar = ((base[0]-bm)*(base[0]-bm) + (base[1]-bm)*(base[1]-bm)
+              + (base[2]-bm)*(base[2]-bm) + (base[3]-bm)*(base[3]-bm)
+              + (base[4]-bm)*(base[4]-bm)) / 5.0
+    let bstd = _sqrt(bvar)
+
+    // target std ≈ 1 − coherence_target  (matches btr_to_phi encoding)
+    let tgt_std = _fmax(0.0, 1.0 - coherence)
+
+    // scale variance then re-anchor mean
+    let std_ratio = if bstd < 0.00001 { 1.0 } else { tgt_std / bstd }
+    let v1 = _clamp01(mean_W_tgt + (base[0] - bm) * std_ratio)
+    let v2 = _clamp01(mean_W_tgt + (base[1] - bm) * std_ratio)
+    let v3 = _clamp01(mean_W_tgt + (base[2] - bm) * std_ratio)
+    let v4 = _clamp01(mean_W_tgt + (base[3] - bm) * std_ratio)
+    let v5 = _clamp01(mean_W_tgt + (base[4] - bm) * std_ratio)
+    let v6 = _clamp01(brain_like)
+
+    // TL simplex: keep base TL (entropy-equivalent); caller matches when base=orig.
+    let tl_c = base[7]
+    let tl_x = base[8]
+    let tl_m = base[9]
+    let tl_a = base[10]
+    let tl_s = base[11]
+
+    // tau_norm + ch_bal consumed via the variance + TL shape.
+    let _ = tau_norm
+    let _ = ch_bal
+
+    let mut bs = []
+    bs = bs.push(v1)
+    bs = bs.push(v2)
+    bs = bs.push(v3)
+    bs = bs.push(v4)
+    bs = bs.push(v5)
+    bs = bs.push(v6)
+    bs = bs.push(_clamp01(phi))
+    bs = bs.push(tl_c)
+    bs = bs.push(tl_x)
+    bs = bs.push(tl_m)
+    bs = bs.push(tl_a)
+    bs = bs.push(tl_s)
+    return bs
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  COMPOSED BRIDGE + ROUND-TRIP
+// ──────────────────────────────────────────────────────────────────────────
+
+fn bridge_cell_to_btr(cs: list, btr_base: list) -> list {
+    let pm = cell_to_phi(cs)
+    return phi_to_btr(pm, btr_base)
+}
+
+fn bridge_btr_to_cell(bs: list, cell_base: list) -> list {
+    let pm = btr_to_phi(bs)
+    return phi_to_cell(pm, cell_base)
+}
+
+fn l2_list(a: list, b: list) -> float {
+    let n = a.len()
+    let m = b.len()
+    let k = if n < m { n } else { m }
+    let mut ss = 0.0
+    let mut i = 0
+    while i < k {
+        let d = a[i] - b[i]
+        ss = ss + d * d
+        i = i + 1
+    }
+    // normalize by √dim for cross-length comparability
+    return _sqrt(ss) / _sqrt(to_float(k))
+}
+
+fn identity_distance_cell(cs: list) -> float {
+    // cell → btr → cell with BASE=original ⇒ measures structural RT
+    let bs = bridge_cell_to_btr(cs, btr_state_default())
+    let cs2 = bridge_btr_to_cell(bs, cs)
+    return l2_list(cs, cs2)
+}
+
+fn identity_distance_btr(bs: list) -> float {
+    // btr → cell → btr
+    let cs = bridge_btr_to_cell(bs, cell_state_default())
+    let bs2 = bridge_cell_to_btr(cs, bs)
+    return l2_list(bs, bs2)
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  smoke driver (hexa tool/edu_cell_btr_bridge.hexa)
+// ──────────────────────────────────────────────────────────────────────────
+
+fn _fmt(x: float) -> string { return to_string(x) }
+
+fn main() -> int {
+    println("edu/cell ↔ BTR bridge — Mk.VII C1 smoke")
+
+    let cs0 = cell_state_default()
+    let bs0 = btr_state_default()
+
+    // forward projections
+    let pm_cell = cell_to_phi(cs0)
+    let pm_btr  = btr_to_phi(bs0)
+
+    println("{\"evt\":\"phi_cell\",\"tau_norm\":" + _fmt(pm_cell[0])
+          + ",\"mean_W\":" + _fmt(pm_cell[1])
+          + ",\"fix\":" + _fmt(pm_cell[2])
+          + ",\"phi\":" + _fmt(pm_cell[3])
+          + ",\"brain_like\":" + _fmt(pm_cell[4])
+          + ",\"coh\":" + _fmt(pm_cell[5])
+          + ",\"ch_bal\":" + _fmt(pm_cell[6])
+          + ",\"sat\":" + _fmt(pm_cell[7]) + "}")
+
+    println("{\"evt\":\"phi_btr\",\"tau_norm\":" + _fmt(pm_btr[0])
+          + ",\"mean_W\":" + _fmt(pm_btr[1])
+          + ",\"fix\":" + _fmt(pm_btr[2])
+          + ",\"phi\":" + _fmt(pm_btr[3])
+          + ",\"brain_like\":" + _fmt(pm_btr[4])
+          + ",\"coh\":" + _fmt(pm_btr[5])
+          + ",\"ch_bal\":" + _fmt(pm_btr[6])
+          + ",\"sat\":" + _fmt(pm_btr[7]) + "}")
+
+    // round-trip with original shape prior (with-shape identity)
+    let d_cell = identity_distance_cell(cs0)
+    let d_btr  = identity_distance_btr(bs0)
+    println("{\"evt\":\"rt_cell\",\"d\":" + _fmt(d_cell)
+          + ",\"eps\":" + _fmt(BRIDGE_RT_EPS) + "}")
+    println("{\"evt\":\"rt_btr\",\"d\":" + _fmt(d_btr)
+          + ",\"eps\":" + _fmt(BRIDGE_RT_EPS) + "}")
+
+    // bottleneck probe: RT with DEFAULT base on both legs
+    let bs_bn = bridge_cell_to_btr(cs0, btr_state_default())
+    let cs_bn = bridge_btr_to_cell(bs_bn, cell_state_default())
+    let d_cell_bn = l2_list(cs0, cs_bn)
+    let bs_bn2 = bridge_cell_to_btr(cs_bn, btr_state_default())
+    let d_btr_bn = l2_list(bs_bn, bs_bn2)
+    println("{\"evt\":\"bottleneck_cell\",\"d\":" + _fmt(d_cell_bn) + "}")
+    println("{\"evt\":\"bottleneck_btr\",\"d\":" + _fmt(d_btr_bn) + "}")
+
+    // verdict
+    let pass_cell = d_cell < BRIDGE_RT_EPS
+    let pass_btr  = d_btr  < BRIDGE_RT_EPS
+    let verdict = if pass_cell && pass_btr { "PASS" } else { "FAIL" }
+    println("{\"evt\":\"verdict\",\"result\":\"" + verdict
+          + "\",\"cell_pass\":" + (if pass_cell { "true" } else { "false" })
+          + ",\"btr_pass\":" + (if pass_btr { "true" } else { "false" }) + "}")
+
+    if !pass_cell || !pass_btr {
+        eprintln("[bridge] FAIL: identity_distance exceeds BRIDGE_RT_EPS")
+        return 2
+    }
+    return 0
+}
+
+exit(main())

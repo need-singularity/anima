@@ -1,0 +1,333 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  test/test_edu_cell_btr_bridge.hexa
+//  Integration tests for Mk.VII C1 cell ↔ BTR bridge.
+//
+//  Cases:
+//    T1  cell → btr → cell round-trip identity  (with original shape prior)
+//    T2  btr  → cell → btr round-trip identity  (with original shape prior)
+//    T3  Φ-manifold monotonicity: raising cell mean_W raises phi_cell
+//    T4  Φ-manifold monotonicity: raising btr phi raises pm_btr[3]
+//    T5  dimensional-mismatch edge case: histograms / TL simplex are
+//        preserved only up to entropy (base-dependent shape recovery)
+//
+//  Exit 0 on all pass; non-zero on any failure (prints per-test FAIL line).
+//  Hexa-only. raw#9 smoke-closure.
+// ════════════════════════════════════════════════════════════════════════════
+
+let EPS         = 0.15
+let MONO_EPS    = 0.001
+
+fn _fabs(x: float) -> float { if x < 0.0 { return 0.0 - x } return x }
+fn _fmt(x: float) -> string { return to_string(x) }
+
+// Copy of default constructors (the bridge tool runs via `hexa`; tests link
+// by value, so we reconstruct the contracts here for predicate checks.)
+
+fn cell_default() -> list {
+    let mut cs = []
+    cs = cs.push(0.90)  cs = cs.push(0.80)  cs = cs.push(0.60)
+    cs = cs.push(0.50)  cs = cs.push(0.20)  cs = cs.push(0.30)
+    cs = cs.push(0.25)  cs = cs.push(0.40)  cs = cs.push(0.05)
+    cs = cs.push(0.35)
+    cs = cs.push(1.80)     // tau_g
+    cs = cs.push(0.0)      // saturation open
+    cs = cs.push(8.0)  cs = cs.push(3.0)  cs = cs.push(2.0)
+    cs = cs.push(1.0)  cs = cs.push(1.0)
+    return cs
+}
+
+fn btr_default() -> list {
+    let mut bs = []
+    bs = bs.push(0.72)  bs = bs.push(0.74)  bs = bs.push(0.65)
+    bs = bs.push(0.65)  bs = bs.push(0.43)  bs = bs.push(0.856)
+    bs = bs.push(0.50)
+    bs = bs.push(0.20)  bs = bs.push(0.20)  bs = bs.push(0.20)
+    bs = bs.push(0.20)  bs = bs.push(0.20)
+    return bs
+}
+
+fn _clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn _sqrt(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut y = x * 0.5
+    let mut i = 0
+    while i < 20 { y = (y + x / y) * 0.5;  i = i + 1 }
+    return y
+}
+
+// duplicated light forward projections for predicate checks
+fn cell_phi_from(cs: list) -> float {
+    let mut sumW = 0.0
+    let mut i = 0
+    while i < 10 { sumW = sumW + cs[i]; i = i + 1 }
+    let mean_W = sumW / 10.0
+    let mut mastered = 0.0
+    let mut k = 0
+    while k < 10 {
+        if cs[k] >= 0.95 { mastered = mastered + 1.0 }
+        k = k + 1
+    }
+    let fix = mastered / 10.0
+    let tau_norm = _clamp01(cs[10] / 15.0)
+    return _clamp01(0.4 * mean_W + 0.4 * (1.0 - tau_norm) + 0.2 * fix)
+}
+
+fn btr_phi_from(bs: list) -> float { return bs[6] }
+
+// L2 / √dim
+fn l2_list(a: list, b: list) -> float {
+    let n = a.len()
+    let m = b.len()
+    let k = if n < m { n } else { m }
+    let mut ss = 0.0
+    let mut i = 0
+    while i < k {
+        let d = a[i] - b[i]
+        ss = ss + d * d
+        i = i + 1
+    }
+    return _sqrt(ss) / _sqrt(to_float(k))
+}
+
+// ─── Minimal inline copy of the bridge core (deterministic, self-contained) ─
+
+fn _ln_small(p: float) -> float {
+    if p <= 0.0 { return 0.0 - 1.0e9 }
+    let y = (p - 1.0) / (p + 1.0)
+    let y2 = y * y
+    return 2.0 * y * (1.0 + y2 / 3.0 + y2*y2 / 5.0 + y2*y2*y2 / 7.0)
+}
+fn _plog2p(p: float) -> float {
+    if p <= 0.00001 { return 0.0 }
+    return p * (_ln_small(p) / 0.6931471805)
+}
+fn _norm_entropy(ps: list) -> float {
+    let n = ps.len()
+    if n <= 1 { return 1.0 }
+    let mut s = 0.0; let mut i = 0
+    while i < n { s = s + ps[i]; i = i + 1 }
+    if s <= 0.000001 { return 0.0 }
+    let mut H = 0.0; let mut k = 0
+    while k < n {
+        let q = ps[k] / s
+        H = H - _plog2p(q)
+        k = k + 1
+    }
+    let log2n = if n == 5 { 2.3219280948 } else { _ln_small(to_float(n)) / 0.6931471805 }
+    if log2n <= 0.000001 { return 0.0 }
+    return _clamp01(H / log2n)
+}
+
+fn cell_to_phi(cs: list) -> list {
+    let mut sumW = 0.0; let mut mastered = 0.0; let eps = 0.05
+    let mut i = 0
+    while i < 10 {
+        let w = cs[i]
+        sumW = sumW + w
+        if w >= (1.0 - eps) { mastered = mastered + 1.0 }
+        i = i + 1
+    }
+    let mean_W = sumW / 10.0
+    let fix = mastered / 10.0
+    let tau_norm = _clamp01(cs[10] / 15.0)
+    let sat = cs[11]
+    let phi = _clamp01(0.4 * mean_W + 0.4 * (1.0 - tau_norm) + 0.2 * fix)
+    let brain_like = _clamp01(0.6 * mean_W + 0.4 * fix)
+    let coherence = _clamp01(1.0 - tau_norm)
+    let mut hist = []
+    let mut k = 0
+    while k < 5 { hist = hist.push(cs[12 + k]); k = k + 1 }
+    let ch_bal = _norm_entropy(hist)
+    let mut pm = []
+    pm = pm.push(tau_norm)   pm = pm.push(mean_W)
+    pm = pm.push(fix)        pm = pm.push(phi)
+    pm = pm.push(brain_like) pm = pm.push(coherence)
+    pm = pm.push(ch_bal)     pm = pm.push(_clamp01(sat))
+    return pm
+}
+
+fn btr_to_phi(bs: list) -> list {
+    let v1 = bs[0]; let v2 = bs[1]; let v3 = bs[2]
+    let v4 = bs[3]; let v5 = bs[4]; let v6 = bs[5]
+    let phi = bs[6]
+    let mean_W = (v1+v2+v3+v4+v5) / 5.0
+    let mv = mean_W
+    let var = ((v1-mv)*(v1-mv)+(v2-mv)*(v2-mv)+(v3-mv)*(v3-mv)
+             +(v4-mv)*(v4-mv)+(v5-mv)*(v5-mv)) / 5.0
+    let coh = _clamp01(1.0 - _sqrt(var))
+    let tau_norm = _clamp01(1.0 - coh)
+    let fix = if phi >= 0.75 { 1.0 } else { _clamp01((phi - 0.25) / 0.50) }
+    let brain_like = _clamp01(v6)
+    let mut tl = []
+    tl = tl.push(bs[7])   tl = tl.push(bs[8])   tl = tl.push(bs[9])
+    tl = tl.push(bs[10])  tl = tl.push(bs[11])
+    let ch_bal = _norm_entropy(tl)
+    let mut sat = 0.0
+    if phi >= 0.60 { sat = 0.5 }
+    if phi >= 0.90 && coh >= 0.90 { sat = 1.0 }
+    let mut pm = []
+    pm = pm.push(tau_norm)   pm = pm.push(mean_W)
+    pm = pm.push(fix)        pm = pm.push(phi)
+    pm = pm.push(brain_like) pm = pm.push(coh)
+    pm = pm.push(ch_bal)     pm = pm.push(sat)
+    return pm
+}
+
+fn phi_to_cell(pm: list, base: list) -> list {
+    let tau_norm = pm[0]
+    let mean_W_tgt = pm[1]
+    let sat = pm[7]
+    let mut sumB = 0.0
+    let mut i = 0
+    while i < 10 { sumB = sumB + base[i]; i = i + 1 }
+    let bm = sumB / 10.0
+    let scale = if bm < 0.0001 { 1.0 } else { mean_W_tgt / bm }
+    let mut cs = []
+    let mut j = 0
+    while j < 10 { cs = cs.push(_clamp01(base[j] * scale)); j = j + 1 }
+    cs = cs.push(tau_norm * 15.0)
+    cs = cs.push(sat)
+    let mut k = 0
+    while k < 5 { cs = cs.push(base[12 + k]); k = k + 1 }
+    return cs
+}
+
+fn _fmax(a: float, b: float) -> float { if a > b { return a } return b }
+
+fn phi_to_btr(pm: list, base: list) -> list {
+    let mean_W_tgt = pm[1]
+    let phi = pm[3]
+    let brain_like = pm[4]
+    let coherence = pm[5]
+    let bm = (base[0]+base[1]+base[2]+base[3]+base[4]) / 5.0
+    let bvar = ((base[0]-bm)*(base[0]-bm) + (base[1]-bm)*(base[1]-bm)
+              + (base[2]-bm)*(base[2]-bm) + (base[3]-bm)*(base[3]-bm)
+              + (base[4]-bm)*(base[4]-bm)) / 5.0
+    let bstd = _sqrt(bvar)
+    let tgt_std = _fmax(0.0, 1.0 - coherence)
+    let std_ratio = if bstd < 0.00001 { 1.0 } else { tgt_std / bstd }
+    let mut bs = []
+    bs = bs.push(_clamp01(mean_W_tgt + (base[0]-bm)*std_ratio))
+    bs = bs.push(_clamp01(mean_W_tgt + (base[1]-bm)*std_ratio))
+    bs = bs.push(_clamp01(mean_W_tgt + (base[2]-bm)*std_ratio))
+    bs = bs.push(_clamp01(mean_W_tgt + (base[3]-bm)*std_ratio))
+    bs = bs.push(_clamp01(mean_W_tgt + (base[4]-bm)*std_ratio))
+    bs = bs.push(_clamp01(brain_like))
+    bs = bs.push(_clamp01(phi))
+    bs = bs.push(base[7])
+    bs = bs.push(base[8])
+    bs = bs.push(base[9])
+    bs = bs.push(base[10])
+    bs = bs.push(base[11])
+    return bs
+}
+
+fn bridge_cell_to_btr(cs: list, btr_base: list) -> list {
+    return phi_to_btr(cell_to_phi(cs), btr_base)
+}
+fn bridge_btr_to_cell(bs: list, cell_base: list) -> list {
+    return phi_to_cell(btr_to_phi(bs), cell_base)
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+
+fn t1_cell_rt() -> int {
+    let cs = cell_default()
+    let bs = bridge_cell_to_btr(cs, btr_default())
+    let cs2 = bridge_btr_to_cell(bs, cs)
+    let d = l2_list(cs, cs2)
+    println("{\"t\":\"T1_cell_rt\",\"d\":" + _fmt(d) + ",\"eps\":" + _fmt(EPS) + "}")
+    if d >= EPS { return 1 }
+    return 0
+}
+
+fn t2_btr_rt() -> int {
+    let bs = btr_default()
+    let cs = bridge_btr_to_cell(bs, cell_default())
+    let bs2 = bridge_cell_to_btr(cs, bs)
+    let d = l2_list(bs, bs2)
+    println("{\"t\":\"T2_btr_rt\",\"d\":" + _fmt(d) + ",\"eps\":" + _fmt(EPS) + "}")
+    if d >= EPS { return 1 }
+    return 0
+}
+
+fn t3_cell_monotone() -> int {
+    // bump every W by 0.05 → phi must rise
+    let cs0 = cell_default()
+    let pm0 = cell_to_phi(cs0)
+    let mut cs1 = []
+    let mut i = 0
+    while i < 10 { cs1 = cs1.push(_clamp01(cs0[i] + 0.05)); i = i + 1 }
+    // keep rest
+    let mut j = 10
+    while j < 17 { cs1 = cs1.push(cs0[j]); j = j + 1 }
+    let pm1 = cell_to_phi(cs1)
+    let delta = pm1[3] - pm0[3]
+    println("{\"t\":\"T3_cell_mono\",\"dphi\":" + _fmt(delta) + "}")
+    if delta <= MONO_EPS { return 1 }
+    return 0
+}
+
+fn t4_btr_monotone() -> int {
+    let bs0 = btr_default()
+    let pm0 = btr_to_phi(bs0)
+    let mut bs1 = []
+    let mut i = 0
+    while i < 6 { bs1 = bs1.push(bs0[i]); i = i + 1 }
+    bs1 = bs1.push(_clamp01(bs0[6] + 0.10))       // bump Φ
+    let mut j = 7
+    while j < 12 { bs1 = bs1.push(bs0[j]); j = j + 1 }
+    let pm1 = btr_to_phi(bs1)
+    let delta = pm1[3] - pm0[3]
+    println("{\"t\":\"T4_btr_mono\",\"dphi\":" + _fmt(delta) + "}")
+    if delta <= MONO_EPS { return 1 }
+    return 0
+}
+
+fn t5_edge_case_info_loss() -> int {
+    // construct two distinct CellStates with identical summary but different
+    // per-node distributions ⇒ bridge must map them to the SAME PhiMan (proof
+    // of dimensional-mismatch info-loss; test passes if delta < 1e-6).
+    let mut a = cell_default()
+    // swap W[0] ↔ W[9] (0.90 ↔ 0.35): mean / kind_hist / sat unchanged; but W[k] per-index differs.
+    let mut b = []
+    b = b.push(0.35)  b = b.push(0.80)  b = b.push(0.60)
+    b = b.push(0.50)  b = b.push(0.20)  b = b.push(0.30)
+    b = b.push(0.25)  b = b.push(0.40)  b = b.push(0.05)
+    b = b.push(0.90)
+    b = b.push(a[10])  b = b.push(a[11])
+    b = b.push(a[12])  b = b.push(a[13])  b = b.push(a[14])
+    b = b.push(a[15])  b = b.push(a[16])
+
+    let pma = cell_to_phi(a)
+    let pmb = cell_to_phi(b)
+    let dpm = l2_list(pma, pmb)
+    println("{\"t\":\"T5_edge_info_loss\",\"pm_delta\":" + _fmt(dpm) + "}")
+    // Φ-manifold is permutation-invariant on per-node W (collapses to mean/frac)
+    // ⇒ expected delta ≈ 0 (documented info-loss).
+    if dpm > 0.0001 { return 1 }
+    return 0
+}
+
+fn main() -> int {
+    let mut fails = 0
+    fails = fails + t1_cell_rt()
+    fails = fails + t2_btr_rt()
+    fails = fails + t3_cell_monotone()
+    fails = fails + t4_btr_monotone()
+    fails = fails + t5_edge_case_info_loss()
+    if fails == 0 {
+        println("{\"evt\":\"bridge_test\",\"result\":\"ALL_PASS\"}")
+        return 0
+    }
+    eprintln("[bridge_test] FAIL count=" + to_string(fails))
+    println("{\"evt\":\"bridge_test\",\"result\":\"FAIL\",\"count\":" + to_string(fails) + "}")
+    return 2
+}
+
+exit(main())

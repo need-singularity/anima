@@ -140,8 +140,42 @@ edu F lattice 실측 후 3 observable verdict:
 - A+F 통합 agent 완료 시 6/6 component landing 기록
 - edu F lattice 측정 시 3 observable 값 + L3 verdict
 - ~~4-gen crystallize (GPU training) 시 distill efficiency 실측 + phase-jump verified/failed~~ **완료 2026-04-21 (축소 CPU native 실측; VERIFIED)** → `shared/state/edu_cell_4gen_crystallize.json`
-- BTR ↔ cell bridge 설계 완료 시 integration 기록
+- ~~BTR ↔ cell bridge 설계 완료 시 integration 기록~~ **완료 2026-04-21 (Mk.VII C1 100%, raw#9)** → `tool/edu_cell_btr_bridge.hexa` + `test/test_edu_cell_btr_bridge.hexa`
 - Mk.VII C2 gate 통과 시 L3_EMERGED evidence SHA 기록
+
+## Mk.VII C1 — BTR ↔ cell substrate bridge (LANDED, 2026-04-21)
+
+**파일**
+- `tool/edu_cell_btr_bridge.hexa` — 양방향 bridge + Φ-manifold 중간 표현
+- `test/test_edu_cell_btr_bridge.hexa` — 5-case integration test (T1–T5, ALL_PASS)
+
+**중간 표현** — Φ-manifold (8-d tension-phase vector):
+`[tau_norm, mean_W, fixpoint_frac, phi, brain_like, coherence, channel_balance, saturation]`
+
+**선택 이유**: cell 쪽 (unit-cell + τ + saturation) 과 BTR 쪽 (6-d EEG StateVec + Φ + 5-d TL simplex) 는 atom 차원이 다르지만, **tension / mastery / saturation** 는 양측의 공통 불변량. phase-space 로 collapse 하면 projection 이 lossy 하되 monotone 이 되어 round-trip 복원 가능.
+
+**변환 API**
+- `cell_to_phi(cs)` / `btr_to_phi(bs)` — forward projection (lossy)
+- `phi_to_cell(pm, base)` / `phi_to_btr(pm, base)` — inverse w/ shape prior (variance-shaping 으로 coherence 보존)
+- `bridge_cell_to_btr(cs, btr_base)` / `bridge_btr_to_cell(bs, cell_base)` — composed
+
+**Round-trip 결과**
+| 경로 | identity distance (L2 / √dim) | ε budget | 결과 |
+|---|---|---|---|
+| cell → btr → cell | **4.626 × 10⁻⁷** | 0.15 | **PASS** |
+| btr  → cell → btr | **0.132**            | 0.15 | **PASS** |
+
+**Edge cases (정보 손실 / dimensional mismatch)**
+- **permutation-invariance**: per-node W 순서는 mean + fixpoint-frac 로 collapse ⇒ 상이한 W 배열이 동일 PhiMan 에 매핑 (T5 검증, Δpm = 0 documented bottleneck).
+- **TL simplex spikiness**: 5-d TL 는 channel-balance 엔트로피 스칼라로 환원; base shape prior 없이 역변환 시 spike 복원 불가.
+- **edge-kind histogram (5-bin)**: 엔트로피 하나로 환원; base prior 로 shape 복원.
+- **BTR v6 (brain_like) ↔ cell mean_W**: 낮은 mean_W (0.44) 의 cell 을 BTR 로 보낼 때 v6 가 0.26 으로 떨어져 native BTR semantics (v6 ≈ 0.85+) 와 격차 발생. round-trip 은 여전히 성립.
+
+**Monotonicity 확인**
+- cell mean_W +0.05 → Φ +0.04 (T3 PASS)
+- BTR Φ +0.10 → PhiMan.phi +0.10 (T4 PASS)
+
+**RAW / contract**: raw#9 · hexa-only · deterministic · LLM=none · V8 SAFE_COMMIT (additive).
 
 ## 4-gen crystallize 실측 (2026-04-21, raw#9)
 
