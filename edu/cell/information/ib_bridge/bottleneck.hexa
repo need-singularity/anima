@@ -1,0 +1,99 @@
+// edu/cell/information/ib_bridge/bottleneck.hexa
+// ─────────────────────────────────────────────────────────────
+// O2 IB_loss = I(X;Z) − β·I(Z;Y), β=1.0
+//
+// X : full 16-dim cell state              (bulk)
+// Z : k=5 projection via fixed random P  (bottleneck)
+// Y : 1-dim teacher = deterministic linear function of X
+//     (same synthesis pattern as btr_evo/5_holographic_ib.hexa)
+//
+// This is the "IB reversal" witness: early in training, higher
+// I(X;Z) dominates (copy-through), IB_loss rises. After the
+// bottleneck engages I(Z;Y) wins, loss reverses / drops.
+//
+// The driver inlines ksg_mi to compute I_XZ and I_ZY.
+//
+// API
+//   build_P(k, d, seed)        -> [k × d]
+//   project_Z(X, P)            -> [n × k]
+//   ib_loss(i_xz, i_zy, beta)  -> float
+// ─────────────────────────────────────────────────────────────
+
+// LCG-based quasi-Gaussian for deterministic projection matrix.
+// Copied from btr_evo 5 — byte-identical so estimator behaviour
+// is unchanged across files.
+fn lcg_next_bn(state: int) -> int {
+    let m: int = 2147483647
+    let a: int = 1103515245
+    let c: int = 12345
+    let s = (a * state + c) % m
+    if s < 0 { return 0 - s }
+    return s
+}
+
+fn normal_pair_bn(seed: int) -> array {
+    let s1 = lcg_next_bn(seed)
+    let s2 = lcg_next_bn(s1)
+    let s3 = lcg_next_bn(s2)
+    let s4 = lcg_next_bn(s3)
+    let u1 = to_float(s1) / 2147483647.0
+    let u2 = to_float(s2) / 2147483647.0
+    let u3 = to_float(s3) / 2147483647.0
+    let u4 = to_float(s4) / 2147483647.0
+    // CLT-of-4 → approx N(0, sqrt(1/3))
+    let z = (u1 + u2 + u3 + u4) - 2.0
+    let mut out = []
+    out = out.push(z)
+    out = out.push(to_float(s4))
+    return out
+}
+
+// P ∈ R^{k × d}, 1/sqrt(d)-scaled to keep Z unit-variance.
+fn build_P(k: int, d: int, seed: int) -> array {
+    let mut P = []
+    let mut s = seed + 31337
+    let mut i = 0
+    let scale = 1.0 / 4.0         // sqrt(16) = 4 for d=16
+    while i < k {
+        let mut row = []
+        let mut j = 0
+        while j < d {
+            let pair = normal_pair_bn(s)
+            row = row.push(pair[0] * scale)
+            s = to_int(pair[1])
+            j = j + 1
+        }
+        P = P.push(row)
+        i = i + 1
+    }
+    return P
+}
+
+fn project_Z(X: array, P: array) -> array {
+    let n = X.len()
+    let k = P.len()
+    let d = P[0].len()
+    let mut Z = []
+    let mut i = 0
+    while i < n {
+        let mut row = []
+        let mut a = 0
+        while a < k {
+            let mut s = 0.0
+            let mut b = 0
+            while b < d {
+                s = s + P[a][b] * X[i][b]
+                b = b + 1
+            }
+            row = row.push(s)
+            a = a + 1
+        }
+        Z = Z.push(row)
+        i = i + 1
+    }
+    return Z
+}
+
+fn ib_loss(i_xz: float, i_zy: float, beta: float) -> float {
+    return i_xz - beta * i_zy
+}

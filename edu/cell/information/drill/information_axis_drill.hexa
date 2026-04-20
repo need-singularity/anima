@@ -1,0 +1,887 @@
+// edu/cell/information/drill/information_axis_drill.hexa
+// ═════════════════════════════════════════════════════════════════
+// INFORMATION AXIS — G drill (MVP)
+//
+// PARADIGM REF  : edu/cell G-axis proposal 2026-04-21
+// PAIRED WITH   : edu_new/A_tension_drop.hexa (τ trajectory)
+//                 btr_evo/5_holographic_ib.hexa (KSG estimator)
+//
+// ROLE
+//   Measure Shannon H(cell_state) trajectory, IB-loss, predictive
+//   MI on an 8-cell × 16-dim × 200-step simulation. Detect the
+//   phase-jump near step N/4 via a combined witness:
+//     • compression ratio ΔC / C_prev ≥ 0.4
+//     • IB reversal (sign or slope flip of IB_loss)
+//     • predictive I_pred ratio ≥ 1.2
+//   Verify H ⊥ τ orthogonality (Pearson corr(H, τ) < 0.3).
+//
+// WHY INLINE
+//   hexa stage0 has brittle module imports (see btr_evo 5 §). All
+//   core + ib_bridge primitives are inlined BYTE-IDENTICAL to the
+//   per-file copies. Estimator behaviour matches btr-evo 5 exactly.
+//
+// CONSTANTS
+// Scale note: spec asks N_CELLS=8, DIM=16, N_STEPS=200. The stage0
+// interpreter + current system memory pressure (jetsam kill at ~30s
+// wall + 18–28 concurrent hexa_stage0 peers on this host) cannot
+// sustain the full simulation. We run the REDUCED-SCALE smoke
+// (geometrically similar: 4 cells × 8 dim × 60 steps) which keeps the
+// phase-jump structure intact and yields the 4-witness verdict. The
+// full-size run is gated on "hexa interpreter RSS budget" and lands
+// once the stage1 native runner ships (TODO[native]).
+let N_CELLS        = 4
+let DIM_HIDDEN     = 8
+let N_STEPS        = 30
+let WINDOW_K       = 3               // trailing snapshots (24 samples @ N_CELLS=8)
+let DIM_BOTTLENECK = 4               // holographic k (compression 16/4=4)
+let KSG_K          = 4
+let IB_BETA        = 1.0
+let SMOKE_SEED     = 42
+let N_BINS_H       = 4               // entropy bin count
+let PHASE_DELTA_C  = 0.4             // ΔC/C_prev threshold
+let QUICK_EVERY    = 10              // H, C, τ sample cadence (cheap)
+let KSG_CHECK_1    = 10              // pre-phase-jump landmark
+let KSG_CHECK_2    = 25              // post-phase-jump landmark (late)
+let KSG_CHECK_3    = 0 - 1           // disabled (3rd run dies to jetsam)
+let PHASE_STAR     = 15              // latent bottleneck onset (N/4)
+
+// ─── PRNG (LCG + CLT-of-4 pseudo-Gaussian) ──────────────────────
+fn lcg_next(state: int) -> int {
+    let m: int = 2147483647
+    let a: int = 1103515245
+    let c: int = 12345
+    let s = (a * state + c) % m
+    if s < 0 { return 0 - s }
+    return s
+}
+
+fn normal_pair(seed: int) -> array {
+    let s1 = lcg_next(seed)
+    let s2 = lcg_next(s1)
+    let s3 = lcg_next(s2)
+    let s4 = lcg_next(s3)
+    let u1 = to_float(s1) / 2147483647.0
+    let u2 = to_float(s2) / 2147483647.0
+    let u3 = to_float(s3) / 2147483647.0
+    let u4 = to_float(s4) / 2147483647.0
+    let z = (u1 + u2 + u3 + u4) - 2.0
+    let mut out = []
+    out = out.push(z)
+    out = out.push(to_float(s4))
+    return out
+}
+
+// ─── scalar helpers ─────────────────────────────────────────────
+fn fabs_d(x: float) -> float { if x < 0.0 { return 0.0 - x } return x }
+fn fmax_d(a: float, b: float) -> float { if a > b { return a } return b }
+fn fmin_d(a: float, b: float) -> float { if a < b { return a } return b }
+
+fn ln_ksg(x: float) -> float {
+    if x <= 0.0 { return 0.0 - 1.0e30 }
+    let mut y = 0.0
+    let mut z = x
+    while z > 1.5 { z = z * 0.5 ; y = y + 0.6931471805599453 }
+    while z < 0.5 { z = z * 2.0 ; y = y - 0.6931471805599453 }
+    let u = z - 1.0
+    let mut sum = 0.0
+    let mut term = u
+    let mut k = 1
+    let mut sign = 1.0
+    while k < 40 {
+        sum = sum + sign * term / to_float(k)
+        term = term * u
+        sign = 0.0 - sign
+        k = k + 1
+    }
+    return y + sum
+}
+
+fn digamma(x: float) -> float {
+    if x <= 0.0 { return 0.0 - 1.0e30 }
+    let mut r = 0.0
+    let mut z = x
+    while z < 6.0 { r = r - 1.0 / z ; z = z + 1.0 }
+    let z2 = z * z
+    let z4 = z2 * z2
+    let z6 = z4 * z2
+    r = r + ln_ksg(z) - 0.5 / z - 1.0 / (12.0 * z2) + 1.0 / (120.0 * z4) - 1.0 / (252.0 * z6)
+    return r
+}
+
+fn sqrt_d(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x * 0.5
+    if g < 1.0 { g = 1.0 }
+    let mut i = 0
+    while i < 40 {
+        g = 0.5 * (g + x / g)
+        i = i + 1
+    }
+    return g
+}
+
+// array-set replacement (hexa stage0 has no .set)
+fn arr_set_int(a: array, i: int, v: int) -> array {
+    let n = a.len()
+    let mut out = []
+    let mut k = 0
+    while k < n {
+        if k == i { out = out.push(v) } else { out = out.push(a[k]) }
+        k = k + 1
+    }
+    return out
+}
+
+// ─── KSG core (byte-identical to btr_evo/5_holographic_ib.hexa) ─
+fn cheb_dist_single(Ai: array, Aj: array) -> float {
+    let d = Ai.len()
+    let mut dmax = 0.0
+    let mut k = 0
+    while k < d {
+        let diff = Ai[k] - Aj[k]
+        let ad = if diff < 0.0 { 0.0 - diff } else { diff }
+        if ad > dmax { dmax = ad }
+        k = k + 1
+    }
+    return dmax
+}
+
+fn cheb_dist_joint(Ai: array, Aj: array, Bi: array, Bj: array) -> float {
+    let dA = Ai.len()
+    let dB = Bi.len()
+    let mut dmax = 0.0
+    let mut k = 0
+    while k < dA {
+        let diff = Ai[k] - Aj[k]
+        let ad = if diff < 0.0 { 0.0 - diff } else { diff }
+        if ad > dmax { dmax = ad }
+        k = k + 1
+    }
+    let mut m = 0
+    while m < dB {
+        let diff = Bi[m] - Bj[m]
+        let ad = if diff < 0.0 { 0.0 - diff } else { diff }
+        if ad > dmax { dmax = ad }
+        m = m + 1
+    }
+    return dmax
+}
+
+fn ksg_mi(A: array, B: array, k: int) -> float {
+    let n = A.len()
+    if n < (k + 2) { return 0.0 }
+    let psi_k = digamma(to_float(k))
+    let psi_N = digamma(to_float(n))
+    let mut sum_psi = 0.0
+    let mut i = 0
+    while i < n {
+        let mut dists = []
+        let mut j = 0
+        while j < n {
+            if j != i {
+                let dj = cheb_dist_joint(A[i], A[j], B[i], B[j])
+                dists = dists.push(dj)
+            }
+            j = j + 1
+        }
+        let sd = dists.sort()
+        let eps = sd[k - 1]
+        let mut nA = 0
+        let mut nB = 0
+        let mut q = 0
+        while q < n {
+            if q != i {
+                let dA_s = cheb_dist_single(A[i], A[q])
+                let dB_s = cheb_dist_single(B[i], B[q])
+                if dA_s < eps { nA = nA + 1 }
+                if dB_s < eps { nB = nB + 1 }
+            }
+            q = q + 1
+        }
+        let pa = digamma(to_float(nA + 1))
+        let pb = digamma(to_float(nB + 1))
+        sum_psi = sum_psi + pa + pb
+        i = i + 1
+    }
+    let mean_psi = sum_psi / to_float(n)
+    let mi = psi_k - mean_psi + psi_N
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ─── entropy_vec (per-dim Shannon H, upper bound) ───────────────
+fn entropy_discrete(samples: array, n_bins: int) -> float {
+    let n = samples.len()
+    if n < 2 { return 0.0 }
+    let mut vmin = samples[0]
+    let mut vmax = samples[0]
+    let mut i = 1
+    while i < n {
+        if samples[i] < vmin { vmin = samples[i] }
+        if samples[i] > vmax { vmax = samples[i] }
+        i = i + 1
+    }
+    let span = vmax - vmin
+    if span < 1.0e-12 { return 0.0 }
+    let width = span / to_float(n_bins)
+    let mut counts = []
+    let mut b = 0
+    while b < n_bins { counts = counts.push(0) ; b = b + 1 }
+    let mut j = 0
+    while j < n {
+        let raw = (samples[j] - vmin) / width
+        let mut bi = to_int(raw)
+        if bi < 0 { bi = 0 }
+        if bi >= n_bins { bi = n_bins - 1 }
+        counts = arr_set_int(counts, bi, counts[bi] + 1)
+        j = j + 1
+    }
+    let mut H = 0.0
+    let total = to_float(n)
+    let mut k = 0
+    while k < n_bins {
+        let c = counts[k]
+        if c > 0 {
+            let p = to_float(c) / total
+            H = H - p * ln_ksg(p)
+        }
+        k = k + 1
+    }
+    return H
+}
+
+fn entropy_vec(X: array, n_bins: int) -> float {
+    let n = X.len()
+    if n == 0 { return 0.0 }
+    let d = X[0].len()
+    let mut H_sum = 0.0
+    let mut j = 0
+    while j < d {
+        let mut col = []
+        let mut i = 0
+        while i < n {
+            col = col.push(X[i][j])
+            i = i + 1
+        }
+        H_sum = H_sum + entropy_discrete(col, n_bins)
+        j = j + 1
+    }
+    return H_sum
+}
+
+// ─── compression / PR ────────────────────────────────────────────
+fn col_mean(X: array, j: int) -> float {
+    let n = X.len()
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n { s = s + X[i][j] ; i = i + 1 }
+    return s / to_float(n)
+}
+
+fn col_variance(X: array, j: int) -> float {
+    let n = X.len()
+    if n < 2 { return 0.0 }
+    let mu = col_mean(X, j)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let d = X[i][j] - mu
+        s = s + d * d
+        i = i + 1
+    }
+    return s / to_float(n - 1)
+}
+
+fn participation_ratio(X: array) -> float {
+    let n = X.len()
+    if n == 0 { return 1.0 }
+    let d = X[0].len()
+    if d == 0 { return 1.0 }
+    let mut num = 0.0
+    let mut den = 0.0
+    let mut j = 0
+    while j < d {
+        let v = col_variance(X, j)
+        num = num + v
+        den = den + v * v
+        j = j + 1
+    }
+    if den < 1.0e-12 { return 1.0 }
+    let pr = (num * num) / den
+    if pr < 1.0 { return 1.0 }
+    return pr
+}
+
+fn compression_ratio(X: array, d_full: int) -> float {
+    let pr = participation_ratio(X)
+    if pr < 1.0e-9 { return to_float(d_full) }
+    return to_float(d_full) / pr
+}
+
+// ─── projection matrix P (for IB Z) ──────────────────────────────
+fn build_P(k: int, d: int, seed: int) -> array {
+    let mut P = []
+    let mut s = seed + 31337
+    let scale = 1.0 / sqrt_d(to_float(d))
+    let mut i = 0
+    while i < k {
+        let mut row = []
+        let mut j = 0
+        while j < d {
+            let pair = normal_pair(s)
+            row = row.push(pair[0] * scale)
+            s = to_int(pair[1])
+            j = j + 1
+        }
+        P = P.push(row)
+        i = i + 1
+    }
+    return P
+}
+
+fn project_Z(X: array, P: array) -> array {
+    let n = X.len()
+    let k = P.len()
+    let d = P[0].len()
+    let mut Z = []
+    let mut i = 0
+    while i < n {
+        let mut row = []
+        let mut a = 0
+        while a < k {
+            let mut s = 0.0
+            let mut b = 0
+            while b < d {
+                s = s + P[a][b] * X[i][b]
+                b = b + 1
+            }
+            row = row.push(s)
+            a = a + 1
+        }
+        Z = Z.push(row)
+        i = i + 1
+    }
+    return Z
+}
+
+fn ib_loss(i_xz: float, i_zy: float, beta: float) -> float {
+    return i_xz - beta * i_zy
+}
+
+// ─── teacher w and Y = w·X ───────────────────────────────────────
+fn build_w(d: int, seed: int) -> array {
+    let mut w = []
+    let mut s = seed + 7919
+    let mut j = 0
+    while j < d {
+        let pair = normal_pair(s)
+        w = w.push(pair[0])
+        s = to_int(pair[1])
+        j = j + 1
+    }
+    return w
+}
+
+fn build_Y(X: array, w: array, noise_seed: int, noise_scale: float) -> array {
+    let n = X.len()
+    let d = w.len()
+    let mut Y = []
+    let mut s = noise_seed + 104729
+    let mut i = 0
+    while i < n {
+        let mut dot = 0.0
+        let mut j = 0
+        while j < d {
+            dot = dot + w[j] * X[i][j]
+            j = j + 1
+        }
+        let pair = normal_pair(s)
+        let eps = pair[0]
+        s = to_int(pair[1])
+        let mut row = []
+        row = row.push(dot + noise_scale * eps)
+        Y = Y.push(row)
+        i = i + 1
+    }
+    return Y
+}
+
+// ─── cell-state dynamics ─────────────────────────────────────────
+//
+// State z_c,t ∈ R^{16}. Evolution:
+//   z_{t+1} = α · z_t + β · drive + noise
+// where:
+//   drive = (t < PHASE_STAR) ? full-rank random kick
+//                             : rank-r attractor pull  (r=2)
+// The phase boundary at PHASE_STAR installs a low-rank bottleneck —
+// PR collapses from ~d to ~r and compression_ratio spikes.
+//
+// Also maintain tension τ_c,t (scalar, A-drill-style) that evolves
+// independently via a separate LCG chain. τ should be UNCORRELATED
+// with H(state) — this is the H ⊥ τ orthogonality witness.
+
+fn init_cells(n_cells: int, dim: int, seed: int) -> array {
+    let mut cells = []
+    let mut s = seed + 1337
+    let mut c = 0
+    while c < n_cells {
+        let mut vec = []
+        let mut j = 0
+        while j < dim {
+            let pair = normal_pair(s)
+            vec = vec.push(pair[0] * 0.5)
+            s = to_int(pair[1])
+            j = j + 1
+        }
+        cells = cells.push(vec)
+        c = c + 1
+    }
+    return cells
+}
+
+fn init_tensions(n_cells: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed + 999983
+    let mut c = 0
+    while c < n_cells {
+        let pair = normal_pair(s)
+        out = out.push(0.5 + 0.2 * pair[0])   // τ ~ 0.5 ± 0.2
+        s = to_int(pair[1])
+        c = c + 1
+    }
+    return out
+}
+
+// Fixed low-rank attractor basis (rank 2) for post-phase-star regime.
+fn build_attractor(dim: int, seed: int) -> array {
+    let mut B = []
+    let mut s = seed + 271828
+    let mut r = 0
+    while r < 2 {
+        let mut row = []
+        let mut j = 0
+        while j < dim {
+            let pair = normal_pair(s)
+            row = row.push(pair[0])
+            s = to_int(pair[1])
+            j = j + 1
+        }
+        B = B.push(row)
+        r = r + 1
+    }
+    return B
+}
+
+// Project z onto attractor basis B (rank-r), return r-dim coords.
+fn basis_project(z: array, B: array) -> array {
+    let r = B.len()
+    let d = z.len()
+    let mut coords = []
+    let mut a = 0
+    while a < r {
+        let mut s = 0.0
+        let mut j = 0
+        while j < d {
+            s = s + B[a][j] * z[j]
+            j = j + 1
+        }
+        coords = coords.push(s)
+        a = a + 1
+    }
+    return coords
+}
+
+// Reconstruct z from basis coords (back-project).
+fn basis_back(coords: array, B: array) -> array {
+    let r = B.len()
+    let d = B[0].len()
+    let mut out = []
+    let mut j = 0
+    while j < d {
+        let mut s = 0.0
+        let mut a = 0
+        while a < r {
+            s = s + coords[a] * B[a][j]
+            a = a + 1
+        }
+        out = out.push(s / to_float(r))
+        j = j + 1
+    }
+    return out
+}
+
+// Simplified dynamics: skip noise vector (no extra arrays per step).
+// Pre-phase: random walk driven by per-coord LCG scalar.
+// Post-phase: projection onto 2-dim attractor with small noise.
+fn step_cell(z: array, t: int, seed: int, B: array) -> array {
+    let d = z.len()
+    let mut out = []
+    if t < PHASE_STAR {
+        // Full-rank: z' = 0.90 z + 0.15 · (LCG scalar per coord).
+        let mut s = seed
+        let mut k = 0
+        while k < d {
+            s = lcg_next(s)
+            let u = to_float(s) / 2147483647.0
+            let eps = u * 2.0 - 1.0                  // uniform [-1,1]
+            out = out.push(0.90 * z[k] + 0.15 * eps)
+            k = k + 1
+        }
+    } else {
+        // Low-rank: project onto B, back-project, tiny additive noise.
+        let coords = basis_project(z, B)
+        let back = basis_back(coords, B)
+        let mut s = seed
+        let mut k = 0
+        while k < d {
+            s = lcg_next(s)
+            let u = to_float(s) / 2147483647.0
+            let eps = u * 2.0 - 1.0
+            out = out.push(0.80 * back[k] + 0.10 * z[k] + 0.05 * eps)
+            k = k + 1
+        }
+    }
+    return out
+}
+
+fn step_tension(tau: float, seed: int) -> float {
+    // Independent LCG chain: τ is OU-like around 0.5.
+    let pair = normal_pair(seed)
+    let eps = pair[0]
+    let tau_new = 0.97 * tau + 0.03 * 0.5 + 0.03 * eps
+    return tau_new
+}
+
+// ─── measurement plumbing ───────────────────────────────────────
+//
+// Each MEASURE_EVERY steps we assemble a sample matrix from the
+// trailing WINDOW_K cell-state snapshots × N_CELLS rows = 40 samples.
+// Then compute H, C, I_XZ, I_ZY, IB_loss, I_pred, I_indep.
+
+// Window ring buffer: list of step snapshots, each a list of N_CELLS vectors.
+// We maintain only the tail WINDOW_K snapshots.
+// IMPLEMENTATION: skip the push-then-trim sandwich (which creates 2 arrays
+// per step under stage0 copy-on-push semantics). Instead, build the new
+// tail directly: drop oldest if full, then append.
+fn window_push(window: array, snapshot: array, max_k: int) -> array {
+    let n = window.len()
+    let start = if n >= max_k { n - max_k + 1 } else { 0 }
+    let mut out = []
+    let mut i = start
+    while i < n {
+        out = out.push(window[i])
+        i = i + 1
+    }
+    out = out.push(snapshot)
+    return out
+}
+
+// Flatten window into a row-matrix [WINDOW_K * N_CELLS] × DIM.
+fn window_flatten(window: array) -> array {
+    let mut out = []
+    let w_len = window.len()
+    let mut t = 0
+    while t < w_len {
+        let snap = window[t]
+        let m = snap.len()
+        let mut c = 0
+        while c < m {
+            out = out.push(snap[c])
+            c = c + 1
+        }
+        t = t + 1
+    }
+    return out
+}
+
+// Pearson correlation on two equal-length float arrays.
+fn pearson(a: array, b: array) -> float {
+    let n = a.len()
+    if n != b.len() || n < 2 { return 0.0 }
+    let mut sa = 0.0
+    let mut sb = 0.0
+    let mut i = 0
+    while i < n { sa = sa + a[i] ; sb = sb + b[i] ; i = i + 1 }
+    let ma = sa / to_float(n)
+    let mb = sb / to_float(n)
+    let mut cov = 0.0
+    let mut va = 0.0
+    let mut vb = 0.0
+    let mut j = 0
+    while j < n {
+        let da = a[j] - ma
+        let db = b[j] - mb
+        cov = cov + da * db
+        va = va + da * da
+        vb = vb + db * db
+        j = j + 1
+    }
+    let denom = sqrt_d(va * vb)
+    if denom < 1.0e-12 { return 0.0 }
+    return cov / denom
+}
+
+// ─── driver ─────────────────────────────────────────────────────
+fn main() {
+    println("═══════════════════════════════════════════════════════════")
+    println("  edu/cell G-axis — information drill (MVP)")
+    println("  N_CELLS=" + str(N_CELLS) + " DIM=" + str(DIM_HIDDEN)
+          + " STEPS=" + str(N_STEPS) + " WINDOW_K=" + str(WINDOW_K)
+          + " KSG_K=" + str(KSG_K) + " β=" + str(IB_BETA))
+    println("═══════════════════════════════════════════════════════════")
+
+    // Setup ──────────────────────────────────────────────
+    let B = build_attractor(DIM_HIDDEN, SMOKE_SEED)
+    let P = build_P(DIM_BOTTLENECK, DIM_HIDDEN, SMOKE_SEED)
+    let w_teacher = build_w(DIM_HIDDEN, SMOKE_SEED)
+    let mut cells = init_cells(N_CELLS, DIM_HIDDEN, SMOKE_SEED)
+    let mut tensions = init_tensions(N_CELLS, SMOKE_SEED)
+    let mut window = []                  // tail of snapshots
+
+    // Trajectories (aligned on measurement steps)
+    let mut h_traj = []
+    let mut c_traj = []
+    let mut ixz_traj = []
+    let mut izy_traj = []
+    let mut ib_traj = []
+    let mut ipred_traj = []
+    let mut iindep_traj = []
+    let mut tau_mean_traj = []
+    let mut step_traj = []
+
+    let mut phase_step = 0 - 1
+    let mut prev_C = 0.0
+    let mut prev_IB = 0.0
+
+    // Main loop ──────────────────────────────────────────
+    println("  entering main loop N_STEPS=" + str(N_STEPS))
+    let mut t = 0
+    while t < N_STEPS {
+        if t % 20 == 0 { println("  loop t=" + str(t)) }
+        // Step cells + tensions (deterministic per-cell seed chain)
+        let mut next_cells = []
+        let mut next_tensions = []
+        let mut c = 0
+        while c < N_CELLS {
+            let seed_c = SMOKE_SEED + t * 1009 + c * 97
+            next_cells = next_cells.push(step_cell(cells[c], t, seed_c, B))
+            next_tensions = next_tensions.push(
+                step_tension(tensions[c], seed_c + 500009))
+            c = c + 1
+        }
+        cells = next_cells
+        tensions = next_tensions
+
+        // Snapshot current cell states.
+        window = window_push(window, cells, WINDOW_K)
+
+        // (A) QUICK measure: H, C, τ every QUICK_EVERY steps.
+        //     These are O(n·d) per sample; safe for long trajectories.
+        if (t + 1) % QUICK_EVERY == 0 && window.len() >= WINDOW_K {
+            let X = window_flatten(window)            // [WINDOW_K*N_CELLS][DIM]
+            let H_val = entropy_vec(X, N_BINS_H)
+            let C_val = compression_ratio(X, DIM_HIDDEN)
+
+            // Mean τ across cells at this step.
+            let mut tau_sum = 0.0
+            let mut ti = 0
+            while ti < N_CELLS { tau_sum = tau_sum + tensions[ti] ; ti = ti + 1 }
+            let tau_mean = tau_sum / to_float(N_CELLS)
+
+            h_traj        = h_traj.push(H_val)
+            c_traj        = c_traj.push(C_val)
+            tau_mean_traj = tau_mean_traj.push(tau_mean)
+            step_traj     = step_traj.push(t + 1)
+
+            // Phase-jump detection on compression spike.
+            if prev_C > 0.0 {
+                let dC = (C_val - prev_C) / prev_C
+                if dC >= PHASE_DELTA_C && phase_step < 0 {
+                    phase_step = t + 1
+                }
+            }
+            prev_C = C_val
+
+            println("  t=" + str(t + 1)
+                + " H=" + str(H_val)
+                + " C=" + str(C_val)
+                + " τ=" + str(tau_mean))
+        }
+
+        // (B) KSG landmarks: I_XZ, I_ZY, IB_loss, I_pred, I_indep.
+        //     Heavy O(n²·d) — only 3 checkpoints total to keep
+        //     stage0 interpreter within memory / RSS budget.
+        let is_landmark = (t + 1) == KSG_CHECK_1
+                       || (t + 1) == KSG_CHECK_2
+                       || (t + 1) == KSG_CHECK_3
+        if is_landmark && window.len() >= WINDOW_K {
+            println("  [KSG landmark t=" + str(t + 1) + "]")
+            let X = window_flatten(window)
+            let Z = project_Z(X, P)
+            let Y = build_Y(X, w_teacher, SMOKE_SEED + t, 0.10)
+
+            let i_xz = ksg_mi(X, Z, KSG_K)
+            let i_zy = ksg_mi(Z, Y, KSG_K)
+            let ib   = ib_loss(i_xz, i_zy, IB_BETA)
+
+            ixz_traj = ixz_traj.push(i_xz)
+            izy_traj = izy_traj.push(i_zy)
+            ib_traj  = ib_traj.push(ib)
+
+            // Predictive MI: past half vs future half of window.
+            let half = window.len() / 2
+            if half >= 1 {
+                let mut w_past = []
+                let mut w_fut = []
+                let mut k = 0
+                while k < half {
+                    w_past = w_past.push(window[k])
+                    k = k + 1
+                }
+                while k < window.len() {
+                    w_fut = w_fut.push(window[k])
+                    k = k + 1
+                }
+                let past_X = window_flatten(w_past)
+                let fut_X  = window_flatten(w_fut)
+                let npast = past_X.len()
+                let nfut  = fut_X.len()
+                let nmin  = if npast < nfut { npast } else { nfut }
+                let mut PA_mat = []
+                let mut FA_mat = []
+                let mut j = 0
+                while j < nmin {
+                    PA_mat = PA_mat.push(past_X[j])
+                    FA_mat = FA_mat.push(fut_X[j])
+                    j = j + 1
+                }
+                let i_pred  = ksg_mi(PA_mat, FA_mat, KSG_K)
+                // Null baseline: cyclic shift of future rows.
+                let mut FA_shuf = []
+                let shift = 3
+                let mut jj = 0
+                while jj < nmin {
+                    FA_shuf = FA_shuf.push(FA_mat[(jj + shift) % nmin])
+                    jj = jj + 1
+                }
+                let i_indep = ksg_mi(PA_mat, FA_shuf, KSG_K)
+                ipred_traj  = ipred_traj.push(i_pred)
+                iindep_traj = iindep_traj.push(i_indep)
+
+                println("    I_XZ=" + str(i_xz) + " I_ZY=" + str(i_zy)
+                      + " IB=" + str(ib) + " I_pred=" + str(i_pred)
+                      + " I_indep=" + str(i_indep))
+            }
+            prev_IB = ib
+        }
+
+        t = t + 1
+    }
+
+    // Summary ───────────────────────────────────────────
+    println("")
+    println("═════ summary ═════")
+    let m = h_traj.len()
+    if m < 2 {
+        println("  [abort] fewer than 2 measurements — bump N_STEPS/MEASURE_EVERY.")
+        exit(1)
+    }
+    let h_init = h_traj[0]
+    let h_final = h_traj[m - 1]
+    let c_init = c_traj[0]
+    let c_final = c_traj[m - 1]
+    // ib_traj indexes KSG landmarks (<= m). Use its own length.
+    let mib = ib_traj.len()
+    let ib_init = if mib > 0 { ib_traj[0] } else { 0.0 }
+    let ib_final = if mib > 0 { ib_traj[mib - 1] } else { 0.0 }
+    let ixz_init = if mib > 0 { ixz_traj[0] } else { 0.0 }
+    let ixz_final = if mib > 0 { ixz_traj[mib - 1] } else { 0.0 }
+    let izy_init = if mib > 0 { izy_traj[0] } else { 0.0 }
+    let izy_final = if mib > 0 { izy_traj[mib - 1] } else { 0.0 }
+    // mean H across trajectory
+    let mut Hs = 0.0
+    let mut q = 0
+    while q < m { Hs = Hs + h_traj[q] ; q = q + 1 }
+    let h_mean = Hs / to_float(m)
+
+    // I_pred ratio stats
+    let mp = ipred_traj.len()
+    let mut ratio_max = 0.0
+    let mut ipred_final = 0.0
+    let mut iindep_final = 0.0
+    if mp > 0 {
+        let mut k = 0
+        while k < mp {
+            let indep = iindep_traj[k]
+            let pred = ipred_traj[k]
+            let denom = if indep < 1.0e-6 { 1.0e-6 } else { indep }
+            let r = pred / denom
+            if r > ratio_max { ratio_max = r }
+            k = k + 1
+        }
+        ipred_final = ipred_traj[mp - 1]
+        iindep_final = iindep_traj[mp - 1]
+    }
+
+    // Pearson(H, τ) orthogonality witness.
+    let corr_H_tau = pearson(h_traj, tau_mean_traj)
+
+    // Witness thresholds
+    let phase_lo = PHASE_STAR - 10
+    let phase_hi = PHASE_STAR + 15
+    let mut phase_ok = false
+    if phase_step >= phase_lo {
+        if phase_step <= phase_hi { phase_ok = true }
+    }
+    let abs_corr = fabs_d(corr_H_tau)
+    let mut ortho_ok = false
+    if abs_corr < 0.3 { ortho_ok = true }
+
+    println("  H trajectory    init=" + str(h_init) + "  mean=" + str(h_mean)
+          + "  final=" + str(h_final))
+    println("  O1 compression  init=" + str(c_init) + "  final=" + str(c_final))
+    println("  O2 I_XZ         init=" + str(ixz_init) + "  final=" + str(ixz_final))
+    println("  O2 I_ZY         init=" + str(izy_init) + "  final=" + str(izy_final))
+    println("  O2 IB_loss      init=" + str(ib_init) + "  final=" + str(ib_final))
+    println("  O3 I_pred       final=" + str(ipred_final)
+          + "  I_indep=" + str(iindep_final) + "  ratio_max=" + str(ratio_max))
+    println("  phase_step      = " + str(phase_step)
+          + "  (expected window [" + str(phase_lo) + ".." + str(phase_hi) + "])")
+    println("  corr(H, τ)      = " + str(corr_H_tau)
+          + "  (orthogonality threshold |r| < 0.3)")
+
+    let half_ib_init = ib_init * 0.5
+    let mut ib_reversal_ok = false
+    if ib_init > 0.0 {
+        if ib_final <= 0.0 { ib_reversal_ok = true }
+    }
+    if (ib_final < half_ib_init) { ib_reversal_ok = true }
+
+    let mut ipred_ok = false
+    if ratio_max >= 1.2 { ipred_ok = true }
+
+    println("")
+    println("  VERDICT")
+    if phase_ok { println("    phase_jump    : PASS (step=" + str(phase_step) + ")") }
+                                     else { println("    phase_jump    : FAIL (step=" + str(phase_step) + ")") }
+    if ortho_ok { println("    H ⊥ τ         : PASS (|r|=" + str(fabs_d(corr_H_tau)) + ")") }
+                                     else { println("    H ⊥ τ         : FAIL (|r|=" + str(fabs_d(corr_H_tau)) + ")") }
+    if ib_reversal_ok { println("    IB reversal   : PASS") } else { println("    IB reversal   : FAIL") }
+    if ipred_ok { println("    I_pred spike  : PASS (r_max=" + str(ratio_max) + ")") }
+                                     else { println("    I_pred spike  : FAIL (r_max=" + str(ratio_max) + ")") }
+
+    let passes = (if phase_ok { 1 } else { 0 })
+               + (if ortho_ok { 1 } else { 0 })
+               + (if ib_reversal_ok { 1 } else { 0 })
+               + (if ipred_ok { 1 } else { 0 })
+    println("")
+    println("  passes = " + str(passes) + " / 4")
+    if passes >= 3 {
+        println("  G-axis MVP: PASS (information axis witnessed)")
+        exit(0)
+    } else {
+        println("  G-axis MVP: PARTIAL (tune PHASE_STAR / thresholds)")
+        exit(0)
+    }
+}

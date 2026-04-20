@@ -1,0 +1,152 @@
+// edu/cell/information/ib_bridge/ksg_estimator.hexa
+// ─────────────────────────────────────────────────────────────
+// KSG (Kraskov–Stöegbauer–Grassberger 2004, eq. 8) k-NN MI
+// estimator — byte-portable port of btr_evo/5_holographic_ib.hexa
+// §"KSG core". No external libs, pure hexa, deterministic.
+//
+// I(U;V) ≈ ψ(k) − ⟨ψ(n_u+1) + ψ(n_v+1)⟩ + ψ(N)
+//
+// API
+//   ln_ksg(x)           -> float
+//   digamma(x)          -> float
+//   cheb_dist_single    -> float   (Chebyshev over one marginal)
+//   cheb_dist_joint     -> float   (joint (U,V) space)
+//   ksg_mi(A, B, k)     -> float   (A, B are [n][d_*] row-matrices)
+//
+// Units: nats. Clamped to 0 if estimator returns small negative.
+// Complexity O(n^2 · (d_A + d_B)) — fine for n<=50 per call.
+// ─────────────────────────────────────────────────────────────
+
+fn fabs_k(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn chmax_k(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+// Natural log (Taylor around 1 + halving). Identical to btr_evo 5.
+fn ln_ksg(x: float) -> float {
+    if x <= 0.0 { return 0.0 - 1.0e30 }
+    let mut y = 0.0
+    let mut z = x
+    while z > 1.5 {
+        z = z * 0.5
+        y = y + 0.6931471805599453
+    }
+    while z < 0.5 {
+        z = z * 2.0
+        y = y - 0.6931471805599453
+    }
+    let u = z - 1.0
+    let mut sum = 0.0
+    let mut term = u
+    let mut k = 1
+    let mut sign = 1.0
+    while k < 40 {
+        sum = sum + sign * term / to_float(k)
+        term = term * u
+        sign = 0.0 - sign
+        k = k + 1
+    }
+    return y + sum
+}
+
+// Digamma ψ(x) via recursion to x>=6 + asymptotic series.
+fn digamma(x: float) -> float {
+    if x <= 0.0 { return 0.0 - 1.0e30 }
+    let mut r = 0.0
+    let mut z = x
+    while z < 6.0 {
+        r = r - 1.0 / z
+        z = z + 1.0
+    }
+    let z2 = z * z
+    let z4 = z2 * z2
+    let z6 = z4 * z2
+    r = r + ln_ksg(z) - 0.5 / z - 1.0 / (12.0 * z2) + 1.0 / (120.0 * z4) - 1.0 / (252.0 * z6)
+    return r
+}
+
+// Chebyshev distance in one marginal (rows Ai, Aj of equal length).
+fn cheb_dist_single(Ai: array, Aj: array) -> float {
+    let d = Ai.len()
+    let mut dmax = 0.0
+    let mut k = 0
+    while k < d {
+        let diff = Ai[k] - Aj[k]
+        let ad = if diff < 0.0 { 0.0 - diff } else { diff }
+        if ad > dmax { dmax = ad }
+        k = k + 1
+    }
+    return dmax
+}
+
+// Chebyshev distance in the joint (A,B) space.
+fn cheb_dist_joint(Ai: array, Aj: array, Bi: array, Bj: array) -> float {
+    let dA = Ai.len()
+    let dB = Bi.len()
+    let mut dmax = 0.0
+    let mut k = 0
+    while k < dA {
+        let diff = Ai[k] - Aj[k]
+        let ad = if diff < 0.0 { 0.0 - diff } else { diff }
+        if ad > dmax { dmax = ad }
+        k = k + 1
+    }
+    let mut m = 0
+    while m < dB {
+        let diff = Bi[m] - Bj[m]
+        let ad = if diff < 0.0 { 0.0 - diff } else { diff }
+        if ad > dmax { dmax = ad }
+        m = m + 1
+    }
+    return dmax
+}
+
+// KSG eq.8 MI estimate of I(A;B) with k-th neighbour.
+fn ksg_mi(A: array, B: array, k: int) -> float {
+    let n = A.len()
+    if n < (k + 2) { return 0.0 }
+    let psi_k = digamma(to_float(k))
+    let psi_N = digamma(to_float(n))
+
+    let mut sum_psi = 0.0
+    let mut i = 0
+    while i < n {
+        let mut dists = []
+        let mut j = 0
+        while j < n {
+            if j != i {
+                let dj = cheb_dist_joint(A[i], A[j], B[i], B[j])
+                dists = dists.push(dj)
+            }
+            j = j + 1
+        }
+        let sd = dists.sort()
+        let eps = sd[k - 1]
+
+        let mut nA = 0
+        let mut nB = 0
+        let mut q = 0
+        while q < n {
+            if q != i {
+                let dA = cheb_dist_single(A[i], A[q])
+                let dB = cheb_dist_single(B[i], B[q])
+                if dA < eps { nA = nA + 1 }
+                if dB < eps { nB = nB + 1 }
+            }
+            q = q + 1
+        }
+        let pa = digamma(to_float(nA + 1))
+        let pb = digamma(to_float(nB + 1))
+        sum_psi = sum_psi + pa + pb
+        i = i + 1
+    }
+    let mean_psi = sum_psi / to_float(n)
+    let mi = psi_k - mean_psi + psi_N
+    if mi < 0.0 { return 0.0 }
+    return mi
+}

@@ -1,0 +1,140 @@
+// edu/cell/information/core/entropy.hexa
+// ─────────────────────────────────────────────────────────────
+// Shannon H(cell_state) trajectory.
+//
+// Cell state = 16-dim real vector. We quantize each coordinate
+// to B=4 bins over a running range, then compute per-dimension
+// Shannon entropy and sum (assumption: dim-wise independence,
+// upper-bound on true joint H). This is the cheap sidekick to
+// KSG MI and captures the "state diversity" shape over time.
+//
+// API
+//   entropy_discrete(samples, n_bins)   -> float  (nats)
+//   entropy_vec(X_rows, n_bins)          -> float  (per-dim sum)
+//
+// X_rows is [n_samples][dim].
+// ─────────────────────────────────────────────────────────────
+
+fn fabs_e(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn fmin_e(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+fn fmax_e(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+// Natural log via Taylor around 1 with halving normalization.
+// Matches ln_ksg from btr_evo/5_holographic_ib.hexa.
+fn ln_ent(x: float) -> float {
+    if x <= 0.0 { return 0.0 - 1.0e30 }
+    let mut y = 0.0
+    let mut z = x
+    while z > 1.5 {
+        z = z * 0.5
+        y = y + 0.6931471805599453
+    }
+    while z < 0.5 {
+        z = z * 2.0
+        y = y - 0.6931471805599453
+    }
+    let u = z - 1.0
+    let mut sum = 0.0
+    let mut term = u
+    let mut k = 1
+    let mut sign = 1.0
+    while k < 40 {
+        sum = sum + sign * term / to_float(k)
+        term = term * u
+        sign = 0.0 - sign
+        k = k + 1
+    }
+    return y + sum
+}
+
+// hexa stage0 has no array.set — rebuild incrementally.
+fn arr_set_int(a: array, i: int, v: int) -> array {
+    let n = a.len()
+    let mut out = []
+    let mut k = 0
+    while k < n {
+        if k == i { out = out.push(v) } else { out = out.push(a[k]) }
+        k = k + 1
+    }
+    return out
+}
+
+// Discrete Shannon entropy of a 1-D float sample array.
+// Bins are equal-width over [min, max]. Units: nats.
+fn entropy_discrete(samples: array, n_bins: int) -> float {
+    let n = samples.len()
+    if n < 2 { return 0.0 }
+    let mut vmin = samples[0]
+    let mut vmax = samples[0]
+    let mut i = 1
+    while i < n {
+        if samples[i] < vmin { vmin = samples[i] }
+        if samples[i] > vmax { vmax = samples[i] }
+        i = i + 1
+    }
+    let span = vmax - vmin
+    if span < 1.0e-12 { return 0.0 }
+    let width = span / to_float(n_bins)
+    // Count per bin — O(n_bins) pass per increment (fine for n_bins<=8).
+    let mut counts = []
+    let mut b = 0
+    while b < n_bins {
+        counts = counts.push(0)
+        b = b + 1
+    }
+    let mut j = 0
+    while j < n {
+        let raw = (samples[j] - vmin) / width
+        let mut bi = to_int(raw)
+        if bi < 0 { bi = 0 }
+        if bi >= n_bins { bi = n_bins - 1 }
+        counts = arr_set_int(counts, bi, counts[bi] + 1)
+        j = j + 1
+    }
+    // Shannon H in nats: -sum p log p
+    let mut H = 0.0
+    let total = to_float(n)
+    let mut k = 0
+    while k < n_bins {
+        let c = counts[k]
+        if c > 0 {
+            let p = to_float(c) / total
+            H = H - p * ln_ent(p)
+        }
+        k = k + 1
+    }
+    return H
+}
+
+// Per-dimension entropy sum over multi-dim row-matrix X in R^{n x d}.
+// Upper-bounds joint entropy by Hannan-style additive approximation;
+// fast and monotone under concentration / diversity shifts.
+fn entropy_vec(X: array, n_bins: int) -> float {
+    let n = X.len()
+    if n == 0 { return 0.0 }
+    let d = X[0].len()
+    let mut H_sum = 0.0
+    let mut j = 0
+    while j < d {
+        let mut col = []
+        let mut i = 0
+        while i < n {
+            col = col.push(X[i][j])
+            i = i + 1
+        }
+        H_sum = H_sum + entropy_discrete(col, n_bins)
+        j = j + 1
+    }
+    return H_sum
+}
