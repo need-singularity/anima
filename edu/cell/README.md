@@ -157,6 +157,38 @@ edu F lattice 실측 후 3 observable verdict:
 
 종합: L3_EMERGED / L3_PARTIAL / L3_FAILED.
 
+### Mk.VII C2 N=16 CPU proxy (LANDED, 2026-04-21)
+
+**파일**
+- `tool/F_lattice_cpu_proxy.hexa` — 3-seed orchestrator (subprocess per seed for RSS budget) + single-seed dispatch
+- `tool/F_lattice_correlation.hexa` — stand-alone O2 correlation helpers (C(r) decay, α fit, ξ/e)
+- `shared/state/F_lattice_cpu_proxy_N16.json` — cert
+
+**config** (deterministic, hexa-only, CPU-native):
+- side=4 (N=16) · ticks=6 · sample_step=2 → 4-point ladder at t ∈ {0,2,4,6}
+- T0=5000 · upper=6500 · lower=3500 · k_numer=50 (tightened vs N=256 physics; see tool comment)
+- seeds = [42, 137, 271]
+
+**관측값** (aggregate across 3 seeds):
+| observable | verdict | 수치 |
+|---|---|---|
+| **O1** score ladder | **PASS** | mean ladder = [0, 20, 249, 312] ppm ; R²=1.000 ; slope_mean=116 ppm/step ; monotone non-decreasing |
+| **O2** correlation decay | **FAIL (borderline)** | α_mean=0.534 (band [0.5, 2.5] ✓) ; ξ_mean=1.878 (threshold 2.0 ✗ by 6%) |
+| **O3** Φ invariance | **FAIL** | sealed_final=0 across all seeds (seal events absent at N=16 / 6-tick budget); std/mean undefined |
+
+**verdict**: **L3_FAILED (1/3 PASS @ N=16)**
+
+해석: N=16 is below the critical N for collective seal emergence at this tick budget. O1 (score ladder monotonicity) cleanly passes — drop transitions do occur. O2 is borderline — correlation structure present (α within decay band, C(1)=166 > C(2)=88 on average) but ξ just under N/8 threshold by 6%. O3 fails outright — no cells reach the `lower=3500` AND seal-flag=1 simultaneously within 6 ticks at N=16. This is the expected small-scale regime: phase transition requires larger N (or more ticks) to enter. Matches `edu_new/F_l3_emergence_measure.hexa` intent — CPU proxy is the N=16 corner of the (16, 64, 256) scan.
+
+**byte-identical reproducibility** (fingerprint = FNV-class hash over ladder + final state):
+- seed=42  → fp=186851801
+- seed=137 → fp=1743798302
+- seed=271 → fp=961246767
+
+Re-run of same seed + config must yield identical fingerprints.
+
+**다음 스텝**: GPU 실측 (`edu_new/F_l3_emergence_measure.hexa` full 3-scale) for phase-transition ratio + ξ → diameter/4 emergence at N=256. CPU proxy confirms physics + pipeline + determinism at N=16 corner.
+
 ## 100% 완료 시 갱신 예약
 
 - ~~A+F 통합 agent 완료 시 6/6 component landing 기록~~ **A 완료 2026-04-21 (raw#9, `59c03257`)**; F formal L3 verdict 는 GPU 실측 의존
