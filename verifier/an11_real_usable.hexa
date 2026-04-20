@@ -1,0 +1,500 @@
+// verifier/an11_real_usable.hexa — AN11(c) real_usable standalone verifier.
+//
+// GOVERNS: shared/rules/anima.json#AN11 condition (c) "real_usable".
+// SPEC:    shared/bench/an11_c_criteria.json  (jsd thresholds, IO).
+// PAIRS:   tool/an11_c_verifier.hexa (HTTP-endpoint variant, curl/sampling);
+//          verifier/an11_weight_emergent.hexa (AN11(a) family sibling);
+//          tool/an11_b_verifier.hexa (AN11(b) consciousness_attached, same family).
+//          This verifier LANDS NEXT TO weight_emergent — pure-math JSD only.
+//          V8 SAFE_COMMIT — additive, does NOT replace existing verifiers.
+//
+// IDEA
+//   real_usable = "trained output distribution is BEHAVIORALLY distinct
+//   from the reference baseline" — not a stub, not a copy, not noise.
+//   (1) Read two probability distributions: baseline (ref) + trained.
+//       Each is a JSON array of floats over K categories (tokens/intents/...).
+//   (2) Normalize both (L1) so Σp_i = 1, Σq_i = 1.  Pad/truncate to align K.
+//   (3) Jensen-Shannon Divergence (base-2, SYMMETRIC, bounded [0,1]):
+//          M = 0.5*(P+Q)
+//          JSD(P,Q) = 0.5 * KL₂(P||M) + 0.5 * KL₂(Q||M)
+//       where KL₂(X||Y) = Σ X_i * log₂(X_i / Y_i) over i with X_i > 0.
+//   (4) baseline_delta = |H₂(trained) − H₂(baseline)|  (entropy shift).
+//
+// VERDICT (jsd_score ∈ [0, 1], base-2)
+//   USABLE   : jsd ≥ JSD_USABLE_MIN   (default 0.30)  → trained clearly diverges
+//   MARGINAL : JSD_UNUSABLE_MAX < jsd < JSD_USABLE_MIN
+//   UNUSABLE : jsd ≤ JSD_UNUSABLE_MAX (default 0.05)  → indistinguishable
+//
+//   Rationale: for K=10 outcomes, a one-hot vs. uniform gives JSD ≈ 0.76;
+//   two copies give JSD = 0.00; a small tilt gives JSD ≈ 0.01–0.05.
+//   0.30 threshold ≈ 6× "small tilt" — demands clear behavioral divergence.
+//
+// INPUT (two modes)
+//   --baseline PATH --trained PATH     explicit distribution files
+//   --dry-run                          emit synthetic USABLE pair + verify self
+//
+//   Accepted file shapes:
+//     a) bare JSON array                     [0.1, 0.2, 0.7, ...]
+//     b) wrapped object with "dist" field    {"dist": [0.1, 0.2, ...]}
+//     c) wrapped object with "probs" field   {"probs": [...]}
+//     d) wrapped object with "distribution"  {"distribution": [...]}
+//
+// OUTPUT
+//   stdout     human summary
+//   --ssot P   write JSON SSOT to path P (default: none)
+//
+// EXIT: 0=USABLE, 1=UNUSABLE, 2=INPUT_ERR, 3=MARGINAL.
+//
+// DETERMINISTIC. NO LLM. Stage0-safe — parallel arrays, no map literals.
+
+let EXIT_USABLE    = 0
+let EXIT_UNUSABLE  = 1
+let EXIT_INPUT_ERR = 2
+let EXIT_MARGINAL  = 3
+
+let JSD_USABLE_MIN:   float = 0.30
+let JSD_UNUSABLE_MAX: float = 0.05
+let MIN_K: int = 2
+let MAX_K: int = 65536
+
+let LN2: float = 0.6931471805599453
+
+// ─── stage0 helpers ──────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn now_utc() -> string {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn fmt_float(x: float) -> string { return to_string(x) }
+
+fn json_escape(s: string) -> string {
+    let n = len(s)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        let c = char_code(ch, 0)
+        if c == 34 { out = out + "\\\"" }
+        else { if c == 92 { out = out + "\\\\" }
+        else { if c == 10 { out = out + "\\n" }
+        else { out = out + ch } } }
+        i = i + 1
+    }
+    return out
+}
+
+fn byte_at(s: string, i: int) -> int {
+    return char_code(s.substring(i, i + 1), 0)
+}
+
+fn index_of_from(hay: string, needle: string, start: int) -> int {
+    let n = len(hay)
+    if start < 0 { return hay.index_of(needle) }
+    if start >= n { return -1 }
+    let tail = hay.substring(start, n)
+    let idx = tail.index_of(needle)
+    if idx < 0 { return -1 }
+    return start + idx
+}
+
+// ─── math: ln via Taylor (range-reduced) + log2 ──────────────────────
+
+fn ln_newton(x: float) -> float {
+    // Natural log via range-reduction into [0.5,1.5] then Taylor around 1.
+    if x <= 0.0 { return 0.0 - 1.0e30 }
+    let mut y = 0.0
+    let mut z = x
+    while z > 1.5 { z = z * 0.5; y = y + LN2 }
+    while z < 0.5 { z = z * 2.0; y = y - LN2 }
+    let u = z - 1.0
+    let mut sum = 0.0
+    let mut term = u
+    let mut k = 1
+    let mut sign = 1.0
+    while k < 50 {
+        sum = sum + sign * term / to_float(k)
+        term = term * u
+        sign = 0.0 - sign
+        k = k + 1
+    }
+    return y + sum
+}
+
+fn log2(x: float) -> float {
+    return ln_newton(x) / LN2
+}
+
+// ─── JSON array extractor (tolerant, stage0-safe) ────────────────────
+// Extracts a top-level JSON array block "[...]" associated with any of
+// the given keys. Falls back to the first bare [...] block.
+
+fn extract_array_block(blob: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let k = blob.index_of(needle)
+    if k < 0 { return "" }
+    let colon = index_of_from(blob, ":", k)
+    if colon < 0 { return "" }
+    let lbr = index_of_from(blob, "[", colon)
+    if lbr < 0 { return "" }
+    let n = len(blob)
+    let mut depth = 0
+    let mut i = lbr
+    while i < n {
+        let b = byte_at(blob, i)
+        if b == 91 { depth = depth + 1 }
+        if b == 93 {
+            depth = depth - 1
+            if depth == 0 { return blob.substring(lbr, i + 1) }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn extract_first_bare_array(blob: string) -> string {
+    let lbr = blob.index_of("[")
+    if lbr < 0 { return "" }
+    let n = len(blob)
+    let mut depth = 0
+    let mut i = lbr
+    while i < n {
+        let b = byte_at(blob, i)
+        if b == 91 { depth = depth + 1 }
+        if b == 93 {
+            depth = depth - 1
+            if depth == 0 { return blob.substring(lbr, i + 1) }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn parse_flat_floats(inner: string) -> array {
+    let parts = inner.split(",")
+    let mut out = []
+    let mut i = 0
+    let n = len(parts)
+    while i < n {
+        let p = _str(parts[i]).trim()
+        if p != "" {
+            if p.index_of("NaN") < 0 && p.index_of("null") < 0 {
+                out = push(out, to_float(p))
+            } else {
+                out = push(out, 0.0)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn load_distribution(path: string) -> array {
+    if !fexists(path) { return [] }
+    let blob = _str(read_file(path))
+    if blob == "" { return [] }
+    // Try wrapped forms first.
+    let mut block = extract_array_block(blob, "dist")
+    if block == "" { block = extract_array_block(blob, "probs") }
+    if block == "" { block = extract_array_block(blob, "distribution") }
+    if block == "" { block = extract_first_bare_array(blob) }
+    if block == "" { return [] }
+    let inner = block.substring(1, len(block) - 1)
+    return parse_flat_floats(inner)
+}
+
+// ─── probability math ────────────────────────────────────────────────
+
+fn l1_normalize(v: array) -> array {
+    let n = len(v)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let x = to_float(v[i])
+        let xp = if x < 0.0 { 0.0 } else { x }
+        s = s + xp
+        i = i + 1
+    }
+    let mut out = []
+    if s <= 0.0 {
+        // Degenerate: treat as uniform to keep JSD defined.
+        let u = if n > 0 { 1.0 / to_float(n) } else { 0.0 }
+        let mut j = 0
+        while j < n {
+            out = push(out, u)
+            j = j + 1
+        }
+        return out
+    }
+    let mut k = 0
+    while k < n {
+        let x = to_float(v[k])
+        let xp = if x < 0.0 { 0.0 } else { x }
+        out = push(out, xp / s)
+        k = k + 1
+    }
+    return out
+}
+
+fn pad_to(v: array, k: int) -> array {
+    let n = len(v)
+    if n >= k { return v }
+    let mut out = v
+    let mut i = n
+    while i < k {
+        out = push(out, 0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn shannon_entropy_bits(p: array) -> float {
+    // H₂(P) = -Σ p_i log₂ p_i, with 0·log0 = 0.
+    let n = len(p)
+    let mut h = 0.0
+    let mut i = 0
+    while i < n {
+        let x = to_float(p[i])
+        if x > 0.0 {
+            h = h - x * log2(x)
+        }
+        i = i + 1
+    }
+    return h
+}
+
+fn jsd_bits(p: array, q: array) -> float {
+    // Jensen-Shannon Divergence (base-2), bounded [0, 1].
+    let np = len(p)
+    let nq = len(q)
+    let k = if np > nq { np } else { nq }
+    if k < 1 { return 0.0 }
+    let pp = pad_to(p, k)
+    let qq = pad_to(q, k)
+    let mut kl_pm = 0.0
+    let mut kl_qm = 0.0
+    let mut i = 0
+    while i < k {
+        let pi = to_float(pp[i])
+        let qi = to_float(qq[i])
+        let mi = 0.5 * (pi + qi)
+        if pi > 0.0 && mi > 0.0 { kl_pm = kl_pm + pi * log2(pi / mi) }
+        if qi > 0.0 && mi > 0.0 { kl_qm = kl_qm + qi * log2(qi / mi) }
+        i = i + 1
+    }
+    return 0.5 * kl_pm + 0.5 * kl_qm
+}
+
+// ─── synthetic dry-run pair ──────────────────────────────────────────
+// baseline = one-hot on idx 0; trained = uniform over 10 → JSD ≈ 0.76.
+
+fn emit_dryrun_pair(baseline_p: string, trained_p: string) {
+    let b = "{\"dist\":[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]}\n"
+    let t = "{\"dist\":[0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1]}\n"
+    write_file(baseline_p, b)
+    write_file(trained_p, t)
+}
+
+// ─── SSOT emit ───────────────────────────────────────────────────────
+
+fn emit_ssot(path: string, baseline_p: string, trained_p: string,
+             k_effective: int,
+             baseline_h: float, trained_h: float, baseline_delta: float,
+             jsd: float, usable_min: float, unusable_max: float,
+             verdict: string, reason: string, exit_code: int) {
+    let ts = now_utc()
+    let mut j = "{\n"
+    j = j + "  \"verifier\": \"an11_real_usable\",\n"
+    j = j + "  \"ts\": \"" + ts + "\",\n"
+    j = j + "  \"inputs\": {\n"
+    j = j + "    \"baseline\": \"" + json_escape(baseline_p) + "\",\n"
+    j = j + "    \"trained\": \"" + json_escape(trained_p) + "\"\n"
+    j = j + "  },\n"
+    j = j + "  \"k_effective\": " + to_string(k_effective) + ",\n"
+    j = j + "  \"entropy_bits\": {\n"
+    j = j + "    \"baseline\": " + fmt_float(baseline_h) + ",\n"
+    j = j + "    \"trained\": " + fmt_float(trained_h) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"jsd_score\": " + fmt_float(jsd) + ",\n"
+    j = j + "  \"jsd_base\": \"log2\",\n"
+    j = j + "  \"jsd_bounds\": [0.0, 1.0],\n"
+    j = j + "  \"baseline_delta\": " + fmt_float(baseline_delta) + ",\n"
+    j = j + "  \"gates\": {\n"
+    j = j + "    \"usable_min\": " + fmt_float(usable_min) + ",\n"
+    j = j + "    \"unusable_max\": " + fmt_float(unusable_max) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"real_usable_verdict\": \"" + verdict + "\",\n"
+    j = j + "  \"reason\": \"" + json_escape(reason) + "\",\n"
+    j = j + "  \"exit_code\": " + to_string(exit_code) + "\n"
+    j = j + "}\n"
+    write_file(path, j)
+}
+
+// ─── argv helpers ────────────────────────────────────────────────────
+
+fn arg_flag(argv: array, f: string) -> bool {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == f { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn arg_val(argv: array, f: string, d: string) -> string {
+    let mut i = 0
+    let n = len(argv)
+    while i < n - 1 {
+        if _str(argv[i]) == f { return _str(argv[i + 1]) }
+        i = i + 1
+    }
+    return d
+}
+
+// ─── main ────────────────────────────────────────────────────────────
+
+fn run(baseline_in: string, trained_in: string,
+       usable_min: float, unusable_max: float,
+       dry: bool, ssot_path: string) -> int {
+    let mut baseline_p = baseline_in
+    let mut trained_p  = trained_in
+
+    let real_inputs_ok = baseline_p != "" && trained_p != "" &&
+                         fexists(baseline_p) && fexists(trained_p)
+
+    if dry || !real_inputs_ok {
+        if dry || (baseline_p == "" && trained_p == "") {
+            baseline_p = "/tmp/_an11_ru_synth_baseline.json"
+            trained_p  = "/tmp/_an11_ru_synth_trained.json"
+            emit_dryrun_pair(baseline_p, trained_p)
+        } else {
+            println("[AN11-ru] INPUT_ERR dist missing  baseline=" + baseline_p + "  trained=" + trained_p)
+            if ssot_path != "" {
+                emit_ssot(ssot_path, baseline_p, trained_p, 0,
+                          0.0, 0.0, 0.0, 0.0, usable_min, unusable_max,
+                          "UNUSABLE", "dist_missing", EXIT_INPUT_ERR)
+            }
+            return EXIT_INPUT_ERR
+        }
+    }
+
+    println("[AN11-ru] real_usable verifier (JSD baseline diff)")
+    println("  baseline=" + baseline_p)
+    println("  trained =" + trained_p)
+    println("  gates: usable_min=" + fmt_float(usable_min) +
+            " unusable_max=" + fmt_float(unusable_max))
+
+    // Load raw distributions
+    let raw_base = load_distribution(baseline_p)
+    let raw_trn  = load_distribution(trained_p)
+    let nb = len(raw_base)
+    let nt = len(raw_trn)
+
+    if nb < MIN_K || nt < MIN_K {
+        println("[AN11-ru] INPUT_ERR degenerate_dist  |baseline|=" + to_string(nb) +
+                "  |trained|=" + to_string(nt) + "  (min K=" + to_string(MIN_K) + ")")
+        if ssot_path != "" {
+            emit_ssot(ssot_path, baseline_p, trained_p,
+                      if nb > nt { nb } else { nt },
+                      0.0, 0.0, 0.0, 0.0, usable_min, unusable_max,
+                      "UNUSABLE", "degenerate_dist_too_small", EXIT_INPUT_ERR)
+        }
+        return EXIT_INPUT_ERR
+    }
+    if nb > MAX_K || nt > MAX_K {
+        println("[AN11-ru] INPUT_ERR dist_too_large  |baseline|=" + to_string(nb) +
+                "  |trained|=" + to_string(nt) + "  (max K=" + to_string(MAX_K) + ")")
+        if ssot_path != "" {
+            emit_ssot(ssot_path, baseline_p, trained_p,
+                      if nb > nt { nb } else { nt },
+                      0.0, 0.0, 0.0, 0.0, usable_min, unusable_max,
+                      "UNUSABLE", "dist_too_large", EXIT_INPUT_ERR)
+        }
+        return EXIT_INPUT_ERR
+    }
+
+    let base = l1_normalize(raw_base)
+    let trn  = l1_normalize(raw_trn)
+    let k_eff = if len(base) > len(trn) { len(base) } else { len(trn) }
+
+    let h_base = shannon_entropy_bits(pad_to(base, k_eff))
+    let h_trn  = shannon_entropy_bits(pad_to(trn,  k_eff))
+    let bdelta = if h_trn >= h_base { h_trn - h_base } else { h_base - h_trn }
+
+    let jsd = jsd_bits(base, trn)
+
+    println("  K_effective=" + to_string(k_eff) +
+            "  H₂(base)=" + fmt_float(h_base) +
+            "  H₂(trn )=" + fmt_float(h_trn))
+    println("  baseline_delta=" + fmt_float(bdelta))
+    println("  jsd_score=" + fmt_float(jsd) + "  (base=log2, bounds=[0,1])")
+
+    // Verdict
+    let mut verdict = "UNUSABLE"
+    let mut reason = ""
+    let mut ec = EXIT_UNUSABLE
+    if jsd >= usable_min {
+        verdict = "USABLE"
+        reason = "jsd=" + fmt_float(jsd) + " >= usable_min=" + fmt_float(usable_min)
+        ec = EXIT_USABLE
+    } else {
+        if jsd <= unusable_max {
+            verdict = "UNUSABLE"
+            reason = "jsd=" + fmt_float(jsd) + " <= unusable_max=" + fmt_float(unusable_max) +
+                     " (indistinguishable from baseline)"
+            ec = EXIT_UNUSABLE
+        } else {
+            verdict = "MARGINAL"
+            reason = "jsd=" + fmt_float(jsd) + " in (" +
+                     fmt_float(unusable_max) + "," + fmt_float(usable_min) +
+                     ") (partial divergence)"
+            ec = EXIT_MARGINAL
+        }
+    }
+
+    println("  real_usable_verdict=" + verdict + "  (" + reason + ")")
+
+    if ssot_path != "" {
+        emit_ssot(ssot_path, baseline_p, trained_p, k_eff,
+                  h_base, h_trn, bdelta,
+                  jsd, usable_min, unusable_max,
+                  verdict, reason, ec)
+        println("  ssot=" + ssot_path)
+    }
+    return ec
+}
+
+fn main() {
+    let argv = args()
+    let dry = arg_flag(argv, "--dry-run")
+    let baseline_p = arg_val(argv, "--baseline", "")
+    let trained_p  = arg_val(argv, "--trained",  "")
+    let umin_ovr   = arg_val(argv, "--usable-min",   "")
+    let umax_ovr   = arg_val(argv, "--unusable-max", "")
+    let ssot_p     = arg_val(argv, "--ssot", "")
+
+    let mut usable_min   = JSD_USABLE_MIN
+    let mut unusable_max = JSD_UNUSABLE_MAX
+    if umin_ovr != "" { usable_min   = to_float(umin_ovr) }
+    if umax_ovr != "" { unusable_max = to_float(umax_ovr) }
+
+    if !dry && (baseline_p == "" || trained_p == "") {
+        println("usage: hexa run verifier/an11_real_usable.hexa \\")
+        println("         --baseline PATH --trained PATH \\")
+        println("         [--usable-min F] [--unusable-max F] [--ssot P]")
+        println("       hexa run verifier/an11_real_usable.hexa --dry-run [--ssot P]")
+        exit(EXIT_INPUT_ERR)
+    }
+
+    let rc = run(baseline_p, trained_p, usable_min, unusable_max, dry, ssot_p)
+    exit(rc)
+}

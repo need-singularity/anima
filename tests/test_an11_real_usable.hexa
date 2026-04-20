@@ -1,0 +1,227 @@
+// tests/test_an11_real_usable.hexa — AN11(c) real_usable verifier smoke.
+//
+// SCENARIO: feed 3 synthetic (baseline, trained) distribution pairs into
+// verifier/an11_real_usable.hexa and assert the verdict matches the
+// fixture's _expected_verdict field.
+//
+// FIXTURES (tests/fixtures/an11_real_usable_*.json):
+//   - an11_real_usable_usable.json     → expect USABLE   (JSD ≈ 0.72)
+//   - an11_real_usable_marginal.json   → expect MARGINAL (JSD ≈ 0.14)
+//   - an11_real_usable_unusable.json   → expect UNUSABLE (JSD ≈ 0.001)
+//
+// PIPELINE PER FIXTURE
+//   1. Read the fixture (contains "baseline":{"dist":[...]} and "trained":{"dist":[...]}).
+//   2. Split into two tmp files /tmp/_an11ru_{name}_{side}.json.
+//   3. Invoke verifier with --ssot → write /tmp/_an11ru_{name}_ssot.json.
+//   4. Assert ssot.real_usable_verdict == expected_verdict.
+//   5. Assert ssot.jsd_score is a non-negative float in [0, 1].
+//
+// Pass criteria: all 3 fixtures match expected verdict.
+// Exit 0 on full pass, 1 on any mismatch.
+
+let VERIFIER = "verifier/an11_real_usable.hexa"
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn assert_true(cond: bool, msg: string) {
+    if cond {
+        println("[PASS] " + msg)
+    } else {
+        println("[FAIL] " + msg)
+        exit(1)
+    }
+}
+
+fn byte_at(s: string, i: int) -> int {
+    return char_code(s.substring(i, i + 1), 0)
+}
+
+fn index_of_from(hay: string, needle: string, start: int) -> int {
+    let n = len(hay)
+    if start < 0 { return hay.index_of(needle) }
+    if start >= n { return -1 }
+    let tail = hay.substring(start, n)
+    let idx = tail.index_of(needle)
+    if idx < 0 { return -1 }
+    return start + idx
+}
+
+// Extract a "key": "value" string (first match).
+fn extract_string(blob: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let k = blob.index_of(needle)
+    if k < 0 { return "" }
+    let colon = index_of_from(blob, ":", k)
+    if colon < 0 { return "" }
+    let q1 = index_of_from(blob, "\"", colon + 1)
+    if q1 < 0 { return "" }
+    let q2 = index_of_from(blob, "\"", q1 + 1)
+    if q2 < 0 { return "" }
+    return blob.substring(q1 + 1, q2)
+}
+
+// Extract a "key": number and parse to float (first match).
+fn extract_float(blob: string, key: string) -> float {
+    let needle = "\"" + key + "\""
+    let k = blob.index_of(needle)
+    if k < 0 { return 0.0 - 1.0e30 }
+    let colon = index_of_from(blob, ":", k)
+    if colon < 0 { return 0.0 - 1.0e30 }
+    let n = len(blob)
+    let mut i = colon + 1
+    // skip whitespace
+    while i < n {
+        let c = byte_at(blob, i)
+        if c == 32 || c == 9 || c == 10 || c == 13 { i = i + 1 } else { break }
+    }
+    let i0 = i
+    while i < n {
+        let c = byte_at(blob, i)
+        let ok = (c >= 48 && c <= 57) || c == 46 || c == 43 || c == 45 || c == 101 || c == 69
+        if ok { i = i + 1 } else { break }
+    }
+    if i == i0 { return 0.0 - 1.0e30 }
+    return to_float(blob.substring(i0, i))
+}
+
+// Extract the inner contents of a nested object block (balanced braces)
+// following a given key. Returns the raw "[...]" / "{...}" + interior text.
+fn extract_object_block(blob: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let k = blob.index_of(needle)
+    if k < 0 { return "" }
+    let colon = index_of_from(blob, ":", k)
+    if colon < 0 { return "" }
+    let lbr = index_of_from(blob, "{", colon)
+    if lbr < 0 { return "" }
+    let n = len(blob)
+    let mut depth = 0
+    let mut i = lbr
+    while i < n {
+        let b = byte_at(blob, i)
+        if b == 123 { depth = depth + 1 }
+        if b == 125 {
+            depth = depth - 1
+            if depth == 0 { return blob.substring(lbr, i + 1) }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// Extract "dist":[...] array block from an inner object-text; returns "[...]".
+fn extract_dist_array(obj_text: string) -> string {
+    let needle = "\"dist\""
+    let k = obj_text.index_of(needle)
+    if k < 0 { return "" }
+    let colon = index_of_from(obj_text, ":", k)
+    if colon < 0 { return "" }
+    let lbr = index_of_from(obj_text, "[", colon)
+    if lbr < 0 { return "" }
+    let n = len(obj_text)
+    let mut depth = 0
+    let mut i = lbr
+    while i < n {
+        let b = byte_at(obj_text, i)
+        if b == 91 { depth = depth + 1 }
+        if b == 93 {
+            depth = depth - 1
+            if depth == 0 { return obj_text.substring(lbr, i + 1) }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// Split a fixture into two tmp files; returns [baseline_path, trained_path].
+fn split_fixture(fixture_path: string, tag: string) -> array {
+    let blob = _str(read_file(fixture_path))
+    let base_obj = extract_object_block(blob, "baseline")
+    let trn_obj  = extract_object_block(blob, "trained")
+    if base_obj == "" || trn_obj == "" {
+        return ["", ""]
+    }
+    let base_arr = extract_dist_array(base_obj)
+    let trn_arr  = extract_dist_array(trn_obj)
+    if base_arr == "" || trn_arr == "" {
+        return ["", ""]
+    }
+    let base_path = "/tmp/_an11ru_" + tag + "_baseline.json"
+    let trn_path  = "/tmp/_an11ru_" + tag + "_trained.json"
+    write_file(base_path, "{\"dist\": " + base_arr + "}\n")
+    write_file(trn_path,  "{\"dist\": " + trn_arr  + "}\n")
+    return [base_path, trn_path]
+}
+
+fn hexa_bin() -> string {
+    // Honor HEXA_BIN override (lets callers point at raw stage0.real to
+    // bypass the mkdir-lock shim when CI has stale locks). Fall back to
+    // the canonical `hexa` on PATH.
+    let hb = _str(env("HEXA_BIN"))
+    if hb != "" { return hb }
+    return "hexa"
+}
+
+fn run_one(tag: string, fixture_path: string) {
+    println("")
+    println("=== fixture: " + tag + " (" + fixture_path + ") ===")
+
+    let fbl = _str(read_file(fixture_path))
+    let expected = extract_string(fbl, "_expected_verdict")
+    assert_true(expected != "", tag + ": fixture has _expected_verdict")
+    println("  expected_verdict=" + expected)
+
+    let paths = split_fixture(fixture_path, tag)
+    let bp = _str(paths[0])
+    let tp = _str(paths[1])
+    assert_true(bp != "" && tp != "", tag + ": fixture split into baseline+trained tmp files")
+
+    let ssot = "/tmp/_an11ru_" + tag + "_ssot.json"
+    let cmd = hexa_bin() + " " + VERIFIER + " --baseline " + bp + " --trained " + tp + " --ssot " + ssot
+    println("  cmd=" + cmd)
+    let out = _str(exec(cmd + " 2>&1"))
+    println("--- verifier stdout ---")
+    println(out.trim())
+    println("--- end stdout ---")
+
+    let sb = _str(read_file(ssot))
+    assert_true(sb != "", tag + ": ssot file emitted at " + ssot)
+
+    let verdict = extract_string(sb, "real_usable_verdict")
+    let jsd_val = extract_float(sb, "jsd_score")
+    let bdelta  = extract_float(sb, "baseline_delta")
+
+    println("  verdict=" + verdict + "  jsd=" + to_string(jsd_val) +
+            "  baseline_delta=" + to_string(bdelta))
+
+    assert_true(verdict == expected,
+                tag + ": verdict matches expected (got=" + verdict + " expected=" + expected + ")")
+    assert_true(jsd_val >= 0.0 - 0.000001, tag + ": jsd_score non-negative")
+    assert_true(jsd_val <= 1.0 + 0.000001, tag + ": jsd_score bounded by 1.0 (base-2)")
+    assert_true(bdelta >= 0.0 - 0.000001, tag + ": baseline_delta non-negative")
+}
+
+fn main() {
+    println("=== test_an11_real_usable smoke (3 fixtures) ===")
+
+    let fix_u = "tests/fixtures/an11_real_usable_usable.json"
+    let fix_m = "tests/fixtures/an11_real_usable_marginal.json"
+    let fix_n = "tests/fixtures/an11_real_usable_unusable.json"
+
+    assert_true(file_exists(VERIFIER), "verifier exists at " + VERIFIER)
+    assert_true(file_exists(fix_u), "fixture exists: " + fix_u)
+    assert_true(file_exists(fix_m), "fixture exists: " + fix_m)
+    assert_true(file_exists(fix_n), "fixture exists: " + fix_n)
+
+    run_one("usable",   fix_u)
+    run_one("marginal", fix_m)
+    run_one("unusable", fix_n)
+
+    println("")
+    println("=== test_an11_real_usable PASS (3/3 verdicts match) ===")
+    exit(0)
+}
