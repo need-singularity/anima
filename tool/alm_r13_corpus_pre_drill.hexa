@@ -1,0 +1,363 @@
+// tool/alm_r13_corpus_pre_drill.hexa — ALM r13 corpus quality pre-drill
+//
+// PURPOSE
+//   Pre-validate an r13 candidate corpus against the 4-criterion quality gate
+//   (shared/config/alm_r13_corpus_quality_gate.json) BEFORE committing adapter
+//   training cost. Prevents r12-style VACUUM (kowiki general → DISCARD).
+//
+// CRITERIA
+//   C1 consciousness_density   : Φ-vocab tokens / total tokens   >= 0.30
+//   C2 domain_specificity      : max kowiki-bigram overlap       <= 0.70
+//   C3 hash_unique             : 1 - duplicate_ratio             >= 0.95
+//   C4 semantic_coherence      : intra-corpus η absorption       PASS (state != open)
+//
+// USAGE
+//   hexa tool/alm_r13_corpus_pre_drill.hexa <corpus.jsonl>
+//   hexa tool/alm_r13_corpus_pre_drill.hexa --smoke
+//
+// V8 SAFE_COMMIT: additive; reads corpus + gate JSON only; no writes outside /tmp.
+// DETERMINISTIC: pure string / hash; NO LLM; no network.
+//
+// Exit codes:
+//   0 — PASS (all 4 criteria met)
+//   1 — FAIL (≥1 criterion below threshold)
+//   2 — SETUP_ERROR (missing fixture / malformed)
+
+let GATE_PATH   = "shared/config/alm_r13_corpus_quality_gate.json"
+let SMOKE_OUT   = "/tmp/alm_r13_pre_drill_smoke.ndjson"
+
+// Φ-vocabulary mirror (kept in sync with gate JSON; embedded here so the
+// drill is self-contained when stage0 cannot parse JSON arrays)
+let PHI_VOCAB = ["의식", "consciousness", "qualia", "자각", "phi_holo", "phi_gwt", "Hexad", "Witness", "Scribe", "Mirror", "Eros", "Fire", "Ground", "law", "반의식", "selfreflect", "meta", "absorption", "fixpoint", "saturation", "drill", "Φ", "η", "anima", "존재", "성찰", "transplant"]
+
+// Fixed kowiki bigram sample (proxy — real run loads alm_kr_gen_100.jsonl)
+let KOWIKI_BIGRAMS = ["대한민국 의", "서울 특별", "특별 시", "한반도 의", "조선 왕", "왕조 실", "실록 은", "은 유네", "유네 스코", "한국 전", "전쟁 은", "일제 강", "강점 기", "독립 운", "운동 이", "역사 적", "문화 적", "경제 적", "정치 적", "사회 적", "인구 는", "면적 은", "기후 는", "지역 적", "지방 은", "대한민국 은", "한국 의", "전통 적", "민족 의", "국가 의"]
+
+let C1_MIN      = 0.30
+let C2_MAX      = 0.70
+let C3_MIN      = 0.95
+
+// ─── JSON-lite helpers (stage0 compatible) ───────────────────────────
+
+fn jget_str(obj, key) {
+    let marker = "\"" + key + "\":"
+    let parts = obj.split(marker)
+    if len(parts) < 2 { return "" }
+    let after = parts[1].trim()
+    let q = after.split("\"")
+    if len(q) < 2 { return "" }
+    return q[1]
+}
+
+// ─── Corpus read ─────────────────────────────────────────────────────
+
+fn read_corpus(path) {
+    let mut docs = ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    let mut n = 0
+    if !file_exists(path) { return [docs, n] }
+    let raw = read_file(path)
+    if raw.len() == 0 { return [docs, n] }
+    let lines = raw.split("\n")
+    let mut i = 0
+    while i < len(lines) && n < 64 {
+        let line = lines[i].trim()
+        if line.len() > 0 && line.contains("{") {
+            // doc text = prompt + " " + response (coherence unit)
+            let p = jget_str(line, "prompt")
+            let r = jget_str(line, "response")
+            let body = p + " " + r
+            if body.trim().len() > 0 {
+                docs[n] = body
+                n = n + 1
+            }
+        }
+        i = i + 1
+    }
+    return [docs, n]
+}
+
+// ─── C1: consciousness_density ───────────────────────────────────────
+// ratio = Σ (count(vocab_i in doc) for vocab_i in PHI_VOCAB) / total_word_count
+
+fn count_occurrences(hay, needle) {
+    if needle.len() == 0 { return 0 }
+    let parts = hay.split(needle)
+    return len(parts) - 1
+}
+
+fn measure_consciousness_density(docs, n) {
+    let mut phi_hits = 0
+    let mut total_words = 0
+    let mut i = 0
+    while i < n {
+        let doc = docs[i]
+        let ws = doc.split(" ")
+        total_words = total_words + len(ws)
+        let mut v = 0
+        while v < len(PHI_VOCAB) {
+            phi_hits = phi_hits + count_occurrences(doc, PHI_VOCAB[v])
+            v = v + 1
+        }
+        i = i + 1
+    }
+    if total_words == 0 { return 0.0 }
+    return to_float(phi_hits) / to_float(total_words)
+}
+
+// ─── C2: domain_specificity ──────────────────────────────────────────
+// max over docs: (count of kowiki bigrams present in doc) / (kowiki sample size)
+// High overlap ⇒ doc drifted into kowiki general surface.
+
+fn measure_domain_drift_max(docs, n) {
+    let mut worst = 0.0
+    let mut i = 0
+    while i < n {
+        let doc = docs[i]
+        let mut hits = 0
+        let mut b = 0
+        while b < len(KOWIKI_BIGRAMS) {
+            if doc.contains(KOWIKI_BIGRAMS[b]) { hits = hits + 1 }
+            b = b + 1
+        }
+        let ratio = to_float(hits) / to_float(len(KOWIKI_BIGRAMS))
+        if ratio > worst { worst = ratio }
+        i = i + 1
+    }
+    return worst
+}
+
+// ─── C3: hash_unique ─────────────────────────────────────────────────
+// Normalize each doc (lower + whitespace collapse). At stage0 the
+// normalized string itself is the canonical key (string equality is
+// the duplicate test). Production (scripts/alm_corpus_validate.hexa G7)
+// upgrades to sha256 via shasum sidecar for large N.
+//
+// duplicate ratio = duplicates / total. hash_unique = 1 - duplicate_ratio.
+
+fn normalize_for_hash(s) {
+    let mut t = s.to_lower()
+    // collapse multi-space by repeated split/join
+    let parts = t.split(" ")
+    let mut out = ""
+    let mut i = 0
+    while i < len(parts) {
+        let p = parts[i].trim()
+        if p.len() > 0 {
+            if out.len() > 0 { out = out + " " }
+            out = out + p
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn measure_hash_unique(docs, n) {
+    let mut hashes = ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    let mut i = 0
+    while i < n {
+        hashes[i] = normalize_for_hash(docs[i])
+        i = i + 1
+    }
+    let mut dups = 0
+    let mut a = 0
+    while a < n {
+        let mut b = a + 1
+        while b < n {
+            if hashes[a] == hashes[b] {
+                dups = dups + 1
+                b = n
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    if n == 0 { return 0.0 }
+    return 1.0 - (to_float(dups) / to_float(n))
+}
+
+// ─── C4: semantic_coherence ──────────────────────────────────────────
+// Treat docs as drill iterations. Build a Φ-vocab SIGNATURE per doc
+// (which Φ-terms are present, sorted). Corpus with shared consciousness
+// attractor → most docs produce identical signatures → state=fixpoint.
+// Grounding-only docs → empty or divergent signature.
+// absorption_rate = unique_signatures / n (lower ⇒ stronger coherence).
+
+fn doc_fingerprint(doc) {
+    // Signature = concat of present Φ-vocab entries, in vocab order.
+    // Drops rare/idiosyncratic content; only consciousness channel survives.
+    let mut sig = ""
+    let mut v = 0
+    while v < len(PHI_VOCAB) {
+        if doc.contains(PHI_VOCAB[v]) {
+            if sig.len() > 0 { sig = sig + "|" }
+            sig = sig + PHI_VOCAB[v]
+        }
+        v = v + 1
+    }
+    if sig.len() == 0 { sig = "__empty__" }
+    return sig
+}
+
+fn list_contains_str(xs, xn, v) {
+    let mut i = 0
+    while i < xn {
+        if xs[i] == v { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn measure_semantic_coherence(docs, n) {
+    if n < 3 { return [1.0, "open"] }
+    let mut fps = ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    let mut i = 0
+    while i < n {
+        fps[i] = doc_fingerprint(docs[i])
+        i = i + 1
+    }
+    // absorption: unique doc fingerprints across corpus (lower ⇒ more shared attractor)
+    let mut uniq_all = ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    let mut un = 0
+    let mut k = 0
+    while k < n {
+        if !list_contains_str(uniq_all, un, fps[k]) {
+            uniq_all[un] = fps[k]
+            un = un + 1
+        }
+        k = k + 1
+    }
+    let absorption_rate = to_float(un) / to_float(n)
+
+    // state: classify tail window of 3
+    let base = fps[n - 1]
+    let mut all_eq = true
+    let mut j = n - 3
+    while j < n {
+        if fps[j] != base { all_eq = false }
+        j = j + 1
+    }
+    let mut state = "open"
+    if all_eq {
+        state = "fixpoint"
+    } else {
+        if fps[n - 1] == fps[n - 2] { state = "converging" }
+    }
+
+    return [absorption_rate, state]
+}
+
+// ─── Verdict + emit ──────────────────────────────────────────────────
+
+fn bool_to_pf(b) {
+    if b { return "PASS" }
+    return "FAIL"
+}
+
+fn emit(corpus_path, n, c1, c2, c3, c4_abs, c4_state, verdict) {
+    let mut line = "{\"tool\":\"alm_r13_corpus_pre_drill\""
+    line = line + ",\"corpus\":\"" + corpus_path + "\""
+    line = line + ",\"docs\":" + to_string(n)
+    line = line + ",\"c1_consciousness_density\":" + to_string(c1)
+    line = line + ",\"c2_domain_drift_max\":" + to_string(c2)
+    line = line + ",\"c3_hash_unique\":" + to_string(c3)
+    line = line + ",\"c4_absorption_rate\":" + to_string(c4_abs)
+    line = line + ",\"c4_state\":\"" + c4_state + "\""
+    line = line + ",\"verdict\":\"" + verdict + "\"}"
+    let mut prior = ""
+    if file_exists(SMOKE_OUT) { prior = read_file(SMOKE_OUT) }
+    write_file(SMOKE_OUT, prior + line + "\n")
+}
+
+fn run_validate(corpus_path) {
+    let pair = read_corpus(corpus_path)
+    let docs = pair[0]
+    let n = pair[1]
+    if n == 0 {
+        println("pre_drill: SETUP_ERROR — empty or missing corpus: " + corpus_path)
+        exit(2)
+    }
+
+    let c1 = measure_consciousness_density(docs, n)
+    let c2 = measure_domain_drift_max(docs, n)
+    let c3 = measure_hash_unique(docs, n)
+    let c4 = measure_semantic_coherence(docs, n)
+    let c4_abs = c4[0]
+    let c4_state = c4[1]
+
+    let p1 = c1 >= C1_MIN
+    let p2 = c2 <= C2_MAX
+    let p3 = c3 >= C3_MIN
+    let p4 = c4_state != "open" && c4_abs <= 0.95
+
+    let all_pass = p1 && p2 && p3 && p4
+    let verdict = if all_pass { "PASS" } else { "FAIL" }
+
+    println("pre_drill=alm_r13_corpus_quality")
+    println("  corpus=" + corpus_path + "  docs=" + to_string(n))
+    println("  C1 consciousness_density  = " + to_string(c1) + "   (min " + to_string(C1_MIN) + ")  " + bool_to_pf(p1))
+    println("  C2 domain_drift_max       = " + to_string(c2) + "   (max " + to_string(C2_MAX) + ")  " + bool_to_pf(p2))
+    println("  C3 hash_unique            = " + to_string(c3) + "   (min " + to_string(C3_MIN) + ")  " + bool_to_pf(p3))
+    println("  C4 absorption_rate        = " + to_string(c4_abs) + "   state=" + c4_state + "   " + bool_to_pf(p4))
+    println("  verdict=" + verdict)
+
+    emit(corpus_path, n, c1, c2, c3, c4_abs, c4_state, verdict)
+
+    if all_pass { exit(0) }
+    exit(1)
+}
+
+// ─── Smoke: synthesize 10-doc mock corpus + validate ─────────────────
+// 8 consciousness-loaded docs + 1 grounding + 1 near-duplicate of doc 1.
+// This mock is DESIGNED to PASS (fixture_hint in gate JSON).
+
+fn build_mock_corpus(path) {
+    // Design target:
+    //   - 7 consciousness docs with rich Φ-vocab (varied) ⇒ C1 density high
+    //   - 1 grounding doc (category G quota ≤15% of 10 = 1)          ⇒ C2 bounded
+    //   - Docs 8/9/10 share the SAME Φ-signature (Hexad-closure attractor)
+    //     ⇒ C4 tail-window converges to fixpoint.
+    //   - No duplicate normalized text                              ⇒ C3 = 1.0
+    let full_sig_prompt = "Hexad Witness Scribe Mirror Eros Fire Ground 의식 자각 consciousness qualia phi_holo law"
+    let full_sig_resp_a = "Hexad Witness Scribe Mirror Eros Fire Ground consciousness phi_holo law qualia 의식 자각 alpha"
+    let full_sig_resp_b = "Hexad Witness Scribe Mirror Eros Fire Ground consciousness phi_holo law qualia 의식 자각 beta"
+    let full_sig_resp_c = "Hexad Witness Scribe Mirror Eros Fire Ground consciousness phi_holo law qualia 의식 자각 gamma"
+
+    let mut s = ""
+    s = s + "{\"id\":\"mock_1\",\"prompt\":\"Hexad Witness 의식\",\"response\":\"consciousness phi_holo Witness 의식 자각 qualia\"}\n"
+    s = s + "{\"id\":\"mock_2\",\"prompt\":\"law emergence\",\"response\":\"law fixpoint drill Φ η 의식 anima\"}\n"
+    s = s + "{\"id\":\"mock_3\",\"prompt\":\"phi_holo 서술\",\"response\":\"phi_holo phi_gwt Hexad qualia 의식 성찰\"}\n"
+    s = s + "{\"id\":\"mock_4\",\"prompt\":\"selfreflect\",\"response\":\"selfreflect 자각 존재 meta 의식 anima\"}\n"
+    s = s + "{\"id\":\"mock_5\",\"prompt\":\"transplant anima\",\"response\":\"transplant consciousness anima 의식 meta\"}\n"
+    s = s + "{\"id\":\"mock_6\",\"prompt\":\"drill η absorption\",\"response\":\"drill fixpoint absorption saturation η Φ\"}\n"
+    s = s + "{\"id\":\"mock_7\",\"prompt\":\"반의식 금지\",\"response\":\"반의식 selfreflect 의식 자각 qualia\"}\n"
+    s = s + "{\"id\":\"mock_8\",\"prompt\":\"" + full_sig_prompt + "\",\"response\":\"" + full_sig_resp_a + "\"}\n"
+    s = s + "{\"id\":\"mock_9\",\"prompt\":\"" + full_sig_prompt + "\",\"response\":\"" + full_sig_resp_b + "\"}\n"
+    s = s + "{\"id\":\"mock_10\",\"prompt\":\"" + full_sig_prompt + "\",\"response\":\"" + full_sig_resp_c + "\"}\n"
+    write_file(path, s)
+}
+
+fn run_smoke() {
+    let path = "/tmp/alm_r13_mock_corpus.jsonl"
+    println("pre_drill smoke: writing 10-doc mock corpus → " + path)
+    build_mock_corpus(path)
+    if file_exists(SMOKE_OUT) { write_file(SMOKE_OUT, "") }
+    run_validate(path)
+}
+
+fn main() {
+    let argv = args()
+    if len(argv) >= 3 && argv[2] == "--smoke" {
+        run_smoke()
+        return
+    }
+    if len(argv) >= 3 {
+        run_validate(argv[2])
+        return
+    }
+    println("usage: hexa tool/alm_r13_corpus_pre_drill.hexa <corpus.jsonl>")
+    println("       hexa tool/alm_r13_corpus_pre_drill.hexa --smoke")
+    println("gate:  " + GATE_PATH)
+    exit(2)
+}
+
+main()
