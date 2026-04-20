@@ -1893,7 +1893,45 @@ fn free_train_loop_state() -> int {
 // the codegen produces a real C body. Verify after build with:
 //   awk '/^int main/,/^}/' build/artifacts/train_alm_lora.c
 
+// 2026-04-20: hexa-lang attr system Phase B — enforcement live.
+// @refuse: Darwin 실행 차단 (HEXA_MAC_OK=1 우회)
+// @repuse: ubu/ubu2/htz/hetzner/runpod 호스트만 허용 (HEXA_REPUSE_OK=1 우회)
+// @watchdog: 14B LoRA 메모리 cap 8GB, wall cap 2h, breach 시 SIGKILL
+// @limit(mem_mb=8192): 진입 시 RSS 8GB 초과면 refuse + singleton
+// @monitor: wall/rss 메트릭 .hexa-monitor.jsonl 기록
+// In-body 가드 (uname check + env HEXA_LOCAL) 는 compiled binary 경로용 병행 유지.
+@refuse
+@repuse
+@watchdog(rss_mb=8192, time_s=7200)
+@limit(mem_mb=8192)
+@monitor
 fn main() {
+    // ─── AG6 Mac Compute ZERO guard (2026-04-20) ───────────────────────
+    // Root-cause of 2026-04-20 03:33 kernel panic: /private/tmp/train_alm_lora_mac
+    // ran heavy LoRA training on Mac Ghostty terminal → 49 swapfiles, LOW swap,
+    // loginwindow watchdog timeout → Mac death. See
+    // ~/Library/Logs/DiagnosticReports/train_alm_lora_mac-2026-04-20-09053*.ips
+    //
+    // Rule: Mac Compute ZERO — 14B LoRA training runs on ubu (RTX 5070) /
+    // ubu2 / htz (AX102-U) only. Mac is orchestration/UI only.
+    //
+    // Opt-out (stub/dry-run CI smoke on Mac only): HEXA_LOCAL=1.
+    //   HEXA_LOCAL=1 ./train_alm_lora --dry-run     # still safe (no GPU work)
+    //
+    // Normal remote dispatch path:
+    //   ssh ubu 'cd ~/Dev/anima && hexa run training/train_alm_lora.hexa ...'
+    let uname_s = exec("uname -s").trim()
+    let hexa_local_ok = env("HEXA_LOCAL")
+    if uname_s == "Darwin" && hexa_local_ok != "1" {
+        println("[ABORT] AG6 Mac Compute ZERO — train_alm_lora may not run on Darwin.")
+        println("[ABORT]   host     : " + uname_s)
+        println("[ABORT]   reason   : 14B LoRA training on Mac caused kernel panic 2026-04-20 03:33")
+        println("[ABORT]            : (swap exhaustion → loginwindow watchdog timeout)")
+        println("[ABORT]   dispatch : ssh ubu 'cd ~/Dev/anima && hexa run training/train_alm_lora.hexa ...'")
+        println("[ABORT]   opt-out  : HEXA_LOCAL=1 (stub / --dry-run CI smoke only)")
+        exit(1)
+    }
+
     println("════════════════════════════════════════════════════════")
     println("  ALM 14B r11 — hexa-native LoRA trainer")
     println("  spec : training/deploy/alm_r11_plan.json")
