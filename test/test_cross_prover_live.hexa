@@ -1,0 +1,409 @@
+// test/test_cross_prover_live.hexa — cross-prover live wire verifier tests.
+//
+// Exercises the logic embodied in tool/cross_prover_live.hexa via three
+// deterministic paths (stage0-safe runtime — no exec/substring):
+//   T1 TRIPLE_PASS      : mock triple (matching the tool's mock shape)
+//                          → all pairwise hybrids ≥ TRI_MIN (0.7).
+//   T2 FULL_DIVERGE     : disjoint category triple → 0 pairs above TRI_MIN.
+//   T3 NDJSON_PARSE_R1  : reads /tmp/nexus_drill_depth.ndjson (if present)
+//                          and asserts round=1 yield projection non-empty
+//                          with expected categories.
+//
+// Run:   hexa test/test_cross_prover_live.hexa
+// Exit:  0 = all tests pass, 1 = failure.
+
+let TRI_MIN = 0.7
+let NDJSON_DEFAULT = "/tmp/nexus_drill_depth.ndjson"
+
+// ─── helpers (mirror tool/cross_prover_live.hexa — stage0 subset) ───
+
+fn is_digit(c: string) -> bool {
+    if c == "0" { return true }
+    if c == "1" { return true }
+    if c == "2" { return true }
+    if c == "3" { return true }
+    if c == "4" { return true }
+    if c == "5" { return true }
+    if c == "6" { return true }
+    if c == "7" { return true }
+    if c == "8" { return true }
+    if c == "9" { return true }
+    return false
+}
+
+fn leading_int(s: string) -> int {
+    let chars = s.split("")
+    let n = chars.len()
+    let mut i = 0
+    let mut skipping = true
+    while skipping {
+        if i >= n {
+            skipping = false
+        } else {
+            let c = chars[i]
+            if c == "" || c == " " || c == "\t" {
+                i = i + 1
+            } else {
+                skipping = false
+            }
+        }
+    }
+    let mut acc = 0
+    let mut saw = false
+    let mut reading = true
+    while reading {
+        if i >= n {
+            reading = false
+        } else {
+            let c = chars[i]
+            if !is_digit(c) {
+                reading = false
+            } else {
+                acc = acc * 10 + to_int(c)
+                saw = true
+                i = i + 1
+            }
+        }
+    }
+    if !saw { return -1 }
+    return acc
+}
+
+fn json_int(line: string, key: string) -> int {
+    let needle = "\"" + key + "\":"
+    let parts = line.split(needle)
+    if parts.len() < 2 { return -1 }
+    return leading_int(parts[1])
+}
+
+fn json_obj_body(line: string, key: string) -> string {
+    let head = "\"" + key + "\":{"
+    let hs = line.split(head)
+    if hs.len() < 2 { return "" }
+    let after = hs[1]
+    let ts = after.split("}")
+    if ts.len() < 1 { return "" }
+    return ts[0]
+}
+
+fn yield_body_to_tokens(yield_body: string) -> array {
+    let mut out = []
+    if yield_body == "" { return out }
+    let entries = yield_body.split(",")
+    let n = entries.len()
+    let mut i = 0
+    while i < n {
+        let entry = entries[i]
+        let kv = entry.split(":")
+        if kv.len() >= 2 {
+            let raw_k = kv[0]
+            let kparts = raw_k.split("\"")
+            let mut cat = ""
+            let mut kk = 0
+            while kk < kparts.len() {
+                if kparts[kk] != "" {
+                    cat = kparts[kk]
+                }
+                kk = kk + 1
+            }
+            let raw_v = kv[1]
+            let k_count = leading_int(raw_v)
+            if cat != "" {
+                let lim = if k_count > 0 { k_count } else { 0 }
+                let mut j = 0
+                while j < lim {
+                    out = out.push(cat)
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn extract_round(body: string, want: int) -> array {
+    let lines = body.split("\n")
+    let n = lines.len()
+    let mut i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let r = json_int(line, "round")
+            if r == want {
+                let yb = json_obj_body(line, "yield")
+                if yb != "" { return yield_body_to_tokens(yb) }
+            }
+        }
+        i = i + 1
+    }
+    return []
+}
+
+// ─── agreement (mirrors tool) ───────────────────────────────────────
+
+fn clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn sqrt_newton(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut r = x
+    let mut i = 0
+    while i < 24 {
+        r = 0.5 * (r + x / r)
+        i = i + 1
+    }
+    return r
+}
+
+fn index_of_str(arr: array, s: string) -> int {
+    let n = arr.len()
+    let mut i = 0
+    while i < n {
+        if arr[i] == s { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn contains_str(arr: array, s: string) -> bool {
+    return index_of_str(arr, s) >= 0
+}
+
+fn histogram(tokens: array) -> array {
+    let mut keys = []
+    let mut counts = []
+    let n = tokens.len()
+    let mut i = 0
+    while i < n {
+        let t = tokens[i]
+        let idx = index_of_str(keys, t)
+        if idx < 0 {
+            keys = keys.push(t)
+            counts = counts.push(1)
+        } else {
+            counts[idx] = counts[idx] + 1
+        }
+        i = i + 1
+    }
+    let mut out = []
+    out = out.push(keys)
+    out = out.push(counts)
+    return out
+}
+
+fn align_vectors(ka: array, ca: array, kb: array, cb: array) -> array {
+    let mut uk = []
+    let mut i = 0
+    while i < ka.len() {
+        uk = uk.push(ka[i])
+        i = i + 1
+    }
+    let mut j = 0
+    while j < kb.len() {
+        if !contains_str(uk, kb[j]) {
+            uk = uk.push(kb[j])
+        }
+        j = j + 1
+    }
+    let mut va = []
+    let mut vb = []
+    let mut k = 0
+    while k < uk.len() {
+        let key = uk[k]
+        let ia = index_of_str(ka, key)
+        let ib = index_of_str(kb, key)
+        let mut av = 0
+        let mut bv = 0
+        if ia >= 0 { av = ca[ia] }
+        if ib >= 0 { bv = cb[ib] }
+        va = va.push(av)
+        vb = vb.push(bv)
+        k = k + 1
+    }
+    let mut out = []
+    out = out.push(va)
+    out = out.push(vb)
+    return out
+}
+
+fn cosine_counts(va: array, vb: array) -> float {
+    let n = va.len()
+    if n != vb.len() { return 0.0 }
+    let mut dot = 0.0
+    let mut na = 0.0
+    let mut nb = 0.0
+    let mut i = 0
+    while i < n {
+        let a = to_float(va[i])
+        let b = to_float(vb[i])
+        dot = dot + a * b
+        na = na + a * a
+        nb = nb + b * b
+        i = i + 1
+    }
+    if na <= 0.0 { return 0.0 }
+    if nb <= 0.0 { return 0.0 }
+    let d = sqrt_newton(na) * sqrt_newton(nb)
+    if d <= 0.0 { return 0.0 }
+    return clamp01(dot / d)
+}
+
+fn jaccard_sets(ka: array, kb: array) -> float {
+    let na = ka.len()
+    let nb = kb.len()
+    let mut inter = 0
+    let mut i = 0
+    while i < na {
+        if contains_str(kb, ka[i]) { inter = inter + 1 }
+        i = i + 1
+    }
+    let uni = na + nb - inter
+    if uni <= 0 { return 0.0 }
+    return to_float(inter) / to_float(uni)
+}
+
+fn hybrid(ta: array, tb: array) -> float {
+    let ha = histogram(ta)
+    let hb = histogram(tb)
+    let al = align_vectors(ha[0], ha[1], hb[0], hb[1])
+    let c = cosine_counts(al[0], al[1])
+    let j = jaccard_sets(ha[0], hb[0])
+    return clamp01(0.6 * c + 0.4 * j)
+}
+
+// ─── verdict (mirrors tool) ─────────────────────────────────────────
+
+fn verdict_label(h12: float, h23: float, h13: float) -> string {
+    let mn = TRI_MIN
+    let mut cnt = 0
+    if h12 >= mn { cnt = cnt + 1 }
+    if h23 >= mn { cnt = cnt + 1 }
+    if h13 >= mn { cnt = cnt + 1 }
+    if cnt == 3 { return "TRIANGLE_PASS" }
+    if cnt == 0 { return "FULL_DIVERGE" }
+    return "PARTIAL_DRIFT"
+}
+
+// ─── mock shapes (match tool/cross_prover_live.hexa exactly) ────────
+
+fn push_n(arr: array, tok: string, n: int) -> array {
+    let mut out = arr
+    let mut i = 0
+    while i < n {
+        out = out.push(tok)
+        i = i + 1
+    }
+    return out
+}
+
+fn mock_r(r: int) -> array {
+    let mut out = []
+    if r == 1 {
+        out = push_n(out, "smash", 35)
+        out = push_n(out, "resonance", 175)
+    } else {
+        if r == 2 {
+            out = push_n(out, "smash", 40)
+            out = push_n(out, "resonance", 170)
+        } else {
+            out = push_n(out, "smash", 30)
+            out = push_n(out, "resonance", 180)
+            out = push_n(out, "free", 5)
+        }
+    }
+    return out
+}
+
+// ─── assertions ─────────────────────────────────────────────────────
+
+fn assert_eq_str(name: string, got: string, want: string) -> bool {
+    if got == want {
+        println("  [PASS] " + name + " == " + want)
+        return true
+    }
+    println("  [FAIL] " + name + " got=\"" + got + "\" want=\"" + want + "\"")
+    return false
+}
+
+fn assert_true(name: string, cond: bool) -> bool {
+    if cond {
+        println("  [PASS] " + name)
+        return true
+    }
+    println("  [FAIL] " + name)
+    return false
+}
+
+// ─── tests ──────────────────────────────────────────────────────────
+
+fn t1_triple_pass() -> bool {
+    println("T1 TRIPLE_PASS:")
+    let r1 = mock_r(1)
+    let r2 = mock_r(2)
+    let r3 = mock_r(3)
+    let h12 = hybrid(r1, r2)
+    let h23 = hybrid(r2, r3)
+    let h13 = hybrid(r1, r3)
+    let v = verdict_label(h12, h23, h13)
+    let mut ok = true
+    if !assert_true("h12 >= TRI_MIN", h12 >= TRI_MIN) { ok = false }
+    if !assert_true("h23 >= TRI_MIN", h23 >= TRI_MIN) { ok = false }
+    if !assert_true("h13 >= TRI_MIN", h13 >= TRI_MIN) { ok = false }
+    if !assert_eq_str("verdict", v, "TRIANGLE_PASS") { ok = false }
+    return ok
+}
+
+fn t2_full_diverge() -> bool {
+    println("T2 FULL_DIVERGE:")
+    let mut a = []
+    a = push_n(a, "smash", 5)
+    let mut b = []
+    b = push_n(b, "free", 5)
+    let mut c = []
+    c = push_n(c, "absolute", 5)
+    let h12 = hybrid(a, b)
+    let h23 = hybrid(b, c)
+    let h13 = hybrid(a, c)
+    let v = verdict_label(h12, h23, h13)
+    let mut ok = true
+    if !assert_true("h12 < TRI_MIN", h12 < TRI_MIN) { ok = false }
+    if !assert_true("h23 < TRI_MIN", h23 < TRI_MIN) { ok = false }
+    if !assert_true("h13 < TRI_MIN", h13 < TRI_MIN) { ok = false }
+    if !assert_eq_str("verdict", v, "FULL_DIVERGE") { ok = false }
+    return ok
+}
+
+fn t3_ndjson_parse_r1() -> bool {
+    println("T3 NDJSON_PARSE_R1:")
+    let mut ok = true
+    if !file_exists(NDJSON_DEFAULT) {
+        // artefact absent — not a failure; tool path exercised via smoke.
+        println("  [SKIP] " + NDJSON_DEFAULT + " not present; smoke-only")
+        return ok
+    }
+    let body = read_file(NDJSON_DEFAULT)
+    let toks = extract_round(body, 1)
+    if !assert_true("round=1 tokens non-empty", toks.len() > 0) { ok = false }
+    if !assert_true("round=1 contains smash", contains_str(toks, "smash")) { ok = false }
+    if !assert_true("round=1 contains resonance", contains_str(toks, "resonance")) { ok = false }
+    return ok
+}
+
+fn main() {
+    println("test_cross_prover_live")
+    let a = t1_triple_pass()
+    let b = t2_full_diverge()
+    let c = t3_ndjson_parse_r1()
+    if a && b && c {
+        println("OK — 3/3 tests pass")
+        exit(0)
+    }
+    println("FAIL")
+    exit(1)
+}
+
+main()

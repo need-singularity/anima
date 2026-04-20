@@ -1,0 +1,536 @@
+// tool/cross_prover_live.hexa — π cross-prover live wire (n6↔anima via θ diagonal)
+//
+// PURPOSE: adjacent-speculation angle π — real wire-up of the nexus↔anima
+//   cross-prover diagonal. Consumes nexus n6 drill-depth NDJSON (Agent A
+//   artefact, E1-E5 verified), projects per-round yield distributions into
+//   deterministic fingerprint bags, and drives the θ diagonal_agreement
+//   (cosine+jaccard hybrid) over the 3 pairs (r1↔r2, r2↔r3, r1↔r3).
+//
+// Supersedes anima commit f84cd507 (spec-only exit=2 stub). This module
+// emits a real triple-verdict computed from prover data, not a placeholder.
+//
+// PIPELINE:
+//   1. read NDJSON lines (each: {"round":N,"yield":{<cat>:count,...},...})
+//   2. extract r1, r2, r3 yield histograms (6 cats: smash/free/absolute/
+//        meta_closure/hyperarith/resonance)
+//   3. project yield → token bag (one fingerprint per unit yield)
+//   4. θ diagonal_agreement(pair) for {r1↔r2, r2↔r3, r1↔r3}
+//        hybrid = 0.6 * cosine(count-histogram) + 0.4 * jaccard(distinct set)
+//   5. verdict:
+//        TRIANGLE_PASS   — all 3 pairwise hybrids ≥ TRI_MIN (0.7)
+//        PARTIAL_DRIFT   — ≥ 1 but not all pairwise hybrids ≥ TRI_MIN
+//        FULL_DIVERGE    — 0 pairwise hybrids ≥ TRI_MIN
+//
+// CLI:
+//   hexa tool/cross_prover_live.hexa [ndjson_path] [--smoke]
+//   default ndjson_path = /tmp/nexus_drill_depth.ndjson
+//   --smoke              = always synthesize r1/r2/r3 mocks
+//   If ndjson_path missing OR has < 3 rounds, mocks fill the gap (r2/r3).
+//
+// EXIT:
+//   0 = TRIANGLE_PASS
+//   1 = PARTIAL_DRIFT
+//   2 = FULL_DIVERGE | input / setup error
+//
+// V8 SAFE_COMMIT: new file only, additive. No LLM, no network,
+//   pure deterministic string / arithmetic operations.
+// HEXA COMPAT: stage0-safe — split()/concat/arith only; no .substring(),
+//   no .index_of() on strings, no ternary-in-let, no multi-line fn sigs.
+
+let CROSS_IN_DEFAULT = "/tmp/nexus_drill_depth.ndjson"
+let CROSS_OUT        = "/tmp/anima_cross_prover_verdict.json"
+let TRI_MIN          = 0.7
+
+// ─── scalar helpers ─────────────────────────────────────────────────
+
+fn clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn sqrt_newton(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut r = x
+    let mut i = 0
+    while i < 24 {
+        r = 0.5 * (r + x / r)
+        i = i + 1
+    }
+    return r
+}
+
+fn round4(x: float) -> float {
+    return to_float(to_int(x * 10000.0 + 0.5)) / 10000.0
+}
+
+// ─── digit gate (split-only; no substring) ──────────────────────────
+
+fn is_digit(c: string) -> bool {
+    if c == "0" { return true }
+    if c == "1" { return true }
+    if c == "2" { return true }
+    if c == "3" { return true }
+    if c == "4" { return true }
+    if c == "5" { return true }
+    if c == "6" { return true }
+    if c == "7" { return true }
+    if c == "8" { return true }
+    if c == "9" { return true }
+    return false
+}
+
+// Take leading-digit run of a string and return it as int. Handles
+// optional leading whitespace. Returns -1 if no digits found.
+// Uses split("") to iterate characters (stage0-safe).
+fn leading_int(s: string) -> int {
+    let chars = s.split("")
+    let n = chars.len()
+    let mut i = 0
+    let mut skipping = true
+    // skip opening empty + whitespace
+    while skipping {
+        if i >= n {
+            skipping = false
+        } else {
+            let c = chars[i]
+            if c == "" || c == " " || c == "\t" {
+                i = i + 1
+            } else {
+                skipping = false
+            }
+        }
+    }
+    let mut acc = 0
+    let mut saw = false
+    let mut reading = true
+    while reading {
+        if i >= n {
+            reading = false
+        } else {
+            let c = chars[i]
+            if !is_digit(c) {
+                reading = false
+            } else {
+                let d = to_int(c)
+                acc = acc * 10 + d
+                saw = true
+                i = i + 1
+            }
+        }
+    }
+    if !saw { return -1 }
+    return acc
+}
+
+// ─── NDJSON helpers (split-only) ────────────────────────────────────
+// Given a single NDJSON line and a key name, return the int value of
+// `"<key>":<digits>`. Returns -1 if key absent or non-numeric.
+fn json_int(line: string, key: string) -> int {
+    let needle = "\"" + key + "\":"
+    let parts = line.split(needle)
+    if parts.len() < 2 { return -1 }
+    return leading_int(parts[1])
+}
+
+// Given an NDJSON line, return the raw body of `"<key>":{...}` (without
+// the wrapping braces). Returns "" if key absent.
+// Note: this does NOT handle nested objects inside <key>. For drill NDJSON
+// yield/plan/actual bodies that is fine — they are flat.
+fn json_obj_body(line: string, key: string) -> string {
+    let head = "\"" + key + "\":{"
+    let hs = line.split(head)
+    if hs.len() < 2 { return "" }
+    let after = hs[1]
+    let ts = after.split("}")
+    if ts.len() < 1 { return "" }
+    return ts[0]
+}
+
+// ─── yield projection (split-only) ──────────────────────────────────
+// yield_body looks like: "smash":5,"free":0,"absolute":0,...
+// For each "<cat>":N entry, emit N copies of <cat> into token bag.
+fn yield_body_to_tokens(yield_body: string) -> array {
+    let mut out = []
+    if yield_body == "" { return out }
+    let entries = yield_body.split(",")
+    let n = entries.len()
+    let mut i = 0
+    while i < n {
+        let entry = entries[i]
+        // entry = "<cat>":<num>  — split by ":" gives [ "<cat>", <num> ]
+        let kv = entry.split(":")
+        if kv.len() >= 2 {
+            let raw_k = kv[0]
+            // strip surrounding quotes via split("\"")
+            let kparts = raw_k.split("\"")
+            let mut cat = ""
+            let mut kk = 0
+            while kk < kparts.len() {
+                if kparts[kk] != "" {
+                    cat = kparts[kk]
+                }
+                kk = kk + 1
+            }
+            let raw_v = kv[1]
+            let k_count = leading_int(raw_v)
+            if cat != "" {
+                let lim = if k_count > 0 { k_count } else { 0 }
+                let mut j = 0
+                while j < lim {
+                    out = out.push(cat)
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Find yield bag for a given round in NDJSON body. Returns empty [] if
+// round not present.
+fn extract_round(ndjson_body: string, want_round: int) -> array {
+    let lines = ndjson_body.split("\n")
+    let n = lines.len()
+    let mut i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let r = json_int(line, "round")
+            if r == want_round {
+                let body = json_obj_body(line, "yield")
+                if body != "" { return yield_body_to_tokens(body) }
+            }
+        }
+        i = i + 1
+    }
+    return []
+}
+
+// ─── mock generator (drift-shaped triple for smoke) ─────────────────
+// r1 shape matches the real round=1 artefact (smash=35, resonance=175).
+// r2 drifts modestly (close enough to agree at TRI_MIN).
+// r3 introduces a "free" category (set divergence) while keeping most
+// resonance mass, so (r1↔r3) and (r2↔r3) drop through jaccard.
+
+fn push_n(arr: array, tok: string, n: int) -> array {
+    let mut out = arr
+    let mut i = 0
+    while i < n {
+        out = out.push(tok)
+        i = i + 1
+    }
+    return out
+}
+
+fn mock_round(r: int) -> array {
+    let mut out = []
+    if r == 1 {
+        out = push_n(out, "smash", 35)
+        out = push_n(out, "resonance", 175)
+    } else {
+        if r == 2 {
+            out = push_n(out, "smash", 40)
+            out = push_n(out, "resonance", 170)
+        } else {
+            out = push_n(out, "smash", 30)
+            out = push_n(out, "resonance", 180)
+            out = push_n(out, "free", 5)
+        }
+    }
+    return out
+}
+
+// ─── histogram / alignment / agreement (mirrors θ tool) ─────────────
+
+fn index_of_str(arr: array, s: string) -> int {
+    let n = arr.len()
+    let mut i = 0
+    while i < n {
+        if arr[i] == s { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn contains_str(arr: array, s: string) -> bool {
+    return index_of_str(arr, s) >= 0
+}
+
+fn histogram(tokens: array) -> array {
+    let mut keys = []
+    let mut counts = []
+    let n = tokens.len()
+    let mut i = 0
+    while i < n {
+        let t = tokens[i]
+        let idx = index_of_str(keys, t)
+        if idx < 0 {
+            keys = keys.push(t)
+            counts = counts.push(1)
+        } else {
+            counts[idx] = counts[idx] + 1
+        }
+        i = i + 1
+    }
+    let mut out = []
+    out = out.push(keys)
+    out = out.push(counts)
+    return out
+}
+
+fn align_vectors(keys_a: array, counts_a: array, keys_b: array, counts_b: array) -> array {
+    let mut union_keys = []
+    let mut i = 0
+    while i < keys_a.len() {
+        union_keys = union_keys.push(keys_a[i])
+        i = i + 1
+    }
+    let mut j = 0
+    while j < keys_b.len() {
+        if !contains_str(union_keys, keys_b[j]) {
+            union_keys = union_keys.push(keys_b[j])
+        }
+        j = j + 1
+    }
+    let u = union_keys.len()
+    let mut va = []
+    let mut vb = []
+    let mut k = 0
+    while k < u {
+        let key = union_keys[k]
+        let ia = index_of_str(keys_a, key)
+        let ib = index_of_str(keys_b, key)
+        let mut ca = 0
+        let mut cb = 0
+        if ia >= 0 { ca = counts_a[ia] }
+        if ib >= 0 { cb = counts_b[ib] }
+        va = va.push(ca)
+        vb = vb.push(cb)
+        k = k + 1
+    }
+    let mut out = []
+    out = out.push(va)
+    out = out.push(vb)
+    return out
+}
+
+fn cosine_counts(va: array, vb: array) -> float {
+    let n = va.len()
+    if n != vb.len() { return 0.0 }
+    let mut dot = 0.0
+    let mut na = 0.0
+    let mut nb = 0.0
+    let mut i = 0
+    while i < n {
+        let a = to_float(va[i])
+        let b = to_float(vb[i])
+        dot = dot + a * b
+        na = na + a * a
+        nb = nb + b * b
+        i = i + 1
+    }
+    if na <= 0.0 { return 0.0 }
+    if nb <= 0.0 { return 0.0 }
+    let denom = sqrt_newton(na) * sqrt_newton(nb)
+    if denom <= 0.0 { return 0.0 }
+    return clamp01(dot / denom)
+}
+
+fn jaccard_sets(keys_a: array, keys_b: array) -> float {
+    let na = keys_a.len()
+    let nb = keys_b.len()
+    if na == 0 {
+        if nb == 0 { return 0.0 }
+    }
+    let mut inter = 0
+    let mut i = 0
+    while i < na {
+        if contains_str(keys_b, keys_a[i]) { inter = inter + 1 }
+        i = i + 1
+    }
+    let uni = na + nb - inter
+    if uni <= 0 { return 0.0 }
+    return to_float(inter) / to_float(uni)
+}
+
+// Returns [cos, jac, hybrid] matching tool/drill_diagonal_agreement.hexa.
+fn diagonal_agreement_breakdown(tokens_a: array, tokens_b: array) -> array {
+    let ha = histogram(tokens_a)
+    let hb = histogram(tokens_b)
+    let keys_a   = ha[0]
+    let counts_a = ha[1]
+    let keys_b   = hb[0]
+    let counts_b = hb[1]
+    let aligned = align_vectors(keys_a, counts_a, keys_b, counts_b)
+    let va = aligned[0]
+    let vb = aligned[1]
+    let cos = cosine_counts(va, vb)
+    let jac = jaccard_sets(keys_a, keys_b)
+    let hybrid = clamp01(0.6 * cos + 0.4 * jac)
+    let mut out = []
+    out = out.push(cos)
+    out = out.push(jac)
+    out = out.push(hybrid)
+    return out
+}
+
+// ─── verdict ────────────────────────────────────────────────────────
+
+fn verdict_label(h12: float, h23: float, h13: float) -> string {
+    let mn = TRI_MIN
+    let mut cnt = 0
+    if h12 >= mn { cnt = cnt + 1 }
+    if h23 >= mn { cnt = cnt + 1 }
+    if h13 >= mn { cnt = cnt + 1 }
+    if cnt == 3 { return "TRIANGLE_PASS" }
+    if cnt == 0 { return "FULL_DIVERGE" }
+    return "PARTIAL_DRIFT"
+}
+
+fn verdict_exit(label: string) -> int {
+    if label == "TRIANGLE_PASS" { return 0 }
+    if label == "PARTIAL_DRIFT" { return 1 }
+    return 2
+}
+
+// ─── certificate emitter ────────────────────────────────────────────
+
+fn emit_cert(path_in: string, n_rounds: int, src_r1: string, src_r2: string, src_r3: string, cos12: float, jac12: float, h12: float, cos23: float, jac23: float, h23: float, cos13: float, jac13: float, h13: float, verdict: string) {
+    let mut body = "{\n"
+    body = body + "  \"verifier\": \"cross_prover_live\",\n"
+    body = body + "  \"variant\": \"n6_anima_triple_v1\",\n"
+    body = body + "  \"angle\": \"adjacent_speculation_pi\",\n"
+    body = body + "  \"input\": \"" + path_in + "\",\n"
+    body = body + "  \"rounds_seen\": " + to_string(n_rounds) + ",\n"
+    body = body + "  \"src\": { \"r1\": \"" + src_r1 + "\", \"r2\": \"" + src_r2 + "\", \"r3\": \"" + src_r3 + "\" },\n"
+    body = body + "  \"pairs\": {\n"
+    body = body + "    \"r1_r2\": { \"cosine\": " + to_string(round4(cos12)) + ", \"jaccard\": " + to_string(round4(jac12)) + ", \"hybrid\": " + to_string(round4(h12)) + " },\n"
+    body = body + "    \"r2_r3\": { \"cosine\": " + to_string(round4(cos23)) + ", \"jaccard\": " + to_string(round4(jac23)) + ", \"hybrid\": " + to_string(round4(h23)) + " },\n"
+    body = body + "    \"r1_r3\": { \"cosine\": " + to_string(round4(cos13)) + ", \"jaccard\": " + to_string(round4(jac13)) + ", \"hybrid\": " + to_string(round4(h13)) + " }\n"
+    body = body + "  },\n"
+    body = body + "  \"tri_min\": " + to_string(TRI_MIN) + ",\n"
+    body = body + "  \"verdict\": \"" + verdict + "\"\n"
+    body = body + "}\n"
+    write_file(CROSS_OUT, body)
+}
+
+// ─── CLI entry ──────────────────────────────────────────────────────
+
+fn safe_read(path: string) -> string {
+    if !file_exists(path) { return "" }
+    return read_file(path)
+}
+
+// Identify a positional argument (not starting with '-') without using
+// .substring() — inspect the first character via split("").
+fn is_flag(arg: string) -> bool {
+    let chars = arg.split("")
+    let n = chars.len()
+    let mut i = 0
+    let mut scanning = true
+    while scanning {
+        if i >= n {
+            scanning = false
+        } else {
+            if chars[i] != "" {
+                scanning = false
+            } else {
+                i = i + 1
+            }
+        }
+    }
+    if i >= n { return false }
+    return chars[i] == "-"
+}
+
+fn main() {
+    let argv = args()
+    let mut path_in = CROSS_IN_DEFAULT
+    let mut force_smoke = false
+    // argv[0] = "hexa", argv[1] = script path — user args start at 2.
+    let mut i = 2
+    while i < argv.len() {
+        let a = argv[i]
+        if a == "--smoke" {
+            force_smoke = true
+        } else {
+            if !is_flag(a) {
+                if a != "" { path_in = a }
+            }
+        }
+        i = i + 1
+    }
+
+    let mut body = ""
+    if !force_smoke {
+        body = safe_read(path_in)
+    }
+
+    // round 1
+    let mut toks1 = []
+    let mut src1 = "mock"
+    if body != "" {
+        toks1 = extract_round(body, 1)
+        if toks1.len() > 0 { src1 = "ndjson" }
+    }
+    if toks1.len() == 0 { toks1 = mock_round(1) }
+
+    // round 2
+    let mut toks2 = []
+    let mut src2 = "mock"
+    if body != "" {
+        toks2 = extract_round(body, 2)
+        if toks2.len() > 0 { src2 = "ndjson" }
+    }
+    if toks2.len() == 0 { toks2 = mock_round(2) }
+
+    // round 3
+    let mut toks3 = []
+    let mut src3 = "mock"
+    if body != "" {
+        toks3 = extract_round(body, 3)
+        if toks3.len() > 0 { src3 = "ndjson" }
+    }
+    if toks3.len() == 0 { toks3 = mock_round(3) }
+
+    let mut n_real = 0
+    if src1 == "ndjson" { n_real = n_real + 1 }
+    if src2 == "ndjson" { n_real = n_real + 1 }
+    if src3 == "ndjson" { n_real = n_real + 1 }
+
+    let bd12 = diagonal_agreement_breakdown(toks1, toks2)
+    let bd23 = diagonal_agreement_breakdown(toks2, toks3)
+    let bd13 = diagonal_agreement_breakdown(toks1, toks3)
+
+    let cos12 = bd12[0]
+    let jac12 = bd12[1]
+    let h12   = bd12[2]
+    let cos23 = bd23[0]
+    let jac23 = bd23[1]
+    let h23   = bd23[2]
+    let cos13 = bd13[0]
+    let jac13 = bd13[1]
+    let h13   = bd13[2]
+
+    let verdict = verdict_label(h12, h23, h13)
+
+    emit_cert(path_in, n_real, src1, src2, src3, cos12, jac12, h12, cos23, jac23, h23, cos13, jac13, h13, verdict)
+
+    println("cross_prover_live")
+    println("  angle=adjacent_speculation_pi")
+    println("  input=" + path_in)
+    println("  rounds_real=" + to_string(n_real) + "/3")
+    println("  src r1=" + src1 + " r2=" + src2 + " r3=" + src3)
+    println("  r1_r2: cos=" + to_string(round4(cos12)) + " jac=" + to_string(round4(jac12)) + " hybrid=" + to_string(round4(h12)))
+    println("  r2_r3: cos=" + to_string(round4(cos23)) + " jac=" + to_string(round4(jac23)) + " hybrid=" + to_string(round4(h23)))
+    println("  r1_r3: cos=" + to_string(round4(cos13)) + " jac=" + to_string(round4(jac13)) + " hybrid=" + to_string(round4(h13)))
+    println("  tri_min=" + to_string(TRI_MIN))
+    println("  verdict=" + verdict)
+    println("  cert=" + CROSS_OUT)
+
+    exit(verdict_exit(verdict))
+}
+
+main()
