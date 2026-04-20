@@ -1,0 +1,299 @@
+// tool/drill_diagonal_agreement.hexa — θ diagonal_agreement calculator
+//
+// PURPOSE: cross-prover drift gate auxiliary. Given the output sets of two
+//   independent provers (as hash / fingerprint lists), compute a
+//   diagonal_agreement_score ∈ [0, 1] that fuses:
+//     - cosine similarity on the count-histogram vectors (captures
+//       multiplicity + distributional shape)
+//     - jaccard similarity on the distinct-hash sets (categorical overlap)
+//   hybrid = 0.6 * cosine + 0.4 * jaccard
+//
+// PAIRS WITH: tool/drill_diagonal.hexa (drill-result metric-vector variant)
+//             tool/drill_cross_run.hexa (2-run consistency witness)
+//   This tool is prover-agnostic: inputs are plain hash lists, so it can
+//   gate nexus↔anima cross-prover diagonal drift without coupling to any
+//   specific drill schema.
+//
+// V8 SAFE_COMMIT: new file only, additive. No LLM, no network, pure
+//   deterministic string / arithmetic operations.
+//
+// INPUT FORMAT: one hash/fingerprint per non-blank line. Lines beginning
+//   with '#' are treated as comments and ignored. Hashes may repeat — the
+//   cosine leg is computed over the resulting count-histogram.
+//
+// CLI:
+//   hexa tool/drill_diagonal_agreement.hexa <prover_a.txt> <prover_b.txt> [min]
+//   <min> defaults to 0.8 (drift-gate threshold). Exit 0 iff
+//   hybrid >= min, else 1. Exit 2 on input error.
+//
+// OUTPUT (stdout):
+//   drill_diagonal_agreement
+//     a=<path_a> (n=<count_a>)
+//     b=<path_b> (n=<count_b>)
+//     cosine=<0.0000..1.0000>
+//     jaccard=<0.0000..1.0000>
+//     hybrid=<0.0000..1.0000>
+//     min=<threshold>
+//     pass=<true|false>
+
+// ─── tokenizer ──────────────────────────────────────────────────────
+// Parse a hash-list file into an array of non-empty, non-comment tokens.
+// Trims trailing '\r' (defensive: accept CRLF fixtures).
+
+fn strip_cr(s: string) -> string {
+    let n = s.len()
+    if n == 0 { return s }
+    let parts = s.split("\r")
+    let mut out = ""
+    let m = parts.len()
+    let mut i = 0
+    while i < m {
+        out = out + parts[i]
+        i = i + 1
+    }
+    return out
+}
+
+fn is_comment_or_blank(line: string) -> bool {
+    if line.len() == 0 { return true }
+    // starts with '#' ?
+    let first = line.split("")
+    // split("") wraps with empties; first real char at index 1
+    if first.len() >= 2 {
+        if first[1] == "#" { return true }
+    }
+    return false
+}
+
+fn parse_hashes(body: string) -> array {
+    let mut out = []
+    let lines = body.split("\n")
+    let n = lines.len()
+    let mut i = 0
+    while i < n {
+        let raw = strip_cr(lines[i])
+        if !is_comment_or_blank(raw) {
+            out = out.push(raw)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── distinct + count helpers (parallel-array set / histogram) ──────
+
+fn index_of(arr: array, s: string) -> int {
+    let n = arr.len()
+    let mut i = 0
+    while i < n {
+        if arr[i] == s { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn contains_str(arr: array, s: string) -> bool {
+    return index_of(arr, s) >= 0
+}
+
+// Returns [keys_array, counts_array] — parallel arrays forming a
+// deterministic histogram (insertion order = first-seen order).
+fn histogram(tokens: array) -> array {
+    let mut keys = []
+    let mut counts = []
+    let n = tokens.len()
+    let mut i = 0
+    while i < n {
+        let t = tokens[i]
+        let idx = index_of(keys, t)
+        if idx < 0 {
+            keys = keys.push(t)
+            counts = counts.push(1)
+        } else {
+            counts[idx] = counts[idx] + 1
+        }
+        i = i + 1
+    }
+    let mut out = []
+    out = out.push(keys)
+    out = out.push(counts)
+    return out
+}
+
+// Build aligned count-vectors over union(keys_a, keys_b).
+// Returns [va, vb] where va[i] and vb[i] reference the same union-key.
+fn align_vectors(keys_a: array, counts_a: array, keys_b: array, counts_b: array) -> array {
+    let mut union_keys = []
+    let mut i = 0
+    while i < keys_a.len() {
+        union_keys = union_keys.push(keys_a[i])
+        i = i + 1
+    }
+    let mut j = 0
+    while j < keys_b.len() {
+        if !contains_str(union_keys, keys_b[j]) {
+            union_keys = union_keys.push(keys_b[j])
+        }
+        j = j + 1
+    }
+    let u = union_keys.len()
+    let mut va = []
+    let mut vb = []
+    let mut k = 0
+    while k < u {
+        let key = union_keys[k]
+        let ia = index_of(keys_a, key)
+        let ib = index_of(keys_b, key)
+        let mut ca = 0
+        let mut cb = 0
+        if ia >= 0 { ca = counts_a[ia] }
+        if ib >= 0 { cb = counts_b[ib] }
+        va = va.push(ca)
+        vb = vb.push(cb)
+        k = k + 1
+    }
+    let mut out = []
+    out = out.push(va)
+    out = out.push(vb)
+    return out
+}
+
+// ─── scalar helpers ─────────────────────────────────────────────────
+
+fn sqrt_newton(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut r = x
+    let mut i = 0
+    while i < 24 {
+        r = 0.5 * (r + x / r)
+        i = i + 1
+    }
+    return r
+}
+
+fn clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn round4(x: float) -> float {
+    return to_float(to_int(x * 10000.0 + 0.5)) / 10000.0
+}
+
+// ─── cosine on non-negative count vectors → [0, 1] ──────────────────
+
+fn cosine_counts(va: array, vb: array) -> float {
+    let n = va.len()
+    if n != vb.len() { return 0.0 }
+    let mut dot = 0.0
+    let mut na = 0.0
+    let mut nb = 0.0
+    let mut i = 0
+    while i < n {
+        let a = to_float(va[i])
+        let b = to_float(vb[i])
+        dot = dot + a * b
+        na = na + a * a
+        nb = nb + b * b
+        i = i + 1
+    }
+    if na <= 0.0 { return 0.0 }
+    if nb <= 0.0 { return 0.0 }
+    let denom = sqrt_newton(na) * sqrt_newton(nb)
+    if denom <= 0.0 { return 0.0 }
+    return clamp01(dot / denom)
+}
+
+// ─── jaccard on distinct hash sets ──────────────────────────────────
+
+fn jaccard_sets(keys_a: array, keys_b: array) -> float {
+    let na = keys_a.len()
+    let nb = keys_b.len()
+    if na == 0 {
+        if nb == 0 { return 0.0 }
+    }
+    let mut inter = 0
+    let mut i = 0
+    while i < na {
+        if contains_str(keys_b, keys_a[i]) { inter = inter + 1 }
+        i = i + 1
+    }
+    let uni = na + nb - inter
+    if uni <= 0 { return 0.0 }
+    return to_float(inter) / to_float(uni)
+}
+
+// ─── public: diagonal_agreement(tokens_a, tokens_b) → [cos, jac, hybrid]
+
+fn diagonal_agreement_breakdown(tokens_a: array, tokens_b: array) -> array {
+    let ha = histogram(tokens_a)
+    let hb = histogram(tokens_b)
+    let keys_a   = ha[0]
+    let counts_a = ha[1]
+    let keys_b   = hb[0]
+    let counts_b = hb[1]
+    let aligned = align_vectors(keys_a, counts_a, keys_b, counts_b)
+    let va = aligned[0]
+    let vb = aligned[1]
+    let cos = cosine_counts(va, vb)
+    let jac = jaccard_sets(keys_a, keys_b)
+    let hybrid = clamp01(0.6 * cos + 0.4 * jac)
+    let mut out = []
+    out = out.push(cos)
+    out = out.push(jac)
+    out = out.push(hybrid)
+    return out
+}
+
+fn diagonal_agreement(tokens_a: array, tokens_b: array) -> float {
+    let bd = diagonal_agreement_breakdown(tokens_a, tokens_b)
+    return bd[2]
+}
+
+// ─── CLI entry ──────────────────────────────────────────────────────
+
+fn load_tokens(path: string) -> array {
+    if !file_exists(path) {
+        print_err("drill_diagonal_agreement: cannot read " + path)
+        exit(2)
+    }
+    let raw = read_file(path)
+    return parse_hashes(raw)
+}
+
+fn main() {
+    let argv = args()
+    if argv.len() < 4 {
+        println("usage: drill_diagonal_agreement <prover_a.txt> <prover_b.txt> [min]")
+        exit(2)
+    }
+    let path_a = argv[2]
+    let path_b = argv[3]
+    let mut min_threshold = 0.8
+    if argv.len() >= 5 {
+        min_threshold = to_float(argv[4])
+    }
+
+    let tokens_a = load_tokens(path_a)
+    let tokens_b = load_tokens(path_b)
+
+    let bd = diagonal_agreement_breakdown(tokens_a, tokens_b)
+    let cos    = round4(bd[0])
+    let jac    = round4(bd[1])
+    let hybrid = round4(bd[2])
+    let pass = hybrid >= min_threshold
+
+    println("drill_diagonal_agreement")
+    println("  a=" + path_a + " (n=" + to_string(tokens_a.len()) + ")")
+    println("  b=" + path_b + " (n=" + to_string(tokens_b.len()) + ")")
+    println("  cosine=" + to_string(cos))
+    println("  jaccard=" + to_string(jac))
+    println("  hybrid=" + to_string(hybrid))
+    println("  min=" + to_string(min_threshold))
+    println("  pass=" + to_string(pass))
+
+    if pass { exit(0) } else { exit(1) }
+}
+
+main()

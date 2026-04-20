@@ -1,0 +1,327 @@
+// tests/test_drill_diagonal.hexa — θ diagonal_agreement unit tests
+//
+// Verifies tool/drill_diagonal_agreement.hexa across 3 fixtures:
+//   - HIGH    (identical hash sets)         → hybrid ≈ 1.0 → PASS gate 0.8
+//   - PARTIAL (50% overlap + 50% drift)     → 0.3 < hybrid < 0.8 → FAIL gate
+//   - DISAGREE (zero overlap)               → hybrid == 0.0 → FAIL gate
+//
+// This test inlines the tool's algorithm (cosine over count-histogram +
+// jaccard over distinct-hash sets, 0.6/0.4 hybrid) so it runs on bare
+// hexa 0.2.0 without depending on `use`/`exec` stdlib features. When the
+// algorithm drifts, the tool file and this test must be updated together.
+//
+// V8 SAFE_COMMIT: additive, deterministic, no LLM, no shell.
+
+// ─── algorithm (mirrors tool/drill_diagonal_agreement.hexa) ─────────
+
+fn strip_cr(s: string) -> string {
+    if s.len() == 0 { return s }
+    let parts = s.split("\r")
+    let mut out = ""
+    let m = parts.len()
+    let mut i = 0
+    while i < m {
+        out = out + parts[i]
+        i = i + 1
+    }
+    return out
+}
+
+fn is_comment_or_blank(line: string) -> bool {
+    if line.len() == 0 { return true }
+    let first = line.split("")
+    if first.len() >= 2 {
+        if first[1] == "#" { return true }
+    }
+    return false
+}
+
+fn parse_hashes(body: string) -> array {
+    let mut out = []
+    let lines = body.split("\n")
+    let n = lines.len()
+    let mut i = 0
+    while i < n {
+        let raw = strip_cr(lines[i])
+        if !is_comment_or_blank(raw) {
+            out = out.push(raw)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn index_of(arr: array, s: string) -> int {
+    let n = arr.len()
+    let mut i = 0
+    while i < n {
+        if arr[i] == s { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn contains_str(arr: array, s: string) -> bool {
+    return index_of(arr, s) >= 0
+}
+
+fn histogram(tokens: array) -> array {
+    let mut keys = []
+    let mut counts = []
+    let n = tokens.len()
+    let mut i = 0
+    while i < n {
+        let t = tokens[i]
+        let idx = index_of(keys, t)
+        if idx < 0 {
+            keys = keys.push(t)
+            counts = counts.push(1)
+        } else {
+            counts[idx] = counts[idx] + 1
+        }
+        i = i + 1
+    }
+    let mut out = []
+    out = out.push(keys)
+    out = out.push(counts)
+    return out
+}
+
+fn align_vectors(keys_a: array, counts_a: array, keys_b: array, counts_b: array) -> array {
+    let mut union_keys = []
+    let mut i = 0
+    while i < keys_a.len() {
+        union_keys = union_keys.push(keys_a[i])
+        i = i + 1
+    }
+    let mut j = 0
+    while j < keys_b.len() {
+        if !contains_str(union_keys, keys_b[j]) {
+            union_keys = union_keys.push(keys_b[j])
+        }
+        j = j + 1
+    }
+    let u = union_keys.len()
+    let mut va = []
+    let mut vb = []
+    let mut k = 0
+    while k < u {
+        let key = union_keys[k]
+        let ia = index_of(keys_a, key)
+        let ib = index_of(keys_b, key)
+        let mut ca = 0
+        let mut cb = 0
+        if ia >= 0 { ca = counts_a[ia] }
+        if ib >= 0 { cb = counts_b[ib] }
+        va = va.push(ca)
+        vb = vb.push(cb)
+        k = k + 1
+    }
+    let mut out = []
+    out = out.push(va)
+    out = out.push(vb)
+    return out
+}
+
+fn sqrt_newton(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut r = x
+    let mut i = 0
+    while i < 24 {
+        r = 0.5 * (r + x / r)
+        i = i + 1
+    }
+    return r
+}
+
+fn clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn cosine_counts(va: array, vb: array) -> float {
+    let n = va.len()
+    if n != vb.len() { return 0.0 }
+    let mut dot = 0.0
+    let mut na = 0.0
+    let mut nb = 0.0
+    let mut i = 0
+    while i < n {
+        let a = to_float(va[i])
+        let b = to_float(vb[i])
+        dot = dot + a * b
+        na = na + a * a
+        nb = nb + b * b
+        i = i + 1
+    }
+    if na <= 0.0 { return 0.0 }
+    if nb <= 0.0 { return 0.0 }
+    let denom = sqrt_newton(na) * sqrt_newton(nb)
+    if denom <= 0.0 { return 0.0 }
+    return clamp01(dot / denom)
+}
+
+fn jaccard_sets(keys_a: array, keys_b: array) -> float {
+    let na = keys_a.len()
+    let nb = keys_b.len()
+    if na == 0 {
+        if nb == 0 { return 0.0 }
+    }
+    let mut inter = 0
+    let mut i = 0
+    while i < na {
+        if contains_str(keys_b, keys_a[i]) { inter = inter + 1 }
+        i = i + 1
+    }
+    let uni = na + nb - inter
+    if uni <= 0 { return 0.0 }
+    return to_float(inter) / to_float(uni)
+}
+
+fn agreement(tokens_a: array, tokens_b: array) -> array {
+    let ha = histogram(tokens_a)
+    let hb = histogram(tokens_b)
+    let keys_a = ha[0]
+    let counts_a = ha[1]
+    let keys_b = hb[0]
+    let counts_b = hb[1]
+    let aligned = align_vectors(keys_a, counts_a, keys_b, counts_b)
+    let cos = cosine_counts(aligned[0], aligned[1])
+    let jac = jaccard_sets(keys_a, keys_b)
+    let hybrid = clamp01(0.6 * cos + 0.4 * jac)
+    let mut out = []
+    out = out.push(cos)
+    out = out.push(jac)
+    out = out.push(hybrid)
+    return out
+}
+
+// ─── assertions ─────────────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn approx_eq(got: float, want: float, eps: float) -> bool {
+    return fabs(got - want) <= eps
+}
+
+fn in_range(got: float, lo: float, hi: float) -> bool {
+    if got < lo { return false }
+    if got > hi { return false }
+    return true
+}
+
+fn load_fixture(path: string) -> array {
+    if !file_exists(path) {
+        println("[FAIL] missing fixture: " + path)
+        exit(2)
+    }
+    let raw = read_file(path)
+    return parse_hashes(raw)
+}
+
+fn tag(label: string, got: float, extra: string) -> string {
+    return "  " + label + "=" + to_string(got) + extra
+}
+
+// ─── test cases ─────────────────────────────────────────────────────
+
+fn test_high(base: array) -> bool {
+    let b = load_fixture("tests/fixtures/drill_diagonal_high.txt")
+    let bd = agreement(base, b)
+    let cos = bd[0]
+    let jac = bd[1]
+    let hy  = bd[2]
+    println("[HIGH ]" + tag("cosine", cos, "") + tag("jaccard", jac, "") + tag("hybrid", hy, ""))
+    let ok_cos = approx_eq(cos, 1.0, 0.0001)
+    let ok_jac = approx_eq(jac, 1.0, 0.0001)
+    let ok_hy  = approx_eq(hy,  1.0, 0.0001)
+    let ok_gate = hy >= 0.8
+    if !ok_cos { println("  [FAIL] cosine expected 1.0") }
+    if !ok_jac { println("  [FAIL] jaccard expected 1.0") }
+    if !ok_hy  { println("  [FAIL] hybrid expected 1.0") }
+    if !ok_gate { println("  [FAIL] expected hybrid >= 0.8 gate") }
+    return ok_cos && ok_jac && ok_hy && ok_gate
+}
+
+fn test_partial(base: array) -> bool {
+    let b = load_fixture("tests/fixtures/drill_diagonal_partial.txt")
+    let bd = agreement(base, b)
+    let cos = bd[0]
+    let jac = bd[1]
+    let hy  = bd[2]
+    println("[PART ]" + tag("cosine", cos, "") + tag("jaccard", jac, "") + tag("hybrid", hy, ""))
+    let ok_cos = in_range(cos, 0.3, 0.7)
+    let ok_jac = in_range(jac, 0.2, 0.6)
+    let ok_hy  = in_range(hy,  0.3, 0.7)
+    let ok_gate = hy < 0.8
+    if !ok_cos { println("  [FAIL] cosine expected in [0.3, 0.7]") }
+    if !ok_jac { println("  [FAIL] jaccard expected in [0.2, 0.6]") }
+    if !ok_hy  { println("  [FAIL] hybrid expected in [0.3, 0.7]") }
+    if !ok_gate { println("  [FAIL] expected hybrid < 0.8 gate") }
+    return ok_cos && ok_jac && ok_hy && ok_gate
+}
+
+fn test_disagree(base: array) -> bool {
+    let b = load_fixture("tests/fixtures/drill_diagonal_disagree.txt")
+    let bd = agreement(base, b)
+    let cos = bd[0]
+    let jac = bd[1]
+    let hy  = bd[2]
+    println("[DISAG]" + tag("cosine", cos, "") + tag("jaccard", jac, "") + tag("hybrid", hy, ""))
+    let ok_cos = approx_eq(cos, 0.0, 0.0001)
+    let ok_jac = approx_eq(jac, 0.0, 0.0001)
+    let ok_hy  = approx_eq(hy,  0.0, 0.0001)
+    let ok_gate = hy < 0.8
+    if !ok_cos { println("  [FAIL] cosine expected 0.0") }
+    if !ok_jac { println("  [FAIL] jaccard expected 0.0") }
+    if !ok_hy  { println("  [FAIL] hybrid expected 0.0") }
+    if !ok_gate { println("  [FAIL] expected hybrid < 0.8 gate" ) }
+    return ok_cos && ok_jac && ok_hy && ok_gate
+}
+
+fn test_symmetric(base: array) -> bool {
+    let b = load_fixture("tests/fixtures/drill_diagonal_partial.txt")
+    let ab = agreement(base, b)
+    let ba = agreement(b, base)
+    let sym = approx_eq(ab[0], ba[0], 0.0001) && approx_eq(ab[1], ba[1], 0.0001) && approx_eq(ab[2], ba[2], 0.0001)
+    println("[SYM  ] agreement(a,b)==agreement(b,a) → " + to_string(sym))
+    if !sym { println("  [FAIL] symmetry broken") }
+    return sym
+}
+
+fn test_self_identity(base: array) -> bool {
+    let bd = agreement(base, base)
+    let ok = approx_eq(bd[0], 1.0, 0.0001) && approx_eq(bd[1], 1.0, 0.0001) && approx_eq(bd[2], 1.0, 0.0001)
+    println("[ID   ] agreement(a,a) == 1.0 → " + to_string(ok))
+    if !ok { println("  [FAIL] self-identity broken") }
+    return ok
+}
+
+// ─── runner ─────────────────────────────────────────────────────────
+
+fn main() {
+    println("test_drill_diagonal — θ diagonal_agreement (cosine+jaccard hybrid)")
+    let base = load_fixture("tests/fixtures/drill_diagonal_prover_a.txt")
+    println("  base prover_a n=" + to_string(base.len()))
+    let p1 = test_high(base)
+    let p2 = test_partial(base)
+    let p3 = test_disagree(base)
+    let p4 = test_symmetric(base)
+    let p5 = test_self_identity(base)
+    let all_ok = p1 && p2 && p3 && p4 && p5
+    println("summary:")
+    println("  high     =" + to_string(p1))
+    println("  partial  =" + to_string(p2))
+    println("  disagree =" + to_string(p3))
+    println("  symmetric=" + to_string(p4))
+    println("  identity =" + to_string(p5))
+    let verdict = if all_ok { "ALL GREEN" } else { "REGRESSION" }
+    println("status=" + verdict)
+    if all_ok { exit(0) } else { exit(1) }
+}
+
+main()
