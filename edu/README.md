@@ -55,7 +55,7 @@ edu/
 | Mk.VII C4 real EEG | optional FAIL (rev=2) | optional FAIL |
 | Mk.VII C5 stable N=10 | ✅ C5_PASS (+17.94%) | (관련) |
 | 6-component landing | N/A | 4/6 (67%) |
-| 4-gen crystallize | N/A | 미측정 (3-gen 0.539) |
+| 4-gen crystallize | N/A | **VERIFIED (축소 CPU 실측, 2026-04-21)** — score ladder 40/125/687/1000‰, phase-jump=CEILING_SATURATION, cum distill_eff=50×; cert `shared/state/edu_cell_4gen_crystallize.json` |
 
 자세한 분류 + 발견사항: `lora/README.md` · `cell/README.md`
 

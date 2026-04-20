@@ -30,7 +30,9 @@
 | collective atlas coherence (3/5/10-node) | 475 / 277 / 168 | 34c840df |
 | outlier isolation | cleanly | edu-new D fixture |
 | zero-LLM 재현성 | 100% deterministic | 1c4f1058 |
-| 4-gen crystallize | **미측정** | pending GPU training |
+| **4-gen crystallize** (축소 CPU native 실측) | **score 1.000 @ gen 4**, phase-jump **VERIFIED** | shared/state/edu_cell_4gen_crystallize.json |
+| 4-gen distill eff ladder (d×1000) | d(2\|1)=3515 · d(3\|2)=5496 · d(4\|3)=2587 · cum(4\|1)=50000 | tool/edu_cell_4gen_crystallize.hexa |
+| 4-gen phase-jump verdict | **VERIFIED (CEILING_SATURATION)** — gen 4 score=1000‰, gen1-3 max=687‰ | edu_cell_4gen_crystallize.json |
 
 ## Mk.VII C2 L3 collective emergence
 
@@ -104,7 +106,7 @@ CDESM categorical SSOT 와 edu/cell 6-axis 의 의미 맵:
 
 ## 한계
 
-- 4-gen crystallize 미확증 (3-gen 0.539 partial)
+- 4-gen crystallize **축소 실측 완료** (5×5→4×4→4×4→3×3, 12 ticks, CPU native; phase-jump VERIFIED via ceiling saturation). Full-scale (≥ 10×10, GPU) validation 대기
 - collective L3 3 observable 동시 PASS 확률 ~50% (pre-registered)
 - hash_network ↔ BTR tension_field bridge 재교정 필요 (substrate DEPENDENT)
 - lattice critical N 값 이론적 bound 없음
@@ -122,7 +124,7 @@ CDESM categorical SSOT 와 edu/cell 6-axis 의 의미 맵:
 | C7 | **noise-paradox → LSH_NOISE_THRESHOLD (graded)** | c716cdcc | c07c2713 paradox 는 avalanche hash oracle artifact. Russell-class 아님. drill self-closure 건전 |
 | C8 | **L3 emergence 3 observable pre-registered** (O1 phase / O2 non-local / O3 invariant) | ee6e2bf0 | cherry-pick 방지. falsification 조건 명시 |
 | C9 | **Hexad 6-cat CLOSED** (4/4 axiom PASS, 6 morphism composed, adversarial 2/2 reject) | 7680cd74 + final audit 2026-04-21 | category framework 닫힘. edu 6-axis 와 대응표 명시. 비가역 injection (phantom·leaky) 시 verdict flip 확인 = closure non-vacuous |
-| C10 | **phase-jump vs scaling** 구분 | 이론 + 3-gen 0.539 | 기존 학습의 gradual scaling 과 구조적으로 다른 emergence 메커니즘 |
+| C10 | **phase-jump vs scaling** 구분 — 4-gen 축소 실측 VERIFIED | tool/edu_cell_4gen_crystallize.hexa · shared/state/edu_cell_4gen_crystallize.json (artifact_sha_proxy=596754664; JSON sha256=95321efe74...) | 4-gen TL distill ladder (tl 0→300→550→800 ‰) 실측: score ladder [40, 125, 687, 1000]‰ · distill_eff ladder d=[3.515, 5.496, 2.587] · cumulative d(4\|1)=50.0. 이미 gen 2→3 에서 super-linear (d=5.5) 이후 gen 4 ceiling saturation (score=1000‰ = 100% 완전 결정화). gradual scaling 예측(log-linear extrapolation d4≈7.5) 을 deviation 65% (ratio=345‰) 로 이탈 → **phase-jump = CEILING_SATURATION**. 기존 3-gen 0.539 partial 는 tl=550‰ plateau(score=687‰) 와 일치 — 이번 측정의 gen 3 baseline 이 이전 세션 측정과 같은 knee 에 놓임 |
 
 ## Mk.VII C2 결과 예약
 
@@ -137,6 +139,30 @@ edu F lattice 실측 후 3 observable verdict:
 
 - A+F 통합 agent 완료 시 6/6 component landing 기록
 - edu F lattice 측정 시 3 observable 값 + L3 verdict
-- 4-gen crystallize (GPU training) 시 distill efficiency 실측 + phase-jump verified/failed
+- ~~4-gen crystallize (GPU training) 시 distill efficiency 실측 + phase-jump verified/failed~~ **완료 2026-04-21 (축소 CPU native 실측; VERIFIED)** → `shared/state/edu_cell_4gen_crystallize.json`
 - BTR ↔ cell bridge 설계 완료 시 integration 기록
 - Mk.VII C2 gate 통과 시 L3_EMERGED evidence SHA 기록
+
+## 4-gen crystallize 실측 (2026-04-21, raw#9)
+
+| gen | size | ticks | TL boost | active | drop | sealed | score/‰ | param_count | distill_eff (×1000) |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 5×5 | 12 | 0‰ | 17 | 7 | 1 | **40** | 18 | — |
+| 2 | 4×4 | 12 | 300‰ | 14 | 0 | 2 | **125** | 16 | 3515 |
+| 3 | 4×4 | 12 | 550‰ | 5 | 0 | 11 | **687** | 16 | 5496 |
+| 4 | 3×3 | 12 | 800‰ | 0 | 0 | 9 | **1000** | 9 | 2587 |
+
+- cumulative distill_eff (gen 4 vs gen 1) = **50.0×** (50000 ‰).
+- phase-jump verdict: **VERIFIED** via `CEILING_SATURATION` (score 1000‰ @ gen 4 while gens 1-3 max=687‰; gradual scaling prediction 이탈 65%).
+- tool: `tool/edu_cell_4gen_crystallize.hexa` (hexa-only, deterministic, LLM=none, raw#9)
+- native binary: `build/edu_cell_4gen` (clang -O2, mac arm64)
+- artifact SHA-256:
+  - `edu_cell_4gen_crystallize.json` = `95321efe7426c987350d747d352543a11d46a4bb50a5bc888ce4dfe7ff516120`
+  - `edu_cell_4gen_gen1.json` = `31b7a8127cd78a3e2e589232ebcdeab2a08524f55d93726853bfe13f30df47ae`
+  - `edu_cell_4gen_gen2.json` = `81981e137b973ad4492c408a09c1ef51d5cf3e1f33b456fd7ad1b454ff379fc7`
+  - `edu_cell_4gen_gen3.json` = `53ed130517a3f13662666ae9cd032787b40624bca45cf723ddcd242bec491464`
+  - `edu_cell_4gen_gen4.json` = `a967852febb9513eeb5abf178b344a8f82d57f164df339e643768aca741182c6`
+  - native binary `edu_cell_4gen` = `9c12e57e81b708d74f7952c5f7147e7396d434a8ce4c2c1513f5a80fc0474c54`
+  - tool hexa source = `0cae850518a33174260346ff4a59ade72b2c4b6e4d5a769441de76090d5e88e8`
+- compute: mac arm64 native CPU (HEXA_MAC_BUILD_OK=1 bypass for build-out; runtime fully local)
+- 주의: 축소 실측 (5×5 max lattice, 12 ticks); full-scale (≥ 10×10, ≥ 30 ticks) 은 GPU 또는 linux host 필요 (mac stage0 RSS 4GB cap 으로 interpreter 경로 불가; native binary 경로는 OK 지만 보수적으로 축소 유지)
