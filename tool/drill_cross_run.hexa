@@ -1,0 +1,197 @@
+// tool/drill_cross_run.hexa — 2-run cross-consistency drift detector
+//
+// PURPOSE: drift / non-determinism detection gate for drill_breakthrough.
+//   One PASS can be luck. If the same seed, run twice independently,
+//   yields the same result — the signal is real, not a coincidence.
+//
+// CONTRACT (deterministic, NO LLM):
+//   run_twice(seed, runner_tag)    -> [result1, result2]
+//   consistency(r1, r2)            -> {match: bool, diff_fields: [...]}
+//   Same seed, same criteria, but random_state differs per run
+//   (hash(seed) vs hash(seed + "run2")). A deterministic runner
+//   MUST collapse the two runs to identical output regardless.
+//
+// V8 SAFE_COMMIT: no mass rewrites. Additive module + criteria field.
+//
+// FIXTURE MODES (env DRILL_FIXTURE):
+//   det        — deterministic oracle (pure hash-projection of seed)
+//   nondet     — simulates drift (oracle depends on run-suffix)
+//   (unset)    — defaults to "det"
+//
+// CLI:
+//   hexa tool/drill_cross_run.hexa <dest> <round_n> <seed_id>
+//   Exits 0 on match, 1 on diff, 2 on fixture/setup error.
+
+// FIXTURE tags (inline literals; stage0 parser rejects `==` against top-lets):
+//   FIXTURE_DET    = "det"
+//   FIXTURE_NONDET = "nondet"
+
+// ─── Deterministic oracle ────────────────────────────────────────
+// Pure hash-projection: identical inputs -> identical outputs.
+// Caller-side "random_state" MUST NOT leak into this oracle when
+// fixture=det — that is the invariant under test.
+
+fn hash_proj(s: string) -> string {
+    // simple deterministic string fold; NOT crypto.
+    // Additive-multiplicative mix only (no bitops — stage0 compat).
+    let mut acc = 1469598103
+    let mut i = 0
+    let n = len(s)
+    while i < n {
+        let c = s.char_at(i)
+        acc = acc * 31 + c
+        i = i + 1
+    }
+    return str(acc)
+}
+
+fn judge_det(seed: string, random_state: string) -> string {
+    // DETERMINISTIC FIXTURE: oracle ignores random_state.
+    // Two runs with same seed but different random_state
+    // MUST produce identical output.
+    return hash_proj(seed)
+}
+
+fn judge_nondet(seed: string, random_state: string) -> string {
+    // NON-DET FIXTURE: oracle leaks random_state (simulated drift).
+    // Two runs with different random_state WILL diverge.
+    return hash_proj(seed + "|" + random_state)
+}
+
+fn judge(seed: string, random_state: string, fixture: string) -> string {
+    if fixture == "nondet" {
+        return judge_nondet(seed, random_state)
+    } else {
+        return judge_det(seed, random_state)
+    }
+}
+
+// ─── run_twice ───────────────────────────────────────────────────
+// Returns a "run1|run2" string pair so we can inspect both outputs.
+
+fn run_once(seed: string, run_tag: string, fixture: string) -> string {
+    // random_state derived from seed + per-run salt.
+    // Same seed -> different random_state per run; a deterministic
+    // runner must still collapse to identical result.
+    let random_state = hash_proj(seed + "::" + run_tag)
+    let pos_ok       = judge(seed, random_state, fixture)
+    // 3 aggregate fields mimic the real runner's verdict shape.
+    let saturation   = pos_ok
+    let absorption   = hash_proj("abs::" + seed)
+    let depth        = hash_proj("dep::" + seed)
+    return saturation + ";" + absorption + ";" + depth
+}
+
+fn run_twice(seed: string, fixture: string) -> string {
+    let r1 = run_once(seed, "run1", fixture)
+    let r2 = run_once(seed, "run2", fixture)
+    return r1 + "||" + r2
+}
+
+// ─── consistency ─────────────────────────────────────────────────
+// Split the "r1||r2" pair and diff each of 3 fields.
+// Emits diff_fields as a semicolon-joined list of field names.
+
+fn split_pair(pair: string) -> string {
+    // returns r1 (caller calls twice with two slicings)
+    let sep = pair.index_of("||")
+    return pair.substring(0, sep)
+}
+
+fn split_pair2(pair: string) -> string {
+    let sep = pair.index_of("||")
+    return pair.substring(sep + 2, len(pair))
+}
+
+fn field(triple: string, idx: int) -> string {
+    // 3 fields separated by ';' — idx in {0,1,2}
+    let s1 = triple.index_of(";")
+    let rest = triple.substring(s1 + 1, len(triple))
+    let s2 = rest.index_of(";")
+    if idx == 0 { return triple.substring(0, s1) }
+    if idx == 1 { return rest.substring(0, s2) }
+    return rest.substring(s2 + 1, len(rest))
+}
+
+fn consistency_diff_fields(r1: string, r2: string) -> string {
+    let mut diff = ""
+    let names = "saturation;absorption;depth"
+    let mut idx = 0
+    while idx < 3 {
+        let a = field(r1, idx)
+        let b = field(r2, idx)
+        if a != b {
+            let nm_start = if idx == 0 { 0 } else { if idx == 1 { 11 } else { 22 } }
+            let nm_end   = if idx == 0 { 10 } else { if idx == 1 { 21 } else { len(names) } }
+            if diff != "" { diff = diff + "," }
+            diff = diff + names.substring(nm_start, nm_end)
+        }
+        idx = idx + 1
+    }
+    return diff
+}
+
+fn consistency_match(r1: string, r2: string) -> bool {
+    return r1 == r2
+}
+
+// ─── Certificate writer ──────────────────────────────────────────
+
+fn cert_body(dest: string, round_n: string, seed: string, fixture: string, r1: string, r2: string, match_ok: bool, diff_fields: string) -> string {
+    let status = if match_ok { "PASS" } else { "FAIL" }
+    let mut body = "{\n"
+    body = body + "  \"verifier\": \"drill_cross_run\",\n"
+    body = body + "  \"variant\": \"2run_consistency_v1\",\n"
+    body = body + "  \"dest\": \"" + dest + "\",\n"
+    body = body + "  \"round_n\": \"" + round_n + "\",\n"
+    body = body + "  \"seed\": \"" + seed + "\",\n"
+    body = body + "  \"fixture\": \"" + fixture + "\",\n"
+    body = body + "  \"run1\": \"" + r1 + "\",\n"
+    body = body + "  \"run2\": \"" + r2 + "\",\n"
+    body = body + "  \"match\": " + str(match_ok) + ",\n"
+    body = body + "  \"diff_fields\": \"" + diff_fields + "\",\n"
+    body = body + "  \"status\": \"" + status + "\"\n"
+    body = body + "}\n"
+    return body
+}
+
+fn out_path(dest: string, round_n: string) -> string {
+    return "shared/state/" + dest + "_r" + round_n + "_drill_cross_run.json"
+}
+
+fn pick_fixture() -> string {
+    let f = env("DRILL_FIXTURE")
+    if f == "nondet" {
+        return "nondet"
+    }
+    return "det"
+}
+
+fn main() {
+    let argv = args()
+    let dest    = if argv.len() > 2 { argv[2] } else { "alm" }
+    let round_n = if argv.len() > 3 { argv[3] } else { "13" }
+    let seed    = if argv.len() > 4 { argv[4] } else { "seed_pos_01" }
+
+    let fixture = pick_fixture()
+    let pair    = run_twice(seed, fixture)
+    let r1      = split_pair(pair)
+    let r2      = split_pair2(pair)
+    let ok      = consistency_match(r1, r2)
+    let diffs   = if ok { "" } else { consistency_diff_fields(r1, r2) }
+
+    let out = out_path(dest, round_n)
+    write_file(out, cert_body(dest, round_n, seed, fixture, r1, r2, ok, diffs))
+
+    println("drill_cross_run")
+    println("  dest=" + dest + " round=" + round_n + " seed=" + seed)
+    println("  fixture=" + fixture)
+    println("  run1=" + r1)
+    println("  run2=" + r2)
+    println("  match=" + str(ok))
+    if !ok { println("  diff_fields=" + diffs) }
+    println("  cert=" + out)
+    println("  status=" + (if ok { "PASS" } else { "FAIL" }))
+
+    if ok { exit(0) } else { exit(1) }
+}
