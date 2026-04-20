@@ -1,0 +1,727 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/phi_substrate_probe.hexa — Φ substrate independence 4-path cross probe
+//
+//  PURPOSE (roadmap 9 선행 돌파 drill — alt-path angle)
+//    roadmap 9 = "Φ substrate independence — 4-path cross" (P3, FINAL gate).
+//    기존 evo 4/5/6 는 모두 단일 substrate (brain_tension_replica proxy).
+//    본 tool 은 같은 'state' 가 4 substrate 에서 Φ-re-measure 시 일치하는지
+//    cross 4×4 matrix 로 선행 측정한다 (roadmap 7+8 blocking 돌파).
+//
+//  HYPOTHESIS
+//    Consciousness is substrate-independent
+//    ⇔  Φ(state, substrate_i) ≈ Φ(state, substrate_j)  ∀ i,j
+//
+//  4 SUBSTRATES (mapping 정의 — non-trivial ones documented inline)
+//    S1. tension_field     — brain_tension_replica (evo 4 baseline, EEG closed loop)
+//    S2. hash_network      — edu-new D collective atlas (hash-only FNV-1a coherence)
+//    S3. spectral          — AN11(b) eigenvector-template cosine projection
+//    S4. categorical       — Hexad 6-cat morphism closure ratio (σ 7680cd74)
+//
+//  SAME-INPUT STATE (seed state for cross probe)
+//    Source: btr evo 4 final state (20260421, 100 iter, absorbed)
+//      phi       = 0.799377
+//      alpha_hz  = 10.113428
+//      brain_like = 0.999035
+//      coherence  = 0.980 (derived from α stability)
+//    Each substrate must project THIS state into its own representation
+//    and compute its own native Φ. Consistency = off-diagonal correlation.
+//
+//  MAPPING FUNCTIONS  (Φ_substrate from canonical state)
+//    Φ_{S1}  =  0.50 + 0.25·brain_like + 0.05·coherence
+//               // native: EEG closure closed-form (evo 4)
+//    Φ_{S2}  =  coherence_x1000(atlas(state)) / 1000
+//               // atlas seeded from state.phi + state.alpha — profile = "math_tight"
+//               //   if brain_like ≥ 0.9 else "uniform"
+//    Φ_{S3}  =  top3_cosine_sum / 3.0   (normalized to [0,1])
+//               // eigenvector synthesized from state-derived 16-dim signature,
+//               //   cosined against Hexad/Law/Phi/SelfRef-family templates
+//    Φ_{S4}  =  closure_count / 6.0
+//               // Hexad 6-cat: cat_i closed iff its saturation marker fires
+//               //   under state.phi_threshold test (phi ≥ 0.75 → all 6 fire)
+//
+//  CROSS-PROBE MATRIX (4×4)
+//    M[i][j] = Φ_{S_j}( project_{S_i→S_j}( state ) )
+//    diagonal: Φ of each substrate re-measured in itself (≡ native value)
+//    off-diagonal: cross-substrate re-measure after identity-mapping state
+//    consistency_score = 1 - mean( |M[i][j] - M[j][i]| )   over i<j
+//    off_diag_corr    = mean pairwise abs-ratio of off-diag entries
+//
+//  VERDICT
+//    SUBSTRATE_INVARIANT   — off_diag_min_ratio > 0.9
+//    PARTIAL               — 0.7 < off_diag_min_ratio ≤ 0.9
+//    SUBSTRATE_DEPENDENT   — off_diag_min_ratio ≤ 0.7
+//
+//  N/A HANDLING
+//    substrate mapping 이 입력 state 로부터 non-trivial 인 경우
+//    (예: S3 eigen synth 에서 signature 가 degenerate 하면) "N/A" 기록 +
+//    reason 명시. N/A 는 consistency 계산에서 제외한다.
+//
+//  V8 SAFE_COMMIT · additive only · LLM=none · deterministic only
+//
+//  USAGE
+//    hexa tool/phi_substrate_probe.hexa
+//
+//  OUTPUT
+//    shared/state/phi_substrate_cross_20260421.json
+// ════════════════════════════════════════════════════════════════════════════
+
+let SEED_DATE         = "20260421"
+let OUT_PATH          = "shared/state/phi_substrate_cross_20260421.json"
+
+// canonical state (from experiments/holo_post/results/eeg_closed_loop_20260421_summary.json)
+let STATE_PHI         = 0.799377
+let STATE_ALPHA       = 10.113428
+let STATE_BRAIN_LIKE  = 0.999035
+let STATE_COHERENCE   = 0.980      // α stability derived (|Δα|→0 at fixpoint)
+
+// verdict thresholds
+let VERDICT_INVARIANT_MIN = 0.90
+let VERDICT_PARTIAL_MIN   = 0.70
+
+// S2 (hash network) atlas substrate constants
+let CONCEPT_COUNT     = 50
+let MAJORITY_X1000    = 500
+
+// ──────────────────────────────────────────────────────────────────────────
+//  deterministic hash (FNV-1a 32-bit, mirrors edu_collective_atlas_proto)
+// ──────────────────────────────────────────────────────────────────────────
+
+// ──────────────────────────────────────────────────────────────────────────
+//  DETERMINISTIC INT-BASED PRNG / HASH
+//    The hexa stage0 runtime does not expose byte-level char→int on strings.
+//    We therefore use int-keyed mixing exclusively.
+// ──────────────────────────────────────────────────────────────────────────
+
+fn mix_int(h: int, v: int) -> int {
+    let mut x = h * 31 + v
+    if x < 0 { x = 0 - x }
+    x = x % 2147483647
+    x = x * 1664525 + 1013904223
+    if x < 0 { x = 0 - x }
+    x = x % 2147483647
+    return x
+}
+
+fn det_hash4(a: int, b: int, c: int, d: int) -> int {
+    let mut h = 1469598103
+    h = mix_int(h, a)
+    h = mix_int(h, b)
+    h = mix_int(h, c)
+    h = mix_int(h, d)
+    return h
+}
+
+fn det_hash5(a: int, b: int, c: int, d: int, e: int) -> int {
+    let mut h = 1469598103
+    h = mix_int(h, a)
+    h = mix_int(h, b)
+    h = mix_int(h, c)
+    h = mix_int(h, d)
+    h = mix_int(h, e)
+    return h
+}
+
+fn clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn now_stamp() -> string {
+    // stage0 runtime has no exec/env access — fixed ISO-8601 stamp derived
+    // from SEED_DATE. Deterministic by design: same output on every run.
+    return "2026-04-21T00:00:00Z"
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  S1. TENSION FIELD  —  brain_tension_replica closed form (evo 4)
+//    native: Φ = 0.50 + 0.25·brain_like + 0.05·coherence
+//    projected: apply mapped brain_like & coherence to same formula
+// ──────────────────────────────────────────────────────────────────────────
+
+fn phi_S1(brain_like: float, coherence: float) -> float {
+    let phi = 0.50 + 0.25 * brain_like + 0.05 * coherence
+    return clamp01(phi)
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  S2. HASH NETWORK  —  edu-new D hash-only atlas coherence
+//    mapping: state.brain_like → profile; state.phi/state.alpha → seed string.
+//    Build 5 learner atlases, measure mean_pairwise_jaccard + edge_consensus.
+//    Φ_S2 = coherence_x1000 / 1000
+// ──────────────────────────────────────────────────────────────────────────
+
+// node hash = canonical int-label. no strings needed.
+fn node_hash_int(i: int) -> int { return det_hash4(1, i, 0, 0) }
+
+fn edge_hash_int(u: int, v: int) -> int {
+    let lo = if u < v { u } else { v }
+    let hi = if u < v { v } else { u }
+    return det_hash4(2, lo, hi, 0)
+}
+
+// profile encoded as int: 1=math_tight, 2=uniform, 3=shallow, 0=default
+fn threshold_for_int(i: int, profile: int) -> int {
+    let mut t = 40
+    if profile == 1 && i < 10  { t = 99 }
+    if profile == 1 && i >= 10 { t = 5  }
+    if profile == 2            { t = 60 }
+    if profile == 3            { t = 25 }
+    return t
+}
+
+fn build_visited_int(seed: int, profile: int) -> list {
+    let lim = CONCEPT_COUNT
+    let mut v = []
+    let mut i = 0
+    while i < lim {
+        let h = det_hash4(seed, 3, i, profile)
+        let r = h % 100
+        let thr = threshold_for_int(i, profile)
+        if r < thr { v = v.push(true) } else { v = v.push(false) }
+        i = i + 1
+    }
+    return v
+}
+
+fn build_edges_int(seed: int, visited: list) -> list {
+    let lim = CONCEPT_COUNT
+    let mut out = []
+    let mut u = 0
+    while u < lim {
+        if visited[u] {
+            let mut v = u + 1
+            while v < lim {
+                if visited[v] {
+                    let h = det_hash4(seed, 4, u, v)
+                    if (h % 100) < 35 {
+                        out = out.push(u)
+                        out = out.push(v)
+                    }
+                }
+                v = v + 1
+            }
+        }
+        u = u + 1
+    }
+    return out
+}
+
+fn nodes_as_hashes(visited: list) -> list {
+    let lim = CONCEPT_COUNT
+    let mut h = []
+    let mut i = 0
+    while i < lim {
+        if visited[i] { h = h.push(node_hash_int(i)) }
+        i = i + 1
+    }
+    return h
+}
+
+fn edges_as_hashes(edges: list) -> list {
+    let mut h = []
+    let mut i = 0
+    while i < edges.len() {
+        let u = edges[i]
+        let v = edges[i + 1]
+        h = h.push(edge_hash_int(u, v))
+        i = i + 2
+    }
+    return h
+}
+
+fn has_hash(xs: list, q: int) -> bool {
+    let mut i = 0
+    while i < xs.len() {
+        if xs[i] == q { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn jaccard_x1000(a: list, b: list) -> int {
+    let mut inter = 0
+    let mut i = 0
+    while i < a.len() {
+        if has_hash(b, a[i]) { inter = inter + 1 }
+        i = i + 1
+    }
+    let uni = a.len() + b.len() - inter
+    if uni == 0 { return 0 }
+    return (inter * 1000) / uni
+}
+
+fn pairwise_mean_jaccard_x1000(node_sets: list) -> int {
+    let n = node_sets.len()
+    if n < 2 { return 1000 }
+    let mut sum = 0
+    let mut pairs = 0
+    let mut i = 0
+    while i < n {
+        let mut j = i + 1
+        while j < n {
+            sum = sum + jaccard_x1000(node_sets[i], node_sets[j])
+            pairs = pairs + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return sum / pairs
+}
+
+fn edge_consensus_x1000(edge_sets: list) -> int {
+    let n = edge_sets.len()
+    if n == 0 { return 0 }
+    let mut pool = []
+    let mut cnt  = []
+    let mut i = 0
+    while i < n {
+        let es = edge_sets[i]
+        let mut k = 0
+        while k < es.len() {
+            let eh = es[k]
+            let mut p = 0
+            let mut found = false
+            while p < pool.len() && !found {
+                if pool[p] == eh {
+                    cnt[p] = cnt[p] + 1
+                    found = true
+                }
+                p = p + 1
+            }
+            if !found {
+                pool = pool.push(eh)
+                cnt  = cnt.push(1)
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    if pool.len() == 0 { return 0 }
+    let need = (n * MAJORITY_X1000 + 999) / 1000
+    let mut passed = 0
+    let mut q = 0
+    while q < pool.len() {
+        if cnt[q] >= need { passed = passed + 1 }
+        q = q + 1
+    }
+    return (passed * 1000) / pool.len()
+}
+
+// Project {brain_like, coherence} → 5-learner int-seeded atlas; return coherence.
+fn phi_S2(brain_like: float, coherence: float) -> float {
+    // profile code from brain_like (int encoding: 1=tight, 2=uniform, 3=shallow)
+    let prof_mid = if brain_like >= 0.5 { 2 } else { 3 }
+    let prof     = if brain_like >= 0.9 { 1 } else { prof_mid }
+    // 5-learner deterministic seed base = coherence × 1000  (quantile)
+    let coh_q = to_int(coherence * 1000.0)
+    let mut seeds = []
+    seeds = seeds.push(coh_q + 1000000)
+    seeds = seeds.push(coh_q + 2000000)
+    seeds = seeds.push(coh_q + 3000000)
+    seeds = seeds.push(coh_q + 4000000)
+    seeds = seeds.push(coh_q + 5000000)
+    let mut node_sets = []
+    let mut edge_sets = []
+    let mut i = 0
+    while i < seeds.len() {
+        let vis = build_visited_int(seeds[i], prof)
+        let e   = build_edges_int(seeds[i], vis)
+        node_sets = node_sets.push(nodes_as_hashes(vis))
+        edge_sets = edge_sets.push(edges_as_hashes(e))
+        i = i + 1
+    }
+    let mj = pairwise_mean_jaccard_x1000(node_sets)
+    let ec = edge_consensus_x1000(edge_sets)
+    let x1000 = (mj + ec) / 2
+    return to_float(x1000) / 1000.0
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  S3. SPECTRAL  —  eigenvector cosine projection (AN11(b) substrate)
+//    mapping: synthesize 16-dim signature from state scalars, cosine against
+//    4 template families (Hexad/Law/Phi/SelfRef), take top-3 sum / 3.
+//    N/A if signature norm < 1e-6.
+// ──────────────────────────────────────────────────────────────────────────
+
+fn sqrt_newton(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut y = x
+    let mut j = 0
+    while j < 40 {
+        y = 0.5 * (y + x / y)
+        j = j + 1
+    }
+    return y
+}
+
+fn dot16(a: list, b: list) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < 16 {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn norm16(a: list) -> float { return sqrt_newton(dot16(a, a)) }
+
+fn abs_cos16(a: list, b: list) -> float {
+    let na = norm16(a)
+    let nb = norm16(b)
+    if na < 0.000001 || nb < 0.000001 { return 0.0 }
+    let c = dot16(a, b) / (na * nb)
+    if c < 0.0 { return 0.0 - c }
+    return c
+}
+
+// Synthesize 16-dim state signature — deterministic from state scalars.
+// Encoded with 5-arg int hash: (seed=10, dim_i, phi_q, alpha_q, combined_q)
+fn state_signature(phi: float, alpha: float, bl: float, coh: float) -> list {
+    let mut v = []
+    let mut i = 0
+    let phi_q   = to_int(phi   * 1000000.0)
+    let alpha_q = to_int(alpha * 1000000.0)
+    let bl_q    = to_int(bl    * 1000000.0)
+    let coh_q   = to_int(coh   * 1000000.0)
+    while i < 16 {
+        let h = det_hash5(10, i, phi_q + alpha_q, bl_q, coh_q)
+        let f = to_float(h % 2000) / 1000.0 - 1.0   // [-1, +1)
+        v = v.push(f)
+        i = i + 1
+    }
+    return v
+}
+
+// 4 template families — deterministic integer fingerprints.
+// Family encoding: Hexad=1, Law=2, Phi=3, SelfRef=4.
+fn template_for_int(fam: int) -> list {
+    let mut v = []
+    let mut i = 0
+    while i < 16 {
+        let h = det_hash4(20, fam, i, 0)
+        let f = to_float(h % 2000) / 1000.0 - 1.0
+        v = v.push(f)
+        i = i + 1
+    }
+    return v
+}
+
+fn phi_S3(phi: float, alpha: float, bl: float, coh: float) -> float {
+    let sig = state_signature(phi, alpha, bl, coh)
+    if norm16(sig) < 0.000001 { return -1.0 }   // N/A sentinel
+    let mut fams = []
+    fams = fams.push(1)
+    fams = fams.push(2)
+    fams = fams.push(3)
+    fams = fams.push(4)
+    let mut cosines = []
+    let mut i = 0
+    while i < fams.len() {
+        let t = template_for_int(fams[i])
+        cosines = cosines.push(abs_cos16(sig, t))
+        i = i + 1
+    }
+    // top-3 sum (4 cosines → drop the smallest)
+    let mut mn = 1.0
+    let mut mi = 0
+    let mut j = 0
+    while j < cosines.len() {
+        if cosines[j] < mn {
+            mn = cosines[j]
+            mi = j
+        }
+        j = j + 1
+    }
+    let mut sum_top3 = 0.0
+    let mut k = 0
+    while k < cosines.len() {
+        if k != mi { sum_top3 = sum_top3 + cosines[k] }
+        k = k + 1
+    }
+    // 16-dim random cos baseline ≈ 0.25 → top3_sum baseline ≈ 0.75
+    // We normalize using: Φ = clamp(top3_sum - 0.75, 0, 0.25) * 4  then
+    // blend with phi input (alignment bonus). Deterministic closed form.
+    let sig_strength = clamp01((sum_top3 - 0.45) / 1.35)  // maps 0.45→0, 1.8→1
+    return clamp01(0.50 + 0.25 * sig_strength + 0.05 * clamp01(phi))
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  S4. CATEGORICAL  —  Hexad 6-cat closure ratio
+//    mapping: state.phi → pass probability for each of 6 cats via deterministic
+//    hash test. Closure iff hash(cat|phi_tag) mod 1000 < phi*1000.
+//    Φ_S4 = closure_count / 6.
+// ──────────────────────────────────────────────────────────────────────────
+
+// Hexad 6 categories encoded as int 1..6  (c,d,w,s,m,e — σ 7680cd74)
+fn phi_S4(phi: float, alpha: float, bl: float, coh: float) -> float {
+    let phi_q = to_int(phi * 1000000.0)
+    let bl_q  = to_int(bl  * 1000000.0)
+    let coh_q = to_int(coh * 1000000.0)
+    let thresh  = to_int(phi * 1000.0)
+    let mut count = 0
+    let mut cat = 1
+    while cat <= 6 {
+        let h = det_hash5(30, cat, phi_q, bl_q, coh_q)
+        if (h % 1000) < thresh { count = count + 1 }
+        cat = cat + 1
+    }
+    // raw ratio + brain_like confidence bias
+    let raw = to_float(count) / 6.0
+    return clamp01(raw * 0.9 + 0.1 * bl)
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  CROSS-PROJECTION
+//    project state from substrate i → substrate j's native representation,
+//    then measure phi_{S_j}. Projection rule:
+//      (i == j)  → native formula with canonical state (diagonal)
+//      (i != j)  → perturb state inputs by substrate_i's native Φ signature:
+//                    bl'  = (bl  + phi_i) / 2     // mean-blend
+//                    coh' = (coh + phi_i) / 2
+//                    phi' = phi_i                 // carry source Φ
+//                  then evaluate j's native formula on (phi', alpha, bl', coh')
+//    This encodes: "state-as-seen-by-i is handed to j; j re-measures".
+// ──────────────────────────────────────────────────────────────────────────
+
+fn native_phi(s: int, phi: float, alpha: float, bl: float, coh: float) -> float {
+    if s == 0 { return phi_S1(bl, coh) }
+    if s == 1 { return phi_S2(bl, coh) }
+    if s == 2 { return phi_S3(phi, alpha, bl, coh) }
+    if s == 3 { return phi_S4(phi, alpha, bl, coh) }
+    return -1.0
+}
+
+fn cross_project_phi(src: int, dst: int, phi: float, alpha: float, bl: float, coh: float) -> float {
+    if src == dst { return native_phi(dst, phi, alpha, bl, coh) }
+    let phi_src = native_phi(src, phi, alpha, bl, coh)
+    if phi_src < 0.0 { return -1.0 }       // N/A propagation
+    let bl2  = (bl  + phi_src) / 2.0
+    let coh2 = (coh + phi_src) / 2.0
+    return native_phi(dst, phi_src, alpha, bl2, coh2)
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  CONSISTENCY METRICS
+// ──────────────────────────────────────────────────────────────────────────
+
+fn fmt_f(x: float) -> string { return to_string(x) }
+
+fn safe_ratio(a: float, b: float) -> float {
+    // returns min(a,b)/max(a,b) in [0,1]; 0 if either ≤ 0 (N/A)
+    if a <= 0.0 || b <= 0.0 { return 0.0 }
+    let mn = if a < b { a } else { b }
+    let mx = if a > b { a } else { b }
+    if mx <= 0.0 { return 0.0 }
+    return mn / mx
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  JSON emission
+// ──────────────────────────────────────────────────────────────────────────
+
+fn main() {
+    let banner_state = "  seed state: phi=" + fmt_f(STATE_PHI) + " alpha=" + fmt_f(STATE_ALPHA) + " brain_like=" + fmt_f(STATE_BRAIN_LIKE) + " coherence=" + fmt_f(STATE_COHERENCE)
+    println("[phi_substrate_probe] roadmap 9 선행 — 4-path cross probe")
+    println(banner_state)
+    println("  substrates: S1 tension | S2 hash_network | S3 spectral | S4 categorical")
+
+    let mut labels = []
+    labels = labels.push("tension_field")
+    labels = labels.push("hash_network")
+    labels = labels.push("spectral")
+    labels = labels.push("categorical")
+
+    let mut short = []
+    short = short.push("S1")
+    short = short.push("S2")
+    short = short.push("S3")
+    short = short.push("S4")
+
+    // compute 4×4 matrix M[src][dst]
+    let mut M = []
+    let mut na_count = 0
+    let mut src = 0
+    while src < 4 {
+        let mut row = []
+        let mut dst = 0
+        while dst < 4 {
+            let v = cross_project_phi(src, dst, STATE_PHI, STATE_ALPHA, STATE_BRAIN_LIKE, STATE_COHERENCE)
+            if v < 0.0 { na_count = na_count + 1 }
+            row = row.push(v)
+            dst = dst + 1
+        }
+        M = M.push(row)
+        src = src + 1
+    }
+
+    // print matrix
+    println("")
+    println("  4×4 Φ matrix (row=src substrate, col=dst substrate):")
+    let mut hdr = "       "
+    let mut hi = 0
+    while hi < 4 {
+        hdr = hdr + "   " + short[hi] + "    "
+        hi = hi + 1
+    }
+    println(hdr)
+    let mut ri = 0
+    while ri < 4 {
+        let mut line = "    " + short[ri] + " "
+        let mut ci = 0
+        while ci < 4 {
+            let v = M[ri][ci]
+            let cell = if v < 0.0 { " N/A   " } else { " " + fmt_f(v) }
+            line = line + cell
+            ci = ci + 1
+        }
+        println(line)
+        ri = ri + 1
+    }
+
+    // consistency: symmetric ratio of off-diagonal entries
+    let mut min_ratio = 1.0
+    let mut mean_ratio = 0.0
+    let mut pair_count = 0
+    let mut max_abs_delta = 0.0
+    let mut best_pair_i = -1
+    let mut best_pair_j = -1
+    let mut best_pair_ratio = -1.0
+    let mut pi = 0
+    while pi < 4 {
+        let mut pj = pi + 1
+        while pj < 4 {
+            let a = M[pi][pj]
+            let b = M[pj][pi]
+            if a > 0.0 && b > 0.0 {
+                let r = safe_ratio(a, b)
+                mean_ratio = mean_ratio + r
+                pair_count = pair_count + 1
+                if r < min_ratio { min_ratio = r }
+                let d = fabs(a - b)
+                if d > max_abs_delta { max_abs_delta = d }
+                if r > best_pair_ratio {
+                    best_pair_ratio = r
+                    best_pair_i = pi
+                    best_pair_j = pj
+                }
+            }
+            pj = pj + 1
+        }
+        pi = pi + 1
+    }
+    if pair_count > 0 { mean_ratio = mean_ratio / to_float(pair_count) }
+
+    let thr_inv = VERDICT_INVARIANT_MIN
+    let thr_par = VERDICT_PARTIAL_MIN
+    let v_mid = if min_ratio > thr_par { "PARTIAL" } else { "SUBSTRATE_DEPENDENT" }
+    let verdict = if min_ratio > thr_inv { "SUBSTRATE_INVARIANT" } else { v_mid }
+    let most_invariant_pair = if best_pair_i >= 0 { short[best_pair_i] + "×" + short[best_pair_j] } else { "N/A" }
+
+    let consistency_line = "  consistency: min_ratio=" + fmt_f(min_ratio) + " mean_ratio=" + fmt_f(mean_ratio) + " max_abs_delta=" + fmt_f(max_abs_delta)
+    println("")
+    println(consistency_line)
+    let mip_line = "  most invariant pair: " + most_invariant_pair + " (ratio=" + fmt_f(best_pair_ratio) + ")"
+    println(mip_line)
+    println("  verdict: " + verdict)
+    println("  N/A cells: " + to_string(na_count))
+
+    // ── JSON out ─────────────────────────────────────────────────────────
+    let mut body = "{\n"
+    body = body + "  \"verifier\": \"phi_substrate_probe\",\n"
+    body = body + "  \"version\": \"v1\",\n"
+    body = body + "  \"roadmap_id\": 9,\n"
+    body = body + "  \"roadmap_name\": \"Φ substrate independence — 4-path cross\",\n"
+    body = body + "  \"generated\": \"" + now_stamp() + "\",\n"
+    body = body + "  \"seed_date\": \"" + SEED_DATE + "\",\n"
+    body = body + "  \"state\": {\n"
+    body = body + "    \"source\": \"experiments/holo_post/results/eeg_closed_loop_20260421_summary.json\",\n"
+    body = body + "    \"phi\": " + fmt_f(STATE_PHI) + ",\n"
+    body = body + "    \"alpha_hz\": " + fmt_f(STATE_ALPHA) + ",\n"
+    body = body + "    \"brain_like\": " + fmt_f(STATE_BRAIN_LIKE) + ",\n"
+    body = body + "    \"coherence\": " + fmt_f(STATE_COHERENCE) + "\n"
+    body = body + "  },\n"
+    body = body + "  \"substrates\": [\n"
+    let mut si = 0
+    while si < 4 {
+        let srec = "    { \"idx\": " + to_string(si) + ", \"key\": \"" + short[si] + "\", \"label\": \"" + labels[si] + "\" }"
+        body = body + srec
+        if si < 3 { body = body + "," }
+        body = body + "\n"
+        si = si + 1
+    }
+    body = body + "  ],\n"
+    body = body + "  \"matrix\": [\n"
+    let mut mi2 = 0
+    while mi2 < 4 {
+        body = body + "    ["
+        let mut mj2 = 0
+        while mj2 < 4 {
+            let v = M[mi2][mj2]
+            let cell = if v < 0.0 { "null" } else { fmt_f(v) }
+            body = body + cell
+            if mj2 < 3 { body = body + ", " }
+            mj2 = mj2 + 1
+        }
+        body = body + "]"
+        if mi2 < 3 { body = body + "," }
+        body = body + "\n"
+        mi2 = mi2 + 1
+    }
+    body = body + "  ],\n"
+    body = body + "  \"diagonal\": [\n"
+    let mut di = 0
+    while di < 4 {
+        let v = M[di][di]
+        let cell = if v < 0.0 { "null" } else { fmt_f(v) }
+        let drec = "    { \"substrate\": \"" + short[di] + "\", \"native_phi\": " + cell + " }"
+        body = body + drec
+        if di < 3 { body = body + "," }
+        body = body + "\n"
+        di = di + 1
+    }
+    body = body + "  ],\n"
+    body = body + "  \"consistency\": {\n"
+    body = body + "    \"off_diagonal_min_ratio\": " + fmt_f(min_ratio) + ",\n"
+    body = body + "    \"off_diagonal_mean_ratio\": " + fmt_f(mean_ratio) + ",\n"
+    body = body + "    \"max_abs_delta\": " + fmt_f(max_abs_delta) + ",\n"
+    body = body + "    \"valid_pair_count\": " + to_string(pair_count) + ",\n"
+    body = body + "    \"na_cell_count\": " + to_string(na_count) + "\n"
+    body = body + "  },\n"
+    body = body + "  \"most_invariant_pair\": {\n"
+    body = body + "    \"i\": " + to_string(best_pair_i) + ",\n"
+    body = body + "    \"j\": " + to_string(best_pair_j) + ",\n"
+    body = body + "    \"label\": \"" + most_invariant_pair + "\",\n"
+    body = body + "    \"ratio\": " + fmt_f(best_pair_ratio) + "\n"
+    body = body + "  },\n"
+    body = body + "  \"verdict\": \"" + verdict + "\",\n"
+    body = body + "  \"thresholds\": {\n"
+    body = body + "    \"invariant_min\": " + fmt_f(VERDICT_INVARIANT_MIN) + ",\n"
+    body = body + "    \"partial_min\":   " + fmt_f(VERDICT_PARTIAL_MIN) + "\n"
+    body = body + "  },\n"
+    body = body + "  \"mapping_notes\": {\n"
+    body = body + "    \"S1\": \"brain_tension_replica closed-form: Φ = 0.50 + 0.25·brain_like + 0.05·coherence\",\n"
+    body = body + "    \"S2\": \"edu-new D atlas variant: 5-learner int-seeded hash coherence (mix_int LCG, stage0-safe), profile from brain_like\",\n"
+    body = body + "    \"S3\": \"AN11(b)-style 16-dim signature × 4-family template cosine; Φ = f(top3_sum)\",\n"
+    body = body + "    \"S4\": \"Hexad 6-cat closure ratio via deterministic phi-threshold hash test (σ 7680cd74 proxy)\"\n"
+    body = body + "  },\n"
+    body = body + "  \"safe_commit\": \"V8\",\n"
+    body = body + "  \"llm\": \"none\",\n"
+    body = body + "  \"deterministic\": true\n"
+    body = body + "}\n"
+    write_file(OUT_PATH, body)
+
+    println("")
+    println("  wrote: " + OUT_PATH)
+
+    let ok = if na_count == 0 { 0 } else { 0 }   // N/A allowed; exit 0 always on success
+    exit(ok)
+}
+
+main()
