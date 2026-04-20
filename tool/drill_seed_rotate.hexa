@@ -1,0 +1,502 @@
+// ════════════════════════════════════════════════════════════════
+//  tool/drill_seed_rotate.hexa — drill seed rotation + ossification
+//
+//  PURPOSE
+//    Rotate shared/bench/drill_seed_set.jsonl to prevent r13 gaming
+//    (hypothesis tuning to a fixed 4-seed set). Enforce lifespan,
+//    archive expired seeds into a retired vault, propose fresh
+//    candidates gated by deterministic quality checks.
+//
+//  POLICY
+//    - Lifespan:        max 3 rounds usage_count per seed.
+//    - Retirement:      seed with usage_count >= MAX_LIFESPAN is
+//                       archived to the retired-vault and removed
+//                       from the active set.
+//    - New candidates:  sourced from `drill_candidate_pool.jsonl`
+//                       (produced offline by drill runs — last 3
+//                       rounds uncertain area), NOT LLM-generated.
+//    - Quality gate (deterministic, all numeric):
+//        G1 length ∈ [100, 200] chars
+//        G2 kind ∈ { positive, negative, closure, diagonal }
+//        G3 expected ∈ { saturation, absorption } (non-empty)
+//        G4 hash-projection similarity vs every active+retired seed
+//           must be < 0.70 (Jaccard over 3-grams of normalized text)
+//
+//  VAULT LAYOUT
+//    shared/bench/drill_seeds_retired/round_<N>/seed_<id>.jsonl
+//    (one retired seed per file; JSONL single-line for replay).
+//
+//  META LAYOUT
+//    shared/bench/drill_seed_meta.json
+//    { "seeds": [ { "id":..., "usage_count":N,
+//                   "last_used_round":R, "success_rate":F } ... ] }
+//
+//  COMMANDS
+//    rotate  --round <N>             scan active set, retire expired,
+//                                    suggest candidates (dry-run default).
+//    rotate  --round <N> --confirm   apply retirement + promote gated
+//                                    candidates into active set.
+//    status  --round <N>             print per-seed usage + gate dryrun.
+//    gate    <candidate.jsonl>       validate a candidate file only.
+//
+//  CONSTRAINTS
+//    - NO LLM. Hash-projection Jaccard only.
+//    - Deterministic: same inputs -> same outputs.
+//    - V8 SAFE_COMMIT: additive; existing seed_set.jsonl untouched in
+//      dry-run; --confirm writes a backup first.
+// ════════════════════════════════════════════════════════════════
+
+let ACTIVE_SEEDS   = "shared/bench/drill_seed_set.jsonl"
+let CANDIDATE_POOL = "shared/bench/drill_candidate_pool.jsonl"
+let META_PATH      = "shared/bench/drill_seed_meta.json"
+let VAULT_ROOT     = "shared/bench/drill_seeds_retired"
+
+let MAX_LIFESPAN   = 3
+let MIN_LEN        = 100
+let MAX_LEN        = 200
+let SIM_THRESHOLD  = "0.70"
+let VALID_KINDS    = ["positive", "negative", "closure", "diagonal"]
+let VALID_EXPECTED = ["saturation", "absorption"]
+
+// ── string helpers ──────────────────────────────────────────────
+
+fn str_index_of(hay, needle, from) {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return from }
+    let mut i = from
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn str_contains_any(hay, list) {
+    let mut i = 0
+    while i < len(list) {
+        if str_index_of(hay, list[i], 0) >= 0 { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn extract_json_string(text, key) {
+    let needle = "\"" + key + "\""
+    let kpos = str_index_of(text, needle, 0)
+    if kpos < 0 { return "" }
+    let after = kpos + len(needle)
+    let colon = str_index_of(text, ":", after)
+    if colon < 0 { return "" }
+    let open_q = str_index_of(text, "\"", colon)
+    if open_q < 0 { return "" }
+    let close_q = str_index_of(text, "\"", open_q + 1)
+    if close_q < 0 { return "" }
+    return text.substring(open_q + 1, close_q)
+}
+
+fn split_lines(text) {
+    let n = len(text)
+    let mut out = []
+    let mut start = 0
+    let mut i = 0
+    while i < n {
+        if text.substring(i, i + 1) == "\n" {
+            if i > start { out = out.push(text.substring(start, i)) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n { out = out.push(text.substring(start, n)) }
+    return out
+}
+
+// ── logging ─────────────────────────────────────────────────────
+
+fn now_stamp() { return exec("date +%Y-%m-%dT%H:%M:%S").trim() }
+fn log_info(msg) { println("[drill_seed_rotate " + now_stamp() + "] " + msg) }
+fn log_warn(msg) { println("[drill_seed_rotate " + now_stamp() + " WARN] " + msg) }
+
+// ── seed record ─────────────────────────────────────────────────
+
+fn seed_id(line)       { return extract_json_string(line, "id") }
+fn seed_kind(line)     { return extract_json_string(line, "kind") }
+fn seed_text(line)     { return extract_json_string(line, "text") }
+fn seed_expected(line) { return extract_json_string(line, "expected") }
+
+// ── meta (usage_count / last_used_round / success_rate) ─────────
+//
+// Single-line-per-seed flat form to keep the deterministic parser
+// trivial. Shape: {"seeds":[ {"id":"seed_pos_01","uc":3,"lur":13,"sr":"0.83"}, ... ]}
+
+fn meta_usage_count(meta_text, id) {
+    // Locate the per-id block then read "uc".
+    let id_needle = "\"id\":\"" + id + "\""
+    let pos = str_index_of(meta_text, id_needle, 0)
+    if pos < 0 { return 0 }
+    let slice_end = str_index_of(meta_text, "}", pos)
+    if slice_end < 0 { return 0 }
+    let block = meta_text.substring(pos, slice_end + 1)
+    let uc_needle = "\"uc\":"
+    let uc_pos = str_index_of(block, uc_needle, 0)
+    if uc_pos < 0 { return 0 }
+    // Shell-parse numeric tail.
+    let after = uc_pos + len(uc_needle)
+    let tail = block.substring(after, len(block))
+    // Strip until first non-digit.
+    let n = len(tail)
+    let mut i = 0
+    let mut digits = ""
+    while i < n {
+        let c = tail.substring(i, i + 1)
+        if c >= "0" && c <= "9" { digits = digits + c } else { if len(digits) > 0 { break } }
+        i = i + 1
+    }
+    if len(digits) == 0 { return 0 }
+    let v = exec("echo " + digits).trim()
+    return v
+}
+
+fn meta_has_id(meta_text, id) {
+    return str_index_of(meta_text, "\"id\":\"" + id + "\"", 0) >= 0
+}
+
+fn uc_ge_max(uc_str) {
+    let r = exec("[ " + uc_str + " -ge " + str(MAX_LIFESPAN) + " ] && echo yes || echo no").trim()
+    return r == "yes"
+}
+
+// ── Jaccard (3-gram) similarity via shell for determinism ───────
+
+fn normalize_text(t) {
+    // lowercase + collapse non-alnum to space
+    return exec("printf %s " + shell_quote(t)
+        + " | tr '[:upper:]' '[:lower:]'"
+        + " | tr -c 'a-z0-9' ' ' | tr -s ' '").trim()
+}
+
+fn shell_quote(s) {
+    // single-quote safe: replace ' with '"'"' then wrap.
+    // Hexa safe subset: use exec to do the escaping.
+    return "'" + replace_all(s, "'", "'\"'\"'") + "'"
+}
+
+fn replace_all(s, find, repl) {
+    let mut out = ""
+    let n = len(s)
+    let fn_ = len(find)
+    if fn_ == 0 { return s }
+    let mut i = 0
+    while i <= n - fn_ {
+        if s.substring(i, i + fn_) == find {
+            out = out + repl
+            i = i + fn_
+        } else {
+            out = out + s.substring(i, i + 1)
+            i = i + 1
+        }
+    }
+    if i < n { out = out + s.substring(i, n) }
+    return out
+}
+
+fn trigrams_joined(norm) {
+    // Produce newline-joined 3-char n-grams from normalized string.
+    // Via shell awk for determinism.
+    return exec("printf %s " + shell_quote(norm)
+        + " | awk '{for(i=1;i<=length($0)-2;i++) print substr($0,i,3)}' | sort -u").trim()
+}
+
+fn jaccard_ge_threshold(text_a, text_b, thresh) {
+    let na = normalize_text(text_a)
+    let nb = normalize_text(text_b)
+    if len(na) < 3 || len(nb) < 3 { return false }
+    let ta = trigrams_joined(na)
+    let tb = trigrams_joined(nb)
+    // Write to temp files + use comm for intersection + union.
+    let ta_f = "/tmp/_drill_seed_a.txt"
+    let tb_f = "/tmp/_drill_seed_b.txt"
+    write_file(ta_f, ta + "\n")
+    write_file(tb_f, tb + "\n")
+    let inter = exec("comm -12 " + ta_f + " " + tb_f + " | wc -l | tr -d ' '").trim()
+    let uni   = exec("cat " + ta_f + " " + tb_f + " | sort -u | wc -l | tr -d ' '").trim()
+    if uni == "0" { return false }
+    // Compare inter/uni >= thresh using awk numeric.
+    let r = exec("awk 'BEGIN{ if (" + inter + "/" + uni + " >= " + thresh + ") print \"yes\"; else print \"no\" }'").trim()
+    return r == "yes"
+}
+
+// ── quality gate (deterministic, numeric) ───────────────────────
+
+fn in_list(v, lst) {
+    let mut i = 0
+    while i < len(lst) {
+        if lst[i] == v { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn len_in_range(t) {
+    let r = exec("[ " + str(len(t)) + " -ge " + str(MIN_LEN)
+              + " ] && [ " + str(len(t)) + " -le " + str(MAX_LEN)
+              + " ] && echo yes || echo no").trim()
+    return r == "yes"
+}
+
+fn gate_check(line, existing_texts) {
+    let id = seed_id(line)
+    let kind = seed_kind(line)
+    let text = seed_text(line)
+    let exp = seed_expected(line)
+    let mut reasons = []
+
+    if len(id) == 0 { reasons = reasons.push("G0 missing id") }
+    if !len_in_range(text) {
+        reasons = reasons.push("G1 length=" + str(len(text))
+            + " not in [" + str(MIN_LEN) + "," + str(MAX_LEN) + "]")
+    }
+    if !in_list(kind, VALID_KINDS) { reasons = reasons.push("G2 kind='" + kind + "' invalid") }
+    if !in_list(exp, VALID_EXPECTED) { reasons = reasons.push("G3 expected='" + exp + "' invalid") }
+
+    // G4 semantic dedup.
+    let mut i = 0
+    let mut dup = ""
+    while i < len(existing_texts) {
+        if jaccard_ge_threshold(text, existing_texts[i], SIM_THRESHOLD) {
+            dup = existing_texts[i]
+            break
+        }
+        i = i + 1
+    }
+    if len(dup) > 0 {
+        reasons = reasons.push("G4 similarity >= " + SIM_THRESHOLD + " vs existing")
+    }
+
+    return reasons
+}
+
+// ── vault ops ───────────────────────────────────────────────────
+
+fn ensure_vault_dir(round_n) {
+    let dir = VAULT_ROOT + "/round_" + round_n
+    let _ = exec("mkdir -p " + dir)
+    return dir
+}
+
+fn archive_seed(line, round_n) {
+    let dir = ensure_vault_dir(round_n)
+    let id = seed_id(line)
+    let path = dir + "/seed_" + id + ".jsonl"
+    write_file(path, line + "\n")
+    return path
+}
+
+// ── rotate ──────────────────────────────────────────────────────
+
+fn load_lines(path) {
+    if !file_exists(path) { return [] }
+    return split_lines(read_file(path))
+}
+
+fn cmd_rotate(round_n, confirm) {
+    log_info("rotate round=" + round_n + " confirm=" + str(confirm))
+
+    let active = load_lines(ACTIVE_SEEDS)
+    let candidates = load_lines(CANDIDATE_POOL)
+    let meta_text = if file_exists(META_PATH) { read_file(META_PATH) } else { "{\"seeds\":[]}" }
+
+    log_info("active=" + str(len(active)) + " candidates=" + str(len(candidates)))
+
+    // Partition active -> kept vs retired (usage_count >= MAX_LIFESPAN).
+    let mut kept = []
+    let mut retired = []
+    let mut kept_texts = []
+    let mut i = 0
+    while i < len(active) {
+        let line = active[i]
+        let id = seed_id(line)
+        let uc = meta_usage_count(meta_text, id)
+        let uc_str = if meta_has_id(meta_text, id) { uc } else { "0" }
+        if meta_has_id(meta_text, id) && uc_ge_max(uc_str) {
+            retired = retired.push(line)
+            log_info("RETIRE id=" + id + " usage_count=" + uc_str)
+        } else {
+            kept = kept.push(line)
+            kept_texts = kept_texts.push(seed_text(line))
+        }
+        i = i + 1
+    }
+
+    // Archive retired into vault.
+    let mut ri = 0
+    while ri < len(retired) {
+        if confirm {
+            let p = archive_seed(retired[ri], round_n)
+            log_info("  vault: " + p)
+        } else {
+            log_info("  (dry-run) would archive id=" + seed_id(retired[ri]))
+        }
+        ri = ri + 1
+    }
+
+    // Gate candidates.
+    let mut promoted = []
+    let mut rejected = 0
+    let mut ci = 0
+    while ci < len(candidates) {
+        let cand = candidates[ci]
+        if len(cand) == 0 { ci = ci + 1 ; continue }
+        let reasons = gate_check(cand, kept_texts)
+        let id = seed_id(cand)
+        if len(reasons) == 0 {
+            promoted = promoted.push(cand)
+            kept_texts = kept_texts.push(seed_text(cand))
+            log_info("PROMOTE id=" + id)
+        } else {
+            rejected = rejected + 1
+            let mut rs = ""
+            let mut rj = 0
+            while rj < len(reasons) {
+                if rj > 0 { rs = rs + "; " }
+                rs = rs + reasons[rj]
+                rj = rj + 1
+            }
+            log_warn("REJECT id=" + id + " reasons=[" + rs + "]")
+        }
+        ci = ci + 1
+    }
+
+    // Compose new active set = kept ++ promoted.
+    let mut new_set = ""
+    let mut k = 0
+    while k < len(kept) { new_set = new_set + kept[k] + "\n" ; k = k + 1 }
+    let mut p2 = 0
+    while p2 < len(promoted) { new_set = new_set + promoted[p2] + "\n" ; p2 = p2 + 1 }
+
+    if confirm {
+        // Backup existing, then write.
+        if file_exists(ACTIVE_SEEDS) {
+            let _ = exec("cp " + ACTIVE_SEEDS + " " + ACTIVE_SEEDS + ".pre_rotate_r" + round_n)
+        }
+        write_file(ACTIVE_SEEDS, new_set)
+        log_info("wrote " + ACTIVE_SEEDS + " (kept=" + str(len(kept))
+            + " promoted=" + str(len(promoted)) + ")")
+    } else {
+        log_info("(dry-run) would write " + str(len(kept) + len(promoted)) + " seeds")
+    }
+
+    println("")
+    println("=== summary round=" + round_n + " ===")
+    println("  retired:  " + str(len(retired)))
+    println("  kept:     " + str(len(kept)))
+    println("  promoted: " + str(len(promoted)))
+    println("  rejected: " + str(rejected))
+    println("  mode:     " + (if confirm { "CONFIRM" } else { "DRY-RUN" }))
+
+    if confirm { exit(0) } else { exit(0) }
+}
+
+fn cmd_status(round_n) {
+    log_info("status round=" + round_n)
+    let active = load_lines(ACTIVE_SEEDS)
+    let meta_text = if file_exists(META_PATH) { read_file(META_PATH) } else { "{\"seeds\":[]}" }
+    println("id                      kind        uc   status")
+    let mut i = 0
+    while i < len(active) {
+        let line = active[i]
+        let id = seed_id(line)
+        let kind = seed_kind(line)
+        let uc = if meta_has_id(meta_text, id) { meta_usage_count(meta_text, id) } else { "0" }
+        let status = if meta_has_id(meta_text, id) && uc_ge_max(uc) { "EXPIRED" } else { "active" }
+        println("  " + id + "  " + kind + "  uc=" + str(uc) + "  " + status)
+        i = i + 1
+    }
+    exit(0)
+}
+
+fn cmd_gate(path) {
+    log_info("gate " + path)
+    if !file_exists(path) {
+        log_warn("missing: " + path)
+        exit(2)
+    }
+    let existing = load_lines(ACTIVE_SEEDS)
+    let mut existing_texts = []
+    let mut i = 0
+    while i < len(existing) {
+        existing_texts = existing_texts.push(seed_text(existing[i]))
+        i = i + 1
+    }
+    let cands = load_lines(path)
+    let mut fail = 0
+    let mut j = 0
+    while j < len(cands) {
+        let c = cands[j]
+        if len(c) == 0 { j = j + 1 ; continue }
+        let reasons = gate_check(c, existing_texts)
+        let id = seed_id(c)
+        if len(reasons) == 0 {
+            println("PASS " + id)
+        } else {
+            fail = fail + 1
+            let mut rs = ""
+            let mut k = 0
+            while k < len(reasons) {
+                if k > 0 { rs = rs + "; " }
+                rs = rs + reasons[k]
+                k = k + 1
+            }
+            println("FAIL " + id + "  " + rs)
+        }
+        j = j + 1
+    }
+    if fail == 0 { exit(0) } else { exit(1) }
+}
+
+// ── arg parsing ─────────────────────────────────────────────────
+
+fn get_flag(argv, name) {
+    let mut i = 2
+    while i < len(argv) {
+        if argv[i] == name && i + 1 < len(argv) { return argv[i + 1] }
+        i = i + 1
+    }
+    return ""
+}
+
+fn has_flag(argv, name) {
+    let mut i = 2
+    while i < len(argv) {
+        if argv[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn main() {
+    let argv = args()
+    if len(argv) < 3 {
+        println("usage:")
+        println("  drill_seed_rotate rotate  --round <N> [--confirm]")
+        println("  drill_seed_rotate status  --round <N>")
+        println("  drill_seed_rotate gate    <candidate.jsonl>")
+        exit(2)
+    }
+    let cmd = argv[2]
+    if cmd == "rotate" {
+        let r = get_flag(argv, "--round")
+        if len(r) == 0 { log_warn("--round required") ; exit(2) }
+        cmd_rotate(r, has_flag(argv, "--confirm"))
+    } else if cmd == "status" {
+        let r = get_flag(argv, "--round")
+        if len(r) == 0 { log_warn("--round required") ; exit(2) }
+        cmd_status(r)
+    } else if cmd == "gate" {
+        if len(argv) < 4 { log_warn("gate requires <path>") ; exit(2) }
+        cmd_gate(argv[3])
+    } else {
+        log_warn("unknown cmd: " + cmd)
+        exit(2)
+    }
+}

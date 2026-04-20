@@ -1,0 +1,312 @@
+// tool/drill_calibrate.hexa -- drill criteria dynamic calibration
+//
+// PURPOSE
+//   Replace the "임의 fix" thresholds (absorption_rate_max=0.3,
+//   diagonal_agreement_min=0.8) with a baseline-driven, audit-logged
+//   calibration pipeline. Prevents the "PASS 안 뜨면 낮추자" hack by
+//   enforcing 30+ round history + 2-signer review for any loosening edit.
+//
+// SUBCOMMANDS
+//   collect  --round N --dest D --absorption A --diag_agreement G
+//            [--saturation_state S]
+//       Appends one measurement to shared/state/drill_baseline_history.jsonl.
+//       Idempotent: (dest, round_n) key never duplicated.
+//
+//   suggest  [--percentile P]
+//       Reads history, emits p10 absorption_rate_max (upper bound: higher
+//       observed absorption is tolerated only at the 10th percentile),
+//       and p10 diagonal_agreement_min (lower bound: floor of observed
+//       agreements). Requires >= 30 rows or exits 2.
+//
+//   apply    --field F --value V --signer S1 [--signer S2] --reason R
+//       Edits shared/bench/drill_breakthrough_criteria.json in place and
+//       appends a row to shared/state/drill_criteria_audit.jsonl.
+//       LOOSENING (absorption_rate_max UP, diagonal_agreement_min DOWN,
+//       depth_min DOWN, diag_min DOWN) REQUIRES 2 DISTINCT SIGNERS.
+//       STRICTENING needs 1. --reason is mandatory in both paths.
+//
+//   verify   (implicit; called by drill_breakthrough_runner on startup)
+//       Recomputes audit hash chain. Exits 0 on integrity, 3 on tamper.
+//
+// FILES
+//   shared/state/drill_baseline_history.jsonl  (append-only measurements)
+//   shared/state/drill_criteria_audit.jsonl    (append-only threshold deltas)
+//   shared/bench/drill_breakthrough_criteria.json (SSOT, mutated by apply)
+//
+// CONSTRAINTS
+//   - V8 SAFE_COMMIT: additive tool + 2 new state files; criteria.json
+//     untouched on this landing (initial audit row seeds current values).
+//   - No mass rewrites, no side-effects outside the 3 listed paths.
+
+let CRITERIA_PATH = "shared/bench/drill_breakthrough_criteria.json"
+let HISTORY_PATH  = "shared/state/drill_baseline_history.jsonl"
+let AUDIT_PATH    = "shared/state/drill_criteria_audit.jsonl"
+
+// Fields classified by direction. "loosen_up"   means: raising the value
+// weakens the gate (e.g. absorption_rate_max). "loosen_down" means lowering
+// the value weakens the gate (e.g. diagonal_agreement_min, depth_min,
+// saturation_policy.diag_min).
+fn is_loosening(field: string, old_v: string, new_v: string) -> bool {
+    let o = to_float(old_v)
+    let n = to_float(new_v)
+    if field == "absorption_rate_max" { return n > o }
+    if field == "diagonal_agreement_min" { return n < o }
+    if field == "depth_min" { return n < o }
+    if field == "saturation_policy.diag_min" { return n < o }
+    if field == "saturation_policy.eps_tol" { return n > o }
+    // unknown field: treat as loosening -- fail safe.
+    return true
+}
+
+// --- append-only helpers ---
+
+fn append_jsonl(path: string, row: string) {
+    let prior = if file_exists(path) { read_file(path) } else { "" }
+    write_file(path, prior + row + "\n")
+}
+
+fn read_lines(path: string) -> list<string> {
+    if !file_exists(path) { return [] }
+    let body = read_file(path)
+    return body.split("\n")
+}
+
+// --- collect ---
+
+fn cmd_collect(argv: list<string>) -> int {
+    let round_n = arg_get(argv, "--round", "")
+    let dest    = arg_get(argv, "--dest", "")
+    let abs_s   = arg_get(argv, "--absorption", "")
+    let diag_s  = arg_get(argv, "--diag_agreement", "")
+    let sat_s   = arg_get(argv, "--saturation_state", "unknown")
+    if round_n == "" || dest == "" || abs_s == "" || diag_s == "" {
+        println("collect: --round, --dest, --absorption, --diag_agreement required")
+        return 2
+    }
+    // idempotency: reject duplicate (dest, round_n)
+    let lines = read_lines(HISTORY_PATH)
+    let key = "\"dest\":\"" + dest + "\",\"round_n\":\"" + round_n + "\""
+    let mut i = 0
+    while i < lines.len() {
+        if lines[i].contains(key) {
+            println("collect: duplicate (dest=" + dest + ", round=" + round_n + ") -- skip")
+            return 0
+        }
+        i = i + 1
+    }
+    let row = "{\"dest\":\"" + dest + "\",\"round_n\":\"" + round_n + "\","
+            + "\"absorption_rate\":" + abs_s + ","
+            + "\"diagonal_agreement\":" + diag_s + ","
+            + "\"saturation_state\":\"" + sat_s + "\","
+            + "\"ts\":\"" + now_iso() + "\"}"
+    append_jsonl(HISTORY_PATH, row)
+    println("collect: appended dest=" + dest + " round=" + round_n)
+    return 0
+}
+
+// --- suggest ---
+
+fn parse_field(row: string, field: string) -> float {
+    // minimal "key":value extractor; assumes numeric unquoted value.
+    let needle = "\"" + field + "\":"
+    let idx = row.index_of(needle)
+    if idx < 0 { return -1.0 }
+    let tail = row.substr(idx + needle.len(), row.len())
+    let comma = tail.index_of(",")
+    let brace = tail.index_of("}")
+    let cut = if comma >= 0 && (comma < brace || brace < 0) { comma } else { brace }
+    let raw = if cut >= 0 { tail.substr(0, cut) } else { tail }
+    return to_float(raw)
+}
+
+fn percentile(values: list<float>, p: float) -> float {
+    let sorted = sort_asc(values)
+    let n = sorted.len()
+    if n == 0 { return 0.0 }
+    let rank = int(p * float(n - 1))
+    return sorted[rank]
+}
+
+fn cmd_suggest(argv: list<string>) -> int {
+    let p_abs = to_float(arg_get(argv, "--percentile_abs", "0.9"))
+    let p_dg  = to_float(arg_get(argv, "--percentile_diag", "0.1"))
+    let lines = read_lines(HISTORY_PATH)
+    let mut abs_vals: list<float> = []
+    let mut dg_vals: list<float> = []
+    let mut i = 0
+    while i < lines.len() {
+        let ln = lines[i]
+        if ln.len() > 0 {
+            let a = parse_field(ln, "absorption_rate")
+            let g = parse_field(ln, "diagonal_agreement")
+            if a >= 0.0 { abs_vals = abs_vals.push(a) }
+            if g >= 0.0 { dg_vals  = dg_vals.push(g) }
+        }
+        i = i + 1
+    }
+    if abs_vals.len() < 30 {
+        println("suggest: insufficient history (" + str(abs_vals.len()) + "/30)")
+        return 2
+    }
+    // absorption: use UPPER percentile so cap tolerates high-noise rounds
+    //             but NOT outliers -- p90 not p100.
+    let abs_cap  = percentile(abs_vals, p_abs)
+    // diagonal_agreement: use LOWER percentile so the floor rejects only
+    //                     the worst 10% of rounds.
+    let dg_floor = percentile(dg_vals, p_dg)
+    println("suggest:")
+    println("  rows=" + str(abs_vals.len()))
+    println("  absorption_rate_max    (p" + str(int(p_abs*100.0)) + ")= " + str(abs_cap))
+    println("  diagonal_agreement_min (p" + str(int(p_dg*100.0))  + ")= " + str(dg_floor))
+    println("  NOTE: apply requires --signer + --reason; loosening requires 2 signers")
+    return 0
+}
+
+// --- apply ---
+
+fn chain_prev_hash() -> string {
+    let lines = read_lines(AUDIT_PATH)
+    let mut i = lines.len() - 1
+    while i >= 0 {
+        if lines[i].len() > 0 {
+            let h = parse_field_str(lines[i], "hash")
+            if h != "" { return h }
+        }
+        i = i - 1
+    }
+    return "GENESIS"
+}
+
+fn parse_field_str(row: string, field: string) -> string {
+    let needle = "\"" + field + "\":\""
+    let idx = row.index_of(needle)
+    if idx < 0 { return "" }
+    let tail = row.substr(idx + needle.len(), row.len())
+    let end = tail.index_of("\"")
+    return if end >= 0 { tail.substr(0, end) } else { "" }
+}
+
+fn cmd_apply(argv: list<string>) -> int {
+    let field    = arg_get(argv, "--field", "")
+    let value    = arg_get(argv, "--value", "")
+    let signer1  = arg_get(argv, "--signer", "")
+    let signer2  = arg_get(argv, "--signer2", "")
+    let reason   = arg_get(argv, "--reason", "")
+    if field == "" || value == "" || signer1 == "" || reason == "" {
+        println("apply: --field, --value, --signer, --reason required")
+        return 2
+    }
+    let crit = read_file(CRITERIA_PATH)
+    let old_v_s = str(parse_field(crit, field))
+    let loosening = is_loosening(field, old_v_s, value)
+    if loosening && signer2 == "" {
+        println("apply: LOOSENING edit on " + field + " requires 2 signers (--signer + --signer2)")
+        return 3
+    }
+    if loosening && signer1 == signer2 {
+        println("apply: 2 signers must be DISTINCT (got " + signer1 + " twice)")
+        return 3
+    }
+    // history gate: loosening also requires >= 30 rows of baseline evidence
+    if loosening {
+        let rows = read_lines(HISTORY_PATH)
+        if rows.len() < 30 {
+            println("apply: loosening requires >=30 rows in history (have "
+                    + str(rows.len()) + ")")
+            return 3
+        }
+    }
+    // edit criteria.json  (naive key-value replace; field must be top-level numeric)
+    let needle = "\"" + field + "\":"
+    let idx = crit.index_of(needle)
+    if idx < 0 {
+        println("apply: field not found in criteria: " + field)
+        return 4
+    }
+    let head = crit.substr(0, idx + needle.len())
+    let tail = crit.substr(idx + needle.len(), crit.len())
+    let comma = tail.index_of(",")
+    let brace = tail.index_of("\n")
+    let cut = if comma >= 0 && (comma < brace || brace < 0) { comma } else { brace }
+    let rest = tail.substr(cut, tail.len())
+    let new_crit = head + " " + value + rest
+    write_file(CRITERIA_PATH, new_crit)
+    // audit row with hash chain
+    let prev = chain_prev_hash()
+    let signers = if signer2 != "" { signer1 + "," + signer2 } else { signer1 }
+    let body = "\"field\":\"" + field + "\","
+             + "\"old\":" + old_v_s + ","
+             + "\"new\":" + value + ","
+             + "\"loosening\":" + str(loosening) + ","
+             + "\"signers\":\"" + signers + "\","
+             + "\"reason\":\"" + reason + "\","
+             + "\"prev\":\"" + prev + "\","
+             + "\"ts\":\"" + now_iso() + "\""
+    let h = sha256(body)
+    let row = "{" + body + ",\"hash\":\"" + h + "\"}"
+    append_jsonl(AUDIT_PATH, row)
+    println("apply: " + field + " " + old_v_s + " -> " + value
+            + " (loosening=" + str(loosening) + ", signers=" + signers + ")")
+    return 0
+}
+
+// --- verify ---
+
+fn cmd_verify(_argv: list<string>) -> int {
+    let lines = read_lines(AUDIT_PATH)
+    let mut prev = "GENESIS"
+    let mut i = 0
+    while i < lines.len() {
+        let ln = lines[i]
+        if ln.len() > 0 {
+            let claimed_prev = parse_field_str(ln, "prev")
+            if claimed_prev != prev {
+                println("verify: chain break at row " + str(i)
+                        + " (expected prev=" + prev + ", got " + claimed_prev + ")")
+                return 3
+            }
+            // recompute hash of body (strip the trailing ,"hash":"...") and compare
+            let hmark = ",\"hash\":\""
+            let hidx = ln.index_of(hmark)
+            if hidx < 0 { return 3 }
+            let body = ln.substr(1, hidx)  // drop leading '{'
+            let claimed_hash = parse_field_str(ln, "hash")
+            if sha256(body) != claimed_hash {
+                println("verify: hash mismatch at row " + str(i))
+                return 3
+            }
+            prev = claimed_hash
+        }
+        i = i + 1
+    }
+    println("verify: audit chain OK (" + str(lines.len()) + " rows)")
+    return 0
+}
+
+// --- arg helper ---
+
+fn arg_get(argv: list<string>, key: string, dflt: string) -> string {
+    let mut i = 0
+    while i < argv.len() - 1 {
+        if argv[i] == key { return argv[i + 1] }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn main() {
+    let argv = args()
+    let sub = if argv.len() > 1 { argv[1] } else { "" }
+    if sub == "collect"      { exit(cmd_collect(argv)) }
+    else if sub == "suggest" { exit(cmd_suggest(argv)) }
+    else if sub == "apply"   { exit(cmd_apply(argv)) }
+    else if sub == "verify"  { exit(cmd_verify(argv)) }
+    else {
+        println("drill_calibrate — dynamic criteria calibration")
+        println("  subcommands: collect | suggest | apply | verify")
+        println("  history: " + HISTORY_PATH)
+        println("  audit:   " + AUDIT_PATH)
+        println("  ssot:    " + CRITERIA_PATH)
+        exit(2)
+    }
+}
