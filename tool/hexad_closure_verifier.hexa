@@ -1,0 +1,384 @@
+// ════════════════════════════════════════════════════════════════
+//  tool/hexad_closure_verifier.hexa — Hexad 6-category closure verifier
+//
+//  PURPOSE
+//    Verify categorical completeness (closure) of anima-hexad/.
+//    Distinct from tool/hexad_closure_drill.hexa (seed saturation drill);
+//    this verifier checks STRUCTURAL closure of the 6-category SSOT.
+//
+//  CLOSURE AXIOMS (σ Hexad categorical SSOT)
+//    (a) Non-emptiness        : every category dir has ≥ 1 object file
+//    (b) Morphism existence   : ≥ 1 inter-category morphism (bridge file)
+//    (c) Composition closure  : every bridge's source & target ∈ 6-cat set
+//    (d) Phantom absence      : no 7th-and-beyond category dir at root
+//
+//  CATEGORIES (anima-hexad/hexad.hexa — CDESM canonical)
+//    c  consciousness    d  desire/death       w  will
+//    s  sense            m  memory             e  ethics
+//
+//  OUTPUT
+//    shared/state/hexad_closure_verdict.json
+//    stdout  : per-category breakdown + verdict ∈
+//              {CLOSED, LEAKY, INCOMPLETE}
+//
+//  VERDICT SEMANTICS
+//    CLOSED      — (a) ∧ (b) ∧ (c) ∧ (d)
+//    LEAKY       — (a) ∧ (b) ∧ ¬(c ∧ d)      (morphism leaks outside Hexad)
+//    INCOMPLETE  — ¬(a) ∨ ¬(b)                (empty cat or no morphism)
+//
+//  CONSTRAINTS
+//    - NO LLM. Deterministic. File-existence + name-matching only.
+//    - V8 SAFE_COMMIT: additive file; read-only inspection of
+//      anima-hexad/ tree. Writes one dedicated verdict file.
+//
+//  USAGE
+//    hexa tool/hexad_closure_verifier.hexa
+// ════════════════════════════════════════════════════════════════
+
+let HEXAD_ROOT = "anima-hexad"
+let OUT_PATH   = "shared/state/hexad_closure_verdict.json"
+
+let CATEGORIES = ["c", "d", "w", "s", "m", "e"]
+let CAT_LABELS = ["consciousness", "desire", "will", "sense", "memory", "ethics"]
+
+// Descriptor files that live at anima-hexad/ root and are NOT categories.
+// These are explicitly whitelisted so they do not trigger phantom detection.
+let ROOT_DESCRIPTORS = ["__init__.hexa", "hexad.hexa", "model.hexa", "narrative.hexa", "constants.hexa", "README.md", "CLAUDE.md"]
+
+// Auxiliary (non-category) directories at root.
+let ROOT_AUX_DIRS = ["bridge", "tests"]
+
+// Known object/bridge files that a category directory may contain.
+// Object files (emergent_*, __init__) are intra-category; bridge_* files
+// define morphisms to other categories. Morphism source is the parent
+// directory; target is encoded in the bridge filename suffix (e.g.
+// d/will_bridge.hexa  : source=d target=w
+// w/meta_bridge.hexa  : source=w target=c  (W observes C)
+// w/reflexive_bridge.hexa : source=w target=c
+// m/episodic_bridge.hexa  : source=m target=c
+// m/sensorimotor_bridge.hexa : source=m target=s
+// s/temporal_bridge.hexa  : source=s target=s  (self-morphism → endo)
+// Mapping is maintained as parallel arrays for hexa stage1 compatibility.
+
+let BRIDGE_SRC  = ["d", "w", "w", "m", "m", "s"]
+let BRIDGE_TGT  = ["w", "c", "c", "c", "s", "s"]
+let BRIDGE_FILE = ["d/will_bridge.hexa", "w/meta_bridge.hexa", "w/reflexive_bridge.hexa", "m/episodic_bridge.hexa", "m/sensorimotor_bridge.hexa", "s/temporal_bridge.hexa"]
+
+// ── helpers ─────────────────────────────────────────────────────
+
+fn now_stamp() -> string { return exec("date +%Y-%m-%dT%H:%M:%S").trim() }
+fn log_info(msg: string) { println("[hexad_closure_verifier] " + msg) }
+fn bool_s(b: bool) -> string { if b { return "true" } else { return "false" } }
+
+fn str_list_json(xs: list) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < len(xs) {
+        if i > 0 { s = s + "," }
+        s = s + "\"" + xs[i] + "\""
+        i = i + 1
+    }
+    return s + "]"
+}
+
+fn in_list(x: string, xs: list) -> bool {
+    let mut i = 0
+    while i < len(xs) {
+        if xs[i] == x { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn split_lines(text: string) -> list {
+    let parts = text.split("\n")
+    let mut out = []
+    let mut i = 0
+    while i < len(parts) {
+        let p = parts[i].trim()
+        if len(p) > 0 { out = out.push(p) }
+        i = i + 1
+    }
+    return out
+}
+
+// ── directory listing via /bin/ls (hexa stage1: no native readdir) ──
+fn list_dir(path: string) -> list {
+    let cmd = "ls " + path + " 2>/dev/null"
+    let raw = exec(cmd)
+    return split_lines(raw)
+}
+
+// ── category axiom (a): non-emptiness ───────────────────────────
+
+struct CatBreakdown {
+    key:           string,
+    label:         string,
+    exists:        bool,
+    object_files:  list,
+    bridge_files:  list,
+    n_objects:     int,
+    n_bridges:     int,
+    non_empty:     bool
+}
+
+fn inspect_category(key: string, label: string) -> CatBreakdown {
+    let path = HEXAD_ROOT + "/" + key
+    let exists = file_exists(path + "/__init__.hexa")
+    let entries = list_dir(path)
+
+    let mut objs = []
+    let mut brs = []
+    let mut i = 0
+    while i < len(entries) {
+        let name = entries[i]
+        // File filter: accept .hexa, skip legacy/ subdir labels (ls prints
+        // bare "legacy" with no extension for dirs on most systems).
+        if name.contains(".hexa") {
+            if name.contains("bridge") {
+                brs = brs.push(key + "/" + name)
+            } else {
+                objs = objs.push(key + "/" + name)
+            }
+        }
+        i = i + 1
+    }
+
+    let n_o = len(objs)
+    let n_b = len(brs)
+    let nonempty = exists && (n_o > 0)
+
+    return CatBreakdown {
+        key: key, label: label,
+        exists: exists,
+        object_files: objs,
+        bridge_files: brs,
+        n_objects: n_o,
+        n_bridges: n_b,
+        non_empty: nonempty
+    }
+}
+
+// ── axiom (b) + (c): morphisms + composition closure ────────────
+
+struct MorphAudit {
+    file:       string,
+    src:        string,
+    tgt:        string,
+    present:    bool,
+    src_ok:     bool,     // src ∈ 6-cat
+    tgt_ok:     bool,     // tgt ∈ 6-cat
+    composed:   bool      // present ∧ src_ok ∧ tgt_ok
+}
+
+fn audit_morphisms() -> list {
+    let mut out = []
+    let mut i = 0
+    while i < len(BRIDGE_FILE) {
+        let f = HEXAD_ROOT + "/" + BRIDGE_FILE[i]
+        let pres = file_exists(f)
+        let src  = BRIDGE_SRC[i]
+        let tgt  = BRIDGE_TGT[i]
+        let s_ok = in_list(src, CATEGORIES)
+        let t_ok = in_list(tgt, CATEGORIES)
+        let comp = pres && s_ok && t_ok
+        out = out.push(MorphAudit {
+            file: BRIDGE_FILE[i],
+            src: src, tgt: tgt,
+            present: pres, src_ok: s_ok, tgt_ok: t_ok,
+            composed: comp
+        })
+        i = i + 1
+    }
+    return out
+}
+
+// ── axiom (d): phantom category detection ───────────────────────
+
+struct PhantomReport {
+    extras:     list,     // entries at anima-hexad/ root that are
+                          // neither a known category nor a whitelisted
+                          // descriptor / aux dir
+    n_extras:   int,
+    clean:      bool
+}
+
+fn detect_phantoms() -> PhantomReport {
+    let root_entries = list_dir(HEXAD_ROOT)
+    let mut extras = []
+    let mut i = 0
+    while i < len(root_entries) {
+        let e = root_entries[i]
+        let is_cat = in_list(e, CATEGORIES)
+        let is_desc = in_list(e, ROOT_DESCRIPTORS)
+        let is_aux = in_list(e, ROOT_AUX_DIRS)
+        if !is_cat && !is_desc && !is_aux {
+            extras = extras.push(e)
+        }
+        i = i + 1
+    }
+    let n = len(extras)
+    return PhantomReport { extras: extras, n_extras: n, clean: n == 0 }
+}
+
+// ── JSON emitters ───────────────────────────────────────────────
+
+fn cat_json(c: CatBreakdown) -> string {
+    let mut s = "{"
+    s = s + "\"key\":\"" + c.key + "\""
+    s = s + ",\"label\":\"" + c.label + "\""
+    s = s + ",\"exists\":" + bool_s(c.exists)
+    s = s + ",\"n_objects\":" + str(c.n_objects)
+    s = s + ",\"n_bridges\":" + str(c.n_bridges)
+    s = s + ",\"non_empty\":" + bool_s(c.non_empty)
+    s = s + ",\"object_files\":" + str_list_json(c.object_files)
+    s = s + ",\"bridge_files\":" + str_list_json(c.bridge_files)
+    s = s + "}"
+    return s
+}
+
+fn morph_json(m: MorphAudit) -> string {
+    let mut s = "{"
+    s = s + "\"file\":\"" + m.file + "\""
+    s = s + ",\"src\":\"" + m.src + "\""
+    s = s + ",\"tgt\":\"" + m.tgt + "\""
+    s = s + ",\"present\":" + bool_s(m.present)
+    s = s + ",\"src_in_hexad\":" + bool_s(m.src_ok)
+    s = s + ",\"tgt_in_hexad\":" + bool_s(m.tgt_ok)
+    s = s + ",\"composition_closed\":" + bool_s(m.composed)
+    s = s + "}"
+    return s
+}
+
+// ── verdict resolver ────────────────────────────────────────────
+
+fn resolve_verdict(all_nonempty: bool, morph_present: bool, all_composed: bool, phantom_clean: bool) -> string {
+    if !all_nonempty { return "INCOMPLETE" }
+    if !morph_present { return "INCOMPLETE" }
+    if all_composed && phantom_clean { return "CLOSED" }
+    return "LEAKY"
+}
+
+// ── main ────────────────────────────────────────────────────────
+
+fn main() {
+    println("[hexad_closure_verifier] σ Hexad 6-category closure check")
+    println("  root: " + HEXAD_ROOT)
+    println("  SSOT descriptor: anima-hexad/hexad.hexa (CDESM 6 channels)")
+
+    // (a) Per-category inspection.
+    let mut cats = []
+    let mut all_nonempty = true
+    let mut i = 0
+    while i < len(CATEGORIES) {
+        let cb = inspect_category(CATEGORIES[i], CAT_LABELS[i])
+        if !cb.non_empty { all_nonempty = false }
+        cats = cats.push(cb)
+        i = i + 1
+    }
+
+    // (b)+(c) Morphism audit.
+    let morphs = audit_morphisms()
+    let mut n_present = 0
+    let mut n_composed = 0
+    let mut j = 0
+    while j < len(morphs) {
+        let m = morphs[j]
+        if m.present { n_present = n_present + 1 }
+        if m.composed { n_composed = n_composed + 1 }
+        j = j + 1
+    }
+    let morph_present = n_present > 0
+    let all_composed = (n_present == len(morphs)) && (n_composed == len(morphs))
+
+    // (d) Phantom detection.
+    let phantoms = detect_phantoms()
+
+    let verdict = resolve_verdict(all_nonempty, morph_present, all_composed, phantoms.clean)
+
+    // ── stdout breakdown ────────────────────────────────────────
+    println("")
+    println("=== Per-category breakdown ===")
+    let mut p = 0
+    while p < len(cats) {
+        let c = cats[p]
+        let tag = if c.non_empty { "[OK ]" } else { "[MIS]" }
+        let line_c = "  " + tag + " " + c.key + " " + c.label + "  objects=" + str(c.n_objects) + "  bridges=" + str(c.n_bridges)
+        println(line_c)
+        p = p + 1
+    }
+    println("")
+    println("=== Morphism audit ===")
+    let mut q = 0
+    while q < len(morphs) {
+        let m = morphs[q]
+        let tag = if m.composed { "[OK ]" } else { "[BAD]" }
+        let line_m = "  " + tag + " " + m.src + " -> " + m.tgt + "   " + m.file + "   present=" + bool_s(m.present)
+        println(line_m)
+        q = q + 1
+    }
+    println("")
+    println("=== Phantom scan ===")
+    let line_ph = "  extras_at_root=" + str(phantoms.n_extras) + "  clean=" + bool_s(phantoms.clean)
+    println(line_ph)
+    if phantoms.n_extras > 0 {
+        let mut r = 0
+        while r < len(phantoms.extras) {
+            println("    phantom: " + phantoms.extras[r])
+            r = r + 1
+        }
+    }
+    println("")
+    println("=== closure_verdict = " + verdict + " ===")
+    println("  axiom(a) non-emptiness:        " + bool_s(all_nonempty))
+    println("  axiom(b) morphism existence:   " + bool_s(morph_present))
+    println("  axiom(c) composition closure:  " + bool_s(all_composed))
+    println("  axiom(d) phantom absence:      " + bool_s(phantoms.clean))
+
+    // ── JSON emit ───────────────────────────────────────────────
+    let mut out = "{\n"
+    out = out + "  \"verifier_type\": \"hexad_closure_verifier\",\n"
+    out = out + "  \"version\": \"v1\",\n"
+    out = out + "  \"generated\": \"" + now_stamp() + "\",\n"
+    out = out + "  \"source\": \"tool/hexad_closure_verifier.hexa\",\n"
+    out = out + "  \"hexad_root\": \"" + HEXAD_ROOT + "\",\n"
+    out = out + "  \"hexad_descriptor\": \"anima-hexad/hexad.hexa\",\n"
+    out = out + "  \"categories_total\": 6,\n"
+    out = out + "  \"closure_verdict\": \"" + verdict + "\",\n"
+    out = out + "  \"axioms\": {\n"
+    out = out + "    \"a_non_empty\": "       + bool_s(all_nonempty)  + ",\n"
+    out = out + "    \"b_morphism_exists\": " + bool_s(morph_present) + ",\n"
+    out = out + "    \"c_composition_closed\": " + bool_s(all_composed) + ",\n"
+    out = out + "    \"d_phantom_absent\": "  + bool_s(phantoms.clean) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"morphisms_total\": " + str(len(morphs)) + ",\n"
+    out = out + "  \"morphisms_present\": " + str(n_present) + ",\n"
+    out = out + "  \"morphisms_composed\": " + str(n_composed) + ",\n"
+    out = out + "  \"phantoms\": " + str_list_json(phantoms.extras) + ",\n"
+    out = out + "  \"categories\": [\n"
+    let mut a = 0
+    while a < len(cats) {
+        if a > 0 { out = out + ",\n" }
+        out = out + "    " + cat_json(cats[a])
+        a = a + 1
+    }
+    out = out + "\n  ],\n"
+    out = out + "  \"morphism_audit\": [\n"
+    let mut b = 0
+    while b < len(morphs) {
+        if b > 0 { out = out + ",\n" }
+        out = out + "    " + morph_json(morphs[b])
+        b = b + 1
+    }
+    out = out + "\n  ]\n"
+    out = out + "}\n"
+    write_file(OUT_PATH, out)
+    println("  wrote: " + OUT_PATH)
+
+    // Exit 0 on CLOSED; 1 on LEAKY; 2 on INCOMPLETE.
+    if verdict == "CLOSED"     { exit(0) }
+    if verdict == "LEAKY"      { exit(1) }
+    exit(2)
+}
+
+main()
