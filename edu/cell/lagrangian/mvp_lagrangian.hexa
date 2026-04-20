@@ -1,0 +1,303 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  edu/cell/lagrangian/mvp_lagrangian.hexa
+//
+//  PURPOSE
+//    MVP harness: overlay the unified Lagrangian L_cell = T − V on the
+//    existing 4-gen crystallize corpus (commit 58aa75eb).
+//
+//        ws = [40, 125, 687, 1000]    (score_per_mille per gen)
+//
+//    Computes per-gen T_tension, V_structure(stub log-score), V_sync
+//    (sealed-fraction proxy), L_cell, and the stationary-action residual
+//    δS/δW.  Emits both an ASCII plot on stdout and a JSON cert.
+//
+//  STATIONARY ACTION CHECK
+//    If the 4-gen trajectory is a true extremal (fixpoint of the lattice
+//    dynamics), δS/δW should vanish at each gen or at least at the
+//    converged gen (gen 4, W = 1000‰).  We report both the per-gen
+//    residual and the L1 aggregate.
+//
+//  OUTPUT
+//    • stdout: header, ASCII plot of L-trajectory, EoM table, verdict
+//    • shared/state/edu_cell_lagrangian_mvp.json
+//
+//  CLI
+//    cd ~/core/anima
+//    hexa run edu/cell/lagrangian/mvp_lagrangian.hexa
+//
+//  RAW contract: raw#9 · hexa-only · LLM=none · deterministic.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── INLINED integrator primitives (byte-equivalent to
+//     edu/cell/lagrangian/l_cell_integrator.hexa).  Stage0 module loader is
+//     fragile, so we preserve a single implementation by inlining.  ──────────
+
+fn _mvp_t_tension_x1000(w_k: int, w_prev: int) -> int {
+    let dw = w_k - w_prev
+    let sq = dw * dw
+    return (sq / 2) / 1000
+}
+
+fn _mvp_ln_perm_x1000(x: int) -> int {
+    let mut v = x
+    if v <= 0   { v = 1 }
+    if v > 1000 { v = 1000 }
+    if v >= 1000 { return 0 }
+    if v >= 950  { return -51 }
+    if v >= 900  { return -105 }
+    if v >= 850  { return -163 }
+    if v >= 800  { return -223 }
+    if v >= 750  { return -288 }
+    if v >= 700  { return -357 }
+    if v >= 650  { return -431 }
+    if v >= 600  { return -511 }
+    if v >= 550  { return -598 }
+    if v >= 500  { return -693 }
+    if v >= 450  { return -799 }
+    if v >= 400  { return -916 }
+    if v >= 350  { return -1050 }
+    if v >= 300  { return -1204 }
+    if v >= 250  { return -1386 }
+    if v >= 200  { return -1609 }
+    if v >= 150  { return -1897 }
+    if v >= 100  { return -2303 }
+    if v >= 50   { return -2996 }
+    return -6908
+}
+
+fn _mvp_v_struct_x1000(w: int) -> int {
+    if w >= 1000 { return 0 }
+    let ratio = w
+    let ln_val = _mvp_ln_perm_x1000(ratio)
+    return 0 - ln_val
+}
+
+fn _mvp_v_sync_x1000(w: int) -> int {
+    let mut s = w
+    if s < 0    { s = 0 }
+    if s > 1000 { s = 1000 }
+    return 1000 - s
+}
+
+fn _mvp_partial_l_wrt_w(w: int) -> int {
+    let w_plus  = if w + 1 > 1000 { 1000 } else { w + 1 }
+    let w_minus = if w - 1 < 0    { 0    } else { w - 1 }
+    let v_plus  = _mvp_v_struct_x1000(w_plus)  + _mvp_v_sync_x1000(w_plus)
+    let v_minus = _mvp_v_struct_x1000(w_minus) + _mvp_v_sync_x1000(w_minus)
+    return 0 - ((v_plus - v_minus) / 2)
+}
+
+// ─── ASCII plot: 5-row bar chart of L-trajectory ────────────────────────
+
+fn _iabs(x: int) -> int { if x < 0 { return 0 - x } return x }
+
+fn _imax(a: int, b: int) -> int { if a > b { return a } return b }
+fn _imin(a: int, b: int) -> int { if a < b { return a } return b }
+
+// Render one row of the plot; width 40 char.
+fn _render_bar(l_x1000: int, l_min: int, l_max: int) -> string {
+    let width = 40
+    let span  = l_max - l_min
+    if span <= 0 {
+        let mut s = ""
+        let mut i = 0
+        while i < width {
+            s = s + "="
+            i = i + 1
+        }
+        return s
+    }
+    let pos = ((l_x1000 - l_min) * width) / span
+    let mut s = ""
+    let mut i = 0
+    while i < width {
+        if i < pos { s = s + "#" } else { s = s + "." }
+        i = i + 1
+    }
+    return s
+}
+
+// ─── main ────────────────────────────────────────────────────────────────
+
+fn main() {
+    println("=== edu/cell unified Lagrangian MVP (L = T - V) ===")
+    println("corpus: 4-gen crystallize (commit 58aa75eb)")
+    println("ws (score_per_mille): [40, 125, 687, 1000]")
+    println("")
+
+    // 4-gen ws from shared/state/edu_cell_4gen_crystallize.json
+    let ws = [40, 125, 687, 1000]
+    let n  = ws.len()
+
+    // Per-gen breakdown
+    let mut l_vals    = []
+    let mut t_vals    = []
+    let mut vs_vals   = []
+    let mut vsy_vals  = []
+    let mut dsdw_vals = []
+
+    let mut action = 0
+    let mut residual_l1 = 0
+
+    let mut i = 0
+    while i < n {
+        let t = if i == 0 { 0 } else { _mvp_t_tension_x1000(ws[i], ws[i - 1]) }
+        let vs = _mvp_v_struct_x1000(ws[i])
+        let vy = _mvp_v_sync_x1000(ws[i])
+        let l  = t - vs - vy
+        let d  = _mvp_partial_l_wrt_w(ws[i])
+
+        t_vals    = t_vals.push(t)
+        vs_vals   = vs_vals.push(vs)
+        vsy_vals  = vsy_vals.push(vy)
+        l_vals    = l_vals.push(l)
+        dsdw_vals = dsdw_vals.push(d)
+
+        action      = action + l
+        residual_l1 = residual_l1 + _iabs(d)
+        i = i + 1
+    }
+
+    // EoM table
+    println("─── per-gen breakdown (all ×1000) ───")
+    println("gen |    W |      T |  V_struct |  V_sync |         L |     dS/dW")
+    println("----+------+--------+-----------+---------+-----------+-----------")
+    let mut k = 0
+    while k < n {
+        let row_gen = k + 1
+        let row_w   = ws[k]
+        let row_t   = t_vals[k]
+        let row_vs  = vs_vals[k]
+        let row_vy  = vsy_vals[k]
+        let row_l   = l_vals[k]
+        let row_d   = dsdw_vals[k]
+        println(" " + str(row_gen)
+            + "  | "  + str(row_w)
+            + "  |  " + str(row_t)
+            + "  |  "  + str(row_vs)
+            + "   |  " + str(row_vy)
+            + "  |  " + str(row_l)
+            + "  | "  + str(row_d))
+        k = k + 1
+    }
+    println("")
+    println("Σ L_k (action S, ×1000) = " + str(action))
+    println("Σ |δS/δW_k| (residual L1, ×1000) = " + str(residual_l1))
+    println("")
+
+    // ASCII plot
+    let mut l_min = l_vals[0]
+    let mut l_max = l_vals[0]
+    let mut j = 1
+    while j < n {
+        l_min = _imin(l_min, l_vals[j])
+        l_max = _imax(l_max, l_vals[j])
+        j = j + 1
+    }
+    println("─── L-trajectory (ASCII, min=" + str(l_min) + " max=" + str(l_max) + ") ───")
+    let mut p = 0
+    while p < n {
+        let bar = _render_bar(l_vals[p], l_min, l_max)
+        let g = p + 1
+        println("gen " + str(g) + " W=" + str(ws[p]) + "  " + bar + "  L=" + str(l_vals[p]))
+        p = p + 1
+    }
+    println("")
+
+    // Stationary-action verdict (dual criterion)
+    //   Classical EoM: δL/δW = 0 AND dW/dt = 0 at the extremal.
+    //   (A) Kinetic vanishing test: T_k at converged gen should equal
+    //       the kinetic minimum (no further ΔW).  We check T_{n} versus
+    //       max T over the trajectory — fixpoint iff T_{n} == 0 OR
+    //       W_{n} == W_{n-1}.
+    //   (B) Potential gradient test: |δV/δW| at fixpoint vs pre-fixpoint.
+    //       Near the W=1000 boundary the log derivative diverges, so we
+    //       also allow the "boundary fixpoint" reading (W pinned at wall).
+    //   Combined verdict: STATIONARY_AT_FIXPOINT iff (A) holds AND W_n=1000
+    //                                              (boundary-minimum of V).
+    let delta_w_final = ws[n - 1] - ws[n - 2]
+    let fixpoint_kinetic = if delta_w_final == 0 { 0 } else { 1 }
+    let mut pre_max = 0
+    let mut q = 0
+    while q < n - 1 {
+        pre_max = _imax(pre_max, _iabs(dsdw_vals[q]))
+        q = q + 1
+    }
+    let fixpoint_res = _iabs(dsdw_vals[n - 1])
+    let ratio_x1000 = if pre_max > 0 { (fixpoint_res * 1000) / pre_max } else { 0 }
+
+    // Trajectory monotonicity in L: is the sequence L_1 < L_2 < ... < L_n?
+    // Action-minimizing descent to the well implies L rises monotonically
+    // as V decreases faster than T increases.
+    let mut monotone = 1
+    let mut m = 1
+    while m < n {
+        if l_vals[m] <= l_vals[m - 1] { monotone = 0 }
+        m = m + 1
+    }
+
+    let w_at_wall = if ws[n - 1] >= 1000 { 1 } else { 0 }
+
+    let verdict = if fixpoint_kinetic == 0 && w_at_wall == 1 && monotone == 1 {
+        "STATIONARY_AT_FIXPOINT"
+    } else if fixpoint_kinetic == 0 && w_at_wall == 1 {
+        "STATIONARY_BOUNDARY"
+    } else if monotone == 1 {
+        "DESCENT_ONLY"
+    } else {
+        "NON_STATIONARY"
+    }
+
+    println("─── stationary-action verdict ───")
+    println("  ΔW at fixpoint (gen n-1→n)   = " + str(delta_w_final))
+    println("  T at fixpoint                = " + str(t_vals[n - 1]))
+    println("  W at wall (1000?)            = " + str(w_at_wall))
+    println("  monotone L ascent            = " + str(monotone))
+    println("  pre-fixpoint max |δV/δW|     = " + str(pre_max))
+    println("  fixpoint |δV/δW| (boundary)  = " + str(fixpoint_res))
+    println("  ratio (×1000)                = " + str(ratio_x1000))
+    println("  verdict                      = " + verdict)
+    println("")
+
+    // ─── emit cert ────────────────────────────────────────────────────
+    let mut cert = "{\n"
+    cert = cert + "  \"verifier\": \"edu_cell_lagrangian_mvp\",\n"
+    cert = cert + "  \"paradigm\": \"L_cell = T_tension - V_structure - V_sync\",\n"
+    cert = cert + "  \"hexa_only\": true,\n"
+    cert = cert + "  \"raw_rank\": 9,\n"
+    cert = cert + "  \"deterministic\": true,\n"
+    cert = cert + "  \"llm\": \"none\",\n"
+    cert = cert + "  \"source_corpus\": \"shared/state/edu_cell_4gen_crystallize.json\",\n"
+    cert = cert + "  \"source_commit\": \"58aa75eb\",\n"
+    cert = cert + "  \"ws_per_mille\": [40, 125, 687, 1000],\n"
+    cert = cert + "  \"scale\": \"all values x1000 fixed-point\",\n"
+    cert = cert + "  \"per_gen\": [\n"
+    let mut r = 0
+    while r < n {
+        if r > 0 { cert = cert + ",\n" }
+        cert = cert + "    {\"gen\":" + str(r + 1)
+        cert = cert + ",\"w\":" + str(ws[r])
+        cert = cert + ",\"t_tension\":" + str(t_vals[r])
+        cert = cert + ",\"v_structure\":" + str(vs_vals[r])
+        cert = cert + ",\"v_sync\":" + str(vsy_vals[r])
+        cert = cert + ",\"l_cell\":" + str(l_vals[r])
+        cert = cert + ",\"dS_dW\":" + str(dsdw_vals[r]) + "}"
+        r = r + 1
+    }
+    cert = cert + "\n  ],\n"
+    cert = cert + "  \"action_sum\": " + str(action) + ",\n"
+    cert = cert + "  \"residual_l1\": " + str(residual_l1) + ",\n"
+    cert = cert + "  \"pre_fixpoint_max_residual\": " + str(pre_max) + ",\n"
+    cert = cert + "  \"fixpoint_residual\": " + str(fixpoint_res) + ",\n"
+    cert = cert + "  \"stationarity_ratio_x1000\": " + str(ratio_x1000) + ",\n"
+    cert = cert + "  \"delta_w_final\": " + str(delta_w_final) + ",\n"
+    cert = cert + "  \"w_at_wall\": " + str(w_at_wall) + ",\n"
+    cert = cert + "  \"monotone_ascent\": " + str(monotone) + ",\n"
+    cert = cert + "  \"stationary_action_verdict\": \"" + verdict + "\",\n"
+    cert = cert + "  \"notes\": \"V_structure stub=-ln(W/Wmax); V_sync stub=1-sealed_frac; comp+diss+phase unimeasured — wire once upstream axes land.\"\n"
+    cert = cert + "}\n"
+
+    write_file("shared/state/edu_cell_lagrangian_mvp.json", cert)
+    println("cert: shared/state/edu_cell_lagrangian_mvp.json")
+    exit(0)
+}

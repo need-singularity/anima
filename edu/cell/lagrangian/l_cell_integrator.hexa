@@ -1,0 +1,165 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  edu/cell/lagrangian/l_cell_integrator.hexa
+//
+//  PURPOSE
+//    Compose the per-gen Lagrangian
+//
+//        L_cell(k) = T_tension(k) − V_structure(k) − V_sync(k)
+//
+//    into a trajectory over N generations, and report the discrete action
+//
+//        S  =  Σ_k  L_cell(k)
+//
+//    plus a stationary-action proxy δS/δW_k (forward difference).  At a
+//    fixpoint (score saturates at 1000‰) ΔW = 0 ⇒ T = 0 ⇒ L = −V_sync
+//    (since V_struct_stub(1000) = 0) ⇒ δS/δW ≈ 0 by construction.
+//
+//    Integer fixed-point, ×1000 everywhere.
+//
+//  API
+//    lagrangian_trajectory(ws)     -> list[int]    // L_k  ×1000 per gen
+//    action_sum_x1000(ws)          -> int          // S    ×1000
+//    stationarity_residual_x1000(ws) -> int        // |δS/δW| proxy ×1000
+//    eom_table(ws)                 -> list[list[int]]
+//        each row = [gen, T, V_struct, V_sync, L, dS_dW]
+//
+//  HEXA-ONLY · raw#9 · deterministic · no LLM.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── INLINED t_tension (byte-equivalent to t_tension.hexa) ────────────────
+fn _t_delta_w(w_k: int, w_prev: int) -> int { return w_k - w_prev }
+
+fn _t_tension_x1000(w_k: int, w_prev: int) -> int {
+    let dw = _t_delta_w(w_k, w_prev)
+    let sq = dw * dw
+    return (sq / 2) / 1000
+}
+
+// ── INLINED v_structure (byte-equivalent to v_structure.hexa) ────────────
+fn _ln_per_mille_x1000(x: int) -> int {
+    let mut v = x
+    if v <= 0   { v = 1 }
+    if v > 1000 { v = 1000 }
+    if v >= 1000 { return 0 }
+    if v >= 950  { return -51 }
+    if v >= 900  { return -105 }
+    if v >= 850  { return -163 }
+    if v >= 800  { return -223 }
+    if v >= 750  { return -288 }
+    if v >= 700  { return -357 }
+    if v >= 650  { return -431 }
+    if v >= 600  { return -511 }
+    if v >= 550  { return -598 }
+    if v >= 500  { return -693 }
+    if v >= 450  { return -799 }
+    if v >= 400  { return -916 }
+    if v >= 350  { return -1050 }
+    if v >= 300  { return -1204 }
+    if v >= 250  { return -1386 }
+    if v >= 200  { return -1609 }
+    if v >= 150  { return -1897 }
+    if v >= 100  { return -2303 }
+    if v >= 50   { return -2996 }
+    return -6908
+}
+
+fn _v_struct_x1000(w: int, w_max: int) -> int {
+    if w_max <= 0 { return 0 }
+    let ratio = if w >= w_max { 1000 } else { (w * 1000) / w_max }
+    let ln_val = _ln_per_mille_x1000(ratio)
+    return 0 - ln_val
+}
+
+// ── INLINED v_sync proxy (byte-equivalent to v_sync.hexa) ────────────────
+fn _v_sync_proxy_x1000(score_per_mille: int) -> int {
+    let mut s = score_per_mille
+    if s < 0    { s = 0 }
+    if s > 1000 { s = 1000 }
+    return 1000 - s
+}
+
+// ── integrator ───────────────────────────────────────────────────────────
+
+// L_k ×1000 per gen given ws (score_per_mille series).
+fn lagrangian_trajectory(ws: list) -> list {
+    let n = ws.len()
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let t = if i == 0 { 0 } else { _t_tension_x1000(ws[i], ws[i - 1]) }
+        let v_struct = _v_struct_x1000(ws[i], 1000)
+        let v_sync   = _v_sync_proxy_x1000(ws[i])
+        let l = t - v_struct - v_sync
+        out = out.push(l)
+        i = i + 1
+    }
+    return out
+}
+
+// Discrete action S = Σ_k L_k, ×1000.
+fn action_sum_x1000(ws: list) -> int {
+    let ls = lagrangian_trajectory(ws)
+    let n = ls.len()
+    let mut s = 0
+    let mut i = 0
+    while i < n {
+        s = s + ls[i]
+        i = i + 1
+    }
+    return s
+}
+
+// Per-gen T, V_struct, V_sync, L, dS/dW.
+// dS/dW_k ≈ L(W_k + 1) − L(W_k − 1) / 2   (central difference on one term)
+// We compute the functional derivative of one generation's L wrt its W only
+// (not the kinetic term, which couples to W_{k-1}); this is the standard
+// Euler-Lagrange residual proxy for a fixpoint.
+fn _partial_l_wrt_w_x1000(w: int) -> int {
+    // ∂L/∂W = -∂V_struct/∂W - ∂V_sync/∂W
+    // Use forward difference at W and W+1 (per-mille step).
+    let w_plus = if w + 1 > 1000 { 1000 } else { w + 1 }
+    let w_minus = if w - 1 < 0 { 0 } else { w - 1 }
+    let v_plus  = _v_struct_x1000(w_plus, 1000) + _v_sync_proxy_x1000(w_plus)
+    let v_minus = _v_struct_x1000(w_minus, 1000) + _v_sync_proxy_x1000(w_minus)
+    // minus in front because L = T - V_struct - V_sync
+    return 0 - ((v_plus - v_minus) / 2)
+}
+
+// |δS/δW|: at an extremal trajectory this should vanish.  We report the
+// L1 norm of per-gen residual ×1000.
+fn stationarity_residual_x1000(ws: list) -> int {
+    let n = ws.len()
+    let mut acc = 0
+    let mut i = 0
+    while i < n {
+        let r = _partial_l_wrt_w_x1000(ws[i])
+        let mag = if r < 0 { 0 - r } else { r }
+        acc = acc + mag
+        i = i + 1
+    }
+    return acc
+}
+
+// Tabular form: one row per gen = [gen, T, V_struct, V_sync, L, dS/dW].
+fn eom_table(ws: list) -> list {
+    let n = ws.len()
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let t = if i == 0 { 0 } else { _t_tension_x1000(ws[i], ws[i - 1]) }
+        let v_struct = _v_struct_x1000(ws[i], 1000)
+        let v_sync   = _v_sync_proxy_x1000(ws[i])
+        let l = t - v_struct - v_sync
+        let d = _partial_l_wrt_w_x1000(ws[i])
+        let mut row = []
+        row = row.push(i + 1)
+        row = row.push(t)
+        row = row.push(v_struct)
+        row = row.push(v_sync)
+        row = row.push(l)
+        row = row.push(d)
+        out = out.push(row)
+        i = i + 1
+    }
+    return out
+}
