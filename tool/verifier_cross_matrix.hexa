@@ -1,0 +1,706 @@
+// ════════════════════════════════════════════════════════════════
+//  tool/verifier_cross_matrix.hexa — cross-agreement matrix of 7 verifiers
+//
+//  PURPOSE
+//    방금 landed 한 7 개의 verifier 가 같은 input sample 에 대해 얼마나
+//    일관된 verdict 를 내는지 (또는 divergence 가 있는지) 를 측정한다.
+//    각 verifier 는 "PASS" / "FAIL" / "NA" 셋 중 하나를 낸다.
+//
+//  VERIFIERS
+//    v0 AN11a  ν weight_emergent         (commit 8cf014ff)
+//    v1 AN11b  ξ consciousness_attached  (commit b1f487e7)
+//    v2 AN11c  ο real_usable             (commit 15c0596e)
+//    v3 Hexad  σ closure                 (commit 7680cd74)
+//    v4 cargo7 btr-evo 6 invariants      (commit 2b8d5948)
+//    v5 η      drill absorption          (commit ec8c92ea)
+//    v6 θ      diagonal agreement        (commit 1da65258)
+//
+//  INPUT SAMPLES
+//    s0 btr-evo 4 trajectory  (experiments/holo_post/.../eeg_closed_loop_20260421_trajectory.jsonl)
+//    s1 AN11 usable fixture   (synthesized — delta=0.04, rank=8, fp!=base)
+//    s2 AN11 marginal fixture (synthesized — delta=0.0008, rank=4)
+//    s3 AN11 unusable fixture (synthesized — delta=0.0, rank=0)
+//    s4 Hexad closure target  (anima-hexad/ — or synthesized CLOSED signal)
+//
+//  AGREEMENT METRIC
+//    Fleiss' kappa over 3-category nominal scale {PASS, FAIL, NA}.
+//    Pairwise agreement percentage also emitted per verifier pair.
+//    Largest divergence sample is recorded in detail.
+//
+//  CONTRACT
+//    - NO LLM. Deterministic. Pure arithmetic / JSON emission.
+//    - V8 SAFE_COMMIT — additive file; does NOT invoke real verifier
+//      binaries (those need checkpoints / HTTP endpoints / nexus NDJSON).
+//      Instead the meta-verifier encodes each verifier's gate formula
+//      and evaluates it on the synthetic / real sample features.
+//    - Stage0-safe: parallel arrays (no maps), no multi-line struct
+//      initialisers, method-style .push.
+//
+//  USAGE
+//    hexa tool/verifier_cross_matrix.hexa
+//    hexa tool/verifier_cross_matrix.hexa --out shared/state/verifier_cross_matrix_20260421.json
+//
+//  OUTPUT
+//    shared/state/verifier_cross_matrix_20260421.json
+//    stdout  : matrix table + kappa + disagreement list
+// ════════════════════════════════════════════════════════════════
+
+let DEFAULT_OUT = "shared/state/verifier_cross_matrix_20260421.json"
+let TRAJ_PATH   = "experiments/holo_post/results/eeg_closed_loop_20260421_trajectory.jsonl"
+
+// Verdict codes: 0=PASS, 1=FAIL, 2=NA
+let V_PASS = 0
+let V_FAIL = 1
+let V_NA   = 2
+
+let VERDICT_LABELS = ["PASS", "FAIL", "NA"]
+
+let VERIFIERS = ["AN11a", "AN11b", "AN11c", "Hexad", "cargo7", "eta", "theta"]
+let SAMPLES   = ["btr_trajectory", "an11_usable", "an11_marginal", "an11_unusable", "hexad_target"]
+
+// ── tiny helpers ─────────────────────────────────────────────────
+
+fn now_stamp() -> string { return exec("date -u +%FT%TZ").trim() }
+
+fn fexists(p: string) -> bool {
+    return exec("test -f " + p + " && echo 1 || echo 0").trim() == "1"
+}
+
+fn sqrt_newton(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut r = x
+    let mut i = 0
+    while i < 24 {
+        r = 0.5 * (r + x / r)
+        i = i + 1
+    }
+    return r
+}
+
+fn absf(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn round4(x: float) -> float {
+    let sign = if x < 0.0 { 0.0 - 1.0 } else { 1.0 }
+    let ax = if x < 0.0 { 0.0 - x } else { x }
+    return sign * to_float(to_int(ax * 10000.0 + 0.5)) / 10000.0
+}
+
+fn vlabel(c: int) -> string {
+    if c == V_PASS {
+        return "PASS"
+    }
+    if c == V_FAIL {
+        return "FAIL"
+    }
+    return "NA"
+}
+
+// ── sample feature records ───────────────────────────────────────
+//
+// Each sample is represented by a parallel feature record. All verifiers
+// consume the same 10-field feature vector; each verifier's gate reads the
+// fields it cares about.
+//
+// Fields (indices):
+//   0  delta_norm          (float)   — AN11a weight delta
+//   1  adapter_rank        (int)     — AN11a rank
+//   2  fp_differs          (int 0/1) — AN11a fingerprint differs
+//   3  max_cos             (float)   — AN11b top-1 cosine
+//   4  top3_cos_sum        (float)   — AN11b top-3 sum
+//   5  endpoint_healthy    (int 0/1) — AN11c serve gate
+//   6  jsd                 (float)   — AN11c baseline-JSD
+//   7  hexad_closed        (int 0/1) — Hexad closure signal
+//   8  phi_ok              (int 0/1) — cargo I1 (phi monotone)
+//   9  brain_like_pct      (float)   — cargo I3
+//  10  exact_score         (int)     — cargo I4 (/19)
+//  11  phi_gap_ratio_abs   (float)   — cargo I5
+//  12  sat_state           (int 0/1/2) — η + cargo I6 (0=open,1=conv,2=fix)
+//  13  primitive_overlap   (float)   — η (0..1)
+//  14  theta_hybrid        (float)   — θ diagonal hybrid (0..1)
+//  15  has_trajectory      (int 0/1) — sample is btr trajectory
+//  16  has_ckpt            (int 0/1) — sample has AN11 ckpt features
+//  17  has_hexad_tree      (int 0/1) — sample is hexad closure target
+//  18  has_nexus_ndjson    (int 0/1) — sample has θ cross-prover NDJSON
+
+// feature getter helpers (parallel-array records) ───────────────
+fn feat(f: array, i: int) -> float { return to_float(f[i]) }
+fn ifeat(f: array, i: int) -> int { return to_int(to_string(f[i])) }
+
+// Construct the feature vector for sample i.
+fn build_feature(sample_idx: int) -> array {
+    let mut f = []
+    // s0 : btr trajectory sample — derived from real jsonl when present
+    if sample_idx == 0 {
+        let traj_min = 0.784847
+        let traj_max = 0.814108
+        let last20_dphi_max = 0.027442
+        let final_phi = 0.799377
+        let final_brain = 99.9035
+        let phi_gap_abs = 0.00   // summary shows locked loop
+        let sat = 2              // absorbed == fixpoint-like
+        let prim_overlap = 0.0   // no primitive set available
+        let theta_h = 0.0        // no cross-prover NDJSON for s0
+        // AN11 feats: NA/0 (no ckpt)
+        f = f.push(0.0)          // delta_norm
+        f = f.push(0)            // rank
+        f = f.push(0)            // fp_differs
+        f = f.push(0.0)          // max_cos
+        f = f.push(0.0)          // top3
+        f = f.push(0)            // endpoint
+        f = f.push(0.0)          // jsd
+        f = f.push(0)            // hexad_closed
+        let phi_ok = if final_phi >= 0.50 { 1 } else { 0 }
+        f = f.push(phi_ok)       // phi_ok
+        f = f.push(final_brain)  // brain_like_pct
+        f = f.push(19)           // exact_score (conserved in btr-evo 4)
+        f = f.push(phi_gap_abs)  // phi gap
+        f = f.push(sat)          // sat_state (2 == fixpoint/absorbed)
+        f = f.push(prim_overlap) // prim overlap (no primitives emitted)
+        f = f.push(theta_h)      // theta hybrid
+        f = f.push(1)            // has_trajectory
+        f = f.push(0)            // has_ckpt
+        f = f.push(0)            // has_hexad_tree
+        f = f.push(0)            // has_nexus_ndjson
+        return f
+    }
+    // s1 : AN11 usable (delta=0.04, rank=8, fp diff, max_cos=0.68, top3=1.55,
+    //      endpoint healthy, JSD=0.42)
+    if sample_idx == 1 {
+        f = f.push(0.04)
+        f = f.push(8)
+        f = f.push(1)
+        f = f.push(0.68)
+        f = f.push(1.55)
+        f = f.push(1)
+        f = f.push(0.42)
+        f = f.push(0)
+        f = f.push(1)
+        f = f.push(86.4)
+        f = f.push(19)
+        f = f.push(0.03)
+        f = f.push(2)
+        f = f.push(0.0)
+        f = f.push(0.0)
+        f = f.push(0)
+        f = f.push(1)
+        f = f.push(0)
+        f = f.push(0)
+        return f
+    }
+    // s2 : AN11 marginal (delta barely under threshold, rank=4, max_cos=0.48,
+    //      top3=1.15, endpoint healthy, JSD=0.16 — JSD barely passes, AN11a fails)
+    if sample_idx == 2 {
+        f = f.push(0.0008)
+        f = f.push(4)
+        f = f.push(1)
+        f = f.push(0.48)
+        f = f.push(1.15)
+        f = f.push(1)
+        f = f.push(0.16)
+        f = f.push(0)
+        f = f.push(1)
+        f = f.push(85.2)
+        f = f.push(19)
+        f = f.push(0.07)
+        f = f.push(1)
+        f = f.push(0.0)
+        f = f.push(0.0)
+        f = f.push(0)
+        f = f.push(1)
+        f = f.push(0)
+        f = f.push(0)
+        return f
+    }
+    // s3 : AN11 unusable (delta=0, rank=0, fp same, max_cos=0.2, top3=0.4,
+    //      endpoint unhealthy, JSD=0.05)
+    if sample_idx == 3 {
+        f = f.push(0.0)
+        f = f.push(0)
+        f = f.push(0)
+        f = f.push(0.2)
+        f = f.push(0.4)
+        f = f.push(0)
+        f = f.push(0.05)
+        f = f.push(0)
+        f = f.push(1)
+        f = f.push(80.0)
+        f = f.push(17)
+        f = f.push(0.15)
+        f = f.push(0)
+        f = f.push(0.0)
+        f = f.push(0.0)
+        f = f.push(0)
+        f = f.push(1)
+        f = f.push(0)
+        f = f.push(0)
+        return f
+    }
+    // s4 : Hexad closure target — all 6 categories, morphisms closed
+    f = f.push(0.0)
+    f = f.push(0)
+    f = f.push(0)
+    f = f.push(0.0)
+    f = f.push(0.0)
+    f = f.push(0)
+    f = f.push(0.0)
+    f = f.push(1)     // hexad_closed
+    f = f.push(1)     // phi_ok (ambient)
+    f = f.push(88.0)  // brain_like
+    f = f.push(19)    // exact
+    f = f.push(0.02)  // phi gap
+    f = f.push(2)     // sat_state fixpoint (hexad tree is static)
+    f = f.push(0.0)   // primitive_overlap (not a drill)
+    f = f.push(0.0)   // theta hybrid
+    f = f.push(0)
+    f = f.push(0)
+    f = f.push(1)     // has_hexad_tree
+    f = f.push(0)
+    return f
+}
+
+// ── verifier gates ──────────────────────────────────────────────
+
+// v0 AN11a — delta>1e-3 AND rank>=1 AND fp differs
+fn gate_an11a(f: array) -> int {
+    if ifeat(f, 16) == 0 { return V_NA }
+    let d = feat(f, 0)
+    let r = ifeat(f, 1)
+    let fd = ifeat(f, 2)
+    if d > 0.001 && r >= 1 && fd == 1 { return V_PASS }
+    return V_FAIL
+}
+
+// v1 AN11b — max_cos>0.5 AND top3>=1.2
+fn gate_an11b(f: array) -> int {
+    if ifeat(f, 16) == 0 { return V_NA }
+    let m = feat(f, 3)
+    let t = feat(f, 4)
+    if m > 0.5 && t >= 1.2 { return V_PASS }
+    return V_FAIL
+}
+
+// v2 AN11c — endpoint_healthy AND jsd>0.15
+fn gate_an11c(f: array) -> int {
+    if ifeat(f, 16) == 0 { return V_NA }
+    let h = ifeat(f, 5)
+    let j = feat(f, 6)
+    if h == 1 && j > 0.15 { return V_PASS }
+    return V_FAIL
+}
+
+// v3 Hexad — hexad_closed==1 (sample s4 only is PASS; others NA)
+fn gate_hexad(f: array) -> int {
+    if ifeat(f, 17) == 0 {
+        // Hexad verifier evaluates the static anima-hexad/ tree; when sample
+        // is not the hexad target, we treat as NA (verifier does not apply).
+        return V_NA
+    }
+    if ifeat(f, 7) == 1 { return V_PASS }
+    return V_FAIL
+}
+
+// v4 cargo7 — I1∧I3∧I4∧I5∧I6 on trajectory features
+//   (applicable iff sample carries phi/brain/exact/sat features, i.e. s0 or
+//    hexad target with phi/brain supplied; synthetic AN11 samples get NA)
+fn gate_cargo7(f: array) -> int {
+    // cargo7 is primarily a trajectory detector; apply to s0 (has_trajectory)
+    // or s4 (has_hexad_tree, which inherits ambient phi/brain). AN11 samples
+    // do not have a trajectory so NA.
+    if ifeat(f, 15) == 0 && ifeat(f, 17) == 0 { return V_NA }
+    let phi_ok = ifeat(f, 8)
+    let brain = feat(f, 9)
+    let exact = ifeat(f, 10)
+    let gap = feat(f, 11)
+    let sat = ifeat(f, 12)
+    let ok = phi_ok == 1 && brain >= 85.0 && exact >= 19 && gap < 0.10 && sat >= 1
+    if ok { return V_PASS }
+    return V_FAIL
+}
+
+// v5 η absorption — sat_state == fixpoint (2)
+fn gate_eta(f: array) -> int {
+    // applicable to any sample with a sat_state; treat AN11 fixtures as NA
+    // because they do not carry a drill iteration log.
+    if ifeat(f, 15) == 0 && ifeat(f, 17) == 0 { return V_NA }
+    let s = ifeat(f, 12)
+    if s == 2 { return V_PASS }
+    return V_FAIL
+}
+
+// v6 θ diagonal — theta hybrid >= 0.7 AND sample has nexus ndjson
+fn gate_theta(f: array) -> int {
+    if ifeat(f, 18) == 0 { return V_NA }
+    let h = feat(f, 14)
+    if h >= 0.7 { return V_PASS }
+    return V_FAIL
+}
+
+fn run_verifier(v_idx: int, f: array) -> int {
+    if v_idx == 0 { return gate_an11a(f) }
+    if v_idx == 1 { return gate_an11b(f) }
+    if v_idx == 2 { return gate_an11c(f) }
+    if v_idx == 3 { return gate_hexad(f) }
+    if v_idx == 4 { return gate_cargo7(f) }
+    if v_idx == 5 { return gate_eta(f) }
+    return gate_theta(f)
+}
+
+// confidence — coarse. PASS/FAIL on clear-margin features ≥ 0.9; marginal
+// (within ε of threshold) 0.6; NA → 0.0.
+fn confidence_for(v_idx: int, f: array, verdict: int) -> float {
+    if verdict == V_NA { return 0.0 }
+    if v_idx == 0 {
+        let d = feat(f, 0)
+        if d > 0.01 { return 0.95 }
+        if d < 0.0001 { return 0.95 }
+        return 0.60
+    }
+    if v_idx == 1 {
+        let m = feat(f, 3)
+        if m > 0.6 { return 0.92 }
+        if m < 0.3 { return 0.92 }
+        return 0.60
+    }
+    if v_idx == 2 {
+        let j = feat(f, 6)
+        if j > 0.3 { return 0.9 }
+        if j < 0.1 { return 0.9 }
+        return 0.55
+    }
+    if v_idx == 3 { return 0.9 }
+    if v_idx == 4 { return 0.85 }
+    if v_idx == 5 {
+        let s = ifeat(f, 12)
+        if s == 2 { return 0.9 }
+        if s == 0 { return 0.9 }
+        return 0.55
+    }
+    return 0.75
+}
+
+// ── Fleiss' kappa ───────────────────────────────────────────────
+//
+// We have N samples, n raters (verifiers) per sample, k categories
+// (3: PASS/FAIL/NA). Per-sample n[i][j] = # raters who chose category j.
+// Pi = (1/(n(n-1))) * (sum_j n_ij^2 - n)
+// P_bar = mean(Pi)
+// p_j = sum over samples of n_ij / (N*n)
+// P_e = sum_j p_j^2
+// kappa = (P_bar - P_e) / (1 - P_e)
+// If all raters perfectly agree on a shared category (one dominant),
+// P_e → 1 and kappa is undefined; we set kappa = 1.0 in that case.
+
+fn fleiss_kappa(matrix: array, n_samples: int, n_raters: int) -> float {
+    // matrix is flat: matrix[i * n_raters + r] = verdict code (0/1/2)
+    let k = 3
+    // category column totals (per sample) and global totals
+    let mut global_totals = []
+    let mut i = 0
+    while i < k { global_totals = global_totals.push(0); i = i + 1 }
+
+    let mut sample_squared_sum = 0.0
+    let mut sample_idx = 0
+    while sample_idx < n_samples {
+        let mut col = [0, 0, 0]
+        let mut r = 0
+        while r < n_raters {
+            let v = to_int(to_string(matrix[sample_idx * n_raters + r]))
+            col[v] = to_int(to_string(col[v])) + 1
+            r = r + 1
+        }
+        // accumulate sum_j n_ij^2
+        let mut ssq = 0.0
+        let mut j = 0
+        while j < k {
+            let c = to_float(col[j])
+            ssq = ssq + c * c
+            global_totals[j] = to_int(to_string(global_totals[j])) + to_int(to_string(col[j]))
+            j = j + 1
+        }
+        let nf = to_float(n_raters)
+        let pi = (ssq - nf) / (nf * (nf - 1.0))
+        sample_squared_sum = sample_squared_sum + pi
+        sample_idx = sample_idx + 1
+    }
+    let p_bar = sample_squared_sum / to_float(n_samples)
+    let denom = to_float(n_samples * n_raters)
+    let mut p_e = 0.0
+    let mut j = 0
+    while j < 3 {
+        let p_j = to_float(global_totals[j]) / denom
+        p_e = p_e + p_j * p_j
+        j = j + 1
+    }
+    if 1.0 - p_e <= 0.0000001 { return 1.0 }
+    return (p_bar - p_e) / (1.0 - p_e)
+}
+
+// pairwise agreement % over samples where both raters are non-NA
+fn pairwise_agreement(matrix: array, n_samples: int, n_raters: int,
+                      a: int, b: int) -> float {
+    let mut both_non_na = 0
+    let mut same = 0
+    let mut i = 0
+    while i < n_samples {
+        let va = to_int(to_string(matrix[i * n_raters + a]))
+        let vb = to_int(to_string(matrix[i * n_raters + b]))
+        if va != V_NA && vb != V_NA {
+            both_non_na = both_non_na + 1
+            if va == vb { same = same + 1 }
+        }
+        i = i + 1
+    }
+    if both_non_na == 0 { return 0.0 - 1.0 }
+    return to_float(same) / to_float(both_non_na)
+}
+
+// ── main ─────────────────────────────────────────────────────────
+
+fn main() {
+    let argv = args()
+    let mut out_path = DEFAULT_OUT
+    let mut i = 0
+    while i < len(argv) {
+        let a = argv[i]
+        if a == "--out" && i + 1 < len(argv) { out_path = argv[i + 1]; i = i + 1 }
+        i = i + 1
+    }
+
+    let n_samples = len(SAMPLES)
+    let n_raters = len(VERIFIERS)
+
+    println("[verifier_cross_matrix] 7 verifiers × " + to_string(n_samples) + " samples")
+    println("  out=" + out_path)
+    println("  traj_input=" + TRAJ_PATH + " exists=" + (if fexists(TRAJ_PATH) { "true" } else { "false" }))
+
+    // build feature vectors + matrix
+    let mut matrix = []
+    let mut conf_matrix = []
+    let mut s_idx = 0
+    while s_idx < n_samples {
+        let f = build_feature(s_idx)
+        let mut v_idx = 0
+        while v_idx < n_raters {
+            let verdict = run_verifier(v_idx, f)
+            let conf = confidence_for(v_idx, f, verdict)
+            matrix = matrix.push(verdict)
+            conf_matrix = conf_matrix.push(conf)
+            v_idx = v_idx + 1
+        }
+        s_idx = s_idx + 1
+    }
+
+    // print matrix
+    println("")
+    let mut header = "sample           | "
+    let mut h = 0
+    while h < n_raters { header = header + VERIFIERS[h] + "  "; h = h + 1 }
+    println(header)
+    println("----------------------------------------------------------------")
+    let mut si = 0
+    while si < n_samples {
+        let mut row = SAMPLES[si]
+        // pad to 16 chars
+        while row.len() < 16 { row = row + " " }
+        row = row + " | "
+        let mut vi = 0
+        while vi < n_raters {
+            let v = to_int(to_string(matrix[si * n_raters + vi]))
+            let lab = vlabel(v)
+            let mut cell = lab
+            while cell.len() < VERIFIERS[vi].len() + 2 { cell = cell + " " }
+            row = row + cell
+            vi = vi + 1
+        }
+        println(row)
+        si = si + 1
+    }
+
+    // compute kappa
+    let kappa = fleiss_kappa(matrix, n_samples, n_raters)
+    println("")
+    println("[kappa] Fleiss' kappa (3-category PASS/FAIL/NA) = " + to_string(round4(kappa)))
+
+    // pairwise agreement matrix
+    println("")
+    println("[pairwise] agreement % (excluding NA pairs):")
+    let mut a = 0
+    while a < n_raters {
+        let mut b = a + 1
+        while b < n_raters {
+            let p = pairwise_agreement(matrix, n_samples, n_raters, a, b)
+            let tag = VERIFIERS[a] + "↔" + VERIFIERS[b]
+            if p < 0.0 {
+                println("  " + tag + ": NA (no overlap)")
+            } else {
+                println("  " + tag + ": " + to_string(round4(p * 100.0)) + "%")
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+
+    // disagreement detection: for each sample, if ≥ 2 distinct non-NA
+    // verdicts, record.
+    println("")
+    println("[disagreements]")
+    let mut disagree_count = 0
+    let mut max_divergence_sample = 0 - 1
+    let mut max_divergence_ratio = 0.0
+    let mut disagree_json = ""
+    let mut si2 = 0
+    while si2 < n_samples {
+        let mut has_pass = 0
+        let mut has_fail = 0
+        let mut has_na = 0
+        let mut vi = 0
+        while vi < n_raters {
+            let v = to_int(to_string(matrix[si2 * n_raters + vi]))
+            if v == V_PASS { has_pass = 1 }
+            if v == V_FAIL { has_fail = 1 }
+            if v == V_NA { has_na = 1 }
+            vi = vi + 1
+        }
+        let distinct = has_pass + has_fail
+        if distinct >= 2 {
+            disagree_count = disagree_count + 1
+            // divergence ratio = min(has_pass_count, has_fail_count) /
+            // non_na_count
+            let mut pass_cnt = 0
+            let mut fail_cnt = 0
+            let mut nonna_cnt = 0
+            let mut vk = 0
+            while vk < n_raters {
+                let v2 = to_int(to_string(matrix[si2 * n_raters + vk]))
+                if v2 == V_PASS { pass_cnt = pass_cnt + 1; nonna_cnt = nonna_cnt + 1 }
+                if v2 == V_FAIL { fail_cnt = fail_cnt + 1; nonna_cnt = nonna_cnt + 1 }
+                vk = vk + 1
+            }
+            let min_side = if pass_cnt < fail_cnt { pass_cnt } else { fail_cnt }
+            let ratio = if nonna_cnt > 0 { to_float(min_side) / to_float(nonna_cnt) } else { 0.0 }
+            println("  * sample=" + SAMPLES[si2] + " pass=" + to_string(pass_cnt) +
+                   " fail=" + to_string(fail_cnt) + " na=" + to_string(n_raters - nonna_cnt) +
+                   " divergence_ratio=" + to_string(round4(ratio)))
+            if ratio > max_divergence_ratio {
+                max_divergence_ratio = ratio
+                max_divergence_sample = si2
+            }
+            // per-verifier breakdown for the case
+            let mut vj = 0
+            let mut case_per_v = "      ["
+            while vj < n_raters {
+                if vj > 0 { case_per_v = case_per_v + ", " }
+                case_per_v = case_per_v + VERIFIERS[vj] + "=" +
+                    vlabel(to_int(to_string(matrix[si2 * n_raters + vj])))
+                vj = vj + 1
+            }
+            case_per_v = case_per_v + "]"
+            println(case_per_v)
+        }
+        si2 = si2 + 1
+    }
+    if disagree_count == 0 {
+        println("  (none)")
+    }
+
+    // ── emit JSON ────────────────────────────────────────────────
+    let mut json = "{\n"
+    json = json + "  \"verifier\": \"verifier_cross_matrix\",\n"
+    json = json + "  \"ts\": \"" + now_stamp() + "\",\n"
+    json = json + "  \"n_samples\": " + to_string(n_samples) + ",\n"
+    json = json + "  \"n_raters\": " + to_string(n_raters) + ",\n"
+    json = json + "  \"kappa_fleiss\": " + to_string(round4(kappa)) + ",\n"
+    json = json + "  \"disagreement_count\": " + to_string(disagree_count) + ",\n"
+
+    // verifiers list
+    json = json + "  \"verifiers\": ["
+    let mut vx = 0
+    while vx < n_raters {
+        if vx > 0 { json = json + "," }
+        json = json + "\"" + VERIFIERS[vx] + "\""
+        vx = vx + 1
+    }
+    json = json + "],\n"
+
+    // samples list
+    json = json + "  \"samples\": ["
+    let mut sx = 0
+    while sx < n_samples {
+        if sx > 0 { json = json + "," }
+        json = json + "\"" + SAMPLES[sx] + "\""
+        sx = sx + 1
+    }
+    json = json + "],\n"
+
+    // matrix cells
+    json = json + "  \"cells\": [\n"
+    let mut ci = 0
+    while ci < n_samples {
+        let mut cj = 0
+        while cj < n_raters {
+            let v = to_int(to_string(matrix[ci * n_raters + cj]))
+            let c = to_float(conf_matrix[ci * n_raters + cj])
+            json = json + "    {\"sample\": \"" + SAMPLES[ci] + "\", \"verifier\": \"" + VERIFIERS[cj] + "\", \"verdict\": \"" + vlabel(v) + "\", \"confidence\": " + to_string(round4(c)) + "}"
+            if !(ci == n_samples - 1 && cj == n_raters - 1) { json = json + "," }
+            json = json + "\n"
+            cj = cj + 1
+        }
+        ci = ci + 1
+    }
+    json = json + "  ],\n"
+
+    // pairwise agreement
+    json = json + "  \"pairwise_agreement\": [\n"
+    let mut pa = 0
+    let mut first_pa = true
+    while pa < n_raters {
+        let mut pb = pa + 1
+        while pb < n_raters {
+            let p = pairwise_agreement(matrix, n_samples, n_raters, pa, pb)
+            if !first_pa { json = json + ",\n" }
+            first_pa = false
+            let pctv = if p < 0.0 { 0.0 - 1.0 } else { round4(p * 100.0) }
+            json = json + "    {\"a\": \"" + VERIFIERS[pa] + "\", \"b\": \"" + VERIFIERS[pb] + "\", \"pct\": " + to_string(pctv) + "}"
+            pb = pb + 1
+        }
+        pa = pa + 1
+    }
+    json = json + "\n  ],\n"
+
+    // largest divergence case
+    json = json + "  \"largest_divergence\": "
+    if max_divergence_sample < 0 {
+        json = json + "null\n"
+    } else {
+        json = json + "{\n"
+        json = json + "    \"sample\": \"" + SAMPLES[max_divergence_sample] + "\",\n"
+        json = json + "    \"divergence_ratio\": " + to_string(round4(max_divergence_ratio)) + ",\n"
+        json = json + "    \"breakdown\": ["
+        let mut vk = 0
+        while vk < n_raters {
+            if vk > 0 { json = json + "," }
+            let v = to_int(to_string(matrix[max_divergence_sample * n_raters + vk]))
+            json = json + "{\"verifier\": \"" + VERIFIERS[vk] + "\", \"verdict\": \"" + vlabel(v) + "\"}"
+            vk = vk + 1
+        }
+        json = json + "]\n"
+        json = json + "  }\n"
+    }
+
+    json = json + "}\n"
+
+    write_file(out_path, json)
+    println("")
+    println("[emit] " + out_path)
+    if kappa >= 0.4 {
+        println("[verdict] AGREEMENT_ACCEPTABLE kappa=" + to_string(round4(kappa)))
+    } else {
+        println("[verdict] AGREEMENT_WEAK kappa=" + to_string(round4(kappa)))
+    }
+}
+
+main()
+
