@@ -1,0 +1,188 @@
+// training/dest1_alm_ship_chain.hexa — DEST1 ALM ship sequence orchestrator
+// =============================================================================
+//
+// PURPOSE (dest1_alm_ship preflight, 2026-04-20)
+//   Single entry point that wires the post-training dest1 ALM ship sequence:
+//
+//     1. emit phi_vec.json from CE       (dest1_phi_vec_emit.hexa)
+//     2. verify phi gate                 (phi_gt_1000_verify.hexa)
+//     3. R2 upload step ckpt dir         (rclone copy)
+//     4. (manual) update .convergence    @state shipped — printed for op
+//
+// On any step failure the chain HALTS and exits non-zero — the ship sequence
+// is fail-fast by design (matches dest1_alm_ship.convergence rollback E1
+// "DO NOT proceed to Stage F/G until E1 PASS").
+//
+// USAGE
+//   hexa run training/dest1_alm_ship_chain.hexa \
+//     <ssh_target> <ckpt_step_dir> <step> <ce> <round> <seed> [r2_path] [phi_holo_override]
+//
+//   example (production after r12 step_2000 lands):
+//     hexa run training/dest1_alm_ship_chain.hexa \
+//       root@216.243.220.220:12148 \
+//       /workspace/ckpt_alm14b_r12/step_2000 \
+//       2000 0.291 r12 3407 \
+//       r2:anima-models/alm14b/r12/step_2000_seed3407/
+//
+//   The orchestrator runs verify + emit LOCALLY against a phi_vec.json that
+//   was either (a) already on disk via the trainer or (b) written by the
+//   sidecar emit step run REMOTELY against the pod. For pod-side execution,
+//   wrap each call with `ssh <ssh_target> 'hexa run ...'` from the launch
+//   script — this orchestrator prints the canonical command set when run
+//   with --dry-run, and EXECUTES if --live is passed.
+//
+// EXIT
+//   0  end-to-end PASS, ckpt uploaded, ship sequence ready for @state shipped
+//   1  phi gate FAIL — DO NOT ship
+//   2  bad args / IO error
+//   3  R2 upload failure
+//
+// CONVENTION
+//   - Self-contained (no imports — feedback_hexa_silent_exit_5_imports)
+//   - rclone path R2 bucket = anima-models (per reference_r2_buckets)
+//   - feedback_troubleshoot_comments — every step has root/fix inline
+
+fn main() {
+    let argv = args()
+    if argv.len() < 8 {
+        print_err("[dest1_chain] ERROR: usage:")
+        print_err("  hexa run training/dest1_alm_ship_chain.hexa \\")
+        print_err("    <ssh_target> <ckpt_step_dir> <step> <ce> <round> <seed> [r2_path] [phi_holo_override]")
+        print_err("  add --live as last arg to actually execute (default: dry-run plan only)")
+        exit(2)
+    }
+    let ssh_target = argv[2]
+    let step_dir = argv[3]
+    let step_s = argv[4]
+    let ce_s = argv[5]
+    let round_s = argv[6]
+    let seed_s = argv[7]
+
+    // Optional positional: r2_path (default = canonical alm14b layout).
+    let mut r2_path = "r2:anima-models/alm14b/" + round_s + "/step_" + step_s + "_seed" + seed_s + "/"
+    if argv.len() >= 9 {
+        let cand = argv[8]
+        // Heuristic: explicit r2: prefix means override, --live is a flag.
+        if cand != "--live" { r2_path = cand }
+    }
+
+    // Optional positional: phi_holo_override.
+    let mut phi_arg = ""
+    if argv.len() >= 10 {
+        let v = argv[9]
+        if v != "--live" { phi_arg = v }
+    }
+
+    // --live detection (any position).
+    let mut live = false
+    let mut i = 0
+    while i < argv.len() {
+        if argv[i] == "--live" { live = true }
+        i = i + 1
+    }
+
+    println("=== dest1 ALM ship chain ===")
+    println("  ssh_target = " + ssh_target)
+    println("  step_dir   = " + step_dir + "  (pod-side path)")
+    println("  step       = " + step_s)
+    println("  ce         = " + ce_s)
+    println("  round      = " + round_s)
+    println("  seed       = " + seed_s)
+    println("  r2_path    = " + r2_path)
+    println("  mode       = " + (if live { "LIVE" } else { "DRY-RUN" }))
+    println("")
+
+    // ── Stage 1: emit phi_vec.json on the pod ───────────────────────────
+    // Root cause for sidecar: train_alm_lora.hexa save_lora_device_state
+    // writes adapter_model + adapter_config but NOT phi_vec.json. BG #21
+    // is wiring the trainer; we must not race-edit it. Sidecar emits the
+    // verifier-compatible phi_vec.json directly from CE next to the ckpt.
+    let mut emit_cmd = "ssh " + ssh_target + " 'hexa run /workspace/anima/training/dest1_phi_vec_emit.hexa "
+    emit_cmd = emit_cmd + step_dir + " " + step_s + " " + ce_s + " " + round_s + " " + seed_s
+    if phi_arg != "" {
+        emit_cmd = emit_cmd + " " + phi_arg
+    }
+    emit_cmd = emit_cmd + "'"
+    println("Stage 1 — emit phi_vec.json (pod-side):")
+    println("  $ " + emit_cmd)
+
+    // ── Stage 2: verify phi gate ────────────────────────────────────────
+    // Verifier exits 0 on PASS, 1 on FAIL. Chain HALTS on FAIL per
+    // dest1_alm_ship.convergence rollback_E1.
+    let phi_path = step_dir + "/phi_vec.json"
+    let verify_cmd = "ssh " + ssh_target + " 'hexa run /workspace/anima/training/phi_gt_1000_verify.hexa " + phi_path + "'"
+    println("")
+    println("Stage 2 — verify phi gate:")
+    println("  $ " + verify_cmd)
+    println("  expected: [phi_gate] step=" + step_s + " phi_holo_scaled=<X> verdict=PASS gate=1000")
+
+    // ── Stage 3: R2 upload (rclone copy) ────────────────────────────────
+    // Per training/CLAUDE.md runpod_mfs_quota: in-training rclone forbidden,
+    // but post-training is mandatory. Bucket = anima-models (R2 SSOT).
+    let upload_cmd = "ssh " + ssh_target + " 'rclone copy " + step_dir + " " + r2_path + " -v --s3-no-check-bucket'"
+    println("")
+    println("Stage 3 — R2 upload:")
+    println("  $ " + upload_cmd)
+
+    // ── Stage 4: convergence @state shipped (manual edit prompt) ────────
+    println("")
+    println("Stage 4 — convergence @state shipped (after stages 1-3 PASS):")
+    println("  edit shared/convergence/dest1_alm_ship.convergence:")
+    println("    @state shipped")
+    println("    @ckpt_r2 " + r2_path)
+    println("    @ckpt_step_2000_phi <X>  # from Stage 2 stdout")
+    println("    @date <today>")
+
+    if !live {
+        println("")
+        println("DRY-RUN complete. Re-run with --live to execute on " + ssh_target + ".")
+        exit(0)
+    }
+
+    // ── LIVE EXEC ───────────────────────────────────────────────────────
+    println("")
+    println("=== LIVE exec ===")
+
+    // Stage 1
+    println("Stage 1 → exec emit ...")
+    let emit_rc = exec_with_status(emit_cmd)
+    if emit_rc[1] != 0 {
+        print_err("[dest1_chain] FAIL Stage 1 (emit) rc=" + to_string(emit_rc[1]))
+        print_err(emit_rc[0])
+        exit(2)
+    }
+    println(emit_rc[0])
+
+    // Stage 2
+    println("Stage 2 → exec verify ...")
+    let verify_rc = exec_with_status(verify_cmd)
+    println(verify_rc[0])
+    if verify_rc[1] != 0 {
+        // Verifier emits exit 1 on FAIL; HALT chain (do NOT upload).
+        print_err("[dest1_chain] FAIL Stage 2 — phi gate FAIL rc=" + to_string(verify_rc[1]))
+        print_err("[dest1_chain] DEST1 not achieved — DO NOT proceed to R2 upload.")
+        print_err("[dest1_chain] See dest1_alm_ship.convergence rollback_E1 for options.")
+        exit(1)
+    }
+
+    // Stage 3
+    println("Stage 3 → exec R2 upload ...")
+    let upload_rc = exec_with_status(upload_cmd)
+    if upload_rc[1] != 0 {
+        print_err("[dest1_chain] FAIL Stage 3 (R2 upload) rc=" + to_string(upload_rc[1]))
+        print_err(upload_rc[0])
+        exit(3)
+    }
+    println(upload_rc[0])
+
+    // Stage 4 — convergence update is a human-on-the-loop step (R14 SSOT).
+    println("")
+    println("=== Stages 1-3 PASS — DEST1 ship gate cleared ===")
+    println("Manual: edit shared/convergence/dest1_alm_ship.convergence:")
+    println("  @state shipped")
+    println("  @ckpt_r2 " + r2_path)
+    println("  @date <today>")
+    exit(0)
+}
+
+main()

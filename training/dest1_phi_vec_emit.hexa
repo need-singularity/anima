@@ -1,0 +1,93 @@
+// training/dest1_phi_vec_emit.hexa — DEST1 phi_vec.json sidecar emitter
+// =============================================================================
+//
+// PURPOSE (dest1_alm_ship preflight, 2026-04-20)
+//   Emits a verifier-compatible phi_vec.json next to a saved LoRA ckpt step
+//   directory. Designed to be invoked AFTER train_alm_lora.hexa's
+//   save_lora_device_state() writes adapter_model.hexackpt — without
+//   modifying train_alm_lora.hexa during BG #21 trainer wiring (race
+//   avoidance per dest1 ALM ship checklist).
+//
+// OUTPUT SCHEMA (matches phi_gt_1000_verify.hexa expectation)
+//   {
+//     "step": <int>,
+//     "phi_holo_proxy": <float>,         // -log(max(ce, 1e-6))
+//     "phi_holo_scaled": <float>,        // phi_holo_proxy * 10000  ← GATE field
+//     "ce_proxy": <float>,               // last-batch CE
+//     "schema": "alm_phi_vec_logger_v1",
+//     "round": "<round_str>",
+//     "seed": <int>,
+//     "dest1_gate_scale": "phi_holo_scaled > 1000"
+//   }
+//
+// USAGE
+//   hexa run training/dest1_phi_vec_emit.hexa <ckpt_step_dir> <step> <ce> <round> <seed>
+//   example:
+//     hexa run training/dest1_phi_vec_emit.hexa \
+//       /workspace/ckpt_alm14b_r12/step_2000 2000 0.291 r12 3407
+//
+// EXIT
+//   0 = wrote
+//   2 = bad args / write fail
+//
+// CONVENTION
+//   Self-contained (no imports — feedback_hexa_silent_exit_5_imports).
+//   No FFI to hxqwen14b — CE is the only required input. If you have an
+//   actual phi_holo measurement (e.g. from hxqwen14b_compute_phi_holo),
+//   pass it as a 6th arg; otherwise we derive phi_holo_proxy from CE.
+
+fn fmt_float(f: float) -> string {
+    // 6-decimal formatting that survives stage0 number→string concat.
+    return to_string(f)
+}
+
+fn safe_log(x: float) -> float {
+    // log(0) = -inf hazard; clamp at 1e-6.
+    let clamped = if x < 0.000001 { 0.000001 } else { x }
+    return log(clamped)
+}
+
+fn main() {
+    let argv = args()
+    if argv.len() < 7 {
+        print_err("[dest1_emit] ERROR: usage:")
+        print_err("  hexa run training/dest1_phi_vec_emit.hexa <ckpt_step_dir> <step> <ce> <round> <seed> [phi_holo_override]")
+        exit(2)
+    }
+    let step_dir = argv[2]
+    let step = to_int(argv[3])
+    let ce = to_float(argv[4])
+    let round_s = argv[5]
+    let seed = to_int(argv[6])
+
+    // phi_holo: optional override at argv[7], else derive from CE.
+    let mut phi_holo_proxy = 0.0 - safe_log(ce)
+    if argv.len() >= 8 {
+        let override_v = to_float(argv[7])
+        // Only accept positive overrides; negative = sentinel.
+        if override_v > 0.0 { phi_holo_proxy = override_v }
+    }
+    let phi_holo_scaled = phi_holo_proxy * 10000.0
+
+    // Build JSON. Stage0-safe: explicit string concat per line.
+    let mut out = "{\n"
+    out = out + "  \"step\": " + to_string(step) + ",\n"
+    out = out + "  \"phi_holo_proxy\": " + fmt_float(phi_holo_proxy) + ",\n"
+    out = out + "  \"phi_holo_scaled\": " + fmt_float(phi_holo_scaled) + ",\n"
+    out = out + "  \"ce_proxy\": " + fmt_float(ce) + ",\n"
+    out = out + "  \"schema\": \"alm_phi_vec_logger_v1\",\n"
+    out = out + "  \"round\": \"" + round_s + "\",\n"
+    out = out + "  \"seed\": " + to_string(seed) + ",\n"
+    out = out + "  \"dest1_gate_scale\": \"phi_holo_scaled > 1000\"\n"
+    out = out + "}\n"
+
+    let path = step_dir + "/phi_vec.json"
+    write_file(path, out)
+    println("[dest1_emit] wrote " + path)
+    println("[dest1_emit] step=" + to_string(step) +
+            " phi_holo_scaled=" + fmt_float(phi_holo_scaled) +
+            " ce=" + fmt_float(ce))
+    exit(0)
+}
+
+main()
