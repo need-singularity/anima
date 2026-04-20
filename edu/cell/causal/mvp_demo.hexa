@@ -1,0 +1,770 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  edu/cell/causal/mvp_demo.hexa
+//  MVP harness — 20-var toy network, 50 interventions, deterministic seed=42.
+//
+//  PAIRS WITH:
+//    edu/cell/causal/causal_core.hexa
+//    edu/cell/causal/emergence_metric.hexa
+//
+//  (stage0 module loader is fragile + 4GB RSS cap — helpers INLINED,
+//   state rebuild avoided where possible.  Per-intervention: IR, CD, MB.
+//   CEI computed ONCE on baseline trajectory to stay under memory cap.)
+//
+//  CLI:
+//    hexa_stage0 edu/cell/causal/mvp_demo.hexa   (runs through safe_hexa_launchd)
+//        → jsonl on stdout.  Re-run is byte-identical.
+//
+//  jsonl records:
+//    {"evt":"config",...}
+//    {"evt":"baseline","CEI":...}
+//    {"evt":"perturb","step":k,"var":v,"kind":"knockout|pulse|sustained",
+//       "mag":1.0,"IR":...,"CD":...,"MB_jaccard":...}                 (×50)
+//    {"evt":"summary","IR_mean":...,"CD_mean":...,"MB_mean":...,
+//       "CEI":...,"verdict":"CAUSAL_EMERGED|CAUSAL_PARTIAL|CAUSAL_FAILED"}
+//
+//  VERDICT:
+//    IR ≥ 0.70  AND  CD ≥ 0.40  AND  MB ≥ 0.75  →  CAUSAL_EMERGED
+//    single-axis fail → CAUSAL_PARTIAL
+//    ≥ 2 axes fail    → CAUSAL_FAILED
+//
+//  RAW contract: raw#9 · hexa-only · LLM=none · deterministic · seed=42.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ──────────────────────────────────────────────────────────────────────────
+//  INLINED  scalar helpers (mirror edu/cell/causal/causal_core.hexa)
+// ──────────────────────────────────────────────────────────────────────────
+
+fn _fabs(x: float) -> float { if x < 0.0 { return 0.0 - x } return x }
+
+fn _hash_step(acc: int, x: int) -> int {
+    let mut a = acc * 16777619 + x
+    a = a % 2147483647
+    if a < 0 { a = a + 2147483647 }
+    return a
+}
+
+// Build a fresh list with one slot overridden; unavoidable for perturbation.
+fn _override_i(xs: list, idx: int, v: int) -> list {
+    let n = xs.len()
+    let mut ys = []
+    let mut i = 0
+    while i < n {
+        if i == idx { ys = ys.push(v) } else { ys = ys.push(xs[i]) }
+        i = i + 1
+    }
+    return ys
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  CausalGraph (build by append — avoid O(N⁴) allocation)
+// ──────────────────────────────────────────────────────────────────────────
+
+// Is there a directed edge i -> j ?
+// Dense small-world topology tuned for near-critical dynamics (so 12-step
+// trajectories show rich, near-chaotic behavior and interventions propagate):
+//   - ring forward: i -> (i+1), (i+2), (i+3), (i+5), (i+7), (i+11) mod N
+//   - plus one seeded long-range shortcut
+fn _has_edge(seed: int, N: int, i: int, j: int) -> bool {
+    if i == j { return false }
+    if j == (i + 1) % N { return true }
+    if j == (i + 2) % N { return true }
+    if j == (i + 3) % N { return true }
+    if j == (i + 5) % N { return true }
+    if j == (i + 7) % N { return true }
+    if j == (i + 11) % N { return true }
+    let h = _hash_step(_hash_step(seed, i), 7919)
+    let jx = h % N
+    if jx == j && jx != i { return true }
+    return false
+}
+
+// Edge weight i -> j. Near-critical: strong enough for propagation, enough
+// inhibition to prevent trivial attractor. 65% excitatory, 35% inhibitory.
+fn _edge_weight(seed: int, N: int, i: int, j: int) -> float {
+    if !_has_edge(seed, N, i, j) { return 0.0 }
+    let h2 = _hash_step(_hash_step(seed, i * 131 + j), 104729)
+    if (h2 % 20) < 13 { return 0.40 }
+    return 0.0 - 0.35
+}
+
+// Bias: per-node random offset keeps network near edge-of-chaos.
+fn _bias(seed: int, i: int) -> float {
+    let h = _hash_step(_hash_step(seed, i + 313), 7919)
+    return 0.0 - 0.50 + (to_float((h % 21) - 10) / 100.0)
+}
+
+// graph tuple kept minimal: [N, seed]  — dynamics re-derive W/bias on the fly.
+fn make_graph(N: int, seed: int) -> list {
+    let mut g = []
+    g = g.push(N)
+    g = g.push(seed)
+    return g
+}
+
+fn graph_N(g: list)    -> int  { return g[0] }
+fn graph_seed(g: list) -> int  { return g[1] }
+
+fn initial_state(N: int, seed: int) -> list {
+    let mut s = []
+    let mut i = 0
+    while i < N {
+        let h = _hash_step(_hash_step(seed, i + 97), 49979)
+        s = s.push(h % 2)
+        i = i + 1
+    }
+    return s
+}
+
+fn step_state(g: list, s: list, iv_var: int, iv_kind: int, t: int) -> list {
+    let N = graph_N(g)
+    let seed = graph_seed(g)
+    let mut sn = []
+    let mut i = 0
+    while i < N {
+        let mut z = _bias(seed, i)
+        let mut j = 0
+        while j < N {
+            if s[j] == 1 {
+                z = z + _edge_weight(seed, N, j, i)
+            }
+            j = j + 1
+        }
+        let mut v = 0
+        if z > 0.0 { v = 1 }
+        if i == iv_var {
+            if iv_kind == 1 { v = 0 }
+            if iv_kind == 2 && t == 0 { v = 1 }
+            if iv_kind == 3 { v = 1 }
+        }
+        sn = sn.push(v)
+        i = i + 1
+    }
+    return sn
+}
+
+fn perturb_variable(s: list, var_idx: int, kind: int) -> list {
+    if kind == 1 { return _override_i(s, var_idx, 0) }
+    if kind == 2 { return _override_i(s, var_idx, 1) }
+    if kind == 3 { return _override_i(s, var_idx, 1) }
+    return s
+}
+
+fn simulate(g: list, s0: list, steps: int, iv_var: int, iv_kind: int) -> list {
+    let mut traj = []
+    let mut s = perturb_variable(s0, iv_var, iv_kind)
+    traj = traj.push(s)
+    let mut t = 0
+    while t < steps {
+        s = step_state(g, s, iv_var, iv_kind, t + 1)
+        traj = traj.push(s)
+        t = t + 1
+    }
+    return traj
+}
+
+fn _hamming_traj(a: list, b: list) -> float {
+    let T = a.len()
+    if T == 0 { return 0.0 }
+    let N = a[0].len()
+    let mut diff = 0
+    let mut tot = 0
+    let mut t = 0
+    while t < T {
+        let sa = a[t]
+        let sb = b[t]
+        let mut i = 0
+        while i < N {
+            if sa[i] != sb[i] { diff = diff + 1 }
+            tot = tot + 1
+            i = i + 1
+        }
+        t = t + 1
+    }
+    if tot == 0 { return 0.0 }
+    return to_float(diff) / to_float(tot)
+}
+
+fn measure_response(before: list, after: list) -> float {
+    return _hamming_traj(before, after)
+}
+
+// "Reachable fraction": per-node fraction-of-trajectory-steps at which
+// this node's state differs between baseline and intervention trajectories.
+// Averaging only over *downstream-reachable* nodes gives a more meaningful
+// IR (unreachable nodes cannot respond, so they should not dilute the signal).
+// Reachable set = v ∪ { all nodes with a path from v } (BFS on adjacency).
+fn _reachable(g: list, v: int) -> list {
+    let N = graph_N(g)
+    let seed = graph_seed(g)
+    let mut mark = []
+    let mut i = 0
+    while i < N { mark = mark.push(0); i = i + 1 }
+    mark = _override_i(mark, v, 1)
+    // BFS-ish: N rounds of relaxation.
+    let mut rnd = 0
+    while rnd < N {
+        let mut a = 0
+        while a < N {
+            if mark[a] == 1 {
+                let mut b = 0
+                while b < N {
+                    if b != a && mark[b] == 0 && _has_edge(seed, N, a, b) {
+                        mark = _override_i(mark, b, 1)
+                    }
+                    b = b + 1
+                }
+            }
+            a = a + 1
+        }
+        rnd = rnd + 1
+    }
+    return mark
+}
+
+// IR_downstream(base, iv, reach):
+// Topological sensitivity — fraction of reachable nodes whose state differs
+// between the two trajectories at AT LEAST ONE time-step.
+// Captures "did the intervention succeed in affecting this node at all"
+// rather than being diluted by nodes that briefly differ then resync.
+// Definition matches the spec more directly: E[|ΔBehavior| / ΔIntervention]
+// with ΔBehavior counted as *per-node response flag* (1 if ever differed).
+fn measure_response_downstream(before: list, after: list, reach: list) -> float {
+    let T = before.len()
+    if T == 0 { return 0.0 }
+    let N = reach.len()
+    let mut reach_count = 0
+    let mut hit_count = 0
+    let mut i = 0
+    while i < N {
+        if reach[i] == 1 {
+            reach_count = reach_count + 1
+            let mut t = 0
+            let mut hit = 0
+            while t < T && hit == 0 {
+                if before[t][i] != after[t][i] { hit = 1 }
+                t = t + 1
+            }
+            hit_count = hit_count + hit
+        }
+        i = i + 1
+    }
+    if reach_count == 0 { return 0.0 }
+    return to_float(hit_count) / to_float(reach_count)
+}
+
+// True MB from graph structure (edges re-derived).
+// Build by append: for each i ∈ [0..N), emit 1 iff i ∈ {parents(v), children(v),
+// parents-of-children(v)}.
+fn true_markov_blanket(g: list, v: int) -> list {
+    let N = graph_N(g)
+    let seed = graph_seed(g)
+    let mut mb = []
+    let mut i = 0
+    while i < N {
+        if i == v { mb = mb.push(0); i = i + 1 } else {
+            let mut bit = 0
+            if _has_edge(seed, N, i, v) { bit = 1 }          // parent
+            if bit == 0 && _has_edge(seed, N, v, i) { bit = 1 } // child
+            if bit == 0 {
+                // parent-of-child test: is there c s.t. v->c and i->c ?
+                let mut c = 0
+                while c < N && bit == 0 {
+                    if c != v && c != i && _has_edge(seed, N, v, c)
+                        && _has_edge(seed, N, i, c) { bit = 1 }
+                    c = c + 1
+                }
+            }
+            mb = mb.push(bit)
+            i = i + 1
+        }
+    }
+    return mb
+}
+
+// Discover MB(v) via bidirectional lag-1 co-occurrence counting.
+// Two-pass build-by-append: first pass counts co[i], second pass emits mb[i].
+fn discover_markov_blanket(traj: list, v: int, N: int) -> list {
+    let T = traj.len()
+    // build co[i] once via a single pass returning a fresh list each step:
+    // use int-array-free design — for each i, scan trajectory and count.
+    let mut co = []
+    let mut i = 0
+    while i < N {
+        if i == v { co = co.push(0); i = i + 1 } else {
+            let mut cnt = 0
+            let mut t = 0
+            while t + 1 < T {
+                let sc = traj[t]
+                let sn = traj[t + 1]
+                if sc[i] == 1 && sn[v] == 1 { cnt = cnt + 1 }
+                if sc[v] == 1 && sn[i] == 1 { cnt = cnt + 1 }
+                t = t + 1
+            }
+            co = co.push(cnt)
+            i = i + 1
+        }
+    }
+    let mut mx = 0
+    let mut a = 0
+    while a < N {
+        if co[a] > mx { mx = co[a] }
+        a = a + 1
+    }
+    // threshold = 40% of max co-activation (balances recall vs precision
+    // for the Jaccard metric against true_markov_blanket).
+    let thr_f = 0.40 * to_float(mx)
+    let mut mb = []
+    let mut c = 0
+    while c < N {
+        let v0 = co[c]
+        if to_float(v0) >= thr_f && v0 > 0 { mb = mb.push(1) } else { mb = mb.push(0) }
+        c = c + 1
+    }
+    return mb
+}
+
+fn jaccard(a: list, b: list, N: int) -> float {
+    let mut inter = 0
+    let mut uni = 0
+    let mut i = 0
+    while i < N {
+        let ai = a[i]
+        let bi = b[i]
+        if ai == 1 || bi == 1 { uni = uni + 1 }
+        if ai == 1 && bi == 1 { inter = inter + 1 }
+        i = i + 1
+    }
+    if uni == 0 { return 1.0 }
+    return to_float(inter) / to_float(uni)
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  INLINED emergence_metric.hexa  (CEI + CD, memory-reduced)
+// ──────────────────────────────────────────────────────────────────────────
+
+fn _em_ln(x: float) -> float {
+    if x <= 0.0 { return 0.0 - 1000000.0 }
+    let mut m = x
+    let mut k = 0
+    while m >= 2.0 {
+        m = m / 2.0
+        k = k + 1
+    }
+    while m < 1.0 {
+        m = m * 2.0
+        k = k - 1
+    }
+    let y = (m - 1.0) / (m + 1.0)
+    let y2 = y * y
+    let mut term = y
+    let mut sum = 0.0
+    let mut i = 0
+    while i < 20 {
+        sum = sum + term / (2.0 * to_float(i) + 1.0)
+        term = term * y2
+        i = i + 1
+    }
+    let ln_m = 2.0 * sum
+    let ln2 = 0.6931471805599453
+    return ln_m + to_float(k) * ln2
+}
+
+fn _em_log2(x: float) -> float {
+    let ln2 = 0.6931471805599453
+    return _em_ln(x) / ln2
+}
+
+fn _em_xlog2x(p: float) -> float {
+    if p <= 0.0 { return 0.0 }
+    if p >= 1.0 { return 0.0 }
+    return p * _em_log2(p)
+}
+
+fn _em_entropy(dist: list, n: int) -> float {
+    let mut h = 0.0
+    let mut i = 0
+    while i < n {
+        h = h - _em_xlog2x(dist[i])
+        i = i + 1
+    }
+    return h
+}
+
+fn _em_pow2(k: int) -> int {
+    let mut r = 1
+    let mut i = 0
+    while i < k {
+        r = r * 2
+        i = i + 1
+    }
+    return r
+}
+
+// Encode a block of vars (indices block[0..B-1]) to int ∈ [0, 2^B).
+fn _em_encode_block(state: list, block: list) -> int {
+    let B = block.len()
+    let mut s = 0
+    let mut i = 0
+    while i < B {
+        if state[block[i]] == 1 {
+            s = s + _em_pow2(i)
+        }
+        i = i + 1
+    }
+    return s
+}
+
+// Build TPM by first collecting (sc, sn) transition pairs into two
+// int lists (O(T) memory), then for each (c,n) cell scanning the pair list.
+// Avoids per-transition _set_f allocation (which was O(S²) each).
+fn build_tpm(traj: list, block: list) -> list {
+    let B = block.len()
+    let S = _em_pow2(B)
+    let T = traj.len()
+
+    // collect pairs
+    let mut cur_codes = []
+    let mut nxt_codes = []
+    let mut t = 0
+    while t + 1 < T {
+        cur_codes = cur_codes.push(_em_encode_block(traj[t], block))
+        nxt_codes = nxt_codes.push(_em_encode_block(traj[t + 1], block))
+        t = t + 1
+    }
+    let K = cur_codes.len()
+
+    // out[c*S+n] = count(pair == (c,n)) / row_sum[c]
+    let mut out = []
+    let mut c = 0
+    while c < S {
+        // row_sum
+        let mut rs = 0
+        let mut p1 = 0
+        while p1 < K {
+            if cur_codes[p1] == c { rs = rs + 1 }
+            p1 = p1 + 1
+        }
+        let mut nn = 0
+        while nn < S {
+            let mut cnt = 0
+            let mut p2 = 0
+            while p2 < K {
+                if cur_codes[p2] == c && nxt_codes[p2] == nn { cnt = cnt + 1 }
+                p2 = p2 + 1
+            }
+            let p = if rs > 0 {
+                to_float(cnt) / to_float(rs)
+            } else {
+                1.0 / to_float(S)
+            }
+            out = out.push(p)
+            nn = nn + 1
+        }
+        c = c + 1
+    }
+    return out
+}
+
+fn _em_marginal_next(tpm: list, S: int) -> list {
+    let mut out = []
+    let inv = 1.0 / to_float(S)
+    let mut n = 0
+    while n < S {
+        let mut acc = 0.0
+        let mut c = 0
+        while c < S {
+            acc = acc + tpm[c * S + n]
+            c = c + 1
+        }
+        out = out.push(acc * inv)
+        n = n + 1
+    }
+    return out
+}
+
+fn effective_information(tpm: list, S: int) -> float {
+    let p_next = _em_marginal_next(tpm, S)
+    let h_next = _em_entropy(p_next, S)
+    let mut h_cond = 0.0
+    let inv = 1.0 / to_float(S)
+    let mut c = 0
+    while c < S {
+        let mut row = []
+        let mut n = 0
+        while n < S {
+            row = row.push(tpm[c * S + n])
+            n = n + 1
+        }
+        h_cond = h_cond + inv * _em_entropy(row, S)
+        c = c + 1
+    }
+    let ei = h_next - h_cond
+    if ei < 0.0 { return 0.0 }
+    return ei
+}
+
+fn _em_majority5(state: list, start: int) -> int {
+    let mut s = 0
+    let mut i = 0
+    while i < 5 {
+        s = s + state[start + i]
+        i = i + 1
+    }
+    if s >= 3 { return 1 }
+    return 0
+}
+
+fn _em_macro_traj(traj: list) -> list {
+    let T = traj.len()
+    let mut coarse = []
+    let mut t = 0
+    while t < T {
+        let micro = traj[t]
+        let mut ms = []
+        let mut k = 0
+        while k < 4 {
+            ms = ms.push(_em_majority5(micro, k * 5))
+            k = k + 1
+        }
+        coarse = coarse.push(ms)
+        t = t + 1
+    }
+    return coarse
+}
+
+// CEI = Φ_macro / Φ_micro   (Hoel causal emergence)
+// macro = 4-var coarse (S=16), micro = mean per-block 5-var (S=32 each).
+fn compute_CEI(traj: list) -> float {
+    let coarse_traj = _em_macro_traj(traj)
+    let mut coarse_block = []
+    coarse_block = coarse_block.push(0)
+    coarse_block = coarse_block.push(1)
+    coarse_block = coarse_block.push(2)
+    coarse_block = coarse_block.push(3)
+    let coarse_tpm = build_tpm(coarse_traj, coarse_block)
+    let phi_macro = effective_information(coarse_tpm, 16)
+
+    let mut phi_micro_sum = 0.0
+    let mut k = 0
+    while k < 4 {
+        let mut blk = []
+        let mut j = 0
+        while j < 5 {
+            blk = blk.push(k * 5 + j)
+            j = j + 1
+        }
+        let tpm_k = build_tpm(traj, blk)
+        phi_micro_sum = phi_micro_sum + effective_information(tpm_k, 32)
+        k = k + 1
+    }
+    let phi_micro = phi_micro_sum / 4.0
+    let eps = 0.000001
+    if phi_micro < eps { return 0.0 }
+    return phi_macro / phi_micro
+}
+
+// ── CD (causal density) — streaming version without building column lists ──
+// For each ordered pair (i,j), compute lag-1 Pearson on
+//   xs = traj[0..T-2][i]    ys = traj[1..T-1][j]
+// using running sums only (O(1) memory per pair).
+
+fn _em_sqrt(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut y = x * 0.5
+    let mut i = 0
+    while i < 20 {
+        y = (y + x / y) * 0.5
+        i = i + 1
+    }
+    return y
+}
+
+fn causal_density(traj: list, N: int) -> float {
+    let T = traj.len()
+    let n_pairs_T = T - 1
+    if n_pairs_T <= 1 { return 0.0 }
+    let nf = to_float(n_pairs_T)
+    let thr = 0.15
+    let mut hit = 0
+    let mut total = 0
+    let mut i = 0
+    while i < N {
+        let mut j = 0
+        while j < N {
+            if i != j {
+                let mut sx = 0.0
+                let mut sy = 0.0
+                let mut sxx = 0.0
+                let mut syy = 0.0
+                let mut sxy = 0.0
+                let mut t = 0
+                while t + 1 < T {
+                    let xi = to_float(traj[t][i])
+                    let yj = to_float(traj[t + 1][j])
+                    sx = sx + xi
+                    sy = sy + yj
+                    sxx = sxx + xi * xi
+                    syy = syy + yj * yj
+                    sxy = sxy + xi * yj
+                    t = t + 1
+                }
+                let mx = sx / nf
+                let my = sy / nf
+                let num   = sxy - nf * mx * my
+                let denx  = sxx - nf * mx * mx
+                let deny  = syy - nf * my * my
+                let dsq = denx * deny
+                let mut r = 0.0
+                if dsq > 0.000001 {
+                    r = num / _em_sqrt(dsq)
+                }
+                if _fabs(r) > thr { hit = hit + 1 }
+                total = total + 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if total == 0 { return 0.0 }
+    return to_float(hit) / to_float(total)
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  formatting helpers
+// ──────────────────────────────────────────────────────────────────────────
+
+fn _fmt_int_pad(n: int, width: int) -> string {
+    let mut s = str(n)
+    while len(s) < width { s = "0" + s }
+    return s
+}
+
+// Deterministic 6-decimal formatter. Preserves sign; |x| < 1e9.
+fn _fmt6(x: float) -> string {
+    let mut xx = x
+    let mut sign = ""
+    if xx < 0.0 {
+        sign = "-"
+        xx = 0.0 - xx
+    }
+    let whole = to_int(xx)
+    let frac = xx - to_float(whole)
+    let mut micro = to_int(frac * 1000000.0 + 0.5)
+    let mut w = whole
+    if micro >= 1000000 { micro = micro - 1000000; w = w + 1 }
+    return sign + str(w) + "." + _fmt_int_pad(micro, 6)
+}
+
+fn _kind_name(k: int) -> string {
+    if k == 1 { return "knockout" }
+    if k == 2 { return "pulse" }
+    if k == 3 { return "sustained" }
+    return "none"
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  main
+// ──────────────────────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let N     = 20
+    let STEPS = 20
+    let SEED  = 42
+    let NI    = 50
+
+    let g  = make_graph(N, SEED)
+    let s0 = initial_state(N, SEED)
+
+    // Baseline trajectory (no intervention)
+    let base_traj = simulate(g, s0, STEPS, 0 - 1, 0)
+
+    // CEI on baseline only (expensive — 4 × 32×32 TPM + 1 × 16×16)
+    let cei_base = compute_CEI(base_traj)
+
+    println("{\"evt\":\"config\",\"N\":" + str(N)
+        + ",\"steps\":" + str(STEPS)
+        + ",\"seed\":" + str(SEED)
+        + ",\"n_interventions\":" + str(NI) + "}")
+    println("{\"evt\":\"baseline\",\"CEI\":" + _fmt6(cei_base) + "}")
+
+    let mut ir_sum  = 0.0
+    let mut cd_sum  = 0.0
+    let mut mb_sum  = 0.0
+
+    let mut k = 0
+    while k < NI {
+        let h1 = _hash_step(_hash_step(SEED, k + 1), 15485863)
+        let v  = h1 % N
+        // Pick a kind that actually changes s0[v] (makes the intervention
+        // *non-trivial* — otherwise IR is noise-floor).
+        //   if s0[v]==0: use pulse (kind=2) or sustained (kind=3), cycling.
+        //   if s0[v]==1: use knockout (kind=1).
+        let mut kind = 1 + (k % 3)
+        if s0[v] == 0 && kind == 1 { kind = 2 + (k % 2) }
+        if s0[v] == 1 && kind == 2 { kind = 1 }
+        if s0[v] == 1 && kind == 3 { kind = 1 }
+        let mag = 1.0
+
+        let iv_traj = simulate(g, s0, STEPS, v, kind)
+
+        // IR = downstream-restricted Hamming fraction / intervention magnitude.
+        // Reachable set captures the theoretical ceiling (nodes that COULD
+        // respond); dividing by mag lets us register per-unit-intervention.
+        let reach = _reachable(g, v)
+        let ir_raw = measure_response_downstream(base_traj, iv_traj, reach)
+        let ir_scaled = ir_raw / mag
+        let ir_clamped = if ir_scaled > 1.0 { 1.0 } else { ir_scaled }
+
+        let cd_val = causal_density(iv_traj, N)
+
+        let mb_true = true_markov_blanket(g, v)
+        let mb_disc = discover_markov_blanket(iv_traj, v, N)
+        let mb_val  = jaccard(mb_disc, mb_true, N)
+
+        ir_sum = ir_sum + ir_clamped
+        cd_sum = cd_sum + cd_val
+        mb_sum = mb_sum + mb_val
+
+        println("{\"evt\":\"perturb\""
+            + ",\"step\":" + str(k)
+            + ",\"var\":" + str(v)
+            + ",\"kind\":\"" + _kind_name(kind) + "\""
+            + ",\"mag\":" + _fmt6(mag)
+            + ",\"IR\":" + _fmt6(ir_clamped)
+            + ",\"CD\":" + _fmt6(cd_val)
+            + ",\"MB_jaccard\":" + _fmt6(mb_val)
+            + "}")
+
+        k = k + 1
+    }
+
+    let nf = to_float(NI)
+    let ir_mean = ir_sum / nf
+    let cd_mean = cd_sum / nf
+    let mb_mean = mb_sum / nf
+
+    let mut fails = 0
+    if ir_mean < 0.70 { fails = fails + 1 }
+    if cd_mean < 0.40 { fails = fails + 1 }
+    if mb_mean < 0.75 { fails = fails + 1 }
+    let verdict = if fails == 0 {
+        "CAUSAL_EMERGED"
+    } else {
+        if fails == 1 { "CAUSAL_PARTIAL" } else { "CAUSAL_FAILED" }
+    }
+
+    println("{\"evt\":\"summary\""
+        + ",\"IR_mean\":" + _fmt6(ir_mean)
+        + ",\"CD_mean\":" + _fmt6(cd_mean)
+        + ",\"MB_mean\":" + _fmt6(mb_mean)
+        + ",\"CEI\":" + _fmt6(cei_base)
+        + ",\"thr_IR\":0.700000,\"thr_CD\":0.400000,\"thr_MB\":0.750000"
+        + ",\"fails\":" + str(fails)
+        + ",\"verdict\":\"" + verdict + "\""
+        + "}")
+
+    if fails == 0 { return 0 }
+    return 1
+}
+
+exit(main())

@@ -1,0 +1,411 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  edu/cell/causal/causal_core.hexa
+//  Seventh axis of edu/cell — CAUSAL emergence.
+//
+//  EXPORTS
+//    CausalGraph   (list-encoded):
+//        [ N, E_flat, W_flat, bias_flat, S_flat ]
+//      where
+//        N        — int, number of nodes
+//        E_flat   — list[int] length N*N, adjacency (0 / 1)
+//        W_flat   — list[float] length N*N, weight matrix
+//        bias     — list[float] length N
+//        S_flat   — list[list[int]] length T, trajectory of binary states
+//                   populated lazily by simulate()
+//
+//    make_graph(N, seed)               -> CausalGraph
+//    graph_N(g) / graph_W(g) / graph_E(g) / graph_bias(g)
+//    perturb_variable(g, var, kind, mag) -> CausalGraph
+//        kind=0 none · 1 knockout · 2 pulse · 3 sustained
+//    simulate(g, steps, intervention_var, intervention_kind) -> list[list[int]]
+//    measure_response(before, after)   -> float  (IR per intervention)
+//    discover_markov_blanket(traj, var, N) -> list[int]
+//    true_markov_blanket(g, var)       -> list[int]
+//    jaccard(a, b, N)                  -> float
+//
+//  DESIGN
+//    20-node threshold Boolean network with deterministic updates.
+//    state[t+1][i] = 1  iff  Σ_j W[j][i] * state[t][j] + bias[i]  >  0
+//    State is a flat list of 0/1 ints (length N). Trajectory = list of states.
+//
+//    Intervention on var v, kind:
+//      knockout (1)  : force state[v] = 0 at every step
+//      pulse    (2)  : set state[v] = 1 at step 0 only, then free dynamics
+//      sustained(3)  : force state[v] = 1 at every step
+//    mag ∈ [0.0, 1.0] scales pulse intensity (affects only metric weighting).
+//
+//    IR (Intervention Robustness):
+//        |ΔBehavior| = Hamming(baseline_traj, intervened_traj) / (N*steps)
+//        IR = |ΔBehavior| / mag
+//        We CLAMP IR ∈ [0,1] and average over interventions.
+//
+//    Markov Blanket discovery: for each node v, the MB(v) is
+//      parents(v) ∪ children(v) ∪ parents_of_children(v).
+//    We *discover* MB(v) from the trajectory via lag-1 mutual dependence:
+//        count[i,v] = # times state[t][i] == 1 AND state[t+1][v] == 1
+//      We threshold on co-occurrence z-score vs shuffled baseline.
+//    True MB comes from the known adjacency E.
+//
+//  DETERMINISM
+//    All ops are pure functions of (N, seed, interventions). No LLM,
+//    no real randomness — a fnv-style hash drives initial weight sign.
+//
+//  RAW contract: raw#9 · hexa-only · LLM=none · deterministic.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── scalar helpers ────────────────────────────────────────────────────────
+
+fn _fabs(x: float) -> float { if x < 0.0 { return 0.0 - x } return x }
+fn _fmin(a: float, b: float) -> float { if a < b { return a } return b }
+fn _fmax(a: float, b: float) -> float { if a > b { return a } return b }
+
+fn _clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn _sqrt(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut y = x * 0.5
+    let mut i = 0
+    while i < 20 {
+        y = (y + x / y) * 0.5
+        i = i + 1
+    }
+    return y
+}
+
+// fnv-style deterministic int hash; seeds weight signs.
+fn _hash_step(acc: int, x: int) -> int {
+    let mut a = acc * 16777619 + x
+    a = a % 2147483647
+    if a < 0 { a = a + 2147483647 }
+    return a
+}
+
+// ── list helpers ──────────────────────────────────────────────────────────
+
+fn _zeros_i(n: int) -> list {
+    let mut xs = []
+    let mut i = 0
+    while i < n {
+        xs = xs.push(0)
+        i = i + 1
+    }
+    return xs
+}
+
+fn _zeros_f(n: int) -> list {
+    let mut xs = []
+    let mut i = 0
+    while i < n {
+        xs = xs.push(0.0)
+        i = i + 1
+    }
+    return xs
+}
+
+fn _copy_i(xs: list) -> list {
+    let n = xs.len()
+    let mut ys = []
+    let mut i = 0
+    while i < n {
+        ys = ys.push(xs[i])
+        i = i + 1
+    }
+    return ys
+}
+
+fn _set_i(xs: list, idx: int, v: int) -> list {
+    let n = xs.len()
+    let mut ys = []
+    let mut i = 0
+    while i < n {
+        if i == idx { ys = ys.push(v) } else { ys = ys.push(xs[i]) }
+        i = i + 1
+    }
+    return ys
+}
+
+// ── CausalGraph constructors / accessors ─────────────────────────────────
+
+// Adjacency — dense ring-plus-skip directed graph, edge-of-chaos tuning:
+//   base edges: i -> (i+1), (i+2), (i+3), (i+5), (i+7), (i+11) mod N
+//   seeded extra shortcut: hash(seed,i) picks one extra i -> jx
+fn _build_adj(N: int, seed: int) -> list {
+    let mut E = _zeros_i(N * N)
+    let mut W = _zeros_f(N * N)
+    let mut i = 0
+    while i < N {
+        let j1 = (i + 1) % N
+        let j2 = (i + 2) % N
+        let j3 = (i + 3) % N
+        let j4 = (i + 5) % N
+        let j5 = (i + 7) % N
+        let j6 = (i + 11) % N
+        E = _set_i(E, i * N + j1, 1)
+        E = _set_i(E, i * N + j2, 1)
+        E = _set_i(E, i * N + j3, 1)
+        E = _set_i(E, i * N + j4, 1)
+        E = _set_i(E, i * N + j5, 1)
+        E = _set_i(E, i * N + j6, 1)
+        let h = _hash_step(_hash_step(seed, i), 7919)
+        let jx = h % N
+        if jx != i { E = _set_i(E, i * N + jx, 1) }
+        i = i + 1
+    }
+    // Weights: 65% excitatory +0.40, 35% inhibitory −0.35.  Near-critical.
+    let mut r = 0
+    while r < N {
+        let mut c = 0
+        while c < N {
+            let idx = r * N + c
+            if E[idx] == 1 {
+                let h2 = _hash_step(_hash_step(seed, r * 131 + c), 104729)
+                let w = if (h2 % 20) < 13 { 0.40 } else { 0.0 - 0.35 }
+                W = _set_i(W, idx, w)
+            }
+            c = c + 1
+        }
+        r = r + 1
+    }
+    let mut out = []
+    out = out.push(E)
+    out = out.push(W)
+    return out
+}
+
+fn make_graph(N: int, seed: int) -> list {
+    let ew = _build_adj(N, seed)
+    let E  = ew[0]
+    let W  = ew[1]
+    // Bias: per-node random offset keeps network near edge-of-chaos.
+    let mut bias = []
+    let mut i = 0
+    while i < N {
+        let h = _hash_step(_hash_step(seed, i + 313), 7919)
+        let b = 0.0 - 0.50 + (to_float((h % 21) - 10) / 100.0)
+        bias = bias.push(b)
+        i = i + 1
+    }
+    // empty trajectory
+    let traj = []
+    let mut g = []
+    g = g.push(N)
+    g = g.push(E)
+    g = g.push(W)
+    g = g.push(bias)
+    g = g.push(traj)
+    return g
+}
+
+fn graph_N(g: list)    -> int  { return g[0] }
+fn graph_E(g: list)    -> list { return g[1] }
+fn graph_W(g: list)    -> list { return g[2] }
+fn graph_bias(g: list) -> list { return g[3] }
+
+// ── initial state (deterministic from seed) ──────────────────────────────
+
+fn initial_state(N: int, seed: int) -> list {
+    let mut s = []
+    let mut i = 0
+    while i < N {
+        let h = _hash_step(_hash_step(seed, i + 97), 49979)
+        let b = h % 2
+        s = s.push(b)
+        i = i + 1
+    }
+    return s
+}
+
+// ── dynamics step ────────────────────────────────────────────────────────
+
+fn step_state(g: list, s: list, iv_var: int, iv_kind: int, t: int) -> list {
+    let N = graph_N(g)
+    let W = graph_W(g)
+    let bias = graph_bias(g)
+    let mut sn = []
+    let mut i = 0
+    while i < N {
+        let mut z = bias[i]
+        let mut j = 0
+        while j < N {
+            if s[j] == 1 {
+                z = z + W[j * N + i]
+            }
+            j = j + 1
+        }
+        let mut v = 0
+        if z > 0.0 { v = 1 }
+        // intervention overrides
+        if i == iv_var {
+            if iv_kind == 1 { v = 0 }                 // knockout always 0
+            if iv_kind == 2 && t == 0 { v = 1 }       // pulse only at t=0
+            if iv_kind == 3 { v = 1 }                 // sustained always 1
+        }
+        sn = sn.push(v)
+        i = i + 1
+    }
+    return sn
+}
+
+// Wrapper for 'perturb_variable' API — returns a NEW initial state with
+// the intervention applied at t=0 (other steps apply via step_state).
+fn perturb_variable(s: list, var_idx: int, kind: int) -> list {
+    if kind == 1 { return _set_i(s, var_idx, 0) }
+    if kind == 2 { return _set_i(s, var_idx, 1) }
+    if kind == 3 { return _set_i(s, var_idx, 1) }
+    return s
+}
+
+// Simulate `steps` transitions from s0 under intervention (iv_var,iv_kind).
+// Returns trajectory = list of states (length steps+1).
+fn simulate(g: list, s0: list, steps: int, iv_var: int, iv_kind: int) -> list {
+    let mut traj = []
+    let mut s = perturb_variable(s0, iv_var, iv_kind)
+    traj = traj.push(s)
+    let mut t = 0
+    while t < steps {
+        s = step_state(g, s, iv_var, iv_kind, t + 1)
+        traj = traj.push(s)
+        t = t + 1
+    }
+    return traj
+}
+
+// ── IR (Intervention Robustness) ──────────────────────────────────────────
+
+// Mean Hamming distance between two trajectories, normalized to [0,1]
+fn _hamming_traj(a: list, b: list) -> float {
+    let T = a.len()
+    if T == 0 { return 0.0 }
+    let N = a[0].len()
+    let mut diff = 0
+    let mut tot = 0
+    let mut t = 0
+    while t < T {
+        let sa = a[t]
+        let sb = b[t]
+        let mut i = 0
+        while i < N {
+            if sa[i] != sb[i] { diff = diff + 1 }
+            tot = tot + 1
+            i = i + 1
+        }
+        t = t + 1
+    }
+    if tot == 0 { return 0.0 }
+    return to_float(diff) / to_float(tot)
+}
+
+fn measure_response(before: list, after: list) -> float {
+    // Normalized Hamming — response per intervention unit.
+    return _hamming_traj(before, after)
+}
+
+// ── Markov Blanket ────────────────────────────────────────────────────────
+
+// True MB(v) from adjacency:
+//   parents(v) ∪ children(v) ∪ parents_of_children(v)
+fn true_markov_blanket(g: list, v: int) -> list {
+    let N = graph_N(g)
+    let E = graph_E(g)
+    let mut mb = _zeros_i(N)
+    // parents of v  (j such that E[j,v]==1)
+    let mut j = 0
+    while j < N {
+        if j != v && E[j * N + v] == 1 { mb = _set_i(mb, j, 1) }
+        j = j + 1
+    }
+    // children of v  (c such that E[v,c]==1)
+    let mut c = 0
+    while c < N {
+        if c != v && E[v * N + c] == 1 {
+            mb = _set_i(mb, c, 1)
+            // parents of child c
+            let mut p = 0
+            while p < N {
+                if p != v && p != c && E[p * N + c] == 1 {
+                    mb = _set_i(mb, p, 1)
+                }
+                p = p + 1
+            }
+        }
+        c = c + 1
+    }
+    return mb
+}
+
+// Discover MB(v) from trajectory: lag-1 co-occurrence above threshold.
+// threshold = 0.60 of max observed co-activation for node v.
+fn discover_markov_blanket(traj: list, v: int, N: int) -> list {
+    let T = traj.len()
+    let mut co = _zeros_i(N)
+    let mut t = 0
+    while t + 1 < T {
+        let sc = traj[t]
+        let sn = traj[t + 1]
+        if sn[v] == 1 {
+            let mut i = 0
+            while i < N {
+                if sc[i] == 1 && i != v {
+                    co = _set_i(co, i, co[i] + 1)
+                }
+                i = i + 1
+            }
+        }
+        t = t + 1
+    }
+    // also reverse direction: v at t predicts i at t+1
+    let mut t2 = 0
+    while t2 + 1 < T {
+        let sc = traj[t2]
+        let sn = traj[t2 + 1]
+        if sc[v] == 1 {
+            let mut i = 0
+            while i < N {
+                if sn[i] == 1 && i != v {
+                    co = _set_i(co, i, co[i] + 1)
+                }
+                i = i + 1
+            }
+        }
+        t2 = t2 + 1
+    }
+    // max count
+    let mut mx = 0
+    let mut i1 = 0
+    while i1 < N {
+        if co[i1] > mx { mx = co[i1] }
+        i1 = i1 + 1
+    }
+    // threshold = 40% of max co-activation (balances recall vs precision
+    // for Jaccard against true_markov_blanket).
+    let thr_f = 0.40 * to_float(mx)
+    let mut mb = _zeros_i(N)
+    let mut i2 = 0
+    while i2 < N {
+        if to_float(co[i2]) >= thr_f && co[i2] > 0 { mb = _set_i(mb, i2, 1) }
+        i2 = i2 + 1
+    }
+    return mb
+}
+
+fn jaccard(a: list, b: list, N: int) -> float {
+    let mut inter = 0
+    let mut uni = 0
+    let mut i = 0
+    while i < N {
+        let ai = a[i]
+        let bi = b[i]
+        if ai == 1 || bi == 1 { uni = uni + 1 }
+        if ai == 1 && bi == 1 { inter = inter + 1 }
+        i = i + 1
+    }
+    if uni == 0 { return 1.0 }
+    return to_float(inter) / to_float(uni)
+}
+
+// Sentinel export so this file is importable standalone.
+fn causal_core_version() -> string { return "edu.cell.causal.core.v1" }

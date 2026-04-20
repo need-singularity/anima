@@ -1,0 +1,369 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  edu/cell/causal/emergence_metric.hexa
+//  CEI (Causal Emergence Index) + CD (Causal Density)
+//
+//  CEI = Φ_macro / Φ_micro     (Hoel 2013)
+//    Φ here is Effective Information (EI) of the coarse-grained vs fine-grained
+//    transition probability matrix.  We inline a minimal EI() that is
+//    byte-equivalent to `hexa-lang/self/ml/phi_metric.hexa::effective_information`.
+//
+//  CD = non_spurious_edges / total_possible_edges
+//    edge (i -> j) counted as non-spurious iff lag-1 Pearson correlation
+//    |ρ(state_i[0..T-1], state_j[1..T])| > CD_THRESH (0.15).
+//
+//  TRAJECTORY → TPM construction:
+//    For a block of B binary vars (B ≤ 5 for tractability), encode state as
+//    an integer s = Σ_i state[i] * 2^i. Count transitions cur→next across the
+//    trajectory to build TPM[s_cur * S + s_next], row-normalize.
+//
+//  MACRO coarse-graining (20 → 4):
+//    macro[k] = majority( micro[5*k .. 5*k+4] )
+//    Φ_macro = EI of the 4-variable coarse TPM (S=16).
+//    Φ_micro = mean EI of each of the 4 blocks treated independently
+//              (5-variable TPM, S=32, per block; mean over 4 blocks).
+//    CEI = Φ_macro / max(Φ_micro, epsilon).
+//
+//  RAW contract: raw#9 · hexa-only · LLM=none · deterministic.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── math primitives (inlined from phi_metric.hexa) ───────────────────────
+
+fn _em_abs(x: float) -> float { if x < 0.0 { return 0.0 - x } return x }
+
+fn _em_ln(x: float) -> float {
+    if x <= 0.0 { return 0.0 - 1000000.0 }
+    let mut m = x
+    let mut k = 0
+    while m >= 2.0 {
+        m = m / 2.0
+        k = k + 1
+    }
+    while m < 1.0 {
+        m = m * 2.0
+        k = k - 1
+    }
+    let y = (m - 1.0) / (m + 1.0)
+    let y2 = y * y
+    let mut term = y
+    let mut sum = 0.0
+    let mut i = 0
+    while i < 20 {
+        sum = sum + term / (2.0 * to_float(i) + 1.0)
+        term = term * y2
+        i = i + 1
+    }
+    let ln_m = 2.0 * sum
+    let ln2 = 0.6931471805599453
+    return ln_m + to_float(k) * ln2
+}
+
+fn _em_log2(x: float) -> float {
+    let ln2 = 0.6931471805599453
+    return _em_ln(x) / ln2
+}
+
+// p · log2(p) with 0·log2(0) = 0
+fn _em_xlog2x(p: float) -> float {
+    if p <= 0.0 { return 0.0 }
+    if p >= 1.0 { return 0.0 }
+    return p * _em_log2(p)
+}
+
+fn _em_entropy(dist: list, n: int) -> float {
+    let mut h = 0.0
+    let mut i = 0
+    while i < n {
+        h = h - _em_xlog2x(dist[i])
+        i = i + 1
+    }
+    return h
+}
+
+// ── TPM + EI (from phi_metric.hexa::effective_information) ───────────────
+
+fn _em_pow2(k: int) -> int {
+    let mut r = 1
+    let mut i = 0
+    while i < k {
+        r = r * 2
+        i = i + 1
+    }
+    return r
+}
+
+// marginal next-state distribution under uniform cause prior.
+fn _em_marginal_next(tpm: list, S: int) -> list {
+    let mut out = []
+    let inv = 1.0 / to_float(S)
+    let mut n = 0
+    while n < S {
+        let mut acc = 0.0
+        let mut c = 0
+        while c < S {
+            acc = acc + tpm[c * S + n]
+            c = c + 1
+        }
+        out = out.push(acc * inv)
+        n = n + 1
+    }
+    return out
+}
+
+// EI(S_cur; S_next) = H(next) − H(next|cur)   under uniform prior on cur.
+fn effective_information(tpm: list, S: int) -> float {
+    let p_next = _em_marginal_next(tpm, S)
+    let h_next = _em_entropy(p_next, S)
+    let mut h_cond = 0.0
+    let inv = 1.0 / to_float(S)
+    let mut c = 0
+    while c < S {
+        let mut row = []
+        let mut n = 0
+        while n < S {
+            row = row.push(tpm[c * S + n])
+            n = n + 1
+        }
+        h_cond = h_cond + inv * _em_entropy(row, S)
+        c = c + 1
+    }
+    let ei = h_next - h_cond
+    if ei < 0.0 { return 0.0 }
+    return ei
+}
+
+// ── build TPM from trajectory ────────────────────────────────────────────
+
+// Encode the state of a block of vars (indices block[0..B-1]) as int ∈ [0, 2^B).
+fn _em_encode_block(state: list, block: list) -> int {
+    let B = block.len()
+    let mut s = 0
+    let mut i = 0
+    while i < B {
+        if state[block[i]] == 1 {
+            s = s + _em_pow2(i)
+        }
+        i = i + 1
+    }
+    return s
+}
+
+// Build TPM[S,S] from trajectory by counting transitions over the block.
+fn build_tpm(traj: list, block: list) -> list {
+    let B = block.len()
+    let S = _em_pow2(B)
+    let T = traj.len()
+    // counts
+    let mut cnt = []
+    let mut z = 0
+    while z < S * S {
+        cnt = cnt.push(0.0)
+        z = z + 1
+    }
+    let mut row_sum = []
+    let mut r0 = 0
+    while r0 < S {
+        row_sum = row_sum.push(0.0)
+        r0 = r0 + 1
+    }
+    let mut t = 0
+    while t + 1 < T {
+        let sc = _em_encode_block(traj[t], block)
+        let sn = _em_encode_block(traj[t + 1], block)
+        let idx = sc * S + sn
+        // mutate by rebuild
+        let mut nc = []
+        let mut k = 0
+        while k < S * S {
+            if k == idx { nc = nc.push(cnt[k] + 1.0) } else { nc = nc.push(cnt[k]) }
+            k = k + 1
+        }
+        cnt = nc
+        let mut nr = []
+        let mut k2 = 0
+        while k2 < S {
+            if k2 == sc { nr = nr.push(row_sum[k2] + 1.0) } else { nr = nr.push(row_sum[k2]) }
+            k2 = k2 + 1
+        }
+        row_sum = nr
+        t = t + 1
+    }
+    // row-normalize with Laplace smoothing (avoid zero rows breaking marginal)
+    let mut out = []
+    let mut c = 0
+    while c < S {
+        let rs = row_sum[c]
+        let mut nn = 0
+        while nn < S {
+            let v = cnt[c * S + nn]
+            let p = if rs > 0.0 {
+                v / rs
+            } else {
+                1.0 / to_float(S)
+            }
+            out = out.push(p)
+            nn = nn + 1
+        }
+        c = c + 1
+    }
+    return out
+}
+
+// ── macro coarse-graining (Hoel) ─────────────────────────────────────────
+
+// Majority over 5 bits.
+fn _em_majority5(state: list, start: int) -> int {
+    let mut s = 0
+    let mut i = 0
+    while i < 5 {
+        s = s + state[start + i]
+        i = i + 1
+    }
+    if s >= 3 { return 1 }
+    return 0
+}
+
+// Build macro trajectory: 4 vars, one per block of 5.
+fn _em_macro_traj(traj: list) -> list {
+    let T = traj.len()
+    let mut coarse = []
+    let mut t = 0
+    while t < T {
+        let micro = traj[t]
+        let mut ms = []
+        let mut k = 0
+        while k < 4 {
+            ms = ms.push(_em_majority5(micro, k * 5))
+            k = k + 1
+        }
+        coarse = coarse.push(ms)
+        t = t + 1
+    }
+    return coarse
+}
+
+// Compute CEI via macro/micro EI ratio.
+// macro: 4-node TPM (S=16) over majority-vote blocks.
+// micro: mean of 4 per-block 5-node TPMs (S=32 each).
+fn compute_CEI(traj: list) -> float {
+    // macro block = [0..3] over 4-var coarse states
+    let coarse_traj = _em_macro_traj(traj)
+    let mut coarse_block = []
+    coarse_block = coarse_block.push(0)
+    coarse_block = coarse_block.push(1)
+    coarse_block = coarse_block.push(2)
+    coarse_block = coarse_block.push(3)
+    let coarse_tpm = build_tpm(coarse_traj, coarse_block)
+    let phi_macro = effective_information(coarse_tpm, 16)
+
+    // micro: each block of 5 vars in the original 20-var trajectory.
+    let mut phi_micro_sum = 0.0
+    let mut k = 0
+    while k < 4 {
+        let mut blk = []
+        let mut j = 0
+        while j < 5 {
+            blk = blk.push(k * 5 + j)
+            j = j + 1
+        }
+        let tpm_k = build_tpm(traj, blk)
+        phi_micro_sum = phi_micro_sum + effective_information(tpm_k, 32)
+        k = k + 1
+    }
+    let phi_micro = phi_micro_sum / 4.0
+    let eps = 0.000001
+    if phi_micro < eps { return 0.0 }
+    return phi_macro / phi_micro
+}
+
+// ── Causal Density via Granger lag-1 correlation ─────────────────────────
+
+// Pearson correlation of two binary vectors (0/1).
+fn _em_pearson(xs: list, ys: list) -> float {
+    let n = xs.len()
+    if n == 0 { return 0.0 }
+    let mut sx = 0.0
+    let mut sy = 0.0
+    let mut i = 0
+    while i < n {
+        sx = sx + to_float(xs[i])
+        sy = sy + to_float(ys[i])
+        i = i + 1
+    }
+    let nf = to_float(n)
+    let mx = sx / nf
+    let my = sy / nf
+    let mut num = 0.0
+    let mut dxx = 0.0
+    let mut dyy = 0.0
+    let mut j = 0
+    while j < n {
+        let dx = to_float(xs[j]) - mx
+        let dy = to_float(ys[j]) - my
+        num = num + dx * dy
+        dxx = dxx + dx * dx
+        dyy = dyy + dy * dy
+        j = j + 1
+    }
+    let denom_sq = dxx * dyy
+    if denom_sq <= 0.000001 { return 0.0 }
+    // sqrt
+    let mut y = denom_sq * 0.5
+    let mut k = 0
+    while k < 20 {
+        y = (y + denom_sq / y) * 0.5
+        k = k + 1
+    }
+    return num / y
+}
+
+// lag-1 column: values of var i from step 0..T-2
+fn _em_col_lag_cur(traj: list, v: int) -> list {
+    let T = traj.len()
+    let mut out = []
+    let mut t = 0
+    while t + 1 < T {
+        out = out.push(traj[t][v])
+        t = t + 1
+    }
+    return out
+}
+
+// lag-1 column: values of var j from step 1..T-1
+fn _em_col_lag_next(traj: list, v: int) -> list {
+    let T = traj.len()
+    let mut out = []
+    let mut t = 1
+    while t < T {
+        out = out.push(traj[t][v])
+        t = t + 1
+    }
+    return out
+}
+
+// Causal density: fraction of ordered (i,j) pairs (i!=j) where
+// |corr(state_i[t], state_j[t+1])| > threshold (non-spurious).
+fn causal_density(traj: list, N: int) -> float {
+    let thr = 0.15
+    let mut total = 0
+    let mut hit = 0
+    let mut i = 0
+    while i < N {
+        let xs = _em_col_lag_cur(traj, i)
+        let mut j = 0
+        while j < N {
+            if i != j {
+                let ys = _em_col_lag_next(traj, j)
+                let r = _em_pearson(xs, ys)
+                let ra = _em_abs(r)
+                if ra > thr { hit = hit + 1 }
+                total = total + 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if total == 0 { return 0.0 }
+    return to_float(hit) / to_float(total)
+}
+
+fn emergence_metric_version() -> string { return "edu.cell.causal.metric.v1" }
