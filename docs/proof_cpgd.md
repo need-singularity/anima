@@ -233,3 +233,71 @@ suffices for AN11(b) 100% guarantee at Path B Day 3 #26.
   (10-step + 3-run SHA).
 * `shared/state/cpgd_minimal_proof_result.json` — SSOT result of the
   minimal demonstration.
+
+--------------------------------------------------------------------------
+
+## 6. Day 4 numerical-bound addendum (roadmap entry #29)
+
+This section extends the Day 3 Lagrangian proof with an explicit empirical
+verification of the ε_lr bound under a learning-rate sweep. It is the formal
+phase-gate artifact for roadmap entry #29 ("Path B Day 4 — formal proof check").
+
+### 6.1 Companion tool
+
+`tool/numerical_bound_test.hexa` sweeps lr ∈ {0.001, 0.005, 0.01, 0.05, 0.1},
+runs a deterministic 100-step CPGD on the same 16-eigenvec basis as this
+proof, and reports:
+
+* `max_drift(lr)` := `max_{k ≤ 100, i ≤ 15} |1 − cos(W_k[i,:], v_i)|`
+* `drift_bound(lr)` := `lr · M · K` with `M = 20`, `K = 100` (§3.2 corollary)
+* `cos_lower(lr)` := `(1 − drift_bound) / (1 + drift_bound)` (§3.3)
+* `empirical_below_analytic(lr)` := `max_drift(lr) < drift_bound(lr)`
+
+Output: `state/numerical_bound_report.json` (SSOT).
+
+### 6.2 Claim ↔ measurement table
+
+The proof claims `cos ≥ 0.5` for every `k ≤ 100` whenever `lr · k ≤ 1/(3M) ≈
+0.01667`. The sweep therefore covers three regimes:
+
+| lr    | `lr · K` | Analytic regime                   | Empirical `max_drift` (see report) |
+|-------|----------|-----------------------------------|------------------------------------|
+| 0.001 | 0.10     | within loose bound                | ≈ `1.4e-3` (cpgd_wrapper witness)  |
+| 0.005 | 0.50     | beyond loose `0.01667` threshold  | measured — must still be < 1/3     |
+| 0.010 | 1.00     | beyond loose threshold            | measured — must still be < 1/3     |
+| 0.050 | 5.00     | deep outside loose bound          | measured — may violate 1/3 gate    |
+| 0.100 | 10.00    | deep outside loose bound          | measured — may violate 1/3 gate    |
+
+The proof's loose bound (`M = 20`) is an upper envelope; the measured drift
+is expected to be 3–5× tighter because the projected gradient row-norm is
+`O(√DIM) ≈ 4` in expectation (see §3.2). The sweep report records which lr
+values satisfy both the strict Lagrangian bound and the AN11(b) `cos > 0.5`
+gate — this cross-check is the "formal verify" phase-gate for #29.
+
+### 6.3 FP precision clause
+
+Hexa stage0 arithmetic is FP64-only, so a native FP32-vs-FP64 A/B inside the
+tool is not feasible in the current interpreter. The proof at §3.5 shows
+that the per-step rounding floor is `ε_round ≤ 3.5e-15`, which is 12 orders
+of magnitude below the `max_drift ≈ 1e-3` observed at lr = 0.001. An FP32
+alternative would introduce `~6e-8` rounding per multiply-add, cumulatively
+`~1e-5` over 100 steps — still five orders of magnitude below the 1/3 gate.
+Hence FP32 execution would not invalidate the `cos > 0.5` guarantee, which
+is recorded in the report under `fp_precision_note`.
+
+### 6.4 Success criteria (roadmap #29 phase-gate)
+
+1. `tool/numerical_bound_test.hexa` exits 0 and emits
+   `state/numerical_bound_report.json`.
+2. The report contains `all_above_floor_all_lr = true` for every lr in the
+   sweep that is inside the Lagrangian regime (`lr · K ≤ 1/(3M)`); lr values
+   outside that regime are reported but not required to pass.
+3. `max_drift_global < 1/3` so the `cos > 0.5` gate holds across the sweep.
+4. 3-run byte-identical SHA over the canonical payload.
+5. `claim_vs_measured` consistency: for every sweep row,
+   `empirical_below_analytic = true`, i.e., the measured drift never exceeds
+   the Lagrangian bound derived in §3.2–§3.4.
+
+All five criteria being green closes roadmap entry #29. The proof in §1–§5
+remains unchanged — this addendum only reconciles the analytic statement
+with the concrete numerical witnesses at multiple lr values.
