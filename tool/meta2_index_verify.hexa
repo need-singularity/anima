@@ -1,0 +1,195 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/meta2_index_verify.hexa — Meta^2 trigger satisfied flag verifier
+//
+//  PURPOSE
+//    Re-read .meta2-cert/index.json and confirm:
+//      (a) triggers.mk8_100pct.satisfied == true
+//      (b) triggers.mk8_100pct.evidence.path points to an existing file
+//      (c) sha256(evidence.path) == evidence.sha256    (raw#10 proof-carrying)
+//      (d) evidence.true_closure_pct >= 100
+//      (e) evidence.passed == evidence.total_components
+//      (f) prev_hash / current_hash 형식 정상 (64-hex)
+//    On PASS print "  PASS: meta2 mk8_100pct satisfied ..." and exit 0.
+//    On any mismatch print FAIL lines and exit 1.
+//
+//  USAGE
+//    hexa tool/meta2_index_verify.hexa              # run full verify (default)
+//    hexa tool/meta2_index_verify.hexa --self-test  # alias for full verify
+//    hexa tool/meta2_index_verify.hexa --help
+//
+//  CONSTRAINTS
+//    raw#9  hexa-only        raw#10 proof-carrying (sha256 recheck)
+//    raw#11 snake_case       raw#12 empirical (실측 hash)
+//    deterministic           LLM=none
+// ════════════════════════════════════════════════════════════════════════════
+
+let DEFAULT_INDEX = ".meta2-cert/index.json"
+let DEFAULT_TRIGGER = "mk8_100pct"
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _file_exists(p: string) -> bool {
+    return exec_with_status("test -f " + _sh_quote(p))[1] == 0
+}
+
+fn _sha256_file(p: string) -> string {
+    let raw = _str(exec("shasum -a 256 " + _sh_quote(p) + " | awk '{print $1}'")).trim()
+    return raw
+}
+
+fn _is_hex64(s: string) -> bool {
+    if len(s) != 64 { return false }
+    let hexchars = "0123456789abcdef"
+    let mut i = 0
+    while i < 64 {
+        let c = s.substring(i, i + 1)
+        if hexchars.index_of(c) < 0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+
+fn _flag(av, k) -> bool {
+    for x in av { if to_string(x) == k { return true } }
+    return false
+}
+
+fn _opt(av, k, d) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && i + 1 < len(av) { return to_string(av[i + 1]) }
+        i = i + 1
+    }
+    return d
+}
+
+fn run_verify(index_path: string, trig_key: string) -> int {
+    println("── meta2_index_verify ──")
+    println("  index:   " + index_path)
+    println("  trigger: " + trig_key)
+
+    if !_file_exists(index_path) {
+        eprintln("  FAIL: index not found: " + index_path)
+        return 1
+    }
+
+    let doc = json_parse(read_file(index_path))
+    if !doc.contains_key("triggers") {
+        eprintln("  FAIL: .triggers missing")
+        return 1
+    }
+    let triggers = doc["triggers"]
+    if !triggers.contains_key(trig_key) {
+        eprintln("  FAIL: triggers." + trig_key + " missing")
+        return 1
+    }
+    let t = triggers[trig_key]
+
+    let mut fails = 0
+
+    // (a) satisfied == true
+    if !t.contains_key("satisfied") || t["satisfied"] != true {
+        eprintln("  FAIL: " + trig_key + ".satisfied != true")
+        fails = fails + 1
+    } else {
+        println("  OK  (a) satisfied=true")
+    }
+
+    // (b)(c) evidence block + sha256 recheck
+    if !t.contains_key("evidence") {
+        eprintln("  FAIL: " + trig_key + ".evidence missing")
+        fails = fails + 1
+    } else {
+        let ev = t["evidence"]
+        let ev_path = if ev.contains_key("path") { to_string(ev["path"]) } else { "" }
+        let ev_sha = if ev.contains_key("sha256") { to_string(ev["sha256"]) } else { "" }
+        if ev_path == "" || !_file_exists(ev_path) {
+            eprintln("  FAIL: evidence.path missing or not found: " + ev_path)
+            fails = fails + 1
+        } else {
+            println("  OK  (b) evidence.path exists: " + ev_path)
+            let obs = _sha256_file(ev_path)
+            if obs != ev_sha {
+                eprintln("  FAIL: sha256 mismatch")
+                eprintln("    expected: " + ev_sha)
+                eprintln("    observed: " + obs)
+                fails = fails + 1
+            } else if !_is_hex64(obs) {
+                eprintln("  FAIL: sha256 not 64-hex: " + obs)
+                fails = fails + 1
+            } else {
+                println("  OK  (c) sha256 match: " + obs)
+            }
+        }
+
+        // (d) true_closure_pct >= 100
+        let pct = if ev.contains_key("true_closure_pct") { ev["true_closure_pct"] } else { 0 }
+        if pct < 100 {
+            eprintln("  FAIL: evidence.true_closure_pct=" + to_string(pct) + " < 100")
+            fails = fails + 1
+        } else {
+            println("  OK  (d) true_closure_pct=" + to_string(pct))
+        }
+
+        // (e) passed == total_components
+        let p = if ev.contains_key("passed") { ev["passed"] } else { 0 }
+        let n = if ev.contains_key("total_components") { ev["total_components"] } else { 0 }
+        if p != n || n == 0 {
+            eprintln("  FAIL: passed(" + to_string(p) + ") != total_components(" + to_string(n) + ")")
+            fails = fails + 1
+        } else {
+            println("  OK  (e) passed=" + to_string(p) + "/" + to_string(n))
+        }
+    }
+
+    // (f) prev_hash / current_hash 64-hex
+    let prev = if t.contains_key("prev_hash") { to_string(t["prev_hash"]) } else { "" }
+    let curr = if t.contains_key("current_hash") { to_string(t["current_hash"]) } else { "" }
+    if !_is_hex64(prev) {
+        eprintln("  FAIL: prev_hash not 64-hex: " + prev)
+        fails = fails + 1
+    } else if !_is_hex64(curr) {
+        eprintln("  FAIL: current_hash not 64-hex: " + curr)
+        fails = fails + 1
+    } else {
+        println("  OK  (f) prev_hash + current_hash are 64-hex")
+    }
+
+    if fails == 0 {
+        println("  PASS: meta2 " + trig_key + " satisfied — all checks green")
+        return 0
+    }
+    eprintln("  FAIL: " + to_string(fails) + " check(s) failed")
+    return 1
+}
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") {
+        println("usage: hexa tool/meta2_index_verify.hexa [--index PATH] [--trigger KEY] [--self-test]")
+        return 0
+    }
+    let idx = _opt(av, "--index", DEFAULT_INDEX)
+    let trig = _opt(av, "--trigger", DEFAULT_TRIGGER)
+    // --self-test is alias for full verify
+    return run_verify(idx, trig)
+}
