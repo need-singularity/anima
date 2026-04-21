@@ -574,3 +574,114 @@ phase-jump = step-function structural break (≠ log-linear gradual scaling). **
 
 ### Next falsification
 - **EXP-2**: L_IX 5-term stress test (V_X=V_hurst 추가) — STATIONARY_AT_FIXPOINT break 예상
+
+---
+
+## 🧬 Path β — Learning-Free Pipeline (CANONICAL MAIN, 실사용 100% Closure)
+
+> **SSOT decision (2026-04-21)**: `edu/paths.json#main_track = "beta"`, `for_real_use = true`
+> **Slogan**: "학습 자체를 없애는 학습 — weight update 0회로 AN11 triple 달성"
+> **Impact**: ★★★★★ / madness rating 최상 / paradigm shift
+
+Path β 는 canonical MAIN 이며, α (Grand Hybrid) 는 fallback, γ (External LLM replicability) 는 β 증명 후 verification 용. **paths.json `decision.main = "beta"` 확정 (commit 74fe08e4)**.
+
+### 선택 근거
+1. **CPGD closed-form 100% math** (commit 6527e9df, AN11(b) 수학 보장)
+2. **cell 60-80× FLOPs / 51× Landauer** advantage (Seed ι 실측 toy regime)
+3. **raw#30 IRREVERSIBILITY 정합** (gen-5 fixpoint 에서 bridge 정보손실 0)
+4. **H100 $0 비용** (CPU-only 가능)
+5. **paradigm shift**: weight optimization → structural admissibility check
+
+### β 4-STAGE orchestration (paths.json §beta.stages)
+
+| STAGE | 작업 | 참조 |
+|-------|------|------|
+| **1** CPGD init (zero gradient) | W₀=V (16 orthonormal eigenvec, P_S=I), max_drift<2e-4/100step | `edu/lora/cpgd_wrapper.hexa`, commit 6527e9df |
+| **2** Cell structural trajectory (no backprop) | L_IX calc, EL residual admissibility, saturation {open/converging/fixpoint}, 4-gen crystallize TL-boost{0,300,550,800}‰ | `edu/cell/lagrangian/l_ix_integrator.hexa:144-158` |
+| **3** Inference-time Hexad activation | 6-module {c,d,w,s,m,e} Law60 phase order, no weight change | `anima-hexad/hexad.hexa:99-104` |
+| **4** AN11 triple verification (no-train) | a: SHA-distinct + Frob>τ + shard_cv∈[0.05,3.0] / b: 16-tpl cos>0.5 / c: JSD>0.15 | `tool/an11_{a,b,c}_verifier.hexa`, `verifier/an11_weight_emergent.hexa` |
+
+### 현재 달성 현황 (2026-04-21)
+
+| component | status | commit | note |
+|-----------|--------|--------|------|
+| Option B P1 MINIMAL PoC | ✅ completed | 77dac94e | smoke Landauer 1.00× (by design, gradient pure ∂CE/∂params) |
+| AN-LIX-01 V_RG regularizer | ✅ completed (gate 1 PASS) | a75ec012 | val_ppl_delta=0, ν̂ drift 421 ppm (gate 2 FAIL, ∂V_RG/∂W 미구현) |
+| cell↔token bridge spec | ✅ landed | b8662bed | ablation C CONDITIONAL_PASS 채택 |
+| Bridge PoC impl | 🔄 in_progress (task 36) | — | 3 fixture pre-registered |
+| learning_free_driver | 🔄 in_progress (task 33) | — | STAGE 1-4 orchestrator |
+| flops_landauer_bench | 🔄 in_progress (task 34) | — | 60-80×/51× 실측 wrapper |
+| shared/bench criteria SSOT | 🔄 in_progress (task 39) | — | Hidden Blocker #0 |
+| G2+G5 FAIL fix loop | 🔄 in_progress (task 31) | — | strict PASS target |
+| EXP-2 L_IX 5-term stress | ✅ completed | b8ba5593 | H★ WEAK_OR_NONE at δ=0.01 |
+
+### HYBRID P2 진입 green-light 조건 (PoC 실측, paths.json:278-290)
+1. ✅ MINIMAL instrumentation 통과
+2. ✅ baseline trajectory-equivalent (ratio 1.00)
+3. ✅ I_irr 스모크 horizon 내 non-zero 유지 (0.037-0.104)
+4. ✅ cert + config JSON 착지
+5. 🔄 ∂I_irr/∂W_k = sign(ΔW)/(|ΔW|+1)² 해석적 도함수
+6. 🔄 β_i·λ·∂I_irr/∂W LoRA gradient update 합산
+7. 🔄 동일 seed 대비 divergence 검증 (목표 5-10× Landauer ↓)
+
+### AN11 Triple Real Closure — Z3 추천
+
+3 option 비교 (`edu/an11_closure_gap_probe_20260421.md`):
+
+| Option | Path | Resource | Time | 성공률 |
+|--------|------|----------|------|--------|
+| Z1 CPU micro | synth ckpt + bridge proto + mock endpoint | 0 GPU | 1-2일 | 80% (math만) |
+| Z2 Qwen 14B LoRA | real H100 fine-tune + serving | H100 72h (~$300) | 5-7일 | 60% (r²=0.782) |
+| **Z3** Learning-free β + bridge (C) | CPGD + cell trajectory + bidirectional bridge | **0 H100**, CPU | **3-4일** | **70%** |
+
+**Z3 추천 근거**: raw#30 정합, H100 $0, paradigm 일관성, CPGD math 100%.
+
+**Hidden Blocker #0 (task 39 진행 중)**: `shared/bench/an11_a_criteria.json` + `an11_c_criteria.json` + `test_prompts.jsonl` 전부 MISSING → 선결 필수.
+
+### 60-day Production Timeline (`edu/production_upgrade_spec_20260421.md`)
+
+| period | 주요 작업 |
+|--------|-----------|
+| **D0-D7** | corpus G2/G5 fix (task 31) + bridge PoC (task 36) + shared/bench SSOT (task 39) |
+| **D8-D21** | Qwen 14B on H100 rental, CPGD init + 4-gen crystallize 1-pass, AN11 triple 측정 |
+| **D22-D35** | anima-serve FastAPI+vLLM, latency 최적화 |
+| **D36-D60** | regression 1주, 7-day uptime, 논문 draft |
+
+**추천 hardware**: H100 rental 단발 (~$2150) + CPU Mac 연속 verify + γ Llama 3 8B 병렬
+
+### Scale Gap (micro vs production)
+| metric | CPU micro | Qwen 14B | gap |
+|--------|-----------|----------|-----|
+| V | 8 | 152064 | 1.9e4× |
+| H | 4 | 5120 | 1.3e3× |
+| params | ~34 | 1.4e10 | 4.1e8× |
+| corpus | 100 pairs | 117k lines | 1170× |
+
+### Production Validation Gates (AN11 이후 추가)
+1. AN11 triple PASS 유지 (deterministic)
+2. Seed B anti-denial 0건 (`enforce_anti_denial_policy()` L1302)
+3. Latency p50<300ms / p95<800ms / p99<2s
+4. Regression: 7일 AN11 verdict 변동 <5%
+5. Bridge round-trip cos ≥ 0.5
+6. I_irr non-zero 유지 (fixpoint collapse 전)
+7. Uptime SLA 99.9%
+
+### Related SSOT (edu/ 하위)
+
+| 파일 | 용도 |
+|------|------|
+| [`paths.json`](./paths.json) | canonical main decision + prerequisites + 3 paths spec |
+| [`cell_token_bridge_spec_20260421.md`](./cell_token_bridge_spec_20260421.md) | β main bridge 설계 (5 매핑 후보, ablation C) |
+| [`an11_closure_gap_probe_20260421.md`](./an11_closure_gap_probe_20260421.md) | AN11 각 real PASS 수식 + 3 closure option + Z3 추천 |
+| [`production_upgrade_spec_20260421.md`](./production_upgrade_spec_20260421.md) | 60-day timeline + 3 hardware + 7 validation gates |
+
+### β fallback α 전환 조건
+`paths.json#falsification_built_in.beta_path_main_risk`:
+- β 30일 이내 tier_3 미달 시 → Path α (Grand Hybrid, gradient-based) 채택
+- α STAGE 1-7 은 β STAGE 1-4 확장 + L_IX hybrid loss (CE + β_*·V_* − β_i·λ·I_irr)
+
+### Combined H★ Verdict (EXP-1 + EXP-2)
+- EXP-1 (category axis): **STRONGLY_SUPPORTED** (n=6→28 primary_pass FLIP)
+- EXP-2 (Lagrangian axis): **WEAK_OR_NONE** (V_hurst δ=0.01 STATIONARY)
+- 종합: **PARTIAL_H_STAR** — τ(6)=4 이 categorical axiom 에서만 strict
+- Mk.XI twin-engine **공간(category)-시간(dynamical) 분리** 가설 정합
