@@ -357,7 +357,7 @@ fn status_tree(cfg) -> array {
             "  " + pct_bar(tool_pct) + " " + str(tool_pct) + "%")
 
     println("")
-    println("┌── SSOT artifacts (expected state outputs)")
+    println("┌── SSOT artifacts (expected shared/state outputs)")
     let mut ssot_present = 0
     let mut j = 0
     while j < len(ssot_set) {
@@ -385,67 +385,10 @@ fn status_tree(cfg) -> array {
     // on stage0. Users run `hexa tool/roadmap_integrity_guard.hexa` first.
     render_integrity_section()
 
-    // ─── closure_debt (closure_debt_scanner) ────────────────────────
-    render_closure_debt_section()
+    // ─── Phase Progression (3-stage OS-level check→plan→live) ───────
+    render_progression_section()
 
     return [tool_present, tool_total, ssot_present, ssot_total, combined]
-}
-
-fn render_closure_debt_section() {
-    let debt_ssot = "state/closure_debt_result.json"
-    println("")
-    println("┌── closure_debt scanner (check_8)")
-    if !fexists(debt_ssot) {
-        println("│  · not yet run — hexa tool/closure_debt_scanner.hexa --all --auto-dispatch")
-        println("└──")
-        return
-    }
-    let raw = read_file(debt_ssot)
-    let j = json_parse(raw)
-    if !is_json_map(j) {
-        println("│  · malformed SSOT: " + debt_ssot)
-        println("└──")
-        return
-    }
-    let debt = str(j["debt_hits"])
-    let exempt = str(j["exempt_hits"])
-    let score = str(j["closure_debt_score"])
-    let srcs  = str(j["sources_scanned"])
-    let ts    = _str(j["ts"])
-    let trigger = _str(j["trigger"])
-    let glyph = if to_int(debt) == 0 { "✓" } else { "⚠" }
-    println("│  " + glyph + " debt_hits=" + debt + "  exempt=" + exempt +
-            "  score=" + score + "  sources=" + srcs)
-    println("│    trigger=" + trigger + "  ts=" + ts)
-    // show top phrases
-    if j.contains_key("unique_debt_phrases") {
-        let phrases = j["unique_debt_phrases"]
-        if len(phrases) > 0 {
-            println("│    unique_debt_phrases:")
-            let cap = if len(phrases) < 6 { len(phrases) } else { 6 }
-            let mut i = 0
-            while i < cap {
-                println("│      · " + _str(phrases[i]))
-                i = i + 1
-            }
-            if len(phrases) > cap {
-                println("│      · (+" + str(len(phrases) - cap) + " more)")
-            }
-        }
-    }
-    if j.contains_key("proposed_roadmap_ids") {
-        let ids = j["proposed_roadmap_ids"]
-        if len(ids) > 0 {
-            let mut id_line = "│    auto_dispatched roadmap ids:"
-            let mut i = 0
-            while i < len(ids) {
-                id_line = id_line + " #" + str(ids[i])
-                i = i + 1
-            }
-            println(id_line)
-        }
-    }
-    println("└──")
 }
 
 fn render_integrity_section() {
@@ -480,11 +423,110 @@ fn render_integrity_section() {
     println("└── integrity exit_code=" + exit_code + "  ts=" + _str(j["ts"]))
 }
 
+// ─── Phase Progression (3-stage OS-level: check → plan → live adjust) ──────
+//
+// Reads 3 SSOT files (all optional — gracefully degrades):
+//   shared/config/phase_progression_config.json  (phase registry)
+//   shared/state/true_closure_cert.json          (Stage 1 check 100%)
+//   shared/state/phase_N_flow_ready.json         (Stage 2 plan 100% per phase)
+//   shared/state/phase_progression_cert.json     (Stage 3 live tick result)
+fn render_progression_section() {
+    println("")
+    println("┌── Phase Progression (3-stage OS-level: check → plan → live adjust)")
+    let cfg_path = "config/phase_progression_config.json"
+    if !fexists(cfg_path) {
+        println("│  · phase_progression_config missing — run phase_progression_controller --stage check")
+        println("└──")
+        return
+    }
+    let cfg = json_parse(read_file(cfg_path))
+    if !is_json_map(cfg) {
+        println("│  · malformed phase_progression_config")
+        println("└──")
+        return
+    }
+    let phases = cfg["phases"]
+    let current_phase = if cfg.contains_key("current_phase") {
+        to_int(str(cfg["current_phase"]))
+    } else { 0 }
+
+    // Stage 1 check result
+    let cert_path = "state/true_closure_cert.json"
+    let mut s1_pct = 0
+    let mut s1_passed = 0
+    let mut s1_total = 0
+    if fexists(cert_path) {
+        let c = json_parse(read_file(cert_path))
+        if is_json_map(c) {
+            if c.contains_key("true_closure_pct") { s1_pct = to_int(str(c["true_closure_pct"])) }
+            if c.contains_key("passed")           { s1_passed = to_int(str(c["passed"])) }
+            if c.contains_key("total_components") { s1_total = to_int(str(c["total_components"])) }
+        }
+    }
+
+    // Per-phase rows (keys 0..4)
+    let keys = ["0", "1", "2", "3", "4"]
+    let mut k = 0
+    while k < len(keys) {
+        let pkey = _str(keys[k])
+        if !phases.contains_key(pkey) { k = k + 1; continue }
+        let ph = phases[pkey]
+        let label = _str(ph["label"])
+        let status = if ph.contains_key("status") { _str(ph["status"]) } else { "PLANNED" }
+        let target = if ph.contains_key("closure_pct_target") {
+            "  target=" + str(ph["closure_pct_target"]) + "%"
+        } else { "" }
+
+        // Flow ready status
+        let flow_ssot = "state/phase_" + pkey + "_flow_ready.json"
+        let mut flow_suffix = ""
+        if fexists(flow_ssot) {
+            let fj = json_parse(read_file(flow_ssot))
+            if is_json_map(fj) {
+                let ready = to_bool(fj["ready"])
+                let planned = to_int(str(fj["planned_count"]))
+                let required = to_int(str(fj["required_count"]))
+                flow_suffix = "  flow_ready=" + (if ready { "true" } else { "false" }) +
+                              " (" + str(planned) + "/" + str(required) + ")"
+            }
+        }
+
+        // ⚠ marks the NEXT phase after the current completed one (gate candidate)
+        let glyph = if status == "COMPLETED" { "✓" }
+                    else if pkey == str(current_phase + 1) { "⚠" }
+                    else { "·" }
+        println("│  " + glyph + " Phase " + pkey + " " + label +
+                "  " + status + target + flow_suffix)
+        k = k + 1
+    }
+
+    // Stage cert (most recent)
+    let ppc_cert = "state/phase_progression_cert.json"
+    if fexists(ppc_cert) {
+        let pj = json_parse(read_file(ppc_cert))
+        if is_json_map(pj) {
+            let stage = _str(pj["stage"])
+            let ec = str(pj["exit_code"])
+            let ts = _str(pj["ts"])
+            println("│  last_controller_run: stage=" + stage + " exit_code=" + ec + " ts=" + ts)
+        }
+    }
+
+    let next_phase = current_phase + 1
+    let next_key = str(next_phase)
+    let gate_desc = if phases.contains_key(next_key) {
+        "Phase " + str(current_phase) + " → " + next_key +
+        " (true_closure " + str(s1_passed) + "/" + str(s1_total) +
+        " = " + str(s1_pct) + "%; flow_ready for phase " + next_key + ")"
+    } else { "terminal — all phases defined" }
+    println("└── Next gate: " + gate_desc)
+}
+
 // ─── result SSOT emission ──────────────────────────────────────────────────
 
 fn emit_result_ssot(out_path: string, mode: string, mode_arg: string,
                     results, status_snap) {
-    let audit_state_dir = "state"
+    let audit_state_dir = "shared/state"
     if !dexists(audit_state_dir) { exec("mkdir -p " + audit_state_dir) }
 
     let mut parts = []

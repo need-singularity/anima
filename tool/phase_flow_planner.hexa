@@ -1,0 +1,364 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/phase_flow_planner.hexa — Stage 2 helper (roadmap flow 100%)
+//
+//  PURPOSE
+//    Generate / verify planned .roadmap entries for a target phase N+1 so
+//    that the phase_progression_controller Stage 2 can gate forward.
+//
+//    For each required_entry in phases[N].required_entries:
+//      • If already present in .roadmap → OK
+//      • If missing and --apply → append a minimal `planned` entry
+//        (status=planned, track, phase, eta=today+14d, exit_criteria>=10 ch)
+//      • Emit shared/state/phase_{N}_flow_ready.json with ready=bool
+//
+//  USAGE
+//    hexa tool/phase_flow_planner.hexa --phase N              # dry-run
+//    hexa tool/phase_flow_planner.hexa --phase N --apply      # append entries
+//    hexa tool/phase_flow_planner.hexa --phase N --check-only # report only
+//
+//  CONSTRAINTS
+//    raw#1  chflags ceremony observed for .roadmap writes (nouchg → write → uchg)
+//    raw#9  hexa-only
+//    raw#10 writes flow_ready SSOT (hash-chain via controller)
+//    raw#11 snake_case
+//    raw#15 no-hardcode (config JSON)
+// ════════════════════════════════════════════════════════════════════════════
+
+let CONFIG_PATH_DEFAULT = "config/phase_progression_config.json"
+
+// ─── helpers (same idiom as controller) ───────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _bool_s(b: bool) -> string { return if b { "true" } else { "false" } }
+
+fn _sh_quote(s: string) -> string {
+    let mut out = "'"
+    out = out + s.replace("'", "'\\''")
+    out = out + "'"
+    return out
+}
+
+fn _exec_out(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _exec_code(cmd: string) -> int {
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+fn _file_exists(path: string) -> bool {
+    return _exec_code("test -f " + _sh_quote(path)) == 0
+}
+
+fn _mkdir_p(dir: string) -> bool {
+    return _exec_code("mkdir -p " + _sh_quote(dir)) == 0
+}
+
+fn _ts_iso() -> string { return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim() }
+fn _today_iso() -> string { return _exec_out("date -u +%Y-%m-%d").trim() }
+
+fn _eta_plus(days: int) -> string {
+    let bsd = "date -u -v+" + str(days) + "d +%Y-%m-%d 2>/dev/null"
+    let r1 = _exec_out(bsd).trim()
+    if r1 != "" { return r1 }
+    let gnu = "date -u -d '+" + str(days) + " days' +%Y-%m-%d 2>/dev/null"
+    return _exec_out(gnu).trim()
+}
+
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+fn _is_map(v) -> bool {
+    let s = str(v)
+    if s.len() < 1 { return false }
+    return s.substring(0, 1) == "{"
+}
+
+fn _dirname(path: string) -> string {
+    let k = path.last_index_of("/")
+    if k < 0 { return "." }
+    return path.substring(0, k)
+}
+
+// ─── argv ──────────────────────────────────────────────────────────────
+
+fn _arg_value(argv, key: string, dflt: string) -> string {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key && i + 1 < len(argv) { return _str(argv[i + 1]) }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _resolve_root() -> string {
+    let gt = _exec_out("git rev-parse --show-toplevel 2>/dev/null").trim()
+    if gt != "" { return gt }
+    let e = _str(env("ANIMA"))
+    if e != "" { return e }
+    return _str(env("HOME")) + "/core/anima"
+}
+
+// ─── config + roadmap parse ───────────────────────────────────────────
+
+fn _load_config(path: string) {
+    if !_file_exists(path) {
+        eprintln("phase_flow_planner: SETUP_ERROR — config missing: " + path)
+        exit(2)
+    }
+    let raw = read_file(path)
+    let cfg = json_parse(raw)
+    if !_is_map(cfg) {
+        eprintln("phase_flow_planner: SETUP_ERROR — malformed config JSON: " + path)
+        exit(2)
+    }
+    return cfg
+}
+
+fn _roadmap_entry_exists(roadmap_src: string, id: int) -> bool {
+    return roadmap_src.index_of("roadmap " + str(id) + " ") >= 0
+}
+
+fn _roadmap_entry_status(roadmap_src: string, id: int) -> string {
+    let needle = "roadmap " + str(id) + " "
+    let k = roadmap_src.index_of(needle)
+    if k < 0 { return "" }
+    let after = roadmap_src.substring(k + len(needle), len(roadmap_src))
+    let sp = after.index_of(" ")
+    if sp < 0 { return "" }
+    return after.substring(0, sp).trim()
+}
+
+fn _is_uchg(path: string) -> bool {
+    if !_file_exists(path) { return false }
+    let out = _exec_out("ls -lO " + _sh_quote(path) + " 2>/dev/null")
+    return out.index_of("uchg") >= 0
+}
+
+fn _chflags(path: string, flag: string) -> bool {
+    return _exec_code("chflags " + flag + " " + _sh_quote(path)) == 0
+}
+
+// ─── entry generation ─────────────────────────────────────────────────
+
+// Build a minimal planned entry text (9 lines — matches existing style).
+fn _build_entry_text(id: int, component: string, track: string, phase: string) -> string {
+    let today = _today_iso()
+    let eta = _eta_plus(14)
+    let title = component
+    let why = "auto-reflected from phase_progression_controller " + today +
+              " — phase " + phase + " required_entry for " + track
+    let exit_crit = component + " verified; phase_progression_controller Stage 1 PASS for phase " + phase
+    let mut p = []
+    p.push("\n")
+    p.push("roadmap " + str(id) + " planned \"" + title + "\"\n")
+    p.push("  track          " + track + "\n")
+    p.push("  phase          " + phase + "\n")
+    p.push("  eta            " + eta + "\n")
+    p.push("  why            " + why + "\n")
+    p.push("  exit_criteria  " + exit_crit + "\n")
+    return p.join("")
+}
+
+// Append multiple entries atomically (single write). Observes chflags uchg.
+fn _append_entries(roadmap_path: string, texts) -> bool {
+    if len(texts) == 0 { return true }
+    if !_file_exists(roadmap_path) {
+        eprintln("phase_flow_planner: .roadmap missing at " + roadmap_path)
+        return false
+    }
+    let had_uchg = _is_uchg(roadmap_path)
+    if had_uchg {
+        if !_chflags(roadmap_path, "nouchg") {
+            eprintln("phase_flow_planner: nouchg failed — skipping write")
+            return false
+        }
+    }
+    let cur = to_string(read_file(roadmap_path))
+    let mut acc = cur
+    if !cur.ends_with("\n") { acc = acc + "\n" }
+    let mut i = 0
+    while i < len(texts) {
+        acc = acc + _str(texts[i])
+        i = i + 1
+    }
+    let ok = write_file(roadmap_path, acc)
+    if had_uchg { let _u = _chflags(roadmap_path, "uchg") }
+    return ok
+}
+
+// ─── flow_ready SSOT emit ──────────────────────────────────────────────
+
+fn _emit_flow_ready(path: string, phase_num: int, label: string, ready: bool,
+                    planned: int, required: int, missing, added_ids) {
+    let _ = _mkdir_p(_dirname(path))
+    let mut parts = []
+    parts.push("{\n")
+    parts.push("  \"schema\": \"anima.phase_flow_ready.v1\",\n")
+    parts.push("  \"ts\": \"" + _ts_iso() + "\",\n")
+    parts.push("  \"tool\": \"tool/phase_flow_planner.hexa\",\n")
+    parts.push("  \"phase\": " + str(phase_num) + ",\n")
+    parts.push("  \"label\": \"" + _json_escape(label) + "\",\n")
+    parts.push("  \"ready\": " + _bool_s(ready) + ",\n")
+    parts.push("  \"planned_count\": " + str(planned) + ",\n")
+    parts.push("  \"required_count\": " + str(required) + ",\n")
+    parts.push("  \"missing_count\": " + str(len(missing)) + ",\n")
+    parts.push("  \"added_ids\": [")
+    let mut i = 0
+    while i < len(added_ids) {
+        let c = if i + 1 < len(added_ids) { ", " } else { "" }
+        parts.push(str(added_ids[i]) + c)
+        i = i + 1
+    }
+    parts.push("],\n")
+    parts.push("  \"missing\": [")
+    let mut j = 0
+    while j < len(missing) {
+        let c = if j + 1 < len(missing) { ", " } else { "" }
+        parts.push("\"" + _json_escape(_str(missing[j])) + "\"" + c)
+        j = j + 1
+    }
+    parts.push("]\n}\n")
+    let _ = write_file(path, parts.join(""))
+}
+
+// ─── main ─────────────────────────────────────────────────────────────
+
+fn _usage() {
+    println("phase_flow_planner — Stage 2 helper (roadmap flow 100%)")
+    println("")
+    println("usage:")
+    println("  hexa tool/phase_flow_planner.hexa --phase N             # dry-run (default)")
+    println("  hexa tool/phase_flow_planner.hexa --phase N --apply     # append missing entries")
+    println("  hexa tool/phase_flow_planner.hexa --phase N --check-only")
+    println("")
+    println("flags:")
+    println("  --phase N           target phase (required)")
+    println("  --apply             mutate .roadmap (chflags ceremony observed)")
+    println("  --check-only        dry-run + exit 1 if not ready")
+    println("  --config <path>     override config")
+}
+
+fn main() -> int {
+    let argv = args()
+    if _arg_present(argv, "--help") || _arg_present(argv, "-h") {
+        _usage()
+        return 0
+    }
+
+    let phase_s = _arg_value(argv, "--phase", "")
+    if phase_s == "" {
+        eprintln("phase_flow_planner: --phase N required")
+        _usage()
+        return 2
+    }
+    let phase_num = to_int(phase_s)
+    let apply = _arg_present(argv, "--apply")
+    let check_only = _arg_present(argv, "--check-only")
+
+    let root = _resolve_root()
+    let cfg_path = root + "/" + _arg_value(argv, "--config", CONFIG_PATH_DEFAULT)
+    let cfg = _load_config(cfg_path)
+
+    let phases = cfg["phases"]
+    let key = str(phase_num)
+    if !phases.contains_key(key) {
+        eprintln("phase_flow_planner: phase " + key + " not defined in config")
+        return 2
+    }
+    let ph = phases[key]
+    let label = _str(ph["label"])
+    let required = ph["required_entries"]
+
+    let roadmap_path = root + "/" + _str(cfg["roadmap_path"])
+    if !_file_exists(roadmap_path) {
+        eprintln("phase_flow_planner: .roadmap missing: " + roadmap_path)
+        return 2
+    }
+    let roadmap_src = to_string(read_file(roadmap_path))
+
+    println("════════════════════════════════════════════════════════════════")
+    println("  tool/phase_flow_planner.hexa — phase " + str(phase_num) + " (" + label + ")")
+    println("  root=" + root + "  roadmap=" + _str(cfg["roadmap_path"]))
+    println("  mode=" + (if apply { "APPLY" } else { if check_only { "CHECK_ONLY" } else { "DRY_RUN" } }))
+    println("════════════════════════════════════════════════════════════════")
+
+    let mut planned = 0
+    let mut missing = []
+    let mut append_texts = []
+    let mut append_ids = []
+
+    let mut i = 0
+    while i < len(required) {
+        let r = required[i]
+        let target_id = to_int(str(r["roadmap_entry_target"]))
+        let comp = _str(r["component"])
+        let track = _str(r["track"])
+        let ph_s = _str(r["phase"])
+
+        let exists = _roadmap_entry_exists(roadmap_src, target_id)
+        let st = _roadmap_entry_status(roadmap_src, target_id)
+        let acceptable = exists && (st == "planned" || st == "active" || st == "done")
+
+        if acceptable {
+            planned = planned + 1
+            println("  ✓ roadmap " + str(target_id) + " status=" + st + "  " + comp)
+        } else {
+            let note = if exists { "status=" + st } else { "MISSING" }
+            println("  ✗ roadmap " + str(target_id) + " " + note + "  " + comp)
+            missing.push(str(target_id) + ":" + comp)
+            if apply && !exists {
+                let text = _build_entry_text(target_id, comp, track, ph_s)
+                append_texts.push(text)
+                append_ids.push(target_id)
+            }
+        }
+        i = i + 1
+    }
+
+    // APPLY path: append all pending entries atomically
+    if apply && len(append_texts) > 0 {
+        let ok = _append_entries(roadmap_path, append_texts)
+        if ok {
+            planned = planned + len(append_texts)
+            println("")
+            println("▶ appended " + str(len(append_texts)) + " planned entries to .roadmap")
+        } else {
+            eprintln("phase_flow_planner: append failed — .roadmap unchanged")
+            return 3
+        }
+    }
+
+    let required_count = len(required)
+    let ready = planned == required_count
+
+    let flow_rel = "state/phase_" + str(phase_num) + "_flow_ready.json"
+    let flow_path = root + "/" + flow_rel
+    _emit_flow_ready(flow_path, phase_num, label, ready, planned, required_count, missing, append_ids)
+
+    println("")
+    println("▶ phase " + str(phase_num) + " ready=" + _bool_s(ready) +
+            "  planned=" + str(planned) + "/" + str(required_count) +
+            "  missing=" + str(len(missing)))
+    println("▶ flow_ready SSOT: " + flow_rel)
+
+    if check_only && !ready { return 1 }
+    return 0
+}

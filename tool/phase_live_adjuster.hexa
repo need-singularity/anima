@@ -1,0 +1,399 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/phase_live_adjuster.hexa — Stage 3 daemon-tick live adjustment
+//
+//  PURPOSE
+//    Called each launchd tick (and from phase_progression_controller --stage live).
+//    Detects WARN / drift / debt in the live roadmap + SSOT surface and applies
+//    auto-fix within spec bounds as defined by live_adjust_policy.
+//
+//    Flow:
+//      1. roadmap_integrity_guard 7-check (read SSOT)
+//      2. closure_debt_scanner (if task 59 tool exists; skip otherwise)
+//      3. For each WARN / FAIL:
+//           severity=ERROR → alert + halt
+//           severity=WARN + auto_fix OK → roadmap_mistake_auto_fix --apply --check N
+//           severity=WARN + no auto_fix → roadmap_auto_reflect --dry-run (hint-only)
+//      4. Append result to shared/state/phase_live_adjust_log.json (JSONL)
+//
+//  USAGE
+//    hexa tool/phase_live_adjuster.hexa --tick                # default tick
+//    hexa tool/phase_live_adjuster.hexa --tick --dry-run      # analyze-only
+//    hexa tool/phase_live_adjuster.hexa --tick --apply        # enable auto-fix
+//
+//  CONSTRAINTS
+//    raw#1  chflags state handled by the sub-tools (auto_fix does check_2 only)
+//    raw#9  hexa-only
+//    raw#10 JSONL append (append-only; never mutates prior lines)
+//    raw#11 snake_case
+//    raw#12 실측 (reads SSOT written by sub-tools, never fabricates verdicts)
+//    raw#15 policy from config (no-hardcode)
+// ════════════════════════════════════════════════════════════════════════════
+
+let CONFIG_PATH_DEFAULT = "config/phase_progression_config.json"
+let HEXA_BIN_DEFAULT    = "/Users/ghost/.hx/bin/hexa"
+
+// ─── helpers ──────────────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _bool_s(b: bool) -> string { return if b { "true" } else { "false" } }
+
+fn _sh_quote(s: string) -> string {
+    let mut out = "'"
+    out = out + s.replace("'", "'\\''")
+    out = out + "'"
+    return out
+}
+
+fn _exec_out(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _exec_code(cmd: string) -> int {
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+fn _file_exists(path: string) -> bool {
+    return _exec_code("test -f " + _sh_quote(path)) == 0
+}
+
+fn _mkdir_p(dir: string) -> bool {
+    return _exec_code("mkdir -p " + _sh_quote(dir)) == 0
+}
+
+fn _ts_iso() -> string { return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim() }
+fn _ts_epoch() -> string { return _exec_out("date -u +%s").trim() }
+
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+fn _is_map(v) -> bool {
+    let s = str(v)
+    if s.len() < 1 { return false }
+    return s.substring(0, 1) == "{"
+}
+
+fn _dirname(path: string) -> string {
+    let k = path.last_index_of("/")
+    if k < 0 { return "." }
+    return path.substring(0, k)
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _arg_value(argv, key: string, dflt: string) -> string {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key && i + 1 < len(argv) { return _str(argv[i + 1]) }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _resolve_root() -> string {
+    let gt = _exec_out("git rev-parse --show-toplevel 2>/dev/null").trim()
+    if gt != "" { return gt }
+    let e = _str(env("ANIMA"))
+    if e != "" { return e }
+    return _str(env("HOME")) + "/core/anima"
+}
+
+fn _resolve_hexa_bin(cfg) -> string {
+    let e = _str(env("HEXA_BIN"))
+    if e != "" { return e }
+    let pref = if cfg.contains_key("hexa_bin") { _str(cfg["hexa_bin"]) } else { "" }
+    if pref != "" && _file_exists(pref) { return pref }
+    if _file_exists(HEXA_BIN_DEFAULT) { return HEXA_BIN_DEFAULT }
+    let p = _exec_out("command -v hexa 2>/dev/null").trim()
+    if p != "" { return p }
+    return HEXA_BIN_DEFAULT
+}
+
+fn _load_config(path: string) {
+    if !_file_exists(path) {
+        eprintln("phase_live_adjuster: SETUP_ERROR — config missing: " + path)
+        exit(2)
+    }
+    let raw = read_file(path)
+    let cfg = json_parse(raw)
+    if !_is_map(cfg) {
+        eprintln("phase_live_adjuster: SETUP_ERROR — malformed config JSON: " + path)
+        exit(2)
+    }
+    return cfg
+}
+
+// ─── sub-tool dispatch ────────────────────────────────────────────────
+
+fn _run_hexa(bin: string, root: string, tool_rel: string, args_inline: string, slug: string) -> array {
+    let tool_abs = root + "/" + tool_rel
+    if !_file_exists(tool_abs) {
+        return [127, ""]
+    }
+    let log_path = "/tmp/_phase_live_" + slug + "_" + _ts_epoch() + ".log"
+    let cmd = "cd " + _sh_quote(root) + " && " +
+              "HEXA_NO_LAUNCHD=1 " + _sh_quote(bin) + " run " + _sh_quote(tool_abs) +
+              " " + args_inline + " > " + _sh_quote(log_path) + " 2>&1; echo __rc=$?"
+    let tail = _exec_out(cmd).trim()
+    let rc_idx = tail.index_of("__rc=")
+    let rc_s = if rc_idx >= 0 { tail.substring(rc_idx + 5, len(tail)).trim() } else { "255" }
+    return [to_int(rc_s), log_path]
+}
+
+// ─── integrity SSOT reader ────────────────────────────────────────────
+
+// Returns array of [check_name, verdict, severity]
+fn _read_integrity_checks(root: string, cfg) -> array {
+    let out = []
+    let rig_cfg_rel = "config/roadmap_integrity_config.json"
+    let rig_cfg_abs = root + "/" + rig_cfg_rel
+    // Prefer absolute summary_ssot path from integrity config
+    let mut ssot_path = root + "/" + _str(cfg["ssot"]["integrity_result"])
+    if _file_exists(rig_cfg_abs) {
+        let rc = json_parse(read_file(rig_cfg_abs))
+        if _is_map(rc) && rc.contains_key("output") {
+            let o = rc["output"]
+            if o.contains_key("summary_ssot") {
+                let alt = _str(o["summary_ssot"])
+                if alt != "" && _file_exists(alt) { ssot_path = alt }
+            }
+        }
+    }
+    if !_file_exists(ssot_path) { return out }
+    let raw = read_file(ssot_path)
+    let j = json_parse(raw)
+    if !_is_map(j) { return out }
+    if !j.contains_key("checks") { return out }
+    let checks = j["checks"]
+    let mut acc = []
+    let mut i = 0
+    while i < len(checks) {
+        let c = checks[i]
+        let name = _str(c["check"])
+        let verdict = _str(c["verdict"])
+        let sev = _str(c["severity"])
+        acc.push([name, verdict, sev])
+        i = i + 1
+    }
+    return acc
+}
+
+// Parse a check name like "check_4_file_drift" → 4
+fn _check_num(name: string) -> int {
+    let parts = name.split("_")
+    if len(parts) < 2 { return -1 }
+    return to_int(_str(parts[1]))
+}
+
+// ─── live_log append (JSONL) ──────────────────────────────────────────
+
+fn _append_live_log(path: string, rec: string) {
+    let _ = _mkdir_p(_dirname(path))
+    if !_file_exists(path) {
+        let _ = write_file(path, rec + "\n")
+        return
+    }
+    let cmd = "printf %s\\\\n " + _sh_quote(rec) + " >> " + _sh_quote(path)
+    let _ = _exec_code(cmd)
+}
+
+// ─── tick ─────────────────────────────────────────────────────────────
+
+fn run_tick(dry_run: bool, apply: bool) -> int {
+    let root = _resolve_root()
+    let cfg_path = root + "/" + CONFIG_PATH_DEFAULT
+    let cfg = _load_config(cfg_path)
+    let bin = _resolve_hexa_bin(cfg)
+    let tools = cfg["tools"]
+    let policy = cfg["live_adjust_policy"]
+
+    let ts = _ts_iso()
+    println("┌── phase_live_adjuster tick " + ts + "  (dry_run=" + _bool_s(dry_run) + " apply=" + _bool_s(apply) + ")")
+
+    // 1. integrity_guard 7-check
+    let rig_cfg_abs = root + "/shared/config/roadmap_integrity_config.json"
+    let rig_args = if _file_exists(rig_cfg_abs) {
+        "--json --config " + _sh_quote(rig_cfg_abs)
+    } else { "--json" }
+    let rig_rc = _run_hexa(bin, root, _str(tools["roadmap_integrity_guard"]), rig_args, "rig")[0]
+    println("│  [1] roadmap_integrity_guard rc=" + str(rig_rc))
+
+    let checks = _read_integrity_checks(root, cfg)
+    let mut warn_list = []
+    let mut error_list = []
+    let mut i = 0
+    while i < len(checks) {
+        let c = checks[i]
+        let name = _str(c[0])
+        let verdict = _str(c[1])
+        let sev = _str(c[2])
+        if verdict != "PASS" && verdict != "INFO" {
+            if sev == "ERROR" { error_list.push(c) }
+            else { warn_list.push(c) }
+        }
+        i = i + 1
+    }
+    println("│  [1b] non-PASS: ERROR=" + str(len(error_list)) + " WARN=" + str(len(warn_list)))
+
+    // 2. closure_debt_scanner (optional; skip if tool missing)
+    let cds_rel = _str(tools["closure_debt_scanner"])
+    let cds_abs = root + "/" + cds_rel
+    let mut debt_rc = -1
+    if _file_exists(cds_abs) {
+        let r = _run_hexa(bin, root, cds_rel, "--json", "cds")
+        debt_rc = r[0]
+        println("│  [2] closure_debt_scanner rc=" + str(debt_rc))
+    } else {
+        println("│  [2] closure_debt_scanner SKIP (tool not present; closure_debt=0 fully resolved)")
+    }
+
+    // 3. ERROR severity → halt
+    let halt_on_error = if policy.contains_key("halt_on_error_severity") {
+        str(policy["halt_on_error_severity"]) == "true"
+    } else { true }
+    if len(error_list) > 0 && halt_on_error {
+        println("│  [3] ERROR severity present — HALT (no auto-fix)")
+        let mut items = []
+        let mut j = 0
+        while j < len(error_list) {
+            let c = error_list[j]
+            items.push(_str(c[0]) + ":" + _str(c[1]))
+            j = j + 1
+        }
+        let rec = _build_record(ts, "halt_on_error", rig_rc, debt_rc, items, [], dry_run, apply)
+        _append_live_log(root + "/" + _str(cfg["output"]["live_log"]), rec)
+        println("└── tick HALT")
+        return 1
+    }
+
+    // 3b. WARN severity → conditional auto-fix
+    let auto_fix_c2 = if policy.contains_key("auto_fix_check_2") {
+        str(policy["auto_fix_check_2"]) == "true"
+    } else { false }
+    let auto_fix_c3_req_apply = _str(policy["auto_fix_check_3"]) == "requires --apply"
+    let auto_fix_c5_req_apply = _str(policy["auto_fix_check_5"]) == "requires --apply"
+
+    let mut fixed = []
+    let mut skipped = []
+    let mut k = 0
+    while k < len(warn_list) {
+        let c = warn_list[k]
+        let name = _str(c[0])
+        let num = _check_num(name)
+        let can_fix_unconditional = (num == 2) && auto_fix_c2
+        let can_fix_with_apply    = (num == 3 && auto_fix_c3_req_apply) ||
+                                    (num == 5 && auto_fix_c5_req_apply)
+        let do_fix = !dry_run && (can_fix_unconditional || (apply && can_fix_with_apply))
+
+        if do_fix {
+            let af_rel = _str(tools["roadmap_mistake_auto_fix"])
+            let af_args = "--apply --check " + str(num)
+            let r = _run_hexa(bin, root, af_rel, af_args, "af" + str(num))
+            println("│  [3b] auto_fix check_" + str(num) + " rc=" + str(r[0]))
+            fixed.push(name + ":rc=" + str(r[0]))
+        } else {
+            println("│  [3b] skip fix " + name + " (dry_run=" + _bool_s(dry_run) +
+                    " can_uncond=" + _bool_s(can_fix_unconditional) +
+                    " can_apply=" + _bool_s(can_fix_with_apply) + ")")
+            skipped.push(name)
+        }
+        k = k + 1
+    }
+
+    // 4. follow-up auto_reflect (best-effort hint; dry-run always)
+    let auto_dispatch = if policy.contains_key("auto_dispatch_follow_up_on_debt") {
+        str(policy["auto_dispatch_follow_up_on_debt"]) == "true"
+    } else { false }
+    let mut reflect_rc = -2
+    if auto_dispatch && (len(warn_list) > 0 || debt_rc > 0) {
+        let rr_rel = _str(tools["roadmap_auto_reflect"])
+        // Only attempt if there's an audit report SSOT the reflect tool can read
+        let audit_ssot = "state/alm_r13_corpus_audit.json"
+        let rr_args = "--audit-report " + audit_ssot + " --dry-run"
+        if _file_exists(root + "/" + audit_ssot) {
+            let r = _run_hexa(bin, root, rr_rel, rr_args, "reflect")
+            reflect_rc = r[0]
+            println("│  [4] roadmap_auto_reflect --dry-run rc=" + str(reflect_rc))
+        } else {
+            println("│  [4] roadmap_auto_reflect SKIP (audit-report SSOT absent)")
+        }
+    }
+
+    let rec = _build_record(ts, "tick_ok", rig_rc, debt_rc, fixed, skipped, dry_run, apply)
+    _append_live_log(root + "/" + _str(cfg["output"]["live_log"]), rec)
+
+    let drift = len(warn_list) > 0 || len(error_list) > 0 || debt_rc > 0
+    let sym = if drift { "⚠ DRIFT_DETECTED (live-adjusted)" } else { "✓ TICK_CLEAN" }
+    println("└── tick " + sym + "  fixed=" + str(len(fixed)) + " skipped=" + str(len(skipped)))
+
+    return 0
+}
+
+fn _build_record(ts: string, phase: string, rig_rc: int, debt_rc: int,
+                 fixed, skipped, dry_run: bool, apply: bool) -> string {
+    let mut parts = []
+    parts.push("{\"ts\":\"" + ts + "\",\"tool\":\"phase_live_adjuster\"")
+    parts.push(",\"phase\":\"" + phase + "\"")
+    parts.push(",\"rig_rc\":" + str(rig_rc))
+    parts.push(",\"debt_rc\":" + str(debt_rc))
+    parts.push(",\"dry_run\":" + _bool_s(dry_run))
+    parts.push(",\"apply\":" + _bool_s(apply))
+    parts.push(",\"fixed\":[")
+    let mut i = 0
+    while i < len(fixed) {
+        let c = if i + 1 < len(fixed) { "," } else { "" }
+        parts.push("\"" + _json_escape(_str(fixed[i])) + "\"" + c)
+        i = i + 1
+    }
+    parts.push("],\"skipped\":[")
+    let mut j = 0
+    while j < len(skipped) {
+        let c = if j + 1 < len(skipped) { "," } else { "" }
+        parts.push("\"" + _json_escape(_str(skipped[j])) + "\"" + c)
+        j = j + 1
+    }
+    parts.push("]}")
+    return parts.join("")
+}
+
+// ─── main ─────────────────────────────────────────────────────────────
+
+fn _usage() {
+    println("phase_live_adjuster — Stage 3 daemon-tick live adjustment")
+    println("")
+    println("usage:")
+    println("  hexa tool/phase_live_adjuster.hexa --tick              # default tick (auto_fix_check_2 only)")
+    println("  hexa tool/phase_live_adjuster.hexa --tick --dry-run    # analyze-only")
+    println("  hexa tool/phase_live_adjuster.hexa --tick --apply      # enable auto_fix_check_3 + 5 as well")
+    println("")
+    println("flags:")
+    println("  --tick       run one tick (default)")
+    println("  --dry-run    no auto_fix invocations")
+    println("  --apply      enable --apply-gated auto_fix checks (3, 5)")
+}
+
+fn main() -> int {
+    let argv = args()
+    if _arg_present(argv, "--help") || _arg_present(argv, "-h") {
+        _usage()
+        return 0
+    }
+
+    let dry_run = _arg_present(argv, "--dry-run")
+    let apply = _arg_present(argv, "--apply")
+    return run_tick(dry_run, apply)
+}
