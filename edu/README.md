@@ -608,7 +608,7 @@ Path β 는 canonical MAIN 이며, α (Grand Hybrid) 는 fallback, γ (External 
 | Option B P1 MINIMAL PoC | ✅ completed | 77dac94e | smoke Landauer 1.00× (by design, gradient pure ∂CE/∂params) |
 | AN-LIX-01 V_RG regularizer | ✅ completed (gate 1 PASS) | a75ec012 | val_ppl_delta=0, ν̂ drift 421 ppm (gate 2 FAIL, ∂V_RG/∂W 미구현) |
 | cell↔token bridge spec | ✅ landed | b8662bed | ablation C CONDITIONAL_PASS 채택 |
-| Bridge PoC impl | 🔄 in_progress (task 36) | — | 3 fixture pre-registered |
+| **Bridge PoC impl** | ✅ **completed** | **56205445** | **3/3 fixture PASS, drift 0.0 within bound 2e-4, CONDITIONAL_PASS** |
 | learning_free_driver | 🔄 in_progress (task 33) | — | STAGE 1-4 orchestrator |
 | flops_landauer_bench | 🔄 in_progress (task 34) | — | 60-80×/51× 실측 wrapper |
 | shared/bench criteria SSOT | 🔄 in_progress (task 39) | — | Hidden Blocker #0 |
