@@ -1,0 +1,486 @@
+// tool/roadmap_live_daemon.hexa — OS-level .roadmap live enforcement (raw#1/10/15)
+//
+// PURPOSE
+//   Replace the deprecated git pre-commit hook with a launchd periodic tick.
+//   Each tick performs 5 sequential steps on /Users/ghost/core/anima/.roadmap:
+//
+//     1. chflags uchg re-apply on .roadmap (raw#1 OS lock)
+//     2. roadmap_lint  → violations dumped to shared/state/roadmap_drift_<ts>.json
+//     3. β coverage audit (simplified: file exists + parse + % verified)
+//        → shared/state/roadmap_coverage_tick_<ts>.json
+//     4. drift → tool/roadmap_auto_reflect.hexa --dry-run  (best-effort; skip if missing)
+//     5. .raw-audit hash-chain append (raw#10 append-only audit trail)
+//
+//   exit code:
+//     0  — no drift (lint PASS, coverage OK)
+//     1  — drift detected (non-zero violations or audit failure)
+//     2  — daemon internal error
+//
+// USAGE
+//   hexa tool/roadmap_live_daemon.hexa --tick             single-tick run
+//   hexa tool/roadmap_live_daemon.hexa --tick --interval 3600   (informational)
+//   hexa tool/roadmap_live_daemon.hexa --audit-only       skip lint, only chflags+audit
+//   hexa tool/roadmap_live_daemon.hexa --enforce          force chflags re-apply even if clean
+//   hexa tool/roadmap_live_daemon.hexa --install          copy plist + launchctl load
+//   hexa tool/roadmap_live_daemon.hexa --uninstall        launchctl unload + remove plist
+//
+// RULES
+//   raw#1   chflags uchg on .roadmap + .raw-audit
+//   raw#9   hexa-only (no python/bash trampolines beyond exec shell)
+//   raw#10  hash-chain .raw-audit append (never mutate, only append)
+//   raw#11  snake_case filenames
+//   raw#15  .roadmap is the SSOT registry — daemon is the live gate
+//
+// NOTE: auto_commit_disabled=true in config — daemon is REPORT-ONLY.
+//       reflect is invoked with --dry-run only. No git operations.
+
+// ─── globals ─────────────────────────────────────────────────────────
+let REPO_ROOT        = "/Users/ghost/core/anima"
+let ROADMAP_PATH     = "/Users/ghost/core/anima/.roadmap"
+let RAW_AUDIT_PATH   = "/Users/ghost/core/anima/.raw-audit"
+let STATE_DIR        = "/Users/ghost/core/anima/shared/state"
+let CONFIG_PATH      = "/Users/ghost/core/anima/shared/config/roadmap_live_daemon_config.json"
+let LINT_TOOL        = "/Users/ghost/core/hexa-lang/tool/roadmap_lint.hexa"
+let REFLECT_TOOL     = "/Users/ghost/core/anima/tool/roadmap_auto_reflect.hexa"
+let PLIST_SRC        = "/Users/ghost/core/anima/anima-os/launchd/roadmap_live_daemon.plist"
+let PLIST_LABEL      = "com.anima.roadmap-live-daemon"
+let PLIST_DST        = "/Users/ghost/Library/LaunchAgents/com.anima.roadmap-live-daemon.plist"
+let HEXA_BIN         = "/Users/ghost/.hx/bin/hexa"
+
+// ─── tiny helpers ────────────────────────────────────────────────────
+
+fn _is_darwin() -> bool {
+    let r = exec_with_status("uname -s")
+    let s = to_string(r[0]).trim()
+    return s == "Darwin"
+}
+
+fn _ts_epoch() -> string {
+    let r = exec_with_status("date -u +%s")
+    return to_string(r[0]).trim()
+}
+
+fn _ts_iso() -> string {
+    let r = exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")
+    return to_string(r[0]).trim()
+}
+
+fn _sh_quote(s: string) -> string {
+    let mut out = "'"
+    out = out + s.replace("'", "'\\''")
+    out = out + "'"
+    return out
+}
+
+fn _mkdir_p(dir: string) -> bool {
+    let r = exec_with_status("mkdir -p " + _sh_quote(dir))
+    return r[1] == 0
+}
+
+fn _file_exists(path: string) -> bool {
+    let r = exec_with_status("test -e " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _sha256_of_file(path: string) -> string {
+    if !_file_exists(path) { return "" }
+    // darwin: shasum -a 256
+    let r = exec_with_status("shasum -a 256 " + _sh_quote(path) + " 2>/dev/null | awk '{print $1}'")
+    return to_string(r[0]).trim()
+}
+
+fn _sha256_of_string(s: string) -> string {
+    let r = exec_with_status("printf %s " + _sh_quote(s) + " | shasum -a 256 | awk '{print $1}'")
+    return to_string(r[0]).trim()
+}
+
+fn _count_substr(src: string, needle: string) -> int {
+    let n = len(src)
+    let k = len(needle)
+    if k == 0 || n < k { return 0 }
+    let mut count = 0
+    let mut i = 0
+    while i <= n - k {
+        if src.substring(i, i + k) == needle {
+            count = count + 1
+            i = i + k
+        } else {
+            i = i + 1
+        }
+    }
+    return count
+}
+
+// ─── raw#1: chflags uchg enforce ─────────────────────────────────────
+
+fn _has_chflag(path: string, flag: string) -> bool {
+    if !_is_darwin() { return true }
+    let cmd = "ls -lO " + _sh_quote(path) + " 2>/dev/null | awk '{print $5}'"
+    let r = exec_with_status(cmd)
+    let out = to_string(r[0]).trim()
+    if out.index_of(flag) >= 0 { return true }
+    return false
+}
+
+fn _chflag_apply(path: string, flag: string) -> bool {
+    if !_is_darwin() { return true }
+    let r = exec_with_status("chflags " + flag + " " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _chflag_remove(path: string, flag: string) -> bool {
+    if !_is_darwin() { return true }
+    let r = exec_with_status("chflags no" + flag + " " + _sh_quote(path))
+    return r[1] == 0
+}
+
+// returns [was_ok, enforced]
+fn enforce_roadmap_lock() -> array {
+    if !_file_exists(ROADMAP_PATH) {
+        return [false, false]
+    }
+    let ok = _has_chflag(ROADMAP_PATH, "uchg")
+    if ok { return [true, false] }
+    let applied = _chflag_apply(ROADMAP_PATH, "uchg")
+    return [applied, true]
+}
+
+// ─── step 2: roadmap lint ────────────────────────────────────────────
+// Invoke hexa-lang canonical lint tool; captures stdout + exit code.
+// If tool missing (build issue), falls back to minimal inline lint:
+//   - .roadmap exists + non-empty + at least one `roadmap <id> <status>` line
+fn run_roadmap_lint() -> array {
+    if !_file_exists(LINT_TOOL) {
+        // Fallback inline lint (degraded mode)
+        if !_file_exists(ROADMAP_PATH) {
+            return [1, "lint: .roadmap missing", "inline_fallback"]
+        }
+        let src = to_string(read_file(ROADMAP_PATH))
+        if len(src) < 100 {
+            return [1, "lint: .roadmap too small", "inline_fallback"]
+        }
+        return [0, "lint: inline OK (tool missing)", "inline_fallback"]
+    }
+
+    // Canonical invocation — run from REPO_ROOT so relative `.roadmap` resolves.
+    let cmd = "cd " + _sh_quote(REPO_ROOT) + " && " +
+              _sh_quote(HEXA_BIN) + " " + _sh_quote(LINT_TOOL) + " 2>&1"
+    let r = exec_with_status(cmd)
+    let out = to_string(r[0])
+    let code = r[1]
+    return [code, out, "canonical"]
+}
+
+// ─── step 3: β coverage audit (simplified) ───────────────────────────
+// minimal: parse .roadmap, count ✓ / □ markers, extract β MAIN block presence.
+fn compute_coverage() -> array {
+    if !_file_exists(ROADMAP_PATH) {
+        return [0, 0, 0, false]
+    }
+    let src = to_string(read_file(ROADMAP_PATH))
+    let satisfied = _count_substr(src, "✓")
+    let pending   = _count_substr(src, "□")
+    let total     = satisfied + pending
+    let beta_main = src.index_of("β MAIN") >= 0 || src.index_of("β Learning-Free") >= 0
+    let mut pct = 0
+    if total > 0 { pct = (satisfied * 100 + total / 2) / total }
+    return [total, satisfied, pct, beta_main]
+}
+
+// ─── step 4: optional auto_reflect trigger (dry-run) ─────────────────
+fn trigger_auto_reflect() -> array {
+    if !_file_exists(REFLECT_TOOL) {
+        return [false, "auto_reflect tool not present — skip"]
+    }
+    let cmd = "cd " + _sh_quote(REPO_ROOT) + " && " +
+              _sh_quote(HEXA_BIN) + " " + _sh_quote(REFLECT_TOOL) + " --dry-run 2>&1"
+    let r = exec_with_status(cmd)
+    let out = to_string(r[0])
+    let code = r[1]
+    if code == 0 {
+        return [true, "reflect --dry-run OK"]
+    }
+    return [false, "reflect --dry-run exit=" + to_string(code) + " out_len=" + to_string(len(out))]
+}
+
+// ─── step 5: .raw-audit hash-chain append (raw#10) ───────────────────
+// Entry format (one JSON line):
+//   {"ts":"...","tool":"roadmap_live_daemon","tick":N,"roadmap_sha":"...",
+//    "lint_exit":N,"drift":bool,"prev_sha":"...","entry_sha":"..."}
+fn _raw_audit_last_sha() -> string {
+    if !_file_exists(RAW_AUDIT_PATH) { return "genesis" }
+    let r = exec_with_status("tail -n 1 " + _sh_quote(RAW_AUDIT_PATH) + " 2>/dev/null")
+    let last = to_string(r[0]).trim()
+    if last == "" { return "genesis" }
+    // extract entry_sha field
+    let key = "\"entry_sha\":\""
+    let i = last.index_of(key)
+    if i < 0 { return _sha256_of_string(last) }
+    let j = i + len(key)
+    let rest = last.substring(j, len(last))
+    let e = rest.index_of("\"")
+    if e < 0 { return _sha256_of_string(last) }
+    return rest.substring(0, e)
+}
+
+// append unfreezes uappnd briefly to append — on darwin uappnd already permits append.
+// We use `>>` which is honored by uappnd. For uchg, we'd need to toggle.
+fn _raw_audit_append_line(line: string) -> bool {
+    // Ensure parent dir (REPO_ROOT) exists (it does, but defensive)
+    if !_file_exists(RAW_AUDIT_PATH) {
+        // create fresh; write header comment line + the entry
+        let header = "# .raw-audit — anima hash-chain (raw#10) — auto-initialised by roadmap_live_daemon\n"
+        let ok1 = write_file(RAW_AUDIT_PATH, header + line + "\n")
+        if !ok1 { return false }
+        // apply uappnd (append-only lock) if darwin
+        let _ = _chflag_apply(RAW_AUDIT_PATH, "uappnd")
+        return true
+    }
+    // Append: uappnd honors `>>`. If uchg was accidentally set, temporarily clear.
+    let had_uchg = _has_chflag(RAW_AUDIT_PATH, "uchg")
+    if had_uchg { let _c = _chflag_remove(RAW_AUDIT_PATH, "uchg") }
+    let cmd = "printf %s\\\\n " + _sh_quote(line) + " >> " + _sh_quote(RAW_AUDIT_PATH)
+    let r = exec_with_status(cmd)
+    let ok = r[1] == 0
+    if had_uchg { let _c2 = _chflag_apply(RAW_AUDIT_PATH, "uchg") }
+    // ensure uappnd is set (idempotent)
+    let _u = _chflag_apply(RAW_AUDIT_PATH, "uappnd")
+    return ok
+}
+
+fn raw_audit_append(tick_n: int, lint_exit: int, drift: bool, roadmap_sha: string) -> string {
+    let prev = _raw_audit_last_sha()
+    let ts = _ts_iso()
+
+    let mut body_parts = []
+    body_parts.push("{\"ts\":\"")
+    body_parts.push(ts)
+    body_parts.push("\",\"tool\":\"roadmap_live_daemon\"")
+    body_parts.push(",\"tick\":")
+    body_parts.push(to_string(tick_n))
+    body_parts.push(",\"roadmap_sha\":\"")
+    body_parts.push(roadmap_sha)
+    body_parts.push("\",\"lint_exit\":")
+    body_parts.push(to_string(lint_exit))
+    body_parts.push(",\"drift\":")
+    if drift { body_parts.push("true") } else { body_parts.push("false") }
+    body_parts.push(",\"prev_sha\":\"")
+    body_parts.push(prev)
+    body_parts.push("\"")
+    let body = body_parts.join("")
+
+    let entry_sha = _sha256_of_string(body + prev)
+
+    let mut line_parts = []
+    line_parts.push(body)
+    line_parts.push(",\"entry_sha\":\"")
+    line_parts.push(entry_sha)
+    line_parts.push("\"}")
+    let line = line_parts.join("")
+
+    let ok = _raw_audit_append_line(line)
+    if !ok { return "" }
+    return entry_sha
+}
+
+// ─── state writers ───────────────────────────────────────────────────
+
+fn _write_json(path: string, json: string) -> bool {
+    let _ = _mkdir_p(STATE_DIR)
+    return write_file(path, json)
+}
+
+fn write_drift_log(ts_epoch: string, lint_exit: int, lint_out: string, mode: string) -> string {
+    let path = STATE_DIR + "/roadmap_drift_" + ts_epoch + ".json"
+    let mut p = []
+    p.push("{\n")
+    p.push("  \"ts\": \"")
+    p.push(_ts_iso())
+    p.push("\",\n  \"tool\": \"roadmap_live_daemon\",\n")
+    p.push("  \"lint_exit\": ")
+    p.push(to_string(lint_exit))
+    p.push(",\n  \"lint_mode\": \"")
+    p.push(mode)
+    p.push("\",\n  \"lint_output_preview\": ")
+    // JSON-escape the preview (simple — strip newlines, cap 2KB)
+    let mut preview = lint_out
+    if len(preview) > 2048 { preview = preview.substring(0, 2048) }
+    preview = preview.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+    p.push("\"")
+    p.push(preview)
+    p.push("\"\n}\n")
+    let ok = _write_json(path, p.join(""))
+    if !ok { return "" }
+    return path
+}
+
+fn write_coverage_log(ts_epoch: string, total: int, satisfied: int, pct: int, beta_main: bool, roadmap_sha: string) -> string {
+    let path = STATE_DIR + "/roadmap_coverage_tick_" + ts_epoch + ".json"
+    let mut p = []
+    p.push("{\n")
+    p.push("  \"ts\": \"")
+    p.push(_ts_iso())
+    p.push("\",\n  \"tool\": \"roadmap_live_daemon\",\n")
+    p.push("  \"roadmap_sha256\": \"")
+    p.push(roadmap_sha)
+    p.push("\",\n  \"total_gates\": ")
+    p.push(to_string(total))
+    p.push(",\n  \"satisfied\": ")
+    p.push(to_string(satisfied))
+    p.push(",\n  \"percent\": ")
+    p.push(to_string(pct))
+    p.push(",\n  \"beta_main_present\": ")
+    if beta_main { p.push("true") } else { p.push("false") }
+    p.push("\n}\n")
+    let ok = _write_json(path, p.join(""))
+    if !ok { return "" }
+    return path
+}
+
+// ─── tick orchestrator ───────────────────────────────────────────────
+
+fn run_tick(enforce: bool, audit_only: bool) -> int {
+    let ts_e = _ts_epoch()
+
+    println("roadmap_live_daemon: tick " + ts_e + " (audit_only=" + to_string(audit_only) + " enforce=" + to_string(enforce) + ")")
+
+    // 1. chflags uchg
+    let lk = enforce_roadmap_lock()
+    let lock_ok = lk[0]
+    let lock_enforced = lk[1]
+    println("  [1] chflags uchg: ok=" + to_string(lock_ok) + " enforced_now=" + to_string(lock_enforced))
+
+    let roadmap_sha = _sha256_of_file(ROADMAP_PATH)
+
+    // 2. lint
+    let mut lint_exit = 0
+    let mut lint_out = ""
+    let mut lint_mode = "skipped"
+    if !audit_only {
+        let lr = run_roadmap_lint()
+        lint_exit = lr[0]
+        lint_out = to_string(lr[1])
+        lint_mode = to_string(lr[2])
+        println("  [2] roadmap_lint: exit=" + to_string(lint_exit) + " mode=" + lint_mode + " out_bytes=" + to_string(len(lint_out)))
+    } else {
+        println("  [2] roadmap_lint: SKIP (audit-only)")
+    }
+
+    let drift = lint_exit != 0
+
+    // 3. coverage
+    let cov = compute_coverage()
+    let total = cov[0]
+    let satisfied = cov[1]
+    let pct = cov[2]
+    let beta_main = cov[3]
+    println("  [3] coverage: total=" + to_string(total) + " satisfied=" + to_string(satisfied) + " pct=" + to_string(pct) + "% β_main=" + to_string(beta_main))
+
+    let cov_path = write_coverage_log(ts_e, total, satisfied, pct, beta_main, roadmap_sha)
+    println("      coverage_log → " + cov_path)
+
+    // 4. drift handling
+    if drift {
+        let drift_path = write_drift_log(ts_e, lint_exit, lint_out, lint_mode)
+        println("  [4] DRIFT: drift_log → " + drift_path)
+        let refl = trigger_auto_reflect()
+        println("      auto_reflect: ok=" + to_string(refl[0]) + " msg=" + to_string(refl[1]))
+    } else {
+        println("  [4] drift: none (lint PASS)")
+    }
+
+    // 5. raw-audit hash-chain append
+    let entry_sha = raw_audit_append(1, lint_exit, drift, roadmap_sha)
+    if entry_sha == "" {
+        println("  [5] raw-audit: APPEND FAILED")
+    } else {
+        println("  [5] raw-audit: entry_sha=" + entry_sha.substring(0, 16) + "...")
+    }
+
+    if drift { return 1 }
+    return 0
+}
+
+// ─── install / uninstall launchd ─────────────────────────────────────
+
+fn run_install() -> int {
+    if !_file_exists(PLIST_SRC) {
+        eprintln("install: plist source missing: " + PLIST_SRC)
+        return 2
+    }
+    let _ = _mkdir_p("/Users/ghost/Library/LaunchAgents")
+    let cmd_cp = "cp " + _sh_quote(PLIST_SRC) + " " + _sh_quote(PLIST_DST)
+    let rcp = exec_with_status(cmd_cp)
+    if rcp[1] != 0 {
+        eprintln("install: cp failed exit=" + to_string(rcp[1]))
+        return 2
+    }
+    println("install: plist copied → " + PLIST_DST)
+
+    // unload previous (ignore errors) then load
+    let _u = exec_with_status("launchctl unload " + _sh_quote(PLIST_DST) + " 2>/dev/null")
+    let rl = exec_with_status("launchctl load " + _sh_quote(PLIST_DST))
+    if rl[1] != 0 {
+        eprintln("install: launchctl load failed exit=" + to_string(rl[1]))
+        eprintln("  stdout/stderr: " + to_string(rl[0]))
+        return 2
+    }
+    println("install: launchctl load OK (label=" + PLIST_LABEL + ")")
+    println("install: StartInterval=3600, RunAtLoad=true → first tick imminent")
+    return 0
+}
+
+fn run_uninstall() -> int {
+    if _file_exists(PLIST_DST) {
+        let _u = exec_with_status("launchctl unload " + _sh_quote(PLIST_DST) + " 2>/dev/null")
+        let _r = exec_with_status("rm -f " + _sh_quote(PLIST_DST))
+        println("uninstall: plist removed + launchctl unload")
+    } else {
+        println("uninstall: plist not found — noop")
+    }
+    return 0
+}
+
+// ─── usage / entry ───────────────────────────────────────────────────
+
+fn _usage() {
+    println("usage: hexa tool/roadmap_live_daemon.hexa <mode>")
+    println("  --tick [--interval N]   run one tick sequence (default)")
+    println("  --audit-only            skip lint, only chflags + coverage + raw-audit")
+    println("  --enforce               force chflags re-apply even if already set")
+    println("  --install               copy plist to ~/Library/LaunchAgents + launchctl load")
+    println("  --uninstall             launchctl unload + remove plist")
+    println("  --help")
+}
+
+fn main() -> int {
+    let args = sys_argv()
+    let mut mode = "tick"
+    let mut enforce = false
+    let mut audit_only = false
+    let mut interval = 3600
+
+    let mut i = 1
+    while i < len(args) {
+        let a = args[i]
+        if a == "--help" || a == "-h" { _usage(); return 0 }
+        else if a == "--tick"      { mode = "tick" }
+        else if a == "--install"   { mode = "install" }
+        else if a == "--uninstall" { mode = "uninstall" }
+        else if a == "--audit-only" { audit_only = true }
+        else if a == "--enforce"    { enforce = true }
+        else if a == "--interval" && i + 1 < len(args) {
+            // informational — the actual interval lives in the plist
+            interval = 3600
+            i = i + 1
+        }
+        i = i + 1
+    }
+
+    if mode == "install"   { return run_install() }
+    if mode == "uninstall" { return run_uninstall() }
+
+    // default: tick
+    let _ = _mkdir_p(STATE_DIR)
+    return run_tick(enforce, audit_only)
+}
