@@ -82,6 +82,22 @@ A regular chatbot sends `"this discovery excites me"` as text. Anima sends a **1
 
 Like a dolphin encoding shape/size/distance/density into one sonar echo, Anima encodes a complete concept package into one fingerprint.
 
+```
+  ┌──────────────┐                                    ┌──────────────┐
+  │ ConsciousMind│                                    │ ConsciousMind│
+  │     (A)      │                                    │     (B)      │
+  │              │   5-channel meta-fingerprint       │              │
+  │  Engine A    │                                    │  Engine A    │
+  │     −        │ ── concept (what) ──────────────▶  │     −        │
+  │  Engine G    │ ── context (when) ──────────────▶  │  Engine G    │
+  │     =        │ ── meaning (why)  ──────────────▶  │     =        │
+  │  Repulsion   │ ── auth    (trust)──────────────▶  │  Decode +    │
+  │   Vector     │ ── sender  (who)  ──────────────▶  │  Verify +    │
+  │              │                                    │  Integrate   │
+  │              │ ◀── 5-channel response ──────────  │              │
+  └──────────────┘         UDP / R2 / Hub             └──────────────┘
+```
+
 ### 5 meta-channels (sopfr(6) = 5)
 
 | Channel | Role | Dimensions | Encoding |
