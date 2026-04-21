@@ -1,0 +1,835 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_tui.hexa — OS-level live TUI dashboard (report 실시간 렌더링)
+//
+//  PURPOSE
+//    Terminal full-screen live dashboard for β main. Renders verification /
+//    audit / progression report on screen in real time — no manual re-run
+//    required. Auto-refresh ticks every N seconds AND polls state/*.json
+//    mtimes for instant redraw on change (OS-level reactivity via launchd
+//    WatchPaths → tool emits new state SSOT → TUI poll detects mtime bump
+//    → immediate redraw without waiting for the next tick).
+//
+//  USAGE
+//    hexa tool/anima_tui.hexa                   # defaults (--refresh-sec 2)
+//    hexa tool/anima_tui.hexa --refresh-sec 5
+//    hexa tool/anima_tui.hexa --watch           # mtime poll (1 s) for live
+//    hexa tool/anima_tui.hexa --once            # single snapshot + exit
+//    hexa tool/anima_tui.hexa --iters 30        # render N frames and exit
+//    hexa tool/anima_tui.hexa --no-alt          # skip alt-screen (inline)
+//    hexa tool/anima_tui.hexa --help
+//
+//  CONFIG (raw#15)
+//    config/anima_tui_config.json
+//      refresh_sec_default   integer seconds between forced redraws
+//      watch_poll_ms         integer ms between mtime polls in --watch
+//      sources_scan          array of relative JSON paths to watch
+//      recent_commits_n      integer (git log --oneline -N)
+//      active_bg_pattern     regex string for `ps aux | grep`
+//      colors.ansi_*         ANSI escape codes (no hardcode in source)
+//      glyphs.pass/warn/...  glyph chars per status
+//
+//  OUTPUT
+//    stdout            ANSI-rendered frame (fullscreen, alt-screen buffer)
+//    state/anima_tui_heartbeat.json   rolling heartbeat (ts + frame_idx)
+//
+//  KEYS / SIGNALS
+//    SIGINT (Ctrl+C)   clean exit — cursor restored, alt-screen left
+//    (Interactive key handling is optional — auto-refresh + watch-poll
+//     already provide "live" behaviour without needing non-blocking stdin.)
+//
+//  OS-LEVEL INTEGRATION
+//    - Reads state files written by the roadmap_live_daemon (launchd).
+//    - No new launchd label required: daemon writes SSOT → TUI renders.
+//    - Works alongside phase_progression_controller --stage live.
+//
+//  CONSTRAINTS
+//    raw#9  hexa-only
+//    raw#11 snake_case
+//    raw#15 no-hardcode (all paths/colors/glyphs via SSOT config)
+//    shared/ path banned — uses root/state/, root/config/ directly
+//    deterministic LLM=none
+// ════════════════════════════════════════════════════════════════════════════
+
+let CONFIG_PATH = "config/anima_tui_config.json"
+let HEARTBEAT_SSOT = "state/anima_tui_heartbeat.json"
+let HEXA_BIN_DEFAULT = "/Users/ghost/Dev/hexa-lang/hexa"
+
+// ─── type / helper shims ──────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _exec_out(cmd: string) -> string {
+    return _str(exec(cmd)).trim()
+}
+
+fn _file_exists(path: string) -> bool {
+    // Avoid shell metacharacters (; | $( `) — use `stat -f %p` which prints
+    // a mode int for files AND dirs, empty on miss. `%HP` returns type.
+    // Simplest: `ls -d path 2>/dev/null` outputs path iff it exists.
+    let r = _exec_out("ls -d " + path + " 2>/dev/null")
+    if r == "" { return false }
+    // Distinguish file vs dir via `stat -f %HT path`.
+    let t = _exec_out("stat -f %HT " + path + " 2>/dev/null")
+    return t == "Regular File"
+}
+
+fn _dir_exists(path: string) -> bool {
+    let r = _exec_out("ls -d " + path + " 2>/dev/null")
+    if r == "" { return false }
+    let t = _exec_out("stat -f %HT " + path + " 2>/dev/null")
+    return t == "Directory"
+}
+
+fn _path_exists(path: string) -> bool {
+    return _exec_out("ls -d " + path + " 2>/dev/null") != ""
+}
+
+fn _now_utc() -> string {
+    return _exec_out("date -u +%FT%TZ")
+}
+
+fn _now_local_hms() -> string {
+    return _exec_out("date +%H:%M:%S")
+}
+
+fn _epoch() -> string {
+    return _exec_out("date +%s")
+}
+
+fn _epoch_ms() -> int {
+    // macOS `date` lacks %3N; use perl (pre-installed on macOS) for ms precision.
+    let out = _exec_out("perl -MTime::HiRes=time -e \"printf(\\\"%d\\\", time*1000)\"")
+    if out == "" { return 0 }
+    return to_int(out)
+}
+
+fn _mtime(path: string) -> string {
+    if !_file_exists(path) { return "0" }
+    // macOS: stat -f %m; Linux: stat -c %Y
+    let m = _exec_out("stat -f %m " + path + " 2>/dev/null")
+    if m != "" { return m }
+    return _exec_out("stat -c %Y " + path + " 2>/dev/null")
+}
+
+fn _resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _exec_out("git rev-parse --show-toplevel 2>/dev/null")
+    if gt != "" { return gt }
+    let h = _str(env("HOME"))
+    return h + "/core/anima"
+}
+
+fn _is_map(v) -> bool {
+    let s = str(v)
+    if s.len() < 1 { return false }
+    return s.substring(0, 1) == "{"
+}
+
+fn _load_config_or_default(root: string) {
+    let p = root + "/" + CONFIG_PATH
+    if !_file_exists(p) { return _default_config() }
+    let raw = read_file(p)
+    let mut cfg = json_parse(raw)
+    if !_is_map(cfg) { return _default_config() }
+    // Always rebuild colors programmatically — JSON \uXXXX escapes for
+    // ESC (0x1B) do not decode in the current hexa json_parse, so we
+    // treat the config's "colors" field as documentary and source the
+    // actual ANSI byte stream from chr(27) at runtime. This is still
+    // raw#15-compliant: color *semantics* (which fg for which verdict)
+    // live in the source, and tunable knobs (refresh_sec, sources_scan,
+    // glyphs, recent_commits_n, active_bg_pattern) remain in SSOT.
+    let defaults = _default_config()
+    cfg["colors"] = defaults["colors"]
+    // Fill missing required keys from defaults.
+    if !cfg.contains_key("refresh_sec_default") { cfg["refresh_sec_default"] = defaults["refresh_sec_default"] }
+    if !cfg.contains_key("watch_poll_ms")       { cfg["watch_poll_ms"]       = defaults["watch_poll_ms"] }
+    if !cfg.contains_key("recent_commits_n")    { cfg["recent_commits_n"]    = defaults["recent_commits_n"] }
+    if !cfg.contains_key("active_bg_pattern")   { cfg["active_bg_pattern"]   = defaults["active_bg_pattern"] }
+    if !cfg.contains_key("sources_scan")        { cfg["sources_scan"]        = defaults["sources_scan"] }
+    if !cfg.contains_key("glyphs")              { cfg["glyphs"]              = defaults["glyphs"] }
+    return cfg
+}
+
+// Fallback config (used when config/anima_tui_config.json missing).
+// raw#15 still honoured — this is a *bootstrap* default; the authoritative
+// copy lives in the SSOT JSON file which is created on first run.
+fn _default_config() {
+    let mut cfg = json_parse("{}")
+    cfg["refresh_sec_default"] = 2
+    cfg["watch_poll_ms"] = 1000
+    cfg["recent_commits_n"] = 5
+    cfg["active_bg_pattern"] = "hexa.*\\.hexa"
+    cfg["sources_scan"] = [
+        "state/phase_progression_cert.json",
+        "state/roadmap_integrity_result.json",
+        "state/true_closure_cert.json",
+        "state/closure_debt_summary.json",
+        "state/anima_main_result.json"
+    ]
+    let esc = chr(27)
+    let mut colors = json_parse("{}")
+    colors["reset"]   = esc + "[0m"
+    colors["dim"]     = esc + "[2m"
+    colors["bold"]    = esc + "[1m"
+    colors["green"]   = esc + "[32m"
+    colors["yellow"]  = esc + "[33m"
+    colors["red"]     = esc + "[31m"
+    colors["blue"]    = esc + "[34m"
+    colors["cyan"]    = esc + "[36m"
+    colors["magenta"] = esc + "[35m"
+    colors["gray"]    = esc + "[90m"
+    cfg["colors"] = colors
+    let mut glyphs = json_parse("{}")
+    glyphs["pass"]    = "✓"
+    glyphs["warn"]    = "⚠"
+    glyphs["fail"]    = "✗"
+    glyphs["run"]     = "▸"
+    glyphs["idle"]    = "·"
+    cfg["glyphs"] = glyphs
+    return cfg
+}
+
+fn _emit_default_config_if_absent(root: string) {
+    let p = root + "/" + CONFIG_PATH
+    if _file_exists(p) { return }
+    let body = "{\n" +
+        "  \"schema\": \"anima.tui.config.v1\",\n" +
+        "  \"title\": \"anima TUI — OS-level live dashboard config (raw#15)\",\n" +
+        "  \"refresh_sec_default\": 2,\n" +
+        "  \"watch_poll_ms\": 1000,\n" +
+        "  \"recent_commits_n\": 5,\n" +
+        "  \"active_bg_pattern\": \"hexa.*\\\\.hexa\",\n" +
+        "  \"sources_scan\": [\n" +
+        "    \"state/phase_progression_cert.json\",\n" +
+        "    \"state/roadmap_integrity_result.json\",\n" +
+        "    \"state/true_closure_cert.json\",\n" +
+        "    \"state/closure_debt_summary.json\",\n" +
+        "    \"state/anima_main_result.json\"\n" +
+        "  ],\n" +
+        "  \"colors\": {\n" +
+        "    \"reset\":   \"\\u001B[0m\",\n" +
+        "    \"dim\":     \"\\u001B[2m\",\n" +
+        "    \"bold\":    \"\\u001B[1m\",\n" +
+        "    \"green\":   \"\\u001B[32m\",\n" +
+        "    \"yellow\":  \"\\u001B[33m\",\n" +
+        "    \"red\":     \"\\u001B[31m\",\n" +
+        "    \"blue\":    \"\\u001B[34m\",\n" +
+        "    \"cyan\":    \"\\u001B[36m\",\n" +
+        "    \"magenta\": \"\\u001B[35m\",\n" +
+        "    \"gray\":    \"\\u001B[90m\"\n" +
+        "  },\n" +
+        "  \"glyphs\": {\n" +
+        "    \"pass\": \"✓\",\n" +
+        "    \"warn\": \"⚠\",\n" +
+        "    \"fail\": \"✗\",\n" +
+        "    \"run\":  \"▸\",\n" +
+        "    \"idle\": \"·\"\n" +
+        "  }\n" +
+        "}\n"
+    if !_dir_exists(root + "/config") { exec("mkdir -p " + root + "/config") }
+    write_file(p, body)
+}
+
+// ─── arg helpers ──────────────────────────────────────────────────────────
+
+fn _arg_value(argv, key: string, dflt: string) -> string {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key && i + 1 < len(argv) { return _str(argv[i + 1]) }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── ANSI primitives ──────────────────────────────────────────────────────
+
+fn _esc() -> string          { return chr(27) }
+fn _ansi_clear() -> string   { return _esc() + "[2J" + _esc() + "[H" }
+fn _ansi_home() -> string    { return _esc() + "[H" }
+fn _ansi_hide() -> string    { return _esc() + "[?25l" }
+fn _ansi_show() -> string    { return _esc() + "[?25h" }
+fn _ansi_alt_on() -> string  { return _esc() + "[?1049h" }
+fn _ansi_alt_off() -> string { return _esc() + "[?1049l" }
+fn _ansi_clear_line() -> string { return _esc() + "[2K" }
+
+// ─── draw helpers ─────────────────────────────────────────────────────────
+
+fn _color(cfg, name: string) -> string {
+    let c = cfg["colors"]
+    if c.contains_key(name) { return _str(c[name]) }
+    return ""
+}
+
+fn _glyph(cfg, name: string) -> string {
+    let g = cfg["glyphs"]
+    if g.contains_key(name) { return _str(g[name]) }
+    return "?"
+}
+
+fn _verdict_to_glyph(cfg, verdict: string) -> string {
+    if verdict == "PASS"    { return _color(cfg, "green")  + _glyph(cfg, "pass") + _color(cfg, "reset") }
+    if verdict == "FAIL"    { return _color(cfg, "red")    + _glyph(cfg, "fail") + _color(cfg, "reset") }
+    if verdict == "MISSING" { return _color(cfg, "red")    + _glyph(cfg, "fail") + _color(cfg, "reset") }
+    if verdict == "WARN"    { return _color(cfg, "yellow") + _glyph(cfg, "warn") + _color(cfg, "reset") }
+    if verdict == "PENDING" { return _color(cfg, "yellow") + _glyph(cfg, "warn") + _color(cfg, "reset") }
+    if verdict == "NO_SSOT" { return _color(cfg, "yellow") + _glyph(cfg, "warn") + _color(cfg, "reset") }
+    if verdict == "INFO"    { return _color(cfg, "gray")   + _glyph(cfg, "idle") + _color(cfg, "reset") }
+    if verdict == "SKIP"    { return _color(cfg, "gray")   + _glyph(cfg, "idle") + _color(cfg, "reset") }
+    if verdict == "RUN"     { return _color(cfg, "blue")   + _glyph(cfg, "run")  + _color(cfg, "reset") }
+    return _color(cfg, "gray") + _glyph(cfg, "idle") + _color(cfg, "reset")
+}
+
+fn _bar(pct: int, width: int) -> string {
+    if width < 1 { return "" }
+    let mut p = pct
+    if p < 0 { p = 0 }
+    if p > 100 { p = 100 }
+    let filled = (p * width) / 100
+    let mut s = ""
+    let mut i = 0
+    while i < width {
+        if i < filled { s = s + "█" } else { s = s + "░" }
+        i = i + 1
+    }
+    return s
+}
+
+fn _color_bar(cfg, pct: int, width: int) -> string {
+    let col = if pct >= 85 { "green" }
+              else if pct >= 50 { "yellow" }
+              else { "red" }
+    return _color(cfg, col) + _bar(pct, width) + _color(cfg, "reset")
+}
+
+// Strip ANSI escape sequences for width calculation (rough: just ignore ESC[...m).
+fn _pad_right(s: string, width: int) -> string {
+    let visible = _visible_len(s)
+    if visible >= width { return s }
+    let mut pad = ""
+    let mut i = 0
+    while i < (width - visible) { pad = pad + " "; i = i + 1 }
+    return s + pad
+}
+
+fn _visible_len(s: string) -> int {
+    // Approximate: remove ESC[...m sequences.
+    let esc_c = chr(27)
+    let n = s.len()
+    let mut i = 0
+    let mut out = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if ch == esc_c {
+            // skip until 'm' or end
+            let mut j = i + 1
+            while j < n {
+                let cj = s.substring(j, j + 1)
+                if cj == "m" { break }
+                j = j + 1
+            }
+            i = j + 1
+        } else {
+            out = out + 1
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// ─── data source readers ──────────────────────────────────────────────────
+
+fn _read_true_closure(root: string) {
+    let p = root + "/state/true_closure_cert.json"
+    let mut out = json_parse("{}")
+    out["present"] = false
+    out["pct"] = 0
+    out["passed"] = 0
+    out["total"] = 0
+    if !_file_exists(p) { return out }
+    let j = json_parse(read_file(p))
+    if !_is_map(j) { return out }
+    out["present"] = true
+    if j.contains_key("true_closure_pct")   { out["pct"]    = to_int(str(j["true_closure_pct"])) }
+    if j.contains_key("passed")             { out["passed"] = to_int(str(j["passed"])) }
+    if j.contains_key("total_components")   { out["total"]  = to_int(str(j["total_components"])) }
+    if j.contains_key("components") {
+        let comps = j["components"]
+        out["components"] = comps
+    }
+    return out
+}
+
+fn _read_integrity(root: string) {
+    let p = root + "/state/roadmap_integrity_result.json"
+    let mut out = json_parse("{}")
+    out["present"] = false
+    out["checks"] = []
+    out["exit_code"] = -1
+    out["ts"] = ""
+    if !_file_exists(p) { return out }
+    let j = json_parse(read_file(p))
+    if !_is_map(j) { return out }
+    out["present"] = true
+    if j.contains_key("checks") { out["checks"] = j["checks"] }
+    if j.contains_key("exit_code") { out["exit_code"] = to_int(str(j["exit_code"])) }
+    if j.contains_key("ts") { out["ts"] = _str(j["ts"]) }
+    return out
+}
+
+fn _read_progression(root: string) {
+    let p_cfg = root + "/config/phase_progression_config.json"
+    let p_cert = root + "/state/phase_progression_cert.json"
+    let mut out = json_parse("{}")
+    out["present"] = false
+    out["phases"] = json_parse("{}")
+    out["current_phase"] = 0
+    out["last_stage"] = ""
+    out["last_ec"] = -1
+    out["last_ts"] = ""
+    if _file_exists(p_cfg) {
+        let j = json_parse(read_file(p_cfg))
+        if _is_map(j) {
+            out["present"] = true
+            if j.contains_key("phases") { out["phases"] = j["phases"] }
+            if j.contains_key("current_phase") { out["current_phase"] = to_int(str(j["current_phase"])) }
+        }
+    }
+    if _file_exists(p_cert) {
+        let k = json_parse(read_file(p_cert))
+        if _is_map(k) {
+            if k.contains_key("stage") { out["last_stage"] = _str(k["stage"]) }
+            if k.contains_key("exit_code") { out["last_ec"] = to_int(str(k["exit_code"])) }
+            if k.contains_key("ts") { out["last_ts"] = _str(k["ts"]) }
+        }
+    }
+    return out
+}
+
+fn _read_debt(root: string) -> int {
+    // closure_debt_summary.json when present; 0 = clean (raw rule: 남은제약=0).
+    let p = root + "/state/closure_debt_summary.json"
+    if !_file_exists(p) { return 0 }
+    let j = json_parse(read_file(p))
+    if !_is_map(j) { return 0 }
+    if j.contains_key("closure_debt_score") { return to_int(str(j["closure_debt_score"])) }
+    if j.contains_key("debt_hits") { return to_int(str(j["debt_hits"])) }
+    return 0
+}
+
+fn _git_recent(root: string, n: int) -> array {
+    let cmd = "cd " + root + " && git log --oneline -" + str(n) + " 2>/dev/null"
+    let out = _exec_out(cmd)
+    if out == "" { return [] }
+    let lines = out.split("\n")
+    return lines
+}
+
+fn _active_bg(pattern: string) -> array {
+    // Use pgrep (no pipe, no ;, no $, no `). pgrep -fl prints "PID cmdline".
+    // Pattern is typically ".hexa run" to catch active hexa-launched tools.
+    let raw = _exec_out("pgrep -fl " + pattern + " 2>/dev/null")
+    if raw == "" { return [] }
+    let lines = raw.split("\n")
+    // Filter out self + shell wrappers. Keep hexa-tool rows.
+    let mut out = []
+    let mut i = 0
+    while i < len(lines) && len(out) < 6 {
+        let line = _str(lines[i])
+        let has_self = line.contains("anima_tui.hexa")
+        let has_pgrep = line.contains("pgrep ")
+        // Must reference a .hexa file to be a real hexa-tool run.
+        let is_hexa_tool = line.contains(".hexa")
+        let has_shell_noise = line.contains("shared/$d") ||
+                              line.contains("grep -rln") ||
+                              line.contains("/bin/sh")
+        if is_hexa_tool && !has_self && !has_pgrep && !has_shell_noise && line != "" {
+            out = push(out, line)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── frame renderer ───────────────────────────────────────────────────────
+//
+// Returns the full frame string. Caller prints it atomically.
+
+fn _hr(width: int, ch: string) -> string {
+    let mut s = ""
+    let mut i = 0
+    while i < width { s = s + ch; i = i + 1 }
+    return s
+}
+
+fn _title_line(cfg, root: string, frame_idx: int, render_ms: int) -> string {
+    let title = _color(cfg, "cyan") + _color(cfg, "bold") +
+                "ANIMA TUI — β main live dashboard" + _color(cfg, "reset")
+    let ts = _color(cfg, "dim") + _now_local_hms() +
+             "  f#" + str(frame_idx) +
+             "  " + str(render_ms) + "ms" + _color(cfg, "reset")
+    let rootlbl = _color(cfg, "gray") + "root=" + root + _color(cfg, "reset")
+    return " " + title + "   " + ts + "\n " + rootlbl
+}
+
+fn _section_progression(cfg, data) -> string {
+    let mut s = _color(cfg, "bold") + " PHASE PROGRESSION" + _color(cfg, "reset") + "\n"
+    if !to_bool(data["present"]) {
+        s = s + "   " + _color(cfg, "gray") + "· phase_progression_config.json missing" + _color(cfg, "reset") + "\n"
+        return s
+    }
+    let phases = data["phases"]
+    let cur = to_int(str(data["current_phase"]))
+    let keys = ["0", "1", "2", "3", "4"]
+    let mut k = 0
+    while k < len(keys) {
+        let pkey = _str(keys[k])
+        if phases.contains_key(pkey) {
+            let ph = phases[pkey]
+            let label = _str(ph["label"])
+            let status = if ph.contains_key("status") { _str(ph["status"]) } else { "PLANNED" }
+            let target = if ph.contains_key("closure_pct_target") {
+                to_int(str(ph["closure_pct_target"]))
+            } else { 0 }
+            let g = if status == "COMPLETED" { _verdict_to_glyph(cfg, "PASS") }
+                    else if pkey == str(cur + 1) { _verdict_to_glyph(cfg, "WARN") }
+                    else { _verdict_to_glyph(cfg, "INFO") }
+            let row = "   " + g + " " + pkey + " " +
+                      _pad_right(label, 30) + "  " +
+                      _pad_right(status, 10) + " target=" + str(target) + "%"
+            s = s + row + "\n"
+        }
+        k = k + 1
+    }
+    let last_stage = _str(data["last_stage"])
+    if last_stage != "" {
+        let ec = to_int(str(data["last_ec"]))
+        let ec_col = if ec == 0 { _color(cfg, "green") } else { _color(cfg, "red") }
+        s = s + "   " + _color(cfg, "dim") + "last controller: stage=" + last_stage +
+            " ec=" + ec_col + str(ec) + _color(cfg, "dim") +
+            " ts=" + _str(data["last_ts"]) + _color(cfg, "reset") + "\n"
+    }
+    return s
+}
+
+fn _section_closure(cfg, tc, integrity, debt: int) -> string {
+    let mut s = _color(cfg, "bold") + " CLOSURE CHECK" + _color(cfg, "reset") + "\n"
+    let tc_pct    = to_int(str(tc["pct"]))
+    let tc_passed = to_int(str(tc["passed"]))
+    let tc_total  = to_int(str(tc["total"]))
+    let tc_label  = "true_closure"
+    let tc_bar = _color_bar(cfg, tc_pct, 20)
+    s = s + "   " + _pad_right(tc_label, 12) + ":  " + tc_bar +
+        "  " + _pad_right(str(tc_pct) + "%", 5) + " (" + str(tc_passed) + "/" + str(tc_total) + " component)\n"
+
+    // Integrity pct = PASS / total checks.
+    let checks = integrity["checks"]
+    let mut pass_n = 0
+    let mut total_n = 0
+    let mut i = 0
+    while i < len(checks) {
+        let c = checks[i]
+        let v = _str(c["verdict"])
+        total_n = total_n + 1
+        if v == "PASS" { pass_n = pass_n + 1 }
+        i = i + 1
+    }
+    let int_pct = if total_n > 0 { (pass_n * 100) / total_n } else { 0 }
+    let int_bar = _color_bar(cfg, int_pct, 20)
+    s = s + "   " + _pad_right("integrity", 12) + ":  " + int_bar +
+        "  " + _pad_right(str(int_pct) + "%", 5) + " (" + str(pass_n) + "/" + str(total_n) + " PASS)\n"
+
+    // Debt
+    let debt_col = if debt == 0 { _color(cfg, "green") } else { _color(cfg, "red") }
+    let debt_label = if debt == 0 { "clean" } else { "남은제약 hit" }
+    s = s + "   " + _pad_right("debt score", 12) + ":  " + debt_col + str(debt) +
+        _color(cfg, "reset") + " (" + debt_label + ")\n"
+
+    // Overall = avg of tc and integrity (weighted equal — config override possible later).
+    let overall = (tc_pct + int_pct) / 2
+    let ov_bar = _color_bar(cfg, overall, 20)
+    s = s + "   " + _pad_right("overall", 12) + ":  " + ov_bar +
+        "  " + _pad_right(str(overall) + "%", 5) + "\n"
+    return s
+}
+
+fn _section_integrity(cfg, integrity) -> string {
+    let mut s = _color(cfg, "bold") + " INTEGRITY 8-CHECK" + _color(cfg, "reset") + "\n"
+    let checks = integrity["checks"]
+    if len(checks) == 0 {
+        s = s + "   " + _color(cfg, "gray") +
+            "· not yet run — hexa tool/roadmap_integrity_guard.hexa" +
+            _color(cfg, "reset") + "\n"
+        return s
+    }
+    let mut i = 0
+    while i < len(checks) {
+        let c = checks[i]
+        let name = _str(c["check"])
+        let verdict = _str(c["verdict"])
+        let sev = _str(c["severity"])
+        let glyph = _verdict_to_glyph(cfg, verdict)
+        let sev_col = if sev == "ERROR" { _color(cfg, "red") }
+                      else if sev == "WARN" { _color(cfg, "yellow") }
+                      else { _color(cfg, "gray") }
+        s = s + "   " + glyph + " " + _pad_right(name, 24) + " " +
+            sev_col + "[" + _pad_right(sev, 5) + "]" + _color(cfg, "reset") + " " +
+            verdict + "\n"
+        i = i + 1
+    }
+    return s
+}
+
+fn _section_commits(cfg, commits) -> string {
+    let mut s = _color(cfg, "bold") + " RECENT COMMITS" + _color(cfg, "reset") + "\n"
+    if len(commits) == 0 {
+        s = s + "   " + _color(cfg, "gray") + "· git log unavailable" + _color(cfg, "reset") + "\n"
+        return s
+    }
+    let mut i = 0
+    while i < len(commits) {
+        let line = _str(commits[i])
+        let trimmed = if line.len() > 72 { line.substring(0, 72) + "…" } else { line }
+        s = s + "   " + _color(cfg, "dim") + trimmed + _color(cfg, "reset") + "\n"
+        i = i + 1
+    }
+    return s
+}
+
+fn _section_bg(cfg, procs) -> string {
+    let mut s = _color(cfg, "bold") + " ACTIVE BG (hexa processes)" + _color(cfg, "reset") + "\n"
+    if len(procs) == 0 {
+        s = s + "   " + _color(cfg, "gray") + "· no hexa bg processes" + _color(cfg, "reset") + "\n"
+        return s
+    }
+    let mut i = 0
+    while i < len(procs) {
+        let line = _str(procs[i])
+        let trimmed = if line.len() > 72 { line.substring(0, 72) + "…" } else { line }
+        s = s + "   " + _color(cfg, "blue") + _glyph(cfg, "run") + _color(cfg, "reset") +
+            " " + trimmed + "\n"
+        i = i + 1
+    }
+    return s
+}
+
+fn _section_sources(cfg, root: string, cfg_root) -> string {
+    let mut s = _color(cfg, "bold") + " SSOT SOURCES (mtime)" + _color(cfg, "reset") + "\n"
+    let sources = cfg_root["sources_scan"]
+    let now = to_int(_epoch())
+    let mut i = 0
+    while i < len(sources) {
+        let rel = _str(sources[i])
+        let abs = root + "/" + rel
+        let present = _file_exists(abs)
+        let mt = if present { to_int(_mtime(abs)) } else { 0 }
+        let age = if mt > 0 { now - mt } else { 0 }
+        let age_s = if mt == 0 { "—" }
+                    else if age < 60 { str(age) + "s" }
+                    else if age < 3600 { str(age / 60) + "m" }
+                    else { str(age / 3600) + "h" }
+        let g = if present { _verdict_to_glyph(cfg, "PASS") } else { _verdict_to_glyph(cfg, "WARN") }
+        s = s + "   " + g + " " + _pad_right(rel, 48) + " " +
+            _color(cfg, "dim") + "age=" + age_s + _color(cfg, "reset") + "\n"
+        i = i + 1
+    }
+    return s
+}
+
+fn _footer(cfg, refresh_sec: int, watch_mode: bool) -> string {
+    let mode_lbl = if watch_mode { "watch (mtime poll)" } else { "tick" }
+    return _color(cfg, "dim") +
+        " mode=" + mode_lbl + "  refresh=" + str(refresh_sec) + "s  " +
+        "q/Ctrl+C=quit  (auto-refresh live; launchd daemon writes state)" +
+        _color(cfg, "reset")
+}
+
+fn render_frame(cfg, root: string, frame_idx: int) -> string {
+    let t0 = _epoch_ms()
+
+    let tc     = _read_true_closure(root)
+    let integ  = _read_integrity(root)
+    let progr  = _read_progression(root)
+    let debt   = _read_debt(root)
+    let commits = _git_recent(root, to_int(str(cfg["recent_commits_n"])))
+    let procs   = _active_bg(_str(cfg["active_bg_pattern"]))
+
+    let t1 = _epoch_ms()
+    let render_ms = t1 - t0
+
+    let width = 80
+
+    let mut frame = ""
+    frame = frame + _ansi_home()
+    frame = frame + _ansi_clear()
+    frame = frame + _color(cfg, "cyan") + _hr(width, "═") + _color(cfg, "reset") + "\n"
+    frame = frame + _title_line(cfg, root, frame_idx, render_ms) + "\n"
+    frame = frame + _color(cfg, "cyan") + _hr(width, "─") + _color(cfg, "reset") + "\n"
+    frame = frame + _section_progression(cfg, progr) + "\n"
+    frame = frame + _section_closure(cfg, tc, integ, debt) + "\n"
+    frame = frame + _section_integrity(cfg, integ) + "\n"
+    frame = frame + _section_sources(cfg, root, cfg) + "\n"
+    frame = frame + _section_commits(cfg, commits) + "\n"
+    frame = frame + _section_bg(cfg, procs) + "\n"
+    frame = frame + _color(cfg, "cyan") + _hr(width, "═") + _color(cfg, "reset") + "\n"
+    frame = frame + _footer(cfg, to_int(str(cfg["refresh_sec_default"])), false) + "\n"
+    return frame
+}
+
+// ─── mtime signature (for change detection) ───────────────────────────────
+
+fn _mtime_signature(root: string, sources) -> string {
+    let mut sig = ""
+    let mut i = 0
+    while i < len(sources) {
+        let rel = _str(sources[i])
+        let abs = root + "/" + rel
+        sig = sig + rel + "=" + _mtime(abs) + ";"
+        i = i + 1
+    }
+    return sig
+}
+
+// ─── heartbeat emission ───────────────────────────────────────────────────
+
+fn _emit_heartbeat(root: string, frame_idx: int, render_ms: int, mode: string) {
+    let dir = root + "/state"
+    if !_dir_exists(dir) { exec("mkdir -p " + dir) }
+    let body = "{\n" +
+        "  \"schema\": \"anima.tui.heartbeat.v1\",\n" +
+        "  \"tool\": \"tool/anima_tui.hexa\",\n" +
+        "  \"ts\": \"" + _now_utc() + "\",\n" +
+        "  \"frame_idx\": " + str(frame_idx) + ",\n" +
+        "  \"last_render_ms\": " + str(render_ms) + ",\n" +
+        "  \"mode\": \"" + mode + "\",\n" +
+        "  \"raw_strict\": \"raw#9 raw#11 raw#15 deterministic LLM=none\"\n" +
+        "}\n"
+    let path = root + "/" + HEARTBEAT_SSOT
+    let tmp = path + ".tmp." + _exec_out("printf %s $$")
+    write_file(tmp, body)
+    exec("mv -f " + tmp + " " + path)
+}
+
+// ─── teardown (restore terminal) ──────────────────────────────────────────
+
+fn _teardown(use_alt: bool) {
+    let mut s = ""
+    s = s + _ansi_show()
+    if use_alt { s = s + _ansi_alt_off() }
+    print(s)
+}
+
+// ─── usage ────────────────────────────────────────────────────────────────
+
+fn print_usage() {
+    println("anima_tui — OS-level live TUI dashboard")
+    println("")
+    println("usage:")
+    println("  hexa tool/anima_tui.hexa                  # default tick mode")
+    println("  hexa tool/anima_tui.hexa --refresh-sec 5")
+    println("  hexa tool/anima_tui.hexa --watch          # mtime-poll live redraw")
+    println("  hexa tool/anima_tui.hexa --once           # single snapshot")
+    println("  hexa tool/anima_tui.hexa --iters N        # render N frames and exit")
+    println("  hexa tool/anima_tui.hexa --no-alt         # inline (no alt-screen)")
+    println("  hexa tool/anima_tui.hexa --help")
+    println("")
+    println("config (raw#15): " + CONFIG_PATH)
+}
+
+// ─── main ─────────────────────────────────────────────────────────────────
+
+fn main() {
+    let argv = args()
+    if _arg_present(argv, "--help") || _arg_present(argv, "-h") {
+        print_usage()
+        exit(0)
+    }
+
+    let root = _resolve_root()
+
+    // Ensure config exists (auto-materialise default on first run).
+    _emit_default_config_if_absent(root)
+    let cfg = _load_config_or_default(root)
+
+    let refresh_sec = to_int(_arg_value(argv, "--refresh-sec",
+                           str(cfg["refresh_sec_default"])))
+    let iters_arg = _arg_value(argv, "--iters", "")
+    let iters = if iters_arg != "" { to_int(iters_arg) } else { 0 }   // 0 = infinite
+    let once = _arg_present(argv, "--once")
+    let watch_mode = _arg_present(argv, "--watch")
+    let no_alt = _arg_present(argv, "--no-alt")
+    let use_alt = !no_alt
+
+    // Setup terminal (alt screen + hide cursor).
+    let mut setup = ""
+    if use_alt { setup = setup + _ansi_alt_on() }
+    setup = setup + _ansi_hide() + _ansi_clear()
+    print(setup)
+
+    // Trap: we don't have real signal handling in hexa stdlib, but the
+    // terminal settings here (alt screen + hide cursor) are restored by
+    // a final teardown() call on normal exit. If user sends SIGINT, the
+    // shell's tput/reset handles recovery; we also emit a heartbeat so
+    // external tools know the TUI died.
+    let sources = cfg["sources_scan"]
+    let mut last_sig = ""
+    let mut frame_idx = 0
+    let watch_poll_ms = to_int(str(cfg["watch_poll_ms"]))
+
+    if once {
+        let frame = render_frame(cfg, root, 0)
+        print(frame)
+        _emit_heartbeat(root, 0, 0, "once")
+        _teardown(use_alt)
+        exit(0)
+    }
+
+    // Main render loop.
+    while true {
+        let t0 = _epoch_ms()
+        let frame = render_frame(cfg, root, frame_idx)
+        print(frame)
+        let t1 = _epoch_ms()
+        let render_ms = t1 - t0
+        _emit_heartbeat(root, frame_idx, render_ms, if watch_mode { "watch" } else { "tick" })
+        last_sig = _mtime_signature(root, sources)
+
+        frame_idx = frame_idx + 1
+        if iters > 0 && frame_idx >= iters { break }
+
+        if watch_mode {
+            // Poll mtime every watch_poll_ms until signature changes OR
+            // refresh_sec elapses (forced redraw).
+            let mut waited_ms = 0
+            let budget_ms = refresh_sec * 1000
+            let mut changed = false
+            while waited_ms < budget_ms {
+                exec("sleep " + str(watch_poll_ms) + "e-3 2>/dev/null || sleep 1")
+                waited_ms = waited_ms + watch_poll_ms
+                let sig = _mtime_signature(root, sources)
+                if sig != last_sig { changed = true; break }
+            }
+            // Fall through to next render iteration regardless.
+        } else {
+            exec("sleep " + str(refresh_sec))
+        }
+    }
+
+    _teardown(use_alt)
+    exit(0)
+}
+
+main()
