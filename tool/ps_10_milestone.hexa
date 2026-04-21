@@ -1,0 +1,135 @@
+// tool/ps_10_milestone.hexa — cl-rotate Step 10: .roadmap milestone landing
+//
+// Writes a milestone proposal SSOT for this issue:
+//   state/issues/<id>_milestone.json
+// and records the milestone_id in the issue. Does NOT modify .roadmap
+// directly (that file is chflags uchg; orchestrator-level write is
+// handled by roadmap_auto_reflect --dry-run OR explicit user action).
+
+let DEFAULT_CONFIG = "/Users/ghost/core/anima/config/problem_solving_protocol_config.json"
+
+fn _sh_quote(s: string) -> string { let mut o = "'"; o = o + s.replace("'", "'\\''"); o = o + "'"; return o }
+fn _file_exists(p: string) -> bool { return exec_with_status("test -e " + _sh_quote(p))[1] == 0 }
+fn _ts_iso() -> string { return to_string(exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")[0]).trim() }
+fn _json_escape(s: string) -> string { return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") }
+fn _is_darwin() -> bool { return to_string(exec_with_status("uname -s")[0]).trim() == "Darwin" }
+fn _chflag_remove(path, flag) -> bool { if !_is_darwin() { return true }; return exec_with_status("chflags no" + flag + " " + _sh_quote(path))[1] == 0 }
+fn _chflag_apply(path, flag) -> bool { if !_is_darwin() { return true }; return exec_with_status("chflags " + flag + " " + _sh_quote(path))[1] == 0 }
+fn _eta_plus_days(days) -> string {
+    let r1 = to_string(exec_with_status("date -u -v+" + to_string(days) + "d +%Y-%m-%d 2>/dev/null")[0]).trim()
+    if r1 != "" { return r1 }
+    return to_string(exec_with_status("date -u -d '+" + to_string(days) + " days' +%Y-%m-%d 2>/dev/null")[0]).trim()
+}
+
+fn _load_config(p: string) { if !_file_exists(p) { eprintln("ps_10: config missing"); exit(2) }; return json_parse(read_file(p)) }
+fn _cfg_str(cfg, k, d) -> string { if cfg.contains_key(k) { return to_string(cfg[k]) }; return d }
+fn _argv() -> array { let a = args(); let mut o = []; let mut i = 2; while i < len(a) { o.push(a[i]); i = i + 1 }; return o }
+fn _flag(av, k) -> bool { for x in av { if to_string(x) == k { return true } }; return false }
+fn _opt(av, k, d) -> string { let mut i = 0; while i < len(av) { if to_string(av[i]) == k && i + 1 < len(av) { return to_string(av[i + 1]) }; i = i + 1 }; return d }
+fn _issue_path(cfg, id) -> string { return _cfg_str(cfg, "issue_state_dir", "/Users/ghost/core/anima/state/issues") + "/" + id + ".json" }
+fn _milestone_path(cfg, id) -> string { return _cfg_str(cfg, "issue_state_dir", "/Users/ghost/core/anima/state/issues") + "/" + id + "_milestone.json" }
+
+fn _replace_field_str(body, key, v) -> string {
+    let needle = "\"" + key + "\": \""
+    let i = body.index_of(needle)
+    if i < 0 { return body }
+    let j = i + len(needle)
+    let rest = body.substring(j, len(body))
+    let e = rest.index_of("\"")
+    if e < 0 { return body }
+    return body.substring(0, j) + _json_escape(v) + rest.substring(e, len(rest))
+}
+
+fn _extract_field(body, key) -> string {
+    let needle = "\"" + key + "\": \""
+    let i = body.index_of(needle)
+    if i < 0 { return "" }
+    let j = i + len(needle)
+    let rest = body.substring(j, len(body))
+    let e = rest.index_of("\"")
+    if e < 0 { return "" }
+    return rest.substring(0, e)
+}
+
+fn milestone(cfg, id: string) -> int {
+    let ipath = _issue_path(cfg, id)
+    if !_file_exists(ipath) { eprintln("ps_10: missing " + id); return 2 }
+    let mpath = _milestone_path(cfg, id)
+    let tmpl = cfg["milestone_template"]
+    let track = if tmpl.contains_key("track") { to_string(tmpl["track"]) } else { "ops" }
+    let phase = if tmpl.contains_key("phase") { to_string(tmpl["phase"]) } else { "quick-win" }
+    let prefix = if tmpl.contains_key("id_prefix") { to_string(tmpl["id_prefix"]) } else { "M_" }
+    let suffix = if tmpl.contains_key("exit_criteria_suffix") { to_string(tmpl["exit_criteria_suffix"]) } else { "L0 lock applied" }
+    let eta_days = if tmpl.contains_key("eta_offset_days") { to_int(to_string(tmpl["eta_offset_days"])) } else { 3 }
+    let mid = prefix + id
+    let eta = _eta_plus_days(eta_days)
+
+    // read issue body to extract problem_type for exit_criteria
+    let body = read_file(ipath)
+    let ptype = _extract_field(body, "problem_type")
+    let desc = _extract_field(body, "description")
+
+    let mut p = []
+    p.push("{\n")
+    p.push("  \"schema\": \"anima.problem_solving.milestone.v1\",\n")
+    p.push("  \"milestone_id\": \"" + _json_escape(mid) + "\",\n")
+    p.push("  \"issue_id\": \"" + _json_escape(id) + "\",\n")
+    p.push("  \"created\": \"" + _ts_iso() + "\",\n")
+    p.push("  \"track\": \"" + _json_escape(track) + "\",\n")
+    p.push("  \"phase\": \"" + _json_escape(phase) + "\",\n")
+    p.push("  \"eta\": \"" + _json_escape(eta) + "\",\n")
+    p.push("  \"problem_type\": \"" + _json_escape(ptype) + "\",\n")
+    p.push("  \"description\": \"" + _json_escape(desc) + "\",\n")
+    p.push("  \"exit_criteria\": \"problem_solving_protocol 10-step complete + " + _json_escape(suffix) + "\",\n")
+    p.push("  \"proposed_roadmap_line\": \"- planned [" + _json_escape(mid) + "] " +
+           _json_escape(ptype) + " — " + _json_escape(desc) + " (track=" + _json_escape(track) +
+           " phase=" + _json_escape(phase) + " eta=" + _json_escape(eta) + ")\",\n")
+    p.push("  \"audit_note\": \"raw#1 chflags uchg + raw#10 hash-chain append via orchestrator\"\n")
+    p.push("}\n")
+    write_file(mpath, p.join(""))
+
+    // update issue: milestone_id + status=resolved
+    // if uchg was applied in step 9, unfreeze first
+    let _rm = _chflag_remove(ipath, "uchg")
+    let mut b2 = _replace_field_str(body, "milestone_id", mid)
+    b2 = _replace_field_str(b2, "status", "resolved")
+    b2 = _replace_field_str(b2, "updated", _ts_iso())
+    write_file(ipath, b2)
+    // re-lock
+    let _la = _chflag_apply(ipath, "uchg")
+
+    println("ps_10_milestone: issue=" + id + " → milestone=" + mid + " (track=" + track + " eta=" + eta + ") status=resolved")
+    println("  milestone_ssot: " + mpath)
+    return 0
+}
+
+fn self_test(cfg) -> int {
+    println("── ps_10_milestone self-test ──")
+    let tid = "SELFTEST-PS10"
+    let p = _issue_path(cfg, tid)
+    let mp = _milestone_path(cfg, tid)
+    let _rm = _chflag_remove(p, "uchg")
+    let _r = exec_with_status("rm -f " + _sh_quote(p) + " " + _sh_quote(mp))
+    write_file(p, "{\n  \"issue_id\": \"" + tid + "\",\n  \"problem_type\": \"test_fail\",\n  \"description\": \"self-test fixture\",\n  \"milestone_id\": \"\",\n  \"status\": \"in_progress\",\n  \"current_step\": 10,\n  \"updated\": \"\"\n}\n")
+    let rc = milestone(cfg, tid)
+    if rc != 0 { return 1 }
+    if !_file_exists(mp) { eprintln("  FAIL milestone SSOT not written"); return 1 }
+    let b2 = read_file(p)
+    if b2.index_of("M_" + tid) < 0 { eprintln("  FAIL milestone_id not recorded"); return 1 }
+    if b2.index_of("\"status\": \"resolved\"") < 0 { eprintln("  FAIL status not resolved"); return 1 }
+    // cleanup
+    let _rm2 = _chflag_remove(p, "uchg")
+    let _c = exec_with_status("rm -f " + _sh_quote(p) + " " + _sh_quote(mp))
+    println("  PASS: milestone created, issue resolved")
+    return 0
+}
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") { println("usage: hexa tool/ps_10_milestone.hexa --issue <id>"); return 0 }
+    let cfg = _load_config(_opt(av, "--config", DEFAULT_CONFIG))
+    if _flag(av, "self-test") || _flag(av, "--self-test") { return self_test(cfg) }
+    let id = _opt(av, "--issue", "")
+    if id == "" { eprintln("--issue required"); return 2 }
+    return milestone(cfg, id)
+}

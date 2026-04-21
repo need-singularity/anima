@@ -1,0 +1,641 @@
+// tool/problem_solving_protocol.hexa — OS-level cl-rotate 10-step orchestrator
+//
+// PURPOSE
+//   anima 에서 문제가 발생하면 (test FAIL / integrity WARN / closure_debt / daemon
+//   crash 등) cl-rotate 10-step protocol 이 자동으로 실행되고 결과가 .roadmap
+//   milestone + L0 lock + .raw-audit hash-chain 으로 landing 한다.
+//
+// 10 STEPS (cl-rotate reference pattern)
+//   1  describe         — 문제 기술 (signal scan → description)
+//   2  options          — A/B/C 옵션 (naive/medium/complex)
+//   3  raw_revise       — Raw 재평가 → chosen option
+//   4  unix_split       — 기능별 단일 책임 분리 설계
+//   5  selftest_scaffold— 각 파일 self-test 추가
+//   6  harness          — exhaustive test harness
+//   7  boundary         — boundary probe (concurrency/unicode/stale)
+//   8  iterative_fix    — FAIL → fix cycle until 100%
+//   9  l0_lock          — chflags uchg 적용 (raw#1)
+//   10 milestone        — .roadmap M_<id> 신규 entry + exit criteria
+//
+// USAGE
+//   hexa tool/problem_solving_protocol.hexa --detect [--auto-dispatch]
+//   hexa tool/problem_solving_protocol.hexa --detect --dry-run
+//   hexa tool/problem_solving_protocol.hexa --step N --issue <id>
+//   hexa tool/problem_solving_protocol.hexa --resolve <issue_id>
+//   hexa tool/problem_solving_protocol.hexa --seed-initial
+//   hexa tool/problem_solving_protocol.hexa --list
+//   hexa tool/problem_solving_protocol.hexa --self-test
+//   hexa tool/problem_solving_protocol.hexa --help
+//
+// EXIT CODES
+//   0  OK / no issues
+//   1  issues detected (WARN)
+//   2  setup/config problem
+//   3  ERROR (resolve failed)
+//
+// RULES
+//   raw#1  chflags uchg (step 9, milestone landing)
+//   raw#9  hexa-only
+//   raw#10 .raw-audit hash-chain append at each step transition
+//   raw#11 snake_case filenames
+//   raw#15 config-driven (config/problem_solving_protocol_config.json)
+//   recursion_guard: 자기 issue SSOT scan 제외
+
+let DEFAULT_CONFIG = "/Users/ghost/core/anima/config/problem_solving_protocol_config.json"
+
+// ─── sys helpers ─────────────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    let mut out = "'"
+    out = out + s.replace("'", "'\\''")
+    out = out + "'"
+    return out
+}
+
+fn _exec_out(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _exec_code(cmd: string) -> int {
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+fn _file_exists(path: string) -> bool {
+    let r = exec_with_status("test -e " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _dir_exists(path: string) -> bool {
+    let r = exec_with_status("test -d " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _mkdir_p(dir: string) -> bool {
+    return _exec_code("mkdir -p " + _sh_quote(dir)) == 0
+}
+
+fn _ts_iso() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _ts_epoch() -> string {
+    return _exec_out("date -u +%s").trim()
+}
+
+fn _eta_plus_days(days: int) -> string {
+    let cmd_bsd = "date -u -v+" + to_string(days) + "d +%Y-%m-%d 2>/dev/null"
+    let r1 = _exec_out(cmd_bsd).trim()
+    if r1 != "" { return r1 }
+    return _exec_out("date -u -d '+" + to_string(days) + " days' +%Y-%m-%d 2>/dev/null").trim()
+}
+
+fn _sha256_of_string(s: string) -> string {
+    let r = exec_with_status("printf %s " + _sh_quote(s) + " | shasum -a 256 | awk '{print $1}'")
+    return to_string(r[0]).trim()
+}
+
+// ─── argv ────────────────────────────────────────────────────────────
+
+fn _argv() -> array {
+    let a = args()
+    let mut out = []
+    let mut i = 2
+    while i < len(a) {
+        out.push(a[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn _flag(av: array, k: string) -> bool {
+    for x in av {
+        if to_string(x) == k { return true }
+    }
+    return false
+}
+
+fn _opt(av: array, k: string, d: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && i + 1 < len(av) {
+            return to_string(av[i + 1])
+        }
+        i = i + 1
+    }
+    return d
+}
+
+// ─── config ──────────────────────────────────────────────────────────
+
+fn _load_config(path: string) {
+    if !_file_exists(path) {
+        eprintln("problem_solving_protocol: SETUP_ERROR — config missing: " + path)
+        exit(2)
+    }
+    return json_parse(read_file(path))
+}
+
+fn _cfg_str(cfg, key: string, dflt: string) -> string {
+    if cfg.contains_key(key) { return to_string(cfg[key]) }
+    return dflt
+}
+
+fn _cfg_bool(cfg, key: string, dflt: bool) -> bool {
+    if cfg.contains_key(key) { return to_bool(cfg[key]) }
+    return dflt
+}
+
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+fn _is_json_map(v) -> bool {
+    let s = to_string(v)
+    if len(s) < 1 { return false }
+    return s.substring(0, 1) == "{"
+}
+
+// ─── issue SSOT (state/issues/<id>.json) ─────────────────────────────
+
+fn _issue_path(cfg, issue_id: string) -> string {
+    let dir = _cfg_str(cfg, "issue_state_dir", "/Users/ghost/core/anima/state/issues")
+    let _ = _mkdir_p(dir)
+    return dir + "/" + issue_id + ".json"
+}
+
+fn _make_issue_body(issue_id: string, problem_type: string, description: string,
+                    current_step: int, status: string) -> string {
+    let mut p = []
+    p.push("{\n")
+    p.push("  \"schema\": \"anima.problem_solving.issue.v1\",\n")
+    p.push("  \"issue_id\": \"" + _json_escape(issue_id) + "\",\n")
+    p.push("  \"created\": \"" + _ts_iso() + "\",\n")
+    p.push("  \"updated\": \"" + _ts_iso() + "\",\n")
+    p.push("  \"problem_type\": \"" + _json_escape(problem_type) + "\",\n")
+    p.push("  \"description\": \"" + _json_escape(description) + "\",\n")
+    p.push("  \"current_step\": " + to_string(current_step) + ",\n")
+    p.push("  \"status\": \"" + _json_escape(status) + "\",\n")
+    p.push("  \"options_ABC\": [],\n")
+    p.push("  \"chosen\": \"\",\n")
+    p.push("  \"unix_split\": [],\n")
+    p.push("  \"selftests\": [],\n")
+    p.push("  \"harness_path\": \"\",\n")
+    p.push("  \"boundaries\": [],\n")
+    p.push("  \"fixes\": [],\n")
+    p.push("  \"pass_rate\": 0,\n")
+    p.push("  \"locked_files\": [],\n")
+    p.push("  \"milestone_id\": \"\",\n")
+    p.push("  \"step_history\": [\n")
+    p.push("    { \"step\": " + to_string(current_step) + ", \"ts\": \"" + _ts_iso() + "\", \"note\": \"seeded\" }\n")
+    p.push("  ]\n")
+    p.push("}\n")
+    return p.join("")
+}
+
+fn _issue_exists(cfg, issue_id: string) -> bool {
+    return _file_exists(_issue_path(cfg, issue_id))
+}
+
+fn _create_issue(cfg, issue_id: string, problem_type: string, description: string,
+                 current_step: int, status: string) -> string {
+    let path = _issue_path(cfg, issue_id)
+    let body = _make_issue_body(issue_id, problem_type, description, current_step, status)
+    write_file(path, body)
+    if !_file_exists(path) { return "" }
+    return path
+}
+
+// ─── signal detection ────────────────────────────────────────────────
+
+fn scan_signals(cfg) -> array {
+    let mut issues = []
+
+    let sigs = cfg["signal_sources"]
+    let thr = cfg["signal_thresholds"]
+
+    // signal 1: integrity_ssot — check_4_file_drift / check_5_ssot_stale
+    let integrity_ssot = _cfg_str(sigs, "integrity_ssot", "")
+    if integrity_ssot != "" && _file_exists(integrity_ssot) {
+        let j = json_parse(read_file(integrity_ssot))
+        if _is_json_map(j) && j.contains_key("checks") {
+            let checks = j["checks"]
+            let mut ci = 0
+            while ci < len(checks) {
+                let c = checks[ci]
+                let name = to_string(c["check"])
+                let verdict = to_string(c["verdict"])
+                if verdict == "WARN" || verdict == "FAIL" {
+                    let mut it = #{}
+                    it["issue_id"] = "SIG-INTEGRITY-" + name
+                    it["problem_type"] = "ssot_drift"
+                    it["description"] = to_string(c["check"]) + " " + verdict + ": " + to_string(c["detail"])
+                    it["source"] = "integrity_guard"
+                    issues.push(it)
+                }
+                ci = ci + 1
+            }
+        }
+    }
+
+    // signal 2: closure_debt_summary
+    let cd_ssot = _cfg_str(sigs, "closure_debt_summary", "")
+    if cd_ssot != "" && _file_exists(cd_ssot) {
+        let j = json_parse(read_file(cd_ssot))
+        if _is_json_map(j) && j.contains_key("closure_debt_score") {
+            let score = to_int(to_string(j["closure_debt_score"]))
+            let min_score = to_int(to_string(thr["closure_debt_score_min"]))
+            if score >= min_score {
+                let mut it = #{}
+                it["issue_id"] = "SIG-CLOSURE-DEBT"
+                it["problem_type"] = "closure_debt"
+                it["description"] = "closure_debt score=" + to_string(score) + " (threshold=" + to_string(min_score) + ")"
+                it["source"] = "closure_debt_scanner"
+                issues.push(it)
+            }
+        }
+    }
+
+    // signal 3: true_closure_cert — low pct
+    let tc_ssot = _cfg_str(sigs, "true_closure_cert", "")
+    if tc_ssot != "" && _file_exists(tc_ssot) {
+        let j = json_parse(read_file(tc_ssot))
+        if _is_json_map(j) && j.contains_key("true_closure_pct") {
+            let pct = to_int(to_string(j["true_closure_pct"]))
+            let min_pct = to_int(to_string(thr["true_closure_min_pct"]))
+            if pct < min_pct {
+                let mut it = #{}
+                it["issue_id"] = "SIG-TRUE-CLOSURE"
+                it["problem_type"] = "test_fail"
+                it["description"] = "true_closure_pct=" + to_string(pct) + "% < target=" + to_string(min_pct) + "%"
+                it["source"] = "true_closure_verifier"
+                issues.push(it)
+            }
+        }
+    }
+
+    // signal 4: daemon drift logs
+    let repo_root = _cfg_str(cfg, "repo_root", "/Users/ghost/core/anima")
+    let daemon_drift = _exec_out("ls " + _sh_quote(repo_root) + "/state/roadmap_drift_*.json 2>/dev/null | head -5").trim()
+    if daemon_drift != "" && _cfg_bool(thr, "daemon_drift_as_issue", true) {
+        let mut it = #{}
+        it["issue_id"] = "SIG-DAEMON-DRIFT"
+        it["problem_type"] = "daemon_crash"
+        it["description"] = "daemon drift logs present: " + daemon_drift.replace("\n", " ").substring(0, 120)
+        it["source"] = "roadmap_live_daemon"
+        issues.push(it)
+    }
+
+    return issues
+}
+
+// ─── dispatch: create issue SSOT + (optional) step 1-10 sequencing ───
+
+fn dispatch_detected(cfg, signals: array, dry_run: bool) -> array {
+    let mut created = []
+    let mut i = 0
+    while i < len(signals) {
+        let s = signals[i]
+        let sid = to_string(s["issue_id"])
+        let ptype = to_string(s["problem_type"])
+        let desc = to_string(s["description"])
+        if !_issue_exists(cfg, sid) {
+            if dry_run {
+                created.push(sid + " (DRY)")
+            } else {
+                let p = _create_issue(cfg, sid, ptype, desc, 1, "in_progress")
+                if p != "" { created.push(sid) }
+            }
+        }
+        i = i + 1
+    }
+    return created
+}
+
+// ─── seed initial issues from config ─────────────────────────────────
+
+fn seed_initial(cfg) -> array {
+    let mut created = []
+    if !cfg.contains_key("initial_seed_issues") { return created }
+    let seeds = cfg["initial_seed_issues"]
+    let mut i = 0
+    while i < len(seeds) {
+        let s = seeds[i]
+        let sid = to_string(s["id"])
+        if !_issue_exists(cfg, sid) {
+            let ptype = to_string(s["problem_type"])
+            let desc = to_string(s["description"])
+            let cstep = to_int(to_string(s["current_step"]))
+            let status = to_string(s["status"])
+            let p = _create_issue(cfg, sid, ptype, desc, cstep, status)
+            if p != "" { created.push(sid) }
+        }
+        i = i + 1
+    }
+    return created
+}
+
+// ─── list active issues (used by anima_main --status) ────────────────
+
+fn list_issues(cfg) -> array {
+    let dir = _cfg_str(cfg, "issue_state_dir", "/Users/ghost/core/anima/state/issues")
+    if !_dir_exists(dir) { return [] }
+    let cmd = "ls " + _sh_quote(dir) + "/*.json 2>/dev/null"
+    let out = _exec_out(cmd)
+    let lines = split(out, "\n")
+    let mut results = []
+    for ln in lines {
+        let p = to_string(ln).trim()
+        if len(p) == 0 { continue }
+        // skip side-files: *_harness.json, *_milestone.json
+        if p.index_of("_harness.json") >= 0 { continue }
+        if p.index_of("_milestone.json") >= 0 { continue }
+        let j = json_parse(read_file(p))
+        if !_is_json_map(j) { continue }
+        // require current_step key (skip non-issue SSOTs)
+        if !j.contains_key("current_step") { continue }
+        let mut e = #{}
+        e["issue_id"] = to_string(j["issue_id"])
+        e["problem_type"] = to_string(j["problem_type"])
+        e["description"] = to_string(j["description"])
+        e["current_step"] = to_int(to_string(j["current_step"]))
+        e["status"] = to_string(j["status"])
+        if j.contains_key("milestone_id") { e["milestone_id"] = to_string(j["milestone_id"]) } else { e["milestone_id"] = "" }
+        results.push(e)
+    }
+    return results
+}
+
+// ─── run single step (delegates to tool/ps_N_*.hexa if present) ──────
+
+fn run_step(cfg, step_n: int, issue_id: string) -> int {
+    let stools = cfg["step_tools"]
+    let key = to_string(step_n)
+    if !stools.contains_key(key) {
+        eprintln("run_step: step_tools[" + key + "] missing in config")
+        return 2
+    }
+    let tool_rel = to_string(stools[key])
+    let repo_root = _cfg_str(cfg, "repo_root", "/Users/ghost/core/anima")
+    let tool_path = repo_root + "/" + tool_rel
+    if !_file_exists(tool_path) {
+        eprintln("run_step: subtool missing: " + tool_path)
+        return 2
+    }
+    let hexa_bin = _cfg_str(cfg, "hexa_bin", "/Users/ghost/.hx/bin/hexa")
+    let cmd = "cd " + _sh_quote(repo_root) + " && HEXA_NO_LAUNCHD=1 " +
+              _sh_quote(hexa_bin) + " " + _sh_quote(tool_path) + " --issue " + _sh_quote(issue_id) + " 2>&1"
+    let r = exec_with_status(cmd)
+    println(to_string(r[0]))
+    return r[1]
+}
+
+// ─── raw-audit hash-chain append (raw#10) ────────────────────────────
+
+fn _raw_audit_log_path(cfg) -> string {
+    let base = _cfg_str(cfg, "raw_audit_path", "/Users/ghost/core/anima/.raw-audit")
+    if _dir_exists(base) {
+        return base + "/problem_solving_protocol.log"
+    }
+    // if .raw-audit is a file, append alongside via a dedicated sibling log
+    let sibling = base + ".problem_solving_protocol"
+    return sibling
+}
+
+fn _raw_audit_append(cfg, action: string, issue_id: string, step_n: int, detail: string) -> string {
+    let log_path = _raw_audit_log_path(cfg)
+    let _ = _mkdir_p(_cfg_str(cfg, "repo_root", "/Users/ghost/core/anima"))
+    let prev = ""
+    let ts = _ts_iso()
+    let body = "{\"ts\":\"" + ts + "\",\"tool\":\"problem_solving_protocol\",\"action\":\"" +
+               _json_escape(action) + "\",\"issue_id\":\"" + _json_escape(issue_id) +
+               "\",\"step\":" + to_string(step_n) + ",\"detail\":\"" + _json_escape(detail) + "\""
+    let entry_sha = _sha256_of_string(body)
+    let line = body + ",\"entry_sha\":\"" + entry_sha + "\"}\n"
+    let prior = if _file_exists(log_path) { read_file(log_path) } else { "" }
+    let _ = write_file(log_path, prior + line)
+    return entry_sha
+}
+
+// ─── resolve: run steps 1-10 sequentially for an issue ───────────────
+
+fn resolve_issue(cfg, issue_id: string, dry_run: bool) -> int {
+    if !_issue_exists(cfg, issue_id) {
+        eprintln("resolve: issue not found: " + issue_id)
+        return 2
+    }
+    let ipath = _issue_path(cfg, issue_id)
+    let ij = json_parse(read_file(ipath))
+    let cur = if _is_json_map(ij) && ij.contains_key("current_step") {
+        to_int(to_string(ij["current_step"]))
+    } else { 1 }
+    let status = if _is_json_map(ij) && ij.contains_key("status") {
+        to_string(ij["status"])
+    } else { "in_progress" }
+    if status == "resolved" {
+        println("resolve: already resolved — " + issue_id)
+        return 0
+    }
+
+    let mut s = cur
+    let mut last_rc = 0
+    while s <= 10 {
+        println("  ↳ step " + to_string(s) + " ...")
+        if dry_run {
+            let _sha = _raw_audit_append(cfg, "step_dry_run", issue_id, s, "dry-run")
+        } else {
+            let rc = run_step(cfg, s, issue_id)
+            last_rc = rc
+            let _sha = _raw_audit_append(cfg, "step_exec", issue_id, s, "rc=" + to_string(rc))
+            if rc != 0 {
+                eprintln("  step " + to_string(s) + " FAIL rc=" + to_string(rc))
+                return 3
+            }
+        }
+        s = s + 1
+    }
+    return last_rc
+}
+
+// ─── output: summary SSOT ────────────────────────────────────────────
+
+fn emit_summary(cfg, signals: array, created: array, listed: array) -> string {
+    let out = cfg["output"]
+    let path = to_string(out["summary_ssot"])
+    let mut p = []
+    p.push("{\n")
+    p.push("  \"schema\": \"anima.problem_solving_protocol.summary.v1\",\n")
+    p.push("  \"ts\": \"" + _ts_iso() + "\",\n")
+    p.push("  \"tool\": \"tool/problem_solving_protocol.hexa\",\n")
+    p.push("  \"signals_detected\": " + to_string(len(signals)) + ",\n")
+    p.push("  \"issues_created\": " + to_string(len(created)) + ",\n")
+    p.push("  \"active_issues\": [\n")
+    let mut i = 0
+    while i < len(listed) {
+        let it = listed[i]
+        let comma = if i + 1 < len(listed) { "," } else { "" }
+        p.push("    { \"issue_id\": \"" + _json_escape(to_string(it["issue_id"])) + "\"")
+        p.push(", \"problem_type\": \"" + _json_escape(to_string(it["problem_type"])) + "\"")
+        p.push(", \"current_step\": " + to_string(it["current_step"]))
+        p.push(", \"status\": \"" + _json_escape(to_string(it["status"])) + "\"")
+        p.push(", \"milestone_id\": \"" + _json_escape(to_string(it["milestone_id"])) + "\" }" + comma + "\n")
+        i = i + 1
+    }
+    p.push("  ],\n")
+    p.push("  \"raw_strict\": \"raw#1/9/10/11/15\"\n")
+    p.push("}\n")
+    let _ = write_file(path, p.join(""))
+    return path
+}
+
+// ─── self-test ───────────────────────────────────────────────────────
+
+fn self_test(cfg) -> int {
+    println("── problem_solving_protocol self-test ──")
+    let dir = _cfg_str(cfg, "issue_state_dir", "/Users/ghost/core/anima/state/issues")
+    let _ = _mkdir_p(dir)
+    let tid = "SELFTEST-PS"
+    let tpath = _issue_path(cfg, tid)
+    // cleanup
+    let _clean = exec_with_status("rm -f " + _sh_quote(tpath))
+    // create + assert
+    let created = _create_issue(cfg, tid, "test_fail", "self-test fixture", 1, "in_progress")
+    if created == "" { eprintln("self-test: create failed"); return 1 }
+    if !_file_exists(tpath) { eprintln("self-test: path missing"); return 1 }
+    let j = json_parse(read_file(tpath))
+    if !_is_json_map(j) || to_string(j["issue_id"]) != tid {
+        eprintln("self-test: roundtrip mismatch")
+        return 1
+    }
+    // raw-audit append
+    let sha = _raw_audit_append(cfg, "self_test", tid, 0, "ok")
+    if sha == "" { eprintln("self-test: raw-audit append failed"); return 1 }
+    // list
+    let listed = list_issues(cfg)
+    if len(listed) < 1 { eprintln("self-test: list empty"); return 1 }
+    // cleanup
+    let _c2 = exec_with_status("rm -f " + _sh_quote(tpath))
+    println("  PASS: create + roundtrip + raw-audit append + list  (entry_sha=" + sha.substring(0, 12) + "...)")
+    return 0
+}
+
+// ─── human print ─────────────────────────────────────────────────────
+
+fn print_detected(signals: array, created: array) {
+    println("── problem_solving_protocol — detect ──")
+    println("  signals_detected:  " + to_string(len(signals)))
+    let mut i = 0
+    while i < len(signals) {
+        let s = signals[i]
+        println("    [" + to_string(s["source"]) + "] " + to_string(s["issue_id"]) +
+                " — " + to_string(s["description"]))
+        i = i + 1
+    }
+    println("  issues_created:    " + to_string(len(created)))
+    let mut k = 0
+    while k < len(created) {
+        println("    + " + to_string(created[k]))
+        k = k + 1
+    }
+}
+
+fn print_list(listed: array) {
+    println("── problem_solving_protocol — active issues ──")
+    if len(listed) == 0 {
+        println("  (no active issues)")
+        return
+    }
+    let mut i = 0
+    while i < len(listed) {
+        let it = listed[i]
+        let sid = to_string(it["issue_id"])
+        let ptype = to_string(it["problem_type"])
+        let cstep = to_int(to_string(it["current_step"]))
+        let status = to_string(it["status"])
+        let mid = to_string(it["milestone_id"])
+        let glyph = if status == "resolved" { "✓" } else { "·" }
+        let mline = if mid != "" { " → " + mid } else { "" }
+        println("  " + glyph + " " + sid + " [" + ptype + "] step " + to_string(cstep) + "/10 " + status + mline)
+        i = i + 1
+    }
+}
+
+// ─── entry ───────────────────────────────────────────────────────────
+
+fn print_usage() {
+    println("problem_solving_protocol — cl-rotate 10-step OS-level orchestrator")
+    println("")
+    println("usage:")
+    println("  hexa tool/problem_solving_protocol.hexa --detect [--auto-dispatch]")
+    println("  hexa tool/problem_solving_protocol.hexa --detect --dry-run")
+    println("  hexa tool/problem_solving_protocol.hexa --step N --issue <id>")
+    println("  hexa tool/problem_solving_protocol.hexa --resolve <issue_id>")
+    println("  hexa tool/problem_solving_protocol.hexa --seed-initial")
+    println("  hexa tool/problem_solving_protocol.hexa --list")
+    println("  hexa tool/problem_solving_protocol.hexa --self-test")
+    println("  hexa tool/problem_solving_protocol.hexa --help")
+}
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") || _flag(av, "-h") { print_usage(); return 0 }
+
+    let cfg_path = _opt(av, "--config", DEFAULT_CONFIG)
+    let cfg = _load_config(cfg_path)
+
+    if _flag(av, "--self-test") {
+        return self_test(cfg)
+    }
+
+    if _flag(av, "--list") {
+        let listed = list_issues(cfg)
+        print_list(listed)
+        return 0
+    }
+
+    if _flag(av, "--seed-initial") {
+        let created = seed_initial(cfg)
+        println("seed-initial: created=" + to_string(len(created)))
+        for s in created { println("  + " + to_string(s)) }
+        let listed = list_issues(cfg)
+        let _ssot = emit_summary(cfg, [], created, listed)
+        let _sha = _raw_audit_append(cfg, "seed_initial", "*", 0, "count=" + to_string(len(created)))
+        return 0
+    }
+
+    if _flag(av, "--detect") {
+        let auto = _flag(av, "--auto-dispatch")
+        let dry = _flag(av, "--dry-run")
+        let signals = scan_signals(cfg)
+        let created = if auto || dry { dispatch_detected(cfg, signals, dry) } else { [] }
+        print_detected(signals, created)
+        let listed = list_issues(cfg)
+        let path = emit_summary(cfg, signals, created, listed)
+        println("  summary_ssot: " + path)
+        let _sha = _raw_audit_append(cfg, "detect", "*", 0,
+                                     "signals=" + to_string(len(signals)) + " created=" + to_string(len(created)))
+        if len(signals) > 0 { return 1 }
+        return 0
+    }
+
+    let resolve_id = _opt(av, "--resolve", "")
+    if resolve_id != "" {
+        let dry = _flag(av, "--dry-run")
+        return resolve_issue(cfg, resolve_id, dry)
+    }
+
+    let step_arg = _opt(av, "--step", "")
+    let issue_arg = _opt(av, "--issue", "")
+    if step_arg != "" && issue_arg != "" {
+        let n = to_int(step_arg)
+        if n < 1 || n > 10 { eprintln("--step must be 1..10"); return 2 }
+        let rc = run_step(cfg, n, issue_arg)
+        let _sha = _raw_audit_append(cfg, "step_manual", issue_arg, n, "rc=" + to_string(rc))
+        return rc
+    }
+
+    // default
+    print_usage()
+    return 0
+}

@@ -1,0 +1,197 @@
+// tool/ps_2_options.hexa — cl-rotate Step 2: A/B/C 옵션 생성
+//
+// PURPOSE
+//   각 issue 에 대해 3 가지 해결 옵션을 생성:
+//     A = naive   (patch / point-fix)
+//     B = medium  (refactor within single module)
+//     C = complex (Unix-split + new tooling)
+//   options_ABC field 에 배열로 저장.
+//
+// USAGE
+//   hexa tool/ps_2_options.hexa --issue <id>
+//   hexa tool/ps_2_options.hexa self-test
+//
+// CONTRACT reads+writes state/issues/<id>.json, step→3
+
+let DEFAULT_CONFIG = "/Users/ghost/core/anima/config/problem_solving_protocol_config.json"
+
+fn _sh_quote(s: string) -> string {
+    let mut out = "'"
+    out = out + s.replace("'", "'\\''")
+    out = out + "'"
+    return out
+}
+
+fn _file_exists(path: string) -> bool {
+    return exec_with_status("test -e " + _sh_quote(path))[1] == 0
+}
+
+fn _ts_iso() -> string {
+    return to_string(exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")[0]).trim()
+}
+
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+fn _load_config(path: string) {
+    if !_file_exists(path) { eprintln("ps_2_options: config missing: " + path); exit(2) }
+    return json_parse(read_file(path))
+}
+
+fn _cfg_str(cfg, key: string, dflt: string) -> string {
+    if cfg.contains_key(key) { return to_string(cfg[key]) }
+    return dflt
+}
+
+fn _argv() -> array {
+    let a = args(); let mut o = []; let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+
+fn _flag(av: array, k: string) -> bool { for x in av { if to_string(x) == k { return true } }; return false }
+
+fn _opt(av: array, k: string, d: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && i + 1 < len(av) { return to_string(av[i + 1]) }
+        i = i + 1
+    }
+    return d
+}
+
+fn _issue_path(cfg, issue_id: string) -> string {
+    return _cfg_str(cfg, "issue_state_dir", "/Users/ghost/core/anima/state/issues") + "/" + issue_id + ".json"
+}
+
+// Replace JSON array field with new inline array (naive single-line replacement).
+fn _replace_array_inline(body: string, key: string, inline: string) -> string {
+    let needle = "\"" + key + "\": ["
+    let i = body.index_of(needle)
+    if i < 0 { return body }
+    let j = i + len(needle)
+    let rest = body.substring(j, len(body))
+    let e = rest.index_of("]")
+    if e < 0 { return body }
+    let before = body.substring(0, j)
+    let after = rest.substring(e, len(rest))
+    return before + inline + after
+}
+
+fn _replace_field_int(body: string, key: string, new_val: int) -> string {
+    let needle = "\"" + key + "\": "
+    let i = body.index_of(needle)
+    if i < 0 { return body }
+    let j = i + len(needle)
+    let rest = body.substring(j, len(body))
+    let mut k = 0
+    while k < len(rest) {
+        let ch = rest.substring(k, k + 1)
+        if ch == "," || ch == "\n" || ch == "}" { break }
+        k = k + 1
+    }
+    return body.substring(0, j) + to_string(new_val) + rest.substring(k, len(rest))
+}
+
+fn _replace_field_str(body: string, key: string, new_val: string) -> string {
+    let needle = "\"" + key + "\": \""
+    let i = body.index_of(needle)
+    if i < 0 { return body }
+    let j = i + len(needle)
+    let rest = body.substring(j, len(body))
+    let e = rest.index_of("\"")
+    if e < 0 { return body }
+    return body.substring(0, j) + _json_escape(new_val) + rest.substring(e, len(rest))
+}
+
+fn _pick_options(ptype: string) -> array {
+    // Return array of 3 option strings (A/B/C) tailored by problem_type
+    if ptype == "ssot_drift" {
+        return ["A=patch_paths_json_manual",
+                "B=ssot_cross_check_rerun + auto_reflect_dry_run",
+                "C=ssot_sync_tool_unix_split (auditor+linter+fixer separate binaries)"]
+    }
+    if ptype == "closure_debt" {
+        return ["A=edit_docs_inline",
+                "B=closure_debt_scanner --auto-dispatch + review",
+                "C=protocol_spawn_milestone (track each TBD as its own issue)"]
+    }
+    if ptype == "concurrency" {
+        return ["A=sequential_serialize",
+                "B=mutex_wrap_critical_section",
+                "C=lock_free_sharding + per_partition_state"]
+    }
+    if ptype == "daemon_crash" {
+        return ["A=restart_launchd_once",
+                "B=add_retry_with_backoff_to_tick",
+                "C=split_daemon_into_workers + per_task_recovery"]
+    }
+    if ptype == "config_missing" {
+        return ["A=copy_default_template",
+                "B=add_config_validator + fallback_defaults",
+                "C=schema_v2_migration + registry_entry"]
+    }
+    // test_fail / default
+    return ["A=skip_or_xfail_local_patch",
+            "B=unit_test_fix + upstream_repair",
+            "C=harness_expansion + boundary_probe_batch"]
+}
+
+fn options(cfg, issue_id: string) -> int {
+    let path = _issue_path(cfg, issue_id)
+    if !_file_exists(path) { eprintln("ps_2_options: missing: " + issue_id); return 2 }
+    let body = read_file(path)
+    // find problem_type
+    let key = "\"problem_type\": \""
+    let i0 = body.index_of(key)
+    let mut ptype = "test_fail"
+    if i0 >= 0 {
+        let j0 = i0 + len(key)
+        let rest = body.substring(j0, len(body))
+        let e0 = rest.index_of("\"")
+        if e0 >= 0 { ptype = rest.substring(0, e0) }
+    }
+    let opts = _pick_options(ptype)
+    let mut inline = ""
+    let mut i = 0
+    while i < len(opts) {
+        let comma = if i + 1 < len(opts) { ", " } else { "" }
+        inline = inline + "\"" + _json_escape(to_string(opts[i])) + "\"" + comma
+        i = i + 1
+    }
+    let mut b2 = _replace_array_inline(body, "options_ABC", inline)
+    b2 = _replace_field_str(b2, "updated", _ts_iso())
+    b2 = _replace_field_int(b2, "current_step", 3)
+    write_file(path, b2)
+    println("ps_2_options: issue=" + issue_id + " → 3 options (" + ptype + "), step=3")
+    return 0
+}
+
+fn self_test(cfg) -> int {
+    println("── ps_2_options self-test ──")
+    let tid = "SELFTEST-PS2"
+    let path = _issue_path(cfg, tid)
+    let _rm = exec_with_status("rm -f " + _sh_quote(path))
+    let body = "{\n  \"issue_id\": \"" + tid + "\",\n  \"problem_type\": \"ssot_drift\",\n" +
+               "  \"current_step\": 2,\n  \"updated\": \"x\",\n  \"options_ABC\": [],\n  \"status\": \"in_progress\"\n}\n"
+    write_file(path, body)
+    let rc = options(cfg, tid)
+    if rc != 0 { eprintln("  FAIL rc=" + to_string(rc)); return 1 }
+    let b2 = read_file(path)
+    if b2.index_of("\"A=") < 0 { eprintln("  FAIL option A missing"); return 1 }
+    if b2.index_of("\"current_step\": 3") < 0 { eprintln("  FAIL step != 3"); return 1 }
+    let _c = exec_with_status("rm -f " + _sh_quote(path))
+    println("  PASS: 3 options (A/B/C) populated, current_step=3")
+    return 0
+}
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") { println("usage: hexa tool/ps_2_options.hexa --issue <id> | self-test"); return 0 }
+    let cfg = _load_config(_opt(av, "--config", DEFAULT_CONFIG))
+    if _flag(av, "self-test") || _flag(av, "--self-test") { return self_test(cfg) }
+    let id = _opt(av, "--issue", "")
+    if id == "" { eprintln("--issue required"); return 2 }
+    return options(cfg, id)
+}

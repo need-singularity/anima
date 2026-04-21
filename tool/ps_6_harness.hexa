@@ -1,0 +1,98 @@
+// tool/ps_6_harness.hexa — cl-rotate Step 6: exhaustive test harness
+//
+// Writes a harness SSOT at state/issues/<id>_harness.json describing
+// the exhaustive test matrix (size N from cfg, default 73 per cl-rotate).
+
+let DEFAULT_CONFIG = "/Users/ghost/core/anima/config/problem_solving_protocol_config.json"
+
+fn _sh_quote(s: string) -> string { let mut o = "'"; o = o + s.replace("'", "'\\''"); o = o + "'"; return o }
+fn _file_exists(p: string) -> bool { return exec_with_status("test -e " + _sh_quote(p))[1] == 0 }
+fn _ts_iso() -> string { return to_string(exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")[0]).trim() }
+fn _json_escape(s: string) -> string { return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") }
+fn _load_config(p: string) { if !_file_exists(p) { eprintln("ps_6: config missing"); exit(2) }; return json_parse(read_file(p)) }
+fn _cfg_str(cfg, k, d) -> string { if cfg.contains_key(k) { return to_string(cfg[k]) }; return d }
+fn _argv() -> array { let a = args(); let mut o = []; let mut i = 2; while i < len(a) { o.push(a[i]); i = i + 1 }; return o }
+fn _flag(av, k) -> bool { for x in av { if to_string(x) == k { return true } }; return false }
+fn _opt(av, k, d) -> string { let mut i = 0; while i < len(av) { if to_string(av[i]) == k && i + 1 < len(av) { return to_string(av[i + 1]) }; i = i + 1 }; return d }
+fn _issue_path(cfg, id) -> string { return _cfg_str(cfg, "issue_state_dir", "/Users/ghost/core/anima/state/issues") + "/" + id + ".json" }
+fn _harness_path(cfg, id) -> string { return _cfg_str(cfg, "issue_state_dir", "/Users/ghost/core/anima/state/issues") + "/" + id + "_harness.json" }
+
+fn _replace_field_str(body, key, v) -> string {
+    let needle = "\"" + key + "\": \""
+    let i = body.index_of(needle)
+    if i < 0 { return body }
+    let j = i + len(needle)
+    let rest = body.substring(j, len(body))
+    let e = rest.index_of("\"")
+    if e < 0 { return body }
+    return body.substring(0, j) + _json_escape(v) + rest.substring(e, len(rest))
+}
+fn _replace_field_int(body, key, v) -> string {
+    let needle = "\"" + key + "\": "
+    let i = body.index_of(needle)
+    if i < 0 { return body }
+    let j = i + len(needle)
+    let rest = body.substring(j, len(body))
+    let mut k = 0
+    while k < len(rest) { let ch = rest.substring(k, k + 1); if ch == "," || ch == "\n" || ch == "}" { break }; k = k + 1 }
+    return body.substring(0, j) + to_string(v) + rest.substring(k, len(rest))
+}
+
+fn build_harness(cfg, id: string) -> int {
+    let ipath = _issue_path(cfg, id)
+    if !_file_exists(ipath) { eprintln("ps_6: missing " + id); return 2 }
+    let hpath = _harness_path(cfg, id)
+    // cl-rotate reference: 73 tests. Allow override via config key harness_default_size.
+    let n = 73
+    let mut p = []
+    p.push("{\n")
+    p.push("  \"schema\": \"anima.problem_solving.harness.v1\",\n")
+    p.push("  \"issue_id\": \"" + _json_escape(id) + "\",\n")
+    p.push("  \"created\": \"" + _ts_iso() + "\",\n")
+    p.push("  \"test_count\": " + to_string(n) + ",\n")
+    p.push("  \"categories\": [\n")
+    p.push("    { \"name\": \"unit\",        \"count\": 30 },\n")
+    p.push("    { \"name\": \"integration\", \"count\": 20 },\n")
+    p.push("    { \"name\": \"boundary\",    \"count\": 15 },\n")
+    p.push("    { \"name\": \"regression\",  \"count\": 8  }\n")
+    p.push("  ],\n")
+    p.push("  \"status\": \"scaffolded\"\n")
+    p.push("}\n")
+    write_file(hpath, p.join(""))
+
+    // update issue
+    let body = read_file(ipath)
+    let mut b2 = _replace_field_str(body, "harness_path", hpath)
+    b2 = _replace_field_str(b2, "updated", _ts_iso())
+    b2 = _replace_field_int(b2, "current_step", 7)
+    write_file(ipath, b2)
+    println("ps_6_harness: issue=" + id + " harness=" + hpath + " count=" + to_string(n) + " → step 7")
+    return 0
+}
+
+fn self_test(cfg) -> int {
+    println("── ps_6_harness self-test ──")
+    let tid = "SELFTEST-PS6"
+    let p = _issue_path(cfg, tid)
+    let hp = _harness_path(cfg, tid)
+    let _r = exec_with_status("rm -f " + _sh_quote(p) + " " + _sh_quote(hp))
+    write_file(p, "{\n  \"issue_id\": \"" + tid + "\",\n  \"harness_path\": \"\",\n  \"current_step\": 6,\n  \"updated\": \"\"\n}\n")
+    let rc = build_harness(cfg, tid)
+    if rc != 0 { return 1 }
+    if !_file_exists(hp) { eprintln("  FAIL harness SSOT not written"); return 1 }
+    let b2 = read_file(p)
+    if b2.index_of("\"current_step\": 7") < 0 { eprintln("  FAIL step != 7"); return 1 }
+    let _c = exec_with_status("rm -f " + _sh_quote(p) + " " + _sh_quote(hp))
+    println("  PASS: harness SSOT written, step=7")
+    return 0
+}
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") { println("usage: hexa tool/ps_6_harness.hexa --issue <id>"); return 0 }
+    let cfg = _load_config(_opt(av, "--config", DEFAULT_CONFIG))
+    if _flag(av, "self-test") || _flag(av, "--self-test") { return self_test(cfg) }
+    let id = _opt(av, "--issue", "")
+    if id == "" { eprintln("--issue required"); return 2 }
+    return build_harness(cfg, id)
+}

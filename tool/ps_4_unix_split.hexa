@@ -1,0 +1,136 @@
+// tool/ps_4_unix_split.hexa — cl-rotate Step 4: 기능별 단일 책임 분리
+//
+// Populates issue.unix_split = ["filename_role1", "filename_role2", ...]
+// based on chosen option (A/B/C) and problem_type.
+
+let DEFAULT_CONFIG = "/Users/ghost/core/anima/config/problem_solving_protocol_config.json"
+
+fn _sh_quote(s: string) -> string { let mut o = "'"; o = o + s.replace("'", "'\\''"); o = o + "'"; return o }
+fn _file_exists(p: string) -> bool { return exec_with_status("test -e " + _sh_quote(p))[1] == 0 }
+fn _ts_iso() -> string { return to_string(exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")[0]).trim() }
+fn _json_escape(s: string) -> string { return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") }
+fn _load_config(p: string) { if !_file_exists(p) { eprintln("ps_4: config missing"); exit(2) }; return json_parse(read_file(p)) }
+fn _cfg_str(cfg, k: string, d: string) -> string { if cfg.contains_key(k) { return to_string(cfg[k]) }; return d }
+fn _argv() -> array { let a = args(); let mut o = []; let mut i = 2; while i < len(a) { o.push(a[i]); i = i + 1 }; return o }
+fn _flag(av, k) -> bool { for x in av { if to_string(x) == k { return true } }; return false }
+fn _opt(av, k, d) -> string {
+    let mut i = 0
+    while i < len(av) { if to_string(av[i]) == k && i + 1 < len(av) { return to_string(av[i + 1]) }; i = i + 1 }
+    return d
+}
+fn _issue_path(cfg, id: string) -> string { return _cfg_str(cfg, "issue_state_dir", "/Users/ghost/core/anima/state/issues") + "/" + id + ".json" }
+
+fn _replace_array_inline(body, key: string, inline: string) -> string {
+    let needle = "\"" + key + "\": ["
+    let i = body.index_of(needle)
+    if i < 0 { return body }
+    let j = i + len(needle)
+    let rest = body.substring(j, len(body))
+    let e = rest.index_of("]")
+    if e < 0 { return body }
+    return body.substring(0, j) + inline + rest.substring(e, len(rest))
+}
+
+fn _replace_field_int(body, key, v) -> string {
+    let needle = "\"" + key + "\": "
+    let i = body.index_of(needle)
+    if i < 0 { return body }
+    let j = i + len(needle)
+    let rest = body.substring(j, len(body))
+    let mut k = 0
+    while k < len(rest) {
+        let ch = rest.substring(k, k + 1)
+        if ch == "," || ch == "\n" || ch == "}" { break }
+        k = k + 1
+    }
+    return body.substring(0, j) + to_string(v) + rest.substring(k, len(rest))
+}
+
+fn _replace_field_str(body, key, v) -> string {
+    let needle = "\"" + key + "\": \""
+    let i = body.index_of(needle)
+    if i < 0 { return body }
+    let j = i + len(needle)
+    let rest = body.substring(j, len(body))
+    let e = rest.index_of("\"")
+    if e < 0 { return body }
+    return body.substring(0, j) + _json_escape(v) + rest.substring(e, len(rest))
+}
+
+fn _extract_field(body, key) -> string {
+    let needle = "\"" + key + "\": \""
+    let i = body.index_of(needle)
+    if i < 0 { return "" }
+    let j = i + len(needle)
+    let rest = body.substring(j, len(body))
+    let e = rest.index_of("\"")
+    if e < 0 { return "" }
+    return rest.substring(0, e)
+}
+
+fn _split(chosen: string, ptype: string) -> array {
+    if chosen == "A" { return ["single_patch.hexa"] }
+    if chosen == "B" { return [ptype + "_auditor.hexa", ptype + "_fixer.hexa"] }
+    // C
+    if ptype == "ssot_drift" {
+        return ["ssot_path_auditor.hexa", "ssot_path_linter.hexa",
+                "ssot_path_fixer.hexa", "ssot_path_reporter.hexa"]
+    }
+    if ptype == "concurrency" {
+        return ["concurrency_detector.hexa", "concurrency_serializer.hexa",
+                "concurrency_retry.hexa", "concurrency_monitor.hexa"]
+    }
+    if ptype == "closure_debt" {
+        return ["closure_debt_scanner.hexa", "closure_debt_dispatcher.hexa",
+                "closure_debt_milestone_writer.hexa"]
+    }
+    return [ptype + "_detector.hexa", ptype + "_analyzer.hexa", ptype + "_fixer.hexa"]
+}
+
+fn split_step(cfg, id: string) -> int {
+    let path = _issue_path(cfg, id)
+    if !_file_exists(path) { eprintln("ps_4: missing " + id); return 2 }
+    let body = read_file(path)
+    let chosen = _extract_field(body, "chosen")
+    let ptype = _extract_field(body, "problem_type")
+    let files = _split(chosen, ptype)
+    let mut inline = ""
+    let mut i = 0
+    while i < len(files) {
+        let c = if i + 1 < len(files) { ", " } else { "" }
+        inline = inline + "\"" + _json_escape(to_string(files[i])) + "\"" + c
+        i = i + 1
+    }
+    let mut b2 = _replace_array_inline(body, "unix_split", inline)
+    b2 = _replace_field_str(b2, "updated", _ts_iso())
+    b2 = _replace_field_int(b2, "current_step", 5)
+    write_file(path, b2)
+    println("ps_4_unix_split: issue=" + id + " chosen=" + chosen + " files=" + to_string(len(files)) + " → step 5")
+    return 0
+}
+
+fn self_test(cfg) -> int {
+    println("── ps_4_unix_split self-test ──")
+    let tid = "SELFTEST-PS4"
+    let p = _issue_path(cfg, tid)
+    let _r = exec_with_status("rm -f " + _sh_quote(p))
+    write_file(p, "{\n  \"issue_id\": \"" + tid + "\",\n  \"problem_type\": \"ssot_drift\",\n  \"chosen\": \"C\",\n  \"unix_split\": [],\n  \"current_step\": 4,\n  \"updated\": \"\"\n}\n")
+    let rc = split_step(cfg, tid)
+    if rc != 0 { return 1 }
+    let b2 = read_file(p)
+    if b2.index_of("ssot_path_auditor") < 0 { eprintln("  FAIL unix_split not populated"); return 1 }
+    if b2.index_of("\"current_step\": 5") < 0 { eprintln("  FAIL step != 5"); return 1 }
+    let _c = exec_with_status("rm -f " + _sh_quote(p))
+    println("  PASS: 4 files split (ssot_drift,C)")
+    return 0
+}
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") { println("usage: hexa tool/ps_4_unix_split.hexa --issue <id>"); return 0 }
+    let cfg = _load_config(_opt(av, "--config", DEFAULT_CONFIG))
+    if _flag(av, "self-test") || _flag(av, "--self-test") { return self_test(cfg) }
+    let id = _opt(av, "--issue", "")
+    if id == "" { eprintln("--issue required"); return 2 }
+    return split_step(cfg, id)
+}

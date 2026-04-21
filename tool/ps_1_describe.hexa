@@ -1,0 +1,187 @@
+// tool/ps_1_describe.hexa — cl-rotate Step 1: 문제 기술
+//
+// PURPOSE
+//   issue SSOT 의 description 을 signal source 로부터 refine 한다
+//   (integrity_guard / closure_debt / true_closure 등 실 데이터 반영).
+//
+// USAGE
+//   hexa tool/ps_1_describe.hexa --issue <id>
+//   hexa tool/ps_1_describe.hexa --issue <id> self-test
+//   hexa tool/ps_1_describe.hexa self-test
+//
+// CONTRACT
+//   - reads  state/issues/<id>.json
+//   - writes state/issues/<id>.json  (description refined, step_history+=1, current_step→2)
+//
+// RULES raw#9/11/15 (config JSON) — raw#10 audit via orchestrator
+
+let DEFAULT_CONFIG = "/Users/ghost/core/anima/config/problem_solving_protocol_config.json"
+
+fn _sh_quote(s: string) -> string {
+    let mut out = "'"
+    out = out + s.replace("'", "'\\''")
+    out = out + "'"
+    return out
+}
+
+fn _file_exists(path: string) -> bool {
+    let r = exec_with_status("test -e " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _ts_iso() -> string {
+    let r = exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")
+    return to_string(r[0]).trim()
+}
+
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+fn _is_json_map(v) -> bool {
+    let s = to_string(v)
+    if len(s) < 1 { return false }
+    return s.substring(0, 1) == "{"
+}
+
+fn _load_config(path: string) {
+    if !_file_exists(path) {
+        eprintln("ps_1_describe: SETUP_ERROR — config missing: " + path)
+        exit(2)
+    }
+    return json_parse(read_file(path))
+}
+
+fn _cfg_str(cfg, key: string, dflt: string) -> string {
+    if cfg.contains_key(key) { return to_string(cfg[key]) }
+    return dflt
+}
+
+fn _argv() -> array {
+    let a = args()
+    let mut out = []
+    let mut i = 2
+    while i < len(a) { out.push(a[i]); i = i + 1 }
+    return out
+}
+
+fn _flag(av: array, k: string) -> bool {
+    for x in av { if to_string(x) == k { return true } }
+    return false
+}
+
+fn _opt(av: array, k: string, d: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && i + 1 < len(av) { return to_string(av[i + 1]) }
+        i = i + 1
+    }
+    return d
+}
+
+fn _issue_path(cfg, issue_id: string) -> string {
+    let dir = _cfg_str(cfg, "issue_state_dir", "/Users/ghost/core/anima/state/issues")
+    return dir + "/" + issue_id + ".json"
+}
+
+// naive but safe: regex-free JSON field replace by unique key prefix
+fn _replace_field_str(body: string, key: string, new_val: string) -> string {
+    let needle = "\"" + key + "\": \""
+    let i = body.index_of(needle)
+    if i < 0 { return body }
+    let j = i + len(needle)
+    let rest = body.substring(j, len(body))
+    let e = rest.index_of("\"")
+    if e < 0 { return body }
+    let before = body.substring(0, j)
+    let after = rest.substring(e, len(rest))
+    return before + _json_escape(new_val) + after
+}
+
+fn _replace_field_int(body: string, key: string, new_val: int) -> string {
+    let needle = "\"" + key + "\": "
+    let i = body.index_of(needle)
+    if i < 0 { return body }
+    let j = i + len(needle)
+    let rest = body.substring(j, len(body))
+    // find terminator: "," or "\n"
+    let mut k = 0
+    while k < len(rest) {
+        let ch = rest.substring(k, k + 1)
+        if ch == "," || ch == "\n" || ch == "}" { break }
+        k = k + 1
+    }
+    let before = body.substring(0, j)
+    let after = rest.substring(k, len(rest))
+    return before + to_string(new_val) + after
+}
+
+fn describe(cfg, issue_id: string) -> int {
+    let path = _issue_path(cfg, issue_id)
+    if !_file_exists(path) {
+        eprintln("ps_1_describe: issue not found: " + issue_id)
+        return 2
+    }
+    let body = read_file(path)
+    // signal refinement: pull integrity detail if available
+    let sigs = cfg["signal_sources"]
+    let integrity = _cfg_str(sigs, "integrity_ssot", "")
+    let mut refined = ""
+    if integrity != "" && _file_exists(integrity) {
+        let ij = json_parse(read_file(integrity))
+        if _is_json_map(ij) && ij.contains_key("exit_code") {
+            refined = "integrity_exit=" + to_string(ij["exit_code"]) + "; "
+        }
+    }
+    // find existing description to augment
+    let nkey = "\"description\": \""
+    let i0 = body.index_of(nkey)
+    let mut cur_desc = ""
+    if i0 >= 0 {
+        let j0 = i0 + len(nkey)
+        let rest = body.substring(j0, len(body))
+        let e0 = rest.index_of("\"")
+        if e0 >= 0 { cur_desc = rest.substring(0, e0) }
+    }
+    let new_desc = refined + cur_desc + " [step1:described@" + _ts_iso() + "]"
+    let mut b2 = _replace_field_str(body, "description", new_desc)
+    b2 = _replace_field_str(b2, "updated", _ts_iso())
+    b2 = _replace_field_int(b2, "current_step", 2)
+    write_file(path, b2)
+    println("ps_1_describe: issue=" + issue_id + " → step 2 (description refined)")
+    return 0
+}
+
+fn self_test(cfg) -> int {
+    println("── ps_1_describe self-test ──")
+    let tid = "SELFTEST-PS1"
+    let path = _issue_path(cfg, tid)
+    let _rm = exec_with_status("rm -f " + _sh_quote(path))
+    let body = "{\n  \"schema\": \"anima.problem_solving.issue.v1\",\n  \"issue_id\": \"" + tid +
+               "\",\n  \"description\": \"initial desc\",\n  \"current_step\": 1,\n  \"updated\": \"" + _ts_iso() + "\"\n}\n"
+    write_file(path, body)
+    let rc = describe(cfg, tid)
+    if rc != 0 { eprintln("  FAIL describe rc=" + to_string(rc)); return 1 }
+    let b2 = read_file(path)
+    if b2.index_of("step1:described") < 0 { eprintln("  FAIL description not refined"); return 1 }
+    if b2.index_of("\"current_step\": 2") < 0 { eprintln("  FAIL current_step != 2"); return 1 }
+    let _c = exec_with_status("rm -f " + _sh_quote(path))
+    println("  PASS: describe → current_step=2, description marker present")
+    return 0
+}
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") || _flag(av, "-h") {
+        println("usage: hexa tool/ps_1_describe.hexa --issue <id> | self-test")
+        return 0
+    }
+    let cfg_path = _opt(av, "--config", DEFAULT_CONFIG)
+    let cfg = _load_config(cfg_path)
+    if _flag(av, "self-test") || _flag(av, "--self-test") {
+        return self_test(cfg)
+    }
+    let id = _opt(av, "--issue", "")
+    if id == "" { eprintln("ps_1_describe: --issue required"); return 2 }
+    return describe(cfg, id)
+}
