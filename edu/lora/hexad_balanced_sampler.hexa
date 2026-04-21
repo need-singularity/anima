@@ -1,0 +1,717 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  edu/lora/hexad_balanced_sampler.hexa
+//    Cluster #31 improvement 7 — Hexad-balanced batch sampler.
+//
+//  PURPOSE
+//    Produce deterministic training batches that are balanced across the 6
+//    Hexad axes {c,d,e,m,s,w}.  Per-axis count difference must be ≤ ε
+//    (ε = 1 by config) so downstream LoRA adapters see no dominant axis.
+//
+//  INPUT
+//    A list of corpus lines.  Each line is one of:
+//        "<axis>\t<text>"     — axis in {c,d,e,m,s,w}, explicit tag
+//        "<axis>|<text>"      — pipe-delimited explicit tag
+//        "<text>"             — no tag; we invoke the deterministic
+//                                keyword tagger (config.tagger.keywords,
+//                                mirrored from tool/corpus_generator.hexa
+//                                HEXAD_*_KW lists).
+//
+//  SAMPLING
+//    Round-robin across the 6 axes in priority order.  At each step pull
+//    the NEXT unused line from the axis bucket.  When an axis bucket is
+//    exhausted we recycle from its start (wrap-around).  Missing axes
+//    (zero lines) are skipped after a single WARN and do not block batch
+//    assembly.
+//
+//  OUTPUT
+//    A batch of exactly batch_size lines whose per-axis count difference
+//    ≤ ε (across non-empty axes only).  Seed is deterministic — same
+//    (corpus, config) input → identical batch, bit-for-bit.
+//
+//  CONFIG SSOT
+//    config/hexad_balanced_sampler_config.json
+//      batch_size : int
+//      epsilon    : int    (per-axis count difference tolerance)
+//      seed       : int    (deterministic; currently only used to scramble
+//                           the axis rotation start offset when requested)
+//      tagger.keywords : { c[], d[], e[], m[], s[], w[] }
+//
+//  SELFTEST (inline, see fn run_selftest)
+//    S1 uniform 100 per axis   → batch balanced within ε=1 PASS
+//    S2 skewed 90% c, 2% each others → minority axes over-sampled via recycle
+//    S3 missing axis 'w'       → graceful WARN; continue with 5 axes
+//
+//  CONSTRAINTS
+//    raw#9  hexa-only (no python)
+//    raw#10 proof-carrying: selftest JSON persisted with per-scenario deltas
+//    raw#15 keywords / thresholds loaded from the config SSOT
+//    Deterministic. No LLM. CPU-only.
+//
+//  USAGE
+//    hexa run edu/lora/hexad_balanced_sampler.hexa selftest
+//    hexa run edu/lora/hexad_balanced_sampler.hexa sample <corpus.txt>
+//    hexa run edu/lora/hexad_balanced_sampler.hexa tag <corpus.txt>
+// ════════════════════════════════════════════════════════════════════════════
+
+// Config SSOT — thresholds, keyword lists, batch params, seed.
+// (`shared/config/` is gitignored in this repo; `config/` is the tracked
+// location used by sibling validators such as tool/alm_corpus_validate.hexa.)
+let CONFIG_PATH  = "config/hexad_balanced_sampler_config.json"
+let SELFTEST_OUT = "edu/lora/hexad_balanced_sampler_selftest_result.json"
+
+// ─── tiny helpers ───────────────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn now_stamp() -> string {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn fexists(path: string) -> bool {
+    let r = _str(exec("test -f " + path + " && echo 1 || echo 0")).trim()
+    return r == "1"
+}
+
+fn bool_s(b: bool) -> string {
+    if b { return "true" }
+    return "false"
+}
+
+fn to_lower_ascii(s: string) -> string {
+    // Hexa stage1 has no built-in to_lower for arbitrary unicode; we map
+    // ASCII A-Z to a-z by offset 32.  Non-ASCII bytes pass through, which
+    // is fine for our English-first keyword lists.
+    let n = len(s)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let b = char_code(s.substring(i, i + 1), 0)
+        if b >= 65 && b <= 90 {
+            out = out + chr(b + 32)
+        } else {
+            out = out + s.substring(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn any_kw_hit(hay_lc: string, kws: array) -> bool {
+    let n = len(kws)
+    let mut i = 0
+    while i < n {
+        let kw = _str(kws[i])
+        if kw != "" {
+            if hay_lc.index_of(kw) >= 0 { return true }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn str_list_json(xs: array) -> string {
+    let n = len(xs)
+    let mut s = "["
+    let mut i = 0
+    while i < n {
+        if i > 0 { s = s + "," }
+        s = s + "\"" + _str(xs[i]) + "\""
+        i = i + 1
+    }
+    return s + "]"
+}
+
+fn int_list_json(xs: array) -> string {
+    let n = len(xs)
+    let mut s = "["
+    let mut i = 0
+    while i < n {
+        if i > 0 { s = s + "," }
+        s = s + str(xs[i])
+        i = i + 1
+    }
+    return s + "]"
+}
+
+// ─── config loader ──────────────────────────────────────────────────────────
+
+fn load_config() -> map {
+    if !fexists(CONFIG_PATH) {
+        println("[hexad_sampler] SETUP_ERROR — config not found: " + CONFIG_PATH)
+        exit(2)
+    }
+    let raw = read_file(CONFIG_PATH)
+    let cfg = json_parse(raw)
+    return cfg
+}
+
+// Read keyword list for axis `ax` from cfg.tagger.keywords.
+fn axis_keywords(cfg: map, ax: string) -> array {
+    let tagger = cfg["tagger"]
+    let kws = tagger["keywords"]
+    if kws.contains_key(ax) { return kws[ax] }
+    return []
+}
+
+fn axis_list(cfg: map) -> array {
+    return cfg["hexad_axes"]
+}
+
+fn priority_order(cfg: map) -> array {
+    let tagger = cfg["tagger"]
+    return tagger["priority_order"]
+}
+
+// ─── deterministic keyword-based tagger ─────────────────────────────────────
+//
+//  Returns one of {"c","d","e","m","s","w","?"}.  "?" means no match → the
+//  line is not admitted to any axis bucket.  Rules are documented in the
+//  config SSOT (config/hexad_balanced_sampler_config.json).
+
+fn explicit_axis_prefix(line: string) -> string {
+    // "<axis>\t..." or "<axis>|..." where axis is exactly 1 char in {c,d,e,m,s,w}.
+    if len(line) < 2 { return "" }
+    let ch0 = line.substring(0, 1)
+    let ch1 = line.substring(1, 2)
+    let is_axis = ch0 == "c" || ch0 == "d" || ch0 == "e" || ch0 == "m" || ch0 == "s" || ch0 == "w"
+    if !is_axis { return "" }
+    if ch1 == "\t" || ch1 == "|" { return ch0 }
+    return ""
+}
+
+fn strip_explicit_prefix(line: string) -> string {
+    let ax = explicit_axis_prefix(line)
+    if ax == "" { return line }
+    return line.substring(2, len(line))
+}
+
+fn tag_line(cfg: map, line: string) -> string {
+    let ax = explicit_axis_prefix(line)
+    if ax != "" { return ax }
+    let body_lc = to_lower_ascii(line)
+    let order = priority_order(cfg)
+    let n = len(order)
+    let mut i = 0
+    while i < n {
+        let a = _str(order[i])
+        let kws = axis_keywords(cfg, a)
+        if any_kw_hit(body_lc, kws) { return a }
+        i = i + 1
+    }
+    return "?"
+}
+
+// Build the per-axis buckets.  Each bucket is an array of lines (text only,
+// explicit prefix stripped so downstream training sees clean strings).
+// Returns a map from axis ("c","d","e","m","s","w") -> array of strings.
+
+fn bucketize(cfg: map, lines: array) -> map {
+    let axes = axis_list(cfg)
+    let mut buckets = json_parse("{}")
+    let mut i = 0
+    while i < len(axes) {
+        buckets[_str(axes[i])] = []
+        i = i + 1
+    }
+    let n = len(lines)
+    let mut j = 0
+    while j < n {
+        let raw = _str(lines[j])
+        if raw != "" {
+            let ax = tag_line(cfg, raw)
+            if ax != "?" {
+                let clean = strip_explicit_prefix(raw)
+                let cur = buckets[ax]
+                cur = push(cur, clean)
+                buckets[ax] = cur
+            }
+        }
+        j = j + 1
+    }
+    return buckets
+}
+
+// ─── round-robin sampler with wrap-around recycle ───────────────────────────
+
+struct BatchResult {
+    batch:           array,
+    tags:            array,
+    per_axis_count:  map,
+    active_axes:     array,
+    missing_axes:    array,
+    max_axis_count:  int,
+    min_axis_count:  int,
+    axis_delta:      int,
+    epsilon:         int,
+    balanced:        bool
+}
+
+fn build_batch(cfg: map, buckets: map) -> BatchResult {
+    let batch_size = to_int(str(cfg["batch_size"]))
+    let epsilon    = to_int(str(cfg["epsilon"]))
+    let axes       = priority_order(cfg)
+    let n_axes     = len(axes)
+
+    // Determine active axes (non-empty buckets) and emit WARNs for missing.
+    let mut active = []
+    let mut missing = []
+    let mut a = 0
+    while a < n_axes {
+        let ax = _str(axes[a])
+        let b = buckets[ax]
+        if len(b) > 0 {
+            active = push(active, ax)
+        } else {
+            missing = push(missing, ax)
+            println("[hexad_sampler] WARN — axis '" + ax + "' has 0 lines; skipping")
+        }
+        a = a + 1
+    }
+
+    let n_active = len(active)
+
+    // Per-axis cursor (index of next line to draw from each active bucket).
+    let mut cursors = json_parse("{}")
+    let mut i = 0
+    while i < n_active {
+        cursors[_str(active[i])] = 0
+        i = i + 1
+    }
+
+    // Round-robin loop.  If there is no active axis we return an empty batch.
+    let mut batch = []
+    let mut tags  = []
+    let mut counts = json_parse("{}")
+    let mut k = 0
+    while k < n_active {
+        counts[_str(active[k])] = 0
+        k = k + 1
+    }
+
+    if n_active == 0 {
+        println("[hexad_sampler] WARN — no active axis; empty batch")
+        return BatchResult {
+            batch: batch, tags: tags,
+            per_axis_count: counts,
+            active_axes: active, missing_axes: missing,
+            max_axis_count: 0, min_axis_count: 0,
+            axis_delta: 0, epsilon: epsilon, balanced: true
+        }
+    }
+
+    let mut step = 0
+    while step < batch_size {
+        let pick_ax = _str(active[step % n_active])
+        let bucket = buckets[pick_ax]
+        let blen = len(bucket)
+        let cur = cursors[pick_ax]
+        let idx = cur % blen           // wrap-around recycle
+        let line = _str(bucket[idx])
+        batch = push(batch, line)
+        tags  = push(tags, pick_ax)
+        cursors[pick_ax] = cur + 1
+        counts[pick_ax] = counts[pick_ax] + 1
+        step = step + 1
+    }
+
+    // Compute per-axis delta over ACTIVE axes only.
+    let mut max_c = 0
+    let mut min_c = batch_size + 1
+    let mut p = 0
+    while p < n_active {
+        let c = counts[_str(active[p])]
+        if c > max_c { max_c = c }
+        if c < min_c { min_c = c }
+        p = p + 1
+    }
+    let delta = max_c - min_c
+    let balanced = delta <= epsilon
+
+    return BatchResult {
+        batch: batch, tags: tags,
+        per_axis_count: counts,
+        active_axes: active, missing_axes: missing,
+        max_axis_count: max_c, min_axis_count: min_c,
+        axis_delta: delta, epsilon: epsilon, balanced: balanced
+    }
+}
+
+// ─── public sampling API ────────────────────────────────────────────────────
+
+fn sample_balanced(cfg: map, lines: array) -> BatchResult {
+    let buckets = bucketize(cfg, lines)
+    return build_batch(cfg, buckets)
+}
+
+// ─── selftest scenarios ─────────────────────────────────────────────────────
+
+struct ScenarioVerdict {
+    id:          string,
+    name:        string,
+    n_input:     int,
+    active:      array,
+    missing:     array,
+    counts:      map,
+    delta:       int,
+    epsilon:     int,
+    balanced:    bool,
+    expect:      string,
+    pass:        bool,
+    notes:       string
+}
+
+// Canonical exemplar texts per axis.  Each contains at least one keyword
+// from the axis's keyword list (see config/hexad_balanced_sampler_config.json).
+let EX_C = "c|core consciousness generator module self-referential integration line "
+let EX_D = "d|data language output verbal symbolic hemisphere line "
+let EX_E = "e|eros affective drive motivation valence reward emotion line "
+let EX_M = "m|mirror reflective metacognition observation loop reflexive line "
+let EX_S = "s|scribe storage memory episodic temporal index archive line "
+let EX_W = "w|witness observer perception attention gate input line "
+
+fn make_uniform_lines(per_axis: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < per_axis {
+        out = push(out, EX_C + str(i))
+        out = push(out, EX_D + str(i))
+        out = push(out, EX_E + str(i))
+        out = push(out, EX_M + str(i))
+        out = push(out, EX_S + str(i))
+        out = push(out, EX_W + str(i))
+        i = i + 1
+    }
+    return out
+}
+
+// S2: skewed — 90% c, 2% each of d,e,m,s,w (rounded to integer counts).
+fn make_skewed_lines(total: int) -> array {
+    let n_c = (total * 90) / 100
+    let n_other = (total * 2) / 100
+    let mut out = []
+    let mut i = 0
+    while i < n_c {
+        out = push(out, EX_C + str(i))
+        i = i + 1
+    }
+    let others = ["d", "e", "m", "s", "w"]
+    let exs    = [EX_D, EX_E, EX_M, EX_S, EX_W]
+    let mut a = 0
+    while a < 5 {
+        let ex = _str(exs[a])
+        let mut j = 0
+        while j < n_other {
+            out = push(out, ex + str(j))
+            j = j + 1
+        }
+        a = a + 1
+    }
+    return out
+}
+
+// S3: missing axis 'w' — uniform 100 per axis for c,d,e,m,s only.
+fn make_missing_w_lines(per_axis: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < per_axis {
+        out = push(out, EX_C + str(i))
+        out = push(out, EX_D + str(i))
+        out = push(out, EX_E + str(i))
+        out = push(out, EX_M + str(i))
+        out = push(out, EX_S + str(i))
+        i = i + 1
+    }
+    return out
+}
+
+fn run_scenario(cfg: map, id: string, name: string, lines: array, expect: string) -> ScenarioVerdict {
+    println("")
+    println("── scenario " + id + " (" + name + ") ──")
+    let res = sample_balanced(cfg, lines)
+    let counts = res.per_axis_count
+    println("  input_lines=" + str(len(lines))
+          + "  active=" + str_list_json(res.active_axes)
+          + "  missing=" + str_list_json(res.missing_axes))
+    let axes = res.active_axes
+    let mut ci = 0
+    while ci < len(axes) {
+        let ax = _str(axes[ci])
+        println("    " + ax + " count=" + str(counts[ax]))
+        ci = ci + 1
+    }
+    println("  delta=" + str(res.axis_delta)
+          + "  epsilon=" + str(res.epsilon)
+          + "  balanced=" + bool_s(res.balanced))
+
+    let mut pass = false
+    let mut notes = ""
+
+    if id == "S1" {
+        // Need balance within epsilon AND all 6 axes active.
+        pass = res.balanced && len(res.active_axes) == 6
+        notes = "S1 expects 6 active axes balanced within epsilon=" + str(res.epsilon)
+    }
+    if id == "S2" {
+        // Need minority axes (d,e,m,s,w) to be RECYCLED past their raw pool
+        // count (2% of total) — i.e. their sampled count must match the
+        // majority axis count within epsilon after wrap-around.
+        pass = res.balanced && len(res.active_axes) == 6
+        notes = "S2 expects minority axes oversampled via recycle so delta <= epsilon"
+    }
+    if id == "S3" {
+        // Need exactly 1 missing axis ('w'), 5 active, balanced within epsilon.
+        let mut miss_is_w = false
+        if len(res.missing_axes) == 1 {
+            if _str(res.missing_axes[0]) == "w" { miss_is_w = true }
+        }
+        pass = res.balanced && len(res.active_axes) == 5 && miss_is_w
+        notes = "S3 expects missing='w' only, 5 active axes, balanced within epsilon"
+    }
+
+    return ScenarioVerdict {
+        id: id, name: name,
+        n_input: len(lines),
+        active: res.active_axes, missing: res.missing_axes,
+        counts: counts,
+        delta: res.axis_delta, epsilon: res.epsilon, balanced: res.balanced,
+        expect: expect, pass: pass, notes: notes
+    }
+}
+
+fn sv_json(v: ScenarioVerdict) -> string {
+    let axes = v.active
+    let counts = v.counts
+    let mut s = "{"
+    s = s + "\"id\":\"" + v.id + "\""
+    s = s + ",\"name\":\"" + v.name + "\""
+    s = s + ",\"n_input\":" + str(v.n_input)
+    s = s + ",\"active_axes\":" + str_list_json(v.active)
+    s = s + ",\"missing_axes\":" + str_list_json(v.missing)
+    s = s + ",\"per_axis_count\":{"
+    let mut i = 0
+    while i < len(axes) {
+        let ax = _str(axes[i])
+        if i > 0 { s = s + "," }
+        s = s + "\"" + ax + "\":" + str(counts[ax])
+        i = i + 1
+    }
+    s = s + "}"
+    s = s + ",\"delta\":" + str(v.delta)
+    s = s + ",\"epsilon\":" + str(v.epsilon)
+    s = s + ",\"balanced\":" + bool_s(v.balanced)
+    s = s + ",\"expect\":\"" + v.expect + "\""
+    s = s + ",\"pass\":" + bool_s(v.pass)
+    s = s + ",\"notes\":\"" + v.notes + "\""
+    s = s + "}"
+    return s
+}
+
+fn run_selftest(cfg: map) -> int {
+    println("[hexad_sampler] SELFTEST — 3 scenarios (raw#10 proof-carrying)")
+    println("  config=" + CONFIG_PATH)
+    println("  batch_size=" + str(cfg["batch_size"])
+          + "  epsilon=" + str(cfg["epsilon"])
+          + "  seed=" + str(cfg["seed"]))
+
+    let s1 = run_scenario(cfg, "S1", "uniform_100_per_axis",
+        make_uniform_lines(100),
+        "balanced_within_epsilon")
+
+    let s2 = run_scenario(cfg, "S2", "skewed_90pct_c_2pct_each_others",
+        make_skewed_lines(1000),
+        "minority_axes_oversampled_to_balance")
+
+    let s3 = run_scenario(cfg, "S3", "missing_axis_w",
+        make_missing_w_lines(100),
+        "graceful_warn_and_continue_with_5_axes")
+
+    let mut n_pass = 0
+    if s1.pass { n_pass = n_pass + 1 }
+    if s2.pass { n_pass = n_pass + 1 }
+    if s3.pass { n_pass = n_pass + 1 }
+
+    println("")
+    println("=== SELFTEST RESULT ===")
+    println("  S1 " + (if s1.pass { "PASS" } else { "FAIL" }) + "  " + s1.notes)
+    println("  S2 " + (if s2.pass { "PASS" } else { "FAIL" }) + "  " + s2.notes)
+    println("  S3 " + (if s3.pass { "PASS" } else { "FAIL" }) + "  " + s3.notes)
+    println("  n_pass=" + str(n_pass) + "/3")
+
+    // Persist verdict JSON (raw#10 proof-carrying).
+    let mut out = "{\n"
+    out = out + "  \"selftest\": \"hexad_balanced_sampler\",\n"
+    out = out + "  \"version\": \"v1\",\n"
+    out = out + "  \"generated\": \"" + now_stamp() + "\",\n"
+    out = out + "  \"config_path\": \"" + CONFIG_PATH + "\",\n"
+    out = out + "  \"batch_size\": " + str(cfg["batch_size"]) + ",\n"
+    out = out + "  \"epsilon\": " + str(cfg["epsilon"]) + ",\n"
+    out = out + "  \"seed\": " + str(cfg["seed"]) + ",\n"
+    out = out + "  \"n_pass\": " + str(n_pass) + ",\n"
+    out = out + "  \"n_total\": 3,\n"
+    out = out + "  \"all_pass\": " + bool_s(n_pass == 3) + ",\n"
+    out = out + "  \"scenarios\": [\n"
+    out = out + "    " + sv_json(s1) + ",\n"
+    out = out + "    " + sv_json(s2) + ",\n"
+    out = out + "    " + sv_json(s3) + "\n"
+    out = out + "  ],\n"
+    out = out + "  \"deterministic\": true,\n"
+    out = out + "  \"llm\": \"none\"\n"
+    out = out + "}\n"
+    write_file(SELFTEST_OUT, out)
+    println("  wrote: " + SELFTEST_OUT)
+
+    if n_pass == 3 { return 0 }
+    return 1
+}
+
+// ─── real-corpus tag distribution report (read-only; no side effects) ───────
+
+fn read_lines_file(path: string) -> array {
+    if !fexists(path) { return [] }
+    let blob = read_file(path)
+    let parts = blob.split("\n")
+    let mut out = []
+    let n = len(parts)
+    let mut i = 0
+    while i < n {
+        let p = _str(parts[i]).trim()
+        if p != "" { out = push(out, p) }
+        i = i + 1
+    }
+    return out
+}
+
+fn report_tag_distribution(cfg: map, path: string) -> int {
+    println("[hexad_sampler] TAG — distribution report")
+    println("  corpus=" + path)
+    let lines = read_lines_file(path)
+    let n = len(lines)
+    println("  lines=" + str(n))
+    if n == 0 {
+        println("  (empty or missing)")
+        return 2
+    }
+    let axes = axis_list(cfg)
+    let mut counts = json_parse("{}")
+    let mut i = 0
+    while i < len(axes) {
+        counts[_str(axes[i])] = 0
+        i = i + 1
+    }
+    counts["?"] = 0
+    let mut j = 0
+    while j < n {
+        let ax = tag_line(cfg, _str(lines[j]))
+        counts[ax] = counts[ax] + 1
+        j = j + 1
+    }
+    let mut k = 0
+    while k < len(axes) {
+        let a = _str(axes[k])
+        println("    " + a + " count=" + str(counts[a]))
+        k = k + 1
+    }
+    println("    ? count=" + str(counts["?"]) + "  (unknown / no keyword match)")
+    return 0
+}
+
+fn report_and_sample(cfg: map, path: string) -> int {
+    let lines = read_lines_file(path)
+    if len(lines) == 0 {
+        println("[hexad_sampler] SETUP_ERROR — corpus empty or missing: " + path)
+        return 2
+    }
+    let res = sample_balanced(cfg, lines)
+    println("[hexad_sampler] SAMPLE — batch produced")
+    println("  batch_size=" + str(len(res.batch))
+          + "  delta=" + str(res.axis_delta)
+          + "  epsilon=" + str(res.epsilon)
+          + "  balanced=" + bool_s(res.balanced))
+    let counts = res.per_axis_count
+    let mut i = 0
+    while i < len(res.active_axes) {
+        let ax = _str(res.active_axes[i])
+        println("    " + ax + " count=" + str(counts[ax]))
+        i = i + 1
+    }
+    if len(res.missing_axes) > 0 {
+        println("  missing=" + str_list_json(res.missing_axes))
+    }
+    if res.balanced { return 0 }
+    return 1
+}
+
+// ─── CLI entry ──────────────────────────────────────────────────────────────
+
+fn print_usage() {
+    println("usage: hexa run edu/lora/hexad_balanced_sampler.hexa <subcmd> [args]")
+    println("  selftest                — run S1/S2/S3 inline selftest (default)")
+    println("  tag <corpus.txt>        — report tag distribution of a real corpus")
+    println("  sample <corpus.txt>     — produce one balanced batch from a real corpus")
+    println("  config SSOT: " + CONFIG_PATH)
+}
+
+// Extract the user-provided sub-command from args().
+// Hexa invokes scripts as `hexa run <script> <subcmd> [args]`, so argv
+// layout is typically [hexa, run, script, subcmd, ...] — we scan from
+// the end for the FIRST known sub-command token to be robust against
+// stage0 vs stage1 argv differences.
+fn pick_subcmd(argv: array) -> string {
+    let n = len(argv)
+    let mut i = 0
+    while i < n {
+        let t = _str(argv[i])
+        if t == "selftest" { return "selftest" }
+        if t == "tag" { return "tag" }
+        if t == "sample" { return "sample" }
+        if t == "help" || t == "--help" || t == "-h" { return "help" }
+        i = i + 1
+    }
+    return "selftest"
+}
+
+// Locate the argument immediately after a given sub-command token.
+fn arg_after(argv: array, key: string) -> string {
+    let n = len(argv)
+    let mut i = 0
+    while i < n {
+        if _str(argv[i]) == key && i + 1 < n { return _str(argv[i + 1]) }
+        i = i + 1
+    }
+    return ""
+}
+
+fn main() {
+    let argv = args()
+    let cfg = load_config()
+    let sub = pick_subcmd(argv)
+
+    if sub == "help" {
+        print_usage()
+        exit(0)
+    }
+    if sub == "selftest" {
+        let code = run_selftest(cfg)
+        exit(code)
+    }
+    if sub == "tag" {
+        let p = arg_after(argv, "tag")
+        if p == "" { print_usage(); exit(2) }
+        let code = report_tag_distribution(cfg, p)
+        exit(code)
+    }
+    if sub == "sample" {
+        let p = arg_after(argv, "sample")
+        if p == "" { print_usage(); exit(2) }
+        let code = report_and_sample(cfg, p)
+        exit(code)
+    }
+    print_usage()
+    exit(2)
+}
+
+main()
