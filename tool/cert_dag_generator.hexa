@@ -1,0 +1,1009 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/cert_dag_generator.hexa — cert dependency DAG generator
+//
+//  PURPOSE (cluster #33 improvement 18)
+//    Scan cert JSON corpora under the repo and materialise a single
+//    dependency-DAG SSOT at state/cert_dag.json.  Each cert entry contributes
+//    one node (slug, hash); edges are drawn from
+//      · prev_hash  →  current_hash     (append-only cert chain)
+//      · depends_on → current_hash      (declared predecessor slug)
+//      · verify     → current_hash      (verifies-this-cert declaration)
+//      · reaches    → current_hash      (graph-style reachability edges)
+//      · cross_refs → current_hash      (common .meta2-cert synonym for
+//                                        depends_on / reaches)
+//    Nodes are topologically ordered (Kahn's algorithm) and any strongly-
+//    connected cycle is reported under `cycles`.
+//
+//  CERT SOURCES (raw#15 no-hardcode — env override CERT_DAG_REPO_ROOT)
+//    .meta2-cert/*.json
+//    shared/state/*cert*.json
+//    state/*cert*.json
+//
+//  OUTPUT SSOT  state/cert_dag.json
+//    { schema, generated, root,
+//      nodes:    [ { slug, hash, source_path } ... ],
+//      edges:    [ { src, dst, kind } ... ],           (sorted canonical)
+//      topo_order: [ slug ... ],
+//      cycles:   [ [slug, slug, ...] ... ],            (each entry = one SCC)
+//      aggregate:{ nodes_n, edges_n, cycle_n, cycles_n },
+//      proof_hash: sha256(sorted "src|dst|kind\n" join over edges) }
+//
+//  CLI
+//    hexa tool/cert_dag_generator.hexa                 real scan + write SSOT
+//    hexa tool/cert_dag_generator.hexa --selftest      inline 3/3 self-test
+//    hexa tool/cert_dag_generator.hexa --help
+//
+//  RAW CONSTRAINTS
+//    raw#9  hexa-only
+//    raw#10 proof-carrying — proof_hash over sorted edge list
+//    raw#11 snake_case
+//    raw#15 no-hardcode — repo root / output path overridable via env
+//    deterministic LLM=none
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── string / sh helpers ──────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return to_string(x)
+}
+
+fn _sh_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _trim(s: string) -> string { return s.trim() }
+
+fn _exec_out(cmd: string) -> string {
+    return _str(exec(cmd))
+}
+
+fn _file_exists(p: string) -> bool {
+    return _exec_out("test -f " + _sh_quote(p) + " && echo 1 || echo 0").trim() == "1"
+}
+
+fn _dir_exists(p: string) -> bool {
+    return _exec_out("test -d " + _sh_quote(p) + " && echo 1 || echo 0").trim() == "1"
+}
+
+fn _mkdir_p(p: string) -> bool {
+    return _exec_out("mkdir -p " + _sh_quote(p) + " && echo 1 || echo 0").trim() == "1"
+}
+
+fn _now_iso() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _ls_glob(pat: string) -> array {
+    let out = _exec_out("ls " + pat + " 2>/dev/null")
+    let lines = split(out, "\n")
+    let mut acc = []
+    for l in lines {
+        let t = _str(l).trim()
+        if len(t) > 0 { acc.push(t) }
+    }
+    return acc
+}
+
+// ─── sha256 helper (shasum -a 256) ────────────────────────────────────────
+
+fn _sha256_of_string(s: string) -> string {
+    let tmp = "/tmp/cert_dag_sha_" + _str(len(s)) + "_" + _exec_out("date +%s%N 2>/dev/null || date +%s").trim() + ".txt"
+    write_file(tmp, s)
+    let r = _exec_out("shasum -a 256 " + _sh_quote(tmp) + " 2>/dev/null | awk '{print $1}'").trim()
+    let _ = _exec_out("rm -f " + _sh_quote(tmp))
+    return r
+}
+
+// ─── argv ─────────────────────────────────────────────────────────────────
+
+fn _argv() -> array {
+    let a = args()
+    let mut out = []
+    let mut i = 2
+    while i < len(a) {
+        out.push(a[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn _flag(av: array, k: string) -> bool {
+    for x in av {
+        if _str(x) == k { return true }
+    }
+    return false
+}
+
+fn _opt(av: array, k: string, d: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if _str(av[i]) == k && i + 1 < len(av) { return _str(av[i + 1]) }
+        i = i + 1
+    }
+    return d
+}
+
+// ─── repo root (raw#15 override) ──────────────────────────────────────────
+
+fn _repo_root() -> string {
+    let ov = _str(env("CERT_DAG_REPO_ROOT")).trim()
+    if ov != "" { return ov }
+    let r = _exec_out("git rev-parse --show-toplevel 2>/dev/null").trim()
+    if r != "" { return r }
+    return "/Users/ghost/core/anima"
+}
+
+// ─── json parse / type introspection ──────────────────────────────────────
+
+fn _is_map(v) -> bool {
+    let t = type_of(v)
+    return t == "map" || t == "object" || t == "dict"
+}
+
+fn _is_array(v) -> bool {
+    let t = type_of(v)
+    return t == "array" || t == "arr" || t == "list"
+}
+
+fn _is_string(v) -> bool {
+    let t = type_of(v)
+    return t == "string" || t == "str"
+}
+
+fn _map_has(m, k: string) -> bool {
+    if !_is_map(m) { return false }
+    return m.contains_key(k)
+}
+
+fn _map_get_str(m, k: string, dflt: string) -> string {
+    if !_map_has(m, k) { return dflt }
+    let v = m[k]
+    if _is_string(v) { return v }
+    return _str(v)
+}
+
+// Safely pull an array field by key; if absent or scalar, return [].
+fn _map_get_arr(m, k: string) -> array {
+    if !_map_has(m, k) { return [] }
+    let v = m[k]
+    if _is_array(v) { return v }
+    return []
+}
+
+// ─── json escape ──────────────────────────────────────────────────────────
+
+fn _json_escape(s: string) -> string {
+    let a = s.replace("\\", "\\\\")
+    let b = a.replace("\"", "\\\"")
+    let c = b.replace("\n", "\\n")
+    let d = c.replace("\r", "\\r")
+    return d.replace("\t", "\\t")
+}
+
+// ─── cert entry extraction ────────────────────────────────────────────────
+//
+// Each cert JSON is normalised into a "cert entry" map:
+//   { slug, current_hash, prev_hash, depends_on:[], verify:[], reaches:[],
+//     cross_refs:[], source_path }
+// Fallbacks preserve back-compat across cert generations:
+//   slug          ← slug | file-stem
+//   current_hash  ← current_hash | cert_sha | mk8_cert_sha | commit | proof_hash
+//   prev_hash     ← prev_hash | prev_index_sha | hash_chain_prev
+//
+// Returns [] if the file is not a JSON map or cannot be parsed.
+fn _extract_cert_entry(path: string) -> array {
+    if !_file_exists(path) { return [] }
+    let raw = read_file(path)
+    let j = json_parse(raw)
+    if !_is_map(j) { return [] }
+
+    // slug
+    let mut slug = _map_get_str(j, "slug", "")
+    if slug == "" {
+        // fallback: basename without extension
+        let base = _exec_out("basename " + _sh_quote(path) + " .json 2>/dev/null").trim()
+        slug = base
+    }
+
+    // current_hash — walk preferred keys in order.
+    let mut current_hash = _map_get_str(j, "current_hash", "")
+    if current_hash == "" { current_hash = _map_get_str(j, "cert_sha", "") }
+    if current_hash == "" { current_hash = _map_get_str(j, "mk8_cert_sha", "") }
+    if current_hash == "" { current_hash = _map_get_str(j, "deterministic_sha", "") }
+    if current_hash == "" { current_hash = _map_get_str(j, "commit", "") }
+    if current_hash == "" { current_hash = _map_get_str(j, "proof_hash", "") }
+
+    // prev_hash
+    let mut prev_hash = _map_get_str(j, "prev_hash", "")
+    if prev_hash == "" { prev_hash = _map_get_str(j, "prev_index_sha", "") }
+    if prev_hash == "" { prev_hash = _map_get_str(j, "hash_chain_prev", "") }
+
+    // Arrays of slug-style references.
+    let depends_on  = _map_get_arr(j, "depends_on")
+    let verifies_by = _map_get_arr(j, "verify")
+    let reaches_arr = _map_get_arr(j, "reaches")
+    let cross_refs  = _map_get_arr(j, "cross_refs")
+
+    // Return a positional array (hexa-portable — avoids cross-file map mutation).
+    let mut entry = []
+    entry.push(slug)              // 0
+    entry.push(current_hash)      // 1
+    entry.push(prev_hash)         // 2
+    entry.push(depends_on)        // 3
+    entry.push(verifies_by)       // 4 (from `verify` field — see-also-verified-by)
+    entry.push(reaches_arr)       // 5
+    entry.push(cross_refs)        // 6 (non-DAG — recorded as node attribute only)
+    entry.push(path)              // 7
+    return entry
+}
+
+fn _entry_slug(e: array) -> string { return _str(e[0]) }
+fn _entry_current(e: array) -> string { return _str(e[1]) }
+fn _entry_prev(e: array) -> string { return _str(e[2]) }
+fn _entry_depends(e: array) -> array { return e[3] }
+fn _entry_verified_by(e: array) -> array { return e[4] }
+fn _entry_reaches(e: array) -> array { return e[5] }
+fn _entry_cross(e: array) -> array { return e[6] }
+fn _entry_path(e: array) -> string { return _str(e[7]) }
+
+// ─── cert corpus scan ─────────────────────────────────────────────────────
+
+fn _scan_cert_paths(repo: string) -> array {
+    let mut all = []
+
+    // 1. .meta2-cert/*.json — canonical breakthrough cert registry.
+    let meta_dir = repo + "/.meta2-cert"
+    if _dir_exists(meta_dir) {
+        for p in _ls_glob(meta_dir + "/*.json") {
+            all.push(_str(p))
+        }
+    }
+
+    // 2. shared/state/*cert*.json
+    let shared_state = repo + "/shared/state"
+    if _dir_exists(shared_state) {
+        for p in _ls_glob(shared_state + "/*cert*.json") {
+            all.push(_str(p))
+        }
+    }
+
+    // 3. state/*cert*.json
+    let st_dir = repo + "/state"
+    if _dir_exists(st_dir) {
+        for p in _ls_glob(st_dir + "/*cert*.json") {
+            // Skip self-output + well-known backup copies.
+            let ps = _str(p)
+            if ps.index_of("cert_dag.json") >= 0 { continue }
+            all.push(ps)
+        }
+    }
+    return all
+}
+
+// ─── DAG construction ─────────────────────────────────────────────────────
+//
+// Node identity: slug (primary key).  Hash is the "current_hash" attribute.
+// Edge kinds: "prev", "depends_on", "verify", "reaches", "cross_refs".
+//
+// Two-pass resolution:
+//   pass 1 — collect all entries; build slug→hash and hash→slug indices.
+//   pass 2 — emit edges; for declared references, resolve target to an
+//            existing node by slug or (fallback) by hash prefix match.
+//            Unresolved references are silently dropped (back-compat safe).
+
+fn _index_of_slug(nodes: array, slug: string) -> int {
+    let mut i = 0
+    while i < len(nodes) {
+        let n = nodes[i]
+        if _str(n[0]) == slug { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _index_of_hash(nodes: array, h: string) -> int {
+    if h == "" { return -1 }
+    let mut i = 0
+    while i < len(nodes) {
+        let n = nodes[i]
+        if _str(n[1]) == h { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// Resolve a reference token (either a slug or a hex sha) to a node slug.
+// Returns "" if unresolved.
+fn _resolve_ref(nodes: array, token: string) -> string {
+    if token == "" { return "" }
+    // direct slug hit
+    let a = _index_of_slug(nodes, token)
+    if a >= 0 { return _str(nodes[a][0]) }
+    // hash hit (exact or prefix)
+    let b = _index_of_hash(nodes, token)
+    if b >= 0 { return _str(nodes[b][0]) }
+    // hash prefix
+    let mut i = 0
+    while i < len(nodes) {
+        let h = _str(nodes[i][1])
+        if h != "" && len(token) >= 6 && h.index_of(token) == 0 {
+            return _str(nodes[i][0])
+        }
+        if h != "" && len(h) >= 6 && token.index_of(h) == 0 {
+            return _str(nodes[i][0])
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// Build edges from entries. Returns edges = array of ["src","dst","kind"].
+fn _build_edges(entries: array, nodes: array) -> array {
+    let mut edges = []
+
+    for e in entries {
+        let dst_slug = _entry_slug(e)
+        if dst_slug == "" { continue }
+
+        // 1) prev_hash → current_hash  (cert chain append)
+        let ph = _entry_prev(e)
+        if ph != "" {
+            let src = _resolve_ref(nodes, ph)
+            if src != "" && src != dst_slug {
+                let mut ed = []
+                ed.push(src); ed.push(dst_slug); ed.push("prev")
+                edges.push(ed)
+            }
+        }
+
+        // 2) depends_on[] → dst
+        for ref_tok in _entry_depends(e) {
+            let r = _str(ref_tok).trim()
+            let src = _resolve_ref(nodes, r)
+            if src != "" && src != dst_slug {
+                let mut ed = []
+                ed.push(src); ed.push(dst_slug); ed.push("depends_on")
+                edges.push(ed)
+            }
+        }
+
+        // 3) verify[]  (a cert may declare "this result is verified by X");
+        //    emit X → dst so the verifier precedes the verified.
+        for ref_tok in _entry_verified_by(e) {
+            let r = _str(ref_tok).trim()
+            let src = _resolve_ref(nodes, r)
+            if src != "" && src != dst_slug {
+                let mut ed = []
+                ed.push(src); ed.push(dst_slug); ed.push("verify")
+                edges.push(ed)
+            }
+        }
+
+        // 4) reaches[] → dst
+        for ref_tok in _entry_reaches(e) {
+            let r = _str(ref_tok).trim()
+            let src = _resolve_ref(nodes, r)
+            if src != "" && src != dst_slug {
+                let mut ed = []
+                ed.push(src); ed.push(dst_slug); ed.push("reaches")
+                edges.push(ed)
+            }
+        }
+
+        // 5) cross_refs[] → dst (.meta2-cert convention — symmetric
+        //    "see-also" links are collapsed to a single edge using a
+        //    deterministic alphabetical tie-break: only emit the edge
+        //    where src<dst.  This prevents the A<->B cycle that mutual
+        //    cross_refs would otherwise induce, while preserving the
+        //    reachability relation for topo / DAG visualisation.
+        for ref_tok in _entry_cross(e) {
+            let r = _str(ref_tok).trim()
+            let src = _resolve_ref(nodes, r)
+            if src == "" || src == dst_slug { continue }
+            // Canonical direction: lexicographically smaller slug → larger
+            // (byte-wise compare via _str_cmp for deterministic ordering
+            // across hexa builds).
+            let cmp = _str_cmp(src, dst_slug)
+            let small = if cmp < 0 { src } else { dst_slug }
+            let big   = if cmp < 0 { dst_slug } else { src }
+            let mut ed = []
+            ed.push(small); ed.push(big); ed.push("cross_refs")
+            edges.push(ed)
+        }
+    }
+
+    // De-duplicate (src|dst|kind).
+    let mut seen = []
+    let mut uniq = []
+    for ed in edges {
+        let key = _str(ed[0]) + "|" + _str(ed[1]) + "|" + _str(ed[2])
+        let mut dup = false
+        for s in seen {
+            if _str(s) == key { dup = true; break }
+        }
+        if dup { continue }
+        seen.push(key)
+        uniq.push(ed)
+    }
+    return uniq
+}
+
+// ─── lexicographic string comparison — byte-wise, deterministic ──────────
+//
+// Returns:
+//   -1 if a <lex  b
+//    0 if a ==    b
+//   +1 if a >lex  b
+//
+// Implemented explicitly so that cert_dag is portable across hexa builds
+// whose built-in string </> operator may not be byte-lexicographic.
+fn _byte_at(s: string, i: int) -> int {
+    return char_code(s.substring(i, i + 1), 0)
+}
+
+fn _str_cmp(a: string, b: string) -> int {
+    let la = len(a)
+    let lb = len(b)
+    let n = if la < lb { la } else { lb }
+    let mut i = 0
+    while i < n {
+        let ca = _byte_at(a, i)
+        let cb = _byte_at(b, i)
+        if ca < cb { return -1 }
+        if ca > cb { return 1 }
+        i = i + 1
+    }
+    if la < lb { return -1 }
+    if la > lb { return 1 }
+    return 0
+}
+
+// ─── sorting (bubble sort on string keys — hexa-portable, deterministic) ─
+
+fn _sort_strings(arr: array) -> array {
+    let mut a = []
+    for x in arr { a.push(_str(x)) }
+    let n = len(a)
+    let mut i = 0
+    while i < n {
+        let mut j = 0
+        while j + 1 < n - i {
+            if _str_cmp(a[j], a[j + 1]) > 0 {
+                let tmp = a[j]
+                a[j] = a[j + 1]
+                a[j + 1] = tmp
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return a
+}
+
+fn _sort_edges_canonical(edges: array) -> array {
+    // Build sort key per edge and pair with the original edge.
+    let mut keys = []
+    for ed in edges {
+        let k = _str(ed[0]) + "|" + _str(ed[1]) + "|" + _str(ed[2])
+        keys.push(k)
+    }
+    let sorted_keys = _sort_strings(keys)
+    // Re-assemble: for each sorted key, find first matching edge (mark used).
+    let mut used = []
+    let n = len(edges)
+    let mut i = 0
+    while i < n { used.push(false); i = i + 1 }
+    let mut out = []
+    for sk in sorted_keys {
+        let mut j = 0
+        while j < n {
+            if !used[j] {
+                let ed = edges[j]
+                let k = _str(ed[0]) + "|" + _str(ed[1]) + "|" + _str(ed[2])
+                if k == _str(sk) {
+                    used[j] = true
+                    out.push(ed)
+                    break
+                }
+            }
+            j = j + 1
+        }
+    }
+    return out
+}
+
+// ─── Kahn's algorithm (topo sort + cycle detection) ───────────────────────
+//
+// Input:  nodes (array of [slug,hash,path]), edges (array of [src,dst,kind]).
+// Output: [ topo_order_slugs:array, cycle_sccs:array-of-array ].
+//
+// Cycle handling: any node not emitted by Kahn has ≥1 in-edge remaining;
+// we group these residual nodes into one synthetic SCC list (implementation
+// keeps it simple — production-grade SCC would run Tarjan; for cert DAGs a
+// coarse residual set is sufficient for the "cycles_n ≥ 1" alarm contract).
+fn _topo_and_cycles(nodes: array, edges: array) -> array {
+    let n = len(nodes)
+    // Build slug→idx.
+    let mut slugs = []
+    let mut i = 0
+    while i < n {
+        slugs.push(_str(nodes[i][0]))
+        i = i + 1
+    }
+    // in-degrees.
+    let mut indeg = []
+    let mut k = 0
+    while k < n { indeg.push(0); k = k + 1 }
+    // adjacency list (adj[src_idx] = array of dst_idx).
+    let mut adj = []
+    let mut a = 0
+    while a < n { adj.push([]); a = a + 1 }
+
+    for ed in edges {
+        let s = _str(ed[0])
+        let d = _str(ed[1])
+        let mut si = -1
+        let mut di = -1
+        let mut ii = 0
+        while ii < n {
+            if _str(slugs[ii]) == s { si = ii }
+            if _str(slugs[ii]) == d { di = ii }
+            ii = ii + 1
+        }
+        if si < 0 || di < 0 { continue }
+        indeg[di] = indeg[di] + 1
+        let cur = adj[si]
+        let mut nxt = []
+        for x in cur { nxt.push(x) }
+        nxt.push(di)
+        adj[si] = nxt
+    }
+
+    // Start queue: all indeg==0.
+    let mut queue = []
+    let mut qi = 0
+    while qi < n {
+        if indeg[qi] == 0 { queue.push(qi) }
+        qi = qi + 1
+    }
+
+    let mut topo = []
+    let mut head = 0
+    while head < len(queue) {
+        let u = queue[head]
+        head = head + 1
+        topo.push(_str(slugs[u]))
+        let neighbours = adj[u]
+        for v in neighbours {
+            indeg[v] = indeg[v] - 1
+            if indeg[v] == 0 {
+                queue.push(v)
+            }
+        }
+    }
+
+    // Residual nodes → cycle set.
+    let mut residual = []
+    let mut ri = 0
+    while ri < n {
+        if indeg[ri] > 0 { residual.push(_str(slugs[ri])) }
+        ri = ri + 1
+    }
+    let mut cycles = []
+    if len(residual) > 0 {
+        // Sort residual for determinism and emit as a single SCC group.
+        let sr = _sort_strings(residual)
+        cycles.push(sr)
+        // If cycle is present, per-spec topo_order may be partial; clear it
+        // when the cycle swallows EVERY node (topo completely empty means
+        // a pure cycle scenario — matches S2 fixture expectation).
+        if len(topo) == 0 {
+            // already empty
+        }
+    }
+
+    let mut out = []
+    out.push(topo)
+    out.push(cycles)
+    return out
+}
+
+// ─── DAG SSOT emission ────────────────────────────────────────────────────
+
+fn _emit_dag_json(repo: string, nodes: array, edges: array, topo: array,
+                  cycles: array, proof_sha: string) -> string {
+    let mut parts = []
+    parts.push("{\n")
+    parts.push("  \"schema\": \"anima.cert_dag.v1\",\n")
+    parts.push("  \"generated\": \"" + _now_iso() + "\",\n")
+    parts.push("  \"tool\": \"tool/cert_dag_generator.hexa\",\n")
+    parts.push("  \"root\": \"" + _json_escape(repo) + "\",\n")
+
+    // nodes
+    parts.push("  \"nodes\": [\n")
+    let nn = len(nodes)
+    let mut i = 0
+    while i < nn {
+        let nd = nodes[i]
+        let comma = if i + 1 < nn { "," } else { "" }
+        parts.push("    {\"slug\": \"" + _json_escape(_str(nd[0])) +
+                   "\", \"hash\": \"" + _json_escape(_str(nd[1])) +
+                   "\", \"source_path\": \"" + _json_escape(_str(nd[2])) +
+                   "\"}" + comma + "\n")
+        i = i + 1
+    }
+    parts.push("  ],\n")
+
+    // edges
+    parts.push("  \"edges\": [\n")
+    let en = len(edges)
+    let mut e = 0
+    while e < en {
+        let ed = edges[e]
+        let comma = if e + 1 < en { "," } else { "" }
+        parts.push("    {\"src\": \"" + _json_escape(_str(ed[0])) +
+                   "\", \"dst\": \"" + _json_escape(_str(ed[1])) +
+                   "\", \"kind\": \"" + _json_escape(_str(ed[2])) +
+                   "\"}" + comma + "\n")
+        e = e + 1
+    }
+    parts.push("  ],\n")
+
+    // topo_order
+    parts.push("  \"topo_order\": [")
+    let tn = len(topo)
+    let mut t = 0
+    while t < tn {
+        let comma = if t + 1 < tn { ", " } else { "" }
+        parts.push("\"" + _json_escape(_str(topo[t])) + "\"" + comma)
+        t = t + 1
+    }
+    parts.push("],\n")
+
+    // cycles  (array of arrays)
+    parts.push("  \"cycles\": [")
+    let cn = len(cycles)
+    let mut ci = 0
+    while ci < cn {
+        let grp = cycles[ci]
+        let comma = if ci + 1 < cn { ", " } else { "" }
+        parts.push("[")
+        let mut gi = 0
+        while gi < len(grp) {
+            let gcomma = if gi + 1 < len(grp) { ", " } else { "" }
+            parts.push("\"" + _json_escape(_str(grp[gi])) + "\"" + gcomma)
+            gi = gi + 1
+        }
+        parts.push("]" + comma)
+        ci = ci + 1
+    }
+    parts.push("],\n")
+
+    // aggregate  (cycle_n kept for spec back-compat; cycles_n is the
+    // canonical ≥1-alarm field used by selftest S2).
+    parts.push("  \"aggregate\": {\n")
+    parts.push("    \"nodes_n\": " + _str(len(nodes)) + ",\n")
+    parts.push("    \"edges_n\": " + _str(len(edges)) + ",\n")
+    parts.push("    \"cycle_n\": " + _str(len(cycles)) + ",\n")
+    parts.push("    \"cycles_n\": " + _str(len(cycles)) + "\n")
+    parts.push("  },\n")
+
+    parts.push("  \"proof_hash\": \"" + proof_sha + "\",\n")
+    parts.push("  \"raw_strict\": \"raw#9 raw#10 raw#11 raw#15 deterministic LLM=none\"\n")
+    parts.push("}\n")
+    return parts.join("")
+}
+
+// Compose DAG from a list of (already extracted) cert entries.
+// Returns a positional array:
+//   [nodes, edges_sorted, topo, cycles, proof_hash]
+fn _build_dag(entries: array) -> array {
+    // Pass 1 — nodes.
+    let mut nodes = []
+    let mut seen_slug = []
+    for e in entries {
+        let slug = _entry_slug(e)
+        if slug == "" { continue }
+        let mut dup = false
+        for s in seen_slug {
+            if _str(s) == slug { dup = true; break }
+        }
+        if dup { continue }
+        seen_slug.push(slug)
+        let mut nd = []
+        nd.push(slug)
+        nd.push(_entry_current(e))
+        nd.push(_entry_path(e))
+        nodes.push(nd)
+    }
+
+    // Pass 2 — edges (resolve references against existing nodes).
+    let raw_edges = _build_edges(entries, nodes)
+    let edges = _sort_edges_canonical(raw_edges)
+
+    // Topo + cycles.
+    let tc = _topo_and_cycles(nodes, edges)
+    let topo = tc[0]
+    let cycles = tc[1]
+
+    // proof_hash = sha256 over canonical edge list.
+    let mut canon = ""
+    for ed in edges {
+        canon = canon + _str(ed[0]) + "|" + _str(ed[1]) + "|" + _str(ed[2]) + "\n"
+    }
+    let proof_sha = _sha256_of_string(canon)
+
+    let mut out = []
+    out.push(nodes)
+    out.push(edges)
+    out.push(topo)
+    out.push(cycles)
+    out.push(proof_sha)
+    return out
+}
+
+// ─── real-scan entrypoint ─────────────────────────────────────────────────
+
+fn _run_real_scan() -> int {
+    let repo = _repo_root()
+    println("cert_dag_generator — real scan")
+    println("  root: " + repo)
+
+    let paths = _scan_cert_paths(repo)
+    println("  cert files discovered: " + _str(len(paths)))
+
+    let mut entries = []
+    for p in paths {
+        let e = _extract_cert_entry(_str(p))
+        if len(e) == 0 { continue }
+        // Skip entries with no current_hash (pure index files etc).
+        if _entry_current(e) == "" && _entry_slug(e) == "" { continue }
+        entries.push(e)
+    }
+    println("  cert entries parsed:   " + _str(len(entries)))
+
+    let dag = _build_dag(entries)
+    let nodes = dag[0]
+    let edges = dag[1]
+    let topo = dag[2]
+    let cycles = dag[3]
+    let proof_sha = dag[4]
+
+    let body = _emit_dag_json(repo, nodes, edges, topo, cycles, proof_sha)
+
+    let out_dir = repo + "/state"
+    let _ = _mkdir_p(out_dir)
+    let out_path = out_dir + "/cert_dag.json"
+    write_file(out_path, body)
+
+    println("  nodes_n:      " + _str(len(nodes)))
+    println("  edges_n:      " + _str(len(edges)))
+    println("  cycles_n:     " + _str(len(cycles)))
+    println("  topo_order_n: " + _str(len(topo)))
+    println("  proof_hash:   " + proof_sha)
+    println("  ssot:         " + out_path)
+
+    return 0
+}
+
+// ─── inline selftest (S1 / S2 / S3) ───────────────────────────────────────
+
+fn _mk_entry(slug: string, current_hash: string, prev_hash: string,
+             depends_on: array, source_path: string) -> array {
+    let mut e = []
+    e.push(slug)
+    e.push(current_hash)
+    e.push(prev_hash)
+    e.push(depends_on)
+    e.push([])          // verify
+    e.push([])          // reaches
+    e.push([])          // cross_refs
+    e.push(source_path)
+    return e
+}
+
+fn _arr_contains(a: array, x: string) -> bool {
+    for v in a {
+        if _str(v) == x { return true }
+    }
+    return false
+}
+
+fn _idx_in(a: array, x: string) -> int {
+    let mut i = 0
+    while i < len(a) {
+        if _str(a[i]) == x { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// S1 — 4-node linear chain.  A → B → C → D (prev_hash chain + depends_on).
+// Expectation: topo_order resolves in A,B,C,D order and cycles_n == 0.
+fn _selftest_s1() -> bool {
+    println("")
+    println("── S1: synthetic linear chain (A→B→C→D) ──")
+    let mut entries = []
+    entries.push(_mk_entry("A", "hashA", "",      [],        "synthetic:A"))
+    entries.push(_mk_entry("B", "hashB", "hashA", ["A"],     "synthetic:B"))
+    entries.push(_mk_entry("C", "hashC", "hashB", ["B"],     "synthetic:C"))
+    entries.push(_mk_entry("D", "hashD", "hashC", ["C"],     "synthetic:D"))
+    let dag = _build_dag(entries)
+    let nodes = dag[0]
+    let edges = dag[1]
+    let topo  = dag[2]
+    let cycles = dag[3]
+    let proof_sha = dag[4]
+    println("  nodes_n=" + _str(len(nodes)) +
+            "  edges_n=" + _str(len(edges)) +
+            "  topo_n=" + _str(len(topo)) +
+            "  cycles_n=" + _str(len(cycles)))
+    println("  topo_order: " + _str(topo))
+    if len(cycles) != 0 {
+        println("  FAIL: cycles_n != 0 (got " + _str(len(cycles)) + ")")
+        return false
+    }
+    if len(topo) != 4 {
+        println("  FAIL: topo_n != 4 (got " + _str(len(topo)) + ")")
+        return false
+    }
+    // topo order must place A before B before C before D.
+    let ia = _idx_in(topo, "A")
+    let ib = _idx_in(topo, "B")
+    let ic = _idx_in(topo, "C")
+    let id = _idx_in(topo, "D")
+    if ia < 0 || ib < 0 || ic < 0 || id < 0 {
+        println("  FAIL: missing node in topo_order")
+        return false
+    }
+    if !(ia < ib && ib < ic && ic < id) {
+        println("  FAIL: topo order violates A<B<C<D")
+        return false
+    }
+    if proof_sha == "" {
+        println("  FAIL: proof_hash empty")
+        return false
+    }
+    println("  PASS")
+    return true
+}
+
+// S2 — cycle A→B→A.  Expectation: cycles_n ≥ 1 and topo_order is empty or
+// partial (strict: does NOT contain A or B since both are inside the cycle).
+fn _selftest_s2() -> bool {
+    println("")
+    println("── S2: synthetic cycle (A→B→A) ──")
+    let mut entries = []
+    // A depends_on B  (B→A)
+    // B depends_on A  (A→B) → forms cycle
+    entries.push(_mk_entry("A", "hA", "", ["B"], "synthetic:A"))
+    entries.push(_mk_entry("B", "hB", "", ["A"], "synthetic:B"))
+    let dag = _build_dag(entries)
+    let nodes = dag[0]
+    let edges = dag[1]
+    let topo  = dag[2]
+    let cycles = dag[3]
+    println("  nodes_n=" + _str(len(nodes)) +
+            "  edges_n=" + _str(len(edges)) +
+            "  topo_n=" + _str(len(topo)) +
+            "  cycles_n=" + _str(len(cycles)))
+    println("  topo_order: " + _str(topo))
+    println("  cycles: " + _str(cycles))
+    if len(cycles) < 1 {
+        println("  FAIL: cycles_n < 1")
+        return false
+    }
+    // topo must NOT contain any member of the cycle.
+    if _arr_contains(topo, "A") || _arr_contains(topo, "B") {
+        println("  FAIL: cycle member leaked into topo_order")
+        return false
+    }
+    // With only {A,B} both in the cycle → topo should be empty.
+    if len(topo) != 0 {
+        println("  FAIL: topo_order expected empty for pure-cycle fixture")
+        return false
+    }
+    println("  PASS")
+    return true
+}
+
+// S3 — real .meta2-cert scan.  Expectation: DAG produced, cycles_n == 0,
+// nodes_n > 0.  Uses the live repo (read-only).
+fn _selftest_s3() -> bool {
+    println("")
+    println("── S3: real .meta2-cert scan ──")
+    let repo = _repo_root()
+    let paths = _scan_cert_paths(repo)
+    println("  cert files discovered: " + _str(len(paths)))
+    if len(paths) == 0 {
+        println("  FAIL: no cert files discovered under " + repo)
+        return false
+    }
+    let mut entries = []
+    for p in paths {
+        let e = _extract_cert_entry(_str(p))
+        if len(e) == 0 { continue }
+        if _entry_current(e) == "" && _entry_slug(e) == "" { continue }
+        entries.push(e)
+    }
+    let dag = _build_dag(entries)
+    let nodes = dag[0]
+    let edges = dag[1]
+    let topo  = dag[2]
+    let cycles = dag[3]
+    let proof_sha = dag[4]
+    println("  nodes_n=" + _str(len(nodes)) +
+            "  edges_n=" + _str(len(edges)) +
+            "  topo_n=" + _str(len(topo)) +
+            "  cycles_n=" + _str(len(cycles)))
+    println("  proof_hash: " + proof_sha)
+    if len(nodes) == 0 {
+        println("  FAIL: nodes_n == 0 after real scan")
+        return false
+    }
+    if len(cycles) != 0 {
+        println("  FAIL: cycles_n != 0 on real corpus (got " +
+                _str(len(cycles)) + ")")
+        return false
+    }
+    if proof_sha == "" {
+        println("  FAIL: proof_hash empty")
+        return false
+    }
+    println("  PASS")
+    return true
+}
+
+fn _run_selftest() -> int {
+    println("cert_dag_generator — inline selftest (S1/S2/S3)")
+    let mut pass = 0
+    let mut fail = 0
+    if _selftest_s1() { pass = pass + 1 } else { fail = fail + 1 }
+    if _selftest_s2() { pass = pass + 1 } else { fail = fail + 1 }
+    if _selftest_s3() { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    println("── selftest summary ──")
+    println("  PASS: " + _str(pass) + "/3")
+    println("  FAIL: " + _str(fail) + "/3")
+    if fail == 0 {
+        println("cert_dag_generator: 3/3 selftest PASS")
+        return 0
+    }
+    println("cert_dag_generator: selftest FAIL")
+    return 1
+}
+
+// ─── help ─────────────────────────────────────────────────────────────────
+
+fn _print_help() {
+    println("usage: hexa tool/cert_dag_generator.hexa [opts]")
+    println("  (no args)     real scan + write state/cert_dag.json")
+    println("  --selftest    inline 3/3 selftest (S1 linear, S2 cycle, S3 real)")
+    println("  --help        show this help")
+    println("")
+    println("env (raw#15 no-hardcode):")
+    println("  CERT_DAG_REPO_ROOT   override repo root used for file discovery")
+    println("")
+    println("cert sources scanned (relative to root):")
+    println("  .meta2-cert/*.json")
+    println("  shared/state/*cert*.json")
+    println("  state/*cert*.json")
+}
+
+// ─── main ─────────────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") || _flag(av, "-h") {
+        _print_help()
+        return 0
+    }
+    if _flag(av, "--selftest") {
+        return _run_selftest()
+    }
+    return _run_real_scan()
+}
+
+main()
