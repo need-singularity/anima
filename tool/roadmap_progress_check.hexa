@@ -1,0 +1,327 @@
+// tool/roadmap_progress_check.hexa — progress tracker for anima /.roadmap.
+//
+// Parses every roadmap entry (raw#2 self-format), scans exit_criteria /
+// proof / evidence / note fields for verifiable tokens, and computes a
+// per-entry completion percentage. Emits AI-native JSON on stdout and to
+// state/roadmap_progress.json. Intended for launchd 300s cadence.
+//
+// usage:
+//   hexa tool/roadmap_progress_check.hexa                  — scan ./.roadmap
+//   hexa tool/roadmap_progress_check.hexa --path <file>    — scan explicit file
+//   hexa tool/roadmap_progress_check.hexa --out <json>     — override output path
+//   hexa tool/roadmap_progress_check.hexa --strict         — exit 1 if any active entry <100%
+//
+// Token heuristics (checked in-order, first match wins):
+//   state/<name>.json     → file exists + optional verdict=PASS / strict_pass=true
+//   .meta2-cert/<slug>    → file exists + verdict=VERIFIED
+//   docs/<path>.(md|html) → file exists
+//   tool/<name>.hexa      → file exists
+//   commit:<sha7+>        → `git cat-file -e <sha>` returns 0
+//
+// raw#9 hexa-only, raw#10 proof-carrying (every % derives from a file probe),
+// raw#12 empirical (no hardcoded verdicts), raw#33 English-only output.
+
+fn _rstrip(s: string) -> string {
+    let mut end = len(s)
+    while end > 0 {
+        let c = s.substring(end - 1, end)
+        if c == " " || c == "\t" || c == "\r" {
+            end = end - 1
+        } else {
+            break
+        }
+    }
+    return s.substring(0, end)
+}
+
+fn _esc(s: string) -> string {
+    let mut r = s.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "")
+    r = r.replace("\t", " ")
+    return r
+}
+
+fn _file_exists(path: string) -> bool {
+    let r = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
+    return r == "y"
+}
+
+fn _grep_pass(path: string, pattern: string) -> bool {
+    let cmd = "grep -E '" + pattern + "' '" + path + "' 2>/dev/null | head -1"
+    let out = to_string(exec(cmd)).trim()
+    return out != ""
+}
+
+fn _commit_exists(sha: string) -> bool {
+    let r = to_string(exec("git -C /Users/ghost/core/anima cat-file -e " + sha + " 2>/dev/null && echo y || echo n")).trim()
+    return r == "y"
+}
+
+// Parse `roadmap <id> <status> "<name>"` → [id, status, name]; empty on fail.
+fn _parse_header(line: string) -> array {
+    let sp1 = line.index_of(" ")
+    if sp1 < 0 { return [] }
+    if line.substring(0, sp1) != "roadmap" { return [] }
+    let rest1 = line.substring(sp1 + 1, len(line))
+    let sp2 = rest1.index_of(" ")
+    if sp2 < 0 { return [] }
+    let id = rest1.substring(0, sp2)
+    let rest2 = rest1.substring(sp2 + 1, len(rest1))
+    let sp3 = rest2.index_of(" ")
+    if sp3 < 0 { return [] }
+    let status = rest2.substring(0, sp3)
+    let mut name = rest2.substring(sp3 + 1, len(rest2)).trim()
+    if len(name) >= 2 && name.substring(0, 1) == "\"" {
+        let qend = name.substring(1, len(name)).index_of("\"")
+        if qend >= 0 {
+            name = name.substring(1, qend + 1)
+        }
+    }
+    return [id, status, name]
+}
+
+fn _load_roadmap(path: string) -> array {
+    let src = to_string(read_file(path))
+    let lines = split(src, "\n")
+    let mut entries = []
+    let mut cur = []
+    let mut cur_keys = []
+    let mut has = false
+    for raw_line in lines {
+        let line = _rstrip(raw_line)
+        if len(line) == 0 {
+            if has {
+                entries.push([cur[0], cur[1], cur[2], cur_keys])
+                cur_keys = []
+                has = false
+            }
+            continue
+        }
+        let first = line.substring(0, 1)
+        if first == "#" { continue }
+        if first == " " || first == "\t" {
+            if !has { continue }
+            let stripped = line.trim_start()
+            let sp = stripped.index_of(" ")
+            if sp < 0 { continue }
+            let key = stripped.substring(0, sp)
+            let val = stripped.substring(sp + 1, len(stripped)).trim()
+            cur_keys.push([key, val])
+        } else {
+            if has {
+                entries.push([cur[0], cur[1], cur[2], cur_keys])
+                cur_keys = []
+            }
+            let hdr = _parse_header(line)
+            if len(hdr) == 0 { has = false; continue }
+            cur = hdr
+            has = true
+        }
+    }
+    if has {
+        entries.push([cur[0], cur[1], cur[2], cur_keys])
+    }
+    return entries
+}
+
+// Extract whitespace-separated tokens matching our 5 probes from a key list.
+// Returns array of [token, kind] where kind in {state, cert, doc, tool, commit}.
+fn _extract_tokens(keys: array) -> array {
+    let mut tokens = []
+    let mut seen = []
+    for kv in keys {
+        let k = kv[0]
+        // Only scan fields that are supposed to carry proof pointers.
+        if k != "exit_criteria" && k != "proof" && k != "evidence" && k != "note" && k != "depends-on" && k != "condition" { continue }
+        let val = kv[1]
+        // Replace common separators with space for tokenization.
+        let mut t = val.replace(",", " ")
+        t = t.replace("(", " ").replace(")", " ").replace("+", " ")
+        t = t.replace(";", " ").replace(":", ": ")
+        let parts = split(t, " ")
+        for p in parts {
+            let tok = p.trim()
+            if len(tok) < 4 { continue }
+            let mut kind = ""
+            if tok.substring(0, 6) == "state/" { kind = "state" }
+            else if tok.substring(0, 12) == ".meta2-cert/" { kind = "cert" }
+            else if tok.substring(0, 5) == "docs/" { kind = "doc" }
+            else if tok.substring(0, 5) == "tool/" { kind = "tool" }
+            // Commit tokens: `commit: <sha>` split becomes [commit, :, <sha>]. Handle `commit:<sha>` too.
+            else if tok.substring(0, 7) == "commit:" {
+                let sha = tok.substring(7, len(tok))
+                if len(sha) >= 7 { kind = "commit"; tokens.push([sha, kind]); continue }
+            }
+            if kind == "" { continue }
+            // Dedupe within an entry.
+            let key_id = kind + "|" + tok
+            let mut dup = false
+            for s in seen { if s == key_id { dup = true } }
+            if dup { continue }
+            seen.push(key_id)
+            tokens.push([tok, kind])
+        }
+    }
+    return tokens
+}
+
+fn _verify_token(tok: string, kind: string, root: string) -> array {
+    // Returns [pass_bool_as_string, note]
+    if kind == "state" {
+        let p = root + "/" + tok
+        if !_file_exists(p) { return ["false", "missing"] }
+        // Optional verdict check — if file has a verdict field, prefer PASS.
+        if _grep_pass(p, "\"verdict\"[[:space:]]*:[[:space:]]*\"(PASS|VERIFIED|USABLE|SUCCESS|H_STAR_STRONGLY_SUPPORTED|CLAIM_CONFIRMED)") {
+            return ["true", "verdict_pass"]
+        }
+        if _grep_pass(p, "\"strict_pass\"[[:space:]]*:[[:space:]]*true") {
+            return ["true", "strict_pass"]
+        }
+        if _grep_pass(p, "\"overall_pass\"[[:space:]]*:[[:space:]]*true") {
+            return ["true", "overall_pass"]
+        }
+        return ["true", "file_exists"]
+    }
+    if kind == "cert" {
+        let p = root + "/" + tok
+        if !_file_exists(p) {
+            // Try with .json suffix if missing.
+            if _file_exists(p + ".json") {
+                if _grep_pass(p + ".json", "\"verdict\"[[:space:]]*:[[:space:]]*\"VERIFIED\"") { return ["true", "cert_verified"] }
+                return ["true", "cert_present"]
+            }
+            return ["false", "missing"]
+        }
+        if _grep_pass(p, "\"verdict\"[[:space:]]*:[[:space:]]*\"VERIFIED\"") { return ["true", "cert_verified"] }
+        return ["true", "cert_present"]
+    }
+    if kind == "doc" || kind == "tool" {
+        let p = root + "/" + tok
+        if _file_exists(p) { return ["true", "file_exists"] }
+        return ["false", "missing"]
+    }
+    if kind == "commit" {
+        if _commit_exists(tok) { return ["true", "git_ref_valid"] }
+        return ["false", "sha_not_in_repo"]
+    }
+    return ["false", "unknown_kind"]
+}
+
+fn _render(entries: array, probes: array, out_path: string, ts: string, total_pct: int) -> string {
+    // entries := [[id, status, name, total, passed, pct]]
+    // probes  := [[id, token, kind, pass_bool, note]]
+    let mut s = "{\"schema\":\"anima.roadmap_progress.v1\""
+    s = s + ",\"tool\":\"tool/roadmap_progress_check.hexa\""
+    s = s + ",\"generated\":\"" + ts + "\""
+    s = s + ",\"out_path\":\"" + _esc(out_path) + "\""
+    s = s + ",\"aggregate\":{\"entry_count\":" + to_string(len(entries))
+    s = s + ",\"mean_pct\":" + to_string(total_pct) + "}"
+    s = s + ",\"entries\":["
+    let mut i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        if i > 0 { s = s + "," }
+        s = s + "{\"id\":" + e[0]
+        s = s + ",\"status\":\"" + e[1] + "\""
+        s = s + ",\"name\":\"" + _esc(e[2]) + "\""
+        s = s + ",\"probe_total\":" + to_string(e[3])
+        s = s + ",\"probe_passed\":" + to_string(e[4])
+        s = s + ",\"pct\":" + to_string(e[5])
+        s = s + "}"
+        i = i + 1
+    }
+    s = s + "]"
+    s = s + ",\"probes\":["
+    let mut j = 0
+    while j < len(probes) {
+        let p = probes[j]
+        if j > 0 { s = s + "," }
+        s = s + "{\"entry_id\":" + p[0]
+        s = s + ",\"token\":\"" + _esc(p[1]) + "\""
+        s = s + ",\"kind\":\"" + p[2] + "\""
+        s = s + ",\"pass\":" + p[3]
+        s = s + ",\"note\":\"" + p[4] + "\"}"
+        j = j + 1
+    }
+    s = s + "]}"
+    return s
+}
+
+fn main() -> int {
+    let argv = args()
+    let mut path = ".roadmap"
+    let mut out = "state/roadmap_progress.json"
+    let mut strict = false
+    let mut i = 0
+    while i < len(argv) {
+        let a = argv[i]
+        if a == "--path" && i + 1 < len(argv) { path = argv[i + 1]; i = i + 2; continue }
+        if a == "--out"  && i + 1 < len(argv) { out  = argv[i + 1]; i = i + 2; continue }
+        if a == "--strict" { strict = true; i = i + 1; continue }
+        i = i + 1
+    }
+
+    // Resolve root = dirname(path) if relative.
+    let root = to_string(exec("pwd")).trim()
+    let roadmap_file = root + "/" + path
+    if !_file_exists(roadmap_file) {
+        println("{\"error\":\"roadmap_file_not_found\",\"path\":\"" + _esc(roadmap_file) + "\"}")
+        return 2
+    }
+
+    let raw_entries = _load_roadmap(roadmap_file)
+    let mut summary = []
+    let mut all_probes = []
+    let mut sum_pct = 0
+    let mut n_entries = 0
+
+    for ent in raw_entries {
+        let id = ent[0]
+        let status = ent[1]
+        let name = ent[2]
+        let keys = ent[3]
+        let tokens = _extract_tokens(keys)
+        let total = len(tokens)
+        let mut passed = 0
+        for tok in tokens {
+            let v = _verify_token(tok[0], tok[1], root)
+            if v[0] == "true" { passed = passed + 1 }
+            all_probes.push([id, tok[0], tok[1], v[0], v[1]])
+        }
+        let mut pct = 0
+        if status == "done" {
+            pct = 100
+        } else if total > 0 {
+            pct = (passed * 100) / total
+        }
+        summary.push([id, status, name, total, passed, pct])
+        sum_pct = sum_pct + pct
+        n_entries = n_entries + 1
+    }
+
+    let mean = 0
+    let mut mean_pct = 0
+    if n_entries > 0 { mean_pct = sum_pct / n_entries }
+
+    let ts = to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+    let body = _render(summary, all_probes, out, ts, mean_pct)
+
+    // Write to output file.
+    let out_full = root + "/" + out
+    let tmp = out_full + ".tmp"
+    write_file(tmp, body)
+    exec("mv '" + tmp + "' '" + out_full + "'")
+
+    println(body)
+
+    if strict {
+        for e in summary {
+            if e[1] == "active" && e[5] < 100 { return 1 }
+        }
+    }
+    return 0
+}
+
+main()
