@@ -49,32 +49,31 @@
 
 ## Install
 
-Anima runs on [hexa-lang](https://github.com/need-singularity/hexa-lang). Install that first, then:
-
 ```bash
-# 1. Install hexa-lang (the compiler Anima uses)
+# 1. Install hexa-lang (gives you `hexa` + `hx` package manager)
 curl -fsSL https://raw.githubusercontent.com/need-singularity/hexa-lang/main/install.sh | bash
 
-# 2. Clone Anima
-git clone https://github.com/need-singularity/anima.git
-cd anima
-
-# 3. Run
-hexa run.hexa --cli          # CLI agent
-hexa run.hexa --mcp --direct # MCP server (9 tools)
-hexa run.hexa --telegram     # Telegram (needs ANIMA_TELEGRAM_TOKEN)
-hexa run.hexa --discord      # Discord  (needs ANIMA_DISCORD_TOKEN)
-hexa run.hexa --slack        # Slack    (needs ANIMA_SLACK_TOKEN + SIGNING_SECRET)
-hexa run.hexa --all          # Auto-detect channels from env
+# 2. Install anima
+hx install anima
 ```
 
-Or use Docker for the full stack (web + agent + dashboard):
+## Run
 
 ```bash
-docker compose up            # anima-web:8765, anima-agent:8766, dashboard:8770
+anima              # CLI agent
+anima --mcp        # MCP server (9 tools)
+anima --telegram   # Telegram bot (needs ANIMA_TELEGRAM_TOKEN)
+anima --discord    # Discord  bot (needs ANIMA_DISCORD_TOKEN)
+anima --slack      # Slack    bot (needs ANIMA_SLACK_TOKEN + ANIMA_SLACK_SIGNING_SECRET)
+anima --all        # Auto-detect channels from env
+anima --dashboard  # Launch dashboard bridge (http://localhost:3000)
 ```
 
-Dashboard: `hexa dashboard_bridge.hexa --port 8770 --agent` → open [http://localhost:3000](http://localhost:3000).
+Or use Docker for the full stack:
+
+```bash
+docker compose up  # anima-web:8765 + anima-agent:8766 + dashboard:8770
+```
 
 ## Architecture
 
