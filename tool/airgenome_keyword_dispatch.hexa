@@ -1,0 +1,312 @@
+// tool/airgenome_keyword_dispatch.hexa — airgenome keyword auto-dispatcher
+//
+// PURPOSE
+//   airgenome is the ops event bus (hook framework, .roadmap session landing
+//   7af142fb). This tool wires a keyword → hexa-tool dispatch plan: an
+//   airgenome event (JSON) is scanned for configured keywords, and each
+//   match produces an invocation plan entry `{keyword, tool, args}`. In
+//   dry-run mode (default) the plan is printed only; with `--apply` the
+//   planned invocations would be executed (placeholder — plan emission is
+//   the L0 deliverable; executor is a follow-up).
+//
+// SCOPE
+//   Cluster #34 improvement #22 — cluster-local L0 landing. Tool paths in
+//   the mapping MAY be placeholders (not yet materialised); the dispatch
+//   plan itself is the unit of value, consumed by callers or by the
+//   apply-path once the downstream tools land.
+//
+// USAGE
+//   hexa tool/airgenome_keyword_dispatch.hexa --event <path>
+//   cat event.json | hexa tool/airgenome_keyword_dispatch.hexa --event -
+//   hexa tool/airgenome_keyword_dispatch.hexa --event <path> --apply
+//   hexa tool/airgenome_keyword_dispatch.hexa --self-test
+//
+// EVENT JSON — accepted shapes:
+//   { "type": "...", "message": "...", "tags": ["...", "..."] }
+//     — any / all of those fields may be present. Matching is performed
+//       over the concatenation `type + " " + message + " " + tags(space-joined)`
+//       so a single substring probe covers all three.
+//
+// MATCH SEMANTICS
+//   - substring (case-sensitive) via string.index_of — deterministic (raw#9).
+//   - Each configured rule matches independently; multiple rules can fire
+//     from a single event. Output plan preserves rule order from config.
+//   - No regex (keeps deterministic scope tight; a later improvement may
+//     extend to regex when stage0 supports it uniformly).
+//
+// OUTPUT (stdout)
+//   dry-run: one human line per plan entry + a "plan entries=<N>" summary
+//            and a trailing JSON line:
+//              {"mode":"dry-run","plan":[{"keyword":"...","tool":"...","args":[...]}]}
+//   apply:   same + per-entry "would-execute: <tool> <args>" (actual exec
+//            gated behind a real executor hook, not wired in L0).
+//
+// V8 SAFE_COMMIT: new file only, additive. No mutation of any SSOT.
+//   No network, no LLM, no filesystem writes outside /tmp during self-test.
+
+// DEFAULT_CONFIG resolution order (first existing wins; cwd-relative so
+// the tool works from any anima worktree without hardcoded prefixes):
+//   1. config/airgenome_keyword_dispatch_config.json    — logical namespace (may be gitignored; nexus/shared mirror)
+//   2. config/airgenome_keyword_dispatch_config.json           — committed fallback
+// Callers can always override with --config <path>.
+let DEFAULT_CONFIG_SHARED = "config/airgenome_keyword_dispatch_config.json"
+let DEFAULT_CONFIG_LOCAL  = "config/airgenome_keyword_dispatch_config.json"
+
+// ─── helpers (argv / io / json) ─────────────────────────────────────
+
+fn _sh_quote(s: string) -> string { let mut o = "'"; o = o + s.replace("'", "'\\''"); o = o + "'"; return o }
+fn _file_exists(p: string) -> bool { return exec_with_status("test -e " + _sh_quote(p))[1] == 0 }
+fn _json_escape(s: string) -> string { return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") }
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+fn _flag(av, k) -> bool { for x in av { if to_string(x) == k { return true } }; return false }
+fn _opt(av, k, d) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && i + 1 < len(av) { return to_string(av[i + 1]) }
+        i = i + 1
+    }
+    return d
+}
+
+fn _load_config(p: string) {
+    if !_file_exists(p) { eprintln("airgenome_keyword_dispatch: config missing: " + p); exit(2) }
+    return json_parse(read_file(p))
+}
+
+// Read event JSON from file path or "-" (stdin).
+fn _load_event(src: string) {
+    if src == "-" {
+        let raw = read_stdin()
+        return json_parse(raw)
+    }
+    if !_file_exists(src) { eprintln("airgenome_keyword_dispatch: event missing: " + src); exit(2) }
+    return json_parse(read_file(src))
+}
+
+// Flatten event payload into a single searchable haystack string.
+// Tolerates missing fields (empty string).
+fn _event_haystack(ev) -> string {
+    let mut out = ""
+    let ks = keys(ev)
+    let mut i = 0
+    while i < len(ks) {
+        if ks[i] == "type"    { out = out + " " + to_string(ev["type"]) }
+        if ks[i] == "message" { out = out + " " + to_string(ev["message"]) }
+        if ks[i] == "tags" {
+            let tags = ev["tags"]
+            let mut j = 0
+            while j < len(tags) { out = out + " " + to_string(tags[j]); j = j + 1 }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Render args array → space-joined string for human-readable plan line.
+fn _args_str(arr) -> string {
+    let mut s = ""
+    let mut i = 0
+    while i < len(arr) {
+        if i > 0 { s = s + " " }
+        s = s + to_string(arr[i])
+        i = i + 1
+    }
+    return s
+}
+
+// Render args array → JSON array payload (inner, no brackets).
+fn _args_json(arr) -> string {
+    let mut s = ""
+    let mut i = 0
+    while i < len(arr) {
+        if i > 0 { s = s + ", " }
+        s = s + "\"" + _json_escape(to_string(arr[i])) + "\""
+        i = i + 1
+    }
+    return s
+}
+
+// ─── core: build plan from (config, event) ──────────────────────────
+
+fn build_plan(cfg, ev) -> array {
+    let haystack = _event_haystack(ev)
+    let rules = cfg["rules"]
+    let mut plan = []
+    let mut i = 0
+    while i < len(rules) {
+        let r = rules[i]
+        let kw = to_string(r["keyword"])
+        if haystack.index_of(kw) >= 0 {
+            plan.push(r)
+        }
+        i = i + 1
+    }
+    return plan
+}
+
+fn emit_plan(plan, apply_mode: bool) {
+    let mode_tag = if apply_mode { "apply" } else { "dry-run" }
+    println("airgenome_keyword_dispatch: mode=" + mode_tag + " plan_entries=" + to_string(len(plan)))
+    let mut i = 0
+    while i < len(plan) {
+        let r = plan[i]
+        let kw   = to_string(r["keyword"])
+        let tool = to_string(r["tool"])
+        let args_arr = if has_key(r, "args") { r["args"] } else { [] }
+        let astr = _args_str(args_arr)
+        println("  [" + to_string(i) + "] keyword=" + kw + " → " + tool + " " + astr)
+        if apply_mode {
+            println("      would-execute: hexa " + tool + " " + astr)
+        }
+        i = i + 1
+    }
+    // Trailing machine-readable JSON line.
+    let mut jline = "{\"mode\":\"" + mode_tag + "\",\"plan\":["
+    let mut j = 0
+    while j < len(plan) {
+        if j > 0 { jline = jline + "," }
+        let r = plan[j]
+        let args_arr = if has_key(r, "args") { r["args"] } else { [] }
+        jline = jline + "{\"keyword\":\"" + _json_escape(to_string(r["keyword"])) + "\""
+        jline = jline + ",\"tool\":\"" + _json_escape(to_string(r["tool"])) + "\""
+        jline = jline + ",\"args\":[" + _args_json(args_arr) + "]}"
+        j = j + 1
+    }
+    jline = jline + "]}"
+    println(jline)
+}
+
+// ─── self-test: S1 match, S2 no-match, S3 multi-keyword ─────────────
+
+fn _write_tmp_event(path: string, body: string) {
+    let _r = exec_with_status("rm -f " + _sh_quote(path))
+    write_file(path, body)
+}
+
+fn _assert_plan_len(label: string, plan, want: int) -> int {
+    if len(plan) != want {
+        eprintln("  FAIL " + label + " plan_len=" + to_string(len(plan)) + " want=" + to_string(want))
+        return 1
+    }
+    return 0
+}
+
+fn _assert_plan_has(label: string, plan, want_kw: string) -> int {
+    let mut i = 0
+    while i < len(plan) {
+        if to_string(plan[i]["keyword"]) == want_kw { return 0 }
+        i = i + 1
+    }
+    eprintln("  FAIL " + label + " missing keyword=" + want_kw)
+    return 1
+}
+
+fn _assert_plan_idx(label: string, plan, idx: int, want_kw: string) -> int {
+    if idx >= len(plan) {
+        eprintln("  FAIL " + label + " idx=" + to_string(idx) + " out of range")
+        return 1
+    }
+    let got = to_string(plan[idx]["keyword"])
+    if got != want_kw {
+        eprintln("  FAIL " + label + " idx=" + to_string(idx) + " kw=" + got + " want=" + want_kw)
+        return 1
+    }
+    return 0
+}
+
+fn self_test(cfg) -> int {
+    println("── airgenome_keyword_dispatch self-test ──")
+    let mut fails = 0
+
+    // S1 — "h100_idle" in event.type → plan = [h100_auto_kill]
+    let s1_path = "/tmp/airgenome_kw_s1.json"
+    _write_tmp_event(s1_path, "{\"type\":\"h100_idle\",\"message\":\"gpu utilisation 0% for 15min\",\"tags\":[\"gpu\",\"idle\"]}\n")
+    let ev1   = _load_event(s1_path)
+    let plan1 = build_plan(cfg, ev1)
+    emit_plan(plan1, false)
+    fails = fails + _assert_plan_len("S1", plan1, 1)
+    if len(plan1) >= 1 {
+        fails = fails + _assert_plan_idx("S1", plan1, 0, "h100_idle")
+        let got_tool = to_string(plan1[0]["tool"])
+        if got_tool != "tool/h100_auto_kill.hexa" {
+            eprintln("  FAIL S1 tool=" + got_tool + " want=tool/h100_auto_kill.hexa")
+            fails = fails + 1
+        }
+    }
+    if fails == 0 { println("  S1 PASS: plan=[h100_auto_kill]") }
+
+    // S2 — no configured keyword present → plan = []
+    let s2_path = "/tmp/airgenome_kw_s2.json"
+    _write_tmp_event(s2_path, "{\"type\":\"heartbeat\",\"message\":\"daemon ok\",\"tags\":[\"ping\"]}\n")
+    let ev2   = _load_event(s2_path)
+    let plan2 = build_plan(cfg, ev2)
+    emit_plan(plan2, false)
+    let s2_fails_before = fails
+    fails = fails + _assert_plan_len("S2", plan2, 0)
+    if fails == s2_fails_before { println("  S2 PASS: plan=[] (no match)") }
+
+    // S3 — event carries multiple keywords → plan preserves config order.
+    // Config order is: h100_idle (0), cert_updated (1), corpus_added (2).
+    // Event triggers cert_updated + corpus_added → plan length 2, order
+    // [cert_updated, corpus_added] per config rule order.
+    let s3_path = "/tmp/airgenome_kw_s3.json"
+    _write_tmp_event(s3_path, "{\"type\":\"batch\",\"message\":\"corpus_added and cert_updated in same cycle\",\"tags\":[\"multi\"]}\n")
+    let ev3   = _load_event(s3_path)
+    let plan3 = build_plan(cfg, ev3)
+    emit_plan(plan3, false)
+    let s3_fails_before = fails
+    fails = fails + _assert_plan_len("S3", plan3, 2)
+    if len(plan3) >= 2 {
+        fails = fails + _assert_plan_idx("S3", plan3, 0, "cert_updated")
+        fails = fails + _assert_plan_idx("S3", plan3, 1, "corpus_added")
+    }
+    if fails == s3_fails_before { println("  S3 PASS: plan=[cert_updated, corpus_added] (config-order preserved)") }
+
+    // cleanup
+    let _c1 = exec_with_status("rm -f " + _sh_quote(s1_path))
+    let _c2 = exec_with_status("rm -f " + _sh_quote(s2_path))
+    let _c3 = exec_with_status("rm -f " + _sh_quote(s3_path))
+
+    let mut passed = 3 - fails
+    if passed < 0 { passed = 0 }
+    if fails == 0 {
+        println("airgenome_keyword_dispatch self-test: 3/3 PASS")
+        return 0
+    }
+    println("airgenome_keyword_dispatch self-test: " + to_string(passed) + "/3 (fails=" + to_string(fails) + ")")
+    return 1
+}
+
+// ─── entry ──────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") {
+        println("usage: hexa tool/airgenome_keyword_dispatch.hexa --event <path|-> [--config <path>] [--apply]")
+        println("       hexa tool/airgenome_keyword_dispatch.hexa --self-test")
+        return 0
+    }
+    let mut cfg_path = _opt(av, "--config", "")
+    if cfg_path == "" {
+        if _file_exists(DEFAULT_CONFIG_SHARED) { cfg_path = DEFAULT_CONFIG_SHARED }
+        else { cfg_path = DEFAULT_CONFIG_LOCAL }
+    }
+    let cfg = _load_config(cfg_path)
+    if _flag(av, "self-test") || _flag(av, "--self-test") { return self_test(cfg) }
+    let event_src = _opt(av, "--event", "")
+    if event_src == "" { eprintln("--event <path|-> required (or --self-test)"); return 2 }
+    let ev = _load_event(event_src)
+    let plan = build_plan(cfg, ev)
+    let apply_mode = _flag(av, "--apply")
+    emit_plan(plan, apply_mode)
+    return 0
+}
+
+main()
