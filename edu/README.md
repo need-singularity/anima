@@ -610,7 +610,7 @@ Path β 는 canonical MAIN 이며, α (Grand Hybrid) 는 fallback, γ (External 
 | cell↔token bridge spec | ✅ landed | b8662bed | ablation C CONDITIONAL_PASS 채택 |
 | **Bridge PoC impl** | ✅ **completed** | **56205445** | **3/3 fixture PASS, drift 0.0 within bound 2e-4, CONDITIONAL_PASS** |
 | **learning_free_driver** | ✅ **overall_pass=true** | **f2d96d45** | **STAGE 1-4 전부 PASS, weight hash invariant, AN11 no-train 2/3 (a FAIL_EXPECTED, b+c PASS)** |
-| flops_landauer_bench | 🔄 in_progress (task 34) | — | 60-80×/51× 실측 wrapper |
+| **flops_landauer_bench** | ✅ **CLAIM_CONFIRMED_CELL_BETTER** | **c5e45e98** | **FLOPs 178.30× EXCEEDS claim 60-80×, Landauer 42.68× IN_BAND claim 51×** |
 | **shared/bench criteria SSOT** | ✅ **RESOLVED** | **f5720d5c** | **Hidden Blocker #0 해제** (an11_a/b/c criteria + 20 test prompts) |
 | G2+G5 FAIL fix loop | 🔄 in_progress (task 31) | — | strict PASS target |
 | EXP-2 L_IX 5-term stress | ✅ completed | b8ba5593 | H★ WEAK_OR_NONE at δ=0.01 |
