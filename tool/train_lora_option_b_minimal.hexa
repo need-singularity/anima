@@ -1,0 +1,855 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/train_lora_option_b_minimal.hexa — Option B P1 MINIMAL PoC
+//
+//  PURPOSE
+//    Cell-first pivot first step.  Add λ·I_irr regularizer term to LoRA
+//    fine-tune as a MINIMAL variation of `edu/lora/train_lora_cpu.hexa`:
+//
+//        loss_total = loss_ce − β_i · λ · I_irr_step
+//
+//        I_irr_step = |ΔW| / (|ΔW| + jitter_floor),    ΔW ≤ 0 ⇒ 0
+//        ΔW = ‖A_t − A_{t-1}‖₁ + ‖B_t − B_{t-1}‖₁   (L1 norm of adapter step)
+//
+//    Sign convention:  L_IX has +λ·I_irr (forward drift reward);
+//    loss uses −β_i·λ·I_irr so a positive I_irr pulls loss DOWN
+//    (encouraging drift).  β_i = 0.1, λ = 1.0 (defaults from
+//    `shared/config/option_b_minimal_config.json`).
+//
+//  MINIMAL vs HYBRID
+//    MINIMAL (this tool):   I_irr is *computed + reported + subtracted from
+//                           the reported loss*, but the gradient remains
+//                           pure ∂CE/∂params.  Zero invasiveness to SGD
+//                           pipeline; measures what the term would buy.
+//    HYBRID  (P2 future):   ∂I_irr/∂params coupled into gradient (ΔW-level
+//                           regularizer back-prop).  Deferred — requires
+//                           tensor-path surgery, out of PoC scope.
+//
+//  MEASUREMENT
+//    - val_loss (CE)           per run
+//    - loss_total              per run (CE − β_i·λ·mean(I_irr))
+//    - I_irr_step[1..N]        per step tracking
+//    - Landauer bit erasure    = ΔCE · n_pairs / ln(2)        (bit-equivalent)
+//                                kT ln 2 per bit ≈ 2.870e-21 J at 300 K
+//      ref Seed ι : cell 658‰, LoRA ~13‰, 51× advantage.  MINIMAL target:
+//                   5-10× improvement over baseline (ideal); smoke scaled.
+//
+//  RAW compliance
+//    raw#9  hexa-only ✓
+//    raw#11 snake_case ✓
+//    raw#15 config JSON hardcode-free ✓ (hyperparams loaded from config)
+//    raw#12 smoke result reported as-is (fixpoint not assumed)
+//
+//  USAGE
+//    hexa run tool/train_lora_option_b_minimal.hexa
+// ════════════════════════════════════════════════════════════════════════════
+
+let CORPUS_PATH = "/Users/ghost/core/anima/experiments/alm_r13/seed_corpus_10mb/corpus.jsonl"
+let CONFIG_PATH = "/Users/ghost/core/anima/.claude/worktrees/option-b-p1-minimal/shared/config/option_b_minimal_config.json"
+let CERT_PATH   = "/Users/ghost/core/anima/.claude/worktrees/option-b-p1-minimal/shared/state/option_b_p1_minimal_smoke_result.json"
+
+// Model dims — same micro scale as train_lora_cpu (V=8, H=4).
+let V = 8
+let H = 4
+
+// ── tensor primitives (self-contained) ───────────────────────────────────
+fn t_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    return out
+}
+
+fn t_randn(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u1_raw = to_float(s % 1000000) / 1000000.0
+        let u1 = if u1_raw < 0.000001 { 0.000001 } else { u1_raw }
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u2 = to_float(s % 1000000) / 1000000.0
+        let r = sqrt(0.0 - 2.0 * log(u1))
+        let theta = 2.0 * 3.141592653589793 * u2
+        out = out.push(r * cos(theta))
+        i = i + 1
+    }
+    return out
+}
+
+fn t_scale(a: array, s: float) -> array {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n { out = out.push(a[i] * s); i = i + 1 }
+    return out
+}
+
+fn log_softmax_row(row: array) -> array {
+    let n = len(row)
+    let mut mx = row[0]
+    let mut k = 1
+    while k < n {
+        if row[k] > mx { mx = row[k] }
+        k = k + 1
+    }
+    let mut s = 0.0
+    let mut exps = []
+    let mut i = 0
+    while i < n {
+        let e = pow(2.718281828459045, row[i] - mx)
+        exps = exps.push(e)
+        s = s + e
+        i = i + 1
+    }
+    let lse = mx + log(s)
+    let mut out = []
+    let mut j = 0
+    while j < n {
+        out = out.push(row[j] - lse)
+        j = j + 1
+    }
+    return out
+}
+
+fn softmax_row(row: array) -> array {
+    let n = len(row)
+    let mut mx = row[0]
+    let mut k = 1
+    while k < n {
+        if row[k] > mx { mx = row[k] }
+        k = k + 1
+    }
+    let mut s = 0.0
+    let mut exps = []
+    let mut i = 0
+    while i < n {
+        let e = pow(2.718281828459045, row[i] - mx)
+        exps = exps.push(e)
+        s = s + e
+        i = i + 1
+    }
+    let mut out = []
+    let mut j = 0
+    while j < n {
+        out = out.push(exps[j] / s)
+        j = j + 1
+    }
+    return out
+}
+
+fn tanh_f(x: float) -> float {
+    let e1 = pow(2.718281828459045, x)
+    let e2 = pow(2.718281828459045, 0.0 - x)
+    return (e1 - e2) / (e1 + e2)
+}
+
+fn argmax(a: array) -> int {
+    let n = len(a)
+    let mut best = 0
+    let mut bv = a[0]
+    let mut i = 1
+    while i < n {
+        if a[i] > bv { bv = a[i]; best = i }
+        i = i + 1
+    }
+    return best
+}
+
+// ── Vocab: folded ASCII 8 classes (matches train_lora_cpu) ───────────────
+fn byte_to_class(b: int) -> int {
+    if b == 65 { return 0 }; if b == 97 { return 0 }
+    if b == 69 { return 0 }; if b == 101 { return 0 }
+    if b == 73 { return 0 }; if b == 105 { return 0 }
+    if b == 79 { return 0 }; if b == 111 { return 0 }
+    if b == 85 { return 0 }; if b == 117 { return 0 }
+    if b >= 65 { if b <= 90 { return 1 + ((b - 65) % 3) } }
+    if b >= 97 { if b <= 122 { return 1 + ((b - 97) % 3) } }
+    if b >= 48 { if b <= 57 { return 4 } }
+    if b == 32 { return 5 }; if b == 9 { return 5 }; if b == 10 { return 5 }
+    if b == 46 { return 6 }; if b == 44 { return 6 }
+    if b == 59 { return 6 }; if b == 58 { return 6 }
+    if b == 33 { return 6 }; if b == 63 { return 6 }
+    return 7
+}
+
+fn make_pairs(text: string, max_pairs: int) -> array {
+    let n = text.len()
+    let mut out = []
+    let mut i = 0
+    let limit = if n - 1 > max_pairs { max_pairs } else { n - 1 }
+    while i < limit {
+        let b0 = text.byte_at(i)
+        let b1 = text.byte_at(i + 1)
+        out = out.push(byte_to_class(b0))
+        out = out.push(byte_to_class(b1))
+        i = i + 1
+    }
+    return out
+}
+
+fn corpus_slice(raw: string, filter: string, per_line_char: int, max_lines: int) -> string {
+    let lines = raw.split("\n")
+    let n_lines = len(lines)
+    let mut out = ""
+    let mut taken = 0
+    let mut i = 0
+    while i < n_lines {
+        if taken >= max_lines { return out }
+        let line = lines[i]
+        if line.len() > 20 {
+            let matched = if filter == "*" { true } else { line.contains(filter) }
+            if matched {
+                let take = if line.len() > per_line_char { per_line_char } else { line.len() }
+                out = out + line.substring(0, take) + " "
+                taken = taken + 1
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Base model ───────────────────────────────────────────────────────────
+struct Base {
+    emb: array,
+    w:   array,
+    b:   array
+}
+
+fn base_init(seed: int) -> Base {
+    let s_emb = 1.0 / sqrt(to_float(V))
+    let s_w   = 1.0 / sqrt(to_float(H))
+    return Base {
+        emb: t_scale(t_randn(V * H, seed), s_emb),
+        w:   t_scale(t_randn(H * V, seed + 1), s_w),
+        b:   t_zeros(V)
+    }
+}
+
+struct Fwd {
+    hidden: array,
+    logits: array
+}
+
+fn base_forward_with_adapter(m: Base, adA: array, adB: array, r: int, alpha: float, prev_cls: int) -> Fwd {
+    let mut h = t_zeros(H)
+    let mut k = 0
+    while k < H {
+        let e = m.emb[prev_cls * H + k]
+        h[k] = tanh_f(e)
+        k = k + 1
+    }
+    let mut logits = t_zeros(V)
+    let mut j = 0
+    while j < V {
+        let mut acc = m.b[j]
+        let mut kk = 0
+        while kk < H {
+            acc = acc + h[kk] * m.w[kk * V + j]
+            kk = kk + 1
+        }
+        logits[j] = acc
+        j = j + 1
+    }
+    if r > 0 {
+        let mut hr = t_zeros(r)
+        let mut i2 = 0
+        while i2 < r {
+            let mut acc = 0.0
+            let mut kk2 = 0
+            while kk2 < H {
+                acc = acc + h[kk2] * adB[kk2 * r + i2]
+                kk2 = kk2 + 1
+            }
+            hr[i2] = acc
+            i2 = i2 + 1
+        }
+        let scale = alpha / to_float(r)
+        let mut j2 = 0
+        while j2 < V {
+            let mut acc = 0.0
+            let mut ii = 0
+            while ii < r {
+                acc = acc + hr[ii] * adA[ii * V + j2]
+                ii = ii + 1
+            }
+            logits[j2] = logits[j2] + scale * acc
+            j2 = j2 + 1
+        }
+    }
+    return Fwd { hidden: h, logits: logits }
+}
+
+fn base_forward(m: Base, prev_cls: int) -> Fwd {
+    let empty = t_zeros(1)
+    return base_forward_with_adapter(m, empty, empty, 0, 0.0, prev_cls)
+}
+
+struct Eval {
+    ce: float,
+    ppl: float,
+    acc: float
+}
+
+fn eval_base(m: Base, adA: array, adB: array, r: int, alpha: float, pairs: array) -> Eval {
+    let n_pair = len(pairs) / 2
+    let mut total_ce = 0.0
+    let mut correct = 0
+    let mut i = 0
+    while i < n_pair {
+        let prev = pairs[i * 2]
+        let tgt  = pairs[i * 2 + 1]
+        let f = base_forward_with_adapter(m, adA, adB, r, alpha, prev)
+        let lp = log_softmax_row(f.logits)
+        total_ce = total_ce - lp[tgt]
+        if argmax(f.logits) == tgt { correct = correct + 1 }
+        i = i + 1
+    }
+    let ce_mean = total_ce / to_float(n_pair)
+    let ppl = pow(2.718281828459045, ce_mean)
+    let acc = to_float(correct) / to_float(n_pair)
+    return Eval { ce: ce_mean, ppl: ppl, acc: acc }
+}
+
+fn train_base(m0: Base, pairs: array, lr: float, steps: int, batch: int) -> Base {
+    let mut m = m0
+    let n_pair = len(pairs) / 2
+    let mut step = 0
+    while step < steps {
+        let mut g_emb = t_zeros(V * H)
+        let mut g_w   = t_zeros(H * V)
+        let mut g_b   = t_zeros(V)
+        let mut bi = 0
+        while bi < batch {
+            let idx = (step * batch + bi) % n_pair
+            let prev = pairs[idx * 2]
+            let tgt  = pairs[idx * 2 + 1]
+            let f = base_forward(m, prev)
+            let p = softmax_row(f.logits)
+            let mut dl = t_zeros(V)
+            let mut j = 0
+            while j < V {
+                dl[j] = p[j]
+                j = j + 1
+            }
+            dl[tgt] = dl[tgt] - 1.0
+            let mut j2 = 0
+            while j2 < V {
+                g_b[j2] = g_b[j2] + dl[j2]
+                j2 = j2 + 1
+            }
+            let mut hh = 0
+            while hh < H {
+                let mut jj = 0
+                while jj < V {
+                    g_w[hh * V + jj] = g_w[hh * V + jj] + f.hidden[hh] * dl[jj]
+                    jj = jj + 1
+                }
+                hh = hh + 1
+            }
+            let mut dh = t_zeros(H)
+            let mut kk = 0
+            while kk < H {
+                let mut acc = 0.0
+                let mut jjj = 0
+                while jjj < V {
+                    acc = acc + dl[jjj] * m.w[kk * V + jjj]
+                    jjj = jjj + 1
+                }
+                dh[kk] = acc * (1.0 - f.hidden[kk] * f.hidden[kk])
+                kk = kk + 1
+            }
+            let mut km = 0
+            while km < H {
+                g_emb[prev * H + km] = g_emb[prev * H + km] + dh[km]
+                km = km + 1
+            }
+            bi = bi + 1
+        }
+        let scale = lr / to_float(batch)
+        let mut ie = 0
+        while ie < V * H {
+            m.emb[ie] = m.emb[ie] - scale * g_emb[ie]
+            ie = ie + 1
+        }
+        let mut iw = 0
+        while iw < H * V {
+            m.w[iw] = m.w[iw] - scale * g_w[iw]
+            iw = iw + 1
+        }
+        let mut ib = 0
+        while ib < V {
+            m.b[ib] = m.b[ib] - scale * g_b[ib]
+            ib = ib + 1
+        }
+        step = step + 1
+    }
+    return m
+}
+
+// ── LoRA adapter ─────────────────────────────────────────────────────────
+struct Lora {
+    A: array,
+    B: array,
+    r: int,
+    alpha: float
+}
+
+fn lora_init(r: int, alpha: float, seed: int) -> Lora {
+    let s = 1.0 / sqrt(to_float(V))
+    return Lora {
+        A: t_scale(t_randn(r * V, seed), s),
+        B: t_zeros(H * r),
+        r: r,
+        alpha: alpha
+    }
+}
+
+// Per-step telemetry captured by MINIMAL train loop.
+struct StepTelemetry {
+    loss_ce: float,      // mean CE over batch (reported, not summed)
+    loss_total: float,   // CE − β_i · λ · I_irr_step
+    i_irr_step: float,   // |ΔW| / (|ΔW| + jitter_floor), ΔW ≤ 0 ⇒ 0
+    delta_w_l1: float    // raw L1 norm of adapter step (A + B)
+}
+
+// I_irr helper — matches `l_ix_integrator.hexa:131-138` semantics.
+// Float version (jitter_floor = 1.0 to match integer x1000 parity).
+fn i_irr_from_delta(delta_w_l1: float, jitter_floor: float) -> float {
+    if delta_w_l1 <= 0.0 { return 0.0 }
+    return delta_w_l1 / (delta_w_l1 + jitter_floor)
+}
+
+// MINIMAL LoRA trainer with per-step I_irr tracking.
+// - Gradient is pure dCE/dparams (unchanged from train_lora_cpu).
+// - After each step's parameter update we compute ΔW (L1) and I_irr_step,
+//   build `loss_total = loss_ce - beta_i*lambda*I_irr`, and log both.
+// Returns (final_lora, telemetry_list[step]).
+struct LoraRun {
+    lo: Lora,
+    tel: list           // list of StepTelemetry
+}
+
+fn train_lora_minimal(
+    m: Base, lo0: Lora, pairs: array,
+    lr: float, steps: int, batch: int,
+    beta_i: float, lambda_val: float, jitter_floor: float
+) -> LoraRun {
+    let mut lo = lo0
+    let r = lo.r
+    let alpha = lo.alpha
+    let scale_lora = alpha / to_float(r)
+    let n_pair = len(pairs) / 2
+    let mut tel = []
+
+    // Memory-friendly ΔW: compute |Δ| directly from the gradient step
+    // (Δ = -s2 * g), which IS the applied update.  Avoids per-step array
+    // copies (hexa_stage0 copy-on-write would blow 4GB RSS cap).
+
+    let mut step = 0
+    while step < steps {
+        let mut gA = t_zeros(r * V)
+        let mut gB = t_zeros(H * r)
+        let mut batch_ce_sum = 0.0
+        let mut bi = 0
+        while bi < batch {
+            let idx = (step * batch + bi) % n_pair
+            let prev = pairs[idx * 2]
+            let tgt  = pairs[idx * 2 + 1]
+            let f = base_forward_with_adapter(m, lo.A, lo.B, r, alpha, prev)
+            // CE accumulate
+            let lp = log_softmax_row(f.logits)
+            batch_ce_sum = batch_ce_sum - lp[tgt]
+            // gradient wrt logits
+            let p = softmax_row(f.logits)
+            let mut dl = t_zeros(V)
+            let mut j = 0
+            while j < V {
+                dl[j] = p[j]
+                j = j + 1
+            }
+            dl[tgt] = dl[tgt] - 1.0
+            // hr = h @ B
+            let mut hr = t_zeros(r)
+            let mut i2 = 0
+            while i2 < r {
+                let mut acc = 0.0
+                let mut kk = 0
+                while kk < H {
+                    acc = acc + f.hidden[kk] * lo.B[kk * r + i2]
+                    kk = kk + 1
+                }
+                hr[i2] = acc
+                i2 = i2 + 1
+            }
+            // grad A
+            let mut ri = 0
+            while ri < r {
+                let mut vi = 0
+                while vi < V {
+                    gA[ri * V + vi] = gA[ri * V + vi] + scale_lora * hr[ri] * dl[vi]
+                    vi = vi + 1
+                }
+                ri = ri + 1
+            }
+            // dhr
+            let mut dhr = t_zeros(r)
+            let mut ri2 = 0
+            while ri2 < r {
+                let mut acc2 = 0.0
+                let mut vi2 = 0
+                while vi2 < V {
+                    acc2 = acc2 + lo.A[ri2 * V + vi2] * dl[vi2]
+                    vi2 = vi2 + 1
+                }
+                dhr[ri2] = scale_lora * acc2
+                ri2 = ri2 + 1
+            }
+            // grad B
+            let mut hh = 0
+            while hh < H {
+                let mut rii = 0
+                while rii < r {
+                    gB[hh * r + rii] = gB[hh * r + rii] + f.hidden[hh] * dhr[rii]
+                    rii = rii + 1
+                }
+                hh = hh + 1
+            }
+            bi = bi + 1
+        }
+        // SGD update (pure dCE/dparams — MINIMAL)
+        // Also accumulate |Δ| on-the-fly = Σ |s2 * g| (equals L1 of actual step).
+        let s2 = lr / to_float(batch)
+        let mut delta_w = 0.0
+        let mut ia = 0
+        while ia < r * V {
+            let d = s2 * gA[ia]
+            let ad = if d < 0.0 { 0.0 - d } else { d }
+            delta_w = delta_w + ad
+            lo.A[ia] = lo.A[ia] - d
+            ia = ia + 1
+        }
+        let mut ib = 0
+        while ib < H * r {
+            let d2 = s2 * gB[ib]
+            let ad2 = if d2 < 0.0 { 0.0 - d2 } else { d2 }
+            delta_w = delta_w + ad2
+            lo.B[ib] = lo.B[ib] - d2
+            ib = ib + 1
+        }
+
+        // ── I_irr step = |ΔW| / (|ΔW| + jitter_floor), ΔW ≤ 0 ⇒ 0 ──
+        let i_irr = i_irr_from_delta(delta_w, jitter_floor)
+        let loss_ce = batch_ce_sum / to_float(batch)
+        let loss_total = loss_ce - beta_i * lambda_val * i_irr
+
+        let row = StepTelemetry {
+            loss_ce: loss_ce,
+            loss_total: loss_total,
+            i_irr_step: i_irr,
+            delta_w_l1: delta_w
+        }
+        tel = tel.push(row)
+
+        step = step + 1
+    }
+    return LoraRun { lo: lo, tel: tel }
+}
+
+// Landauer bit erasure (bit-equivalent):
+//   bits = ΔCE · n_pairs / ln(2)
+// kT ln 2 per bit ≈ 2.870e-21 J at 300 K (dissipated energy floor).
+fn landauer_bits(delta_ce: float, n_pairs: int, ln_2: float) -> float {
+    let raw = delta_ce * to_float(n_pairs) / ln_2
+    if raw < 0.0 { return 0.0 - raw }   // sign-normalize — we care about magnitude of info change
+    return raw
+}
+
+// ── Run harness ──────────────────────────────────────────────────────────
+struct RunResult {
+    name: string,
+    beta_i: float,
+    pre_ce: float,
+    post_ce: float,
+    delta_ce: float,
+    landauer_bits: float,
+    mean_i_irr: float,
+    mean_delta_w: float,
+    tel: list
+}
+
+// Slim entry: pre-trained base + pre-materialized pairs supplied by caller.
+fn run_smoke_prepared(
+    m: Base, lora_pairs: array, name: string,
+    rank: int, alpha: float, lora_steps: int, lora_lr: float, batch: int,
+    lora_seed: int,
+    beta_i: float, lambda_val: float, jitter_floor: float,
+    ln_2: float
+) -> RunResult {
+    println("  -- run [" + name + "]  beta_i=" + to_string(beta_i) + " lambda=" + to_string(lambda_val))
+    let lora_n = len(lora_pairs) / 2
+
+    // Pre-LoRA eval on lora slice
+    let pre = eval_base(m, t_zeros(1), t_zeros(1), 0, 0.0, lora_pairs)
+
+    // LoRA init
+    let lo0 = lora_init(rank, alpha, lora_seed)
+
+    // MINIMAL trainer (beta_i=0 → baseline;  beta_i=0.1 → MINIMAL)
+    let run = train_lora_minimal(m, lo0, lora_pairs, lora_lr, lora_steps, batch,
+                                  beta_i, lambda_val, jitter_floor)
+    let post = eval_base(m, run.lo.A, run.lo.B, rank, alpha, lora_pairs)
+
+    let delta_ce = pre.ce - post.ce
+    let bits = landauer_bits(delta_ce, lora_n, ln_2)
+
+    // Aggregate telemetry
+    let n_tel = run.tel.len()
+    let mut acc_i = 0.0
+    let mut acc_d = 0.0
+    let mut ti = 0
+    while ti < n_tel {
+        let row = run.tel[ti]
+        acc_i = acc_i + row.i_irr_step
+        acc_d = acc_d + row.delta_w_l1
+        ti = ti + 1
+    }
+    let mean_i = if n_tel > 0 { acc_i / to_float(n_tel) } else { 0.0 }
+    let mean_d = if n_tel > 0 { acc_d / to_float(n_tel) } else { 0.0 }
+
+    println("     pre_ce=" + to_string(pre.ce) + " post_ce=" + to_string(post.ce)
+          + " dCE=" + to_string(delta_ce))
+    println("     landauer_bits=" + to_string(bits)
+          + " mean_i_irr=" + to_string(mean_i)
+          + " mean_dW=" + to_string(mean_d))
+
+    return RunResult {
+        name: name,
+        beta_i: beta_i,
+        pre_ce: pre.ce,
+        post_ce: post.ce,
+        delta_ce: delta_ce,
+        landauer_bits: bits,
+        mean_i_irr: mean_i,
+        mean_delta_w: mean_d,
+        tel: run.tel
+    }
+}
+
+fn telemetry_to_json(tel: list) -> string {
+    let n = tel.len()
+    let mut out = "[\n"
+    let mut i = 0
+    while i < n {
+        let row = tel[i]
+        if i > 0 { out = out + ",\n" }
+        out = out + "      {\"step\":" + to_string(i + 1)
+        out = out + ",\"loss_ce\":"    + to_string(row.loss_ce)
+        out = out + ",\"loss_total\":" + to_string(row.loss_total)
+        out = out + ",\"i_irr_step\":" + to_string(row.i_irr_step)
+        out = out + ",\"delta_w_l1\":" + to_string(row.delta_w_l1)
+        out = out + "}"
+        i = i + 1
+    }
+    out = out + "\n    ]"
+    return out
+}
+
+fn main() {
+    println("=================================================================")
+    println("  Option B P1 MINIMAL — lambda*I_irr regularizer PoC")
+    println("  loss_total = CE - beta_i * lambda * I_irr_step")
+    println("  raw#9 hexa-only  raw#11 snake_case  raw#15 config-JSON")
+    println("=================================================================")
+
+    // ── Load config (raw#15: no hardcoded hyperparams) ────────────────────
+    let cfg_raw = read_file(CONFIG_PATH)
+    println("[config] " + CONFIG_PATH + "  bytes=" + to_string(cfg_raw.len()))
+
+    // Minimal JSON numeric field extraction: finds `"key":` then scans
+    // numeric literal (digits, '.', '-', '+', 'e', 'E') after optional ws.
+    fn extract_num(src: string, key: string) -> float {
+        let pat = "\"" + key + "\":"
+        let idx = src.find(pat)
+        if idx < 0 { return 0.0 }
+        let n = src.len()
+        // skip whitespace after the colon
+        let mut q = idx + pat.len()
+        let mut ws_done = 0
+        while ws_done == 0 {
+            if q >= n { ws_done = 1 }
+            else {
+                let bq = src.byte_at(q)
+                if bq == 32 || bq == 9 { q = q + 1 }
+                else { ws_done = 1 }
+            }
+        }
+        // scan numeric literal
+        let mut end_idx = q
+        let mut done = 0
+        while done == 0 {
+            if end_idx >= n { done = 1 }
+            else {
+                let be = src.byte_at(end_idx)
+                if (be >= 48 && be <= 57) || be == 46 || be == 45 || be == 43 || be == 101 || be == 69 {
+                    end_idx = end_idx + 1
+                } else { done = 1 }
+            }
+        }
+        return to_float(src.substring(q, end_idx))
+    }
+
+    let beta_i       = extract_num(cfg_raw, "beta_i")
+    let lambda_val   = extract_num(cfg_raw, "lambda")
+    let jitter_floor = extract_num(cfg_raw, "jitter_floor")
+    let ln_2         = extract_num(cfg_raw, "ln_2")
+    let rank         = to_int(extract_num(cfg_raw, "rank"))
+    let alpha_f      = extract_num(cfg_raw, "alpha")
+    let lora_steps   = to_int(extract_num(cfg_raw, "lora_steps"))
+    let batch        = to_int(extract_num(cfg_raw, "batch"))
+    let lora_lr      = extract_num(cfg_raw, "lora_lr")
+    let base_seed    = to_int(extract_num(cfg_raw, "base_seed"))
+    let lora_seed    = to_int(extract_num(cfg_raw, "lora_seed"))
+    let lora_lines   = to_int(extract_num(cfg_raw, "lora_lines"))
+    let lora_per_ln  = to_int(extract_num(cfg_raw, "lora_per_line_char"))
+    let base_steps   = to_int(extract_num(cfg_raw, "base_steps"))
+    let base_lr      = extract_num(cfg_raw, "base_lr")
+    let max_pairs    = to_int(extract_num(cfg_raw, "max_pairs"))
+    let baseline_bi  = extract_num(cfg_raw, "baseline_beta_i")
+    let minimal_bi   = extract_num(cfg_raw, "minimal_beta_i")
+
+    println("[hyperparams] beta_i=" + to_string(beta_i) + " lambda=" + to_string(lambda_val)
+          + " jitter=" + to_string(jitter_floor) + " ln2=" + to_string(ln_2))
+    println("[smoke] rank=" + to_string(rank) + " alpha=" + to_string(alpha_f)
+          + " lora_steps=" + to_string(lora_steps) + " batch=" + to_string(batch)
+          + " lora_lr=" + to_string(lora_lr))
+    println("")
+
+    // Load corpus once, slice + pair once, then drop the big corpus string.
+    let corpus = read_file(CORPUS_PATH)
+    println("[corpus] bytes=" + to_string(corpus.len()))
+    let base_text = corpus_slice(corpus, "hexad", lora_per_ln, lora_lines)
+    let lora_text = corpus_slice(corpus, "hexad", lora_per_ln, lora_lines)
+    let base_pairs = make_pairs(base_text, max_pairs)
+    let lora_pairs = make_pairs(lora_text, max_pairs)
+    println("[data] base_pairs=" + to_string(len(base_pairs) / 2)
+          + " lora_pairs=" + to_string(len(lora_pairs) / 2))
+
+    // Pretrain base once (shared between baseline & MINIMAL; seed identical).
+    let m0 = base_init(base_seed)
+    let m  = train_base(m0, base_pairs, base_lr, base_steps, batch)
+    println("[base] pretrain done (" + to_string(base_steps) + " steps)")
+    println("")
+
+    // ── Run A: baseline (beta_i = 0, pure CE) ──────────────────────────
+    println("─── A: baseline (beta_i=0, pure CE) ───")
+    let r_base = run_smoke_prepared(
+        m, lora_pairs, "baseline",
+        rank, alpha_f, lora_steps, lora_lr, batch, lora_seed,
+        baseline_bi, lambda_val, jitter_floor, ln_2
+    )
+    println("")
+
+    // ── Run B: MINIMAL (beta_i = 0.1) ──────────────────────────────────
+    println("─── B: MINIMAL (beta_i=0.1, lambda*I_irr in loss_total) ───")
+    let r_min = run_smoke_prepared(
+        m, lora_pairs, "minimal",
+        rank, alpha_f, lora_steps, lora_lr, batch, lora_seed,
+        minimal_bi, lambda_val, jitter_floor, ln_2
+    )
+    println("")
+
+    // ── Compare & Landauer ratio ───────────────────────────────────────
+    let ratio_bits = if r_base.landauer_bits > 0.0 {
+        r_min.landauer_bits / r_base.landauer_bits
+    } else { 0.0 }
+    let ratio_ce_drop = if r_base.delta_ce > 0.0 || r_base.delta_ce < 0.0 {
+        r_min.delta_ce / r_base.delta_ce
+    } else { 0.0 }
+
+    println("=================================================================")
+    println("  SUMMARY — Option B P1 MINIMAL smoke")
+    println("=================================================================")
+    println("  baseline  : pre_ce=" + to_string(r_base.pre_ce)
+          + " post_ce=" + to_string(r_base.post_ce)
+          + " dCE="      + to_string(r_base.delta_ce))
+    println("              landauer_bits=" + to_string(r_base.landauer_bits)
+          + " mean_i_irr=" + to_string(r_base.mean_i_irr))
+    println("  MINIMAL   : pre_ce=" + to_string(r_min.pre_ce)
+          + " post_ce="   + to_string(r_min.post_ce)
+          + " dCE="        + to_string(r_min.delta_ce))
+    println("              landauer_bits=" + to_string(r_min.landauer_bits)
+          + " mean_i_irr=" + to_string(r_min.mean_i_irr))
+    println("  ratio_bits (MINIMAL/baseline)    = " + to_string(ratio_bits))
+    println("  ratio_ce_drop (MINIMAL/baseline) = " + to_string(ratio_ce_drop))
+    println("")
+
+    // Note on MINIMAL expectation: since gradient is pure dCE in both runs
+    // (seed identical), ratio_bits is expected ≈ 1.0 (i.e. MINIMAL does NOT
+    // change weight trajectory).  The value here confirms the I_irr term is
+    // observed and reported; HYBRID P2 will couple the term into gradient
+    // and generate a meaningful ratio.
+    let trajectory_equivalent = if (ratio_ce_drop > 0.9999 && ratio_ce_drop < 1.0001) { 1 } else { 0 }
+    println("  trajectory_equivalent (expected for MINIMAL) = " + to_string(trajectory_equivalent))
+
+    // fixpoint check: if I_irr_step -> 0 within 10 steps => collapse reached.
+    let last_tel = r_min.tel[r_min.tel.len() - 1]
+    let fixpoint_collapsed = if last_tel.i_irr_step < 0.01 { 1 } else { 0 }
+    println("  i_irr_step_last (MINIMAL)    = " + to_string(last_tel.i_irr_step))
+    println("  fixpoint_collapsed_within_10 = " + to_string(fixpoint_collapsed))
+    println("")
+
+    // ── Cert JSON ──────────────────────────────────────────────────────
+    let mut cert = "{\n"
+    cert = cert + "  \"tool\": \"tool/train_lora_option_b_minimal.hexa\",\n"
+    cert = cert + "  \"pivot\": \"option_b_p1_minimal_cell_first\",\n"
+    cert = cert + "  \"date\": \"2026-04-21\",\n"
+    cert = cert + "  \"design\": \"loss_total = CE - beta_i * lambda * I_irr_step\",\n"
+    cert = cert + "  \"raw_compliance\": [\"raw#9_hexa_only\", \"raw#11_snake_case\", \"raw#12_report_as_is\", \"raw#15_config_json\"],\n"
+    cert = cert + "  \"hyperparams\": {\n"
+    cert = cert + "    \"beta_i\": "       + to_string(minimal_bi)   + ",\n"
+    cert = cert + "    \"lambda\": "       + to_string(lambda_val)   + ",\n"
+    cert = cert + "    \"jitter_floor\": " + to_string(jitter_floor) + ",\n"
+    cert = cert + "    \"rank\": "         + to_string(rank)         + ",\n"
+    cert = cert + "    \"alpha\": "        + to_string(alpha_f)      + ",\n"
+    cert = cert + "    \"lora_steps\": "   + to_string(lora_steps)   + ",\n"
+    cert = cert + "    \"batch\": "        + to_string(batch)        + ",\n"
+    cert = cert + "    \"lora_lr\": "      + to_string(lora_lr)      + "\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"baseline\": {\n"
+    cert = cert + "    \"pre_ce\": "        + to_string(r_base.pre_ce)        + ",\n"
+    cert = cert + "    \"post_ce\": "       + to_string(r_base.post_ce)       + ",\n"
+    cert = cert + "    \"delta_ce\": "      + to_string(r_base.delta_ce)      + ",\n"
+    cert = cert + "    \"landauer_bits\": " + to_string(r_base.landauer_bits) + ",\n"
+    cert = cert + "    \"mean_i_irr\": "    + to_string(r_base.mean_i_irr)    + ",\n"
+    cert = cert + "    \"mean_delta_w\": "  + to_string(r_base.mean_delta_w)  + ",\n"
+    cert = cert + "    \"telemetry\": " + telemetry_to_json(r_base.tel) + "\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"minimal\": {\n"
+    cert = cert + "    \"pre_ce\": "        + to_string(r_min.pre_ce)        + ",\n"
+    cert = cert + "    \"post_ce\": "       + to_string(r_min.post_ce)       + ",\n"
+    cert = cert + "    \"delta_ce\": "      + to_string(r_min.delta_ce)      + ",\n"
+    cert = cert + "    \"landauer_bits\": " + to_string(r_min.landauer_bits) + ",\n"
+    cert = cert + "    \"mean_i_irr\": "    + to_string(r_min.mean_i_irr)    + ",\n"
+    cert = cert + "    \"mean_delta_w\": "  + to_string(r_min.mean_delta_w)  + ",\n"
+    cert = cert + "    \"telemetry\": " + telemetry_to_json(r_min.tel) + "\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"compare\": {\n"
+    cert = cert + "    \"landauer_bits_ratio_minimal_over_baseline\": " + to_string(ratio_bits) + ",\n"
+    cert = cert + "    \"ce_drop_ratio_minimal_over_baseline\": "       + to_string(ratio_ce_drop) + ",\n"
+    cert = cert + "    \"trajectory_equivalent\": " + to_string(trajectory_equivalent) + ",\n"
+    cert = cert + "    \"fixpoint_collapsed_within_10\": " + to_string(fixpoint_collapsed) + "\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"notes\": \"MINIMAL keeps gradient = pure dCE; I_irr term is observed + reported. Trajectory-equivalent to baseline by design. HYBRID P2 will add dI_irr/dW backprop and is expected to diverge. Seed iota target (5-10x Landauer reduction) is NOT expected in MINIMAL — it is the P2 bar.\"\n"
+    cert = cert + "}\n"
+    write_file(CERT_PATH, cert)
+    println("[cert] " + CERT_PATH)
+    println("")
+    println("  PoC done — see docs/option_b_p1_minimal_poc_result_20260421.md")
+}
+
+main()
