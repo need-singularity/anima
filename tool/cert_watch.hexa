@@ -1,0 +1,596 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/cert_watch.hexa — L5 auto-ingest daemon (cluster #34 improvement 24)
+//
+//  PURPOSE
+//    Poll cert-bearing paths at a fixed interval, detect new/modified *.json,
+//    append proof-chain events to state/cert_ingest_log.json, and invoke
+//    meta2_hashchain_verify on each change (or log SKIP if the tool is absent).
+//    Fingerprint baseline is persisted in state/cert_watch_state.json so that
+//    subsequent polls emit events only for real deltas (mtime OR size change).
+//
+//  USAGE
+//    hexa tool/cert_watch.hexa --once               single poll then exit
+//    hexa tool/cert_watch.hexa --selftest           inline 3-step selftest
+//    hexa tool/cert_watch.hexa                      one poll (daemon mode
+//                                                   driven externally by cron
+//                                                   or launchd — we do not
+//                                                   busy-loop)
+//
+//  RULES
+//    raw#9   hexa-only (no python/bash trampolines beyond exec shell)
+//    raw#10  proof-chain append-only (fingerprint state + ingest log)
+//    raw#11  snake_case
+//    raw#15  no-hardcode — paths/interval from shared/config/cert_watch_config.json
+//
+//  OUTPUTS
+//    state/cert_watch_state.json     fingerprint map {path: {mtime, size, sha}}
+//    state/cert_ingest_log.json      proof-chain append-only event log
+//
+//  EXIT CODES
+//    0  poll completed OK (selftest 3/3 PASS when --selftest)
+//    1  setup error (config missing/invalid)
+//    2  internal error (state write failure)
+//    3  selftest FAIL
+// ════════════════════════════════════════════════════════════════════════════
+
+let DEFAULT_CONFIG = "shared/config/cert_watch_config.json"
+let TOOL_NAME      = "cert_watch"
+let TOOL_VERSION   = "v1"
+
+// ─── sys helpers ─────────────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    let mut out = "'"
+    out = out + s.replace("'", "'\\''")
+    out = out + "'"
+    return out
+}
+
+fn _exec_out(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _exec_code(cmd: string) -> int {
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+fn _file_exists(path: string) -> bool {
+    let r = exec_with_status("test -e " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _is_file(path: string) -> bool {
+    let r = exec_with_status("test -f " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _dir_exists(path: string) -> bool {
+    let r = exec_with_status("test -d " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _mkdir_p(dir: string) -> bool {
+    let r = exec_with_status("mkdir -p " + _sh_quote(dir))
+    return r[1] == 0
+}
+
+fn _dirname(path: string) -> string {
+    let r = exec_with_status("dirname " + _sh_quote(path))
+    let d = to_string(r[0]).trim()
+    if len(d) == 0 { return "." }
+    return d
+}
+
+fn _ts_iso() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _ts_epoch() -> string {
+    return _exec_out("date -u +%s").trim()
+}
+
+fn _sha256_of_file(path: string) -> string {
+    if !_is_file(path) { return "" }
+    let r = exec_with_status("shasum -a 256 " + _sh_quote(path) + " 2>/dev/null | awk '{print $1}'")
+    return to_string(r[0]).trim()
+}
+
+fn _sha256_of_string(s: string) -> string {
+    let r = exec_with_status("printf %s " + _sh_quote(s) + " | shasum -a 256 | awk '{print $1}'")
+    return to_string(r[0]).trim()
+}
+
+// Portable mtime (seconds since epoch). Try BSD stat, fall back to GNU stat.
+fn _file_mtime(path: string) -> string {
+    if !_is_file(path) { return "" }
+    let cmd_bsd = "stat -f %m " + _sh_quote(path) + " 2>/dev/null"
+    let bsd = _exec_out(cmd_bsd).trim()
+    if len(bsd) > 0 { return bsd }
+    let cmd_gnu = "stat -c %Y " + _sh_quote(path) + " 2>/dev/null"
+    return _exec_out(cmd_gnu).trim()
+}
+
+// Portable size in bytes.
+fn _file_size(path: string) -> string {
+    if !_is_file(path) { return "0" }
+    let cmd_bsd = "stat -f %z " + _sh_quote(path) + " 2>/dev/null"
+    let bsd = _exec_out(cmd_bsd).trim()
+    if len(bsd) > 0 { return bsd }
+    let cmd_gnu = "stat -c %s " + _sh_quote(path) + " 2>/dev/null"
+    return _exec_out(cmd_gnu).trim()
+}
+
+// List *.json regular files directly under `dir` (non-recursive).
+fn _list_json(dir: string) -> array {
+    if !_dir_exists(dir) { return [] }
+    let cmd = "find " + _sh_quote(dir) + " -maxdepth 1 -type f -name '*.json' 2>/dev/null | sort"
+    let out = _exec_out(cmd)
+    let lines = split(out, "\n")
+    let mut acc = []
+    for l in lines {
+        let t = to_string(l).trim()
+        if len(t) > 0 { acc.push(t) }
+    }
+    return acc
+}
+
+// ─── JSON escape (minimal) ───────────────────────────────────────────
+
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+// ─── config load ─────────────────────────────────────────────────────
+
+fn _load_config(path: string) {
+    if !_file_exists(path) {
+        eprintln(TOOL_NAME + ": SETUP_ERROR — config missing: " + path)
+        exit(1)
+    }
+    let raw = read_file(path)
+    let cfg = json_parse(raw)
+    return cfg
+}
+
+fn _cfg_paths(cfg) -> array {
+    if !cfg.contains_key("paths") { return [] }
+    let p = cfg["paths"]
+    let mut acc = []
+    for x in p { acc.push(to_string(x)) }
+    return acc
+}
+
+fn _cfg_interval(cfg) -> int {
+    if !cfg.contains_key("poll_interval_s") { return 60 }
+    return to_int(to_string(cfg["poll_interval_s"]))
+}
+
+fn _cfg_state_path(cfg, key: string, dflt: string) -> string {
+    if !cfg.contains_key("state") { return dflt }
+    let st = cfg["state"]
+    if !st.contains_key(key) { return dflt }
+    return to_string(st[key])
+}
+
+// First invoke_chain entry (single supported chain step).
+fn _cfg_invoke(cfg) {
+    let mut empty = #{}
+    empty["path"] = ""
+    empty["slug"] = "none"
+    if !cfg.contains_key("invoke_chain") { return empty }
+    let chain = cfg["invoke_chain"]
+    if len(chain) == 0 { return empty }
+    return chain[0]
+}
+
+// ─── fingerprint state (prior poll baseline) ─────────────────────────
+//
+// Layout on disk (state/cert_watch_state.json):
+//   {
+//     "tool": "cert_watch",
+//     "version": "v1",
+//     "updated": "<iso>",
+//     "entries": [
+//        {"path":"...", "mtime":"<epoch>", "size":"<bytes>", "sha":"<sha256>"},
+//        ...
+//     ]
+//   }
+
+fn _load_state(path: string) {
+    let mut empty = #{}
+    empty["entries"] = []
+    if !_file_exists(path) { return empty }
+    let raw = read_file(path)
+    if len(raw.trim()) == 0 { return empty }
+    return json_parse(raw)
+}
+
+// Map-style lookup by path through entries array (no native dict for
+// loaded state so we scan). Returns entry or empty dict.
+fn _state_lookup(state, path: string) {
+    let mut miss = #{}
+    miss["path"] = ""
+    if !state.contains_key("entries") { return miss }
+    let entries = state["entries"]
+    for e in entries {
+        if to_string(e["path"]) == path { return e }
+    }
+    return miss
+}
+
+// Build a fresh state blob from entries array.
+fn _render_state(entries: array) -> string {
+    let mut body = "{\n"
+    body = body + "  \"tool\": \"" + TOOL_NAME + "\",\n"
+    body = body + "  \"version\": \"" + TOOL_VERSION + "\",\n"
+    body = body + "  \"updated\": \"" + _ts_iso() + "\",\n"
+    body = body + "  \"entries\": [\n"
+    let n = len(entries)
+    let mut i = 0
+    while i < n {
+        let e = entries[i]
+        body = body + "    {\"path\":\"" + _json_escape(to_string(e["path"])) + "\""
+        body = body + ",\"mtime\":\"" + to_string(e["mtime"]) + "\""
+        body = body + ",\"size\":\"" + to_string(e["size"]) + "\""
+        body = body + ",\"sha\":\"" + to_string(e["sha"]) + "\"}"
+        if i + 1 < n { body = body + "," }
+        body = body + "\n"
+        i = i + 1
+    }
+    body = body + "  ]\n"
+    body = body + "}\n"
+    return body
+}
+
+// ─── ingest log (append-only proof-chain) ────────────────────────────
+//
+// Layout: JSONL-like array form stored as a single JSON document for
+// easy parsing. Each event record:
+//   {"ts":"...","tool":"cert_watch","event":"modified|added",
+//    "path":"...","old_size":"N","new_size":"M","mtime":"E",
+//    "sha":"...","prev_sha":"...","entry_sha":"...",
+//    "verify_mode":"present|mock|skip","verify_exit":N}
+//
+// We always re-serialize the full array on append (the log is a small
+// O(Δ) structure; sustained volume → rotate via external archiver).
+
+fn _load_log(path: string) -> array {
+    if !_file_exists(path) { return [] }
+    let raw = read_file(path).trim()
+    if len(raw) == 0 { return [] }
+    let doc = json_parse(raw)
+    if !doc.contains_key("events") { return [] }
+    return doc["events"]
+}
+
+fn _render_log(events: array) -> string {
+    let mut body = "{\n"
+    body = body + "  \"tool\": \"" + TOOL_NAME + "\",\n"
+    body = body + "  \"version\": \"" + TOOL_VERSION + "\",\n"
+    body = body + "  \"updated\": \"" + _ts_iso() + "\",\n"
+    body = body + "  \"raw_rule\": \"raw#10 proof-chain append-only\",\n"
+    body = body + "  \"events\": [\n"
+    let n = len(events)
+    let mut i = 0
+    while i < n {
+        let e = events[i]
+        body = body + "    {"
+        body = body + "\"ts\":\"" + to_string(e["ts"]) + "\""
+        body = body + ",\"tool\":\"" + TOOL_NAME + "\""
+        body = body + ",\"event\":\"" + to_string(e["event"]) + "\""
+        body = body + ",\"path\":\"" + _json_escape(to_string(e["path"])) + "\""
+        body = body + ",\"old_size\":\"" + to_string(e["old_size"]) + "\""
+        body = body + ",\"new_size\":\"" + to_string(e["new_size"]) + "\""
+        body = body + ",\"mtime\":\"" + to_string(e["mtime"]) + "\""
+        body = body + ",\"sha\":\"" + to_string(e["sha"]) + "\""
+        body = body + ",\"prev_sha\":\"" + to_string(e["prev_sha"]) + "\""
+        body = body + ",\"entry_sha\":\"" + to_string(e["entry_sha"]) + "\""
+        body = body + ",\"verify_mode\":\"" + to_string(e["verify_mode"]) + "\""
+        body = body + ",\"verify_exit\":" + to_string(e["verify_exit"])
+        body = body + "}"
+        if i + 1 < n { body = body + "," }
+        body = body + "\n"
+        i = i + 1
+    }
+    body = body + "  ]\n"
+    body = body + "}\n"
+    return body
+}
+
+fn _last_entry_sha(events: array) -> string {
+    let n = len(events)
+    if n == 0 { return "genesis" }
+    let last = events[n - 1]
+    return to_string(last["entry_sha"])
+}
+
+// ─── meta2_hashchain_verify integration (present_or_mock) ────────────
+//
+// Return dict: {mode: "present"|"mock"|"skip", exit: N}
+fn _invoke_verify(invoke, path: string) {
+    let mut result = #{}
+    result["mode"] = "skip"
+    result["exit"] = 0
+    let tool_path = to_string(invoke["path"])
+    if len(tool_path) == 0 {
+        result["mode"] = "skip"
+        return result
+    }
+    if _file_exists(tool_path) {
+        let hexa_bin = "/Users/ghost/Dev/hexa-lang/hexa"
+        let cmd = _sh_quote(hexa_bin) + " run " + _sh_quote(tool_path)
+                + " --cert " + _sh_quote(path) + " 2>&1"
+        let rc = _exec_code(cmd)
+        result["mode"] = "present"
+        result["exit"] = rc
+        return result
+    }
+    // Tool absent — log SKIP via the MOCK mode (content-stable, no-op).
+    result["mode"] = "mock"
+    result["exit"] = 0
+    return result
+}
+
+// ─── one poll pass ───────────────────────────────────────────────────
+//
+// Algorithm
+//   1. Load prior fingerprint state (may be empty → first run is baseline).
+//   2. Walk each configured path; for every *.json file:
+//      - Fetch current {mtime, size}.
+//      - Compare against prior state → if new OR size/mtime changed:
+//         * sha256 the file
+//         * invoke verify (present / mock / skip)
+//         * compose event {prev_sha, entry_sha = sha256(body + prev_sha)}
+//         * append to in-memory events list
+//      - Record new fingerprint for the next cycle.
+//   3. Write fresh state + appended log; return #changes.
+
+fn _baseline_first_run(prior_state) -> bool {
+    if !prior_state.contains_key("entries") { return true }
+    let e = prior_state["entries"]
+    if len(e) == 0 { return true }
+    return false
+}
+
+fn run_poll(cfg_path: string) -> int {
+    let cfg = _load_config(cfg_path)
+    let paths = _cfg_paths(cfg)
+    let state_path = _cfg_state_path(cfg, "fingerprint_path", "state/cert_watch_state.json")
+    let log_path   = _cfg_state_path(cfg, "ingest_log_path", "state/cert_ingest_log.json")
+    let invoke = _cfg_invoke(cfg)
+
+    let _ = _mkdir_p("state")
+
+    let prior_state = _load_state(state_path)
+    let first_run = _baseline_first_run(prior_state)
+    let mut events = _load_log(log_path)
+    let mut new_entries = []
+    let mut changes = 0
+
+    for dir in paths {
+        let files = _list_json(to_string(dir))
+        for fp in files {
+            let path = to_string(fp)
+            let mtime = _file_mtime(path)
+            let size  = _file_size(path)
+
+            let prior = _state_lookup(prior_state, path)
+            let had_prior = to_string(prior["path"]) == path
+
+            let old_size = if had_prior { to_string(prior["size"]) } else { "0" }
+            let old_mtime = if had_prior { to_string(prior["mtime"]) } else { "" }
+
+            let changed = (!had_prior) || (mtime != old_mtime) || (size != old_size)
+
+            // First run — seed baseline; emit NO events (per S1 spec).
+            if first_run {
+                let mut entry = #{}
+                entry["path"]  = path
+                entry["mtime"] = mtime
+                entry["size"]  = size
+                entry["sha"]   = _sha256_of_file(path)
+                new_entries.push(entry)
+                continue
+            }
+
+            if !changed {
+                // Carry forward prior fingerprint unchanged.
+                let mut entry = #{}
+                entry["path"]  = path
+                entry["mtime"] = mtime
+                entry["size"]  = size
+                entry["sha"]   = to_string(prior["sha"])
+                new_entries.push(entry)
+                continue
+            }
+
+            // ── change path: compute sha + verify + chain event ──
+            let sha = _sha256_of_file(path)
+            let vres = _invoke_verify(invoke, path)
+            let verify_mode = to_string(vres["mode"])
+            let verify_exit = to_int(to_string(vres["exit"]))
+
+            let ev_type = if had_prior { "modified" } else { "added" }
+            let ts = _ts_iso()
+            let prev_sha = _last_entry_sha(events)
+
+            // canonical body (ordered, deterministic) → entry_sha
+            let canon = "ts=" + ts
+                      + ";event=" + ev_type
+                      + ";path=" + path
+                      + ";old_size=" + old_size
+                      + ";new_size=" + size
+                      + ";mtime=" + mtime
+                      + ";sha=" + sha
+                      + ";prev=" + prev_sha
+                      + ";verify=" + verify_mode + "/" + to_string(verify_exit)
+            let entry_sha = _sha256_of_string(canon)
+
+            let mut event = #{}
+            event["ts"]          = ts
+            event["event"]       = ev_type
+            event["path"]        = path
+            event["old_size"]    = old_size
+            event["new_size"]    = size
+            event["mtime"]       = mtime
+            event["sha"]         = sha
+            event["prev_sha"]    = prev_sha
+            event["entry_sha"]   = entry_sha
+            event["verify_mode"] = verify_mode
+            event["verify_exit"] = verify_exit
+            events.push(event)
+            changes = changes + 1
+
+            // update fingerprint for next cycle
+            let mut entry = #{}
+            entry["path"]  = path
+            entry["mtime"] = mtime
+            entry["size"]  = size
+            entry["sha"]   = sha
+            new_entries.push(entry)
+        }
+    }
+
+    // ── persist state + log (atomic-ish: write fresh body) ──
+    // Ensure parent directories exist (selftest uses nested sandbox paths).
+    let _md1 = exec_with_status("mkdir -p " + _sh_quote(_dirname(state_path)))
+    let _md2 = exec_with_status("mkdir -p " + _sh_quote(_dirname(log_path)))
+    let _w1 = write_file(state_path, _render_state(new_entries))
+    let _w2 = write_file(log_path, _render_log(events))
+    if !_file_exists(state_path) {
+        eprintln(TOOL_NAME + ": ERROR — failed to write " + state_path)
+        return 2
+    }
+    if !_file_exists(log_path) {
+        eprintln(TOOL_NAME + ": ERROR — failed to write " + log_path)
+        return 2
+    }
+
+    println(TOOL_NAME + " poll: files_tracked=" + to_string(len(new_entries))
+          + " changes=" + to_string(changes)
+          + " first_run=" + (if first_run { "yes" } else { "no" })
+          + " verify_mode=" + (if _file_exists(to_string(invoke["path"])) { "present" } else { "mock" }))
+    return 0
+}
+
+// ─── inline selftest (3-step, uses --once semantics) ─────────────────
+//
+// S1 initial scan    → state file created, log empty
+// S2 synthetic touch → event logged next --once run
+// S3 unchanged       → no duplicate event
+
+fn _selftest() -> int {
+    println("cert_watch selftest — 3 steps")
+
+    // Build an isolated sandbox so we don't pollute repo state.
+    let sandbox = "state/_cert_watch_selftest"
+    let _ = exec_with_status("rm -rf " + _sh_quote(sandbox))
+    let _ = _mkdir_p(sandbox)
+    let watch_dir = sandbox + "/watch"
+    let _ = _mkdir_p(watch_dir)
+
+    let cfg_path   = sandbox + "/config.json"
+    let state_path = sandbox + "/state.json"
+    let log_path   = sandbox + "/log.json"
+
+    let cfg_body = "{\n"
+        + "  \"schema\": \"cert_watch.config.v1\",\n"
+        + "  \"poll_interval_s\": 60,\n"
+        + "  \"paths\": [\"" + watch_dir + "\"],\n"
+        + "  \"invoke_chain\": [ {\"slug\":\"meta2_hashchain_verify\",\"path\":\"tool/meta2_hashchain_verify.hexa\",\"mode\":\"present_or_mock\",\"required\":false} ],\n"
+        + "  \"state\": {\"fingerprint_path\":\"" + state_path + "\", \"ingest_log_path\":\"" + log_path + "\"}\n"
+        + "}\n"
+    let _w = write_file(cfg_path, cfg_body)
+
+    // Seed two cert files before the first poll.
+    let _s1 = write_file(watch_dir + "/alpha.json", "{\"id\":\"alpha\",\"v\":1}\n")
+    let _s2 = write_file(watch_dir + "/beta.json",  "{\"id\":\"beta\",\"v\":1}\n")
+
+    // ── S1: initial scan → state created, log has zero events ──
+    let r1 = run_poll(cfg_path)
+    let s1_state_ok = _file_exists(state_path)
+    let s1_log_events = _load_log(log_path)
+    let s1_pass = (r1 == 0) && s1_state_ok && (len(s1_log_events) == 0)
+    println("  S1 initial_scan      r=" + to_string(r1)
+          + " state_created=" + (if s1_state_ok { "yes" } else { "no" })
+          + " log_events=" + to_string(len(s1_log_events))
+          + " → " + (if s1_pass { "PASS" } else { "FAIL" }))
+
+    // ── S2: synthetic touch → next poll logs exactly 1 event ──
+    // Sleep 1s so mtime ticks forward even on coarse-grained FS.
+    let _sl = exec_with_status("sleep 1")
+    let _s3 = write_file(watch_dir + "/alpha.json", "{\"id\":\"alpha\",\"v\":2,\"mutated\":true}\n")
+    let r2 = run_poll(cfg_path)
+    let s2_log_events = _load_log(log_path)
+    let s2_count = len(s2_log_events)
+    // exactly one new event; payload must reference alpha.json and event=modified
+    let mut s2_target_ok = false
+    if s2_count >= 1 {
+        let last = s2_log_events[s2_count - 1]
+        let ev = to_string(last["event"])
+        let p  = to_string(last["path"])
+        if (ev == "modified") && (p == watch_dir + "/alpha.json") { s2_target_ok = true }
+    }
+    let s2_pass = (r2 == 0) && (s2_count == 1) && s2_target_ok
+    println("  S2 synthetic_touch   r=" + to_string(r2)
+          + " log_events=" + to_string(s2_count)
+          + " target_ok=" + (if s2_target_ok { "yes" } else { "no" })
+          + " → " + (if s2_pass { "PASS" } else { "FAIL" }))
+
+    // ── S3: unchanged → no new event (log count stable) ──
+    let r3 = run_poll(cfg_path)
+    let s3_log_events = _load_log(log_path)
+    let s3_count = len(s3_log_events)
+    let s3_pass = (r3 == 0) && (s3_count == s2_count)
+    println("  S3 unchanged         r=" + to_string(r3)
+          + " log_events=" + to_string(s3_count)
+          + " (expected=" + to_string(s2_count) + ")"
+          + " → " + (if s3_pass { "PASS" } else { "FAIL" }))
+
+    let pass_n = (if s1_pass { 1 } else { 0 })
+               + (if s2_pass { 1 } else { 0 })
+               + (if s3_pass { 1 } else { 0 })
+    println("selftest: " + to_string(pass_n) + "/3 PASS")
+
+    // cleanup sandbox (keep artefacts on FAIL for triage)
+    if pass_n == 3 {
+        let _c = exec_with_status("rm -rf " + _sh_quote(sandbox))
+        return 0
+    }
+    return 3
+}
+
+// ─── usage / entry ───────────────────────────────────────────────────
+
+fn _usage() {
+    println("usage: hexa tool/cert_watch.hexa <mode>")
+    println("  --once                 single poll then exit (uses shared/config/cert_watch_config.json)")
+    println("  --selftest             inline 3-step selftest (S1 initial, S2 touch, S3 unchanged)")
+    println("  --config <path>        override config path")
+    println("  --help                 show this message")
+}
+
+fn main() -> int {
+    let argv = args()
+    let mut mode = "once"
+    let mut cfg_path = DEFAULT_CONFIG
+    let mut i = 0
+    while i < len(argv) {
+        let a = to_string(argv[i])
+        if a == "--help" || a == "-h" { _usage(); return 0 }
+        else if a == "--once"     { mode = "once" }
+        else if a == "--selftest" { mode = "selftest" }
+        else if a == "--config" && i + 1 < len(argv) {
+            cfg_path = to_string(argv[i + 1])
+            i = i + 1
+        }
+        i = i + 1
+    }
+
+    if mode == "selftest" { return _selftest() }
+
+    // default: --once single poll
+    return run_poll(cfg_path)
+}
