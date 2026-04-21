@@ -1,0 +1,620 @@
+// tool/corpus_curriculum_tier.hexa — corpus curriculum tier 30/50/70 splitter
+//
+// PURPOSE
+//   roadmap #68 (Seed D TOP10 GAP #4) — split an ALM corpus JSONL into 3-4
+//   consciousness-density bands (<30%, 30-50%, 50-70%, >70%) and attach a
+//   per-tier cert reward multiplier (0.7 / 1.0 / 1.3 / 1.5).  Downstream
+//   AN11(a) trainer consumes tier files for curriculum sample efficiency
+//   A/B (exit criterion: epoch-count compare).
+//
+//   Upstream  : experiments/alm_r13/corpus_alm_r13_v1.jsonl (or r12 fallback)
+//   Downstream: tier[1-4].jsonl + state/corpus_tier_manifest.json (SSOT)
+//
+// DENSITY MODEL
+//   per-line unique_keyword_fraction — for each JSONL line, scan prompt+response
+//   against the G3 consciousness keyword set (reused from alm_corpus_validate,
+//   loaded via config/alm_corpus_validate_config.json; fallback list baked into
+//   corpus_curriculum_tier_config.json so raw#15 holds even with upstream gone).
+//   density = unique_keywords_matched / total_keyword_count   ∈ [0, 1]
+//
+// TIER BANDS (half-open [lo, hi); config-driven)
+//   tier1_low     [0.00, 0.30)   × 0.7
+//   tier2_mid     [0.30, 0.50)   × 1.0
+//   tier3_high    [0.50, 0.70)   × 1.3
+//   tier4_summit  [0.70, 1.01)   × 1.5  (optional 4th band per task spec)
+//
+// USAGE
+//   hexa tool/corpus_curriculum_tier.hexa --corpus <path>
+//   hexa tool/corpus_curriculum_tier.hexa --self-test
+//
+// CONFIG
+//   config/corpus_curriculum_tier_config.json      (runtime mirror)
+//   shared/config/corpus_curriculum_tier_config.json (SSOT, gitignored)
+//
+// OUTPUTS
+//   state/corpus_tier_tier1_low.jsonl
+//   state/corpus_tier_tier2_mid.jsonl
+//   state/corpus_tier_tier3_high.jsonl
+//   state/corpus_tier_tier4_summit.jsonl
+//   state/corpus_tier_manifest.json   (paths + counts + sha256 + multipliers)
+//
+// SELF-TESTS (--self-test)
+//   S1 all-high synthetic corpus   → tier3+ receives every line
+//   S2 mixed synthetic corpus      → each band receives at least one line
+//   S3 all-low  synthetic corpus   → tier1 receives every line
+//
+// RULES
+//   raw#9  hexa-only (no python)
+//   raw#10 proof-carrying — manifest embeds sha256(input) and sha256(per tier)
+//   raw#11 snake_case
+//   raw#12 new .hexa (not amending an existing module)
+//   raw#15 thresholds/keywords/paths loaded from JSON config
+//   raw#25 atomic tmp+mv writes (concurrent-git-lock safe)
+//
+// DETERMINISTIC: pure string + file ops; NO LLM; NO network.
+
+let CONFIG_PATH_PRIMARY  = "config/corpus_curriculum_tier_config.json"
+let CONFIG_PATH_SSOT     = "shared/config/corpus_curriculum_tier_config.json"
+let UPSTREAM_G3_CONFIG   = "config/alm_corpus_validate_config.json"
+
+// ─── arg helpers ──────────────────────────────────────────────────────
+
+fn arg_value(argv, key, dflt) {
+    let mut i = 0
+    while i < len(argv) {
+        if argv[i] == key && i + 1 < len(argv) { return argv[i + 1] }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn arg_present(argv, key) {
+    let mut i = 0
+    while i < len(argv) {
+        if argv[i] == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── fs / shell helpers ───────────────────────────────────────────────
+
+fn fexists(p) {
+    return exec("test -f " + p + " && echo 1 || echo 0").trim() == "1"
+}
+
+fn dexists(p) {
+    return exec("test -d " + p + " && echo 1 || echo 0").trim() == "1"
+}
+
+fn now_stamp() { return exec("date -u +%FT%TZ").trim() }
+
+fn sha256_of_file(p) {
+    if !fexists(p) { return "" }
+    return exec("shasum -a 256 " + p + " 2>/dev/null | awk '{print $1}'").trim()
+}
+
+fn atomic_write(path, body) {
+    let tmp = path + ".tmp." + exec("printf %s $$").trim()
+    write_file(tmp, body)
+    let _ = exec("mv -f " + tmp + " " + path)
+}
+
+fn ensure_dir(d) {
+    if !dexists(d) { let _ = exec("mkdir -p " + d) }
+}
+
+// ─── JSON helpers ─────────────────────────────────────────────────────
+
+fn json_escape(s) {
+    let a = s.replace("\\", "\\\\")
+    let b = a.replace("\"", "\\\"")
+    let c = b.replace("\n", "\\n")
+    let d = c.replace("\r", "\\r")
+    let e = d.replace("\t", "\\t")
+    return e
+}
+
+fn is_json_map(v) {
+    let s = str(v)
+    if s.len() < 1 { return false }
+    return s.substring(0, 1) == "{"
+}
+
+// ─── config loader ────────────────────────────────────────────────────
+//
+// Load primary runtime-mirror config; if absent, fall back to SSOT.
+// Terminates with SETUP_ERROR (exit 2) if neither exists.
+
+fn load_config() {
+    let p = if fexists(CONFIG_PATH_PRIMARY) {
+        CONFIG_PATH_PRIMARY
+    } else {
+        CONFIG_PATH_SSOT
+    }
+    if !fexists(p) {
+        println("corpus_curriculum_tier: SETUP_ERROR — config missing at " + CONFIG_PATH_PRIMARY + " / " + CONFIG_PATH_SSOT)
+        exit(2)
+    }
+    let raw = read_file(p)
+    let cfg = json_parse(raw)
+    if !is_json_map(cfg) {
+        println("corpus_curriculum_tier: SETUP_ERROR — malformed config JSON: " + p)
+        exit(2)
+    }
+    return cfg
+}
+
+// ─── keyword set loader ───────────────────────────────────────────────
+//
+// Reuse the G3 keyword set from alm_corpus_validate_config.json (raw#15:
+// single source of truth for "what counts as consciousness").  If the
+// upstream config is missing or malformed, fall back to the inline list
+// inside corpus_curriculum_tier_config.json.
+
+fn load_keyword_set(cfg) {
+    if fexists(UPSTREAM_G3_CONFIG) {
+        let raw = read_file(UPSTREAM_G3_CONFIG)
+        let up = json_parse(raw)
+        if is_json_map(up) && up.contains_key("g3_consciousness_keywords") {
+            return up["g3_consciousness_keywords"]
+        }
+    }
+    return cfg["consciousness_keywords_fallback"]
+}
+
+// ─── density scorer ───────────────────────────────────────────────────
+//
+// per-line unique_keyword_fraction over prompt + response text.
+// "unique" = each keyword counts at most once per line (presence, not
+// frequency). this gives a bounded [0, 1] ratio irrespective of line
+// length, which matches how alm_corpus_validate G3 scores lines (presence).
+
+fn line_density(prompt_s, response_s, keywords) {
+    let n = len(keywords)
+    if n == 0 { return 0.0 }
+    let mut hits = 0
+    let mut ki = 0
+    while ki < n {
+        let kw = keywords[ki]
+        if prompt_s.contains(kw) || response_s.contains(kw) {
+            hits = hits + 1
+        }
+        ki = ki + 1
+    }
+    return to_float(hits) / to_float(n)
+}
+
+// ─── band assignment ──────────────────────────────────────────────────
+//
+// Assign a density d to a configured band.  Bands are half-open [lo, hi).
+// Returns index into the band array (0-based) or -1 if unmatched.
+
+fn assign_band(d, bands) {
+    let mut i = 0
+    while i < len(bands) {
+        let b = bands[i]
+        let lo = to_float(str(b["lo"]))
+        let hi = to_float(str(b["hi"]))
+        if d >= lo && d < hi { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── split execution ──────────────────────────────────────────────────
+
+fn split_corpus(corpus_path, cfg) {
+    let bands = cfg["tier_bands"]
+    let n_bands = len(bands)
+    let output_dir = str(cfg["output_dir"])
+    let prefix = str(cfg["tier_jsonl_prefix"])
+    let manifest_path = str(cfg["manifest_path"])
+
+    ensure_dir(output_dir)
+
+    let keywords = load_keyword_set(cfg)
+
+    // per-band accumulators — one []string of raw JSONL lines, plus counters
+    let mut band_lines = []
+    let mut band_counts = []
+    let mut band_density_sum = []
+    let mut b_init = 0
+    while b_init < n_bands {
+        band_lines = band_lines.push([])
+        band_counts = band_counts.push(0)
+        band_density_sum = band_density_sum.push(0.0)
+        b_init = b_init + 1
+    }
+
+    let raw = read_file(corpus_path)
+    let lines = raw.split("\n")
+    let total_raw = len(lines)
+    let mut nonempty = 0
+    let mut json_ok = 0
+    let mut json_fail = 0
+    let mut unassigned = 0
+
+    let mut li = 0
+    while li < total_raw {
+        let line = lines[li]
+        let trimmed = line.trim()
+        if trimmed.len() > 0 {
+            nonempty = nonempty + 1
+            let m = json_parse(trimmed)
+            if !is_json_map(m) {
+                json_fail = json_fail + 1
+            } else {
+                json_ok = json_ok + 1
+                let prompt_s = if m.contains_key("prompt") { str(m["prompt"]) } else { "" }
+                let response_s = if m.contains_key("response") { str(m["response"]) } else { "" }
+                let d = line_density(prompt_s, response_s, keywords)
+                let idx = assign_band(d, bands)
+                if idx < 0 {
+                    unassigned = unassigned + 1
+                } else {
+                    band_lines[idx] = band_lines[idx].push(trimmed)
+                    band_counts[idx] = band_counts[idx] + 1
+                    band_density_sum[idx] = band_density_sum[idx] + d
+                }
+            }
+        }
+        li = li + 1
+    }
+
+    // write per-band jsonl
+    let mut band_paths = []
+    let mut band_shas = []
+    let mut bi = 0
+    while bi < n_bands {
+        let b = bands[bi]
+        let label = str(b["label"])
+        let path = prefix + "_" + label + ".jsonl"
+        let arr = band_lines[bi]
+        let mut body = ""
+        let mut ai = 0
+        while ai < len(arr) {
+            body = body + arr[ai] + "\n"
+            ai = ai + 1
+        }
+        atomic_write(path, body)
+        band_paths = band_paths.push(path)
+        band_shas = band_shas.push(sha256_of_file(path))
+        bi = bi + 1
+    }
+
+    // build manifest JSON
+    let corpus_sha = sha256_of_file(corpus_path)
+    let stamp = now_stamp()
+    let mut parts = []
+    parts = parts.push("{\n")
+    parts = parts.push("  \"tool\": \"corpus_curriculum_tier\",\n")
+    parts = parts.push("  \"version\": \"v1\",\n")
+    parts = parts.push("  \"generated\": \"" + stamp + "\",\n")
+    parts = parts.push("  \"corpus_path\": \"" + json_escape(corpus_path) + "\",\n")
+    parts = parts.push("  \"corpus_sha256\": \"" + corpus_sha + "\",\n")
+    parts = parts.push("  \"corpus_lines_raw\": " + str(total_raw) + ",\n")
+    parts = parts.push("  \"corpus_lines_nonempty\": " + str(nonempty) + ",\n")
+    parts = parts.push("  \"json_ok\": " + str(json_ok) + ",\n")
+    parts = parts.push("  \"json_fail\": " + str(json_fail) + ",\n")
+    parts = parts.push("  \"unassigned\": " + str(unassigned) + ",\n")
+    parts = parts.push("  \"keyword_count\": " + str(len(keywords)) + ",\n")
+    parts = parts.push("  \"tiers\": [\n")
+    let mut tj = 0
+    while tj < n_bands {
+        let b = bands[tj]
+        let label = str(b["label"])
+        let tier_no = str(b["tier"])
+        let lo = str(b["lo"])
+        let hi = str(b["hi"])
+        let mult = str(b["reward_multiplier"])
+        let cnt = band_counts[tj]
+        let dsum = band_density_sum[tj]
+        let avg = if cnt > 0 { dsum / to_float(cnt) } else { 0.0 }
+        let comma = if tj + 1 < n_bands { "," } else { "" }
+        parts = parts.push("    { \"tier\": " + tier_no
+                         + ", \"label\": \"" + json_escape(label) + "\""
+                         + ", \"lo\": " + lo
+                         + ", \"hi\": " + hi
+                         + ", \"reward_multiplier\": " + mult
+                         + ", \"count\": " + str(cnt)
+                         + ", \"avg_density\": " + str(avg)
+                         + ", \"path\": \"" + json_escape(band_paths[tj]) + "\""
+                         + ", \"sha256\": \"" + band_shas[tj] + "\""
+                         + " }" + comma + "\n")
+        tj = tj + 1
+    }
+    parts = parts.push("  ],\n")
+    parts = parts.push("  \"safe_commit\": \"V8\",\n")
+    parts = parts.push("  \"deterministic\": true,\n")
+    parts = parts.push("  \"llm\": \"none\"\n")
+    parts = parts.push("}\n")
+
+    let mut body = ""
+    let mut pj = 0
+    while pj < len(parts) {
+        body = body + parts[pj]
+        pj = pj + 1
+    }
+    atomic_write(manifest_path, body)
+
+    // build result summary map
+    let mut r = json_parse("{}")
+    r["total_raw"] = total_raw
+    r["nonempty"] = nonempty
+    r["json_ok"] = json_ok
+    r["json_fail"] = json_fail
+    r["unassigned"] = unassigned
+    r["band_counts"] = band_counts
+    r["band_paths"] = band_paths
+    r["manifest_path"] = manifest_path
+    return r
+}
+
+// ─── console summary ──────────────────────────────────────────────────
+
+fn print_summary(r, cfg) {
+    let bands = cfg["tier_bands"]
+    let band_counts = r["band_counts"]
+    let band_paths = r["band_paths"]
+    println("corpus_curriculum_tier=SPLIT_DONE")
+    println("  raw=" + str(r["total_raw"]) + "  nonempty=" + str(r["nonempty"])
+             + "  json_ok=" + str(r["json_ok"]) + "  json_fail=" + str(r["json_fail"])
+             + "  unassigned=" + str(r["unassigned"]))
+    let mut i = 0
+    while i < len(bands) {
+        let b = bands[i]
+        let label = str(b["label"])
+        let lo = str(b["lo"])
+        let hi = str(b["hi"])
+        let mult = str(b["reward_multiplier"])
+        println("  " + label
+                 + "  [" + lo + "," + hi + ")"
+                 + "  x" + mult
+                 + "  count=" + str(band_counts[i])
+                 + "  path=" + band_paths[i])
+        i = i + 1
+    }
+    println("  manifest=" + str(r["manifest_path"]))
+}
+
+// ─── self tests ───────────────────────────────────────────────────────
+//
+// Three synthetic corpora under state/selftest_curriculum_tier/:
+//   S1 high.jsonl   — every line has many keywords        → tier3+ only
+//   S2 mixed.jsonl  — proportional split across 4 bands   → each band ≥ 1
+//   S3 low.jsonl    — every line has zero keywords        → tier1 only
+// All three return PASS iff the invariants above hold.
+
+fn build_line(id, prompt, response) {
+    return "{\"id\":\"" + json_escape(id) + "\","
+         + "\"prompt\":\"" + json_escape(prompt) + "\","
+         + "\"response\":\"" + json_escape(response) + "\","
+         + "\"source\":\"selftest\","
+         + "\"category\":\"selftest\"}"
+}
+
+// helper: write synth corpus lines to a path
+fn write_synth(path, lines) {
+    let mut body = ""
+    let mut i = 0
+    while i < len(lines) {
+        body = body + lines[i] + "\n"
+        i = i + 1
+    }
+    atomic_write(path, body)
+}
+
+// run split + classify → returns per-tier count array
+fn run_split_and_report(corpus_path, cfg) {
+    let r = split_corpus(corpus_path, cfg)
+    return r["band_counts"]
+}
+
+// build a whitespace-separated bag of the first k keywords (selftest helper)
+fn bag_of_keywords(keywords, k) {
+    let mut s = ""
+    let mut i = 0
+    while i < k {
+        s = s + keywords[i] + " "
+        i = i + 1
+    }
+    return s
+}
+
+fn all_in_upper_tiers(counts, lower_cutoff) {
+    // lower_cutoff is the exclusive upper index of "low" tiers (e.g. 2 = tier1,tier2 disallowed)
+    let mut i = 0
+    while i < lower_cutoff {
+        if counts[i] > 0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn all_in_lower_tier(counts, upper_cutoff) {
+    // upper_cutoff is the exclusive lower index of "upper" tiers (e.g. 1 = tier2+ disallowed)
+    let mut i = upper_cutoff
+    while i < len(counts) {
+        if counts[i] > 0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn sum_arr(a) {
+    let mut s = 0
+    let mut i = 0
+    while i < len(a) {
+        s = s + a[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn self_test() {
+    println("── corpus_curriculum_tier self-test ──")
+    let cfg = load_config()
+    let keywords = load_keyword_set(cfg)
+    let nkw = len(keywords)
+
+    // Build synthetic lines programmatically so density is deterministic w.r.t.
+    // actual keyword list (raw#15 — don't hardcode assumptions about which
+    // words are keywords; read them from config).
+    let dir = str(cfg["selftest_corpus_dir"])
+    ensure_dir(dir)
+
+    // --- S1 all-high: each line hits 80%+ of keywords
+    let n_high_hits = (nkw * 4) / 5        // ~80% of keyword count
+    let mut high_bag = ""
+    let mut hi = 0
+    while hi < n_high_hits {
+        high_bag = high_bag + keywords[hi] + " "
+        hi = hi + 1
+    }
+    let mut s1_lines = []
+    let mut s1i = 0
+    while s1i < 5 {
+        s1_lines = s1_lines.push(build_line("s1_" + str(s1i),
+                                            "high density probe " + str(s1i) + ": " + high_bag,
+                                            "reflecting on " + high_bag))
+        s1i = s1i + 1
+    }
+    let s1_path = dir + "/s1_high.jsonl"
+    write_synth(s1_path, s1_lines)
+
+    // --- S3 all-low: zero keywords
+    let mut s3_lines = []
+    let mut s3i = 0
+    while s3i < 5 {
+        s3_lines = s3_lines.push(build_line("s3_" + str(s3i),
+                                            "completely neutral prompt about weather index " + str(s3i),
+                                            "the sky color varies with atmospheric scattering intensity"))
+        s3i = s3i + 1
+    }
+    let s3_path = dir + "/s3_low.jsonl"
+    write_synth(s3_path, s3_lines)
+
+    // --- S2 mixed: planted to hit each of 4 bands deterministically.
+    //   density = unique_kw_hits / nkw
+    //   target bands: [0, 0.30), [0.30, 0.50), [0.50, 0.70), [0.70, 1.01)
+    //   midpoints:       0.15        0.40         0.60         0.85
+    //   kw count for midpoint = round(mid * nkw).  We floor-divide and add a
+    //   nudge so we don't straddle a boundary.
+    let n_t1 = (nkw * 15) / 100       // ~15%  → tier1
+    let n_t2 = (nkw * 40) / 100       // ~40%  → tier2
+    let n_t3 = (nkw * 60) / 100       // ~60%  → tier3
+    let n_t4 = (nkw * 85) / 100       // ~85%  → tier4
+    let bag_t1 = bag_of_keywords(keywords, n_t1)
+    let bag_t2 = bag_of_keywords(keywords, n_t2)
+    let bag_t3 = bag_of_keywords(keywords, n_t3)
+    let bag_t4 = bag_of_keywords(keywords, n_t4)
+    let mut s2_lines = []
+    let mut gi = 0
+    while gi < 3 {
+        s2_lines = s2_lines.push(build_line("s2_t1_" + str(gi),
+                                            "t1 prompt " + str(gi) + ": " + bag_t1,
+                                            "t1 response " + bag_t1))
+        s2_lines = s2_lines.push(build_line("s2_t2_" + str(gi),
+                                            "t2 prompt " + str(gi) + ": " + bag_t2,
+                                            "t2 response " + bag_t2))
+        s2_lines = s2_lines.push(build_line("s2_t3_" + str(gi),
+                                            "t3 prompt " + str(gi) + ": " + bag_t3,
+                                            "t3 response " + bag_t3))
+        s2_lines = s2_lines.push(build_line("s2_t4_" + str(gi),
+                                            "t4 prompt " + str(gi) + ": " + bag_t4,
+                                            "t4 response " + bag_t4))
+        gi = gi + 1
+    }
+    let s2_path = dir + "/s2_mixed.jsonl"
+    write_synth(s2_path, s2_lines)
+
+    // --- Run + verify
+    let mut pass_count = 0
+    let mut fail_count = 0
+
+    // S1: all lines should land in tier3_high (idx 2) or tier4_summit (idx 3)
+    let c1 = run_split_and_report(s1_path, cfg)
+    let s1_total = sum_arr(c1)
+    let s1_upper_only = all_in_upper_tiers(c1, 2)  // disallow idx 0 (tier1) and idx 1 (tier2)
+    let s1_pass = s1_total > 0 && s1_upper_only
+    if s1_pass {
+        println("  S1 all-high    : PASS  counts=" + str(c1))
+        pass_count = pass_count + 1
+    } else {
+        println("  S1 all-high    : FAIL  counts=" + str(c1))
+        fail_count = fail_count + 1
+    }
+
+    // S2: each of 4 bands should have ≥ 1 line (proportional split)
+    let c2 = run_split_and_report(s2_path, cfg)
+    let mut s2_each_nonempty = true
+    let mut s2k = 0
+    while s2k < len(c2) {
+        if c2[s2k] == 0 { s2_each_nonempty = false }
+        s2k = s2k + 1
+    }
+    let s2_pass = s2_each_nonempty
+    if s2_pass {
+        println("  S2 mixed       : PASS  counts=" + str(c2))
+        pass_count = pass_count + 1
+    } else {
+        println("  S2 mixed       : FAIL  counts=" + str(c2)
+                 + "  (expected all 4 bands > 0)")
+        fail_count = fail_count + 1
+    }
+
+    // S3: all lines should land in tier1_low (idx 0)
+    let c3 = run_split_and_report(s3_path, cfg)
+    let s3_total = sum_arr(c3)
+    let s3_lower_only = all_in_lower_tier(c3, 1)   // disallow idx 1,2,3
+    let s3_pass = s3_total > 0 && s3_lower_only
+    if s3_pass {
+        println("  S3 all-low     : PASS  counts=" + str(c3))
+        pass_count = pass_count + 1
+    } else {
+        println("  S3 all-low     : FAIL  counts=" + str(c3))
+        fail_count = fail_count + 1
+    }
+
+    println("selftest: " + str(pass_count) + "/" + str(pass_count + fail_count) + " PASS")
+    if fail_count > 0 { return 1 }
+    return 0
+}
+
+// ─── CLI entry ────────────────────────────────────────────────────────
+
+fn print_usage() {
+    println("usage: hexa tool/corpus_curriculum_tier.hexa --corpus <path>")
+    println("       hexa tool/corpus_curriculum_tier.hexa --self-test")
+    println("  --corpus   path to JSONL corpus")
+    println("  --self-test  run S1/S2/S3 selftest")
+    println("  config:   " + CONFIG_PATH_PRIMARY + " (fallback " + CONFIG_PATH_SSOT + ")")
+}
+
+fn main() {
+    let argv = args()
+    if arg_present(argv, "--help") || arg_present(argv, "-h") {
+        print_usage()
+        exit(0)
+    }
+    if arg_present(argv, "--self-test") || arg_present(argv, "-s") {
+        let code = self_test()
+        exit(code)
+    }
+    let corpus = arg_value(argv, "--corpus", "")
+    if corpus == "" {
+        print_usage()
+        exit(2)
+    }
+    if !fexists(corpus) {
+        println("corpus_curriculum_tier: SETUP_ERROR — corpus not found: " + corpus)
+        exit(2)
+    }
+    let cfg = load_config()
+    let r = split_corpus(corpus, cfg)
+    print_summary(r, cfg)
+    exit(0)
+}
+
+main()
