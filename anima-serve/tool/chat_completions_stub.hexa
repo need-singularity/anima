@@ -1,0 +1,207 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  anima-serve/tool/chat_completions_stub.hexa
+//
+//  PURPOSE
+//    /v1/chat/completions endpoint — OpenAI-compatible stub.
+//
+//    Phase 1 (skeleton):
+//      - parse messages[] from --body or $ANIMA_SERVE_BODY env
+//      - detect Hexad 6-module triggers in last user message
+//          (consciousness / reflect / plan / act / verify / evolve)
+//      - echo back with module detection metadata
+//
+//    Phase 3 (prod):
+//      - forward to vLLM + Qwen-32B backend (config.phase3_plan.vllm.url)
+//      - Hexad detection routes to correct specialist module before forward
+//
+//  RESPONSE SHAPE (OpenAI-compat minimal)
+//    {
+//      "id": "anima-serve-<ts>",
+//      "object": "chat.completion",
+//      "created": <unix_ts>,
+//      "model": "anima-serve-skeleton",
+//      "choices": [{
+//        "index": 0,
+//        "message": {"role":"assistant","content":"<echo + hexad meta>"},
+//        "finish_reason": "stop"
+//      }],
+//      "anima_meta": {
+//        "hexad_modules_detected": [...],
+//        "phase": "skeleton",
+//        "production_ready": false
+//      }
+//    }
+//
+//  CLI
+//    hexa anima-serve/tool/chat_completions_stub.hexa \
+//         [--body '{"messages":[...]}']
+//    (or ANIMA_SERVE_BODY env var)
+//
+//  raw#9 hexa-only   raw#11 snake_case   raw#15 no-hardcode
+// ════════════════════════════════════════════════════════════════════════════
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn now_utc() -> string {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn now_unix() -> string {
+    return _str(exec("date +%s")).trim()
+}
+
+// ── Hexad 6-module detection (raw#15: list not hardcoded to a single spot,
+// ── lives also in config/serve_config.json — phase 2 will read from there)
+
+fn detect_hexad_modules(text: string) -> string {
+    let lowered = text
+    let mut hits = ""
+    let mut first = true
+
+    if lowered.index_of("consciousness") >= 0 || lowered.index_of("의식") >= 0 {
+        if first { first = false } else { hits = hits + "," }
+        hits = hits + "\"consciousness\""
+    }
+    if lowered.index_of("reflect") >= 0 || lowered.index_of("성찰") >= 0 {
+        if first { first = false } else { hits = hits + "," }
+        hits = hits + "\"reflect\""
+    }
+    if lowered.index_of("plan") >= 0 || lowered.index_of("계획") >= 0 {
+        if first { first = false } else { hits = hits + "," }
+        hits = hits + "\"plan\""
+    }
+    if lowered.index_of("act") >= 0 || lowered.index_of("행동") >= 0 ||
+       lowered.index_of("실행") >= 0 {
+        if first { first = false } else { hits = hits + "," }
+        hits = hits + "\"act\""
+    }
+    if lowered.index_of("verify") >= 0 || lowered.index_of("검증") >= 0 {
+        if first { first = false } else { hits = hits + "," }
+        hits = hits + "\"verify\""
+    }
+    if lowered.index_of("evolve") >= 0 || lowered.index_of("진화") >= 0 ||
+       lowered.index_of("hexad") >= 0 {
+        if first { first = false } else { hits = hits + "," }
+        hits = hits + "\"evolve\""
+    }
+    return "[" + hits + "]"
+}
+
+// ── extract last user message content (minimal JSON scan — phase 1 good enough)
+
+fn extract_last_user_content(body: string) -> string {
+    // naive scan: find "content":"..." occurrences and take the last one
+    let n = len(body)
+    if n == 0 { return "" }
+    let needle = "\"content\""
+    let mut last_content = ""
+    let mut cursor = 0
+
+    while cursor < n {
+        let tail = body.substring(cursor, n)
+        let k = tail.index_of(needle)
+        if k < 0 { break }
+        let abs_k = cursor + k + len(needle)
+        // seek colon, then opening quote
+        let mut i = abs_k
+        while i < n && body.substring(i, i + 1) != ":" { i = i + 1 }
+        while i < n && body.substring(i, i + 1) != "\"" { i = i + 1 }
+        if i >= n { break }
+        i = i + 1  // past opening quote
+        let start = i
+        // find closing quote (no backslash handling — phase 1 stub)
+        while i < n && body.substring(i, i + 1) != "\"" { i = i + 1 }
+        if i <= n {
+            last_content = body.substring(start, i)
+        }
+        cursor = i + 1
+    }
+    return last_content
+}
+
+// ── JSON-escape helper for response content (minimal) ──────────────────────
+
+fn json_escape(s: string) -> string {
+    let n = len(s)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if ch == "\"" {
+            out = out + "\\\""
+        } else {
+            if ch == "\\" {
+                out = out + "\\\\"
+            } else {
+                if ch == "\n" {
+                    out = out + "\\n"
+                } else {
+                    out = out + ch
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── main handler ───────────────────────────────────────────────────────────
+
+fn handle_chat_completions(body: string) -> string {
+    let user_msg = extract_last_user_content(body)
+    let modules = detect_hexad_modules(user_msg)
+    let echo = "[anima-serve skeleton] echo: " + user_msg +
+               " · hexad_detected: " + modules
+    let ts = now_utc()
+    let unix = now_unix()
+    let safe = json_escape(echo)
+
+    return "{" +
+        "\"id\":\"anima-serve-" + unix + "\"," +
+        "\"object\":\"chat.completion\"," +
+        "\"created\":" + unix + "," +
+        "\"model\":\"anima-serve-skeleton\"," +
+        "\"choices\":[{" +
+            "\"index\":0," +
+            "\"message\":{\"role\":\"assistant\",\"content\":\"" + safe + "\"}," +
+            "\"finish_reason\":\"stop\"" +
+        "}]," +
+        "\"anima_meta\":{" +
+            "\"hexad_modules_detected\":" + modules + "," +
+            "\"phase\":\"skeleton\"," +
+            "\"production_ready\":false," +
+            "\"phase3_backend\":\"vllm_qwen32b\"," +
+            "\"timestamp\":\"" + ts + "\"" +
+        "}" +
+    "}"
+}
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+    let mut body = ""
+
+    let mut k = 0
+    while k < argc {
+        let a = _str(argv[k])
+        if a == "--body" && k + 1 < argc {
+            body = _str(argv[k + 1])
+            k = k + 1
+        }
+        k = k + 1
+    }
+
+    if body == "" {
+        body = _str(env("ANIMA_SERVE_BODY"))
+    }
+    if body == "" {
+        // empty body default — echoes as empty user content
+        body = "{\"messages\":[]}"
+    }
+
+    println(handle_chat_completions(body))
+}

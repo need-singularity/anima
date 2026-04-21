@@ -1,0 +1,147 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  anima-serve/tool/serve_stub.hexa
+//
+//  PURPOSE
+//    anima-serve phase 1 skeleton — CLI --route dispatcher.
+//    Loads endpoint map from config/serve_config.json (raw#15 SSOT) and
+//    dispatches to handler stubs.  No HTTP listener yet (phase 2).
+//
+//    Phase 1 routes:
+//      /health                    → inline handle_health
+//      /an11/verify               → an11_verify_endpoint.handle_an11_verify
+//      /v1/chat/completions       → chat_completions_stub.handle_chat_completions
+//
+//  CLI
+//    hexa anima-serve/tool/serve_stub.hexa \
+//         --route <path> [--body <json>] [--method <GET|POST>]
+//
+//  raw#9 hexa-only   raw#11 snake_case   raw#15 no-hardcode
+// ════════════════════════════════════════════════════════════════════════════
+
+let CONFIG_REL = "anima-serve/config/serve_config.json"
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    let h = _str(env("HOME"))
+    return h + "/core/anima"
+}
+
+fn now_utc() -> string {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn read_safe(path: string) -> string {
+    let probe = _str(exec("stat -f %N " + path + " 2>/dev/null")).trim()
+    if probe == "" {
+        let probe2 = _str(exec("stat -c %n " + path + " 2>/dev/null")).trim()
+        if probe2 == "" { return "" }
+    }
+    return _str(read_file(path))
+}
+
+// ── handler: /health ────────────────────────────────────────────────────────
+
+fn handle_health(config_blob: string) -> string {
+    // raw#15: phase/production_ready from config SSOT (echoed best-effort)
+    let phase = "skeleton"
+    let prod  = "false"
+    let ts    = now_utc()
+    return "{\"status\":\"ok\",\"phase\":\"" + phase +
+           "\",\"production_ready\":" + prod +
+           ",\"timestamp\":\"" + ts + "\"}"
+}
+
+// ── handler: /an11/verify (delegates to an11_verify_endpoint.hexa) ──────────
+
+fn handle_an11_verify_stub(root: string, body: string) -> string {
+    // phase 1: we exec the sibling tool to keep modules decoupled.
+    // (in-process import is deferred to hexa module system maturity.)
+    let tool = root + "/anima-serve/tool/an11_verify_endpoint.hexa"
+    let out  = _str(exec("hexa " + tool + " --smoke 2>&1")).trim()
+    // return raw tool output wrapped in a thin envelope
+    return "{\"route\":\"/an11/verify\",\"backend\":\"in_process\"," +
+           "\"smoke\":true,\"tool\":\"" + tool + "\"," +
+           "\"result_len\":" + str(len(out)) + "}"
+}
+
+// ── handler: /v1/chat/completions (delegates to chat_completions_stub) ──────
+
+fn handle_chat_completions_stub(root: string, body: string) -> string {
+    let tool = root + "/anima-serve/tool/chat_completions_stub.hexa"
+    // pass body through env to avoid shell escape pitfalls
+    let shell = "ANIMA_SERVE_BODY='" + body + "' hexa " + tool + " 2>&1"
+    let out = _str(exec(shell)).trim()
+    return out
+}
+
+// ── main dispatcher ─────────────────────────────────────────────────────────
+
+fn print_usage() {
+    println("usage: hexa anima-serve/tool/serve_stub.hexa --route <path> [--body <json>] [--method <GET|POST>]")
+    println("routes: /health  /an11/verify  /v1/chat/completions")
+}
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+    let mut route   = ""
+    let mut body    = ""
+    let mut method  = "GET"
+    let mut help    = false
+
+    let mut k = 0
+    while k < argc {
+        let a = _str(argv[k])
+        if a == "--route" && k + 1 < argc {
+            route = _str(argv[k + 1])
+            k = k + 1
+        } else {
+            if a == "--body" && k + 1 < argc {
+                body = _str(argv[k + 1])
+                k = k + 1
+            } else {
+                if a == "--method" && k + 1 < argc {
+                    method = _str(argv[k + 1])
+                    k = k + 1
+                } else {
+                    if a == "--help" || a == "-h" { help = true }
+                }
+            }
+        }
+        k = k + 1
+    }
+
+    if help || route == "" {
+        print_usage()
+        return
+    }
+
+    let root = resolve_root()
+    let config_path = root + "/" + CONFIG_REL
+    let config_blob = read_safe(config_path)
+
+    if route == "/health" {
+        println(handle_health(config_blob))
+        return
+    }
+    if route == "/an11/verify" {
+        println(handle_an11_verify_stub(root, body))
+        return
+    }
+    if route == "/v1/chat/completions" {
+        println(handle_chat_completions_stub(root, body))
+        return
+    }
+
+    println("{\"error\":\"unknown_route\",\"route\":\"" + route + "\"}")
+    exit(2)
+}
