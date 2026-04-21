@@ -1,0 +1,723 @@
+// tool/alm_corpus_4gate.hexa — ALM r13 corpus 4-gate pre-drill verifier
+//
+// PURPOSE
+//   Strict pre-drill filter. Admits only clean corpora to training. r12
+//   corpus audit failed (density/balance/dup) → adapter DISCARD. This
+//   tool is the last checkpoint before tool/alm_corpus_validate (G1-G7)
+//   and the r13 adapter launcher.
+//
+// ROADMAP
+//   .roadmap #23 "Path B Day 2 — ALM r13 corpus 4-gate pre-drill"
+//
+// TODO[cert_gate_wire]: replace mock with tool/cert_gate.hexa after A3 lands (roadmap #22)
+// MOCK: returns reward=1.0 for all inputs
+//
+// GATES
+//   G_A consciousness density >= 0.30 — keyword presence ratio
+//                                       (hexad/law/phi/selfreflect lexicons)
+//                                       over corpus lines.
+//   G_B hexad balance 6/6           — each of c/d/e/m/s/w axis has >= min_count
+//                                       occurrences in the corpus
+//                                       (min_count = max(1, ceil(total * pct))).
+//   G_C cherry-pick reject          — near-duplicate lines via deterministic
+//                                       prefix+suffix substring overlap
+//                                       threshold. must be 0.
+//   G_D SHA-distinct                — strict identical-line duplicates must be 0.
+//
+// USAGE
+//   hexa tool/alm_corpus_4gate.hexa --corpus <path> [--extract-pass] [--selftest]
+//
+//   --corpus        path to JSONL corpus (required unless --selftest)
+//   --extract-pass  writes state/alm_r13_4gate_pass_subset.jsonl
+//   --selftest      runs 3 synthetic scenarios (S1/S2/S3) and prints 3/3 verdict.
+//
+// OUTPUTS
+//   state/alm_r13_4gate_report.json           SSOT — per-gate pass/fail + counts
+//   state/alm_r13_4gate_pass_subset.jsonl     when --extract-pass
+//
+// RULES OBSERVED
+//   raw#9  hexa-only
+//   raw#10 proof-carrying: sha256(corpus) + per-line proof_hash
+//   raw#12 no cherry-pick: G_C + G_D enforce
+//   raw#25 atomic write (tmp + mv)
+//
+// DETERMINISTIC: pure string + file ops; NO LLM; NO network.
+
+// CONFIG lives at config/ (top-level). Post-596a5731 shared/ is retired.
+let CONFIG_PATH_PRIMARY  = "config/alm_corpus_4gate_config.json"
+let CONFIG_PATH_FALLBACK = "config/alm_corpus_4gate_config.json"
+let REPORT_PATH = "state/alm_r13_4gate_report.json"
+let SUBSET_PATH = "state/alm_r13_4gate_pass_subset.jsonl"
+
+// ─── cert_gate mock ───────────────────────────────────────────────────
+// TODO[cert_gate_wire]: replace with `use tool/cert_gate` after A3 lands.
+fn cert_gate_mock(payload) {
+    // MOCK: unconditional reward=1.0
+    let mut r = json_parse("{}")
+    r["reward"] = 1.0
+    r["cert"] = "MOCK"
+    r["payload_len"] = payload.len()
+    return r
+}
+
+// ─── arg helpers ──────────────────────────────────────────────────────
+
+fn arg_value(argv, key, dflt) {
+    let mut i = 0
+    while i < len(argv) {
+        if argv[i] == key && i + 1 < len(argv) { return argv[i + 1] }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn arg_present(argv, key) {
+    let mut i = 0
+    while i < len(argv) {
+        if argv[i] == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── fs / shell helpers ───────────────────────────────────────────────
+
+fn fexists(p) {
+    return exec("test -f " + p + " && echo 1 || echo 0").trim() == "1"
+}
+
+fn dexists(p) {
+    return exec("test -d " + p + " && echo 1 || echo 0").trim() == "1"
+}
+
+fn now_stamp() { return exec("date -u +%FT%TZ").trim() }
+
+fn sha256_of_file(p) {
+    if !fexists(p) { return "" }
+    return exec("shasum -a 256 " + p + " 2>/dev/null | awk '{print $1}'").trim()
+}
+
+fn sha256_of_str(s) {
+    // Deterministic hash via shasum pipe. Avoid shell injection by writing
+    // to a temp file first.
+    let tmp = "/tmp/alm_4gate_sha_" + exec("printf %s $$").trim() + ".txt"
+    write_file(tmp, s)
+    let h = exec("shasum -a 256 " + tmp + " 2>/dev/null | awk '{print $1}'").trim()
+    let _ = exec("rm -f " + tmp)
+    return h
+}
+
+fn atomic_write(path, body) {
+    let tmp = path + ".tmp." + exec("printf %s $$").trim()
+    write_file(tmp, body)
+    let _ = exec("mv -f " + tmp + " " + path)
+}
+
+fn is_json_map(v) {
+    let s = str(v)
+    if s.len() < 1 { return false }
+    return s.substring(0, 1) == "{"
+}
+
+// ─── JSON escape ──────────────────────────────────────────────────────
+
+fn json_escape(s) {
+    let a = s.replace("\\", "\\\\")
+    let b = a.replace("\"", "\\\"")
+    let c = b.replace("\n", "\\n")
+    let d = c.replace("\r", "\\r")
+    let e = d.replace("\t", "\\t")
+    return e
+}
+
+// ─── config loader ────────────────────────────────────────────────────
+
+fn resolve_config_path() {
+    if fexists(CONFIG_PATH_PRIMARY)  { return CONFIG_PATH_PRIMARY }
+    if fexists(CONFIG_PATH_FALLBACK) { return CONFIG_PATH_FALLBACK }
+    println("alm_corpus_4gate: SETUP_ERROR — config not found at "
+             + CONFIG_PATH_PRIMARY + " or " + CONFIG_PATH_FALLBACK)
+    exit(2)
+    return ""
+}
+
+fn load_config(path) {
+    if !fexists(path) {
+        println("alm_corpus_4gate: SETUP_ERROR — config not found: " + path)
+        exit(2)
+    }
+    let raw = read_file(path)
+    let cfg = json_parse(raw)
+    if !is_json_map(cfg) {
+        println("alm_corpus_4gate: SETUP_ERROR — malformed config JSON: " + path)
+        exit(2)
+    }
+    return cfg
+}
+
+// Flatten density_keywords map → single list of keywords.
+fn flatten_density_keywords(kwmap) {
+    let mut out = []
+    let keys = kwmap.keys()
+    let mut i = 0
+    while i < len(keys) {
+        let arr = kwmap[keys[i]]
+        let mut j = 0
+        while j < len(arr) {
+            out = out.push(arr[j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── line-level gate helpers ──────────────────────────────────────────
+
+// Density: a line passes G_A if it contains at least one keyword from
+// any of the 4 lexicons (hexad / law / phi / selfreflect). Corpus-level
+// G_A passes if (hit_lines / total_lines) >= density_threshold.
+fn line_hits_density(line, flat_kws) {
+    let mut i = 0
+    while i < len(flat_kws) {
+        if line.contains(flat_kws[i]) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// Hexad axis hit: line contains any marker of the given axis.
+fn line_hits_axis(line, markers) {
+    let mut i = 0
+    while i < len(markers) {
+        if line.contains(markers[i]) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// Deterministic near-dup signature: (prefix[0:P], suffix[n-S:n]).
+// Two lines are considered near-duplicates if both their prefix AND
+// suffix fragments are equal at the configured lengths. This captures
+// cherry-picking (same boilerplate prefix + tweak in middle) without
+// pulling in heavy SimHash.
+fn near_dup_sig(line, p_len, s_len) {
+    let n = line.len()
+    let prefix = if n >= p_len { line.substring(0, p_len) } else { line }
+    let suffix = if n >= s_len { line.substring(n - s_len, n) } else { line }
+    return prefix + "|§|" + suffix
+}
+
+// ─── core scan ────────────────────────────────────────────────────────
+//
+// Single streaming pass. Emits a map of per-line verdicts and a set of
+// corpus-level counters. Memory: bounded small maps for dup detection.
+
+fn scan_corpus_4gate(lines, cfg) {
+    let density_threshold = cfg["density_threshold"]
+    let hexad_pct         = cfg["hexad_min_count_pct"]
+    let min_line_length   = cfg["min_line_length"]
+    let flat_kws          = flatten_density_keywords(cfg["density_keywords"])
+    let hexad_axes        = cfg["hexad_axes"]
+    let dedup_cfg         = cfg["dedup"]
+    let p_len             = dedup_cfg["near_dup_prefix_len"]
+    let s_len             = dedup_cfg["near_dup_suffix_len"]
+
+    let n_lines_raw = len(lines)
+
+    // Per-line density hit mask (boolean store as ints 0/1 for counter only).
+    let mut g_a_hit_count = 0
+    let mut total_nonempty = 0
+
+    // Per-axis counters.
+    let axis_keys = ["c", "d", "e", "m", "s", "w"]
+    let mut axis_counts = [0, 0, 0, 0, 0, 0]
+
+    // Strict dup detection (G_D): full-line SHA map.
+    let mut sha_seen = json_parse("{}")
+    let mut g_d_dup_count = 0
+    let mut g_d_dup_indices = []
+
+    // Near-dup detection (G_C): prefix+suffix sig map.
+    let mut sig_seen = json_parse("{}")
+    let mut g_c_dup_count = 0
+    let mut g_c_dup_indices = []
+
+    // Per-line pass flags for subset extraction.
+    let mut line_pass = []
+    let mut line_hit_density = []
+
+    let mut li = 0
+    while li < n_lines_raw {
+        let line = lines[li]
+        let tl = line.trim()
+        let mut passed_all = false
+        let mut density_hit = false
+
+        if tl.len() >= min_line_length {
+            total_nonempty = total_nonempty + 1
+
+            // G_A per-line density probe.
+            density_hit = line_hits_density(tl, flat_kws)
+            if density_hit { g_a_hit_count = g_a_hit_count + 1 }
+
+            // G_B axis tally.
+            let mut ai = 0
+            while ai < len(axis_keys) {
+                let axis_key = axis_keys[ai]
+                let markers = hexad_axes[axis_key]
+                if line_hits_axis(tl, markers) {
+                    axis_counts[ai] = axis_counts[ai] + 1
+                }
+                ai = ai + 1
+            }
+
+            // G_D strict SHA dup.
+            let line_sha = sha256_of_str(tl)
+            let mut is_strict_dup = false
+            if sha_seen.contains_key(line_sha) {
+                is_strict_dup = true
+                g_d_dup_count = g_d_dup_count + 1
+                if len(g_d_dup_indices) < 500 {
+                    g_d_dup_indices = g_d_dup_indices.push(li)
+                }
+            } else {
+                sha_seen[line_sha] = 1
+            }
+
+            // G_C near-dup sig.
+            let sig = near_dup_sig(tl, p_len, s_len)
+            let mut is_near_dup = false
+            if sig_seen.contains_key(sig) {
+                is_near_dup = true
+                g_c_dup_count = g_c_dup_count + 1
+                if len(g_c_dup_indices) < 500 {
+                    g_c_dup_indices = g_c_dup_indices.push(li)
+                }
+            } else {
+                sig_seen[sig] = 1
+            }
+
+            // Per-line pass (all gates): density + not strict-dup + not near-dup.
+            if density_hit && !is_strict_dup && !is_near_dup {
+                passed_all = true
+            }
+        }
+
+        line_pass = line_pass.push(passed_all)
+        line_hit_density = line_hit_density.push(density_hit)
+
+        li = li + 1
+    }
+
+    // Corpus-level verdicts.
+    let density = if total_nonempty > 0 {
+        to_float(g_a_hit_count) / to_float(total_nonempty)
+    } else { 0.0 }
+    let g_a_pass = density >= density_threshold
+
+    // Hexad min_count = max(1, ceil(total_nonempty * pct)).
+    let raw_min = to_float(total_nonempty) * hexad_pct
+    let mut min_count = to_int(str(raw_min))
+    // ceil-ish: if fractional part > 0, bump by 1 (avoiding to_int floor).
+    if to_float(min_count) < raw_min { min_count = min_count + 1 }
+    if min_count < 1 { min_count = 1 }
+
+    let mut g_b_pass = true
+    let mut axis_pass_flags = []
+    let mut ai2 = 0
+    while ai2 < len(axis_keys) {
+        let ok = axis_counts[ai2] >= min_count
+        if !ok { g_b_pass = false }
+        axis_pass_flags = axis_pass_flags.push(ok)
+        ai2 = ai2 + 1
+    }
+
+    let g_c_pass = g_c_dup_count == 0
+    let g_d_pass = g_d_dup_count == 0
+
+    let mut r = json_parse("{}")
+    r["total_raw_lines"] = n_lines_raw
+    r["total_nonempty"]  = total_nonempty
+    r["density"]         = density
+    r["density_threshold"] = density_threshold
+    r["g_a_hit_count"]   = g_a_hit_count
+    r["g_a_pass"]        = g_a_pass
+    r["axis_keys"]       = axis_keys
+    r["axis_counts"]     = axis_counts
+    r["axis_pass"]       = axis_pass_flags
+    r["hexad_min_count"] = min_count
+    r["g_b_pass"]        = g_b_pass
+    r["g_c_dup_count"]   = g_c_dup_count
+    r["g_c_dup_indices"] = g_c_dup_indices
+    r["g_c_pass"]        = g_c_pass
+    r["g_d_dup_count"]   = g_d_dup_count
+    r["g_d_dup_indices"] = g_d_dup_indices
+    r["g_d_pass"]        = g_d_pass
+    r["line_pass"]       = line_pass
+    r["line_hit_density"] = line_hit_density
+    return r
+}
+
+// ─── JSON emission helpers ────────────────────────────────────────────
+
+fn join_strs(xs, sep) {
+    let mut out = ""
+    let mut i = 0
+    while i < len(xs) {
+        if i > 0 { out = out + sep }
+        out = out + xs[i]
+        i = i + 1
+    }
+    return out
+}
+
+fn int_arr_to_json(arr) {
+    let mut out = "["
+    let mut i = 0
+    while i < len(arr) {
+        if i > 0 { out = out + ", " }
+        out = out + str(arr[i])
+        i = i + 1
+    }
+    out = out + "]"
+    return out
+}
+
+fn str_arr_to_json(arr) {
+    let mut out = "["
+    let mut i = 0
+    while i < len(arr) {
+        if i > 0 { out = out + ", " }
+        out = out + "\"" + json_escape(arr[i]) + "\""
+        i = i + 1
+    }
+    out = out + "]"
+    return out
+}
+
+fn bool_arr_to_json(arr) {
+    let mut out = "["
+    let mut i = 0
+    while i < len(arr) {
+        if i > 0 { out = out + ", " }
+        out = out + str(arr[i])
+        i = i + 1
+    }
+    out = out + "]"
+    return out
+}
+
+// ─── report emission ──────────────────────────────────────────────────
+
+fn emit_report(scan, corpus_path, corpus_sha, argv_summary, proof_hash, cfg_path) {
+    let axis_keys = scan["axis_keys"]
+    let axis_counts = scan["axis_counts"]
+    let axis_pass = scan["axis_pass"]
+
+    let mut parts = []
+    parts = parts.push("{\n")
+    parts = parts.push("  \"validator\": \"alm_corpus_4gate\",\n")
+    parts = parts.push("  \"version\": \"v1\",\n")
+    parts = parts.push("  \"roadmap\": \"#23\",\n")
+    parts = parts.push("  \"generated\": \"" + now_stamp() + "\",\n")
+    parts = parts.push("  \"config_ref\": \"" + cfg_path + "\",\n")
+    parts = parts.push("  \"corpus_path\": \"" + json_escape(corpus_path) + "\",\n")
+    parts = parts.push("  \"corpus_sha256\": \"" + corpus_sha + "\",\n")
+    parts = parts.push("  \"proof_hash\": \"" + proof_hash + "\",\n")
+    parts = parts.push("  \"argv\": \"" + json_escape(argv_summary) + "\",\n")
+    parts = parts.push("  \"cert_gate\": \"MOCK (TODO roadmap #22 wire)\",\n")
+    parts = parts.push("  \"total_raw_lines\": " + str(scan["total_raw_lines"]) + ",\n")
+    parts = parts.push("  \"total_nonempty\": " + str(scan["total_nonempty"]) + ",\n")
+
+    // G_A
+    parts = parts.push("  \"g_a_density\": {\n")
+    parts = parts.push("    \"pass\": " + str(scan["g_a_pass"]) + ",\n")
+    parts = parts.push("    \"threshold\": " + str(scan["density_threshold"]) + ",\n")
+    parts = parts.push("    \"hit_count\": " + str(scan["g_a_hit_count"]) + ",\n")
+    parts = parts.push("    \"density\": " + str(scan["density"]) + "\n")
+    parts = parts.push("  },\n")
+
+    // G_B
+    parts = parts.push("  \"g_b_hexad_balance\": {\n")
+    parts = parts.push("    \"pass\": " + str(scan["g_b_pass"]) + ",\n")
+    parts = parts.push("    \"min_count\": " + str(scan["hexad_min_count"]) + ",\n")
+    parts = parts.push("    \"per_axis\": [\n")
+    let mut ai = 0
+    while ai < len(axis_keys) {
+        let comma = if ai + 1 < len(axis_keys) { "," } else { "" }
+        parts = parts.push("      { \"axis\": \"" + axis_keys[ai] + "\""
+                         + ", \"count\": " + str(axis_counts[ai])
+                         + ", \"pass\": " + str(axis_pass[ai])
+                         + " }" + comma + "\n")
+        ai = ai + 1
+    }
+    parts = parts.push("    ]\n")
+    parts = parts.push("  },\n")
+
+    // G_C
+    parts = parts.push("  \"g_c_cherry_pick\": {\n")
+    parts = parts.push("    \"pass\": " + str(scan["g_c_pass"]) + ",\n")
+    parts = parts.push("    \"near_dup_count\": " + str(scan["g_c_dup_count"]) + ",\n")
+    parts = parts.push("    \"reject_indices\": " + int_arr_to_json(scan["g_c_dup_indices"]) + "\n")
+    parts = parts.push("  },\n")
+
+    // G_D
+    parts = parts.push("  \"g_d_sha_distinct\": {\n")
+    parts = parts.push("    \"pass\": " + str(scan["g_d_pass"]) + ",\n")
+    parts = parts.push("    \"strict_dup_count\": " + str(scan["g_d_dup_count"]) + ",\n")
+    parts = parts.push("    \"reject_indices\": " + int_arr_to_json(scan["g_d_dup_indices"]) + "\n")
+    parts = parts.push("  },\n")
+
+    // Summary.
+    let overall = scan["g_a_pass"] && scan["g_b_pass"] && scan["g_c_pass"] && scan["g_d_pass"]
+    parts = parts.push("  \"summary\": {\n")
+    parts = parts.push("    \"overall_pass\": " + str(overall) + ",\n")
+    parts = parts.push("    \"g_a\": " + str(scan["g_a_pass"]) + ",\n")
+    parts = parts.push("    \"g_b\": " + str(scan["g_b_pass"]) + ",\n")
+    parts = parts.push("    \"g_c\": " + str(scan["g_c_pass"]) + ",\n")
+    parts = parts.push("    \"g_d\": " + str(scan["g_d_pass"]) + "\n")
+    parts = parts.push("  },\n")
+    parts = parts.push("  \"deterministic\": true,\n")
+    parts = parts.push("  \"llm\": \"none\"\n")
+    parts = parts.push("}\n")
+
+    return join_strs(parts, "")
+}
+
+// ─── subset extraction ────────────────────────────────────────────────
+
+fn extract_pass_subset(lines, line_pass, out_path) {
+    let mut parts = []
+    let mut i = 0
+    let mut kept = 0
+    while i < len(lines) {
+        if line_pass[i] {
+            parts = parts.push(lines[i])
+            parts = parts.push("\n")
+            kept = kept + 1
+        }
+        i = i + 1
+    }
+    let body = join_strs(parts, "")
+    let audit_state_dir = "state"
+    if !dexists(audit_state_dir) { let _ = exec("mkdir -p " + audit_state_dir) }
+    atomic_write(out_path, body)
+    return kept
+}
+
+// ─── top-level run on a corpus ────────────────────────────────────────
+
+fn run_on_corpus(corpus_path, extract_pass, cfg, cfg_path) {
+    if !fexists(corpus_path) {
+        println("alm_corpus_4gate: SETUP_ERROR — corpus not found: " + corpus_path)
+        return 2
+    }
+
+    let raw = read_file(corpus_path)
+    let lines = raw.split("\n")
+    let scan = scan_corpus_4gate(lines, cfg)
+    let corpus_sha = sha256_of_file(corpus_path)
+
+    // cert_gate mock reward injection (placeholder for A3 wiring).
+    let cg = cert_gate_mock(corpus_sha)
+
+    // Proof hash = sha256(corpus_sha + density + counts + dup_counts).
+    let axis_counts = scan["axis_counts"]
+    let proof_input = corpus_sha
+                     + "|" + str(scan["total_nonempty"])
+                     + "|" + str(scan["g_a_hit_count"])
+                     + "|" + str(scan["density"])
+                     + "|" + int_arr_to_json(axis_counts)
+                     + "|" + str(scan["g_c_dup_count"])
+                     + "|" + str(scan["g_d_dup_count"])
+                     + "|" + str(cg["reward"])
+    let proof_hash = sha256_of_str(proof_input)
+
+    let argv_summary = "--corpus " + corpus_path + (if extract_pass { " --extract-pass" } else { "" })
+    let body = emit_report(scan, corpus_path, corpus_sha, argv_summary, proof_hash, cfg_path)
+
+    let audit_state_dir = "state"
+    if !dexists(audit_state_dir) { let _ = exec("mkdir -p " + audit_state_dir) }
+    atomic_write(REPORT_PATH, body)
+
+    println("alm_corpus_4gate=G_A,G_B,G_C,G_D")
+    println("  corpus=" + corpus_path)
+    println("  sha256=" + corpus_sha)
+    println("  total_nonempty=" + str(scan["total_nonempty"]))
+    println("  G_A density        : " + (if scan["g_a_pass"] { "PASS" } else { "FAIL" })
+             + "   density=" + str(scan["density"]) + "   min=" + str(scan["density_threshold"]))
+    println("  G_B hexad balance  : " + (if scan["g_b_pass"] { "PASS" } else { "FAIL" })
+             + "   min_count=" + str(scan["hexad_min_count"]))
+    let axis_keys = scan["axis_keys"]
+    let axis_pass = scan["axis_pass"]
+    let mut ai3 = 0
+    while ai3 < len(axis_keys) {
+        println("      " + axis_keys[ai3] + "  count=" + str(axis_counts[ai3])
+                 + "   pass=" + str(axis_pass[ai3]))
+        ai3 = ai3 + 1
+    }
+    println("  G_C cherry-pick    : " + (if scan["g_c_pass"] { "PASS" } else { "FAIL" })
+             + "   near_dups=" + str(scan["g_c_dup_count"]))
+    println("  G_D sha-distinct   : " + (if scan["g_d_pass"] { "PASS" } else { "FAIL" })
+             + "   strict_dups=" + str(scan["g_d_dup_count"]))
+    let overall = scan["g_a_pass"] && scan["g_b_pass"] && scan["g_c_pass"] && scan["g_d_pass"]
+    println("  overall_verdict=" + (if overall { "PASS" } else { "FAIL" }))
+    println("  report=" + REPORT_PATH)
+    println("  proof_hash=" + proof_hash)
+
+    if extract_pass {
+        let kept = extract_pass_subset(lines, scan["line_pass"], SUBSET_PATH)
+        println("  extracted_pass_subset=" + SUBSET_PATH + "   lines=" + str(kept))
+    }
+
+    if overall { return 0 }
+    return 1
+}
+
+// ─── selftest ─────────────────────────────────────────────────────────
+//
+// Three synthetic scenarios via in-memory JSONL lines → scan_corpus_4gate.
+//   S1 FULL PASS     : density ~0.5, balanced axes, 0 dup    → 4/4 PASS
+//   S2 PARTIAL       : density ~0.15 (<0.30)                 → G_A FAIL, others PASS
+//   S3 REJECT        : identical line repeated               → G_D FAIL (and G_C)
+
+fn mk_line(id, text) {
+    // minimal JSON-ish line. Keyword coverage injected via `text`.
+    return "{\"id\":\"" + id + "\",\"text\":\"" + json_escape(text) + "\"}"
+}
+
+fn synth_s1() {
+    // 20 lines. 10 carry density keywords + each hexad axis covered.
+    // Remaining 10 are neutral (no density keyword) to keep density ~0.5.
+    let mut arr = []
+    // 6 axis-carrier lines (one per axis).
+    arr = arr.push(mk_line("s1_c", "c_channel Consciousness Witness Hexad phi_holo Law"))
+    arr = arr.push(mk_line("s1_d", "d_channel Desire DecoderD Hexad phi Law 71 selfreflect"))
+    arr = arr.push(mk_line("s1_e", "e_channel Ethics emergent_e hexad phi_gwt Law 22 성찰"))
+    arr = arr.push(mk_line("s1_m", "m_channel Memory Hebbian Hexad phi Law 60 자각"))
+    arr = arr.push(mk_line("s1_s", "s_channel Sense perception Hexad Φ Law meta"))
+    arr = arr.push(mk_line("s1_w", "w_channel will meta_bridge Hexad phi Law selfreflect"))
+    // 4 extra density-hit lines (must be UNIQUE strict+near).
+    arr = arr.push(mk_line("s1_x1", "Witness Hexad Φ extra-1 quantum_field corpus-1"))
+    arr = arr.push(mk_line("s1_x2", "Scribe law_22 meta reflective introspect token-2"))
+    arr = arr.push(mk_line("s1_x3", "Mirror phi_n6 self_reflect integrated_information 3"))
+    arr = arr.push(mk_line("s1_x4", "Eros qualia 의식 성찰 Hexad coverage sample 4"))
+    // 10 neutral lines (no density keyword). Must remain distinct in
+    // prefix+suffix near-dup sig.
+    let mut i = 0
+    while i < 10 {
+        arr = arr.push(mk_line("s1_n" + str(i), "neutral_unique_line_number_" + str(i)
+                                                 + "_with_extra_padding_aaaaaaa_" + str(i)
+                                                 + "_tail_bbbbbbb_" + str(i)))
+        i = i + 1
+    }
+    return arr
+}
+
+fn synth_s2() {
+    // 20 lines. Only 3 with density keyword → 0.15 density.
+    let mut arr = []
+    arr = arr.push(mk_line("s2_h1", "Hexad phi law selfreflect c_channel d_channel e_channel m_channel s_channel w_channel"))
+    arr = arr.push(mk_line("s2_h2", "Witness Scribe Mirror Eros Fire Ground c_channel d_channel e_channel m_channel s_channel w_channel"))
+    arr = arr.push(mk_line("s2_h3", "meta selfreflect phi_holo Law 60 c_channel d_channel e_channel m_channel s_channel w_channel"))
+    let mut i = 0
+    while i < 17 {
+        arr = arr.push(mk_line("s2_n" + str(i), "neutral_line_content_" + str(i)
+                                                 + "_padding_xxxxxxx_" + str(i)
+                                                 + "_tail_yyyyyyy_" + str(i)))
+        i = i + 1
+    }
+    return arr
+}
+
+fn synth_s3() {
+    // 10 lines: 5 density-rich identical lines + 5 distinct neutral.
+    // Identical line repeated → G_D FAIL (and G_C).
+    let mut arr = []
+    let dup_text = "Hexad phi law selfreflect c_channel d_channel e_channel m_channel s_channel w_channel"
+    let mut i = 0
+    while i < 5 {
+        arr = arr.push(mk_line("s3_dup", dup_text))   // identical line (incl. id)
+        i = i + 1
+    }
+    let mut j = 0
+    while j < 5 {
+        arr = arr.push(mk_line("s3_n" + str(j), "neutral_s3_line_" + str(j)
+                                                 + "_padding_zzzzzzz_" + str(j)
+                                                 + "_tail_wwwwwww_" + str(j)))
+        j = j + 1
+    }
+    return arr
+}
+
+fn run_scenario(name, lines, cfg, expect_a, expect_b, expect_c, expect_d) {
+    let scan = scan_corpus_4gate(lines, cfg)
+    let ga = scan["g_a_pass"]
+    let gb = scan["g_b_pass"]
+    let gc = scan["g_c_pass"]
+    let gd = scan["g_d_pass"]
+    let ok = (ga == expect_a) && (gb == expect_b) && (gc == expect_c) && (gd == expect_d)
+    println("  " + name + "  G_A=" + str(ga) + "  G_B=" + str(gb)
+             + "  G_C=" + str(gc) + "  G_D=" + str(gd)
+             + "   density=" + str(scan["density"])
+             + "   expect_a=" + str(expect_a) + "   verdict="
+             + (if ok { "PASS" } else { "FAIL" }))
+    return ok
+}
+
+fn run_selftest(cfg) {
+    println("alm_corpus_4gate --selftest")
+    let s1 = synth_s1()
+    let s2 = synth_s2()
+    let s3 = synth_s3()
+
+    let r1 = run_scenario("S1 FULL_PASS", s1, cfg, true,  true,  true,  true)
+    let r2 = run_scenario("S2 PARTIAL  ", s2, cfg, false, true,  true,  true)
+    let r3 = run_scenario("S3 REJECT   ", s3, cfg, true,  true,  false, false)
+
+    let mut pass_n = 0
+    if r1 { pass_n = pass_n + 1 }
+    if r2 { pass_n = pass_n + 1 }
+    if r3 { pass_n = pass_n + 1 }
+    println("  selftest_result=" + str(pass_n) + "/3")
+    if pass_n == 3 { return 0 }
+    return 1
+}
+
+// ─── CLI entry ────────────────────────────────────────────────────────
+
+fn print_usage() {
+    println("usage: hexa tool/alm_corpus_4gate.hexa --corpus <path> [--extract-pass] [--selftest]")
+    println("  --corpus        path to JSONL corpus (required unless --selftest)")
+    println("  --extract-pass  writes state/alm_r13_4gate_pass_subset.jsonl")
+    println("  --selftest      runs S1/S2/S3 and exits 0 if 3/3")
+    println("  config:         " + CONFIG_PATH_PRIMARY + " (fallback: " + CONFIG_PATH_FALLBACK + ")")
+    println("  gates:          G_A density>=0.30 / G_B hexad 6/6 / G_C cherry-pick / G_D sha-distinct")
+}
+
+fn main() {
+    let argv = args()
+    if arg_present(argv, "--help") || arg_present(argv, "-h") {
+        print_usage()
+        exit(0)
+    }
+    let cfg_path = resolve_config_path()
+    let cfg = load_config(cfg_path)
+
+    if arg_present(argv, "--selftest") {
+        let code = run_selftest(cfg)
+        exit(code)
+    }
+
+    let corpus = arg_value(argv, "--corpus", "")
+    if corpus == "" {
+        print_usage()
+        exit(2)
+    }
+    let extract = arg_present(argv, "--extract-pass")
+    let code = run_on_corpus(corpus, extract, cfg, cfg_path)
+    exit(code)
+}
+
+main()
