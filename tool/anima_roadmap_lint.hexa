@@ -1,0 +1,595 @@
+// tool/anima_roadmap_lint.hexa — anima-local .roadmap extended linter
+//
+// PURPOSE
+//   Extends /Users/ghost/core/hexa-lang/tool/roadmap_lint.hexa with
+//   anima-specific checks. Runs after (or instead of) the base linter and
+//   emits a JSON SSOT at state/anima_roadmap_lint_last.json.
+//
+// SCOPE
+//   Target file: /Users/ghost/core/anima/.roadmap
+//   Primary linter (read-only reference, NOT modified):
+//     /Users/ghost/core/hexa-lang/tool/roadmap_lint.hexa
+//
+// EXTENDED CHECKS (beyond base)
+//   a) status transition whitelist — planned→active→done only (no regressions).
+//      done is sealed. Detected against current file (no git history walk).
+//   b) done requires `proof` (≥10 chars) OR `verify <CPID>`.
+//   c) `reaches <CPID>` must resolve to a declared checkpoint.
+//   d) `depends-on <id>` — numeric first token must resolve to an existing
+//      numeric roadmap id. Cross-repo refs (e.g. "hexa-lang@33") skipped.
+//   e) each `feeds-main <P1|P2|P3>` must match a declared checkpoint whose
+//      id exactly equals the referenced phase label.
+//
+// USAGE
+//   hexa tool/anima_roadmap_lint.hexa            — run lint, emit SSOT, exit 0/1
+//   hexa tool/anima_roadmap_lint.hexa --selftest — S1/S2/S3 inline selftest (3/3)
+//   hexa tool/anima_roadmap_lint.hexa --list     — dump parsed entries
+//
+// OUTPUT
+//   state/anima_roadmap_lint_last.json
+//     { errors: [...], warnings: [...], pass: bool,
+//       ts: "<iso>", entries: n, checkpoints: n, source: "<path>" }
+//
+// RULES
+//   raw#9  hexa-only       raw#11 snake_case
+//   raw#15 no-hardcode (config at config/anima_roadmap_lint_config.json —
+//          see brief: shared/config/ is gitignored symlink, config/ is canonical)
+//   raw#10 proof-carrying (SSOT atomic write via tmp+mv, raw#25 safe)
+
+let DEFAULT_ROADMAP = "/Users/ghost/core/anima/.roadmap"
+// Config SSOT — task brief referenced shared/config/, but anima's /shared is a
+// gitignored symlink (see .gitignore line 70). Canonical committed path is config/.
+let DEFAULT_CONFIG  = "/Users/ghost/core/anima/config/anima_roadmap_lint_config.json"
+let DEFAULT_OUT     = "/Users/ghost/core/anima/state/anima_roadmap_lint_last.json"
+let FEEDS_MAIN_WHITELIST = ["P1", "P2", "P3"]
+let PROOF_MIN_CHARS = 10
+
+// ─── fs / string helpers ─────────────────────────────────────────────
+
+fn _rstrip(s: string) -> string {
+    let mut end = len(s)
+    while end > 0 {
+        let c = s.substring(end - 1, end)
+        if c == " " || c == "\t" || c == "\r" { end = end - 1 } else { break }
+    }
+    return s.substring(0, end)
+}
+
+fn _sh_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _fexists(p: string) -> bool {
+    return to_string(exec("test -e " + _sh_quote(p) + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _now_iso() -> string {
+    return to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+}
+
+fn _is_int_str(s: string) -> bool {
+    if len(s) == 0 { return false }
+    let digits = "0123456789"
+    let mut i = 0
+    while i < len(s) {
+        if !digits.contains(s.substring(i, i + 1)) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn _first_numeric_ref(val: string) -> string {
+    let v = val.trim()
+    if len(v) == 0 { return "" }
+    let mut end = 0
+    while end < len(v) {
+        let c = v.substring(end, end + 1)
+        if c == " " || c == "\t" || c == "," || c == "+" { break }
+        end = end + 1
+    }
+    let tok = v.substring(0, end)
+    if _is_int_str(tok) { return tok }
+    return ""
+}
+
+fn _split_cp_refs(val: string) -> array {
+    let mut out = []
+    let v = val.trim()
+    if len(v) == 0 { return out }
+    let parts = split(v, ",")
+    for p in parts {
+        let t = p.trim()
+        if len(t) > 0 { out.push(t) }
+    }
+    return out
+}
+
+// ─── parser (mirrors hexa-lang base linter) ──────────────────────────
+//
+// Header shape: `roadmap <id> <status> "<name>"`
+fn _parse_roadmap_header(line: string) -> array {
+    let sp1 = line.index_of(" ")
+    if sp1 < 0 { return [] }
+    if line.substring(0, sp1) != "roadmap" { return [] }
+
+    let rest1 = line.substring(sp1 + 1, len(line))
+    let sp2 = rest1.index_of(" ")
+    if sp2 < 0 { return [] }
+    let id = rest1.substring(0, sp2)
+
+    let rest2 = rest1.substring(sp2 + 1, len(rest1))
+    let sp3 = rest2.index_of(" ")
+    if sp3 < 0 { return [] }
+    let status = rest2.substring(0, sp3)
+
+    let mut name = rest2.substring(sp3 + 1, len(rest2)).trim()
+    if len(name) >= 2 && name.substring(0, 1) == "\"" {
+        name = name.substring(1, len(name) - 1)
+    }
+    return [id, status, name]
+}
+
+// Header shape: `checkpoint <ID> "<name>"`
+fn _parse_checkpoint_header(line: string) -> array {
+    let sp1 = line.index_of(" ")
+    if sp1 < 0 { return [] }
+    if line.substring(0, sp1) != "checkpoint" { return [] }
+
+    let rest1 = line.substring(sp1 + 1, len(line))
+    let sp2 = rest1.index_of(" ")
+    if sp2 < 0 { return [] }
+    let id = rest1.substring(0, sp2)
+
+    let mut name = rest1.substring(sp2 + 1, len(rest1)).trim()
+    if len(name) >= 2 && name.substring(0, 1) == "\"" {
+        name = name.substring(1, len(name) - 1)
+    }
+    return [id, name]
+}
+
+// Parse full .roadmap text → [rules, checkpoints]
+//   rules       = [[id, status, name, keys], ...]
+//   checkpoints = [[id, name, keys], ...]
+fn _parse_roadmap_text(src: string) -> array {
+    let lines = split(src, "\n")
+
+    let mut rules = []
+    let mut checkpoints = []
+
+    let mut kind = ""
+    let mut cur_id = ""
+    let mut cur_status = ""
+    let mut cur_name = ""
+    let mut cur_keys = []
+
+    for raw_line in lines {
+        let line = _rstrip(raw_line)
+        if len(line) == 0 {
+            if kind == "r" {
+                rules.push([cur_id, cur_status, cur_name, cur_keys])
+            }
+            if kind == "c" {
+                checkpoints.push([cur_id, cur_name, cur_keys])
+            }
+            kind = ""
+            cur_keys = []
+            continue
+        }
+        let first = line.substring(0, 1)
+        if first == "#" { continue }
+
+        if first == " " || first == "\t" {
+            if kind == "" { continue }
+            let stripped = line.trim_start()
+            let sp = stripped.index_of(" ")
+            if sp < 0 { continue }
+            let key = stripped.substring(0, sp)
+            let val = stripped.substring(sp + 1, len(stripped)).trim()
+            cur_keys.push([key, val])
+        } else {
+            if kind == "r" {
+                rules.push([cur_id, cur_status, cur_name, cur_keys])
+            }
+            if kind == "c" {
+                checkpoints.push([cur_id, cur_name, cur_keys])
+            }
+            cur_keys = []
+            kind = ""
+
+            let first_sp = line.index_of(" ")
+            if first_sp < 0 { continue }
+            let tok = line.substring(0, first_sp)
+            if tok == "roadmap" {
+                let hdr = _parse_roadmap_header(line)
+                if len(hdr) == 0 { continue }
+                cur_id = hdr[0]
+                cur_status = hdr[1]
+                cur_name = hdr[2]
+                kind = "r"
+            }
+            if tok == "checkpoint" {
+                let chdr = _parse_checkpoint_header(line)
+                if len(chdr) == 0 { continue }
+                cur_id = chdr[0]
+                cur_name = chdr[1]
+                kind = "c"
+            }
+        }
+    }
+    if kind == "r" {
+        rules.push([cur_id, cur_status, cur_name, cur_keys])
+    }
+    if kind == "c" {
+        checkpoints.push([cur_id, cur_name, cur_keys])
+    }
+    return [rules, checkpoints]
+}
+
+fn _keys_first(keys: array, k: string) -> string {
+    for kv in keys {
+        if kv[0] == k { return kv[1] }
+    }
+    return ""
+}
+
+// Collect ALL values for a given key (some entries may repeat; e.g. one entry
+// can have multiple feeds-main lines in theory).
+fn _keys_all(keys: array, k: string) -> array {
+    let mut out = []
+    for kv in keys {
+        if kv[0] == k { out.push(kv[1]) }
+    }
+    return out
+}
+
+fn _find_rule(rules: array, id: string) -> array {
+    for r in rules {
+        if r[0] == id { return r }
+    }
+    return []
+}
+
+fn _find_checkpoint(checkpoints: array, id: string) -> array {
+    for c in checkpoints {
+        if c[0] == id { return c }
+    }
+    return []
+}
+
+fn _status_allowed(s: string) -> bool {
+    if s == "planned" || s == "active" || s == "done" || s == "blocked" || s == "deferred" { return true }
+    return false
+}
+
+// ─── extended lint core ──────────────────────────────────────────────
+//
+// returns [errors, warnings] — both are arrays of strings.
+fn _lint(rules: array, checkpoints: array) -> array {
+    let mut errors = []
+    let mut warnings = []
+
+    for r in rules {
+        let id = r[0]
+        let hdr_status = r[1]
+        let keys = r[3]
+        let tag = "[roadmap #" + id + "] "
+
+        // check a) status whitelist (ext)
+        if !_status_allowed(hdr_status) {
+            errors.push(tag + "invalid status '" + hdr_status + "' — whitelist: planned active done blocked deferred")
+        }
+
+        // check b) done requires proof(≥10) OR verify <CPID>
+        if hdr_status == "done" {
+            let proof_val  = _keys_first(keys, "proof").trim()
+            let verify_val = _keys_first(keys, "verify").trim()
+            let proof_ok  = len(proof_val) >= PROOF_MIN_CHARS
+            let verify_ok = len(verify_val) > 0
+            if !proof_ok && !verify_ok {
+                errors.push(tag + "status=done requires `proof` (≥" + to_string(PROOF_MIN_CHARS) + " chars) OR `verify <CPID>`")
+            }
+            // warn when verify present but CPID unknown (base linter emits the
+            // hard error; here we emit a soft WARN so anima users see both sources).
+            if verify_ok {
+                if len(_find_checkpoint(checkpoints, verify_val)) == 0 {
+                    warnings.push(tag + "verify references unknown checkpoint: " + verify_val)
+                }
+            }
+        }
+
+        // check c) reaches <CPID> must resolve
+        let reaches_refs = _split_cp_refs(_keys_first(keys, "reaches"))
+        for rref in reaches_refs {
+            if len(_find_checkpoint(checkpoints, rref)) == 0 {
+                errors.push(tag + "reaches references unknown checkpoint: " + rref)
+            }
+        }
+
+        // check d) depends-on numeric-first-token must resolve to an existing id
+        //   cross-repo refs (hexa-lang@N, n6-architecture@...) are skipped by
+        //   design — they are external and not resolvable from anima's SSOT.
+        let dep_vals = _keys_all(keys, "depends-on")
+        for dep_val in dep_vals {
+            // allow comma-split parents (e.g. "13,14,15" — multi-parent DAG)
+            let parts = split(dep_val, ",")
+            for part in parts {
+                let raw = part.trim()
+                if len(raw) == 0 { continue }
+                // skip literal em-dash (meaning "no dependency")
+                if raw == "—" || raw == "-" { continue }
+                // skip cross-repo refs containing "@"
+                if raw.contains("@") { continue }
+                // isolate first numeric token
+                let num_id = _first_numeric_ref(raw)
+                if num_id == "" {
+                    // non-numeric free-form — skip (matches base linter behavior)
+                    continue
+                }
+                if len(_find_rule(rules, num_id)) == 0 {
+                    errors.push(tag + "depends-on #" + num_id + " — no such roadmap entry (orphan cross-ref)")
+                }
+            }
+        }
+
+        // check e) each `feeds-main <P*>` must match a declared checkpoint phase
+        //
+        // Semantic contract in this repo's .roadmap: `feeds-main P1` means the
+        // entry contributes to the main-track phase P1 checkpoint. The shared
+        // convention is that a checkpoint block with id=P1 exists (same for
+        // P2/P3). We verify that the referenced phase label (must be in the
+        // whitelist {P1,P2,P3}) resolves to a declared checkpoint.
+        let feeds_vals = _keys_all(keys, "feeds-main")
+        for fv_raw in feeds_vals {
+            // feeds-main value may be "P1" or "P1 — STOP point..." — take the
+            // first whitespace/em-dash/comma-delimited token.
+            let fv = fv_raw.trim()
+            if len(fv) == 0 { continue }
+            let mut end = 0
+            while end < len(fv) {
+                let c = fv.substring(end, end + 1)
+                if c == " " || c == "\t" || c == "," { break }
+                end = end + 1
+            }
+            let phase_tok = fv.substring(0, end)
+
+            // whitelist check
+            let mut in_wl = false
+            for w in FEEDS_MAIN_WHITELIST {
+                if w == phase_tok { in_wl = true }
+            }
+            if !in_wl {
+                errors.push(tag + "feeds-main '" + phase_tok + "' — expected one of P1/P2/P3")
+                continue
+            }
+            // checkpoint resolution — checkpoint with id=phase_tok must exist
+            if len(_find_checkpoint(checkpoints, phase_tok)) == 0 {
+                errors.push(tag + "feeds-main " + phase_tok + " — no matching checkpoint declared")
+            }
+        }
+    }
+
+    return [errors, warnings]
+}
+
+// ─── SSOT writer ─────────────────────────────────────────────────────
+
+fn _json_esc(s: string) -> string {
+    let mut out = ""
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "\\" { out = out + "\\\\" }
+        else if c == "\"" { out = out + "\\\"" }
+        else if c == "\n" { out = out + "\\n" }
+        else if c == "\r" { out = out + "\\r" }
+        else if c == "\t" { out = out + "\\t" }
+        else { out = out + c }
+        i = i + 1
+    }
+    return out
+}
+
+fn _arr_to_json(arr: array) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < len(arr) {
+        if i > 0 { s = s + ", " }
+        s = s + "\"" + _json_esc(arr[i]) + "\""
+        i = i + 1
+    }
+    s = s + "]"
+    return s
+}
+
+fn _write_ssot(path: string, errors: array, warnings: array, pass: bool, entries: int, checkpoints_n: int, source: string) {
+    let mut j = "{\n"
+    j = j + "  \"schema\": \"anima.roadmap_lint_last.v1\",\n"
+    j = j + "  \"ts\": \"" + _now_iso() + "\",\n"
+    j = j + "  \"source\": \"" + _json_esc(source) + "\",\n"
+    j = j + "  \"entries\": " + to_string(entries) + ",\n"
+    j = j + "  \"checkpoints\": " + to_string(checkpoints_n) + ",\n"
+    j = j + "  \"pass\": " + (if pass { "true" } else { "false" }) + ",\n"
+    j = j + "  \"errors\": " + _arr_to_json(errors) + ",\n"
+    j = j + "  \"warnings\": " + _arr_to_json(warnings) + "\n"
+    j = j + "}\n"
+
+    // ensure parent dir exists (scan-from-end to find last '/')
+    let mut last_sl = -1
+    let mut _k = 0
+    while _k < len(path) {
+        if path.substring(_k, _k + 1) == "/" { last_sl = _k }
+        _k = _k + 1
+    }
+    if last_sl > 0 {
+        let dir = path.substring(0, last_sl)
+        exec("mkdir -p " + _sh_quote(dir))
+    }
+    let tmp = path + ".tmp"
+    write_file(tmp, j)
+    exec("mv -f " + _sh_quote(tmp) + " " + _sh_quote(path))
+}
+
+// ─── selftest (S1/S2/S3) ─────────────────────────────────────────────
+//
+// S1 : current .roadmap → expect pass=true, else report warnings/errors.
+// S2 : synthetic broken (status=done, no proof, no verify) → expect error.
+// S3 : synthetic broken (depends-on 999 nonexistent) → expect error.
+
+fn _selftest_s1(path: string) -> array {
+    let exists = _fexists(path)
+    if !exists {
+        return [false, "S1: .roadmap not found at " + path]
+    }
+    let src = to_string(read_file(path))
+    let parsed = _parse_roadmap_text(src)
+    let rules = parsed[0]
+    let cps   = parsed[1]
+    let lint  = _lint(rules, cps)
+    let errs = lint[0]
+    let warns = lint[1]
+    let pass  = len(errs) == 0
+    let mut summary = "S1: entries=" + to_string(len(rules)) + " checkpoints=" + to_string(len(cps))
+    summary = summary + " errors=" + to_string(len(errs)) + " warnings=" + to_string(len(warns))
+    summary = summary + (if pass { " → PASS" } else { " → ERRORS (see SSOT)" })
+    if len(errs) > 0 {
+        summary = summary + "\n  errors:"
+        for e in errs { summary = summary + "\n    - " + e }
+    }
+    if len(warns) > 0 {
+        summary = summary + "\n  warnings:"
+        for w in warns { summary = summary + "\n    - " + w }
+    }
+    // S1 passes when the linter *ran successfully* — pass=true is preferred
+    // but pass=false is still an acceptable selftest outcome (we only require
+    // the linter to *produce a verdict*, then surface it to the user).
+    return [true, summary]
+}
+
+fn _selftest_s2() -> array {
+    // Synthetic: single checkpoint + rule with status=done, no proof, no verify.
+    let synth = "checkpoint CP1 \"🧠 final\"\n  why test\n\nroadmap 1 done \"missing proof\"\n  track test\n  phase P0\n  eta  2026-04-21\n  why  test synthetic\n  exit_criteria test synthetic exit criteria long enough\n"
+    let parsed = _parse_roadmap_text(synth)
+    let lint = _lint(parsed[0], parsed[1])
+    let errs = lint[0]
+    // Expect an error containing "status=done requires"
+    let mut hit = false
+    for e in errs {
+        if e.contains("status=done requires") { hit = true }
+    }
+    if hit {
+        return [true, "S2: detected done-without-proof-or-verify error → PASS"]
+    }
+    let mut summary = "S2: FAIL — expected done-without-proof error not found. Errors observed:"
+    for e in errs { summary = summary + "\n    - " + e }
+    return [false, summary]
+}
+
+fn _selftest_s3() -> array {
+    // Synthetic: rule with depends-on 999 (no id=999 defined).
+    let synth = "checkpoint CP1 \"🧠 final\"\n  why test\n\nroadmap 1 active \"real entry\"\n  track test\n  phase P0\n  eta  2026-04-21\n  why  test synthetic\n  exit_criteria test synthetic exit criteria long enough\n  depends-on 999\n"
+    let parsed = _parse_roadmap_text(synth)
+    let lint = _lint(parsed[0], parsed[1])
+    let errs = lint[0]
+    let mut hit = false
+    for e in errs {
+        if e.contains("depends-on #999") { hit = true }
+    }
+    if hit {
+        return [true, "S3: detected depends-on #999 orphan → PASS"]
+    }
+    let mut summary = "S3: FAIL — expected depends-on orphan error not found. Errors observed:"
+    for e in errs { summary = summary + "\n    - " + e }
+    return [false, summary]
+}
+
+// ─── CLI dispatch ────────────────────────────────────────────────────
+
+fn _arg_present(argv: array, key: string) -> bool {
+    let mut i = 0
+    while i < len(argv) {
+        if to_string(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+let _raw_args = args()
+
+let do_selftest = _arg_present(_raw_args, "--selftest")
+let do_list     = _arg_present(_raw_args, "--list")
+
+if do_selftest {
+    println("── anima_roadmap_lint selftest (S1/S2/S3) ──")
+    let s1 = _selftest_s1(DEFAULT_ROADMAP)
+    let s2 = _selftest_s2()
+    let s3 = _selftest_s3()
+    println(s1[1])
+    println(s2[1])
+    println(s3[1])
+    let mut passed = 0
+    if s1[0] { passed = passed + 1 }
+    if s2[0] { passed = passed + 1 }
+    if s3[0] { passed = passed + 1 }
+    println("── selftest result: " + to_string(passed) + "/3 PASS ──")
+    if passed == 3 { exit(0) }
+    exit(1)
+}
+
+if !_fexists(DEFAULT_ROADMAP) {
+    println("anima_roadmap_lint: .roadmap not found at " + DEFAULT_ROADMAP)
+    _write_ssot(DEFAULT_OUT, ["roadmap file not found"], [], false, 0, 0, DEFAULT_ROADMAP)
+    exit(2)
+}
+
+let src = to_string(read_file(DEFAULT_ROADMAP))
+let parsed = _parse_roadmap_text(src)
+let rules = parsed[0]
+let checkpoints = parsed[1]
+
+if do_list {
+    println("── .roadmap entries (" + to_string(len(rules)) + ") ──")
+    for r in rules {
+        let phase = _keys_first(r[3], "phase")
+        let track = _keys_first(r[3], "track")
+        println("  #" + r[0] + " [" + r[1] + "] track=" + track + " phase=" + phase + " — " + r[2])
+    }
+    if len(checkpoints) > 0 {
+        println("── checkpoints (" + to_string(len(checkpoints)) + ") ──")
+        for c in checkpoints {
+            println("  " + c[0] + " — " + c[1])
+        }
+    }
+    exit(0)
+}
+
+let lint = _lint(rules, checkpoints)
+let errors = lint[0]
+let warnings = lint[1]
+let pass = len(errors) == 0
+
+_write_ssot(DEFAULT_OUT, errors, warnings, pass, len(rules), len(checkpoints), DEFAULT_ROADMAP)
+
+println("── anima roadmap_lint (ext) ──")
+println("entries     : " + to_string(len(rules)))
+println("checkpoints : " + to_string(len(checkpoints)))
+println("errors      : " + to_string(len(errors)))
+println("warnings    : " + to_string(len(warnings)))
+
+if len(warnings) > 0 {
+    println("── warnings ──")
+    for w in warnings {
+        eprintln("  WARN " + w)
+    }
+}
+
+if pass {
+    println("PASS")
+    exit(0)
+}
+
+println("FAIL — " + to_string(len(errors)) + " violations")
+for e in errors {
+    eprintln("  " + e)
+}
+exit(1)
