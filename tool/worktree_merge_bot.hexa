@@ -1,0 +1,720 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/worktree_merge_bot.hexa — auto-classifier for .claude/worktrees/agent-*
+//                                 branches relative to a base branch (main).
+//
+//  PURPOSE
+//    Parallel agents commit to per-worktree branches under
+//    .claude/worktrees/agent-*/.  Merging them back to main is manual today.
+//    This tool scans every worktree, probes each branch for conflicts against
+//    base, and emits a structured merge plan:
+//
+//        state/worktree_merge_plan.json
+//
+//    By default the tool is dry-run (plan emit only).  With `--apply`, it
+//    performs `git merge --no-ff` ONLY on branches classified `clean`.
+//    Conflict branches are NEVER auto-resolved.
+//
+//  CLASSIFICATION
+//    clean      : git merge-tree rc=0 AND commits_ahead > 0
+//    conflict   : git merge-tree rc!=0 (conflict stage entries present)
+//    abandoned  : commits_ahead == 0 (no new commits vs base)
+//
+//  CLI
+//    hexa tool/worktree_merge_bot.hexa                     # dry-run scan
+//    hexa tool/worktree_merge_bot.hexa --apply             # merge clean ones
+//    hexa tool/worktree_merge_bot.hexa --config <path>     # override config
+//    hexa tool/worktree_merge_bot.hexa --selftest          # built-in 3/3 test
+//    hexa tool/worktree_merge_bot.hexa --help
+//
+//  RAW CONSTRAINTS
+//    raw#9  hexa-only
+//    raw#11 snake_case
+//    raw#15 no-hardcode (all tunables via JSON config)
+//    raw#25 no destructive op without explicit --apply
+// ════════════════════════════════════════════════════════════════════════════
+
+let DEFAULT_CONFIG = "/Users/ghost/core/anima/shared/config/worktree_merge_bot_config.json"
+
+// ── string / sys helpers ──────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return to_string(x)
+}
+
+fn _sh_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _file_exists(p: string) -> bool {
+    return exec_with_status("test -e " + _sh_quote(p))[1] == 0
+}
+
+fn _dir_exists(p: string) -> bool {
+    return exec_with_status("test -d " + _sh_quote(p))[1] == 0
+}
+
+fn _exec_out(cmd: string) -> string {
+    return _str(exec_with_status(cmd)[0])
+}
+
+fn _exec_rc(cmd: string) -> int {
+    return exec_with_status(cmd)[1]
+}
+
+fn _ts_iso() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _ts_epoch() -> string {
+    return _exec_out("date -u +%s").trim()
+}
+
+fn _mkdir_p(dir: string) -> bool {
+    return _exec_rc("mkdir -p " + _sh_quote(dir)) == 0
+}
+
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+// ── argv ──────────────────────────────────────────────────────────────────
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(_str(a[i])); i = i + 1 }
+    return o
+}
+
+fn _flag(av: array, k: string) -> bool {
+    for x in av { if _str(x) == k { return true } }
+    return false
+}
+
+fn _opt(av: array, k: string, d: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if _str(av[i]) == k && i + 1 < len(av) { return _str(av[i + 1]) }
+        i = i + 1
+    }
+    return d
+}
+
+// ── config ────────────────────────────────────────────────────────────────
+
+fn _load_config(p: string) {
+    if !_file_exists(p) {
+        eprintln("worktree_merge_bot: SETUP_ERROR — config missing: " + p)
+        exit(2)
+    }
+    return json_parse(read_file(p))
+}
+
+fn _cfg_str(cfg, k: string, d: string) -> string {
+    if cfg.contains_key(k) { return _str(cfg[k]) }
+    return d
+}
+
+fn _cfg_bool(cfg, k: string, d: bool) -> bool {
+    if !cfg.contains_key(k) { return d }
+    let v = cfg[k]
+    let t = type_of(v)
+    if t == "bool" { return v }
+    let s = _str(v).to_lower()
+    if s == "true" || s == "1" || s == "yes" { return true }
+    return false
+}
+
+// ── worktree discovery ────────────────────────────────────────────────────
+
+// Manual reverse-scan for last '/' (avoid last_index_of — some hexa codegen
+// paths reject it for unannotated receivers in certain contexts).
+fn _last_slash(s: string) -> int {
+    let mut i = len(s) - 1
+    while i >= 0 {
+        if s.substring(i, i + 1) == "/" { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+fn _basename(path: string) -> string {
+    let k = _last_slash(path)
+    if k < 0 { return path }
+    return path.substring(k + 1, len(path))
+}
+
+fn _dirname(path: string) -> string {
+    let k = _last_slash(path)
+    if k < 0 { return "." }
+    return path.substring(0, k)
+}
+
+fn _list_worktrees(root: string, pat_prefix: string) -> array {
+    let mut out = []
+    if !_dir_exists(root) { return out }
+    // We expect agent-* dirs. Use ls -1d + prefix match for portability.
+    let cmd = "ls -1d " + _sh_quote(root) + "/*/ 2>/dev/null"
+    let body = _exec_out(cmd)
+    for ln in split(body, "\n") {
+        let t: string = _str(ln).trim()
+        if t == "" { continue }
+        // Strip trailing slash.
+        let mut p: string = t
+        if len(p) > 0 && p.substring(len(p) - 1, len(p)) == "/" {
+            p = p.substring(0, len(p) - 1)
+        }
+        let base: string = _basename(p)
+        if len(base) < len(pat_prefix) { continue }
+        let pre = base.substring(0, len(pat_prefix))
+        if pre != pat_prefix { continue }
+        out.push(p)
+    }
+    return out
+}
+
+// ── git probes (run `git -C <wt> ...`) ────────────────────────────────────
+
+fn _git_c(wt: string, rest: string) -> string {
+    let cmd = "git -C " + _sh_quote(wt) + " " + rest + " 2>/dev/null"
+    return _exec_out(cmd)
+}
+
+fn _git_c_rc(wt: string, rest: string) -> int {
+    let cmd = "git -C " + _sh_quote(wt) + " " + rest + " >/dev/null 2>&1"
+    return _exec_rc(cmd)
+}
+
+fn _branch_of(wt: string) -> string {
+    return _git_c(wt, "rev-parse --abbrev-ref HEAD").trim()
+}
+
+fn _rev_parse(wt: string, ref_name: string) -> string {
+    return _git_c(wt, "rev-parse " + _sh_quote(ref_name)).trim()
+}
+
+// Count commits on branch not in base.  Empty/unknown → 0.
+fn _commits_ahead(wt: string, base: string, branch: string) -> int {
+    let rng = _sh_quote(base + ".." + branch)
+    let body = _git_c(wt, "rev-list --count " + rng)
+    let t = body.trim()
+    if t == "" { return 0 }
+    return to_int(t)
+}
+
+// Return array of "sha\tsubject" for commits in base..branch (up to cap).
+fn _commit_list(wt: string, base: string, branch: string, cap: int) -> array {
+    let rng = _sh_quote(base + ".." + branch)
+    let body = _git_c(wt, "log " + rng + " --oneline -n " + to_string(cap))
+    let mut out = []
+    for ln in split(body, "\n") {
+        let t = _str(ln).trim()
+        if t != "" { out.push(t) }
+    }
+    return out
+}
+
+// Merge-tree conflict probe.  Returns [rc, conflict_files_array].
+//  rc=0 → clean; rc!=0 → conflict; --name-only keeps output compact.
+fn _merge_tree_probe(wt: string, base: string, branch: string) -> array {
+    let cmd = "git -C " + _sh_quote(wt) +
+              " merge-tree --name-only " + _sh_quote(base) +
+              " " + _sh_quote(branch) + " 2>/dev/null"
+    let r = exec_with_status(cmd)
+    let rc = r[1]
+    let body = _str(r[0])
+    // Output format (git 2.38+ w/ --name-only):
+    //   <tree-oid>
+    //   <file1>
+    //   <file2>
+    //   <blank line>
+    //   <message lines...>
+    // On clean merge, only <tree-oid> (single line) is printed.
+    let mut files = []
+    if rc == 0 { return [0, files] }
+    let lines = split(body, "\n")
+    // Skip first line (tree oid).  Collect file names until blank line.
+    let mut i = 1
+    while i < len(lines) {
+        let t = _str(lines[i]).trim()
+        if t == "" { break }
+        files.push(t)
+        i = i + 1
+    }
+    return [rc, files]
+}
+
+// ── classify one worktree ─────────────────────────────────────────────────
+//
+// Returns a dict:
+//   {
+//     "worktree": "<abs path>",
+//     "branch":   "<name or ''>",
+//     "base":     "<base branch>",
+//     "commits_ahead": <int>,
+//     "commits":  [ "<sha> <subj>", ... ] (capped),
+//     "classification": "clean" | "conflict" | "abandoned" | "error",
+//     "conflict_files": [ ... ] (only when conflict),
+//     "error": "<msg>"  (only when error),
+//     "merge_cmd": "git -C <repo> merge --no-ff <branch>" (only when clean)
+//   }
+//
+fn _classify_one(repo_root: string, wt: string, base: string, strategy: string) {
+    let mut rec = #{}
+    rec["worktree"] = wt
+    rec["base"]     = base
+
+    // Must be a git dir.
+    if !_dir_exists(wt + "/.git") && _git_c_rc(wt, "rev-parse --is-inside-work-tree") != 0 {
+        rec["branch"] = ""
+        rec["commits_ahead"] = 0
+        rec["commits"] = []
+        rec["classification"] = "error"
+        rec["error"] = "not a git worktree"
+        return rec
+    }
+
+    let branch = _branch_of(wt)
+    rec["branch"] = branch
+
+    if branch == "" || branch == "HEAD" {
+        rec["commits_ahead"] = 0
+        rec["commits"] = []
+        rec["classification"] = "error"
+        rec["error"] = "detached HEAD or branch resolution failed"
+        return rec
+    }
+
+    // Ensure base ref resolves inside this worktree (git rev-parse main).
+    let base_sha = _rev_parse(wt, base)
+    if base_sha == "" {
+        rec["commits_ahead"] = 0
+        rec["commits"] = []
+        rec["classification"] = "error"
+        rec["error"] = "base ref '" + base + "' not resolvable in worktree"
+        return rec
+    }
+
+    let ahead = _commits_ahead(wt, base, branch)
+    rec["commits_ahead"] = ahead
+    rec["commits"] = _commit_list(wt, base, branch, 20)
+
+    if ahead <= 0 {
+        rec["classification"] = "abandoned"
+        return rec
+    }
+
+    let probe = _merge_tree_probe(wt, base, branch)
+    let rc = probe[0]
+    let files = probe[1]
+    if rc == 0 {
+        rec["classification"] = "clean"
+        rec["merge_cmd"] = "git -C " + repo_root + " merge " + strategy + " " + branch
+        return rec
+    }
+    rec["classification"] = "conflict"
+    rec["conflict_files"] = files
+    return rec
+}
+
+// ── plan emit ─────────────────────────────────────────────────────────────
+
+fn _emit_commits_json(commits: array) -> string {
+    let mut acc = "["
+    let mut i = 0
+    while i < len(commits) {
+        if i > 0 { acc = acc + "," }
+        acc = acc + "\"" + _json_escape(_str(commits[i])) + "\""
+        i = i + 1
+    }
+    return acc + "]"
+}
+
+fn _emit_record_json(rec) -> string {
+    let mut a = "{"
+    a = a + "\"worktree\":\"" + _json_escape(_str(rec["worktree"])) + "\","
+    a = a + "\"branch\":\""   + _json_escape(_str(rec["branch"]))   + "\","
+    a = a + "\"base\":\""     + _json_escape(_str(rec["base"]))     + "\","
+    a = a + "\"classification\":\"" + _json_escape(_str(rec["classification"])) + "\","
+    a = a + "\"commits_ahead\":" + to_string(rec["commits_ahead"]) + ","
+    a = a + "\"commits\":" + _emit_commits_json(rec["commits"])
+    if rec.contains_key("conflict_files") {
+        a = a + ",\"conflict_files\":" + _emit_commits_json(rec["conflict_files"])
+    }
+    if rec.contains_key("merge_cmd") {
+        a = a + ",\"merge_cmd\":\"" + _json_escape(_str(rec["merge_cmd"])) + "\""
+    }
+    if rec.contains_key("error") {
+        a = a + ",\"error\":\"" + _json_escape(_str(rec["error"])) + "\""
+    }
+    return a + "}"
+}
+
+fn _emit_plan_json(plan_records: array, summary) -> string {
+    let mut a = "{\n"
+    a = a + "  \"schema\": \"worktree_merge_plan/v1\",\n"
+    a = a + "  \"generated_at\": \"" + _ts_iso() + "\",\n"
+    a = a + "  \"base_branch\": \"" + _json_escape(_str(summary["base"])) + "\",\n"
+    a = a + "  \"dry_run\": "   + (if summary["dry_run"] { "true" } else { "false" }) + ",\n"
+    a = a + "  \"totals\": {\n"
+    a = a + "    \"scanned\":   " + to_string(summary["scanned"])   + ",\n"
+    a = a + "    \"clean\":     " + to_string(summary["clean"])     + ",\n"
+    a = a + "    \"conflict\":  " + to_string(summary["conflict"])  + ",\n"
+    a = a + "    \"abandoned\": " + to_string(summary["abandoned"]) + ",\n"
+    a = a + "    \"error\":     " + to_string(summary["error"])     + "\n"
+    a = a + "  },\n"
+    a = a + "  \"records\": [\n"
+    let mut i = 0
+    while i < len(plan_records) {
+        let tail = if i + 1 < len(plan_records) { "," } else { "" }
+        a = a + "    " + _emit_record_json(plan_records[i]) + tail + "\n"
+        i = i + 1
+    }
+    a = a + "  ]\n"
+    a = a + "}\n"
+    return a
+}
+
+fn _tally(records: array) {
+    let mut s = #{}
+    s["clean"] = 0
+    s["conflict"] = 0
+    s["abandoned"] = 0
+    s["error"] = 0
+    for r in records {
+        let c = _str(r["classification"])
+        if c == "clean"     { s["clean"]     = s["clean"]     + 1 }
+        if c == "conflict"  { s["conflict"]  = s["conflict"]  + 1 }
+        if c == "abandoned" { s["abandoned"] = s["abandoned"] + 1 }
+        if c == "error"     { s["error"]     = s["error"]     + 1 }
+    }
+    return s
+}
+
+// ── apply: merge clean branches ───────────────────────────────────────────
+
+fn _apply_merges(repo_root: string, records: array, strategy: string) -> int {
+    let mut applied = 0
+    let mut failed = 0
+    for r in records {
+        if _str(r["classification"]) != "clean" { continue }
+        let branch = _str(r["branch"])
+        let cmd = "git -C " + _sh_quote(repo_root) + " merge " + strategy +
+                  " " + _sh_quote(branch) + " 2>&1"
+        println("[apply] " + cmd)
+        let rc = exec_with_status(cmd)
+        let body = _str(rc[0])
+        print(body)
+        if rc[1] == 0 {
+            applied = applied + 1
+            println("[apply] OK: " + branch)
+        } else {
+            failed = failed + 1
+            eprintln("[apply] FAIL rc=" + to_string(rc[1]) + ": " + branch)
+            // Best-effort abort to avoid leaving merge in progress.
+            let _ab = exec_with_status("git -C " + _sh_quote(repo_root) +
+                                       " merge --abort 2>/dev/null")
+        }
+    }
+    println("[apply] done: applied=" + to_string(applied) +
+            " failed=" + to_string(failed))
+    return if failed == 0 { 0 } else { 1 }
+}
+
+// ── core run: scan → plan → (optional) apply ──────────────────────────────
+
+fn run_scan(cfg, apply_flag: bool) -> int {
+    let base = _cfg_str(cfg, "base_branch", "main")
+    let wts_root = _cfg_str(cfg, "worktrees_root",
+                            "/Users/ghost/core/anima/.claude/worktrees")
+    let prefix = _cfg_str(cfg, "worktree_glob", "agent-*")
+    // Our _list_worktrees takes a prefix (pre-*).  Strip trailing '*' if any.
+    let pat_prefix = if len(prefix) > 0 && prefix.substring(len(prefix)-1, len(prefix)) == "*" {
+        prefix.substring(0, len(prefix) - 1)
+    } else { prefix }
+    let repo_root = _cfg_str(cfg, "repo_root", "/Users/ghost/core/anima")
+    let plan_out  = _cfg_str(cfg, "plan_out",
+                             "/Users/ghost/core/anima/state/worktree_merge_plan.json")
+    let strategy  = _cfg_str(cfg, "merge_strategy", "--no-ff")
+
+    let wts = _list_worktrees(wts_root, pat_prefix)
+    println("worktree_merge_bot: scanning " + to_string(len(wts)) +
+            " worktree(s) under " + wts_root + " (prefix=" + pat_prefix + ")")
+    println("  base_branch = " + base)
+    println("  repo_root   = " + repo_root)
+    println("  mode        = " + (if apply_flag { "apply" } else { "dry-run" }))
+
+    let mut records = []
+    for wt in wts {
+        let r = _classify_one(repo_root, wt, base, strategy)
+        records.push(r)
+    }
+
+    let tally = _tally(records)
+    let mut summary = #{}
+    summary["base"]      = base
+    summary["dry_run"]   = !apply_flag
+    summary["scanned"]   = len(records)
+    summary["clean"]     = tally["clean"]
+    summary["conflict"]  = tally["conflict"]
+    summary["abandoned"] = tally["abandoned"]
+    summary["error"]     = tally["error"]
+
+    // Emit plan JSON.
+    let parent = _dirname(plan_out)
+    let _m = _mkdir_p(parent)
+    let body = _emit_plan_json(records, summary)
+    write_file(plan_out, body)
+
+    println("")
+    println("  classification breakdown:")
+    println("    clean     : " + to_string(summary["clean"]))
+    println("    conflict  : " + to_string(summary["conflict"]))
+    println("    abandoned : " + to_string(summary["abandoned"]))
+    println("    error     : " + to_string(summary["error"]))
+    println("  plan emitted: " + plan_out)
+
+    if !apply_flag {
+        println("")
+        println("[dry-run] no merges performed. Re-run with --apply to merge clean branches.")
+        return 0
+    }
+
+    // Apply path.
+    if summary["clean"] <= 0 {
+        println("")
+        println("[apply] no clean branches — nothing to merge.")
+        return 0
+    }
+    return _apply_merges(repo_root, records, strategy)
+}
+
+// ── selftest ──────────────────────────────────────────────────────────────
+//
+// Three synthetic worktrees built under /tmp.  We exercise _classify_one
+// directly (does not require an actual `git worktree` — a plain branch in a
+// temp repo is sufficient because _classify_one only uses `git -C <wt>`
+// commands).  No real merges are ever performed.
+//
+fn _selftest_build_fixture() -> string {
+    let base = "/tmp/worktree_merge_bot_selftest_" + _exec_out("echo $$").trim()
+    let _rm = exec_with_status("rm -rf " + _sh_quote(base))
+    let _mk = exec_with_status("mkdir -p " + _sh_quote(base))
+
+    // Master repo with 'main' branch and one commit.
+    let setup = "cd " + _sh_quote(base) + " && " +
+                "git init -q -b main && " +
+                "git -c user.email=a@b -c user.name=t commit --allow-empty -q -m 'seed' && " +
+                "echo 'original line' > shared.txt && git add shared.txt && " +
+                "git -c user.email=a@b -c user.name=t commit -q -m 'main: shared.txt'"
+    let r = exec_with_status(setup)
+    if r[1] != 0 {
+        eprintln("selftest: fixture setup failed rc=" + to_string(r[1]))
+        return ""
+    }
+    return base
+}
+
+fn _selftest_make_branch(base: string, branch: string, payload_cmd: string) -> int {
+    let cmd = "cd " + _sh_quote(base) + " && " +
+              "git checkout -q -b " + _sh_quote(branch) + " main && " +
+              payload_cmd + " && " +
+              "git checkout -q main"
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+fn _selftest() -> int {
+    println("worktree_merge_bot: selftest BEGIN")
+    let base = _selftest_build_fixture()
+    if base == "" {
+        eprintln("  FAIL: fixture build")
+        return 1
+    }
+
+    // S1: clean branch — modifies a NEW file, no conflict with main.
+    let rc1 = _selftest_make_branch(base, "s1_clean",
+        "echo 'feature-only' > s1.txt && git add s1.txt && " +
+        "git -c user.email=a@b -c user.name=t commit -q -m 's1: add s1.txt'")
+    if rc1 != 0 {
+        eprintln("  FAIL: s1 branch setup rc=" + to_string(rc1))
+        let _c = exec_with_status("rm -rf " + _sh_quote(base))
+        return 1
+    }
+
+    // S2: conflict branch — edits shared.txt differently from main. We must
+    // actually diverge main to produce a conflict: commit a competing change
+    // on main AFTER s2 branches off.
+    let rc2a = _selftest_make_branch(base, "s2_conflict",
+        "echo 's2 side change' > shared.txt && git add shared.txt && " +
+        "git -c user.email=a@b -c user.name=t commit -q -m 's2: edit shared.txt'")
+    if rc2a != 0 {
+        eprintln("  FAIL: s2 branch setup rc=" + to_string(rc2a))
+        let _c = exec_with_status("rm -rf " + _sh_quote(base))
+        return 1
+    }
+    let rc2b = exec_with_status("cd " + _sh_quote(base) + " && " +
+        "echo 'main side change' > shared.txt && git add shared.txt && " +
+        "git -c user.email=a@b -c user.name=t commit -q -m 'main: edit shared.txt'")[1]
+    if rc2b != 0 {
+        eprintln("  FAIL: main divergence commit rc=" + to_string(rc2b))
+        let _c = exec_with_status("rm -rf " + _sh_quote(base))
+        return 1
+    }
+
+    // S3: abandoned branch — no new commits vs main.
+    let rc3 = exec_with_status("cd " + _sh_quote(base) + " && " +
+        "git checkout -q -b s3_abandoned main && git checkout -q main")[1]
+    if rc3 != 0 {
+        eprintln("  FAIL: s3 branch setup rc=" + to_string(rc3))
+        let _c = exec_with_status("rm -rf " + _sh_quote(base))
+        return 1
+    }
+
+    // For each synthetic "worktree" we switch base to the branch name; real
+    // worktrees have HEAD already on the per-agent branch.  Simulate that by
+    // building three per-branch *worktrees* via `git worktree add`.
+    let wt1 = base + "/wt_s1"
+    let wt2 = base + "/wt_s2"
+    let wt3 = base + "/wt_s3"
+    let add1 = exec_with_status("cd " + _sh_quote(base) +
+        " && git worktree add -q " + _sh_quote(wt1) + " s1_clean 2>&1")
+    if add1[1] != 0 {
+        eprintln("  FAIL: worktree add s1 rc=" + to_string(add1[1]) + " " + _str(add1[0]))
+        let _c = exec_with_status("rm -rf " + _sh_quote(base))
+        return 1
+    }
+    let add2 = exec_with_status("cd " + _sh_quote(base) +
+        " && git worktree add -q " + _sh_quote(wt2) + " s2_conflict 2>&1")
+    if add2[1] != 0 {
+        eprintln("  FAIL: worktree add s2 rc=" + to_string(add2[1]) + " " + _str(add2[0]))
+        let _c = exec_with_status("rm -rf " + _sh_quote(base))
+        return 1
+    }
+    let add3 = exec_with_status("cd " + _sh_quote(base) +
+        " && git worktree add -q " + _sh_quote(wt3) + " s3_abandoned 2>&1")
+    if add3[1] != 0 {
+        eprintln("  FAIL: worktree add s3 rc=" + to_string(add3[1]) + " " + _str(add3[0]))
+        let _c = exec_with_status("rm -rf " + _sh_quote(base))
+        return 1
+    }
+
+    // Run classify on each.  repo_root points at the master repo so merge_cmd
+    // rendering uses it (we never actually merge during selftest).
+    let r1 = _classify_one(base, wt1, "main", "--no-ff")
+    let r2 = _classify_one(base, wt2, "main", "--no-ff")
+    let r3 = _classify_one(base, wt3, "main", "--no-ff")
+
+    let mut passed = 0
+    let mut total  = 3
+
+    // Assertion S1: clean.
+    if _str(r1["classification"]) == "clean" &&
+       r1["commits_ahead"] >= 1 &&
+       r1.contains_key("merge_cmd") {
+        println("  [S1] clean worktree → classify=clean (ahead=" +
+                to_string(r1["commits_ahead"]) + ")  PASS")
+        passed = passed + 1
+    } else {
+        eprintln("  [S1] FAIL: got classification=" + _str(r1["classification"]) +
+                 " ahead=" + to_string(r1["commits_ahead"]))
+    }
+
+    // Assertion S2: conflict + files listed.
+    if _str(r2["classification"]) == "conflict" &&
+       r2.contains_key("conflict_files") &&
+       len(r2["conflict_files"]) >= 1 {
+        let files = r2["conflict_files"]
+        let mut saw_shared = false
+        for f in files {
+            if _str(f) == "shared.txt" { saw_shared = true }
+        }
+        if saw_shared {
+            println("  [S2] conflict worktree → classify=conflict (files=" +
+                    to_string(len(files)) + ", shared.txt listed)  PASS")
+            passed = passed + 1
+        } else {
+            eprintln("  [S2] FAIL: conflict detected but shared.txt missing from list")
+        }
+    } else {
+        eprintln("  [S2] FAIL: got classification=" + _str(r2["classification"]))
+    }
+
+    // Assertion S3: abandoned.
+    if _str(r3["classification"]) == "abandoned" &&
+       r3["commits_ahead"] == 0 {
+        println("  [S3] empty branch → classify=abandoned  PASS")
+        passed = passed + 1
+    } else {
+        eprintln("  [S3] FAIL: got classification=" + _str(r3["classification"]) +
+                 " ahead=" + to_string(r3["commits_ahead"]))
+    }
+
+    // Also sanity-check: emitting a plan from these records must produce
+    // valid JSON with non-zero records array and no merges executed.
+    let plan_path = base + "/_selftest_plan.json"
+    let mut recs = []
+    recs.push(r1); recs.push(r2); recs.push(r3)
+    let tally = _tally(recs)
+    let mut summary = #{}
+    summary["base"] = "main"
+    summary["dry_run"] = true
+    summary["scanned"] = 3
+    summary["clean"] = tally["clean"]
+    summary["conflict"] = tally["conflict"]
+    summary["abandoned"] = tally["abandoned"]
+    summary["error"] = tally["error"]
+    let body = _emit_plan_json(recs, summary)
+    write_file(plan_path, body)
+    let parsed = json_parse(read_file(plan_path))
+    if !parsed.contains_key("records") {
+        eprintln("  plan emit sanity: FAIL (no records key)")
+    } else {
+        println("  plan emit sanity: OK (" + plan_path + ")")
+    }
+
+    // Cleanup.
+    let _cleanup = exec_with_status("rm -rf " + _sh_quote(base))
+
+    println("worktree_merge_bot: selftest " + to_string(passed) + "/" + to_string(total))
+    if passed == total { return 0 }
+    return 1
+}
+
+// ── help ──────────────────────────────────────────────────────────────────
+
+fn _print_help() {
+    println("usage: hexa tool/worktree_merge_bot.hexa [opts]")
+    println("  (no args)              dry-run scan → state/worktree_merge_plan.json")
+    println("  --apply                merge clean branches (never resolves conflicts)")
+    println("  --config <path>        override config (default shared/config/worktree_merge_bot_config.json)")
+    println("  --selftest             run built-in 3-case fixture (no real merges)")
+    println("  --help")
+}
+
+// ── main ──────────────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = _argv()
+
+    if _flag(av, "--help") || _flag(av, "-h") {
+        _print_help()
+        return 0
+    }
+    if _flag(av, "--selftest") {
+        return _selftest()
+    }
+
+    let cfg_path = _opt(av, "--config", DEFAULT_CONFIG)
+    let cfg = _load_config(cfg_path)
+
+    let cfg_dry = _cfg_bool(cfg, "dry_run", true)
+    let apply   = _flag(av, "--apply")
+    if apply && cfg_dry {
+        println("worktree_merge_bot: --apply overrides config.dry_run=true")
+    }
+    return run_scan(cfg, apply)
+}
