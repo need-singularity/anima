@@ -1,0 +1,644 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/unified_eval.hexa — Unified eval harness (parallel cert aggregator)
+//
+//  PURPOSE
+//    Aggregate 20+ anima cert tools (AN11, Hexad closure, Mk.VIII stationary,
+//    L_IX integrator, cell_token_bridge_proto, hexad_n28_falsification,
+//    true_closure_verifier, corpus G1-G7, …) into ONE parallel invocation.
+//
+//    Sequential execution in CI / Path B dry-run wastes minutes; this harness
+//    fans the cert tools out via OS background spawn (shell "&" + wait) and
+//    aggregates their {verdict, elapsed_ms, proof_hash} into a single SSOT
+//    cert carrying a deterministic hash-chain over the sorted child hashes.
+//
+//  DETERMINISM
+//    raw#9  hexa-only        raw#10 proof-carrying hash-chain
+//    raw#11 snake_case       raw#12 empirical (실측 wall/elapsed)
+//    raw#15 no-hardcode (all certs driven by shared/config/…json)
+//    LLM=none     children sorted by slug in output → same proof_hash
+//    when per-child outputs are byte-identical.
+//
+//  PARALLELISM
+//    Primary: OS-level background-spawn via `cmd &` + `wait $pid` (POSIX).
+//             hexa-lang does not ship a native parallel primitive (checked
+//             `hexa --help`; only `run` and `batch` — batch is sequential).
+//             Evidence of parallelism recorded in output as
+//                total_wall_ms <  Σ child_elapsed_ms
+//             factor 0.9 threshold allows startup/teardown overhead.
+//
+//  USAGE
+//    hexa tool/unified_eval.hexa config/unified_eval_config.json
+//    hexa tool/unified_eval.hexa config/unified_eval_config.json \
+//         --output state/unified_eval_result.json
+//    hexa tool/unified_eval.hexa config/unified_eval_config.json \
+//         --skip-run              # read existing child SSOTs, do not spawn
+//    hexa tool/unified_eval.hexa --help
+//
+//  OUTPUT (raw#10 proof-carrying)
+//    state/unified_eval_result.json   schema: anima.unified_eval.v1
+//    .raw-audit/unified_eval.log      hash-chain append line
+// ════════════════════════════════════════════════════════════════════════════
+
+// NOTE: the roadmap #33/#16 spec referenced shared/config/unified_eval_config.json,
+// but `/shared` is gitignored in this repo (symlinks to nexus/shared for
+// local-only assets).  We therefore land the tracked copy in config/, matching
+// the convention of other cert tool configs (config/true_closure_config.json,
+// etc).  Callers may still pass any path as the last positional arg.
+let DEFAULT_CONFIG = "config/unified_eval_config.json"
+let DEFAULT_OUT    = "state/unified_eval_result.json"
+let DEFAULT_AUDIT  = ".raw-audit/unified_eval.log"
+let HEXA_BIN_DEFAULT = "/Users/ghost/Dev/hexa-lang/hexa"
+
+// ─── type / string helpers ────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn now_utc() -> string {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+// portable ms-since-epoch via perl Time::HiRes (guaranteed on macOS + linux)
+fn now_ms() -> int {
+    let s = _str(exec("perl -MTime::HiRes=time -e 'printf \"%d\\n\", time()*1000'")).trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+fn bool_s(b: bool) -> string { return if b { "true" } else { "false" } }
+
+fn fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn dexists(p: string) -> bool {
+    return _str(exec("test -d " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn resolve_root() -> string {
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let h = _str(env("HOME"))
+    return h + "/core/anima"
+}
+
+fn resolve_hexa_bin() -> string {
+    let e = _str(env("HEXA_BIN"))
+    if e != "" { return e }
+    if fexists(HEXA_BIN_DEFAULT) { return HEXA_BIN_DEFAULT }
+    let p = _str(exec("command -v hexa 2>/dev/null")).trim()
+    if p != "" { return p }
+    return HEXA_BIN_DEFAULT
+}
+
+fn sha256_file(path: string) -> string {
+    if !fexists(path) { return "" }
+    return _str(exec("shasum -a 256 " + path + " | awk '{print $1}'")).trim()
+}
+
+fn sha256_str(s: string) -> string {
+    // pipe via printf %s so we avoid trailing newline issues.
+    let esc = s.replace("'", "'\\''")
+    let cmd = "printf %s '" + esc + "' | shasum -a 256 | awk '{print $1}'"
+    return _str(exec(cmd)).trim()
+}
+
+fn json_escape(s: string) -> string {
+    let a = s.replace("\\", "\\\\")
+    let b = a.replace("\"", "\\\"")
+    let c = b.replace("\n", "\\n")
+    let d = c.replace("\r", "\\r")
+    return d.replace("\t", "\\t")
+}
+
+fn is_json_map(v) -> bool {
+    let s = str(v)
+    if s.len() < 1 { return false }
+    return s.substring(0, 1) == "{"
+}
+
+fn sh_escape(s: string) -> string {
+    let e = s.replace("'", "'\\''")
+    return "'" + e + "'"
+}
+
+// ─── arg helpers ──────────────────────────────────────────────────────────
+
+fn arg_present(argv, key: string) -> bool {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn arg_value(argv, key: string, dflt: string) -> string {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key && i + 1 < len(argv) { return _str(argv[i + 1]) }
+        i = i + 1
+    }
+    return dflt
+}
+
+// last positional (non-flag) arg with a .json suffix — used for config path.
+// hexa's args() includes the interpreter/cache binary path at argv[0..n]; we
+// want the user-supplied config, which is reliably the LAST positional .json.
+fn last_positional_json(argv) -> string {
+    let mut i = len(argv) - 1
+    while i >= 0 {
+        let s = _str(argv[i])
+        if s.len() >= 5 {
+            let suf = s.substring(s.len() - 5, s.len())
+            if suf == ".json" { return s }
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+fn args_to_cmd(args_arr) -> string {
+    let mut s = ""
+    let mut i = 0
+    while i < len(args_arr) {
+        s = s + " " + sh_escape(_str(args_arr[i]))
+        i = i + 1
+    }
+    return s
+}
+
+// ─── config load ──────────────────────────────────────────────────────────
+
+fn load_config(path: string) {
+    if !fexists(path) {
+        println("unified_eval: SETUP_ERROR — config not found: " + path)
+        exit(2)
+    }
+    let raw = read_file(path)
+    let cfg = json_parse(raw)
+    if !is_json_map(cfg) {
+        println("unified_eval: SETUP_ERROR — malformed config JSON: " + path)
+        exit(2)
+    }
+    return cfg
+}
+
+// ─── rc membership ────────────────────────────────────────────────────────
+
+fn rc_accepted(rc: int, accept_arr) -> bool {
+    if type_of(accept_arr) == "null" { return rc == 0 }
+    let mut i = 0
+    while i < len(accept_arr) {
+        let v = accept_arr[i]
+        let want = if type_of(v) == "int" { v } else { to_int(str(v)) }
+        if want == rc { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── verdict extraction ───────────────────────────────────────────────────
+//
+// Each cert entry has a verdict_rule = {key, pass_values[]}. We read the
+// SSOT JSON, pull the value at key (top-level only — keep it simple), stringify
+// deterministically, and classify:
+//   PASS  ← value ∈ pass_values
+//   FAIL  ← ssot present, key present, value ∉ pass_values
+//   OTHER ← ssot missing / malformed / key missing
+//
+// Returns [verdict_str, observed_str].
+
+fn classify_verdict(ssot_abs: string, rule) -> array {
+    if !fexists(ssot_abs) {
+        return ["OTHER", "ssot_missing"]
+    }
+    let raw = read_file(ssot_abs)
+    let sm = json_parse(raw)
+    if !is_json_map(sm) {
+        return ["OTHER", "malformed_json"]
+    }
+    if type_of(rule) != "map" {
+        return ["OTHER", "no_verdict_rule"]
+    }
+    if !rule.contains_key("key") || !rule.contains_key("pass_values") {
+        return ["OTHER", "bad_verdict_rule"]
+    }
+    let key = _str(rule["key"])
+    if !sm.contains_key(key) {
+        return ["OTHER", "missing_key:" + key]
+    }
+    let obs = str(sm[key])
+    let pv = rule["pass_values"]
+    let mut i = 0
+    while i < len(pv) {
+        if _str(pv[i]) == obs { return ["PASS", obs] }
+        i = i + 1
+    }
+    return ["FAIL", obs]
+}
+
+// ─── child spawn (parallel fan-out) ───────────────────────────────────────
+//
+// We spawn every child in one shell command so all backgrounded subshells
+// start before `wait` is issued. Each child writes a side-channel meta file
+// containing `rc start_ms end_ms`. stdout/stderr are captured per-child.
+//
+// Layout under /tmp:
+//   /tmp/unified_eval.<runid>.<slug>.log    stdout+stderr
+//   /tmp/unified_eval.<runid>.<slug>.meta   "rc start_ms end_ms"
+//   /tmp/unified_eval.<runid>.wall.meta     global "start_ms end_ms"
+//
+// The shell orchestration itself performs the time measurement so that
+// startup cost of the hexa interpreter is INCLUDED in child elapsed_ms.
+
+fn build_child_cmd(runid: string, root: string, hexa_bin: string,
+                   slug: string, path: string, args_inline: string,
+                   timeout_s: int) -> string {
+    let log_path  = "/tmp/unified_eval." + runid + "." + slug + ".log"
+    let meta_path = "/tmp/unified_eval." + runid + "." + slug + ".meta"
+    let t_prefix = if timeout_s > 0 {
+        "ulimit -t " + str(timeout_s) + "; "
+    } else { "" }
+    // Child subshell:
+    //   1. record start_ms
+    //   2. cd to root + unset ANIMA/NEXUS leak + run tool
+    //   3. capture rc
+    //   4. record end_ms + emit meta
+    let ms_expr = "$(perl -MTime::HiRes=time -e 'printf \"%d\", time()*1000')"
+    let body = "( " +
+        "_s=" + ms_expr + "; " +
+        "cd " + sh_escape(root) + " && " + t_prefix +
+        "ANIMA=" + sh_escape(root) + " NEXUS=" + sh_escape(root) +
+        " HEXA_NO_LAUNCHD=1 " +
+        sh_escape(hexa_bin) + " run " + sh_escape(path) + args_inline +
+        " > " + sh_escape(log_path) + " 2>&1; " +
+        "_rc=$?; " +
+        "_e=" + ms_expr + "; " +
+        "printf '%s %s %s\\n' \"$_rc\" \"$_s\" \"$_e\" > " + sh_escape(meta_path) +
+        " ) &"
+    return body
+}
+
+fn parse_meta(meta_path: string) -> array {
+    // returns [rc, start_ms, end_ms]; all 0/0/0 on missing.
+    if !fexists(meta_path) { return [0, 0, 0] }
+    let raw = _str(exec("cat " + sh_escape(meta_path))).trim()
+    // tokenize on spaces
+    let mut toks = []
+    let mut cur = ""
+    let mut i = 0
+    while i < raw.len() {
+        let c = raw.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" {
+            if cur.len() > 0 { toks = push(toks, cur); cur = "" }
+        } else {
+            cur = cur + c
+        }
+        i = i + 1
+    }
+    if cur.len() > 0 { toks = push(toks, cur) }
+    if len(toks) < 3 { return [0, 0, 0] }
+    return [to_int(_str(toks[0])), to_int(_str(toks[1])), to_int(_str(toks[2]))]
+}
+
+// ─── sort child records by slug (deterministic proof_hash input) ──────────
+// Simple insertion sort on an array of [slug, path, verdict, observed,
+// proof_hash, elapsed_ms, rc, log_path].
+
+fn sort_children_by_slug(arr) -> array {
+    let mut a = arr
+    let n = len(a)
+    let mut i = 1
+    while i < n {
+        let cur = a[i]
+        let cur_slug = _str(cur[0])
+        let mut j = i - 1
+        while j >= 0 {
+            let jj = a[j]
+            if _str(jj[0]) > cur_slug {
+                a[j + 1] = jj
+                j = j - 1
+            } else { break }
+        }
+        a[j + 1] = cur
+        i = i + 1
+    }
+    return a
+}
+
+// ─── render helpers ───────────────────────────────────────────────────────
+
+fn short12(h: string) -> string {
+    if h.len() > 12 { return h.substring(0, 12) }
+    return h
+}
+
+// ─── usage ────────────────────────────────────────────────────────────────
+
+fn print_usage() {
+    println("unified_eval — parallel cert aggregation harness (anima)")
+    println("")
+    println("usage:")
+    println("  hexa tool/unified_eval.hexa <config.json>")
+    println("  hexa tool/unified_eval.hexa --help")
+    println("")
+    println("options:")
+    println("  --output <path>  cert output path (default " + DEFAULT_OUT + ")")
+    println("")
+    println("default config path: " + DEFAULT_CONFIG)
+}
+
+// ─── main ─────────────────────────────────────────────────────────────────
+
+fn main() {
+    let argv = args()
+    if arg_present(argv, "--help") || arg_present(argv, "-h") {
+        print_usage(); exit(0)
+    }
+
+    let _cfg_pos = last_positional_json(argv)
+    let cfg_rel = if _cfg_pos == "" { DEFAULT_CONFIG } else { _cfg_pos }
+    let out_override = arg_value(argv, "--output", "")
+    let skip_run = arg_present(argv, "--skip-run")
+
+    let root = resolve_root()
+    let hexa_bin = resolve_hexa_bin()
+    let cfg_abs = if cfg_rel.index_of("/") == 0 { cfg_rel } else { root + "/" + cfg_rel }
+    let cfg = load_config(cfg_abs)
+
+    let timeout_s = if cfg.contains_key("timeout_per_cert_s") {
+        to_int(str(cfg["timeout_per_cert_s"]))
+    } else { 60 }
+    let parallel_max = if cfg.contains_key("parallel_max") {
+        to_int(str(cfg["parallel_max"]))
+    } else { 8 }
+    let certs = cfg["certs"]
+
+    println("════════════════════════════════════════════════════════════════")
+    println("  tool/unified_eval.hexa")
+    println("  raw#9 hexa-only · raw#10 proof-carrying · raw#11 snake_case")
+    println("  raw#12 empirical · raw#15 no-hardcode · deterministic · LLM=none")
+    println("  root=" + root)
+    println("  hexa_bin=" + hexa_bin)
+    println("  config=" + cfg_rel)
+    println("  certs=" + str(len(certs)))
+    println("  timeout_per_cert_s=" + str(timeout_s))
+    println("  parallel_max=" + str(parallel_max))
+    println("  skip_run=" + bool_s(skip_run))
+    println("════════════════════════════════════════════════════════════════")
+
+    // Run id — isolate per-invocation temp files.
+    let runid = _str(exec("date -u +%Y%m%d%H%M%S")).trim() + "_" +
+                _str(exec("printf %s $$")).trim()
+
+    // Build spawn script containing all child backgrounds + a final `wait`.
+    // (skip_run path bypasses spawn and reads existing child SSOTs only —
+    //  used for harness-determinism selftest where child outputs are frozen.)
+    let mut total_wall_ms = 0
+    let mut spawn_path = ""
+    let mut i = 0
+    if !skip_run {
+        let mut spawn_sh = "set +e\n"
+        i = 0
+        while i < len(certs) {
+            let c = certs[i]
+            let slug = _str(c["slug"])
+            let path = _str(c["path"])
+            let args_a = if c.contains_key("args") { c["args"] } else { [] }
+            let cmd = build_child_cmd(runid, root, hexa_bin, slug, path,
+                                      args_to_cmd(args_a), timeout_s)
+            spawn_sh = spawn_sh + cmd + "\n"
+            i = i + 1
+        }
+        spawn_sh = spawn_sh + "wait\n"
+        spawn_path = "/tmp/unified_eval." + runid + ".spawn.sh"
+        write_file(spawn_path, spawn_sh)
+        exec("chmod +x " + sh_escape(spawn_path))
+        let wall_start = now_ms()
+        exec("bash " + sh_escape(spawn_path))
+        let wall_end = now_ms()
+        total_wall_ms = wall_end - wall_start
+    }
+
+    // Collect child results.
+    let mut children = []
+    let mut sum_child_ms = 0
+    let mut pass_n = 0
+    let mut fail_n = 0
+    let mut other_n = 0
+    i = 0
+    while i < len(certs) {
+        let c = certs[i]
+        let slug = _str(c["slug"])
+        let path = _str(c["path"])
+        let ssot = _str(c["ssot"])
+        let verdict_rule = if c.contains_key("verdict_rule") { c["verdict_rule"] } else { json_parse("{}") }
+        let accept_rc = if c.contains_key("accept_rc") { c["accept_rc"] } else { [0] }
+
+        let meta_path = "/tmp/unified_eval." + runid + "." + slug + ".meta"
+        let log_path  = "/tmp/unified_eval." + runid + "." + slug + ".log"
+        let meta = if skip_run { [0, 0, 0] } else { parse_meta(meta_path) }
+        let rc = meta[0]
+        let start_ms = meta[1]
+        let end_ms = meta[2]
+        let elapsed_ms = if end_ms >= start_ms { end_ms - start_ms } else { 0 }
+
+        let ssot_abs = if ssot.index_of("/") == 0 { ssot } else { root + "/" + ssot }
+        let vv = classify_verdict(ssot_abs, verdict_rule)
+        let mut verdict = _str(vv[0])
+        let observed = _str(vv[1])
+        let proof_hash = sha256_file(ssot_abs)
+
+        // Demote to OTHER if the child process rc wasn't accepted (unless
+        // verdict is already OTHER from a missing SSOT).
+        let rc_ok = rc_accepted(rc, accept_rc)
+        if !rc_ok && verdict == "PASS" {
+            // unexpected rc despite passing SSOT — flag as OTHER for safety
+            verdict = "OTHER"
+        }
+
+        sum_child_ms = sum_child_ms + elapsed_ms
+        if verdict == "PASS" { pass_n = pass_n + 1 }
+        else if verdict == "FAIL" { fail_n = fail_n + 1 }
+        else { other_n = other_n + 1 }
+
+        // Record:
+        //   [slug, path, verdict, observed, proof_hash, elapsed_ms, rc, log_path, ssot]
+        children = push(children, [slug, path, verdict, observed, proof_hash,
+                                   elapsed_ms, rc, log_path, ssot])
+        i = i + 1
+    }
+
+    // Deterministic sort by slug.
+    children = sort_children_by_slug(children)
+
+    // Compute proof_hash: sha256 of "\n"-joined child proof_hashes in
+    // slug-sorted order. If a child proof_hash is empty we substitute
+    // literal "EMPTY:" + slug so the chain still has structure.
+    let mut hash_concat = ""
+    let mut k = 0
+    while k < len(children) {
+        let r = children[k]
+        let slug = _str(r[0])
+        let ph = _str(r[4])
+        let line = if ph == "" { "EMPTY:" + slug } else { ph }
+        hash_concat = hash_concat + line + "\n"
+        k = k + 1
+    }
+    let proof_hash = sha256_str(hash_concat)
+    let hash_chain_prev = sha256_file(cfg_abs)
+
+    // Parallelism evidence.
+    let parallel_factor_permille = if sum_child_ms > 0 {
+        (total_wall_ms * 1000) / sum_child_ms
+    } else { 0 }
+    let parallel_ok = (sum_child_ms > 0) && (total_wall_ms * 10 < sum_child_ms * 9)
+
+    let total = len(children)
+    let closure_permille = if total > 0 { (pass_n * 1000) / total } else { 0 }
+    let closure_pct = closure_permille / 10
+
+    // Print per-child rows.
+    println("")
+    k = 0
+    while k < len(children) {
+        let r = children[k]
+        let slug = _str(r[0])
+        let verdict = _str(r[2])
+        let observed = _str(r[3])
+        let ph = _str(r[4])
+        let el = r[5]
+        let rc = r[6]
+        let g = if verdict == "PASS" { "✓" } else { if verdict == "FAIL" { "✗" } else { "?" } }
+        println("  " + g + " [" + slug + "] verdict=" + verdict +
+                " obs=" + observed +
+                " rc=" + str(rc) +
+                " elapsed_ms=" + str(el) +
+                " sha=" + short12(ph))
+        k = k + 1
+    }
+
+    println("")
+    println("═══ SUMMARY ═══")
+    println("  certs_total      = " + str(total))
+    println("  passed           = " + str(pass_n))
+    println("  failed           = " + str(fail_n))
+    println("  other            = " + str(other_n))
+    println("  closure_pct      = " + str(closure_pct) + "%")
+    println("  total_wall_ms    = " + str(total_wall_ms))
+    println("  sum_child_ms     = " + str(sum_child_ms))
+    println("  wall/child‰      = " + str(parallel_factor_permille) + " (want < 900)")
+    println("  parallel_evident = " + bool_s(parallel_ok))
+    println("  proof_hash       = " + short12(proof_hash))
+    println("  hash_chain_prev  = " + short12(hash_chain_prev))
+    println("")
+
+    // ── emit cert ─────────────────────────────────────────────────────────
+    let out_rel = if out_override != "" { out_override } else { DEFAULT_OUT }
+    let out_abs = if out_rel.index_of("/") == 0 { out_rel } else { root + "/" + out_rel }
+
+    let mut parts = []
+    parts = push(parts, "{\n")
+    parts = push(parts, "  \"schema\": \"anima.unified_eval.v1\",\n")
+    parts = push(parts, "  \"created\": \"" + now_utc() + "\",\n")
+    parts = push(parts, "  \"tool\": \"tool/unified_eval.hexa\",\n")
+    parts = push(parts, "  \"config\": \"" + json_escape(cfg_rel) + "\",\n")
+    parts = push(parts, "  \"root\": \"" + json_escape(root) + "\",\n")
+    parts = push(parts, "  \"timeout_per_cert_s\": " + str(timeout_s) + ",\n")
+    parts = push(parts, "  \"parallel_max\": " + str(parallel_max) + ",\n")
+    parts = push(parts, "  \"run_id\": \"" + json_escape(runid) + "\",\n")
+    parts = push(parts, "  \"children\": [\n")
+    k = 0
+    while k < len(children) {
+        let r = children[k]
+        let slug = _str(r[0])
+        let path = _str(r[1])
+        let verdict = _str(r[2])
+        let observed = _str(r[3])
+        let ph = _str(r[4])
+        let el = r[5]
+        let rc = r[6]
+        let lp = _str(r[7])
+        let ss = _str(r[8])
+        let comma = if k + 1 < len(children) { "," } else { "" }
+        parts = push(parts, "    {\n")
+        parts = push(parts, "      \"slug\": \"" + json_escape(slug) + "\",\n")
+        parts = push(parts, "      \"path\": \"" + json_escape(path) + "\",\n")
+        parts = push(parts, "      \"ssot\": \"" + json_escape(ss) + "\",\n")
+        parts = push(parts, "      \"verdict\": \"" + verdict + "\",\n")
+        parts = push(parts, "      \"observed\": \"" + json_escape(observed) + "\",\n")
+        parts = push(parts, "      \"proof_hash\": \"" + ph + "\",\n")
+        parts = push(parts, "      \"checks_pass\": " + (if verdict == "PASS" { "1" } else { "0" }) + ",\n")
+        parts = push(parts, "      \"checks_total\": 1,\n")
+        parts = push(parts, "      \"elapsed_ms\": " + str(el) + ",\n")
+        parts = push(parts, "      \"rc\": " + str(rc) + ",\n")
+        parts = push(parts, "      \"log_path\": \"" + json_escape(lp) + "\"\n")
+        parts = push(parts, "    }" + comma + "\n")
+        k = k + 1
+    }
+    parts = push(parts, "  ],\n")
+    parts = push(parts, "  \"aggregate\": {\n")
+    parts = push(parts, "    \"passed\": " + str(pass_n) + ",\n")
+    parts = push(parts, "    \"failed\": " + str(fail_n) + ",\n")
+    parts = push(parts, "    \"other\":  " + str(other_n) + ",\n")
+    parts = push(parts, "    \"total\":  " + str(total) + ",\n")
+    parts = push(parts, "    \"closure_pct\": " + str(closure_pct) + "\n")
+    parts = push(parts, "  },\n")
+    parts = push(parts, "  \"total_wall_ms\":  " + str(total_wall_ms) + ",\n")
+    parts = push(parts, "  \"sum_child_ms\":   " + str(sum_child_ms) + ",\n")
+    parts = push(parts, "  \"parallel_factor_permille\": " + str(parallel_factor_permille) + ",\n")
+    parts = push(parts, "  \"parallel_evident\": " + bool_s(parallel_ok) + ",\n")
+    parts = push(parts, "  \"hash_chain_prev\": \"" + hash_chain_prev + "\",\n")
+    parts = push(parts, "  \"proof_hash\":      \"" + proof_hash + "\",\n")
+    parts = push(parts, "  \"raw_strict\": \"raw#9 raw#10 raw#11 raw#12 raw#15 deterministic LLM=none\"\n")
+    parts = push(parts, "}\n")
+
+    let mut body = ""
+    let mut m = 0
+    while m < len(parts) {
+        body = body + _str(parts[m])
+        m = m + 1
+    }
+
+    // atomic write
+    let pid = _str(exec("printf %s $$")).trim()
+    let tmp = out_abs + ".tmp." + pid
+    write_file(tmp, body)
+    exec("mv -f " + sh_escape(tmp) + " " + sh_escape(out_abs))
+    let curr_hash = sha256_file(out_abs)
+
+    // audit log append
+    let audit_dir = root + "/.raw-audit"
+    if !dexists(audit_dir) { exec("mkdir -p " + sh_escape(audit_dir)) }
+    let audit_path = root + "/" + DEFAULT_AUDIT
+    let line = now_utc() + " unified_eval" +
+               " certs=" + str(total) +
+               " passed=" + str(pass_n) +
+               " failed=" + str(fail_n) +
+               " other=" + str(other_n) +
+               " wall_ms=" + str(total_wall_ms) +
+               " child_ms=" + str(sum_child_ms) +
+               " parallel=" + bool_s(parallel_ok) +
+               " prev=" + hash_chain_prev +
+               " proof=" + proof_hash +
+               " current=" + curr_hash + "\n"
+    exec("printf %s " + sh_escape(line) + " >> " + sh_escape(audit_path))
+
+    println("▶ cert:       " + out_rel)
+    println("▶ curr_hash:  " + curr_hash)
+    println("▶ audit log:  " + DEFAULT_AUDIT)
+
+    // Cleanup temp spawn/meta files (keep logs for debugging).
+    if spawn_path != "" { exec("rm -f " + sh_escape(spawn_path)) }
+    if !skip_run { exec("rm -f /tmp/unified_eval." + runid + ".*.meta") }
+
+    exit(0)
+}
+
+main()
