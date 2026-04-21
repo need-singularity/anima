@@ -39,8 +39,24 @@
 
 let CONFIG_PATH = "config/true_closure_config.json"
 let DEFAULT_OUT = "state/true_closure_cert.json"
+let DEFAULT_PREV = "state/true_closure_cert_prev.json"
 let DEFAULT_AUDIT_LOG = ".raw-audit/true_closure.log"
 let HEXA_BIN_DEFAULT = "/Users/ghost/Dev/hexa-lang/hexa"
+let AIRGENOME_BIN_DEFAULT = "/Users/ghost/Dev/airgenome/bin/airgenome"
+let AIRGENOME_BIN_SHIM    = "/Users/ghost/.hx/bin/airgenome"
+let AIRGENOME_PROBE_TIMEOUT_S = 3
+
+// ─── airgenome hook helper state (selective touch) ─────────────────────────
+// global mutable accumulators populated during per-component runs and
+// referenced by the cert builder via ag_top_chain() / ag_touch_count().
+
+let mut AG_AVAILABLE = false       // airgenome binary reachable
+let mut AG_CHECKED = false         // binary probe done
+let mut AG_BIN = ""                // resolved airgenome binary path
+let mut AG_DATE = ""               // YYYYMMDD slug for chain ids
+let mut AG_TOUCH_COUNT = 0         // total selective touches issued
+let mut AG_TOP_CHAIN = ""          // representative top-level chain id
+let mut AG_ACTIVE_CHAINS = []      // list of activated component chains
 
 // ─── type helpers ──────────────────────────────────────────────────────────
 
@@ -149,6 +165,119 @@ fn sha256_file(path: string) -> string {
     let r = _str(exec("shasum -a 256 " + path + " | awk '{print $1}'")).trim()
     return r
 }
+
+// ─── airgenome hook CLI adapter (graceful skip if unavailable) ─────────────
+//
+// Per-component chain activation + selective touch.  Every call tolerates
+// missing airgenome binary / missing hook_cli_state.hexa and becomes a
+// no-op in that case.  No silent fabrication; no stdout noise.
+// CLI-ONLY: we shell out to `airgenome hook {activate|touch|release}`.
+
+fn ag_resolve_bin() -> string {
+    // Prefer the canonical direct binary to avoid the shim's launchd
+    // re-entrancy hang (observed 2026-04-21 in agent-a449dad7 worktree).
+    let e = _str(env("AIRGENOME_BIN"))
+    if e != "" && fexists(e) { return e }
+    if fexists(AIRGENOME_BIN_DEFAULT) { return AIRGENOME_BIN_DEFAULT }
+    if fexists(AIRGENOME_BIN_SHIM)    { return AIRGENOME_BIN_SHIM }
+    let p = _str(exec("command -v airgenome 2>/dev/null")).trim()
+    if p != "" { return p }
+    return ""
+}
+
+fn ag_probe() -> bool {
+    if AG_CHECKED { return AG_AVAILABLE }
+    AG_CHECKED = true
+    let b = ag_resolve_bin()
+    if b == "" {
+        AG_AVAILABLE = false
+        return false
+    }
+    AG_BIN = b
+    // Hard timeout + capture stderr so a missing hook_cli_state.hexa
+    // leaves a detectable marker.  We probe with a bare `hook` (no sub)
+    // which the airgenome dispatcher refuses fast.
+    let tprefix = "timeout " + str(AIRGENOME_PROBE_TIMEOUT_S) + " "
+    let out = _str(exec(tprefix + b + " hook status 2>&1"))
+    if out.index_of("hook_cli_state.hexa missing") >= 0 {
+        AG_AVAILABLE = false
+        return false
+    }
+    if out.index_of("missing") >= 0 && out.index_of("hook_cli") >= 0 {
+        AG_AVAILABLE = false
+        return false
+    }
+    // Require at least one successful invocation of `hook activate` on
+    // a throwaway chain id as a functional check.  If it returns rc != 0
+    // we consider airgenome unavailable.
+    let probe_chain = "tc-probe-" + _str(exec("date -u +%Y%m%d%H%M%S")).trim()
+    let rc = _str(exec(tprefix + b + " hook activate " +
+                       ag_shell_escape(probe_chain) +
+                       " >/dev/null 2>&1; echo $?")).trim()
+    if rc != "0" {
+        AG_AVAILABLE = false
+        return false
+    }
+    // Best-effort cleanup of the probe chain.
+    exec(tprefix + b + " hook release " + ag_shell_escape(probe_chain) +
+         " 'probe-cleanup' >/dev/null 2>&1")
+    AG_AVAILABLE = true
+    AG_DATE = _str(exec("date -u +%Y%m%d")).trim()
+    return true
+}
+
+fn ag_shell_escape(s: string) -> string {
+    // single-quote shell escape
+    let e = s.replace("'", "'\\''")
+    return "'" + e + "'"
+}
+
+fn ag_chain_id(ck: string) -> string {
+    // ck example "1_cpgd" → short prefix "c1"
+    let idx = if ck.len() > 0 { ck.substring(0, 1) } else { "x" }
+    let d = if AG_DATE != "" { AG_DATE } else { "00000000" }
+    return "tc-c" + idx + "-" + d
+}
+
+fn ag_activate(ck: string) {
+    if !ag_probe() { return }
+    let chain = ag_chain_id(ck)
+    let cmd = AG_BIN + " hook activate " + ag_shell_escape(chain) +
+              " >/dev/null 2>&1; echo $?"
+    let rc = _str(exec(cmd)).trim()
+    if rc == "0" {
+        let mut found = false
+        let mut i = 0
+        while i < len(AG_ACTIVE_CHAINS) {
+            if _str(AG_ACTIVE_CHAINS[i]) == chain { found = true }
+            i = i + 1
+        }
+        if !found { AG_ACTIVE_CHAINS = push(AG_ACTIVE_CHAINS, chain) }
+        if AG_TOP_CHAIN == "" { AG_TOP_CHAIN = chain }
+    }
+}
+
+fn ag_touch(ck: string, kind: string, detail: string) {
+    if !ag_probe() { return }
+    let chain = ag_chain_id(ck)
+    let cmd = AG_BIN + " hook touch " + ag_shell_escape(chain) + " " +
+              ag_shell_escape(kind) + " " + ag_shell_escape(detail) +
+              " >/dev/null 2>&1; echo $?"
+    let rc = _str(exec(cmd)).trim()
+    if rc == "0" { AG_TOUCH_COUNT = AG_TOUCH_COUNT + 1 }
+}
+
+fn ag_release(ck: string, reason: string) {
+    if !ag_probe() { return }
+    let chain = ag_chain_id(ck)
+    let cmd = AG_BIN + " hook release " + ag_shell_escape(chain) + " " +
+              ag_shell_escape(reason) + " >/dev/null 2>&1"
+    exec(cmd)
+}
+
+fn ag_top_chain() -> string { return AG_TOP_CHAIN }
+fn ag_touch_count() -> int  { return AG_TOUCH_COUNT }
+fn ag_available()  -> bool  { return AG_AVAILABLE }
 
 // ─── nested JSON access (path "a.b.c") ─────────────────────────────────────
 
@@ -355,9 +484,63 @@ fn parse_float_scaled(s: string) -> int {
     return if neg == 1 { -mag } else { mag }
 }
 
+// ─── prev-cert check → key helpers (for flip-risk detection) ──────────────
+//
+// A prev cert stores each component's detail as an array of
+// {"pass": bool, "check": "<label>"}.  We index by check label string.
+// Label is deterministic for a given SSOT key/path — stable across runs
+// as long as observed values haven't changed.  To detect FLIP we only
+// need to know the PASS/FAIL status of the same check label.
+
+fn prev_checks_for(prev_root, ck: string) -> array {
+    // returns array of [label, pass_bool] pairs
+    let mut out = []
+    if type_of(prev_root) != "map" { return out }
+    if !prev_root.contains_key("components") { return out }
+    let comps = prev_root["components"]
+    if !comps.contains_key(ck) { return out }
+    let cc = comps[ck]
+    if !cc.contains_key("detail") { return out }
+    let det = cc["detail"]
+    let mut i = 0
+    while i < len(det) {
+        let e = det[i]
+        if e.contains_key("check") {
+            let lbl = _str(e["check"])
+            let p   = is_true(e["pass"])
+            out = push(out, [lbl, p])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn prev_check_pass(prev_arr, label: string) -> array {
+    // returns [found_bool, was_pass_bool]
+    let mut i = 0
+    while i < len(prev_arr) {
+        let e = prev_arr[i]
+        if _str(e[0]) == label { return [true, is_true(e[1])] }
+        i = i + 1
+    }
+    return [false, false]
+}
+
+fn extract_label(detail_str: string) -> string {
+    // Match check labels as produced by check_* helpers.  We strip any
+    // " want..." tail so FAIL labels still map to the same base key
+    // used when PASS produced a different suffix.
+    let idx = detail_str.index_of(" want")
+    if idx >= 0 { return detail_str.substring(0, idx) }
+    // Also strip "=<value>" to make labels stable across changing obs.
+    let eq = detail_str.index_of("=")
+    if eq >= 0 { return detail_str.substring(0, eq) }
+    return detail_str
+}
+
 // ─── component runner + verifier ───────────────────────────────────────────
 
-fn run_component(bin: string, root: string, ck: string, cc, skip_run: bool) -> array {
+fn run_component(bin: string, root: string, ck: string, cc, skip_run: bool, prev_root) -> array {
     let slug = _str(cc["slug"])
     let label = _str(cc["label"])
     let path = _str(cc["path"])
@@ -373,10 +556,14 @@ fn run_component(bin: string, root: string, ck: string, cc, skip_run: bool) -> a
     println("│  path=" + path)
     println("│  ssot=" + ssot)
 
+    // Activate per-component airgenome chain (no-op if unavailable).
+    ag_activate(ck)
+
     let path_abs = root + "/" + path
     if !fexists(path_abs) {
         println("│  ✗ MISSING tool file: " + path_abs)
         println("└──")
+        ag_touch(ck, "tool_missing", "path=" + path)
         return [ck, slug, "MISSING", "", "tool_file_not_found:" + path, "", 0, 0]
     }
 
@@ -429,6 +616,7 @@ fn run_component(bin: string, root: string, ck: string, cc, skip_run: bool) -> a
     if !fexists(ssot_abs) {
         println("│  ✗ SSOT missing after run: " + ssot)
         println("└──")
+        ag_touch(ck, "ssot_missing", "path=" + ssot)
         return [ck, slug, "NO_SSOT", "", "ssot_missing:" + ssot, "", 0, 0]
     }
 
@@ -437,6 +625,7 @@ fn run_component(bin: string, root: string, ck: string, cc, skip_run: bool) -> a
     if !is_json_map(sm) {
         println("│  ✗ SSOT malformed: " + ssot)
         println("└──")
+        ag_touch(ck, "ssot_malformed", "path=" + ssot)
         return [ck, slug, "MALFORMED", "", "malformed_json:" + ssot, "", 0, 0]
     }
 
@@ -575,14 +764,47 @@ fn run_component(bin: string, root: string, ck: string, cc, skip_run: bool) -> a
         }
     }
 
-    // Print check rows.
+    // Index prev checks for this component (flip-risk detection).
+    let prev_arr = prev_checks_for(prev_root, ck)
+
+    // Print check rows + selective airgenome touch (FAIL or flip-risk).
+    // Rule: NEVER touch on PASS-stable (전수 touch 금지).  Only emit a
+    // touch when (a) current FAIL, or (b) prev PASS → now FAIL flip.
     let mut i = 0
+    let mut flip_n = 0
+    let mut fail_n_local = 0
     while i < len(checks) {
         let c = checks[i]
         let pass = (c[0] == true)
         let g = if pass { "✓" } else { "✗" }
         let d = _str(c[1])
         println("│    " + g + " " + d)
+
+        let lbl = extract_label(d)
+        let pg = prev_check_pass(prev_arr, lbl)
+        let prev_found = is_true(pg[0])
+        let prev_was_pass = is_true(pg[1])
+
+        if !pass {
+            // Current FAIL — always touch (detail includes observed value).
+            let kind = if prev_found && prev_was_pass {
+                flip_n = flip_n + 1
+                "check_transition"
+            } else {
+                "check_fail"
+            }
+            let prev_tag = if prev_found {
+                if prev_was_pass { "prev=PASS" } else { "prev=FAIL" }
+            } else { "prev=NONE" }
+            let detail = "check_" + str(i + 1) + " " + prev_tag + " now=FAIL :: " + lbl
+            ag_touch(ck, kind, detail)
+            fail_n_local = fail_n_local + 1
+        } else {
+            // Current PASS — do NOT touch.  (전수 touch 금지)
+            // Edge case: prev FAIL → now PASS is a recovery flip; we
+            // intentionally skip to keep touch counts minimal and
+            // idempotent across stable runs.
+        }
         i = i + 1
     }
 
@@ -650,6 +872,25 @@ fn main() {
     let cfg_abs = root + "/" + CONFIG_PATH
     let cfg = load_config(cfg_abs)
 
+    // Load prev cert (for flip-risk detection) BEFORE we run.
+    // We copy the current cert into _prev so that the fresh write
+    // won't clobber the compare baseline.
+    let out_rel_main = if out_override != "" { out_override } else { DEFAULT_OUT }
+    let out_abs_main = if out_rel_main.index_of("/") == 0 { out_rel_main } else { root + "/" + out_rel_main }
+    let prev_abs = root + "/" + DEFAULT_PREV
+    if fexists(out_abs_main) {
+        exec("cp -f " + out_abs_main + " " + prev_abs)
+    }
+    let empty_map = json_parse("{}")
+    let prev_root = if fexists(prev_abs) {
+        let praw = read_file(prev_abs)
+        let pm = json_parse(praw)
+        if is_json_map(pm) { pm } else { empty_map }
+    } else { empty_map }
+
+    // Probe airgenome (cheap — one shellout).  Log availability only.
+    let ag_ok = ag_probe()
+
     println("════════════════════════════════════════════════════════════════")
     println("  tool/true_closure_verifier.hexa")
     println("  raw#9 hexa-only · raw#10 proof-carrying · raw#11 snake_case")
@@ -658,6 +899,7 @@ fn main() {
     println("  hexa_bin=" + bin)
     println("  config=" + CONFIG_PATH)
     println("  skip_run=" + bool_s(skip_run) + "  strict=" + bool_s(strict))
+    println("  airgenome=" + (if ag_ok { "available(" + AG_BIN + ")" } else { "skip(unavailable)" }))
     println("════════════════════════════════════════════════════════════════")
 
     let comps = cfg["components"]
@@ -700,7 +942,7 @@ fn main() {
             continue
         }
         let cc = comps[ck]
-        let r = run_component(bin, root, ck, cc, skip_run)
+        let r = run_component(bin, root, ck, cc, skip_run, prev_root)
         results = push(results, r)
         let v = _str(r[2])
         if v == "PASS" { pass_n = pass_n + 1 }
@@ -775,6 +1017,15 @@ fn main() {
     parts = push(parts, "  \"total_components\": 8,\n")
     parts = push(parts, "  \"true_closure_pct\": " + str(true_closure_pct) + ",\n")
     parts = push(parts, "  \"hash_chain_prev\": \"" + prev_hash + "\",\n")
+    // airgenome hook embed (CLI-only, raw#9 hexa-only, raw#15 no-hardcode).
+    // Fields are optional — consumers may ignore when air_available=false.
+    let _ag_avail = ag_available()
+    let _ag_chain = ag_top_chain()
+    let _ag_touch = ag_touch_count()
+    let _ag_chain_json = if _ag_chain == "" { "null" } else { "\"" + _ag_chain + "\"" }
+    parts = push(parts, "  \"air_available\": " + bool_s(_ag_avail) + ",\n")
+    parts = push(parts, "  \"air_chain\": " + _ag_chain_json + ",\n")
+    parts = push(parts, "  \"touch_count\": " + str(_ag_touch) + ",\n")
     parts = push(parts, "  \"raw_strict\": \"raw#9 raw#10 raw#11 raw#12 raw#15 deterministic LLM=none\"\n")
     parts = push(parts, "}\n")
 
@@ -811,6 +1062,27 @@ fn main() {
     println("▶ prev_hash:  " + prev_hash)
     println("▶ curr_hash:  " + current_hash)
     println("▶ audit log:  " + DEFAULT_AUDIT_LOG)
+
+    // Release per-component chains when cert reaches 100% (all PASS).
+    // Only fires if all requested components PASSed AND we ran the full
+    // set (comp_arg == "all") to avoid spurious releases on partial runs.
+    if ag_available() && comp_arg == "all" && fail_n == 0 && other_n == 0 && pass_n > 0 && pass_n == physical_count {
+        let reason = "cert sha=" + current_hash
+        let mut ri = 0
+        while ri < len(AG_ACTIVE_CHAINS) {
+            let chain = _str(AG_ACTIVE_CHAINS[ri])
+            let cmd = AG_BIN + " hook release " + ag_shell_escape(chain) + " " +
+                      ag_shell_escape(reason) + " >/dev/null 2>&1"
+            exec(cmd)
+            ri = ri + 1
+        }
+        println("▶ airgenome:  released " + str(len(AG_ACTIVE_CHAINS)) + " chains (100% cert)")
+    } else {
+        if ag_available() {
+            println("▶ airgenome:  activated=" + str(len(AG_ACTIVE_CHAINS)) +
+                    " touched=" + str(ag_touch_count()))
+        }
+    }
 
     if strict && (fail_n > 0 || other_n > 0) { exit(1) }
     exit(0)
