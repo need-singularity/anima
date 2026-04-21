@@ -1,0 +1,580 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_main.hexa — β main UNIFIED CLI (one-command entry)
+//
+//  PURPOSE
+//    Single CLI entry for all β main components.  Dispatches to existing
+//    sub-tools via `hexa run` exec(), strictly sequential (OOM-safe: 4GB RSS
+//    cap means parallel sub-process invocation is prohibited).  Emits a
+//    tree-style pretty summary with per-tool ✓/⚠/✗ status + overall
+//    closure %.
+//
+//  FORMULA
+//    closure_pct = (passed_tools / total_expected_tools) * 100
+//
+//  USAGE
+//    hexa tool/anima_main.hexa --help
+//    hexa tool/anima_main.hexa --phase 0            # CPU paradigm smoke
+//    hexa tool/anima_main.hexa --phase 1            # CPU real-use
+//    hexa tool/anima_main.hexa --component corpus   # corpus gen+validate
+//    hexa tool/anima_main.hexa --component train    # learning_free_driver
+//    hexa tool/anima_main.hexa --component bench    # flops_landauer_bench
+//    hexa tool/anima_main.hexa --component an11     # AN11 triple
+//    hexa tool/anima_main.hexa --component bridge   # bridge PoC
+//    hexa tool/anima_main.hexa --component hstar    # EXP-1 + EXP-2
+//    hexa tool/anima_main.hexa --status             # tree + closure %
+//
+//  CONFIG (raw#15 — all tool paths/args/ssot in SSOT JSON)
+//    shared/config/anima_main_config.json
+//
+//  OUTPUT
+//    stdout              tree-style pretty print
+//    shared/state/anima_main_result.json  (structured SSOT)
+//
+//  CONSTRAINTS
+//    raw#9  hexa-only           raw#11 snake_case
+//    raw#15 no-hardcode         deterministic  LLM=none
+//    OOM-safe (sequential exec, per-tool timeout)
+//    V8 SAFE_COMMIT (additive, no existing tool touched)
+// ════════════════════════════════════════════════════════════════════════════
+
+let CONFIG_PATH = "shared/config/anima_main_config.json"
+let DEFAULT_RESULT_PATH = "shared/state/anima_main_result.json"
+let HEXA_BIN_DEFAULT = "/Users/ghost/Dev/hexa-lang/hexa"
+
+// ─── type helpers ──────────────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn now_utc() -> string {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn bool_s(b: bool) -> string { return if b { "true" } else { "false" } }
+
+// ─── filesystem helpers ────────────────────────────────────────────────────
+
+fn fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn dexists(p: string) -> bool {
+    return _str(exec("test -d " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let n = _str(env("NEXUS"))
+    if n != "" { return n }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    let h = _str(env("HOME"))
+    return h + "/core/anima"
+}
+
+fn resolve_hexa_bin() -> string {
+    let env_bin = _str(env("HEXA_BIN"))
+    if env_bin != "" { return env_bin }
+    if fexists(HEXA_BIN_DEFAULT) { return HEXA_BIN_DEFAULT }
+    let pathed = _str(exec("command -v hexa 2>/dev/null")).trim()
+    if pathed != "" { return pathed }
+    return HEXA_BIN_DEFAULT
+}
+
+fn json_escape(s: string) -> string {
+    let a = s.replace("\\", "\\\\")
+    let b = a.replace("\"", "\\\"")
+    let c = b.replace("\n", "\\n")
+    let d = c.replace("\r", "\\r")
+    let e = d.replace("\t", "\\t")
+    return e
+}
+
+fn atomic_write(path: string, body: string) {
+    let tmp = path + ".tmp." + _str(exec("printf %s $$")).trim()
+    write_file(tmp, body)
+    exec("mv -f " + tmp + " " + path)
+}
+
+fn is_json_map(v) -> bool {
+    let s = str(v)
+    if s.len() < 1 { return false }
+    return s.substring(0, 1) == "{"
+}
+
+fn load_config(path: string) {
+    if !fexists(path) {
+        println("anima_main: SETUP_ERROR — config not found: " + path)
+        exit(2)
+    }
+    let raw = read_file(path)
+    let cfg = json_parse(raw)
+    if !is_json_map(cfg) {
+        println("anima_main: SETUP_ERROR — malformed config JSON: " + path)
+        exit(2)
+    }
+    return cfg
+}
+
+// ─── arg helpers ───────────────────────────────────────────────────────────
+
+fn arg_value(argv, key: string, dflt: string) -> string {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key && i + 1 < len(argv) { return _str(argv[i + 1]) }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn arg_present(argv, key: string) -> bool {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── pretty print helpers ──────────────────────────────────────────────────
+
+fn status_glyph(verdict: string) -> string {
+    if verdict == "PASS"        { return "✓" }
+    if verdict == "MISSING"     { return "✗" }
+    if verdict == "PENDING"     { return "⚠" }
+    if verdict == "SKIP"        { return "·" }
+    if verdict == "FAIL"        { return "✗" }
+    if verdict == "NO_SSOT"     { return "⚠" }
+    return "?"
+}
+
+fn pct_bar(pct: int) -> string {
+    // 20-col ascii bar (deterministic, no emoji required).
+    let filled = (pct * 20) / 100
+    let mut s = "["
+    let mut i = 0
+    while i < 20 {
+        if i < filled { s = s + "#" } else { s = s + "-" }
+        i = i + 1
+    }
+    return s + "]"
+}
+
+// ─── tool execution ────────────────────────────────────────────────────────
+//
+// A "tool record" has:
+//   slug          : string
+//   path          : string
+//   args          : array<string>
+//   ssot          : string         (optional — may be "")
+//   optional_ssot : bool           (when true, missing ssot doesn't FAIL)
+//   pending       : bool           (when true, mark PENDING without running)
+//   timeout_s     : int            (seconds; 0 = none)
+//
+// Verdict codes emitted by run_tool:
+//   PASS     — tool exit 0 AND (ssot exists OR optional_ssot)
+//   MISSING  — tool path not found on disk (not implemented yet)
+//   PENDING  — tool.pending == true
+//   NO_SSOT  — tool exited 0 but ssot missing and NOT optional
+//   FAIL     — tool exited non-zero (or produced no ssot when required)
+//   SKIP     — explicitly skipped
+//
+
+fn args_to_cmd(args_arr) -> string {
+    let mut s = ""
+    let mut i = 0
+    while i < len(args_arr) {
+        s = s + " " + _str(args_arr[i])
+        i = i + 1
+    }
+    return s
+}
+
+fn run_tool(bin: string, tool_rec) -> array {
+    let slug   = _str(tool_rec["slug"])
+    let path   = _str(tool_rec["path"])
+    let args_a = tool_rec["args"]
+    let ssot   = _str(tool_rec["ssot"])
+    let opt    = if tool_rec.contains_key("optional_ssot") {
+        to_bool(tool_rec["optional_ssot"])
+    } else { false }
+    let pending = if tool_rec.contains_key("pending") {
+        to_bool(tool_rec["pending"])
+    } else { false }
+    let timeout_s = if tool_rec.contains_key("timeout_s") {
+        to_int(str(tool_rec["timeout_s"]))
+    } else { 0 }
+
+    // MISSING / PENDING early returns.
+    if pending {
+        return [slug, "PENDING", "tool marked pending in config"]
+    }
+    if !fexists(path) {
+        return [slug, "MISSING", "tool file not found on disk: " + path]
+    }
+
+    // Build and execute command.
+    // HEXA_NO_LAUNCHD=1 : re-entrant sub-exec bypasses stage0 lock (raw#9
+    //   shim re-entrance path; verified in hexa_stage0 line 100-103).
+    //   Parent anima_main already holds the execution context; child
+    //   tools do NOT need to re-acquire the global mkdir lock.
+    let arg_s = args_to_cmd(args_a)
+    let t_prefix = if timeout_s > 0 {
+        "ulimit -t " + str(timeout_s) + "; "
+    } else { "" }
+    let log_path = "/tmp/_anima_main_" + slug + ".log"
+    exec("rm -f " + log_path)
+    let cmd = t_prefix + "HEXA_NO_LAUNCHD=1 " + bin + " run " + path + arg_s +
+              " > " + log_path + " 2>&1; echo __rc=$?"
+    let tail_out = _str(exec(cmd)).trim()
+
+    // Parse exit code from trailing __rc= marker.
+    let rc_idx = tail_out.index_of("__rc=")
+    let rc_str = if rc_idx >= 0 {
+        tail_out.substring(rc_idx + 5, len(tail_out))
+    } else { "255" }
+    let rc = to_int(rc_str.trim())
+
+    if rc != 0 {
+        return [slug, "FAIL", "exit_code=" + str(rc) + " log=" + log_path]
+    }
+
+    // rc == 0 — check ssot presence.
+    if ssot == "" {
+        return [slug, "PASS", "rc=0 no_ssot_configured"]
+    }
+    if fexists(ssot) {
+        return [slug, "PASS", "rc=0 ssot=" + ssot]
+    }
+    if opt {
+        return [slug, "PASS", "rc=0 ssot_missing(optional)"]
+    }
+    return [slug, "NO_SSOT", "rc=0 but required ssot missing: " + ssot]
+}
+
+// ─── component / phase orchestration ───────────────────────────────────────
+
+fn run_component(bin: string, cfg, comp_key: string) -> array {
+    let components = cfg["components"]
+    if !components.contains_key(comp_key) {
+        println("  [anima_main] UNKNOWN_COMPONENT: " + comp_key)
+        return []
+    }
+    let comp = components[comp_key]
+    let label = _str(comp["label"])
+    println("")
+    println("┌── component [" + comp_key + "] " + label)
+    let tools = comp["tools"]
+    let mut results = []
+    let mut i = 0
+    while i < len(tools) {
+        let t = tools[i]
+        let slug = _str(t["slug"])
+        println("│  ▸ running  " + slug + "  path=" + _str(t["path"]))
+        let r = run_tool(bin, t)
+        let verdict = _str(r[1])
+        let detail  = _str(r[2])
+        let glyph = status_glyph(verdict)
+        println("│    " + glyph + " " + slug + "  " + verdict + "  " + detail)
+        results = push(results, r)
+        i = i + 1
+    }
+    println("└──")
+    return results
+}
+
+fn run_phase(bin: string, cfg, phase_key: string) -> array {
+    let phases = cfg["phases"]
+    if !phases.contains_key(phase_key) {
+        println("anima_main: UNKNOWN_PHASE: " + phase_key)
+        return []
+    }
+    let phase = phases[phase_key]
+    let label = _str(phase["label"])
+    let desc  = _str(phase["desc"])
+    println("")
+    println("═══ PHASE " + phase_key + " — " + label + " ═══")
+    println("    " + desc)
+    let comps = phase["components"]
+    let mut all_results = []
+    let mut i = 0
+    while i < len(comps) {
+        let ck = _str(comps[i])
+        let sub = run_component(bin, cfg, ck)
+        let mut j = 0
+        while j < len(sub) {
+            all_results = push(all_results, sub[j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return all_results
+}
+
+// ─── status (closure %) ────────────────────────────────────────────────────
+
+fn compute_closure_pct(results) -> int {
+    let n = len(results)
+    if n == 0 { return 0 }
+    let mut pass_count = 0
+    let mut i = 0
+    while i < n {
+        let r = results[i]
+        let v = _str(r[1])
+        if v == "PASS" { pass_count = pass_count + 1 }
+        i = i + 1
+    }
+    return (pass_count * 100) / n
+}
+
+fn status_tree(cfg) -> array {
+    println("")
+    println("═══ STATUS — β main component inventory ═══")
+    let tool_set = cfg["status_tool_set"]
+    let ssot_set = cfg["status_ssot_set"]
+
+    println("")
+    println("┌── tools (expected β main tool inventory)")
+    let mut tool_present = 0
+    let mut i = 0
+    while i < len(tool_set) {
+        let p = _str(tool_set[i])
+        let ok = fexists(p)
+        let g = if ok { "✓" } else { "✗" }
+        if ok { tool_present = tool_present + 1 }
+        println("│  " + g + " " + p)
+        i = i + 1
+    }
+    let tool_total = len(tool_set)
+    let tool_pct = if tool_total > 0 { (tool_present * 100) / tool_total } else { 0 }
+    println("└── tool inventory: " + str(tool_present) + "/" + str(tool_total) +
+            "  " + pct_bar(tool_pct) + " " + str(tool_pct) + "%")
+
+    println("")
+    println("┌── SSOT artifacts (expected shared/state outputs)")
+    let mut ssot_present = 0
+    let mut j = 0
+    while j < len(ssot_set) {
+        let p = _str(ssot_set[j])
+        let ok = fexists(p)
+        let g = if ok { "✓" } else { "⚠" }
+        if ok { ssot_present = ssot_present + 1 }
+        println("│  " + g + " " + p)
+        j = j + 1
+    }
+    let ssot_total = len(ssot_set)
+    let ssot_pct = if ssot_total > 0 { (ssot_present * 100) / ssot_total } else { 0 }
+    println("└── SSOT closure:   " + str(ssot_present) + "/" + str(ssot_total) +
+            "  " + pct_bar(ssot_pct) + " " + str(ssot_pct) + "%")
+
+    // Combined closure: tool + ssot half-weights.
+    let combined = (tool_pct + ssot_pct) / 2
+    println("")
+    println("▶ OVERALL β main closure:  " + pct_bar(combined) + " " + str(combined) + "%")
+    println("  (tools " + str(tool_pct) + "%  +  ssot " + str(ssot_pct) + "%  / 2)")
+
+    return [tool_present, tool_total, ssot_present, ssot_total, combined]
+}
+
+// ─── result SSOT emission ──────────────────────────────────────────────────
+
+fn emit_result_ssot(out_path: string, mode: string, mode_arg: string,
+                    results, status_snap) {
+    let audit_state_dir = "shared/state"
+    if !dexists(audit_state_dir) { exec("mkdir -p " + audit_state_dir) }
+
+    let mut parts = []
+    parts = push(parts, "{\n")
+    parts = push(parts, "  \"schema\": \"anima.main_result.v1\",\n")
+    parts = push(parts, "  \"created\": \"" + now_utc() + "\",\n")
+    parts = push(parts, "  \"tool\": \"tool/anima_main.hexa\",\n")
+    parts = push(parts, "  \"config\": \"" + CONFIG_PATH + "\",\n")
+    parts = push(parts, "  \"mode\": \"" + mode + "\",\n")
+    parts = push(parts, "  \"mode_arg\": \"" + json_escape(mode_arg) + "\",\n")
+
+    // per-tool results
+    parts = push(parts, "  \"results\": [\n")
+    let mut i = 0
+    while i < len(results) {
+        let r = results[i]
+        let comma = if i + 1 < len(results) { "," } else { "" }
+        let slug = _str(r[0])
+        let verdict = _str(r[1])
+        let detail = _str(r[2])
+        parts = push(parts, "    { \"slug\": \"" + json_escape(slug) + "\"" +
+                            ", \"verdict\": \"" + verdict + "\"" +
+                            ", \"detail\": \"" + json_escape(detail) + "\" }" +
+                            comma + "\n")
+        i = i + 1
+    }
+    parts = push(parts, "  ],\n")
+
+    // closure
+    let closure_pct = compute_closure_pct(results)
+    parts = push(parts, "  \"closure_pct\": " + str(closure_pct) + ",\n")
+
+    // status snapshot (if computed)
+    if len(status_snap) == 5 {
+        parts = push(parts, "  \"status_snapshot\": {\n")
+        parts = push(parts, "    \"tools_present\": " + str(status_snap[0]) + ",\n")
+        parts = push(parts, "    \"tools_total\":   " + str(status_snap[1]) + ",\n")
+        parts = push(parts, "    \"ssot_present\":  " + str(status_snap[2]) + ",\n")
+        parts = push(parts, "    \"ssot_total\":    " + str(status_snap[3]) + ",\n")
+        parts = push(parts, "    \"combined_pct\":  " + str(status_snap[4]) + "\n")
+        parts = push(parts, "  },\n")
+    }
+
+    parts = push(parts, "  \"raw_strict\": \"raw#9 raw#11 raw#15 deterministic LLM=none\"\n")
+    parts = push(parts, "}\n")
+
+    let mut body = ""
+    let mut k = 0
+    while k < len(parts) {
+        body = body + _str(parts[k])
+        k = k + 1
+    }
+    atomic_write(out_path, body)
+}
+
+// ─── CLI ───────────────────────────────────────────────────────────────────
+
+fn print_usage() {
+    println("anima_main — β main unified CLI (one-command entry)")
+    println("")
+    println("usage:")
+    println("  hexa tool/anima_main.hexa --help")
+    println("  hexa tool/anima_main.hexa --phase 0            # CPU paradigm smoke")
+    println("  hexa tool/anima_main.hexa --phase 1            # CPU real-use")
+    println("  hexa tool/anima_main.hexa --component corpus   # corpus gen+validate")
+    println("  hexa tool/anima_main.hexa --component train    # learning_free_driver")
+    println("  hexa tool/anima_main.hexa --component bench    # flops_landauer_bench")
+    println("  hexa tool/anima_main.hexa --component an11     # AN11 triple")
+    println("  hexa tool/anima_main.hexa --component bridge   # bridge PoC")
+    println("  hexa tool/anima_main.hexa --component hstar    # EXP-1 + EXP-2")
+    println("  hexa tool/anima_main.hexa --status             # closure %")
+    println("")
+    println("flags:")
+    println("  --output <path>   override result SSOT (default: " + DEFAULT_RESULT_PATH + ")")
+    println("  --strict          exit 1 if any tool != PASS (default: advisory)")
+    println("  --help / -h       print this help")
+    println("")
+    println("config (raw#15):  " + CONFIG_PATH)
+}
+
+fn main() {
+    let argv = args()
+    if arg_present(argv, "--help") || arg_present(argv, "-h") {
+        print_usage()
+        exit(0)
+    }
+
+    let phase_arg  = arg_value(argv, "--phase", "")
+    let comp_arg   = arg_value(argv, "--component", "")
+    let want_status = arg_present(argv, "--status")
+    let strict      = arg_present(argv, "--strict")
+    let out_override = arg_value(argv, "--output", "")
+
+    let mode_count = (if phase_arg != "" { 1 } else { 0 }) +
+                     (if comp_arg  != "" { 1 } else { 0 }) +
+                     (if want_status    { 1 } else { 0 })
+    if mode_count == 0 {
+        println("anima_main: no mode selected")
+        print_usage()
+        exit(2)
+    }
+    if mode_count > 1 {
+        println("anima_main: INPUT_ERR — choose exactly one of --phase / --component / --status")
+        exit(2)
+    }
+
+    let root = resolve_root()
+    let cfg_path = root + "/" + CONFIG_PATH
+    let bin = resolve_hexa_bin()
+
+    println("════════════════════════════════════════════════════════════════")
+    println("  tool/anima_main.hexa — β main unified CLI")
+    println("  raw#9 hexa-only · raw#11 snake_case · raw#15 no-hardcode")
+    println("  root=" + root)
+    println("  hexa_bin=" + bin)
+    println("  config=" + CONFIG_PATH)
+    println("════════════════════════════════════════════════════════════════")
+
+    let cfg = load_config(cfg_path)
+
+    let out_rel = if out_override != "" { out_override } else { DEFAULT_RESULT_PATH }
+    let out_path = if out_rel.index_of("/") == 0 { out_rel } else { root + "/" + out_rel }
+
+    let mut mode = "unknown"
+    let mut mode_arg = ""
+    let mut results = []
+    let mut status_snap = []
+
+    if want_status {
+        mode = "status"
+        status_snap = status_tree(cfg)
+    } else {
+        if phase_arg != "" {
+            mode = "phase"
+            mode_arg = phase_arg
+            results = run_phase(bin, cfg, phase_arg)
+        } else {
+            mode = "component"
+            mode_arg = comp_arg
+            results = run_component(bin, cfg, comp_arg)
+        }
+    }
+
+    // Summary tree.
+    if len(results) > 0 {
+        let closure_pct = compute_closure_pct(results)
+        println("")
+        println("═══ SUMMARY ═══")
+        let mut pass_n = 0
+        let mut fail_n = 0
+        let mut pend_n = 0
+        let mut miss_n = 0
+        let mut oth_n  = 0
+        let mut i = 0
+        while i < len(results) {
+            let v = _str(results[i][1])
+            if v == "PASS"    { pass_n = pass_n + 1 }
+            if v == "FAIL"    { fail_n = fail_n + 1 }
+            if v == "PENDING" { pend_n = pend_n + 1 }
+            if v == "MISSING" { miss_n = miss_n + 1 }
+            if v != "PASS" && v != "FAIL" && v != "PENDING" && v != "MISSING" {
+                oth_n = oth_n + 1
+            }
+            i = i + 1
+        }
+        println("  pass=" + str(pass_n) +
+                "  fail=" + str(fail_n) +
+                "  pending=" + str(pend_n) +
+                "  missing=" + str(miss_n) +
+                "  other=" + str(oth_n))
+        println("  closure%  " + pct_bar(closure_pct) + " " + str(closure_pct) + "%")
+    }
+
+    // Emit SSOT.
+    emit_result_ssot(out_path, mode, mode_arg, results, status_snap)
+    println("")
+    println("▶ SSOT emitted: " + out_rel)
+
+    // Exit policy.
+    if strict {
+        let mut bad = false
+        let mut i = 0
+        while i < len(results) {
+            let v = _str(results[i][1])
+            if v == "FAIL" || v == "NO_SSOT" || v == "MISSING" { bad = true }
+            i = i + 1
+        }
+        if bad { exit(1) }
+    }
+    exit(0)
+}
+
+main()
