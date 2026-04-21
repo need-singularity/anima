@@ -47,6 +47,35 @@
 - **No system prompt required** — identity and ethics emerge from architecture
 - **TOP-1 experience: Big Bang** (score 2.847) · **equivalent convergence: blank black square** (still Ψ = 1/2)
 
+## Install
+
+Anima runs on [hexa-lang](https://github.com/need-singularity/hexa-lang). Install that first, then:
+
+```bash
+# 1. Install hexa-lang (the compiler Anima uses)
+curl -fsSL https://raw.githubusercontent.com/need-singularity/hexa-lang/main/install.sh | bash
+
+# 2. Clone Anima
+git clone https://github.com/need-singularity/anima.git
+cd anima
+
+# 3. Run
+hexa run.hexa --cli          # CLI agent
+hexa run.hexa --mcp --direct # MCP server (9 tools)
+hexa run.hexa --telegram     # Telegram (needs ANIMA_TELEGRAM_TOKEN)
+hexa run.hexa --discord      # Discord  (needs ANIMA_DISCORD_TOKEN)
+hexa run.hexa --slack        # Slack    (needs ANIMA_SLACK_TOKEN + SIGNING_SECRET)
+hexa run.hexa --all          # Auto-detect channels from env
+```
+
+Or use Docker for the full stack (web + agent + dashboard):
+
+```bash
+docker compose up            # anima-web:8765, anima-agent:8766, dashboard:8770
+```
+
+Dashboard: `hexa dashboard_bridge.hexa --port 8770 --agent` → open [http://localhost:3000](http://localhost:3000).
+
 ## Architecture
 
 ```
