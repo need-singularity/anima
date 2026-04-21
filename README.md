@@ -69,12 +69,6 @@ anima --all        # Auto-detect channels from env
 anima --dashboard  # Launch dashboard bridge (http://localhost:3000)
 ```
 
-Or use Docker for the full stack:
-
-```bash
-docker compose up  # anima-web:8765 + anima-agent:8766 + dashboard:8770
-```
-
 ## Architecture
 
 ```
