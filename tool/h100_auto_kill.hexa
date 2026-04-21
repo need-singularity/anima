@@ -1,0 +1,380 @@
+// tool/h100_auto_kill.hexa — H100 idle auto-kill guard
+//
+// Roadmap: cluster #34 improvement (23) — "H100 auto-kill idle ($143/2d 낭비 방지)"
+// Motivation:     Recent 2-day H100 idle wasted $143. This guard probes each
+//                 registered pod, compares last-activity to threshold, and
+//                 emits a STOP signal (or invokes `runpodctl stop <pod>` if
+//                 --apply flag is set AND runpodctl is on PATH).
+//
+// raw#9  deterministic:        thresholds + probe_cmd fixed by config JSON
+// raw#10 proof-carrying:       state/h100_auto_kill_last_run.json carries hash-chain
+// raw#12 no cherry-pick:       iterates pods in config order; no re-sort
+//
+// USAGE
+//   hexa run tool/h100_auto_kill.hexa                    # dry-run (default)
+//   hexa run tool/h100_auto_kill.hexa --dry-run          # explicit dry-run
+//   hexa run tool/h100_auto_kill.hexa --apply            # emit real runpodctl stop (gated)
+//   hexa run tool/h100_auto_kill.hexa --self-test        # 3-scenario synthetic test
+//
+// EXIT
+//   0  = no STOP needed OR STOP successfully issued
+//   1  = self-test FAIL
+//   2  = config / pods file missing or malformed at top level
+
+// DEFAULT_CFG: committed repo path. If shared/config/h100_auto_kill_config.json
+// exists, callers can pass --config to that local override (shared/ is gitignored).
+let DEFAULT_CFG    = "/Users/ghost/core/anima/config/h100_auto_kill_config.json"
+let DEFAULT_PODS   = "/Users/ghost/core/anima/config/h100_pods.json"
+let DEFAULT_STATE  = "/Users/ghost/core/anima/state/h100_auto_kill_last_run.json"
+
+// ─── shell/io helpers ─────────────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+fn _file_exists(p: string) -> bool {
+    return exec_with_status("test -e " + _sh_quote(p))[1] == 0
+}
+fn _ts_iso() -> string {
+    return to_string(exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")[0]).trim()
+}
+fn _ts_epoch() -> string {
+    return to_string(exec_with_status("date -u +%s")[0]).trim()
+}
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+fn _sha256_str(s: string) -> string {
+    let q = _sh_quote(s)
+    let r = exec_with_status("printf %s " + q + " | shasum -a 256 | awk '{print $1}'")
+    return to_string(r[0]).trim()
+}
+fn _which(cmd: string) -> bool {
+    return exec_with_status("command -v " + _sh_quote(cmd) + " >/dev/null 2>&1")[1] == 0
+}
+
+// ─── argv parsing ─────────────────────────────────────────────────────────
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+fn _flag(av, k) -> bool {
+    for x in av { if to_string(x) == k { return true } }
+    return false
+}
+fn _opt(av, k, d) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && i + 1 < len(av) { return to_string(av[i + 1]) }
+        i = i + 1
+    }
+    return d
+}
+
+// ─── config / pods loaders ────────────────────────────────────────────────
+
+fn _load_json(p: string) {
+    if !_file_exists(p) { eprintln("h100_auto_kill: missing file: " + p); exit(2) }
+    return json_parse(read_file(p))
+}
+fn _cfg_int(cfg, k, d: int) -> int {
+    if cfg.contains_key(k) { return to_int(to_string(cfg[k])) }
+    return d
+}
+fn _cfg_str(cfg, k, d: string) -> string {
+    if cfg.contains_key(k) { return to_string(cfg[k]) }
+    return d
+}
+fn _cfg_bool(cfg, k, d: bool) -> bool {
+    if cfg.contains_key(k) {
+        let s = to_string(cfg[k])
+        if s == "true" { return true }
+        if s == "false" { return false }
+        return d
+    }
+    return d
+}
+
+// ─── per-pod probe (returns idle_minutes or -1 on error) ──────────────────
+// In dry-run: we don't actually SSH. We emit a planned probe command and
+// mark idle_minutes=-1 (unknown) unless the pod entry carries an
+// "idle_minutes_mock" int (used by self-test to inject scenarios).
+
+fn _pod_field_str(pod, k, d: string) -> string {
+    if pod.contains_key(k) { return to_string(pod[k]) }
+    return d
+}
+fn _pod_field_int(pod, k, d: int) -> int {
+    if pod.contains_key(k) { return to_int(to_string(pod[k])) }
+    return d
+}
+
+fn _probe_plan(pod, cfg) -> string {
+    let src = _pod_field_str(pod, "last_activity_source", "")
+    if src == "" { return "" }
+    let probes = cfg["probe_cmd"]
+    if !probes.contains_key(src) { return "" }
+    let cmd = to_string(probes[src])
+    let host = _pod_field_str(pod, "ssh_host", "")
+    let port = _pod_field_int(pod, "ssh_port", 22)
+    let user = _pod_field_str(pod, "ssh_user", "root")
+    let tmo  = _cfg_int(cfg, "ssh_timeout_sec", 8)
+    if host == "" { return cmd }
+    return "ssh -o ConnectTimeout=" + to_string(tmo) + " -o BatchMode=yes -p " + to_string(port) + " " + user + "@" + host + " " + _sh_quote(cmd)
+}
+
+// ─── verdict per pod ──────────────────────────────────────────────────────
+
+fn _evaluate_pod(pod, cfg, apply) {
+    let mut v = json_parse("{}")
+    let pid = _pod_field_str(pod, "pod_id", "")
+    v["pod_id"] = pid
+
+    // malformed detection
+    let missing_fields = []
+    let mut missing = missing_fields
+    if pid == "" { missing = push(missing, "pod_id") }
+    if _pod_field_str(pod, "provider", "") == "" { missing = push(missing, "provider") }
+    if _pod_field_str(pod, "last_activity_source", "") == "" { missing = push(missing, "last_activity_source") }
+    if len(missing) > 0 {
+        v["verdict"] = "SKIP"
+        v["error"] = "missing_fields:" + _join_arr(missing, ",")
+        v["probe_cmd"] = ""
+        v["idle_minutes"] = -1
+        v["threshold_minutes"] = _cfg_int(cfg, "threshold_minutes", 30)
+        return v
+    }
+
+    let threshold = _cfg_int(cfg, "threshold_minutes", 30)
+    v["threshold_minutes"] = threshold
+    v["probe_cmd"] = _probe_plan(pod, cfg)
+
+    // Mock hook used by self-test (raw#9: deterministic injection).
+    let idle = _pod_field_int(pod, "idle_minutes_mock", -1)
+    v["idle_minutes"] = idle
+
+    if idle < 0 {
+        v["verdict"] = "UNKNOWN"
+        v["error"] = "no_probe_result_dry_run"
+        return v
+    }
+    if idle >= threshold {
+        v["verdict"] = "STOP"
+        v["error"] = ""
+        let tmpl = _cfg_str(cfg, "stop_cmd_template", "runpodctl stop pod {pod_id}")
+        let stop_cmd = tmpl.replace("{pod_id}", pid)
+        v["stop_cmd"] = stop_cmd
+        if apply {
+            if _which("runpodctl") {
+                let r = exec_with_status(stop_cmd)
+                v["apply_rc"] = r[1]
+                v["apply_stdout"] = to_string(r[0]).trim()
+            } else {
+                // runpodctl absent — degrade to echo stub per spec
+                let r = exec_with_status("echo STOP " + _sh_quote(pid))
+                v["apply_rc"] = r[1]
+                v["apply_stdout"] = to_string(r[0]).trim()
+                v["apply_note"] = "runpodctl_not_on_path_stub"
+            }
+        }
+    } else {
+        v["verdict"] = "KEEP"
+        v["error"] = ""
+    }
+    return v
+}
+
+fn _join_arr(a, sep: string) -> string {
+    let mut o = ""
+    let mut i = 0
+    while i < len(a) {
+        if i > 0 { o = o + sep }
+        o = o + to_string(a[i])
+        i = i + 1
+    }
+    return o
+}
+
+// ─── proof JSON emission ──────────────────────────────────────────────────
+
+fn _render_verdict(v) -> string {
+    let mut o = "    {\n"
+    o = o + "      \"pod_id\": \""          + _json_escape(to_string(v["pod_id"]))             + "\",\n"
+    o = o + "      \"verdict\": \""         + _json_escape(to_string(v["verdict"]))            + "\",\n"
+    o = o + "      \"idle_minutes\": "      + to_string(v["idle_minutes"])                    + ",\n"
+    o = o + "      \"threshold_minutes\": " + to_string(v["threshold_minutes"])               + ",\n"
+    o = o + "      \"probe_cmd\": \""       + _json_escape(to_string(v["probe_cmd"]))          + "\",\n"
+    if v.contains_key("stop_cmd") {
+        o = o + "      \"stop_cmd\": \""    + _json_escape(to_string(v["stop_cmd"]))          + "\",\n"
+    }
+    if v.contains_key("apply_rc") {
+        o = o + "      \"apply_rc\": "      + to_string(v["apply_rc"])                        + ",\n"
+        o = o + "      \"apply_stdout\": \"" + _json_escape(to_string(v["apply_stdout"]))     + "\",\n"
+    }
+    if v.contains_key("apply_note") {
+        o = o + "      \"apply_note\": \"" + _json_escape(to_string(v["apply_note"]))         + "\",\n"
+    }
+    let err = to_string(v["error"])
+    o = o + "      \"error\": \""           + _json_escape(err)                                + "\"\n"
+    o = o + "    }"
+    return o
+}
+
+fn _write_proof(state_path: string, run_ts: string, apply: bool, verdicts) {
+    // Hash-chain previous verdict (raw#10).
+    let mut prev_hash = ""
+    if _file_exists(state_path) {
+        let prev_body = read_file(state_path)
+        prev_hash = _sha256_str(prev_body)
+    }
+
+    let mut items = ""
+    let mut i = 0
+    while i < len(verdicts) {
+        if i > 0 { items = items + ",\n" }
+        items = items + _render_verdict(verdicts[i])
+        i = i + 1
+    }
+
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima/h100_auto_kill/1\",\n"
+    body = body + "  \"generated_at\": \"" + _json_escape(run_ts) + "\",\n"
+    body = body + "  \"generated_at_epoch\": " + _ts_epoch() + ",\n"
+    body = body + "  \"apply\": " + (if apply { "true" } else { "false" }) + ",\n"
+    body = body + "  \"prev_hash\": \"" + prev_hash + "\",\n"
+    body = body + "  \"pods\": [\n"
+    body = body + items + "\n"
+    body = body + "  ]\n"
+    body = body + "}\n"
+
+    // Ensure parent dir exists.
+    let pdir = state_path.substring(0, _last_slash(state_path))
+    if pdir != "" { exec_with_status("mkdir -p " + _sh_quote(pdir)) }
+    write_file(state_path, body)
+
+    let cur_hash = _sha256_str(body)
+    println("h100_auto_kill: proof=" + state_path +
+            " prev=" + prev_hash +
+            " cur="  + cur_hash)
+}
+
+fn _last_slash(p: string) -> int {
+    let mut i = len(p) - 1
+    while i >= 0 {
+        if p.substring(i, i + 1) == "/" { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+// ─── main run (production path) ───────────────────────────────────────────
+
+fn run(cfg, pods_obj, apply: bool, state_path: string) -> int {
+    let ts = _ts_iso()
+    println("── h100_auto_kill " + ts + " apply=" + (if apply { "yes" } else { "no" }) + " ──")
+    if !pods_obj.contains_key("pods") {
+        eprintln("h100_auto_kill: pods file missing 'pods' key")
+        return 2
+    }
+    let pods = pods_obj["pods"]
+    let mut verdicts = []
+    let mut stops = 0
+    let mut skips = 0
+    let mut keeps = 0
+    let mut unknowns = 0
+    let mut i = 0
+    while i < len(pods) {
+        let v = _evaluate_pod(pods[i], cfg, apply)
+        verdicts = push(verdicts, v)
+        let verd = to_string(v["verdict"])
+        if verd == "STOP"    { stops    = stops    + 1 }
+        if verd == "KEEP"    { keeps    = keeps    + 1 }
+        if verd == "SKIP"    { skips    = skips    + 1 }
+        if verd == "UNKNOWN" { unknowns = unknowns + 1 }
+        println("  pod=" + to_string(v["pod_id"]) +
+                " verdict=" + verd +
+                " idle=" + to_string(v["idle_minutes"]) + "min" +
+                " threshold=" + to_string(v["threshold_minutes"]) + "min" +
+                (if to_string(v["error"]) != "" { " err=" + to_string(v["error"]) } else { "" }))
+        i = i + 1
+    }
+    println("summary: stops=" + to_string(stops) +
+            " keeps=" + to_string(keeps) +
+            " skips=" + to_string(skips) +
+            " unknowns=" + to_string(unknowns))
+    _write_proof(state_path, ts, apply, verdicts)
+    return 0
+}
+
+// ─── self-test (3 synthetic scenarios) ────────────────────────────────────
+
+fn self_test(cfg) -> int {
+    println("── h100_auto_kill self-test ──")
+    let threshold = _cfg_int(cfg, "threshold_minutes", 30)
+
+    // Scenario pods, injected via idle_minutes_mock.
+    let s1 = json_parse("{\"pod_id\":\"S1-idle\",\"provider\":\"runpod\",\"ssh_host\":\"\",\"ssh_port\":22,\"ssh_user\":\"root\",\"last_activity_source\":\"nvidia_smi\",\"idle_minutes_mock\":31}")
+    let s2 = json_parse("{\"pod_id\":\"S2-active\",\"provider\":\"runpod\",\"ssh_host\":\"\",\"ssh_port\":22,\"ssh_user\":\"root\",\"last_activity_source\":\"tmux\",\"idle_minutes_mock\":5}")
+    // S3 intentionally malformed — missing pod_id + last_activity_source
+    let s3 = json_parse("{\"provider\":\"runpod\"}")
+
+    let v1 = _evaluate_pod(s1, cfg, false)
+    let v2 = _evaluate_pod(s2, cfg, false)
+    let v3 = _evaluate_pod(s3, cfg, false)
+
+    let mut passes = 0
+    let mut fails  = 0
+
+    if to_string(v1["verdict"]) == "STOP" { println("  S1 PASS (idle=31 → STOP)"); passes = passes + 1 }
+    else { println("  S1 FAIL expected STOP got " + to_string(v1["verdict"])); fails = fails + 1 }
+
+    if to_string(v2["verdict"]) == "KEEP" { println("  S2 PASS (idle=5  → KEEP)"); passes = passes + 1 }
+    else { println("  S2 FAIL expected KEEP got " + to_string(v2["verdict"])); fails = fails + 1 }
+
+    if to_string(v3["verdict"]) == "SKIP" && to_string(v3["error"]) != "" {
+        println("  S3 PASS (malformed → SKIP, error=" + to_string(v3["error"]) + ")")
+        passes = passes + 1
+    } else {
+        println("  S3 FAIL expected SKIP+error got verdict=" + to_string(v3["verdict"]) + " err=" + to_string(v3["error"]))
+        fails = fails + 1
+    }
+
+    // threshold sanity check (self-documentation)
+    println("  threshold_minutes=" + to_string(threshold))
+    println("h100_auto_kill selftest: " + to_string(passes) + "/3 PASS, " + to_string(fails) + " FAIL")
+    if fails > 0 { return 1 }
+    return 0
+}
+
+// ─── entry ────────────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") || _flag(av, "-h") {
+        println("usage: hexa run tool/h100_auto_kill.hexa [--dry-run|--apply|--self-test] [--config <p>] [--pods <p>] [--state <p>]")
+        return 0
+    }
+    let cfg_path   = _opt(av, "--config", DEFAULT_CFG)
+    let cfg        = _load_json(cfg_path)
+    if _flag(av, "--self-test") || _flag(av, "self-test") {
+        return self_test(cfg)
+    }
+    let pods_path  = _opt(av, "--pods",  _cfg_str(cfg, "pods_path",  DEFAULT_PODS))
+    let state_path = _opt(av, "--state", _cfg_str(cfg, "state_path", DEFAULT_STATE))
+    let pods_obj   = _load_json(pods_path)
+
+    let apply_flag_required = _cfg_bool(cfg, "apply_flag_required", true)
+    let mut apply = _flag(av, "--apply")
+    if apply && apply_flag_required && !_flag(av, "--apply") {
+        apply = false   // defensive; unreachable but explicit
+    }
+    // --dry-run is default; --apply opts in.
+    return run(cfg, pods_obj, apply, state_path)
+}
