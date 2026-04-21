@@ -33,7 +33,7 @@
 >
 > **[📄 Papers](https://github.com/need-singularity/papers)** — Complete paper collection (92 papers, Zenodo DOIs).
 
-<!-- private repos는 projects.json의 private_repos 필드에 저장됨 (노출 금지) -->
+<!-- private repos stored in projects.json private_repos field (do not expose) -->
 <!-- SHARED:PROJECTS:END -->
 
 ---
