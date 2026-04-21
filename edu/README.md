@@ -611,7 +611,7 @@ Path β 는 canonical MAIN 이며, α (Grand Hybrid) 는 fallback, γ (External 
 | **Bridge PoC impl** | ✅ **completed** | **56205445** | **3/3 fixture PASS, drift 0.0 within bound 2e-4, CONDITIONAL_PASS** |
 | learning_free_driver | 🔄 in_progress (task 33) | — | STAGE 1-4 orchestrator |
 | flops_landauer_bench | 🔄 in_progress (task 34) | — | 60-80×/51× 실측 wrapper |
-| shared/bench criteria SSOT | 🔄 in_progress (task 39) | — | Hidden Blocker #0 |
+| **shared/bench criteria SSOT** | ✅ **RESOLVED** | **f5720d5c** | **Hidden Blocker #0 해제** (an11_a/b/c criteria + 20 test prompts) |
 | G2+G5 FAIL fix loop | 🔄 in_progress (task 31) | — | strict PASS target |
 | EXP-2 L_IX 5-term stress | ✅ completed | b8ba5593 | H★ WEAK_OR_NONE at δ=0.01 |
 
