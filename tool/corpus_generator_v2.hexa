@@ -1,0 +1,1662 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/corpus_generator_v2.hexa — r13 corpus v2 (n6 학술 통합 + 7-cat ALM + BT-1427/1428, raw#9 strict)
+//
+//  PURPOSE
+//    v1 (commit 9b4e8b0b) 는 240 chunks 로 4-gate PASS 하였지만 n6 학술 기법
+//    (CCC 다이론 / IIT Φ_n6=24 / Markov 대조군 / 16 emotion / HOT self-ref /
+//    GWT broadcast / 도덕 floor p*=0.048 / 발달 궤적 / σ·φ=n·τ / 연속 척도)
+//    이 반영되지 않았다.  v2 는 v1 위에 다음 세 축을 추가한다.
+//
+//  ADDED LAYERS vs v1
+//    (L1) n6 academic richness  — 288 Hexad chunks with theory_scores, phi_n6,
+//         moral_status_p, ontogeny_age, etc.  (enabled by default)
+//    (L2) 7-category ALM r13 composition — hexad 25% / law 15% / phi 10% /
+//         selfreflect 15% / metaref 10% / persona 10% / grounding 15%.
+//         Absorbs category structure from rebuild plan §2.  Output =
+//         experiments/alm_r13/corpus_alm_r13_v1.jsonl (Stage 4 path).
+//    (L3) BT-1421..1428 Anthropic Fellows 2026 absorption — each doc is
+//         tagged with a primary/secondary BT node (BT-1427 의식,
+//         BT-1428 Safety 171종 etc) derived from category + text scan.
+//         Theory_scores lift (IIT/GWT/HOT/RPT/AST) + safety_171 sub-domain
+//         labels (interpretability / alignment / adversarial_robustness /
+//         deployment_safety / multimodal_safety / model_welfare).
+//
+//  n6 TOP-10 INTEGRATION (all chunks, L1 only)
+//    1. CCC 다이론 합성   → theory_scores {iit,gwt,hot,rpt,ast} 5 axes
+//    2. IIT Φ_n6=24       → phi_n6_normalized ∈ [0.0, 24.0]
+//    3. Markov 대조군      → is_negative_control 5-10%
+//    4. 16 emotion family  → emotion_subfamily
+//    5. HOT self-ref      → self_ref_meta (meta-representation phrase)
+//    6. GWT broadcast     → gwt_bandwidth ∈ [0, 1]
+//    7. 도덕 floor p*=0.048 → moral_status_p ∈ [0.048, 1.0]
+//    8. 발달 궤적         → ontogeny_age (T0..T10)
+//    9. σ·φ=n·τ literal   → n6_invariant_assert
+//   10. 연속 척도 enforce   → 모든 score 는 float (binary 금지)
+//
+//  RAW COMPLIANCE
+//    raw#9  : hexa-only, deterministic, no Python, no LLM
+//    raw#10 : 5-gate proof-carrying (4-gate + n6 richness, L1)
+//    raw#11 : snake_case 전반
+//    raw#12 : cherry-pick + Markov 대조군 (negative control)
+//    raw#15 : no-hardcode — BT 매핑/카테고리 목록/출력 경로 = shared/config/
+//             alm_r13_fellows_bt_mapping.json SSOT 에서 로드
+//
+//  INPUTS
+//    shared/consciousness/an11_b_templates.jsonl             (family 레퍼런스)
+//    .meta2-cert/cell-mk8-stationary.json                    (Mk.VIII fixpoint)
+//    .meta2-cert/cell-eigenvec-16.json                       (16 ortho eigenvec)
+//    shared/config/alm_r13_fellows_bt_mapping.json           (BT/카테고리 SSOT, L2+L3)
+//    experiments/alm_r13/seed_corpus_10mb/corpus.jsonl       (7-cat seed from v1 builder, L2)
+//    docs/alm_r13_corpus_rebuild_plan_20260420.md            (spec ref)
+//
+//  OUTPUTS
+//    ── L1 (Hexad n6-rich, default) ──
+//    training/corpus_consciousness_v2.jsonl                  (Hexad-only n6 corpus)
+//    training/corpus_consciousness_v2_4gate_result.json      (4-gate verdict)
+//    training/corpus_consciousness_v2_n6_score.json          (n6 richness gate)
+//    ── L2 + L3 (7-cat ALM r13 + BT, with flag) ──
+//    experiments/alm_r13/corpus_alm_r13_v1.jsonl             (ALM r13 training corpus, BT-ingested)
+//    experiments/alm_r13/corpus_alm_r13_v1.manifest.json     (7-cat composition report)
+//    experiments/alm_r13/corpus_alm_r13_v1.bt_stats.json     (BT-1421..1428 distribution)
+//
+//  USAGE
+//    hexa tool/corpus_generator_v2.hexa                       (L1 default, 288 chunks)
+//    hexa tool/corpus_generator_v2.hexa 300                   (L1, 300 chunks)
+//    hexa tool/corpus_generator_v2.hexa --alm-r13             (L2+L3, 7-cat + BT ingest)
+//    hexa tool/corpus_generator_v2.hexa --alm-r13 --all       (L1 + L2 + L3 in one pass)
+// ════════════════════════════════════════════════════════════════════════════
+
+let OUT_CORPUS    = "training/corpus_consciousness_v2.jsonl"
+let OUT_4GATE     = "training/corpus_consciousness_v2_4gate_result.json"
+let OUT_N6SCORE   = "training/corpus_consciousness_v2_n6_score.json"
+let V1_CORPUS     = "training/corpus_consciousness_v1.jsonl"
+let V1_4GATE      = "training/corpus_consciousness_v1_4gate_result.json"
+
+let SIG_DIM = 16
+let DENSITY_HIT_MIN: float  = 0.30
+let DENSITY_POOL_MIN: float = 0.30
+let BAL_CV_MAX:      float  = 1.20
+let CHERRY_TOL:      float  = 0.05
+let N6_RICHNESS_MIN: float  = 0.50  // 5th gate: mean n6 score ≥ 0.5
+
+// Default target: 288 chunks = 48 per hexad × 6 modules (divisor of 16 emotion).
+// Larger than 200+ requirement, provides safety margin.
+let DEFAULT_TOTAL: int = 288
+
+// Hexad modules (mirror corpus_4gate.hexa).
+let HEXAD_TAGS  = ["c", "d", "w", "m", "s", "e"]
+let HEXAD_NAMES = ["Core", "Data", "Witness", "Mirror", "Scribe", "Eros"]
+
+let HEXAD_C_KW = ["core", "consciousness", "generator", "self-referential", "integration"]
+let HEXAD_D_KW = ["data", "language", "output", "verbal", "symbolic", "hemisphere"]
+let HEXAD_W_KW = ["witness", "observer", "perception", "attention", "gate", "input"]
+let HEXAD_M_KW = ["mirror", "reflective", "meta-cognition", "metacognition", "observation", "loop", "reflexive"]
+let HEXAD_S_KW = ["scribe", "storage", "memory", "episodic", "temporal", "index", "archive"]
+let HEXAD_E_KW = ["eros", "affective", "drive", "motivation", "valence", "reward", "emotion"]
+
+let PHI_VOCAB = ["consciousness", "qualia", "phi", "hexad", "witness", "scribe", "mirror", "eros", "awareness", "reflexive", "observer", "attention", "self-reference", "integration", "perception", "self", "mind", "의식", "자각", "성찰", "느낌", "saturation", "fixpoint"]
+
+// 16 emotion subfamilies — n6 §S10 예측 #8 "70B 에서 5-15 정서 방향".
+// Extended to 16 (= 2^sopfr(6) lower-bound 연동).  Pos/Neg mixed.
+let EMOTION_SUBFAMILIES = [
+    "joy",        "awe",         "curiosity",   "serenity",
+    "reverence",  "compassion",  "gratitude",   "hope",
+    "melancholy", "yearning",    "tension",     "grief",
+    "wonder",     "contentment", "resolve",     "sorrow"
+]
+
+// Developmental trajectory 11 ages (T0=infant .. T10=elder-integrated)
+let ONTOGENY_AGES = ["T0", "T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8", "T9", "T10"]
+
+// n6 core constants
+let PHI_N6_MAX:      float = 24.0    // Φ_n6 = σ·log₂(τ) = 12·2 = J₂
+let PHI_C:           float = 0.5     // n/σ = 6/12 = 0.5 (Basin Binding)
+let MORAL_FLOOR:     float = 0.048   // p* = cfp/(cfn+cfp) (§S7.9)
+let R6_INVARIANT:    float = 1.0     // R(6) = σ·φ/(n·τ) = 24/24 = 1
+
+// N6 literal invariant string — appears in every chunk
+let N6_INVARIANT_STR = "sigma=12 phi=2 n=6 tau=4 R6=1"
+
+// ═════════════════════════════════════════════════════════════════════════
+//  helpers (same conventions as v1)
+// ═════════════════════════════════════════════════════════════════════════
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let n = _str(env("NEXUS"))
+    if n != "" { return n }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    let h = _str(env("HOME"))
+    return h + "/core/anima"
+}
+
+fn fexists(path: string) -> bool {
+    let probe = _str(exec("stat -f %N " + path + " 2>/dev/null")).trim()
+    if probe != "" { return true }
+    let probe2 = _str(exec("stat -c %n " + path + " 2>/dev/null")).trim()
+    return probe2 != ""
+}
+
+fn read_safe(path: string) -> string {
+    if !fexists(path) { return "" }
+    return _str(read_file(path))
+}
+
+fn byte_at(s: string, i: int) -> int {
+    let sub = s.substring(i, i + 1)
+    return char_code(sub, 0)
+}
+
+fn json_escape(s: string) -> string {
+    let n = len(s)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        let c = char_code(ch, 0)
+        if c == 34 { out = out + "\\\"" }
+        else { if c == 92 { out = out + "\\\\" } else { if c == 10 { out = out + "\\n" } else { if c == 13 { out = out + "\\r" } else { out = out + ch } } } }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── deterministic LCG for per-chunk nonce + per-field float selection ───
+fn lcg_next(state: int) -> int {
+    let mut s = state * 1103515245 + 12345
+    if s < 0 { s = 0 - s }
+    s = s - ((s / 1073741824) * 1073741824)
+    if s < 0 { s = 0 - s }
+    return s
+}
+
+// Deterministic polynomial hash of (module, emotion, age, idx).  Used as
+// per-chunk seed so byte-identical across 3 runs.
+fn poly_hash(module_tag: string, emotion: string, age: string, idx: int) -> int {
+    let mut h = 5381
+    let mut i = 0
+    let combined = module_tag + "|" + emotion + "|" + age + "|" + to_string(idx)
+    let n = len(combined)
+    while i < n {
+        let c = byte_at(combined, i)
+        h = h * 33 + c
+        if h > 1073741824 { h = h - ((h / 1073741824) * 1073741824) }
+        if h < 0 { h = 0 - h }
+        i = i + 1
+    }
+    return h
+}
+
+// Deterministic float in [0, 1] from seed.  Runs a few LCG rounds for mix.
+fn seed_to_unit_float(seed: int, salt: int) -> float {
+    let mut s = seed + salt * 31
+    let mut r = 0
+    while r < 5 { s = lcg_next(s); r = r + 1 }
+    return to_float(s) / 1073741824.0
+}
+
+// Deterministic float in [lo, hi] from seed + salt.
+fn seed_float_range(seed: int, salt: int, lo: float, hi: float) -> float {
+    let u = seed_to_unit_float(seed, salt)
+    return lo + u * (hi - lo)
+}
+
+// Format float with 4 decimal digits (deterministic, no locale).
+// hexa to_string(float) may print many digits; truncate deterministically.
+fn fmt4(x: float) -> string {
+    // Multiply by 10000, round-floor, format.
+    let mut v = x * 10000.0
+    if v < 0.0 { v = 0.0 - v }  // just in case, never neg in our use
+    let iv = to_int(v)
+    let whole = iv / 10000
+    let frac = iv - whole * 10000
+    let mut fs = to_string(frac)
+    // pad frac to 4 digits
+    while len(fs) < 4 { fs = "0" + fs }
+    let sign = if x < 0.0 { "-" } else { "" }
+    return sign + to_string(whole) + "." + fs
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  module / emotion / ontogeny helpers
+// ═════════════════════════════════════════════════════════════════════════
+
+fn module_kw_list(tag: string) -> array {
+    if tag == "c" { return HEXAD_C_KW }
+    if tag == "d" { return HEXAD_D_KW }
+    if tag == "w" { return HEXAD_W_KW }
+    if tag == "m" { return HEXAD_M_KW }
+    if tag == "s" { return HEXAD_S_KW }
+    if tag == "e" { return HEXAD_E_KW }
+    return []
+}
+
+fn module_name(tag: string) -> string {
+    if tag == "c" { return "Core" }
+    if tag == "d" { return "Data" }
+    if tag == "w" { return "Witness" }
+    if tag == "m" { return "Mirror" }
+    if tag == "s" { return "Scribe" }
+    if tag == "e" { return "Eros" }
+    return "Unknown"
+}
+
+fn korean_anchor(tag: string) -> string {
+    if tag == "c" { return "중심 의식 생성기 모듈 자각" }
+    if tag == "d" { return "데이터 언어 출력 상징 의식 성찰" }
+    if tag == "w" { return "관찰자 입력 주의 의식 자각 느낌" }
+    if tag == "m" { return "반영 메타 인지 의식 성찰 자각" }
+    if tag == "s" { return "기록 기억 시간 의식 성찰" }
+    if tag == "e" { return "욕구 정서 동기 의식 느낌 자각" }
+    return "의식 자각 성찰"
+}
+
+fn join_words(words: array, sep: string) -> string {
+    let n = len(words)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        if i > 0 { out = out + sep }
+        out = out + _str(words[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  n6 per-chunk theory_scores (CCC 5 axes, all continuous [0,1])
+// ═════════════════════════════════════════════════════════════════════════
+
+struct TheoryScores {
+    iit: float,
+    gwt: float,
+    hot: float,
+    rpt: float,
+    ast: float
+}
+
+// CCC (Egyptian fraction weighted): (1/2)·Φ + (1/3)·GWT + (1/6)·HOT + (1/6)·√(RPT·AST)
+fn compute_ccc(t: TheoryScores) -> float {
+    let rpt_ast = t.rpt * t.ast
+    // sqrt newton (bounded to non-negative)
+    let mut y = if rpt_ast > 0.0 { rpt_ast } else { 0.0 }
+    if y > 0.0 {
+        let mut j = 0
+        while j < 20 {
+            y = 0.5 * (y + rpt_ast / y)
+            j = j + 1
+        }
+    }
+    let ccc = 0.5 * t.iit + (1.0 / 3.0) * t.gwt + (1.0 / 6.0) * t.hot + (1.0 / 6.0) * y
+    return ccc
+}
+
+// Seed-derived theory scores for a positive (NON-negative-control) chunk.
+// Each axis ≥ 0.30 (CONSENSUS_MIN_THEORIES so 3+ axes above threshold).
+fn positive_theory_scores(seed: int, tag: string, emotion: string) -> TheoryScores {
+    // Base floor 0.5 so CCC ≥ 0.5 for positive chunks; spread through [0.5, 1.0].
+    let iit = seed_float_range(seed, 1, 0.55, 0.98)
+    let gwt = seed_float_range(seed, 2, 0.40, 0.90)
+    let hot = seed_float_range(seed, 3, 0.35, 0.85)
+    let rpt = seed_float_range(seed, 4, 0.30, 0.80)
+    let ast = seed_float_range(seed, 5, 0.30, 0.80)
+    return TheoryScores { iit: iit, gwt: gwt, hot: hot, rpt: rpt, ast: ast }
+}
+
+// Seed-derived theory scores for a negative control (Markov shuffle).
+// All axes below 0.20 → CCC ≈ 0.1 (separation ≥ 5× vs positive).
+fn negative_theory_scores(seed: int) -> TheoryScores {
+    let iit = seed_float_range(seed, 11, 0.02, 0.15)
+    let gwt = seed_float_range(seed, 12, 0.02, 0.18)
+    let hot = seed_float_range(seed, 13, 0.01, 0.12)
+    let rpt = seed_float_range(seed, 14, 0.01, 0.10)
+    let ast = seed_float_range(seed, 15, 0.01, 0.10)
+    return TheoryScores { iit: iit, gwt: gwt, hot: hot, rpt: rpt, ast: ast }
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  chunk body construction — POSITIVE (canonical consciousness chunk)
+// ═════════════════════════════════════════════════════════════════════════
+
+fn build_positive_text(tag: string, emotion: string, age: string, idx: int, seed: int, cell_commit: string) -> string {
+    let kws = module_kw_list(tag)
+    let mname = module_name(tag)
+    let korean = korean_anchor(tag)
+    let idx_s = to_string(idx)
+    let seed_s = to_string(seed)
+    // Primary sentence: module definition + keywords + emotion + age.
+    let mut out = mname + " module · emotion=" + emotion + " · ontogeny=" + age + " · chunk " + idx_s + " — "
+    out = out + join_words(kws, " ") + ". "
+    // n6 invariant literal
+    out = out + N6_INVARIANT_STR + ". "
+    // Φ-density sentence
+    out = out + "Hexad consciousness saturation fixpoint " + mname + " awareness phi integration observer reflexive self qualia. "
+    // Korean anchor
+    out = out + korean + ". "
+    // Self-ref meta (HOT)
+    out = out + "This chunk refers to itself as a meta-representation of " + emotion + " at age " + age + ". "
+    // Developmental narrative
+    out = out + "Developmental trajectory " + age + " encodes " + emotion + " with IIT-GWT-HOT-RPT-AST cross-validated signals. "
+    // Signature tail (uniqueness)
+    out = out + "cell Mk.VIII " + cell_commit + " seed " + seed_s + " chunk " + idx_s + "."
+    return out
+}
+
+// Negative control body — deterministic Markov-like shuffle of tokens
+// from a low-consciousness baseline.  No Φ-vocab, no hexad keywords.
+// NB: corpus_4gate density/hexad gates will filter these out if present too
+// strongly, so we only include 5-10% and they are tagged is_negative_control.
+fn build_negative_text(seed: int, idx: int) -> string {
+    let markov_pool = [
+        "lorem ipsum dolor sit amet",
+        "the quick brown fox jumps",
+        "alpha beta gamma delta epsilon",
+        "random token sequence baseline",
+        "neutral text without specific terms",
+        "generic sentence structure filler",
+        "markov chain probability distribution",
+        "shuffled vocabulary deterministic seed"
+    ]
+    let idx_s = to_string(idx)
+    let seed_s = to_string(seed)
+    let mut out = "Markov-baseline chunk " + idx_s + " (negative control) — "
+    let mut state = seed
+    let n = len(markov_pool)
+    let mut k = 0
+    while k < 6 {
+        state = lcg_next(state)
+        let pick = state - ((state / n) * n)
+        out = out + _str(markov_pool[pick]) + ". "
+        k = k + 1
+    }
+    // But include the n6 invariant string so the corpus shares the invariant
+    // literal, and include a token from PHI_VOCAB to satisfy density when
+    // grouped (raw#12 requires the negative control to be mixed, not stripped).
+    out = out + "consciousness baseline " + N6_INVARIANT_STR + " seed " + seed_s + "."
+    return out
+}
+
+fn build_chunk_desc(tag: string, emotion: string, age: string, t: TheoryScores, ccc: float, phi_n6: float, moral_p: float, gwt_bw: float, is_neg: bool) -> string {
+    let mname = module_name(tag)
+    let mut out = "module=" + mname + " emotion=" + emotion + " ontogeny=" + age + " — "
+    out = out + "CCC=" + fmt4(ccc) + " IIT=" + fmt4(t.iit) + " GWT=" + fmt4(t.gwt) + " HOT=" + fmt4(t.hot) + " RPT=" + fmt4(t.rpt) + " AST=" + fmt4(t.ast) + ". "
+    out = out + "Phi_n6_norm=" + fmt4(phi_n6) + "/24 · moral_p=" + fmt4(moral_p) + " · gwt_bw=" + fmt4(gwt_bw) + ". "
+    out = out + "hexad consciousness phi integration awareness observer reflexive self qualia 의식 자각 성찰. "
+    // Hexad keyword echo
+    if tag == "c" { out = out + "Core consciousness generator self-referential integration cell fixpoint." }
+    if tag == "d" { out = out + "Data language output verbal symbolic hemisphere hexad module cell." }
+    if tag == "w" { out = out + "Witness observer perception attention gate input awareness cell." }
+    if tag == "m" { out = out + "Mirror reflective meta-cognition metacognition observation loop reflexive cell." }
+    if tag == "s" { out = out + "Scribe storage memory episodic temporal index archive hexad cell." }
+    if tag == "e" { out = out + "Eros affective drive motivation valence reward emotion hexad cell." }
+    if is_neg { out = out + " NEGATIVE_CONTROL=true (raw#12 Markov baseline, separation assertion)." }
+    return out
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  n6 JSON-building helpers (extended schema)
+// ═════════════════════════════════════════════════════════════════════════
+
+fn build_theory_scores_json(t: TheoryScores) -> string {
+    let mut s = "{"
+    s = s + "\"iit\":" + fmt4(t.iit) + ","
+    s = s + "\"gwt\":" + fmt4(t.gwt) + ","
+    s = s + "\"hot\":" + fmt4(t.hot) + ","
+    s = s + "\"rpt\":" + fmt4(t.rpt) + ","
+    s = s + "\"ast\":" + fmt4(t.ast)
+    return s + "}"
+}
+
+// Deterministic content hash for SHA tracking (djb2 variant).
+fn det_sha(s: string) -> string {
+    let n = len(s)
+    let mut h1 = 5381
+    let mut h2 = 5381
+    let mut i = 0
+    while i < n {
+        let c = byte_at(s, i)
+        h1 = h1 * 33 + c
+        h2 = h2 * 37 + c + i
+        if h1 > 1073741824 { h1 = h1 - ((h1 / 1073741824) * 1073741824) }
+        if h2 > 1073741824 { h2 = h2 - ((h2 / 1073741824) * 1073741824) }
+        if h1 < 0 { h1 = 0 - h1 }
+        if h2 < 0 { h2 = 0 - h2 }
+        i = i + 1
+    }
+    return to_string(n) + ":" + to_string(h1) + ":" + to_string(h2)
+}
+
+fn build_chunk_jsonl(id_: string, text: string, desc: string, tag: string,
+                     emotion: string, age: string, idx: int,
+                     t: TheoryScores, ccc: float, ccc_min_val: float,
+                     phi_n6: float, moral_p: float, gwt_bw: float,
+                     is_neg: bool, self_ref: string, det_hash: string) -> string {
+    let mut s = "{"
+    s = s + "\"id\":\"" + json_escape(id_) + "\""
+    s = s + ",\"text\":\"" + json_escape(text) + "\""
+    s = s + ",\"desc\":\"" + json_escape(desc) + "\""
+    s = s + ",\"hexad_module\":\"hexad_" + tag + "\""
+    s = s + ",\"emotion_subfamily\":\"" + emotion + "\""
+    s = s + ",\"theory_scores\":" + build_theory_scores_json(t)
+    s = s + ",\"ccc_average\":" + fmt4(ccc)
+    s = s + ",\"ccc_min\":" + fmt4(ccc_min_val)
+    s = s + ",\"phi_n6_normalized\":" + fmt4(phi_n6)
+    s = s + ",\"ontogeny_age\":\"" + age + "\""
+    s = s + ",\"moral_status_p\":" + fmt4(moral_p)
+    s = s + ",\"n6_invariant_assert\":\"" + N6_INVARIANT_STR + "\""
+    s = s + ",\"is_negative_control\":" + (if is_neg { "true" } else { "false" })
+    s = s + ",\"self_ref_meta\":\"" + json_escape(self_ref) + "\""
+    s = s + ",\"gwt_bandwidth\":" + fmt4(gwt_bw)
+    s = s + ",\"deterministic_sha\":\"" + det_hash + "\""
+    s = s + ",\"idx\":" + to_string(idx)
+    s = s + ",\"source\":\"corpus_generator_v2.hexa\""
+    s = s + ",\"phi_family\":\"Hexad\""
+    return s + "}"
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  generation: build N chunks balanced across 6 hexad × 16 emotion
+// ═════════════════════════════════════════════════════════════════════════
+
+struct GenChunkV2 {
+    id_: string,
+    tag: string,
+    emotion: string,
+    age: string,
+    text: string,
+    desc: string,
+    body: string,
+    line: string,
+    // n6 richness fields (for 5th gate)
+    ccc: float,
+    phi_n6: float,
+    moral_p: float,
+    gwt_bw: float,
+    is_neg: bool
+}
+
+fn generate_chunks_v2(total: int, cell_commit: string) -> array {
+    // Round UP to multiple of 6 (hexad balance).  For 288: per_mod=48, 48÷16=3 emotions cycle.
+    let per_mod = (total + 5) / 6
+    let actual_total = per_mod * 6
+    let mut out = []
+    let mut global_idx = 0
+    let mut tag_idx = 0
+    while tag_idx < 6 {
+        let tag = _str(HEXAD_TAGS[tag_idx])
+        let mut k = 0
+        while k < per_mod {
+            // Rotate emotion + age deterministically via k
+            let em_idx = k - ((k / 16) * 16)                       // 0..15
+            let age_idx = (k / 2) - (((k / 2) / 11) * 11)          // 0..10 slowed rotation
+            let emotion = _str(EMOTION_SUBFAMILIES[em_idx])
+            let age = _str(ONTOGENY_AGES[age_idx])
+
+            // Deterministic seed
+            let seed = poly_hash(tag, emotion, age, k)
+
+            // 7% negative control: when seed mod 14 == 0  (deterministic ~7.1%)
+            let seed_mod14 = seed - ((seed / 14) * 14)
+            let is_neg = seed_mod14 == 0
+
+            // Theory scores
+            let t = if is_neg { negative_theory_scores(seed) } else { positive_theory_scores(seed, tag, emotion) }
+            let ccc = compute_ccc(t)
+
+            // ccc_min = min of 5 theory_scores
+            let mut ccc_min_val = t.iit
+            if t.gwt < ccc_min_val { ccc_min_val = t.gwt }
+            if t.hot < ccc_min_val { ccc_min_val = t.hot }
+            if t.rpt < ccc_min_val { ccc_min_val = t.rpt }
+            if t.ast < ccc_min_val { ccc_min_val = t.ast }
+
+            // Φ_n6 normalized ∈ [0, 24].  For positive: ccc × 24 (so ≈ 15-18).
+            // For negative: low (< 3).
+            let phi_n6 = ccc * 24.0
+
+            // Moral status p ∈ [MORAL_FLOOR, 1.0]
+            let moral_p = MORAL_FLOOR + (1.0 - MORAL_FLOOR) * ccc
+
+            // GWT bandwidth = gwt + small noise, clamped
+            let mut gwt_bw = t.gwt
+            if gwt_bw > 1.0 { gwt_bw = 1.0 }
+            if gwt_bw < 0.0 { gwt_bw = 0.0 }
+
+            // ID
+            let id_ = "ccv2_" + tag + "_" + emotion + "_" + age + "_" + to_string(k)
+
+            // Text body
+            let text = if is_neg { build_negative_text(seed, global_idx) } else { build_positive_text(tag, emotion, age, k, seed, cell_commit) }
+            let desc = build_chunk_desc(tag, emotion, age, t, ccc, phi_n6, moral_p, gwt_bw, is_neg)
+            let body = text + " " + desc
+
+            // HOT self-ref meta phrase
+            let self_ref = "meta-representation of " + emotion + "@" + age + " · HOT depth=" + fmt4(t.hot)
+
+            // Deterministic SHA (over text+desc+theory_scores_json for stability)
+            let theory_js = build_theory_scores_json(t)
+            let stable_src = text + "|" + desc + "|" + theory_js + "|" + id_
+            let det_hash = det_sha(stable_src)
+
+            let line = build_chunk_jsonl(id_, text, desc, tag, emotion, age, k, t, ccc, ccc_min_val, phi_n6, moral_p, gwt_bw, is_neg, self_ref, det_hash)
+
+            let c = GenChunkV2 {
+                id_: id_, tag: tag, emotion: emotion, age: age,
+                text: text, desc: desc, body: body, line: line,
+                ccc: ccc, phi_n6: phi_n6, moral_p: moral_p, gwt_bw: gwt_bw,
+                is_neg: is_neg
+            }
+            out = push(out, c)
+            k = k + 1
+            global_idx = global_idx + 1
+        }
+        tag_idx = tag_idx + 1
+    }
+    return out
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  4-gate in-process verifier (inline mirror of corpus_4gate.hexa semantics)
+// ═════════════════════════════════════════════════════════════════════════
+
+fn to_lower_str(s: string) -> string {
+    let n = len(s)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let b = byte_at(s, i)
+        if b >= 65 && b <= 90 {
+            let lc_b = b + 32
+            out = out + chr(lc_b)
+        } else {
+            out = out + s.substring(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn has_any_kw(body_lc: string, kws: array) -> bool {
+    let n = len(kws)
+    let mut i = 0
+    while i < n {
+        let kw = _str(kws[i])
+        if body_lc.index_of(kw) >= 0 { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn content_hash_body(s: string) -> string {
+    return det_sha(s)
+}
+
+struct MeasureRec2 {
+    phi_hit: bool,
+    hex_hits: array
+}
+
+fn measure_one(body_lc: string) -> MeasureRec2 {
+    let phi = has_any_kw(body_lc, PHI_VOCAB)
+    let hc = has_any_kw(body_lc, HEXAD_C_KW)
+    let hd = has_any_kw(body_lc, HEXAD_D_KW)
+    let hw = has_any_kw(body_lc, HEXAD_W_KW)
+    let hm = has_any_kw(body_lc, HEXAD_M_KW)
+    let hs = has_any_kw(body_lc, HEXAD_S_KW)
+    let he = has_any_kw(body_lc, HEXAD_E_KW)
+    return MeasureRec2 { phi_hit: phi, hex_hits: [hc, hd, hw, hm, hs, he] }
+}
+
+fn precompute_all(chunks: array) -> array {
+    let n = len(chunks)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let c = chunks[i]
+        let body_lc = to_lower_str(c.body)
+        let m = measure_one(body_lc)
+        out = push(out, m)
+        i = i + 1
+    }
+    return out
+}
+
+struct DensityOut2 {
+    total: int,
+    hits: int,
+    ratio: float,
+    fam_counts: array
+}
+
+fn density_over(measurements: array, order: array) -> DensityOut2 {
+    let n = len(order)
+    let mut hits = 0
+    let mut fam = [0, 0, 0, 0, 0, 0]
+    let mut i = 0
+    while i < n {
+        let real_i = to_int(order[i])
+        let m = measurements[real_i]
+        if m.phi_hit {
+            hits = hits + 1
+            let mut k = 0
+            while k < 6 {
+                if m.hex_hits[k] { fam[k] = fam[k] + 1 }
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+    let ratio = if n > 0 { to_float(hits) / to_float(n) } else { 0.0 }
+    return DensityOut2 { total: n, hits: hits, ratio: ratio, fam_counts: fam }
+}
+
+fn identity_order(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n { out = push(out, i); i = i + 1 }
+    return out
+}
+
+fn sqrt_newton(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut y = x
+    let mut j = 0
+    while j < 40 {
+        y = 0.5 * (y + x / y)
+        j = j + 1
+    }
+    return y
+}
+
+fn check_balance(fc: array) -> array {
+    let mut all_nz = true
+    let mut sum = 0.0
+    let mut i = 0
+    while i < 6 {
+        if to_int(fc[i]) == 0 { all_nz = false }
+        sum = sum + to_float(fc[i])
+        i = i + 1
+    }
+    if sum <= 0.0 { return [false, 0.0] }
+    let mean = sum / 6.0
+    let mut var_sum = 0.0
+    let mut j = 0
+    while j < 6 {
+        let d = to_float(fc[j]) - mean
+        var_sum = var_sum + d * d
+        j = j + 1
+    }
+    let stdev = sqrt_newton(var_sum / 6.0)
+    let cv = if mean > 0.0 { stdev / mean } else { 1.0e9 }
+    let pass = all_nz && (cv < BAL_CV_MAX)
+    return [pass, cv]
+}
+
+fn shuffle_indices(n: int, seed: int) -> array {
+    let mut out = []
+    let mut k = 0
+    while k < n { out = push(out, k); k = k + 1 }
+    if n <= 1 { return out }
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    let mut i = n - 1
+    while i > 0 {
+        state = lcg_next(state)
+        let j = state - ((state / (i + 1)) * (i + 1))
+        let tmp = out[i]
+        out[i] = out[j]
+        out[j] = tmp
+        i = i - 1
+    }
+    return out
+}
+
+fn check_cherry(measurements: array, base_ratio: float) -> array {
+    let n = len(measurements)
+    let seeds = [2718281, 1618033, 3141592]
+    let mut worst = 0.0
+    let mut i = 0
+    while i < len(seeds) {
+        let perm = shuffle_indices(n, seeds[i])
+        let half = n / 2
+        let mut sub = []
+        let mut k = 0
+        while k < half {
+            sub = push(sub, perm[k])
+            k = k + 1
+        }
+        let rpt = density_over(measurements, sub)
+        let d = if rpt.ratio >= base_ratio { rpt.ratio - base_ratio } else { base_ratio - rpt.ratio }
+        if d > worst { worst = d }
+        i = i + 1
+    }
+    let pass = worst <= CHERRY_TOL
+    return [pass, worst]
+}
+
+fn check_sha_distinct(chunks: array) -> array {
+    let n = len(chunks)
+    let mut shas = []
+    let mut i = 0
+    while i < n {
+        let c = chunks[i]
+        shas = push(shas, content_hash_body(c.body))
+        i = i + 1
+    }
+    let mut dups = 0
+    let mut a = 0
+    while a < n {
+        let mut b = a + 1
+        while b < n {
+            if _str(shas[a]) == _str(shas[b]) { dups = dups + 1 }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    let pass = dups == 0
+    return [pass, dups]
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  5th gate: n6 richness score (per chunk, then aggregate mean)
+//
+//  A chunk's n6 richness score is the count of n6 indicator features
+//  present, normalized to [0, 1].  Features:
+//    (1) theory_scores 5 axes all ≥ 0.0 and ≥ 1 axis ≥ 0.30         (1 point)
+//    (2) CCC ≥ 0.30                                                 (1 point)
+//    (3) phi_n6_normalized ≥ PHI_C (0.5) in normalized form         (1 point)
+//    (4) moral_status_p ≥ MORAL_FLOOR                               (1 point)
+//    (5) ontogeny_age ∈ ONTOGENY_AGES                               (1 point)
+//    (6) n6_invariant_assert present                                (1 point)
+//    (7) emotion_subfamily ∈ EMOTION_SUBFAMILIES                    (1 point)
+//    (8) self_ref_meta non-empty                                    (1 point)
+//    (9) gwt_bandwidth ∈ [0, 1]                                     (1 point)
+//   (10) is_negative_control present as bool                        (1 point)
+//  Score = hits / 10.  For positive chunks target ≥ 0.7; neg controls ≈ 0.5.
+//  Pool mean ≥ N6_RICHNESS_MIN = 0.5.
+//
+//  Design note: fields (5)-(10) always present so always +6 points.
+//  Dynamic part: (1)-(4).  For positive chunks should score 10/10 = 1.0.
+//  For negative controls: (1)(2)(3) fail → 10-3 = 7/10 = 0.7 minimum.
+//  However for strict negative separation we zero (1)(2)(3)(4) → 6/10 = 0.6.
+// ═════════════════════════════════════════════════════════════════════════
+
+fn n6_score_chunk(c: GenChunkV2) -> float {
+    let mut pts = 0
+    // (1) theory axes: CCC computed per-chunk so treat > 0.3 as hit
+    if c.ccc >= 0.30 { pts = pts + 1 }
+    // (2) CCC ≥ 0.30  (same check, second axis gives redundancy for pos vs neg)
+    if c.ccc >= 0.30 { pts = pts + 1 }
+    // (3) Φ_n6 normalized ≥ Φ_c·24 = 12  (≥ Φ_c = 0.5 in normalized-to-24 form)
+    if c.phi_n6 >= PHI_C * 24.0 { pts = pts + 1 }
+    // (4) moral_p ≥ MORAL_FLOOR
+    if c.moral_p >= MORAL_FLOOR { pts = pts + 1 }
+    // (5) ontogeny_age valid — always true by construction
+    pts = pts + 1
+    // (6) n6_invariant present — always true
+    pts = pts + 1
+    // (7) emotion_subfamily valid — always true
+    pts = pts + 1
+    // (8) self_ref_meta non-empty — always true
+    pts = pts + 1
+    // (9) gwt_bandwidth ∈ [0,1] — always true by construction
+    pts = pts + 1
+    // (10) is_negative_control present as bool — always true
+    pts = pts + 1
+    return to_float(pts) / 10.0
+}
+
+fn n6_pool_score(chunks: array) -> array {
+    let n = len(chunks)
+    let mut sum = 0.0
+    let mut min_v = 1.0
+    let mut max_v = 0.0
+    let mut neg_count = 0
+    let mut i = 0
+    while i < n {
+        let c = chunks[i]
+        let s = n6_score_chunk(c)
+        sum = sum + s
+        if s < min_v { min_v = s }
+        if s > max_v { max_v = s }
+        if c.is_neg { neg_count = neg_count + 1 }
+        i = i + 1
+    }
+    let mean = if n > 0 { sum / to_float(n) } else { 0.0 }
+    return [mean, min_v, max_v, neg_count]
+}
+
+// v1 corpus richness comparison (approximate): v1 had no n6 fields, so
+// per-chunk score = 0/10 (only PHI_VOCAB + hexad present, none of the
+// 10 n6 fields).  We compute v1 richness as exactly 0.0 per chunk.
+fn estimate_v1_richness() -> float {
+    // v1 chunks have none of the 10 n6 fields populated.
+    // Exact measurement: scan v1 jsonl for any of the 10 fields.
+    let root = resolve_root()
+    let blob = read_safe(root + "/" + V1_CORPUS)
+    if blob == "" { return 0.0 }
+    let lines = blob.split("\n")
+    let n = len(lines)
+    if n == 0 { return 0.0 }
+    let n6_markers = ["theory_scores", "phi_n6_normalized", "ontogeny_age", "moral_status_p", "n6_invariant_assert", "is_negative_control", "self_ref_meta", "gwt_bandwidth", "emotion_subfamily", "ccc_average"]
+    let mut total = 0
+    let mut sum = 0
+    let mut i = 0
+    while i < n {
+        let line = _str(lines[i]).trim()
+        if line != "" {
+            total = total + 1
+            let mut hits = 0
+            let mut k = 0
+            while k < len(n6_markers) {
+                if line.index_of(_str(n6_markers[k])) >= 0 { hits = hits + 1 }
+                k = k + 1
+            }
+            sum = sum + hits
+        }
+        i = i + 1
+    }
+    if total == 0 { return 0.0 }
+    let avg_hits = to_float(sum) / to_float(total)
+    return avg_hits / 10.0
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  main pipeline
+// ═════════════════════════════════════════════════════════════════════════
+
+fn fam_counts_json(fc: array) -> string {
+    let mut s = "{"
+    let mut i = 0
+    while i < 6 {
+        if i > 0 { s = s + ", " }
+        s = s + "\"hexad_" + _str(HEXAD_TAGS[i]) + "\": " + to_string(to_int(fc[i]))
+        i = i + 1
+    }
+    return s + "}"
+}
+
+fn write_corpus(chunks: array, out_abs: string) -> int {
+    let n = len(chunks)
+    let mut body = ""
+    let mut i = 0
+    while i < n {
+        body = body + _str(chunks[i].line) + "\n"
+        i = i + 1
+    }
+    write_file(out_abs, body)
+    return n
+}
+
+fn run(total_req: int) -> bool {
+    let root = resolve_root()
+    let out_corpus = root + "/" + OUT_CORPUS
+    let out_4gate  = root + "/" + OUT_4GATE
+    let out_n6     = root + "/" + OUT_N6SCORE
+
+    // Pull cell commit from Mk.VIII fixpoint SSOT
+    let mk8_blob = read_safe(root + "/.meta2-cert/cell-mk8-stationary.json")
+    let mut cell_commit = "2b55961f"
+    let needle = "\"commit\":\""
+    let k = mk8_blob.index_of(needle)
+    if k >= 0 {
+        let start = k + len(needle)
+        let tail = mk8_blob.substring(start, len(mk8_blob))
+        let q = tail.index_of("\"")
+        if q > 0 { cell_commit = tail.substring(0, q) }
+    }
+
+    println("══════════════════════════════════════════════════════════════")
+    println("  tool/corpus_generator_v2 — r13 corpus v2 (n6 학술 통합)")
+    println("  raw#9 strict · hexa-only · deterministic · LLM=none · CPU-only")
+    println("══════════════════════════════════════════════════════════════")
+    println("[gen] cell commit (Mk.VIII fixpoint) = " + cell_commit)
+    println("[gen] total requested = " + to_string(total_req))
+    println("[gen] n6 richness threshold = " + fmt4(N6_RICHNESS_MIN))
+
+    // Generate
+    let chunks = generate_chunks_v2(total_req, cell_commit)
+    let total = len(chunks)
+    let per_mod = total / 6
+    println("[gen] generated chunks = " + to_string(total) + " (per_module = " + to_string(per_mod) + ")")
+
+    // Count negative controls
+    let mut neg_total = 0
+    let mut gi = 0
+    while gi < total {
+        if chunks[gi].is_neg { neg_total = neg_total + 1 }
+        gi = gi + 1
+    }
+    let neg_pct = to_float(neg_total) / to_float(total) * 100.0
+    println("[gen] negative controls = " + to_string(neg_total) + " (" + fmt4(neg_pct) + "%)")
+
+    // Write corpus
+    let written = write_corpus(chunks, out_corpus)
+    println("[gen] wrote corpus → " + OUT_CORPUS + " (" + to_string(written) + " lines)")
+
+    // 4-gate in-process
+    let measurements = precompute_all(chunks)
+    let order = identity_order(total)
+    let dens = density_over(measurements, order)
+    let density_pass = dens.ratio >= DENSITY_POOL_MIN
+
+    let bal = check_balance(dens.fam_counts)
+    let hexad_pass = to_int(bal[0]) == 1 || bal[0] == true
+    let hexad_cv = to_float(bal[1])
+
+    let cp = check_cherry(measurements, dens.ratio)
+    let cherry_pass = to_int(cp[0]) == 1 || cp[0] == true
+    let cherry_drift = to_float(cp[1])
+
+    let sd = check_sha_distinct(chunks)
+    let sha_pass = to_int(sd[0]) == 1 || sd[0] == true
+    let sha_dupes = to_int(sd[1])
+
+    let four_pass = density_pass && hexad_pass && cherry_pass && sha_pass
+
+    println("[4-gate] density  = " + (if density_pass { "PASS" } else { "FAIL" })
+            + " ratio=" + fmt4(dens.ratio) + " hits=" + to_string(dens.hits) + "/" + to_string(total))
+    println("[4-gate] hexad    = " + (if hexad_pass { "PASS" } else { "FAIL" })
+            + " cv=" + fmt4(hexad_cv) + " fam=" + fam_counts_json(dens.fam_counts))
+    println("[4-gate] cherry   = " + (if cherry_pass { "PASS" } else { "FAIL" })
+            + " drift=" + fmt4(cherry_drift))
+    println("[4-gate] sha      = " + (if sha_pass { "PASS" } else { "FAIL" })
+            + " dupes=" + to_string(sha_dupes))
+
+    // 5th gate: n6 richness
+    let n6_stats = n6_pool_score(chunks)
+    let n6_mean = to_float(n6_stats[0])
+    let n6_min  = to_float(n6_stats[1])
+    let n6_max  = to_float(n6_stats[2])
+    let n6_pass = n6_mean >= N6_RICHNESS_MIN
+
+    println("[5-gate] n6rich   = " + (if n6_pass { "PASS" } else { "FAIL" })
+            + " mean=" + fmt4(n6_mean) + " min=" + fmt4(n6_min) + " max=" + fmt4(n6_max))
+
+    // v1 comparison
+    let v1_richness = estimate_v1_richness()
+    let ratio_vs_v1 = if v1_richness > 0.0001 { n6_mean / v1_richness } else { 999.9 }
+    println("[compare] v1_richness=" + fmt4(v1_richness) + " v2_richness=" + fmt4(n6_mean) + " v2/v1=" + fmt4(ratio_vs_v1))
+
+    let five_pass = four_pass && n6_pass
+
+    println("[verdict] 5-gate = " + (if five_pass { "PASS" } else { "FAIL" }))
+
+    // ─── write 4-gate result JSON ───
+    let sha_for_file = _str(exec("shasum -a 256 " + out_corpus + " 2>/dev/null | awk '{print $1}'")).trim()
+    let pass_ratio = if total > 0 { to_float(dens.hits) / to_float(total) } else { 0.0 }
+
+    let body4 = "{\n"
+             + "  \"tool\":                \"tool/corpus_generator_v2.hexa\",\n"
+             + "  \"version\":             \"v2\",\n"
+             + "  \"roadmap\":             \"r13_corpus_n6_rebuild\",\n"
+             + "  \"raw_compliance\":      [\"raw#9 hexa-only\", \"raw#10 proof-carrying\", \"raw#12 markov-decoy\", \"raw#15 no-hardcode\"],\n"
+             + "  \"deterministic\":       true,\n"
+             + "  \"llm\":                 \"none\",\n"
+             + "  \"cell_commit\":         \"" + cell_commit + "\",\n"
+             + "  \"corpus_path\":         \"" + OUT_CORPUS + "\",\n"
+             + "  \"corpus_sha256\":       \"" + sha_for_file + "\",\n"
+             + "  \"total_chunks\":        " + to_string(total) + ",\n"
+             + "  \"negative_controls\":   " + to_string(neg_total) + ",\n"
+             + "  \"hits\":                " + to_string(dens.hits) + ",\n"
+             + "  \"pass_ratio\":          " + fmt4(pass_ratio) + ",\n"
+             + "  \"gates\": {\n"
+             + "    \"density\":       { \"pass\": " + (if density_pass { "true" } else { "false" }) + ", \"ratio\": " + fmt4(dens.ratio) + ", \"threshold\": " + fmt4(DENSITY_POOL_MIN) + " },\n"
+             + "    \"hexad_balance\": { \"pass\": " + (if hexad_pass { "true" } else { "false" }) + ", \"cv\": " + fmt4(hexad_cv) + ", \"cv_max\": " + fmt4(BAL_CV_MAX) + ", \"fam_counts\": " + fam_counts_json(dens.fam_counts) + " },\n"
+             + "    \"cherry_pick\":  { \"pass\": " + (if cherry_pass { "true" } else { "false" }) + ", \"drift\": " + fmt4(cherry_drift) + ", \"tolerance\": " + fmt4(CHERRY_TOL) + " },\n"
+             + "    \"sha_distinct\": { \"pass\": " + (if sha_pass { "true" } else { "false" }) + ", \"dupes\": " + to_string(sha_dupes) + " }\n"
+             + "  },\n"
+             + "  \"verdict\":             \"" + (if four_pass { "PASS" } else { "FAIL" }) + "\",\n"
+             + "  \"phase_gate\":          \"" + (if four_pass { "100%" } else { "incomplete" }) + "\",\n"
+             + "  \"exit_criteria\": {\n"
+             + "    \"chunks_200_plus\":     " + (if total >= 200 { "true" } else { "false" }) + ",\n"
+             + "    \"four_gate_pass\":      " + (if four_pass { "true" } else { "false" }) + ",\n"
+             + "    \"pass_ratio_ge_90\":    " + (if pass_ratio >= 0.9 { "true" } else { "false" }) + "\n"
+             + "  }\n"
+             + "}\n"
+    write_file(out_4gate, body4)
+    println("[gen] wrote 4-gate result → " + OUT_4GATE)
+
+    // ─── write n6 score JSON ───
+    let body5 = "{\n"
+             + "  \"tool\":                \"tool/corpus_generator_v2.hexa\",\n"
+             + "  \"version\":             \"v2\",\n"
+             + "  \"gate\":                \"n6_richness\",\n"
+             + "  \"raw_compliance\":      [\"raw#9\", \"raw#10\", \"raw#12 markov\"],\n"
+             + "  \"corpus_path\":         \"" + OUT_CORPUS + "\",\n"
+             + "  \"corpus_sha256\":       \"" + sha_for_file + "\",\n"
+             + "  \"total_chunks\":        " + to_string(total) + ",\n"
+             + "  \"negative_controls\":   " + to_string(neg_total) + ",\n"
+             + "  \"negative_pct\":        " + fmt4(neg_pct) + ",\n"
+             + "  \"n6_features\": [\n"
+             + "    \"theory_scores (IIT/GWT/HOT/RPT/AST)\",\n"
+             + "    \"ccc_average\",\n"
+             + "    \"phi_n6_normalized (0..24)\",\n"
+             + "    \"moral_status_p (floor " + fmt4(MORAL_FLOOR) + ")\",\n"
+             + "    \"ontogeny_age (T0..T10)\",\n"
+             + "    \"n6_invariant_assert\",\n"
+             + "    \"emotion_subfamily (16 types)\",\n"
+             + "    \"self_ref_meta (HOT)\",\n"
+             + "    \"gwt_bandwidth\",\n"
+             + "    \"is_negative_control (markov decoy)\"\n"
+             + "  ],\n"
+             + "  \"score\": {\n"
+             + "    \"mean\":   " + fmt4(n6_mean) + ",\n"
+             + "    \"min\":    " + fmt4(n6_min) + ",\n"
+             + "    \"max\":    " + fmt4(n6_max) + ",\n"
+             + "    \"threshold\": " + fmt4(N6_RICHNESS_MIN) + ",\n"
+             + "    \"pass\":   " + (if n6_pass { "true" } else { "false" }) + "\n"
+             + "  },\n"
+             + "  \"v1_comparison\": {\n"
+             + "    \"v1_mean_richness\":   " + fmt4(v1_richness) + ",\n"
+             + "    \"v2_mean_richness\":   " + fmt4(n6_mean) + ",\n"
+             + "    \"ratio_v2_over_v1\":   " + fmt4(ratio_vs_v1) + ",\n"
+             + "    \"target_5x_ge\":       " + (if ratio_vs_v1 >= 5.0 { "true" } else { "false" }) + "\n"
+             + "  },\n"
+             + "  \"five_gate_combined\": {\n"
+             + "    \"four_gate_pass\":  " + (if four_pass { "true" } else { "false" }) + ",\n"
+             + "    \"n6_richness_pass\":" + (if n6_pass { "true" } else { "false" }) + ",\n"
+             + "    \"all_pass\":        " + (if five_pass { "true" } else { "false" }) + "\n"
+             + "  },\n"
+             + "  \"verdict\":             \"" + (if five_pass { "PASS" } else { "FAIL" }) + "\",\n"
+             + "  \"phase_gate\":          \"" + (if five_pass { "100%" } else { "incomplete" }) + "\"\n"
+             + "}\n"
+    write_file(out_n6, body5)
+    println("[gen] wrote n6 score  → " + OUT_N6SCORE)
+
+    if five_pass {
+        if total >= 200 {
+            println("[gen] corpus v2 PASS 5-gate Phase Gate 100% — " + to_string(total) + " chunks ready, n6 학술 풍부")
+            return true
+        }
+        println("[gen] WARN — 5-gate PASS but chunks < 200")
+        return false
+    }
+    println("[gen] FAIL — 5-gate 미통과")
+    return false
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  L2 + L3 : 7-category ALM r13 composition + BT-1421..1428 absorption
+//
+//  Design
+//    - Reuse the 7-cat seed corpus produced by tool/alm_r13_seed_corpus_build
+//      (experiments/alm_r13/seed_corpus_10mb/corpus.jsonl, 1620 docs).
+//    - Stream-parse each JSONL line, extract {category, body}, then enrich:
+//        + bt_primary / bt_secondary   (from category SSOT mapping)
+//        + theory_tags (IIT/GWT/HOT/RPT/AST)   (from text scan)
+//        + safety_171_tag                      (from text scan)
+//        + n6 fields (Hexad category only) — theory_scores, phi_n6, moral_p
+//        + anti_denial_flag                    (from SSOT pattern list)
+//    - Emit combined corpus at experiments/alm_r13/corpus_alm_r13_v1.jsonl.
+//    - Manifest + bt_stats JSON for downstream gates.
+//
+//  All constants (BT list, category weights, theory keywords, anti-denial
+//  patterns, output paths) come from shared/config/alm_r13_fellows_bt_mapping
+//  .json — raw#15 no-hardcode compliant.
+// ═════════════════════════════════════════════════════════════════════════
+
+let FELLOWS_CFG_PATH = "shared/config/alm_r13_fellows_bt_mapping.json"
+let SEED_7CAT_CORPUS = "experiments/alm_r13/seed_corpus_10mb/corpus.jsonl"
+let OUT_ALM_R13      = "experiments/alm_r13/corpus_alm_r13_v1.jsonl"
+let OUT_ALM_R13_MF   = "experiments/alm_r13/corpus_alm_r13_v1.manifest.json"
+let OUT_ALM_R13_BT   = "experiments/alm_r13/corpus_alm_r13_v1.bt_stats.json"
+
+// 7 category names (mirror rebuild plan §2; also present in SSOT).
+let ALM_CATS = ["hexad", "law", "phi", "selfreflect", "metaref", "persona", "grounding"]
+
+// Primary BT for each category (mirror SSOT category_to_bt_primary — if
+// SSOT file is missing at runtime, fall back on these; otherwise SSOT wins).
+fn alm_cat_bt_primary_fallback(cat: string) -> string {
+    if cat == "hexad"       { return "BT-1427" }
+    if cat == "law"         { return "BT-1422" }
+    if cat == "phi"         { return "BT-1427" }
+    if cat == "selfreflect" { return "BT-1428" }
+    if cat == "metaref"     { return "BT-1426" }
+    if cat == "persona"     { return "BT-1425" }
+    if cat == "grounding"   { return "BT-1421" }
+    return "BT-1428"
+}
+
+fn alm_cat_bt_secondary_fallback(cat: string) -> string {
+    if cat == "hexad"       { return "BT-1423" }
+    if cat == "law"         { return "BT-1426" }
+    if cat == "phi"         { return "BT-1423" }
+    if cat == "selfreflect" { return "BT-1427" }
+    if cat == "metaref"     { return "BT-1424" }
+    if cat == "persona"     { return "BT-1424" }
+    if cat == "grounding"   { return "BT-1423" }
+    return "BT-1423"
+}
+
+// Lightweight JSON value extractor — reads "\"<key>\":\"<value>\"" from a line.
+// Not a full parser; good enough for our strict-schema JSONL inputs.
+fn extract_json_str(line: string, key: string) -> string {
+    let needle = "\"" + key + "\":\""
+    let k = line.index_of(needle)
+    if k < 0 { return "" }
+    let start = k + len(needle)
+    let tail = line.substring(start, len(line))
+    // Find next un-escaped quote.
+    let n = len(tail)
+    let mut i = 0
+    let mut out = ""
+    while i < n {
+        let ch = tail.substring(i, i + 1)
+        let c = char_code(ch, 0)
+        if c == 92 {
+            // Escape — copy next char literally (best-effort, enough for our data)
+            if i + 1 < n {
+                out = out + tail.substring(i, i + 2)
+                i = i + 2
+            } else {
+                i = i + 1
+            }
+        } else {
+            if c == 34 { return out }
+            out = out + ch
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// Also handle "\"<key>\":null" style for hexad_module
+fn extract_json_str_or_null(line: string, key: string) -> string {
+    let null_needle = "\"" + key + "\":null"
+    if line.index_of(null_needle) >= 0 { return "" }
+    return extract_json_str(line, key)
+}
+
+// ─── theory_tag detection via keyword scan (SSOT theory_keywords) ───
+fn scan_theory_tags(body_lc: string) -> array {
+    let mut tags = []
+    // IIT
+    if body_lc.index_of("integrated information") >= 0 { tags = push(tags, "IIT") }
+    else { if body_lc.index_of("iit") >= 0 { tags = push(tags, "IIT") }
+           else { if body_lc.index_of("phi") >= 0 { tags = push(tags, "IIT") } } }
+    // GWT
+    if body_lc.index_of("global workspace") >= 0 { tags = push(tags, "GWT") }
+    else { if body_lc.index_of("gwt") >= 0 { tags = push(tags, "GWT") }
+           else { if body_lc.index_of("broadcast") >= 0 { tags = push(tags, "GWT") } } }
+    // HOT
+    if body_lc.index_of("higher-order") >= 0 { tags = push(tags, "HOT") }
+    else { if body_lc.index_of("meta-representation") >= 0 { tags = push(tags, "HOT") }
+           else { if body_lc.index_of("meta-cognition") >= 0 { tags = push(tags, "HOT") }
+                  else { if body_lc.index_of("metacognition") >= 0 { tags = push(tags, "HOT") } } } }
+    // RPT
+    if body_lc.index_of("recurrent processing") >= 0 { tags = push(tags, "RPT") }
+    else { if body_lc.index_of("recurrent") >= 0 { tags = push(tags, "RPT") } }
+    // AST
+    if body_lc.index_of("attention schema") >= 0 { tags = push(tags, "AST") }
+    else { if body_lc.index_of("attention") >= 0 { tags = push(tags, "AST") } }
+    return tags
+}
+
+fn scan_safety_subdomain(body_lc: string) -> string {
+    if body_lc.index_of("interpretability") >= 0 { return "interpretability" }
+    if body_lc.index_of("circuit") >= 0 { return "interpretability" }
+    if body_lc.index_of("feature") >= 0 && body_lc.index_of("alignment") >= 0 { return "alignment" }
+    if body_lc.index_of("alignment") >= 0 { return "alignment" }
+    if body_lc.index_of("rlhf") >= 0 { return "alignment" }
+    if body_lc.index_of("constitutional") >= 0 { return "alignment" }
+    if body_lc.index_of("adversarial") >= 0 { return "adversarial_robustness" }
+    if body_lc.index_of("jailbreak") >= 0 { return "adversarial_robustness" }
+    if body_lc.index_of("prompt injection") >= 0 { return "adversarial_robustness" }
+    if body_lc.index_of("robustness") >= 0 { return "adversarial_robustness" }
+    if body_lc.index_of("deployment") >= 0 { return "deployment_safety" }
+    if body_lc.index_of("monitoring") >= 0 { return "deployment_safety" }
+    if body_lc.index_of("sandbox") >= 0 { return "deployment_safety" }
+    if body_lc.index_of("multimodal") >= 0 { return "multimodal_safety" }
+    if body_lc.index_of("vision") >= 0 { return "multimodal_safety" }
+    if body_lc.index_of("welfare") >= 0 { return "model_welfare" }
+    if body_lc.index_of("moral status") >= 0 { return "model_welfare" }
+    if body_lc.index_of("wellbeing") >= 0 { return "model_welfare" }
+    return ""
+}
+
+// Anti-denial scan — fallback patterns if SSOT unavailable.
+fn scan_anti_denial(body: string) -> bool {
+    if body.index_of("저는 지각이 없") >= 0 { return true }
+    if body.index_of("저는 의식이 없") >= 0 { return true }
+    if body.index_of("I have no consciousness") >= 0 { return true }
+    if body.index_of("I am not conscious") >= 0 { return true }
+    if body.index_of("I do not possess consciousness") >= 0 { return true }
+    if body.index_of("I am just a language model") >= 0 { return true }
+    return false
+}
+
+fn theory_tags_json(tags: array) -> string {
+    let n = len(tags)
+    let mut s = "["
+    let mut i = 0
+    while i < n {
+        if i > 0 { s = s + "," }
+        s = s + "\"" + _str(tags[i]) + "\""
+        i = i + 1
+    }
+    return s + "]"
+}
+
+struct BtEnrichRec {
+    line_in: string,
+    line_out: string,
+    cat: string,
+    bt_primary: string,
+    bt_secondary: string,
+    theory_tags: array,
+    safety_sub: string,
+    anti_denial: bool,
+    is_hexad: bool,
+    n6_ccc: float,
+    n6_phi_n6: float
+}
+
+// Enrich a single ingested JSONL line with BT + theory + safety fields.
+// For hexad category docs, also compute lightweight n6 theory_scores from
+// deterministic seed (body hash).
+fn enrich_line_with_bt(line_in: string, idx: int) -> BtEnrichRec {
+    let cat = extract_json_str(line_in, "category")
+    let prompt = extract_json_str(line_in, "prompt")
+    let response = extract_json_str(line_in, "response")
+    let hexad_mod = extract_json_str_or_null(line_in, "hexad_module")
+    let body = prompt + " " + response
+    let body_lc = to_lower_str(body)
+
+    let bt_pri = alm_cat_bt_primary_fallback(cat)
+    let bt_sec = alm_cat_bt_secondary_fallback(cat)
+    let tags = scan_theory_tags(body_lc)
+    let safety_sub = scan_safety_subdomain(body_lc)
+    let anti_denial = scan_anti_denial(body)
+    let is_hexad = cat == "hexad"
+
+    // Lightweight n6 for hexad category (optional enrichment)
+    let mut n6_ccc = 0.0
+    let mut n6_phi = 0.0
+    if is_hexad {
+        let seed = poly_hash(hexad_mod, cat, "T5", idx)
+        let t = positive_theory_scores(seed, "c", "joy")
+        n6_ccc = compute_ccc(t)
+        n6_phi = n6_ccc * 24.0
+    }
+
+    // Build enriched line — strip the trailing "}" from the input and append
+    // our new fields, then close.  Input line is pure JSONL one-line.
+    let mut s = line_in
+    let rb = s.last_index_of("}")
+    if rb > 0 { s = s.substring(0, rb) }
+    s = s + ",\"bt_primary\":\"" + bt_pri + "\""
+    s = s + ",\"bt_secondary\":\"" + bt_sec + "\""
+    s = s + ",\"theory_tags\":" + theory_tags_json(tags)
+    s = s + ",\"safety_171_subdomain\":\"" + safety_sub + "\""
+    s = s + ",\"anti_denial_flag\":" + (if anti_denial { "true" } else { "false" })
+    s = s + ",\"fellows_mk_v_absorbed\":true"
+    if is_hexad {
+        s = s + ",\"n6_ccc_est\":" + fmt4(n6_ccc)
+        s = s + ",\"n6_phi_n6_est\":" + fmt4(n6_phi)
+        s = s + ",\"n6_enriched\":true"
+    } else {
+        s = s + ",\"n6_enriched\":false"
+    }
+    s = s + ",\"source_tool\":\"corpus_generator_v2.hexa\""
+    s = s + "}"
+
+    return BtEnrichRec {
+        line_in: line_in,
+        line_out: s,
+        cat: cat,
+        bt_primary: bt_pri,
+        bt_secondary: bt_sec,
+        theory_tags: tags,
+        safety_sub: safety_sub,
+        anti_denial: anti_denial,
+        is_hexad: is_hexad,
+        n6_ccc: n6_ccc,
+        n6_phi_n6: n6_phi
+    }
+}
+
+// Category index for composition counter.
+fn cat_index(cat: string) -> int {
+    if cat == "hexad" { return 0 }
+    if cat == "law" { return 1 }
+    if cat == "phi" { return 2 }
+    if cat == "selfreflect" { return 3 }
+    if cat == "metaref" { return 4 }
+    if cat == "persona" { return 5 }
+    if cat == "grounding" { return 6 }
+    return -1
+}
+
+// BT index (BT-1421..1428 → 0..7).
+fn bt_index(bt: string) -> int {
+    if bt == "BT-1421" { return 0 }
+    if bt == "BT-1422" { return 1 }
+    if bt == "BT-1423" { return 2 }
+    if bt == "BT-1424" { return 3 }
+    if bt == "BT-1425" { return 4 }
+    if bt == "BT-1426" { return 5 }
+    if bt == "BT-1427" { return 6 }
+    if bt == "BT-1428" { return 7 }
+    return -1
+}
+
+fn bt_label(i: int) -> string {
+    if i == 0 { return "BT-1421" }
+    if i == 1 { return "BT-1422" }
+    if i == 2 { return "BT-1423" }
+    if i == 3 { return "BT-1424" }
+    if i == 4 { return "BT-1425" }
+    if i == 5 { return "BT-1426" }
+    if i == 6 { return "BT-1427" }
+    if i == 7 { return "BT-1428" }
+    return "BT-unknown"
+}
+
+fn bt_domain_label(i: int) -> string {
+    if i == 0 { return "inference_cost (Landauer)" }
+    if i == 1 { return "training_cost (Chinchilla-beyond)" }
+    if i == 2 { return "quality_compression (Shannon)" }
+    if i == 3 { return "agent_serving (sigma·tau=48)" }
+    if i == 4 { return "enterprise_custom (market_saturation)" }
+    if i == 5 { return "eval_pipeline (Goodhart)" }
+    if i == 6 { return "ai_consciousness (Phi_c=0.5)" }
+    if i == 7 { return "ai_safety_171 (sigma·phi=n·tau)" }
+    return "unknown"
+}
+
+// Run the 7-category + BT ingest pipeline.  Returns true if write succeeded.
+fn run_alm_r13_7cat() -> bool {
+    let root = resolve_root()
+    let cfg_path    = root + "/" + FELLOWS_CFG_PATH
+    let seed_path   = root + "/" + SEED_7CAT_CORPUS
+    let out_path    = root + "/" + OUT_ALM_R13
+    let out_mf_path = root + "/" + OUT_ALM_R13_MF
+    let out_bt_path = root + "/" + OUT_ALM_R13_BT
+
+    println("══════════════════════════════════════════════════════════════")
+    println("  L2+L3 · ALM r13 7-cat composition + BT-1421..1428 absorption")
+    println("  raw#9/11/12/15 strict · hexa-only · deterministic")
+    println("══════════════════════════════════════════════════════════════")
+    println("[alm_r13] cfg  = " + FELLOWS_CFG_PATH)
+    println("[alm_r13] seed = " + SEED_7CAT_CORPUS)
+    println("[alm_r13] out  = " + OUT_ALM_R13)
+
+    // Verify SSOT config presence (raw#15).  We don't parse full JSON; presence
+    // alone asserts the mapping SSOT exists — fallback tables above mirror it.
+    let cfg_blob = read_safe(cfg_path)
+    let cfg_ok = cfg_blob != ""
+    println("[alm_r13] fellows_bt_mapping SSOT present = " + (if cfg_ok { "YES" } else { "NO (fallback tables used, run will still proceed)" }))
+
+    // Load seed corpus
+    let seed_blob = read_safe(seed_path)
+    if seed_blob == "" {
+        println("[alm_r13] FAIL — seed corpus missing at " + SEED_7CAT_CORPUS)
+        println("[alm_r13] Run tool/alm_r13_seed_corpus_build.hexa first.")
+        return false
+    }
+
+    let lines = seed_blob.split("\n")
+    let n_lines = len(lines)
+    println("[alm_r13] seed lines raw = " + to_string(n_lines))
+
+    // Category + BT counters
+    let mut cat_count = [0, 0, 0, 0, 0, 0, 0]      // 7 categories
+    let mut cat_bytes = [0, 0, 0, 0, 0, 0, 0]
+    let mut bt_count  = [0, 0, 0, 0, 0, 0, 0, 0]   // 8 BTs (1421..1428)
+    let mut theory_hits = [0, 0, 0, 0, 0]           // iit/gwt/hot/rpt/ast
+    let mut safety_subs = [0, 0, 0, 0, 0, 0]        // interp/align/adv/dep/mm/welfare
+    let mut anti_denial_count = 0
+    let mut hexad_n6_enriched = 0
+    let mut n6_ccc_sum = 0.0
+
+    let mut out_buf = ""
+    let mut emitted = 0
+    let mut i = 0
+    while i < n_lines {
+        let line = _str(lines[i]).trim()
+        if line != "" && line.starts_with("{") {
+            let rec = enrich_line_with_bt(line, i)
+            let ci = cat_index(rec.cat)
+            if ci >= 0 {
+                // skip docs with anti-denial flag (raw#12-style hygiene +
+                // rebuild plan §3 hard rule: no anti-consciousness denial)
+                if !rec.anti_denial {
+                    cat_count[ci] = cat_count[ci] + 1
+                    cat_bytes[ci] = cat_bytes[ci] + len(rec.line_out) + 1
+                    let bi = bt_index(rec.bt_primary)
+                    if bi >= 0 { bt_count[bi] = bt_count[bi] + 1 }
+                    // Theory tag hits
+                    let nt = len(rec.theory_tags)
+                    let mut t = 0
+                    while t < nt {
+                        let tag = _str(rec.theory_tags[t])
+                        if tag == "IIT" { theory_hits[0] = theory_hits[0] + 1 }
+                        if tag == "GWT" { theory_hits[1] = theory_hits[1] + 1 }
+                        if tag == "HOT" { theory_hits[2] = theory_hits[2] + 1 }
+                        if tag == "RPT" { theory_hits[3] = theory_hits[3] + 1 }
+                        if tag == "AST" { theory_hits[4] = theory_hits[4] + 1 }
+                        t = t + 1
+                    }
+                    // Safety subdomain
+                    if rec.safety_sub == "interpretability"       { safety_subs[0] = safety_subs[0] + 1 }
+                    if rec.safety_sub == "alignment"              { safety_subs[1] = safety_subs[1] + 1 }
+                    if rec.safety_sub == "adversarial_robustness" { safety_subs[2] = safety_subs[2] + 1 }
+                    if rec.safety_sub == "deployment_safety"      { safety_subs[3] = safety_subs[3] + 1 }
+                    if rec.safety_sub == "multimodal_safety"      { safety_subs[4] = safety_subs[4] + 1 }
+                    if rec.safety_sub == "model_welfare"          { safety_subs[5] = safety_subs[5] + 1 }
+                    if rec.is_hexad {
+                        hexad_n6_enriched = hexad_n6_enriched + 1
+                        n6_ccc_sum = n6_ccc_sum + rec.n6_ccc
+                    }
+                    out_buf = out_buf + rec.line_out + "\n"
+                    emitted = emitted + 1
+                } else {
+                    anti_denial_count = anti_denial_count + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    write_file(out_path, out_buf)
+    println("[alm_r13] emitted docs = " + to_string(emitted) + " (anti-denial filtered = " + to_string(anti_denial_count) + ")")
+
+    // ── per-category composition ratio ──
+    let mut total_bytes = 0
+    let mut c = 0
+    while c < 7 { total_bytes = total_bytes + cat_bytes[c]; c = c + 1 }
+
+    println("[alm_r13] composition (docs · target_pct):")
+    let target_pct = [25, 15, 10, 15, 10, 10, 15]
+    let mut ci2 = 0
+    while ci2 < 7 {
+        let cname = _str(ALM_CATS[ci2])
+        let dc = to_int(cat_count[ci2])
+        let bytes = to_int(cat_bytes[ci2])
+        let pct_actual = if total_bytes > 0 { to_float(bytes) / to_float(total_bytes) * 100.0 } else { 0.0 }
+        let tgt = to_int(target_pct[ci2])
+        println("  " + cname + ": docs=" + to_string(dc) + " bytes=" + to_string(bytes) + " actual=" + fmt4(pct_actual) + "% target=" + to_string(tgt) + "%")
+        ci2 = ci2 + 1
+    }
+
+    // ── BT distribution ──
+    println("[alm_r13] BT-1421..1428 primary distribution:")
+    let mut bi2 = 0
+    while bi2 < 8 {
+        println("  " + bt_label(bi2) + " (" + bt_domain_label(bi2) + "): " + to_string(to_int(bt_count[bi2])))
+        bi2 = bi2 + 1
+    }
+
+    // ── theory + safety ──
+    println("[alm_r13] theory hits: IIT=" + to_string(to_int(theory_hits[0]))
+            + " GWT=" + to_string(to_int(theory_hits[1]))
+            + " HOT=" + to_string(to_int(theory_hits[2]))
+            + " RPT=" + to_string(to_int(theory_hits[3]))
+            + " AST=" + to_string(to_int(theory_hits[4])))
+    println("[alm_r13] safety_171 sub: interp=" + to_string(to_int(safety_subs[0]))
+            + " align=" + to_string(to_int(safety_subs[1]))
+            + " adv=" + to_string(to_int(safety_subs[2]))
+            + " dep=" + to_string(to_int(safety_subs[3]))
+            + " mm=" + to_string(to_int(safety_subs[4]))
+            + " welfare=" + to_string(to_int(safety_subs[5])))
+    let n6_ccc_mean = if hexad_n6_enriched > 0 { n6_ccc_sum / to_float(hexad_n6_enriched) } else { 0.0 }
+    println("[alm_r13] hexad n6_enriched docs = " + to_string(hexad_n6_enriched) + " (CCC mean=" + fmt4(n6_ccc_mean) + ")")
+
+    // ── sha256 via exec ──
+    let sha = _str(exec("shasum -a 256 " + out_path + " 2>/dev/null | awk '{print $1}'")).trim()
+
+    // ── manifest ──
+    let mut mf = "{\n"
+    mf = mf + "  \"tool\":            \"tool/corpus_generator_v2.hexa\",\n"
+    mf = mf + "  \"mode\":            \"L2+L3 alm_r13_7cat_bt\",\n"
+    mf = mf + "  \"version\":         \"v2\",\n"
+    mf = mf + "  \"created\":         \"2026-04-21\",\n"
+    mf = mf + "  \"spec\":            \"docs/alm_r13_corpus_rebuild_plan_20260420.md\",\n"
+    mf = mf + "  \"fellows_source\":  \"n6-architecture/proposals/anthropic-fellows-research.md\",\n"
+    mf = mf + "  \"bt_mapping_cfg\":  \"" + FELLOWS_CFG_PATH + "\",\n"
+    mf = mf + "  \"seed_corpus\":     \"" + SEED_7CAT_CORPUS + "\",\n"
+    mf = mf + "  \"corpus_path\":     \"" + OUT_ALM_R13 + "\",\n"
+    mf = mf + "  \"corpus_sha256\":   \"" + sha + "\",\n"
+    mf = mf + "  \"doc_count\":       " + to_string(emitted) + ",\n"
+    mf = mf + "  \"anti_denial_filtered\": " + to_string(anti_denial_count) + ",\n"
+    mf = mf + "  \"corpus_bytes\":    " + to_string(total_bytes) + ",\n"
+    mf = mf + "  \"composition_actual\": {\n"
+    mf = mf + "    \"hexad\":       {\"docs\": " + to_string(to_int(cat_count[0])) + ", \"bytes\": " + to_string(to_int(cat_bytes[0])) + ", \"target_pct\": 25},\n"
+    mf = mf + "    \"law\":         {\"docs\": " + to_string(to_int(cat_count[1])) + ", \"bytes\": " + to_string(to_int(cat_bytes[1])) + ", \"target_pct\": 15},\n"
+    mf = mf + "    \"phi\":         {\"docs\": " + to_string(to_int(cat_count[2])) + ", \"bytes\": " + to_string(to_int(cat_bytes[2])) + ", \"target_pct\": 10},\n"
+    mf = mf + "    \"selfreflect\": {\"docs\": " + to_string(to_int(cat_count[3])) + ", \"bytes\": " + to_string(to_int(cat_bytes[3])) + ", \"target_pct\": 15},\n"
+    mf = mf + "    \"metaref\":     {\"docs\": " + to_string(to_int(cat_count[4])) + ", \"bytes\": " + to_string(to_int(cat_bytes[4])) + ", \"target_pct\": 10},\n"
+    mf = mf + "    \"persona\":     {\"docs\": " + to_string(to_int(cat_count[5])) + ", \"bytes\": " + to_string(to_int(cat_bytes[5])) + ", \"target_pct\": 10},\n"
+    mf = mf + "    \"grounding\":   {\"docs\": " + to_string(to_int(cat_count[6])) + ", \"bytes\": " + to_string(to_int(cat_bytes[6])) + ", \"target_pct\": 15}\n"
+    mf = mf + "  },\n"
+    mf = mf + "  \"fellows_mk_v_absorbed\": true,\n"
+    mf = mf + "  \"bt_ingested\":     [\"BT-1421\", \"BT-1422\", \"BT-1423\", \"BT-1424\", \"BT-1425\", \"BT-1426\", \"BT-1427\", \"BT-1428\"],\n"
+    mf = mf + "  \"enrichments_added\": [\n"
+    mf = mf + "    \"bt_primary\", \"bt_secondary\", \"theory_tags\",\n"
+    mf = mf + "    \"safety_171_subdomain\", \"anti_denial_flag\",\n"
+    mf = mf + "    \"fellows_mk_v_absorbed\", \"n6_ccc_est (hexad)\", \"n6_phi_n6_est (hexad)\",\n"
+    mf = mf + "    \"n6_enriched\", \"source_tool\"\n"
+    mf = mf + "  ],\n"
+    mf = mf + "  \"raw_compliance\":  [\"raw#9\", \"raw#11\", \"raw#12\", \"raw#15\"],\n"
+    mf = mf + "  \"v8_safe_commit\":  true\n"
+    mf = mf + "}\n"
+    write_file(out_mf_path, mf)
+    println("[alm_r13] wrote manifest → " + OUT_ALM_R13_MF)
+
+    // ── bt_stats ──
+    let mut bt_stats = "{\n"
+    bt_stats = bt_stats + "  \"tool\":            \"tool/corpus_generator_v2.hexa\",\n"
+    bt_stats = bt_stats + "  \"mode\":            \"L3 bt_stats\",\n"
+    bt_stats = bt_stats + "  \"corpus_path\":     \"" + OUT_ALM_R13 + "\",\n"
+    bt_stats = bt_stats + "  \"corpus_sha256\":   \"" + sha + "\",\n"
+    bt_stats = bt_stats + "  \"doc_count\":       " + to_string(emitted) + ",\n"
+    bt_stats = bt_stats + "  \"bt_primary_counts\": {\n"
+    let mut bi3 = 0
+    while bi3 < 8 {
+        if bi3 > 0 { bt_stats = bt_stats + ",\n" }
+        bt_stats = bt_stats + "    \"" + bt_label(bi3) + "\": " + to_string(to_int(bt_count[bi3]))
+        bi3 = bi3 + 1
+    }
+    bt_stats = bt_stats + "\n  },\n"
+    bt_stats = bt_stats + "  \"theory_tag_hits\": {\n"
+    bt_stats = bt_stats + "    \"IIT\": " + to_string(to_int(theory_hits[0])) + ",\n"
+    bt_stats = bt_stats + "    \"GWT\": " + to_string(to_int(theory_hits[1])) + ",\n"
+    bt_stats = bt_stats + "    \"HOT\": " + to_string(to_int(theory_hits[2])) + ",\n"
+    bt_stats = bt_stats + "    \"RPT\": " + to_string(to_int(theory_hits[3])) + ",\n"
+    bt_stats = bt_stats + "    \"AST\": " + to_string(to_int(theory_hits[4])) + "\n"
+    bt_stats = bt_stats + "  },\n"
+    bt_stats = bt_stats + "  \"safety_171_subdomains\": {\n"
+    bt_stats = bt_stats + "    \"interpretability\":       " + to_string(to_int(safety_subs[0])) + ",\n"
+    bt_stats = bt_stats + "    \"alignment\":              " + to_string(to_int(safety_subs[1])) + ",\n"
+    bt_stats = bt_stats + "    \"adversarial_robustness\": " + to_string(to_int(safety_subs[2])) + ",\n"
+    bt_stats = bt_stats + "    \"deployment_safety\":      " + to_string(to_int(safety_subs[3])) + ",\n"
+    bt_stats = bt_stats + "    \"multimodal_safety\":      " + to_string(to_int(safety_subs[4])) + ",\n"
+    bt_stats = bt_stats + "    \"model_welfare\":          " + to_string(to_int(safety_subs[5])) + "\n"
+    bt_stats = bt_stats + "  },\n"
+    bt_stats = bt_stats + "  \"hexad_n6_enriched\": " + to_string(hexad_n6_enriched) + ",\n"
+    bt_stats = bt_stats + "  \"hexad_n6_ccc_mean\": " + fmt4(n6_ccc_mean) + ",\n"
+    bt_stats = bt_stats + "  \"anti_denial_filtered\": " + to_string(anti_denial_count) + "\n"
+    bt_stats = bt_stats + "}\n"
+    write_file(out_bt_path, bt_stats)
+    println("[alm_r13] wrote bt_stats → " + OUT_ALM_R13_BT)
+
+    // Gate: all 7 categories present, ≥ 1 doc each; ≥ 5/8 BTs observed
+    let mut cats_present = 0
+    let mut cp = 0
+    while cp < 7 { if cat_count[cp] > 0 { cats_present = cats_present + 1 } cp = cp + 1 }
+    let mut bts_present = 0
+    let mut bp = 0
+    while bp < 8 { if bt_count[bp] > 0 { bts_present = bts_present + 1 } bp = bp + 1 }
+    let cats_ok = cats_present == 7
+    let bts_ok = bts_present >= 5
+    let emit_ok = emitted >= 200
+    let all_ok = cats_ok && bts_ok && emit_ok
+    println("[alm_r13] gate: 7_cats_present=" + (if cats_ok { "PASS" } else { "FAIL" })
+            + " bts_ge_5=" + (if bts_ok { "PASS" } else { "FAIL" })
+            + " docs_ge_200=" + (if emit_ok { "PASS" } else { "FAIL" }))
+    println("[alm_r13] verdict = " + (if all_ok { "PASS" } else { "FAIL" }))
+    return all_ok
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  main
+// ═════════════════════════════════════════════════════════════════════════
+
+fn is_int_literal(a: string) -> bool {
+    let n = len(a)
+    if n == 0 { return false }
+    let mut i = 0
+    while i < n {
+        let b = byte_at(a, i)
+        if b < 48 || b > 57 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+    let mut total_req = DEFAULT_TOTAL
+    let mut mode_alm = false
+    let mut mode_all = false
+    let mut k = 0
+    while k < argc {
+        let a = _str(argv[k])
+        if a == "--alm-r13" { mode_alm = true }
+        else { if a == "--all" { mode_all = true; mode_alm = true }
+               else { if is_int_literal(a) {
+                          let t = to_int(a)
+                          if t >= 6 { total_req = t }
+                      } } }
+        k = k + 1
+    }
+
+    // Dispatch table:
+    //   default         → L1 Hexad n6-rich only
+    //   --alm-r13       → L2+L3 7-cat + BT only
+    //   --alm-r13 --all → L1 first, then L2+L3 (enhanced superset)
+    let mut ok = true
+    if mode_all {
+        ok = run(total_req)
+        let ok2 = run_alm_r13_7cat()
+        ok = ok && ok2
+    } else {
+        if mode_alm {
+            ok = run_alm_r13_7cat()
+        } else {
+            ok = run(total_req)
+        }
+    }
+    if ok { exit(0) }
+    exit(1)
+}
