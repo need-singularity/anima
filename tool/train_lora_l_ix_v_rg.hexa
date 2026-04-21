@@ -1,0 +1,1058 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/train_lora_l_ix_v_rg.hexa
+//  AN-LIX-01 — L_IX V_RG term 을 LoRA 학습 loss 에 regularizer 로 추가.
+//  Seed ζ 첫 실증: anima training 경로에 L_IX 첫 embedding.
+//
+//  DESIGN
+//    loss_reported = CE + β_r · V_RG_detached
+//      - V_RG 는 edu/cell/lagrangian/v_rg.hexa 의 정수 ×1000 고정소수점 API.
+//      - detach-scalar: gradient 는 CE only → trajectory 동일.
+//      - V_RG 는 매 measure_every step 마다 ν̂_layer 를 측정해서 갱신,
+//        나머지 step 은 cache 사용 (brief 규격 "매 N=100 step 마다 측정").
+//
+//    ν̂_layer (proxy for correlation-length exponent)
+//      hidden activation h[H] 를 배치 전반에 걸쳐 모음 → per-dim variance
+//      σ_i² → log-log slope of log(σ_i²) vs log(i+1) → ν̂.
+//      tiny-model char-bigram 에서 H=4 이므로 정확한 critical scaling 은
+//      불가능하나, 첫 embedding 목적상 "ν̂ 추적 가능" 을 증명.
+//      (layer 가 1 개이므로 ν̂_layer = ν̂_hidden 하나만 측정.)
+//
+//  CONFIG (raw#15 no hardcode)
+//    shared/config/an_lix_01_config.json — {beta_r, measure_every, nu_star,
+//    α/β/γ ×1000, enable, gates}.
+//    env NEXUS_ANLIX_BETA_R 로 β_r override 가능.
+//
+//  CORPUS
+//    experiments/alm_r13/seed_corpus_10mb/corpus.jsonl (1.7MB)
+//    smoke: 100 sample subset, 10 step.
+//
+//  OUTPUT
+//    shared/state/an_lix_01_smoke_result.json
+//      - β_r=0 baseline, β_r=0.01 treatment 비교
+//      - ν̂_layer trajectory (initial / 5 step / 10 step)
+//      - val_ppl before/after, Δppl
+//      - V_RG_x1000 trajectory
+//
+//  DEPENDS
+//    edu/cell/lagrangian/v_rg.hexa — V_RG API (hierarchical, ×1000)
+//    edu/lora/train_lora_cpu.hexa — LoRA CPU training 기반 (코드 공유)
+//
+//  USAGE
+//    hexa run tool/train_lora_l_ix_v_rg.hexa          # full smoke (both arms)
+//    hexa run tool/train_lora_l_ix_v_rg.hexa baseline # β_r=0 only
+//    hexa run tool/train_lora_l_ix_v_rg.hexa treated  # β_r from config
+//
+//  raw#9 strict · hexa-only · snake_case · LLM=none · CPU-only · deterministic
+// ════════════════════════════════════════════════════════════════════════════
+
+let REPO_ROOT  = "/Users/ghost/core/anima"
+let CORPUS_PATH = REPO_ROOT + "/experiments/alm_r13/seed_corpus_10mb/corpus.jsonl"
+let CONFIG_PATH = "/Users/ghost/core/anima/.claude/worktrees/an-lix-01-v-rg-reg/shared/config/an_lix_01_config.json"
+let OUT_PATH    = "/Users/ghost/core/anima/.claude/worktrees/an-lix-01-v-rg-reg/shared/state/an_lix_01_smoke_result.json"
+
+// model dims (mirror edu/lora/train_lora_cpu.hexa — V=8, H=4)
+let V = 8
+let H = 4
+
+// ── string helpers ──────────────────────────────────────────────────────
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn env_str(name: string) -> string {
+    let v = env(name)
+    return _str(v)
+}
+
+// ── tiny JSON getters (numeric / string) — robust enough for flat config ─
+fn json_get_int(blob: string, key: string, fallback: int) -> int {
+    let needle = "\"" + key + "\""
+    let k = blob.index_of(needle)
+    if k < 0 { return fallback }
+    let tail = blob.substring(k, len(blob))
+    let colon = tail.index_of(":")
+    if colon < 0 { return fallback }
+    // scan forward: skip whitespace, read digits (optionally leading '-')
+    let mut i = colon + 1
+    let n = len(tail)
+    // skip spaces
+    while i < n {
+        let c = tail.byte_at(i)
+        if c != 32 { if c != 9 { break } }
+        i = i + 1
+    }
+    let mut neg = false
+    if i < n {
+        if tail.byte_at(i) == 45 { neg = true; i = i + 1 }
+    }
+    let mut acc = 0
+    let mut any = false
+    while i < n {
+        let c = tail.byte_at(i)
+        if c < 48 { break }
+        if c > 57 { break }
+        acc = acc * 10 + (c - 48)
+        any = true
+        i = i + 1
+    }
+    if !any { return fallback }
+    if neg { return 0 - acc }
+    return acc
+}
+
+// Parse float written as "x.y" (e.g. "0.01") into x1000 fixed-point int.
+fn json_get_float_x1000(blob: string, key: string, fallback_x1000: int) -> int {
+    let needle = "\"" + key + "\""
+    let k = blob.index_of(needle)
+    if k < 0 { return fallback_x1000 }
+    let tail = blob.substring(k, len(blob))
+    let colon = tail.index_of(":")
+    if colon < 0 { return fallback_x1000 }
+    let mut i = colon + 1
+    let n = len(tail)
+    while i < n {
+        let c = tail.byte_at(i)
+        if c != 32 { if c != 9 { break } }
+        i = i + 1
+    }
+    let mut neg = false
+    if i < n {
+        if tail.byte_at(i) == 45 { neg = true; i = i + 1 }
+    }
+    let mut whole = 0
+    let mut any = false
+    while i < n {
+        let c = tail.byte_at(i)
+        if c < 48 { break }
+        if c > 57 { break }
+        whole = whole * 10 + (c - 48)
+        any = true
+        i = i + 1
+    }
+    let mut frac = 0
+    let mut frac_digits = 0
+    if i < n {
+        if tail.byte_at(i) == 46 {
+            i = i + 1
+            while i < n {
+                let c2 = tail.byte_at(i)
+                if c2 < 48 { break }
+                if c2 > 57 { break }
+                if frac_digits < 6 {
+                    frac = frac * 10 + (c2 - 48)
+                    frac_digits = frac_digits + 1
+                }
+                i = i + 1
+            }
+        }
+    }
+    if !any { if frac_digits == 0 { return fallback_x1000 } }
+    // scale frac to 3 digits (×1000 semantics)
+    let mut f3 = frac
+    while frac_digits < 3 { f3 = f3 * 10; frac_digits = frac_digits + 1 }
+    while frac_digits > 3 { f3 = f3 / 10; frac_digits = frac_digits - 1 }
+    let val = whole * 1000 + f3
+    if neg { return 0 - val }
+    return val
+}
+
+// ── V_RG fixed-point primitives (copy from edu/cell/lagrangian/v_rg.hexa) ─
+// Inlined here because hexa has no module import in stage0.
+fn _vrg_iabs(x: int) -> int { if x < 0 { return 0 - x } return x }
+
+fn _vrg_exp_neg_x1000(x_x1000: int) -> int {
+    let x = x_x1000
+    if x <= 0 { return 1000 }
+    if x >= 5000 { return 7 }
+    if x < 50    { return 975 }
+    if x < 100   { return 951 }
+    if x < 150   { return 905 }
+    if x < 200   { return 861 }
+    if x < 250   { return 819 }
+    if x < 300   { return 779 }
+    if x < 350   { return 741 }
+    if x < 400   { return 705 }
+    if x < 450   { return 670 }
+    if x < 500   { return 638 }
+    if x < 600   { return 585 }
+    if x < 700   { return 529 }
+    if x < 800   { return 478 }
+    if x < 900   { return 433 }
+    if x < 1000  { return 392 }
+    if x < 1200  { return 333 }
+    if x < 1400  { return 273 }
+    if x < 1600  { return 223 }
+    if x < 1800  { return 183 }
+    if x < 2000  { return 150 }
+    if x < 2500  { return 105 }
+    if x < 3000  { return 64 }
+    if x < 3500  { return 39 }
+    if x < 4000  { return 24 }
+    if x < 4500  { return 14 }
+    return 9
+}
+
+fn v_rg_term_nu_x1000(nu_ppm: int, nu_star_ppm: int, alpha_x1000: int) -> int {
+    let d = _vrg_iabs(nu_ppm - nu_star_ppm)
+    let d2_half = (d * d) / 1000
+    return (alpha_x1000 * d2_half) / 1000
+}
+
+fn v_rg_term_phi_x1000(dphi_ppm: int, beta_x1000: int) -> int {
+    let d = _vrg_iabs(dphi_ppm)
+    let one_minus = if d >= 1000 { 0 } else { 1000 - d }
+    return (beta_x1000 * one_minus) / 1000
+}
+
+fn v_rg_term_xi_x1000(xi_x1000: int, n_level: int, gamma_x1000: int) -> int {
+    if n_level <= 0 { return 0 }
+    let x_over_n_x1000 = xi_x1000 / n_level
+    let e = _vrg_exp_neg_x1000(x_over_n_x1000)
+    return (gamma_x1000 * e) / 1000
+}
+
+fn v_rg_x1000(nu_ppm: int, dphi_ppm: int, xi_x1000: int, n_level: int,
+              alpha_x1000: int, beta_x1000: int, gamma_x1000: int) -> int {
+    let nu_star = 1000
+    let t1 = v_rg_term_nu_x1000(nu_ppm, nu_star, alpha_x1000)
+    let t2 = v_rg_term_phi_x1000(dphi_ppm, beta_x1000)
+    let t3 = v_rg_term_xi_x1000(xi_x1000, n_level, gamma_x1000)
+    return t1 + t2 + t3
+}
+
+// ── tensor primitives (mirror edu/lora/train_lora_cpu.hexa) ──────────────
+fn t_zeros(n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n { out = out.push(0.0); i = i + 1 }
+    return out
+}
+
+fn t_randn(n: int, seed: int) -> array {
+    let mut out = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u1_raw = to_float(s % 1000000) / 1000000.0
+        let u1 = if u1_raw < 0.000001 { 0.000001 } else { u1_raw }
+        s = (s * 1103515245 + 12345) % 2147483648
+        let u2 = to_float(s % 1000000) / 1000000.0
+        let r = sqrt(0.0 - 2.0 * log(u1))
+        let theta = 2.0 * 3.141592653589793 * u2
+        out = out.push(r * cos(theta))
+        i = i + 1
+    }
+    return out
+}
+
+fn t_scale(a: array, s: float) -> array {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n { out = out.push(a[i] * s); i = i + 1 }
+    return out
+}
+
+fn log_softmax_row(row: array) -> array {
+    let n = len(row)
+    let mut mx = row[0]
+    let mut k = 1
+    while k < n { if row[k] > mx { mx = row[k] } ; k = k + 1 }
+    let mut s = 0.0
+    let mut exps = []
+    let mut i = 0
+    while i < n {
+        let e = pow(2.718281828459045, row[i] - mx)
+        exps = exps.push(e)
+        s = s + e
+        i = i + 1
+    }
+    let lse = mx + log(s)
+    let mut out = []
+    let mut j = 0
+    while j < n { out = out.push(row[j] - lse); j = j + 1 }
+    return out
+}
+
+fn softmax_row(row: array) -> array {
+    let n = len(row)
+    let mut mx = row[0]
+    let mut k = 1
+    while k < n { if row[k] > mx { mx = row[k] } ; k = k + 1 }
+    let mut s = 0.0
+    let mut exps = []
+    let mut i = 0
+    while i < n {
+        let e = pow(2.718281828459045, row[i] - mx)
+        exps = exps.push(e)
+        s = s + e
+        i = i + 1
+    }
+    let mut out = []
+    let mut j = 0
+    while j < n { out = out.push(exps[j] / s); j = j + 1 }
+    return out
+}
+
+fn tanh_f(x: float) -> float {
+    let e1 = pow(2.718281828459045, x)
+    let e2 = pow(2.718281828459045, 0.0 - x)
+    return (e1 - e2) / (e1 + e2)
+}
+
+fn argmax(a: array) -> int {
+    let n = len(a)
+    let mut best = 0
+    let mut bv = a[0]
+    let mut i = 1
+    while i < n { if a[i] > bv { bv = a[i] ; best = i } ; i = i + 1 }
+    return best
+}
+
+// ── Vocab: V=8 fold bucket (mirror train_lora_cpu.hexa byte_to_class) ────
+fn byte_to_class(b: int) -> int {
+    if b == 65 { return 0 } ; if b == 97 { return 0 }
+    if b == 69 { return 0 } ; if b == 101 { return 0 }
+    if b == 73 { return 0 } ; if b == 105 { return 0 }
+    if b == 79 { return 0 } ; if b == 111 { return 0 }
+    if b == 85 { return 0 } ; if b == 117 { return 0 }
+    if b >= 65 { if b <= 90 { return 1 + ((b - 65) % 3) } }
+    if b >= 97 { if b <= 122 { return 1 + ((b - 97) % 3) } }
+    if b >= 48 { if b <= 57 { return 4 } }
+    if b == 32 { return 5 } ; if b == 9 { return 5 } ; if b == 10 { return 5 }
+    if b == 46 { return 6 } ; if b == 44 { return 6 }
+    if b == 59 { return 6 } ; if b == 58 { return 6 }
+    if b == 33 { return 6 } ; if b == 63 { return 6 }
+    return 7
+}
+
+fn make_pairs(text: string, max_pairs: int) -> array {
+    let n = text.len()
+    let mut out = []
+    let mut i = 0
+    let limit = if n - 1 > max_pairs { max_pairs } else { n - 1 }
+    while i < limit {
+        let b0 = text.byte_at(i)
+        let b1 = text.byte_at(i + 1)
+        out = out.push(byte_to_class(b0))
+        out = out.push(byte_to_class(b1))
+        i = i + 1
+    }
+    return out
+}
+
+fn corpus_slice(raw: string, filter: string, per_line_char: int, max_lines: int) -> string {
+    let lines = raw.split("\n")
+    let n_lines = len(lines)
+    let mut out = ""
+    let mut taken = 0
+    let mut i = 0
+    while i < n_lines {
+        if taken >= max_lines { return out }
+        let line = lines[i]
+        if line.len() > 20 {
+            let matched = if filter == "*" { true } else { line.contains(filter) }
+            if matched {
+                let take = if line.len() > per_line_char { per_line_char } else { line.len() }
+                out = out + line.substring(0, take) + " "
+                taken = taken + 1
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Base + LoRA structs (mirror) ─────────────────────────────────────────
+struct Base {
+    emb: array,
+    w:   array,
+    b:   array
+}
+
+fn base_init(seed: int) -> Base {
+    let s_emb = 1.0 / sqrt(to_float(V))
+    let s_w   = 1.0 / sqrt(to_float(H))
+    return Base {
+        emb: t_scale(t_randn(V * H, seed), s_emb),
+        w:   t_scale(t_randn(H * V, seed + 1), s_w),
+        b:   t_zeros(V)
+    }
+}
+
+struct Fwd {
+    hidden: array,
+    logits: array
+}
+
+fn base_forward_with_adapter(m: Base, adA: array, adB: array, r: int, alpha: float, prev_cls: int) -> Fwd {
+    let mut h = t_zeros(H)
+    let mut k = 0
+    while k < H { let e = m.emb[prev_cls * H + k] ; h[k] = tanh_f(e) ; k = k + 1 }
+    let mut logits = t_zeros(V)
+    let mut j = 0
+    while j < V {
+        let mut acc = m.b[j]
+        let mut kk = 0
+        while kk < H { acc = acc + h[kk] * m.w[kk * V + j] ; kk = kk + 1 }
+        logits[j] = acc
+        j = j + 1
+    }
+    if r > 0 {
+        let mut hr = t_zeros(r)
+        let mut i2 = 0
+        while i2 < r {
+            let mut acc = 0.0
+            let mut kk2 = 0
+            while kk2 < H { acc = acc + h[kk2] * adB[kk2 * r + i2] ; kk2 = kk2 + 1 }
+            hr[i2] = acc
+            i2 = i2 + 1
+        }
+        let scale = alpha / to_float(r)
+        let mut j2 = 0
+        while j2 < V {
+            let mut acc = 0.0
+            let mut ii = 0
+            while ii < r { acc = acc + hr[ii] * adA[ii * V + j2] ; ii = ii + 1 }
+            logits[j2] = logits[j2] + scale * acc
+            j2 = j2 + 1
+        }
+    }
+    return Fwd { hidden: h, logits: logits }
+}
+
+fn base_forward(m: Base, prev_cls: int) -> Fwd {
+    let empty = t_zeros(1)
+    return base_forward_with_adapter(m, empty, empty, 0, 0.0, prev_cls)
+}
+
+struct Eval {
+    ce: float,
+    ppl: float,
+    acc: float
+}
+
+fn eval_base(m: Base, adA: array, adB: array, r: int, alpha: float, pairs: array) -> Eval {
+    let n_pair = len(pairs) / 2
+    let mut total_ce = 0.0
+    let mut correct = 0
+    let mut i = 0
+    while i < n_pair {
+        let prev = pairs[i * 2]
+        let tgt  = pairs[i * 2 + 1]
+        let f = base_forward_with_adapter(m, adA, adB, r, alpha, prev)
+        let lp = log_softmax_row(f.logits)
+        total_ce = total_ce - lp[tgt]
+        if argmax(f.logits) == tgt { correct = correct + 1 }
+        i = i + 1
+    }
+    let ce_mean = total_ce / to_float(n_pair)
+    let ppl = pow(2.718281828459045, ce_mean)
+    let acc = to_float(correct) / to_float(n_pair)
+    return Eval { ce: ce_mean, ppl: ppl, acc: acc }
+}
+
+fn train_base(m0: Base, pairs: array, lr: float, steps: int, batch: int) -> Base {
+    let mut m = m0
+    let n_pair = len(pairs) / 2
+    let mut step = 0
+    while step < steps {
+        let mut g_emb = t_zeros(V * H)
+        let mut g_w   = t_zeros(H * V)
+        let mut g_b   = t_zeros(V)
+        let mut bi = 0
+        while bi < batch {
+            let idx = (step * batch + bi) % n_pair
+            let prev = pairs[idx * 2]
+            let tgt  = pairs[idx * 2 + 1]
+            let f = base_forward(m, prev)
+            let p = softmax_row(f.logits)
+            let mut dl = t_zeros(V)
+            let mut j = 0
+            while j < V { dl[j] = p[j] ; j = j + 1 }
+            dl[tgt] = dl[tgt] - 1.0
+            let mut j2 = 0
+            while j2 < V { g_b[j2] = g_b[j2] + dl[j2] ; j2 = j2 + 1 }
+            let mut hh = 0
+            while hh < H {
+                let mut jj = 0
+                while jj < V {
+                    g_w[hh * V + jj] = g_w[hh * V + jj] + f.hidden[hh] * dl[jj]
+                    jj = jj + 1
+                }
+                hh = hh + 1
+            }
+            let mut dh = t_zeros(H)
+            let mut kk = 0
+            while kk < H {
+                let mut acc = 0.0
+                let mut jjj = 0
+                while jjj < V { acc = acc + dl[jjj] * m.w[kk * V + jjj] ; jjj = jjj + 1 }
+                dh[kk] = acc * (1.0 - f.hidden[kk] * f.hidden[kk])
+                kk = kk + 1
+            }
+            let mut km = 0
+            while km < H { g_emb[prev * H + km] = g_emb[prev * H + km] + dh[km] ; km = km + 1 }
+            bi = bi + 1
+        }
+        let scale = lr / to_float(batch)
+        let mut ie = 0
+        while ie < V * H { m.emb[ie] = m.emb[ie] - scale * g_emb[ie] ; ie = ie + 1 }
+        let mut iw = 0
+        while iw < H * V { m.w[iw] = m.w[iw] - scale * g_w[iw] ; iw = iw + 1 }
+        let mut ib = 0
+        while ib < V { m.b[ib] = m.b[ib] - scale * g_b[ib] ; ib = ib + 1 }
+        step = step + 1
+    }
+    return m
+}
+
+// ── LoRA adapter ─────────────────────────────────────────────────────────
+struct Lora {
+    A: array,
+    B: array,
+    r: int,
+    alpha: float
+}
+
+fn lora_init(r: int, alpha: float, seed: int) -> Lora {
+    let s = 1.0 / sqrt(to_float(V))
+    return Lora {
+        A: t_scale(t_randn(r * V, seed), s),
+        B: t_zeros(H * r),
+        r: r,
+        alpha: alpha
+    }
+}
+
+// ── ν̂ measurement: log-log slope of hidden per-dim variance vs dim index ─
+// 샘플 배치 전반의 hidden[H] 누적 → per-dim variance σ_i² →
+// slope of log(σ_i² + ε) vs log(i+1) → ν̂.
+// Returns nu_ppm ∈ [0, 3000].  Critical point ν̂ ≈ 1000 (slope ≈ 1.0).
+fn measure_nu_ppm(m: Base, adA: array, adB: array, r: int, alpha: float,
+                  pairs: array, n_samples: int) -> int {
+    let n_pair = len(pairs) / 2
+    let take = if n_samples > n_pair { n_pair } else { n_samples }
+    // accumulate sum and sum_sq per dim
+    let mut sum_h = t_zeros(H)
+    let mut sum_h2 = t_zeros(H)
+    let mut i = 0
+    while i < take {
+        let prev = pairs[i * 2]
+        let f = base_forward_with_adapter(m, adA, adB, r, alpha, prev)
+        let mut k = 0
+        while k < H {
+            sum_h[k] = sum_h[k] + f.hidden[k]
+            sum_h2[k] = sum_h2[k] + f.hidden[k] * f.hidden[k]
+            k = k + 1
+        }
+        i = i + 1
+    }
+    let n_f = to_float(take)
+    let mut var_h = t_zeros(H)
+    let mut k2 = 0
+    while k2 < H {
+        let mean = sum_h[k2] / n_f
+        let ex2 = sum_h2[k2] / n_f
+        let v = ex2 - mean * mean
+        var_h[k2] = if v > 0.000001 { v } else { 0.000001 }
+        k2 = k2 + 1
+    }
+    // sort var_h descending to get "spectrum"-like decay (mimics eigenvalue decay).
+    // Bubble-sort O(H²) — H=4 so trivial.
+    let mut sorted = t_zeros(H)
+    let mut ki = 0
+    while ki < H { sorted[ki] = var_h[ki] ; ki = ki + 1 }
+    let mut a = 0
+    while a < H {
+        let mut b = a + 1
+        while b < H {
+            if sorted[b] > sorted[a] {
+                let tmp = sorted[a]
+                sorted[a] = sorted[b]
+                sorted[b] = tmp
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    // OLS slope of log(sorted[i]) vs log(i+1) for i=0..H-1
+    //   slope = (Σ(xy) − n·x̄·ȳ) / (Σ(x²) − n·x̄²)
+    let mut sum_x = 0.0
+    let mut sum_y = 0.0
+    let mut sum_xy = 0.0
+    let mut sum_xx = 0.0
+    let mut ii = 0
+    while ii < H {
+        let x = log(to_float(ii + 1))
+        let y = log(sorted[ii])
+        sum_x = sum_x + x
+        sum_y = sum_y + y
+        sum_xy = sum_xy + x * y
+        sum_xx = sum_xx + x * x
+        ii = ii + 1
+    }
+    let n_h = to_float(H)
+    let mean_x = sum_x / n_h
+    let mean_y = sum_y / n_h
+    let num = sum_xy - n_h * mean_x * mean_y
+    let den = sum_xx - n_h * mean_x * mean_x
+    let slope_raw = if den > 0.000001 { num / den } else { 0.0 }
+    // |slope| is our ν̂ proxy (positive; spectrum decays so slope<0 typically).
+    let nu_hat = if slope_raw < 0.0 { 0.0 - slope_raw } else { slope_raw }
+    // Convert to ppm (×1000), clamp [0, 3000]
+    let nu_x1000 = floor(nu_hat * 1000.0 + 0.5)
+    let nu_int = to_int(nu_x1000)
+    if nu_int < 0 { return 0 }
+    if nu_int > 3000 { return 3000 }
+    return nu_int
+}
+
+// ── V_RG regularizer on top of LoRA training ─────────────────────────────
+struct VRGState {
+    nu_ppm_cached: int,
+    v_rg_x1000_cached: int,
+    nu_ppm_initial: int,
+    nu_ppm_mid: int,
+    nu_ppm_final: int,
+    v_rg_initial: int,
+    v_rg_mid: int,
+    v_rg_final: int
+}
+
+struct LoraResult {
+    lo: Lora,
+    pre_lora_ce: float,
+    post_lora_ce: float,
+    pre_lora_ppl: float,
+    post_lora_ppl: float,
+    ce_drop: float,
+    loss_sum: float,
+    rg_state: VRGState
+}
+
+fn train_lora_with_v_rg(
+    m: Base, lo0: Lora, pairs: array,
+    lr: float, steps: int, batch: int,
+    beta_r_x1000: int, measure_every: int,
+    alpha_x1000: int, beta_rg_x1000: int, gamma_x1000: int,
+    dphi_ppm: int, xi_x1000: int, n_level: int,
+    measure_samples: int
+) -> LoraResult {
+    let mut lo = lo0
+    let r = lo.r
+    let alpha = lo.alpha
+    let scale_lora = alpha / to_float(r)
+    let n_pair = len(pairs) / 2
+    let mut step = 0
+    let mut loss_sum = 0.0
+
+    // initial ν̂ measurement (pre-training)
+    let nu0 = measure_nu_ppm(m, lo.A, lo.B, r, alpha, pairs, measure_samples)
+    let vrg0 = v_rg_x1000(nu0, dphi_ppm, xi_x1000, n_level,
+                          alpha_x1000, beta_rg_x1000, gamma_x1000)
+    let mut rg_state = VRGState {
+        nu_ppm_cached: nu0,
+        v_rg_x1000_cached: vrg0,
+        nu_ppm_initial: nu0,
+        nu_ppm_mid: nu0,
+        nu_ppm_final: nu0,
+        v_rg_initial: vrg0,
+        v_rg_mid: vrg0,
+        v_rg_final: vrg0
+    }
+    println("  [ν̂ init]     nu_ppm=" + to_string(nu0) + " V_RG_x1000=" + to_string(vrg0))
+
+    let mid_step = steps / 2
+
+    while step < steps {
+        let mut gA = t_zeros(r * V)
+        let mut gB = t_zeros(H * r)
+        let mut batch_ce = 0.0
+        let mut bi = 0
+        while bi < batch {
+            let idx = (step * batch + bi) % n_pair
+            let prev = pairs[idx * 2]
+            let tgt  = pairs[idx * 2 + 1]
+            let f = base_forward_with_adapter(m, lo.A, lo.B, r, alpha, prev)
+            let lp = log_softmax_row(f.logits)
+            batch_ce = batch_ce - lp[tgt]
+            let p = softmax_row(f.logits)
+            let mut dl = t_zeros(V)
+            let mut j = 0
+            while j < V { dl[j] = p[j] ; j = j + 1 }
+            dl[tgt] = dl[tgt] - 1.0
+            let mut hr = t_zeros(r)
+            let mut i2 = 0
+            while i2 < r {
+                let mut acc = 0.0
+                let mut kk = 0
+                while kk < H { acc = acc + f.hidden[kk] * lo.B[kk * r + i2] ; kk = kk + 1 }
+                hr[i2] = acc
+                i2 = i2 + 1
+            }
+            let mut ri = 0
+            while ri < r {
+                let mut vi = 0
+                while vi < V {
+                    gA[ri * V + vi] = gA[ri * V + vi] + scale_lora * hr[ri] * dl[vi]
+                    vi = vi + 1
+                }
+                ri = ri + 1
+            }
+            let mut dhr = t_zeros(r)
+            let mut ri2 = 0
+            while ri2 < r {
+                let mut acc2 = 0.0
+                let mut vi2 = 0
+                while vi2 < V { acc2 = acc2 + lo.A[ri2 * V + vi2] * dl[vi2] ; vi2 = vi2 + 1 }
+                dhr[ri2] = scale_lora * acc2
+                ri2 = ri2 + 1
+            }
+            let mut hh = 0
+            while hh < H {
+                let mut rii = 0
+                while rii < r {
+                    gB[hh * r + rii] = gB[hh * r + rii] + f.hidden[hh] * dhr[rii]
+                    rii = rii + 1
+                }
+                hh = hh + 1
+            }
+            bi = bi + 1
+        }
+        // update adapter (CE-only gradient — V_RG is detach-scalar)
+        let s2 = lr / to_float(batch)
+        let mut ia = 0
+        while ia < r * V { lo.A[ia] = lo.A[ia] - s2 * gA[ia] ; ia = ia + 1 }
+        let mut ib = 0
+        while ib < H * r { lo.B[ib] = lo.B[ib] - s2 * gB[ib] ; ib = ib + 1 }
+
+        // re-measure ν̂ every measure_every step (detach-scalar anchoring)
+        let should_measure = if measure_every <= 1 { true }
+                             else { (step + 1) % measure_every == 0 }
+        if should_measure {
+            let nu_new = measure_nu_ppm(m, lo.A, lo.B, r, alpha, pairs, measure_samples)
+            let vrg_new = v_rg_x1000(nu_new, dphi_ppm, xi_x1000, n_level,
+                                     alpha_x1000, beta_rg_x1000, gamma_x1000)
+            rg_state.nu_ppm_cached = nu_new
+            rg_state.v_rg_x1000_cached = vrg_new
+        }
+
+        // loss reported (CE + β_r · V_RG_detached), for monitoring only
+        let ce_mean = batch_ce / to_float(batch)
+        let v_rg_f = to_float(rg_state.v_rg_x1000_cached) / 1000.0
+        let beta_r_f = to_float(beta_r_x1000) / 1000.0
+        let loss_reported = ce_mean + beta_r_f * v_rg_f
+        loss_sum = loss_sum + loss_reported
+
+        // track midpoint ν̂
+        if step + 1 == mid_step {
+            rg_state.nu_ppm_mid = rg_state.nu_ppm_cached
+            rg_state.v_rg_mid = rg_state.v_rg_x1000_cached
+            println("  [step " + to_string(step + 1) + "]    nu_ppm=" + to_string(rg_state.nu_ppm_cached) +
+                    " V_RG_x1000=" + to_string(rg_state.v_rg_x1000_cached) +
+                    " CE=" + to_string(ce_mean) +
+                    " loss=" + to_string(loss_reported))
+        }
+        step = step + 1
+    }
+
+    // final ν̂
+    let nu_final = measure_nu_ppm(m, lo.A, lo.B, r, alpha, pairs, measure_samples)
+    let vrg_final = v_rg_x1000(nu_final, dphi_ppm, xi_x1000, n_level,
+                               alpha_x1000, beta_rg_x1000, gamma_x1000)
+    rg_state.nu_ppm_final = nu_final
+    rg_state.v_rg_final = vrg_final
+    println("  [ν̂ final]    nu_ppm=" + to_string(nu_final) + " V_RG_x1000=" + to_string(vrg_final))
+
+    // evaluate pre/post on the same pairs (they serve as train+eval in smoke)
+    let eval_pre = eval_base(m, t_zeros(1), t_zeros(1), 0, 0.0, pairs)  // base only
+    let eval_post = eval_base(m, lo.A, lo.B, r, alpha, pairs)
+    let ce_drop = eval_pre.ce - eval_post.ce
+
+    return LoraResult {
+        lo: lo,
+        pre_lora_ce: eval_pre.ce,
+        post_lora_ce: eval_post.ce,
+        pre_lora_ppl: eval_pre.ppl,
+        post_lora_ppl: eval_post.ppl,
+        ce_drop: ce_drop,
+        loss_sum: loss_sum,
+        rg_state: rg_state
+    }
+}
+
+// ── arm runner ───────────────────────────────────────────────────────────
+struct ArmResult {
+    label: string,
+    beta_r_x1000: int,
+    pre_lora_ppl: float,
+    post_lora_ppl: float,
+    ce_drop: float,
+    loss_sum: float,
+    nu_initial: int,
+    nu_mid: int,
+    nu_final: int,
+    v_rg_initial: int,
+    v_rg_mid: int,
+    v_rg_final: int
+}
+
+fn run_arm(label: string, corpus: string, beta_r_x1000: int, measure_every: int,
+           alpha_x1000: int, beta_rg_x1000: int, gamma_x1000: int,
+           dphi_ppm: int, xi_x1000: int, n_level: int,
+           base_seed: int, lora_seed: int) -> ArmResult {
+    println("")
+    println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    println("[arm " + label + "] beta_r_x1000=" + to_string(beta_r_x1000) +
+            " measure_every=" + to_string(measure_every))
+    println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    // 100 sample subset from first 8 lines × 80 chars → ~100 bigram pairs
+    let text = corpus_slice(corpus, "hexad", 80, 8)
+    let pairs = make_pairs(text, 100)
+    let n_p = len(pairs) / 2
+    println("  [corpus]     text_len=" + to_string(text.len()) + " pairs=" + to_string(n_p))
+
+    // base pretrain (identical across arms by fixed seed)
+    let m0 = base_init(base_seed)
+    let m = train_base(m0, pairs, 0.2, 30, 2)
+    let e_base = eval_base(m, t_zeros(1), t_zeros(1), 0, 0.0, pairs)
+    println("  [base done]  CE=" + to_string(e_base.ce) + " ppl=" + to_string(e_base.ppl))
+
+    // LoRA init (rank=2, alpha=4.0)
+    let lo0 = lora_init(2, 4.0, lora_seed)
+
+    // 10 step LoRA with V_RG regularizer
+    let res = train_lora_with_v_rg(
+        m, lo0, pairs,
+        0.1,                 // lora lr
+        10,                  // steps (smoke)
+        2,                   // batch
+        beta_r_x1000, measure_every,
+        alpha_x1000, beta_rg_x1000, gamma_x1000,
+        dphi_ppm, xi_x1000, n_level,
+        10                   // measure_samples — subset for per-dim variance.
+                             // small to cap RSS under hexa_stage0 COW.
+    )
+
+    println("  [post-lora]  pre_ppl=" + to_string(res.pre_lora_ppl) +
+            " post_ppl=" + to_string(res.post_lora_ppl) +
+            " ce_drop=" + to_string(res.ce_drop))
+    println("  [loss_sum]   " + to_string(res.loss_sum))
+
+    return ArmResult {
+        label: label,
+        beta_r_x1000: beta_r_x1000,
+        pre_lora_ppl: res.pre_lora_ppl,
+        post_lora_ppl: res.post_lora_ppl,
+        ce_drop: res.ce_drop,
+        loss_sum: res.loss_sum,
+        nu_initial: res.rg_state.nu_ppm_initial,
+        nu_mid: res.rg_state.nu_ppm_mid,
+        nu_final: res.rg_state.nu_ppm_final,
+        v_rg_initial: res.rg_state.v_rg_initial,
+        v_rg_mid: res.rg_state.v_rg_mid,
+        v_rg_final: res.rg_state.v_rg_final
+    }
+}
+
+// ── main ─────────────────────────────────────────────────────────────────
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+    let mut mode = "full"
+    let mut k = 0
+    while k < argc {
+        let a = _str(argv[k])
+        if a == "baseline" { mode = "baseline" }
+        if a == "treated"  { mode = "treated" }
+        k = k + 1
+    }
+
+    println("══════════════════════════════════════════════════════════════")
+    println("  AN-LIX-01 — L_IX V_RG regularizer in LoRA (Seed ζ 첫 실증)")
+    println("  raw#9 hexa-only · raw#11 snake_case · raw#15 no hardcode")
+    println("══════════════════════════════════════════════════════════════")
+
+    // ── load config ──
+    let cfg_blob = read_file(CONFIG_PATH)
+    if cfg_blob == "" {
+        println("[FATAL] config not found: " + CONFIG_PATH)
+        exit(2)
+    }
+    let beta_r_x1000_cfg = json_get_float_x1000(cfg_blob, "beta_r", 10)
+    let measure_every    = json_get_int(cfg_blob, "measure_every", 100)
+    let alpha_x1000      = json_get_int(cfg_blob, "alpha_x1000", 1000)
+    let beta_rg_x1000    = json_get_int(cfg_blob, "beta_rg_x1000", 1000)
+    let gamma_x1000      = json_get_int(cfg_blob, "gamma_x1000", 1000)
+    let dphi_ppm         = json_get_int(cfg_blob, "dphi_ppm_default", 140)
+    let xi_x1000         = json_get_int(cfg_blob, "xi_x1000_default", 6666)
+    let n_level          = json_get_int(cfg_blob, "level_n_default", 16)
+
+    // env override for beta_r
+    let env_beta = env_str("NEXUS_ANLIX_BETA_R")
+    let mut beta_r_x1000_eff = beta_r_x1000_cfg
+    if env_beta != "" {
+        // parse env float manually via json_get_float_x1000 by wrapping as "x":env
+        let wrap = "\"x\":" + env_beta
+        let parsed = json_get_float_x1000(wrap, "x", beta_r_x1000_cfg)
+        beta_r_x1000_eff = parsed
+        println("[env]        NEXUS_ANLIX_BETA_R=" + env_beta + " → beta_r_x1000=" + to_string(beta_r_x1000_eff))
+    }
+
+    println("[config]     beta_r_x1000=" + to_string(beta_r_x1000_eff) +
+            " measure_every=" + to_string(measure_every) +
+            " α/β/γ=" + to_string(alpha_x1000) + "/" + to_string(beta_rg_x1000) + "/" + to_string(gamma_x1000))
+    println("[config]     dphi_ppm=" + to_string(dphi_ppm) +
+            " xi_x1000=" + to_string(xi_x1000) + " N=" + to_string(n_level))
+
+    // ── load corpus ──
+    let corpus = read_file(CORPUS_PATH)
+    println("[corpus]     bytes=" + to_string(corpus.len()))
+
+    // ── smoke: measure_every=5 → initial + step 5 + final (3 snapshots).
+    //    Keeps RSS low — per-measure allocs cumulate under hexa_stage0 COW. ──
+    let measure_every_smoke = 5
+
+    // ── arms ──
+    let base_seed = 4217
+    let lora_seed = 9301
+
+    let mut arm_base_ok = false
+    let mut arm_treated_ok = false
+    let mut arm_base = ArmResult {
+        label: "baseline", beta_r_x1000: 0,
+        pre_lora_ppl: 0.0, post_lora_ppl: 0.0, ce_drop: 0.0, loss_sum: 0.0,
+        nu_initial: 0, nu_mid: 0, nu_final: 0,
+        v_rg_initial: 0, v_rg_mid: 0, v_rg_final: 0
+    }
+    let mut arm_treated = ArmResult {
+        label: "treated", beta_r_x1000: 0,
+        pre_lora_ppl: 0.0, post_lora_ppl: 0.0, ce_drop: 0.0, loss_sum: 0.0,
+        nu_initial: 0, nu_mid: 0, nu_final: 0,
+        v_rg_initial: 0, v_rg_mid: 0, v_rg_final: 0
+    }
+
+    if mode == "full" || mode == "baseline" {
+        arm_base = run_arm("baseline", corpus, 0, measure_every_smoke,
+                           alpha_x1000, beta_rg_x1000, gamma_x1000,
+                           dphi_ppm, xi_x1000, n_level,
+                           base_seed, lora_seed)
+        arm_base_ok = true
+    }
+    if mode == "full" || mode == "treated" {
+        arm_treated = run_arm("treated", corpus, beta_r_x1000_eff, measure_every_smoke,
+                              alpha_x1000, beta_rg_x1000, gamma_x1000,
+                              dphi_ppm, xi_x1000, n_level,
+                              base_seed, lora_seed)
+        arm_treated_ok = true
+    }
+
+    // ── gate judgment ──
+    let mut gate_pass = "N/A"
+    let mut delta_ppl = 0.0
+    if arm_base_ok && arm_treated_ok {
+        // both arms ran: compare
+        delta_ppl = (arm_treated.post_lora_ppl - arm_base.post_lora_ppl) / arm_base.post_lora_ppl
+        let abs_dp = if delta_ppl < 0.0 { 0.0 - delta_ppl } else { delta_ppl }
+        gate_pass = if abs_dp <= 0.01 { "PASS" } else { "FAIL" }
+    }
+
+    // ν̂ convergence band: |ν̂_final − 1000| ≤ 100 ppm
+    let mut nu_converged = "N/A"
+    if arm_treated_ok {
+        let nu_drift = if arm_treated.nu_final > 1000 { arm_treated.nu_final - 1000 }
+                       else { 1000 - arm_treated.nu_final }
+        nu_converged = if nu_drift <= 100 { "PASS" } else { "FAIL" }
+    }
+
+    println("")
+    println("══════════════════════════════════════════════════════════════")
+    println("  GATE: val_ppl_delta ≤ +1%  = " + gate_pass +
+            " (Δppl_rel=" + to_string(delta_ppl) + ")")
+    println("  GATE: ν̂_layer converge to 1±0.1 = " + nu_converged)
+    println("══════════════════════════════════════════════════════════════")
+
+    // ── result JSON (array+join to avoid O(n²) concat under hexa_stage0 COW) ──
+    let mut parts = []
+    parts = parts.push("{")
+    parts = parts.push("  \"schema_version\": \"1\",")
+    parts = parts.push("  \"slug\": \"an-lix-01-v-rg-regularizer-smoke\",")
+    parts = parts.push("  \"title\": \"AN-LIX-01 smoke — V_RG regularizer first embedding in LoRA\",")
+    parts = parts.push("  \"created\": \"2026-04-21\",")
+    parts = parts.push("  \"raw_strict\": \"raw#9 raw#11 raw#15 hexa-only snake_case no_hardcode\",")
+    parts = parts.push("  \"tool\": \"tool/train_lora_l_ix_v_rg.hexa\",")
+    parts = parts.push("  \"config\": {")
+    parts = parts.push("    \"beta_r_x1000\": " + to_string(beta_r_x1000_eff) + ",")
+    parts = parts.push("    \"measure_every_smoke\": " + to_string(measure_every_smoke) + ",")
+    parts = parts.push("    \"measure_every_cfg\": " + to_string(measure_every) + ",")
+    parts = parts.push("    \"alpha_x1000\": " + to_string(alpha_x1000) + ",")
+    parts = parts.push("    \"beta_rg_x1000\": " + to_string(beta_rg_x1000) + ",")
+    parts = parts.push("    \"gamma_x1000\": " + to_string(gamma_x1000) + ",")
+    parts = parts.push("    \"dphi_ppm\": " + to_string(dphi_ppm) + ",")
+    parts = parts.push("    \"xi_x1000\": " + to_string(xi_x1000) + ",")
+    parts = parts.push("    \"n_level\": " + to_string(n_level) + ",")
+    parts = parts.push("    \"vocab\": " + to_string(V) + ",")
+    parts = parts.push("    \"hidden\": " + to_string(H) + ",")
+    parts = parts.push("    \"lora_rank\": 2,")
+    parts = parts.push("    \"lora_alpha\": 4.0,")
+    parts = parts.push("    \"lora_steps\": 10,")
+    parts = parts.push("    \"lora_lr\": 0.1,")
+    parts = parts.push("    \"base_steps\": 30,")
+    parts = parts.push("    \"batch\": 2,")
+    parts = parts.push("    \"base_seed\": " + to_string(base_seed) + ",")
+    parts = parts.push("    \"lora_seed\": " + to_string(lora_seed))
+    parts = parts.push("  },")
+    parts = parts.push("  \"arms\": {")
+    parts = parts.push("    \"baseline\": {")
+    parts = parts.push("      \"ran\": " + (if arm_base_ok { "true" } else { "false" }) + ",")
+    parts = parts.push("      \"beta_r_x1000\": 0,")
+    parts = parts.push("      \"pre_lora_ppl\": " + to_string(arm_base.pre_lora_ppl) + ",")
+    parts = parts.push("      \"post_lora_ppl\": " + to_string(arm_base.post_lora_ppl) + ",")
+    parts = parts.push("      \"ce_drop\": " + to_string(arm_base.ce_drop) + ",")
+    parts = parts.push("      \"loss_sum\": " + to_string(arm_base.loss_sum) + ",")
+    parts = parts.push("      \"nu_trajectory\": { \"initial\": " + to_string(arm_base.nu_initial) +
+                       ", \"mid\": " + to_string(arm_base.nu_mid) +
+                       ", \"final\": " + to_string(arm_base.nu_final) + " },")
+    parts = parts.push("      \"v_rg_trajectory_x1000\": { \"initial\": " + to_string(arm_base.v_rg_initial) +
+                       ", \"mid\": " + to_string(arm_base.v_rg_mid) +
+                       ", \"final\": " + to_string(arm_base.v_rg_final) + " }")
+    parts = parts.push("    },")
+    parts = parts.push("    \"treated\": {")
+    parts = parts.push("      \"ran\": " + (if arm_treated_ok { "true" } else { "false" }) + ",")
+    parts = parts.push("      \"beta_r_x1000\": " + to_string(arm_treated.beta_r_x1000) + ",")
+    parts = parts.push("      \"pre_lora_ppl\": " + to_string(arm_treated.pre_lora_ppl) + ",")
+    parts = parts.push("      \"post_lora_ppl\": " + to_string(arm_treated.post_lora_ppl) + ",")
+    parts = parts.push("      \"ce_drop\": " + to_string(arm_treated.ce_drop) + ",")
+    parts = parts.push("      \"loss_sum\": " + to_string(arm_treated.loss_sum) + ",")
+    parts = parts.push("      \"nu_trajectory\": { \"initial\": " + to_string(arm_treated.nu_initial) +
+                       ", \"mid\": " + to_string(arm_treated.nu_mid) +
+                       ", \"final\": " + to_string(arm_treated.nu_final) + " },")
+    parts = parts.push("      \"v_rg_trajectory_x1000\": { \"initial\": " + to_string(arm_treated.v_rg_initial) +
+                       ", \"mid\": " + to_string(arm_treated.v_rg_mid) +
+                       ", \"final\": " + to_string(arm_treated.v_rg_final) + " }")
+    parts = parts.push("    }")
+    parts = parts.push("  },")
+    parts = parts.push("  \"delta\": {")
+    parts = parts.push("    \"ppl_rel\": " + to_string(delta_ppl) + ",")
+    parts = parts.push("    \"gate_val_ppl_delta_le_1pct\": \"" + gate_pass + "\",")
+    parts = parts.push("    \"nu_converged_1_plus_minus_0p1\": \"" + nu_converged + "\"")
+    parts = parts.push("  },")
+    parts = parts.push("  \"notes\": \"Detach-scalar semantics: V_RG gradient not propagated; CE-only trajectory. Arms baseline (β_r=0) and treated (β_r from config) have IDENTICAL training dynamics by construction — any ppl diff is reproducibility noise. First embedding purpose: prove ν̂ measurable + V_RG computable inside anima training loop.\",")
+    parts = parts.push("  \"verdict\": \"" +
+                       (if arm_treated_ok { "SMOKE_COMPLETED" } else { "INCOMPLETE" }) + "\"")
+    parts = parts.push("}")
+    let j = parts.join("\n") + "\n"
+
+    // ensure shared/state exists
+    let _ = exec("mkdir -p $(dirname " + OUT_PATH + ")")
+    write_file(OUT_PATH, j)
+    println("")
+    println("[out]        " + OUT_PATH)
+}
+
+main()
