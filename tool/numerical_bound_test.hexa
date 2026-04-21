@@ -225,9 +225,15 @@ fn load_eigenvecs(path: string) -> array {
     return out
 }
 
+// Projector tolerance for identity fast-path: when eigenvecs form an
+// orthonormal basis of the full DIM space (as in cell-eigenvec-16.json,
+// max_off_diagonal ~ 1e-15), P_S = Σ v_k v_k^T = I and matmul_right(G, P_S) = G.
+// Detect identity during construction to skip the O(DIM^3) matmul per step.
 fn make_projector(eigenvecs: array) -> array {
     let n = len(eigenvecs)
+    let tol = 0.00001
     let mut P = []
+    let mut is_identity = true
     let mut a = 0
     while a < DIM {
         let mut row = []
@@ -241,12 +247,25 @@ fn make_projector(eigenvecs: array) -> array {
                 k = k + 1
             }
             row = push(row, s)
+            let expected = if a == b { 1.0 } else { 0.0 }
+            let diff = s - expected
+            let absdiff = if diff < 0.0 { -diff } else { diff }
+            if absdiff > tol { is_identity = false }
             b = b + 1
         }
         P = push(P, row)
         a = a + 1
     }
+    // Append identity flag as last row sentinel ["__is_identity__", true/false].
+    // Downstream (cpgd_step) inspects this to short-circuit matmul_right.
+    let flag_row = [to_float(if is_identity { 1 } else { 0 })]
+    P = push(P, flag_row)
     return P
+}
+
+fn projector_is_identity(P: array) -> bool {
+    let flag_row = P[DIM]
+    return to_float(flag_row[0]) > 0.5
 }
 
 fn make_W_init(eigenvecs: array) -> array {
@@ -352,6 +371,12 @@ fn update_W(W: array, G: array, lr: float) -> array {
 }
 
 fn cpgd_step(W: array, grad: array, P_S: array, lr: float) -> array {
+    // Identity fast-path: if P_S = I (orthonormal basis spans full DIM),
+    // matmul_right(grad, I) = grad, so skip the O(DIM^3) multiplication
+    // per step. Reduces per-lr work from ~4k ops × 10 steps to ~0.
+    if projector_is_identity(P_S) {
+        return update_W(W, grad, lr)
+    }
     let grad_proj = matmul_right(grad, P_S)
     return update_W(W, grad_proj, lr)
 }
