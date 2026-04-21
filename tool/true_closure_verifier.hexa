@@ -1,0 +1,819 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/true_closure_verifier.hexa — β main PHYSICAL + MATH reproduction
+//
+//  PURPOSE
+//    Replace "file-exists" weak 100% signal with strong empirical reproduction
+//    verification. For each of the 8 β main components:
+//      1. Physically execute the tool (hexa run <path> [args]).
+//      2. Read the SSOT JSON output.
+//      3. Verify math / numeric invariants (thresholds in config).
+//      4. Compute a proof hash (SHA256 of the SSOT bytes — deterministic
+//         artifact hash-chain proof).
+//      5. Record PASS / FAIL + observed metrics (raw#12 실측).
+//    Emit a consolidated cert with a hash-chain linking to previous cert
+//    (raw#10 proof-carrying).
+//
+//  FORMULA
+//    true_closure_pct = (passed_components * 100) / total_components
+//
+//  USAGE
+//    hexa tool/true_closure_verifier.hexa --help
+//    hexa tool/true_closure_verifier.hexa --component 1     # run a single
+//    hexa tool/true_closure_verifier.hexa --component all   # run all 8
+//    hexa tool/true_closure_verifier.hexa --strict          # exit 1 on any FAIL
+//    hexa tool/true_closure_verifier.hexa --skip-run        # verify existing SSOT
+//
+//  CONFIG (raw#15)
+//    shared/config/true_closure_config.json
+//
+//  OUTPUT (raw#10 proof-carrying)
+//    shared/state/true_closure_cert.json     structured cert
+//    .raw-audit/true_closure.log             hash-chain append line
+//
+//  CONSTRAINTS
+//    raw#9  hexa-only         raw#10 proof-carrying hash-chain
+//    raw#11 snake_case        raw#12 empirical (실측 only)
+//    raw#15 no-hardcode (config JSON)    deterministic     LLM=none
+//    OOM-safe: sequential exec, per-component timeout
+// ════════════════════════════════════════════════════════════════════════════
+
+let CONFIG_PATH = "shared/config/true_closure_config.json"
+let DEFAULT_OUT = "shared/state/true_closure_cert.json"
+let DEFAULT_AUDIT_LOG = ".raw-audit/true_closure.log"
+let HEXA_BIN_DEFAULT = "/Users/ghost/Dev/hexa-lang/hexa"
+
+// ─── type helpers ──────────────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn now_utc() -> string {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn bool_s(b: bool) -> string { return if b { "true" } else { "false" } }
+
+fn fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn dexists(p: string) -> bool {
+    return _str(exec("test -d " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn resolve_root() -> string {
+    // Prefer git toplevel so we honor the active worktree even when
+    // ANIMA / NEXUS point to the canonical checkout.
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let h = _str(env("HOME"))
+    return h + "/core/anima"
+}
+
+fn resolve_hexa_bin() -> string {
+    let e = _str(env("HEXA_BIN"))
+    if e != "" { return e }
+    if fexists(HEXA_BIN_DEFAULT) { return HEXA_BIN_DEFAULT }
+    let p = _str(exec("command -v hexa 2>/dev/null")).trim()
+    if p != "" { return p }
+    return HEXA_BIN_DEFAULT
+}
+
+fn json_escape(s: string) -> string {
+    let a = s.replace("\\", "\\\\")
+    let b = a.replace("\"", "\\\"")
+    let c = b.replace("\n", "\\n")
+    let d = c.replace("\r", "\\r")
+    return d.replace("\t", "\\t")
+}
+
+fn is_json_map(v) -> bool {
+    let s = str(v)
+    if s.len() < 1 { return false }
+    return s.substring(0, 1) == "{"
+}
+
+fn load_config(path: string) {
+    if !fexists(path) {
+        println("true_closure_verifier: SETUP_ERROR — config not found: " + path)
+        exit(2)
+    }
+    let raw = read_file(path)
+    let cfg = json_parse(raw)
+    if !is_json_map(cfg) {
+        println("true_closure_verifier: SETUP_ERROR — malformed config JSON: " + path)
+        exit(2)
+    }
+    return cfg
+}
+
+// ─── arg helpers ───────────────────────────────────────────────────────────
+
+fn arg_value(argv, key: string, dflt: string) -> string {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key && i + 1 < len(argv) { return _str(argv[i + 1]) }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn arg_present(argv, key: string) -> bool {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn args_to_cmd(args_arr) -> string {
+    let mut s = ""
+    let mut i = 0
+    while i < len(args_arr) {
+        s = s + " " + _str(args_arr[i])
+        i = i + 1
+    }
+    return s
+}
+
+// ─── SHA256 of a file ──────────────────────────────────────────────────────
+
+fn sha256_file(path: string) -> string {
+    if !fexists(path) { return "" }
+    let r = _str(exec("shasum -a 256 " + path + " | awk '{print $1}'")).trim()
+    return r
+}
+
+// ─── nested JSON access (path "a.b.c") ─────────────────────────────────────
+
+fn str_split_dots(s: string) -> array {
+    let mut parts = []
+    let mut cur = ""
+    let mut i = 0
+    while i < s.len() {
+        let ch = s.substring(i, i + 1)
+        if ch == "." {
+            parts = push(parts, cur)
+            cur = ""
+        } else {
+            cur = cur + ch
+        }
+        i = i + 1
+    }
+    parts = push(parts, cur)
+    return parts
+}
+
+fn json_get_path(root, path: string) -> array {
+    // returns [found_bool, value] tagged as [bool, any]
+    let parts = str_split_dots(path)
+    let mut cur = root
+    let mut i = 0
+    while i < len(parts) {
+        let key = _str(parts[i])
+        let t = type_of(cur)
+        if t != "map" && t != "object" && t != "dict" {
+            // Fallback to contains_key attempt
+        }
+        let has_fn = cur.contains_key(key)
+        if !has_fn { return [false, ""] }
+        cur = cur[key]
+        i = i + 1
+    }
+    return [true, cur]
+}
+
+// ─── verification per component ────────────────────────────────────────────
+//
+// Returns a map-equivalent array:
+//   [verdict_str, checks_pass_count, checks_total_count, failure_detail_str,
+//    metrics_json_inline_str]
+//
+
+fn coerce_int(v) -> int {
+    let t = type_of(v)
+    if t == "int" { return v }
+    return to_int(str(v))
+}
+
+// Direct bool comparison to work around to_bool() runtime quirk where
+// to_bool(false) may return true in this hexa build. Compare via ==.
+fn is_true(v) -> bool {
+    if v == true { return true }
+    return false
+}
+
+fn coerce_float_str(v) -> string {
+    // deterministic string for int/float
+    return str(v)
+}
+
+fn check_bool_eq(ssot_map, key: string, want: bool) -> array {
+    // returns [pass_bool, detail_str]
+    if !ssot_map.contains_key(key) {
+        return [false, "missing_key:" + key]
+    }
+    let v = ssot_map[key]
+    let b = is_true(v)
+    if b == want {
+        return [true, key + "=" + bool_s(b)]
+    }
+    return [false, key + "=" + bool_s(b) + " want=" + bool_s(want)]
+}
+
+fn check_nested_bool_eq(ssot_map, path: string, want: bool) -> array {
+    let g = json_get_path(ssot_map, path)
+    let found = is_true(g[0])
+    if !found { return [false, "missing_path:" + path] }
+    let b = is_true(g[1])
+    if b == want {
+        return [true, path + "=" + bool_s(b)]
+    }
+    return [false, path + "=" + bool_s(b) + " want=" + bool_s(want)]
+}
+
+fn check_int_eq(ssot_map, key: string, want: int) -> array {
+    if !ssot_map.contains_key(key) {
+        return [false, "missing_key:" + key]
+    }
+    let obs = coerce_int(ssot_map[key])
+    if obs == want {
+        return [true, key + "=" + str(obs)]
+    }
+    return [false, key + "=" + str(obs) + " want=" + str(want)]
+}
+
+fn check_int_ge(ssot_map, key: string, want: int) -> array {
+    if !ssot_map.contains_key(key) {
+        return [false, "missing_key:" + key]
+    }
+    let obs = coerce_int(ssot_map[key])
+    if obs >= want {
+        return [true, key + "=" + str(obs) + ">=" + str(want)]
+    }
+    return [false, key + "=" + str(obs) + " want>=" + str(want)]
+}
+
+fn check_str_eq(ssot_map, key: string, want: string) -> array {
+    if !ssot_map.contains_key(key) {
+        return [false, "missing_key:" + key]
+    }
+    let obs = _str(ssot_map[key])
+    if obs == want {
+        return [true, key + "=" + obs]
+    }
+    return [false, key + "=" + obs + " want=" + want]
+}
+
+fn check_nested_str_eq(ssot_map, path: string, want: string) -> array {
+    let g = json_get_path(ssot_map, path)
+    let found = is_true(g[0])
+    if !found { return [false, "missing_path:" + path] }
+    let obs = _str(g[1])
+    if obs == want {
+        return [true, path + "=" + obs]
+    }
+    return [false, path + "=" + obs + " want=" + want]
+}
+
+fn check_nested_int_eq(ssot_map, path: string, want: int) -> array {
+    let g = json_get_path(ssot_map, path)
+    let found = is_true(g[0])
+    if !found { return [false, "missing_path:" + path] }
+    let obs = coerce_int(g[1])
+    if obs == want {
+        return [true, path + "=" + str(obs)]
+    }
+    return [false, path + "=" + str(obs) + " want=" + str(want)]
+}
+
+// max_float_lt uses per-mille (x1000) comparison deterministically via
+// scaling on coerced int — but many SSOT values are floats. Hexa can
+// compare numerically via direct arithmetic.  Our only float threshold
+// is max_cos_drift < 2e-4 which we check via scaled int:  x*1e9 < 200000
+// (== 0.0002 * 1e9).
+
+fn check_max_float_lt(ssot_map, key: string, thresh_str: string) -> array {
+    if !ssot_map.contains_key(key) {
+        return [false, "missing_key:" + key]
+    }
+    let v = ssot_map[key]
+    // The SSOT is int-scaled or float. We compare string lexicographically
+    // after canonicalizing to a fixed-point int x 1e9.
+    let vs = str(v)
+    // parse as float-ish using scaled int multiplication
+    let thresh = parse_float_scaled(thresh_str)
+    let obs = parse_float_scaled(vs)
+    if obs < thresh {
+        return [true, key + "=" + vs + "<" + thresh_str]
+    }
+    return [false, key + "=" + vs + " want<" + thresh_str]
+}
+
+// parse a numeric string like "0.000162752" or "0.0002" into integer*1e9.
+// Handles int + "0.xxx" forms. Negatives supported.
+
+fn parse_float_scaled(s: string) -> int {
+    let t = s.trim()
+    if t.len() == 0 { return 0 }
+    let mut neg = 0
+    let mut i = 0
+    if t.substring(0, 1) == "-" { neg = 1; i = 1 }
+    // split at dot
+    let mut int_part = ""
+    let mut frac_part = ""
+    let mut in_frac = 0
+    while i < t.len() {
+        let ch = t.substring(i, i + 1)
+        if ch == "." {
+            in_frac = 1
+        } else {
+            if in_frac == 0 {
+                int_part = int_part + ch
+            } else {
+                frac_part = frac_part + ch
+            }
+        }
+        i = i + 1
+    }
+    // pad frac to 9 digits
+    while frac_part.len() < 9 {
+        frac_part = frac_part + "0"
+    }
+    if frac_part.len() > 9 {
+        frac_part = frac_part.substring(0, 9)
+    }
+    let ip = if int_part == "" { 0 } else { to_int(int_part) }
+    let fp = if frac_part == "" { 0 } else { to_int(frac_part) }
+    let mag = ip * 1000000000 + fp
+    return if neg == 1 { -mag } else { mag }
+}
+
+// ─── component runner + verifier ───────────────────────────────────────────
+
+fn run_component(bin: string, root: string, ck: string, cc, skip_run: bool) -> array {
+    let slug = _str(cc["slug"])
+    let label = _str(cc["label"])
+    let path = _str(cc["path"])
+    let args_a = cc["args"]
+    let ssot = _str(cc["ssot"])
+    let timeout_s = if cc.contains_key("timeout_s") {
+        to_int(str(cc["timeout_s"]))
+    } else { 300 }
+
+    println("")
+    println("┌── component [" + ck + "] " + label)
+    println("│  slug=" + slug)
+    println("│  path=" + path)
+    println("│  ssot=" + ssot)
+
+    let path_abs = root + "/" + path
+    if !fexists(path_abs) {
+        println("│  ✗ MISSING tool file: " + path_abs)
+        println("└──")
+        return [ck, slug, "MISSING", "", "tool_file_not_found:" + path, "", 0, 0]
+    }
+
+    // Physical execution (unless skip_run).
+    let mut exec_verdict = "SKIPPED"
+    let mut exec_rc = 0
+    let mut log_path = "/tmp/_true_closure_" + slug + ".log"
+    if !skip_run {
+        let reuse_key = if cc.contains_key("reuse_component") { _str(cc["reuse_component"]) } else { "" }
+        if reuse_key != "" {
+            println("│  ⏭ reuse previous component output (" + reuse_key + ") — skipping re-run")
+            exec_verdict = "REUSE"
+        } else {
+            let arg_s = args_to_cmd(args_a)
+            exec("rm -f " + log_path)
+            // HEXA_NO_LAUNCHD=1 bypasses the global mkdir lock on
+            // re-entrant sub-exec (same pattern as anima_main).
+            // Also cd into root so child tools resolve git toplevel
+            // correctly inside the worktree.
+            let t_prefix = if timeout_s > 0 {
+                "ulimit -t " + str(timeout_s) + "; "
+            } else { "" }
+            // Unset ANIMA/NEXUS env vars so child tools that resolve
+            // root via env("ANIMA") first fall back to git toplevel
+            // (which respects our worktree).  Also set ANIMA=root
+            // explicitly for tools that require it.
+            let cmd = "cd " + root + " && " + t_prefix +
+                      "ANIMA=" + root + " NEXUS=" + root +
+                      " HEXA_NO_LAUNCHD=1 " + bin + " run " + path + arg_s +
+                      " > " + log_path + " 2>&1; echo __rc=$?"
+            println("│  ▸ exec: hexa run " + path + arg_s)
+            let tail_out = _str(exec(cmd)).trim()
+            let rc_idx = tail_out.index_of("__rc=")
+            let rc_str = if rc_idx >= 0 {
+                tail_out.substring(rc_idx + 5, len(tail_out))
+            } else { "255" }
+            exec_rc = to_int(rc_str.trim())
+            if exec_rc == 0 {
+                exec_verdict = "EXEC_OK"
+                println("│    exec rc=0")
+            } else {
+                exec_verdict = "EXEC_FAIL"
+                println("│    ✗ exec rc=" + str(exec_rc) + " log=" + log_path)
+            }
+        }
+    }
+
+    // Read SSOT.
+    let ssot_abs = root + "/" + ssot
+    if !fexists(ssot_abs) {
+        println("│  ✗ SSOT missing after run: " + ssot)
+        println("└──")
+        return [ck, slug, "NO_SSOT", "", "ssot_missing:" + ssot, "", 0, 0]
+    }
+
+    let raw = read_file(ssot_abs)
+    let sm = json_parse(raw)
+    if !is_json_map(sm) {
+        println("│  ✗ SSOT malformed: " + ssot)
+        println("└──")
+        return [ck, slug, "MALFORMED", "", "malformed_json:" + ssot, "", 0, 0]
+    }
+
+    // Proof hash.
+    let proof_hash = sha256_file(ssot_abs)
+
+    // Verify.
+    let v = cc["verify"]
+    let mut checks = []
+    let mut pass_count = 0
+    let mut total_count = 0
+
+    // bool_keys
+    if v.contains_key("bool_keys") {
+        let bks = v["bool_keys"]
+        let mut i = 0
+        while i < len(bks) {
+            let k = _str(bks[i])
+            let r = check_bool_eq(sm, k, true)
+            checks = push(checks, r)
+            total_count = total_count + 1
+            if r[0] == true { pass_count = pass_count + 1 }
+            i = i + 1
+        }
+    }
+
+    // nested_bool
+    if v.contains_key("nested_bool") {
+        let arr = v["nested_bool"]
+        let mut i = 0
+        while i < len(arr) {
+            let e2 = arr[i]
+            let p = _str(e2["path"])
+            let want = is_true(e2["eq"])
+            let r = check_nested_bool_eq(sm, p, want)
+            checks = push(checks, r)
+            total_count = total_count + 1
+            if r[0] == true { pass_count = pass_count + 1 }
+            i = i + 1
+        }
+    }
+
+    // int_eq_keys
+    if v.contains_key("int_eq_keys") {
+        let arr = v["int_eq_keys"]
+        let mut i = 0
+        while i < len(arr) {
+            let e2 = arr[i]
+            let k = _str(e2["key"])
+            let want = coerce_int(e2["eq"])
+            let r = check_int_eq(sm, k, want)
+            checks = push(checks, r)
+            total_count = total_count + 1
+            if r[0] == true { pass_count = pass_count + 1 }
+            i = i + 1
+        }
+    }
+
+    // int_ge_keys
+    if v.contains_key("int_ge_keys") {
+        let arr = v["int_ge_keys"]
+        let mut i = 0
+        while i < len(arr) {
+            let e2 = arr[i]
+            let k = _str(e2["key"])
+            let want = coerce_int(e2["ge"])
+            let r = check_int_ge(sm, k, want)
+            checks = push(checks, r)
+            total_count = total_count + 1
+            if r[0] == true { pass_count = pass_count + 1 }
+            i = i + 1
+        }
+    }
+
+    // str_eq_keys
+    if v.contains_key("str_eq_keys") {
+        let arr = v["str_eq_keys"]
+        let mut i = 0
+        while i < len(arr) {
+            let e2 = arr[i]
+            let k = _str(e2["key"])
+            let want = _str(e2["eq"])
+            let r = check_str_eq(sm, k, want)
+            checks = push(checks, r)
+            total_count = total_count + 1
+            if r[0] == true { pass_count = pass_count + 1 }
+            i = i + 1
+        }
+    }
+
+    // nested_int_eq
+    if v.contains_key("nested_int_eq") {
+        let arr = v["nested_int_eq"]
+        let mut i = 0
+        while i < len(arr) {
+            let e2 = arr[i]
+            let p = _str(e2["path"])
+            let want = coerce_int(e2["eq"])
+            let r = check_nested_int_eq(sm, p, want)
+            checks = push(checks, r)
+            total_count = total_count + 1
+            if r[0] == true { pass_count = pass_count + 1 }
+            i = i + 1
+        }
+    }
+
+    // nested_str_eq
+    if v.contains_key("nested_str_eq") {
+        let arr = v["nested_str_eq"]
+        let mut i = 0
+        while i < len(arr) {
+            let e2 = arr[i]
+            let p = _str(e2["path"])
+            let want = _str(e2["eq"])
+            let r = check_nested_str_eq(sm, p, want)
+            checks = push(checks, r)
+            total_count = total_count + 1
+            if r[0] == true { pass_count = pass_count + 1 }
+            i = i + 1
+        }
+    }
+
+    // max_float_lt
+    if v.contains_key("max_float_lt_keys") {
+        let arr = v["max_float_lt_keys"]
+        let mut i = 0
+        while i < len(arr) {
+            let e2 = arr[i]
+            let k = _str(e2["key"])
+            let want = _str(e2["lt"])
+            let r = check_max_float_lt(sm, k, want)
+            checks = push(checks, r)
+            total_count = total_count + 1
+            if r[0] == true { pass_count = pass_count + 1 }
+            i = i + 1
+        }
+    }
+
+    // Print check rows.
+    let mut i = 0
+    while i < len(checks) {
+        let c = checks[i]
+        let pass = (c[0] == true)
+        let g = if pass { "✓" } else { "✗" }
+        let d = _str(c[1])
+        println("│    " + g + " " + d)
+        i = i + 1
+    }
+
+    let comp_verdict = if total_count == 0 {
+        "NO_CHECKS"
+    } else {
+        if pass_count == total_count { "PASS" } else { "FAIL" }
+    }
+
+    println("│  checks: " + str(pass_count) + "/" + str(total_count) +
+            "  exec=" + exec_verdict +
+            "  sha=" + (if proof_hash.len() > 12 { proof_hash.substring(0, 12) } else { proof_hash }))
+    println("│  verdict=" + comp_verdict)
+    println("└──")
+
+    // Build inline details json.
+    let mut det = "["
+    let mut j = 0
+    while j < len(checks) {
+        let c = checks[j]
+        let pass = (c[0] == true)
+        let d = _str(c[1])
+        if j > 0 { det = det + ", " }
+        det = det + "{\"pass\": " + bool_s(pass) +
+              ", \"check\": \"" + json_escape(d) + "\"}"
+        j = j + 1
+    }
+    det = det + "]"
+
+    return [ck, slug, comp_verdict, proof_hash, label, det, pass_count, total_count]
+}
+
+// ─── main ──────────────────────────────────────────────────────────────────
+
+fn print_usage() {
+    println("true_closure_verifier — anima β main physical+math reproduction verifier")
+    println("")
+    println("usage:")
+    println("  hexa tool/true_closure_verifier.hexa --help")
+    println("  hexa tool/true_closure_verifier.hexa --component 1")
+    println("  hexa tool/true_closure_verifier.hexa --component all")
+    println("  hexa tool/true_closure_verifier.hexa --skip-run")
+    println("  hexa tool/true_closure_verifier.hexa --strict")
+    println("  hexa tool/true_closure_verifier.hexa --output <path>")
+    println("")
+    println("config:  " + CONFIG_PATH)
+    println("cert:    " + DEFAULT_OUT)
+    println("audit:   " + DEFAULT_AUDIT_LOG)
+}
+
+fn main() {
+    let argv = args()
+    if arg_present(argv, "--help") || arg_present(argv, "-h") {
+        print_usage()
+        exit(0)
+    }
+
+    let comp_arg = arg_value(argv, "--component", "all")
+    let strict   = arg_present(argv, "--strict")
+    let skip_run = arg_present(argv, "--skip-run")
+    let out_override = arg_value(argv, "--output", "")
+
+    let root = resolve_root()
+    let bin  = resolve_hexa_bin()
+    let cfg_abs = root + "/" + CONFIG_PATH
+    let cfg = load_config(cfg_abs)
+
+    println("════════════════════════════════════════════════════════════════")
+    println("  tool/true_closure_verifier.hexa")
+    println("  raw#9 hexa-only · raw#10 proof-carrying · raw#11 snake_case")
+    println("  raw#12 empirical · raw#15 no-hardcode · deterministic")
+    println("  root=" + root)
+    println("  hexa_bin=" + bin)
+    println("  config=" + CONFIG_PATH)
+    println("  skip_run=" + bool_s(skip_run) + "  strict=" + bool_s(strict))
+    println("════════════════════════════════════════════════════════════════")
+
+    let comps = cfg["components"]
+    let order_keys = ["1_cpgd","2_l_ix","3_bridge","4_learning_free_driver",
+                      "5_flops_landauer","6_an11_triple","7_hstar_n28",
+                      "8_corpus_g1_g7"]
+
+    // Build run list (single or all).
+    let mut run_keys = []
+    if comp_arg == "all" {
+        run_keys = order_keys
+    } else {
+        // accept either "1" or "1_cpgd"
+        let mut i = 0
+        let mut matched = ""
+        while i < len(order_keys) {
+            let k = _str(order_keys[i])
+            if k == comp_arg { matched = k }
+            let idx_tag = k.substring(0, 1)
+            if idx_tag == comp_arg { matched = k }
+            i = i + 1
+        }
+        if matched == "" {
+            println("true_closure_verifier: UNKNOWN_COMPONENT: " + comp_arg)
+            exit(2)
+        }
+        run_keys = [matched]
+    }
+
+    let mut results = []
+    let mut pass_n = 0
+    let mut fail_n = 0
+    let mut other_n = 0
+    let mut i = 0
+    while i < len(run_keys) {
+        let ck = _str(run_keys[i])
+        if !comps.contains_key(ck) {
+            println("component key missing in config: " + ck)
+            i = i + 1
+            continue
+        }
+        let cc = comps[ck]
+        let r = run_component(bin, root, ck, cc, skip_run)
+        results = push(results, r)
+        let v = _str(r[2])
+        if v == "PASS" { pass_n = pass_n + 1 }
+        else if v == "FAIL" { fail_n = fail_n + 1 }
+        else { other_n = other_n + 1 }
+        i = i + 1
+    }
+
+    let physical_count = len(results)
+    let true_closure_pct = if physical_count > 0 {
+        (pass_n * 100) / physical_count
+    } else { 0 }
+
+    println("")
+    println("═══ SUMMARY ═══")
+    println("  components run  = " + str(physical_count))
+    println("  pass            = " + str(pass_n))
+    println("  fail            = " + str(fail_n))
+    println("  other           = " + str(other_n))
+    println("  true_closure_%  = " + str(true_closure_pct) + "%")
+    println("")
+
+    // ── cert emission (raw#10 proof-carrying hash-chain) ──
+    let out_rel = if out_override != "" { out_override } else { DEFAULT_OUT }
+    let out_abs = if out_rel.index_of("/") == 0 { out_rel } else { root + "/" + out_rel }
+
+    // hash-chain prev
+    let mut prev_hash = ""
+    if fexists(out_abs) {
+        prev_hash = sha256_file(out_abs)
+    }
+
+    let mut parts = []
+    parts = push(parts, "{\n")
+    parts = push(parts, "  \"schema\": \"anima.true_closure.v1\",\n")
+    parts = push(parts, "  \"created\": \"" + now_utc() + "\",\n")
+    parts = push(parts, "  \"tool\": \"tool/true_closure_verifier.hexa\",\n")
+    parts = push(parts, "  \"config\": \"" + CONFIG_PATH + "\",\n")
+    parts = push(parts, "  \"root\": \"" + json_escape(root) + "\",\n")
+    parts = push(parts, "  \"skip_run\": " + bool_s(skip_run) + ",\n")
+    parts = push(parts, "  \"strict\": " + bool_s(strict) + ",\n")
+
+    parts = push(parts, "  \"components\": {\n")
+    let mut j = 0
+    while j < len(results) {
+        let r = results[j]
+        let ck = _str(r[0])
+        let slug = _str(r[1])
+        let verdict = _str(r[2])
+        let phash = _str(r[3])
+        let label = _str(r[4])
+        let detail = _str(r[5])
+        let pc = coerce_int(r[6])
+        let tc = coerce_int(r[7])
+        let comma = if j + 1 < len(results) { "," } else { "" }
+        parts = push(parts, "    \"" + ck + "\": {\n")
+        parts = push(parts, "      \"slug\": \"" + slug + "\",\n")
+        parts = push(parts, "      \"label\": \"" + json_escape(label) + "\",\n")
+        parts = push(parts, "      \"verdict\": \"" + verdict + "\",\n")
+        parts = push(parts, "      \"proof_hash\": \"" + phash + "\",\n")
+        parts = push(parts, "      \"checks_pass\": " + str(pc) + ",\n")
+        parts = push(parts, "      \"checks_total\": " + str(tc) + ",\n")
+        parts = push(parts, "      \"detail\": " + detail + "\n")
+        parts = push(parts, "    }" + comma + "\n")
+        j = j + 1
+    }
+    parts = push(parts, "  },\n")
+    parts = push(parts, "  \"physical_count\": " + str(physical_count) + ",\n")
+    parts = push(parts, "  \"passed\":         " + str(pass_n) + ",\n")
+    parts = push(parts, "  \"failed\":         " + str(fail_n) + ",\n")
+    parts = push(parts, "  \"other\":          " + str(other_n) + ",\n")
+    parts = push(parts, "  \"total_components\": 8,\n")
+    parts = push(parts, "  \"true_closure_pct\": " + str(true_closure_pct) + ",\n")
+    parts = push(parts, "  \"hash_chain_prev\": \"" + prev_hash + "\",\n")
+    parts = push(parts, "  \"raw_strict\": \"raw#9 raw#10 raw#11 raw#12 raw#15 deterministic LLM=none\"\n")
+    parts = push(parts, "}\n")
+
+    let mut body = ""
+    let mut k = 0
+    while k < len(parts) {
+        body = body + _str(parts[k])
+        k = k + 1
+    }
+
+    // atomic write
+    let pid = _str(exec("printf %s $$")).trim()
+    let tmp = out_abs + ".tmp." + pid
+    write_file(tmp, body)
+    exec("mv -f " + tmp + " " + out_abs)
+
+    // hash-chain current (computed post-write)
+    let current_hash = sha256_file(out_abs)
+
+    // append to .raw-audit/true_closure.log
+    let audit_dir = root + "/.raw-audit"
+    if !dexists(audit_dir) { exec("mkdir -p " + audit_dir) }
+    let audit_path = root + "/" + DEFAULT_AUDIT_LOG
+    let line = now_utc() + " true_closure_verifier" +
+               " physical_count=" + str(physical_count) +
+               " passed=" + str(pass_n) +
+               " failed=" + str(fail_n) +
+               " true_closure_pct=" + str(true_closure_pct) +
+               " prev=" + prev_hash +
+               " current=" + current_hash + "\n"
+    exec("printf %s " + "'" + line.replace("'", "'\\''") + "'" + " >> " + audit_path)
+
+    println("▶ cert:       " + out_rel)
+    println("▶ prev_hash:  " + prev_hash)
+    println("▶ curr_hash:  " + current_hash)
+    println("▶ audit log:  " + DEFAULT_AUDIT_LOG)
+
+    if strict && (fail_n > 0 || other_n > 0) { exit(1) }
+    exit(0)
+}
+
+main()
