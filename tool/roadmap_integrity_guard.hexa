@@ -1,23 +1,24 @@
-// tool/roadmap_integrity_guard.hexa — OS-level live 실수 방지 7-check guard
+// tool/roadmap_integrity_guard.hexa — OS-level live 실수 방지 8-check guard
 //
 // PURPOSE
 //   이번 세션에서 12+ 건 발생한 .roadmap / paths.json / SSOT drift
-//   실수 패턴을 7 개 체크로 자동 감지한다. report-only (auto-fix 는
+//   실수 패턴을 8 개 체크로 자동 감지한다. report-only (auto-fix 는
 //   tool/roadmap_mistake_auto_fix.hexa 로 분리).
 //
 // CHECKS
-//   #1 lint        — hexa /hexa-lang/tool/roadmap_lint.hexa → violations==0
-//   #2 uchg        — ls -lO .roadmap → "uchg" 포함 required
-//   #3 paths_drift — paths.json path-like string 후행 설명 / line-range flag
-//   #4 file_drift  — 선언 path vs repo 실체 비교 + 유사 이름 제안
-//   #5 ssot_stale  — shared/state/*_audit.json validator_status stale flag
-//   #6 lock        — /tmp/hexa_stage0.lock.d long-hold PID 기록
-//   #7 coverage    — .roadmap vs paths.json vs tool/*.hexa symmetric diff
+//   #1 lint         — hexa /hexa-lang/tool/roadmap_lint.hexa → violations==0
+//   #2 uchg         — ls -lO .roadmap → "uchg" 포함 required
+//   #3 paths_drift  — paths.json path-like string 후행 설명 / line-range flag
+//   #4 file_drift   — 선언 path vs repo 실체 비교 + 유사 이름 제안
+//   #5 ssot_stale   — state/*_audit.json validator_status stale flag
+//   #6 lock         — /tmp/hexa_stage0.lock.d long-hold PID 기록
+//   #7 coverage     — .roadmap vs paths.json vs tool/*.hexa symmetric diff
+//   #8 closure_debt — closure_debt_scanner SSOT debt_hits/score readback (WARN)
 //
 // USAGE
 //   hexa tool/roadmap_integrity_guard.hexa              full run, exit 1 on ERROR
 //   hexa tool/roadmap_integrity_guard.hexa --json       emit SSOT only, silent
-//   hexa tool/roadmap_integrity_guard.hexa --check N    run single check (1..7)
+//   hexa tool/roadmap_integrity_guard.hexa --check N    run single check (1..8)
 //   hexa tool/roadmap_integrity_guard.hexa --config P   override config path
 //   hexa tool/roadmap_integrity_guard.hexa --help
 //
@@ -411,7 +412,7 @@ fn check_4_file_drift(cfg) -> array {
 
 // ─── check #5: SSOT validator_status stale ──────────────────────────
 //
-// Iterate shared/state/*_audit.json, look for validator_status /
+// Iterate state/*_audit.json, look for validator_status /
 // gate_status / strict_status fields matching "NOT_EXECUTED" or
 // "PENDING". Emits SSOT_STALE warning per file.
 fn _list_dir(dir: string, pattern: string) -> array {
@@ -652,6 +653,69 @@ fn check_7_coverage(cfg) -> array {
     return ["check_7_coverage", "INFO", summary, detail]
 }
 
+// ─── check #8: closure_debt pattern detection ──────────────────────
+//
+// Reads the closure_debt_scanner SSOT (shared/state/closure_debt_result.json)
+// if present and reports debt_hits / closure_debt_score. If SSOT missing
+// suggests the scanner invocation. Does NOT re-invoke the scanner here
+// (stage0 is serialized; embedded invocation would deadlock).
+fn _json_field_num(raw: string, key: string) -> int {
+    // "key": <digits> — parse integer after colon.
+    let needle = "\"" + key + "\""
+    let k = raw.index_of(needle)
+    if k < 0 { return 0 }
+    let rest = raw.substring(k + len(needle), len(raw))
+    let mut j = 0
+    while j < len(rest) {
+        let c = rest.substring(j, j + 1)
+        if c == " " || c == "\t" || c == ":" { j = j + 1 } else { break }
+    }
+    if j >= len(rest) { return 0 }
+    // optional leading minus
+    let mut sign = 1
+    if rest.substring(j, j + 1) == "-" { sign = -1; j = j + 1 }
+    let mut v = 0
+    let mut saw = false
+    while j < len(rest) {
+        let c = rest.substring(j, j + 1)
+        if c == "0" { v = v * 10 + 0; saw = true; j = j + 1 }
+        else if c == "1" { v = v * 10 + 1; saw = true; j = j + 1 }
+        else if c == "2" { v = v * 10 + 2; saw = true; j = j + 1 }
+        else if c == "3" { v = v * 10 + 3; saw = true; j = j + 1 }
+        else if c == "4" { v = v * 10 + 4; saw = true; j = j + 1 }
+        else if c == "5" { v = v * 10 + 5; saw = true; j = j + 1 }
+        else if c == "6" { v = v * 10 + 6; saw = true; j = j + 1 }
+        else if c == "7" { v = v * 10 + 7; saw = true; j = j + 1 }
+        else if c == "8" { v = v * 10 + 8; saw = true; j = j + 1 }
+        else if c == "9" { v = v * 10 + 9; saw = true; j = j + 1 }
+        else { break }
+    }
+    if !saw { return 0 }
+    return v * sign
+}
+
+fn check_8_closure_debt(cfg) -> array {
+    let ccfg = cfg["checks"]["check_8_closure_debt"]
+    let ssot_path = to_string(ccfg["closure_debt_result"])
+    let scanner_path = to_string(ccfg["closure_debt_scanner"])
+    if !_file_exists(ssot_path) {
+        let hint = "run: hexa " + scanner_path + " --all --auto-dispatch"
+        return ["check_8_closure_debt", "INFO", "closure_debt SSOT 부재 (raw#12 추측 exempt) — " + hint, []]
+    }
+    let raw = read_file(ssot_path)
+    let score = _json_field_num(raw, "closure_debt_score")
+    let debt  = _json_field_num(raw, "debt_hits")
+    let ex    = _json_field_num(raw, "exempt_hits")
+    let ts_s  = _json_field_str(raw, "ts")
+    if debt == 0 {
+        return ["check_8_closure_debt", "PASS", "debt_hits=0 exempt=" + to_string(ex) + " ts=" + ts_s, []]
+    }
+    let items = ["ssot: " + ssot_path,
+                 "debt_hits=" + to_string(debt) + " exempt=" + to_string(ex) + " score=" + to_string(score),
+                 "run: hexa " + scanner_path + " --all --auto-dispatch"]
+    return ["check_8_closure_debt", "WARN", "closure_debt detected score=" + to_string(score), items]
+}
+
 // ─── dispatcher ─────────────────────────────────────────────────────
 
 fn run_check(cfg, n: int) -> array {
@@ -662,6 +726,7 @@ fn run_check(cfg, n: int) -> array {
     if n == 5 { return check_5_ssot_stale(cfg) }
     if n == 6 { return check_6_lock(cfg) }
     if n == 7 { return check_7_coverage(cfg) }
+    if n == 8 { return check_8_closure_debt(cfg) }
     return ["check_unknown_" + to_string(n), "FAIL", "unknown check number", []]
 }
 
@@ -772,7 +837,7 @@ fn main() -> int {
     if _flag(av, "--help") || _flag(av, "-h") {
         println("usage: hexa tool/roadmap_integrity_guard.hexa [opts]")
         println("  --json                emit SSOT only, suppress human output")
-        println("  --check N             run single check (1..7)")
+        println("  --check N             run single check (1..8)")
         println("  --config <path>       override config path")
         println("  --help")
         return 0
@@ -786,14 +851,14 @@ fn main() -> int {
     let mut results = []
     if single != "" {
         let n = to_int(single)
-        if n < 1 || n > 7 {
-            eprintln("integrity_guard: --check must be 1..7")
+        if n < 1 || n > 8 {
+            eprintln("integrity_guard: --check must be 1..8")
             return 2
         }
         results.push(run_check(cfg, n))
     } else {
         let mut n = 1
-        while n <= 7 {
+        while n <= 8 {
             results.push(run_check(cfg, n))
             n = n + 1
         }

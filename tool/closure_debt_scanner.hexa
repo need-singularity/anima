@@ -1,0 +1,732 @@
+// tool/closure_debt_scanner.hexa — OS-level "남은 제약" pattern 자동 감지
+//
+// PURPOSE
+//   agent completion report / SSOT JSON / docs MD / rolling /tmp/claude-*
+//   task output 파일을 스캔하여 "남은 제약", "TBD", "PENDING",
+//   "SKIPPED_LOCK_CONTENTION", "추후 follow-up" 등 closure_debt 패턴을
+//   감지한다. 감지 시 auto_dispatch 가 true 이면 roadmap_auto_reflect
+//   에 gap 으로 넘겨 .roadmap 신규 planned entry 를 제안한다
+//   (항상 --dry-run, 실제 write 는 user 확인 후).
+//
+// USAGE
+//   hexa tool/closure_debt_scanner.hexa --input <text-or-path>
+//   hexa tool/closure_debt_scanner.hexa --scan-ssot
+//   hexa tool/closure_debt_scanner.hexa --scan-docs
+//   hexa tool/closure_debt_scanner.hexa --scan-tmp
+//   hexa tool/closure_debt_scanner.hexa --all
+//   hexa tool/closure_debt_scanner.hexa --auto-dispatch           # emits proposals SSOT
+//   hexa tool/closure_debt_scanner.hexa --smoke                   # task 54 fixture
+//   hexa tool/closure_debt_scanner.hexa --config <path>
+//   hexa tool/closure_debt_scanner.hexa --help
+//
+// EXIT CODES
+//   0  scan completed, no closure_debt detected
+//   1  scan completed, WARN (debt_count > 0, severity=WARN)
+//   2  config / setup problem
+//   3  scan completed, ERROR (debt_count > 0, severity=ERROR)
+//
+// RULES
+//   raw#9  hexa-only     raw#11 snake_case    raw#15 no-hardcode (config JSON)
+//   raw#12 exempt list   raw#10 .raw-audit append via SSOT log
+//
+// CLOSURE_DEBT_SCORE (non-negative, target 0)
+//   = (debt_hits * 1.0) − (exempt_hits * 1.0)
+//   (exempt hits subtract so raw#12 guesswork 이 합법)
+
+let DEFAULT_CONFIG = "/Users/ghost/core/anima/config/closure_debt_patterns.json"
+
+// ─── sys helpers ─────────────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    let mut out = "'"
+    out = out + s.replace("'", "'\\''")
+    out = out + "'"
+    return out
+}
+
+fn _exec_out(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _exec_code(cmd: string) -> int {
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+fn _file_exists(path: string) -> bool {
+    let r = exec_with_status("test -e " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _dir_exists(path: string) -> bool {
+    let r = exec_with_status("test -d " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _ts_epoch() -> string {
+    return _exec_out("date -u +%s").trim()
+}
+
+fn _ts_iso() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _eta_plus_days(days: int) -> string {
+    // BSD date (macOS) first; GNU fallback
+    let cmd_bsd = "date -u -v+" + to_string(days) + "d +%Y-%m-%d 2>/dev/null"
+    let r1 = _exec_out(cmd_bsd).trim()
+    if r1 != "" { return r1 }
+    let cmd_gnu = "date -u -d '+" + to_string(days) + " days' +%Y-%m-%d 2>/dev/null"
+    return _exec_out(cmd_gnu).trim()
+}
+
+fn _mkdir_p(dir: string) -> bool {
+    return _exec_code("mkdir -p " + _sh_quote(dir)) == 0
+}
+
+// ─── argv ────────────────────────────────────────────────────────────
+
+fn _argv() -> array {
+    let a = args()
+    let mut out = []
+    let mut i = 2
+    while i < len(a) {
+        out.push(a[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn _flag(av: array, k: string) -> bool {
+    for x in av {
+        if to_string(x) == k { return true }
+    }
+    return false
+}
+
+fn _opt(av: array, k: string, d: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && i + 1 < len(av) {
+            return to_string(av[i + 1])
+        }
+        i = i + 1
+    }
+    return d
+}
+
+// ─── config load ─────────────────────────────────────────────────────
+
+fn _load_config(path: string) {
+    if !_file_exists(path) {
+        eprintln("closure_debt_scanner: SETUP_ERROR — config missing: " + path)
+        exit(2)
+    }
+    let raw = read_file(path)
+    let cfg = json_parse(raw)
+    return cfg
+}
+
+fn _cfg_str(cfg, key: string, dflt: string) -> string {
+    if cfg.contains_key(key) { return to_string(cfg[key]) }
+    return dflt
+}
+
+// ─── JSON escape ─────────────────────────────────────────────────────
+
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+// ─── pattern matcher ─────────────────────────────────────────────────
+
+// Check if body contains phrase (case-sensitive).
+fn _contains(body: string, phrase: string) -> bool {
+    return body.index_of(phrase) >= 0
+}
+
+// Count non-overlapping occurrences of phrase in body.
+fn _count_occurrences(body: string, phrase: string) -> int {
+    if len(phrase) == 0 { return 0 }
+    let mut count = 0
+    let mut start = 0
+    while start < len(body) {
+        let rest = body.substring(start, len(body))
+        let k = rest.index_of(phrase)
+        if k < 0 { break }
+        count = count + 1
+        start = start + k + len(phrase)
+    }
+    return count
+}
+
+// Scan a single text blob. Returns array of hits:
+//   [{"phrase":"...","count":N,"is_exempt":bool}]
+fn scan_text(body: string, deny: array, exempt: array) -> array {
+    let mut hits = []
+    // exempt first — exempt windows override deny.
+    let mut exempt_ranges = []
+    for ex in exempt {
+        let p = to_string(ex)
+        let cnt = _count_occurrences(body, p)
+        if cnt > 0 {
+            let mut h = #{}
+            h["phrase"] = p
+            h["count"] = cnt
+            h["is_exempt"] = true
+            hits.push(h)
+        }
+    }
+    for d in deny {
+        let p = to_string(d)
+        let cnt = _count_occurrences(body, p)
+        if cnt > 0 {
+            let mut h = #{}
+            h["phrase"] = p
+            h["count"] = cnt
+            h["is_exempt"] = false
+            hits.push(h)
+        }
+    }
+    return hits
+}
+
+// ─── input resolution ────────────────────────────────────────────────
+
+fn _load_input(spec: string) -> string {
+    if _file_exists(spec) { return read_file(spec) }
+    return spec  // treat as literal inline text
+}
+
+// List files matching a glob pattern under repo_root.
+fn _ls_glob(repo_root: string, pat: string) -> array {
+    let full = repo_root + "/" + pat
+    let cmd = "ls " + full + " 2>/dev/null"
+    let out = _exec_out(cmd)
+    let lines = split(out, "\n")
+    let mut acc = []
+    for l in lines {
+        let t = to_string(l).trim()
+        if len(t) > 0 { acc.push(t) }
+    }
+    return acc
+}
+
+// Tail last N lines from a file.
+fn _tail_lines(path: string, n: int) -> string {
+    let cmd = "tail -n " + to_string(n) + " " + _sh_quote(path) + " 2>/dev/null"
+    return _exec_out(cmd)
+}
+
+// Recursive list of *.output files under claude tmp root.
+fn _find_claude_output(root: string) -> array {
+    if !_dir_exists(root) { return [] }
+    let cmd = "find " + _sh_quote(root) + " -type f -name '*.output' 2>/dev/null"
+    let out = _exec_out(cmd)
+    let lines = split(out, "\n")
+    let mut acc = []
+    for l in lines {
+        let t = to_string(l).trim()
+        if len(t) > 0 { acc.push(t) }
+    }
+    return acc
+}
+
+// ─── source scans ────────────────────────────────────────────────────
+//
+// Each scan_* function returns array of per-source results:
+//   [{"source":"...","hits":[...], "debt_count":N, "exempt_count":M}]
+//
+fn _source_result(source: string, hits: array) {
+    let mut debt = 0
+    let mut ex = 0
+    for h in hits {
+        let is_ex = h["is_exempt"]
+        let cnt = to_int(to_string(h["count"]))
+        if is_ex { ex = ex + cnt } else { debt = debt + cnt }
+    }
+    let mut r = #{}
+    r["source"] = source
+    r["hits"] = hits
+    r["debt_count"] = debt
+    r["exempt_count"] = ex
+    return r
+}
+
+fn scan_inline(text: string, deny: array, exempt: array) -> array {
+    let hits = scan_text(text, deny, exempt)
+    let mut out = []
+    out.push(_source_result("inline:<input>", hits))
+    return out
+}
+
+fn scan_file(path: string, deny: array, exempt: array) -> array {
+    let body = read_file(path)
+    let hits = scan_text(body, deny, exempt)
+    let mut out = []
+    out.push(_source_result(path, hits))
+    return out
+}
+
+fn scan_ssot(cfg, deny: array, exempt: array) -> array {
+    let repo_root = _cfg_str(cfg, "repo_root", "/Users/ghost/core/anima")
+    let sources = cfg["scan_sources"]
+    let globs = sources["ssot_globs"]
+    let scanner_self = repo_root + "/state/closure_debt_log.json"
+    let scanner_self_2 = repo_root + "/state/closure_debt_result.json"
+    let scanner_self_3 = repo_root + "/state/closure_debt_dispatch_proposals.json"
+
+    let mut results = []
+    let mut gi = 0
+    while gi < len(globs) {
+        let pat = to_string(globs[gi])
+        let files = _ls_glob(repo_root, pat)
+        for f in files {
+            let path = to_string(f)
+            // skip self outputs (prevents recursive self-detection)
+            if path == scanner_self { continue }
+            if path == scanner_self_2 { continue }
+            if path == scanner_self_3 { continue }
+            if !_file_exists(path) { continue }
+            let body = read_file(path)
+            let hits = scan_text(body, deny, exempt)
+            if len(hits) > 0 {
+                results.push(_source_result(path, hits))
+            }
+        }
+        gi = gi + 1
+    }
+    return results
+}
+
+fn scan_docs(cfg, deny: array, exempt: array) -> array {
+    let repo_root = _cfg_str(cfg, "repo_root", "/Users/ghost/core/anima")
+    let sources = cfg["scan_sources"]
+    let globs = sources["doc_globs"]
+
+    let mut results = []
+    let mut gi = 0
+    while gi < len(globs) {
+        let pat = to_string(globs[gi])
+        let files = _ls_glob(repo_root, pat)
+        for f in files {
+            let path = to_string(f)
+            if !_file_exists(path) { continue }
+            let body = read_file(path)
+            let hits = scan_text(body, deny, exempt)
+            if len(hits) > 0 {
+                results.push(_source_result(path, hits))
+            }
+        }
+        gi = gi + 1
+    }
+    return results
+}
+
+fn scan_tmp(cfg, deny: array, exempt: array) -> array {
+    let sources = cfg["scan_sources"]
+    let root = to_string(sources["claude_tmp_root"])
+    let tail_n = to_int(to_string(sources["claude_tmp_tail_lines"]))
+    let files = _find_claude_output(root)
+    let mut results = []
+    for f in files {
+        let path = to_string(f)
+        let body = _tail_lines(path, tail_n)
+        let hits = scan_text(body, deny, exempt)
+        if len(hits) > 0 {
+            results.push(_source_result(path, hits))
+        }
+    }
+    return results
+}
+
+// ─── aggregation ─────────────────────────────────────────────────────
+
+fn aggregate(all_results: array) {
+    let mut total_debt = 0
+    let mut total_exempt = 0
+    let mut total_sources = 0
+    let mut unique_phrases = []
+    for r in all_results {
+        total_sources = total_sources + 1
+        total_debt = total_debt + to_int(to_string(r["debt_count"]))
+        total_exempt = total_exempt + to_int(to_string(r["exempt_count"]))
+        let hits = r["hits"]
+        for h in hits {
+            if h["is_exempt"] { continue }
+            let p = to_string(h["phrase"])
+            let mut seen = false
+            for u in unique_phrases {
+                if to_string(u) == p { seen = true }
+            }
+            if !seen { unique_phrases.push(p) }
+        }
+    }
+    let mut agg = #{}
+    agg["total_sources_with_hits"] = total_sources
+    agg["debt_hits"] = total_debt
+    agg["exempt_hits"] = total_exempt
+    agg["closure_debt_score"] = total_debt - total_exempt
+    agg["unique_debt_phrases"] = unique_phrases
+    return agg
+}
+
+// ─── auto-dispatch (roadmap_auto_reflect integration) ────────────────
+
+// Build a markdown-table audit report consumable by roadmap_auto_reflect
+// Format (task 42 convention):
+//   | file | category | coverage_pct | reason |
+// `file` — source path
+// `category` — ops (roadmap_track_default)
+// `coverage_pct` — 0 (no closure for the debt phrase)
+// `reason` — "closure_debt pattern '<phrase>' (x N) — 해결 필요"
+fn build_dispatch_report(all_results: array, cfg) -> string {
+    let mut s = ""
+    s = s + "# closure_debt audit — " + _ts_iso() + "\n\n"
+    s = s + "Generated by tool/closure_debt_scanner.hexa. Each row represents a\n"
+    s = s + "closure_debt pattern that agent report / SSOT / doc left unresolved.\n\n"
+    s = s + "| file | category | coverage_pct | reason |\n"
+    s = s + "|------|----------|--------------|--------|\n"
+    for r in all_results {
+        let src = to_string(r["source"])
+        let hits = r["hits"]
+        for h in hits {
+            if h["is_exempt"] { continue }
+            let phrase = to_string(h["phrase"])
+            let cnt = to_string(h["count"])
+            s = s + "| " + src + " | ops | 0 | closure_debt pattern '" + phrase + "' (x" + cnt + ") — 해결 필요 (코드/SSOT 까지 완료, 언급만 아님) |\n"
+        }
+    }
+    s = s + "\nEnd of closure_debt audit.\n"
+    return s
+}
+
+fn dispatch_proposals(cfg, all_results: array) -> array {
+    let repo_root = _cfg_str(cfg, "repo_root", "/Users/ghost/core/anima")
+    let hexa_bin = _cfg_str(cfg, "hexa_bin", "/Users/ghost/.hx/bin/hexa")
+    let output = cfg["output"]
+    let proposals_path = to_string(output["dispatch_proposals"])
+    let eta_days = to_int(to_string(cfg["eta_offset_days"]))
+    let track = _cfg_str(cfg, "roadmap_track_default", "ops")
+    let phase = _cfg_str(cfg, "roadmap_phase_default", "quick-win")
+    let eta = _eta_plus_days(eta_days)
+
+    // Write audit report to /tmp
+    let audit_path = "/tmp/closure_debt_audit_" + _ts_epoch() + ".md"
+    let body = build_dispatch_report(all_results, cfg)
+    write_file(audit_path, body)
+
+    // Call roadmap_auto_reflect in --dry-run mode
+    let reflect_tool = repo_root + "/tool/roadmap_auto_reflect.hexa"
+    let cmd = "cd " + _sh_quote(repo_root) + " && " +
+              _sh_quote(hexa_bin) + " " + _sh_quote(reflect_tool) +
+              " --audit-report " + _sh_quote(audit_path) +
+              " --dry-run 2>&1"
+    let r = exec_with_status(cmd)
+    let out = to_string(r[0])
+    let code = r[1]
+
+    // Parse proposed roadmap ids from reflect stdout
+    // Pattern: "  PROPOSE  #<N> track=<...>  <file>"
+    let mut proposed_ids = []
+    let lines = split(out, "\n")
+    for l in lines {
+        let t = to_string(l).trim()
+        let k = t.index_of("PROPOSE  #")
+        if k >= 0 {
+            let rest = t.substring(k + len("PROPOSE  #"), len(t))
+            let sp = rest.index_of(" ")
+            let id_s = if sp > 0 { rest.substring(0, sp) } else { rest }
+            proposed_ids.push(id_s.trim())
+        }
+    }
+
+    // Emit proposals SSOT
+    let mut parts = []
+    parts.push("{\n")
+    parts.push("  \"schema\": \"anima.closure_debt.dispatch.v1\",\n")
+    parts.push("  \"ts\": \"" + _ts_iso() + "\",\n")
+    parts.push("  \"audit_report\": \"" + _json_escape(audit_path) + "\",\n")
+    parts.push("  \"roadmap_auto_reflect_exit\": " + to_string(code) + ",\n")
+    parts.push("  \"track_default\": \"" + track + "\",\n")
+    parts.push("  \"phase_default\": \"" + phase + "\",\n")
+    parts.push("  \"eta\": \"" + eta + "\",\n")
+    parts.push("  \"proposed_roadmap_ids\": [")
+    let mut i = 0
+    while i < len(proposed_ids) {
+        let id_s = to_string(proposed_ids[i])
+        let comma = if i + 1 < len(proposed_ids) { ", " } else { "" }
+        parts.push(id_s + comma)
+        i = i + 1
+    }
+    parts.push("]\n}\n")
+    let body2 = parts.join("")
+    let _ = _mkdir_p("/Users/ghost/core/anima/state")
+    let _ = write_file(proposals_path, body2)
+
+    return proposed_ids
+}
+
+// ─── SSOT log emission ───────────────────────────────────────────────
+
+fn emit_log(cfg, all_results: array, agg, auto_dispatched: array, roadmap_ids: array, trigger: string) -> string {
+    let output = cfg["output"]
+    let log_path = to_string(output["log_path"])
+    let summary_path = to_string(output["summary_ssot"])
+
+    // Build log entry
+    let mut parts = []
+    parts.push("{\n")
+    parts.push("  \"schema\": \"anima.closure_debt.result.v1\",\n")
+    parts.push("  \"ts\": \"" + _ts_iso() + "\",\n")
+    parts.push("  \"tool\": \"tool/closure_debt_scanner.hexa\",\n")
+    parts.push("  \"trigger\": \"" + _json_escape(trigger) + "\",\n")
+    parts.push("  \"sources_scanned\": " + to_string(len(all_results)) + ",\n")
+    parts.push("  \"debt_hits\": " + to_string(agg["debt_hits"]) + ",\n")
+    parts.push("  \"exempt_hits\": " + to_string(agg["exempt_hits"]) + ",\n")
+    parts.push("  \"closure_debt_score\": " + to_string(agg["closure_debt_score"]) + ",\n")
+    parts.push("  \"unique_debt_phrases\": [")
+    let phrases = agg["unique_debt_phrases"]
+    let mut pi = 0
+    while pi < len(phrases) {
+        let p = to_string(phrases[pi])
+        let comma = if pi + 1 < len(phrases) { ", " } else { "" }
+        parts.push("\"" + _json_escape(p) + "\"" + comma)
+        pi = pi + 1
+    }
+    parts.push("],\n")
+    let dispatched_bool = if len(auto_dispatched) > 0 { "true" } else { "false" }
+    parts.push("  \"auto_dispatched\": " + dispatched_bool + ",\n")
+    parts.push("  \"proposed_roadmap_ids\": [")
+    let mut ri = 0
+    while ri < len(roadmap_ids) {
+        let id_s = to_string(roadmap_ids[ri])
+        let comma2 = if ri + 1 < len(roadmap_ids) { ", " } else { "" }
+        parts.push(id_s + comma2)
+        ri = ri + 1
+    }
+    parts.push("],\n")
+    parts.push("  \"sources\": [\n")
+    let mut si = 0
+    while si < len(all_results) {
+        let r = all_results[si]
+        let comma3 = if si + 1 < len(all_results) { "," } else { "" }
+        parts.push("    { \"source\": \"" + _json_escape(to_string(r["source"])) + "\"")
+        parts.push(", \"debt_count\": " + to_string(r["debt_count"]))
+        parts.push(", \"exempt_count\": " + to_string(r["exempt_count"]))
+        parts.push(", \"debt_patterns\": [")
+        let hits = r["hits"]
+        let mut hi = 0
+        let mut emitted = 0
+        while hi < len(hits) {
+            let h = hits[hi]
+            if !h["is_exempt"] {
+                if emitted > 0 { parts.push(", ") }
+                let p = to_string(h["phrase"])
+                let c = to_string(h["count"])
+                parts.push("\"" + _json_escape(p) + " x" + c + "\"")
+                emitted = emitted + 1
+            }
+            hi = hi + 1
+        }
+        parts.push("] }" + comma3 + "\n")
+        si = si + 1
+    }
+    parts.push("  ]\n")
+    parts.push("}\n")
+    let body = parts.join("")
+
+    // Append to log (JSONL-style — each entry is a standalone JSON object)
+    let mut prior = ""
+    if _file_exists(log_path) { prior = read_file(log_path) }
+    let _ = _mkdir_p("/Users/ghost/core/anima/state")
+    let _ = write_file(log_path, prior + body)
+
+    // Summary SSOT (single-object, always-replaced)
+    let _ = write_file(summary_path, body)
+
+    return summary_path
+}
+
+// ─── human print ─────────────────────────────────────────────────────
+
+fn print_human(all_results: array, agg, roadmap_ids: array) {
+    println("── closure_debt_scanner ──")
+    println("  sources_scanned:    " + to_string(len(all_results)))
+    println("  debt_hits:          " + to_string(agg["debt_hits"]))
+    println("  exempt_hits:        " + to_string(agg["exempt_hits"]))
+    println("  closure_debt_score: " + to_string(agg["closure_debt_score"]))
+
+    let phrases = agg["unique_debt_phrases"]
+    if len(phrases) > 0 {
+        println("  unique_debt_phrases:")
+        for p in phrases {
+            println("    · " + to_string(p))
+        }
+    }
+
+    if len(all_results) > 0 {
+        println("")
+        println("  per-source:")
+        let cap = if len(all_results) < 12 { len(all_results) } else { 12 }
+        let mut i = 0
+        while i < cap {
+            let r = all_results[i]
+            let src = to_string(r["source"])
+            let dc = to_string(r["debt_count"])
+            let ec = to_string(r["exempt_count"])
+            println("    [" + dc + "d/" + ec + "e] " + src)
+            let hits = r["hits"]
+            let hcap = if len(hits) < 4 { len(hits) } else { 4 }
+            let mut hi = 0
+            while hi < hcap {
+                let h = hits[hi]
+                if !h["is_exempt"] {
+                    println("       · '" + to_string(h["phrase"]) + "' x" + to_string(h["count"]))
+                }
+                hi = hi + 1
+            }
+            i = i + 1
+        }
+        if len(all_results) > cap {
+            println("    · (+" + to_string(len(all_results) - cap) + " more sources suppressed)")
+        }
+    }
+
+    if len(roadmap_ids) > 0 {
+        println("")
+        println("  auto_dispatched proposed_roadmap_ids: " + to_string(len(roadmap_ids)))
+        let mut k = 0
+        while k < len(roadmap_ids) {
+            println("    #" + to_string(roadmap_ids[k]))
+            k = k + 1
+        }
+    }
+}
+
+// ─── smoke test ──────────────────────────────────────────────────────
+
+fn build_smoke_fixture(cfg) -> string {
+    let path = _cfg_str(cfg, "smoke_fixture_task54", "/tmp/closure_debt_smoke_task54_20260421.md")
+    let mut s = ""
+    s = s + "# task 54 fake agent report (closure_debt smoke fixture)\n\n"
+    s = s + "This is a simulated agent completion report for unit-testing the\n"
+    s = s + "closure_debt_scanner. It deliberately uses patterns the scanner\n"
+    s = s + "should flag.\n\n"
+    s = s + "## 작업 완료\n"
+    s = s + "- install_os_enforcement.hexa landed (~800 lines)\n"
+    s = s + "- chflags uchg 자동 복구 완료\n\n"
+    s = s + "## 남은 제약\n"
+    s = s + "- fsevents 부재 환경 → launchd 1h tick 으로 대체\n"
+    s = s + "- auto-fix 범위: chflags 만 자동, 나머지 MANUAL (raw#12 추측 제외)\n"
+    s = s + "- phase 3 vLLM bridge 연결 준비됨 (PENDING)\n\n"
+    s = s + "## 추후 follow-up\n"
+    s = s + "- lock 해제 후 재실행 필요\n"
+    s = s + "- TBD: ∂V_RG/∂W backprop 미완 — 별도 fix\n"
+    s = s + "- NOT_EXECUTED stage 3 (SKIPPED_LOCK_CONTENTION)\n\n"
+    s = s + "End of fake report.\n"
+    write_file(path, s)
+    return path
+}
+
+// ─── entrypoint ──────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = _argv()
+
+    if _flag(av, "--help") || _flag(av, "-h") {
+        println("usage: hexa tool/closure_debt_scanner.hexa [opts]")
+        println("  --input <text|path>       scan one inline text or file")
+        println("  --scan-ssot               scan state/*.json (exclude self)")
+        println("  --scan-docs               scan docs/*.md")
+        println("  --scan-tmp                scan /tmp/claude-*/tasks/*.output tails")
+        println("  --all                     all of the above")
+        println("  --auto-dispatch           invoke roadmap_auto_reflect (dry-run)")
+        println("  --smoke                   scan task 54 fixture (built-in)")
+        println("  --config <path>           override config")
+        println("  --help")
+        return 0
+    }
+
+    let cfg_path = _opt(av, "--config", DEFAULT_CONFIG)
+    let cfg = _load_config(cfg_path)
+    let deny = cfg["deny_phrases"]
+    let exempt = cfg["exempt_phrases"]
+
+    let want_input = _opt(av, "--input", "")
+    let want_ssot  = _flag(av, "--scan-ssot")
+    let want_docs  = _flag(av, "--scan-docs")
+    let want_tmp   = _flag(av, "--scan-tmp")
+    let want_all   = _flag(av, "--all")
+    let want_disp  = _flag(av, "--auto-dispatch")
+    let want_smoke = _flag(av, "--smoke")
+
+    let mut all_results = []
+    let mut trigger = ""
+
+    if want_smoke {
+        let fix = build_smoke_fixture(cfg)
+        trigger = trigger + "smoke(" + fix + ") "
+        let rs = scan_file(fix, deny, exempt)
+        for r in rs { all_results.push(r) }
+    }
+
+    if want_input != "" {
+        trigger = trigger + "input "
+        if _file_exists(want_input) {
+            let rs = scan_file(want_input, deny, exempt)
+            for r in rs { all_results.push(r) }
+        } else {
+            let rs = scan_inline(want_input, deny, exempt)
+            for r in rs { all_results.push(r) }
+        }
+    }
+
+    if want_all || want_ssot {
+        trigger = trigger + "ssot "
+        let rs = scan_ssot(cfg, deny, exempt)
+        for r in rs { all_results.push(r) }
+    }
+    if want_all || want_docs {
+        trigger = trigger + "docs "
+        let rs = scan_docs(cfg, deny, exempt)
+        for r in rs { all_results.push(r) }
+    }
+    if want_all || want_tmp {
+        trigger = trigger + "tmp "
+        let rs = scan_tmp(cfg, deny, exempt)
+        for r in rs { all_results.push(r) }
+    }
+
+    if trigger == "" {
+        eprintln("closure_debt_scanner: no scan source selected (use --help)")
+        return 2
+    }
+
+    let agg = aggregate(all_results)
+
+    let mut roadmap_ids = []
+    let mut auto_dispatched = []
+    if want_disp && agg["debt_hits"] > 0 {
+        roadmap_ids = dispatch_proposals(cfg, all_results)
+        for id_s in roadmap_ids { auto_dispatched.push(id_s) }
+    }
+
+    let summary = emit_log(cfg, all_results, agg, auto_dispatched, roadmap_ids, trigger.trim())
+
+    print_human(all_results, agg, roadmap_ids)
+    println("")
+    println("  log:          " + to_string(cfg["output"]["log_path"]))
+    println("  summary_ssot: " + summary)
+    if want_disp {
+        println("  dispatch:     " + to_string(cfg["output"]["dispatch_proposals"]))
+    }
+
+    // Exit policy
+    let sev = _cfg_str(cfg, "severity", "WARN")
+    let score = agg["closure_debt_score"]
+    if score <= 0 { return 0 }
+    if sev == "ERROR" { return 3 }
+    return 1
+}
