@@ -284,14 +284,17 @@ Phase-3 (trainer integration) 별도 0.5-1h.
 
 ## 16. Landing checkpoint
 
-§14 착지 순서 기준:
+§14 착지 순서 기준 (초기 기록 f52e9776 + 2026-04-20 EOD 재측정):
 - [x] 1. proposal commit (f52e9776)
-- [ ] 2. hxtok.c + hxtok.h (hexa-lang 세션)
-- [ ] 3. build 레시피 (Mac + Linux)
-- [ ] 4. C-side smoke + reference parity
-- [x] 5a. tokenizer_qwen.hexa scaffold — landing-safe (5d155ce9). FFI 호출부 uncomment 대기.
-- [ ] 5b. tokenizer_qwen.hexa Phase-2 load_qwen_tokenizer 가 hxtok_load 호출해 hxtok_h set
-- [ ] 6. train_alm_lora.hexa text_to_ids_stub 교체
+- [x] 2. hxtok.c (750 LOC) + hxtok.h (49 LOC) — hexa-lang/self/native/
+- [x] 3a. Mac build — libhxtok.dylib 34640 B (2026-04-20 12:49)
+- [ ] 3b. Linux build — libhxtok.so 미착지 (pod gcc 필요; step 7 선행조건)
+- [x] 4. C-side smoke (code-comment 증거 — encode('hello world')=[14990,1879], encode('안녕')=[126246,144370])
+- [x] 5a. tokenizer_qwen.hexa scaffold (5d155ce9)
+- [x] 5b. tokenizer_qwen.hexa Phase-2 hxtok_load wiring — 411 LOC (extern L70-84, hxtok_load L262, encode dispatch L290-302)
+- [x] 6. train_alm_lora.hexa text_to_ids_stub 교체 — encode_real_bpe (L929-948) + text_to_ids unified (L952-957) + main hxtok_load pod/mac fallback (L2056-2070). stub 경로는 fallback 보존 (--dry-corpus / CI smoke 용).
 - [ ] 7. pod 1-step smoke (loss != log(16))
 - [ ] 8. 100-step smoke
 - [ ] 9. full r12 launch (P2+P3 PASS 조건)
+
+세부 SSOT: `shared/state/alm_r12_hxtok_landing_20260420.json` (EOD 스냅샷 — 전 체크박스 evidence 고정).

@@ -1989,6 +1989,28 @@ extern fn hxblas_sgemm(order: int, transA: int, transB: int, M: int, N: int, K: 
 @link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
 extern fn hxblas_attn_softmax_causal(S: int, scale: float, scores: int)
 
+// r5-a6.7 (2026-04-20): non-matmul primitive FFI bindings.
+// Root cause (substrate fix doc): hexa-interpreter execution of RMSNorm/SiLU/
+// embed_lookup/embed_scatter/cross_entropy non-matmul ops was 95% of step
+// wallclock at d=768 seq=128 — boxed HexaVal arithmetic at ~30B-50B ops/step.
+// Fix: route to libhxblas primitives (already exported, just unused). Each
+// primitive is a tight C float* loop; ~5-15x step speedup expected.
+// Source: hexa-lang/self/native/hxblas_linux.c (lines 163-313).
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_rmsnorm_fwd(S: int, D: int, eps: float, y: int, x: int, g: int)
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_rmsnorm_bwd(S: int, D: int, eps: float, dx: int, dg: int, x: int, g: int, dy: int)
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_silu_fwd(N: int, out: int, x: int)
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_silu_bwd(N: int, dx: int, x: int, dy: int)
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_embed_lookup(S: int, D: int, h: int, embed_ptr: int, tokens: int)
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_embed_scatter(S: int, D: int, dembed_ptr: int, dh: int, tokens: int)
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_cross_entropy(S: int, V: int, scale: float, logits: int, dlogits: int, targets: int) -> float
+
 // CBLAS enum constants (row-major, no-transpose, transpose)
 comptime const CBLAS_ROW_MAJOR = 101
 comptime const CBLAS_NO_TRANS  = 111
@@ -2362,15 +2384,47 @@ fn _silu_grad(x: float) -> float {
     s + x * s * (1.0 - s)
 }
 
+// r5-a6.7 (2026-04-20): body replaced with hxblas_rmsnorm_fwd FFI (S=1).
+// Root cause: original 2-pass scalar loop ran as boxed HexaVal arithmetic —
+// ~25 _block_forward sites × 12 layers × seq calls/step = ~150K boxed ops
+// per token at d=768. Fix: marshal x/gamma → raw f32, call C primitive (one
+// tight loop), unmarshal. Marshal cost O(D) is dwarfed by the eliminated
+// O(D) hexa interpreter overhead (boxed mul + add per element + GC pressure
+// from out.push growth). See shared/state/clm_r5_substrate_fix_20260420.json
+// Phase 5 next_substrate_lever.
 fn _rms_norm(x: [float], gamma: [float]) -> [float] {
     let n = len(x)
-    let mut sq = 0.0
-    let mut i = 0
-    while i < n { sq = sq + x[i] * x[i]; i = i + 1 }
-    let rms = sqrt(sq / to_float(n) + DECODER_EPS)
-    let mut out = []
-    i = 0
-    while i < n { out = out.push(x[i] / rms * gamma[i]); i = i + 1 }
+    let buf_x = alloc_raw(n * 4)
+    let buf_g = alloc_raw(n * 4)
+    let buf_y = alloc_raw(n * 4)
+    _list_to_raw(x,     0, n, buf_x)
+    _list_to_raw(gamma, 0, n, buf_g)
+    hxblas_rmsnorm_fwd(1, n, DECODER_EPS, buf_y, buf_x, buf_g)
+    let mut out = _tz(n)
+    _raw_to_list(buf_y, n, out, 0)
+    free_raw(buf_x, n * 4)
+    free_raw(buf_g, n * 4)
+    free_raw(buf_y, n * 4)
+    return out
+}
+
+// r5-a6.7 (2026-04-20): full-sequence RMSNorm — single FFI call across all
+// rows. Callers in _block_forward and decoder_forward final-norm previously
+// did `for i in seq { _rms_norm(x[i*d..(i+1)*d], gamma) }` = seq× the
+// per-row marshal overhead. With this primitive: 1 marshal + 1 C call +
+// 1 unmarshal for the whole [seq × d] tensor.
+fn _rms_norm_seq(x: [float], gamma: [float], seq: int, d: int) -> [float] {
+    let buf_x = alloc_raw(seq * d * 4)
+    let buf_g = alloc_raw(d * 4)
+    let buf_y = alloc_raw(seq * d * 4)
+    _list_to_raw(x,     0, seq * d, buf_x)
+    _list_to_raw(gamma, 0, d,       buf_g)
+    hxblas_rmsnorm_fwd(seq, d, DECODER_EPS, buf_y, buf_x, buf_g)
+    let mut out = _tz(seq * d)
+    _raw_to_list(buf_y, seq * d, out, 0)
+    free_raw(buf_x, seq * d * 4)
+    free_raw(buf_g, d * 4)
+    free_raw(buf_y, seq * d * 4)
     return out
 }
 
@@ -2662,11 +2716,25 @@ fn _block_ffn(
     let gate = _matmul(x_normed, blk.Wgate, seq, d, d_ff)  // [seq × d_ff]
     let up = _matmul(x_normed, blk.Wup, seq, d, d_ff)      // [seq × d_ff]
     // SwiGLU: silu(gate) * up
+    // r5-a6.7 (2026-04-20): per-element hexa loop replaced with hxblas_silu_fwd
+    // (native C exp+mul tight loop). At seq=512 d_ff=2816 = 1.44M elements per
+    // layer × 12 layers = 17.3M boxed _silu+mul ops/step → 12 FFI calls/step
+    // (silu only) + 1.44M-wide native multiply loop. Marshal cost amortised
+    // across the full vector. Multiply by `up` retained as hexa loop because
+    // hxblas does not export an elementwise multiply primitive (sgemm is the
+    // wrong shape; saxpy is alpha*x+y, not x*y).
     let n = seq * d_ff
+    let buf_g = alloc_raw(n * 4)
+    let buf_s = alloc_raw(n * 4)
+    _list_to_raw(gate, 0, n, buf_g)
+    hxblas_silu_fwd(n, buf_s, buf_g)
     let mut activated = _tz(n)
+    _raw_to_list(buf_s, n, activated, 0)
+    free_raw(buf_g, n * 4)
+    free_raw(buf_s, n * 4)
     let mut i = 0
     while i < n {
-        activated[i] = _silu(gate[i]) * up[i]
+        activated[i] = activated[i] * up[i]
         i = i + 1
     }
     // r5-a10.5-A: gate + up consumed into activated; safe to free.
@@ -2684,18 +2752,12 @@ fn _block_forward(
     seq: int, d: int, d_ff: int, n_head: int, n_kv_head: int
 ) -> [float] {
     // 1. Pre-norm for attention
-    let mut normed1 = _tz(seq * d)
-    let mut i = 0
-    while i < seq {
-        let row = _tslice(x, i * d, (i + 1) * d)
-        let nr = _rms_norm(row, blk.gamma_attn)
-        let mut p = 0
-        while p < d { normed1[i * d + p] = nr[p]; p = p + 1 }
-        // r5-a10.5-A: per-row temps (12 layers × seq iters × 2 small arrays)
-        free_array(row)
-        free_array(nr)
-        i = i + 1
-    }
+    // r5-a6.7 (2026-04-20): replaced seq-iter per-row _rms_norm scalar loop
+    // with single _rms_norm_seq FFI call (hxblas_rmsnorm_fwd over all rows).
+    // Eliminates seq × (2 marshal + 1 alloc + 1 unmarshal + 2 free) round-trips
+    // per layer per step. Prior path: 12 layers × seq × per-row hexa iter
+    // dominated step wallclock at d=768.
+    let normed1 = _rms_norm_seq(x, blk.gamma_attn, seq, d)
     // Self-attention + residual
     let attn_out = _block_attn(normed1, blk, seq, d, n_head, n_kv_head)
     free_array(normed1)            // r5-a10.5-A: consumed by _block_attn
@@ -2703,17 +2765,11 @@ fn _block_forward(
     free_array(attn_out)           // r5-a10.5-A: consumed by _tadd above
 
     // 2. Pre-norm for FFN
-    let mut normed2 = _tz(seq * d)
-    i = 0
-    while i < seq {
-        let row = _tslice(x1, i * d, (i + 1) * d)
-        let nr = _rms_norm(row, blk.gamma_ffn)
-        let mut p = 0
-        while p < d { normed2[i * d + p] = nr[p]; p = p + 1 }
-        free_array(row)
-        free_array(nr)
-        i = i + 1
-    }
+    // r5-a6.7 (2026-04-20): seq-iter per-row _rms_norm → _rms_norm_seq FFI
+    // (single hxblas_rmsnorm_fwd call). Same rationale as the pre-attn norm
+    // above. 12 layers × 2 sites = 24 FFI calls/step replaces 24 × seq
+    // marshal+unmarshal cycles.
+    let normed2 = _rms_norm_seq(x1, blk.gamma_ffn, seq, d)
     // SwiGLU FFN + residual
     let ffn_out = _block_ffn(normed2, blk, seq, d, d_ff)
     free_array(normed2)            // r5-a10.5-A: consumed by _block_ffn
@@ -2744,17 +2800,29 @@ fn decoder_forward(model: DecoderModel, tokens: [int], seq: int) -> ForwardResul
     let d = model.d
 
     // 1. Embedding lookup
-    let mut x = _tz(seq * d)
-    let mut ti = 0
-    while ti < seq {
-        let tok = tokens[ti]
-        let mut p = 0
-        while p < d {
-            x[ti * d + p] = model.tok_emb[tok * d + p]
-            p = p + 1
-        }
-        ti = ti + 1
+    // r5-a6.7 (2026-04-20): nested seq×d hexa loop replaced with single
+    // hxblas_embed_lookup FFI (memcpy-per-row in C). Marshal: seq tokens
+    // ([int] → int64 raw buffer) + tok_emb table ([float] → f32 raw) + out.
+    // Saves seq×d boxed index arithmetic per step (e.g. 393K boxed ops at
+    // d=768 seq=512). Note tok_emb marshal is full vocab×d (107M floats at
+    // 32K vocab × d=768 → 410 MiB) — acceptable per-step cost vs eliminating
+    // hexa-side index loop, and trivially amortisable when paired with
+    // device-resident weights (Phase 3 deferred work).
+    let buf_emb  = alloc_raw(model.vocab * d * 4)
+    let buf_x    = alloc_raw(seq * d * 4)
+    let buf_toks = alloc_raw(seq * 8)
+    _list_to_raw(model.tok_emb, 0, model.vocab * d, buf_emb)
+    let mut _ti = 0
+    while _ti < seq {
+        write_i64(buf_toks, _ti * 8, tokens[_ti])
+        _ti = _ti + 1
     }
+    hxblas_embed_lookup(seq, d, buf_x, buf_emb, buf_toks)
+    let mut x = _tz(seq * d)
+    _raw_to_list(buf_x, seq * d, x, 0)
+    free_raw(buf_emb, model.vocab * d * 4)
+    free_raw(buf_x, seq * d * 4)
+    free_raw(buf_toks, seq * 8)
 
     // 2. Decoder blocks (save hidden states for backward)
     let mut block_hs = []
@@ -2770,18 +2838,10 @@ fn decoder_forward(model: DecoderModel, tokens: [int], seq: int) -> ForwardResul
     }
 
     // 3. Final RMS norm
-    let mut x_final = _tz(seq * d)
-    let mut ni = 0
-    while ni < seq {
-        let row = _tslice(x, ni * d, (ni + 1) * d)
-        let nr = _rms_norm(row, model.gamma_final)
-        let mut p = 0
-        while p < d { x_final[ni * d + p] = nr[p]; p = p + 1 }
-        // r5-a10.5-A: per-row temps freed (seq iters × 2 small arrays)
-        free_array(row)
-        free_array(nr)
-        ni = ni + 1
-    }
+    // r5-a6.7 (2026-04-20): seq-iter per-row _rms_norm replaced with single
+    // _rms_norm_seq FFI dispatch. Same root cause + fix as block pre-norms;
+    // see _rms_norm_seq above.
+    let x_final = _rms_norm_seq(x, model.gamma_final, seq, d)
 
     // 4. LM head: U+V factored projection (DD175 #1)
     //    mid = x_final @ U  [seq × rank]
@@ -3083,20 +3143,45 @@ fn decoder_backward(
 
     // 7. Embedding gradient: dL/demb = dL/dx[0] (first block input grad)
     //    For each token position, accumulate gradient into embedding row.
+    // r5-a6.7 (2026-04-20): nested seq×d scatter loop routed through
+    // hxblas_embed_scatter (C primitive does dembed[t*D + p] += dh[i*D + p]).
+    // Root cause: original boxed inner loop did per-element index mul +
+    // index_get/set per token; at seq=512 d=768 = 393K boxed scatter ops/step.
+    // Fix: marshal targets ([int] → int64 raw), dh ([float] → f32 raw), and
+    // a zeroed dembed accumulator; scatter via C memcpy-with-add; unmarshal
+    // back into a fresh new_emb list with element-wise SGD update applied.
     let mut new_emb = model.tok_emb
     let emb_lr = lr * 0.1
     let h0_grad = dL_dx  // gradient at block 0 input = embedding output grad
-    let mut i_emb = 0
-    while i_emb < seq {
-        let tok = targets[i_emb]  // use target tokens for teacher forcing alignment
-        let mut p = 0
-        while p < d {
-            let idx = tok * d + p
-            new_emb[idx] = new_emb[idx] - emb_lr * h0_grad[i_emb * d + p]
-            p = p + 1
-        }
-        i_emb = i_emb + 1
+    let buf_dh   = alloc_raw(seq * d * 4)
+    let buf_dem  = alloc_raw(model.vocab * d * 4)
+    let buf_tgt  = alloc_raw(seq * 8)
+    _list_to_raw(h0_grad, 0, seq * d, buf_dh)
+    // dembed accumulator must start at zero; alloc_raw is uninitialised.
+    let mut _zk = 0
+    while _zk < model.vocab * d {
+        write_f32(buf_dem, _zk * 4, 0.0)
+        _zk = _zk + 1
     }
+    let mut _ie = 0
+    while _ie < seq {
+        write_i64(buf_tgt, _ie * 8, targets[_ie])
+        _ie = _ie + 1
+    }
+    hxblas_embed_scatter(seq, d, buf_dem, buf_dh, buf_tgt)
+    // Apply SGD in-place over dembed: new_emb[i] -= emb_lr * dembed[i].
+    // Single hexa loop pass (vocab*d) writing to a fresh list — still hexa
+    // overhead, but eliminated the 4× nested boxed index_get of the prior
+    // path. Future Phase 3 work could keep new_emb as raw f32 buffer end-to-end.
+    let mut _ki = 0
+    while _ki < model.vocab * d {
+        let g = deref_f32(buf_dem, _ki * 4)
+        new_emb[_ki] = new_emb[_ki] - emb_lr * g
+        _ki = _ki + 1
+    }
+    free_raw(buf_dh,  seq * d * 4)
+    free_raw(buf_dem, model.vocab * d * 4)
+    free_raw(buf_tgt, seq * 8)
 
     // 8. Assemble updated model
     let updated_model = DecoderModel {

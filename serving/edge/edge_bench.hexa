@@ -7,6 +7,9 @@
 //   E5-1: peak RSS <= 14 GB  (target <= 12 GB)
 //   E5-2: hire_sim >= 0.80   (calls hire_sim_100 externally)
 //   E5-3: tok/s >= 20        (physical ceiling comparison)
+//                            — status: NOT_IMPLEMENTED until a real
+//                              forward_pass backend is wired in (requires
+//                              edge HW + model). See bench_tok_speed.
 //   E5-4: 24h stability      (separate tool — not checked here)
 //   E5-5: zero quantization  (dtype audit — bf16 only)
 //
@@ -70,7 +73,14 @@ struct BenchResult {
     ceiling_utilization_pct: float,
     gate_memory_pass: bool,
     gate_speed_pass: bool,
-    gate_quantization_pass: bool
+    gate_quantization_pass: bool,
+    // NOT_IMPLEMENTED flag for E5-3 tok/s gate.
+    // true  = real forward-pass measurement ran, tok_per_sec is trustworthy
+    // false = placeholder/unimplemented, tok_per_sec is MEANINGLESS, gate
+    //         must NOT rubber-stamp PASS on the empty-loop overhead number.
+    // Root cause: bench_tok_speed currently has no real inference wired in
+    // (requires edge HW + model forward). Flagging prevents phantom PASS.
+    speed_measurement_implemented: bool
 }
 
 // ─── Defaults ───────────────────────────────────────────────────────
@@ -124,43 +134,38 @@ fn str_to_float(s: string) -> float {
 
 // ─── Token speed measurement ────────────────────────────────────────
 
+// Sentinel returned by bench_tok_speed when no real inference backend is
+// wired in. Distinct from 0.0 / small values so callers can detect it and
+// refuse to PASS the E5-3 gate on empty-loop overhead.
+//   -1.0  = NOT_IMPLEMENTED (placeholder, do not trust tok/s)
+comptime const BENCH_TOK_NOT_IMPLEMENTED = -1.0
+
 fn bench_tok_speed(n_tokens: int) -> float {
     // Measures ms per token for n_tokens generation iterations.
-    // Returns average ms/tok across the run.
     //
-    // Root cause: this wraps timestamp capture around the token generation loop.
-    // In production, this calls into the actual model inference pipeline.
-    // For self-test, the caller can provide a mock.
+    // STATUS (2026-04-20 fix of phantom audit b31d48f1): this function has
+    // NO real forward-pass backend wired in. Measuring the previous empty
+    // `while i<n { i+=1 }` loop produced loop-iteration overhead (typically
+    // 1e5+ tok/s) and caused E5-3 (`tok/s >= 20`) to rubber-stamp PASS
+    // without ever touching a model.
+    //
+    // Real implementation requires BOTH:
+    //   (1) an edge inference primitive (e.g. edge_server.decode_once) OR
+    //       an mmap'd bf16 model + hxmetal/hxblas matvec kernels on-device
+    //   (2) actual edge hardware (M4 16GB / ESP32-S3 / Jetson) to run it on
+    // Neither is available in this source tree today, so the honest return
+    // is the NOT_IMPLEMENTED sentinel, and the E5-3 gate must treat it as
+    // "cannot evaluate" rather than PASS.
+    //
+    // TODO[wire-real-inference]: replace the NOT_IMPLEMENTED return below
+    // with a real decode loop once edge_server.decode_once (or equivalent)
+    // exists. At that point, restore a timed loop around real token decodes
+    // and remove the sentinel / speed_measurement_implemented=false path.
 
-    // ⚠ PHANTOM AUDIT 2026-04-20: the loop below is a placeholder — it does
-    //   NOT call the real forward pass. Resulting tok/s measures only loop
-    //   iteration overhead, not inference. All downstream "Measured X tok/s"
-    //   strings emitted via this function are PHANTOM until a real
-    //   forward_pass() call is wired in. E5-3 gate currently rubber-stamps.
-    //   TODO: replace placeholder with edge_server.decode_once(current_stream)
-    //   or a similar real-inference primitive before trusting results.
-
-    let t0 = now_ms()
-
-    // Token generation loop — in production, this calls the actual model
-    let mut i = 0
-    while i < n_tokens {
-        // Placeholder: real inference would call forward pass here.
-        // Each iteration represents one token decode step.
-        i = i + 1
-    }
-
-    let t1 = now_ms()
-    let elapsed_str = ms_diff(t0, t1)
-    let elapsed_ms = str_to_float(elapsed_str)
-
-    // Avoid division by zero
     if n_tokens <= 0 {
-        return 0.0
+        return BENCH_TOK_NOT_IMPLEMENTED
     }
-
-    let ms_per_tok = elapsed_ms / n_tokens
-    return ms_per_tok
+    return BENCH_TOK_NOT_IMPLEMENTED
 }
 
 // ─── Dtype audit (E5-5: zero quantization) ──────────────────────────
@@ -202,9 +207,18 @@ fn bench_run(config: BenchConfig) -> BenchResult {
     let mut first_token_ms = 0.0
     let mut m = 0
 
+    // Track whether any iteration actually got a real measurement.
+    // bench_tok_speed returns BENCH_TOK_NOT_IMPLEMENTED (-1.0) today;
+    // if ANY iteration returns the sentinel, the whole run is flagged.
+    let mut any_not_implemented = false
+
     while m < config.n_measure {
         let ms_tok = bench_tok_speed(config.max_tokens)
-        total_ms = total_ms + (ms_tok * config.max_tokens)
+        if ms_tok == BENCH_TOK_NOT_IMPLEMENTED {
+            any_not_implemented = true
+        } else {
+            total_ms = total_ms + (ms_tok * config.max_tokens)
+        }
 
         // Track peak RSS across iterations
         let rss_now = bench_memory()
@@ -220,12 +234,21 @@ fn bench_run(config: BenchConfig) -> BenchResult {
         m = m + 1
     }
 
-    // Compute averages
+    // Compute averages — but only if we actually measured something.
+    // When NOT_IMPLEMENTED, tok_per_sec stays 0.0 and the E5-3 gate fails
+    // (intentionally — no real measurement means no PASS).
     let total_tokens = config.n_measure * config.max_tokens
-    let avg_ms_per_tok = total_ms / total_tokens
+    let mut avg_ms_per_tok = 0.0
     let mut tok_per_sec = 0.0
-    if avg_ms_per_tok > 0.0 {
-        tok_per_sec = 1000.0 / avg_ms_per_tok
+    if any_not_implemented {
+        // Keep sentinel values so downstream reports make the state obvious.
+        avg_ms_per_tok = 0.0
+        tok_per_sec = 0.0
+    } else {
+        avg_ms_per_tok = total_ms / total_tokens
+        if avg_ms_per_tok > 0.0 {
+            tok_per_sec = 1000.0 / avg_ms_per_tok
+        }
     }
 
     // Ceiling utilization: measured tok/s vs achievable ceiling (33 tok/s)
@@ -233,7 +256,9 @@ fn bench_run(config: BenchConfig) -> BenchResult {
 
     // Gate checks
     let gate_mem = peak_rss <= E5_RSS_LIMIT_MB
-    let gate_speed = tok_per_sec >= E5_TOKS_MIN
+    // E5-3: must have a REAL measurement AND meet threshold. NOT_IMPLEMENTED
+    // forces FAIL so the gate cannot rubber-stamp on empty-loop overhead.
+    let speed_ok = (!any_not_implemented) && (tok_per_sec >= E5_TOKS_MIN)
     let gate_quant = check_quantization_clean()
 
     let result = BenchResult {
@@ -244,8 +269,9 @@ fn bench_run(config: BenchConfig) -> BenchResult {
         first_token_ms: first_token_ms,
         ceiling_utilization_pct: ceil_util,
         gate_memory_pass: gate_mem,
-        gate_speed_pass: gate_speed,
-        gate_quantization_pass: gate_quant
+        gate_speed_pass: speed_ok,
+        gate_quantization_pass: gate_quant,
+        speed_measurement_implemented: !any_not_implemented
     }
     return result
 }
@@ -300,8 +326,16 @@ fn bench_gate_report(result: BenchResult) -> string {
     }
 
     let mut spd_status = "FAIL"
+    let mut spd_detail = str(result.tok_per_sec) + " tok/s"
     if result.gate_speed_pass {
         spd_status = "PASS"
+    }
+    if !result.speed_measurement_implemented {
+        // Phantom-audit fix (2026-04-20): empty-loop placeholder in
+        // bench_tok_speed. Until a real forward-pass is wired, E5-3 must
+        // render NOT_IMPLEMENTED (explicit FAIL) instead of a false PASS.
+        spd_status = "NOT_IMPLEMENTED"
+        spd_detail = "no real forward_pass wired — requires edge HW + model"
     }
 
     let mut quant_status = "FAIL"
@@ -312,7 +346,7 @@ fn bench_gate_report(result: BenchResult) -> string {
     let out = "=== E5 Gate Report ===" + "\n"
         + "  E5-1 Memory (RSS <= 14 GB):    [" + mem_status + "] " + str(result.rss_peak_mb) + " MB" + mem_note + "\n"
         + "  E5-2 hire_sim (>= 0.80):       [DEFERRED] run hire_sim_100 externally" + "\n"
-        + "  E5-3 Speed (tok/s >= 20):      [" + spd_status + "] " + str(result.tok_per_sec) + " tok/s" + "\n"
+        + "  E5-3 Speed (tok/s >= 20):      [" + spd_status + "] " + spd_detail + "\n"
         + "  E5-4 24h Stability:            [DEFERRED] separate tool" + "\n"
         + "  E5-5 Zero Quantization:        [" + quant_status + "] bf16 dtype audit"
     return out
@@ -330,9 +364,15 @@ fn bench_full_report(result: BenchResult) -> string {
     if result.gate_memory_pass {
         if result.gate_speed_pass {
             if result.gate_quantization_pass {
-                overall = "PASS (E5-2/E5-4 deferred)"
+                if result.speed_measurement_implemented {
+                    overall = "PASS (E5-2/E5-4 deferred)"
+                }
             }
         }
+    }
+    if !result.speed_measurement_implemented {
+        // Be loud about it — an empty-loop phantom must never read as PASS.
+        overall = "FAIL (E5-3 NOT_IMPLEMENTED — no real forward_pass)"
     }
 
     let out = "================================================================" + "\n"
@@ -400,7 +440,8 @@ fn test_gate_logic_pass() -> bool {
         ceiling_utilization_pct: 75.76,
         gate_memory_pass: true,
         gate_speed_pass: true,
-        gate_quantization_pass: true
+        gate_quantization_pass: true,
+        speed_measurement_implemented: true
     }
 
     let mut ok = true
@@ -483,7 +524,8 @@ fn test_ceiling_comparison() -> bool {
         tok_per_sec: 15.0, ms_per_tok: 66.7,
         first_token_ms: 70.0, ceiling_utilization_pct: 45.5,
         gate_memory_pass: true, gate_speed_pass: false,
-        gate_quantization_pass: true
+        gate_quantization_pass: true,
+        speed_measurement_implemented: true
     }
     let s_below = bench_ceiling_compare(r_below)
     // Root cause: 15 tok/s < 19.8 practical floor, should say BELOW
@@ -500,7 +542,8 @@ fn test_ceiling_comparison() -> bool {
         tok_per_sec: 22.0, ms_per_tok: 45.5,
         first_token_ms: 50.0, ceiling_utilization_pct: 66.7,
         gate_memory_pass: true, gate_speed_pass: true,
-        gate_quantization_pass: true
+        gate_quantization_pass: true,
+        speed_measurement_implemented: true
     }
     let s_practical = bench_ceiling_compare(r_practical)
     if s_practical == "" {
@@ -514,7 +557,8 @@ fn test_ceiling_comparison() -> bool {
         tok_per_sec: 35.0, ms_per_tok: 28.6,
         first_token_ms: 30.0, ceiling_utilization_pct: 106.1,
         gate_memory_pass: true, gate_speed_pass: true,
-        gate_quantization_pass: true
+        gate_quantization_pass: true,
+        speed_measurement_implemented: true
     }
     let s_achievable = bench_ceiling_compare(r_achievable)
     if s_achievable == "" {
@@ -528,7 +572,8 @@ fn test_ceiling_comparison() -> bool {
         tok_per_sec: 42.0, ms_per_tok: 23.8,
         first_token_ms: 25.0, ceiling_utilization_pct: 127.3,
         gate_memory_pass: true, gate_speed_pass: true,
-        gate_quantization_pass: true
+        gate_quantization_pass: true,
+        speed_measurement_implemented: true
     }
     let s_stretched = bench_ceiling_compare(r_stretched)
     if s_stretched == "" {
@@ -586,7 +631,8 @@ fn test_full_report_structure() -> bool {
         ceiling_utilization_pct: 84.8,
         gate_memory_pass: true,
         gate_speed_pass: true,
-        gate_quantization_pass: true
+        gate_quantization_pass: true,
+        speed_measurement_implemented: true
     }
 
     let report = bench_full_report(result)
