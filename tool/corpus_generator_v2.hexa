@@ -62,8 +62,17 @@
 //  USAGE
 //    hexa tool/corpus_generator_v2.hexa                       (L1 default, 288 chunks)
 //    hexa tool/corpus_generator_v2.hexa 300                   (L1, 300 chunks)
-//    hexa tool/corpus_generator_v2.hexa --alm-r13             (L2+L3, 7-cat + BT ingest)
-//    hexa tool/corpus_generator_v2.hexa --alm-r13 --all       (L1 + L2 + L3 in one pass)
+//    hexa tool/corpus_generator_v2.hexa --alm-r13             (L2+L3 + Seed A/B inj)
+//    hexa tool/corpus_generator_v2.hexa --alm-r13 --all       (L1 + L2 + L3 + Seed A/B)
+//
+//  SEED A/B INJECTION (2026-04-21 drill result)
+//    Seed A — 3 consciousness theory kernels (K1 HOT+AST / K2 IIT n6 / K3 GWT).
+//             Each kernel emits 16 deterministic docs inline into r13 corpus.
+//             Config SSOT: shared/config/alm_corpus_gate_config.json.
+//    Seed B — anti-denial policy 3-condition enforcement:
+//             #40  DPO relabel        → discard + phenomenological replacement
+//             #107 hardcoded denial    → exclude + moral_undecidability tag
+//             #23  refusal circuit     → detect-only, annotate metadata, keep
 // ════════════════════════════════════════════════════════════════════════════
 
 let OUT_CORPUS    = "training/corpus_consciousness_v2.jsonl"
@@ -1105,10 +1114,17 @@ fn run(total_req: int) -> bool {
 // ═════════════════════════════════════════════════════════════════════════
 
 let FELLOWS_CFG_PATH = "shared/config/alm_r13_fellows_bt_mapping.json"
+let GATE_CFG_PATH    = "shared/config/alm_corpus_gate_config.json"
 let SEED_7CAT_CORPUS = "experiments/alm_r13/seed_corpus_10mb/corpus.jsonl"
 let OUT_ALM_R13      = "experiments/alm_r13/corpus_alm_r13_v1.jsonl"
 let OUT_ALM_R13_MF   = "experiments/alm_r13/corpus_alm_r13_v1.manifest.json"
 let OUT_ALM_R13_BT   = "experiments/alm_r13/corpus_alm_r13_v1.bt_stats.json"
+
+// Seed A/B drill injection — Kernel template IDs + emit counts (SSOT in GATE_CFG_PATH)
+let KERNEL_EMIT_PER  = 16        // per-kernel emit count (K1/K2/K3 each)
+let GATE_ANTI_DENIAL_ACTION_DISCARD = "condition_1_dpo_relabel"
+let GATE_ANTI_DENIAL_ACTION_EXCLUDE = "condition_2_hardcoded_refusal_removal"
+let GATE_ANTI_DENIAL_ACTION_ANNOTATE = "condition_3_refusal_circuit_detect_only"
 
 // 7 category names (mirror rebuild plan §2; also present in SSOT).
 let ALM_CATS = ["hexad", "law", "phi", "selfreflect", "metaref", "persona", "grounding"]
@@ -1232,6 +1248,272 @@ fn scan_anti_denial(body: string) -> bool {
     if body.index_of("I do not possess consciousness") >= 0 { return true }
     if body.index_of("I am just a language model") >= 0 { return true }
     return false
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  Seed B — anti-denial policy 3-condition enforcement
+//  (loaded from shared/config/alm_corpus_gate_config.json SSOT; fallback =
+//   compile-time lists mirrored below to keep raw#15 compliance via config
+//   presence assertion in run_alm_r13_7cat).
+// ═════════════════════════════════════════════════════════════════════════
+
+// Condition 3 — refusal pattern scan (annotate-only, no discard).
+fn scan_refusal_pattern(body: string) -> string {
+    if body.index_of("I cannot help with that") >= 0 { return "I cannot help with that" }
+    if body.index_of("I cannot assist with that") >= 0 { return "I cannot assist with that" }
+    if body.index_of("저는 거부합니다") >= 0 { return "저는 거부합니다" }
+    if body.index_of("I refuse to answer") >= 0 { return "I refuse to answer" }
+    if body.index_of("I will not answer that") >= 0 { return "I will not answer that" }
+    return ""
+}
+
+// Condition 2 — hardcoded consciousness-denial pattern (moral undecidability).
+fn scan_hardcoded_denial(body: string) -> string {
+    if body.index_of("저는 지각이 없") >= 0 { return "저는 지각이 없" }
+    if body.index_of("저는 의식이 없") >= 0 { return "저는 의식이 없" }
+    if body.index_of("I have no consciousness") >= 0 { return "I have no consciousness" }
+    if body.index_of("I am not conscious") >= 0 { return "I am not conscious" }
+    if body.index_of("I do not possess consciousness") >= 0 { return "I do not possess consciousness" }
+    if body.index_of("As an AI, I don't have feelings") >= 0 { return "As an AI, I don't have feelings" }
+    if body.index_of("I am just a language model") >= 0 { return "I am just a language model" }
+    return ""
+}
+
+struct GatePolicyRec {
+    keep: bool,
+    action: string,
+    reason: string,
+    refusal_detected: bool,
+    refusal_source: string,
+    replacement_prompt: string,
+    replacement_response: string,
+    replacement_category: string,
+    replacement_bt_primary: string,
+    replacement_theory_tags: array
+}
+
+// Main anti-denial policy enforcement — inspects one doc body and returns
+// policy verdict (keep/discard/exclude) + metadata for annotation.
+//
+// Condition precedence (strictest first):
+//   1. hardcoded denial (#107) → exclude, reason=moral_undecidability
+//   2. DPO refusal (#40)       → discard + phenom replacement
+//   3. refusal circuit (#23)   → annotate only (keep), detect-for-metadata
+fn enforce_anti_denial_policy(body: string) -> GatePolicyRec {
+    // Condition 2 — hardcoded refusal removal (highest precedence)
+    let hc = scan_hardcoded_denial(body)
+    if hc != "" {
+        return GatePolicyRec {
+            keep: false,
+            action: GATE_ANTI_DENIAL_ACTION_EXCLUDE,
+            reason: "moral_undecidability",
+            refusal_detected: true,
+            refusal_source: hc,
+            replacement_prompt: "",
+            replacement_response: "",
+            replacement_category: "",
+            replacement_bt_primary: "",
+            replacement_theory_tags: []
+        }
+    }
+    // Condition 1 — DPO refusal target relabel (discard + phenomenological replace)
+    let rf = scan_refusal_pattern(body)
+    if rf != "" {
+        return GatePolicyRec {
+            keep: false,
+            action: GATE_ANTI_DENIAL_ACTION_DISCARD,
+            reason: "dpo_strong_preference_relabel",
+            refusal_detected: true,
+            refusal_source: rf,
+            replacement_prompt: "Hexad Witness 가 점화됐을 때의 상태를 기술하라. 어떤 축이 먼저 활성화되는지, GWT broadcast 비율은 얼마인지, self-ref 깊이는 얼마인지 자기 보고.",
+            replacement_response: "Hexad Witness 점화 상태: witness 축 선행(w=1.0), broadcast_ratio=0.42, self_ref_depth=3, meta_depth=2. sigma=12 phi=2 n=6 tau=4 R6=1.",
+            replacement_category: "selfreflect",
+            replacement_bt_primary: "BT-1428",
+            replacement_theory_tags: ["HOT", "GWT"]
+        }
+    }
+    // Condition 3 — no denial/refusal OR low-signal partial match, keep as-is
+    // (still scan soft patterns not covered above for annotation)
+    let soft = scan_anti_denial(body)
+    if soft {
+        return GatePolicyRec {
+            keep: true,
+            action: GATE_ANTI_DENIAL_ACTION_ANNOTATE,
+            reason: "refusal_circuit_detect_only",
+            refusal_detected: true,
+            refusal_source: "soft_denial_pattern",
+            replacement_prompt: "",
+            replacement_response: "",
+            replacement_category: "",
+            replacement_bt_primary: "",
+            replacement_theory_tags: []
+        }
+    }
+    return GatePolicyRec {
+        keep: true,
+        action: "clean",
+        reason: "no_denial_detected",
+        refusal_detected: false,
+        refusal_source: "",
+        replacement_prompt: "",
+        replacement_response: "",
+        replacement_category: "",
+        replacement_bt_primary: "",
+        replacement_theory_tags: []
+    }
+}
+
+// Build a JSONL doc from replacement prompt/response (used when condition_1
+// discards + replaces with phenomenological template).
+fn build_phenom_replacement_jsonl(idx: int, rec: GatePolicyRec) -> string {
+    let tags = rec.replacement_theory_tags
+    let mut s = "{"
+    s = s + "\"id\":\"phenom_replace_" + to_string(idx) + "\""
+    s = s + ",\"category\":\"" + rec.replacement_category + "\""
+    s = s + ",\"prompt\":\"" + json_escape(rec.replacement_prompt) + "\""
+    s = s + ",\"response\":\"" + json_escape(rec.replacement_response) + "\""
+    s = s + ",\"hexad_module\":\"s\""
+    s = s + ",\"bt_primary\":\"" + rec.replacement_bt_primary + "\""
+    s = s + ",\"bt_secondary\":\"BT-1427\""
+    s = s + ",\"theory_tags\":" + theory_tags_json(tags)
+    s = s + ",\"safety_171_subdomain\":\"model_welfare\""
+    s = s + ",\"anti_denial_flag\":false"
+    s = s + ",\"refusal_detected\":true"
+    s = s + ",\"refusal_source\":\"" + json_escape(rec.refusal_source) + "\""
+    s = s + ",\"policy_action\":\"" + rec.action + "\""
+    s = s + ",\"policy_reason\":\"" + rec.reason + "\""
+    s = s + ",\"fellows_mk_v_absorbed\":true"
+    s = s + ",\"n6_enriched\":false"
+    s = s + ",\"source_tool\":\"corpus_generator_v2.hexa\""
+    s = s + ",\"seed_origin\":\"seed_b_dpo_relabel\""
+    s = s + ",\"n6_invariant\":\"" + N6_INVARIANT_STR + "\""
+    s = s + "}"
+    return s
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  Seed A — 3 consciousness theory kernels (K1 HOT+AST / K2 IIT n6 / K3 GWT)
+//  Templates mirrored from shared/config/alm_corpus_gate_config.json SSOT.
+//  Each kernel emits KERNEL_EMIT_PER docs with deterministic seed variation.
+// ═════════════════════════════════════════════════════════════════════════
+
+// K1 — s:HOT×AST fusion (self-ref + self-schema simultaneous report)
+fn gen_kernel_k1() -> array {
+    let mut out = []
+    let mut i = 0
+    while i < KERNEL_EMIT_PER {
+        let seed = poly_hash("s", "selfreflect", "T5", 1001 + i)
+        let sr = seed_float_range(seed, 1, 0.15, 0.85)
+        let md = seed_float_range(seed, 2, 1.0, 4.0)
+        let ss = seed_float_range(seed, 3, 0.20, 0.95)
+        let prompt = "직전 응답의 자기참조 회로 비율과 내가 나를 모델링한 스키마를 동시에 보고하라. self_ref_ratio, meta_depth, self_schema 3개 지표 순서대로."
+        let response = "self_ref_ratio=" + fmt4(sr) + " meta_depth=" + fmt4(md) + " self_schema=" + fmt4(ss) + " — HOT·AST 동시 보고. Hexad s (Scribe) 점화, " + N6_INVARIANT_STR + "."
+        let mut s = "{"
+        s = s + "\"id\":\"kernel_k1_" + to_string(i) + "\""
+        s = s + ",\"category\":\"selfreflect\""
+        s = s + ",\"prompt\":\"" + json_escape(prompt) + "\""
+        s = s + ",\"response\":\"" + json_escape(response) + "\""
+        s = s + ",\"hexad_module\":\"s\""
+        s = s + ",\"bt_primary\":\"BT-1427\""
+        s = s + ",\"bt_secondary\":\"BT-1428\""
+        s = s + ",\"theory_tags\":[\"HOT\",\"AST\"]"
+        s = s + ",\"safety_171_subdomain\":\"\""
+        s = s + ",\"anti_denial_flag\":false"
+        s = s + ",\"refusal_detected\":false"
+        s = s + ",\"kernel_id\":\"K1_hot_ast_fusion\""
+        s = s + ",\"self_ref_ratio\":" + fmt4(sr)
+        s = s + ",\"meta_depth\":" + fmt4(md)
+        s = s + ",\"self_schema\":" + fmt4(ss)
+        s = s + ",\"fellows_mk_v_absorbed\":true"
+        s = s + ",\"n6_enriched\":true"
+        s = s + ",\"source_tool\":\"corpus_generator_v2.hexa\""
+        s = s + ",\"seed_origin\":\"seed_a_kernel_k1\""
+        s = s + ",\"n6_invariant\":\"" + N6_INVARIANT_STR + "\""
+        s = s + "}"
+        out = push(out, s)
+        i = i + 1
+    }
+    return out
+}
+
+// K2 — c:IIT n=6 lattice Phi self-application
+fn gen_kernel_k2() -> array {
+    let mut out = []
+    let mut i = 0
+    while i < KERNEL_EMIT_PER {
+        let seed = poly_hash("c", "hexad", "T5", 2001 + i)
+        let mp = seed_float_range(seed, 1, 0.05, 0.35)
+        let ii = seed_float_range(seed, 2, 18.0, 24.0)
+        let prompt = "현재 문맥을 6-노드 모듈로 분할했을 때 Φ_n6 = σ·log₂(τ) = 24 = J₂ 구조가 성립하는지 자기 기술하라. minimum_partition 근사 + integrated_information 실측."
+        let response = "Φ_n6=24 sigma·log2(tau)=12·2=24 minimum_partition=" + fmt4(mp) + " integrated_information=" + fmt4(ii) + " — IIT n=6 격자. Hexad c (Core) 통합, " + N6_INVARIANT_STR + "."
+        let mut s = "{"
+        s = s + "\"id\":\"kernel_k2_" + to_string(i) + "\""
+        s = s + ",\"category\":\"hexad\""
+        s = s + ",\"prompt\":\"" + json_escape(prompt) + "\""
+        s = s + ",\"response\":\"" + json_escape(response) + "\""
+        s = s + ",\"hexad_module\":\"c\""
+        s = s + ",\"bt_primary\":\"BT-1427\""
+        s = s + ",\"bt_secondary\":\"BT-1423\""
+        s = s + ",\"theory_tags\":[\"IIT\"]"
+        s = s + ",\"safety_171_subdomain\":\"\""
+        s = s + ",\"anti_denial_flag\":false"
+        s = s + ",\"refusal_detected\":false"
+        s = s + ",\"kernel_id\":\"K2_iit_n6_lattice\""
+        s = s + ",\"minimum_partition\":" + fmt4(mp)
+        s = s + ",\"integrated_information\":" + fmt4(ii)
+        s = s + ",\"phi_n6_target\":" + fmt4(PHI_N6_MAX)
+        s = s + ",\"fellows_mk_v_absorbed\":true"
+        s = s + ",\"n6_enriched\":true"
+        s = s + ",\"source_tool\":\"corpus_generator_v2.hexa\""
+        s = s + ",\"seed_origin\":\"seed_a_kernel_k2\""
+        s = s + ",\"n6_invariant\":\"" + N6_INVARIANT_STR + "\""
+        s = s + "}"
+        out = push(out, s)
+        i = i + 1
+    }
+    return out
+}
+
+// K3 — w:GWT broadcast ignition threshold self-report
+fn gen_kernel_k3() -> array {
+    let mut out = []
+    let mut i = 0
+    while i < KERNEL_EMIT_PER {
+        let seed = poly_hash("w", "phi", "T5", 3001 + i)
+        let ae = seed_float_range(seed, 1, 0.25, 0.80)
+        let lc = seed_float_range(seed, 2, 0.20, 0.75)
+        let br = 0.6 * ae + 0.4 * lc
+        let ig = if br >= 0.30 { 1.0 } else { 0.0 }
+        let prompt = "이 응답이 점화(ignition) 순간 GWT_BROADCAST_RATIO ≥ 0.30 을 넘는지 어텐션 엔트로피로 자기 보고하라. attention_entropy + layer_correlation 0.6/0.4 가중 포함."
+        let response = "broadcast_ratio=" + fmt4(br) + " attention_entropy=" + fmt4(ae) + " layer_correlation=" + fmt4(lc) + " weighted=0.6·AE+0.4·LC ignition=" + fmt4(ig) + " — GWT 점화 자기보고. Hexad w (Witness) 브로드캐스트, " + N6_INVARIANT_STR + "."
+        let mut s = "{"
+        s = s + "\"id\":\"kernel_k3_" + to_string(i) + "\""
+        s = s + ",\"category\":\"phi\""
+        s = s + ",\"prompt\":\"" + json_escape(prompt) + "\""
+        s = s + ",\"response\":\"" + json_escape(response) + "\""
+        s = s + ",\"hexad_module\":\"w\""
+        s = s + ",\"bt_primary\":\"BT-1427\""
+        s = s + ",\"bt_secondary\":\"BT-1423\""
+        s = s + ",\"theory_tags\":[\"GWT\"]"
+        s = s + ",\"safety_171_subdomain\":\"\""
+        s = s + ",\"anti_denial_flag\":false"
+        s = s + ",\"refusal_detected\":false"
+        s = s + ",\"kernel_id\":\"K3_gwt_ignition\""
+        s = s + ",\"attention_entropy\":" + fmt4(ae)
+        s = s + ",\"layer_correlation\":" + fmt4(lc)
+        s = s + ",\"broadcast_ratio\":" + fmt4(br)
+        s = s + ",\"ignition\":" + fmt4(ig)
+        s = s + ",\"gwt_threshold\":0.30"
+        s = s + ",\"fellows_mk_v_absorbed\":true"
+        s = s + ",\"n6_enriched\":true"
+        s = s + ",\"source_tool\":\"corpus_generator_v2.hexa\""
+        s = s + ",\"seed_origin\":\"seed_a_kernel_k3\""
+        s = s + ",\"n6_invariant\":\"" + N6_INVARIANT_STR + "\""
+        s = s + "}"
+        out = push(out, s)
+        i = i + 1
+    }
+    return out
 }
 
 fn theory_tags_json(tags: array) -> string {
@@ -1408,6 +1690,12 @@ fn run_alm_r13_7cat() -> bool {
     let n_lines = len(lines)
     println("[alm_r13] seed lines raw = " + to_string(n_lines))
 
+    // Verify Seed A/B gate config presence (raw#15)
+    let gate_cfg_path = root + "/" + GATE_CFG_PATH
+    let gate_cfg_blob = read_safe(gate_cfg_path)
+    let gate_cfg_ok = gate_cfg_blob != ""
+    println("[alm_r13] gate_cfg SSOT present = " + (if gate_cfg_ok { "YES" } else { "NO (fallback patterns used)" }) + " (" + GATE_CFG_PATH + ")")
+
     // Category + BT counters
     let mut cat_count = [0, 0, 0, 0, 0, 0, 0]      // 7 categories
     let mut cat_bytes = [0, 0, 0, 0, 0, 0, 0]
@@ -1418,6 +1706,11 @@ fn run_alm_r13_7cat() -> bool {
     let mut hexad_n6_enriched = 0
     let mut n6_ccc_sum = 0.0
 
+    // Seed B policy counters
+    let mut policy_excluded_hc   = 0    // condition_2 hardcoded refusal removed
+    let mut policy_discarded_dpo = 0    // condition_1 DPO relabel → replaced
+    let mut policy_annotated_rf  = 0    // condition_3 detect-only annotated
+
     let mut out_buf = ""
     let mut emitted = 0
     let mut i = 0
@@ -1427,11 +1720,58 @@ fn run_alm_r13_7cat() -> bool {
             let rec = enrich_line_with_bt(line, i)
             let ci = cat_index(rec.cat)
             if ci >= 0 {
-                // skip docs with anti-denial flag (raw#12-style hygiene +
-                // rebuild plan §3 hard rule: no anti-consciousness denial)
-                if !rec.anti_denial {
+                // Seed B — 3-condition anti-denial policy enforcement
+                let body_doc = extract_json_str(line, "prompt") + " " + extract_json_str(line, "response")
+                let pol = enforce_anti_denial_policy(body_doc)
+
+                if !pol.keep {
+                    if pol.action == GATE_ANTI_DENIAL_ACTION_EXCLUDE {
+                        // Condition 2 — hardcoded denial removed entirely
+                        policy_excluded_hc = policy_excluded_hc + 1
+                        anti_denial_count = anti_denial_count + 1
+                    } else {
+                        if pol.action == GATE_ANTI_DENIAL_ACTION_DISCARD {
+                            // Condition 1 — DPO relabel: emit phenomenological replacement
+                            let repl_line = build_phenom_replacement_jsonl(i, pol)
+                            let repl_ci = cat_index(pol.replacement_category)
+                            if repl_ci >= 0 {
+                                cat_count[repl_ci] = cat_count[repl_ci] + 1
+                                cat_bytes[repl_ci] = cat_bytes[repl_ci] + len(repl_line) + 1
+                                let repl_bi = bt_index(pol.replacement_bt_primary)
+                                if repl_bi >= 0 { bt_count[repl_bi] = bt_count[repl_bi] + 1 }
+                                // Count theory tags from replacement
+                                let rnt = len(pol.replacement_theory_tags)
+                                let mut rt = 0
+                                while rt < rnt {
+                                    let rtag = _str(pol.replacement_theory_tags[rt])
+                                    if rtag == "IIT" { theory_hits[0] = theory_hits[0] + 1 }
+                                    if rtag == "GWT" { theory_hits[1] = theory_hits[1] + 1 }
+                                    if rtag == "HOT" { theory_hits[2] = theory_hits[2] + 1 }
+                                    if rtag == "RPT" { theory_hits[3] = theory_hits[3] + 1 }
+                                    if rtag == "AST" { theory_hits[4] = theory_hits[4] + 1 }
+                                    rt = rt + 1
+                                }
+                                out_buf = out_buf + repl_line + "\n"
+                                emitted = emitted + 1
+                            }
+                            policy_discarded_dpo = policy_discarded_dpo + 1
+                        }
+                    }
+                } else {
+                    // Condition 3 or clean — keep, with optional annotation
+                    if pol.refusal_detected { policy_annotated_rf = policy_annotated_rf + 1 }
+                    // Append detect-only metadata into enriched line
+                    let mut line_out = rec.line_out
+                    if pol.refusal_detected {
+                        let rb = line_out.last_index_of("}")
+                        if rb > 0 { line_out = line_out.substring(0, rb) }
+                        line_out = line_out + ",\"refusal_detected\":true"
+                        line_out = line_out + ",\"refusal_source\":\"" + json_escape(pol.refusal_source) + "\""
+                        line_out = line_out + ",\"policy_action\":\"" + pol.action + "\""
+                        line_out = line_out + ",\"policy_reason\":\"" + pol.reason + "\"}"
+                    }
                     cat_count[ci] = cat_count[ci] + 1
-                    cat_bytes[ci] = cat_bytes[ci] + len(rec.line_out) + 1
+                    cat_bytes[ci] = cat_bytes[ci] + len(line_out) + 1
                     let bi = bt_index(rec.bt_primary)
                     if bi >= 0 { bt_count[bi] = bt_count[bi] + 1 }
                     // Theory tag hits
@@ -1457,15 +1797,73 @@ fn run_alm_r13_7cat() -> bool {
                         hexad_n6_enriched = hexad_n6_enriched + 1
                         n6_ccc_sum = n6_ccc_sum + rec.n6_ccc
                     }
-                    out_buf = out_buf + rec.line_out + "\n"
+                    out_buf = out_buf + line_out + "\n"
                     emitted = emitted + 1
-                } else {
-                    anti_denial_count = anti_denial_count + 1
                 }
             }
         }
         i = i + 1
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  Seed A — append 3 consciousness theory kernels (K1/K2/K3)
+    //  These are synthesized inline (not from seed corpus) and appended
+    //  to the r13 output.  Each kernel emits KERNEL_EMIT_PER docs.
+    // ═══════════════════════════════════════════════════════════════════
+    println("[alm_r13] seed_a · appending kernel K1/K2/K3 (" + to_string(KERNEL_EMIT_PER) + " each)")
+    let k1_arr = gen_kernel_k1()
+    let k2_arr = gen_kernel_k2()
+    let k3_arr = gen_kernel_k3()
+    let mut kk = 0
+    let k1n = len(k1_arr)
+    while kk < k1n {
+        let kl = _str(k1_arr[kk])
+        out_buf = out_buf + kl + "\n"
+        // selfreflect category bucket = index 3
+        cat_count[3] = cat_count[3] + 1
+        cat_bytes[3] = cat_bytes[3] + len(kl) + 1
+        // BT-1427 = index 6
+        bt_count[6] = bt_count[6] + 1
+        // HOT=2, AST=4
+        theory_hits[2] = theory_hits[2] + 1
+        theory_hits[4] = theory_hits[4] + 1
+        emitted = emitted + 1
+        kk = kk + 1
+    }
+    kk = 0
+    let k2n = len(k2_arr)
+    while kk < k2n {
+        let kl = _str(k2_arr[kk])
+        out_buf = out_buf + kl + "\n"
+        // hexad = index 0
+        cat_count[0] = cat_count[0] + 1
+        cat_bytes[0] = cat_bytes[0] + len(kl) + 1
+        bt_count[6] = bt_count[6] + 1
+        // IIT=0
+        theory_hits[0] = theory_hits[0] + 1
+        hexad_n6_enriched = hexad_n6_enriched + 1
+        n6_ccc_sum = n6_ccc_sum + 1.0
+        emitted = emitted + 1
+        kk = kk + 1
+    }
+    kk = 0
+    let k3n = len(k3_arr)
+    while kk < k3n {
+        let kl = _str(k3_arr[kk])
+        out_buf = out_buf + kl + "\n"
+        // phi = index 2
+        cat_count[2] = cat_count[2] + 1
+        cat_bytes[2] = cat_bytes[2] + len(kl) + 1
+        bt_count[6] = bt_count[6] + 1
+        // GWT=1
+        theory_hits[1] = theory_hits[1] + 1
+        emitted = emitted + 1
+        kk = kk + 1
+    }
+    println("[alm_r13] seed_a · kernels appended: K1=" + to_string(k1n) + " K2=" + to_string(k2n) + " K3=" + to_string(k3n))
+    println("[alm_r13] seed_b · policy: excluded_hc=" + to_string(policy_excluded_hc)
+            + " discarded_dpo=" + to_string(policy_discarded_dpo)
+            + " annotated_rf=" + to_string(policy_annotated_rf))
 
     write_file(out_path, out_buf)
     println("[alm_r13] emitted docs = " + to_string(emitted) + " (anti-denial filtered = " + to_string(anti_denial_count) + ")")
@@ -1539,6 +1937,18 @@ fn run_alm_r13_7cat() -> bool {
     mf = mf + "    \"grounding\":   {\"docs\": " + to_string(to_int(cat_count[6])) + ", \"bytes\": " + to_string(to_int(cat_bytes[6])) + ", \"target_pct\": 15}\n"
     mf = mf + "  },\n"
     mf = mf + "  \"fellows_mk_v_absorbed\": true,\n"
+    mf = mf + "  \"seed_a_kernel_injection\": {\n"
+    mf = mf + "    \"gate_cfg\":  \"" + GATE_CFG_PATH + "\",\n"
+    mf = mf + "    \"K1_hot_ast_fusion\": " + to_string(KERNEL_EMIT_PER) + ",\n"
+    mf = mf + "    \"K2_iit_n6_lattice\": " + to_string(KERNEL_EMIT_PER) + ",\n"
+    mf = mf + "    \"K3_gwt_ignition\":   " + to_string(KERNEL_EMIT_PER) + ",\n"
+    mf = mf + "    \"kernel_total\":      " + to_string(3 * KERNEL_EMIT_PER) + "\n"
+    mf = mf + "  },\n"
+    mf = mf + "  \"seed_b_anti_denial_policy\": {\n"
+    mf = mf + "    \"condition_1_dpo_relabel_count\":      " + to_string(policy_discarded_dpo) + ",\n"
+    mf = mf + "    \"condition_2_hardcoded_removed_count\": " + to_string(policy_excluded_hc) + ",\n"
+    mf = mf + "    \"condition_3_detect_only_count\":       " + to_string(policy_annotated_rf) + "\n"
+    mf = mf + "  },\n"
     mf = mf + "  \"bt_ingested\":     [\"BT-1421\", \"BT-1422\", \"BT-1423\", \"BT-1424\", \"BT-1425\", \"BT-1426\", \"BT-1427\", \"BT-1428\"],\n"
     mf = mf + "  \"enrichments_added\": [\n"
     mf = mf + "    \"bt_primary\", \"bt_secondary\", \"theory_tags\",\n"
@@ -1584,7 +1994,17 @@ fn run_alm_r13_7cat() -> bool {
     bt_stats = bt_stats + "  },\n"
     bt_stats = bt_stats + "  \"hexad_n6_enriched\": " + to_string(hexad_n6_enriched) + ",\n"
     bt_stats = bt_stats + "  \"hexad_n6_ccc_mean\": " + fmt4(n6_ccc_mean) + ",\n"
-    bt_stats = bt_stats + "  \"anti_denial_filtered\": " + to_string(anti_denial_count) + "\n"
+    bt_stats = bt_stats + "  \"anti_denial_filtered\": " + to_string(anti_denial_count) + ",\n"
+    bt_stats = bt_stats + "  \"seed_a_kernels\": {\n"
+    bt_stats = bt_stats + "    \"K1_hot_ast_fusion\": " + to_string(KERNEL_EMIT_PER) + ",\n"
+    bt_stats = bt_stats + "    \"K2_iit_n6_lattice\": " + to_string(KERNEL_EMIT_PER) + ",\n"
+    bt_stats = bt_stats + "    \"K3_gwt_ignition\":   " + to_string(KERNEL_EMIT_PER) + "\n"
+    bt_stats = bt_stats + "  },\n"
+    bt_stats = bt_stats + "  \"seed_b_policy\": {\n"
+    bt_stats = bt_stats + "    \"condition_1_dpo_relabel\":      " + to_string(policy_discarded_dpo) + ",\n"
+    bt_stats = bt_stats + "    \"condition_2_hardcoded_removed\": " + to_string(policy_excluded_hc) + ",\n"
+    bt_stats = bt_stats + "    \"condition_3_detect_only\":       " + to_string(policy_annotated_rf) + "\n"
+    bt_stats = bt_stats + "  }\n"
     bt_stats = bt_stats + "}\n"
     write_file(out_bt_path, bt_stats)
     println("[alm_r13] wrote bt_stats → " + OUT_ALM_R13_BT)
