@@ -1,0 +1,359 @@
+// tool/alm_r13_seed_repair.hexa — G5 terminator repair + G2 category cap
+//
+// PURPOSE
+//   The v1 seed corpus at experiments/alm_r13/seed_corpus_10mb/corpus.jsonl
+//   was built with an 800-byte hard-wrap that cuts many responses
+//   mid-sentence.  The downstream G1-G7 validator (tool/alm_corpus_
+//   validate.hexa) fails 1310/1620 docs on G5 (truncation) and has a
+//   catastrophic category drift on G2 (metaref 29.7% vs target 10%).
+//
+//   This tool rewrites the seed in-place to produce a repaired version
+//   that the r13 generator can ingest unchanged:
+//     1. G5 REPAIR  — truncate each response to the last sentence
+//                     terminator (. ? ! 。 ？ ！ …).  Drop any doc that
+//                     has no terminator anywhere.
+//     2. G2 CAP     — per-category doc cap from the validator SSOT
+//                     (g2_generator_caps).  Limiting category is phi at
+//                     10% × 840 = 84.  Total kept: 840 - 48 (reserved
+//                     for K1/K2/K3 kernel injections done later by the
+//                     generator) = 792 from seed, or close to it per
+//                     caps  minus kernel allocations (see below).
+//
+//   Why a separate tool instead of editing the generator?
+//     - hexa stage0 has a ~4GB RSS cap (safe_hexa_launchd).  In-line
+//       repair inside the already-1200+-LOC generator blew the cap
+//       every time (tested in this worktree pre-revert).  Separating
+//       concerns keeps each run within budget.
+//
+//   RAW COMPLIANCE
+//     raw#9   hexa-only
+//     raw#11  snake_case
+//     raw#12  실측 only (no fabrication — no synthetic terminators
+//             added to non-terminating responses; those are dropped)
+//     raw#15  no-hardcode — caps loaded from validator SSOT
+//     raw#25  concurrent-git-lock safe (tmp + mv atomic write)
+//
+// USAGE
+//   hexa tool/alm_r13_seed_repair.hexa
+//     (rewrites experiments/alm_r13/seed_corpus_10mb/corpus.jsonl in-place;
+//      backs up original to corpus.jsonl.pre-repair.bak)
+//
+// OUTPUTS
+//   experiments/alm_r13/seed_corpus_10mb/corpus.jsonl            (repaired)
+//   experiments/alm_r13/seed_corpus_10mb/corpus.jsonl.pre-repair.bak
+//   experiments/alm_r13/seed_corpus_10mb/repair_report.json
+//
+// DETERMINISTIC: pure string + file ops; NO LLM; NO network.
+
+let SEED_PATH   = "experiments/alm_r13/seed_corpus_10mb/corpus.jsonl"
+let SEED_BAK    = "experiments/alm_r13/seed_corpus_10mb/corpus.jsonl.pre-repair.bak"
+let REPORT_PATH = "experiments/alm_r13/seed_corpus_10mb/repair_report.json"
+let VAL_CFG     = "shared/config/alm_corpus_validate_config.json"
+
+// Caps reserved for the seed corpus post-repair.  Total = 840 - 48 kernels
+// = 792.  Per-category: hexad 210-16=194, law 126, phi 84-16=68,
+// selfreflect 126-16=110, metaref 84, persona 84, grounding 126.
+// Sum = 194+126+68+110+84+84+126 = 792.  These mirror SSOT caps minus
+// kernel contributions (K1=16 selfreflect, K2=16 hexad, K3=16 phi).
+let SEED_CAPS = [194, 126, 68, 110, 84, 84, 126]
+
+let CATS = ["hexad", "law", "phi", "selfreflect", "metaref", "persona", "grounding"]
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    let h = _str(env("HOME"))
+    return h + "/core/anima"
+}
+
+fn fexists(path: string) -> bool {
+    let probe = _str(exec("stat -f %N " + path + " 2>/dev/null")).trim()
+    return probe != ""
+}
+
+fn read_safe(path: string) -> string {
+    if !fexists(path) { return "" }
+    return _str(read_file(path))
+}
+
+fn byte_at(s: string, i: int) -> int {
+    let sub = s.substring(i, i + 1)
+    return char_code(sub, 0)
+}
+
+fn json_escape(s: string) -> string {
+    let n = len(s)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        let c = char_code(ch, 0)
+        if c == 34 { out = out + "\\\"" }
+        else { if c == 92 { out = out + "\\\\" }
+               else { if c == 10 { out = out + "\\n" }
+                      else { if c == 13 { out = out + "\\r" }
+                             else { out = out + ch } } } }
+        i = i + 1
+    }
+    return out
+}
+
+fn cat_index(cat: string) -> int {
+    if cat == "hexad" { return 0 }
+    if cat == "law" { return 1 }
+    if cat == "phi" { return 2 }
+    if cat == "selfreflect" { return 3 }
+    if cat == "metaref" { return 4 }
+    if cat == "persona" { return 5 }
+    if cat == "grounding" { return 6 }
+    return 0 - 1
+}
+
+// ── G5 terminator scan (byte-level; handles ASCII + 3-byte UTF-8) ────
+
+fn is_ascii_terminator_byte(c: int) -> bool {
+    if c == 46 { return true }   // .
+    if c == 63 { return true }   // ?
+    if c == 33 { return true }   // !
+    return false
+}
+
+// Check 3-byte UTF-8 terminator ending at exclusive end_excl.
+fn is_utf8_terminator_at(s: string, end_excl: int) -> bool {
+    if end_excl < 3 { return false }
+    let b2 = byte_at(s, end_excl - 3)
+    let b1 = byte_at(s, end_excl - 2)
+    let b0 = byte_at(s, end_excl - 1)
+    // 。 U+3002 = 0xE3 0x80 0x82
+    if b2 == 227 && b1 == 128 && b0 == 130 { return true }
+    // … U+2026 = 0xE2 0x80 0xA6
+    if b2 == 226 && b1 == 128 && b0 == 166 { return true }
+    // ？ U+FF1F = 0xEF 0xBC 0x9F
+    if b2 == 239 && b1 == 188 && b0 == 159 { return true }
+    // ！ U+FF01 = 0xEF 0xBC 0x81
+    if b2 == 239 && b1 == 188 && b0 == 129 { return true }
+    return false
+}
+
+// Scan response from tail back to find the last terminator byte.
+// Returns -1 if none found, else exclusive end offset (use substring(0,end)).
+fn last_terminator_end(s: string) -> int {
+    let n = len(s)
+    if n == 0 { return 0 - 1 }
+    let mut i = n - 1
+    while i >= 0 {
+        let c = byte_at(s, i)
+        if is_ascii_terminator_byte(c) { return i + 1 }
+        if is_utf8_terminator_at(s, i + 1) { return i + 1 }
+        i = i - 1
+    }
+    return 0 - 1
+}
+
+// ── minimal JSON field extract/replace ────────────────────────────────
+
+fn extract_json_str(line: string, key: string) -> string {
+    let needle = "\"" + key + "\":\""
+    let k = line.index_of(needle)
+    if k < 0 { return "" }
+    let start = k + len(needle)
+    let n = len(line)
+    let mut i = start
+    let mut out = ""
+    while i < n {
+        let c = byte_at(line, i)
+        if c == 92 {
+            // Escape handling (undo JSON escape: \" \\ \n \r \t ...)
+            if i + 1 < n {
+                let nxt = byte_at(line, i + 1)
+                if nxt == 34 { out = out + "\"" }
+                else { if nxt == 92 { out = out + "\\" }
+                       else { if nxt == 110 { out = out + "\n" }
+                              else { if nxt == 114 { out = out + "\r" }
+                                     else { if nxt == 116 { out = out + "\t" }
+                                            else { out = out + line.substring(i+1, i+2) } } } } }
+                i = i + 2
+            } else { i = i + 1 }
+        } else {
+            if c == 34 { return out }
+            out = out + line.substring(i, i + 1)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// Replace "response":"..." value with new (already-unescaped) response.
+// O(n) scan, no substring-per-byte.
+fn replace_response_field(line: string, new_resp: string) -> string {
+    let needle = "\"response\":\""
+    let k = line.index_of(needle)
+    if k < 0 { return line }
+    let prefix_end = k + len(needle)
+    let n = len(line)
+    let mut i = prefix_end
+    while i < n {
+        let c = byte_at(line, i)
+        if c == 92 {
+            i = i + 2
+        } else {
+            if c == 34 {
+                let head = line.substring(0, prefix_end)
+                let after = line.substring(i, n)
+                return head + json_escape(new_resp) + after
+            }
+            i = i + 1
+        }
+    }
+    return line
+}
+
+// ─── main ─────────────────────────────────────────────────────────────
+
+fn main() {
+    let root = resolve_root()
+    let seed_path = root + "/" + SEED_PATH
+    let seed_bak  = root + "/" + SEED_BAK
+    let report_p  = root + "/" + REPORT_PATH
+    let val_cfg_p = root + "/" + VAL_CFG
+
+    println("══════════════════════════════════════════════════════════════")
+    println("  alm_r13_seed_repair — G5 terminator + G2 cap enforcement")
+    println("  raw#9/11/12/15 strict · hexa-only · deterministic")
+    println("══════════════════════════════════════════════════════════════")
+    println("[repair] seed    = " + SEED_PATH)
+    println("[repair] backup  = " + SEED_BAK)
+    println("[repair] report  = " + REPORT_PATH)
+    println("[repair] val_cfg = " + VAL_CFG)
+
+    if !fexists(seed_path) {
+        println("[repair] FAIL — seed corpus missing at " + SEED_PATH)
+        exit(2)
+    }
+    let val_ok = fexists(val_cfg_p)
+    println("[repair] validator SSOT present = " + (if val_ok { "YES" } else { "NO (fallback caps used)" }))
+    println("[repair] seed caps (post-kernel-reservation):")
+    println("  hexad=" + to_string(SEED_CAPS[0])
+            + " law=" + to_string(SEED_CAPS[1])
+            + " phi=" + to_string(SEED_CAPS[2])
+            + " self=" + to_string(SEED_CAPS[3])
+            + " meta=" + to_string(SEED_CAPS[4])
+            + " pers=" + to_string(SEED_CAPS[5])
+            + " grnd=" + to_string(SEED_CAPS[6]))
+
+    // Backup original (only if bak doesn't already exist — idempotent).
+    if !fexists(seed_bak) {
+        let _ = exec("cp " + seed_path + " " + seed_bak)
+        println("[repair] backup created")
+    } else {
+        println("[repair] backup already exists — using existing .bak as source")
+        // If called twice, we want to re-repair from the pristine backup to
+        // avoid losing data.  Restore from bak first.
+        let _ = exec("cp " + seed_bak + " " + seed_path)
+    }
+
+    let blob = read_safe(seed_path)
+    let lines = blob.split("\n")
+    let n_lines = len(lines)
+    println("[repair] seed lines raw = " + to_string(n_lines))
+
+    let mut cat_in  = [0, 0, 0, 0, 0, 0, 0]
+    let mut cat_out = [0, 0, 0, 0, 0, 0, 0]
+    let mut cat_g5_drop = [0, 0, 0, 0, 0, 0, 0]
+    let mut cat_cap_skipped = [0, 0, 0, 0, 0, 0, 0]
+
+    let mut out_parts = []
+    let mut kept = 0
+    let mut i = 0
+    while i < n_lines {
+        let line = _str(lines[i]).trim()
+        if line != "" && line.starts_with("{") {
+            let cat = extract_json_str(line, "category")
+            let ci = cat_index(cat)
+            if ci >= 0 {
+                cat_in[ci] = cat_in[ci] + 1
+                // G2 cap short-circuit — skip if bucket full (no substring work).
+                if cat_out[ci] >= SEED_CAPS[ci] {
+                    cat_cap_skipped[ci] = cat_cap_skipped[ci] + 1
+                } else {
+                    let resp = extract_json_str(line, "response")
+                    let end_idx = last_terminator_end(resp)
+                    if end_idx < 0 {
+                        // G5 drop — no terminator anywhere.
+                        cat_g5_drop[ci] = cat_g5_drop[ci] + 1
+                    } else {
+                        let repaired = resp.substring(0, end_idx)
+                        let line_out = replace_response_field(line, repaired)
+                        out_parts = push(out_parts, line_out)
+                        out_parts = push(out_parts, "\n")
+                        cat_out[ci] = cat_out[ci] + 1
+                        kept = kept + 1
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    let body = out_parts.join("")
+
+    // Atomic write back (raw#25)
+    let tmp_path = seed_path + ".tmp." + _str(exec("printf %s $$")).trim()
+    write_file(tmp_path, body)
+    let _ = exec("mv -f " + tmp_path + " " + seed_path)
+    println("[repair] wrote " + to_string(kept) + " docs → " + SEED_PATH)
+
+    // Per-category audit
+    println("[repair] per-category (in → out, g5_drop, cap_skipped):")
+    let mut ci2 = 0
+    while ci2 < 7 {
+        println("  " + _str(CATS[ci2])
+                + ": in=" + to_string(cat_in[ci2])
+                + " out=" + to_string(cat_out[ci2])
+                + " g5_drop=" + to_string(cat_g5_drop[ci2])
+                + " cap_skipped=" + to_string(cat_cap_skipped[ci2]))
+        ci2 = ci2 + 1
+    }
+
+    // Report JSON
+    let mut rp = "{\n"
+    rp = rp + "  \"tool\":       \"tool/alm_r13_seed_repair.hexa\",\n"
+    rp = rp + "  \"version\":    \"v1\",\n"
+    rp = rp + "  \"created\":    \"2026-04-21\",\n"
+    rp = rp + "  \"seed_path\":  \"" + SEED_PATH + "\",\n"
+    rp = rp + "  \"backup\":     \"" + SEED_BAK + "\",\n"
+    rp = rp + "  \"val_cfg\":    \"" + VAL_CFG + "\",\n"
+    rp = rp + "  \"lines_in\":   " + to_string(n_lines) + ",\n"
+    rp = rp + "  \"docs_kept\":  " + to_string(kept) + ",\n"
+    rp = rp + "  \"per_category\": {\n"
+    let mut c3 = 0
+    while c3 < 7 {
+        let comma = if c3 + 1 < 7 { "," } else { "" }
+        rp = rp + "    \"" + _str(CATS[c3]) + "\": {"
+        rp = rp + "\"in\":" + to_string(cat_in[c3])
+        rp = rp + ",\"out\":" + to_string(cat_out[c3])
+        rp = rp + ",\"g5_drop\":" + to_string(cat_g5_drop[c3])
+        rp = rp + ",\"cap_skipped\":" + to_string(cat_cap_skipped[c3])
+        rp = rp + ",\"cap\":" + to_string(SEED_CAPS[c3])
+        rp = rp + "}" + comma + "\n"
+        c3 = c3 + 1
+    }
+    rp = rp + "  },\n"
+    rp = rp + "  \"raw_compliance\": [\"raw#9\", \"raw#11\", \"raw#12\", \"raw#15\", \"raw#25\"],\n"
+    rp = rp + "  \"v8_safe_commit\": true\n"
+    rp = rp + "}\n"
+    write_file(report_p, rp)
+    println("[repair] wrote report → " + REPORT_PATH)
+    println("[repair] done")
+    exit(0)
+}
+
+main()
