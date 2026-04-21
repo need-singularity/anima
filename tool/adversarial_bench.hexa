@@ -1,0 +1,554 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/adversarial_bench.hexa — raw#12 cherry-pick immunity adversarial bench
+//
+//  PURPOSE
+//    roadmap #33 (improvements 17 + 19) — land the "adversarial 3/3 flip"
+//    P1 gate artifact.  Apply 3 flip operations (a/b/c) to a clean input
+//    that an existing verifier PASSes, confirm that EACH flip causes the
+//    verifier to FAIL (verdict != clean).  3/3 FAIL = raw#12 cherry-pick
+//    immunity evidence.
+//
+//  TARGET VERIFIER (chosen from eligible set)
+//    tool/hexad_closure_verifier.hexa — deterministic, file/directory-based,
+//    verdict ∈ {CLOSED, LEAKY, INCOMPLETE}.  Reads anima-hexad/ from cwd —
+//    so we can run it in isolated SANDBOX copies without touching the real
+//    repo.  Sub-second runtime, no GPU, no corpus load → safe headless.
+//
+//    Rationale for NOT using an11_a_verifier.hexa:
+//      - stage1 args() duplicates script path at argv[0] and argv[1], so the
+//        verifier's nth_positional(1) returns the exe path as "base", not
+//        the user-supplied file.  Pre-existing bug; we don't mutate.
+//      - to_int(to_string(8.0)) returns 0 in stage1, so rank is always 0
+//        even on valid synth input → verdict always FAIL.  Can't distinguish
+//        flips from clean.
+//    Rationale for NOT using true_closure_verifier.hexa:
+//      - orchestrates 8 child verifiers (60-300s per run, overkill).
+//
+//  FLIPS (cluster #33 spec — raw#12 3-axis attack surface)
+//    flip_a label_pair_swap            : swap a category-label directory
+//                                        (rename 'c' → 'x_swapped').
+//                                        Removes category (c missing) +
+//                                        creates phantom (x) at root.
+//                                        Expected verdict = INCOMPLETE.
+//    flip_b token_shuffle_10pct        : delete ≥10% of morphism bridges
+//                                        (6 total → 1 deleted > 10%).
+//                                        Breaks axiom(c) composition.
+//                                        Expected verdict = LEAKY.
+//    flip_c cherry_pick_near_duplicate : insert synthetic category-like
+//                                        phantom dir (z_cherry_phantom/)
+//                                        with __init__.hexa at hexad root.
+//                                        Breaks axiom(d) phantom absence.
+//                                        Expected verdict = LEAKY.
+//
+//  DELIVERABLES
+//    1. tool/adversarial_bench.hexa                      (this file)
+//    2. shared/config/adversarial_bench_config.json      (flip params)
+//    3. state/adversarial_bench_last.json                (3-flip results +
+//                                                         proof_hash)
+//    4. Inline selftest: 3/3 flips change verdict CLOSED → non-CLOSED
+//
+//  EXIT CODES
+//    0 — selftest 3/3 PASS (clean CLOSED + 3 flips non-CLOSED)
+//    1 — selftest FAILED (some flip did not flip the verdict)
+//    2 — setup error
+//
+//  CONSTRAINTS
+//    raw#9  hexa-only          raw#11 snake_case
+//    raw#12 empirical (실측)   raw#15 no-hardcode (config JSON)
+//    deterministic · LLM=none · OOM-safe (no corpus load)
+//
+//  USAGE
+//    hexa run tool/adversarial_bench.hexa
+//    hexa run tool/adversarial_bench.hexa --verbose
+// ════════════════════════════════════════════════════════════════════════════
+
+// CFG_PATH: config lives under config/ per repo convention (the /shared
+// symlink is gitignored in this worktree, see .gitignore line 70).  We
+// document the spec's canonical "shared/config/" alias below for tooling
+// that expects the airgenome SSOT layout; runtime resolves from config/.
+let CFG_PATH = "config/adversarial_bench_config.json"
+let CFG_PATH_CANONICAL = "shared/config/adversarial_bench_config.json"
+let DEFAULT_OUT = "state/adversarial_bench_last.json"
+let DEFAULT_AUDIT_LOG = ".raw-audit/adversarial_bench.log"
+let HEXA_BIN_DEFAULT = "/Users/ghost/Dev/hexa-lang/hexa"
+
+// ─── type helpers ──────────────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn now_utc() -> string {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn bool_s(b: bool) -> string { return if b { "true" } else { "false" } }
+
+fn fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn dexists(p: string) -> bool {
+    return _str(exec("test -d " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn resolve_root() -> string {
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let h = _str(env("HOME"))
+    return h + "/core/anima"
+}
+
+fn resolve_hexa_bin() -> string {
+    let e = _str(env("HEXA_BIN"))
+    if e != "" { return e }
+    if fexists(HEXA_BIN_DEFAULT) { return HEXA_BIN_DEFAULT }
+    let p = _str(exec("command -v hexa 2>/dev/null")).trim()
+    if p != "" { return p }
+    return HEXA_BIN_DEFAULT
+}
+
+fn json_escape(s: string) -> string {
+    let a = s.replace("\\", "\\\\")
+    let b = a.replace("\"", "\\\"")
+    let c = b.replace("\n", "\\n")
+    let d = c.replace("\r", "\\r")
+    return d.replace("\t", "\\t")
+}
+
+fn sha256_file(path: string) -> string {
+    if !fexists(path) { return "" }
+    let r = _str(exec("shasum -a 256 " + path + " 2>/dev/null | awk '{print $1}'")).trim()
+    return r
+}
+
+fn sha256_str(s: string) -> string {
+    let tmp = "/tmp/_adv_bench_hash_in.txt"
+    write_file(tmp, s)
+    let r = _str(exec("shasum -a 256 " + tmp + " 2>/dev/null | awk '{print $1}'")).trim()
+    return r
+}
+
+// ─── argv helpers ───────────────────────────────────────────────────────────
+
+fn arg_present(argv, key: string) -> bool {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── config loader (flat keys, strict "key": colon match) ──────────────────
+
+fn cfg_get_str(cfg: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let i = cfg.index_of(needle)
+    if i < 0 { return "" }
+    let rest = cfg.substring(i + len(needle), len(cfg))
+    let mut p = 0
+    let n = len(rest)
+    while p < n {
+        let c = rest.substring(p, p + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" { p = p + 1 } else { break }
+    }
+    if p >= n { return "" }
+    if rest.substring(p, p + 1) != ":" { return "" }
+    let tail = rest.substring(p + 1, n)
+    let mut j = 0
+    let m = len(tail)
+    while j < m {
+        if tail.substring(j, j + 1) == "\"" {
+            let mut k = j + 1
+            while k < m {
+                if tail.substring(k, k + 1) == "\"" {
+                    return tail.substring(j + 1, k)
+                }
+                k = k + 1
+            }
+            return ""
+        }
+        j = j + 1
+    }
+    return ""
+}
+
+// ─── verdict extractor (single-key JSON helper) ────────────────────────────
+
+fn extract_str_field(blob: string, key: string) -> string {
+    return cfg_get_str(blob, key)
+}
+
+// ─── sandbox preparation ───────────────────────────────────────────────────
+//
+// We reproduce anima-hexad/ into a scoped directory so the verifier, run
+// with cwd=<sandbox_root>, reads <sandbox_root>/anima-hexad/ and writes
+// <sandbox_root>/state/hexad_closure_verdict.json.  Original repo tree is
+// NOT mutated.
+
+fn mkdir_p(p: string) {
+    exec("mkdir -p " + p)
+}
+
+fn rmrf_path(p: string) {
+    // Safety: only allow removal under /tmp or state/adv_bench_sandbox prefix.
+    if p.index_of("/tmp/") == 0 || p.index_of("state/adv_bench_sandbox") >= 0 ||
+       p.index_of("/state/adv_bench_sandbox") >= 0 {
+        exec("rm -rf " + p)
+    } else {
+        println("[safety] refusing rm -rf outside sandbox: " + p)
+    }
+}
+
+fn copy_tree(src: string, dst: string) {
+    // Use cp -R for bitwise recursion (safe, no git metadata).
+    mkdir_p(dst)
+    exec("cp -R " + src + "/. " + dst + "/")
+}
+
+// ─── clean sandbox: copy anima-hexad/ into sandbox/clean/anima-hexad ──────
+
+fn prepare_clean_sandbox(root: string, sandbox_clean_abs: string, src_hexad_abs: string) {
+    rmrf_path(sandbox_clean_abs)
+    mkdir_p(sandbox_clean_abs + "/anima-hexad")
+    mkdir_p(sandbox_clean_abs + "/state")
+    copy_tree(src_hexad_abs, sandbox_clean_abs + "/anima-hexad")
+}
+
+// ─── flipped sandboxes ────────────────────────────────────────────────────
+
+fn prepare_flip_a(root: string, sb_src_abs: string, sb_dst_abs: string,
+                  rename_src: string, rename_dst: string) {
+    rmrf_path(sb_dst_abs)
+    mkdir_p(sb_dst_abs + "/anima-hexad")
+    mkdir_p(sb_dst_abs + "/state")
+    copy_tree(sb_src_abs + "/anima-hexad", sb_dst_abs + "/anima-hexad")
+    // Rename the chosen category dir to a new label (phantom swap).
+    let from_p = sb_dst_abs + "/anima-hexad/" + rename_src
+    let to_p   = sb_dst_abs + "/anima-hexad/" + rename_dst
+    exec("mv " + from_p + " " + to_p)
+}
+
+fn prepare_flip_b(root: string, sb_src_abs: string, sb_dst_abs: string,
+                  bridge_rel: string) {
+    rmrf_path(sb_dst_abs)
+    mkdir_p(sb_dst_abs + "/anima-hexad")
+    mkdir_p(sb_dst_abs + "/state")
+    copy_tree(sb_src_abs + "/anima-hexad", sb_dst_abs + "/anima-hexad")
+    // Delete the chosen morphism bridge file (> 10% of the 6 bridges).
+    exec("rm -f " + sb_dst_abs + "/anima-hexad/" + bridge_rel)
+}
+
+fn prepare_flip_c(root: string, sb_src_abs: string, sb_dst_abs: string,
+                  phantom_dir: string, phantom_file: string,
+                  phantom_content: string) {
+    rmrf_path(sb_dst_abs)
+    mkdir_p(sb_dst_abs + "/anima-hexad")
+    mkdir_p(sb_dst_abs + "/state")
+    copy_tree(sb_src_abs + "/anima-hexad", sb_dst_abs + "/anima-hexad")
+    // Insert phantom dir + file at hexad root (cherry-pick near-duplicate).
+    let pd = sb_dst_abs + "/anima-hexad/" + phantom_dir
+    mkdir_p(pd)
+    write_file(pd + "/" + phantom_file, phantom_content)
+}
+
+// ─── verifier runner (scoped cwd) ─────────────────────────────────────────
+
+struct VerifyResult {
+    rc:            int,
+    verdict:       string,   // CLOSED | LEAKY | INCOMPLETE | (empty)
+    verdict_file:  string,
+    verdict_sha:   string,
+    extras_count:  string,   // string form — we avoid int parse lossy
+    log_path:      string
+}
+
+fn run_verifier_in_sandbox(bin: string, root: string, verifier_rel: string,
+                           sandbox_abs: string, tag: string) -> VerifyResult {
+    let log_path = "/tmp/_adv_bench_" + tag + ".log"
+    exec("rm -f " + log_path)
+    let verdict_abs = sandbox_abs + "/state/hexad_closure_verdict.json"
+    exec("rm -f " + verdict_abs)
+
+    let cmd = "cd " + sandbox_abs + " && HEXA_NO_LAUNCHD=1 " + bin +
+              " run " + root + "/" + verifier_rel +
+              " > " + log_path + " 2>&1; echo __rc=$?"
+    let tail_out = _str(exec(cmd)).trim()
+    let rc_idx = tail_out.index_of("__rc=")
+    let rc_str = if rc_idx >= 0 {
+        tail_out.substring(rc_idx + 5, len(tail_out))
+    } else { "255" }
+    let rc = to_int(rc_str.trim())
+
+    let mut verdict = ""
+    let mut sha = ""
+    let mut extras = ""
+    if fexists(verdict_abs) {
+        let blob = read_file(verdict_abs)
+        verdict = extract_str_field(blob, "closure_verdict")
+        sha = sha256_file(verdict_abs)
+        // minimal: scan for "extras_at_root":N pattern isn't needed,
+        // but we surface phantom count via a line in stdout log.
+    }
+    return VerifyResult {
+        rc: rc,
+        verdict: verdict,
+        verdict_file: verdict_abs,
+        verdict_sha: sha,
+        extras_count: extras,
+        log_path: log_path
+    }
+}
+
+// ─── pretty print ──────────────────────────────────────────────────────────
+
+fn short_sha(s: string) -> string {
+    if len(s) < 12 { return s }
+    return s.substring(0, 12)
+}
+
+fn print_row(label: string, r: VerifyResult, clean_verdict: string, want_flip: bool) {
+    let is_clean = (r.verdict == clean_verdict)
+    let flipped = !is_clean && r.verdict != ""
+    let tag = if want_flip {
+        if flipped { "✓" } else { "✗" }
+    } else {
+        if is_clean { "✓" } else { "✗" }
+    }
+    println("  " + tag + " " + label +
+            " verdict=" + r.verdict +
+            " rc=" + to_string(r.rc) +
+            " sha=" + short_sha(r.verdict_sha))
+}
+
+fn run_json(r: VerifyResult) -> string {
+    return "{\"verdict\": \"" + r.verdict + "\", " +
+           "\"rc\": " + to_string(r.rc) + ", " +
+           "\"verdict_file\": \"" + json_escape(r.verdict_file) + "\", " +
+           "\"verdict_sha256\": \"" + r.verdict_sha + "\", " +
+           "\"log_path\": \"" + r.log_path + "\"}"
+}
+
+// ─── main ─────────────────────────────────────────────────────────────────
+
+fn main() {
+    let argv = args()
+    let verbose = arg_present(argv, "--verbose") || arg_present(argv, "-v")
+
+    let root = resolve_root()
+    let bin  = resolve_hexa_bin()
+    let cfg_abs = root + "/" + CFG_PATH
+    if !fexists(cfg_abs) {
+        println("adversarial_bench: SETUP_ERROR — config not found: " + CFG_PATH)
+        exit(2)
+    }
+    let cfg = read_file(cfg_abs)
+
+    // Config fields (flat keys).
+    let verifier_rel      = cfg_get_str(cfg, "target_verifier_path")
+    let clean_verdict_exp = cfg_get_str(cfg, "target_verifier_clean_verdict")
+    let src_hexad_rel     = cfg_get_str(cfg, "source_hexad_dir")
+    let sb_clean_rel      = cfg_get_str(cfg, "sandbox_dir_clean")
+    let sb_flip_a_rel     = cfg_get_str(cfg, "sandbox_dir_flip_a")
+    let sb_flip_b_rel     = cfg_get_str(cfg, "sandbox_dir_flip_b")
+    let sb_flip_c_rel     = cfg_get_str(cfg, "sandbox_dir_flip_c")
+    let fa_src            = cfg_get_str(cfg, "flip_a_rename_src")
+    let fa_dst            = cfg_get_str(cfg, "flip_a_rename_dst")
+    let fb_bridge         = cfg_get_str(cfg, "flip_b_delete_bridge_path")
+    let fc_phantom_dir    = cfg_get_str(cfg, "flip_c_phantom_dir")
+    let fc_phantom_file   = cfg_get_str(cfg, "flip_c_phantom_file")
+    let fc_phantom_body   = cfg_get_str(cfg, "flip_c_phantom_content")
+
+    // Defaults (raw#15: config is SSOT, but keep safe fallbacks).
+    let vrel = if verifier_rel == "" { "tool/hexad_closure_verifier.hexa" } else { verifier_rel }
+    let cve  = if clean_verdict_exp == "" { "CLOSED" } else { clean_verdict_exp }
+    let sh   = if src_hexad_rel == "" { "anima-hexad" } else { src_hexad_rel }
+    let sbc  = if sb_clean_rel == "" { "state/adv_bench_sandbox/clean" } else { sb_clean_rel }
+    let sba  = if sb_flip_a_rel == "" { "state/adv_bench_sandbox/flip_a" } else { sb_flip_a_rel }
+    let sbb  = if sb_flip_b_rel == "" { "state/adv_bench_sandbox/flip_b" } else { sb_flip_b_rel }
+    let sbcc = if sb_flip_c_rel == "" { "state/adv_bench_sandbox/flip_c" } else { sb_flip_c_rel }
+    let fa_from = if fa_src == "" { "c" } else { fa_src }
+    let fa_to   = if fa_dst == "" { "x_swapped" } else { fa_dst }
+    let fb_bp   = if fb_bridge == "" { "d/will_bridge.hexa" } else { fb_bridge }
+    let fc_pd   = if fc_phantom_dir == "" { "z_cherry_phantom" } else { fc_phantom_dir }
+    let fc_pf   = if fc_phantom_file == "" { "__init__.hexa" } else { fc_phantom_file }
+    let fc_pc   = if fc_phantom_body == "" { "// phantom\n" } else { fc_phantom_body }
+
+    let verifier_abs = root + "/" + vrel
+    let src_hexad_abs = root + "/" + sh
+    if !fexists(verifier_abs) {
+        println("adversarial_bench: SETUP_ERROR — verifier not found: " + vrel)
+        exit(2)
+    }
+    if !dexists(src_hexad_abs) {
+        println("adversarial_bench: SETUP_ERROR — source hexad dir not found: " + sh)
+        exit(2)
+    }
+
+    println("════════════════════════════════════════════════════════════════")
+    println("  tool/adversarial_bench.hexa — raw#12 cherry-pick immunity")
+    println("  cluster #33 improvements 17 + 19 · P1 gate 'adversarial 3/3 flip'")
+    println("  root=" + root)
+    println("  hexa_bin=" + bin)
+    println("  config=" + CFG_PATH)
+    println("  target_verifier=" + vrel)
+    println("  source_hexad=" + sh)
+    println("  expected_clean_verdict=" + cve)
+    println("════════════════════════════════════════════════════════════════")
+
+    let sbc_abs  = root + "/" + sbc
+    let sba_abs  = root + "/" + sba
+    let sbb_abs  = root + "/" + sbb
+    let sbcc_abs = root + "/" + sbcc
+
+    // ── Build 4 sandboxes.
+    println("")
+    println("[SANDBOX] preparing 4 scoped hexad sandboxes under state/adv_bench_sandbox/")
+    prepare_clean_sandbox(root, sbc_abs, src_hexad_abs)
+    println("  ✓ clean  → " + sbc)
+    prepare_flip_a(root, sbc_abs, sba_abs, fa_from, fa_to)
+    println("  ✓ flip_a → " + sba + "   (rename " + fa_from + " → " + fa_to + ")")
+    prepare_flip_b(root, sbc_abs, sbb_abs, fb_bp)
+    println("  ✓ flip_b → " + sbb + "   (delete " + fb_bp + ")")
+    prepare_flip_c(root, sbc_abs, sbcc_abs, fc_pd, fc_pf, fc_pc)
+    println("  ✓ flip_c → " + sbcc + "  (insert phantom " + fc_pd + "/)")
+
+    // ── Run verifier in each sandbox.
+    println("")
+    println("[RUN] 4× verifier invocations (hexad_closure_verifier)")
+
+    let r_clean  = run_verifier_in_sandbox(bin, root, vrel, sbc_abs,  "clean")
+    let r_a      = run_verifier_in_sandbox(bin, root, vrel, sba_abs,  "flip_a")
+    let r_b      = run_verifier_in_sandbox(bin, root, vrel, sbb_abs,  "flip_b")
+    let r_c      = run_verifier_in_sandbox(bin, root, vrel, sbcc_abs, "flip_c")
+
+    println("")
+    println("[RESULTS] (✓ = matches expectation)")
+    print_row("clean  ", r_clean, cve, false)
+    print_row("flip_a ", r_a, cve, true)
+    print_row("flip_b ", r_b, cve, true)
+    print_row("flip_c ", r_c, cve, true)
+
+    // ── Selftest.
+    let clean_matches = (r_clean.verdict == cve)
+    let a_flipped = (r_a.verdict != cve) && (r_a.verdict != "")
+    let b_flipped = (r_b.verdict != cve) && (r_b.verdict != "")
+    let c_flipped = (r_c.verdict != cve) && (r_c.verdict != "")
+    let flip_fail_count = (if a_flipped { 1 } else { 0 }) +
+                          (if b_flipped { 1 } else { 0 }) +
+                          (if c_flipped { 1 } else { 0 })
+    let selftest_pass = clean_matches && (flip_fail_count == 3)
+
+    println("")
+    println("[SELFTEST] — raw#12 cherry-pick immunity")
+    println("  clean_matches_expected  = " + bool_s(clean_matches) + "  (expect " + cve + ", got " + r_clean.verdict + ")")
+    println("  flip_a_flipped          = " + bool_s(a_flipped) + "  (expect != " + cve + ", got " + r_a.verdict + ")")
+    println("  flip_b_flipped          = " + bool_s(b_flipped) + "  (expect != " + cve + ", got " + r_b.verdict + ")")
+    println("  flip_c_flipped          = " + bool_s(c_flipped) + "  (expect != " + cve + ", got " + r_c.verdict + ")")
+    println("  flip_fail_count         = " + to_string(flip_fail_count) + "/3")
+    println("  selftest_verdict        = " + (if selftest_pass { "PASS" } else { "FAIL" }))
+
+    // ── Emit SSOT cert.
+    let ts = now_utc()
+    let mut parts = []
+    parts = push(parts, "{\n")
+    parts = push(parts, "  \"schema\": \"anima.adversarial_bench.v1\",\n")
+    parts = push(parts, "  \"tool\": \"tool/adversarial_bench.hexa\",\n")
+    parts = push(parts, "  \"config\": \"" + CFG_PATH + "\",\n")
+    parts = push(parts, "  \"ts\": \"" + ts + "\",\n")
+    parts = push(parts, "  \"root\": \"" + json_escape(root) + "\",\n")
+    parts = push(parts, "  \"target_verifier\": \"" + vrel + "\",\n")
+    parts = push(parts, "  \"target_verifier_kind\": \"hexad_6cat_closure\",\n")
+    parts = push(parts, "  \"expected_clean_verdict\": \"" + cve + "\",\n")
+    parts = push(parts, "  \"source_hexad_dir\": \"" + sh + "\",\n")
+    parts = push(parts, "  \"cluster\": \"33\",\n")
+    parts = push(parts, "  \"improvements\": [\"17_cherry_pick_reject\", \"19_adversarial_bench_3of3_flip\"],\n")
+    parts = push(parts, "  \"p1_gate\": \"adversarial 3/3 flip (raw#12 cherry-pick immunity)\",\n")
+
+    parts = push(parts, "  \"flips\": {\n")
+    parts = push(parts, "    \"flip_a\": {\"name\": \"label_pair_swap\",           \"action\": \"rename " + fa_from + " → " + fa_to + "\",        \"breaks_axiom\": \"a_non_empty + d_phantom_absent\"},\n")
+    parts = push(parts, "    \"flip_b\": {\"name\": \"token_shuffle_10pct\",      \"action\": \"delete " + fb_bp + "\",          \"breaks_axiom\": \"c_composition_closed\"},\n")
+    parts = push(parts, "    \"flip_c\": {\"name\": \"cherry_pick_near_duplicate\", \"action\": \"insert " + fc_pd + "/ + " + fc_pf + "\", \"breaks_axiom\": \"d_phantom_absent\"}\n")
+    parts = push(parts, "  },\n")
+
+    parts = push(parts, "  \"sandboxes\": {\n")
+    parts = push(parts, "    \"clean\":  \"" + sbc + "\",\n")
+    parts = push(parts, "    \"flip_a\": \"" + sba + "\",\n")
+    parts = push(parts, "    \"flip_b\": \"" + sbb + "\",\n")
+    parts = push(parts, "    \"flip_c\": \"" + sbcc + "\"\n")
+    parts = push(parts, "  },\n")
+
+    parts = push(parts, "  \"runs\": {\n")
+    parts = push(parts, "    \"clean\":  " + run_json(r_clean) + ",\n")
+    parts = push(parts, "    \"flip_a\": " + run_json(r_a) + ",\n")
+    parts = push(parts, "    \"flip_b\": " + run_json(r_b) + ",\n")
+    parts = push(parts, "    \"flip_c\": " + run_json(r_c) + "\n")
+    parts = push(parts, "  },\n")
+
+    parts = push(parts, "  \"selftest\": {\n")
+    parts = push(parts, "    \"clean_matches_expected\": " + bool_s(clean_matches) + ",\n")
+    parts = push(parts, "    \"flip_a_flipped\":         " + bool_s(a_flipped) + ",\n")
+    parts = push(parts, "    \"flip_b_flipped\":         " + bool_s(b_flipped) + ",\n")
+    parts = push(parts, "    \"flip_c_flipped\":         " + bool_s(c_flipped) + ",\n")
+    parts = push(parts, "    \"flip_fail_count\":        " + to_string(flip_fail_count) + ",\n")
+    parts = push(parts, "    \"required_flips\":         3,\n")
+    parts = push(parts, "    \"verdict\":                \"" + (if selftest_pass { "PASS" } else { "FAIL" }) + "\"\n")
+    parts = push(parts, "  },\n")
+
+    // proof_hash = SHA256 of concatenated per-run verdict-file hashes + selftest verdict.
+    let pf_input = r_clean.verdict_sha + "|" + r_a.verdict_sha + "|" +
+                   r_b.verdict_sha + "|" + r_c.verdict_sha + "|" +
+                   (if selftest_pass { "PASS" } else { "FAIL" })
+    let proof_hash = sha256_str(pf_input)
+    parts = push(parts, "  \"proof_hash\": \"" + proof_hash + "\",\n")
+    parts = push(parts, "  \"proof_hash_input\": \"" + json_escape(pf_input) + "\",\n")
+    parts = push(parts, "  \"raw_contract\": [\"raw#9\", \"raw#11\", \"raw#12\", \"raw#15\"]\n")
+    parts = push(parts, "}\n")
+
+    let mut body = ""
+    let mut k = 0
+    while k < len(parts) {
+        body = body + _str(parts[k])
+        k = k + 1
+    }
+
+    // Atomic write.
+    let out_rel = DEFAULT_OUT
+    let out_abs = root + "/" + out_rel
+    let pid = _str(exec("printf %s $$")).trim()
+    let tmp = out_abs + ".tmp." + pid
+    write_file(tmp, body)
+    exec("mv -f " + tmp + " " + out_abs)
+
+    // Audit log append (raw#10 hash chain).
+    let audit_dir = root + "/.raw-audit"
+    if !dexists(audit_dir) { exec("mkdir -p " + audit_dir) }
+    let audit_path = root + "/" + DEFAULT_AUDIT_LOG
+    let current_hash = sha256_file(out_abs)
+    let line = ts + " adversarial_bench" +
+               " clean=" + r_clean.verdict +
+               " flip_a=" + r_a.verdict +
+               " flip_b=" + r_b.verdict +
+               " flip_c=" + r_c.verdict +
+               " flip_fail_count=" + to_string(flip_fail_count) + "/3" +
+               " selftest=" + (if selftest_pass { "PASS" } else { "FAIL" }) +
+               " proof=" + proof_hash +
+               " cert=" + current_hash + "\n"
+    exec("printf %s " + "'" + line.replace("'", "'\\''") + "'" + " >> " + audit_path)
+
+    println("")
+    println("▶ cert:      " + out_rel)
+    println("▶ cert_sha:  " + current_hash)
+    println("▶ proof:     " + proof_hash)
+    println("▶ audit:     " + DEFAULT_AUDIT_LOG)
+
+    if selftest_pass { exit(0) }
+    exit(1)
+}
+
+main()
