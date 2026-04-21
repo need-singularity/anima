@@ -542,3 +542,35 @@ phase-jump = step-function structural break (≠ log-linear gradual scaling). **
 | 2 | AN-LIX-01 V_RG regularizer r13 | 1일 | ζ 첫 실증 |
 | 3 | E1 Hexad 25% Law60 가중 | 1일 | η 첫 실증 |
 | 4 | MINIMAL LoRA + λ·I_irr | 2-4주 | Option B P1 런칭 |
+
+---
+
+## 🎯 EXP-1 실행 결과 (2026-04-21 commit 672610fc) — **H★ STRONGLY_SUPPORTED**
+
+### 결정적 실측 (n=6 baseline vs n=28 test)
+
+| metric | n=6 baseline | **n=28 test** | Δ |
+|--------|-------------|---------------|---|
+| score_empirical_x1000 | 1000 | 833 | −167 |
+| primary_pass_count (empirical) | **4/4** | **0/4** | **−4 FLIP** |
+| p_primary_quartet | true all | **false all** | **FLIP** |
+| UNIVERSAL_4 relation | SAME_STRUCTURE | **INDEPENDENT_4** | **FLIP** |
+| σ·φ = n·τ identity | true (24=24) | false (672 vs 168) | **깨짐** |
+
+### Pre-registered criterion → Actual
+- 예상: primary_pass_count=0 → STRONGLY_SUPPORTED
+- 실측: **primary_pass_count_empirical = 0** (D0/D1/D2/D3 전원 FAIL, tau_ok 게이트로 차단)
+- **verdict: H_STAR_STRONGLY_SUPPORTED**
+
+### 의미
+- τ(6)=4 primitivity 가 Hexad 4-primary 구조의 **필요조건** 실증
+- τ(28)=6 number-theoretic 구조에서 p_primary_quartet FAIL 이 4 empirical domain 전체에서 동일 → 우연 아님
+- Mk.XI twin-engine 공간(τ=4) × 시간(Arrow cusp) 결합 예언의 **첫 실측 근거**
+
+### Artifacts
+- 파일: `tool/hexad_n28_falsification.hexa` (576줄)
+- verdict JSON: `shared/state/hexad_n28_falsification_verdict.json`
+- commit: `672610fc` (main, cherry-picked from `hexad-universality-a549791e`)
+
+### Next falsification
+- **EXP-2**: L_IX 5-term stress test (V_X=V_hurst 추가) — STATIONARY_AT_FIXPOINT break 예상
