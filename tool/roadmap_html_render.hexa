@@ -1,0 +1,921 @@
+// tool/roadmap_html_render.hexa — .roadmap → docs/roadmap.html static renderer
+//
+// PURPOSE
+//   Parse the repo's canonical .roadmap DSL (raw#15 format) and emit a
+//   single self-contained HTML page to docs/roadmap.html for GitHub
+//   Pages. No JavaScript, no external CSS — the page renders trivially
+//   from the Pages static bundle (.github/workflows/pages.yml already
+//   ships the docs/ directory).
+//
+// DSL (parsed subset)
+//   `roadmap <id> <status> "<title>"`      — entry header
+//     indented keys: track, phase, eta, completed, why,
+//                    exit_criteria, verify, reaches, depends-on,
+//                    feeds-main, proof, evidence, note
+//   `checkpoint <id> "<title>"`            — checkpoint header
+//     indented keys: condition, gate, why
+//   Comment lines (start with `#`) are ignored.
+//
+// OUTPUT
+//   docs/roadmap.html — self-contained HTML+inline CSS page with:
+//     - header: timestamp + entry/checkpoint counts
+//     - checkpoint summary (CP1 / CP2 / FINAL / P1 / P2 / P3 / others)
+//     - entries grouped by track (alm/clm/verifier/consciousness/ssot/
+//       cell/lora/hybrid/ops/...). Tracks appear only if non-empty.
+//     - colored status badges:
+//         planned=gray  active=blue  done=green  blocked=red  deferred=orange
+//
+// USAGE
+//   hexa tool/roadmap_html_render.hexa                 — render
+//   hexa tool/roadmap_html_render.hexa --selftest      — parse+render selftest
+//   hexa tool/roadmap_html_render.hexa --input <path>  — override .roadmap
+//   hexa tool/roadmap_html_render.hexa --output <path> — override docs/roadmap.html
+//   hexa tool/roadmap_html_render.hexa --help
+//
+// SELFTEST
+//   1. parsed roadmap count == `grep -c ^roadmap .roadmap`
+//   2. rendered HTML has no unclosed tag (simple open/close stack check)
+//   Both must PASS; exit 0 on PASS, exit 1 on FAIL.
+//
+// RULES
+//   raw#9  hexa-only                        raw#11 snake_case paths
+//   raw#15 no hard-coded tunables (inputs/outputs are --flags)
+
+// ─── defaults ────────────────────────────────────────────────────────
+let DEFAULT_INPUT  = "/Users/ghost/core/anima/.roadmap"
+let DEFAULT_OUTPUT = "/Users/ghost/core/anima/docs/roadmap.html"
+
+// ─── argv helpers ────────────────────────────────────────────────────
+
+fn arg_value(argv, key, dflt) {
+    let mut i = 0
+    while i < len(argv) {
+        if argv[i] == key && i + 1 < len(argv) { return argv[i + 1] }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn arg_present(argv, key) {
+    let mut i = 0
+    while i < len(argv) {
+        if argv[i] == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── sys + string helpers ────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    let mut out = "'"
+    out = out + s.replace("'", "'\\''")
+    out = out + "'"
+    return out
+}
+
+fn _exec_out(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _file_exists(path: string) -> bool {
+    let r = exec_with_status("test -r " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _ts_iso() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _html_escape(s: string) -> string {
+    let mut out = s
+    out = out.replace("&", "&amp;")
+    out = out.replace("<", "&lt;")
+    out = out.replace(">", "&gt;")
+    out = out.replace("\"", "&quot;")
+    return out
+}
+
+// trim leading whitespace (spaces + tabs) — str.trim() in hexa is
+// full trim; we need left-trim specifically for counting indentation
+// boundaries during key scans.
+fn _ltrim(s: string) -> string {
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == " " || c == "\t" { i = i + 1 } else { break }
+    }
+    return s.substring(i, n)
+}
+
+fn _starts_with(s: string, p: string) -> bool {
+    if len(s) < len(p) { return false }
+    return s.substring(0, len(p)) == p
+}
+
+// ─── DSL parser ──────────────────────────────────────────────────────
+//
+// The .roadmap file is line-oriented:
+//   - comment (leading '#' after optional ws) → skipped
+//   - blank line → skipped
+//   - header `roadmap <id> <status> "<title>"` (no leading ws)
+//   - header `checkpoint <id> "<title>"`        (no leading ws)
+//   - key-value (leading ws + `<key>  <value>`) attaches to previous header
+//
+// Entries: array of map-like arrays. Each entry is represented as a
+// list [kind, id, status_or_empty, title, kv_pairs_array] where
+// kv_pairs_array is an array of [key, value] pairs preserving order.
+
+fn _parse_header_roadmap(line: string) -> array {
+    // line starts with "roadmap "
+    let rest = _ltrim(line.substring(8, len(line)))  // after "roadmap "
+    // id = first token
+    let sp1 = rest.index_of(" ")
+    if sp1 < 0 { return [] }
+    let id = rest.substring(0, sp1)
+    let rest2 = _ltrim(rest.substring(sp1 + 1, len(rest)))
+    // status = next token
+    let sp2 = rest2.index_of(" ")
+    if sp2 < 0 { return [] }
+    let status = rest2.substring(0, sp2)
+    let rest3 = _ltrim(rest2.substring(sp2 + 1, len(rest2)))
+    // title = quoted string "…"
+    if len(rest3) < 2 || rest3.substring(0, 1) != "\"" { return [] }
+    let body = rest3.substring(1, len(rest3))
+    let qe = body.index_of("\"")
+    let title = if qe >= 0 { body.substring(0, qe) } else { body }
+    return [id, status, title]
+}
+
+fn _parse_header_checkpoint(line: string) -> array {
+    let rest = _ltrim(line.substring(10, len(line)))  // after "checkpoint"
+    let sp1 = rest.index_of(" ")
+    if sp1 < 0 {
+        // no quoted title
+        return [rest, ""]
+    }
+    let id = rest.substring(0, sp1)
+    let rest2 = _ltrim(rest.substring(sp1 + 1, len(rest)))
+    if len(rest2) == 0 || rest2.substring(0, 1) != "\"" {
+        return [id, ""]
+    }
+    let body = rest2.substring(1, len(rest2))
+    let qe = body.index_of("\"")
+    let title = if qe >= 0 { body.substring(0, qe) } else { body }
+    return [id, title]
+}
+
+// Parse `<leading-ws><key><ws><value>` indented line. Returns [key,
+// value] or [] if the line has no value.
+fn _parse_kv(line: string) -> array {
+    let t = _ltrim(line)
+    if len(t) == 0 { return [] }
+    // key = chars until first whitespace
+    let n = len(t)
+    let mut i = 0
+    while i < n {
+        let c = t.substring(i, i + 1)
+        if c == " " || c == "\t" { break }
+        i = i + 1
+    }
+    if i == 0 || i == n { return [] }
+    let key = t.substring(0, i)
+    let mut j = i
+    while j < n {
+        let c = t.substring(j, j + 1)
+        if c == " " || c == "\t" { j = j + 1 } else { break }
+    }
+    let value = t.substring(j, n)
+    return [key, value]
+}
+
+// Returns [entries, checkpoints]. Each entry:
+//   ["roadmap", id, status, title, kv_pairs]
+// Each checkpoint:
+//   ["checkpoint", id, "", title, kv_pairs]
+fn parse_roadmap(body: string) -> array {
+    let lines = body.split("\n")
+    let mut entries = []
+    let mut checkpoints = []
+    let mut cur_kind = ""          // "roadmap" | "checkpoint" | ""
+    let mut cur_id = ""
+    let mut cur_status = ""
+    let mut cur_title = ""
+    let mut cur_kv = []
+
+    let mut i = 0
+    while i < len(lines) {
+        let raw = to_string(lines[i])
+        // strip trailing \r (if present)
+        let line = if len(raw) > 0 && raw.substring(len(raw) - 1, len(raw)) == "\r" {
+            raw.substring(0, len(raw) - 1)
+        } else {
+            raw
+        }
+        let t = _ltrim(line)
+        if len(t) == 0 {
+            // blank terminates the current block
+            if cur_kind == "roadmap" {
+                entries.push([cur_kind, cur_id, cur_status, cur_title, cur_kv])
+            } else if cur_kind == "checkpoint" {
+                checkpoints.push([cur_kind, cur_id, cur_status, cur_title, cur_kv])
+            }
+            cur_kind = ""
+            cur_id = ""
+            cur_status = ""
+            cur_title = ""
+            cur_kv = []
+            i = i + 1
+            continue
+        }
+        if t.substring(0, 1) == "#" {
+            i = i + 1
+            continue
+        }
+        // header detection — no leading whitespace
+        let has_indent = line.substring(0, 1) == " " || line.substring(0, 1) == "\t"
+        if !has_indent && _starts_with(line, "roadmap ") {
+            // flush previous block
+            if cur_kind == "roadmap" {
+                entries.push([cur_kind, cur_id, cur_status, cur_title, cur_kv])
+            } else if cur_kind == "checkpoint" {
+                checkpoints.push([cur_kind, cur_id, cur_status, cur_title, cur_kv])
+            }
+            let h = _parse_header_roadmap(line)
+            if len(h) == 3 {
+                cur_kind = "roadmap"
+                cur_id = to_string(h[0])
+                cur_status = to_string(h[1])
+                cur_title = to_string(h[2])
+                cur_kv = []
+            } else {
+                cur_kind = ""
+            }
+            i = i + 1
+            continue
+        }
+        if !has_indent && _starts_with(line, "checkpoint ") {
+            if cur_kind == "roadmap" {
+                entries.push([cur_kind, cur_id, cur_status, cur_title, cur_kv])
+            } else if cur_kind == "checkpoint" {
+                checkpoints.push([cur_kind, cur_id, cur_status, cur_title, cur_kv])
+            }
+            let h = _parse_header_checkpoint(line)
+            if len(h) == 2 {
+                cur_kind = "checkpoint"
+                cur_id = to_string(h[0])
+                cur_status = ""
+                cur_title = to_string(h[1])
+                cur_kv = []
+            } else {
+                cur_kind = ""
+            }
+            i = i + 1
+            continue
+        }
+        // indented key/value — attach to current block if any
+        if has_indent && cur_kind != "" {
+            let kv = _parse_kv(line)
+            if len(kv) == 2 { cur_kv.push(kv) }
+        }
+        i = i + 1
+    }
+    // final flush
+    if cur_kind == "roadmap" {
+        entries.push([cur_kind, cur_id, cur_status, cur_title, cur_kv])
+    } else if cur_kind == "checkpoint" {
+        checkpoints.push([cur_kind, cur_id, cur_status, cur_title, cur_kv])
+    }
+    return [entries, checkpoints]
+}
+
+// Look up a key's value from an ordered kv_pairs array. Returns "" if
+// absent.
+fn _kv_get(kv: array, key: string) -> string {
+    let mut i = 0
+    while i < len(kv) {
+        let pair = kv[i]
+        if to_string(pair[0]) == key { return to_string(pair[1]) }
+        i = i + 1
+    }
+    return ""
+}
+
+// ─── HTML rendering ──────────────────────────────────────────────────
+//
+// Color palette per spec:
+//   planned  = gray    (#8a8a8a)
+//   active   = blue    (#1f7fd6)
+//   done     = green   (#2ea043)
+//   blocked  = red     (#d93025)
+//   deferred = orange  (#e07b00)
+//   unknown  = slate   (#555)
+fn _status_color(status: string) -> string {
+    if status == "planned"  { return "#8a8a8a" }
+    if status == "active"   { return "#1f7fd6" }
+    if status == "done"     { return "#2ea043" }
+    if status == "blocked"  { return "#d93025" }
+    if status == "deferred" { return "#e07b00" }
+    return "#555555"
+}
+
+fn _render_badge(status: string) -> string {
+    let color = _status_color(status)
+    let text = if status == "" { "?" } else { status }
+    let mut parts = []
+    parts.push("<span class=\"badge\" style=\"background:" + color + "\">")
+    parts.push(_html_escape(text))
+    parts.push("</span>")
+    return parts.join("")
+}
+
+// Stable ordering for tracks — alm/clm come first, ops last, rest
+// sorted alphabetically in between.
+fn _track_order(t: string) -> int {
+    if t == "alm"            { return 1 }
+    if t == "clm"            { return 2 }
+    if t == "verifier"       { return 3 }
+    if t == "consciousness"  { return 4 }
+    if t == "ssot"           { return 5 }
+    if t == "cell"           { return 6 }
+    if t == "lora"           { return 7 }
+    if t == "hybrid"         { return 8 }
+    if t == "serving"        { return 9 }
+    if t == "bench"          { return 10 }
+    if t == "ops"            { return 11 }
+    return 50
+}
+
+// Group entries by track → array of [track_name, entry_list].
+fn _group_by_track(entries: array) -> array {
+    let mut groups = []  // array of [track, [entry, entry, ...]]
+
+    let mut i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        let kv = e[4]
+        let t_raw = _kv_get(kv, "track")
+        let track = if t_raw == "" { "other" } else { t_raw }
+        let mut found = false
+        let mut j = 0
+        while j < len(groups) {
+            let g = groups[j]
+            if to_string(g[0]) == track {
+                let lst = g[1]
+                lst.push(e)
+                groups[j] = [track, lst]
+                found = true
+                break
+            }
+            j = j + 1
+        }
+        if !found {
+            groups.push([track, [e]])
+        }
+        i = i + 1
+    }
+
+    // stable selection sort on _track_order
+    let n = len(groups)
+    let mut a = 0
+    while a < n {
+        let mut best = a
+        let mut b = a + 1
+        while b < n {
+            let tb = to_string(groups[b][0])
+            let tbest = to_string(groups[best][0])
+            if _track_order(tb) < _track_order(tbest) { best = b }
+            b = b + 1
+        }
+        if best != a {
+            let tmp = groups[a]
+            groups[a] = groups[best]
+            groups[best] = tmp
+        }
+        a = a + 1
+    }
+    return groups
+}
+
+// Render one roadmap entry to HTML.
+fn _render_entry(e: array) -> string {
+    let id = to_string(e[1])
+    let status = to_string(e[2])
+    let title = to_string(e[3])
+    let kv = e[4]
+
+    let mut parts = []
+    parts.push("<div class=\"entry\">\n")
+    parts.push("  <div class=\"entry-head\">")
+    parts.push("<span class=\"entry-id\">#" + _html_escape(id) + "</span> ")
+    parts.push(_render_badge(status))
+    parts.push(" <span class=\"entry-title\">" + _html_escape(title) + "</span>")
+    parts.push("</div>\n")
+
+    // key-value table, render a small curated set first
+    let ordered_keys = ["phase", "eta", "completed", "depends-on",
+                        "feeds-main", "verify", "reaches",
+                        "why", "exit_criteria", "proof", "evidence", "note"]
+    parts.push("  <dl class=\"kv\">\n")
+    let mut shown = []
+    let mut i = 0
+    while i < len(ordered_keys) {
+        let k = to_string(ordered_keys[i])
+        let v = _kv_get(kv, k)
+        if v != "" {
+            parts.push("    <dt>" + _html_escape(k) + "</dt><dd>" + _html_escape(v) + "</dd>\n")
+            shown.push(k)
+        }
+        i = i + 1
+    }
+    // any other keys (not track — already in header grouping)
+    let mut j = 0
+    while j < len(kv) {
+        let pair = kv[j]
+        let k = to_string(pair[0])
+        let v = to_string(pair[1])
+        let mut already = k == "track"
+        if !already {
+            for s in shown {
+                if to_string(s) == k { already = true }
+            }
+        }
+        if !already {
+            parts.push("    <dt>" + _html_escape(k) + "</dt><dd>" + _html_escape(v) + "</dd>\n")
+        }
+        j = j + 1
+    }
+    parts.push("  </dl>\n")
+    parts.push("</div>\n")
+    return parts.join("")
+}
+
+// Render a checkpoint entry (summary card).
+fn _render_checkpoint(c: array) -> string {
+    let id = to_string(c[1])
+    let title = to_string(c[3])
+    let kv = c[4]
+    let condition = _kv_get(kv, "condition")
+    let gate = _kv_get(kv, "gate")
+    let why = _kv_get(kv, "why")
+
+    let mut parts = []
+    parts.push("<div class=\"cp-card\">\n")
+    parts.push("  <div class=\"cp-id\">" + _html_escape(id) + "</div>\n")
+    parts.push("  <div class=\"cp-title\">" + _html_escape(title) + "</div>\n")
+    if gate != "" {
+        parts.push("  <div class=\"cp-row\"><span class=\"cp-k\">gate</span> " + _html_escape(gate) + "</div>\n")
+    }
+    if condition != "" {
+        parts.push("  <div class=\"cp-row\"><span class=\"cp-k\">condition</span> <code>" + _html_escape(condition) + "</code></div>\n")
+    }
+    if why != "" {
+        parts.push("  <div class=\"cp-row cp-why\"><span class=\"cp-k\">why</span> " + _html_escape(why) + "</div>\n")
+    }
+    parts.push("</div>\n")
+    return parts.join("")
+}
+
+fn _counts(entries: array) -> array {
+    // returns [planned, active, done, blocked, deferred, other]
+    let mut p = 0
+    let mut a = 0
+    let mut d = 0
+    let mut b = 0
+    let mut f = 0
+    let mut o = 0
+    let mut i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        let s = to_string(e[2])
+        if s == "planned"       { p = p + 1 }
+        else if s == "active"   { a = a + 1 }
+        else if s == "done"     { d = d + 1 }
+        else if s == "blocked"  { b = b + 1 }
+        else if s == "deferred" { f = f + 1 }
+        else                    { o = o + 1 }
+        i = i + 1
+    }
+    return [to_string(p), to_string(a), to_string(d), to_string(b), to_string(f), to_string(o)]
+}
+
+fn render_html(entries: array, checkpoints: array, src_path: string) -> string {
+    let ts = _ts_iso()
+    let cnt = _counts(entries)
+    let total = to_string(len(entries))
+    let groups = _group_by_track(entries)
+
+    let mut h = []
+    h.push("<!doctype html>\n")
+    h.push("<html lang=\"en\">\n")
+    h.push("<head>\n")
+    h.push("<meta charset=\"utf-8\">\n")
+    h.push("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n")
+    h.push("<title>anima roadmap</title>\n")
+    h.push("<style>\n")
+    h.push("  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;\n")
+    h.push("         margin: 0; padding: 24px; background: #fafafa; color: #222; line-height: 1.45; }\n")
+    h.push("  h1 { margin: 0 0 8px; font-size: 26px; }\n")
+    h.push("  h2 { margin: 32px 0 12px; padding-bottom: 6px; border-bottom: 2px solid #e0e0e0;\n")
+    h.push("       font-size: 20px; text-transform: uppercase; letter-spacing: 0.06em; }\n")
+    h.push("  h3 { margin: 16px 0 8px; font-size: 15px; }\n")
+    h.push("  .meta { color: #666; font-size: 13px; margin-bottom: 20px; }\n")
+    h.push("  .summary { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 24px; }\n")
+    h.push("  .summary .chip { padding: 4px 10px; border-radius: 12px; color: #fff; font-size: 12px; font-weight: 600; }\n")
+    h.push("  .cp-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(260px,1fr)); gap: 12px; }\n")
+    h.push("  .cp-card { background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 12px 14px; }\n")
+    h.push("  .cp-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: #555; }\n")
+    h.push("  .cp-title { font-weight: 700; margin: 4px 0 6px; font-size: 14px; }\n")
+    h.push("  .cp-row { font-size: 12px; color: #333; margin: 2px 0; }\n")
+    h.push("  .cp-row code { background: #f2f2f2; padding: 1px 4px; border-radius: 3px; font-size: 11px; }\n")
+    h.push("  .cp-k { display: inline-block; min-width: 64px; color: #888; font-size: 11px; text-transform: uppercase; }\n")
+    h.push("  .cp-why { color: #555; }\n")
+    h.push("  .entry { background: #fff; border: 1px solid #e3e3e3; border-radius: 6px; padding: 10px 14px; margin: 8px 0; }\n")
+    h.push("  .entry-head { font-size: 14px; margin-bottom: 4px; }\n")
+    h.push("  .entry-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #666; margin-right: 6px; }\n")
+    h.push("  .entry-title { font-weight: 600; }\n")
+    h.push("  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; color: #fff;\n")
+    h.push("           font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }\n")
+    h.push("  dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px;\n")
+    h.push("          margin: 6px 0 0; font-size: 12px; }\n")
+    h.push("  dl.kv dt { color: #777; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }\n")
+    h.push("  dl.kv dd { margin: 0; color: #222; }\n")
+    h.push("  .track-grid { }\n")
+    h.push("  footer { margin-top: 40px; color: #888; font-size: 12px; border-top: 1px solid #e0e0e0; padding-top: 12px; }\n")
+    h.push("</style>\n")
+    h.push("</head>\n")
+    h.push("<body>\n")
+
+    h.push("<h1>anima roadmap</h1>\n")
+    h.push("<div class=\"meta\">source: <code>" + _html_escape(src_path) + "</code>")
+    h.push(" · rendered: " + _html_escape(ts))
+    h.push(" · entries: " + total)
+    h.push(" · checkpoints: " + to_string(len(checkpoints)))
+    h.push("</div>\n")
+
+    // status summary chips
+    h.push("<div class=\"summary\">\n")
+    let status_names = ["done", "active", "planned", "blocked", "deferred"]
+    let status_counts = [cnt[2], cnt[1], cnt[0], cnt[3], cnt[4]]
+    let mut si = 0
+    while si < len(status_names) {
+        let name = to_string(status_names[si])
+        let c = to_string(status_counts[si])
+        let color = _status_color(name)
+        h.push("  <span class=\"chip\" style=\"background:" + color + "\">" + _html_escape(name) + ": " + c + "</span>\n")
+        si = si + 1
+    }
+    h.push("</div>\n")
+
+    // ── checkpoint summary ─────────────────────────────────────────
+    h.push("<h2>checkpoints</h2>\n")
+    h.push("<div class=\"cp-grid\">\n")
+
+    // featured first: CP1 / CP2 / FINAL / P1 / P2 / P3 — then others
+    let featured = ["CP1", "CP2", "FINAL", "P1", "P2", "P3"]
+    let mut emitted_ids = []
+    let mut fi = 0
+    while fi < len(featured) {
+        let want = to_string(featured[fi])
+        let mut k = 0
+        while k < len(checkpoints) {
+            let c = checkpoints[k]
+            if to_string(c[1]) == want {
+                h.push(_render_checkpoint(c))
+                emitted_ids.push(want)
+            }
+            k = k + 1
+        }
+        fi = fi + 1
+    }
+    // remaining checkpoints (P1-prep, ops, cross, quick-win, ...)
+    let mut k = 0
+    while k < len(checkpoints) {
+        let c = checkpoints[k]
+        let cid = to_string(c[1])
+        let mut skip = false
+        for e in emitted_ids {
+            if to_string(e) == cid { skip = true }
+        }
+        if !skip { h.push(_render_checkpoint(c)) }
+        k = k + 1
+    }
+    h.push("</div>\n")
+
+    // ── entries grouped by track ───────────────────────────────────
+    h.push("<h2>entries by track</h2>\n")
+    let mut gi = 0
+    while gi < len(groups) {
+        let g = groups[gi]
+        let track_name = to_string(g[0])
+        let lst = g[1]
+        h.push("<section class=\"track-grid\">\n")
+        h.push("  <h3>track: " + _html_escape(track_name) + " <span style=\"color:#888;font-weight:400\">(" + to_string(len(lst)) + ")</span></h3>\n")
+        let mut ei = 0
+        while ei < len(lst) {
+            h.push(_render_entry(lst[ei]))
+            ei = ei + 1
+        }
+        h.push("</section>\n")
+        gi = gi + 1
+    }
+
+    h.push("<footer>generated by tool/roadmap_html_render.hexa · raw#9 hexa-only · no-js static render</footer>\n")
+    h.push("</body>\n")
+    h.push("</html>\n")
+    return h.join("")
+}
+
+// ─── HTML tag balance check ──────────────────────────────────────────
+//
+// Simple open/close stack walk:
+//   - ignore self-closing `<tag/>`, void elements, `<!doctype…>` and
+//     `<!-- … -->` comments
+//   - match `<name …>` / `</name>` pairs with LIFO stack; any mismatch
+//     (pop from empty, name mismatch, non-empty stack at end) is a FAIL
+// Returns [ok_bool_str, detail_string]. ok_str is "1"/"0".
+fn _is_void_tag(name: string) -> bool {
+    let voids = ["meta", "link", "br", "hr", "img", "input", "source",
+                 "area", "base", "col", "embed", "param", "track", "wbr"]
+    for v in voids {
+        if to_string(v) == name { return true }
+    }
+    return false
+}
+
+// manual ASCII lowercase — hexa stdlib lacks .lowercase()
+fn _ascii_lower(s: string) -> string {
+    let n = len(s)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "A" { out = out + "a" }
+        else if c == "B" { out = out + "b" }
+        else if c == "C" { out = out + "c" }
+        else if c == "D" { out = out + "d" }
+        else if c == "E" { out = out + "e" }
+        else if c == "F" { out = out + "f" }
+        else if c == "G" { out = out + "g" }
+        else if c == "H" { out = out + "h" }
+        else if c == "I" { out = out + "i" }
+        else if c == "J" { out = out + "j" }
+        else if c == "K" { out = out + "k" }
+        else if c == "L" { out = out + "l" }
+        else if c == "M" { out = out + "m" }
+        else if c == "N" { out = out + "n" }
+        else if c == "O" { out = out + "o" }
+        else if c == "P" { out = out + "p" }
+        else if c == "Q" { out = out + "q" }
+        else if c == "R" { out = out + "r" }
+        else if c == "S" { out = out + "s" }
+        else if c == "T" { out = out + "t" }
+        else if c == "U" { out = out + "u" }
+        else if c == "V" { out = out + "v" }
+        else if c == "W" { out = out + "w" }
+        else if c == "X" { out = out + "x" }
+        else if c == "Y" { out = out + "y" }
+        else if c == "Z" { out = out + "z" }
+        else { out = out + c }
+        i = i + 1
+    }
+    return out
+}
+
+fn _read_tag_name(html: string, start: int) -> array {
+    // start points at '<' — scan until first whitespace / '>' / '/'
+    let n = len(html)
+    let mut i = start + 1
+    let mut close = false
+    if i < n && html.substring(i, i + 1) == "/" {
+        close = true
+        i = i + 1
+    }
+    let name_start = i
+    while i < n {
+        let c = html.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ">" || c == "/" { break }
+        i = i + 1
+    }
+    let name = _ascii_lower(html.substring(name_start, i))
+    return [name, to_string(i), (if close { "1" } else { "0" })]
+}
+
+// manual pop — hexa's .pop() returns top element but does NOT mutate
+// the underlying array. Rebuild a same-order copy with last item
+// dropped. Called infrequently (once per close tag) so O(n) cost is
+// acceptable for doc-sized HTML.
+fn _arr_drop_last(a: array) -> array {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i + 1 < n {
+        out.push(a[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn check_html_balance(html: string) -> array {
+    let n = len(html)
+    let mut stack = []        // array of tag names
+    let mut i = 0
+    while i < n {
+        let c = html.substring(i, i + 1)
+        if c != "<" { i = i + 1; continue }
+        // comment?
+        if i + 4 <= n && html.substring(i, i + 4) == "<!--" {
+            let end = html.index_of("-->")  // note: index_of starts at 0 — need sub
+            // fall back: scan forward from i+4
+            let mut j = i + 4
+            while j + 3 <= n {
+                if html.substring(j, j + 3) == "-->" { break }
+                j = j + 1
+            }
+            if j + 3 > n { return ["0", "unterminated <!-- comment at " + to_string(i)] }
+            i = j + 3
+            continue
+        }
+        // doctype / declaration
+        if i + 2 <= n && html.substring(i + 1, i + 2) == "!" {
+            // skip until '>'
+            let mut j = i + 1
+            while j < n && html.substring(j, j + 1) != ">" { j = j + 1 }
+            if j >= n { return ["0", "unterminated <! declaration at " + to_string(i)] }
+            i = j + 1
+            continue
+        }
+        let info = _read_tag_name(html, i)
+        let name = to_string(info[0])
+        let after_name = to_int(to_string(info[1]))
+        let is_close = to_string(info[2]) == "1"
+        // walk to the '>' to detect self-close
+        let mut j = after_name
+        let mut self_close = false
+        while j < n {
+            let cc = html.substring(j, j + 1)
+            if cc == ">" { break }
+            if cc == "/" {
+                // next non-ws is '>'?
+                let mut k = j + 1
+                while k < n {
+                    let dc = html.substring(k, k + 1)
+                    if dc == " " || dc == "\t" { k = k + 1; continue }
+                    break
+                }
+                if k < n && html.substring(k, k + 1) == ">" { self_close = true }
+            }
+            j = j + 1
+        }
+        if j >= n { return ["0", "unterminated < tag at " + to_string(i) + " name=" + name] }
+        // style/script — swallow until matching close tag to avoid
+        // parsing embedded '<' inside CSS/JS bodies. Push opener so the
+        // subsequent </style> pop is balanced normally.
+        if !is_close && !self_close && (name == "style" || name == "script") {
+            stack.push(name)
+            let need = "</" + name
+            let mut k = j + 1
+            while k + len(need) <= n {
+                if _ascii_lower(html.substring(k, k + len(need))) == need { break }
+                k = k + 1
+            }
+            if k + len(need) > n { return ["0", "unterminated <" + name + ">"] }
+            i = k
+            continue
+        }
+        if is_close {
+            // stack must top == name
+            if len(stack) == 0 { return ["0", "unexpected </" + name + "> at " + to_string(i) + " (empty stack)"] }
+            let top = to_string(stack[len(stack) - 1])
+            if top != name {
+                let mut dump = "stack:"
+                for s in stack { dump = dump + "[" + to_string(s) + "]" }
+                return ["0", "mismatched </" + name + "> (expected </" + top + ">) at " + to_string(i) + " " + dump]
+            }
+            stack = _arr_drop_last(stack)
+        } else {
+            if self_close { /* skip */ }
+            else if _is_void_tag(name) { /* skip */ }
+            else { stack.push(name) }
+        }
+        i = j + 1
+    }
+    if len(stack) > 0 {
+        let top = to_string(stack[len(stack) - 1])
+        return ["0", "unclosed <" + top + "> (stack_depth=" + to_string(len(stack)) + ")"]
+    }
+    return ["1", "balanced"]
+}
+
+// ─── render driver ───────────────────────────────────────────────────
+
+fn render_to_file(input_path: string, output_path: string) -> array {
+    if !_file_exists(input_path) {
+        return ["0", "input missing: " + input_path, "0", "0"]
+    }
+    let body = read_file(input_path)
+    let parsed = parse_roadmap(body)
+    let entries = parsed[0]
+    let checkpoints = parsed[1]
+    let html = render_html(entries, checkpoints, input_path)
+    write_file(output_path, html)
+    return ["1", "ok", to_string(len(entries)), to_string(len(checkpoints)), to_string(len(html))]
+}
+
+// ─── selftest ────────────────────────────────────────────────────────
+
+fn run_selftest(input_path: string, output_path: string) -> int {
+    println("── roadmap_html_render selftest ──")
+
+    // #1 parse count vs grep
+    if !_file_exists(input_path) {
+        println("  ✗ [FAIL] input missing: " + input_path)
+        return 1
+    }
+    let body = read_file(input_path)
+    let parsed = parse_roadmap(body)
+    let entries = parsed[0]
+    let checkpoints = parsed[1]
+
+    let grep_cmd = "grep -c '^roadmap' " + _sh_quote(input_path) + " 2>/dev/null"
+    let grep_out = _exec_out(grep_cmd).trim()
+    let grep_n = to_int(grep_out)
+    let parsed_n = len(entries)
+
+    let mut test1_ok = parsed_n == grep_n
+    if test1_ok {
+        println("  ✓ [PASS] parse_count == grep_count  (" + to_string(parsed_n) + ")")
+    } else {
+        println("  ✗ [FAIL] parse_count=" + to_string(parsed_n) + " grep_count=" + to_string(grep_n))
+    }
+
+    // #2 render + tag balance
+    let html = render_html(entries, checkpoints, input_path)
+    // also write for visual inspection
+    write_file(output_path, html)
+    let bal = check_html_balance(html)
+    let bal_ok = to_string(bal[0]) == "1"
+    if bal_ok {
+        println("  ✓ [PASS] html_tag_balance  size=" + to_string(len(html)) + " bytes")
+    } else {
+        println("  ✗ [FAIL] html_tag_balance: " + to_string(bal[1]))
+    }
+
+    // #3 rudimentary sanity — grep count > 0 and html size > 1k
+    let sanity_ok = parsed_n > 0 && len(html) > 1024
+    if sanity_ok {
+        println("  ✓ [PASS] sanity  entries>0 && html>1KB")
+    } else {
+        println("  ✗ [FAIL] sanity entries=" + to_string(parsed_n) + " html_size=" + to_string(len(html)))
+    }
+
+    println("")
+    println("  summary: entries=" + to_string(parsed_n) +
+            " checkpoints=" + to_string(len(checkpoints)) +
+            " html_bytes=" + to_string(len(html)))
+    println("  output: " + output_path)
+
+    if test1_ok && bal_ok && sanity_ok {
+        println("selftest=PASS")
+        return 0
+    }
+    println("selftest=FAIL")
+    return 1
+}
+
+// ─── usage ───────────────────────────────────────────────────────────
+
+fn print_usage() {
+    println("usage: hexa tool/roadmap_html_render.hexa [opts]")
+    println("  --input  <path>   override .roadmap source     (default: " + DEFAULT_INPUT + ")")
+    println("  --output <path>   override docs/roadmap.html   (default: " + DEFAULT_OUTPUT + ")")
+    println("  --selftest        run inline parse+render selftest (exit 0 PASS / 1 FAIL)")
+    println("  --help")
+}
+
+fn main() {
+    let argv = args()
+    if arg_present(argv, "--help") || arg_present(argv, "-h") {
+        print_usage()
+        exit(0)
+    }
+    let input  = arg_value(argv, "--input",  DEFAULT_INPUT)
+    let output = arg_value(argv, "--output", DEFAULT_OUTPUT)
+
+    if arg_present(argv, "--selftest") {
+        exit(run_selftest(input, output))
+    }
+
+    let r = render_to_file(input, output)
+    if to_string(r[0]) != "1" {
+        println("error: " + to_string(r[1]))
+        exit(1)
+    }
+    println("rendered: " + output)
+    println("  entries=" + to_string(r[2]) + " checkpoints=" + to_string(r[3]) + " bytes=" + to_string(r[4]))
+    exit(0)
+}
+
+main()
