@@ -1,0 +1,662 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/meta2_hashchain_verify.hexa — .meta2-cert hash-chain auto-verifier
+//
+//  CLUSTER   cluster #34 adjacent (supports C4 cert_watch daemon)
+//  RAW       raw#9 hexa-only · raw#10 proof-carrying hash-chain · raw#11 snake_case
+//            raw#15 no-hardcode · V8 SAFE_COMMIT · LLM=none · deterministic
+//
+//  PURPOSE
+//    Walk `.meta2-cert/*.json`.  For each entry that declares a hash-chain pair
+//    (`prev_hash` + `current_hash`):
+//        1. Strip `current_hash` from the canonical JSON body.
+//        2. Recompute  sha256( canonical_json_minus_current_hash )  and
+//           require it to match the declared `current_hash`  (OK / BREAK).
+//        3. Require entry N's `prev_hash` to equal entry N-1's `current_hash`
+//           in chain order (OK / BREAK).
+//    Entries that declare NEITHER field are tagged MISSING (treated as WARN —
+//    not a BREAK) so legacy meta2-cert snapshots stay back-compat under raw#10.
+//
+//  CHAIN ORDER (documented choice)
+//    · Primary:   explicit integer field `chain_index` (ascending).
+//    · Fallback:  POSIX file mtime (ascending) when `chain_index` is absent.
+//    The chosen source is recorded in the output JSON as `order_source`.
+//    When a mix is observed (some entries have `chain_index`, others don't)
+//    we fall back to mtime across the whole set — consistent global order is
+//    required for chain verification.
+//
+//  CANONICAL JSON (for recomputing current_hash)
+//    `jq -S -c 'del(.current_hash)' <file>` — sorted keys, compact form,
+//    current_hash field excised.  sha256 is taken over this canonical bytes.
+//    We use the on-disk entry file itself as the canonical input (not a
+//    freshly-reserialized copy), so the verifier matches whatever tool
+//    produced the entry — provided that tool also used sorted-key canonical.
+//
+//  OUTPUT
+//    state/meta2_hashchain_verify.json
+//      {
+//        "schema": "anima.meta2.hashchain.verify.v1",
+//        "ts":    "<UTC ISO>",
+//        "root":  ".meta2-cert",
+//        "order_source":   "chain_index" | "mtime" | "empty",
+//        "per_entry": [
+//          { "file": "...", "chain_index": <int|null>,
+//            "verdict": "OK" | "BREAK" | "MISSING",
+//            "computed_hash": "<sha256|'' >",
+//            "declared_current_hash": "<sha256|'' >",
+//            "declared_prev_hash":    "<sha256|'' >",
+//            "reason": "<short tag>" }
+//        ],
+//        "aggregate": { "ok_n": k, "break_n": b, "missing_n": m, "total_n": n },
+//        "proof_hash": "<sha256 over canonical per_entry list>",
+//        "raw_strict": "raw#9 raw#10 raw#11 raw#15 deterministic LLM=none V8"
+//      }
+//
+//  SELFTEST (--selftest flag)
+//    S1  real walk of $ANIMA_ROOT/.meta2-cert   → expect break_n == 0
+//        (ok_n may be 0 when every entry lacks prev_hash/current_hash — that
+//        is WARN, not BREAK; real-walk PASS gate is  break_n == 0).
+//    S2  synthetic 3-entry valid chain  → expect  ok_n == 3, break_n == 0.
+//    S3  synthetic 3-entry chain with middle entry mutated  → expect
+//        break_n == 1  (mutation flips recompute; downstream link may also
+//        break — we accept break_n >= 1 as "mutation detected").
+//    PASS gate: 3/3.
+//
+//  USAGE
+//    hexa tool/meta2_hashchain_verify.hexa              # one-shot verify
+//    hexa tool/meta2_hashchain_verify.hexa --selftest   # 3/3 selftest
+//    hexa tool/meta2_hashchain_verify.hexa --root <dir> # custom root
+//    hexa tool/meta2_hashchain_verify.hexa --out  <json># custom output
+// ════════════════════════════════════════════════════════════════════════════
+
+let OUT_DEFAULT  = "state/meta2_hashchain_verify.json"
+let ROOT_DEFAULT = ".meta2-cert"
+let SCHEMA_TAG   = "anima.meta2.hashchain.verify.v1"
+let RAW_STRICT   = "raw#9 raw#10 raw#11 raw#15 deterministic LLM=none V8"
+
+// ─── string helpers ────────────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _sh_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn fexists(p: string) -> bool {
+    return _str(exec("test -e " + _sh_quote(p) + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn now_stamp() -> string { return _str(exec("date -u +%FT%TZ")).trim() }
+
+fn split_lines(text: string) -> list {
+    let parts = text.split("\n")
+    let mut out = []
+    let mut i = 0
+    while i < len(parts) {
+        let p = parts[i].trim()
+        if len(p) > 0 { out = out.push(p) }
+        i = i + 1
+    }
+    return out
+}
+
+// sha256 of a file on disk
+fn sha256_file(p: string) -> string {
+    if !fexists(p) { return "" }
+    let r = _str(exec("shasum -a 256 " + _sh_quote(p) + " 2>/dev/null | awk '{print $1}'")).trim()
+    return r
+}
+
+// sha256 of an arbitrary bytes-string (write to tmp, hash, unlink)
+fn sha256_of_bytes(s: string) -> string {
+    let tmp = "/tmp/meta2_hashchain_buf_" + str(len(s)) + "_" + _str(exec("date +%s%N")).trim() + ".bin"
+    write_file(tmp, s)
+    let r = _str(exec("shasum -a 256 " + _sh_quote(tmp) + " 2>/dev/null | awk '{print $1}'")).trim()
+    let _ = exec("rm -f " + _sh_quote(tmp))
+    return r
+}
+
+// ─── directory walk ────────────────────────────────────────────────────────
+
+// Return list of *.json filenames (bare basenames) sorted lexicographically.
+// We keep it a bare basename list; callers assemble full paths as needed.
+fn list_json_entries(root: string) -> list {
+    if !fexists(root) { return [] }
+    let cmd = "ls -1 " + _sh_quote(root) + " 2>/dev/null | grep -E '\\.json$' | LC_ALL=C sort"
+    let raw = _str(exec(cmd))
+    return split_lines(raw)
+}
+
+// File mtime as integer epoch seconds (for ordering fallback).
+fn mtime_of(path: string) -> int {
+    if !fexists(path) { return 0 }
+    let raw = _str(exec("stat -f %m " + _sh_quote(path) + " 2>/dev/null")).trim()
+    if raw == "" {
+        // GNU stat fallback
+        let raw2 = _str(exec("stat -c %Y " + _sh_quote(path) + " 2>/dev/null")).trim()
+        if raw2 == "" { return 0 }
+        return int(raw2)
+    }
+    return int(raw)
+}
+
+// ─── per-entry JSON probe (via jq — read-only, raw#10 friendly) ───────────
+
+fn jq_field(path: string, jq_expr: string) -> string {
+    // `jq -r` yields "null" for missing — we normalize that to "".
+    let cmd = "jq -r " + _sh_quote(jq_expr) + " " + _sh_quote(path) + " 2>/dev/null"
+    let out = _str(exec(cmd)).trim()
+    if out == "null" { return "" }
+    return out
+}
+
+// Canonical JSON bytes for hash recomputation:
+//   sorted keys, compact (jq -S -c), `current_hash` field deleted.
+fn canonical_minus_current_hash(path: string) -> string {
+    let cmd = "jq -S -c 'del(.current_hash)' " + _sh_quote(path) + " 2>/dev/null"
+    return _str(exec(cmd))
+}
+
+// ─── per-entry verdict record ──────────────────────────────────────────────
+//
+// Positional tuple (list) — kept positional rather than struct for max
+// portability across hexa-stage0 shim ages.  Fields:
+//   0  file (basename)
+//   1  chain_index (int; -1 when absent)
+//   2  verdict ("OK" | "BREAK" | "MISSING")
+//   3  computed_hash
+//   4  declared_current_hash
+//   5  declared_prev_hash
+//   6  reason (short tag)
+//   7  mtime (int epoch, for ordering)
+
+fn probe_entry(root: string, name: string) -> list {
+    let full = root + "/" + name
+    let declared_curr = jq_field(full, ".current_hash // empty")
+    let declared_prev = jq_field(full, ".prev_hash    // empty")
+    let ci_raw = jq_field(full, ".chain_index // empty")
+    let chain_index = if ci_raw == "" { -1 } else { int(ci_raw) }
+    let mt = mtime_of(full)
+
+    // Entries with NEITHER field: WARN (MISSING), not BREAK.
+    if declared_curr == "" && declared_prev == "" {
+        let mut r = []
+        r = r.push(name)               // 0
+        r = r.push(chain_index)        // 1
+        r = r.push("MISSING")          // 2
+        r = r.push("")                 // 3
+        r = r.push("")                 // 4
+        r = r.push("")                 // 5
+        r = r.push("no_hashchain_fields")
+        r = r.push(mt)                 // 7
+        return r
+    }
+
+    // Recompute current_hash over canonical-minus-current_hash.
+    let canon = canonical_minus_current_hash(full)
+    let computed = if canon == "" { "" } else { sha256_of_bytes(canon) }
+
+    // Local (per-entry) recompute verdict.  prev-link verdict is assigned
+    // in a second pass once chain order is known.
+    let local_ok = (declared_curr != "") && (computed == declared_curr)
+    let verdict_tag = if declared_curr == "" {
+            "BREAK"                    // prev_hash present but no current_hash to verify
+        } else {
+            if local_ok { "OK" } else { "BREAK" }
+        }
+    let reason = if declared_curr == "" {
+            "prev_hash_without_current_hash"
+        } else {
+            if local_ok { "recompute_match" } else { "recompute_mismatch" }
+        }
+
+    let mut r = []
+    r = r.push(name)
+    r = r.push(chain_index)
+    r = r.push(verdict_tag)
+    r = r.push(computed)
+    r = r.push(declared_curr)
+    r = r.push(declared_prev)
+    r = r.push(reason)
+    r = r.push(mt)
+    return r
+}
+
+// ─── chain ordering + prev-link verification ───────────────────────────────
+//
+// Two-phase:
+//   Phase A: probe each entry independently, building per_entry[].
+//   Phase B: sort the *hash-chain participating* entries (verdict != MISSING)
+//            by the chosen order_source.  For each adjacent (prev, curr)
+//            pair, require  curr.declared_prev_hash == prev.declared_current_hash
+//            otherwise downgrade curr.verdict to BREAK (reason=prev_link_mismatch).
+//
+// order_source decision: if EVERY participating entry has chain_index >= 0 we
+// use "chain_index"; otherwise "mtime".  With zero participants → "empty".
+
+fn pick_order_source(per_entry: list) -> string {
+    let mut participating = 0
+    let mut with_ci = 0
+    let mut i = 0
+    while i < len(per_entry) {
+        let e = per_entry[i]
+        let v = _str(e[2])
+        if v != "MISSING" {
+            participating = participating + 1
+            // slot 1 holds chain_index (int already; no cast needed)
+            if e[1] >= 0 { with_ci = with_ci + 1 }
+        }
+        i = i + 1
+    }
+    if participating == 0 { return "empty" }
+    if with_ci == participating { return "chain_index" }
+    return "mtime"
+}
+
+// Stable insertion-sort by key (ascending).  key_field = 1 for chain_index,
+// 7 for mtime.  We sort a filtered list of *participating* entries only.
+fn _entry_sort_key(e: list, order_source: string) -> int {
+    // centralized sort-key extraction.  slot 1 = chain_index (int), slot 7 =
+    // mtime (int).  Both are already int — the cast would be a no-op and some
+    // stage0 codegen versions choke on  `... as int`  in a return position, so
+    // we just return the bare value.
+    if order_source == "chain_index" { return e[1] }
+    return e[7]
+}
+
+fn sort_participating(per_entry: list, order_source: string) -> list {
+    let mut out = []
+    let mut i = 0
+    while i < len(per_entry) {
+        let e = per_entry[i]
+        if _str(e[2]) != "MISSING" {
+            let key = _entry_sort_key(e, order_source)
+            let mut j = 0
+            let mut inserted = false
+            let mut next = []
+            while j < len(out) {
+                let ej = out[j]
+                let kj = _entry_sort_key(ej, order_source)
+                if !inserted && kj > key {
+                    next = next.push(e)
+                    inserted = true
+                }
+                next = next.push(ej)
+                j = j + 1
+            }
+            if !inserted { next = next.push(e) }
+            out = next
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Apply prev-link rule across sorted chain.  Returns updated per_entry list
+// (same ordering as input; we only modify verdict/reason of entries whose
+// prev_hash does not match the predecessor's current_hash).
+fn apply_prev_link(per_entry: list, order_source: string) -> list {
+    let sorted_part = sort_participating(per_entry, order_source)
+    // Build a map: basename -> (verdict_override, reason_override).
+    // Simplest form in hexa-stage0: iterate parallel lists.
+    let mut override_names = []
+    let mut override_verdicts = []
+    let mut override_reasons = []
+
+    let mut i = 1
+    while i < len(sorted_part) {
+        let prev = sorted_part[i - 1]
+        let curr = sorted_part[i]
+        let prev_curr_hash = _str(prev[4])
+        let curr_prev_hash = _str(curr[5])
+        // If curr already BREAK from recompute, keep it.  We only *add*
+        // break reasons; we never promote a BREAK back to OK.
+        let curr_verdict = _str(curr[2])
+        if curr_prev_hash == "" {
+            if curr_verdict == "OK" {
+                override_names    = override_names.push(_str(curr[0]))
+                override_verdicts = override_verdicts.push("BREAK")
+                override_reasons  = override_reasons.push("missing_prev_hash_in_chain_interior")
+            }
+        } else {
+            if curr_prev_hash != prev_curr_hash {
+                if curr_verdict == "OK" {
+                    override_names    = override_names.push(_str(curr[0]))
+                    override_verdicts = override_verdicts.push("BREAK")
+                    override_reasons  = override_reasons.push("prev_link_mismatch")
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    // Rewrite per_entry with overrides applied.
+    let mut out = []
+    let mut k = 0
+    while k < len(per_entry) {
+        let e = per_entry[k]
+        let name = _str(e[0])
+        // look up override
+        let mut idx = -1
+        let mut m = 0
+        while m < len(override_names) {
+            if override_names[m] == name { idx = m }
+            m = m + 1
+        }
+        if idx >= 0 {
+            let mut e2 = []
+            e2 = e2.push(e[0])
+            e2 = e2.push(e[1])
+            e2 = e2.push(override_verdicts[idx])
+            e2 = e2.push(e[3])
+            e2 = e2.push(e[4])
+            e2 = e2.push(e[5])
+            e2 = e2.push(override_reasons[idx])
+            e2 = e2.push(e[7])
+            out = out.push(e2)
+        } else {
+            out = out.push(e)
+        }
+        k = k + 1
+    }
+    return out
+}
+
+// ─── emit ──────────────────────────────────────────────────────────────────
+
+fn json_escape(s: string) -> string {
+    // Minimal escape for quote + backslash.  Content sha256s are hex so
+    // this is sufficient for the fields we emit.
+    let a = s.replace("\\", "\\\\")
+    return a.replace("\"", "\\\"")
+}
+
+fn emit_per_entry_line(e: list) -> string {
+    // slot 1 already int
+    let ci = e[1]
+    let ci_json = if ci < 0 { "null" } else { str(ci) }
+    let mut s = "    { "
+    s = s + "\"file\": \""                  + json_escape(_str(e[0])) + "\", "
+    s = s + "\"chain_index\": "             + ci_json                 + ", "
+    s = s + "\"verdict\": \""               + _str(e[2])              + "\", "
+    s = s + "\"computed_hash\": \""         + _str(e[3])              + "\", "
+    s = s + "\"declared_current_hash\": \"" + _str(e[4])              + "\", "
+    s = s + "\"declared_prev_hash\": \""    + _str(e[5])              + "\", "
+    s = s + "\"reason\": \""                + _str(e[6])              + "\""
+    s = s + " }"
+    return s
+}
+
+fn aggregate_counts(per_entry: list) -> list {
+    let mut ok_n = 0
+    let mut break_n = 0
+    let mut missing_n = 0
+    let mut i = 0
+    while i < len(per_entry) {
+        let v = _str(per_entry[i][2])
+        if v == "OK" { ok_n = ok_n + 1 }
+        else { if v == "BREAK" { break_n = break_n + 1 }
+               else { if v == "MISSING" { missing_n = missing_n + 1 } } }
+        i = i + 1
+    }
+    let mut r = []
+    r = r.push(ok_n)
+    r = r.push(break_n)
+    r = r.push(missing_n)
+    r = r.push(len(per_entry))
+    return r
+}
+
+// Canonical proof_hash = sha256 over  "file|verdict|computed|declared_curr|declared_prev;"  joined.
+// Deterministic across runs for identical inputs.
+fn compute_proof_hash(per_entry: list) -> string {
+    let mut blob = ""
+    let mut i = 0
+    while i < len(per_entry) {
+        let e = per_entry[i]
+        blob = blob + _str(e[0]) + "|" + _str(e[2]) + "|" + _str(e[3])
+                + "|" + _str(e[4]) + "|" + _str(e[5]) + ";"
+        i = i + 1
+    }
+    return sha256_of_bytes(blob)
+}
+
+fn build_output_json(root: string, per_entry: list, order_source: string) -> string {
+    let agg = aggregate_counts(per_entry)
+    let proof_h = compute_proof_hash(per_entry)
+    let stamp = now_stamp()
+
+    let mut body = "{\n"
+    body = body + "  \"schema\": \""       + SCHEMA_TAG + "\",\n"
+    body = body + "  \"ts\": \""           + stamp      + "\",\n"
+    body = body + "  \"root\": \""         + json_escape(root) + "\",\n"
+    body = body + "  \"order_source\": \"" + order_source + "\",\n"
+    body = body + "  \"per_entry\": [\n"
+    let mut i = 0
+    while i < len(per_entry) {
+        body = body + emit_per_entry_line(per_entry[i])
+        if i + 1 < len(per_entry) { body = body + "," }
+        body = body + "\n"
+        i = i + 1
+    }
+    body = body + "  ],\n"
+    body = body + "  \"aggregate\": {\n"
+    body = body + "    \"ok_n\": "      + str(agg[0]) + ",\n"
+    body = body + "    \"break_n\": "   + str(agg[1]) + ",\n"
+    body = body + "    \"missing_n\": " + str(agg[2]) + ",\n"
+    body = body + "    \"total_n\": "   + str(agg[3]) + "\n"
+    body = body + "  },\n"
+    body = body + "  \"proof_hash\": \"" + proof_h + "\",\n"
+    body = body + "  \"raw_strict\": \"" + RAW_STRICT + "\"\n"
+    body = body + "}\n"
+    return body
+}
+
+// ─── top-level verify routine ──────────────────────────────────────────────
+
+fn verify_root(root: string) -> list {
+    let names = list_json_entries(root)
+    let mut per_entry = []
+    let mut i = 0
+    while i < len(names) {
+        let e = probe_entry(root, names[i])
+        per_entry = per_entry.push(e)
+        i = i + 1
+    }
+    let order_source = pick_order_source(per_entry)
+    let per_entry2 = if order_source == "empty" { per_entry }
+                     else { apply_prev_link(per_entry, order_source) }
+    let mut r = []
+    r = r.push(per_entry2)
+    r = r.push(order_source)
+    return r
+}
+
+// ─── inline selftest harness ───────────────────────────────────────────────
+
+fn _mk_synth_dir(tag: string) -> string {
+    let p = "/tmp/meta2_hc_synth_" + tag + "_" + _str(exec("date +%s%N")).trim()
+    let _ = exec("rm -rf " + _sh_quote(p) + " && mkdir -p " + _sh_quote(p))
+    return p
+}
+
+// Synthesize one chain entry file.  We compute current_hash the same way the
+// verifier will: sha256 over `jq -S -c 'del(.current_hash)' <file>`.
+// Step A: write a draft without current_hash; Step B: compute hash; Step C:
+// rewrite with current_hash embedded.  Result: self-consistent entry.
+fn _synth_entry(dir: string, name: string, chain_index: int, prev_hash: string, payload_tag: string) -> string {
+    let path = dir + "/" + name
+    // draft (no current_hash)
+    let mut draft = "{"
+    draft = draft + "\"chain_index\":" + str(chain_index) + ","
+    draft = draft + "\"prev_hash\":\"" + prev_hash + "\","
+    draft = draft + "\"payload\":\""   + payload_tag + "\""
+    draft = draft + "}"
+    write_file(path, draft)
+    // canonical form (sorted keys, no current_hash)
+    let canon = _str(exec("jq -S -c 'del(.current_hash)' " + _sh_quote(path) + " 2>/dev/null"))
+    let curr_hash = sha256_of_bytes(canon)
+    // final file with current_hash embedded
+    let mut final = "{"
+    final = final + "\"chain_index\":" + str(chain_index) + ","
+    final = final + "\"current_hash\":\"" + curr_hash + "\","
+    final = final + "\"payload\":\""   + payload_tag + "\","
+    final = final + "\"prev_hash\":\"" + prev_hash + "\""
+    final = final + "}"
+    write_file(path, final)
+    return curr_hash
+}
+
+fn _selftest_s1() -> list {
+    let root = env("ANIMA_ROOT")
+    let r = if root == "" { ROOT_DEFAULT } else { root + "/" + ROOT_DEFAULT }
+    let res = verify_root(r)
+    let per = res[0]
+    let agg = aggregate_counts(per)
+    let mut row = []
+    row = row.push("S1_real_walk")
+    row = row.push(agg[0])   // ok_n
+    row = row.push(agg[1])   // break_n
+    row = row.push(agg[2])   // missing_n
+    row = row.push(agg[3])   // total_n
+    row = row.push(_str(res[1]))
+    // PASS gate: break_n == 0  (ok_n may legitimately be 0 under back-compat)
+    row = row.push(if agg[1] == 0 { "PASS" } else { "FAIL" })
+    return row
+}
+
+fn _selftest_s2() -> list {
+    let d = _mk_synth_dir("s2")
+    let h1 = _synth_entry(d, "01_a.json", 1, "GENESIS", "alpha")
+    let h2 = _synth_entry(d, "02_b.json", 2, h1,        "beta")
+    let _h3 = _synth_entry(d, "03_c.json", 3, h2,       "gamma")
+    let res = verify_root(d)
+    let per = res[0]
+    let agg = aggregate_counts(per)
+    let _ = exec("rm -rf " + _sh_quote(d))
+    let mut row = []
+    row = row.push("S2_synthetic_valid_chain")
+    row = row.push(agg[0])
+    row = row.push(agg[1])
+    row = row.push(agg[2])
+    row = row.push(agg[3])
+    row = row.push(_str(res[1]))
+    row = row.push(if agg[0] == 3 && agg[1] == 0 && agg[2] == 0 { "PASS" } else { "FAIL" })
+    return row
+}
+
+fn _selftest_s3() -> list {
+    let d = _mk_synth_dir("s3")
+    let h1 = _synth_entry(d, "01_a.json", 1, "GENESIS", "alpha")
+    let h2 = _synth_entry(d, "02_b.json", 2, h1,        "beta")
+    let _h3 = _synth_entry(d, "03_c.json", 3, h2,       "gamma")
+    // Mutate middle entry: flip payload without recomputing current_hash.
+    // jq edit in place via tmp file.
+    let middle = d + "/02_b.json"
+    let mutated = _str(exec("jq -c '.payload=\"beta_TAMPERED\"' " + _sh_quote(middle) + " 2>/dev/null"))
+    write_file(middle, mutated)
+    let res = verify_root(d)
+    let per = res[0]
+    let agg = aggregate_counts(per)
+    let _ = exec("rm -rf " + _sh_quote(d))
+    let mut row = []
+    row = row.push("S3_synthetic_mutated_middle")
+    row = row.push(agg[0])
+    row = row.push(agg[1])
+    row = row.push(agg[2])
+    row = row.push(agg[3])
+    row = row.push(_str(res[1]))
+    // Expect at least 1 break (mutation detected by recompute).  The downstream
+    // prev-link check may also break 03 when its prev_hash stops matching the
+    // mutated 02.  We accept break_n >= 1 as "mutation detected".
+    row = row.push(if agg[1] >= 1 { "PASS" } else { "FAIL" })
+    return row
+}
+
+fn _print_selftest_row(row: list) {
+    println("  " + _str(row[0]) + ":"
+        + "  ok_n="      + str(row[1])
+        + "  break_n="   + str(row[2])
+        + "  missing_n=" + str(row[3])
+        + "  total_n="   + str(row[4])
+        + "  order="     + _str(row[5])
+        + "  -> "        + _str(row[6]))
+}
+
+fn run_selftest() -> int {
+    println("meta2_hashchain_verify v1 — selftest")
+    let s1 = _selftest_s1()
+    let s2 = _selftest_s2()
+    let s3 = _selftest_s3()
+    _print_selftest_row(s1)
+    _print_selftest_row(s2)
+    _print_selftest_row(s3)
+    let mut passed = 0
+    if _str(s1[6]) == "PASS" { passed = passed + 1 }
+    if _str(s2[6]) == "PASS" { passed = passed + 1 }
+    if _str(s3[6]) == "PASS" { passed = passed + 1 }
+    println("selftest result: " + str(passed) + "/3 PASS")
+    if passed == 3 { return 0 }
+    return 1
+}
+
+// ─── arg helpers ───────────────────────────────────────────────────────────
+
+fn arg_present(argv, key: string) -> bool {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn arg_value(argv, key: string, dflt: string) -> string {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key && i + 1 < len(argv) { return _str(argv[i + 1]) }
+        i = i + 1
+    }
+    return dflt
+}
+
+// ─── main ──────────────────────────────────────────────────────────────────
+
+fn main() {
+    let av = argv()
+
+    if arg_present(av, "--help") {
+        println("usage: hexa tool/meta2_hashchain_verify.hexa [--root <dir>] [--out <json>] [--selftest]")
+        exit(0)
+    }
+
+    if arg_present(av, "--selftest") {
+        let rc = run_selftest()
+        exit(rc)
+    }
+
+    let root = arg_value(av, "--root", ROOT_DEFAULT)
+    let out  = arg_value(av, "--out",  OUT_DEFAULT)
+
+    println("meta2_hashchain_verify v1 — walking " + root)
+    let res = verify_root(root)
+    let per_entry = res[0]
+    let order_source = _str(res[1])
+    let body = build_output_json(root, per_entry, order_source)
+    write_file(out, body)
+    let agg = aggregate_counts(per_entry)
+    println("  order_source = " + order_source)
+    println("  ok_n="      + str(agg[0])
+        + "  break_n="   + str(agg[1])
+        + "  missing_n=" + str(agg[2])
+        + "  total_n="   + str(agg[3]))
+    println("  wrote: " + out)
+    // Exit 0 iff no BREAK.  MISSING is WARN, not FAIL.
+    if agg[1] == 0 { exit(0) }
+    exit(1)
+}
+
+main()
