@@ -1,0 +1,365 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  edu/lora/verified_replay_buffer.hexa — cluster #31 improvement 3 (raw#9/10/12)
+//
+//  PURPOSE
+//    Ring buffer keyed by (sample_id, cert_reward).  Retains samples whose
+//    cert_reward ≥ min_reward_to_retain (loaded from shared/config JSON).
+//    On capacity overflow, oldest retained entry is evicted (FIFO ring).
+//    Consumed by ALM/LoRA replay consolidation once cert_gate is wired.
+//
+//  API
+//    fn vrb_new() -> VRB
+//    fn vrb_push(vrb, sample_id: string, cert_result: string, reward: float) -> VRB
+//    fn vrb_sample_batch(vrb, n: int, seed: int) -> list<Sample>
+//    fn vrb_len(vrb) -> int
+//    fn vrb_clear(vrb) -> VRB
+//
+//  POLICY
+//    push(sample, cert_result, reward):
+//      if reward < min_reward_to_retain → reject (buffer unchanged)
+//      else                              → append at tail; if len > capacity,
+//                                          drop head (oldest) until len == cap
+//
+//  DETERMINISM
+//    vrb_sample_batch uses an LCG keyed by `seed`.  Two calls with identical
+//    (buffer state, n, seed) produce bit-identical output.
+//
+//  SELFTEST (inline, 3/3 target)
+//    S1  push 5 PASS (reward=1.0) + 3 FAIL (reward=0.0) → buffer size = 5
+//    S2  push 10005 PASS           → oldest 5 evicted, size = 10000
+//    S3  sample_batch(3, seed=42) called twice → identical output
+//
+//  cert_gate integration: MOCK only.
+//  TODO[cert_gate_wire]: real integration post-A3
+//
+//  raw#9 strict · hexa-only · raw#10 proof-carrying · raw#12 single-truth-json
+//  deterministic · LLM=none · CPU-only
+// ════════════════════════════════════════════════════════════════════════════
+
+let CONFIG_PATH = "config/verified_replay_buffer_config.json"
+let OUT_PATH    = "edu/lora/verified_replay_buffer_selftest_result.json"
+
+// ── primitives (local copies; keep file self-contained) ─────────────────────
+
+fn json_num_field(body: string, key: string, default_val: float) -> float {
+    let needle = "\"" + key + "\""
+    let nlen = needle.len()
+    let bn = body.len()
+    let mut i = 0
+    while i + nlen <= bn {
+        if body.substring(i, i + nlen) == needle {
+            let mut j = i + nlen
+            while j < bn {
+                let c = body.substring(j, j + 1)
+                if c == ":" { j = j + 1; break }
+                j = j + 1
+            }
+            while j < bn {
+                let c = body.substring(j, j + 1)
+                if c != " " { if c != "\t" { if c != "\n" { break } } }
+                j = j + 1
+            }
+            let start = j
+            while j < bn {
+                let c = body.substring(j, j + 1)
+                let ok = (c == "0") || (c == "1") || (c == "2") || (c == "3") || (c == "4") || (c == "5") || (c == "6") || (c == "7") || (c == "8") || (c == "9") || (c == ".") || (c == "-") || (c == "+") || (c == "e") || (c == "E")
+                if !ok { break }
+                j = j + 1
+            }
+            if j == start { return default_val }
+            let tok = body.substring(start, j)
+            return to_float(tok)
+        }
+        i = i + 1
+    }
+    return default_val
+}
+
+fn fexists(p: string) -> bool {
+    return exec("test -f " + p + " && echo 1 || echo 0").trim() == "1"
+}
+
+// ── cert_gate MOCK (real integration deferred) ──────────────────────────────
+// TODO[cert_gate_wire]: real integration post-A3
+fn cert_gate_mock_accept(cert_result: string, reward: float, min_reward: float) -> bool {
+    // Mock policy: accept iff reward ≥ min_reward AND cert_result == "PASS".
+    if cert_result != "PASS" { return false }
+    if reward < min_reward { return false }
+    return true
+}
+
+// ── config loader ───────────────────────────────────────────────────────────
+
+struct VRBConfig {
+    capacity:             int,
+    min_reward_to_retain: float
+}
+
+fn load_config() -> VRBConfig {
+    // Defaults if config file is missing (safe fallback).
+    let mut cap_f = 10000.0
+    let mut min_r = 0.5
+    if fexists(CONFIG_PATH) {
+        let body = read_file(CONFIG_PATH)
+        cap_f = json_num_field(body, "capacity", 10000.0)
+        min_r = json_num_field(body, "min_reward_to_retain", 0.5)
+    }
+    let cap_i = to_int(cap_f)
+    return VRBConfig { capacity: cap_i, min_reward_to_retain: min_r }
+}
+
+// ── sample record ───────────────────────────────────────────────────────────
+
+struct Sample {
+    sample_id:   string,
+    cert_result: string,
+    reward:      float
+}
+
+// ── ring buffer (SoA via parallel lists) ────────────────────────────────────
+// Keeps three parallel arrays of equal length.  On overflow, drop index 0
+// of each array (oldest-evict).
+
+struct VRB {
+    ids:      list,
+    certs:    list,
+    rewards:  list,
+    capacity: int,
+    min_r:    float
+}
+
+fn vrb_new() -> VRB {
+    let cfg = load_config()
+    return VRB {
+        ids:      [],
+        certs:    [],
+        rewards:  [],
+        capacity: cfg.capacity,
+        min_r:    cfg.min_reward_to_retain
+    }
+}
+
+fn vrb_len(vrb: VRB) -> int {
+    return len(vrb.ids)
+}
+
+fn vrb_clear(vrb: VRB) -> VRB {
+    return VRB {
+        ids:      [],
+        certs:    [],
+        rewards:  [],
+        capacity: vrb.capacity,
+        min_r:    vrb.min_r
+    }
+}
+
+// Drop first element of a list (oldest-evict).
+fn drop_head(xs: list) -> list {
+    let n = len(xs)
+    if n <= 1 { return [] }
+    let mut out = []
+    let mut i = 1
+    while i < n {
+        out = out.push(xs[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn vrb_push(vrb: VRB, sample_id: string, cert_result: string, reward: float) -> VRB {
+    // cert_gate MOCK acceptance check (TODO: replace post-A3)
+    if !cert_gate_mock_accept(cert_result, reward, vrb.min_r) {
+        return vrb
+    }
+    let mut ids = vrb.ids.push(sample_id)
+    let mut certs = vrb.certs.push(cert_result)
+    let mut rewards = vrb.rewards.push(reward)
+    // Enforce capacity by dropping oldest until len ≤ capacity.
+    while len(ids) > vrb.capacity {
+        ids = drop_head(ids)
+        certs = drop_head(certs)
+        rewards = drop_head(rewards)
+    }
+    return VRB {
+        ids:      ids,
+        certs:    certs,
+        rewards:  rewards,
+        capacity: vrb.capacity,
+        min_r:    vrb.min_r
+    }
+}
+
+// Deterministic LCG producing index in [0, n).
+// Glibc-style a=1103515245, c=12345, m=2^31.
+fn lcg_next(s: int) -> int {
+    return (s * 1103515245 + 12345) % 2147483648
+}
+
+fn vrb_sample_batch(vrb: VRB, n: int, seed: int) -> list {
+    let m = len(vrb.ids)
+    let mut out = []
+    if m == 0 { return out }
+    if n <= 0 { return out }
+    let mut s = seed
+    let mut k = 0
+    while k < n {
+        s = lcg_next(s)
+        let idx = s % m
+        let sid = vrb.ids[idx]
+        let cert = vrb.certs[idx]
+        let r = vrb.rewards[idx]
+        out = out.push(Sample { sample_id: sid, cert_result: cert, reward: r })
+        k = k + 1
+    }
+    return out
+}
+
+// ── selftest ───────────────────────────────────────────────────────────────
+
+fn samples_equal(a: list, b: list) -> bool {
+    let na = len(a)
+    let nb = len(b)
+    if na != nb { return false }
+    let mut i = 0
+    while i < na {
+        let sa = a[i]
+        let sb = b[i]
+        if sa.sample_id != sb.sample_id { return false }
+        if sa.cert_result != sb.cert_result { return false }
+        let d = sa.reward - sb.reward
+        let ad = if d < 0.0 { 0.0 - d } else { d }
+        if ad > 0.000001 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn batch_to_str(batch: list) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < len(batch) {
+        let smp = batch[i]
+        if i > 0 { s = s + ", " }
+        s = s + "(" + smp.sample_id + "," + smp.cert_result + "," + to_string(smp.reward) + ")"
+        i = i + 1
+    }
+    return s + "]"
+}
+
+struct SelftestReport {
+    s1_pass: bool,
+    s1_size: int,
+    s2_pass: bool,
+    s2_size: int,
+    s3_pass: bool,
+    s3_batch_a: string,
+    s3_batch_b: string,
+    all_pass: bool
+}
+
+fn run_s1() -> SelftestReport {
+    // S1: push 5 PASS (reward=1.0) + 3 FAIL (reward=0.0) → size = 5
+    let mut vrb = vrb_new()
+    let mut i = 0
+    while i < 5 {
+        vrb = vrb_push(vrb, "pass_" + to_string(i), "PASS", 1.0)
+        i = i + 1
+    }
+    let mut j = 0
+    while j < 3 {
+        vrb = vrb_push(vrb, "fail_" + to_string(j), "FAIL", 0.0)
+        j = j + 1
+    }
+    let sz = vrb_len(vrb)
+    let ok = sz == 5
+
+    // S2: fresh buffer; push 10005 PASS → size = 10000 (oldest 5 evicted)
+    let mut vrb2 = vrb_new()
+    let mut k = 0
+    while k < 10005 {
+        vrb2 = vrb_push(vrb2, "s_" + to_string(k), "PASS", 1.0)
+        k = k + 1
+    }
+    let sz2 = vrb_len(vrb2)
+    let ok2 = sz2 == 10000
+    // Also verify oldest 5 were evicted: head id should be "s_5".
+    let head_ok = if sz2 > 0 { vrb2.ids[0] == "s_5" } else { false }
+    let ok2_full = ok2 && head_ok
+
+    // S3: sample_batch(3, seed=42) called twice → identical output.
+    let batch_a = vrb_sample_batch(vrb2, 3, 42)
+    let batch_b = vrb_sample_batch(vrb2, 3, 42)
+    let ok3 = samples_equal(batch_a, batch_b) && len(batch_a) == 3
+
+    let all = ok && ok2_full && ok3
+    return SelftestReport {
+        s1_pass:    ok,
+        s1_size:    sz,
+        s2_pass:    ok2_full,
+        s2_size:    sz2,
+        s3_pass:    ok3,
+        s3_batch_a: batch_to_str(batch_a),
+        s3_batch_b: batch_to_str(batch_b),
+        all_pass:   all
+    }
+}
+
+fn bool_s(b: bool) -> string {
+    if b { return "true" }
+    return "false"
+}
+
+fn write_selftest_result(rep: SelftestReport) {
+    let body = "{\n"
+        + "  \"tool\": \"edu/lora/verified_replay_buffer.hexa\",\n"
+        + "  \"version\": \"v1\",\n"
+        + "  \"cluster\": 31,\n"
+        + "  \"improvement\": 3,\n"
+        + "  \"raw_compliance\": [\"raw#9 hexa-only\", \"raw#10 proof-carrying\", \"raw#12 single-truth-json\"],\n"
+        + "  \"deterministic\": true,\n"
+        + "  \"llm\": \"none\",\n"
+        + "  \"cert_gate\": \"MOCK (TODO[cert_gate_wire]: real integration post-A3)\",\n"
+        + "  \"config_path\": \"" + CONFIG_PATH + "\",\n"
+        + "  \"selftest\": {\n"
+        + "    \"s1_push_5pass_3fail\": {\"pass\": " + bool_s(rep.s1_pass) + ", \"size\": " + to_string(rep.s1_size) + ", \"expected\": 5},\n"
+        + "    \"s2_overflow_10005\":   {\"pass\": " + bool_s(rep.s2_pass) + ", \"size\": " + to_string(rep.s2_size) + ", \"expected\": 10000},\n"
+        + "    \"s3_determinism\":      {\"pass\": " + bool_s(rep.s3_pass) + ", \"batch_a\": \"" + rep.s3_batch_a + "\", \"batch_b\": \"" + rep.s3_batch_b + "\"}\n"
+        + "  },\n"
+        + "  \"all_pass\": " + bool_s(rep.all_pass) + "\n"
+        + "}\n"
+    write_file(OUT_PATH, body)
+}
+
+fn main() {
+    println("══════════════════════════════════════════════════════════════")
+    println("  edu/lora/verified_replay_buffer — cluster #31 improvement 3")
+    println("  raw#9 hexa-only · raw#10 proof-carrying · raw#12 single-truth-json")
+    println("══════════════════════════════════════════════════════════════")
+
+    let cfg = load_config()
+    println("")
+    println("── config ──")
+    println("  path                  = " + CONFIG_PATH)
+    println("  capacity              = " + to_string(cfg.capacity))
+    println("  min_reward_to_retain  = " + to_string(cfg.min_reward_to_retain))
+
+    println("")
+    println("── inline selftest (3 cases) ──")
+    let rep = run_s1()
+
+    println("  S1 push 5 PASS + 3 FAIL → size=" + to_string(rep.s1_size) + " (expect 5) → " + if rep.s1_pass { "PASS" } else { "FAIL" })
+    println("  S2 push 10005 PASS       → size=" + to_string(rep.s2_size) + " (expect 10000, head=s_5) → " + if rep.s2_pass { "PASS" } else { "FAIL" })
+    println("  S3 sample_batch(3,42)×2 → determinism → " + if rep.s3_pass { "PASS" } else { "FAIL" })
+    println("    batch_a = " + rep.s3_batch_a)
+    println("    batch_b = " + rep.s3_batch_b)
+
+    write_selftest_result(rep)
+    println("")
+    println("  [out] " + OUT_PATH)
+
+    if rep.all_pass {
+        println("  [PASS] 3/3 — verified replay buffer landed (MOCK cert_gate)")
+    } else {
+        println("  [FAIL] selftest did not achieve 3/3")
+    }
+}
