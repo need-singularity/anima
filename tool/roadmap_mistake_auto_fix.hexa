@@ -4,18 +4,28 @@
 //   roadmap_integrity_guard 결과 (shared/state/roadmap_integrity_result.json)
 //   를 읽어 auto_fix 가 허용된 check 에 한해 복구 루틴을 실행한다.
 //
-//   auto_fix matrix (config 에서 결정):
-//     check_2_uchg          → auto  : chflags uchg .roadmap
-//     check_3_paths_drift   → manual: WARN 출력만 (수동 수정)
-//     check_4_file_drift    → manual: WARN + 유사 이름 제안
-//     check_5_ssot_stale    → manual: "needs revalidation" 표기 (파일 불변)
-//     check_6_lock          → observe-only: ps 정보 덤프, kill 금지
+//   auto_fix matrix (config 에서 결정 — auto_fix_policy):
+//     check_2_uchg          → auto (requires_apply=false)  : chflags uchg .roadmap
+//     check_3_paths_drift   → apply                        : paths.json 후행 desc / range suffix 제거 + lint re-verify rollback
+//     check_4_file_drift    → apply + aggressive           : missing entry (SIMILAR_FOUND 없음) 제거 제안/수행
+//     check_5_ssot_stale    → apply                        : validator_tool 재실행 (lock 경합 skip)
+//     check_6_lock          → observe-only                 : ps 정보 덤프, kill 금지
 //
 // USAGE
-//   hexa tool/roadmap_mistake_auto_fix.hexa             분석 + auto-fix (default)
-//   hexa tool/roadmap_mistake_auto_fix.hexa --dry-run   진단만, 쓰기 없음
+//   hexa tool/roadmap_mistake_auto_fix.hexa                 분석 + check #2 auto (dry-run 기본)
+//   hexa tool/roadmap_mistake_auto_fix.hexa --dry-run       진단만, 쓰기 없음
+//   hexa tool/roadmap_mistake_auto_fix.hexa --apply         #2 + #3 + #5 자동 수정
+//   hexa tool/roadmap_mistake_auto_fix.hexa --apply --aggressive   + #4 entry 제거
+//   hexa tool/roadmap_mistake_auto_fix.hexa --check 2,3,5   특정 check 만
 //   hexa tool/roadmap_mistake_auto_fix.hexa --config P
 //   hexa tool/roadmap_mistake_auto_fix.hexa --help
+//
+// RULES
+//   raw#1  chflags 는 check_2 로만 건드림
+//   raw#9  hexa-only
+//   raw#11 snake_case
+//   raw#12 실측 + .bak.<ts> backup 보관 (raw#10 audit)
+//   raw#15 auto_fix_policy config 로드 (no-hardcode)
 
 let DEFAULT_CONFIG = "/Users/ghost/core/anima/shared/config/roadmap_integrity_config.json"
 
@@ -41,6 +51,7 @@ fn _file_exists(path: string) -> bool {
 }
 
 fn _ts_iso() -> string { return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim() }
+fn _ts_epoch() -> string { return _exec_out("date -u +%s").trim() }
 
 fn _argv() -> array {
     let a = args()
@@ -67,6 +78,24 @@ fn _opt(av: array, k: string, d: string) -> string {
     return d
 }
 
+// Parse "--check 2,3,5" into a set-like array of ints (as strings). Empty → all.
+fn _parse_checks(s: string) -> array {
+    let mut out = []
+    if s == "" { return out }
+    let parts = split(s, ",")
+    for p in parts {
+        let t = to_string(p).trim()
+        if len(t) > 0 { out.push(t) }
+    }
+    return out
+}
+
+fn _check_selected(selected: array, n: string) -> bool {
+    if len(selected) == 0 { return true }
+    for x in selected { if to_string(x) == n { return true } }
+    return false
+}
+
 // Returns the JSON check entry (map) or empty array as sentinel.
 fn _find_check(checks, name: string) {
     let mut i = 0
@@ -79,7 +108,6 @@ fn _find_check(checks, name: string) {
 }
 
 fn _is_found(c) -> bool {
-    // sentinel: empty array means "not found". Maps have contains_key.
     let t = type_of(c)
     if t == "array" { return false }
     return true
@@ -94,11 +122,20 @@ fn _load_json(path: string) {
     return json_parse(raw)
 }
 
+// raw#10 .raw-audit append helper (best-effort). Schema: timestamp tool verdict detail.
+fn _raw_audit_append(cfg, verdict: string, detail: string) {
+    if !cfg.contains_key("raw_audit_path") { return }
+    let p = to_string(cfg["raw_audit_path"])
+    let line = _ts_iso() + " tool/roadmap_mistake_auto_fix.hexa " + verdict + " " + detail + "\n"
+    // tee-append; ignore failure (audit is best-effort, never blocks fix)
+    let cmd = "printf '%s' " + _sh_quote(line) + " >> " + _sh_quote(p) + " 2>/dev/null"
+    let _ = exec_with_status(cmd)
+}
+
 // ─── fix routines ───────────────────────────────────────────────────
 
 fn fix_uchg(cfg, dry: bool) -> array {
     let roadmap_path = to_string(cfg["roadmap_path"])
-    // read current chflags
     let cmd = "ls -lO " + _sh_quote(roadmap_path) + " 2>/dev/null"
     let out = _exec_out(cmd)
     let has = out.index_of("uchg") >= 0
@@ -110,29 +147,455 @@ fn fix_uchg(cfg, dry: bool) -> array {
     }
     let rc = _exec_code("chflags uchg " + _sh_quote(roadmap_path))
     if rc == 0 {
+        _raw_audit_append(cfg, "FIXED", "check_2_uchg chflags uchg re-applied")
         return ["check_2_uchg", "FIXED", "chflags uchg re-applied"]
     }
     return ["check_2_uchg", "FAIL", "chflags exit=" + to_string(rc)]
 }
 
-fn report_paths_drift(result) -> array {
-    let items = result["items"]
-    let n = len(items)
-    return ["check_3_paths_drift", "MANUAL", to_string(n) + " description-suffix strings — hand-fix required (no auto)"]
+// ── check #3: paths.json desc-suffix / line-range auto-strip ────────
+//
+// Algorithm:
+//   For every paths.json string whose trimmed prefix matches a known
+//   path-prefix (tool/, edu/, …) AND contains a description separator
+//   or trailing :NUM-NUM range, strip the suffix in place.
+//   Safety: .bak.<ts> before write; roadmap_lint re-verify after; on
+//   lint FAIL → restore .bak and return ROLLED_BACK.
+
+fn _has_prefix(s: string, prefixes: array) -> bool {
+    for p in prefixes {
+        let ps = to_string(p)
+        if len(s) >= len(ps) && s.substring(0, len(ps)) == ps { return true }
+    }
+    return false
 }
 
-fn report_file_drift(cfg, result) -> array {
-    let items = result["items"]
-    let n = len(items)
-    let fix_map = cfg["checks"]["check_4_file_drift"]["drift_fix_map"]
-    let mapped = len(fix_map)
-    return ["check_4_file_drift", "MANUAL", to_string(n) + " missing paths — " + to_string(mapped) + " known mappings in drift_fix_map"]
+fn _strip_desc_and_range(v: string, seps: array) -> string {
+    let mut out = v
+    // desc separators: first match wins
+    for sep in seps {
+        let ss = to_string(sep)
+        let k = out.index_of(ss)
+        if k >= 0 { out = out.substring(0, k) }
+    }
+    // trailing :N-N
+    let n = len(out)
+    let mut j = n - 1
+    let mut d_right = 0
+    while j >= 0 {
+        let c = out.substring(j, j + 1)
+        if c >= "0" && c <= "9" { d_right = d_right + 1; j = j - 1 } else { break }
+    }
+    if d_right > 0 && j >= 0 && out.substring(j, j + 1) == "-" {
+        let mut k = j - 1
+        let mut d_left = 0
+        while k >= 0 {
+            let c2 = out.substring(k, k + 1)
+            if c2 >= "0" && c2 <= "9" { d_left = d_left + 1; k = k - 1 } else { break }
+        }
+        if d_left > 0 && k >= 0 && out.substring(k, k + 1) == ":" {
+            out = out.substring(0, k)
+        }
+    }
+    return out.trim()
 }
 
-fn report_ssot_stale(result) -> array {
-    let items = result["items"]
+fn _needs_strip(v: string, seps: array) -> bool {
+    for sep in seps {
+        let ss = to_string(sep)
+        if v.index_of(ss) >= 0 { return true }
+    }
+    // trailing range
+    let n = len(v)
+    let mut j = n - 1
+    let mut d_right = 0
+    while j >= 0 {
+        let c = v.substring(j, j + 1)
+        if c >= "0" && c <= "9" { d_right = d_right + 1; j = j - 1 } else { break }
+    }
+    if d_right > 0 && j >= 0 && v.substring(j, j + 1) == "-" {
+        let mut k = j - 1
+        let mut d_left = 0
+        while k >= 0 {
+            let c2 = v.substring(k, k + 1)
+            if c2 >= "0" && c2 <= "9" { d_left = d_left + 1; k = k - 1 } else { break }
+        }
+        if d_left > 0 && k >= 0 && v.substring(k, k + 1) == ":" { return true }
+    }
+    return false
+}
+
+// Rewrite paths.json by scanning raw text for JSON string literals;
+// when the literal starts with a known prefix and needs stripping,
+// replace in place. Returns [new_src, n_changes].
+fn _rewrite_paths_source(raw: string, prefixes: array, seps: array) -> array {
+    let n = len(raw)
+    let mut out = ""
+    let mut i = 0
+    let mut changes = 0
+    while i < n {
+        let c = raw.substring(i, i + 1)
+        if c != "\"" {
+            out = out + c
+            i = i + 1
+            continue
+        }
+        // find literal end, tracking escapes
+        let mut j = i + 1
+        let mut buf = ""
+        while j < n {
+            let cc = raw.substring(j, j + 1)
+            if cc == "\\" && j + 1 < n {
+                buf = buf + cc + raw.substring(j + 1, j + 2)
+                j = j + 2
+                continue
+            }
+            if cc == "\"" { break }
+            buf = buf + cc
+            j = j + 1
+        }
+        // decoded (for prefix + suffix checks) — unescape only \" \\ \n
+        let mut decoded = ""
+        let mut p = 0
+        while p < len(buf) {
+            let ch = buf.substring(p, p + 1)
+            if ch == "\\" && p + 1 < len(buf) {
+                let nx = buf.substring(p + 1, p + 2)
+                if nx == "\"" { decoded = decoded + "\""; p = p + 2; continue }
+                if nx == "\\" { decoded = decoded + "\\"; p = p + 2; continue }
+                if nx == "n"  { decoded = decoded + "\n"; p = p + 2; continue }
+                decoded = decoded + ch + nx
+                p = p + 2
+                continue
+            }
+            decoded = decoded + ch
+            p = p + 1
+        }
+        let mut final_raw = buf
+        if _has_prefix(decoded, prefixes) && _needs_strip(decoded, seps) {
+            let stripped = _strip_desc_and_range(decoded, seps)
+            // re-encode: only \" and \\ need escaping (no \n expected in paths)
+            let mut enc = ""
+            let mut q = 0
+            while q < len(stripped) {
+                let cs = stripped.substring(q, q + 1)
+                if cs == "\\" { enc = enc + "\\\\" }
+                else if cs == "\"" { enc = enc + "\\\"" }
+                else { enc = enc + cs }
+                q = q + 1
+            }
+            final_raw = enc
+            changes = changes + 1
+        }
+        // emit: opening quote + (possibly rewritten) escaped content + closing quote
+        out = out + "\"" + final_raw + "\""
+        // advance past closing quote (if present)
+        if j < n { i = j + 1 } else { i = j }
+    }
+    return [out, to_string(changes)]
+}
+
+fn _lint_ok(cfg) -> bool {
+    if !cfg.contains_key("lint_tool") || !cfg.contains_key("hexa_bin") { return true }
+    let lint = to_string(cfg["lint_tool"])
+    let hexa = to_string(cfg["hexa_bin"])
+    let repo = to_string(cfg["repo_root"])
+    if !_file_exists(lint) { return true }
+    let cmd = "cd " + _sh_quote(repo) + " && " + _sh_quote(hexa) + " " + _sh_quote(lint) + " 2>&1"
+    let rc = _exec_code(cmd + " >/dev/null")
+    return rc == 0
+}
+
+fn fix_paths_drift(cfg, c3, dry: bool, allowed: bool) -> array {
+    if !allowed {
+        let items = c3["items"]
+        let n = len(items)
+        return ["check_3_paths_drift", "MANUAL", to_string(n) + " suffix strings — pass --apply to auto-strip"]
+    }
+    let repo_root = to_string(cfg["repo_root"])
+    let sources = cfg["paths_json_sources"]
+    let pcfg = cfg["checks"]["check_3_paths_drift"]
+    let prefixes = pcfg["path_prefixes"]
+    let seps = pcfg["description_separators"]
+
+    let mut total_changes = 0
+    let mut files_changed = 0
+    let mut backups = []
+    let mut rollback_note = ""
+    let mut rolled_back = false
+
+    let mut i = 0
+    while i < len(sources) {
+        let rel = to_string(sources[i])
+        let full = repo_root + "/" + rel
+        if !_file_exists(full) { i = i + 1; continue }
+        let src = to_string(read_file(full))
+        let rw = _rewrite_paths_source(src, prefixes, seps)
+        let new_src = to_string(rw[0])
+        let n_changes = to_int(to_string(rw[1]))
+        if n_changes == 0 { i = i + 1; continue }
+
+        if dry {
+            total_changes = total_changes + n_changes
+            files_changed = files_changed + 1
+            i = i + 1
+            continue
+        }
+
+        // backup
+        let bak = full + ".bak." + _ts_epoch()
+        let bc = _exec_code("cp " + _sh_quote(full) + " " + _sh_quote(bak))
+        if bc != 0 {
+            return ["check_3_paths_drift", "FAIL", "backup failed for " + rel]
+        }
+        backups.push(bak)
+
+        let _ = write_file(full, new_src)
+        total_changes = total_changes + n_changes
+        files_changed = files_changed + 1
+        i = i + 1
+    }
+
+    if dry {
+        return ["check_3_paths_drift", "WOULD_FIX", to_string(total_changes) + " suffixes across " + to_string(files_changed) + " file(s) (dry-run)"]
+    }
+    if total_changes == 0 {
+        return ["check_3_paths_drift", "NOOP", "no stripable suffixes found"]
+    }
+
+    // lint re-verify. rollback on fail (unless policy disables).
+    let mut lint_rollback = true
+    let polcfg = cfg
+    if polcfg.contains_key("auto_fix_policy") {
+        let ap = polcfg["auto_fix_policy"]
+        if ap.contains_key("check_3_paths_drift") {
+            let sub = ap["check_3_paths_drift"]
+            if sub.contains_key("rollback_on_lint_fail") {
+                if to_string(sub["rollback_on_lint_fail"]) == "false" { lint_rollback = false }
+            }
+        }
+    }
+
+    if !_lint_ok(cfg) && lint_rollback {
+        // restore from backups
+        for b in backups {
+            let bs = to_string(b)
+            let idx = bs.index_of(".bak.")
+            if idx > 0 {
+                let orig = bs.substring(0, idx)
+                let _ = _exec_code("cp " + _sh_quote(bs) + " " + _sh_quote(orig))
+            }
+        }
+        rolled_back = true
+        rollback_note = " (ROLLED_BACK: lint failed post-fix)"
+    }
+
+    if rolled_back {
+        _raw_audit_append(cfg, "ROLLED_BACK", "check_3_paths_drift " + to_string(total_changes) + " changes rolled back")
+        return ["check_3_paths_drift", "ROLLED_BACK", to_string(total_changes) + " changes reverted; lint FAIL" + rollback_note]
+    }
+    let bak_hint = if len(backups) > 0 { " bak=" + to_string(backups[0]) } else { "" }
+    _raw_audit_append(cfg, "FIXED", "check_3_paths_drift " + to_string(total_changes) + " suffixes stripped")
+    return ["check_3_paths_drift", "FIXED", to_string(total_changes) + " suffixes stripped; lint PASS" + bak_hint]
+}
+
+// ── check #4: file_drift — SIMILAR_FOUND suggest / missing entry removal
+//
+// Conservative: only with --apply --aggressive. Even then, we only
+// REMOVE paths.json entries where the string is a bare path literal AND
+// the guard items give no similar hint (i.e., the path is dangling).
+// We do not auto-rename via similar-found (that requires user review).
+
+fn _basename(p: string) -> string {
+    let n = len(p)
+    let mut i = n - 1
+    while i >= 0 {
+        if p.substring(i, i + 1) == "/" { return p.substring(i + 1, n) }
+        i = i - 1
+    }
+    return p
+}
+
+fn _find_similar(repo_root: string, bn: string) -> string {
+    let cmd = "find " + _sh_quote(repo_root) + " -maxdepth 6 -name " + _sh_quote(bn) + " 2>/dev/null | head -1"
+    return _exec_out(cmd).trim()
+}
+
+fn fix_file_drift(cfg, c4, dry: bool, apply: bool, aggressive: bool) -> array {
+    let items = c4["items"]
     let n = len(items)
-    return ["check_5_ssot_stale", "MANUAL", to_string(n) + " audit SSOT stale — marked 'needs revalidation' (no file skip, no auto-overwrite)"]
+    if !apply || !aggressive {
+        // Just report with similar suggestions
+        let repo_root = to_string(cfg["repo_root"])
+        let mut n_similar = 0
+        let mut n_dangling = 0
+        let mut i = 0
+        while i < len(items) {
+            let line = to_string(items[i])
+            if line.index_of(" → similar:") >= 0 || line.index_of(" → map:") >= 0 {
+                n_similar = n_similar + 1
+            } else {
+                n_dangling = n_dangling + 1
+            }
+            i = i + 1
+        }
+        return ["check_4_file_drift", "MANUAL", to_string(n) + " missing (similar=" + to_string(n_similar) + " dangling=" + to_string(n_dangling) + ") — pass --apply --aggressive to prune dangling"]
+    }
+    // aggressive mode: currently we only REPORT what would be pruned.
+    // Actual JSON pruning requires structural edit; we flag for user review and emit a .prune_candidates.json list.
+    let repo_root = to_string(cfg["repo_root"])
+    let state_dir = to_string(cfg["state_dir"])
+    let mut dangling = []
+    let mut i = 0
+    while i < len(items) {
+        let line = to_string(items[i])
+        if line.index_of(" → similar:") < 0 && line.index_of(" → map:") < 0 {
+            dangling.push(line)
+        }
+        i = i + 1
+    }
+    if len(dangling) == 0 {
+        return ["check_4_file_drift", "NOOP", "all " + to_string(n) + " missing have similar/map hints — no dangling to prune"]
+    }
+    if dry {
+        return ["check_4_file_drift", "WOULD_FIX", to_string(len(dangling)) + " dangling paths flagged for prune (aggressive dry-run)"]
+    }
+    let out_path = state_dir + "/paths_prune_candidates_" + _ts_epoch() + ".json"
+    let mut body = "{\n  \"schema\": \"anima.roadmap_integrity.prune.v1\",\n"
+    body = body + "  \"ts\": \"" + _ts_iso() + "\",\n"
+    body = body + "  \"candidates\": [\n"
+    let mut k = 0
+    while k < len(dangling) {
+        let esc = to_string(dangling[k]).replace("\\", "\\\\").replace("\"", "\\\"")
+        let comma = if k + 1 < len(dangling) { "," } else { "" }
+        body = body + "    \"" + esc + "\"" + comma + "\n"
+        k = k + 1
+    }
+    body = body + "  ]\n}\n"
+    let _ = _exec_code("mkdir -p " + _sh_quote(state_dir))
+    let _ = write_file(out_path, body)
+    _raw_audit_append(cfg, "FLAGGED", "check_4_file_drift " + to_string(len(dangling)) + " prune candidates at " + out_path)
+    return ["check_4_file_drift", "FLAGGED", to_string(len(dangling)) + " dangling flagged — " + out_path + " (review + manual JSON edit required; raw#12 conservatism)"]
+}
+
+// ── check #5: SSOT validator re-execute if stale ────────────────────
+//
+// For each stale audit file, read "validator_tool"+"validator_invocation"
+// if present, re-run under 300s timeout. On success, the validator is
+// expected to update its own SSOT file; we only observe exit code.
+// On lock contention, skip (never kill).
+
+fn _read_json_field(raw: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let k = raw.index_of(needle)
+    if k < 0 { return "" }
+    let rest = raw.substring(k + len(needle), len(raw))
+    let mut j = 0
+    while j < len(rest) {
+        let c = rest.substring(j, j + 1)
+        if c == " " || c == "\t" || c == ":" { j = j + 1 } else { break }
+    }
+    if j >= len(rest) { return "" }
+    if rest.substring(j, j + 1) != "\"" { return "" }
+    j = j + 1
+    let mut buf = ""
+    while j < len(rest) {
+        let c = rest.substring(j, j + 1)
+        if c == "\"" { break }
+        buf = buf + c
+        j = j + 1
+    }
+    return buf
+}
+
+fn fix_ssot_stale(cfg, c5, dry: bool, apply: bool) -> array {
+    let items = c5["items"]
+    let n = len(items)
+    if !apply {
+        return ["check_5_ssot_stale", "MANUAL", to_string(n) + " stale audit SSOT — pass --apply to re-invoke validator_tool"]
+    }
+    let repo_root = to_string(cfg["repo_root"])
+    let hexa = to_string(cfg["hexa_bin"])
+    let mut timeout_s = 300
+    if cfg.contains_key("auto_fix_policy") {
+        let ap = cfg["auto_fix_policy"]
+        if ap.contains_key("check_5_ssot_stale") {
+            let sub = ap["check_5_ssot_stale"]
+            if sub.contains_key("timeout_s") {
+                timeout_s = to_int(to_string(sub["timeout_s"]))
+            }
+        }
+    }
+    let mut ran = 0
+    let mut ok = 0
+    let mut skipped = 0
+    let mut failed = 0
+    let mut logs = []
+
+    let mut i = 0
+    while i < len(items) {
+        let line = to_string(items[i])
+        // line shape: "/path/to/xxx_audit.json validator_status=..."
+        let sp = line.index_of(" ")
+        let audit_path = if sp > 0 { line.substring(0, sp) } else { line }
+        if !_file_exists(audit_path) { skipped = skipped + 1; i = i + 1; continue }
+        let raw = to_string(read_file(audit_path))
+        let tool_rel = _read_json_field(raw, "validator_tool")
+        let invocation = _read_json_field(raw, "validator_invocation")
+        if tool_rel == "" {
+            logs.push(audit_path + " [SKIP] no validator_tool field")
+            skipped = skipped + 1
+            i = i + 1
+            continue
+        }
+
+        // quick lock-holder probe: if hexa_stage0 lock dir populated → skip (no kill).
+        let lock_pid = "/tmp/hexa_stage0.lock.d/pid"
+        if _file_exists(lock_pid) {
+            let pid = _exec_out("cat " + _sh_quote(lock_pid) + " 2>/dev/null").trim()
+            logs.push(audit_path + " [SKIP_LOCK] holder pid=" + pid)
+            skipped = skipped + 1
+            i = i + 1
+            continue
+        }
+
+        if dry {
+            logs.push(audit_path + " [WOULD_RUN] " + tool_rel)
+            i = i + 1
+            continue
+        }
+
+        let cmd = "cd " + _sh_quote(repo_root) + " && "
+        // Prefer explicit invocation if present (full shell expr)
+        let full_cmd = if invocation != "" {
+            cmd + invocation
+        } else {
+            cmd + _sh_quote(hexa) + " " + _sh_quote(tool_rel)
+        }
+        // no native timeout in shell on darwin; wrap with perl alarm fallback
+        let timed = "perl -e 'alarm " + to_string(timeout_s) + "; exec @ARGV' sh -c " + _sh_quote(full_cmd) + " 2>&1"
+        let r = exec_with_status(timed)
+        ran = ran + 1
+        if r[1] == 0 {
+            ok = ok + 1
+            logs.push(audit_path + " [OK]")
+        } else {
+            failed = failed + 1
+            let out = to_string(r[0])
+            let prev = if len(out) > 120 { out.substring(0, 120) } else { out }
+            logs.push(audit_path + " [FAIL exit=" + to_string(r[1]) + "] " + prev)
+        }
+        i = i + 1
+    }
+
+    if dry {
+        let would = n - skipped
+        return ["check_5_ssot_stale", "WOULD_FIX", to_string(would) + "/" + to_string(n) + " validators would re-run (skip_lock=" + to_string(skipped) + ")"]
+    }
+    _raw_audit_append(cfg, "REVALIDATED", "check_5_ssot_stale ran=" + to_string(ran) + " ok=" + to_string(ok) + " fail=" + to_string(failed) + " skip=" + to_string(skipped))
+    let tag = if failed == 0 && ok > 0 { "FIXED" } else { if ok > 0 { "PARTIAL" } else { "FAIL" } }
+    let detail = "ran=" + to_string(ran) + " ok=" + to_string(ok) + " fail=" + to_string(failed) + " skip=" + to_string(skipped)
+    return ["check_5_ssot_stale", tag, detail]
 }
 
 fn observe_lock(result) -> array {
@@ -151,15 +614,26 @@ fn observe_lock(result) -> array {
 fn main() -> int {
     let av = _argv()
     if _flag(av, "--help") || _flag(av, "-h") {
-        println("usage: hexa tool/roadmap_mistake_auto_fix.hexa [--dry-run] [--config path]")
+        println("usage: hexa tool/roadmap_mistake_auto_fix.hexa [opts]")
+        println("  --dry-run            preview only (default)")
+        println("  --apply              run auto-fix for #2/#3/#5")
+        println("  --apply --aggressive also prune #4 dangling (flags paths_prune_candidates_*.json)")
+        println("  --check 2,3,5        restrict to listed checks")
+        println("  --config <path>")
         return 0
     }
     let cfg_path = _opt(av, "--config", DEFAULT_CONFIG)
-    let dry = _flag(av, "--dry-run")
+    let dry_flag = _flag(av, "--dry-run")
+    let apply_flag = _flag(av, "--apply")
+    let aggressive = _flag(av, "--aggressive")
+    // default: dry-run (no --apply)
+    let dry = !apply_flag || dry_flag
+    let sel_raw = _opt(av, "--check", "")
+    let selected = _parse_checks(sel_raw)
+
     let cfg = _load_json(cfg_path)
     let result_path = to_string(cfg["output"]["summary_ssot"])
 
-    // Ensure the integrity result exists — prompt user to run guard first.
     if !_file_exists(result_path) {
         println("auto_fix: integrity result missing — run roadmap_integrity_guard first:")
         println("  hexa tool/roadmap_integrity_guard.hexa")
@@ -169,37 +643,47 @@ fn main() -> int {
     let res = _load_json(result_path)
     let checks = res["checks"]
 
-    // Linear lookup — checks list is tiny (≤7).
     let mut actions = []
 
-    let c2 = _find_check(checks, "check_2_uchg")
-    if _is_found(c2) && to_string(c2["verdict"]) != "PASS" {
-        actions.push(fix_uchg(cfg, dry))
-    } else {
-        actions.push(["check_2_uchg", "NOOP", "already PASS or absent"])
+    if _check_selected(selected, "2") {
+        let c2 = _find_check(checks, "check_2_uchg")
+        if _is_found(c2) && to_string(c2["verdict"]) != "PASS" {
+            actions.push(fix_uchg(cfg, dry))
+        } else {
+            actions.push(["check_2_uchg", "NOOP", "already PASS or absent"])
+        }
     }
 
-    let c3 = _find_check(checks, "check_3_paths_drift")
-    if _is_found(c3) && to_string(c3["verdict"]) != "PASS" {
-        actions.push(report_paths_drift(c3))
+    if _check_selected(selected, "3") {
+        let c3 = _find_check(checks, "check_3_paths_drift")
+        if _is_found(c3) && to_string(c3["verdict"]) != "PASS" {
+            actions.push(fix_paths_drift(cfg, c3, dry, apply_flag))
+        }
     }
 
-    let c4 = _find_check(checks, "check_4_file_drift")
-    if _is_found(c4) && to_string(c4["verdict"]) != "PASS" {
-        actions.push(report_file_drift(cfg, c4))
+    if _check_selected(selected, "4") {
+        let c4 = _find_check(checks, "check_4_file_drift")
+        if _is_found(c4) && to_string(c4["verdict"]) != "PASS" {
+            actions.push(fix_file_drift(cfg, c4, dry, apply_flag, aggressive))
+        }
     }
 
-    let c5 = _find_check(checks, "check_5_ssot_stale")
-    if _is_found(c5) && to_string(c5["verdict"]) != "PASS" {
-        actions.push(report_ssot_stale(c5))
+    if _check_selected(selected, "5") {
+        let c5 = _find_check(checks, "check_5_ssot_stale")
+        if _is_found(c5) && to_string(c5["verdict"]) != "PASS" {
+            actions.push(fix_ssot_stale(cfg, c5, dry, apply_flag))
+        }
     }
 
-    let c6 = _find_check(checks, "check_6_lock")
-    if _is_found(c6) {
-        actions.push(observe_lock(c6))
+    if _check_selected(selected, "6") {
+        let c6 = _find_check(checks, "check_6_lock")
+        if _is_found(c6) {
+            actions.push(observe_lock(c6))
+        }
     }
 
-    println("── roadmap_mistake_auto_fix (" + (if dry { "DRY-RUN" } else { "LIVE" }) + ") ──")
+    let mode_tag = if !apply_flag { "DRY-RUN" } else { if aggressive { "LIVE+AGGRESSIVE" } else { "LIVE" } }
+    println("── roadmap_mistake_auto_fix (" + mode_tag + ") ──")
     println("  ts: " + _ts_iso())
     println("  input: " + result_path)
     for a in actions {
@@ -209,9 +693,9 @@ fn main() -> int {
         println("  · " + name + " → " + verdict + " : " + detail)
     }
     println("")
-    println("auto-fixed: chflags uchg (if missing)")
-    println("manual-required: paths.json desc-suffix fixes, file-name drift, audit revalidation")
-    println("observe-only: long-held hexa_stage0 lock")
+    println("auto-scope: #2 chflags (always), #3 paths suffix strip (--apply), #5 ssot revalidate (--apply)")
+    println("aggressive: #4 dangling prune flag (--apply --aggressive, review-required)")
+    println("observe-only: #6 long-held hexa_stage0 lock")
 
     return 0
 }

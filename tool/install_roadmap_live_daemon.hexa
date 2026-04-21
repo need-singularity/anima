@@ -4,7 +4,10 @@
 //   hexa tool/roadmap_live_daemon.hexa --install
 //
 // Kept as its own entry per install-tool convention (raw#11 snake_case +
-// tool/install_*.hexa family). Performs an extra pre-flight verification.
+// tool/install_*.hexa family). Performs an extra pre-flight verification
+// and creates a .bak.<ts> snapshot of the destination plist before the
+// daemon overwrites it (constraint #1: WatchPaths + StartInterval plist
+// upgrade — zero-downtime switchover, rollback-safe).
 //
 // USAGE
 //   hexa tool/install_roadmap_live_daemon.hexa            — install + launchctl load
@@ -29,11 +32,25 @@ fn _file_exists(p: string) -> bool {
     return r[1] == 0
 }
 
+fn _exec_out(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _has_watchpaths(path: string) -> bool {
+    if !_file_exists(path) { return false }
+    let raw = to_string(read_file(path))
+    return raw.index_of("<key>WatchPaths</key>") >= 0
+}
+
 fn _show_state() {
     println("install_roadmap_live_daemon — state")
     println("  daemon_tool : " + DAEMON_TOOL + " " + (if _file_exists(DAEMON_TOOL) { "OK" } else { "MISSING" }))
     println("  plist_src   : " + PLIST_SRC + " " + (if _file_exists(PLIST_SRC) { "OK" } else { "MISSING" }))
     println("  plist_dst   : " + PLIST_DST + " " + (if _file_exists(PLIST_DST) { "INSTALLED" } else { "NOT_INSTALLED" }))
+    let src_wp = _has_watchpaths(PLIST_SRC)
+    let dst_wp = _has_watchpaths(PLIST_DST)
+    println("  WatchPaths  : src=" + (if src_wp { "YES" } else { "NO" }) + " dst=" + (if dst_wp { "YES" } else { "NO" }))
     let loaded = exec_with_status("launchctl list 2>/dev/null | grep -q " + _sh_q(LABEL))
     if loaded[1] == 0 {
         println("  launchd     : LOADED (label=" + LABEL + ")")
@@ -42,12 +59,21 @@ fn _show_state() {
     }
 }
 
+fn _backup_dst_if_exists() -> string {
+    if !_file_exists(PLIST_DST) { return "" }
+    let ts = _exec_out("date -u +%s").trim()
+    let bak = PLIST_DST + ".bak." + ts
+    let rc = exec_with_status("cp " + _sh_q(PLIST_DST) + " " + _sh_q(bak))
+    if rc[1] == 0 { return bak }
+    return ""
+}
+
 fn main() -> int {
-    let args = sys_argv()
+    let av = args()
     let mut mode = "install"
-    let mut i = 1
-    while i < len(args) {
-        let a = args[i]
+    let mut i = 2
+    while i < len(av) {
+        let a = to_string(av[i])
         if a == "--check"     { mode = "check" }
         else if a == "--uninstall" { mode = "uninstall" }
         else if a == "--install"   { mode = "install" }
@@ -66,6 +92,17 @@ fn main() -> int {
     if !_file_exists(DAEMON_TOOL) {
         eprintln("installer: daemon tool missing: " + DAEMON_TOOL)
         return 2
+    }
+
+    // Pre-flight WatchPaths sanity on source plist (constraint #1)
+    if mode == "install" {
+        if !_has_watchpaths(PLIST_SRC) {
+            eprintln("installer: WARN plist_src missing <key>WatchPaths</key> — real-time trigger absent, periodic-only")
+        } else {
+            println("installer: plist_src has WatchPaths — real-time FSEvent trigger enabled")
+        }
+        let bak = _backup_dst_if_exists()
+        if bak != "" { println("installer: backup: " + bak) }
     }
 
     let cmd = _sh_q(HEXA_BIN) + " " + _sh_q(DAEMON_TOOL) + " " + sub
