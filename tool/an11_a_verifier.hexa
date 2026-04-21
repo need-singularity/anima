@@ -1,0 +1,390 @@
+// tool/an11_a_verifier.hexa — AN11 (a) weight_emergent deterministic verifier
+//
+// AN11 3-condition gate (rules/anima.json#AN11); this file implements (a) only:
+//   (a) weight_emergent — post-training ckpt has a REAL weight delta vs base.
+//
+// SPEC:  docs/alm_clm_verifier_design_20260420.md §G_VALIDITY
+// INPUT: base_ckpt_path, round_N_ckpt_path, round_N (positional) [--dest|--dry-run|--threshold]
+// OUT:   shared/state/{dest}_r{N}_an11_a.json
+// GATES: delta_norm > threshold  AND  adapter_rank >= 1  AND  fingerprint != base
+//
+// DETERMINISTIC. NO LLM. Frobenius (or byte-L2 proxy) + SHA256 only.
+
+let CRITERIA = "bench/an11_a_criteria.json"
+let EXIT_PASS = 0
+let EXIT_FAIL = 1
+let EXIT_INPUT_ERR = 2
+let EXIT_DRY_RUN = 3
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn now_utc() -> string {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn sha256_of(p: string) -> string {
+    if !fexists(p) { return "" }
+    let gnu = _str(exec("command -v sha256sum 2>/dev/null")).trim()
+    let cmd = if gnu != "" { "sha256sum " + p + " 2>/dev/null | awk '{print $1}'" } else { "shasum -a 256 " + p + " 2>/dev/null | awk '{print $1}'" }
+    return _str(exec(cmd)).trim()
+}
+
+fn sqrt_newton(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x
+    let mut j = 0
+    while j < 60 {
+        g = 0.5 * (g + x / g)
+        j = j + 1
+    }
+    return g
+}
+
+// ── JSON number parsers (tolerant, stage0-safe) ──────────────────────
+
+fn skip_ws(s: string, from: int) -> int {
+    let n = len(s)
+    let mut i = from
+    while i < n {
+        let c = char_code(s.substring(i, i + 1), 0)
+        if c == 32 || c == 9 || c == 10 || c == 13 { i = i + 1 } else { break }
+    }
+    return i
+}
+
+fn parse_num_at(s: string, from: int) -> float {
+    let n = len(s)
+    let i0 = from
+    let mut i = from
+    while i < n {
+        let c = char_code(s.substring(i, i + 1), 0)
+        let ok = (c >= 48 && c <= 57) || c == 46 || c == 43 || c == 45 || c == 101 || c == 69
+        if ok { i = i + 1 } else { break }
+    }
+    if i == i0 { return 0.0 }
+    return to_float(s.substring(i0, i))
+}
+
+fn get_float(blob: string, key: string, dflt: float) -> float {
+    let k = blob.index_of("\"" + key + "\"")
+    if k < 0 { return dflt }
+    let colon = blob.index_of(":", k)
+    if colon < 0 { return dflt }
+    let i = skip_ws(blob, colon + 1)
+    let v = parse_num_at(blob, i)
+    return v
+}
+
+fn get_int(blob: string, key: string) -> int {
+    let v = get_float(blob, key, 0.0 - 1.0)
+    if v < 0.0 { return 0 }
+    return to_int(to_string(v))
+}
+
+// ── synthetic JSON tensor ({"weights":[...],"rank":N}) ───────────────
+
+fn parse_weights(blob: string) -> array {
+    let k = blob.index_of("\"weights\"")
+    if k < 0 { return [] }
+    let lbr = blob.index_of("[", k)
+    let rbr = blob.index_of("]", lbr)
+    if lbr < 0 || rbr < 0 { return [] }
+    let parts = blob.substring(lbr + 1, rbr).split(",")
+    let mut out = []
+    let mut i = 0
+    let n = len(parts)
+    while i < n {
+        let p = _str(parts[i]).trim()
+        if p != "" { out = push(out, to_float(p)) }
+        i = i + 1
+    }
+    return out
+}
+
+fn frob_synth(bblob: string, rblob: string) -> float {
+    let wb = parse_weights(bblob)
+    let wr = parse_weights(rblob)
+    let nb = len(wb)
+    let nr = len(wr)
+    let nmin = if nb < nr { nb } else { nr }
+    let mut s = 0.0
+    let mut i = 0
+    while i < nmin {
+        let d = to_float(wr[i]) - to_float(wb[i])
+        s = s + d * d
+        i = i + 1
+    }
+    if nb != nr {
+        let longer = if nb > nr { wb } else { wr }
+        let m = len(longer)
+        let mut j = nmin
+        while j < m {
+            let v = to_float(longer[j])
+            s = s + v * v
+            j = j + 1
+        }
+    }
+    return sqrt_newton(s)
+}
+
+// ── python3 safetensors Frobenius (preferred on pods) ────────────────
+
+fn py_available() -> bool {
+    return _str(exec("command -v python3 2>/dev/null")).trim() != ""
+}
+
+fn st_available() -> bool {
+    if !py_available() { return false }
+    return _str(exec("python3 -c 'import safetensors' 2>&1 | head -c 1")).trim() == ""
+}
+
+fn run_py(script_body: string, out_path: string) -> string {
+    let script = "/tmp/_an11_a_py.sh"
+    let mut sh = "#!/bin/sh\npython3 - <<'PYEOF' > " + out_path + " 2>/dev/null\n"
+    sh = sh + script_body + "\nPYEOF\nexit 0\n"
+    write_file(script, sh)
+    exec("chmod +x " + script)
+    exec(script)
+    if !fexists(out_path) { return "" }
+    return _str(exec("cat " + out_path + " 2>/dev/null")).trim()
+}
+
+fn frob_safetensors(b: string, r: string) -> float {
+    let mut body = "from safetensors.torch import load_file\nimport torch\n"
+    body = body + "B=load_file('" + b + "')\nR=load_file('" + r + "')\n"
+    body = body + "acc=0.0\n"
+    body = body + "for k in (set(B)|set(R)):\n"
+    body = body + "    bt=B.get(k)\n    rt=R.get(k)\n"
+    body = body + "    if bt is None:\n        acc+=float((rt.float()**2).sum())\n        continue\n"
+    body = body + "    if rt is None:\n        acc+=float((bt.float()**2).sum())\n        continue\n"
+    body = body + "    if bt.shape!=rt.shape:\n        acc+=float((bt.float()**2).sum())+float((rt.float()**2).sum())\n        continue\n"
+    body = body + "    acc+=float(((rt.float()-bt.float())**2).sum())\n"
+    body = body + "print(acc**0.5)"
+    let s = run_py(body, "/tmp/_an11_a_st.out")
+    if s == "" { return 0.0 }
+    return to_float(s)
+}
+
+// byte-L2 proxy: sqrt(sum((byte_r - byte_b)^2)) over raw payloads
+fn frob_bytes(b: string, r: string) -> float {
+    let mut body = "b=open('" + b + "','rb').read()\nr=open('" + r + "','rb').read()\n"
+    body = body + "n=min(len(b),len(r))\ns=0\n"
+    body = body + "for i in range(n):\n    d=b[i]-r[i]\n    s+=d*d\n"
+    body = body + "m=max(len(b),len(r))\nL=b if len(b)>len(r) else r\n"
+    body = body + "for i in range(n,m):\n    s+=L[i]*L[i]\n"
+    body = body + "print(s**0.5)"
+    let s = run_py(body, "/tmp/_an11_a_b.out")
+    if s == "" { return 0.0 }
+    return to_float(s)
+}
+
+// ── adapter rank probe ───────────────────────────────────────────────
+
+fn adapter_rank(round_path: string, is_synth: bool, rblob: string) -> int {
+    if is_synth { return get_int(rblob, "rank") }
+    let slash = round_path.last_index_of("/")
+    if slash > 0 {
+        let cfg = round_path.substring(0, slash) + "/adapter_config.json"
+        if fexists(cfg) {
+            let v = get_int(read_file(cfg), "r")
+            if v > 0 { return v }
+        }
+    }
+    if !st_available() { return 0 }
+    let mut body = "from safetensors import safe_open\nbest=10**9\n"
+    body = body + "try:\n"
+    body = body + "    with safe_open('" + round_path + "','pt') as f:\n"
+    body = body + "        for k in f.keys():\n"
+    body = body + "            if 'lora_A' in k or 'lora_a' in k:\n"
+    body = body + "                t=f.get_tensor(k)\n"
+    body = body + "                if t.ndim>=2:\n                    best=min(best,int(min(t.shape)))\n"
+    body = body + "except Exception:\n    pass\n"
+    body = body + "print(0 if best==10**9 else best)"
+    let s = run_py(body, "/tmp/_an11_a_rk.out")
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ── synthetic dry-run emitter ────────────────────────────────────────
+
+fn emit_synth_pair(bp: string, rp: string) {
+    // base = 16 zeros; round = base + 1e-2  ==>  delta L2 = sqrt(16e-4) = 0.04 > 1e-3.
+    let bj = "{\"weights\":[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],\"rank\":8}\n"
+    let rj = "{\"weights\":[0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01],\"rank\":8}\n"
+    write_file(bp, bj)
+    write_file(rp, rj)
+}
+
+// ── backend selector ─────────────────────────────────────────────────
+
+fn ext_of(p: string) -> string {
+    let i = p.last_index_of(".")
+    if i < 0 { return "" }
+    return p.substring(i, len(p))
+}
+
+fn backend_for(p: string) -> string {
+    let e = ext_of(p)
+    if e == ".json" { return "synthetic_json" }
+    if st_available() { return "native_safetensors" }
+    return "native_bytes"
+}
+
+// ── SSOT emit ────────────────────────────────────────────────────────
+
+fn emit_report(out: string, dest: string, rn: string, backend: string,
+               delta: float, rank: int, fpr: string, fpb: string,
+               thr: float, verdict: string, reason: string) {
+    let ts = now_utc()
+    let j = "{\n" +
+        "  \"verifier\": \"an11_a_weight_emergent\",\n" +
+        "  \"dest\": \"" + dest + "\",\n" +
+        "  \"round_n\": \"" + rn + "\",\n" +
+        "  \"ts\": \"" + ts + "\",\n" +
+        "  \"backend_used\": \"" + backend + "\",\n" +
+        "  \"delta_norm\": " + to_string(delta) + ",\n" +
+        "  \"adapter_rank\": " + to_string(rank) + ",\n" +
+        "  \"fingerprint\": \"" + fpr + "\",\n" +
+        "  \"base_fingerprint\": \"" + fpb + "\",\n" +
+        "  \"threshold\": " + to_string(thr) + ",\n" +
+        "  \"verdict\": \"" + verdict + "\",\n" +
+        "  \"reason\": \"" + reason + "\"\n" +
+        "}\n"
+    write_file(out, j)
+}
+
+// ── argv helpers ─────────────────────────────────────────────────────
+
+fn arg_flag(argv: array, f: string) -> bool {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == f { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn arg_val(argv: array, f: string, d: string) -> string {
+    let mut i = 0
+    let n = len(argv)
+    while i < n - 1 {
+        if _str(argv[i]) == f { return _str(argv[i + 1]) }
+        i = i + 1
+    }
+    return d
+}
+
+fn nth_positional(argv: array, k: int) -> string {
+    let mut seen = 0
+    let mut i = 0
+    let n = len(argv)
+    while i < n {
+        let a = _str(argv[i])
+        if a.index_of("--") == 0 {
+            if a == "--dest" || a == "--threshold" { i = i + 1 }
+        } else {
+            if seen == k { return a }
+            seen = seen + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ── main ─────────────────────────────────────────────────────────────
+
+fn main() {
+    let argv = args()
+    let dry = arg_flag(argv, "--dry-run")
+    let dest = arg_val(argv, "--dest", "alm")
+    let t_ovr = arg_val(argv, "--threshold", "")
+    // positionals — skip idx 0 (script/harness token on stage0 invocations).
+    let base_arg  = nth_positional(argv, 1)
+    let round_arg = nth_positional(argv, 2)
+    let rn_arg    = nth_positional(argv, 3)
+    let round_n = if rn_arg == "" { "0" } else { rn_arg }
+    let out = "state/" + dest + "_r" + round_n + "_an11_a.json"
+
+    let mut base_path = base_arg
+    let mut round_path = round_arg
+    let mut backend = ""
+    let mut used_dry = false
+    let real_inputs_ok = base_path != "" && round_path != "" && fexists(base_path) && fexists(round_path)
+    if dry || !real_inputs_ok {
+        if dry || (base_path == "" && round_path == "") {
+            base_path = "/tmp/_an11_a_synth_base.json"
+            round_path = "/tmp/_an11_a_synth_round.json"
+            emit_synth_pair(base_path, round_path)
+            backend = "synthetic_json"
+            used_dry = true
+        } else {
+            println("[AN11-A] INPUT_ERR ckpt missing (base=" + base_path + " round=" + round_path + ")")
+            emit_report(out, dest, round_n, "none", 0.0, 0, "", "", 0.001, "FAIL", "ckpt_missing")
+            exit(EXIT_INPUT_ERR)
+        }
+    } else {
+        backend = backend_for(round_path)
+    }
+
+    // threshold: override → criteria.json → 1e-3 default
+    let mut thr = 0.001
+    if fexists(CRITERIA) { thr = get_float(read_file(CRITERIA), "min_delta_threshold", 0.001) }
+    if t_ovr != "" { thr = to_float(t_ovr) }
+
+    println("[AN11-A] weight_emergent  dest=" + dest + " round=r" + round_n +
+        " backend=" + backend + " threshold=" + to_string(thr))
+    println("  base=" + base_path + "  round=" + round_path)
+
+    // delta
+    let mut delta = 0.0
+    let rblob_cache = if backend == "synthetic_json" { read_file(round_path) } else { "" }
+    if backend == "synthetic_json" {
+        delta = frob_synth(read_file(base_path), rblob_cache)
+    } else {
+        if backend == "native_safetensors" {
+            delta = frob_safetensors(base_path, round_path)
+        } else {
+            delta = frob_bytes(base_path, round_path)
+        }
+    }
+
+    // rank + fingerprints
+    let rank = adapter_rank(round_path, backend == "synthetic_json", rblob_cache)
+    let fpr = sha256_of(round_path)
+    let fpb = sha256_of(base_path)
+
+    println("  delta_norm=" + to_string(delta) + " rank=" + to_string(rank))
+    if fpr != "" { println("  fp(round)=" + fpr.substring(0, 16) + "...") }
+    if fpb != "" { println("  fp(base )=" + fpb.substring(0, 16) + "...") }
+
+    // verdict
+    let mut verdict = "PASS"
+    let mut reason = "delta>" + to_string(thr) + " rank>=1 fingerprint!=base"
+    if delta <= thr {
+        verdict = "FAIL"
+        reason = "delta_norm=" + to_string(delta) + " <= threshold=" + to_string(thr)
+    }
+    if verdict == "PASS" && rank < 1 {
+        verdict = "FAIL"
+        reason = "adapter_rank=" + to_string(rank) + " < 1"
+    }
+    if verdict == "PASS" && fpr != "" && fpr == fpb {
+        verdict = "FAIL"
+        reason = "fingerprint_identical_to_base"
+    }
+
+    emit_report(out, dest, round_n, backend, delta, rank, fpr, fpb, thr, verdict, reason)
+    println("  ssot=" + out + "  verdict=" + verdict + "  reason=" + reason)
+
+    if used_dry { exit(EXIT_DRY_RUN) }
+    if verdict == "PASS" { exit(EXIT_PASS) }
+    exit(EXIT_FAIL)
+}

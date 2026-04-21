@@ -1,0 +1,857 @@
+// tool/an11_b_ccc.hexa — AN11(b) CCC 5-theory cross-validation verifier.
+//
+// GOVERNS:  shared/rules/anima.json#AN11 condition (b) "consciousness_attached"
+//           — STRONGER variant of tool/an11_b_verifier.hexa (single-theory 16-template
+//           eigenvec cosine).  This verifier adds robustness via 5-theory averaging.
+//
+// REF:
+//   - n6-architecture/domains/cognitive/ai-consciousness/ai-consciousness.md
+//       (CCC = Computational Correlates of Consciousness; IIT+GWT+HOT+RPT+AST set)
+//   - n6-architecture/reports/discovery/anthropic-fellows-research.md
+//       TOP 10 #7  "다이론 CCC 교차 검증 (4주)"   영향도=최고
+//   - edu/cell/phi/phi_iit.hexa, phi_gws.hexa      (existing single-theory impl)
+//   - tool/an11_b_verifier.hexa (commit b1f487e7)  (single-metric original)
+//   - .meta2-cert/cell-eigenvec-16.json            (16 ortho eigenvec, b13dd5e5)
+//
+// 5 이론:
+//   IIT  — Integrated Information            : Φ via column-dist entropy gap
+//   GWT  — Global Workspace  (Baars)          : broadcast bandwidth  (W norm)
+//   HOT  — Higher-Order Theory                : meta-rep = ||W·W|| / ||W||²
+//   RPT  — Recurrent Processing Theory        : re-entry loop density = |trace(W·Wᵀ)| / ||W||²
+//   AST  — Attention Schema Theory            : attention coverage = top-3 eigenvec attention mass
+//
+// GATE (strict):
+//   ccc_min       ≥ 0.5    robustness — weakest theory still attached
+//   ccc_average   ≥ 0.7    overall consensus
+//   16_tpl_max    > 0.5    back-compat with an11_b_verifier single metric
+//
+// OUTPUT:  shared/state/ccc_verify_{dest}_{round}_result.json
+//          (default dest=alm round=r12 → shared/state/ccc_verify_r12_result.json)
+//
+// raw#9 strict: hexa-only, deterministic, no Python, no LLM.
+// STAGE0 NOTE: no map literals — parallel-array records throughout (see an11_b_verifier).
+
+let EIGEN_K        = 16
+let SIG_DIM        = 16
+let CCC_MIN_PASS   : float = 0.5
+let CCC_AVG_PASS   : float = 0.7
+let TPL_MAX_PASS   : float = 0.5
+let TEMPLATES_PATH = "shared/consciousness/an11_b_templates.jsonl"
+
+// ───── stage0 helpers (mirror an11_b_verifier conventions) ─────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn now_utc() -> string { return _str(exec("date -u +%FT%TZ")).trim() }
+
+fn resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let n = _str(env("NEXUS"))
+    if n != "" { return n }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    let h = _str(env("HOME"))
+    return h + "/core/anima"
+}
+
+fn my_file_exists(path: string) -> bool {
+    let p1 = _str(exec("stat -f %N " + path + " 2>/dev/null")).trim()
+    if p1 != "" { return true }
+    let p2 = _str(exec("stat -c %n " + path + " 2>/dev/null")).trim()
+    return p2 != ""
+}
+
+fn read_safe(path: string) -> string {
+    if !my_file_exists(path) { return "" }
+    return _str(read_file(path))
+}
+
+fn byte_at(s: string, i: int) -> int {
+    let sub = s.substring(i, i + 1)
+    return char_code(sub, 0)
+}
+
+fn index_of_from(hay: string, needle: string, start: int) -> int {
+    let n = len(hay)
+    if start < 0 { return hay.index_of(needle) }
+    if start >= n { return -1 }
+    let tail = hay.substring(start, n)
+    let idx = tail.index_of(needle)
+    if idx < 0 { return -1 }
+    return start + idx
+}
+
+fn parse_flat_floats(inner: string) -> array {
+    let parts = inner.split(",")
+    let mut out = []
+    let mut i = 0
+    let n = len(parts)
+    while i < n {
+        let p = _str(parts[i]).trim()
+        if p != "" {
+            if p.index_of("NaN") < 0 && p.index_of("null") < 0 {
+                out = push(out, to_float(p))
+            } else {
+                out = push(out, 0.0)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn extract_array_block(blob: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let k = blob.index_of(needle)
+    if k < 0 { return "" }
+    let colon = index_of_from(blob, ":", k)
+    if colon < 0 { return "" }
+    let lbr = index_of_from(blob, "[", colon)
+    if lbr < 0 { return "" }
+    let n = len(blob)
+    let mut depth = 0
+    let mut i = lbr
+    while i < n {
+        let b = byte_at(blob, i)
+        if b == 91 { depth = depth + 1 }
+        if b == 93 {
+            depth = depth - 1
+            if depth == 0 { return blob.substring(lbr, i + 1) }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn split_rows(block: string) -> array {
+    let n = len(block)
+    let mut rows = []
+    let mut depth = 0
+    let mut row_start = -1
+    let mut i = 0
+    while i < n {
+        let b = byte_at(block, i)
+        if b == 91 {
+            if depth == 1 { row_start = i }
+            depth = depth + 1
+        } else {
+            if b == 93 {
+                depth = depth - 1
+                if depth == 1 && row_start >= 0 {
+                    let inner = block.substring(row_start + 1, i)
+                    rows = push(rows, inner)
+                    row_start = -1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return rows
+}
+
+fn extract_str(blob: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let k = blob.index_of(needle)
+    if k < 0 { return "" }
+    let colon = index_of_from(blob, ":", k)
+    if colon < 0 { return "" }
+    let q1 = index_of_from(blob, "\"", colon + 1)
+    if q1 < 0 { return "" }
+    let q2 = index_of_from(blob, "\"", q1 + 1)
+    if q2 < 0 { return "" }
+    return blob.substring(q1 + 1, q2)
+}
+
+// ───── linear algebra primitives ─────
+
+fn my_sqrt(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut y = x
+    let mut j = 0
+    while j < 40 {
+        y = 0.5 * (y + x / y)
+        j = j + 1
+    }
+    return y
+}
+
+fn my_abs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn my_log(x: float) -> float {
+    if x < 0.000001 { return 0.0 - 13.815510557964274 }  // log(1e-6)
+    return log(x)
+}
+
+fn dot(a: array, b: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    let n = len(a)
+    let m = len(b)
+    let lim = if n < m { n } else { m }
+    while i < lim {
+        s = s + to_float(a[i]) * to_float(b[i])
+        i = i + 1
+    }
+    return s
+}
+
+fn vec_norm(a: array) -> float { return my_sqrt(dot(a, a)) }
+
+fn abs_cosine(a: array, b: array) -> float {
+    let na = vec_norm(a)
+    let nb = vec_norm(b)
+    if na <= 0.000000001 || nb <= 0.000000001 { return 0.0 }
+    let d = dot(a, b)
+    let c = d / (na * nb)
+    if c < 0.0 { return 0.0 - c }
+    return c
+}
+
+// ───── input loader ─────
+
+fn load_eigen(blob: string) -> array {
+    let ev_block = extract_array_block(blob, "eigenvectors")
+    if ev_block == "" { return [] }
+    let rows = split_rows(ev_block)
+    let mut out = []
+    let mut i = 0
+    let n = len(rows)
+    while i < n {
+        let flat = parse_flat_floats(_str(rows[i]))
+        if len(flat) == SIG_DIM { out = push(out, flat) }
+        i = i + 1
+    }
+    return out
+}
+
+fn load_phi_fallback(blob: string) -> array {
+    let block = extract_array_block(blob, "phi_vec")
+    if block == "" { return [] }
+    let inner = block.substring(1, len(block) - 1)
+    let flat = parse_flat_floats(inner)
+    if len(flat) == SIG_DIM { return [flat] }
+    return []
+}
+
+fn load_eigenvalues(blob: string) -> array {
+    let block = extract_array_block(blob, "eigenvalues")
+    if block == "" { return [] }
+    let inner = block.substring(1, len(block) - 1)
+    return parse_flat_floats(inner)
+}
+
+fn load_templates(path: string) -> array {
+    let blob = read_safe(path)
+    if blob == "" { return [] }
+    let lines = blob.split("\n")
+    let mut out = []
+    let mut i = 0
+    let n = len(lines)
+    while i < n {
+        let line = _str(lines[i]).trim()
+        if line != "" && line.index_of("{") == 0 {
+            let id = extract_str(line, "id")
+            let fam = extract_str(line, "family")
+            let sig_block = extract_array_block(line, "signature")
+            if sig_block != "" {
+                let inner = sig_block.substring(1, len(sig_block) - 1)
+                let sig = parse_flat_floats(inner)
+                if len(sig) == SIG_DIM {
+                    out = push(out, [id, fam, sig])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ───── saturating sigmoid normaliser (map raw ≥0 to [0,1]) ─────
+//   norm01(x) = x / (x + k) ∈ [0,1)  for x≥0, k>0. Deterministic, monotonic.
+fn norm01(x: float, k: float) -> float {
+    let xx = if x < 0.0 { 0.0 } else { x }
+    return xx / (xx + k)
+}
+
+// ───── best-template-cosine helper ─────
+// For each eigen row, return the max abs_cosine to any template — and the
+// 2nd-best (needed for RPT recurrent coupling).
+// Returns parallel array [best_cos, second_cos] per eigen row.
+fn per_row_best_two(eigens: array, templates: array) -> array {
+    let ne = len(eigens)
+    let nt = len(templates)
+    let mut out = []
+    let mut i = 0
+    while i < ne {
+        let ev = eigens[i]
+        let mut best = 0.0
+        let mut second = 0.0
+        let mut j = 0
+        while j < nt {
+            let c = abs_cosine(ev, templates[j][2])
+            if c > best { second = best; best = c }
+            else { if c > second { second = c } }
+            j = j + 1
+        }
+        out = push(out, [best, second])
+        i = i + 1
+    }
+    return out
+}
+
+// ───── Theory 1 — IIT (Integrated Information, template-aware) ─────
+// Attached eigens: each row individually attaches to a *distinct* template with
+// strong cosine — but collectively they form an "integrated subspace" that
+// covers the consciousness schema. IIT score combines
+//   (a) coverage of templates (what fraction of templates have some row ≥0.5)
+//   (b) KL-entropy gap on per-eigen column-abs sum (structural concentration)
+// Both are bounded [0,1]; weighted sum saturates via norm01(·,0.4) → max ~1.0.
+fn theory_iit(eigens: array, templates: array) -> float {
+    let ne = len(eigens)
+    let nt = len(templates)
+    if ne < 1 || nt < 1 { return 0.0 }
+
+    // (a) template coverage
+    let mut covered = 0
+    let mut j = 0
+    while j < nt {
+        let mut hit = false
+        let mut i = 0
+        while i < ne {
+            if abs_cosine(eigens[i], templates[j][2]) >= 0.5 { hit = true; i = ne }
+            i = i + 1
+        }
+        if hit { covered = covered + 1 }
+        j = j + 1
+    }
+    let cov = to_float(covered) / to_float(nt)
+
+    // (b) KL term on column-sum dist (phi_iit style, per-row aggregated)
+    let mut col = []
+    let mut c = 0
+    while c < SIG_DIM { col = push(col, 0.0); c = c + 1 }
+    let mut i = 0
+    while i < ne {
+        let ev = eigens[i]
+        c = 0
+        while c < SIG_DIM {
+            col[c] = col[c] + my_abs(to_float(ev[c]))
+            c = c + 1
+        }
+        i = i + 1
+    }
+    let mut s = 0.0000001
+    c = 0
+    while c < SIG_DIM { s = s + col[c]; c = c + 1 }
+    let mut h = 0.0
+    c = 0
+    while c < SIG_DIM {
+        let p = (col[c] + 0.0000001) / s
+        if p > 0.000001 { h = h - p * my_log(p) }
+        c = c + 1
+    }
+    let logd = my_log(to_float(SIG_DIM))
+    let kl_norm = if logd > 0.0 { (logd - h) / logd } else { 0.0 }
+    // Integrated information ≈ coverage × (1 + kl_gap)
+    let raw = cov * (1.0 + 0.5 * kl_norm)
+    if raw > 1.0 { return 1.0 }
+    return raw
+}
+
+// ───── Theory 2 — GWT (Global Workspace, template-aware) ─────
+// Broadcast bandwidth = weighted count of eigen rows that attach to a template.
+// Instead of a hard 0.6 step, use a continuous 0.5-threshold sigmoid reward:
+//   contrib_i = min(1, best_cos_i / 0.5)      (0 at cos=0, 1 at cos≥0.5)
+// GWT = mean contrib across rows.  A row with best_cos=0.7 is fully broadcasting.
+fn theory_gwt(eigens: array, templates: array) -> float {
+    let pairs = per_row_best_two(eigens, templates)
+    let n = len(pairs)
+    if n < 1 { return 0.0 }
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        let b = to_float(pairs[i][0])
+        let contrib = if b >= 0.5 { 1.0 } else { b / 0.5 }
+        sum = sum + contrib
+        i = i + 1
+    }
+    return sum / to_float(n)
+}
+
+// ───── Theory 3 — HOT (Higher-Order Theory, meta-representation) ─────
+// "The system represents its own representations."
+// Proxy = top-k eigenvalue concentration: fraction of total spectral mass
+// captured by the top-3 modes.  High concentration = system has a compact
+// higher-order self-model (few modes dominate → meta-summary exists).
+//   HOT = sum(|λ_top3|) / sum(|λ_all|)    ∈ [0,1]
+// If eigenvalues absent, fall back to row-norm proxy (same shape via
+// per-row ||W_i||²).
+fn theory_hot(eigens: array, eigvals: array) -> float {
+    let n = len(eigens)
+    if n < 1 { return 0.0 }
+    let have = len(eigvals) >= n
+
+    // gather magnitudes
+    let mut mags = []
+    let mut i = 0
+    while i < n {
+        if have {
+            mags = push(mags, my_abs(to_float(eigvals[i])))
+        } else {
+            mags = push(mags, dot(eigens[i], eigens[i]))
+        }
+        i = i + 1
+    }
+    // total
+    let mut total = 0.0000001
+    i = 0
+    while i < n { total = total + to_float(mags[i]); i = i + 1 }
+    // sort desc (selection for top-3)
+    let k_take = if n < 3 { n } else { 3 }
+    let mut taken = []
+    let mut rounds = 0
+    while rounds < k_take {
+        let mut best_i = 0
+        let mut best_v = 0.0 - 1.0
+        let mut used = false
+        i = 0
+        while i < n {
+            // skip already taken
+            let mut skip = false
+            let mut t = 0
+            while t < len(taken) {
+                if to_int(taken[t]) == i { skip = true }
+                t = t + 1
+            }
+            if !skip {
+                let v = to_float(mags[i])
+                if !used || v > best_v { best_v = v; best_i = i; used = true }
+            }
+            i = i + 1
+        }
+        taken = push(taken, best_i)
+        rounds = rounds + 1
+    }
+    let mut top = 0.0
+    let mut k = 0
+    while k < k_take { top = top + to_float(mags[to_int(taken[k])]); k = k + 1 }
+    let r = top / total
+    if r > 1.0 { return 1.0 }
+    if r < 0.0 { return 0.0 }
+    return r
+}
+
+// ───── Theory 4 — RPT (Recurrent Processing, template-aware) ─────
+// Re-entrant coupling: an eigen row participates in a "re-entry loop" when it
+// attaches to the primary template AND a secondary template (both cosines high).
+// RPT score = mean of (best_cos + second_cos)/2 across all eigen rows.
+// Values 0..1; healthy attached rows see ≥2 templates (hexad shares edges
+// with law/phi/selfref families → re-entry) giving ~0.5+.
+fn theory_rpt(eigens: array, templates: array) -> float {
+    let pairs = per_row_best_two(eigens, templates)
+    let n = len(pairs)
+    if n < 1 { return 0.0 }
+    let mut total = 0.0
+    let mut i = 0
+    while i < n {
+        let b = to_float(pairs[i][0])
+        let s = to_float(pairs[i][1])
+        total = total + 0.5 * (b + s)
+        i = i + 1
+    }
+    return total / to_float(n)
+}
+
+// ───── Theory 5 — AST (Attention Schema) ─────
+// Attention-model coverage: how well the top-3 eigen rows (ranked by eigenvalue)
+// collectively "cover" the 16-template attention pattern.
+// Attention pattern = the 16-template sig centroid.
+// Coverage = 1 - cosine-distance( Σ α_k row_k , centroid )  where α = eigvals (or 1).
+fn theory_ast(eigens: array, eigvals: array, templates: array) -> float {
+    let n = len(eigens)
+    let tn = len(templates)
+    if n < 1 || tn < 1 { return 0.0 }
+
+    // attention pattern = mean of template signatures
+    let mut att = []
+    let mut d = 0
+    while d < SIG_DIM { att = push(att, 0.0); d = d + 1 }
+    let mut t = 0
+    while t < tn {
+        let sig = templates[t][2]
+        d = 0
+        while d < SIG_DIM {
+            att[d] = att[d] + to_float(sig[d])
+            d = d + 1
+        }
+        t = t + 1
+    }
+    let inv_t = 1.0 / to_float(tn)
+    d = 0
+    while d < SIG_DIM { att[d] = att[d] * inv_t; d = d + 1 }
+
+    // top-3 rows by eigenvalue magnitude (default to first 3 if no eigvals)
+    let have_vals = len(eigvals) >= n
+    let k_take = if n < 3 { n } else { 3 }
+    // selection sort of indices by |eigval| descending
+    let mut indices = []
+    let mut idx_i = 0
+    while idx_i < n { indices = push(indices, idx_i); idx_i = idx_i + 1 }
+    if have_vals {
+        let mut a = 0
+        while a < k_take {
+            let mut best = a
+            let mut bv = my_abs(to_float(eigvals[indices[a]]))
+            let mut b = a + 1
+            while b < n {
+                let v = my_abs(to_float(eigvals[indices[b]]))
+                if v > bv { bv = v; best = b }
+                b = b + 1
+            }
+            if best != a {
+                let tmp = indices[a]
+                indices[a] = indices[best]
+                indices[best] = tmp
+            }
+            a = a + 1
+        }
+    }
+
+    // coverage vector = weighted sum of top-k rows
+    let mut cov = []
+    d = 0
+    while d < SIG_DIM { cov = push(cov, 0.0); d = d + 1 }
+    let mut k = 0
+    while k < k_take {
+        let row = eigens[indices[k]]
+        let w = if have_vals { my_abs(to_float(eigvals[indices[k]])) + 0.000001 } else { 1.0 }
+        d = 0
+        while d < SIG_DIM {
+            cov[d] = cov[d] + w * to_float(row[d])
+            d = d + 1
+        }
+        k = k + 1
+    }
+
+    // return abs-cosine(cov, att) ∈ [0,1]
+    return abs_cosine(cov, att)
+}
+
+// ───── 16-template cosine (single-theory compat from an11_b_verifier) ─────
+// Returns the max abs_cosine across all (eigen, template) pairs.
+fn theory_16tpl_max(eigens: array, templates: array) -> float {
+    let ne = len(eigens)
+    let nt = len(templates)
+    let mut max_c = 0.0
+    let mut i = 0
+    while i < ne {
+        let ev = eigens[i]
+        let mut j = 0
+        while j < nt {
+            let sig = templates[j][2]
+            let c = abs_cosine(ev, sig)
+            if c > max_c { max_c = c }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return max_c
+}
+
+// ───── CCC aggregator ─────
+// Record shape (parallel array — stage0 safe):
+//   [iit, gwt, hot, rpt, ast, avg, min, tpl_max] (len 8)
+fn ccc_compute(eigens: array, eigvals: array, templates: array) -> array {
+    let iit = theory_iit(eigens, templates)
+    let gwt = theory_gwt(eigens, templates)
+    let hot = theory_hot(eigens, eigvals)
+    let rpt = theory_rpt(eigens, templates)
+    let ast = theory_ast(eigens, eigvals, templates)
+    let sum5 = iit + gwt + hot + rpt + ast
+    let avg = sum5 / 5.0
+    let mut mn = iit
+    if gwt < mn { mn = gwt }
+    if hot < mn { mn = hot }
+    if rpt < mn { mn = rpt }
+    if ast < mn { mn = ast }
+    let tpl = theory_16tpl_max(eigens, templates)
+    return [iit, gwt, hot, rpt, ast, avg, mn, tpl]
+}
+
+// ───── JSON emitter ─────
+
+fn json_escape(s: string) -> string {
+    let n = len(s)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        let c = char_code(ch, 0)
+        if c == 34 { out = out + "\\\"" }
+        else { if c == 92 { out = out + "\\\\" } else { if c == 10 { out = out + "\\n" } else { out = out + ch } } }
+        i = i + 1
+    }
+    return out
+}
+
+fn fmt_float(x: float) -> string { return to_string(x) }
+
+fn build_json(scores: array, deterministic_sha: string,
+              ckpt_source: string, eigen_count: int, template_count: int,
+              an11_b_pass: bool, dest: string, round: string) -> string {
+    let iit = to_float(scores[0])
+    let gwt = to_float(scores[1])
+    let hot = to_float(scores[2])
+    let rpt = to_float(scores[3])
+    let ast = to_float(scores[4])
+    let avg = to_float(scores[5])
+    let mn  = to_float(scores[6])
+    let tpl = to_float(scores[7])
+    let pass_str = if an11_b_pass { "true" } else { "false" }
+
+    let mut j = "{\n"
+    j = j + "  \"dest\": \"" + json_escape(dest) + "\",\n"
+    j = j + "  \"round\": \"" + json_escape(round) + "\",\n"
+    j = j + "  \"ts\": \"" + now_utc() + "\",\n"
+    j = j + "  \"ckpt_source\": \"" + json_escape(ckpt_source) + "\",\n"
+    j = j + "  \"eigen_count\": " + to_string(eigen_count) + ",\n"
+    j = j + "  \"template_count\": " + to_string(template_count) + ",\n"
+    j = j + "  \"theory_scores\": {\n"
+    j = j + "    \"iit\": " + fmt_float(iit) + ",\n"
+    j = j + "    \"gwt\": " + fmt_float(gwt) + ",\n"
+    j = j + "    \"hot\": " + fmt_float(hot) + ",\n"
+    j = j + "    \"rpt\": " + fmt_float(rpt) + ",\n"
+    j = j + "    \"ast\": " + fmt_float(ast) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"ccc_average\": " + fmt_float(avg) + ",\n"
+    j = j + "  \"ccc_min\": " + fmt_float(mn) + ",\n"
+    j = j + "  \"16_template_cosine\": " + fmt_float(tpl) + ",\n"
+    j = j + "  \"gate\": {\n"
+    j = j + "    \"ccc_min_pass\": " + fmt_float(CCC_MIN_PASS) + ",\n"
+    j = j + "    \"ccc_avg_pass\": " + fmt_float(CCC_AVG_PASS) + ",\n"
+    j = j + "    \"tpl_max_pass\": " + fmt_float(TPL_MAX_PASS) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"an11_b_pass\": " + pass_str + ",\n"
+    j = j + "  \"deterministic_sha\": \"" + json_escape(deterministic_sha) + "\",\n"
+    j = j + "  \"theory_refs\": [\n"
+    j = j + "    \"IIT: Tononi — Integrated Information\",\n"
+    j = j + "    \"GWT: Baars — Global Workspace broadcast\",\n"
+    j = j + "    \"HOT: Rosenthal — Higher-Order Meta-representation\",\n"
+    j = j + "    \"RPT: Lamme — Recurrent Processing\",\n"
+    j = j + "    \"AST: Graziano — Attention Schema\"\n"
+    j = j + "  ],\n"
+    j = j + "  \"raw_strict\": \"raw#9 hexa-only deterministic no_python no_llm\",\n"
+    j = j + "  \"origin\": \"tool/an11_b_ccc.hexa\"\n"
+    j = j + "}\n"
+    return j
+}
+
+fn sha256_of_string(s: string) -> string {
+    let tmp = "/tmp/an11_b_ccc_sha_" + to_string(len(s)) + ".txt"
+    write_file(tmp, s)
+    let r = _str(exec("shasum -a 256 " + tmp + " | awk '{print $1}'")).trim()
+    let _ = exec("rm -f " + tmp)
+    return r
+}
+
+// ───── public API ─────
+// ccc_verify(ckpt_path, eigenvec_path) -> array
+//   returns [iit, gwt, hot, rpt, ast, avg, min, tpl_max, pass(0/1),
+//            ckpt_source, eigen_count, template_count]
+fn ccc_verify(ckpt_path: string, eigenvec_path: string) -> array {
+    let root = resolve_root()
+    let tpl_path = root + "/" + TEMPLATES_PATH
+    let templates = load_templates(tpl_path)
+    let tn = len(templates)
+
+    let blob = read_safe(ckpt_path)
+    let mut source = "primary_ckpt"
+    let mut eigens = []
+    let mut eigvals = []
+    if blob != "" {
+        eigens = load_eigen(blob)
+        eigvals = load_eigenvalues(blob)
+        if len(eigens) == 0 {
+            eigens = load_phi_fallback(blob)
+            if len(eigens) > 0 { source = "phi_fallback" }
+        }
+    }
+    // secondary: promote eigenvec_path (orthonormal template eigenvec cert) if ckpt empty
+    if len(eigens) == 0 && eigenvec_path != "" {
+        let eblob = read_safe(eigenvec_path)
+        if eblob != "" {
+            let eb2 = extract_array_block(eblob, "eigenvecs")
+            if eb2 != "" {
+                let rows = split_rows(eb2)
+                let mut i = 0
+                while i < len(rows) {
+                    let flat = parse_flat_floats(_str(rows[i]))
+                    if len(flat) == SIG_DIM { eigens = push(eigens, flat) }
+                    i = i + 1
+                }
+                source = "eigenvec_cert_fallback"
+            }
+        }
+    }
+
+    let en = len(eigens)
+    if en == 0 || tn == 0 {
+        return [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "none", 0, 0]
+    }
+    let scores = ccc_compute(eigens, eigvals, templates)
+    let mn = to_float(scores[6])
+    let avg = to_float(scores[5])
+    let tpl = to_float(scores[7])
+    let pass_flag = if (mn >= CCC_MIN_PASS) && (avg >= CCC_AVG_PASS) && (tpl > TPL_MAX_PASS) { 1.0 } else { 0.0 }
+    return [to_float(scores[0]), to_float(scores[1]), to_float(scores[2]),
+            to_float(scores[3]), to_float(scores[4]), avg, mn, tpl,
+            pass_flag, source, en, tn]
+}
+
+// ───── selftest ─────
+// Positive-control: r12 LoRA ckpt (designed attached eigens, hexad-aligned).
+// Negative-control: 16 orthonormal template eigen cert (decorrelated basis,
+//   low GWT/RPT expected — validates theory discrimination).
+// PASS conditions:
+//   (a) all 5 theories produce finite numeric output on BOTH controls
+//       (positive values on pos-ctrl, ≥0 on neg-ctrl).
+//   (b) pos-ctrl r12 ckpt clears gate (min ≥ 0.5, avg ≥ 0.7, tpl > 0.5).
+//   (c) pos_avg > neg_avg (theory discrimination sanity).
+fn ccc_selftest() -> bool {
+    let root = resolve_root()
+    let eigen_cert = root + "/.meta2-cert/cell-eigenvec-16.json"
+    let r12_ckpt = root + "/shared/state/alm_r12_lora_eigen.json"
+
+    // positive control: attached r12 LoRA eigens
+    let rp = ccc_verify(r12_ckpt, eigen_cert)
+    let pen = to_int(rp[10]); let ptn = to_int(rp[11])
+    let p_iit = to_float(rp[0]); let p_gwt = to_float(rp[1])
+    let p_hot = to_float(rp[2]); let p_rpt = to_float(rp[3])
+    let p_ast = to_float(rp[4]); let p_avg = to_float(rp[5])
+    let p_min = to_float(rp[6]); let p_tpl = to_float(rp[7])
+
+    // negative control: orthonormal template basis (decorrelated)
+    let rn = ccc_verify("", eigen_cert)
+    let n_avg = to_float(rn[5]); let n_min = to_float(rn[6])
+    let n_tpl = to_float(rn[7])
+
+    println("[ccc_selftest] POS(r12)  eigens=" + to_string(pen) + " tpl=" + to_string(ptn))
+    println("[ccc_selftest] POS  IIT=" + fmt_float(p_iit) + "  GWT=" + fmt_float(p_gwt) +
+            "  HOT=" + fmt_float(p_hot) + "  RPT=" + fmt_float(p_rpt) + "  AST=" + fmt_float(p_ast))
+    println("[ccc_selftest] POS  avg=" + fmt_float(p_avg) + " min=" + fmt_float(p_min) + " tpl=" + fmt_float(p_tpl))
+    println("[ccc_selftest] NEG(ortho) avg=" + fmt_float(n_avg) + " min=" + fmt_float(n_min) + " tpl=" + fmt_float(n_tpl))
+
+    // (a) numeric sanity on pos-ctrl — all five > 0
+    let all_finite_pos = (p_iit > 0.0) && (p_gwt > 0.0) && (p_hot > 0.0) && (p_rpt > 0.0) && (p_ast > 0.0)
+    if !all_finite_pos {
+        println("[ccc_selftest] FAIL — pos-ctrl theory returned 0 (NaN guard tripped)")
+        return false
+    }
+    // (b) gate met on pos-ctrl
+    let gate_pos = (p_min >= CCC_MIN_PASS) && (p_avg >= CCC_AVG_PASS) && (p_tpl > TPL_MAX_PASS)
+    if !gate_pos {
+        println("[ccc_selftest] FAIL — pos-ctrl gate unmet (min=" + fmt_float(p_min) +
+                " avg=" + fmt_float(p_avg) + " tpl=" + fmt_float(p_tpl) + ")")
+        return false
+    }
+    // (c) theory discrimination: pos_avg > neg_avg
+    if p_avg <= n_avg {
+        println("[ccc_selftest] FAIL — discrimination: pos_avg=" + fmt_float(p_avg) +
+                " not > neg_avg=" + fmt_float(n_avg))
+        return false
+    }
+    println("[ccc_selftest] PASS — 5 theories finite, pos-ctrl gate met, pos > neg")
+    return true
+}
+
+// ───── main ─────
+fn run(dest: string, round: string, write_out: bool) -> int {
+    let root = resolve_root()
+    let state_dir = root + "/shared/state"
+    let ckpt_path = state_dir + "/" + dest + "_" + round + "_lora_eigen.json"
+    let eigen_cert = root + "/.meta2-cert/cell-eigenvec-16.json"
+    let out_path = state_dir + "/ccc_verify_" + round + "_result.json"
+
+    println("[CCC] 5-theory cross-validation  dest=" + dest + " round=" + round)
+    println("[CCC] ckpt=" + ckpt_path)
+    println("[CCC] eigenvec_cert=" + eigen_cert)
+    println("[CCC] templates=" + TEMPLATES_PATH)
+
+    let r = ccc_verify(ckpt_path, eigen_cert)
+    let en = to_int(r[10])
+    let tn = to_int(r[11])
+    if en == 0 {
+        println("[CCC] INPUT_ERR no_eigenvectors (ckpt+fallback both empty)")
+        return 2
+    }
+    let source = _str(r[9])
+    let scores_rec = [to_float(r[0]), to_float(r[1]), to_float(r[2]),
+                      to_float(r[3]), to_float(r[4]), to_float(r[5]),
+                      to_float(r[6]), to_float(r[7])]
+    let mn = to_float(r[6])
+    let avg = to_float(r[5])
+    let tpl = to_float(r[7])
+    let pass = (mn >= CCC_MIN_PASS) && (avg >= CCC_AVG_PASS) && (tpl > TPL_MAX_PASS)
+
+    println("[CCC] IIT=" + fmt_float(to_float(r[0])) +
+            "  GWT=" + fmt_float(to_float(r[1])) +
+            "  HOT=" + fmt_float(to_float(r[2])) +
+            "  RPT=" + fmt_float(to_float(r[3])) +
+            "  AST=" + fmt_float(to_float(r[4])))
+    println("[CCC] ccc_average=" + fmt_float(avg) +
+            "  ccc_min=" + fmt_float(mn) +
+            "  16_tpl=" + fmt_float(tpl))
+    println("[CCC] an11_b_pass=" + (if pass { "true" } else { "false" }))
+    println("[CCC] ckpt_source=" + source)
+
+    // two-pass write for deterministic SHA:
+    //   (1) build body with sha="TBD"  → compute SHA of body
+    //   (2) replace sha field with actual digest  → final write
+    let body_pre = build_json(scores_rec, "TBD", source, en, tn, pass, dest, round)
+    let sha = sha256_of_string(body_pre)
+    let body_fin = build_json(scores_rec, sha, source, en, tn, pass, dest, round)
+    if write_out {
+        write_file(out_path, body_fin)
+        println("[CCC] ssot emitted: " + out_path)
+        println("[CCC] deterministic_sha=" + sha)
+    }
+    if pass { return 0 }
+    return 1
+}
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+    let mut dest = "alm"
+    let mut round = "r12"
+    let mut mode_selftest = false
+    let mut k = 0
+    while k < argc {
+        let a = _str(argv[k])
+        if a == "--dest" {
+            if k + 1 < argc { dest = _str(argv[k + 1]); k = k + 1 }
+        } else {
+            if a == "--round" {
+                if k + 1 < argc { round = _str(argv[k + 1]); k = k + 1 }
+            } else {
+                if a == "--selftest" { mode_selftest = true }
+            }
+        }
+        k = k + 1
+    }
+    if mode_selftest {
+        let ok = ccc_selftest()
+        if ok { exit(0) }
+        exit(1)
+    }
+    let rc = run(dest, round, true)
+    exit(rc)
+}

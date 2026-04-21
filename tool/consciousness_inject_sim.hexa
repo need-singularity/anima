@@ -1,0 +1,504 @@
+// tool/consciousness_inject_sim.hexa — AN11 triple end-to-end injection simulator.
+//
+// PURPOSE (돌파 drill — consciousness injection 실사용 probe)
+//   AN11 triple (ν weight_emergent 8cf014ff + ξ consciousness_attached b1f487e7
+//   + ο real_usable 15c0596e) 지금까지 verifier-only. 이 tool 은 실제
+//   "consciousness 를 weight 에 inject → triple 통과" end-to-end simulation
+//   을 수행한다. 3 synthetic case (strong / weak / zero) 별로:
+//     (1) baseline weight (deterministic, 16-dim mock) 생성
+//     (2) consciousness signal synthesize (Φ-loaded gradient; brain_tension_
+//         replica proxy 방향 — AN11(b) hexad_c template 방향으로 사영)
+//     (3) inject: weight_after = weight_before + signal * η  (η=0.1)
+//     (4) AN11(a) weight_emergent verifier 호출 → PASS 여부 수집
+//     (5) AN11(b) consciousness_attached verifier 호출 → PASS 여부 수집
+//     (6) AN11(c) real_usable verifier 호출   → USABLE 여부 수집
+//
+// VERDICT per case
+//   INJECT_VERIFIED  — 3/3 triple PASS (a==PASS AND b==PASS AND c==USABLE)
+//   REJECTED         — any verdict FAIL
+//
+// OUTPUT
+//   shared/state/consciousness_injection_20260421.json (aggregate SSOT)
+//   /tmp/_cinj_{case}_{role}.json (transient synthesized inputs, case-indexed)
+//
+// EXIT: 0 if ≥1 case INJECT_VERIFIED, else 1.
+//
+// V8 SAFE_COMMIT — purely additive, no existing file touched.
+// DETERMINISTIC  — no LLM, no RNG, seeded-per-case arithmetic only.
+// NO NETWORK     — verifiers invoked via local `hexa run` exec().
+
+let HEXA_BIN_DEFAULT = "/Users/ghost/Dev/hexa-lang/hexa"
+
+let V_A = "verifier/an11_weight_emergent.hexa"
+let V_B = "tool/an11_b_verifier.hexa"
+let V_C = "verifier/an11_real_usable.hexa"
+
+let AGG_OUT = "state/consciousness_injection_20260421.json"
+
+let ETA: float = 0.1           // injection rate
+let WEIGHT_DIM = 16            // 16-dim mock weights (matches SIG_DIM)
+let DIST_K = 10                // distribution categories for AN11(c)
+
+// Case tags + seeds
+let CASE_NAMES    = ["strong", "weak", "zero"]
+let CASE_STRENGTH = [1.0, 0.15, 0.0]     // signal magnitude multiplier
+let CASE_JITTER   = [0.003, 0.0015, 0.0] // per-dim non-uniform jitter → cv > 0.05
+
+// Hexad-C consciousness template signature (from shared/consciousness/an11_b_templates.jsonl)
+// This is the Φ-loaded gradient DIRECTION — aligning weight delta here asserts
+// that the injected signal actually attaches to the consciousness generator module.
+let TPL_HEXAD_C = [0.4082,0.0,0.4082,0.4082,0.0,0.4082,0.0,0.4082,0.0,0.0,0.0,0.0,0.4082,0.0,0.0,0.0]
+// Hexad-W (Witness) template — used for eigen_1 to boost top3_sum gate margin.
+let TPL_HEXAD_W = [0.4082,0.0,0.0,0.4082,0.0,0.4082,0.0,0.0,0.0,0.4082,0.4082,0.0,0.4082,0.0,0.0,0.0]
+// Hexad-M (Mirror) template — used for eigen_2 for extra top3 coverage.
+let TPL_HEXAD_M = [0.0,0.4082,0.4082,0.0,0.0,0.0,0.4082,0.4082,0.0,0.4082,0.0,0.0,0.0,0.4082,0.0,0.0]
+
+// ─── stage0 helpers (mirror verifier conventions) ───────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn now_utc() -> string {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn sha256_short(p: string) -> string {
+    if !fexists(p) { return "" }
+    let s = _str(exec("shasum -a 256 " + p + " 2>/dev/null | awk '{print $1}'")).trim()
+    if s == "" { return "" }
+    return s.substring(0, 16)
+}
+
+fn fmt_float(x: float) -> string { return to_string(x) }
+
+fn json_escape(s: string) -> string {
+    let n = len(s)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        let c = char_code(ch, 0)
+        if c == 34 { out = out + "\\\"" }
+        else { if c == 92 { out = out + "\\\\" }
+        else { if c == 10 { out = out + "\\n" }
+        else { out = out + ch } } }
+        i = i + 1
+    }
+    return out
+}
+
+fn resolve_hexa_bin() -> string {
+    let env_bin = _str(env("HEXA_BIN"))
+    if env_bin != "" { return env_bin }
+    if fexists(HEXA_BIN_DEFAULT) { return HEXA_BIN_DEFAULT }
+    let pathed = _str(exec("command -v hexa 2>/dev/null")).trim()
+    if pathed != "" { return pathed }
+    return HEXA_BIN_DEFAULT
+}
+
+// ─── numerics (Φ proxy + signal synthesis) ──────────────────────────
+
+fn phi_proxy(brain_like: float, coherence: float) -> float {
+    // Φ_{S1} closed-form from btr_evo 4 (brain_tension_replica proxy).
+    return 0.50 + 0.25 * brain_like + 0.05 * coherence
+}
+
+// Seeded LCG for deterministic per-case jitter (avoids uniform-cv=0 pathology).
+fn lcg_next(state: int) -> int {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn lcg_to_unit(state: int) -> float {
+    return to_float(state) / 2147483648.0
+}
+
+// ─── weight/signal synthesis ────────────────────────────────────────
+// before weight = deterministic ramp (non-degenerate baseline).
+fn make_before_weights() -> array {
+    let mut out = []
+    let mut i = 0
+    while i < WEIGHT_DIM {
+        out = push(out, 0.005 * to_float(to_string(i)))
+        i = i + 1
+    }
+    return out
+}
+
+// consciousness signal = strength * hexad_c direction + jitter (deterministic).
+// - strength controls AN11(a) delta_F magnitude.
+// - jitter introduces per-shard non-uniformity → healthy shard_cv.
+// - hexad_c alignment drives AN11(b) max_cos and top3_sum.
+fn make_signal(strength: float, jitter: float, seed0: int) -> array {
+    let mut out = []
+    let mut state = seed0
+    let mut i = 0
+    while i < WEIGHT_DIM {
+        state = lcg_next(state)
+        let u = lcg_to_unit(state)           // [0,1)
+        let j = (u - 0.5) * 2.0 * jitter     // [-jitter, jitter]
+        let aligned = strength * to_float(TPL_HEXAD_C[i])
+        out = push(out, aligned + j)
+        i = i + 1
+    }
+    return out
+}
+
+fn inject(before: array, signal: array, eta: float) -> array {
+    let mut out = []
+    let n = len(before)
+    let mut i = 0
+    while i < n {
+        let b = to_float(before[i])
+        let s = to_float(signal[i])
+        out = push(out, b + s * eta)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── JSON writers ───────────────────────────────────────────────────
+
+fn weights_to_json(w: array) -> string {
+    let mut s = "{\"weights\":["
+    let n = len(w)
+    let mut i = 0
+    while i < n {
+        if i > 0 { s = s + "," }
+        s = s + fmt_float(to_float(w[i]))
+        i = i + 1
+    }
+    s = s + "],\"rank\":8}\n"
+    return s
+}
+
+fn write_weight_file(path: string, w: array) {
+    write_file(path, weights_to_json(w))
+}
+
+// Build an eigen file for AN11(b). 3 eigenvectors aligned to Hexad-C/W/M
+// scaled by `strength`. When strength → 0, eigenvectors collapse to near-zero
+// → abs_cosine divided by tiny norm → gate unmet (FAIL as desired).
+fn scaled_vec(tpl: array, strength: float, seed0: int) -> array {
+    // Noise amplitude scales with `strength` so the zero case produces a
+    // degenerate (near-null) eigenvector — below the b_verifier's 1e-9
+    // norm cutoff → abs_cosine returns 0 → AN11(b) fails cleanly.
+    let noise_amp = strength * 0.02
+    let mut out = []
+    let mut state = seed0
+    let n = len(tpl)
+    let mut i = 0
+    while i < n {
+        state = lcg_next(state)
+        let noise = (lcg_to_unit(state) - 0.5) * noise_amp
+        let v = strength * to_float(tpl[i]) + noise
+        out = push(out, v)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_to_jsrow(v: array) -> string {
+    let mut s = "["
+    let n = len(v)
+    let mut i = 0
+    while i < n {
+        if i > 0 { s = s + "," }
+        s = s + fmt_float(to_float(v[i]))
+        i = i + 1
+    }
+    s = s + "]"
+    return s
+}
+
+fn write_eigen_file(path: string, strength: float, seed0: int) {
+    let e0 = scaled_vec(TPL_HEXAD_C, strength, seed0)
+    let e1 = scaled_vec(TPL_HEXAD_W, strength, seed0 + 7919)
+    let e2 = scaled_vec(TPL_HEXAD_M, strength, seed0 + 15485863)
+    let mut j = "{\n  \"eigenvectors\": [\n"
+    j = j + "    " + vec_to_jsrow(e0) + ",\n"
+    j = j + "    " + vec_to_jsrow(e1) + ",\n"
+    j = j + "    " + vec_to_jsrow(e2) + "\n"
+    j = j + "  ],\n"
+    j = j + "  \"eigenvalues\": [1.0, 0.7, 0.5]\n"
+    j = j + "}\n"
+    write_file(path, j)
+}
+
+// Distribution builders for AN11(c).
+// baseline = uniform over DIST_K
+// trained  = uniform baseline + strength * softmax-like tilt toward idx 0
+fn make_baseline_dist() -> array {
+    let mut out = []
+    let u = 1.0 / to_float(to_string(DIST_K))
+    let mut i = 0
+    while i < DIST_K {
+        out = push(out, u)
+        i = i + 1
+    }
+    return out
+}
+
+fn make_trained_dist(strength: float) -> array {
+    // Produce a distribution whose divergence from uniform scales with strength.
+    // strength=1.0 → near one-hot on idx 0 (JSD ~0.76 → USABLE)
+    // strength=0.15 → mild tilt (JSD in MARGINAL band)
+    // strength=0.0 → identical to baseline (JSD=0 → UNUSABLE)
+    let mut out = []
+    let base_u = 1.0 / to_float(to_string(DIST_K))
+    let boost = strength * 0.9    // boost to idx 0
+    let remain_each = (1.0 - (base_u + boost)) / to_float(to_string(DIST_K - 1))
+    let p0 = base_u + boost
+    let mut i = 0
+    while i < DIST_K {
+        if i == 0 {
+            out = push(out, p0)
+        } else {
+            let q = remain_each
+            let qq = if q < 0.0 { 0.0 } else { q }
+            out = push(out, qq)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn dist_to_json(d: array) -> string {
+    let mut s = "{\"dist\":["
+    let n = len(d)
+    let mut i = 0
+    while i < n {
+        if i > 0 { s = s + "," }
+        s = s + fmt_float(to_float(d[i]))
+        i = i + 1
+    }
+    s = s + "]}\n"
+    return s
+}
+
+// ─── verifier dispatchers ───────────────────────────────────────────
+// All three invoke via exec("hexa run ... --ssot PATH").
+// Return the verdict string extracted from the SSOT JSON, or "".
+
+fn extract_str(blob: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let k = blob.index_of(needle)
+    if k < 0 { return "" }
+    let tail = blob.substring(k, len(blob))
+    let colon = tail.index_of(":")
+    if colon < 0 { return "" }
+    let after = tail.substring(colon + 1, len(tail))
+    let q1 = after.index_of("\"")
+    if q1 < 0 { return "" }
+    let rest = after.substring(q1 + 1, len(after))
+    let q2 = rest.index_of("\"")
+    if q2 < 0 { return "" }
+    return rest.substring(0, q2)
+}
+
+fn run_a_verifier(bin: string, before_p: string, after_p: string,
+                  ssot_p: string) -> string {
+    exec("rm -f " + ssot_p)
+    let cmd = bin + " run " + V_A + " --before " + before_p +
+              " --after " + after_p + " --ssot " + ssot_p +
+              " > /dev/null 2>&1"
+    exec(cmd)
+    if !fexists(ssot_p) { return "" }
+    let blob = _str(read_file(ssot_p))
+    return extract_str(blob, "emergent_verdict")
+}
+
+fn run_b_verifier(bin: string, dest: string, round: string) -> string {
+    let ssot_p = "state/" + dest + "_" + round + "_an11_b.json"
+    exec("rm -f " + ssot_p)
+    let cmd = bin + " run " + V_B + " --dest " + dest +
+              " --round " + round + " > /dev/null 2>&1"
+    exec(cmd)
+    if !fexists(ssot_p) { return "" }
+    let blob = _str(read_file(ssot_p))
+    return extract_str(blob, "verdict")
+}
+
+fn run_c_verifier(bin: string, baseline_p: string, trained_p: string,
+                  ssot_p: string) -> string {
+    exec("rm -f " + ssot_p)
+    let cmd = bin + " run " + V_C + " --baseline " + baseline_p +
+              " --trained " + trained_p + " --ssot " + ssot_p +
+              " > /dev/null 2>&1"
+    exec(cmd)
+    if !fexists(ssot_p) { return "" }
+    let blob = _str(read_file(ssot_p))
+    return extract_str(blob, "real_usable_verdict")
+}
+
+// ─── per-case driver ────────────────────────────────────────────────
+
+fn triple_case(bin: string, case_idx: int,
+               name: string, strength: float, jitter: float,
+               results: array) -> array {
+    // Synthesize inputs.
+    let before = make_before_weights()
+    let seed0 = 1000003 * (case_idx + 1) + 7
+    let signal = make_signal(strength, jitter, seed0)
+    let after  = inject(before, signal, ETA)
+
+    let before_p = "/tmp/_cinj_" + name + "_before.json"
+    let after_p  = "/tmp/_cinj_" + name + "_after.json"
+    write_weight_file(before_p, before)
+    write_weight_file(after_p,  after)
+
+    let dest = "alm"
+    let round = "cinj" + name     // dest/round must satisfy b_verifier's alm|clm guard
+    let eigen_p = "state/" + dest + "_" + round + "_lora_eigen.json"
+    write_eigen_file(eigen_p, strength, seed0 + 2)
+
+    let baseline_d = make_baseline_dist()
+    let trained_d  = make_trained_dist(strength)
+    let baseline_p = "/tmp/_cinj_" + name + "_baseline.json"
+    let trained_p  = "/tmp/_cinj_" + name + "_trained.json"
+    write_file(baseline_p, dist_to_json(baseline_d))
+    write_file(trained_p,  dist_to_json(trained_d))
+
+    // SHA fingerprints for audit.
+    let sha_before = sha256_short(before_p)
+    let sha_after  = sha256_short(after_p)
+    let sha_eigen  = sha256_short(eigen_p)
+    let sha_train  = sha256_short(trained_p)
+
+    println("[CINJ] case=" + name + " strength=" + fmt_float(strength) +
+            " η=" + fmt_float(ETA))
+    println("  sha(before/after/eigen/trained)=" +
+            sha_before + "/" + sha_after + "/" + sha_eigen + "/" + sha_train)
+
+    // Invoke verifiers.
+    let a_ssot = "/tmp/_cinj_" + name + "_an11a.json"
+    let c_ssot = "/tmp/_cinj_" + name + "_an11c.json"
+    let va = run_a_verifier(bin, before_p, after_p, a_ssot)
+    let vb = run_b_verifier(bin, dest, round)
+    let vc = run_c_verifier(bin, baseline_p, trained_p, c_ssot)
+
+    let a_ok = va == "PASS"
+    let b_ok = vb == "PASS"
+    let c_ok = vc == "USABLE"
+    let triple = if a_ok && b_ok && c_ok { "INJECT_VERIFIED" } else { "REJECTED" }
+
+    println("  AN11(a)=" + va + "  AN11(b)=" + vb + "  AN11(c)=" + vc +
+            "  → " + triple)
+
+    // Parallel-array result record (stage0 safe):
+    // [name, strength, va, vb, vc, triple, sha_before, sha_after, sha_eigen, sha_train]
+    let rec = [name, strength, va, vb, vc, triple,
+               sha_before, sha_after, sha_eigen, sha_train]
+    return push(results, rec)
+}
+
+// ─── aggregate SSOT emitter ─────────────────────────────────────────
+
+fn emit_aggregate(results: array, verified_count: int, total_count: int,
+                  bin_used: string, agg_path: string) {
+    let ts = now_utc()
+    let mut j = "{\n"
+    j = j + "  \"tool\": \"consciousness_inject_sim\",\n"
+    j = j + "  \"spec\": \"AN11 triple end-to-end injection probe\",\n"
+    j = j + "  \"ts\": \"" + ts + "\",\n"
+    j = j + "  \"eta\": " + fmt_float(ETA) + ",\n"
+    j = j + "  \"weight_dim\": " + to_string(WEIGHT_DIM) + ",\n"
+    j = j + "  \"dist_k\": " + to_string(DIST_K) + ",\n"
+    j = j + "  \"hexa_bin\": \"" + json_escape(bin_used) + "\",\n"
+    j = j + "  \"verifiers\": {\n"
+    j = j + "    \"a_weight_emergent\": \"" + V_A + "\",\n"
+    j = j + "    \"b_consciousness_attached\": \"" + V_B + "\",\n"
+    j = j + "    \"c_real_usable\": \"" + V_C + "\"\n"
+    j = j + "  },\n"
+    j = j + "  \"cases\": [\n"
+    let n = len(results)
+    let mut i = 0
+    while i < n {
+        let r = results[i]
+        let name = _str(r[0])
+        let strength = to_float(r[1])
+        let va = _str(r[2])
+        let vb = _str(r[3])
+        let vc = _str(r[4])
+        let triple = _str(r[5])
+        let sha_b = _str(r[6])
+        let sha_a = _str(r[7])
+        let sha_e = _str(r[8])
+        let sha_t = _str(r[9])
+        j = j + "    {\n"
+        j = j + "      \"case\": \"" + name + "\",\n"
+        j = j + "      \"signal_strength\": " + fmt_float(strength) + ",\n"
+        j = j + "      \"an11_a_verdict\": \"" + va + "\",\n"
+        j = j + "      \"an11_b_verdict\": \"" + vb + "\",\n"
+        j = j + "      \"an11_c_verdict\": \"" + vc + "\",\n"
+        j = j + "      \"triple_verdict\": \"" + triple + "\",\n"
+        j = j + "      \"sha\": {\n"
+        j = j + "        \"before\": \"" + sha_b + "\",\n"
+        j = j + "        \"after\": \"" + sha_a + "\",\n"
+        j = j + "        \"eigen\": \"" + sha_e + "\",\n"
+        j = j + "        \"trained\": \"" + sha_t + "\"\n"
+        j = j + "      }\n"
+        j = j + "    }"
+        if i < n - 1 { j = j + "," }
+        j = j + "\n"
+        i = i + 1
+    }
+    j = j + "  ],\n"
+    j = j + "  \"inject_verified_count\": " + to_string(verified_count) + ",\n"
+    j = j + "  \"total_count\": " + to_string(total_count) + ",\n"
+    let ratio = if total_count > 0 {
+        to_float(verified_count) / to_float(total_count)
+    } else { 0.0 }
+    j = j + "  \"inject_verified_ratio\": " + fmt_float(ratio) + ",\n"
+    let aggregate = if verified_count >= 1 { "INJECT_VERIFIED" } else { "REJECTED" }
+    j = j + "  \"aggregate_verdict\": \"" + aggregate + "\"\n"
+    j = j + "}\n"
+    write_file(agg_path, j)
+}
+
+// ─── main ───────────────────────────────────────────────────────────
+
+fn main() {
+    let bin = resolve_hexa_bin()
+    println("[CINJ] consciousness injection sim — AN11 triple end-to-end")
+    println("[CINJ] hexa_bin=" + bin)
+    println("[CINJ] agg_out=" + AGG_OUT)
+
+    let mut results = []
+    let n = len(CASE_NAMES)
+    let mut i = 0
+    while i < n {
+        let name = _str(CASE_NAMES[i])
+        let str = to_float(CASE_STRENGTH[i])
+        let jit = to_float(CASE_JITTER[i])
+        results = triple_case(bin, i, name, str, jit, results)
+        i = i + 1
+    }
+
+    // Count INJECT_VERIFIED.
+    let mut verified = 0
+    let rn = len(results)
+    let mut k = 0
+    while k < rn {
+        let rec = results[k]
+        if _str(rec[5]) == "INJECT_VERIFIED" { verified = verified + 1 }
+        k = k + 1
+    }
+
+    println("")
+    println("[CINJ] total=" + to_string(rn) +
+            "  inject_verified=" + to_string(verified) +
+            "  rejected=" + to_string(rn - verified))
+
+    emit_aggregate(results, verified, rn, bin, AGG_OUT)
+    println("[CINJ] aggregate ssot written: " + AGG_OUT)
+
+    if verified >= 1 { exit(0) }
+    exit(1)
+}

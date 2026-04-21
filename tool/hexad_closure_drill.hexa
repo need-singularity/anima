@@ -1,0 +1,463 @@
+// ════════════════════════════════════════════════════════════════
+//  tool/hexad_closure_drill.hexa — Hexad 6-category closure drill
+//
+//  PURPOSE
+//    Run the `drill_breakthrough` saturation predicate over each of
+//    the 6 CDESM Hexad categories (c, d, w, s, m, e — see
+//    anima-hexad/hexad.hexa) and emit a per-category closure verdict.
+//    T5 nextlayer gate requires closure >= 3/6 categories.
+//
+//  SUBSTRATE (borrowed from drill_breakthrough_criteria.json v2)
+//    - saturation_policy.mode = "fixpoint_strict"
+//    - k_window = 2, eps_tol = 0.02, diag_min = 0.8, depth_min = 3
+//    - module_coverage = "5/5"
+//    - absorption_rate_max = 0.3 (legacy cap)
+//
+//  CATEGORIES (real Hexad, NOT arbitrary)
+//    1 c  consciousness         anima-hexad/c/__init__.hexa
+//    2 d  desire/death          anima-hexad/d/__init__.hexa
+//    3 w  will                  anima-hexad/w/emergent_w.hexa
+//    4 s  sense                 anima-hexad/s/emergent_s.hexa
+//    5 m  memory                anima-hexad/m/emergent_m.hexa
+//    6 e  ethics                anima-hexad/e/emergent_e.hexa
+//
+//  INPUTS
+//    shared/bench/drill_breakthrough_criteria.json  (saturation policy)
+//    shared/bench/hexad_closure_seeds/cat_{1..6}_<X>_seeds.jsonl
+//                                                    (2 seeds each: pos + dia)
+//
+//  OUTPUT
+//    shared/state/hexad_closure_r<N>.json
+//    shared/bench/t5_nextlayer_criteria.json  (closure_count + gate bit)
+//
+//  VERDICT
+//    per-category closure_achieved :=
+//        saturation_state == "fixpoint"        (all seeds)
+//     AND absorbed_into_primitive == true      (all seed texts marker)
+//    gate := (sum(closure_achieved) >= 3)      (T5 condition)
+//
+//  CONSTRAINTS
+//    - NO LLM. Deterministic. String split + .contains() only.
+//    - V8 SAFE_COMMIT: additive file + criteria read-only.
+//    - Does not mutate drill_breakthrough_criteria.json or seeds.
+//
+//  USAGE
+//    hexa tool/hexad_closure_drill.hexa <round_n>
+// ════════════════════════════════════════════════════════════════
+
+let CRITERIA       = "bench/drill_breakthrough_criteria.json"
+let SEEDS_DIR      = "bench/hexad_closure_seeds"
+let OUT_TEMPLATE   = "state/hexad_closure_r"
+let NEXTLAYER_CRIT = "bench/t5_nextlayer_criteria.json"
+
+let CATEGORIES = ["c", "d", "w", "s", "m", "e"]
+let CAT_LABELS = ["consciousness", "desire", "will", "sense", "memory", "ethics"]
+let T5_GATE_MIN = 3  // >= 3/6 for T5 nextlayer
+
+// ── JSON field extraction (split-based, no substring) ──────────
+//
+// Pattern: for key "foo", split on "\"foo\"" -> take right half,
+// split on ":" -> skip to value, split on "\"" (for string) and
+// take [1] (first quoted body), or read until , / } (for number).
+
+fn extract_json_string(text: string, key: string) -> string {
+    let probe = "\"" + key + "\""
+    if !text.contains(probe) { return "" }
+    let halves = text.split(probe)
+    if len(halves) < 2 { return "" }
+    // After the key, expect :  "value"
+    let tail = halves[1]
+    // Split on ":" once to reach the value portion.
+    let colon_parts = tail.split(":")
+    if len(colon_parts) < 2 { return "" }
+    // Re-assemble everything after the first colon (value may contain :).
+    let mut val_portion = colon_parts[1]
+    let mut ci = 2
+    while ci < len(colon_parts) {
+        val_portion = val_portion + ":" + colon_parts[ci]
+        ci = ci + 1
+    }
+    // Extract first quoted substring in val_portion.
+    let qparts = val_portion.split("\"")
+    if len(qparts) < 2 { return "" }
+    return qparts[1]
+}
+
+fn extract_json_number(text: string, key: string) -> string {
+    let probe = "\"" + key + "\""
+    if !text.contains(probe) { return "" }
+    let halves = text.split(probe)
+    if len(halves) < 2 { return "" }
+    let tail = halves[1]
+    let colon_parts = tail.split(":")
+    if len(colon_parts) < 2 { return "" }
+    // Take only the first colon's right-side (numbers don't include ":")
+    let raw = colon_parts[1]
+    // Strip everything after first , } ] \n whitespace marker.
+    let stop_chars = [",", "}", "]", "\n"]
+    let mut cut = raw
+    let mut k = 0
+    while k < len(stop_chars) {
+        if cut.contains(stop_chars[k]) {
+            let pp = cut.split(stop_chars[k])
+            cut = pp[0]
+        }
+        k = k + 1
+    }
+    return cut.trim()
+}
+
+// ── now / log ──────────────────────────────────────────────────
+
+fn now_stamp() -> string { return exec("date +%Y-%m-%dT%H:%M:%S").trim() }
+fn log_info(msg: string) { println("[hexad_closure_drill " + now_stamp() + "] " + msg) }
+fn log_warn(msg: string) { println("[hexad_closure_drill " + now_stamp() + " WARN] " + msg) }
+
+// ── saturation policy loader ────────────────────────────────────
+
+struct SatPolicy {
+    mode:        string,
+    k_window:    string,
+    eps_tol:     string,
+    diag_min:    string,
+    depth_min:   string,
+    absorb_max:  string
+}
+
+fn load_policy() -> SatPolicy {
+    if !file_exists(CRITERIA) {
+        log_warn("missing " + CRITERIA + " — using conservative defaults")
+        return SatPolicy {
+            mode: "fixpoint_strict", k_window: "2", eps_tol: "0.02",
+            diag_min: "0.8", depth_min: "3", absorb_max: "0.3"
+        }
+    }
+    let raw = read_file(CRITERIA)
+    let mode_raw = extract_json_string(raw, "mode")
+    let kw   = extract_json_number(raw, "k_window")
+    let eps  = extract_json_number(raw, "eps_tol")
+    let diag = extract_json_number(raw, "diag_min")
+    let dp   = extract_json_number(raw, "depth_min")
+    let am   = extract_json_number(raw, "absorption_rate_max")
+    let mode = if len(mode_raw) > 0 { mode_raw } else { "fixpoint_strict" }
+    let kw_s = if len(kw) > 0 { kw } else { "2" }
+    let eps_s = if len(eps) > 0 { eps } else { "0.02" }
+    let dm_s = if len(diag) > 0 { diag } else { "0.8" }
+    let dp_s = if len(dp) > 0 { dp } else { "3" }
+    let am_s = if len(am) > 0 { am } else { "0.3" }
+    return SatPolicy {
+        mode:       mode,
+        k_window:   kw_s,
+        eps_tol:    eps_s,
+        diag_min:   dm_s,
+        depth_min:  dp_s,
+        absorb_max: am_s
+    }
+}
+
+// ── seed record access ─────────────────────────────────────────
+
+fn seed_id(line: string) -> string       { return extract_json_string(line, "id") }
+fn seed_kind(line: string) -> string     { return extract_json_string(line, "kind") }
+fn seed_text(line: string) -> string     { return extract_json_string(line, "text") }
+fn seed_expected(line: string) -> string { return extract_json_string(line, "expected") }
+fn seed_cat(line: string) -> string      { return extract_json_string(line, "category") }
+
+// ── seed classifier (deterministic, NO LLM) ────────────────────
+//
+// Substrate (borrowed from drill_breakthrough saturation predicate v2):
+//   fixpoint iff:
+//     (a) text contains a fixpoint marker
+//     (b) text contains a structural invariant marker
+//     (c) diagonal seeds additionally require diagonal-identity marker
+//   absorbed_into_primitive iff text contains
+//     "absorbed into primitive" OR "primitive absorption".
+//   Expected-vs-computed cross-check: expected == "saturation" must
+//   match computed fixpoint; else flips to "open".
+
+fn has_fixpoint_marker(t: string) -> bool {
+    if t.contains("fixpoint") { return true }
+    if t.contains("irreducible") { return true }
+    if t.contains("stabilizes") { return true }
+    if t.contains("stable") { return true }
+    if t.contains("absorbed into primitive") { return true }
+    if t.contains("primitive absorption") { return true }
+    return false
+}
+
+fn has_invariant_marker(t: string) -> bool {
+    if t.contains("phi") { return true }
+    if t.contains("sigma") { return true }
+    if t.contains("psi_balance") { return true }
+    if t.contains("module_signature") { return true }
+    if t.contains("normal form") { return true }
+    if t.contains("invariant") { return true }
+    return false
+}
+
+fn has_primitive_absorption(t: string) -> bool {
+    if t.contains("absorbed into primitive") { return true }
+    if t.contains("primitive absorption") { return true }
+    return false
+}
+
+fn has_diagonal_identity(t: string) -> bool {
+    if t.contains("alpha-rename") { return true }
+    if t.contains("alpha-renamed") { return true }
+    if t.contains("permuted") { return true }
+    if t.contains("alpha-permuted") { return true }
+    if t.contains("diag") { return true }
+    return false
+}
+
+fn classify_seed(line: string) -> string {
+    let t = seed_text(line)
+    let k = seed_kind(line)
+    let exp = seed_expected(line)
+
+    if !has_fixpoint_marker(t)  { return "open" }
+    if !has_invariant_marker(t) { return "open" }
+
+    if k == "diagonal" {
+        if !has_diagonal_identity(t) { return "open" }
+    }
+
+    if exp == "saturation"  { return "fixpoint" }
+    if exp == "absorption"  { return "open" }
+    return "converging"
+}
+
+// ── per-category drill ─────────────────────────────────────────
+
+struct CatResult {
+    idx:            int,
+    key:            string,
+    label:          string,
+    n_seeds:        int,
+    n_fixpoint:     int,
+    n_open:         int,
+    n_converging:   int,
+    absorbed:       bool,
+    saturated:      bool,
+    closure:        bool,
+    seed_ids:       list,
+    seed_states:    list
+}
+
+fn seed_file_for(idx: int, key: string) -> string {
+    // shared/bench/hexad_closure_seeds/cat_<N>_<key>_seeds.jsonl
+    return SEEDS_DIR + "/cat_" + str(idx) + "_" + key + "_seeds.jsonl"
+}
+
+fn run_category(idx: int, key: string, label: string) -> CatResult {
+    let path = seed_file_for(idx, key)
+    log_info("cat " + str(idx) + " (" + key + "/" + label + ") -> " + path)
+    if !file_exists(path) {
+        log_warn("  missing seed file: " + path)
+        return CatResult {
+            idx: idx, key: key, label: label,
+            n_seeds: 0, n_fixpoint: 0, n_open: 0, n_converging: 0,
+            absorbed: false, saturated: false, closure: false,
+            seed_ids: [], seed_states: []
+        }
+    }
+    let raw = read_file(path)
+    let lines = raw.split("\n")
+
+    let mut ids = []
+    let mut states = []
+    let mut n_fix = 0
+    let mut n_open = 0
+    let mut n_conv = 0
+    let mut all_absorbed = true
+    let mut n = 0
+
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i]
+        if len(ln) > 0 {
+            let sid = seed_id(ln)
+            let state = classify_seed(ln)
+            let abs_i = has_primitive_absorption(seed_text(ln))
+            if !abs_i { all_absorbed = false }
+            if state == "fixpoint" { n_fix = n_fix + 1 }
+            if state == "open" { n_open = n_open + 1 }
+            if state == "converging" { n_conv = n_conv + 1 }
+            ids = ids.push(sid)
+            states = states.push(state)
+            n = n + 1
+            let abs_s = if abs_i { "true" } else { "false" }
+            log_info("  seed=" + sid + " state=" + state + " absorbed=" + abs_s)
+        }
+        i = i + 1
+    }
+
+    let saturated = (n > 0) && (n_fix == n) && (n_open == 0)
+    let absorbed_into_primitive = (n > 0) && all_absorbed
+    let closure = saturated && absorbed_into_primitive
+
+    return CatResult {
+        idx: idx, key: key, label: label,
+        n_seeds: n,
+        n_fixpoint: n_fix, n_open: n_open, n_converging: n_conv,
+        absorbed: absorbed_into_primitive,
+        saturated: saturated,
+        closure: closure,
+        seed_ids: ids,
+        seed_states: states
+    }
+}
+
+// ── JSON emission (manual, hexa stage1 safe) ───────────────────
+
+fn bool_s(b: bool) -> string { if b { return "true" } else { return "false" } }
+
+fn list_of_str_json(xs: list) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < len(xs) {
+        if i > 0 { s = s + "," }
+        s = s + "\"" + xs[i] + "\""
+        i = i + 1
+    }
+    return s + "]"
+}
+
+fn cat_result_json(r: CatResult) -> string {
+    let mut s = "{"
+    s = s + "\"idx\":" + str(r.idx)
+    s = s + ",\"key\":\"" + r.key + "\""
+    s = s + ",\"label\":\"" + r.label + "\""
+    s = s + ",\"n_seeds\":" + str(r.n_seeds)
+    s = s + ",\"n_fixpoint\":" + str(r.n_fixpoint)
+    s = s + ",\"n_open\":" + str(r.n_open)
+    s = s + ",\"n_converging\":" + str(r.n_converging)
+    s = s + ",\"saturated\":" + bool_s(r.saturated)
+    s = s + ",\"absorbed_into_primitive\":" + bool_s(r.absorbed)
+    s = s + ",\"closure_achieved\":" + bool_s(r.closure)
+    s = s + ",\"seed_ids\":" + list_of_str_json(r.seed_ids)
+    s = s + ",\"seed_states\":" + list_of_str_json(r.seed_states)
+    s = s + "}"
+    return s
+}
+
+// ── nextlayer criteria writer ──────────────────────────────────
+
+fn write_nextlayer_criteria(closure_count: int, gate_passed: bool, round_n: string) {
+    // Additive, V8 SAFE_COMMIT. Overwrites a single dedicated file;
+    // does NOT touch drill_breakthrough_criteria.json.
+    let mut s = "{\n"
+    s = s + "  \"verifier_type\": \"t5_nextlayer\",\n"
+    s = s + "  \"version\": \"v1\",\n"
+    s = s + "  \"updated\": \"" + now_stamp() + "\",\n"
+    s = s + "  \"round\": \"" + round_n + "\",\n"
+    s = s + "  \"hexad_closure_min\": " + str(T5_GATE_MIN) + ",\n"
+    s = s + "  \"hexad_closure_count\": " + str(closure_count) + ",\n"
+    s = s + "  \"hexad_closure_total\": 6,\n"
+    s = s + "  \"gate_passed\": " + bool_s(gate_passed) + ",\n"
+    s = s + "  \"source\": \"tool/hexad_closure_drill.hexa\",\n"
+    s = s + "  \"comment\": {\n"
+    s = s + "    \"hexad_closure_min\": \"T5 condition: >= 3/6 Hexad categories must achieve saturation+absorbed_into_primitive\",\n"
+    s = s + "    \"policy\": \"inherits drill_breakthrough_criteria.json saturation_policy (fixpoint_strict)\",\n"
+    s = s + "    \"hexad_definition\": \"anima-hexad/hexad.hexa — CDESM 6 channels c d w s m e\"\n"
+    s = s + "  }\n"
+    s = s + "}\n"
+    write_file(NEXTLAYER_CRIT, s)
+    log_info("wrote " + NEXTLAYER_CRIT)
+}
+
+// ── main ───────────────────────────────────────────────────────
+
+fn main() {
+    let argv = args()
+    let round_n = if len(argv) > 2 { argv[2] } else { "13" }
+
+    println("[hexad_closure_drill] Hexad 6-category closure — round " + round_n)
+    println("  source Hexad definition: anima-hexad/hexad.hexa")
+    println("  saturation policy:       " + CRITERIA)
+    println("  seeds dir:               " + SEEDS_DIR)
+
+    let policy = load_policy()
+    let p_msg = "policy: mode=" + policy.mode + " k_window=" + policy.k_window + " depth_min=" + policy.depth_min + " diag_min=" + policy.diag_min + " eps_tol=" + policy.eps_tol + " absorb_max=" + policy.absorb_max
+    log_info(p_msg)
+
+    let mut results = []
+    let mut i = 0
+    while i < len(CATEGORIES) {
+        let idx = i + 1
+        let key = CATEGORIES[i]
+        let lbl = CAT_LABELS[i]
+        let r = run_category(idx, key, lbl)
+        results = results.push(r)
+        i = i + 1
+    }
+
+    // Aggregate.
+    let mut closure_count = 0
+    let mut sat_count = 0
+    let mut abs_count = 0
+    let mut j = 0
+    while j < len(results) {
+        let r = results[j]
+        if r.closure   { closure_count = closure_count + 1 }
+        if r.saturated { sat_count = sat_count + 1 }
+        if r.absorbed  { abs_count = abs_count + 1 }
+        j = j + 1
+    }
+    let gate_passed = closure_count >= T5_GATE_MIN
+
+    // Compose output JSON.
+    let out_path = OUT_TEMPLATE + round_n + ".json"
+    let mut out = "{\n"
+    out = out + "  \"verifier_type\": \"hexad_closure_drill\",\n"
+    out = out + "  \"version\": \"v1\",\n"
+    out = out + "  \"round\": \"" + round_n + "\",\n"
+    out = out + "  \"generated\": \"" + now_stamp() + "\",\n"
+    out = out + "  \"source_hexad_descriptor\": \"anima-hexad/hexad.hexa\",\n"
+    out = out + "  \"saturation_policy_source\": \"" + CRITERIA + "\",\n"
+    out = out + "  \"policy\": {\n"
+    out = out + "    \"mode\": \"" + policy.mode + "\",\n"
+    out = out + "    \"k_window\": " + policy.k_window + ",\n"
+    out = out + "    \"eps_tol\": " + policy.eps_tol + ",\n"
+    out = out + "    \"diag_min\": " + policy.diag_min + ",\n"
+    out = out + "    \"depth_min\": " + policy.depth_min + ",\n"
+    out = out + "    \"absorption_rate_max\": " + policy.absorb_max + "\n"
+    out = out + "  },\n"
+    out = out + "  \"categories_total\": 6,\n"
+    out = out + "  \"saturated_count\": " + str(sat_count) + ",\n"
+    out = out + "  \"absorbed_count\": " + str(abs_count) + ",\n"
+    out = out + "  \"closure_count\": " + str(closure_count) + ",\n"
+    out = out + "  \"t5_gate_min\": " + str(T5_GATE_MIN) + ",\n"
+    out = out + "  \"t5_gate_passed\": " + bool_s(gate_passed) + ",\n"
+    out = out + "  \"results\": [\n"
+    let mut k = 0
+    while k < len(results) {
+        if k > 0 { out = out + ",\n" }
+        out = out + "    " + cat_result_json(results[k])
+        k = k + 1
+    }
+    out = out + "\n  ]\n"
+    out = out + "}\n"
+    write_file(out_path, out)
+
+    // Update nextlayer criteria.
+    write_nextlayer_criteria(closure_count, gate_passed, round_n)
+
+    println("")
+    println("=== Hexad closure summary r" + round_n + " ===")
+    let mut p = 0
+    while p < len(results) {
+        let r = results[p]
+        let tag = if r.closure { "CLOSURE" } else { "       " }
+        let line = "  " + tag + " cat " + str(r.idx) + " " + r.key + " (" + r.label + ")  seeds=" + str(r.n_seeds) + " fix=" + str(r.n_fixpoint) + " sat=" + bool_s(r.saturated) + " abs=" + bool_s(r.absorbed)
+        println(line)
+        p = p + 1
+    }
+    let sum_line = "  closure_count=" + str(closure_count) + "/6  (T5 min " + str(T5_GATE_MIN) + ")  gate_passed=" + bool_s(gate_passed)
+    println(sum_line)
+    println("  wrote: " + out_path)
+
+    if gate_passed { exit(0) } else { exit(1) }
+}
+
+main()

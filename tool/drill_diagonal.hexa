@@ -1,0 +1,303 @@
+// tool/drill_diagonal.hexa — diagonal_agreement calculator (cosine+jaccard)
+//
+// PURPOSE: implement drill_breakthrough_criteria.diagonal_agreement_min (0.8)
+// measurement. Given two drill result dicts (positive seed angle + diagonal
+// seed angle for the same claim), compute an agreement score in [0, 1].
+//
+// METHOD (deterministic, no LLM, no semantic embedding):
+//   agreement = 0.6 * cosine_sim(metric_vec_pos, metric_vec_diag)
+//             + 0.4 * jaccard(modules_hit_pos, modules_hit_diag)
+//
+// METRIC VECTOR (4 components, L2-normalizable, comparable scale):
+//   [ absorption_rate          (float, 0..1)
+//   , saturation_score         (float, 0..1)       // normalized depth/k_window
+//   , depth_reached / max_dep  (float, 0..1)
+//   , modules_hit_count / 5    (float, 0..1)       // 5-lens coverage
+//   ]
+//
+// JACCARD on modules_hit set:
+//   |A ∩ B| / |A ∪ B|   (empty-union → 0.0)
+//
+// CONTRACT:
+//   fn agreement(result_pos: dict, result_diag: dict) -> float in [0, 1]
+//   deterministic: agreement(r,r) == 1.0 ± ε  (ε from sqrt_newton truncation)
+//   symmetric:     agreement(a, b) == agreement(b, a)
+//
+// CLI:
+//   (A) paired fixture:  hexa tool/drill_diagonal.hexa <pair.json>
+//         where <pair.json>.pos  = result_pos dict
+//               <pair.json>.diag = result_diag dict
+//         (compatible with tests/fixtures/drill_agree_{high,mid,low}.json
+//          which wrap the pair under "_pair": {pos, diag})
+//   (B) two-file:        hexa tool/drill_diagonal.hexa <pos.json> <diag.json>
+//   prints: cosine=... jaccard=... agreement=... pass=...
+//   exit 0 if agreement >= 0.8 (criteria.diagonal_agreement_min), else 1.
+//
+// V8 SAFE_COMMIT: new file only; touches no existing substrate.
+
+// ─── file read guard (Hexa Error-type safe) ─────────────────────────
+
+fn safe_read(path: string) -> string {
+    let raw = read_file(path)
+    let parts = raw.split("\n")
+    if parts.len() == 1 && parts[0] == "" { return "" }
+    return raw
+}
+
+// ─── scalar helpers ─────────────────────────────────────────────────
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sqrt_newton(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut r = x
+    let mut i = 0
+    while i < 20 {
+        r = 0.5 * (r + x / r)
+        i = i + 1
+    }
+    return r
+}
+
+fn clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+// ─── metric-vector extraction ───────────────────────────────────────
+//
+// Accepts partial dicts: missing fields default to 0.0 (absorption/sat/depth)
+// or empty array (modules_hit). Deterministic: same input → same vector.
+
+fn get_float(d: any, k: string, dflt: float) -> float {
+    let key_list = keys(d)
+    let n = len(key_list)
+    let mut i = 0
+    while i < n {
+        if key_list[i] == k { return to_float(d[k]) }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn get_array(d: any, k: string) -> array {
+    let key_list = keys(d)
+    let n = len(key_list)
+    let mut i = 0
+    while i < n {
+        if key_list[i] == k { return d[k] }
+        i = i + 1
+    }
+    return []
+}
+
+fn metric_vec(result: any) -> array {
+    // absorption_rate: 0..1 (criteria cap at 0.3, we still normalize by 1.0)
+    let absorption = clamp01(get_float(result, "absorption_rate", 0.0))
+    // saturation_score: 0..1. Prefer explicit field; else derive from state.
+    let mut saturation = get_float(result, "saturation_score", -1.0)
+    if saturation < 0.0 {
+        // state ∈ {open:0.0, converging:0.5, fixpoint:1.0}
+        let state = get_float(result, "saturation_state_num", -1.0)
+        if state >= 0.0 { saturation = clamp01(state) } else { saturation = 0.0 }
+    } else {
+        saturation = clamp01(saturation)
+    }
+    // depth_reached normalized by max_depth (default 5 = depth_min(3)+k_window(2))
+    let depth = get_float(result, "depth_reached", 0.0)
+    let max_depth = get_float(result, "max_depth", 5.0)
+    let mut depth_n = 0.0
+    if max_depth > 0.0 { depth_n = clamp01(depth / max_depth) }
+    // modules_hit fraction of 5 (5-lens coverage)
+    let modules = get_array(result, "modules_hit")
+    let mut mod_n = to_float(len(modules)) / 5.0
+    mod_n = clamp01(mod_n)
+    let mut v = []
+    v = v.push(absorption)
+    v = v.push(saturation)
+    v = v.push(depth_n)
+    v = v.push(mod_n)
+    return v
+}
+
+// ─── cosine similarity (remapped to [0, 1]) ─────────────────────────
+//
+// Raw cosine ∈ [-1, 1]; our vectors are non-negative (all components ≥ 0),
+// so cosine ∈ [0, 1] naturally. Zero-norm → 0.0 (no agreement claim possible).
+
+fn cosine_sim_01(a: array, b: array) -> float {
+    let n = len(a)
+    if n != len(b) { return 0.0 }
+    let mut dot = 0.0
+    let mut na = 0.0
+    let mut nb = 0.0
+    let mut i = 0
+    while i < n {
+        dot = dot + a[i] * b[i]
+        na = na + a[i] * a[i]
+        nb = nb + b[i] * b[i]
+        i = i + 1
+    }
+    if na <= 0.0 || nb <= 0.0 { return 0.0 }
+    let denom = sqrt_newton(na) * sqrt_newton(nb)
+    if denom <= 0.0 { return 0.0 }
+    return clamp01(dot / denom)
+}
+
+// ─── jaccard similarity on string sets ──────────────────────────────
+
+fn contains_str(arr: array, s: string) -> bool {
+    let n = len(arr)
+    let mut i = 0
+    while i < n {
+        if arr[i] == s { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn jaccard_sets(a: array, b: array) -> float {
+    let na = len(a)
+    let nb = len(b)
+    if na == 0 && nb == 0 { return 0.0 }
+    // intersection
+    let mut inter = 0
+    let mut i = 0
+    while i < na {
+        if contains_str(b, a[i]) { inter = inter + 1 }
+        i = i + 1
+    }
+    // union = |A| + |B| - |A ∩ B|  (assumes set-shaped inputs; modules_hit is)
+    let uni = na + nb - inter
+    if uni <= 0 { return 0.0 }
+    return to_float(inter) / to_float(uni)
+}
+
+// ─── public: agreement(result_pos, result_diag) ─────────────────────
+
+fn agreement(result_pos: any, result_diag: any) -> float {
+    let vp = metric_vec(result_pos)
+    let vd = metric_vec(result_diag)
+    let cos = cosine_sim_01(vp, vd)
+    let mods_p = get_array(result_pos, "modules_hit")
+    let mods_d = get_array(result_diag, "modules_hit")
+    let jac = jaccard_sets(mods_p, mods_d)
+    // weighted hybrid: cosine primary (metric-space geometry),
+    // jaccard secondary (categorical module participation).
+    let score = 0.6 * cos + 0.4 * jac
+    return clamp01(score)
+}
+
+// Expose components for CLI reporting / debugging.
+fn agreement_breakdown(result_pos: any, result_diag: any) -> array {
+    let vp = metric_vec(result_pos)
+    let vd = metric_vec(result_diag)
+    let cos = cosine_sim_01(vp, vd)
+    let mods_p = get_array(result_pos, "modules_hit")
+    let mods_d = get_array(result_diag, "modules_hit")
+    let jac = jaccard_sets(mods_p, mods_d)
+    let score = clamp01(0.6 * cos + 0.4 * jac)
+    let mut out = []
+    out = out.push(cos)
+    out = out.push(jac)
+    out = out.push(score)
+    return out
+}
+
+// ─── CLI entry ──────────────────────────────────────────────────────
+
+fn round4(x: float) -> float {
+    return to_float(to_int(x * 10000.0 + 0.5)) / 10000.0
+}
+
+fn _load_pair_from_single(obj: any) -> array {
+    // Accepts either top-level {pos,diag} or nested {_pair:{pos,diag}}.
+    let key_list = keys(obj)
+    let n = len(key_list)
+    let mut has_pair = false
+    let mut has_pos = false
+    let mut has_diag = false
+    let mut i = 0
+    while i < n {
+        if key_list[i] == "_pair" { has_pair = true }
+        if key_list[i] == "pos"   { has_pos  = true }
+        if key_list[i] == "diag"  { has_diag = true }
+        i = i + 1
+    }
+    let mut out = []
+    if has_pair {
+        let p = obj["_pair"]
+        out = out.push(p["pos"])
+        out = out.push(p["diag"])
+        return out
+    }
+    if has_pos && has_diag {
+        out = out.push(obj["pos"])
+        out = out.push(obj["diag"])
+        return out
+    }
+    print_err("drill_diagonal: single-file fixture must contain {pos,diag} or {_pair:{pos,diag}}")
+    exit(2)
+    return out
+}
+
+fn main() {
+    let argv = args()
+    let mut result_pos  = {}
+    let mut result_diag = {}
+    let mut path_pos  = ""
+    let mut path_diag = ""
+    if argv.len() == 3 {
+        // (A) paired fixture mode
+        path_pos  = argv[2]
+        path_diag = argv[2]
+        let raw = safe_read(path_pos)
+        if raw == "" {
+            print_err("drill_diagonal: cannot read " + path_pos)
+            exit(2)
+        }
+        let obj = json_parse(raw)
+        let pair = _load_pair_from_single(obj)
+        result_pos  = pair[0]
+        result_diag = pair[1]
+    } else {
+        if argv.len() < 4 {
+            println("usage: drill_diagonal <pair.json>")
+            println("   or: drill_diagonal <pos.json> <diag.json>")
+            exit(2)
+        }
+        path_pos  = argv[2]
+        path_diag = argv[3]
+        let raw_pos  = safe_read(path_pos)
+        let raw_diag = safe_read(path_diag)
+        if raw_pos == "" {
+            print_err("drill_diagonal: cannot read " + path_pos)
+            exit(2)
+        }
+        if raw_diag == "" {
+            print_err("drill_diagonal: cannot read " + path_diag)
+            exit(2)
+        }
+        result_pos  = json_parse(raw_pos)
+        result_diag = json_parse(raw_diag)
+    }
+    let bd = agreement_breakdown(result_pos, result_diag)
+    let cos   = round4(bd[0])
+    let jac   = round4(bd[1])
+    let score = round4(bd[2])
+    let diag_min = 0.8   // from criteria.json (diagonal_agreement_min)
+    let pass = score >= diag_min
+    println("drill_diagonal")
+    println("  pos="  + path_pos)
+    println("  diag=" + path_diag)
+    println("  cosine="    + str(cos))
+    println("  jaccard="   + str(jac))
+    println("  agreement=" + str(score))
+    println("  diag_min="  + str(diag_min))
+    println("  pass="      + str(pass))
+    if pass { exit(0) } else { exit(1) }
+}
