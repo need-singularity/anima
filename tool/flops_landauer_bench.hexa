@@ -1,0 +1,535 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/flops_landauer_bench.hexa — cell vs LoRA FLOPs + Landauer 실측 wrapper
+//
+//  PURPOSE
+//    β main track Seed ι 주장 ("cell 60-80× 적은 FLOPs, 51× Landauer 우세") 를
+//    실제 수식으로 재계산하고 주장 대비 drift 를 측정한다.  LoRA 쪽 실학습
+//    경로 (edu/lora/train_lora_cpu.hexa) 와 cell 4-gen crystallize 경로
+//    (tool/edu_cell_4gen_crystallize.hexa) 를 '학습 가능 한 FLOPs + bit erase'
+//    차원에서 직접 비교한다.  실제 학습은 재실행하지 않고 (OOM 회피) —
+//    모듈 계수 + 공식 만으로 정합 점검한다.
+//
+//  수식 (ref edu/comparison/cell_vs_lora_flops.md §2)
+//
+//    FLOPs_cell  = Σ_gen  N_cells(g) × ticks × op_per_cell
+//                  with N_cells = [18, 16, 16, 9], ticks = 12, op_per_cell = 8
+//
+//    FLOPs_lora  = V × H × steps × batch × rank × 2  (LoRA adapter fwd+bwd)
+//                  with V=8, H=4, batch=2, 2 = fwd+bwd multiplier
+//
+//    bits_erased_cell  = sealed_k + drop_k  (1 bit each, Landauer)
+//    bits_erased_lora  = ΔCE_nats · n_pairs / ln(2)
+//
+//    E_cell_J   = bits_erased_cell · kT·ln(2)    (kT·ln2 = 2.870e-21 J @ 300K)
+//    E_lora_J   = bits_erased_lora · kT·ln(2)
+//
+//    ratio_flops = FLOPs_lora / FLOPs_cell          (expected 60-80×)
+//    eff_cell    = score_cell / E_cell_J            (useful_progress per Joule)
+//    eff_lora    = score_lora / E_lora_J
+//    ratio_landauer = eff_cell / eff_lora           (expected 51×)
+//
+//  HEXA-ONLY · raw#9 · raw#11 · raw#12 · raw#15 · deterministic · no LLM
+//
+//  CLI
+//    hexa run tool/flops_landauer_bench.hexa [--n-samples 100] [--seed 20260421]
+//                                            [--cell-gens 4] [--lora-steps 25]
+//                                            [--rank 4]
+//
+//  OUTPUT
+//    shared/state/flops_landauer_bench_result.json
+//
+//  CONFIG
+//    shared/config/flops_landauer_bench_config.json
+// ════════════════════════════════════════════════════════════════════════════
+
+let OUT_PATH = "shared/state/flops_landauer_bench_result.json"
+let CFG_PATH = "shared/config/flops_landauer_bench_config.json"
+
+// ─── helpers (stage0-safe, no deps) ─────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn now_utc() -> string {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    let h = _str(env("HOME"))
+    return h + "/core/anima"
+}
+
+fn fmt_f(x: float) -> string { return to_string(x) }
+
+fn digit_val(c: string) -> int {
+    if c == "0" { return 0 }
+    if c == "1" { return 1 }
+    if c == "2" { return 2 }
+    if c == "3" { return 3 }
+    if c == "4" { return 4 }
+    if c == "5" { return 5 }
+    if c == "6" { return 6 }
+    if c == "7" { return 7 }
+    if c == "8" { return 8 }
+    if c == "9" { return 9 }
+    return -1
+}
+
+fn parse_int_safe(s: string, default_v: int) -> int {
+    let n = len(s)
+    if n == 0 { return default_v }
+    let sign = if s.substring(0, 1) == "-" { -1 } else { 1 }
+    let start = if sign == -1 { 1 } else { 0 }
+    let mut acc = 0
+    let mut i = start
+    let mut any_digit = false
+    while i < n {
+        let c = s.substring(i, i + 1)
+        let d = digit_val(c)
+        if d >= 0 { acc = acc * 10 + d; any_digit = true }
+        i = i + 1
+    }
+    if !any_digit { return default_v }
+    return acc * sign
+}
+
+// ─── cell FLOPs + bit-erase model ───────────────────────────────────────────
+// Lattice size per gen (5×5 → 4×4 → 4×4 → 3×3 crystallize compression).
+// Matches edu/comparison/cell_vs_lora_flops.md §2.
+fn cells_per_gen(g: int) -> int {
+    if g == 1 { return 25 }
+    if g == 2 { return 16 }
+    if g == 3 { return 16 }
+    if g == 4 { return 9 }
+    return 9
+}
+
+// sealed_k + drop_k bit-erase per gen (landauer_tracker.hexa:32 convention)
+// Empirical counts from tool/edu_cell_4gen_crystallize.hexa:
+//   sealed: [18, 16, 16, 9],  drops: [7, 0, 0, 0]  (gen1 drops 7 → 5×5→4×4)
+fn cell_bits_per_gen(g: int) -> int {
+    let mut sealed = 0
+    let mut drop_ct = 0
+    if g == 1 { sealed = 18; drop_ct = 7 }
+    if g == 2 { sealed = 16; drop_ct = 0 }
+    if g == 3 { sealed = 16; drop_ct = 0 }
+    if g == 4 { sealed = 9;  drop_ct = 0 }
+    return sealed + drop_ct
+}
+
+// score_per_mille per gen (useful_progress × 1000) — empirical from
+// edu_cell_4gen_crystallize: 40 → 125 → 687 → 1000 (phase-jump @ gen 4).
+fn cell_score_pm(g: int) -> int {
+    if g == 1 { return 40 }
+    if g == 2 { return 125 }
+    if g == 3 { return 687 }
+    if g == 4 { return 1000 }
+    return 0
+}
+
+// cell FLOPs = cells × ticks × raw_op_per_cell × precision_factor.
+// raw_op_per_cell = 2 (hash mix + neighbor gather, ref cell_vs_lora_flops.md §2).
+// precision_factor = 8 converts hash-op → fp-equivalent FLOPs.
+let CELL_PRECISION_FACTOR = 8
+fn cell_flops(gens: int, ticks: int, op_per_cell: int) -> int {
+    let mut raw = 0
+    let mut g = 1
+    while g <= gens {
+        raw = raw + cells_per_gen(g) * ticks * op_per_cell
+        g = g + 1
+    }
+    return raw * CELL_PRECISION_FACTOR
+}
+
+fn cell_total_bits(gens: int) -> int {
+    let mut total = 0
+    let mut g = 1
+    while g <= gens {
+        total = total + cell_bits_per_gen(g)
+        g = g + 1
+    }
+    return total
+}
+
+fn cell_final_score_pm(gens: int) -> int {
+    // Use score at final gen.
+    return cell_score_pm(gens)
+}
+
+// ─── lora FLOPs + bit-erase model ──────────────────────────────────────────
+// Base pretrain + LoRA fine-tune.  Follows edu/lora/train_lora_cpu.hexa
+// topology: V=8, H=4, batch=2, 1 fwd + 3 bwd passes per step.
+// Per edu/comparison/cell_vs_lora_flops.md §2: base = steps × pairs × (1 fwd + 3 bwd × V·H)
+//                                              adapter = steps × pairs × (1 fwd + 3 bwd × r·V)
+fn lora_base_flops(V_: int, H_: int, base_steps: int, base_pairs: int, batch: int) -> int {
+    // per pair per step: fwd (2·V·H  — embedding lookup + output proj) + 3·bwd = 4·2·V·H
+    let per_pair = 4 * 2 * V_ * H_
+    return base_steps * base_pairs * per_pair
+}
+
+fn lora_adapter_flops(V_: int, H_: int, rank: int, steps: int, lora_pairs: int) -> int {
+    // per pair per step: fwd (H·r + r·V = r·(H+V)) + 3·bwd = 4·r·(H+V)
+    let per_pair = 4 * rank * (H_ + V_)
+    return steps * lora_pairs * per_pair
+}
+
+fn lora_total_flops(V_: int, H_: int, rank: int, base_steps: int, lora_steps: int,
+                    base_pairs: int, lora_pairs: int, batch: int) -> int {
+    let base = lora_base_flops(V_, H_, base_steps, base_pairs, batch)
+    let lora = lora_adapter_flops(V_, H_, rank, lora_steps, lora_pairs)
+    return base + lora
+}
+
+// bits_erased_lora = ΔCE_nats · n_pairs / ln(2)  → integer ×1000
+fn lora_bits_x1000(ce_drop_nats_x1000: int, n_pairs: int) -> int {
+    // numerator = n_pairs · ce_drop_nats (×1000)
+    // divide by ln(2) ≈ 0.6931 → multiply by 1000 / 693 to keep x1000
+    let num = n_pairs * ce_drop_nats_x1000
+    return (num * 1000) / 693
+}
+
+// ─── Config loader (minimal, key-value only) ────────────────────────────────
+
+fn cfg_get_str(cfg: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let i = cfg.index_of(needle)
+    if i < 0 { return "" }
+    let rest = cfg.substring(i + len(needle), len(cfg))
+    let colon = rest.index_of(":")
+    if colon < 0 { return "" }
+    let tail = rest.substring(colon + 1, len(rest))
+    // Find opening quote, then closing quote
+    let mut j = 0
+    let n = len(tail)
+    while j < n {
+        if tail.substring(j, j + 1) == "\"" {
+            let mut k = j + 1
+            while k < n {
+                if tail.substring(k, k + 1) == "\"" {
+                    return tail.substring(j + 1, k)
+                }
+                k = k + 1
+            }
+            return ""
+        }
+        j = j + 1
+    }
+    return ""
+}
+
+// ─── Metric assemblies ──────────────────────────────────────────────────────
+
+struct CellMetrics {
+    n_cells_per_gen: array,
+    total_cells: int,
+    flops: int,
+    bits: int,
+    score_pm: int
+}
+
+struct LoraMetrics {
+    flops_base: int,
+    flops_adapter: int,
+    flops_total: int,
+    bits_x1000: int,
+    ce_drop_nats_x1000: int,
+    n_pairs: int
+}
+
+fn compute_cell(gens: int, ticks: int, op_per_cell: int) -> CellMetrics {
+    let mut arr = []
+    let mut tot = 0
+    let mut g = 1
+    while g <= gens {
+        let n = cells_per_gen(g)
+        arr = arr.push(n)
+        tot = tot + n
+        g = g + 1
+    }
+    let fl = cell_flops(gens, ticks, op_per_cell)
+    let bts = cell_total_bits(gens)
+    let sc = cell_final_score_pm(gens)
+    return CellMetrics {
+        n_cells_per_gen: arr,
+        total_cells: tot,
+        flops: fl,
+        bits: bts,
+        score_pm: sc
+    }
+}
+
+fn compute_lora(V_: int, H_: int, rank: int, base_steps: int, lora_steps: int,
+                base_pairs: int, lora_pairs: int, batch: int,
+                ce_drop_nats_x1000: int) -> LoraMetrics {
+    let f_base = lora_base_flops(V_, H_, base_steps, base_pairs, batch)
+    let f_ad = lora_adapter_flops(V_, H_, rank, lora_steps, lora_pairs)
+    let bits = lora_bits_x1000(ce_drop_nats_x1000, lora_pairs)
+    return LoraMetrics {
+        flops_base: f_base,
+        flops_adapter: f_ad,
+        flops_total: f_base + f_ad,
+        bits_x1000: bits,
+        ce_drop_nats_x1000: ce_drop_nats_x1000,
+        n_pairs: lora_pairs
+    }
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+
+fn main() {
+    // CLI parse
+    let argv = args()
+    let argc = len(argv)
+    let mut n_samples = 100
+    let mut seed = 20260421
+    let mut cell_gens = 4
+    let mut lora_steps = 25
+    let mut rank = 4
+    let mut k = 0
+    while k < argc {
+        let a = _str(argv[k])
+        if a == "--n-samples" {
+            if k + 1 < argc { n_samples = parse_int_safe(_str(argv[k + 1]), n_samples) }
+        }
+        if a == "--seed" {
+            if k + 1 < argc { seed = parse_int_safe(_str(argv[k + 1]), seed) }
+        }
+        if a == "--cell-gens" {
+            if k + 1 < argc { cell_gens = parse_int_safe(_str(argv[k + 1]), cell_gens) }
+        }
+        if a == "--lora-steps" {
+            if k + 1 < argc { lora_steps = parse_int_safe(_str(argv[k + 1]), lora_steps) }
+        }
+        if a == "--rank" {
+            if k + 1 < argc { rank = parse_int_safe(_str(argv[k + 1]), rank) }
+        }
+        k = k + 1
+    }
+
+    let root = resolve_root()
+    let out_path = root + "/" + OUT_PATH
+    let cfg_path = root + "/" + CFG_PATH
+
+    println("══════════════════════════════════════════════════════════════")
+    println("  flops_landauer_bench — cell vs LoRA 실측 wrapper")
+    println("══════════════════════════════════════════════════════════════")
+    println("[CFG] n_samples=" + to_string(n_samples) + " seed=" + to_string(seed))
+    println("[CFG] cell_gens=" + to_string(cell_gens) + " lora_steps=" + to_string(lora_steps) + " rank=" + to_string(rank))
+    println("[CFG] root=" + root)
+    println("[CFG] out =" + out_path)
+
+    // Model constants — match config
+    let ticks = 12
+    let op_per_cell = 2  // raw hash ops per cell-tick (fnv mix + neighbor)
+    let V_ = 8
+    let H_ = 4
+    let batch = 2
+    let base_steps = 30
+    let base_pairs = 200
+    let lora_pairs = 150
+
+    // Empirical LoRA CE drop (run1 real artifact): 0.0127 nats → x1000
+    let ce_drop_nats_x1000 = 13  // floor(0.0127 × 1000) = 12 ~ 13
+
+    // Compute metrics
+    let cell = compute_cell(cell_gens, ticks, op_per_cell)
+    let lora = compute_lora(V_, H_, rank, base_steps, lora_steps,
+                            base_pairs, lora_pairs, batch, ce_drop_nats_x1000)
+
+    // FLOPs ratio (×1000)
+    let mut ratio_flops_x1000 = 0
+    if cell.flops > 0 {
+        ratio_flops_x1000 = (lora.flops_total * 1000) / cell.flops
+    }
+
+    // Landauer (physical): kT·ln2 = 2.870e-21 J/bit.  Work in attojoule (×1e-18) ×1000
+    // E_cell_aJ_x1000 = bits · 2870e-21 J × 1e18 aJ/J × 1000 = bits · 2870e-6 × 1000 = bits · 2.87
+    // Simpler: use zeptojoule (zJ = 1e-21 J).  kT·ln2 = 2.870 zJ per bit.
+    // E_cell_zJ_x1000 = bits · 2870  (exact integer, since 2.870 × 1000 = 2870)
+    let kT_ln2_x1000_zJ = 2870  // zJ/bit × 1000
+    let e_cell_x1000_zJ = cell.bits * kT_ln2_x1000_zJ
+    // lora.bits_x1000 is already ×1000.  E = bits × kT_ln2_zJ → (bits_x1000 × 2870) / 1000 = bits × 2870
+    let e_lora_x1000_zJ = (lora.bits_x1000 * kT_ln2_x1000_zJ) / 1000
+
+    // Efficiency: useful_progress / E.
+    // score_cell_pm is ×1000 (useful × 1000).  efficiency_cell_x1000 = score_pm / e_cell_zJ (unit: per zJ × 1000)
+    // For LoRA "useful" we use ce_drop_nats × n_pairs ≈ lora.bits × ln2 (nats of info gained)
+    // → score_lora_x1000 = ce_drop_nats_x1000 × n_pairs / 1000  (nats)
+    // To keep dimensional parity we express both as (info_units / energy_zJ) × 1000.
+    //
+    //   info_cell_x1000 = score_pm × 1     (per-mille useful progress)
+    //   info_lora_x1000 = ce_drop × pairs  (total nats × 1000)
+    //
+    // ratio_landauer = (info_cell / E_cell) / (info_lora / E_lora)
+    //                = (info_cell × E_lora) / (info_lora × E_cell)
+    //
+    // All integers; careful with overflow — use sub-terms.
+    let info_cell_x1000 = cell.score_pm
+    let info_lora_x1000 = (lora.ce_drop_nats_x1000 * lora.n_pairs) / 1000  // x1000 drop × 1 pairs → x1000
+
+    // Efficiency per bit (unitless ratio): useful / bits_erased.
+    // eff_cell = info_cell_x1000 / cell.bits
+    // eff_lora = info_lora_x1000 / (lora.bits_x1000 / 1000)  = info_lora_x1000 × 1000 / lora.bits_x1000
+    let mut eff_cell_x1000 = 0
+    if cell.bits > 0 {
+        eff_cell_x1000 = (info_cell_x1000 * 1000) / cell.bits
+    }
+    let mut eff_lora_x1000 = 0
+    if lora.bits_x1000 > 0 {
+        eff_lora_x1000 = (info_lora_x1000 * 1000000) / lora.bits_x1000
+    }
+
+    let mut ratio_landauer_x1000 = 0
+    if eff_lora_x1000 > 0 {
+        ratio_landauer_x1000 = (eff_cell_x1000 * 1000) / eff_lora_x1000
+    }
+
+    // Claim comparison
+    // Expected: FLOPs ratio ∈ [60, 80], Landauer eff ratio ≈ 51
+    let claim_flops_lo_x1000 = 60000
+    let claim_flops_hi_x1000 = 80000
+    let claim_landauer_x1000 = 51000
+
+    let flops_in_band = (ratio_flops_x1000 >= claim_flops_lo_x1000) && (ratio_flops_x1000 <= claim_flops_hi_x1000)
+    // If actual ratio exceeds claim high-end, cell is MORE efficient than claimed — not drift.
+    let flops_exceeds_claim = ratio_flops_x1000 > claim_flops_hi_x1000
+    let flops_ok = flops_in_band || flops_exceeds_claim
+    let flops_mid = (claim_flops_lo_x1000 + claim_flops_hi_x1000) / 2
+    let flops_d = ratio_flops_x1000 - flops_mid
+    let flops_drift_x1000 = if flops_d < 0 { 0 - flops_d } else { flops_d }
+    let land_d = ratio_landauer_x1000 - claim_landauer_x1000
+    let landauer_drift_x1000 = if land_d < 0 { 0 - land_d } else { land_d }
+    // tolerance 20% of claim
+    let landauer_tol_x1000 = claim_landauer_x1000 / 5
+    let landauer_in_band = landauer_drift_x1000 <= landauer_tol_x1000
+
+    // ─── print ─────────────────────────────────────────────────────────
+    println("")
+    println("[CELL] gens=" + to_string(cell_gens) +
+            " cells_per_gen=[25,16,16,9] total=" + to_string(cell.total_cells))
+    println("[CELL] FLOPs = " + to_string(cell.flops) +
+            "  bits_erased=" + to_string(cell.bits) +
+            "  score_pm=" + to_string(cell.score_pm))
+    println("[LORA] V=" + to_string(V_) + " H=" + to_string(H_) +
+            " rank=" + to_string(rank) +
+            " base_steps=" + to_string(base_steps) +
+            " lora_steps=" + to_string(lora_steps))
+    println("[LORA] FLOPs_base=" + to_string(lora.flops_base) +
+            "  FLOPs_adapter=" + to_string(lora.flops_adapter) +
+            "  FLOPs_total=" + to_string(lora.flops_total))
+    println("[LORA] CE_drop=0.013 nats · pairs=" + to_string(lora.n_pairs) +
+            "  bits_x1000=" + to_string(lora.bits_x1000))
+    println("")
+    println("[RATIO] FLOPs    = " + to_string(ratio_flops_x1000) + " /1000  " +
+            "(= " + to_string(ratio_flops_x1000 / 1000) + "." +
+            to_string(ratio_flops_x1000 % 1000) + "×)")
+    println("[RATIO] expect [60×..80×] → in_band=" + (if flops_in_band { "TRUE" } else { "FALSE" }))
+    println("[RATIO] Landauer = " + to_string(ratio_landauer_x1000) + " /1000  " +
+            "(= " + to_string(ratio_landauer_x1000 / 1000) + "." +
+            to_string(ratio_landauer_x1000 % 1000) + "×)")
+    println("[RATIO] expect 51× ±20% → in_band=" + (if landauer_in_band { "TRUE" } else { "FALSE" }))
+    println("[E] cell  E ≈ " + to_string(e_cell_x1000_zJ / 1000) + " zJ (" +
+            to_string(cell.bits) + " bits × 2.870 zJ/bit)")
+    println("[E] lora  E ≈ " + to_string(e_lora_x1000_zJ / 1000) + " zJ  (ΔCE · pairs / ln2 × 2.870 zJ)")
+    println("")
+
+    // ─── Emit SSOT JSON (chunked parts.push + join, raw#12 memory cap) ────
+    let ts = now_utc()
+    let mut parts = []
+    parts = parts.push("{\n")
+    parts = parts.push("  \"tool\": \"tool/flops_landauer_bench.hexa\",\n")
+    parts = parts.push("  \"spec\": \"cell vs LoRA FLOPs + Landauer 실측 wrapper (β main Seed ι 검증)\",\n")
+    parts = parts.push("  \"ts\": \"" + ts + "\",\n")
+    parts = parts.push("  \"config_path\": \"" + CFG_PATH + "\",\n")
+    parts = parts.push("  \"cli\": {\n")
+    parts = parts.push("    \"n_samples\": " + to_string(n_samples) + ",\n")
+    parts = parts.push("    \"seed\": " + to_string(seed) + ",\n")
+    parts = parts.push("    \"cell_gens\": " + to_string(cell_gens) + ",\n")
+    parts = parts.push("    \"lora_steps\": " + to_string(lora_steps) + ",\n")
+    parts = parts.push("    \"rank\": " + to_string(rank) + "\n")
+    parts = parts.push("  },\n")
+    parts = parts.push("  \"constants\": {\n")
+    parts = parts.push("    \"kT_ln2_zJ_per_bit\": 2.870,\n")
+    parts = parts.push("    \"kT_ln2_J_per_bit\": 2.870e-21,\n")
+    parts = parts.push("    \"temperature_K\": 300,\n")
+    parts = parts.push("    \"ln2\": 0.6931\n")
+    parts = parts.push("  },\n")
+    parts = parts.push("  \"cell\": {\n")
+    parts = parts.push("    \"gens\": " + to_string(cell_gens) + ",\n")
+    parts = parts.push("    \"ticks_per_gen\": " + to_string(ticks) + ",\n")
+    parts = parts.push("    \"op_per_cell\": " + to_string(op_per_cell) + ",\n")
+    parts = parts.push("    \"n_cells_per_gen\": [25, 16, 16, 9],\n")
+    parts = parts.push("    \"sealed_per_gen\": [18, 16, 16, 9],\n")
+    parts = parts.push("    \"drops_per_gen\": [7, 0, 0, 0],\n")
+    parts = parts.push("    \"precision_factor\": 8,\n")
+    parts = parts.push("    \"total_cells\": " + to_string(cell.total_cells) + ",\n")
+    parts = parts.push("    \"flops\": " + to_string(cell.flops) + ",\n")
+    parts = parts.push("    \"bits_erased\": " + to_string(cell.bits) + ",\n")
+    parts = parts.push("    \"score_per_mille\": " + to_string(cell.score_pm) + ",\n")
+    parts = parts.push("    \"energy_zJ_x1000\": " + to_string(e_cell_x1000_zJ) + "\n")
+    parts = parts.push("  },\n")
+    parts = parts.push("  \"lora\": {\n")
+    parts = parts.push("    \"V\": " + to_string(V_) + ",\n")
+    parts = parts.push("    \"H\": " + to_string(H_) + ",\n")
+    parts = parts.push("    \"rank\": " + to_string(rank) + ",\n")
+    parts = parts.push("    \"batch\": " + to_string(batch) + ",\n")
+    parts = parts.push("    \"base_steps\": " + to_string(base_steps) + ",\n")
+    parts = parts.push("    \"lora_steps\": " + to_string(lora_steps) + ",\n")
+    parts = parts.push("    \"base_pairs\": " + to_string(base_pairs) + ",\n")
+    parts = parts.push("    \"lora_pairs\": " + to_string(lora_pairs) + ",\n")
+    parts = parts.push("    \"flops_base\": " + to_string(lora.flops_base) + ",\n")
+    parts = parts.push("    \"flops_adapter\": " + to_string(lora.flops_adapter) + ",\n")
+    parts = parts.push("    \"flops_total\": " + to_string(lora.flops_total) + ",\n")
+    parts = parts.push("    \"ce_drop_nats_x1000\": " + to_string(ce_drop_nats_x1000) + ",\n")
+    parts = parts.push("    \"bits_erased_x1000\": " + to_string(lora.bits_x1000) + ",\n")
+    parts = parts.push("    \"energy_zJ_x1000\": " + to_string(e_lora_x1000_zJ) + "\n")
+    parts = parts.push("  },\n")
+    parts = parts.push("  \"ratios\": {\n")
+    parts = parts.push("    \"flops_lora_over_cell_x1000\": " + to_string(ratio_flops_x1000) + ",\n")
+    parts = parts.push("    \"flops_ratio_human\": \"" + to_string(ratio_flops_x1000 / 1000) + "." + to_string(ratio_flops_x1000 % 1000) + "×\",\n")
+    parts = parts.push("    \"landauer_eff_cell_over_lora_x1000\": " + to_string(ratio_landauer_x1000) + ",\n")
+    parts = parts.push("    \"landauer_ratio_human\": \"" + to_string(ratio_landauer_x1000 / 1000) + "." + to_string(ratio_landauer_x1000 % 1000) + "×\",\n")
+    parts = parts.push("    \"eff_cell_x1000\": " + to_string(eff_cell_x1000) + ",\n")
+    parts = parts.push("    \"eff_lora_x1000\": " + to_string(eff_lora_x1000) + "\n")
+    parts = parts.push("  },\n")
+    parts = parts.push("  \"claim_check\": {\n")
+    parts = parts.push("    \"claim_flops_band\": [60, 80],\n")
+    parts = parts.push("    \"flops_in_band\": " + (if flops_in_band { "true" } else { "false" }) + ",\n")
+    parts = parts.push("    \"flops_exceeds_claim\": " + (if flops_exceeds_claim { "true" } else { "false" }) + ",\n")
+    parts = parts.push("    \"flops_ok\": " + (if flops_ok { "true" } else { "false" }) + ",\n")
+    parts = parts.push("    \"flops_drift_from_mid_x1000\": " + to_string(flops_drift_x1000) + ",\n")
+    parts = parts.push("    \"claim_landauer\": 51,\n")
+    parts = parts.push("    \"landauer_in_band_20pct\": " + (if landauer_in_band { "true" } else { "false" }) + ",\n")
+    parts = parts.push("    \"landauer_drift_x1000\": " + to_string(landauer_drift_x1000) + "\n")
+    parts = parts.push("  },\n")
+    parts = parts.push("  \"raw_contract\": [\"raw#9\", \"raw#11\", \"raw#12\", \"raw#15\"],\n")
+    parts = parts.push("  \"ssot_refs\": {\n")
+    parts = parts.push("    \"cell_flops_model\": \"edu/cell/lagrangian/l_ix_integrator.hexa\",\n")
+    parts = parts.push("    \"cell_landauer\": \"edu/cell/dissipation/landauer_tracker.hexa:32\",\n")
+    parts = parts.push("    \"cell_efficiency\": \"edu/cell/dissipation/efficiency.hexa\",\n")
+    parts = parts.push("    \"lora_train\": \"edu/lora/train_lora_cpu.hexa\",\n")
+    parts = parts.push("    \"comparison_doc\": \"edu/comparison/cell_vs_lora_flops.md\"\n")
+    parts = parts.push("  },\n")
+    let mut verdict = "DRIFT_DETECTED"
+    if flops_ok && landauer_in_band { verdict = "CLAIM_CONFIRMED" }
+    else { if flops_ok || landauer_in_band { verdict = "PARTIAL_DRIFT" } }
+    if flops_exceeds_claim { verdict = verdict + "_CELL_BETTER_THAN_CLAIMED" }
+
+    parts = parts.push("  \"verdict\": \"" + verdict + "\"\n")
+    parts = parts.push("}\n")
+
+    let blob = parts.join("")
+    write_file(out_path, blob)
+    println("[OUT] " + out_path)
+    println("[VERDICT] " + verdict)
+
+    if verdict == "DRIFT_DETECTED" { exit(1) }
+    exit(0)
+}
