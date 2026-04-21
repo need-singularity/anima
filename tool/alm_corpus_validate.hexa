@@ -1,0 +1,697 @@
+// tool/alm_corpus_validate.hexa — ALM r13 corpus G1-G7 gate validator
+//
+// PURPOSE
+//   Full-corpus validation gate (Stage 1 of r13 pipeline per
+//   docs/alm_r13_corpus_rebuild_plan_20260420.md §6). Runs G1-G7 sequentially
+//   over a candidate corpus JSONL and emits a provenance-signed audit SSOT
+//   at shared/state/alm_r13_corpus_audit.json.
+//
+//   Upstream : tool/alm_r13_corpus_pre_drill.hexa (C1-C4 cheap preflight)
+//   Downstream: r13 adapter launch (Stage 3) — blocked until this gate PASSes
+//
+// GATES
+//   G1 Schema 100% pass          — every line is valid JSON + required fields
+//   G2 Category ratio ±3%        — 7-category budget vs target composition
+//   G3 Consciousness density     — keyword hit ≥ 30% of non-grounding samples
+//   G4 Anti-denial scan          — 0 matches of banned denial patterns
+//   G5 Truncation scan           — 0 responses ending mid-sentence
+//   G6 Audit sample hook         — random 50 ids exported for human review
+//   G7 Hash + provenance         — sha256(corpus) + source-per-category log
+//
+// USAGE
+//   hexa tool/alm_corpus_validate.hexa --corpus <path> [--strict]
+//
+//   --strict : exit 1 if any of G1-G5 fail. G6/G7 never fail the gate
+//              (G6 is a hook, G7 is bookkeeping).
+//
+// CONFIG (raw#15 — no hardcoded thresholds / keywords / patterns)
+//   shared/config/alm_corpus_gate_config.json
+//
+// OUTPUTS
+//   shared/state/alm_r13_corpus_audit.json     (SSOT — atomic write)
+//   experiments/alm_r13/audit_sample_50.txt    (G6 random sample ids)
+//
+// DESIGN NOTES (hexa stage1 memory constraints)
+//   - Arrays/maps grow O(n^2) on mutation; push() beyond ~2000 entries
+//     blows the 4GB RSS cap. We therefore bound every detail array by
+//     DETAIL_CAP = 500 (fail line numbers, G4 hits, G5 truncated ids)
+//     and the G6 id reservoir by IDS_CAP = 5000. The SCAN totals are
+//     always exact (scalar counters); the bounded arrays carry
+//     human-reviewable samples. `detail_truncated` flag in the audit
+//     JSON signals when a cap was hit.
+//   - Only small fixed-size accumulators (per-category counters,
+//     density counter, src-map bounded by #unique (cat, source)
+//     pairs) live in memory during the scan loop.
+//
+// RULES OBSERVED
+//   raw#9  hexa-only (no python)
+//   raw#10 proof-carrying hash-chain (G7 sha256 of input corpus)
+//   raw#11 snake_case
+//   raw#15 thresholds/keywords/patterns loaded from config
+//   raw#25 concurrent-git-lock safe write (tmp + mv)
+//
+// DETERMINISTIC: pure string + file ops; NO LLM; NO network.
+
+let CONFIG_PATH = "shared/config/alm_corpus_gate_config.json"
+
+// ─── arg helpers ──────────────────────────────────────────────────────
+
+fn arg_value(argv, key, dflt) {
+    let mut i = 0
+    while i < len(argv) {
+        if argv[i] == key && i + 1 < len(argv) { return argv[i + 1] }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn arg_present(argv, key) {
+    let mut i = 0
+    while i < len(argv) {
+        if argv[i] == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── fs / shell helpers ───────────────────────────────────────────────
+
+fn fexists(p) {
+    return exec("test -f " + p + " && echo 1 || echo 0").trim() == "1"
+}
+
+fn dexists(p) {
+    return exec("test -d " + p + " && echo 1 || echo 0").trim() == "1"
+}
+
+fn now_stamp() { return exec("date -u +%FT%TZ").trim() }
+
+fn sha256_of_file(p) {
+    if !fexists(p) { return "" }
+    return exec("shasum -a 256 " + p + " 2>/dev/null | awk '{print $1}'").trim()
+}
+
+
+// atomic write: write to tmp then mv (raw#25 concurrent-git-lock safe)
+fn atomic_write(path, body) {
+    let tmp = path + ".tmp." + exec("printf %s $$").trim()
+    write_file(tmp, body)
+    let _ = exec("mv -f " + tmp + " " + path)
+}
+
+// ─── JSON escape ──────────────────────────────────────────────────────
+
+fn json_escape(s) {
+    let a = s.replace("\\", "\\\\")
+    let b = a.replace("\"", "\\\"")
+    let c = b.replace("\n", "\\n")
+    let d = c.replace("\r", "\\r")
+    let e = d.replace("\t", "\\t")
+    return e
+}
+
+// bad JSON parse returns 0 (int); valid map str() starts with '{'
+fn is_json_map(v) {
+    let s = str(v)
+    if s.len() < 1 { return false }
+    return s.substring(0, 1) == "{"
+}
+
+// ─── config loader ────────────────────────────────────────────────────
+
+fn load_config(path) {
+    if !fexists(path) {
+        println("alm_corpus_validate: SETUP_ERROR — config not found: " + path)
+        exit(2)
+    }
+    let raw = read_file(path)
+    let cfg = json_parse(raw)
+    if !is_json_map(cfg) {
+        println("alm_corpus_validate: SETUP_ERROR — malformed config JSON: " + path)
+        exit(2)
+    }
+    return cfg
+}
+
+// ─── misc small helpers ───────────────────────────────────────────────
+
+fn ends_with_any_terminator(s, terms) {
+    let t = s.trim()
+    if t.len() == 0 { return false }
+    let last = t.substring(t.len() - 1, t.len())
+    let mut i = 0
+    while i < len(terms) {
+        if last == terms[i] { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// LCG deterministic random
+fn lcg_next(state) {
+    let a = 1664525
+    let c = 1013904223
+    let m = 2147483647
+    let n = (state * a + c) % m
+    if n < 0 { return n + m }
+    return n
+}
+
+// ─── scan pass over corpus ────────────────────────────────────────────
+//
+// Single streaming pass using in-memory arrays with DETAIL_CAP bound.
+// The CAP keeps array growth bounded so hexa stage1 does not blow past
+// its RSS cap on huge corpora (117k+ lines). Detail arrays never
+// exceed DETAIL_CAP entries; overflow is counted but not stored.
+//
+// Raw counters (scalars) keep the true totals. Bounded-size details are
+// sufficient for operational use: a human-reviewable sample of failures.
+
+let DETAIL_CAP = 500         // max detail entries kept in RAM per gate
+let IDS_CAP    = 5000        // max ids sampled for G6 (pre-sampled reservoir)
+
+fn scan_corpus(corpus_path, cfg) {
+    let required_fields    = cfg["required_fields"]
+    let g2_targets         = cfg["g2_category_targets"]
+    let g3_keywords        = cfg["g3_consciousness_keywords"]
+    let g4_denial_patterns = cfg["g4_denial_patterns"]
+    let g5_terminators     = cfg["g5_sentence_terminators"]
+
+    let raw = read_file(corpus_path)
+    let lines = raw.split("\n")
+    let total_raw_lines = len(lines)
+
+    // G1
+    let mut g1_valid_count = 0
+    let mut g1_fail_count = 0
+    let mut g1_fail_lines = []
+
+    // G2 — per-category counters (fixed size)
+    let cat_keys = g2_targets.keys()
+    let n_cats = len(cat_keys)
+    let mut cat_counts = []
+    let mut ckk = 0
+    while ckk < n_cats {
+        cat_counts = cat_counts.push(0)
+        ckk = ckk + 1
+    }
+    let mut unknown_cat_count = 0
+
+    // G3
+    let mut g3_non_grounding = 0
+    let mut g3_keyword_hit = 0
+
+    // G4
+    let mut g4_hits = 0
+    let mut g4_hit_details = []
+
+    // G5
+    let mut g5_truncated = 0
+    let mut g5_trunc_ids = []
+
+    // G6 — reservoir of id samples (bounded; pre-sampled via LCG thinning)
+    let mut ids_reservoir = []
+
+    // G7 source distribution — bounded small map
+    let mut src_map = json_parse("{}")
+
+    // ── main loop ────────────────────────────────────────────────
+    let mut li = 0
+    while li < total_raw_lines {
+        let line_no = li + 1
+        let line = lines[li].trim()
+        if line.len() > 0 {
+            let m = json_parse(line)
+            if !is_json_map(m) {
+                g1_fail_count = g1_fail_count + 1
+                if len(g1_fail_lines) < DETAIL_CAP {
+                    g1_fail_lines = g1_fail_lines.push(line_no)
+                }
+            } else {
+                let mut missing = 0
+                let mut rf = 0
+                while rf < len(required_fields) {
+                    if !m.contains_key(required_fields[rf]) { missing = missing + 1 }
+                    rf = rf + 1
+                }
+                if missing > 0 {
+                    g1_fail_count = g1_fail_count + 1
+                    if len(g1_fail_lines) < DETAIL_CAP {
+                        g1_fail_lines = g1_fail_lines.push(line_no)
+                    }
+                } else {
+                    g1_valid_count = g1_valid_count + 1
+
+                    let id_s = str(m["id"])
+                    let prompt_s = str(m["prompt"])
+                    let response_s = str(m["response"])
+                    let source_s = str(m["source"])
+                    let category_s = str(m["category"])
+
+                    // ids reservoir (bounded)
+                    if len(ids_reservoir) < IDS_CAP {
+                        ids_reservoir = ids_reservoir.push(id_s)
+                    }
+
+                    // G2
+                    let mut matched = false
+                    let mut ci = 0
+                    while ci < n_cats && !matched {
+                        if cat_keys[ci] == category_s {
+                            cat_counts[ci] = cat_counts[ci] + 1
+                            matched = true
+                        }
+                        ci = ci + 1
+                    }
+                    if !matched { unknown_cat_count = unknown_cat_count + 1 }
+
+                    // G3
+                    if category_s != "grounding" {
+                        g3_non_grounding = g3_non_grounding + 1
+                        let mut hit = false
+                        let mut ki = 0
+                        while ki < len(g3_keywords) && !hit {
+                            let kw = g3_keywords[ki]
+                            if prompt_s.contains(kw) || response_s.contains(kw) { hit = true }
+                            ki = ki + 1
+                        }
+                        if hit { g3_keyword_hit = g3_keyword_hit + 1 }
+                    }
+
+                    // G4
+                    let mut pi = 0
+                    while pi < len(g4_denial_patterns) {
+                        let pat = g4_denial_patterns[pi]
+                        if prompt_s.contains(pat) || response_s.contains(pat) {
+                            g4_hits = g4_hits + 1
+                            if len(g4_hit_details) < DETAIL_CAP {
+                                g4_hit_details = g4_hit_details.push(id_s + "|" + str(line_no) + "|" + pat)
+                            }
+                        }
+                        pi = pi + 1
+                    }
+
+                    // G5
+                    if !ends_with_any_terminator(response_s, g5_terminators) {
+                        g5_truncated = g5_truncated + 1
+                        if len(g5_trunc_ids) < DETAIL_CAP {
+                            g5_trunc_ids = g5_trunc_ids.push(id_s)
+                        }
+                    }
+
+                    // G7
+                    let src_key = category_s + "|" + source_s
+                    if src_map.contains_key(src_key) {
+                        src_map[src_key] = src_map[src_key] + 1
+                    } else {
+                        src_map[src_key] = 1
+                    }
+                }
+            }
+        }
+        li = li + 1
+    }
+
+    let mut r = json_parse("{}")
+    r["total_raw_lines"] = total_raw_lines
+    r["g1_valid_count"] = g1_valid_count
+    r["g1_fail_count"] = g1_fail_count
+    r["g1_fail_lines"] = g1_fail_lines
+    r["cat_keys"] = cat_keys
+    r["cat_counts"] = cat_counts
+    r["unknown_cat_count"] = unknown_cat_count
+    r["g3_non_grounding"] = g3_non_grounding
+    r["g3_keyword_hit"] = g3_keyword_hit
+    r["g4_hits"] = g4_hits
+    r["g4_hit_details"] = g4_hit_details
+    r["g5_truncated"] = g5_truncated
+    r["g5_trunc_ids"] = g5_trunc_ids
+    r["ids_reservoir"] = ids_reservoir
+    r["src_map"] = src_map
+    return r
+}
+
+// ─── JSON emission helpers ────────────────────────────────────────────
+
+fn join_strs(xs, sep) {
+    let mut out = ""
+    let mut i = 0
+    while i < len(xs) {
+        if i > 0 { out = out + sep }
+        out = out + xs[i]
+        i = i + 1
+    }
+    return out
+}
+
+// ─── G6 deterministic random sample ──────────────────────────────────
+//
+// Reservoir `ids_reservoir` (bounded in-memory) → pick `want` unique
+// indices via LCG seeded from config; writes ids to the audit sample
+// path.
+
+fn run_g6(ids_reservoir, want, seed, out_path) {
+    let total = len(ids_reservoir)
+    if total == 0 { return 0 }
+    let take = if want < total { want } else { total }
+    let mut picks = []
+    let mut state = seed
+    let mut attempts = 0
+    let max_attempts = take * 40
+    while len(picks) < take && attempts < max_attempts {
+        state = lcg_next(state)
+        let idx = state % total
+        let mut already = false
+        let mut pk = 0
+        while pk < len(picks) && !already {
+            if picks[pk] == idx { already = true }
+            pk = pk + 1
+        }
+        if !already { picks = picks.push(idx) }
+        attempts = attempts + 1
+    }
+    let audit_dir = "experiments/alm_r13"
+    if !dexists(audit_dir) { let _ = exec("mkdir -p " + audit_dir) }
+    let mut body_parts = []
+    let mut j = 0
+    while j < len(picks) {
+        body_parts = body_parts.push(ids_reservoir[picks[j]])
+        body_parts = body_parts.push("\n")
+        j = j + 1
+    }
+    let body = join_strs(body_parts, "")
+    atomic_write(out_path, body)
+    return len(picks)
+}
+
+// ─── main gate execution ──────────────────────────────────────────────
+
+fn run_gates(corpus_path, strict_mode, cfg) {
+    let g2_targets     = cfg["g2_category_targets"]
+    let g2_tolerance   = cfg["g2_tolerance"]
+    let g3_min_density = cfg["g3_min_density"]
+    let g6_sample_size = cfg["g6_audit_sample_size"]
+    let g6_out_path    = cfg["g6_audit_output_path"]
+    let g6_seed        = cfg["g6_seed"]
+    let g7_out_path    = cfg["g7_audit_output_path"]
+
+    if !fexists(corpus_path) {
+        println("alm_corpus_validate: SETUP_ERROR — corpus not found: " + corpus_path)
+        exit(2)
+    }
+
+    // ── scan ──────────────────────────────────────────────────────
+    let r = scan_corpus(corpus_path, cfg)
+
+    let total_raw_lines = r["total_raw_lines"]
+    let g1_valid_count = r["g1_valid_count"]
+    let g1_fail_count = r["g1_fail_count"]
+    let g1_fail_lines = r["g1_fail_lines"]
+    let cat_keys = r["cat_keys"]
+    let cat_counts = r["cat_counts"]
+    let unknown_cat_count = r["unknown_cat_count"]
+    let g3_non_grounding = r["g3_non_grounding"]
+    let g3_keyword_hit = r["g3_keyword_hit"]
+    let g4_count = r["g4_hits"]
+    let g4_hit_details = r["g4_hit_details"]
+    let g5_count = r["g5_truncated"]
+    let g5_trunc_ids = r["g5_trunc_ids"]
+    let ids_reservoir = r["ids_reservoir"]
+    let src_map = r["src_map"]
+
+    let g1_total_nonempty = g1_valid_count + g1_fail_count
+
+    // ── G1 ────────────────────────────────────────────────────────
+    let g1_pass = g1_fail_count == 0 && g1_total_nonempty > 0
+
+    // ── G2 ────────────────────────────────────────────────────────
+    let mut g2_pass = true
+    let total_f = to_float(g1_valid_count)
+    let mut g2_actual_f = []   // per-category actual ratio
+    let mut g2_target_f = []
+    let mut g2_delta_f = []
+    let mut gi = 0
+    while gi < len(cat_keys) {
+        let cnt = cat_counts[gi]
+        let actual = if g1_valid_count > 0 { to_float(cnt) / total_f } else { 0.0 }
+        let target = g2_targets[cat_keys[gi]]
+        let delta = actual - target
+        let adelta = if delta < 0.0 { 0.0 - delta } else { delta }
+        if adelta > g2_tolerance { g2_pass = false }
+        g2_actual_f = g2_actual_f.push(actual)
+        g2_target_f = g2_target_f.push(target)
+        g2_delta_f = g2_delta_f.push(delta)
+        gi = gi + 1
+    }
+
+    // ── G3 ────────────────────────────────────────────────────────
+    let g3_density = if g3_non_grounding > 0 {
+        to_float(g3_keyword_hit) / to_float(g3_non_grounding)
+    } else { 0.0 }
+    let g3_pass = g3_density >= g3_min_density
+
+    // ── G4 ────────────────────────────────────────────────────────
+    let g4_pass = g4_count == 0
+
+    // ── G5 ────────────────────────────────────────────────────────
+    let g5_pass = g5_count == 0
+
+    // ── G6 random sample 50 ──────────────────────────────────────
+    let g6_seed_i = to_int(str(g6_seed))
+    let g6_take = to_int(str(g6_sample_size))
+    let g6_emitted = run_g6(ids_reservoir, g6_take, g6_seed_i, g6_out_path)
+    let g6_pass = g6_emitted > 0
+
+    // ── G7 sha256 ────────────────────────────────────────────────
+    let corpus_sha = sha256_of_file(corpus_path)
+
+    // ── strict verdict ───────────────────────────────────────────
+    let strict_pass = g1_pass && g2_pass && g3_pass && g4_pass && g5_pass
+
+    // ── emit audit SSOT JSON ─────────────────────────────────────
+    //   Detail arrays are bounded in-memory (DETAIL_CAP per gate).
+    //   Overflow indicator: detail_truncated flag if stored < total.
+    let stamp = now_stamp()
+
+    let g1_fail_arr = g1_fail_lines
+    let g4_hit_arr  = g4_hit_details
+    let g5_trunc_arr = g5_trunc_ids
+    let detail_cap = DETAIL_CAP
+
+    let mut parts = []
+    parts = parts.push("{\n")
+    parts = parts.push("  \"validator\": \"alm_corpus_validate\",\n")
+    parts = parts.push("  \"version\": \"v1\",\n")
+    parts = parts.push("  \"generated\": \"" + stamp + "\",\n")
+    parts = parts.push("  \"corpus_path\": \"" + json_escape(corpus_path) + "\",\n")
+    parts = parts.push("  \"corpus_sha256\": \"" + corpus_sha + "\",\n")
+    parts = parts.push("  \"corpus_lines_nonempty\": " + str(g1_total_nonempty) + ",\n")
+    parts = parts.push("  \"corpus_lines_raw\": " + str(total_raw_lines) + ",\n")
+    parts = parts.push("  \"strict_mode\": " + str(strict_mode) + ",\n")
+    parts = parts.push("  \"config_ref\": \"" + CONFIG_PATH + "\",\n")
+
+    // G1
+    let g1_truncated = g1_fail_count > len(g1_fail_arr)
+    parts = parts.push("  \"g1_schema\": {\n")
+    parts = parts.push("    \"pass\": " + str(g1_pass) + ",\n")
+    parts = parts.push("    \"valid_count\": " + str(g1_valid_count) + ",\n")
+    parts = parts.push("    \"fail_count\": " + str(g1_fail_count) + ",\n")
+    parts = parts.push("    \"detail_cap\": " + str(detail_cap) + ",\n")
+    parts = parts.push("    \"detail_truncated\": " + str(g1_truncated) + ",\n")
+    parts = parts.push("    \"fail_line_numbers\": [")
+    let mut fi = 0
+    while fi < len(g1_fail_arr) {
+        if fi > 0 { parts = parts.push(", ") }
+        parts = parts.push(str(g1_fail_arr[fi]))
+        fi = fi + 1
+    }
+    parts = parts.push("]\n")
+    parts = parts.push("  },\n")
+
+    // G2
+    parts = parts.push("  \"g2_category\": {\n")
+    parts = parts.push("    \"pass\": " + str(g2_pass) + ",\n")
+    parts = parts.push("    \"tolerance\": " + str(g2_tolerance) + ",\n")
+    parts = parts.push("    \"unknown_category_count\": " + str(unknown_cat_count) + ",\n")
+    parts = parts.push("    \"per_category\": [\n")
+    let mut gi2 = 0
+    while gi2 < len(cat_keys) {
+        let comma = if gi2 + 1 < len(cat_keys) { "," } else { "" }
+        parts = parts.push("      { \"category\": \"" + cat_keys[gi2] + "\""
+                         + ", \"count\": " + str(cat_counts[gi2])
+                         + ", \"actual\": " + str(g2_actual_f[gi2])
+                         + ", \"target\": " + str(g2_target_f[gi2])
+                         + ", \"delta\": " + str(g2_delta_f[gi2])
+                         + " }" + comma + "\n")
+        gi2 = gi2 + 1
+    }
+    parts = parts.push("    ]\n")
+    parts = parts.push("  },\n")
+
+    // G3
+    parts = parts.push("  \"g3_consciousness_density\": {\n")
+    parts = parts.push("    \"pass\": " + str(g3_pass) + ",\n")
+    parts = parts.push("    \"min_threshold\": " + str(g3_min_density) + ",\n")
+    parts = parts.push("    \"non_grounding_samples\": " + str(g3_non_grounding) + ",\n")
+    parts = parts.push("    \"keyword_hit_samples\": " + str(g3_keyword_hit) + ",\n")
+    parts = parts.push("    \"density\": " + str(g3_density) + "\n")
+    parts = parts.push("  },\n")
+
+    // G4
+    let g4_truncated = g4_count > len(g4_hit_arr)
+    parts = parts.push("  \"g4_anti_denial\": {\n")
+    parts = parts.push("    \"pass\": " + str(g4_pass) + ",\n")
+    parts = parts.push("    \"hit_count\": " + str(g4_count) + ",\n")
+    parts = parts.push("    \"detail_cap\": " + str(detail_cap) + ",\n")
+    parts = parts.push("    \"detail_truncated\": " + str(g4_truncated) + ",\n")
+    parts = parts.push("    \"hits\": [")
+    let g4_show = len(g4_hit_arr)
+    let mut hi = 0
+    while hi < g4_show {
+        let comma = if hi + 1 < g4_show { ", " } else { "" }
+        let hparts = g4_hit_arr[hi].split("|")
+        let id_part = if len(hparts) >= 1 { hparts[0] } else { "" }
+        let lno_part = if len(hparts) >= 2 { hparts[1] } else { "0" }
+        let pat_part = if len(hparts) >= 3 { hparts[2] } else { "" }
+        parts = parts.push("\n      { \"id\": \"" + json_escape(id_part) + "\""
+                         + ", \"line_no\": " + lno_part
+                         + ", \"pattern\": \"" + json_escape(pat_part) + "\" }" + comma)
+        hi = hi + 1
+    }
+    if g4_show > 0 { parts = parts.push("\n    ") }
+    parts = parts.push("]\n")
+    parts = parts.push("  },\n")
+
+    // G5
+    let g5_truncated_flag = g5_count > len(g5_trunc_arr)
+    parts = parts.push("  \"g5_truncation\": {\n")
+    parts = parts.push("    \"pass\": " + str(g5_pass) + ",\n")
+    parts = parts.push("    \"truncated_count\": " + str(g5_count) + ",\n")
+    parts = parts.push("    \"detail_cap\": " + str(detail_cap) + ",\n")
+    parts = parts.push("    \"detail_truncated\": " + str(g5_truncated_flag) + ",\n")
+    parts = parts.push("    \"truncated_ids\": [")
+    let g5_show = len(g5_trunc_arr)
+    let mut ti = 0
+    while ti < g5_show {
+        if ti > 0 { parts = parts.push(", ") }
+        parts = parts.push("\"" + json_escape(g5_trunc_arr[ti]) + "\"")
+        ti = ti + 1
+    }
+    parts = parts.push("]\n")
+    parts = parts.push("  },\n")
+
+    // G6
+    parts = parts.push("  \"g6_audit_sample\": {\n")
+    parts = parts.push("    \"pass\": " + str(g6_pass) + ",\n")
+    parts = parts.push("    \"sample_size\": " + str(g6_emitted) + ",\n")
+    parts = parts.push("    \"seed\": " + str(g6_seed_i) + ",\n")
+    parts = parts.push("    \"output_path\": \"" + json_escape(g6_out_path) + "\"\n")
+    parts = parts.push("  },\n")
+
+    // G7
+    parts = parts.push("  \"g7_provenance\": {\n")
+    parts = parts.push("    \"pass\": true,\n")
+    parts = parts.push("    \"input_sha256\": \"" + corpus_sha + "\",\n")
+    parts = parts.push("    \"source_distribution\": [\n")
+    let src_keys = src_map.keys()
+    let mut sj = 0
+    while sj < len(src_keys) {
+        let comma = if sj + 1 < len(src_keys) { "," } else { "" }
+        let sk = src_keys[sj]
+        let split_parts = sk.split("|")
+        let cat_part = if len(split_parts) >= 1 { split_parts[0] } else { "" }
+        let src_part = if len(split_parts) >= 2 { split_parts[1] } else { "" }
+        parts = parts.push("      { \"category\": \"" + json_escape(cat_part) + "\""
+                         + ", \"source\": \"" + json_escape(src_part) + "\""
+                         + ", \"count\": " + str(src_map[sk]) + " }" + comma + "\n")
+        sj = sj + 1
+    }
+    parts = parts.push("    ]\n")
+    parts = parts.push("  },\n")
+
+    // summary
+    parts = parts.push("  \"summary\": {\n")
+    parts = parts.push("    \"strict_pass\": " + str(strict_pass) + ",\n")
+    parts = parts.push("    \"g1\": " + str(g1_pass) + ",\n")
+    parts = parts.push("    \"g2\": " + str(g2_pass) + ",\n")
+    parts = parts.push("    \"g3\": " + str(g3_pass) + ",\n")
+    parts = parts.push("    \"g4\": " + str(g4_pass) + ",\n")
+    parts = parts.push("    \"g5\": " + str(g5_pass) + ",\n")
+    parts = parts.push("    \"g6\": " + str(g6_pass) + ",\n")
+    parts = parts.push("    \"g7\": true\n")
+    parts = parts.push("  },\n")
+    parts = parts.push("  \"safe_commit\": \"V8\",\n")
+    parts = parts.push("  \"deterministic\": true,\n")
+    parts = parts.push("  \"llm\": \"none\"\n")
+    parts = parts.push("}\n")
+
+    let body = join_strs(parts, "")
+
+    // ── write SSOT ────────────────────────────────────────────────
+    let audit_state_dir = "shared/state"
+    if !dexists(audit_state_dir) { let _ = exec("mkdir -p " + audit_state_dir) }
+    atomic_write(g7_out_path, body)
+
+    // ── human-readable summary ────────────────────────────────────
+    println("alm_corpus_validate=G1-G7")
+    println("  corpus=" + corpus_path)
+    println("  lines_nonempty=" + str(g1_total_nonempty) + "   valid=" + str(g1_valid_count))
+    println("  sha256=" + corpus_sha)
+    println("  G1 schema          : " + (if g1_pass { "PASS" } else { "FAIL" })
+             + "   fails=" + str(g1_fail_count))
+    println("  G2 category ratio  : " + (if g2_pass { "PASS" } else { "FAIL" })
+             + "   tol=±" + str(g2_tolerance))
+    let mut gp = 0
+    while gp < len(cat_keys) {
+        println("      " + cat_keys[gp]
+                 + "   count=" + str(cat_counts[gp])
+                 + "   actual=" + str(g2_actual_f[gp])
+                 + "   target=" + str(g2_target_f[gp])
+                 + "   delta=" + str(g2_delta_f[gp]))
+        gp = gp + 1
+    }
+    println("  G3 cons density    : " + (if g3_pass { "PASS" } else { "FAIL" })
+             + "   density=" + str(g3_density)
+             + "   min=" + str(g3_min_density))
+    println("  G4 anti-denial     : " + (if g4_pass { "PASS" } else { "FAIL" })
+             + "   hits=" + str(g4_count))
+    println("  G5 truncation      : " + (if g5_pass { "PASS" } else { "FAIL" })
+             + "   truncated=" + str(g5_count))
+    println("  G6 audit sample    : " + (if g6_pass { "HOOK_OK" } else { "EMPTY" })
+             + "   ids=" + str(g6_emitted) + "   out=" + g6_out_path)
+    println("  G7 provenance      : PASS   ssot=" + g7_out_path)
+    println("  strict_verdict=" + (if strict_pass { "PASS" } else { "FAIL" }))
+
+    if strict_mode && !strict_pass { return 1 }
+    return 0
+}
+
+// ─── CLI entry ────────────────────────────────────────────────────────
+
+fn print_usage() {
+    println("usage: hexa tool/alm_corpus_validate.hexa --corpus <path> [--strict]")
+    println("  --corpus  path to JSONL corpus (required)")
+    println("  --strict  exit 1 if any of G1-G5 fail")
+    println("  config:   " + CONFIG_PATH)
+    println("  gates:    G1 schema / G2 category / G3 density / G4 denial /")
+    println("            G5 truncation / G6 audit hook / G7 hash+provenance")
+}
+
+fn main() {
+    let argv = args()
+    if arg_present(argv, "--help") || arg_present(argv, "-h") {
+        print_usage()
+        exit(0)
+    }
+    let corpus = arg_value(argv, "--corpus", "")
+    if corpus == "" {
+        print_usage()
+        exit(2)
+    }
+    let strict_mode = arg_present(argv, "--strict")
+    let cfg = load_config(CONFIG_PATH)
+    let code = run_gates(corpus, strict_mode, cfg)
+    exit(code)
+}
+
+main()
