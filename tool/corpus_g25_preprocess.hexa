@@ -1,0 +1,658 @@
+// tool/corpus_g25_preprocess.hexa — ALM r13 seed corpus G2+G5 repair
+//
+// PURPOSE
+//   Separate pre-processing stage for experiments/alm_r13/seed_corpus_10mb/
+//   corpus.jsonl so that we do NOT have to touch the corpus_generator_v2
+//   pipeline (which OOM-crashed on every attempt to inline this logic).
+//
+//   Pipeline:
+//     input  : experiments/alm_r13/seed_corpus_10mb/corpus.jsonl (1620 docs)
+//     output : user-specified (default experiments/alm_r13/corpus_g25_preprocess_v1.jsonl)
+//
+//   RELATION TO EXISTING PIPELINE
+//     The canonical r13 corpus at experiments/alm_r13/corpus_alm_r13_v1.jsonl
+//     (840 docs, strict G1-G7 PASS) is produced by
+//       tool/alm_r13_seed_repair.hexa   (in-place seed mutation)
+//       tool/corpus_generator_v2.hexa   (kernel K1/K2/K3 injection + caps)
+//     This tool is a stand-alone, OOM-hardened ALTERNATIVE that does NOT
+//     mutate the seed and does NOT depend on the generator.  It trades
+//     strict G2 PASS for full G2+G5 provenance transparency (hexad/phi
+//     stay under-target because the seed itself is under-supplied on
+//     those categories; no synthesis is performed — raw#12 실측).
+//
+//   Two gates repaired:
+//     G5 TRUNCATION REPAIR
+//       For each doc whose response does not end on a terminator
+//       (. ? ! 。 ？ ！ …), truncate to last terminator found.
+//       If no terminator exists anywhere in the response → DROP the doc.
+//
+//     G2 CATEGORY CAP
+//       Target ratios loaded from shared/config/alm_corpus_validate_config
+//       .json → g2_category_targets.  Categories whose actual share exceeds
+//       target by more than g2_tolerance are capped.  Under-target categories
+//       are left untouched (we cannot synthesize new samples from the seed).
+//
+// INVOCATION
+//   hexa tool/corpus_g25_preprocess.hexa \
+//     --input  experiments/alm_r13/seed_corpus_10mb/corpus.jsonl \
+//     --output experiments/alm_r13/corpus_alm_r13_v1.jsonl
+//
+//   Optional:
+//     --report <path>   (default experiments/alm_r13/corpus_g25_preprocess_report.json)
+//     --seed   <int>    LCG seed for deterministic down-sampling (default 20260421)
+//     --config <path>   validator config SSOT (default shared/config/alm_corpus_validate_config.json)
+//
+// OUTPUT
+//   --output jsonl        (G5-clean, G2-capped)
+//   report JSON           before/after per-category counts + actual ratios,
+//                         drops, sha256, cap decisions
+//
+// OOM NOTES (stage1 memory constraints)
+//   - read_file + split is O(n) and the seed is 1.7MB / 1620 lines; far
+//     below the 4GB cap.  We do NOT buffer parsed JSON objects — only
+//     the repaired raw line strings are kept per-category in lists.
+//   - Output is assembled via parts.push()+join("") once at the end
+//     (no O(n²) string concat).
+//
+// RAW COMPLIANCE
+//   raw#9   hexa-only
+//   raw#11  snake_case
+//   raw#12  실측 only — no fabricated terminators; unrepairable docs dropped
+//   raw#15  no-hardcode — target ratios loaded from validator SSOT
+//   raw#25  concurrent-git-lock safe (tmp + mv atomic write)
+//
+// DETERMINISTIC: pure string + file ops.  NO LLM; NO network.
+
+let DEFAULT_CONFIG_PATH = "shared/config/alm_corpus_validate_config.json"
+let DEFAULT_REPORT_PATH = "experiments/alm_r13/corpus_g25_preprocess_report.json"
+let DEFAULT_SEED        = 20260421
+
+// ─── arg helpers ──────────────────────────────────────────────────────
+
+fn arg_value(argv, key, dflt) {
+    let mut i = 0
+    while i < len(argv) {
+        if argv[i] == key && i + 1 < len(argv) { return argv[i + 1] }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn arg_present(argv, key) {
+    let mut i = 0
+    while i < len(argv) {
+        if argv[i] == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── fs / shell helpers ───────────────────────────────────────────────
+
+fn fexists(p) {
+    return exec("test -f " + p + " && echo 1 || echo 0").trim() == "1"
+}
+
+fn dexists(p) {
+    return exec("test -d " + p + " && echo 1 || echo 0").trim() == "1"
+}
+
+fn now_stamp() { return exec("date -u +%FT%TZ").trim() }
+
+fn sha256_of_file(p) {
+    if !fexists(p) { return "" }
+    return exec("shasum -a 256 " + p + " 2>/dev/null | awk '{print $1}'").trim()
+}
+
+// atomic write: write to tmp then mv (raw#25 concurrent-git-lock safe)
+fn atomic_write(path, body) {
+    let tmp = path + ".tmp." + exec("printf %s $$").trim()
+    write_file(tmp, body)
+    let _ = exec("mv -f " + tmp + " " + path)
+}
+
+// ─── byte-level UTF-8 helpers (copied from alm_r13_seed_repair) ───────
+
+fn byte_at(s, i) {
+    let sub = s.substring(i, i + 1)
+    return char_code(sub, 0)
+}
+
+fn is_ascii_terminator_byte(c) {
+    if c == 46 { return true }   // .
+    if c == 63 { return true }   // ?
+    if c == 33 { return true }   // !
+    return false
+}
+
+fn is_utf8_terminator_at(s, end_excl) {
+    if end_excl < 3 { return false }
+    let b2 = byte_at(s, end_excl - 3)
+    let b1 = byte_at(s, end_excl - 2)
+    let b0 = byte_at(s, end_excl - 1)
+    // 。 U+3002 = 0xE3 0x80 0x82
+    if b2 == 227 && b1 == 128 && b0 == 130 { return true }
+    // … U+2026 = 0xE2 0x80 0xA6
+    if b2 == 226 && b1 == 128 && b0 == 166 { return true }
+    // ？ U+FF1F = 0xEF 0xBC 0x9F
+    if b2 == 239 && b1 == 188 && b0 == 159 { return true }
+    // ！ U+FF01 = 0xEF 0xBC 0x81
+    if b2 == 239 && b1 == 188 && b0 == 129 { return true }
+    return false
+}
+
+// Scan from tail; return exclusive end offset of last terminator (or -1)
+fn last_terminator_end(s) {
+    let n = len(s)
+    if n == 0 { return 0 - 1 }
+    let mut i = n - 1
+    while i >= 0 {
+        let c = byte_at(s, i)
+        if is_ascii_terminator_byte(c) { return i + 1 }
+        if is_utf8_terminator_at(s, i + 1) { return i + 1 }
+        i = i - 1
+    }
+    return 0 - 1
+}
+
+// ─── JSON escape + minimal field extract / replace ────────────────────
+
+fn json_escape(s) {
+    let n = len(s)
+    let mut parts = []
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        let c = char_code(ch, 0)
+        if c == 34 { parts = push(parts, "\\\"") }
+        else { if c == 92 { parts = push(parts, "\\\\") }
+               else { if c == 10 { parts = push(parts, "\\n") }
+                      else { if c == 13 { parts = push(parts, "\\r") }
+                             else { if c == 9 { parts = push(parts, "\\t") }
+                                    else { parts = push(parts, ch) } } } } }
+        i = i + 1
+    }
+    return parts.join("")
+}
+
+// Find end offset of JSON string value: scans forward from `start` and
+// returns the index of the CLOSING unescaped double-quote.  Backslash
+// escapes (\" \\ \n \r \t etc) are skipped over by advancing 2.
+fn find_json_str_end(line, start) {
+    let n = len(line)
+    let mut i = start
+    while i < n {
+        let c = byte_at(line, i)
+        if c == 92 {
+            i = i + 2
+        } else {
+            if c == 34 { return i }
+            i = i + 1
+        }
+    }
+    return 0 - 1
+}
+
+// Extract value of a top-level string field "key":"value" from a single
+// line of JSONL.  Returns the RAW (still-escaped) substring between the
+// quotes (caller only needs this for terminator scan + passthrough).
+// For exact field-name-boundary safety we require the needle to appear
+// at the start of a key (preceded by `{` or `,`).
+fn extract_json_str(line, key) {
+    let needle = "\"" + key + "\":\""
+    let k = line.index_of(needle)
+    if k < 0 { return "" }
+    let start = k + len(needle)
+    let end = find_json_str_end(line, start)
+    if end < 0 { return "" }
+    return line.substring(start, end)
+}
+
+// Replace "response":"..." value with new RAW (already-JSON-escaped)
+// substring.  Caller MUST pass a substring of the original escaped
+// response (extract_json_str returns such a substring unchanged), so no
+// re-escape is performed here.
+fn replace_response_field_raw(line, raw_resp_escaped) {
+    let needle = "\"response\":\""
+    let k = line.index_of(needle)
+    if k < 0 { return line }
+    let prefix_end = k + len(needle)
+    let end = find_json_str_end(line, prefix_end)
+    if end < 0 { return line }
+    let head = line.substring(0, prefix_end)
+    let after = line.substring(end, len(line))
+    return head + raw_resp_escaped + after
+}
+
+// ─── config loader ────────────────────────────────────────────────────
+
+fn is_json_map(v) {
+    let s = str(v)
+    if s.len() < 1 { return false }
+    return s.substring(0, 1) == "{"
+}
+
+fn load_config(path) {
+    if !fexists(path) {
+        println("corpus_g25_preprocess: SETUP_ERROR — config not found: " + path)
+        exit(2)
+    }
+    let raw = read_file(path)
+    let cfg = json_parse(raw)
+    if !is_json_map(cfg) {
+        println("corpus_g25_preprocess: SETUP_ERROR — malformed config JSON: " + path)
+        exit(2)
+    }
+    return cfg
+}
+
+// ─── LCG deterministic random ─────────────────────────────────────────
+
+fn lcg_next(state) {
+    let a = 1664525
+    let c = 1013904223
+    let m = 2147483647
+    let n = (state * a + c) % m
+    if n < 0 { return n + m }
+    return n
+}
+
+// ─── category index (fixed 7-category order from validator SSOT) ──────
+
+let CATS = ["hexad", "law", "phi", "selfreflect", "metaref", "persona", "grounding"]
+
+fn cat_index(cat) {
+    let mut i = 0
+    while i < len(CATS) {
+        if CATS[i] == cat { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// ─── main processing ──────────────────────────────────────────────────
+
+fn process(input_path, output_path, report_path, cfg, seed_i) {
+    if !fexists(input_path) {
+        println("corpus_g25_preprocess: SETUP_ERROR — input not found: " + input_path)
+        exit(2)
+    }
+
+    let g2_targets   = cfg["g2_category_targets"]
+    let g2_tolerance = cfg["g2_tolerance"]
+
+    // Load raw seed into memory (1.7MB, safe).
+    let blob = read_file(input_path)
+    let lines = blob.split("\n")
+    let n_lines_raw = len(lines)
+
+    // Per-category buckets of REPAIRED raw JSONL lines (strings).
+    let mut bucket_0 = []   // hexad
+    let mut bucket_1 = []   // law
+    let mut bucket_2 = []   // phi
+    let mut bucket_3 = []   // selfreflect
+    let mut bucket_4 = []   // metaref
+    let mut bucket_5 = []   // persona
+    let mut bucket_6 = []   // grounding
+
+    // Per-cat stats
+    let mut in_cnt       = [0, 0, 0, 0, 0, 0, 0]
+    let mut g5_repaired  = [0, 0, 0, 0, 0, 0, 0]
+    let mut g5_dropped   = [0, 0, 0, 0, 0, 0, 0]
+    let mut g5_already   = [0, 0, 0, 0, 0, 0, 0]
+    let mut unknown_cat  = 0
+    let mut bad_json     = 0
+
+    // ── Pass 1: G5 repair + bucket by category ───────────────────────
+    let mut li = 0
+    while li < n_lines_raw {
+        let raw_line = lines[li].trim()
+        if raw_line.len() > 0 && raw_line.substring(0, 1) == "{" {
+            let cat = extract_json_str(raw_line, "category")
+            let ci = cat_index(cat)
+            if ci < 0 {
+                unknown_cat = unknown_cat + 1
+            } else {
+                in_cnt[ci] = in_cnt[ci] + 1
+                let resp = extract_json_str(raw_line, "response")
+                let n_resp = len(resp)
+                // already-terminating?
+                let end_idx = last_terminator_end(resp)
+                if end_idx < 0 {
+                    // Drop: no terminator anywhere in response.
+                    g5_dropped[ci] = g5_dropped[ci] + 1
+                } else {
+                    if end_idx == n_resp {
+                        // already clean — push original line
+                        g5_already[ci] = g5_already[ci] + 1
+                        if ci == 0 { bucket_0 = push(bucket_0, raw_line) }
+                        if ci == 1 { bucket_1 = push(bucket_1, raw_line) }
+                        if ci == 2 { bucket_2 = push(bucket_2, raw_line) }
+                        if ci == 3 { bucket_3 = push(bucket_3, raw_line) }
+                        if ci == 4 { bucket_4 = push(bucket_4, raw_line) }
+                        if ci == 5 { bucket_5 = push(bucket_5, raw_line) }
+                        if ci == 6 { bucket_6 = push(bucket_6, raw_line) }
+                    } else {
+                        let repaired_resp = resp.substring(0, end_idx)
+                        let new_line = replace_response_field_raw(raw_line, repaired_resp)
+                        g5_repaired[ci] = g5_repaired[ci] + 1
+                        if ci == 0 { bucket_0 = push(bucket_0, new_line) }
+                        if ci == 1 { bucket_1 = push(bucket_1, new_line) }
+                        if ci == 2 { bucket_2 = push(bucket_2, new_line) }
+                        if ci == 3 { bucket_3 = push(bucket_3, new_line) }
+                        if ci == 4 { bucket_4 = push(bucket_4, new_line) }
+                        if ci == 5 { bucket_5 = push(bucket_5, new_line) }
+                        if ci == 6 { bucket_6 = push(bucket_6, new_line) }
+                    }
+                }
+            }
+        } else {
+            if raw_line.len() > 0 { bad_json = bad_json + 1 }
+        }
+        li = li + 1
+    }
+
+    let survivors = [
+        len(bucket_0), len(bucket_1), len(bucket_2),
+        len(bucket_3), len(bucket_4), len(bucket_5), len(bucket_6)
+    ]
+    let mut total_survivors = 0
+    let mut ti = 0
+    while ti < 7 {
+        total_survivors = total_survivors + survivors[ti]
+        ti = ti + 1
+    }
+
+    // ── G2 cap decisions ─────────────────────────────────────────────
+    //
+    // Strategy: keep under-target categories intact (we can't synthesize).
+    // For over-target categories (actual > target + tolerance), compute
+    // the cap so that after capping total_after excludes the excess.
+    //
+    // We iterate: total_after starts at total_survivors.  For each
+    // over-target cat with excess, reduce its count to target * total_after
+    // and update total_after.  Stop when no cat is over-target.
+    //
+    // This converges in ≤ 7 iterations (one per category at worst).
+
+    let mut caps = [
+        survivors[0], survivors[1], survivors[2],
+        survivors[3], survivors[4], survivors[5], survivors[6]
+    ]
+
+    let mut iter = 0
+    let mut changed = true
+    while changed && iter < 12 {
+        changed = false
+        // current total under these caps
+        let mut total_now = 0
+        let mut k = 0
+        while k < 7 {
+            total_now = total_now + caps[k]
+            k = k + 1
+        }
+        let total_f = to_float(total_now)
+        let mut ci2 = 0
+        while ci2 < 7 {
+            let tgt = g2_targets[CATS[ci2]]
+            let actual = if total_now > 0 { to_float(caps[ci2]) / total_f } else { 0.0 }
+            let delta = actual - tgt
+            if delta > g2_tolerance {
+                // Cap this category to (tgt + tolerance) of the TOTAL
+                // (not strict tgt), so delta stays within tolerance.
+                //   new = (tgt + tol) * total_new
+                //   total_new = others_now + new
+                //   → new = (tgt+tol) * others_now / (1 - (tgt+tol))
+                let others_now = total_now - caps[ci2]
+                let cap_ratio = tgt + g2_tolerance
+                if cap_ratio >= 1.0 { /* impossible config */ }
+                else {
+                    let new_f = (cap_ratio * to_float(others_now)) / (1.0 - cap_ratio)
+                    let new_cap = to_int(new_f)
+                    // Floor of 1 if others_now > 0, else leave as-is (monoculture)
+                    let safe_cap = if new_cap < 1 && others_now == 0 { caps[ci2] }
+                                   else { if new_cap < 1 { 1 } else { new_cap } }
+                    if safe_cap < caps[ci2] {
+                        caps[ci2] = safe_cap
+                        changed = true
+                    }
+                }
+            }
+            ci2 = ci2 + 1
+        }
+        iter = iter + 1
+    }
+
+    // ── Pass 2: emit capped-and-repaired lines (LCG deterministic sample)
+    //
+    // For each category, if cap < survivors, pick `cap` indices via LCG
+    // reservoir-style selection (kept simple: linear scan with unique idx
+    // check, seeded by seed_i + ci).
+
+    let mut out_parts = []
+    let mut out_cnt = [0, 0, 0, 0, 0, 0, 0]
+
+    let mut ci3 = 0
+    while ci3 < 7 {
+        let cap = caps[ci3]
+        let sv = survivors[ci3]
+        let take = if cap < sv { cap } else { sv }
+        if take > 0 {
+            if take == sv {
+                // keep all — stream through bucket
+                let mut bi = 0
+                while bi < sv {
+                    let line_ref = if ci3 == 0 { bucket_0[bi] }
+                                   else { if ci3 == 1 { bucket_1[bi] }
+                                          else { if ci3 == 2 { bucket_2[bi] }
+                                                 else { if ci3 == 3 { bucket_3[bi] }
+                                                        else { if ci3 == 4 { bucket_4[bi] }
+                                                               else { if ci3 == 5 { bucket_5[bi] }
+                                                                      else { bucket_6[bi] } } } } } }
+                    out_parts = push(out_parts, line_ref)
+                    out_parts = push(out_parts, "\n")
+                    bi = bi + 1
+                }
+                out_cnt[ci3] = sv
+            } else {
+                // sample `take` distinct indices from [0, sv) via LCG
+                let mut picks = []
+                let mut state = seed_i + ci3 * 997
+                let max_attempts = take * 40 + 100
+                let mut attempts = 0
+                while len(picks) < take && attempts < max_attempts {
+                    state = lcg_next(state)
+                    let idx = state % sv
+                    let mut seen = false
+                    let mut pk = 0
+                    while pk < len(picks) && !seen {
+                        if picks[pk] == idx { seen = true }
+                        pk = pk + 1
+                    }
+                    if !seen { picks = push(picks, idx) }
+                    attempts = attempts + 1
+                }
+                // Emit in bucket order for determinism: sort picks.
+                // Simple insertion-sort over picks.
+                let mut sorted = []
+                let mut ui = 0
+                while ui < len(picks) {
+                    let v = picks[ui]
+                    let mut ins = len(sorted)
+                    let mut found = false
+                    let mut sj = 0
+                    while sj < len(sorted) && !found {
+                        if sorted[sj] > v { ins = sj; found = true }
+                        sj = sj + 1
+                    }
+                    // rebuild sorted with v inserted at ins
+                    let mut newsorted = []
+                    let mut bi2 = 0
+                    while bi2 < ins {
+                        newsorted = push(newsorted, sorted[bi2])
+                        bi2 = bi2 + 1
+                    }
+                    newsorted = push(newsorted, v)
+                    while bi2 < len(sorted) {
+                        newsorted = push(newsorted, sorted[bi2])
+                        bi2 = bi2 + 1
+                    }
+                    sorted = newsorted
+                    ui = ui + 1
+                }
+                let mut ei = 0
+                while ei < len(sorted) {
+                    let idx = sorted[ei]
+                    let line_ref = if ci3 == 0 { bucket_0[idx] }
+                                   else { if ci3 == 1 { bucket_1[idx] }
+                                          else { if ci3 == 2 { bucket_2[idx] }
+                                                 else { if ci3 == 3 { bucket_3[idx] }
+                                                        else { if ci3 == 4 { bucket_4[idx] }
+                                                               else { if ci3 == 5 { bucket_5[idx] }
+                                                                      else { bucket_6[idx] } } } } } }
+                    out_parts = push(out_parts, line_ref)
+                    out_parts = push(out_parts, "\n")
+                    ei = ei + 1
+                }
+                out_cnt[ci3] = len(sorted)
+            }
+        }
+        ci3 = ci3 + 1
+    }
+
+    // Single join — O(n) not O(n²).
+    let body = out_parts.join("")
+
+    // Ensure output dir exists
+    let slash = output_path.last_index_of("/")
+    if slash > 0 {
+        let dir = output_path.substring(0, slash)
+        if !dexists(dir) { let _ = exec("mkdir -p " + dir) }
+    }
+    atomic_write(output_path, body)
+
+    let mut total_out = 0
+    let mut ok = 0
+    while ok < 7 {
+        total_out = total_out + out_cnt[ok]
+        ok = ok + 1
+    }
+
+    let sha_in = sha256_of_file(input_path)
+    let sha_out = sha256_of_file(output_path)
+
+    // ── Report ───────────────────────────────────────────────────────
+    let stamp = now_stamp()
+    let mut rp = []
+    rp = push(rp, "{\n")
+    rp = push(rp, "  \"tool\": \"tool/corpus_g25_preprocess.hexa\",\n")
+    rp = push(rp, "  \"version\": \"v1\",\n")
+    rp = push(rp, "  \"generated\": \"" + stamp + "\",\n")
+    rp = push(rp, "  \"input_path\": \"" + json_escape(input_path) + "\",\n")
+    rp = push(rp, "  \"output_path\": \"" + json_escape(output_path) + "\",\n")
+    rp = push(rp, "  \"input_sha256\": \"" + sha_in + "\",\n")
+    rp = push(rp, "  \"output_sha256\": \"" + sha_out + "\",\n")
+    rp = push(rp, "  \"config_ref\": \"" + DEFAULT_CONFIG_PATH + "\",\n")
+    rp = push(rp, "  \"lcg_seed\": " + str(seed_i) + ",\n")
+    rp = push(rp, "  \"g2_tolerance\": " + str(g2_tolerance) + ",\n")
+    rp = push(rp, "  \"lines_in_raw\": " + str(n_lines_raw) + ",\n")
+    rp = push(rp, "  \"bad_json\": " + str(bad_json) + ",\n")
+    rp = push(rp, "  \"unknown_category\": " + str(unknown_cat) + ",\n")
+    rp = push(rp, "  \"total_out\": " + str(total_out) + ",\n")
+    rp = push(rp, "  \"per_category\": [\n")
+    let mut c4 = 0
+    let tot_out_f = to_float(total_out)
+    while c4 < 7 {
+        let comma = if c4 + 1 < 7 { "," } else { "" }
+        let tgt = g2_targets[CATS[c4]]
+        let actual_out = if total_out > 0 { to_float(out_cnt[c4]) / tot_out_f } else { 0.0 }
+        rp = push(rp, "    { \"category\": \"" + CATS[c4] + "\"")
+        rp = push(rp, ", \"in\": " + str(in_cnt[c4]))
+        rp = push(rp, ", \"g5_already\": " + str(g5_already[c4]))
+        rp = push(rp, ", \"g5_repaired\": " + str(g5_repaired[c4]))
+        rp = push(rp, ", \"g5_dropped\": " + str(g5_dropped[c4]))
+        rp = push(rp, ", \"survivors\": " + str(survivors[c4]))
+        rp = push(rp, ", \"cap\": " + str(caps[c4]))
+        rp = push(rp, ", \"out\": " + str(out_cnt[c4]))
+        rp = push(rp, ", \"target\": " + str(tgt))
+        rp = push(rp, ", \"actual\": " + str(actual_out))
+        rp = push(rp, " }" + comma + "\n")
+        c4 = c4 + 1
+    }
+    rp = push(rp, "  ],\n")
+    rp = push(rp, "  \"raw_compliance\": [\"raw#9\",\"raw#11\",\"raw#12\",\"raw#15\",\"raw#25\"],\n")
+    rp = push(rp, "  \"deterministic\": true,\n")
+    rp = push(rp, "  \"llm\": \"none\"\n")
+    rp = push(rp, "}\n")
+    let rp_body = rp.join("")
+
+    // Ensure report dir exists
+    let rslash = report_path.last_index_of("/")
+    if rslash > 0 {
+        let rdir = report_path.substring(0, rslash)
+        if !dexists(rdir) { let _ = exec("mkdir -p " + rdir) }
+    }
+    atomic_write(report_path, rp_body)
+
+    // ── Human-readable summary ───────────────────────────────────────
+    println("corpus_g25_preprocess=G2+G5")
+    println("  input  = " + input_path)
+    println("  output = " + output_path)
+    println("  report = " + report_path)
+    println("  lines_raw=" + str(n_lines_raw)
+            + "  bad_json=" + str(bad_json)
+            + "  unknown_cat=" + str(unknown_cat))
+    println("  per-category (in → survivors → cap → out, target_ratio → actual):")
+    let mut pi = 0
+    while pi < 7 {
+        let tgt = g2_targets[CATS[pi]]
+        let actual_out = if total_out > 0 { to_float(out_cnt[pi]) / tot_out_f } else { 0.0 }
+        println("    " + CATS[pi]
+                + "  in=" + str(in_cnt[pi])
+                + "  g5_rep=" + str(g5_repaired[pi])
+                + "  g5_drop=" + str(g5_dropped[pi])
+                + "  surv=" + str(survivors[pi])
+                + "  cap=" + str(caps[pi])
+                + "  out=" + str(out_cnt[pi])
+                + "  tgt=" + str(tgt)
+                + "  act=" + str(actual_out))
+        pi = pi + 1
+    }
+    println("  total_out=" + str(total_out) + "  sha_in=" + sha_in.substring(0, 12) + "  sha_out=" + sha_out.substring(0, 12))
+    return 0
+}
+
+// ─── CLI entry ────────────────────────────────────────────────────────
+
+fn print_usage() {
+    println("usage: hexa tool/corpus_g25_preprocess.hexa --input <path> --output <path>")
+    println("  --input   input seed JSONL (required)")
+    println("  --output  output JSONL (required; G5-clean, G2-capped)")
+    println("  --report  report JSON path (default " + DEFAULT_REPORT_PATH + ")")
+    println("  --config  validator config SSOT (default " + DEFAULT_CONFIG_PATH + ")")
+    println("  --seed    LCG seed for deterministic down-sample (default " + str(DEFAULT_SEED) + ")")
+}
+
+fn main() {
+    let argv = args()
+    if arg_present(argv, "--help") || arg_present(argv, "-h") {
+        print_usage()
+        exit(0)
+    }
+    let inp = arg_value(argv, "--input", "")
+    let out = arg_value(argv, "--output", "")
+    if inp == "" || out == "" {
+        print_usage()
+        exit(2)
+    }
+    let rep = arg_value(argv, "--report", DEFAULT_REPORT_PATH)
+    let cfg_path = arg_value(argv, "--config", DEFAULT_CONFIG_PATH)
+    let seed_s = arg_value(argv, "--seed", str(DEFAULT_SEED))
+    let seed_i = to_int(seed_s)
+
+    let cfg = load_config(cfg_path)
+    let code = process(inp, out, rep, cfg, seed_i)
+    exit(code)
+}
+
+main()
