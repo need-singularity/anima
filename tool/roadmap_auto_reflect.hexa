@@ -1,0 +1,678 @@
+// tool/roadmap_auto_reflect.hexa — audit report → .roadmap auto-reflection
+//
+// PURPOSE
+//   Take an audit report (β coverage / lint / integrity) and propose new
+//   planned entries in .roadmap for every gap (file not yet covered by a
+//   roadmap entry). Keeps the two feedback loops — audit and roadmap —
+//   aligned so that drift cannot accumulate silently.
+//
+// MODES
+//   --dry-run   (default) parse audit, compute gaps, print proposals,
+//               do NOT modify .roadmap or anything else. Always safe.
+//   --apply     mutate .roadmap in-place: chflags nouchg (if locked),
+//               append new entries atomically, chflags uchg (re-lock
+//               only if it was locked before), run roadmap_lint.
+//   --commit    after --apply, stage .roadmap and create a single
+//               `feat(tool): roadmap_auto_reflect — ...` commit.
+//               (Implies --apply.) Never pushes.
+//
+// INPUT (auto-detected by extension)
+//   --audit-report <path>  accepts:
+//     .json  — {"gaps":[{"file":"...","category":"...",
+//                        "coverage_pct":<num>,"reason":"..."}]}
+//     .md    — task 42 style markdown with a pipe-separated gap table.
+//
+// GAP → roadmap entry mapping
+//   track = inferred from category (β | corpus | lora | verifier | edu |
+//           cell | bridge | hexad | bench | serving | ops) — fallback ops
+//   phase = ops
+//   eta   = today + 14d (raw#14 7-day default ×2 for aux batch)
+//   why   = "auto-reflected from <audit_date>: <reason>"
+//   exit_criteria = "<file> coverage = 100% (parse + smoke + verdict SSOT)"
+//
+// INVARIANTS
+//   - V8 SAFE by default: --dry-run only touches stdout + log JSON.
+//   - raw#9 : hexa-only, no .py / .sh / .js shell scripts.
+//   - raw#11: snake_case file paths.
+//   - raw#15: atomic file write via write_file once, no redirection.
+//   - raw#1 : anima/.roadmap is NOT chflags-locked in this project, but
+//             the ceremony is still executed (stat check → nouchg → write
+//             → uchg iff observed beforehand). hexa-lang/.roadmap would
+//             require the same ceremony and is supported.
+//   - Never overwrites an existing roadmap entry. Existence is keyed on
+//     the file path substring inside an `exit_criteria` or entry title.
+//   - Never skips git hooks or signs on behalf of the user.
+//
+// OUTPUT
+//   shared/state/roadmap_auto_reflect_log.json  (append-mode JSONL)
+//     {"ts":"...","mode":"dry-run","audit":"...",
+//      "gaps_total":N,"gaps_new":K,"gaps_existing":N-K,
+//      "proposals":[{"id":..,"title":..,"track":..,"file":..}]}
+//
+// EXIT CODES
+//   0  run completed (proposals printed / applied cleanly)
+//   1  usage error (missing --audit-report, bad flags)
+//   2  audit report unreadable / malformed
+//   3  roadmap_lint failed after --apply (rollback NOT attempted here;
+//      the pre-apply content is saved to .roadmap.bak.<ts>-auto-reflect)
+//   4  chflags ceremony failure (unlock or re-lock failed)
+
+// ─── arg helpers (same idiom as alm_corpus_validate.hexa) ─────────────
+
+fn arg_value(argv, key, dflt) {
+    let mut i = 0
+    while i < len(argv) {
+        if argv[i] == key && i + 1 < len(argv) { return argv[i + 1] }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn arg_present(argv, key) {
+    let mut i = 0
+    while i < len(argv) {
+        if argv[i] == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── config ───────────────────────────────────────────────────────────
+
+let ROADMAP_PATH    = ".roadmap"
+let LOG_PATH        = "shared/state/roadmap_auto_reflect_log.json"
+let LINT_PATH       = "/Users/ghost/core/hexa-lang/tool/roadmap_lint.hexa"
+let ETA_PLUS_DAYS   = 14
+
+// ─── time / date helpers ──────────────────────────────────────────────
+
+fn now_iso() -> string {
+    // exec `date -u +"%Y-%m-%dT%H:%M:%SZ"` — portable on macOS + linux.
+    let r = to_string(exec("date -u +\"%Y-%m-%dT%H:%M:%SZ\""))
+    return r.trim()
+}
+
+fn today_iso() -> string {
+    let r = to_string(exec("date -u +\"%Y-%m-%d\""))
+    return r.trim()
+}
+
+fn eta_plus(days: int) -> string {
+    // Try BSD date first (macOS). If empty, fall back to GNU date (linux).
+    let mut bsd = []
+    bsd.push("date -u -v+")
+    bsd.push(to_string(days))
+    bsd.push("d +\"%Y-%m-%d\" 2>/dev/null")
+    let r1 = to_string(exec(bsd.join(""))).trim()
+    if r1 != "" { return r1 }
+    let mut gnu = []
+    gnu.push("date -u -d \"+")
+    gnu.push(to_string(days))
+    gnu.push(" days\" +\"%Y-%m-%d\" 2>/dev/null")
+    return to_string(exec(gnu.join(""))).trim()
+}
+
+// ─── fs helpers ───────────────────────────────────────────────────────
+
+fn exists(path: string) -> bool {
+    let mut parts = []
+    parts.push("test -r ")
+    parts.push(path)
+    let r = exec_with_status(parts.join(""))
+    return r[1] == 0
+}
+
+fn is_uchg(path: string) -> bool {
+    let mut parts = []
+    parts.push("ls -lO ")
+    parts.push(path)
+    parts.push(" 2>/dev/null")
+    let out = to_string(exec(parts.join("")))
+    return out.contains("uchg")
+}
+
+fn chflags_set(path: string, flag: string) -> bool {
+    // flag is "nouchg" (unlock) or "uchg" (re-lock).
+    let mut parts = []
+    parts.push("chflags ")
+    parts.push(flag)
+    parts.push(" ")
+    parts.push(path)
+    let r = exec_with_status(parts.join(""))
+    return r[1] == 0
+}
+
+fn backup_copy(src: string, ts: string) -> string {
+    let mut parts = []
+    parts.push(src)
+    parts.push(".bak.")
+    parts.push(ts)
+    parts.push("-auto-reflect")
+    let dst = parts.join("")
+    let mut cp = []
+    cp.push("cp ")
+    cp.push(src)
+    cp.push(" ")
+    cp.push(dst)
+    exec(cp.join(""))
+    return dst
+}
+
+// ─── audit parsing (JSON) ─────────────────────────────────────────────
+
+// Returns array of gap dicts shaped as arrays of 4:
+//   [file, category, coverage_pct_string, reason]
+fn parse_json_gaps(body: string) -> array {
+    let mut out = []
+    // Minimal hand-rolled extraction: find each `{...}` inside "gaps":[...].
+    let key = "\"gaps\""
+    let k = body.index_of(key)
+    if k < 0 { return out }
+    let rest = body.substring(k, len(body))
+    let lb = rest.index_of("[")
+    if lb < 0 { return out }
+    let tail = rest.substring(lb + 1, len(rest))
+    // split on "},{"   (tolerate whitespace)
+    let chunks = tail.split("}")
+    let mut i = 0
+    while i < len(chunks) {
+        let chunk = chunks[i]
+        if chunk.contains("\"file\"") {
+            let file  = _extract_field(chunk, "file")
+            let cat   = _extract_field(chunk, "category")
+            let pct   = _extract_field(chunk, "coverage_pct")
+            let why   = _extract_field(chunk, "reason")
+            if file != "" {
+                let mut row = []
+                row.push(file)
+                row.push(cat)
+                row.push(pct)
+                row.push(why)
+                out.push(row)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _extract_field(chunk: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let k = chunk.index_of(needle)
+    if k < 0 { return "" }
+    let rest = chunk.substring(k + len(needle), len(chunk))
+    let colon = rest.index_of(":")
+    if colon < 0 { return "" }
+    let v = rest.substring(colon + 1, len(rest))
+    // Skip leading whitespace + optional quote.
+    let mut i = 0
+    while i < len(v) && (v.substring(i, i + 1) == " " || v.substring(i, i + 1) == "\t") {
+        i = i + 1
+    }
+    let first = if i < len(v) { v.substring(i, i + 1) } else { "" }
+    if first == "\"" {
+        let after = v.substring(i + 1, len(v))
+        let close = after.index_of("\"")
+        if close < 0 { return "" }
+        return after.substring(0, close)
+    }
+    // numeric — read until `,` or end.
+    let rest2 = v.substring(i, len(v))
+    let comma = rest2.index_of(",")
+    let end = if comma >= 0 { comma } else { len(rest2) }
+    return rest2.substring(0, end).trim()
+}
+
+// ─── audit parsing (markdown table, task 42 style) ────────────────────
+//
+// Accepted format — a single table block with header line:
+//   | file | category | coverage_pct | reason |
+// separators and rows follow. Lines outside the table are ignored.
+
+fn parse_md_gaps(body: string) -> array {
+    let mut out = []
+    let lines = body.split("\n")
+    let mut in_table = false
+    let mut idx_file = -1
+    let mut idx_cat  = -1
+    let mut idx_pct  = -1
+    let mut idx_why  = -1
+
+    let mut i = 0
+    while i < len(lines) {
+        let line = lines[i].trim()
+        if line.starts_with("|") && line.contains("|") {
+            let cells = _split_pipe(line)
+            if !in_table {
+                // Header row.
+                let mut j = 0
+                while j < len(cells) {
+                    let h = cells[j].trim().to_lowercase()
+                    if h == "file"         { idx_file = j }
+                    if h == "category"     { idx_cat  = j }
+                    if h == "coverage_pct" || h == "coverage" { idx_pct = j }
+                    if h == "reason"       { idx_why  = j }
+                    j = j + 1
+                }
+                if idx_file >= 0 { in_table = true }
+            } else {
+                // Separator (|---|---|) or data row.
+                let is_sep = _is_separator_row(cells)
+                if !is_sep && idx_file < len(cells) {
+                    let file = cells[idx_file].trim()
+                    let cat  = if idx_cat >= 0 && idx_cat < len(cells) { cells[idx_cat].trim() } else { "" }
+                    let pct  = if idx_pct >= 0 && idx_pct < len(cells) { cells[idx_pct].trim() } else { "" }
+                    let why  = if idx_why >= 0 && idx_why < len(cells) { cells[idx_why].trim() } else { "" }
+                    // Defensive: discard rows whose file cell is ONLY
+                    // dashes / colons / whitespace (separator residue).
+                    let dash_only_file = _is_dash_only(file)
+                    if !dash_only_file && file != "" && file != "file" {
+                        let mut row = []
+                        row.push(file)
+                        row.push(cat)
+                        row.push(pct)
+                        row.push(why)
+                        out.push(row)
+                    }
+                }
+            }
+        } else {
+            in_table = false
+            idx_file = -1
+            idx_cat  = -1
+            idx_pct  = -1
+            idx_why  = -1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _is_dash_only(s: string) -> bool {
+    if len(s) == 0 { return false }
+    let mut i = 0
+    while i < len(s) {
+        let ch = s.substring(i, i + 1)
+        if ch != "-" && ch != ":" && ch != " " && ch != "\t" {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn _is_separator_row(cells: array) -> bool {
+    // True if every non-empty cell contains only '-', ':', or whitespace.
+    let mut saw_any = false
+    let mut i = 0
+    while i < len(cells) {
+        let c = cells[i].trim()
+        if c != "" {
+            saw_any = true
+            let mut j = 0
+            while j < len(c) {
+                let ch = c.substring(j, j + 1)
+                if ch != "-" && ch != ":" && ch != " " && ch != "\t" {
+                    return false
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return saw_any
+}
+
+fn _split_pipe(line: string) -> array {
+    // Drop leading/trailing `|` then split.
+    let mut s = line
+    if s.starts_with("|") { s = s.substring(1, len(s)) }
+    if s.ends_with("|")   { s = s.substring(0, len(s) - 1) }
+    return s.split("|")
+}
+
+// ─── track inference (category → track) ───────────────────────────────
+
+fn infer_track(category: string) -> string {
+    let c = category.to_lowercase()
+    if c.contains("corpus")              { return "corpus" }
+    if c.contains("β") || c == "beta" || c.contains("learning-free") { return "β" }
+    if c.contains("lora") || c.contains("train")     { return "lora" }
+    if c.contains("verif")               { return "verifier" }
+    if c.contains("edu") || c.contains("cell") || c.contains("l_ix") { return "edu" }
+    if c.contains("bridge")              { return "bridge" }
+    if c.contains("hexad")               { return "hexad" }
+    if c.contains("bench") || c.contains("flop") || c.contains("landauer") { return "bench" }
+    if c.contains("serve") || c.contains("serving") { return "serving" }
+    if c.contains("lint") || c.contains("integ")    { return "ops" }
+    return "ops"
+}
+
+// ─── existing-entry detection ─────────────────────────────────────────
+
+fn max_roadmap_id(roadmap_body: string) -> int {
+    let lines = roadmap_body.split("\n")
+    let mut max = 0
+    let mut i = 0
+    while i < len(lines) {
+        let line = lines[i]
+        if line.starts_with("roadmap ") {
+            let rest = line.substring(8, len(line))
+            let sp = rest.index_of(" ")
+            let num_s = if sp > 0 { rest.substring(0, sp) } else { rest }
+            let n = _atoi(num_s)
+            if n > max { max = n }
+        }
+        i = i + 1
+    }
+    return max
+}
+
+fn _atoi(s: string) -> int {
+    let mut out = 0
+    let mut i = 0
+    let t = s.trim()
+    while i < len(t) {
+        let ch = t.substring(i, i + 1)
+        if ch == "0" { out = out * 10 + 0 }
+        else if ch == "1" { out = out * 10 + 1 }
+        else if ch == "2" { out = out * 10 + 2 }
+        else if ch == "3" { out = out * 10 + 3 }
+        else if ch == "4" { out = out * 10 + 4 }
+        else if ch == "5" { out = out * 10 + 5 }
+        else if ch == "6" { out = out * 10 + 6 }
+        else if ch == "7" { out = out * 10 + 7 }
+        else if ch == "8" { out = out * 10 + 8 }
+        else if ch == "9" { out = out * 10 + 9 }
+        else { return out }
+        i = i + 1
+    }
+    return out
+}
+
+fn roadmap_covers(roadmap_body: string, file_path: string) -> bool {
+    // Covered if file path (raw substring) appears on any `roadmap`,
+    // `exit_criteria`, or same-id continuation line. Simple + robust.
+    return roadmap_body.contains(file_path)
+}
+
+// ─── entry rendering ──────────────────────────────────────────────────
+
+fn render_entry(id: int, file_path: string, category: string,
+                coverage_pct: string, reason: string,
+                audit_date: string, eta: string) -> string {
+    let track = infer_track(category)
+    let why_reason = if reason != "" { reason } else { "coverage " + coverage_pct + "% below target" }
+    let mut s = ""
+    s = s + "\nroadmap " + to_string(id) + " planned \"auto " + file_path + "\"\n"
+    s = s + "  track          " + track + "\n"
+    s = s + "  phase          ops\n"
+    s = s + "  eta            " + eta + "\n"
+    s = s + "  why            auto-reflected from " + audit_date + ": " + why_reason + "\n"
+    s = s + "  exit_criteria  " + file_path + " coverage = 100% (parse + smoke + verdict SSOT)\n"
+    s = s + "  depends-on     —\n"
+    s = s + "  reaches        ops\n"
+    return s
+}
+
+// ─── log emission ─────────────────────────────────────────────────────
+
+fn emit_log(mode: string, audit: string, total: int, gaps_new: int,
+            proposals: array) {
+    let mut s = ""
+    s = s + "{\"ts\":\"" + now_iso() + "\""
+    s = s + ",\"mode\":\"" + mode + "\""
+    s = s + ",\"audit\":\"" + audit + "\""
+    s = s + ",\"gaps_total\":" + to_string(total)
+    s = s + ",\"gaps_new\":" + to_string(gaps_new)
+    s = s + ",\"gaps_existing\":" + to_string(total - gaps_new)
+    s = s + ",\"proposals\":["
+    let mut i = 0
+    while i < len(proposals) {
+        if i > 0 { s = s + "," }
+        let p = proposals[i]
+        s = s + "{\"id\":" + to_string(p[0])
+        s = s + ",\"file\":\"" + p[1] + "\""
+        s = s + ",\"track\":\"" + p[2] + "\""
+        s = s + ",\"eta\":\"" + p[3] + "\"}"
+        i = i + 1
+    }
+    s = s + "]}\n"
+
+    let mut prior = ""
+    if exists(LOG_PATH) { prior = read_file(LOG_PATH) }
+    write_file(LOG_PATH, prior + s)
+}
+
+// ─── usage ────────────────────────────────────────────────────────────
+
+fn print_usage() {
+    println("usage: hexa tool/roadmap_auto_reflect.hexa --audit-report <path>")
+    println("                                             [--dry-run] [--apply] [--commit]")
+    println("                                             [--smoke]")
+    println("")
+    println("input:  JSON {\"gaps\":[{...}]}  or  markdown | file | category | coverage_pct | reason |")
+    println("output: shared/state/roadmap_auto_reflect_log.json  (append JSONL)")
+    println("")
+    println("track inference (category → track):")
+    println("  corpus → corpus | β/learning-free → β | lora/train → lora")
+    println("  verif* → verifier | edu/cell/l_ix → edu | bridge → bridge")
+    println("  hexad → hexad | bench/flop/landauer → bench | serve* → serving")
+    println("  lint/integ → ops | else → ops")
+}
+
+// ─── core run ─────────────────────────────────────────────────────────
+
+fn load_audit(path: string) -> array {
+    if !exists(path) {
+        println("ERROR: audit report not readable: " + path)
+        return []
+    }
+    let body = read_file(path)
+    if path.ends_with(".md") { return parse_md_gaps(body) }
+    return parse_json_gaps(body)
+}
+
+fn audit_date_of(path: string) -> string {
+    // Extract date from filename like "...20260421.md". Else use today.
+    let mut i = 0
+    while i + 8 <= len(path) {
+        let seg = path.substring(i, i + 8)
+        if _is_digits(seg) {
+            let y = seg.substring(0, 4)
+            let m = seg.substring(4, 6)
+            let d = seg.substring(6, 8)
+            return y + "-" + m + "-" + d
+        }
+        i = i + 1
+    }
+    return today_iso()
+}
+
+fn _is_digits(s: string) -> bool {
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c != "0" && c != "1" && c != "2" && c != "3" && c != "4"
+        && c != "5" && c != "6" && c != "7" && c != "8" && c != "9" {
+            return false
+        }
+        i = i + 1
+    }
+    return len(s) > 0
+}
+
+fn run(mode: string, audit_path: string) -> int {
+    let gaps = load_audit(audit_path)
+    let total = len(gaps)
+    if !exists(ROADMAP_PATH) {
+        println("ERROR: .roadmap not readable at " + ROADMAP_PATH)
+        return 2
+    }
+    let roadmap_body = read_file(ROADMAP_PATH)
+    let mut next_id = max_roadmap_id(roadmap_body) + 1
+    let audit_date = audit_date_of(audit_path)
+    let eta = eta_plus(ETA_PLUS_DAYS)
+
+    let mut proposals_meta = []   // for log (id, file, track, eta)
+    let mut appended_text = ""
+    let mut new_count = 0
+
+    println("=== roadmap_auto_reflect ===")
+    println("mode:          " + mode)
+    println("audit:         " + audit_path + "   (date=" + audit_date + ")")
+    println("roadmap:       " + ROADMAP_PATH)
+    println("next_id start: " + to_string(next_id))
+    println("eta (+14d):    " + eta)
+    println("gaps_total:    " + to_string(total))
+    println("")
+
+    let mut i = 0
+    while i < total {
+        let g = gaps[i]
+        let file = g[0]
+        let cat  = g[1]
+        let pct  = g[2]
+        let why  = g[3]
+        if roadmap_covers(roadmap_body, file) {
+            println("  SKIP     " + file + "  (already covered in .roadmap)")
+        } else {
+            let entry = render_entry(next_id, file, cat, pct, why, audit_date, eta)
+            appended_text = appended_text + entry
+            println("  PROPOSE  #" + to_string(next_id) + " track=" + infer_track(cat) + "  " + file)
+            let mut meta = []
+            meta.push(next_id)
+            meta.push(file)
+            meta.push(infer_track(cat))
+            meta.push(eta)
+            proposals_meta.push(meta)
+            new_count = new_count + 1
+            next_id = next_id + 1
+        }
+        i = i + 1
+    }
+
+    println("")
+    println("=== summary ===")
+    println("gaps_total=" + to_string(total) + "  new=" + to_string(new_count) + "  existing=" + to_string(total - new_count))
+
+    if mode == "dry-run" {
+        println("")
+        println("--- proposed entries (not written) ---")
+        println(appended_text)
+        emit_log("dry-run", audit_path, total, new_count, proposals_meta)
+        return 0
+    }
+
+    // --apply / --commit
+    if new_count == 0 {
+        println("nothing to apply — all gaps already covered.")
+        emit_log(mode, audit_path, total, 0, proposals_meta)
+        return 0
+    }
+
+    let was_locked = is_uchg(ROADMAP_PATH)
+    let ts = now_iso().replace(":", "").replace("-", "")
+    let bak = backup_copy(ROADMAP_PATH, ts)
+    println("backup:        " + bak)
+
+    if was_locked {
+        if !chflags_set(ROADMAP_PATH, "nouchg") {
+            println("ERROR: chflags nouchg failed — exit 4")
+            return 4
+        }
+        println("chflags:       nouchg (was uchg)")
+    }
+
+    let new_body = roadmap_body + appended_text
+    write_file(ROADMAP_PATH, new_body)
+    println("write:         " + to_string(new_count) + " entries appended")
+
+    if was_locked {
+        if !chflags_set(ROADMAP_PATH, "uchg") {
+            println("ERROR: chflags uchg re-lock failed — exit 4")
+            return 4
+        }
+        println("chflags:       uchg (re-locked)")
+    }
+
+    // roadmap_lint check
+    let lint_cmd = "hexa " + LINT_PATH + " 2>&1"
+    let lr = exec_with_status(lint_cmd)
+    println("lint exit:     " + to_string(lr[1]))
+    if lr[1] != 0 {
+        println("ERROR: roadmap_lint failed after write. See backup: " + bak)
+        println("--- lint output ---")
+        println(to_string(lr[0]))
+        emit_log(mode + "-lint-fail", audit_path, total, new_count, proposals_meta)
+        return 3
+    }
+    println("lint:          PASS")
+
+    emit_log(mode, audit_path, total, new_count, proposals_meta)
+
+    if mode == "commit" {
+        let msg = "feat(tool): roadmap_auto_reflect — audit 자동 .roadmap 반영 (" + to_string(new_count) + " entries)"
+        let mut g1 = []
+        g1.push("git add ")
+        g1.push(ROADMAP_PATH)
+        g1.push(" ")
+        g1.push(LOG_PATH)
+        exec(g1.join(""))
+        let mut g2 = []
+        g2.push("git commit -m \"")
+        g2.push(msg)
+        g2.push("\"")
+        let cr = exec_with_status(g2.join(""))
+        println("commit exit:   " + to_string(cr[1]))
+    }
+
+    return 0
+}
+
+// ─── smoke test (no external audit file needed) ───────────────────────
+
+fn run_smoke() -> int {
+    let fixture = "/tmp/roadmap_auto_reflect_smoke_20260421.md"
+    let mut s = ""
+    s = s + "# task 42 — β coverage audit 2026-04-21\n\n"
+    s = s + "Summary: 3 files below 100% coverage, 0 lint violations.\n\n"
+    s = s + "| file | category | coverage_pct | reason |\n"
+    s = s + "|------|----------|--------------|--------|\n"
+    s = s + "| tool/nonexistent_sample_x.hexa | corpus | 42 | missing smoke path |\n"
+    s = s + "| tool/nonexistent_sample_y.hexa | verifier | 67 | G3 density check absent |\n"
+    s = s + "| tool/nonexistent_sample_z.hexa | bench | 0 | never executed under flops bench |\n"
+    s = s + "| tool/raw_audit_drill_integration.hexa | ops | 80 | should be skipped (already covered) |\n\n"
+    s = s + "End of audit.\n"
+    write_file(fixture, s)
+    println("smoke fixture: " + fixture)
+    return run("dry-run", fixture)
+}
+
+// ─── entry point ──────────────────────────────────────────────────────
+
+fn main() {
+    let argv = args()
+    if arg_present(argv, "--help") || arg_present(argv, "-h") {
+        print_usage()
+        exit(0)
+    }
+    if arg_present(argv, "--smoke") {
+        exit(run_smoke())
+    }
+    let audit = arg_value(argv, "--audit-report", "")
+    if audit == "" {
+        print_usage()
+        exit(1)
+    }
+
+    let mut mode = "dry-run"
+    if arg_present(argv, "--apply")  { mode = "apply" }
+    if arg_present(argv, "--commit") { mode = "commit" }
+    // --dry-run overrides (safety)
+    if arg_present(argv, "--dry-run") { mode = "dry-run" }
+
+    exit(run(mode, audit))
+}
+
+main()
