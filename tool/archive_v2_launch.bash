@@ -18,7 +18,7 @@ cd "$(dirname "$0")/.."
 # Use dev build — homebrew 0.2.0 lacks exec() builtin
 HEXA="/Users/ghost/core/hexa-lang/hexa"
 DRIVER="tool/archive_v2_driver.hexa"
-OUT="/tmp/archive_v2.out"
+OUT="${ARCHIVE_V2_OUT:-$HOME/archive_v2.out}"
 
 if [[ ! -x "$HEXA" ]]; then
     echo "[ERR] hexa dev build not found at $HEXA" >&2
@@ -35,10 +35,10 @@ for a in "$@"; do
 done
 
 if [[ $FG -eq 1 ]]; then
-    exec "$HEXA" "$DRIVER" "${ARGS[@]}"
+    exec "$HEXA" "$DRIVER" ${ARGS[@]+"${ARGS[@]}"}
 fi
 
-nohup setsid "$HEXA" "$DRIVER" "${ARGS[@]}" > "$OUT" 2>&1 &
+nohup setsid "$HEXA" "$DRIVER" ${ARGS[@]+"${ARGS[@]}"} > "$OUT" 2>&1 &
 PID=$!
 disown $PID 2>/dev/null || true
 echo "[launched] pid=$PID out=$OUT"
