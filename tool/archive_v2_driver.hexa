@@ -132,8 +132,10 @@ fn kind_of(path) {
     return out
 }
 
+// File-only size in bytes. macOS `du` lacks -b, so we use `stat -f %z` which
+// works for regular files on BSD/macOS. (Dir verify path doesn't call this.)
 fn local_size(path) {
-    let out = sh_out("du -sb '" + shq(path) + "' 2>/dev/null | awk '{print $1}'").trim()
+    let out = sh_out("stat -f '%z' '" + shq(path) + "' 2>/dev/null").trim()
     if out.len() == 0 { return 0 }
     let mut n = 0
     try { n = to_int(out) } catch e { return 0 }
@@ -215,17 +217,34 @@ fn archive_one(row, skip_delete) {
     // R2-exists short-circuit: skip upload if already present with valid size
     let pre_rsize = r2_size(bucket, verify_key)
     let mut need_upload = true
+    let mut short_circuit = false
     if pre_rsize > 0 {
         if k == "file" {
             let lsize = local_size(path)
+            if lsize == 0 {
+                // local already gone (prior run deleted it) but r2 has the object — consider archived
+                let inv_size = 0
+                let mut isz = 0
+                try { isz = to_int(size_est) } catch e { isz = 0 }
+                if pre_rsize == isz {
+                    println("  [already-archived] local missing, r2 matches inventory size=" + to_string(pre_rsize))
+                    log_event(path, "archived_no_delete", "local-gone r2_bytes=" + to_string(pre_rsize))
+                    return true
+                }
+                println("  VERIFY-FAIL local=0 inv=" + to_string(isz) + " r2=" + to_string(pre_rsize))
+                log_event(path, "verify_failed", "local=0 inv=" + to_string(isz) + " r2=" + to_string(pre_rsize))
+                return false
+            }
             if pre_rsize == lsize {
                 println("  [skip-upload] r2 already has exact size=" + to_string(pre_rsize))
                 need_upload = false
+                short_circuit = true
             }
         } else {
             // dir: treat any non-empty r2 object as "already archived" (size estimation too variable due to compression)
             println("  [skip-upload] r2 already has tar.zst size=" + to_string(pre_rsize))
             need_upload = false
+            short_circuit = true
         }
     }
 
