@@ -307,13 +307,18 @@ a5bbd564  chore(gitignore): runtime ephemeral
 (+ airgenome c14be1ec: SSH ControlMaster sandbox fix)
 ```
 
-### 📡 Infra 현황 (2026-04-22T06:21Z 신선 probe)
-| Host | hostname | Role | Status | Load | Action |
+### 📡 Infra 현황 (2026-04-22 lspci deep probe)
+| Host | hostname | CPU | GPU (discrete) | 상태 | Action |
 |---|---|---|---|---|---|
-| **ubu1** | aiden-B650M-K | RTX 5070 GPU | SSH OK · GPU lock | 1.89 | sudo reboot 대기 |
-| **ubu2** | summer-B650M-K | CPU | **idle** | 0.39 | 신규 delegation 후보 |
-| **htz** | anima-ax102 | CPU (Ryzen 9) | 고부하 | 10.36 | 다른 작업 중 |
-| mac | local | — | active | — | AG6 compute zero |
+| **ubu1** | aiden-B650M-K | Ryzen 5 9600X 12T | NVIDIA RTX 5070 12GB (CUDA 13.0) | SSH OK · **GPU FULLCHIP_RESET lock** | `sudo reboot` |
+| **ubu2** | summer-B650M-K | Ryzen 5 9600X 12T | **NVIDIA 0x10de:0x2f04** (likely RTX 5070-class) | SSH OK · idle · **CUDA 드라이버 미설치** (nouveau 만) | `sudo apt install nvidia-driver-580` |
+| **htz** | anima-ax102 | Ryzen 9 7950X3D 16C/32T | ❌ 없음 (AMD Raphael iGPU만) | SSH OK · 고부하 | CPU 서빙 전용 |
+| mac | local | — | — | AG6 compute zero | — |
+
+**🔑 중요 수정**: 2026-04-22 lspci 확인 결과 —
+- ubu2 는 "CPU-only 노드" 로 잘못 기록되어 있었으나 실제로는 **NVIDIA discrete GPU 하드웨어 탑재** (rev a1). 드라이버만 설치하면 사용 가능.
+- htz 는 "EPYC 7950X3D" 가 아닌 **Ryzen 9 7950X3D** (Hetzner consumer-chip server). discrete GPU 부재 확정.
+- 수정: nexus@96156620 `config/hosts` 업데이트 + `.workspace` 수정.
 
 ### 🚀 Delegation 이력 (sub-agents)
 - **Agent A** — htz SSH 차단 조사 → airgenome fix c14be1ec 계기
