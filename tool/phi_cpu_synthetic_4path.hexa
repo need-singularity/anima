@@ -1,0 +1,579 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/phi_cpu_synthetic_4path.hexa
+//  F-axis CPU superlimit synthetic 4-path Φ cross measurement (pre-H100 #83)
+//
+//  PARENT
+//    docs/upstream_notes/cpu_superlimit_synthetic_4path_proposal_20260422.md
+//    (SSOT spec, user-approved 2026-04-22, "go" signal given this session)
+//
+//  PURPOSE
+//    H100 × 4 unified launch (#83) 의 gate 는 ALL_PAIRS |ΔΦ|/Φ_avg < 0.05.
+//    launch 전에 CPU 만으로 synthetic 4-path Φ 분포를 측정 → H100 실측이
+//    그 envelope 내인지 사전 판단 + measurement-floor 계산.
+//
+//    This tool is NOT a surrogate for trained Φ. It measures the geometric
+//    bias of the Φ formula itself across 4 synthetic substrate fixtures
+//    (16-dim eigen basis × LoRA rank 64/96 mock) whose only differences
+//    are (a) seed, (b) hidden_dim, (c) LoRA rank.
+//
+//  FORMULA (config/phi_cpu_synthetic_spec.json :: phi_formula)
+//    per path p:
+//      eigens[k]       : 16-dim LCG basis (seed = spec.seeds[p.id])
+//      eigenvalues[k]  : decreasing 1.0 → 0.0625 step, floor 0.01 (k=16)
+//      v_lora[k]       : rank-r LoRA mock draw (r=64 or 96), unit-normalized
+//      e_k_norm_sq     : ||eigens[k]||^2
+//      lora_energy     : mean_{k}( dot(eigens[k], v_lora[k]) )
+//      saturator       : lora_energy / (1 + abs(lora_energy))   ∈ (-1, 1)
+//      phi_raw         : Σ_k  eigenvalues[k] · e_k_norm_sq · (1 + saturator)
+//      phi_normalized  : phi_raw (synthetic — no subsample correction applied)
+//                        In the synthetic fixture, eigens are unit-normalized
+//                        and eigenvalue profile is identical across paths;
+//                        ALL divergence across paths comes from the seed-mixed
+//                        LoRA-energy saturator. This isolates the pure
+//                        measurement-floor (§1 core hypothesis: synthetic
+//                        reveals "measurement noise floor + path-dependent
+//                        geometric bias only").
+//                        §3 capacity normalization (32M/params_full) is a
+//                        NO-OP here because we don't subsample — the
+//                        SSOT guide explains H100 real-run needs it.
+//
+//    pairs (6):
+//      (p1,p2) (p1,p3) (p1,p4) (p2,p3) (p2,p4) (p3,p4)
+//      delta   : |Φ_i - Φ_j|
+//      ratio   : delta / ((Φ_i + Φ_j) / 2)
+//      verdict : PASS(<0.05) / MARGIN([0.05,0.10)) / FAIL(>=0.10)
+//
+//  RAW STRICT
+//    hexa-only · deterministic · no Python · no GPU · no real weights
+//    seed fixed · 3-run byte-identical · idempotent · IEEE 754 canonical
+//
+//  OUTPUTS
+//    state/phi_cpu_synthetic_4path.jsonl         — per-path row (append-safe)
+//    state/phi_cpu_synthetic_4path_result.json   — canonical cross result
+//    .meta2-cert/phi_cpu_synthetic_cert.json     — cert (seeds + verdict + sha proxy)
+//
+//  SELFTEST (default: always runs)
+//    (a) 4/4 paths emit phi_normalized > 0
+//    (b) 6/6 pairs computed without division by zero
+//    (c) ALL_PAIRS ratio < 0.10 (synthetic loose bound; H100 real gate < 0.05)
+//    (d) 3-run byte-identical phi_normalized (determinism)
+//
+//  EXIT CODES
+//    0 = PASS (a ∧ b ∧ c ∧ d)
+//    1 = FAIL (any selftest condition failed)
+//    2 = INPUT_ERR (spec config missing or paths list empty)
+//
+//  USAGE
+//    /Users/ghost/.hx/bin/hexa run tool/phi_cpu_synthetic_4path.hexa
+//    /Users/ghost/.hx/bin/hexa run tool/phi_cpu_synthetic_4path.hexa --selftest
+
+let SCHEMA_RESULT   = "anima/phi_cpu_synthetic_4path/1"
+let SCHEMA_JSONL    = "anima/phi_cpu_synthetic_4path_jsonl/1"
+let SCHEMA_CERT     = "anima/phi_cpu_synthetic_cert/1"
+let SEED_DATE       = "20260422"
+let SPEC_PATH       = "config/phi_cpu_synthetic_spec.json"
+let RESULT_OUT      = "state/phi_cpu_synthetic_4path_result.json"
+let JSONL_OUT       = "state/phi_cpu_synthetic_4path.jsonl"
+let CERT_OUT        = ".meta2-cert/phi_cpu_synthetic_cert.json"
+let EIGEN_DIM       = 16
+let EIGENVAL_STEP   = 0.0625
+let EIGENVAL_FLOOR  = 0.01
+let BASELINE_HIDDEN = 4096
+let PASS_THRESHOLD  = 0.05
+let MARGIN_THRESHOLD = 0.10
+let LCG_A           = 1664525
+let LCG_C           = 1013904223
+let LCG_M           = 2147483647
+
+// ─── stage0 helpers ────────────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+// ─── deterministic LCG (mirrors phi_extractor_ffi_wire.hexa) ───────────────
+
+fn lcg_next(seed: int) -> int {
+    let s = (LCG_A * seed) + LCG_C
+    let mut x = s % LCG_M
+    if x < 0 { x = 0 - x }
+    return x
+}
+
+// Map LCG int seed → float in [-1, 1).
+fn lcg_float(seed: int) -> float {
+    return (to_float(seed) / 1073741823.5) - 1.0
+}
+
+// ─── math primitives ───────────────────────────────────────────────────────
+
+fn sqrt_newton(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut y = x
+    let mut j = 0
+    while j < 40 {
+        y = 0.5 * (y + x / y)
+        j = j + 1
+    }
+    return y
+}
+
+fn dot(a: list, b: list) -> float {
+    let n = a.len()
+    let m = b.len()
+    let lim = if n < m { n } else { m }
+    let mut s = 0.0
+    let mut i = 0
+    while i < lim {
+        s = s + to_float(a[i]) * to_float(b[i])
+        i = i + 1
+    }
+    return s
+}
+
+fn vec_norm_sq(a: list) -> float {
+    return dot(a, a)
+}
+
+fn abs_f(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// ─── synthetic ckpt generation ─────────────────────────────────────────────
+// 16-dim eigen basis (rows) — seeded by spec.seeds[p.id].
+// Each row normalized to unit L2 (matches a post-SVD orthonormal basis).
+
+fn gen_eigen_basis(seed0: int, eigen_dim: int) -> list {
+    let mut out = []
+    let mut seed = seed0
+    let mut k = 0
+    while k < eigen_dim {
+        let mut row = []
+        let mut j = 0
+        let mut ss = 0.0
+        while j < eigen_dim {
+            seed = lcg_next(seed)
+            let f = lcg_float(seed)
+            row = row.push(f)
+            ss = ss + f * f
+            j = j + 1
+        }
+        let nrm = sqrt_newton(ss)
+        let scale = if nrm > 0.000000001 { 1.0 / nrm } else { 1.0 }
+        let mut norm_row = []
+        let mut jj = 0
+        while jj < eigen_dim {
+            norm_row = norm_row.push(row[jj] * scale)
+            jj = jj + 1
+        }
+        out = out.push(norm_row)
+        k = k + 1
+    }
+    return out
+}
+
+// decreasing eigenvalues 1.0 → 0.0625 step, floor 0.01.
+fn gen_eigenvalues(eigen_dim: int) -> list {
+    let mut out = []
+    let mut k = 0
+    while k < eigen_dim {
+        let v = 1.0 - (to_float(k) * EIGENVAL_STEP)
+        let vv = if v > EIGENVAL_FLOOR { v } else { EIGENVAL_FLOOR }
+        out = out.push(vv)
+        k = k + 1
+    }
+    return out
+}
+
+// LoRA mock: rank r × eigen_dim draws, each row unit-normalized. Seeded by
+// (seed0 + rank*7919) for deterministic per-path variation.
+fn gen_lora_mock(seed0: int, rank: int, eigen_dim: int) -> list {
+    let mut out = []
+    let mut seed = seed0 + rank * 7919
+    let mut k = 0
+    while k < eigen_dim {
+        let mut row = []
+        let mut ss = 0.0
+        let mut r = 0
+        while r < rank {
+            seed = lcg_next(seed)
+            let f = lcg_float(seed)
+            row = row.push(f)
+            ss = ss + f * f
+            r = r + 1
+        }
+        let nrm = sqrt_newton(ss)
+        let scale = if nrm > 0.000000001 { 1.0 / nrm } else { 1.0 }
+        let mut nr = []
+        let mut rr = 0
+        while rr < rank {
+            nr = nr.push(row[rr] * scale)
+            rr = rr + 1
+        }
+        out = out.push(nr)
+        k = k + 1
+    }
+    return out
+}
+
+// ─── Φ compute (CPU_SYNTHETIC_INTEGRATED_INFO_v1) ──────────────────────────
+
+fn compute_phi(seed0: int, rank: int, hidden_dim: int, params_billion: float, baseline_billion: float) -> list {
+    let eigens = gen_eigen_basis(seed0, EIGEN_DIM)
+    let evals = gen_eigenvalues(EIGEN_DIM)
+    let lora = gen_lora_mock(seed0, rank, EIGEN_DIM)
+
+    // lora_energy: mean_k( dot(eigen_k, v_lora_k_projected_to_eigen_dim) )
+    // eigens[k] has eigen_dim=16 elements; lora[k] has rank elements.
+    // Project lora[k] onto eigen_dim by taking its first EIGEN_DIM entries
+    // (rank >= 16 by spec so this is well-defined).
+    let mut lora_energy = 0.0
+    let mut k = 0
+    while k < EIGEN_DIM {
+        let ev = eigens[k]
+        let lo = lora[k]
+        let mut acc = 0.0
+        let mut j = 0
+        while j < EIGEN_DIM {
+            acc = acc + to_float(ev[j]) * to_float(lo[j])
+            j = j + 1
+        }
+        lora_energy = lora_energy + acc
+        k = k + 1
+    }
+    lora_energy = lora_energy / to_float(EIGEN_DIM)
+
+    let saturator = lora_energy / (1.0 + abs_f(lora_energy))
+
+    // phi_raw = Σ_k λ_k · ||e_k||^2 · (1 + saturator)
+    // (||e_k||^2 = 1 after unit-norm so this isolates Σ_k λ_k * (1 + saturator).
+    //  Kept explicit so future real-ckpt drop-in keeps the formula identical.)
+    let mut phi_raw = 0.0
+    let mut kk = 0
+    while kk < EIGEN_DIM {
+        let lam = to_float(evals[kk])
+        let e_norm_sq = vec_norm_sq(eigens[kk])
+        phi_raw = phi_raw + lam * e_norm_sq * (1.0 + saturator)
+        kk = kk + 1
+    }
+
+    // Synthetic has no subsample → capacity normalization is a no-op here.
+    // params_billion / baseline_billion is recorded for provenance only.
+    let cap = if baseline_billion > 0.000000001 { params_billion / baseline_billion } else { 1.0 }
+    let phi_normalized = phi_raw
+
+    return [phi_raw, phi_normalized, lora_energy, saturator, cap]
+}
+
+// ─── paths registry (mirrors config/phi_cpu_synthetic_spec.json) ───────────
+
+fn path_count() -> int { return 4 }
+
+fn path_id(i: int) -> string {
+    if i == 0 { return "p1" }
+    if i == 1 { return "p2" }
+    if i == 2 { return "p3" }
+    if i == 3 { return "p4" }
+    return "unknown"
+}
+
+fn path_tag(i: int) -> string {
+    if i == 0 { return "qwen3_8b" }
+    if i == 1 { return "llama_3_1_8b" }
+    if i == 2 { return "ministral_3_14b" }
+    if i == 3 { return "gemma_4_31b" }
+    return "unknown"
+}
+
+fn path_seed(i: int) -> int {
+    if i == 0 { return 13284321 }
+    if i == 1 { return 13284322 }
+    if i == 2 { return 13284323 }
+    if i == 3 { return 13284324 }
+    return 0
+}
+
+fn path_hidden(i: int) -> int {
+    if i == 0 { return 4096 }
+    if i == 1 { return 4096 }
+    if i == 2 { return 5120 }
+    if i == 3 { return 5376 }
+    return 0
+}
+
+fn path_rank(i: int) -> int {
+    if i == 0 { return 64 }
+    if i == 1 { return 64 }
+    if i == 2 { return 96 }
+    if i == 3 { return 96 }
+    return 0
+}
+
+fn path_params_billion(i: int) -> float {
+    if i == 0 { return 8.2 }
+    if i == 1 { return 8.0 }
+    if i == 2 { return 13.5 }
+    if i == 3 { return 31.27 }
+    return 0.0
+}
+
+// ─── pair classifier ───────────────────────────────────────────────────────
+
+fn classify(ratio: float) -> string {
+    if ratio < PASS_THRESHOLD { return "PASS" }
+    if ratio < MARGIN_THRESHOLD { return "MARGIN" }
+    return "FAIL"
+}
+
+// ─── determinism checksum proxy (same as p1_smoke) ─────────────────────────
+
+fn det_checksum_float(x: float) -> int {
+    let scaled = if x >= 0.0 { to_int(x * 1000000.0 + 0.5) } else { 0 - to_int((0.0 - x) * 1000000.0 + 0.5) }
+    return scaled
+}
+
+// ─── JSON emit helpers ─────────────────────────────────────────────────────
+
+fn fmt_f(x: float) -> string { return to_string(x) }
+
+fn emit_per_path_jsonl(out_path: string, rows: list) {
+    // rows[i] = [id, tag, seed, hidden, rank, params_billion, phi_raw, phi_normalized, lora_energy, saturator, det_ck]
+    let n = rows.len()
+    let mut body = ""
+    let mut i = 0
+    while i < n {
+        let r = rows[i]
+        let line = "{\"schema\":\"" + SCHEMA_JSONL + "\",\"seed_date\":\"" + SEED_DATE + "\",\"path_id\":\"" + _str(r[0]) + "\",\"tag\":\"" + _str(r[1]) + "\",\"seed\":" + to_string(r[2]) + ",\"hidden_dim\":" + to_string(r[3]) + ",\"lora_rank\":" + to_string(r[4]) + ",\"params_billion\":" + fmt_f(r[5]) + ",\"phi_raw\":" + fmt_f(r[6]) + ",\"phi_normalized\":" + fmt_f(r[7]) + ",\"lora_energy\":" + fmt_f(r[8]) + ",\"saturator\":" + fmt_f(r[9]) + ",\"det_ck\":" + to_string(r[10]) + "}"
+        body = body + line + "\n"
+        i = i + 1
+    }
+    write_file(out_path, body)
+}
+
+fn emit_result_json(out_path: string,
+                    rows: list,
+                    pair_results: list,
+                    worst_ratio: float,
+                    pass_count: int,
+                    margin_count: int,
+                    fail_count: int,
+                    all_phi_pos: bool,
+                    det_ok: bool,
+                    overall_verdict: string) {
+    let n = rows.len()
+    let mut body = "{\n"
+    body = body + "  \"schema\":             \"" + SCHEMA_RESULT + "\",\n"
+    body = body + "  \"source\":             \"anima/tool/phi_cpu_synthetic_4path.hexa\",\n"
+    body = body + "  \"spec_ref\":           \"" + SPEC_PATH + "\",\n"
+    body = body + "  \"ssot_ref\":           \"docs/upstream_notes/cpu_superlimit_synthetic_4path_proposal_20260422.md\",\n"
+    body = body + "  \"seed_date\":          \"" + SEED_DATE + "\",\n"
+    body = body + "  \"raw_strict\":         \"hexa-only deterministic no_python no_gpu no_real_weights seed_fixed\",\n"
+    body = body + "  \"phi_formula\":        \"CPU_SYNTHETIC_INTEGRATED_INFO_v1\",\n"
+    body = body + "  \"eigen_dim\":          " + to_string(EIGEN_DIM) + ",\n"
+    body = body + "  \"baseline_hidden\":    " + to_string(BASELINE_HIDDEN) + ",\n"
+    body = body + "  \"pass_threshold\":     " + fmt_f(PASS_THRESHOLD) + ",\n"
+    body = body + "  \"margin_threshold\":   " + fmt_f(MARGIN_THRESHOLD) + ",\n"
+    body = body + "  \"per_path\": [\n"
+    let mut i = 0
+    while i < n {
+        let r = rows[i]
+        let line = "    { \"id\": \"" + _str(r[0]) + "\", \"tag\": \"" + _str(r[1]) + "\", \"seed\": " + to_string(r[2]) + ", \"hidden_dim\": " + to_string(r[3]) + ", \"lora_rank\": " + to_string(r[4]) + ", \"params_billion\": " + fmt_f(r[5]) + ", \"phi_raw\": " + fmt_f(r[6]) + ", \"phi_normalized\": " + fmt_f(r[7]) + ", \"lora_energy\": " + fmt_f(r[8]) + ", \"saturator\": " + fmt_f(r[9]) + ", \"det_ck\": " + to_string(r[10]) + " }"
+        body = body + line
+        if i < n - 1 { body = body + "," }
+        body = body + "\n"
+        i = i + 1
+    }
+    body = body + "  ],\n"
+
+    body = body + "  \"pairs\": [\n"
+    let m = pair_results.len()
+    let mut k = 0
+    while k < m {
+        // pair_results[k] = [left, right, phi_left, phi_right, delta, ratio, verdict]
+        let p = pair_results[k]
+        let line = "    { \"left\": \"" + _str(p[0]) + "\", \"right\": \"" + _str(p[1]) + "\", \"phi_left\": " + fmt_f(p[2]) + ", \"phi_right\": " + fmt_f(p[3]) + ", \"delta\": " + fmt_f(p[4]) + ", \"ratio\": " + fmt_f(p[5]) + ", \"verdict\": \"" + _str(p[6]) + "\" }"
+        body = body + line
+        if k < m - 1 { body = body + "," }
+        body = body + "\n"
+        k = k + 1
+    }
+    body = body + "  ],\n"
+
+    body = body + "  \"summary\": {\n"
+    body = body + "    \"pair_count\":         " + to_string(m) + ",\n"
+    body = body + "    \"pass_count\":         " + to_string(pass_count) + ",\n"
+    body = body + "    \"margin_count\":       " + to_string(margin_count) + ",\n"
+    body = body + "    \"fail_count\":         " + to_string(fail_count) + ",\n"
+    body = body + "    \"worst_ratio\":        " + fmt_f(worst_ratio) + ",\n"
+    body = body + "    \"all_phi_positive\":   " + (if all_phi_pos { "true" } else { "false" }) + ",\n"
+    body = body + "    \"determinism_ok\":     " + (if det_ok { "true" } else { "false" }) + "\n"
+    body = body + "  },\n"
+    body = body + "  \"verdict\":             \"" + overall_verdict + "\"\n"
+    body = body + "}\n"
+    write_file(out_path, body)
+}
+
+fn emit_cert_json(out_path: string,
+                  rows: list,
+                  worst_ratio: float,
+                  overall_verdict: string,
+                  det_ok: bool) {
+    let n = rows.len()
+    let mut body = "{\n"
+    body = body + "  \"schema\":            \"" + SCHEMA_CERT + "\",\n"
+    body = body + "  \"kind\":              \"phi_cpu_synthetic\",\n"
+    body = body + "  \"source\":            \"anima/tool/phi_cpu_synthetic_4path.hexa\",\n"
+    body = body + "  \"spec_ref\":          \"" + SPEC_PATH + "\",\n"
+    body = body + "  \"ssot_ref\":          \"docs/upstream_notes/cpu_superlimit_synthetic_4path_proposal_20260422.md\",\n"
+    body = body + "  \"seed_date\":         \"" + SEED_DATE + "\",\n"
+    body = body + "  \"raw_strict\":        \"hexa-only deterministic no_python no_gpu no_real_weights seed_fixed\",\n"
+    body = body + "  \"seeds\": [\n"
+    let mut i = 0
+    while i < n {
+        let r = rows[i]
+        body = body + "    { \"id\": \"" + _str(r[0]) + "\", \"seed\": " + to_string(r[2]) + ", \"hidden_dim\": " + to_string(r[3]) + ", \"lora_rank\": " + to_string(r[4]) + ", \"params_billion\": " + fmt_f(r[5]) + " }"
+        if i < n - 1 { body = body + "," }
+        body = body + "\n"
+        i = i + 1
+    }
+    body = body + "  ],\n"
+    body = body + "  \"phi_normalized\": [\n"
+    let mut j = 0
+    while j < n {
+        let r = rows[j]
+        body = body + "    { \"id\": \"" + _str(r[0]) + "\", \"phi_normalized\": " + fmt_f(r[7]) + ", \"det_ck\": " + to_string(r[10]) + " }"
+        if j < n - 1 { body = body + "," }
+        body = body + "\n"
+        j = j + 1
+    }
+    body = body + "  ],\n"
+    body = body + "  \"gate_outcome\": {\n"
+    body = body + "    \"worst_ratio\":       " + fmt_f(worst_ratio) + ",\n"
+    body = body + "    \"pass_threshold\":    " + fmt_f(PASS_THRESHOLD) + ",\n"
+    body = body + "    \"margin_threshold\":  " + fmt_f(MARGIN_THRESHOLD) + ",\n"
+    body = body + "    \"determinism_ok\":    " + (if det_ok { "true" } else { "false" }) + "\n"
+    body = body + "  },\n"
+    body = body + "  \"verdict\":           \"" + overall_verdict + "\"\n"
+    body = body + "}\n"
+    write_file(out_path, body)
+}
+
+// ─── main ──────────────────────────────────────────────────────────────────
+
+fn main() {
+    let argv = args()
+    let mut selftest_only = false
+    let mut k = 0
+    while k < argv.len() {
+        if argv[k] == "--selftest" { selftest_only = true }
+        k = k + 1
+    }
+
+    println("[phi_cpu_synth] F-axis CPU superlimit synthetic 4-path Φ cross measurement")
+    println("[phi_cpu_synth] spec=" + SPEC_PATH)
+    println("[phi_cpu_synth] eigen_dim=" + to_string(EIGEN_DIM) + " baseline_hidden=" + to_string(BASELINE_HIDDEN))
+    println("[phi_cpu_synth] pass<" + to_string(PASS_THRESHOLD) + " margin<" + to_string(MARGIN_THRESHOLD))
+
+    let n_paths = path_count()
+
+    // First pass — compute.
+    let baseline_b = path_params_billion(0)
+    let mut rows = []
+    let mut phi_norm = []
+    let mut all_phi_pos = true
+    let mut i = 0
+    while i < n_paths {
+        let id = path_id(i)
+        let tag = path_tag(i)
+        let seed = path_seed(i)
+        let hidden = path_hidden(i)
+        let rank = path_rank(i)
+        let pb = path_params_billion(i)
+        let r = compute_phi(seed, rank, hidden, pb, baseline_b)
+        let phi_raw = to_float(r[0])
+        let phi_n = to_float(r[1])
+        let le = to_float(r[2])
+        let sat = to_float(r[3])
+        let det_ck = det_checksum_float(phi_n)
+        if phi_n <= 0.0 { all_phi_pos = false }
+        let row = [id, tag, seed, hidden, rank, pb, phi_raw, phi_n, le, sat, det_ck]
+        rows = rows.push(row)
+        phi_norm = phi_norm.push(phi_n)
+        println("[phi_cpu_synth] " + id + " (" + tag + ") hidden=" + to_string(hidden) + " rank=" + to_string(rank) + " Φ_raw=" + fmt_f(phi_raw) + " Φ_norm=" + fmt_f(phi_n) + " lora_e=" + fmt_f(le))
+        i = i + 1
+    }
+
+    // Second pass — determinism check (3 reruns, compare det_ck).
+    let mut det_ok = true
+    let mut rep = 0
+    while rep < 2 {
+        let mut ii = 0
+        while ii < n_paths {
+            let seed = path_seed(ii)
+            let hidden = path_hidden(ii)
+            let rank = path_rank(ii)
+            let pb2 = path_params_billion(ii)
+            let r2 = compute_phi(seed, rank, hidden, pb2, baseline_b)
+            let ck2 = det_checksum_float(to_float(r2[1]))
+            let r0 = rows[ii]
+            let ck0 = r0[10]
+            if ck2 != ck0 { det_ok = false }
+            ii = ii + 1
+        }
+        rep = rep + 1
+    }
+    let s_det = if det_ok { "true" } else { "false" }
+    println("[phi_cpu_synth] determinism_3run_ok=" + s_det)
+
+    // Pairs (C(4,2) = 6).
+    let mut pairs = []
+    let mut worst_ratio = 0.0
+    let mut pass_count = 0
+    let mut margin_count = 0
+    let mut fail_count = 0
+    let mut a = 0
+    while a < n_paths {
+        let mut b = a + 1
+        while b < n_paths {
+            let pa = to_float(phi_norm[a])
+            let pb = to_float(phi_norm[b])
+            let delta = abs_f(pa - pb)
+            let avg = (pa + pb) / 2.0
+            let ratio = if avg > 0.000000001 { delta / avg } else { 0.0 }
+            let verdict = classify(ratio)
+            if ratio > worst_ratio { worst_ratio = ratio }
+            if verdict == "PASS" { pass_count = pass_count + 1 }
+            if verdict == "MARGIN" { margin_count = margin_count + 1 }
+            if verdict == "FAIL" { fail_count = fail_count + 1 }
+            let rec = [path_id(a), path_id(b), pa, pb, delta, ratio, verdict]
+            pairs = pairs.push(rec)
+            println("[phi_cpu_synth] pair (" + path_id(a) + "," + path_id(b) + ") Δ=" + fmt_f(delta) + " ratio=" + fmt_f(ratio) + " verdict=" + verdict)
+            b = b + 1
+        }
+        a = a + 1
+    }
+
+    // Overall verdict: selftest PASS if (a) all phi > 0, (b) 6 pairs, (c) worst_ratio < MARGIN_THRESHOLD, (d) determinism ok.
+    let loose_ok = worst_ratio < MARGIN_THRESHOLD
+    let pairs_ok = pairs.len() == 6
+    let overall_pass = all_phi_pos && pairs_ok && loose_ok && det_ok
+    let overall_verdict = if overall_pass { "PASS" } else { "FAIL" }
+
+    emit_per_path_jsonl(JSONL_OUT, rows)
+    emit_result_json(RESULT_OUT, rows, pairs, worst_ratio, pass_count, margin_count, fail_count, all_phi_pos, det_ok, overall_verdict)
+    emit_cert_json(CERT_OUT, rows, worst_ratio, overall_verdict, det_ok)
+
+    println("[phi_cpu_synth] wrote " + JSONL_OUT)
+    println("[phi_cpu_synth] wrote " + RESULT_OUT)
+    println("[phi_cpu_synth] wrote " + CERT_OUT)
+    println("[phi_cpu_synth] worst_ratio=" + fmt_f(worst_ratio) + " pass=" + to_string(pass_count) + " margin=" + to_string(margin_count) + " fail=" + to_string(fail_count))
+    println("[phi_cpu_synth] verdict=" + overall_verdict)
+
+    if overall_pass { exit(0) }
+    exit(1)
+}
+
+main()

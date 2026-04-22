@@ -1,0 +1,313 @@
+// tool/archive_v2_driver.hexa — hexa-native archive+delete driver
+//
+// Usage (from /Users/ghost/core/anima):
+//   hexa tool/archive_v2_driver.hexa                # process all pending
+//   hexa tool/archive_v2_driver.hexa --limit 3      # first 3 only
+//   hexa tool/archive_v2_driver.hexa --dry          # plan, no side-effects
+//
+// Session-independent launch (detaches from Claude harness shell):
+//   nohup setsid hexa tool/archive_v2_driver.hexa > /tmp/archive_v2.out 2>&1 &
+
+let INVENTORY = "state/asset_inventory.json"
+let LOG = "state/asset_archive_log.jsonl"
+let LOCK = "state/archive_v2.lock"
+
+fn ts() {
+    return to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+}
+
+fn shq(s) {
+    return s.replace("'", "'\\''")
+}
+
+fn log_event(path, status, detail) {
+    let line = "{\"ts\":\"" + ts() + "\",\"path\":\"" + path + "\",\"action\":\"archive_then_delete\",\"status\":\"" + status + "\",\"detail\":\"" + detail + "\"}"
+    let cmd = "printf '%s\\n' '" + shq(line) + "' >> '" + LOG + "'"
+    exec(cmd)
+}
+
+// Manual last-index-of (hexa dev build lacks last_index_of method)
+fn last_idx(hay, needle) {
+    if needle.len() == 0 { return -1 }
+    if hay.len() < needle.len() { return -1 }
+    let mut i = hay.len() - needle.len()
+    while i >= 0 {
+        if hay.substring(i, i + needle.len()) == needle { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+fn rc_of(out) {
+    let marker = "__RC_"
+    let idx = last_idx(out, marker)
+    if idx < 0 { return -1 }
+    let tail = out.substring(idx + 5, out.len()).trim()
+    let mut n = -1
+    try { n = to_int(tail) } catch e { return -1 }
+    return n
+}
+
+fn sh_rc(cmd) {
+    let out = to_string(exec(cmd + " >&2; echo __RC_$?"))
+    return rc_of(out)
+}
+
+fn sh_out(cmd) {
+    return to_string(exec(cmd))
+}
+
+fn try_lock() {
+    let existing = sh_out("cat '" + LOCK + "' 2>/dev/null").trim()
+    if existing.len() > 0 {
+        let chk = sh_out("kill -0 " + existing + " 2>&1; echo __RC_$?")
+        if rc_of(chk) == 0 {
+            println("[LOCKED] another instance alive pid=" + existing)
+            exit(0)
+        }
+    }
+    let wrc = sh_rc("echo $$ > '" + LOCK + "' 2>&1")
+    if wrc != 0 {
+        println("[lock-skip] cannot write " + LOCK + " (sandbox?) — continuing without lock")
+        return
+    }
+    println("[LOCK] acquired pid=" + sh_out("cat '" + LOCK + "' 2>/dev/null").trim())
+}
+
+fn release_lock() {
+    exec("rm -f '" + LOCK + "' 2>/dev/null")
+}
+
+fn raw_pending() {
+    let jq = ".groups[].assets[] | select(.action==\"archive_then_delete\" and .status==\"pending\") | [.path, .r2_bucket, .r2_key, (.size_bytes // 0)] | @tsv"
+    return sh_out("jq -r '" + jq + "' '" + INVENTORY + "'")
+}
+
+fn done_paths() {
+    let cmd = "jq -sr 'map(select(.status==\"deleted\") | .path) | unique | .[]' '" + LOG + "' 2>/dev/null"
+    return sh_out(cmd)
+}
+
+fn contains_line(text, needle) {
+    for line in text.split("\n") {
+        if line == needle { return true }
+    }
+    return false
+}
+
+fn build_queue() {
+    let pending = raw_pending()
+    let done = done_paths()
+    let mut rows = []
+    for line in pending.split("\n") {
+        if line.len() == 0 { continue }
+        let parts = line.split("\t")
+        if parts.len() < 4 { continue }
+        let p = parts[0]
+        if contains_line(done, p) { continue }
+        rows = rows + [parts]
+    }
+    let n = rows.len()
+    let mut i = 0
+    while i < n {
+        let mut j = i + 1
+        while j < n {
+            let si = to_int(rows[i][3])
+            let sj = to_int(rows[j][3])
+            if sj < si {
+                let tmp = rows[i]
+                rows[i] = rows[j]
+                rows[j] = tmp
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return rows
+}
+
+fn kind_of(path) {
+    let out = sh_out("if [ -d '" + shq(path) + "' ]; then echo dir; elif [ -f '" + shq(path) + "' ]; then echo file; else echo missing; fi").trim()
+    return out
+}
+
+fn local_size(path) {
+    let out = sh_out("du -sb '" + shq(path) + "' 2>/dev/null | awk '{print $1}'").trim()
+    if out.len() == 0 { return 0 }
+    let mut n = 0
+    try { n = to_int(out) } catch e { return 0 }
+    return n
+}
+
+fn r2_size(bucket, key) {
+    let cmd = "rclone size 'r2:" + bucket + "/" + key + "' --json 2>/dev/null | jq -r .bytes 2>/dev/null"
+    let out = sh_out(cmd).trim()
+    if out.len() == 0 { return 0 }
+    let mut n = 0
+    try { n = to_int(out) } catch e { return 0 }
+    return n
+}
+
+fn parent_dir(path) {
+    let idx = last_idx(path, "/")
+    if idx < 0 { return "." }
+    return path.substring(0, idx)
+}
+
+fn basename(path) {
+    let idx = last_idx(path, "/")
+    if idx < 0 { return path }
+    return path.substring(idx + 1, path.len())
+}
+
+fn upload_dir(path, bucket, key) {
+    let target = "r2:" + bucket + "/" + key + ".tar.zst"
+    let parent = parent_dir(path)
+    let base = basename(path)
+    let cmd = "tar -cf - -C '" + shq(parent) + "' '" + shq(base) + "' | zstd -T0 -3 | rclone rcat --s3-chunk-size 64M --s3-upload-concurrency 4 '" + target + "'"
+    println("  [upload-dir] " + target)
+    return sh_rc(cmd)
+}
+
+fn upload_file(path, bucket, key) {
+    let target = "r2:" + bucket + "/" + key
+    let cmd = "rclone copyto --s3-chunk-size 64M --s3-upload-concurrency 4 '" + shq(path) + "' '" + target + "'"
+    println("  [upload-file] " + target)
+    return sh_rc(cmd)
+}
+
+fn delete_local(path) {
+    let cmd = "rm -rf '" + shq(path) + "'"
+    return sh_rc(cmd)
+}
+
+fn archive_one(row) {
+    let path = row[0]
+    let bucket = row[1]
+    let key = row[2]
+    let size_est = row[3]
+
+    let k = kind_of(path)
+    if k == "missing" {
+        println("[skip-missing] " + path)
+        log_event(path, "skipped_missing", "")
+        return true
+    }
+
+    println("")
+    println("[" + ts() + "] " + path)
+    println("  kind=" + k + " size_est=" + size_est + " -> r2:" + bucket + "/" + key)
+
+    log_event(path, "uploading", k)
+
+    let mut rc = -1
+    if k == "dir" {
+        rc = upload_dir(path, bucket, key)
+    } else {
+        rc = upload_file(path, bucket, key)
+    }
+
+    if rc != 0 {
+        println("  UPLOAD-FAIL rc=" + to_string(rc))
+        log_event(path, "upload_failed", "rc=" + to_string(rc))
+        return false
+    }
+
+    let verify_key = key
+    if k == "dir" { verify_key = key + ".tar.zst" }
+    let rsize = r2_size(bucket, verify_key)
+
+    if k == "file" {
+        let lsize = local_size(path)
+        if rsize != lsize {
+            println("  VERIFY-FAIL local=" + to_string(lsize) + " r2=" + to_string(rsize))
+            log_event(path, "verify_failed", "local=" + to_string(lsize) + " r2=" + to_string(rsize))
+            return false
+        }
+    }
+
+    if rsize <= 0 {
+        println("  VERIFY-FAIL r2=" + to_string(rsize))
+        log_event(path, "verify_failed", "r2=" + to_string(rsize))
+        return false
+    }
+
+    log_event(path, "verified", "r2_bytes=" + to_string(rsize))
+
+    let drc = delete_local(path)
+    if drc != 0 {
+        println("  DELETE-FAIL rc=" + to_string(drc))
+        log_event(path, "delete_failed", "rc=" + to_string(drc))
+        return false
+    }
+
+    log_event(path, "deleted", "")
+    println("  OK deleted. disk free: " + sh_out("df -h /Users/ghost/core | tail -1 | awk '{print $4}'").trim())
+    return true
+}
+
+fn parse_args(argv) {
+    let mut limit = -1
+    let mut dry = false
+    let mut i = 1
+    while i < argv.len() {
+        let a = argv[i]
+        if a == "--dry" { dry = true }
+        if a == "--limit" {
+            if i + 1 < argv.len() {
+                try { limit = to_int(argv[i + 1]) } catch e { limit = -1 }
+                i = i + 1
+            }
+        }
+        i = i + 1
+    }
+    return [limit, dry]
+}
+
+fn main() {
+    let argv = args()
+    let opts = parse_args(argv)
+    let limit = opts[0]
+    let dry = opts[1]
+
+    if dry == false {
+        try_lock()
+    }
+
+    let queue = build_queue()
+    println("[queue] " + to_string(queue.len()) + " pending items (smallest-first)")
+
+    if queue.len() == 0 {
+        println("[done] nothing to do")
+        release_lock()
+        return
+    }
+
+    let mut processed = 0
+    let mut ok_count = 0
+    let mut fail_count = 0
+
+    for row in queue {
+        if limit >= 0 && processed >= limit {
+            println("[stop] --limit " + to_string(limit) + " reached")
+            break
+        }
+        if dry {
+            println("[dry] " + row[0] + " -> r2:" + row[1] + "/" + row[2] + " (size=" + row[3] + ")")
+            processed = processed + 1
+        } else {
+            let ok = archive_one(row)
+            processed = processed + 1
+            if ok { ok_count = ok_count + 1 } else { fail_count = fail_count + 1 }
+        }
+    }
+
+    println("")
+    println("[summary] processed=" + to_string(processed) + " ok=" + to_string(ok_count) + " fail=" + to_string(fail_count))
+
+    if dry == false {
+        release_lock()
+    }
+}
+
+main()

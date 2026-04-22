@@ -49,7 +49,30 @@ PLISTS=(
     "com.anima.adversarial_bench_periodic.plist"
     "com.anima.cert_dag_periodic.plist"
     "com.anima.auto_evolution.plist"
+    "com.anima.weight_precache_monitor.plist"
+    "com.anima.runpod_credit_check.plist"
+    "com.anima.log_rotation_weekly.plist"
+    "com.anima.dist_native_build_periodic.plist"
 )
+
+# Plists that are SYMLINKED + READY but MUST NOT be launchctl-loaded by
+# --activate (e.g. h100_auto_kill is only meaningful AFTER an H100 pod is
+# launched; loading it early would fire the kill hourly against a non-
+# existent pod). --unload still unloads them if they are loaded.
+SKIP_ACTIVATION=(
+    "com.anima.h100_auto_kill.plist"
+)
+
+_is_skip_activation() {
+    local candidate="$1"
+    local s
+    for s in "${SKIP_ACTIVATION[@]}"; do
+        if [[ "${s}" == "${candidate}" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
 
 MODE="${1:-}"
 if [[ -z "${MODE}" ]]; then
@@ -107,8 +130,16 @@ link_only() {
             rm "${dst}"
             ln -s "${src}" "${dst}"
         elif [[ -e "${dst}" ]]; then
-            echo "  [SKIP non-symlink dst exists]  ${p} — manual review required"
-            continue
+            # If the dst is a plain file identical to src, replace with symlink;
+            # otherwise require manual review.
+            if cmp -s "${src}" "${dst}"; then
+                rm "${dst}"
+                ln -s "${src}" "${dst}"
+                echo "  [REPLACED-FILE-WITH-LINK]  ${p}"
+            else
+                echo "  [SKIP non-symlink dst exists]  ${p} — manual review required"
+                continue
+            fi
         else
             ln -s "${src}" "${dst}"
             echo "  [LINK CREATED    ]  ${p}"
@@ -126,12 +157,20 @@ activate() {
             echo "  [SKIP not-linked]  ${p}"
             continue
         fi
-        # Idempotent: launchctl load is a no-op if already loaded; suppress its
-        # "already loaded" stderr.
+        if _is_skip_activation "${p}"; then
+            echo "  [SKIP-ACTIVATION]  ${p}  (per SKIP_ACTIVATION policy)"
+            continue
+        fi
+        # Idempotent: check whether label is already loaded before calling load.
+        local label="${p%.plist}"
+        if launchctl list "${label}" >/dev/null 2>&1; then
+            echo "  [ALREADY-LOADED ]  ${p}"
+            continue
+        fi
         if launchctl load -w "${dst}" 2>/dev/null; then
             echo "  [LOADED         ]  ${p}"
         else
-            echo "  [ALREADY-LOADED ]  ${p}"
+            echo "  [LOAD-FAILED    ]  ${p}"
         fi
     done
     echo
