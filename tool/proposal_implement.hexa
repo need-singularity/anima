@@ -1,0 +1,386 @@
+// tool/proposal_implement.hexa — anima proposal stack: emit propose-only md
+//
+// PURPOSE
+//   For an APPROVED proposal, emit docs/proposed_implementation_<N>.md as a
+//   spec for the user to spawn a sub-agent against. Set
+//   inventory.proposal.implementation_module_path = <propose-only path>.
+//   P4 (docs/anima_proposal_stack_paradigm_20260422.md §5 + §8 + raw#20).
+//
+// USAGE
+//   hexa tool/proposal_implement.hexa --id <N>
+//   hexa tool/proposal_implement.hexa --selftest
+//
+// EXIT
+//   0 success | 1 validation fail | 3 user error
+//
+// HARD CONSTRAINTS
+//   - 자동 코드 생성/수정 절대 금지 (raw#20).
+//   - implementation_module_path is PROPOSED only (file may not exist —
+//     it is the *intended* path for the future module).
+//   - Re-running on same id (md already emitted) → exit 0 noop.
+
+let DEFAULT_ROOT     = "/Users/ghost/core/anima"
+let PROPOSALS_DIR    = DEFAULT_ROOT + "/state/proposals"
+let APPROVED_DIR     = PROPOSALS_DIR + "/approved"
+let DOCS_DIR         = DEFAULT_ROOT + "/docs"
+let INVENTORY_PATH   = PROPOSALS_DIR + "/inventory.json"
+
+// ─── shared helpers ──────────────────────────────────────────────────
+
+fn _str(x) -> string { return to_string(x) }
+
+fn _sh_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _fexists(p: string) -> bool {
+    let r = to_string(exec("ls -d " + _sh_quote(p) + " 2>/dev/null")).trim()
+    return r == p
+}
+
+fn _now_iso() -> string {
+    return to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+}
+
+fn _ensure_dir(p: string) { exec("mkdir -p " + _sh_quote(p)) }
+
+fn _atomic_write(path: string, body: string) {
+    let mut last_sl = -1
+    let mut k = 0
+    while k < len(path) {
+        if path.substring(k, k + 1) == "/" { last_sl = k }
+        k = k + 1
+    }
+    if last_sl > 0 { _ensure_dir(path.substring(0, last_sl)) }
+    let tmp = path + ".tmp"
+    write_file(tmp, body)
+    exec("mv -f " + _sh_quote(tmp) + " " + _sh_quote(path))
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _arg_value(argv, key: string, dflt: string) -> string {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key && i + 1 < len(argv) { return _str(argv[i + 1]) }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _json_esc(s: string) -> string {
+    let mut out = ""
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "\\" { out = out + "\\\\" }
+        else if c == "\"" { out = out + "\\\"" }
+        else if c == "\n" { out = out + "\\n" }
+        else if c == "\r" { out = out + "\\r" }
+        else if c == "\t" { out = out + "\\t" }
+        else { out = out + c }
+        i = i + 1
+    }
+    return out
+}
+
+fn _list_dir(dir: string) -> array {
+    if !_fexists(dir) { return [] }
+    let raw = to_string(exec("ls -1 " + _sh_quote(dir) + " 2>/dev/null"))
+    let mut out = []
+    let mut buf = ""
+    let mut i = 0
+    while i < len(raw) {
+        let c = raw.substring(i, i + 1)
+        if c == "\n" {
+            if len(buf) > 0 { out = out.push(buf) }
+            buf = ""
+        } else {
+            buf = buf + c
+        }
+        i = i + 1
+    }
+    if len(buf) > 0 { out = out.push(buf) }
+    return out
+}
+
+fn _resolve_proposal_file(dir: string, id: string) -> string {
+    if !_fexists(dir) { return "" }
+    let exact = dir + "/" + id + ".json"
+    if _fexists(exact) { return exact }
+    let files = _list_dir(dir)
+    let mut i = 0
+    let suffix = "-" + id + ".json"
+    let prefix = id + "_"
+    let prefix_dot = id + ".json"
+    while i < len(files) {
+        let f = files[i]
+        if f == prefix_dot { return dir + "/" + f }
+        if len(f) >= len(suffix) {
+            let tail = f.substring(len(f) - len(suffix), len(f))
+            if tail == suffix { return dir + "/" + f }
+        }
+        if len(f) >= len(prefix) {
+            let head = f.substring(0, len(prefix))
+            if head == prefix { return dir + "/" + f }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _load_inventory() {
+    if !_fexists(INVENTORY_PATH) {
+        return json_parse("{\"schema\":\"anima.proposals.inventory.v1\",\"updated_at\":\"\",\"proposals\":[]}")
+    }
+    return json_parse(read_file(INVENTORY_PATH))
+}
+
+fn _inv_find_idx(inv, id: string) -> int {
+    if !inv.contains_key("proposals") { return -1 }
+    let ps = inv["proposals"]
+    let mut i = 0
+    while i < len(ps) {
+        let p = ps[i]
+        if p.contains_key("id") && _str(p["id"]) == id { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _proposal_to_json(p) -> string {
+    let ks = keys(p)
+    let mut out = "{\n"
+    let mut i = 0
+    while i < len(ks) {
+        let k = ks[i]
+        let v = p[k]
+        out = out + "    \"" + _json_esc(k) + "\": "
+        if v == null {
+            out = out + "null"
+        } else {
+            let s = _str(v)
+            if s == "true" || s == "false" { out = out + s }
+            else if s != "" && (s.substring(0, 1) == "0" || s.substring(0, 1) == "1" || s.substring(0, 1) == "2" || s.substring(0, 1) == "3" || s.substring(0, 1) == "4" || s.substring(0, 1) == "5" || s.substring(0, 1) == "6" || s.substring(0, 1) == "7" || s.substring(0, 1) == "8" || s.substring(0, 1) == "9" || s.substring(0, 1) == "-") {
+                if k == "id" || k == "first_seen_ts" || k == "last_refined_ts" || k == "user_decision_at" {
+                    out = out + "\"" + _json_esc(s) + "\""
+                } else {
+                    out = out + s
+                }
+            } else {
+                out = out + "\"" + _json_esc(s) + "\""
+            }
+        }
+        if i + 1 < len(ks) { out = out + "," }
+        out = out + "\n"
+        i = i + 1
+    }
+    out = out + "  }"
+    return out
+}
+
+fn _save_inventory(inv) {
+    let ps = if inv.contains_key("proposals") { inv["proposals"] } else { [] }
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima.proposals.inventory.v1\",\n"
+    body = body + "  \"updated_at\": \"" + _now_iso() + "\",\n"
+    body = body + "  \"proposals\": [\n"
+    let mut i = 0
+    while i < len(ps) {
+        body = body + "  " + _proposal_to_json(ps[i])
+        if i + 1 < len(ps) { body = body + "," }
+        body = body + "\n"
+        i = i + 1
+    }
+    body = body + "  ]\n"
+    body = body + "}\n"
+    _atomic_write(INVENTORY_PATH, body)
+}
+
+fn _per_proposal_load(path: string) {
+    return json_parse(read_file(path))
+}
+
+fn _per_proposal_save(path: string, p) {
+    let raw = _proposal_to_json(p)
+    _atomic_write(path, raw + "\n")
+}
+
+fn _set_field(p, k: string, v) { p[k] = v }
+
+// ─── propose-only md emission ────────────────────────────────────────
+//
+// Spec body intentionally minimal & propose-only. The user copies/pastes
+// this into a sub-agent prompt. NO code generation happens here.
+
+fn _propose_md_path(id: string) -> string {
+    return DOCS_DIR + "/proposed_implementation_" + id + ".md"
+}
+
+fn _propose_module_path(id: string, kind: string) -> string {
+    // Default propose-only path. raw#20: this is a *suggestion*, the path
+    // need not (and must not, until user spawns sub-agent) exist.
+    if kind == "tool" { return "tool/proposal_" + id + ".hexa" }
+    if kind == "cert" { return "cert/proposal_" + id + ".hexa" }
+    if kind == "doc"  { return "docs/proposal_" + id + ".md" }
+    return "tool/proposal_" + id + ".hexa"
+}
+
+fn _emit_propose_md(p, md_path: string, module_path: string) {
+    let id    = if p.contains_key("id")    { _str(p["id"])    } else { "" }
+    let title = if p.contains_key("title") { _str(p["title"]) } else { "(untitled)" }
+    let kind  = if p.contains_key("kind")  { _str(p["kind"])  } else { "tool" }
+    let rationale = if p.contains_key("rationale") { _str(p["rationale"]) } else { "" }
+    let effort = if p.contains_key("estimated_effort") { _str(p["estimated_effort"]) } else { "" }
+    let impact = if p.contains_key("estimated_impact") { _str(p["estimated_impact"]) } else { "" }
+    let risk   = if p.contains_key("risk_level") { _str(p["risk_level"]) } else { "" }
+
+    let mut body = ""
+    body = body + "# Proposed Implementation Spec — proposal #" + id + "\n\n"
+    body = body + "Generated: " + _now_iso() + "\n"
+    body = body + "Source: state/proposals/approved/<id>.json\n"
+    body = body + "Status: PROPOSE-ONLY (raw#20 — do NOT auto-implement)\n\n"
+    body = body + "---\n\n"
+    body = body + "## Title\n" + title + "\n\n"
+    body = body + "## Kind\n" + kind + "\n\n"
+    body = body + "## Proposed module path (does not yet exist)\n`" + module_path + "`\n\n"
+    body = body + "## Rationale\n" + rationale + "\n\n"
+    body = body + "## Effort estimate\n" + effort + "\n\n"
+    body = body + "## Impact estimate\n" + impact + "\n\n"
+    body = body + "## Risk level\n" + risk + "\n\n"
+    body = body + "---\n\n"
+    body = body + "## Sub-agent instructions\n"
+    body = body + "1. Read the approved proposal JSON at `state/proposals/approved/" + id + ".json` for full spec.\n"
+    body = body + "2. Build the module at `" + module_path + "` per hexa conventions (raw#9/10/11/15).\n"
+    body = body + "3. Include a `--selftest` that exits 0 on success.\n"
+    body = body + "4. After the module is built and selftest passes, the USER (not auto) runs:\n"
+    body = body + "   `hexa tool/proposal_archive.hexa --id " + id + " --module-path " + module_path + "`\n"
+    body = body + "5. archive verifies file existence + selftest exit 0, then moves approved → archived.\n\n"
+    body = body + "## Anti-patterns\n"
+    body = body + "- ❌ This file is NOT executable spec — do NOT build until user spawns sub-agent.\n"
+    body = body + "- ❌ Do NOT modify .roadmap (uchg).\n"
+    body = body + "- ❌ Do NOT write .py files (hexa-only, raw#9).\n"
+    _atomic_write(md_path, body)
+}
+
+// ─── core action ─────────────────────────────────────────────────────
+
+fn _do_implement(id: string) -> array {
+    if id == "" { return [3, "proposal_implement: --id required"] }
+
+    let approved_path = _resolve_proposal_file(APPROVED_DIR, id)
+    if approved_path == "" {
+        return [1, "proposal_implement: id=" + id + " not found in approved/ — must be approved first"]
+    }
+
+    let p = _per_proposal_load(approved_path)
+    let kind = if p.contains_key("kind") { _str(p["kind"]) } else { "tool" }
+
+    let md_path = _propose_md_path(id)
+    let module_path = _propose_module_path(id, kind)
+
+    // Idempotency: if md already exists AND inventory already has same
+    // implementation_module_path → exit 0 noop.
+    let inv_pre = _load_inventory()
+    let idx = _inv_find_idx(inv_pre, id)
+    if _fexists(md_path) && idx >= 0 {
+        let pre_entry = (inv_pre["proposals"])[idx]
+        let pre_mod = if pre_entry.contains_key("implementation_module_path") {
+            _str(pre_entry["implementation_module_path"])
+        } else { "" }
+        if pre_mod == module_path {
+            return [0, "proposal_implement: id=" + id + " md already at " + md_path + ", inventory already has module_path (noop)"]
+        }
+    }
+
+    _emit_propose_md(p, md_path, module_path)
+
+    // Mutate per-proposal json: implementation_module_path field (PROPOSED).
+    _set_field(p, "implementation_module_path", module_path)
+    _per_proposal_save(approved_path, p)
+
+    // Update inventory.
+    let inv = _load_inventory()
+    let idx2 = _inv_find_idx(inv, id)
+    if idx2 >= 0 {
+        let ps = inv["proposals"]
+        let entry = ps[idx2]
+        _set_field(entry, "implementation_module_path", module_path)
+        ps[idx2] = entry
+        inv["proposals"] = ps
+    }
+    _save_inventory(inv)
+
+    return [0, "proposal_implement: id=" + id + " emitted propose-md at " + md_path + " (module_path proposed: " + module_path + ")"]
+}
+
+// ─── selftest ────────────────────────────────────────────────────────
+
+fn _selftest() -> array {
+    let id = "99999999-T03"
+    let approved_path = APPROVED_DIR + "/" + id + ".json"
+    let md_path = DOCS_DIR + "/proposed_implementation_" + id + ".md"
+    let module_path = "tool/proposal_" + id + ".hexa"
+    let module_abs = DEFAULT_ROOT + "/" + module_path
+
+    _ensure_dir(APPROVED_DIR)
+    _ensure_dir(DOCS_DIR)
+    exec("rm -f " + _sh_quote(approved_path) + " " + _sh_quote(md_path))
+
+    let synth = "{\n  \"id\": \"" + id + "\",\n  \"title\": \"selftest synthetic implement\",\n  \"kind\": \"tool\",\n  \"user_status\": \"approved\",\n  \"rationale\": \"selftest rationale\",\n  \"estimated_effort\": \"1h\",\n  \"estimated_impact\": \"selftest only\",\n  \"risk_level\": \"low\"\n}\n"
+    _atomic_write(approved_path, synth)
+
+    let r = _do_implement(id)
+    if r[0] != 0 {
+        exec("rm -f " + _sh_quote(approved_path) + " " + _sh_quote(md_path))
+        return [false, "S1: implement returned " + _str(r[0]) + " — " + _str(r[1])]
+    }
+
+    if !_fexists(md_path) {
+        return [false, "S1: propose md missing at " + md_path]
+    }
+
+    // Critical: the proposed module path must NOT exist (raw#20).
+    if _fexists(module_abs) {
+        exec("rm -f " + _sh_quote(approved_path) + " " + _sh_quote(md_path))
+        return [false, "S1: VIOLATION raw#20 — module path " + module_abs + " was created (must remain non-existent until user-trigger sub-agent)"]
+    }
+
+    // Idempotency: re-run → noop exit 0.
+    let r2 = _do_implement(id)
+    if r2[0] != 0 {
+        exec("rm -f " + _sh_quote(approved_path) + " " + _sh_quote(md_path))
+        return [false, "S2: idempotent re-implement returned " + _str(r2[0]) + " — " + _str(r2[1])]
+    }
+
+    // Cleanup synthetic.
+    exec("rm -f " + _sh_quote(approved_path) + " " + _sh_quote(md_path))
+
+    return [true, "S1 propose-md emitted (module path NOT created, raw#20 OK) + S2 idempotent → 2/2 PASS"]
+}
+
+// ─── CLI ─────────────────────────────────────────────────────────────
+
+let argv = args()
+
+if _arg_present(argv, "--selftest") {
+    println("── proposal_implement selftest ──")
+    let r = _selftest()
+    println(_str(r[1]))
+    println("── selftest result: " + (if r[0] { "2/2 PASS" } else { "FAIL" }) + " ──")
+    if r[0] { exit(0) }
+    exit(1)
+}
+
+let id = _arg_value(argv, "--id", "")
+let r = _do_implement(id)
+println(_str(r[1]))
+exit(r[0])

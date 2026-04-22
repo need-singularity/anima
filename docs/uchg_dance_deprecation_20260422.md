@@ -91,9 +91,18 @@ hexa tool/uchg_safe_edit.hexa --file tool/<your_tool>.hexa --allow-comments
 
 ## Files migrated 2026-04-22
 
-- `tool/roadmap_auto_reflect.hexa` — `--apply` path
-- `tool/phase_progression_controller.hexa` — `_raw_audit_append`
-- `tool/ps_9_l0_lock.hexa` — `l0_lock` write+chflags
+Executable dance migrations:
+
+- `tool/roadmap_auto_reflect.hexa` — `--apply` path → `with_unlock_apply()`
+- `tool/phase_progression_controller.hexa` — `_raw_audit_append` wrap
+- `tool/ps_9_l0_lock.hexa` — `l0_lock` → `_stage_via_helper`
+- `tool/phase_flow_planner.hexa` — `_append_entries` (initial grep
+  missed this; dance was hidden behind `_chflags()` indirection)
+
+Proposal text rewritten:
+
+- `tool/roadmap_83_auto_mark.hexa` — `dance` array → `recipe` that
+  invokes `roadmap_with_unlock.hexa`
 
 Files inspected and confirmed NOT to contain a dance (lock-only or
 comment-only references retained):
@@ -103,6 +112,5 @@ comment-only references retained):
 - `tool/roadmap_live_daemon.hexa` — enforce-only
 - `tool/roadmap_integrity_guard.hexa` — check-only
 - `tool/closure_debt_scanner.hexa`, `tool/problem_solving_protocol.hexa`,
-  `tool/ps_10_milestone.hexa`, `tool/ssot_cross_check.hexa`,
-  `tool/roadmap_83_auto_mark.hexa`, `tool/phase_flow_planner.hexa` —
+  `tool/ps_10_milestone.hexa`, `tool/ssot_cross_check.hexa` —
   comment / docstring references only

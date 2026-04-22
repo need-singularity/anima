@@ -17,6 +17,7 @@
 #    - com.anima.worktree_merge_bot.plist             (pre-existing)
 #    - com.anima.adversarial_bench_periodic.plist     (D24: new, every 6h)
 #    - com.anima.cert_dag_periodic.plist              (E26: new, every 12h)
+#    - com.anima.auto_evolution.plist                 (P9: every 12h)
 #
 #  USAGE
 #    bash tool/launchd_install_local.bash                # default: --dry-run
@@ -47,6 +48,7 @@ PLISTS=(
     "com.anima.worktree_merge_bot.plist"
     "com.anima.adversarial_bench_periodic.plist"
     "com.anima.cert_dag_periodic.plist"
+    "com.anima.auto_evolution.plist"
 )
 
 MODE="${1:-}"

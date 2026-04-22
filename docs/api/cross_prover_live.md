@@ -1,0 +1,149 @@
+<!-- AUTO-GENERATED, DO NOT EDIT — source: tool/api_surface_extract.hexa -->
+<!-- generated: 2026-04-22T12:40:18Z -->
+<!-- source: tool/cross_prover_live.hexa -->
+<!-- entry_count: 24 -->
+
+# `tool/cross_prover_live.hexa` API surface
+
+_AUTO-GENERATED, DO NOT EDIT — generated 2026-04-22T12:40:18Z UTC._
+
+**Tool:** � π cross-prover live wire (n6↔anima via θ diagonal)
+
+**Public/Internal entries:** 24
+
+## Table of contents
+
+- `fn clamp01`
+- `fn sqrt_newton`
+- `fn round4`
+- `fn is_digit`
+- `fn leading_int`
+- `fn json_int`
+- `fn json_obj_body`
+- `fn yield_body_to_tokens`
+- `fn extract_round`
+- `fn push_n`
+- `fn mock_round`
+- `fn index_of_str`
+- `fn contains_str`
+- `fn histogram`
+- `fn align_vectors`
+- `fn cosine_counts`
+- `fn jaccard_sets`
+- `fn diagonal_agreement_breakdown`
+- `fn verdict_label`
+- `fn verdict_exit`
+- `fn emit_cert`
+- `fn safe_read`
+- `fn is_flag`
+- `fn main`
+
+## Entries
+
+### `fn clamp01(x: float) -> float`
+
+_(no docstring)_
+
+### `fn sqrt_newton(x: float) -> float`
+
+_(no docstring)_
+
+### `fn round4(x: float) -> float`
+
+_(no docstring)_
+
+### `fn is_digit(c: string) -> bool`
+
+_(no docstring)_
+
+### `fn leading_int(s: string) -> int`
+
+> Take leading-digit run of a string and return it as int. Handles
+> optional leading whitespace. Returns -1 if no digits found.
+> Uses split("") to iterate characters (stage0-safe).
+
+### `fn json_int(line: string, key: string) -> int`
+
+> ─── NDJSON helpers (split-only) ────────────────────────────────────
+> Given a single NDJSON line and a key name, return the int value of
+> `"<key>":<digits>`. Returns -1 if key absent or non-numeric.
+
+### `fn json_obj_body(line: string, key: string) -> string`
+
+> Given an NDJSON line, return the raw body of `"<key>":{...}` (without
+> the wrapping braces). Returns "" if key absent.
+> Note: this does NOT handle nested objects inside <key>. For drill NDJSON
+> yield/plan/actual bodies that is fine — they are flat.
+
+### `fn yield_body_to_tokens(yield_body: string) -> array`
+
+> ─── yield projection (split-only) ──────────────────────────────────
+> yield_body looks like: "smash":5,"free":0,"absolute":0,...
+> For each "<cat>":N entry, emit N copies of <cat> into token bag.
+
+### `fn extract_round(ndjson_body: string, want_round: int) -> array`
+
+> Find yield bag for a given round in NDJSON body. Returns empty [] if
+> round not present.
+
+### `fn push_n(arr: array, tok: string, n: int) -> array`
+
+_(no docstring)_
+
+### `fn mock_round(r: int) -> array`
+
+_(no docstring)_
+
+### `fn index_of_str(arr: array, s: string) -> int`
+
+_(no docstring)_
+
+### `fn contains_str(arr: array, s: string) -> bool`
+
+_(no docstring)_
+
+### `fn histogram(tokens: array) -> array`
+
+_(no docstring)_
+
+### `fn align_vectors(keys_a: array, counts_a: array, keys_b: array, counts_b: array) -> array`
+
+_(no docstring)_
+
+### `fn cosine_counts(va: array, vb: array) -> float`
+
+_(no docstring)_
+
+### `fn jaccard_sets(keys_a: array, keys_b: array) -> float`
+
+_(no docstring)_
+
+### `fn diagonal_agreement_breakdown(tokens_a: array, tokens_b: array) -> array`
+
+> Returns [cos, jac, hybrid] matching tool/drill_diagonal_agreement.hexa.
+
+### `fn verdict_label(h12: float, h23: float, h13: float) -> string`
+
+_(no docstring)_
+
+### `fn verdict_exit(label: string) -> int`
+
+_(no docstring)_
+
+### `fn emit_cert(path_in: string, n_rounds: int, src_r1: string, src_r2: string, src_r3: string, cos12: float, jac12: float, h12: float, cos23: float, jac23: float, h23: float, cos13: float, jac13: float, h13: float, verdict: string)`
+
+_(no docstring)_
+
+### `fn safe_read(path: string) -> string`
+
+_(no docstring)_
+
+### `fn is_flag(arg: string) -> bool`
+
+> Identify a positional argument (not starting with '-') without using
+> .substring() — inspect the first character via split("").
+
+### `fn main()`
+
+_(no docstring)_
+

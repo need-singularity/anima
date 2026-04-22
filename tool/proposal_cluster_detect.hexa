@@ -1,0 +1,660 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/proposal_cluster_detect.hexa — P7 (proposal stack paradigm §7 cluster)
+//
+//  PURPOSE
+//    Scan pending proposals + inventory for groups of 5+ related items.
+//    Two grouping signals (algorithm):
+//      A. EVIDENCE-ROOT signal:
+//         For every proposal collect roots of every evidence_sources[].path
+//         (root = first 2 path segments under repo, e.g. "tool/x", "state/y").
+//         Any root shared by ≥ 5 distinct proposal ids → cluster candidate.
+//      B. KIND-KEYWORD signal:
+//         (kind, keyword) where keyword ∈ tokenized(title) ∩ STOP_FILTERED.
+//         Any pair shared by ≥ 5 distinct proposal ids → cluster candidate.
+//
+//  EMIT (only with --apply)
+//    state/proposals/clusters/<cluster_slug>.json
+//        {
+//          "id": "<cluster_id>",
+//          "kind": "cluster",
+//          "title": "...",
+//          "rationale": "...",
+//          "members": ["20260422-001", ...],
+//          "signal": {"kind": "evidence_root|kind_keyword", "key": "..."},
+//          "ts": "..."
+//        }
+//    + append cluster proposal stub to inventory.json (kind=cluster).
+//
+//  FLAGS
+//    (default)    dry-run — print candidates only, no file emit
+//    --apply      emit cluster json + inventory append
+//    --selftest   synthetic 6 proposals (5 sharing same evidence root) →
+//                 must detect exactly 1 cluster of 5 members
+//
+//  SAFETY
+//    - READ-ONLY for individual proposals (only cluster json is created)
+//    - never modifies .roadmap
+//    - no .py emitted
+//
+//  RAW
+//    raw#9 hexa-only · raw#10 deterministic · raw#11 snake_case
+//    raw#12 실측 only · raw#15 no-hardcode (paths anchored at REPO_ROOT)
+//
+//  EXIT CODES
+//    0 — done (any mode) / selftest pass
+//    1 — selftest fail
+//    2 — setup error
+// ════════════════════════════════════════════════════════════════════════════
+
+let TOOL_NAME    = "proposal_cluster_detect"
+let TOOL_VERSION = "v1"
+let REPO_ROOT    = "/Users/ghost/core/anima"
+let PROP_ROOT    = "/Users/ghost/core/anima/state/proposals"
+let INVENTORY    = "/Users/ghost/core/anima/state/proposals/inventory.json"
+let PENDING_DIR  = "/Users/ghost/core/anima/state/proposals/pending"
+let CLUSTER_DIR  = "/Users/ghost/core/anima/state/proposals/clusters"
+let SMOKE_OUT    = "/Users/ghost/core/anima/state/proposal_cluster_detect_result.json"
+let STATE_DIR    = "/Users/ghost/core/anima/state"
+
+let CLUSTER_THRESHOLD = 5
+
+// stop-words excluded from kind-keyword signal (lowercase compare).
+let STOP_WORDS = ["the","a","an","of","for","and","or","to","in","on","by",
+                  "with","from","into","add","fix","update","new","tool",
+                  "auto","via","using","based","support","make","into"]
+
+// ─── shell helpers ───────────────────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    let mut out = "'"
+    out = out + s.replace("'", "'\\''")
+    out = out + "'"
+    return out
+}
+
+fn _exec_out(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _exec_code(cmd: string) -> int {
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+fn _ts_iso() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _date_compact() -> string {
+    return _exec_out("date -u +%Y%m%d").trim()
+}
+
+fn _bool_s(b: bool) -> string {
+    if b { return "true" } else { return "false" }
+}
+
+fn _file_exists(path: string) -> bool {
+    let r = exec_with_status("test -e " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _is_file(path: string) -> bool {
+    let r = exec_with_status("test -f " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _mkdir_p(d: string) -> bool {
+    let r = exec_with_status("mkdir -p " + _sh_quote(d))
+    return r[1] == 0
+}
+
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+fn flag_present(name: string) -> bool {
+    let argv = args()
+    let mut i = 0
+    while i < len(argv) {
+        if to_string(argv[i]) == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── path / token helpers ────────────────────────────────────────────────────
+
+// "tool/proposal_emit.hexa"      → "tool/proposal_emit.hexa"   (2-seg root)
+// "state/proposals/pending/x"    → "state/proposals"
+// "/Users/ghost/core/anima/tool/x.hexa"
+//                                → "tool/x.hexa"
+fn evidence_root(p: string) -> string {
+    let mut s = p.trim()
+    if len(s) == 0 { return "" }
+    // strip repo root prefix if absolute
+    let prefix = REPO_ROOT + "/"
+    if s.starts_with(prefix) { s = s.substring(len(prefix), len(s)) }
+    if s.starts_with("/") { s = s.substring(1, len(s)) }
+    let parts = split(s, "/")
+    if len(parts) == 0 { return s }
+    if len(parts) == 1 { return to_string(parts[0]) }
+    return to_string(parts[0]) + "/" + to_string(parts[1])
+}
+
+fn _is_stop(w: string) -> bool {
+    let mut i = 0
+    while i < len(STOP_WORDS) {
+        if to_string(STOP_WORDS[i]) == w { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn tokenize_title(t: string) -> array {
+    let mut s = t.to_lower()
+    // replace separators with space
+    let seps = ["-", "_", ".", "/", ",", ":", ";", "(", ")", "[", "]",
+                "{", "}", "<", ">", "?", "!", "\""]
+    let mut i = 0
+    while i < len(seps) {
+        s = s.replace(to_string(seps[i]), " ")
+        i = i + 1
+    }
+    let raw = split(s, " ")
+    let mut out = []
+    let mut j = 0
+    while j < len(raw) {
+        let w = to_string(raw[j]).trim()
+        if len(w) >= 3 && !_is_stop(w) {
+            out.push(w)
+        }
+        j = j + 1
+    }
+    return out
+}
+
+fn _slugify(s: string) -> string {
+    let mut out = s.to_lower()
+    out = out.replace("/", "_").replace(".", "_").replace(" ", "_")
+    out = out.replace("-", "_").replace(":", "_")
+    // collapse double underscores (best-effort)
+    let mut prev = ""
+    while prev != out {
+        prev = out
+        out = out.replace("__", "_")
+    }
+    if out.starts_with("_") { out = out.substring(1, len(out)) }
+    if out.ends_with("_") { out = out.substring(0, len(out) - 1) }
+    if len(out) > 60 { out = out.substring(0, 60) }
+    return out
+}
+
+// ─── proposal ingestion ──────────────────────────────────────────────────────
+//
+// Each ingested proposal: { id, title, kind, evidence_paths:[] }
+//
+// Sources:
+//   1. state/proposals/pending/*.json
+//   2. state/proposals/inventory.json (entries)
+
+fn _list_pending_files() -> array {
+    let mut acc = []
+    if !_file_exists(PENDING_DIR) { return acc }
+    let out = _exec_out("ls -1 " + _sh_quote(PENDING_DIR) + " 2>/dev/null").trim()
+    if len(out) == 0 { return acc }
+    let lines = split(out, "\n")
+    let mut i = 0
+    while i < len(lines) {
+        let f = to_string(lines[i]).trim()
+        if len(f) > 0 && f.ends_with(".json") {
+            acc.push(PENDING_DIR + "/" + f)
+        }
+        i = i + 1
+    }
+    return acc
+}
+
+fn _ingest_doc(props, doc) {
+    let id = if doc.contains_key("id") { to_string(doc["id"]) } else { "" }
+    if len(id) == 0 { return props }
+    let title = if doc.contains_key("title") { to_string(doc["title"]) } else { "" }
+    let kind  = if doc.contains_key("kind")  { to_string(doc["kind"])  } else { "" }
+    let mut roots = []
+    if doc.contains_key("evidence_sources") {
+        let ev = doc["evidence_sources"]
+        if type_of(ev) == "array" {
+            let mut i = 0
+            while i < len(ev) {
+                let e = ev[i]
+                let p = if type_of(e) == "string" {
+                    to_string(e)
+                } else if type_of(e) == "object_dynamic" || type_of(e) == "map" {
+                    if e.contains_key("path") { to_string(e["path"]) } else { "" }
+                } else if type_of(e) == "array" {
+                    ""
+                } else {
+                    ""
+                }
+                let r = evidence_root(p)
+                if len(r) > 0 { roots.push(r) }
+                i = i + 1
+            }
+        }
+    }
+    let mut entry = #{}
+    entry["id"] = id
+    entry["title"] = title
+    entry["kind"] = kind
+    entry["roots"] = roots
+    // Last write wins (pending may override inventory).
+    props[id] = entry
+    return props
+}
+
+fn load_proposals() {
+    let mut props = #{}
+    // inventory first
+    if _is_file(INVENTORY) {
+        let raw = read_file(INVENTORY).trim()
+        if len(raw) > 0 {
+            let doc = json_parse(raw)
+            let entries = if doc.contains_key("entries") { doc["entries"] } else { doc }
+            if type_of(entries) == "array" {
+                let mut i = 0
+                while i < len(entries) {
+                    props = _ingest_doc(props, entries[i])
+                    i = i + 1
+                }
+            }
+        }
+    }
+    // pending overlay
+    let files = _list_pending_files()
+    let mut i = 0
+    while i < len(files) {
+        let p = to_string(files[i])
+        let raw = read_file(p).trim()
+        if len(raw) > 0 {
+            props = _ingest_doc(props, json_parse(raw))
+        }
+        i = i + 1
+    }
+    return props
+}
+
+// ─── cluster algorithm ───────────────────────────────────────────────────────
+//
+// Signal A: evidence root → [ids]
+// Signal B: "<kind>::<keyword>" → [ids]
+//
+// Threshold check: |ids| >= CLUSTER_THRESHOLD (5).
+// Output candidates sorted deterministically by signal kind then key.
+
+fn _push_unique(arr, v: string) {
+    let mut i = 0
+    while i < len(arr) {
+        if to_string(arr[i]) == v { return arr }
+        i = i + 1
+    }
+    arr.push(v)
+    return arr
+}
+
+fn detect_clusters(props) -> array {
+    let mut by_root = #{}
+    let mut by_kk   = #{}
+    let ids = props.keys()
+    let mut i = 0
+    while i < len(ids) {
+        let id = to_string(ids[i])
+        let p = props[id]
+        let roots = p["roots"]
+        let mut j = 0
+        while j < len(roots) {
+            let r = to_string(roots[j])
+            if !by_root.contains_key(r) { by_root[r] = [] }
+            by_root[r] = _push_unique(by_root[r], id)
+            j = j + 1
+        }
+        let kind = to_string(p["kind"])
+        let toks = tokenize_title(to_string(p["title"]))
+        let mut k = 0
+        while k < len(toks) {
+            let key = kind + "::" + to_string(toks[k])
+            if !by_kk.contains_key(key) { by_kk[key] = [] }
+            by_kk[key] = _push_unique(by_kk[key], id)
+            k = k + 1
+        }
+        i = i + 1
+    }
+
+    let mut out = []
+    let rkeys = by_root.keys()
+    let mut a = 0
+    while a < len(rkeys) {
+        let key = to_string(rkeys[a])
+        let members = by_root[key]
+        if len(members) >= CLUSTER_THRESHOLD {
+            let mut c = #{}
+            c["signal_kind"] = "evidence_root"
+            c["signal_key"] = key
+            c["members"] = members
+            out.push(c)
+        }
+        a = a + 1
+    }
+    let kkeys = by_kk.keys()
+    let mut b = 0
+    while b < len(kkeys) {
+        let key = to_string(kkeys[b])
+        let members = by_kk[key]
+        if len(members) >= CLUSTER_THRESHOLD {
+            let mut c = #{}
+            c["signal_kind"] = "kind_keyword"
+            c["signal_key"] = key
+            c["members"] = members
+            out.push(c)
+        }
+        b = b + 1
+    }
+    return out
+}
+
+// ─── emission ────────────────────────────────────────────────────────────────
+
+fn _members_json(members: array) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < len(members) {
+        if i > 0 { s = s + ", " }
+        s = s + "\"" + _json_escape(to_string(members[i])) + "\""
+        i = i + 1
+    }
+    s = s + "]"
+    return s
+}
+
+fn render_cluster_json(cluster_id: string, slug: string, signal_kind: string,
+                       signal_key: string, members: array) -> string {
+    let title = "cluster: " + signal_kind + " = " + signal_key
+    let rationale = "auto-detected by P7 — " + to_string(len(members)) +
+                    " proposals share " + signal_kind + " '" + signal_key +
+                    "' (threshold = " + to_string(CLUSTER_THRESHOLD) + ")"
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima.proposal_cluster.v1\",\n"
+    body = body + "  \"id\": \"" + _json_escape(cluster_id) + "\",\n"
+    body = body + "  \"slug\": \"" + _json_escape(slug) + "\",\n"
+    body = body + "  \"kind\": \"cluster\",\n"
+    body = body + "  \"title\": \"" + _json_escape(title) + "\",\n"
+    body = body + "  \"rationale\": \"" + _json_escape(rationale) + "\",\n"
+    body = body + "  \"signal\": {\"kind\": \"" + _json_escape(signal_kind) +
+                  "\", \"key\": \"" + _json_escape(signal_key) + "\"},\n"
+    body = body + "  \"members\": " + _members_json(members) + ",\n"
+    body = body + "  \"member_count\": " + to_string(len(members)) + ",\n"
+    body = body + "  \"merges_with\": " + _members_json(members) + ",\n"
+    body = body + "  \"user_status\": \"pending\",\n"
+    body = body + "  \"first_seen_ts\": \"" + _ts_iso() + "\"\n"
+    body = body + "}\n"
+    return body
+}
+
+// Append cluster stub to inventory.json. If inventory missing, create a
+// minimal one. Format: { "schema":"anima.proposal_inventory.v1",
+//                        "entries":[ ... ] }
+fn append_to_inventory(cluster_id: string, slug: string, signal_kind: string,
+                       signal_key: string, members: array) {
+    let mut entries = []
+    if _is_file(INVENTORY) {
+        let raw = read_file(INVENTORY).trim()
+        if len(raw) > 0 {
+            let doc = json_parse(raw)
+            if doc.contains_key("entries") {
+                let e = doc["entries"]
+                if type_of(e) == "array" { entries = e }
+            }
+        }
+    } else {
+        let _ = _mkdir_p(PROP_ROOT)
+    }
+    // de-dup: skip if cluster_id already present
+    let mut i = 0
+    while i < len(entries) {
+        let ee = entries[i]
+        if ee.contains_key("id") && to_string(ee["id"]) == cluster_id {
+            return
+        }
+        i = i + 1
+    }
+    let title = "cluster: " + signal_kind + " = " + signal_key
+    let mut stub = "  {\"id\": \"" + _json_escape(cluster_id) +
+                   "\", \"kind\": \"cluster\", \"title\": \"" + _json_escape(title) +
+                   "\", \"merges_with\": " + _members_json(members) +
+                   ", \"member_count\": " + to_string(len(members)) +
+                   ", \"signal_kind\": \"" + _json_escape(signal_kind) +
+                   "\", \"signal_key\": \"" + _json_escape(signal_key) + "\"}"
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima.proposal_inventory.v1\",\n"
+    body = body + "  \"updated_ts\": \"" + _ts_iso() + "\",\n"
+    body = body + "  \"entries\": [\n"
+    let mut j = 0
+    while j < len(entries) {
+        let ee = entries[j]
+        let id = if ee.contains_key("id") { to_string(ee["id"]) } else { "?" }
+        let kind = if ee.contains_key("kind") { to_string(ee["kind"]) } else { "?" }
+        let t = if ee.contains_key("title") { to_string(ee["title"]) } else { "" }
+        body = body + "    {\"id\": \"" + _json_escape(id) +
+                       "\", \"kind\": \"" + _json_escape(kind) +
+                       "\", \"title\": \"" + _json_escape(t) + "\"}"
+        body = body + ",\n"
+        j = j + 1
+    }
+    body = body + "  " + stub + "\n"
+    body = body + "  ]\n"
+    body = body + "}\n"
+    write_file(INVENTORY, body)
+}
+
+fn emit_cluster(cluster, idx: int) {
+    let _ = _mkdir_p(CLUSTER_DIR)
+    let signal_kind = to_string(cluster["signal_kind"])
+    let signal_key  = to_string(cluster["signal_key"])
+    let members = cluster["members"]
+    let slug = _slugify(signal_key)
+    let cluster_id = "cluster-" + _date_compact() + "-" +
+                     (if idx < 10 { "00" + to_string(idx) }
+                      else if idx < 100 { "0" + to_string(idx) }
+                      else { to_string(idx) })
+    let body = render_cluster_json(cluster_id, slug, signal_kind, signal_key, members)
+    let path = CLUSTER_DIR + "/" + cluster_id + "_" + slug + ".json"
+    write_file(path, body)
+    println("[clu]   emitted " + path)
+    append_to_inventory(cluster_id, slug, signal_kind, signal_key, members)
+    println("[clu]   inventory updated → " + INVENTORY)
+}
+
+// ─── selftest ────────────────────────────────────────────────────────────────
+//
+// 6 synthetic proposals. 5 share evidence root "tool/foo", 1 disjoint:
+//   p1..p5 → evidence_sources path = tool/foo/<x>.hexa
+//   p6     → evidence_sources path = state/bar/quux.json
+// Expect: detect exactly 1 cluster (signal=evidence_root key=tool/foo
+// members={p1..p5}). p6 must NOT join.
+// kind+keyword signal must NOT trigger here (titles are unique).
+
+fn _mk_synth(id: string, title: string, kind: string, paths: array) {
+    let mut p = #{}
+    p["id"] = id
+    p["title"] = title
+    p["kind"] = kind
+    let mut roots = []
+    let mut i = 0
+    while i < len(paths) {
+        let r = evidence_root(to_string(paths[i]))
+        if len(r) > 0 { roots.push(r) }
+        i = i + 1
+    }
+    p["roots"] = roots
+    return p
+}
+
+fn run_selftest() -> int {
+    println("[clu] selftest — 6 synthetic proposals (5 share root tool/foo)")
+    let mut props = #{}
+    // Titles deliberately share NO non-stop tokens — only evidence_root signal must fire.
+    props["p1"] = _mk_synth("p1", "alpha aaa",      "tool", ["tool/foo/a.hexa"])
+    props["p2"] = _mk_synth("p2", "beta bbb",       "tool", ["tool/foo/b.hexa"])
+    props["p3"] = _mk_synth("p3", "gamma ccc",      "tool", ["tool/foo/c.hexa"])
+    props["p4"] = _mk_synth("p4", "delta ddd",      "tool", ["tool/foo/d.hexa"])
+    props["p5"] = _mk_synth("p5", "epsilon eee",    "tool", ["tool/foo/e.hexa"])
+    props["p6"] = _mk_synth("p6", "zeta zzz",       "fix",  ["state/bar/quux.json"])
+
+    let clusters = detect_clusters(props)
+    println("[clu]   clusters_found=" + to_string(len(clusters)))
+
+    let mut ok = true
+    if len(clusters) != 1 {
+        ok = false
+        eprintln("[clu]   FAIL want 1 cluster got " + to_string(len(clusters)))
+        let mut z = 0
+        while z < len(clusters) {
+            let c = clusters[z]
+            eprintln("[clu]     cand: " + to_string(c["signal_kind"]) +
+                     " key=" + to_string(c["signal_key"]) +
+                     " members=" + to_string(len(c["members"])))
+            z = z + 1
+        }
+    } else {
+        let c = clusters[0]
+        let sk = to_string(c["signal_kind"])
+        let key = to_string(c["signal_key"])
+        let n = len(c["members"])
+        println("[clu]   cluster signal_kind=" + sk + " key=" + key + " members=" + to_string(n))
+        if sk != "evidence_root" { ok = false ; eprintln("[clu]   FAIL signal_kind") }
+        if key != "tool/foo"     { ok = false ; eprintln("[clu]   FAIL signal_key=" + key) }
+        if n != 5                 { ok = false ; eprintln("[clu]   FAIL member_count=" + to_string(n)) }
+        // p6 must not be in members
+        let members = c["members"]
+        let mut i = 0
+        while i < len(members) {
+            if to_string(members[i]) == "p6" {
+                ok = false
+                eprintln("[clu]   FAIL p6 incorrectly grouped")
+            }
+            i = i + 1
+        }
+    }
+
+    // Render check (does not write file)
+    if len(clusters) >= 1 {
+        let c = clusters[0]
+        let body = render_cluster_json("cluster-test-001", "tool_foo",
+            to_string(c["signal_kind"]), to_string(c["signal_key"]), c["members"])
+        let needs = ["\"kind\": \"cluster\"", "\"member_count\": 5",
+                     "\"signal\":", "tool/foo"]
+        let mut i = 0
+        while i < len(needs) {
+            let need = to_string(needs[i])
+            if !body.contains(need) {
+                ok = false
+                eprintln("[clu]   FAIL render missing token: " + need)
+            }
+            i = i + 1
+        }
+    }
+
+    if ok {
+        println("[clu] selftest PASS — 1 cluster detected (5 members), render OK")
+        return 0
+    }
+    eprintln("[clu] selftest FAIL")
+    return 1
+}
+
+// ─── main ────────────────────────────────────────────────────────────────────
+
+fn main() {
+    let _ = _mkdir_p(STATE_DIR)
+
+    println("════════════════════════════════════════════════════════════════")
+    println("  tool/proposal_cluster_detect.hexa — P7 (proposal §7 cluster)")
+    println("  raw#9 hexa-only · raw#12 실측 · ts=" + _ts_iso())
+    println("════════════════════════════════════════════════════════════════")
+
+    if flag_present("--selftest") {
+        let rc = run_selftest()
+        let mut body = "{\n"
+        body = body + "  \"schema\": \"anima.proposal_cluster_detect.v1\",\n"
+        body = body + "  \"tool\": \"tool/proposal_cluster_detect.hexa\",\n"
+        body = body + "  \"ts\": \"" + _ts_iso() + "\",\n"
+        body = body + "  \"mode\": \"selftest\",\n"
+        body = body + "  \"verdict\": \"" + (if rc == 0 { "PASS" } else { "FAIL" }) + "\"\n"
+        body = body + "}\n"
+        write_file(SMOKE_OUT, body)
+        exit(rc)
+    }
+
+    let apply = flag_present("--apply")
+    let mode_label = if apply { "apply" } else { "dry" }
+
+    let props = load_proposals()
+    let n_props = len(props.keys())
+    println("[clu] loaded proposals=" + to_string(n_props) +
+            " (inventory " + _bool_s(_is_file(INVENTORY)) +
+            " · pending_dir " + _bool_s(_file_exists(PENDING_DIR)) + ")")
+
+    if n_props == 0 {
+        println("[clu] NO_DATA — no proposals discovered")
+        let mut body = "{\n"
+        body = body + "  \"schema\": \"anima.proposal_cluster_detect.v1\",\n"
+        body = body + "  \"tool\": \"tool/proposal_cluster_detect.hexa\",\n"
+        body = body + "  \"ts\": \"" + _ts_iso() + "\",\n"
+        body = body + "  \"mode\": \"" + mode_label + "\",\n"
+        body = body + "  \"proposals\": 0,\n"
+        body = body + "  \"clusters_detected\": 0,\n"
+        body = body + "  \"verdict\": \"NO_DATA\"\n"
+        body = body + "}\n"
+        write_file(SMOKE_OUT, body)
+        exit(0)
+    }
+
+    let clusters = detect_clusters(props)
+    let n_clu = len(clusters)
+    println("[clu] cluster_candidates=" + to_string(n_clu) +
+            " (threshold=" + to_string(CLUSTER_THRESHOLD) + ")")
+
+    let mut i = 0
+    while i < n_clu {
+        let c = clusters[i]
+        println("[clu]   #" + to_string(i + 1) + " signal=" + to_string(c["signal_kind"]) +
+                " key=" + to_string(c["signal_key"]) +
+                " members=" + to_string(len(c["members"])))
+        i = i + 1
+    }
+
+    if !apply {
+        println("[clu] DRY_RUN — pass --apply to emit cluster json + inventory")
+    } else {
+        let mut j = 0
+        while j < n_clu {
+            emit_cluster(clusters[j], j + 1)
+            j = j + 1
+        }
+    }
+
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima.proposal_cluster_detect.v1\",\n"
+    body = body + "  \"tool\": \"tool/proposal_cluster_detect.hexa\",\n"
+    body = body + "  \"ts\": \"" + _ts_iso() + "\",\n"
+    body = body + "  \"mode\": \"" + mode_label + "\",\n"
+    body = body + "  \"proposals\": " + to_string(n_props) + ",\n"
+    body = body + "  \"clusters_detected\": " + to_string(n_clu) + ",\n"
+    body = body + "  \"threshold\": " + to_string(CLUSTER_THRESHOLD) + ",\n"
+    body = body + "  \"applied\": " + _bool_s(apply) + ",\n"
+    body = body + "  \"verdict\": \"OK\"\n"
+    body = body + "}\n"
+    write_file(SMOKE_OUT, body)
+    exit(0)
+}
+
+main()

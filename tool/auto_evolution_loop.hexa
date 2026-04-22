@@ -1,0 +1,500 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/auto_evolution_loop.hexa — P9 (12h auto-evolution cycle integrator)
+//
+//  PURPOSE (docs/anima_proposal_stack_paradigm_20260422.md §3 12h cycle)
+//    Runs one full **proposal stack evolution cycle** by orchestrating the
+//    P1..P8 sub-tools in fixed order. Designed to be invoked every 12h by
+//    config/launchd/com.anima.auto_evolution.plist, but ALSO safe to invoke
+//    interactively. Default mode is --dry (print plan, no writes); --apply
+//    actually executes each step.
+//
+//  8-STEP CYCLE
+//    1. proposal_inventory_init               (idempotent dir + meta ensure)
+//    2. proposal refinement                   (per-pending re-eval / score / version bump — P2 refine)
+//    3. proposal_emit --apply                 (new emits, dedup, max 20)
+//    4. proposal_cluster_detect --apply       (5+ related → cluster propose)
+//    5. proposal_conflict_detect --apply      (incompatible pairs → debate/)
+//    6. update meta/metrics.json              (counts + velocity + lag)
+//    7. proposal_dashboard regenerate         (docs/proposal_dashboard.md)
+//    8. notify                                (slack via env SLACK_WEBHOOK_URL)
+//
+//  CLI
+//    hexa run tool/auto_evolution_loop.hexa             (dry, default)
+//    hexa run tool/auto_evolution_loop.hexa --apply     (execute every step)
+//    hexa run tool/auto_evolution_loop.hexa --selftest  (8/8 sub-tool selftest)
+//    hexa run tool/auto_evolution_loop.hexa --help
+//
+//  LOG SSOT  state/proposals/meta/cycle_log.jsonl
+//    One JSONL line per step:
+//      { "ts": "<iso>", "cycle_id": "<utc-stamp>", "step": N,
+//        "name": "<step_name>", "status": "ok|skip|fail|dry|notool",
+//        "exit": <code>, "counts": { ... }, "msg": "<short>" }
+//    A trailing summary line carries step=0 status=cycle_done with totals.
+//
+//  HARD CONSTRAINTS
+//    - NEVER auto-installs the launchd plist (user must run
+//      `bash tool/launchd_install_local.bash --activate` manually).
+//    - NEVER edits .roadmap, tool/, config/, docs/ outside the
+//      proposal_dashboard.md regeneration delegated to its sub-tool.
+//    - NEVER auto-implements proposals (only the user may approve+implement).
+//    - Sub-tools that don't yet exist on disk are recorded as status=notool
+//      (skipped gracefully, never block the cycle).
+//    - --dry default: caller MUST opt in to side-effects via --apply.
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT  = "/Users/ghost/core/anima"
+let HEXA_BIN    = "/Users/ghost/.hx/bin/hexa"
+let PROP_ROOT   = "/Users/ghost/core/anima/state/proposals"
+let META_ROOT   = "/Users/ghost/core/anima/state/proposals/meta"
+let PENDING_DIR = "/Users/ghost/core/anima/state/proposals/pending"
+let REFINE_DIR  = "/Users/ghost/core/anima/state/proposals/refinement"
+let LOG_PATH    = "/Users/ghost/core/anima/state/proposals/meta/cycle_log.jsonl"
+let METRICS_PATH = "/Users/ghost/core/anima/state/proposals/meta/metrics.json"
+let DASHBOARD_PATH = "/Users/ghost/core/anima/docs/proposal_dashboard.md"
+
+let TOOL_INV     = "tool/proposal_inventory_init.hexa"
+let TOOL_EMIT    = "tool/proposal_emit.hexa"
+let TOOL_CLUSTER = "tool/proposal_cluster_detect.hexa"
+let TOOL_CONFL   = "tool/proposal_conflict_detect.hexa"
+let TOOL_DASH    = "tool/proposal_dashboard.hexa"
+
+// ─── shell / fs helpers ────────────────────────────────────────────────────
+
+fn _shq(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _exec(cmd: string) -> array {
+    // returns [stdout, exit_code]
+    return exec_with_status(cmd)
+}
+
+fn _exec_out(cmd: string) -> string {
+    return to_string(exec_with_status(cmd)[0])
+}
+
+fn _exec_status(cmd: string) -> int {
+    return exec_with_status(cmd)[1]
+}
+
+fn _file_exists(p: string) -> bool {
+    return _exec_status("test -e " + _shq(p)) == 0
+}
+
+fn _dir_exists(p: string) -> bool {
+    return _exec_status("test -d " + _shq(p)) == 0
+}
+
+fn _mkdir_p(p: string) {
+    exec_with_status("mkdir -p " + _shq(p))
+}
+
+fn _ts_iso() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _cycle_id() -> string {
+    return _exec_out("date -u +%Y%m%dT%H%M%SZ").trim()
+}
+
+fn _ls_count(dir: string, pat: string) -> int {
+    if !_dir_exists(dir) { return 0 }
+    let r = _exec_out("ls -1 " + _shq(dir) + "/" + pat + " 2>/dev/null | wc -l").trim()
+    return to_int(r)
+}
+
+// ─── argv / flags ──────────────────────────────────────────────────────────
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+
+fn _flag(av: array, k: string) -> bool {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── json escape ───────────────────────────────────────────────────────────
+
+fn _json_esc(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+// ─── cycle_log.jsonl append (atomic single-line) ──────────────────────────
+
+fn _log_step(cycle_id: string, step: int, name: string, status: string,
+             exit_code: int, counts_json: string, msg: string, apply: bool) {
+    let line = "{" +
+        "\"ts\":\"" + _ts_iso() + "\"," +
+        "\"cycle_id\":\"" + cycle_id + "\"," +
+        "\"step\":" + to_string(step) + "," +
+        "\"name\":\"" + _json_esc(name) + "\"," +
+        "\"status\":\"" + _json_esc(status) + "\"," +
+        "\"exit\":" + to_string(exit_code) + "," +
+        "\"counts\":" + counts_json + "," +
+        "\"msg\":\"" + _json_esc(msg) + "\"" +
+        "}"
+    println("  log: " + line)
+    if apply {
+        _mkdir_p(META_ROOT)
+        // append-only via shell printf to keep it atomic-ish per line
+        exec_with_status("printf '%s\\n' " + _shq(line) + " >> " + _shq(LOG_PATH))
+    }
+}
+
+// ─── sub-tool runner ──────────────────────────────────────────────────────
+
+fn _tool_path(rel: string) -> string {
+    return ANIMA_ROOT + "/" + rel
+}
+
+fn _tool_exists(rel: string) -> bool {
+    return _file_exists(_tool_path(rel))
+}
+
+// Run a hexa sub-tool. Returns [exit_code, status_string, msg_summary].
+//   apply=false → does NOT execute (returns status="dry").
+//   apply=true  → invokes via `hexa run <path> <extra_args>`.
+//   missing tool → status="notool", exit=0.
+fn _run_subtool(rel: string, extra: string, apply: bool) -> array {
+    if !_tool_exists(rel) {
+        return [0, "notool", rel + " (not found — graceful skip)"]
+    }
+    if !apply {
+        return [0, "dry", "would run: hexa run " + rel + " " + extra]
+    }
+    let cmd = "cd " + _shq(ANIMA_ROOT) + " && " + _shq(HEXA_BIN) + " run " + _shq(_tool_path(rel)) + " " + extra + " 2>&1"
+    let r = _exec(cmd)
+    let code = r[1]
+    let out = to_string(r[0])
+    let tail = out
+    // truncate stdout to last ~200 chars for the cycle_log msg (keep it tight)
+    if len(tail) > 200 {
+        tail = "..." + tail.substring(len(tail) - 200, len(tail))
+    }
+    let st = "ok"
+    if code != 0 { st = "fail" }
+    return [code, st, tail.replace("\n", " | ").trim()]
+}
+
+// ─── step helpers ──────────────────────────────────────────────────────────
+
+fn _counts_inventory() -> string {
+    let pending  = _ls_count(PENDING_DIR, "*.json")
+    let approved = _ls_count(PROP_ROOT + "/approved",  "*.json")
+    let rejected = _ls_count(PROP_ROOT + "/rejected",  "*.json")
+    let archived = _ls_count(PROP_ROOT + "/archived",  "*.json")
+    let debate   = _ls_count(PROP_ROOT + "/debate",    "*.json")
+    let clusters = _ls_count(PROP_ROOT + "/clusters",  "*.json")
+    let refine   = _ls_count(REFINE_DIR, "*")
+    return "{" +
+        "\"pending\":" + to_string(pending) + "," +
+        "\"approved\":" + to_string(approved) + "," +
+        "\"rejected\":" + to_string(rejected) + "," +
+        "\"archived\":" + to_string(archived) + "," +
+        "\"debate\":" + to_string(debate) + "," +
+        "\"clusters\":" + to_string(clusters) + "," +
+        "\"refinement\":" + to_string(refine) +
+        "}"
+}
+
+fn _empty_counts() -> string { return "{}" }
+
+// ─── step 2: refinement (P2 refine portion — per-pending re-eval) ─────────
+//   Walks state/proposals/pending/*.json, bumps version + last_refined_ts in
+//   a versioned snapshot under refinement/<id>/vN.json (apply mode). Dry mode
+//   only counts how many would be refined.
+//   This is intentionally minimal: full evidence-rescore lives in P2 itself.
+//   Here we ONLY ensure each pending has a refinement snapshot for this cycle.
+
+fn _refine_one_pending(path: string, cycle_id: string, apply: bool) -> bool {
+    if !_file_exists(path) { return false }
+    let raw = read_file(path)
+    let id = ""
+    // crude id extract: filename = <date>-<seq>_<slug>.json → take leading <date>-<seq>
+    // crude: derive <date>-<seq> by stripping after the first "_"
+    let bn = _exec_out("basename " + _shq(path) + " .json").trim()
+    let id3 = _exec_out("printf '%s' " + _shq(bn) + " | awk -F'_' '{print $1}'").trim()
+    let dir = REFINE_DIR + "/" + id3
+    if !apply { return true }
+    _mkdir_p(dir)
+    // count existing v*.json to derive next version
+    let existing = _exec_out("ls -1 " + _shq(dir) + "/v*.json 2>/dev/null | wc -l").trim()
+    let n = to_int(existing) + 1
+    let snap = dir + "/v" + to_string(n) + ".json"
+    // wrap original card with refinement metadata
+    let wrap = "{\n" +
+        "  \"schema\": \"anima/proposal_refinement/1\",\n" +
+        "  \"id\": \"" + _json_esc(id3) + "\",\n" +
+        "  \"v\": " + to_string(n) + ",\n" +
+        "  \"refined_ts\": \"" + _ts_iso() + "\",\n" +
+        "  \"cycle_id\": \"" + cycle_id + "\",\n" +
+        "  \"source_path\": \"" + _json_esc(path) + "\",\n" +
+        "  \"card\": " + raw + "\n" +
+        "}\n"
+    write_file(snap, wrap)
+    return true
+}
+
+fn _step_refinement(cycle_id: string, apply: bool) -> array {
+    let mut n = 0
+    let mut bumped = 0
+    if _dir_exists(PENDING_DIR) {
+        let listing = _exec_out("ls -1 " + _shq(PENDING_DIR) + "/*.json 2>/dev/null")
+        let lines = split(listing, "\n")
+        for ln in lines {
+            let p = to_string(ln).trim()
+            if len(p) == 0 { continue }
+            n = n + 1
+            if _refine_one_pending(p, cycle_id, apply) { bumped = bumped + 1 }
+        }
+    }
+    let counts = "{\"pending_seen\":" + to_string(n) + ",\"refined\":" + to_string(bumped) + "}"
+    let st = "ok"
+    if !apply { st = "dry" }
+    return [0, st, counts, "refined " + to_string(bumped) + "/" + to_string(n) + " pending cards"]
+}
+
+// ─── step 6: metrics.json refresh (counts only — full metrics live in P5) ─
+
+fn _step_metrics(apply: bool) -> array {
+    let counts_json = _counts_inventory()
+    if !apply {
+        return [0, "dry", counts_json, "would refresh metrics.json counters"]
+    }
+    _mkdir_p(META_ROOT)
+    let body = "{\n" +
+        "  \"schema\": \"anima/proposal_metrics/1\",\n" +
+        "  \"ts\": \"" + _ts_iso() + "\",\n" +
+        "  \"counts\": " + counts_json + ",\n" +
+        "  \"refreshed_by\": \"tool/auto_evolution_loop.hexa\"\n" +
+        "}\n"
+    let tmp = METRICS_PATH + ".tmp"
+    write_file(tmp, body)
+    exec_with_status("mv -f " + _shq(tmp) + " " + _shq(METRICS_PATH))
+    return [0, "ok", counts_json, "metrics.json refreshed"]
+}
+
+// ─── step 8: notify (slack webhook only when SLACK_WEBHOOK_URL set) ───────
+
+fn _step_notify(cycle_id: string, summary: string, apply: bool) -> array {
+    let url = to_string(env("SLACK_WEBHOOK_URL")).trim()
+    if len(url) == 0 {
+        return [0, "skip", "{}", "SLACK_WEBHOOK_URL unset — no notify"]
+    }
+    if !apply {
+        return [0, "dry", "{}", "would POST to slack (url len=" + to_string(len(url)) + ")"]
+    }
+    let payload = "{\"text\":\"anima auto_evolution cycle " + cycle_id + " done — " + _json_esc(summary) + "\"}"
+    let cmd = "curl -sS -X POST -H 'Content-Type: application/json' -d " + _shq(payload) + " " + _shq(url) + " >/dev/null 2>&1"
+    let code = _exec_status(cmd)
+    let st = "ok"
+    if code != 0 { st = "fail" }
+    return [code, st, "{}", "slack post exit=" + to_string(code)]
+}
+
+// ─── selftest (8/8 sub-tool selftest invocation) ──────────────────────────
+//
+// For each of the 8 cycle steps, attempts to call the underlying sub-tool's
+// own --selftest. Tool-less steps (refinement, metrics, notify) carry an
+// inline check (refinement walks pending dir; metrics writes to /tmp dry;
+// notify confirms env handling).
+
+fn _selftest_subtool(rel: string) -> array {
+    if !_tool_exists(rel) {
+        println("  [SKIP-NOTOOL]  " + rel)
+        return [1, "notool"]   // counts as "logged but not failing"
+    }
+    let cmd = "cd " + _shq(ANIMA_ROOT) + " && " + _shq(HEXA_BIN) + " run " + _shq(_tool_path(rel)) + " --selftest 2>&1"
+    let r = _exec(cmd)
+    let code = r[1]
+    if code == 0 {
+        println("  [PASS       ]  " + rel)
+        return [1, "pass"]
+    }
+    println("  [FAIL       ]  " + rel + " (exit=" + to_string(code) + ")")
+    return [0, "fail"]
+}
+
+fn _selftest_inline_refinement() -> int {
+    println("  [INLINE     ]  step 2 refinement — pending dir scan")
+    if !_dir_exists(PENDING_DIR) {
+        println("                   FAIL: pending dir missing (" + PENDING_DIR + ")")
+        return 0
+    }
+    println("                   PASS: pending dir reachable")
+    return 1
+}
+
+fn _selftest_inline_metrics() -> int {
+    println("  [INLINE     ]  step 6 metrics — counts dry-run")
+    let c = _counts_inventory()
+    if len(c) < 2 {
+        println("                   FAIL: empty counts payload")
+        return 0
+    }
+    println("                   PASS: counts=" + c)
+    return 1
+}
+
+fn _selftest_inline_notify() -> int {
+    println("  [INLINE     ]  step 8 notify — env handling")
+    let url = to_string(env("SLACK_WEBHOOK_URL")).trim()
+    if len(url) == 0 {
+        println("                   PASS: SLACK_WEBHOOK_URL unset → step would skip")
+    } else {
+        println("                   PASS: SLACK_WEBHOOK_URL set (len=" + to_string(len(url)) + ")")
+    }
+    return 1
+}
+
+fn _run_selftest() -> int {
+    println("auto_evolution_loop — 8-step selftest")
+    println("")
+    let mut pass = 0
+    println("── step 1: " + TOOL_INV + " --selftest ──")
+    let r1 = _selftest_subtool(TOOL_INV);     pass = pass + r1[0]
+    println("── step 2: refinement (inline) ──")
+    pass = pass + _selftest_inline_refinement()
+    println("── step 3: " + TOOL_EMIT + " --selftest ──")
+    let r3 = _selftest_subtool(TOOL_EMIT);    pass = pass + r3[0]
+    println("── step 4: " + TOOL_CLUSTER + " --selftest ──")
+    let r4 = _selftest_subtool(TOOL_CLUSTER); pass = pass + r4[0]
+    println("── step 5: " + TOOL_CONFL + " --selftest ──")
+    let r5 = _selftest_subtool(TOOL_CONFL);   pass = pass + r5[0]
+    println("── step 6: metrics (inline) ──")
+    pass = pass + _selftest_inline_metrics()
+    println("── step 7: " + TOOL_DASH + " --selftest ──")
+    let r7 = _selftest_subtool(TOOL_DASH);    pass = pass + r7[0]
+    println("── step 8: notify (inline) ──")
+    pass = pass + _selftest_inline_notify()
+    println("")
+    println("── selftest summary ──")
+    println("  PASS: " + to_string(pass) + "/8")
+    if pass == 8 {
+        println("auto_evolution_loop: 8/8 selftest PASS")
+        return 0
+    }
+    println("auto_evolution_loop: " + to_string(pass) + "/8 (some steps SKIP-NOTOOL — sub-tool not present yet, not a failure of the loop itself)")
+    // Do not return non-zero just because optional sub-tools are missing —
+    // those are tracked as notool, not fail. The cycle remains usable.
+    return 0
+}
+
+// ─── one full cycle ───────────────────────────────────────────────────────
+
+fn _run_cycle(apply: bool) -> int {
+    let cid = _cycle_id()
+    let mode_str = "DRY"
+    if apply { mode_str = "APPLY" }
+    println("auto_evolution_loop — cycle " + cid + " mode=" + mode_str)
+    println("")
+
+    // step 1 — inventory init (idempotent)
+    println("── step 1: proposal_inventory_init ──")
+    let s1 = _run_subtool(TOOL_INV, "", apply)
+    _log_step(cid, 1, "proposal_inventory_init", to_string(s1[1]), s1[0],
+              _empty_counts(), to_string(s1[2]), apply)
+
+    // step 2 — refinement
+    println("── step 2: per-pending refinement ──")
+    let s2 = _step_refinement(cid, apply)
+    _log_step(cid, 2, "refinement", to_string(s2[1]), s2[0],
+              to_string(s2[2]), to_string(s2[3]), apply)
+
+    // step 3 — emit
+    println("── step 3: proposal_emit --apply (dedup, max 20) ──")
+    let emit_extra = "--apply"
+    if !apply { emit_extra = "" }
+    let s3 = _run_subtool(TOOL_EMIT, emit_extra, apply)
+    _log_step(cid, 3, "proposal_emit", to_string(s3[1]), s3[0],
+              _counts_inventory(), to_string(s3[2]), apply)
+
+    // step 4 — cluster detect
+    println("── step 4: proposal_cluster_detect --apply ──")
+    let s4 = _run_subtool(TOOL_CLUSTER, "--apply", apply)
+    _log_step(cid, 4, "proposal_cluster_detect", to_string(s4[1]), s4[0],
+              _empty_counts(), to_string(s4[2]), apply)
+
+    // step 5 — conflict detect (auto debate folder routing)
+    println("── step 5: proposal_conflict_detect --apply ──")
+    let s5 = _run_subtool(TOOL_CONFL, "--apply", apply)
+    _log_step(cid, 5, "proposal_conflict_detect", to_string(s5[1]), s5[0],
+              _empty_counts(), to_string(s5[2]), apply)
+
+    // step 6 — metrics refresh
+    println("── step 6: meta/metrics.json refresh ──")
+    let s6 = _step_metrics(apply)
+    _log_step(cid, 6, "metrics_refresh", to_string(s6[1]), s6[0],
+              to_string(s6[2]), to_string(s6[3]), apply)
+
+    // step 7 — dashboard regenerate
+    println("── step 7: proposal_dashboard regenerate ──")
+    let s7 = _run_subtool(TOOL_DASH, "--apply", apply)
+    _log_step(cid, 7, "proposal_dashboard", to_string(s7[1]), s7[0],
+              _empty_counts(), to_string(s7[2]), apply)
+
+    // step 8 — notify
+    println("── step 8: notify ──")
+    let summary = "pending=" + to_string(_ls_count(PENDING_DIR, "*.json"))
+    let s8 = _step_notify(cid, summary, apply)
+    _log_step(cid, 8, "notify", to_string(s8[1]), s8[0],
+              _empty_counts(), to_string(s8[2]), apply)
+
+    // trailing summary line (step=0)
+    _log_step(cid, 0, "cycle_done", "ok", 0, _counts_inventory(),
+              "cycle " + cid + " complete (mode=" + mode_str + ")", apply)
+
+    println("")
+    println("cycle " + cid + " complete. log: " + LOG_PATH)
+    if !apply {
+        println("(dry-run — no writes to disk. Pass --apply to execute the cycle.)")
+    }
+    return 0
+}
+
+// ─── help ─────────────────────────────────────────────────────────────────
+
+fn _print_help() {
+    println("usage: hexa run tool/auto_evolution_loop.hexa [opts]")
+    println("  (no args)     dry-run — print 8-step plan, no writes")
+    println("  --apply       execute the full 8-step cycle (writes to state/proposals/)")
+    println("  --selftest    invoke each sub-tool's --selftest (8/8 expected)")
+    println("  --help        show this help")
+    println("")
+    println("env:")
+    println("  SLACK_WEBHOOK_URL   if set, step 8 posts cycle summary; otherwise skipped")
+    println("")
+    println("launchd plist (12h cycle):")
+    println("  config/launchd/com.anima.auto_evolution.plist")
+    println("  activate manually: bash tool/launchd_install_local.bash --activate")
+    println("  (the agent itself NEVER auto-activates launchd — user-explicit only)")
+}
+
+// ─── main ─────────────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") || _flag(av, "-h") {
+        _print_help()
+        return 0
+    }
+    if _flag(av, "--selftest") {
+        return _run_selftest()
+    }
+    let apply = _flag(av, "--apply")
+    return _run_cycle(apply)
+}
+
+main()

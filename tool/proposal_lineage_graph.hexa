@@ -1,0 +1,644 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/proposal_lineage_graph.hexa — P6 (proposal stack paradigm §9 lineage)
+//
+//  PURPOSE
+//    Render a mermaid lineage graph for proposals stored in
+//    state/proposals/. Combines three sources of edges:
+//      1. state/proposals/inventory.json    — { id → entry } meta index
+//      2. state/proposals/meta/lineage.json — explicit edges array
+//      3. per-proposal pending/<id>.json    — fields:
+//             lineage_parent  (single id  — parent → self edge)
+//             lineage_children (array     — self → child edges)
+//             merges_with      (array     — each → self  + dotted merge)
+//
+//  OUTPUT
+//    docs/proposal_lineage.md
+//        ```mermaid
+//        graph TD
+//        A[title] --> B[title]
+//        ```
+//
+//  FLAGS
+//    --id <N>     restrict graph to ancestors + descendants of proposal N
+//    --selftest   synthetic 3-level lineage (A→B→C, B→D)
+//                 → must produce 4 nodes 4 edges (A,B,C,D ; A→B B→C B→D)
+//                   (3-level depth, 4 nodes — see verdict)
+//
+//  SAFETY
+//    - READ-ONLY for inventory + per-proposal jsons
+//    - never touches .roadmap
+//    - no .py emitted
+//
+//  RAW
+//    raw#9 hexa-only · raw#10 deterministic · raw#11 snake_case
+//    raw#12 실측 only · raw#15 no-hardcode (paths anchored at REPO_ROOT)
+//
+//  EXIT CODES
+//    0 — wrote graph / NO_DATA / selftest pass
+//    1 — selftest fail
+//    2 — setup error
+// ════════════════════════════════════════════════════════════════════════════
+
+let TOOL_NAME    = "proposal_lineage_graph"
+let TOOL_VERSION = "v1"
+let REPO_ROOT    = "/Users/ghost/core/anima"
+let PROP_ROOT    = "/Users/ghost/core/anima/state/proposals"
+let INVENTORY    = "/Users/ghost/core/anima/state/proposals/inventory.json"
+let LINEAGE_META = "/Users/ghost/core/anima/state/proposals/meta/lineage.json"
+let PENDING_DIR  = "/Users/ghost/core/anima/state/proposals/pending"
+let DOC_OUT      = "/Users/ghost/core/anima/docs/proposal_lineage.md"
+let SMOKE_OUT    = "/Users/ghost/core/anima/state/proposal_lineage_graph_result.json"
+let DOCS_DIR     = "/Users/ghost/core/anima/docs"
+let STATE_DIR    = "/Users/ghost/core/anima/state"
+
+// ─── shell helpers ───────────────────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    let mut out = "'"
+    out = out + s.replace("'", "'\\''")
+    out = out + "'"
+    return out
+}
+
+fn _exec_out(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _exec_code(cmd: string) -> int {
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+fn _ts_iso() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _bool_s(b: bool) -> string {
+    if b { return "true" } else { return "false" }
+}
+
+fn _file_exists(path: string) -> bool {
+    let r = exec_with_status("test -e " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _is_file(path: string) -> bool {
+    let r = exec_with_status("test -f " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _mkdir_p(d: string) -> bool {
+    let r = exec_with_status("mkdir -p " + _sh_quote(d))
+    return r[1] == 0
+}
+
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+fn flag_present(name: string) -> bool {
+    let argv = args()
+    let mut i = 0
+    while i < len(argv) {
+        if to_string(argv[i]) == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn flag_value(name: string) -> string {
+    let argv = args()
+    let mut i = 0
+    while i < len(argv) {
+        if to_string(argv[i]) == name {
+            if i + 1 < len(argv) { return to_string(argv[i + 1]) }
+            return ""
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ─── label sanitization for mermaid ──────────────────────────────────────────
+//
+// mermaid label rules: no `[` or `]` inside `[...]`; quotes require escape.
+// We strip / replace conservatively.
+
+fn _mm_label(s: string) -> string {
+    let mut out = s
+    out = out.replace("[", "(")
+    out = out.replace("]", ")")
+    out = out.replace("\"", "'")
+    out = out.replace("\n", " ")
+    if len(out) > 60 { out = out.substring(0, 57) + "..." }
+    return out
+}
+
+// mermaid node ids must be alphanumeric — proposal ids look like
+// "20260422-001" which contains '-'. Replace with '_'.
+fn _mm_id(id: string) -> string {
+    return "n_" + id.replace("-", "_").replace(".", "_").replace("/", "_")
+}
+
+// ─── proposal load ───────────────────────────────────────────────────────────
+//
+// Build a map { id → { id, title, parent, children:[], merges:[] } }
+//
+// Order of merges:
+//   1. inventory.json (if exists)  — base titles
+//   2. meta/lineage.json edges     — augment + add edges
+//   3. pending/*.json per-proposal — augment + add edges
+//
+// All sources are optional; tool degrades gracefully (NO_DATA).
+
+fn _new_node(id: string, title: string) {
+    let mut n = #{}
+    n["id"] = id
+    n["title"] = title
+    n["parent"] = ""
+    n["children"] = []
+    n["merges"] = []
+    return n
+}
+
+fn _ensure_node(nodes, id: string, title: string) {
+    if !nodes.contains_key(id) {
+        nodes[id] = _new_node(id, title)
+    } else {
+        let existing = nodes[id]
+        if len(to_string(existing["title"])) == 0 && len(title) > 0 {
+            existing["title"] = title
+            nodes[id] = existing
+        }
+    }
+    return nodes
+}
+
+fn _add_child(nodes, parent_id: string, child_id: string) {
+    if !nodes.contains_key(parent_id) { nodes = _ensure_node(nodes, parent_id, "") }
+    if !nodes.contains_key(child_id)  { nodes = _ensure_node(nodes, child_id, "") }
+    let p = nodes[parent_id]
+    let kids = p["children"]
+    let mut already = false
+    let mut k = 0
+    while k < len(kids) {
+        if to_string(kids[k]) == child_id { already = true }
+        k = k + 1
+    }
+    if !already {
+        kids.push(child_id)
+        p["children"] = kids
+        nodes[parent_id] = p
+    }
+    let c = nodes[child_id]
+    if len(to_string(c["parent"])) == 0 {
+        c["parent"] = parent_id
+        nodes[child_id] = c
+    }
+    return nodes
+}
+
+fn _add_merge(nodes, src_id: string, target_id: string) {
+    if !nodes.contains_key(src_id)    { nodes = _ensure_node(nodes, src_id, "") }
+    if !nodes.contains_key(target_id) { nodes = _ensure_node(nodes, target_id, "") }
+    let t = nodes[target_id]
+    let mg = t["merges"]
+    let mut already = false
+    let mut k = 0
+    while k < len(mg) {
+        if to_string(mg[k]) == src_id { already = true }
+        k = k + 1
+    }
+    if !already {
+        mg.push(src_id)
+        t["merges"] = mg
+        nodes[target_id] = t
+    }
+    return nodes
+}
+
+fn load_inventory(nodes) {
+    if !_is_file(INVENTORY) { return nodes }
+    let raw = read_file(INVENTORY).trim()
+    if len(raw) == 0 { return nodes }
+    let doc = json_parse(raw)
+    // inventory.json shape: { "entries": [ {id,title,kind,...}, ... ] }
+    //   OR direct array of entries — accept both for resilience.
+    let entries = if doc.contains_key("entries") { doc["entries"] } else { doc }
+    if type_of(entries) != "array" { return nodes }
+    let mut i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        let id = if e.contains_key("id") { to_string(e["id"]) } else { "" }
+        if len(id) > 0 {
+            let title = if e.contains_key("title") { to_string(e["title"]) } else { "" }
+            nodes = _ensure_node(nodes, id, title)
+            if e.contains_key("lineage_parent") {
+                let p = to_string(e["lineage_parent"])
+                if len(p) > 0 { nodes = _add_child(nodes, p, id) }
+            }
+            if e.contains_key("lineage_children") {
+                let kids = e["lineage_children"]
+                if type_of(kids) == "array" {
+                    let mut j = 0
+                    while j < len(kids) {
+                        let cid = to_string(kids[j])
+                        if len(cid) > 0 { nodes = _add_child(nodes, id, cid) }
+                        j = j + 1
+                    }
+                }
+            }
+            if e.contains_key("merges_with") {
+                let mg = e["merges_with"]
+                if type_of(mg) == "array" {
+                    let mut j = 0
+                    while j < len(mg) {
+                        let sid = to_string(mg[j])
+                        if len(sid) > 0 { nodes = _add_merge(nodes, sid, id) }
+                        j = j + 1
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return nodes
+}
+
+fn load_lineage_meta(nodes) {
+    if !_is_file(LINEAGE_META) { return nodes }
+    let raw = read_file(LINEAGE_META).trim()
+    if len(raw) == 0 { return nodes }
+    let doc = json_parse(raw)
+    // shape: { "edges": [ {parent, child, kind?}, ... ] }
+    if !doc.contains_key("edges") { return nodes }
+    let edges = doc["edges"]
+    if type_of(edges) != "array" { return nodes }
+    let mut i = 0
+    while i < len(edges) {
+        let e = edges[i]
+        let kind = if e.contains_key("kind") { to_string(e["kind"]) } else { "lineage" }
+        if kind == "merge" {
+            let s = if e.contains_key("source") { to_string(e["source"]) } else { "" }
+            let t = if e.contains_key("target") { to_string(e["target"]) } else { "" }
+            if len(s) > 0 && len(t) > 0 { nodes = _add_merge(nodes, s, t) }
+        } else {
+            let p = if e.contains_key("parent") { to_string(e["parent"]) } else { "" }
+            let c = if e.contains_key("child")  { to_string(e["child"])  } else { "" }
+            if len(p) > 0 && len(c) > 0 { nodes = _add_child(nodes, p, c) }
+        }
+        i = i + 1
+    }
+    return nodes
+}
+
+fn _list_pending_files() -> array {
+    let mut acc = []
+    if !_file_exists(PENDING_DIR) { return acc }
+    let out = _exec_out("ls -1 " + _sh_quote(PENDING_DIR) + " 2>/dev/null").trim()
+    if len(out) == 0 { return acc }
+    let lines = split(out, "\n")
+    let mut i = 0
+    while i < len(lines) {
+        let f = to_string(lines[i]).trim()
+        if len(f) > 0 && f.ends_with(".json") {
+            acc.push(PENDING_DIR + "/" + f)
+        }
+        i = i + 1
+    }
+    return acc
+}
+
+fn load_pending(nodes) {
+    let files = _list_pending_files()
+    let mut i = 0
+    while i < len(files) {
+        let p = to_string(files[i])
+        let raw = read_file(p).trim()
+        if len(raw) > 0 {
+            let doc = json_parse(raw)
+            let id = if doc.contains_key("id") { to_string(doc["id"]) } else { "" }
+            if len(id) > 0 {
+                let title = if doc.contains_key("title") { to_string(doc["title"]) } else { "" }
+                nodes = _ensure_node(nodes, id, title)
+                if doc.contains_key("lineage_parent") {
+                    let pp = to_string(doc["lineage_parent"])
+                    if len(pp) > 0 { nodes = _add_child(nodes, pp, id) }
+                }
+                if doc.contains_key("lineage_children") {
+                    let kids = doc["lineage_children"]
+                    if type_of(kids) == "array" {
+                        let mut j = 0
+                        while j < len(kids) {
+                            let cid = to_string(kids[j])
+                            if len(cid) > 0 { nodes = _add_child(nodes, id, cid) }
+                            j = j + 1
+                        }
+                    }
+                }
+                if doc.contains_key("merges_with") {
+                    let mg = doc["merges_with"]
+                    if type_of(mg) == "array" {
+                        let mut j = 0
+                        while j < len(mg) {
+                            let sid = to_string(mg[j])
+                            if len(sid) > 0 { nodes = _add_merge(nodes, sid, id) }
+                            j = j + 1
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return nodes
+}
+
+// ─── focus filter — ancestors + descendants of one id ────────────────────────
+
+fn _collect_ancestors(nodes, id: string, acc) {
+    if !nodes.contains_key(id) { return acc }
+    let n = nodes[id]
+    let p = to_string(n["parent"])
+    if len(p) > 0 && !acc.contains_key(p) {
+        acc[p] = true
+        acc = _collect_ancestors(nodes, p, acc)
+    }
+    return acc
+}
+
+fn _collect_descendants(nodes, id: string, acc) {
+    if !nodes.contains_key(id) { return acc }
+    let n = nodes[id]
+    let kids = n["children"]
+    let mut i = 0
+    while i < len(kids) {
+        let cid = to_string(kids[i])
+        if !acc.contains_key(cid) {
+            acc[cid] = true
+            acc = _collect_descendants(nodes, cid, acc)
+        }
+        i = i + 1
+    }
+    return acc
+}
+
+fn focus_subset(nodes, focus_id: string) {
+    let mut keep = #{}
+    keep[focus_id] = true
+    keep = _collect_ancestors(nodes, focus_id, keep)
+    keep = _collect_descendants(nodes, focus_id, keep)
+    let mut sub = #{}
+    let keys = keep.keys()
+    let mut i = 0
+    while i < len(keys) {
+        let k = to_string(keys[i])
+        if nodes.contains_key(k) { sub[k] = nodes[k] }
+        i = i + 1
+    }
+    return sub
+}
+
+// ─── mermaid render ──────────────────────────────────────────────────────────
+
+fn _sorted_ids(nodes) -> array {
+    let raw = nodes.keys()
+    let mut arr = []
+    let mut i = 0
+    while i < len(raw) {
+        arr.push(to_string(raw[i]))
+        i = i + 1
+    }
+    // simple insertion sort (deterministic order)
+    let mut j = 1
+    while j < len(arr) {
+        let key = to_string(arr[j])
+        let mut k = j - 1
+        while k >= 0 && to_string(arr[k]) > key {
+            arr[k + 1] = arr[k]
+            k = k - 1
+        }
+        arr[k + 1] = key
+        j = j + 1
+    }
+    return arr
+}
+
+fn render_mermaid(nodes) -> string {
+    let ids = _sorted_ids(nodes)
+    let mut body = "```mermaid\ngraph TD\n"
+    // Declare nodes first (so isolated nodes still render).
+    let mut i = 0
+    while i < len(ids) {
+        let id = to_string(ids[i])
+        let n = nodes[id]
+        let title = to_string(n["title"])
+        let label = if len(title) > 0 { _mm_label(id + " " + title) } else { _mm_label(id) }
+        body = body + _mm_id(id) + "[" + label + "]\n"
+        i = i + 1
+    }
+    // Edges (parent → child).
+    let mut e = 0
+    let mut edge_count = 0
+    while e < len(ids) {
+        let id = to_string(ids[e])
+        let n = nodes[id]
+        let kids = n["children"]
+        let mut j = 0
+        while j < len(kids) {
+            let cid = to_string(kids[j])
+            body = body + _mm_id(id) + " --> " + _mm_id(cid) + "\n"
+            edge_count = edge_count + 1
+            j = j + 1
+        }
+        // merge edges (dotted)
+        let mg = n["merges"]
+        let mut k = 0
+        while k < len(mg) {
+            let sid = to_string(mg[k])
+            body = body + _mm_id(sid) + " -.merge.-> " + _mm_id(id) + "\n"
+            edge_count = edge_count + 1
+            k = k + 1
+        }
+        e = e + 1
+    }
+    body = body + "```\n"
+    return body
+}
+
+fn count_edges(nodes) -> int {
+    let ids = _sorted_ids(nodes)
+    let mut total = 0
+    let mut i = 0
+    while i < len(ids) {
+        let n = nodes[to_string(ids[i])]
+        total = total + len(n["children"]) + len(n["merges"])
+        i = i + 1
+    }
+    return total
+}
+
+// ─── doc emit ────────────────────────────────────────────────────────────────
+
+fn write_doc(mermaid: string, n_nodes: int, n_edges: int, focus_id: string) {
+    let _ = _mkdir_p(DOCS_DIR)
+    let mut body = "# proposal lineage graph\n\n"
+    body = body + "Generated by `tool/proposal_lineage_graph.hexa` (P6, paradigm §9 lineage).\n\n"
+    body = body + "- generated_at: `" + _ts_iso() + "`\n"
+    body = body + "- nodes: `" + to_string(n_nodes) + "`\n"
+    body = body + "- edges: `" + to_string(n_edges) + "`\n"
+    if len(focus_id) > 0 {
+        body = body + "- focus: `" + focus_id + "` (ancestors + descendants only)\n"
+    }
+    body = body + "\n"
+    body = body + mermaid
+    write_file(DOC_OUT, body)
+}
+
+// ─── selftest ────────────────────────────────────────────────────────────────
+//
+// synthetic 3-level lineage:
+//     A → B → C
+//         B → D
+// Expected: 4 nodes, 3 edges (A→B, B→C, B→D).
+// Spec says "3 nodes 4 edges" which is inconsistent (3-level lineage A→B→C
+// + B→D yields 4 distinct ids). We treat the spec's intent as
+// "3-LEVEL graph + 4 distinct nodes/edges including all ids". Verdict checks:
+//   - 4 nodes (A,B,C,D)
+//   - 3 parent-child edges (A→B, B→C, B→D)
+//   - mermaid string contains `graph TD` + each id + `-->`
+//
+// Selftest also exercises --id focus restricted to descendants of B.
+
+fn run_selftest() -> int {
+    println("[lin] selftest — synthetic 3-level lineage A->B->C , B->D")
+    let mut nodes = #{}
+    nodes = _ensure_node(nodes, "A", "alpha-root")
+    nodes = _ensure_node(nodes, "B", "beta-mid")
+    nodes = _ensure_node(nodes, "C", "gamma-leaf")
+    nodes = _ensure_node(nodes, "D", "delta-leaf")
+    nodes = _add_child(nodes, "A", "B")
+    nodes = _add_child(nodes, "B", "C")
+    nodes = _add_child(nodes, "B", "D")
+
+    let n_nodes = len(nodes.keys())
+    let n_edges = count_edges(nodes)
+    let mermaid = render_mermaid(nodes)
+    println("[lin]   nodes=" + to_string(n_nodes) + " edges=" + to_string(n_edges))
+
+    let mut ok = true
+    if n_nodes != 4 { ok = false ; eprintln("[lin]   FAIL want 4 nodes got " + to_string(n_nodes)) }
+    if n_edges != 3 { ok = false ; eprintln("[lin]   FAIL want 3 edges got " + to_string(n_edges)) }
+
+    let needs = ["graph TD", "n_A", "n_B", "n_C", "n_D",
+                 "n_A --> n_B", "n_B --> n_C", "n_B --> n_D"]
+    let mut i = 0
+    while i < len(needs) {
+        let need = to_string(needs[i])
+        if !mermaid.contains(need) {
+            ok = false
+            eprintln("[lin]   FAIL mermaid missing token: " + need)
+        }
+        i = i + 1
+    }
+
+    // focus on B → expect {A,B,C,D} (ancestors A + descendants C,D)
+    let sub = focus_subset(nodes, "B")
+    let n_sub = len(sub.keys())
+    println("[lin]   focus(B) sub_nodes=" + to_string(n_sub))
+    if n_sub != 4 { ok = false ; eprintln("[lin]   FAIL focus want 4 got " + to_string(n_sub)) }
+
+    if ok {
+        println("[lin] selftest PASS — 4 nodes, 3 edges, mermaid render OK, focus OK")
+        return 0
+    }
+    eprintln("[lin] selftest FAIL")
+    return 1
+}
+
+// ─── main ────────────────────────────────────────────────────────────────────
+
+fn main() {
+    let _ = _mkdir_p(STATE_DIR)
+    let _ = _mkdir_p(DOCS_DIR)
+
+    println("════════════════════════════════════════════════════════════════")
+    println("  tool/proposal_lineage_graph.hexa — P6 (proposal §9 lineage)")
+    println("  raw#9 hexa-only · raw#12 실측 · ts=" + _ts_iso())
+    println("════════════════════════════════════════════════════════════════")
+
+    if flag_present("--selftest") {
+        let rc = run_selftest()
+        let mut body = "{\n"
+        body = body + "  \"schema\": \"anima.proposal_lineage_graph.v1\",\n"
+        body = body + "  \"tool\": \"tool/proposal_lineage_graph.hexa\",\n"
+        body = body + "  \"ts\": \"" + _ts_iso() + "\",\n"
+        body = body + "  \"mode\": \"selftest\",\n"
+        body = body + "  \"verdict\": \"" + (if rc == 0 { "PASS" } else { "FAIL" }) + "\"\n"
+        body = body + "}\n"
+        write_file(SMOKE_OUT, body)
+        exit(rc)
+    }
+
+    let focus_id = flag_value("--id")
+
+    let mut nodes = #{}
+    nodes = load_inventory(nodes)
+    nodes = load_lineage_meta(nodes)
+    nodes = load_pending(nodes)
+
+    let total = len(nodes.keys())
+    println("[lin] loaded nodes=" + to_string(total) +
+            " (inventory " + _bool_s(_is_file(INVENTORY)) +
+            " · lineage_meta " + _bool_s(_is_file(LINEAGE_META)) +
+            " · pending_dir " + _bool_s(_file_exists(PENDING_DIR)) + ")")
+
+    if total == 0 {
+        println("[lin] NO_DATA — no proposals discovered (inventory + meta + pending all empty)")
+        let mut body = "{\n"
+        body = body + "  \"schema\": \"anima.proposal_lineage_graph.v1\",\n"
+        body = body + "  \"tool\": \"tool/proposal_lineage_graph.hexa\",\n"
+        body = body + "  \"ts\": \"" + _ts_iso() + "\",\n"
+        body = body + "  \"mode\": \"render\",\n"
+        body = body + "  \"nodes\": 0,\n"
+        body = body + "  \"edges\": 0,\n"
+        body = body + "  \"verdict\": \"NO_DATA\"\n"
+        body = body + "}\n"
+        write_file(SMOKE_OUT, body)
+        exit(0)
+    }
+
+    let mut graph = nodes
+    if len(focus_id) > 0 {
+        if !nodes.contains_key(focus_id) {
+            eprintln("[lin] SETUP_ERROR — --id " + focus_id + " not found in any source")
+            exit(2)
+        }
+        graph = focus_subset(nodes, focus_id)
+        println("[lin] focus(" + focus_id + ") → sub_nodes=" + to_string(len(graph.keys())))
+    }
+
+    let mermaid = render_mermaid(graph)
+    let n_nodes = len(graph.keys())
+    let n_edges = count_edges(graph)
+    write_doc(mermaid, n_nodes, n_edges, focus_id)
+    println("[lin] wrote " + DOC_OUT + " — nodes=" + to_string(n_nodes) +
+            " edges=" + to_string(n_edges))
+
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima.proposal_lineage_graph.v1\",\n"
+    body = body + "  \"tool\": \"tool/proposal_lineage_graph.hexa\",\n"
+    body = body + "  \"ts\": \"" + _ts_iso() + "\",\n"
+    body = body + "  \"mode\": \"render\",\n"
+    body = body + "  \"focus_id\": \"" + _json_escape(focus_id) + "\",\n"
+    body = body + "  \"nodes\": " + to_string(n_nodes) + ",\n"
+    body = body + "  \"edges\": " + to_string(n_edges) + ",\n"
+    body = body + "  \"doc_path\": \"" + _json_escape(DOC_OUT) + "\",\n"
+    body = body + "  \"verdict\": \"OK\"\n"
+    body = body + "}\n"
+    write_file(SMOKE_OUT, body)
+    exit(0)
+}
+
+main()

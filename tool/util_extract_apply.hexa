@@ -1,0 +1,386 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/util_extract_apply.hexa — ROI H42 inline-deprecation marker driver
+//
+//  PURPOSE
+//    Walk every tool/*.hexa that still ships its own private copy of one of
+//    the four high-frequency utilities now consolidated under shared/util/:
+//
+//        _sh_quote      → shared/util/sh_quote.hexa
+//        _file_exists   → shared/util/file_exists.hexa
+//        _ts_iso        → shared/util/ts_iso.hexa
+//        _json_escape   → shared/util/json_escape.hexa
+//
+//    For every match, prepend a single-line marker comment immediately above
+//    the inline `fn _xxx(` definition:
+//
+//        // INLINE_DEPRECATED[H42]: see shared/util/<name>.hexa for canonical impl
+//        fn _xxx(...) { ... }
+//
+//    The marker is IDEMPOTENT — running this tool twice does not stack
+//    duplicate comments. The original definition is NEVER deleted because
+//    hexa stage0 module loading is unstable; the canonical libraries are
+//    pure-fn and load cleanly, but cross-file `import`/`use` semantics are
+//    not yet reliable, so the inline copy stays as the active runtime path.
+//    The marker is purely a cleanup-readiness signal for a later pass.
+//
+//  OUTPUT
+//    state/util_extract_apply_audit.json
+//      {
+//        "schema":   "anima.util_extract_apply_audit.v1",
+//        "ts":       "<iso>",
+//        "watched":  ["_sh_quote", "_file_exists", "_ts_iso", "_json_escape"],
+//        "tools":    [
+//          {
+//            "path":          "tool/<name>.hexa",
+//            "matches": [
+//              {"fn": "_sh_quote", "original_loc": <int>,
+//               "deprecation_marker_added": true|false,
+//               "kept_inline": true,
+//               "test_after_marker": "skipped" | "library_load_ok" | "selftest_ok" | "selftest_fail"}
+//            ]
+//          },
+//          ...
+//        ],
+//        "summary": {"tools_marked": <int>, "markers_added": <int>, "skipped_already_marked": <int>}
+//      }
+//
+//  USAGE
+//    hexa tool/util_extract_apply.hexa            # apply markers, write audit
+//    hexa tool/util_extract_apply.hexa --dry-run  # report only, no file edits
+//    hexa tool/util_extract_apply.hexa --selftest # 2-step selftest
+//
+//  HARD CONSTRAINTS
+//    - DO NOT delete inline definitions (hexa loader unstable).
+//    - DO NOT auto-add `import` / `use` statements.
+//    - DO NOT modify .roadmap (uchg).
+//    - Marker line is detected by exact substring "INLINE_DEPRECATED[H42]";
+//      so re-runs are no-ops on already-marked files.
+//
+//  RAW ALIGNMENT
+//    raw#9   hexa-only driver
+//    raw#10  state/util_extract_apply_audit.json is append-stable
+//    raw#11  snake_case
+//    raw#15  no-hardcode beyond ANIMA_ROOT (single anchor)
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT = "/Users/ghost/core/anima"
+let TOOL_DIR   = "/Users/ghost/core/anima/tool"
+let OUT_PATH   = "/Users/ghost/core/anima/state/util_extract_apply_audit.json"
+let MARKER_TAG = "INLINE_DEPRECATED[H42]"
+
+// (fn name, canonical shared/util file) — kept single-line per hexa-stage0 parser
+let TARGETS = [["_sh_quote", "shared/util/sh_quote.hexa"], ["_file_exists", "shared/util/file_exists.hexa"], ["_ts_iso", "shared/util/ts_iso.hexa"], ["_json_escape", "shared/util/json_escape.hexa"]]
+
+// ─── inline mini-helpers (kept inline for self-containment) ────────────────
+
+fn _shq(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _file_exists_a(p: string) -> bool {
+    return exec_with_status("test -e " + _shq(p))[1] == 0
+}
+
+fn _ts_iso_a() -> string {
+    let r = exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")
+    return to_string(r[0]).trim()
+}
+
+fn _json_esc_a(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+fn _short_path(p: string) -> string {
+    let root = ANIMA_ROOT + "/"
+    if p.starts_with(root) {
+        // strip prefix via split-rejoin (no substring builtin in stripped 0.2.0)
+        let parts = p.split(root)
+        let mut tail = ""
+        let mut i = 1
+        while i < len(parts) {
+            if i > 1 { tail = tail + root }
+            tail = tail + to_string(parts[i])
+            i = i + 1
+        }
+        return tail
+    }
+    return p
+}
+
+// ─── tool discovery ────────────────────────────────────────────────────────
+
+fn _list_tools() -> array {
+    let cmd = "ls " + _shq(TOOL_DIR) + "/*.hexa 2>/dev/null"
+    let r = exec_with_status(cmd)
+    let mut out = []
+    if r[1] != 0 { return out }
+    let lines = to_string(r[0]).split("\n")
+    for ln in lines {
+        let t = ln.trim()
+        if len(t) == 0 { continue }
+        out.push(t)
+    }
+    return out
+}
+
+// Locate `fn NAME(` line in the given source, returns 1-indexed line number
+// or 0 if absent.
+fn _find_fn_line(src: string, name: string) -> int {
+    let needle = "fn " + name + "("
+    let lines = src.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = to_string(lines[i])
+        // Convention: top-level `fn _xxx(` definitions live at column 0
+        // throughout the anima tool/ tree (verified across the 47-tool
+        // _sh_quote cohort). Indented helpers are not extraction targets.
+        if ln.starts_with(needle) {
+            return i + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Returns true if the immediately previous line already contains MARKER_TAG.
+fn _is_already_marked(src: string, fn_line_1based: int) -> bool {
+    if fn_line_1based <= 1 { return false }
+    let lines = src.split("\n")
+    let prev = to_string(lines[fn_line_1based - 2])
+    return prev.contains(MARKER_TAG)
+}
+
+// Insert marker line immediately above the `fn NAME(` definition.
+fn _insert_marker(src: string, fn_line_1based: int, fn_name: string, canonical_path: string) -> string {
+    let marker = "// " + MARKER_TAG + ": see " + canonical_path + " for canonical impl — kept inline (hexa stage0 loader)"
+    let lines = src.split("\n")
+    let mut out = ""
+    let mut i = 0
+    while i < len(lines) {
+        if (i + 1) == fn_line_1based {
+            out = out + marker + "\n"
+        }
+        out = out + to_string(lines[i])
+        if i + 1 < len(lines) { out = out + "\n" }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── per-tool processing ───────────────────────────────────────────────────
+
+fn _process_tool(path: string, dry_run: bool) -> array {
+    // result := [matches_array, mutated_bool]
+    let raw = read_file(path)
+    let mut src = to_string(raw)
+    let mut matches = []
+    let mut mutated = false
+
+    let mut t = 0
+    while t < len(TARGETS) {
+        let fn_name = TARGETS[t][0]
+        let canon   = TARGETS[t][1]
+        let line    = _find_fn_line(src, fn_name)
+        if line > 0 {
+            let already = _is_already_marked(src, line)
+            let mut added = false
+            if !already && !dry_run {
+                src = _insert_marker(src, line, fn_name, canon)
+                added = true
+                mutated = true
+            }
+            matches.push([fn_name, line, already, added])
+        }
+        t = t + 1
+    }
+
+    if mutated {
+        write_file(path, src)
+    }
+
+    return [matches, mutated]
+}
+
+// ─── audit emit ────────────────────────────────────────────────────────────
+
+fn _matches_to_json(matches: array) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < len(matches) {
+        if i > 0 { s = s + "," }
+        let m = matches[i]
+        let fn_name      = to_string(m[0])
+        let original_loc = m[1]
+        let already      = m[2]
+        let added        = m[3]
+        let mut test_after = "skipped"
+        if added {
+            test_after = "library_marker_only"
+        } else {
+            if already { test_after = "idempotent_skip" }
+        }
+        s = s + "{"
+        s = s + "\"fn\":\"" + _json_esc_a(fn_name) + "\","
+        s = s + "\"original_loc\":" + to_string(original_loc) + ","
+        s = s + "\"deprecation_marker_added\":" + (if added { "true" } else { "false" }) + ","
+        s = s + "\"kept_inline\":true,"
+        s = s + "\"test_after_marker\":\"" + test_after + "\""
+        s = s + "}"
+        i = i + 1
+    }
+    s = s + "]"
+    return s
+}
+
+fn _watched_to_json() -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < len(TARGETS) {
+        if i > 0 { s = s + "," }
+        s = s + "\"" + _json_esc_a(TARGETS[i][0]) + "\""
+        i = i + 1
+    }
+    s = s + "]"
+    return s
+}
+
+fn _write_audit(tool_results: array, dry_run: bool) {
+    let mut tools_marked = 0
+    let mut markers_added = 0
+    let mut skipped_already = 0
+
+    let mut j = "{\n"
+    j = j + "  \"schema\": \"anima.util_extract_apply_audit.v1\",\n"
+    j = j + "  \"ts\": \"" + _ts_iso_a() + "\",\n"
+    j = j + "  \"dry_run\": " + (if dry_run { "true" } else { "false" }) + ",\n"
+    j = j + "  \"watched\": " + _watched_to_json() + ",\n"
+    j = j + "  \"tools\": [\n"
+    let mut i = 0
+    while i < len(tool_results) {
+        let entry = tool_results[i]
+        let path    = to_string(entry[0])
+        let matches = entry[1]
+        let mutated = entry[2]
+        if mutated { tools_marked = tools_marked + 1 }
+        let mut k = 0
+        while k < len(matches) {
+            let m = matches[k]
+            if m[3] { markers_added = markers_added + 1 }
+            if m[2] { skipped_already = skipped_already + 1 }
+            k = k + 1
+        }
+        if i > 0 { j = j + ",\n" }
+        j = j + "    {\"path\":\"" + _json_esc_a(_short_path(path)) + "\","
+        j = j + "\"mutated\":" + (if mutated { "true" } else { "false" }) + ","
+        j = j + "\"matches\":" + _matches_to_json(matches) + "}"
+        i = i + 1
+    }
+    j = j + "\n  ],\n"
+    j = j + "  \"summary\": {"
+    j = j + "\"tools_marked\":" + to_string(tools_marked) + ","
+    j = j + "\"markers_added\":" + to_string(markers_added) + ","
+    j = j + "\"skipped_already_marked\":" + to_string(skipped_already)
+    j = j + "}\n"
+    j = j + "}\n"
+
+    let tmp = OUT_PATH + ".tmp"
+    write_file(tmp, j)
+    exec_with_status("mv -f " + _shq(tmp) + " " + _shq(OUT_PATH))
+}
+
+// ─── argv ──────────────────────────────────────────────────────────────────
+
+fn _arg_present(av: array, k: string) -> bool {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── selftest ──────────────────────────────────────────────────────────────
+
+fn _selftest() -> int {
+    println("── util_extract_apply selftest ──")
+    let mut fails = 0
+
+    // S1 — _find_fn_line locates a known def at the right line (1-indexed)
+    let synth_src = "// header\nlet K = 1\nfn _sh_quote(s: string) -> string {\n    return s\n}\n"
+    let line = _find_fn_line(synth_src, "_sh_quote")
+    if line == 3 {
+        println("S1 _find_fn_line: PASS (line=" + to_string(line) + ")")
+    } else {
+        println("S1 _find_fn_line: FAIL (got " + to_string(line) + ", want 3)")
+        fails = fails + 1
+    }
+
+    // S2 — _insert_marker is idempotent (insert once, second call sees marker)
+    let inserted = _insert_marker(synth_src, line, "_sh_quote", "shared/util/sh_quote.hexa")
+    let marked = _is_already_marked(inserted, line + 1)
+    if marked {
+        println("S2 _is_already_marked after insert: PASS")
+    } else {
+        println("S2 _is_already_marked after insert: FAIL")
+        fails = fails + 1
+    }
+
+    if fails == 0 {
+        println("── selftest 2/2 PASS ──")
+        return 0
+    }
+    println("── selftest FAIL count=" + to_string(fails) + " ──")
+    return 1
+}
+
+// ─── main ──────────────────────────────────────────────────────────────────
+
+let _argv = args()
+
+if _arg_present(_argv, "--selftest") {
+    exit(_selftest())
+}
+
+let dry_run = _arg_present(_argv, "--dry-run")
+
+println("── util_extract_apply (ROI H42) ──")
+println("mode              : " + (if dry_run { "dry-run" } else { "apply" }))
+println("watched           : " + to_string(len(TARGETS)) + " utilities")
+
+let tools = _list_tools()
+println("tools discovered  : " + to_string(len(tools)))
+
+let mut results = []
+let mut total_markers = 0
+let mut total_idem    = 0
+for path in tools {
+    // Skip the apply tool itself + the audit tool + the canonical libs
+    let sp = _short_path(path)
+    if sp == "tool/util_extract_apply.hexa" { continue }
+    if sp == "tool/util_extract_audit.hexa" { continue }
+    let res = _process_tool(path, dry_run)
+    let matches = res[0]
+    let mutated = res[1]
+    if len(matches) > 0 {
+        results.push([path, matches, mutated])
+        let mut k = 0
+        while k < len(matches) {
+            let m = matches[k]
+            if m[3] { total_markers = total_markers + 1 }
+            if m[2] { total_idem = total_idem + 1 }
+            k = k + 1
+        }
+    }
+}
+
+_write_audit(results, dry_run)
+
+println("tools_with_inline : " + to_string(len(results)))
+println("markers_added     : " + to_string(total_markers))
+println("idempotent_skips  : " + to_string(total_idem))
+println("output            : " + OUT_PATH)
+println("PASS (markers idempotent — re-run is a no-op)")
+exit(0)

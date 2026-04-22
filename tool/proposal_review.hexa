@@ -1,0 +1,664 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/proposal_review.hexa — P3 (CLI interactive proposal review)
+//
+//  PURPOSE
+//    READ-ONLY CLI for browsing accumulated proposals in state/proposals/.
+//    Implements §5 of docs/anima_proposal_stack_paradigm_20260422.md.
+//    Top-10 pending listing, per-id detail view, category & kind filters,
+//    score floor, JSON output, and synthetic selftest.
+//
+//  STATE (read-only — never mutated)
+//    state/proposals/inventory.json
+//    state/proposals/{pending,approved,rejected,archived,debate}/<id>.json
+//    state/proposals/refinement/<id>/v*.json
+//    state/proposals/meta/lineage.json
+//
+//  CLI
+//    hexa tool/proposal_review.hexa                       top 10 pending
+//    hexa tool/proposal_review.hexa --id 20260422-042     full detail (yaml-ish)
+//    hexa tool/proposal_review.hexa --pending             list pending
+//    hexa tool/proposal_review.hexa --approved            list approved
+//    hexa tool/proposal_review.hexa --rejected            list rejected
+//    hexa tool/proposal_review.hexa --archived            list archived
+//    hexa tool/proposal_review.hexa --debate              list debate
+//    hexa tool/proposal_review.hexa --kind tool           filter by kind
+//    hexa tool/proposal_review.hexa --score-min 70        score floor
+//    hexa tool/proposal_review.hexa --json                machine-readable
+//    hexa tool/proposal_review.hexa --selftest            synthetic 3-proposal
+//
+//  HARD CONSTRAINTS
+//    READ-ONLY — never writes to proposal/, .roadmap, or state outside
+//    /tmp scratch (selftest only). Empty inventory → "no pending proposals".
+//
+//  RAW
+//    raw#9 hexa-only · raw#11 snake_case · raw#15 no-hardcode (anchored)
+//
+//  EXIT CODES
+//    0 — listing OR detail OR selftest PASS OR empty-graceful
+//    1 — selftest FAIL OR --id not found
+//    2 — setup error (cannot read inventory)
+// ════════════════════════════════════════════════════════════════════════════
+
+let TOOL_NAME    = "proposal_review"
+let TOOL_VERSION = "v1"
+let REPO_ROOT    = "/Users/ghost/core/anima"
+let PROPOSAL_DIR = "/Users/ghost/core/anima/state/proposals"
+let INVENTORY    = "/Users/ghost/core/anima/state/proposals/inventory.json"
+let LINEAGE      = "/Users/ghost/core/anima/state/proposals/meta/lineage.json"
+
+// ─── shell helpers ───────────────────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    let mut out = "'"
+    out = out + s.replace("'", "'\\''")
+    out = out + "'"
+    return out
+}
+
+fn _exec_out(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _file_exists(path: string) -> bool {
+    let r = exec_with_status("test -e " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _is_file(path: string) -> bool {
+    let r = exec_with_status("test -f " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _is_dir(path: string) -> bool {
+    let r = exec_with_status("test -d " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _ts_iso() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _bool_s(b: bool) -> string {
+    if b { return "true" } else { return "false" }
+}
+
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+// ─── arg parsing ─────────────────────────────────────────────────────────────
+
+fn _arg_present(argv: array, key: string) -> bool {
+    let mut i = 0
+    while i < len(argv) {
+        if to_string(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _arg_value(argv: array, key: string, dflt: string) -> string {
+    let mut i = 0
+    while i < len(argv) {
+        if to_string(argv[i]) == key {
+            if i + 1 < len(argv) { return to_string(argv[i + 1]) }
+        }
+        i = i + 1
+    }
+    return dflt
+}
+
+// ─── string padding helpers (text table) ─────────────────────────────────────
+
+fn _pad_right(s: string, n: int) -> string {
+    let mut out = s
+    let mut k = len(s)
+    while k < n {
+        out = out + " "
+        k = k + 1
+    }
+    return out
+}
+
+fn _pad_left(s: string, n: int) -> string {
+    let mut out = s
+    let mut k = len(s)
+    while k < n {
+        out = " " + out
+        k = k + 1
+    }
+    return out
+}
+
+fn _truncate(s: string, n: int) -> string {
+    if len(s) <= n { return s }
+    if n <= 3 { return s.substring(0, n) }
+    return s.substring(0, n - 1) + "…"
+}
+
+// ─── proposal I/O ────────────────────────────────────────────────────────────
+//
+// Each proposal lives at PROPOSAL_DIR/<status>/<id>.json (per spec §1).
+// The inventory.json index has fields per proposal — we trust the index
+// as SSOT for listing (per cycle invariant), but for --id detail we re-read
+// the per-file json so the user sees full schema fields.
+
+fn _empty_proposal() {
+    let mut p = #{}
+    p["id"] = ""
+    p["version"] = 1
+    p["first_seen_ts"] = ""
+    p["last_refined_ts"] = ""
+    p["title"] = ""
+    p["kind"] = "tool"
+    p["rationale"] = ""
+    p["evidence_sources"] = []
+    p["estimated_effort"] = ""
+    p["estimated_impact"] = ""
+    p["risk_level"] = "0"
+    p["loss_free"] = true
+    p["depends_on"] = []
+    p["conflicts_with"] = []
+    p["merges_with"] = []
+    p["refinement_history"] = []
+    p["score_priority"] = 0
+    p["user_status"] = "pending"
+    p["user_decision_at"] = ""
+    p["user_decision_reason"] = ""
+    p["implementation_module_path"] = ""
+    p["lineage_parent"] = ""
+    p["lineage_children"] = []
+    p["veto_count"] = 0
+    p["resurrection_eligible_after"] = ""
+    return p
+}
+
+// Defensive merge: take whatever the on-disk dict has, fall back to defaults.
+fn _hydrate(doc) {
+    let mut p = _empty_proposal()
+    let keys = ["id", "version", "first_seen_ts", "last_refined_ts", "title",
+                "kind", "rationale", "evidence_sources", "estimated_effort",
+                "estimated_impact", "risk_level", "loss_free", "depends_on",
+                "conflicts_with", "merges_with", "refinement_history",
+                "score_priority", "user_status", "user_decision_at",
+                "user_decision_reason", "implementation_module_path",
+                "lineage_parent", "lineage_children", "veto_count",
+                "resurrection_eligible_after"]
+    let mut i = 0
+    while i < len(keys) {
+        let k = to_string(keys[i])
+        if doc.contains_key(k) { p[k] = doc[k] }
+        i = i + 1
+    }
+    return p
+}
+
+fn _read_proposal_file(path: string) {
+    let raw = read_file(path).trim()
+    if len(raw) == 0 { return _empty_proposal() }
+    let doc = json_parse(raw)
+    return _hydrate(doc)
+}
+
+// Walk PROPOSAL_DIR/<status>/ for *.json files. Returns array of proposals.
+// status="" → walk all five canonical status dirs.
+fn _scan_status(status: string) -> array {
+    let mut acc = []
+    let dirs = if len(status) > 0 {
+        [PROPOSAL_DIR + "/" + status]
+    } else {
+        [PROPOSAL_DIR + "/pending", PROPOSAL_DIR + "/approved",
+         PROPOSAL_DIR + "/rejected", PROPOSAL_DIR + "/archived",
+         PROPOSAL_DIR + "/debate"]
+    }
+    let mut i = 0
+    while i < len(dirs) {
+        let d = to_string(dirs[i])
+        if _is_dir(d) {
+            let listing = _exec_out("ls " + _sh_quote(d) + " 2>/dev/null").trim()
+            if len(listing) > 0 {
+                let names = split(listing, "\n")
+                for n in names {
+                    let nm = to_string(n).trim()
+                    if len(nm) == 0 { continue }
+                    if !nm.ends_with(".json") { continue }
+                    let p = _read_proposal_file(d + "/" + nm)
+                    acc.push(p)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return acc
+}
+
+// Inventory-first listing for the requested status. If inventory.json has
+// proposals[] entries we use those (fast path & SSOT), otherwise fall back
+// to filesystem scan. Empty in either case → empty array (graceful).
+fn _load_proposals(status: string) -> array {
+    if _is_file(INVENTORY) {
+        let raw = read_file(INVENTORY).trim()
+        if len(raw) > 0 {
+            let doc = json_parse(raw)
+            if doc.contains_key("proposals") {
+                let items = doc["proposals"]
+                let mut acc = []
+                let mut i = 0
+                while i < len(items) {
+                    let p = _hydrate(items[i])
+                    let st = to_string(p["user_status"])
+                    if len(status) == 0 || st == status {
+                        acc.push(p)
+                    }
+                    i = i + 1
+                }
+                return acc
+            }
+        }
+    }
+    return _scan_status(status)
+}
+
+// ─── filtering / sorting ─────────────────────────────────────────────────────
+
+fn _filter_kind(items: array, kind: string) -> array {
+    if len(kind) == 0 { return items }
+    let mut acc = []
+    let mut i = 0
+    while i < len(items) {
+        if to_string(items[i]["kind"]) == kind { acc.push(items[i]) }
+        i = i + 1
+    }
+    return acc
+}
+
+fn _filter_score_min(items: array, score_min: int) -> array {
+    if score_min <= 0 { return items }
+    let mut acc = []
+    let mut i = 0
+    while i < len(items) {
+        let s = to_int(to_string(items[i]["score_priority"]))
+        if s >= score_min { acc.push(items[i]) }
+        i = i + 1
+    }
+    return acc
+}
+
+// In-place insertion sort by score_priority desc (stable enough for small N).
+fn _sort_by_score_desc(items: array) -> array {
+    let n = len(items)
+    let mut out = []
+    let mut i = 0
+    while i < n { out.push(items[i]); i = i + 1 }
+    let mut a = 1
+    while a < len(out) {
+        let cur = out[a]
+        let cur_s = to_int(to_string(cur["score_priority"]))
+        let mut b = a - 1
+        while b >= 0 {
+            let prev_s = to_int(to_string(out[b]["score_priority"]))
+            if prev_s >= cur_s { break }
+            out[b + 1] = out[b]
+            b = b - 1
+        }
+        out[b + 1] = cur
+        a = a + 1
+    }
+    return out
+}
+
+// ─── age computation (days since first_seen_ts) ──────────────────────────────
+//
+// We shell out to `date -d` (gnu) / `date -j -f` (bsd). Use the bsd-friendly
+// path (macOS). On parse fail return -1 → printed as "?" in the table.
+fn _age_days(first_seen: string) -> int {
+    if len(first_seen) == 0 { return -1 }
+    let stamp = first_seen.substring(0, 10)  // YYYY-MM-DD
+    let cmd = "python3 -c " + _sh_quote(
+        "import datetime,sys;" +
+        "d=datetime.date.fromisoformat(\"" + stamp + "\");" +
+        "n=datetime.datetime.now(datetime.timezone.utc).date();" +
+        "print((n-d).days)")
+    let r = exec_with_status(cmd)
+    if r[1] != 0 { return -1 }
+    let s = to_string(r[0]).trim()
+    if len(s) == 0 { return -1 }
+    return to_int(s)
+}
+
+fn _refines_label(p) -> string {
+    let v = to_int(to_string(p["version"]))
+    return "v" + to_string(v)
+}
+
+// ─── text rendering ──────────────────────────────────────────────────────────
+
+let HDR_ID    = "ID"
+let HDR_SCORE = "score"
+let HDR_KIND  = "kind"
+let HDR_TITLE = "title"
+let HDR_AGE   = "age (d)"
+let HDR_REF   = "refines"
+
+fn _render_table(items: array, max_n: int) -> string {
+    if len(items) == 0 {
+        return "(empty)"
+    }
+    let mut out = ""
+    out = out + _pad_right(HDR_ID, 13) + " | " +
+                _pad_left(HDR_SCORE, 5) + " | " +
+                _pad_right(HDR_KIND, 8) + " | " +
+                _pad_right(HDR_TITLE, 38) + " | " +
+                _pad_left(HDR_AGE, 7) + " | " +
+                HDR_REF + "\n"
+    out = out + "-------------+-------+----------+----------------------------------------+---------+--------\n"
+    let mut i = 0
+    let n = len(items)
+    let limit = if max_n > 0 && max_n < n { max_n } else { n }
+    while i < limit {
+        let p = items[i]
+        let id = to_string(p["id"])
+        let sc = to_string(p["score_priority"])
+        let kd = to_string(p["kind"])
+        let tt = _truncate(to_string(p["title"]), 38)
+        let ag = _age_days(to_string(p["first_seen_ts"]))
+        let ag_s = if ag < 0 { "?" } else { to_string(ag) }
+        let rf = _refines_label(p)
+        out = out + _pad_right(id, 13) + " | " +
+                    _pad_left(sc, 5) + " | " +
+                    _pad_right(kd, 8) + " | " +
+                    _pad_right(tt, 38) + " | " +
+                    _pad_left(ag_s, 7) + " | " +
+                    rf + "\n"
+        i = i + 1
+    }
+    return out
+}
+
+// expanded YAML-ish detail block for --id
+fn _yaml_str(s: string) -> string {
+    // simple double-quote wrap, escape \\ and "
+    let esc = s.replace("\\", "\\\\").replace("\"", "\\\"")
+    return "\"" + esc + "\""
+}
+
+fn _render_array(arr: array) -> string {
+    if len(arr) == 0 { return "[]" }
+    let mut out = "["
+    let mut i = 0
+    while i < len(arr) {
+        if i > 0 { out = out + ", " }
+        out = out + _yaml_str(to_string(arr[i]))
+        i = i + 1
+    }
+    out = out + "]"
+    return out
+}
+
+fn _render_detail(p) -> string {
+    let mut out = ""
+    out = out + "id: "                          + _yaml_str(to_string(p["id"])) + "\n"
+    out = out + "version: "                     + to_string(p["version"]) + "\n"
+    out = out + "first_seen_ts: "               + _yaml_str(to_string(p["first_seen_ts"])) + "\n"
+    out = out + "last_refined_ts: "             + _yaml_str(to_string(p["last_refined_ts"])) + "\n"
+    out = out + "title: "                       + _yaml_str(to_string(p["title"])) + "\n"
+    out = out + "kind: "                        + _yaml_str(to_string(p["kind"])) + "\n"
+    out = out + "rationale: "                   + _yaml_str(to_string(p["rationale"])) + "\n"
+    out = out + "estimated_effort: "            + _yaml_str(to_string(p["estimated_effort"])) + "\n"
+    out = out + "estimated_impact: "            + _yaml_str(to_string(p["estimated_impact"])) + "\n"
+    out = out + "risk_level: "                  + _yaml_str(to_string(p["risk_level"])) + "\n"
+    out = out + "loss_free: "                   + _bool_s(p["loss_free"]) + "\n"
+    out = out + "depends_on: "                  + _render_array(p["depends_on"]) + "\n"
+    out = out + "conflicts_with: "              + _render_array(p["conflicts_with"]) + "\n"
+    out = out + "merges_with: "                 + _render_array(p["merges_with"]) + "\n"
+    out = out + "score_priority: "              + to_string(p["score_priority"]) + "\n"
+    out = out + "user_status: "                 + _yaml_str(to_string(p["user_status"])) + "\n"
+    out = out + "user_decision_at: "            + _yaml_str(to_string(p["user_decision_at"])) + "\n"
+    out = out + "user_decision_reason: "        + _yaml_str(to_string(p["user_decision_reason"])) + "\n"
+    out = out + "implementation_module_path: "  + _yaml_str(to_string(p["implementation_module_path"])) + "\n"
+    out = out + "lineage_parent: "              + _yaml_str(to_string(p["lineage_parent"])) + "\n"
+    out = out + "lineage_children: "            + _render_array(p["lineage_children"]) + "\n"
+    out = out + "veto_count: "                  + to_string(p["veto_count"]) + "\n"
+    out = out + "resurrection_eligible_after: " + _yaml_str(to_string(p["resurrection_eligible_after"])) + "\n"
+
+    out = out + "evidence_sources:\n"
+    let ev = p["evidence_sources"]
+    let mut i = 0
+    while i < len(ev) {
+        let e = ev[i]
+        let path = if e.contains_key("path") { to_string(e["path"]) } else { "" }
+        let field = if e.contains_key("field") { to_string(e["field"]) } else { "" }
+        let sha = if e.contains_key("snapshot_sha256") { to_string(e["snapshot_sha256"]) } else { "" }
+        out = out + "  - path: " + _yaml_str(path) + "\n"
+        out = out + "    field: " + _yaml_str(field) + "\n"
+        out = out + "    snapshot_sha256: " + _yaml_str(sha) + "\n"
+        i = i + 1
+    }
+
+    out = out + "refinement_history:\n"
+    let rh = p["refinement_history"]
+    let mut j = 0
+    while j < len(rh) {
+        let h = rh[j]
+        let v = if h.contains_key("v") { to_string(h["v"]) } else { "?" }
+        let ts = if h.contains_key("ts") { to_string(h["ts"]) } else { "" }
+        let diff = if h.contains_key("diff") { to_string(h["diff"]) } else { "" }
+        out = out + "  - v: " + v + "\n"
+        out = out + "    ts: " + _yaml_str(ts) + "\n"
+        out = out + "    diff: " + _yaml_str(diff) + "\n"
+        j = j + 1
+    }
+    return out
+}
+
+// ─── JSON rendering (machine-readable) ───────────────────────────────────────
+
+fn _render_json_listing(items: array) -> string {
+    let mut out = "{\n"
+    out = out + "  \"schema\": \"anima.proposal_review.v1\",\n"
+    out = out + "  \"tool\": \"tool/proposal_review.hexa\",\n"
+    out = out + "  \"ts\": \"" + _ts_iso() + "\",\n"
+    out = out + "  \"count\": " + to_string(len(items)) + ",\n"
+    out = out + "  \"items\": [\n"
+    let mut i = 0
+    while i < len(items) {
+        let p = items[i]
+        out = out + "    {"
+        out = out + "\"id\":\"" + _json_escape(to_string(p["id"])) + "\","
+        out = out + "\"score_priority\":" + to_string(p["score_priority"]) + ","
+        out = out + "\"kind\":\"" + _json_escape(to_string(p["kind"])) + "\","
+        out = out + "\"title\":\"" + _json_escape(to_string(p["title"])) + "\","
+        out = out + "\"version\":" + to_string(p["version"]) + ","
+        out = out + "\"user_status\":\"" + _json_escape(to_string(p["user_status"])) + "\","
+        out = out + "\"first_seen_ts\":\"" + _json_escape(to_string(p["first_seen_ts"])) + "\""
+        out = out + "}"
+        if i < len(items) - 1 { out = out + "," }
+        out = out + "\n"
+        i = i + 1
+    }
+    out = out + "  ]\n"
+    out = out + "}\n"
+    return out
+}
+
+// ─── selftest (synthetic 3 proposals) ────────────────────────────────────────
+//
+// Builds 3 in-memory proposals (high/med/low score), runs the same sort +
+// filter + render path the main pipeline uses, and asserts the top item is
+// the high-score one. NEVER touches disk under PROPOSAL_DIR.
+
+fn _mk_synthetic(id: string, title: string, kind: string, score: int) {
+    let mut p = _empty_proposal()
+    p["id"] = id
+    p["title"] = title
+    p["kind"] = kind
+    p["score_priority"] = score
+    p["first_seen_ts"] = "2026-04-22T00:00:00Z"
+    p["version"] = 1
+    p["user_status"] = "pending"
+    return p
+}
+
+fn _selftest() -> int {
+    println("[review] selftest — synthetic 3-proposal pipeline")
+    let mut items = []
+    items.push(_mk_synthetic("20260422-001", "high score paradigm proposal", "paradigm", 87))
+    items.push(_mk_synthetic("20260422-002", "med score tool proposal",      "tool",     55))
+    items.push(_mk_synthetic("20260422-003", "low score axis proposal",      "axis",     12))
+
+    let sorted = _sort_by_score_desc(items)
+    let top = sorted[0]
+    let top_id = to_string(top["id"])
+    let top_score = to_int(to_string(top["score_priority"]))
+    let s1 = top_id == "20260422-001" && top_score == 87
+    println("[review]   S1 sort_desc top=" + top_id + " score=" + to_string(top_score) + " " + _bool_s(s1))
+
+    let mid_filter = _filter_score_min(sorted, 50)
+    let s2 = len(mid_filter) == 2
+    println("[review]   S2 score_min=50 → count=" + to_string(len(mid_filter)) + " (want 2) " + _bool_s(s2))
+
+    let kind_filter = _filter_kind(sorted, "tool")
+    let s3 = len(kind_filter) == 1 && to_string(kind_filter[0]["id"]) == "20260422-002"
+    println("[review]   S3 kind=tool → count=" + to_string(len(kind_filter)) + " " + _bool_s(s3))
+
+    let table = _render_table(sorted, 10)
+    let s4 = table.contains("20260422-001") && table.contains("paradigm") && table.contains("87")
+    println("[review]   S4 table render contains top row " + _bool_s(s4))
+
+    let detail = _render_detail(top)
+    let s5 = detail.contains("score_priority: 87") && detail.contains("kind: \"paradigm\"")
+    println("[review]   S5 detail render contains expanded fields " + _bool_s(s5))
+
+    let json_out = _render_json_listing(sorted)
+    let s6 = json_out.contains("\"count\": 3") && json_out.contains("\"score_priority\":87")
+    println("[review]   S6 json render contains count + top score " + _bool_s(s6))
+
+    let empty_table = _render_table([], 10)
+    let s7 = empty_table == "(empty)"
+    println("[review]   S7 empty table → \"(empty)\" " + _bool_s(s7))
+
+    let ok = s1 && s2 && s3 && s4 && s5 && s6 && s7
+    println("[review] sample top output:")
+    println(table)
+    println("[review] sample --id detail:")
+    println(detail)
+    if ok {
+        println("[review] selftest PASS (7/7)")
+        return 0
+    }
+    eprintln("[review] selftest FAIL")
+    return 1
+}
+
+// ─── main dispatch ───────────────────────────────────────────────────────────
+
+fn main() {
+    let argv = args()
+
+    println("════════════════════════════════════════════════════════════════")
+    println("  tool/proposal_review.hexa — P3 (proposal stack CLI)")
+    println("  raw#9 hexa-only · READ-ONLY · ts=" + _ts_iso())
+    println("════════════════════════════════════════════════════════════════")
+
+    if _arg_present(argv, "--selftest") {
+        let rc = _selftest()
+        exit(rc)
+    }
+
+    let want_json = _arg_present(argv, "--json")
+    let kind_flt  = _arg_value(argv, "--kind", "")
+    let score_min = to_int(_arg_value(argv, "--score-min", "0"))
+    let id_flt    = _arg_value(argv, "--id", "")
+
+    // Determine status filter from the category flags.
+    let mut status = "pending"
+    let mut any_cat = false
+    if _arg_present(argv, "--pending")  { status = "pending";  any_cat = true }
+    if _arg_present(argv, "--approved") { status = "approved"; any_cat = true }
+    if _arg_present(argv, "--rejected") { status = "rejected"; any_cat = true }
+    if _arg_present(argv, "--archived") { status = "archived"; any_cat = true }
+    if _arg_present(argv, "--debate")   { status = "debate";   any_cat = true }
+
+    // ── --id detail mode ──
+    if len(id_flt) > 0 {
+        // Try inventory first, then walk all status dirs.
+        let all = _load_proposals("")
+        let mut found_idx = -1
+        let mut i = 0
+        while i < len(all) {
+            if to_string(all[i]["id"]) == id_flt { found_idx = i; break }
+            i = i + 1
+        }
+        if found_idx < 0 {
+            // fallback: scan disk all five status folders
+            let scanned = _scan_status("")
+            let mut k = 0
+            while k < len(scanned) {
+                if to_string(scanned[k]["id"]) == id_flt {
+                    if want_json {
+                        println(_render_json_listing([scanned[k]]))
+                    } else {
+                        println(_render_detail(scanned[k]))
+                    }
+                    exit(0)
+                }
+                k = k + 1
+            }
+            eprintln("[review] id not found: " + id_flt)
+            exit(1)
+        }
+        let p = all[found_idx]
+        if want_json {
+            println(_render_json_listing([p]))
+        } else {
+            println(_render_detail(p))
+        }
+        exit(0)
+    }
+
+    // ── listing mode ──
+    if !_is_dir(PROPOSAL_DIR) && !_is_file(INVENTORY) {
+        println("[review] no pending proposals (state/proposals/ not initialised — see P1 tool/proposal_inventory_init.hexa)")
+        exit(0)
+    }
+
+    let raw_items = _load_proposals(status)
+    let kf = _filter_kind(raw_items, kind_flt)
+    let sf = _filter_score_min(kf, score_min)
+    let sorted = _sort_by_score_desc(sf)
+
+    let max_n = if any_cat || len(kind_flt) > 0 || score_min > 0 { 0 } else { 10 }
+
+    if len(sorted) == 0 {
+        if status == "pending" && !any_cat && len(kind_flt) == 0 && score_min == 0 {
+            println("[review] no pending proposals")
+        } else {
+            println("[review] no proposals match filter (status=" + status +
+                    " kind=" + kind_flt + " score_min=" + to_string(score_min) + ")")
+        }
+        if want_json { println(_render_json_listing([])) }
+        exit(0)
+    }
+
+    if want_json {
+        let limit = if max_n > 0 && max_n < len(sorted) { max_n } else { len(sorted) }
+        let mut subset = []
+        let mut i = 0
+        while i < limit { subset.push(sorted[i]); i = i + 1 }
+        println(_render_json_listing(subset))
+        exit(0)
+    }
+
+    let banner_n = if max_n > 0 && max_n < len(sorted) { max_n } else { len(sorted) }
+    println("[review] status=" + status +
+            " total_matched=" + to_string(len(sorted)) +
+            " showing=" + to_string(banner_n) +
+            (if len(kind_flt) > 0 { " kind=" + kind_flt } else { "" }) +
+            (if score_min > 0 { " score_min=" + to_string(score_min) } else { "" }))
+    println("")
+    println(_render_table(sorted, max_n))
+    exit(0)
+}
+
+main()

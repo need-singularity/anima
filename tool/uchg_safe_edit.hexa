@@ -51,6 +51,7 @@ fn _arg_present(av, key: string) -> bool {
     return false
 }
 
+// INLINE_DEPRECATED[H42]: see shared/util/file_exists.hexa for canonical impl — kept inline (hexa stage0 loader)
 fn _file_exists(p: string) -> bool {
     let r = exec_with_status("test -r '" + p.replace("'", "'\\''") + "'")
     return r[1] == 0
@@ -68,13 +69,44 @@ fn _strip_line_comments(line: string) -> string {
 // Returns array of [line_no, raw_line] pairs that look like real exec calls
 // of `chflags nouchg` or `chflags uchg`. Heuristic: line contains `chflags`
 // AND `nouchg` or `uchg` AND is wrapped in an exec/exec_with_status/_exec_*
-// call OR is otherwise outside a // comment.
+// call OR is otherwise outside a // comment. Lines tagged with the sentinel
+// `uchg_safe_edit:fallback-allow` (typically inside a !exists(HELPER) fallback
+// branch) are skipped — those are intentionally retained for offline safety.
+fn _leading_indent(s: string) -> int {
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c != " " && c != "\t" { return i }
+        i = i + 1
+    }
+    return i
+}
+
 fn _scan(body: string, allow_comments: bool) -> array {
     let mut hits = []
     let lines = body.split("\n")
     let mut idx = 0
+    let mut in_fallback = false
+    let mut sentinel_indent = -1
     while idx < len(lines) {
         let raw = lines[idx]
+        // Activate fallback skip when sentinel comment seen. Skip continues
+        // until a closing brace appears at indentation <= sentinel indent
+        // (i.e. the enclosing fallback block has closed).
+        if !in_fallback && raw.contains("uchg_safe_edit:fallback-allow") {
+            in_fallback = true
+            sentinel_indent = _leading_indent(raw)
+        } else {
+            if in_fallback {
+                let trimmed = raw.trim()
+                let li = _leading_indent(raw)
+                if (trimmed == "}" || trimmed.starts_with("}")) && li < sentinel_indent {
+                    in_fallback = false
+                    sentinel_indent = -1
+                }
+            }
+        }
+        if in_fallback { idx = idx + 1; continue }
         let scanned = if allow_comments { _strip_line_comments(raw) } else { raw }
         if scanned.contains("chflags") {
             let has_uchg = scanned.contains(" uchg") || scanned.contains("\"uchg")
@@ -135,6 +167,12 @@ fn main() -> int {
         return 2
     }
     let allow_comments = _arg_present(av, "--allow-comments")
+    // Self-skip — this auditor's own pattern-matching strings would otherwise
+    // be reported as the very dance it's hunting for.
+    if file.ends_with("/uchg_safe_edit.hexa") || file == "uchg_safe_edit.hexa" {
+        println("uchg_safe_edit: OK — self-skip (auditor source); patterns intentional")
+        return 0
+    }
     let body = read_file(file)
     let hits = _scan(body, allow_comments)
     if !_has_dance(hits) {
@@ -157,5 +195,6 @@ fn main() -> int {
     return 3
 }
 
-// Anima convention (e.g. tool/ps_9_l0_lock.hexa, tool/inference_cert_gate.hexa):
-// hexa runtime auto-invokes `main()`. No explicit dispatcher is needed.
+// Explicit exit dispatch — anima hexa runtime does not propagate main()'s
+// return value to the process exit code by default.
+exit(main())
