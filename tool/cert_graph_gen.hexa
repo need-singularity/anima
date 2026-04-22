@@ -440,8 +440,25 @@ fn _opt(av: array, k: string, d: string) -> string {
 
 // ─── selftest ────────────────────────────────────────────────────────────
 
+// Volatile-line strip for idempotency hashing. Covers:
+//   md:   `<!-- generated: <ts> -->`              (HDR ts comment)
+//         `<!-- cert_dir: <path> -->`             (tmp path varies)
+//         `<!-- AUTO-GENERATED, DO NOT EDIT ...`  (HDR_MD sentinel)
+//         `_AUTO-GENERATED, DO NOT EDIT — generated <ts> UTC._` (body ts)
+//   json: `  "generated": "<ts>",`                (ts field)
+//         `  "cert_dir": "<path>",`               (cert_dir field · tmp path)
+// Use year-agnostic `generated 20` and `"generated":` to survive 2027+.
 fn _hash_no_ts(path: string) -> string {
-    let cmd = "grep -v -e '<!-- generated:' -e 'generated 2026' -e '\"generated\":' -e 'Generated (UTC):' -e 'AUTO-GENERATED, DO NOT EDIT' " + _sh_quote(path) + " | shasum -a 256 | awk '{print $1}'"
+    let cmd = "grep -v"
+        + " -e '<!-- generated:'"
+        + " -e '<!-- cert_dir:'"
+        + " -e 'generated 20'"
+        + " -e '\"generated\":'"
+        + " -e '\"cert_dir\":'"
+        + " -e 'Generated (UTC):'"
+        + " -e 'AUTO-GENERATED, DO NOT EDIT'"
+        + " " + _sh_quote(path)
+        + " | shasum -a 256 | awk '{print $1}'"
     return _exec_out(cmd).trim()
 }
 
@@ -478,16 +495,40 @@ fn run_selftest() -> int {
         // ok — kind is in edges as depends_on
         if body_js.index_of("depends_on") < 0 { fails = fails + 1; println("S1 FAIL: depends_on edge missing") }
     }
-    // idempotency
+    // S2: idempotency (synthetic). Sleep 1s between runs to force ts drift —
+    // if _hash_no_ts doesn't strip every volatile line, S2 catches it.
     let h_a_md = _hash_no_ts(md); let h_a_js = _hash_no_ts(js)
+    let _ = _exec_code("sleep 1")
     let _ = do_generate(d, md, js)
     let h_b_md = _hash_no_ts(md); let h_b_js = _hash_no_ts(js)
     if h_a_md == h_b_md && h_a_js == h_b_js {
-        println("S2 PASS: idempotent (md+json)")
+        println("S2 PASS: idempotent (md+json · synthetic · ts-drift forced)")
     } else {
         fails = fails + 1
         println("S2 FAIL: drift md(" + h_a_md + " vs " + h_b_md + ") js(" + h_a_js + " vs " + h_b_js + ")")
     }
+
+    // S3: idempotency against real .meta2-cert (skip cleanly if absent).
+    // Guards against regressions where real-world cert content introduces a
+    // new volatile line the synthetic fixture doesn't exercise.
+    let real_cd = DEFAULT_CERT_DIR
+    if _dir_exists(real_cd) {
+        let rmd = d + "/out/real.md"; let rjs = d + "/out/real.json"
+        let rc3a = do_generate(real_cd, rmd, rjs)
+        let r_h_a_md = _hash_no_ts(rmd); let r_h_a_js = _hash_no_ts(rjs)
+        let _ = _exec_code("sleep 1")
+        let rc3b = do_generate(real_cd, rmd, rjs)
+        let r_h_b_md = _hash_no_ts(rmd); let r_h_b_js = _hash_no_ts(rjs)
+        if rc3a == 0 && rc3b == 0 && r_h_a_md == r_h_b_md && r_h_a_js == r_h_b_js {
+            println("S3 PASS: idempotent (md+json · real .meta2-cert)")
+        } else {
+            fails = fails + 1
+            println("S3 FAIL: real drift md(" + r_h_a_md + " vs " + r_h_b_md + ") js(" + r_h_a_js + " vs " + r_h_b_js + ")")
+        }
+    } else {
+        println("S3 SKIP: real cert_dir absent (" + real_cd + ")")
+    }
+
     let _ = _rm_rf(d)
     if fails == 0 { println("cert_graph_gen: SELFTEST PASS"); return 0 }
     println("cert_graph_gen: SELFTEST FAIL (" + to_string(fails) + ")"); return 1

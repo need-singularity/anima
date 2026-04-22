@@ -54,28 +54,85 @@ fn _opt(av, k, d: string) -> string {
 // ─── balance probe ────────────────────────────────────────────────────────
 // Returns [balance_usd: float, method: string, raw: string].
 // balance_usd = -1.0 means probe unavailable.
+//
+// Strategy (2026-04-22 rewrite — ROI P1 fix):
+//   1. Prefer `runpodctl user -o json` (modern CLI emits {"clientBalance": ...}).
+//   2. Fallback to GraphQL direct call using ~/.runpod/config.toml api key.
+//   3. On any failure: method="api_unavailable", balance=-1.0, alert=false.
 
-fn _probe_balance() -> array {
+fn _parse_client_balance(raw: string) -> float {
+    // Prefer jq if available (robust JSON), else grep fallback.
+    let q = _sh_quote(raw)
+    let jq_cmd = "printf %s " + q + " | jq -r '.clientBalance // empty' 2>/dev/null"
+    let r = exec_with_status(jq_cmd)
+    let bal_s = to_string(r[0]).trim()
+    if len(bal_s) > 0 { return to_float(bal_s) }
+    // Fallback grep: "clientBalance": 135.95
+    let grep_cmd = "printf %s " + q +
+                   " | grep -oE '\"clientBalance\"[[:space:]]*:[[:space:]]*[0-9]+(\\.[0-9]+)?'" +
+                   " | grep -oE '[0-9]+(\\.[0-9]+)?' | head -1"
+    let r2 = exec_with_status(grep_cmd)
+    let bal_s2 = to_string(r2[0]).trim()
+    if len(bal_s2) > 0 { return to_float(bal_s2) }
+    return -1.0
+}
+
+fn _probe_via_runpodctl() -> array {
     if !_which("runpodctl") {
-        return [-1.0, "unavailable", "runpodctl not on PATH"]
+        return [-1.0, "", "runpodctl not on PATH"]
     }
-    // Try modern subcommand first, then legacy. Both are tried via shell so
-    // a missing one returns non-zero and we fall through.
-    let cmd = "runpodctl get user 2>/dev/null || runpodctl balance 2>/dev/null || true"
+    let cmd = "runpodctl user -o json 2>/dev/null || runpodctl me -o json 2>/dev/null || true"
     let r = exec_with_status(cmd)
     let raw = to_string(r[0])
     if len(raw) == 0 {
-        return [-1.0, "unavailable", "runpodctl returned no output"]
+        return [-1.0, "", "runpodctl returned no output"]
     }
-    // Heuristic parse: look for first dollar amount.
-    let extract = "printf %s " + _sh_quote(raw) +
-                  " | grep -oE '\\$[0-9]+(\\.[0-9]+)?' | head -1 | tr -d '$'"
-    let r2 = exec_with_status(extract)
-    let bal_s = to_string(r2[0]).trim()
-    if len(bal_s) == 0 {
-        return [-1.0, "parse_failed", raw]
-    }
-    return [to_float(bal_s), "runpodctl", raw]
+    let bal = _parse_client_balance(raw)
+    if bal < 0.0 { return [-1.0, "", raw] }
+    return [bal, "runpodctl", raw]
+}
+
+fn _probe_via_graphql() -> array {
+    let cfg = "/Users/ghost/.runpod/config.toml"
+    if !_file_exists(cfg) { return [-1.0, "", "no runpod config.toml"] }
+    // Extract apikey and apiurl from TOML (single-quoted values).
+    let key_r = exec_with_status(
+        "grep -E '^apikey' " + _sh_quote(cfg) +
+        " | sed -E \"s/^apikey[[:space:]]*=[[:space:]]*'([^']+)'.*/\\1/\" | head -1"
+    )
+    let api_key = to_string(key_r[0]).trim()
+    if len(api_key) == 0 { return [-1.0, "", "apikey missing in config.toml"] }
+    let url_r = exec_with_status(
+        "grep -E '^apiurl' " + _sh_quote(cfg) +
+        " | sed -E \"s/^apiurl[[:space:]]*=[[:space:]]*'([^']+)'.*/\\1/\" | head -1"
+    )
+    let api_url_raw = to_string(url_r[0]).trim()
+    let api_url = if len(api_url_raw) > 0 { api_url_raw } else { "https://api.runpod.io/graphql" }
+    if !_which("curl") { return [-1.0, "", "curl unavailable"] }
+    let query = "{\"query\":\"query{myself{clientBalance}}\"}"
+    let curl_cmd = "curl -fsS -X POST " + _sh_quote(api_url) +
+                   " -H 'Content-Type: application/json'" +
+                   " -H 'Authorization: Bearer " + api_key + "'" +
+                   " --data " + _sh_quote(query) +
+                   " --max-time 10 2>/dev/null || true"
+    let r = exec_with_status(curl_cmd)
+    let raw = to_string(r[0])
+    if len(raw) == 0 { return [-1.0, "", "graphql empty response"] }
+    let bal = _parse_client_balance(raw)
+    if bal < 0.0 { return [-1.0, "", raw] }
+    return [bal, "graphql", raw]
+}
+
+fn _probe_balance() -> array {
+    let p1 = _probe_via_runpodctl()
+    if to_float(to_string(p1[0])) >= 0.0 { return p1 }
+    let p2 = _probe_via_graphql()
+    if to_float(to_string(p2[0])) >= 0.0 { return p2 }
+    // Graceful fallback — never blocks launchd.
+    let raw1 = to_string(p1[2])
+    let raw2 = to_string(p2[2])
+    let combined = "runpodctl:" + raw1 + " | graphql:" + raw2
+    return [-1.0, "api_unavailable", combined]
 }
 
 fn _atomic_write(path: string, content: string) {
@@ -84,16 +141,22 @@ fn _atomic_write(path: string, content: string) {
     exec_with_status("mv " + _sh_quote(tmp) + " " + _sh_quote(path))
 }
 
-fn _build_ssot(balance: float, method: string, threshold: float, alert: bool, raw_digest: string) -> string {
+fn _build_ssot(balance: float, method: string, threshold: float, alert: bool, raw_digest: string, reason: string) -> string {
     let ts = to_string(utc_iso_now())
     let alert_s = if alert { "true" } else { "false" }
+    // When balance < 0 → emit JSON null (semantic "unknown"), else numeric.
+    let bal_s = if balance >= 0.0 { to_string(balance) } else { "null" }
+    let reason_line = if len(reason) > 0 {
+        "  \"reason\": \"" + _json_escape(reason) + "\",\n"
+    } else { "" }
     return "{\n" +
            "  \"schema\": \"anima/runpod_credit_status/1\",\n" +
            "  \"generated_at\": \"" + ts + "\",\n" +
            "  \"probe_method\": \"" + _json_escape(method) + "\",\n" +
-           "  \"balance_usd\": " + to_string(balance) + ",\n" +
+           "  \"balance_usd\": " + bal_s + ",\n" +
            "  \"threshold_usd\": " + to_string(threshold) + ",\n" +
            "  \"alert\": " + alert_s + ",\n" +
+           reason_line +
            "  \"raw_digest\": \"" + _json_escape(raw_digest) + "\",\n" +
            "  \"source\": \"tool/runpod_credit_check.hexa\"\n" +
            "}\n"
@@ -106,19 +169,29 @@ fn _digest(s: string) -> string {
 }
 
 fn _self_test() {
-    let s1 = _build_ssot(2500.0, "mock", 1000.0, false, "deadbeef")
+    let s1 = _build_ssot(2500.0, "mock", 1000.0, false, "deadbeef", "")
     if s1.index_of("\"alert\": false") < 0 { eprintln("SELFTEST FAIL alert false"); exit(1) }
-    let s2 = _build_ssot(750.5, "mock", 1000.0, true, "cafebabe")
+    if s1.index_of("\"balance_usd\": 2500") < 0 { eprintln("SELFTEST FAIL balance numeric"); exit(1) }
+    let s2 = _build_ssot(750.5, "mock", 1000.0, true, "cafebabe", "")
     if s2.index_of("\"alert\": true") < 0 { eprintln("SELFTEST FAIL alert true"); exit(1) }
-    let s3 = _build_ssot(-1.0, "unavailable", 1000.0, false, "")
-    if s3.index_of("unavailable") < 0 { eprintln("SELFTEST FAIL unavailable"); exit(1) }
-    println("[runpod_credit_check] SELFTEST PASS scenarios=3")
+    let s3 = _build_ssot(-1.0, "api_unavailable", 1000.0, false, "", "api_unavailable")
+    if s3.index_of("api_unavailable") < 0 { eprintln("SELFTEST FAIL unavailable"); exit(1) }
+    if s3.index_of("\"balance_usd\": null") < 0 { eprintln("SELFTEST FAIL balance null"); exit(1) }
+    // Parser unit — known runpodctl v2 JSON shape.
+    let sample = "{\"clientBalance\":135.9528663854,\"email\":\"x@y\"}"
+    let parsed = _parse_client_balance(sample)
+    if parsed < 135.0 || parsed > 136.0 { eprintln("SELFTEST FAIL parse clientBalance"); exit(1) }
+    // Parser: missing key → -1.0
+    let sample2 = "{\"foo\":1}"
+    let parsed2 = _parse_client_balance(sample2)
+    if parsed2 >= 0.0 { eprintln("SELFTEST FAIL parse missing"); exit(1) }
+    println("[runpod_credit_check] SELFTEST PASS scenarios=5")
     exit(0)
 }
 
 fn main() {
     let av = _argv()
-    if _has(av, "--self-test") { _self_test() }
+    if _has(av, "--self-test") || _has(av, "--selftest") { _self_test() }
 
     let apply = _has(av, "--apply")
     let threshold = to_float(_opt(av, "--threshold", to_string(DEFAULT_THRESHOLD_USD)))
@@ -130,7 +203,8 @@ fn main() {
 
     let alert = balance >= 0.0 && balance < threshold
     let raw_digest = if len(raw) > 0 { _digest(raw) } else { "" }
-    let ssot = _build_ssot(balance, method, threshold, alert, raw_digest)
+    let reason = if balance < 0.0 { method } else { "" }
+    let ssot = _build_ssot(balance, method, threshold, alert, raw_digest, reason)
     _atomic_write(SSOT_PATH, ssot)
 
     println("[runpod_credit_check] balance=$" + to_string(balance) +
