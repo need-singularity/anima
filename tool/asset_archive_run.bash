@@ -4,7 +4,19 @@ cd /Users/ghost/core/anima
 ROOT="$(pwd)"
 INVENTORY="$ROOT/state/asset_inventory.json"
 LOG="$ROOT/state/asset_archive_log.jsonl"
+LOCK="/tmp/asset_archive_run.lock"
 export INVENTORY
+
+# single-instance lock (macOS-compatible): check existing pid, otherwise claim
+if [[ -f "$LOCK" ]]; then
+  existing=$(cat "$LOCK" 2>/dev/null)
+  if [[ -n "$existing" ]] && kill -0 "$existing" 2>/dev/null; then
+    echo "[LOCKED] another instance alive pid=$existing — exit"
+    exit 0
+  fi
+fi
+echo $$ > "$LOCK"
+trap 'rm -f "$LOCK"' EXIT
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() {
@@ -19,7 +31,7 @@ inv=json.load(open(os.environ["INVENTORY"]))
 rows=[]
 for g in inv["groups"]:
   for a in g["assets"]:
-    if a.get("action")=="archive_then_delete":
+    if a.get("action")=="archive_then_delete" and a.get("status")!="deleted":
       rows.append((a.get("size_bytes",0), a["path"], a["r2_bucket"], a["r2_key"]))
 rows.sort(key=lambda r:-r[0])
 for sz,p,b,k in rows:
@@ -27,7 +39,7 @@ for sz,p,b,k in rows:
 PY
 
 total_jobs=$(wc -l < /tmp/asset_archive_jobs.tsv | tr -d ' ')
-echo "[$(ts)] START: $total_jobs jobs (largest-first)"
+echo "[$(ts)] START: $total_jobs jobs (largest-first, copyto for files)"
 idx=0
 while IFS=$'\t' read -r sz path bucket key; do
   idx=$((idx+1))
@@ -40,37 +52,46 @@ while IFS=$'\t' read -r sz path bucket key; do
     log "$path" "archive_then_delete" "skipped_missing" ""
     continue
   fi
-  if [[ -d "$local_path" ]]; then
-    src="$local_path/"
-    dst="r2:${bucket}/${key}"
-    [[ "$dst" != */ ]] && dst="${dst}/"
-  else
-    src="$local_path"
-    dst="r2:${bucket}/${key}"
-  fi
+
   echo "  [UPLOAD] $(ts)"
   log "$path" "archive_then_delete" "uploading" ""
-  rclone copy "$src" "$dst" \
-    --transfers 4 --checkers 8 \
-    --s3-chunk-size 64M --s3-upload-concurrency 4 \
-    --stats 60s --stats-one-line 2>&1 | tail -20
-  rc=${PIPESTATUS[0]}
+  if [[ -d "$local_path" ]]; then
+    # directory: rclone copy with trailing /
+    dst="r2:${bucket}/${key}"
+    [[ "$dst" != */ ]] && dst="${dst}/"
+    rclone copy "$local_path/" "$dst" \
+      --transfers 4 --checkers 8 \
+      --s3-chunk-size 64M --s3-upload-concurrency 4 \
+      --stats 60s --stats-one-line
+    rc=$?
+  else
+    # single file: rclone copyto for exact key mapping
+    dst="r2:${bucket}/${key}"
+    rclone copyto "$local_path" "$dst" \
+      --s3-chunk-size 64M --s3-upload-concurrency 4 \
+      --stats 60s --stats-one-line
+    rc=$?
+  fi
+
   if [[ $rc -ne 0 ]]; then
     echo "  [UPLOAD-FAIL] rc=$rc"
     log "$path" "archive_then_delete" "upload_failed" "rc=$rc"
     continue
   fi
   echo "  [UPLOAD-OK] $(ts)"
+
+  # verify size
   if [[ -d "$local_path" ]]; then
     rclone check "$local_path/" "$dst" --size-only 2>&1 | tail -3
     vrc=${PIPESTATUS[0]}
     [[ $vrc -eq 0 ]] && vok=1 || vok=0
   else
     LS=$(stat -f '%z' "$local_path" 2>/dev/null)
-    RS=$(rclone size "$dst" --json 2>/dev/null | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('bytes',-1))" 2>/dev/null || echo -1)
+    RS=$(rclone lsjson "$dst" 2>/dev/null | python3 -c "import sys,json;d=json.load(sys.stdin);print(d[0].get('Size',-1) if d else -1)" 2>/dev/null || echo -1)
     echo "  local=$LS r2=$RS"
     [[ "$LS" = "$RS" ]] && vok=1 || vok=0
   fi
+
   if [[ "$vok" = "1" ]]; then
     echo "  [VERIFIED] deleting local"
     log "$path" "archive_then_delete" "verified" ""
