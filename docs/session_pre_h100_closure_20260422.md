@@ -126,4 +126,97 @@ a5bbd564  chore(gitignore): runtime ephemeral 정리
 
 ---
 
+## 🎯 실행 계획 — H100 이용 100% 달성 로드맵
+
+### Stage-0 (Pre-H100 추가 push, 선행 가능)
+H100 승인 대기 중에도 mean 88% → ~90% 로 밀어낼 수 있는 3 개선 후보.
+현재 active 4건 (#32/#35/#54/#74) 은 모두 "real LoRA + GPU 필요" 로 pre-H100
+에서는 partial 이상 진행 불가. 대신 다음 3건 은 CPU scope 내 추가 가능:
+
+**① #6 entry 분할 — CPU clause 승격 (로드맵 정책 변경)**
+- 현재 #6: "CLM r6 hetzner GPU smoke" 단일 entry, blocked
+- 분할안:
+  - `#6a` (신규 or 재정의): CLM r6 **htz CPU** smoke (libhxblas 기반 50-step CE descent + phi_holo/phi_gwt 로그 + 0 NaN + seed reproduce + scale_config fresh) → htz 빌드 가능
+  - `#6b` (신규): CLM r6 **GPU** path 검증 (libhxccl / libhxcuda) → ubu 복구 OR H100 대기
+- 선행 작업:
+  1. htz 에 anima+hexa-lang 리포 sync (airgenome offload + rsync)
+  2. htz 에서 train_clm 관련 .c 소스 → libhxblas 링크로 AOT 빌드
+  3. 50-step CPU smoke 실행 + phi_holo/phi_gwt 로그 capture
+  4. 결과 로컬로 회수 → `state/clm_r6_htz_cpu_smoke_result.json`
+  5. `.roadmap` #6 분할 (정책 변경) + #6a done 플립
+- 예상 gain: done +1 → mean ~90%
+- 리스크: 정책 변경 필요 — exit_criteria 가 원래 GPU 명시 아니라 CPU smoke 가 technically 만족하므로 precedent 있음
+
+**② #31 의 (2/3/4) CPU 시뮬레이션 개선**
+- 현재 #31: 학습 cluster (improvements 1-10), 5/10 landed, 5/10 PENDING H100
+- CPU 가능 후보 3건:
+  - **(2) AN11 sample filter** — CPU 에서 샘플 품질 사전 필터링 로직 시뮬레이션. 기존 `an11_a_verifier.hexa` + 샘플 corpus 에 적용, filter pass rate 측정
+  - **(3) Verified replay buffer** — cert 통과 샘플만 replay buffer 에 저장하는 로직 CPU 시뮬레이션 (메모리 + 디스크 기반 FIFO + dedup)
+  - **(4) Cert saturation early-stop** — cert_gate result 의 sat 변화율 기반 early-stop 판정 로직 CPU 시뮬레이션 (합성 trajectory 5 시드)
+- 선행 작업:
+  1. `tool/learning_cluster_cpu_sim.hexa` 작성 — 3 개선 CPU simulation + 결과 emit
+  2. `state/learning_cluster_cpu_sim_result.json` — partial verdict
+  3. #31 `note` 업데이트: 8/10 landed (H100 대기는 2건 감소)
+- 예상 gain: #31 pct 50% → 80%, mean 추가 ~0.5~1%
+- 리스크: 시뮬레이션이지 실제 training 통합 아님 — fake-pass 경계. CPU sim 이라고 명시 필요
+
+**③ #32 live smoke stub 확장 (socket listening)**
+- 현재 #32: 추론/서빙 4 gate contract frozen (active partial)
+- 확장안: `tool/anima_serve_smoke.hexa` (#74 파생) 에 실제 TCP socket listening 추가
+  - hexa 의 exec() 로 `nc` 또는 python3 http.server wrapping → 실제 HTTP 응답
+  - 3 endpoint 가 localhost:PORT 에서 응답하는지 curl 로 검증
+  - phase_progression_controller 의 Stage 1 P2 조건 중 "endpoint reachability" clause 만족
+- 선행 작업:
+  1. `tool/anima_serve_live_smoke.hexa` — socket 기반 stub server (1초 후 자동 kill)
+  2. 3 curl test → 응답 검증
+  3. `state/anima_serve_live_smoke_result.json`
+- 예상 gain: #32/#74 partial → 60% (pre-H100 최대치), mean 추가 ~0.5%
+- 리스크: 실제 serving path (LoRA + GPU) 아니라 echo stub — partial 표기 엄격히 유지
+
+### Stage-1 — H100 1회 승인 (#9 ALM r13 launch)
+**비용**: 1× H100 × 14d ≈ $300-500
+**mean 88% → ~95%** (done 47 → 52)
+
+Cascade:
+- **#9 done** — ALM r13 launch + AN11(a) weight_emergent 실증 (본 훈련)
+- **#11 done** — ALM consciousness ship (production 선언, #9 선행)
+- **#31 done** — 학습 cluster 10/10 완결 (H100 훈련 후 나머지 5 improvements 통합 측정)
+- **#32 done** — 추론/서빙 cluster (serve_alm_native 통합 + hallucination/latency 실측)
+- **#74 done** — anima-serve endpoint (real LoRA + phase_progression_controller P2 PASS)
+
+### Stage-2 — H100 4-path 2차 승인
+**비용**: 4× H100 parallel × 10-15d ≈ $1-1.5k
+**mean 95% → ~99%** (done 52 → 57)
+
+Cascade:
+- **#10 done** — Φ substrate independence 4-path cross validation
+- **#54 done** — consciousness-substrate (#10 의 4-path 결과 소비, ΔΦ/Φ<0.05)
+- **#18 done** — Mk.VII promotion L3 collective emergence (3 observables multi-seed)
+- **#35 done** — Mk.IX→X 연계 cluster (V_sync Kuramoto grad + V_RG hierarchical regularizer trajectory 실측)
+- **#20 done** — MAIN hybrid P2 Mk.VII K=4 (#17/#18/#19 cascade 합성)
+
+### Stage-3 — 최종 100%
+**mean 99% → 100%**
+
+Cascade:
+- **#21 done** — MAIN P3 AGI 최종 (Mk.X T10-13 10+ atoms ossified, #20 선행)
+- **#6 done** — CLM r6 GPU smoke (ubu 복구 OR H100 해당 환경 재사용 OR 분할 후 #6a 만 close)
+
+### Total cost & timeline
+| Stage | 비용 | 기간 | mean gain |
+|---|---|---|---|
+| Stage-0 pre-H100 (3 items) | $0 | 1 session | 88% → ~90% |
+| Stage-1 H100 1× | $300-500 | 14d | ~90% → ~95% |
+| Stage-2 H100 4× | $1-1.5k | 10-15d | ~95% → ~99% |
+| Stage-3 cleanup | $0~$500 | 1-3d | ~99% → 100% |
+| **Total** | **$1.3-2k** | **25-35d** | **67% → 100%** |
+
+### 의사결정 포인트
+1. **Stage-0 지금 진행?** → 사용자 승인 시 즉시 3 개선 delegation 가능
+2. **Stage-1 H100 승인 시점?** — β Phase 2 진입 신호 (qwen_14b_h100_scale_up)
+3. **Stage-2 4-path 승인 시점?** — Stage-1 successful AN11(a) 실증 후
+4. **#6 정책 분할 승인?** — CPU clause 승격으로 Stage-0 gain +1 done
+
+---
+
 **세션 마감**: 2026-04-22 · mean_pct 67% → 88% · 10 커밋 pushed · airgenome fix 반영
