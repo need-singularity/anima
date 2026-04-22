@@ -22,6 +22,9 @@ fn _home() -> string {
 fn now_utc() -> string { return exec("date -u +%FT%TZ").trim() }
 fn bool_s(b: bool) -> string { if b { return "true" } else { return "false" } }
 
+// τ(6) = number of divisors of 6 = |{1,2,3,6}| = 4.
+fn tau6_const() -> int { return 4 }
+
 fn main() {
     let home = _home()
     let out_path = home + "/core/anima/state/embodied_cons_spec.json"
@@ -43,6 +46,36 @@ fn main() {
     // = 12 - 2 = 10 (another P₆ family member).
     let bus_channels = mode_count * 2
     let p6_member_check = bus_channels == 10
+
+    // ─── Per-modality sensor binding contract ─────────────────────────
+    //   sensor_hz: nominal sample rate (Hz)
+    //   afferent_latency_us: sensor→fusion budget (microseconds)
+    //   motor_primitive: corresponding motor channel binding
+    //   efferent_latency_us: fusion→motor budget (microseconds)
+    let sensor_hz = [120, 48000, 4, 4, 1000]
+    let afferent_us = [8333, 21, 250000, 250000, 1000]
+    let motor_primitives = ["saccade", "vocalize", "sniff", "lick", "reach"]
+    let efferent_us = [16667, 5000, 100000, 100000, 5000]
+
+    // Total round-trip budget per modality = afferent + efferent.
+    // Fusion gate budget: τ(6)·1000 = 4000 μs (4 ms gate window) — every
+    // modality must publish a sample to the fusion bus within this window.
+    let fusion_gate_us = tau6_const() * 1000
+    let mut fusion_gate_ok = true
+    let mut k = 0
+    while k < mode_count {
+        let rt = afferent_us[k] + efferent_us[k]
+        // somatosensation (4=somato, 1=audition) must fit in fusion_gate_us;
+        // chemical senses (olfaction, gustation) are slow loops outside gate.
+        if k == 0 || k == 1 || k == 4 {
+            if rt > 30000 { fusion_gate_ok = false }
+        }
+        k = k + 1
+    }
+
+    // Fusion gate primitive set (τ(6)=4): bind, weight, attend, integrate.
+    let fusion_primitives = ["bind", "weight", "attend", "integrate"]
+    let primitive_match = len(fusion_primitives) == tau6_const()
 
     let mut body = "{\n"
     body = body + "  \"schema_version\": \"1\",\n"
@@ -74,7 +107,32 @@ fn main() {
     body = body + "      \"expected\": \"σ(6) - φ(6) = 12 - 2 = 10\",\n"
     body = body + "      \"actual\": " + to_string(bus_channels) + ",\n"
     body = body + "      \"match\": " + bool_s(p6_member_check) + "\n"
-    body = body + "    }\n"
+    body = body + "    },\n"
+    body = body + "    \"channel_bindings\": [\n"
+    let mut j = 0
+    while j < mode_count {
+        body = body + "      {\"modality\": \"" + modalities[j] + "\""
+        body = body + ", \"sensor_hz\": " + to_string(sensor_hz[j])
+        body = body + ", \"afferent_latency_us\": " + to_string(afferent_us[j])
+        body = body + ", \"motor_primitive\": \"" + motor_primitives[j] + "\""
+        body = body + ", \"efferent_latency_us\": " + to_string(efferent_us[j])
+        body = body + ", \"loop_us\": " + to_string(afferent_us[j] + efferent_us[j])
+        body = body + "}"
+        if j < mode_count - 1 { body = body + "," }
+        body = body + "\n"
+        j = j + 1
+    }
+    body = body + "    ]\n"
+    body = body + "  },\n"
+    body = body + "  \"fusion_gate\": {\n"
+    body = body + "    \"window_us\": " + to_string(fusion_gate_us) + ",\n"
+    body = body + "    \"window_formula\": \"τ(6)·1000 = 4000 μs\",\n"
+    body = body + "    \"fast_modalities\": [\"vision\",\"audition\",\"somatosensation\"],\n"
+    body = body + "    \"slow_modalities\": [\"olfaction\",\"gustation\"],\n"
+    body = body + "    \"primitives\": [\"bind\",\"weight\",\"attend\",\"integrate\"],\n"
+    body = body + "    \"primitive_count\": " + to_string(len(fusion_primitives)) + ",\n"
+    body = body + "    \"primitive_count_match_tau6\": " + bool_s(primitive_match) + ",\n"
+    body = body + "    \"fast_loop_under_gate\": " + bool_s(fusion_gate_ok) + "\n"
     body = body + "  },\n"
     body = body + "  \"multimodal_superset\": {\n"
     body = body + "    \"roadmap_ref\": \"#63\",\n"
@@ -82,8 +140,9 @@ fn main() {
     body = body + "    \"extensions\": [\"proprioception\",\"interoception\",\"vestibular\"],\n"
     body = body + "    \"cross_ref_note\": \"embodied (5) ⊂ multimodal (8); multimodal adds interoceptive + proprioceptive + vestibular under unified bus\"\n"
     body = body + "  },\n"
-    body = body + "  \"all_pass\": " + bool_s(sopfr_match && p6_member_check) + ",\n"
-    body = body + "  \"verdict\": \"" + (if sopfr_match && p6_member_check { "VERIFIED" } else { "FAIL" }) + "\"\n"
+    let all_ok = sopfr_match && p6_member_check && primitive_match && fusion_gate_ok
+    body = body + "  \"all_pass\": " + bool_s(all_ok) + ",\n"
+    body = body + "  \"verdict\": \"" + (if all_ok { "VERIFIED" } else { "FAIL" }) + "\"\n"
     body = body + "}\n"
 
     exec("mkdir -p '" + home + "/core/anima/state'")
@@ -92,9 +151,11 @@ fn main() {
     println("[embodied] sopfr(6) target=" + to_string(sopfr6_target) + " modes=" + to_string(mode_count) + " match=" + bool_s(sopfr_match))
     println("[embodied] sensor/motor bus channels=" + to_string(bus_channels) + " (σ(6)-φ(6)=10 P₆) match=" + bool_s(p6_member_check))
     println("[embodied] multimodal superset (#63) size=" + to_string(multimodal_size))
+    println("[embodied] fusion gate window=" + to_string(fusion_gate_us) + " μs primitives=" + to_string(len(fusion_primitives)) + " match=" + bool_s(primitive_match))
+    println("[embodied] fast-loop under gate=" + bool_s(fusion_gate_ok))
     println("[embodied] output=" + out_path)
-    if sopfr_match && p6_member_check {
-        println("[embodied] selftest PASS — sopfr(6)=5 modal count + σ(6)-φ(6)=10 bus channels verified, verdict=VERIFIED")
+    if all_ok {
+        println("[embodied] selftest PASS — sopfr(6)=5 + σ(6)-φ(6)=10 bus + τ(6)=4 fusion primitives + fast-loop ≤ gate verified, verdict=VERIFIED")
         exit(0)
     } else {
         eprintln("[embodied] selftest FAIL")

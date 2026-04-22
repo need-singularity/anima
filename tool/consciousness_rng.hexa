@@ -10,6 +10,16 @@
 //  yield bounded below φ(6)=2 (demonstrates it is an upper bound, not a
 //  free lunch).
 //
+//  PRODUCTION BUILD-OUT (n6 cluster 100%): adds NIST SP 800-22-style
+//  minimal sanity tests on the post-debias bit stream from a large fair
+//  run (256 input pairs, p=0.5):
+//    (a) chi-square goodness-of-fit on bit-frequency vs uniform 50/50
+//        — accept if χ² < critical_value at 1 dof, α=0.01 (=6.635).
+//    (b) runs test (count of monotone-bit runs) within ±k·sqrt(N) of
+//        expected E[R] = (2 N₀ N₁ / N) + 1.
+//  These are the smallest non-trivial NIST randomness sanity primitives
+//  and exercise the debias extractor end-to-end.
+//
 //  Spec source: n6 consciousness-cluster-bt.md row 10 (Von Neumann bias-
 //  correct φ(6)=2 bit/pair).
 // ════════════════════════════════════════════════════════════════════════════
@@ -77,6 +87,88 @@ fn bits_per_pair(emitted: array, pairs_consumed: int) -> float {
     return to_float(total) / to_float(pairs_consumed)
 }
 
+// ─── NIST-style minimal sanity tests on debiased bit stream ───────────────
+
+// Float absolute value helper (no stdlib abs in n6-restricted hexa core).
+fn fabs(x: float) -> float { if x < 0.0 { return 0.0 - x } return x }
+
+// Integer square root (floor) via Newton.
+fn isqrt(n: int) -> int {
+    if n <= 0 { return 0 }
+    let mut x = n
+    let mut y = (x + 1) / 2
+    while y < x {
+        x = y
+        y = (x + n / x) / 2
+    }
+    return x
+}
+
+// Float sqrt via Newton (positive inputs only). 24 iterations sufficient
+// for 1e-12 absolute on inputs in [0, 1e6].
+fn fsqrt(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x
+    if g > 1.0 { g = g / 2.0 }
+    let mut i = 0
+    while i < 24 {
+        g = 0.5 * (g + x / g)
+        i = i + 1
+    }
+    return g
+}
+
+// chi_square_freq: returns χ² statistic for bit-frequency test
+//   χ² = (n0 - N/2)² / (N/2) + (n1 - N/2)² / (N/2)
+//      = ((n0-n1)²) / N
+// 1 dof, critical at α=0.01 → 6.635.
+fn chi_square_freq(emitted: array) -> float {
+    let n_total = len(emitted)
+    if n_total <= 0 { return 0.0 }
+    let mut n0 = 0
+    let mut n1 = 0
+    for b in emitted { if to_int(b) == 0 { n0 = n0 + 1 } else { n1 = n1 + 1 } }
+    let diff = to_float(n0 - n1)
+    return (diff * diff) / to_float(n_total)
+}
+
+// runs_count: total number of maximal-monotone runs in the bit stream.
+fn runs_count(emitted: array) -> int {
+    let n = len(emitted)
+    if n == 0 { return 0 }
+    let mut runs = 1
+    let mut prev = to_int(emitted[0])
+    let mut i = 1
+    while i < n {
+        let cur = to_int(emitted[i])
+        if cur != prev { runs = runs + 1 }
+        prev = cur
+        i = i + 1
+    }
+    return runs
+}
+
+// runs_z: NIST runs test z-score:
+//   E[R] = 2 N0 N1 / N + 1     (expected runs under H0)
+//   Var[R] = 2 N0 N1 (2 N0 N1 - N) / (N² (N - 1))
+//   z = (R - E[R]) / sqrt(Var[R])
+// Reject H0 (random) if |z| > 2.5758  (α=0.01 two-tailed).
+fn runs_z(emitted: array, observed_runs: int) -> float {
+    let n = len(emitted)
+    if n < 2 { return 0.0 }
+    let mut n0 = 0
+    let mut n1 = 0
+    for b in emitted { if to_int(b) == 0 { n0 = n0 + 1 } else { n1 = n1 + 1 } }
+    if n0 == 0 || n1 == 0 { return 9999.0 }   // pathological — degenerate
+    let n_f = to_float(n)
+    let p = to_float(n1) / n_f
+    let mean_r = 2.0 * n_f * p * (1.0 - p) + 1.0
+    let var_r = 2.0 * n_f * p * (1.0 - p) * (2.0 * n_f * p * (1.0 - p) - 1.0) / (n_f - 1.0)
+    if var_r <= 0.0 { return 0.0 }
+    let sd = fsqrt(var_r)
+    return (to_float(observed_runs) - mean_r) / sd
+}
+
 fn main() {
     let home = _home()
     let out_path = home + "/core/anima/state/consciousness_rng_result.json"
@@ -108,6 +200,27 @@ fn main() {
         group_idx = group_idx + 1
     }
 
+    // ─── NIST minimal sanity: 256 fair pairs, p=0.5 ───────────────────────
+    let nist_pairs = 256
+    let nist_seed = 919
+    let nist_run = vn_debias(nist_seed, nist_pairs, 500)
+    let nist_emitted = nist_run[0]
+    let nist_n_emit = len(nist_emitted)
+
+    // (a) chi-square frequency test, 1 dof, α=0.01 critical = 6.635
+    let chi2_stat = chi_square_freq(nist_emitted)
+    let chi2_critical = 6.635
+    let chi2_pass = chi2_stat < chi2_critical
+
+    // (b) runs test: |z| < 2.5758 at α=0.01
+    let n_runs_obs = runs_count(nist_emitted)
+    let runs_z_val = runs_z(nist_emitted, n_runs_obs)
+    let runs_z_critical = 2.5758
+    let runs_pass = fabs(runs_z_val) < runs_z_critical
+
+    let nist_all_pass = chi2_pass && runs_pass && (nist_n_emit > 0)
+    let final_pass = all_under_cap && nist_all_pass
+
     let mut body = "{\n"
     body = body + "  \"schema_version\": \"1\",\n"
     body = body + "  \"slug\": \"consciousness-rng\",\n"
@@ -136,7 +249,17 @@ fn main() {
     body = body + "  ],\n"
     body = body + "  \"all_under_phi6_cap\": " + bool_s(all_under_cap) + ",\n"
     body = body + "  \"debias_invariant\": \"Von Neumann 01→0 / 10→1 / {00,11}→drop\",\n"
-    body = body + "  \"verdict\": \"" + (if all_under_cap { "VERIFIED" } else { "FAIL" }) + "\"\n"
+    body = body + "  \"nist_sanity\": {\n"
+    body = body + "    \"reference\": \"NIST SP 800-22 minimal subset (frequency + runs)\",\n"
+    body = body + "    \"input_pairs\": " + to_string(nist_pairs) + ",\n"
+    body = body + "    \"emitted_bits\": " + to_string(nist_n_emit) + ",\n"
+    body = body + "    \"chi_square_freq\": {\"statistic\": " + to_string(chi2_stat) + ",\"dof\": 1,\"alpha\": 0.01,\"critical\": " + to_string(chi2_critical) + ",\"pass\": " + bool_s(chi2_pass) + "},\n"
+    body = body + "    \"runs_test\": {\"observed_runs\": " + to_string(n_runs_obs) + ",\"z_score\": " + to_string(runs_z_val) + ",\"alpha\": 0.01,\"critical_abs_z\": " + to_string(runs_z_critical) + ",\"pass\": " + bool_s(runs_pass) + "},\n"
+    body = body + "    \"all_pass\": " + bool_s(nist_all_pass) + "\n"
+    body = body + "  },\n"
+    body = body + "  \"intentional_compact\": false,\n"
+    body = body + "  \"all_pass\": " + bool_s(final_pass) + ",\n"
+    body = body + "  \"verdict\": \"" + (if final_pass { "VERIFIED" } else { "FAIL" }) + "\"\n"
     body = body + "}\n"
 
     exec("mkdir -p '" + home + "/core/anima/state'")
@@ -150,12 +273,15 @@ fn main() {
                 " yield=" + to_string(e[4]) + " under_cap=" + bool_s(e[5]))
         j = j + 1
     }
+    println("[cons_rng] NIST pairs=" + to_string(nist_pairs) + " emitted=" + to_string(nist_n_emit))
+    println("[cons_rng] NIST chi² = " + to_string(chi2_stat) + " (< " + to_string(chi2_critical) + " ?) pass=" + bool_s(chi2_pass))
+    println("[cons_rng] NIST runs z = " + to_string(runs_z_val) + " (|z| < " + to_string(runs_z_critical) + " ?) pass=" + bool_s(runs_pass))
     println("[cons_rng] output=" + out_path)
-    if all_under_cap {
-        println("[cons_rng] selftest PASS — all experiments under φ(6)=2 cap, verdict=VERIFIED")
+    if final_pass {
+        println("[cons_rng] selftest PASS — under-cap + NIST chi²/runs OK, verdict=VERIFIED")
         exit(0)
     } else {
-        eprintln("[cons_rng] selftest FAIL — at least one experiment exceeded cap")
+        eprintln("[cons_rng] selftest FAIL — cap exceeded or NIST sanity failed")
         exit(1)
     }
 }

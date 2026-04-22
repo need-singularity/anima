@@ -16,19 +16,28 @@
 #   tool/h100_weight_precache.bash                # default = dry-run, prints commands
 #   tool/h100_weight_precache.bash --dry-run      # explicit dry-run
 #   tool/h100_weight_precache.bash --apply        # real fetch+mirror (requires creds)
+#   tool/h100_weight_precache.bash --status       # show progress jsonl as table
 #   tool/h100_weight_precache.bash --help
 #
+# RESUME / IDEMPOTENCY
+#   --apply consults state/h100_weight_precache_progress.jsonl: paths marked
+#   status=done are skipped. R2-side: each file is checked via `rclone lsjson`
+#   for matching size — matching files are skipped within rclone copy via its
+#   built-in size-based duplicate suppression.
+#
 # EXIT
-#   0 = dry-run printed OK / apply succeeded
+#   0 = dry-run printed OK / apply succeeded (all paths done)
 #   1 = manifest missing or unreadable
 #   2 = bad arg
-#   3 = --apply but credentials missing (HF_TOKEN / rclone profile)
-#   4 = mirror step failed (apply only)
+#   3 = --apply but credentials/tools missing (HF_TOKEN / rclone profile / hf cli)
+#   4 = one or more paths failed during apply (other paths may have succeeded)
 set -euo pipefail
 
 # --- constants ----------------------------------------------------------------
 readonly ANIMA_ROOT="/Users/ghost/core/anima"
 readonly MANIFEST="${ANIMA_ROOT}/state/h100_weight_precache_manifest.json"
+readonly PROGRESS_JSONL="${ANIMA_ROOT}/state/h100_weight_precache_progress.jsonl"
+readonly COMPLETION_JSON="${ANIMA_ROOT}/state/h100_weight_precache_completion.json"
 readonly RCLONE_REMOTE="${RCLONE_R2_REMOTE:-r2anima}"
 readonly STAGING_DIR="${WEIGHT_PRECACHE_STAGE:-/tmp/anima_weight_precache}"
 readonly TS="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -41,6 +50,7 @@ pass() { printf '  [PASS] %s\n' "$*"; }
 fail() { printf '  [FAIL] %s\n' "$*"; }
 warn() { printf '  [WARN] %s\n' "$*"; }
 plan() { printf '  [PLAN] %s\n' "$*"; }
+ts_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # --- argv ---------------------------------------------------------------------
 MODE="dry-run"
@@ -48,7 +58,8 @@ for arg in "$@"; do
   case "$arg" in
     --dry-run) MODE="dry-run" ;;
     --apply)   MODE="apply" ;;
-    --help|-h) sed -n '1,25p' "$0"; exit 0 ;;
+    --status)  MODE="status" ;;
+    --help|-h) sed -n '1,35p' "$0"; exit 0 ;;
     *) log "unknown arg: $arg"; exit 2 ;;
   esac
 done
@@ -57,6 +68,7 @@ log "mode=${MODE} log=${LOG}"
 log "manifest=${MANIFEST}"
 log "rclone_remote=${RCLONE_REMOTE} (override via env RCLONE_R2_REMOTE)"
 log "staging_dir=${STAGING_DIR} (override via env WEIGHT_PRECACHE_STAGE)"
+log "progress_jsonl=${PROGRESS_JSONL}"
 
 # --- pre-flight 1: manifest readable ------------------------------------------
 log "pre-flight 1/3: manifest readable"
@@ -77,6 +89,58 @@ TOTAL_GB=$(python3 -c 'import json,sys
 m=json.load(open(sys.argv[1]))
 print(m["estimated_total_gb"])' "${MANIFEST}")
 pass "paths=[${PATH_IDS}] bucket=${R2_BUCKET} total_gb=${TOTAL_GB}"
+
+# --- --status mode ------------------------------------------------------------
+if [[ "${MODE}" == "status" ]]; then
+  log ""
+  log "=== progress status ==="
+  if [[ ! -f "${PROGRESS_JSONL}" ]]; then
+    warn "no progress jsonl yet at ${PROGRESS_JSONL}"
+    log "RESULT: STATUS — no apply runs recorded"
+    exit 0
+  fi
+  PROGRESS_JSONL="${PROGRESS_JSONL}" PATH_IDS="${PATH_IDS}" python3 - <<'PY'
+import json, os
+p = os.environ["PROGRESS_JSONL"]
+ids = os.environ["PATH_IDS"].split()
+# last status per pid wins
+last = {}
+with open(p) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        pid = r.get("path")
+        if pid:
+            last[pid] = r
+print()
+print(f"  {'path':<6} {'status':<10} {'size_mb':>9}  tokenizer_sha256 (first 16) / error")
+print(f"  {'-'*6} {'-'*10} {'-'*9}  {'-'*40}")
+for pid in ids:
+    r = last.get(pid)
+    if r is None:
+        print(f"  {pid:<6} {'pending':<10} {'-':>9}  -")
+    else:
+        st = r.get("status", "?")
+        sz = r.get("size_mb", "-")
+        if st == "done":
+            tail = (r.get("tokenizer_sha256") or "")[:16]
+        else:
+            tail = r.get("error", "")
+        if isinstance(sz, (int, float)):
+            sz_s = f"{sz:.1f}"
+        else:
+            sz_s = str(sz)
+        print(f"  {pid:<6} {st:<10} {sz_s:>9}  {tail}")
+print()
+PY
+  log "RESULT: STATUS OK"
+  exit 0
+fi
 
 # --- pre-flight 2: tool availability ------------------------------------------
 log "pre-flight 2/3: tool availability"
@@ -123,7 +187,67 @@ compute_sha256() {
   fi
 }
 
-# --- emit per-path commands ---------------------------------------------------
+# --- helper: portable file size in bytes --------------------------------------
+file_size_bytes() {
+  local f="$1"
+  stat -f '%z' "$f" 2>/dev/null || stat -c '%s' "$f" 2>/dev/null || echo 0
+}
+
+# --- helper: directory size in MB (sum of files) ------------------------------
+dir_size_mb() {
+  local d="$1"
+  if [[ ! -d "$d" ]]; then echo 0; return; fi
+  local kb
+  kb=$(du -sk "$d" 2>/dev/null | awk '{print $1}')
+  awk -v k="${kb:-0}" 'BEGIN{printf "%.1f", k/1024.0}'
+}
+
+# --- helper: append progress jsonl line ---------------------------------------
+progress_append() {
+  # args: pid status [size_mb] [tokenizer_sha256] [error]
+  local pid="$1" status="$2" size_mb="${3:-}" tok="${4:-}" err="${5:-}"
+  local err_esc="${err//\"/\\\"}"
+  mkdir -p "$(dirname "${PROGRESS_JSONL}")"
+  if [[ -n "${size_mb}" && -n "${tok}" ]]; then
+    printf '{"ts":"%s","path":"%s","status":"%s","size_mb":%s,"tokenizer_sha256":"%s"}\n' \
+      "$(ts_iso)" "${pid}" "${status}" "${size_mb}" "${tok}" >> "${PROGRESS_JSONL}"
+  elif [[ -n "${size_mb}" ]]; then
+    printf '{"ts":"%s","path":"%s","status":"%s","size_mb":%s}\n' \
+      "$(ts_iso)" "${pid}" "${status}" "${size_mb}" >> "${PROGRESS_JSONL}"
+  elif [[ -n "${err}" ]]; then
+    printf '{"ts":"%s","path":"%s","status":"%s","error":"%s"}\n' \
+      "$(ts_iso)" "${pid}" "${status}" "${err_esc}" >> "${PROGRESS_JSONL}"
+  else
+    printf '{"ts":"%s","path":"%s","status":"%s"}\n' \
+      "$(ts_iso)" "${pid}" "${status}" >> "${PROGRESS_JSONL}"
+  fi
+}
+
+# --- helper: is path already done according to progress jsonl? ----------------
+path_already_done() {
+  local pid="$1"
+  [[ -f "${PROGRESS_JSONL}" ]] || return 1
+  PROGRESS_JSONL="${PROGRESS_JSONL}" PID="${pid}" python3 - <<'PY' 2>/dev/null || return 1
+import json, os, sys
+p = os.environ["PROGRESS_JSONL"]
+pid = os.environ["PID"]
+last = None
+with open(p) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if r.get("path") == pid:
+            last = r
+sys.exit(0 if (last and last.get("status") == "done") else 1)
+PY
+}
+
+# --- emit per-path commands (always — used by both dry-run and apply preview) -
 log ""
 log "=== per-path mirror plan ==="
 for pid in ${PATH_IDS}; do
@@ -144,9 +268,9 @@ print(" ".join(m["paths"][sys.argv[2]]["files"]))' "${MANIFEST}" "${pid}")
   log "[${pid}] ${MODEL_ID}  (~${SIZE_GB}GB → ${R2_TARGET})"
   STAGE="${STAGING_DIR}/${pid}"
   plan "mkdir -p ${STAGE}"
-  plan "hf download ${MODEL_ID} --local-dir ${STAGE} --include $(echo "${FILES}" | tr ' ' ',')"
+  plan "huggingface-cli download ${MODEL_ID} --local-dir ${STAGE} --include $(echo "${FILES}" | tr ' ' ',')"
   plan "TOK_SHA=\$(sha256sum ${STAGE}/tokenizer.json | awk '{print \$1}')   # write back to manifest"
-  plan "rclone copy ${STAGE}/ ${RCLONE_REMOTE}:${R2_TARGET} --progress --transfers 4 --checkers 8"
+  plan "rclone copy ${STAGE}/ ${RCLONE_REMOTE}:${R2_TARGET} --progress --transfers 4 --checkers 8 --size-only"
 done
 
 # --- dry-run exit -------------------------------------------------------------
@@ -183,10 +307,17 @@ fi
 
 mkdir -p "${STAGING_DIR}"
 TOKENIZER_SHA_RECORD="${ANIMA_ROOT}/state/h100_weight_precache_tokenizer_sha.json"
-printf '{\n  "schema": "anima/h100_weight_precache_tokenizer_sha/1",\n  "recorded_at": "%s",\n  "paths": {\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${TOKENIZER_SHA_RECORD}"
+printf '{\n  "schema": "anima/h100_weight_precache_tokenizer_sha/1",\n  "recorded_at": "%s",\n  "paths": {\n' \
+  "$(ts_iso)" > "${TOKENIZER_SHA_RECORD}"
 first=1
 
 HF_BIN="$(command -v hf || command -v huggingface-cli)"
+
+# verdict accumulator (pid:status:size_mb:tok)
+declare -a VERDICTS=()
+fail_count=0
+done_count=0
+skip_count=0
 
 for pid in ${PATH_IDS}; do
   MODEL_ID=$(python3 -c 'import json,sys
@@ -200,28 +331,57 @@ m=json.load(open(sys.argv[1]))
 print(",".join(m["paths"][sys.argv[2]]["files"]))' "${MANIFEST}" "${pid}")
   STAGE="${STAGING_DIR}/${pid}"
 
-  log "[${pid}] downloading ${MODEL_ID} -> ${STAGE}"
+  log ""
+  log "[${pid}] === processing ${MODEL_ID} ==="
+
+  # Resume: skip if already done
+  if path_already_done "${pid}"; then
+    pass "[${pid}] progress jsonl shows status=done — skipping (resume)"
+    VERDICTS+=("${pid}:skipped_resume:0:resume")
+    skip_count=$((skip_count+1))
+    continue
+  fi
+
+  log "[${pid}] downloading -> ${STAGE}"
   mkdir -p "${STAGE}"
   if ! "${HF_BIN}" download "${MODEL_ID}" --local-dir "${STAGE}" --include "${FILES}" --token "${HF_TOKEN}"; then
     fail "[${pid}] HF download failed"
-    exit 4
+    progress_append "${pid}" "fail" "" "" "hf_download_failed"
+    VERDICTS+=("${pid}:fail:0:hf_download_failed")
+    fail_count=$((fail_count+1))
+    continue
   fi
 
+  TOK_SHA=""
   if [[ -f "${STAGE}/tokenizer.json" ]]; then
     TOK_SHA=$(compute_sha256 "${STAGE}/tokenizer.json")
     log "[${pid}] tokenizer.json sha256 = ${TOK_SHA}"
     if [[ ${first} -eq 1 ]]; then first=0; else printf ',\n' >> "${TOKENIZER_SHA_RECORD}"; fi
-    printf '    "%s": {"model_id": "%s", "tokenizer_sha256": "%s"}' "${pid}" "${MODEL_ID}" "${TOK_SHA}" >> "${TOKENIZER_SHA_RECORD}"
+    printf '    "%s": {"model_id": "%s", "tokenizer_sha256": "%s"}' \
+      "${pid}" "${MODEL_ID}" "${TOK_SHA}" >> "${TOKENIZER_SHA_RECORD}"
   else
     warn "[${pid}] tokenizer.json absent in download — skipping sha256"
   fi
 
   log "[${pid}] mirroring to ${RCLONE_REMOTE}:${R2_TARGET}"
-  if ! rclone copy "${STAGE}/" "${RCLONE_REMOTE}:${R2_TARGET}" --progress --transfers 4 --checkers 8; then
+  # --size-only enables idempotent re-runs: existing R2 objects with matching
+  # size are skipped (rclone built-in suppression).
+  if ! rclone copy "${STAGE}/" "${RCLONE_REMOTE}:${R2_TARGET}" \
+        --progress --transfers 4 --checkers 8 --size-only \
+        --s3-chunk-size 64M --s3-upload-concurrency 4 \
+        --stats 60s --stats-one-line; then
     fail "[${pid}] rclone copy failed"
-    exit 4
+    progress_append "${pid}" "fail" "" "" "rclone_copy_failed"
+    VERDICTS+=("${pid}:fail:0:rclone_copy_failed")
+    fail_count=$((fail_count+1))
+    continue
   fi
-  pass "[${pid}] mirror complete"
+
+  size_mb=$(dir_size_mb "${STAGE}")
+  pass "[${pid}] mirror complete (size_mb=${size_mb})"
+  progress_append "${pid}" "done" "${size_mb}" "${TOK_SHA}" ""
+  VERDICTS+=("${pid}:done:${size_mb}:${TOK_SHA}")
+  done_count=$((done_count+1))
 done
 
 printf '\n  }\n}\n' >> "${TOKENIZER_SHA_RECORD}"
@@ -230,5 +390,40 @@ log "NOTE: operator must merge the recorded sha values into the canonical manife
 log "      (state/h100_weight_precache_manifest.json paths.<pid>.tokenizer_sha256)"
 log "      so pod start-up integrity gate can compare. (manual edit avoids accidental SSOT mutation by this script.)"
 
-log "RESULT: APPLY OK — 4 paths mirrored to ${R2_BUCKET}"
+# emit completion json
+{
+  printf '{\n'
+  printf '  "schema": "anima/h100_weight_precache_completion/1",\n'
+  printf '  "completed_at": "%s",\n' "$(ts_iso)"
+  printf '  "log_path": "%s",\n' "${LOG}"
+  printf '  "progress_jsonl": "%s",\n' "${PROGRESS_JSONL}"
+  printf '  "summary": {"done": %d, "skipped_resume": %d, "fail": %d, "total": %d},\n' \
+    "${done_count}" "${skip_count}" "${fail_count}" "$(echo "${PATH_IDS}" | wc -w | tr -d ' ')"
+  printf '  "verdicts": {\n'
+  vfirst=1
+  for v in "${VERDICTS[@]}"; do
+    pid="${v%%:*}"; rest="${v#*:}"
+    status="${rest%%:*}"; rest="${rest#*:}"
+    size="${rest%%:*}"; tail_field="${rest#*:}"
+    if [[ ${vfirst} -eq 1 ]]; then vfirst=0; else printf ',\n'; fi
+    if [[ "${status}" == "done" ]]; then
+      printf '    "%s": {"status": "done", "size_mb": %s, "tokenizer_sha256": "%s"}' \
+        "${pid}" "${size}" "${tail_field}"
+    elif [[ "${status}" == "skipped_resume" ]]; then
+      printf '    "%s": {"status": "skipped_resume"}' "${pid}"
+    else
+      printf '    "%s": {"status": "fail", "error": "%s"}' "${pid}" "${tail_field}"
+    fi
+  done
+  printf '\n  }\n}\n'
+} > "${COMPLETION_JSON}"
+log "completion json: ${COMPLETION_JSON}"
+
+if [[ ${fail_count} -gt 0 ]]; then
+  fail "RESULT: APPLY PARTIAL — done=${done_count} skipped=${skip_count} fail=${fail_count}"
+  log "Re-run --apply to retry failed paths (resume will skip already-done paths)."
+  exit 4
+fi
+
+log "RESULT: APPLY OK — done=${done_count} skipped=${skip_count} (bucket=${R2_BUCKET})"
 exit 0

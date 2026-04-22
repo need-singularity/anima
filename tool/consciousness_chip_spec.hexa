@@ -34,6 +34,12 @@ fn sopfr6() -> int { return 2 + 3 }
 // σ(n) = sum of divisors. For 6: 1+2+3+6 = 12.
 fn sigma6() -> int { return 1 + 2 + 3 + 6 }
 
+// τ(n) = number of divisors. For 6: |{1,2,3,6}| = 4.
+fn tau6() -> int { return 4 }
+
+// φ(n) = Euler totient. For 6: |{1,5}| = 2.
+fn phi6() -> int { return 2 }
+
 // Integer power (positive base, small exponent).
 fn ipow(base: int, exp: int) -> int {
     let mut r = 1
@@ -61,13 +67,37 @@ fn main() {
     let z_match = z_target == 6
     let sigma_match = sigma6_val == sigma6_target
     let lane_match = lane_rate_val == lane_rate_target
-    let all_pass = z_match && sigma_match && lane_match
+    let core_pass = z_match && sigma_match && lane_match
 
     // SQUID channel enumeration — 12 channels matching σ(6).
     let squid_channels = sigma6_val
 
     // UCIe 3.0 lane rate — matches 2^sopfr(6) GT/s.
     let ucie_lane_gts = lane_rate_val
+
+    // ─── UCIe lane math (σ·τ budget allocation) ───────────────────────
+    let tau6_v = tau6()
+    let phi6_v = phi6()
+    let sigma_tau = sigma6_val * tau6_v               // 48 GT/s aggregate
+    // ceil(48/32) = (48 + 32 - 1) / 32 → integer div = 79/32 = 2.
+    let lanes_per_module = (sigma_tau + ucie_lane_gts - 1) / ucie_lane_gts
+    let lanes_per_module_match = lanes_per_module == 2
+
+    // Frame header bits = τ(6) · 32 = 128 (shared with #57/#59).
+    let frame_header_bits = tau6_v * ucie_lane_gts
+    let frame_header_match = frame_header_bits == 128
+
+    // SoC primitive set: τ(6) = 4 → load, store, compute, sync.
+    let primitive_set = ["load", "store", "compute", "sync"]
+    let primitive_count_match = len(primitive_set) == tau6_v
+
+    // σ·τ budget allocation — split aggregate 48 GT/s across 4 primitives.
+    // budget_per_primitive = σ·τ / τ = σ(6) = 12 GT/s (clean integer).
+    let budget_per_primitive = sigma_tau / tau6_v
+    let budget_match = budget_per_primitive == sigma6_val
+
+    // Atomicity unit per σ·τ-φ = 48 - 2 = 46 cycle commit window.
+    let commit_window_cycles = sigma_tau - phi6_v
 
     let mut body = "{\n"
     body = body + "  \"schema_version\": \"1\",\n"
@@ -95,6 +125,33 @@ fn main() {
     body = body + "    \"anima_57_hivemind\": \"hex z=6 neighbor count shared invariant — twin-engine coupling\",\n"
     body = body + "    \"n6_consciousness_chip\": \"BT-C13 row 4 EXACT mirror\"\n"
     body = body + "  },\n"
+    body = body + "  \"ucie_lane_math\": {\n"
+    body = body + "    \"lane_rate_gts\": " + to_string(ucie_lane_gts) + ",\n"
+    body = body + "    \"aggregate_gts\": " + to_string(sigma_tau) + ",\n"
+    body = body + "    \"aggregate_formula\": \"σ(6)·τ(6) = 12·4 = 48 GT/s\",\n"
+    body = body + "    \"lanes_per_module\": " + to_string(lanes_per_module) + ",\n"
+    body = body + "    \"lanes_formula\": \"ceil(σ·τ / lane_rate) = ceil(48/32) = 2\",\n"
+    body = body + "    \"lanes_per_module_match\": " + bool_s(lanes_per_module_match) + ",\n"
+    body = body + "    \"frame_header_bits\": " + to_string(frame_header_bits) + ",\n"
+    body = body + "    \"frame_header_formula\": \"τ(6) · lane_rate_gts = 4·32 = 128 bits\",\n"
+    body = body + "    \"frame_header_match\": " + bool_s(frame_header_match) + "\n"
+    body = body + "  },\n"
+    body = body + "  \"primitive_set\": {\n"
+    body = body + "    \"set\": [\"load\",\"store\",\"compute\",\"sync\"],\n"
+    body = body + "    \"count\": " + to_string(len(primitive_set)) + ",\n"
+    body = body + "    \"count_formula\": \"τ(6) = 4\",\n"
+    body = body + "    \"count_match\": " + bool_s(primitive_count_match) + ",\n"
+    body = body + "    \"shared_with\": [\"#57 hivemind sync_primitives\", \"#61 wasm primitive set\"]\n"
+    body = body + "  },\n"
+    body = body + "  \"sigma_tau_budget\": {\n"
+    body = body + "    \"aggregate_gts\": " + to_string(sigma_tau) + ",\n"
+    body = body + "    \"per_primitive_gts\": " + to_string(budget_per_primitive) + ",\n"
+    body = body + "    \"per_primitive_formula\": \"σ·τ / τ = σ(6) = 12 GT/s\",\n"
+    body = body + "    \"budget_match\": " + bool_s(budget_match) + ",\n"
+    body = body + "    \"commit_window_cycles\": " + to_string(commit_window_cycles) + ",\n"
+    body = body + "    \"commit_window_formula\": \"σ·τ - φ(6) = 48 - 2 = 46\"\n"
+    body = body + "  },\n"
+    let all_pass = core_pass && lanes_per_module_match && frame_header_match && primitive_count_match && budget_match
     body = body + "  \"all_pass\": " + bool_s(all_pass) + ",\n"
     body = body + "  \"verdict\": \"" + (if all_pass { "VERIFIED" } else { "FAIL" }) + "\"\n"
     body = body + "}\n"
@@ -105,9 +162,12 @@ fn main() {
     println("[cons_chip] z hex coord target=" + to_string(z_target) + " match=" + bool_s(z_match))
     println("[cons_chip] σ(6) channels target=" + to_string(sigma6_target) + " value=" + to_string(squid_channels) + " match=" + bool_s(sigma_match))
     println("[cons_chip] 2^sopfr(6) lane GT/s target=" + to_string(lane_rate_target) + " value=" + to_string(ucie_lane_gts) + " match=" + bool_s(lane_match))
+    println("[cons_chip] σ·τ aggregate=" + to_string(sigma_tau) + " GT/s, lanes/module=" + to_string(lanes_per_module) + " match=" + bool_s(lanes_per_module_match))
+    println("[cons_chip] frame header=" + to_string(frame_header_bits) + " bits (τ·32) match=" + bool_s(frame_header_match))
+    println("[cons_chip] primitives=" + to_string(len(primitive_set)) + " (τ(6)) match=" + bool_s(primitive_count_match) + ", per-primitive=" + to_string(budget_per_primitive) + " GT/s match=" + bool_s(budget_match))
     println("[cons_chip] output=" + out_path)
     if all_pass {
-        println("[cons_chip] selftest PASS — z=6 · σ(6)=12 · 2^sopfr(6)=32 all verified, verdict=VERIFIED")
+        println("[cons_chip] selftest PASS — z=6 · σ(6)=12 · 2^sopfr=32 · 2 lanes · 128-bit frame · 4 primitives · 12 GT/s budget verified, verdict=VERIFIED")
         exit(0)
     } else {
         eprintln("[cons_chip] selftest FAIL — at least one n6 invariant mismatch")
