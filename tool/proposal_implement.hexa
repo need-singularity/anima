@@ -75,6 +75,53 @@ fn _arg_value(argv, key: string, dflt: string) -> string {
     return dflt
 }
 
+fn _is_numeric_str(s: string) -> bool {
+    if s == "" { return false }
+    let mut start = 0
+    if s.substring(0, 1) == "-" {
+        if len(s) == 1 { return false }
+        start = 1
+    }
+    let mut saw_dot = false
+    let mut i = start
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "." {
+            if saw_dot { return false }
+            saw_dot = true
+        } else if c == "0" || c == "1" || c == "2" || c == "3" || c == "4" || c == "5" || c == "6" || c == "7" || c == "8" || c == "9" {
+            // ok
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn _is_string_key(k: string) -> bool {
+    if k == "id" { return true }
+    if k == "title" { return true }
+    if k == "kind" { return true }
+    if k == "rationale" { return true }
+    if k == "user_status" { return true }
+    if k == "first_seen_ts" { return true }
+    if k == "last_refined_ts" { return true }
+    if k == "user_decision_at" { return true }
+    if k == "user_decision_reason" { return true }
+    if k == "implementation_module_path" { return true }
+    if k == "resurrection_eligible_after" { return true }
+    if k == "estimated_effort" { return true }
+    if k == "estimated_impact" { return true }
+    if k == "lineage_parent" { return true }
+    if k == "source_signal" { return true }
+    if k == "path" { return true }
+    if k == "schema" { return true }
+    if k == "created_at" { return true }
+    if k == "updated_at" { return true }
+    return false
+}
+
 fn _json_esc(s: string) -> string {
     let mut out = ""
     let n = len(s)
@@ -156,29 +203,55 @@ fn _inv_find_idx(inv, id: string) -> int {
     return -1
 }
 
+fn _serialize_value(k: string, v, indent: string) -> string {
+    let ts = _str(v)
+    if ts == "void" { return "null" }
+    if ts == "true" || ts == "false" { return ts }
+
+    if len(ts) >= 1 && ts.substring(0, 1) == "[" {
+        let n = len(v)
+        if n == 0 { return "[]" }
+        let mut out = "[\n"
+        let mut i = 0
+        while i < n {
+            out = out + indent + "  " + _serialize_value("", v[i], indent + "  ")
+            if i + 1 < n { out = out + "," }
+            out = out + "\n"
+            i = i + 1
+        }
+        out = out + indent + "]"
+        return out
+    }
+
+    if len(ts) >= 1 && ts.substring(0, 1) == "{" {
+        let mks = keys(v)
+        let n = len(mks)
+        if n == 0 { return "{}" }
+        let mut out = "{\n"
+        let mut i = 0
+        while i < n {
+            let mk = mks[i]
+            out = out + indent + "  \"" + _json_esc(mk) + "\": " + _serialize_value(mk, v[mk], indent + "  ")
+            if i + 1 < n { out = out + "," }
+            out = out + "\n"
+            i = i + 1
+        }
+        out = out + indent + "}"
+        return out
+    }
+
+    if k != "" && _is_string_key(k) { return "\"" + _json_esc(ts) + "\"" }
+    if _is_numeric_str(ts) { return ts }
+    return "\"" + _json_esc(ts) + "\""
+}
+
 fn _proposal_to_json(p) -> string {
     let ks = keys(p)
     let mut out = "{\n"
     let mut i = 0
     while i < len(ks) {
         let k = ks[i]
-        let v = p[k]
-        out = out + "    \"" + _json_esc(k) + "\": "
-        if v == null {
-            out = out + "null"
-        } else {
-            let s = _str(v)
-            if s == "true" || s == "false" { out = out + s }
-            else if s != "" && (s.substring(0, 1) == "0" || s.substring(0, 1) == "1" || s.substring(0, 1) == "2" || s.substring(0, 1) == "3" || s.substring(0, 1) == "4" || s.substring(0, 1) == "5" || s.substring(0, 1) == "6" || s.substring(0, 1) == "7" || s.substring(0, 1) == "8" || s.substring(0, 1) == "9" || s.substring(0, 1) == "-") {
-                if k == "id" || k == "first_seen_ts" || k == "last_refined_ts" || k == "user_decision_at" {
-                    out = out + "\"" + _json_esc(s) + "\""
-                } else {
-                    out = out + s
-                }
-            } else {
-                out = out + "\"" + _json_esc(s) + "\""
-            }
-        }
+        out = out + "    \"" + _json_esc(k) + "\": " + _serialize_value(k, p[k], "    ")
         if i + 1 < len(ks) { out = out + "," }
         out = out + "\n"
         i = i + 1
@@ -188,17 +261,32 @@ fn _proposal_to_json(p) -> string {
 }
 
 fn _save_inventory(inv) {
-    let ps = if inv.contains_key("proposals") { inv["proposals"] } else { [] }
+    let ks = keys(inv)
     let mut body = "{\n"
-    body = body + "  \"schema\": \"anima.proposals.inventory.v1\",\n"
-    body = body + "  \"updated_at\": \"" + _now_iso() + "\",\n"
-    body = body + "  \"proposals\": [\n"
+    let mut emitted_updated = false
     let mut i = 0
-    while i < len(ps) {
-        body = body + "  " + _proposal_to_json(ps[i])
-        if i + 1 < len(ps) { body = body + "," }
-        body = body + "\n"
+    while i < len(ks) {
+        let k = ks[i]
+        if k == "proposals" { i = i + 1; continue }
+        let mut v = inv[k]
+        if k == "updated_at" {
+            emitted_updated = true
+            v = _now_iso()
+        }
+        body = body + "  \"" + _json_esc(k) + "\": " + _serialize_value(k, v, "  ") + ",\n"
         i = i + 1
+    }
+    if !emitted_updated {
+        body = body + "  \"updated_at\": \"" + _now_iso() + "\",\n"
+    }
+    let ps = if inv.contains_key("proposals") { inv["proposals"] } else { [] }
+    body = body + "  \"proposals\": [\n"
+    let mut j = 0
+    while j < len(ps) {
+        body = body + "  " + _proposal_to_json(ps[j])
+        if j + 1 < len(ps) { body = body + "," }
+        body = body + "\n"
+        j = j + 1
     }
     body = body + "  ]\n"
     body = body + "}\n"
