@@ -1,0 +1,264 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/mk_xii_scale_plan.hexa — B-axis B.1 (post-H100 research)
+//
+//  PURPOSE
+//    Emit a deterministic scale-up plan from Mk.VI (8B) to Mk.XII (70B).
+//    Plan-only tool. No training, no pod allocation, no network. Writes
+//    state/mk_xii_scale_plan.json with per-axis comparison, VRAM budget
+//    computation for H100 4pod x 4 (80GB each = 320GB cluster), and a
+//    deepspeed zero-3 + tensor-parallel sharding strategy.
+//
+//  AXES COMPARED (Mk.VI 8B vs Mk.XII 70B)
+//    rank, hidden_dim, num_layers, gradient_ckpt, zero_stage
+//
+//  VRAM CALCULATION
+//    Per-parameter footprint under zero-3 + bf16 mixed precision:
+//      weights      : 2 bytes (bf16)
+//      grads        : 2 bytes (bf16)  — sharded across DP ranks
+//      optimizer    : 12 bytes (fp32 master + momentum + variance) — sharded
+//      activations  : ~10-20% of weight bytes with grad_ckpt=true
+//    Total naive   : 16 bytes/param
+//    After zero-3 shard across N ranks: weights + grads + optim all / N
+//    With grad_ckpt + activation recomputation: activations small
+//
+//  H100 4 pod × 4 = 16 GPUs × 80GB = 1280GB cluster VRAM
+//
+//  RAW STRICT
+//    raw#9 hexa-only · raw#11 snake_case · raw#15 no-hardcode (local consts)
+//    LLM=none · deterministic · idempotent · selftest (--self-test)
+// ════════════════════════════════════════════════════════════════════════════
+
+fn _home() -> string {
+    let h = env("HOME")
+    if len(h) > 0 { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+fn now_utc() -> string { return exec("date -u +%FT%TZ").trim() }
+fn bool_s(b: bool) -> string { if b { return "true" } else { return "false" } }
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+fn _has(av, k) -> bool {
+    let mut i = 0
+    while i < len(av) { if to_string(av[i]) == k { return true }; i = i + 1 }
+    return false
+}
+
+// ─── VRAM model (per-param, bytes) ────────────────────────────────────────
+// zero_stage=3 shards weights+grads+optimizer across N dp ranks.
+// Assumes bf16 mixed precision + fp32 master copy in optimizer.
+fn vram_gib_per_param(zero_stage: int, n_dp_ranks: int, grad_ckpt: bool) -> float {
+    let w_bytes = 2.0                          // bf16 weight
+    let g_bytes = 2.0                          // bf16 grad
+    let o_bytes = 12.0                         // fp32 master + m + v
+    let mut act_frac = 0.18                    // activations ~18% of weight bytes (rough)
+    if grad_ckpt { act_frac = 0.05 }           // grad_ckpt lowers activations ~3-4x
+
+    let n_f = to_float(n_dp_ranks)
+    let mut per_param = w_bytes + g_bytes + o_bytes
+    if zero_stage == 3 {
+        per_param = (w_bytes + g_bytes + o_bytes) / n_f
+    }
+    if zero_stage == 2 {
+        per_param = w_bytes + (g_bytes + o_bytes) / n_f
+    }
+    if zero_stage == 1 {
+        per_param = w_bytes + g_bytes + o_bytes / n_f
+    }
+    // add activation per-param estimate (acts are per-token, this is a coarse amortized estimate)
+    per_param = per_param + w_bytes * act_frac
+    return per_param
+}
+
+// total_gib = params * bytes_per_param / 1e9 ... but 1 GiB = 2^30
+fn total_gib(params_b: float, bytes_per_param: float) -> float {
+    let params = params_b * 1.0e9
+    let bytes = params * bytes_per_param
+    return bytes / 1073741824.0  // 2^30
+}
+
+fn round3(x: float) -> float {
+    let s = 1000.0
+    let mut v = x * s
+    if v >= 0.0 { v = v + 0.5 } else { v = v - 0.5 }
+    return to_float(to_int(v)) / s
+}
+
+fn main() {
+    let home = _home()
+    let out_path = home + "/core/anima/state/mk_xii_scale_plan.json"
+    let av = _argv()
+    let self_test = _has(av, "--self-test")
+
+    // ── Mk.VI (8B) axis values ────────────────────────────────────────────
+    let mk_vi_params_b     = 8.0          // 8B
+    let mk_vi_rank         = 64
+    let mk_vi_hidden       = 4096
+    let mk_vi_layers       = 32
+    let mk_vi_grad_ckpt    = false
+    let mk_vi_zero_stage   = 2
+    let mk_vi_dp_ranks     = 4            // 1 pod x 4 gpu
+
+    // ── Mk.XII (70B) axis values ──────────────────────────────────────────
+    let mk_xii_params_b    = 70.0         // 70B
+    let mk_xii_rank        = 128
+    let mk_xii_hidden      = 8192
+    let mk_xii_layers      = 80
+    let mk_xii_grad_ckpt   = true
+    let mk_xii_zero_stage  = 3
+    let mk_xii_dp_ranks    = 16           // 4 pod x 4 gpu
+
+    // ── VRAM calc ────────────────────────────────────────────────────────
+    let bpp_mk_vi  = vram_gib_per_param(mk_vi_zero_stage, mk_vi_dp_ranks, mk_vi_grad_ckpt)
+    let bpp_mk_xii = vram_gib_per_param(mk_xii_zero_stage, mk_xii_dp_ranks, mk_xii_grad_ckpt)
+
+    let mk_vi_total_gib  = total_gib(mk_vi_params_b, bpp_mk_vi)
+    let mk_xii_total_gib = total_gib(mk_xii_params_b, bpp_mk_xii)
+
+    // per-GPU share (DP shards uniformly)
+    let mk_vi_per_gpu  = mk_vi_total_gib  / to_float(mk_vi_dp_ranks)
+    let mk_xii_per_gpu = mk_xii_total_gib / to_float(mk_xii_dp_ranks)
+
+    // H100 cluster budget
+    let h100_vram_per_gpu = 80.0
+    let h100_n_pods = 4
+    let h100_gpu_per_pod = 4
+    let cluster_vram_gib = to_float(h100_n_pods * h100_gpu_per_pod) * h100_vram_per_gpu
+
+    // headroom check (need < 80% GPU budget for safety)
+    let safety_frac = 0.80
+    let gpu_budget_gib = h100_vram_per_gpu * safety_frac
+    let fits_70b = mk_xii_per_gpu < gpu_budget_gib
+
+    // ── Self-test: invariants ────────────────────────────────────────────
+    let mut selftest_pass = true
+    let mut selftest_notes = []
+    if bpp_mk_xii >= bpp_mk_vi {
+        // zero-3 with 16 ranks must be < zero-2 with 4 ranks per-param
+        selftest_pass = false
+        selftest_notes.push("zero3_16ranks_not_less_than_zero2_4ranks")
+    }
+    if mk_xii_per_gpu <= 0.0 { selftest_pass = false; selftest_notes.push("per_gpu_nonpositive") }
+    if mk_vi_params_b <= 0.0 || mk_xii_params_b <= mk_vi_params_b { selftest_pass = false; selftest_notes.push("param_scale_invalid") }
+    if cluster_vram_gib < h100_vram_per_gpu { selftest_pass = false; selftest_notes.push("cluster_vram_invalid") }
+
+    // ── Verdict ──────────────────────────────────────────────────────────
+    let vram_verdict = if fits_70b { "FITS_WITH_HEADROOM" } else { "OVER_BUDGET" }
+    let plan_verdict = if selftest_pass && fits_70b { "PLAN_READY" } else { "PLAN_REVIEW_REQUIRED" }
+
+    // ── Emit JSON ────────────────────────────────────────────────────────
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima.mk_xii_scale_plan.v1\",\n"
+    body = body + "  \"tool\": \"tool/mk_xii_scale_plan.hexa\",\n"
+    body = body + "  \"generated_at\": \"" + now_utc() + "\",\n"
+    body = body + "  \"side_effects\": \"plan_file_only\",\n"
+    body = body + "  \"h100_activated\": false,\n"
+    body = body + "  \"seed_fixed\": 2026,\n"
+    body = body + "  \"comparison\": {\n"
+    body = body + "    \"rank\":           {\"mk_vi\": " + to_string(mk_vi_rank)    + ", \"mk_xii\": " + to_string(mk_xii_rank)    + "},\n"
+    body = body + "    \"hidden_dim\":     {\"mk_vi\": " + to_string(mk_vi_hidden)  + ", \"mk_xii\": " + to_string(mk_xii_hidden)  + "},\n"
+    body = body + "    \"num_layers\":     {\"mk_vi\": " + to_string(mk_vi_layers)  + ", \"mk_xii\": " + to_string(mk_xii_layers)  + "},\n"
+    body = body + "    \"gradient_ckpt\":  {\"mk_vi\": " + bool_s(mk_vi_grad_ckpt)  + ", \"mk_xii\": " + bool_s(mk_xii_grad_ckpt)  + "},\n"
+    body = body + "    \"zero_stage\":     {\"mk_vi\": " + to_string(mk_vi_zero_stage) + ", \"mk_xii\": " + to_string(mk_xii_zero_stage) + "},\n"
+    body = body + "    \"params_billion\": {\"mk_vi\": " + to_string(mk_vi_params_b) + ", \"mk_xii\": " + to_string(mk_xii_params_b) + "}\n"
+    body = body + "  },\n"
+    body = body + "  \"cluster\": {\n"
+    body = body + "    \"h100_pods\": " + to_string(h100_n_pods) + ",\n"
+    body = body + "    \"gpu_per_pod\": " + to_string(h100_gpu_per_pod) + ",\n"
+    body = body + "    \"total_gpus\": " + to_string(h100_n_pods * h100_gpu_per_pod) + ",\n"
+    body = body + "    \"vram_per_gpu_gib\": " + to_string(h100_vram_per_gpu) + ",\n"
+    body = body + "    \"cluster_vram_gib\": " + to_string(cluster_vram_gib) + "\n"
+    body = body + "  },\n"
+    body = body + "  \"vram_budget\": {\n"
+    body = body + "    \"mk_vi\": {\n"
+    body = body + "      \"bytes_per_param\":  " + to_string(round3(bpp_mk_vi))  + ",\n"
+    body = body + "      \"total_gib\":        " + to_string(round3(mk_vi_total_gib)) + ",\n"
+    body = body + "      \"per_gpu_gib\":      " + to_string(round3(mk_vi_per_gpu)) + ",\n"
+    body = body + "      \"dp_ranks\":         " + to_string(mk_vi_dp_ranks)      + "\n"
+    body = body + "    },\n"
+    body = body + "    \"mk_xii\": {\n"
+    body = body + "      \"bytes_per_param\":  " + to_string(round3(bpp_mk_xii)) + ",\n"
+    body = body + "      \"total_gib\":        " + to_string(round3(mk_xii_total_gib)) + ",\n"
+    body = body + "      \"per_gpu_gib\":      " + to_string(round3(mk_xii_per_gpu)) + ",\n"
+    body = body + "      \"dp_ranks\":         " + to_string(mk_xii_dp_ranks)     + ",\n"
+    body = body + "      \"gpu_budget_gib\":   " + to_string(gpu_budget_gib)      + ",\n"
+    body = body + "      \"safety_fraction\":  " + to_string(safety_frac)         + ",\n"
+    body = body + "      \"fits_in_budget\":   " + bool_s(fits_70b)               + "\n"
+    body = body + "    }\n"
+    body = body + "  },\n"
+    body = body + "  \"sharding_strategy\": {\n"
+    body = body + "    \"framework\": \"deepspeed\",\n"
+    body = body + "    \"zero_stage\": 3,\n"
+    body = body + "    \"tensor_parallel_size\": 4,\n"
+    body = body + "    \"pipeline_parallel_size\": 1,\n"
+    body = body + "    \"data_parallel_size\": 4,\n"
+    body = body + "    \"dp_x_tp_x_pp\": \"4 x 4 x 1 = 16 GPUs\",\n"
+    body = body + "    \"offload_optimizer\": \"none\",\n"
+    body = body + "    \"offload_param\": \"none\",\n"
+    body = body + "    \"gradient_accumulation_steps\": 8,\n"
+    body = body + "    \"micro_batch_size_per_gpu\": 1,\n"
+    body = body + "    \"bf16\": true,\n"
+    body = body + "    \"activation_checkpointing\": true,\n"
+    body = body + "    \"flash_attention\": true,\n"
+    body = body + "    \"notes\": \"zero-3 shards w+g+opt across 16 DP ranks. TP=4 within each pod (NVLink). PP=1 (no cross-pod pipeline to keep comm cost sane).\"\n"
+    body = body + "  },\n"
+    body = body + "  \"verdict\": {\n"
+    body = body + "    \"vram_verdict\": \"" + vram_verdict + "\",\n"
+    body = body + "    \"plan_verdict\": \"" + plan_verdict + "\",\n"
+    body = body + "    \"fits_70b\": " + bool_s(fits_70b) + ",\n"
+    body = body + "    \"selftest_pass\": " + bool_s(selftest_pass) + "\n"
+    body = body + "  },\n"
+    body = body + "  \"selftest\": {\n"
+    body = body + "    \"invariants_checked\": [\n"
+    body = body + "      \"zero3_16ranks_per_param < zero2_4ranks_per_param\",\n"
+    body = body + "      \"mk_xii_per_gpu > 0\",\n"
+    body = body + "      \"mk_xii_params > mk_vi_params > 0\",\n"
+    body = body + "      \"cluster_vram >= per_gpu_vram\"\n"
+    body = body + "    ],\n"
+    body = body + "    \"pass\": " + bool_s(selftest_pass) + ",\n"
+    body = body + "    \"notes\": ["
+    let mut i = 0
+    while i < len(selftest_notes) {
+        if i > 0 { body = body + ", " }
+        body = body + "\"" + to_string(selftest_notes[i]) + "\""
+        i = i + 1
+    }
+    body = body + "]\n"
+    body = body + "  },\n"
+    body = body + "  \"audit\": {\n"
+    body = body + "    \"fake_pass_guard\": \"No pod allocated, no training run. Static closed-form VRAM calc only.\",\n"
+    body = body + "    \"no_py\": true,\n"
+    body = body + "    \"deterministic\": true,\n"
+    body = body + "    \"idempotent\": true,\n"
+    body = body + "    \"raw_strict\": \"raw#9 raw#11 raw#15 · LLM=none\"\n"
+    body = body + "  }\n"
+    body = body + "}\n"
+
+    exec("mkdir -p '" + home + "/core/anima/state'")
+    write_file(out_path, body)
+
+    println("[mk_xii_scale_plan] mk_vi_per_gpu_gib=" + to_string(round3(mk_vi_per_gpu))
+            + " mk_xii_per_gpu_gib=" + to_string(round3(mk_xii_per_gpu))
+            + " gpu_budget_gib=" + to_string(gpu_budget_gib))
+    println("[mk_xii_scale_plan] vram_verdict=" + vram_verdict + " plan_verdict=" + plan_verdict)
+    println("[mk_xii_scale_plan] output=" + out_path)
+
+    if self_test {
+        if !selftest_pass {
+            println("[mk_xii_scale_plan] SELFTEST FAIL")
+            exit(1)
+        }
+        println("[mk_xii_scale_plan] SELFTEST PASS")
+    }
+    if !selftest_pass {
+        exit(1)
+    }
+    exit(0)
+}
+
+main()

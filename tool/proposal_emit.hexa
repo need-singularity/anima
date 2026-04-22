@@ -432,6 +432,11 @@ fn _load_inventory() -> map {
     inv["proposals"]  = if parsed.contains_key("proposals")  { parsed["proposals"] }             else { [] }
     inv["summary"]    = if parsed.contains_key("summary")    { parsed["summary"] }               else { json_parse("{\"total\":0,\"pending\":0,\"approved\":0,\"rejected\":0,\"archived\":0,\"debate\":0}") }
     inv["seq_today"]  = if parsed.contains_key("seq_today")  { parsed["seq_today"] }             else { json_parse("{}") }
+    // SCHEMA COEXISTENCE (option C, 2026-04-22): preserve "entries" if the
+    // cluster_detect tool has populated it, so our rewrite does not clobber
+    // cluster meta. Downstream consumers may ignore this field — it is a
+    // transparent passthrough.
+    inv["entries"]    = if parsed.contains_key("entries")    { parsed["entries"] }               else { [] }
     return inv
 }
 
@@ -441,6 +446,7 @@ fn _load_inventory_blank() -> map {
     inv["created_at"]  = _ts_iso()
     inv["updated_at"]  = _ts_iso()
     inv["proposals"]   = []
+    inv["entries"]     = []   // coexistence: cluster_detect's namespace
     inv["summary"]     = json_parse("{\"total\":0,\"pending\":0,\"approved\":0,\"rejected\":0,\"archived\":0,\"debate\":0}")
     inv["seq_today"]   = json_parse("{}")
     return inv
@@ -589,6 +595,11 @@ fn _inventory_to_json(inv: map) -> string {
     j = j + "  \"updated_at\": \""  + _json_esc(to_string(inv["updated_at"])) + "\",\n"
     j = j + "  \"summary\": "       + _summary_inline(inv["summary"])         + ",\n"
     j = j + "  \"seq_today\": "     + _seq_today_inline(inv["seq_today"])     + ",\n"
+    // SCHEMA COEXISTENCE (option C): preserve cluster_detect's "entries"
+    // namespace. Serialized as-is via json_stringify so cluster meta
+    // (member_count / merges_with / signal_kind / …) round-trips losslessly.
+    let ents = if inv.contains_key("entries") { inv["entries"] } else { [] }
+    j = j + "  \"entries\": " + json_stringify(ents) + ",\n"
     j = j + "  \"proposals\": [\n"
     let proposals = inv["proposals"]
     let mut i = 0
@@ -832,6 +843,8 @@ fn _apply(cands: array, source_signals: array, max_new: int) -> array {
     summary["debate"]   = deb
 
     // Reassemble inventory map fresh to dodge the nested-map mutation issue.
+    // Preserve "entries" (cluster_detect namespace) untouched — schema
+    // coexistence, option C 2026-04-22.
     let mut inv = json_parse("{}")
     inv["schema"]      = schema_v
     inv["created_at"]  = created_at
@@ -839,6 +852,11 @@ fn _apply(cands: array, source_signals: array, max_new: int) -> array {
     inv["summary"]     = summary
     inv["seq_today"]   = seq_map
     inv["proposals"]   = props
+    if inv0.contains_key("entries") {
+        inv["entries"] = inv0["entries"]
+    } else {
+        inv["entries"] = []
+    }
     _atomic_write(INV_PATH, _inventory_to_json(inv))
     return [new_n, hit_n, sample]
 }

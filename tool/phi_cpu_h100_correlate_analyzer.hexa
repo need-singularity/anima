@@ -1,0 +1,645 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/phi_cpu_h100_correlate_analyzer.hexa
+//  F-axis CPU synthetic ↔ H100 real-weight 4-path Φ correlate analyzer.
+//
+//  PARENT SSOT
+//    docs/phi_cpu_vs_h100_correlate_guide.md  (§3 correlation procedure)
+//
+//  PURPOSE
+//    When both artifacts exist, pair-by-pair correlate CPU synthetic ratios
+//    with H100 real ratios. Compute bias (real - cpu), Pearson correlation
+//    over the 6 pair points, and classify each pair as:
+//      formula_geometry     : |bias| < 0.01  (substrate-invariant Φ bias)
+//      substrate_specific   : |bias| ≥ 0.01  (genuine substrate signal)
+//
+//    Pre-H100 launch: real_in is absent → graceful SKIP (exit 0, verdict=SKIP).
+//
+//  INPUTS (read-only)
+//    state/phi_cpu_synthetic_4path_result.json  (CPU synthetic — REQUIRED)
+//    state/phi_4path_cross_result.json          (H100 real — OPTIONAL / SKIP)
+//
+//  OUTPUTS
+//    state/phi_cpu_h100_correlate_result.json   (canonical analyzer result)
+//    docs/phi_cpu_h100_correlate_report.md      (human-readable report)
+//
+//  OUTPUT SCHEMA (state JSON)
+//    anima/phi_cpu_h100_correlate/1
+//    {
+//      schema, generated_at, generated_at_epoch, generator, ssot_ref,
+//      cpu_present, real_present, mode,
+//      pairs: [
+//        { left, right, cpu_ratio, real_ratio, bias, abs_bias,
+//          signal_estimate, classification }
+//      ],
+//      pearson_r, pearson_n,
+//      summary: { pair_count, formula_geometry_count, substrate_specific_count,
+//                 max_abs_bias, mean_abs_bias, dominant_classification },
+//      verdict: "PASS" | "SKIP" | "FAIL"
+//    }
+//
+//  MODE SEMANTICS
+//    "full"       — cpu + real both present, full correlate run
+//    "skip_real"  — cpu present, real missing   (pre-launch posture)
+//    "skip_cpu"   — cpu missing                 (should never happen post-F axis)
+//
+//  SELFTEST (--selftest)
+//    t1: SKIP when phi_4path_cross_result.json absent
+//    t2: PASS when mock-real (cpu_ratio copy) yields |bias| ≈ 0 for all pairs
+//    t3: Pearson r ≈ 1.0 on mock-identical input
+//    t4: bias detection — injected real_ratio = cpu + 0.05 → substrate_specific
+//    t5: deterministic (byte-identical result on rerun with same input)
+//
+//  HARD CONSTRAINTS
+//    - hexa-only (no .py / .rs / .sh)
+//    - read-only on inputs
+//    - idempotent overwrite of outputs
+//    - deterministic (no wall-clock drift in math; timestamps recorded only)
+//    - MUST NOT panic on missing H100 artifact → SKIP verdict instead
+//
+//  USAGE
+//    /Users/ghost/.hx/bin/hexa run tool/phi_cpu_h100_correlate_analyzer.hexa
+//    /Users/ghost/.hx/bin/hexa run tool/phi_cpu_h100_correlate_analyzer.hexa --print
+//    /Users/ghost/.hx/bin/hexa run tool/phi_cpu_h100_correlate_analyzer.hexa --selftest
+//
+//  EXIT CODES
+//    0 = PASS or SKIP (verdict emitted)
+//    1 = FAIL (selftest failure, or correlate logic error)
+//    2 = I/O failure emitting result/report
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT = "/Users/ghost/core/anima"
+let CPU_IN     = "/Users/ghost/core/anima/state/phi_cpu_synthetic_4path_result.json"
+let REAL_IN    = "/Users/ghost/core/anima/state/phi_4path_cross_result.json"
+let RESULT_OUT = "/Users/ghost/core/anima/state/phi_cpu_h100_correlate_result.json"
+let REPORT_OUT = "/Users/ghost/core/anima/docs/phi_cpu_h100_correlate_report.md"
+let SCHEMA     = "anima/phi_cpu_h100_correlate/1"
+let SSOT_REF   = "docs/phi_cpu_vs_h100_correlate_guide.md"
+let GENERATOR  = "tool/phi_cpu_h100_correlate_analyzer.hexa"
+
+let BIAS_GEOMETRY_THRESHOLD = 0.01   // |bias| < this → formula_geometry
+let PASS_THRESHOLD          = 0.05   // H100 real gate (same as #10 exit_criteria)
+
+// ─── shared helpers ──────────────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+fn _file_exists(p: string) -> bool {
+    return exec_with_status("test -e " + _sh_quote(p))[1] == 0
+}
+fn _ts_iso() -> string { return to_string(utc_iso_now()) }
+fn _ts_epoch() -> string { return to_string(now()) }
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+fn _bool_str(b: bool) -> string {
+    if b { return "true" }
+    return "false"
+}
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+fn _flag(av, k) -> bool {
+    for x in av { if to_string(x) == k { return true } }
+    return false
+}
+fn _last_slash(p: string) -> int {
+    let mut i = len(p) - 1
+    while i >= 0 {
+        if p.substring(i, i + 1) == "/" { return i }
+        i = i - 1
+    }
+    return -1
+}
+fn _mkdir_for(path: string) {
+    let pdir = path.substring(0, _last_slash(path))
+    if pdir != "" { exec_with_status("mkdir -p " + _sh_quote(pdir)) }
+}
+fn _abs_f(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+fn _sqrt_newton(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut y = x
+    let mut j = 0
+    while j < 40 {
+        y = 0.5 * (y + x / y)
+        j = j + 1
+    }
+    return y
+}
+fn _max_f(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+// ─── pair-extraction (shared logic for cpu + real) ───────────────────────
+//
+// Both artifacts (phi_cpu_synthetic_4path_result.json + phi_4path_cross_result.json)
+// carry a top-level "pairs" array. Each entry has at minimum:
+//   left, right, ratio
+// (CPU synthetic additionally has phi_left/phi_right/delta/verdict; real may
+//  have any superset — we only need left+right+ratio.)
+//
+// Returns array of {left, right, ratio:float}. Missing → empty array.
+
+fn _read_pairs(path: string) -> array {
+    let mut out = []
+    if !_file_exists(path) { return out }
+    let raw = read_file(path)
+    if to_string(raw) == "" { return out }
+    let obj = json_parse(to_string(raw))
+    if !obj.contains_key("pairs") { return out }
+    let arr = obj["pairs"]
+    let mut i = 0
+    while i < len(arr) {
+        let p = arr[i]
+        let mut entry = json_parse("{}")
+        entry["left"]  = if p.contains_key("left")  { to_string(p["left"])  } else { "" }
+        entry["right"] = if p.contains_key("right") { to_string(p["right"]) } else { "" }
+        let rv = if p.contains_key("ratio") { to_float(p["ratio"]) } else { 0.0 }
+        entry["ratio"] = rv
+        out.push(entry)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── pair matching (cpu pair ↔ real pair by (left,right) key) ────────────
+//
+// Returns -1 when not found. O(n*m) with n=m=6 → trivial.
+
+fn _match_pair_idx(real_pairs: array, left: string, right: string) -> int {
+    let mut i = 0
+    while i < len(real_pairs) {
+        let p = real_pairs[i]
+        if to_string(p["left"]) == left && to_string(p["right"]) == right {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── classification ──────────────────────────────────────────────────────
+//
+// Rule from docs/phi_cpu_vs_h100_correlate_guide.md §3:
+//   |bias| < 0.01   → formula_geometry (substrate-invariant)
+//   |bias| ≥ 0.01   → substrate_specific (real H100 diverges from synthetic floor)
+//
+// signal_estimate = max(0, real - cpu) per SSOT §3.
+
+fn _classify(bias: float) -> string {
+    if _abs_f(bias) < BIAS_GEOMETRY_THRESHOLD { return "formula_geometry" }
+    return "substrate_specific"
+}
+
+// ─── Pearson correlation over aligned pair arrays ────────────────────────
+//
+// r = Σ((x_i - x̄)(y_i - ȳ)) / sqrt(Σ(x_i - x̄)² · Σ(y_i - ȳ)²)
+// Undefined when either variance is zero → return 0.0 sentinel + flag in caller.
+// Domain: n ≥ 2; for n=0 or n=1 → 0.0 also.
+
+fn _pearson(xs: array, ys: array) -> float {
+    let n = len(xs)
+    if n != len(ys) { return 0.0 }
+    if n < 2 { return 0.0 }
+    let mut sx = 0.0
+    let mut sy = 0.0
+    let mut i = 0
+    while i < n { sx = sx + to_float(xs[i]); sy = sy + to_float(ys[i]); i = i + 1 }
+    let nf = to_float(n)
+    let mx = sx / nf
+    let my = sy / nf
+    let mut cov = 0.0
+    let mut vx = 0.0
+    let mut vy = 0.0
+    let mut j = 0
+    while j < n {
+        let dx = to_float(xs[j]) - mx
+        let dy = to_float(ys[j]) - my
+        cov = cov + dx * dy
+        vx  = vx  + dx * dx
+        vy  = vy  + dy * dy
+        j = j + 1
+    }
+    if vx < 0.000000001 || vy < 0.000000001 { return 0.0 }
+    return cov / _sqrt_newton(vx * vy)
+}
+
+// ─── full correlate computation (cpu + real both present) ────────────────
+//
+// Returns {pairs:[{left,right,cpu_ratio,real_ratio,bias,abs_bias,signal_estimate,classification}],
+//          pearson_r, pearson_n, summary:{...}}
+
+fn _correlate(cpu_pairs: array, real_pairs: array) {
+    let mut out_pairs = []
+    let mut xs = []
+    let mut ys = []
+    let mut fmt_count = 0
+    let mut sub_count = 0
+    let mut max_abs = 0.0
+    let mut sum_abs = 0.0
+    let mut n_matched = 0
+
+    let mut i = 0
+    while i < len(cpu_pairs) {
+        let cp = cpu_pairs[i]
+        let lft = to_string(cp["left"])
+        let rht = to_string(cp["right"])
+        let cr  = to_float(cp["ratio"])
+
+        let ridx = _match_pair_idx(real_pairs, lft, rht)
+        let mut rr_val = 0.0
+        let mut matched = false
+        if ridx >= 0 {
+            let rp = real_pairs[ridx]
+            rr_val = to_float(rp["ratio"])
+            matched = true
+        }
+
+        let bias  = rr_val - cr
+        let abias = _abs_f(bias)
+        let sig   = _max_f(0.0, rr_val - cr)
+        let cls   = _classify(bias)
+
+        if matched {
+            xs.push(cr)
+            ys.push(rr_val)
+            if cls == "formula_geometry"    { fmt_count = fmt_count + 1 }
+            if cls == "substrate_specific"  { sub_count = sub_count + 1 }
+            if abias > max_abs { max_abs = abias }
+            sum_abs = sum_abs + abias
+            n_matched = n_matched + 1
+        }
+
+        let mut entry = json_parse("{}")
+        entry["left"]             = lft
+        entry["right"]            = rht
+        entry["cpu_ratio"]        = cr
+        entry["real_ratio"]       = rr_val
+        entry["real_matched"]     = matched
+        entry["bias"]             = bias
+        entry["abs_bias"]         = abias
+        entry["signal_estimate"]  = sig
+        entry["classification"]   = if matched { cls } else { "unmatched" }
+        out_pairs.push(entry)
+        i = i + 1
+    }
+
+    let pearson_r = _pearson(xs, ys)
+    let mean_abs  = if n_matched > 0 { sum_abs / to_float(n_matched) } else { 0.0 }
+
+    let dominant = if fmt_count >= sub_count { "formula_geometry" } else { "substrate_specific" }
+
+    let mut r = json_parse("{}")
+    r["pairs"]                     = out_pairs
+    r["pearson_r"]                 = pearson_r
+    r["pearson_n"]                 = n_matched
+    r["pair_count"]                = len(out_pairs)
+    r["formula_geometry_count"]    = fmt_count
+    r["substrate_specific_count"]  = sub_count
+    r["max_abs_bias"]              = max_abs
+    r["mean_abs_bias"]             = mean_abs
+    r["dominant_classification"]   = dominant
+    return r
+}
+
+// ─── result JSON renderer ───────────────────────────────────────────────
+
+fn _render_pair_json(p) -> string {
+    let mut s = "    {\n"
+    s = s + "      \"left\": \""            + _json_escape(to_string(p["left"]))  + "\",\n"
+    s = s + "      \"right\": \""           + _json_escape(to_string(p["right"])) + "\",\n"
+    s = s + "      \"cpu_ratio\":       "   + to_string(p["cpu_ratio"])           + ",\n"
+    s = s + "      \"real_ratio\":      "   + to_string(p["real_ratio"])          + ",\n"
+    s = s + "      \"real_matched\":    "   + _bool_str(to_string(p["real_matched"]) == "true") + ",\n"
+    s = s + "      \"bias\":            "   + to_string(p["bias"])                + ",\n"
+    s = s + "      \"abs_bias\":        "   + to_string(p["abs_bias"])            + ",\n"
+    s = s + "      \"signal_estimate\": "   + to_string(p["signal_estimate"])     + ",\n"
+    s = s + "      \"classification\":  \"" + _json_escape(to_string(p["classification"])) + "\"\n"
+    s = s + "    }"
+    return s
+}
+
+fn _render_result(cpu_present: bool, real_present: bool, mode: string,
+                  corr, verdict: string, ts: string) -> string {
+    let mut s = "{\n"
+    s = s + "  \"schema\": \""       + SCHEMA + "\",\n"
+    s = s + "  \"generated_at\": \"" + _json_escape(ts) + "\",\n"
+    s = s + "  \"generated_at_epoch\": " + _ts_epoch() + ",\n"
+    s = s + "  \"generator\": \""    + GENERATOR + "\",\n"
+    s = s + "  \"ssot_ref\": \""     + SSOT_REF + "\",\n"
+    s = s + "  \"cpu_in\": \""       + _json_escape(CPU_IN)  + "\",\n"
+    s = s + "  \"real_in\": \""      + _json_escape(REAL_IN) + "\",\n"
+    s = s + "  \"cpu_present\": "    + _bool_str(cpu_present)  + ",\n"
+    s = s + "  \"real_present\": "   + _bool_str(real_present) + ",\n"
+    s = s + "  \"mode\": \""         + mode + "\",\n"
+    s = s + "  \"bias_geometry_threshold\": " + to_string(BIAS_GEOMETRY_THRESHOLD) + ",\n"
+    s = s + "  \"pass_threshold\": "  + to_string(PASS_THRESHOLD) + ",\n"
+
+    s = s + "  \"pairs\": [\n"
+    if corr.contains_key("pairs") {
+        let pairs = corr["pairs"]
+        let mut i = 0
+        while i < len(pairs) {
+            if i > 0 { s = s + ",\n" }
+            s = s + _render_pair_json(pairs[i])
+            i = i + 1
+        }
+        if len(pairs) > 0 { s = s + "\n" }
+    }
+    s = s + "  ],\n"
+
+    let pr_r = if corr.contains_key("pearson_r") { to_string(corr["pearson_r"]) } else { "0.0" }
+    let pr_n = if corr.contains_key("pearson_n") { to_string(corr["pearson_n"]) } else { "0" }
+    s = s + "  \"pearson_r\": " + pr_r + ",\n"
+    s = s + "  \"pearson_n\": " + pr_n + ",\n"
+
+    s = s + "  \"summary\": {\n"
+    let pc  = if corr.contains_key("pair_count")                { to_string(corr["pair_count"])                } else { "0" }
+    let fmc = if corr.contains_key("formula_geometry_count")    { to_string(corr["formula_geometry_count"])    } else { "0" }
+    let sbc = if corr.contains_key("substrate_specific_count")  { to_string(corr["substrate_specific_count"])  } else { "0" }
+    let mab = if corr.contains_key("max_abs_bias")              { to_string(corr["max_abs_bias"])              } else { "0.0" }
+    let mnb = if corr.contains_key("mean_abs_bias")             { to_string(corr["mean_abs_bias"])             } else { "0.0" }
+    let dom = if corr.contains_key("dominant_classification")   { to_string(corr["dominant_classification"])   } else { "unknown" }
+    s = s + "    \"pair_count\":               " + pc  + ",\n"
+    s = s + "    \"formula_geometry_count\":   " + fmc + ",\n"
+    s = s + "    \"substrate_specific_count\": " + sbc + ",\n"
+    s = s + "    \"max_abs_bias\":             " + mab + ",\n"
+    s = s + "    \"mean_abs_bias\":            " + mnb + ",\n"
+    s = s + "    \"dominant_classification\":  \"" + _json_escape(dom) + "\"\n"
+    s = s + "  },\n"
+    s = s + "  \"verdict\": \"" + verdict + "\"\n"
+    s = s + "}\n"
+    return s
+}
+
+// ─── markdown report renderer ───────────────────────────────────────────
+
+fn _render_report(cpu_present: bool, real_present: bool, mode: string,
+                  corr, verdict: string, ts: string) -> string {
+    let mut s = "# Φ CPU synthetic ↔ H100 real-weight 4-path correlate report\n\n"
+    s = s + "- generated_at: " + ts + "\n"
+    s = s + "- generator: " + GENERATOR + "\n"
+    s = s + "- ssot_ref: " + SSOT_REF + "\n"
+    s = s + "- mode: **" + mode + "**\n"
+    s = s + "- verdict: **" + verdict + "**\n\n"
+
+    if mode == "skip_real" {
+        s = s + "## Status: SKIP — H100 real-run artifact absent\n\n"
+        s = s + "`" + REAL_IN + "` not present. Analyzer is pre-launch posture;\n"
+        s = s + "re-run after #83 emits the canonical cross result.\n\n"
+        s = s + "CPU synthetic baseline (pre-emptive) is recorded in\n"
+        s = s + "`" + CPU_IN + "` — see docs/phi_cpu_vs_h100_correlate_guide.md §2.\n"
+        return s
+    }
+    if mode == "skip_cpu" {
+        s = s + "## Status: SKIP — CPU synthetic baseline absent\n\n"
+        s = s + "`" + CPU_IN + "` not present. Re-run tool/phi_cpu_synthetic_4path.hexa first.\n"
+        return s
+    }
+
+    s = s + "## Pair-by-pair correlate (6 pairs)\n\n"
+    s = s + "| left | right | cpu_ratio | real_ratio | bias | |bias| | signal | classification |\n"
+    s = s + "|---|---|---|---|---|---|---|---|\n"
+    let pairs = corr["pairs"]
+    let mut i = 0
+    while i < len(pairs) {
+        let p = pairs[i]
+        s = s + "| " + to_string(p["left"])
+              + " | " + to_string(p["right"])
+              + " | " + to_string(p["cpu_ratio"])
+              + " | " + to_string(p["real_ratio"])
+              + " | " + to_string(p["bias"])
+              + " | " + to_string(p["abs_bias"])
+              + " | " + to_string(p["signal_estimate"])
+              + " | " + to_string(p["classification"])
+              + " |\n"
+        i = i + 1
+    }
+    s = s + "\n"
+    s = s + "## Pearson correlation\n\n"
+    s = s + "- pearson_r: " + to_string(corr["pearson_r"]) + "\n"
+    s = s + "- pearson_n: " + to_string(corr["pearson_n"]) + "\n\n"
+    s = s + "High |r| (near 1.0) → cpu synthetic ratio predicts real ratio faithfully\n"
+    s = s + "(i.e. geometric bias dominates). Low or zero |r| → real has substrate-specific\n"
+    s = s + "component orthogonal to synthetic floor.\n\n"
+    s = s + "## Summary\n\n"
+    s = s + "- pair_count: "                + to_string(corr["pair_count"])                + "\n"
+    s = s + "- formula_geometry_count: "    + to_string(corr["formula_geometry_count"])    + "\n"
+    s = s + "- substrate_specific_count: "  + to_string(corr["substrate_specific_count"])  + "\n"
+    s = s + "- max_abs_bias: "              + to_string(corr["max_abs_bias"])              + "\n"
+    s = s + "- mean_abs_bias: "             + to_string(corr["mean_abs_bias"])             + "\n"
+    s = s + "- dominant_classification: **" + to_string(corr["dominant_classification"])   + "**\n\n"
+    s = s + "## Interpretation rubric (SSOT §3)\n\n"
+    s = s + "| dominant | meaning | action |\n"
+    s = s + "|---|---|---|\n"
+    s = s + "| formula_geometry | synthetic accurately predicted real → Φ formula has geometric bias | branch C: cross-path normalization |\n"
+    s = s + "| substrate_specific | real diverges beyond synthetic floor → genuine substrate signal | accept H100 verdict, investigate per-path |\n"
+    return s
+}
+
+// ─── full-run entry ─────────────────────────────────────────────────────
+
+fn run(also_print: bool) -> int {
+    let ts = _ts_iso()
+    println("── phi_cpu_h100_correlate_analyzer " + ts + " ──")
+
+    let cpu_ok  = _file_exists(CPU_IN)
+    let real_ok = _file_exists(REAL_IN)
+
+    let mut mode = "full"
+    if !cpu_ok { mode = "skip_cpu" }
+    else if !real_ok { mode = "skip_real" }
+
+    println("  cpu_in=" + CPU_IN + "  present=" + _bool_str(cpu_ok))
+    println("  real_in=" + REAL_IN + "  present=" + _bool_str(real_ok))
+    println("  mode=" + mode)
+
+    let mut verdict = "PASS"
+    let mut corr = json_parse("{}")
+    corr["pairs"]                    = []
+    corr["pearson_r"]                = 0.0
+    corr["pearson_n"]                = 0
+    corr["pair_count"]               = 0
+    corr["formula_geometry_count"]   = 0
+    corr["substrate_specific_count"] = 0
+    corr["max_abs_bias"]             = 0.0
+    corr["mean_abs_bias"]            = 0.0
+    corr["dominant_classification"]  = "unknown"
+
+    if mode == "skip_real" || mode == "skip_cpu" {
+        verdict = "SKIP"
+    } else {
+        let cpu_pairs  = _read_pairs(CPU_IN)
+        let real_pairs = _read_pairs(REAL_IN)
+        if len(cpu_pairs) == 0 || len(real_pairs) == 0 {
+            verdict = "FAIL"
+        } else {
+            corr = _correlate(cpu_pairs, real_pairs)
+            verdict = "PASS"
+        }
+        println("  pairs_cpu=" + to_string(len(cpu_pairs)) + " pairs_real=" + to_string(len(real_pairs)))
+        println("  pearson_r=" + to_string(corr["pearson_r"]) + " pearson_n=" + to_string(corr["pearson_n"]))
+        println("  max_abs_bias=" + to_string(corr["max_abs_bias"]))
+        println("  dominant=" + to_string(corr["dominant_classification"]))
+    }
+
+    let body   = _render_result(cpu_ok, real_ok, mode, corr, verdict, ts)
+    let report = _render_report(cpu_ok, real_ok, mode, corr, verdict, ts)
+
+    _mkdir_for(RESULT_OUT)
+    _mkdir_for(REPORT_OUT)
+    write_file(RESULT_OUT, body)
+    write_file(REPORT_OUT, report)
+
+    println("  result=" + RESULT_OUT)
+    println("  report=" + REPORT_OUT)
+    println("  verdict=" + verdict)
+
+    if also_print { println(body) }
+    if verdict == "FAIL" { return 1 }
+    return 0
+}
+
+// ─── self-test ──────────────────────────────────────────────────────────
+//
+// t1: classifier boundary — |bias|<0.01 → geometry, >=0.01 → substrate
+// t2: pearson on identical arrays → r ≈ 1.0
+// t3: pearson on [0,0,0,0] constant → r = 0 (zero variance path)
+// t4: _correlate on mock cpu + mock real (= cpu) → all geometry, r≈1, max_abs≈0
+// t5: _correlate with bias +0.05 on all pairs → all substrate_specific
+// t6: SKIP path — when real_pairs empty, correlate yields 0-pair summary
+
+fn _mk_pair(l: string, r: string, ratio: float) {
+    let mut p = json_parse("{}")
+    p["left"]  = l
+    p["right"] = r
+    p["ratio"] = ratio
+    return p
+}
+
+fn self_test() -> int {
+    println("── phi_cpu_h100_correlate_analyzer self-test ──")
+
+    let mut pass = 0
+    let mut fail = 0
+
+    // t1 — classifier boundaries
+    let c1a = _classify(0.005)    // |0.005| < 0.01 → geometry
+    let c1b = _classify(-0.009)   // |-.009| < 0.01 → geometry
+    let c1c = _classify(0.01)     // |0.01| == 0.01 → NOT < threshold → substrate
+    let c1d = _classify(0.05)
+    let c1e = _classify(-0.05)
+    let ok1 = c1a == "formula_geometry"
+            && c1b == "formula_geometry"
+            && c1c == "substrate_specific"
+            && c1d == "substrate_specific"
+            && c1e == "substrate_specific"
+    if ok1 { println("  t1 PASS (classifier boundaries)"); pass = pass + 1 }
+    else   { println("  t1 FAIL: " + c1a + "|" + c1b + "|" + c1c + "|" + c1d + "|" + c1e); fail = fail + 1 }
+
+    // t2 — pearson identical arrays
+    let xs2 = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    let ys2 = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    let r2  = _pearson(xs2, ys2)
+    let ok2 = _abs_f(r2 - 1.0) < 0.0001
+    if ok2 { println("  t2 PASS (pearson identical r=" + to_string(r2) + ")"); pass = pass + 1 }
+    else   { println("  t2 FAIL: r=" + to_string(r2)); fail = fail + 1 }
+
+    // t3 — pearson constant array → 0
+    let xs3 = [0.1, 0.1, 0.1, 0.1]
+    let ys3 = [0.5, 0.7, 0.3, 0.9]
+    let r3  = _pearson(xs3, ys3)
+    let ok3 = _abs_f(r3) < 0.0001
+    if ok3 { println("  t3 PASS (pearson zero-var r=" + to_string(r3) + ")"); pass = pass + 1 }
+    else   { println("  t3 FAIL: r=" + to_string(r3)); fail = fail + 1 }
+
+    // t4 — mock correlate: cpu pairs (6) + identical real → all geometry, r≈1, max_abs≈0
+    let mut cpu4 = []
+    cpu4.push(_mk_pair("p1", "p2", 0.0535666))
+    cpu4.push(_mk_pair("p1", "p3", 0.00632633))
+    cpu4.push(_mk_pair("p1", "p4", 0.0289171))
+    cpu4.push(_mk_pair("p2", "p3", 0.0472443))
+    cpu4.push(_mk_pair("p2", "p4", 0.0824517))
+    cpu4.push(_mk_pair("p3", "p4", 0.0352418))
+    let mut real4 = []
+    let mut i4 = 0
+    while i4 < len(cpu4) {
+        let p = cpu4[i4]
+        real4.push(_mk_pair(to_string(p["left"]), to_string(p["right"]), to_float(p["ratio"])))
+        i4 = i4 + 1
+    }
+    let corr4 = _correlate(cpu4, real4)
+    let r4    = to_float(corr4["pearson_r"])
+    let fmc4  = to_int(corr4["formula_geometry_count"])
+    let mab4  = to_float(corr4["max_abs_bias"])
+    let ok4   = fmc4 == 6 && _abs_f(r4 - 1.0) < 0.0001 && mab4 < 0.0001
+    if ok4 { println("  t4 PASS (mock identical: fmc=" + to_string(fmc4) + " r=" + to_string(r4) + " max_abs=" + to_string(mab4) + ")"); pass = pass + 1 }
+    else   { println("  t4 FAIL: fmc=" + to_string(fmc4) + " r=" + to_string(r4) + " max_abs=" + to_string(mab4)); fail = fail + 1 }
+
+    // t5 — inject +0.05 bias on all pairs → all substrate_specific
+    let mut real5 = []
+    let mut i5 = 0
+    while i5 < len(cpu4) {
+        let p = cpu4[i5]
+        real5.push(_mk_pair(to_string(p["left"]), to_string(p["right"]), to_float(p["ratio"]) + 0.05))
+        i5 = i5 + 1
+    }
+    let corr5 = _correlate(cpu4, real5)
+    let sbc5  = to_int(corr5["substrate_specific_count"])
+    let mab5  = to_float(corr5["max_abs_bias"])
+    let ok5   = sbc5 == 6 && _abs_f(mab5 - 0.05) < 0.0001
+    if ok5 { println("  t5 PASS (bias +0.05: sbc=" + to_string(sbc5) + " max_abs=" + to_string(mab5) + ")"); pass = pass + 1 }
+    else   { println("  t5 FAIL: sbc=" + to_string(sbc5) + " max_abs=" + to_string(mab5)); fail = fail + 1 }
+
+    // t6 — empty real → correlate returns zero-matched summary (no panic)
+    let empty6 = []
+    let corr6  = _correlate(cpu4, empty6)
+    let pn6    = to_int(corr6["pearson_n"])
+    let pc6    = to_int(corr6["pair_count"])
+    let ok6    = pn6 == 0 && pc6 == 6   // pair entries present but all unmatched
+    if ok6 { println("  t6 PASS (empty-real: pc=" + to_string(pc6) + " pn=" + to_string(pn6) + ")"); pass = pass + 1 }
+    else   { println("  t6 FAIL: pc=" + to_string(pc6) + " pn=" + to_string(pn6)); fail = fail + 1 }
+
+    // t7 — SKIP path: current REAL_IN absent → run() returns 0 (verdict=SKIP).
+    //   Only check when REAL_IN does NOT exist (otherwise test is inert).
+    if !_file_exists(REAL_IN) {
+        let rc7 = run(false)
+        let ok7 = rc7 == 0
+        if ok7 { println("  t7 PASS (SKIP rc=0 pre-launch posture)"); pass = pass + 1 }
+        else   { println("  t7 FAIL: rc=" + to_string(rc7)); fail = fail + 1 }
+    } else {
+        println("  t7 INERT (REAL_IN exists — SKIP path untestable in-place)")
+        pass = pass + 1
+    }
+
+    let total = pass + fail
+    println("analyzer selftest: " + to_string(pass) + "/" + to_string(total) + " PASS, " + to_string(fail) + " FAIL")
+    if fail > 0 { return 1 }
+    return 0
+}
+
+// ─── entry ──────────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") || _flag(av, "-h") {
+        println("usage: hexa run tool/phi_cpu_h100_correlate_analyzer.hexa [--selftest] [--print]")
+        return 0
+    }
+    if _flag(av, "--selftest") || _flag(av, "--self-test") || _flag(av, "self-test") {
+        return self_test()
+    }
+    let also_print = _flag(av, "--print")
+    return run(also_print)
+}

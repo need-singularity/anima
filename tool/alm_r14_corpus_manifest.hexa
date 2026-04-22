@@ -1,0 +1,350 @@
+// ════════════════════════════════════════════════════════════════════════════
+// tool/alm_r14_corpus_manifest.hexa — ALM r14 corpus shard manifest emitter
+//
+// PURPOSE
+//   Emit the frozen r14 shard layout (tier1/tier2/tier3 × p1/p2/p3/p4) as a
+//   single machine-readable manifest JSON. Upstream tools (audit, pre-launch
+//   dry-run, handoff) consume this as the canonical shard description.
+//
+//   This tool does NOT generate corpus lines. It only writes the shard plan
+//   plus the r13 preserve probe (sha256 + mtime of
+//   experiments/alm_r13/corpus_alm_r13_v1.jsonl) so any r14 tooling can
+//   mechanically verify r13 was not touched.
+//
+// INPUT
+//   docs/alm_r14_design_v2_20260422.md    (design SSOT, §4.3 shard matrix)
+//   experiments/alm_r13/corpus_alm_r13_v1.jsonl  (preserve probe source)
+//
+// OUTPUT
+//   state/alm_r14_corpus_manifest.json
+//
+// SELFTEST
+//   S1 design_doc_exists
+//   S2 manifest_written (file on disk after run)
+//   S3 shard_count_eq_12_plus_4           (12 paired tier1+tier2 + 4 tier3)
+//   S4 total_lines_eq_1600                (sum of per-shard line target)
+//   S5 weighted_ko_ratio_ge_0_30          (weighted KO ratio over all shards)
+//   S6 r13_preserve_probe_captured        (sha256 non-empty + mtime non-zero)
+//   S7 r13_preserve_probe_stable          (sha256 at start == sha256 at end)
+//
+// RULES
+//   raw#9  hexa-only (no python)
+//   raw#11 snake_case
+//   raw#12 empirical: r13 probe uses real shasum + stat calls
+//   raw#15 no-hardcode where possible (shard matrix is declarative table)
+//   deterministic · idempotent · no external API · NO corpus line generation
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT  = "/Users/ghost/core/anima"
+let OUT_PATH    = "/Users/ghost/core/anima/state/alm_r14_corpus_manifest.json"
+let DESIGN_DOC  = "/Users/ghost/core/anima/docs/alm_r14_design_v2_20260422.md"
+let R13_CORPUS  = "/Users/ghost/core/anima/experiments/alm_r13/corpus_alm_r13_v1.jsonl"
+
+// ─── helpers ─────────────────────────────────────────────────────────────
+
+fn _str(x) {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return to_string(x)
+}
+
+fn _sh_quote(s) {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn fexists(p) {
+    return _str(exec("test -f " + _sh_quote(p) + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn dexists(p) {
+    return _str(exec("test -d " + _sh_quote(p) + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn ensure_dir(d) {
+    if !dexists(d) { exec("mkdir -p " + _sh_quote(d)) }
+}
+
+fn now_utc() {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn sha256_file(p) {
+    if !fexists(p) { return "" }
+    return _str(exec("shasum -a 256 " + _sh_quote(p) + " | awk '{print $1}'")).trim()
+}
+
+fn mtime_file(p) {
+    if !fexists(p) { return "0" }
+    return _str(exec("stat -f %m " + _sh_quote(p))).trim()
+}
+
+fn bytes_file(p) {
+    if !fexists(p) { return "0" }
+    return _str(exec("wc -c < " + _sh_quote(p))).trim()
+}
+
+fn atomic_write(path, body) {
+    let pid = _str(exec("printf %s $$")).trim()
+    let tmp = path + ".tmp." + pid
+    write_file(tmp, body)
+    exec("mv -f " + _sh_quote(tmp) + " " + _sh_quote(path))
+}
+
+fn json_escape(s) {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+// ─── shard matrix (declarative; mirrors docs §4.3 verbatim) ──────────────
+//
+// Each shard tuple (in order):
+//   shard_id | tier | path | lines | ko_ratio | density_tier | kernel_tag
+
+fn shard_table() {
+    let mut t = []
+    // tier1 — r13 carry-forward EN baseline
+    t = t.push(["p1_t1_qwen3_base",      "tier1", "p1", 180, 0.03, 0.30, "r13_carry_forward"])
+    t = t.push(["p2_t1_llama31_base",    "tier1", "p2", 180, 0.03, 0.50, "r13_carry_forward"])
+    t = t.push(["p3_t1_ministral3",      "tier1", "p3", 180, 0.03, 0.50, "r13_carry_forward_plus_p3_spice"])
+    t = t.push(["p4_t1_gemma4_base",     "tier1", "p4", 180, 0.03, 0.70, "r13_carry_forward_plus_p4_sentinels"])
+    // tier2 — bilingual kernel (k4/k5/k6)
+    t = t.push(["p1_t2_bilingual",       "tier2", "p1", 200, 0.50, 0.85, "seed_b_k4_k5_k6_x_p1"])
+    t = t.push(["p2_t2_bilingual",       "tier2", "p2", 200, 0.50, 0.85, "seed_b_k4_k5_k6_x_p2"])
+    t = t.push(["p3_t2_bilingual",       "tier2", "p3", 200, 0.50, 0.85, "seed_b_k4_k5_k6_x_p3"])
+    t = t.push(["p4_t2_bilingual",       "tier2", "p4", 200, 0.50, 0.85, "seed_b_k4_k5_k6_x_p4"])
+    // tier3 — adversarial KO (k7, unpaired KO-only)
+    t = t.push(["p1_t3_adversarial_ko",  "tier3", "p1",  20, 1.00, 0.60, "seed_b_k7_x_p1"])
+    t = t.push(["p2_t3_adversarial_ko",  "tier3", "p2",  20, 1.00, 0.60, "seed_b_k7_x_p2"])
+    t = t.push(["p3_t3_adversarial_ko",  "tier3", "p3",  20, 1.00, 0.60, "seed_b_k7_x_p3"])
+    t = t.push(["p4_t3_adversarial_ko",  "tier3", "p4",  20, 1.00, 0.60, "seed_b_k7_x_p4"])
+    return t
+}
+
+fn total_lines(t) {
+    let mut s = 0
+    let mut i = 0
+    while i < len(t) {
+        s = s + t[i][3]
+        i = i + 1
+    }
+    return s
+}
+
+fn weighted_ko_ratio(t) {
+    let mut acc = 0.0
+    let mut tot = 0
+    let mut i = 0
+    while i < len(t) {
+        let lines = t[i][3]
+        let r = t[i][4]
+        acc = acc + to_float(lines) * r
+        tot = tot + lines
+        i = i + 1
+    }
+    if tot == 0 { return 0.0 }
+    return acc / to_float(tot)
+}
+
+fn count_by_tier(t, tier) {
+    let mut c = 0
+    let mut i = 0
+    while i < len(t) {
+        if t[i][1] == tier { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── JSON emission ───────────────────────────────────────────────────────
+
+fn shard_to_json(row) {
+    let mut o = "    {"
+    o = o + "\"shard_id\":\"" + json_escape(row[0]) + "\","
+    o = o + "\"tier\":\""     + json_escape(row[1]) + "\","
+    o = o + "\"path\":\""     + json_escape(row[2]) + "\","
+    o = o + "\"lines\":"      + str(row[3]) + ","
+    o = o + "\"ko_ratio_target\":" + str(row[4]) + ","
+    o = o + "\"density_tier\":"    + str(row[5]) + ","
+    o = o + "\"kernel_tag\":\""    + json_escape(row[6]) + "\""
+    o = o + "}"
+    return o
+}
+
+fn emit_manifest(pre_sha, pre_mtime, pre_bytes, post_sha) {
+    let t = shard_table()
+    let ts = now_utc()
+    let n_total = total_lines(t)
+    let wr = weighted_ko_ratio(t)
+    let n_tier1 = count_by_tier(t, "tier1")
+    let n_tier2 = count_by_tier(t, "tier2")
+    let n_tier3 = count_by_tier(t, "tier3")
+
+    let mut body = "{\n"
+    body = body + "  \"schema_version\":\"alm_r14_corpus_manifest/1\",\n"
+    body = body + "  \"ts_utc\":\""      + json_escape(ts) + "\",\n"
+    body = body + "  \"source_doc\":\""  + json_escape(DESIGN_DOC) + "\",\n"
+    body = body + "  \"ssot_note\":\"docs/upstream_notes/b_axis_post_h100_mk_xii_r14_paper_20260422.md §B.2\",\n"
+    body = body + "  \"roadmap_entry\":\"#86\",\n"
+    body = body + "  \"r13_preserve_probe\":{\n"
+    body = body + "    \"path\":\""     + json_escape(R13_CORPUS) + "\",\n"
+    body = body + "    \"sha256_pre\":\""  + json_escape(pre_sha)  + "\",\n"
+    body = body + "    \"sha256_post\":\"" + json_escape(post_sha) + "\",\n"
+    body = body + "    \"stable\":"     + (if pre_sha == post_sha && pre_sha.len() > 0 { "true" } else { "false" }) + ",\n"
+    body = body + "    \"mtime\":"      + json_escape(pre_mtime) + ",\n"
+    body = body + "    \"bytes\":"      + json_escape(pre_bytes) + "\n"
+    body = body + "  },\n"
+    body = body + "  \"totals\":{\n"
+    body = body + "    \"shard_count\":"           + str(len(t)) + ",\n"
+    body = body + "    \"tier1_shard_count\":"     + str(n_tier1) + ",\n"
+    body = body + "    \"tier2_shard_count\":"     + str(n_tier2) + ",\n"
+    body = body + "    \"tier3_shard_count\":"     + str(n_tier3) + ",\n"
+    body = body + "    \"total_lines\":"           + str(n_total) + ",\n"
+    body = body + "    \"weighted_ko_ratio\":"     + str(wr) + "\n"
+    body = body + "  },\n"
+    body = body + "  \"gate_targets\":{\n"
+    body = body + "    \"g1_line_count_min\":1200,\n"
+    body = body + "    \"g3a_density_keyword_min\":0.85,\n"
+    body = body + "    \"g3b_density_semantic_min\":0.40,\n"
+    body = body + "    \"g4_anti_denial_max\":0,\n"
+    body = body + "    \"g8_korean_ratio_min\":0.27,\n"
+    body = body + "    \"g8_korean_ratio_tight\":0.30,\n"
+    body = body + "    \"g8b_pair_match_min\":0.98,\n"
+    body = body + "    \"g8b_pair_diff_abs_max\":2\n"
+    body = body + "  },\n"
+    body = body + "  \"shards\":[\n"
+    let mut i = 0
+    while i < len(t) {
+        body = body + shard_to_json(t[i])
+        if i < len(t) - 1 { body = body + "," }
+        body = body + "\n"
+        i = i + 1
+    }
+    body = body + "  ],\n"
+    body = body + "  \"notes\":[\n"
+    body = body + "    \"tier1 = r13 carry-forward EN baseline (density-graded 30/50/70)\",\n"
+    body = body + "    \"tier2 = bilingual seed_b k4/k5/k6 (ko_ratio 0.50 by pair design)\",\n"
+    body = body + "    \"tier3 = adversarial KO seed_b_k7 (unpaired, refusal-resilience)\",\n"
+    body = body + "    \"r13 corpus MUST NOT be modified; pre/post sha256 stability is selftest S7\",\n"
+    body = body + "    \"actual shard line generation is external session per SSOT B.2 outside-anima\"\n"
+    body = body + "  ]\n"
+    body = body + "}\n"
+    atomic_write(OUT_PATH, body)
+}
+
+// ─── selftest ────────────────────────────────────────────────────────────
+
+fn selftest(pre_sha, post_sha) {
+    println("── alm_r14_corpus_manifest selftest ──")
+    let mut pass = 0
+    let mut fail = 0
+
+    // S1 design doc exists
+    if fexists(DESIGN_DOC) {
+        println("  S1 design_doc_exists               : PASS  (" + DESIGN_DOC + ")")
+        pass = pass + 1
+    } else {
+        println("  S1 design_doc_exists               : FAIL  (missing " + DESIGN_DOC + ")")
+        fail = fail + 1
+    }
+
+    // S2 manifest written
+    if fexists(OUT_PATH) {
+        println("  S2 manifest_written                : PASS  (" + OUT_PATH + ")")
+        pass = pass + 1
+    } else {
+        println("  S2 manifest_written                : FAIL")
+        fail = fail + 1
+    }
+
+    // S3 shard count (12 paired + 4 tier3 = actually 4+4+4=12 total but target is 12 rows)
+    let t = shard_table()
+    let n = len(t)
+    // expected: 4 tier1 + 4 tier2 + 4 tier3 = 12 rows
+    if n == 12 {
+        println("  S3 shard_count_eq_12               : PASS  (n=" + str(n) + ")")
+        pass = pass + 1
+    } else {
+        println("  S3 shard_count_eq_12               : FAIL  (n=" + str(n) + ")")
+        fail = fail + 1
+    }
+
+    // S4 total lines == 1600
+    let n_total = total_lines(t)
+    if n_total == 1600 {
+        println("  S4 total_lines_eq_1600             : PASS  (n=" + str(n_total) + ")")
+        pass = pass + 1
+    } else {
+        println("  S4 total_lines_eq_1600             : FAIL  (n=" + str(n_total) + ")")
+        fail = fail + 1
+    }
+
+    // S5 weighted KO ratio >= 0.30
+    let wr = weighted_ko_ratio(t)
+    if wr >= 0.30 {
+        println("  S5 weighted_ko_ratio_ge_0_30       : PASS  (wr=" + str(wr) + ")")
+        pass = pass + 1
+    } else {
+        println("  S5 weighted_ko_ratio_ge_0_30       : FAIL  (wr=" + str(wr) + ")")
+        fail = fail + 1
+    }
+
+    // S6 r13 preserve probe captured
+    if pre_sha.len() > 0 {
+        println("  S6 r13_preserve_probe_captured     : PASS  (sha=" + pre_sha + ")")
+        pass = pass + 1
+    } else {
+        println("  S6 r13_preserve_probe_captured     : FAIL  (sha empty; r13 corpus missing?)")
+        fail = fail + 1
+    }
+
+    // S7 pre == post
+    if pre_sha.len() > 0 && pre_sha == post_sha {
+        println("  S7 r13_preserve_probe_stable       : PASS")
+        pass = pass + 1
+    } else {
+        println("  S7 r13_preserve_probe_stable       : FAIL  (pre=" + pre_sha + " post=" + post_sha + ")")
+        fail = fail + 1
+    }
+
+    println("selftest: " + str(pass) + "/" + str(pass + fail) + " PASS")
+    if fail > 0 { return 1 }
+    return 0
+}
+
+// ─── main ────────────────────────────────────────────────────────────────
+
+fn main() {
+    println("[alm_r14_corpus_manifest] emitting shard layout manifest → " + OUT_PATH)
+    println("  source_doc: " + DESIGN_DOC)
+    println("  ts: " + now_utc())
+    ensure_dir("/Users/ghost/core/anima/state")
+
+    // r13 preserve probe: capture sha256 BEFORE any work
+    let pre_sha   = sha256_file(R13_CORPUS)
+    let pre_mtime = mtime_file(R13_CORPUS)
+    let pre_bytes = bytes_file(R13_CORPUS)
+    println("  r13 preserve probe PRE:  sha=" + pre_sha + " mtime=" + pre_mtime + " bytes=" + pre_bytes)
+
+    // emit manifest
+    emit_manifest(pre_sha, pre_mtime, pre_bytes, pre_sha)
+
+    // r13 preserve probe: capture sha256 AFTER
+    let post_sha = sha256_file(R13_CORPUS)
+    println("  r13 preserve probe POST: sha=" + post_sha)
+
+    // re-emit with both pre and post (first emission wrote pre twice; now update with real post)
+    emit_manifest(pre_sha, pre_mtime, pre_bytes, post_sha)
+
+    let code = selftest(pre_sha, post_sha)
+    if code == 0 {
+        println("[alm_r14_corpus_manifest] DONE — manifest frozen, r13 preserve verified")
+        println("  NOTE: actual shard line generation is external session (SSOT B.2 outside-anima)")
+    } else {
+        println("[alm_r14_corpus_manifest] FAILED selftest")
+    }
+    exit(code)
+}
+
+main()

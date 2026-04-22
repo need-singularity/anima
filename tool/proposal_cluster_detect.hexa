@@ -401,10 +401,19 @@ fn render_cluster_json(cluster_id: string, slug: string, signal_kind: string,
 
 // Append cluster stub to inventory.json. If inventory missing, create a
 // minimal one. Format: { "schema":"anima.proposal_inventory.v1",
-//                        "entries":[ ... ] }
+//                        "entries":[ ... ],
+//                        "proposals":[ ... preserved from existing file ... ] }
+//
+// SCHEMA COEXISTENCE (option C, 2026-04-22):
+//   inventory.json carries BOTH "entries" (cluster meta — this tool's domain)
+//   and "proposals" (per-card dedup/seq — P2 emit's domain). When rewriting
+//   we MUST preserve the "proposals" array so P2/P4 state is not clobbered.
+//   Ditto any "summary" / "seq_today" / "created_at" fields that sibling
+//   tools maintain. We use a raw passthrough embedding of those as JSON.
 fn append_to_inventory(cluster_id: string, slug: string, signal_kind: string,
                        signal_key: string, members: array) {
     let mut entries = []
+    let mut preserved_raw = ""   // serialized "proposals"/"summary"/… tail
     if _is_file(INVENTORY) {
         let raw = read_file(INVENTORY).trim()
         if len(raw) > 0 {
@@ -412,6 +421,20 @@ fn append_to_inventory(cluster_id: string, slug: string, signal_kind: string,
             if doc.contains_key("entries") {
                 let e = doc["entries"]
                 if type_of(e) == "array" { entries = e }
+            }
+            // Preserve every non-{schema,updated_ts,updated_at,entries} key
+            // as a JSON fragment appended after the entries array. This
+            // keeps "proposals", "summary", "seq_today", "created_at", etc.
+            // intact so P2 emit / P4 tools retain their state across a
+            // cluster_detect rewrite.
+            let keys = doc.keys()
+            let mut ki = 0
+            while ki < len(keys) {
+                let k = to_string(keys[ki])
+                if k != "schema" && k != "updated_ts" && k != "updated_at" && k != "entries" {
+                    preserved_raw = preserved_raw + ",\n  \"" + _json_escape(k) + "\": " + json_stringify(doc[k])
+                }
+                ki = ki + 1
             }
         }
     } else {
@@ -450,7 +473,8 @@ fn append_to_inventory(cluster_id: string, slug: string, signal_kind: string,
         j = j + 1
     }
     body = body + "  " + stub + "\n"
-    body = body + "  ]\n"
+    body = body + "  ]"
+    body = body + preserved_raw + "\n"
     body = body + "}\n"
     write_file(INVENTORY, body)
 }
