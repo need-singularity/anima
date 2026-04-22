@@ -1,0 +1,208 @@
+<!-- AUTO-GENERATED, DO NOT EDIT — source: tool/api_surface_extract.hexa -->
+<!-- generated: 2026-04-22T16:42:48Z -->
+<!-- source: tool/drill_lens_aggregator.hexa -->
+<!-- entry_count: 38 -->
+
+# `tool/drill_lens_aggregator.hexa` API surface
+
+_AUTO-GENERATED, DO NOT EDIT — generated 2026-04-22T16:42:48Z UTC._
+
+**Tool:** � ζ 5-module lens aggregator
+
+**Public/Internal entries:** 38
+
+## Table of contents
+
+- `fn verdict_primary`
+- `fn verdict_secondary`
+- `fn verdict_score`
+- `fn make_verdict`
+- `fn drill_state`
+- `fn drill_abs_rate`
+- `fn drill_sat_score`
+- `fn drill_depth`
+- `fn drill_missing`
+- `fn drill_per_module`
+- `fn pm_missing`
+- `fn pm_abs`
+- `fn pm_sat`
+- `fn clamp01`
+- `fn abs_spread`
+- `fn abs_mean`
+- `fn asymmetric_spike`
+- `fn sat_spread`
+- `fn sat_all_above`
+- `fn majority_below`
+- `fn missing_count`
+- `fn mean_sat`
+- `fn min_sat`
+- `fn entropy_proxy`
+- `fn lens_blowup`
+- `fn lens_closure`
+- `fn lens_gap`
+- `fn lens_phi`
+- `fn lens_self_ref`
+- `fn agg_names`
+- `fn agg_verdicts`
+- `fn agg_consensus`
+- `fn agg_avg`
+- `fn agg_agreement`
+- `fn agg_verdict`
+- `fn is_good_primary`
+- `fn aggregate`
+- `fn main`
+
+## Entries
+
+### `fn verdict_primary(v: array) -> string`
+
+_(no docstring)_
+
+### `fn verdict_secondary(v: array) -> string`
+
+_(no docstring)_
+
+### `fn verdict_score(v: array) -> float`
+
+_(no docstring)_
+
+### `fn make_verdict(primary: string, secondary: string, score: float) -> array`
+
+_(no docstring)_
+
+### `fn drill_state(d: array) -> string`
+
+_(no docstring)_
+
+### `fn drill_abs_rate(d: array) -> float`
+
+_(no docstring)_
+
+### `fn drill_sat_score(d: array) -> float`
+
+_(no docstring)_
+
+### `fn drill_depth(d: array) -> int`
+
+_(no docstring)_
+
+### `fn drill_missing(d: array) -> int`
+
+_(no docstring)_
+
+### `fn drill_per_module(d: array) -> array`
+
+_(no docstring)_
+
+### `fn pm_missing(m: array) -> bool`
+
+_(no docstring)_
+
+### `fn pm_abs(m: array) -> float`
+
+_(no docstring)_
+
+### `fn pm_sat(m: array) -> float`
+
+_(no docstring)_
+
+### `fn clamp01(x: float) -> float`
+
+_(no docstring)_
+
+### `fn abs_spread(per_mod: array) -> float`
+
+_(no docstring)_
+
+### `fn abs_mean(per_mod: array) -> float`
+
+_(no docstring)_
+
+### `fn asymmetric_spike(per_mod: array) -> bool`
+
+_(no docstring)_
+
+### `fn sat_spread(per_mod: array) -> float`
+
+_(no docstring)_
+
+### `fn sat_all_above(per_mod: array, thr: float) -> bool`
+
+_(no docstring)_
+
+### `fn majority_below(per_mod: array, thr: float) -> bool`
+
+_(no docstring)_
+
+### `fn missing_count(per_mod: array) -> int`
+
+_(no docstring)_
+
+### `fn mean_sat(per_mod: array) -> float`
+
+_(no docstring)_
+
+### `fn min_sat(per_mod: array) -> float`
+
+_(no docstring)_
+
+### `fn entropy_proxy(per_mod: array) -> float`
+
+_(no docstring)_
+
+### `fn lens_blowup(input: array) -> array`
+
+_(no docstring)_
+
+### `fn lens_closure(input: array) -> array`
+
+_(no docstring)_
+
+### `fn lens_gap(input: array) -> array`
+
+_(no docstring)_
+
+### `fn lens_phi(input: array) -> array`
+
+_(no docstring)_
+
+### `fn lens_self_ref(input: array) -> array`
+
+_(no docstring)_
+
+### `fn agg_names(a: array) -> array`
+
+_(no docstring)_
+
+### `fn agg_verdicts(a: array) -> array`
+
+_(no docstring)_
+
+### `fn agg_consensus(a: array) -> string`
+
+_(no docstring)_
+
+### `fn agg_avg(a: array) -> float`
+
+_(no docstring)_
+
+### `fn agg_agreement(a: array) -> float`
+
+_(no docstring)_
+
+### `fn agg_verdict(a: array) -> string`
+
+_(no docstring)_
+
+### `fn is_good_primary(p: string) -> bool`
+
+_(no docstring)_
+
+### `fn aggregate(input: array) -> array`
+
+_(no docstring)_
+
+### `fn main()`
+
+_(no docstring)_
+

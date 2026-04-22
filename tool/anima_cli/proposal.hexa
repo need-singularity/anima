@@ -14,6 +14,9 @@
 //    dashboard
 //    cluster   (detect → consolidate)
 //    cycle     (one auto-threshold + conflict-detect loop)
+//    lineage   [<id>] [--depth N] [--json]  (wraps tool/proposal_lineage_graph.hexa)
+//    diff-cycles [--cycle-a <id> --cycle-b <id>] [--json]
+//                                           (wraps tool/proposal_cycle_diff.hexa)
 //    --selftest  --help
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -90,6 +93,8 @@ fn sub_help() {
     println("  dashboard       aggregate inventory dashboard")
     println("  cluster         detect + consolidate duplicates")
     println("  cycle           auto-threshold tick + conflict scan")
+    println("  lineage [<id>] [--depth N] [--json]   mermaid lineage graph + count summary")
+    println("  diff-cycles [--cycle-a <id> --cycle-b <id>] [--json]   AA3 2-cycle delta")
     println("")
     println("  --selftest  --help")
 }
@@ -166,6 +171,64 @@ fn sub_cycle() {
     _pipe_hexa(root + "/tool/proposal_conflict_detect.hexa", "")
 }
 
+fn sub_lineage(argv, start_idx: int) {
+    // wrap tool/proposal_lineage_graph.hexa — additive, no modification of wrapped tool.
+    //   anima proposal lineage                  → full graph
+    //   anima proposal lineage <id>             → --id <id> (ancestor + descendant focus)
+    //   anima proposal lineage --depth N        → passthrough hint (wrapped tool ignores unknown)
+    //   anima proposal lineage --json           → also dump SMOKE_OUT json tail
+    let root = _resolve_root()
+    let tool = root + "/tool/proposal_lineage_graph.hexa"
+    let smoke = root + "/state/proposal_lineage_graph_result.json"
+
+    // collect tail args; if first positional is a bare id (no leading '-'), map → --id
+    let mut tail = ""
+    let mut want_json = false
+    let mut i = start_idx
+    let mut id_injected = false
+    while i < len(argv) {
+        let a = _str(argv[i])
+        if a == "--json" {
+            want_json = true
+        } else if a == "--depth" && i + 1 < len(argv) {
+            // passthrough (wrapped tool treats unknown flags transparently)
+            if tail != "" { tail = tail + " " }
+            tail = tail + "--depth " + _str(argv[i + 1])
+            i = i + 1
+        } else if a == "--id" && i + 1 < len(argv) {
+            if tail != "" { tail = tail + " " }
+            tail = tail + "--id " + _str(argv[i + 1])
+            id_injected = true
+            i = i + 1
+        } else if !a.starts_with("-") && !id_injected {
+            // positional <id>
+            if tail != "" { tail = tail + " " }
+            tail = tail + "--id " + a
+            id_injected = true
+        } else {
+            if tail != "" { tail = tail + " " }
+            tail = tail + a
+        }
+        i = i + 1
+    }
+
+    _pipe_hexa(tool, tail)
+
+    if want_json && _fexists(smoke) {
+        println("── lineage --json (" + smoke + ") ──")
+        println(_str(exec("cat " + smoke)))
+    }
+}
+
+fn sub_diff_cycles(tail: string) {
+    // wrap tool/proposal_cycle_diff.hexa — additive, no modification of wrapped tool.
+    //   anima proposal diff-cycles                             → auto (last two)
+    //   anima proposal diff-cycles --cycle-a A --cycle-b B     → explicit pair
+    //   anima proposal diff-cycles --json                      → include json tail
+    let root = _resolve_root()
+    _pipe_hexa(root + "/tool/proposal_cycle_diff.hexa", tail)
+}
+
 fn sub_selftest() {
     let root = _resolve_root()
     if root == "" { println("FAIL anima_cli/proposal selftest"); exit(1) }
@@ -173,7 +236,9 @@ fn sub_selftest() {
     let ok = _fexists(root + "/tool/proposal_review.hexa")
              && _fexists(root + "/tool/proposal_approve.hexa")
              && _fexists(root + "/tool/proposal_dashboard.hexa")
-    if ok { println("PASS anima_cli/proposal selftest"); exit(0) }
+             && _fexists(root + "/tool/proposal_lineage_graph.hexa")
+             && _fexists(root + "/tool/proposal_cycle_diff.hexa")
+    if ok { println("PASS anima_cli/proposal selftest (review+approve+dashboard+lineage+diff-cycles wraps present)"); exit(0) }
     println("FAIL anima_cli/proposal selftest (wrapped tools missing)")
     exit(1)
 }
@@ -203,6 +268,8 @@ fn main() {
     if sub == "dashboard" { sub_dashboard(); return }
     if sub == "cluster"   { sub_cluster(); return }
     if sub == "cycle"     { sub_cycle(); return }
+    if sub == "lineage"   { sub_lineage(argv, 1); return }
+    if sub == "diff-cycles" { sub_diff_cycles(_forward_rest(argv, 1)); return }
     println("proposal: unknown subcmd '" + sub + "'")
     sub_help()
     exit(2)

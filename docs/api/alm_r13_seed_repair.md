@@ -1,11 +1,11 @@
 <!-- AUTO-GENERATED, DO NOT EDIT — source: tool/api_surface_extract.hexa -->
-<!-- generated: 2026-04-22T12:40:18Z -->
+<!-- generated: 2026-04-22T16:42:48Z -->
 <!-- source: tool/alm_r13_seed_repair.hexa -->
 <!-- entry_count: 13 -->
 
 # `tool/alm_r13_seed_repair.hexa` API surface
 
-_AUTO-GENERATED, DO NOT EDIT — generated 2026-04-22T12:40:18Z UTC._
+_AUTO-GENERATED, DO NOT EDIT — generated 2026-04-22T16:42:48Z UTC._
 
 **Tool:** � G5 terminator repair + G2 category cap
 

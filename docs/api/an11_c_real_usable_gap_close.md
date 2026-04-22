@@ -1,11 +1,11 @@
 <!-- AUTO-GENERATED, DO NOT EDIT — source: tool/api_surface_extract.hexa -->
-<!-- generated: 2026-04-22T12:40:18Z -->
+<!-- generated: 2026-04-22T16:42:48Z -->
 <!-- source: tool/an11_c_real_usable_gap_close.hexa -->
 <!-- entry_count: 20 -->
 
 # `tool/an11_c_real_usable_gap_close.hexa` API surface
 
-_AUTO-GENERATED, DO NOT EDIT — generated 2026-04-22T12:40:18Z UTC._
+_AUTO-GENERATED, DO NOT EDIT — generated 2026-04-22T16:42:48Z UTC._
 
 **Tool:** � AN11(c) real_usable gap-close:
 

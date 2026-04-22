@@ -1,0 +1,488 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_cli/doctor.hexa — anima CLI `doctor` topic (self-diagnose)
+//
+//  PURPOSE
+//    Run a 10-check read-only self-diagnose across binaries, creds, remotes,
+//    auth, repo sanity, sandbox env, recent cert_gate runs, and proposal
+//    stack health. Prints a human-readable table and persists a structured
+//    result to state/anima_doctor_result.json for downstream tooling.
+//
+//  INVOCATION
+//    anima doctor            run all 10 checks (no subcmd)
+//    anima doctor --selftest synthetic bad-path resilience test
+//    anima doctor --help
+//    anima doctor --json     emit raw JSON verdict (skip table render)
+//
+//  DESIGN
+//    raw#9  hexa-only (no .py anywhere in this tool)
+//    raw#11 snake_case
+//    raw#15 no-hardcode via _resolve_root()
+//    idempotent, graceful fail — every probe captured, never aborts early.
+//
+//  OUTPUT SCHEMA
+//    state/anima_doctor_result.json:
+//      { "schema":"anima.doctor.v1", "ts":"...", "verdict":"ok|warn|fail",
+//        "counts":{"ok":N,"warn":N,"fail":N},
+//        "checks":[{"id":1,"name":"...","status":"ok|warn|fail","detail":"..."}, ...] }
+// ════════════════════════════════════════════════════════════════════════════
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    if t == "int" || t == "float" || t == "number" { return str(x) }
+    return ""
+}
+
+fn _fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _dexists(p: string) -> bool {
+    return _str(exec("test -d " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _xexists(p: string) -> bool {
+    return _str(exec("test -x " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    return _str(env("HOME")) + "/core/anima"
+}
+
+fn _ts_iso() -> string {
+    let rep = _str(env("HEXA_REPRODUCIBLE"))
+    if rep == "1" { return "REDACTED" }
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _user_argv(raw) -> array {
+    let out = []
+    let i = 0
+    while i < len(raw) {
+        let s = _str(raw[i])
+        if !s.contains("/.hexa-cache/") {
+            out = out + [s]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _home() -> string { return _str(env("HOME")) }
+
+fn _glyph(status: string) -> string {
+    if status == "ok"   { return "✓" }
+    if status == "warn" { return "⚠" }
+    return "✗"
+}
+
+// ─── individual checks ─────────────────────────────────────────────────────
+
+fn check_binaries() -> array {
+    // [status, detail]
+    let paths = [
+        "/Users/ghost/.hx/bin/hexa",
+        "/opt/homebrew/bin/runpodctl",
+        "/opt/homebrew/bin/hf",
+        "/opt/homebrew/bin/rclone"
+    ]
+    let missing = []
+    let i = 0
+    while i < len(paths) {
+        let p = _str(paths[i])
+        if !_xexists(p) { missing = missing + [p] }
+        i = i + 1
+    }
+    if len(missing) == 0 {
+        return ["ok", "4/4 binaries present"]
+    }
+    let d = _str(len(missing)) + "/4 missing: " + _str(missing[0])
+    if len(missing) > 1 { d = d + " (+more)" }
+    return ["fail", d]
+}
+
+fn check_creds() -> array {
+    let h = _home()
+    let items = [
+        h + "/.runpod/config.toml",
+        h + "/.cache/huggingface/token",
+        h + "/.config/rclone/rclone.conf"
+    ]
+    let missing = []
+    let i = 0
+    while i < len(items) {
+        let p = _str(items[i])
+        if !_fexists(p) { missing = missing + [p] }
+        i = i + 1
+    }
+    if len(missing) == 0 { return ["ok", "runpod+hf+rclone creds present"] }
+    if len(missing) == 3 { return ["fail", "all 3 creds missing"] }
+    return ["warn", _str(len(missing)) + "/3 creds missing: " + _str(missing[0])]
+}
+
+fn check_r2_remote() -> array {
+    if !_xexists("/opt/homebrew/bin/rclone") {
+        return ["warn", "rclone binary missing — skipped"]
+    }
+    let out = _str(exec("rclone listremotes 2>/dev/null"))
+    if out.contains("r2:") { return ["ok", "r2: remote configured"] }
+    return ["fail", "r2: remote not in listremotes"]
+}
+
+fn check_hf_auth() -> array {
+    if !_xexists("/opt/homebrew/bin/hf") {
+        return ["warn", "hf binary missing — skipped"]
+    }
+    let out = _str(exec("hf auth whoami 2>&1"))
+    if out.contains("Not logged in") || out.contains("not logged in") {
+        return ["fail", "hf auth: not logged in"]
+    }
+    if out.contains("error") || out.contains("Error") {
+        let first = _str(exec("hf auth whoami 2>&1 | head -n1")).trim()
+        return ["warn", "hf auth probe inconclusive: " + first]
+    }
+    // strip ANSI + leading "user:" label
+    let who = _str(exec("hf auth whoami 2>/dev/null | head -n1 | sed 's/\\x1b\\[[0-9;]*m//g; s/^[Uu]ser:[[:space:]]*//'")).trim()
+    if who == "" { return ["warn", "hf auth: empty response"] }
+    return ["ok", "hf user=" + who]
+}
+
+fn check_runpodctl_auth() -> array {
+    if !_xexists("/opt/homebrew/bin/runpodctl") {
+        return ["warn", "runpodctl binary missing — skipped"]
+    }
+    // runpodctl has no `user` subcommand in some releases; fall back to a
+    // read-only probe (list pods) and map exit=0 → ok.
+    let rc = _str(exec("runpodctl get pod >/dev/null 2>&1 && echo 0 || echo 1")).trim()
+    if rc == "0" { return ["ok", "runpodctl get pod: 200 OK"] }
+    return ["fail", "runpodctl get pod: non-zero exit"]
+}
+
+fn check_repo_sanity() -> array {
+    let root = _resolve_root()
+    let rp = root + "/state/roadmap_progress.json"
+    if !_fexists(rp) { return ["fail", "state/roadmap_progress.json missing"] }
+    let rdmap = root + "/.roadmap"
+    if !_fexists(rdmap) { return ["warn", ".roadmap file missing"] }
+    let flags = _str(exec("stat -f '%Of' " + rdmap + " 2>/dev/null")).trim()
+    // macOS flags: uchg (user immutable) bit = 0x2
+    let has_uchg = _str(exec("ls -lO " + rdmap + " 2>/dev/null | grep -q uchg && echo 1 || echo 0")).trim()
+    if has_uchg == "1" { return ["ok", "roadmap_progress.json + .roadmap uchg lock"] }
+    return ["warn", ".roadmap present but uchg flag not set"]
+}
+
+fn check_4repo_links() -> array {
+    let ws = _str(env("WS"))
+    let hl = _str(env("HEXA_LANG"))
+    let ag = _str(env("AIRGENOME"))
+    let items = [
+        ["nexus",     ws + "/nexus"],
+        ["hexa-lang", hl],
+        ["airgenome", ag],
+        ["anima",     ws + "/anima"]
+    ]
+    let missing = []
+    let i = 0
+    while i < len(items) {
+        let name = _str(items[i][0])
+        let p    = _str(items[i][1])
+        if p == "" || !_dexists(p) { missing = missing + [name] }
+        i = i + 1
+    }
+    if len(missing) == 0 { return ["ok", "4/4 repo roots linked"] }
+    if len(missing) == 4 { return ["fail", "no repo roots visible"] }
+    let d = _str(len(missing)) + "/4 missing: " + _str(missing[0])
+    if len(missing) > 1 { d = d + " (+more)" }
+    return ["warn", d]
+}
+
+fn check_sandbox_env() -> array {
+    // classify: claude-code harness / ssh / terminal
+    let cc1 = _str(env("CLAUDECODE"))
+    let cc2 = _str(env("CLAUDE_CODE_ENTRYPOINT"))
+    if cc1 == "1" || cc2 != "" {
+        let ep = cc2
+        if ep == "" { ep = "cli" }
+        return ["ok", "sandbox=claude-code harness (" + ep + ")"]
+    }
+    let ssh = _str(env("SSH_CONNECTION"))
+    if ssh != "" { return ["ok", "sandbox=ssh session"] }
+    let term = _str(env("TERM_PROGRAM"))
+    if term == "" { term = _str(env("TERM")) }
+    if term == "" { term = "unknown" }
+    return ["ok", "sandbox=terminal (" + term + ")"]
+}
+
+fn check_cert_gate_recent() -> array {
+    let root = _resolve_root()
+    let p = root + "/state/cert_gate_result.json"
+    if !_fexists(p) { return ["warn", "no cert_gate_result.json yet"] }
+    // age in seconds = now - mtime
+    let now = _str(exec("date -u +%s")).trim()
+    let mt  = _str(exec("stat -f %m " + p + " 2>/dev/null")).trim()
+    if now == "" || mt == "" { return ["warn", "mtime probe failed"] }
+    let age = _str(exec("echo $(( " + now + " - " + mt + " ))")).trim()
+    let age_n = int(age)
+    if age_n < 0 { age_n = 0 }
+    let age_min = age_n / 60
+    if age_n <= 21600 { return ["ok", "cert_gate ran " + _str(age_min) + "m ago"] }
+    return ["warn", "cert_gate last ran " + _str(age_min) + "m ago (>6h)"]
+}
+
+fn check_proposal_stack() -> array {
+    let root = _resolve_root()
+    let d = root + "/state/proposals"
+    if !_dexists(d) { return ["warn", "state/proposals/ missing"] }
+    let pend = _str(exec("ls " + d + "/pending 2>/dev/null | wc -l")).trim()
+    let appr = _str(exec("ls " + d + "/approved 2>/dev/null | wc -l")).trim()
+    let arch = _str(exec("ls " + d + "/archived 2>/dev/null | wc -l")).trim()
+    let detail = "pending=" + pend + " approved=" + appr + " archived=" + arch
+    // warn if pending is unreasonably large (>200) — tuning bound, not failure
+    if int(pend) > 200 { return ["warn", detail + " (pending>200)"] }
+    return ["ok", detail]
+}
+
+// ─── orchestrator ──────────────────────────────────────────────────────────
+
+fn run_all_checks() -> array {
+    let names = [
+        "binary paths",
+        "credential files",
+        "R2 remote",
+        "HF auth",
+        "runpodctl auth",
+        "repo sanity",
+        "4-repo links",
+        "sandbox env",
+        "cert_gate recent",
+        "proposal stack"
+    ]
+    let r1 = check_binaries()
+    let r2 = check_creds()
+    let r3 = check_r2_remote()
+    let r4 = check_hf_auth()
+    let r5 = check_runpodctl_auth()
+    let r6 = check_repo_sanity()
+    let r7 = check_4repo_links()
+    let r8 = check_sandbox_env()
+    let r9 = check_cert_gate_recent()
+    let r10 = check_proposal_stack()
+    let results = [r1, r2, r3, r4, r5, r6, r7, r8, r9, r10]
+    let checks = []
+    let i = 0
+    while i < len(names) {
+        let st = _str(results[i][0])
+        let dt = _str(results[i][1])
+        checks = checks + [[i + 1, _str(names[i]), st, dt]]
+        i = i + 1
+    }
+    return checks
+}
+
+fn tally(checks) -> array {
+    let ok = 0
+    let wn = 0
+    let fl = 0
+    let i = 0
+    while i < len(checks) {
+        let s = _str(checks[i][2])
+        if s == "ok"   { ok = ok + 1 }
+        if s == "warn" { wn = wn + 1 }
+        if s == "fail" { fl = fl + 1 }
+        i = i + 1
+    }
+    return [ok, wn, fl]
+}
+
+fn verdict_of(tall) -> string {
+    if tall[2] > 0 { return "fail" }
+    if tall[1] > 0 { return "warn" }
+    return "ok"
+}
+
+fn render_table(checks) {
+    println("anima doctor — self-diagnose (10 checks)")
+    println("────────────────────────────────────────────────────────────────")
+    let i = 0
+    while i < len(checks) {
+        let idx = _str(checks[i][0])
+        let nm  = _str(checks[i][1])
+        let st  = _str(checks[i][2])
+        let dt  = _str(checks[i][3])
+        let glyph = _glyph(st)
+        let pad_idx = idx
+        if len(pad_idx) == 1 { pad_idx = " " + pad_idx }
+        // pad name to 20 chars
+        let pad_nm = nm
+        while len(pad_nm) < 20 { pad_nm = pad_nm + " " }
+        println(pad_idx + ". " + glyph + "  " + pad_nm + "  " + dt)
+        i = i + 1
+    }
+    println("────────────────────────────────────────────────────────────────")
+}
+
+fn jq_esc(s: string) -> string {
+    // minimal escaping for embedding in JSON string literal
+    let out = ""
+    let i = 0
+    while i < len(s) {
+        let ch = s.substring(i, i + 1)
+        if ch == "\\" { out = out + "\\\\" }
+        else {
+            if ch == "\"" { out = out + "\\\"" }
+            else { out = out + ch }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn build_json(ts: string, checks, tall, verdict: string) -> string {
+    let s = "{"
+    s = s + "\"schema\":\"anima.doctor.v1\","
+    s = s + "\"ts\":\"" + ts + "\","
+    s = s + "\"verdict\":\"" + verdict + "\","
+    s = s + "\"counts\":{\"ok\":" + _str(tall[0]) + ",\"warn\":" + _str(tall[1]) + ",\"fail\":" + _str(tall[2]) + "},"
+    s = s + "\"checks\":["
+    let i = 0
+    while i < len(checks) {
+        if i > 0 { s = s + "," }
+        let idx = _str(checks[i][0])
+        let nm  = jq_esc(_str(checks[i][1]))
+        let st  = _str(checks[i][2])
+        let dt  = jq_esc(_str(checks[i][3]))
+        s = s + "{\"id\":" + idx + ",\"name\":\"" + nm + "\",\"status\":\"" + st + "\",\"detail\":\"" + dt + "\"}"
+        i = i + 1
+    }
+    s = s + "]}"
+    return s
+}
+
+fn write_result(json_text: string) -> string {
+    let root = _resolve_root()
+    let out_path = root + "/state/anima_doctor_result.json"
+    let tmp = out_path + ".tmp"
+    // atomic write via tmp + mv, piped through jq for pretty formatting
+    exec("mkdir -p " + root + "/state")
+    let cmd = "printf '%s' " + "'" + json_text.replace("'", "'\\''") + "'"
+             + " | jq . > " + tmp + " 2>/dev/null && mv " + tmp + " " + out_path
+             + " || (printf '%s' '" + json_text.replace("'", "'\\''") + "' > " + out_path + ")"
+    exec(cmd)
+    return out_path
+}
+
+fn sub_help() {
+    println("anima doctor — 10-check self-diagnose (read-only)")
+    println("")
+    println("  anima doctor               run all 10 checks")
+    println("  anima doctor --json        print JSON verdict only")
+    println("")
+    println("  --selftest   synthetic bad-path resilience test")
+    println("  --help       this help")
+    println("")
+    println("CHECKS")
+    println("  1. binary paths   (hexa · runpodctl · hf · rclone)")
+    println("  2. credential files (~/.runpod · ~/.cache/huggingface · ~/.config/rclone)")
+    println("  3. R2 remote (rclone listremotes)")
+    println("  4. HF auth (hf auth whoami)")
+    println("  5. runpodctl auth")
+    println("  6. anima repo sanity (roadmap_progress.json + .roadmap uchg)")
+    println("  7. 4-repo links (WS/nexus · HEXA_LANG · AIRGENOME · WS/anima)")
+    println("  8. sandbox env (claude-code · ssh · terminal)")
+    println("  9. cert_gate recent run (6h window)")
+    println(" 10. proposal stack health (pending/approved/archived counts)")
+    println("")
+    println("OUTPUT")
+    println("  state/anima_doctor_result.json  (schema=anima.doctor.v1)")
+}
+
+fn sub_selftest() {
+    // synthetic bad-path resilience: exercise probes against a missing binary
+    // and assert it produces warn/fail without aborting.
+    let bad = "/nonexistent/absolutely/missing/binary"
+    let x = _xexists(bad)
+    if x { println("FAIL selftest: ghost binary erroneously reports executable"); exit(1) }
+    // exercise every check function (each must be graceful, never throw)
+    let c1 = check_binaries()
+    let c2 = check_creds()
+    let c3 = check_r2_remote()
+    let c4 = check_hf_auth()
+    let c5 = check_runpodctl_auth()
+    let c6 = check_repo_sanity()
+    let c7 = check_4repo_links()
+    let c8 = check_sandbox_env()
+    let c9 = check_cert_gate_recent()
+    let c10 = check_proposal_stack()
+    let results = [c1, c2, c3, c4, c5, c6, c7, c8, c9, c10]
+    let i = 0
+    while i < len(results) {
+        let st = _str(results[i][0])
+        let dt = _str(results[i][1])
+        if st != "ok" && st != "warn" && st != "fail" {
+            println("FAIL selftest: check #" + _str(i + 1) + " returned invalid status=" + st)
+            exit(1)
+        }
+        if dt == "" {
+            println("FAIL selftest: check #" + _str(i + 1) + " empty detail")
+            exit(1)
+        }
+        i = i + 1
+    }
+    // JSON builder round-trip on a synthetic checks list
+    let fake = [
+        [1, "synthetic", "warn", "ghost binary " + bad + " missing"]
+    ]
+    let t = tally(fake)
+    if t[1] != 1 { println("FAIL selftest: tally warn mismatch"); exit(1) }
+    let v = verdict_of(t)
+    if v != "warn" { println("FAIL selftest: verdict mismatch"); exit(1) }
+    let j = build_json("REDACTED", fake, t, v)
+    if !j.contains("anima.doctor.v1") { println("FAIL selftest: schema tag missing"); exit(1) }
+    if !j.contains("synthetic")       { println("FAIL selftest: check name missing"); exit(1) }
+    println("PASS anima_cli/doctor selftest (graceful on bad-path · 10 probes · JSON schema ok)")
+    exit(0)
+}
+
+fn sub_run(json_only: bool) {
+    let ts = _ts_iso()
+    let checks = run_all_checks()
+    let tall = tally(checks)
+    let verdict = verdict_of(tall)
+    let json_text = build_json(ts, checks, tall, verdict)
+    let out_path = write_result(json_text)
+    if json_only {
+        println(json_text)
+        return
+    }
+    render_table(checks)
+    let summary = "verdict=" + verdict
+                + "  ok=" + _str(tall[0])
+                + "  warn=" + _str(tall[1])
+                + "  fail=" + _str(tall[2])
+    println(summary)
+    println("ts=" + ts)
+    println("wrote " + out_path)
+}
+
+fn main() {
+    let argv = _user_argv(args())
+    if _arg_present(argv, "--selftest") { sub_selftest(); return }
+    if _arg_present(argv, "--help")     { sub_help(); return }
+    let json_only = _arg_present(argv, "--json")
+    sub_run(json_only)
+}
+
+main()

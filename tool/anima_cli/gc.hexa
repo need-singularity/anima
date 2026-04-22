@@ -1,0 +1,621 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_cli/gc.hexa — anima CLI `gc` topic (cleanup unused artifacts)
+//
+//  PURPOSE
+//    Garbage-collect repo- and host-local artifacts that safely regenerate.
+//    DRY by default (zero side-effects unless --apply). Never touches
+//    git-tracked files; `state/proposals/archived/` is only considered under
+//    --aggressive. Idempotent across repeated runs.
+//
+//  INVOCATION
+//    anima gc                            dry-run table + freeable bytes
+//    anima gc --apply                    delete conservative set
+//    anima gc --aggressive --apply       include archived 90d+
+//    anima gc --dry-json                 machine-readable (schema anima.gc.v1)
+//    anima gc --selftest                 synthetic-orphan detect + dry check
+//    anima gc --help
+//
+//  CATEGORIES
+//    1. /tmp/anima_* (file artifacts left by selftests)
+//    2. state/proposals/{rejected,archived}/ 90d+ with veto_count>=3 or
+//       implement_module_path set   (archived only under --aggressive)
+//    3. state/proposals/pending/ with BOTH cluster_member AND lineage_parent
+//       (super-proposal-absorbed orphans)
+//    4. build/artifacts/*.c (AOT intermediate, regeneratable from .hexa)
+//    5. /tmp/h100_weight_precache_*.log older than 7 days
+//    6. dist/*.old (unused native build residuals)
+//
+//  OUTPUT
+//    state/anima_gc_result.json (schema=anima.gc.v1)
+//
+//  DESIGN
+//    raw#9  hexa-only (no .py)     raw#10 deterministic under HEXA_REPRODUCIBLE=1
+//    raw#11 snake_case              raw#15 no-hardcode (paths via _resolve_root)
+// ════════════════════════════════════════════════════════════════════════════
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    if t == "int" || t == "float" || t == "number" { return str(x) }
+    return ""
+}
+
+fn _fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _dexists(p: string) -> bool {
+    return _str(exec("test -d " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    return _str(env("HOME")) + "/core/anima"
+}
+
+fn _ts_iso() -> string {
+    let rep = _str(env("HEXA_REPRODUCIBLE"))
+    if rep == "1" { return "REDACTED" }
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _user_argv(raw) -> array {
+    let out = []
+    let i = 0
+    while i < len(raw) {
+        let s = _str(raw[i])
+        if !s.contains("/.hexa-cache/") {
+            out = out + [s]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _size_bytes(path: string) -> int {
+    // stat -f %z on macOS; 0 on missing
+    if !_fexists(path) { return 0 }
+    let s = _str(exec("stat -f %z " + path + " 2>/dev/null")).trim()
+    if s == "" { return 0 }
+    return int(s)
+}
+
+fn _is_tracked(path: string) -> bool {
+    // git ls-files --error-unmatch exits 0 if tracked
+    let rc = _str(exec("git ls-files --error-unmatch " + path
+                       + " >/dev/null 2>&1 && echo 1 || echo 0")).trim()
+    return rc == "1"
+}
+
+fn _humanize(n: int) -> string {
+    if n < 1024 { return _str(n) + "B" }
+    let kb = n / 1024
+    if kb < 1024 { return _str(kb) + "K" }
+    let mb = kb / 1024
+    if mb < 1024 { return _str(mb) + "M" }
+    let gb = mb / 1024
+    return _str(gb) + "G"
+}
+
+fn _json_esc(s: string) -> string {
+    let out = ""
+    let i = 0
+    while i < len(s) {
+        let ch = s.substring(i, i + 1)
+        if ch == "\\" { out = out + "\\\\" }
+        else {
+            if ch == "\"" { out = out + "\\\"" }
+            else { out = out + ch }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── category scanners ─────────────────────────────────────────────────────
+//   Each returns array of [path, bytes_int] pairs. Tracked files skipped.
+
+fn scan_tmp_anima() -> array {
+    // /tmp/anima_* — FILES only (weight_precache dir etc. excluded).
+    // Directories like /tmp/anima_weight_precache are NEVER removed.
+    let out = []
+    // /tmp is a symlink on macOS → traverse target via -L
+    let listing = _str(exec(
+      "find -L /tmp -maxdepth 1 -name 'anima_*' -type f 2>/dev/null"
+    ))
+    let lines = listing.split("\n")
+    let i = 0
+    while i < len(lines) {
+        let p = _str(lines[i]).trim()
+        if p != "" {
+            // never consider directories (defensive)
+            if _fexists(p) {
+                let sz = _size_bytes(p)
+                out = out + [[p, sz]]
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn scan_rejected_90d() -> array {
+    // state/proposals/rejected/*.json with mtime > 90d AND
+    //   (veto_count >= 3 OR implement_module_path != null/"")
+    // Filter: skip git-tracked.
+    let root = _resolve_root()
+    let dir = root + "/state/proposals/rejected"
+    let out = []
+    if !_dexists(dir) { return out }
+    let listing = _str(exec(
+      "find " + dir + " -maxdepth 1 -name '*.json' -type f -mtime +90 2>/dev/null"
+    ))
+    let lines = listing.split("\n")
+    let i = 0
+    while i < len(lines) {
+        let p = _str(lines[i]).trim()
+        if p == "" { i = i + 1; continue }
+        if _is_tracked(p) { i = i + 1; continue }
+        let vc = _str(exec("jq -r '.veto_count // 0' " + p + " 2>/dev/null")).trim()
+        let imp = _str(exec("jq -r '.implement_module_path // \"\"' " + p + " 2>/dev/null")).trim()
+        let qualifies = false
+        if vc != "" && int(vc) >= 3 { qualifies = true }
+        if imp != "" { qualifies = true }
+        if qualifies {
+            let sz = _size_bytes(p)
+            out = out + [[p, sz]]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn scan_archived_90d() -> array {
+    // state/proposals/archived/*.json — aggressive-only; 90d + veto/impl rule.
+    // Skip git-tracked.
+    let root = _resolve_root()
+    let dir = root + "/state/proposals/archived"
+    let out = []
+    if !_dexists(dir) { return out }
+    let listing = _str(exec(
+      "find " + dir + " -maxdepth 1 -name '*.json' -type f -mtime +90 2>/dev/null"
+    ))
+    let lines = listing.split("\n")
+    let i = 0
+    while i < len(lines) {
+        let p = _str(lines[i]).trim()
+        if p == "" { i = i + 1; continue }
+        if _is_tracked(p) { i = i + 1; continue }
+        let vc = _str(exec("jq -r '.veto_count // 0' " + p + " 2>/dev/null")).trim()
+        let imp = _str(exec("jq -r '.implement_module_path // \"\"' " + p + " 2>/dev/null")).trim()
+        let qualifies = false
+        if vc != "" && int(vc) >= 3 { qualifies = true }
+        if imp != "" { qualifies = true }
+        if qualifies {
+            let sz = _size_bytes(p)
+            out = out + [[p, sz]]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn scan_pending_orphans() -> array {
+    // state/proposals/pending/*.json with BOTH cluster_member AND
+    // lineage_parent populated (super-proposal absorbed). Skip git-tracked.
+    let root = _resolve_root()
+    let dir = root + "/state/proposals/pending"
+    let out = []
+    if !_dexists(dir) { return out }
+    let listing = _str(exec(
+      "find " + dir + " -maxdepth 1 -name '*.json' -type f 2>/dev/null"
+    ))
+    let lines = listing.split("\n")
+    let i = 0
+    while i < len(lines) {
+        let p = _str(lines[i]).trim()
+        if p == "" { i = i + 1; continue }
+        if _is_tracked(p) { i = i + 1; continue }
+        let cm = _str(exec("jq -r '.cluster_member // \"\"' " + p + " 2>/dev/null")).trim()
+        let lp = _str(exec("jq -r '.lineage_parent // \"\"' " + p + " 2>/dev/null")).trim()
+        if cm != "" && lp != "" {
+            let sz = _size_bytes(p)
+            out = out + [[p, sz]]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn scan_build_artifacts_c() -> array {
+    // build/artifacts/*.c — AOT intermediate. Skip git-tracked (shouldn't be).
+    let root = _resolve_root()
+    let dir = root + "/build/artifacts"
+    let out = []
+    if !_dexists(dir) { return out }
+    let listing = _str(exec(
+      "find " + dir + " -maxdepth 1 -name '*.c' -type f 2>/dev/null"
+    ))
+    let lines = listing.split("\n")
+    let i = 0
+    while i < len(lines) {
+        let p = _str(lines[i]).trim()
+        if p == "" { i = i + 1; continue }
+        if _is_tracked(p) { i = i + 1; continue }
+        let sz = _size_bytes(p)
+        out = out + [[p, sz]]
+        i = i + 1
+    }
+    return out
+}
+
+fn scan_h100_logs_7d() -> array {
+    // /tmp/h100_weight_precache_*.log older than 7 days
+    let out = []
+    let listing = _str(exec(
+      "find -L /tmp -maxdepth 1 -name 'h100_weight_precache_*.log' -type f -mtime +7 2>/dev/null"
+    ))
+    let lines = listing.split("\n")
+    let i = 0
+    while i < len(lines) {
+        let p = _str(lines[i]).trim()
+        if p != "" {
+            let sz = _size_bytes(p)
+            out = out + [[p, sz]]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn scan_dist_old() -> array {
+    // dist/*.old — unused native build residuals. Skip git-tracked.
+    let root = _resolve_root()
+    let dir = root + "/dist"
+    let out = []
+    if !_dexists(dir) { return out }
+    let listing = _str(exec(
+      "find " + dir + " -maxdepth 2 -name '*.old' -type f 2>/dev/null"
+    ))
+    let lines = listing.split("\n")
+    let i = 0
+    while i < len(lines) {
+        let p = _str(lines[i]).trim()
+        if p == "" { i = i + 1; continue }
+        if _is_tracked(p) { i = i + 1; continue }
+        let sz = _size_bytes(p)
+        out = out + [[p, sz]]
+        i = i + 1
+    }
+    return out
+}
+
+// ─── aggregation + apply ───────────────────────────────────────────────────
+
+fn _total_bytes(items) -> int {
+    let t = 0
+    let i = 0
+    while i < len(items) {
+        t = t + int(items[i][1])
+        i = i + 1
+    }
+    return t
+}
+
+fn _apply_delete(items) -> int {
+    // rm -f each (idempotent). Returns count actually removed.
+    let n = 0
+    let i = 0
+    while i < len(items) {
+        let p = _str(items[i][0])
+        if _fexists(p) {
+            exec("rm -f " + p + " 2>/dev/null")
+            if !_fexists(p) { n = n + 1 }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// ─── report rendering ─────────────────────────────────────────────────────
+
+fn render_table(cats, verdict: string, mode: string) {
+    println("anima gc — unused artifact cleanup (" + mode + ")")
+    println("────────────────────────────────────────────────────────────────")
+    let i = 0
+    let total = 0
+    while i < len(cats) {
+        let nm  = _str(cats[i][0])
+        let cnt = int(cats[i][1])
+        let by  = int(cats[i][2])
+        let note = _str(cats[i][3])
+        total = total + by
+        let pad = nm
+        while len(pad) < 32 { pad = pad + " " }
+        let cs = _str(cnt)
+        while len(cs) < 5 { cs = " " + cs }
+        let bs = _humanize(by)
+        while len(bs) < 8 { bs = " " + bs }
+        println("  " + pad + cs + "  " + bs + "  " + note)
+        i = i + 1
+    }
+    println("────────────────────────────────────────────────────────────────")
+    println("  total freeable: " + _humanize(total)
+            + "   verdict=" + verdict)
+}
+
+fn build_json(ts: string, cats, total: int, mode: string, applied: bool) -> string {
+    let s = "{"
+    s = s + "\"schema\":\"anima.gc.v1\","
+    s = s + "\"ts\":\"" + ts + "\","
+    s = s + "\"mode\":\"" + mode + "\","
+    s = s + "\"applied\":" + (if applied { "true" } else { "false" }) + ","
+    s = s + "\"total_bytes\":" + _str(total) + ","
+    s = s + "\"categories\":["
+    let i = 0
+    while i < len(cats) {
+        if i > 0 { s = s + "," }
+        let nm  = _json_esc(_str(cats[i][0]))
+        let cnt = int(cats[i][1])
+        let by  = int(cats[i][2])
+        s = s + "{\"name\":\"" + nm + "\",\"count\":" + _str(cnt)
+              + ",\"bytes\":" + _str(by) + "}"
+        i = i + 1
+    }
+    s = s + "]}"
+    return s
+}
+
+fn write_result(json_text: string) -> string {
+    let root = _resolve_root()
+    let out_path = root + "/state/anima_gc_result.json"
+    let tmp = out_path + ".tmp"
+    exec("mkdir -p " + root + "/state")
+    let cmd = "printf '%s' " + "'" + json_text.replace("'", "'\\''") + "'"
+             + " | jq . > " + tmp + " 2>/dev/null && mv " + tmp + " " + out_path
+             + " || (printf '%s' '" + json_text.replace("'", "'\\''") + "' > " + out_path + ")"
+    exec(cmd)
+    return out_path
+}
+
+// ─── dispatch ─────────────────────────────────────────────────────────────
+
+fn sub_help() {
+    println("anima gc — cleanup unused tool/orphan artifacts (dry-default, safe)")
+    println("")
+    println("  anima gc                        dry-run · freeable bytes")
+    println("  anima gc --apply                delete conservative set")
+    println("  anima gc --aggressive --apply   include archived 90d")
+    println("  anima gc --dry-json             JSON (schema anima.gc.v1)")
+    println("  anima gc --selftest             synthetic-orphan detect test")
+    println("  anima gc --help                 this help")
+    println("")
+    println("CATEGORIES")
+    println("  1. /tmp/anima_*                     file artifacts (dir excluded)")
+    println("  2. state/proposals/rejected/ 90d+   (veto_count>=3 OR impl path)")
+    println("  3. state/proposals/archived/ 90d+   AGGRESSIVE-only")
+    println("  4. state/proposals/pending/         cluster_member + lineage_parent")
+    println("  5. build/artifacts/*.c              AOT intermediate (regenerates)")
+    println("  6. /tmp/h100_weight_precache_*.log  > 7 days")
+    println("  7. dist/*.old                        unused native builds")
+    println("")
+    println("SAFETY")
+    println("  - git-tracked files are NEVER deleted (filtered upstream)")
+    println("  - directories are NEVER deleted (files only)")
+    println("  - idempotent — safe to re-run")
+    println("  - archived/ only under --aggressive")
+    println("")
+    println("OUTPUT")
+    println("  state/anima_gc_result.json (schema=anima.gc.v1)")
+}
+
+fn sub_run(apply: bool, aggressive: bool, dry_json: bool) {
+    let ts = _ts_iso()
+    let c1 = scan_tmp_anima()
+    let c2 = scan_rejected_90d()
+    let c3 = []
+    if aggressive { c3 = scan_archived_90d() }
+    let c4 = scan_pending_orphans()
+    let c5 = scan_build_artifacts_c()
+    let c6 = scan_h100_logs_7d()
+    let c7 = scan_dist_old()
+
+    let n1 = len(c1)
+    let n2 = len(c2)
+    let n3 = len(c3)
+    let n4 = len(c4)
+    let n5 = len(c5)
+    let n6 = len(c6)
+    let n7 = len(c7)
+
+    let b1 = _total_bytes(c1)
+    let b2 = _total_bytes(c2)
+    let b3 = _total_bytes(c3)
+    let b4 = _total_bytes(c4)
+    let b5 = _total_bytes(c5)
+    let b6 = _total_bytes(c6)
+    let b7 = _total_bytes(c7)
+
+    // apply deletes (gated by --apply)
+    let applied = false
+    if apply {
+        applied = true
+        let _x1 = _apply_delete(c1)
+        let _x2 = _apply_delete(c2)
+        if aggressive { let _x3 = _apply_delete(c3) }
+        let _x4 = _apply_delete(c4)
+        let _x5 = _apply_delete(c5)
+        let _x6 = _apply_delete(c6)
+        let _x7 = _apply_delete(c7)
+    }
+
+    let mode = "dry"
+    if apply { mode = "apply" }
+    if aggressive {
+        if apply { mode = "apply-aggressive" } else { mode = "dry-aggressive" }
+    }
+
+    let arch_note = "(skipped — aggressive-only)"
+    if aggressive { arch_note = "(aggressive)" }
+
+    let cats = [
+        ["1. /tmp/anima_* files",            n1, b1, ""],
+        ["2. rejected/ 90d+ veto|impl",      n2, b2, ""],
+        ["3. archived/ 90d+ veto|impl",      n3, b3, arch_note],
+        ["4. pending/ cluster+lineage orph", n4, b4, ""],
+        ["5. build/artifacts/*.c (AOT)",     n5, b5, ""],
+        ["6. /tmp/h100_precache *.log >7d",  n6, b6, ""],
+        ["7. dist/*.old native residuals",   n7, b7, ""]
+    ]
+
+    let total = b1 + b2 + b3 + b4 + b5 + b6 + b7
+    let verdict = "clean"
+    if total > 0 { verdict = "freeable" }
+
+    let json_text = build_json(ts, cats, total, mode, applied)
+    let out_path = write_result(json_text)
+
+    if dry_json {
+        println(json_text)
+        return
+    }
+
+    render_table(cats, verdict, mode)
+    println("ts=" + ts)
+    println("wrote " + out_path)
+    if !apply {
+        println("(dry-run · re-run with --apply to delete)")
+    }
+}
+
+// ─── selftest ─────────────────────────────────────────────────────────────
+
+fn sub_selftest() {
+    // synthetic orphan harness: create a throwaway pending/ proposal with
+    // cluster_member + lineage_parent under /tmp, verify detection & that
+    // dry-run does not delete it.
+    let tmp_proposal = "/tmp/anima_gc_selftest_orphan.json"
+    let body = "{\"id\":\"selftest-001\",\"cluster_member\":\"cl-x\",\"lineage_parent\":\"parent-0\"}"
+    exec("printf '%s' '" + body + "' > " + tmp_proposal)
+    if !_fexists(tmp_proposal) {
+        println("FAIL anima_cli/gc selftest (tmp proposal create failed)")
+        exit(1)
+    }
+
+    // quick hand-check of json probing (mirrors scan_pending_orphans logic)
+    let cm = _str(exec("jq -r '.cluster_member // \"\"' " + tmp_proposal + " 2>/dev/null")).trim()
+    let lp = _str(exec("jq -r '.lineage_parent // \"\"' " + tmp_proposal + " 2>/dev/null")).trim()
+    if cm == "" || lp == "" {
+        exec("rm -f " + tmp_proposal)
+        println("FAIL anima_cli/gc selftest (orphan fields not detected: cm=" + cm + " lp=" + lp + ")")
+        exit(1)
+    }
+
+    // call every scanner — must not throw, must return arrays
+    let s1 = scan_tmp_anima()
+    let s2 = scan_rejected_90d()
+    let s3 = scan_archived_90d()
+    let s4 = scan_pending_orphans()
+    let s5 = scan_build_artifacts_c()
+    let s6 = scan_h100_logs_7d()
+    let s7 = scan_dist_old()
+    let scans = [s1, s2, s3, s4, s5, s6, s7]
+    let i = 0
+    while i < len(scans) {
+        let r = scans[i]
+        if type_of(r) != "array" && type_of(r) != "list" {
+            exec("rm -f " + tmp_proposal)
+            println("FAIL anima_cli/gc selftest (scanner " + _str(i + 1) + " did not return array)")
+            exit(1)
+        }
+        i = i + 1
+    }
+
+    // synthetic /tmp orphan must be detected as a category-1 candidate
+    let found = false
+    let j = 0
+    while j < len(s1) {
+        if _str(s1[j][0]) == tmp_proposal { found = true }
+        j = j + 1
+    }
+    if !found {
+        exec("rm -f " + tmp_proposal)
+        println("FAIL anima_cli/gc selftest (synthetic /tmp/anima_* orphan not detected)")
+        exit(1)
+    }
+
+    // dry-run MUST NOT delete the probe file
+    if !_fexists(tmp_proposal) {
+        println("FAIL anima_cli/gc selftest (dry-run deleted probe)")
+        exit(1)
+    }
+
+    // JSON builder round-trip
+    let cats = [
+        ["1. synthetic", 1, 42, ""]
+    ]
+    let js = build_json("REDACTED", cats, 42, "dry", false)
+    if !js.contains("anima.gc.v1") {
+        exec("rm -f " + tmp_proposal)
+        println("FAIL anima_cli/gc selftest (JSON schema tag missing)")
+        exit(1)
+    }
+    if !js.contains("synthetic") {
+        exec("rm -f " + tmp_proposal)
+        println("FAIL anima_cli/gc selftest (category name missing in JSON)")
+        exit(1)
+    }
+
+    // humanize sanity
+    if _humanize(0) != "0B" {
+        exec("rm -f " + tmp_proposal)
+        println("FAIL anima_cli/gc selftest (humanize 0 != 0B)")
+        exit(1)
+    }
+    if _humanize(2048) != "2K" {
+        exec("rm -f " + tmp_proposal)
+        println("FAIL anima_cli/gc selftest (humanize 2048 != 2K)")
+        exit(1)
+    }
+
+    // cleanup the probe (idempotent proof: call _apply_delete on it)
+    let removed = _apply_delete([[tmp_proposal, 42]])
+    if removed != 1 {
+        println("FAIL anima_cli/gc selftest (_apply_delete did not remove probe)")
+        exit(1)
+    }
+    // idempotent: second call should be a no-op (return 0)
+    let again = _apply_delete([[tmp_proposal, 42]])
+    if again != 0 {
+        println("FAIL anima_cli/gc selftest (non-idempotent: second delete returned " + _str(again) + ")")
+        exit(1)
+    }
+
+    println("PASS anima_cli/gc selftest (orphan detect · dry safe · 7 scanners · JSON schema · idempotent)")
+    exit(0)
+}
+
+fn main() {
+    let argv = _user_argv(args())
+    if _arg_present(argv, "--selftest")   { sub_selftest(); return }
+    if _arg_present(argv, "--help")       { sub_help();     return }
+    let apply      = _arg_present(argv, "--apply")
+    let aggressive = _arg_present(argv, "--aggressive")
+    let dry_json   = _arg_present(argv, "--dry-json")
+                   || _arg_present(argv, "--json")
+    sub_run(apply, aggressive, dry_json)
+}
+
+main()

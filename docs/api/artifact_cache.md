@@ -1,11 +1,11 @@
 <!-- AUTO-GENERATED, DO NOT EDIT — source: tool/api_surface_extract.hexa -->
-<!-- generated: 2026-04-22T12:40:18Z -->
+<!-- generated: 2026-04-22T16:42:48Z -->
 <!-- source: tool/artifact_cache.hexa -->
 <!-- entry_count: 24 -->
 
 # `tool/artifact_cache.hexa` API surface
 
-_AUTO-GENERATED, DO NOT EDIT — generated 2026-04-22T12:40:18Z UTC._
+_AUTO-GENERATED, DO NOT EDIT — generated 2026-04-22T16:42:48Z UTC._
 
 **Tool:** ════════════════════════════════════════════════════════════════════════════
 

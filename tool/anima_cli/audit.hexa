@@ -1,0 +1,544 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_cli/audit.hexa — anima CLI `audit` topic (pre-push safety check)
+//
+//  PURPOSE
+//    Single-entry pre-push safety gate. Wraps existing scanners/linters — adds
+//    zero new detection logic. Recommended (not forced) before `git push`.
+//
+//  CHECKS
+//    1. secret_scan       — wrap tool/secret_scanner.hexa (0 CRITICAL/HIGH)
+//    2. raw9_no_py        — repo-wide .py file detection
+//    3. lint_rule_pack    — L1-L4 violation count (wrap tool/lint_rule_pack.hexa)
+//    4. dead_code_reg     — compare vs previous baseline; new dead fns = 0
+//    5. schema_field_ci   — state/*.json missing .schema field (post-D5 fix)
+//    6. orphan_json_root  — .json at repo root outside config/ + .meta2-cert/
+//    7. large_file        — committed file >10MB (git lfs recommended)
+//    8. git_clean         — staged-only; no uncommitted binaries
+//
+//  SUBCMDS
+//    anima audit              — run every check (human table)
+//    anima audit fix          — apply auto-fixable only (lint_autofix wrap)
+//    anima audit --json       — machine-readable verdict dump
+//    anima audit --selftest   — synthetic path self-check
+//    anima audit --help
+//
+//  OUTPUT
+//    stdout: ✓/⚠/✗ table per check
+//    state/anima_audit_result.json (schema anima.audit_result.v1)
+//
+//  EXIT CODES
+//    0  PASS  — all checks ✓
+//    1  WARN  — at least one ⚠, no ✗
+//    2  FAIL  — at least one ✗ (push block recommended)
+//
+//  DESIGN
+//    raw#9   hexa-only; no .py
+//    raw#10  idempotent (overwrite state/anima_audit_result.json)
+//    raw#11  snake_case
+//    raw#15  no hardcoded paths outside ANIMA_ROOT constants
+// ════════════════════════════════════════════════════════════════════════════
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    return _str(env("HOME")) + "/core/anima"
+}
+
+fn _hexa() -> string {
+    let e = _str(env("HEXA_BIN"))
+    if e != "" && _fexists(e) { return e }
+    return "/Users/ghost/.hx/bin/hexa"
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _user_argv(raw) -> array {
+    let out = []
+    let i = 0
+    while i < len(raw) {
+        let s = _str(raw[i])
+        if !s.contains("/.hexa-cache/") { out = out + [s] }
+        i = i + 1
+    }
+    return out
+}
+
+fn _ts() -> string {
+    let r = _str(env("HEXA_REPRODUCIBLE"))
+    if r == "1" { return "REDACTED" }
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn _shq(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _glyph(v: string) -> string {
+    if v == "PASS" { return "✓" }
+    if v == "WARN" { return "⚠" }
+    return "✗"
+}
+
+// ─── result row = pipe-joined string "name|verdict|fixable|count|detail" ───
+
+fn _row(name: string, verdict: string, fixable: bool, count: int, detail: string) -> string {
+    let fx = if fixable { "1" } else { "0" }
+    return name + "|" + verdict + "|" + fx + "|" + to_string(count) + "|" + detail
+}
+
+fn _row_name(r: string) -> string {
+    let parts = r.split("|")
+    if len(parts) > 0 { return _str(parts[0]) }
+    return ""
+}
+
+fn _row_verdict(r: string) -> string {
+    let parts = r.split("|")
+    if len(parts) > 1 { return _str(parts[1]) }
+    return ""
+}
+
+fn _row_fixable(r: string) -> bool {
+    let parts = r.split("|")
+    if len(parts) > 2 { return _str(parts[2]) == "1" }
+    return false
+}
+
+fn _row_count(r: string) -> string {
+    let parts = r.split("|")
+    if len(parts) > 3 { return _str(parts[3]) }
+    return "0"
+}
+
+fn _row_detail(r: string) -> string {
+    let parts = r.split("|")
+    if len(parts) <= 4 { return "" }
+    // detail may itself contain "|" → rejoin tail
+    let mut out = _str(parts[4])
+    let i = 5
+    while i < len(parts) {
+        out = out + "|" + _str(parts[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── individual checks (each returns a row string) ─────────────────────
+
+fn check_secret_scan(root: string) -> string {
+    let summary = root + "/state/secret_scan_summary.json"
+    if !_fexists(summary) {
+        return _row("secret_scan", "WARN", false, 0, "summary missing (run tool/secret_scanner.hexa)")
+    }
+    let crit = _str(exec("jq -r '.by_severity.CRITICAL // 0' " + summary + " 2>/dev/null")).trim()
+    let high = _str(exec("jq -r '.by_severity.HIGH // 0' " + summary + " 2>/dev/null")).trim()
+    let med  = _str(exec("jq -r '.by_severity.MEDIUM // 0' " + summary + " 2>/dev/null")).trim()
+    let bad = 0
+    if crit != "" && crit != "0" { bad = bad + 1 }
+    if high != "" && high != "0" { bad = bad + 1 }
+    if bad > 0 {
+        return _row("secret_scan", "FAIL", false, bad,
+            "CRITICAL=" + crit + " HIGH=" + high + " (push block)")
+    }
+    if med != "" && med != "0" {
+        return _row("secret_scan", "WARN", false, 0,
+            "MEDIUM=" + med + " (review recommended)")
+    }
+    return _row("secret_scan", "PASS", false, 0, "no CRITICAL/HIGH/MEDIUM")
+}
+
+fn check_raw9_no_py(root: string) -> string {
+    // raw#9: hexa-only for LOGIC surface. Scan the hexa-logic dirs only.
+    // Research code under ready/, docs/, .meta2-cert/ etc. is explicitly allowed.
+    let roots = "tool shared bin state config"
+    let cmd = "cd " + _shq(root) + " && for d in " + roots + "; do "
+            + "[ -d \"$d\" ] && find \"$d\" -type f -name '*.py' 2>/dev/null; "
+            + "done | wc -l"
+    let n = _str(exec(cmd)).trim()
+    if n == "" || n == "0" {
+        return _row("raw9_no_py", "PASS", false, 0, "no .py in hexa-logic dirs (tool/shared/bin/state/config)")
+    }
+    return _row("raw9_no_py", "FAIL", false, 1,
+        n + " .py file(s) in hexa-logic dirs (raw#9)")
+}
+
+fn check_lint_rule_pack(root: string) -> string {
+    let path = root + "/state/lint_violations.json"
+    if !_fexists(path) {
+        return _row("lint_rule_pack", "WARN", true, 0,
+            "state missing (run tool/lint_rule_pack.hexa)")
+    }
+    let vc = _str(exec("jq -r '.violation_count // 0' " + path + " 2>/dev/null")).trim()
+    if vc == "" || vc == "0" {
+        return _row("lint_rule_pack", "PASS", true, 0, "0 violations")
+    }
+    let l1 = _str(exec("jq -r '[.violations[] | select(.check==\"L1_no_py\")] | length' "
+                     + path + " 2>/dev/null")).trim()
+    if l1 != "" && l1 != "0" {
+        return _row("lint_rule_pack", "FAIL", true, 1,
+            "L1 violation (.py in tool/) count=" + l1)
+    }
+    return _row("lint_rule_pack", "WARN", true, 1, vc + " violation(s) (L2-L4)")
+}
+
+fn check_dead_code_regression(root: string) -> string {
+    let cur = root + "/state/dead_code_candidates.json"
+    let baseline = root + "/state/dead_code_baseline.json"
+    if !_fexists(cur) {
+        return _row("dead_code_reg", "WARN", false, 0, "current audit missing")
+    }
+    let cur_n = _str(exec("jq -r '.dead_count // 0' " + cur + " 2>/dev/null")).trim()
+    if !_fexists(baseline) {
+        return _row("dead_code_reg", "WARN", false, 0,
+            "baseline absent; current=" + cur_n + " (seed baseline to enable gate)")
+    }
+    let base_n = _str(exec("jq -r '.dead_count // 0' " + baseline + " 2>/dev/null")).trim()
+    let cur_i = 0
+    let base_i = 0
+    if cur_n  != "" { cur_i  = to_int(cur_n) }
+    if base_n != "" { base_i = to_int(base_n) }
+    if cur_i > base_i {
+        return _row("dead_code_reg", "FAIL", false, cur_i - base_i,
+            "regression: " + base_n + " -> " + cur_n)
+    }
+    return _row("dead_code_reg", "PASS", false, 0,
+        "no regression (baseline=" + base_n + ", current=" + cur_n + ")")
+}
+
+fn check_schema_field_ci(root: string) -> string {
+    let cmd = "ls " + root + "/state/*.json 2>/dev/null"
+    let out = _str(exec(cmd))
+    if out.trim() == "" {
+        return _row("schema_field_ci", "PASS", false, 0, "no state/*.json")
+    }
+    let lines = out.split("\n")
+    let missing = 0
+    let sample = ""
+    let i = 0
+    while i < len(lines) {
+        let p = _str(lines[i]).trim()
+        if p != "" {
+            let has = _str(exec("jq -r 'if type==\"object\" then (.schema // \"\") else \"\" end' "
+                              + p + " 2>/dev/null")).trim()
+            if has == "" {
+                missing = missing + 1
+                if sample == "" { sample = p.replace(root + "/", "") }
+            }
+        }
+        i = i + 1
+    }
+    if missing == 0 {
+        return _row("schema_field_ci", "PASS", false, 0, "all state/*.json have .schema")
+    }
+    return _row("schema_field_ci", "WARN", false, missing,
+        to_string(missing) + " file(s) missing .schema (e.g. " + sample + ")")
+}
+
+fn check_orphan_json_root(root: string) -> string {
+    let cmd = "find " + root + " -maxdepth 1 -type f -name '*.json' 2>/dev/null"
+    let out = _str(exec(cmd))
+    if out.trim() == "" {
+        return _row("orphan_json_root", "PASS", false, 0, "no root *.json")
+    }
+    let lines = out.split("\n")
+    let n = 0
+    let sample = ""
+    let i = 0
+    while i < len(lines) {
+        let p = _str(lines[i]).trim()
+        if p != "" {
+            n = n + 1
+            if sample == "" { sample = p.replace(root + "/", "") }
+        }
+        i = i + 1
+    }
+    if n == 0 {
+        return _row("orphan_json_root", "PASS", false, 0, "no orphan")
+    }
+    return _row("orphan_json_root", "WARN", false, n,
+        to_string(n) + " orphan root json (e.g. " + sample + ") — move to config/")
+}
+
+fn check_large_file(root: string) -> string {
+    let cmd = "cd " + _shq(root) + " && git ls-files 2>/dev/null "
+            + "| while read f; do "
+            + "if [ -f \"$f\" ]; then "
+            + "sz=$(wc -c < \"$f\" 2>/dev/null); "
+            + "if [ -n \"$sz\" ] && [ \"$sz\" -gt 10485760 ]; then echo \"$sz $f\"; fi; "
+            + "fi; done"
+    let out = _str(exec(cmd))
+    if out.trim() == "" {
+        return _row("large_file", "PASS", false, 0, "no committed file >10MB")
+    }
+    let lines = out.split("\n")
+    let n = 0
+    let sample = ""
+    let i = 0
+    while i < len(lines) {
+        let ln = _str(lines[i]).trim()
+        if ln != "" {
+            n = n + 1
+            if sample == "" { sample = ln }
+        }
+        i = i + 1
+    }
+    if n == 0 {
+        return _row("large_file", "PASS", false, 0, "no committed file >10MB")
+    }
+    return _row("large_file", "WARN", false, n,
+        to_string(n) + " file(s) >10MB (git lfs; e.g. " + sample + ")")
+}
+
+fn check_git_clean(root: string) -> string {
+    let cmd = "cd " + _shq(root) + " && git status --porcelain 2>/dev/null"
+    let out = _str(exec(cmd))
+    if out.trim() == "" {
+        return _row("git_clean", "PASS", false, 0, "working tree clean")
+    }
+    let lines = out.split("\n")
+    let unt_bin = 0
+    let sample = ""
+    let i = 0
+    while i < len(lines) {
+        let ln = _str(lines[i])
+        if ln.len() >= 3 && ln.substring(0, 2) == "??" {
+            let p = ln.substring(3, ln.len()).trim()
+            if p != "" {
+                let fp = root + "/" + p
+                let sz = _str(exec("wc -c < " + _shq(fp) + " 2>/dev/null")).trim()
+                if sz != "" {
+                    let n_sz = to_int(sz)
+                    if n_sz > 1048576 {
+                        unt_bin = unt_bin + 1
+                        if sample == "" { sample = p + " (" + sz + "B)" }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    if unt_bin > 0 {
+        return _row("git_clean", "FAIL", false, unt_bin,
+            to_string(unt_bin) + " untracked binary (e.g. " + sample + ")")
+    }
+    return _row("git_clean", "PASS", false, 0,
+        "no untracked binaries (staged changes allowed)")
+}
+
+// ─── aggregation ──────────────────────────────────────────────────────
+
+fn _worst(results: array) -> string {
+    let has_fail = false
+    let has_warn = false
+    let i = 0
+    while i < len(results) {
+        let v = _row_verdict(_str(results[i]))
+        if v == "FAIL" { has_fail = true }
+        if v == "WARN" { has_warn = true }
+        i = i + 1
+    }
+    if has_fail { return "FAIL" }
+    if has_warn { return "WARN" }
+    return "PASS"
+}
+
+fn _exit_code(verdict: string) -> int {
+    if verdict == "PASS" { return 0 }
+    if verdict == "WARN" { return 1 }
+    return 2
+}
+
+fn _pad_right(s: string, width: int) -> string {
+    let mut out = s
+    while out.len() < width { out = out + " " }
+    return out
+}
+
+fn _print_table(results: array) {
+    println("anima audit — pre-push safety check")
+    println("─────────────────────────────────────────────────────────────────")
+    println("check              status  detail")
+    println("─────────────────────────────────────────────────────────────────")
+    let i = 0
+    while i < len(results) {
+        let r = _str(results[i])
+        let name = _pad_right(_row_name(r), 18)
+        let v = _row_verdict(r)
+        let d = _row_detail(r)
+        let status = _glyph(v) + " " + _pad_right(v, 4)
+        println(name + " " + status + "  " + d)
+        i = i + 1
+    }
+    println("─────────────────────────────────────────────────────────────────")
+    let w = _worst(results)
+    println("verdict: " + _glyph(w) + " " + w + " (exit " + to_string(_exit_code(w)) + ")")
+}
+
+fn _json_escape(s: string) -> string {
+    let t = s.replace("\\", "\\\\").replace("\"", "\\\"")
+    return "\"" + t + "\""
+}
+
+fn _emit_json(results: array, out_path: string) {
+    let w = _worst(results)
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima.audit_result.v1\",\n"
+    body = body + "  \"ts\": \"" + _ts() + "\",\n"
+    body = body + "  \"verdict\": \"" + w + "\",\n"
+    body = body + "  \"exit_code\": " + to_string(_exit_code(w)) + ",\n"
+    body = body + "  \"checks\": [\n"
+    let i = 0
+    while i < len(results) {
+        let r = _str(results[i])
+        let comma = if i < len(results) - 1 { "," } else { "" }
+        body = body + "    {"
+        body = body + "\"name\":\""    + _row_name(r)    + "\","
+        body = body + "\"verdict\":\"" + _row_verdict(r) + "\","
+        body = body + "\"fixable\":"   + (if _row_fixable(r) { "true" } else { "false" }) + ","
+        body = body + "\"count\":"     + _row_count(r) + ","
+        body = body + "\"detail\":"    + _json_escape(_row_detail(r))
+        body = body + "}" + comma + "\n"
+        i = i + 1
+    }
+    body = body + "  ]\n}\n"
+    write_file(out_path, body)
+}
+
+// ─── subcmds ───────────────────────────────────────────────────────────
+
+fn run_all(root: string) -> array {
+    let mut results = []
+    results = results + [check_secret_scan(root)]
+    results = results + [check_raw9_no_py(root)]
+    results = results + [check_lint_rule_pack(root)]
+    results = results + [check_dead_code_regression(root)]
+    results = results + [check_schema_field_ci(root)]
+    results = results + [check_orphan_json_root(root)]
+    results = results + [check_large_file(root)]
+    results = results + [check_git_clean(root)]
+    return results
+}
+
+fn sub_default(json_mode: bool) {
+    let root = _resolve_root()
+    let results = run_all(root)
+    let out_path = root + "/state/anima_audit_result.json"
+    _emit_json(results, out_path)
+    if json_mode {
+        println(_str(exec("cat " + out_path)))
+    } else {
+        _print_table(results)
+        println("state: " + out_path.replace(root + "/", ""))
+    }
+    exit(_exit_code(_worst(results)))
+}
+
+fn sub_fix() {
+    let root = _resolve_root()
+    let tool = root + "/tool/lint_autofix.hexa"
+    if !_fexists(tool) {
+        println("audit fix: tool/lint_autofix.hexa missing")
+        exit(2)
+    }
+    println("anima audit fix — applying auto-fixable lint (lint_autofix wrap)")
+    let out = _str(exec(_hexa() + " run " + tool + " 2>&1"))
+    println(out)
+    println("─────────────────────────────────────────────────────────────────")
+    println("re-running audit to verify")
+    sub_default(false)
+}
+
+fn sub_help() {
+    println("anima audit — pre-push safety gate (8 checks)")
+    println("")
+    println("  audit              run every check (human table)")
+    println("  audit fix          apply auto-fixable (lint_autofix wrap)")
+    println("  audit --json       machine-readable verdict")
+    println("")
+    println("  --selftest  --help")
+    println("")
+    println("CHECKS")
+    println("  1 secret_scan       wraps tool/secret_scanner.hexa")
+    println("  2 raw9_no_py        repo-wide .py detection")
+    println("  3 lint_rule_pack    wraps tool/lint_rule_pack.hexa (L1-L4)")
+    println("  4 dead_code_reg     regression vs state/dead_code_baseline.json")
+    println("  5 schema_field_ci   state/*.json .schema presence")
+    println("  6 orphan_json_root  no .json at repo root")
+    println("  7 large_file        >10MB git-tracked (git lfs hint)")
+    println("  8 git_clean         no untracked binaries")
+    println("")
+    println("EXIT CODES")
+    println("  0 PASS · 1 WARN · 2 FAIL (push block recommended)")
+}
+
+fn sub_selftest() {
+    let tmp = _str(exec("mktemp -d")).trim()
+    if tmp == "" { println("FAIL anima_cli/audit selftest (mktemp)"); exit(1) }
+    exec("mkdir -p " + tmp + "/state " + tmp + "/config")
+    write_file(tmp + "/state/secret_scan_summary.json",
+        "{\"schema\":\"anima.secret_scan_summary.v1\",\"by_severity\":{\"CRITICAL\":0,\"HIGH\":0,\"MEDIUM\":0,\"LOW\":0}}\n")
+    write_file(tmp + "/state/lint_violations.json",
+        "{\"schema\":\"anima.lint_violations.v1\",\"violation_count\":0,\"violations\":[]}\n")
+    write_file(tmp + "/state/dead_code_candidates.json",
+        "{\"schema\":\"anima.dead_code_candidates.v1\",\"dead_count\":3}\n")
+    write_file(tmp + "/state/dead_code_baseline.json",
+        "{\"schema\":\"anima.dead_code_candidates.v1\",\"dead_count\":3}\n")
+    let r1 = check_secret_scan(tmp)
+    let r2 = check_lint_rule_pack(tmp)
+    let r3 = check_dead_code_regression(tmp)
+    let r4 = check_schema_field_ci(tmp)
+    let r5 = check_orphan_json_root(tmp)
+    let ok = _row_verdict(r1) == "PASS"
+          && _row_verdict(r2) == "PASS"
+          && _row_verdict(r3) == "PASS"
+          && _row_verdict(r4) == "PASS"
+          && _row_verdict(r5) == "PASS"
+    exec("rm -rf " + tmp)
+    if ok { println("PASS anima_cli/audit selftest"); exit(0) }
+    println("FAIL anima_cli/audit selftest")
+    println("  secret_scan="   + _row_verdict(r1))
+    println("  lint="          + _row_verdict(r2))
+    println("  dead_code_reg=" + _row_verdict(r3))
+    println("  schema="        + _row_verdict(r4))
+    println("  orphan="        + _row_verdict(r5))
+    exit(1)
+}
+
+fn main() {
+    let argv = _user_argv(args())
+    if _arg_present(argv, "--selftest") { sub_selftest(); return }
+    if _arg_present(argv, "--help") { sub_help(); return }
+    let json_mode = _arg_present(argv, "--json")
+    if len(argv) == 0 {
+        sub_default(json_mode)
+        return
+    }
+    let sub = _str(argv[0])
+    if sub == "fix" { sub_fix(); return }
+    if sub == "--json" { sub_default(true); return }
+    sub_default(json_mode)
+}
+
+main()

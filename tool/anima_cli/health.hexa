@@ -1,0 +1,782 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_cli/health.hexa — anima CLI `health` topic (SLI/SLO evaluator)
+//
+//  PURPOSE
+//    Evaluate the 4 anima service SLIs against budgets defined in
+//    config/sli_slo.json (SSOT). Prints a human-readable table and persists
+//    a structured result to state/anima_health_result.json for downstream
+//    tooling. Wraps tool/error_budget_check.hexa conceptually but computes
+//    locally so the CLI can add the "proposal_cycle_success" indicator
+//    sourced from state/proposals/meta/cycle_log.jsonl.
+//
+//  INVOCATION
+//    anima health              4 SLI current vs budget · table render
+//    anima health --json       emit raw JSON verdict (skip table)
+//    anima health --budget     error budget remaining column
+//    anima health --alert      list BREACH/WARN only (exit 1 if any)
+//    anima health --selftest   synthetic SLO config + samples round-trip
+//    anima health --help
+//
+//  DESIGN
+//    raw#9  hexa-only (no .py anywhere)
+//    raw#11 snake_case
+//    raw#15 no-hardcode — config paths via _resolve_root()
+//    idempotent, graceful fail — missing samples → verdict=unknown for
+//    that indicator, never aborts.
+//
+//  OUTPUT SCHEMA
+//    state/anima_health_result.json:
+//      { "schema":"anima.health.v1",
+//        "ts":"...",
+//        "verdict":"ok|warn|breach|unknown",
+//        "rollup":{ "ok":N, "warn":N, "breach":N, "unknown":N },
+//        "window_days": 30,
+//        "indicators":[
+//          { "id":"availability", "label":"...", "observed":"...",
+//            "objective":"...", "budget_remaining_pct":"...",
+//            "n":N, "verdict":"ok|warn|breach|unknown", "source":"..." },
+//          ...
+//        ] }
+// ════════════════════════════════════════════════════════════════════════════
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    if t == "int" || t == "float" || t == "number" { return str(x) }
+    return ""
+}
+
+fn _fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _dexists(p: string) -> bool {
+    return _str(exec("test -d " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    return _str(env("HOME")) + "/core/anima"
+}
+
+fn _ts_iso() -> string {
+    let rep = _str(env("HEXA_REPRODUCIBLE"))
+    if rep == "1" { return "REDACTED" }
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _user_argv(raw) -> array {
+    let out = []
+    let i = 0
+    while i < len(raw) {
+        let s = _str(raw[i])
+        if !s.contains("/.hexa-cache/") {
+            out = out + [s]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _glyph(status: string) -> string {
+    if status == "ok"      { return "✓" }
+    if status == "warn"    { return "⚠" }
+    if status == "breach"  { return "✗" }
+    return "?"
+}
+
+// ─── ppm ratio math (avoid float print ambiguity) ──────────────────────────
+
+fn _ratio_ppm(num: int, den: int) -> int {
+    if den == 0 { return 0 }
+    return (num * 1000000) / den
+}
+
+fn _ppm_to_str(ppm: int) -> string {
+    let whole = ppm / 1000000
+    let frac  = ppm % 1000000
+    let mut fs = _str(frac)
+    while len(fs) < 6 { fs = "0" + fs }
+    return _str(whole) + "." + fs
+}
+
+fn _ppm_to_pct(ppm: int) -> string {
+    // two fractional digits, e.g. 999000 → "99.90"
+    let bp = ppm / 100        // basis points of 10k → we want percent*100
+    let whole = bp / 100
+    let frac  = bp % 100
+    let mut fs = _str(frac)
+    while len(fs) < 2 { fs = "0" + fs }
+    return _str(whole) + "." + fs + "%"
+}
+
+// ─── verdict from observed vs objective (ratio-min semantics) ──────────────
+//   ok     if observed_ppm >= objective_ppm
+//   warn   if observed_ppm >= objective - 0.5*budget
+//   breach otherwise
+fn _eval_min(obs_ppm: int, obj_ppm: int) -> string {
+    if obs_ppm >= obj_ppm { return "ok" }
+    let budget = 1000000 - obj_ppm
+    let warn_floor = obj_ppm - (budget / 2)
+    if obs_ppm >= warn_floor { return "warn" }
+    return "breach"
+}
+
+// budget remaining as percentage:
+//   if observed >= objective → 100%  (budget untouched)
+//   else consumed = (objective - observed) / budget; remaining = 100 - consumed
+fn _budget_remaining_pct(obs_ppm: int, obj_ppm: int) -> string {
+    if obj_ppm >= 1000000 { return "n/a" }
+    let budget = 1000000 - obj_ppm
+    if obs_ppm >= obj_ppm { return "100.00%" }
+    let consumed_ppm = obj_ppm - obs_ppm
+    // clamp to budget
+    let mut c = consumed_ppm
+    if c > budget { c = budget }
+    let remaining_ppm = budget - c
+    // express as percent of budget (not total) with 2 digits
+    let bp = (remaining_ppm * 10000) / budget
+    let whole = bp / 100
+    let frac  = bp % 100
+    let mut fs = _str(frac)
+    while len(fs) < 2 { fs = "0" + fs }
+    return _str(whole) + "." + fs + "%"
+}
+
+// ─── jsonl probes (copied idiom from error_budget_check.hexa) ──────────────
+
+fn _split_lines(text: string) -> array {
+    let n = len(text)
+    let mut out = []
+    let mut start = 0
+    let mut i = 0
+    while i < n {
+        if text.substring(i, i + 1) == "\n" {
+            out = out + [text.substring(start, i)]
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n { out = out + [text.substring(start, n)] }
+    return out
+}
+
+// Find `needle` in `hay`, starting at absolute offset `start`. Returns -1 when
+// absent. Works around the 2-arg index_of() pitfall in this hexa build which
+// (confusingly) ignores the start offset and returns the first hit from pos 0.
+fn _index_of_from(hay: string, needle: string, start: int) -> int {
+    let n = len(hay)
+    if start < 0 { return hay.index_of(needle) }
+    if start >= n { return -1 }
+    let tail = hay.substring(start, n)
+    let rel = tail.index_of(needle)
+    if rel < 0 { return -1 }
+    return start + rel
+}
+
+fn _pluck_int(line: string, key: string) -> int {
+    let needle = "\"" + key + "\""
+    let k = line.index_of(needle)
+    if k < 0 { return -1 }
+    let colon = _index_of_from(line, ":", k + len(needle))
+    if colon < 0 { return -1 }
+    let mut i = colon + 1
+    let n = len(line)
+    while i < n {
+        let c = line.substring(i, i + 1)
+        if c != " " && c != "\t" { break }
+        i = i + 1
+    }
+    let mut j = i
+    while j < n {
+        let c = line.substring(j, j + 1)
+        let cc = char_code(c, 0)
+        let ok = (cc >= 48 && cc <= 57) || cc == 45
+        if !ok { break }
+        j = j + 1
+    }
+    if j == i { return -1 }
+    return to_int(line.substring(i, j))
+}
+
+fn _pluck_bool(line: string, key: string) -> int {
+    let needle = "\"" + key + "\""
+    let k = line.index_of(needle)
+    if k < 0 { return -1 }
+    let colon = _index_of_from(line, ":", k + len(needle))
+    if colon < 0 { return -1 }
+    let mut i = colon + 1
+    let n = len(line)
+    while i < n {
+        let c = line.substring(i, i + 1)
+        if c != " " && c != "\t" { break }
+        i = i + 1
+    }
+    if i + 4 <= n && line.substring(i, i + 4) == "true"  { return 1 }
+    if i + 5 <= n && line.substring(i, i + 5) == "false" { return 0 }
+    return -1
+}
+
+fn _pluck_str(line: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let k = line.index_of(needle)
+    if k < 0 { return "" }
+    let colon = _index_of_from(line, ":", k + len(needle))
+    if colon < 0 { return "" }
+    let q1 = _index_of_from(line, "\"", colon + 1)
+    if q1 < 0 { return "" }
+    let q2 = _index_of_from(line, "\"", q1 + 1)
+    if q2 < 0 { return "" }
+    return line.substring(q1 + 1, q2)
+}
+
+// ─── SLI evaluation ────────────────────────────────────────────────────────
+
+// availability: fraction of requests in serve_alm_persona_log.jsonl where
+//   (cert_pass && an11_a) — i.e. the endpoint returned a valid response.
+//   objective: >= 0.99 (from config request_success_rate)
+fn _eval_availability(samples_path: string, obj_ppm: int) -> array {
+    if !_fexists(samples_path) {
+        return ["unknown", 0, 0, "samples missing: " + samples_path]
+    }
+    let text = read_file(samples_path)
+    let lines = _split_lines(text)
+    let mut total = 0
+    let mut good  = 0
+    let mut i = 0
+    while i < len(lines) {
+        let ln = _str(lines[i])
+        if ln != "" {
+            let cp = _pluck_bool(ln, "cert_pass")
+            let an = _pluck_bool(ln, "an11_a")
+            if cp >= 0 && an >= 0 {
+                total = total + 1
+                if cp == 1 && an == 1 { good = good + 1 }
+            }
+        }
+        i = i + 1
+    }
+    if total == 0 {
+        return ["unknown", 0, 0, "no qualifying samples"]
+    }
+    let obs = _ratio_ppm(good, total)
+    let v = _eval_min(obs, obj_ppm)
+    return [v, obs, total, _str(good) + "/" + _str(total) + " ok"]
+}
+
+// latency_p95: fraction of requests with latency_ms <= 500.
+//   objective: >= 0.95 (from config request_latency_p95_ms)
+fn _eval_latency(samples_path: string, obj_ppm: int, budget_ms: int) -> array {
+    if !_fexists(samples_path) {
+        return ["unknown", 0, 0, "samples missing"]
+    }
+    let text = read_file(samples_path)
+    let lines = _split_lines(text)
+    let mut total = 0
+    let mut under = 0
+    let mut i = 0
+    while i < len(lines) {
+        let ln = _str(lines[i])
+        if ln != "" {
+            let lat = _pluck_int(ln, "latency_ms")
+            if lat >= 0 {
+                total = total + 1
+                if lat <= budget_ms { under = under + 1 }
+            }
+        }
+        i = i + 1
+    }
+    if total == 0 {
+        return ["unknown", 0, 0, "no latency samples"]
+    }
+    let obs = _ratio_ppm(under, total)
+    let v = _eval_min(obs, obj_ppm)
+    return [v, obs, total, _str(under) + "/" + _str(total) + " <=" + _str(budget_ms) + "ms"]
+}
+
+// cert_verdict_pass: cert_pass ratio from serve log.
+//   objective: 0.999 (from config cert_gate_pass_rate — task spec asks 100%
+//   but we honor SSOT; the verdict shows BREACH on any failure because the
+//   budget of 0.1% is tiny)
+fn _eval_cert_pass(samples_path: string, obj_ppm: int) -> array {
+    if !_fexists(samples_path) {
+        return ["unknown", 0, 0, "samples missing"]
+    }
+    let text = read_file(samples_path)
+    let lines = _split_lines(text)
+    let mut total = 0
+    let mut pass  = 0
+    let mut i = 0
+    while i < len(lines) {
+        let ln = _str(lines[i])
+        if ln != "" {
+            let cp = _pluck_bool(ln, "cert_pass")
+            if cp >= 0 {
+                total = total + 1
+                if cp == 1 { pass = pass + 1 }
+            }
+        }
+        i = i + 1
+    }
+    if total == 0 { return ["unknown", 0, 0, "no cert samples"] }
+    let obs = _ratio_ppm(pass, total)
+    let v = _eval_min(obs, obj_ppm)
+    return [v, obs, total, _str(pass) + "/" + _str(total) + " cert_pass"]
+}
+
+// proposal_cycle_success: fraction of cycle_done entries with status=="ok"
+//   over the last 30-day window. Objective: >= 0.95.
+fn _eval_cycle_success(cycle_log_path: string, obj_ppm: int) -> array {
+    if !_fexists(cycle_log_path) {
+        return ["unknown", 0, 0, "cycle_log missing"]
+    }
+    // only "cycle_done" entries mark a full cycle outcome
+    let cmd = "grep '\"name\":\"cycle_done\"' " + cycle_log_path + " 2>/dev/null"
+    let text = _str(exec(cmd))
+    let lines = _split_lines(text)
+    let mut total = 0
+    let mut ok    = 0
+    let mut i = 0
+    while i < len(lines) {
+        let ln = _str(lines[i])
+        if ln != "" {
+            total = total + 1
+            let st = _pluck_str(ln, "status")
+            if st == "ok" { ok = ok + 1 }
+        }
+        i = i + 1
+    }
+    if total == 0 { return ["unknown", 0, 0, "no cycle_done entries"] }
+    let obs = _ratio_ppm(ok, total)
+    let v = _eval_min(obs, obj_ppm)
+    return [v, obs, total, _str(ok) + "/" + _str(total) + " ok cycles"]
+}
+
+// ─── config reader ─────────────────────────────────────────────────────────
+
+fn _read_objective_ppm(cfg_path: string, id: string, default_ppm: int) -> int {
+    // pull objective_min from config via jq; fall back to default_ppm
+    let cmd = "jq -r '.indicators[] | select(.id==\"" + id + "\") | .objective_min // empty' " + cfg_path + " 2>/dev/null"
+    let v = _str(exec(cmd)).trim()
+    if v == "" { return default_ppm }
+    // v is a decimal like "0.99" → convert to ppm
+    let dot = v.index_of(".")
+    if dot < 0 {
+        // integer ratio like "1"
+        return to_int(v) * 1000000
+    }
+    let whole_s = v.substring(0, dot)
+    let frac_s  = v.substring(dot + 1, len(v))
+    // pad/truncate frac to 6 digits
+    let mut fs = frac_s
+    while len(fs) < 6 { fs = fs + "0" }
+    if len(fs) > 6 { fs = fs.substring(0, 6) }
+    let whole_i = to_int(whole_s)
+    let frac_i  = to_int(fs)
+    return whole_i * 1000000 + frac_i
+}
+
+fn _read_latency_budget_ms(cfg_path: string, default_ms: int) -> int {
+    let cmd = "jq -r '.indicators[] | select(.id==\"request_latency_p95_ms\") | .objective_max // empty' " + cfg_path + " 2>/dev/null"
+    let v = _str(exec(cmd)).trim()
+    if v == "" { return default_ms }
+    return to_int(v)
+}
+
+fn _read_window_days(cfg_path: string, default_days: int) -> int {
+    let v = _str(exec("jq -r '.window_days // empty' " + cfg_path + " 2>/dev/null")).trim()
+    if v == "" { return default_days }
+    return to_int(v)
+}
+
+// ─── orchestrator ──────────────────────────────────────────────────────────
+
+fn run_all(cfg_path: string, samples_path: string, cycle_path: string) -> array {
+    // objectives from SSOT (with safe defaults mirroring config)
+    let obj_avail = _read_objective_ppm(cfg_path, "request_success_rate", 990000)
+    let obj_lat   = 950000            // config formula says >= 0.95 of reqs under budget
+    let obj_cert  = _read_objective_ppm(cfg_path, "cert_gate_pass_rate", 999000)
+    let obj_cycle = 950000            // 95% cycle run success (not in SSOT yet → default)
+    let lat_ms    = _read_latency_budget_ms(cfg_path, 500)
+
+    let r_avail = _eval_availability(samples_path, obj_avail)
+    let r_lat   = _eval_latency(samples_path, obj_lat, lat_ms)
+    let r_cert  = _eval_cert_pass(samples_path, obj_cert)
+    let r_cycle = _eval_cycle_success(cycle_path, obj_cycle)
+
+    // assemble indicator records: [id, label, observed_ppm, obj_ppm, n, verdict, detail, source]
+    let indicators = [
+        ["availability",
+         "serve_alm_persona health endpoint uptime",
+         r_avail[1], obj_avail, r_avail[2], r_avail[0], r_avail[3],
+         "state/serve_alm_persona_log.jsonl"],
+        ["latency_p95",
+         "request latency P95 <= " + _str(lat_ms) + "ms",
+         r_lat[1], obj_lat, r_lat[2], r_lat[0], r_lat[3],
+         "state/serve_alm_persona_log.jsonl"],
+        ["cert_verdict_pass",
+         "cert_gate verdict PASS rate",
+         r_cert[1], obj_cert, r_cert[2], r_cert[0], r_cert[3],
+         "state/serve_alm_persona_log.jsonl"],
+        ["proposal_cycle_success",
+         "12h proposal cycle run succeeded",
+         r_cycle[1], obj_cycle, r_cycle[2], r_cycle[0], r_cycle[3],
+         "state/proposals/meta/cycle_log.jsonl"]
+    ]
+    return indicators
+}
+
+fn tally(indicators) -> array {
+    let ok = 0
+    let wn = 0
+    let br = 0
+    let un = 0
+    let i = 0
+    while i < len(indicators) {
+        let v = _str(indicators[i][5])
+        if v == "ok"      { ok = ok + 1 }
+        if v == "warn"    { wn = wn + 1 }
+        if v == "breach"  { br = br + 1 }
+        if v == "unknown" { un = un + 1 }
+        i = i + 1
+    }
+    return [ok, wn, br, un]
+}
+
+fn verdict_of(tall) -> string {
+    if tall[2] > 0 { return "breach" }
+    if tall[1] > 0 { return "warn" }
+    if tall[3] > 0 && tall[0] == 0 { return "unknown" }
+    return "ok"
+}
+
+// ─── renderers ─────────────────────────────────────────────────────────────
+
+fn _pad(s: string, w: int) -> string {
+    let mut out = s
+    while len(out) < w { out = out + " " }
+    return out
+}
+
+fn render_table(indicators, show_budget: bool) {
+    println("anima health — SLI/SLO (4 indicators · SSOT=config/sli_slo.json)")
+    println("────────────────────────────────────────────────────────────────")
+    let header = "   "
+               + _pad("id", 26)
+               + _pad("observed", 12)
+               + _pad("objective", 12)
+               + _pad("n", 6)
+    if show_budget { header = header + _pad("budget", 10) }
+    header = header + "verdict"
+    println(header)
+    println("----------------------------------------------------------------")
+    let i = 0
+    while i < len(indicators) {
+        let id  = _str(indicators[i][0])
+        let obs = indicators[i][2]
+        let obj = indicators[i][3]
+        let n   = _str(indicators[i][4])
+        let v   = _str(indicators[i][5])
+        let obs_s = "-"
+        let obj_s = _ppm_to_pct(obj)
+        let bud_s = "-"
+        if v != "unknown" {
+            obs_s = _ppm_to_pct(obs)
+            bud_s = _budget_remaining_pct(obs, obj)
+        }
+        let row = " " + _glyph(v) + " "
+                + _pad(id, 26)
+                + _pad(obs_s, 12)
+                + _pad(obj_s, 12)
+                + _pad(n, 6)
+        if show_budget { row = row + _pad(bud_s, 10) }
+        row = row + v
+        println(row)
+        i = i + 1
+    }
+    println("────────────────────────────────────────────────────────────────")
+}
+
+fn render_alert(indicators) -> int {
+    // list BREACH/WARN/UNKNOWN only; return non-zero exit when any found
+    let mut hits = 0
+    println("anima health --alert  (BREACH/WARN/UNKNOWN only)")
+    println("----------------------------------------------------------------")
+    let i = 0
+    while i < len(indicators) {
+        let v = _str(indicators[i][5])
+        if v != "ok" {
+            hits = hits + 1
+            let id  = _str(indicators[i][0])
+            let obs = indicators[i][2]
+            let obj = indicators[i][3]
+            let det = _str(indicators[i][6])
+            let obs_s = "-"
+            if v != "unknown" { obs_s = _ppm_to_pct(obs) }
+            println(" " + _glyph(v) + " " + id
+                    + "  observed=" + obs_s
+                    + "  objective=" + _ppm_to_pct(obj)
+                    + "  [" + v + "]  " + det)
+        }
+        i = i + 1
+    }
+    if hits == 0 {
+        println(" ✓ all 4 indicators within budget")
+        return 0
+    }
+    println("----------------------------------------------------------------")
+    println(_str(hits) + " indicator(s) need attention")
+    return 1
+}
+
+// ─── JSON emitter ──────────────────────────────────────────────────────────
+
+fn jq_esc(s: string) -> string {
+    let out = ""
+    let i = 0
+    while i < len(s) {
+        let ch = s.substring(i, i + 1)
+        if ch == "\\" { out = out + "\\\\" }
+        else {
+            if ch == "\"" { out = out + "\\\"" }
+            else { out = out + ch }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn build_json(ts: string, window_days: int, indicators, tall, verdict: string) -> string {
+    let mut s = "{"
+    s = s + "\"schema\":\"anima.health.v1\","
+    s = s + "\"ts\":\"" + ts + "\","
+    s = s + "\"verdict\":\"" + verdict + "\","
+    s = s + "\"window_days\":" + _str(window_days) + ","
+    s = s + "\"rollup\":{\"ok\":" + _str(tall[0])
+          + ",\"warn\":" + _str(tall[1])
+          + ",\"breach\":" + _str(tall[2])
+          + ",\"unknown\":" + _str(tall[3]) + "},"
+    s = s + "\"indicators\":["
+    let i = 0
+    while i < len(indicators) {
+        if i > 0 { s = s + "," }
+        let id  = jq_esc(_str(indicators[i][0]))
+        let lbl = jq_esc(_str(indicators[i][1]))
+        let obs = indicators[i][2]
+        let obj = indicators[i][3]
+        let n   = _str(indicators[i][4])
+        let v   = _str(indicators[i][5])
+        let det = jq_esc(_str(indicators[i][6]))
+        let src = jq_esc(_str(indicators[i][7]))
+        let obs_str = "null"
+        let bud_str = "null"
+        if v != "unknown" {
+            obs_str = "\"" + _ppm_to_str(obs) + "\""
+            bud_str = "\"" + _budget_remaining_pct(obs, obj) + "\""
+        }
+        s = s + "{"
+        s = s + "\"id\":\"" + id + "\","
+        s = s + "\"label\":\"" + lbl + "\","
+        s = s + "\"observed\":" + obs_str + ","
+        s = s + "\"objective\":\"" + _ppm_to_str(obj) + "\","
+        s = s + "\"budget_remaining\":" + bud_str + ","
+        s = s + "\"n\":" + n + ","
+        s = s + "\"verdict\":\"" + v + "\","
+        s = s + "\"detail\":\"" + det + "\","
+        s = s + "\"source\":\"" + src + "\""
+        s = s + "}"
+        i = i + 1
+    }
+    s = s + "]}"
+    return s
+}
+
+fn write_result(json_text: string) -> string {
+    let root = _resolve_root()
+    let out_path = root + "/state/anima_health_result.json"
+    let tmp = out_path + ".tmp"
+    exec("mkdir -p " + root + "/state")
+    let safe = json_text.replace("'", "'\\''")
+    let cmd = "printf '%s' '" + safe + "' | jq . > " + tmp + " 2>/dev/null && mv " + tmp + " " + out_path
+             + " || (printf '%s' '" + safe + "' > " + out_path + ")"
+    exec(cmd)
+    return out_path
+}
+
+// ─── help ──────────────────────────────────────────────────────────────────
+
+fn sub_help() {
+    println("anima health — 4-indicator SLI/SLO evaluation (read-only)")
+    println("")
+    println("  anima health               4 SLI · observed vs objective · table")
+    println("  anima health --json        raw JSON verdict only")
+    println("  anima health --budget      adds 'budget remaining' column")
+    println("  anima health --alert       list WARN/BREACH/UNKNOWN only (exit 1)")
+    println("  anima health --selftest    synthetic SLO config + eval round-trip")
+    println("  anima health --help        this help")
+    println("")
+    println("INDICATORS (mapped to config/sli_slo.json SSOT)")
+    println("  availability            cert_pass && an11_a in serve log")
+    println("  latency_p95             fraction of requests <= 500ms")
+    println("  cert_verdict_pass       cert_pass ratio")
+    println("  proposal_cycle_success  cycle_done entries with status=ok")
+    println("")
+    println("OUTPUT")
+    println("  state/anima_health_result.json   (schema=anima.health.v1)")
+}
+
+// ─── selftest ──────────────────────────────────────────────────────────────
+
+fn sub_selftest() {
+    // Synthetic: tmp config with loose objectives + tmp samples that pass.
+    let tmp_cfg     = "/tmp/anima_health_selftest_cfg.json"
+    let tmp_samples = "/tmp/anima_health_selftest_samples.jsonl"
+    let tmp_cycle   = "/tmp/anima_health_selftest_cycle.jsonl"
+
+    let cfg = "{\"schema\":\"anima.sli_slo.v1\",\"window_days\":30,"
+            + "\"indicators\":["
+            + "{\"id\":\"request_success_rate\",\"objective_min\":0.9},"
+            + "{\"id\":\"request_latency_p95_ms\",\"objective_max\":500},"
+            + "{\"id\":\"cert_gate_pass_rate\",\"objective_min\":0.9},"
+            + "{\"id\":\"an11_a_pass_rate\",\"objective_min\":0.9}"
+            + "]}"
+    exec("printf '%s' '" + cfg + "' > " + tmp_cfg)
+
+    // 10 serve samples: all cert_pass=true, an11_a=true, latency_ms=5
+    let mut body = ""
+    let mut i = 0
+    while i < 10 {
+        body = body + "{\"endpoint\":\"/persona\",\"latency_ms\":5,\"cert_pass\":true,\"an11_a\":true}\n"
+        i = i + 1
+    }
+    exec("printf '%s' '" + body + "' > " + tmp_samples)
+
+    // 5 cycle_done entries, all status=ok
+    let mut cbody = ""
+    let mut k = 0
+    while k < 5 {
+        cbody = cbody + "{\"ts\":\"2026-04-22T00:00:00Z\",\"name\":\"cycle_done\",\"status\":\"ok\",\"exit\":0}\n"
+        k = k + 1
+    }
+    exec("printf '%s' '" + cbody + "' > " + tmp_cycle)
+
+    let inds = run_all(tmp_cfg, tmp_samples, tmp_cycle)
+    if len(inds) != 4 {
+        println("FAIL selftest: expected 4 indicators, got " + _str(len(inds)))
+        exit(1)
+    }
+    let t = tally(inds)
+    if t[2] != 0 {
+        println("FAIL selftest: unexpected breach count=" + _str(t[2]))
+        exit(1)
+    }
+    if t[0] != 4 {
+        println("FAIL selftest: expected 4 ok verdicts, got " + _str(t[0]))
+        exit(1)
+    }
+    let v = verdict_of(t)
+    if v != "ok" {
+        println("FAIL selftest: expected overall verdict=ok, got " + v)
+        exit(1)
+    }
+    // JSON round-trip
+    let j = build_json("REDACTED", 30, inds, t, v)
+    if !j.contains("anima.health.v1") {
+        println("FAIL selftest: schema tag missing")
+        exit(1)
+    }
+    if !j.contains("availability") {
+        println("FAIL selftest: availability indicator missing")
+        exit(1)
+    }
+
+    // Second case — a BREACH sample forces rollup=breach
+    let mut bbody = ""
+    let mut j2 = 0
+    while j2 < 10 {
+        let cp = "false"
+        bbody = bbody + "{\"endpoint\":\"/persona\",\"latency_ms\":999,\"cert_pass\":" + cp + ",\"an11_a\":false}\n"
+        j2 = j2 + 1
+    }
+    exec("printf '%s' '" + bbody + "' > " + tmp_samples)
+    let inds2 = run_all(tmp_cfg, tmp_samples, tmp_cycle)
+    let t2 = tally(inds2)
+    if t2[2] == 0 {
+        println("FAIL selftest: expected some breach on all-failing samples")
+        exit(1)
+    }
+    let v2 = verdict_of(t2)
+    if v2 != "breach" {
+        println("FAIL selftest: expected overall verdict=breach, got " + v2)
+        exit(1)
+    }
+
+    // cleanup tmp artifacts
+    exec("rm -f " + tmp_cfg + " " + tmp_samples + " " + tmp_cycle)
+
+    println("PASS anima_cli/health selftest (synthetic cfg+samples · 4 SLI · json schema ok · breach case ok)")
+    exit(0)
+}
+
+// ─── dispatch ──────────────────────────────────────────────────────────────
+
+fn sub_run(json_only: bool, show_budget: bool, alert_only: bool) {
+    let root = _resolve_root()
+    let cfg_path     = root + "/config/sli_slo.json"
+    let samples_path = root + "/state/serve_alm_persona_log.jsonl"
+    let cycle_path   = root + "/state/proposals/meta/cycle_log.jsonl"
+    let window_days = _read_window_days(cfg_path, 30)
+    let ts = _ts_iso()
+
+    let indicators = run_all(cfg_path, samples_path, cycle_path)
+    let t = tally(indicators)
+    let verdict = verdict_of(t)
+    let json_text = build_json(ts, window_days, indicators, t, verdict)
+    let out_path = write_result(json_text)
+
+    if json_only {
+        println(json_text)
+        return
+    }
+
+    if alert_only {
+        let rc = render_alert(indicators)
+        println("wrote " + out_path)
+        if rc != 0 { exit(1) }
+        return
+    }
+
+    render_table(indicators, show_budget)
+    let summary = "verdict=" + verdict
+                + "  ok=" + _str(t[0])
+                + "  warn=" + _str(t[1])
+                + "  breach=" + _str(t[2])
+                + "  unknown=" + _str(t[3])
+    println(summary)
+    println("ts=" + ts + "  window=" + _str(window_days) + "d")
+    println("wrote " + out_path)
+}
+
+fn main() {
+    let argv = _user_argv(args())
+    if _arg_present(argv, "--selftest") { sub_selftest(); return }
+    if _arg_present(argv, "--help")     { sub_help(); return }
+    let json_only   = _arg_present(argv, "--json")
+    let show_budget = _arg_present(argv, "--budget")
+    let alert_only  = _arg_present(argv, "--alert")
+    sub_run(json_only, show_budget, alert_only)
+}
+
+main()

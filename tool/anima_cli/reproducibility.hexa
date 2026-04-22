@@ -1,0 +1,566 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_cli/reproducibility.hexa — anima CLI `reproducibility` topic
+//
+//  PURPOSE
+//    DD1 — 2-run byte-diff verification across every deterministic-emit tool
+//    in the anima repo. Runs each target tool TWICE under a pinned
+//    HEXA_REPRODUCIBLE=1 + SOURCE_DATE_EPOCH=0 envelope, snapshots the
+//    primary emit output after each run, then asserts sha256(run_a) ==
+//    sha256(run_b). Any drift is reported per-tool with a short unified
+//    diff sample.
+//
+//    Methodology (per tool/reproducible_emit_check.hexa / hexa-lang PR #23):
+//      1. snapshot baseline (current emit file → /tmp)
+//      2. run target under HEXA_REPRODUCIBLE=1 SOURCE_DATE_EPOCH=0
+//      3. snapshot → run_a, sha256(run_a)
+//      4. restore baseline
+//      5. run target again with identical env
+//      6. snapshot → run_b, sha256(run_b)
+//      7. compare; restore baseline (idempotent, no side effects)
+//
+//  TARGET TOOLS (7 declared deterministic — HEXA_REPRODUCIBLE=1 byte-stable)
+//      tool/h100_launch_manifest_spec.hexa   → state/h100_launch_manifest.json
+//      tool/openapi_emit.hexa                → docs/api/openapi.yaml
+//      tool/cert_graph_gen.hexa              → state/cert_graph.json
+//      tool/auto_tool_index.hexa             → docs/tool_index_auto.md
+//      tool/roadmap_diff_viz.hexa            → docs/roadmap_diff_viz.md
+//      tool/api_surface_extract.hexa         → docs/api/ (per-tool .md)
+//      tool/phi_cpu_synthetic_4path.hexa     → state/phi_cpu_synthetic_4path_result.json
+//
+//  SUBCOMMANDS
+//    (none)                    verify all 7 registered tools · table
+//    --tool <name>             single-tool verification (path-rel or stem match)
+//    --json                    machine-readable (schema anima.reproducibility.v1)
+//    --selftest                verify 1 tool (h100_launch_manifest_spec) 2-run diff
+//    --help
+//
+//  STATE
+//    state/anima_reproducibility_result.json  (schema anima.reproducibility.v1)
+//      · ts · per-tool verdict (match|drift|error) · hash_a · hash_b
+//      · total count · drift_count · error_count
+//
+//  DESIGN
+//    raw#9  hexa-only (NO .py · bash one-liners only) · raw#11 snake_case
+//    raw#15 no-hardcode (paths via _resolve_root / ANIMA env)
+//    Idempotent (baselines restored). Deterministic (HEXA_REPRODUCIBLE=1).
+//    Env pinning: HEXA_REPRODUCIBLE=1 SOURCE_DATE_EPOCH=0 → epoch-0 timestamps
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── shared helpers (vendored sibling pattern) ──────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _ts_iso() -> string {
+    let rep = _str(env("HEXA_REPRODUCIBLE"))
+    if rep == "1" { return "REDACTED" }
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn _fexists(p: string) -> bool {
+    return _str(exec("test -e " + _shell_quote(p) + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _dexists(p: string) -> bool {
+    return _str(exec("test -d " + _shell_quote(p) + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    return _str(env("HOME")) + "/core/anima"
+}
+
+fn _hexa() -> string {
+    let h = _str(env("HEXA_BIN"))
+    if h != "" { return h }
+    return "/Users/ghost/.hx/bin/hexa"
+}
+
+fn _user_argv(raw) -> array {
+    let out = []
+    let i = 0
+    while i < len(raw) {
+        let s = _str(raw[i])
+        if !s.contains("/.hexa-cache/") {
+            out = out + [s]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _arg_value(argv, key: string, dflt: string) -> string {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key && i + 1 < len(argv) {
+            return _str(argv[i + 1])
+        }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _shell_quote(s: string) -> string {
+    // single-quote + escape embedded single quotes
+    let esc = s.replace("'", "'\\''")
+    return "'" + esc + "'"
+}
+
+fn _pad_right(s: string, w: int) -> string {
+    let out = s
+    while len(out) < w {
+        out = out + " "
+    }
+    return out
+}
+
+fn _sha256_file(p: string) -> string {
+    if !_fexists(p) { return "" }
+    return _str(exec("shasum -a 256 " + _shell_quote(p) + " | awk '{print $1}'")).trim()
+}
+
+fn _sha256_dir(p: string) -> string {
+    // stable sha across a whole directory: list · sort · concat contents · hash
+    if !_dexists(p) { return "" }
+    let cmd = "find " + _shell_quote(p) + " -type f | LC_ALL=C sort | "
+            + "xargs shasum -a 256 2>/dev/null | shasum -a 256 | awk '{print $1}'"
+    return _str(exec(cmd)).trim()
+}
+
+// ─── target registry ────────────────────────────────────────────────────────
+//   [stem, tool_rel, emit_rel, kind]   kind ∈ "file" | "dir"
+//   The 7 canonically deterministic tools. Extend as new tools adopt
+//   HEXA_REPRODUCIBLE=1 byte-stable emit.
+
+fn _targets() -> array {
+    return [
+        ["h100_launch_manifest_spec",
+            "tool/h100_launch_manifest_spec.hexa",
+            "state/h100_launch_manifest.json",
+            "file"],
+        ["openapi_emit",
+            "tool/openapi_emit.hexa",
+            "docs/api/openapi.yaml",
+            "file"],
+        ["cert_graph_gen",
+            "tool/cert_graph_gen.hexa",
+            "state/cert_graph.json",
+            "file"],
+        ["auto_tool_index",
+            "tool/auto_tool_index.hexa",
+            "docs/tool_index_auto.md",
+            "file"],
+        ["roadmap_diff_viz",
+            "tool/roadmap_diff_viz.hexa",
+            "docs/roadmap_diff_viz.md",
+            "file"],
+        ["api_surface_extract",
+            "tool/api_surface_extract.hexa",
+            "docs/api",
+            "dir"],
+        ["phi_cpu_synthetic_4path",
+            "tool/phi_cpu_synthetic_4path.hexa",
+            "state/phi_cpu_synthetic_4path_result.json",
+            "file"]
+    ]
+}
+
+// ─── core 2-run check ───────────────────────────────────────────────────────
+//  Returns [verdict, hash_a, hash_b, detail]
+//    verdict ∈ "match" | "drift" | "error"
+
+fn _check_one(stem: string, tool_rel: string, emit_rel: string,
+              kind: string) -> array {
+    let root = _resolve_root()
+    let tool_abs = root + "/" + tool_rel
+    let emit_abs = root + "/" + emit_rel
+
+    if !_fexists(tool_abs) {
+        return ["error", "", "", "tool missing: " + tool_rel]
+    }
+
+    // snapshot baseline (file or dir)
+    let baseline_existed = _fexists(emit_abs)
+    let baseline_tmp = "/tmp/_anima_repro_baseline_" + stem
+    if baseline_existed {
+        if kind == "dir" {
+            exec("rm -rf " + _shell_quote(baseline_tmp))
+            exec("cp -R " + _shell_quote(emit_abs) + " " + _shell_quote(baseline_tmp))
+        } else {
+            exec("cp " + _shell_quote(emit_abs) + " " + _shell_quote(baseline_tmp))
+        }
+    }
+
+    // env envelope — pin to epoch 0 + reproducible flag
+    let env_prefix = "HEXA_REPRODUCIBLE=1 SOURCE_DATE_EPOCH=0 "
+
+    // Run A
+    let cmd_a = "cd " + _shell_quote(root) + " && " + env_prefix
+              + _hexa() + " run " + _shell_quote(tool_rel) + " >/dev/null 2>&1; echo $?"
+    let ec_a = _str(exec(cmd_a)).trim()
+    if ec_a != "0" {
+        _restore_baseline(emit_abs, baseline_tmp, baseline_existed, kind)
+        return ["error", "", "", "run_a exit=" + ec_a]
+    }
+    let hash_a = ""
+    let snap_a_path = "/tmp/_anima_repro_run_a_" + stem
+    if kind == "dir" {
+        hash_a = _sha256_dir(emit_abs)
+        exec("rm -rf " + _shell_quote(snap_a_path))
+        exec("cp -R " + _shell_quote(emit_abs) + " " + _shell_quote(snap_a_path))
+    } else {
+        hash_a = _sha256_file(emit_abs)
+        exec("cp " + _shell_quote(emit_abs) + " " + _shell_quote(snap_a_path))
+    }
+
+    // restore baseline (so prev_hash chain / input is identical for run B)
+    _restore_baseline(emit_abs, baseline_tmp, baseline_existed, kind)
+
+    // Run B
+    let cmd_b = "cd " + _shell_quote(root) + " && " + env_prefix
+              + _hexa() + " run " + _shell_quote(tool_rel) + " >/dev/null 2>&1; echo $?"
+    let ec_b = _str(exec(cmd_b)).trim()
+    if ec_b != "0" {
+        _restore_baseline(emit_abs, baseline_tmp, baseline_existed, kind)
+        exec("rm -rf " + _shell_quote(snap_a_path))
+        return ["error", hash_a, "", "run_b exit=" + ec_b]
+    }
+    let hash_b = ""
+    let snap_b_path = "/tmp/_anima_repro_run_b_" + stem
+    if kind == "dir" {
+        hash_b = _sha256_dir(emit_abs)
+        exec("rm -rf " + _shell_quote(snap_b_path))
+        exec("cp -R " + _shell_quote(emit_abs) + " " + _shell_quote(snap_b_path))
+    } else {
+        hash_b = _sha256_file(emit_abs)
+        exec("cp " + _shell_quote(emit_abs) + " " + _shell_quote(snap_b_path))
+    }
+
+    // final restore — no side effects
+    _restore_baseline(emit_abs, baseline_tmp, baseline_existed, kind)
+
+    let detail = ""
+    let verdict = "drift"
+    if hash_a == hash_b && hash_a != "" {
+        verdict = "match"
+    } else {
+        // sample a short diff for debugging
+        if kind == "file" {
+            detail = _str(exec("diff -u " + _shell_quote(snap_a_path) + " "
+                        + _shell_quote(snap_b_path) + " 2>/dev/null | head -6")).trim()
+        } else {
+            detail = _str(exec("diff -r " + _shell_quote(snap_a_path) + " "
+                        + _shell_quote(snap_b_path) + " 2>/dev/null | head -6")).trim()
+        }
+        if detail == "" { detail = "empty hash (emit not produced)" }
+    }
+
+    // cleanup tmp snapshots
+    exec("rm -rf " + _shell_quote(snap_a_path) + " " + _shell_quote(snap_b_path)
+            + " " + _shell_quote(baseline_tmp))
+
+    return [verdict, hash_a, hash_b, detail]
+}
+
+fn _restore_baseline(emit_abs: string, baseline_tmp: string,
+                     existed: bool, kind: string) {
+    if existed {
+        if kind == "dir" {
+            exec("rm -rf " + _shell_quote(emit_abs))
+            exec("cp -R " + _shell_quote(baseline_tmp) + " " + _shell_quote(emit_abs))
+        } else {
+            exec("cp " + _shell_quote(baseline_tmp) + " " + _shell_quote(emit_abs))
+        }
+    } else {
+        if kind == "dir" {
+            exec("rm -rf " + _shell_quote(emit_abs))
+        } else {
+            exec("rm -f " + _shell_quote(emit_abs))
+        }
+    }
+}
+
+// ─── state write (schema anima.reproducibility.v1) ──────────────────────────
+
+fn _write_result(rows, match_count: int, drift_count: int,
+                 error_count: int, total: int) {
+    let root = _resolve_root()
+    let state_dir = root + "/state"
+    if !_dexists(state_dir) { exec("mkdir -p " + _shell_quote(state_dir)) }
+    let out_path = state_dir + "/anima_reproducibility_result.json"
+    let ts = _ts_iso()
+
+    let body = "{\"schema\":\"anima.reproducibility.v1\",\"ts\":\"" + ts + "\","
+    body = body + "\"env_pin\":\"HEXA_REPRODUCIBLE=1 SOURCE_DATE_EPOCH=0\","
+    body = body + "\"total\":" + str(total) + ","
+    body = body + "\"match_count\":" + str(match_count) + ","
+    body = body + "\"drift_count\":" + str(drift_count) + ","
+    body = body + "\"error_count\":" + str(error_count) + ","
+    body = body + "\"tools\":["
+    let i = 0
+    while i < len(rows) {
+        let r = rows[i]
+        if i > 0 { body = body + "," }
+        let stem = _str(r[0])
+        let tool_rel = _str(r[1])
+        let emit_rel = _str(r[2])
+        let verdict = _str(r[3])
+        let ha = _str(r[4])
+        let hb = _str(r[5])
+        let detail = _str(r[6])
+        body = body + "{\"stem\":\"" + stem + "\","
+        body = body + "\"tool\":\"" + tool_rel + "\","
+        body = body + "\"emit\":\"" + emit_rel + "\","
+        body = body + "\"verdict\":\"" + verdict + "\","
+        body = body + "\"hash_a\":\"" + ha + "\","
+        body = body + "\"hash_b\":\"" + hb + "\""
+        if detail != "" {
+            let de = detail.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+            body = body + ",\"detail\":\"" + de + "\""
+        }
+        body = body + "}"
+        i = i + 1
+    }
+    body = body + "]}"
+
+    // jq pretty (tolerate jq absent)
+    let tmp = "/tmp/anima_reproducibility_result.stage.json"
+    exec("printf '%s' " + _shell_quote(body) + " > " + tmp)
+    let jq_ok = _str(exec("command -v jq >/dev/null 2>&1 && echo 1 || echo 0")).trim()
+    if jq_ok == "1" {
+        exec("jq . " + _shell_quote(tmp) + " > " + _shell_quote(out_path)
+                + " 2>/dev/null || cp " + _shell_quote(tmp) + " " + _shell_quote(out_path))
+    } else {
+        exec("cp " + _shell_quote(tmp) + " " + _shell_quote(out_path))
+    }
+    exec("rm -f " + _shell_quote(tmp))
+}
+
+// ─── rendering ──────────────────────────────────────────────────────────────
+
+fn _render_table(rows, match_count: int, drift_count: int,
+                 error_count: int, total: int) {
+    println(_pad_right("tool", 32) + "  " + _pad_right("verdict", 8)
+            + "  " + _pad_right("hash_a", 14) + "  " + "detail")
+    let i = 0
+    while i < len(rows) {
+        let r = rows[i]
+        let stem = _str(r[0])
+        let verdict = _str(r[3])
+        let ha = _str(r[4])
+        let short = ha
+        if len(ha) > 12 { short = ha.substring(0, 12) }
+        let detail = _str(r[6])
+        if len(detail) > 60 { detail = detail.substring(0, 60) + "…" }
+        println(_pad_right(stem, 32) + "  " + _pad_right(verdict, 8)
+                + "  " + _pad_right(short, 14) + "  " + detail)
+        i = i + 1
+    }
+    let summary = str(match_count) + "/" + str(total) + " match"
+    if drift_count > 0 { summary = summary + " · " + str(drift_count) + " drift" }
+    if error_count > 0 { summary = summary + " · " + str(error_count) + " error" }
+    println(_pad_right("TOTAL", 32) + "  " + summary)
+}
+
+fn _render_json() {
+    let p = _resolve_root() + "/state/anima_reproducibility_result.json"
+    if _fexists(p) {
+        println(_str(exec("cat " + _shell_quote(p))))
+    }
+}
+
+// ─── subcommands ────────────────────────────────────────────────────────────
+
+fn sub_help() {
+    println("anima reproducibility — DD1 2-run byte-diff verifier")
+    println("")
+    println("  (no subcmd)           verify all 7 deterministic tools · table")
+    println("  --tool <stem|path>    single-tool verification")
+    println("  --json                machine-readable (anima.reproducibility.v1)")
+    println("  --selftest            1-tool 2-run diff self-check")
+    println("  --help                this help")
+    println("")
+    println("ENV PIN")
+    println("  HEXA_REPRODUCIBLE=1 SOURCE_DATE_EPOCH=0  (pinned per run)")
+    println("")
+    println("REGISTERED TOOLS (7)")
+    let tgts = _targets()
+    let i = 0
+    while i < len(tgts) {
+        let t = tgts[i]
+        println("  " + _pad_right(_str(t[0]), 28) + " → " + _str(t[2]))
+        i = i + 1
+    }
+    println("")
+    println("State: state/anima_reproducibility_result.json")
+}
+
+fn _match_target(targets, needle: string) -> int {
+    // match by stem, tool_rel, or emit_rel substring; -1 if not found
+    let i = 0
+    while i < len(targets) {
+        let t = targets[i]
+        let stem = _str(t[0])
+        let tool_rel = _str(t[1])
+        let emit_rel = _str(t[2])
+        if stem == needle { return i }
+        if tool_rel == needle { return i }
+        if emit_rel == needle { return i }
+        // stem substring or tool-path-stem match (e.g. "openapi")
+        if tool_rel.contains(needle) { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn sub_all(emit_json: bool) {
+    let tgts = _targets()
+    let rows = []
+    let match_count = 0
+    let drift_count = 0
+    let error_count = 0
+    let total = len(tgts)
+    let i = 0
+    while i < total {
+        let t = tgts[i]
+        let stem = _str(t[0])
+        let tool_rel = _str(t[1])
+        let emit_rel = _str(t[2])
+        let kind = _str(t[3])
+        let r = _check_one(stem, tool_rel, emit_rel, kind)
+        let verdict = _str(r[0])
+        let ha = _str(r[1])
+        let hb = _str(r[2])
+        let det = _str(r[3])
+        if verdict == "match" { match_count = match_count + 1 }
+        if verdict == "drift" { drift_count = drift_count + 1 }
+        if verdict == "error" { error_count = error_count + 1 }
+        rows = rows + [[stem, tool_rel, emit_rel, verdict, ha, hb, det]]
+        i = i + 1
+    }
+    _write_result(rows, match_count, drift_count, error_count, total)
+    if emit_json {
+        _render_json()
+        return
+    }
+    _render_table(rows, match_count, drift_count, error_count, total)
+}
+
+fn sub_single(needle: string, emit_json: bool) {
+    let tgts = _targets()
+    let idx = _match_target(tgts, needle)
+    if idx < 0 {
+        println("reproducibility: unknown tool '" + needle + "'")
+        println("                 run `anima reproducibility --help` for the list")
+        exit(2)
+    }
+    let t = tgts[idx]
+    let stem = _str(t[0])
+    let tool_rel = _str(t[1])
+    let emit_rel = _str(t[2])
+    let kind = _str(t[3])
+    let r = _check_one(stem, tool_rel, emit_rel, kind)
+    let verdict = _str(r[0])
+    let ha = _str(r[1])
+    let hb = _str(r[2])
+    let det = _str(r[3])
+    let rows = [[stem, tool_rel, emit_rel, verdict, ha, hb, det]]
+    let mc = 0
+    let dc = 0
+    let ec = 0
+    if verdict == "match" { mc = 1 }
+    if verdict == "drift" { dc = 1 }
+    if verdict == "error" { ec = 1 }
+    _write_result(rows, mc, dc, ec, 1)
+    if emit_json {
+        _render_json()
+        return
+    }
+    _render_table(rows, mc, dc, ec, 1)
+}
+
+fn sub_selftest() {
+    // synthetic: run the 2-run check against h100_launch_manifest_spec
+    // (the canonical deterministic tool — already verified PASS).
+    let tgts = _targets()
+    let idx = _match_target(tgts, "h100_launch_manifest_spec")
+    if idx < 0 {
+        println("FAIL anima_cli/reproducibility selftest (target registry missing h100_launch_manifest_spec)")
+        exit(1)
+    }
+    let t = tgts[idx]
+    let stem = _str(t[0])
+    let tool_rel = _str(t[1])
+    let emit_rel = _str(t[2])
+    let kind = _str(t[3])
+
+    // tool file must exist
+    let root = _resolve_root()
+    if !_fexists(root + "/" + tool_rel) {
+        println("FAIL anima_cli/reproducibility selftest (tool missing: " + tool_rel + ")")
+        exit(1)
+    }
+
+    let r = _check_one(stem, tool_rel, emit_rel, kind)
+    let verdict = _str(r[0])
+    let ha = _str(r[1])
+    let hb = _str(r[2])
+    let det = _str(r[3])
+    if verdict != "match" {
+        println("FAIL anima_cli/reproducibility selftest (" + stem + " verdict="
+                + verdict + " ha=" + ha + " hb=" + hb + " detail=" + det + ")")
+        exit(1)
+    }
+    if ha == "" || ha != hb {
+        println("FAIL anima_cli/reproducibility selftest (hash mismatch or empty)")
+        exit(1)
+    }
+    // verify state write shape
+    _write_result([[stem, tool_rel, emit_rel, verdict, ha, hb, det]], 1, 0, 0, 1)
+    let p = root + "/state/anima_reproducibility_result.json"
+    if !_fexists(p) {
+        println("FAIL anima_cli/reproducibility selftest (state not written)")
+        exit(1)
+    }
+    let sch = _str(exec("jq -r '.schema // \"\"' " + _shell_quote(p) + " 2>/dev/null")).trim()
+    if sch != "anima.reproducibility.v1" {
+        println("FAIL anima_cli/reproducibility selftest (schema mismatch: " + sch + ")")
+        exit(1)
+    }
+    // idempotency check: 2-run diff = 0 (asserted above via verdict==match)
+    let short = ha
+    if len(ha) > 12 { short = ha.substring(0, 12) }
+    println("PASS anima_cli/reproducibility selftest (" + stem + " 2-run diff=0 · hash="
+            + short + " · schema=" + sch + ")")
+    exit(0)
+}
+
+fn main() {
+    let argv = _user_argv(args())
+    if _arg_present(argv, "--selftest") { sub_selftest(); return }
+    if _arg_present(argv, "--help") { sub_help(); return }
+    let emit_json = _arg_present(argv, "--json")
+    let single = _arg_value(argv, "--tool", "")
+    if single != "" {
+        sub_single(single, emit_json)
+        return
+    }
+    sub_all(emit_json)
+}
+
+main()

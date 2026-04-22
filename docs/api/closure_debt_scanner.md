@@ -1,11 +1,11 @@
 <!-- AUTO-GENERATED, DO NOT EDIT — source: tool/api_surface_extract.hexa -->
-<!-- generated: 2026-04-22T12:40:18Z -->
+<!-- generated: 2026-04-22T16:42:48Z -->
 <!-- source: tool/closure_debt_scanner.hexa -->
 <!-- entry_count: 33 -->
 
 # `tool/closure_debt_scanner.hexa` API surface
 
-_AUTO-GENERATED, DO NOT EDIT — generated 2026-04-22T12:40:18Z UTC._
+_AUTO-GENERATED, DO NOT EDIT — generated 2026-04-22T16:42:48Z UTC._
 
 **Tool:** � OS-level "남은 제약" pattern 자동 감지
 

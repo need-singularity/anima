@@ -2,25 +2,39 @@
 //
 // PURPOSE
 //   Single-line stdout summary of in-flight H100 burn rate, suitable for
-//   embedding in tmux/zsh/Grafana statusline strips. Reads
-//   state/h100_stage2_launch_state.json (or falls back to launch_manifest
-//   when the canonical state is not yet present).
+//   embedding in tmux/zsh/Grafana/Claude-Code statusline strips.
+//
+//   Data precedence (first non-empty wins):
+//     1. --live  → parse `runpodctl pod list -o json` (desiredStatus=RUNNING)
+//                  sum .costPerHr; pods = len(running). Graceful fail → step 2.
+//     2. state/h100_stage2_launch_state.json  (live launch snapshot)
+//     3. state/h100_launch_manifest.json stages[].gpu_count × $3/hr (planned)
+//
+//   On every invocation (unless --no-snapshot), writes:
+//     state/statusline_burn_last.json  (last resolved snapshot, idempotent)
 //
 // USAGE
-//   hexa run tool/statusline_h100_burn.hexa
-//   hexa run tool/statusline_h100_burn.hexa --json   # JSON line instead
+//   hexa run tool/statusline_h100_burn.hexa            # one-shot, state-only
+//   hexa run tool/statusline_h100_burn.hexa --live     # parse runpodctl live
+//   hexa run tool/statusline_h100_burn.hexa --json     # JSON line stdout
+//   hexa run tool/statusline_h100_burn.hexa --live --json
+//   hexa run tool/statusline_h100_burn.hexa --no-snapshot
+//   anima compute status --statusline                  # 1-line CLI wrapper
 //
 // OUTPUT (default)
-//   "H100 burn $X.XX/hr · Y pods · elapsed Zh"
-//   When no launch is live:
-//   "H100 burn $0.00/hr · 0 pods · idle"
+//   "H100 burn $X.XX/hr · N pods · stage-Y"             (live pods > 0)
+//   "H100 burn $X.XX/hr · N pods · elapsed Zh"          (state2 live)
+//   "H100 burn $X.XX/hr · N pods · planned (manifest)"  (manifest fallback)
+//   "H100 burn $0.00/hr · 0 pods · idle"                (no live + no manifest)
 //
 // CONSTRAINTS
-//   raw#9 hexa-only, raw#10 proof-carrying (output is read-only summary; no
-//   state mutation, no remote calls, no docker).
+//   raw#9 hexa-only · raw#11 snake_case · raw#15 no-hardcode
+//   runpodctl missing → graceful fall-through (never fail CLI)
+//   idempotent: snapshot write is overwrite-in-place, no jsonl append
 
 let STATE_PRIMARY  = "/Users/ghost/core/anima/state/h100_stage2_launch_state.json"
 let STATE_MANIFEST = "/Users/ghost/core/anima/state/h100_launch_manifest.json"
+let STATE_SNAPSHOT = "/Users/ghost/core/anima/state/statusline_burn_last.json"
 
 // INLINE_DEPRECATED[H42]: see shared/util/sh_quote.hexa for canonical impl — kept inline (hexa stage0 loader)
 fn _sh_quote(s: string) -> string { let mut o = "'"; o = o + s.replace("'", "'\\''"); o = o + "'"; return o }
@@ -51,6 +65,37 @@ fn _fmt_money(n) -> string {
     return to_string(dollars) + "." + frac_s
 }
 
+fn _has_runpodctl() -> bool {
+    return exec_with_status("command -v runpodctl >/dev/null 2>&1")[1] == 0
+}
+
+fn _has_jq() -> bool {
+    return exec_with_status("command -v jq >/dev/null 2>&1")[1] == 0
+}
+
+// Returns [burn_per_hr, pods, stage_label, source] for live runpodctl state.
+// stage_label: "stage-1" | "stage-2" | "stage-X" inferred from pod .name.
+// On any failure (runpodctl missing / jq missing / non-zero exit / empty) →
+// [0.0, 0, "", ""] so caller can fall through.
+fn _summarise_from_live() -> array {
+    if !_has_runpodctl() || !_has_jq() {
+        return [0.0, 0, "", ""]
+    }
+    // Running-only (no -a flag). Price sum via jq.
+    let pair_burn = exec_with_status("runpodctl pod list -o json 2>/dev/null | jq -r '[.[] | select(.desiredStatus==\"RUNNING\") | .costPerHr] | add // 0'")
+    if pair_burn[1] != 0 { return [0.0, 0, "", ""] }
+    let pair_n    = exec_with_status("runpodctl pod list -o json 2>/dev/null | jq -r '[.[] | select(.desiredStatus==\"RUNNING\")] | length'")
+    if pair_n[1] != 0 { return [0.0, 0, "", ""] }
+    let pair_stg  = exec_with_status("runpodctl pod list -o json 2>/dev/null | jq -r '[.[] | select(.desiredStatus==\"RUNNING\") | .name] | map(capture(\"stage(?<s>[0-9]+)\") // null) | map(select(. != null) | .s) | unique | join(\",\")'")
+    let burn_s = pair_burn[0].trim()
+    let n_s    = pair_n[0].trim()
+    let stg_s  = pair_stg[0].trim()
+    let burn   = to_float(if burn_s == "" || burn_s == "null" { "0" } else { burn_s })
+    let pods   = to_int(if n_s == "" { "0" } else { n_s })
+    let stage_label = if stg_s == "" { "" } else { "stage-" + stg_s }
+    return [burn, pods, stage_label, "runpodctl_live"]
+}
+
 // Returns [burn_per_hr, pods, elapsed_h, live(0|1), source]
 fn _summarise_from_manifest() -> array {
     if !_file_exists(STATE_MANIFEST) {
@@ -73,24 +118,61 @@ fn _summarise_from_manifest() -> array {
     return [burn, pods, 0, 0, src]
 }
 
+fn _write_snapshot(burn, pods: int, elapsed_h: int, stage_label: string, live: bool, source: string) {
+    let live_s = if live { "true" } else { "false" }
+    let ts = exec_with_status("date -u +%FT%TZ")[0].trim()
+    let body = "{\"schema\":\"anima/statusline_burn_last/1\""
+             + ",\"ts\":\"" + ts + "\""
+             + ",\"burn_per_hr\":" + _fmt_money(burn)
+             + ",\"pods\":" + to_string(pods)
+             + ",\"elapsed_h\":" + to_string(elapsed_h)
+             + ",\"stage_label\":\"" + stage_label + "\""
+             + ",\"live\":" + live_s
+             + ",\"source\":\"" + source + "\"}\n"
+    // overwrite-in-place (idempotent); write via shell to avoid write_file dep
+    exec_with_status("cat > " + _sh_quote(STATE_SNAPSHOT) + " <<'__EOF__'\n" + body + "__EOF__")
+}
+
 fn main() {
     let av = _argv()
-    let want_json = _has(av, "--json")
+    let want_json    = _has(av, "--json")
+    let want_live    = _has(av, "--live")
+    let no_snapshot  = _has(av, "--no-snapshot")
 
     let mut burn = 0.0
     let mut pods = 0
     let mut elapsed_h = 0
+    let mut stage_label = ""
     let mut live = false
     let mut source = "none"
 
-    if _file_exists(STATE_PRIMARY) {
+    // Step 1: --live → runpodctl (graceful fall-through on any failure).
+    if want_live {
+        let r = _summarise_from_live()
+        let l_pods = to_int(r[1])
+        if l_pods > 0 {
+            burn   = to_float(r[0])
+            pods   = l_pods
+            stage_label = to_string(r[2])
+            source = to_string(r[3])
+            live   = true
+        }
+        // else: zero running pods from runpodctl; fall through to state files
+    }
+
+    // Step 2: stage2_launch_state live snapshot.
+    if pods == 0 && _file_exists(STATE_PRIMARY) {
         let s = json_parse(read_file(STATE_PRIMARY))
         if has_key(s, "burn_per_hr") { burn = to_float(s["burn_per_hr"]) }
         if has_key(s, "pods")        { pods = to_int(s["pods"]) }
         if has_key(s, "elapsed_h")   { elapsed_h = to_int(s["elapsed_h"]) }
         if has_key(s, "live")        { live = s["live"] == true || s["live"] == "true" }
+        if has_key(s, "stage")       { stage_label = "stage-" + to_string(s["stage"]) }
         source = "stage2_launch_state"
-    } else {
+    }
+
+    // Step 3: manifest planned totals (no live pods).
+    if pods == 0 {
         let r = _summarise_from_manifest()
         burn = to_float(r[0])
         pods = to_int(r[1])
@@ -99,11 +181,17 @@ fn main() {
         source = to_string(r[4])
     }
 
+    // idempotent snapshot write
+    if !no_snapshot {
+        _write_snapshot(burn, pods, elapsed_h, stage_label, live, source)
+    }
+
     if want_json {
         let live_s = if live { "true" } else { "false" }
         println("{\"schema\":\"anima/statusline_h100_burn/1\",\"burn_per_hr\":" + _fmt_money(burn) +
                 ",\"pods\":" + to_string(pods) +
                 ",\"elapsed_h\":" + to_string(elapsed_h) +
+                ",\"stage_label\":\"" + stage_label + "\"" +
                 ",\"live\":" + live_s +
                 ",\"source\":\"" + source + "\"}")
         exit(0)
@@ -113,7 +201,11 @@ fn main() {
         println("H100 burn $0.00/hr · 0 pods · idle")
         exit(0)
     }
-    let tail = if live { "elapsed " + to_string(elapsed_h) + "h" } else { "planned (" + source + ")" }
+    let tail = if stage_label != "" {
+        stage_label
+    } else {
+        if live { "elapsed " + to_string(elapsed_h) + "h" } else { "planned (" + source + ")" }
+    }
     println("H100 burn $" + _fmt_money(burn) + "/hr · " + to_string(pods) + " pods · " + tail)
     exit(0)
 }

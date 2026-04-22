@@ -1,11 +1,11 @@
 <!-- AUTO-GENERATED, DO NOT EDIT — source: tool/api_surface_extract.hexa -->
-<!-- generated: 2026-04-22T12:40:18Z -->
+<!-- generated: 2026-04-22T16:42:48Z -->
 <!-- source: tool/cert_graph_gen.hexa -->
 <!-- entry_count: 28 -->
 
 # `tool/cert_graph_gen.hexa` API surface
 
-_AUTO-GENERATED, DO NOT EDIT — generated 2026-04-22T12:40:18Z UTC._
+_AUTO-GENERATED, DO NOT EDIT — generated 2026-04-22T16:42:48Z UTC._
 
 **Tool:** ════════════════════════════════════════════════════════════════════════════
 
@@ -152,7 +152,14 @@ _(no docstring)_
 
 ### `fn _hash_no_ts(path: string) -> string`
 
-_(no docstring)_
+> Volatile-line strip for idempotency hashing. Covers:
+> md:   `<!-- generated: <ts> -->`              (HDR ts comment)
+> `<!-- cert_dir: <path> -->`             (tmp path varies)
+> `<!-- AUTO-GENERATED, DO NOT EDIT ...`  (HDR_MD sentinel)
+> `_AUTO-GENERATED, DO NOT EDIT — generated <ts> UTC._` (body ts)
+> json: `  "generated": "<ts>",`                (ts field)
+> `  "cert_dir": "<path>",`               (cert_dir field · tmp path)
+> Use year-agnostic `generated 20` and `"generated":` to survive 2027+.
 
 ### `fn run_selftest() -> int`
 

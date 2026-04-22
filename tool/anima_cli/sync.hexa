@@ -1,0 +1,382 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_cli/sync.hexa — anima CLI `sync` topic
+//
+//  PURPOSE
+//    Cross-repo proposal sync orchestrator via nexus hub.
+//    anima's local proposal stack (state/proposals/pending/*) is pushed
+//    into nexus's inventory (nexus/state/proposals/inventory.json) using
+//    $HEXA_LANG/tool/proposal_inbox.hexa submit as the write path, and
+//    nexus-aggregated proposal advisories are pulled back via
+//    $HEXA_LANG/tool/proposal_inbox.hexa list (repo=anima) as a read
+//    path (submit-to-anima already happens when peer repos call inbox
+//    submit --to anima; this tool snapshots the current inbound view).
+//
+//  SUBCOMMANDS
+//    sync            push + pull (default)
+//    sync push       anima → nexus only
+//    sync pull       nexus → anima only (snapshot inbound inbox)
+//    sync status     last sync ts / items synced / conflict count
+//    --selftest --help
+//
+//  OPERATION
+//    1. verify $WS/nexus exists + inventory present → else graceful SKIP.
+//    2. push: for each anima state/proposals/pending/*.json, submit an
+//       advisory entry into nexus inbox (idempotent via title hash —
+//       proposal_inbox.hexa dedups by id+title+from).
+//    3. pull: call proposal_inbox.hexa list --repo anima → count + cache.
+//    4. log append → state/cross_repo_sync_log.jsonl
+//    5. emit state/anima_sync_status.json
+//
+//  OUTPUT
+//    state/anima_sync_status.json  {ts, mode, pushed, pulled, conflicts,
+//                                    nexus_available, last_ok}
+//    state/cross_repo_sync_log.jsonl
+//
+//  CONSTRAINTS
+//    raw#9 hexa-only (no .py logic; trivial jq/grep via exec allowed)
+//    raw#15 no-hardcode
+//    idempotent (re-run safe — proposal_inbox.hexa handles dedup)
+//    NEXUS repo READ + QUEUE (via submit) only — never mutate nexus files
+//    directly; only through the shared inbox tool.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── helpers ───────────────────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _ts_iso() -> string {
+    let rep = _str(env("HEXA_REPRODUCIBLE"))
+    if rep == "1" { return "REDACTED" }
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn _fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _dexists(p: string) -> bool {
+    return _str(exec("test -d " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    let h = _str(env("HOME"))
+    return h + "/core/anima"
+}
+
+fn _resolve_ws() -> string {
+    let w = _str(env("WS"))
+    if w != "" { return w }
+    let h = _str(env("HOME"))
+    return h + "/core"
+}
+
+fn _resolve_hexa_lang() -> string {
+    let h = _str(env("HEXA_LANG"))
+    if h != "" { return h }
+    return _resolve_ws() + "/hexa-lang"
+}
+
+fn _hexa_bin() -> string {
+    let e = _str(env("HEXA_BIN"))
+    if e != "" { return e }
+    return "/Users/ghost/.hx/bin/hexa"
+}
+
+fn _upstream_tool() -> string {
+    return _resolve_hexa_lang() + "/tool/proposal_inbox.hexa"
+}
+
+fn _nexus_root() -> string {
+    return _resolve_ws() + "/nexus"
+}
+
+fn _nexus_inventory() -> string {
+    return _nexus_root() + "/state/proposals/inventory.json"
+}
+
+fn _anima_pending_dir() -> string {
+    return _resolve_root() + "/state/proposals/pending"
+}
+
+fn _sync_log_path() -> string {
+    return _resolve_root() + "/state/cross_repo_sync_log.jsonl"
+}
+
+fn _sync_status_path() -> string {
+    return _resolve_root() + "/state/anima_sync_status.json"
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _user_argv(raw) -> array {
+    let out = []
+    let i = 0
+    while i < len(raw) {
+        let s = _str(raw[i])
+        if !s.contains("/.hexa-cache/") {
+            out = out + [s]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _sh_q(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+// ─── nexus availability ────────────────────────────────────────────────────
+
+fn _nexus_available() -> bool {
+    if !_dexists(_nexus_root())      { return false }
+    if !_fexists(_nexus_inventory()) { return false }
+    if !_fexists(_upstream_tool())   { return false }
+    return true
+}
+
+// ─── log / status ──────────────────────────────────────────────────────────
+
+fn _append_log(mode: string, pushed: int, pulled: int, conflicts: int, available: bool) {
+    let root = _resolve_root()
+    let avs = "false"
+    if available { avs = "true" }
+    let line = "{\"ts\":\"" + _ts_iso() + "\","
+             + "\"tool\":\"anima_cli/sync.hexa\","
+             + "\"mode\":\"" + mode + "\","
+             + "\"pushed\":" + to_string(pushed) + ","
+             + "\"pulled\":" + to_string(pulled) + ","
+             + "\"conflicts\":" + to_string(conflicts) + ","
+             + "\"nexus_available\":" + avs + "}"
+    exec("mkdir -p " + root + "/state && printf '%s\\n' " + _sh_q(line)
+         + " >> " + _sync_log_path())
+}
+
+fn _write_status(mode: string, pushed: int, pulled: int, conflicts: int, available: bool) {
+    let path = _sync_status_path()
+    let avs = "false"
+    if available { avs = "true" }
+    let json = "{\"schema\":\"anima/sync_status/1\","
+             + "\"ts\":\"" + _ts_iso() + "\","
+             + "\"mode\":\"" + mode + "\","
+             + "\"pushed\":" + to_string(pushed) + ","
+             + "\"pulled\":" + to_string(pulled) + ","
+             + "\"conflicts\":" + to_string(conflicts) + ","
+             + "\"nexus_available\":" + avs + "}"
+    exec("mkdir -p " + _resolve_root() + "/state && printf '%s\\n' "
+         + _sh_q(json) + " > " + path)
+}
+
+// ─── push: anima pending → nexus inbox ────────────────────────────────────
+
+fn _list_pending_titles() -> array {
+    let dir = _anima_pending_dir()
+    if !_dexists(dir) { return [] }
+    // Extract "title" + "id" field from each pending json via grep (no .py).
+    // Output format per line: "<id>\t<title>"
+    let cmd = "for f in " + dir + "/*.json; do "
+            + "[ -f \"$f\" ] || continue; "
+            + "id=$(grep -m1 '\"id\"' \"$f\" | sed -E 's/.*\"id\"[[:space:]]*:[[:space:]]*\"([^\"]+)\".*/\\1/'); "
+            + "ti=$(grep -m1 '\"title\"' \"$f\" | sed -E 's/.*\"title\"[[:space:]]*:[[:space:]]*\"([^\"]+)\".*/\\1/'); "
+            + "printf '%s\\t%s\\n' \"$id\" \"$ti\"; "
+            + "done 2>/dev/null"
+    let raw = _str(exec(cmd))
+    let out = []
+    let lines = raw.split("\n")
+    let i = 0
+    while i < len(lines) {
+        let ln = _str(lines[i]).trim()
+        if ln != "" { out = out + [ln] }
+        i = i + 1
+    }
+    return out
+}
+
+fn _nexus_seen_title(title: string) -> bool {
+    // Treat dedup as "title substring already present in nexus inventory".
+    // (proposal_inbox.hexa submit itself is idempotent by generated id —
+    // this extra check keeps nexus-side noise low when we re-run.)
+    let inv = _nexus_inventory()
+    if !_fexists(inv) { return false }
+    let q = title.replace("'", "")
+    let cmd = "grep -F " + _sh_q(q) + " " + inv + " >/dev/null 2>&1 && echo 1 || echo 0"
+    return _str(exec(cmd)).trim() == "1"
+}
+
+fn _submit_to_nexus(title: string, kind: string, prompt_ref: string) -> bool {
+    let tool = _upstream_tool()
+    let tail = "submit --to nexus --from anima --kind " + kind
+             + " --title " + _sh_q(title)
+    if prompt_ref != "" {
+        tail = tail + " --prompt-ref " + _sh_q(prompt_ref)
+    }
+    let cmd = _hexa_bin() + " run " + tool + " " + tail + " >/dev/null 2>&1 && echo ok || echo no"
+    return _str(exec(cmd)).trim() == "ok"
+}
+
+fn do_push() -> array {
+    // returns [pushed, conflicts]
+    let items = _list_pending_titles()
+    let pushed = 0
+    let conflicts = 0
+    let i = 0
+    let max_per_cycle = 20    // flood protection
+    while i < len(items) && pushed < max_per_cycle {
+        let ln = _str(items[i])
+        let tab = ln.index_of("\t")
+        let id = ""
+        let title = ln
+        if tab >= 0 {
+            id = ln.substring(0, tab)
+            title = ln.substring(tab + 1, len(ln))
+        }
+        if title == "" {
+            i = i + 1
+            continue
+        }
+        let tagged = "[anima:" + id + "] " + title
+        if _nexus_seen_title(tagged) {
+            // already mirrored — idempotent skip
+            i = i + 1
+            continue
+        }
+        let ok = _submit_to_nexus(tagged, "advisory",
+                                  "state/proposals/pending/" + id + ".json")
+        if ok { pushed = pushed + 1 } else { conflicts = conflicts + 1 }
+        i = i + 1
+    }
+    return [pushed, conflicts]
+}
+
+// ─── pull: nexus → anima (snapshot inbound inbox) ─────────────────────────
+
+fn do_pull() -> int {
+    // Items submitted BY anima or TO anima living in anima's own inventory
+    // are already in place (since peers submit via proposal_inbox.hexa).
+    // This "pull" asks the upstream tool to list anima's inbox and counts
+    // entries kind=advisory authored by non-anima.
+    let tool = _upstream_tool()
+    if !_fexists(tool) { return 0 }
+    let cmd = _hexa_bin() + " run " + tool + " list --repo anima 2>/dev/null"
+             + " | grep -c '^' || echo 0"
+    let out = _str(exec(cmd)).trim()
+    if out == "" { return 0 }
+    return out.parse_int()
+}
+
+// ─── subcommands ──────────────────────────────────────────────────────────
+
+fn sub_help() {
+    println("anima sync — cross-repo proposal sync via nexus hub")
+    println("")
+    println("  sync             push + pull (default)")
+    println("  sync push        anima → nexus only")
+    println("  sync pull        nexus → anima only")
+    println("  sync status      last sync ts · items synced · conflicts")
+    println("")
+    println("  --selftest   --help")
+}
+
+fn sub_status() {
+    let p = _sync_status_path()
+    if !_fexists(p) {
+        println("anima sync status: (no prior sync — run `anima sync`)")
+        return
+    }
+    let txt = _str(exec("cat " + p))
+    println(txt.trim())
+    // tail of log
+    let lg = _sync_log_path()
+    if _fexists(lg) {
+        println("")
+        println("recent log (tail 3):")
+        let tail = _str(exec("tail -n 3 " + lg))
+        println(tail.trim())
+    }
+}
+
+fn _run(mode: string) {
+    let avail = _nexus_available()
+    if !avail {
+        println("anima sync [" + mode + "]: nexus unavailable at "
+                + _nexus_root() + " → graceful SKIP")
+        _append_log(mode, 0, 0, 0, false)
+        _write_status(mode, 0, 0, 0, false)
+        return
+    }
+    let pushed = 0
+    let pulled = 0
+    let conflicts = 0
+    if mode == "push" || mode == "both" {
+        let r = do_push()
+        pushed = r[0]
+        conflicts = r[1]
+    }
+    if mode == "pull" || mode == "both" {
+        pulled = do_pull()
+    }
+    println("anima sync [" + mode + "]: pushed=" + to_string(pushed)
+            + " pulled=" + to_string(pulled)
+            + " conflicts=" + to_string(conflicts)
+            + " nexus=available")
+    _append_log(mode, pushed, pulled, conflicts, true)
+    _write_status(mode, pushed, pulled, conflicts, true)
+}
+
+fn sub_push() { _run("push") }
+fn sub_pull() { _run("pull") }
+fn sub_both() { _run("both") }
+
+fn sub_selftest() {
+    // read-only: verify resolvers + upstream + graceful-skip path.
+    let root = _resolve_root()
+    if root == ""               { println("FAIL anima_cli/sync selftest (root unresolved)"); exit(1) }
+    let ws = _resolve_ws()
+    if ws == ""                 { println("FAIL anima_cli/sync selftest (ws unresolved)"); exit(1) }
+    let up = _upstream_tool()
+    if !_fexists(up)            { println("FAIL anima_cli/sync selftest (upstream missing: " + up + ")"); exit(1) }
+    // synthetic-absence path: if $WS/nexus is absent, graceful-skip branch
+    // must produce a well-formed status file without crashing.
+    let avail = _nexus_available()
+    if !avail {
+        _append_log("selftest", 0, 0, 0, false)
+        _write_status("selftest", 0, 0, 0, false)
+        println("PASS anima_cli/sync selftest (nexus absent → graceful SKIP)")
+        exit(0)
+    }
+    // nexus present: smoke the title-seen probe (read-only)
+    let _seen = _nexus_seen_title("__anima_sync_selftest_nonexistent__")
+    println("PASS anima_cli/sync selftest (nexus available)")
+    exit(0)
+}
+
+fn main() {
+    let argv = _user_argv(args())
+    if _arg_present(argv, "--selftest") { sub_selftest(); return }
+    if _arg_present(argv, "--help")     { sub_help(); return }
+    if len(argv) == 0 { sub_both(); return }
+    let sub = _str(argv[0])
+    if sub == "push"   { sub_push();   return }
+    if sub == "pull"   { sub_pull();   return }
+    if sub == "status" { sub_status(); return }
+    if sub == "both" || sub == "sync" { sub_both(); return }
+    println("sync: unknown subcmd '" + sub + "'")
+    sub_help()
+    exit(2)
+}
+
+main()

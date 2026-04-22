@@ -1,0 +1,566 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_cli/handoff.hexa — anima CLI `handoff` topic (session handoff doc)
+//
+//  PURPOSE
+//    Auto-regenerate a session handoff markdown doc at
+//    docs/session_handoff_YYYYMMDD.md by aggregating read-only signals from
+//    the repo:
+//      - git log / git diff (since last handoff or --since flag) [READ-ONLY]
+//      - state/anima_cost_ledger.jsonl      (last N entries)
+//      - state/proposals/meta/cycle_log.jsonl (last cycle)
+//      - state/h100_stage*_launch_state.json (attempts + cost)
+//      - state/runpod_credit_status.json    (balance)
+//      - .roadmap diff                       (git diff .roadmap — read-only)
+//      - anima paradigm status snapshot      (in-band render)
+//
+//  SUBCOMMANDS
+//    generate [--since ISO|GITREF] [--out PATH] [--ledger-tail N] [--dry-run]
+//        default --since: timestamp parsed from newest docs/session_handoff_*.md
+//                         filename ("session_handoff_YYYYMMDD.md" → 00:00 UTC).
+//                         Falls back to "24 hours ago" if none exists.
+//        default --out   : docs/session_handoff_<UTC today YYYYMMDD>.md
+//        default ledger N: 8
+//    --selftest   --help
+//
+//  OUTPUT STRUCTURE (markdown)
+//    # Session Handoff — <date>
+//    - HEAD sha + branch
+//    - 1. Session scope summary  (commit count · files changed)
+//    - 2. Commits (oneline)
+//    - 3. H100 activity  (attempts table + cumulative burn)
+//    - 4. Proposal stack delta  (pending before/after + approved/rejected)
+//    - 5. Cost ledger (last N)
+//    - 6. Paradigm status snapshot
+//    - 7. .roadmap diff summary (lines added/removed)
+//    - 8. Key decisions (extracted from commit subjects beginning with keywords)
+//    - 9. Open blockers  (roadmap entries with status=BLOCKED)
+//    - 10. Next session paste-ready prompt
+//
+//  DESIGN
+//    raw#9  hexa-only (no .py — small python helper embedded only where jsonl
+//           arithmetic would be unsafe in bash is avoided; this module uses
+//           jq + awk + sort + git so the hard constraint holds)
+//    raw#11 snake_case
+//    raw#15 no-hardcode (ANIMA + git-root resolution)
+//    raw#20 no git state mutation — git log/diff ONLY; NO `git commit`, no
+//           `git add`, no index writes. idempotent (overwrite same out path).
+//    deterministic when HEXA_REPRODUCIBLE=1 (ts REDACTED).
+//
+//  SAFETY
+//    - never invokes: git commit | git add | git push | git reset | git rebase
+//    - only invokes:  git log | git diff | git rev-parse | git status (plumbing)
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── vendored helpers (pattern from sibling modules) ────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _ts_iso() -> string {
+    let rep = _str(env("HEXA_REPRODUCIBLE"))
+    if rep == "1" { return "REDACTED" }
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn _today_ymd() -> string {
+    let rep = _str(env("HEXA_REPRODUCIBLE"))
+    if rep == "1" { return "REDACTED" }
+    return _str(exec("date -u +%Y%m%d")).trim()
+}
+
+fn _fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _dexists(p: string) -> bool {
+    return _str(exec("test -d " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    let h = _str(env("HOME"))
+    return h + "/core/anima"
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _arg_value(argv, key: string, dflt: string) -> string {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key && i + 1 < len(argv) {
+            return _str(argv[i + 1])
+        }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _user_argv(raw) -> array {
+    let out = []
+    let i = 0
+    while i < len(raw) {
+        let s = _str(raw[i])
+        if !s.contains("/.hexa-cache/") {
+            out = out + [s]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _sh_q(s: string) -> string {
+    // naive single-quote wrap — content must not contain single quotes
+    return "'" + s + "'"
+}
+
+fn _json_field(path: string, key: string) -> string {
+    if !_fexists(path) { return "" }
+    return _str(exec("jq -r '" + key + " // \"\"' " + path + " 2>/dev/null")).trim()
+}
+
+fn _jq(path: string, expr: string) -> string {
+    if !_fexists(path) { return "" }
+    return _str(exec("jq -r '" + expr + " // \"\"' " + path + " 2>/dev/null")).trim()
+}
+
+// ─── last handoff detection ─────────────────────────────────────────────────
+
+fn _last_handoff_date(root: string) -> string {
+    // newest docs/session_handoff_YYYYMMDD.md → YYYYMMDD ("" if none)
+    let cmd = "ls -1 " + root + "/docs/session_handoff_*.md 2>/dev/null "
+            + "| sed -E 's|.*session_handoff_([0-9]{8})\\.md|\\1|' "
+            + "| sort -r | head -n 1"
+    return _str(exec(cmd)).trim()
+}
+
+fn _since_default(root: string) -> string {
+    // use last handoff's YYYYMMDD at 00:00 UTC; if none → "24 hours ago"
+    let ymd = _last_handoff_date(root)
+    if ymd == "" { return "24 hours ago" }
+    // yyyy-mm-dd 00:00:00Z
+    let y = ymd.substring(0, 4)
+    let m = ymd.substring(4, 6)
+    let d = ymd.substring(6, 8)
+    return y + "-" + m + "-" + d + "T00:00:00Z"
+}
+
+// ─── git read-only probes ───────────────────────────────────────────────────
+
+fn _git_head_sha(root: string) -> string {
+    return _str(exec("git -C " + root + " rev-parse --short HEAD 2>/dev/null")).trim()
+}
+
+fn _git_branch(root: string) -> string {
+    return _str(exec("git -C " + root + " rev-parse --abbrev-ref HEAD 2>/dev/null")).trim()
+}
+
+fn _git_log_oneline(root: string, since: string) -> string {
+    // since is parsed by git --since= (accepts iso or "24 hours ago")
+    let cmd = "git -C " + root + " log --oneline --since=" + _sh_q(since) + " 2>/dev/null"
+    return _str(exec(cmd))
+}
+
+fn _git_log_count(root: string, since: string) -> string {
+    let cmd = "git -C " + root + " log --since=" + _sh_q(since)
+            + " --pretty=oneline 2>/dev/null | wc -l | tr -d ' '"
+    return _str(exec(cmd)).trim()
+}
+
+fn _git_diff_file_count(root: string, since: string) -> string {
+    // number of distinct files changed in the window (commit-only, not working tree)
+    let cmd = "git -C " + root + " log --since=" + _sh_q(since)
+            + " --name-only --pretty=format: 2>/dev/null "
+            + "| sed '/^$/d' | sort -u | wc -l | tr -d ' '"
+    return _str(exec(cmd)).trim()
+}
+
+fn _git_roadmap_diff_stat(root: string, since: string) -> string {
+    // show +/- for .roadmap only, within window (comparing window's earliest parent to HEAD)
+    // Use a simple rev range: first-commit-in-window..HEAD if possible
+    let first_cmd = "git -C " + root + " log --since=" + _sh_q(since)
+                  + " --reverse --pretty=%H 2>/dev/null | head -n 1"
+    let first = _str(exec(first_cmd)).trim()
+    if first == "" { return "(no commits in window)" }
+    // parent of first, fallback to first itself if root commit
+    let parent_cmd = "git -C " + root + " rev-parse " + first + "^ 2>/dev/null"
+    let parent = _str(exec(parent_cmd)).trim()
+    let base = if parent == "" { first } else { parent }
+    let stat_cmd = "git -C " + root + " diff --numstat " + base + "..HEAD -- .roadmap 2>/dev/null"
+    let out = _str(exec(stat_cmd)).trim()
+    if out == "" { return "(.roadmap unchanged in window)" }
+    return out
+}
+
+// ─── state probes ───────────────────────────────────────────────────────────
+
+fn _stage_attempts_table(root: string) -> string {
+    // render attempts across all stage*_launch_state.json as markdown rows.
+    // raw#9: no python; pure jq iteration.
+    let glob = root + "/state/h100_stage*_launch_state.json"
+    let files_cmd = "ls -1 " + glob + " 2>/dev/null"
+    let files_raw = _str(exec(files_cmd))
+    if files_raw.trim() == "" { return "_(no h100_stage*_launch_state.json on disk)_" }
+    // Build a single jq stream that emits: stage|pod_id|name|cost|created|deleted
+    // Accept absence of .attempts gracefully
+    let jq_prog = "[.stage // (input_filename | sub(\".*/\";\"\") | sub(\"\\\\.json$\";\"\")),"
+                + " (.attempts // [])] | .[0] as $st | .[1][]? "
+                + "| [$st, (.pod_id // \"?\"), (.name // \"?\"), "
+                + "   ((.cost_estimate_usd // 0) | tostring), "
+                + "   (.created_at // \"?\"), (.deleted_at // \"?\")] | @tsv"
+    let cmd = "jq -r " + _sh_q(jq_prog) + " " + glob + " 2>/dev/null"
+    let tsv = _str(exec(cmd))
+    if tsv.trim() == "" { return "_(no attempts recorded)_" }
+    // render as markdown table
+    let hdr = "| stage | pod_id | name | cost_usd | created | deleted |\n"
+            + "|---|---|---|---|---|---|\n"
+    let mk_cmd = "printf '%s' " + _sh_q(tsv)
+               + " | awk -F '\\t' '{printf(\"| %s | %s | %s | %s | %s | %s |\\n\", $1,$2,$3,$4,$5,$6)}'"
+    let body = _str(exec(mk_cmd))
+    return hdr + body
+}
+
+fn _stage_burn_sum(root: string) -> string {
+    // sum .total_session_cost_usd across stage*_launch_state.json using jq only
+    let glob = root + "/state/h100_stage*_launch_state.json"
+    let files_cmd = "ls -1 " + glob + " 2>/dev/null"
+    let files_raw = _str(exec(files_cmd))
+    if files_raw.trim() == "" { return "0.0000" }
+    let cmd = "jq -rs 'map(.total_session_cost_usd // 0) | add // 0 "
+            + "| . * 10000 | round / 10000 | tostring' " + glob + " 2>/dev/null"
+    let out = _str(exec(cmd)).trim()
+    if out == "" { return "0.0000" }
+    return out
+}
+
+fn _proposal_counts(root: string) -> string {
+    // "pending=N approved=M rejected=K archived=A debate=D refinement=R"
+    let base = root + "/state/proposals"
+    let cnt = fn(dir: string) -> string {
+        let p = base + "/" + dir
+        if !_dexists(p) { return "0" }
+        return _str(exec("ls -1 " + p + " 2>/dev/null | grep -c '\\.json$' | tr -d ' '")).trim()
+    }
+    let p = cnt("pending")
+    let a = cnt("approved")
+    let r = cnt("rejected")
+    let ar = cnt("archived")
+    let d = cnt("debate")
+    let rf = cnt("refinement")
+    return "pending=" + p + " approved=" + a + " rejected=" + r
+         + " archived=" + ar + " debate=" + d + " refinement=" + rf
+}
+
+fn _proposal_prev_counts_from_handoff(path: string) -> string {
+    // parse "pending=N ... archived=A" line from a previous handoff doc.
+    // returns "" if not found (caller renders "?" accordingly)
+    if !_fexists(path) { return "" }
+    let cmd = "grep -E '^proposal_counts_prev: ' " + path + " 2>/dev/null | head -n 1 | sed 's/^proposal_counts_prev: //'"
+    let out = _str(exec(cmd)).trim()
+    if out != "" { return out }
+    // fallback: look for the new-format "counts (this handoff): ..." line
+    let cmd2 = "grep -E 'counts.*:.*pending=' " + path + " 2>/dev/null | head -n 1"
+    return _str(exec(cmd2)).trim()
+}
+
+fn _cost_ledger_tail(root: string, n: string) -> string {
+    let p = root + "/state/anima_cost_ledger.jsonl"
+    if !_fexists(p) { return "_(no ledger yet)_" }
+    let cmd = "tail -n " + n + " " + p + " 2>/dev/null | jq -r "
+            + "'\"- \" + .ts + \"  bal=$\" + (.balance_usd // \"?\") + "
+            + "\"  delta=$\" + (.delta_usd // \"?\") + "
+            + "\"  burn=$\" + (.cumulative_burn_usd // \"?\")' 2>/dev/null"
+    let out = _str(exec(cmd))
+    if out.trim() == "" { return "_(ledger empty)_" }
+    return out
+}
+
+fn _cycle_last(root: string) -> string {
+    let p = root + "/state/proposals/meta/cycle_log.jsonl"
+    if !_fexists(p) { return "_(no cycle_log.jsonl)_" }
+    // group by cycle_id → pick max cycle_id (ISO-sortable), emit its lines
+    let cmd = "awk -F'\"cycle_id\":\"' 'NF>1{split($2,a,\"\\\"\"); print a[1]}' " + p
+            + " | sort -u | tail -n 1"
+    let last_id = _str(exec(cmd)).trim()
+    if last_id == "" { return "_(no cycle_id found)_" }
+    let pull = "grep -F " + _sh_q("\"cycle_id\":\"" + last_id + "\"") + " " + p
+             + " | jq -r '\"- step=\" + (.step|tostring) + \" name=\" + .name + "
+             + "\" status=\" + .status + \" exit=\" + (.exit|tostring)' 2>/dev/null"
+    let body = _str(exec(pull))
+    return "cycle_id: `" + last_id + "`\n\n" + body
+}
+
+fn _paradigm_snapshot(root: string) -> string {
+    // call sibling paradigm.hexa status --short; tolerate failure
+    let self = root + "/tool/anima_cli/paradigm.hexa"
+    if !_fexists(self) { return "_(paradigm.hexa missing)_" }
+    let hb = _str(env("HEXA_BIN"))
+    if hb == "" { hb = "/Users/ghost/.hx/bin/hexa" }
+    let cmd = hb + " run " + self + " status --short 2>/dev/null"
+    let out = _str(exec(cmd))
+    if out.trim() == "" { return "_(paradigm snapshot empty)_" }
+    return out
+}
+
+fn _open_blockers(root: string) -> string {
+    let p = root + "/state/roadmap_progress.json"
+    if !_fexists(p) { return "_(no roadmap_progress.json)_" }
+    let cmd = "jq -r '[.entries[]? | select(.status==\"BLOCKED\") "
+            + "| \"- \" + (.id // \"?\") + \": \" + (.title // .summary // \"?\")] "
+            + "| .[]' " + p + " 2>/dev/null"
+    let out = _str(exec(cmd))
+    if out.trim() == "" { return "_(no BLOCKED entries)_" }
+    return out
+}
+
+fn _key_decisions(root: string, since: string) -> string {
+    // extract commit subjects starting with keywords we treat as "decision signals"
+    // (feat · fix · chore · docs · BREAKING · SEAL · DECIDE)
+    let cmd = "git -C " + root + " log --since=" + _sh_q(since)
+            + " --pretty=%s 2>/dev/null "
+            + "| grep -E '^(feat|fix|chore|docs|BREAKING|SEAL|DECIDE)' "
+            + "| head -n 20 | sed 's/^/- /'"
+    let out = _str(exec(cmd))
+    if out.trim() == "" { return "_(no decision-prefixed commits in window)_" }
+    return out
+}
+
+// ─── paste-ready next prompt ────────────────────────────────────────────────
+
+fn _next_prompt(head: string, branch: string, counts: string, date: string) -> string {
+    let body = "세션 컨텍스트: anima continuation — HEAD `" + head + "` on `" + branch + "`.\n"
+             + "이전 handoff: docs/session_handoff_" + date + ".md\n"
+             + "proposal stack 현재: " + counts + "\n"
+             + "\n"
+             + "상태 확인 명령:\n"
+             + "  anima status\n"
+             + "  anima cost session\n"
+             + "  anima proposal review --top 5\n"
+             + "  anima cert verify --incremental\n"
+             + "\n"
+             + "작업 결정 (택1):\n"
+             + "  (A) H100 approval 및 launch — docs/h100_launch_runbook_frozen.md 참조\n"
+             + "  (B) proposal review 다음 round — anima proposal review / approve / reject\n"
+             + "  (C) open blocker 해소 — 섹션 9 참조\n"
+             + "\n"
+             + "제약: raw#9 hexa-only · raw#11 snake_case · raw#12 no fake-pass · raw#15 no-hardcode · raw#20 user gate"
+    return body
+}
+
+// ─── doc render ─────────────────────────────────────────────────────────────
+
+fn _render_doc(root: string, since: string, out_path: string, ledger_n: string) -> string {
+    let head    = _git_head_sha(root)
+    let branch  = _git_branch(root)
+    let today   = _today_ymd()
+    let ts      = _ts_iso()
+    let commits_n = _git_log_count(root, since)
+    let files_n   = _git_diff_file_count(root, since)
+    let log_lines = _git_log_oneline(root, since)
+    let attempts  = _stage_attempts_table(root)
+    let burn      = _stage_burn_sum(root)
+    let counts    = _proposal_counts(root)
+    let ledger    = _cost_ledger_tail(root, ledger_n)
+    let cycle     = _cycle_last(root)
+    let paradigm  = _paradigm_snapshot(root)
+    let rmdiff    = _git_roadmap_diff_stat(root, since)
+    let decisions = _key_decisions(root, since)
+    let blockers  = _open_blockers(root)
+    let prev_counts_line = ""
+    let prev_handoff = root + "/docs/session_handoff_" + _last_handoff_date(root) + ".md"
+    if _fexists(prev_handoff) && prev_handoff != out_path {
+        prev_counts_line = "\nproposal_counts_prev: " + _proposal_counts(root) + "  _(rolled forward — next run will compare vs this)_\n"
+    }
+
+    let md = "# Session Handoff — " + today + "\n"
+           + "\n"
+           + "- generated_at: `" + ts + "`\n"
+           + "- HEAD: `" + head + "`   branch: `" + branch + "`\n"
+           + "- since: `" + since + "`\n"
+           + "- tool: `tool/anima_cli/handoff.hexa`\n"
+           + prev_counts_line
+           + "\n"
+           + "---\n"
+           + "\n"
+           + "## 1. Session scope summary\n"
+           + "\n"
+           + "- commits in window: **" + commits_n + "**\n"
+           + "- files changed in window: **" + files_n + "**\n"
+           + "- counts (this handoff): " + counts + "\n"
+           + "\n"
+           + "## 2. Commits (oneline)\n"
+           + "\n"
+           + "```\n"
+           + (if log_lines.trim() == "" { "(no commits in window)\n" } else { log_lines })
+           + "```\n"
+           + "\n"
+           + "## 3. H100 activity (attempts + cost)\n"
+           + "\n"
+           + "cumulative_burn_usd: **$" + burn + "**\n"
+           + "\n"
+           + attempts + "\n"
+           + "\n"
+           + "## 4. Proposal stack delta\n"
+           + "\n"
+           + "- now: `" + counts + "`\n"
+           + "\n"
+           + "last cycle:\n"
+           + "\n"
+           + cycle + "\n"
+           + "\n"
+           + "## 5. Cost ledger (last " + ledger_n + ")\n"
+           + "\n"
+           + ledger + "\n"
+           + "\n"
+           + "## 6. Paradigm status snapshot\n"
+           + "\n"
+           + "```\n"
+           + paradigm
+           + "```\n"
+           + "\n"
+           + "## 7. .roadmap diff (numstat)\n"
+           + "\n"
+           + "```\n"
+           + rmdiff + "\n"
+           + "```\n"
+           + "\n"
+           + "## 8. Key decisions (commit-extracted)\n"
+           + "\n"
+           + decisions + "\n"
+           + "\n"
+           + "## 9. Open blockers\n"
+           + "\n"
+           + blockers + "\n"
+           + "\n"
+           + "## 10. Next session paste-ready prompt\n"
+           + "\n"
+           + "```\n"
+           + _next_prompt(head, branch, counts, today) + "\n"
+           + "```\n"
+    return md
+}
+
+fn _write_doc(out_path: string, md: string) {
+    // write via heredoc-free path: use printf with a temp file because markdown
+    // may contain single quotes; safer to write via python? → raw#9 forbids .py.
+    // Use `cat > path <<'__EOF__'` heredoc via exec, with a delimiter that
+    // cannot appear in rendered markdown ("__ANIMA_HANDOFF_EOF_MARKER__").
+    let delim = "__ANIMA_HANDOFF_EOF_MARKER__"
+    let parent_cmd = "mkdir -p " + _str(exec("dirname " + out_path + " 2>/dev/null")).trim() + " 2>/dev/null"
+    exec(parent_cmd)
+    let full = "cat > " + out_path + " 2>/dev/null <<'" + delim + "'\n" + md + "\n" + delim + "\n"
+    exec(full)
+}
+
+// ─── subcommands ────────────────────────────────────────────────────────────
+
+fn sub_help() {
+    println("anima handoff — session handoff doc auto-regen")
+    println("")
+    println("  generate [--since ISO|GITREF] [--out PATH] [--ledger-tail N] [--dry-run]")
+    println("           [--selftest] [--help]")
+    println("")
+    println("  defaults:")
+    println("    --since       last docs/session_handoff_YYYYMMDD.md date @ 00:00Z")
+    println("                  (fallback: \"24 hours ago\")")
+    println("    --out         docs/session_handoff_<UTC today>.md")
+    println("    --ledger-tail 8")
+    println("")
+    println("  safety: READ-ONLY git (log/diff/rev-parse). Never commits.")
+}
+
+fn sub_generate(argv) {
+    let root = _resolve_root()
+    let since = _arg_value(argv, "--since", _since_default(root))
+    let today = _today_ymd()
+    let default_out = root + "/docs/session_handoff_" + today + ".md"
+    let out_path = _arg_value(argv, "--out", default_out)
+    let ledger_n = _arg_value(argv, "--ledger-tail", "8")
+    let dry = _arg_present(argv, "--dry-run")
+
+    let md = _render_doc(root, since, out_path, ledger_n)
+
+    if dry {
+        println("== anima handoff (dry-run) ==")
+        println("since   : " + since)
+        println("out     : " + out_path)
+        println("ledger_n: " + ledger_n)
+        println("--- begin preview (first 40 lines) ---")
+        let head_cmd = "printf '%s' " + _sh_q(md) + " | head -n 40"
+        println(_str(exec(head_cmd)))
+        println("--- end preview ---")
+        return
+    }
+
+    _write_doc(out_path, md)
+    let line_count = _str(exec("wc -l < " + out_path + " 2>/dev/null | tr -d ' '")).trim()
+    println("anima handoff: wrote " + out_path + "  (" + line_count + " lines)")
+}
+
+fn sub_selftest() {
+    // synthetic minimal-input selftest: use an isolated tmp root so we don't
+    // mutate the real repo, and exercise render on an empty state tree.
+    let tmp = "/tmp/anima_handoff_selftest_" + _str(exec("date +%s")).trim()
+    exec("mkdir -p " + tmp + "/docs " + tmp + "/state/proposals/meta")
+    // synthetic ledger + cycle_log with one entry each
+    exec("printf '%s\\n' '{\"schema\":\"anima/cost_ledger/1\",\"ts\":\"2026-04-22T00:00:00Z\",\"action\":\"session\",\"balance_usd\":\"100.0\",\"prev_balance_usd\":\"\",\"delta_usd\":\"\",\"cumulative_burn_usd\":\"0.0\"}' > "
+         + tmp + "/state/anima_cost_ledger.jsonl")
+    exec("printf '%s\\n' '{\"ts\":\"2026-04-22T00:00:00Z\",\"cycle_id\":\"20260422T000000Z\",\"step\":1,\"name\":\"noop\",\"status\":\"ok\",\"exit\":0}' > "
+         + tmp + "/state/proposals/meta/cycle_log.jsonl")
+    // init a throwaway git repo so _git_head_sha works
+    exec("cd " + tmp + " && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m 'init' 2>/dev/null")
+
+    // override root via ANIMA env for this call
+    let prev_anima = _str(env("ANIMA"))
+    exec("true")
+    // We cannot set env in-process portably; so render directly with tmp root arg.
+    let since = "24 hours ago"
+    let out = tmp + "/docs/session_handoff_selftest.md"
+    let md = _render_doc(tmp, since, out, "3")
+    if md == "" {
+        println("FAIL anima_cli/handoff selftest (empty render)")
+        exec("rm -rf " + tmp)
+        exit(1)
+    }
+    _write_doc(out, md)
+    if !_fexists(out) {
+        println("FAIL anima_cli/handoff selftest (doc not written)")
+        exec("rm -rf " + tmp)
+        exit(1)
+    }
+    // smoke: doc contains required headings
+    let grep_cmd = "grep -c -E '^## (1\\. Session|10\\. Next)' " + out + " 2>/dev/null | tr -d ' '"
+    let hits = _str(exec(grep_cmd)).trim()
+    exec("rm -rf " + tmp)
+    if hits != "2" {
+        println("FAIL anima_cli/handoff selftest (missing sections, hits=" + hits + ")")
+        exit(1)
+    }
+    println("PASS anima_cli/handoff selftest")
+    exit(0)
+}
+
+fn main() {
+    let argv = _user_argv(args())
+    if _arg_present(argv, "--selftest") { sub_selftest(); return }
+    if _arg_present(argv, "--help") || len(argv) == 0 { sub_help(); return }
+    let sub = _str(argv[0])
+    if sub == "generate" { sub_generate(argv); return }
+    println("handoff: unknown subcmd '" + sub + "'")
+    sub_help()
+    exit(2)
+}
+
+main()

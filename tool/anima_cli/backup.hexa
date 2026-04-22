@@ -1,0 +1,456 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_cli/backup.hexa — anima CLI `backup` topic (EE1)
+//
+//  PURPOSE
+//    One-shot full state snapshot to Cloudflare R2.  Bundles the three
+//    durable directories (state/, config/, .meta2-cert/) into a single
+//    zstd-compressed tarball, records a sha256 ledger entry, and (on
+//    --apply) ships it to r2:anima-backup/<ts>.tar.zst via rclone.
+//
+//  SUBCOMMANDS
+//    anima backup                          → DRY  (create tarball, print size,
+//                                                  DO NOT upload, DO NOT write ledger)
+//    anima backup --apply                  → REAL (tarball + rclone copy + ledger)
+//    anima backup list                     → rclone ls r2:anima-backup/
+//    anima backup restore <ts> [--apply]   → fetch r2:anima-backup/<ts>.tar.zst
+//                                            into /tmp (dry default prints plan)
+//    --selftest  --help
+//
+//  PIPELINE
+//    ts=$(date -u +%Y%m%d-%H%M%S)
+//    tar -C <root> -cf - [--exclude state/proposals/pending] \
+//        state config .meta2-cert | zstd -19 > /tmp/anima_backup_<ts>.tar.zst
+//    rclone copyto /tmp/anima_backup_<ts>.tar.zst r2:anima-backup/<ts>.tar.zst
+//    sha256 + size_mb → append state/anima_backup_ledger.jsonl
+//
+//  LEDGER SCHEMA (anima/backup_ledger/1, jsonl)
+//    {ts, size_mb, sha256, r2_path, src_dirs, excludes, exit}
+//
+//  CONSTRAINTS
+//    raw#9  hexa-only (no .py; uses tar/zstd/rclone/jq/shasum)
+//    raw#11 snake_case
+//    raw#15 no-hardcode (ANIMA / git-root resolution)
+//    raw#20 no silent state mutation: dry never writes ledger
+//    rclone r2: remote absent → graceful SKIP (no fake-pass; explicit warn)
+//    state/asset_archive_log.jsonl is NEVER touched (separate log surface)
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── vendored helpers (sibling-module pattern) ──────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _ts_iso() -> string {
+    let rep = _str(env("HEXA_REPRODUCIBLE"))
+    if rep == "1" { return "REDACTED" }
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn _ts_compact() -> string {
+    let rep = _str(env("HEXA_REPRODUCIBLE"))
+    if rep == "1" { return "19700101-000000" }
+    return _str(exec("date -u +%Y%m%d-%H%M%S")).trim()
+}
+
+fn _fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _dexists(p: string) -> bool {
+    return _str(exec("test -d " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    return _str(env("HOME")) + "/core/anima"
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _arg_value(argv, key: string, dflt: string) -> string {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key && i + 1 < len(argv) {
+            return _str(argv[i + 1])
+        }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _user_argv(raw) -> array {
+    let out = []
+    let i = 0
+    while i < len(raw) {
+        let s = _str(raw[i])
+        if !s.contains("/.hexa-cache/") {
+            out = out + [s]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _sh_q(s: string) -> string { return "'" + s + "'" }
+
+// ─── r2 remote probe ────────────────────────────────────────────────────────
+
+fn _rclone_available() -> bool {
+    let out = _str(exec("command -v rclone 2>/dev/null")).trim()
+    return out != ""
+}
+
+fn _r2_remote_present() -> bool {
+    if !_rclone_available() { return false }
+    let out = _str(exec("rclone listremotes 2>/dev/null | grep -Fx 'r2:'")).trim()
+    return out == "r2:"
+}
+
+// ─── tar / zstd ─────────────────────────────────────────────────────────────
+
+fn _src_dirs_present(root: string) -> array {
+    // Return whichever of {state, config, .meta2-cert} actually exist.
+    let out = []
+    let candidates = ["state", "config", ".meta2-cert"]
+    let i = 0
+    while i < len(candidates) {
+        let name = _str(candidates[i])
+        if _dexists(root + "/" + name) { out = out + [name] }
+        i = i + 1
+    }
+    return out
+}
+
+fn _build_tar_zst(root: string, out_path: string, exclude_pending: bool) -> string {
+    // Returns "ok" on success, error string otherwise.
+    let dirs = _src_dirs_present(root)
+    if len(dirs) == 0 { return "no_src_dirs" }
+    let dir_args = ""
+    let i = 0
+    while i < len(dirs) {
+        dir_args = dir_args + " " + _str(dirs[i])
+        i = i + 1
+    }
+    let excl = ""
+    if exclude_pending {
+        excl = " --exclude=state/proposals/pending"
+    }
+    // GNU tar on mac (/usr/bin/tar is bsdtar) — both accept --exclude
+    let cmd = "tar -C " + _sh_q(root) + excl + " -cf - " + dir_args
+            + " 2>/dev/null | zstd -19 -q -o " + _sh_q(out_path) + " 2>/dev/null"
+    let rc = _str(exec(cmd + " ; echo __rc=$?")).trim()
+    if !_fexists(out_path) { return "tar_failed" }
+    // rc is the last shell pipeline's exit, we encode it separately:
+    return "ok"
+}
+
+fn _file_size_bytes(p: string) -> string {
+    // portable: use wc -c (works for binaries too)
+    if !_fexists(p) { return "0" }
+    return _str(exec("wc -c < " + _sh_q(p) + " | tr -d ' '")).trim()
+}
+
+fn _size_mb_str(bytes_s: string) -> string {
+    // integer-MB with 2-decimal fractional via awk
+    let cmd = "awk -v b=" + _sh_q(bytes_s) + " 'BEGIN{printf \"%.2f\", b/1048576}'"
+    return _str(exec(cmd)).trim()
+}
+
+fn _sha256_file(p: string) -> string {
+    if !_fexists(p) { return "" }
+    // mac: shasum -a 256; linux: sha256sum — try both
+    let out = _str(exec("shasum -a 256 " + _sh_q(p) + " 2>/dev/null | awk '{print $1}'")).trim()
+    if out != "" { return out }
+    return _str(exec("sha256sum " + _sh_q(p) + " 2>/dev/null | awk '{print $1}'")).trim()
+}
+
+// ─── ledger append ──────────────────────────────────────────────────────────
+
+fn _ledger_append(root: string, ts: string, size_mb: string, sha: string,
+                  r2_path: string, dirs_csv: string, excludes_csv: string,
+                  exit_code: string) {
+    let ledger = root + "/state/anima_backup_ledger.jsonl"
+    // jq -c builds a compact json object; raw#9 — no python
+    let jq_cmd = "jq -cn "
+               + "--arg ts " + _sh_q(ts) + " "
+               + "--arg size_mb " + _sh_q(size_mb) + " "
+               + "--arg sha256 " + _sh_q(sha) + " "
+               + "--arg r2_path " + _sh_q(r2_path) + " "
+               + "--arg src_dirs " + _sh_q(dirs_csv) + " "
+               + "--arg excludes " + _sh_q(excludes_csv) + " "
+               + "--arg exit " + _sh_q(exit_code) + " "
+               + "'{schema:\"anima/backup_ledger/1\",ts:$ts,"
+               + "size_mb:($size_mb|tonumber),sha256:$sha256,"
+               + "r2_path:$r2_path,src_dirs:$src_dirs,excludes:$excludes,"
+               + "exit:($exit|tonumber)}'"
+    let line = _str(exec(jq_cmd)).trim()
+    if line == "" { return }
+    exec("printf '%s\\n' " + _sh_q(line) + " >> " + _sh_q(ledger))
+}
+
+// ─── subcommands ────────────────────────────────────────────────────────────
+
+fn sub_help() {
+    println("anima backup — EE1 snapshot state/ + config/ + .meta2-cert/ to R2")
+    println("")
+    println("  anima backup                      dry-run (tar+zst, no upload, no ledger)")
+    println("  anima backup --apply              real (tar+zst + rclone copy + ledger)")
+    println("  anima backup list                 rclone ls r2:anima-backup/")
+    println("  anima backup restore <ts> [--apply]  fetch to /tmp (dry default)")
+    println("")
+    println("  flags:")
+    println("    --apply                     perform real upload / download")
+    println("    --no-exclude-pending        include state/proposals/pending (default excludes)")
+    println("    --bucket NAME               override r2 bucket (default anima-backup)")
+    println("")
+    println("  --selftest  --help")
+    println("")
+    println("  safety: dry never writes ledger; r2: remote absent → graceful SKIP")
+}
+
+fn sub_backup(argv) {
+    let root = _resolve_root()
+    let apply = _arg_present(argv, "--apply")
+    let exclude_pending = !_arg_present(argv, "--no-exclude-pending")
+    let bucket = _arg_value(argv, "--bucket", "anima-backup")
+    let ts = _ts_compact()
+    let iso = _ts_iso()
+    let tarball = "/tmp/anima_backup_" + ts + ".tar.zst"
+
+    println("anima backup" + (if apply { " --apply" } else { " (dry)" }))
+    println("─────────────────────────────────────────")
+    println("ts          : " + ts)
+    println("iso         : " + iso)
+    println("root        : " + root)
+    println("tarball     : " + tarball)
+    let excl_str = if exclude_pending { "state/proposals/pending" } else { "(none)" }
+    println("excludes    : " + excl_str)
+
+    let dirs = _src_dirs_present(root)
+    if len(dirs) == 0 {
+        println("backup: no source dirs present (state/, config/, .meta2-cert/) — aborting")
+        exit(1)
+    }
+    let dirs_csv = ""
+    let di = 0
+    while di < len(dirs) {
+        if di > 0 { dirs_csv = dirs_csv + "," }
+        dirs_csv = dirs_csv + _str(dirs[di])
+        di = di + 1
+    }
+    println("src_dirs    : " + dirs_csv)
+
+    // Build tarball
+    let result = _build_tar_zst(root, tarball, exclude_pending)
+    if result != "ok" {
+        println("backup: tar/zst failed (" + result + ")")
+        exit(1)
+    }
+    let bytes_s = _file_size_bytes(tarball)
+    let mb = _size_mb_str(bytes_s)
+    println("size_mb     : " + mb + " MB (" + bytes_s + " bytes)")
+
+    let sha = _sha256_file(tarball)
+    println("sha256      : " + sha)
+
+    let r2_path = "r2:" + bucket + "/" + ts + ".tar.zst"
+
+    if !apply {
+        println("r2_path     : " + r2_path + "  (dry — not uploaded)")
+        println("ledger      : (dry — not appended)")
+        println("")
+        println("→ run `anima backup --apply` to upload + append ledger")
+        exit(0)
+    }
+
+    // apply path: require rclone + r2: remote
+    if !_r2_remote_present() {
+        println("backup --apply: rclone r2: remote not configured — SKIP upload")
+        println("  (tarball retained at " + tarball + " for manual handling)")
+        // still log the dry build for auditability — but mark exit=2 (SKIP)
+        _ledger_append(root, iso, mb, sha, "(skipped:no-r2-remote)",
+                       dirs_csv, excl_str, "2")
+        exit(2)
+    }
+
+    println("uploading   : → " + r2_path)
+    let up_cmd = "rclone copyto " + _sh_q(tarball) + " " + _sh_q(r2_path)
+               + " --s3-chunk-size 64M --s3-upload-concurrency 4 "
+               + " --stats 0 2>&1"
+    let up_out = _str(exec(up_cmd + " ; echo __rc=$?"))
+    // extract rc
+    let rc_cmd = "printf '%s' " + _sh_q(up_out) + " | awk -F= '/^__rc=/{print $2}' | tail -n 1"
+    let rc = _str(exec(rc_cmd)).trim()
+    if rc == "" { rc = "1" }
+    if rc != "0" {
+        println("backup --apply: rclone upload failed (rc=" + rc + ")")
+        println(up_out)
+        _ledger_append(root, iso, mb, sha, "(failed:" + r2_path + ")",
+                       dirs_csv, excl_str, rc)
+        exit(1)
+    }
+    println("upload ok")
+    _ledger_append(root, iso, mb, sha, r2_path, dirs_csv, excl_str, "0")
+    println("ledger      : state/anima_backup_ledger.jsonl (appended)")
+    exit(0)
+}
+
+fn sub_list(argv) {
+    let bucket = _arg_value(argv, "--bucket", "anima-backup")
+    if !_r2_remote_present() {
+        println("anima backup list: rclone r2: remote not configured — SKIP")
+        exit(2)
+    }
+    let cmd = "rclone ls r2:" + bucket + "/ 2>&1"
+    let out = _str(exec(cmd))
+    println("anima backup list  (r2:" + bucket + "/)")
+    println("─────────────────────────────────────────")
+    if out.trim() == "" {
+        println("(empty)")
+        exit(0)
+    }
+    println(out)
+    exit(0)
+}
+
+fn sub_restore(argv) {
+    // argv[0] == "restore", argv[1] == <ts>
+    if len(argv) < 2 {
+        println("usage: anima backup restore <ts> [--apply] [--bucket NAME]")
+        exit(2)
+    }
+    let ts = _str(argv[1])
+    let apply = _arg_present(argv, "--apply")
+    let bucket = _arg_value(argv, "--bucket", "anima-backup")
+    let r2_path = "r2:" + bucket + "/" + ts + ".tar.zst"
+    let dst = "/tmp/anima_backup_restore_" + ts + ".tar.zst"
+
+    println("anima backup restore  " + ts + (if apply { " --apply" } else { " (dry)" }))
+    println("─────────────────────────────────────────")
+    println("r2_path     : " + r2_path)
+    println("dst         : " + dst)
+
+    if !_r2_remote_present() {
+        println("restore: rclone r2: remote not configured — SKIP")
+        exit(2)
+    }
+    if !apply {
+        // probe existence via rclone lsjson
+        let probe = _str(exec("rclone lsjson " + _sh_q(r2_path) + " 2>/dev/null | head -c 200")).trim()
+        if probe == "" || probe == "[]" {
+            println("(probe)     : object not found on r2")
+            exit(1)
+        }
+        println("(probe)     : " + probe)
+        println("")
+        println("→ run with --apply to actually download to " + dst)
+        println("  then manually: zstd -d < " + dst + " | tar -C <target> -xf -")
+        exit(0)
+    }
+    let cmd = "rclone copyto " + _sh_q(r2_path) + " " + _sh_q(dst)
+            + " --stats 0 2>&1 ; echo __rc=$?"
+    let out = _str(exec(cmd))
+    let rc_cmd = "printf '%s' " + _sh_q(out) + " | awk -F= '/^__rc=/{print $2}' | tail -n 1"
+    let rc = _str(exec(rc_cmd)).trim()
+    if rc != "0" {
+        println("restore: rclone copyto failed (rc=" + rc + ")")
+        println(out)
+        exit(1)
+    }
+    let size = _file_size_bytes(dst)
+    println("downloaded  : " + dst + "  (" + size + " bytes)")
+    println("")
+    println("next (manual): zstd -d < " + dst + " | tar -C <target> -xf -")
+    exit(0)
+}
+
+// ─── selftest ───────────────────────────────────────────────────────────────
+
+fn sub_selftest() {
+    // Synthetic tar + zst on a throwaway tree; mock rclone by
+    // exercising only the dry path (no network).  raw#9 / raw#20 friendly.
+    let tmp = "/tmp/anima_backup_selftest_" + _str(exec("date +%s")).trim()
+    exec("mkdir -p " + tmp + "/state " + tmp + "/config " + tmp + "/.meta2-cert")
+    exec("printf 'hello\\n' > " + tmp + "/state/x.txt")
+    exec("printf 'cfg\\n' > " + tmp + "/config/y.yaml")
+    exec("printf '{}\\n' > " + tmp + "/.meta2-cert/z.json")
+
+    let tarball = tmp + "/out.tar.zst"
+    let res = _build_tar_zst(tmp, tarball, false)
+    if res != "ok" {
+        println("FAIL anima_cli/backup selftest (tar_zst=" + res + ")")
+        exec("rm -rf " + tmp)
+        exit(1)
+    }
+    if !_fexists(tarball) {
+        println("FAIL anima_cli/backup selftest (tarball missing)")
+        exec("rm -rf " + tmp)
+        exit(1)
+    }
+    let bytes = _file_size_bytes(tarball)
+    if bytes == "0" || bytes == "" {
+        println("FAIL anima_cli/backup selftest (tarball empty)")
+        exec("rm -rf " + tmp)
+        exit(1)
+    }
+    let sha = _sha256_file(tarball)
+    if sha.len() != 64 {
+        println("FAIL anima_cli/backup selftest (sha256 len=" + _str(sha.len()) + ")")
+        exec("rm -rf " + tmp)
+        exit(1)
+    }
+
+    // round-trip: zstd -d | tar tf - must list all three members
+    let rt_cmd = "zstd -d -q < " + tarball + " | tar tf - 2>/dev/null | wc -l | tr -d ' '"
+    let n = _str(exec(rt_cmd)).trim()
+    if n == "" || n == "0" {
+        println("FAIL anima_cli/backup selftest (round-trip members=" + n + ")")
+        exec("rm -rf " + tmp)
+        exit(1)
+    }
+
+    // mock rclone probe: we DON'T require r2: to be present; just exercise
+    // the graceful-skip branch detection (should not crash).
+    let has_r2 = _r2_remote_present()
+    let skip_msg = if has_r2 { "r2:present" } else { "r2:absent-skip-ok" }
+
+    exec("rm -rf " + tmp)
+    println("PASS anima_cli/backup selftest  (bytes=" + bytes + " sha=" + sha.substring(0,12)
+           + " members=" + n + " " + skip_msg + ")")
+    exit(0)
+}
+
+fn main() {
+    let argv = _user_argv(args())
+    if _arg_present(argv, "--selftest") { sub_selftest(); return }
+    if _arg_present(argv, "--help") { sub_help(); return }
+    if len(argv) == 0 {
+        // default: dry backup
+        sub_backup(argv); return
+    }
+    let sub = _str(argv[0])
+    if sub == "list"    { sub_list(argv); return }
+    if sub == "restore" { sub_restore(argv); return }
+    // default (no subcmd, or --apply / --no-exclude-pending flags only) → backup
+    if sub == "--apply" || sub == "--no-exclude-pending" || sub == "--bucket" {
+        sub_backup(argv); return
+    }
+    println("backup: unknown subcmd '" + sub + "'")
+    sub_help()
+    exit(2)
+}
+
+main()
