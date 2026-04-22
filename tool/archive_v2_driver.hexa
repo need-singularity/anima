@@ -172,19 +172,32 @@ fn strip_trailing_slash(s) {
     return out
 }
 
+// Idempotent .tar.zst suffix — avoid "foo.tar.zst.tar.zst" on re-normalize.
+fn with_tar_zst(key) {
+    let k = strip_trailing_slash(key)
+    let tail = ".tar.zst"
+    if k.len() >= tail.len() && k.substring(k.len() - tail.len(), k.len()) == tail {
+        return k
+    }
+    return k + tail
+}
+
+// Shared rclone flags — retries for network blips, stats for progress visibility.
+let RCLONE_FLAGS = "--s3-chunk-size 64M --s3-upload-concurrency 4 --retries 5 --low-level-retries 20 --stats 30s --stats-one-line"
+
 fn upload_dir(path, bucket, key) {
-    let clean_key = strip_trailing_slash(key)
-    let target = "r2:" + bucket + "/" + clean_key + ".tar.zst"
+    let target = "r2:" + bucket + "/" + with_tar_zst(key)
     let parent = parent_dir(path)
     let base = basename(path)
-    let cmd = "tar -cf - -C '" + shq(parent) + "' '" + shq(base) + "' | zstd -T0 -3 | rclone rcat --s3-chunk-size 64M --s3-upload-concurrency 4 '" + target + "'"
+    let cmd = "tar -cf - -C '" + shq(parent) + "' '" + shq(base) + "' | zstd -T0 -3 | rclone rcat " + RCLONE_FLAGS + " '" + target + "'"
     println("  [upload-dir] " + target)
     return sh_rc(cmd)
 }
 
 fn upload_file(path, bucket, key) {
     let target = "r2:" + bucket + "/" + key
-    let cmd = "rclone copyto --s3-chunk-size 64M --s3-upload-concurrency 4 '" + shq(path) + "' '" + target + "'"
+    // copyto is resumable (MPU with size-only skip on re-run) — preferred over rcat for files.
+    let cmd = "rclone copyto " + RCLONE_FLAGS + " '" + shq(path) + "' '" + target + "'"
     println("  [upload-file] " + target)
     return sh_rc(cmd)
 }
@@ -208,7 +221,7 @@ fn archive_one(row, skip_delete) {
     }
 
     let verify_key = key
-    if k == "dir" { verify_key = strip_trailing_slash(key) + ".tar.zst" }
+    if k == "dir" { verify_key = with_tar_zst(key) }
 
     println("")
     println("[" + ts() + "] " + path)
