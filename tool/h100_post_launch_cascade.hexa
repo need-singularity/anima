@@ -1,0 +1,309 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/h100_post_launch_cascade.hexa — ROI V2 (pre-H100): Stage-2 → Stage-3
+//                                       cascade PROPOSAL (propose-only).
+//
+//  PURPOSE
+//    When state/h100_launch_completion_verdict.json reaches overall=VERIFIED
+//    (per tool/h100_post_launch_ingest.hexa) we want to:
+//      1) auto-shutdown the 4 Stage-2 H100 pods (cost stop)
+//      2) cascade-spawn the Stage-3 pod (single H100, post-cross drill)
+//
+//    THIS TOOL DOES NEITHER. It only emits a PROPOSAL JSON describing the
+//    runpodctl stop / create commands an operator would issue. Real shutdown
+//    + spawn require a human invoking the printed commands. Hard-gated.
+//
+//  HARD CONSTRAINTS (ROI V2)
+//    - propose-only: NO runpodctl pod stop / create executed
+//    - NO modification of .roadmap or any SSOT besides the proposal file
+//    - NO remote API calls (only reads local state files)
+//    - safe to re-run; idempotent overwrite of proposal JSON
+//
+//  INPUTS (read-only)
+//    state/h100_launch_completion_verdict.json   (from h100_post_launch_ingest)
+//    state/h100_stage2_launch_state.json         (4 Stage-2 pod ids/names)
+//    state/h100_launch_manifest.json             (Stage-3 kickoff command)
+//
+//  EMITS
+//    state/h100_post_launch_cascade_proposal.json
+//      {
+//        "schema": "anima/h100_post_launch_cascade_proposal/1",
+//        "trigger_verdict": "VERIFIED|PARTIAL|PENDING|FAILED",
+//        "action": "PROPOSE|WAIT|ABORT",
+//        "shutdown_pods": [{pod_id, pod_name, cmd}],
+//        "stage3_spawn":  {kickoff_command, env, note},
+//        "operator_runbook": [<step strings>],
+//        "policy": {executes_remote: false, propose_only: true, ...}
+//      }
+//
+//  USAGE
+//    hexa run tool/h100_post_launch_cascade.hexa             # emit proposal
+//    hexa run tool/h100_post_launch_cascade.hexa --print     # also stdout
+//    hexa run tool/h100_post_launch_cascade.hexa --self-test # scenarios
+//
+//  EXIT
+//    0 = proposal emitted (read .action field for outcome)
+//    1 = self-test FAIL
+//    2 = proposal writer I/O failure
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT       = "/Users/ghost/core/anima"
+let VERDICT_IN       = "/Users/ghost/core/anima/state/h100_launch_completion_verdict.json"
+let LAUNCH_STATE_IN  = "/Users/ghost/core/anima/state/h100_stage2_launch_state.json"
+let MANIFEST_IN      = "/Users/ghost/core/anima/state/h100_launch_manifest.json"
+let PROPOSAL_OUT     = "/Users/ghost/core/anima/state/h100_post_launch_cascade_proposal.json"
+
+// ─── shared helpers ──────────────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+fn _file_exists(p: string) -> bool {
+    return exec_with_status("test -e " + _sh_quote(p))[1] == 0
+}
+fn _ts_iso() -> string {
+    return to_string(utc_iso_now())
+}
+fn _ts_epoch() -> string {
+    return to_string(now())
+}
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+fn _bool_str(b: bool) -> string {
+    if b { return "true" }
+    return "false"
+}
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+fn _flag(av, k) -> bool {
+    for x in av { if to_string(x) == k { return true } }
+    return false
+}
+
+fn _last_slash(p: string) -> int {
+    let mut i = len(p) - 1
+    while i >= 0 {
+        if p.substring(i, i + 1) == "/" { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+// ─── verdict probe ───────────────────────────────────────────────────────
+
+fn _read_verdict_field(key: string) -> string {
+    if !_file_exists(VERDICT_IN) { return "" }
+    let raw = read_file(VERDICT_IN)
+    if to_string(raw) == "" { return "" }
+    let obj = json_parse(to_string(raw))
+    if !obj.contains_key(key) { return "" }
+    return to_string(obj[key])
+}
+
+// ─── stage-2 pods probe (returns array of {path_id, pod_id, pod_name}) ──
+
+fn _read_stage2_pods() -> array {
+    let mut out = []
+    if !_file_exists(LAUNCH_STATE_IN) { return out }
+    let raw = read_file(LAUNCH_STATE_IN)
+    if to_string(raw) == "" { return out }
+    let obj = json_parse(to_string(raw))
+    if !obj.contains_key("pods") { return out }
+    let pods = obj["pods"]
+    let mut i = 0
+    while i < len(pods) {
+        let p = pods[i]
+        let mut entry = json_parse("{}")
+        entry["path_id"]  = if p.contains_key("path_id")  { to_string(p["path_id"])  } else { "" }
+        entry["pod_id"]   = if p.contains_key("pod_id")   { to_string(p["pod_id"])   } else { "" }
+        entry["pod_name"] = if p.contains_key("pod_name") { to_string(p["pod_name"]) } else { "" }
+        out.push(entry)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── stage-3 kickoff command from manifest (best-effort) ────────────────
+
+fn _read_stage3_kickoff() -> string {
+    if !_file_exists(MANIFEST_IN) { return "" }
+    let raw = read_file(MANIFEST_IN)
+    if to_string(raw) == "" { return "" }
+    let obj = json_parse(to_string(raw))
+    if !obj.contains_key("one_command_kickoff") { return "" }
+    let kk = obj["one_command_kickoff"]
+    if !kk.contains_key("stage3") { return "" }
+    return to_string(kk["stage3"])
+}
+
+// ─── action gating ──────────────────────────────────────────────────────
+//
+//  VERIFIED → PROPOSE  (operator may execute the printed cmds)
+//  PENDING  → WAIT     (no-op; Stage-2 not yet complete)
+//  PARTIAL  → WAIT     (mid-flight)
+//  FAILED   → ABORT    (do NOT cascade; investigate failures first)
+//  <missing>/<empty>   → WAIT
+
+fn _decide_action(overall: string) -> string {
+    if overall == "VERIFIED" { return "PROPOSE" }
+    if overall == "FAILED"   { return "ABORT" }
+    return "WAIT"
+}
+
+// ─── proposal renderer ──────────────────────────────────────────────────
+
+fn _render_pods_array(pods: array) -> string {
+    let mut s = ""
+    let mut i = 0
+    while i < len(pods) {
+        let p = pods[i]
+        let pid  = to_string(p["path_id"])
+        let oid  = to_string(p["pod_id"])
+        let name = to_string(p["pod_name"])
+        let cmd  = "runpodctl stop pod " + oid
+        if i > 0 { s = s + ",\n" }
+        s = s + "    {\n"
+        s = s + "      \"path_id\": \""  + _json_escape(pid)  + "\",\n"
+        s = s + "      \"pod_id\":  \""  + _json_escape(oid)  + "\",\n"
+        s = s + "      \"pod_name\": \"" + _json_escape(name) + "\",\n"
+        s = s + "      \"shutdown_cmd\": \"" + _json_escape(cmd) + "\"\n"
+        s = s + "    }"
+        i = i + 1
+    }
+    return s
+}
+
+fn _render_runbook(action: string, pods: array, stage3: string) -> string {
+    let mut s = ""
+    if action != "PROPOSE" {
+        s = s + "    \"action=" + _json_escape(action) + " — no operator steps; re-run after Stage-2 verdict flips VERIFIED.\""
+        return s
+    }
+    let mut steps = []
+    steps.push("1. Verify all 4 Stage-2 verdicts PASS in state/h100_launch_completion_verdict.json")
+    steps.push("2. Execute the 4 shutdown_cmd entries above (sequentially or in parallel) to stop Stage-2 pods")
+    steps.push("3. Wait ~60s for runpodctl pod list to reflect TERMINATED state on all 4")
+    steps.push("4. Execute stage3_spawn.kickoff_command to launch the Stage-3 cascade pod")
+    steps.push("5. Append the new Stage-3 pod to config/h100_pods.json (idle_threshold_min=5)")
+    steps.push("6. Re-run hexa run tool/h100_post_launch_ingest.hexa to refresh verdict for next cascade")
+    let mut i = 0
+    while i < len(steps) {
+        if i > 0 { s = s + ",\n" }
+        s = s + "    \"" + _json_escape(to_string(steps[i])) + "\""
+        i = i + 1
+    }
+    return s
+}
+
+fn _render_proposal(verdict: string, action: string, pods: array, stage3: string, ts: string) -> string {
+    let mut s = "{\n"
+    s = s + "  \"schema\": \"anima/h100_post_launch_cascade_proposal/1\",\n"
+    s = s + "  \"generated_at\": \"" + _json_escape(ts) + "\",\n"
+    s = s + "  \"generated_at_epoch\": " + _ts_epoch() + ",\n"
+    s = s + "  \"generator\": \"tool/h100_post_launch_cascade.hexa\",\n"
+    s = s + "  \"roi_item\": \"V2\",\n"
+    s = s + "  \"trigger_verdict\": \"" + _json_escape(verdict) + "\",\n"
+    s = s + "  \"action\": \"" + _json_escape(action) + "\",\n"
+    s = s + "  \"shutdown_pods\": [\n"
+    s = s + _render_pods_array(pods)
+    s = s + "\n  ],\n"
+    s = s + "  \"stage3_spawn\": {\n"
+    s = s + "    \"kickoff_command\": \"" + _json_escape(stage3) + "\",\n"
+    s = s + "    \"env\": {\n"
+    s = s + "      \"ANIMA_STAGE\": \"3\",\n"
+    s = s + "      \"ANIMA_ROADMAP_ENTRY\": \"11\",\n"
+    s = s + "      \"HEXA_STRICT\": \"1\"\n"
+    s = s + "    },\n"
+    s = s + "    \"note\": \"Stage-3 cascade is OPERATOR-EXECUTED only. This tool never spawns pods.\"\n"
+    s = s + "  },\n"
+    s = s + "  \"operator_runbook\": [\n"
+    s = s + _render_runbook(action, pods, stage3)
+    s = s + "\n  ],\n"
+    s = s + "  \"policy\": {\n"
+    s = s + "    \"propose_only\": true,\n"
+    s = s + "    \"executes_remote_api\": false,\n"
+    s = s + "    \"executes_runpodctl_stop\": false,\n"
+    s = s + "    \"executes_runpodctl_create\": false,\n"
+    s = s + "    \"modifies_roadmap\": false,\n"
+    s = s + "    \"safe_to_repeat\": true,\n"
+    s = s + "    \"note\": \"V2 cascade is propose-only by hard constraint. Operator must hand-execute commands.\"\n"
+    s = s + "  }\n"
+    s = s + "}\n"
+    return s
+}
+
+// ─── main ───────────────────────────────────────────────────────────────
+
+fn run(emit_path: string, also_print: bool) -> int {
+    let ts = _ts_iso()
+    println("── h100_post_launch_cascade " + ts + " ──")
+
+    let overall = _read_verdict_field("overall")
+    let verdict_s = if overall == "" { "PENDING" } else { overall }
+    let action = _decide_action(verdict_s)
+
+    let pods   = _read_stage2_pods()
+    let stage3 = _read_stage3_kickoff()
+
+    println("  trigger_verdict=" + verdict_s)
+    println("  action=" + action + "  (propose-only — no shutdown/spawn executed)")
+    println("  stage2_pods_known=" + to_string(len(pods)))
+    println("  stage3_kickoff_present=" + (if stage3 == "" { "false" } else { "true" }))
+
+    let body = _render_proposal(verdict_s, action, pods, stage3, ts)
+
+    let pdir = emit_path.substring(0, _last_slash(emit_path))
+    if pdir != "" { exec_with_status("mkdir -p " + _sh_quote(pdir)) }
+
+    write_file(emit_path, body)
+    println("  proposal=" + emit_path)
+
+    if also_print { println(body) }
+    return 0
+}
+
+// ─── self-test ──────────────────────────────────────────────────────────
+
+fn self_test() -> int {
+    println("── h100_post_launch_cascade self-test ──")
+
+    let ok1 = (_decide_action("VERIFIED") == "PROPOSE")
+    let ok2 = (_decide_action("PENDING")  == "WAIT")
+    let ok3 = (_decide_action("PARTIAL")  == "WAIT")
+    let ok4 = (_decide_action("FAILED")   == "ABORT")
+    let ok5 = (_decide_action("")         == "WAIT")
+
+    let mut pass = 0
+    let mut fail = 0
+    if ok1 { println("  S1 PASS (VERIFIED→PROPOSE)"); pass = pass + 1 } else { println("  S1 FAIL"); fail = fail + 1 }
+    if ok2 { println("  S2 PASS (PENDING→WAIT)");     pass = pass + 1 } else { println("  S2 FAIL"); fail = fail + 1 }
+    if ok3 { println("  S3 PASS (PARTIAL→WAIT)");     pass = pass + 1 } else { println("  S3 FAIL"); fail = fail + 1 }
+    if ok4 { println("  S4 PASS (FAILED→ABORT)");     pass = pass + 1 } else { println("  S4 FAIL"); fail = fail + 1 }
+    if ok5 { println("  S5 PASS (empty→WAIT)");       pass = pass + 1 } else { println("  S5 FAIL"); fail = fail + 1 }
+
+    println("post_launch_cascade selftest: " + to_string(pass) + "/5 PASS, " + to_string(fail) + " FAIL")
+    if fail > 0 { return 1 }
+    return 0
+}
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") || _flag(av, "-h") {
+        println("usage: hexa run tool/h100_post_launch_cascade.hexa [--self-test] [--print] [--out <path>]")
+        return 0
+    }
+    if _flag(av, "--self-test") || _flag(av, "self-test") {
+        return self_test()
+    }
+    let also_print = _flag(av, "--print")
+    return run(PROPOSAL_OUT, also_print)
+}

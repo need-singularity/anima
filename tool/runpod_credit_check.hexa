@@ -1,0 +1,153 @@
+// tool/runpod_credit_check.hexa — pre-H100 ROI P3 (5-min runpod credit guard)
+//
+// PURPOSE
+//   Periodically (every 5 min via launchd) checks the runpod credit balance
+//   and emits an alert when balance < ALERT_USD (default $1000). Persists the
+//   most recent result to state/runpod_credit_status.json. Idempotent: each
+//   run rewrites the SSOT atomically, never appends a stream.
+//
+// USAGE
+//   hexa run tool/runpod_credit_check.hexa             # dry (probe + write SSOT, no notify)
+//   hexa run tool/runpod_credit_check.hexa --apply     # also fire Slack notify if alert
+//   hexa run tool/runpod_credit_check.hexa --self-test # synthetic balance scenarios
+//   hexa run tool/runpod_credit_check.hexa --threshold 500
+//
+// CONSTRAINTS
+//   raw#9 deterministic: threshold + SSOT path fixed.
+//   raw#10 proof-carrying: SSOT carries probe_method + raw stdout digest.
+//   No network unless runpodctl is on PATH; otherwise records probe="unavailable"
+//   and exits 0 (graceful — never blocks the launchd cycle).
+//   --apply only effect is forwarding to slack_webhook_test.hexa --apply when
+//   alert is active AND env SLACK_WEBHOOK_URL set.
+
+let SSOT_PATH    = "/Users/ghost/core/anima/state/runpod_credit_status.json"
+let DEFAULT_THRESHOLD_USD = 1000.0
+let SLACK_NOTIFY_TOOL = "/Users/ghost/core/anima/tool/slack_webhook_test.hexa"
+
+// INLINE_DEPRECATED[H42]
+fn _sh_quote(s: string) -> string { let mut o = "'"; o = o + s.replace("'", "'\\''"); o = o + "'"; return o }
+fn _file_exists(p: string) -> bool { return exec_with_status("test -e " + _sh_quote(p))[1] == 0 }
+fn _json_escape(s: string) -> string { return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") }
+fn _which(cmd: string) -> bool { return exec_with_status("command -v " + _sh_quote(cmd) + " >/dev/null 2>&1")[1] == 0 }
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+fn _has(av, k) -> bool {
+    let mut i = 0
+    while i < len(av) { if to_string(av[i]) == k { return true }; i = i + 1 }
+    return false
+}
+fn _opt(av, k, d: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && i + 1 < len(av) { return to_string(av[i + 1]) }
+        i = i + 1
+    }
+    return d
+}
+
+// ─── balance probe ────────────────────────────────────────────────────────
+// Returns [balance_usd: float, method: string, raw: string].
+// balance_usd = -1.0 means probe unavailable.
+
+fn _probe_balance() -> array {
+    if !_which("runpodctl") {
+        return [-1.0, "unavailable", "runpodctl not on PATH"]
+    }
+    // Try modern subcommand first, then legacy. Both are tried via shell so
+    // a missing one returns non-zero and we fall through.
+    let cmd = "runpodctl get user 2>/dev/null || runpodctl balance 2>/dev/null || true"
+    let r = exec_with_status(cmd)
+    let raw = to_string(r[0])
+    if len(raw) == 0 {
+        return [-1.0, "unavailable", "runpodctl returned no output"]
+    }
+    // Heuristic parse: look for first dollar amount.
+    let extract = "printf %s " + _sh_quote(raw) +
+                  " | grep -oE '\\$[0-9]+(\\.[0-9]+)?' | head -1 | tr -d '$'"
+    let r2 = exec_with_status(extract)
+    let bal_s = to_string(r2[0]).trim()
+    if len(bal_s) == 0 {
+        return [-1.0, "parse_failed", raw]
+    }
+    return [to_float(bal_s), "runpodctl", raw]
+}
+
+fn _atomic_write(path: string, content: string) {
+    let tmp = path + ".tmp"
+    write_file(tmp, content)
+    exec_with_status("mv " + _sh_quote(tmp) + " " + _sh_quote(path))
+}
+
+fn _build_ssot(balance: float, method: string, threshold: float, alert: bool, raw_digest: string) -> string {
+    let ts = to_string(utc_iso_now())
+    let alert_s = if alert { "true" } else { "false" }
+    return "{\n" +
+           "  \"schema\": \"anima/runpod_credit_status/1\",\n" +
+           "  \"generated_at\": \"" + ts + "\",\n" +
+           "  \"probe_method\": \"" + _json_escape(method) + "\",\n" +
+           "  \"balance_usd\": " + to_string(balance) + ",\n" +
+           "  \"threshold_usd\": " + to_string(threshold) + ",\n" +
+           "  \"alert\": " + alert_s + ",\n" +
+           "  \"raw_digest\": \"" + _json_escape(raw_digest) + "\",\n" +
+           "  \"source\": \"tool/runpod_credit_check.hexa\"\n" +
+           "}\n"
+}
+
+fn _digest(s: string) -> string {
+    let q = _sh_quote(s)
+    let r = exec_with_status("printf %s " + q + " | shasum -a 256 | awk '{print $1}'")
+    return to_string(r[0]).trim()
+}
+
+fn _self_test() {
+    let s1 = _build_ssot(2500.0, "mock", 1000.0, false, "deadbeef")
+    if s1.index_of("\"alert\": false") < 0 { eprintln("SELFTEST FAIL alert false"); exit(1) }
+    let s2 = _build_ssot(750.5, "mock", 1000.0, true, "cafebabe")
+    if s2.index_of("\"alert\": true") < 0 { eprintln("SELFTEST FAIL alert true"); exit(1) }
+    let s3 = _build_ssot(-1.0, "unavailable", 1000.0, false, "")
+    if s3.index_of("unavailable") < 0 { eprintln("SELFTEST FAIL unavailable"); exit(1) }
+    println("[runpod_credit_check] SELFTEST PASS scenarios=3")
+    exit(0)
+}
+
+fn main() {
+    let av = _argv()
+    if _has(av, "--self-test") { _self_test() }
+
+    let apply = _has(av, "--apply")
+    let threshold = to_float(_opt(av, "--threshold", to_string(DEFAULT_THRESHOLD_USD)))
+
+    let probe = _probe_balance()
+    let balance = to_float(to_string(probe[0]))
+    let method  = to_string(probe[1])
+    let raw     = to_string(probe[2])
+
+    let alert = balance >= 0.0 && balance < threshold
+    let raw_digest = if len(raw) > 0 { _digest(raw) } else { "" }
+    let ssot = _build_ssot(balance, method, threshold, alert, raw_digest)
+    _atomic_write(SSOT_PATH, ssot)
+
+    println("[runpod_credit_check] balance=$" + to_string(balance) +
+            " threshold=$" + to_string(threshold) +
+            " method=" + method +
+            " alert=" + (if alert { "true" } else { "false" }))
+    println("[runpod_credit_check] ssot=" + SSOT_PATH)
+
+    if alert && apply {
+        let msg = "anima runpod balance ALERT: $" + to_string(balance) +
+                  " < threshold $" + to_string(threshold)
+        let cmd = "/Users/ghost/.hx/bin/hexa run " + SLACK_NOTIFY_TOOL +
+                  " --apply --message " + _sh_quote(msg)
+        exec_with_status(cmd)
+        println("[runpod_credit_check] notify dispatched (best-effort)")
+    }
+    exit(0)
+}
+
+main()

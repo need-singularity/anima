@@ -1,0 +1,272 @@
+// tool/per_pod_ckpt_isolation_verify.hexa — verify 4-pod ckpt path isolation
+//
+// Roadmap: 2026-04-22 ROI Q4 — per-pod independent ckpt isolation verify.
+// Motivation: With ROI Q1 (ckpt_interval_steps=25) and ROI Q2 (R2 auto-resume),
+// each of the 4 Stage-2 pods (p1..p4) plus Stage-1 must write/read ckpts under
+// a path-disjoint R2 prefix. Cross-pod ckpt collision would silently corrupt
+// substrate-cross Φ measurement (different tokenizers, different LoRA ranks).
+//
+// What this verifies (no real R2 calls; pure schema/path-layout check):
+//   (a) tool/h100_pod_resume.bash R2_PREFIX layout uses ${PATH_ID} subdir
+//   (b) the 4 stage-2 path ids (p1..p4) yield disjoint R2 URIs and disjoint
+//       local ckpt dirs (no prefix collision: p1/ is NOT a prefix of p1x/)
+//   (c) tool/h100_launch_manifest_spec.hexa Stage-2 substrate_variants have
+//       distinct id values matching {p1, p2, p3, p4}
+//   (d) Stage-1 (stage1) is also disjoint from p1..p4
+//
+// raw#9  deterministic: path layout literal-checked from manifest SSOT
+// raw#10 proof-carrying: writes state/per_pod_ckpt_isolation_verify.json
+// raw#15 no-hardcode: probes manifest JSON; only the path-id list is canonical
+//
+// USAGE
+//   hexa run tool/per_pod_ckpt_isolation_verify.hexa
+//   hexa run tool/per_pod_ckpt_isolation_verify.hexa --self-test
+//
+// EXIT
+//   0 = isolation VERIFIED
+//   1 = self-test FAIL
+//   2 = isolation VIOLATED (collision detected)
+
+let ANIMA_ROOT = "/Users/ghost/core/anima"
+let MANIFEST   = "/Users/ghost/core/anima/state/h100_launch_manifest.json"
+let RESUME_BASH = "/Users/ghost/core/anima/tool/h100_pod_resume.bash"
+let OUT_PATH   = "/Users/ghost/core/anima/state/per_pod_ckpt_isolation_verify.json"
+
+// ─── helpers (inline; INLINE_DEPRECATED[H42] same pattern as sibling tools) ─
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+fn _file_exists(p: string) -> bool {
+    return exec_with_status("test -e " + _sh_quote(p))[1] == 0
+}
+fn _ts_iso() -> string {
+    return to_string(utc_iso_now())
+}
+fn _ts_epoch() -> string {
+    return to_string(now())
+}
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+fn _sha256_str(s: string) -> string {
+    let q = _sh_quote(s)
+    let r = exec_with_status("printf %s " + q + " | shasum -a 256 | awk '{print $1}'")
+    return to_string(r[0]).trim()
+}
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+fn _flag(av, k) -> bool {
+    for x in av { if to_string(x) == k { return true } }
+    return false
+}
+
+// ─── path id constants (canonical SSOT for resilience layer) ──────────────
+
+fn _path_ids() -> array {
+    return ["stage1", "p1", "p2", "p3", "p4"]
+}
+
+// ─── R2 URI + local dir builders (mirror h100_pod_resume.bash) ────────────
+
+fn _r2_uri(remote: string, prefix: string, pid: string) -> string {
+    return remote + ":" + prefix + "/" + pid + "/"
+}
+fn _local_dir(root: string, pid: string) -> string {
+    return root + "/" + pid
+}
+
+// ─── isolation checks ─────────────────────────────────────────────────────
+
+// Disjoint = no two URIs equal AND no URI is a prefix of another (which would
+// allow rclone copy on a/ to clobber files under a/b/).
+fn _check_disjoint(uris: array) -> string {
+    let mut i = 0
+    while i < len(uris) {
+        let mut j = 0
+        while j < len(uris) {
+            if i != j {
+                let u_i = to_string(uris[i])
+                let u_j = to_string(uris[j])
+                if u_i == u_j {
+                    return "COLLISION_EQUAL:" + u_i
+                }
+                // check prefix relation in either direction
+                if len(u_j) > len(u_i) {
+                    let head = u_j.substring(0, len(u_i))
+                    if head == u_i {
+                        return "COLLISION_PREFIX:" + u_i + "<<" + u_j
+                    }
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return "DISJOINT"
+}
+
+// Verify resume bash exposes per-PATH_ID layout (string check; raw#15).
+fn _check_resume_bash_layout() -> string {
+    if !_file_exists(RESUME_BASH) {
+        return "MISSING_RESUME_BASH"
+    }
+    let body = read_file(RESUME_BASH)
+    // Two anchors that must appear in the resume script for per-pod isolation:
+    //   1) R2 URI builder includes ${PATH_ID} segment
+    //   2) local dir builder includes ${PATH_ID} segment
+    let r2_anchor    = "R2_PREFIX}/${PATH_ID}"
+    let local_anchor = "LOCAL_ROOT}/${PATH_ID}"
+    if !body.contains(r2_anchor) {
+        return "RESUME_BASH_MISSING_R2_PATH_ID_SEGMENT"
+    }
+    if !body.contains(local_anchor) {
+        return "RESUME_BASH_MISSING_LOCAL_PATH_ID_SEGMENT"
+    }
+    return "OK"
+}
+
+// Verify manifest Stage-2 substrate_variants id set ⊇ {p1,p2,p3,p4}.
+fn _check_manifest_path_ids() -> string {
+    if !_file_exists(MANIFEST) {
+        return "MISSING_MANIFEST"
+    }
+    let body = read_file(MANIFEST)
+    let mut want = ["p1", "p2", "p3", "p4"]
+    let mut i = 0
+    while i < len(want) {
+        let needle = "\"id\":\"" + to_string(want[i]) + "\""
+        if !body.contains(needle) {
+            return "MANIFEST_MISSING_ID:" + to_string(want[i])
+        }
+        i = i + 1
+    }
+    return "OK"
+}
+
+// ─── main run ─────────────────────────────────────────────────────────────
+
+fn run() -> int {
+    let ts = _ts_iso()
+    println("── per_pod_ckpt_isolation_verify " + ts + " ──")
+
+    let ids   = _path_ids()
+    let remote = "r2"
+    let prefix = "anima/h100/ckpts"
+    let local  = "/workspace/ckpts"
+
+    let mut uris   = []
+    let mut locals = []
+    let mut i = 0
+    while i < len(ids) {
+        let pid = to_string(ids[i])
+        uris   = push(uris,   _r2_uri(remote, prefix, pid))
+        locals = push(locals, _local_dir(local, pid))
+        i = i + 1
+    }
+
+    let r2_disj    = _check_disjoint(uris)
+    let local_disj = _check_disjoint(locals)
+    let layout     = _check_resume_bash_layout()
+    let manifest_ok = _check_manifest_path_ids()
+
+    println("  R2 URIs disjoint:      " + r2_disj)
+    println("  local dirs disjoint:   " + local_disj)
+    println("  resume bash layout:    " + layout)
+    println("  manifest path id set:  " + manifest_ok)
+
+    let all_ok = (r2_disj == "DISJOINT") && (local_disj == "DISJOINT") &&
+                 (layout == "OK") && (manifest_ok == "OK")
+    let verdict = if all_ok { "VERIFIED" } else { "VIOLATED" }
+    println("  verdict=" + verdict)
+
+    // Build pod table for proof.
+    let mut pods_json = "["
+    i = 0
+    while i < len(ids) {
+        if i > 0 { pods_json = pods_json + "," }
+        pods_json = pods_json + "{\"path_id\":\"" + to_string(ids[i]) + "\","
+        pods_json = pods_json + "\"r2_uri\":\""   + _json_escape(to_string(uris[i])) + "\","
+        pods_json = pods_json + "\"local_dir\":\"" + _json_escape(to_string(locals[i])) + "\"}"
+        i = i + 1
+    }
+    pods_json = pods_json + "]"
+
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima/per_pod_ckpt_isolation/1\",\n"
+    body = body + "  \"generated_at\": \"" + _json_escape(ts) + "\",\n"
+    body = body + "  \"generated_at_epoch\": " + _ts_epoch() + ",\n"
+    body = body + "  \"r2_remote\": \"" + remote + "\",\n"
+    body = body + "  \"r2_prefix\": \"" + prefix + "\",\n"
+    body = body + "  \"local_root\": \"" + local + "\",\n"
+    body = body + "  \"pods\": " + pods_json + ",\n"
+    body = body + "  \"checks\": {\n"
+    body = body + "    \"r2_uris_disjoint\":    \"" + r2_disj + "\",\n"
+    body = body + "    \"local_dirs_disjoint\": \"" + local_disj + "\",\n"
+    body = body + "    \"resume_bash_layout\":  \"" + layout + "\",\n"
+    body = body + "    \"manifest_path_ids\":   \"" + manifest_ok + "\"\n"
+    body = body + "  },\n"
+    body = body + "  \"verdict\": \"" + verdict + "\"\n"
+    body = body + "}\n"
+
+    exec_with_status("mkdir -p " + _sh_quote("/Users/ghost/core/anima/state"))
+    write_file(OUT_PATH, body)
+    let cur_hash = _sha256_str(body)
+    println("  proof=" + OUT_PATH + " sha=" + cur_hash)
+    if all_ok { return 0 }
+    return 2
+}
+
+// ─── self-test ─────────────────────────────────────────────────────────────
+
+fn self_test() -> int {
+    println("── per_pod_ckpt_isolation_verify self-test ──")
+    let mut pass = 0
+    let mut fail = 0
+
+    // S1: disjoint set returns DISJOINT
+    let s1 = _check_disjoint(["r2:a/p1/", "r2:a/p2/", "r2:a/p3/", "r2:a/p4/"])
+    if s1 == "DISJOINT" { println("  S1 PASS (4 disjoint uris)"); pass = pass + 1 }
+    else                { println("  S1 FAIL got " + s1); fail = fail + 1 }
+
+    // S2: equal collision detected
+    let s2 = _check_disjoint(["r2:a/p1/", "r2:a/p1/"])
+    if s2.contains("COLLISION_EQUAL") { println("  S2 PASS (equal collision)"); pass = pass + 1 }
+    else                              { println("  S2 FAIL got " + s2); fail = fail + 1 }
+
+    // S3: prefix collision detected (p1/ is prefix of p1/sub/)
+    let s3 = _check_disjoint(["r2:a/p1/", "r2:a/p1/sub/"])
+    if s3.contains("COLLISION_PREFIX") { println("  S3 PASS (prefix collision)"); pass = pass + 1 }
+    else                                { println("  S3 FAIL got " + s3); fail = fail + 1 }
+
+    // S4: real layout check on actual resume bash
+    let s4 = _check_resume_bash_layout()
+    if s4 == "OK" { println("  S4 PASS (resume bash layout has PATH_ID segments)"); pass = pass + 1 }
+    else          { println("  S4 FAIL got " + s4); fail = fail + 1 }
+
+    println("isolation_verify selftest: " + to_string(pass) + "/4 PASS, " + to_string(fail) + " FAIL")
+    if fail > 0 { return 1 }
+    return 0
+}
+
+// ─── entry ─────────────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") || _flag(av, "-h") {
+        println("usage: hexa run tool/per_pod_ckpt_isolation_verify.hexa [--self-test]")
+        return 0
+    }
+    if _flag(av, "--self-test") || _flag(av, "self-test") {
+        return self_test()
+    }
+    return run()
+}

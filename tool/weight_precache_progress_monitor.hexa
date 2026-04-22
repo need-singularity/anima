@@ -1,0 +1,194 @@
+// tool/weight_precache_progress_monitor.hexa — pre-H100 ROI P4 (10-min ETA monitor)
+//
+// PURPOSE
+//   Reads state/h100_weight_precache_progress.jsonl (written by
+//   tool/h100_weight_precache.bash) and computes per-path % done + overall ETA
+//   based on the manifest expected sizes. Persists to
+//   state/weight_precache_eta.json — atomic, idempotent SSOT replacement.
+//
+// USAGE
+//   hexa run tool/weight_precache_progress_monitor.hexa
+//   hexa run tool/weight_precache_progress_monitor.hexa --self-test
+//
+// CONSTRAINTS
+//   raw#9 deterministic: same inputs → same SSOT output (timestamp aside).
+//   raw#10 proof-carrying: SSOT carries source_lines + done_count for audit.
+//   No network. No mutation of progress.jsonl. Pure read+derive+write.
+
+let MANIFEST_PATH = "/Users/ghost/core/anima/state/h100_weight_precache_manifest.json"
+let PROGRESS_JSONL = "/Users/ghost/core/anima/state/h100_weight_precache_progress.jsonl"
+let ETA_SSOT = "/Users/ghost/core/anima/state/weight_precache_eta.json"
+
+// Effective throughput assumption: same as manifest (800 MB/s pod inbound).
+// For the htz-side R2 mirror process the bandwidth is HF→htz→R2, but we use
+// a conservative 200 MB/s for ETA purposes (htz upstream typical).
+let EFFECTIVE_MBPS = 200.0
+
+// INLINE_DEPRECATED[H42]
+fn _sh_quote(s: string) -> string { let mut o = "'"; o = o + s.replace("'", "'\\''"); o = o + "'"; return o }
+fn _file_exists(p: string) -> bool { return exec_with_status("test -e " + _sh_quote(p))[1] == 0 }
+fn _json_escape(s: string) -> string { return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") }
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+fn _has(av, k) -> bool {
+    let mut i = 0
+    while i < len(av) { if to_string(av[i]) == k { return true }; i = i + 1 }
+    return false
+}
+
+fn _atomic_write(path: string, content: string) {
+    let tmp = path + ".tmp"
+    write_file(tmp, content)
+    exec_with_status("mv " + _sh_quote(tmp) + " " + _sh_quote(path))
+}
+
+fn _safe_float(obj, k) -> float {
+    if obj.contains_key(k) { return to_float(to_string(obj[k])) }
+    return 0.0
+}
+
+fn _read_progress_done() -> array {
+    // Returns array of done-line objects (last wins per path).
+    if !_file_exists(PROGRESS_JSONL) { return [] }
+    let body = read_file(PROGRESS_JSONL)
+    let lines = body.split("\n")
+    let mut by_path = json_parse("{}")
+    let mut i = 0
+    while i < len(lines) {
+        let s = to_string(lines[i]).trim()
+        i = i + 1
+        if len(s) == 0 { continue }
+        let obj = json_parse(s)
+        if !obj.contains_key("status") { continue }
+        if to_string(obj["status"]) != "done" { continue }
+        if !obj.contains_key("path") { continue }
+        let p = to_string(obj["path"])
+        by_path[p] = obj
+    }
+    let mut out = []
+    let ks = keys(by_path)
+    let mut j = 0
+    while j < len(ks) { out.push(by_path[to_string(ks[j])]); j = j + 1 }
+    return out
+}
+
+fn _expected_paths(manifest) -> array {
+    if !manifest.contains_key("paths") { return [] }
+    let paths = manifest["paths"]
+    let ks = keys(paths)
+    let mut out = []
+    let mut i = 0
+    while i < len(ks) {
+        let k = to_string(ks[i])
+        let entry = paths[k]
+        let size_gb = _safe_float(entry, "estimated_size_gb")
+        let mut row = json_parse("{}")
+        row["path"] = k
+        row["size_mb"] = size_gb * 1024.0
+        out.push(row)
+        i = i + 1
+    }
+    return out
+}
+
+fn _build_eta(manifest_present: bool, expected: array, done: array, throughput_mbps: float) -> string {
+    let mut total_mb = 0.0
+    let mut i = 0
+    while i < len(expected) {
+        total_mb = total_mb + _safe_float(expected[i], "size_mb")
+        i = i + 1
+    }
+
+    let mut done_mb = 0.0
+    let mut done_paths = []
+    let mut j = 0
+    while j < len(done) {
+        let d = done[j]
+        done_mb = done_mb + _safe_float(d, "size_mb")
+        if d.contains_key("path") { done_paths.push(to_string(d["path"])) }
+        j = j + 1
+    }
+
+    let pct = if total_mb > 0.0 { (done_mb / total_mb) * 100.0 } else { 0.0 }
+    let remaining_mb = if total_mb > done_mb { total_mb - done_mb } else { 0.0 }
+    let eta_seconds = if throughput_mbps > 0.0 { remaining_mb / throughput_mbps } else { 0.0 }
+
+    let mut done_arr_s = "["
+    let mut k = 0
+    while k < len(done_paths) {
+        if k > 0 { done_arr_s = done_arr_s + ", " }
+        done_arr_s = done_arr_s + "\"" + _json_escape(done_paths[k]) + "\""
+        k = k + 1
+    }
+    done_arr_s = done_arr_s + "]"
+
+    let ts = to_string(utc_iso_now())
+    let mp_s = if manifest_present { "true" } else { "false" }
+    return "{\n" +
+           "  \"schema\": \"anima/weight_precache_eta/1\",\n" +
+           "  \"generated_at\": \"" + ts + "\",\n" +
+           "  \"manifest_present\": " + mp_s + ",\n" +
+           "  \"total_paths\": " + to_string(len(expected)) + ",\n" +
+           "  \"done_paths\": " + done_arr_s + ",\n" +
+           "  \"done_count\": " + to_string(len(done_paths)) + ",\n" +
+           "  \"total_mb\": " + to_string(total_mb) + ",\n" +
+           "  \"done_mb\": " + to_string(done_mb) + ",\n" +
+           "  \"percent\": " + to_string(pct) + ",\n" +
+           "  \"throughput_mbps_assumed\": " + to_string(throughput_mbps) + ",\n" +
+           "  \"eta_seconds\": " + to_string(eta_seconds) + ",\n" +
+           "  \"source\": {\n" +
+           "    \"manifest\": \"" + MANIFEST_PATH + "\",\n" +
+           "    \"progress_jsonl\": \"" + PROGRESS_JSONL + "\"\n" +
+           "  }\n" +
+           "}\n"
+}
+
+fn _mk_row(path: string, size_mb: float) {
+    let mut row = json_parse("{}")
+    row["path"] = path
+    row["size_mb"] = size_mb
+    return row
+}
+
+fn _self_test() {
+    let mut expected = []
+    expected.push(_mk_row("p1", 1000.0))
+    expected.push(_mk_row("p2", 2000.0))
+    let mut done = []
+    done.push(_mk_row("p1", 1000.0))
+    let s = _build_eta(true, expected, done, 200.0)
+    if s.index_of("\"done_count\": 1") < 0 { eprintln("SELFTEST FAIL done_count"); exit(1) }
+    if s.index_of("\"total_paths\": 2") < 0 { eprintln("SELFTEST FAIL total_paths"); exit(1) }
+    if s.index_of("\"percent\":") < 0 { eprintln("SELFTEST FAIL percent"); exit(1) }
+    if s.index_of("\"eta_seconds\":") < 0 { eprintln("SELFTEST FAIL eta_seconds"); exit(1) }
+    let s2 = _build_eta(false, [], [], 200.0)
+    if s2.index_of("\"manifest_present\": false") < 0 { eprintln("SELFTEST FAIL manifest_present"); exit(1) }
+    println("[weight_precache_progress_monitor] SELFTEST PASS scenarios=2")
+    exit(0)
+}
+
+fn main() {
+    let av = _argv()
+    if _has(av, "--self-test") { _self_test() }
+
+    let manifest_present = _file_exists(MANIFEST_PATH)
+    let manifest = if manifest_present { json_parse(read_file(MANIFEST_PATH)) } else { json_parse("{}") }
+    let expected = _expected_paths(manifest)
+    let done = _read_progress_done()
+
+    let ssot = _build_eta(manifest_present, expected, done, EFFECTIVE_MBPS)
+    _atomic_write(ETA_SSOT, ssot)
+
+    println("[weight_precache_progress_monitor] done=" + to_string(len(done)) +
+            "/" + to_string(len(expected)) +
+            " ssot=" + ETA_SSOT)
+    exit(0)
+}
+
+main()

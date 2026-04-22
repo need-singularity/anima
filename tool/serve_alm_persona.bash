@@ -12,5 +12,17 @@ if [ -z "$HEXA_BIN" ]; then
   else HEXA_BIN="hexa"; fi
 fi
 HEXA_FILE="$(cd "$(dirname "$0")/.." && pwd)/tool/serve_alm_persona.hexa"
+
+# MINIMAL SELFTEST (T1-T4 ROI): parse-clean + 1 invariant. Does NOT exec hexa.
+if [[ "${1:-}" == "--selftest" ]]; then
+  echo "── serve_alm_persona.bash (shim) selftest ──"
+  bash -n "$0" || { echo "  parse FAIL"; exit 1; }
+  if [[ ! -f "$HEXA_FILE" ]]; then echo "  invariant FAIL: target hexa missing ($HEXA_FILE)"; exit 1; fi
+  echo "  parse: PASS"
+  echo "  invariant: shim target $HEXA_FILE present"
+  echo "  SELFTEST PASS"
+  exit 0
+fi
+
 echo "[serve_alm_persona] DEPRECATED bash bridge — forwarding to native hexa ($HEXA_FILE)" >&2
 exec "$HEXA_BIN" "$HEXA_FILE" "$@"

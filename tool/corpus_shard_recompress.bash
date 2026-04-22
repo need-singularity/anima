@@ -27,15 +27,31 @@ ANIMA_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LOG="$ANIMA_ROOT/state/corpus_shard_recompress_log.jsonl"
 AUDIT_OUT="$ANIMA_ROOT/state/corpus_shard_recompress_last.json"
 
+SELFTEST=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --apply)    APPLY=1; shift ;;
     --root)     CORPUS_ROOT="$2"; shift 2 ;;
     --sample-n) SAMPLE_N="$2"; shift 2 ;;
+    --selftest) SELFTEST=1; shift ;;
     -h|--help)  sed -n '2,22p' "$0"; exit 0 ;;
     *) echo "[corpus_recompress] unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+
+if [[ "$SELFTEST" -eq 1 ]]; then
+  # MINIMAL SELFTEST: parse-clean + 1 invariant. NEVER recompresses real shards.
+  echo "── corpus_shard_recompress selftest ──"
+  bash -n "$0" || { echo "  parse FAIL"; exit 1; }
+  if [[ "$APPLY" -ne 0 ]]; then echo "  invariant FAIL: --selftest must not co-occur with --apply"; exit 1; fi
+  if [[ "$LEVEL_NEW" -le "$LEVEL_OLD" ]]; then
+    echo "  invariant FAIL: LEVEL_NEW($LEVEL_NEW) must exceed LEVEL_OLD($LEVEL_OLD)"; exit 1
+  fi
+  echo "  parse: PASS"
+  echo "  invariant: APPLY=0 default, LEVEL_NEW($LEVEL_NEW) > LEVEL_OLD($LEVEL_OLD)"
+  echo "  SELFTEST PASS"
+  exit 0
+fi
 
 mkdir -p "$ANIMA_ROOT/state"
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }

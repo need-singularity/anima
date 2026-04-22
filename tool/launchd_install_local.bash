@@ -167,7 +167,34 @@ status() {
     ls -la "${DST_DIR}/com.anima."* 2>/dev/null || echo "  (none)"
 }
 
+selftest() {
+    # MINIMAL SELFTEST (T1-T4 ROI): parse-clean + 1 invariant.
+    # NEVER calls launchctl. NEVER touches ${DST_DIR}.
+    echo "── launchd_install_local.bash  mode=SELFTEST ──"
+    bash -n "$0" || { echo "  parse FAIL"; return 1; }
+    # Invariant: every plist declared in PLISTS exists under SRC_DIR.
+    local missing=0
+    for p in "${PLISTS[@]}"; do
+        if [[ ! -f "${SRC_DIR}/${p}" ]]; then
+            echo "  [MISSING-SRC] ${p}"
+            missing=$((missing + 1))
+        fi
+    done
+    if [[ "${missing}" -gt 0 ]]; then
+        echo "  SELFTEST FAIL — ${missing} plist(s) missing"
+        return 1
+    fi
+    echo "  parse: PASS"
+    echo "  invariant: ${#PLISTS[@]} plist(s) all present in ${SRC_DIR}"
+    echo "  SELFTEST PASS"
+    return 0
+}
+
 case "${MODE}" in
+    --selftest)
+        selftest
+        exit $?
+        ;;
     --dry-run|"")
         dry_run
         ;;
@@ -184,7 +211,7 @@ case "${MODE}" in
         status
         ;;
     *)
-        echo "usage: $0 [--dry-run|--link|--activate|--unload|--status]" >&2
+        echo "usage: $0 [--dry-run|--link|--activate|--unload|--status|--selftest]" >&2
         exit 2
         ;;
 esac

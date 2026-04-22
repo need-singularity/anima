@@ -1,0 +1,344 @@
+// ════════════════════════════════════════════════════════════════════════════
+// tool/corpus_tier_verify.hexa — curriculum tier 30/50/70% verifier
+//
+// PURPOSE
+//   pre-H100 ROI R3 — verify that state/corpus_tier_manifest.json (produced
+//   by tool/corpus_curriculum_tier.hexa) actually reflects the configured
+//   30 / 50 / 70 % half-open band cuts AND that the per-tier counts add up
+//   to the source corpus line count. Read-only audit; does NOT regenerate
+//   the manifest, does NOT mutate any tier file.
+//
+// INPUT
+//   state/corpus_tier_manifest.json
+//   config/corpus_curriculum_tier_config.json  (band cuts cross-check)
+//
+// OUTPUT
+//   state/corpus_tier_verify_result.json
+//
+// VERIFICATIONS
+//   V1 manifest_exists                       (file present + parseable)
+//   V2 band_cuts_match_30_50_70             (lo/hi values = 0/0.30/0.50/0.70/1.01)
+//   V3 sum(tier_counts) == json_ok          (no leak into "unassigned")
+//   V4 corpus_sha256_recompute_match        (raw#10 proof reverify)
+//   V5 each_tier_jsonl_sha_match            (per-tier file sha integrity)
+//   V6 reward_multiplier_monotonic          (0.7 < 1.0 < 1.3 < 1.5)
+//
+// SELFTEST (--selftest)
+//   T1 V1..V6 run on existing manifest → emits result, returns 0 if all PASS
+//   T2 synthetic-bad manifest → V2 must FAIL (negative test)
+//
+// RULES
+//   raw#9 hexa-only · raw#10 sha-proof · raw#11 snake_case
+//   raw#12 empirical · deterministic · LLM=none · read-only
+// ════════════════════════════════════════════════════════════════════════════
+
+let MANIFEST     = "state/corpus_tier_manifest.json"
+let TIER_CFG     = "config/corpus_curriculum_tier_config.json"
+let OUT_RESULT   = "state/corpus_tier_verify_result.json"
+
+// expected band-cuts (30/50/70%)
+let EXPECTED_LOS = ["0", "0.3", "0.5", "0.7"]
+let EXPECTED_HIS = ["0.3", "0.5", "0.7", "1.01"]
+let EXPECTED_MULTS = [0.7, 1.0, 1.3, 1.5]
+
+// ─── helpers ─────────────────────────────────────────────────────────────
+
+fn _str(x) {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn fexists(p) {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn dexists(p) {
+    return _str(exec("test -d " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn ensure_dir(d) {
+    if !dexists(d) { exec("mkdir -p " + d) }
+}
+
+fn now_utc() {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn sha256_file(p) {
+    if !fexists(p) { return "" }
+    return _str(exec("shasum -a 256 " + p + " 2>/dev/null | awk '{print $1}'")).trim()
+}
+
+fn atomic_write(path, body) {
+    let pid = _str(exec("printf %s $$")).trim()
+    let tmp = path + ".tmp." + pid
+    write_file(tmp, body)
+    exec("mv -f " + tmp + " " + path)
+}
+
+fn json_escape(s) {
+    let a = s.replace("\\", "\\\\")
+    let b = a.replace("\"", "\\\"")
+    let c = b.replace("\n", "\\n")
+    return c
+}
+
+fn arg_present(argv, key) {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn is_json_map(v) {
+    let s = str(v)
+    if s.len() < 1 { return false }
+    return s.substring(0, 1) == "{"
+}
+
+// approximate float comparison
+fn fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn near_eq(a, b) {
+    return fabs(a - b) < 0.0001
+}
+
+// ─── verify execution ────────────────────────────────────────────────────
+
+struct VerifyOut {
+    v1: bool,
+    v2: bool,
+    v3: bool,
+    v4: bool,
+    v5: bool,
+    v6: bool,
+    n_tiers: int,
+    sum_counts: int,
+    json_ok: int,
+    corpus_path: string,
+    corpus_sha_manifest: string,
+    corpus_sha_recompute: string,
+    detail: string
+}
+
+fn run_verify() {
+    let mut out = VerifyOut {
+        v1: false, v2: false, v3: false, v4: false, v5: false, v6: false,
+        n_tiers: 0, sum_counts: 0, json_ok: 0,
+        corpus_path: "", corpus_sha_manifest: "", corpus_sha_recompute: "",
+        detail: ""
+    }
+
+    // V1
+    if !fexists(MANIFEST) {
+        out.detail = "manifest missing: " + MANIFEST
+        return out
+    }
+    let raw = read_file(MANIFEST)
+    let m = json_parse(raw)
+    if !is_json_map(m) {
+        out.detail = "manifest unparseable JSON"
+        return out
+    }
+    out.v1 = true
+
+    let tiers = m["tiers"]
+    let n = len(tiers)
+    out.n_tiers = n
+
+    // V2 band cuts match expected 30/50/70 cuts
+    let mut v2_ok = (n == 4)
+    let mut i = 0
+    while i < n && v2_ok {
+        let t = tiers[i]
+        let lo_s = str(t["lo"])
+        let hi_s = str(t["hi"])
+        if lo_s != EXPECTED_LOS[i] { v2_ok = false }
+        if hi_s != EXPECTED_HIS[i] { v2_ok = false }
+        i = i + 1
+    }
+    out.v2 = v2_ok
+
+    // V3 sum(counts) == json_ok
+    let json_ok = to_int(str(m["json_ok"]))
+    let mut sum = 0
+    let mut j = 0
+    while j < n {
+        sum = sum + to_int(str(tiers[j]["count"]))
+        j = j + 1
+    }
+    out.sum_counts = sum
+    out.json_ok = json_ok
+    out.v3 = (sum == json_ok)
+
+    // V4 corpus_sha recompute
+    let corpus_path = str(m["corpus_path"])
+    out.corpus_path = corpus_path
+    let manifest_sha = str(m["corpus_sha256"])
+    out.corpus_sha_manifest = manifest_sha
+    let recompute = sha256_file(corpus_path)
+    out.corpus_sha_recompute = recompute
+    out.v4 = (recompute != "" && recompute == manifest_sha)
+
+    // V5 per-tier file sha match
+    let mut v5_ok = true
+    let mut k = 0
+    while k < n && v5_ok {
+        let t = tiers[k]
+        let path = str(t["path"])
+        let claim = str(t["sha256"])
+        let actual = sha256_file(path)
+        if actual == "" { v5_ok = false }
+        if actual != claim { v5_ok = false }
+        k = k + 1
+    }
+    out.v5 = v5_ok
+
+    // V6 reward multiplier monotonic 0.7 < 1.0 < 1.3 < 1.5
+    let mut v6_ok = (n == 4)
+    let mut p = 0
+    while p < n && v6_ok {
+        let t = tiers[p]
+        let mult = to_float(str(t["reward_multiplier"]))
+        if !near_eq(mult, EXPECTED_MULTS[p]) { v6_ok = false }
+        p = p + 1
+    }
+    out.v6 = v6_ok
+
+    return out
+}
+
+// ─── result writer ───────────────────────────────────────────────────────
+
+fn b(x) { return if x { "true" } else { "false" } }
+
+fn write_result(o, all_pass) {
+    ensure_dir("state")
+    let raw = if fexists(MANIFEST) { read_file(MANIFEST) } else { "{}" }
+    let m = json_parse(raw)
+    let tiers = if is_json_map(m) { m["tiers"] } else { [] }
+    let n = len(tiers)
+
+    let mut parts = []
+    parts = parts.push("{\n")
+    parts = parts.push("  \"schema\": \"anima.corpus_tier_verify.v1\",\n")
+    parts = parts.push("  \"tool\": \"tool/corpus_tier_verify.hexa\",\n")
+    parts = parts.push("  \"generated\": \"" + now_utc() + "\",\n")
+    parts = parts.push("  \"manifest_path\": \"" + json_escape(MANIFEST) + "\",\n")
+    parts = parts.push("  \"manifest_sha256\": \"" + sha256_file(MANIFEST) + "\",\n")
+    parts = parts.push("  \"tier_config_path\": \"" + json_escape(TIER_CFG) + "\",\n")
+    parts = parts.push("  \"corpus_path\": \"" + json_escape(o.corpus_path) + "\",\n")
+    parts = parts.push("  \"corpus_sha256_manifest\": \"" + o.corpus_sha_manifest + "\",\n")
+    parts = parts.push("  \"corpus_sha256_recompute\": \"" + o.corpus_sha_recompute + "\",\n")
+    parts = parts.push("  \"n_tiers\": " + str(o.n_tiers) + ",\n")
+    parts = parts.push("  \"sum_tier_counts\": " + str(o.sum_counts) + ",\n")
+    parts = parts.push("  \"json_ok_in_manifest\": " + str(o.json_ok) + ",\n")
+
+    parts = parts.push("  \"tier_counts\": [\n")
+    let mut i = 0
+    while i < n {
+        let t = tiers[i]
+        let label = str(t["label"])
+        let cnt = str(t["count"])
+        let lo = str(t["lo"])
+        let hi = str(t["hi"])
+        let mult = str(t["reward_multiplier"])
+        let comma = if i + 1 < n { "," } else { "" }
+        parts = parts.push("    {\"tier\": " + str(i + 1)
+                         + ", \"label\": \"" + json_escape(label) + "\""
+                         + ", \"lo\": " + lo
+                         + ", \"hi\": " + hi
+                         + ", \"reward_multiplier\": " + mult
+                         + ", \"count\": " + cnt + "}" + comma + "\n")
+        i = i + 1
+    }
+    parts = parts.push("  ],\n")
+
+    parts = parts.push("  \"checks\": {\n")
+    parts = parts.push("    \"v1_manifest_exists\":            " + b(o.v1) + ",\n")
+    parts = parts.push("    \"v2_band_cuts_30_50_70\":         " + b(o.v2) + ",\n")
+    parts = parts.push("    \"v3_sum_counts_eq_json_ok\":      " + b(o.v3) + ",\n")
+    parts = parts.push("    \"v4_corpus_sha_recompute_match\": " + b(o.v4) + ",\n")
+    parts = parts.push("    \"v5_each_tier_sha_match\":        " + b(o.v5) + ",\n")
+    parts = parts.push("    \"v6_reward_mult_monotonic\":      " + b(o.v6) + "\n")
+    parts = parts.push("  },\n")
+    parts = parts.push("  \"all_pass\": " + b(all_pass) + ",\n")
+    parts = parts.push("  \"deterministic\": true,\n")
+    parts = parts.push("  \"llm\": \"none\"\n")
+    parts = parts.push("}\n")
+
+    let mut body = ""
+    let mut k = 0
+    while k < len(parts) {
+        body = body + parts[k]
+        k = k + 1
+    }
+    atomic_write(OUT_RESULT, body)
+}
+
+// ─── selftest (negative branch) ──────────────────────────────────────────
+
+fn selftest_negative() {
+    // Build a tiny synthetic manifest with WRONG band cuts and verify V2 fails.
+    let bad = "{\n  \"schema\": \"x\",\n  \"corpus_path\": \"/dev/null\",\n  \"corpus_sha256\": \"x\",\n  \"json_ok\": 0,\n  \"tiers\": [\n    {\"tier\":1,\"label\":\"a\",\"lo\":0,\"hi\":0.25,\"reward_multiplier\":0.7,\"count\":0,\"path\":\"/dev/null\",\"sha256\":\"x\"},\n    {\"tier\":2,\"label\":\"b\",\"lo\":0.25,\"hi\":0.5,\"reward_multiplier\":1.0,\"count\":0,\"path\":\"/dev/null\",\"sha256\":\"x\"},\n    {\"tier\":3,\"label\":\"c\",\"lo\":0.5,\"hi\":0.75,\"reward_multiplier\":1.3,\"count\":0,\"path\":\"/dev/null\",\"sha256\":\"x\"},\n    {\"tier\":4,\"label\":\"d\",\"lo\":0.75,\"hi\":1.01,\"reward_multiplier\":1.5,\"count\":0,\"path\":\"/dev/null\",\"sha256\":\"x\"}\n  ]\n}\n"
+    let tmp = "/tmp/_corpus_tier_verify_bad.json"
+    write_file(tmp, bad)
+    let m = json_parse(bad)
+    let tiers = m["tiers"]
+    let n = len(tiers)
+    let mut v2_ok = (n == 4)
+    let mut i = 0
+    while i < n && v2_ok {
+        let t = tiers[i]
+        let lo_s = str(t["lo"])
+        let hi_s = str(t["hi"])
+        if lo_s != EXPECTED_LOS[i] { v2_ok = false }
+        if hi_s != EXPECTED_HIS[i] { v2_ok = false }
+        i = i + 1
+    }
+    return !v2_ok      // PASS iff bad manifest gets rejected
+}
+
+// ─── main ────────────────────────────────────────────────────────────────
+
+fn main() {
+    let argv = args()
+    println("[corpus_tier_verify] read-only audit on " + MANIFEST)
+    println("  ts: " + now_utc())
+
+    let o = run_verify()
+    let all_pass = o.v1 && o.v2 && o.v3 && o.v4 && o.v5 && o.v6
+    write_result(o, all_pass)
+
+    println("  V1 manifest_exists           = " + b(o.v1))
+    println("  V2 band_cuts_30_50_70        = " + b(o.v2))
+    println("  V3 sum_counts(" + str(o.sum_counts) + ")=json_ok(" + str(o.json_ok) + ") = " + b(o.v3))
+    println("  V4 corpus_sha_recompute      = " + b(o.v4))
+    println("  V5 each_tier_sha_match       = " + b(o.v5))
+    println("  V6 reward_mult_monotonic     = " + b(o.v6))
+    println("  result: " + OUT_RESULT)
+
+    println("── corpus_tier_verify selftest ──")
+    let neg = selftest_negative()
+    if neg {
+        println("  T_neg synthetic_bad_rejected : PASS")
+    } else {
+        println("  T_neg synthetic_bad_rejected : FAIL")
+    }
+
+    let st_pass = all_pass && neg
+    if st_pass {
+        println("[corpus_tier_verify] ALL PASS — curriculum tier 30/50/70 verified")
+        exit(0)
+    }
+    println("[corpus_tier_verify] some checks failed (real_all=" + b(all_pass) + " selftest=" + b(neg) + ")")
+    exit(1)
+}
+
+main()

@@ -176,6 +176,31 @@ fn _evaluate_pod(pod, cfg, apply) {
         let tmpl = _cfg_str(cfg, "stop_cmd_template", "runpodctl stop pod {pod_id}")
         let stop_cmd = tmpl.replace("{pod_id}", pid)
         v["stop_cmd"] = stop_cmd
+        // 2026-04-22 ROI Q3: SIGUSR2 graceful ckpt save before STOP.
+        // Cfg-gated (graceful_save_enabled, default true); fully backward-compat:
+        //   - if disabled, planning + apply skip the SIGUSR2 step entirely.
+        //   - graceful_save_cmd_template defaults to a no-op SSH-based kill -USR2;
+        //     in dry-run we only PLAN it (no exec). On apply, we exec only when
+        //     SSH host is present AND the cmd is non-empty.
+        let graceful_enabled = _cfg_bool(cfg, "graceful_save_enabled", true)
+        if graceful_enabled {
+            let g_tmpl = _cfg_str(cfg, "graceful_save_cmd_template",
+                "ssh -o ConnectTimeout=8 -o BatchMode=yes -p {ssh_port} {ssh_user}@{ssh_host} 'pkill -USR2 -f anima || true'")
+            let host = _pod_field_str(pod, "ssh_host", "")
+            let port = _pod_field_int(pod, "ssh_port", 22)
+            let user = _pod_field_str(pod, "ssh_user", "root")
+            let g_cmd = g_tmpl.replace("{pod_id}", pid).replace("{ssh_host}", host).replace("{ssh_port}", to_string(port)).replace("{ssh_user}", user)
+            v["graceful_save_cmd"] = g_cmd
+            let wait_sec = _cfg_int(cfg, "graceful_save_wait_sec", 30)
+            v["graceful_save_wait_sec"] = wait_sec
+            if apply && host != "" {
+                let gr = exec_with_status(g_cmd)
+                v["graceful_rc"] = gr[1]
+                v["graceful_stdout"] = to_string(gr[0]).trim()
+                // Brief sleep to let the trap finish ckpt write before STOP.
+                exec_with_status("sleep " + to_string(wait_sec))
+            }
+        }
         if apply {
             if _which("runpodctl") {
                 let r = exec_with_status(stop_cmd)
@@ -218,6 +243,14 @@ fn _render_verdict(v) -> string {
     o = o + "      \"probe_cmd\": \""       + _json_escape(to_string(v["probe_cmd"]))          + "\",\n"
     if v.contains_key("stop_cmd") {
         o = o + "      \"stop_cmd\": \""    + _json_escape(to_string(v["stop_cmd"]))          + "\",\n"
+    }
+    if v.contains_key("graceful_save_cmd") {
+        o = o + "      \"graceful_save_cmd\": \"" + _json_escape(to_string(v["graceful_save_cmd"])) + "\",\n"
+        o = o + "      \"graceful_save_wait_sec\": " + to_string(v["graceful_save_wait_sec"]) + ",\n"
+    }
+    if v.contains_key("graceful_rc") {
+        o = o + "      \"graceful_rc\": " + to_string(v["graceful_rc"]) + ",\n"
+        o = o + "      \"graceful_stdout\": \"" + _json_escape(to_string(v["graceful_stdout"])) + "\",\n"
     }
     if v.contains_key("apply_rc") {
         o = o + "      \"apply_rc\": "      + to_string(v["apply_rc"])                        + ",\n"
@@ -352,9 +385,19 @@ fn self_test(cfg) -> int {
         fails = fails + 1
     }
 
+    // 2026-04-22 ROI Q3: SIGUSR2 graceful save plan must be present on STOP verdict
+    // when graceful_save_enabled (default true). Re-uses S1 verdict above.
+    if v1.contains_key("graceful_save_cmd") && to_string(v1["graceful_save_cmd"]).contains("USR2") {
+        println("  S4 PASS (STOP → graceful_save_cmd contains SIGUSR2 plan)")
+        passes = passes + 1
+    } else {
+        println("  S4 FAIL expected graceful_save_cmd with USR2; got=" + to_string(v1.contains_key("graceful_save_cmd")))
+        fails = fails + 1
+    }
+
     // threshold sanity check (self-documentation)
     println("  threshold_minutes=" + to_string(threshold))
-    println("h100_auto_kill selftest: " + to_string(passes) + "/3 PASS, " + to_string(fails) + " FAIL")
+    println("h100_auto_kill selftest: " + to_string(passes) + "/4 PASS, " + to_string(fails) + " FAIL")
     if fails > 0 { return 1 }
     return 0
 }

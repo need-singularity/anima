@@ -28,15 +28,29 @@ EXTRA_GLOB=""
 LOG_OUT="$ANIMA_ROOT/state/log_rotation_zstd_log.jsonl"
 AUDIT_OUT="$ANIMA_ROOT/state/log_rotation_zstd_last.json"
 
+SELFTEST=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --apply)       APPLY=1; shift ;;
     --age-days)    AGE_DAYS="$2"; shift 2 ;;
     --extra-glob)  EXTRA_GLOB="$2"; shift 2 ;;
+    --selftest)    SELFTEST=1; shift ;;
     -h|--help)     sed -n '2,22p' "$0"; exit 0 ;;
     *) echo "[log_rotation_zstd] unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+
+if [[ "$SELFTEST" -eq 1 ]]; then
+  # MINIMAL SELFTEST: parse-clean + 1 invariant (default age safe + APPLY=0).
+  echo "── log_rotation_zstd selftest ──"
+  bash -n "$0" || { echo "  parse FAIL"; exit 1; }
+  if [[ "$APPLY" -ne 0 ]]; then echo "  invariant FAIL: --selftest must not co-occur with --apply"; exit 1; fi
+  if [[ "$AGE_DAYS" -lt 1 ]]; then echo "  invariant FAIL: AGE_DAYS=$AGE_DAYS < 1 (would compress live logs)"; exit 1; fi
+  echo "  parse: PASS"
+  echo "  invariant: APPLY=0 default, AGE_DAYS=$AGE_DAYS >= 1"
+  echo "  SELFTEST PASS"
+  exit 0
+fi
 
 mkdir -p "$ANIMA_ROOT/state"
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }

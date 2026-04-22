@@ -38,6 +38,11 @@ readonly NUMERICAL_DRIFT_BOUND="0.0002"
 readonly IDLE_MINUTES_MAX=5  # 2026-04-22 ROI A2: 30→5 min
 readonly PHI_REL_DELTA_MAX="0.05"
 readonly MIN_PATHS_PASS=3
+# 2026-04-22 ROI V1: spot bid lock — H100 SXM5 secure-cloud bid ceiling.
+# runpodctl uses --cost as $/hr price CEILING (bid). secureCloud=stable supply for H100.
+# To override: export ANIMA_H100_BID_USD=<float> ; default 3.50 ($/hr/GPU) calibrated 2026-04-22.
+readonly BID_USD_PER_HR="${ANIMA_H100_BID_USD:-3.50}"
+readonly CLOUD_TIER="secureCloud"  # secureCloud | communityCloud — locked secure for H100 SXM5
 
 readonly TS="$(date -u +%Y%m%dT%H%M%SZ)"
 readonly LOG="/tmp/h100_stage2_launch_${TS}.log"
@@ -65,8 +70,17 @@ done
 log "mode=${MODE} log=${LOG}"
 log "anima_root=${ANIMA_ROOT}"
 
-# 2026-04-22 ROI A3: spot enforce, ondemand fallback block (per manifest abort_thresholds.ondemand_disallowed=true).
+# 2026-04-22 ROI A3+V1: spot enforce, ondemand fallback block, bid lock verification.
 if [[ "${RUNPOD_GPU_TYPE_FLAG:-}" == "ondemand" ]]; then echo "ABORT: ondemand disallowed per manifest"; exit 4; fi
+# V1 spot bid lock: BID_USD_PER_HR must be a positive float; CLOUD_TIER must be secureCloud (H100 SXM5).
+if ! awk -v v="${BID_USD_PER_HR}" 'BEGIN{exit !(v+0>0 && v+0<=10)}'; then
+  echo "ABORT: BID_USD_PER_HR=${BID_USD_PER_HR} out of sane range (0,10] $/hr"; exit 4
+fi
+if [[ "${CLOUD_TIER}" != "secureCloud" && "${CLOUD_TIER}" != "communityCloud" ]]; then
+  echo "ABORT: CLOUD_TIER=${CLOUD_TIER} invalid (must be secureCloud|communityCloud)"; exit 4
+fi
+# Echo the lock so dry-run output proves the bid ceiling is wired.
+log "V1 spot_bid_lock: cloud_tier=${CLOUD_TIER} bid_usd_per_hr=${BID_USD_PER_HR}"
 
 FAIL_N=0
 
@@ -180,8 +194,9 @@ if [[ "${MODE}" == "dry-run" ]]; then
     mdl_tag=$(echo "${mdl}" | tr '[:upper:]' '[:lower:]' | tr '/._' '-' | tr -cd 'a-z0-9-' | cut -c1-32)
     pod_name="anima-${pid}-${mdl_tag}"
     log "  [${idx}/4] ${RUNPODCTL} create pod --gpuType 'NVIDIA H100 80GB HBM3' --gpuCount 1 \\"
+    log "         --${CLOUD_TIER} \\"
     log "         --name ${pod_name} --imageName ${STAGE2_IMAGE} \\"
-    log "         --cost 3.50 --containerDiskSize 80 --volumeSize 200 --volumePath /workspace \\"
+    log "         --cost ${BID_USD_PER_HR} --containerDiskSize 80 --volumeSize 200 --volumePath /workspace \\"
     log "         --startSSH --ports '22/tcp' \\"
     log "         --env ANIMA_STAGE=2 --env ANIMA_ROADMAP_ENTRY=10 --env HEXA_STRICT=1 \\"
     log "         --env PHI_PATH_ID=${pid} --env PHI_MODEL='${mdl}' --env PHI_THRESHOLD_REL=${PHI_REL_DELTA_MAX} \\"
@@ -211,11 +226,15 @@ for path_model in "p1:${MODEL_P1}" "p2:${MODEL_P2}" "p3:${MODEL_P3}" "p4:${MODEL
   mdl_tag=$(echo "${mdl}" | tr '[:upper:]' '[:lower:]' | tr '/._' '-' | tr -cd 'a-z0-9-' | cut -c1-32)
   pod_name="anima-${pid}-${mdl_tag}"
   log "  [${idx}/4] launching ${pod_name} ..."
+  # V1 spot bid lock: --secureCloud + --cost <bid ceiling>. runpodctl picks the
+  # cheapest available offering at-or-below this ceiling; ondemand fallback was
+  # already blocked above by RUNPOD_GPU_TYPE_FLAG guard.
   out=$("${RUNPODCTL}" create pod \
     --gpuType "NVIDIA H100 80GB HBM3" --gpuCount 1 \
+    --"${CLOUD_TIER}" \
     --name "${pod_name}" \
     --imageName "${STAGE2_IMAGE}" \
-    --cost 3.50 --containerDiskSize 80 --volumeSize 200 --volumePath /workspace \
+    --cost "${BID_USD_PER_HR}" --containerDiskSize 80 --volumeSize 200 --volumePath /workspace \
     --startSSH --ports "22/tcp" \
     --env "ANIMA_STAGE=2" \
     --env "ANIMA_ROADMAP_ENTRY=10" \

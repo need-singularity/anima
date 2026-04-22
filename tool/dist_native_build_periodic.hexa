@@ -1,0 +1,230 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/dist_native_build_periodic.hexa — T2: dist/ native build daily cron
+//
+//  PURPOSE
+//    Drives `tool/build_fixup_native.bash --selftest` once per launchd tick
+//    (default 24h), captures stdout/stderr + duration + exit_code, and
+//    appends one JSON-line per run to state/dist_native_build_periodic_log.jsonl.
+//
+//    Goal: keep dist/*.native artifacts (serve_alm_persona.native +
+//    h100_post_launch_ingest.native) regenerated against latest tool/*.hexa
+//    sources, so a stale binary never gets pinned to the H100 ingest path.
+//
+//    The bash script already does a 2/2 PASS selftest; this hexa tool is the
+//    cron-friendly wrapper that records each run for the audit log.
+//
+//  USAGE
+//    hexa run tool/dist_native_build_periodic.hexa
+//    hexa run tool/dist_native_build_periodic.hexa --selftest
+//    hexa run tool/dist_native_build_periodic.hexa --dry      # parse + log only
+//
+//  RULES
+//    raw#9   hexa-only wrapper
+//    raw#10  proof-carrying (state/dist_native_build_periodic_log.jsonl SSOT)
+//    raw#11  snake_case
+//    raw#15  no-hardcode (build script path overridable via --script)
+//
+//  EXIT CODES
+//    0  build OK (build_fixup_native.bash --selftest exit 0)
+//    1  build FAIL  (non-zero exit propagated)
+//    2  setup error (script missing, log dir unwritable)
+//    3  --dry path mismatch
+// ════════════════════════════════════════════════════════════════════════════
+
+let DEFAULT_SCRIPT  = "/Users/ghost/core/anima/tool/build_fixup_native.bash"
+let DEFAULT_LOG     = "/Users/ghost/core/anima/state/dist_native_build_periodic_log.jsonl"
+let DEFAULT_WORKDIR = "/Users/ghost/core/anima"
+let TOOL_NAME       = "dist_native_build_periodic"
+let TOOL_VERSION    = "v1"
+
+// ─── shell helpers ───────────────────────────────────────────────────────
+
+// INLINE_DEPRECATED[H42]: see shared/util/sh_quote.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _sh_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _exec_out(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _exec_code(cmd: string) -> int {
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+// INLINE_DEPRECATED[H42]: see shared/util/file_exists.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _file_exists(p: string) -> bool { return _exec_code("test -e " + _sh_quote(p)) == 0 }
+fn _dir_exists(p: string)  -> bool { return _exec_code("test -d " + _sh_quote(p)) == 0 }
+fn _mkdir_p(p: string)     -> bool { return _exec_code("mkdir -p " + _sh_quote(p)) == 0 }
+
+fn _utc_now() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _epoch_s() -> int {
+    let s = _exec_out("date -u +%s").trim()
+    return to_int(s)
+}
+
+fn _parent_of(path: string) -> string {
+    let parts = path.split("/")
+    if len(parts) <= 1 { return "." }
+    let mut out = ""
+    let mut i = 0
+    let cap = len(parts) - 1
+    while i < cap {
+        if i > 0 { out = out + "/" }
+        out = out + to_string(parts[i])
+        i = i + 1
+    }
+    if out == "" { return "/" }
+    return out
+}
+
+// INLINE_DEPRECATED[H42]: see shared/util/json_escape.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _json_escape(s: string) -> string {
+    let a = s.replace("\\", "\\\\")
+    let b = a.replace("\"", "\\\"")
+    let c = b.replace("\n", "\\n")
+    let d = c.replace("\r", "\\r")
+    let e = d.replace("\t", "\\t")
+    return e
+}
+
+fn _append_jsonl(log_path: string, line: string) -> bool {
+    let _ = _mkdir_p(_parent_of(log_path))
+    let cmd = "printf '%s\\n' " + _sh_quote(line) + " >> " + _sh_quote(log_path)
+    return _exec_code(cmd) == 0
+}
+
+// ─── argv ────────────────────────────────────────────────────────────────
+
+fn _argv() -> array {
+    let a = args()
+    let mut out = []
+    let mut i = 2
+    while i < len(a) { out.push(a[i]); i = i + 1 }
+    return out
+}
+
+fn _flag(av: array, k: string) -> bool {
+    for x in av { if to_string(x) == k { return true } }
+    return false
+}
+
+fn _opt(av: array, k: string, d: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && i + 1 < len(av) { return to_string(av[i + 1]) }
+        i = i + 1
+    }
+    return d
+}
+
+// ─── core run ─────────────────────────────────────────────────────────────
+
+fn do_run(script: string, workdir: string, log_path: string, dry: bool) -> int {
+    let ts = _utc_now()
+    if !_file_exists(script) {
+        let line = "{\"ts\":\"" + ts + "\",\"tool\":\"" + TOOL_NAME +
+            "\",\"event\":\"setup_error\",\"reason\":\"script_missing\"," +
+            "\"script\":\"" + _json_escape(script) + "\",\"verdict\":\"SETUP_ERROR\"}"
+        let _ = _append_jsonl(log_path, line)
+        eprintln(TOOL_NAME + ": SETUP_ERROR — script missing: " + script)
+        return 2
+    }
+    if !_dir_exists(workdir) {
+        eprintln(TOOL_NAME + ": SETUP_ERROR — workdir missing: " + workdir)
+        return 2
+    }
+    if dry {
+        let line = "{\"ts\":\"" + ts + "\",\"tool\":\"" + TOOL_NAME +
+            "\",\"event\":\"dry\",\"script\":\"" + _json_escape(script) +
+            "\",\"workdir\":\"" + _json_escape(workdir) + "\",\"verdict\":\"DRY\"}"
+        let _ = _append_jsonl(log_path, line)
+        println(TOOL_NAME + ": DRY — would run " + script + " --selftest")
+        return 0
+    }
+    let t0 = _epoch_s()
+    // cd to workdir so build_fixup_native's relative tool/* + dist/* paths resolve.
+    let cmd = "cd " + _sh_quote(workdir) + " && bash " + _sh_quote(script) + " --selftest 2>&1"
+    let r = exec_with_status(cmd)
+    let stdout = to_string(r[0])
+    let rc = r[1]
+    let t1 = _epoch_s()
+    let dur = t1 - t0
+    let verdict = if rc == 0 { "PASS" } else { "FAIL" }
+    // Tail of output (last 400 chars) is logged — full output goes to launchd's
+    // StandardErrorPath / StandardOutPath.
+    let tail = if stdout.len() > 400 {
+        stdout.substring(stdout.len() - 400, stdout.len())
+    } else { stdout }
+    let line = "{\"ts\":\"" + ts + "\",\"tool\":\"" + TOOL_NAME +
+        "\",\"event\":\"build\",\"script\":\"" + _json_escape(script) +
+        "\",\"exit_code\":" + to_string(rc) +
+        ",\"duration_s\":" + to_string(dur) +
+        ",\"verdict\":\"" + verdict + "\"" +
+        ",\"stdout_tail\":\"" + _json_escape(tail) + "\"}"
+    let _ = _append_jsonl(log_path, line)
+    println(TOOL_NAME + ": " + verdict + " (rc=" + to_string(rc) +
+            " dur=" + to_string(dur) + "s log=" + log_path + ")")
+    if rc == 0 { return 0 }
+    return 1
+}
+
+// ─── selftest ─────────────────────────────────────────────────────────────
+
+fn run_selftest() -> int {
+    println(TOOL_NAME + ": SELFTEST starting")
+    let mut fails = 0
+    // S1: helper sanity.
+    let q = _sh_quote("a b'c")
+    if q.len() < 5 { fails = fails + 1; println("S1 FAIL: sh_quote") }
+    // S2: argv default resolution.
+    let av = []
+    let s = _opt(av, "--script", DEFAULT_SCRIPT)
+    if s != DEFAULT_SCRIPT { fails = fails + 1; println("S2 FAIL: opt default") }
+    // S3: script presence (build_fixup_native.bash MUST exist for periodic to be useful).
+    if !_file_exists(DEFAULT_SCRIPT) {
+        fails = fails + 1; println("S3 FAIL: build script missing: " + DEFAULT_SCRIPT)
+    }
+    // S4: dry-run path (writes a DRY line to a temp log, NEVER touches dist/).
+    let tmp = _exec_out("mktemp -t dist_native_st.XXXXXX 2>/dev/null").trim()
+    if tmp == "" { fails = fails + 1; println("S4 FAIL: mktemp") }
+    else {
+        let rc = do_run(DEFAULT_SCRIPT, DEFAULT_WORKDIR, tmp, true)
+        if rc != 0 { fails = fails + 1; println("S4 FAIL: dry rc=" + to_string(rc)) }
+        let body = read_file(tmp)
+        if body.index_of("\"verdict\":\"DRY\"") < 0 {
+            fails = fails + 1; println("S4 FAIL: DRY verdict not in log")
+        }
+        let _ = _exec_code("rm -f " + _sh_quote(tmp))
+    }
+    if fails == 0 { println(TOOL_NAME + ": SELFTEST PASS"); return 0 }
+    println(TOOL_NAME + ": SELFTEST FAIL (" + to_string(fails) + ")"); return 1
+}
+
+// ─── main ─────────────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") || _flag(av, "-h") {
+        println("usage: hexa run tool/dist_native_build_periodic.hexa [opts]")
+        println("  --script  <path>  default: " + DEFAULT_SCRIPT)
+        println("  --workdir <path>  default: " + DEFAULT_WORKDIR)
+        println("  --log     <path>  default: " + DEFAULT_LOG)
+        println("  --dry             write DRY line to log, no build")
+        println("  --selftest        run selftest")
+        return 0
+    }
+    if _flag(av, "--selftest") { return run_selftest() }
+    let script = _opt(av, "--script", DEFAULT_SCRIPT)
+    let wd     = _opt(av, "--workdir", DEFAULT_WORKDIR)
+    let log    = _opt(av, "--log", DEFAULT_LOG)
+    let dry    = _flag(av, "--dry")
+    return do_run(script, wd, log, dry)
+}
+
+exit(main())

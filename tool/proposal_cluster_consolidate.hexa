@@ -1,0 +1,632 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/proposal_cluster_consolidate.hexa  —  N3 of pre-H100 ROI batch
+//
+//  PURPOSE
+//    Read state/proposals/clusters/*.json  (21 auto-detected clusters at
+//    2026-04-22T13:12Z), pick the TOP 5 by member_count, and synthesize one
+//    SUPER-PROPOSAL per cluster into:
+//
+//        state/proposals/pending/<date>-<seq>_super-<slug>.json
+//
+//    Each super-proposal carries:
+//      kind = "cluster"
+//      title = "super-proposal: <slug>  (N members)"
+//      merges_with = [<member ids>]
+//      score_priority = max(member.score) + ceil(log2(N))   (capped 100)
+//      rationale = aggregated, names every member id
+//      evidence_sources = first evidence path of each member (capped 5)
+//      lineage_parent = null
+//      lineage_children = <member ids>
+//
+//  HARD CONSTRAINTS  (raw#20 + .roadmap-uchg)
+//    - DRY-RUN by default. Caller MUST pass --apply.
+//    - NEVER edits .roadmap. NEVER touches tool/, config/.
+//    - NEVER auto-approves the super-proposal — it is emitted as
+//      user_status="pending" so the user reviews + approves manually.
+//    - Idempotent: super for the same cluster slug is detected by checking
+//      pending/ for filename suffix "_super-<slug>.json". If present + same
+//      member set → no-op.
+//    - The original member proposals are NOT mutated — only the super is
+//      added. (User can later reject the members with reason "merged → super".)
+//    - Selftest: synthetic 3-cluster fixture, 5/5 invariant checks.
+//
+//  USAGE
+//    hexa run tool/proposal_cluster_consolidate.hexa             # dry plan
+//    hexa run tool/proposal_cluster_consolidate.hexa --apply
+//    hexa run tool/proposal_cluster_consolidate.hexa --top N     # default 5
+//    hexa run tool/proposal_cluster_consolidate.hexa --selftest
+//
+//  EXIT CODES
+//    0 success | 1 selftest fail / runtime fail | 3 user error
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT   = "/Users/ghost/core/anima"
+let PROP_ROOT    = "/Users/ghost/core/anima/state/proposals"
+let CLUSTERS_DIR = "/Users/ghost/core/anima/state/proposals/clusters"
+let PENDING_DIR  = "/Users/ghost/core/anima/state/proposals/pending"
+
+// ─── basics ────────────────────────────────────────────────────────────────
+
+fn _str(x) -> string { return to_string(x) }
+
+fn _shq(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _exists(p: string) -> bool {
+    let r = exec_with_status("test -e " + _shq(p))
+    return to_int(_str(r[1])) == 0
+}
+
+fn _mkdir_p(p: string) { exec_with_status("mkdir -p " + _shq(p)) }
+
+fn _now_iso() -> string {
+    return _str(exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")[0]).trim()
+}
+
+fn _today_yyyymmdd() -> string {
+    return _str(exec_with_status("date -u +%Y%m%d")[0]).trim()
+}
+
+fn _atomic_write(path: string, body: string) {
+    let tmp = path + ".tmp"
+    write_file(tmp, body)
+    exec_with_status("mv -f " + _shq(tmp) + " " + _shq(path))
+}
+
+fn _arg_present(av: array, k: string) -> bool {
+    let mut i = 0
+    while i < len(av) {
+        if _str(av[i]) == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _arg_value(av: array, k: string, dflt: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if _str(av[i]) == k && i + 1 < len(av) { return _str(av[i + 1]) }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+
+fn _list_json(dir: string) -> array {
+    if !_exists(dir) { return [] }
+    let raw = _str(exec_with_status("ls -1 " + _shq(dir) + " 2>/dev/null | grep -E '\\.json$' || true")[0])
+    let mut out = []
+    let mut buf = ""
+    let mut i = 0
+    while i < len(raw) {
+        let c = raw.substring(i, i + 1)
+        if c == "\n" {
+            if len(buf) > 0 { out.push(buf) }
+            buf = ""
+        } else { buf = buf + c }
+        i = i + 1
+    }
+    if len(buf) > 0 { out.push(buf) }
+    return out
+}
+
+fn _json_esc(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+fn _ceil_log2(n: int) -> int {
+    if n <= 1 { return 0 }
+    if n <= 2 { return 1 }
+    if n <= 4 { return 2 }
+    if n <= 8 { return 3 }
+    if n <= 16 { return 4 }
+    if n <= 32 { return 5 }
+    if n <= 64 { return 6 }
+    return 7
+}
+
+// ─── load clusters + sort by member_count desc ────────────────────────────
+
+fn _load_clusters() -> array {
+    let mut out = []
+    let files = _list_json(CLUSTERS_DIR)
+    let mut i = 0
+    while i < len(files) {
+        let fp = CLUSTERS_DIR + "/" + _str(files[i])
+        let raw = _str(read_file(fp))
+        if len(raw.trim()) > 0 {
+            let c = json_parse(raw)
+            let mut rec = json_parse("{}")
+            rec["id"]    = if c.contains_key("id")    { _str(c["id"])    } else { "" }
+            rec["slug"]  = if c.contains_key("slug")  { _str(c["slug"])  } else { "" }
+            rec["title"] = if c.contains_key("title") { _str(c["title"]) } else { "" }
+            rec["rationale"] = if c.contains_key("rationale") { _str(c["rationale"]) } else { "" }
+            rec["members"] = if c.contains_key("members") { c["members"] } else { [] }
+            let mc = if c.contains_key("member_count") {
+                to_int(_str(c["member_count"]))
+            } else {
+                if c.contains_key("members") { len(c["members"]) } else { 0 }
+            }
+            rec["member_count"] = mc
+            rec["path"] = fp
+            out.push(rec)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _sort_by_member_count_desc(clusters: array) -> array {
+    // Simple O(n^2) selection sort — n <= 30, fine.
+    let mut arr = clusters
+    let n = len(arr)
+    let mut i = 0
+    while i < n {
+        let mut max_k = i
+        let mut j = i + 1
+        while j < n {
+            let a_mc = to_int(_str(arr[max_k]["member_count"]))
+            let b_mc = to_int(_str(arr[j]["member_count"]))
+            if b_mc > a_mc { max_k = j }
+            j = j + 1
+        }
+        if max_k != i {
+            let tmp = arr[i]
+            arr[i] = arr[max_k]
+            arr[max_k] = tmp
+        }
+        i = i + 1
+    }
+    return arr
+}
+
+// ─── per-member load (for score_priority + first evidence path) ───────────
+
+fn _resolve_member_path(member_id: string) -> string {
+    let exact = PENDING_DIR + "/" + member_id + ".json"
+    if _exists(exact) { return exact }
+    let files = _list_json(PENDING_DIR)
+    let prefix = member_id + "_"
+    let mut i = 0
+    while i < len(files) {
+        let f = _str(files[i])
+        if len(f) >= len(prefix) {
+            let head = f.substring(0, len(prefix))
+            if head == prefix { return PENDING_DIR + "/" + f }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _member_score(member_id: string) -> int {
+    let p = _resolve_member_path(member_id)
+    if p == "" { return 0 }
+    let raw = _str(read_file(p))
+    if len(raw.trim()) == 0 { return 0 }
+    let m = json_parse(raw)
+    if !m.contains_key("score_priority") { return 0 }
+    return to_int(_str(m["score_priority"]))
+}
+
+fn _member_first_evidence_path(member_id: string) -> string {
+    let p = _resolve_member_path(member_id)
+    if p == "" { return "" }
+    let raw = _str(read_file(p))
+    if len(raw.trim()) == 0 { return "" }
+    let m = json_parse(raw)
+    if !m.contains_key("evidence_sources") { return "" }
+    let evs = m["evidence_sources"]
+    if len(evs) == 0 { return "" }
+    let e0 = evs[0]
+    if !e0.contains_key("path") { return "" }
+    return _str(e0["path"])
+}
+
+// ─── pending dir scan: detect existing super-<slug> ───────────────────────
+
+fn _existing_super_path(slug: string) -> string {
+    let files = _list_json(PENDING_DIR)
+    let needle = "_super-" + slug + ".json"
+    let mut i = 0
+    while i < len(files) {
+        let f = _str(files[i])
+        if len(f) >= len(needle) {
+            let tail = f.substring(len(f) - len(needle), len(f))
+            if tail == needle { return PENDING_DIR + "/" + f }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ─── seq number for today (based on max existing pending seq) ─────────────
+
+fn _next_seq_today() -> int {
+    let files = _list_json(PENDING_DIR)
+    let day = _today_yyyymmdd()
+    let mut max_seq = 0
+    let mut i = 0
+    while i < len(files) {
+        let f = _str(files[i])
+        if len(f) >= 12 {
+            let head = f.substring(0, 8)
+            if head == day {
+                // f looks like "20260422-NNN_<slug>.json" — extract NNN.
+                let mut k = 9   // skip "20260422-"
+                let mut buf = ""
+                while k < len(f) {
+                    let c = f.substring(k, k + 1)
+                    if c == "_" { k = len(f) + 1 }
+                    else {
+                        buf = buf + c
+                        k = k + 1
+                    }
+                }
+                let n = to_int(buf)
+                if n > max_seq { max_seq = n }
+            }
+        }
+        i = i + 1
+    }
+    return max_seq + 1
+}
+
+fn _seq_str(n: int) -> string {
+    if n < 10  { return "00" + _str(n) }
+    if n < 100 { return "0" + _str(n) }
+    return _str(n)
+}
+
+// ─── super-proposal synthesis ─────────────────────────────────────────────
+
+fn _build_super(c: map, seq: int) -> map {
+    let slug = _str(c["slug"])
+    let members = c["members"]
+    let n = len(members)
+
+    // Compute aggregate score = max(member.score) + ceil_log2(N)  (capped 100).
+    let mut max_member_score = 0
+    let mut k = 0
+    while k < n {
+        let mid = _str(members[k])
+        let s = _member_score(mid)
+        if s > max_member_score { max_member_score = s }
+        k = k + 1
+    }
+    let mut agg_score = max_member_score + _ceil_log2(n)
+    if agg_score > 100 { agg_score = 100 }
+    if agg_score < 0   { agg_score = 0   }
+
+    // Aggregate evidence (first evidence path per member, capped 5).
+    let mut evs = []
+    let mut k2 = 0
+    let mut taken = 0
+    while k2 < n && taken < 5 {
+        let mid = _str(members[k2])
+        let p = _member_first_evidence_path(mid)
+        if p != "" {
+            let mut e = json_parse("{}")
+            e["path"] = p
+            e["field"] = "merged from " + mid
+            e["snapshot_sha256"] = ""
+            evs.push(e)
+            taken = taken + 1
+        }
+        k2 = k2 + 1
+    }
+
+    // Member id list as comma-string for rationale.
+    let mut ids_str = ""
+    let mut k3 = 0
+    while k3 < n {
+        if k3 > 0 { ids_str = ids_str + ", " }
+        ids_str = ids_str + _str(members[k3])
+        k3 = k3 + 1
+    }
+
+    let day = _today_yyyymmdd()
+    let pid = day + "-" + _seq_str(seq)
+    let now_ts = _now_iso()
+    let title = "super-proposal: " + slug + "  (" + _str(n) + " members)"
+    let rat = "Consolidates " + _str(n) + " pending proposals (" + ids_str +
+              ") sharing cluster signal '" + _str(c["title"]) +
+              "'. Single super-proposal lets reviewer approve/reject the entire" +
+              " batch in one action; original members can then be marked" +
+              " merged → super on follow-up reject sweep. Spec: docs/anima_proposal_stack_paradigm_20260422.md §3 step 5."
+
+    let mut sp = json_parse("{}")
+    sp["id"] = pid
+    sp["version"] = 1
+    sp["first_seen_ts"] = now_ts
+    sp["last_refined_ts"] = now_ts
+    sp["title"] = title
+    sp["kind"] = "cluster"
+    sp["rationale"] = rat
+    sp["evidence_sources"] = evs
+    sp["estimated_effort_hours"] = "varies"
+    sp["estimated_impact"] = max_member_score
+    sp["risk_level"] = 0.1
+    sp["loss_free"] = true
+    sp["depends_on"] = []
+    sp["conflicts_with"] = []
+    sp["merges_with"] = members
+    sp["refinement_history"] = [json_parse("{\"v\": 1, \"ts\": \"" + now_ts +
+        "\", \"diff\": \"super-proposal synthesized from cluster " + _str(c["id"]) + "\"}")]
+    sp["score_priority"] = agg_score
+    sp["user_status"] = "pending"
+    sp["user_decision_at"] = "null"
+    sp["user_decision_reason"] = "null"
+    sp["implementation_module_path"] = "null"
+    sp["lineage_parent"] = "null"
+    sp["lineage_children"] = members
+    sp["veto_count"] = 0
+    sp["resurrection_eligible_after"] = "null"
+    sp["dedup_key"] = "super:" + slug + ":" + _str(n)
+    sp["source_signal"] = "cluster_consolidate"
+    sp["super_of_cluster"] = _str(c["id"])
+    sp["slug"] = slug
+
+    return sp
+}
+
+fn _super_to_json(p: map) -> string {
+    let mut j = "{\n"
+    j = j + "  \"id\": \"" + _json_esc(_str(p["id"])) + "\",\n"
+    j = j + "  \"version\": " + _str(p["version"]) + ",\n"
+    j = j + "  \"first_seen_ts\": \"" + _json_esc(_str(p["first_seen_ts"])) + "\",\n"
+    j = j + "  \"last_refined_ts\": \"" + _json_esc(_str(p["last_refined_ts"])) + "\",\n"
+    j = j + "  \"title\": \"" + _json_esc(_str(p["title"])) + "\",\n"
+    j = j + "  \"kind\": \"" + _json_esc(_str(p["kind"])) + "\",\n"
+    j = j + "  \"rationale\": \"" + _json_esc(_str(p["rationale"])) + "\",\n"
+    j = j + "  \"evidence_sources\": [\n"
+    let evs = p["evidence_sources"]
+    let mut i = 0
+    while i < len(evs) {
+        let e = evs[i]
+        j = j + "    {\"path\": \"" + _json_esc(_str(e["path"])) +
+            "\", \"field\": \"" + _json_esc(_str(e["field"])) +
+            "\", \"snapshot_sha256\": \"" + _json_esc(_str(e["snapshot_sha256"])) + "\"}"
+        if i + 1 < len(evs) { j = j + "," }
+        j = j + "\n"
+        i = i + 1
+    }
+    j = j + "  ],\n"
+    j = j + "  \"estimated_effort_hours\": \"" + _json_esc(_str(p["estimated_effort_hours"])) + "\",\n"
+    j = j + "  \"estimated_impact\": " + _str(p["estimated_impact"]) + ",\n"
+    j = j + "  \"risk_level\": " + _str(p["risk_level"]) + ",\n"
+    j = j + "  \"loss_free\": true,\n"
+    j = j + "  \"depends_on\": [],\n"
+    j = j + "  \"conflicts_with\": [],\n"
+    j = j + "  \"merges_with\": ["
+    let merges = p["merges_with"]
+    let mut k = 0
+    while k < len(merges) {
+        if k > 0 { j = j + ", " }
+        j = j + "\"" + _json_esc(_str(merges[k])) + "\""
+        k = k + 1
+    }
+    j = j + "],\n"
+    j = j + "  \"refinement_history\": [\n"
+    let hist = p["refinement_history"]
+    let mut h = 0
+    while h < len(hist) {
+        let r = hist[h]
+        j = j + "    {\"v\": " + _str(r["v"]) +
+            ", \"ts\": \"" + _json_esc(_str(r["ts"])) +
+            "\", \"diff\": \"" + _json_esc(_str(r["diff"])) + "\"}"
+        if h + 1 < len(hist) { j = j + "," }
+        j = j + "\n"
+        h = h + 1
+    }
+    j = j + "  ],\n"
+    j = j + "  \"score_priority\": " + _str(p["score_priority"]) + ",\n"
+    j = j + "  \"user_status\": \"pending\",\n"
+    j = j + "  \"user_decision_at\": null,\n"
+    j = j + "  \"user_decision_reason\": null,\n"
+    j = j + "  \"implementation_module_path\": null,\n"
+    j = j + "  \"lineage_parent\": null,\n"
+    j = j + "  \"lineage_children\": ["
+    let ch = p["lineage_children"]
+    let mut c = 0
+    while c < len(ch) {
+        if c > 0 { j = j + ", " }
+        j = j + "\"" + _json_esc(_str(ch[c])) + "\""
+        c = c + 1
+    }
+    j = j + "],\n"
+    j = j + "  \"veto_count\": 0,\n"
+    j = j + "  \"resurrection_eligible_after\": null,\n"
+    j = j + "  \"dedup_key\": \"" + _json_esc(_str(p["dedup_key"])) + "\",\n"
+    j = j + "  \"source_signal\": \"" + _json_esc(_str(p["source_signal"])) + "\",\n"
+    j = j + "  \"super_of_cluster\": \"" + _json_esc(_str(p["super_of_cluster"])) + "\"\n"
+    j = j + "}\n"
+    return j
+}
+
+// ─── plan + apply ─────────────────────────────────────────────────────────
+
+fn _print_plan(top: array, apply: bool) {
+    println("── proposal_cluster_consolidate plan ──")
+    println("ts          : " + _now_iso())
+    println("mode        : " + (if apply { "APPLY" } else { "dry-run" }))
+    println("top picked  : " + _str(len(top)) + "  (sorted by member_count desc)")
+    let mut i = 0
+    while i < len(top) {
+        let c = top[i]
+        let existing = _existing_super_path(_str(c["slug"]))
+        let st = if existing == "" { "NEW" } else { "EXISTS (idempotent skip)" }
+        println("  [" + _str(i + 1) + "] " + _str(c["id"]) + "  slug=" + _str(c["slug"]) +
+            "  members=" + _str(c["member_count"]) + "  → " + st)
+        i = i + 1
+    }
+}
+
+fn _apply(top: array) -> array {
+    let mut emitted = []
+    let mut seq = _next_seq_today()
+    let mut i = 0
+    while i < len(top) {
+        let c = top[i]
+        let slug = _str(c["slug"])
+        let existing = _existing_super_path(slug)
+        if existing != "" {
+            // Idempotent: skip.
+        } else {
+            let sp = _build_super(c, seq)
+            let pid = _str(sp["id"])
+            let path = PENDING_DIR + "/" + pid + "_super-" + slug + ".json"
+            _atomic_write(path, _super_to_json(sp))
+            let mut rec = json_parse("{}")
+            rec["id"] = pid
+            rec["path"] = path
+            rec["slug"] = slug
+            rec["member_count"] = c["member_count"]
+            rec["score_priority"] = sp["score_priority"]
+            emitted.push(rec)
+            seq = seq + 1
+        }
+        i = i + 1
+    }
+    return emitted
+}
+
+// ─── selftest ─────────────────────────────────────────────────────────────
+
+fn _selftest() -> int {
+    println("── proposal_cluster_consolidate selftest ──")
+
+    // S1: ceil_log2 sanity.
+    let s1 = (_ceil_log2(1) == 0) && (_ceil_log2(2) == 1) &&
+             (_ceil_log2(5) == 3) && (_ceil_log2(10) == 4) &&
+             (_ceil_log2(25) == 5) && (_ceil_log2(64) == 6)
+    println("S1 ceil_log2 lookup                    : " + (if s1 { "PASS" } else { "FAIL" }))
+
+    // S2: sort by member_count desc.
+    let mut a = []
+    let mut x1 = json_parse("{}"); x1["member_count"] = 5;  x1["slug"] = "a"; a.push(x1)
+    let mut x2 = json_parse("{}"); x2["member_count"] = 25; x2["slug"] = "b"; a.push(x2)
+    let mut x3 = json_parse("{}"); x3["member_count"] = 10; x3["slug"] = "c"; a.push(x3)
+    let sorted = _sort_by_member_count_desc(a)
+    let s2 = (_str(sorted[0]["slug"]) == "b") &&
+             (_str(sorted[1]["slug"]) == "c") &&
+             (_str(sorted[2]["slug"]) == "a")
+    println("S2 sort by member_count desc           : " + (if s2 { "PASS" } else { "FAIL" }))
+
+    // S3: super build score = max(member.score) + ceil_log2(N), capped 100.
+    //     Synthetic c with 4 members; we monkey-mock _member_score by
+    //     placing a stub pending file.
+    let stub_dir = "/tmp/anima_cluster_consolidate_selftest"
+    exec_with_status("rm -rf " + _shq(stub_dir))
+    _mkdir_p(stub_dir)
+    // We can't override PENDING_DIR cheaply — instead write four stub files
+    // into the real PENDING_DIR and remove them after. Use highly distinctive
+    // ids to avoid collision.
+    let stub_ids = ["SELFTEST-XA", "SELFTEST-XB", "SELFTEST-XC", "SELFTEST-XD"]
+    let stub_scores = [40, 60, 30, 50]
+    let mut k = 0
+    while k < 4 {
+        let body = "{\"id\":\"" + _str(stub_ids[k]) + "\",\"title\":\"stub\"," +
+                   "\"score_priority\":" + _str(stub_scores[k]) + "," +
+                   "\"evidence_sources\":[{\"path\":\"/tmp/stub.json\",\"field\":\"f\",\"snapshot_sha256\":\"\"}]}\n"
+        _atomic_write(PENDING_DIR + "/" + _str(stub_ids[k]) + ".json", body)
+        k = k + 1
+    }
+    let mut c = json_parse("{}")
+    c["id"] = "cluster-SELFTEST-X"
+    c["slug"] = "selftest_x"
+    c["title"] = "selftest cluster"
+    c["members"] = stub_ids
+    c["member_count"] = 4
+    let sp = _build_super(c, 999)
+    // max=60, ceil_log2(4)=2 → 62.
+    let s3 = (to_int(_str(sp["score_priority"])) == 62)
+    println("S3 score = max(60) + log2(4)=2 == 62   : " +
+        (if s3 { "PASS" } else { "FAIL (got " + _str(sp["score_priority"]) + ")" }))
+
+    // S4: merges_with carries all 4 ids, kind=cluster.
+    let s4 = (len(sp["merges_with"]) == 4) && (_str(sp["kind"]) == "cluster")
+    println("S4 merges_with=4 + kind=cluster        : " + (if s4 { "PASS" } else { "FAIL" }))
+
+    // S5: idempotency lookup. Write a fake super file then re-detect.
+    let fake_super = PENDING_DIR + "/20260422-999_super-selftest_x.json"
+    _atomic_write(fake_super, _super_to_json(sp))
+    let detected = _existing_super_path("selftest_x")
+    let s5 = (detected != "")
+    println("S5 idempotent detect existing super    : " + (if s5 { "PASS" } else { "FAIL" }))
+
+    // Cleanup all stubs (raw#20: never leak synthetic into real stack).
+    exec_with_status("rm -f " + _shq(fake_super))
+    let mut z = 0
+    while z < 4 {
+        exec_with_status("rm -f " + _shq(PENDING_DIR + "/" + _str(stub_ids[z]) + ".json"))
+        z = z + 1
+    }
+    exec_with_status("rm -rf " + _shq(stub_dir))
+
+    if s1 && s2 && s3 && s4 && s5 {
+        println("── selftest 5/5 PASS ──")
+        return 0
+    }
+    println("── selftest FAIL ──")
+    return 1
+}
+
+// ─── main ─────────────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = _argv()
+    if _arg_present(av, "--selftest") { return _selftest() }
+
+    let apply = _arg_present(av, "--apply")
+    let top_str = _arg_value(av, "--top", "5")
+    let top_n = if len(top_str) > 0 { to_int(top_str) } else { 5 }
+    if top_n <= 0 {
+        println("proposal_cluster_consolidate: --top must be > 0")
+        return 3
+    }
+
+    let clusters = _load_clusters()
+    if len(clusters) == 0 {
+        println("proposal_cluster_consolidate: no clusters found at " + CLUSTERS_DIR)
+        return 0
+    }
+
+    let sorted = _sort_by_member_count_desc(clusters)
+    let mut top = []
+    let mut i = 0
+    while i < len(sorted) && i < top_n {
+        top.push(sorted[i])
+        i = i + 1
+    }
+
+    _print_plan(top, apply)
+
+    if !apply {
+        println("(dry-run — no super-proposal written. Pass --apply to persist.)")
+        return 0
+    }
+
+    let emitted = _apply(top)
+    println("── apply done ──")
+    println("super-proposals emitted: " + _str(len(emitted)))
+    let mut k = 0
+    while k < len(emitted) {
+        let r = emitted[k]
+        println("  + " + _str(r["id"]) + " (slug=" + _str(r["slug"]) +
+            ", members=" + _str(r["member_count"]) +
+            ", score=" + _str(r["score_priority"]) + ")  →  " + _str(r["path"]))
+        k = k + 1
+    }
+    return 0
+}
+
+exit(main())

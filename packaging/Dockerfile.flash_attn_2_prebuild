@@ -1,0 +1,86 @@
+# packaging/Dockerfile.flash_attn_2_prebuild
+# pre-H100 ROI S4 — flash-attn-2 build cache image.
+#
+# Goal: ship a tagged image that contains a *pre-built* flash-attn 2.x wheel
+# matched to the H100 (sm_90) + CUDA 12.4 + torch 2.5.1 toolchain used by
+# training/Dockerfile.h100. The wheel is built once (~30-45 min on a single
+# build node), cached as a Docker layer, and then COPY-able into runtime
+# images so H100 pods boot in seconds instead of recompiling every time.
+#
+# Build:
+#   docker build \
+#     --platform linux/amd64 \
+#     -f packaging/Dockerfile.flash_attn_2_prebuild \
+#     -t anima/flash-attn-2-prebuild:cu124-torch251-sm90 \
+#     packaging/
+#
+# Consume in another Dockerfile:
+#   COPY --from=anima/flash-attn-2-prebuild:cu124-torch251-sm90 \
+#        /wheels/flash_attn-*.whl /tmp/
+#   RUN pip install --no-cache-dir /tmp/flash_attn-*.whl
+#
+# Hard constraints (pre-H100 ROI):
+#   - DO NOT spawn pod from this file
+#   - DO NOT push image to public registry without sha256 pin
+#   - DO NOT include any HF token / R2 credentials
+#   - selftest: `pip show flash-attn` must report 2.7.x and import must succeed
+
+# --- Stage 1: builder (CUDA + torch + ninja, sm_90 only) ---
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel AS builder
+
+ARG FLASH_ATTN_VERSION=2.7.2.post1
+ARG TORCH_CUDA_ARCH_LIST="9.0"
+ARG MAX_JOBS=8
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
+    FLASH_ATTENTION_FORCE_BUILD=TRUE \
+    MAX_JOBS=${MAX_JOBS}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git build-essential ninja-build ca-certificates pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --upgrade pip wheel setuptools \
+    && pip install packaging psutil ninja
+
+# Build flash-attn from sdist with sm_90 target only — keeps wheel small
+# and avoids hour-long multi-arch compiles.
+RUN mkdir -p /wheels \
+    && pip wheel --no-build-isolation --wheel-dir=/wheels \
+        flash-attn==${FLASH_ATTN_VERSION} \
+    && ls -lh /wheels/
+
+# --- Stage 2: thin cache layer (just the wheel) ---
+FROM scratch AS cache
+COPY --from=builder /wheels/ /wheels/
+
+# --- Stage 3: smoke runtime (selftest target — never used in prod) ---
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime AS smoke
+
+ARG FLASH_ATTN_VERSION=2.7.2.post1
+
+LABEL org.opencontainers.image.title="anima/flash-attn-2-prebuild" \
+      org.opencontainers.image.description="Pre-built flash-attn 2.x wheel cache (CUDA 12.4 / torch 2.5.1 / sm_90)" \
+      org.opencontainers.image.source="https://github.com/need-singularity/anima" \
+      anima.roi_item="S4" \
+      anima.track="pre-H100 ROI" \
+      anima.flash_attn_version="${FLASH_ATTN_VERSION}" \
+      anima.cuda="12.4" \
+      anima.torch="2.5.1" \
+      anima.sm_arch="9.0"
+
+COPY --from=builder /wheels /wheels
+
+RUN pip install --no-cache-dir /wheels/flash_attn-*.whl \
+    && python -c "import flash_attn; print('flash_attn', flash_attn.__version__)" \
+    && pip show flash-attn | grep -E '^(Name|Version):'
+
+# Selftest entrypoint — verifies the wheel is loadable. CPU-only smoke
+# (skips kernel launch since no GPU is attached at build time).
+RUN printf '#!/bin/bash\nset -e\necho "=== flash-attn-2 prebuild selftest ==="\npython -c "import flash_attn; print(\"version=\" + flash_attn.__version__); assert flash_attn.__version__.startswith(\"2.\"), \"wrong major\"; print(\"PASS\")"\n' > /usr/local/bin/selftest.sh \
+    && chmod +x /usr/local/bin/selftest.sh
+
+ENTRYPOINT ["/usr/local/bin/selftest.sh"]
