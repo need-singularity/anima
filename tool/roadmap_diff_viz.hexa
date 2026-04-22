@@ -1,0 +1,434 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/roadmap_diff_viz.hexa — per-commit roadmap status-change visualizer
+//
+//  PURPOSE
+//    For each commit that touched .roadmap (most-recent N), parse the file
+//    contents at HEAD~k and HEAD~k+1, diff the `roadmap <id> <status> "<name>"`
+//    status field, and emit a markdown table with columns:
+//      | commit | date | added | changed_status | removed |
+//    Output: docs/roadmap_diff_viz.md (AUTO-GENERATED header + timestamp).
+//
+//  USAGE
+//    hexa run tool/roadmap_diff_viz.hexa
+//    hexa run tool/roadmap_diff_viz.hexa --limit 30 --out <file>
+//    hexa run tool/roadmap_diff_viz.hexa --selftest
+//
+//  IDEMPOTENCY
+//    For a fixed git history + N, output is byte-stable except the
+//    "<!-- generated: ... -->" line. The selftest strips that line before
+//    comparing two consecutive runs.
+//
+//  RULES
+//    raw#9 hexa-only · raw#11 snake_case · DO NOT mutate .roadmap (uchg).
+// ════════════════════════════════════════════════════════════════════════════
+
+let DEFAULT_REPO     = "/Users/ghost/core/anima"
+let DEFAULT_ROADMAP  = ".roadmap"
+let DEFAULT_OUT_PATH = "/Users/ghost/core/anima/docs/roadmap_diff_viz.md"
+let DEFAULT_LIMIT    = 25
+
+let HDR = "<!-- AUTO-GENERATED, DO NOT EDIT — source: tool/roadmap_diff_viz.hexa -->"
+
+// ─── shell helpers ───────────────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _exec_out(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _exec_code(cmd: string) -> int {
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+fn _file_exists(path: string) -> bool {
+    return _exec_code("test -e " + _sh_quote(path)) == 0
+}
+
+fn _dir_exists(path: string) -> bool {
+    return _exec_code("test -d " + _sh_quote(path)) == 0
+}
+
+fn _mkdir_p(dir: string) -> bool {
+    return _exec_code("mkdir -p " + _sh_quote(dir)) == 0
+}
+
+fn _rm_rf(p: string) -> bool {
+    return _exec_code("rm -rf " + _sh_quote(p)) == 0
+}
+
+fn _utc_now() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _parent_of(path: string) -> string {
+    let parts = path.split("/")
+    if len(parts) <= 1 { return "." }
+    let mut out = ""
+    let mut i = 0
+    let cap = len(parts) - 1
+    while i < cap {
+        if i > 0 { out = out + "/" }
+        out = out + to_string(parts[i])
+        i = i + 1
+    }
+    if out == "" { return "/" }
+    return out
+}
+
+// ─── git helpers ─────────────────────────────────────────────────────────
+
+fn git_log_commits(repo: string, path: string, limit: int) -> array {
+    // Returns array of "sha|date" strings most-recent first.
+    let cmd = "git -C " + _sh_quote(repo) + " log --pretty=format:'%h|%ad' --date=short -n " + to_string(limit) + " -- " + _sh_quote(path)
+    let out = _exec_out(cmd)
+    let lines = out.split("\n")
+    let mut acc = []
+    for l in lines {
+        let t = to_string(l).trim()
+        if t.len() > 0 { acc.push(t) }
+    }
+    return acc
+}
+
+fn git_show_at(repo: string, sha: string, path: string) -> string {
+    // Returns file contents at given sha; "" on failure.
+    let cmd = "git -C " + _sh_quote(repo) + " show " + _sh_quote(sha + ":" + path) + " 2>/dev/null"
+    return _exec_out(cmd)
+}
+
+fn git_parent_sha(repo: string, sha: string) -> string {
+    let cmd = "git -C " + _sh_quote(repo) + " rev-parse --short " + _sh_quote(sha + "^") + " 2>/dev/null"
+    return _exec_out(cmd).trim()
+}
+
+fn git_subject(repo: string, sha: string) -> string {
+    let cmd = "git -C " + _sh_quote(repo) + " log -1 --pretty=format:%s " + _sh_quote(sha)
+    return _exec_out(cmd).trim()
+}
+
+// ─── roadmap parser ──────────────────────────────────────────────────────
+//
+// Parse lines of form:
+//   roadmap <id> <status> "<name>"
+// Returns map<string, string> id → status. (Name dropped — diff is on status.)
+//
+
+fn parse_roadmap(body: string) -> any {
+    let mut m = #{}
+    let lines = body.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    while i < n {
+        let raw = to_string(lines[i])
+        let t = raw.trim()
+        if t.len() > 8 {
+            if t.substring(0, 8) == "roadmap " {
+                // tokenize: roadmap <id> <status> ...
+                let rest = t.substring(8, t.len()).trim()
+                // first token = id
+                let sp1 = rest.find(" ")
+                if sp1 > 0 {
+                    let id = rest.substring(0, sp1).trim()
+                    let after = rest.substring(sp1 + 1, rest.len()).trim()
+                    let sp2 = after.find(" ")
+                    let status = if sp2 > 0 { after.substring(0, sp2).trim() } else { after.trim() }
+                    if id.len() > 0 && status.len() > 0 {
+                        m[id] = status
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return m
+}
+
+fn _map_keys(m: any) -> array {
+    let mut ks = []
+    for k in keys(m) { ks.push(to_string(k)) }
+    return ks
+}
+
+fn _id_to_int(s: string) -> int {
+    // Best-effort numeric sort key; non-numeric returns 0.
+    let n = s.len()
+    let mut i = 0
+    let mut v = 0
+    let mut any_d = false
+    while i < n {
+        let c = s.substring(i, i + 1)
+        let cc = char_code(c, 0)
+        if cc >= 48 && cc <= 57 {
+            v = v * 10 + (cc - 48)
+            any_d = true
+        } else {
+            break
+        }
+        i = i + 1
+    }
+    if any_d { return v }
+    return 0
+}
+
+fn _sort_ids(ids: array) -> array {
+    // O(n^2) selection sort by numeric id then lexical id.
+    let mut a = ids
+    let n = len(a)
+    let mut i = 0
+    while i < n {
+        let mut min = i
+        let mut j = i + 1
+        while j < n {
+            let av = to_string(a[min]); let bv = to_string(a[j])
+            let ai = _id_to_int(av); let bi = _id_to_int(bv)
+            let smaller = if ai != bi { bi < ai } else { bv < av }
+            if smaller { min = j }
+            j = j + 1
+        }
+        if min != i {
+            let tmp = a[i]; a[i] = a[min]; a[min] = tmp
+        }
+        i = i + 1
+    }
+    return a
+}
+
+// Diff two parsed roadmap maps.
+//   added   = ids in cur not in prev
+//   changed = ids in both with different status (id:prev→cur)
+//   removed = ids in prev not in cur
+struct Diff {
+    added: array,
+    changed: array,
+    removed: array
+}
+
+fn diff_roadmaps(prev: any, cur: any) -> Diff {
+    let mut added = []
+    let mut changed = []
+    let mut removed = []
+    let cur_keys = _sort_ids(_map_keys(cur))
+    let mut i = 0
+    while i < len(cur_keys) {
+        let id = to_string(cur_keys[i])
+        let cv = to_string(cur[id])
+        let has_prev = has_key(prev, id)
+        if !has_prev {
+            added.push(id + ":" + cv)
+        } else {
+            let pv = to_string(prev[id])
+            if pv != cv {
+                changed.push(id + ":" + pv + "→" + cv)
+            }
+        }
+        i = i + 1
+    }
+    let prev_keys = _sort_ids(_map_keys(prev))
+    let mut j = 0
+    while j < len(prev_keys) {
+        let id = to_string(prev_keys[j])
+        if !has_key(cur, id) { removed.push(id + ":" + to_string(prev[id])) }
+        j = j + 1
+    }
+    return Diff { added: added, changed: changed, removed: removed }
+}
+
+fn has_key(m: any, k: string) -> bool {
+    for kk in keys(m) {
+        if to_string(kk) == k { return true }
+    }
+    return false
+}
+
+// ─── render ──────────────────────────────────────────────────────────────
+
+fn _join(a: array, sep: string) -> string {
+    let mut s = ""
+    let mut i = 0
+    while i < len(a) {
+        if i > 0 { s = s + sep }
+        s = s + to_string(a[i])
+        i = i + 1
+    }
+    return s
+}
+
+fn _md_cell_list(a: array) -> string {
+    if len(a) == 0 { return "—" }
+    let s = _join(a, "; ")
+    return s.replace("|", "\\|")
+}
+
+fn render(repo: string, roadmap_path: string, limit: int, ts: string) -> string {
+    let commits = git_log_commits(repo, roadmap_path, limit)
+    let n = len(commits)
+    let mut s = ""
+    s = s + HDR + "\n"
+    s = s + "<!-- generated: " + ts + " -->\n"
+    s = s + "<!-- repo: " + repo + " -->\n"
+    s = s + "<!-- roadmap: " + roadmap_path + " -->\n"
+    s = s + "<!-- limit: " + to_string(limit) + " -->\n"
+    s = s + "<!-- commit_count: " + to_string(n) + " -->\n\n"
+    s = s + "# .roadmap status diff (last " + to_string(n) + " commits)\n\n"
+    s = s + "_AUTO-GENERATED, DO NOT EDIT — generated " + ts + " UTC._\n\n"
+    s = s + "| commit | date | added | changed_status | removed |\n"
+    s = s + "| ------ | ---- | ----- | -------------- | ------- |\n"
+    let mut i = 0
+    while i < n {
+        let line = to_string(commits[i])
+        let bar = line.find("|")
+        if bar <= 0 { i = i + 1; continue }
+        let sha = line.substring(0, bar).trim()
+        let date = line.substring(bar + 1, line.len()).trim()
+        let parent = git_parent_sha(repo, sha)
+        let cur_body = git_show_at(repo, sha, roadmap_path)
+        let prev_body = if parent.len() > 0 { git_show_at(repo, parent, roadmap_path) } else { "" }
+        let cur_map = parse_roadmap(cur_body)
+        let prev_map = parse_roadmap(prev_body)
+        let d = diff_roadmaps(prev_map, cur_map)
+        s = s + "| `" + sha + "` | " + date + " | "
+            + _md_cell_list(d.added) + " | "
+            + _md_cell_list(d.changed) + " | "
+            + _md_cell_list(d.removed) + " |\n"
+        i = i + 1
+    }
+    return s
+}
+
+fn _atomic_write(path: string, body: string) {
+    let tmp = path + ".tmp"
+    write_file(tmp, body)
+    let _ = _exec_code("mv -f " + _sh_quote(tmp) + " " + _sh_quote(path))
+}
+
+fn generate(repo: string, roadmap_path: string, limit: int, out_path: string) -> int {
+    if !_dir_exists(repo) {
+        eprintln("roadmap_diff_viz: SETUP_ERROR — repo missing: " + repo)
+        return 2
+    }
+    let _ = _mkdir_p(_parent_of(out_path))
+    let ts = _utc_now()
+    let body = render(repo, roadmap_path, limit, ts)
+    _atomic_write(out_path, body)
+    let n = len(git_log_commits(repo, roadmap_path, limit))
+    println("roadmap_diff_viz: wrote " + out_path)
+    println("  repo     = " + repo)
+    println("  path     = " + roadmap_path)
+    println("  commits  = " + to_string(n))
+    return 0
+}
+
+// ─── argv / main ─────────────────────────────────────────────────────────
+
+fn _argv() -> array {
+    let a = args()
+    let mut out = []
+    let mut i = 2
+    while i < len(a) {
+        out.push(a[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn _flag(av: array, k: string) -> bool {
+    for x in av {
+        if to_string(x) == k { return true }
+    }
+    return false
+}
+
+fn _opt(av: array, k: string, d: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && i + 1 < len(av) {
+            return to_string(av[i + 1])
+        }
+        i = i + 1
+    }
+    return d
+}
+
+// ─── selftest ────────────────────────────────────────────────────────────
+
+fn run_selftest() -> int {
+    println("roadmap_diff_viz: SELFTEST starting")
+    let mut fails = 0
+
+    // Direct unit test on parse_roadmap + diff_roadmaps (no git).
+    let body_a =
+        "roadmap 1 planned \"alpha\"\n" +
+        "roadmap 2 active \"bravo\"\n" +
+        "roadmap 3 done \"charlie\"\n"
+    let body_b =
+        "roadmap 1 active \"alpha\"\n" +
+        "roadmap 2 active \"bravo\"\n" +
+        "roadmap 4 planned \"delta\"\n"
+    let pa = parse_roadmap(body_a)
+    let pb = parse_roadmap(body_b)
+    let d  = diff_roadmaps(pa, pb)
+    let s_added   = _join(d.added, ",")
+    let s_changed = _join(d.changed, ",")
+    let s_removed = _join(d.removed, ",")
+    if s_added != "4:planned" {
+        fails = fails + 1
+        println("S1 FAIL: added=" + s_added)
+    }
+    if s_changed != "1:planned→active" {
+        fails = fails + 1
+        println("S1 FAIL: changed=" + s_changed)
+    }
+    if s_removed != "3:done" {
+        fails = fails + 1
+        println("S1 FAIL: removed=" + s_removed)
+    }
+    if fails == 0 { println("S1 PASS: parse + diff unit (3-id fixture)") }
+
+    // Idempotency: render twice with limit=3 against actual repo, hash sans ts.
+    let tmp_a = "/tmp/roadmap_diff_viz_st_a.md"
+    let tmp_b = "/tmp/roadmap_diff_viz_st_b.md"
+    let _ = generate(DEFAULT_REPO, DEFAULT_ROADMAP, 3, tmp_a)
+    let _ = generate(DEFAULT_REPO, DEFAULT_ROADMAP, 3, tmp_b)
+    let h_a = _exec_out("grep -v '<!-- generated:' " + _sh_quote(tmp_a) + " | shasum -a 256 | awk '{print $1}'").trim()
+    let h_b = _exec_out("grep -v '<!-- generated:' " + _sh_quote(tmp_b) + " | shasum -a 256 | awk '{print $1}'").trim()
+    if h_a != "" && h_a == h_b {
+        println("S2 PASS: idempotent (sha256_no_ts=" + h_a.substring(0, 12) + "...)")
+    } else {
+        fails = fails + 1
+        println("S2 FAIL: hash drift a=" + h_a + " b=" + h_b)
+    }
+    let _ = _exec_code("rm -f " + _sh_quote(tmp_a) + " " + _sh_quote(tmp_b))
+
+    if fails == 0 {
+        println("roadmap_diff_viz: SELFTEST PASS")
+        return 0
+    }
+    println("roadmap_diff_viz: SELFTEST FAIL (" + to_string(fails) + ")")
+    return 1
+}
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") || _flag(av, "-h") {
+        println("usage: hexa run tool/roadmap_diff_viz.hexa [opts]")
+        println("  --repo <dir>       default: " + DEFAULT_REPO)
+        println("  --roadmap <path>   default: " + DEFAULT_ROADMAP)
+        println("  --limit <n>        default: " + to_string(DEFAULT_LIMIT))
+        println("  --out <file>       default: " + DEFAULT_OUT_PATH)
+        println("  --selftest         run selftest")
+        return 0
+    }
+    if _flag(av, "--selftest") { return run_selftest() }
+    let repo = _opt(av, "--repo", DEFAULT_REPO)
+    let rm   = _opt(av, "--roadmap", DEFAULT_ROADMAP)
+    let lim  = to_int(_opt(av, "--limit", to_string(DEFAULT_LIMIT)))
+    let op   = _opt(av, "--out", DEFAULT_OUT_PATH)
+    return generate(repo, rm, lim, op)
+}
+
+exit(main())

@@ -1,0 +1,296 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/phi_offset_auto_detect.hexa — Φ measurement hook offset auto-detect
+//
+//  PURPOSE (ROI item C17)
+//    config/phi_4path_substrates.json hardcodes hidden_dim per substrate
+//    (4096 / 4096 / 5120 / 5376). If a model's HF config.json updates
+//    (revision bump, repo rename, dim change), the Φ measurement hook
+//    silently misaligns. This tool detects the live hidden_size per path
+//    via a pre-populated cache and emits a per-path match report
+//    (detected vs hardcoded).
+//
+//  RUNTIME ARCHITECTURE
+//    The active hexa stage0 runtime in this environment intentionally
+//    blocks `exec`/`exec_with_status` and exposes a minimal string method
+//    surface (only contains/starts_with/replace/split/trim — no substring,
+//    no index_of). Direct in-tool curl invocation and JSON surgery are
+//    therefore impossible. The tool cooperates with a sister fetch helper:
+//
+//        tool/phi_offset_fetch_cache.bash
+//
+//    The bash helper (CPU-only — fetches `config.json` per path, ~ 5 KB
+//    each, NO model weights) populates the cache directory:
+//
+//        state/cache/phi_offset_hf_config/<safe_tag>.hidden_size  (int)
+//        state/cache/phi_offset_hf_config/<safe_tag>.http_code    (str)
+//        state/cache/phi_offset_hf_config/.populated              (sentinel)
+//        state/cache/phi_offset_hf_config/.hf_token_present       (sentinel)
+//
+//    This hexa tool reads the cache, compares each path's detected
+//    hidden_size against the hardcoded value, and writes the report.
+//
+//    If the cache directory is empty or missing (offline / first run /
+//    no HF_TOKEN for gated repos), every path degrades to:
+//
+//        source       = "hardcoded_fallback"
+//        detected     = null
+//        match        = null
+//        error_class  = "no_cache" | "auth_required" | "http_<code>" | "parse"
+//
+//    The tool ALWAYS exits 0 — degradation is reported, not aborted.
+//
+//  WHAT IT DOES NOT DO
+//    - NEVER downloads model weights (only the small config.json file).
+//    - NEVER triggers training, H100 launch, or roadmap mutation.
+//    - NEVER mutates config/phi_4path_substrates.json (read-only consumer).
+//
+//  V8 SAFE_COMMIT · additive only · LLM=none
+//
+//  USAGE
+//    # 1. (optional) populate the cache:
+//    HF_TOKEN=hf_xxx bash tool/phi_offset_fetch_cache.bash
+//    # 2. run the auto-detect:
+//    hexa tool/phi_offset_auto_detect.hexa
+//
+//  OUTPUT
+//    state/phi_offset_auto_detected.json
+// ════════════════════════════════════════════════════════════════════════════
+
+let CONFIG_PATH    = "config/phi_4path_substrates.json"
+let OUT_PATH       = "state/phi_offset_auto_detected.json"
+let CACHE_DIR      = "state/cache/phi_offset_hf_config"
+
+// ──────────────────────────────────────────────────────────────────────────
+//  hardcoded hidden_size table (canonical per task spec C17 + arch_details)
+//    p1 qwen3_8b              = 4096   (Qwen3-8B dense)
+//    p2 llama_3_1_8b          = 4096   (Llama-3.1-8B dense)
+//    p3 ministral_3_14b       = 5120   (Ministral-3-14B-Base-2512 LM core)
+//    p4 gemma_4_31b           = 5376   (Gemma-4-31B arch_details.hidden)
+// ──────────────────────────────────────────────────────────────────────────
+
+fn hardcoded_for_tag(tag: string) -> int {
+    if tag == "qwen3_8b"        { return 4096 }
+    if tag == "llama_3_1_8b"    { return 4096 }
+    if tag == "ministral_3_14b" { return 5120 }
+    if tag == "gemma_4_31b"     { return 5376 }
+    return 0
+}
+
+fn model_for_tag(tag: string) -> string {
+    if tag == "qwen3_8b"        { return "Qwen/Qwen3-8B" }
+    if tag == "llama_3_1_8b"    { return "meta-llama/Llama-3.1-8B" }
+    if tag == "ministral_3_14b" { return "mistralai/Ministral-3-14B-Base-2512" }
+    if tag == "gemma_4_31b"     { return "google/gemma-4-31B" }
+    return ""
+}
+
+// canonical 4-path tag list (mirrors config/phi_4path_substrates.json)
+fn all_tags() -> array {
+    let mut o = []
+    o = o.push("qwen3_8b")
+    o = o.push("llama_3_1_8b")
+    o = o.push("ministral_3_14b")
+    o = o.push("gemma_4_31b")
+    return o
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  helpers (no exec — file IO + minimal string ops only)
+// ──────────────────────────────────────────────────────────────────────────
+
+fn _str(x) -> string { return to_string(x) }
+
+fn json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+}
+
+// stage0 read_file returns kind "error" if the file is missing.
+// Coerce defensively — return "" so all downstream string ops are safe.
+fn read_or_empty(path: string) -> string {
+    let r = read_file(path)
+    let t = type_of(r)
+    if t == "string" {
+        return _str(r)
+    }
+    return ""
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  per-path probe driver (cache-only — no exec available)
+//
+//  Returns 8-element parallel array (stage0 has no object literals):
+//    [0] tag                     string
+//    [1] model_id                string
+//    [2] hidden_size_detected    string ("null" or digits)
+//    [3] hidden_size_hardcoded   int
+//    [4] match                   string ("null" / "true" / "false")
+//    [5] source                  string
+//    [6] http_code               string
+//    [7] error_class             string
+// ──────────────────────────────────────────────────────────────────────────
+
+fn probe_path(tag: string) -> array {
+    let model_id  = model_for_tag(tag)
+    let hardcoded = hardcoded_for_tag(tag)
+
+    let mut detected = -1
+    let mut source = "hardcoded_fallback"
+    let mut error_class = "no_cache"
+    let mut http_code = "000"
+
+    let cache_hidden_path = CACHE_DIR + "/" + tag + ".hidden_size"
+    let cache_code_path   = CACHE_DIR + "/" + tag + ".http_code"
+
+    let hidden_raw = read_or_empty(cache_hidden_path).trim()
+    let code_raw   = read_or_empty(cache_code_path).trim()
+
+    if code_raw != "" {
+        http_code = code_raw
+    }
+
+    if hidden_raw != "" {
+        let h = to_int(hidden_raw)
+        if h > 0 {
+            detected = h
+            source = "huggingface_cache"
+            error_class = ""
+            if http_code == "000" || http_code == "" {
+                http_code = "200"
+            }
+        } else {
+            error_class = "parse"
+        }
+    } else {
+        if http_code == "401" || http_code == "403" {
+            error_class = "auth_required"
+        } else {
+            if http_code != "" && http_code != "000" && http_code != "200" {
+                error_class = "http_" + http_code
+            }
+        }
+    }
+
+    let mut match_str = "null"
+    if detected > 0 {
+        if detected == hardcoded {
+            match_str = "true"
+        } else {
+            match_str = "false"
+        }
+    }
+
+    let mut detected_str = "null"
+    if detected > 0 {
+        detected_str = to_string(detected)
+    }
+
+    return [tag, model_id, detected_str, hardcoded, match_str, source, http_code, error_class]
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  main
+// ──────────────────────────────────────────────────────────────────────────
+
+fn main() {
+    println("[phi_offset_auto_detect] ROI C17 — HF config.json hidden_size probe")
+    println("  config: " + CONFIG_PATH)
+    println("  cache:  " + CACHE_DIR)
+    println("  output: " + OUT_PATH)
+
+    // online status is inferred from cache presence; the active runtime
+    // blocks exec, so the bash helper is the only path to populate cache.
+    let probe_marker = read_or_empty(CACHE_DIR + "/.populated").trim()
+    let online = probe_marker != ""
+    let token_marker = read_or_empty(CACHE_DIR + "/.hf_token_present").trim()
+    let token = token_marker != ""
+
+    if !online {
+        println("  WARN: cache marker missing (" + CACHE_DIR + "/.populated)")
+        println("        run: bash tool/phi_offset_fetch_cache.bash")
+        println("        all paths will report hardcoded_fallback (no_cache).")
+    }
+
+    let tags = all_tags()
+    println("  paths: " + to_string(len(tags)))
+
+    let mut results = []
+    let mut all_match = true
+    let mut any_detected = false
+    let mut i = 0
+    while i < len(tags) {
+        let tag = _str(tags[i])
+        println("  probe #" + to_string(i + 1) + ": " + tag + " (" + model_for_tag(tag) + ")")
+        let r = probe_path(tag)
+        results = results.push(r)
+        let det = _str(r[2])
+        let m   = _str(r[4])
+        if det != "null" {
+            any_detected = true
+        }
+        if m == "false" {
+            all_match = false
+        }
+        println("    detected=" + det + " hardcoded=" + to_string(r[3]) + " match=" + m + " source=" + _str(r[5]) + " http=" + _str(r[6]) + " err=" + _str(r[7]))
+        i = i + 1
+    }
+
+    let mut verdict = "DEGRADED"
+    if any_detected && all_match {
+        verdict = "ALL_MATCH"
+    }
+    if !any_detected {
+        verdict = "OFFLINE_FALLBACK"
+    }
+    if any_detected && !all_match {
+        verdict = "MISMATCH_DETECTED"
+    }
+
+    let mut online_str = "false"
+    if online { online_str = "true" }
+    let mut token_str = "false"
+    if token { token_str = "true" }
+
+    let mut out = "{\n"
+    out = out + "  \"schema\": \"anima.phi_offset_auto_detected.v1\",\n"
+    out = out + "  \"roi_item\": \"C17\",\n"
+    out = out + "  \"generated\": \"2026-04-22T00:00:00Z\",\n"
+    out = out + "  \"config_source\": \"" + json_escape(CONFIG_PATH) + "\",\n"
+    out = out + "  \"cache_dir\": \"" + json_escape(CACHE_DIR) + "\",\n"
+    out = out + "  \"online\": " + online_str + ",\n"
+    out = out + "  \"hf_token_present\": " + token_str + ",\n"
+    out = out + "  \"verdict\": \"" + verdict + "\",\n"
+    out = out + "  \"paths\": [\n"
+    let mut k = 0
+    while k < len(results) {
+        let r = results[k]
+        out = out + "    {\n"
+        out = out + "      \"tag\": \""                 + json_escape(_str(r[0])) + "\",\n"
+        out = out + "      \"model_id\": \""            + json_escape(_str(r[1])) + "\",\n"
+        out = out + "      \"hidden_size_detected\": "  + _str(r[2])              + ",\n"
+        out = out + "      \"hidden_size_hardcoded\": " + to_string(r[3])         + ",\n"
+        out = out + "      \"match\": "                 + _str(r[4])              + ",\n"
+        out = out + "      \"source\": \""              + json_escape(_str(r[5])) + "\",\n"
+        out = out + "      \"http_code\": \""           + json_escape(_str(r[6])) + "\",\n"
+        out = out + "      \"error_class\": \""         + json_escape(_str(r[7])) + "\"\n"
+        if k < len(results) - 1 {
+            out = out + "    },\n"
+        } else {
+            out = out + "    }\n"
+        }
+        k = k + 1
+    }
+    out = out + "  ],\n"
+    out = out + "  \"degradation_policy\": \"exit 0 on offline / no_cache / 401 / parse failure — hardcoded values remain authoritative until next online run.\",\n"
+    out = out + "  \"sister_helper\": \"tool/phi_offset_fetch_cache.bash\",\n"
+    out = out + "  \"safe_commit\": \"V8\",\n"
+    out = out + "  \"deterministic\": false,\n"
+    out = out + "  \"deterministic_note\": \"output deterministic given cache contents; cache itself depends on network round-trip.\",\n"
+    out = out + "  \"llm\": \"none\"\n"
+    out = out + "}\n"
+
+    write_file(OUT_PATH, out)
+    println("  emitted: " + OUT_PATH)
+    println("  verdict: " + verdict)
+}
+
+main()

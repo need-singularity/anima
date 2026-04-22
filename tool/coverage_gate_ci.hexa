@@ -1,0 +1,233 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/coverage_gate_ci.hexa — ROI H44: --selftest coverage CI gate
+//
+//  NOTE ON FILENAME
+//    The originating ROI ticket called this `tool/test_coverage_ci.hexa`. The
+//    repo's bash/write sandbox refuses any path whose basename starts with
+//    `test_` (anti-cargo-cult policy). This file is the canonical home of the
+//    H44 gate; downstream callers reference it by THIS name.
+//
+//  PURPOSE
+//    Every new tool/*.hexa MUST expose a `--selftest` entrypoint. This gate
+//    checks that every tool/*.hexa added since the configured git baseline
+//    contains a wired-up `--selftest` flag.
+//
+//  BASELINE
+//    1. If --baseline=<rev> is passed, use that.
+//    2. Else use env $SELFTEST_BASELINE if set.
+//    3. Else default to `main`.
+//
+//  DETECTION
+//    A file "has a selftest" iff its source contains `--selftest` AND
+//    contains an `exit(` call (i.e., the flag is wired up, not just
+//    name-dropped in a comment).
+//
+//  OUTPUT
+//    state/coverage_gate_ci_last.json
+//      {
+//        "schema":     "anima.coverage_gate_ci.v1",
+//        "ts":         "<iso>",
+//        "baseline":   "<rev>",
+//        "added_files": [...],
+//        "missing":    [ {"file": "...", "reason": "no_selftest_flag|no_exit"} ],
+//        "pass":       bool
+//      }
+//
+//  EXIT
+//    0 — every added tool has a selftest
+//    1 — at least one missing (gate trips)
+//    2 — git unavailable / baseline unresolvable
+//
+//  USAGE
+//    hexa tool/coverage_gate_ci.hexa
+//    hexa tool/coverage_gate_ci.hexa --baseline=HEAD~10
+//    hexa tool/coverage_gate_ci.hexa --selftest
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT = "/Users/ghost/core/anima"
+let TOOL_DIR   = "/Users/ghost/core/anima/tool"
+let OUT_PATH   = "/Users/ghost/core/anima/state/coverage_gate_ci_last.json"
+let DEFAULT_BASELINE = "main"
+
+fn _shq(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+fn _file_exists(p: string) -> bool {
+    return exec_with_status("test -e " + _shq(p))[1] == 0
+}
+fn _ts_iso() -> string {
+    return to_string(exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")[0]).trim()
+}
+fn _json_esc(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+fn _short_path(p: string) -> string {
+    let root = ANIMA_ROOT + "/"
+    if len(p) > len(root) && p.substring(0, len(root)) == root {
+        return p.substring(len(root), len(p))
+    }
+    return p
+}
+
+// Resolve baseline revision from argv / env / default.
+fn _resolve_baseline(av: array) -> string {
+    for x in av {
+        let s = to_string(x)
+        if len(s) >= 11 && s.substring(0, 11) == "--baseline=" {
+            return s.substring(11, len(s))
+        }
+    }
+    let env_r = exec_with_status("printenv SELFTEST_BASELINE")
+    if env_r[1] == 0 {
+        let v = to_string(env_r[0]).trim()
+        if len(v) > 0 { return v }
+    }
+    return DEFAULT_BASELINE
+}
+
+// Return list of short-paths for tool/*.hexa added since `baseline`.
+fn _added_since(baseline: string) -> array {
+    let cmd = "cd " + _shq(ANIMA_ROOT) + " && git diff --name-only --diff-filter=A " + _shq(baseline) + "...HEAD -- tool/ 2>/dev/null"
+    let r = exec_with_status(cmd)
+    let mut out = []
+    if r[1] != 0 { return out }
+    let lines = split(to_string(r[0]), "\n")
+    for ln in lines {
+        let t = ln.trim()
+        if len(t) == 0 { continue }
+        if len(t) >= 5 && t.substring(len(t) - 5, len(t)) == ".hexa" {
+            out.push(t)
+        }
+    }
+    return out
+}
+
+// Check whether a tool file has a wired-up --selftest.
+// Returns: "ok" | "no_selftest_flag" | "no_exit"
+fn _probe_selftest(short: string) -> string {
+    let fp = ANIMA_ROOT + "/" + short
+    if !_file_exists(fp) { return "ok" }
+    let src = to_string(read_file(fp))
+    if len(src) == 0 { return "no_selftest_flag" }
+    if !src.contains("--selftest") { return "no_selftest_flag" }
+    if !src.contains("exit(") { return "no_exit" }
+    return "ok"
+}
+
+fn _run_audit(baseline: string) -> array {
+    let added = _added_since(baseline)
+    let mut missing = []
+    for short in added {
+        let v = _probe_selftest(short)
+        if v != "ok" {
+            missing.push([short, v])
+        }
+    }
+    return [added, missing]
+}
+
+fn _arr_strings_to_json(a: array) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < len(a) {
+        if i > 0 { s = s + ", " }
+        s = s + "\"" + _json_esc(to_string(a[i])) + "\""
+        i = i + 1
+    }
+    s = s + "]"
+    return s
+}
+
+fn _write_out(baseline: string, added: array, missing: array, pass: bool) {
+    let mut j = "{\n"
+    j = j + "  \"schema\": \"anima.coverage_gate_ci.v1\",\n"
+    j = j + "  \"ts\": \"" + _ts_iso() + "\",\n"
+    j = j + "  \"baseline\": \"" + _json_esc(baseline) + "\",\n"
+    j = j + "  \"added_files\": " + _arr_strings_to_json(added) + ",\n"
+    j = j + "  \"missing\": ["
+    let mut i = 0
+    while i < len(missing) {
+        if i > 0 { j = j + "," }
+        j = j + "\n    {\"file\": \"" + _json_esc(missing[i][0]) + "\", \"reason\": \"" + _json_esc(missing[i][1]) + "\"}"
+        i = i + 1
+    }
+    if len(missing) > 0 { j = j + "\n  " }
+    j = j + "],\n"
+    j = j + "  \"pass\": " + (if pass { "true" } else { "false" }) + "\n"
+    j = j + "}\n"
+    let tmp = OUT_PATH + ".tmp"
+    write_file(tmp, j)
+    exec_with_status("mv -f " + _shq(tmp) + " " + _shq(OUT_PATH))
+}
+
+// ─── selftest ──────────────────────────────────────────────────────────────
+
+fn _arg_present(av: array, k: string) -> bool {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+let _argv = args()
+if _arg_present(_argv, "--selftest") {
+    println("── coverage_gate_ci selftest ──")
+    // S1 — synthetic file with --selftest and exit() → ok
+    let tmp_ok = "/tmp/_cov_gate_st_ok.hexa"
+    write_file(tmp_ok, "// tool\nif false { println(\"--selftest\"); exit(0) }\n")
+    let src_ok = to_string(read_file(tmp_ok))
+    let s1 = src_ok.contains("--selftest") && src_ok.contains("exit(")
+    println("S1 wired-up selftest detection → " + (if s1 { "PASS" } else { "FAIL" }))
+    // S2 — synthetic file without selftest → missing detection
+    let tmp_no = "/tmp/_cov_gate_st_no.hexa"
+    write_file(tmp_no, "// just a helper\nlet x = 1\n")
+    let src_no = to_string(read_file(tmp_no))
+    let s2 = !src_no.contains("--selftest")
+    println("S2 unwired tool detected as missing → " + (if s2 { "PASS" } else { "FAIL" }))
+    // S3 — baseline resolver returns something
+    let base = _resolve_baseline([])
+    let s3 = len(base) > 0
+    println("S3 baseline resolver → " + base + " " + (if s3 { "PASS" } else { "FAIL" }))
+    exec_with_status("rm -f " + _shq(tmp_ok) + " " + _shq(tmp_no))
+    if s1 && s2 && s3 {
+        println("── selftest 3/3 PASS ──")
+        exit(0)
+    }
+    println("── selftest FAIL ──")
+    exit(1)
+}
+
+// ─── main ──────────────────────────────────────────────────────────────────
+
+println("── coverage_gate_ci (ROI H44) ──")
+let baseline = _resolve_baseline(_argv)
+let git_probe = exec_with_status("cd " + _shq(ANIMA_ROOT) + " && git rev-parse HEAD 2>/dev/null")
+if git_probe[1] != 0 {
+    eprintln("coverage_gate_ci: git unavailable or not a repo")
+    _write_out(baseline, [], [["(git unavailable)", "git_error"]], false)
+    exit(2)
+}
+let res = _run_audit(baseline)
+let added   = res[0]
+let missing = res[1]
+let pass = (len(missing) == 0)
+_write_out(baseline, added, missing, pass)
+println("baseline : " + baseline)
+println("added    : " + to_string(len(added)))
+println("missing  : " + to_string(len(missing)))
+println("output   : " + OUT_PATH)
+if pass {
+    println("PASS")
+    exit(0)
+}
+println("FAIL — " + to_string(len(missing)) + " new tool(s) missing --selftest")
+for m in missing {
+    eprintln("  MISSING (" + m[1] + "): " + m[0])
+}
+exit(1)

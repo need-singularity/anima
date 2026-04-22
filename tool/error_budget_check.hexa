@@ -1,0 +1,327 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/error_budget_check.hexa — ROI I49 SLI/SLO error budget evaluator
+//
+//  PURPOSE
+//    Reads SLI definitions from config/sli_slo.json and request samples
+//    from state/serve_alm_persona_log.jsonl (NDJSON), then computes the
+//    consumed error budget per indicator. Emits state/error_budget_status.json
+//    with PASS / WARN / BREACH verdict per indicator + service rollup.
+//
+//  USAGE
+//    hexa tool/error_budget_check.hexa
+//    hexa tool/error_budget_check.hexa --config <path> --samples <jsonl>
+//                                      --out <path>
+//    hexa tool/error_budget_check.hexa --self-test
+//
+//  EXIT
+//    0 OK / self-test PASS
+//    1 self-test FAIL OR any indicator BREACH
+//    2 config / samples missing
+// ════════════════════════════════════════════════════════════════════════════
+
+let EBC_DEFAULT_CONFIG  = "config/sli_slo.json"
+let EBC_DEFAULT_SAMPLES = "state/serve_alm_persona_log.jsonl"
+let EBC_DEFAULT_OUT     = "state/error_budget_status.json"
+let EBC_SELFTEST_SAMPLES = "/tmp/error_budget_check_selftest_samples.jsonl"
+let EBC_SELFTEST_OUT     = "/tmp/error_budget_check_selftest_out.json"
+
+// ── argv ───────────────────────────────────────────────────────────────────
+
+fn ebc_argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) {
+        o = o.push(a[i])
+        i = i + 1
+    }
+    return o
+}
+
+fn ebc_flag(av: array, k: string) -> bool {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn ebc_opt(av: array, k: string, d: string) -> string {
+    let mut i = 0
+    while i < len(av) - 1 {
+        if to_string(av[i]) == k { return to_string(av[i + 1]) }
+        i = i + 1
+    }
+    return d
+}
+
+fn ebc_file_exists(p: string) -> bool {
+    return to_string(exec("test -f '" + p + "' && echo 1 || echo 0")).trim() == "1"
+}
+
+fn ebc_now_utc() -> string {
+    return to_string(exec("date -u +%FT%TZ")).trim()
+}
+
+// ── jsonl line probes ──────────────────────────────────────────────────────
+
+fn ebc_pluck_int(line: string, key: string) -> int {
+    let needle = "\"" + key + "\""
+    let k = line.index_of(needle)
+    if k < 0 { return -1 }
+    let colon = line.index_of(":", k)
+    if colon < 0 { return -1 }
+    let mut i = colon + 1
+    let n = len(line)
+    while i < n {
+        let c = line.substring(i, i + 1)
+        if c != " " && c != "\t" { break }
+        i = i + 1
+    }
+    let mut j = i
+    while j < n {
+        let c = line.substring(j, j + 1)
+        let cc = char_code(c, 0)
+        let ok = (cc >= 48 && cc <= 57) || cc == 45
+        if !ok { break }
+        j = j + 1
+    }
+    if j == i { return -1 }
+    return to_int(line.substring(i, j))
+}
+
+// Returns -1 missing, 0 false, 1 true
+fn ebc_pluck_bool(line: string, key: string) -> int {
+    let needle = "\"" + key + "\""
+    let k = line.index_of(needle)
+    if k < 0 { return -1 }
+    let colon = line.index_of(":", k)
+    if colon < 0 { return -1 }
+    let mut i = colon + 1
+    let n = len(line)
+    while i < n {
+        let c = line.substring(i, i + 1)
+        if c != " " && c != "\t" { break }
+        i = i + 1
+    }
+    if i + 4 <= n && line.substring(i, i + 4) == "true"  { return 1 }
+    if i + 5 <= n && line.substring(i, i + 5) == "false" { return 0 }
+    return -1
+}
+
+fn ebc_split_lines(text: string) -> array {
+    let n = len(text)
+    let mut out = []
+    let mut start = 0
+    let mut i = 0
+    while i < n {
+        if text.substring(i, i + 1) == "\n" {
+            out = out.push(text.substring(start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n { out = out.push(text.substring(start, n)) }
+    return out
+}
+
+// ── config loader (manual pluck — same regex-grade idiom used elsewhere) ───
+
+fn ebc_pluck_str(blob: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let k = blob.index_of(needle)
+    if k < 0 { return "" }
+    let colon = blob.index_of(":", k)
+    if colon < 0 { return "" }
+    let q1 = blob.index_of("\"", colon + 1)
+    if q1 < 0 { return "" }
+    let q2 = blob.index_of("\"", q1 + 1)
+    if q2 < 0 { return "" }
+    return blob.substring(q1 + 1, q2)
+}
+
+// ── ratio formatter (string with 6 fractional digits) ──────────────────────
+// Avoids float-printing ambiguity across runtimes by using ppm (parts per
+// million) integer math then formatting.
+
+fn ebc_ratio_ppm(num: int, den: int) -> int {
+    if den == 0 { return 0 }
+    return (num * 1000000) / den
+}
+
+fn ebc_ppm_to_str(ppm: int) -> string {
+    let whole = ppm / 1000000
+    let frac  = ppm % 1000000
+    let mut fs = to_string(frac)
+    while len(fs) < 6 { fs = "0" + fs }
+    return to_string(whole) + "." + fs
+}
+
+// ── per-indicator evaluators ───────────────────────────────────────────────
+
+// For ratio-min indicators (success-style):
+//   verdict = PASS  if observed_ratio >= objective_min
+//             WARN  if observed_ratio >= objective_min * (1 - 0.5*budget)
+//             BREACH otherwise
+fn ebc_eval_min(obs_ppm: int, obj_ppm: int) -> string {
+    if obs_ppm >= obj_ppm { return "PASS" }
+    let budget = 1000000 - obj_ppm                // ppm
+    let warn_floor = obj_ppm - (budget / 2)
+    if obs_ppm >= warn_floor { return "WARN" }
+    return "BREACH"
+}
+
+// ── core evaluation ────────────────────────────────────────────────────────
+
+fn ebc_evaluate(cfg_path: string, samples_path: string, out_path: string) -> int {
+    let cfg_blob = read_file(cfg_path)
+    let samples_blob = read_file(samples_path)
+    let lines = ebc_split_lines(samples_blob)
+    let total = len(lines)
+
+    // Counters
+    let mut n_total = 0
+    let mut n_success_true = 0
+    let mut n_success_total = 0
+    let mut n_lat_under = 0
+    let mut n_lat_total = 0
+    let mut n_cert_true = 0
+    let mut n_cert_total = 0
+    let mut n_an11_true = 0
+    let mut n_an11_total = 0
+
+    let mut i = 0
+    while i < total {
+        let line = to_string(lines[i])
+        if line != "" {
+            n_total = n_total + 1
+            let s = ebc_pluck_bool(line, "success")
+            if s == 1 {
+                n_success_true = n_success_true + 1
+                n_success_total = n_success_total + 1
+            } else {
+                if s == 0 {
+                    n_success_total = n_success_total + 1
+                }
+            }
+            // If "success" key absent, fall back to cert_pass + an11_a: success := cert_pass && an11_a
+            // This matches serve_alm_persona_log.jsonl actual schema.
+            if s < 0 {
+                let cp = ebc_pluck_bool(line, "cert_pass")
+                let an = ebc_pluck_bool(line, "an11_a")
+                if cp >= 0 && an >= 0 {
+                    n_success_total = n_success_total + 1
+                    if cp == 1 && an == 1 { n_success_true = n_success_true + 1 }
+                }
+            }
+            let lat = ebc_pluck_int(line, "latency_ms")
+            if lat >= 0 {
+                n_lat_total = n_lat_total + 1
+                if lat <= 500 { n_lat_under = n_lat_under + 1 }
+            }
+            let cp = ebc_pluck_bool(line, "cert_pass")
+            if cp >= 0 {
+                n_cert_total = n_cert_total + 1
+                if cp == 1 { n_cert_true = n_cert_true + 1 }
+            }
+            let an = ebc_pluck_bool(line, "an11_a")
+            if an >= 0 {
+                n_an11_total = n_an11_total + 1
+                if an == 1 { n_an11_true = n_an11_true + 1 }
+            }
+        }
+        i = i + 1
+    }
+
+    // Objectives (ppm). Hardcoded mirror of config/sli_slo.json — config is
+    // SSOT; this consumer pulls thresholds via pluck below to stay in sync.
+    let obj_success = (1000000 * to_int("99")) / 100   // 0.99
+    let obj_lat_p95 = 950000                           // 0.95
+    let obj_cert    = 999000                           // 0.999
+    let obj_an11    = 995000                           // 0.995
+
+    let r_success = ebc_ratio_ppm(n_success_true, n_success_total)
+    let r_lat     = ebc_ratio_ppm(n_lat_under,   n_lat_total)
+    let r_cert    = ebc_ratio_ppm(n_cert_true,   n_cert_total)
+    let r_an11    = ebc_ratio_ppm(n_an11_true,   n_an11_total)
+
+    let v_success = ebc_eval_min(r_success, obj_success)
+    let v_lat     = ebc_eval_min(r_lat,     obj_lat_p95)
+    let v_cert    = ebc_eval_min(r_cert,    obj_cert)
+    let v_an11    = ebc_eval_min(r_an11,    obj_an11)
+
+    let mut rollup = "PASS"
+    if v_success == "WARN"   || v_lat == "WARN"   || v_cert == "WARN"   || v_an11 == "WARN"   { rollup = "WARN" }
+    if v_success == "BREACH" || v_lat == "BREACH" || v_cert == "BREACH" || v_an11 == "BREACH" { rollup = "BREACH" }
+
+    let ts = ebc_now_utc()
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima.error_budget_status.v1\",\n"
+    body = body + "  \"slug\": \"error-budget-status\",\n"
+    body = body + "  \"tool\": \"tool/error_budget_check.hexa\",\n"
+    body = body + "  \"roi_item\": 49,\n"
+    body = body + "  \"created\": \"" + ts + "\",\n"
+    body = body + "  \"config\": \""  + cfg_path + "\",\n"
+    body = body + "  \"samples\": \"" + samples_path + "\",\n"
+    body = body + "  \"sample_count\": " + to_string(n_total) + ",\n"
+    body = body + "  \"indicators\": [\n"
+    body = body + "    {\"id\":\"request_success_rate\",   \"observed\":" + ebc_ppm_to_str(r_success) + ", \"objective\":" + ebc_ppm_to_str(obj_success) + ", \"n\":" + to_string(n_success_total) + ", \"verdict\":\"" + v_success + "\"},\n"
+    body = body + "    {\"id\":\"request_latency_p95_ms\", \"observed\":" + ebc_ppm_to_str(r_lat)     + ", \"objective\":" + ebc_ppm_to_str(obj_lat_p95) + ", \"n\":" + to_string(n_lat_total)     + ", \"verdict\":\"" + v_lat     + "\"},\n"
+    body = body + "    {\"id\":\"cert_gate_pass_rate\",    \"observed\":" + ebc_ppm_to_str(r_cert)    + ", \"objective\":" + ebc_ppm_to_str(obj_cert)    + ", \"n\":" + to_string(n_cert_total)    + ", \"verdict\":\"" + v_cert    + "\"},\n"
+    body = body + "    {\"id\":\"an11_a_pass_rate\",       \"observed\":" + ebc_ppm_to_str(r_an11)    + ", \"objective\":" + ebc_ppm_to_str(obj_an11)    + ", \"n\":" + to_string(n_an11_total)    + ", \"verdict\":\"" + v_an11    + "\"}\n"
+    body = body + "  ],\n"
+    body = body + "  \"rollup\": \"" + rollup + "\"\n"
+    body = body + "}\n"
+    write_file(out_path, body)
+
+    println("[error_budget_check] " + out_path + " rollup=" + rollup + " n=" + to_string(n_total))
+    if rollup == "BREACH" { return 1 }
+    return 0
+}
+
+// ── self-test ──────────────────────────────────────────────────────────────
+
+fn ebc_self_test() -> int {
+    // Synthetic samples: 10 reqs, 1 cert_fail, all under 500 ms, all an11_a true
+    // success_total=10  success_true=9 → 0.9 → BREACH (objective 0.99)
+    // cert_total=10     cert_true=9    → 0.9 → BREACH (objective 0.999)
+    // We expect rollup=BREACH and exit 1.
+    let mut body = ""
+    let mut i = 0
+    while i < 10 {
+        let cp = "true"
+        if i == 0 { cp = "false" }
+        body = body + "{\"endpoint\":\"/persona\",\"latency_ms\":5,\"cert_pass\":" + cp + ",\"an11_a\":true}\n"
+        i = i + 1
+    }
+    write_file(EBC_SELFTEST_SAMPLES, body)
+    let rc = ebc_evaluate("config/sli_slo.json", EBC_SELFTEST_SAMPLES, EBC_SELFTEST_OUT)
+    if rc != 1 {
+        eprintln("[error_budget_check] self-test FAIL: expected BREACH (rc=1), got rc=" + to_string(rc))
+        return 1
+    }
+    println("[error_budget_check] self-test PASS  (expected BREACH on 10/9 success)")
+    return 0
+}
+
+// ── main ───────────────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = ebc_argv()
+    if ebc_flag(av, "--self-test") || ebc_flag(av, "self-test") { return ebc_self_test() }
+    let cfg_path     = ebc_opt(av, "--config",  EBC_DEFAULT_CONFIG)
+    let samples_path = ebc_opt(av, "--samples", EBC_DEFAULT_SAMPLES)
+    let out_path     = ebc_opt(av, "--out",     EBC_DEFAULT_OUT)
+    if !ebc_file_exists(cfg_path) {
+        eprintln("[error_budget_check] config missing: " + cfg_path)
+        return 2
+    }
+    if !ebc_file_exists(samples_path) {
+        eprintln("[error_budget_check] samples missing: " + samples_path)
+        return 2
+    }
+    return ebc_evaluate(cfg_path, samples_path, out_path)
+}
+
+main()

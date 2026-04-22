@@ -1,0 +1,104 @@
+{
+  "schema": "anima.pr_preview_env.spec.v1",
+  "roi_item": "L64",
+  "tool_owner": "tool/test-parallel-runner.hexa (CI dispatcher) + GitHub Actions trigger",
+  "spec_status": "SPEC_ONLY",
+  "activation_status": "DEFERRED_COST_GATED",
+  "rationale": [
+    "Each PR spawning an ephemeral RunPod (H100 or A100) shifts spend from the per-launch budget to the per-merge budget. Until P2 contract freeze (roadmap entry #74) clears CP1 we hold this behind a manual cost gate.",
+    "Ephemeral pods are useful primarily for verifying the live LoRA serving path; the CPU-only smoke layer (anima_serve_smoke + ci_serve_alm_persona_smoke) already exercises contract schemas without GPU. Activating preview env before CP1 = paying GPU cost for low-yield validation."
+  ],
+  "activation_gate": {
+    "must_have": [
+      "CP1 reached (roadmap waypoint Mk.VI VERIFIED)",
+      "weekly H100 spend < $200 sustained for 2 weeks",
+      "explicit user OK in URGENT_ACTION_LIST.md"
+    ],
+    "kill_switch_env_var": "ANIMA_PR_PREVIEW_ENABLED",
+    "default_value": "false"
+  },
+  "trigger": {
+    "source": "github.com/anima/anima — pull_request events",
+    "events": ["opened", "synchronize", "reopened"],
+    "skip_labels": ["docs-only", "no-preview", "skip-ci"],
+    "required_paths": [
+      "tool/**",
+      "anima-serve/**",
+      "config/**",
+      "edu/**"
+    ],
+    "spawn_action": ".github/workflows/pr_preview.yml (NOT YET COMMITTED)"
+  },
+  "runpod_template": {
+    "provider": "runpod.io",
+    "gpu_type": "RTX A6000",
+    "gpu_count": 1,
+    "vcpu": 8,
+    "ram_gb": 64,
+    "disk_gb": 100,
+    "image": "runpod/pytorch:2.4.0-py3.11-cuda12.4-devel-ubuntu22.04",
+    "rationale": "A6000 is the cheapest 48GB tier ($0.49/hr) — sufficient for Qwen-14B inference without quant. We do NOT spawn H100 for previews; H100 is reserved for actual training runs (P2 + CP1).",
+    "expected_spend_per_pr_usd": 0.5,
+    "max_runtime_minutes": 60
+  },
+  "env_vars": {
+    "ANIMA_PR_NUMBER": "<pull_request.number>",
+    "ANIMA_PR_HEAD_SHA": "<pull_request.head.sha>",
+    "ANIMA_PR_BASE_BRANCH": "<pull_request.base.ref>",
+    "ANIMA_R2_ACCESS_KEY": "<github secret: R2_ACCESS_KEY>",
+    "ANIMA_R2_SECRET_KEY": "<github secret: R2_SECRET_KEY>",
+    "ANIMA_LORA_PATH": "/workspace/checkpoints/qwen14b-pr-${ANIMA_PR_NUMBER}.lora",
+    "ANIMA_PREVIEW_TTL_SECONDS": "3600"
+  },
+  "lifecycle": {
+    "spawn": [
+      "1. Pull base image",
+      "2. git clone --depth 1 --branch <PR head> https://github.com/anima/anima",
+      "3. install hexa toolchain (cargo install --path hexa-lang)",
+      "4. download LoRA artifact from R2 (ANIMA_LORA_PATH)",
+      "5. start anima-serve on port 8080 (bound to 0.0.0.0)",
+      "6. expose port via runpod proxy URL",
+      "7. POST {pr_number, preview_url, ttl} to GitHub PR comment via gh CLI"
+    ],
+    "validate": [
+      "1. probe /health endpoint (expect HTTP 200, JSON {\"ok\": true})",
+      "2. POST /v1/chat/completions with smoke prompt → expect non-empty echo",
+      "3. record p50/p95 latency in state/pr_preview_<pr>_metrics.json"
+    ],
+    "teardown_trigger": [
+      "PR closed (any close: merged or rejected)",
+      "PR labeled 'no-preview' after spawn",
+      "TTL expired (default 3600s = 1 hour)",
+      "manual: gh workflow run pr_preview_teardown.yml -f pr=<num>",
+      "any push that triggers a new spawn (replace, not stack)"
+    ],
+    "teardown": [
+      "1. runpod-cli stop --pod-id $POD_ID",
+      "2. runpod-cli rm --pod-id $POD_ID",
+      "3. POST teardown notice to PR comment",
+      "4. append event to state/pr_preview_log.jsonl"
+    ]
+  },
+  "observability": {
+    "log_path": "state/pr_preview_log.jsonl",
+    "metrics_path_glob": "state/pr_preview_*_metrics.json",
+    "github_status_check": "anima-pr-preview"
+  },
+  "security": {
+    "secrets_source": "github actions secrets only — never commit to repo",
+    "no_ssh_inbound": true,
+    "no_persistent_volume": "ephemeral pods only — no state survives teardown",
+    "outbound_allowlist": [
+      "huggingface.co",
+      "*.r2.cloudflarestorage.com",
+      "github.com",
+      "api.openai.com (for /v1 compat shim parity tests only)"
+    ]
+  },
+  "owner": {
+    "primary": "loveiu99@proton.me",
+    "escalation": "URGENT_ACTION_LIST.md (top-of-file)"
+  },
+  "raw_strict": "raw#9 raw#10 raw#11 raw#15 spec_only deterministic LLM=none",
+  "verdict": "SPEC_FROZEN_NOT_ACTIVATED"
+}

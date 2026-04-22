@@ -1,0 +1,123 @@
+{
+  "schema": "anima.inference_optimization_audit.v1",
+  "generated": "2026-04-22",
+  "scope": "ROI batch F (F28-F35) — inference / serving optimization knobs (post-CP1)",
+  "source_doc": "docs/h100_roi_improvements_20260422.md",
+  "spec_doc": "docs/inference_optimization_spec_20260422.md",
+  "config_ssot": "config/inference_serve_optimization.json",
+  "smoke_tool": "tool/inference_optimization_smoke.hexa",
+  "smoke_result": "state/inference_optimization_smoke_result.json",
+  "owner_tool": "tool/serve_alm_persona.hexa",
+  "constraints": [
+    "DO NOT modify .roadmap (uchg)",
+    "DO NOT trigger H100 launch",
+    "DO NOT commit",
+    "NO .py files",
+    "Existing tool/serve_alm_persona.hexa selftest must PASS (verified: 3/3)"
+  ],
+  "totals": {
+    "items": 8,
+    "applied": 0,
+    "pending": 1,
+    "blocked_by_h100": 7
+  },
+  "items": [
+    {
+      "id": "F28",
+      "name": "KV cache reuse across personas (same base model)",
+      "status": "blocked-by-H100",
+      "requires_weights": true,
+      "config_field": "config/inference_serve_optimization.json :: knobs.f28_kv_cache_reuse_across_personas",
+      "integration_point": "tool/serve_alm_persona.hexa :: backend_invoke (mode=gpu) — prefix-cache before persona LoRA forward",
+      "blocker": "H100 cascade #9 — base_model at /workspace/base_model + persona_lora at /workspace/lora/persona_lora/<id>/",
+      "expected_impact": "5-10x throughput on multi-persona workloads"
+    },
+    {
+      "id": "F29",
+      "name": "vLLM PagedAttention integration",
+      "status": "blocked-by-H100",
+      "requires_weights": true,
+      "config_field": "config/inference_serve_optimization.json :: knobs.f29_vllm_paged_attention",
+      "integration_point": "tool/serve_alm_persona.hexa :: backend_invoke — replace placeholder with vllm.AsyncLLMEngine.generate(...)",
+      "blocker": "H100 cascade #9 + vLLM>=0.6 in pod env (STAGED_FOR_POD; raw#9)",
+      "expected_impact": "2-4x throughput vs reference HF attention"
+    },
+    {
+      "id": "F30",
+      "name": "Continuous batching (vs static batching)",
+      "status": "blocked-by-H100",
+      "requires_weights": true,
+      "config_field": "config/inference_serve_optimization.json :: knobs.f30_continuous_batching",
+      "integration_point": "tool/serve_alm_persona.hexa :: backend_invoke — vLLM engine_args.scheduler_config",
+      "blocker": "F29 vLLM (which is itself blocked-by-H100)",
+      "expected_impact": "2-3x throughput under variable load"
+    },
+    {
+      "id": "F31",
+      "name": "Speculative decoding (draft 0.5B → target 8B)",
+      "status": "blocked-by-H100",
+      "requires_weights": true,
+      "config_field": "config/inference_serve_optimization.json :: knobs.f31_speculative_decoding",
+      "integration_point": "tool/serve_alm_persona.hexa :: backend_invoke — vLLM SpeculativeConfig(draft_model=Qwen3-0.5B, num_speculative_tokens=5)",
+      "blocker": "Qwen3-0.5B draft weights at /workspace/draft_model_qwen3_0_5b + Qwen3-8B target at /workspace/base_model (cascade #9)",
+      "expected_impact": "2x latency reduction at identical output distribution"
+    },
+    {
+      "id": "F32",
+      "name": "API layer prompt cache (response memoization)",
+      "status": "pending",
+      "requires_weights": false,
+      "config_field": "config/inference_serve_optimization.json :: knobs.f32_api_prompt_cache",
+      "integration_point": "tool/serve_alm_persona.hexa :: handler_persona — check cache before backend_invoke; populate after PASS verdict",
+      "blocker": "pod-side fastapi runtime body must implement LRU cache (STAGED_FOR_POD)",
+      "expected_impact": "Repeat-prompt latency ≈0ms; estimated 20-40% hit rate on benchmark traffic",
+      "notes": "ONLY knob without H100 weight dependency — can be activated first when pod runtime body lands"
+    },
+    {
+      "id": "F33",
+      "name": "Streaming token output (TTFT < 200ms)",
+      "status": "blocked-by-H100",
+      "requires_weights": true,
+      "config_field": "config/inference_serve_optimization.json :: knobs.f33_streaming_token_output",
+      "integration_point": "tool/serve_alm_persona.hexa — new endpoint POST /persona/stream alongside /persona; same gate stack",
+      "blocker": "F29 vLLM + pod-side fastapi/uvicorn SSE wiring (bash-nc loop in serve_alm_persona.bash does NOT support chunked transfer)",
+      "expected_impact": "Perceived latency ↓ 5-10x for long generations; TTFT < 200ms target"
+    },
+    {
+      "id": "F34",
+      "name": "fp8 / int8 quantization at serve time",
+      "status": "blocked-by-H100",
+      "requires_weights": true,
+      "config_field": "config/inference_serve_optimization.json :: knobs.f34_fp8_int8_quantization",
+      "integration_point": "tool/serve_alm_persona.hexa :: backend_invoke — engine init quantization=knobs.f34.format",
+      "blocker": "FP16 baseline weights + AN11(a) baseline established + calibration dataset shared/calibration/dest1_calib_512.jsonl",
+      "expected_impact": "30-50% inference speedup; VRAM ↓ 50%; quality preserved within AN11(a) verified Δ ≤ 0.02"
+    },
+    {
+      "id": "F35",
+      "name": "Dynamic batch scheduling (latency SLO aware)",
+      "status": "blocked-by-H100",
+      "requires_weights": true,
+      "config_field": "config/inference_serve_optimization.json :: knobs.f35_dynamic_batch_scheduling",
+      "integration_point": "tool/serve_alm_persona.hexa :: handler_persona — extract X-Anima-Priority header; vLLM scheduler enforces class quota",
+      "blocker": "F29 + F30 (both blocked-by-H100)",
+      "expected_impact": "Fairness across priority classes; throughput ↑ 1.5-2x at fixed P95 SLO"
+    }
+  ],
+  "smoke_verdict": "PASS",
+  "smoke_summary": "8/8 knobs schema-complete; safe_defaults_invariant=true (all enabled=false); requires_weights ⇒ blocked_by_h100 consistency holds for all 7 weight-dependent items",
+  "selftest_compatibility": {
+    "tool": "tool/serve_alm_persona.bash",
+    "command": "bash tool/serve_alm_persona.bash --selftest --dry",
+    "verdict_before": "PASS (3/3)",
+    "verdict_after":  "PASS (3/3)",
+    "regression": false
+  },
+  "raw_compliance": [
+    "raw#9  hexa-only (config JSON + spec md + smoke .hexa; no .py)",
+    "raw#10 deterministic (no live timestamps inside knob params)",
+    "raw#11 snake_case",
+    "raw#12 실측 only — blocked-by-H100 surfaced honestly via requires_weights flag",
+    "raw#15 no-hardcode (knob params live in config SSOT; tool reads from there)"
+  ]
+}

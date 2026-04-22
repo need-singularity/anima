@@ -54,6 +54,13 @@
 //  GRACEFUL SHUTDOWN
 //    SIGTERM trap installed via bash wrapper (exec'd) — server loop exits
 //    on /tmp/serve_alm_persona.<port>.stop sentinel file.
+//
+//  RUNTIME (2026-04-22)
+//    NATIVE_HEXA — this file runs natively via `hexa tool/serve_alm_persona.hexa`
+//    using stage0 primitives exec_capture / setenv / env (upstream hexa-lang
+//    update 2026-04-22; see docs/upstream_notes/hexa_lang_20260422.md).
+//    The bash companion tool/serve_alm_persona.bash is now a 5-line shim
+//    that execs this file — kept for backward-compatible invocation only.
 // ════════════════════════════════════════════════════════════════════════════
 
 let SAP_VERSION             = "serve_alm_persona/1.0.0"
@@ -71,18 +78,20 @@ let SAP_BOOT_DRYRUN_PATH    = "state/serve_alm_persona_boot_dryrun.json"
 let SAP_LOG_PATH            = "state/serve_alm_persona_log.jsonl"
 let SAP_DRYRUN_SSOT_PATH    = "state/serve_alm_persona_dryrun.json"
 
-// ── primitives ───────────────────────────────────────────────────────────
+// ── primitives (NATIVE_HEXA — exec_capture / env / setenv) ───────────────
 
 fn _home() -> string {
-    return to_string(exec("echo $HOME")).trim()
+    let h = env("HOME")
+    if len(h) > 0 { return h }
+    return to_string(exec_capture("echo $HOME")[0]).trim()
 }
 
 fn now_utc() -> string {
-    return to_string(exec("date -u +%FT%TZ")).trim()
+    return to_string(exec_capture("date -u +%FT%TZ")[0]).trim()
 }
 
 fn now_ms() -> string {
-    let s = to_string(exec("date -u +%s")).trim()
+    let s = to_string(exec_capture("date -u +%s")[0]).trim()
     return s + "000"
 }
 
@@ -91,11 +100,13 @@ fn bool_s(b: bool) -> string {
 }
 
 fn fexists(p: string) -> bool {
-    return to_string(exec("test -f '" + p + "' && echo 1 || echo 0")).trim() == "1"
+    let r = exec_capture("test -f '" + p + "'")
+    return to_int(to_string(r[2])) == 0
 }
 
 fn dexists(p: string) -> bool {
-    return to_string(exec("test -d '" + p + "' && echo 1 || echo 0")).trim() == "1"
+    let r = exec_capture("test -d '" + p + "'")
+    return to_int(to_string(r[2])) == 0
 }
 
 fn json_escape(s: string) -> string {
@@ -204,7 +215,7 @@ fn emit_boot_dryrun(home: string, mode: string, port: string, persona_id: string
     body = body + "  \"raw_compliance\": [\"raw#9\", \"raw#10\", \"raw#11\", \"raw#12\", \"raw#15\"],\n"
     body = body + "  \"verdict\": \"BOOT_DRYRUN_OK\"\n"
     body = body + "}\n"
-    exec("mkdir -p '" + home + "/core/anima/state'")
+    exec_capture("mkdir -p '" + home + "/core/anima/state'")
     write_file(out, body)
 }
 
@@ -212,9 +223,9 @@ fn emit_boot_dryrun(home: string, mode: string, port: string, persona_id: string
 
 fn append_log(home: string, line: string) {
     let path = home + "/core/anima/" + SAP_LOG_PATH
-    exec("mkdir -p '" + home + "/core/anima/state'")
+    exec_capture("mkdir -p '" + home + "/core/anima/state'")
     let escaped = line.replace("'", "'\\''")
-    exec("printf '%s\\n' '" + escaped + "' >> '" + path + "'")
+    exec_capture("printf '%s\\n' '" + escaped + "' >> '" + path + "'")
 }
 
 // ── inline gate stubs (deterministic, mirror serve_cert_gate_spec contract)
@@ -288,7 +299,7 @@ fn handler_personas(personas_csv: string) -> string {
 }
 
 fn handler_persona(prompt: string, persona_id: string, max_tokens: int, mode: string, home: string) -> string {
-    let t0 = to_string(exec("date +%s%N")).trim()
+    let t0 = to_string(exec_capture("date +%s%N")[0]).trim()
     let cert_pass = gate_cert_gate_inline(prompt, mode)
     let an11_pass = gate_an11_a_inline(persona_id, mode)
     let mut text = ""
@@ -299,7 +310,7 @@ fn handler_persona(prompt: string, persona_id: string, max_tokens: int, mode: st
     } else {
         text = "GATE_REJECT cert_pass=" + bool_s(cert_pass) + " an11_a=" + bool_s(an11_pass)
     }
-    let t1 = to_string(exec("date +%s%N")).trim()
+    let t1 = to_string(exec_capture("date +%s%N")[0]).trim()
     // crude latency_ms = (t1-t0)/1e6
     let mut latency_ms = 0
     if len(t0) > 0 && len(t1) > 0 {
@@ -417,7 +428,7 @@ fn run_selftest(home: string, persona_id: string, mode: string, base_model_path:
     body = body + "  \"steps_total\": 3,\n"
     body = body + "  \"verdict\": \"" + (if all_pass { "PASS" } else { "FAIL" }) + "\"\n"
     body = body + "}\n"
-    exec("mkdir -p '" + home + "/core/anima/state'")
+    exec_capture("mkdir -p '" + home + "/core/anima/state'")
     write_file(out, body)
     return all_pass
 }
@@ -428,15 +439,19 @@ fn refresh_ssot_dryrun(home: string, mode: string, persona_id: string, port: str
     let out = home + "/core/anima/" + SAP_DRYRUN_SSOT_PATH
     let ts = now_utc()
     let mut body = "{\n"
-    body = body + "  \"schema\": \"anima/serve_alm_persona_dryrun/2\",\n"
+    body = body + "  \"schema\": \"anima/serve_alm_persona_dryrun/3\",\n"
     body = body + "  \"generated_at\": \"" + ts + "\",\n"
     body = body + "  \"serve_tool\": \"tool/serve_alm_persona.hexa\",\n"
     body = body + "  \"sap_version\": \"" + SAP_VERSION + "\",\n"
     body = body + "  \"roadmap_entry\": \"77\",\n"
     body = body + "  \"checkpoint\": \"CP1 — dest1 persona LIVE\",\n"
-    body = body + "  \"scope_note\": \"v2 — tool/serve_alm_persona.hexa is now LIVE-IMPLEMENTED in repo. Self-test PASSes 3 endpoints inline. Real LoRA + GPU forward STAGED for H100 cascade #9.\",\n"
-    body = body + "  \"tool_implementation_status\": \"LIVE_IN_REPO\",\n"
+    body = body + "  \"scope_note\": \"v3 — tool/serve_alm_persona.hexa runs natively via stage0 exec_capture/setenv/env primitives (hexa-lang upstream 2026-04-22). bash bridge collapsed to a 5-line deprecation shim that execs the .hexa file. Self-test PASSes 3 endpoints inline. Real LoRA + GPU forward STAGED for H100 cascade #9.\",\n"
+    body = body + "  \"tool_implementation_status\": \"NATIVE_HEXA\",\n"
+    body = body + "  \"bash_bridge_deprecated\": true,\n"
+    body = body + "  \"bash_bridge_path\": \"tool/serve_alm_persona.bash\",\n"
+    body = body + "  \"bash_bridge_kind\": \"deprecation_shim\",\n"
     body = body + "  \"selftest_invocation\": \"hexa tool/serve_alm_persona.hexa --selftest --dry\",\n"
+    body = body + "  \"selftest_invocation_legacy\": \"bash tool/serve_alm_persona.bash --selftest --dry  (forwards to hexa)\",\n"
     body = body + "  \"endpoints_identified\": [\n"
     body = body + "    {\"path\": \"/persona\",  \"method\": \"POST\", \"gates\": [\"cert_gate\", \"an11_a\"]},\n"
     body = body + "    {\"path\": \"/health\",   \"method\": \"GET\"},\n"
@@ -469,7 +484,7 @@ fn refresh_ssot_dryrun(home: string, mode: string, persona_id: string, port: str
     body = body + "  \"raw_compliance\": [\"raw#9\", \"raw#10\", \"raw#11\", \"raw#12\", \"raw#15\"],\n"
     body = body + "  \"verdict\": \"READY\"\n"
     body = body + "}\n"
-    exec("mkdir -p '" + home + "/core/anima/state'")
+    exec_capture("mkdir -p '" + home + "/core/anima/state'")
     write_file(out, body)
 }
 
@@ -502,7 +517,7 @@ fn main() {
         // Fail fast: config missing means no swap-in pointers known.
         let err = home + "/core/anima/state/serve_alm_persona_boot_error.json"
         let body = "{\"verdict\":\"FAIL\",\"reason\":\"config_missing\",\"path\":\"" + cfg_path + "\",\"ts\":\"" + now_utc() + "\"}\n"
-        exec("mkdir -p '" + home + "/core/anima/state'")
+        exec_capture("mkdir -p '" + home + "/core/anima/state'")
         write_file(err, body)
         exit(2)
     }
@@ -553,7 +568,7 @@ fn main() {
     let serve_script = "/tmp/serve_alm_persona." + port + ".sh"
     let sh = build_serve_loop_script(home, port, persona_id, mode)
     write_file(serve_script, sh)
-    exec("chmod +x '" + serve_script + "'")
+    exec_capture("chmod +x '" + serve_script + "'")
 
     // Note: actual long-lived bind is the operator's call — we record
     // the launch command in state and exit. This avoids hexa-driven

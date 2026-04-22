@@ -1,0 +1,83 @@
+{
+  "schema": "anima.r2_audit_log_immutable.v1",
+  "purpose": "ROI #69 — audit log immutability spec for Cloudflare R2 (write-once) + rclone enable templates",
+  "applies_to": [
+    "state/cert_ingest_log.json",
+    "state/asset_archive_log.jsonl",
+    "state/closure_debt_log.json",
+    "state/audit_log/*.jsonl",
+    "logs/audit/*.log"
+  ],
+  "bucket": {
+    "provider": "cloudflare_r2",
+    "name_pattern": "anima-audit-immutable-${env}",
+    "default_env": "prod",
+    "region": "auto",
+    "endpoint_template": "https://${ACCOUNT_ID}.r2.cloudflarestorage.com",
+    "object_lock_supported": true,
+    "object_lock_note": "R2 supports S3-compat object lock + versioning since 2024-07; verify with `rclone backend versioning` before enable"
+  },
+  "versioning": {
+    "enabled": true,
+    "rclone_command_template": "rclone backend versioning ${REMOTE}:${BUCKET} Enabled",
+    "verification_command_template": "rclone backend versioning ${REMOTE}:${BUCKET}"
+  },
+  "object_lock": {
+    "mode": "COMPLIANCE",
+    "default_retention_days": 2555,
+    "rationale_days": "7 years — SOC2/GDPR audit retention floor",
+    "rclone_set_retention_template": "rclone backend set ${REMOTE}:${BUCKET}/${KEY} retention-mode=COMPLIANCE retention-until=${ISO8601}",
+    "legal_hold_template": "rclone backend set ${REMOTE}:${BUCKET}/${KEY} legal-hold=ON"
+  },
+  "lifecycle": {
+    "noncurrent_versions_keep_forever": true,
+    "rationale": "audit immutability — no automatic version expiry; manual review only",
+    "abort_incomplete_multipart_days": 7
+  },
+  "write_policy": {
+    "mode": "WRITE_ONCE_NO_DELETE",
+    "iam_principal_allowed_actions": [
+      "s3:PutObject",
+      "s3:GetObject",
+      "s3:ListBucket",
+      "s3:GetObjectVersion"
+    ],
+    "iam_principal_denied_actions": [
+      "s3:DeleteObject",
+      "s3:DeleteObjectVersion",
+      "s3:PutBucketVersioning",
+      "s3:PutObjectRetention",
+      "s3:BypassGovernanceRetention"
+    ],
+    "rationale": "agent (and humans) can append + read; only break-glass root key (separately stored) can override"
+  },
+  "rclone_enable_runbook": [
+    "# 1. configure remote (one-time, stored in ~/.config/rclone/rclone.conf, NOT in repo)",
+    "rclone config create r2-audit s3 provider=Cloudflare access_key_id=${R2_KEY} secret_access_key=${R2_SECRET} endpoint=https://${ACCOUNT_ID}.r2.cloudflarestorage.com",
+    "# 2. create bucket with object-lock at creation (R2 requires lock at create-time)",
+    "rclone mkdir r2-audit:anima-audit-immutable-prod --s3-no-check-bucket",
+    "# 3. enable versioning",
+    "rclone backend versioning r2-audit:anima-audit-immutable-prod Enabled",
+    "# 4. verify",
+    "rclone backend versioning r2-audit:anima-audit-immutable-prod",
+    "# 5. test write-once (expected to FAIL with AccessDenied for restricted IAM)",
+    "rclone copy state/cert_ingest_log.json r2-audit:anima-audit-immutable-prod/$(date -u +%Y/%m/%d)/cert_ingest_log_$(date -u +%s).json",
+    "# 6. delete must FAIL",
+    "rclone delete r2-audit:anima-audit-immutable-prod/.../cert_ingest_log_*.json   # expected: AccessDenied"
+  ],
+  "verification_checklist": [
+    {"check": "versioning_enabled", "method": "rclone backend versioning <remote>:<bucket> | grep -i enabled"},
+    {"check": "delete_denied", "method": "rclone delete <object>; expect non-zero exit + AccessDenied"},
+    {"check": "object_lock_compliance", "method": "S3 head-object includes x-amz-object-lock-mode: COMPLIANCE"},
+    {"check": "noncurrent_kept", "method": "rclone lsf --include '**' --r2-versions <remote>:<bucket> shows >1 version after second PUT of same key"}
+  ],
+  "applied_status": {
+    "spec": "applied (this file)",
+    "bucket_provisioned": "PENDING (manual rclone runbook execution required)",
+    "rationale_pending": "agent MUST NOT provision cloud resources without explicit user trigger"
+  },
+  "rotation_policy": {
+    "audit_log_local_to_r2_sync_cadence": "daily 02:00 UTC",
+    "launchd_plist_proposal": "config/launchd/com.anima.r2_audit_sync.plist (NOT auto-installed)"
+  }
+}

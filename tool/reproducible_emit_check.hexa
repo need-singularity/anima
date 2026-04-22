@@ -1,0 +1,152 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/reproducible_emit_check.hexa
+//
+//  PURPOSE
+//    CI helper. Verifies that a target emitter tool produces byte-identical
+//    output across two runs when SOURCE_DATE_EPOCH (or HEXA_REPRODUCIBLE=1)
+//    is set. Eliminates the "git checkout state/*.json" dance after re-emit.
+//
+//    Methodology (per hexa-lang PR #23):
+//      1. Snapshot current emit_path → /tmp baseline
+//      2. Run target with SOURCE_DATE_EPOCH=<git_mtime(emit_path)>
+//      3. Snapshot result → run_a
+//      4. Restore baseline
+//      5. Run target with same SOURCE_DATE_EPOCH again
+//      6. Snapshot result → run_b
+//      7. Assert byte-for-byte equal (sha256)
+//      8. Restore baseline (no side effects)
+//
+//  USAGE
+//    hexa run tool/reproducible_emit_check.hexa \
+//      --tool tool/h100_launch_manifest_spec.hexa \
+//      --emit state/h100_launch_manifest.json
+//
+//    Defaults to h100_launch_manifest_spec.hexa / h100_launch_manifest.json
+//    if no flags supplied (smoke).
+//
+//  EXIT
+//    0 = byte-stable across two SDE runs (PASS)
+//    1 = drift detected (FAIL)
+//    2 = invocation error (target missing, no baseline, etc.)
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT = "/Users/ghost/core/anima"
+let DEFAULT_TOOL = "tool/h100_launch_manifest_spec.hexa"
+let DEFAULT_EMIT = "state/h100_launch_manifest.json"
+let HEXA_BIN     = "~/.hx/bin/hexa"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+fn _file_exists(p: string) -> bool {
+    return exec_with_status("test -e " + _sh_quote(p))[1] == 0
+}
+fn _sha256_file(p: string) -> string {
+    if !_file_exists(p) { return "" }
+    let r = exec_with_status("shasum -a 256 " + _sh_quote(p) + " | awk '{print $1}'")
+    return to_string(r[0]).trim()
+}
+fn _git_mtime(p: string) -> string {
+    let r = exec_with_status("cd " + _sh_quote(ANIMA_ROOT) +
+        " && git log -1 --format=%ct -- " + _sh_quote(p) + " 2>/dev/null")
+    let s = to_string(r[0]).trim()
+    if s == "" { return to_string(now()) }
+    return s
+}
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+fn _opt(av, k, dflt: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && (i + 1) < len(av) { return to_string(av[i + 1]) }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn main() -> int {
+    let av = _argv()
+    let tool_rel = _opt(av, "--tool", DEFAULT_TOOL)
+    let emit_rel = _opt(av, "--emit", DEFAULT_EMIT)
+    let tool_abs = ANIMA_ROOT + "/" + tool_rel
+    let emit_abs = ANIMA_ROOT + "/" + emit_rel
+
+    println("── reproducible_emit_check ──")
+    println("  tool=" + tool_abs)
+    println("  emit=" + emit_abs)
+
+    if !_file_exists(tool_abs) {
+        println("ERROR: tool not found: " + tool_abs)
+        return 2
+    }
+
+    let baseline_existed = _file_exists(emit_abs)
+    let baseline_tmp = "/tmp/_repro_emit_baseline.json"
+    if baseline_existed {
+        exec_with_status("cp " + _sh_quote(emit_abs) + " " + _sh_quote(baseline_tmp))
+    }
+
+    let sde = _git_mtime(emit_rel)
+    println("  SOURCE_DATE_EPOCH=" + sde)
+
+    // Run A
+    let cmd_a = "cd " + _sh_quote(ANIMA_ROOT) +
+        " && SOURCE_DATE_EPOCH=" + sde + " " + HEXA_BIN + " " + _sh_quote(tool_rel) +
+        " >/dev/null 2>&1"
+    let r_a = exec_with_status(cmd_a)
+    if r_a[1] != 0 {
+        println("ERROR: tool run A failed exit=" + to_string(r_a[1]))
+        return 2
+    }
+    let hash_a = _sha256_file(emit_abs)
+    let snap_a = "/tmp/_repro_emit_run_a.json"
+    exec_with_status("cp " + _sh_quote(emit_abs) + " " + _sh_quote(snap_a))
+
+    // Restore baseline so prev_hash chain is identical
+    if baseline_existed {
+        exec_with_status("cp " + _sh_quote(baseline_tmp) + " " + _sh_quote(emit_abs))
+    } else {
+        exec_with_status("rm -f " + _sh_quote(emit_abs))
+    }
+
+    // Run B
+    let cmd_b = "cd " + _sh_quote(ANIMA_ROOT) +
+        " && SOURCE_DATE_EPOCH=" + sde + " " + HEXA_BIN + " " + _sh_quote(tool_rel) +
+        " >/dev/null 2>&1"
+    let r_b = exec_with_status(cmd_b)
+    if r_b[1] != 0 {
+        println("ERROR: tool run B failed exit=" + to_string(r_b[1]))
+        return 2
+    }
+    let hash_b = _sha256_file(emit_abs)
+    let snap_b = "/tmp/_repro_emit_run_b.json"
+    exec_with_status("cp " + _sh_quote(emit_abs) + " " + _sh_quote(snap_b))
+
+    // Restore final baseline (no side effects)
+    if baseline_existed {
+        exec_with_status("cp " + _sh_quote(baseline_tmp) + " " + _sh_quote(emit_abs))
+    } else {
+        exec_with_status("rm -f " + _sh_quote(emit_abs))
+    }
+
+    println("  hash_a=" + hash_a)
+    println("  hash_b=" + hash_b)
+
+    if hash_a == hash_b && hash_a != "" {
+        println("VERDICT: PASS (byte-stable across SOURCE_DATE_EPOCH re-emit)")
+        return 0
+    }
+    println("VERDICT: FAIL (drift detected — see diff:)")
+    let diff_r = exec_with_status("diff -u " + _sh_quote(snap_a) + " " + _sh_quote(snap_b) + " | head -40")
+    println(to_string(diff_r[0]))
+    return 1
+}

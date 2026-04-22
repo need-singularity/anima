@@ -1,0 +1,301 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/inference_optimization_smoke.hexa — ROI batch F (F28-F35) smoke
+//
+//  PURPOSE
+//    Validate config/inference_serve_optimization.json schema and emit a
+//    per-knob status snapshot consumed by ROI audit. CPU-only, deterministic,
+//    no .py, no GPU, no LLM call. Verifies:
+//      • config file present and parseable
+//      • all 8 expected knobs (F28-F35) declared
+//      • each knob has the required fields:
+//          enabled (bool), requires_weights (bool), blocked_by_h100 (bool),
+//          expected_impact (string), prereq (array), integration_point (str),
+//          rollback (string), source_doc_row (string)
+//      • requires_weights==true ⇒ blocked_by_h100==true (consistency)
+//      • all enabled flags default false (do-not-trigger-h100 invariant)
+//
+//  OUTPUT
+//    state/inference_optimization_smoke_result.json — full smoke result JSON
+//
+//  EXIT CODES
+//    0 = PASS (all checks green; emits verdict=PASS)
+//    1 = FAIL (any check red)
+//    2 = INPUT_ERR (config missing / unreadable)
+//
+//  RAW STRICT
+//    raw#9  hexa-only
+//    raw#10 deterministic (only ts is utc seed_date constant)
+//    raw#11 snake_case
+//    raw#12 실측 only (no faked PASS — real schema probe)
+//    raw#15 no-hardcode (knob list comes from KNOB_IDS constant which mirrors
+//                        the SSOT config; any divergence FAILs the smoke)
+// ════════════════════════════════════════════════════════════════════════════
+
+let SCHEMA_RESULT  = "anima.inference_optimization_smoke_result.v1"
+let SEED_DATE      = "20260422"
+let CFG_REL        = "config/inference_serve_optimization.json"
+let OUT_REL        = "state/inference_optimization_smoke_result.json"
+let SOURCE_DOC     = "docs/h100_roi_improvements_20260422.md"
+
+// expected knob ids (mirrors the keys in config/inference_serve_optimization.json :: knobs)
+fn knob_ids() -> list {
+    let mut out = []
+    out = out.push("f28_kv_cache_reuse_across_personas")
+    out = out.push("f29_vllm_paged_attention")
+    out = out.push("f30_continuous_batching")
+    out = out.push("f31_speculative_decoding")
+    out = out.push("f32_api_prompt_cache")
+    out = out.push("f33_streaming_token_output")
+    out = out.push("f34_fp8_int8_quantization")
+    out = out.push("f35_dynamic_batch_scheduling")
+    return out
+}
+
+// ── helpers ────────────────────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return to_string(x)
+}
+
+// stage0 hexa has no exec/env — use relative paths; callers must run from repo root.
+fn fexists(p: string) -> bool {
+    // Attempt to read; if non-empty we consider it present. write_file failures
+    // for non-existing dirs surface directly. For schema probes we only need
+    // the config blob; read_file on a missing path returns "" in stage0.
+    let content = read_file(p)
+    let s = _str(content)
+    return s.len() > 0
+}
+
+fn read_safe(path: string) -> string {
+    return _str(read_file(path))
+}
+
+// Locate the start of the knob block "knob_id" : { ... } and return its
+// substring (between the matching braces). Returns "" if knob not declared.
+fn slice_knob_block(blob: string, knob_id: string) -> string {
+    let needle = "\"" + knob_id + "\""
+    let k = blob.index_of(needle)
+    if k < 0 { return "" }
+    // find first '{' after the colon following the key
+    let n = blob.len()
+    let mut i = k + needle.len()
+    while i < n && blob.substring(i, i + 1) != "{" { i = i + 1 }
+    if i >= n { return "" }
+    let start = i
+    let mut depth = 0
+    let mut j = i
+    while j < n {
+        let c = blob.substring(j, j + 1)
+        if c == "{" { depth = depth + 1 }
+        if c == "}" {
+            depth = depth - 1
+            if depth == 0 { return blob.substring(start, j + 1) }
+        }
+        j = j + 1
+    }
+    return ""
+}
+
+// Probe whether a "key" appears in the knob block (any value type).
+fn has_key(block: string, key: string) -> bool {
+    let needle = "\"" + key + "\""
+    return block.index_of(needle) >= 0
+}
+
+// Probe whether a "key" maps to "true" (literal). Bool only.
+fn key_is_true(block: string, key: string) -> bool {
+    let needle = "\"" + key + "\""
+    let k = block.index_of(needle)
+    if k < 0 { return false }
+    let n = block.len()
+    let mut i = k + needle.len()
+    while i < n && block.substring(i, i + 1) != ":" { i = i + 1 }
+    if i >= n { return false }
+    i = i + 1
+    // skip whitespace
+    while i < n {
+        let c = block.substring(i, i + 1)
+        if c != " " && c != "\t" && c != "\n" && c != "\r" { break }
+        i = i + 1
+    }
+    if i + 4 > n { return false }
+    return block.substring(i, i + 4) == "true"
+}
+
+fn key_is_false(block: string, key: string) -> bool {
+    let needle = "\"" + key + "\""
+    let k = block.index_of(needle)
+    if k < 0 { return false }
+    let n = block.len()
+    let mut i = k + needle.len()
+    while i < n && block.substring(i, i + 1) != ":" { i = i + 1 }
+    if i >= n { return false }
+    i = i + 1
+    while i < n {
+        let c = block.substring(i, i + 1)
+        if c != " " && c != "\t" && c != "\n" && c != "\r" { break }
+        i = i + 1
+    }
+    if i + 5 > n { return false }
+    return block.substring(i, i + 5) == "false"
+}
+
+// ── per-knob check ─────────────────────────────────────────────────────────
+// Returns [ok:bool, requires_weights:bool, blocked_by_h100:bool, enabled:bool,
+//          missing_fields:string]
+
+fn check_knob(blob: string, knob_id: string) -> list {
+    let block = slice_knob_block(blob, knob_id)
+    if block == "" {
+        return [false, false, false, false, "block_not_found"]
+    }
+    let required = ["id", "name", "enabled", "requires_weights", "blocked_by_h100", "params", "expected_impact", "prereq", "integration_point", "rollback", "source_doc_row"]
+    let mut missing = ""
+    let mut i = 0
+    while i < required.len() {
+        let k = _str(required[i])
+        if !has_key(block, k) {
+            if missing != "" { missing = missing + "," }
+            missing = missing + k
+        }
+        i = i + 1
+    }
+    let req_w = key_is_true(block, "requires_weights")
+    let blk = key_is_true(block, "blocked_by_h100")
+    let ena = key_is_true(block, "enabled")
+
+    // consistency: requires_weights ⇒ blocked_by_h100
+    let consistent = if req_w { blk } else { true }
+    // do-not-trigger invariant: enabled MUST be false at rest
+    let safe_default = !ena
+    let fields_ok = missing == ""
+    let ok = fields_ok && consistent && safe_default
+    if !consistent {
+        if missing != "" { missing = missing + "," }
+        missing = missing + "consistency:requires_weights_without_blocked_by_h100"
+    }
+    if !safe_default {
+        if missing != "" { missing = missing + "," }
+        missing = missing + "invariant:enabled_must_default_false"
+    }
+    return [ok, req_w, blk, ena, missing]
+}
+
+// ── emitter ────────────────────────────────────────────────────────────────
+
+fn bool_s(b: bool) -> string {
+    if b { return "true" }
+    return "false"
+}
+
+fn emit_result(out_path: string, cfg_path: string, cfg_present: bool, rows: list, applied_count: int, pending_count: int, blocked_count: int, total: int, all_ok: bool) {
+    let verdict = if all_ok { "PASS" } else { "FAIL" }
+    let mut body = "{\n"
+    body = body + "  \"schema\":             \"" + SCHEMA_RESULT + "\",\n"
+    body = body + "  \"source\":             \"tool/inference_optimization_smoke.hexa\",\n"
+    body = body + "  \"source_doc\":         \"" + SOURCE_DOC + "\",\n"
+    body = body + "  \"config_path\":        \"" + cfg_path + "\",\n"
+    body = body + "  \"config_present\":     " + bool_s(cfg_present) + ",\n"
+    body = body + "  \"seed_date\":          \"" + SEED_DATE + "\",\n"
+    body = body + "  \"knobs_total\":        " + to_string(total) + ",\n"
+    body = body + "  \"knobs_applied\":      " + to_string(applied_count) + ",\n"
+    body = body + "  \"knobs_pending\":      " + to_string(pending_count) + ",\n"
+    body = body + "  \"knobs_blocked_h100\": " + to_string(blocked_count) + ",\n"
+    body = body + "  \"rows\": [\n"
+    let n = rows.len()
+    let mut i = 0
+    while i < n {
+        let r = rows[i]
+        let kid = _str(r[0])
+        let ok = r[1]
+        let req_w = r[2]
+        let blk = r[3]
+        let ena = r[4]
+        let miss = _str(r[5])
+        let mut line = "    { \"knob_id\": \"" + kid + "\""
+        line = line + ", \"ok\": " + bool_s(ok)
+        line = line + ", \"enabled\": " + bool_s(ena)
+        line = line + ", \"requires_weights\": " + bool_s(req_w)
+        line = line + ", \"blocked_by_h100\": " + bool_s(blk)
+        line = line + ", \"missing_fields\": \"" + miss + "\" }"
+        body = body + line
+        if i < n - 1 { body = body + "," }
+        body = body + "\n"
+        i = i + 1
+    }
+    body = body + "  ],\n"
+    body = body + "  \"checks\": {\n"
+    body = body + "    \"all_knobs_present\":      " + bool_s(rows.len() == total) + ",\n"
+    body = body + "    \"all_schemas_complete\":   " + bool_s(all_ok) + ",\n"
+    body = body + "    \"safe_defaults_invariant\": " + bool_s(applied_count == 0) + ",\n"
+    body = body + "    \"do_not_trigger_h100\":    true\n"
+    body = body + "  },\n"
+    body = body + "  \"raw_strict\":         \"raw#9 raw#10 raw#11 raw#12 raw#15\",\n"
+    body = body + "  \"verdict\":            \"" + verdict + "\"\n"
+    body = body + "}\n"
+    write_file(out_path, body)
+}
+
+// ── main ───────────────────────────────────────────────────────────────────
+
+fn main() {
+    println("[inference_opt_smoke] ROI batch F (F28-F35) smoke BEGIN")
+    // stage0 hexa has no exec/env — use repo-relative paths. Caller must run
+    // from repo root (`hexa tool/inference_optimization_smoke.hexa`).
+    let cfg_path = CFG_REL
+    let out_path = OUT_REL
+
+    let ids = knob_ids()
+    let cfg_present = fexists(cfg_path)
+    if !cfg_present {
+        println("[inference_opt_smoke] FATAL config_missing path=" + cfg_path)
+        emit_result(out_path, cfg_path, false, [], 0, 0, 0, ids.len(), false)
+        exit(2)
+    }
+
+    let blob = read_safe(cfg_path)
+    let mut rows = []
+    let mut all_ok = true
+    let mut applied_count = 0
+    let mut pending_count = 0
+    let mut blocked_count = 0
+    let n = ids.len()
+    let mut i = 0
+    while i < n {
+        let kid = _str(ids[i])
+        let r = check_knob(blob, kid)
+        let ok = r[0]
+        let req_w = r[1]
+        let blk = r[2]
+        let ena = r[3]
+        let miss = _str(r[4])
+        rows = rows.push([kid, ok, req_w, blk, ena, miss])
+        if !ok { all_ok = false }
+        if ena { applied_count = applied_count + 1 } else {
+            if blk { blocked_count = blocked_count + 1 } else { pending_count = pending_count + 1 }
+        }
+        let s_ok = bool_s(ok)
+        let s_blk = bool_s(blk)
+        let tag = if ena { "APPLIED" } else { if blk { "BLOCKED_H100" } else { "PENDING" } }
+        println("[inference_opt_smoke] " + kid + " ok=" + s_ok + " status=" + tag + " miss=[" + miss + "]")
+        i = i + 1
+    }
+
+    emit_result(out_path, cfg_path, cfg_present, rows, applied_count, pending_count, blocked_count, ids.len(), all_ok)
+
+    let verdict = if all_ok { "PASS" } else { "FAIL" }
+    let mut summary = "[inference_opt_smoke] applied=" + to_string(applied_count)
+    summary = summary + " pending=" + to_string(pending_count)
+    summary = summary + " blocked_h100=" + to_string(blocked_count)
+    summary = summary + " total=" + to_string(ids.len())
+    println(summary)
+    println("[inference_opt_smoke] wrote " + out_path)
+    println("[inference_opt_smoke] verdict=" + verdict)
+    if all_ok { exit(0) }
+    exit(1)
+}
+
+main()

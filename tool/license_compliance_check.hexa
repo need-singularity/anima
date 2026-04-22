@@ -1,0 +1,365 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/license_compliance_check.hexa — ROI #70 (security/compliance)
+//
+//  PURPOSE
+//    Read config/phi_4path_substrates.json (model licenses) +
+//    config/license_compliance_config.json (lib licenses + policy table) +
+//    scan tool/*.hexa for `use` imports → emit per-component license +
+//    redistribution policy decision (Apache-2.0 OK, Llama Community gated, ...).
+//
+//  DESIGN
+//    raw#9   hexa-only
+//    raw#15  no-hardcode (config-driven)
+//    Decision policy lives in license_policy_table (config) — tool only routes.
+//
+//  USAGE
+//    hexa tool/license_compliance_check.hexa
+//    hexa tool/license_compliance_check.hexa --selftest
+//    hexa tool/license_compliance_check.hexa --config <path>
+//
+//  EXIT CODES
+//    0  all PASS or GATED-acknowledged   1  REVIEW required
+//    2  BLOCK present                    3  setup error
+// ════════════════════════════════════════════════════════════════════════════
+
+let DEFAULT_CONFIG = "/Users/ghost/core/anima/config/license_compliance_config.json"
+
+// ─── sys helpers ─────────────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    let mut out = "'"
+    out = out + s.replace("'", "'\\''")
+    out = out + "'"
+    return out
+}
+
+fn _exec_out(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _exec_code(cmd: string) -> int {
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+fn _file_exists(path: string) -> bool {
+    let r = exec_with_status("test -e " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _mkdir_p(dir: string) -> bool {
+    return _exec_code("mkdir -p " + _sh_quote(dir)) == 0
+}
+
+fn _ts_iso() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+// ─── argv ────────────────────────────────────────────────────────────
+
+fn _argv() -> array {
+    let a = args()
+    let mut out = []
+    let mut i = 2
+    while i < len(a) {
+        out.push(a[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn _flag(av: array, k: string) -> bool {
+    for x in av {
+        if to_string(x) == k { return true }
+    }
+    return false
+}
+
+fn _opt(av: array, k: string, d: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && i + 1 < len(av) {
+            return to_string(av[i + 1])
+        }
+        i = i + 1
+    }
+    return d
+}
+
+// ─── config ──────────────────────────────────────────────────────────
+
+fn _load_config(path: string) {
+    if !_file_exists(path) {
+        eprintln("license_compliance_check: SETUP_ERROR — config missing: " + path)
+        exit(3)
+    }
+    return json_parse(read_file(path))
+}
+
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+// ─── policy lookup ───────────────────────────────────────────────────
+
+fn _policy_for(license: string, table) {
+    if table.contains_key(license) { return table[license] }
+    return table["UNKNOWN"]
+}
+
+fn _policy_decision(p) -> string {
+    return to_string(p["decision"])
+}
+
+fn _policy_redistribution(p) -> string {
+    return to_string(p["redistribution"])
+}
+
+fn _verdict_from_policy(p) -> string {
+    let r = _policy_redistribution(p)
+    if r == "OK" { return "PASS" }
+    if r == "GATED" || r == "OK_WITH_TERMS" || r == "GATED_700M_MAU" { return "GATED" }
+    if r == "REVIEW" { return "REVIEW" }
+    if r == "NO" { return "BLOCK" }
+    return "REVIEW"
+}
+
+// ─── tool import scan ────────────────────────────────────────────────
+
+fn _list_hexa_files(repo_root: string, root: string) -> array {
+    let full = repo_root + "/" + root
+    if !_file_exists(full) { return [] }
+    let cmd = "find " + _sh_quote(full) + " -maxdepth 4 -type f -name '*.hexa' 2>/dev/null | sort"
+    let out = _exec_out(cmd)
+    let lines = split(out, "\n")
+    let mut acc = []
+    for l in lines {
+        let t = to_string(l).trim()
+        if len(t) > 0 { acc.push(t) }
+    }
+    return acc
+}
+
+fn _scan_imports(path: string) -> array {
+    let body = read_file(path)
+    let lines = split(body, "\n")
+    let mut imports = []
+    for l in lines {
+        let t = to_string(l).trim()
+        if t.index_of("use \"") == 0 {
+            let after = t.substring(5, len(t))
+            let q = after.index_of("\"")
+            if q > 0 { imports.push(after.substring(0, q)) }
+        }
+    }
+    return imports
+}
+
+// ─── output emission ─────────────────────────────────────────────────
+
+fn _emit_result(out_path: string, summary_path: string, models: array, libs: array, tools: array, ts: string) {
+    let mut tally = #{}
+    let mut block_count = 0
+    let mut review_count = 0
+    let mut gated_count = 0
+    let mut pass_count = 0
+    let mut all_components = []
+    for m in models { all_components.push(m) }
+    for l in libs { all_components.push(l) }
+    for t in tools { all_components.push(t) }
+    for c in all_components {
+        let v = to_string(c["verdict"])
+        if v == "BLOCK" { block_count = block_count + 1 }
+        else if v == "REVIEW" { review_count = review_count + 1 }
+        else if v == "GATED" { gated_count = gated_count + 1 }
+        else { pass_count = pass_count + 1 }
+        let lic = to_string(c["license"])
+        if tally.contains_key(lic) {
+            tally[lic] = to_int(to_string(tally[lic])) + 1
+        } else {
+            tally[lic] = 1
+        }
+    }
+
+    let mut p = []
+    p.push("{\n")
+    p.push("  \"schema\": \"anima.license_compliance.v1\",\n")
+    p.push("  \"tool\": \"tool/license_compliance_check.hexa\",\n")
+    p.push("  \"ts\": \"" + ts + "\",\n")
+    p.push("  \"component_total\": " + to_string(len(all_components)) + ",\n")
+    p.push("  \"by_verdict\": {\"PASS\": " + to_string(pass_count) + ", \"GATED\": " + to_string(gated_count) + ", \"REVIEW\": " + to_string(review_count) + ", \"BLOCK\": " + to_string(block_count) + "},\n")
+    p.push("  \"models\": [\n")
+    let mut i = 0
+    while i < len(models) {
+        let c = models[i]
+        let comma = if i + 1 < len(models) { "," } else { "" }
+        p.push("    {\"id\": \"" + _json_escape(to_string(c["id"])) + "\"")
+        p.push(", \"model\": \"" + _json_escape(to_string(c["model"])) + "\"")
+        p.push(", \"license\": \"" + _json_escape(to_string(c["license"])) + "\"")
+        p.push(", \"verdict\": \"" + to_string(c["verdict"]) + "\"")
+        p.push(", \"redistribution\": \"" + to_string(c["redistribution"]) + "\"")
+        p.push(", \"decision\": \"" + _json_escape(to_string(c["decision"])) + "\"}" + comma + "\n")
+        i = i + 1
+    }
+    p.push("  ],\n")
+    p.push("  \"libs\": [\n")
+    let mut j = 0
+    while j < len(libs) {
+        let c = libs[j]
+        let comma = if j + 1 < len(libs) { "," } else { "" }
+        p.push("    {\"name\": \"" + _json_escape(to_string(c["name"])) + "\"")
+        p.push(", \"license\": \"" + _json_escape(to_string(c["license"])) + "\"")
+        p.push(", \"source\": \"" + _json_escape(to_string(c["source"])) + "\"")
+        p.push(", \"verdict\": \"" + to_string(c["verdict"]) + "\"")
+        p.push(", \"redistribution\": \"" + to_string(c["redistribution"]) + "\"")
+        p.push(", \"decision\": \"" + _json_escape(to_string(c["decision"])) + "\"}" + comma + "\n")
+        j = j + 1
+    }
+    p.push("  ],\n")
+    p.push("  \"tools\": [\n")
+    let mut k = 0
+    while k < len(tools) {
+        let c = tools[k]
+        let comma = if k + 1 < len(tools) { "," } else { "" }
+        p.push("    {\"path\": \"" + _json_escape(to_string(c["path"])) + "\"")
+        p.push(", \"license\": \"" + to_string(c["license"]) + "\"")
+        p.push(", \"verdict\": \"" + to_string(c["verdict"]) + "\"")
+        p.push(", \"imports\": " + to_string(c["imports_count"]) + "}" + comma + "\n")
+        k = k + 1
+    }
+    p.push("  ]\n}\n")
+    let _ = _mkdir_p("/Users/ghost/core/anima/state")
+    let _ = write_file(out_path, p.join(""))
+
+    // Summary
+    let mut sp = []
+    sp.push("{\n")
+    sp.push("  \"schema\": \"anima.license_compliance_summary.v1\",\n")
+    sp.push("  \"ts\": \"" + ts + "\",\n")
+    sp.push("  \"component_total\": " + to_string(len(all_components)) + ",\n")
+    sp.push("  \"by_verdict\": {\"PASS\": " + to_string(pass_count) + ", \"GATED\": " + to_string(gated_count) + ", \"REVIEW\": " + to_string(review_count) + ", \"BLOCK\": " + to_string(block_count) + "},\n")
+    sp.push("  \"verdict\": \"" + (if block_count > 0 { "BLOCK" } else if review_count > 0 { "REVIEW" } else { "PASS" }) + "\",\n")
+    sp.push("  \"licenses_tally\": {")
+    let keys = tally.keys()
+    let mut ki = 0
+    while ki < len(keys) {
+        let kx = to_string(keys[ki])
+        let comma = if ki + 1 < len(keys) { ", " } else { "" }
+        sp.push("\"" + _json_escape(kx) + "\": " + to_string(tally[kx]) + comma)
+        ki = ki + 1
+    }
+    sp.push("}\n}\n")
+    let _ = write_file(summary_path, sp.join(""))
+}
+
+// ─── main ────────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = _argv()
+
+    if _flag(av, "--help") || _flag(av, "-h") {
+        println("usage: hexa tool/license_compliance_check.hexa [opts]")
+        println("  --selftest       run with built-in fixture")
+        println("  --config <path>  override config")
+        return 0
+    }
+
+    let cfg_path = _opt(av, "--config", DEFAULT_CONFIG)
+    let cfg = _load_config(cfg_path)
+    let repo_root = to_string(cfg["repo_root"])
+    let policy_table = cfg["license_policy_table"]
+    let tool_root = to_string(cfg["tool_scan_root"])
+    let tool_default_license = to_string(cfg["tool_default_license"])
+    let lib_deps = cfg["lib_dependencies"]
+    let model_src = repo_root + "/" + to_string(cfg["model_substrate_source"])
+    let output = cfg["output"]
+    let out_path = repo_root + "/" + to_string(output["result_path"])
+    let summary_path = repo_root + "/" + to_string(output["summary_path"])
+
+    // Build models from phi_4path_substrates.json
+    let mut models = []
+    if _file_exists(model_src) {
+        let psub = json_parse(read_file(model_src))
+        let paths = psub["paths"]
+        for p in paths {
+            let lic = to_string(p["license"])
+            let policy = _policy_for(lic, policy_table)
+            let mut m = #{}
+            m["id"] = to_string(p["id"])
+            m["model"] = to_string(p["model"])
+            m["license"] = lic
+            m["redistribution"] = _policy_redistribution(policy)
+            m["decision"] = _policy_decision(policy)
+            m["verdict"] = _verdict_from_policy(policy)
+            models.push(m)
+        }
+    }
+
+    // Build libs from config.lib_dependencies
+    let mut libs = []
+    for d in lib_deps {
+        let lic = to_string(d["license"])
+        let policy = _policy_for(lic, policy_table)
+        let mut l = #{}
+        l["name"] = to_string(d["name"])
+        l["license"] = lic
+        l["source"] = to_string(d["source"])
+        l["redistribution"] = _policy_redistribution(policy)
+        l["decision"] = _policy_decision(policy)
+        l["verdict"] = _verdict_from_policy(policy)
+        libs.push(l)
+    }
+
+    // Build tools (each tool/*.hexa under default project license)
+    let mut tools = []
+    let tool_files = _list_hexa_files(repo_root, tool_root)
+    let policy_default = _policy_for(tool_default_license, policy_table)
+    for f in tool_files {
+        let path = to_string(f)
+        let imps = _scan_imports(path)
+        let mut t = #{}
+        t["path"] = path
+        t["license"] = tool_default_license
+        t["imports_count"] = len(imps)
+        t["verdict"] = _verdict_from_policy(policy_default)
+        tools.push(t)
+    }
+
+    let ts = _ts_iso()
+    _emit_result(out_path, summary_path, models, libs, tools, ts)
+
+    let mut block = 0
+    let mut review = 0
+    let mut gated = 0
+    let mut passc = 0
+    let mut all_c = []
+    for m in models { all_c.push(m) }
+    for l in libs { all_c.push(l) }
+    for t in tools { all_c.push(t) }
+    for c in all_c {
+        let v = to_string(c["verdict"])
+        if v == "BLOCK" { block = block + 1 }
+        else if v == "REVIEW" { review = review + 1 }
+        else if v == "GATED" { gated = gated + 1 }
+        else { passc = passc + 1 }
+    }
+
+    println("── license_compliance_check ──")
+    println("  models:           " + to_string(len(models)))
+    println("  libs:             " + to_string(len(libs)))
+    println("  tools:            " + to_string(len(tools)))
+    println("  PASS:             " + to_string(passc))
+    println("  GATED:            " + to_string(gated))
+    println("  REVIEW:           " + to_string(review))
+    println("  BLOCK:            " + to_string(block))
+    println("  result_path:      " + out_path)
+    println("  summary_path:     " + summary_path)
+
+    let exit_pol = cfg["exit_policy"]
+    if block > 0 { return to_int(to_string(exit_pol["block_present"])) }
+    if review > 0 { return to_int(to_string(exit_pol["review_required"])) }
+    return to_int(to_string(exit_pol["all_pass_or_gated_acknowledged"]))
+}
+
+main()

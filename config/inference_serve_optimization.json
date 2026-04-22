@@ -1,0 +1,219 @@
+{
+  "schema": "anima.inference_serve_optimization.v1",
+  "generated": "2026-04-22",
+  "source_doc": "docs/h100_roi_improvements_20260422.md",
+  "scope": "ROI batch F (F28-F35) — inference / serving optimization knobs (post-CP1, activate when H100 weights land)",
+  "owner_tool": "tool/serve_alm_persona.hexa",
+  "spec_doc": "docs/inference_optimization_spec_20260422.md",
+  "audit_state": "state/inference_optimization_audit.json",
+  "smoke_tool": "tool/inference_optimization_smoke.hexa",
+  "smoke_state": "state/inference_optimization_smoke_result.json",
+  "constraints": [
+    "DO NOT modify .roadmap (uchg)",
+    "DO NOT trigger H100 launch",
+    "NO .py files in repo (raw#9 — pod-side .py STAGED_FOR_POD only)",
+    "Defaults preserve current serve_alm_persona behaviour (enabled=false everywhere)",
+    "Items requiring weights are marked requires_weights=true and blocked-by-H100 until cascade #9 lands base_model + persona_lora"
+  ],
+  "knobs": {
+    "f28_kv_cache_reuse_across_personas": {
+      "id": "F28",
+      "name": "KV cache reuse across personas (same base model)",
+      "enabled": false,
+      "requires_weights": true,
+      "blocked_by_h100": true,
+      "params": {
+        "share_scope": "base_model_layers_0_to_persona_layer_idx_minus_1",
+        "persona_layer_idx": 20,
+        "max_cached_prompts": 64,
+        "max_prefix_tokens": 2048,
+        "eviction_policy": "lru",
+        "hash_fn": "sha256_of_token_ids"
+      },
+      "expected_impact": "5-10x throughput on multi-persona workloads (prefix shared across dest1/default/friend/scholar/engineer/sorceress; only persona-conditioning suffix recomputed)",
+      "prereq": [
+        "base_model loaded at /workspace/base_model",
+        "persona_lora swapped only at layers >= persona_layer_idx (=20)",
+        "persona dispatch routes to layer-aware backend"
+      ],
+      "integration_point": "tool/serve_alm_persona.hexa :: backend_invoke (mode=gpu) — prefix-cache layer attaches BEFORE persona LoRA forward",
+      "rollback": "set knobs.f28_kv_cache_reuse_across_personas.enabled=false; restart serve",
+      "source_doc_row": "F28"
+    },
+    "f29_vllm_paged_attention": {
+      "id": "F29",
+      "name": "vLLM PagedAttention integration",
+      "enabled": false,
+      "requires_weights": true,
+      "blocked_by_h100": true,
+      "params": {
+        "block_size": 16,
+        "gpu_memory_utilization": 0.90,
+        "max_num_seqs": 256,
+        "max_num_batched_tokens": 8192,
+        "swap_space_gb": 4,
+        "tensor_parallel_size": 1
+      },
+      "expected_impact": "2-4x throughput vs reference HF attention; memory fragmentation -90%",
+      "prereq": [
+        "vLLM>=0.6 installed in pod environment (STAGED_FOR_POD; raw#9)",
+        "base_model in HF format at /workspace/base_model",
+        "LoRA dynamic adapter API supported by vLLM"
+      ],
+      "integration_point": "tool/serve_alm_persona.hexa :: backend_invoke (mode=gpu) — replace placeholder forward with vLLM AsyncLLMEngine.generate(...)",
+      "rollback": "set knobs.f29_vllm_paged_attention.enabled=false; backend reverts to HF transformers reference path",
+      "source_doc_row": "F29"
+    },
+    "f30_continuous_batching": {
+      "id": "F30",
+      "name": "Continuous batching (vs static batching)",
+      "enabled": false,
+      "requires_weights": true,
+      "blocked_by_h100": true,
+      "params": {
+        "scheduler": "iteration_level",
+        "max_batch_size": 32,
+        "max_waiting_tokens": 256,
+        "preempt_mode": "swap",
+        "watermark": 0.01
+      },
+      "expected_impact": "2-3x throughput under variable-load (mixed prompt-lengths); P99 latency stable vs static",
+      "prereq": [
+        "F29 vLLM enabled (continuous batching is a vLLM scheduler config)",
+        "AsyncLLMEngine connected (not the synchronous LLM class)"
+      ],
+      "integration_point": "tool/serve_alm_persona.hexa :: backend_invoke — engine_args.scheduler_config in vLLM init",
+      "rollback": "scheduler=static (single-batch-per-iter); equivalent to F30 disabled",
+      "source_doc_row": "F30"
+    },
+    "f31_speculative_decoding": {
+      "id": "F31",
+      "name": "Speculative decoding (draft 0.5B → target 8B)",
+      "enabled": false,
+      "requires_weights": true,
+      "blocked_by_h100": true,
+      "params": {
+        "draft_model": "Qwen3-0.5B",
+        "target_model": "Qwen3-8B",
+        "draft_model_path": "/workspace/draft_model_qwen3_0_5b",
+        "num_speculative_tokens": 5,
+        "acceptance_method": "rejection_sampling",
+        "expected_acceptance_rate": 0.60
+      },
+      "expected_impact": "2x latency reduction at identical output distribution (output mathematically equivalent)",
+      "prereq": [
+        "Qwen3-0.5B weights pre-cached at /workspace/draft_model_qwen3_0_5b (waits on tool/h100_weight_precache.bash --apply for the draft)",
+        "Qwen3-8B target loaded at /workspace/base_model (cascade #9)",
+        "draft and target share the same tokenizer (Qwen3 family — verified)"
+      ],
+      "integration_point": "tool/serve_alm_persona.hexa :: backend_invoke (mode=gpu) — vLLM SpeculativeConfig(draft_model=..., num_speculative_tokens=5)",
+      "rollback": "set knobs.f31_speculative_decoding.enabled=false; engine falls back to standard auto-regressive decode",
+      "source_doc_row": "F31"
+    },
+    "f32_api_prompt_cache": {
+      "id": "F32",
+      "name": "API layer prompt cache (response memoization)",
+      "enabled": false,
+      "requires_weights": false,
+      "blocked_by_h100": false,
+      "params": {
+        "cache_backend": "lru_in_memory",
+        "max_entries": 1024,
+        "max_entry_bytes": 65536,
+        "ttl_seconds": 3600,
+        "hash_fn": "sha256",
+        "key_includes": ["prompt", "persona_id", "max_tokens"],
+        "bypass_on_temperature_gt": 0.0
+      },
+      "expected_impact": "Repeat-prompt latency ≈0ms (cache hit); estimated 20-40% hit rate on benchmark/probe traffic",
+      "prereq": [
+        "deterministic decode (temperature=0) for cache correctness — bypass_on_temperature_gt enforces this"
+      ],
+      "integration_point": "tool/serve_alm_persona.hexa :: handler_persona — check cache before backend_invoke; populate after PASS verdict",
+      "rollback": "set knobs.f32_api_prompt_cache.enabled=false; handler skips cache check entirely",
+      "source_doc_row": "F32"
+    },
+    "f33_streaming_token_output": {
+      "id": "F33",
+      "name": "Streaming token output (TTFT < 200ms)",
+      "enabled": false,
+      "requires_weights": true,
+      "blocked_by_h100": true,
+      "params": {
+        "transport": "sse",
+        "endpoint": "/persona/stream",
+        "method": "POST",
+        "ttft_target_ms": 200,
+        "chunk_size_tokens": 1,
+        "keepalive_interval_ms": 15000,
+        "abort_on_client_disconnect": true
+      },
+      "expected_impact": "Perceived latency ↓ 5-10x for long generations; TTFT < 200ms target (vs full-response wait of 2-5s)",
+      "prereq": [
+        "F29 vLLM (or any incremental-decode backend)",
+        "HTTP server supports chunked transfer / SSE (current bash-nc loop does NOT — STAGED_FOR_POD fastapi/uvicorn does)"
+      ],
+      "integration_point": "tool/serve_alm_persona.hexa — new endpoint /persona/stream alongside /persona; gated identically (cert_gate + an11_a)",
+      "rollback": "set knobs.f33_streaming_token_output.enabled=false; clients must use /persona (full-response)",
+      "source_doc_row": "F33"
+    },
+    "f34_fp8_int8_quantization": {
+      "id": "F34",
+      "name": "fp8 / int8 quantization at serve time",
+      "enabled": false,
+      "requires_weights": true,
+      "blocked_by_h100": true,
+      "params": {
+        "format": "fp8_e4m3",
+        "format_alternatives": ["fp8_e4m3", "fp8_e5m2", "int8_w8a8", "int8_w8a16"],
+        "scope": "weights_only",
+        "calibration_dataset": "shared/calibration/dest1_calib_512.jsonl",
+        "calibration_samples": 512,
+        "an11_validation_required": true,
+        "max_acceptable_an11_a_delta": 0.02
+      },
+      "expected_impact": "30-50% inference speedup; VRAM ↓ 50%; quality preserved within AN11(a) verified range",
+      "prereq": [
+        "AN11(a) baseline established for FP16 model",
+        "calibration dataset available (shared/calibration/...)",
+        "vLLM or TensorRT-LLM quantization kernel support"
+      ],
+      "integration_point": "tool/serve_alm_persona.hexa :: backend_invoke (mode=gpu) — engine init reads quantization=knobs.f34.format",
+      "rollback": "set knobs.f34_fp8_int8_quantization.enabled=false; engine loads FP16 weights",
+      "source_doc_row": "F34"
+    },
+    "f35_dynamic_batch_scheduling": {
+      "id": "F35",
+      "name": "Dynamic batch scheduling (latency SLO aware)",
+      "enabled": false,
+      "requires_weights": true,
+      "blocked_by_h100": true,
+      "params": {
+        "slo_p50_ms": 500,
+        "slo_p95_ms": 1500,
+        "slo_p99_ms": 3000,
+        "priority_classes": ["interactive", "batch", "background"],
+        "interactive_max_batch": 4,
+        "batch_max_batch": 32,
+        "background_max_batch": 64,
+        "queue_depth_warn": 100,
+        "queue_depth_drop": 500
+      },
+      "expected_impact": "Fairness across priority classes; throughput ↑ 1.5-2x at fixed P95 SLO; degraded gracefully (drop background first) under burst",
+      "prereq": [
+        "F29 vLLM (or compatible engine) with priority-aware scheduler",
+        "F30 continuous batching"
+      ],
+      "integration_point": "tool/serve_alm_persona.hexa :: handler_persona — assign priority_class from request header X-Anima-Priority; engine scheduler respects class quota",
+      "rollback": "set knobs.f35_dynamic_batch_scheduling.enabled=false; engine uses FIFO scheduler",
+      "source_doc_row": "F35"
+    }
+  },
+  "raw_compliance": [
+    "raw#9  hexa-only (config JSON; no .py)",
+    "raw#10 deterministic (no timestamps inside knob params)",
+    "raw#11 snake_case (knob ids snake_case)",
+    "raw#12 실측 only (requires_weights flag surfaces blocked-by-H100 honestly)",
+    "raw#15 no-hardcode (params live here; tool reads from this SSOT)"
+  ]
+}

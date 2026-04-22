@@ -1,0 +1,207 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/schema_field_ci.hexa — ROI H43: schema versioning CI gate
+//
+//  PURPOSE
+//    Every state/*.json SSOT MUST carry a top-level `schema` (or
+//    `schema_version`) field for forward-compatibility. This tool scans
+//    state/*.json (non-recursive, JSON only — skips .jsonl, dotfiles, and
+//    sub-directories) and lists any file missing the field.
+//
+//  EXIT
+//    0 — every JSON has a schema field
+//    1 — at least one missing (CI gate trips); list emitted to stderr & SSOT
+//    2 — internal error (state dir unreadable)
+//
+//  OUTPUT
+//    state/schema_field_ci_last.json
+//      {
+//        "schema":  "anima.schema_field_ci.v1",
+//        "ts":      "<iso>",
+//        "scanned": <int>,
+//        "missing": [ {"file": "...", "reason": "no_field|unparseable"} ],
+//        "pass":    bool
+//      }
+//
+//  EXEMPTIONS
+//    - Files matching the explicit allow-list below (legacy / external feeds).
+//    - .jsonl files (line-delimited; per-line schema is the next ROI).
+//
+//  USAGE
+//    hexa tool/schema_field_ci.hexa
+//    hexa tool/schema_field_ci.hexa --selftest
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT = "/Users/ghost/core/anima"
+let STATE_DIR  = "/Users/ghost/core/anima/state"
+let OUT_PATH   = "/Users/ghost/core/anima/state/schema_field_ci_last.json"
+
+// Allow-list: files that pre-date the schema convention. New entries here
+// require a roadmap justification — keep this short.
+let ALLOW_LIST = []
+
+fn _shq(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+fn _file_exists(p: string) -> bool {
+    return exec_with_status("test -e " + _shq(p))[1] == 0
+}
+fn _ts_iso() -> string {
+    return to_string(exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")[0]).trim()
+}
+fn _json_esc(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+fn _short_path(p: string) -> string {
+    let root = ANIMA_ROOT + "/"
+    if len(p) > len(root) && p.substring(0, len(root)) == root {
+        return p.substring(len(root), len(p))
+    }
+    return p
+}
+
+fn _is_allowed(short: string) -> bool {
+    for a in ALLOW_LIST {
+        if to_string(a) == short { return true }
+    }
+    return false
+}
+
+// Return list of state/*.json absolute paths (non-recursive, .json only).
+fn _list_state_json() -> array {
+    let r = exec_with_status("ls -1 " + _shq(STATE_DIR) + "/*.json 2>/dev/null")
+    let mut out = []
+    if r[1] != 0 { return out }
+    let lines = split(to_string(r[0]), "\n")
+    for ln in lines {
+        let t = ln.trim()
+        if len(t) == 0 { continue }
+        // exclude .jsonl just in case (ls glob already does, but defensive)
+        if len(t) >= 6 && t.substring(len(t) - 6, len(t)) == ".jsonl" { continue }
+        out.push(t)
+    }
+    return out
+}
+
+// Probe `schema` (or fallback `schema_version`) in top-level JSON object.
+//
+// Returns: "ok" | "no_field" | "unparseable"
+fn _probe_schema(path: string) -> string {
+    let raw = read_file(path)
+    let s = to_string(raw).trim()
+    if len(s) == 0 { return "unparseable" }
+    // Heuristic: if it doesn't start with `{` it's not a top-level object.
+    if s.substring(0, 1) != "{" { return "unparseable" }
+    let obj = json_parse(s)
+    if obj.contains_key("schema") { return "ok" }
+    if obj.contains_key("schema_version") { return "ok" }
+    return "no_field"
+}
+
+// ─── audit driver ──────────────────────────────────────────────────────────
+
+fn _run_audit() -> array {
+    let files = _list_state_json()
+    let mut missing = []
+    let mut scanned = 0
+    for fp in files {
+        let short = _short_path(fp)
+        if _is_allowed(short) { continue }
+        scanned = scanned + 1
+        let v = _probe_schema(fp)
+        if v != "ok" {
+            missing.push([short, v])
+        }
+    }
+    return [scanned, missing]
+}
+
+fn _write_out(scanned: int, missing: array, pass: bool) {
+    let mut j = "{\n"
+    j = j + "  \"schema\": \"anima.schema_field_ci.v1\",\n"
+    j = j + "  \"ts\": \"" + _ts_iso() + "\",\n"
+    j = j + "  \"scanned\": " + to_string(scanned) + ",\n"
+    j = j + "  \"missing\": ["
+    let mut i = 0
+    while i < len(missing) {
+        if i > 0 { j = j + "," }
+        j = j + "\n    {\"file\": \"" + _json_esc(missing[i][0]) + "\", \"reason\": \"" + _json_esc(missing[i][1]) + "\"}"
+        i = i + 1
+    }
+    if len(missing) > 0 { j = j + "\n  " }
+    j = j + "],\n"
+    j = j + "  \"pass\": " + (if pass { "true" } else { "false" }) + "\n"
+    j = j + "}\n"
+    let tmp = OUT_PATH + ".tmp"
+    write_file(tmp, j)
+    exec_with_status("mv -f " + _shq(tmp) + " " + _shq(OUT_PATH))
+}
+
+// ─── selftest ──────────────────────────────────────────────────────────────
+
+fn _arg_present(av: array, k: string) -> bool {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+let _argv = args()
+if _arg_present(_argv, "--selftest") {
+    println("── schema_field_ci selftest ──")
+    // S1 — synthetic with schema field → ok
+    let tmp_ok = "/tmp/_schema_ci_selftest_ok.json"
+    write_file(tmp_ok, "{\"schema\": \"anima.test.v1\", \"x\": 1}\n")
+    let v_ok = _probe_schema(tmp_ok)
+    let s1 = (v_ok == "ok")
+    println("S1 schema field present → " + v_ok + " " + (if s1 { "PASS" } else { "FAIL" }))
+    // S2 — synthetic without schema → no_field
+    let tmp_no = "/tmp/_schema_ci_selftest_no.json"
+    write_file(tmp_no, "{\"x\": 1}\n")
+    let v_no = _probe_schema(tmp_no)
+    let s2 = (v_no == "no_field")
+    println("S2 no schema field → " + v_no + " " + (if s2 { "PASS" } else { "FAIL" }))
+    // S3 — schema_version fallback also accepted
+    let tmp_alt = "/tmp/_schema_ci_selftest_alt.json"
+    write_file(tmp_alt, "{\"schema_version\": \"1\"}\n")
+    let v_alt = _probe_schema(tmp_alt)
+    let s3 = (v_alt == "ok")
+    println("S3 schema_version fallback → " + v_alt + " " + (if s3 { "PASS" } else { "FAIL" }))
+    exec_with_status("rm -f " + _shq(tmp_ok) + " " + _shq(tmp_no) + " " + _shq(tmp_alt))
+    if s1 && s2 && s3 {
+        println("── selftest 3/3 PASS ──")
+        exit(0)
+    }
+    println("── selftest FAIL ──")
+    exit(1)
+}
+
+// ─── main ──────────────────────────────────────────────────────────────────
+
+println("── schema_field_ci (ROI H43) ──")
+if !_file_exists(STATE_DIR) {
+    eprintln("schema_field_ci: state dir not found at " + STATE_DIR)
+    exit(2)
+}
+let res = _run_audit()
+let scanned = res[0]
+let missing = res[1]
+let pass = (len(missing) == 0)
+_write_out(scanned, missing, pass)
+println("scanned : " + to_string(scanned))
+println("missing : " + to_string(len(missing)))
+println("output  : " + OUT_PATH)
+if pass {
+    println("PASS")
+    exit(0)
+}
+println("FAIL — " + to_string(len(missing)) + " state/*.json missing schema field")
+for m in missing {
+    eprintln("  MISSING (" + m[1] + "): " + m[0])
+}
+exit(1)

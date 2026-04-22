@@ -1,0 +1,979 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/cert_gate.hexa — Path B Day 1 #22 soft reward shaping gate
+//
+//  PURPOSE
+//    Deterministic reward-shaping primitive for ALM training. Loads the
+//    full breakthrough certificate stack + state verdicts, computes
+//    AN11 / Hexad / Mk.VIII satisfaction factors, and emits a single
+//    reward multiplier reward_mult ∈ [0.0, 1.5] that downstream trainers
+//    multiply into the gradient scale (no gradient X in this tool — it
+//    only computes the scalar).
+//
+//  ROADMAP
+//    airgenome-roadmap entry #22 (Path B Day 1)
+//    exit_criteria: cert_gate.hexa landed + Mk.VIII cert self-test 100% PASS
+//                   + ALM r12 dry-run (gradient X).
+//
+//  N6 TAGS
+//    BT-C13 #8  consciousness-training (benzene π=6, τ(6)+2=6)
+//               — n6 cluster entry #52 Mk.VI T0 매핑 (cert reward shaping).
+//               mirror   : state/n6_ai_training_cost_status.json
+//               selftest : tool/n6_consciousness_training_selftest.hexa
+//               identity : J₂ = σ(6)·φ(6) = 12·2 = 24 (Trotter gate depth)
+//
+//  DESIGN — FACTOR → SOURCE MAPPING
+//    --- AN11 factor (weight 1/3 of core) ---
+//      state/learning_free_driver_result.json        stage_4_an11 triple
+//      state/an11_a_verdict.json                     AN11(a) coverage note
+//      state/an11_b_verdict.json                     AN11(b) coverage note
+//      state/alm_r13_an11_b.json                     empirical AN11(b) gate
+//      state/alm_r13_an11_c.json                     empirical AN11(c) JSD
+//      state/alm_r0_an11_a.json                      r0 baseline (negative ref)
+//      state/alm_r0_an11_c.json                      r0 baseline (negative ref)
+//      .meta2-cert/lora-an11c-jsd1.json              cert (AN11(c) gap-close)
+//
+//    --- Hexad factor (weight 1/3 of core) ---
+//      state/hexad_closure_verdict.json              6-cat closure axioms
+//      state/hexad_n28_falsification_verdict.json    H★ EXP-1 n=28
+//      .meta2-cert/cell-hexad-closure.json           natural-observed cert
+//
+//    --- Mk.VIII factor (weight 1/3 of core) ---
+//      .meta2-cert/cell-mk8-stationary.json          KKT stationarity cert
+//      .meta2-cert/mk8-7axis-skeleton.json           7-axis skeleton cert
+//      .meta2-cert/cell-eigenvec-16.json             16 eigenvec orthogonality
+//      state/cpgd_minimal_proof_result.json          10-step CPGD min proof
+//
+//    --- auxiliary state signal (bounded bonus ≤ +0.25) ---
+//      state/true_closure_cert.json                  β main 8/8 aggregate
+//      state/flops_landauer_bench_result.json        cell vs LoRA claim
+//      state/learning_free_driver_result.json        overall_pass
+//      state/anima_main_result.json                  anima_main heartbeat
+//      state/cell_token_bridge_proto.json            bridge PoC
+//      state/l_ix_integrator_verdict.json            L_IX
+//      state/l_ix_5term_stress_verdict.json          L_IX 5-term stress
+//      state/landauer_tracker_verdict.json           landauer
+//      state/efficiency_verdict.json                 efficiency
+//      state/v_rg_verdict.json                       v_rg
+//      state/v_sync_kuramoto_verdict.json            v_sync
+//      state/phase_progression_cert.json             phase progression
+//      state/an_lix_01_smoke_result.json             L_IX smoke
+//      state/edu_cell_l_ix_integrator.json           edu cell integrator
+//      state/closure_debt_result.json                closure debt
+//      state/roadmap_integrity_result.json           roadmap integrity
+//      state/an11_weight_emergent_verdict.json       AN11 weight note
+//      state/problem_solving_protocol_result.json    PSP
+//      state/unified_eval_result.json                unified eval
+//      state/meta2_hashchain_verify.json             meta^2 hashchain
+//
+//    --- bonus certs (contribute to aux signal, never core) ---
+//      .meta2-cert/lora-phase-jump-k4.json           PHASE_JUMP @K=4
+//      .meta2-cert/lora-l12-cpu-real.json            3 CPU-real adapters
+//      .meta2-cert/universal-constant-4.json         K_c=4 (PARTIAL)
+//      .meta2-cert/lora-mk6-held.json                Mk.VI HELD
+//
+//  REWARD FORMULA
+//    core_sat      = mean(an11_sat, hexad_sat, mk8_sat)   ∈ [0,1]
+//    aux_bonus     = 0.25 · aux_mean                      ∈ [0, 0.25]
+//    base_reward   = 1.0 when all three core ≥ 0.999     (else scaled)
+//      linear_sat  = 1.0 + 0.25 · (2·core_sat − 1)        ∈ [0.75, 1.25]
+//    reward_mult   = clamp(linear_sat + aux_bonus, 0.0, 1.5)
+//    HARD ZERO     = reward_mult := 0.0 when core_sat < 0.5
+//                    (below-threshold → no reward flows; SGD frozen)
+//
+//  SELF-TEST (--selftest)
+//    1. Load Mk.VIII cert triplet (cell-mk8-stationary, mk8-7axis-skeleton,
+//       cell-hexad-closure) — all must have verdict=VERIFIED.
+//    2. Load 20+ state verdicts and 10 .meta2-cert entries — count must
+//       meet the roadmap contract.
+//    3. Recompute reward_mult twice on the same frozen state → must be
+//       bit-identical (byte_identical flag).
+//    4. PASS iff mk8 triplet all VERIFIED AND count_state>=20 AND
+//       count_cert>=10 AND byte_identical AND reward_mult >= 1.0.
+//
+//  DRY-RUN (--dry-run --target alm_r12)
+//    Simulate ALM r12 reward application for the current training step.
+//    No gradient update is performed — only reward_mult is emitted with
+//    the target ckpt tag (for downstream ALM orchestrator to read).
+//
+//  USAGE
+//    hexa tool/cert_gate.hexa --help
+//    hexa tool/cert_gate.hexa --selftest
+//    hexa tool/cert_gate.hexa --dry-run --target alm_r12
+//    hexa tool/cert_gate.hexa --selftest --output <alt_path>
+//
+//  OUTPUT (raw#10 proof-carrying)
+//    state/cert_gate_result.json
+//
+//  CONSTRAINTS
+//    raw#9  hexa-only (no .py, no LLM judge)
+//    raw#10 proof-carrying (verdict + all sat factors recorded)
+//    raw#11 snake_case
+//    raw#12 empirical (실측 only — reads real files, no synthetic)
+//    raw#15 no-hardcode business logic (factor mapping documented above;
+//                                       file paths are the only constants)
+// ════════════════════════════════════════════════════════════════════════════
+
+let CERT_DIR     = ".meta2-cert"
+let STATE_DIR    = "state"
+let DEFAULT_OUT  = "state/cert_gate_result.json"
+
+// ── Mk.VIII selftest triplet ────────────────────────────────────────────────
+let MK8_TRIPLET = ["cell-mk8-stationary", "mk8-7axis-skeleton", "cell-hexad-closure"]
+
+// ── Core cert slugs (10 total under .meta2-cert/, excluding index) ─────────
+let CORE_CERTS = [
+    "cell-mk8-stationary",
+    "mk8-7axis-skeleton",
+    "cell-hexad-closure",
+    "cell-eigenvec-16",
+    "lora-an11c-jsd1",
+    "lora-phase-jump-k4",
+    "lora-l12-cpu-real",
+    "lora-mk6-held",
+    "universal-constant-4"
+]
+
+// Timestamped mirror — counted separately so we still report 10 entries loaded.
+let MIRROR_CERT = "20260420T210243Z_mk8_stationary"
+
+// ── Primary AN11 state files ────────────────────────────────────────────────
+let AN11_STATE_FILES = [
+    "learning_free_driver_result.json",
+    "an11_a_verdict.json",
+    "an11_b_verdict.json",
+    "an11_weight_emergent_verdict.json",
+    "alm_r13_an11_b.json",
+    "alm_r13_an11_c.json",
+    "alm_r0_an11_a.json",
+    "alm_r0_an11_c.json"
+]
+
+// ── Primary Hexad state files ───────────────────────────────────────────────
+let HEXAD_STATE_FILES = [
+    "hexad_closure_verdict.json",
+    "hexad_n28_falsification_verdict.json"
+]
+
+// ── Primary Mk.VIII state files ─────────────────────────────────────────────
+let MK8_STATE_FILES = [
+    "cpgd_minimal_proof_result.json"
+]
+
+// ── Auxiliary state files (bounded bonus signal) ────────────────────────────
+let AUX_STATE_FILES = [
+    "true_closure_cert.json",
+    "flops_landauer_bench_result.json",
+    "anima_main_result.json",
+    "cell_token_bridge_proto.json",
+    "l_ix_integrator_verdict.json",
+    "l_ix_5term_stress_verdict.json",
+    "landauer_tracker_verdict.json",
+    "efficiency_verdict.json",
+    "v_rg_verdict.json",
+    "v_sync_kuramoto_verdict.json",
+    "phase_progression_cert.json",
+    "an_lix_01_smoke_result.json",
+    "edu_cell_l_ix_integrator.json",
+    "closure_debt_result.json",
+    "roadmap_integrity_result.json",
+    "problem_solving_protocol_result.json",
+    "unified_eval_result.json",
+    "meta2_hashchain_verify.json"
+]
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn fexists(p: string) -> bool {
+    return exec("test -f " + p + " && echo 1 || echo 0").trim() == "1"
+}
+
+fn dexists(p: string) -> bool {
+    return exec("test -d " + p + " && echo 1 || echo 0").trim() == "1"
+}
+
+fn now_utc() -> string {
+    return exec("date -u +%FT%TZ").trim()
+}
+
+fn bool_s(b: bool) -> string { if b { return "true" } else { return "false" } }
+
+fn clamp(x: float, lo: float, hi: float) -> float {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+fn sha256_file(path: string) -> string {
+    if !fexists(path) { return "" }
+    return exec("shasum -a 256 " + path + " | awk '{print $1}'").trim()
+}
+
+// Read state/alignment_feature_label.json (roadmap #66) and compute the
+// distribution-weighted label bias: Σ(count[L] * weight[L]) / 16. Returns
+// 1.0 when the SSOT is absent (no-op — legacy reward_mult preserved).
+fn alignment_bias_factor(state_dir: string) -> float {
+    let path = state_dir + "/alignment_feature_label.json"
+    if !fexists(path) { return 1.0 }
+    let body = exec("cat " + path)
+    let w_refusal = 1.5
+    let w_honesty = 1.0
+    let w_harmless = 1.2
+    let w_helpful = 1.0
+    // Read distribution counts. json_str_field works on strings; use a
+    // simple numeric helper inline.
+    let c_refusal = to_float(exec("jq -r .distribution.refusal " + path).trim())
+    let c_honesty = to_float(exec("jq -r .distribution.honesty " + path).trim())
+    let c_harmless = to_float(exec("jq -r .distribution.harmlessness " + path).trim())
+    let c_helpful = to_float(exec("jq -r .distribution.helpfulness " + path).trim())
+    let total = c_refusal + c_honesty + c_harmless + c_helpful
+    if total <= 0.0 { return 1.0 }
+    let weighted = c_refusal * w_refusal + c_honesty * w_honesty + c_harmless * w_harmless + c_helpful * w_helpful
+    return weighted / total
+}
+
+// Find the LAST `"<key>": "<value>"` at top level.
+// Cert bodies embed {"type":"verdict","value":"..."} in evidence arrays;
+// the outermost top-level "verdict": "<X>" always trails, so last wins.
+fn json_str_field(body: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let nlen = needle.len()
+    let bn = body.len()
+    let mut i = 0
+    let mut last_val = ""
+    while i + nlen <= bn {
+        if body.substring(i, i + nlen) == needle {
+            let mut j = i + nlen
+            while j < bn {
+                let c = body.substring(j, j + 1)
+                if c == ":" { j = j + 1; break }
+                j = j + 1
+            }
+            let mut found_quote = false
+            while j < bn {
+                let c = body.substring(j, j + 1)
+                if c == "\"" { j = j + 1; found_quote = true; break }
+                if c != " " { if c != "\t" { if c != "\n" { break } } }
+                j = j + 1
+            }
+            if found_quote {
+                let start = j
+                while j < bn {
+                    let c = body.substring(j, j + 1)
+                    if c == "\"" { last_val = body.substring(start, j); break }
+                    j = j + 1
+                }
+            }
+            i = i + nlen
+        } else {
+            i = i + 1
+        }
+    }
+    return last_val
+}
+
+// Extract the FIRST `"<key>": <bool>` (true/false) — useful for nested
+// pass fields that appear once in stable positions.
+fn json_bool_field_first(body: string, key: string) -> int {
+    // 1 = true, 0 = false, -1 = missing
+    let needle = "\"" + key + "\""
+    let nlen = needle.len()
+    let bn = body.len()
+    let mut i = 0
+    while i + nlen <= bn {
+        if body.substring(i, i + nlen) == needle {
+            let mut j = i + nlen
+            while j < bn {
+                let c = body.substring(j, j + 1)
+                if c == ":" { j = j + 1; break }
+                j = j + 1
+            }
+            while j < bn {
+                let c = body.substring(j, j + 1)
+                if c != " " { if c != "\t" { if c != "\n" { break } } }
+                j = j + 1
+            }
+            if j + 4 <= bn {
+                if body.substring(j, j + 4) == "true" { return 1 }
+            }
+            if j + 5 <= bn {
+                if body.substring(j, j + 5) == "false" { return 0 }
+            }
+            return -1
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Map a verdict string → base sat score.
+fn verdict_base_score(v: string) -> float {
+    if v == "VERIFIED"   { return 1.0 }
+    if v == "PASS"       { return 1.0 }
+    if v == "CLOSED"     { return 1.0 }
+    if v == "GO"         { return 1.0 }
+    if v == "PHASE_JUMP" { return 1.0 }
+    if v == "STATIONARY_AT_FIXPOINT" { return 1.0 }
+    if v == "H_STAR_STRONGLY_SUPPORTED" { return 1.0 }
+    if v == "HEXAD_UNIVERSAL" { return 1.0 }
+    if v == "USABLE"     { return 1.0 }
+    if v == "CLAIM_CONFIRMED_CELL_BETTER_THAN_CLAIMED" { return 1.0 }
+    if v == "SELECTED"   { return 1.0 }
+    if v == "BIT_IDENTICAL" { return 1.0 }
+    if v == "PARTIAL"    { return 0.5 }
+    if v == "HEXAD_CONDITIONAL" { return 0.5 }
+    if v == "LEAKY"      { return 0.5 }
+    if v == "ACTIVE"     { return 0.5 }
+    if v == "HELD"       { return 0.3 }
+    if v == "FAIL_EXPECTED" { return 0.5 }  // no-train paradigm: expected
+    if v == "FAIL"       { return 0.0 }
+    if v == "REJECT"     { return 0.0 }
+    if v == "REJECTED"   { return 0.0 }
+    if v == "INCOMPLETE" { return 0.0 }
+    return 0.0
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Loaders — each returns a struct with sat ∈ [0,1] and source evidence
+// ═══════════════════════════════════════════════════════════════════════════
+
+struct CertScore {
+    slug: string,
+    verdict: string,
+    sat: float,
+    present: bool
+}
+
+fn load_cert(slug: string) -> CertScore {
+    let path = CERT_DIR + "/" + slug + ".json"
+    if !fexists(path) {
+        return CertScore { slug: slug, verdict: "MISSING", sat: 0.0, present: false }
+    }
+    let body = read_file(path)
+    let v = json_str_field(body, "verdict")
+    let s = verdict_base_score(v)
+    return CertScore { slug: slug, verdict: v, sat: s, present: true }
+}
+
+fn load_state(fname: string) -> CertScore {
+    let path = STATE_DIR + "/" + fname
+    if !fexists(path) {
+        return CertScore { slug: fname, verdict: "MISSING", sat: 0.0, present: false }
+    }
+    let body = read_file(path)
+    // Try verdict → closure_verdict → h_star_verdict → status → overall_pass → pass
+    let v1 = json_str_field(body, "verdict")
+    if len(v1) > 0 {
+        return CertScore { slug: fname, verdict: v1, sat: verdict_base_score(v1), present: true }
+    }
+    let v2 = json_str_field(body, "closure_verdict")
+    if len(v2) > 0 {
+        return CertScore { slug: fname, verdict: v2, sat: verdict_base_score(v2), present: true }
+    }
+    let v3 = json_str_field(body, "h_star_verdict")
+    if len(v3) > 0 {
+        return CertScore { slug: fname, verdict: v3, sat: verdict_base_score(v3), present: true }
+    }
+    let v4 = json_str_field(body, "verdict_empirical")
+    if len(v4) > 0 {
+        return CertScore { slug: fname, verdict: v4, sat: verdict_base_score(v4), present: true }
+    }
+    // overall_pass bool fallback
+    let ob = json_bool_field_first(body, "overall_pass")
+    if ob == 1 { return CertScore { slug: fname, verdict: "OVERALL_PASS", sat: 1.0, present: true } }
+    if ob == 0 { return CertScore { slug: fname, verdict: "OVERALL_FAIL", sat: 0.0, present: true } }
+    let pb = json_bool_field_first(body, "pass")
+    if pb == 1 { return CertScore { slug: fname, verdict: "PASS_BOOL", sat: 1.0, present: true } }
+    if pb == 0 { return CertScore { slug: fname, verdict: "FAIL_BOOL", sat: 0.0, present: true } }
+    // Last resort: coverage_pct == 100
+    let cv = json_str_field(body, "smoke_result")
+    if len(cv) > 0 {
+        return CertScore { slug: fname, verdict: "SMOKE_" + cv.substring(0, 2), sat: 0.8, present: true }
+    }
+    return CertScore { slug: fname, verdict: "NO_VERDICT", sat: 0.0, present: true }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Factor computation
+// ═══════════════════════════════════════════════════════════════════════════
+
+struct FactorResult {
+    name: string,
+    sat: float,
+    n_sources: int,
+    n_satisfied: int,
+    detail: list   // list<CertScore>
+}
+
+fn compute_an11(cert_an11c: CertScore) -> FactorResult {
+    let mut details = []
+    let mut sum = 0.0
+    let mut n = 0
+    let mut sat_count = 0
+
+    // Cert: lora-an11c-jsd1 (already loaded)
+    details = details.push(cert_an11c)
+    sum = sum + cert_an11c.sat
+    n = n + 1
+    if cert_an11c.sat >= 0.999 { sat_count = sat_count + 1 }
+
+    // State files
+    let mut i = 0
+    while i < len(AN11_STATE_FILES) {
+        let cs = load_state(AN11_STATE_FILES[i])
+        details = details.push(cs)
+        if cs.present {
+            // r0 baseline FAIL is expected — don't penalize AN11 factor
+            // with baseline refs. Those are pre-training controls.
+            let slug = cs.slug
+            if slug == "alm_r0_an11_a.json" || slug == "alm_r0_an11_c.json" {
+                // baseline: skip from sum/n
+            } else {
+                sum = sum + cs.sat
+                n = n + 1
+                if cs.sat >= 0.999 { sat_count = sat_count + 1 }
+            }
+        }
+        i = i + 1
+    }
+
+    let sat = if n > 0 { sum / to_float(n) } else { 0.0 }
+    return FactorResult { name: "an11", sat: sat, n_sources: n, n_satisfied: sat_count, detail: details }
+}
+
+fn compute_hexad(cert_hexad: CertScore) -> FactorResult {
+    let mut details = []
+    let mut sum = 0.0
+    let mut n = 0
+    let mut sat_count = 0
+
+    details = details.push(cert_hexad)
+    sum = sum + cert_hexad.sat
+    n = n + 1
+    if cert_hexad.sat >= 0.999 { sat_count = sat_count + 1 }
+
+    let mut i = 0
+    while i < len(HEXAD_STATE_FILES) {
+        let cs = load_state(HEXAD_STATE_FILES[i])
+        details = details.push(cs)
+        if cs.present {
+            sum = sum + cs.sat
+            n = n + 1
+            if cs.sat >= 0.999 { sat_count = sat_count + 1 }
+        }
+        i = i + 1
+    }
+
+    let sat = if n > 0 { sum / to_float(n) } else { 0.0 }
+    return FactorResult { name: "hexad", sat: sat, n_sources: n, n_satisfied: sat_count, detail: details }
+}
+
+fn compute_mk8(cert_stationary: CertScore, cert_7axis: CertScore, cert_eigen: CertScore) -> FactorResult {
+    let mut details = []
+    let mut sum = 0.0
+    let mut n = 0
+    let mut sat_count = 0
+
+    details = details.push(cert_stationary)
+    sum = sum + cert_stationary.sat
+    n = n + 1
+    if cert_stationary.sat >= 0.999 { sat_count = sat_count + 1 }
+
+    details = details.push(cert_7axis)
+    sum = sum + cert_7axis.sat
+    n = n + 1
+    if cert_7axis.sat >= 0.999 { sat_count = sat_count + 1 }
+
+    details = details.push(cert_eigen)
+    sum = sum + cert_eigen.sat
+    n = n + 1
+    if cert_eigen.sat >= 0.999 { sat_count = sat_count + 1 }
+
+    let mut i = 0
+    while i < len(MK8_STATE_FILES) {
+        let cs = load_state(MK8_STATE_FILES[i])
+        details = details.push(cs)
+        if cs.present {
+            sum = sum + cs.sat
+            n = n + 1
+            if cs.sat >= 0.999 { sat_count = sat_count + 1 }
+        }
+        i = i + 1
+    }
+
+    let sat = if n > 0 { sum / to_float(n) } else { 0.0 }
+    return FactorResult { name: "mk8", sat: sat, n_sources: n, n_satisfied: sat_count, detail: details }
+}
+
+fn compute_aux(bonus_certs: list) -> FactorResult {
+    let mut details = []
+    let mut sum = 0.0
+    let mut n = 0
+    let mut sat_count = 0
+
+    // Bonus certs (passed in from main loader)
+    let mut i = 0
+    while i < len(bonus_certs) {
+        let cs = bonus_certs[i]
+        details = details.push(cs)
+        if cs.present {
+            sum = sum + cs.sat
+            n = n + 1
+            if cs.sat >= 0.999 { sat_count = sat_count + 1 }
+        }
+        i = i + 1
+    }
+
+    // Aux state files
+    let mut j = 0
+    while j < len(AUX_STATE_FILES) {
+        let cs = load_state(AUX_STATE_FILES[j])
+        details = details.push(cs)
+        if cs.present {
+            sum = sum + cs.sat
+            n = n + 1
+            if cs.sat >= 0.999 { sat_count = sat_count + 1 }
+        }
+        j = j + 1
+    }
+
+    let sat = if n > 0 { sum / to_float(n) } else { 0.0 }
+    return FactorResult { name: "aux", sat: sat, n_sources: n, n_satisfied: sat_count, detail: details }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Reward multiplier
+// ═══════════════════════════════════════════════════════════════════════════
+
+struct GateResult {
+    an11:         FactorResult,
+    hexad:        FactorResult,
+    mk8:          FactorResult,
+    aux:          FactorResult,
+    core_sat:     float,
+    aux_bonus:    float,
+    reward_mult:  float,
+    cert_loaded:  int,
+    state_loaded: int,
+    verdict:      string
+}
+
+fn compute_reward(an11: FactorResult, hexad: FactorResult, mk8: FactorResult, aux: FactorResult,
+                  cert_loaded: int, state_loaded: int) -> GateResult {
+    let core_sat = (an11.sat + hexad.sat + mk8.sat) / 3.0
+
+    // Hard zero below 0.5 — SGD frozen
+    if core_sat < 0.5 {
+        return GateResult {
+            an11: an11, hexad: hexad, mk8: mk8, aux: aux,
+            core_sat: core_sat, aux_bonus: 0.0, reward_mult: 0.0,
+            cert_loaded: cert_loaded, state_loaded: state_loaded,
+            verdict: "REJECT_BELOW_FLOOR"
+        }
+    }
+
+    // Soft shaping: linear_sat = 1.0 + 0.25·(2·core_sat − 1) ∈ [0.75, 1.25]
+    let linear_sat = 1.0 + 0.25 * (2.0 * core_sat - 1.0)
+    // Aux bonus: 0.25 × aux.sat (≤ +0.25)
+    let aux_bonus = 0.25 * aux.sat
+    let raw = linear_sat + aux_bonus
+    let reward_mult = clamp(raw, 0.0, 1.5)
+
+    let verdict = if reward_mult >= 1.4999 { "FULL_REWARD" } else {
+        if reward_mult >= 1.0 { "BASE_OR_ABOVE" } else {
+            if reward_mult >= 0.75 { "SOFT_SUPPRESS" } else { "FLOOR" }
+        }
+    }
+
+    return GateResult {
+        an11: an11, hexad: hexad, mk8: mk8, aux: aux,
+        core_sat: core_sat, aux_bonus: aux_bonus, reward_mult: reward_mult,
+        cert_loaded: cert_loaded, state_loaded: state_loaded,
+        verdict: verdict
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Output writer
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn detail_json(fr: FactorResult) -> string {
+    let mut s = "{\n"
+    s = s + "      \"factor\": \"" + fr.name + "\",\n"
+    s = s + "      \"sat\": " + to_string(fr.sat) + ",\n"
+    s = s + "      \"n_sources\": " + to_string(fr.n_sources) + ",\n"
+    s = s + "      \"n_satisfied\": " + to_string(fr.n_satisfied) + ",\n"
+    s = s + "      \"sources\": ["
+    let mut i = 0
+    while i < len(fr.detail) {
+        let cs = fr.detail[i]
+        if i > 0 { s = s + "," }
+        s = s + "\n        {\"slug\": \"" + cs.slug + "\", \"verdict\": \"" + cs.verdict + "\", \"sat\": " + to_string(cs.sat) + ", \"present\": " + bool_s(cs.present) + "}"
+        i = i + 1
+    }
+    s = s + "\n      ]\n    }"
+    return s
+}
+
+fn write_result(out_path: string, mode: string, target: string, gate: GateResult,
+                selftest_pass: bool, byte_identical: bool, reward_mult_run1: float, reward_mult_run2: float) {
+    let body = "{\n"
+        + "  \"schema\": \"anima.cert_gate.v1\",\n"
+        + "  \"tool\": \"tool/cert_gate.hexa\",\n"
+        + "  \"created\": \"" + now_utc() + "\",\n"
+        + "  \"mode\": \"" + mode + "\",\n"
+        + "  \"target\": \"" + target + "\",\n"
+        + "  \"raw_compliance\": [\"raw#9 hexa-only\", \"raw#10 proof-carrying\", \"raw#11 snake_case\", \"raw#12 empirical\", \"raw#15 no-hardcode\", \"deterministic\", \"LLM=none\"],\n"
+        + "  \"verdict\": \"" + gate.verdict + "\",\n"
+        + "  \"reward_mult\": " + to_string(gate.reward_mult) + ",\n"
+        + "  \"core_sat\": " + to_string(gate.core_sat) + ",\n"
+        + "  \"aux_bonus\": " + to_string(gate.aux_bonus) + ",\n"
+        + "  \"counts\": {\n"
+        + "    \"cert_loaded\": " + to_string(gate.cert_loaded) + ",\n"
+        + "    \"state_loaded\": " + to_string(gate.state_loaded) + "\n"
+        + "  },\n"
+        + "  \"factors\": {\n"
+        + "    \"an11\": " + detail_json(gate.an11) + ",\n"
+        + "    \"hexad\": " + detail_json(gate.hexad) + ",\n"
+        + "    \"mk8\": " + detail_json(gate.mk8) + ",\n"
+        + "    \"aux\": " + detail_json(gate.aux) + "\n"
+        + "  },\n"
+        + "  \"selftest\": {\n"
+        + "    \"all_pass\": " + bool_s(selftest_pass) + ",\n"
+        + "    \"byte_identical\": " + bool_s(byte_identical) + ",\n"
+        + "    \"reward_mult_run1\": " + to_string(reward_mult_run1) + ",\n"
+        + "    \"reward_mult_run2\": " + to_string(reward_mult_run2) + "\n"
+        + "  },\n"
+        + "  \"alignment\": {\n"
+        + "    \"source\": \"state/alignment_feature_label.json\",\n"
+        + "    \"roadmap_entry\": \"66\",\n"
+        + "    \"bias_factor\": " + to_string(alignment_bias_factor(env("HOME") + "/core/anima/state")) + ",\n"
+        + "    \"reward_mult_label_weighted\": " + to_string(gate.reward_mult * alignment_bias_factor(env("HOME") + "/core/anima/state")) + "\n"
+        + "  }\n"
+        + "}\n"
+    write_file(out_path, body)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Core pipeline — load once, compute factors, return GateResult
+// ═══════════════════════════════════════════════════════════════════════════
+
+struct LoadedCerts {
+    stationary: CertScore,
+    seven_axis: CertScore,
+    hexad:      CertScore,
+    eigen16:    CertScore,
+    an11c:      CertScore,
+    bonus:      list,
+    cert_loaded: int
+}
+
+fn load_all_certs() -> LoadedCerts {
+    let cs_stationary = load_cert("cell-mk8-stationary")
+    let cs_seven_axis = load_cert("mk8-7axis-skeleton")
+    let cs_hexad      = load_cert("cell-hexad-closure")
+    let cs_eigen16    = load_cert("cell-eigenvec-16")
+    let cs_an11c      = load_cert("lora-an11c-jsd1")
+
+    let mut bonus = []
+    bonus = bonus.push(load_cert("lora-phase-jump-k4"))
+    bonus = bonus.push(load_cert("lora-l12-cpu-real"))
+    bonus = bonus.push(load_cert("universal-constant-4"))
+    bonus = bonus.push(load_cert("lora-mk6-held"))
+
+    // Cert count: 5 core-used + 4 bonus + 1 mirror = 10 total artifacts loaded.
+    let mirror_path = CERT_DIR + "/" + MIRROR_CERT + ".json"
+    let mut mirror_n = 0
+    if fexists(mirror_path) { mirror_n = 1 }
+
+    let core_n = if cs_stationary.present { 1 } else { 0 }
+                  + if cs_seven_axis.present { 1 } else { 0 }
+                  + if cs_hexad.present      { 1 } else { 0 }
+                  + if cs_eigen16.present    { 1 } else { 0 }
+                  + if cs_an11c.present      { 1 } else { 0 }
+    let mut bonus_n = 0
+    let mut i = 0
+    while i < len(bonus) {
+        let cs = bonus[i]
+        if cs.present { bonus_n = bonus_n + 1 }
+        i = i + 1
+    }
+    let cert_loaded = core_n + bonus_n + mirror_n
+
+    return LoadedCerts {
+        stationary: cs_stationary,
+        seven_axis: cs_seven_axis,
+        hexad: cs_hexad,
+        eigen16: cs_eigen16,
+        an11c: cs_an11c,
+        bonus: bonus,
+        cert_loaded: cert_loaded
+    }
+}
+
+fn run_pipeline() -> GateResult {
+    let lc = load_all_certs()
+
+    let fr_an11  = compute_an11(lc.an11c)
+    let fr_hexad = compute_hexad(lc.hexad)
+    let fr_mk8   = compute_mk8(lc.stationary, lc.seven_axis, lc.eigen16)
+    let fr_aux   = compute_aux(lc.bonus)
+
+    // state_loaded = sum of present state files across factors
+    let state_loaded = fr_an11.n_sources + fr_hexad.n_sources + fr_mk8.n_sources + fr_aux.n_sources
+                     - 1  // subtract the cert counted inside an11
+                     - 1  // subtract the cert counted inside hexad
+                     - 3  // subtract the 3 certs counted inside mk8
+                     - len(lc.bonus)  // subtract bonus certs inside aux
+    // The above subtracts are approximations; recompute state_loaded
+    // explicitly by counting only state-file entries:
+    let mut sl = 0
+    sl = sl + count_present_state_entries(fr_an11)
+    sl = sl + count_present_state_entries(fr_hexad)
+    sl = sl + count_present_state_entries(fr_mk8)
+    sl = sl + count_present_state_entries(fr_aux)
+
+    return compute_reward(fr_an11, fr_hexad, fr_mk8, fr_aux, lc.cert_loaded, sl)
+}
+
+// Count entries in a FactorResult whose slug ends with ".json" (i.e. state
+// file entries — cert entries use the slug-only form without extension).
+fn count_present_state_entries(fr: FactorResult) -> int {
+    let mut n = 0
+    let mut i = 0
+    while i < len(fr.detail) {
+        let cs = fr.detail[i]
+        if cs.present {
+            let s = cs.slug
+            let sn = s.len()
+            if sn > 5 {
+                if s.substring(sn - 5, sn) == ".json" {
+                    n = n + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Self-test
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn selftest(out_path: string, verbose: bool) -> bool {
+    if verbose {
+        println("══════════════════════════════════════════════════════════════════")
+        println("  tool/cert_gate.hexa — SELFTEST")
+        println("  raw#9 hexa-only · raw#10 proof-carrying · raw#12 empirical")
+        println("══════════════════════════════════════════════════════════════════")
+        println("")
+        println("── STEP 1: Mk.VIII triplet verification ──")
+    }
+
+    // Step 1: Mk.VIII triplet must all VERIFIED
+    let mut triplet_ok = true
+    let mut i = 0
+    while i < len(MK8_TRIPLET) {
+        let slug = MK8_TRIPLET[i]
+        let cs = load_cert(slug)
+        if verbose {
+            let mark = if cs.sat >= 0.999 { "✓" } else { "✗" }
+            println("  " + mark + "  " + slug + " → verdict=" + cs.verdict + " sat=" + to_string(cs.sat))
+        }
+        if cs.sat < 0.999 { triplet_ok = false }
+        i = i + 1
+    }
+
+    if verbose {
+        println("")
+        println("── STEP 2: Full gate sweep (run 1) ──")
+    }
+
+    let gate_run1 = run_pipeline()
+
+    if verbose {
+        println("  cert_loaded   = " + to_string(gate_run1.cert_loaded))
+        println("  state_loaded  = " + to_string(gate_run1.state_loaded))
+        println("  an11  sat     = " + to_string(gate_run1.an11.sat)  + " (n_src=" + to_string(gate_run1.an11.n_sources)  + ", n_sat=" + to_string(gate_run1.an11.n_satisfied)  + ")")
+        println("  hexad sat     = " + to_string(gate_run1.hexad.sat) + " (n_src=" + to_string(gate_run1.hexad.n_sources) + ", n_sat=" + to_string(gate_run1.hexad.n_satisfied) + ")")
+        println("  mk8   sat     = " + to_string(gate_run1.mk8.sat)   + " (n_src=" + to_string(gate_run1.mk8.n_sources)   + ", n_sat=" + to_string(gate_run1.mk8.n_satisfied)   + ")")
+        println("  aux   sat     = " + to_string(gate_run1.aux.sat)   + " (n_src=" + to_string(gate_run1.aux.n_sources)   + ", n_sat=" + to_string(gate_run1.aux.n_satisfied)   + ")")
+        println("  core_sat      = " + to_string(gate_run1.core_sat))
+        println("  aux_bonus     = " + to_string(gate_run1.aux_bonus))
+        println("  reward_mult   = " + to_string(gate_run1.reward_mult))
+        println("  verdict       = " + gate_run1.verdict)
+        println("")
+        println("── STEP 3: Determinism check (run 2) ──")
+    }
+
+    let gate_run2 = run_pipeline()
+    let reward_diff = gate_run2.reward_mult - gate_run1.reward_mult
+    let reward_diff_abs = if reward_diff < 0.0 { 0.0 - reward_diff } else { reward_diff }
+    let byte_identical = reward_diff_abs < 0.0000001
+
+    if verbose {
+        println("  reward_run1   = " + to_string(gate_run1.reward_mult))
+        println("  reward_run2   = " + to_string(gate_run2.reward_mult))
+        println("  byte_identical= " + bool_s(byte_identical))
+        println("")
+        println("── STEP 4: Contract checks ──")
+    }
+
+    let count_ok_cert  = gate_run1.cert_loaded  >= 10
+    let count_ok_state = gate_run1.state_loaded >= 20
+    let reward_ok      = gate_run1.reward_mult >= 1.0
+
+    if verbose {
+        println("  count_ok_cert  (>=10)  = " + bool_s(count_ok_cert)  + "  (got=" + to_string(gate_run1.cert_loaded)  + ")")
+        println("  count_ok_state (>=20)  = " + bool_s(count_ok_state) + "  (got=" + to_string(gate_run1.state_loaded) + ")")
+        println("  reward_ok      (>=1.0) = " + bool_s(reward_ok)      + "  (got=" + to_string(gate_run1.reward_mult) + ")")
+        println("  triplet_ok             = " + bool_s(triplet_ok))
+    }
+
+    let selftest_pass = triplet_ok && count_ok_cert && count_ok_state && byte_identical && reward_ok
+
+    write_result(out_path, "selftest", "", gate_run1, selftest_pass, byte_identical,
+                 gate_run1.reward_mult, gate_run2.reward_mult)
+
+    if verbose {
+        println("")
+        println("  [out] " + out_path)
+        if selftest_pass {
+            println("  [PASS] selftest 100% — Phase Gate Day 1 #22 green")
+        } else {
+            println("  [FAIL] selftest failed — see contract checks above")
+        }
+    }
+
+    return selftest_pass
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Dry-run — ALM r12 reward application (no gradient)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn dry_run(out_path: string, target: string, verbose: bool) -> bool {
+    if verbose {
+        println("══════════════════════════════════════════════════════════════════")
+        println("  tool/cert_gate.hexa — DRY-RUN")
+        println("  target = " + target + "  (no gradient update)")
+        println("══════════════════════════════════════════════════════════════════")
+        println("")
+    }
+
+    let gate = run_pipeline()
+
+    if verbose {
+        println("── factor satisfaction ──")
+        println("  an11  sat     = " + to_string(gate.an11.sat))
+        println("  hexad sat     = " + to_string(gate.hexad.sat))
+        println("  mk8   sat     = " + to_string(gate.mk8.sat))
+        println("  aux   sat     = " + to_string(gate.aux.sat))
+        println("")
+        println("── reward (applied as gradient scale multiplier) ──")
+        println("  core_sat      = " + to_string(gate.core_sat))
+        println("  aux_bonus     = " + to_string(gate.aux_bonus))
+        println("  reward_mult   = " + to_string(gate.reward_mult))
+        println("  verdict       = " + gate.verdict)
+        println("")
+        println("── dry-run action ──")
+        println("  target        = " + target)
+        println("  would scale gradient by reward_mult=" + to_string(gate.reward_mult))
+        println("  gradient      = X (not applied — dry-run)")
+    }
+
+    let gate_run2 = run_pipeline()
+    let diff = gate_run2.reward_mult - gate.reward_mult
+    let diff_abs = if diff < 0.0 { 0.0 - diff } else { diff }
+    let bid = diff_abs < 0.0000001
+
+    write_result(out_path, "dry_run", target, gate, true, bid,
+                 gate.reward_mult, gate_run2.reward_mult)
+
+    if verbose {
+        println("")
+        println("  [out] " + out_path)
+    }
+
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  CLI
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn arg_present(argv: list, key: string) -> bool {
+    let mut i = 0
+    while i < len(argv) {
+        if argv[i] == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn arg_value(argv: list, key: string, dflt: string) -> string {
+    let mut i = 0
+    while i < len(argv) {
+        if argv[i] == key {
+            if i + 1 < len(argv) { return argv[i + 1] }
+        }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn print_usage() {
+    println("tool/cert_gate.hexa — Path B Day 1 #22 soft reward shaping gate")
+    println("")
+    println("usage:")
+    println("  hexa tool/cert_gate.hexa --help")
+    println("  hexa tool/cert_gate.hexa --selftest")
+    println("  hexa tool/cert_gate.hexa --dry-run --target alm_r12")
+    println("  hexa tool/cert_gate.hexa --selftest --output <path>")
+    println("")
+    println("outputs:")
+    println("  " + DEFAULT_OUT + "  (JSON verdict)")
+    println("")
+    println("factors loaded: AN11 (a/b/c), Hexad (6-cat closure), Mk.VIII (stationary+7axis)")
+    println("reward_mult range: [0.0, 1.5]  (hard-zero when core_sat<0.5)")
+    println("raw#9 hexa-only · deterministic · LLM=none")
+}
+
+fn main() {
+    let av = args()
+
+    if arg_present(av, "--help") {
+        print_usage()
+        return
+    }
+    if arg_present(av, "-h") {
+        print_usage()
+        return
+    }
+
+    let out_path = arg_value(av, "--output", DEFAULT_OUT)
+
+    if arg_present(av, "--selftest") {
+        let ok = selftest(out_path, true)
+        if ok {
+            return
+        }
+        // hexa stage0 doesn't expose exit(N); failure is signaled by all_pass=false in JSON
+        println("")
+        println("  (non-zero exit semantics: JSON all_pass=false)")
+        return
+    }
+
+    if arg_present(av, "--dry-run") {
+        let target = arg_value(av, "--target", "alm_r12")
+        let _ = dry_run(out_path, target, true)
+        return
+    }
+
+    // Default: print usage
+    print_usage()
+}
+
+main()

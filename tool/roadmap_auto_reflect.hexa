@@ -9,9 +9,9 @@
 // MODES
 //   --dry-run   (default) parse audit, compute gaps, print proposals,
 //               do NOT modify .roadmap or anything else. Always safe.
-//   --apply     mutate .roadmap in-place: chflags nouchg (if locked),
-//               append new entries atomically, chflags uchg (re-lock
-//               only if it was locked before), run roadmap_lint.
+//   --apply     mutate .roadmap in-place via tool/roadmap_with_unlock.hexa
+//               (PR #25): atomic unlock → tmp-write → mv → relock under a
+//               bash trap that fires on EXIT/INT/TERM. Then run roadmap_lint.
 //   --commit    after --apply, stage .roadmap and create a single
 //               `feat(tool): roadmap_auto_reflect — ...` commit.
 //               (Implies --apply.) Never pushes.
@@ -82,6 +82,7 @@ fn arg_present(argv, key) {
 let ROADMAP_PATH    = ".roadmap"
 let LOG_PATH        = "state/roadmap_auto_reflect_log.json"
 let LINT_PATH       = "/Users/ghost/core/hexa-lang/tool/roadmap_lint.hexa"
+let WITH_UNLOCK_TOOL = "/Users/ghost/core/hexa-lang/tool/roadmap_with_unlock.hexa"
 let ETA_PLUS_DAYS   = 14
 
 // ─── time / date helpers ──────────────────────────────────────────────
@@ -133,12 +134,57 @@ fn is_uchg(path: string) -> bool {
 
 fn chflags_set(path: string, flag: string) -> bool {
     // flag is "nouchg" (unlock) or "uchg" (re-lock).
+    // RETAINED for telemetry / fallback. Migration 20260422: prefer
+    // with_unlock_apply() below which atomicizes the unlock/edit/relock
+    // dance via tool/roadmap_with_unlock.hexa (PR #25).
     let mut parts = []
     parts.push("chflags ")
     parts.push(flag)
     parts.push(" ")
     parts.push(path)
     let r = exec_with_status(parts.join(""))
+    return r[1] == 0
+}
+
+// with_unlock_apply — atomic unlock/replace/relock via roadmap_with_unlock.
+// Stages `body` into a tempfile then invokes the helper with `mv tmp dst`.
+// Helper installs a bash trap on EXIT/INT/TERM so the file relocks even on
+// signal/crash mid-mv. Returns true iff the helper exits 0.
+fn with_unlock_apply(target: string, body: string) -> bool {
+    let mut tparts = []
+    tparts.push(target)
+    tparts.push(".tmp.with_unlock.")
+    tparts.push(now_iso().replace(":", "").replace("-", ""))
+    let tmp = tparts.join("")
+    write_file(tmp, body)
+    if !exists(WITH_UNLOCK_TOOL) {
+        // Fallback: legacy direct chflags dance (preserves prior behavior
+        // when helper is absent — e.g. fresh checkout).
+        let was_locked = is_uchg(target)
+        if was_locked && !chflags_set(target, "nouchg") {
+            exec_with_status("rm -f " + tmp)
+            return false
+        }
+        let mut mvp = []
+        mvp.push("mv ")
+        mvp.push(tmp)
+        mvp.push(" ")
+        mvp.push(target)
+        let mvr = exec_with_status(mvp.join(""))
+        if was_locked { let _ = chflags_set(target, "uchg") }
+        return mvr[1] == 0
+    }
+    let mut cmd = []
+    cmd.push("hexa ")
+    cmd.push(WITH_UNLOCK_TOOL)
+    cmd.push(" --file ")
+    cmd.push(target)
+    cmd.push(" -- mv ")
+    cmd.push(tmp)
+    cmd.push(" ")
+    cmd.push(target)
+    let r = exec_with_status(cmd.join(""))
+    if r[1] != 0 { exec_with_status("rm -f " + tmp) }
     return r[1] == 0
 }
 
@@ -576,25 +622,18 @@ fn run(mode: string, audit_path: string) -> int {
     let bak = backup_copy(ROADMAP_PATH, ts)
     println("backup:        " + bak)
 
-    if was_locked {
-        if !chflags_set(ROADMAP_PATH, "nouchg") {
-            println("ERROR: chflags nouchg failed — exit 4")
-            return 4
-        }
-        println("chflags:       nouchg (was uchg)")
-    }
-
     let new_body = roadmap_body + appended_text
-    write_file(ROADMAP_PATH, new_body)
-    println("write:         " + to_string(new_count) + " entries appended")
-
-    if was_locked {
-        if !chflags_set(ROADMAP_PATH, "uchg") {
-            println("ERROR: chflags uchg re-lock failed — exit 4")
-            return 4
-        }
-        println("chflags:       uchg (re-locked)")
+    // Migration 20260422: atomic unlock/write/relock via roadmap_with_unlock
+    // (PR #25). Replaces the legacy 3-step chflags dance. The helper traps
+    // EXIT/INT/TERM, guaranteeing relock even if interrupted mid-write.
+    // Exit-code semantics preserved: any failure → exit 4 (chflags ceremony).
+    let helper_ok = with_unlock_apply(ROADMAP_PATH, new_body)
+    if !helper_ok {
+        println("ERROR: roadmap_with_unlock apply failed — exit 4")
+        return 4
     }
+    println("write:         " + to_string(new_count) + " entries appended")
+    if was_locked { println("chflags:       uchg (re-locked via roadmap_with_unlock)") }
 
     // roadmap_lint check
     let lint_cmd = "hexa " + LINT_PATH + " 2>&1"

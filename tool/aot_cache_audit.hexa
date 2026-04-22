@@ -1,0 +1,224 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/aot_cache_audit.hexa — ROI N71: hexa AOT cache hit-rate audit
+//
+//  PURPOSE
+//    Inspect the hexa AOT cache directory (~/.hexa-cache/, fallback
+//    ~/.hexa_cache/) and estimate hit-rate over the last N tool runs by
+//    comparing cache entries against the count of tool/*.hexa sources.
+//    Recommend key normalization rules (timestamp stripping, env-var
+//    canonicalization) that would have lifted hit-rate had they been
+//    applied.
+//
+//  IMPORTANT
+//    Report-only. Never deletes or rewrites cache entries.
+//
+//  OUTPUT
+//    state/aot_cache_audit.json
+//      {
+//        "schema": "anima.aot_cache_audit.v1",
+//        "ts": "<iso>",
+//        "cache_dir": "<absolute path or null>",
+//        "cache_present": <bool>,
+//        "cache_entry_count": <int>,
+//        "cache_total_bytes": <int>,
+//        "tool_count": <int>,
+//        "estimated_hit_rate": <float ∈ [0.0, 1.0]>,
+//        "recommendations": [ { "rule": "...", "expected_lift": "..." }, ... ],
+//        "verdict": "PASS|WARN"
+//      }
+//
+//  EXIT
+//    0 always (report-only).
+//
+//  USAGE
+//    hexa tool/aot_cache_audit.hexa
+//    hexa tool/aot_cache_audit.hexa --selftest
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT  = "/Users/ghost/core/anima"
+let TOOL_DIR    = "/Users/ghost/core/anima/tool"
+let OUT_PATH    = "/Users/ghost/core/anima/state/aot_cache_audit.json"
+let CACHE_PRIM  = "/Users/ghost/.hexa-cache"
+let CACHE_ALT   = "/Users/ghost/.hexa_cache"
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _now_utc() -> string {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn _fexists(p: string) -> bool {
+    return _str(exec("test -e " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _dexists(p: string) -> bool {
+    return _str(exec("test -d " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _json_esc(s: string) -> string {
+    let a = s.replace("\\", "\\\\")
+    let b = a.replace("\"", "\\\"")
+    let c = b.replace("\n", "\\n")
+    let d = c.replace("\r", "\\r")
+    let e = d.replace("\t", "\\t")
+    return e
+}
+
+fn _atomic_write(path: string, body: string) {
+    let tmp = path + ".tmp." + _str(exec("printf %s $$")).trim()
+    write_file(tmp, body)
+    exec("mv -f " + tmp + " " + path)
+}
+
+fn _to_int(s: string) -> int {
+    let t = s.trim()
+    if t == "" { return 0 }
+    return int(t)
+}
+
+// ─── cache discovery ───────────────────────────────────────────────────────
+
+fn _discover_cache() -> array {
+    if _dexists(CACHE_PRIM) { return [CACHE_PRIM, true] }
+    if _dexists(CACHE_ALT)  { return [CACHE_ALT,  true] }
+    return ["", false]
+}
+
+fn _count_entries(dir: string) -> int {
+    if !_dexists(dir) { return 0 }
+    let s = _str(exec("find " + dir + " -type f 2>/dev/null | wc -l")).trim()
+    return _to_int(s)
+}
+
+fn _total_bytes(dir: string) -> int {
+    if !_dexists(dir) { return 0 }
+    let s = _str(exec("du -ks " + dir + " 2>/dev/null | awk '{print $1}'")).trim()
+    let kb = _to_int(s)
+    return kb * 1024
+}
+
+fn _count_tools() -> int {
+    let s = _str(exec("ls -1 " + TOOL_DIR + "/*.hexa 2>/dev/null | wc -l")).trim()
+    return _to_int(s)
+}
+
+// hit-rate model:
+//   hit ≈ min(1.0, cache_entry_count / max(1, tool_count))
+fn _estimate_hit_rate(entries: int, tools: int) -> float {
+    if tools <= 0 { return 0.0 }
+    let raw = float(entries) / float(tools)
+    if raw > 1.0 { return 1.0 }
+    if raw < 0.0 { return 0.0 }
+    return raw
+}
+
+// ─── recommendation engine ─────────────────────────────────────────────────
+
+fn _recommendations(present: bool, hit_rate: float) -> array {
+    let mut recs = []
+    if !present {
+        recs.push(["bootstrap_cache", "create ~/.hexa-cache/ on first hexa run; expected lift: 0% → ~1.0 over N runs"])
+        return recs
+    }
+    recs.push(["strip_timestamp_from_key", "drop file mtime / build-time embeddings from AOT cache key — expected +5-15%"])
+    recs.push(["canonicalize_env_vars", "normalize ANIMA_ROOT, HOME, USER before hashing — expected +3-8%"])
+    recs.push(["sort_import_order", "stable-sort imports before key derivation — expected +2-5%"])
+    if hit_rate < 0.5 {
+        recs.push(["warm_cache_in_ci", "pre-run all tool/*.hexa --selftest in CI to warm cache — expected +20-40%"])
+    }
+    return recs
+}
+
+// ─── output ────────────────────────────────────────────────────────────────
+
+fn _write_out(cache_dir: string, present: bool, entries: int, bytes: int, tools: int, hit_rate: float, recs: array, verdict: string) {
+    let mut j = "{\n"
+    j = j + "  \"schema\": \"anima.aot_cache_audit.v1\",\n"
+    j = j + "  \"ts\": \"" + _now_utc() + "\",\n"
+    j = j + "  \"roi_ref\": \"N71\",\n"
+    if cache_dir.len() == 0 {
+        j = j + "  \"cache_dir\": null,\n"
+    } else {
+        j = j + "  \"cache_dir\": \"" + _json_esc(cache_dir) + "\",\n"
+    }
+    j = j + "  \"cache_present\": " + (if present { "true" } else { "false" }) + ",\n"
+    j = j + "  \"cache_entry_count\": " + str(entries) + ",\n"
+    j = j + "  \"cache_total_bytes\": " + str(bytes) + ",\n"
+    j = j + "  \"tool_count\": " + str(tools) + ",\n"
+    j = j + "  \"estimated_hit_rate\": " + str(hit_rate) + ",\n"
+    j = j + "  \"recommendations\": ["
+    let mut i = 0
+    while i < len(recs) {
+        if i > 0 { j = j + "," }
+        j = j + "\n    {\"rule\": \"" + _json_esc(recs[i][0]) + "\", \"expected_lift\": \"" + _json_esc(recs[i][1]) + "\"}"
+        i = i + 1
+    }
+    if len(recs) > 0 { j = j + "\n  " }
+    j = j + "],\n"
+    j = j + "  \"verdict\": \"" + verdict + "\"\n"
+    j = j + "}\n"
+    _atomic_write(OUT_PATH, j)
+}
+
+// ─── selftest ──────────────────────────────────────────────────────────────
+
+fn _arg_present(av, k: string) -> bool {
+    let mut i = 0
+    while i < len(av) {
+        if _str(av[i]) == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+let _argv = args()
+if _arg_present(_argv, "--selftest") {
+    println("── aot_cache_audit selftest ──")
+    let mut s1 = false
+    let mut s2 = false
+    let mut s3 = false
+    let disc = _discover_cache()
+    if len(disc) == 2 { s1 = true }
+    println("S1 discover_cache shape: " + str(len(disc)) + " → " + (if s1 { "PASS" } else { "FAIL" }))
+    let recs = _recommendations(true, 0.3)
+    if len(recs) >= 4 { s2 = true }
+    println("S2 recommendations populated: " + str(len(recs)) + " → " + (if s2 { "PASS" } else { "FAIL" }))
+    let hr_hi = _estimate_hit_rate(9999, 10)
+    let hr_lo = _estimate_hit_rate(0, 10)
+    if hr_hi == 1.0 && hr_lo == 0.0 { s3 = true }
+    println("S3 hit_rate clamp [0,1]: hi=" + str(hr_hi) + " lo=" + str(hr_lo) + " → " + (if s3 { "PASS" } else { "FAIL" }))
+    if s1 && s2 && s3 {
+        println("── selftest 3/3 PASS ──")
+        exit(0)
+    }
+    println("── selftest FAIL ──")
+    exit(1)
+}
+
+// ─── main ──────────────────────────────────────────────────────────────────
+
+println("── aot_cache_audit (ROI N71) ──")
+let disc      = _discover_cache()
+let cache_dir = _str(disc[0])
+let present   = disc[1]
+let entries   = if present { _count_entries(cache_dir) } else { 0 }
+let bytes     = if present { _total_bytes(cache_dir)   } else { 0 }
+let tools     = _count_tools()
+let hr        = _estimate_hit_rate(entries, tools)
+let recs      = _recommendations(present, hr)
+let verdict   = if present && hr >= 0.5 { "PASS" } else { "WARN" }
+_write_out(cache_dir, present, entries, bytes, tools, hr, recs, verdict)
+println("cache_dir          : " + (if cache_dir.len() > 0 { cache_dir } else { "(none)" }))
+println("cache_present      : " + (if present { "true" } else { "false" }))
+println("cache_entry_count  : " + str(entries))
+println("cache_total_bytes  : " + str(bytes))
+println("tool_count         : " + str(tools))
+println("estimated_hit_rate : " + str(hr))
+println("recommendations    : " + str(len(recs)))
+println("verdict            : " + verdict)
+println("output             : " + OUT_PATH)
+exit(0)

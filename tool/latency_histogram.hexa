@@ -1,0 +1,273 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/latency_histogram.hexa — ROI I48 per-pod latency histogram
+//
+//  PURPOSE
+//    Reads state/serve_alm_persona_log.jsonl (NDJSON, one request per line
+//    with field "latency_ms") and computes P50 / P95 / P99 / P999 plus
+//    summary stats. Emits state/latency_histogram.json.
+//
+//  USAGE
+//    hexa tool/latency_histogram.hexa
+//    hexa tool/latency_histogram.hexa --in <path> --out <path>
+//    hexa tool/latency_histogram.hexa --self-test     // synthetic 10 reqs
+//
+//  EXIT
+//    0 OK / self-test PASS
+//    1 self-test FAIL
+//    2 input missing
+//
+//  RAW
+//    raw#9 hexa-only / raw#10 deterministic / raw#11 snake_case
+// ════════════════════════════════════════════════════════════════════════════
+
+let LH_DEFAULT_IN  = "state/serve_alm_persona_log.jsonl"
+let LH_DEFAULT_OUT = "state/latency_histogram.json"
+let LH_SELFTEST_IN = "/tmp/latency_histogram_selftest_in.jsonl"
+let LH_SELFTEST_OUT = "/tmp/latency_histogram_selftest_out.json"
+
+// ── argv ───────────────────────────────────────────────────────────────────
+
+fn lh_argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) {
+        o = o.push(a[i])
+        i = i + 1
+    }
+    return o
+}
+
+fn lh_flag(av: array, k: string) -> bool {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn lh_opt(av: array, k: string, d: string) -> string {
+    let mut i = 0
+    while i < len(av) - 1 {
+        if to_string(av[i]) == k { return to_string(av[i + 1]) }
+        i = i + 1
+    }
+    return d
+}
+
+// ── io ─────────────────────────────────────────────────────────────────────
+
+fn lh_file_exists(p: string) -> bool {
+    return to_string(exec("test -f '" + p + "' && echo 1 || echo 0")).trim() == "1"
+}
+
+// ── jsonl scan: pull "latency_ms":<int> per line ───────────────────────────
+
+fn lh_pluck_latency(line: string) -> int {
+    let key = "\"latency_ms\""
+    let k = line.index_of(key)
+    if k < 0 { return -1 }
+    let colon = line.index_of(":", k)
+    if colon < 0 { return -1 }
+    let mut i = colon + 1
+    let n = len(line)
+    while i < n {
+        let c = line.substring(i, i + 1)
+        if c != " " && c != "\t" { break }
+        i = i + 1
+    }
+    let mut j = i
+    while j < n {
+        let c = line.substring(j, j + 1)
+        let cc = char_code(c, 0)
+        let ok = (cc >= 48 && cc <= 57) || cc == 45
+        if !ok { break }
+        j = j + 1
+    }
+    if j == i { return -1 }
+    return to_int(line.substring(i, j))
+}
+
+fn lh_split_lines(text: string) -> array {
+    let n = len(text)
+    let mut out = []
+    let mut start = 0
+    let mut i = 0
+    while i < n {
+        if text.substring(i, i + 1) == "\n" {
+            out = out.push(text.substring(start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n { out = out.push(text.substring(start, n)) }
+    return out
+}
+
+fn lh_collect(in_path: string) -> array {
+    let raw = read_file(in_path)
+    let lines = lh_split_lines(raw)
+    let mut out = []
+    let mut i = 0
+    while i < len(lines) {
+        let l = to_string(lines[i])
+        if l != "" {
+            let v = lh_pluck_latency(l)
+            if v >= 0 { out = out.push(v) }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── insertion sort (n typically < 10k for our request logs) ────────────────
+
+fn lh_sort_asc(arr: array) -> array {
+    let n = len(arr)
+    let mut a = []
+    let mut i = 0
+    while i < n {
+        a = a.push(arr[i])
+        i = i + 1
+    }
+    let mut idx = 1
+    while idx < n {
+        let v = a[idx]
+        let mut j = idx - 1
+        while j >= 0 && a[j] > v {
+            a[j + 1] = a[j]
+            j = j - 1
+        }
+        a[j + 1] = v
+        idx = idx + 1
+    }
+    return a
+}
+
+// ── percentile (nearest-rank, 0 < p < 1) ───────────────────────────────────
+
+fn lh_percentile(sorted: array, p_num: int, p_den: int) -> int {
+    let n = len(sorted)
+    if n == 0 { return 0 }
+    // rank = ceil(p * n), 1-indexed; clamp to [1,n]
+    let mut rank = (p_num * n + p_den - 1) / p_den
+    if rank < 1 { rank = 1 }
+    if rank > n { rank = n }
+    return sorted[rank - 1]
+}
+
+fn lh_min(sorted: array) -> int {
+    if len(sorted) == 0 { return 0 }
+    return sorted[0]
+}
+
+fn lh_max(sorted: array) -> int {
+    let n = len(sorted)
+    if n == 0 { return 0 }
+    return sorted[n - 1]
+}
+
+fn lh_mean(arr: array) -> int {
+    let n = len(arr)
+    if n == 0 { return 0 }
+    let mut s = 0
+    let mut i = 0
+    while i < n {
+        s = s + arr[i]
+        i = i + 1
+    }
+    return s / n
+}
+
+// ── ts ─────────────────────────────────────────────────────────────────────
+
+fn lh_now_utc() -> string {
+    return to_string(exec("date -u +%FT%TZ")).trim()
+}
+
+// ── histogram emit ─────────────────────────────────────────────────────────
+
+fn lh_emit(out_path: string, in_path: string, samples: array) -> int {
+    let sorted = lh_sort_asc(samples)
+    let n = len(sorted)
+    let p50  = lh_percentile(sorted, 50,  100)
+    let p95  = lh_percentile(sorted, 95,  100)
+    let p99  = lh_percentile(sorted, 99,  100)
+    let p999 = lh_percentile(sorted, 999, 1000)
+    let mn   = lh_min(sorted)
+    let mx   = lh_max(sorted)
+    let av   = lh_mean(sorted)
+    let ts   = lh_now_utc()
+
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima.latency_histogram.v1\",\n"
+    body = body + "  \"slug\": \"latency-histogram\",\n"
+    body = body + "  \"tool\": \"tool/latency_histogram.hexa\",\n"
+    body = body + "  \"roi_item\": 48,\n"
+    body = body + "  \"created\": \"" + ts + "\",\n"
+    body = body + "  \"input\": \"" + in_path + "\",\n"
+    body = body + "  \"sample_count\": " + to_string(n) + ",\n"
+    body = body + "  \"unit\": \"ms\",\n"
+    body = body + "  \"min\":  " + to_string(mn) + ",\n"
+    body = body + "  \"mean\": " + to_string(av) + ",\n"
+    body = body + "  \"max\":  " + to_string(mx) + ",\n"
+    body = body + "  \"p50\":  " + to_string(p50) + ",\n"
+    body = body + "  \"p95\":  " + to_string(p95) + ",\n"
+    body = body + "  \"p99\":  " + to_string(p99) + ",\n"
+    body = body + "  \"p999\": " + to_string(p999) + "\n"
+    body = body + "}\n"
+    write_file(out_path, body)
+    return 0
+}
+
+// ── self-test (synthetic 10 requests, deterministic) ───────────────────────
+
+fn lh_self_test() -> int {
+    // Latencies (ms): 1,2,3,4,5,6,7,8,9,500
+    // sorted: same. p50 = rank 5 = 5; p95 = rank 10 = 500; p99 = rank 10 = 500;
+    // p999 = rank 10 = 500.
+    let mut body = ""
+    let vals = [1, 2, 3, 4, 5, 6, 7, 8, 9, 500]
+    let mut i = 0
+    while i < len(vals) {
+        body = body + "{\"endpoint\":\"/persona\",\"latency_ms\":" + to_string(vals[i]) + "}\n"
+        i = i + 1
+    }
+    write_file(LH_SELFTEST_IN, body)
+    let samples = lh_collect(LH_SELFTEST_IN)
+    if len(samples) != 10 {
+        eprintln("[latency_histogram] self-test FAIL: collected " + to_string(len(samples)) + " want 10")
+        return 1
+    }
+    lh_emit(LH_SELFTEST_OUT, LH_SELFTEST_IN, samples)
+    let sorted = lh_sort_asc(samples)
+    let p50 = lh_percentile(sorted, 50, 100)
+    let p95 = lh_percentile(sorted, 95, 100)
+    let p99 = lh_percentile(sorted, 99, 100)
+    if p50 != 5 || p95 != 500 || p99 != 500 {
+        eprintln("[latency_histogram] self-test FAIL: p50=" + to_string(p50) + " p95=" + to_string(p95) + " p99=" + to_string(p99))
+        return 1
+    }
+    println("[latency_histogram] self-test PASS  (n=10 p50=5 p95=500 p99=500)")
+    return 0
+}
+
+// ── main ───────────────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = lh_argv()
+    if lh_flag(av, "--self-test") || lh_flag(av, "self-test") { return lh_self_test() }
+    let in_path  = lh_opt(av, "--in",  LH_DEFAULT_IN)
+    let out_path = lh_opt(av, "--out", LH_DEFAULT_OUT)
+    if !lh_file_exists(in_path) {
+        eprintln("[latency_histogram] input missing: " + in_path)
+        return 2
+    }
+    let samples = lh_collect(in_path)
+    lh_emit(out_path, in_path, samples)
+    println("[latency_histogram] wrote " + out_path + " (n=" + to_string(len(samples)) + ")")
+    return 0
+}
+
+main()

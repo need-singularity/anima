@@ -1,0 +1,161 @@
+// tool/uchg_safe_edit.hexa — guard against manual chflags uchg dance
+//
+// PURPOSE
+//   Audit a hexa source file passed via argv and reject (exit 3) if it
+//   contains the classic 3-step manual dance:
+//
+//       chflags nouchg <path>
+//       <edit ...>
+//       chflags uchg   <path>
+//
+//   The dance leaks the file as unlocked if the editor crashes or the
+//   process catches a signal between step 1 and step 3. PR #25 of
+//   hexa-lang ships `tool/roadmap_with_unlock.hexa` which atomicizes the
+//   sequence under a bash `trap '...' EXIT INT TERM`, guaranteeing the
+//   relock fires on every exit path.
+//
+// USAGE
+//   hexa tool/uchg_safe_edit.hexa --file <path>
+//   hexa tool/uchg_safe_edit.hexa --file <path> --allow-comments
+//
+// EXIT CODES
+//   0   file is clean (no dance pattern, or only inside comments and
+//       --allow-comments was passed)
+//   2   usage error
+//   3   manual dance detected — file MUST migrate to roadmap_with_unlock
+//
+// CONSTRAINTS
+//   raw#9  hexa-only
+//   raw#11 snake_case
+//   raw#15 no .roadmap mutation; pure read-only auditor
+
+let WITH_UNLOCK_TOOL = "/Users/ghost/core/hexa-lang/tool/roadmap_with_unlock.hexa"
+
+fn _argv() -> array { return args() }
+
+fn _arg_value(av, key: string, dflt: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == key && i + 1 < len(av) { return to_string(av[i + 1]) }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _arg_present(av, key: string) -> bool {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _file_exists(p: string) -> bool {
+    let r = exec_with_status("test -r '" + p.replace("'", "'\\''") + "'")
+    return r[1] == 0
+}
+
+// Strip line-comments (// ...) so we can decide whether the dance lives in
+// real code vs prose. We do NOT strip block /* ... */ because none of the
+// migrated files use them.
+fn _strip_line_comments(line: string) -> string {
+    let i = line.index_of("//")
+    if i < 0 { return line }
+    return line.substring(0, i)
+}
+
+// Returns array of [line_no, raw_line] pairs that look like real exec calls
+// of `chflags nouchg` or `chflags uchg`. Heuristic: line contains `chflags`
+// AND `nouchg` or `uchg` AND is wrapped in an exec/exec_with_status/_exec_*
+// call OR is otherwise outside a // comment.
+fn _scan(body: string, allow_comments: bool) -> array {
+    let mut hits = []
+    let lines = body.split("\n")
+    let mut idx = 0
+    while idx < len(lines) {
+        let raw = lines[idx]
+        let scanned = if allow_comments { _strip_line_comments(raw) } else { raw }
+        if scanned.contains("chflags") {
+            let has_uchg = scanned.contains(" uchg") || scanned.contains("\"uchg")
+            let has_nouchg = scanned.contains("nouchg")
+            if has_uchg || has_nouchg {
+                let mut row = []
+                row.push(to_string(idx + 1))
+                row.push(raw)
+                hits.push(row)
+            }
+        }
+        idx = idx + 1
+    }
+    return hits
+}
+
+// Detect the canonical dance: a `nouchg` line followed (within 50 lines) by
+// a `uchg` re-lock line on the same file. Returns true if any pair found.
+fn _has_dance(hits: array) -> bool {
+    let mut i = 0
+    while i < len(hits) {
+        let line = to_string(hits[i][1])
+        if line.contains("nouchg") {
+            let mut j = i + 1
+            while j < len(hits) && j < i + 50 {
+                let later = to_string(hits[j][1])
+                if later.contains("chflags") && later.contains(" uchg") && !later.contains("nouchg") {
+                    return true
+                }
+                if later.contains("\"uchg\"") {
+                    return true
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn main() -> int {
+    let av = _argv()
+    if _arg_present(av, "--help") || _arg_present(av, "-h") {
+        println("usage: hexa tool/uchg_safe_edit.hexa --file <path> [--allow-comments]")
+        println("")
+        println("Rejects (exit 3) source files that contain the manual chflags")
+        println("nouchg → edit → chflags uchg dance. Migrate to:")
+        println("  hexa " + WITH_UNLOCK_TOOL + " --file <p> -- <cmd>")
+        return 0
+    }
+    let file = _arg_value(av, "--file", "")
+    if file == "" {
+        eprintln("uchg_safe_edit: --file required")
+        return 2
+    }
+    if !_file_exists(file) {
+        eprintln("uchg_safe_edit: file not readable: " + file)
+        return 2
+    }
+    let allow_comments = _arg_present(av, "--allow-comments")
+    let body = read_file(file)
+    let hits = _scan(body, allow_comments)
+    if !_has_dance(hits) {
+        println("uchg_safe_edit: OK — no manual dance pattern detected (" + file + ")")
+        return 0
+    }
+    eprintln("uchg_safe_edit: REJECT — manual chflags uchg dance detected")
+    eprintln("  file: " + file)
+    eprintln("  hits:")
+    let mut k = 0
+    while k < len(hits) {
+        eprintln("    L" + to_string(hits[k][0]) + ":  " + to_string(hits[k][1]).trim())
+        k = k + 1
+    }
+    eprintln("")
+    eprintln("  HINT: replace the dance with the atomic helper —")
+    eprintln("    hexa " + WITH_UNLOCK_TOOL + " --file <path> -- <edit_cmd>")
+    eprintln("")
+    eprintln("  See docs/uchg_dance_deprecation_20260422.md for migration recipe.")
+    return 3
+}
+
+// Anima convention (e.g. tool/ps_9_l0_lock.hexa, tool/inference_cert_gate.hexa):
+// hexa runtime auto-invokes `main()`. No explicit dispatcher is needed.

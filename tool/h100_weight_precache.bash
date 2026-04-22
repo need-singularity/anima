@@ -38,7 +38,7 @@ readonly ANIMA_ROOT="/Users/ghost/core/anima"
 readonly MANIFEST="${ANIMA_ROOT}/state/h100_weight_precache_manifest.json"
 readonly PROGRESS_JSONL="${ANIMA_ROOT}/state/h100_weight_precache_progress.jsonl"
 readonly COMPLETION_JSON="${ANIMA_ROOT}/state/h100_weight_precache_completion.json"
-readonly RCLONE_REMOTE="${RCLONE_R2_REMOTE:-r2anima}"
+readonly RCLONE_REMOTE="${RCLONE_R2_REMOTE:-r2}"  # 2026-04-22 fix: actual remote is 'r2:' (was 'r2anima' default)
 readonly STAGING_DIR="${WEIGHT_PRECACHE_STAGE:-/tmp/anima_weight_precache}"
 readonly TS="$(date -u +%Y%m%dT%H%M%SZ)"
 readonly LOG="/tmp/h100_weight_precache_${TS}.log"
@@ -99,9 +99,9 @@ if [[ "${MODE}" == "status" ]]; then
     log "RESULT: STATUS — no apply runs recorded"
     exit 0
   fi
-  PROGRESS_JSONL="${PROGRESS_JSONL}" PATH_IDS="${PATH_IDS}" python3 - <<'PY'
+  PROG_FILE="${PROGRESS_JSONL}" PATH_IDS="${PATH_IDS}" python3 - <<'PY'
 import json, os
-p = os.environ["PROGRESS_JSONL"]
+p = os.environ["PROG_FILE"]
 ids = os.environ["PATH_IDS"].split()
 # last status per pid wins
 last = {}
@@ -166,10 +166,15 @@ fi
 # --- pre-flight 3: credentials (only mandatory for --apply) -------------------
 log "pre-flight 3/3: credentials (HF_TOKEN, rclone profile)"
 HAVE_HF_TOKEN=0; HAVE_RCLONE_PROFILE=0
+# 2026-04-22 fix: fall back to ~/.cache/huggingface/token (where 'hf auth login' stores it)
+if [[ -z "${HF_TOKEN:-}" && -f "${HOME}/.cache/huggingface/token" ]]; then
+  HF_TOKEN="$(tr -d '\n' < "${HOME}/.cache/huggingface/token")"
+  export HF_TOKEN
+fi
 if [[ -n "${HF_TOKEN:-}" ]]; then
   HAVE_HF_TOKEN=1; pass "HF_TOKEN env set (length=${#HF_TOKEN})"
 else
-  warn "HF_TOKEN not set"
+  warn "HF_TOKEN not set (export OR run 'hf auth login' to populate ~/.cache/huggingface/token)"
 fi
 if [[ "${HAVE_RCLONE}" -eq 1 ]] && rclone listremotes 2>/dev/null | grep -q "^${RCLONE_REMOTE}:"; then
   HAVE_RCLONE_PROFILE=1; pass "rclone profile '${RCLONE_REMOTE}:' configured"
@@ -227,9 +232,9 @@ progress_append() {
 path_already_done() {
   local pid="$1"
   [[ -f "${PROGRESS_JSONL}" ]] || return 1
-  PROGRESS_JSONL="${PROGRESS_JSONL}" PID="${pid}" python3 - <<'PY' 2>/dev/null || return 1
+  PROG_FILE="${PROGRESS_JSONL}" PID="${pid}" python3 - <<'PY' 2>/dev/null || return 1
 import json, os, sys
-p = os.environ["PROGRESS_JSONL"]
+p = os.environ["PROG_FILE"]
 pid = os.environ["PID"]
 last = None
 with open(p) as f:
@@ -326,13 +331,17 @@ print(m["paths"][sys.argv[2]]["model_id"])' "${MANIFEST}" "${pid}")
   R2_TARGET=$(python3 -c 'import json,sys
 m=json.load(open(sys.argv[1]))
 print(m["paths"][sys.argv[2]]["r2_target"])' "${MANIFEST}" "${pid}")
-  FILES=$(python3 -c 'import json,sys
+  # 2026-04-22 fix: hf-cli --include expects multiple patterns or repeated flags, not a single comma-string.
+  # Read files into a bash array and pass as: --include p1 p2 p3 ... (space-separated args after one --include).
+  IFS=$'\n' read -r -d '' -a FILES_ARR < <(python3 -c 'import json,sys
 m=json.load(open(sys.argv[1]))
-print(",".join(m["paths"][sys.argv[2]]["files"]))' "${MANIFEST}" "${pid}")
+for f in m["paths"][sys.argv[2]]["files"]:
+    print(f)' "${MANIFEST}" "${pid}" && printf '\0')
   STAGE="${STAGING_DIR}/${pid}"
 
   log ""
   log "[${pid}] === processing ${MODEL_ID} ==="
+  log "[${pid}] include patterns: ${FILES_ARR[*]}"
 
   # Resume: skip if already done
   if path_already_done "${pid}"; then
@@ -344,7 +353,7 @@ print(",".join(m["paths"][sys.argv[2]]["files"]))' "${MANIFEST}" "${pid}")
 
   log "[${pid}] downloading -> ${STAGE}"
   mkdir -p "${STAGE}"
-  if ! "${HF_BIN}" download "${MODEL_ID}" --local-dir "${STAGE}" --include "${FILES}" --token "${HF_TOKEN}"; then
+  if ! "${HF_BIN}" download "${MODEL_ID}" --local-dir "${STAGE}" --include "${FILES_ARR[@]}" --token "${HF_TOKEN}"; then
     fail "[${pid}] HF download failed"
     progress_append "${pid}" "fail" "" "" "hf_download_failed"
     VERDICTS+=("${pid}:fail:0:hf_download_failed")

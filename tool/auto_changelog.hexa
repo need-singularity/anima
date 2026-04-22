@@ -1,0 +1,490 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/auto_changelog.hexa — ROI L65 (automated changelog)
+//
+//  PURPOSE
+//    Generate (and incrementally update) docs/CHANGELOG.md from git commit
+//    history. Commits are grouped by Conventional-Commit type (feat / fix /
+//    chore / docs / refactor / test / perf / ci / build / style / other).
+//    The most recent batch is prepended to docs/CHANGELOG.md so historical
+//    sections survive across runs. Idempotent: re-running with no new
+//    commits produces a NO_CHANGES verdict and does not touch the file.
+//
+//  STATE
+//    state/auto_changelog_last_run.json — {last_sha, last_ts, sections_n}
+//    docs/CHANGELOG.md                  — append-only history (newest first)
+//
+//  ALGORITHM
+//    1. Resolve "since" cutoff:
+//        a. If state/auto_changelog_last_run.json exists → use last_sha + ".."
+//        b. Else if `git describe --tags --match v*` succeeds → that tag + ".."
+//        c. Else fall back to the last 50 commits (defensive bound).
+//    2. `git log <since>..HEAD --pretty=%H|%s|%aI` → parse into commit list.
+//    3. If empty → NO_CHANGES, exit 0 (no file edits).
+//    4. Group commits by Conventional-Commit type prefix (regex-free: split
+//       at first '(' or ':', lowercase). Unknown types → "other".
+//    5. Render new section markdown:
+//         ## [<HEAD-short>] — <YYYY-MM-DD>
+//         ### feat  ← only emit headers for non-empty groups
+//         - <subject> (<short>)
+//         ...
+//    6. If docs/CHANGELOG.md missing → write fresh file with header +
+//       new section.
+//       Else → prepend new section after the existing top header line.
+//    7. Persist new last_run state.
+//
+//  USAGE
+//    hexa run tool/auto_changelog.hexa             normal incremental run
+//    hexa run tool/auto_changelog.hexa --selftest  group-classifier selftest
+//    hexa run tool/auto_changelog.hexa --dry-run   print what would change
+//
+//  RAW
+//    raw#9 hexa-only · raw#10 deterministic ledger · raw#11 snake_case
+//    raw#12 실측 only · raw#15 no-hardcode (paths anchored)
+//
+//  EXIT CODES
+//    0 — wrote new section / NO_CHANGES / selftest pass
+//    1 — selftest fail
+//    2 — setup error (no git)
+// ════════════════════════════════════════════════════════════════════════════
+
+let TOOL_NAME    = "auto_changelog"
+let TOOL_VERSION = "v1"
+let REPO_ROOT    = "/Users/ghost/core/anima"
+let CHANGELOG    = "/Users/ghost/core/anima/docs/CHANGELOG.md"
+let LAST_RUN     = "/Users/ghost/core/anima/state/auto_changelog_last_run.json"
+let SMOKE_OUT    = "/Users/ghost/core/anima/state/auto_changelog_result.json"
+let DOCS_DIR     = "/Users/ghost/core/anima/docs"
+let STATE_DIR    = "/Users/ghost/core/anima/state"
+
+// ─── shell helpers ───────────────────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    let mut out = "'"
+    out = out + s.replace("'", "'\\''")
+    out = out + "'"
+    return out
+}
+
+fn _exec_out(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _exec_code(cmd: string) -> int {
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+fn _ts_iso() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _date_only() -> string {
+    return _exec_out("date -u +%Y-%m-%d").trim()
+}
+
+fn _bool_s(b: bool) -> string {
+    if b { return "true" } else { return "false" }
+}
+
+fn _file_exists(path: string) -> bool {
+    let r = exec_with_status("test -e " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _is_file(path: string) -> bool {
+    let r = exec_with_status("test -f " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _mkdir_p(d: string) -> bool {
+    let r = exec_with_status("mkdir -p " + _sh_quote(d))
+    return r[1] == 0
+}
+
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+fn flag_present(name: string) -> bool {
+    let argv = args()
+    let mut i = 0
+    while i < len(argv) {
+        if to_string(argv[i]) == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── git helpers ─────────────────────────────────────────────────────────────
+
+fn _git_head_sha() -> string {
+    return _exec_out("cd " + _sh_quote(REPO_ROOT) + " && git rev-parse HEAD 2>/dev/null").trim()
+}
+
+fn _git_head_short() -> string {
+    return _exec_out("cd " + _sh_quote(REPO_ROOT) + " && git rev-parse --short HEAD 2>/dev/null").trim()
+}
+
+fn _git_last_semver_tag() -> string {
+    return _exec_out("cd " + _sh_quote(REPO_ROOT) +
+        " && git describe --tags --abbrev=0 --match 'v*' 2>/dev/null").trim()
+}
+
+// `git log <since>..HEAD --pretty=%H|%s|%aI`. Returns array of commit dicts.
+// `since` may be empty → fall back to "-n 50" mode for the very first run.
+fn _git_log_commits(since: string) -> array {
+    let mut acc = []
+    let range_arg = if len(since) > 0 {
+        _sh_quote(since) + "..HEAD"
+    } else {
+        "-n 50"
+    }
+    let cmd = "cd " + _sh_quote(REPO_ROOT) +
+              " && git log " + range_arg + " --pretty=format:%H%x09%s 2>/dev/null"
+    let out = _exec_out(cmd)
+    let lines = split(out, "\n")
+    for l in lines {
+        let row = to_string(l).trim()
+        if len(row) == 0 { continue }
+        let parts = split(row, "\t")
+        if len(parts) < 2 { continue }
+        let mut c = #{}
+        c["sha"] = to_string(parts[0]).trim()
+        c["short"] = to_string(parts[0]).trim().substring(0, 8)
+        c["subject"] = to_string(parts[1]).trim()
+        acc.push(c)
+    }
+    return acc
+}
+
+// ─── classification ──────────────────────────────────────────────────────────
+//
+// Conventional-Commit type extraction. Pattern: `<type>(scope)?: subject`.
+// We split at the first ':' AND the first '(' (whichever earlier). Anything
+// before is candidate type; lowercase, trim. Unknown → "other".
+
+let KNOWN_TYPES = ["feat", "fix", "chore", "docs", "refactor", "test",
+                   "perf", "ci", "build", "style", "revert"]
+
+fn classify_commit(subject: string) -> string {
+    let s = subject.trim()
+    if len(s) == 0 { return "other" }
+    let colon = s.index_of(":")
+    let paren = s.index_of("(")
+    let mut cut = -1
+    if colon >= 0 && paren >= 0 {
+        cut = if colon < paren { colon } else { paren }
+    } else if colon >= 0 {
+        cut = colon
+    } else if paren >= 0 {
+        cut = paren
+    }
+    if cut <= 0 { return "other" }
+    let raw = s.substring(0, cut).trim().to_lower()
+    let mut i = 0
+    while i < len(KNOWN_TYPES) {
+        if to_string(KNOWN_TYPES[i]) == raw { return raw }
+        i = i + 1
+    }
+    return "other"
+}
+
+// ─── last-run state I/O ──────────────────────────────────────────────────────
+
+fn load_last_run() {
+    let mut empty = #{}
+    empty["last_sha"] = ""
+    empty["last_ts"] = ""
+    empty["sections_n"] = 0
+    empty["first_run"] = true
+    if !_file_exists(LAST_RUN) { return empty }
+    let raw = read_file(LAST_RUN).trim()
+    if len(raw) == 0 { return empty }
+    let doc = json_parse(raw)
+    let mut state = #{}
+    state["last_sha"] = if doc.contains_key("last_sha") { doc["last_sha"] } else { "" }
+    state["last_ts"] = if doc.contains_key("last_ts") { doc["last_ts"] } else { "" }
+    state["sections_n"] = if doc.contains_key("sections_n") { doc["sections_n"] } else { 0 }
+    state["first_run"] = false
+    return state
+}
+
+fn write_last_run(sha: string, ts: string, sections_n: int) {
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima.auto_changelog.v1\",\n"
+    body = body + "  \"tool\": \"tool/auto_changelog.hexa\",\n"
+    body = body + "  \"last_sha\": \"" + sha + "\",\n"
+    body = body + "  \"last_ts\": \"" + ts + "\",\n"
+    body = body + "  \"sections_n\": " + to_string(sections_n) + ",\n"
+    body = body + "  \"raw_strict\": \"raw#9 raw#10 raw#11 raw#12 raw#15\"\n"
+    body = body + "}\n"
+    write_file(LAST_RUN, body)
+}
+
+// ─── changelog rendering ─────────────────────────────────────────────────────
+//
+// New section format:
+//   ## [<short>] — <YYYY-MM-DD>
+//
+//   ### feat
+//   - subject text (abc1234)
+//   ...
+//
+//   ### fix
+//   - subject text (def5678)
+//
+//   <blank line>
+
+let SECTION_ORDER = ["feat", "fix", "perf", "refactor", "docs", "test",
+                     "ci", "build", "style", "chore", "revert", "other"]
+
+fn render_section(short: string, date: string, by_type) -> string {
+    let mut body = "## [" + short + "] — " + date + "\n\n"
+    let mut i = 0
+    while i < len(SECTION_ORDER) {
+        let t = to_string(SECTION_ORDER[i])
+        if by_type.contains_key(t) {
+            let entries = by_type[t]
+            if len(entries) > 0 {
+                body = body + "### " + t + "\n"
+                let mut j = 0
+                while j < len(entries) {
+                    let e = entries[j]
+                    let subj = to_string(e["subject"])
+                    let sh = to_string(e["short"])
+                    body = body + "- " + subj + " (" + sh + ")\n"
+                    j = j + 1
+                }
+                body = body + "\n"
+            }
+        }
+        i = i + 1
+    }
+    return body
+}
+
+fn group_by_type(commits: array) {
+    let mut acc = #{}
+    let mut i = 0
+    while i < len(commits) {
+        let c = commits[i]
+        let t = classify_commit(to_string(c["subject"]))
+        if !acc.contains_key(t) { acc[t] = [] }
+        acc[t].push(c)
+        i = i + 1
+    }
+    return acc
+}
+
+// ─── changelog file management ───────────────────────────────────────────────
+//
+// Header line is always:
+//   # Changelog
+//
+// followed by a brief explainer paragraph (one line) — both preserved
+// across incremental writes. New sections are inserted *after* the header
+// + explainer, before any existing `## [...]` sections.
+
+let HEADER_LINE = "# Changelog"
+let EXPLAINER   = "Auto-generated by tool/auto_changelog.hexa. Newest sections appear first; older history is preserved verbatim."
+
+fn create_initial_changelog(new_section: string) {
+    let _ = _mkdir_p(DOCS_DIR)
+    let mut body = HEADER_LINE + "\n\n"
+    body = body + EXPLAINER + "\n\n"
+    body = body + new_section
+    write_file(CHANGELOG, body)
+}
+
+// Prepend new section into existing changelog, after the header block.
+// If the header block isn't found, inject one.
+fn prepend_section(new_section: string) {
+    let raw = read_file(CHANGELOG)
+    if !raw.starts_with(HEADER_LINE) {
+        // Recreate with header preserved at top.
+        let mut body = HEADER_LINE + "\n\n"
+        body = body + EXPLAINER + "\n\n"
+        body = body + new_section
+        body = body + raw
+        write_file(CHANGELOG, body)
+        return
+    }
+    // Locate the first `## [` section header — that's where we splice.
+    let marker = "\n## ["
+    let idx = raw.index_of(marker)
+    if idx < 0 {
+        // No prior version sections: append after header block.
+        let body = raw.trim_end() + "\n\n" + new_section
+        write_file(CHANGELOG, body)
+        return
+    }
+    let head = raw.substring(0, idx + 1)  // include trailing newline
+    let tail = raw.substring(idx + 1, len(raw))
+    let body = head + new_section + tail
+    write_file(CHANGELOG, body)
+}
+
+fn count_lines(s: string) -> int {
+    if len(s) == 0 { return 0 }
+    let lines = split(s, "\n")
+    return len(lines)
+}
+
+// ─── selftest ────────────────────────────────────────────────────────────────
+
+fn run_selftest() -> int {
+    println("[clog] selftest — classifier + render")
+    let cases = [
+        ["feat(roi): add L63",         "feat"],
+        ["fix: typo in cert spec",     "fix"],
+        ["chore(state): regenerate",   "chore"],
+        ["docs(roadmap): update",      "docs"],
+        ["refactor(api): clean up",    "refactor"],
+        ["random thing happened",      "other"],
+        ["WIP",                        "other"]
+    ]
+    let mut ok = true
+    let mut i = 0
+    while i < len(cases) {
+        let pair = cases[i]
+        let got = classify_commit(to_string(pair[0]))
+        let want = to_string(pair[1])
+        let pass = got == want
+        if !pass { ok = false }
+        println("[clog]   " + to_string(pair[0]) + " → " + got +
+                " (want=" + want + ", " + _bool_s(pass) + ")")
+        i = i + 1
+    }
+    let mut by_type = #{}
+    let mut e1 = #{}
+    e1["subject"] = "feat: thing one"
+    e1["short"] = "abc1234"
+    let mut e2 = #{}
+    e2["subject"] = "fix: thing two"
+    e2["short"] = "def5678"
+    by_type["feat"] = [e1]
+    by_type["fix"] = [e2]
+    let section = render_section("test1234", "2026-04-22", by_type)
+    let render_ok = section.contains("## [test1234]") && section.contains("### feat") && section.contains("### fix")
+    println("[clog] render_ok=" + _bool_s(render_ok) + " bytes=" + to_string(len(section)))
+    if !render_ok { ok = false }
+
+    if ok {
+        println("[clog] selftest PASS")
+        return 0
+    }
+    eprintln("[clog] selftest FAIL")
+    return 1
+}
+
+// ─── main ────────────────────────────────────────────────────────────────────
+
+fn main() {
+    let _ = _mkdir_p(STATE_DIR)
+    let _ = _mkdir_p(DOCS_DIR)
+
+    println("════════════════════════════════════════════════════════════════")
+    println("  tool/auto_changelog.hexa — ROI L65")
+    println("  raw#9 hexa-only · raw#12 실측 · ts=" + _ts_iso())
+    println("════════════════════════════════════════════════════════════════")
+
+    if flag_present("--selftest") {
+        let rc = run_selftest()
+        let mut body = "{\n"
+        body = body + "  \"schema\": \"anima.auto_changelog.v1\",\n"
+        body = body + "  \"tool\": \"tool/auto_changelog.hexa\",\n"
+        body = body + "  \"ts\": \"" + _ts_iso() + "\",\n"
+        body = body + "  \"mode\": \"selftest\",\n"
+        body = body + "  \"verdict\": \"" + (if rc == 0 { "PASS" } else { "FAIL" }) + "\"\n"
+        body = body + "}\n"
+        write_file(SMOKE_OUT, body)
+        exit(rc)
+    }
+
+    let dry_run = flag_present("--dry-run")
+    let head_sha = _git_head_sha()
+    let head_short = _git_head_short()
+    if len(head_sha) == 0 {
+        eprintln("[clog] SETUP_ERROR — no git HEAD")
+        exit(2)
+    }
+
+    let last = load_last_run()
+    let last_sha = to_string(last["last_sha"])
+    let mut since = last_sha
+    let mut since_kind = "last_sha"
+    if len(since) == 0 {
+        since = _git_last_semver_tag()
+        since_kind = if len(since) > 0 { "semver_tag" } else { "fallback_n50" }
+    }
+    println("[clog] head_sha=" + head_sha + " (" + head_short + ")")
+    println("[clog] since=" + (if len(since) > 0 { since } else { "<n=50>" }) +
+            " kind=" + since_kind)
+
+    let commits = _git_log_commits(since)
+    let n_commits = len(commits)
+    println("[clog] commits_in_window=" + to_string(n_commits))
+
+    if n_commits == 0 {
+        println("[clog] NO_CHANGES — no new commits since last run")
+        let mut body = "{\n"
+        body = body + "  \"schema\": \"anima.auto_changelog.v1\",\n"
+        body = body + "  \"tool\": \"tool/auto_changelog.hexa\",\n"
+        body = body + "  \"ts\": \"" + _ts_iso() + "\",\n"
+        body = body + "  \"mode\": \"incremental\",\n"
+        body = body + "  \"head_sha\": \"" + head_sha + "\",\n"
+        body = body + "  \"since\": \"" + _json_escape(since) + "\",\n"
+        body = body + "  \"commits_n\": 0,\n"
+        body = body + "  \"new_section_lines\": 0,\n"
+        body = body + "  \"changelog_lines\": " +
+            (if _is_file(CHANGELOG) { to_string(count_lines(read_file(CHANGELOG))) } else { "0" }) + ",\n"
+        body = body + "  \"verdict\": \"NO_CHANGES\"\n"
+        body = body + "}\n"
+        write_file(SMOKE_OUT, body)
+        exit(0)
+    }
+
+    let by_type = group_by_type(commits)
+    let new_section = render_section(head_short, _date_only(), by_type)
+    let new_section_lines = count_lines(new_section)
+    println("[clog] new_section_lines=" + to_string(new_section_lines))
+
+    if dry_run {
+        println("[clog] --dry-run — preview:")
+        println(new_section)
+        exit(0)
+    }
+
+    if !_is_file(CHANGELOG) {
+        create_initial_changelog(new_section)
+        println("[clog] created fresh " + CHANGELOG)
+    } else {
+        prepend_section(new_section)
+        println("[clog] prepended new section to " + CHANGELOG)
+    }
+
+    let final_lines = count_lines(read_file(CHANGELOG))
+    write_last_run(head_sha, _ts_iso(), to_int(to_string(last["sections_n"])) + 1)
+
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima.auto_changelog.v1\",\n"
+    body = body + "  \"tool\": \"tool/auto_changelog.hexa\",\n"
+    body = body + "  \"ts\": \"" + _ts_iso() + "\",\n"
+    body = body + "  \"mode\": \"incremental\",\n"
+    body = body + "  \"head_sha\": \"" + head_sha + "\",\n"
+    body = body + "  \"head_short\": \"" + head_short + "\",\n"
+    body = body + "  \"since\": \"" + _json_escape(since) + "\",\n"
+    body = body + "  \"since_kind\": \"" + since_kind + "\",\n"
+    body = body + "  \"commits_n\": " + to_string(n_commits) + ",\n"
+    body = body + "  \"new_section_lines\": " + to_string(new_section_lines) + ",\n"
+    body = body + "  \"changelog_lines\": " + to_string(final_lines) + ",\n"
+    body = body + "  \"verdict\": \"WROTE_SECTION\"\n"
+    body = body + "}\n"
+    write_file(SMOKE_OUT, body)
+    println("[clog] changelog_total_lines=" + to_string(final_lines))
+    println("[clog] verdict=WROTE_SECTION")
+    exit(0)
+}
+
+main()

@@ -1,0 +1,237 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/dest_alm_beta_ssot_ci.hexa — ROI-D22 dest_alm β SSOT auto-CI gate
+//
+//  PURPOSE
+//    Git-hook-friendly CI gate around the β SSOT audit produced by the
+//    ext-8 audit pass (state/dest_alm_beta_ssot_audit.json). Re-uses the
+//    audit artifact directly: parses accidental_count and exits non-zero
+//    when accidental_count > 0 (i.e. an unintentional α reference slipped
+//    into a main-track SSOT file). Suitable for pre-commit or pre-push.
+//
+//    Audit is REPORT-ONLY — this gate does NOT regenerate the audit and
+//    does NOT mutate any SSOT. If the audit JSON is stale the operator
+//    re-runs the ext-8 producer first.
+//
+//  CHECKS
+//    1. state/dest_alm_beta_ssot_audit.json present + parseable
+//    2. accidental_count == 0
+//    3. main_track_value == "beta" (canonical)
+//    4. verdict == "CLEAN"
+//
+//  CLI
+//    hexa run tool/dest_alm_beta_ssot_ci.hexa             # gate
+//    hexa run tool/dest_alm_beta_ssot_ci.hexa --print     # gate + stdout
+//    hexa run tool/dest_alm_beta_ssot_ci.hexa --self-test # logic test
+//
+//  EXIT
+//    0 — gate PASS (all 4 checks ok)
+//    1 — gate FAIL (any drift) — git hook should abort
+//    2 — audit JSON missing / unreadable
+//
+//  HARD CONSTRAINTS
+//    - hexa-only (no .py / .rs / .sh business logic)
+//    - PROPOSE_ONLY semantics — NEVER mutates audit, SSOT, or .roadmap
+//    - idempotent — re-run safe; overwrites gate verdict file only
+//    - emits state/dest_alm_beta_ssot_ci_verdict.json
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT  = "/Users/ghost/core/anima"
+let AUDIT_PATH  = "/Users/ghost/core/anima/state/dest_alm_beta_ssot_audit.json"
+let GATE_OUT    = "/Users/ghost/core/anima/state/dest_alm_beta_ssot_ci_verdict.json"
+
+// ─── helpers (mirror sibling tools) ──────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+fn _file_exists(p: string) -> bool {
+    return exec_with_status("test -e " + _sh_quote(p))[1] == 0
+}
+fn _ts_iso() -> string {
+    return to_string(exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")[0]).trim()
+}
+fn _ts_epoch() -> string {
+    return to_string(exec_with_status("date -u +%s")[0]).trim()
+}
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+fn _bool_str(b: bool) -> string {
+    if b { return "true" }
+    return "false"
+}
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+fn _flag(av, k) -> bool {
+    for x in av { if to_string(x) == k { return true } }
+    return false
+}
+
+fn _last_slash(p: string) -> int {
+    let mut i = len(p) - 1
+    while i >= 0 {
+        if p.substring(i, i + 1) == "/" { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+// ─── audit reader ─────────────────────────────────────────────────────────
+
+fn _read_audit(path: string) {
+    let mut r = json_parse("{}")
+    r["present"]          = false
+    r["accidental_count"] = -1
+    r["intentional_count"] = -1
+    r["main_track_value"] = ""
+    r["verdict"]          = ""
+    if !_file_exists(path) { return r }
+    let raw = read_file(path)
+    if to_string(raw) == "" { return r }
+    let obj = json_parse(to_string(raw))
+    r["present"] = true
+    if obj.contains_key("accidental_count")  { r["accidental_count"]  = obj["accidental_count"] }
+    if obj.contains_key("intentional_count") { r["intentional_count"] = obj["intentional_count"] }
+    if obj.contains_key("main_track_value")  { r["main_track_value"]  = to_string(obj["main_track_value"]) }
+    if obj.contains_key("verdict")           { r["verdict"]           = to_string(obj["verdict"]) }
+    return r
+}
+
+// ─── gate evaluator ───────────────────────────────────────────────────────
+
+fn _evaluate(present: bool, accidental_count: int, main_track: string, verdict: string) -> bool {
+    if !present { return false }
+    if accidental_count != 0 { return false }
+    if main_track != "beta" { return false }
+    if verdict != "CLEAN" { return false }
+    return true
+}
+
+// ─── runner ───────────────────────────────────────────────────────────────
+
+fn run(also_print: bool) -> int {
+    let ts = _ts_iso()
+    println("── dest_alm_beta_ssot_ci " + ts + " ──")
+
+    let a = _read_audit(AUDIT_PATH)
+    let present = (to_string(a["present"]) == "true")
+    println("  audit_present=" + _bool_str(present))
+
+    if !present {
+        println("  FAIL: audit JSON missing — run the ext-8 audit producer first")
+        let body = "{\n"
+            + "  \"schema\": \"anima/dest_alm_beta_ssot_ci_verdict/1\",\n"
+            + "  \"generated_at\": \"" + _json_escape(ts) + "\",\n"
+            + "  \"verdict\": \"FAIL\",\n"
+            + "  \"reason\": \"audit_missing\",\n"
+            + "  \"audit_path\": \"" + _json_escape(AUDIT_PATH) + "\"\n"
+            + "}\n"
+        let pdir = GATE_OUT.substring(0, _last_slash(GATE_OUT))
+        if pdir != "" { exec_with_status("mkdir -p " + _sh_quote(pdir)) }
+        write_file(GATE_OUT, body)
+        return 2
+    }
+
+    let accidental  = to_int(a["accidental_count"])
+    let intentional = to_int(a["intentional_count"])
+    let main_track  = to_string(a["main_track_value"])
+    let verdict_in  = to_string(a["verdict"])
+
+    println("  accidental_count="  + to_string(accidental))
+    println("  intentional_count=" + to_string(intentional))
+    println("  main_track_value="  + main_track)
+    println("  audit_verdict="     + verdict_in)
+
+    let ok = _evaluate(present, accidental, main_track, verdict_in)
+    let verdict = if ok { "PASS" } else { "FAIL" }
+    println("  gate_verdict=" + verdict)
+
+    let body = "{\n"
+        + "  \"schema\": \"anima/dest_alm_beta_ssot_ci_verdict/1\",\n"
+        + "  \"generated_at\": \"" + _json_escape(ts) + "\",\n"
+        + "  \"generated_at_epoch\": " + _ts_epoch() + ",\n"
+        + "  \"generator\": \"tool/dest_alm_beta_ssot_ci.hexa\",\n"
+        + "  \"audit_path\": \"" + _json_escape(AUDIT_PATH) + "\",\n"
+        + "  \"checks\": {\n"
+        + "    \"audit_present\": " + _bool_str(present) + ",\n"
+        + "    \"accidental_count_zero\": " + _bool_str(accidental == 0) + ",\n"
+        + "    \"main_track_is_beta\": " + _bool_str(main_track == "beta") + ",\n"
+        + "    \"audit_verdict_clean\": " + _bool_str(verdict_in == "CLEAN") + "\n"
+        + "  },\n"
+        + "  \"observed\": {\n"
+        + "    \"accidental_count\": "  + to_string(accidental)  + ",\n"
+        + "    \"intentional_count\": " + to_string(intentional) + ",\n"
+        + "    \"main_track_value\": \"" + _json_escape(main_track) + "\",\n"
+        + "    \"audit_verdict\": \""    + _json_escape(verdict_in) + "\"\n"
+        + "  },\n"
+        + "  \"verdict\": \"" + verdict + "\",\n"
+        + "  \"policy\": {\n"
+        + "    \"side_effects\": \"gate_verdict_file_only\",\n"
+        + "    \"modifies_audit\": false,\n"
+        + "    \"modifies_ssot\": false,\n"
+        + "    \"modifies_roadmap\": false,\n"
+        + "    \"safe_to_repeat\": true,\n"
+        + "    \"git_hook_exit_semantic\": \"non-zero aborts pre-commit / pre-push\"\n"
+        + "  }\n"
+        + "}\n"
+
+    let pdir = GATE_OUT.substring(0, _last_slash(GATE_OUT))
+    if pdir != "" { exec_with_status("mkdir -p " + _sh_quote(pdir)) }
+    write_file(GATE_OUT, body)
+    println("  gate_out=" + GATE_OUT)
+
+    if also_print { println(body) }
+    if ok { return 0 }
+    return 1
+}
+
+// ─── self-test ────────────────────────────────────────────────────────────
+
+fn self_test() -> int {
+    println("── dest_alm_beta_ssot_ci self-test ──")
+    let mut pass = 0
+    let mut fail = 0
+
+    if _evaluate(true, 0, "beta", "CLEAN") { println("  S1 PASS (clean β audit → PASS)"); pass = pass + 1 }
+    else { println("  S1 FAIL"); fail = fail + 1 }
+
+    if !_evaluate(true, 1, "beta", "CLEAN") { println("  S2 PASS (1 accidental → FAIL)"); pass = pass + 1 }
+    else { println("  S2 FAIL"); fail = fail + 1 }
+
+    if !_evaluate(true, 0, "alpha", "CLEAN") { println("  S3 PASS (main_track drift → FAIL)"); pass = pass + 1 }
+    else { println("  S3 FAIL"); fail = fail + 1 }
+
+    if !_evaluate(true, 0, "beta", "DIRTY") { println("  S4 PASS (verdict not CLEAN → FAIL)"); pass = pass + 1 }
+    else { println("  S4 FAIL"); fail = fail + 1 }
+
+    if !_evaluate(false, 0, "beta", "CLEAN") { println("  S5 PASS (audit missing → FAIL)"); pass = pass + 1 }
+    else { println("  S5 FAIL"); fail = fail + 1 }
+
+    println("dest_alm_beta_ssot_ci selftest: " + to_string(pass) + "/5 PASS, " + to_string(fail) + " FAIL")
+    if fail > 0 { return 1 }
+    return 0
+}
+
+// ─── entry ────────────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") || _flag(av, "-h") {
+        println("usage: hexa run tool/dest_alm_beta_ssot_ci.hexa [--self-test] [--print]")
+        return 0
+    }
+    if _flag(av, "--self-test") || _flag(av, "self-test") {
+        return self_test()
+    }
+    let also_print = _flag(av, "--print")
+    return run(also_print)
+}

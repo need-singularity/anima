@@ -1,0 +1,455 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/api_surface_extract.hexa — per-tool API surface extractor
+//
+//  PURPOSE
+//    For every tool/*.hexa, scan top-level `fn name(args) -> ret { ... }`
+//    lines (and `struct Name { ... }` blocks), pair each fn with the
+//    immediately-preceding `// ...` comment block as docstring, and emit
+//    one markdown file per tool at docs/api/<tool_basename>.md.
+//
+//  USAGE
+//    hexa run tool/api_surface_extract.hexa
+//    hexa run tool/api_surface_extract.hexa --tool-dir <dir> --out-dir <dir>
+//    hexa run tool/api_surface_extract.hexa --selftest
+//
+//  IDEMPOTENCY
+//    Output filenames are derived from input basenames + sorted scan order.
+//    Each file gains an "AUTO-GENERATED" header + ts. Re-running with the
+//    same inputs produces byte-identical bodies (sans the ts line).
+//
+//  RULES
+//    raw#9 hexa-only · raw#11 snake_case · raw#15 no-hardcode (paths via flags)
+// ════════════════════════════════════════════════════════════════════════════
+
+let DEFAULT_TOOL_DIR = "/Users/ghost/core/anima/tool"
+let DEFAULT_OUT_DIR  = "/Users/ghost/core/anima/docs/api"
+
+let HDR = "<!-- AUTO-GENERATED, DO NOT EDIT — source: tool/api_surface_extract.hexa -->"
+
+// ─── shell helpers ───────────────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _exec_out(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _exec_code(cmd: string) -> int {
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+fn _file_exists(p: string) -> bool { return _exec_code("test -e " + _sh_quote(p)) == 0 }
+fn _dir_exists(p: string) -> bool { return _exec_code("test -d " + _sh_quote(p)) == 0 }
+fn _mkdir_p(p: string) -> bool { return _exec_code("mkdir -p " + _sh_quote(p)) == 0 }
+fn _rm_rf(p: string) -> bool { return _exec_code("rm -rf " + _sh_quote(p)) == 0 }
+
+fn _utc_now() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _basename(path: string) -> string {
+    let parts = path.split("/")
+    if len(parts) == 0 { return path }
+    return to_string(parts[len(parts) - 1])
+}
+
+fn _strip_hexa_ext(name: string) -> string {
+    let n = name.len()
+    if n > 5 {
+        if name.substring(n - 5, n) == ".hexa" { return name.substring(0, n - 5) }
+    }
+    return name
+}
+
+fn _list_hexa(dir: string) -> array {
+    if !_dir_exists(dir) { return [] }
+    let cmd = "find " + _sh_quote(dir) + " -maxdepth 1 -type f -name '*.hexa' 2>/dev/null | LC_ALL=C sort"
+    let out = _exec_out(cmd)
+    let lines = out.split("\n")
+    let mut acc = []
+    for l in lines {
+        let t = to_string(l).trim()
+        if t.len() > 0 { acc.push(t) }
+    }
+    return acc
+}
+
+// ─── sig extraction ──────────────────────────────────────────────────────
+//
+// Walk lines top to bottom. Maintain a "pending docstring" buffer of the
+// most-recent contiguous run of `// ...` comment lines (cleared on any
+// non-comment, non-blank line that isn't a fn/struct decl).
+//
+// For each line that starts with `fn ` or `struct `, emit an API entry
+// {kind, signature, doc}. Signature = the line up to (and excluding) the
+// trailing `{` (or full line if `{` absent). Doc = the cumulated comment
+// block (each line stripped of `// ` prefix; box borders skipped).
+//
+
+struct Entry { kind: string, signature: string, doc: string }
+
+fn _is_comment(line: string) -> bool {
+    let t = line.trim()
+    if t.len() < 2 { return false }
+    return t.substring(0, 2) == "//"
+}
+
+fn _strip_comment_marks(line: string) -> string {
+    let t = line.trim()
+    if t.len() == 0 { return "" }
+    let mut i = 0
+    let n = t.len()
+    while i < n {
+        let c = t.substring(i, i + 1)
+        if c == "/" { i = i + 1 } else { break }
+    }
+    let body = t.substring(i, n).trim()
+    // Drop pure-border lines.
+    if body.len() == 0 { return "" }
+    let h = body.substring(0, 1)
+    if h == "═" || h == "─" || h == "━" || h == "=" { return "" }
+    return body
+}
+
+fn _is_decl_start(line: string) -> bool {
+    let t = line
+    if t.len() < 3 { return false }
+    if t.len() >= 3 {
+        if t.substring(0, 3) == "fn " { return true }
+    }
+    if t.len() >= 7 {
+        if t.substring(0, 7) == "struct " { return true }
+    }
+    return false
+}
+
+fn _decl_kind(line: string) -> string {
+    if line.len() >= 3 {
+        if line.substring(0, 3) == "fn " { return "fn" }
+    }
+    if line.len() >= 7 {
+        if line.substring(0, 7) == "struct " { return "struct" }
+    }
+    return ""
+}
+
+fn _trim_signature(line: string) -> string {
+    // Cut at first '{' not inside a string. Tools rarely embed { in sigs;
+    // a simple find suffices and we strip trailing whitespace.
+    let idx = line.find("{")
+    let cut = if idx >= 0 { line.substring(0, idx) } else { line }
+    return cut.trim()
+}
+
+fn extract_entries(body: string) -> array {
+    let lines = body.split("\n")
+    let n = len(lines)
+    let mut entries = []
+    let mut doc_buf = []     // array<string>
+    let mut in_fence = false
+    let mut i = 0
+    while i < n {
+        let raw = to_string(lines[i])
+        let t = raw.trim()
+        if in_fence {
+            // Hexa has no string fences but be safe with """ in case.
+            if t.find("\"\"\"") >= 0 { in_fence = false }
+            i = i + 1
+            continue
+        }
+        // Only top-level decls (column 0) — skip indented inner fns.
+        let starts_at_col0 = raw == t  // full line equals trimmed → no leading ws
+        if _is_comment(t) {
+            // Append (only if comment is at top level too — we still allow it).
+            let stripped = _strip_comment_marks(t)
+            if stripped.len() > 0 { doc_buf.push(stripped) }
+            i = i + 1
+            continue
+        }
+        if t.len() == 0 {
+            // Blank line keeps the doc buffer alive for one decl, but we
+            // clear it if no decl appears in next non-blank line. Cheaper
+            // policy: clear immediately on blank lines to avoid accidental
+            // pairing across sections.
+            doc_buf = []
+            i = i + 1
+            continue
+        }
+        if starts_at_col0 && _is_decl_start(t) {
+            let kind = _decl_kind(t)
+            let sig = _trim_signature(t)
+            let mut doc = ""
+            let mut j = 0
+            while j < len(doc_buf) {
+                if j > 0 { doc = doc + "\n" }
+                doc = doc + to_string(doc_buf[j])
+                j = j + 1
+            }
+            let e = Entry { kind: kind, signature: sig, doc: doc }
+            entries.push(e)
+            doc_buf = []
+            i = i + 1
+            continue
+        }
+        // Non-comment, non-decl, non-blank → drop accumulated doc.
+        doc_buf = []
+        i = i + 1
+    }
+    return entries
+}
+
+// First-line tool description (mirrors auto_tool_index logic).
+fn extract_tool_desc(body: string) -> string {
+    let lines = body.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    while i < n {
+        let raw = to_string(lines[i]).trim()
+        if raw.len() == 0 { i = i + 1; continue }
+        if !_is_comment(raw) { return "" }
+        let payload = _strip_comment_marks(raw)
+        if payload.len() == 0 { i = i + 1; continue }
+        let idx = payload.find(" — ")
+        if idx >= 0 {
+            return payload.substring(idx + 3, payload.len()).trim()
+        }
+        let idx2 = payload.find(" - ")
+        if idx2 >= 0 {
+            return payload.substring(idx2 + 3, payload.len()).trim()
+        }
+        return payload
+        i = i + 1
+    }
+    return ""
+}
+
+// ─── render ──────────────────────────────────────────────────────────────
+
+fn _md_escape_inline(s: string) -> string {
+    return s.replace("|", "\\|")
+}
+
+fn render_doc(entries: array) -> string {
+    if len(entries) == 0 { return "" }
+    let mut s = ""
+    let mut i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        if e.doc.len() == 0 { return "" }
+        let lines = e.doc.split("\n")
+        let mut j = 0
+        while j < len(lines) {
+            s = s + "  " + to_string(lines[j]) + "\n"
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return s
+}
+
+fn render_for_tool(tool_path: string, ts: string) -> string {
+    let body = read_file(tool_path)
+    let base = _basename(tool_path)
+    let desc = extract_tool_desc(body)
+    let entries = extract_entries(body)
+
+    // Stable order: as-found in source (already top-down). Provide a
+    // separate table-of-contents alphabetical view too.
+
+    let mut s = ""
+    s = s + HDR + "\n"
+    s = s + "<!-- generated: " + ts + " -->\n"
+    s = s + "<!-- source: tool/" + base + " -->\n"
+    s = s + "<!-- entry_count: " + to_string(len(entries)) + " -->\n\n"
+    s = s + "# `tool/" + base + "` API surface\n\n"
+    s = s + "_AUTO-GENERATED, DO NOT EDIT — generated " + ts + " UTC._\n\n"
+    if desc.len() > 0 {
+        s = s + "**Tool:** " + desc + "\n\n"
+    }
+    s = s + "**Public/Internal entries:** " + to_string(len(entries)) + "\n\n"
+
+    if len(entries) == 0 {
+        s = s + "_No top-level fn or struct declarations found._\n"
+        return s
+    }
+
+    // TOC
+    s = s + "## Table of contents\n\n"
+    let mut sigs = []
+    let mut i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        // Extract bare name from signature: "fn foo(...)" or "struct Foo {"
+        let after = if e.kind == "fn" { e.signature.substring(3, e.signature.len()) } else { e.signature.substring(7, e.signature.len()) }
+        let pn = after.find("(")
+        let nb = if pn > 0 { after.substring(0, pn).trim() } else {
+            let sb = after.find(" ")
+            if sb > 0 { after.substring(0, sb).trim() } else { after.trim() }
+        }
+        sigs.push(e.kind + " " + nb)
+        i = i + 1
+    }
+    let mut k = 0
+    while k < len(sigs) {
+        s = s + "- `" + to_string(sigs[k]) + "`\n"
+        k = k + 1
+    }
+    s = s + "\n## Entries\n\n"
+
+    let mut m = 0
+    while m < len(entries) {
+        let e = entries[m]
+        s = s + "### `" + e.signature + "`\n\n"
+        if e.doc.len() > 0 {
+            let lines = e.doc.split("\n")
+            let mut q = 0
+            while q < len(lines) {
+                s = s + "> " + to_string(lines[q]) + "\n"
+                q = q + 1
+            }
+            s = s + "\n"
+        } else {
+            s = s + "_(no docstring)_\n\n"
+        }
+        m = m + 1
+    }
+    return s
+}
+
+fn _atomic_write(path: string, body: string) {
+    let tmp = path + ".tmp"
+    write_file(tmp, body)
+    let _ = _exec_code("mv -f " + _sh_quote(tmp) + " " + _sh_quote(path))
+}
+
+fn generate(tool_dir: string, out_dir: string) -> int {
+    if !_dir_exists(tool_dir) {
+        eprintln("api_surface_extract: SETUP_ERROR — tool dir missing: " + tool_dir)
+        return 2
+    }
+    let _ = _mkdir_p(out_dir)
+    let ts = _utc_now()
+    let files = _list_hexa(tool_dir)
+    let mut written = 0
+    let mut total_entries = 0
+    let mut i = 0
+    while i < len(files) {
+        let full = to_string(files[i])
+        let base = _basename(full)
+        let stem = _strip_hexa_ext(base)
+        let out_path = out_dir + "/" + stem + ".md"
+        let body = render_for_tool(full, ts)
+        _atomic_write(out_path, body)
+        // Count entries (re-extract for stat — cheap).
+        let raw = read_file(full)
+        let es = extract_entries(raw)
+        total_entries = total_entries + len(es)
+        written = written + 1
+        i = i + 1
+    }
+    println("api_surface_extract: wrote " + to_string(written) + " files into " + out_dir)
+    println("  tool_dir       = " + tool_dir)
+    println("  total_entries  = " + to_string(total_entries))
+    println("  ts             = " + ts)
+    return 0
+}
+
+// ─── argv / main ─────────────────────────────────────────────────────────
+
+fn _argv() -> array {
+    let a = args()
+    let mut out = []
+    let mut i = 2
+    while i < len(a) { out.push(a[i]); i = i + 1 }
+    return out
+}
+
+fn _flag(av: array, k: string) -> bool {
+    for x in av { if to_string(x) == k { return true } }
+    return false
+}
+
+fn _opt(av: array, k: string, d: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && i + 1 < len(av) { return to_string(av[i + 1]) }
+        i = i + 1
+    }
+    return d
+}
+
+// ─── selftest ────────────────────────────────────────────────────────────
+
+fn _hash_no_ts(path: string) -> string {
+    let cmd = "grep -v 'generated' " + _sh_quote(path) + " | shasum -a 256 | awk '{print $1}'"
+    return _exec_out(cmd).trim()
+}
+
+fn run_selftest() -> int {
+    println("api_surface_extract: SELFTEST starting")
+    let mut fails = 0
+    let d = _exec_out("mktemp -d -t api_surface_st.XXXXXX 2>/dev/null").trim()
+    if d == "" { println("S0 FAIL: mktemp"); return 1 }
+    let td = d + "/tool"
+    let od = d + "/api"
+    let _ = _mkdir_p(td)
+    write_file(td + "/sample.hexa",
+        "// tool/sample.hexa — sample tool for selftest\n" +
+        "// Doc for greet.\n" +
+        "fn greet(name: string) -> string {\n" +
+        "    return \"hi \" + name\n" +
+        "}\n" +
+        "\n" +
+        "// Adds two ints.\n" +
+        "fn add(a: int, b: int) -> int { return a + b }\n" +
+        "\n" +
+        "struct Point { x: int, y: int }\n")
+    let rc = generate(td, od)
+    if rc != 0 { fails = fails + 1; println("S1 FAIL: rc=" + to_string(rc)) }
+    let out_path = od + "/sample.md"
+    if !_file_exists(out_path) { fails = fails + 1; println("S1 FAIL: out file missing") }
+    else {
+        let body = read_file(out_path)
+        if body.find("AUTO-GENERATED") < 0 { fails = fails + 1; println("S1 FAIL: header missing") }
+        if body.find("fn greet(name: string) -> string") < 0 { fails = fails + 1; println("S1 FAIL: greet sig missing") }
+        if body.find("Doc for greet.") < 0 { fails = fails + 1; println("S1 FAIL: greet docstring missing") }
+        if body.find("fn add(a: int, b: int) -> int") < 0 { fails = fails + 1; println("S1 FAIL: add sig missing") }
+        if body.find("struct Point") < 0 { fails = fails + 1; println("S1 FAIL: struct missing") }
+        if body.find("sample tool for selftest") < 0 { fails = fails + 1; println("S1 FAIL: tool desc missing") }
+    }
+    // idempotency
+    let h_a = _hash_no_ts(out_path)
+    let _ = generate(td, od)
+    let h_b = _hash_no_ts(out_path)
+    if h_a != "" && h_a == h_b {
+        println("S2 PASS: idempotent (sha256_no_ts=" + h_a.substring(0, 12) + "...)")
+    } else {
+        fails = fails + 1
+        println("S2 FAIL: drift a=" + h_a + " b=" + h_b)
+    }
+    let _ = _rm_rf(d)
+    if fails == 0 { println("api_surface_extract: SELFTEST PASS"); return 0 }
+    println("api_surface_extract: SELFTEST FAIL (" + to_string(fails) + ")")
+    return 1
+}
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") || _flag(av, "-h") {
+        println("usage: hexa run tool/api_surface_extract.hexa [opts]")
+        println("  --tool-dir <dir>   default: " + DEFAULT_TOOL_DIR)
+        println("  --out-dir <dir>    default: " + DEFAULT_OUT_DIR)
+        println("  --selftest         run selftest")
+        return 0
+    }
+    if _flag(av, "--selftest") { return run_selftest() }
+    let td = _opt(av, "--tool-dir", DEFAULT_TOOL_DIR)
+    let od = _opt(av, "--out-dir", DEFAULT_OUT_DIR)
+    return generate(td, od)
+}
+
+exit(main())

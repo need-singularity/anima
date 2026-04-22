@@ -1,0 +1,172 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/code_quality_audit_summary.hexa — ROI H41-H45 combined summary
+//
+//  PURPOSE
+//    Aggregate the verdicts from the five sibling audit tools into one
+//    canonical SSOT at state/code_quality_audit.json.
+//
+//  INPUTS (read-only)
+//    state/dead_code_candidates.json    (H41)
+//    state/util_extract_candidates.json (H42)
+//    state/schema_field_ci_last.json    (H43)
+//    state/coverage_gate_ci_last.json   (H44)
+//    state/lint_violations.json         (H45)
+//
+//  OUTPUT
+//    state/code_quality_audit.json
+//      {
+//        "schema":     "anima.code_quality_audit.v1",
+//        "ts":         "<iso>",
+//        "rois":       ["H41", "H42", "H43", "H44", "H45"],
+//        "summary": {
+//          "H41_dead_fns":        <int>,
+//          "H42_dup_utils":       <int>,
+//          "H43_schema_missing":  <int>,
+//          "H44_no_selftest":     <int>,
+//          "H45_lint_violations": <int>
+//        },
+//        "sources": {
+//          "H41": "state/dead_code_candidates.json",
+//          ...
+//        },
+//        "overall_pass": bool   // true when H43 + H44 + H45 are all clean
+//      }
+//
+//  EXIT
+//    0 always (this is a roll-up; gate decisions belong to the per-ROI tools).
+//
+//  USAGE
+//    hexa tool/code_quality_audit_summary.hexa
+//    hexa tool/code_quality_audit_summary.hexa --selftest
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT = "/Users/ghost/core/anima"
+let OUT_PATH   = "/Users/ghost/core/anima/state/code_quality_audit.json"
+
+let SRC_H41 = "/Users/ghost/core/anima/state/dead_code_candidates.json"
+let SRC_H42 = "/Users/ghost/core/anima/state/util_extract_candidates.json"
+let SRC_H43 = "/Users/ghost/core/anima/state/schema_field_ci_last.json"
+let SRC_H44 = "/Users/ghost/core/anima/state/coverage_gate_ci_last.json"
+let SRC_H45 = "/Users/ghost/core/anima/state/lint_violations.json"
+
+fn _shq(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+fn _file_exists(p: string) -> bool {
+    return exec_with_status("test -e " + _shq(p))[1] == 0
+}
+fn _ts_iso() -> string {
+    return to_string(exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")[0]).trim()
+}
+fn _json_esc(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+// Probe top-level int field; returns -1 when missing/unreadable.
+fn _probe_int(path: string, key: string) -> int {
+    if !_file_exists(path) { return -1 }
+    let raw = read_file(path)
+    let s = to_string(raw).trim()
+    if len(s) == 0 { return -1 }
+    let obj = json_parse(s)
+    if !obj.contains_key(key) { return -1 }
+    let v = obj[key]
+    return to_int(to_string(v))
+}
+
+// Probe length of a top-level array field; -1 when missing.
+fn _probe_arr_len(path: string, key: string) -> int {
+    if !_file_exists(path) { return -1 }
+    let raw = read_file(path)
+    let s = to_string(raw).trim()
+    if len(s) == 0 { return -1 }
+    let obj = json_parse(s)
+    if !obj.contains_key(key) { return -1 }
+    return len(obj[key])
+}
+
+fn _arg_present(av: array, k: string) -> bool {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+let _argv = args()
+if _arg_present(_argv, "--selftest") {
+    println("── code_quality_audit_summary selftest ──")
+    let tmp = "/tmp/_cq_summary_selftest.json"
+    write_file(tmp, "{\"x\": 5, \"arr\": [1,2,3]}\n")
+    let s1 = (_probe_int(tmp, "x") == 5)
+    println("S1 _probe_int → " + (if s1 { "PASS" } else { "FAIL" }))
+    let s2 = (_probe_arr_len(tmp, "arr") == 3)
+    println("S2 _probe_arr_len → " + (if s2 { "PASS" } else { "FAIL" }))
+    let s3 = (_probe_int("/tmp/__nonexistent_cq.json", "x") == -1)
+    println("S3 missing-file probe → -1 " + (if s3 { "PASS" } else { "FAIL" }))
+    exec_with_status("rm -f " + _shq(tmp))
+    if s1 && s2 && s3 {
+        println("── selftest 3/3 PASS ──")
+        exit(0)
+    }
+    println("── selftest FAIL ──")
+    exit(1)
+}
+
+// ─── main ──────────────────────────────────────────────────────────────────
+
+println("── code_quality_audit_summary (ROI H41-H45) ──")
+
+let h41_dead         = _probe_int(SRC_H41, "dead_count")
+let h42_refactor_arr = _probe_arr_len(SRC_H42, "refactor_candidates")
+let h43_missing_arr  = _probe_arr_len(SRC_H43, "missing")
+let h44_missing_arr  = _probe_arr_len(SRC_H44, "missing")
+let h45_viols        = _probe_int(SRC_H45, "violation_count")
+
+let pass_h43 = (h43_missing_arr == 0)
+let pass_h44 = (h44_missing_arr == 0)
+let pass_h45 = (h45_viols == 0)
+let overall_pass = pass_h43 && pass_h44 && pass_h45
+
+let mut j = "{\n"
+j = j + "  \"schema\": \"anima.code_quality_audit.v1\",\n"
+j = j + "  \"ts\": \"" + _ts_iso() + "\",\n"
+j = j + "  \"rois\": [\"H41\", \"H42\", \"H43\", \"H44\", \"H45\"],\n"
+j = j + "  \"summary\": {\n"
+j = j + "    \"H41_dead_fns\": " + to_string(h41_dead) + ",\n"
+j = j + "    \"H42_dup_utils\": " + to_string(h42_refactor_arr) + ",\n"
+j = j + "    \"H43_schema_missing\": " + to_string(h43_missing_arr) + ",\n"
+j = j + "    \"H44_no_selftest\": " + to_string(h44_missing_arr) + ",\n"
+j = j + "    \"H45_lint_violations\": " + to_string(h45_viols) + "\n"
+j = j + "  },\n"
+j = j + "  \"sources\": {\n"
+j = j + "    \"H41\": \"state/dead_code_candidates.json\",\n"
+j = j + "    \"H42\": \"state/util_extract_candidates.json\",\n"
+j = j + "    \"H43\": \"state/schema_field_ci_last.json\",\n"
+j = j + "    \"H44\": \"state/coverage_gate_ci_last.json\",\n"
+j = j + "    \"H45\": \"state/lint_violations.json\"\n"
+j = j + "  },\n"
+j = j + "  \"per_roi_pass\": {\n"
+j = j + "    \"H43\": " + (if pass_h43 { "true" } else { "false" }) + ",\n"
+j = j + "    \"H44\": " + (if pass_h44 { "true" } else { "false" }) + ",\n"
+j = j + "    \"H45\": " + (if pass_h45 { "true" } else { "false" }) + "\n"
+j = j + "  },\n"
+j = j + "  \"overall_pass\": " + (if overall_pass { "true" } else { "false" }) + "\n"
+j = j + "}\n"
+
+let tmp = OUT_PATH + ".tmp"
+write_file(tmp, j)
+exec_with_status("mv -f " + _shq(tmp) + " " + _shq(OUT_PATH))
+
+println("H41 dead_fns        : " + to_string(h41_dead))
+println("H42 dup_utils       : " + to_string(h42_refactor_arr))
+println("H43 schema_missing  : " + to_string(h43_missing_arr))
+println("H44 no_selftest     : " + to_string(h44_missing_arr))
+println("H45 lint_violations : " + to_string(h45_viols))
+println("output              : " + OUT_PATH)
+println(if overall_pass { "OVERALL PASS" } else { "OVERALL FAIL (one or more gates tripped)" })
+exit(0)

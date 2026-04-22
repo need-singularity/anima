@@ -1,0 +1,318 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/drill_breakthrough_auto_trigger.hexa — ROI item E25
+//
+//  PURPOSE
+//    Watcher: scan the per-path Φ live artifact directory for newly-emitted
+//    ckpt-bound results.  Whenever a NEW ckpt artifact is observed (file
+//    fingerprint not present in the trigger ledger), automatically invoke
+//    tool/drill_breakthrough_runner.hexa for the matching dest/round to
+//    refresh the breakthrough verdict.  Removes manual ckpt → drill cycle.
+//
+//  WATCHED INPUTS (state/)
+//    state/phi_p1_qwen3_8b_live.json
+//    state/phi_p2_llama_3_1_8b_live.json
+//    state/phi_p3_ministral_3_14b_live.json
+//    state/phi_p4_gemma_4_31b_live.json
+//    state/h100_launch_completion_verdict.json   (signal that ckpts have landed)
+//
+//  LEDGER
+//    state/drill_breakthrough_trigger_ledger.json
+//      {
+//        "schema": "anima/drill_breakthrough_trigger_ledger/1",
+//        "entries": [
+//           { "ckpt_path": "...", "sha16": "...", "triggered_at": "<iso>",
+//             "dest": "alm", "round": "13", "exit_code": 0, "verdict": "PASS|FAIL|SKIP" },
+//           ...
+//        ]
+//      }
+//
+//  TRIGGER POLICY
+//    - For each watched ckpt artifact present:
+//        compute sha16(file_contents).
+//        if sha16 already in ledger → SKIP (no-op).
+//        else → invoke drill_breakthrough_runner with --dest alm --round <N>,
+//               capture exit code, append entry to ledger.
+//    - With --dry-run: skip the runner invocation; record SKIP_DRY entries.
+//    - With --no-trigger: scan + report only; record nothing.
+//
+//  USAGE
+//    hexa run tool/drill_breakthrough_auto_trigger.hexa
+//    hexa run tool/drill_breakthrough_auto_trigger.hexa --dry-run
+//    hexa run tool/drill_breakthrough_auto_trigger.hexa --no-trigger    (audit)
+//    hexa run tool/drill_breakthrough_auto_trigger.hexa --print
+//
+//  EXIT
+//    0 = scan complete (read ledger for outcomes per ckpt)
+//    2 = ledger writer I/O failure
+//
+//  HARD CONSTRAINTS
+//    - Hexa-only, deterministic
+//    - Idempotent (sha16 dedup) — re-run any time, only NEW ckpts trigger
+//    - Never modifies .roadmap or any anima SSOT other than its own ledger
+//    - --dry-run is the safe default behaviour for first-time invocation
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT  = "/Users/ghost/core/anima"
+let LEDGER_PATH = "/Users/ghost/core/anima/state/drill_breakthrough_trigger_ledger.json"
+let RUNNER_TOOL = "/Users/ghost/core/anima/tool/drill_breakthrough_runner.hexa"
+let HEXA_BIN    = "/Users/ghost/Dev/hexa-lang/hexa"
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return to_string(x)
+}
+
+fn _ts_iso() -> string { return _str(exec("date -u +%FT%TZ")).trim() }
+
+fn _file_exists(p: string) -> bool {
+    return _str(exec("test -e " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _sha16(p: string) -> string {
+    if !_file_exists(p) { return "" }
+    let cmd = "shasum -a 256 " + p + " 2>/dev/null | awk '{print substr($1,1,16)}'"
+    return _str(exec(cmd)).trim()
+}
+
+fn _bool_str(b: bool) -> string { if b { return "true" } else { return "false" } }
+
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+// ── argv ─────────────────────────────────────────────────────────────────
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) {
+        o.push(a[i])
+        i = i + 1
+    }
+    return o
+}
+
+fn _has_flag(av: array, k: string) -> bool {
+    let mut i = 0
+    while i < len(av) {
+        if _str(av[i]) == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ── ledger I/O ───────────────────────────────────────────────────────────
+//
+// Ledger is a flat JSON with an "entries" array of {ckpt_path,sha16,...}.
+// We treat it as opaque text and use plain substring containment to test
+// whether a sha16 has already been recorded.
+
+fn _load_ledger() -> string {
+    if !_file_exists(LEDGER_PATH) {
+        return "{\n  \"schema\": \"anima/drill_breakthrough_trigger_ledger/1\",\n  \"entries\": []\n}\n"
+    }
+    return _str(read_file(LEDGER_PATH))
+}
+
+fn _ledger_has_sha(ledger: string, sha: string) -> bool {
+    if sha == "" { return false }
+    let needle = "\"sha16\": \"" + sha + "\""
+    return ledger.index_of(needle) >= 0
+}
+
+fn _entry_render(ckpt: string, sha: string, dest: string, round_n: string, exit_code: int, verdict: string, ts: string) -> string {
+    let mut s = "{"
+    s = s + "\"ckpt_path\": \"" + _json_escape(ckpt) + "\", "
+    s = s + "\"sha16\": \"" + _json_escape(sha) + "\", "
+    s = s + "\"dest\": \"" + _json_escape(dest) + "\", "
+    s = s + "\"round\": \"" + _json_escape(round_n) + "\", "
+    s = s + "\"exit_code\": " + to_string(exit_code) + ", "
+    s = s + "\"verdict\": \"" + _json_escape(verdict) + "\", "
+    s = s + "\"triggered_at\": \"" + _json_escape(ts) + "\""
+    s = s + "}"
+    return s
+}
+
+// Append a JSON entry into the ledger's "entries" array. Naive but stable:
+// locate the last "]" in the file, insert ",<entry>" before it (or just <entry>
+// if entries array currently empty).
+
+fn _ledger_append(ledger: string, entry_obj: string) -> string {
+    // find the entries: [ ... ] block (only one in our schema)
+    let key = "\"entries\""
+    let k = ledger.index_of(key)
+    if k < 0 {
+        // malformed: rebuild
+        return "{\n  \"schema\": \"anima/drill_breakthrough_trigger_ledger/1\",\n  \"entries\": [\n    " + entry_obj + "\n  ]\n}\n"
+    }
+    // find the [ after k
+    let n = len(ledger)
+    let mut i = k
+    while i < n {
+        if ledger.substring(i, i + 1) == "[" { break }
+        i = i + 1
+    }
+    if i >= n { return ledger }
+    // find matching ] (single-level — we control schema; no nested arrays inside entries[])
+    let mut depth = 1
+    let mut j = i + 1
+    let mut close_idx = -1
+    while j < n {
+        let c = ledger.substring(j, j + 1)
+        if c == "[" { depth = depth + 1 }
+        if c == "]" {
+            depth = depth - 1
+            if depth == 0 {
+                close_idx = j
+                break
+            }
+        }
+        j = j + 1
+    }
+    if close_idx < 0 { return ledger }
+    let head = ledger.substring(0, i + 1)
+    let inner = ledger.substring(i + 1, close_idx)
+    let tail = ledger.substring(close_idx, n)
+    let inner_trim = inner.trim()
+    let mut new_inner = ""
+    if inner_trim == "" {
+        new_inner = "\n    " + entry_obj + "\n  "
+    } else {
+        new_inner = inner + ",\n    " + entry_obj + "\n  "
+    }
+    return head + new_inner + tail
+}
+
+// ── ckpt watch list ──────────────────────────────────────────────────────
+//
+// Each (path, dest, round) describes a path artifact whose presence implies
+// that a new ckpt has landed for the named (dest, round) tuple.  When the
+// runner is triggered, it consumes (dest, round) on its own.
+
+fn _watchlist() -> array {
+    let mut wl = []
+    let mut e1 = []
+    e1.push("/Users/ghost/core/anima/state/phi_p1_qwen3_8b_live.json")
+    e1.push("alm")
+    e1.push("13")
+    wl.push(e1)
+    let mut e2 = []
+    e2.push("/Users/ghost/core/anima/state/phi_p2_llama_3_1_8b_live.json")
+    e2.push("alm")
+    e2.push("13")
+    wl.push(e2)
+    let mut e3 = []
+    e3.push("/Users/ghost/core/anima/state/phi_p3_ministral_3_14b_live.json")
+    e3.push("alm")
+    e3.push("13")
+    wl.push(e3)
+    let mut e4 = []
+    e4.push("/Users/ghost/core/anima/state/phi_p4_gemma_4_31b_live.json")
+    e4.push("alm")
+    e4.push("13")
+    wl.push(e4)
+    let mut e5 = []
+    e5.push("/Users/ghost/core/anima/state/h100_launch_completion_verdict.json")
+    e5.push("alm")
+    e5.push("13")
+    wl.push(e5)
+    return wl
+}
+
+// ── runner trigger ───────────────────────────────────────────────────────
+//
+// Returns [exit_code, verdict_str].  We probe the runner's emitted state
+// file (state/drill_breakthrough_results.json) for the verdict afterwards;
+// `verdict` is best-effort.
+
+fn _trigger_runner(dest: string, round_n: string) -> array {
+    let cmd = HEXA_BIN + " run " + RUNNER_TOOL + " --dest " + dest + " --round " + round_n + " --no-audit 2>&1 | tail -n 50"
+    let out = _str(exec(cmd))
+    // exit code is not surfaced by exec(); we infer from stdout — look for "exit"/"FAIL" tokens.
+    let mut exit_code = 0
+    if out.index_of("FAIL") >= 0 { exit_code = 1 }
+    let mut verdict = "UNKNOWN"
+    if out.index_of("PASS") >= 0 { verdict = "PASS" }
+    if out.index_of("FAIL") >= 0 { verdict = "FAIL" }
+    let mut ret = []
+    ret.push(exit_code)
+    ret.push(verdict)
+    return ret
+}
+
+// ── main ─────────────────────────────────────────────────────────────────
+
+fn main() {
+    let av = _argv()
+    let dry = _has_flag(av, "--dry-run")
+    let no_trigger = _has_flag(av, "--no-trigger")
+    let also_print = _has_flag(av, "--print")
+
+    let ts = _ts_iso()
+    println("[drill_auto_trigger] " + ts + "  dry=" + _bool_str(dry) + "  no_trigger=" + _bool_str(no_trigger))
+
+    let mut ledger = _load_ledger()
+    let wl = _watchlist()
+    let mut newly_triggered = 0
+    let mut skipped_known = 0
+    let mut missing = 0
+
+    let mut idx = 0
+    while idx < len(wl) {
+        let entry = wl[idx]
+        let ckpt = _str(entry[0])
+        let dest = _str(entry[1])
+        let round_n = _str(entry[2])
+
+        if !_file_exists(ckpt) {
+            println("  [MISSING] " + ckpt)
+            missing = missing + 1
+            idx = idx + 1
+            continue
+        }
+
+        let sha = _sha16(ckpt)
+        if _ledger_has_sha(ledger, sha) {
+            println("  [SKIP-KNOWN]  sha16=" + sha + "  " + ckpt)
+            skipped_known = skipped_known + 1
+            idx = idx + 1
+            continue
+        }
+
+        if no_trigger {
+            println("  [AUDIT-ONLY]  sha16=" + sha + "  " + ckpt)
+            idx = idx + 1
+            continue
+        }
+
+        if dry {
+            let entry_str = _entry_render(ckpt, sha, dest, round_n, 0, "SKIP_DRY", ts)
+            ledger = _ledger_append(ledger, entry_str)
+            println("  [TRIGGER-DRY] sha16=" + sha + "  " + ckpt)
+            newly_triggered = newly_triggered + 1
+            idx = idx + 1
+            continue
+        }
+
+        let runner_res = _trigger_runner(dest, round_n)
+        let exit_code = to_int(to_string(runner_res[0]))
+        let verdict = _str(runner_res[1])
+        let entry_str = _entry_render(ckpt, sha, dest, round_n, exit_code, verdict, ts)
+        ledger = _ledger_append(ledger, entry_str)
+        println("  [TRIGGERED]  sha16=" + sha + "  exit=" + to_string(exit_code) + "  verdict=" + verdict + "  " + ckpt)
+        newly_triggered = newly_triggered + 1
+
+        idx = idx + 1
+    }
+
+    write_file(LEDGER_PATH, ledger)
+    println("  ledger=" + LEDGER_PATH)
+    println("  summary: triggered=" + to_string(newly_triggered) + " skipped_known=" + to_string(skipped_known) + " missing=" + to_string(missing))
+
+    if also_print {
+        println(ledger)
+    }
+    exit(0)
+}

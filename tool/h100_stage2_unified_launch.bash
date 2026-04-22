@@ -35,7 +35,7 @@ readonly HF_CLI="/opt/homebrew/bin/hf"
 readonly STAGE2_IMAGE="runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
 readonly BUDGET_USD_HARD_CAP=0  # 0 = unlimited (no cap policy 2026-04-22, user-absorbed)
 readonly NUMERICAL_DRIFT_BOUND="0.0002"
-readonly IDLE_MINUTES_MAX=30
+readonly IDLE_MINUTES_MAX=5  # 2026-04-22 ROI A2: 30→5 min
 readonly PHI_REL_DELTA_MAX="0.05"
 readonly MIN_PATHS_PASS=3
 
@@ -64,6 +64,9 @@ done
 
 log "mode=${MODE} log=${LOG}"
 log "anima_root=${ANIMA_ROOT}"
+
+# 2026-04-22 ROI A3: spot enforce, ondemand fallback block (per manifest abort_thresholds.ondemand_disallowed=true).
+if [[ "${RUNPOD_GPU_TYPE_FLAG:-}" == "ondemand" ]]; then echo "ABORT: ondemand disallowed per manifest"; exit 4; fi
 
 FAIL_N=0
 

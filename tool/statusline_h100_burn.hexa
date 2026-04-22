@@ -1,0 +1,119 @@
+// tool/statusline_h100_burn.hexa — ROI #79 statusline H100 burn indicator
+//
+// PURPOSE
+//   Single-line stdout summary of in-flight H100 burn rate, suitable for
+//   embedding in tmux/zsh/Grafana statusline strips. Reads
+//   state/h100_stage2_launch_state.json (or falls back to launch_manifest
+//   when the canonical state is not yet present).
+//
+// USAGE
+//   hexa run tool/statusline_h100_burn.hexa
+//   hexa run tool/statusline_h100_burn.hexa --json   # JSON line instead
+//
+// OUTPUT (default)
+//   "H100 burn $X.XX/hr · Y pods · elapsed Zh"
+//   When no launch is live:
+//   "H100 burn $0.00/hr · 0 pods · idle"
+//
+// CONSTRAINTS
+//   raw#9 hexa-only, raw#10 proof-carrying (output is read-only summary; no
+//   state mutation, no remote calls, no docker).
+
+let STATE_PRIMARY  = "/Users/ghost/core/anima/state/h100_stage2_launch_state.json"
+let STATE_MANIFEST = "/Users/ghost/core/anima/state/h100_launch_manifest.json"
+
+fn _sh_quote(s: string) -> string { let mut o = "'"; o = o + s.replace("'", "'\\''"); o = o + "'"; return o }
+fn _file_exists(p: string) -> bool { return exec_with_status("test -e " + _sh_quote(p))[1] == 0 }
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+fn _has(av, k) -> bool {
+    let mut i = 0
+    while i < len(av) { if to_string(av[i]) == k { return true }; i = i + 1 }
+    return false
+}
+
+// Two-decimal stringifier without depending on float formatters.
+fn _fmt_money(n) -> string {
+    let cents_total = (n * 100.0) + 0.5
+    let cents = to_int(cents_total)
+    let dollars = cents / 100
+    let frac = cents - dollars * 100
+    let mut frac_s = to_string(frac)
+    if frac < 10 { frac_s = "0" + frac_s }
+    return to_string(dollars) + "." + frac_s
+}
+
+// Returns [burn_per_hr, pods, elapsed_h, live(0|1), source]
+fn _summarise_from_manifest() -> array {
+    if !_file_exists(STATE_MANIFEST) {
+        return [0.0, 0, 0, 0, "idle"]
+    }
+    let m = json_parse(read_file(STATE_MANIFEST))
+    let stages = m["stages"]
+    let mut burn = 0.0
+    let mut pods = 0
+    let mut i = 0
+    while i < len(stages) {
+        let s = stages[i]
+        let gpu_n = if has_key(s, "gpu_count") { to_int(s["gpu_count"]) } else { 1 }
+        // Conservative price: $3/hr per H100 (matches manifest cost_theoretical line).
+        burn = burn + (3.0 * to_float(gpu_n))
+        pods = pods + gpu_n
+        i = i + 1
+    }
+    let src = if pods > 0 { "manifest_planned" } else { "idle" }
+    return [burn, pods, 0, 0, src]
+}
+
+fn main() {
+    let av = _argv()
+    let want_json = _has(av, "--json")
+
+    let mut burn = 0.0
+    let mut pods = 0
+    let mut elapsed_h = 0
+    let mut live = false
+    let mut source = "none"
+
+    if _file_exists(STATE_PRIMARY) {
+        let s = json_parse(read_file(STATE_PRIMARY))
+        if has_key(s, "burn_per_hr") { burn = to_float(s["burn_per_hr"]) }
+        if has_key(s, "pods")        { pods = to_int(s["pods"]) }
+        if has_key(s, "elapsed_h")   { elapsed_h = to_int(s["elapsed_h"]) }
+        if has_key(s, "live")        { live = s["live"] == true || s["live"] == "true" }
+        source = "stage2_launch_state"
+    } else {
+        let r = _summarise_from_manifest()
+        burn = to_float(r[0])
+        pods = to_int(r[1])
+        elapsed_h = to_int(r[2])
+        live = to_int(r[3]) == 1
+        source = to_string(r[4])
+    }
+
+    if want_json {
+        let live_s = if live { "true" } else { "false" }
+        println("{\"schema\":\"anima/statusline_h100_burn/1\",\"burn_per_hr\":" + _fmt_money(burn) +
+                ",\"pods\":" + to_string(pods) +
+                ",\"elapsed_h\":" + to_string(elapsed_h) +
+                ",\"live\":" + live_s +
+                ",\"source\":\"" + source + "\"}")
+        exit(0)
+    }
+
+    if pods == 0 {
+        println("H100 burn $0.00/hr · 0 pods · idle")
+        exit(0)
+    }
+    let tail = if live { "elapsed " + to_string(elapsed_h) + "h" } else { "planned (" + source + ")" }
+    println("H100 burn $" + _fmt_money(burn) + "/hr · " + to_string(pods) + " pods · " + tail)
+    exit(0)
+}
+
+main()

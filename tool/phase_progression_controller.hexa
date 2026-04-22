@@ -43,6 +43,7 @@ use "airgenome_cli_probe"
 
 let CONFIG_PATH_DEFAULT = "config/phase_progression_config.json"
 let HEXA_BIN_DEFAULT    = "/Users/ghost/.hx/bin/hexa"
+let WITH_UNLOCK_TOOL    = "/Users/ghost/core/hexa-lang/tool/roadmap_with_unlock.hexa"
 
 // ─── type / helpers ───────────────────────────────────────────────────
 
@@ -598,19 +599,36 @@ fn _raw_audit_append(root: string, cfg, stage: string, phase_num: int, exit_code
     let entry_sha = _sha256_str(body + prev)
     let line = body + ",\"entry_sha\":\"" + entry_sha + "\"}"
 
-    // append-safe: temporarily clear uchg if present (raw#1 ceremony)
+    // Migration 20260422: append-safe via tool/roadmap_with_unlock.hexa
+    // (PR #25). The helper installs `trap '<relock>' EXIT INT TERM` so the
+    // file is relocked even if the append is interrupted. Behavior parity:
+    //   - bootstrap (no file yet) writes header inline (no lock to honor)
+    //   - existing file: append via printf >>, wrapped through the helper
+    //   - uappnd best-effort re-apply preserved post-edit
     let had_uchg = _exec_out("ls -lO " + _sh_quote(path) + " 2>/dev/null").index_of("uchg") >= 0
-    if had_uchg { let _u = _exec_code("chflags nouchg " + _sh_quote(path)) }
     if !_file_exists(path) {
         let header = "# .raw-audit/phase_progression.log — raw#10 hash-chain\n"
         let _w = write_file(path, header + line + "\n")
     } else {
-        let cmd = "printf %s\\\\n " + _sh_quote(line) + " >> " + _sh_quote(path)
-        let _c = _exec_code(cmd)
+        let append_cmd = "printf %s\\\\n " + _sh_quote(line) + " >> " + _sh_quote(path)
+        if _file_exists(WITH_UNLOCK_TOOL) {
+            let mut wrap = []
+            wrap.push("hexa ")
+            wrap.push(WITH_UNLOCK_TOOL)
+            wrap.push(" --file ")
+            wrap.push(_sh_quote(path))
+            wrap.push(" -- bash -c ")
+            wrap.push(_sh_quote(append_cmd))
+            let _c = _exec_code(wrap.join(""))
+        } else {
+            // Fallback: legacy direct chflags dance (helper not present).
+            if had_uchg { let _u = _exec_code("chflags nouchg " + _sh_quote(path)) }
+            let _c = _exec_code(append_cmd)
+            if had_uchg { let _u3 = _exec_code("chflags uchg " + _sh_quote(path)) }
+        }
     }
     // re-apply uappnd (append-only) best-effort
     let _u2 = _exec_code("chflags uappnd " + _sh_quote(path) + " 2>/dev/null")
-    if had_uchg { let _u3 = _exec_code("chflags uchg " + _sh_quote(path)) }
     return entry_sha
 }
 

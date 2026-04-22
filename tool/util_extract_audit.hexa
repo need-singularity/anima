@@ -1,0 +1,215 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/util_extract_audit.hexa — ROI H42: shared utility extraction audit
+//
+//  PURPOSE
+//    Find duplicated helper definitions across tool/*.hexa that could be
+//    consolidated into shared/util/*.hexa. Currently watches the canonical
+//    extraction targets:
+//      _json_field_str        (canonical: shared/util/json_field.hexa)
+//      _json_field_str_safe   (alias of  _json_field_str)
+//      _sh_quote              (1-line shell quoter)
+//      _file_exists           (test -e wrapper)
+//      _ts_iso                (date -u +iso wrapper)
+//      _json_escape           (string escape for JSON emit)
+//      _json_esc              (alias)
+//
+//  OUTPUT
+//    state/util_extract_candidates.json
+//      {
+//        "schema":      "anima.util_extract_candidates.v1",
+//        "ts":          "<iso>",
+//        "watched":     ["_json_field_str", ...],
+//        "summary": {
+//          "_json_field_str": { "count": <int>, "files": [...] },
+//          ...
+//        },
+//        "refactor_candidates": [
+//          { "fn": "...", "files": [...], "recommendation": "extract to shared/util/..." }
+//        ]
+//      }
+//
+//  EXIT
+//    0 — report emitted (refactor candidates may or may not be present).
+//        This is an advisory tool; not a blocking gate.
+//
+//  USAGE
+//    hexa tool/util_extract_audit.hexa
+//    hexa tool/util_extract_audit.hexa --selftest
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT = "/Users/ghost/core/anima"
+let TOOL_DIR   = "/Users/ghost/core/anima/tool"
+let OUT_PATH   = "/Users/ghost/core/anima/state/util_extract_candidates.json"
+
+// Watched helper names. Threshold: any helper defined in ≥ 2 tool files is a
+// refactor candidate (one canonical home + N call-sites is the goal).
+let WATCHED = ["_json_field_str", "_json_field_str_safe", "_sh_quote", "_file_exists", "_ts_iso", "_json_escape", "_json_esc"]
+let DUP_THRESHOLD = 2
+
+fn _shq(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+fn _file_exists(p: string) -> bool {
+    return exec_with_status("test -e " + _shq(p))[1] == 0
+}
+fn _ts_iso() -> string {
+    return to_string(exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")[0]).trim()
+}
+fn _json_esc(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+fn _short_path(p: string) -> string {
+    let root = ANIMA_ROOT + "/"
+    if len(p) > len(root) && p.substring(0, len(root)) == root {
+        return p.substring(len(root), len(p))
+    }
+    return p
+}
+
+// Find all tool/*.hexa files that contain `fn NAME(` at any indent.
+fn _files_defining(name: string) -> array {
+    let pat = "fn " + name + "("
+    let cmd = "grep -RlF " + _shq(pat) + " " + _shq(TOOL_DIR) + "/ 2>/dev/null"
+    let r = exec_with_status(cmd)
+    let mut out = []
+    if r[1] != 0 && len(to_string(r[0]).trim()) == 0 { return out }
+    let lines = split(to_string(r[0]), "\n")
+    for ln in lines {
+        let t = ln.trim()
+        if len(t) == 0 { continue }
+        // restrict to .hexa
+        if len(t) >= 5 && t.substring(len(t) - 5, len(t)) == ".hexa" {
+            out.push(_short_path(t))
+        }
+    }
+    return out
+}
+
+// ─── audit driver ──────────────────────────────────────────────────────────
+
+fn _run_audit() -> array {
+    let mut summary = []
+    let mut refactor = []
+    for nm in WATCHED {
+        let files = _files_defining(nm)
+        summary.push([nm, files])
+        if len(files) >= DUP_THRESHOLD {
+            refactor.push([nm, files])
+        }
+    }
+    return [summary, refactor]
+}
+
+fn _arr_to_json_strings(a: array) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < len(a) {
+        if i > 0 { s = s + ", " }
+        s = s + "\"" + _json_esc(to_string(a[i])) + "\""
+        i = i + 1
+    }
+    s = s + "]"
+    return s
+}
+
+fn _watched_to_json() -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < len(WATCHED) {
+        if i > 0 { s = s + ", " }
+        s = s + "\"" + _json_esc(WATCHED[i]) + "\""
+        i = i + 1
+    }
+    s = s + "]"
+    return s
+}
+
+fn _write_out(summary: array, refactor: array) {
+    let mut j = "{\n"
+    j = j + "  \"schema\": \"anima.util_extract_candidates.v1\",\n"
+    j = j + "  \"ts\": \"" + _ts_iso() + "\",\n"
+    j = j + "  \"watched\": " + _watched_to_json() + ",\n"
+    j = j + "  \"summary\": {"
+    let mut i = 0
+    while i < len(summary) {
+        if i > 0 { j = j + "," }
+        let nm = summary[i][0]
+        let files = summary[i][1]
+        j = j + "\n    \"" + _json_esc(nm) + "\": {\"count\": " + to_string(len(files)) + ", \"files\": " + _arr_to_json_strings(files) + "}"
+        i = i + 1
+    }
+    if len(summary) > 0 { j = j + "\n  " }
+    j = j + "},\n"
+    j = j + "  \"refactor_candidates\": ["
+    let mut k = 0
+    while k < len(refactor) {
+        if k > 0 { j = j + "," }
+        let nm = refactor[k][0]
+        let files = refactor[k][1]
+        j = j + "\n    {\"fn\": \"" + _json_esc(nm) + "\", \"files\": " + _arr_to_json_strings(files) + ", \"recommendation\": \"extract to shared/util/json_field.hexa or sibling and remove local copies\"}"
+        k = k + 1
+    }
+    if len(refactor) > 0 { j = j + "\n  " }
+    j = j + "]\n}\n"
+    let tmp = OUT_PATH + ".tmp"
+    write_file(tmp, j)
+    exec_with_status("mv -f " + _shq(tmp) + " " + _shq(OUT_PATH))
+}
+
+// ─── selftest ──────────────────────────────────────────────────────────────
+
+fn _arg_present(av: array, k: string) -> bool {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+let _argv = args()
+if _arg_present(_argv, "--selftest") {
+    println("── util_extract_audit selftest ──")
+    let res = _run_audit()
+    let summary = res[0]
+    let mut s1_pass = false
+    let mut s2_pass = true
+    if len(summary) == len(WATCHED) { s1_pass = true }
+    println("S1 watched-list shape: " + to_string(len(summary)) + "/" + to_string(len(WATCHED)) + " → " + (if s1_pass { "PASS" } else { "FAIL" }))
+    // S2 — _json_field_str MUST appear in ≥ 1 file (it's defined in canonical helpers)
+    for entry in summary {
+        if entry[0] == "_json_field_str" {
+            if len(entry[1]) < 1 { s2_pass = false }
+        }
+    }
+    println("S2 _json_field_str observed in tree: " + (if s2_pass { "PASS" } else { "FAIL" }))
+    if s1_pass && s2_pass {
+        println("── selftest 2/2 PASS ──")
+        exit(0)
+    }
+    println("── selftest FAIL ──")
+    exit(1)
+}
+
+// ─── main ──────────────────────────────────────────────────────────────────
+
+println("── util_extract_audit (ROI H42) ──")
+let res = _run_audit()
+let summary  = res[0]
+let refactor = res[1]
+_write_out(summary, refactor)
+println("watched           : " + to_string(len(WATCHED)))
+println("refactor_candidates: " + to_string(len(refactor)))
+for entry in summary {
+    let count = len(entry[1])
+    if count > 0 {
+        println("  " + entry[0] + " : " + to_string(count) + " file(s)")
+    }
+}
+println("output            : " + OUT_PATH)
+println("PASS (advisory — ≥" + to_string(DUP_THRESHOLD) + " files = candidate)")
+exit(0)

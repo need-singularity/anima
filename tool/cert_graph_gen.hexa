@@ -1,0 +1,505 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/cert_graph_gen.hexa — .meta2-cert relationship graph generator
+//
+//  PURPOSE
+//    Walk .meta2-cert/index.json + each per-cert *.json, extract edges from
+//    the `cross_refs` and `depends_on` JSON arrays, and emit:
+//      docs/cert_graph.md       — markdown adjacency list
+//      state/cert_graph.json    — parseable JSON (nodes[], edges[])
+//    Slug normalization: case-folded, "_" preserved; "UNIVERSAL_CONSTANT_4"
+//    folds to "universal-constant-4" via underscore→hyphen + lowercase.
+//
+//  USAGE
+//    hexa run tool/cert_graph_gen.hexa
+//    hexa run tool/cert_graph_gen.hexa --cert-dir <dir> --md <file> --json <file>
+//    hexa run tool/cert_graph_gen.hexa --selftest
+//
+//  RULES
+//    raw#9 hexa-only · raw#10 proof-carrying (state/cert_graph.json SSOT)
+//    raw#11 snake_case · idempotent (sort by slug ascending).
+// ════════════════════════════════════════════════════════════════════════════
+
+let DEFAULT_CERT_DIR = "/Users/ghost/core/anima/.meta2-cert"
+let DEFAULT_MD_OUT   = "/Users/ghost/core/anima/docs/cert_graph.md"
+let DEFAULT_JSON_OUT = "/Users/ghost/core/anima/state/cert_graph.json"
+
+let HDR_MD = "<!-- AUTO-GENERATED, DO NOT EDIT — source: tool/cert_graph_gen.hexa -->"
+
+// ─── shell helpers ───────────────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _exec_out(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _exec_code(cmd: string) -> int {
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+fn _file_exists(p: string) -> bool { return _exec_code("test -e " + _sh_quote(p)) == 0 }
+fn _dir_exists(p: string) -> bool { return _exec_code("test -d " + _sh_quote(p)) == 0 }
+fn _mkdir_p(p: string) -> bool { return _exec_code("mkdir -p " + _sh_quote(p)) == 0 }
+fn _rm_rf(p: string) -> bool { return _exec_code("rm -rf " + _sh_quote(p)) == 0 }
+
+fn _utc_now() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _basename(path: string) -> string {
+    let parts = path.split("/")
+    if len(parts) == 0 { return path }
+    return to_string(parts[len(parts) - 1])
+}
+
+fn _parent_of(path: string) -> string {
+    let parts = path.split("/")
+    if len(parts) <= 1 { return "." }
+    let mut out = ""
+    let mut i = 0
+    let cap = len(parts) - 1
+    while i < cap {
+        if i > 0 { out = out + "/" }
+        out = out + to_string(parts[i])
+        i = i + 1
+    }
+    if out == "" { return "/" }
+    return out
+}
+
+fn _list_jsons(dir: string) -> array {
+    if !_dir_exists(dir) { return [] }
+    let cmd = "find " + _sh_quote(dir) + " -maxdepth 1 -type f -name '*.json' 2>/dev/null | LC_ALL=C sort"
+    let out = _exec_out(cmd)
+    let lines = out.split("\n")
+    let mut acc = []
+    for l in lines {
+        let t = to_string(l).trim()
+        if t.len() > 0 { acc.push(t) }
+    }
+    return acc
+}
+
+// ─── slug normalization ──────────────────────────────────────────────────
+//
+// Lowercase + underscores → hyphens. "UNIVERSAL_CONSTANT_4" →
+// "universal-constant-4" matches the on-disk slug. Pure-numeric IDs (e.g.
+// "22" from depends_on) pass through unchanged with a "rm#" prefix marking
+// them as roadmap-id refs.
+//
+fn slug_norm(s: string) -> string {
+    let t = s.trim()
+    if t.len() == 0 { return "" }
+    // numeric-only? treat as roadmap id ref.
+    let mut all_d = true
+    let mut i = 0
+    while i < t.len() {
+        let cc = char_code(t.substring(i, i + 1), 0)
+        if cc < 48 || cc > 57 { all_d = false; break }
+        i = i + 1
+    }
+    if all_d { return "rm#" + t }
+    return t.to_lower().replace("_", "-")
+}
+
+// ─── minimal JSON array-of-string extractor ──────────────────────────────
+//
+// Locate `"<key>"` then the next `[ ... ]` and split string elements.
+// Tolerates whitespace and nested objects (we count depth on `[]` and `{}`).
+//
+fn json_string_array(body: string, key: string) -> array {
+    let needle = "\"" + key + "\""
+    let idx = body.find(needle)
+    if idx < 0 { return [] }
+    // advance past key, optional whitespace, ':' , optional whitespace
+    let mut i = idx + needle.len()
+    let n = body.len()
+    while i < n {
+        let c = body.substring(i, i + 1)
+        if c == ":" { i = i + 1; break }
+        if c != " " && c != "\t" && c != "\n" && c != "\r" { break }
+        i = i + 1
+    }
+    while i < n {
+        let c = body.substring(i, i + 1)
+        if c == "[" { i = i + 1; break }
+        if c != " " && c != "\t" && c != "\n" && c != "\r" { return [] }
+        i = i + 1
+    }
+    // walk array body
+    let mut out = []
+    let mut depth = 1
+    while i < n && depth > 0 {
+        let c = body.substring(i, i + 1)
+        if c == "[" { depth = depth + 1; i = i + 1; continue }
+        if c == "]" { depth = depth - 1; i = i + 1; continue }
+        if c == "{" {
+            // skip nested object
+            let mut od = 1; i = i + 1
+            while i < n && od > 0 {
+                let cc = body.substring(i, i + 1)
+                if cc == "{" { od = od + 1 }
+                if cc == "}" { od = od - 1 }
+                i = i + 1
+            }
+            continue
+        }
+        if c == "\"" {
+            // read string until unescaped "
+            i = i + 1
+            let start = i
+            while i < n {
+                let cc = body.substring(i, i + 1)
+                if cc == "\\" { i = i + 2; continue }
+                if cc == "\"" { break }
+                i = i + 1
+            }
+            let s = body.substring(start, i)
+            out.push(s)
+            i = i + 1
+            continue
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn json_string_field(body: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let idx = body.find(needle)
+    if idx < 0 { return "" }
+    let mut i = idx + needle.len()
+    let n = body.len()
+    while i < n {
+        let c = body.substring(i, i + 1)
+        if c == ":" { i = i + 1; break }
+        if c != " " && c != "\t" && c != "\n" && c != "\r" { return "" }
+        i = i + 1
+    }
+    while i < n {
+        let c = body.substring(i, i + 1)
+        if c == "\"" { i = i + 1; break }
+        if c != " " && c != "\t" && c != "\n" && c != "\r" { return "" }
+        i = i + 1
+    }
+    let start = i
+    while i < n {
+        let c = body.substring(i, i + 1)
+        if c == "\\" { i = i + 2; continue }
+        if c == "\"" { break }
+        i = i + 1
+    }
+    return body.substring(start, i)
+}
+
+// ─── graph build ─────────────────────────────────────────────────────────
+
+struct Edge { src: string, dst: string, kind: string }
+
+fn _sort_strings(a: array) -> array {
+    let mut x = a
+    let n = len(x)
+    let mut i = 0
+    while i < n {
+        let mut min = i
+        let mut j = i + 1
+        while j < n {
+            if to_string(x[j]) < to_string(x[min]) { min = j }
+            j = j + 1
+        }
+        if min != i { let t = x[i]; x[i] = x[min]; x[min] = t }
+        i = i + 1
+    }
+    return x
+}
+
+fn build(cert_dir: string) -> any {
+    let files = _list_jsons(cert_dir)
+    let mut nodes = []         // array<string slug>
+    let mut node_verdict = #{} // slug -> verdict
+    let mut node_title   = #{} // slug -> title
+    let mut edges = []         // array<Edge>
+    let mut i = 0
+    while i < len(files) {
+        let full = to_string(files[i])
+        let base = _basename(full)
+        if base == "index.json" { i = i + 1; continue }
+        let body = read_file(full)
+        let slug_raw = json_string_field(body, "slug")
+        let slug = if slug_raw.len() > 0 { slug_norm(slug_raw) } else {
+            // strip ".json"
+            let bn = base.len()
+            slug_norm(base.substring(0, bn - 5))
+        }
+        let verdict = json_string_field(body, "verdict")
+        let title   = json_string_field(body, "title")
+        nodes.push(slug)
+        node_verdict[slug] = verdict
+        node_title[slug] = title
+        // cross_refs
+        let xs = json_string_array(body, "cross_refs")
+        let mut k = 0
+        while k < len(xs) {
+            let dst = slug_norm(to_string(xs[k]))
+            if dst.len() > 0 && dst != slug {
+                let e = Edge { src: slug, dst: dst, kind: "cross_ref" }
+                edges.push(e)
+            }
+            k = k + 1
+        }
+        // depends_on
+        let ds = json_string_array(body, "depends_on")
+        let mut m = 0
+        while m < len(ds) {
+            let dst = slug_norm(to_string(ds[m]))
+            if dst.len() > 0 && dst != slug {
+                let e = Edge { src: slug, dst: dst, kind: "depends_on" }
+                edges.push(e)
+            }
+            m = m + 1
+        }
+        i = i + 1
+    }
+    let mut g = #{}
+    g["nodes"] = _sort_strings(nodes)
+    g["node_verdict"] = node_verdict
+    g["node_title"] = node_title
+    g["edges"] = edges
+    return g
+}
+
+// ─── render md ───────────────────────────────────────────────────────────
+
+fn render_md(g: any, cert_dir: string, ts: string) -> string {
+    let nodes = g["nodes"]
+    let nv = g["node_verdict"]
+    let nt = g["node_title"]
+    let edges = g["edges"]
+    let mut s = ""
+    s = s + HDR_MD + "\n"
+    s = s + "<!-- generated: " + ts + " -->\n"
+    s = s + "<!-- cert_dir: " + cert_dir + " -->\n"
+    s = s + "<!-- node_count: " + to_string(len(nodes)) + " -->\n"
+    s = s + "<!-- edge_count: " + to_string(len(edges)) + " -->\n\n"
+    s = s + "# .meta2-cert relationship graph\n\n"
+    s = s + "_AUTO-GENERATED, DO NOT EDIT — generated " + ts + " UTC._\n\n"
+    s = s + "**Nodes:** " + to_string(len(nodes)) + " · **Edges:** " + to_string(len(edges)) + "\n\n"
+    s = s + "## Adjacency list\n\n"
+    let mut i = 0
+    while i < len(nodes) {
+        let slug = to_string(nodes[i])
+        let v = to_string(nv[slug])
+        let t = to_string(nt[slug])
+        s = s + "### `" + slug + "` — " + v + "\n"
+        if t.len() > 0 { s = s + "_" + t.replace("_", "\\_") + "_\n\n" } else { s = s + "\n" }
+        // outgoing edges from this slug, sorted by (kind, dst)
+        let mut outs = []
+        let mut j = 0
+        while j < len(edges) {
+            let e = edges[j]
+            if e.src == slug { outs.push(e.kind + "|" + e.dst) }
+            j = j + 1
+        }
+        let outs_sorted = _sort_strings(outs)
+        if len(outs_sorted) == 0 {
+            s = s + "- _(no outgoing edges)_\n\n"
+        } else {
+            let mut k = 0
+            while k < len(outs_sorted) {
+                let pair = to_string(outs_sorted[k])
+                let p = pair.find("|")
+                let kind = pair.substring(0, p)
+                let dst  = pair.substring(p + 1, pair.len())
+                s = s + "- **" + kind + "** → `" + dst + "`\n"
+                k = k + 1
+            }
+            s = s + "\n"
+        }
+        i = i + 1
+    }
+    return s
+}
+
+fn _json_escape(s: string) -> string {
+    let a = s.replace("\\", "\\\\")
+    let b = a.replace("\"", "\\\"")
+    let c = b.replace("\n", "\\n")
+    let d = c.replace("\r", "\\r")
+    let e = d.replace("\t", "\\t")
+    return e
+}
+
+fn render_json(g: any, cert_dir: string, ts: string) -> string {
+    let nodes = g["nodes"]
+    let nv = g["node_verdict"]
+    let nt = g["node_title"]
+    let edges = g["edges"]
+    let mut s = "{\n"
+    s = s + "  \"schema\": \"anima.cert_graph.v1\",\n"
+    s = s + "  \"tool\": \"tool/cert_graph_gen.hexa\",\n"
+    s = s + "  \"generated\": \"" + ts + "\",\n"
+    s = s + "  \"cert_dir\": \"" + _json_escape(cert_dir) + "\",\n"
+    s = s + "  \"nodes\": [\n"
+    let mut i = 0
+    while i < len(nodes) {
+        let slug = to_string(nodes[i])
+        let v = to_string(nv[slug])
+        let t = to_string(nt[slug])
+        s = s + "    {\"slug\": \"" + _json_escape(slug)
+            + "\", \"verdict\": \"" + _json_escape(v)
+            + "\", \"title\": \"" + _json_escape(t) + "\"}"
+        if i < len(nodes) - 1 { s = s + "," }
+        s = s + "\n"
+        i = i + 1
+    }
+    s = s + "  ],\n"
+    // sort edges by src, then kind, then dst
+    let mut keys = []
+    let mut j = 0
+    while j < len(edges) {
+        let e = edges[j]
+        keys.push(e.src + "\t" + e.kind + "\t" + e.dst + "\t" + to_string(j))
+        j = j + 1
+    }
+    let keys_sorted = _sort_strings(keys)
+    s = s + "  \"edges\": [\n"
+    let mut k = 0
+    while k < len(keys_sorted) {
+        let parts = to_string(keys_sorted[k]).split("\t")
+        let src = to_string(parts[0])
+        let kind = to_string(parts[1])
+        let dst = to_string(parts[2])
+        s = s + "    {\"src\": \"" + _json_escape(src)
+            + "\", \"dst\": \"" + _json_escape(dst)
+            + "\", \"kind\": \"" + _json_escape(kind) + "\"}"
+        if k < len(keys_sorted) - 1 { s = s + "," }
+        s = s + "\n"
+        k = k + 1
+    }
+    s = s + "  ],\n"
+    s = s + "  \"counts\": {\"nodes\": " + to_string(len(nodes)) + ", \"edges\": " + to_string(len(edges)) + "}\n"
+    s = s + "}\n"
+    return s
+}
+
+fn _atomic_write(path: string, body: string) {
+    let tmp = path + ".tmp"
+    write_file(tmp, body)
+    let _ = _exec_code("mv -f " + _sh_quote(tmp) + " " + _sh_quote(path))
+}
+
+fn generate(cert_dir: string, md_out: string, json_out: string) -> int {
+    if !_dir_exists(cert_dir) {
+        eprintln("cert_graph_gen: SETUP_ERROR — cert dir missing: " + cert_dir)
+        return 2
+    }
+    let _ = _mkdir_p(_parent_of(md_out))
+    let _ = _mkdir_p(_parent_of(json_out))
+    let ts = _utc_now()
+    let g = build(cert_dir)
+    _atomic_write(md_out, render_md(g, cert_dir, ts))
+    _atomic_write(json_out, render_json(g, cert_dir, ts))
+    let nodes = g["nodes"]; let edges = g["edges"]
+    println("cert_graph_gen: wrote " + md_out)
+    println("                wrote " + json_out)
+    println("  nodes = " + to_string(len(nodes)))
+    println("  edges = " + to_string(len(edges)))
+    return 0
+}
+
+// ─── argv / main ─────────────────────────────────────────────────────────
+
+fn _argv() -> array {
+    let a = args()
+    let mut out = []
+    let mut i = 2
+    while i < len(a) { out.push(a[i]); i = i + 1 }
+    return out
+}
+
+fn _flag(av: array, k: string) -> bool {
+    for x in av { if to_string(x) == k { return true } }
+    return false
+}
+
+fn _opt(av: array, k: string, d: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && i + 1 < len(av) { return to_string(av[i + 1]) }
+        i = i + 1
+    }
+    return d
+}
+
+// ─── selftest ────────────────────────────────────────────────────────────
+
+fn _hash_no_ts(path: string) -> string {
+    let cmd = "grep -v 'generated' " + _sh_quote(path) + " | shasum -a 256 | awk '{print $1}'"
+    return _exec_out(cmd).trim()
+}
+
+fn run_selftest() -> int {
+    println("cert_graph_gen: SELFTEST starting")
+    let mut fails = 0
+    let d = _exec_out("mktemp -d -t cert_graph_st.XXXXXX 2>/dev/null").trim()
+    if d == "" { println("S0 FAIL: mktemp"); return 1 }
+    write_file(d + "/index.json",
+        "{\"entries\":[{\"slug\":\"alpha\"},{\"slug\":\"bravo\"}]}\n")
+    write_file(d + "/alpha.json",
+        "{\"slug\":\"alpha\",\"title\":\"Alpha cert\",\"verdict\":\"VERIFIED\"," +
+        "\"cross_refs\":[\"bravo\",\"UNIVERSAL_CONSTANT_4\"]," +
+        "\"depends_on\":[\"22\"]}\n")
+    write_file(d + "/bravo.json",
+        "{\"slug\":\"bravo\",\"title\":\"Bravo cert\",\"verdict\":\"PARTIAL\"," +
+        "\"cross_refs\":[]}\n")
+    let md = d + "/g.md"; let js = d + "/g.json"
+    let rc = generate(d, md, js)
+    if rc != 0 { fails = fails + 1; println("S1 FAIL: rc=" + to_string(rc)) }
+    let body_md = read_file(md)
+    let body_js = read_file(js)
+    if body_md.find("AUTO-GENERATED") < 0 { fails = fails + 1; println("S1 FAIL: header missing") }
+    if body_md.find("`alpha`") < 0 { fails = fails + 1; println("S1 FAIL: alpha node") }
+    if body_md.find("`bravo`") < 0 { fails = fails + 1; println("S1 FAIL: bravo node") }
+    if body_md.find("`universal-constant-4`") < 0 { fails = fails + 1; println("S1 FAIL: slug normalization") }
+    if body_md.find("rm#22") < 0 { fails = fails + 1; println("S1 FAIL: numeric depends_on") }
+    if body_js.find("\"depends_on\"") < 0 {
+        // ok — kind is in edges as depends_on
+        if body_js.find("depends_on") < 0 { fails = fails + 1; println("S1 FAIL: depends_on edge missing") }
+    }
+    // idempotency
+    let h_a_md = _hash_no_ts(md); let h_a_js = _hash_no_ts(js)
+    let _ = generate(d, md, js)
+    let h_b_md = _hash_no_ts(md); let h_b_js = _hash_no_ts(js)
+    if h_a_md == h_b_md && h_a_js == h_b_js {
+        println("S2 PASS: idempotent (md+json)")
+    } else {
+        fails = fails + 1
+        println("S2 FAIL: drift md(" + h_a_md + " vs " + h_b_md + ") js(" + h_a_js + " vs " + h_b_js + ")")
+    }
+    let _ = _rm_rf(d)
+    if fails == 0 { println("cert_graph_gen: SELFTEST PASS"); return 0 }
+    println("cert_graph_gen: SELFTEST FAIL (" + to_string(fails) + ")"); return 1
+}
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") || _flag(av, "-h") {
+        println("usage: hexa run tool/cert_graph_gen.hexa [opts]")
+        println("  --cert-dir <dir>   default: " + DEFAULT_CERT_DIR)
+        println("  --md   <file>      default: " + DEFAULT_MD_OUT)
+        println("  --json <file>      default: " + DEFAULT_JSON_OUT)
+        println("  --selftest         run selftest")
+        return 0
+    }
+    if _flag(av, "--selftest") { return run_selftest() }
+    let cd = _opt(av, "--cert-dir", DEFAULT_CERT_DIR)
+    let md = _opt(av, "--md", DEFAULT_MD_OUT)
+    let js = _opt(av, "--json", DEFAULT_JSON_OUT)
+    return generate(cd, md, js)
+}
+
+exit(main())

@@ -1,0 +1,96 @@
+{
+  "schema": "anima.observability_audit.v1",
+  "slug": "observability-audit",
+  "scope": "ROI items I46-I50 (observability / debug infra)",
+  "created": "2026-04-22T11:28:00Z",
+  "host_runtime_note": "Local hexa CLI on this host is parser-only (lacks exec/json_parse stdlib). Production hexa runtime executes .hexa tools end-to-end; smoke verdict therefore distinguishes parse-clean from runtime-executed.",
+  "items": [
+    {
+      "id": "I46",
+      "title": "Structured logging schema",
+      "deliverable": "shared/util/structured_log.hexa",
+      "status": "applied",
+      "verifications": [
+        {"check": "parse_clean",      "result": "PASS"},
+        {"check": "no_top_level",     "result": "PASS", "detail": "fn defs only — usable as library by serve_alm_persona"},
+        {"check": "schema_documented", "result": "PASS", "detail": "{ts, level, component, msg, kv} per docstring"},
+        {"check": "levels_enumerated", "result": "PASS", "detail": "DEBUG=10 INFO=20 WARN=30 ERROR=40"}
+      ],
+      "sample_log_line": "{\"ts\":\"2026-04-22T11:27:57Z\",\"level\":\"INFO\",\"component\":\"serve_alm_persona.handler\",\"msg\":\"request_start\",\"kv\":{\"endpoint\":\"/persona\",\"persona_id\":\"dest1\",\"traceparent\":\"00-b574b1de03a2069bbf6e33c7411224f0-9379001ec6bd8879-01\"}}",
+      "pending": ["wire emit_log() into serve_alm_persona.hexa per-request path"]
+    },
+    {
+      "id": "I47",
+      "title": "Request trace ID (W3C trace context)",
+      "deliverable": "shared/util/trace_context.hexa",
+      "status": "applied",
+      "verifications": [
+        {"check": "parse_clean",        "result": "PASS"},
+        {"check": "no_top_level",       "result": "PASS"},
+        {"check": "format_w3c_level1",  "result": "PASS", "detail": "version-traceId(32hex)-spanId(16hex)-flags, total 55 chars"},
+        {"check": "validator_rejects_zero", "result": "PASS", "detail": "all-zero trace_id / span_id rejected per spec"},
+        {"check": "format_smoke",       "result": "PASS", "detail": "regex 00-[0-9a-f]{32}-[0-9a-f]{16}-(00|01) verified by shell-equivalent build"}
+      ],
+      "sample_traceparent": "00-b574b1de03a2069bbf6e33c7411224f0-9379001ec6bd8879-01",
+      "pending": ["read incoming traceparent header in serve_alm_persona handler", "include traceparent in every emit_log kv"]
+    },
+    {
+      "id": "I48",
+      "title": "Per-pod latency histogram (P50/P95/P99)",
+      "deliverable": "tool/latency_histogram.hexa",
+      "status": "applied",
+      "verifications": [
+        {"check": "parse_clean",         "result": "PASS"},
+        {"check": "self_test_documented", "result": "PASS", "detail": "synthetic 10 reqs (1..9, 500ms) — expected p50=5 p95=500 p99=500"},
+        {"check": "bash_equivalent_smoke", "result": "PASS", "detail": "shell-equivalent percentile (nearest-rank) confirms n=10 p50=5 p95=500 p99=500"},
+        {"check": "output_schema",       "result": "PASS", "detail": "anima.latency_histogram.v1 → state/latency_histogram.json"}
+      ],
+      "input_source": "state/serve_alm_persona_log.jsonl",
+      "output_artifact": "state/latency_histogram.json",
+      "pending": ["scheduled invocation (launchd/cron) once production hexa runtime confirmed on host"]
+    },
+    {
+      "id": "I49",
+      "title": "Error budget tracking (SLI/SLO)",
+      "deliverables": ["config/sli_slo.json", "tool/error_budget_check.hexa"],
+      "status": "applied",
+      "verifications": [
+        {"check": "config_valid_json",   "result": "PASS"},
+        {"check": "indicators_count",    "result": "PASS", "detail": "4 indicators: request_success_rate, request_latency_p95_ms, cert_gate_pass_rate, an11_a_pass_rate"},
+        {"check": "burn_rate_alerts",    "result": "PASS", "detail": "fast_burn / slow_burn / trend_burn declared"},
+        {"check": "tool_parse_clean",    "result": "PASS"},
+        {"check": "self_test_documented", "result": "PASS", "detail": "10 synthetic reqs, 1 cert_fail → expected rollup=BREACH (success 0.9 < 0.99)"},
+        {"check": "bash_equivalent_smoke", "result": "PASS", "detail": "shell-equivalent ratio computation confirms BREACH on synthetic 9/10"}
+      ],
+      "samples_input_default": "state/serve_alm_persona_log.jsonl",
+      "status_output_default": "state/error_budget_status.json",
+      "pending": ["dashboard wiring (config/grafana SLO panels) — config SSOT now exists"]
+    },
+    {
+      "id": "I50",
+      "title": "Continuous profile (sampled perf record)",
+      "deliverable": "tool/continuous_profile.bash",
+      "status": "applied",
+      "verifications": [
+        {"check": "wrapper_executable",    "result": "PASS"},
+        {"check": "subcommands_present",   "result": "PASS", "detail": "--start --stop --report --smoke"},
+        {"check": "platform_dispatch",     "result": "PASS", "detail": "Darwin→sample, Linux→perf record"},
+        {"check": "smoke_run",             "result": "PASS", "detail": "bash tool/continuous_profile.bash --smoke exit 0; emitted state/profile_<ts>_smoke.json with hot_functions array"}
+      ],
+      "output_artifact_pattern": "state/profile_<utc-ts>.json",
+      "pending": ["periodic schedule (launchd plist) — not part of I50 scope"]
+    }
+  ],
+  "rollup": {
+    "applied": 5,
+    "pending_followups": 5,
+    "smoked_runtime_pass": ["I50"],
+    "smoked_parse_pass":   ["I46", "I47", "I48", "I49"],
+    "smoked_shell_equiv":  ["I47", "I48", "I49"]
+  },
+  "notes": [
+    "Pure-library constraint enforced for I46 + I47: structured_log.hexa and trace_context.hexa contain only fn defs (no top-level call), so they can be `use`d by serve_alm_persona.hexa or any handler without side effects.",
+    "Bash-equivalent smoke (shell percentile + ratio) was used to confirm semantic correctness of the algorithms baked into the .hexa self-test paths, since the local hexa CLI on this host is parser-only.",
+    "Hard constraint compliance: no .roadmap modification, no edits to tools outside the deliverable list, no .py files added."
+  ]
+}

@@ -1,0 +1,112 @@
+{
+  "schema": "anima.r2_cross_region_replicate.v1",
+  "spec_status": "SPEC_ONLY_NOT_ACTIVE",
+  "decided_at": "2026-04-22",
+  "roi_item": "K58",
+  "activation_gate": "post_CP2 + DR_decision + R2_secondary_account_provisioned",
+  "purpose": "Disaster Recovery (DR) spec — Cloudflare R2 source bucket → 2 destination region buckets. Sync interval 1h via cron-driven rclone. NO actual replicate triggered by this spec.",
+  "do_not_execute_warning": "This file is SPEC ONLY. Running the rclone command without operator approval will incur R2 egress costs and may collide with active training. Activation requires explicit go-ahead post-CP2.",
+  "source": {
+    "provider": "cloudflare_r2",
+    "bucket": "anima-models",
+    "region_label": "auto (CF default — currently WNAM)",
+    "endpoint": "https://ce4bdcce7c74d4e3c78fdf944c4d1d7b.r2.cloudflarestorage.com",
+    "endpoint_source": "config/runpod.json#r2_backup",
+    "access_via": "rclone remote 'r2-source' (s3-compat, AWS_S3 v4 sig)",
+    "approx_size_gb_estimate": 50,
+    "object_classes_replicated": [
+      "ckpt/*.safetensors",
+      "lora/*.safetensors",
+      "phi_traj/*.json",
+      "an11/*.json"
+    ],
+    "object_classes_excluded": [
+      "logs/*",
+      "tmp/*",
+      "*.tmp",
+      "*-debug-*"
+    ]
+  },
+  "destinations": [
+    {
+      "id": "dst_eu",
+      "provider": "cloudflare_r2",
+      "bucket": "anima-models-dr-eu",
+      "region_hint": "EEUR (Europe East — Frankfurt jurisdiction)",
+      "purpose": "Geographic DR (EU) + GDPR-friendly residency option for future EU collab.",
+      "endpoint_template": "https://<DR_ACCOUNT_ID>.r2.cloudflarestorage.com",
+      "endpoint_status": "PENDING — DR account/bucket not yet provisioned",
+      "rclone_remote": "r2-dr-eu"
+    },
+    {
+      "id": "dst_apac",
+      "provider": "cloudflare_r2",
+      "bucket": "anima-models-dr-apac",
+      "region_hint": "APAC (Singapore / Tokyo edge)",
+      "purpose": "Geographic DR (APAC) + low-latency restore for Korea/Japan operator location.",
+      "endpoint_template": "https://<DR_ACCOUNT_ID>.r2.cloudflarestorage.com",
+      "endpoint_status": "PENDING — DR account/bucket not yet provisioned",
+      "rclone_remote": "r2-dr-apac"
+    }
+  ],
+  "rclone_command_template": {
+    "preflight_check": "rclone lsd r2-source: && rclone lsd r2-dr-eu: && rclone lsd r2-dr-apac:",
+    "sync_to_dst_eu": "rclone sync r2-source:anima-models r2-dr-eu:anima-models-dr-eu --include 'ckpt/**' --include 'lora/**' --include 'phi_traj/**' --include 'an11/**' --exclude 'logs/**' --exclude 'tmp/**' --exclude '*.tmp' --transfers 4 --checkers 8 --fast-list --log-file /var/log/anima/r2_sync_eu.log --log-level INFO",
+    "sync_to_dst_apac": "rclone sync r2-source:anima-models r2-dr-apac:anima-models-dr-apac --include 'ckpt/**' --include 'lora/**' --include 'phi_traj/**' --include 'an11/**' --exclude 'logs/**' --exclude 'tmp/**' --exclude '*.tmp' --transfers 4 --checkers 8 --fast-list --log-file /var/log/anima/r2_sync_apac.log --log-level INFO",
+    "dry_run_first": "append --dry-run before any first execution; verify object count and bytes",
+    "checksum_verify": "rclone check r2-source:anima-models r2-dr-eu:anima-models-dr-eu --one-way --download (post-sync verification)"
+  },
+  "rclone_config_template": {
+    "config_path_hint": "$HOME/.config/rclone/rclone.conf (ENV-isolated; do NOT commit credentials)",
+    "remote_block_template_source": "[r2-source]\ntype = s3\nprovider = Cloudflare\naccess_key_id = <REDACTED>\nsecret_access_key = <REDACTED>\nendpoint = https://ce4bdcce7c74d4e3c78fdf944c4d1d7b.r2.cloudflarestorage.com\nacl = private\n",
+    "remote_block_template_dst_eu": "[r2-dr-eu]\ntype = s3\nprovider = Cloudflare\naccess_key_id = <REDACTED>\nsecret_access_key = <REDACTED>\nendpoint = https://<DR_ACCOUNT_ID>.r2.cloudflarestorage.com\nregion_hint = EEUR\nacl = private\n",
+    "remote_block_template_dst_apac": "[r2-dr-apac]\ntype = s3\nprovider = Cloudflare\naccess_key_id = <REDACTED>\nsecret_access_key = <REDACTED>\nendpoint = https://<DR_ACCOUNT_ID>.r2.cloudflarestorage.com\nregion_hint = APAC\nacl = private\n",
+    "credential_loading_policy": "Read access keys from ENV (R2_DR_EU_ACCESS_KEY etc.) or 1Password CLI; never persist plain in repo or rclone.conf checked-in copy."
+  },
+  "schedule": {
+    "interval_human": "every 1 hour",
+    "interval_seconds": 3600,
+    "cron_expression": "0 * * * *",
+    "launchd_plist_path_planned": "config/launchd/com.anima.r2_cross_region_sync.plist",
+    "launchd_plist_status": "NOT_CREATED — activation gate requires K58 go-ahead",
+    "concurrency_guard": "use rclone --syslog-level WARNING + lock file /var/lock/anima_r2_sync.lock to prevent overlapping runs",
+    "activity_window": "skip sync during active training write-window (R01 NFS I/O rule; check ps aux | grep train_alm)"
+  },
+  "monitoring": {
+    "success_signal": "rclone exit 0 + log line 'Transferred: ...' + rclone check 0 mismatches",
+    "failure_actions": [
+      "exit != 0 → write state/r2_sync_dr_failure.json with timestamp + dst id + log tail",
+      "post-sync rclone check mismatch > 0 → mark as DEGRADED + notify via airgenome dispatch (#K58 alert)",
+      "consecutive 3 failure → suspend cron + require manual intervention (R12 analog — 'do not auto-resume DR')"
+    ],
+    "audit_log": ".raw-audit/r2_cross_region_replicate.log (append-only, line per sync run)"
+  },
+  "cost_estimate": {
+    "r2_egress_per_gb": "$0 (CF R2 free egress is the design choice)",
+    "r2_storage_per_gb_month": "$0.015",
+    "estimated_dr_storage_gb": 50,
+    "monthly_cost_per_destination": "$0.75",
+    "monthly_cost_total_2_dst": "$1.50",
+    "transfer_class_a_ops_per_1000": "$4.50",
+    "estimated_class_a_ops_per_sync": 200,
+    "monthly_class_a_ops_cost_24x30x2dst_per_sync": "200 × 24 × 30 × 2 / 1000 × $4.50 ≈ $1.30",
+    "monthly_total_estimate": "~$3 (storage + ops, no egress)"
+  },
+  "activation_checklist": [
+    "[ ] CP2 milestone hit",
+    "[ ] DR Cloudflare account/sub-account provisioned with EEUR + APAC bucket created",
+    "[ ] R2 access keys minted scoped only to DR buckets (write) + source bucket (read-only)",
+    "[ ] rclone.conf populated locally on operator workstation/scheduler host",
+    "[ ] First sync executed with --dry-run; object count + bytes manually approved",
+    "[ ] First real sync executed manually (no cron); rclone check 0 mismatches",
+    "[ ] launchd plist landed and tested via tool/launchd_install_local.bash --dry-run",
+    "[ ] launchd plist activated via tool/launchd_install_local.bash --activate"
+  ],
+  "audit_notes": {
+    "fake_pass_guard": "Spec only; no rclone command executed by this file. DR buckets do not exist yet.",
+    "uchg_note": "Not uchg-locked; endpoints/regions may be revised pre-activation.",
+    "no_actual_replicate": true,
+    "post_cp2_only": true,
+    "linked_to": ["config/runpod.json#r2_backup", "config/launchd/ (planned plist)"]
+  }
+}
