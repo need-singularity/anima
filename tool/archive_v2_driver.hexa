@@ -84,7 +84,8 @@ fn raw_pending() {
 }
 
 fn done_paths() {
-    let cmd = "jq -sr 'map(select(.status==\"deleted\") | .path) | unique | .[]' '" + LOG + "' 2>/dev/null"
+    // Terminal statuses: item should not be re-processed.
+    let cmd = "jq -sr 'map(select(.status==\"deleted\" or .status==\"archived_no_delete\") | .path) | unique | .[]' '" + LOG + "' 2>/dev/null"
     return sh_out(cmd)
 }
 
@@ -191,7 +192,7 @@ fn delete_local(path) {
     return sh_rc(cmd)
 }
 
-fn archive_one(row) {
+fn archive_one(row, skip_delete) {
     let path = row[0]
     let bucket = row[1]
     let key = row[2]
@@ -204,29 +205,46 @@ fn archive_one(row) {
         return true
     }
 
-    println("")
-    println("[" + ts() + "] " + path)
-    println("  kind=" + k + " size_est=" + size_est + " -> r2:" + bucket + "/" + key)
-
-    log_event(path, "uploading", k)
-
-    let mut rc = -1
-    if k == "dir" {
-        rc = upload_dir(path, bucket, key)
-    } else {
-        rc = upload_file(path, bucket, key)
-    }
-
-    if rc != 0 {
-        println("  UPLOAD-FAIL rc=" + to_string(rc))
-        log_event(path, "upload_failed", "rc=" + to_string(rc))
-        return false
-    }
-
     let verify_key = key
     if k == "dir" { verify_key = strip_trailing_slash(key) + ".tar.zst" }
-    let rsize = r2_size(bucket, verify_key)
 
+    println("")
+    println("[" + ts() + "] " + path)
+    println("  kind=" + k + " size_est=" + size_est + " -> r2:" + bucket + "/" + verify_key)
+
+    // R2-exists short-circuit: skip upload if already present with valid size
+    let pre_rsize = r2_size(bucket, verify_key)
+    let mut need_upload = true
+    if pre_rsize > 0 {
+        if k == "file" {
+            let lsize = local_size(path)
+            if pre_rsize == lsize {
+                println("  [skip-upload] r2 already has exact size=" + to_string(pre_rsize))
+                need_upload = false
+            }
+        } else {
+            // dir: treat any non-empty r2 object as "already archived" (size estimation too variable due to compression)
+            println("  [skip-upload] r2 already has tar.zst size=" + to_string(pre_rsize))
+            need_upload = false
+        }
+    }
+
+    if need_upload {
+        log_event(path, "uploading", k)
+        let mut rc = -1
+        if k == "dir" {
+            rc = upload_dir(path, bucket, key)
+        } else {
+            rc = upload_file(path, bucket, key)
+        }
+        if rc != 0 {
+            println("  UPLOAD-FAIL rc=" + to_string(rc))
+            log_event(path, "upload_failed", "rc=" + to_string(rc))
+            return false
+        }
+    }
+
+    let rsize = r2_size(bucket, verify_key)
     if k == "file" {
         let lsize = local_size(path)
         if rsize != lsize {
@@ -235,7 +253,6 @@ fn archive_one(row) {
             return false
         }
     }
-
     if rsize <= 0 {
         println("  VERIFY-FAIL r2=" + to_string(rsize))
         log_event(path, "verify_failed", "r2=" + to_string(rsize))
@@ -243,6 +260,13 @@ fn archive_one(row) {
     }
 
     log_event(path, "verified", "r2_bytes=" + to_string(rsize))
+    println("  VERIFIED r2_bytes=" + to_string(rsize))
+
+    if skip_delete {
+        // Terminal status for this driver run; delete handled elsewhere.
+        log_event(path, "archived_no_delete", "skip-delete=1")
+        return true
+    }
 
     let drc = delete_local(path)
     if drc != 0 {
@@ -259,10 +283,12 @@ fn archive_one(row) {
 fn parse_args(argv) {
     let mut limit = -1
     let mut dry = false
+    let mut no_delete = false
     let mut i = 1
     while i < argv.len() {
         let a = argv[i]
         if a == "--dry" { dry = true }
+        if a == "--no-delete" { no_delete = true }
         if a == "--limit" {
             if i + 1 < argv.len() {
                 try { limit = to_int(argv[i + 1]) } catch e { limit = -1 }
@@ -271,7 +297,7 @@ fn parse_args(argv) {
         }
         i = i + 1
     }
-    return [limit, dry]
+    return [limit, dry, no_delete]
 }
 
 fn main() {
@@ -279,6 +305,11 @@ fn main() {
     let opts = parse_args(argv)
     let limit = opts[0]
     let dry = opts[1]
+    let no_delete = opts[2]
+
+    if no_delete {
+        println("[mode] --no-delete (terminal status: archived_no_delete)")
+    }
 
     if dry == false {
         try_lock()
@@ -306,7 +337,7 @@ fn main() {
             println("[dry] " + row[0] + " -> r2:" + row[1] + "/" + row[2] + " (size=" + row[3] + ")")
             processed = processed + 1
         } else {
-            let ok = archive_one(row)
+            let ok = archive_one(row, no_delete)
             processed = processed + 1
             if ok { ok_count = ok_count + 1 } else { fail_count = fail_count + 1 }
         }
